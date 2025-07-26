@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    ".",
+    "crates/kernel",
+    "crates/storage_engine",
+    "crates/query_engine",
+    "crates/transaction_manager",
+]
+
+[workspace.package]
+authors = ["Vlayd Detect"]
+edition = "2024"
+version = "0.1.0"
+description = "Embedded Graph Database Engine powered by Rust"
+repository = "https://github.com/VlaydDetect/ferros-grynn"
+homepage = "https://github.com/VlaydDetect/ferros-grynn"
+keywords = [
+    "database",
+    "embedded-database",
+    "graph",
+    "graph-store",
+]
+categories = ["database-implementations", "data-structures", "embedded"]
+
+[workspace.dependencies]
+kernel = { version = "=0.1.0", package = "kernel", path = "crates/kernel" }
+storage_engine = { version = "=0.1.0", package = "storage_engine", path = "crates/storage_engine" }
+query_engine = { version = "=0.1.0", package = "query_engine", path = "crates/query_engine" }
+transaction_manager = { version = "=0.1.0", package = "transaction_manager", path = "crates/transaction_manager" }
+
+[package]
+name = "ferros-grynn"
+authors.workspace = true
+edition.workspace = true
+version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+kernel.workspace = true
+storage_engine.workspace = true
+query_engine.workspace = true
+transaction_manager.workspace = true
