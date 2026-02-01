@@ -1,0 +1,25 @@
+[package]
+name = "configuration"
+authors.workspace = true
+edition.workspace = true
+version.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+io.workspace = true
+
+thiserror.workspace = true
+itertools.workspace = true
+rayon.workspace = true
+humantime.workspace = true
+chrono.workspace = true
+num.workspace = true
+path-clean.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+magic_utils.workspace = true
+inventory.workspace = true

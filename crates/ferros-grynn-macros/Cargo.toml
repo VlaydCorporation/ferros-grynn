@@ -1,0 +1,15 @@
+[package]
+name = "ferros-grynn-macros"
+authors = ["Vlayd Detect"]
+edition = "2024"
+version = "0.1.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { version = "1" }
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = { version = "1" }
+darling = { version = "0.23.0", features = ["suggestions"] }
+itertools = "0.14.0"
