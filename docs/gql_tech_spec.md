@@ -35,7 +35,7 @@
 
 **Вне охвата:** физический формат страниц и байтовые раскладки (это `disk_storage_spec.md`); грамматика (это `gql_grammar.md`); семантика операторов языка (это `gql_spec.md`).
 
-> **Важно об архитектуре хранения.** Ранние черновики этого файла описывали LSM-дерево (L0/L1/compaction). Это устранено: и `disk_storage_spec.md` (§20.2.8 — LSM отклонён в пользу B+tree), и `implementation_notes.md` фиксируют модель **WAL + snapshot + fuzzy checkpoint + single-pass physiological REDO + MVCC**. Данный документ следует этой модели. См. §31.2 `gql_spec.md`.
+> **Важно об архитектуре хранения.** Ранние черновики этого файла описывали LSM-дерево (L0/L1/compaction). Это устранено: `disk_storage_spec.md` §20.2.8 отклоняет LSM в пользу B+tree. Модель дискового режима — **frame-WAL (COW в логе) + бэкфилл на штатные места + MVCC через индекс версий страниц**, журнал единый на базу данных (§12). См. §31.2 `gql_spec.md`.
 
 ---
 
@@ -64,7 +64,7 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 Архитектурные контракты выражаются через код: traits, инварианты типов, паттерны. Ключевые интерфейсы-границы:
 
-- **`PageManager`** (`disk_storage_spec.md` §29.2) — страничный I/O: `alloc_page`, `free_page`, `read_page`, `write_page_dirty(…, lsn)`, `flush_file`, `flush_all`, `page_count`.
+- **`PageManager`** (`disk_storage_spec.md` §29.2) — страничный I/O: `alloc_page`, `free_page`, `read_page`, `write_frame`, `flush_file`, `flush_all`, `page_count`; чтение параметризовано снимком.
 - **`Index`** (`disk_storage_spec.md` §20.1) — единый интерфейс индексов: `insert`, `delete`, `lookup`, `range`, `rebuild`, `status`.
 - **`TransactionLogSink`** — приёмник WAL-записей (append + fsync-барьеры).
 - **`Operator`** (§7, §9) — узел плана исполнения: `next_batch() -> Option<Batch>`.
@@ -520,22 +520,25 @@ Runtime-решения: batch too large → split; skew → rebalance; выбо�
 Исполнитель никогда не читает файлы напрямую — только через `PageManager` (`disk_storage_spec.md` §29.2) поверх `BufferPool`:
 ```rust
 trait PageManager: Send + Sync {
-    fn alloc_page(&self, file: DataFileKind) -> io::Result<u64>;
-    fn free_page(&self, file: DataFileKind, page_no: u64) -> io::Result<()>;
-    fn read_page(&self, file: DataFileKind, page_no: u64, buf: &mut [u8; PAGE_SIZE]) -> io::Result<()>;
-    fn write_page_dirty(&self, file: DataFileKind, page_no: u64, buf: &[u8; PAGE_SIZE], lsn: Lsn) -> io::Result<()>;
-    fn flush_file(&self, file: DataFileKind) -> io::Result<()>;
-    fn flush_all(&self) -> io::Result<()>;
-    fn page_count(&self, file: DataFileKind) -> io::Result<u64>;
+    fn begin_tx(&self) -> TxHandle;
+    fn alloc_page(&self, tx: &TxHandle, key: PageKey) -> io::Result<u64>;
+    fn free_page(&self, tx: &TxHandle, key: PageKey) -> io::Result<()>;
+    /// Чтение всегда параметризовано снимком: сначала индекс версий, затем .fgb
+    fn read_page(&self, key: PageKey, snapshot: Lsn, buf: &mut [u8; PAGE_SIZE]) -> io::Result<()>;
+    /// Запись — новый фрейм в журнал; LSN назначает журнал, не вызывающий
+    fn write_frame(&self, tx: &TxHandle, key: PageKey, buf: &[u8; PAGE_SIZE]) -> io::Result<Lsn>;
+    fn commit_tx(&self, tx: TxHandle) -> io::Result<CommitTs>;
+    fn abort_tx(&self, tx: TxHandle);
+    fn checkpoint(&self, mode: CheckpointMode) -> io::Result<()>;
 }
 ```
-`PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и `checksum` (xxHash3-64). При чтении buffer pool проверяет `page_no` и checksum → при рассинхроне страница помечается как требующая REDO из WAL (torn-write detection, §12). I/O — `SyncIo`/`AsyncIo` с выровненными буферами (O_DIRECT), пакетные чтения через io_uring (§18 задела).
+`PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и `checksum` (xxHash3-64). Ключ `PageKey = (graph_id, file_kind, page_no)`; `graph_id = 0` — системное пространство (каталог схемы и графов). При чтении из `.fgb` проверяются `page_no` и checksum → при рассинхроне страница восстанавливается применением фрейма из журнала (§12.4). I/O — `SyncIo`/`AsyncIo` с выровненными буферами (O_DIRECT), пакетные чтения через io_uring (§18 задела).
 
 ### 10.3. Разрешение идентификаторов: `RecordId → DiskAtomRef → AtomId`
 
 Три уровня идентификаторов (`disk_storage_spec.md` §4, §9):
 - **`RecordId`** (`table:id`) — публичный, единственный, видимый в GrynQL; хранится как свойство `id`.
-- **`DiskAtomRef`** (`u32`: бит31 = kind, биты30..0 = slot) — стабильный дисковый id (без generation).
+- **`DiskAtomRef`** (`u64`: бит40 = kind, биты39..0 = slot) — стабильный дисковый id (без generation).
 - **`AtomId`** (`u64`: slot + generation) — внутренний in-memory handle; **никогда не экспонируется** в GrynQL (§3.7 gql_spec).
 
 Разрешение при выполнении:
@@ -602,7 +605,7 @@ MemoryGraphHandle
 ├── snapshot_ts: TxId             -- снимок на момент загрузки
 └── settings: MemoryGraphSettings
 ```
-- **Загрузка** (`load_subgraph`, disk-spec §25): выполнить GrynQL-запрос на disk-backend → набор `DiskAtomRef` → Pass 1 (узлы: пропустить tombstone, резолв label через `LabelDictionary`, чтение props), Pass 2 (рёбра между загруженными узлами) → построить `slot_to_atom: Map<u32, AtomId>`; зафиксировать `snapshot_ts`.
+- **Загрузка** (`load_subgraph`, disk-spec §25): выполнить GrynQL-запрос на disk-backend → набор `DiskAtomRef` → Pass 1 (узлы: пропустить tombstone, резолв label через `LabelDictionary`, чтение props), Pass 2 (рёбра между загруженными узлами) → построить `slot_to_atom: Map<u64, AtomId>`; зафиксировать `snapshot_ts`.
 - **Flush**: сериализовать `dirty_set` → WAL-записи → применить через `GraphHandle::commit()` → опционально checkpoint.
 - **Параллельный доступ**: через `MvccStore` (несколько читателей lock-free, писатели через SSI-конфликты).
 
@@ -614,7 +617,7 @@ MemoryGraphHandle
 
 ### 11.1. Уровни изоляции
 
-Snapshot Isolation по умолчанию, SSI опционально, Read Committed поддержан (§17.1). Задаётся при `BEGIN ISOLATION LEVEL …`. Вне явной транзакции каждый оператор — автотранзакция.
+**Serializable (SSI) по умолчанию**; Snapshot Isolation и Read Committed — явный opt-in (§17.1). Причина доменная: под SI структурные инварианты типизированных графов (`DAG`/`TREE`/`BIPARTITE`) не выдерживаются — две конкурентные транзакции независимо проходят проверку, а их объединение нарушает инвариант. Задаётся при `BEGIN ISOLATION LEVEL …`. Вне явной транзакции каждый оператор — автотранзакция.
 
 ### 11.2. Снимок на весь запрос
 
@@ -657,46 +660,60 @@ Durability: ответ клиенту — только после fsync WAL (§1
 
 ## 12. WAL, checkpoint, recovery со стороны исполнителя
 
-Согласовано с `implementation_notes.md` и `disk_storage_spec.md` §22–§24. **Single-pass REDO, без ARIES-фаз Undo/CLR; без LSM.**
+Согласовано с `disk_storage_spec.md` §22–§24. Модель — **физический журнал из образов страниц (frame-WAL) с индексом версий**, «copy-on-write в логе». Единый журнал на **базу данных**, не на граф. Ни LSM, ни ARIES-фаз Undo/CLR.
 
-### 12.1. WAL
+### 12.1. Что видит исполнитель
 
-Логический WAL уровня транзакции. Формат записи (`disk_storage_spec.md` §22.4, как в `mvcc_persist.rs`):
+Исполнитель не пишет страницы на месте. Изменение логической страницы — это копия в scratch-фрейм и правка копии; коммит — дописать фреймы и маркер `TxCommit`, затем один `fdatasync` на всю транзакцию, сколько бы графов и файлов она ни затронула.
+
+Чтение страницы всегда параметризовано снимком:
+
 ```
-[ MVCE:4 ][ lsn:8 ][ tx_id:8 ][ kind:1 ][ payload_len:4 ][ crc32:4 ]  = 29 байт заголовка + payload
+read_page(PageKey, snapshot_lsn) =
+    самый свежий фрейм с lsn ≤ snapshot_lsn,
+    иначе страница из .fgb
+PageKey = (graph_id, file_kind, page_no)
 ```
-`crc32` покрывает `lsn‖tx_id‖kind‖payload_len‖payload`. LSN — единый монотонный `u64`. Сегменты — `wal/<lsn_hex>.wal`, ротация при `FG_WAL_SEGMENT_SIZE` (64 MiB) и всегда при checkpoint; `MultiSegmentReader` читает прозрачно через несколько файлов.
 
-`WalKind`: базовые `0x01–0x07` (Begin/Write/Delete/Commit/Abort/Checkpoint/**Meta**) — для Режима 1; для Режима 2 добавлены страничные `0x10–0x22` (`NodeAlloc`, `EdgeAlloc`, `NodeHotUpdate`, `AdjAppend`, `PropSet`, `IndexInsert`, `SchemaDef`, `PageAlloc`, `StatsUpdate`, `ChangefeedPut`, …). `WalKind::Meta` хранит `AtomMeta` → точный phantom-matching после рестарта (§3.6 impl-notes).
+Отсюда три свойства, на которые опирается исполнение:
+1. **Снимок консистентен по всей базе.** `snapshot_lsn` сравним с `commit_ts` любой транзакции любого графа, поэтому запрос над несколькими графами (`MATCH … FROM g1, g2`) читает одну версию мира. При пографовых счётчиках это было бы невыразимо: значения из разных графов попарно несравнимы.
+2. **Читатели не блокируют писателя.** Писатель дописывает фреймы, читатель смотрит на префикс журнала.
+3. **Отмена транзакции ничего не откатывает.** Отбросить scratch-фреймы и записи индекса; UNDO-лога и CLR не существует.
 
-**WAL-first инвариант** (§22.3 disk-spec): (1) WAL append → (2) грязная страница в пуле, `page_lsn = entry_lsn` → (3) на COMMIT fsync WAL → (4) страницы сбрасываются только при eviction/checkpoint и только если `page_lsn ≤ persisted_wal_lsn`. **Страница никогда не пишется раньше своей WAL-записи.**
+### 12.2. Checkpoint (бэкфилл) и его влияние на планирование
 
-> **Контракт NO-STEAL (обязателен для корректности).** Так как recovery в дисковом режиме — чистый REDO без UNDO-фазы (§12.3), buffer pool **не имеет права вытеснять на диск страницу с незакоммиченными данными** (политика NO-STEAL). Иначе оборванная/откатанная транзакция оставит изменения на диске без отката. Eviction ограничивается committed-данными; грязные страницы незавершённых tx остаются в пуле до commit/abort. (Замечание к `disk_storage_spec.md` §22.3/§23.2: политику STEAL нужно явно запретить либо добавить UNDO.)
+Checkpoint переносит **закоммиченные** фреймы обратно в `.fgb` на их штатные места, после чего обрезает журнал. Бэкфилл пографовый и планируется независимо; глобальна только обрезка:
 
-### 12.2. Checkpoint
+```
+prunable_prefix = min( min по графам(backfilled_lsn), oldest_reader_mark, oldest_active_tx_first_frame )
+```
 
-Fuzzy (не останавливает систему): flush грязных страниц по файлам → fsync каждого `.fgb` (порядок props→hot→adj→labels→schema→stats→idx) → WAL `CheckpointEnd{snapshot_lsn}` → fsync WAL → атомарное обновление `GraphSuperblock.checkpoint_lsn` (tmp→rename) → ротация WAL → `prune_before(checkpoint_lsn)`. В Режиме 1 — streaming snapshot O(1) RAM + inline compaction (carry-forward только active-tx, `implementation_notes.md` §5.3). Триггеры: `FG_CHECKPOINT_DIRTY_THRESHOLD` (0.25), `FG_CHECKPOINT_INTERVAL_SEC` (300).
+Практическое следствие для исполнителя: **долгий читатель удерживает журнал**. Многоминутный аналитический обход не даёт обрезать лог, и он растёт. Поэтому:
+- долгую аналитику следует выполнять через режим 3 (`query_to_memory`), который материализует подграф и **освобождает снимок**, а не держит его весь расчёт;
+- для чтения только отбэкфилленных данных предусмотрен checkpoint-stable режим: такой запрос не удерживает ни одного фрейма и видит состояние на последний checkpoint;
+- `FG_MAX_SNAPSHOT_AGE_SEC` принудительно закрывает устаревшие снимки, `FG_WAL_MAX_TOTAL_BYTES` форсирует бэкфилл отстающего графа.
 
 ### 12.3. Recovery
 
-**Single-pass REDO** (`implementation_notes.md` §5.5, `disk_storage_spec.md` §23.2):
-```
-1. Открыть GraphSuperblock → checkpoint_lsn (fallback .tmp, иначе FATAL).
-2. Читать WAL после checkpoint_lsn (MultiSegmentReader), один проход:
-     per_tx_ops: Map<TxId, Vec<Op>>   -- deferred apply
-     WRITE/DELETE/PROP/… → накопить в per_tx_ops[tx]  (last-write-wins по atom/page)
-     META               → per_tx_meta[tx]
-     COMMIT             → применить per_tx_ops[tx] к состоянию (REDO здесь)
-     ABORT              → отбросить per_tx_ops[tx]
-     BEGIN              → active.insert(tx)
-3. После прохода: незакоммиченные tx отброшены (UNDO не нужен при NO-STEAL, §12.1).
-4. Flush грязных + fsync всех .fgb → свежий checkpoint.
-```
-Идемпотентность REDO — через `page_lsn` (в Режиме 2: применять запись, только если `entry_lsn > page.page_lsn`; при torn-write — checksum/`page_no` mismatch → применять безусловно). Recovery = `Checkpoint + WAL + IdempotentReplay`; сложность `O(|WAL с последнего checkpoint|)`.
+Один упорядоченный проход; каталога процедур на каждый вид записи нет — применение фрейма это `memcpy`.
 
-Крэш-сценарии: до commit → tx отброшена; после commit до flush → REDO из WAL; частичная запись WAL → checksum fail → обрезать хвост.
+```
+1. db.fgb → checkpoint_lsn
+2. Проход по журналу: построить индекс версий, отметить транзакции с TxCommit,
+   отметить graph_id, удалённые записями GraphDrop
+3. Отбросить фреймы транзакций без маркера коммита  ← весь «откат»
+4. Применить закоммиченные фреймы В ПОРЯДКЕ ВОЗРАСТАНИЯ LSN
+   (пропуская удалённые графы и страницы с page_lsn ≥ lsn)
+5. fsync → свежий checkpoint
+```
 
-> **ARIES / physical-WAL** актуальны только для будущего disk-backed режима с page-level physical logging; для MVP single-pass REDO достаточен (§31.2 gql_spec, §18).
+**Порядок строго по LSN — обязателен.** Применение по порядку коммитов вместе с монотонным `page_lsn` теряет закоммиченные изменения: если транзакция с меньшим LSN коммитится позже, её правка на общей странице оказывается отфильтрована guard'ом `lsn ≤ page_lsn`. Две транзакции регулярно пересекаются на одной странице (63–102 слота на страницу, общий freelist), поэтому это не краевой случай.
+
+**Память** — `O(число фреймов)`, а не `O(объём payload)`: индекс хранит смещения, а не содержимое.
+
+### 12.4. Torn write
+
+Рваная страница обнаруживается по контрольной сумме и `page_no` и восстанавливается применением фрейма — **фрейм является полным образом**, поэтому отдельного механизма full-page-write не требуется. Единственное условие: обрезка журнала строго после `fsync` файлов данных.
 
 ---
 
@@ -733,6 +750,25 @@ Fuzzy (не останавливает систему): flush грязных с�
 - **`REBUILD INDEX`** — перестройка (актуально для HNSW после многих обновлений).
 
 Индекс тоже MVCC-aware: `(index entry, ts)`; видимость записи индекса согласована со снимком (§32.3 gql_spec).
+
+**Разделение ролей `DEFER` и bulk-сборки.** `DEFER` переносит ту же построчную работу в фон — это оптимизация **малой** дельты, а не замена массовому пути: на загрузке в сотни миллионов строк он даёт очередь того же порядка. Поэтому очередь ограничена `FG_INDEX_PENDING_MAX`, а при переполнении происходит эскалация: очередь сбрасывается, индекс помечается `stale`, планируется полная bulk-пересборка. Это crash-safe по построению — устаревший индекс всё равно строится заново из базовых данных, поэтому персистентная очередь (которая незаметно превратилась бы в L0 LSM-дерева) не нужна.
+
+### 13.4. Bulk-путь построения индексов
+
+Построчное сопровождение — правильный steady state для read-heavy нагрузки на NVMe (прецеденты-предостережения: GIN `fastupdate` и InnoDB change buffer решали проблему медленных случайных чтений на HDD, которой здесь нет). Отдельный **bulk-путь** нужен для другого сценария — загрузки и пересборки.
+
+Четыре переиспользуемых компонента (`disk_storage_spec.md` §20.13):
+
+1. **Внешняя сортировка** по непрозрачным ключам. Компаратор — `memcmp`, поскольку кодирование ключей order-preserving; сортируется `encoded_key ‖ DiskAtomRef`, что даёт тотальный порядок и попутно упорядочивает posting-списки.
+2. **Упаковщик снизу вверх** — листья по fill factor, posting-страницы, внутренние уровни. `inline_count` известен заранее, поэтому запись пишется в финальной форме и не переписывается.
+3. **Side-file + одна WAL-запись + подмена поколения.** Тело сборки не журналируется: файл недостижим из каталога, поэтому крах в процессе безвреден. Сборка индекса на 3 ГБ даёт ~200 байт журнала.
+4. **Import epoch** — отсоединённые индексы, отложенные ограничения, сегментные коммиты.
+
+Планировщик обязан задействовать bulk-путь автоматически при `DEFINE INDEX` на непустой таблице, при `REBUILD INDEX` и при `COMPACT INDEX`; `CONCURRENTLY` реализуется поверх него (снимок → сборка в side-file → добор небольшой очереди → атомарная подмена).
+
+**Отложенная проверка ограничений — условие применимости, а не оптимизация.** `VALIDATE ON_MUTATION` для `DAG` делает обход на каждое ребро, то есть `O(E·(V+E))` на загрузку; отложенная проверка — один Tarjan за `O(V+E)`. Режим импорта обязан форсировать `DEFERRED`.
+
+**Производные индексы** (reachability, neighbourhood, path) построчного сопровождения не поддерживают в принципе: одна вставка ребра может инвалидировать `Θ(n)` меток. Они объявляются снимковыми артефактами, актуальными на `build_lsn`; мутация топологии переводит их в `stale`, и планировщик молча ими не пользуется — он откатывается к `ON_DEMAND`.
 
 ---
 
@@ -817,7 +853,7 @@ Cost-based выбор при равенстве стоимостей разре�
 | Значения                               | `src/values` (`runtime/storable`, `runtime/virt`, `runtime/graph`, `storage`)                                 | Активный модуль               |
 | Граф-ядро / traversal-алгоритмы        | `fg-meta` `graph.rs`, `traversal.rs` (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA)                                  | Референс-реализация           |
 | MVCC (SI/SSI)                          | `fg-meta` `mvcc.rs` (SSI + O(1)-индексы + predicate locking)                                                  | Реализовано                   |
-| Персистентный MVCC / WAL               | `fg-meta` `mvcc_persist.rs` (single-pass REDO, segment rotation)                                              | Реализовано                   |
+| Персистентный MVCC / WAL               | `fg-meta` `mvcc_persist.rs` (логический WAL режима 1; для режима 2 — frame-WAL, §12)                                              | Реализовано                   |
 | Snapshot / store                       | `fg-meta` `store.rs`                                                                                          | Реализовано                   |
 | Direct/Async I/O, BufferPool           | `fg-meta` `io_sync`/`io_async`/`async_io`; `crates/storage_engine/io`                                         | Реализовано / каркас          |
 | PageManager / DiskMetaGraph / страницы | `crates/storage_engine` (`store`, `layout`) — `NodeRecord`/`EdgeRecord`/`PropertyRecord`, `FerrosGrynnLayout` | Каркас (по disk-spec §29–§30) |
@@ -833,7 +869,7 @@ Cost-based выбор при равенстве стоимостей разре�
 | JIT-компиляция (LLVM: expression/operator-fusion/pipeline JIT) | Не входит в контракт языка; implementation detail; после стабилизации интерпретатора |
 | Worst-Case Optimal Join (Leapfrog TrieJoin)                    | Базовый Index NL достаточен для MVP; WCOJ — для паттернов с циклами позже            |
 | Disk-backed graph-native pages (полная реализация Режима 2)    | Каркас есть; полная — большая работа, не нужна для in-memory MVP                     |
-| Physical-WAL + ARIES (Undo/CLR)                                | Только для disk-backed physical logging; single-pass REDO достаточен                 |
+| Physical-WAL + ARIES (Undo/CLR)                                | Не требуется: frame-WAL даёт те же гарантии без UNDO/CLR (§12)                 |
 | Параллельный recovery                                          | Отложено; single-pass достаточен                                                     |
 | SPDK / NVMe kernel-bypass                                      | Задел (`spdk.rs`), Linux-only, не развивается                                        |
 | SMT-верификация оптимизатора                                   | Long-term; property-based тесты как практический инструмент                          |

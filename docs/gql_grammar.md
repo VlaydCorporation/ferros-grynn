@@ -224,6 +224,9 @@ statement ::=
     | try_stmt
     | explain_stmt
     | assert_invariants_stmt
+    | import_stmt
+    | alter_index_stmt
+    | compact_stmt
     | define_stmt
     | remove_stmt
     | rebuild_stmt
@@ -285,7 +288,9 @@ continue_stmt ::= "CONTINUE"
 ### 4.5. Транзакции
 
 ```ebnf
-begin_stmt   ::= "BEGIN" [ "ISOLATION" "LEVEL" isolation_level ]
+begin_stmt   ::= "BEGIN" [ "ISOLATION" "LEVEL" isolation_level ] [ "READ" "ONLY" ]
+                 [ "EXECUTION" "MODE" execution_mode ]
+execution_mode ::= "DETERMINISTIC" | "BEST_EFFORT" | "FAST"
 isolation_level ::= "READ" "COMMITTED" | "SNAPSHOT" | "SERIALIZABLE"
 commit_stmt  ::= "COMMIT" [ "WITH" "VALIDATION" ]
 cancel_stmt  ::= "CANCEL"
@@ -302,7 +307,12 @@ explain_stmt ::= "EXPLAIN" [ "ANALYZE" | "FULL" ]
                  [ "FORMAT" ( "TEXT" | "JSON" ) ]
                  statement
 
-assert_invariants_stmt ::= "ASSERT" "INVARIANTS" [ "FOR" "GRAPH" graph_ref ]
+assert_invariants_stmt ::= "ASSERT" "INVARIANTS" [ "FOR" "GRAPH" graph_ref ] [ "REPORT" integer ]
+
+(* Массовая загрузка: эпоха импорта поверх обычного DML *)
+import_stmt  ::= "BEGIN" "IMPORT" [ "INTO" "GRAPH" name ] [ with_options ]
+                 { statement ";" }
+                 "END" "IMPORT" [ "WITH" "VALIDATION" ]
 graph_ref    ::= name | param
 ```
 
@@ -319,6 +329,7 @@ graph_ref    ::= name | param
 create_stmt ::= "CREATE" create_target_list
                 [ content_or_set ]
                 [ create_return ]
+                [ expect_clause ]
                 [ timeout_clause ]
 
 create_target_list ::= create_target { "," create_target }
@@ -344,15 +355,15 @@ update_stmt ::= "UPDATE" update_target_list
                 [ update_data ]
                 [ where_clause ]
                 [ mutate_return ]
+                [ expect_clause ]
                 [ timeout_clause ]
-                [ explain_suffix ]
 
 upsert_stmt ::= "UPSERT" update_target_list
                 [ update_data ]
                 [ where_clause ]                (* WHERE или явный ID обязателен для UPSERT *)
                 [ mutate_return ]
+                [ expect_clause ]
                 [ timeout_clause ]
-                [ explain_suffix ]
 
 update_target_list ::= target { "," target }
 
@@ -379,8 +390,8 @@ mutate_return ::= "RETURN" "NONE"
 delete_stmt ::= "DELETE" target_list
                 [ where_clause ]
                 [ mutate_return ]
+                [ expect_clause ]
                 [ timeout_clause ]
-                [ explain_suffix ]
 ```
 
 ### 5.4. RELATE
@@ -390,6 +401,7 @@ relate_stmt ::= "RELATE" ( relate_binary | relate_hyper )
                 [ "WEIGHTED" expr ]
                 [ content_or_set ]
                 [ mutate_return ]
+                [ expect_clause ]
                 [ timeout_clause ]
 
 relate_binary ::= relate_endpoint edge_dir_left edge_atom edge_dir_right relate_endpoint
@@ -416,7 +428,8 @@ hyper_headtail ::= "(" "head" ":" expr "," "tail" ":" array_lit ")"
 ## 6. MATCH и паттерны графа
 
 ```ebnf
-match_stmt ::= "MATCH" [ match_cardinality ] [ atom_kw ] [ match_scope ]
+match_stmt ::= "MATCH" [ match_cardinality ] [ match_mode ] [ atom_kw ] [ match_scope ]
+               [ constraints_clause ]
                match_pattern_list
                [ from_clause ]
                [ where_clause ]
@@ -429,7 +442,8 @@ match_stmt ::= "MATCH" [ match_cardinality ] [ atom_kw ] [ match_scope ]
                [ keep_clause ]
                [ match_return ]
 
-match_cardinality ::= "OPTIONAL" | "DISTINCT" | "ISOMORPHIC"
+match_cardinality ::= "OPTIONAL" | "DISTINCT"
+match_mode        ::= "REPEATABLE" "ELEMENTS" | "DIFFERENT" "EDGES" | "DIFFERENT" "ATOMS"
 atom_kw           ::= "ATOM"                        (* включает AtomWalk-режим *)
 match_scope       ::= "HYPER" | "META" | "METAVERTEX" | "METAEDGE"
 
@@ -447,7 +461,11 @@ return_item      ::= expr [ "AS" alias ]
 ### 6.1. Паттерны вершин и рёбер
 
 ```ebnf
-graph_pattern ::= node_pattern { edge_pattern node_pattern }
+graph_pattern ::= pattern_term { edge_pattern pattern_term }
+
+(* Вложенность в мета-атомы: читается слева направо, от листа к корню *)
+pattern_term  ::= node_pattern { within_op node_pattern }
+within_op     ::= "WITHIN" [ "*" "[" [ integer ] ".." [ integer ] "]" ]
 
 node_pattern  ::= "(" [ alias ] [ ":" label_expr ] [ node_filter ] ")"
                 | meta_vertex_pattern
@@ -667,6 +685,7 @@ define_table_index ::= "DEFINE" "INDEX" [ overwrite_or_ifne ] name
                        [ table_index_kind ]
                        [ "COMMENT" string_lit ]
                        [ "CONCURRENTLY" ]
+                       [ with_options ]
                        [ "DEFER" ]
 
 table_index_kind ::=
@@ -675,6 +694,7 @@ table_index_kind ::=
     | "FULLTEXT" "ANALYZER" name [ "BM25" [ "(" number_lit "," number_lit ")" ] ] [ "HIGHLIGHTS" ]
     | "HNSW" "DIMENSION" integer [ "TYPE" vector_type ] [ "DIST" distance ]
              [ "EFC" integer ] [ "M" integer ]
+    | "GEOMETRY" [ "TYPE" name ]
 vector_type ::= "F64" | "F32" | "I64" | "I32" | "I16"
 distance    ::= "COSINE" | "EUCLIDEAN" | "MANHATTAN" | "MINKOWSKI" | fn_name
 
@@ -687,6 +707,7 @@ define_graph_index ::= "DEFINE" "INDEX" [ overwrite_or_ifne ] name
                        [ "PATTERNS" expr ]
                        [ "COMMENT" string_lit ]
                        [ "CONCURRENTLY" ]
+                       [ with_options ]
                        [ "DEFER" ]
 
 graph_index_kind ::=
@@ -712,7 +733,7 @@ define_analyzer ::= "DEFINE" "ANALYZER" [ overwrite_or_ifne ] name
 tokenizer_list ::= tokenizer { "," tokenizer }
 tokenizer      ::= "blank" | "camel" | "class" | "punct"
 filter_list    ::= filter { "," filter }
-filter         ::= "ascii" | "lowercase" | "uppercase"
+filter         ::= "ascii" | "lowercase" | "uppercase" | "nfc" | "nfkc"
                  | "edgengram" "(" integer "," integer ")"
                  | "ngram" "(" integer "," integer ")"
                  | "snowball" "(" ident ")"
@@ -769,11 +790,24 @@ show_changes_stmt ::= "SHOW" "CHANGES" "FOR" "TABLE" name
 kill_stmt ::= "KILL" ( param | expr )
 
 rebuild_stmt ::= "REBUILD" "INDEX" [ if_exists ] name "ON" [ "TABLE" ] name
+                 [ "CONCURRENTLY" ] [ with_options ]
+
+alter_index_stmt ::= "ALTER" "INDEX" name "SET" ( "ENABLED" | "DISABLED" | "READ_ONLY" )
+
+compact_stmt ::= "COMPACT" ( "INDEX" name | "GRAPH" name ) [ "CONCURRENTLY" ]
+
+(* Общий блок опций сборки: FILL_FACTOR, SORT_MEM, PARALLELISM, ... *)
+with_options ::= "WITH" "(" option_assign { "," option_assign } ")"
+option_assign ::= ident "=" expr
 
 live_select_stmt ::= "LIVE" "SELECT" live_projection
                      "FROM" target_list
                      [ where_clause ]
                      [ fetch_clause ]
+                     [ "SINCE" ( param | integer | datetime_lit ) ]
+                     [ "ON" "OVERFLOW" overflow_policy ]
+                     [ "BUFFER" integer ]
+overflow_policy  ::= "GAP" | "DISCONNECT" | "BLOCK"
 live_projection ::= [ "VALUE" ] select_field_list [ "AS" alias ]
                   | "DIFF"
                   | "PATCH"
@@ -799,7 +833,6 @@ select_stmt ::= "SELECT" [ "ONLY" ] select_projection
                 [ fetch_clause ]
                 [ timeout_clause ]
                 [ "TEMPFILES" ]
-                [ explain_suffix ]
 
 select_projection ::= "VALUE" select_field [ omit_clause ]
                     | select_field_list [ omit_clause ]
@@ -836,6 +869,7 @@ nulls_pos    ::= "NULLS" ( "FIRST" | "LAST" )
 
 limit_clause ::= "LIMIT" [ "BY" ] ( integer | param )
 start_clause ::= "START" [ "AT" ] ( integer | param )
+              | "START" "AFTER" ( param | expr )          (* keyset-курсор *)
 
 fetch_clause ::= "FETCH" idiom_list
 omit_clause  ::= "OMIT" idiom_list
@@ -844,7 +878,9 @@ timeout_clause ::= "TIMEOUT" ( duration_lit | param )
 keep_clause    ::= ( "KEEP" "LEVELPATH" ) [ "FOR" alias_list ]
 alias_list     ::= alias { "," alias }
 
-explain_suffix ::= "EXPLAIN" [ "FULL" ]
+expect_clause  ::= "EXPECT" ( expr | "EXISTS" | "NOT" "EXISTS" )
+
+(* EXPLAIN — только префиксный оператор (§4.6); суффиксной формы нет *)
 
 target ::= record_range | record_id | table_name | param
          | "(" statement ")"          (* подзапрос / (MATCH ...) / (SELECT ...) *)
@@ -898,7 +934,7 @@ equality_op    ::= "=" | "IS" | "!=" | "NOT" "IS" | "?=" | "*="
                  | "IN" | "NOT" "IN" | "ALLIN" | "ANYIN" | "NONEIN"
 comparison_op  ::= "<" | ">" | "<=" | ">="
                  | knn_op | fulltext_op | geo_op | contains_op
-knn_op         ::= "<|" expr [ "," ( ident | expr ) ] "|>"
+knn_op         ::= "<|" expr [ "," ( ident | "EF" expr ) ] "|>"
 fulltext_op    ::= "@@" | "@" integer "@" | "@AND@" | "@OR@"
 geo_op         ::= "INSIDE" | "NOTINSIDE" | "ALLINSIDE" | "ANYINSIDE" | "NONEINSIDE"
                  | "OUTSIDE" | "INTERSECTS"
@@ -1047,7 +1083,7 @@ composite_type ::=
 type_list ::= type { "," type }
 table_ref ::= name
 
-utility_type ::= "computed" "<" type ">" | "formatter" | "matcher"
+utility_type ::= "computed" "<" type ">" | "formatter" | "matcher" | "cursor"
 
 domain_type ::=
       ( "vertex" | "metavertex" | "edge" | "hyperedge" | "metaedge" | "atom" )
@@ -1072,7 +1108,7 @@ domain_type ::=
 `SET`, `UNSET`, `MERGE`, `PATCH`, `REPLACE`, `RETURN`, `NONE`, `BEFORE`, `AFTER`, `DIFF`, `WEIGHTED`, `HYPER`,
 `TARGETS`, `AS`, `DIRECTED`, `UNDIRECTED`, `BOTH`.
 
-**Паттерн-матчинг / traversal:** `MATCH`, `OPTIONAL`, `DISTINCT`, `ISOMORPHIC`, `ATOM`, `META`, `METAVERTEX`,
+**Паттерн-матчинг / traversal:** `MATCH`, `OPTIONAL`, `DISTINCT`, `ATOM`, `META`, `METAVERTEX`,
 `METAEDGE`, `CONTAINS`, `START`, `END`, `CONSTRAINTS`, `MAXDEPTH`, `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC`,
 `SHORTEST`, `METAVERTICES`, `METAEDGES`, `HYPEREDGES`, `CROSS_LEVEL`, `CROSS-LEVEL`, `COST`, `TRAVERSE`,
 `KEEP`, `LEVELPATH`.
@@ -1098,6 +1134,16 @@ domain_type ::=
 
 **Clause-модификаторы:** `BY`, `ALL`, `ASC`, `DESC`, `COLLATE`, `NUMERIC`, `NULLS`, `FIRST`, `LAST`, `AT`,
 `NOINDEX`.
+
+**Морфизм и путь:** `REPEATABLE`, `ELEMENTS`, `DIFFERENT`, `EDGES`, `ATOMS`, `WITHIN`.
+
+**Условная запись и импорт:** `EXPECT`, `IMPORT`, `VALIDATION`, `REPORT`.
+
+**Пагинация и подписки:** `AFTER`, `SINCE`, `OVERFLOW`, `BUFFER`, `GAP`, `DISCONNECT`, `BLOCK`.
+
+**Режимы исполнения:** `EXECUTION`, `MODE`, `DETERMINISTIC`, `BEST_EFFORT`, `FAST`, `ONLY`.
+
+**Обслуживание индексов:** `ALTER`, `COMPACT`, `ENABLED`, `DISABLED`, `READ_ONLY`, `GEOMETRY`.
 
 **Литералы:** `true`, `false`, `null`, `none`.
 

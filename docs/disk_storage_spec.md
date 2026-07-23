@@ -69,7 +69,7 @@
 | Идемпотентное восстановление    | `pageLSN` в каждой странице — REDO применяется только если `entry_lsn > page_lsn` |
 | Direct I/O                      | Все файлы открываются с O_DIRECT/F_NOCACHE/FILE_FLAG_NO_BUFFERING                 |
 | Атомарность суперблоков         | Запись через tmp + rename                                                         |
-| Стабильный дисковый ID          | `DiskAtomRef = u32` (kind-бит + slot-индекс, без поколения)                       |
+| Стабильный дисковый ID          | `DiskAtomRef = u64` (kind-бит + 40-битный slot-индекс, без поколения)             |
 | RecordId                        | Публичный идентификатор записи отделён от внутреннего AtomId                      |
 
 ### 1.3. Что требует изменения в кодовой базе
@@ -136,10 +136,10 @@ Mode 3: Hybrid                                  (поверх Mode 2)
 | 0x03 | `bool (true)`               | Логическое                           | 1 байт                     |
 | 0x04 | `int`                       | i64                                  | 2..11 байт (LEB128 zigzag) |
 | 0x05 | `float`                     | f64 IEEE 754                         | 9 байт                     |
-| 0x06 | `decimal`                   | Произвольная точность (128-bit)      | 17 байт                    |
+| 0x06 | `decimal`                   | i128 мантисса + scale (Arrow-совместимо) | 18 байт                |
 | 0x07 | `string`                    | UTF-8                                | 1+len(uLEB128)+N байт      |
 | 0x08 | `bytes`                     | Произвольные байты                   | 1+len(uLEB128)+N байт      |
-| 0x09 | `datetime`                  | RFC 3339 + timezone                  | 1+8+4+tz байт              |
+| 0x09 | `datetime`                  | RFC 3339 + timezone                  | 1+8+4+4 байт               |
 | 0x0A | `duration`                  | Временной интервал (знаковый)        | 3..18 байт (переменная)    |
 | 0x0B | `uuid`                      | UUID v7 (128 бит)                    | 17 байт                    |
 | 0x0C | `ulid`                      | ULID (128 бит)                       | 17 байт                    |
@@ -179,15 +179,31 @@ Mode 3: Hybrid                                  (поверх Mode 2)
 
 ### 3.3. Decimal (фиксированная высокая точность)
 
-Используется формат **IEEE 754-2008 decimal128** (16 байт): coefficient + exponent + sign.
-Это даёт:
-- Точность: 34 значимых десятичных цифры.
-- Диапазон: ±9.999...×10^6144.
-- Поддержку NaN, ±Infinity, ±0.
+Используется формат **coefficient + scale** (модель Arrow/Parquet `Decimal128`, она же `DECIMAL` в DuckDB и `Decimal128` в ClickHouse), а **не** IEEE 754-2008 decimal128.
 
-На диске: тег(1) + 16 байт little-endian = 17 байт.
+**Почему не decimal128.** В экосистеме Rust нет ни одной пригодной чисто-Rust реализации IEEE 754-2008 decimal128. Все существующие — обёртки над C-библиотеками decNumber / Intel DFP (`dec`, `decimal`, `dfp-number`); `decmathlib-rs` заархивирован автором; `decstr` — кодек без арифметики. Зависимость от C противоречит требованиям проекта, поэтому требование decimal128 снимается.
 
-Реализация в Rust: крейт `rust_decimal` или `bigdecimal` для расширенной точности.
+**Runtime-тип: `rust_decimal::Decimal`** (16 байт: 96-битная мантисса + знак + масштаб).
+
+- Точность: **28 значащих десятичных цифр** (29 частично).
+- Диапазон: `±7.9228162514264337593543950335 × 10²⁸`; минимальное ненулевое `1e-28`.
+- Масштаб: `0..=28`; положительной экспоненты нет.
+- **NaN и ±Infinity не поддерживаются** — это соответствует семантике `NUMERIC` в SQL/GQL. Арифметическое переполнение возвращает ошибку, а не `Inf`.
+- `-0` нормализуется в `0`; `Eq`/`Ord` не зависят от масштаба (`1.0 == 1.00`), а `Hash` нормализует значение — это требуется для `set<T>` и unique-индексов, иначе одно и то же число попало бы в множество дважды.
+
+**Дисковый формат намеренно шире runtime-типа:**
+
+```
+decimal → 0x06 + mantissa: i128 (16 байт LE, дополнительный код) + scale: u8   = 18 байт
+```
+
+Мантисса `i128` даёт 38 цифр против 28 у runtime-типа. Запас сделан осознанно:
+- замена реализации decimal (на другой крейт или на собственный тип) не потребует миграции файлов;
+- байты мантиссы **побайтово совпадают** с элементом Arrow `Decimal128Array`, поэтому колоночный кэш свойств (§13.6) строится обычным `memcpy`, без переформатирования.
+
+Запись выполняется как `(d.mantissa() as i128, d.scale() as u8)` — экспорт всегда точен, поскольку 96-битная мантисса заведомо помещается в `i128`. Чтение — `Decimal::try_from_i128_with_scale(m, s)`; значение с `|mantissa| ≥ 2⁹⁶` (такое может быть записано только более поздней версией движка) возвращает ошибку `DecimalPrecisionExceeded`, а не молча теряет точность.
+
+Крейт: `rust_decimal 1.42` (пин на минорную версию: в `master` идёт несовместимая разработка 2.0). Публичный API движка не должен раскрывать типы крейта наружу — тонкий newtype оставляет замену дешёвой.
 
 ### 3.4. DateTime и Duration
 
@@ -201,11 +217,11 @@ Mode 3: Hybrid                                  (поверх Mode 2)
 - `0` = UTC (по умолчанию)
 - `1 .. 999_999` = ID пояса в IANA timezone dictionary (§16, отдельная секция).
 Хватит на любые пополнения tzdb (2024 год: ~600 поясов).
-- `1_000_000 .. 1_172_799` = Фиксированное UTC-смещение.
+- `1_000_000 ..1_172_798` = Фиксированное UTC-смещение.
 Декодирование: offset_seconds = tz_id − 1_000_000 − 86_399 (86_399 — сдвиг для представления отрицательных смещений).
-Диапазон: `−86_399 .. +86_399` секунд (≈ ±24 ч с запасом). Реальный диапазон UTC-смещений: `−43_200 .. +50_400` с.
+Диапазон: `−86_399 .. +86_400` секунд (≈ ±24 ч с запасом). Реальный диапазон UTC-смещений: `−43_200 .. +50_400` с.
 
-Итоговый размер DateTime на диске: `тег(1) + header(2) + [uLEB128 per unit × 0..10] = 3..22 байт`.
+Итоговый размер DateTime на диске: `тег(1) + i64 + 32 + u32 = 17 байт`.
 
 Реализация: крейт `jiff` (`Timestamp` + `TimeZone`).
 
@@ -244,8 +260,6 @@ header: u16
 попытка сохранить Span с разными знаками компонент приведёт к ошибке валидации.
 
 Это совпадает с `jiff::Span` (гражданское время, не физическое).
-
-На диске: DateTime = тег(1) + i64 + u32 + u32 = 17 байт; Duration = тег(1) + i32 + i32 + i64 = 17 байт.
 
 ### 3.5. Geometry (GeoJSON-совместимый)
 
@@ -301,7 +315,7 @@ GQL определяет доменные типы для атомов и стр
 | 0x37 | `graph`          | Ссылка на подграф                     | 1 + 8 байт      |
 
 Кодирование:
-- `atom → tag(u8) + DiskAtomRef(u32)`
+- `atom → tag(u8) + DiskAtomRef(u64)`
 - `graph → tag(u8) + sg_slot(u32) + sg_gen(u32)`
 
 **Семантика**: тег кодирует тип (атом или граф), разделение атомов происходит на уровне валидации схемы по kind-биту; 
@@ -336,7 +350,7 @@ struct QualifiedAtomRef {
 Обычная ссылка `atom_ref` не изменяется — используется для атомов в том же графе; `qualified_atom_ref` — явный маркер кросс-уровневого адреса.
 
 При чтении `EdgeHotSlot.inv_inline[i]`:
-- Если bit 31 = 0 (DiskAtomRef.kind=Node) или 1 (kind=Edge) без флага `HAS_QUALIFIED` — обычный DiskAtomRef.
+- Если bit 31 = 0 (DiskAtomRef.kind=Node) или 1 (kind=Edge) без флага `CROSS_LEVEL` — обычный DiskAtomRef.
 - Если `EdgeHotSlot.flags.CROSS_LEVEL = 1` — inv/out inline хранят QualifiedAtomRef своих endpoint'ов.
 
 ---
@@ -422,7 +436,7 @@ bool (false)        →  0x02
 bool (true)         →  0x03
 int                 →  0x04 + i64(zigzag LEB128)
 float               →  0x05 + f64(8 байт LE)
-decimal             →  0x06 + 16 байт (decimal128 LE)
+decimal             →  0x06 + mantissa i128 (16 байт LE) + scale u8       (18 байт)
 string              →  0x07 + len(uLEB128) + utf8_bytes
 bytes               →  0x08 + len(uLEB128) + raw_bytes
 datetime            →  0x09 + i64(seconds LE) + u32(nanos LE) + u32(tz_id LE)
@@ -438,7 +452,7 @@ option              →  0x15 + 0x00 (none) | 0x15 + 0x01 + Value
 range               →  0x16 + flags(u8) + [lo: Value] + [hi: Value]
 point               →  0x21 + f64(lon LE) + f64(lat LE)
 linestr             →  0x22 + count(u32 LE) + [f64 lon + f64 lat]×count
-polygon             →  0x23 + ring_count(u16 LE) + [count(u32 LE) + [f64×2]×count]×ring_count
+polygon             →  0x23 + ring_count(u32 LE) + [count(u32 LE) + [f64×2]×count]×ring_count
 multipt             →  0x24 + count(u32 LE) + [f64×2]×count
 multiline           →  0x25 + count(u32 LE) + [linestring_body]×count
 multipoly           →  0x26 + count(u32 LE) + [polygon_body]×count
@@ -515,6 +529,12 @@ STORAGE_FORMAT_VERSION = 1
     ns.fgb                              -- суперблок namespace
     <database>/
       db.fgb                            -- суперблок БД: format_version, last_back_compat_version,
+                                        --               глобальные LSN/TxId/CommitTs, каталог графов
+      wal/
+        <lsn_hex>.wal                   -- ЕДИНЫЙ журнал уровня БД (frame-WAL, §22)
+      snapshot/
+        <lsn_hex>.snap                  -- снимки MVCC (режим 1)
+      mvcc.chk                          -- CheckpointHeader
       schema/
         catalog.fgb                   -- SchemaCatalog root
         tables.fgb                    -- DEFINE TABLE definitions
@@ -569,12 +589,28 @@ STORAGE_FORMAT_VERSION = 1
             freelist_ee_endpoint.fgb
         changefeed/
           <table_id>_<since_lsn>.fcf    -- changefeed log segments
-        wal/
-          <lsn_hex>.wal                 -- WAL сегменты
-        snapshot/
-          <lsn_hex>.snap                -- MVCC snapshots
-        mvcc.chk                        -- CheckpointHeader
 ```
+
+### 7.1. Домен журналирования — база данных, а не граф
+
+Журнал (`wal/`), снимки и `CheckpointHeader` лежат на уровне **базы данных**, а не отдельного графа. Это следствие двух независимых требований.
+
+**1. Глобальные часы обязательны для кросс-граф чтения.** Видимость версии — `version.commit_ts ≤ snapshot_ts`. Если бы `commit_ts` выдавался локально для графа, счётчики двух графов были бы попарно **несравнимы**, и предикат видимости для версии из другого графа не имел бы смысла. Кросс-граф чтение (`MATCH ... FROM g1, g2`, `BUILD GRAPH x FROM MATCH ... FROM y`) — штатная возможность языка, поэтому глобальные `LSN` / `TxId` / `CommitTs` нужны в любом случае. А раз единая точка сериализации уже оплачена, per-graph журналы не дают ничего — они лишь отбирают атомарность, которая при едином журнале достаётся бесплатно.
+
+**2. Каталоги уровня БД не помещаются ни в один per-graph журнал.** `schema/*`, список графов и сам `db.fgb` общие для всех графов. `DEFINE GRAPH`, `BUILD GRAPH <name>`, `REMOVE GRAPH` создают или удаляют каталог графа и правят `db.fgb`: в момент создания журнала графа ещё нет, в момент удаления — уже нет. Атомарно это выразимо только в журнале уровня БД.
+
+Следствия:
+- Транзакция атомарна над любым числом графов и таблиц одной БД; один коммит — один `fsync` независимо от числа затронутых графов ([gql_spec §17.7](gql_spec.md)).
+- Транзакция **не может** охватывать две БД или два namespace — отвергается статически.
+- `SYSTEM_GRAPH_ID = 0` — системное пространство: каталог схемы, каталог графов, параметры, функции и таблицы, объявленные без указания графа.
+- Бэкфилл (перенос фреймов в `.fgb`) остаётся **пографовым** и планируется независимо; глобальной является только обрезка журнала (§23.1).
+- Отделение графа в самостоятельный набор файлов (`DETACH GRAPH`) требует предварительного бэкфилла до состояния покоя — это административная операция, не бесплатная.
+
+### 7.2. Каталог графов
+
+`db.fgb` содержит не только счётчик `graph_count`, но и сам список графов: `(graph_id: u64, name: [u8; 128], flags: u32, created_lsn: u64)`. Создание и удаление графа журналируются записями `GraphCreate` / `GraphDrop` (§22.1).
+
+Запись `GraphDrop` обязательна: при восстановлении фреймы, адресующие удалённый `graph_id`, должны отбрасываться, иначе воспроизведение упрётся в отсутствующий файл. Физическое удаление каталога графа откладывается до момента, когда запись `GraphDrop` durable и старше самого раннего живого читателя.
 
 **Расширения файлов:**
 
@@ -640,8 +676,8 @@ Total = 32 байт
 0x0005  EdgeHot             
 0x0006  AdjacencyOverflow
 0x0007  CrossLevelAdjacencyOverflow
-0x0008  EdgeIncidencePage
-0x0009  CrossLevelEdgeIncidencePage
+0x0008  EdgeIncidence
+0x0009  CrossLevelEdgeIncidence
 0x000A  PropHeap            
 0x000B  PropLargeHeap      
 0x000C  SubgraphDir         
@@ -713,38 +749,62 @@ Total = 32 байт
 
 ## 9. DiskAtomRef — стабильный дисковый идентификатор
 
-`AtomId` (u64 из `id.rs`) содержит поколение (gen, биты 63..32) — runtime-концепция для генерационной инвалидации.
+`AtomId` (u64 из `id.rs`) содержит поколение (gen) — runtime-концепция для генерационной инвалидации.
 На диске поколение избыточно: оно хранится внутри hot-слота и восстанавливается при загрузке.
 
-**DiskAtomRef = u32**
+### 9.1. Разрядность
+
+**AtomId = u64**
 
 ```
-бит  31       kind        0=Node, 1=Edge
-биты 30..0    slot_index  u31 (до 2 147 483 648 на каждый kind)
+биты 63..41   gen         u23  (8 388 608 поколений на слот)
+бит  40       kind        0=Node, 1=Edge
+биты 39..0    slot_index  u40  (1 099 511 627 776 слотов на каждый kind)
 ```
 
-Null-значение: `NULL_DISKATOMREF = u32::MAX = 0xFFFF_FFFF`
+**DiskAtomRef = u64** — то же, без поколения:
+
+```
+бит  40       kind        0=Node, 1=Edge
+биты 39..0    slot_index  u40
+биты 63..41   зарезервированы, при записи нули
+```
+
+Null-значения: `NULL_DISKATOMREF = u64::MAX`, `NULL_SLOT = 0xFF_FFFF_FFFF` (все 40 бит slot_index).
+
+**Почему u40, а не u31.** Прежний `u31` давал потолок ~2.1 млрд атомов каждого вида на граф — мало для движка, заявленного как универсальный метаграфовый на масштабе. u40 даёт ~1.1 трлн, что заведомо перекрывает любой граф, помещающийся на одну машину, и при этом `AtomId` остаётся ровно `u64`: расширение до `u128` удвоило бы размер handle и ударило по кэш-локальности SoA — той самой, ради которой выбрана раскладка «горячее отдельно от холодного».
+
+**Адресация не переполняется.** При `slot_index` до 2⁴⁰ номер страницы `page_no = slot / 102` не превосходит ≈1.08·10¹⁰, что укладывается в `u64` с запасом (≈285 ТБ при 16 КиБ на страницу). Пространства имён `label_id`, `table_id`, `key_id`, `sg_slot` остаются `u32` — они нумеруют метки, таблицы, ключи и подграфы, а не атомы, и с числом атомов не связаны.
 
 ```rust
+const KIND_SHIFT: u32 = 40;
+const SLOT_MASK:  u64 = (1 << 40) - 1;
+
 // AtomId → DiskAtomRef
 fn to_disk_ref(id: AtomId) -> DiskAtomRef {
-    let slot = id.slot() as u32;        // bits 30..0
-    let kind = id.is_edge() as u32;     // bit 31
-    (kind << 31) | slot
+    ((id.is_edge() as u64) << KIND_SHIFT) | (id.slot() & SLOT_MASK)
 }
 
 // DiskAtomRef → AtomId (требует восстановленного поколения из hot-слота)
 fn from_disk_ref(r: DiskAtomRef, gen: u32) -> AtomId {
-    let slot = r & 0x7FFF_FFFF;
-    if (r >> 31) == 0 { AtomId::new_node(slot, gen) } else { AtomId::new_edge(slot, gen) }
+    let slot = r & SLOT_MASK;
+    if (r >> KIND_SHIFT) & 1 == 0 { AtomId::new_node(slot, gen) } else { AtomId::new_edge(slot, gen) }
 }
 ```
+
+### 9.2. Переполнение поколений
+
+Поколение занимает 23 бита — 8 388 608 переиспользований одного слота. Достижение этого предела маловероятно, но должно иметь определённое поведение, а не приводить к ABA (когда устаревший `AtomId` внезапно снова становится валидным и указывает на чужой атом).
+
+**Стратегия — retirement слота.** Слот, поколение которого достигло `GEN_MAX`, при освобождении **не возвращается** во freelist и больше не выделяется. Он остаётся помеченным как tombstone до полного дефрагментирования (§24.3), которое переназначает слоты и обнуляет поколения.
+
+Отказ вырождается в микро-утечку одного слота вместо нарушения корректности. Счётчик выбывших слотов доступен через `INFO`; систематический рост — сигнал, что рабочая нагрузка пересоздаёт атомы в одних и тех же слотах и стоит запланировать дефрагментацию.
 
 ---
 
 ## 10. NodeHotPage — горячие данные вершин
 
-### 10.1. NodeHotSlot (256 байт, фиксированный)
+### 10.1. NodeHotSlot (160 байт, фиксированный)
 
 ```
 Offset  Size  Тип        Поле             Описание
@@ -752,29 +812,33 @@ Offset  Size  Тип        Поле             Описание
 4       4     u32        subgraph_slot    GraphId.index() если is_meta; NULL_SLOT иначе
 8       4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
 12      4     u32        table_id         Таблица, которой принадлежит запись; NULL_TABLE = нет
-16      2     u16        adj_out_count    Общее кол-во исходящих рёбер (inline + overflow)
-18      2     u16        adj_in_count     Общее кол-во входящих рёбер
-20      2     u16        adj_undir_count  Общее кол-во неориентированных рёбер
-22      1     u8         kind_flags       Биты: [7]=is_meta; [6]=tombstone; [5]=visited;
+16      4     u32        adj_out_count    Общее кол-во исходящих рёбер (inline + overflow)
+20      4     u32        adj_in_count     Общее кол-во входящих рёбер
+24      4     u32        adj_undir_count  Общее кол-во неориентированных рёбер
+28      1     u8         kind_flags       Биты: [7]=is_meta; [6]=tombstone; [5]=visited;
                                           [4]=port; [3]=in_result; [2]=cut_vertex; [1]=reserved
-23      1     u8         _pad                                     
-24      8     u64        overflow_out     page_no overflow для out; NULL_PAGE = нет
-32      8     u64        overflow_in      page_no overflow для in
-40      8     u64        overflow_undir   page_no overflow для undirected
-48      8     u64        props_page       page_no в props.fgb; NULL_PAGE = нет
-56      4     u32        props_slot       Индекс слота в SlotDirectory PropHeapPage
-60      4     u32        props_len        Длина сериализованного PropertyMap
-64      64    [u32; 16]  adj_out          Inline исходящие: edge slot indices; NULL_SLOT = конец
-128     64    [u32; 16]  adj_in           Inline входящие
-192     32    [u32;  8]  adj_undir        Inline неориентированные
-224     32    —          _reserved        Зарезервировано (выравнивание до 256 байт); обнулить при записи
-Total = 256 байт
+29      3     u8[3]      _pad
+32      8     u64        overflow_out     page_no overflow для out; NULL_PAGE = нет
+40      8     u64        overflow_in      page_no overflow для in
+48      8     u64        overflow_undir   page_no overflow для undirected
+56      8     u64        props_page       page_no в props.fgb; NULL_PAGE = нет
+64      4     u32        props_slot       Индекс слота в SlotDirectory PropHeapPage
+68      4     u32        props_len        Длина сериализованного PropertyMap
+72      8     —          _reserved        Выравнивание массивов смежности на 16 байт
+80      32    [u64; 4]   adj_out          Inline исходящие: DiskAtomRef рёбер; NULL_SLOT = конец
+112     32    [u64; 4]   adj_in           Inline входящие
+144     16    [u64; 2]   adj_undir        Inline неориентированные
+Total = 160 байт
 ```
+
+**Почему инлайн 4, а не 16.** Прежние `[u32;16]` были перенесены из in-memory представления (`SmallVec<[u32;16]>`), где размер подобран под кэш-линию. Для диска оптимум другой: степенны́е распределения означают, что у подавляющего большинства вершин степень 1–3, поэтому при инлайне 16 бо́льшая часть слота — пустые `NULL_SLOT`, а хабы всё равно уходят в overflow. Инлайн 4 покрывает типичную вершину целиком и втрое уплотняет страницу (102 слота вместо 63) при том же поведении на хабах.
+
+**Почему счётчики u32, а не u16.** `u16` ограничивал степень вершины 65 535, что противоречит §12, где разбирается пример со степенью 100 000, и заведомо мало для хабов.
 
 **Инварианты:**
 
 - Если `kind_flags.tombstone = 1`, остальные поля не гарантированы (кроме `gen`).
-- Если `adj_out_count > 16`, первая overflow-страница: `overflow_out`.
+- Если `adj_out_count > 4`, первая overflow-страница: `overflow_out`.
 - `adj_out[]` заполняется с индекса 0; `NULL_SLOT` — конец inline части.
 - `table_id` используется планировщиком для быстрой фильтрации по таблице.
 
@@ -783,28 +847,27 @@ Total = 256 байт
 ```
 Offset   Size   Содержимое
 0        32     PageHeader (magic=MAGIC_NODE_HOT, type=NodeHot)
-32       16128  63 × NodeHotSlot (63 × 256 = 16128)
-16160    224    _padding
+32       16320  102 × NodeHotSlot (102 × 160 = 16320)
+16352    32     _padding
 Total = PAGE_SIZE байт
 ```
 
-**Слотов на страницу:** 63  
-**Покрытие:** NodeHotPage[k] содержит слоты `[63k .. 63k+62]`.  
-**Смещение слота:** `page_header_size + slot_within_page * 256`
+**Слотов на страницу:** 102  
+**Покрытие:** NodeHotPage[k] содержит слоты `[102k .. 102k+101]`.
 
 **Адресация:**
 
 ```
-page_no          = slot_index / 63
-slot_within_page = slot_index % 63
-byte_offset      = 32 + slot_within_page × 256
+page_no          = slot_index / 102
+slot_within_page = slot_index % 102
+byte_offset      = 32 + slot_within_page × 160
 ```
 
 ---
 
 ## 11. EdgeHotPage — горячие данные рёбер
 
-### 11.1. EdgeHotSlot (128 байт, фиксированный)
+### 11.1. EdgeHotSlot (160 байт, фиксированный)
 
 ```
 Offset  Size  Тип        Поле             Описание
@@ -820,66 +883,74 @@ Offset  Size  Тип        Поле             Описание
                                             bit 5: IN_RESULT
                                             bit 6: CROSS_LEVEL   -- endpoint в другом подграфе
                                             bit 7: _reserved
-2       1     u8         inv_count        Кол-во invertex конечных точек (total, ≤4 inline)
-3       1     u8         out_count        Кол-во outvertex конечных точек (total, ≤4 inline)
-4       4     u32        gen              Поколение
-8       4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
-12      4     u32        table_id         Таблица (для RELATION-таблиц)
-16      8     f64        weight           NaN = нет веса
-24      4     u32        transition_gid   GraphId.index() для MetaEdge; NULL_SLOT = нет
-28      1     u8         edge_kind_ext    Расширенная классификация:
+2       1     u8         edge_kind_ext    Расширенная классификация:
                                             bit 0: HAS_TRANSITION   -- transition_gid != NULL_SLOT
                                             bit 1: HAS_INCIDENCES   -- inc_page != NULL_PAGE
                                             bits 2-7: reserved (0)
-29      3     u8[3]      _pad
-32      16    [u32; 4]   inv_inline       Inline invertex: DiskAtomRef (QualifiedAtomRef при CROSS_LEVEL)
-48      16    [u32; 4]   out_inline       Inline outvertex: DiskAtomRef (QualifiedAtomRef при CROSS_LEVEL)
+3       1     u8         _pad
+4       4     u32        gen              Поколение
+8       4     u32        inv_count        Кол-во invertex конечных точек (total, ≤2 inline)
+12      4     u32        out_count        Кол-во outvertex конечных точек (total, ≤2 inline)
+16      4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
+20      4     u32        table_id         Таблица (для RELATION-таблиц)
+24      8     f64        weight           NaN = нет веса
+32      4     u32        transition_gid   GraphId.index() для MetaEdge; NULL_SLOT = нет
+36      4     u32        inv_sg_slot      GraphId.index() для inv_inline[0]; NULL_SLOT = тот же граф
+40      4     u32        out_sg_slot      GraphId.index() для out_inline[0]; NULL_SLOT = тот же граф
+44      4     u32        props_slot       Индекс слота в SlotDirectory PropHeapPage
+48      4     u32        props_len        Длина сериализованного PropertyMap
+52      4     u32        _pad
+56      8     u64        props_page       page_no в props.fgb
 64      8     u64        inv_overflow     page_no overflow для invertex
 72      8     u64        out_overflow     page_no overflow для outvertex
 80      8     u64        inc_page         page_no EdgeIncidence list; NULL_PAGE = нет
-88      8     u64        props_page       page_no в props.fgb
-96      4     u32        props_slot
-100     4     u32        props_len
-104     4     u32        inv_sg_slot      GraphId.index() для inv_inline[0]; NULL_SLOT = тот же граф (не cross-level)
-108     4     u32        out_sg_slot      GraphId.index() для out_inline[0]; NULL_SLOT = тот же граф
-112     8     u64        in_sg_overflow   page_no overflow для inv_sg_slot
-120     8     u64        out_sg_overflow  page_no overflow для out_sg_slot
-Total = 128 байт
+88      8     u64        inv_sg_overflow  page_no overflow для inv_sg_slot
+96      8     u64        out_sg_overflow  page_no overflow для out_sg_slot
+104     8     —          _reserved        Выравнивание массивов endpoint'ов на 16 байт
+112     16    [u64; 2]   inv_inline       Inline invertex: DiskAtomRef
+128     16    [u64; 2]   out_inline       Inline outvertex: DiskAtomRef
+144     16    —          _reserved        Зарезервировано под эволюцию формата; обнулить при записи
+Total = 160 байт
 ```
+
+**Почему инлайн 2.** Бинарное ребро — подавляющее большинство — имеет ровно `inv_count = 1` и `out_count = 1`, поэтому двух inline-ячеек достаточно с запасом; гиперрёбра уходят в overflow в любом случае. Инлайн 4 при 8-байтовых ссылках стоил бы лишних 32 байта на каждое ребро ради редкого случая.
+
+**Почему счётчики u32, а не u8.** Прежний `u8` ограничивал гиперребро 255 конечными точками; для гиперграфов это произвольное и слишком низкое ограничение.
 
 **Инварианты:**
 - При `topo ∈ {Directed, Undirected, Bidirectional, Loop}`: `inv_count + out_count = 2`.
 - При `topo ∈ {HyperDirected, HyperUndirected}`: `inv_count + out_count ≥ 2`.
 - При `topo ∈ {Undirected, HyperUndirected}`: все вершины в `inv_inline`; `out_count = 0`.
-- При `inv_count > 4` или `out_count > 4` — соответствующий overflow активен.
+- При `inv_count > 2` или `out_count > 2` — соответствующий overflow активен.
 - `inc_page != NULL_PAGE` означает MetaEdge (edge-to-edge инциденции в отдельной странице).
 
 **Хранение cross-level endpoints:**
 - Для CROSS_LEVEL=0: inv_inline/out_inline содержат DiskAtomRef (slot в пространстве текущего графа) - стандартное поведение.
 - Для CROSS_LEVEL=1: inv_inline/out_inline содержат DiskAtomRef атомов **в пространстве подграфа, которому они принадлежат**. Чтобы получить полный QualifiedAtomRef, нужен sg_slot их подграфа.
   inv_sg_slot/out_sg_slot покрывают простейший случай: одно inv и одно out с разными уровнями.
-  Для гиперрёбер с несколькими cross-level endpoints — полные QualifiedAtomRef хранятся в overflow-странице in_sg_overflow/out_sg_overflow (CrossLevelAdjacencyOverflowPage).
+  Для гиперрёбер с несколькими cross-level endpoints — полные QualifiedAtomRef хранятся в overflow-странице inv_sg_overflow/out_sg_overflow (CrossLevelAdjacencyOverflowPage).
 
 ### 11.2. EdgeHotPage layout
 
 ```
 Offset   Size   Содержимое
 0        32     PageHeader (magic=MAGIC_EDGE_HOT, type=EdgeHot)
-32       16256  127 × EdgeHotSlot (127 × 128 = 16256)
-16288    96     _padding
+32       16320  102 × EdgeHotSlot (102 × 160 = 16320)
+16352    32     _padding
 Total = PAGE_SIZE байт
 ```
 
-**Слотов на страницу:** 127  
-**Смещение слота:** `32 + slot_within_page * 128`
+**Слотов на страницу:** 102
 
 **Адресация:**
 
 ```
-page_no          = slot_index / 127
-slot_within_page = slot_index % 127
-byte_offset      = 32 + slot_within_page × 128
+page_no          = slot_index / 102
+slot_within_page = slot_index % 102
+byte_offset      = 32 + slot_within_page × 160
 ```
+
+Слоты вершин и рёбер имеют одинаковый размер (160 байт) и одинаковую плотность (102 на страницу), поэтому арифметика адресации у них общая — это упрощает и код, и дефрагментацию.
 
 ### 11.3. EdgeIncidencePage
 
@@ -923,17 +994,17 @@ Offset  Size    Тип    Поле       Описание
 32      8       u64    next_page  Следующая страница цепочки; NULL_PAGE = последняя
 40      4       u32    count      Число entries на этой странице
 44      4       u32    _pad
-48      16336   —      entries    Массив u32 (edge slot index или DiskAtomRef)
-                                  → 16336 / 4 = 4084 entries per page
+48      16336   —      entries    Массив u64 (DiskAtomRef ребра)
+                                  → 16336 / 8 = 2042 entries per page
 Total = PAGE_SIZE байт
 ```
 
 **Важно:** entries в overflow-странице являются **продолжением** inline-массива из hot-слота.
 Читать: сначала inline из hot-слота, затем последовательно все страницы цепочки.
 
-**Ёмкость:** Для узла со степенью 100,000:
-- Inline: 16 рёбер в NodeHotSlot
-- Overflow: ceil(99984 / 4084) = 25 страниц цепочки
+**Ёмкость:** Для узла со степенью 100 000:
+- Inline: 4 ребра в NodeHotSlot
+- Overflow: `ceil(99 996 / 2042) = 49` страниц цепочки
 
 ### 12.1. CrossLevelAdjacencyOverflowPage
 
@@ -944,12 +1015,15 @@ PageHeader: (magic=MAGIC_ADJ_OVER_CL, type=CrossLevelAdjacencyOverflow)
 ```
 
 ```
-overflow_entry_cl (12 байт):
+overflow_entry_cl (16 байт):
       sg_slot:    u32   -- GraphId.index() подграфа
-      local_slot: u32   -- DiskAtomRef в пространстве подграфа
       role:       u8    -- 0=inv, 1=out
       _pad:       u8[3]
+      local_slot: u64   -- DiskAtomRef в пространстве подграфа
+→ 16336 / 16 = 1021 entries per page
 ```
+
+`QualifiedAtomRef` = `{ sg_slot: u32, local_slot: u64 }` — 16 байт с учётом выравнивания.
 
 ---
 
@@ -967,7 +1041,7 @@ Offset  Size  Тип    Поле         Описание
 34      2     u16    free_start   Смещение начала свободного пространства
 36      2     u16    free_end      Начало zone записей (следующая позиция для новой записи, записи растут к меньшим адресам)
 38      2     u16    _pad
-40      16336 —      [SlotDirectory ... GAP ... records]
+40      16334 —      [SlotDirectory ... GAP ... records]
               SlotEntry(4B) × slot_count  ← растёт вниз от offset 40
               [свободное место]
               [records] ← растут вверх от конца страницы
@@ -1039,7 +1113,7 @@ num_props: uLEB128
 ### 13.4. Мультистраничные записи (Large Objects)
 
 Если PropertyMap > `PAGE_PAYLOAD_SIZE / 2` (>8176 байт), он хранится как Large Object:
-цепочка `PropLargePage` с `next_page` указателями.
+цепочка `PropLargeChunkPage` с `next_page` указателями.
 
 ```
 PropLargeChunkPage:
@@ -1063,6 +1137,54 @@ struct PropertyRef {
 ```
 
 **Замечание:** Для прямого доступа без чтения `SlotDirectory` — использовать смещение из `SlotEntry`: `SlotEntry[props_slot].record_offset`.
+
+### 13.6. Свойства и аналитика: OLTP row-store + колоночный кэш
+
+`PropHeapPage` — **намеренно строково-ориентированное OLTP-хранилище**: все свойства атома лежат одной сериализованной записью. Это оптимально для доминирующего сценария (взять атом — получить все его свойства) и плохо для аналитического скана одного поля по миллионам атомов, где приходится читать целые записи ради одного значения.
+
+Разрешение — не превращать `PropHeapPage` в колоночный формат, а дать **явный путь материализации**:
+
+```
+DiskMetaGraph → выгрузка нужного поля колонкой → SparseSet<T> / ECS → алгоритм
+```
+
+Это соответствует существующему разделению: горячая топология на диске, аналитические компоненты — в ECS-слое, который уже колоночный по построению.
+
+#### PropertyColumnCachePage — дисковый колоночный кэш
+
+Чтобы повторные аналитические проходы не платили за материализацию каждый раз, вводится кэш по образцу `TensorCachePage` (§26) — с той же логикой инвалидации.
+
+Файл: `props_cache/<label_id>_<key_id>.fgb`, magic `MAGIC_PROP_COL`, тип страницы `PropColumnCache`.
+
+```
+Offset  Size  Тип   Поле          Описание
+0       32    —     PageHeader
+32      4     u32   label_id
+36      4     u32   key_id        Интернированный ключ свойства
+40      1     u8    elem_type     TypeTag элемента колонки
+41      7     —     _pad
+48      8     u64   first_slot    DiskAtomRef.slot первого элемента диапазона
+56      8     u64   elem_count    Число элементов на странице
+64      8     u64   next_page     Следующая страница цепочки; NULL_PAGE = последняя
+72      8     u64   build_lsn     LSN, на котором построен кэш
+80      8     u64   validity_page page_no битовой карты валидности; NULL_PAGE = нет пропусков
+88      16264 —     data          Плотный массив [value; elem_count] фиксированной ширины
+Total = PAGE_SIZE байт
+```
+
+Свойства и ограничения:
+- Кэшируются **только поля фиксированной ширины** (числа, `datetime`, `duration`, `decimal`, векторы фиксированной размерности, `bool`). Строки и вложенные структуры не кэшируются.
+- Элементы упорядочены по `DiskAtomRef.slot`, поэтому доступ по атому — арифметика, а не поиск. Пропуски (у атома нет этого свойства) отмечаются в битовой карте валидности.
+- Инвалидация — как у `TensorCachePage`: `build_lsn < текущий checkpoint_lsn` при любой мутации соответствующего поля делает кэш устаревшим. Устаревший кэш не используется молча: планировщик либо перестраивает его, либо идёт по обычному пути.
+- Раскладка `decimal` (§3.3) выбрана так, что колонка `decimal` побайтово совместима с Arrow `Decimal128Array`.
+
+#### Продвинутая аналитика — через Arrow, а не своим кодом
+
+Собственные реализации dictionary/RLE/bitpacking-кодирования и колоночного исполнителя сознательно **не разрабатываются**: это отдельная колоночная СУБД внутри графовой, с несоразмерной стоимостью сопровождения.
+
+Вместо этого колонка из кэша отдаётся наружу как **Arrow-массив** (нулевое копирование для типов фиксированной ширины), после чего доступны готовые инструменты экосистемы: Arrow — как in-memory представление, Parquet — как формат выгрузки, DataFusion — как исполнитель аналитических запросов поверх выгруженных колонок. Все три написаны на Rust и пригодны и для памяти, и для файлов.
+
+Граница ответственности: движок отвечает за граф, топологию, транзакции и материализацию колонок; тяжёлая колоночная аналитика — за пределами его ядра.
 
 ---
 
@@ -1109,9 +1231,9 @@ Offset  Size    Тип    Поле                 Описание
 0       32      —      PageHeader (magic=MAGIC_FREELIST, type=Freelist)  
 32      8       u64    first_page_covered   Первая страница, покрытая этим bitmap
 40      8       u64    next_freelist_page   Следующая страница freelist; NULL_PAGE = одна
-48      16328   bits   Bitmap               1 бит = 1 страница; 1=свободна, 0=занята
-  → 16328 × 8 = 130,624 страницы покрыто одной FreelistPage
-  → 130,624 × PAGE_SIZE = 2 ТиБ покрытия на один freelist
+48      16336   bits   Bitmap               1 бит = 1 страница; 1=свободна, 0=занята
+  → 16336 × 8 = 130688 страницы покрыто одной FreelistPage
+  → 130688 × PAGE_SIZE = 2 ГиБ покрытия на один freelist
 Total = PAGE_SIZE байт
 ```
 
@@ -1145,7 +1267,7 @@ Page N+1..:  DictEntryPage    (EdgeLabel entries)
 Lookup через отдельную HashIndexPage с ключом = `xxHash64(iana_name) → tz_id`. 
 Диапазон `tz_id` для именованных зон: `1..999_999` (как в §3.4).
 
-### 16.2. LabelDictHeader (Page 0, offset 32..160)
+### 16.2. LabelDictHeader (Page 0)
 
 ```
 Offset  Size  Тип    Поле                                 Описание
@@ -1231,7 +1353,7 @@ Offset  Size  Тип    Поле
 160     8     u64    schema_root_page           Первая страница в schema/catalog.fgb
 168     8     u64    stats_root_page            Первая страница в stats/graph_stats.fgb
 176     128   u8[]   graph_name                 UTF-8 null-terminated, max 127 символов
-304     80    —      _reserved
+304     16080 —      _reserved
 ```
 
 ---
@@ -1325,7 +1447,7 @@ COMPUTED-поле не хранится в PropHeapPage. При SELECT executor 
 ```
 index_name_id: u32
 index_kind:    u8  -- 0=Standard, 1=Unique, 2=Count, 3=Fulltext,
-                   -- 4=HNSW, 5=Geometry, 6=Reachability, 7=Neighbourhood
+                   -- 4=HNSW, 5=DiskANN, 6=Geometry, 7=Reachability, 8=Neighbourhood, 9=Path
 field_count:   u8
 field_ids:     [u32] × field_count
 flags:         u8  -- bit0=CONCURRENT, bit1=DEFERRED
@@ -1445,11 +1567,27 @@ bucket_count: u16
 buckets:   [min_degree(u32) + max_degree(u32) + node_count(u64)] × bucket_count
 ```
 
-### 19.5. Обновление статистики
+### 19.5. Метод построения гистограмм и NDV
 
-- **Инкрементально**: при каждом INSERT/DELETE обновляются счётчики в LabelStatsPage.
-- **Полный пересчёт**: `ANALYZE TABLE @name` — полное сканирование + пересчёт гистограмм.
-- **Автоматический trigger**: при `dirty_row_fraction > 0.10` (10% изменений с последнего ANALYZE).
+**Гистограммы — equi-depth (равнонаполненные).** Границы корзин выбираются так, чтобы в каждую попадало примерно одинаковое число строк, а не чтобы корзины были равной ширины по значению. Equi-width деградирует на перекошенных распределениях: одна корзина собирает почти всё, и оценка селективности становится бессмысленной — а перекос в графовых данных норма (степени вершин, частоты меток).
+
+Число корзин — `FG_STATS_HISTOGRAM_BUCKETS` (по умолчанию 100). Для каждой корзины хранятся границы, частота и число различных значений внутри неё (`ndv`), что позволяет оценивать и точечные предикаты, и диапазонные.
+
+**NDV — HyperLogLog.** Точный подсчёт различных значений требует памяти порядка их количества. Вместо этого используется тот же компонент HLL, что уже применяется в neighbourhood-индексе (§20.9): фиксированные 64 байта регистров на поле, погрешность ~2%. Итог записывается в `distinct_count`.
+
+### 19.6. Обновление статистики
+
+- **Инкрементально**: счётчики (`node_count`, `edge_count`, per-label `atom_count`) обновляются **дельтой на транзакцию** — накапливаются в транзакции и применяются один раз при коммите. Обновление на каждую строку превращало бы одну страницу статистики в точку сериализации всех писателей.
+- **Полный пересчёт**: `ANALYZE [ TABLE @name | GRAPH @name ]`.
+- **Автоматический trigger**: при `dirty_row_fraction > FG_STATS_AUTO_ANALYZE_DIRTY` (0.10).
+
+**Выборка вместо полного скана.** `ANALYZE` не читает таблицу целиком, если она больше порога `FG_STATS_FULL_SCAN_THRESHOLD` (по умолчанию 32 страницы): для маленьких таблиц полный скан дешевле и точнее, для больших берётся **выборка фиксированного размера** `FG_STATS_SAMPLE_ROWS` (по умолчанию 30 000 случайных строк) **независимо от размера таблицы**.
+
+Фиксированный, а не пропорциональный размер выборки — принципиально: иначе `ANALYZE` растёт линейно с графом и сам становится узким местом, что прямо противоречит автоматическому триггеру при 10% изменений. Точность equi-depth гистограммы определяется размером выборки, а не долей таблицы, поэтому нескольких десятков тысяч строк достаточно и для миллиарда атомов.
+
+Алгоритм: собрать выборку → отсортировать → расставить границы корзин так, чтобы в каждой было ≈ `sample_size / bucket_count` строк → масштабировать частоты на `row_count / sample_size`. Границы корзин записываются в том же order-preserving кодировании, что и ключи индексов (§20.2.1), поэтому сравнение с предикатом не требует декодирования.
+
+**Статистика как побочный продукт bulk-сборки.** При массовой загрузке (§20.13) ключи каждого индекса и так проходят через полную сортировку, поэтому точные `distinct_count`, `null_fraction` и границы корзин вычисляются одним и тем же проходом — отдельный `ANALYZE` после импорта не нужен и выборка не требуется.
 
 ---
 
@@ -1486,7 +1624,7 @@ int       → big-endian i64 с инвертированным MSB: v ^ 0x8000_0
 float     → IEEE 754 order-preserving: (v - битовое представление f64, NaN в индексе - ошибка валидации)
               if positive: flip MSB    → v ^ 0x8000_0000_0000_0000
               if negative: flip all    → v ^ 0xFFFF_FFFF_FFFF_FFFF
-decimal   → sign_byte(u8: 0x00=neg,0x01=pos) + 16 байт big-endian coefficient + exponent (order-preserving)
+decimal   → см. §20.2.1.1 (наивная схема «sign + coefficient + exponent» НЕ сохраняет порядок)
 string    → raw UTF-8 (encoding зависит от позиции в composite key, см. §20.2.6)
 bytes     → raw + 0x00 sentinel
 datetime  → big-endian i64(seconds) + u32(nanos) [tz не индексируется]
@@ -1507,6 +1645,36 @@ record_id → table_id(4 байта BE) + id_part_encoding(variable)
 
 При попытке вставить `NaN` значение в индекс происходит **ошибка валидации**.
 В `PropHeapPage` `NaN` хранится как `edge weight sentinel`; в B+tree индексе он недопустим.
+
+#### 20.2.1.1. Order-preserving ключ для `decimal`
+
+Наивная схема «знак + big-endian мантисса + экспонента» **не сохраняет порядок** и потому непригодна. Два дефекта:
+
+1. Численно равные значения с разным масштабом (`1.0` при `scale=1` и `1.00` при `scale=2`) дают **разные** ключи. Для unique-индекса это означает, что дубликат пройдёт проверку.
+2. Сравнение сырых мантисс при разных экспонентах даёт неверный порядок: `5e-1` (мантисса 5) окажется больше `1e0` (мантисса 1), хотя `0.5 < 1.0`.
+
+**Схема для schemaless-полей** (масштаб заранее не известен):
+
+```
+1. Нормализовать: убрать хвостовые нули → канонические (mantissa, scale).
+   Ноль кодируется отдельным значением sign_byte и пустым остатком.
+2. sign_byte:  0x00 — отрицательное, 0x01 — ноль, 0x02 — положительное.
+3. adjusted_exponent = digits(|mantissa|) - scale - 1        (десятичный порядок числа)
+   Записать как big-endian i16, смещённый в беззнаковый: (adj_exp ^ 0x8000).
+4. Десятичные цифры |mantissa| без ведущих нулей, по одной на байт, дополненные
+   до фиксированной длины (39 байт — максимум для i128) байтом 0x00.
+5. Для отрицательных значений все байты ПОСЛЕ sign_byte инвертируются побитово.
+```
+
+Порядок при таком кодировании лексикографический: сначала различает знак, затем десятичный порядок, затем значащие цифры слева направо. Нормализация на шаге 1 гарантирует, что численно равные значения дают побайтово равные ключи.
+
+**Схема для schemafull-полей** (в `DEFINE FIELD` объявлен фиксированный масштаб): значение приводится к каноническому масштабу столбца, после чего ключ — просто
+
+```
+(mantissa as i128) ^ 0x8000_0000_0000_0000_0000_0000_0000_0000, big-endian, 16 байт
+```
+
+Это тот же приём, что уже применяется к `int`, он тривиально сохраняет порядок и вдвое короче. Схема выбирается по индексу: при объявленном масштабе — вторая, иначе — первая.
 
 ── Составные типы ──────────────────────────────────────────────────────
 ```
@@ -1551,7 +1719,7 @@ graph_ref → big-endian u64 (sg_slot(u32 BE) + sg_gen(u32 BE))
 ```
 [0..32]                           PageHeader (magic=MAGIC_IDX_BTREE, type=IndexBtreeInternal; !FLAG_LEAF set)
 [32..34]                          num_keys (u16)
-[34..36]                          _pad
+[34..36]                          key_area_len (u16)  -- суммарная длина key_area в байтах
 [36..36+2n]                       key_offsets: u16[num_keys]    
                                       -- смещения от начала key_area (= offset 36+2n) до начала ключа i
 [36+2n..]                         key_area: [encoded_key(variable)] × num_keys  
@@ -1564,15 +1732,22 @@ graph_ref → big-endian u64 (sg_slot(u32 BE) + sg_gen(u32 BE))
 - `child_pages[num_keys]` = правый крайний потомок;
 - смещение: `PAGE_SIZE − 8 × (num_keys + 1) + 8 × k`.
 - инвариант (проверка `key_area_end < child_pages_start`): 
-  `44 + 2 × num_keys + key_area_size + 8 × (num_keys + 1) ≤ PAGE_SIZE` 
+  `36 + 2 × num_keys + key_area_size + 8 × (num_keys + 1) ≤ PAGE_SIZE` 
 
 Доступный для ключей объём: `PAGE_SIZE − 36 − 2n − 8(n+1)`.
 Свободное место: `child_pages_start − key_area_end`.
 
+`key_area_len` обязателен: без него протяжённость **последнего** ключа невыводима (`key_offsets` хранит только начала), а значит нельзя ни вычислить свободное место, ни корректно обойти область ключей.
+
 ```
 Binary search (O(log num_keys)):
-  decode key[mid] из key_area[key_offsets[mid]..] → compare → сдвинуть границы
+  сравнить key[mid] из key_area[key_offsets[mid]..] с искомым ключом
+  сравнение — прямой memcmp, БЕЗ декодирования → сдвинуть границы
 ```
+
+**Сравнение внутренних ключей — побайтовое (`memcmp`), а не через декодирование.** Кодирование ключей order-preserving по построению (§20.2.1), поэтому лексикографическое сравнение байтов семантически тождественно сравнению значений — но не требует диспетчеризации по типу и работает заметно быстрее.
+
+Из этого следует важное для сборки индекса свойство: **разделитель можно усекать**. Между `последний_ключ(левый)` и `первый_ключ(правый)` в качестве разделителя допустим любой кратчайший префикс `P`, для которого `последний_ключ(левый) < P ≤ первый_ключ(правый)`. Для строковых и составных ключей это часто вдвое сокращает размер разделителя и добавляет целый уровень ветвления.
 
 Вставка нового ключа `key[j]` с правым потомком `ptr`:
 1. Проверить: `free_space ≥ key_len + 2 + 8`
@@ -1626,7 +1801,7 @@ Offset  Size   Содержимое
 32      8      next_page (u64)
 40      4      count (u32)
 44      4      _pad
-48      16304  [DiskAtomRef(u32)] × (count) → (PAGE_SIZE - 48) / 4 = 4084 entries per page
+48      16336  [DiskAtomRef(u64)] × (count) → (PAGE_SIZE - 48) / 16 = 1021 entries per page
 ```
 
 #### 20.2.6. Composite Index
@@ -1777,6 +1952,36 @@ O(k) где k — длина ключа. Не предназначен для д
 - Нет write amplification проблем LSM (нет levels/compaction для property indexes).
 - Хорошо изученная splitting/merging логика.
 
+#### 20.2.9. Сжатие страниц индекса
+
+Два независимых механизма: структурное сжатие ключей и блочное сжатие страницы. Они складываются и решают разные задачи.
+
+**Префиксное сжатие ключей (первично, применяется по умолчанию).** Ключи в листе отсортированы, поэтому соседние обычно имеют длинный общий префикс — особенно строковые и составные (§20.2.6). В листе хранится общий префикс всех ключей страницы один раз, а каждая запись содержит только суффикс:
+
+```
+[..]        page_prefix_len (u16)
+[..]        page_prefix (page_prefix_len байт)
+[записи]    для каждого ключа: suffix_len (u16) + suffix_bytes
+```
+
+Это **не** LZ4 и вообще не универсальный компрессор: сжатие структурное и order-preserving, поэтому по сжатой странице по-прежнему работает бинарный поиск **без распаковки** — сравнивается только суффикс. Стоимость на чтении нулевая, выигрыш для строковых ключей часто двукратный.
+
+Существенно: префиксное сжатие дёшево при bulk-сборке (§20.13), где лист формируется целиком и общий префикс известен сразу, и дорого при построчной вставке — вставка в середину сжатого листа может изменить общий префикс и потребовать перекодирования всей страницы. Поэтому оно применяется при сборке и перестроении, а при точечных вставках лист может временно храниться без него до ближайшего уплотнения.
+
+**Блочное сжатие (вторично, опционально).** Сжатие всей полезной нагрузки страницы целиком, как уже сделано для `PropHeapPage` (§13.3) через `FLAG_COMPRESSED`. Требует распаковки страницы перед любым обращением, поэтому применяется только при выигрыше — порог `FG_PROPS_COMPRESS_THRESHOLD`.
+
+Алгоритм настраивается **на таблицу** (`block_compressor` в `TableDefinition`), а не глобально: у разных данных разный профиль.
+
+| Значение | Когда уместно |
+|----------|---------------|
+| `none` | Данные уже плотные; приоритет — латентность |
+| `lz4` (по умолчанию) | Универсальный компромисс; тот же кодек, что и в `PropHeapPage` |
+| `zstd` | Холодные данные и архивные графы; заметно плотнее LZ4, дороже по CPU |
+| `snappy` | Совместимость с внешними экосистемами |
+| `fsst` | Специализированно для коротких строк — сохраняет возможность работы без полной распаковки |
+
+Кодеки, требующие полной распаковки страницы (`lz4`, `zstd`, `snappy`), не сочетаются с чтением произвольной записи «на месте», поэтому для горячих индексов рекомендуется ограничиваться префиксным сжатием.
+
 ### 20.3. Count Index
 
 Хранит единственное значение — число живых записей в таблице.
@@ -1807,7 +2012,7 @@ Offset  Size    Содержимое
 32      8       next_page (u64)
 40      4       count (u32)
 44      4       _pad
-48      16304   [DiskAtomRef(u32)] × count  → (PAGE_SIZE - 48) / 4 = 4084 per page
+48      16336   [DiskAtomRef(u64)] × count  → (PAGE_SIZE - 48) / 8 = 2042 per page
 ```
 
 Массив отсортирован по slot_index. Binary search + страничная навигация.
@@ -1894,8 +2099,8 @@ Offset  Size   Содержимое
 32      8      next_page (u64)
 40      4      count (u32)
 44      4      _pad
-48      var    entries: [DiskAtomRef(u32) + term_freq(u16) + _pad(2)] × count
-                  → (PAGE_SIZE - 48) / 8 = 2042 entries per page
+48      var    entries: [DiskAtomRef(u64) + term_freq(u16) + _pad(6)] × count
+                  → (PAGE_SIZE - 48) / 16 = 1021 entries per page
 ```
 
 Posting lists сортированы по DiskAtomRef → эффективный AND/OR через merge.
@@ -1951,7 +2156,7 @@ PageHeader(32) (magic=MAGIC_IDX_VEC, type=IndexVectorData)
 next_page:  u64
 data_len:   u32
 _pad:       4
-data:       [u8] × 16304   -- сырые байты сериализованного HNSW
+data:       [u8] × 16336   -- сырые байты сериализованного HNSW
 ```
 
 **Memory management**: HNSW целиком в памяти до `FG_HNSW_CACHE_SIZE` (default 256 МиБ).
@@ -1960,6 +2165,21 @@ data:       [u8] × 16304   -- сырые байты сериализованн�
 **Поддерживаемые метрики**: EUCLIDEAN, COSINE, MANHATTAN, MINKOWSKI, пользовательская функция.
 
 **Supported element types**: F64, F32, I64, I32, I16 (совпадает с `gql_spec.md §9.6`).
+
+#### 20.6.3. Долговечность и восстановление
+
+Сериализация графа HNSW блобом только при checkpoint означала бы, что крах между checkpoint'ами теряет все вставки с момента последнего из них, а восстановление требует полной пересборки индекса — операции, стоимость которой растёт с размером набора векторов и на больших индексах измеряется десятками минут. Это неприемлемо как единственная стратегия.
+
+**Двухуровневая схема:**
+
+1. **Журналирование операций.** Каждая вставка и удаление вектора логируется записью `IndexInsert` / `IndexDelete` с `index_id` вектора, `DiskAtomRef` атома и самим вектором. Это логические аннотации (§22.1) — они не участвуют в восстановлении страниц, но образуют полный журнал изменений вектор-индекса начиная с `build_lsn` последнего сохранённого блоба.
+2. **Периодическая сериализация.** Блоб `VectorDataPage` пишется при checkpoint и хранит `build_lsn` — момент, на который он актуален.
+
+**Восстановление:** загрузить блоб → проиграть записи `IndexInsert`/`IndexDelete` с `lsn > build_lsn` как обычные вставки в память. Стоимость ограничена числом векторных операций **с последнего checkpoint**, а не размером индекса.
+
+**Граница деградации.** Если журнал с `build_lsn` недоступен (обрезан, повреждён) — индекс помечается `stale`. Устаревший вектор-индекс **не используется молча**: планировщик либо отказывается от него (точный перебор, если это допустимо по стоимости), либо возвращает ошибку, требуя `REBUILD INDEX`. Молчаливая выдача неполных результатов ANN-поиска недопустима — она неотличима от нормальной работы.
+
+**Память при сборке.** `FG_HNSW_CACHE_SIZE` (256 МиБ) — бюджет **обслуживания**, а не построения. Для построения выделяется отдельный `FG_HNSW_BUILD_MEM` (по умолчанию 2 ГиБ). При нехватке бюджета сборка завершается явной ошибкой ресурса; для наборов, не помещающихся в память, предназначен `DISKANN` (§20.6.4 `gql_spec` §9.6) — он изначально спроектирован как out-of-core и в этом сценарии предпочтителен шардированию HNSW.
 
 ### 20.7. Geometry R-tree Index
 
@@ -1999,7 +2219,7 @@ PageHeader(32) (magic=MAGIC_IDX_RTREE, type=IndexGeometryRtreeLeaf, FLAG_LEAF se
 num_entries: u16
 _pad: 6
 entries: [mbr_lo_lon + mbr_lo_lat + mbr_hi_lon + mbr_hi_lat (f64×4)
-          + DiskAtomRef(u32) + _pad(4)] × num_entries
+          + DiskAtomRef(u64)] × num_entries
 → (PAGE_SIZE - 40) / 36 = 454 entries per page
 ```
 
@@ -2032,7 +2252,7 @@ Offset  Size  Тип    Поле
 #### Формат label-записей (хранятся в B+tree с ключом DiskAtomRef)
 
 Label-записи хранятся в стандартных B+tree leaf-страницах (§20.2.3).
-Ключ leaf-записи = DiskAtomRef(u32) вершины. Значение зависит от алгоритма:
+Ключ leaf-записи = DiskAtomRef(u64) вершины. Значение зависит от алгоритма:
 ```
 TREE_COVER:
 PageHeader (magic=MAGIC_IDX_REACH, type=IndexReachabilitTreeCover)
@@ -2061,8 +2281,8 @@ in_bitmap:  u64[ ceil(n_landmarks/64) ]   -- landmark'ы, из которых v 
   32      8       next_page (u64)
   40      4       count (u32)
   44      4       _pad
-  48      16336   landmarks: DiskAtomRef(u32) × count
-  -- per page: 16336 / 4 = 4084 landmark-вершины
+  48      16336   landmarks: DiskAtomRef(u64) × count
+  -- per page: 16336 / 8 = 2042 landmark-вершины
 ```
 
 ### 20.9. Neighbourhood Index
@@ -2097,25 +2317,25 @@ Total = PAGE_SIZE байт
 
 #### EXACT — Neighbourhood Posting Pages
 
-  B+tree (exact_roots[k-1]): ключ = DiskAtomRef(u32) центра, значение = page_no первой NeighbourhoodListPage.
+  B+tree (exact_roots[k-1]): ключ = DiskAtomRef(u64) центра, значение = page_no первой NeighbourhoodListPage.
 
 ```
 NeighbourhoodListPage:
     Offset  Size    Содержимое
     0       32      PageHeader (MAGIC_IDX_NBH, type=IndexNeighbourhoodExact)
-    32      4       center_ref: DiskAtomRef(u32)
-    36      1       k (u8)
-    37      3       _pad
-    40      8       next_page (u64)
-    48      4       count (u32)
-    52      4       _pad
-    56      16328   neighbors: DiskAtomRef(u32) × count
-    -- per page: 16328 / 4 = 4082 соседей
+    32      8       center_ref: DiskAtomRef(u64)
+    40      1       k (u8)
+    41      7       _pad
+    48      8       next_page (u64)
+    56      4       count (u32)
+    60      4       _pad
+    64      16320   neighbors: DiskAtomRef(u64) × count
+    -- per page: 16320 / 8 = 2040 соседей
 ```
 
 #### SKETCH — HyperLogLog Pages
 
-B+tree (sketch_root): составной ключ = k(u8) + DiskAtomRef(u32) = 5 байт, значение = hll_sketch(u8[64]).
+B+tree (sketch_root): составной ключ = k(u8) + _pad(7) + DiskAtomRef(u64) = 16 байт, значение = hll_sketch(u8[64]).
 
 ```
 PageHeader (MAGIC_IDX_NBH, type=IndexNeighbourhoodSketch)
@@ -2165,7 +2385,7 @@ LandmarkListPage: аналог §20.8 LandmarkListPage.
 PageHeader (magic=MAGIC_IDX_PATH, type=IndexPathLandmarkList)
 
 B+tree (sssp_root):
-    ключ: landmark_idx(u8) + DiskAtomRef(u32) = 5 байт
+    ключ: landmark_idx(u8) + _pad(7) + DiskAtomRef(u64) = 16 байт
     значение: distance(u32)   -- u32::MAX = недостижимо
     
 Пространство: n_landmarks × n_nodes × 4 байт.
@@ -2218,13 +2438,14 @@ Header:
   PageHeader (magic=MAGIC_IDX_EE, type=IndexEdgeEndpointHeader)
 ```
 
+Листовые страницы используют стандартный формат B+tree-листа (§20.2.3); собственного `PageHeader` у отдельной записи, разумеется, нет — заголовок принадлежит странице. Запись:
+
 ```
-LeafEntry:
-  PageHeader (magic=MAGIC_IDX_EE, type=IndexEdgeEndpointEntry)
-  endpoint_ref:  u32  -- DiskAtomRef ребра, выступающего endpoint'ом
-  edge_ref:      u32  -- DiskAtomRef ребра, у которого оно endpoint
+LeafEntry (24 байта):
+  endpoint_ref:  u64  -- DiskAtomRef ребра, выступающего endpoint'ом (ключ)
+  edge_ref:      u64  -- DiskAtomRef ребра, у которого оно endpoint
   role:          u8   -- 0=inv (Source), 1=out (Target)
-  _pad:          u8[3]
+  _pad:          u8[7]
 ```
 
 **Создаётся автоматически** при наличии хотя бы одного ребра с is_edge(endpoint) = true.
@@ -2236,6 +2457,117 @@ LeafEntry:
 
 **Participation-инцидентность (EdgeIncidence)** хранится в `EdgeIncidencePage` (уже определённой в §11.3), не в `EdgeEndpointIndex`. 
 Два разных индекса для двух разных видов инцидентности.
+
+### 20.13. Bulk-сборка индексов
+
+Построчная вставка сопровождает каждый индекс отдельно: спуск по дереву за `O(log n)` **случайными** обращениями к страницам, расщепления, и WAL-запись на каждую пару (строка, индекс). При загрузке графа это доминирующая стоимость. Bulk-путь строит индекс снизу вверх, записывая каждую страницу **ровно один раз**, последовательно.
+
+Путь состоит из четырёх переиспользуемых компонентов; они одни и те же для `DEFINE INDEX` на непустой таблице, `REBUILD INDEX`, `COMPACT INDEX` и режима импорта (`gql_spec` §7.11).
+
+#### 20.13.1. Внешняя сортировка
+
+Ключ сортировки — `encoded_key ‖ DiskAtomRef` (big-endian). Два следствия, оба важны:
+- кодирование ключей order-preserving (§20.2.1), поэтому компаратор — **`memcmp`**, без декодирования и диспетчеризации по типу;
+- добавление `DiskAtomRef` делает порядок **тотальным**, поэтому устойчивая сортировка не нужна, а posting-списки выходят уже упорядоченными по `DiskAtomRef` — ровно так, как требуется §20.5.4 для слияния AND/OR и §20.4 для label-массивов.
+
+Алгоритм: генерация прогонов (заполнить `FG_BULK_SORT_MEM`, отсортировать `sort_unstable`, параллельно по потокам) → спиллинг прогонов в `FG_TEMPFILES_PATH` через собственный слой Direct I/O → k-путёвое слияние (`FG_BULK_SORT_MERGE_FANIN`, по умолчанию 64) деревом проигравших. Выход слияния — итератор, напрямую питающий упаковщик страниц; промежуточная материализация не нужна.
+
+Параллелизм имеет смысл прежде всего **по индексам** (загрузка объявляет 5–10 независимых индексов), а не внутри слияния одного.
+
+#### 20.13.2. Упаковка снизу вверх
+
+```
+target = floor(usable_leaf_space × FILL_FACTOR)
+для каждой группы записей с одинаковым ключом (уже упорядоченной по ref):
+    inline_count известен ЗАРАНЕЕ → запись сразу пишется в финальной форме
+    если не помещается в текущий лист — запечатать лист, начать новый
+запечатать последний лист
+```
+
+Ключевое отличие от построчного пути: `inline_count` известен до записи, поэтому запись не приходится переписывать и мигрировать из inline-формы в posting-страницы при пересечении порога в 8 ссылок.
+
+Физическая раскладка файла делает цепочку листьев **непрерывной**, поэтому `next_leaf = page_no + 1`, а полный скан индекса становится одним последовательным чтением:
+
+```
+страница 0        : метастраница
+страницы 1..L     : листья (непрерывно)
+страницы L+1..L+P : posting-страницы
+далее             : внутренние уровни, снизу вверх
+последняя         : корень (фиксируется в метастранице)
+```
+
+Внутренние уровни строятся потоково: при запечатывании потомка в родительский строитель отдаётся разделитель (с усечением, §20.2.2); когда родитель заполняется, он рекурсивно отдаёт свой разделитель выше. Уровень, завершившийся единственной страницей, и есть корень.
+
+#### 20.13.3. Fill factor
+
+`FG_INDEX_BTREE_FILL_FACTOR` = **0.90** (было 0.80). Плотность здесь защищает не столько от расщеплений, сколько от **физической фрагментации цепочки листьев**: первая вставка в полный лист и расщепляет его, и вытягивает физически случайную страницу из freelist в логически последовательную цепочку — после чего последовательность скана восстанавливается только полной пересборкой.
+
+| Случай | Fill factor |
+|--------|-------------|
+| По умолчанию | 0.90 |
+| Монотонно возрастающий ключ (`pk_` над ULID/UUIDv7/int, `DiskAtomRef`) | 1.00 — рост идёт по правому краю, внутренних расщеплений не бывает |
+| Индекс объявлен только для чтения | 1.00 |
+| Заведомо случайные вставки после загрузки | 0.75–0.80 |
+
+Монотонность определяется автоматически: если первый ключ отсортированного потока не меньше текущего максимума индекса (или индекс пуст, а тип ключа `uuid`/`ulid`/`record_id`), fill factor повышается до 1.00.
+
+Отдельно: `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` = 0.95 (внутренних страниц мало, они кэш-резидентны — плотнее упаковать почти бесплатно), `FG_INDEX_RTREE_FILL_FACTOR` = 0.95.
+
+#### 20.13.4. Протокол side-file: журнал не растёт
+
+Тело bulk-сборки **не журналируется**. Сборка идёт в новый файл, недостижимый из закоммиченного состояния каталога, поэтому крах в процессе не может нарушить консистентность — незавершённый файл просто удаляется.
+
+```
+1. Собрать в idx/.build/<name>.<gen>.fgidx.tmp — последовательная запись
+   мимо BufferPool и мимо WAL. Записей журнала: НОЛЬ.
+2. fsync(tmp), fsync(каталог)
+3. WAL: одна запись в той же транзакции, что и обновление каталога:
+     IndexBuildComplete { index_id, generation, root_page, leaf_count,
+                          key_count, source_snapshot_lsn, file_checksum }
+     SchemaDef { IndexDefinition: status = ready, file_generation = <gen> }
+4. WAL: fsync
+5. rename(tmp → idx/<name>.<gen>.fgidx), fsync(каталог)
+6. Удалить прежнее поколение, когда на него не осталось ссылок
+```
+
+Порядок величин: сборка индекса на 3 ГБ даёт **~200 байт** журнала вместо десятков гигабайт при построчном пути.
+
+**Нумерация поколений вместо перезаписи** принципиальна для Windows (целевая платформа): открытый читателями файл нельзя удалить, а `MoveFileEx` с заменой оставляет существующие хендлы указывающими на прежний inode. Поколение в имени и указатель в каталоге снимают весь этот класс проблем на обеих платформах.
+
+Восстановление: незавершённые файлы в `idx/.build/` собираются сборщиком мусора; REDO записи `IndexBuildComplete` идемпотентен (переименовать, если источник есть, а цели нет; иначе — ничего). Если ни временного, ни финального файла нет, индекс помечается `stale` — **никогда** не `ready` молча.
+
+#### 20.13.5. Стратегия по типам индексов
+
+| Индекс | Стратегия | Нужна сортировка |
+|--------|-----------|------------------|
+| B+tree standard / unique, `pk_` | Внешняя сортировка → упаковка снизу вверх | да |
+| Label | Слоты выделяются монотонно → разбиение по `label_id` и последовательная запись | **нет** |
+| Count | Побочный продукт скана | нет |
+| Fulltext BM25 | Сортировка кортежей `(term, doc_ref, tf)` → потоковая инверсия по группам термов | да |
+| HNSW | Параллельная сборка в памяти, сериализация один раз | не применимо |
+| Geometry R-tree | STR-упаковка (Sort-Tile-Recursive) | да, 2 сортировки на уровень |
+| Reachability / Neighbourhood / Path | Вычисляются **после** загрузки; вход уже упорядочен по `DiskAtomRef` | нет |
+| EdgeEndpoint | Сортировка `(endpoint_ref, edge_ref, role)` | да |
+
+**Проверка уникальности бесплатна.** В отсортированном потоке нарушение уникальности — это ровно пара соседних записей с равным префиксом-ключом. Одно сравнение с предыдущей записью, `O(1)` памяти, ноль обращений к диску — вместо спуска по дереву на каждую строку только ради ответа на вопрос «есть ли дубликат».
+
+Тем же проходом бесплатно получаются `distinct_count`, границы корзин гистограммы, `null_fraction` (§19.5) и `doc_freq` для полнотекстового индекса.
+
+**Производные индексы (reachability, neighbourhood, path) не поддерживают построчного сопровождения в принципе:** все их алгоритмы (интервальные метки DFS, GRAIL, FERRARI, BFL, k-hop замыкание, multi-source Dijkstra) требуют глобального обзора графа, и одна вставка ребра может инвалидировать `Θ(n)` меток. Они объявляются **снимковыми артефактами**, актуальными на `build_lsn`: любая мутация топологии переводит их в `stale`, а устаревший индекс не используется молча — планировщик откатывается к `ON_DEMAND`. У них нет `insert`/`delete`, только `build(snapshot)` и `invalidate()`.
+
+**STR-упаковка R-tree** (Sort-Tile-Recursive): отсортировать по координате X, разбить на `S = ceil(sqrt(P))` вертикальных полос, внутри каждой отсортировать по Y и нарезать узлами по `C` элементов; полученные MBR подать на следующий уровень. Даёт заполнение узлов ~100% против ~70% при поштучной вставке и существенно меньшее перекрытие MBR.
+
+**HNSW** сортировке не поддаётся — это инкрементальное построение графа. Bulk-режим ограничивается параллельной сборкой в памяти с **перемешиванием порядка вставки**: если поток загрузки кластеризован (по таблице, по метке, по исходному файлу), жадное построение HNSW деградирует по полноте выдачи, поскольку алгоритм рассчитан на случайный порядок поступления.
+
+#### 20.13.6. Отношение к `DEFER` и `CONCURRENTLY`
+
+`DEFER` (§20.11) **не является** заменой bulk-сборке: он переносит ту же построчную работу в фон, то есть превращает проблему латентности в проблему очереди. На загрузке в сотни миллионов строк это даёт очередь того же порядка.
+
+Разрешение противоречия «очередь в памяти или персистентная» (§20.11 против `gql_spec` §9.6): очередь остаётся **в памяти и ограниченной** `FG_INDEX_PENDING_MAX`. При достижении порога происходит **эскалация**: очередь сбрасывается, индекс помечается `stale`, планируется полная bulk-пересборка. Это crash-safe по построению — ничего долговечного не теряется, поскольку устаревший индекс всё равно строится заново из базовых данных. Персистентная очередь потребовала бы собственного формата, вида WAL-записи и семантики восстановления — то есть незаметно превратилась бы в L0 LSM-дерева, от которого проект отказался сознательно.
+
+Роли получаются раздельными и определёнными: `DEFER` — оптимизация **малой** дельты при редких точечных записях; bulk-сборка — путь **большой** дельты; между ними один явный переход.
+
+`CONCURRENTLY` реализуется **поверх** bulk-сборки: снимок на `build_lsn` → внешняя сортировка и сборка в side-file → добор накопившейся (к этому моменту небольшой) очереди обычными вставками → атомарная подмена поколения.
 
 ---
 
@@ -2312,561 +2644,231 @@ Live queries хранятся только в SchemaCatalog для восста�
 
 ## 22. WAL для дискового режима
 
-### 22.1. Расширенный набор WalKind
+Дисковый режим использует **физический журнал из образов страниц** (frame-WAL) с индексом версий страниц — модель «copy-on-write в логе», как в SQLite WAL и RavenDB Voron. Журнал единый на всю базу данных (§7.1).
 
-Дисковый режим добавляет новые `WalKind`. Существующие (0x01–0x07) не изменяются.
+### 22.0. Модель
 
-```
-// Добавить в WalKind:
-NodeAlloc      = 0x10,   // Выделен slot вершины
-EdgeAlloc      = 0x11,   // Выделен слот ребра
-NodeFree       = 0x12,   // Tombstone вершины
-EdgeFree       = 0x13,
-NodeHotUpdate  = 0x14,   // Обновление NodeHotSlot (delta)
-EdgeHotUpdate  = 0x15,   // Обновление EdgeHotSlot (delta)
-AdjAppend      = 0x16,   // Добавление ребра в adjacency list
-AdjRemove      = 0x17,   // Удаление ребра из adjacency list
-PropSet        = 0x18,   // Установить / обновить PropertyMap
-PropDelete     = 0x19,   // Удалить PropertyMap
-IndexInsert    = 0x1A,   // Вставка в индекс
-IndexDelete    = 0x1B,   // Удаление из индекса
-IndexCompact   = 0x1C,   // Сжатие индекса
-SchemaDef      = 0x1D,   // DDL: DEFINE
-SchemaRemove   = 0x1E,   // DDL: REMOVE
-PageAlloc      = 0x1F,   // Аллокация страницы в файле
-PageFree       = 0x20,   // Освобождение страницы
-StatsUpdate    = 0x21,   // Обновление статистики
-ChangefeedPut  = 0x22,   // Запись в changefeed
-```
+Писатель, желающий изменить логическую страницу `P`, **не правит её на месте**. Он копирует `P` в scratch-фрейм и меняет копию. Коммит — дописать фреймы транзакции и маркер `TxCommit`, затем один `fdatasync`. Чтение страницы на снимке `S` — самый свежий фрейм с `lsn ≤ S`, а если такого нет — страница из `.fgb`. Checkpoint переносит закоммиченные фреймы обратно **на их штатные места** в `.fgb` (§23.1).
 
-### 22.2. Payload для каждого вида
+Что эта модель даёт по сравнению с журналом дельт:
+
+| Проблема | Решение |
+|----------|---------|
+| Незакоммиченные данные на диске | Фреймы незавершённой транзакции лежат в журнале, но без маркера коммита невидимы и никогда не бэкфиллятся. NO-STEAL на уровне `.fgb` **без** ограничения размера транзакции |
+| Torn write | Фрейм **и есть** полный образ страницы; отдельный механизм full-page-write не нужен |
+| Отсутствие on-disk MVCC | Снимок = «фреймы с `lsn ≤ S`». Версионность появляется как побочный эффект |
+| Потолок объёма транзакции | Фреймы спиллятся в журнал; в памяти — только индекс (≈16 байт на фрейм) |
+| Откат | Отбросить scratch-фреймы и записи индекса. UNDO и CLR не нужны |
+| Идемпотентность replay | Применение фрейма — `memcpy`; повторное применение того же образа ничего не меняет |
+
+Ключевое отличие от «чистого COW» (LMDB): обратная запись **на штатное место** сохраняет арифметическую адресацию §25.1 (`page_no = slot / 102`) и физическую кластеризацию SoA, на которых держится аналитический путь. Data-file COW обе эти вещи разрушает.
+
+### 22.1. Набор WalKind
+
+**Записи восстановления** (участвуют в replay):
 
 ```
-NodeAlloc:     slot(u32) + gen(u32) + kind_flags(u8) + label_id(u32) + table_id(u32)
-EdgeAlloc:     slot(u32) + gen(u32) + topo(u8) + label_id(u32) + table_id(u32)
-NodeFree:      slot(u32) + gen(u32)
-EdgeFree:      slot(u32) + gen(u32)
-NodeHotUpdate: slot(u32) + field_mask(u32) + changed_bytes(variable)
-               field_mask bits: 0=kind_flags, 1=label_id, 2=table_id,
-                                3=adj_out_count, 4=adj_in_count, 5=adj_undir_count,
-                                6=overflow_out, 7=overflow_in, 8=overflow_undir,
-                                9=props_ref
-EdgeHotUpdate: slot(u32) + field_mask(u32) + changed_bytes(variable)
-AdjAppend:
-  kind:       u8   -- 0=node_adj (V-E-V), 1=edge_endpoint (A-I-A)
-  direction:  u8   -- 0=out/inv, 1=in/out, 2=undir
-  new_count:  u16  -- итоговое значение adj_*_count после вставки
-  atom_slot:  u32  -- слот атома-endpoint'а
-  edge_slot:   u32  -- слот ребра, реализующего инцидентность
-  Total = 12 байт
-AdjRemove:
-  kind:       u8   -- 0=node_adj (V-E-V), 1=edge_endpoint (A-I-A)
-  direction:  u8   -- 0=out/inv, 1=in/out, 2=undir
-  new_count:  u16  -- итоговое значение adj_*_count после удаления
-  atom_slot:  u32  -- слот атома-endpoint'а
-  edge_slot:   u32  -- слот удаляемого ребра
-  Total = 12 байт
-PropSet:       disk_atom_ref(u32) + props_len(u32) + encoded_props(variable)
-PropDelete:    disk_atom_ref(u32)
-IndexInsert:   index_id(u32) + key_len(u16) + encoded_key(variable) + disk_atom_ref(u32)
-IndexDelete:   index_id(u32) + key_len(u16) + encoded_key(variable) + disk_atom_ref(u32)
-SchemaDef:     kind(u8) + schema_id(u32) + def_len(u32) + def_bytes(variable)
-SchemaRemove:  kind(u8) + schema_id(u32)
-PageAlloc:     file_kind(u8) + page_no(u64)
-PageFree:      file_kind(u8) + page_no(u64)
-StatsUpdate:   stats_kind(u8) + table_id(u32) + delta_bytes(variable)
-ChangefeedPut: table_id(u32) + entry_len(u32) + entry_bytes(variable)
+TxBegin         = 0x30,   // Начало транзакции
+TxCommit        = 0x31,   // Коммит: commit_ts + frame_count
+TxAbort         = 0x32,   // Явный откат
+PageFrame       = 0x33,   // Полный образ страницы
+PageInit        = 0x34,   // Страница создана после checkpoint (образ не нужен)
+CheckpointBegin = 0x35,
+CheckpointEnd   = 0x36,   // checkpoint_lsn + dirty page table
+GraphCreate     = 0x37,   // graph_id + name
+GraphDrop       = 0x38,   // graph_id
 ```
 
-### 22.3. WAL-first инвариант
+**Логические аннотации** (0x10–0x22 из прежней редакции: `NodeAlloc`, `AdjAppend`, `PropSet`, `IndexInsert`, `SchemaDef`, `StatsUpdate`, `ChangefeedPut` и прочие) **сохраняются, но перестают быть записями восстановления**. Они опциональны, не реплеятся и служат changefeed'у, логической репликации и диагностике. Единственный источник истины при восстановлении — фреймы.
 
-Для каждой мутации:
-1. WAL: append запись с operation details
-2. BufferPool: обновить страницу (dirty), установить page_lsn = entry_lsn
-3. При COMMIT: WAL fsync → данные durable
-4. Страницы flush: при eviction или checkpoint
-   (только если wal_lsn для страницы ≤ persisted_wal_lsn — LSN последнего fsync'нутого WAL сегмента)
+Записи режима 1 (0x01–0x07, in-memory MVCC поверх логического WAL) не изменяются.
 
-**Нарушение**: страница **никогда** не должна быть записана на диск раньше соответствующей WAL-записи.
-Это обеспечивает `page_lsn ≤ persisted_wal_lsn` на диске.
+### 22.2. Формат записей
 
-### 22.4. Формат заголовка WAL-записи
-
-Расширение существующего формата (без изменения). Текущий формат (`mvcc_persist.rs`):
+Заголовок записи:
 
 ```
-[MVCE:4][lsn:8][tx_id:8][kind:1][payload_len:4][crc32:4] = 29 байт
+[ MVCE:4 ][ lsn:8 ][ tx_id:8 ][ kind:1 ][ payload_len:4 ][ checksum:8 ] = 33 байта
 ```
 
-Этот формат достаточен для дискового режима с новыми `WalKind` значениями.
-`crc32` покрывает `lsn || tx_id || kind || payload_len || payload`.
+`checksum` — xxHash3-64 по `lsn ‖ tx_id ‖ kind ‖ payload_len ‖ payload`. Переход с CRC32 на xxHash3-64 согласует контрольную сумму записи с контрольной суммой страницы (§8) и заметно дешевле на 16-КиБ полезной нагрузке.
+
+Payload по видам:
+
+```
+PageFrame:       graph_id(u64) + file_kind(u8) + _pad(7) + page_no(u64) + page_bytes(PAGE_SIZE)
+                 Total = 16408 байт
+PageInit:        graph_id(u64) + file_kind(u8) + _pad(1) + page_type(u16) + _pad(4) + page_no(u64)
+TxBegin:         (пусто)
+TxCommit:        commit_ts(u64) + frame_count(u32) + _pad(4)
+TxAbort:         (пусто)
+CheckpointBegin: (пусто)
+CheckpointEnd:   checkpoint_lsn(u64) + dpt_len(u32) + [ (graph_id u64, file_kind u8, _pad u8[7],
+                                                         page_no u64, rec_lsn u64) × N ]
+GraphCreate:     graph_id(u64) + name_len(u16) + name_utf8(variable)
+GraphDrop:       graph_id(u64)
+```
+
+**`PageKey = (graph_id: u64, file_kind: u8, page_no: u64)`** — ключ индекса версий страниц. `graph_id = SYSTEM_GRAPH_ID = 0` адресует системное пространство (каталог схемы, каталог графов, параметры, функции), поэтому DDL и данные покрываются одним механизмом.
+
+`PageInit` вместо `PageFrame` для страниц, выделенных **после** последнего checkpoint: у такой страницы нет предыдущего содержимого, которое стоило бы сохранять, а восстановить её можно из логики аллокации. Это убирает практически всю стоимость фреймов при массовой загрузке, где страницы создаются и заполняются один раз.
+
+### 22.3. Индекс версий страниц
+
+В памяти: `HashMap<PageKey, SmallVec<(Lsn, FrameOffset)>>` — для каждой страницы список её версий в журнале. Чтение страницы на снимке `S`: взять самый свежий фрейм с `lsn ≤ S`; если такого нет — читать `.fgb`.
+
+Стоимость — один хеш-поиск на промах буфер-пула. В read-heavy фазе после бэкфилла индекс пуст, поэтому доминирующая нагрузка не платит ничего. Память — порядка 16 байт на фрейм: миллион неотбэкфилленных страниц ≈ 16 МБ.
+
+Индекс восстанавливается при старте одним проходом по журналу и не персистится отдельно.
+
+### 22.4. WAL-first инвариант
+
+1. Изменение страницы идёт в scratch-фрейм; исходная страница в `.fgb` не трогается.
+2. Коммит: дописать фреймы транзакции → `TxCommit` → **один** `fdatasync` (независимо от числа затронутых графов и файлов).
+3. Страница в `.fgb` по физическому адресу `L` записывается **только после** того, как все фреймы этой страницы с `lsn ≤ page_lsn` durable в журнале.
+4. Журнал **никогда** не обрезается раньше `fsync` файлов данных.
+
+Пункты 3–4 — это весь протокол долговечности; правило «не писать страницу раньше её WAL-записи» выполняется автоматически, поскольку запись в `.fgb` бывает только при бэкфилле уже durable фреймов.
 
 ---
 
 ## 23. Checkpoint и Recovery
 
-### 23.1. Checkpoint (дисковый режим)
+### 23.1. Checkpoint — бэкфилл фреймов
 
-Checkpoint синхронизирует состояние BufferPool с WAL и обновляет суперблок.
-
-Алгоритм disk-backed checkpoint:
-
-1. Flush all dirty pages для каждого .fgb файла:
-   для каждого файла: BufferPool::flush_all(file_id, backend)
-2. fsync каждого .fgb файла (в порядке: props → hot → adj → labels → schema → stats → idx)
-3. WAL: append CheckpointEnd { snapshot_lsn: current_lsn, dirty_pages: [] }
-4. WAL: fsync активного сегмента
-5. Атомарно обновить GraphSuperblock:
-   superblock.checkpoint_lsn = current_lsn
-   atomiс write (tmp → rename)
-6. WAL rotation: start_new_segment()
-7. prune_before(checkpoint_lsn): удалить старые WAL сегменты
-8. (опционально) purge старых changefeed файлов
-
-**Fuzzy checkpoint (non-blocking):**
-
-- Шаги 1–2 выполняются фоново (dirty flush через BufferPool eviction clock).
-- Транзакции продолжают работать; новые WAL-записи идут в активный сегмент.
-- Шаги 3–8 выполняются после подтверждения flush всех страниц с `page_lsn ≤ checkpoint_lsn`.
-
-### 23.2. Recovery (дисковый режим)
+Checkpoint переносит закоммиченные фреймы из журнала обратно в `.fgb` **на их штатные места** и затем обрезает журнал.
 
 ```
-Алгоритм disk-backed recovery:
-
-1. Открыть GraphSuperblock → checkpoint_lsn
-   Если суперблок повреждён (checksum mismatch или page_no mismatch) →
-   попытаться прочитать резервную копию superblock.fgb.tmp;
-   если и она повреждена → FATAL ERROR (нет точки восстановления).
-   
-2. Загрузить все WAL сегменты через MultiSegmentReader после checkpoint_lsn.
-
-3. Single-Pass REDO с inline torn-write detection:
-   
-   per_tx_ops: HashMap<TxId, Vec<DiskPageOp>>
-   
-   for (lsn, entry) in wal.iter_from(checkpoint_lsn):
-     match entry:
-       COMMIT(tx, commit_ts) →
-         for each op in per_tx_ops[tx] (в порядке LSN):
-           page = read_page(op.file_kind, op.page_no)
-
-           -- Inline torn-write detection:
-           if checksum(page) != stored_checksum(page)
-              OR page.page_no != op.page_no:
-             -- Страница повреждена (torn write).
-             -- REDO применяем безусловно, игнорируем page_lsn.
-             apply_op(op, page)
-             set_page_lsn(page, lsn)
-           else if lsn > page.page_lsn:
-             -- Страница цела, но не содержит эту операцию.
-             apply_op(op, page)
-             set_page_lsn(page, lsn)
-           -- else: lsn ≤ page_lsn → операция уже на диске, пропускаем.
-
-         per_tx_ops.remove(tx)
-
-       ABORT(tx) →
-         per_tx_ops.remove(tx)    -- uncommitted → discard
-
-       other(tx, op) →
-         per_tx_ops[tx].push(op)  -- накапливаем до COMMIT/ABORT
-
-4. Flush всех dirty страниц → fsync всех .fgb файлов.
-
-5. Write fresh checkpoint.
+1. WAL: append CheckpointBegin
+2. Для каждого графа (независимо, в любом порядке):
+     для каждого фрейма с lsn ≤ commit_watermark и lsn > page_lsn страницы:
+         записать образ страницы по адресу page_no в соответствующий .fgb
+         page_lsn := lsn фрейма
+3. fsync каждого затронутого .fgb
+4. Обновить пографовые водяные знаки: GraphSuperblock.backfilled_lsn
+5. WAL: append CheckpointEnd { checkpoint_lsn, dirty_page_table }
+6. WAL: fsync
+7. Атомарно обновить db.fgb (глобальный checkpoint_lsn), tmp → rename
+8. prune_before(prunable_prefix) — обрезать журнал
 ```
 
-Порядок применения WAL-записей при recovery имеет значение. 
-Если в одной транзакции были `PageAlloc → NodeAlloc → AdjAppend`, то при recovery они применяются строго в порядке LSN. 
-`PageAlloc` должен быть обработан раньше `NodeAlloc` — иначе freelist окажется в рассинхронизированном состоянии. 
-Это гарантируется тем, что WAL пишется последовательно и итерируется по возрастанию LSN.
+**Что копируется.** Только фреймы транзакций, у которых есть маркер `TxCommit`. Фрейм незавершённой транзакции физически не может попасть в файл данных — отсюда свойство NO-STEAL на уровне `.fgb` без каких-либо ограничений на размер транзакции.
 
-**Гарантии:**
-
-- Uncommitted транзакции отбрасываются (нет UNDO фазы, нет CLR).
-- `page_lsn` обеспечивает idempotency: повторный REDO не портит данные.
-- torn write страницы обязательно восстанавливаются через REDO.
-
-REDO-семантика AdjAppend (зависит от kind bit):
-- Если `kind = 0`:
-  1. Читаем `NodeHotSlot[node_slot]`
-  2. Если `edge_slot` уже есть в `adj_*[]` или overflow — пропускаем (idempotent)
-  3. Иначе вставляем: в inline-массив если место есть, иначе в overflow-цепочку
-  4. Устанавливаем `adj_*_count = new_count`
-- Если `kind = 1`:
-  1. Прочитать `EdgeHotSlot[edge_slot]`
-  2. Определить сторону: `direction=0 → inv_inline, direction=1 → out_inline`
-  3. Проверить idempotency: если `ref_slot` уже присутствует в inline-массиве или в цепочке overflow для выбранного `direction` → пропустить (уже применено)
-  4. Если место в inline-массиве (`inv_count < 4` или `out_count < 4`):
-     a. Записать `ref_slot` в следующую свободную позицию inline-массива
-     b. Инкрементировать `inv_count` или `out_count`
-  5. Иначе (overflow):
-     a. Найти последнюю страницу overflow-цепочки (`inv_overflow` или `out_overflow`)
-     b. Если страница полна — аллоцировать новую `AdjacencyOverflowPage`, обновить `next_page`
-     c. Записать `ref_slot` в entries новой/текущей overflow-страницы, инкрементировать count
-  6. Установить `inv_count` или `out_count` = new_count из WAL-записи
-  7. Пометить `EdgeHotSlot` страницу dirty, обновить `page_lsn`
-  8. Если `ref_slot` является атомом типа Edge (bit31=1):
-     a. Обновить `EdgeEndpointIndex`: вставить запись `{endpoint_ref=ref_slot, edge_ref=edge_slot, role=direction}`
-
-REDO-семантика AdjRemove (зависит от kind bit):
-- Если `kind = 0`:
-  1. Читаем `NodeHotSlot[node_slot]`
-  2. Если `edge_slot` не найден в `adj_*[]` и overflow — пропускаем (idempotent)
-  3. Иначе удаляем: из inline swap-remove или из overflow
-  4. Устанавливаем `adj_*_count = new_count`
-- Если `kind = 1`:
-  1. Прочитать `EdgeHotSlot[edge_slot]`
-  2. Определить сторону: `direction=0 → inv_inline, direction=1 → out_inline`
-  3. Проверить idempotency: если `ref_slot` отсутствует в inline и overflow → пропустить
-  4. Если `ref_slot` в inline-массиве:
-     a. swap_remove: заменить `ref_slot` на последний элемент inline-массива
-     b. Декрементировать `inv_count` или `out_count`
-  5. Иначе (в overflow):
-     a. Найти страницу цепочки, содержащую `ref_slot`
-     b. swap_remove внутри страницы: заменить `ref_slot` на последний entry страницы
-     c. Если страница стала пустой — исключить из цепочки, освободить страницу в freelist
-     d. Декрементировать count на overflow-странице
-  6. Установить `inv_count` или `out_count` = new_count из WAL-записи
-  7. Пометить dirty, обновить page_lsn
-  8. Если `ref_slot` типа Edge:
-     a. Удалить запись из `EdgeEndpointIndex`
-
-Примечание: AdjAppend и AdjRemove содержат `new_count`, поэтому отдельный NodeHotUpdate для счётчика НЕ нужен.
-Операция атомарна в рамках одной WAL-записи.
-
-#### 23.2.1. Алгоритмы Recovery для всех `WalKind`
-
-Базовый принцип для всех: проверка `entry_lsn > page_lsn` перед применением (idempotency guard).
-Если `entry_lsn ≤ page_lsn` — операция уже применена, пропустить.
-
-###### NodeAlloc
+**Что можно делать пографово, а что нельзя.** Бэкфилл — пографовая работа и планируется независимо для каждого графа. Глобальна только **обрезка**:
 
 ```
-1. Прочитать страницу nodes_hot.fgb, содержащую slot
-   (page_no = slot / 63)
-2. Idempotency: если NodeHotSlot[slot].gen == gen И tombstone=0 → пропустить
-3. Инициализировать NodeHotSlot[slot]:
-   - gen = payload.gen
-   - kind_flags = payload.kind_flags (tombstone=0)
-   - label_id = payload.label_id
-   - table_id = payload.table_id
-   - все adj_* = 0, overflow_* = NULL_PAGE
-   - props_page = NULL_PAGE
-4. Обновить freelist: установить бит slot в 0 (занят)
-5. Пометить страницу dirty, page_lsn = entry_lsn
+prunable_prefix = min( min по живым графам (backfilled_lsn),
+                       oldest_reader_mark,
+                       oldest_active_tx_first_frame )
 ```
 
-###### EdgeAlloc
+Это стандартное ограничение любого общего журнала: PostgreSQL, InnoDB и RocksDB держат общий лог до минимума по всем объектам. Отсюда же следует патология: один граф, в который давно не было checkpoint'а, удерживает журнал целиком. Защита — `FG_WAL_MAX_TOTAL_BYTES`: при превышении принудительно запускается бэкфилл отстающего графа (аналог `max_total_wal_size` в RocksDB).
+
+**Идемпотентность и прерываемость.** Шаг 2 — чистый `memcpy` под защитой `page_lsn`, поэтому checkpoint можно прервать и перезапустить в любой момент без последствий. Обрезка (шаг 8) выполняется строго после `fsync` файлов данных: пока файл не синхронизирован, фреймы обязаны оставаться в журнале.
+
+**Долгие читатели.** Читатель удерживает `oldest_reader_mark` и тем самым тормозит обрезку — журнал растёт. Меры: `FG_MAX_SNAPSHOT_AGE_SEC` принудительно закрывает устаревшие снимки; режим checkpoint `Restart` блокирует новых читателей, чтобы дать журналу схлопнуться; для долгой аналитики предусмотрен режим 3 (`query_to_memory`), который материализует подграф в память и **освобождает снимок**, вместо того чтобы держать его открытым весь расчёт.
+
+### 23.2. Recovery
+
+Восстановление — один упорядоченный проход по журналу. Отдельных фаз analysis/redo/undo нет, каталога процедур на каждый вид записи нет.
 
 ```
-1. Прочитать страницу edges_hot.fgb (page_no = slot / 127)
-2. Idempotency: если EdgeHotSlot[slot].gen == gen И tombstone=0 → пропустить
-3. Инициализировать EdgeHotSlot[slot]:
-   - gen = payload.gen
-   - topo = payload.topo
-   - flags = 0 (tombstone=0)
-   - label_id = payload.label_id
-   - table_id = payload.table_id
-   - weight = NaN
-   - все inline-массивы обнулить, overflow = NULL_PAGE
-   - props_page = NULL_PAGE
-4. Обновить freelist edges: бит slot = 0
-5. Dirty, page_lsn = entry_lsn
+1. Прочитать db.fgb → checkpoint_lsn (при повреждении — из .tmp, иначе FATAL).
+2. Проход по журналу с checkpoint_lsn:
+     построить индекс версий страниц: PageKey → [(lsn, offset)]
+     зафиксировать множество транзакций с маркером TxCommit
+     отметить graph_id, удалённые записями GraphDrop
+3. Отбросить фреймы транзакций без маркера коммита (это и есть весь «откат»).
+4. Применить закоммиченные фреймы в порядке возрастания LSN:
+     пропустить фреймы для удалённых graph_id
+     применить, если lsn > page_lsn страницы (или страница повреждена — см. §23.4)
+5. fsync файлов данных.
+6. Записать свежий checkpoint.
 ```
 
-###### NodeFree
+**Порядок строго по LSN, а не по коммитам.** Это принципиально. Прежняя редакция буферизовала операции по транзакциям и применяла их в момент `COMMIT`, из-за чего при пересечении двух транзакций на одной странице закоммиченное изменение могло быть **молча потеряно**:
 
 ```
-1. Прочитать NodeHotSlot[slot]
-2. Idempotency: если tombstone=1 → пропустить
-3. Проверить gen совпадает (защита от применения к переиспользованному слоту)
-4. Установить kind_flags.tombstone = 1
-5. Обнулить adj_*, overflow_*, props_page (опционально — для чистоты)
-6. Обновить freelist: бит slot = 1 (свободен)
-7. Dirty, page_lsn = entry_lsn
+lsn 100: tx A → изменение страницы P
+lsn 101: tx B → изменение страницы P
+lsn 200: COMMIT B → применяем (101 > page_lsn) → page_lsn = 101
+lsn 300: COMMIT A → 100 ≤ 101 → ПРОПУЩЕНО, хотя A закоммичена
 ```
 
-###### EdgeFree
+При воспроизведении в порядке LSN этой ситуации не возникает по построению.
+
+**Память.** `O(число фреймов)`, а не `O(объём полезной нагрузки)`: индекс хранит только смещения. Прежняя схема удерживала полные payload'ы (`PropSet` несёт весь сериализованный `PropertyMap`), то есть требовала памяти порядка размера самой большой транзакции.
+
+**Сложность.** `O(|журнал с последнего checkpoint|)`.
+
+### 23.3. Порядок при COMMIT
 
 ```
-1. Прочитать EdgeHotSlot[slot]
-2. Idempotency: tombstone=1 → пропустить
-3. Проверить gen
-4. Установить flags.tombstone = 1
-5. Обнулить inline-массивы, overflow, props_page
-6. Freelist: бит slot = 1
-7. Dirty, page_lsn = entry_lsn
+1. Validate (SSI / SI)
+2. Assign commit_ts (глобальный счётчик БД)
+3. WAL: append фреймы транзакции
+4. WAL: append TxCommit { commit_ts, frame_count }
+5. WAL: fsync (fdatasync)               ← один на всю транзакцию
+6. MvccManager: commit(tx)              ← версии становятся видимы
+7. Бэкфилл — позже, при checkpoint
 ```
 
-###### NodeHotUpdate
+Один `fsync` покрывает транзакцию целиком, сколько бы графов, таблиц и файлов она ни затронула.
+
+### 23.4. Torn write
 
 ```
-1. Прочитать NodeHotSlot[slot]
-2. Idempotency: page_lsn ≥ entry_lsn → пропустить
-3. Декодировать field_mask из payload
-4. Для каждого установленного бита маски — применить соответствующее поле:
-   - bit0 (kind_flags): записать 1 байт
-   - bit1 (label_id): записать u32
-   - bit2 (table_id): записать u32
-   - bit3 (adj_out_count): записать u16
-   - bit4 (adj_in_count): записать u16
-   - bit5 (adj_undir_count): записать u16
-   - bit6 (overflow_out): записать u64
-   - bit7 (overflow_in): записать u64
-   - bit8 (overflow_undir): записать u64
-   - bit9 (props_ref): записать props_page(u64) + props_slot(u32) + props_len(u32)
-5. Dirty, page_lsn = entry_lsn
-```
-
-###### EdgeHotUpdate
-
-Аналогично NodeHotUpdate, но для EdgeHotSlot с соответствующим полевым маппингом.
-
-###### AdjAppend
-
-kind=0 (node-adjacency, V-E-V):
-```
-1. Прочитать NodeHotSlot[node_slot]
-2. Idempotency: если edge_slot уже есть в adj_*[direction] inline или overflow → пропустить
-3. Если место в inline (счётчик < 16 для out/in, < 8 для undir):
-   a. Записать edge_slot в следующую свободную позицию
-   b. Инкрементировать adj_*_count
-4. Иначе:
-   a. Пройти overflow-цепочку до последней страницы
-   b. Если последняя страница полна (count = 4076):
-      - Аллоцировать новую AdjacencyOverflowPage (freelist adj_over)
-      - WAL: PageAlloc уже должен быть в логе до этой записи
-      - Установить next_page предыдущей страницы
-   c. Записать edge_slot в entries, инкрементировать count страницы
-5. Установить adj_*_count = new_count
-6. Dirty NodeHotSlot и overflow-страница, page_lsn = entry_lsn
-```
-
-kind=1 (edge-adjacency, A-I-A):
-```
-1. Прочитать EdgeHotSlot[atom_slot] (atom_slot = edge_slot в WAL)
-2. Idempotency: если ref_slot уже в inv_inline или out_inline или overflow → пропустить
-3. direction=0 → inv_inline (inv_count), direction=1 → out_inline (out_count)
-4. Если место в inline (count < 4):
-   a. Записать ref_slot
-   b. Инкрементировать inv_count / out_count
-5. Иначе:
-   a. Если CROSS_LEVEL=1: пройти in_sg_overflow / out_sg_overflow цепочку
-      (CrossLevelAdjacencyOverflowPage, entries = 12 байт)
-   б. Иначе: пройти inv_overflow / out_overflow (обычный AdjacencyOverflowPage)
-   в. Аллоцировать новую страницу если нужно
-   г. Записать ref_slot, обновить count
-6. Если ref_slot является Edge (bit31=1):
-   Обновить EdgeEndpointIndex: вставить {endpoint_ref=ref_slot, edge_ref=atom_slot, role=direction}
-7. Установить inv_count / out_count = new_count
-8. Dirty, page_lsn = entry_lsn
-```
-
-###### AdjRemove
-
-kind=0 (node-adjacency, V-E-V):
-```
-1. Прочитать NodeHotSlot[node_slot]
-2. Idempotency: edge_slot отсутствует в adj_* → пропустить
-3. Если в inline: swap_remove (заменить на последний элемент)
-4. Если в overflow:
-   a. Найти страницу и позицию
-   b. swap_remove: заменить на последний entry последней страницы цепочки
-   c. Если последняя страница стала пустой: исключить из цепочки, освободить в freelist
-5. Установить adj_*_count = new_count
-6. Dirty, page_lsn = entry_lsn
-```
-
-kind=1 (edge-adjacency, A-I-A):
-```
-1. Прочитать EdgeHotSlot[atom_slot]
-2. Idempotency: ref_slot отсутствует → пропустить
-3. Аналогичный swap_remove из inline или overflow
-4. Если ref_slot типа Edge: удалить из EdgeEndpointIndex
-5. Установить inv_count / out_count = new_count
-6. Dirty, page_lsn = entry_lsn
-```
-
-###### PropSet
-
-```
-1. Декодировать disk_atom_ref → определить это Node или Edge (bit31)
-2. Прочитать соответствующий hot-слот → получить props_page, props_slot, props_len
-3. Idempotency: если props_len == payload.props_len И page_lsn ≥ entry_lsn → пропустить
-4. Если props_page == NULL_PAGE (новая запись):
-   a. Найти страницу PropHeapPage с достаточным местом (free_bytes ≥ props_len + 4)
-      или аллоцировать новую (freelist props)
-   b. Вставить запись: new_record_start = free_end - props_len
-   c. Записать данные, добавить SlotEntry
-   d. Обновить free_start, free_end
-   e. Обновить hot-слот: props_page, props_slot, props_len
-5. Если props_page != NULL_PAGE (обновление):
-   a. Если новый размер ≤ старого: перезаписать на месте (в пределах record_len)
-   б. Если новый размер > старого:
-      - Tombstone старый SlotEntry (record_offset = 0)
-      - Вставить новую запись (как шаг 4a-4d)
-      - Обновить hot-слот
-6. Если props_len > PAGE_PAYLOAD_SIZE / 2:
-   Large Object: аллоцировать цепочку PropLargeChunkPage
-   - props_slot = 0xFFFF_FFFE (Large Object sentinel)
-   - Записать данные в цепочку, установить props_page на первый chunk
-7. Dirty все затронутые страницы, page_lsn = entry_lsn
-```
-
-###### PropDelete
-
-```
-1. Прочитать hot-слот → props_page, props_slot, props_len
-2. Idempotency: props_page == NULL_PAGE → пропустить
-3. Если Large Object (props_slot == 0xFFFF_FFFE):
-   a. free_page_chain(props.fgb, props_page)
-4. Иначе:
-   a. Прочитать PropHeapPage[props_page]
-   б. SlotEntry[props_slot].record_offset = 0 (tombstone)
-   в. Dirty PropHeapPage
-5. Обнулить в hot-слоте: props_page = NULL_PAGE, props_slot = NULL_SLOT, props_len = 0
-6. Dirty hot-слот, page_lsn = entry_lsn
-```
-
-###### IndexInsert
-
-```
-1. Определить тип индекса по index_id (lookup в SchemaCatalog)
-2. Для B+tree (standard, unique, primary, ee_endpoint):
-   a. Найти leaf-страницу для данного ключа: спуск от root по internal pages
-   б. Idempotency: если ключ+DiskAtomRef уже в leaf → пропустить
-   в. Вставить entry в leaf:
-      - Если место есть: записать entry, обновить num_entries
-      - Если нет места (overflow): B+tree split
-        * Аллоцировать новую leaf-страницу (freelist индекса)
-        * Разделить entries поровну
-        * Обновить next_leaf у обеих страниц
-        * Поднять median-ключ в parent internal page
-        * Если parent тоже переполнен → рекурсивный split вверх
-        * Если split дошёл до root → аллоцировать новый root
-   г. Dirty все затронутые страницы, page_lsn = entry_lsn
-3. Для LabelIndex (sorted array):
-   a. Найти позицию вставки (binary search)
-   б. Idempotency: DiskAtomRef уже есть → пропустить
-   в. Вставить в отсортированную позицию
-   г. Если страница полна: аппендировать в следующую страницу (next_page)
-```
-
-###### IndexDelete
-
-```
-1. Тип индекса по index_id
-2. Для B+tree:
-   a. Спуск от root до leaf
-   б. Idempotency: запись отсутствует → пропустить
-   в. Удалить entry из leaf
-   г. Если leaf опустел: рассмотреть merge с соседним leaf
-      (если сосед имеет достаточно записей — rebalance, иначе merge)
-   д. Если merge — удалить разделительный ключ из parent
-   е. Dirty, page_lsn = entry_lsn
-3. Для LabelIndex:
-   a. Записать NULL_SLOT tombstone на позиции DiskAtomRef
-   б. Dirty, page_lsn = entry_lsn
-```
-
-###### SchemaDef
-
-```
-1. Прочитать SchemaCatalogPage
-2. Idempotency: schema_id уже существует с тем же version → пропустить
-3. Найти страницу с достаточным местом или аллоцировать новую
-4. Вставить SchemaEntry: schema_id, kind, version, name_id, parent_id, def_len, definition
-5. Если schema_id уже существует с меньшим version (OVERWRITE):
-   а. Tombstone старый entry (def_len = 0)
-   б. Вставить новый
-6. Dirty, page_lsn = entry_lsn
-```
-
-###### SchemaRemove
-
-```
-1. Найти SchemaEntry по schema_id
-2. Idempotency: не найден → пропустить
-3. Tombstone: установить def_len = 0 (или специальный флаг DELETED)
-4. Dirty, page_lsn = entry_lsn
-```
-
-###### PageAlloc
-
-```
-1. Прочитать FreelistPage для file_kind
-   (найти нужную FreelistPage: first_page_covered ≤ page_no < first_page_covered + 130624)
-2. Idempotency: бит page_no уже = 0 (занят) → пропустить
-3. Установить бит page_no = 0 в bitmap
-4. Dirty FreelistPage, page_lsn = entry_lsn
-5. Примечание: сама целевая страница инициализируется последующей операцией
-   (NodeAlloc, EdgeAlloc и т.д.) — PageAlloc только резервирует место
-```
-
-###### PageFree
-
-```
-1. Прочитать FreelistPage для file_kind
-2. Idempotency: бит page_no уже = 1 (свободен) → пропустить
-3. Установить бит page_no = 1
-4. Dirty FreelistPage, page_lsn = entry_lsn
-```
-
-###### StatsUpdate
-
-```
-1. По stats_kind определить целевую страницу:
-   - 0=GraphStats: graph_stats_page из суперблока
-   - 1=LabelStats: найти entry по table_id в LabelStatsPage
-   - 2=PropertyHistogram: найти страницу по (table_id, field_id)
-   - 3=DegreeHistogram: найти по label_id + direction
-2. Idempotency: page_lsn ≥ entry_lsn → пропустить
-3. Декодировать delta_bytes и применить к соответствующим счётчикам
-4. Dirty, page_lsn = entry_lsn
-```
-
-###### ChangefeedPut
-
-```
-1. Найти активный changefeed файл для table_id
-   (по имени <table_id>_<since_lsn>.fcf)
-2. Idempotency: запись с данным lsn уже есть → пропустить
-3. Найти последнюю ChangefeedPage или аллоцировать новую
-4. Вставить ChangefeedEntry: lsn, versionstamp, event_kind, atom_ref, данные
-5. Dirty, page_lsn = entry_lsn
-6. Проверить TTL: если текущее время > changefeed_duration от самого старого entry
-   удалить старые сегменты (purge по файловому имени)
-```
-
-### 23.3. Порядок WAL-first при COMMIT
-
-```
-1. Validate (SSI/SI check)
-2. Assign commit_ts
-3. WAL: append COMMIT record          ← сначала log
-4. WAL: fsync (fdatasync)             ← сначала persist
-5. MvccManager: commit(tx)            ← только потом версии видимы
-6. Dirty pages остаются в BufferPool  ← flush при eviction/checkpoint
-```
-
-### 23.4. Torn write handling
-
-```
-При чтении страницы:
-  expected_checksum = xxhash3(page_bytes with checksum field = 0)
-  if page_header.checksum != expected_checksum:
+При чтении страницы из .fgb:
+  expected = xxhash3_64(page_bytes с обнулённым полем checksum)
+  if page_header.checksum != expected || page_header.page_no != ожидаемый:
     → страница повреждена
-    → если есть WAL-записи для этой страницы с lsn > checkpoint_lsn:
-        восстановить через REDO (страница будет перезаписана)
+    → если в журнале есть фрейм этой страницы с lsn > checkpoint_lsn:
+        применить фрейм (полный образ) — страница восстановлена
     → иначе:
-        страница считается потерянной → MetaGraphError::PageCorrupt
+        MetaGraphError::PageCorrupt
 ```
+
+Восстановление всегда возможно, пока фрейм не обрезан, потому что **фрейм — это полный образ**, а не дельта. Именно поэтому обрезка журнала обязана следовать строго после `fsync` файлов данных (§22.4, п. 4): нарушение этого порядка — единственный способ получить невосстановимую рваную страницу.
+
+### 23.5. Изоляция и чтение на снимке
+
+Снимок транзакции — значение `snapshot_lsn` из глобальной последовательности БД. Разрешение чтения страницы:
+
+```
+read_page(PageKey, snapshot_lsn):
+    frames = page_version_index[PageKey]
+    взять самый свежий фрейм с lsn ≤ snapshot_lsn
+    если найден → вернуть его образ
+    иначе       → прочитать страницу из .fgb
+```
+
+Отсюда следуют свойства, которых у модели дельт не было:
+- **Снимок консистентен по всей базе**, а не по одному графу: `snapshot_lsn` сравним с `commit_ts` любой транзакции любого графа.
+- **Читатели не блокируют писателя и наоборот**: писатель добавляет новые фреймы, читатель смотрит на префикс журнала.
+- **Обрезка учитывает читателей**: живой снимок удерживает `oldest_reader_mark`.
+
+**Checkpoint-stable чтение.** Транзакция, объявленная как читающая только отбэкфилленные данные (`BEGIN READ ONLY` с соответствующим режимом), читает исключительно `.fgb`, **не удерживает ни одного фрейма** и видит состояние на момент последнего checkpoint. Это штатный режим для долгой аналитики: он полностью снимает риск разрастания журнала из-за многоминутного обхода.
 
 ---
 
 ## 24. Compaction и дефрагментация
+
+### 24.0. Два разных сценария — и только один из них требует ремапа
+
+Проблема ремапа ссылок возникает исключительно потому, что `DiskAtomRef` — это **позиция слота** (§9). Любое физическое перемещение слота обязано переписать все ссылки на него: индексы, overflow-цепочки, инцидентности, changefeed. Но перемещение слотов нужно далеко не всегда.
+
+Различаются два запроса пользователя, и путать их не следует:
+
+| Запрос | Механизм | Ремап | Блокирует |
+|--------|----------|-------|-----------|
+| «Верните место **внутри** файла для переиспользования» | Логический реклейминг через freelist | **не нужен** | нет |
+| «Сожмите файл **на диске**, верните место ОС» | Полный дефраг с `slot_remap` + `ftruncate` | нужен | да |
+
+**Основной путь — инкрементальный, без ремапа.** По аналогии с `SlotAllocator` освобождение слота логическое: слот помечается tombstone и возвращается во freelist. Страница, у которой доля tombstone-слотов превысила `FG_COMPACTION_TOMBSTONE_RATIO`, становится кандидатом на реклейминг, но **живые слоты на ней не двигаются** — освобождается лишь дыра внутри уже выделенного файла, через постраничный freelist (§15). Файл физически не ужимается, зато новые вставки переиспользуют освободившиеся страницы вместо роста файла. `DiskAtomRef` при этом не меняется вообще, поэтому операция не требует ни ремапа, ни остановки читателей и выполняется в фоне.
+
+Это распространение на hot-страницы того, что уже описано для label-индекса (§24.1) и кучи свойств (§24.2).
+
+**Полный дефраг (§24.3) остаётся, но как редкая офлайн-операция** — ровно для второго сценария, когда нужно вернуть место операционной системе. Он требует эксклюзивного доступа и checkpoint'а с обеих сторон: ни один читатель не может удерживать снимок поперёк `slot_remap`.
 
 ### 24.1. Label Index Compaction
 
@@ -2916,8 +2918,8 @@ kind=1 (edge-adjacency, A-I-A):
 9. SubgraphDirPage — sg_slot это GraphId арены подграфов, не DiskAtomRef;
    если подграфы тоже дефрагментируются — отдельная процедура
 10. Changefeed entries — atom_ref применить remap
-9. Обновить GraphSuperblock
-10. fsync всего → atomic rename
+11. Обновить GraphSuperblock
+12. fsync всего → atomic rename
 ```
 
 Дорогая операция; только по явному запросу или при запуске после длительной эксплуатации по расписанию.
@@ -2962,28 +2964,27 @@ fn free_large_object(pm: &PageManager, first_chunk: u64, wal: &WalWriter, tx: Tx
 ### 25.1. Формулы адресации
 
 ```
-Для NodeHotPage (63 слота × 256 байт):
-  page_no          = slot_index / 63
-  slot_within_page = slot_index % 63
-  byte_offset      = PAGE_HEADER_SIZE + slot_within_page × 256
+Слоты вершин и рёбер имеют одинаковый размер, поэтому формула общая:
 
-Для EdgeHotPage (127 слотов × 128 байт):
-  page_no          = slot_index / 127
-  slot_within_page = slot_index % 127
-  byte_offset      = PAGE_HEADER_SIZE + slot_within_page × 128
+Для NodeHotPage и EdgeHotPage (102 слота × 160 байт):
+  page_no          = slot_index / 102
+  slot_within_page = slot_index % 102
+  byte_offset      = PAGE_HEADER_SIZE + slot_within_page × 160
 ```
+
+Арифметическая адресация сохраняется и в дисковом режиме именно потому, что checkpoint возвращает фреймы **на штатные места** (§23.1); это и было причиной выбрать COW-в-логе вместо COW в файле данных.
 
 ### 25.2. Чтение смежности
 
 ```rust
-fn out_neighbors(disk_graph: &DiskMetaGraph, node_slot: u32) -> Vec<DiskAtomRef> {
+fn out_neighbors(disk_graph: &DiskMetaGraph, node_slot: u64) -> Vec<DiskAtomRef> {
     let hot = disk_graph.node_hot(node_slot);
-    let inline = &hot.adj_out[..min(hot.adj_out_count, 16)];
+    let inline = &hot.adj_out[..min(hot.adj_out_count as usize, 4)];
     let mut result: Vec<_> = inline.iter()
         .take_while(|&&s| s != NULL_SLOT)
         .map(|&&s| DiskAtomRef::edge(s))
         .collect();
-    if hot.adj_out_count > 16 {
+    if hot.adj_out_count > 4 {
         // traverse overflow chain
         let mut page_no = hot.overflow_out;
         while page_no != NULL_PAGE {
@@ -3035,11 +3036,11 @@ fn load_subgraph(disk: &DiskMetaGraph, tx: &MvccTransaction, atom_slots: &[u32])
 ### 25.4. Прямое чтение слота (без BufferPool)
 
 ```rust
-fn node_hot_page_no(slot: u32) -> u64    { (slot / 63) as u64 }
-fn node_hot_offset(slot: u32)  -> usize  { 32 + (slot % 63) as usize * 256 }
+const SLOTS_PER_HOT_PAGE: u64 = 102;
+const HOT_SLOT_SIZE:      u64 = 160;
 
-fn edge_hot_page_no(slot: u32) -> u64    { (slot / 127) as u64 }
-fn edge_hot_offset(slot: u32)  -> usize  { 32 + (slot % 127) as usize * 128 }
+fn hot_page_no(slot: u64) -> u64   { slot / SLOTS_PER_HOT_PAGE }
+fn hot_offset(slot: u64)  -> usize { (32 + (slot % SLOTS_PER_HOT_PAGE) * HOT_SLOT_SIZE) as usize }
 ```
 
 ---
@@ -3073,7 +3074,7 @@ PageHeader(32) (magic=MAGIC_TENSOR, type=TensorCache)
 - Dense-формат: packed bit-matrix, 1 бит на ячейку.
 - Страница данных: PageHeader(32) + 16352 байт битовой матрицы = 16352 × 8 = 130816 бит на страницу.
 
-Например, для n_atoms=10000, n_edges=50000: matrix size = 10000 × 50000 / 8 = 62.5 МБ ≈ 3908 страниц.
+Например, для n_atoms=10000, n_edges=50000: matrix size = 10000 × 50000 / 8 = 62.5 МБ ≈ 3823 страниц.
 Только для специализированных ML-сценариев.
 
 ### 26.3. Инвалидация кэша
@@ -3110,15 +3111,50 @@ TensorCachePage инвалидируется при любом изменени�
 | `FG_LABEL_DICT_CACHE_MB`             | usize  | 32        | In-memory LRU кэш label dictionary                 |
 | `FG_PROPS_COMPRESS_THRESHOLD`        | usize  | 512       | Сжимать props если serialized_size > N байт        |
 | `FG_HNSW_CACHE_SIZE`                 | usize  | 268435456 | HNSW кэш (256 МиБ); §9.6 gql_spec                  |
-| `FG_INDEX_BTREE_FILL_FACTOR`         | f64    | 0.80      | Заполнение B+tree листьев при bulk insert          |
-| `FG_COMPACTION_TOMBSTONE_RATIO`      | f64    | 0.20      | Compaction label index при tombstone ratio > N     |
+| `FG_COMPACTION_TOMBSTONE_RATIO`      | f64    | 0.20      | Инкрементальный реклейминг страницы при tombstone ratio > N |
 | `FG_COMPACT_HOT_TOMBSTONE_RATIO`     | f64    | 0.30      | Полный defrag при tombstone ratio > N              |
 | `FG_STATS_AUTO_ANALYZE_DIRTY`        | f64    | 0.10      | Авто-ANALYZE при dirty_fraction > N                |
 | `FG_ASYNC_EVENT_PROCESSING_INTERVAL` | u64    | 5000      | Интервал обработки async событий (мс)              |
 | `FG_CHANGEFEED_PURGE_INTERVAL_SEC`   | u64    | 3600      | Интервал очистки старых changefeed файлов          |
 | `FG_PATH_MAX_DEPTH`                  | usize  | 30        | Максимальная глубина путей                         |
 | `FG_TRAVERSAL_READ_YOUR_WRITES`      | bool   | false     | Traversal видит собственные мутации                |
-| `FG_TEMPFILES_PATH`                  | String | ""        | Путь для SELECT TEMPFILES                          |
+| `FG_TEMPFILES_PATH`                  | String | ""        | Каталог временных файлов: спиллинг сортировок запросов **и** сборки индексов |
+
+**Журнал и checkpoint** (§22–§23)
+
+| Параметр                     | Тип   | Default    | Описание                                                              |
+|------------------------------|-------|------------|-------------------------------------------------------------------------|
+| `FG_WAL_FRAME_SPILL_PAGES`   | usize | 1024       | Порог грязных фреймов транзакции, после которого они спиллятся в журнал |
+| `FG_WAL_CHECKPOINT_FRAMES`   | usize | 4096       | Порог автоматического запуска бэкфилла                                |
+| `FG_WAL_MAX_TOTAL_BYTES`     | u64   | 1073741824 | Жёсткий предел размера журнала (1 ГиБ) → принудительный бэкфилл отстающего графа |
+| `FG_WAL_SYNC_MODE`           | enum  | `full`     | `full` \| `normal` \| `off`                                            |
+| `FG_MAX_SNAPSHOT_AGE_SEC`    | u64   | 300        | Возраст снимка, после которого он принудительно закрывается, чтобы разблокировать обрезку журнала |
+
+**Сборка индексов и массовая загрузка** (§20.13)
+
+| Параметр                              | Тип   | Default   | Описание                                              |
+|---------------------------------------|-------|-----------|---------------------------------------------------------|
+| `FG_BULK_SORT_MEM`                    | usize | 268435456 | Память на прогон внешней сортировки (256 МиБ)         |
+| `FG_BULK_SORT_MERGE_FANIN`            | usize | 64        | Степень k-путёвого слияния                            |
+| `FG_BULK_SORT_PARALLELISM`            | usize | ядра      | Потоки генерации прогонов                             |
+| `FG_INDEX_BTREE_FILL_FACTOR`          | f64   | **0.90**  | Заполнение листьев B+tree (было 0.80); 1.00 автоматически при монотонном ключе |
+| `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | f64   | 0.95      | Заполнение внутренних узлов B+tree                    |
+| `FG_INDEX_RTREE_FILL_FACTOR`          | f64   | 0.95      | Заполнение узлов R-tree при STR-упаковке              |
+| `FG_INDEX_PENDING_MAX`                | usize | 1000000   | Порог очереди `DEFER` → индекс `stale` + пересборка   |
+| `FG_HNSW_BUILD_MEM`                   | usize | 2 ГиБ     | Бюджет памяти на построение HNSW (отдельно от кэша обслуживания) |
+| `FG_IMPORT_COMMIT_ROWS`               | usize | 1000000   | Размер сегментного коммита при импорте                |
+| `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | usize | 1000      | Сколько нарушений описывается подробно                |
+| `FG_IMPORT_REJECT_LIMIT`              | usize | 0         | Допустимое число нарушений до прерывания              |
+| `FG_IMPORT_NO_SLOT_REUSE`             | bool  | true      | Импорт только дописывает → возможен откат усечением   |
+| `FG_BULK_WAL_MODE`                    | enum  | `minimal` | `minimal` \| `full`; `full` станет обязательным при появлении репликации/PITR |
+
+**Статистика** (§19.5)
+
+| Параметр                        | Тип   | Default | Описание                                                    |
+|---------------------------------|-------|---------|---------------------------------------------------------------|
+| `FG_STATS_HISTOGRAM_BUCKETS`    | usize | 100     | Число корзин equi-depth гистограммы                          |
+| `FG_STATS_SAMPLE_ROWS`          | usize | 30000   | Размер выборки для `ANALYZE`, не зависит от размера таблицы  |
+| `FG_STATS_FULL_SCAN_THRESHOLD`  | usize | 32      | Таблицы меньше N страниц анализируются полным сканом         |
 
 ---
 
@@ -3344,7 +3380,7 @@ pub enum Value {
 
 **Действие**:
 
-- Добавить новые `WalKind` значения 0x10–0x21 (§22.1).
+- Добавить новые `WalKind` значения 0x10–0x22 (§22.1).
 - Добавить соответствующие `WalEntry` варианты.
 - Разделить логику: `MvccWal` (текущий, Mode 1) и `DiskWal` (расширенный, Mode 2).
   Оба используют `WalWriter` / `WalSegmentManager` как transport layer.
