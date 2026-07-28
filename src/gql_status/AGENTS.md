@@ -1,250 +1,234 @@
 # AGENTS.md — `gql_status`
 
 Этот файл дополняет корневой `AGENTS.md` и действует для `src/gql_status/**`.
-Документация и комментарии в этом модуле должны оставаться на русском языке.
+Документация и внутренние комментарии модуля должны оставаться на русском.
 
-## Назначение
+## Назначение и границы
 
-`gql_status` — единая проектная система диагностик Ferros-Grynn. Это не только
-ошибки GQL и не тонкая обёртка над `thiserror`: через неё должны выражаться
-ошибки клиента, движка, хранилища и транзакций, а также предупреждения,
-уведомления и успешные статусы. Модель вдохновлена GQLSTATUS/Neo4j и сохраняет
-машиночитаемую семантику отдельно от текста для человека.
+`gql_status` — единая система структурированных результатов и диагностик
+Ferros-Grynn. Она описывает успешное завершение, отсутствие данных,
+уведомления и ошибки. Не заменяйте её строковыми ошибками, `anyhow` или
+локальными error-enum подсистем.
 
-Не заменяйте эту систему на `anyhow`, строковые ошибки или разрозненные enum с
-ручным `Display`. `thiserror` используется только как совместимый с
-`std::error::Error` внешний слой; источником смысла остаются `Status` и его
-дескриптор.
+`thiserror` не является частью архитектуры модуля. Совместимость со
+`std::error::Error` реализуется явно, а источником семантики остаётся каталог
+`Status`.
 
-## Модель и слои
-
-Поток данных устроен так:
+## Целевая модель
 
 ```text
-Status + StatusMeta
-        │
-        ▼
-   StatusObject
-        │
-        ▼
-DiagnosticRecord + Severity
-        │
-        ▼
- ErrorState + optional cause
-        │
-        ▼
-FerrosGrynnError (Arc<ErrorState>)
+StatusDefinition (статическая семантика кода)
+            +
+Status (типизированные параметры экземпляра)
+            +
+DiagnosticRecord (контекст события)
+            │
+            ▼
+       StatusObject
+        ├──────────────► StatusReport ─► Outcome<T>
+        └── error only ► FerrosGrynnError ─► cause
 ```
 
-- `Status` — сгенерированный enum конкретных кодов. Вариант несёт только
-  параметры, необходимые его шаблону.
-- `StatusDescriptor` — стабильная таксономия статуса: `condition`, `category`,
-  `domain`, `properties`, `classification`.
-- `StatusMeta` — контекст конкретного возникновения: позиция, время и фаза
-  выполнения. Он не является частью идентичности кода.
-- `StatusObject` объединяет `Status` и `StatusMeta`; его `Display` делегирует
-  форматирование статусу.
-- `DiagnosticRecord` добавляет `Severity`, тем самым превращая статус в
-  диагностическое событие.
-- `ErrorState` добавляет причинную связь к другой `FerrosGrynnError`.
-- `FerrosGrynnError` хранит `Arc<ErrorState>`, поэтому клонирование ошибки
-  дешёвое и не копирует всю цепочку.
-- `FerrosGrynnResult<T>` — стандартный alias
-  `Result<T, FerrosGrynnError>`.
+- `StatusDefinition` хранит имя, `StatusCode`, condition, subcondition, domain,
+  kind и hint.
+- `StatusKind` делает допустимые сочетания явными:
+  `Completion`, `Notification { classification, severity }` или
+  `Error { classification, category, severity }`.
+- `Status` — сгенерированный enum. Поля варианта являются параметрами сообщения
+  и wire-представления.
+- `DiagnosticRecord` относится к конкретному событию: location, дополнительные
+  spans, timestamp, execution phase, severity override и extensions.
+- `StatusObject` объединяет статус и diagnostic record и является универсальной
+  публичной диагностикой.
+- `StatusReport` содержит только completion/notification статусы и выбирает
+  primary по GQL precedence.
+- `Outcome<T>` возвращает значение вместе с неошибочными статусами.
+- `FerrosGrynnError` принимает только error-kind и добавляет структурированную
+  cause-цепочку.
 
-`FerrosGrynnError::chain()` идёт от верхнеуровневого контекста к первопричине,
-всегда возвращает хотя бы текущую ошибку; `root()` возвращает последний элемент
-этой цепочки. Поле `cause` помечено `#[source]`, поэтому цепочка должна также
-корректно работать через стандартный `std::error::Error::source`.
+Текущая вложенность намеренно соответствует GQL: diagnostic record является
+частью status object, а не оборачивает его.
 
 ## Карта файлов
 
-- `mod.rs` — публичные реэкспорты и верхнеуровневая классификация
-  (`GqlClassification`, `ErrorClassification`,
-  `NotificationClassification`).
-- `status.rs` — условия, категории, домены, свойства, метаданные,
-  `StatusObject`, декларативный каталог кодов и `Display` для `Status`.
-- `diagnostic.rs` — `Severity` и `DiagnosticRecord`.
-- `error.rs` — `FerrosGrynnError`, `ErrorState`, builder, цепочки причин и
-  преобразования внешних ошибок.
-- `params.rs` — типизированная подготовка параметров шаблона: идентификаторы,
-  строковые литералы, числа, списки и стили их соединения.
-- `crates/ferros-grynn-macros/src/status_codes.rs` — парсер и генератор
-  `define_status_codes!`; при изменении DSL обязательно изучайте и меняйте его
-  вместе с каталогом.
+- `status.rs` — код, таксономия, определения, каталог и `StatusObject`;
+- `formatting.rs` — formatter-маркеры и wire-значения параметров;
+- `diagnostic.rs` — severity, execution phase и source locations;
+- `error.rs` — `FerrosGrynnError`, cause и адаптеры внешних ошибок;
+- `outcome.rs` — `StatusReport` и `Outcome<T>`;
+- `wire.rs` — отдельный версионированный DTO;
+- `crates/ferros-grynn-macros/src/status_codes.rs` — parser/codegen
+  `define_status_codes!`.
 
-## Контракт статуса
+При изменении DSL всегда меняйте proc-macro, каталог, compile-fail проверки и
+этот документ согласованно.
 
-Каждый обычный вариант задаётся только внутри `define_status_codes!` и обязан
-иметь:
+## Ортогональные измерения
 
-1. уникальное Rust-имя варианта;
-2. уникальный стабильный код строго вида `FG-NNNNN`, где каждая `N` — цифра;
-3. полный `StatusDescriptor`.
+- `Condition` — стандартный класс результата/исключения.
+- `ErrorClassification` — ожидаемая реакция клиента:
+  `ClientError`, `TransientError`, `DatabaseError`.
+- `NotificationClassification` — фильтрация уведомлений.
+- `ErrorCategory` — стадия/характер ошибки из `gql_spec.md`:
+  syntax, semantic, type, transaction, planning или runtime.
+- `Domain` — подсистема-владелец: query, graph, storage, transaction, I/O,
+  configuration, security или external.
+- `Severity` — важность конкретной диагностики. Completion не имеет severity;
+  notification допускает information/warning, error — error/critical.
+- `ExecutionPhase` — динамический контекст. Он не заменяет category: например,
+  runtime-ошибка может обнаружиться при constant folding в optimization.
 
-Опциональны:
+Не возвращайте `StatusProperties`. Transient/performance выражаются
+classification, а external provenance — техническим source.
 
-- `subcondition` — короткое стабильное описание подвида условия;
-- `template` — сообщение для человека с `{}`-местами;
-- `params` — типы и порядок значений для мест шаблона;
-- `join_styles` — обязательный стиль для каждого `ListParam`;
-- `hint` — краткая рекомендация по исправлению.
+## Коды
 
-Пример:
+`StatusCode` отображается как `FG-XXXXX`; тело состоит ровно из пяти ASCII
+цифр/заглавных букв и сохраняет семантику GQL class prefix.
+
+- `00`, `01`, `02`, `03` — completion/warning/no data/information;
+- `22` — data exception;
+- `42` — syntax/access;
+- `50`–`54` — processing/configuration/procedure/program limits;
+- `G1`, `G2` — dependent-object/graph violations.
+
+Для FG-specific подклассов используйте `F` в subclass, например `22F01`.
+Proc-macro обязан отклонять неверный формат, дубликаты и condition, не
+соответствующий class prefix. Опубликованные коды не перенумеровываются без
+явной миграции протокола.
+
+## DSL каталога
+
+Статусы объявляются только через `define_status_codes!`:
 
 ```rust
-InvalidArgument, "FG-00001" => {
-	template: "{}",
-	params: [StringParam::Message],
-	subcondition: "invalid argument",
-	descriptor: StatusDescriptor {
-		condition: Condition::DataException,
-		category: StatusCategory::Data,
-		domain: StatusDomain::Client,
-		properties: StatusProperties::NONE,
-		classification: GqlClassification::ErrorClassification(
-			ErrorClassification::ClientError,
-		),
+ConversionError, "FG-22N37" => {
+	kind: Error {
+		classification: ErrorClassification::ClientError,
+		category: ErrorCategory::Type,
+		severity: Severity::Error,
 	},
+	condition: Condition::DataException,
+	domain: Domain::Query,
+	subcondition: "invalid coercion",
+	message: "Cannot convert {value} to {target_type}; rejected: {value}.",
+	params: {
+		value: String => StringLiteral,
+		target_type: String => ValueType,
+	},
+	hint: "Use an explicit compatible cast.",
 },
 ```
 
-Макрос генерирует:
+Параметр всегда имеет независимые:
 
-- enum `Status`, включая служебные `InternalError` и
-  `UnknownExternalError`;
-- `code()`, `subcondition()`, `descriptor()`, `message()` и `hint()`;
-- поля варианта из `params`: `StringParam` → `String`, `NumberParam` →
-  `i64`, `BoolParam` → `bool`, `ListParam` → `Vec<String>`.
+1. имя поля/именованного placeholder;
+2. хранимый Rust-тип;
+3. formatter-маркер.
 
-Имена полей получаются переводом имени параметра в нижний регистр. Порядок
-`params` обязан точно совпадать с порядком `{}` в `template`. Один параметр
-может повторяться в списке, если значение должно быть подставлено несколько
-раз. Для каждого `ListParam` парсер макроса требует запись в `join_styles`;
-ссылаться там на не-списочный параметр запрещено.
+Один placeholder может встречаться в message многократно; поле и аргумент
+конструктора остаются единственными. Не создавайте `Value1`, `Value2` и
+подобные семантически пустые типы.
 
-Тип параметра задаёт не только Rust-тип, но и отображение. Например,
-`StringParam::Ident` заключает значение в обратные кавычки,
-`StringParam::Operation` — в одинарные, а `Message` выводится без изменений.
-Перед добавлением нового вида параметра проверьте `params.rs`; не форматируйте
-значения заранее в вызывающем коде.
+Macro генерирует:
 
-`Display for Status` сейчас выводит только `message()` или пустую строку.
-`Condition::create_standard_description()` отдельно строит стандартное
-описание из condition/subcondition. Не смешивайте код, стандартное описание,
-сообщение и hint: это разные представления с разными потребителями.
+- вариант `Status`;
+- статический `StatusDefinition`;
+- message formatting и parameters map;
+- snake_case constructor на `Status`;
+- такой же constructor на `FerrosGrynnError` только для error-kind.
 
-## Как добавлять и использовать ошибки
+`constructor: custom_name` переопределяет имя обоих методов. Составные
+предметные фабрики с несколькими cause-узлами остаются ручными в `error.rs`.
 
-Для нового известного состояния:
+## Форматирование параметров
 
-1. выберите condition, category, domain, properties и classification по
-   семантике, а не по месту вызова;
-2. зарезервируйте уникальный валидный код;
-3. при необходимости добавьте типизированный параметр/processor;
-4. объявите вариант в активном вызове `define_status_codes!`;
-5. создавайте ошибку через `Status::Variant { ... }.into()` или
-   `FerrosGrynnErrorBuilder`;
-6. добавьте тесты кода, дескриптора, форматирования и цепочки.
+`ParameterFormatter<T>` пишет непосредственно в `fmt::Formatter`; не
+возвращайте из него промежуточный `String`, кроме неизбежного преобразования
+чужого `Display`.
 
-Builder нужен, когда есть причина, критическая severity или метаданные:
+Встроены `DisplayValue`, `Identifier`, `StringLiteral`, `Callable`,
+`QueryParameter`, `ValueType` и `Join<Comma|And|Or, F>`. Идентификаторы и
+литералы обязаны экранироваться. Join обязан корректно работать для 0/1/2/N.
 
-```rust
-FerrosGrynnErrorBuilder::from_status(Status::IntervalFieldOverflow)
-	.with_cause(Status::OverflowError {
-		operation: operation.to_owned(),
-	})
-	.at_phase(ExecutionPhase::Execution)
-	.build()
-```
+Новый тип параметра должен:
 
-Верхний статус должен давать контекст, а `cause` — описывать исходную причину.
-Не инвертируйте эту связь. Не теряйте типизированную внешнюю ошибку без
-необходимости; пока для неё нет отдельного структурированного статуса,
-конвертируйте её в `UnknownExternalError`, сохраняя исходное сообщение.
+- реализовать `StatusParameter` для структурированной инспекции/wire;
+- иметь подходящий `ParameterFormatter<T>`;
+- быть `Clone + Debug + PartialEq`, поскольку эти свойства имеет `Status`.
 
-Новые удобные конструкторы в `impl FerrosGrynnError` допустимы для частых и
-семантически устойчивых случаев, но они не должны дублировать логику
-дескриптора или ручную сборку текста.
+Не форматируйте параметр заранее в call site: это теряет структуру и мешает
+другим представлениям.
 
-## Инварианты
+## Locations
 
-- Код является публичным машинным контрактом: не переиспользуйте и не
-  перенумеровывайте опубликованные коды без миграционного решения.
-- Код, имя варианта и дескриптор должны описывать одно состояние; одинаковый
-  текст не означает одинаковую семантику.
-- Классификация ошибки определяет ответственность и повторяемость:
-  `ClientError` исправляется изменением запроса, `TransientError` допускает
-  повтор позже, `DatabaseError` означает сбой обслуживания со стороны БД.
-- Notification- и error-классификации не взаимозаменяемы и должны
-  соответствовать severity/condition.
-- Метаданные относятся к конкретному событию и не должны встраиваться в
-  статический дескриптор.
-- В цепочке не создавайте циклов. Текущая immutable-модель с новым builder на
-  каждом уровне естественно поддерживает это ограничение.
-- Не раскрывайте в клиентском `message` секреты, внутренние пути, содержимое
-  страниц, ключи или подробности, предназначенные только для логов.
-- Английский язык текущих кодов, subcondition и пользовательских шаблонов
-  сохраняйте для единообразия протокола; русским остаются документация и
-  внутренние поясняющие комментарии.
+`TextSpan` использует UTF-8 byte offset/length и `u32`, как синтаксический
+frontend. `Location` дополнительно хранит 1-based line/column начала и конца.
 
-## Текущее состояние и известные ограничения
+Создавайте location через `Location::from_source`: он проверяет диапазон и
+границы UTF-8. Исходный текст после расчёта не сохраняется. `source_id` должен
+быть безопасным логическим именем, не автоматически раскрытым путём.
 
-Модуль находится в разработке. Не принимайте наличие типа за завершённый API:
+Primary location попадает в стандартную wire-position. Для парных delimiter,
+related expression и других пояснений используйте `LabeledLocation`.
 
-- `ErrorState::fmt` содержит `todo!()`, поэтому форматирование
-  `FerrosGrynnError` сейчас приведёт к panic.
-- Тип `Location`, используемый `StatusMeta` и `at_location`, пока не определён
-  или не импортирован.
-- `StatusObject`, `StatusMeta`, `ExecutionPhase`, `DiagnosticRecord` и
-  `Severity` почти полностью закрыты внутри модуля; публичный API метаданных и
-  инспекции ошибки ещё требует проектирования.
-- `Severity` и диагностические типы пока не сериализуются, хотя классификации
-  сериализуются.
-- Макрос проверяет структуру DSL и наличие join style, но не проверяет формат и
-  уникальность кодов, число placeholder-ов, лишние join styles или
-  согласованность classification с condition.
-- В активном каталоге уже есть временные нарушения целевого контракта:
-  `InvalidArgument` и `ConversationError` используют один код; несколько
-  вариантов имеют пустой код; имя `DivizionByZero` и слово `ConversationError`
-  выглядят как опечатки (`Division`, `Conversion`). Не копируйте эти образцы;
-  исправляйте их отдельным осознанным изменением с тестами и оценкой
-  совместимости.
-- `StatusProperties::EXTERNAL = !0` временно включает все биты, а не отдельный
-  флаг (`TODO` в коде).
-- Большой закомментированный каталог в `status.rs` — справочный черновик, не
-  активный контракт. Не редактируйте его вместо активного вызова макроса и не
-  включайте целиком без ревизии кодов и дескрипторов.
-- Автоматических тестов непосредственно у `gql_status` сейчас нет.
+## Ошибки и внешние источники
 
-При работе над этим модулем сначала отделяйте исправление инфраструктуры от
-массового наполнения каталога. Желательный порядок стабилизации: компиляция и
-безопасный `Display`, публичная инспекция диагностик, валидация DSL
-proc-макросом, тесты, затем расширение набора кодов.
+Cause-цепочка содержит только `FerrosGrynnError`. Внешний Rust error никогда не
+должен становиться пользовательским сообщением или wire cause.
+
+Для внешнего crate пишите явный `From<ExternalError>` или предметную фабрику:
+
+- пользователь получает FG-код и понятный FG-template;
+- оригинал можно сохранить через crate-private `with_technical_source`;
+- technical source исключается из `Display`, публичного `Debug`, `chain()`,
+  `std::error::Error::source()` и wire DTO;
+- не используйте `external.to_string()` как клиентский message.
+
+`chain()` идёт от контекста к корню, `root()` возвращает последний
+структурированный status. Внешний status должен добавлять контекст, внутренний
+cause — конкретную первопричину.
+
+## Wire и безопасность
+
+Не добавляйте `Serialize` непосредственно к runtime error graph.
+`StatusWireV1` — отдельный versioned DTO с code, description, message,
+parameters, classification/category/domain/severity, diagnostic record и
+структурированным cause.
+
+Не помещайте в message/parameters/extensions секреты, исходные страницы,
+ключи, полные локальные пути или непроверенный текст внешней ошибки.
+Неизвестные будущие поля размещаются в extensions.
 
 ## Проверка изменений
 
-Минимальный набор проверок:
+Для каждого статуса проверяйте:
+
+- code/condition/kind/domain и classification/category/severity;
+- message, hint и parameters;
+- повтор именованного placeholder;
+- escaping formatter-ов;
+- `Status`- и error-конструкторы;
+- wire DTO и cause.
+
+Общие сценарии модуля:
+
+- Unicode и многострочные locations, invalid byte boundaries;
+- severity override только в допустимом семействе;
+- GQL precedence в `StatusReport`;
+- `Outcome<T>::map/into_parts`;
+- порядок `chain()`, `root()` и `Error::source`;
+- редактирование technical source.
+
+Запускайте:
 
 ```text
 cargo +nightly fmt
-cargo check
-cargo test gql_status
 cargo test -p ferros-grynn-macros
+cargo test gql_status
+cargo check
 ```
 
-Корневая crate находится в миграции, поэтому общий `cargo check` может падать
-по причинам вне модуля. Это не повод пропускать узкие тесты макроса и
-`gql_status`; явно отделяйте уже существующие сбои от внесённых.
-
-Для каждого нового статуса тестируйте:
-
-- точный `code()`, `subcondition()`, descriptor и hint;
-- сообщение и обработку каждого типа параметра;
-- пустые, одиночные и составные списки для `ListParam`;
-- `From<Status>`, builder с метаданными и severity;
-- порядок `chain()`, результат `root()` и стандартный `source()`;
-- отсутствие panic при `Display`/`Debug`.
-
-После изменений всегда запускайте nightly rustfmt: репозиторий требует табы и
-нестабильные настройки `.rustfmt.toml`.
+Корневая crate находится в миграции и может не собираться по причинам вне
+`gql_status`. Всегда отделяйте исходные failures от внесённых регрессий и
+добивайтесь отсутствия ошибок, указывающих на этот модуль.

@@ -1,11 +1,107 @@
-use crate::gql_status::params::{JoinStyle, ListParam, NumberParam, StringParam};
-use crate::gql_status::{ErrorClassification, GqlClassification, NotificationClassification};
-use ferros_grynn_macros::define_status_codes;
-use magic_utils::Display;
-use std::fmt::{Display, Formatter};
-use bitflags::bitflags;
+use std::{
+	collections::BTreeMap,
+	error::Error,
+	fmt::{self, Display, Formatter},
+	str::FromStr,
+	time::SystemTime,
+};
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Display)]
+use ferros_grynn_macros::define_status_codes;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::gql_status::{
+	diagnostic::{DiagnosticRecord, ExecutionPhase, LabeledLocation, Location, Severity},
+	formatting::{DiagnosticValue, DisplayValue, Identifier, StringLiteral, ValueType},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StatusCode([u8; 5]);
+
+impl StatusCode {
+	pub const fn new(body: [u8; 5]) -> Self {
+		let mut index = 0;
+		while index < body.len() {
+			let byte = body[index];
+			assert!(
+				(byte >= b'0' && byte <= b'9') || (byte >= b'A' && byte <= b'Z'),
+				"status code contains an invalid byte"
+			);
+			index += 1;
+		}
+		Self(body)
+	}
+
+	pub fn body(&self) -> &str {
+		// SAFETY: constructors validate that every byte is ASCII.
+		unsafe { std::str::from_utf8_unchecked(&self.0) }
+	}
+}
+
+impl Display for StatusCode {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(f, "FG-{}", self.body())
+	}
+}
+
+impl FromStr for StatusCode {
+	type Err = StatusCodeParseError;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		let body = value.strip_prefix("FG-").ok_or(StatusCodeParseError::MissingPrefix)?;
+		if body.len() != 5 {
+			return Err(StatusCodeParseError::InvalidLength);
+		}
+		let mut bytes = [0_u8; 5];
+		bytes.copy_from_slice(body.as_bytes());
+		if !bytes.iter().all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase()) {
+			return Err(StatusCodeParseError::InvalidCharacter);
+		}
+		Ok(Self(bytes))
+	}
+}
+
+impl Serialize for StatusCode {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.collect_str(self)
+	}
+}
+
+impl<'de> Deserialize<'de> for StatusCode {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let value = String::deserialize(deserializer)?;
+		value.parse().map_err(serde::de::Error::custom)
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusCodeParseError {
+	MissingPrefix,
+	InvalidLength,
+	InvalidCharacter,
+}
+
+impl Display for StatusCodeParseError {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::MissingPrefix => f.write_str("status code must start with FG-"),
+			Self::InvalidLength => f.write_str("status code body must contain five characters"),
+			Self::InvalidCharacter => {
+				f.write_str("status code must contain only ASCII uppercase letters and digits")
+			}
+		}
+	}
+}
+
+impl Error for StatusCodeParseError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Condition {
 	NoData,
 	Warning,
@@ -13,7 +109,6 @@ pub enum Condition {
 	Informational,
 	DataException,
 	QueryException,
-
 	SyntaxErrorOrAccessRuleViolation,
 	GeneralProcessingException,
 	SystemConfigurationOrOperationException,
@@ -23,3883 +118,619 @@ pub enum Condition {
 	InvalidTransactionState,
 	InvalidTransactionTermination,
 	TransactionRollback,
-	Unknown,
+	ProgramLimitExceeded,
 }
 
 impl Condition {
-	pub fn create_standard_description(&self, subcondition: Option<&str>) -> String {
-		let subcondition = subcondition.unwrap_or("");
+	pub const fn description(self) -> &'static str {
 		match self {
-			Condition::Warning => format!("warn: {}", subcondition),
-			Condition::Informational => format!("info: {}", subcondition),
-			Condition::SuccessfulCompletion => {
-				let message = "note: successful completion";
-				if subcondition.is_empty() {
-					message.to_string()
-				} else {
-					format!("{} - {}", message, subcondition)
-				}
+			Self::NoData => "note: no data",
+			Self::Warning => "warn",
+			Self::SuccessfulCompletion => "note: successful completion",
+			Self::Informational => "info",
+			Self::DataException => "error: data exception",
+			Self::QueryException => "error: query exception",
+			Self::SyntaxErrorOrAccessRuleViolation => {
+				"error: syntax error or access rule violation"
 			}
-			Condition::NoData => {
-				let message = "note: successful completion";
-				if subcondition.is_empty() {
-					message.to_string()
-				} else {
-					format!("{} - {}", message, subcondition)
-				}
+			Self::GeneralProcessingException => "error: general processing exception",
+			Self::SystemConfigurationOrOperationException => {
+				"error: system configuration or operation exception"
 			}
-			_ => {
-				let message =
-					format!("error: {}", self.to_string().to_lowercase().replace("_", " "));
-				if subcondition.is_empty() {
-					message
-				} else {
-					format!("{} - {}", message, subcondition)
-				}
+			Self::ProcedureException => "error: procedure exception",
+			Self::DependentObjectError => "error: dependent object error",
+			Self::GraphTypeViolation => "error: graph type violation",
+			Self::InvalidTransactionState => "error: invalid transaction state",
+			Self::InvalidTransactionTermination => "error: invalid transaction termination",
+			Self::TransactionRollback => "error: transaction rollback",
+			Self::ProgramLimitExceeded => "error: program limit exceeded",
+		}
+	}
+
+	pub fn standard_description(self, subcondition: Option<&str>) -> String {
+		match subcondition {
+			Some(subcondition) if !subcondition.is_empty() => {
+				format!("{} - {subcondition}", self.description())
 			}
+			_ => self.description().to_owned(),
 		}
 	}
 }
 
-#[derive(Debug)]
-pub struct StatusObject {
-	pub(crate) status: Status,
-	pub(crate) meta: StatusMeta,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NotificationClassification {
+	Deprecation,
+	Hint,
+	Performance,
+	Generic,
+	Unrecognised,
+	Unsupported,
+	Security,
+	Topology,
+	Schema,
 }
 
-impl Display for StatusObject {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}", self.status)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorClassification {
+	ClientError,
+	DatabaseError,
+	TransientError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCategory {
+	Syntax,
+	Semantic,
+	Type,
+	Transaction,
+	Planning,
+	Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Domain {
+	Query,
+	Graph,
+	Storage,
+	Transaction,
+	Io,
+	Configuration,
+	Security,
+	External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StatusKind {
+	Completion,
+	Notification {
+		classification: NotificationClassification,
+		severity: Severity,
+	},
+	Error {
+		classification: ErrorClassification,
+		category: ErrorCategory,
+		severity: Severity,
+	},
+}
+
+impl StatusKind {
+	pub const fn severity(self) -> Option<Severity> {
+		match self {
+			Self::Completion => None,
+			Self::Notification {
+				severity,
+				..
+			}
+			| Self::Error {
+				severity,
+				..
+			} => Some(severity),
+		}
+	}
+
+	pub const fn error_classification(self) -> Option<ErrorClassification> {
+		match self {
+			Self::Error {
+				classification,
+				..
+			} => Some(classification),
+			_ => None,
+		}
+	}
+
+	pub const fn notification_classification(self) -> Option<NotificationClassification> {
+		match self {
+			Self::Notification {
+				classification,
+				..
+			} => Some(classification),
+			_ => None,
+		}
+	}
+
+	pub const fn error_category(self) -> Option<ErrorCategory> {
+		match self {
+			Self::Error {
+				category,
+				..
+			} => Some(category),
+			_ => None,
+		}
+	}
+
+	pub const fn is_error(self) -> bool {
+		matches!(self, Self::Error { .. })
+	}
+
+	pub const fn allows_severity(self, severity: Severity) -> bool {
+		matches!(
+			(self, severity),
+			(Self::Notification { .. }, Severity::Information | Severity::Warning)
+				| (Self::Error { .. }, Severity::Error | Severity::Critical)
+		)
 	}
 }
 
-#[derive(Debug, Copy, Clone)]
-enum StatusCategory {
-	Unknown,
-	Query,
-	Syntax,
-	Semantic,
-	Data,
-	Arithmetic,
-	Constraint,
-	Authorization,
-}
-
-#[derive(Debug, Copy, Clone)]
-enum StatusDomain {
-	Unknown,
-	Client,
-	Database,
-	Storage,
-	Transaction,
-	Topology,
-}
-
-bitflags! {
-    #[derive(Debug, Copy, Clone)]
-    struct StatusProperties: u8 {
-        const NONE = 0;
-        const TRANSIENT = 1;
-        const PERFORMANCE = 2;
-
-        const EXTERNAL = !0; // TODO
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-struct StatusDescriptor {
-	condition: Condition,
-	category: StatusCategory,
-	domain: StatusDomain,
-	properties: StatusProperties,
-	classification: GqlClassification,
-}
-
-#[derive(Debug)]
-pub enum ExecutionPhase {
-	Parsing,
-	Planning,
-	Optimization,
-	Execution,
-	Commit,
-}
-
-#[derive(Debug, Default)]
-pub struct StatusMeta {
-	pub(crate) location: Option<Location>,
-	pub(crate) timestamp: Option<std::time::SystemTime>,
-	pub(crate) execution_phase: Option<ExecutionPhase>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusDefinition {
+	pub name: &'static str,
+	pub code: StatusCode,
+	pub condition: Condition,
+	pub subcondition: Option<&'static str>,
+	pub domain: Domain,
+	pub kind: StatusKind,
+	pub hint: Option<&'static str>,
+	pub(crate) has_message: bool,
 }
 
 define_status_codes!(
-    SuccessfulCompletion, "FG-00000" => {
-        descriptor: StatusDescriptor {
-                condition: Condition::SuccessfulCompletion,
-                category: StatusCategory::Unknown,
-                domain: StatusDomain::Unknown,
-                properties: StatusProperties::NONE,
-                classification: GqlClassification::NotificationClassification(NotificationClassification::Unknown),
-        },
-    },
-	InvalidArgument, "FG-00001" => {
-		template: "{}",
-		params: [StringParam::Message]
+	SuccessfulCompletion, "FG-00000" => {
+		kind: Completion,
+		condition: Condition::SuccessfulCompletion,
+		domain: Domain::Query,
+	},
+	OmittedResult, "FG-00001" => {
+		kind: Completion,
+		condition: Condition::SuccessfulCompletion,
+		domain: Domain::Query,
+		subcondition: "omitted result",
+	},
+	NoData, "FG-02000" => {
+		kind: Completion,
+		condition: Condition::NoData,
+		domain: Domain::Query,
+	},
+	DeprecatedFeature, "FG-01F01" => {
+		kind: Notification {
+			classification: NotificationClassification::Deprecation,
+			severity: Severity::Warning,
+		},
+		condition: Condition::Warning,
+		domain: Domain::Query,
+		subcondition: "deprecated feature",
+		message: "{feature} is deprecated; use {replacement} instead.",
+		params: {
+			feature: String => Identifier,
+			replacement: String => Identifier,
+		},
+	},
+	PerformanceAdvisory, "FG-03F01" => {
+		kind: Notification {
+			classification: NotificationClassification::Performance,
+			severity: Severity::Information,
+		},
+		condition: Condition::Informational,
+		domain: Domain::Query,
+		subcondition: "performance advisory",
+		message: "{message}",
+		params: {
+			message: String => DisplayValue,
+		},
+	},
+	InvalidArgument, "FG-22N11" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
 		subcondition: "invalid argument",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
+		message: "{message}",
+		params: {
+			message: String => DisplayValue,
 		},
 	},
-	ConversationError, "FG-00001" => {
-		template: "Cannot convert from '{}' to '{}'",
-		params: [StringParam::Value, StringParam::ValueType]
-		subcondition: "conversation error",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
+	ConversionError, "FG-22N37" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "invalid coercion",
+		message: "Cannot convert {value} to {target_type}; the rejected value was {value}.",
+		params: {
+			value: String => StringLiteral,
+			target_type: String => ValueType,
 		},
 	},
-	DivizionByZero, "FG-22012" => {
+	DivisionByZero, "FG-22012" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
 		subcondition: "division by zero",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::Unknown),
-		}
 	},
 	IntervalFieldOverflow, "FG-22015" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
 		subcondition: "interval field overflow",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
 	},
-	OverflowError, "FG-22N28" => {
-		template: "The result of the operation {} has caused an overflow.",
-		params: [StringParam::Operation],
-		subcondition: "interval field overflow",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+	OperationOverflow, "FG-22N28" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "operation overflow",
+		message: "The result of operation {operation} cannot be represented.",
+		params: {
+			operation: String => StringLiteral,
+		},
 	},
-	InfiniteFloatingPointValue, "" => {
-		subcondition: "floating point value is infinite",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+	NumericValueOutOfRange, "FG-22003" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "numeric value out of range",
+		message: "The numeric value {value} is outside the required range.",
+		params: {
+			value: String => DisplayValue,
+		},
 	},
-	SpecifiedNumericValueOutOfRange, "" => {
-		template: "Expected {} to be of type {} and in the range {} to {} but found {}.",
-		params: [
-			StringParam::Component,
-			StringParam::ValueType,
-			NumberParam::Lower,
-			NumberParam::Upper,
-			StringParam::Value,
-		],
+	SpecifiedNumericValueOutOfRange, "FG-22N03" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
 		subcondition: "specified numeric value out of range",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+		message: "Expected {component} to be of type {value_type} in the range {lower} to {upper}, but found {value}.",
+		params: {
+			component: String => StringLiteral,
+			value_type: String => ValueType,
+			lower: i64 => DisplayValue,
+			upper: i64 => DisplayValue,
+			value: String => DisplayValue,
+		},
 	},
-	StructBuildError, "" => {
-		template: "Cannot build struct {}",
-		params: [StringParam::Ident],
+	StructBuildError, "FG-22F01" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
 		subcondition: "struct build error",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+		message: "Cannot build struct {identifier}.",
+		params: {
+			identifier: String => Identifier,
+		},
 	},
-	UnknownField, "" => {
-		template: "Unknown field {}",
-		params: [StringParam::Field],
+	UnknownField, "FG-22F02" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Semantic,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
 		subcondition: "unknown field",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+		message: "Unknown field {field}.",
+		params: {
+			field: String => Identifier,
+		},
 	},
-	AtomDoesNotExists, "" => {
-		template: "The atom of type {} with id {} does not exist.",
-		params: [StringParam::AtomType, StringParam::Id],
-		subcondition: "atom does not exists",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+	NonExactDivision, "FG-22F03" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "non-exact division",
 	},
-	EmptyEdgeTargets, "" => {
-		template: "Edge atom has not targets",
-		subcondition: "edge atom targets is empty",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+	TemporalProcessingError, "FG-22F04" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::External,
+		subcondition: "temporal value processing failed",
+		message: "The temporal value could not be processed.",
 	},
-	EdgeCreationError, "" => {
+	AtomDoesNotExist, "FG-G1F01" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Graph,
+		subcondition: "atom does not exist",
+		message: "The atom of type {atom_type} with id {id} does not exist.",
+		params: {
+			atom_type: String => ValueType,
+			id: String => DisplayValue,
+		},
+	},
+	EmptyEdgeTargets, "FG-G2F01" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GraphTypeViolation,
+		domain: Domain::Graph,
+		subcondition: "edge targets are empty",
+		message: "An edge must have at least one target.",
+	},
+	EdgeCreationError, "FG-G2F02" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GraphTypeViolation,
+		domain: Domain::Graph,
 		subcondition: "cannot create edge",
-		descriptor: StatusDescriptor {
-			condition: Condition::DataException,
-			category: StatusCategory::Data,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
 	},
-	QueryTooLarge, "" => {
-		template: "Size of query script exceeded maximum supported size of 4,294,967,295 bytes."
+	QueryTooLarge, "FG-54F01" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Syntax,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Query,
 		subcondition: "query too large",
-		descriptor: StatusDescriptor {
-			condition: Condition::QueryException,
-			category: StatusCategory::Query,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+		message: "The query exceeds the maximum supported size of 4,294,967,295 bytes.",
 	},
-	QueryParseError, "" => {
-		template: "Parse error:\n{}",
-		params: [StringParam::Message]
-		subcondition: "query parse error",
-		descriptor: StatusDescriptor {
-			condition: Condition::SyntaxErrorOrAccessRuleViolation,
-			category: StatusCategory::Syntax,
-			domain: StatusDomain::Client,
-			properties: StatusProperties::NONE,
-			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
-		}
+	QueryParseError, "FG-42001" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Syntax,
+			severity: Severity::Error,
+		},
+		condition: Condition::SyntaxErrorOrAccessRuleViolation,
+		domain: Domain::Query,
+		subcondition: "invalid syntax",
+		message: "{message}",
+		params: {
+			message: String => DisplayValue,
+		},
+	},
+	UnexpectedExternalFailure, "FG-50F00" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GeneralProcessingException,
+		domain: Domain::External,
+		subcondition: "unexpected external component failure",
+		message: "Component {component} failed while performing {operation}.",
+		params: {
+			component: String => Identifier,
+			operation: String => StringLiteral,
+		},
 	}
 );
 
-// #[derive(Debug)]
-// pub enum Status {
-//     InternalError {
-//         code: &'static str,
-//         subcondition: Option<&'static str>,
-//         descriptor: StatusDescriptor,
-//         message: Option<String>,
-//         hint: Option<&'static str>,
-//     },
-//     UnknownExternalError {
-//         message: String,
-//     },
-// }
-//
-// impl Status {
-//     pub const fn code(&self) -> &'static str {
-//         match self {
-//             Status::InternalError { code, .. } => code,
-//             Status::UnknownExternalError { .. } => "FG-UnknownCode",
-//         }
-//     }
-//
-//     pub const fn subcondition(&self) -> Option<&'static str> {
-//         match self {
-//             Status::InternalError { subcondition, .. } => *subcondition,
-//             Status::UnknownExternalError { .. } => Some("unknown external error"),
-//         }
-//     }
-//
-//     pub const fn descriptor(&self) -> StatusDescriptor {
-//         match self {
-//             Status::InternalError { descriptor, .. } => *descriptor,
-//             Status::UnknownExternalError { .. } => StatusDescriptor {
-//                 condition: Condition::Unknown,
-//                 category: StatusCategory::Unknown,
-//                 domain: StatusDomain::Unknown,
-//                 properties: StatusProperties::EXTERNAL,
-//                 classification: GqlClassification::ErrorClassification(ErrorClassification::Unknown),
-//             },
-//         }
-//     }
-//
-//     pub fn message(&self) -> Option<String> {
-//         match self {
-//             Status::InternalError { message, .. } => message.clone(),
-//             Status::UnknownExternalError { message } => Some(message.clone()),
-//         }
-//     }
-//
-//     pub const fn hint(&self) -> Option<&'static str> {
-//         match self {
-//             Status::InternalError { hint, .. } => *hint,
-//             Status::UnknownExternalError { .. } => None,
-//         }
-//     }
-// }
-
 impl Display for Status {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}", self.message().unwrap_or("".to_string()))
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		self.fmt_message(f)
 	}
 }
 
-// define_status_codes!(
-// 	Status00000, SuccessfulCompletion => {
-// 		condition: Condition::SuccessfulCompletion,
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status00001, OmittedResult => {
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "omitted result",
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status00N50, DatabaseDoesNotExist => {
-// 		template: "The database {} does not exist. Verify that the spelling is correct or create the database for the command to take effect.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "home database does not exist",
-// 		classification: NotificationClassification::Unrecognised,
-// 	},
-// 	Status00N70, RoleOrPrivilegeAlreadyAssigned => {
-// 		template: "The command {} has no effect. The role or privilege is already assigned.",
-// 		params: [StringParam::Cmd],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "role or privilege already assigned",
-// 		classification: NotificationClassification::Security,
-// 	},
-// 	Status00N71, RoleOrPrivilegeNotAssigned => {
-// 		template: "The command {} has no effect. The role or privilege is not assigned.",
-// 		params: [StringParam::Cmd],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "role or privilege not assigned",
-// 		classification: NotificationClassification::Security,
-// 	},
-// 	Status00N72, UndefinedAuthProvider => {
-// 		template: "The auth provider {} is not defined in the configuration. Verify that the spelling is correct or define {} in the configuration.",
-// 		params: [StringParam::Auth, StringParam::Auth],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "undefined auth provider",
-// 		classification: NotificationClassification::Security,
-// 	},
-// 	Status00N80, ServerAlreadyEnabled => {
-// 		template: "The command 'ENABLE SERVER' has no effect. Server {} is already enabled. Verify that this is the intended server.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "server already enabled",
-// 		classification: NotificationClassification::Topology,
-// 	},
-// 	Status00N81, ServerAlreadyCordoned => {
-// 		template: "The command 'CORDON SERVER' has no effect. The server {} is already cordoned. Verify that this is the intended server.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "server already cordoned",
-// 		classification: NotificationClassification::Topology,
-// 	},
-// 	Status00N82, NoDatabasesReallocated => {
-// 		template: "The command 'REALLOCATE DATABASES' has no effect. No databases were reallocated. No better allocation is currently possible.",
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "no databases reallocated",
-// 		classification: NotificationClassification::Topology,
-// 	},
-// 	Status00N83, CordonedServersExistedDuringAllocation => {
-// 		template: "Cordoned servers existed when making an allocation decision. Server(s) {} are cordoned. This can impact allocation decisions.",
-// 		params: [ListParam::ServerList],
-// 		join_styles: [ListParam::ServerList => JoinStyle::ANDED],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "cordoned servers existed during allocation",
-// 		classification: NotificationClassification::Topology,
-// 	},
-// 	Status00N84, RequestedTopologyMatchedCurrentTopology => {
-// 		template: "The command 'ALTER DATABASE' has no effect. The requested topology matched the current topology. No allocations were changed.",
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "requested topology matched current topology",
-// 		classification: NotificationClassification::Topology,
-// 	},
-// 	Status00NA0, IndexOrConstraintAlreadyExists => {
-// 		template: "The command {} has no effect. The index or constraint specified by {} already exists.",
-// 		params: [StringParam::Cmd, StringParam::IdxOrConstrPat],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "index or constraint already exists",
-// 		classification: NotificationClassification::Schema,
-// 	},
-// 	Status00NA1, IndexOrConstraintDoesNotExist => {
-// 		template: "The command {} has no effect. The specified index or constraint {} does not exist.",
-// 		params: [StringParam::Cmd, StringParam::IdxOrConstrPat],
-// 		condition: Condition::SuccessfulCompletion,
-// 		subcondition: "index or constraint does not exist",
-// 		classification: NotificationClassification::Schema,
-// 	},
-// 	Status01000, Warning => {
-// 		condition: Condition::Warning,
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status01004, StringDataRightTruncation => {
-// 		condition: Condition::Warning,
-// 		subcondition: "string data, right truncation",
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status01G03, GraphDoesNotExist => {
-// 		condition: Condition::Warning,
-// 		subcondition: "graph does not exist",
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status01G04, GraphTypeDoesNotExist => {
-// 		condition: Condition::Warning,
-// 		subcondition: "graph type does not exist",
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status01G11, NullValueEliminatedInSetFunction => {
-// 		condition: Condition::Warning,
-// 		subcondition: "null value eliminated in set function",
-// 		classification: NotificationClassification::Unrecognised,
-// 	},
-// 	Status01N00, FeatureDeprecated => {
-// 		template: "{}",
-// 		params: [StringParam::Item],
-// 		condition: Condition::Warning,
-// 		subcondition: "feature deprecated",
-// 		classification: NotificationClassification::Deprecation,
-// 	},
-// 	Status01N01, FeatureDeprecatedWithReplacement => {
-// 		template: "{} is deprecated. It is replaced by {}.",
-// 		params: [StringParam::Feat1, StringParam::Feat2],
-// 		condition: Condition::Warning,
-// 		subcondition: "feature deprecated with replacement",
-// 		classification: NotificationClassification::Deprecation,
-// 	},
-// 	Status01N02, FeatureDeprecatedWithoutReplacement => {
-// 		template: "{} is deprecated and will be removed without a replacement.",
-// 		params: [StringParam::Feat],
-// 		condition: Condition::Warning,
-// 		subcondition: "feature deprecated without replacement",
-// 		classification: NotificationClassification::Deprecation,
-// 	},
-// 	Status01N03, ProcedureFieldDeprecated => {
-// 		template: "The field {} of procedure {} is deprecated.",
-// 		params: [StringParam::ProcField, StringParam::Proc],
-// 		condition: Condition::Warning,
-// 		subcondition: "procedure field deprecated",
-// 		classification: NotificationClassification::Deprecation,
-// 	},
-// 	Status01N30, JoinHintUnfulfillable => {
-// 		template: "Unable to create a plan with 'JOIN ON {}'. Try to change the join key(s) or restructure your query.",
-// 		params: [ListParam::VariableList],
-// 		join_styles: [ListParam::VariableList => JoinStyle::COMMAD],
-// 		condition: Condition::Warning,
-// 		subcondition: "join hint unfulfillable",
-// 		classification: NotificationClassification::Hint,
-// 	},
-// 	Status01N31, HintedIndexDoesNotExist => {
-// 		template: "Unable to create a plan with {} because the index does not exist.",
-// 		params: [StringParam::IdxDescription],
-// 		condition: Condition::Warning,
-// 		subcondition: "hinted index does not exist",
-// 		classification: NotificationClassification::Hint,
-// 	},
-// 	Status01N40, UnsupportedRuntime => {
-// 		template: "The query cannot be executed with {}; instead, {} is used. Cause: {}.",
-// 		params: [
-// 			StringParam::PreparserInput1,
-// 			StringParam::PreparserInput2,
-// 			StringParam::Msg,
-// 		],
-// 		condition: Condition::Warning,
-// 		subcondition: "unsupported runtime",
-// 		classification: NotificationClassification::Unsupported,
-// 	},
-// 	Status01N42, UnknownWarning => {
-// 		template: "Unknown warning.",
-// 		condition: Condition::Warning,
-// 		subcondition: "unknown warning",
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status01N50, LabelDoesNotExist => {
-// 		template: "The label {} does not exist. Verify that the spelling is correct.",
-// 		params: [StringParam::Label],
-// 		condition: Condition::Warning,
-// 		subcondition: "label does not exist",
-// 		classification: NotificationClassification::Unrecognised,
-// 	},
-// 	Status01N51, RelationshipTypeDoesNotExist => {
-// 		template: "The relationship type {} does not exist. Verify that the spelling is correct.",
-// 		params: [StringParam::RelType],
-// 		condition: Condition::Warning,
-// 		subcondition: "relationship type does not exist",
-// 		classification: NotificationClassification::Unrecognised,
-// 	},
-// 	Status01N52, PropertyKeyDoesNotExist => {
-// 		template: "The property {} does not exist. Verify that the spelling is correct.",
-// 		params: [StringParam::PropKey],
-// 		condition: Condition::Warning,
-// 		subcondition: "property key does not exist",
-// 		classification: NotificationClassification::Unrecognised,
-// 	},
-// 	Status01N60, ParameterMissing => {
-// 		template: "The query plan cannot be cached and is not executable without 'EXPLAIN' due to the undefined parameter(s) {}. Provide the parameter(s).",
-// 		params: [ListParam::ParamList],
-// 		join_styles: [ListParam::ParamList => JoinStyle::ANDED],
-// 		condition: Condition::Warning,
-// 		subcondition: "parameter missing",
-// 		classification: NotificationClassification::Generic,
-// 	},
-// 	Status01N61, UnsatisfiableRelationshipTypeExpression => {
-// 		template: "The expression {} cannot be satisfied because relationships must have exactly one type.",
-// 		params: [StringParam::LabelExpr],
-// 		condition: Condition::Warning,
-// 		subcondition: "unsatisfiable relationship type expression",
-// 		classification: NotificationClassification::Generic,
-// 	},
-// 	Status01N62, ProcedureOrFunctionExecutionWarning => {
-// 		template: "Execution of the procedure {} generated the warning {}.",
-// 		params: [StringParam::Proc, StringParam::Msg],
-// 		condition: Condition::Warning,
-// 		subcondition: "procedure or function execution warning",
-// 		classification: NotificationClassification::Generic,
-// 	},
-// 	Status01N63, RepeatedRelationshipPatternVariable => {
-// 		template: "{} is repeated in {}, which leads to no results.",
-// 		params: [StringParam::Proc, StringParam::Msg],
-// 		condition: Condition::Warning,
-// 		subcondition: "repeated relationship pattern variable",
-// 		classification: NotificationClassification::Generic,
-// 	},
-// 	Status01N70, InoperationalRevokeCommand => {
-// 		template: "The command {} has no effect. Make sure nothing is misspelled. This notification will become an error in a future major version. Cause: {}.",
-// 		params: [StringParam::Cmd, StringParam::Msg],
-// 		condition: Condition::Warning,
-// 		subcondition: "inoperational revoke command",
-// 		classification: NotificationClassification::Security,
-// 	},
-// 	Status01N71, ExternalAuthDisabled => {
-// 		template: "Use the setting 'dbms.security.require_local_user' to enable external auth.",
-// 		condition: Condition::Warning,
-// 		subcondition: "external auth disabled",
-// 		classification: NotificationClassification::Security,
-// 	},
-// 	Status01N72, InsecureUrlProtocol => {
-// 		template: "Query uses an insecure protocol. Consider using 'https' instead.",
-// 		condition: Condition::Warning,
-// 		subcondition: "insecure URL protocol",
-// 		classification: NotificationClassification::Security,
-// 	},
-// 	Status02000, NoData => {
-// 		condition: Condition::NoData,
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status02N42, UnknownSubcondition => {
-// 		template: "Unknown GQLSTATUS from old server.",
-// 		condition: Condition::NoData,
-// 		subcondition: "unknown subcondition",
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status03000, Informational => {
-// 		condition: Condition::Informational,
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status03N42, UnknownNotification => {
-// 		template: "Unknown notification.",
-// 		condition: Condition::Informational,
-// 		subcondition: "unknown notification",
-// 		classification: NotificationClassification::Unknown,
-// 	},
-// 	Status03N60, SubqueryVariableShadowing => {
-// 		template: "The variable {} in the subquery uses the same name as a variable from the outer query. Use 'WITH {}' in the subquery to import the one from the outer scope unless you want it to be a new variable.",
-// 		params: [StringParam::Variable, StringParam::Variable],
-// 		condition: Condition::Informational,
-// 		subcondition: "subquery variable shadowing",
-// 		classification: NotificationClassification::Generic,
-// 	},
-// 	Status03N61, RedundantOptionalProcedure => {
-// 		template: "The use of `OPTIONAL` is redundant as `CALL {}` is a void procedure.",
-// 		params: [StringParam::Proc],
-// 		condition: Condition::Informational,
-// 		subcondition: "redundant optional procedure",
-// 		classification: NotificationClassification::Generic,
-// 	},
-// 	Status03N62, RedundantOptionalSubquery => {
-// 		template: "The use of `OPTIONAL` is redundant as `CALL` is a unit subquery.",
-// 		condition: Condition::Informational,
-// 		subcondition: "redundant optional subquery",
-// 		classification: NotificationClassification::Generic,
-// 	},
-// 	Status03N90, CartesianProduct => {
-// 		template: "The disconnected pattern {} builds a cartesian product. A cartesian product may produce a large amount of data and slow down query processing.",
-// 		params: [StringParam::Pat],
-// 		condition: Condition::Informational,
-// 		subcondition: "cartesian product",
-// 		classification: NotificationClassification::Performance,
-// 	},
-// 	Status03N91, UnboundedVariableLengthPattern => {
-// 		template: "The provided pattern {} is unbounded. Shortest path with an unbounded pattern may result in long execution times. Use an upper limit (e.g. '[*..5]') on the number of node hops in your pattern.",
-// 		params: [StringParam::Pat],
-// 		condition: Condition::Informational,
-// 		subcondition: "unbounded variable length pattern",
-// 		classification: NotificationClassification::Performance,
-// 	},
-// 	Status03N92, ExhaustiveShortestPath => {
-// 		template: "The query runs with exhaustive shortest path due to the existential predicate(s) {}. It may be possible to use 'WITH' to separate the 'MATCH' from the existential predicate(s).",
-// 		params: [ListParam::PredList],
-// 		join_styles: [ListParam::PredList => JoinStyle::ANDED],
-// 		condition: Condition::Informational,
-// 		subcondition: "exhaustive shortest path",
-// 		classification: NotificationClassification::Performance,
-// 	},
-// 	Status03N93, NoApplicableIndex => {
-// 		template: "'LOAD CSV' in combination with 'MATCH' or 'MERGE' on a label that does not have an index may result in long execution times. Consider adding an index for label {}.",
-// 		params: [StringParam::Label],
-// 		condition: Condition::Informational,
-// 		subcondition: "no applicable index",
-// 		classification: NotificationClassification::Performance,
-// 	},
-// 	Status03N94, EagerOperator => {
-// 		template: "The query execution plan contains the 'Eager' operator. 'LOAD CSV' in combination with 'Eager' can consume a lot of memory.",
-// 		condition: Condition::Informational,
-// 		subcondition: "eager operator",
-// 		classification: NotificationClassification::Performance,
-// 	},
-// 	Status03N95, DynamicProperty => {
-// 		template: "An index already exists on the relationship type or the label(s) {}. It is not possible to use indexes for dynamic properties. Consider using static properties.",
-// 		params: [ListParam::LabelList],
-// 		join_styles: [ListParam::LabelList => JoinStyle::ANDED],
-// 		condition: Condition::Informational,
-// 		subcondition: "dynamic property",
-// 		classification: NotificationClassification::Performance,
-// 	},
-// 	Status03N96, CodeGenerationFailed => {
-// 		template: "Failed to generate code, falling back to interpreted {} engine. A stacktrace can be found in the debug.log. Cause: {}.",
-// 		params: [StringParam::CfgSetting, StringParam::Cause],
-// 		condition: Condition::Informational,
-// 		subcondition: "code generation failed",
-// 		classification: NotificationClassification::Performance,
-// 	},
-// 	Status08000, ConnectionException => {
-// 		condition: Condition::ConnectionException,
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status08007, TransactionResolutionUnknown => {
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "transaction resolution unknown",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status08N00, UnableToConnectToDatabase => {
-// 		template: "Unable to connect to database {}.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "unable to connect to database",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status08N01, UnableToWriteToDatabase => {
-// 		template: "Unable to write to database {} on this server. Server-side routing is disabled. Either connect to the database leader directly or enable server-side routing by setting '{}=true'.",
-// 		params: [StringParam::Db, StringParam::CfgSetting],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "unable to write to database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N02, UnableToRouteToDatabase => {
-// 		template: "Unable to connect to database {}. Server-side routing is disabled. Either connect to {} directly, or enable server-side routing by setting '{}=true'.",
-// 		params: [StringParam::Db, StringParam::Db, StringParam::CfgSetting],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "unable to route to database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N03, FailedToWriteToGraph => {
-// 		template: "Failed to write to graph {}. Check the defined access mode in both driver and database.",
-// 		params: [StringParam::Graph],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "failed to write to graph",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N04, UnableToRouteUseClause => {
-// 		template: "Routing with {} is not supported in embedded sessions. Connect to the database directly or try running the query using a HTTP API.",
-// 		params: [StringParam::Clause],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "unable to route use clause",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N05, UnableToRouteAdministrationCommand => {
-// 		template: "Routing administration commands is not supported in embedded sessions. Connect to the system database directly or try running the query using a HTTP API.",
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "unable to route administration command",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N06, ProtocolError => {
-// 		template: "General network protocol error.",
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "protocol error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N07, NotTheLeader => {
-// 		template: "This member is not the leader.",
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "not the leader",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N08, DatabaseIsReadOnly => {
-// 		template: "This database is read only on this server.",
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "database is read only",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N09, DatabaseUnavailable => {
-// 		template: "The database {} is currently unavailable. Check the database status. Retry your request at a later time.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "database unavailable",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status08N10, InvalidServerState => {
-// 		template: "Message {} cannot be handled by session in the {} state.",
-// 		params: [StringParam::Db, StringParam::BoltServerState],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "invalid server state",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N11, RequestError => {
-// 		template: "The request is invalid and could not be processed by the server. See cause for further details.",
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "request error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N12, FailedToParseBookmark => {
-// 		template: "Failed to parse the supplied bookmark. Verify it is correct or check the debug log for more information.",
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "failed to parse bookmark",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N13, DatabaseNotUpToRequestedBookmark => {
-// 		template: "The database {} is not up to the requested bookmark {}. The latest transaction ID is {}.",
-// 		params: [
-// 			StringParam::Db,
-// 			StringParam::TransactionId1,
-// 			StringParam::TransactionId2,
-// 		],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "database not up to requested bookmark",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status08N14, AliasChainsAreNotPermitted => {
-// 		template: "Unable to provide a routing table for the database identified by the alias {} because the request comes from another alias {} and alias chains are not permitted.",
-// 		params: [StringParam::Alias1, StringParam::Alias2],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "alias chains are not permitted",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N15, NoSuchRoutingPolicy => {
-// 		template: "Policy definition of the routing policy {} could not be found. Verify that the spelling is correct.",
-// 		params: [StringParam::RoutingPolicy],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "no such routing policy",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N16, GeneralDriverClientError => {
-// 		template: "Remote execution failed with message {}.",
-// 		params: [StringParam::Msg],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "general driver client error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status08N17, GeneralDriverTransientError => {
-// 		template: "Remote execution failed with message {}.",
-// 		params: [StringParam::Msg],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "general driver transient error",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status08N18, GeneralDriverDatabaseError => {
-// 		template: "Remote execution failed with message {}.",
-// 		params: [StringParam::Msg],
-// 		condition: Condition::ConnectionException,
-// 		subcondition: "general driver database error",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status22000, DataException => {
-// 		condition: Condition::DataException,
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22001, StringDataRightTruncationError => {
-// 		condition: Condition::DataException,
-// 		subcondition: "string data, right truncation",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22003, NumericValueOutOfRange => {
-// 		template: "The numeric value {} is outside the required range.",
-// 		params: [StringParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "numeric value out of range",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22004, NullValueNotAllowed => {
-// 		condition: Condition::DataException,
-// 		subcondition: "null value not allowed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22007, InvalidDateTimeFormat => {
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid date, time, or datetime format",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22008, DatetimeFieldOverflow => {
-// 		condition: Condition::DataException,
-// 		subcondition: "datetime field overflow",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22011, SubstringError => {
-// 		condition: Condition::DataException,
-// 		subcondition: "substring error",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22012, DivisionByZero => {
-// 		condition: Condition::DataException,
-// 		subcondition: "division by zero",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22015, IntervalFieldOverflow => {
-// 		condition: Condition::DataException,
-// 		subcondition: "interval field overflow",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22018, InvalidCharacterValueForCast => {
-// 		template: "The character value {} is an invalid argument for the specified cast.",
-// 		params: [NumberParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid character value for cast",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status2201E, InvalidArgumentForNaturalLogarithm => {
-// 		template: "The value {} is an invalid argument for the specified natural logarithm.",
-// 		params: [NumberParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid argument for natural logarithm",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status2201F, InvalidArgumentForPowerFunction => {
-// 		template: "The value {} is an invalid argument for the specified power function.",
-// 		params: [NumberParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid argument for power function",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22027, TrimError => {
-// 		condition: Condition::DataException,
-// 		subcondition: "trim error",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status2202F, ArrayDataRightTruncation => {
-// 		condition: Condition::DataException,
-// 		subcondition: "array data, right truncation",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G02, NegativeLimitValue => {
-// 		condition: Condition::DataException,
-// 		subcondition: "negative limit value",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G03, InvalidValueType => {
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid value type",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G04, ValuesNotComparable => {
-// 		condition: Condition::DataException,
-// 		subcondition: "values not comparable",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G05, InvalidDateTimeFunctionFieldName => {
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid date, time, or datetime function field name",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G06, InvalidDatetimeFunctionValue => {
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid datetime function value",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G07, InvalidDurationFunctionFieldName => {
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid duration function field name",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0B, ListDataRightTruncation => {
-// 		condition: Condition::DataException,
-// 		subcondition: "list data, right truncation",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0C, ListElementError => {
-// 		condition: Condition::DataException,
-// 		subcondition: "list element error",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0F, InvalidNumberOfPathsOrGroups => {
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid number of paths or groups",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0H, InvalidDurationFormat => {
-// 		template: "The duration format {} is invalid.",
-// 		params: [StringParam::Format],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid duration format",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0M, MultipleAssignmentsToGraphElementProperty => {
-// 		condition: Condition::DataException,
-// 		subcondition: "multiple assignments to a graph element property",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0N, NumberOfNodeLabelsBelowSupportedMinimum => {
-// 		condition: Condition::DataException,
-// 		subcondition: "number of node labels below supported minimum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0P, NumberOfNodeLabelsExceedsSupportedMaximum => {
-// 		condition: Condition::DataException,
-// 		subcondition: "number of node labels exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0Q, NumberOfEdgeLabelsBelowSupportedMinimum => {
-// 		condition: Condition::DataException,
-// 		subcondition: "number of edge labels below supported minimum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0R, NumberOfEdgeLabelsExceedsSupportedMaximum => {
-// 		condition: Condition::DataException,
-// 		subcondition: "number of edge labels exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0S, NumberOfNodePropertiesExceedsSupportedMaximum => {
-// 		condition: Condition::DataException,
-// 		subcondition: "number of node properties exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0T, NumberOfEdgePropertiesExceedsSupportedMaximum => {
-// 		condition: Condition::DataException,
-// 		subcondition: "number of edge properties exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0U, RecordFieldsDoNotMatch => {
-// 		condition: Condition::DataException,
-// 		subcondition: "record fields do not match",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0V, ReferenceValueInvalidBaseType => {
-// 		condition: Condition::DataException,
-// 		subcondition: "reference value, invalid base type",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0W, ReferenceValueInvalidConstrainedType => {
-// 		condition: Condition::DataException,
-// 		subcondition: "reference value, invalid constrained type",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0X, RecordDataFieldUnassignable => {
-// 		condition: Condition::DataException,
-// 		subcondition: "record data, field unassignable",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0Y, RecordDataFieldMissing => {
-// 		condition: Condition::DataException,
-// 		subcondition: "record data, field missing",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G0Z, MalformedPath => {
-// 		condition: Condition::DataException,
-// 		subcondition: "malformed path",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G10, PathDataRightTruncation => {
-// 		condition: Condition::DataException,
-// 		subcondition: "path data, right truncation",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G11, ReferenceValueReferentDeleted => {
-// 		condition: Condition::DataException,
-// 		subcondition: "reference value, referent deleted",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G13, InvalidGroupVariableValue => {
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid group variable value",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22G14, IncompatibleTemporalInstantUnitGroups => {
-// 		condition: Condition::DataException,
-// 		subcondition: "incompatible temporal instant unit groups",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status22N00, UnsupportedValue => {
-// 		template: "The provided value is unsupported and cannot be processed.",
-// 		condition: Condition::DataException,
-// 		subcondition: "unsupported value",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N01, InvalidType => {
-// 		template: "Expected the value {} to be of type {}, but was of type {}.",
-// 		params: [StringParam::Value, ListParam::ValueTypeList, StringParam::ValueType],
-// 		join_styles: [ListParam::ValueTypeList => JoinStyle::ORED],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N02, SpecifiedNegativeNumericValue => {
-// 		template: "Expected {} to be a positive number but found {} instead.",
-// 		params: [StringParam::Option, StringParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "specified negative numeric value",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N03, SpecifiedNumericValueOutOfRange => {
-// 		template: "Expected {} to be of type {} and in the range {} to {} but found {}.",
-// 		params: [
-// 			StringParam::Component,
-// 			StringParam::ValueType,
-// 			NumberParam::Lower,
-// 			NumberParam::Upper,
-// 			StringParam::Value,
-// 		],
-// 		condition: Condition::DataException,
-// 		subcondition: "specified numeric value out of range",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N04, InvalidInputValue => {
-// 		template: "Invalid input {} for {}. Expected {}.",
-// 		params: [StringParam::Input, StringParam::Context, ListParam::InputList],
-// 		join_styles: [ListParam::InputList => JoinStyle::ORED],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid input value",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N05, InputFailedValidation => {
-// 		template: "Invalid input {} for {}.",
-// 		params: [StringParam::Input, StringParam::Context],
-// 		condition: Condition::DataException,
-// 		subcondition: "input failed validation",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N06, EmptyInputString => {
-// 		template: "Invalid input. {} needs to be specified.",
-// 		params: [StringParam::Option],
-// 		condition: Condition::DataException,
-// 		subcondition: "empty input string",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N07, InvalidPreParserOptionKey => {
-// 		template: "Invalid pre-parser option(s): {}.",
-// 		params: [ListParam::OptionList],
-// 		join_styles: [ListParam::OptionList => JoinStyle::COMMAD],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid pre-parser option key",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N08, InvalidPreParserCombination => {
-// 		template: "Invalid pre-parser option, cannot combine {} with {}.",
-// 		params: [StringParam::Option1, StringParam::Option2],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid pre-parser combination",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N09, ConflictingPreParserCombination => {
-// 		template: "Invalid pre-parser option, cannot specify multiple conflicting values for {}.",
-// 		params: [StringParam::Option],
-// 		condition: Condition::DataException,
-// 		subcondition: "conflicting pre-parser combination",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N10, InvalidPreParserOptionValue => {
-// 		template: "Invalid pre-parser option, specified {} is not valid for option {}. Valid options are: {}.",
-// 		params: [StringParam::Input, StringParam::Option, ListParam::OptionList],
-// 		join_styles: [ListParam::OptionList => JoinStyle::ANDED],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid pre-parser option value",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N11, InvalidArgument => {
-// 		template: "Invalid argument: cannot process {}.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid argument",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N12, InvalidDateTimeFormatArgument => {
-// 		template: "Invalid argument: cannot process {}.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid date, time, or datetime format",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N13, InvalidTimeZone => {
-// 		template: "Specified time zones must include a date component.",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid time zone",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N14, InvalidTemporalValueCombination => {
-// 		template: "Cannot select both {} and {}.",
-// 		params: [StringParam::Temporal, StringParam::Component],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid temporal value combination",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N15, InvalidTemporalComponent => {
-// 		template: "Cannot read the specified {} component from {}.",
-// 		params: [StringParam::Component, StringParam::Temporal],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid temporal component",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N16, InvalidImportValue => {
-// 		template: "Importing entity values to a graph with a USE clause is not supported. Attempted to import {} to {}.",
-// 		params: [StringParam::Expr, StringParam::Graph],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid import value",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N18, IncompleteSpatialValue => {
-// 		template: "A {} POINT must contain {}.",
-// 		params: [StringParam::Crs, ListParam::MapKeyList],
-// 		join_styles: [ListParam::MapKeyList => JoinStyle::ANDED],
-// 		condition: Condition::DataException,
-// 		subcondition: "incomplete spatial value",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N19, InvalidSpatialValue => {
-// 		template: "A POINT must contain either 'x' and 'y', or 'latitude' and 'longitude'.",
-// 		condition: Condition::DataException,
-// 		subcondition: "incomplete spatial value",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N20, InvalidSpatialValueDimensions => {
-// 		template: "Cannot create POINT with {}D coordinate reference system (CRS) and {} coordinates. Use the equivalent {}D coordinate reference system instead.",
-// 		params: [NumberParam::Dim1, NumberParam::Value, NumberParam::Dim2],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid spatial value dimensions",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N21, UnsupportedCrs => {
-// 		template: "Unsupported coordinate reference system (CRS): {}.",
-// 		params: [StringParam::Crs],
-// 		condition: Condition::DataException,
-// 		subcondition: "unsupported coordinate reference system",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N22, InvalidSpatialValueCombination => {
-// 		template: "Cannot specify both coordinate reference system (CRS) and spatial reference identifier (SRID).",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid spatial value combination",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N23, InvalidLatitudeValue => {
-// 		template: "Cannot create WGS84 POINT with invalid coordinate: {}. The valid range for the latitude coordinate is [-90, 90].",
-// 		params: [StringParam::Coordinates],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid latitude value",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N24, InvalidCoordinateArguments => {
-// 		template: "Cannot construct a {} from {}.",
-// 		params: [StringParam::ValueType, StringParam::Coordinates],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid coordinate arguments",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N25, InvalidTemporalArguments => {
-// 		template: "Cannot construct a {} from {}.",
-// 		params: [StringParam::ValueType, StringParam::Temporal],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid temporal arguments",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N26, UnsupportedRoundingMode => {
-// 		template: "Unknown rounding mode. Valid values are: CEILING, FLOOR, UP, DOWN, HALF_EVEN, HALF_UP, HALF_DOWN, UNNECESSARY.",
-// 		condition: Condition::DataException,
-// 		subcondition: "unsupported rounding mode",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N27, InvalidEntityType => {
-// 		template: "Invalid input {} for {}. Expected to be {}.",
-// 		params: [StringParam::Input, StringParam::Context, ListParam::ValueTypeList],
-// 		join_styles: [ListParam::ValueTypeList => JoinStyle::ORED],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid entity type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N28, OverflowError => {
-// 		template: "The result of the operation {} has caused an overflow.",
-// 		params: [StringParam::Operation],
-// 		condition: Condition::DataException,
-// 		subcondition: "overflow error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N29, UnknownCrs => {
-// 		template: "Unknown coordinate reference system (CRS).",
-// 		condition: Condition::DataException,
-// 		subcondition: "unknown coordinate reference system",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N30, MissingTemporalUnit => {
-// 		template: "At least one temporal unit must be specified.",
-// 		condition: Condition::DataException,
-// 		subcondition: "missing temporal unit",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N31, InvalidPropertiesInMergePattern => {
-// 		template: "'MERGE' cannot be used with graph element property values that are null or NaN.",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid properties in merge pattern",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N32, NonDeterministicSortExpression => {
-// 		template: "'ORDER BY' expressions must be deterministic.",
-// 		condition: Condition::DataException,
-// 		subcondition: "non-deterministic sort expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N33, InvalidShortestPathExpression => {
-// 		template: "Shortest path expressions must contain start and end nodes. Cannot find: {}.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid shortest path expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N34, InvalidUseOfAggregateFunction => {
-// 		template: "Cannot use the {} function inside an aggregate function.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid use of aggregate function",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N35, InvalidDateFormat => {
-// 		template: "Cannot parse {} as a DATE. Calendar dates need to be specified using the format 'YYYY-MM', while ordinal dates need to be specified using the format 'YYYY-DDD'.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid date format",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N36, InvalidTemporalFormat => {
-// 		template: "Cannot parse {} as a {}.",
-// 		params: [StringParam::Input, StringParam::ValueType],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid temporal format",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N37, InvalidCoercion => {
-// 		template: "Cannot coerce {} to {}.",
-// 		params: [StringParam::Value, StringParam::ValueType],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid coercion",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N38, InvalidFunctionArgument => {
-// 		template: "Invalid argument to the function {}.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid function argument",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N39, UnsupportedPropertyValueType => {
-// 		template: "Value {} cannot be stored in properties.",
-// 		params: [NumberParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "unsupported property value type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N40, NonAssignableTemporalComponent => {
-// 		template: "Cannot assign {} of a {}.",
-// 		params: [StringParam::Component, StringParam::ValueType],
-// 		condition: Condition::DataException,
-// 		subcondition: "non-assignable temporal component",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N41, MergeNodeUniquenessConstraintViolation => {
-// 		template: "The 'MERGE' clause did not find a matching node {} and cannot create a new node due to conflicts with existing uniqueness constraints.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::DataException,
-// 		subcondition: "merge node uniqueness constraint violation",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N42, MergeRelationshipUniquenessConstraintViolation => {
-// 		template: "The 'MERGE' clause did not find a matching relationship {} and cannot create a new relationship due to conflicts with existing uniqueness constraints.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::DataException,
-// 		subcondition: "merge relationship uniqueness constraint violation",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N43, UnableToLoadExternalResource => {
-// 		template: "Could not load external resource from {}.",
-// 		params: [StringParam::Url],
-// 		condition: Condition::DataException,
-// 		subcondition: "unable to load external resource",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N44, ParallelRuntimeDisabled => {
-// 		template: "Parallel runtime has been disabled, enable it or upgrade to a bigger Aura instance.",
-// 		condition: Condition::DataException,
-// 		subcondition: "parallel runtime disabled",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N46, UnsupportedUseOfParallelRuntime => {
-// 		template: "Parallel runtime does not support updating queries or a change in the state of transactions. Use another runtime.",
-// 		condition: Condition::DataException,
-// 		subcondition: "unsupported use of parallel runtime",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N47, InvalidParallelRuntimeConfiguration => {
-// 		template: "No workers are configured for the parallel runtime. Set 'server.cypher.parallel.worker_limit' to a larger value.",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid parallel runtime configuration",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N48, UnableToUseSpecifiedRuntime => {
-// 		template: "Cannot use the specified runtime {} due to {}. Use another runtime.",
-// 		params: [StringParam::Runtime, StringParam::Cause],
-// 		condition: Condition::DataException,
-// 		subcondition: "unable to use specified runtime",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N49, CsvBufferSizeOverflow => {
-// 		template: "Cannot read a CSV field larger than the set buffer size. Ensure the field does not have an unterminated quote, or increase the buffer size via 'dbms.import.csv.buffer_size'.",
-// 		condition: Condition::DataException,
-// 		subcondition: "CSV buffer size overflow",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N51, DatabaseOrAliasDoesNotExist => {
-// 		template: "A [composite] database or alias with the name {} does not exist. Verify that the spelling is correct.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::DataException,
-// 		subcondition: "database or alias does not exist",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N52, InvalidCombinationOfProfileAndExplain => {
-// 		template: "'PROFILE' and 'EXPLAIN' cannot be combined.",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid combination of PROFILE and EXPLAIN",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N53, InvalidUseOfProfile => {
-// 		template: "Cannot 'PROFILE' query before results are materialized.",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid use of PROFILE",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N54, InvalidMap => {
-// 		template: "Multiple conflicting entries specified for {}.",
-// 		params: [StringParam::MapKey],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid map",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N55, RequiredKeyMissingFromMap => {
-// 		template: "Map requires key {} but was missing from field {}.",
-// 		params: [StringParam::MapKey, StringParam::Field],
-// 		condition: Condition::DataException,
-// 		subcondition: "required key missing from map",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N56, ProtocolMessageLengthLimitOverflow => {
-// 		template: "Protocol message length limit exceeded (limit: {}).",
-// 		params: [NumberParam::BoltMsgLenLimit],
-// 		condition: Condition::DataException,
-// 		subcondition: "protocol message length limit overflow",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N57, InvalidProtocolType => {
-// 		template: "Protocol type is invalid. Invalid number of struct components (received {} but expected {}).",
-// 		params: [NumberParam::Count1, NumberParam::Count2],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid protocol type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N58, InvalidSpatialComponent => {
-// 		template: "Cannot read the specified {} component from {}.",
-// 		params: [StringParam::Component, NumberParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid spatial component",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N59, TokenDoesNotExist => {
-// 		template: "The {} token with id {} does not exist.",
-// 		params: [StringParam::TokenType, StringParam::TokenId],
-// 		condition: Condition::DataException,
-// 		subcondition: "token does not exist",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status22N62, RelationshipTypeTokenDoesNotExist => {
-// 		template: "The relationship type {} does not exist.",
-// 		params: [StringParam::RelType],
-// 		condition: Condition::DataException,
-// 		subcondition: "relationship type does not exist",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status22N63, PropertyKeyTokenDoesNotExist => {
-// 		template: "The property key {} does not exist.",
-// 		params: [StringParam::PropKey],
-// 		condition: Condition::DataException,
-// 		subcondition: "property key does not exist",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status22N64, ConstraintDoesNotExist => {
-// 		template: "The constraint {} does not exist.",
-// 		params: [StringParam::ConstrDescriptionOrName],
-// 		condition: Condition::DataException,
-// 		subcondition: "constraint does not exist",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N65, EquivalentConstraintAlreadyExists => {
-// 		template: "An equivalent constraint already exists: {}.",
-// 		params: [StringParam::ConstrDescriptionOrName],
-// 		condition: Condition::DataException,
-// 		subcondition: "equivalent constraint already exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N66, ConflictingConstraintAlreadyExists => {
-// 		template: "A conflicting constraint already exists: {}.",
-// 		params: [StringParam::ConstrDescriptionOrName],
-// 		condition: Condition::DataException,
-// 		subcondition: "conflicting constraint already exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N67, DuplicatedConstraintName => {
-// 		template: "A constraint with the same name already exists: {}.",
-// 		params: [StringParam::Constr],
-// 		condition: Condition::DataException,
-// 		subcondition: "duplicated constraint name",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N68, DependentConstraintManagedIndividually => {
-// 		template: "Dependent constraints cannot be managed individually and must be managed together with its graph type.",
-// 		condition: Condition::DataException,
-// 		subcondition: "dependent constraint managed individually",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status22N69, IndexDoesNotExist => {
-// 		template: "The index specified by {} does not exist.",
-// 		params: [StringParam::IdxDescriptionOrName],
-// 		condition: Condition::DataException,
-// 		subcondition: "index does not exist",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N70, EquivalentIndexAlreadyExists => {
-// 		template: "An equivalent index already exists: {}",
-// 		params: [StringParam::IdxDescriptionOrName],
-// 		condition: Condition::DataException,
-// 		subcondition: "equivalent index already exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N71, IndexWithSameNameAlreadyExists => {
-// 		template: "An index with the same name already exists: {}",
-// 		params: [StringParam::Idx],
-// 		condition: Condition::DataException,
-// 		subcondition: "index with the same name already exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N73, ConstraintConflictsWithExistingIndex => {
-// 		template: "Constraint conflicts with already existing index {}.",
-// 		params: [StringParam::Idx],
-// 		condition: Condition::DataException,
-// 		subcondition: "constraint conflicts with existing index",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N74, IndexConflictsWithExistingConstraint => {
-// 		template: "An index that belongs to the constraint {} contains a conflicting index.",
-// 		params: [StringParam::Constr],
-// 		condition: Condition::DataException,
-// 		subcondition: "index conflicts with existing constraint",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N75, ConstraintContainsDuplicatedTokens => {
-// 		template: "The constraint specified by {} includes a label, relationship type, a property key with name {} more than once.",
-// 		params: [StringParam::ConstrDescriptionOrName, StringParam::Token],
-// 		condition: Condition::DataException,
-// 		subcondition: "constraint contains duplicated tokens",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N76, IndexContainsDuplicatedTokens => {
-// 		template: "The index specified by {} includes a label, relationship type, a property key with name {} more than once.",
-// 		params: [StringParam::IdxDescriptionOrName, StringParam::Token],
-// 		condition: Condition::DataException,
-// 		subcondition: "index contains duplicated tokens",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N77, PropertyPresenceVerificationFailed => {
-// 		template: "{} ({}) with {} {} must have the following properties: {}.",
-// 		params: [
-// 			StringParam::EntityType,
-// 			NumberParam::EntityId,
-// 			StringParam::TokenType,
-// 			StringParam::Token,
-// 			ListParam::PropKeyList,
-// 		],
-// 		join_styles: [ListParam::PropKeyList => JoinStyle::COMMAD],
-// 		condition: Condition::DataException,
-// 		subcondition: "property presence verification failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N78, PropertyTypeVerificationFailed => {
-// 		template: "{} ({}) with {} {} must have the property {} with value type {}.",
-// 		params: [
-// 			StringParam::EntityType,
-// 			NumberParam::EntityId,
-// 			StringParam::TokenType,
-// 			StringParam::Token,
-// 			StringParam::PropKey,
-// 			StringParam::ValueType,
-// 		],
-// 		condition: Condition::DataException,
-// 		subcondition: "property type verification failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N79, PropertyUniquenessVerificationFailed => {
-// 		template: "Both {} ({}) and {} ({}) have the same value for property {}.",
-// 		params: [
-// 			StringParam::EntityType,
-// 			StringParam::EntityId1,
-// 			StringParam::EntityType,
-// 			StringParam::EntityId2,
-// 			StringParam::PropKey,
-// 		],
-// 		condition: Condition::DataException,
-// 		subcondition: "property uniqueness verification failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N81, ExpressionTypeUnsupportedHere => {
-// 		template: "Invalid input: {} is not supported in {}.",
-// 		params: [StringParam::ExprType, StringParam::Context],
-// 		condition: Condition::DataException,
-// 		subcondition: "expression type unsupported here",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N82, InputContainsInvalidCharacters => {
-// 		template: "Input {} contains invalid characters for {}. Special characters may require that the input is quoted using backticks.",
-// 		params: [StringParam::Input, StringParam::Context],
-// 		condition: Condition::DataException,
-// 		subcondition: "input contains invalid characters",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N83, InputConsistsOfTooManyComponents => {
-// 		template: "Expected name to contain at most {} components separated by '.'.",
-// 		params: [NumberParam::Upper],
-// 		condition: Condition::DataException,
-// 		subcondition: "input consists of too many components",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N84, StringTooLong => {
-// 		template: "Expected the string to be no more than {} characters long.",
-// 		params: [NumberParam::Upper],
-// 		condition: Condition::DataException,
-// 		subcondition: "string too long",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N85, StringTooShort => {
-// 		template: "Expected the string to be at least {} characters long.",
-// 		params: [NumberParam::Lower],
-// 		condition: Condition::DataException,
-// 		subcondition: "string too short",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N86, NumericRangeZeroDisallowed => {
-// 		template: "Expected a nonzero number.",
-// 		condition: Condition::DataException,
-// 		subcondition: "numeric range 0 disallowed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N87, NumericRangeZeroOrGreaterAllowed => {
-// 		template: "Expected a number that is zero or greater.",
-// 		condition: Condition::DataException,
-// 		subcondition: "numeric range 0 or greater allowed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N88, NotAValidCidrIp => {
-// 		template: "{} is not a valid CIDR IP.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::DataException,
-// 		subcondition: "not a valid CIDR IP",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N89, NewPasswordCannotBeSameAsOldPassword => {
-// 		template: "Expected the new password to be different from the old password.",
-// 		condition: Condition::DataException,
-// 		subcondition: "new password cannot be the same as the old password",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N90, PropertyTypeUnsupportedInConstraint => {
-// 		template: "{} is not supported in property type constraints.",
-// 		params: [StringParam::Item],
-// 		condition: Condition::DataException,
-// 		subcondition: "property type unsupported in constraint",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N91, CannotConvertAliasLocalRemote => {
-// 		template: "Failed to alter the specified database alias {}. Altering remote alias to a local alias or vice versa is not supported. Drop and recreate the alias instead.",
-// 		params: [StringParam::Alias],
-// 		condition: Condition::DataException,
-// 		subcondition: "cannot convert alias local to remote or remote to local",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N92, MissingReturn => {
-// 		template: "This query requires a RETURN clause.",
-// 		condition: Condition::DataException,
-// 		subcondition: "missing RETURN",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N93, MissingYield => {
-// 		template: "A required YIELD clause is missing.",
-// 		condition: Condition::DataException,
-// 		subcondition: "missing YIELD",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N94, InvalidYieldAll => {
-// 		template: "'YIELD *' is not supported in this context. Explicitly specify which columns to yield.",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid YIELD *",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N95, ParsingJsonException => {
-// 		template: "Invalid JSON input. Please check the format.",
-// 		condition: Condition::DataException,
-// 		subcondition: "parsing JSON exception",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N96, MappingJsonException => {
-// 		template: "Unable to map the JSON input. Please verify the structure.",
-// 		condition: Condition::DataException,
-// 		subcondition: "mapping JSON exception",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N97, UnexpectedStructTag => {
-// 		template: "Unexpected struct tag: {}.",
-// 		params: [StringParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "unexpected struct tag",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N98, WrongFirstFieldDuringDeserialization => {
-// 		template: "Unable to deserialize request. Expected first field to be {}, but was '{}'.",
-// 		params: [StringParam::Field, StringParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "wrong first field during deserialization",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22N99, WrongTokenDuringDeserialization => {
-// 		template: "Unable to deserialize request. Expected {}, found {}.",
-// 		params: [StringParam::Token, StringParam::Value],
-// 		condition: Condition::DataException,
-// 		subcondition: "wrong token during deserialization",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA0, InvalidPropertyBasedAccessControlRule => {
-// 		template: "Failed to administer property rule.",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA1, InvalidPropertyBasedAccessControlRuleInvolvingNonCommutativeExpressions => {
-// 		template: "The property {} must appear on the left hand side of the {} operator.",
-// 		params: [StringParam::PropKey, StringParam::Operation],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule involving non-commutative expressions",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA2, InvalidPropertyBasedAccessControlRuleInvolvingMultipleProperties => {
-// 		template: "The expression: {} is not supported. Property rules can only contain one property.",
-// 		params: [StringParam::Expr],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule involving multiple properties",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA3, InvalidPropertyBasedAccessControlRuleInvolvingNaN => {
-// 		template: "'NaN' is not supported for property-based access control.",
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule involving NaN",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA4, InvalidPropertyBasedAccessControlRuleInvolvingComparisonWithNull => {
-// 		template: "The property value access rule pattern {} always evaluates to 'NULL'.",
-// 		params: [StringParam::Pred],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule involving comparison with NULL",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA5, InvalidPropertyBasedAccessControlRuleInvolvingIsNull => {
-// 		template: "The property value access rule pattern {} always evaluates to 'NULL'. Use `IS NULL' instead.",
-// 		params: [StringParam::Pred],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule involving IS NULL",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA6, InvalidPropertyBasedAccessControlRuleInvolvingIsNotNull => {
-// 		template: "The property value access rule pattern {} always evaluates to 'NULL'. Use 'IS NOT NULL' instead.",
-// 		params: [StringParam::Pred],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule involving IS NOT NULL",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA7, InvalidPropertyBasedAccessControlRuleInvolvingNontrivialPredicates => {
-// 		template: "The expression: {} is not supported. Only single, literal-based predicate expressions are allowed for property-based access control.",
-// 		params: [StringParam::Expr],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule involving nontrivial predicates",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NA8, UnderlyingError => {
-// 		template: "Underlying error: {}",
-// 		params: [StringParam::Cause],
-// 		condition: Condition::DataException,
-// 		subcondition: "parsing JSON failure",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NB0, InvalidAccessControlRule => {
-// 		template: "The property value access rule pattern {} always evaluates to 'NULL'. Use `WHERE` syntax in combination with `IS NULL` instead.",
-// 		params: [StringParam::Pred],
-// 		condition: Condition::DataException,
-// 		subcondition: "invalid property based access control rule involving WHERE and IS NULL",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status22NB1, MismatchedType => {
-// 		template: "Type mismatch: expected to be {} but was {}.",
-// 		params: [ListParam::ValueTypeList, StringParam::Input],
-// 		join_styles: [ListParam::ValueTypeList => JoinStyle::ORED],
-// 		condition: Condition::DataException,
-// 		subcondition: "type mismatch",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status25000, InvalidTransactionState => {
-// 		condition: Condition::InvalidTransactionState,
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	// TODO: is this name?
-// 	Status25G01, ActiveTransaction => {
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "active GQL-transaction",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status25G02, CatalogAndDataStatementMixing => {
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "catalog and data statement mixing not supported",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status25G03, ReadOnlyTransaction => {
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "read-only GQL-transaction",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status25G04, MultiGraphsAccessing => {
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "accessing multiple graphs not supported",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status25N01, InvalidStatementTypsCombination => {
-// 		template: "Failed to execute the query {} due to conflicting statement types (read query, write query, schema modification, or administration command). To execute queries in the same transaction, they must be either of the same type, or be a combination of schema modifications and read commands.",
-// 		params: [StringParam::Query],
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "invalid combination of statement types",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status25N02, UnableToCompleteTransaction => {
-// 		template: "Unable to complete transaction. See debug log for details.",
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "unable to complete transaction",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status25N03, ConcurrentAccessViolation => {
-// 		template: "Transaction is being used concurrently by another request.",
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "concurrent access violation",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status25N04, TransactionDoesNotExists => {
-// 		template: "Transaction {} does not exist.",
-// 		params: [StringParam::TransactionId],
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "specified transaction does not exist",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status25N05, TransactionTerminatedOrClosed => {
-// 		template: "Transaction has been terminated or closed.",
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "transaction terminated or closed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status25N06, TransactionStartFailed => {
-// 		template: "Failed to start transaction. See debug log for details.",
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "transaction start failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status25N07, ConstituentTransactionStartFailed => {
-// 		template: "Failed to start constituent transaction. See debug log for details.",
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "constituent transaction start failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status25N08, InvalidTransactionLease => {
-// 		template: "The lease for the transaction is no longer valid.",
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "invalid transaction lease",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status25N09, InternalTransactionFailure => {
-// 		template: "The transaction failed due to an internal error.",
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "internal transaction failure",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status25N11, ConflictingTransactionState => {
-// 		template: "There was a conflict detected between the transaction state and applied updates. Please retry the transaction.",
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "conflicting transaction state",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status25N12, IndexWasDropped => {
-// 		template: "Index {} was dropped in this transaction and cannot be used.",
-// 		params: [StringParam::Idx],
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "index was dropped",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status25N13, EntryAccessAfterRemove => {
-// 		template: "A {} was accessed after being deleted in this transaction. Verify the transaction statements.",
-// 		params: [StringParam::EntityType],
-// 		condition: Condition::InvalidTransactionState,
-// 		subcondition: "cannot access entity after removal",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status2D000, InvalidTransactionTermination => {
-// 		condition: Condition::InvalidTransactionTermination,
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status2DN01, CommitFailed => {
-// 		template: "Failed to commit transaction. See debug log for details.",
-// 		condition: Condition::InvalidTransactionTermination,
-// 		subcondition: "commit failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status2DN02, ConstituentCommitFailed => {
-// 		template: "Failed to commit constituent transaction. See debug log for details.",
-// 		condition: Condition::InvalidTransactionTermination,
-// 		subcondition: "constituent commit failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status2DN03, TransactionTerminationFailed => {
-// 		template: "Failed to terminate transaction. See debug log for details.",
-// 		condition: Condition::InvalidTransactionTermination,
-// 		subcondition: "transaction termination failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status2DN04, ConstituentTransactionTerminationFailed => {
-// 		template: "Failed to terminate constituent transaction. See debug log for details.",
-// 		condition: Condition::InvalidTransactionTermination,
-// 		subcondition: "constituent transaction termination failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status2DN05, TransactionApplyingFailed => {
-// 		template: "There was an error on applying the transaction. See logs for more information.",
-// 		condition: Condition::InvalidTransactionTermination,
-// 		subcondition: "failed to apply transaction",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status2DN06, TransactionAppendingFailed => {
-// 		template: "There was an error on appending the transaction. See logs for more information.",
-// 		condition: Condition::InvalidTransactionTermination,
-// 		subcondition: "failed to append transaction",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status2DN07, InnerTransactionStillOpen => {
-// 		template: "Unable to commit transaction because it still have non-closed inner transactions.",
-// 		condition: Condition::InvalidTransactionTermination,
-// 		subcondition: "inner transactions still open",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status40000, TransactionRollback => {
-// 		condition: Condition::TransactionRollback,
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status40003, StatementCompletionUnknown => {
-// 		condition: Condition::TransactionRollback,
-// 		subcondition: "statement completion unknown",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status40N01, RollbackFailed => {
-// 		template: "Failed to rollback transaction. See debug log for details.",
-// 		condition: Condition::TransactionRollback,
-// 		subcondition: "rollback failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status40N02, ConstituentRollbackFailed => {
-// 		template: "Failed to rollback constituent transaction. See debug log for details.",
-// 		condition: Condition::TransactionRollback,
-// 		subcondition: "constituent rollback failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status42000, SyntaxErrorOrAccessRuleViolation => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42001, InvalidSyntax => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid syntax",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42002, InvalidReference => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid reference",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42004, VisuallyConfusableIdentifiersUsing => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "use of visually confusable identifiers",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42006, EdgeLabelsNumberBelowMinimum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of edge labels below supported minimum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42007, EdgeLabelsNumberExceedsMaximum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of edge labels exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42008, EdgePropertiesNumberExceedsMaximum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of edge properties exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42009, NodeLabelsNumberBelowMinimum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of node labels below supported minimum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42010, NodeLabelsNumberExceedsMaximum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of node labels exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42011, NodePropertiesNumberExceedsMaximum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of node properties exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42012, NodeTypeKeyLabelsNumberBelowMinimum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of node type key labels below supported minimum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42013, NodeTypeKeyLabelsNumberExceedsMaximum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of node type key labels exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42014, EdgeTypeKeyLabelsNumberBelowMinimum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of edge type key labels below supported minimum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42015, EdgeTypeKeyLabelsNumberExceedsMaximum => {
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "number of edge type key labels exceeds supported maximum",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status42I00, InvalidCaseExpression => {
-// 		template: "'CASE' expressions must have the same number of 'WHEN' and 'THEN' operands.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid case expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I01, InvalidForEach => {
-// 		template: "Invalid use of {} inside 'FOREACH'.",
-// 		params: [StringParam::Clause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid FOREACH",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I02, InvalidComment => {
-// 		template: "Failed to parse comment. A comment starting with '/*' must also have a closing '*/'.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid comment",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I03, EmptyRequest => {
-// 		template: "A Cypher query has to contain at least one clause.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "empty request",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I04, InvalidExpression => {
-// 		template: "{} cannot be used in a {} clause.",
-// 		params: [StringParam::Expr, StringParam::Clause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I05, InvalidFieldTerminator => {
-// 		template: "The FIELDTERMINATOR specified for LOAD CSV can only be one character wide.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid FIELDTERMINATOR",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I06, InvalidInput => {
-// 		template: "Invalid input {}, expected: {}.",
-// 		params: [StringParam::Input, ListParam::ValueList],
-// 		join_styles: [ListParam::ValueList => JoinStyle::COMMAD,],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid input",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I07, InvalidIntegerLiteral => {
-// 		template: "The given {} integer literal {} is invalid.",
-// 		params: [StringParam::ValueType, StringParam::Input],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid integer literal",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I08, InvalidLowerBound => {
-// 		template: "The lower bound of the variable length relationship used in the {} function must be 0 or 1.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid lower bound",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I09, InvalidMap => {
-// 		template: "Expected MAP to contain the same number of keys and values, but got keys {} and values {}.",
-// 		params: [ListParam::MapKeyList, ListParam::ValueList],
-// 		join_styles: [
-// 			ListParam::MapKeyList => JoinStyle::ANDED,
-// 			ListParam::ValueList => JoinStyle::COMMAD,
-// 		],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid map",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I10, InvalidLabelExpression => {
-// 		template: "Mixing label expression symbols (`|`, `&`, `!`, and `%`) with colon (`:`) between labels is not allowed. This expression could be expressed as {}.",
-// 		params: [StringParam::Syntax],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid label expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I11, InvalidName => {
-// 		template: "A {} name cannot be empty or contain any null-bytes: {}.",
-// 		params: [StringParam::TokenType, StringParam::Input],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid name",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I12, InvalidPatternNesting => {
-// 		template: "Quantified path patterns cannot be nested.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid nesting of quantified path patterns",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I13, InvalidArgumentsNumber => {
-// 		template: "The procedure or function call does not provide the required number of arguments; expected {} but got {}.\nThe procedure or function {} has the signature: {}.",
-// 		params: [
-// 			NumberParam::Count1,
-// 			NumberParam::Count2,
-// 			StringParam::ProcFun,
-// 			StringParam::Sig,
-// 		],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid number of procedure or function arguments",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I14, InvalidRelationshipTypesNumber => {
-// 		template: "Exactly one relationship type must be specified for {}.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid number of relationship types",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I15, InvalidStatementsNumber => {
-// 		template: "Expected exactly one statement per query but got: {}.",
-// 		params: [NumberParam::Count],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid number of statements",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I16, InvalidPoint => {
-// 		template: "Map with keys {} is not a valid POINT. Use either Cartesian or geographic coordinates.",
-// 		params: [ListParam::MapKeyList],
-// 		join_styles: [ListParam::MapKeyList => JoinStyle::ANDED],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid point",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I17, InvalidQuantifier => {
-// 		template: "A quantifier must not have a lower bound greater than the upper bound.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid quantifier",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I18, InvalidImplicitlyGroupedExpressionsReference => {
-// 		template: "The aggregation column contains implicit grouping expressions referenced by the variables {}. Implicit grouping expressions are variables not explicitly declared as grouping keys.",
-// 		params: [ListParam::VariableList],
-// 		join_styles: [ListParam::VariableList => JoinStyle::COMMAD],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid reference to implicitly grouped expressions",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I19, InvalidStringLiteral => {
-// 		template: "Failed to parse string literal. The query must contain an even number of non-escaped quotes.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid string literal",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I20, InvalidSymbolInExpression => {
-// 		template: "Label expressions and relationship type expressions cannot contain {}. To express a label disjunction use {} instead.",
-// 		params: [StringParam::Input, StringParam::LabelExpr],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid symbol in expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I22, InvalidUnionUsing => {
-// 		template: "The right hand side of a UNION clause must be a single query.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of UNION",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I23, InvalidPatternInShortestPath => {
-// 		template: "The {} function cannot contain a quantified path pattern.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid quantified path pattern in shortest path",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I24, InvalidAggregateFunctionUsing => {
-// 		template: "Aggregate expressions are not allowed inside of {}.",
-// 		params: [StringParam::Expr],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of aggregate function",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I25, InvalidCallInTransactionUsing => {
-// 		template: "'CALL { ... } IN TRANSACTIONS' is not supported after a write clause.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of CALL IN TRANSACTIONS",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I26, InvalidDeleteUsing => {
-// 		template: "'DELETE ...' does not support removing labels from a node. Use 'REMOVE ...' instead.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid DELETE",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I27, InvalidDistinctUsing => {
-// 		template: "`DISTINCT` cannot be used with the {} function.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of DISTINCT with non-aggregate function",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I28, InvalidImportingWithUsing => {
-// 		template: "Importing WITH can consist only of direct references to outside variables. {} is not allowed.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of importing WITH",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I29, InvalidIsUsing => {
-// 		template: "The IS keyword cannot be used together with multiple labels in {}. Rewrite the expression as {}.",
-// 		params: [StringParam::Input, StringParam::Replacement],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of IS",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I30, InvalidLabelExpressionUsing => {
-// 		template: "Label expressions cannot be used in a {}.",
-// 		params: [StringParam::Expr],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of label expressions",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I31, InvalidMatchUsing => {
-// 		template: "'MATCH ...' cannot directly follow an 'OPTIONAL MATCH ...'. Use a WITH clause between them.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of MATCH",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I32, InvalidPatternPredicateUsing => {
-// 		template: "Node and relationship pattern predicates cannot be used in a {} clause. They can only be used in a `MATCH` clause or inside a pattern comprehension.",
-// 		params: [StringParam::Clause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of node and relationship pattern predicate",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I33, InvalidNotNullUsing => {
-// 		template: "Closed Dynamic Union types cannot be appended with 'NOT NULL', specify 'NOT NULL' on inner types instead.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of NOT NULL",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I34, InvalidPatternExpressionUsing => {
-// 		template: "A pattern expression can only be used to test the existence of a pattern. Use a pattern comprehension instead.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of pattern expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I35, InvalidRelationshipTypeExpressionUsing => {
-// 		template: "Relationship type expressions can only be used in 'MATCH ...'.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of relationship type expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I36, InvalidReportStatusUsing => {
-// 		template: "'REPORT STATUS' can only be used when specifying 'ON ERROR CONTINUE' or 'ON ERROR BREAK'.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of REPORT STATUS",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I37, InvalidReturnStarUsing => {
-// 		template: "'RETURN *' is not allowed when there are no variables in scope.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of RETURN *",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I38, InvalidReturnUsing => {
-// 		template: "'RETURN ...' can only be used at the end of a query or subquery.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of RETURN",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I39, InvalidShortestPathFunctionUsing => {
-// 		template: "Mixing the {} function with path selectors or explicit match modes is not allowed.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of shortest path function",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I40, InvalidUnionAndUnionAllUsing => {
-// 		template: "UNION and UNION ALL cannot be combined.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of UNION and UNION ALL",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I41, InvalidVariableLengthRelationshipUsing => {
-// 		template: "Variable length relationships cannot be used in {}.",
-// 		params: [StringParam::Expr],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of variable length relationship",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I42, InvalidYieldUsing => {
-// 		template: "Cannot use YIELD on a call to a void procedure..",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of YIELD",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I43, InvalidYieldStarUsing => {
-// 		template: "'YIELD *' can only be used with a standalone procedure call.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of YIELD *",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I44, InvalidJointHint => {
-// 		template: "Cannot use a join hint for a single node pattern.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid joint hint",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I45, InvalidMultiplePathPatternsUsing => {
-// 		template: "Multiple path patterns cannot be used in the same clause in combination with a selective path selector.{}",
-// 		params: [StringParam::Action],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of multiple path patterns",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I46, InvalidNodePatternPairUsing => {
-// 		template: "Node pattern pairs are only supported for quantified path patterns.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of a node pattern pair",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I47, ParseError => {
-// 		template: "Parser Error: {}.",
-// 		params: [StringParam::Msg],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "parser error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I48, InvalidSubqueryInMergeClauseUsing => {
-// 		template: "Subqueries are not allowed in a MERGE clause.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of a subquery in MERGE",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I49, InvalidInequalityOperatorUsing => {
-// 		template: "Unknown inequality operator '!='. The operator for inequality in Cypher is '<>'.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid inequality operator",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I50, TokenNameTooLong => {
-// 		template: "Invalid input {}... A {} name cannot be longer than {}.",
-// 		params: [StringParam::Input, StringParam::TokenType, NumberParam::Value],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "token name too long",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42I51, InvalidCallSignature => {
-// 		template: "The procedure or function {} must have the signature: {}.",
-// 		params: [StringParam::ProcFun, StringParam::Sig],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid call signature",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N00, NoSuchDatabase => {
-// 		template: "The database {} was not found. Verify that the spelling is correct.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "no such database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N01, NoSuchConstituentGraphExistsInCompositeDatabase => {
-// 		template: "The constituent graph {} was not found in the in composite database {}. Verify that the spelling is correct.",
-// 		params: [StringParam::Graph, StringParam::Db],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "no such constituent graph exists in composite database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N02, WritingInReadAccessMode => {
-// 		template: "Writing in read access mode not allowed.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "writing in read access mode",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N03, WritingToMultipleGraphs => {
-// 		template: "Writing to multiple graphs in the same transaction is not allowed. Use CALL IN TRANSACTION or create separate transactions in your application.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "writing to multiple graphs",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N04, UnsupportedAccessOfCompositeDatabase => {
-// 		template: "Failed to access database identified by {} while connected to session database {}. Connect to {} directly.",
-// 		params: [StringParam::Db1, StringParam::Db2, StringParam::Db3],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported access of composite database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N05, UnsupportedAccessOfStandardDatabase => {
-// 		template: "Failed to access database identified by {} while connected to composite session database {}. Connect to {} directly or create an alias in the composite database.",
-// 		params: [StringParam::Db1, StringParam::Db2, StringParam::Db3],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported access of standard database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N06, UnsupportedActionOfCompositeDatabase => {
-// 		template: "{} is not supported on composite databases.",
-// 		params: [StringParam::Action],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported action on composite database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N07, VariableShadowing => {
-// 		template: "The variable {} is shadowing a variable with the same name from the outer scope and needs to be renamed.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "variable shadowing",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N08, NoSuchProcedureOrFunction => {
-// 		template: "The procedure or function {} was not registered for this database instance. Verify that the spelling is correct.",
-// 		params: [StringParam::ProcFun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "no such procedure or function",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N09, NoSuchUser => {
-// 		template: "A user with the name {} was not found. Verify that the spelling is correct.",
-// 		params: [StringParam::User],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "no such user",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N10, NoSuchRole => {
-// 		template: "A role with the name {} was not found. Verify that the spelling is correct.",
-// 		params: [StringParam::Role],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "no such role",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N11, DatabaseOrAliasAlreadyExists => {
-// 		template: "A [composite] database or alias with the name {} already exists.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "database or alias already exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N12, UserAlreadyExists => {
-// 		template: "A user with the name {} already exists.",
-// 		params: [StringParam::User],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "user already exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N13, RoleAlreadyExists => {
-// 		template: "A role with the name {} already exists.",
-// 		params: [StringParam::Role],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "role already exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N14, InvalidCommandUsing => {
-// 		template: "{} cannot be used together with {}.",
-// 		params: [StringParam::Clause, StringParam::Cmd],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of command",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N15, InvalidReservedKeywordUsing => {
-// 		template: "{} is a reserved keyword and cannot be used in this place.",
-// 		params: [StringParam::Syntax],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of reserved keyword",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N16, UnsupportedIndexOrConstraint => {
-// 		template: "Only single property {} are supported.",
-// 		params: [StringParam::IdxType],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported index or constraint",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N17, UnsupportedRequest => {
-// 		template: "{} is not allowed on the system database.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported request",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N18, ReadOnlyDatabase => {
-// 		template: "The database is in read-only mode.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "read-only database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N19, DuplicateClause => {
-// 		template: "Duplicate {} clause.",
-// 		params: [StringParam::Syntax],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "duplicate clause",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N20, EmptyListRangeOperator => {
-// 		template: "The list range operator '[ ]' cannot be empty.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "empty list range operator",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N21, UnaliasedReturnItem => {
-// 		template: "Expression in {} must be aliased (use AS).",
-// 		params: [StringParam::Clause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unaliased return item",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N22, SingleReturnColumnRequired => {
-// 		template: "A COLLECT subquery must end with a single return column.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "single return column required",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N23, MissingAggregationFunctionReference => {
-// 		template: "The aggregating function must be included in the {} clause for use in 'ORDER BY ...'.",
-// 		params: [StringParam::Clause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "missing reference to aggregation function",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N24, MissingWith => {
-// 		template: "A WITH clause is required between {} and {}.",
-// 		params: [StringParam::Input1, StringParam::Input2],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "missing WITH",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N25, MissingYield => {
-// 		template: "Procedure call inside a query does not support naming results implicitly. Use YIELD instead.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "missing YIELD",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N26, MultipleJoinHintsOnSameVariable => {
-// 		template: "Multiple join hints for the same variable {} are not supported.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "multiple join hints on same variable",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N28, PatternsOrVariablesNotStaticallyInferrable => {
-// 		template: "Only statically inferrable patterns and variables are allowed in {}.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "patterns or variables not statically inferrable",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N29, UnboundVariablesInPatternExpression => {
-// 		template: "Pattern expressions are not allowed to introduce new variables: {}.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unbound variables in pattern expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N31, NumberOutOfRange => {
-// 		template: "Expected {} to be {} in the range {} to {} but found {}.",
-// 		params: [
-// 			StringParam::Component,
-// 			StringParam::ValueType,
-// 			NumberParam::Lower,
-// 			NumberParam::Upper,
-// 			StringParam::Value,
-// 		],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "specified number out of range",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N32, InvalidParameterMapUsing => {
-// 		template: "Parameter maps cannot be used in {} patterns. Use a literal map instead.",
-// 		params: [StringParam::Keyword],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of parameter map",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N34, PathBoundInQuantifiedPathPattern => {
-// 		template: "Path cannot be bound in a quantified path pattern.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "path bound in quantified path pattern",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N35, UnsupportedPathSelectorInPathPattern => {
-// 		template: "The path selector {} is not supported within quantified or parenthesized path patterns.",
-// 		params: [StringParam::Selector],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported path selector in path pattern",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N36, ProcedureCallWithoutParentheses => {
-// 		template: "Procedure call is missing parentheses.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "procedure call without parentheses",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N37, InvalidRelationshipPatternPredicatesUsing => {
-// 		template: "Relationship pattern predicates cannot be use in variable length relationships.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of relationship pattern predicates in variable length relationships",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N38, DuplicateReturnItemName => {
-// 		template: "Return items must have unique names.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "duplicate return item name",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N39, IncompatibleReturnColumns => {
-// 		template: "All subqueries in a UNION clause must have the same return column names.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "incompatible return columns",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N40, SignleRelationshipPattternRequired => {
-// 		template: "The {} function must contain one relationship pattern.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "single relationship pattern required",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N41, MissingPipeExpression => {
-// 		template: "The reduce function requires a '| expression' (pipe expression) after the accumulator.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "missing |-expression (pipe expression)",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N42, UnsupportedSubPathBinding => {
-// 		template: "Sub-path assignment is not supported.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported sub-path binding",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N44, InaccessibleVariable => {
-// 		template: "It is not possible to access the variable {} declared before the {} clause when using DISTINCT` or an aggregation.",
-// 		params: [StringParam::Variable, StringParam::Clause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "inaccessible variable",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N45, UnexpectedInputEnd => {
-// 		template: "Unexpected end of input, expected 'CYPHER', 'EXPLAIN', 'PROFILE' or a query.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unexpected end of input",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N46, UnexpectedType => {
-// 		template: "{} is not a recognized Cypher type.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unexpected type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N47, InvalidUnionAndCallInTransactionUsing => {
-// 		template: "'CALL { ... } IN TRANSACTIONS' is not supported in '... UNION ...'.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of UNION and CALL IN TRANSACTIONS",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N48, NoSuchFunction => {
-// 		template: "The function {} was not found. Verify that the spelling is correct.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "no such function",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N49, UnsupportedNormalForm => {
-// 		template: "Unknown Normal Form: {}.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported normal form",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N50, NoSuchProcedure => {
-// 		template: "The procedure {} was not found. Verify that the spelling is correct.",
-// 		params: [StringParam::Proc],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "no such procedure",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N51, InvalidParameter => {
-// 		template: "Invalid parameter {}.",
-// 		params: [StringParam::Param],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid parameter",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N52, InvalidValueType => {
-// 		template: "{} is not a recognized Cypher type.",
-// 		params: [StringParam::Input],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid value type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N53, UnsafeRepeatableElementsUsing => {
-// 		template: "The quantified path pattern may yield an infinite number of rows under match mode 'REPEATABLE ELEMENTS` Use a path selector or add an upper bound to the quantified path pattern.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsafe usage of repeatable elements",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N54, UnsupportedMatchMode => {
-// 		template: "The match mode {} is not supported.",
-// 		params: [StringParam::MatchMode],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported match mode",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N55, UnsupportedPathSelector => {
-// 		template: "The path selector {} is not supported.",
-// 		params: [StringParam::Selector],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported path selector",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N56, UnsupportedPropertiesUsing => {
-// 		template: "Properties are not supported in the {} function.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported use of properties",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N57, InvalidDataModificationsInExpressionsUsing => {
-// 		template: "{} cannot contain any updating clauses.",
-// 		params: [StringParam::Expr],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of data-modifications in expressions",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N58, UnsupportedNestingUsing => {
-// 		template: "Nested 'CALL { ... } IN TRANSACTIONS is not supported.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unsupported use of nesting",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N59, VariableAlreadyDefined => {
-// 		template: "Variable {} already declared.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "variable already defined",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N62, VariableNotDefined => {
-// 		template: "Variable {} not defined.",
-// 		params: [StringParam::Variable],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "variable not defined",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N63, InnerTypeWithDifferentNullability => {
-// 		template: "All inner types in a Closed Dynamic Union must be nullable, or be appended with 'NOT NULL'.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "inner type with different nullability",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N64, AtLeastOneNodeOrRelationshipRequired => {
-// 		template: "A quantified or parenthesized path pattern must have at least one node or relationship pattern.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "at least one node or relationship required",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N65, NodeVariableNotfound => {
-// 		template: "The {} function requires bound node variables when it is not part of a 'MATCH ...'.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "node variable not bound",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N66, RelationshipVariableAlreadyBound => {
-// 		template: "Bound relationships are not allowed in calls to the {} function.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "relationship variable already bound",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N67, DuplicateParameter => {
-// 		template: "Duplicated {} parameter.",
-// 		params: [StringParam::Param],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "duplicate parameter",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N68, DuplicateVariableDefinition => {
-// 		template: "Variables cannot be defined more than once in a {} clause.",
-// 		params: [StringParam::Clause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "duplicate variable definition",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N69, FunctionNotAllowedInsideExpression => {
-// 		template: "The {} function is only allowed as a top-level element and not inside an {}.",
-// 		params: [StringParam::Fun, StringParam::Expr],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "function not allowed inside expression",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N70, FunctionWithoutRequiredWhereClause => {
-// 		template: "The function {} requires a WHERE clause.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "function without required WHERE clause",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N71, IncompleteQuery => {
-// 		template: "A query must conclude with a RETURN clause, a FINISH clause, an update clause, a unit subquery call, or a procedure call without a YIELD clause.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "incomplete query",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N72, GraphFunctionOnlySupportedOnCompositeDatabase => {
-// 		template: "Calling graph functions is only supported on composite databases. Use the name directly or connect to a composite database with the desired constituents.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "graph function only supported on composite databases",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N73, InvalidUseClausePlacement => {
-// 		template: "The USE clause must be the first clause of a query or an operand to '... UNION ...' . In a CALL sub-query, it can also be the second clause if the first clause is an importing WITH.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid placement of USE clause",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N74, InvalidNestedUseClause => {
-// 		template: "Failed to access {} and {}. Child USE clauses must target the same graph as their parent query. Run in separate (sub)queries instead.",
-// 		params: [StringParam::Db1, StringParam::Db2],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid nested USE clause",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N75, InvalidGraphFunctionUsing => {
-// 		template: "A call to the graph function {} is only allowed as the top-level argument of a USE clause.",
-// 		params: [StringParam::Fun],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid use of graph function",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N76, UnfulfillableHints => {
-// 		template: "The hint(s) {} cannot be fulfilled.",
-// 		params: [ListParam::HintList],
-// 		join_styles: [ListParam::HintList => JoinStyle::ANDED],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "unfulfillable hints",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N77, MissingHintPredicate => {
-// 		template: "The hint {} cannot be fulfilled. The query does not contain a compatible predicate for {} on {}.",
-// 		params: [StringParam::Hint, StringParam::EntityType, StringParam::Variable],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "missing hint predicate",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N78, VariableAlreadyBound => {
-// 		template: "Node {} has already been bound and cannot be modified by the {} clause.",
-// 		params: [StringParam::Variable, StringParam::Clause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "variable already bound",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N81, MissingRequiredParameter => {
-// 		template: "Expected {}, but got {}.",
-// 		params: [StringParam::Param, ListParam::ParamList],
-// 		join_styles: [ListParam::ParamList => JoinStyle::ANDED],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "missing request parameter",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N82, CannotDropDatabaseWithAliases => {
-// 		template: "The database identified by {} has one or more aliases. Drop the aliases {} before dropping the database.",
-// 		params: [StringParam::Db1, StringParam::Db2],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "cannot drop database with aliases",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N83, ImpersonationDisallowedWhilePasswordChangeRequired => {
-// 		template: "Cannot impersonate a user while password change required.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "impersonation disallowed while password change required",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N84, TerminateTransactionMissesYieldClause => {
-// 		template: "WHERE clause without YIELD clause. Use 'TERMINATE TRANSACTION ... YIELD ... WHERE ...'.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "TERMINATE TRANSACTION misses YIELD clause",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N85, CannotSpecifyBothAllowedAndDenidedDatabase => {
-// 		template: "Allowed and denied database options are mutually exclusive.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "cannot specify both allowed and denied databases",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N86, WildcardInParameter => {
-// 		template: "{} failed. Parameterized database and graph names do not support wildcards.",
-// 		params: [StringParam::Syntax],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "wildcard in parameter",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N87, DatabaseOrAliasWithSimilarNameExists => {
-// 		template: "The database or alias name {} conflicts with the name {} of an existing database or alias.",
-// 		params: [StringParam::Db1, StringParam::Db2],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "database or alias with similar name exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N88, CannotGrantPrivilege => {
-// 		template: "Permission cannot be granted for 'REMOVE IMMUTABLE PRIVILEGE'.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "cannot grant privilege",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N89, InvalidDriverSettingsMap => {
-// 		template: "Failed evaluating the given driver settings. {}",
-// 		params: [StringParam::Cause],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid driver settings map",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N90, CannotAlterImmutableCompositeDatabase => {
-// 		template: "Composite databases cannot be altered (database: {}).",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "cannot alter immutable composite database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N91, CannotIndexNestedProperty => {
-// 		template: "Cannot index nested properties (property: {}).",
-// 		params: [StringParam::PropKey],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "cannot index nested property",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N92, CannotCombineOldAndNewAuthProviderSyntax => {
-// 		template: "Cannot combine old and new auth syntax for the same auth provider.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "cannot combine old and new auth provider syntax",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N93, MissingAuthClause => {
-// 		template: "No auth given for user.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "missing auth clause",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N94, IncompleteAlterUseCommand => {
-// 		template: "'ALTER USER' requires at least one clause.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "incomplete ALTER USER command",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N95, ProviderIdCombinationAlreadyExists => {
-// 		template: "The combination of provider and id is already in use.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "provider-id combination already exists",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N96, InvalidUserConfiguration => {
-// 		template: "User has no auth provider. Add at least one auth provider for the user or consider suspending them.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid user configuration",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N97, MissingMandatoryAuthClause => {
-// 		template: "Clause {} is mandatory for auth provider {}.",
-// 		params: [StringParam::Clause, StringParam::Auth],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "missing mandatory auth clause",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N98, cannotModifyOwnUser => {
-// 		template: "Cannot modify the user record of the current user.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "cannot modify own user",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42N99, cannotDeleteOwnUser => {
-// 		template: "Cannot delete the user record of the current user.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "cannot delete own user",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NA0, OperationsMustBeExecutedOnConstituent => {
-// 		template: "Query contains operations that must be executed on the constituent.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "operations must be executed on constituent",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NA1, GraphAccessOperationsOnCompositeDatabase => {
-// 		template: "Graph access operations are not supported on composite databases.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "graph access operations on composite database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NA2, DatabaseOperationsOperationsOnCompositeDatabase => {
-// 		template: "Database operations are not supported on composite databases.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "database operations operations on composite database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NA3, SchemaOperationsOperationsOnCompositeDatabase => {
-// 		template: "Schema operations are not supported on composite databases.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "schema operations operations on composite database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NA4, TransactionOperationsOperationsOnCompositeDatabase => {
-// 		template: "Transaction operations are not supported on composite databases.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "transaction operations operations on composite database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NA5, AccessingMultipleGraphsOnlySupportedOnCompositeDatabase => {
-// 		template: "Accessing multiple graphs in the same query is only supported on composite databases. Connect to a composite database with the desired constituents.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "accessing multiple graphs only supported on composite databases",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NA6, InvalidAliasTarget => {
-// 		template: "Aliases are not allowed to target composite databases.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "invalid alias target",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NA7, ReferencedDatabaseNotFound => {
-// 		template: "No database is corresponding to {}. Verify that the elementId is correct.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "referenced database not found",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NFC, AuthInfoValidationError => {
-// 		template: "Authentication and/or authorization could not be validated. See security logs for details.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "auth info validation error",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status42NFD, CredentialsExpired => {
-// 		template: "Permission denied. The credentials you provided were valid, but must be changed before you can use this instance.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "credentials expired",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NFE, AuthInfoExpired => {
-// 		template: "Authentication and/or authorization info expired.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "auth info expired",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status42NFF, PermissionOrAccessDenided => {
-// 		template: "Access denied, see the security logs for details.",
-// 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
-// 		subcondition: "permission/access denied",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status50N00, InternalError => {
-// 		template: "Internal exception raised {}: {}",
-// 		params: [StringParam::MsgTitle, StringParam::Msg],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "internal error",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status50N01, RemoteExeutionError => {
-// 		template: "Remote execution by {} raised {}: {}",
-// 		params: [StringParam::Server, StringParam::MsgTitle, StringParam::Msg],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "remote execution error",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status50N05, DeadlockDetected => {
-// 		template: "Deadlock detected while trying to acquire locks. See log for more details.",
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "deadlock detected",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status50N06, RemoteExeutionClientError => {
-// 		template: "Remote execution failed. See cause for more details.",
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "remote execution client error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status50N07, TransactionTerminatedOrClosed => {
-// 		template: "Execution failed. See cause and debug log for details.",
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "transaction terminated or closed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status50N09, InvalidServerStateTransaction => {
-// 		template: "The server transitioned into a server state that is not valid in the current context: {}.",
-// 		params: [StringParam::BoltServerState],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "invalid server state transition",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status50N10, IndexDropFailed => {
-// 		template: "Unable to drop {}.",
-// 		params: [StringParam::BoltServerState],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "index drop failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status50N11, ConstraintCreationFailed => {
-// 		template: "Unable to create {}.",
-// 		params: [StringParam::ConstrDescriptionOrName],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "constraint creation failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status50N12, ConstraintDropFailed => {
-// 		template: "Unable to drop {}.",
-// 		params: [StringParam::ConstrDescriptionOrName],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "constraint drop failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status50N13, ConstraintValidationFailed => {
-// 		template: "Unable to validate constraint {}.",
-// 		params: [StringParam::ConstrDescriptionOrName],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "constraint validation error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status50N14, ConstraintViolation => {
-// 		template: "A constraint imposed by the database was violated.",
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "constraint violation",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status50N15, UnsupportedIndexOperation => {
-// 		template: "The system attempted to execute an unsupported operation on index {}. See debug.log for more information.",
-// 		params: [StringParam::Idx],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "unsupported index operation",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status50N16, RemoteExecutionTransientError => {
-// 		template: "Remote execution failed. See cause for more details.",
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "remote execution transient error",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status50N17, RemoteExecutionDatabaseError => {
-// 		template: "Remote execution failed. See cause for more details.",
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "remote execution database error",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status50N21, NoSuchSchemaDescriptor => {
-// 		template: "The {} was not found for {}. Verify that the spelling is correct.",
-// 		params: [StringParam::SchemaDescription, StringParam::Token],
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "no such schema descriptor",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status50N42, UnexpectedError => {
-// 		template: "Unexpected error has occurred. See debug log for details.",
-// 		condition: Condition::GeneralProcessingException,
-// 		subcondition: "unexpected error",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	Status51N00, ProcedureRegistrationError => {
-// 		template: "Failed to register procedure/function.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "procedure registration error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N01, ClassFieldAnnotationMustBePublicNonFinalNonStatic => {
-// 		template: "The field {} in the class {} is annotated as a '@Context' field, but it is declared as static. '@Context' fields must be public, non-final and non-static.",
-// 		params: [StringParam::ProcField, StringParam::ProcClass],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "class field annotation should be public, non-final, and non-static",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N02, UnsupportedInjectableComponentType => {
-// 		template: "Unable to set up injection for procedure {}. The field {} has type {} which is not a supported injectable component.",
-// 		params: [
-// 			StringParam::ProcClass,
-// 			StringParam::ProcField,
-// 			StringParam::ProcFieldType,
-// 		],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "unsupported injectable component type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N03, UnableToAccessField => {
-// 		template: "Unable to set up injection for {}, failed to access field {}.",
-// 		params: [StringParam::ProcClass, StringParam::ProcField],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "unable to access field",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N04, MissingClassFieldAnnotation => {
-// 		template: "The field {} on {} must be annotated as a '@Context' field in order to store its state.",
-// 		params: [StringParam::ProcField, StringParam::ProcClass],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "missing class field annotation",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N05, ClassFieldShouldBePublicAndNonFinal => {
-// 		template: "The field {} on {} must be declared non-final and public.",
-// 		params: [StringParam::ProcField, StringParam::ProcClass],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "class field should be public and non-final",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N06, MissingArgumentName => {
-// 		template: "The argument at position {} in {} requires a '@Name' annotation and a non-empty name.",
-// 		params: [NumberParam::Pos, StringParam::ProcMethod],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "missing argument name",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N07, InvalidOrderingOfDefaultArguments => {
-// 		template: "The {} contains a non-default argument after a default argument. Non-default arguments are not allowed to be positioned after default arguments.",
-// 		params: [StringParam::ProcFun],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "invalid ordering of default arguments",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N08, ExactlyOneUserAggregationResultMethodAndOneUserAggregationUpdateMethodRequired => {
-// 		template: "The class {} must contain exactly one '@UserAggregationResult' method and exactly one '@UserAggregationUpdate' method.",
-// 		params: [StringParam::ProcClass],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "exactly one @UserAggregationResult method and one @UserAggregationUpdate method required",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N09, UserAggregationUpdateMethodMustBePublicAndVoid => {
-// 		template: "The '@UserAggregationUpdate' method {} of {} must be public and have the return type 'void'.",
-// 		params: [StringParam::ProcMethod, StringParam::ProcClass],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "@UserAggregationUpdate method must be public and void",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N10, AggregationMethodNotPublic => {
-// 		template: "The method {} of {} must be public.",
-// 		params: [StringParam::ProcMethod, StringParam::ProcClass],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "aggregation method not public",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N11, ClassNotPublic => {
-// 		template: "The class {} must be public.",
-// 		params: [StringParam::ProcClass],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "class not public",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N12, ClassNotVoid => {
-// 		template: "The procedure {} has zero output fields and must be defined as void.",
-// 		params: [StringParam::Proc],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "class not void",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N13, ProcedureOrFunctionNameAlreadyInUse => {
-// 		template: "Unable to register the procedure or function {} because the name is already in use.",
-// 		params: [StringParam::ProcFun],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "procedure or function name already in use",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N14, DuplicateFieldName => {
-// 		template: "The procedure {} has a duplicate {} field, {}.",
-// 		params: [StringParam::Proc, StringParam::ProcFieldType, StringParam::ProcField],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "duplicate field name",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N15, InvalidMapKeyType => {
-// 		template: "Type mismatch for map key. Required 'STRING', but found {}.",
-// 		params: [StringParam::ValueType],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "invalid map key type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N16, InvalidDefaultValueType => {
-// 		template: "Type mismatch for the default value. Required {}, but found {}.",
-// 		params: [StringParam::ValueType, StringParam::Input],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "invalid default value type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N17, InvalidProcedureOrFunctionName => {
-// 		template: "Procedures and functions cannot be defined in the root namespace, or use a reserved namespace. Use the package name instead (e.g., org.example.com.{}).",
-// 		params: [StringParam::ProcFun],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "invalid procedure or function name",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N18, InvalidMethodReturnType => {
-// 		template: "The method {} has an invalid return type. Procedures must return a stream of records, where each record is of a defined concrete class.",
-// 		params: [StringParam::ProcMethod],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "invalid method return type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N20, CannotInjectField => {
-// 		template: "The field {} is not injectable. Ensure the field is marked as public and non-final.",
-// 		params: [StringParam::ProcField],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot inject field",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N21, ProcedureRegistryIsBusy => {
-// 		template: "The procedure registration failed because the procedure registry was busy. Try again.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "procedure registry is busy",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N22, ExhaustiveShortestPathSearchDisabled => {
-// 		template: "Finding the shortest path for the given pattern requires an exhaustive search. To enable exhaustive searches, set 'cypher.forbid_exhaustive_shortestpath' to false.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "exhaustive shortest path search disabled",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N23, CyclicShortestPathSearchDisabled => {
-// 		template: "Cannot find the shortest path when the start and end nodes are the same. To enable this behavior, set 'dbms.cypher.forbid_shortestpath_common_nodes' to false.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cyclic shortest path search disabled",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N24, InsufficientResourcesForPlanSearch => {
-// 		template: "Could not find a query plan within given time and space limits.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "insufficient resources for plan search",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N25, DatabaseIsBusy => {
-// 		template: "Cannot compile query due to excessive updates to indexes and constraints.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "database is busy",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N26, NotSupportedInThisVersion => {
-// 		template: "{} is not available. This implementation of Cypher does not support {}.",
-// 		params: [StringParam::Item, StringParam::Feat],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "not supported in this version",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N27, NotSupportedInThisEdition => {
-// 		template: "{} is not supported in {}.",
-// 		params: [StringParam::Item, StringParam::Edition],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "not supported in this edition",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N28, NotSupportedByThisDatabase => {
-// 		template: "This Cypher command must be executed against the database {}.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "not supported by this database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N29, NotSupportedByThisServer => {
-// 		template: "The command {} must be executed on the current 'LEADER' server.",
-// 		params: [StringParam::Cmd],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "not supported by this server",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N30, NotSupportedWithThisConfiguration => {
-// 		template: "{} is not supported in {}.",
-// 		params: [StringParam::Item, StringParam::Context],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "not supported with this configuration",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N31, NotSupported => {
-// 		template: "{} is not supported in {}.",
-// 		params: [StringParam::Item, StringParam::Context],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "not supported",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N32, ServerPanic => {
-// 		template: "Server is in panic.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "server panic",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N33, ReplicationError => {
-// 		template: "This member failed to replicate transaction, try again.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "replication error",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N34, WriteTransactionFailedDueToLeaderChange => {
-// 		template: "Failed to write to the database due to a cluster leader change. Retrying your request at a later time may succeed.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "write transaction failed due to leader change",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N35, DatabaseLocationChanged => {
-// 		template: "The location of {} has changed while the transaction was running.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "database location changed",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N36, OutOfMemory => {
-// 		template: "There is not enough memory to perform the current task.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "out of memory",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N37, StackOverflow => {
-// 		template: "There is not enough stack size to perform the current task.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "stack overflow",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N38, FailedToAcquireExecutionThread => {
-// 		template: "There are insufficient threads available for executing the current task.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "failed to acquire execution thread",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N39, RaftLogCorrupted => {
-// 		template: "Expected set of files not found on disk. Please restore from backup.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "raft log corrupted",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N40, UnableToStartDatabase => {
-// 		template: "Database {} failed to start. Try restarting it.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "unable to start database",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N41, AdminOperationFailed => {
-// 		template: "Server or database admin operation not possible.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "admin operation failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N42, AllocatorAvailabilityCheckFailed => {
-// 		template: "Unable to check if allocator {} is available.",
-// 		params: [StringParam::Alloc],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "allocator availability check failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N43, CannotDeallocateServers => {
-// 		template: "Cannot deallocate server(s) {}.",
-// 		params: [ListParam::ServerList],
-// 		join_styles: [ListParam::ServerList => JoinStyle::ANDED],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot deallocate servers",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N44, CannotDropServer => {
-// 		template: "Cannot drop server {}.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot drop server",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N45, CannotCordonServer => {
-// 		template: "Cannot cordon server {}.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot cordon server",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N46, CannotAlterServer => {
-// 		template: "Cannot alter server {}.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot alter server",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N47, CannotRenameServer => {
-// 		template: "Cannot rename server {}.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot rename server",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N48, CannotEnableServer => {
-// 		template: "Cannot enable server {}.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot enable server",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N49, CannotAlterDatabase => {
-// 		template: "Cannot alter database {}.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot alter database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N50, CannotRecreateDatabase => {
-// 		template: "Cannot recreate database {}.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot recreate database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N51, CannotCreateDatabase => {
-// 		template: "Cannot create database {}.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot create database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N52, NumberPrimariesOutOfRange => {
-// 		template: "Cannot alter database topology. Number of primaries {} needs to be at least 1 and may not exceed {}.",
-// 		params: [NumberParam::Count, NumberParam::Upper],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "number primaries out of range",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N53, NumberSecondariesOutOfRange => {
-// 		template: "Cannot alter database topology. Number of secondaries {} needs to be at least 0 and may not exceed {}.",
-// 		params: [NumberParam::Count, NumberParam::Upper],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "number secondaries out of range",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N54, CannotReallocate => {
-// 		template: "Failed to calculate reallocation for databases. {}.",
-// 		params: [StringParam::Msg],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot reallocate",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N55, CannotCreateAdditionalDatabase => {
-// 		template: "Failed to create the database {}. The limit of databases is reached. Either increase the limit using the config setting {} or drop a database.",
-// 		params: [StringParam::Db, StringParam::CfgSetting],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "cannot create additional database",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N56, TopologyOutOfRange => {
-// 		template: "The number of {} seeding servers {} is larger than the desired number of {} allocations {}.",
-// 		params: [
-// 			StringParam::ServerType,
-// 			NumberParam::Count1,
-// 			StringParam::AllocType,
-// 			NumberParam::Count2,
-// 		],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "topology out of range",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N57, GenericTopologyModificationError => {
-// 		template: "Unexpected error while picking allocations. {}",
-// 		params: [StringParam::Msg],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "generic topology modification error",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N59, InternalResourceExhaustion => {
-// 		template: "The DBMS is unable to handle the request, please retry later or contact the system operator. More information is present in the logs.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "internal resource exhaustion",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N60, UnableToCheckEnterpriseLicenseAcceptance => {
-// 		template: "The DBMS is unable to determine the enterprise license acceptance status.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "unable to check enterprise license acceptance",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N61, IndexPopulationFailed => {
-// 		template: "Index {} population failed.",
-// 		params: [StringParam::Idx],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "index population failed",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N62, IndexIsInAFailedState => {
-// 		template: "Unable to use index {} because it is in a failed state. See logs for more information.",
-// 		params: [StringParam::Idx],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "index is in a failed state",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N63, IndexIsStillPopulating => {
-// 		template: "Index is not ready yet. Wait until it finishes populating and retry the transaction.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "index is still populating",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status51N64, IndexDroppedWhileSampling => {
-// 		template: "The index dropped while sampling.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "index dropped while sampling",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N65, VectorIndexDimensionalityMismatch => {
-// 		template: "Vector index {} has a dimensionality of {}, but indexed vectors have {}.",
-// 		params: [StringParam::Idx, NumberParam::Dim1, NumberParam::Dim2],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "vector index dimensionality mismatch",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N66, ResourceExhaustion => {
-// 		template: "Insufficient resources to complete the request.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "resource exhaustion",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N67, InvalidCdcSelectorType => {
-// 		template: "Unexpected CDC selector {} at {}, expected selector to be a {} selector.",
-// 		params: [
-// 			StringParam::SelectorType1,
-// 			StringParam::Input,
-// 			StringParam::SelectorType2,
-// 		],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "invalid CDC selector type",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N68, CdcIsDisabledForThisDatabase => {
-// 		template: "Change Data Capture is not currently enabled for this database.",
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "CDC is disabled for this database",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status51N69, SystemDatabaseIsImmutable => {
-// 		template: "It is not possible to perform {} on the system database.",
-// 		params: [StringParam::Operation],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "system database is immutable",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status51N70, BoltIsNotEnabled => {
-// 		template: "Cannot get routing table for {} because Bolt is not enabled. Please update your configuration such that 'server.bolt.enabled' is set to true.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::SystemConfigurationOrOperationException,
-// 		subcondition: "bolt is not enabled",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N01, ProcedureExecutionTimeout => {
-// 		template: "Execution of the procedure {} timed out after {} {}.",
-// 		params: [StringParam::Proc, NumberParam::TimeAmount, StringParam::TimeUnit],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "procedure execution timeout",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N02, ProcedureExecutionClientError => {
-// 		template: "Execution of the procedure {} failed due to a client error.",
-// 		params: [StringParam::Proc],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "procedure execution client error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N03, InvalidProcedureExecutionMode => {
-// 		template: "Execution of the procedure {} failed due to an invalid specified execution mode {}.",
-// 		params: [StringParam::Proc, StringParam::ProcExeMode],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid procedure execution mode",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N05, CannotInvokeProcedureOnAPrimary => {
-// 		template: "Can't invoke procedure on this member because it is not a secondary for database {}.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "cannot invoke procedure on a primary",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N06, InvalidNumberOfArgumentsToCheckConnectivity => {
-// 		template: "Unexpected number of arguments (expected 0-2 but received {}).",
-// 		params: [NumberParam::Count],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid number of arguments to checkConnectivity",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N07, InvalidPortArgumentToCheckConnectivity => {
-// 		template: "Unrecognised port name {} (valid values are: {}.",
-// 		params: [StringParam::Port, ListParam::PortList],
-// 		join_styles: [ListParam::PortList => JoinStyle::ANDED],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid port argument to checkConnectivity",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N08, InvalidServerIdArgumentToCheckConnectivity => {
-// 		template: "Unable to parse server id {}.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid server id argument to checkConnectivity",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N09, ProcedureExecutionDatabaseError => {
-// 		template: "Execution of the procedure {} failed due to a database error.",
-// 		params: [StringParam::Proc],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "procedure execution database error",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status52N10, InvalidAddressKey => {
-// 		template: "An address key is included in the query string provided to the GetRoutingTableProcedure, but its value could not be parsed.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid address key",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N11, GenericTopologyProcedureError => {
-// 		template: "An unexpected error has occurred. Please refer to the server's debug log for more information.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "generic topology procedure error",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N12, CannotChangeDefaultDatabase => {
-// 		template: "The previous default database {} is still running.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "cannot change default database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N13, NewDefaultDatabaseDoesNotExist => {
-// 		template: "New default database {} does not exist.",
-// 		params: [StringParam::Db],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "new default database does not exist",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N14, SystemCannotBeDefaultDatabase => {
-// 		template: "System database cannot be set as default.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "system cannot be default database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N15, NoSuchAllocator => {
-// 		template: "Provided allocator {} is not available or was not initialized. Verify that the spelling is correct.",
-// 		params: [StringParam::Alloc],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "no such allocator",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N16, InvalidProcedureArgumentList => {
-// 		template: "Invalid arguments to procedure.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid procedure argument list",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N17, QuarantineChangeFailed => {
-// 		template: "Setting/removing the quarantine marker failed.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "quarantine change failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N18, TooManySeeders => {
-// 		template: "The number of seeding servers {} is larger than the defined number of allocations {}.",
-// 		params: [NumberParam::CountSeeders, NumberParam::CountAllocs],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "too many seeders",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N19, NoSuchSeeder => {
-// 		template: "The specified seeding server with id {} was not found. Verify that the spelling is correct.",
-// 		params: [StringParam::Server],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "no such seeder",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N20, SeedUpdatingNotEnabled => {
-// 		template: "The recreation of a database is not supported when seed updating is not enabled.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "seed updating not enabled",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N21, FailedToCleanTheSystemGraph => {
-// 		template: "Failed to clean the system graph.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "failed to clean the system graph",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N22, InvalidProcedureArgument => {
-// 		template: "Invalid argument {} for {} on procedure {}. The expected format of {} is {}.",
-// 		params: [
-// 			NumberParam::Value,
-// 			StringParam::ProcParam,
-// 			StringParam::Proc,
-// 			StringParam::ProcParam,
-// 			StringParam::ProcParamFmt,
-// 		],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid procedure argument",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N23, NonReloadableNamespace => {
-// 		template: "The following namespaces are not reloadable: {}.",
-// 		params: [ListParam::NamespaceList],
-// 		join_styles: [ListParam::NamespaceList => JoinStyle::ANDED],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "non-reloadable namespace",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N24, FailedToReloadProcedures => {
-// 		template: "Failed to reload procedures. See logs for more information.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "failed to reload procedures",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	// TODO: JMX
-// 	Status52N25, JmxError => {
-// 		template: "JMX error while accessing {}. See logs for more information.",
-// 		params: [StringParam::Param],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "JMX error",
-// 		classification: ErrorClassification::DatabaseError,
-// 	},
-// 	Status52N26, InvalidChangeIdentifier => {
-// 		template: "Invalid change identifier.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid change identifier",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N27, InvalidCommitTimestamp => {
-// 		template: "The commit timestamp for the provided transaction ID does not match the one in the transaction log.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid commit timestamp",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N28, InvalidChangeIdentifierAndTransactionId => {
-// 		template: "{} is not a valid change identifier. Transaction ID does not exist.",
-// 		params: [StringParam::TransactionId],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid change identifier and transaction id",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N29, OutdatedChangeIdentifier => {
-// 		template: "Given ChangeIdentifier describes a transaction that occurred before any enrichment records exist.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "outdated change identifier",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N30, FutureChangeIdentifier => {
-// 		template: "Given ChangeIdentifier describes a transaction that hasn't yet occurred.",
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "future change identifier",
-// 		classification: ErrorClassification::TransientError,
-// 	},
-// 	Status52N31, WrongDatabase => {
-// 		template: "Change identifier {} does not belong to this database.",
-// 		params: [StringParam::Param],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "wrong database",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N32, InvalidSequenceNumber => {
-// 		template: "Change identifier {} has an invalid sequence number {}.",
-// 		params: [StringParam::Param1, StringParam::Param2],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "invalid sequence number",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N33, ProcedureInvocationFailed => {
-// 		template: "Failed to invoke procedure/function {} caused by: {}.",
-// 		params: [StringParam::Sig, StringParam::Msg],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "procedure invocation failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N34, ProcedureSandboxed => {
-// 		template: "{} is unavailable because it is sandboxed. Sandboxing is controlled by the dbms.security.procedures.unrestricted setting. Only un-restrict procedures you can trust with access to database internals.",
-// 		params: [StringParam::Sig],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "procedure sandboxed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	Status52N35, ProcedureCompilationFailed => {
-// 		template: "Failed to compile procedure/function defined in {}: {}.",
-// 		params: [StringParam::ProcClass, StringParam::Msg],
-// 		condition: Condition::ProcedureException,
-// 		subcondition: "procedure compilation failed",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	StatusG1000, DependentObjectError => {
-// 		condition: Condition::DependentObjectError,
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	StatusG1001, EdgesStillExist => {
-// 		condition: Condition::DependentObjectError,
-// 		subcondition: "edges still exist",
-// 		classification: ErrorClassification::ClientError,
-// 	},
-// 	StatusG1002, EndpointNodeIsDeleted => {
-// 		condition: Condition::DependentObjectError,
-// 		subcondition: "endpoint node is deleted",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	StatusG1003, EndpointNodeNotInCurrentWorkingGraph => {
-// 		condition: Condition::DependentObjectError,
-// 		subcondition: "endpoint node not in current working graph",
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// 	StatusG2000, GraphTypeViolation => {
-// 		condition: Condition::GraphTypeViolation,
-// 		classification: ErrorClassification::Unknown,
-// 	},
-// );
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusObject {
+	status: Status,
+	diagnostic: DiagnosticRecord,
+}
+
+impl StatusObject {
+	pub fn new(status: Status) -> Self {
+		Self {
+			status,
+			diagnostic: DiagnosticRecord::default(),
+		}
+	}
+
+	pub const fn status(&self) -> &Status {
+		&self.status
+	}
+
+	pub const fn definition(&self) -> &'static StatusDefinition {
+		self.status.definition()
+	}
+
+	pub const fn code(&self) -> StatusCode {
+		self.definition().code
+	}
+
+	pub const fn condition(&self) -> Condition {
+		self.definition().condition
+	}
+
+	pub const fn domain(&self) -> Domain {
+		self.definition().domain
+	}
+
+	pub const fn hint(&self) -> Option<&'static str> {
+		self.definition().hint
+	}
+
+	pub const fn error_classification(&self) -> Option<ErrorClassification> {
+		self.definition().kind.error_classification()
+	}
+
+	pub const fn notification_classification(&self) -> Option<NotificationClassification> {
+		self.definition().kind.notification_classification()
+	}
+
+	pub const fn error_category(&self) -> Option<ErrorCategory> {
+		self.definition().kind.error_category()
+	}
+
+	pub const fn diagnostic(&self) -> &DiagnosticRecord {
+		&self.diagnostic
+	}
+
+	pub fn parameters(&self) -> BTreeMap<&'static str, DiagnosticValue> {
+		self.status.parameters()
+	}
+
+	pub fn message(&self) -> Option<String> {
+		self.status.message()
+	}
+
+	pub fn description(&self) -> String {
+		let definition = self.definition();
+		let mut description = definition.condition.standard_description(definition.subcondition);
+		if let Some(message) = self.message().filter(|message| !message.is_empty()) {
+			description.push_str(". ");
+			description.push_str(&message);
+		}
+		description
+	}
+
+	pub const fn effective_severity(&self) -> Option<Severity> {
+		match self.diagnostic.severity_override() {
+			Some(severity) => Some(severity),
+			None => self.definition().kind.severity(),
+		}
+	}
+
+	pub fn with_location(mut self, location: Location) -> Self {
+		self.diagnostic = self.diagnostic.with_primary_location(location);
+		self
+	}
+
+	pub fn with_related_location(mut self, location: LabeledLocation) -> Self {
+		self.diagnostic = self.diagnostic.with_related_location(location);
+		self
+	}
+
+	pub fn with_phase(mut self, phase: ExecutionPhase) -> Self {
+		self.diagnostic = self.diagnostic.with_phase(phase);
+		self
+	}
+
+	pub fn with_timestamp(mut self, timestamp: SystemTime) -> Self {
+		self.diagnostic = self.diagnostic.with_timestamp(timestamp);
+		self
+	}
+
+	pub fn with_extension(mut self, key: impl Into<String>, value: DiagnosticValue) -> Self {
+		self.diagnostic = self.diagnostic.with_extension(key, value);
+		self
+	}
+
+	pub fn with_severity(mut self, severity: Severity) -> Result<Self, InvalidSeverity> {
+		if !self.definition().kind.allows_severity(severity) {
+			return Err(InvalidSeverity {
+				status: self.code(),
+				severity,
+			});
+		}
+		self.diagnostic.set_severity_override(severity);
+		Ok(self)
+	}
+
+	pub fn into_status(self) -> Status {
+		self.status
+	}
+}
+
+impl From<Status> for StatusObject {
+	fn from(status: Status) -> Self {
+		Self::new(status)
+	}
+}
+
+impl Display for StatusObject {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(f, "{}: {}", self.code(), self.description())
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSeverity {
+	pub status: StatusCode,
+	pub severity: Severity,
+}
+
+impl Display for InvalidSeverity {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(f, "severity {:?} is incompatible with status {}", self.severity, self.status)
+	}
+}
+
+impl Error for InvalidSeverity {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn parses_and_formats_status_code() {
+		let code = "FG-22N28".parse::<StatusCode>().unwrap();
+		assert_eq!(code.body(), "22N28");
+		assert_eq!(code.to_string(), "FG-22N28");
+		assert!("22N28".parse::<StatusCode>().is_err());
+	}
+
+	#[test]
+	fn named_parameter_may_be_used_twice() {
+		let status = Status::conversion_error("42", "integer");
+		assert_eq!(
+			status.message().unwrap(),
+			"Cannot convert '42' to integer; the rejected value was '42'."
+		);
+		assert_eq!(status.parameters().len(), 2);
+	}
+
+	#[test]
+	fn status_object_builds_full_description() {
+		let status = StatusObject::new(Status::division_by_zero());
+		assert_eq!(status.to_string(), "FG-22012: error: data exception - division by zero");
+	}
+}

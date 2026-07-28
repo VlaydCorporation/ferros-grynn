@@ -1,201 +1,230 @@
-use std::fmt::{Display, Formatter};
-use crate::gql_status::diagnostic::{DiagnosticRecord, Severity};
-use crate::gql_status::status::{ExecutionPhase, Status, StatusMeta, StatusObject};
-use jiff::Error;
-use std::sync::Arc;
-use thiserror::Error;
+use std::{
+	error::Error,
+	fmt::{self, Debug, Display, Formatter},
+	sync::Arc,
+	time::SystemTime,
+};
 
-pub type FerrosGrynnResult<T> = core::result::Result<T, FerrosGrynnError>;
+use crate::gql_status::{
+	diagnostic::{ExecutionPhase, LabeledLocation, Location, Severity},
+	formatting::DiagnosticValue,
+	status::{InvalidSeverity, Status, StatusObject},
+};
 
-#[derive(Error, Debug, Clone)]
-#[error("{inner}")]
+pub type FerrosGrynnResult<T> = Result<T, FerrosGrynnError>;
+
+#[derive(Clone)]
 pub struct FerrosGrynnError {
 	inner: Arc<ErrorState>,
 }
 
-impl FerrosGrynnError {
-	pub fn conversation_error(value: String, ty: impl Into<String>) -> Self {
-		Status::ConversationError {
-			value,
-			valuetype: ty.into()
-		}.into()
-	}
-
-	pub fn atom_does_not_exist(id: String, ty: String) -> Self {
-		Status::AtomDoesNotExists {
-			atomtype: ty,
-			id
-		}.into()
-	}
-
-	pub fn empty_edge_targets() -> Self {
-		Status::EmptyEdgeTargets.into()
-	}
-
-	pub fn edge_creation_error() -> Self {
-		Status::EdgeCreationError.into()
-	}
-
-	pub fn invalid_argument(message: String) -> FerrosGrynnError {
-		Status::InvalidArgument {
-			message,
-		}.into()
-	}
-
-	pub fn operation_overflow(operation: &str) -> FerrosGrynnError {
-		FerrosGrynnErrorBuilder::from_status(Status::IntervalFieldOverflow)
-			.with_cause(Status::OverflowError {
-				operation: operation.to_string(),
-			})
-			.build()
-	}
-
-	pub fn division_by_zero() -> FerrosGrynnError {
-		Status::DivizionByZero.into()
-	}
-
-	pub fn infinite_fp() -> FerrosGrynnError {
-		Status::InfiniteFloatingPointValue.into()
-	}
-
-	pub fn out_of_range(component: String, valuetype: String, lower: i64, upper: i64, value: String) -> FerrosGrynnError {
-		Status::SpecifiedNumericValueOutOfRange {
-			component,
-			valuetype,
-			lower,
-			upper,
-			value,
-		}.into()
-	}
-
-	pub fn accumulator_unknown_field(ident: &str, field: &str) -> FerrosGrynnError {
-		FerrosGrynnErrorBuilder::from_status(Status::StructBuildError {
-			ident: ident.to_string(),
-		})
-		.with_cause(Status::UnknownField {
-			field: field.to_string(),
-		})
-		.build()
-	}
-}
-
-pub struct FerrosGrynnErrorBuilder {
-	state: ErrorState,
-}
-
-impl FerrosGrynnErrorBuilder {
-	pub fn from_status(status: Status) -> Self {
-		Self {
-			state: ErrorState {
-				status: DiagnosticRecord::error_record(StatusObject {
-					status,
-					meta: StatusMeta::default(),
-				}),
-				cause: None,
-			},
-		}
-	}
-
-	pub fn with_cause(mut self, cause: impl Into<FerrosGrynnError>) -> Self {
-		self.state.cause = Some(Arc::new(cause.into()));
-		self
-	}
-
-	pub fn mark_critical(mut self) -> Self {
-		self.state.status.severity = Severity::Critical;
-		self
-	}
-
-	pub fn at_location(mut self, location: Location) -> Self {
-		self.state.status.status.meta.location = Some(location);
-		self
-	}
-
-	pub fn at_time(mut self, time: std::time::SystemTime) -> Self {
-		self.state.status.status.meta.timestamp = Some(time);
-		self
-	}
-
-	pub fn at_phase(mut self, phase: ExecutionPhase) -> Self {
-		self.state.status.status.meta.execution_phase = Some(phase);
-		self
-	}
-
-	pub fn build(self) -> FerrosGrynnError {
-		FerrosGrynnError {
-			inner: Arc::new(self.state),
-		}
-	}
-}
-
-#[derive(Error, Debug)]
+#[derive(Clone)]
 struct ErrorState {
-	status: DiagnosticRecord,
-	#[source]
-	cause: Option<Arc<FerrosGrynnError>>,
-}
-
-impl Display for ErrorState {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-		todo!()
-	}
+	status: StatusObject,
+	cause: Option<FerrosGrynnError>,
+	technical_source: Option<Arc<dyn Error + Send + Sync>>,
 }
 
 impl FerrosGrynnError {
-	/// Returns the root error in this chain.
-	pub fn root(&self) -> &FerrosGrynnError {
-		// OK because `Error::chain` is guaranteed to return a non-empty
-		// iterator.
-		self.chain().last().unwrap()
+	pub(crate) fn from_error_status(status: Status) -> Self {
+		debug_assert!(
+			status.definition().kind.is_error(),
+			"only an error status may create FerrosGrynnError"
+		);
+		Self {
+			inner: Arc::new(ErrorState {
+				status: StatusObject::new(status),
+				cause: None,
+				technical_source: None,
+			}),
+		}
 	}
 
-	/// Returns a chain of error values.
-	///
-	/// This starts with the most recent error added to the chain. That is,
-	/// the highest level context. The last error in the chain is always the
-	/// "root" cause. That is, the error closest to the point where something
-	/// has gone wrong.
-	///
-	/// The iterator returned is guaranteed to yield at least one error.
+	pub fn status(&self) -> &StatusObject {
+		&self.inner.status
+	}
+
+	pub fn cause(&self) -> Option<&FerrosGrynnError> {
+		self.inner.cause.as_ref()
+	}
+
+	pub fn with_cause(mut self, cause: FerrosGrynnError) -> Self {
+		Arc::make_mut(&mut self.inner).cause = Some(cause);
+		self
+	}
+
+	pub fn with_location(mut self, location: Location) -> Self {
+		let state = Arc::make_mut(&mut self.inner);
+		state.status = state.status.clone().with_location(location);
+		self
+	}
+
+	pub fn with_related_location(mut self, location: LabeledLocation) -> Self {
+		let state = Arc::make_mut(&mut self.inner);
+		state.status = state.status.clone().with_related_location(location);
+		self
+	}
+
+	pub fn with_phase(mut self, phase: ExecutionPhase) -> Self {
+		let state = Arc::make_mut(&mut self.inner);
+		state.status = state.status.clone().with_phase(phase);
+		self
+	}
+
+	pub fn with_timestamp(mut self, timestamp: SystemTime) -> Self {
+		let state = Arc::make_mut(&mut self.inner);
+		state.status = state.status.clone().with_timestamp(timestamp);
+		self
+	}
+
+	pub fn with_extension(mut self, key: impl Into<String>, value: DiagnosticValue) -> Self {
+		let state = Arc::make_mut(&mut self.inner);
+		state.status = state.status.clone().with_extension(key, value);
+		self
+	}
+
+	pub fn with_severity(mut self, severity: Severity) -> Result<Self, InvalidSeverity> {
+		let state = Arc::make_mut(&mut self.inner);
+		state.status = state.status.clone().with_severity(severity)?;
+		Ok(self)
+	}
+
+	pub fn mark_critical(self) -> Self {
+		self.with_severity(Severity::Critical)
+			.expect("critical severity is valid for every error status")
+	}
+
+	pub(crate) fn with_technical_source<E>(mut self, source: E) -> Self
+	where
+		E: Error + Send + Sync + 'static,
+	{
+		Arc::make_mut(&mut self.inner).technical_source = Some(Arc::new(source));
+		self
+	}
+
+	pub(crate) fn technical_source(&self) -> Option<&(dyn Error + Send + Sync + 'static)> {
+		self.inner.technical_source.as_deref()
+	}
+
+	/// Returns the root structured FG status.
+	pub fn root(&self) -> &FerrosGrynnError {
+		self.chain().last().expect("an error chain always contains itself")
+	}
+
+	/// Iterates structured causes from external context to the root.
 	pub fn chain(&self) -> impl Iterator<Item = &FerrosGrynnError> {
-		let mut err = self;
-		core::iter::once(err).chain(core::iter::from_fn(move || {
-			err = err.inner.as_ref().cause.as_ref()?;
-			Some(err)
+		let mut current = self;
+		std::iter::once(current).chain(std::iter::from_fn(move || {
+			current = current.cause()?;
+			Some(current)
 		}))
 	}
-}
 
-impl From<StatusObject> for FerrosGrynnError {
-	fn from(status: StatusObject) -> Self {
-		FerrosGrynnError {
-			inner: Arc::new(ErrorState {
-				status: DiagnosticRecord::error_record(status),
-				cause: None,
-			}),
-		}
+	pub fn accumulator_unknown_field(identifier: &str, field: &str) -> Self {
+		Self::struct_build_error(identifier).with_cause(Self::unknown_field(field))
+	}
+
+	pub fn infinite_fp() -> Self {
+		Self::numeric_value_out_of_range("infinity")
+	}
+
+	pub fn out_of_range(
+		component: impl Into<String>,
+		value_type: impl Into<String>,
+		lower: i64,
+		upper: i64,
+		value: impl Into<String>,
+	) -> Self {
+		Self::specified_numeric_value_out_of_range(component, value_type, lower, upper, value)
 	}
 }
 
-impl From<Status> for FerrosGrynnError {
-	fn from(status: Status) -> Self {
-		FerrosGrynnError {
-			inner: Arc::new(ErrorState {
-				status: DiagnosticRecord::error_record(StatusObject {
-					status,
-					meta: StatusMeta::default(),
-				}),
-				cause: None,
-			}),
+impl TryFrom<StatusObject> for FerrosGrynnError {
+	type Error = NonErrorStatus;
+
+	fn try_from(status: StatusObject) -> Result<Self, Self::Error> {
+		if !status.definition().kind.is_error() {
+			return Err(NonErrorStatus(status));
 		}
+		Ok(Self {
+			inner: Arc::new(ErrorState {
+				status,
+				cause: None,
+				technical_source: None,
+			}),
+		})
 	}
 }
 
 impl From<jiff::Error> for FerrosGrynnError {
-	fn from(value: Error) -> Self {
-		FerrosGrynnErrorBuilder::from_status(Status::UnknownExternalError {
-			message: value.to_string(),
-		})
-		.build()
+	fn from(source: jiff::Error) -> Self {
+		Self::temporal_processing_error().with_technical_source(source)
+	}
+}
+
+impl Display for FerrosGrynnError {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(&self.inner.status, f)
+	}
+}
+
+impl Debug for FerrosGrynnError {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		f.debug_struct("FerrosGrynnError")
+			.field("status", &self.inner.status)
+			.field("cause", &self.inner.cause)
+			.field("technical_source", &self.inner.technical_source.as_ref().map(|_| "<redacted>"))
+			.finish()
+	}
+}
+
+impl Error for FerrosGrynnError {
+	fn source(&self) -> Option<&(dyn Error + 'static)> {
+		self.inner.cause.as_ref().map(|cause| cause as &(dyn Error + 'static))
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct NonErrorStatus(StatusObject);
+
+impl NonErrorStatus {
+	pub fn status(&self) -> &StatusObject {
+		&self.0
+	}
+}
+
+impl Display for NonErrorStatus {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(f, "{} is not an error status", self.0.code())
+	}
+}
+
+impl Error for NonErrorStatus {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn structured_chain_is_ordered_from_context_to_root() {
+		let error = FerrosGrynnError::struct_build_error("Example")
+			.with_cause(FerrosGrynnError::unknown_field("missing"));
+		let codes =
+			error.chain().map(|error| error.status().code().to_string()).collect::<Vec<_>>();
+
+		assert_eq!(codes, ["FG-22F01", "FG-22F02"]);
+		assert_eq!(error.root().status().code().to_string(), "FG-22F02");
+		assert!(Error::source(&error).is_some());
+	}
+
+	#[test]
+	fn technical_source_is_redacted_and_not_in_structured_chain() {
+		let external = "not a date".parse::<jiff::civil::Date>().unwrap_err();
+		let error = FerrosGrynnError::from(external);
+
+		assert_eq!(error.chain().count(), 1);
+		assert!(Error::source(&error).is_none());
+		assert!(error.technical_source().is_some());
+		assert!(!format!("{error:?}").contains("not a date"));
 	}
 }
