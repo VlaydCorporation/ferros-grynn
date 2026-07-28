@@ -152,7 +152,6 @@ none_lit     ::= "none"
 
 ```ebnf
 array_lit    ::= "[" [ expr_list [ "," ] ] "]"
-tuple_lit    ::= "tuple" "[" [ expr_list [ "," ] ] "]"
 set_lit      ::= "set" "[" [ expr_list [ "," ] ] "]"
 object_lit   ::= "{" [ object_field { "," object_field } [ "," ] ] "}"
 object_field ::= object_key ":" expr
@@ -188,7 +187,7 @@ range_bound  ::= id_part
 ```ebnf
 literal ::= number_lit | string_lit | bool_lit | null_lit | none_lit
           | datetime_lit | duration_lit
-          | array_lit | tuple_lit | set_lit | object_lit
+          | array_lit | set_lit | object_lit
 ```
 
 ---
@@ -1073,7 +1072,6 @@ primitive_type ::= "bool" | "int" | "float" | "decimal" | "number"
 composite_type ::=
       "array"  "<" type [ "," integer ] ">"
     | "set"    "<" type ">"
-    | "tuple"  "<" type_list ">"
     | "object"
     | "option" "<" type ">"
     | "range"  "<" type ">"

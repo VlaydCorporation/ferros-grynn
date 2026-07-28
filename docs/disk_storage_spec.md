@@ -128,43 +128,42 @@ Mode 3: Hybrid                                  (поверх Mode 2)
 
 ### 3.1. Хранимые типы
 
-| Тег  | GQL тип                     | Описание                             | Размер на диске            |
-|------|-----------------------------|--------------------------------------|----------------------------|
-| 0x00 | `none`                      | Поле отсутствует                     | 1 байт (тег)               |
-| 0x01 | `null`                      | Поле есть, значение пусто            | 1 байт                     |
-| 0x02 | `bool (false)`              | Логическое                           | 1 байт                     |
-| 0x03 | `bool (true)`               | Логическое                           | 1 байт                     |
-| 0x04 | `int`                       | i64                                  | 2..11 байт (LEB128 zigzag) |
-| 0x05 | `float`                     | f64 IEEE 754                         | 9 байт                     |
-| 0x06 | `decimal`                   | i128 мантисса + scale (Arrow-совместимо) | 18 байт                |
-| 0x07 | `string`                    | UTF-8                                | 1+len(uLEB128)+N байт      |
-| 0x08 | `bytes`                     | Произвольные байты                   | 1+len(uLEB128)+N байт      |
-| 0x09 | `datetime`                  | RFC 3339 + timezone                  | 1+8+4+4 байт               |
-| 0x0A | `duration`                  | Временной интервал (знаковый)        | 3..18 байт (переменная)    |
-| 0x0B | `uuid`                      | UUID v7 (128 бит)                    | 17 байт                    |
-| 0x0C | `ulid`                      | ULID (128 бит)                       | 17 байт                    |
-| 0x10 | `record_id`                 | RecordId (table:id)                  | 1+переменная               |
-| 0x11 | `array<T>`                  | Типизированный массив                | 1+4+Σ(elements)            |
-| 0x12 | `set<T>`                    | Множество уникальных                 | 1+4+Σ(elements)            |
-| 0x13 | `tuple<...>`                | Кортеж                               | 1+1+Σ(elements)            |
-| 0x14 | `object`                    | Map ключ→значение                    | 1+4+Σ(key_id+value)        |
-| 0x15 | `option<T>`                 | Some(T) или None                     | 1+[value]                  |
-| 0x16 | `range<T>`                  | Диапазон [lo..hi] с флагами          | 1+flags+[lo]+[hi]          |
-| 0x21 | `geometry::Point`           | Точка (lon, lat)                     | 17 байт                    |
-| 0x22 | `geometry::LineString`      | Ломаная                              | 1+4+N×16 байт              |
-| 0x23 | `geometry::Polygon`         | Многоугольник + holes                | переменная                 |
-| 0x24 | `geometry::MultiPoint`      |                                      | переменная                 |
-| 0x25 | `geometry::MultiLineString` |                                      | переменная                 |
-| 0x26 | `geometry::MultiPolygon`    |                                      | переменная                 |
-| 0x27 | `geometry::Collection`      | GeometryCollection                   | переменная                 |
-| 0x31 | `vector_f64`                | Вектор f64 (для HNSW)                | 1+2+N×8 байт               |
-| 0x32 | `vector_f32`                | Вектор f32                           | 1+2+N×4 байт               |
-| 0x33 | `vector_i64`                | Вектор i64                           | 1+2+N×8 байт               |
-| 0x34 | `vector_i32`                | Вектор i32                           | 1+2+N×4 байт               |
-| 0x35 | `vector_i16`                | Вектор i16                           | 1+2+N×2 байт               |
-| 0x36 | `atom_ref`                  | disk_atom_ref(u32 LE)                | 1 + 4 байт                 |
-| 0x37 | `graph_ref`                 | sg_slot(u32) + sg_gen(u32)           | 1 + 8 байт                 |
-| 0x38 | `qualified_atom_ref`        | sg_slot(u32 LE) + local_slot(u32 LE) | 1 + 8 байт                 |
+| Тег  | GQL тип                     | Описание                                 | Размер на диске            |
+|------|-----------------------------|------------------------------------------|----------------------------|
+| 0x00 | `none`                      | Поле отсутствует                         | 1 байт (тег)               |
+| 0x01 | `null`                      | Поле есть, значение пусто                | 1 байт                     |
+| 0x02 | `bool (false)`              | Логическое                               | 1 байт                     |
+| 0x03 | `bool (true)`               | Логическое                               | 1 байт                     |
+| 0x04 | `int`                       | i64                                      | 2..11 байт (LEB128 zigzag) |
+| 0x05 | `float`                     | f64 IEEE 754                             | 9 байт                     |
+| 0x06 | `decimal`                   | i128 мантисса + scale (Arrow-совместимо) | 18 байт                    |
+| 0x07 | `string`                    | UTF-8                                    | 1+len(uLEB128)+N байт      |
+| 0x08 | `bytes`                     | Произвольные байты                       | 1+len(uLEB128)+N байт      |
+| 0x09 | `datetime`                  | RFC 3339 + timezone                      | 1+8+4+4 байт               |
+| 0x0A | `duration`                  | Временной интервал (знаковый)            | 3..18 байт (переменная)    |
+| 0x0B | `uuid`                      | UUID v7 (128 бит)                        | 17 байт                    |
+| 0x0C | `ulid`                      | ULID (128 бит)                           | 17 байт                    |
+| 0x10 | `record_id`                 | RecordId (table:id)                      | 1+переменная               |
+| 0x11 | `array<T>`                  | Типизированный массив                    | 1+4+Σ(elements)            |
+| 0x12 | `set<T>`                    | Множество уникальных                     | 1+4+Σ(elements)            |
+| 0x13 | `object`                    | Map ключ→значение                        | 1+4+Σ(key_id+value)        |
+| 0x14 | `option<T>`                 | Some(T) или None                         | 1+[value]                  |
+| 0x15 | `range<T>`                  | Диапазон [lo..hi] с флагами              | 1+flags+[lo]+[hi]          |
+| 0x21 | `geometry::Point`           | Точка (lon, lat)                         | 17 байт                    |
+| 0x22 | `geometry::LineString`      | Ломаная                                  | 1+4+N×16 байт              |
+| 0x23 | `geometry::Polygon`         | Многоугольник + holes                    | переменная                 |
+| 0x24 | `geometry::MultiPoint`      |                                          | переменная                 |
+| 0x25 | `geometry::MultiLineString` |                                          | переменная                 |
+| 0x26 | `geometry::MultiPolygon`    |                                          | переменная                 |
+| 0x27 | `geometry::Collection`      | GeometryCollection                       | переменная                 |
+| 0x31 | `vector_f64`                | Вектор f64 (для HNSW)                    | 1+2+N×8 байт               |
+| 0x32 | `vector_f32`                | Вектор f32                               | 1+2+N×4 байт               |
+| 0x33 | `vector_i64`                | Вектор i64                               | 1+2+N×8 байт               |
+| 0x34 | `vector_i32`                | Вектор i32                               | 1+2+N×4 байт               |
+| 0x35 | `vector_i16`                | Вектор i16                               | 1+2+N×2 байт               |
+| 0x36 | `atom_ref`                  | disk_atom_ref(u32 LE)                    | 1 + 4 байт                 |
+| 0x37 | `graph_ref`                 | sg_slot(u32) + sg_gen(u32)               | 1 + 8 байт                 |
+| 0x38 | `qualified_atom_ref`        | sg_slot(u32 LE) + local_slot(u32 LE)     | 1 + 8 байт                 |
 
 ### 3.2. Нехранимые типы (runtime only)
 
@@ -446,10 +445,9 @@ ulid                →  0x0C + 16 байт (raw big-endian)
 record_id           →  0x10 + table_id(u32 LE) + id_kind(u8) + [id_payload]
 array               →  0x11 + count(uLEB128) + [Value]×count
 set                 →  0x12 + count(uLEB128) + [Value sorted]×count
-tuple               →  0x13 + arity(u8) + [Value]×arity
-object              →  0x14 + count(uLEB128) + [(key_id u32 LE + Value)]×count
-option              →  0x15 + 0x00 (none) | 0x15 + 0x01 + Value
-range               →  0x16 + flags(u8) + [lo: Value] + [hi: Value]
+object              →  0x13 + count(uLEB128) + [(key_id u32 LE + Value)]×count
+option              →  0x14 + 0x00 (none) | 0x15 + 0x01 + Value
+range               →  0x15 + flags(u8) + [lo: Value] + [hi: Value]
 point               →  0x21 + f64(lon LE) + f64(lat LE)
 linestr             →  0x22 + count(u32 LE) + [f64 lon + f64 lat]×count
 polygon             →  0x23 + ring_count(u32 LE) + [count(u32 LE) + [f64×2]×count]×ring_count
@@ -1681,8 +1679,6 @@ record_id → table_id(4 байта BE) + id_part_encoding(variable)
 option<T> → 0x00 (None, сортируется первым) | 0x01 + encode(T)
 array<T>  → element-wise: encode(elem[0]) + 0x01 + encode(elem[1]) + ... + 0x00
 set<T>    → то же что array, элементы уже отсортированы (set = sorted unique)
-tuple     → encode(field[0]) + encode(field[1]) + ...
-            (каждый компонент self-delimiting через TypeTag-декодирование)
 object    → индексирование object целиком не поддерживается;
             для composite index используются отдельные поля
 ```
@@ -1833,7 +1829,7 @@ Composite index строится по нескольким полям однов
 Для определения длины каждого компонента при декодировании:
 - Скалярные типы (int, float, decimal, datetime, uuid, ulid): фиксированная длина.
 - String, bytes: до первого терминирующего sentinel (правила ниже).
-- Составные типы (array, set, tuple): self-delimiting через TypeTag + length prefix.
+- Составные типы (array, set): self-delimiting через TypeTag + length prefix.
 
 **Кодирование строк в composite key**:
 
@@ -1972,13 +1968,13 @@ O(k) где k — длина ключа. Не предназначен для д
 
 Алгоритм настраивается **на таблицу** (`block_compressor` в `TableDefinition`), а не глобально: у разных данных разный профиль.
 
-| Значение | Когда уместно |
-|----------|---------------|
-| `none` | Данные уже плотные; приоритет — латентность |
-| `lz4` (по умолчанию) | Универсальный компромисс; тот же кодек, что и в `PropHeapPage` |
-| `zstd` | Холодные данные и архивные графы; заметно плотнее LZ4, дороже по CPU |
-| `snappy` | Совместимость с внешними экосистемами |
-| `fsst` | Специализированно для коротких строк — сохраняет возможность работы без полной распаковки |
+| Значение             | Когда уместно                                                                             |
+|----------------------|-------------------------------------------------------------------------------------------|
+| `none`               | Данные уже плотные; приоритет — латентность                                               |
+| `lz4` (по умолчанию) | Универсальный компромисс; тот же кодек, что и в `PropHeapPage`                            |
+| `zstd`               | Холодные данные и архивные графы; заметно плотнее LZ4, дороже по CPU                      |
+| `snappy`             | Совместимость с внешними экосистемами                                                     |
+| `fsst`               | Специализированно для коротких строк — сохраняет возможность работы без полной распаковки |
 
 Кодеки, требующие полной распаковки страницы (`lz4`, `zstd`, `snappy`), не сочетаются с чтением произвольной записи «на месте», поэтому для горячих индексов рекомендуется ограничиваться префиксным сжатием.
 
@@ -2502,12 +2498,12 @@ target = floor(usable_leaf_space × FILL_FACTOR)
 
 `FG_INDEX_BTREE_FILL_FACTOR` = **0.90** (было 0.80). Плотность здесь защищает не столько от расщеплений, сколько от **физической фрагментации цепочки листьев**: первая вставка в полный лист и расщепляет его, и вытягивает физически случайную страницу из freelist в логически последовательную цепочку — после чего последовательность скана восстанавливается только полной пересборкой.
 
-| Случай | Fill factor |
-|--------|-------------|
-| По умолчанию | 0.90 |
+| Случай                                                                 | Fill factor                                                        |
+|------------------------------------------------------------------------|--------------------------------------------------------------------|
+| По умолчанию                                                           | 0.90                                                               |
 | Монотонно возрастающий ключ (`pk_` над ULID/UUIDv7/int, `DiskAtomRef`) | 1.00 — рост идёт по правому краю, внутренних расщеплений не бывает |
-| Индекс объявлен только для чтения | 1.00 |
-| Заведомо случайные вставки после загрузки | 0.75–0.80 |
+| Индекс объявлен только для чтения                                      | 1.00                                                               |
+| Заведомо случайные вставки после загрузки                              | 0.75–0.80                                                          |
 
 Монотонность определяется автоматически: если первый ключ отсортированного потока не меньше текущего максимума индекса (или индекс пуст, а тип ключа `uuid`/`ulid`/`record_id`), fill factor повышается до 1.00.
 
@@ -2538,16 +2534,16 @@ target = floor(usable_leaf_space × FILL_FACTOR)
 
 #### 20.13.5. Стратегия по типам индексов
 
-| Индекс | Стратегия | Нужна сортировка |
-|--------|-----------|------------------|
-| B+tree standard / unique, `pk_` | Внешняя сортировка → упаковка снизу вверх | да |
-| Label | Слоты выделяются монотонно → разбиение по `label_id` и последовательная запись | **нет** |
-| Count | Побочный продукт скана | нет |
-| Fulltext BM25 | Сортировка кортежей `(term, doc_ref, tf)` → потоковая инверсия по группам термов | да |
-| HNSW | Параллельная сборка в памяти, сериализация один раз | не применимо |
-| Geometry R-tree | STR-упаковка (Sort-Tile-Recursive) | да, 2 сортировки на уровень |
-| Reachability / Neighbourhood / Path | Вычисляются **после** загрузки; вход уже упорядочен по `DiskAtomRef` | нет |
-| EdgeEndpoint | Сортировка `(endpoint_ref, edge_ref, role)` | да |
+| Индекс                              | Стратегия                                                                        | Нужна сортировка            |
+|-------------------------------------|----------------------------------------------------------------------------------|-----------------------------|
+| B+tree standard / unique, `pk_`     | Внешняя сортировка → упаковка снизу вверх                                        | да                          |
+| Label                               | Слоты выделяются монотонно → разбиение по `label_id` и последовательная запись   | **нет**                     |
+| Count                               | Побочный продукт скана                                                           | нет                         |
+| Fulltext BM25                       | Сортировка кортежей `(term, doc_ref, tf)` → потоковая инверсия по группам термов | да                          |
+| HNSW                                | Параллельная сборка в памяти, сериализация один раз                              | не применимо                |
+| Geometry R-tree                     | STR-упаковка (Sort-Tile-Recursive)                                               | да, 2 сортировки на уровень |
+| Reachability / Neighbourhood / Path | Вычисляются **после** загрузки; вход уже упорядочен по `DiskAtomRef`             | нет                         |
+| EdgeEndpoint                        | Сортировка `(endpoint_ref, edge_ref, role)`                                      | да                          |
 
 **Проверка уникальности бесплатна.** В отсортированном потоке нарушение уникальности — это ровно пара соседних записей с равным префиксом-ключом. Одно сравнение с предыдущей записью, `O(1)` памяти, ноль обращений к диску — вместо спуска по дереву на каждую строку только ради ответа на вопрос «есть ли дубликат».
 
@@ -2652,14 +2648,14 @@ Live queries хранятся только в SchemaCatalog для восста�
 
 Что эта модель даёт по сравнению с журналом дельт:
 
-| Проблема | Решение |
-|----------|---------|
+| Проблема                        | Решение                                                                                                                                                                     |
+|---------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Незакоммиченные данные на диске | Фреймы незавершённой транзакции лежат в журнале, но без маркера коммита невидимы и никогда не бэкфиллятся. NO-STEAL на уровне `.fgb` **без** ограничения размера транзакции |
-| Torn write | Фрейм **и есть** полный образ страницы; отдельный механизм full-page-write не нужен |
-| Отсутствие on-disk MVCC | Снимок = «фреймы с `lsn ≤ S`». Версионность появляется как побочный эффект |
-| Потолок объёма транзакции | Фреймы спиллятся в журнал; в памяти — только индекс (≈16 байт на фрейм) |
-| Откат | Отбросить scratch-фреймы и записи индекса. UNDO и CLR не нужны |
-| Идемпотентность replay | Применение фрейма — `memcpy`; повторное применение того же образа ничего не меняет |
+| Torn write                      | Фрейм **и есть** полный образ страницы; отдельный механизм full-page-write не нужен                                                                                         |
+| Отсутствие on-disk MVCC         | Снимок = «фреймы с `lsn ≤ S`». Версионность появляется как побочный эффект                                                                                                  |
+| Потолок объёма транзакции       | Фреймы спиллятся в журнал; в памяти — только индекс (≈16 байт на фрейм)                                                                                                     |
+| Откат                           | Отбросить scratch-фреймы и записи индекса. UNDO и CLR не нужны                                                                                                              |
+| Идемпотентность replay          | Применение фрейма — `memcpy`; повторное применение того же образа ничего не меняет                                                                                          |
 
 Ключевое отличие от «чистого COW» (LMDB): обратная запись **на штатное место** сохраняет арифметическую адресацию §25.1 (`page_no = slot / 102`) и физическую кластеризацию SoA, на которых держится аналитический путь. Data-file COW обе эти вещи разрушает.
 
@@ -2859,10 +2855,10 @@ read_page(PageKey, snapshot_lsn):
 
 Различаются два запроса пользователя, и путать их не следует:
 
-| Запрос | Механизм | Ремап | Блокирует |
-|--------|----------|-------|-----------|
-| «Верните место **внутри** файла для переиспользования» | Логический реклейминг через freelist | **не нужен** | нет |
-| «Сожмите файл **на диске**, верните место ОС» | Полный дефраг с `slot_remap` + `ftruncate` | нужен | да |
+| Запрос                                                 | Механизм                                   | Ремап        | Блокирует |
+|--------------------------------------------------------|--------------------------------------------|--------------|-----------|
+| «Верните место **внутри** файла для переиспользования» | Логический реклейминг через freelist       | **не нужен** | нет       |
+| «Сожмите файл **на диске**, верните место ОС»          | Полный дефраг с `slot_remap` + `ftruncate` | нужен        | да        |
 
 **Основной путь — инкрементальный, без ремапа.** По аналогии с `SlotAllocator` освобождение слота логическое: слот помечается tombstone и возвращается во freelist. Страница, у которой доля tombstone-слотов превысила `FG_COMPACTION_TOMBSTONE_RATIO`, становится кандидатом на реклейминг, но **живые слоты на ней не двигаются** — освобождается лишь дыра внутри уже выделенного файла, через постраничный freelist (§15). Файл физически не ужимается, зато новые вставки переиспользуют освободившиеся страницы вместо роста файла. `DiskAtomRef` при этом не меняется вообще, поэтому операция не требует ни ремапа, ни остановки читателей и выполняется в фоне.
 
@@ -3102,51 +3098,51 @@ TensorCachePage инвалидируется при любом изменени�
 
 ### 27.2. Runtime-параметры
 
-| Параметр                             | Тип    | Default   | Описание                                           |
-|--------------------------------------|--------|-----------|----------------------------------------------------|
-| `FG_PAGE_BUFFER_PAGES`               | usize  | 4096      | Ёмкость BufferPool (4096 × 16 КиБ = 64 МиБ)        |
-| `FG_WAL_SEGMENT_SIZE`                | u64    | 67108864  | Размер WAL сегмента до ротации (64 МиБ)            |
-| `FG_CHECKPOINT_DIRTY_THRESHOLD`      | f64    | 0.25      | Checkpoint при ≥ N% dirty pages в pool             |
-| `FG_CHECKPOINT_INTERVAL_SEC`         | u64    | 300       | Максимальный интервал checkpoint                   |
-| `FG_LABEL_DICT_CACHE_MB`             | usize  | 32        | In-memory LRU кэш label dictionary                 |
-| `FG_PROPS_COMPRESS_THRESHOLD`        | usize  | 512       | Сжимать props если serialized_size > N байт        |
-| `FG_HNSW_CACHE_SIZE`                 | usize  | 268435456 | HNSW кэш (256 МиБ); §9.6 gql_spec                  |
-| `FG_COMPACTION_TOMBSTONE_RATIO`      | f64    | 0.20      | Инкрементальный реклейминг страницы при tombstone ratio > N |
-| `FG_COMPACT_HOT_TOMBSTONE_RATIO`     | f64    | 0.30      | Полный defrag при tombstone ratio > N              |
-| `FG_STATS_AUTO_ANALYZE_DIRTY`        | f64    | 0.10      | Авто-ANALYZE при dirty_fraction > N                |
-| `FG_ASYNC_EVENT_PROCESSING_INTERVAL` | u64    | 5000      | Интервал обработки async событий (мс)              |
-| `FG_CHANGEFEED_PURGE_INTERVAL_SEC`   | u64    | 3600      | Интервал очистки старых changefeed файлов          |
-| `FG_PATH_MAX_DEPTH`                  | usize  | 30        | Максимальная глубина путей                         |
-| `FG_TRAVERSAL_READ_YOUR_WRITES`      | bool   | false     | Traversal видит собственные мутации                |
+| Параметр                             | Тип    | Default   | Описание                                                                     |
+|--------------------------------------|--------|-----------|------------------------------------------------------------------------------|
+| `FG_PAGE_BUFFER_PAGES`               | usize  | 4096      | Ёмкость BufferPool (4096 × 16 КиБ = 64 МиБ)                                  |
+| `FG_WAL_SEGMENT_SIZE`                | u64    | 67108864  | Размер WAL сегмента до ротации (64 МиБ)                                      |
+| `FG_CHECKPOINT_DIRTY_THRESHOLD`      | f64    | 0.25      | Checkpoint при ≥ N% dirty pages в pool                                       |
+| `FG_CHECKPOINT_INTERVAL_SEC`         | u64    | 300       | Максимальный интервал checkpoint                                             |
+| `FG_LABEL_DICT_CACHE_MB`             | usize  | 32        | In-memory LRU кэш label dictionary                                           |
+| `FG_PROPS_COMPRESS_THRESHOLD`        | usize  | 512       | Сжимать props если serialized_size > N байт                                  |
+| `FG_HNSW_CACHE_SIZE`                 | usize  | 268435456 | HNSW кэш (256 МиБ); §9.6 gql_spec                                            |
+| `FG_COMPACTION_TOMBSTONE_RATIO`      | f64    | 0.20      | Инкрементальный реклейминг страницы при tombstone ratio > N                  |
+| `FG_COMPACT_HOT_TOMBSTONE_RATIO`     | f64    | 0.30      | Полный defrag при tombstone ratio > N                                        |
+| `FG_STATS_AUTO_ANALYZE_DIRTY`        | f64    | 0.10      | Авто-ANALYZE при dirty_fraction > N                                          |
+| `FG_ASYNC_EVENT_PROCESSING_INTERVAL` | u64    | 5000      | Интервал обработки async событий (мс)                                        |
+| `FG_CHANGEFEED_PURGE_INTERVAL_SEC`   | u64    | 3600      | Интервал очистки старых changefeed файлов                                    |
+| `FG_PATH_MAX_DEPTH`                  | usize  | 30        | Максимальная глубина путей                                                   |
+| `FG_TRAVERSAL_READ_YOUR_WRITES`      | bool   | false     | Traversal видит собственные мутации                                          |
 | `FG_TEMPFILES_PATH`                  | String | ""        | Каталог временных файлов: спиллинг сортировок запросов **и** сборки индексов |
 
 **Журнал и checkpoint** (§22–§23)
 
-| Параметр                     | Тип   | Default    | Описание                                                              |
-|------------------------------|-------|------------|-------------------------------------------------------------------------|
-| `FG_WAL_FRAME_SPILL_PAGES`   | usize | 1024       | Порог грязных фреймов транзакции, после которого они спиллятся в журнал |
-| `FG_WAL_CHECKPOINT_FRAMES`   | usize | 4096       | Порог автоматического запуска бэкфилла                                |
-| `FG_WAL_MAX_TOTAL_BYTES`     | u64   | 1073741824 | Жёсткий предел размера журнала (1 ГиБ) → принудительный бэкфилл отстающего графа |
-| `FG_WAL_SYNC_MODE`           | enum  | `full`     | `full` \| `normal` \| `off`                                            |
-| `FG_MAX_SNAPSHOT_AGE_SEC`    | u64   | 300        | Возраст снимка, после которого он принудительно закрывается, чтобы разблокировать обрезку журнала |
+| Параметр                   | Тип   | Default    | Описание                                                                                          |
+|----------------------------|-------|------------|---------------------------------------------------------------------------------------------------|
+| `FG_WAL_FRAME_SPILL_PAGES` | usize | 1024       | Порог грязных фреймов транзакции, после которого они спиллятся в журнал                           |
+| `FG_WAL_CHECKPOINT_FRAMES` | usize | 4096       | Порог автоматического запуска бэкфилла                                                            |
+| `FG_WAL_MAX_TOTAL_BYTES`   | u64   | 1073741824 | Жёсткий предел размера журнала (1 ГиБ) → принудительный бэкфилл отстающего графа                  |
+| `FG_WAL_SYNC_MODE`         | enum  | `full`     | `full` \| `normal` \| `off`                                                                       |
+| `FG_MAX_SNAPSHOT_AGE_SEC`  | u64   | 300        | Возраст снимка, после которого он принудительно закрывается, чтобы разблокировать обрезку журнала |
 
 **Сборка индексов и массовая загрузка** (§20.13)
 
-| Параметр                              | Тип   | Default   | Описание                                              |
-|---------------------------------------|-------|-----------|---------------------------------------------------------|
-| `FG_BULK_SORT_MEM`                    | usize | 268435456 | Память на прогон внешней сортировки (256 МиБ)         |
-| `FG_BULK_SORT_MERGE_FANIN`            | usize | 64        | Степень k-путёвого слияния                            |
-| `FG_BULK_SORT_PARALLELISM`            | usize | ядра      | Потоки генерации прогонов                             |
+| Параметр                              | Тип   | Default   | Описание                                                                       |
+|---------------------------------------|-------|-----------|--------------------------------------------------------------------------------|
+| `FG_BULK_SORT_MEM`                    | usize | 268435456 | Память на прогон внешней сортировки (256 МиБ)                                  |
+| `FG_BULK_SORT_MERGE_FANIN`            | usize | 64        | Степень k-путёвого слияния                                                     |
+| `FG_BULK_SORT_PARALLELISM`            | usize | ядра      | Потоки генерации прогонов                                                      |
 | `FG_INDEX_BTREE_FILL_FACTOR`          | f64   | **0.90**  | Заполнение листьев B+tree (было 0.80); 1.00 автоматически при монотонном ключе |
-| `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | f64   | 0.95      | Заполнение внутренних узлов B+tree                    |
-| `FG_INDEX_RTREE_FILL_FACTOR`          | f64   | 0.95      | Заполнение узлов R-tree при STR-упаковке              |
-| `FG_INDEX_PENDING_MAX`                | usize | 1000000   | Порог очереди `DEFER` → индекс `stale` + пересборка   |
-| `FG_HNSW_BUILD_MEM`                   | usize | 2 ГиБ     | Бюджет памяти на построение HNSW (отдельно от кэша обслуживания) |
-| `FG_IMPORT_COMMIT_ROWS`               | usize | 1000000   | Размер сегментного коммита при импорте                |
-| `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | usize | 1000      | Сколько нарушений описывается подробно                |
-| `FG_IMPORT_REJECT_LIMIT`              | usize | 0         | Допустимое число нарушений до прерывания              |
-| `FG_IMPORT_NO_SLOT_REUSE`             | bool  | true      | Импорт только дописывает → возможен откат усечением   |
-| `FG_BULK_WAL_MODE`                    | enum  | `minimal` | `minimal` \| `full`; `full` станет обязательным при появлении репликации/PITR |
+| `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | f64   | 0.95      | Заполнение внутренних узлов B+tree                                             |
+| `FG_INDEX_RTREE_FILL_FACTOR`          | f64   | 0.95      | Заполнение узлов R-tree при STR-упаковке                                       |
+| `FG_INDEX_PENDING_MAX`                | usize | 1000000   | Порог очереди `DEFER` → индекс `stale` + пересборка                            |
+| `FG_HNSW_BUILD_MEM`                   | usize | 2 ГиБ     | Бюджет памяти на построение HNSW (отдельно от кэша обслуживания)               |
+| `FG_IMPORT_COMMIT_ROWS`               | usize | 1000000   | Размер сегментного коммита при импорте                                         |
+| `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | usize | 1000      | Сколько нарушений описывается подробно                                         |
+| `FG_IMPORT_REJECT_LIMIT`              | usize | 0         | Допустимое число нарушений до прерывания                                       |
+| `FG_IMPORT_NO_SLOT_REUSE`             | bool  | true      | Импорт только дописывает → возможен откат усечением                            |
+| `FG_BULK_WAL_MODE`                    | enum  | `minimal` | `minimal` \| `full`; `full` станет обязательным при появлении репликации/PITR  |
 
 **Статистика** (§19.5)
 
@@ -3199,247 +3195,25 @@ fn migrate(graph_dir: &Path, from_version: u32, to_version: u32) -> io::Result<(
 
 ## 29. Новые Rust-компоненты
 
-### 29.1. Структура модулей
-
-```
-src/
-  types/
-    mod.rs            -- Value enum (расширенный), TypeTag, кодирование
-    value.rs          -- расширенный Value + все варианты
-    record_id.rs      -- RecordId, RecordIdPart
-    datetime.rs       -- DateTime, Duration (обёртки над jiff)
-    decimal.rs        -- Decimal (обёртка крейтом)
-    geometry.rs       -- Geometry variants
-    vector.rs         -- VectorValue
-
-  storage/
-    mod.rs            -- PageManager trait, DataFileKind, constants
-    superblock.rs     -- StorageSuperblock, NamespaceSuperblock, DatabseSuperblock, GraphSuperblock
-    node_pages.rs     -- NodeHotSlot, NodeHotPage
-    edge_pages.rs     -- EdgeHotSlot, EdgeHotPage
-    adj_overflow.rs   -- AdjacencyOverflowPage, CrossLevelAdjacencyOverflowPage
-    edge_incidence.rs -- EdgeIncidencePage, CrossLevelEdgeIncidencePage
-    prop_heap.rs      -- PropHeapPage, slotted page
-    subgraph_dir.rs   -- SubgraphDirPage
-    freelist.rs       -- FreelistPage
-    label_dict.rs     -- LabelDictionary
-    disk_graph.rs     -- DiskMetaGraph (главный фасад)
-
-  schema/
-    mod.rs            -- SchemaCatalog
-    table.rs          -- TableDefinition
-    field.rs          -- FieldDefinition
-    index_def.rs      -- IndexDefinition metadata
-    event.rs          -- EventDefinition
-    function.rs       -- FunctionDefinition
-    analyzer.rs       -- AnalyzerDefinition
-    param.rs          -- ParamDefinition
-
-  stats/
-    mod.rs            -- StatisticsStore
-    graph_stats.rs    -- GraphStatsPage
-    label_stats.rs    -- LabelStatsPage
-    prop_hist.rs      -- PropertyHistogramPage
-    degree_hist.rs    -- DegreeHistogramPage
-
-  index/
-    mod.rs            -- Index trait, IndexStatus
-    label_index.rs    -- LabelIndex (sorted u32 array)
-    btree.rs          -- BTreeIndex (B+tree)
-    fulltext.rs       -- FulltextIndex (inverted + BM25)
-    hnsw.rs           -- HnswIndex
-    rtree.rs          -- RtreeIndex (geometry)
-    count.rs          -- CountIndex
-
-  changefeed/
-    mod.rs            -- ChangefeedStore
-    log.rs            -- ChangefeedPage, ChangefeedEntry
-    live_query.rs     -- LiveQueryRegistry
-```
-
-### 29.2. PageManager trait
-
-```rust
-pub trait PageManager: Send + Sync {
-    /// Выделяет новую страницу типа `file` и возвращает её page_no.
-    fn alloc_page(&self , file: DataFileKind) -> io::Result<u64>;
-
-    /// Освобождает страницу (обновляет freelist).
-    fn free_page(&self , file: DataFileKind, page_no: u64) -> io::Result<()>;
-
-  /// Читает страницу в буфер; использует BufferPool (Clock-Pro).
-    fn read_page(&self , file: DataFileKind, page_no: u64, buf: & mut [u8; PAGE_SIZE]) -> io::Result<()>;
-
-    /// Записывает страницу; обновляет BufferPool (dirty).
-    /// Возвращает LSN записи для установки page_lsn.
-    fn write_page_dirty(&self , file: DataFileKind, page_no: u64, buf: &[u8; PAGE_SIZE], lsn: Lsn) -> io::Result<()>;
-
-    /// Сбрасывает все dirty страницы заданного файла.
-    fn flush_file(&self , file: DataFileKind) -> io::Result<() >;
-
-    /// Сбрасывает все dirty страницы всех файлов.
-    fn flush_all(&self ) -> io::Result<() >;
-
-    /// Текущий page_count для файла.
-    fn page_count(&self , file: DataFileKind) -> io::Result<u64>;
-}
-```
-
-### 29.3. Новые компоненты
-
-| Компонент                     | Где                                      | Что делает                     |
-|-------------------------------|------------------------------------------|--------------------------------|
-| `PageManager` trait           | `storage/mod.rs`                         | Абстракция page-level I/O      |
-| `DiskMetaGraph`               | `storage/disk_graph.rs`                  | Disk-backed MetaGraph          |
-| `NodeHotSlot` / `EdgeHotSlot` | `storage/node_pages.rs`, `edge_pages.rs` | Encode/decode hot-слотов       |
-| `PropHeapPage`                | `storage/prop_heap.rs`                   | Slotted-page для PropertyMap   |
-| `LabelDictionary`             | `storage/label_dict.rs`                  | Интернирование строк           |
-| `LabelIndex`                  | `index/label_index.rs`                   | Sorted array index по меткам   |
-| `BTreeIndex`                  | `index/btree.rs`                         | B+tree property index          |
-| `FulltextIndex`               | `index/fulltext.rs`                      | Inverted index + posting lists |
-| `HnswIndex`                   | `index/hnsw.rs`                          | In-memory HNSW с checkpoint    |
-
-### 29.4. Зависимости (добавить в Cargo.toml)
-
-```toml
-jiff = { version = "0.2", features = ["serde"] }   # DateTime, Duration
-# ... Some Decimal Implementation here ... 
-xxhash-rust = { version = "0.8", features = ["xxh3"] }     # Page checksum
-geo = { version = "0.33" }                              # planar geospatial geometries and algorithms
-geojson = { version = "1.0.0" }                         # GeoJSON
-```
+> **Вынесено в [implementation_plan.md](implementation_plan.md).** Целевая структура Rust-модулей,
+> trait `PageManager`, таблица новых компонентов и зависимости `Cargo.toml` перенесены в план
+> реализации: §2 «Целевая структура модулей», §3 «Ключевые Rust-контракты» (§3.3 — действующая
+> frame-WAL-редакция `PageManager`, заменившая раннюю STEAL-версию `write_page_dirty`/`flush_*`),
+> §3.6 «Новые компоненты», §3.7 «Зависимости».
 
 ---
 
 ## 30. План доработки кодовой базы
 
-### 30.1. value.rs — Критический приоритет
-
-**Проблема**: текущий `Value` не поддерживает `None` (distinct from `Null`), `Decimal`, `DateTime`, `Duration`,
-`RecordId`, `Geometry`, `Set`, `Tuple`, `Range`, `Vector`, `Uuid`, `Ulid`.
-
-**Действие**: Полная замена `Value` enum.
-
-```rust
-// Новый Value enum (src/types/value.rs):
-pub enum Value {
-    None,                               // 0x00 — поле отсутствует
-    Null,                               // 0x01 — поле есть, значение null
-    Bool(bool),                         // 0x02
-    Int(i64),                           // 0x03
-    Float(f64),                         // 0x04
-    Decimal(SomeDecimalImpl),           // 0x05 (d128)
-    String(Box<str>),                   // 0x06
-    Bytes(Vec<u8>),                     // 0x07
-    DateTime(crate::types::DateTime),   // 0x08
-    Duration(crate::types::Duration),   // 0x09
-    Uuid(u128),                         // 0x0A
-    Ulid(u128),                         // 0x0B
-    RecordId(Box<RecordId>),            // 0x0C
-    Array(Vec<Value>),                  // 0x10
-    Set(BTreeSet<OrdValue>),            // 0x11 (ordered for encoding)
-    Tuple(Vec<Value>),                  // 0x12
-    Object(PropertyMap),                // 0x13
-    Option(Option<Box<Value>>),         // 0x14
-    Range(Box<RangeValue>),             // 0x15
-    Geometry(Box<Geometry>),            // 0x20–0x26
-    Vector(VectorValue),                // 0x30–0x34
-}
-```
-
-Обратная совместимость на этапе MVP не требуется.
-
-**Обратная совместимость** (future): старые `serial.rs` снимки читаются через версионированный decoder.
-Новые теги добавляются с новой версией CODEC_VERSION.
-
-### 30.2. serial.rs — Высокий приоритет
-
-**Проблема**: кодек не поддерживает новые типы.
-
-**Действие**: Обновить `write_value` / `read_value` для всех новых TypeTag.
-`CODEC_VERSION` = 1 на всём этапе MVP. На этапе MVP совместимость со снимками других форматов не поддерживается.
-
-Ключевые изменения:
-
-- Добавить ветки для TypeTag.
-- Обновить `write_props` / `read_props` для использования `key_id (u32)` вместо строк в disk mode.
-
-### 30.3. id.rs — Средний приоритет
-
-**Проблема**: `AtomId` и `GraphId` — только внутренние. Нет публичного `RecordId`.
-
-**Действие**: Добавить `RecordId` как отдельный публичный тип (не в `id.rs` — в `src/types/record_id.rs`).
-`AtomId` и `GraphId` остаются внутренними.
-
-Добавить `DiskAtomRef (u32)` как newtype в `src/storage/mod.rs`.
-
-### 30.4. mvcc_persist.rs — Средний приоритет
-
-**Проблема**: `WalKind` не покрывает дисковые операции; `WalEntry::Write` использует `atom_id: u64` (внутренний AtomId),
-а не `DiskAtomRef`.
-
-**Действие**:
-
-- Добавить новые `WalKind` значения 0x10–0x22 (§22.1).
-- Добавить соответствующие `WalEntry` варианты.
-- Разделить логику: `MvccWal` (текущий, Mode 1) и `DiskWal` (расширенный, Mode 2).
-  Оба используют `WalWriter` / `WalSegmentManager` как transport layer.
-- `PersistLayer::checkpoint()` расширить для flush .fgb файлов.
-
-### 30.5. mvcc.rs — Низкий приоритет
-
-**Проблема**: `VersionChain<T>` хранит typed T. Для дискового режима версии — bytes.
-
-**Действие**: Для Mode 2 `MvccStore<Vec<u8>, BytesCodec>` используется как есть (bytes = сериализованный `PropertyMap`).
-Не требует изменений, но нужно убедиться, что `MvccManager` корректно работает с `DiskMetaGraph`.
-
-### 30.6. store.rs — Низкий приоритет
-
-**Проблема**: `GraphStore` управляет только Mode 1 графами (`.fgr` + `.wal`).
-
-**Действие**: Добавить `GraphStore::open_disk_graph(name: &str) -> io::Result<DiskMetaGraph>`.
-Существующие методы `create_graph`, `open_graph` для Mode 1 — без изменений.
-
-### 30.7. graph.rs — Отложено
-
-`MetaGraph` остаётся in-memory (Mode 1 и загруженные subgraphs в Mode 3).
-
-Единственное необходимое дополнение: метод `MetaGraph::from_disk_batch(...)` для
-эффективной загрузки множества атомов из `DiskMetaGraph` без повторного сканирования.
-
-### 30.8. Приоритизированный порядок работ
-
-| Приоритет       | Компонент                | Что делать                                     |
-|-----------------|--------------------------|------------------------------------------------|
-| 1 (Блокирующий) | `src/types/value.rs`     | Новый `Value` enum с полной системой типов     |
-| 1 (Блокирующий) | `src/types/record_id.rs` | `RecordId`, `RecordIdPart`                     |
-| 1 (Блокирующий) | `serial.rs`              | Новые TypeTag                                  |
-| 1 (Блокирующий) | `src/types/datetime.rs`  | Полная интеграция Jiff                         |
-| 1 (Блокирующий) | `src/types/geometry.rs`  | GeoJSON parsing + encoding                     |
-| 2 (Высокий)     | `src/storage/`           | `PageManager`, `DiskMetaGraph`, all page types |
-| 2 (Высокий)     | `mvcc_persist.rs`        | Новые WalKind 0x10–0x21                        |
-| 3 (Средний)     | `src/schema/`            | `SchemaCatalog`                                |
-| 3 (Средний)     | `src/index/`             | `LabelIndex`, `BTreeIndex`, `CountIndex`       |
-| 4 (Нормальный)  | `src/stats/`             | `StatisticsStore`                              |
-| 4 (Нормальный)  | `src/index/fulltext.rs`  | `FulltextIndex` (BM25)                         |
-| 5 (Низкий)      | `src/index/hnsw.rs`      | `HnswIndex`                                    |
-| 5 (Низкий)      | `src/index/rtree.rs`     | `RtreeIndex`                                   |
-| 5 (Низкий)      | `src/changefeed/`        | `ChangefeedStore`, `LiveQueryRegistry`         |
-| 6 (MVP+)        | `store.rs`               | `open_disk_graph`                              |
-
-### 30.9. Исправления для полной инцидентности
-
-| Компонент                         | Что исправить                                                                                                                          |
-|-----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| `graph.rs::register_adjacency()`  | Добавить путь для edge-endpoints: регистрировать в EdgeEndpointIndex вместо игнорирования                                              |
-| `graph.rs::EdgeFlags`             | Добавить `CROSS_LEVEL = 0b0100_0000`                                                                                                   |
-| `graph.rs::add_cross_meta_edge()` | Установить `CROSS_LEVEL` на ребре; убрать запись `__from_inner`/`__to_inner`; использовать `source_atom_ref`/`target_atom_ref` в props |
-| `node.rs::NodeFlags`              | Убрать `PORT` бит или оставить deprecated                                                                                              |
-| `traversal.rs::neighbors()`       | Параметризовать: `NodeOnly` (текущий) vs `AtomWalk` (новый); AtomWalk использует EdgeEndpointIndex и EdgeIncidence                     |
-| `traversal.rs::TarjanCuts`        | Параметризовать тип обхода; `n.is_node()` — только в NodeOnly-режиме                                                                   |
-| `matrix.rs`                       | Добавить `EndpointTensor` и `ParticipationTensor`                                                                                      |
-| `id.rs`                           | Добавить `QualifiedAtomRef { sg_slot: u32, local_slot: u32 }`                                                                          |
+> **Вынесено в [implementation_plan.md](implementation_plan.md).** Пофайловый план доработки
+> (`value.rs`, `serial.rs`, `id.rs`, `mvcc_persist.rs`, `mvcc.rs`, `store.rs`, `graph.rs`),
+> приоритизированный порядок работ и правки полной инцидентности графового ядра перенесены в план:
+> §4 «План реализации по областям» (пофайловая детализация — Области A–D, N) и §5
+> «Приоритизированный порядок работ».
+>
+> Часть ранней редакции плана отменена принятыми решениями и в план не переносилась дословно:
+> `WalKind 0x10–0x22` и раздельные `MvccWal`/`DiskWal` → единый **frame-WAL** уровня БД (§22–§23);
+> `DiskAtomRef (u32)` → `u64` (§9). Актуализированные формулировки — в таблице решений в начале
+> плана (помечены 🔄).
 
 ---
-
-*Конец спецификации. Версия 0.1.*

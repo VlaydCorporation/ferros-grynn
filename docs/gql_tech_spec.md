@@ -35,7 +35,7 @@
 
 **Вне охвата:** физический формат страниц и байтовые раскладки (это `disk_storage_spec.md`); грамматика (это `gql_grammar.md`); семантика операторов языка (это `gql_spec.md`).
 
-> **Важно об архитектуре хранения.** Ранние черновики этого файла описывали LSM-дерево (L0/L1/compaction). Это устранено: `disk_storage_spec.md` §20.2.8 отклоняет LSM в пользу B+tree. Модель дискового режима — **frame-WAL (COW в логе) + бэкфилл на штатные места + MVCC через индекс версий страниц**, журнал единый на базу данных (§12). См. §31.2 `gql_spec.md`.
+> **Важно об архитектуре хранения.** Ранние черновики этого файла описывали LSM-дерево (L0/L1/compaction). Это устранено: `disk_storage_spec.md` §20.2.8 отклоняет LSM в пользу B+tree. Модель дискового режима — **frame-WAL (COW в логе) + бэкфилл на штатные места + MVCC через индекс версий страниц**, журнал единый на базу данных (§12). См. [implementation_plan.md](implementation_plan.md) §1.2.
 
 ---
 
@@ -64,7 +64,7 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 Архитектурные контракты выражаются через код: traits, инварианты типов, паттерны. Ключевые интерфейсы-границы:
 
-- **`PageManager`** (`disk_storage_spec.md` §29.2) — страничный I/O: `alloc_page`, `free_page`, `read_page`, `write_frame`, `flush_file`, `flush_all`, `page_count`; чтение параметризовано снимком.
+- **`PageManager`** ([implementation_plan.md](implementation_plan.md) §3.3) — страничный I/O под frame-WAL: `begin_tx`/`commit_tx`/`abort_tx`, `alloc_page`, `free_page`, `read_page` (параметризовано снимком), `write_frame`, `checkpoint`.
 - **`Index`** (`disk_storage_spec.md` §20.1) — единый интерфейс индексов: `insert`, `delete`, `lookup`, `range`, `rebuild`, `status`.
 - **`TransactionLogSink`** — приёмник WAL-записей (append + fsync-барьеры).
 - **`Operator`** (§7, §9) — узел плана исполнения: `next_batch() -> Option<Batch>`.
@@ -159,7 +159,7 @@ QueryResult (AnyValue)
 
 Ошибки — `SyntaxError { diagnostic: Box<Diagnostic> }` (`src/syn/error`). `Diagnostic` — **цепочка** записей `DiagnosticKind::{Cause, Span{kind, span, label}}` (связаны через `next`), что позволяет накапливать контекст («ожидался разделитель», «этот делимитер должен был закрыться здесь»). При выдаче ошибка рендерится на исходных байтах (`render_on_bytes` → `RenderedError`/`Snippet`/`Location`, с подсветкой участка) и конвертируется в `FerrosGrynnError::query_parse_error(...)`.
 
-Это — часть общей диагностической системы `gql_status`: `Status → DiagnosticRecord → ErrorState → FerrosGrynnError` (см. CLAUDE.md, `src/gql_status`). Синтаксические статусы — подкласс `ClientError` (§4.7 gql_spec).
+Это — часть общей диагностической системы `gql_status`: `StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError` (см. CLAUDE.md, `src/gql_status`). Синтаксические статусы — подкласс `ClientError` (§4.7 gql_spec).
 
 ---
 
@@ -182,7 +182,7 @@ QueryResult (AnyValue)
 1. Value: `int | float | decimal | string | bool | bytes | datetime | duration | …`
 2. Record: `record<T> | record<T1 | T2>`
 3. Graph: `vertex<T> | metavertex<T> | edge<T> | hyperedge<T> | metaedge<T> | atom<T> | path | subgraph | graph | tree | …`
-4. Collection: `array<T> | set<T> | tuple<…> | bag<T>`
+4. Collection: `array<T> | set<T> | bag<T>`
 5. Function: `(T1,…,Tn) -> U`
 
 Правила вывода — §24.9 gql_spec (T-Var, T-Field, T-FunctionCall, T-SELECT, T-MATCH, T-Traversal, T-Join). Idiom-навигация типизируется через `field(T, f) = τ`.
@@ -517,21 +517,8 @@ Runtime-решения: batch too large → split; skew → rebalance; выбо�
 
 ### 10.2. Абстракция страничного доступа
 
-Исполнитель никогда не читает файлы напрямую — только через `PageManager` (`disk_storage_spec.md` §29.2) поверх `BufferPool`:
-```rust
-trait PageManager: Send + Sync {
-    fn begin_tx(&self) -> TxHandle;
-    fn alloc_page(&self, tx: &TxHandle, key: PageKey) -> io::Result<u64>;
-    fn free_page(&self, tx: &TxHandle, key: PageKey) -> io::Result<()>;
-    /// Чтение всегда параметризовано снимком: сначала индекс версий, затем .fgb
-    fn read_page(&self, key: PageKey, snapshot: Lsn, buf: &mut [u8; PAGE_SIZE]) -> io::Result<()>;
-    /// Запись — новый фрейм в журнал; LSN назначает журнал, не вызывающий
-    fn write_frame(&self, tx: &TxHandle, key: PageKey, buf: &[u8; PAGE_SIZE]) -> io::Result<Lsn>;
-    fn commit_tx(&self, tx: TxHandle) -> io::Result<CommitTs>;
-    fn abort_tx(&self, tx: TxHandle);
-    fn checkpoint(&self, mode: CheckpointMode) -> io::Result<()>;
-}
-```
+Исполнитель никогда не читает файлы напрямую — только через `PageManager` поверх `BufferPool`. Полное определение trait'а (действующая frame-WAL-редакция) — в [implementation_plan.md](implementation_plan.md) §3.3 «`PageManager` — страничный доступ». Ключевые методы: `begin_tx`/`commit_tx`/`abort_tx` (транзакции); `alloc_page`/`free_page`; `read_page(key, snapshot, buf)` — чтение всегда параметризовано снимком (сначала индекс версий, затем `.fgb`); `write_frame(tx, key, buf) -> Lsn` — запись добавляет новый фрейм в журнал, LSN назначает журнал, не вызывающий; `checkpoint(mode)`.
+
 `PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и `checksum` (xxHash3-64). Ключ `PageKey = (graph_id, file_kind, page_no)`; `graph_id = 0` — системное пространство (каталог схемы и графов). При чтении из `.fgb` проверяются `page_no` и checksum → при рассинхроне страница восстанавливается применением фрейма из журнала (§12.4). I/O — `SyncIo`/`AsyncIo` с выровненными буферами (O_DIRECT), пакетные чтения через io_uring (§18 задела).
 
 ### 10.3. Разрешение идентификаторов: `RecordId → DiskAtomRef → AtomId`
@@ -749,7 +736,7 @@ prunable_prefix = min( min по графам(backfilled_lsn), oldest_reader_mark
 - **`CONCURRENTLY`** — двухфазная постройка без блокировки таблицы: initial (индексация существующих; новые изменения копятся как `pending`) → update (обработка pending); статус (`building_initial`/`building_update`/`ready`/`error`) виден через `INFO FOR INDEX` (§9.6 gql_spec).
 - **`REBUILD INDEX`** — перестройка (актуально для HNSW после многих обновлений).
 
-Индекс тоже MVCC-aware: `(index entry, ts)`; видимость записи индекса согласована со снимком (§32.3 gql_spec).
+Индекс тоже MVCC-aware: `(index entry, ts)`; видимость записи индекса согласована со снимком (§17 gql_spec).
 
 **Разделение ролей `DEFER` и bulk-сборки.** `DEFER` переносит ту же построчную работу в фон — это оптимизация **малой** дельты, а не замена массовому пути: на загрузке в сотни миллионов строк он даёт очередь того же порядка. Поэтому очередь ограничена `FG_INDEX_PENDING_MAX`, а при переполнении происходит эскалация: очередь сбрасывается, индекс помечается `stale`, планируется полная bulk-пересборка. Это crash-safe по построению — устаревший индекс всё равно строится заново из базовых данных, поэтому персистентная очередь (которая незаметно превратилась бы в L0 LSM-дерева) не нужна.
 
@@ -843,37 +830,18 @@ Cost-based выбор при равенстве стоимостей разре�
 
 ## 17. Соответствие кодовой базе
 
-| Компонент tech-spec                    | Модуль                                                                                                        | Статус                        |
-|----------------------------------------|---------------------------------------------------------------------------------------------------------------|-------------------------------|
-| Лексер / парсер                        | `src/syn` (`lexer`/`parser`/`token`/`error`, reblessive)                                                      | Каркас реализован             |
-| AST / Expr                             | `src/gql/ast.rs`, `src/gql/expression.rs`                                                                     | Каркас                        |
-| Datastore / execute                    | `src/gql/ds.rs` (`Datastore::execute → Vec<QueryResult>`)                                                     | Каркас (тело TODO)            |
-| Traversal VM                           | `src/gql/traversal` (`TraversalMachine`, `Traverser`, `TraversalContext`)                                     | Каркас                        |
-| Диагностика                            | `src/gql_status` (`Status → DiagnosticRecord → ErrorState → FerrosGrynnError`)                                | Реализовано                   |
-| Значения                               | `src/values` (`runtime/storable`, `runtime/virt`, `runtime/graph`, `storage`)                                 | Активный модуль               |
-| Граф-ядро / traversal-алгоритмы        | `fg-meta` `graph.rs`, `traversal.rs` (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA)                                  | Референс-реализация           |
-| MVCC (SI/SSI)                          | `fg-meta` `mvcc.rs` (SSI + O(1)-индексы + predicate locking)                                                  | Реализовано                   |
-| Персистентный MVCC / WAL               | `fg-meta` `mvcc_persist.rs` (логический WAL режима 1; для режима 2 — frame-WAL, §12)                                              | Реализовано                   |
-| Snapshot / store                       | `fg-meta` `store.rs`                                                                                          | Реализовано                   |
-| Direct/Async I/O, BufferPool           | `fg-meta` `io_sync`/`io_async`/`async_io`; `crates/storage_engine/io`                                         | Реализовано / каркас          |
-| PageManager / DiskMetaGraph / страницы | `crates/storage_engine` (`store`, `layout`) — `NodeRecord`/`EdgeRecord`/`PropertyRecord`, `FerrosGrynnLayout` | Каркас (по disk-spec §29–§30) |
-
-Что новое / требует реализации (сводно из `disk_storage_spec.md` §30): полная замена `Value` (types/), `RecordId`/`DiskAtomRef`/`QualifiedAtomRef`, `PageManager` + disk-страницы (storage/), `SchemaCatalog` (schema/), `StatisticsStore` (stats/), индексы (index/), changefeed/live (changefeed/); в query-слое — binder/typechecker, lowering AST→IR, RuleEngine/CostEngine, физические операторы, соединение Traversal VM с реляционным движком.
+> **Вынесено в [implementation_plan.md](implementation_plan.md) §1 «Соответствие кодовой базе».**
+> Таблица «компонент tech-spec → модуль → статус» и перечень того, что требует реализации,
+> объединены там с аналогичной таблицей `gql_spec.md` §31 в единый источник (без дублирования).
 
 ---
 
 ## 18. Отложено / вне MVP
 
-| Область                                                        | Решение                                                                              |
-|----------------------------------------------------------------|--------------------------------------------------------------------------------------|
-| JIT-компиляция (LLVM: expression/operator-fusion/pipeline JIT) | Не входит в контракт языка; implementation detail; после стабилизации интерпретатора |
-| Worst-Case Optimal Join (Leapfrog TrieJoin)                    | Базовый Index NL достаточен для MVP; WCOJ — для паттернов с циклами позже            |
-| Disk-backed graph-native pages (полная реализация Режима 2)    | Каркас есть; полная — большая работа, не нужна для in-memory MVP                     |
-| Physical-WAL + ARIES (Undo/CLR)                                | Не требуется: frame-WAL даёт те же гарантии без UNDO/CLR (§12)                 |
-| Параллельный recovery                                          | Отложено; single-pass достаточен                                                     |
-| SPDK / NVMe kernel-bypass                                      | Задел (`spdk.rs`), Linux-only, не развивается                                        |
-| SMT-верификация оптимизатора                                   | Long-term; property-based тесты как практический инструмент                          |
-| Тензорные кеши (dense/CSR на диске)                            | `TensorCachePage` — для ML/аналитики позже                                           |
+> **Вынесено в [implementation_plan.md](implementation_plan.md) §6 «Отложено / вне MVP».**
+> Сводный список отложенного (JIT, WCOJ, полный disk-backed режим 2, ARIES/UNDO, параллельный
+> recovery, SPDK, SMT-верификация оптимизатора, тензорные кеши) собран там из `gql_tech_spec.md`,
+> `gql_spec.md` §32.3 и `disk_storage_spec.md`.
 
 ---
 
