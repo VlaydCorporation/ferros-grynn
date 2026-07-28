@@ -11,8 +11,9 @@ pub enum Condition {
 	Warning,
 	SuccessfulCompletion,
 	Informational,
-	ConnectionException,
 	DataException,
+	QueryException,
+
 	SyntaxErrorOrAccessRuleViolation,
 	GeneralProcessingException,
 	SystemConfigurationOrOperationException,
@@ -75,6 +76,7 @@ impl Display for StatusObject {
 #[derive(Debug, Copy, Clone)]
 enum StatusCategory {
 	Unknown,
+	Query,
 	Syntax,
 	Semantic,
 	Data,
@@ -141,8 +143,20 @@ define_status_codes!(
     },
 	InvalidArgument, "FG-00001" => {
 		template: "{}",
-		params: [StringParam::Msg]
+		params: [StringParam::Message]
 		subcondition: "invalid argument",
+		descriptor: StatusDescriptor {
+			condition: Condition::DataException,
+			category: StatusCategory::Data,
+			domain: StatusDomain::Client,
+			properties: StatusProperties::NONE,
+			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
+		},
+	},
+	ConversationError, "FG-00001" => {
+		template: "Cannot convert from '{}' to '{}'",
+		params: [StringParam::Value, StringParam::ValueType]
+		subcondition: "conversation error",
 		descriptor: StatusDescriptor {
 			condition: Condition::DataException,
 			category: StatusCategory::Data,
@@ -230,6 +244,62 @@ define_status_codes!(
 		descriptor: StatusDescriptor {
 			condition: Condition::DataException,
 			category: StatusCategory::Data,
+			domain: StatusDomain::Client,
+			properties: StatusProperties::NONE,
+			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
+		}
+	},
+	AtomDoesNotExists, "" => {
+		template: "The atom of type {} with id {} does not exist.",
+		params: [StringParam::AtomType, StringParam::Id],
+		subcondition: "atom does not exists",
+		descriptor: StatusDescriptor {
+			condition: Condition::DataException,
+			category: StatusCategory::Data,
+			domain: StatusDomain::Client,
+			properties: StatusProperties::NONE,
+			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
+		}
+	},
+	EmptyEdgeTargets, "" => {
+		template: "Edge atom has not targets",
+		subcondition: "edge atom targets is empty",
+		descriptor: StatusDescriptor {
+			condition: Condition::DataException,
+			category: StatusCategory::Data,
+			domain: StatusDomain::Client,
+			properties: StatusProperties::NONE,
+			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
+		}
+	},
+	EdgeCreationError, "" => {
+		subcondition: "cannot create edge",
+		descriptor: StatusDescriptor {
+			condition: Condition::DataException,
+			category: StatusCategory::Data,
+			domain: StatusDomain::Client,
+			properties: StatusProperties::NONE,
+			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
+		}
+	},
+	QueryTooLarge, "" => {
+		template: "Size of query script exceeded maximum supported size of 4,294,967,295 bytes."
+		subcondition: "query too large",
+		descriptor: StatusDescriptor {
+			condition: Condition::QueryException,
+			category: StatusCategory::Query,
+			domain: StatusDomain::Client,
+			properties: StatusProperties::NONE,
+			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),
+		}
+	},
+	QueryParseError, "" => {
+		template: "Parse error:\n{}",
+		params: [StringParam::Message]
+		subcondition: "query parse error",
+		descriptor: StatusDescriptor {
+			condition: Condition::SyntaxErrorOrAccessRuleViolation,
+			category: StatusCategory::Syntax,
 			domain: StatusDomain::Client,
 			properties: StatusProperties::NONE,
 			classification: GqlClassification::ErrorClassification(ErrorClassification::ClientError),

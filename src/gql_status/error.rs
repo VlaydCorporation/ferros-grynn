@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use crate::gql_status::diagnostic::{DiagnosticRecord, Severity};
 use crate::gql_status::status::{ExecutionPhase, Status, StatusMeta, StatusObject};
 use jiff::Error;
@@ -13,9 +14,31 @@ pub struct FerrosGrynnError {
 }
 
 impl FerrosGrynnError {
+	pub fn conversation_error(value: String, ty: impl Into<String>) -> Self {
+		Status::ConversationError {
+			value,
+			valuetype: ty.into()
+		}.into()
+	}
+
+	pub fn atom_does_not_exist(id: String, ty: String) -> Self {
+		Status::AtomDoesNotExists {
+			atomtype: ty,
+			id
+		}.into()
+	}
+
+	pub fn empty_edge_targets() -> Self {
+		Status::EmptyEdgeTargets.into()
+	}
+
+	pub fn edge_creation_error() -> Self {
+		Status::EdgeCreationError.into()
+	}
+
 	pub fn invalid_argument(message: String) -> FerrosGrynnError {
 		Status::InvalidArgument {
-			msg: message,
+			message,
 		}.into()
 	}
 
@@ -110,6 +133,12 @@ struct ErrorState {
 	status: DiagnosticRecord,
 	#[source]
 	cause: Option<Arc<FerrosGrynnError>>,
+}
+
+impl Display for ErrorState {
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		todo!()
+	}
 }
 
 impl FerrosGrynnError {
