@@ -603,6 +603,9 @@ build_source     ::= match_stmt | select_stmt | traverse_stmt | "(" statement ")
 
 `graph_constraint` — тот же набор типов графов, что и в `DEFINE GRAPH` (§9.8, §14.4). Проверка типа выполняется
 **после** построения результата; несоответствие → `ConstraintViolation`.
+Без annotation `RETURN GRAPH` имеет тип `subgraph`; с annotation — точный указанный graph type.
+Оба результата полностью материализуются до выхода из запроса. Эти правила семантические и не
+добавляют альтернатив в EBNF.
 
 ---
 
@@ -813,6 +816,8 @@ live_projection ::= [ "VALUE" ] select_field_list [ "AS" alias ]
 ```
 
 `LIVE SELECT` обычно связывается с идентификатором: `LET $id = LIVE SELECT ...`, где `$id` используется в `KILL`.
+Оператор возвращает event stream. `LiveGraph<Frozen/Mutable>` является SDK-материализацией этого
+потока и не добавляет отдельной синтаксической формы.
 
 ---
 

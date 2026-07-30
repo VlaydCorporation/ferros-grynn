@@ -84,7 +84,7 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 ## 2. Конвейер обработки запроса
 
-Точка входа — `Datastore::execute(text: &str, vars: Option<Variables>) -> Vec<QueryResult>` (`src/gql/ds.rs`). Каждый оператор верхнего уровня возвращает свой `QueryResult { time, query_type, result: FerrosGrynnResult<AnyValue> }` (`src/dbs/response.rs`).
+Точка входа — `Datastore::execute(text: &str, vars: Option<Variables>) -> Vec<QueryResult>` (`src/gql/ds.rs`). Каждый оператор верхнего уровня возвращает свой `QueryResult { time, query_type, result: FerrosGrynnResult<Value> }` (`src/dbs/response.rs`).
 
 Конвейер (соответствует диаграмме §22.1 `gql_spec.md`):
 
@@ -108,7 +108,7 @@ Fail-closed неприятнее в моменте, но честнее в эк�
    │           └── §10 доступ к хранилищу (PageManager / BufferPool / Index / Stats)
    │           └── §11 снимок MVCC
    ▼
-QueryResult (AnyValue)
+QueryResult (Value)
 ```
 
 Каждая стадия — отдельный компонент с явным контрактом входа/выхода. Между стадиями данные не «протекают» синтаксисом: логический IR не хранит синтаксис (§26 gql_spec, «IR НЕ ДОЛЖЕН хранить синтаксис»).
@@ -193,27 +193,45 @@ Graph-специфичные проверки:
 - `path<T> = sequence(vertex<T>)`; функции `path::nodes/edges/atoms/length/cost` типизируются по типу пути (§15.6 gql_spec).
 - `RETURN GRAPH <constraint> {…}`: тип результата — `subgraph` или заявленный тип графа; **система типов не делает неявных преобразований** (запрос `rooted_tree` при фактическом `forest` → ошибка; проверка **после** построения результата, §16.1 gql_spec).
 
+`option<T>` существует только в Typed AST: `Some(v)` понижается в `v`, `None` — в
+`Value::None`. Отдельного runtime-варианта и `TypeTag` нет. Операторы над `none`/`null` всегда
+типизируются в `bool`; IR не содержит `TruthValue::Unknown`.
+
+Контракт graph/query результатов фиксируется уже при типизации:
+
+| Оператор | Typed result |
+|----------|--------------|
+| `RETURN atom` | stable atom/record ref |
+| `RETURN path` | materialized `Path` |
+| `RETURN GRAPH {…}` | `Subgraph<Frozen>` |
+| `RETURN GRAPH <T> {…}` | точный `T<Frozen>` |
+| именованный `BUILD GRAPH <T>` | `GraphRef<T>` после commit |
+| анонимный `BUILD GRAPH <T>` | session-owned `T<Frozen>` |
+| `graph::inner` внутри плана | borrowed graph/subgraph view |
+
+Backend-dispatch не меняет Typed result и остаётся внутренним.
+
 ### 4.3. Фаза 3 — Constraint solving
 
 Уточнение типов из контекста: `a.age > 10` ⟹ `type(a.age) = number`. Унификация типовых переменных; проверка `record<A | B>` (union) — §24.4.
 
 ### 4.4. Разрешение перегрузки `number`
 
-Единственная разрешённая перегрузка (§18.7 gql_spec) — числовой тип `number`, разрешаемый в `int`/`float`/`decimal` **на этапе анализа** (не в рантайме). Автоприведение `int → float → decimal` неявное; сужающее (`decimal → int`) — только через явный cast `<int> e`.
+Единственная разрешённая перегрузка (§18.7 gql_spec) — числовой тип `number`, разрешаемый в
+`int`/`float`/`decimal` **на этапе анализа** (не в рантайме). Автоматически разрешены
+`int → float` и `int → decimal`. `float → decimal` и все сужающие преобразования выполняются
+только явным fallible cast; смешение `float` и `decimal` без явного целевого типа — ошибка.
+Контекстный `decimal → float` разрешён с диагностикой о возможной потере точности.
 
-### 4.5. Три-значная логика и `null`/`none`
-
-Типизация фиксирует различие `null` (∈ любой nullable-тип, участвует в `UNKNOWN`) и `none` (∉ любого `T`, ведёт себя как `false` в `WHERE`) — §5.1 gql_spec. Линт-предупреждение при смешивании (§32.1 gql_spec).
-
-### 4.6. Classification purity
+### 4.5. Classification purity
 
 Каждая функция/выражение получает класс purity (`PURE | STABLE | IMPURE`, §18.5 gql_spec), считываемый из `FunctionDefinition.purity` (`disk_storage_spec.md` §18). Класс влияет на оптимизатор (§6): `PURE` можно инлайнить/кешировать/переставлять; `STABLE` фиксирована в рамках запроса (`time::now()` замораживается на снимок); `IMPURE` — барьер порядка.
 
-### 4.7. Проверка computed-полей
+### 4.6. Проверка computed-полей
 
 `DEFINE FIELD … COMPUTED expr` строит граф зависимостей computed-значений; при обнаружении цикла — ошибка (§5.10 gql_spec). Тип помечается обёрткой `computed<T>`; `COMPUTED`-поля **не хранятся** на диске и вычисляются исполнителем при `SELECT` из `FieldDefinition.expr_bytes` (IR) (`disk_storage_spec.md` §18).
 
-### 4.8. Soundness
+### 4.7. Soundness
 
 Цель: `WellTyped(Q) ⟹ нет runtime type errors` (за исключением явно разрешённых dynamic-cast). Теоремы Preservation/Progress (§59.4 gql_spec). Unsound-зоны фиксируются явно: floating-point, time-dependent функции, randomness, side-effects (§61.2).
 
@@ -368,7 +386,9 @@ PathExpandOp { input, adjacency, min_depth, max_depth, mode, objective?, frontie
 - **BFS** (frontier-based): очередь состояний, `emit` при `depth ≥ min`, расширение при `depth < max` и `allowed_by_mode` (§50.1). Bitmap-frontier + ранняя дедупликация (§15.4, §50.2).
 - **DFS** — для перечисления путей и constrained-search с pruning.
 - **Shortest** — BFS (невзвешенный) / Dijkstra (взвешенный), `weight(NaN) = 1` (§15.1 gql_spec).
-- Path-representation: `Path = { nodes: Vec<NodeId>, edges: Vec<EdgeId> }`, хранится в arena + offsets, immutable-сегменты (§7.3, §13.9 gql_spec) → O(1) append.
+- Во время поиска path хранится в `PathTraceArena`: узел trace содержит `previous`,
+  stable atom ref, optional via-edge, direction/role и cumulative cost. Общие prefixes
+  разделяются, append выполняется за `O(1)`.
 
 ### 7.5. Соединения (Join)
 
@@ -442,7 +462,11 @@ Traverser = {
 
 ### 8.5. Path propagation
 
-На каждом шаге: `new_path = old_path + edge + node` (§13.9). Хранение — persistent structure (rope / arena-index) → O(1) append, без копирования сегментов (§7.3). Path трекается **лениво** — только если запрошен (`tv::path()` или именованный путь).
+На каждом шаге trace расширяется новым `PathTraceNode` (§13.9). Planner включает tracking с
+начала обхода, если path именован, возвращается, используется `tv::path()` либо path-функцией.
+Если path статически не используется, trace не создаётся. Barrier сам по себе не обязан
+материализовывать path; это делают `RETURN`, `collect` и операторы, которым нужна полная
+структура для сравнения.
 
 ### 8.6. Control flow
 
@@ -451,6 +475,11 @@ Traverser = {
 ### 8.7. Материализация и барьеры
 
 Материализация потока происходит только на: barrier-шагах (`order`, `group`, `dedup`, `fold`); явном `collect()`; границе (`RETURN`) (§13.7). Планировщик учитывает barrier'ы при оценке стоимости (блокируют pipeline-fusion).
+
+Публичный `Path` материализуется в `Arc<[PathStep]>` со stable refs, origin graph identity и
+`SnapshotId`. Структурные функции не требуют I/O. Разрешение свойств выполняется только через
+`GraphRead`, совпадающий по origin и snapshot; при отсутствии исторической версии возвращается
+`SnapshotUnavailable`, а не latest value.
 
 ### 8.8. Параллелизм
 
@@ -511,9 +540,18 @@ Runtime-решения: batch too large → split; skew → rebalance; выбо�
 
 ### 10.1. Режимы хранения
 
-- **Режим 1 — Full in-memory** (`MetaGraph`, `fg-meta`): весь граф в RAM (SoA), MVCC в памяти, WAL + snapshot для durability; recovery = load snapshot + replay WAL. Максимальная скорость traversal.
-- **Режим 2 — Disk-backed** (`DiskMetaGraph`, `disk_storage_spec.md`): страницы графа в наборе `.fgb`-файлов, горячие — в Clock-Pro buffer pool; MVCC на уровне записей; Direct I/O. Для графов, не помещающихся в RAM.
-- **Режим 3 — Hybrid** (`MemoryGraphHandle` через `query_to_memory`): подграф из disk-backed загружается в in-memory `MetaGraph`; работа через MVCC in-memory; flush по политике.
+- **Режим 1 — Full in-memory**: `Graph<Mutable>` или специализированный `T<Mutable>` хранит
+  topology в RAM, MVCC — в памяти, WAL + snapshot обеспечивают durability. Frozen-представление
+  строится явно через `freeze`.
+- **Режим 2 — Disk-backed**: каталог возвращает `GraphRef`; `read(&tx)` создаёт
+  `DiskGraphView<'tx>` над `PageManager`, `BufferPool` и `SnapshotId`. View не является копией
+  графа и не переживает transaction guard.
+- **Режим 3 — Hybrid**: `query_to_memory::<T, State>` загружает выбранный disk-backed подграф в
+  собственную storage family `T<State>`. После полной загрузки исходный disk snapshot
+  освобождается.
+
+Все режимы реализуют общий read-only контракт `GraphRead`. Мутация доступна только типам в
+состоянии `Mutable`; query results используют `Frozen`.
 
 ### 10.2. Абстракция страничного доступа
 
@@ -534,11 +572,18 @@ RecordId --(primary B+tree pk_<table_id>.fgidx)--> DiskAtomRef --(read hot slot 
 ```
 `from_disk_ref(r, gen)` восстанавливает `AtomId` из `DiskAtomRef` + generation, прочитанной из hot-slot. Материализация результата (§4.2) выполняет обратный маппинг `AtomId → DiskAtomRef → RecordId` и разыменование `id`-свойства.
 
-Кросс-уровневые endpoint'ы адресуются `QualifiedAtomRef { sg_slot, local_slot }` (§3.9 disk-spec): когда `EdgeHotSlot.flags.CROSS_LEVEL = 1`, inline-endpoint'ы хранят `QualifiedAtomRef`, иначе plain `DiskAtomRef`.
+Кросс-уровневые endpoint'ы адресуются
+`QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }` (§3.9 disk-spec): когда
+`EdgeHotSlot.flags.CROSS_LEVEL = 1`, inline/overflow endpoint'ы разрешаются как qualified refs,
+иначе используются plain `DiskAtomRef`.
 
 ### 10.4. Как операторы читают данные
 
-**Атомы (hot data).** `NodeHotSlot` (256 байт, 63/страница) и `EdgeHotSlot` (128 байт, 127/страница) хранят «горячее»: kind-флаги, `label_id`, `table_id`, счётчики степени, inline-adjacency, ссылку на свойства (`props_page`/`props_slot`/`props_len`). Адресация — O(1) без B+tree: `page_no = slot / slots_per_page`, `offset = 32 + (slot % slots_per_page) × slot_size`.
+**Атомы (hot data).** `NodeHotSlot` и `EdgeHotSlot` имеют по 160 байт
+(102 слота/страница) и хранят «горячее»: kind-флаги, `label_id`, `table_id`, счётчики степени,
+inline-adjacency и ссылку на свойства (`props_page`/`props_slot`/`props_len`). Адресация — O(1)
+без B+tree: `page_no = slot / slots_per_page`,
+`offset = 32 + (slot % slots_per_page) × slot_size`.
 
 `table_id` в hot-slot используется планировщиком для быстрой пофильтровой выборки по таблице без обращения к props.
 
@@ -546,12 +591,25 @@ RecordId --(primary B+tree pk_<table_id>.fgidx)--> DiskAtomRef --(read hot slot 
 ```
 1. Прочитать NodeHotSlot(node_slot).
 2. Взять adj_out[..min(adj_out_count, 16)] до первого NULL_SLOT — inline edge DiskAtomRef'ы.
-3. Если adj_out_count > 16 — идти по цепочке overflow_out:
-     каждая AdjacencyOverflowPage: entries[..count] (u32), затем next_page, пока != NULL_PAGE.
+3. Если adjacency не помещается inline — идти по цепочке overflow:
+     каждая AdjacencyOverflowPage: entries[..count] (DiskAtomRef/u64), затем next_page,
+     пока != NULL_PAGE.
 ```
-Это зеркалит in-memory модель `fg-meta` (`SmallVec<[u32;16]>` inline + overflow) — единая семантика в обоих режимах. Направления: `adj_out`/`adj_in` (16 inline), `adj_undir` (8 inline).
+Это зеркалит in-memory модель `fg-meta` (inline `SmallVec` + overflow) при иной стабильной
+дисковой ширине ссылок.
 
-**Свойства (cold data).** `PropHeapPage` — слоттированная страница; `PropertyMap` кодируется как `num_props(uLEB128) + [key_id(u32) + Value]` (`disk_storage_spec.md` §13.2). Ключи интернированы (`key_id` из `LabelDictionary`). Крупные объекты (> ½ payload) — цепочка `PropLargeChunkPage`. Late materialization (§7.6): свойства читаются только для строк, прошедших топологический/label-фильтр.
+**Свойства (cold data).** `PropHeapPage` остаётся row-oriented слоттированной страницей;
+`PropertyMap` кодируется как `num_props(uLEB128) + [key_id(u32) + StorageValue]`
+(`disk_storage_spec.md` §13.2). Ключи интернированы и отсортированы по `key_id`; duplicate key
+при decode является ошибкой. Крупные объекты (> ½ payload) — цепочка `PropLargeChunkPage`.
+Late materialization (§7.6): свойства читаются только для строк, прошедших
+топологический/label-фильтр.
+
+`PropertyMap` не заменяется `Arrow::MapArray`. Для аналитики отдельный адаптер строит
+`PropertyBatch { RecordBatch, presence bitmaps, key_id_to_field }`: `present=0` означает `none`,
+`present=1 && valid=0` — `null`, `present=1 && valid=1` — значение. Повторные сканы могут
+использовать `PropertyColumnCachePage`; DataFusion подключается только к batch-слою и не
+проникает в runtime `Value`.
 
 **Рёбра-endpoint'ы и MetaEdge.** `EdgeHotSlot` держит inline `inv_inline`/`out_inline` (по 4), overflow-цепочки, `weight` (NaN = нет веса), `transition_gid` (для MetaEdge с transition-подграфом), `inc_page` (список `EdgeIncidence`, ≠ NULL ⇒ MetaEdge). Participation-инцидентность (`EdgeIncidencePage`, роли Source/Target/Control) читается отдельно от endpoint-инцидентности — два независимых механизма (§3.8 gql_spec).
 
@@ -563,38 +621,56 @@ RecordId --(primary B+tree pk_<table_id>.fgidx)--> DiskAtomRef --(read hot slot 
 
 Планировщик (§6.3) читает `StatisticsStore` (`GraphStatsPage`, `LabelStatsPage`, `PropertyHistogramPage`, `DegreeHistogramPage`) через `PageManager`. Статистика — это то, без чего графовый планировщик не работает (§6.4), поэтому её сбор обязателен для MVP.
 
-### 10.6. Режим 3 — query_to_memory / MemoryGraphHandle
+### 10.6. Режим 3 — `query_to_memory`
 
 Высокоуровневый API для гибридного режима:
 ```rust
-fn query_to_memory_sample() {
-  let handle: MemoryGraphHandle = db.query_to_memory(
-    "MATCH (p:Person)-[:FRIEND*1..3]->(q:Person) WHERE p.name = $name",
-    Some(vars!{ "name" => "Alice" }),
-    MemoryGraphSettings {
-      max_nodes: Some(100_000), max_edges: Some(500_000),
-      max_memory_bytes: Some(512 * 1024 * 1024),
-      isolation: IsolationLevel::SnapshotIsolation,
-      flush: FlushPolicy::Auto { dirty_threshold: 1000, interval: Some(Duration::from_secs(30)), on_drop: true },
-      overflow: OverflowPolicy::Error,        // | Evict | SpillToDisk
-      lifetime: GraphLifetime::Transaction,   // | Session | Named("working_graph")
-    },
-  ).await?;
-}
+let graph: Dag<Frozen> = db
+    .query_to_memory::<Dag<Frozen>>(query, vars, settings)
+    .await?;
+
+let working: Dag<Mutable> = db
+    .query_to_memory::<Dag<Mutable>>(query, vars, write_back_settings)
+    .await?;
 ```
-Внутренняя структура:
-```
-MemoryGraphHandle
-├── inner: MetaGraph              -- in-memory граф (graph.rs)
-├── mvcc: MvccStore               -- MVCC + SSI (mvcc.rs)
-├── source: DiskMetaGraph         -- disk-источник (§10.1 режим 2)
-├── dirty_set: FxHashSet<AtomId>  -- изменённые атомы
-├── snapshot_ts: TxId             -- снимок на момент загрузки
-└── settings: MemoryGraphSettings
-```
-- **Загрузка** (`load_subgraph`, disk-spec §25): выполнить GrynQL-запрос на disk-backend → набор `DiskAtomRef` → Pass 1 (узлы: пропустить tombstone, резолв label через `LabelDictionary`, чтение props), Pass 2 (рёбра между загруженными узлами) → построить `slot_to_atom: Map<u64, AtomId>`; зафиксировать `snapshot_ts`.
-- **Flush**: сериализовать `dirty_set` → WAL-записи → применить через `GraphHandle::commit()` → опционально checkpoint.
-- **Параллельный доступ**: через `MvccStore` (несколько читателей lock-free, писатели через SSI-конфликты).
+
+- Загрузка выполняет запрос на одном `SnapshotId`, в два прохода материализует атомы и
+  инцидентность, проверяет constraint `T`, строит нужную storage family и source mapping.
+- После успешной загрузки `GraphReadView<'tx>` закрывается. Возвращаемый граф не зависит от
+  доступности исторического disk snapshot.
+- `T<Frozen>` не содержит dirty-set и flush API.
+- `T<Mutable>` содержит source mapping и dirty-set; `flush` является явной fallible операцией
+  через новую транзакцию, проверку конфликтов и graph invariants. `Drop` не выполняет скрытый
+  commit.
+- Публичного неоднозначного `MemoryGraphHandle`/`GraphHandle` нет; backend и storage family
+  известны из типа результата.
+
+### 10.7. Graph family и type-state
+
+Общие публичные типы: `Graph<State>`, `Tree<State>`, `RootedTree<State>`, `Forest<State>`,
+`Dag<State>`, `Hypergraph<State>`, `Metagraph<State>`, где `State = Mutable | Frozen`.
+Один универсальный backing для всех типов не используется:
+
+- general family — универсальная multi-hyper-meta topology;
+- forest family — parent/children/roots и tree-specific caches;
+- DAG family — incoming/outgoing adjacency и topological rank;
+- hyper family — vertices, hyperedges и incidence без meta/cross-level.
+
+`freeze`/`thaw` и owned cross-family conversion могут стоить `O(V+E)`. Расширяющие read-only
+views не перестраивают данные; сужающие conversions валидируют и перестраивают representation.
+Точная матрица — `gql_spec.md` §3.9 и [graphs.md](graphs.md).
+
+### 10.8. Live graph materialization
+
+`LiveGraph<Frozen>` хранит atomically replaceable `Arc` текущей frozen revision. Changefeed
+delta применяется к copy-on-write chunks, валидируется и публикуется одним swap; `read()`
+возвращает guard одной revision.
+
+`LiveGraph<Mutable>` дополнительно содержит local dirty-set и incoming queue. При пересечении
+remote delta с dirty-set подписка ставится на паузу и выдаёт `LiveEvent::Conflict` с incoming,
+local, conflicts и remote revision. Delta не применяется автоматически. После явного
+`accept_remote`/`keep_local`/`discard_local`/`rebase`/`flush`/`resume` повторно проверяются
+инварианты graph family.
 
 ---
 
@@ -612,9 +688,23 @@ MemoryGraphHandle
 
 Timestamp oracle: глобальный `atomic<u64> next_ts`; при старте tx `start_ts = next_ts.load()`, при commit `commit_ts = next_ts.fetch_add(1)`. Видимость версии: `visible(v, snapshot_ts) = v.begin_ts ≤ snapshot_ts < v.end_ts`.
 
+`SnapshotId` — только identity MVCC-версии. Он не владеет данными и сам по себе не позволяет
+читать граф.
+
 ### 11.3. GraphView
 
-В рамках одной транзакции граф виден консистентно (§17.3): мутации видны внутри транзакции немедленно, вне — после `COMMIT`. Traversal **не видит** собственные мутации в рамках одного шага, если не включён `FG_TRAVERSAL_READ_YOUR_WRITES` (default false).
+`GraphReadView<'tx>` — transaction-bound read guard:
+
+- в режиме 1 содержит ссылку/guard на корень in-memory MVCC version;
+- в режиме 2 содержит `GraphRef`, `SnapshotId` и доступ к страницам через `PageManager`;
+- borrowed atom/subgraph views наследуют `'tx` и не выходят из транзакции.
+
+Самостоятельный возвращаемый `GraphSnapshot` не вводится. `RETURN GRAPH` и
+`query_to_memory` сначала полностью материализуют результат, затем освобождают source view.
+
+В рамках одной транзакции граф виден консистентно (§17.3): мутации видны внутри транзакции
+немедленно, вне — после `COMMIT`. Traversal **не видит** собственные мутации в рамках одного
+шага, если не включён `FG_TRAVERSAL_READ_YOUR_WRITES` (default false).
 
 ### 11.4. Обнаружение конфликтов
 

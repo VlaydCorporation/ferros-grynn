@@ -46,7 +46,8 @@
 
 - Поддержать **Режим 2** (`gql_tech_spec.md §2.2`): граф не помещается в RAM; горячие страницы в Clock-Pro buffer pool.
 - Поддержать **Режим 3** (гибридный): загрузка подграфа из диска в in-memory MetaGraph через `query_to_memory`.
-- Обеспечить хранение **полной системы типов GQL** (`gql_spec.md §5`): все примитивы, составные типы, доменные типы.
+- Обеспечить хранение всех **persistable** типов GQL (`gql_spec.md §5`); runtime-only,
+  mutable/live и transaction-bound значения отклоняются явно.
 - Обеспечить хранение **схемы** (таблицы, поля, индексы, события, функции, анализаторы, параметры).
 - Обеспечить хранение **статистики** для cost model планировщика (степени, гистограммы, selectivity).
 - Поддержать **все виды индексов**: standard, unique, count, fulltext (BM25), HNSW vector, path, reachability,
@@ -114,11 +115,18 @@ Mode 2: Disk-Backed                             (ЭТА СПЕЦИФИКАЦИЯ
 
 Mode 3: Hybrid                                  (поверх Mode 2)
   DiskMetaGraph (disk backend)
-  ↓ query_to_memory
-  MemoryGraphHandle { inner: MetaGraph, source: DiskMetaGraph, dirty_set, snapshot_ts }
-  ↓ flush
-  DiskMetaGraph (записать dirty_set)
+  ↓ query_to_memory::<T, Frozen>()
+  T<Frozen> (самостоятельный read-optimized граф)
+  или
+  ↓ query_to_memory::<T, Mutable>()
+  T<Mutable> { source_mapping, dirty_set }
+  ↓ explicit flush в новой транзакции
+  DiskMetaGraph
 ```
+
+Оба варианта загружаются на одном `SnapshotId` и освобождают исходный snapshot после полной
+материализации. `Frozen` не имеет flush API; `Mutable` никогда не коммитит изменения скрыто в
+`Drop`.
 
 ---
 
@@ -147,7 +155,6 @@ Mode 3: Hybrid                                  (поверх Mode 2)
 | 0x11 | `array<T>`                  | Типизированный массив                    | 1+4+Σ(elements)            |
 | 0x12 | `set<T>`                    | Множество уникальных                     | 1+4+Σ(elements)            |
 | 0x13 | `object`                    | Map ключ→значение                        | 1+4+Σ(key_id+value)        |
-| 0x14 | `option<T>`                 | Some(T) или None                         | 1+[value]                  |
 | 0x15 | `range<T>`                  | Диапазон [lo..hi] с флагами              | 1+flags+[lo]+[hi]          |
 | 0x21 | `geometry::Point`           | Точка (lon, lat)                         | 17 байт                    |
 | 0x22 | `geometry::LineString`      | Ломаная                                  | 1+4+N×16 байт              |
@@ -161,9 +168,13 @@ Mode 3: Hybrid                                  (поверх Mode 2)
 | 0x33 | `vector_i64`                | Вектор i64                               | 1+2+N×8 байт               |
 | 0x34 | `vector_i32`                | Вектор i32                               | 1+2+N×4 байт               |
 | 0x35 | `vector_i16`                | Вектор i16                               | 1+2+N×2 байт               |
-| 0x36 | `atom_ref`                  | disk_atom_ref(u32 LE)                    | 1 + 4 байт                 |
+| 0x36 | `atom_ref`                  | disk_atom_ref(u64 LE)                    | 1 + 8 байт                 |
 | 0x37 | `graph_ref`                 | sg_slot(u32) + sg_gen(u32)               | 1 + 8 байт                 |
-| 0x38 | `qualified_atom_ref`        | sg_slot(u32 LE) + local_slot(u32 LE)     | 1 + 8 байт                 |
+| 0x38 | `qualified_atom_ref`        | sg_slot(u32 LE) + local_ref(u64 LE)      | 1 + 12 байт                |
+
+Таблица в §5.2 — единственный нормативный реестр `TypeTag`. Теги в этой таблице приведены для
+навигации и обязаны совпадать с ним. `0x14` зарезервирован в format v1 и не переиспользуется:
+`option<T>` является статическим типом, `Some(v)` кодируется как `v`, `None` — как `none`.
 
 ### 3.2. Нехранимые типы (runtime only)
 
@@ -202,7 +213,8 @@ decimal → 0x06 + mantissa: i128 (16 байт LE, дополнительный 
 
 Запись выполняется как `(d.mantissa() as i128, d.scale() as u8)` — экспорт всегда точен, поскольку 96-битная мантисса заведомо помещается в `i128`. Чтение — `Decimal::try_from_i128_with_scale(m, s)`; значение с `|mantissa| ≥ 2⁹⁶` (такое может быть записано только более поздней версией движка) возвращает ошибку `DecimalPrecisionExceeded`, а не молча теряет точность.
 
-Крейт: `rust_decimal 1.42` (пин на минорную версию: в `master` идёт несовместимая разработка 2.0). Публичный API движка не должен раскрывать типы крейта наружу — тонкий newtype оставляет замену дешёвой.
+Runtime использует `rust_decimal::Decimal` напрямую внутри `Number::Decimal`; отдельный newtype
+для сокрытия типа не вводится. Дисковая форма остаётся независимым `i128 + scale`.
 
 ### 3.4. DateTime и Duration
 
@@ -306,11 +318,11 @@ GQL определяет доменные типы для атомов и стр
 #### 3.8.1. Хранимые ссылочные типы
 
 Используются как значения свойств для хранения ссылок на элементы графа.
-Не добавляют накладных расходов: тип хранится в одном байте тега, данные — в u32 слоте.
+Тип хранится в одном байте тега, `DiskAtomRef` — в `u64`.
 
 | Тег  | GQL тип          | Описание                              | Размер на диске |
 |------|------------------|---------------------------------------|-----------------|
-| 0x36 | `atom`           | Ссылка на любой атом (vertex \| edge) | 1 + 4 байт      |
+| 0x36 | `atom`           | Ссылка на любой атом (vertex \| edge) | 1 + 8 байт      |
 | 0x37 | `graph`          | Ссылка на подграф                     | 1 + 8 байт      |
 
 Кодирование:
@@ -335,14 +347,15 @@ generic-параметр T (например, `vertex<Person>`) является
 
 ### 3.9. QualifiedAtomRef — составной идентификатор кросс-уровневого атома
 
-Когда endpoint ребра принадлежит вложенному подграфу, простого `DiskAtomRef (u32)` недостаточно — нужно указать и подграф.
+Когда endpoint ребра принадлежит вложенному подграфу, одного `DiskAtomRef (u64)` недостаточно —
+нужно указать и подграф.
 
 ```rust
-// DiskAtomRef — для endpoints в том же графе (u32)
+// DiskAtomRef — для endpoints в том же графе (u64)
 // QualifiedAtomRef — для cross-level endpoints
 struct QualifiedAtomRef {
     sg_slot:    u32,   // GraphId.index() подграфа, содержащего атом
-    local_slot: u32,   // DiskAtomRef — slot в координатах подграфа
+    local_ref:  u64,   // DiskAtomRef в координатах подграфа
 }
 ```
 
@@ -369,11 +382,11 @@ struct RecordId {
 
 enum RecordIdPart {
     Int(i64),
-    String(Box<str>),
+    String(CompactString),
     Uuid(u128),           // UUIDv7
     Ulid(u128),           // ULID
     Array(Vec<Value>),    // composite key
-    Object(PropertyMap),  // object key
+    Object(Object),       // public string-keyed object, не PropertyMap
 }
 ```
 
@@ -392,13 +405,26 @@ id_kind(u8):
 [id_bytes: variable encoding per kind]
 ```
 
+Payload кодируется так:
+
+- `Int` — zigzag LEB128;
+- `String` — `len(uLEB128) + UTF-8`;
+- `Uuid`/`Ulid` — 16 raw big-endian bytes;
+- `Array` — `count(uLEB128) + [StorageValue]`;
+- `Object` — `count(uLEB128) + [key_len(uLEB128) + UTF-8 key + StorageValue]`.
+
+Object-часть `RecordId` не использует `LabelDictionary`: её ключи сортируются
+лексикографически по UTF-8 bytes, duplicate keys запрещены. Это делает ID каноническим и
+переносимым между графами. Индексирование произвольного object как обычного B+tree key не
+поддерживается; primary index сравнивает канонически закодированный `RecordId`.
+
 ### 4.3. Отображение RecordId ↔ AtomId
 
 Каждая запись в таблице имеет:
 
 - `RecordId` — публичный (хранится как свойство `id` в PropHeapPage).
 - `AtomId` — внутренний (slot + generation, только in-memory).
-- `DiskAtomRef` — стабильный дисковый (slot без generation, u32).
+- `DiskAtomRef` — стабильный дисковый (kind + slot без generation, u64).
 
 Маппинг `RecordId → DiskAtomRef` хранится в B+tree индексе
 (`idx/pk_<table_id>.fgidx`), который является **первичным индексом** каждой таблицы.
@@ -415,16 +441,20 @@ id_kind(u8):
 
 ## 5. Бинарное кодирование значений
 
-Единый формат кодирования для **PropHeapPage**, **WAL payload**, **serial.rs snapshot**, **индексов**.
+Канонический value codec используется для **PropHeapPage** и value payload в **WAL**.
+Snapshot/cache archives могут использовать отдельный versioned rkyv envelope. B+tree использует
+отдельное order-preserving кодирование (§20.2), а не байты этого codec.
 
 ### 5.1. Принципы
 
-- Первый байт — **тег типа** (TypeTag, см. §3.1).
+- Первый байт — **тег типа** (`TypeTag`); §5.2 является единственным нормативным реестром тегов.
 - Числа без знака кодируются **LEB128 unsigned** (переменная длина).
 - Числа со знаком — **LEB128 zigzag**.
 - f64 — 8 байт little-endian.
 - Строки — `len(LEB128) + UTF-8 bytes` (без null-terminator).
 - Коллекции — `count(LEB128) + [elements]`.
+- LEB128 обязан быть каноническим (кратчайшим); decoder ограничивает глубину, длины коллекций,
+  строк и общий allocation budget.
 
 ### 5.2. Полная таблица кодирования
 
@@ -443,11 +473,11 @@ duration            →  0x0A + header(u16 LE) + [uLEB128 per unit × count]
 uuid                →  0x0B + 16 байт (raw big-endian)
 ulid                →  0x0C + 16 байт (raw big-endian)
 record_id           →  0x10 + table_id(u32 LE) + id_kind(u8) + [id_payload]
-array               →  0x11 + count(uLEB128) + [Value]×count
-set                 →  0x12 + count(uLEB128) + [Value sorted]×count
-object              →  0x13 + count(uLEB128) + [(key_id u32 LE + Value)]×count
-option              →  0x14 + 0x00 (none) | 0x15 + 0x01 + Value
-range               →  0x15 + flags(u8) + [lo: Value] + [hi: Value]
+array               →  0x11 + count(uLEB128) + [StorageValue]×count
+set                 →  0x12 + count(uLEB128) + [StorageValue sorted]×count
+object              →  0x13 + count(uLEB128) + [(key_id u32 LE + StorageValue)]×count
+0x14                →  reserved in format v1
+range               →  0x15 + flags(u8) + [lo: StorageValue] + [hi: StorageValue]
 point               →  0x21 + f64(lon LE) + f64(lat LE)
 linestr             →  0x22 + count(u32 LE) + [f64 lon + f64 lat]×count
 polygon             →  0x23 + ring_count(u32 LE) + [count(u32 LE) + [f64×2]×count]×ring_count
@@ -460,15 +490,39 @@ vec_f32             →  0x32 + dim(u16 LE) + [f32 LE]×dim
 vec_i64             →  0x33 + dim(u16 LE) + [i64 LE]×dim
 vec_i32             →  0x34 + dim(u16 LE) + [i32 LE]×dim
 vec_i16             →  0x35 + dim(u16 LE) + [i16 LE]×dim
-atom_ref            →  0x36 + disk_atom_ref(u32)
+atom_ref            →  0x36 + disk_atom_ref(u64 LE)
 graph_ref           →  0x37 + sg_slot(u32) + sg_gen(u32)
-qualified_atom_ref  →  0x38 + sg_slot(u32 LE) + local_slot(u32 LE)
+qualified_atom_ref  →  0x38 + sg_slot(u32 LE) + local_ref(u64 LE)
 ```
+
+`option<T>` не имеет собственного кодирования: `Some(v)` кодируется как `v`, `None` — как
+`none`. Встреча `0x14` в format v1 является `UnknownTypeTag`, а не option payload.
 
 ### 5.3. Кодирование object-ключей
 
-В `object` ключи хранятся как `key_id (u32)` из `LabelDictionary` (§16).
-Это устраняет повторение строк-ключей в PropHeapPage.
+В property-`object` ключи хранятся как `key_id (u32)` из `LabelDictionary` (§16).
+Это устраняет повторение строк-ключей в PropHeapPage. Пары обязаны быть отсортированы по
+`key_id`; duplicate key и неканонический порядок являются decode error. Object-часть
+`RecordId` является отдельным контекстом и кодируется строковыми ключами по §4.2.
+
+### 5.4. Границы codec
+
+Canonical codec из §5.2 реализуется вручную и версионируется вместе с storage format. Неизвестный
+тег в format v1 возвращает структурированную ошибку `UnknownTypeTag { tag, offset }`. Decoder не
+может сохранить его как `Bytes`: длина неизвестного payload не выводится без внешнего framing.
+Если внешняя запись имеет длину (например, slot в `PropHeapPage`), её можно целиком пропустить
+для recovery/диагностики, но нельзя выдавать как успешно декодированный `Value`.
+
+Фиксированные page headers и slots могут использовать endian-aware zerocopy-представления.
+`rkyv + bytecheck` допускается для Mode 1 snapshots, rebuildable caches и временных query
+archives, но не определяет вечный формат §5. Каждый archive имеет envelope:
+
+```text
+magic + format_version + schema_id + payload_length + checksum + rkyv_payload
+```
+
+Изменение rkyv schema требует новой версии envelope. `bincode` и `binrw` могут использоваться
+для benchmark/reference tooling, но не задают production value format.
 
 ---
 
@@ -961,7 +1015,7 @@ PageHeader: (magic=MAGIC_EDGE_INC, type=EdgeIncidence)
 Формат AdjacencyOverflowPage (§12), но записи имеют другой формат:
 
 ```
-entry (8 байт): peer_disk_ref(u32) + role(u8) + _pad(3)
+entry (16 байт): peer_disk_ref(u64) + role(u8) + _pad(7)
 ```
 
 где `role` = 0=Source, 1=Target, 2=Control (совпадает с `EdgeRole` из `edge.rs`).
@@ -975,11 +1029,11 @@ PageHeader: (magic=MAGIC_EDGE_INC_CL, type=CrossLevelEdgeIncidence)
 ```
 
 ```
-entry (12 байт):
+entry (16 байт):
       sg_slot:    u32   -- GraphId.index() подграфа
-      local_slot: u32   -- DiskAtomRef в пространстве подграфа
       role:       u8    -- 0=Source, 1=Target, 2=Control
       _pad:       u8[3]
+      local_ref:  u64   -- DiskAtomRef в пространстве подграфа
 ```
 
 ---
@@ -1017,11 +1071,11 @@ overflow_entry_cl (16 байт):
       sg_slot:    u32   -- GraphId.index() подграфа
       role:       u8    -- 0=inv, 1=out
       _pad:       u8[3]
-      local_slot: u64   -- DiskAtomRef в пространстве подграфа
+      local_ref:  u64   -- DiskAtomRef в пространстве подграфа
 → 16336 / 16 = 1021 entries per page
 ```
 
-`QualifiedAtomRef` = `{ sg_slot: u32, local_slot: u64 }` — 16 байт с учётом выравнивания.
+`QualifiedAtomRef` = `{ sg_slot: u32, local_ref: u64 }` — 16 байт с учётом выравнивания.
 
 ---
 
@@ -1097,8 +1151,12 @@ Compaction страницы:
 num_props: uLEB128
 для каждого свойства:
   key_id:  u32 LE       -- интернированный id ключа из LabelDictionary
-  value:   encoded Value  -- §5
+  value:   encoded StorageValue  -- §5
 ```
+
+Пары записываются строго по возрастанию `key_id`. Decoder отклоняет duplicate key и
+неканонический порядок. Эта сортировка относится только к дисковой записи: порядок свойств
+runtime `PropertyMap` семантически незначим.
 
 ### 13.3. Сжатие
 
@@ -1165,14 +1223,18 @@ Offset  Size  Тип   Поле          Описание
 56      8     u64   elem_count    Число элементов на странице
 64      8     u64   next_page     Следующая страница цепочки; NULL_PAGE = последняя
 72      8     u64   build_lsn     LSN, на котором построен кэш
-80      8     u64   validity_page page_no битовой карты валидности; NULL_PAGE = нет пропусков
-88      16264 —     data          Плотный массив [value; elem_count] фиксированной ширины
+80      8     u64   presence_page page_no bitmap существования свойства; NULL_PAGE = все present
+88      8     u64   validity_page page_no bitmap null-validity; NULL_PAGE = все non-null
+96      16288 —     data          Плотный массив [value; elem_count] фиксированной ширины
 Total = PAGE_SIZE байт
 ```
 
 Свойства и ограничения:
 - Кэшируются **только поля фиксированной ширины** (числа, `datetime`, `duration`, `decimal`, векторы фиксированной размерности, `bool`). Строки и вложенные структуры не кэшируются.
-- Элементы упорядочены по `DiskAtomRef.slot`, поэтому доступ по атому — арифметика, а не поиск. Пропуски (у атома нет этого свойства) отмечаются в битовой карте валидности.
+- Элементы упорядочены по `DiskAtomRef.slot`, поэтому доступ по атому — арифметика, а не поиск.
+  `presence=0` означает `none`; `presence=1 && validity=0` — `null`;
+  `presence=1 && validity=1` — значение. Одна validity bitmap недостаточна, потому что она не
+  различает `none` и `null`.
 - Инвалидация — как у `TensorCachePage`: `build_lsn < текущий checkpoint_lsn` при любой мутации соответствующего поля делает кэш устаревшим. Устаревший кэш не используется молча: планировщик либо перестраивает его, либо идёт по обычному пути.
 - Раскладка `decimal` (§3.3) выбрана так, что колонка `decimal` побайтово совместима с Arrow `Decimal128Array`.
 
@@ -1180,7 +1242,10 @@ Total = PAGE_SIZE байт
 
 Собственные реализации dictionary/RLE/bitpacking-кодирования и колоночного исполнителя сознательно **не разрабатываются**: это отдельная колоночная СУБД внутри графовой, с несоразмерной стоимостью сопровождения.
 
-Вместо этого колонка из кэша отдаётся наружу как **Arrow-массив** (нулевое копирование для типов фиксированной ширины), после чего доступны готовые инструменты экосистемы: Arrow — как in-memory представление, Parquet — как формат выгрузки, DataFusion — как исполнитель аналитических запросов поверх выгруженных колонок. Все три написаны на Rust и пригодны и для памяти, и для файлов.
+Вместо этого набор колонок материализуется как `PropertyBatch`: Arrow `RecordBatch`, отдельные
+presence bitmaps и mapping `PropertyKeyId → Arrow field`. `Arrow::MapArray` не заменяет
+row-oriented `PropertyMap`. Для типов фиксированной ширины данные кэша могут передаваться в
+Arrow без копирования; DataFusion работает только поверх этого batch-слоя.
 
 Граница ответственности: движок отвечает за граф, топологию, транзакции и материализацию колонок; тяжёлая колоночная аналитика — за пределами его ядра.
 
@@ -1676,7 +1741,7 @@ record_id → table_id(4 байта BE) + id_part_encoding(variable)
 
 ── Составные типы ──────────────────────────────────────────────────────
 ```
-option<T> → 0x00 (None, сортируется первым) | 0x01 + encode(T)
+option<T> → отдельного ключа нет: None кодируется как none, Some(v) как encode(v)
 array<T>  → element-wise: encode(elem[0]) + 0x01 + encode(elem[1]) + ... + 0x00
 set<T>    → то же что array, элементы уже отсортированы (set = sorted unique)
 object    → индексирование object целиком не поддерживается;
@@ -1685,7 +1750,7 @@ object    → индексирование object целиком не подде
 
 ── Доменные типы ───────────────────────────────────────────────────────
 ```
-vertex/edge/atom ref → big-endian u32 (DiskAtomRef; порядок по slot_index)
+vertex/edge/atom ref → big-endian u64 (DiskAtomRef; порядок по kind, затем slot_index)
                        (семантический порядок вставки, не семантический)
 ```
 
@@ -1764,7 +1829,7 @@ Binary search (O(log num_keys)):
 LeafEntry (variable):
   encoded_key:     variable                     -- order-preserving (§20.2.1)
   inline_count:    u32                          -- общее число DiskAtomRef в индексе для этого ключа (inline + posting_pages)
-  atom_refs:       u32 × min(8, inline_count)   -- DiskAtomRef inline, только первые 8 (или меньше) хранятся inline
+  atom_refs:       u64 × min(8, inline_count)   -- DiskAtomRef inline, только первые 8 (или меньше) хранятся inline
   posting_page:    u64                          -- только если inline_count > 8; первая PostingPage
 ```
 
@@ -1782,7 +1847,7 @@ Binary search:
 PageHeader (magic=MAGIC_IDX_BTREE, type=IndexUniqueBtreeLeaf, FLAG_LEAF set)
 
 encoded_key:  variable
-atom_ref:     u32   -- единственная запись; нет posting_page
+atom_ref:     u64   -- единственная запись; нет posting_page
 ```
 
 При нарушении уникальности → транзакция aborted с `ConstraintViolation`.
@@ -1797,7 +1862,7 @@ Offset  Size   Содержимое
 32      8      next_page (u64)
 40      4      count (u32)
 44      4      _pad
-48      16336  [DiskAtomRef(u64)] × (count) → (PAGE_SIZE - 48) / 16 = 1021 entries per page
+48      16336  [DiskAtomRef(u64)] × count → (PAGE_SIZE - 48) / 8 = 2042 entries per page
 ```
 
 #### 20.2.6. Composite Index
@@ -2000,7 +2065,7 @@ CountIndexPage (единственная страница):
 
 Файл: `idx/lbl_node_<label_id>.fgidx` и `idx/lbl_edge_<label_id>.fgidx`.
 
-Sorted array DiskAtomRef (u32), разбитый по страницам:
+Sorted array `DiskAtomRef (u64)`, разбитый по страницам:
 
 ```
 Offset  Size    Содержимое
@@ -2137,7 +2202,7 @@ m:                u32  -- max connections per layer (default 12)
 m0:               u32  -- connections at base layer (default 24 = 2×M)
 efc:              u32  -- ef_construction (default 150)
 lm:               f32  -- малое вещественное число
-entry_point_ref:  u32  -- DiskAtomRef точки входа
+entry_point_ref:  u64  -- DiskAtomRef точки входа
 max_level:        u32
 node_count:       u64
 data_start_page:  u64  -- первая страница blob-данных
@@ -2597,7 +2662,7 @@ PageHeader (magic=MAGIC_CHANGEFEED, type=ChangefeedEntry)
 lsn:           u64
 versionstamp:  u64   -- монотонно растущий глобальный счётчик
 event_kind:    u8    -- 0=create, 1=update, 2=delete, 3=define_table
-atom_ref:      u32   -- DiskAtomRef
+atom_ref:      u64   -- DiskAtomRef
 record_id_len: u16
 record_id:     [u8]  -- encoded RecordId
 [before_len:   u32]  -- если event_kind ∈ {1, 2}
@@ -2903,7 +2968,7 @@ read_page(PageKey, snapshot_lsn):
 3. Для каждого EdgeHotSlot:
    - inv_inline[], out_inline[] — применить remap к каждому элементу;
    - inv_sg_slot, out_sg_slot — это GraphId, не DiskAtomRef, не трогать;
-4. Применить remap к AdjacencyOverflowPage, CrossLevelAdjacencyOverflowPage (local_slot), EdgeIncidencePage (peer_disk_ref), CrossLevelEdgeIncidencePage;
+4. Применить remap к AdjacencyOverflowPage, CrossLevelAdjacencyOverflowPage (local_ref), EdgeIncidencePage (peer_disk_ref), CrossLevelEdgeIncidencePage;
 5. NodeHotSlot adjacency (adj_out, adj_in, adj_undir) — это edge slots,
    применить remap если рёбра тоже дефрагментируются
 6. EdgeEndpointIndex — перестроить полностью (endpoint_ref и edge_ref оба меняются)
@@ -2997,12 +3062,13 @@ fn out_neighbors(disk_graph: &DiskMetaGraph, node_slot: u64) -> Vec<DiskAtomRef>
 ### 25.3. Загрузка в in-memory MetaGraph (Mode 3)
 
 ```rust
-fn load_subgraph(disk: &DiskMetaGraph, tx: &MvccTransaction, atom_slots: &[u32]) -> io::Result<MetaGraph> {
-    let mut g = MetaGraph::with_capacity(atom_slots.len(), atom_slots.len() * 4);
-    let mut slot_to_atom: HashMap < u32, AtomId > = HashMap::new();
+fn load_subgraph(disk: &DiskMetaGraph, tx: &MvccTransaction, atom_refs: &[DiskAtomRef]) -> io::Result<MetaGraph> {
+    let mut g = MetaGraph::with_capacity(atom_refs.len(), atom_refs.len() * 4);
+    let mut ref_to_atom: HashMap<DiskAtomRef, AtomId> = HashMap::new();
     
     // Pass 1: load nodes
-    for & slot in atom_slots {
+    for &disk_ref in atom_refs {
+        let slot = disk_ref.slot();
         let hot = disk.node_hot(slot)?;
         if hot.kind_flags & TOMBSTONE != 0 { continue; }
       
@@ -3019,7 +3085,7 @@ fn load_subgraph(disk: &DiskMetaGraph, tx: &MvccTransaction, atom_slots: &[u32])
             PropertyMap::default() 
         };
         // ... add node to g ...
-        slot_to_atom.insert(slot, id);
+        ref_to_atom.insert(disk_ref, id);
     }
     
     // Pass 2: load edges between loaded nodes
@@ -3171,7 +3237,9 @@ TensorCachePage инвалидируется при любом изменени�
 - `_reserved` поля: обнулить при записи, игнорировать при чтении.
 - Новые `PageType` в страницах: старая версия возвращает `IoError::UnknownPageType` (не panic).
 - Новые `WalKind`: старые WAL readers обязаны пропускать неизвестные entries с предупреждением (не panic).
-- Новые TypeTag для Value: при чтении неизвестного тега возвращать `Value::Bytes(raw_bytes)`.
+- Новые `TypeTag`: reader format v1 возвращает `UnknownTypeTag { tag, offset }`. Пропуск
+  возможен только на уровне внешней length-framed записи; подмена неизвестного значения на
+  `Bytes` запрещена.
 
 ### 28.3. Migration functions
 
@@ -3213,7 +3281,7 @@ fn migrate(graph_dir: &Path, from_version: u32, to_version: u32) -> io::Result<(
 >
 > Часть ранней редакции плана отменена принятыми решениями и в план не переносилась дословно:
 > `WalKind 0x10–0x22` и раздельные `MvccWal`/`DiskWal` → единый **frame-WAL** уровня БД (§22–§23);
-> `DiskAtomRef (u32)` → `u64` (§9). Актуализированные формулировки — в таблице решений в начале
-> плана (помечены 🔄).
+> `DiskAtomRef = u64` (§9). Актуализированные формулировки — в таблице решений в начале плана
+> (помечены 🔄).
 
 ---

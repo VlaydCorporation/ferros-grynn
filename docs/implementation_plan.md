@@ -36,6 +36,9 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | `AtomId = gen(23) \| kind(1) \| slot(40)`, `DiskAtomRef = u64`                                   | `disk_storage_spec.md` §9                              |
 | **SSI по умолчанию** (SI/RC — opt-in)                                                            | `gql_spec.md` §17.1                                    |
 | `decimal` — `rust_decimal` в рантайме, Arrow-форма `i128 + scale` (18 байт) на диске             | `disk_storage_spec.md` §3.3, §5.2                      |
+| `none`/`null` — разные sentinel, но вся логика двухзначная; `option<T>` не имеет runtime-варианта | `gql_spec.md` §5–§6                                    |
+| `PropHeapPage` — row-store; аналитика — `PropertyColumnCachePage`/Arrow batch                    | `disk_storage_spec.md` §13.6                           |
+| Graph results — frozen owned values; disk views ограничены lifetime транзакции                   | `gql_spec.md` §16–§17, `graphs.md`                     |
 | Массовая загрузка — `BEGIN IMPORT … END IMPORT` + bulk-сборка индексов (без LSM/delta-store)     | `gql_spec.md` §7.11, `disk_storage_spec.md` §20.13     |
 
 ---
@@ -53,8 +56,8 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 |--------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|--------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------|
 | Модель данных `G = ⟨V, MV, E, ME⟩`                                                                                                   | `gql_spec` §3                          | `fg-meta` `graph.rs` → `src/values/runtime/graph`                                                            | 🟢 референс                                                 |
 | `AtomId` (генерационный, kind-бит, u64)                                                                                              | `disk` §9                              | `id.rs`                                                                                                      | 🟢 (🔄 `slot(40)`)                                          |
-| Значения (`Value`, storable/virt)                                                                                                    | `gql_spec` §5                          | `src/values` (`runtime/storable`, `runtime/virt`, `runtime/graph`, `storage`)                                | 🟡 активный, требует расширения                             |
-| Диагностика (`StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError`)                                                            | —                                      | `src/gql_status`                                                                                             | 🟢                                                          |
+| Значения (`Value`, runtime/storage/columnar)                                                                                          | `gql_spec` §5–§6; `disk` §5            | `src/values` (`runtime`, `storage`, `columnar`)                                                              | 🟡 активный, этап спецификаций завершён                     |
+| Диагностика (`StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError`)                                       | —                                      | `src/gql_status`                                                                                             | 🟢                                                          |
 | Изоляция SSI по умолчанию, SI/RC — opt-in                                                                                            | `gql_spec` §17.1                       | `fg-meta` `mvcc.rs`                                                                                          | 🟢                                                          |
 | MVCC + снимки, O(1)-индексы конфликтов, predicate locking                                                                            | `gql_spec` §17                         | `fg-meta` `mvcc.rs`, `mvcc_persist.rs`                                                                       | 🟢 режим 1 / 🔴 режим 2                                     |
 | Журнал (frame-WAL, уровень БД)                                                                                                       | `disk` §22–§23                         | `mvcc_persist.rs` → `crates/storage_engine`                                                                  | 🟡 логический WAL режима 1 есть; frame-WAL режима 2 — новое |
@@ -67,7 +70,7 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/gql/ds.rs`                                                                                              | 🟡 тело TODO                                                |
 | Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql/traversal`                                                                                          | 🟡 каркас                                                   |
 | `PageManager` / `DiskMetaGraph` / disk-страницы                                                                                      | `gql_tech` §10; формат — `disk` §9–§21 | `crates/storage_engine` (`store`, `layout`): `NodeRecord`/`EdgeRecord`/`PropertyRecord`, `FerrosGrynnLayout` | 🟡 каркас                                                   |
-| `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/types` (нов.)                                                                                           | 🔴 новое                                                    |
+| `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`                                                    | 🔴 новое                                                    |
 | `SchemaCatalog`                                                                                                                      | `disk` §18                             | `src/schema` (нов.)                                                                                          | 🔴 новое                                                    |
 | `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats` (нов.)                                                                                           | 🔴 новое                                                    |
 | Индексы (Label/BTree/Count/Fulltext/HNSW/R-tree/…)                                                                                   | `disk` §20                             | `src/index` (нов.)                                                                                           | 🔴 новое                                                    |
@@ -82,7 +85,7 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 |----------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Формат хранилища     | Ранние документы описывали LSM (L0/L1/compaction). Действует WAL + snapshot без LSM; GQL-спека внутреннее хранилище не регламентирует — противоречие устранено. |
 | WAL recovery         | Ранний документ описывал ARIES 3-phase. Действует **frame-WAL** с single-pass REDO по LSN; ARIES/UNDO не нужен (см. таблицу решений).                           |
-| `PropertyMap`        | В коде `PropertyMap = FxHashMap<Box<str>, Value>`; GQL `object` — схожий тип. Нужен маппинг `Value` → GQL-типы при возврате результата.                         |
+| `PropertyMap`        | Решено: отдельный от публичного `Object` hybrid `SmallVec`/`RapidHashMap` по `PropertyKeyId`; Arrow используется только в `PropertyBatch`.                    |
 | `GraphId` / `AtomId` | Внутренние идентификаторы не экспонируются в GrynQL; публичная форма — `table:id` (`RecordId`).                                                                 |
 | Гиперрёбра           | Реализованы (`HyperDirected`, `HyperUndirected` в `edge.rs`). Синтаксис `RELATE HYPER` / `MATCH HYPER` — новый, требует согласования.                           |
 | Метаатомы в GQL      | `MetaGraph.promote_to_meta()` реализован; GrynQL-синтаксис (`graph::inner`/`graph::nodes`) требует реализации функций.                                          |
@@ -94,21 +97,35 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 
 Из `disk_storage_spec.md` §29.1.
 
-> 🔄 **Замечание о раскладке.** Текущая кодовая база использует `src/values/runtime/*` +
-> `src/values/storage` и отдельный крейт `crates/storage_engine`; дисковый слой мигрирует именно
-> туда. Дерево ниже — **целевой ориентир** по составу компонентов; финальные пути (плоский
-> `src/storage/*` против `crates/storage_engine/*`) согласуются при переносе. Состав важнее путей.
+> 🔄 **Замечание о раскладке.** `src/values` — система значений, `src/storage` — перенесённый в
+> основную кодовую базу `crates/storage_engine`. Runtime не зависит от Arrow/DataFusion или
+> storage engine. Отдельный crate удаляется только после parity-тестов.
 
 ```
 src/
-  types/
-    mod.rs            -- Value enum (расширенный), TypeTag, кодирование
-    value.rs          -- расширенный Value + все варианты
-    record_id.rs      -- RecordId, RecordIdPart
-    datetime.rs       -- DateTime, Duration (обёртки над jiff)
-    decimal.rs        -- Decimal (обёртка над rust_decimal)
-    geometry.rs       -- Geometry variants
-    vector.rs         -- VectorValue
+  values/
+    mod.rs
+    runtime/
+      mod.rs          -- Value, ValueKind, Type; без TypeTag
+      number.rs       -- Number с rust_decimal::Decimal
+      string.rs       -- CompactString используется напрямую
+      array.rs
+      set.rs
+      object.rs       -- публичный BTreeMap<CompactString, Value>
+      range.rs
+      record_id.rs
+      temporal.rs
+      ids.rs          -- Uuid/Ulid newtype с inner API
+      property_map.rs -- PropertyKeyId + SmallVec/RapidHashMap
+      graph/          -- graph family, Mutable/Frozen, Path, LiveGraph
+    storage/
+      mod.rs          -- StorageValue, StorageValueRef, TypeTag
+      codec.rs        -- canonical value codec v1 + DecodeLimits
+      context.rs      -- dictionaries и ref resolution
+    columnar/
+      mod.rs          -- PropertyBatch
+      arrow.rs        -- Arrow arrays + presence bitmap
+      datafusion.rs   -- batch integration
 
   storage/
     mod.rs            -- PageManager trait, DataFileKind, constants
@@ -164,52 +181,54 @@ src/
 
 ### 3.1. `Value` — система типов значений (🔴 P1)
 
-Из `disk_storage_spec.md` §30.1. Текущий `Value` не поддерживает `None` (в отличие от `Null`),
-`Decimal`, `DateTime`, `Duration`, `RecordId`, `Geometry`, `Set`, `Tuple`, `Range`, `Vector`,
-`Uuid`, `Ulid`. Требуется полная замена enum.
+Детальный порядок работ — [plan.md](plan.md). Публичный runtime использует типы без суффикса
+`Value`: `Array`, `Bytes`, `Set`, `Object`, `Range`, `Duration`, `DateTime`, `Path`, `Graph`
+и т. д. Строки — `CompactString` напрямую; decimal — `rust_decimal::Decimal` внутри `Number`.
 
 ```rust
-// Новый Value enum (src/types/value.rs):
+#[non_exhaustive]
 pub enum Value {
-    None,                               // 0x00 — поле отсутствует
-    Null,                               // 0x01 — поле есть, значение null
-    Bool(bool),                         // 0x02
-    Int(i64),                           // 0x03
-    Float(f64),                         // 0x04
-    Decimal(rust_decimal::Decimal),     // 0x05  🔄 (рантайм-decimal; на диске — Arrow-форма i128+scale)
-    String(Box<str>),                   // 0x06
-    Bytes(Vec<u8>),                     // 0x07
-    DateTime(crate::types::DateTime),   // 0x08
-    Duration(crate::types::Duration),   // 0x09
-    Uuid(u128),                         // 0x0A
-    Ulid(u128),                         // 0x0B
-    RecordId(Box<RecordId>),            // 0x0C
-    Array(Vec<Value>),                  // 0x10
-    Set(BTreeSet<OrdValue>),            // 0x11 (ordered for encoding)
-    Tuple(Vec<Value>),                  // 0x12
-    Object(PropertyMap),                // 0x13
-    Option(Option<Box<Value>>),         // 0x14
-    Range(Box<RangeValue>),             // 0x15
-    Geometry(Box<Geometry>),            // 0x20–0x26
-    Vector(VectorValue),                // 0x30–0x34
+    None,
+    Null,
+    Bool(bool),
+    Number(Number),
+    String(CompactString),
+    Bytes(Bytes),
+    DateTime(DateTime),
+    Duration(Duration),
+    Uuid(Uuid),
+    Ulid(Ulid),
+    Record(RecordId),
+    Array(Array),
+    Set(Set),
+    Object(Object),
+    Range(Range),
+    Geometry(Geometry),
+    Vector(Vector),
+    // graph/domain/runtime-only variants добавляются по этапам plan.md
 }
 ```
 
-Обратная совместимость на этапе MVP не требуется. В будущем — старые снимки читаются
-версионированным decoder'ом; новые теги добавляются с новой `CODEC_VERSION`.
+`ValueKind` задаёт runtime rank, `Type` — статические GQL-типы, `TypeTag` живёт только в
+`values::storage` и соответствует `disk_storage_spec.md` §5.2. `option<T>` — только `Type`:
+`Some(v) = v`, `None = Value::None`. `OrdValue` и `Value::Option` не вводятся.
+
+`Value` реализует согласованные `Eq`/`Ord`/`Hash`; rank не зависит от порядка enum-вариантов.
+Mutable/live/snapshot-bound graph objects не помещаются в `Value`. Storage conversion
+отклоняет runtime-only значения структурированной диагностикой.
 
 ### 3.2. Идентификаторы — `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`
 
 Три уровня (`disk_storage_spec.md` §4, §9):
 
 - **`RecordId`** (`table:id`) — публичный, единственный видимый в GrynQL; хранится как свойство `id`.
-  Отдельный публичный тип в `src/types/record_id.rs` (не в `id.rs`).
+  Отдельный публичный тип в `src/values/runtime/record_id.rs`.
 - **`DiskAtomRef`** (`u64`: бит 40 = kind, биты 39..0 = slot) — стабильный дисковый id без
   generation. 🔄 newtype в `src/storage/mod.rs` (ранее планировался `u32`).
 - **`AtomId`** (`u64`: slot + generation) — внутренний in-memory handle; **никогда** не
   экспонируется в GrynQL. `AtomId` и `GraphId` остаются внутренними.
-- **`QualifiedAtomRef { sg_slot: u32, local_slot: … }`** — кросс-уровневый адрес (см.
-  `disk_storage_spec.md` §3.9; согласовать ширину `local_slot` с `DiskAtomRef` = u40).
+- **`QualifiedAtomRef { sg_slot: u32, local_ref: DiskAtomRef }`** — кросс-уровневый адрес
+  (`disk_storage_spec.md` §3.9); payload занимает 12 байт, Rust-структура с выравниванием — 16.
 
 Разрешение при выполнении: `RecordId --(pk B+tree)--> DiskAtomRef --(hot slot → gen)--> AtomId`;
 `from_disk_ref(r, gen)` восстанавливает `AtomId`. Материализация результата делает обратный
@@ -316,10 +335,17 @@ impl ParticipationTensor {
 Из `disk_storage_spec.md` §29.4 (🔄 decimal уточнён).
 
 ```toml
+compact_str = { workspace = true, features = ["rkyv"] } # runtime string
 jiff = { version = "0.2", features = ["serde"] }        # DateTime, Duration
-rust_decimal = { version = "1.42" }                     # 🔄 decimal (рантайм; диск — Arrow-форма)
+rust_decimal = { version = "1.42" }                     # Number::Decimal
+smallvec.workspace = true                               # inline PropertyMap
+rapidhash.workspace = true                              # large PropertyMap
+rkyv = { workspace = true, features = ["bytecheck"] }   # snapshots/caches, не canonical codec
+zerocopy.workspace = true                               # fixed page headers/slots
+arrow.workspace = true                                  # PropertyBatch
+datafusion.workspace = true                             # только columnar adapter
 xxhash-rust = { version = "0.8", features = ["xxh3"] }  # Page checksum
-geo = { version = "0.33" }                              # planar geospatial geometries and algorithms
+geo = { version = "0.33" }                              # planar geometry
 geojson = { version = "1.0.0" }                         # GeoJSON
 ```
 
@@ -331,21 +357,30 @@ geojson = { version = "1.0.0" }                         # GeoJSON
 зависимости и состав работ. Детализация по существующим файлам (`fg-meta` / `src`) взята из
 `disk_storage_spec.md` §30.1–§30.7.
 
+**Этап 1 плана `values` — синхронизация спецификаций: ✅ завершён.** Согласованы
+`gql_spec.md`, `gql_tech_spec.md`, `disk_storage_spec.md`, `graphs.md` и [plan.md](plan.md).
+Следующий исполняемый этап — runtime-фундамент.
+
 ### Область A. Система типов и значения — P1 (блокирующая)
 
 Фундамент, от которого зависит сериализация, хранилище, индексы и исполнитель.
 
-- **`src/types/value.rs`** 🔴 — новый `Value` enum (§3.1). Полная замена; обратная совместимость
-  не требуется.
-- **`src/types/record_id.rs`** 🔴 — `RecordId`, `RecordIdPart` (§3.2).
-- **`serial.rs`** 🟡 — обновить `write_value`/`read_value` под все новые `TypeTag`; `write_props`/
-  `read_props` перевести на `key_id (u32)` вместо строк в disk-режиме; `CODEC_VERSION = 1` на
-  всём этапе MVP (совместимость со снимками других форматов не поддерживается).
-- **`src/types/datetime.rs`** 🔴 — полная интеграция `jiff` (`DateTime`, `Duration`).
-- **`src/types/decimal.rs`** 🔴 — обёртка над `rust_decimal`; на диске — Arrow-форма `i128+scale`.
-- **`src/types/geometry.rs`** 🔴 — парсинг/кодирование GeoJSON (`geo`, `geojson`).
-- **`id.rs`** 🟡 — `AtomId`/`GraphId` остаются внутренними; добавить `DiskAtomRef (u64)` newtype
-  (🔄) и `QualifiedAtomRef` (согласовать ширину `local_slot`).
+- **`src/values/runtime`** 🟡 — поэтапный `Value`, `ValueKind`, `Type`, scalars и коллекции;
+  `CompactString`, `Number::Decimal(Decimal)`, согласованные `Eq`/`Ord`/`Hash`; без
+  `OrdValue`, `Tuple` и `Value::Option`.
+- **`src/values/runtime/record_id.rs`** 🔴 — `RecordId`, `RecordIdPart`; object-ID хранит
+  строковые ключи и имеет канонический UTF-8 порядок.
+- **`src/values/runtime/property_map.rs`** 🔴 — `PropertyKeyId`, sorted inline `SmallVec` до
+  benchmark-порога и `RapidHashMap` для больших наборов.
+- **`src/values/storage`** 🟡 — `StorageValue`, borrowed `StorageValueRef`, encode/decode
+  contexts, `TypeTag` из `disk_storage_spec.md` §5.2, canonical codec v1 и `DecodeLimits`.
+- **`src/values/columnar`** 🔴 — `PropertyBatch`, presence bitmaps, Arrow conversion и
+  DataFusion adapter; runtime от этого слоя не зависит.
+- **`src/values/runtime/graph`** 🔴/🟢 reference — type-state, storage families, conversions,
+  PathTrace/Path и LiveGraph по [graphs.md](graphs.md) и [plan.md](plan.md).
+- **`src/storage`** 🟡 — `DiskAtomRef(u64)` и
+  `QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }`; перенос `crates/storage_engine`
+  выполняется после стабилизации value codec.
 
 ### Область B. Страничное хранилище и I/O — P2
 
@@ -431,7 +466,8 @@ Disk-backed режим 2. Зависит от A.
 
 - **Binder** 🔴 — scope/alias (`gql_tech_spec.md` §4.1).
 - **Typechecker** 🔴 — type inference, разрешение перегрузки `number` (`int`/`float`/`decimal`) на
-  этапе анализа, трёхзначная логика `null`/`none`, classification purity, проверка computed-полей.
+  этапе анализа, двухзначная sentinel-семантика `null`/`none`, classification purity, проверка
+  computed-полей; `option<T>` стирается в `T | none`.
 - **Lowering AST → IR** 🔴 — логический IR (§5), две под-алгебры (join engine ↔ traversal VM).
 
 ### Область J. Оптимизатор — P3
@@ -464,6 +500,10 @@ Disk-backed режим 2. Зависит от A.
   `LiveQueryRegistry`. Событие ставится в очередь в той же транзакции; at-least-once с `ack`;
   порядок по versionstamp; `SINCE`-resume; `ON OVERFLOW GAP|DISCONNECT|BLOCK`; очереди in-memory,
   восстановление через `SINCE`.
+- **`LiveGraph<Frozen>`** 🔴 — COW delta, atomic publish frozen revision и revision guard.
+- **`LiveGraph<Mutable>`** 🔴 — dirty-set, incoming queue, pause-on-conflict и явные
+  `accept_remote`/`keep_local`/`discard_local`/`rebase`/`flush`/`resume`; ни remote delta, ни
+  local changes не коммитятся при конфликте автоматически.
 
 ### Область N. Полная инцидентность (граф-ядро) — P4
 
@@ -479,7 +519,7 @@ Disk-backed режим 2. Зависит от A.
 | `traversal.rs::neighbors()`       | Параметризовать: `NodeOnly` (текущий) vs `AtomWalk` (новый, через `EdgeEndpointIndex` + `EdgeIncidence`)            |
 | `traversal.rs::TarjanCuts`        | Параметризовать тип обхода; `n.is_node()` — только в `NodeOnly`                                                     |
 | `matrix.rs`                       | Добавить `EndpointTensor` и `ParticipationTensor` (§3.5)                                                            |
-| `id.rs`                           | Добавить `QualifiedAtomRef` (согласовать ширину с `DiskAtomRef` = u40)                                              |
+| `id.rs`                           | Добавить `QualifiedAtomRef { sg_slot: u32, local_ref: DiskAtomRef }`                                                |
 
 ### Область O. Мосты (bridges) — MVP+
 
@@ -494,12 +534,11 @@ Disk-backed режим 2. Зависит от A.
 
 | Приоритет            | Область | Компоненты                                | Что делать                                                          |
 |----------------------|---------|-------------------------------------------|---------------------------------------------------------------------|
-| **P1** (блокирующий) | A       | `src/types/value.rs`                      | Новый `Value` enum с полной системой типов                          |
-| **P1**               | A       | `src/types/record_id.rs`                  | `RecordId`, `RecordIdPart`                                          |
-| **P1**               | A       | `serial.rs`                               | Новые `TypeTag`, `key_id` в disk-режиме                             |
-| **P1**               | A       | `src/types/datetime.rs`                   | Полная интеграция `jiff`                                            |
-| **P1**               | A       | `src/types/decimal.rs`                    | `rust_decimal` + Arrow-форма на диске                               |
-| **P1**               | A       | `src/types/geometry.rs`                   | GeoJSON parsing + encoding                                          |
+| **P1** (блокирующий) | A       | `src/values/runtime`                      | Runtime-фундамент, `ValueKind`, scalars и collections               |
+| **P1**               | A       | `src/values/storage`                      | `StorageValue`, `TypeTag`, canonical codec и decode limits          |
+| **P1**               | A       | `src/values/runtime/record_id.rs`         | `RecordId`, `RecordIdPart`                                          |
+| **P2**               | A       | `src/values/columnar`                     | `PropertyBatch`, Arrow/presence, затем DataFusion                   |
+| **P2**               | A       | `src/values/runtime/graph`                | Graph family/type-state, Path и query return contracts              |
 | **P2** (высокий)     | B       | `src/storage/`                            | `PageManager`, `DiskMetaGraph`, все типы страниц                    |
 | **P2**               | C       | frame-WAL                                 | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
 | **P2**               | H, I    | `src/syn`, binder, typechecker, lowering  | Фронтенд → AST → IR                                                 |
@@ -517,16 +556,18 @@ Disk-backed режим 2. Зависит от A.
 
 **Фазы (укрупнённо):**
 
-- **Фаза 0 — фундамент типов** (P1): Область A целиком. Блокирует всё остальное.
-- **Фаза 1 — страничное хранилище** (P2): Область B + интеграция BufferPool.
-- **Фаза 2 — журнал и восстановление** (P2): Область C + D (снимки, чтение на снимке).
-- **Фаза 3 — query-конвейер MVP** (P2–P3): H → I → J/K/L, доведение `Datastore::execute`
+- **Фаза 0 — синхронизация спецификаций**: ✅ завершена; нормативные контракты values,
+  graph/path/live и storage codec согласованы.
+- **Фаза 1 — фундамент типов** (P1): runtime-часть Области A, затем StorageValue/codec.
+- **Фаза 2 — страничное хранилище** (P2): Область B + интеграция BufferPool.
+- **Фаза 3 — журнал и восстановление** (P2): Область C + D (снимки, чтение на снимке).
+- **Фаза 4 — query-конвейер MVP** (P2–P3): H → I → J/K/L, доведение `Datastore::execute`
   сначала для in-memory режима 1.
-- **Фаза 4 — схема, статистика, индексы** (P3–P4): E, F, G (Label/BTree/Count + bulk),
+- **Фаза 5 — схема, статистика, индексы** (P3–P4): E, F, G (Label/BTree/Count + bulk),
   подключение к оптимизатору.
-- **Фаза 5 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, R-tree; N (полная
+- **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, R-tree; N (полная
   инцидентность); M (changefeed/live).
-- **Фаза 6 — полный disk-backed режим 2 и мосты** (P6, MVP+): `open_disk_graph`, O.
+- **Фаза 7 — полный disk-backed режим 2 и мосты** (P6, MVP+): `open_disk_graph`, O.
 
 ---
 
