@@ -58,15 +58,15 @@ The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optim
 
 ### Graph core (`fg-meta`, target: `src/values/runtime/graph`)
 - Data model `MG = ⟨V, MV, E, ME⟩` (Basu–Blanning + Chernenko–Gapanyuk extensions). Stored **struct-of-arrays (SoA)**.
-- **`AtomId`** is the central handle, bit-packed `gen(32) | kind(1) | slot(31)`; slots are handed out by a `SlotAllocator`. Nodes and edges are both "atoms". `MetaGraph` is the container; `traversal` holds the algorithms (BFS/DFS, topo sort, SCC/WCC, Dijkstra, Bellman–Ford with negative-cycle detection, MST, cuts, binary-lifting LCA); `subgraph` extracts typed subgraphs (`TreeSubGraph`, `ForestSubGraph`, `DagSubGraph`, `HyperSubGraph`) plus generic `SubGraph`; `matrix` provides `AdjacencyMatrix`, `IncidenceMatrix`, `MetaAdjacencyMatrix`, `IncidenceTensor` (via `nalgebra`).
+- **`AtomId`** is the central handle. The production layout is `gen(23) | kind(1) | slot(40)` per `disk_storage_spec.md` §9; `fg-meta` still uses the legacy `gen(32) | kind(1) | slot(31)` prototype layout. Slots are handed out by a `SlotAllocator`. Nodes and edges are both "atoms". `MetaGraph` is the container; `traversal` holds the algorithms (BFS/DFS, topo sort, SCC/WCC, Dijkstra, Bellman–Ford with negative-cycle detection, MST, cuts, binary-lifting LCA); `subgraph` extracts typed subgraphs (`TreeSubGraph`, `ForestSubGraph`, `DagSubGraph`, `HyperSubGraph`) plus generic `SubGraph`; `matrix` provides `AdjacencyMatrix`, `IncidenceMatrix`, `MetaAdjacencyMatrix`, `IncidenceTensor` (via `nalgebra`).
 - An **ECS layer** (`SparseSet`, `AnyPool`, component registries, `join!`-style iterators) attaches components (positions, PageRank, feature vectors, weights…) to atoms for analytics/ML.
 
 ### Values (`src/values`, the one module currently active in the main crate)
-The property/value type system, split into:
-- `runtime/storable` — persistable scalar values (bool, number, duration, temporal…).
-- `runtime/virt` — virtual/composite runtime values (list, map, node, path, relationship).
-- `runtime/graph` — the in-memory graph atoms (re-exported as the crate's `graph` module).
-- `storage` — on-disk atom writer/representation.
+The property/value type system. Read `src/values/AGENTS.md` before changing it.
+- `runtime` — the public Rust SDK types, collections, identifiers, runtime-only values, and graph
+  foundation (re-exported as the crate's `graph` module).
+- `storage` — internal on-disk DTOs, tags, conversion contexts, and codecs.
+- `columnar` — future Arrow/DataFusion batch materialization; runtime remains independent of it.
 
 ### MVCC & persistence (`fg-meta`)
 Serializable Snapshot Isolation (**SSI**) with O(1) conflict indices (`atom_readers`/`atom_writers`) and predicate locking via an `AtomMeta` label/property cache for exact phantom matching. Persistence adds a **WAL with segment rotation** (`{lsn:016x}.wal`), streaming O(1)-RAM snapshot write, single-pass deferred REDO recovery, and inline compaction at checkpoint (carry-forward of only active-tx entries). The codec is generic: `BytesCodec` (identity) or `ClosureCodec<T>` (`Arc<dyn Fn>`, cloneable, supports capturing closures — needed for crash recovery). `implementation_notes.md` documents the exact algorithms, invariants, and complexity table — read it before touching MVCC/WAL/checkpoint code.
@@ -94,6 +94,6 @@ These `.md` files are the design authority for sensitive subsystems; when implem
 ## Conventions
 
 - All comments in the code must be in English.
-- Formatting is enforced by `.rustfmt.toml`: **hard tabs**, block indentation, crate-granularity imports grouped `StdExternalCrate`, `use_small_heuristics = "Off"`. Always run `cargo fmt` after edits.
+- Formatting is enforced by `.rustfmt.toml`: **hard tabs**, block indentation, crate-granularity imports grouped `StdExternalCrate`, `use_small_heuristics = "Off"`. Always run `cargo +nightly fmt` and `cargo clippy` after edits.
 - `slotmap`/`slot-cell` back atom storage; `smallvec` (alpha 2.0) for inline adjacency; `rapidhash`/`rustc-hash` for hashing; `parking_lot`/`dashmap`/`crossbeam` for concurrency; `rayon` for data parallelism.
 - Serialization uses `binrw` (disk layout) and `rkyv`; the graph binary codec lives in `fg-meta`'s `serial` module.

@@ -1,7 +1,13 @@
 [workspace]
 members = [
-    "crates/ferros-grynn-macros"
+    "crates/ferros-grynn-macros",
+    "ferros-grynn-bench"
 ]
+
+[workspace.dependencies]
+ferros-grynn = { path = "." }
+ferros-grynn-macros = { path = "crates/ferros-grynn-macros" }
+
 
 [package]
 name = "ferros-grynn"
@@ -29,21 +35,21 @@ windows = { version = "0.62.2", features = [
     "Win32_System_SystemInformation"
 ] }
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30.1", features = ["fs", "uio", "feature"] }
+nix = { version = "0.31.3", features = ["fs", "uio", "feature"] }
 # ----------------------------------------------------
 
 # -------------------- Custom Allocator --------------------
 [target.'cfg(target_env="msvc")'.dependencies]
 mimalloc = "0.1.48"
 [target.'cfg(not(target_env="msvc"))'.dependencies]
-tikv-jemallocator = "0.6.1"
+tikv-jemallocator = "0.7.0"
 # ----------------------------------------------------------
 
 [dependencies]
 ferros-grynn-macros = { path = "crates/ferros-grynn-macros" }
 
 # --------- Platform ---------
-sysinfo = "0.37.2"
+sysinfo = "0.39.6"
 
 # --------- Async ---------
 tokio = { version = "1.48.0", features = ["fs", "io-util", "rt", "rt-multi-thread"] }
@@ -52,6 +58,27 @@ crossbeam = "0.8.4"
 parking_lot = "0.12.5"
 rayon = "1.11.0"
 
+# --------- Serialization ---------
+binrw = "0.15.0"
+rkyv = { version = "0.8.14", features = [] }
+
+# --------- Collections ---------
+slotmap = "1.1.1"
+slot-cell = "0.1.2"
+smallvec = "2.0.0-alpha.12"
+rapidhash = "4.2.2"
+thin-vec = "0.2.19"
+reblessive = "0.4.3"
+
+# --------- Data ---------
+bytes = "1.12.1"
+compact_str = { version = "0.9.1", features = ["rkyv"] }
+geo = "0.33.1"
+geojson = "1.0.0"
+jiff = "0.2.34"
+rust_decimal = { version = "1.42.1" }
+uuid = { version = "1.18.1", features = ["v4", "v7"] }
+ulid = { version = "3.0.0" }
 
 # --------- Error Handling ---------
 thiserror = "2.0.17"
@@ -60,16 +87,15 @@ anyhow = "1.0.100"
 # --------- Utils ---------
 bitflags = "2.10.0"
 lazy_static = "1.5.0"
-itertools = { version = "0.14.0", features = ["use_std"] }
-uuid = { version = "1.18.1", features = ["v4", "v7"] }
+itertools = { version = "0.15.0", features = ["use_std"] }
 humantime = "2.3.0"
 chrono = { version = "0.4.42", features = ["std", "clock"] }
-jiff = { version = "0.2.17" }
 num = { version = "0.4.3", features = ["std"] }
 num-traits = "0.2.19"
 regex = "1.12.2"
 once_cell = "1.21.3"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 
 
 
@@ -79,10 +105,30 @@ paste = "1"
 macro_rules_attribute = "0.2.2"
 magic_utils = { git = "https://github.com/VlaydDetect/magic_utils.git", features = ["derive"] }
 
-num-derive = "0.4.2"
+num-derive = "0.5.1"
 path-clean = "1.0.1"
 
 inventory = "0.3.21"
 
 tracing = "0.1.41"
 tracing-subscriber = "0.3.21"
+
+[dev-dependencies]
+proptest = "1.11.0"
+
+# aggressive optimizations for benchmark consistency
+[profile.release]
+codegen-units = 1
+lto = "fat"
+incremental = false
+opt-level = 3
+
+# aggressive optimizations for benchmark consistency
+[profile.bench]
+codegen-units = 1
+lto = "fat"
+incremental = false
+opt-level = 3
+debug = true
+debug-assertions = false
+strip = false

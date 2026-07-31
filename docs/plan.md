@@ -12,8 +12,8 @@
 
 ### `Value` и типы
 
-- Использовать `CompactString` напрямую для строк, имён таблиц, меток и публичных ключей. Собственные `StringValue` и SSO не реализовывать. `compact_str` хранит короткие строки inline и поддерживает `rkyv`. [Документация](https://docs.rs/compact_str/latest/compact_str/).
-- Публичные типы именовать `Array`, `Bytes`, `Set`, `Object`, `Range`, `Duration`, `DateTime`, `Uuid`, `Ulid`, `RecordId`, `Geometry`, `Regex`, `Path`, `Graph`, без суффикса `Value`.
+- Использовать публичный newtype `Text` над `compact_str::CompactString` для строк, имён таблиц, меток и публичных ключей. Обёртка является местом для доменной логики и скрывает выбор SSO-реализации; собственную SSO не реализовывать. Совместимость с inner-типом предоставлять через `as_inner`, `into_inner` и `From`/`Into`. [Документация compact_str](https://docs.rs/compact_str/latest/compact_str/).
+- Публичные типы именовать `Text`, `Array`, `Bytes`, `Set`, `Object`, `Range`, `Duration`, `DateTime`, `Uuid`, `Ulid`, `RecordId`, `Geometry`, `Regex`, `Path`, `Graph`, без суффикса `Value`.
 - Хранить `rust_decimal::Decimal` непосредственно внутри `Number::Decimal`.
 - `Uuid`/`Ulid` сделать newtype обёртками с `as_inner`, `into_inner`, `From`/`Into`, parsing и Ferros-Grynn API.
 - `option<T>` оставить только статическим `Type`: `Some(v)` представлен самим `v`, отсутствие — `Value::None`. Вариант `Value::Option` не вводить.
@@ -29,7 +29,7 @@
     - runtime-only: `Closure`, `Regex`, `Matcher`, `Computed`, `Formatter`, `Cursor`, `Error`;
     - графовые результаты: атом, путь и граф/подграф с различением reference/materialized состояния внутри соответствующих типов.
 - Все сужающие и потенциально неточные преобразования сделать `TryFrom`; удалить преобразования, молча возвращающие `0`/default.
-- `CompactString`, `Bytes`, `Array` и `Object` предоставляют `as_str`/`as_ref`, итераторы, `len`, `is_empty`, consuming-конверсии и контролируемые методы изменения. Не использовать `DerefMut`, если он обходит инварианты.
+- `Text`, `Bytes`, `Array` и `Object` предоставляют `as_str`/`as_ref`, итераторы, `len`, `is_empty`, consuming-конверсии и контролируемые методы изменения. Не использовать `DerefMut`, если он обходит инварианты.
 - `Set` хранить как `BTreeSet<Value>`, `Range` валидировать на совместимость границ, а `RecordId` разделить на публичные строковые `table:id` и внутренние идентификаторы словаря.
 
 ### Sentinel-семантика и порядок
@@ -52,8 +52,8 @@ bool(null)    → false
 
 ```text
 none < null < bool < number < string < duration < datetime
-     < ulid < uuid < array < set < object < geometry < bytes
-     < table < record < regex < range
+     < ulid < uuid < array < set < object < geometry < vector
+     < bytes < table < record < regex < range
      < atom < path < subgraph < graph < closure
 ```
 
@@ -68,17 +68,24 @@ none < null < bool < number < string < duration < datetime
 
 - `Array` хранит `Vec<Value>`.
 - `Set` хранит `BTreeSet<Value>`.
-- Публичный `Object` хранит `BTreeMap<CompactString, Value>` ради канонического порядка, стабильного вывода и дешёвого `Ord`.
+- Публичный `Object` хранит `BTreeMap<Text, Value>` ради канонического порядка, стабильного вывода и дешёвого `Ord`.
 - `PropertyMap` не является alias для `Object`. Внутри графа ключи представлены `PropertyKeyId(u32)` и разрешаются через `PropertyDictionary`.
-- Начальное представление `PropertyMap`:
+- Представление `PropertyMap`:
 
 ```text
-до 8 свойств   → sorted SmallVec<[(PropertyKeyId, Value); 8]>
-больше 8       → RapidHashMap<PropertyKeyId, Value>
+empty       → allocation-free ThinVec singleton
+non-empty   → sorted ThinVec<(PropertyKeyId, Value)>, один contiguous allocation
 ```
 
-- Порядок свойств семантически незначим. При дисковом кодировании heap-вариант сортируется по `PropertyKeyId`.
-- Benchmark может изменить константу `INLINE_PROPERTIES`, но не публичный API или disk format.
+- `PropertyMap` остаётся размером в один указатель. `ThinVec` хранит length/capacity рядом с
+  элементами в том же выделении; первая вставка создаёт один компактный буфер, а не `Box` на
+  656-байтный псевдо-inline storage.
+- Настоящий `union<SmallVec<8>, RapidHashMap>` не применяется: при `Value = 64 B` он увеличивает
+  каждый элемент плотного `Vec<PropertyMap>` до 672 B, включая пустые карты.
+- Порядок свойств семантически незначим, но runtime держит пары по `PropertyKeyId` для дешёвых
+  iteration, `Eq`/`Ord`/`Hash` и canonical codec без временной сортировки.
+- Возврат hash-представления допустим только после workload-бенчмарков, показывающих, что
+  point lookup больших property maps важнее row iteration, clone и плотности памяти.
 
 ### Column-store
 
@@ -105,6 +112,33 @@ present=1, valid=1    → значение
 - Schemafull-свойства материализуются в нативные Arrow arrays.
 - Schemaless-колонка получает вычисленный общий тип; несовместимые значения кодируются как dense union либо `Binary(StorageValue)` по явно зафиксированному fallback.
 - DataFusion подключается только к batch-слою. Его `ScalarValue` не используется внутри `Value`: nested scalar фактически хранится как одноэлементный Arrow array, а документация рекомендует пакетные arrays для производительности. [ScalarValue](https://docs.rs/datafusion/latest/datafusion/common/scalar/enum.ScalarValue.html).
+
+### ECS и материализованные свойства
+
+ECS не заменяет `PropertyMap`, `PropHeapPage` или Arrow. Он является типизированным runtime-слоем
+для компонентов алгоритмов и временно материализованных property-columns:
+
+```text
+PropertyMap / PropHeapPage → PropertyColumn<T> / SparseSet<T> → graph/ML algorithm
+                          ↘ PropertyBatch / Arrow            → DataFusion
+```
+
+- `SparseSet<T>` ключуется полным `AtomId`, а не отдельным `Entity`.
+- Sparse-index строится отдельными paged-таблицами для node/edge slot space; lookup после
+  получения dense index проверяет полный `AtomId`, включая generation.
+- Источником создания и переиспользования ID остаётся graph `SlotAllocator`; ECS не имеет
+  собственного entity allocator.
+- Обычный component pool идентифицируется `TypeId`. Материализованное свойство использует
+  `(PropertyKeyId, TypeId)`, иначе несколько свойств одного Rust-типа попадут в один pool.
+- Отсутствующая sparse-запись означает `none`; `null` хранится отдельной validity/null bitmap,
+  согласованной с `PropertyBatch`.
+- `AnyPool::remove_atom` удаляет компоненты атома из всех pools при освобождении graph slot.
+- Read-only join итерируется по реально наименьшему pool и проверяет остальные; mutable join
+  проектируется отдельно с явными aliasing-ограничениями.
+
+Архитектурный референс — paged sparse set/storage/view из
+[EnTT](https://github.com/skypjack/entt/blob/main/single_include/entt/entt.hpp), но entity layout,
+generation и node/edge kind берутся только из Ferros-Grynn `AtomId`.
 
 
 ## 2. Графовый домен и пути
@@ -164,6 +198,34 @@ pub struct Metagraph<State = Frozen>;
 - Обе конверсии явно документируются как потенциально `O(V+E)`.
 - Query results и обычный `LIVE SELECT` используют `Frozen`. При ручной конвертации в `Mutable` - явный fallback `LIVE SELECT` при конфликте dirty-set.
 - Manual SDK и write-back `query_to_memory` могут сразу запрашивать `Mutable`.
+
+### `GraphWorkspace` и ECS
+
+Произвольные Rust-компоненты не включаются непосредственно в `Graph<State>`:
+
+```rust
+pub struct GraphWorkspace<G> {
+    graph: G,
+    components: WorldComponents,
+    bound_identity: Uuid,
+    bound_revision: u64,
+}
+```
+
+- `Graph` остаётся каноническим cloneable/materializable значением topology + `PropertyMap`.
+- `GraphWorkspace<Graph<State>>` — public Rust SDK sidecar для layout, PageRank, weights,
+  feature vectors, пользовательских компонентов и materialized property-columns.
+- Workspace не помещается в `Value`, не возвращается обычным GQL `RETURN` и не сериализуется
+  автоматически. `query_to_memory` сохраняет прежний точный return type; workspace создаётся
+  явным `graph.into_workspace()` или внутренним аналитическим оператором.
+- Component mutation не меняет graph revision. Изменение topology/PropertyMap проходит через
+  workspace facade, обновляет graph revision и инвалидирует производные pools.
+- Workspace привязан к `(graph identity, revision)`. Доступ к устаревшему derived pool после
+  внешней мутации графа возвращает structured error; молчаливое чтение stale-компонента запрещено.
+- Компонент, который должен участвовать в query, durability, graph equality или write-back,
+  обязан быть явно сохранён как schema/property value. ECS-компонент по умолчанию ephemeral.
+- `freeze`/`thaw` графа не требуют `Clone` от произвольных компонентов: sidecar переносится
+  отдельно, а несовместимые derived pools инвалидируются.
 
 ### Storage families
 
@@ -358,24 +420,36 @@ LiveEvent::Conflict {
     - Для неизвестного тега в codec v1 возвращать структурированную ошибку: сохранить неизвестное значение как `Bytes` невозможно без внешнего length framing.
     - Синхронизированы `gql_spec.md`, `gql_tech_spec.md`, `disk_storage_spec.md`, `graphs.md`, `implementation_plan.md` и этот план.
 
-2. **Runtime-фундамент**
-    - Исправить `Array::new`, `Number::Hash` и некорректный `Value::Ord`.
-    - Реализовать scalars, безопасные конверсии, `Display`, parsing и introspection, `CompactString`, `Number`, temporal, UUID/ULID, `RecordId`.
-    - Добавить `DateTime`/`Duration` поверх `jiff`, UUID/ULID как непрозрачные 128-битные значения, GeoJSON-совместимую геометрию и типизированные vector-варианты.
-    - Реализовать полный `ValueKind`, `Eq`/`Ord`/`Hash`.
-    - Реализовать `Array`, `Set`, `Object`, `Range`.
-    - Реализовать `RecordId`, включая int/string/uuid/ulid/array/object части и рекурсивную проверку допустимости.
-    - Затем перенести графовые типы из `fg-meta`, адаптировать их `PropertyMap` и реэкспортировать как корневой `graph` API.
-    - Runtime-only типы добавить последними; попытка сохранить их должна возвращать диагностическую ошибку, а не panic.
-    - После каждого варианта сохранять успешный `cargo check`.
+2. **Runtime-фундамент — ✅ выполнено**
+    - Исправлены `Array::new`, `Number::Hash` и некорректный `Value::Ord`.
+    - Реализованы scalars, безопасные конверсии, `Display`, parsing и introspection, `Text` над `CompactString`, `Number`, temporal, UUID/ULID, `RecordId`.
+    - Добавлены `DateTime`/`Duration` поверх `jiff`, UUID/ULID как непрозрачные 128-битные значения, GeoJSON-совместимая геометрия и типизированные vector-варианты.
+    - Реализованы `ValueKind`, структурный `Type` и согласованные `Eq`/`Ord`/`Hash`.
+    - Реализованы `Array`, `Bytes`, `Set`, `Object`, `Range`.
+    - Реализован `RecordId` с int/string/uuid/ulid/array/object частями, parsing и рекурсивной проверкой допустимости.
+    - Из `fg-meta` перенесён необходимый graph foundation: bit-packed `AtomId` в актуальной раскладке `gen(23) | kind(1) | slot(40)`, general SoA, node/edge и edge/edge incidence, identity/revision, `Graph<Mutable>`/`Graph<Frozen>`, `GraphRef`; API реэкспортирован как корневой `graph`. Алгоритмы, специализированные storage families, Path и LiveGraph остаются этапом 4.
+    - Добавлены отдельный sorted `ThinVec`-based `PropertyMap` и `PropertyKeyId`, необходимые graph foundation; dictionary и columnar integration остаются этапом 3.
+    - Fallible API `Text`, `Geometry`, `RecordId` и graph foundation возвращает
+      `FerrosGrynnResult`; value-ошибки имеют `Domain::Value`, а ошибки внешних parser crates
+      сохраняются только как redacted `technical_source`.
+    - Runtime-only `Closure` и `Regex` добавлены последними; `Value::ensure_storable` отклоняет runtime-only и материализованные graph-значения диагностической ошибкой.
+    - Runtime покрыт unit- и property-based тестами законов `Eq`/`Ord`/`Hash`; `cargo check`, Clippy и library/integration tests проходят.
 
 3. **PropertyMap и columnar**
-    - Реализовать dictionary и hybrid small/hash representation.
+    - Реализовать dictionary; benchmark target сравнивает production sorted `ThinVec`, прежний
+      boxed/tagged hybrid, настоящий inline hybrid, `Vec`, `BTreeMap` и `RapidHashMap` на размерах
+      0/1/4/8/9/16/32/128.
+    - По измерениям latency/throughput/allocation пересматривать representation, не меняя
+      публичный API или disk format. Порог inline → hash больше не является исходным допущением.
+    - Реализовать ECS foundation: paged generation-aware `SparseSet`, `AnyPool`,
+      `WorldComponents` и `(PropertyKeyId, TypeId)` materialized property pools.
     - Реализовать `PropertyBatch`, presence bitmaps и Arrow conversion.
     - Подключить DataFusion только после проверки Arrow round-trip и `none`/`null`.
 
 4. **Графовое ядро**
     - Перенести универсальное поведение `fg-meta`.
+    - Добавить `GraphWorkspace`, AtomId-keyed ECS facade, invalidation по identity/revision и
+      read-only joins по наименьшему pool.
     - Ввести type-state API и storage families.
     - Реализовать mutable/frozen conversions и conversion matrix.
     - Реализовать три storage modes и `query_to_memory`.
@@ -444,7 +518,8 @@ LiveEvent::Conflict {
 
 - `Set`: `BTreeSet`, sorted `Vec` (`SmallVec`), `RapidHashSet`;
 - `Object`: `BTreeMap`, `RapidHashMap`, `IndexMap`;
-- `PropertyMap`: sorted `SmallVec`, `RapidHashMap`, hybrid;
+- `PropertyMap`: production sorted `ThinVec`, boxed/tagged hybrid, direct inline hybrid,
+  sorted `Vec`, `BTreeMap`, `RapidHashMap`;
 - mutable/frozen representations каждой storage family;
 - traversal general Graph против Tree/Forest/Dag;
 - freeze/thaw и cross-family conversion;
@@ -453,7 +528,8 @@ LiveEvent::Conflict {
 - live COW delta и atomic publish;
 - canonical codec, rkyv, bincode и binrw на проектных данных.
 
-Размеры PropertyMap: `0, 1, 4, 8, 16, 32, 128`. Измерять latency, throughput, bytes/atom и число аллокаций.
+Размеры PropertyMap: `0, 1, 4, 8, 9, 16, 32, 128`; `8/9` сохраняются для сравнения со старым
+inline → heap порогом. Измерять latency, throughput, bytes/atom и число аллокаций.
 
 ### Готовность
 

@@ -382,7 +382,7 @@ struct RecordId {
 
 enum RecordIdPart {
     Int(i64),
-    String(CompactString),
+    String(Text),
     Uuid(u128),           // UUIDv7
     Ulid(u128),           // ULID
     Array(Vec<Value>),    // composite key

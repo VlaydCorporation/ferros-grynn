@@ -1,0 +1,29 @@
+[package]
+name = "ferros-grynn-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bench]]
+name = "collections"
+harness = false
+
+[[bench]]
+name = "property_map"
+harness = false
+
+[dependencies]
+ferros-grynn = { workspace = true }
+
+[dev-dependencies]
+# benchmarking helpers
+criterion = { version = "0.8.1", features = ["async", "async_futures", "async_tokio", "rayon", "cargo_bench_support", "html_reports"] }
+divan = "0.1.21"
+
+rand = "0.10.0"
+
+rapidhash = "4.4.1"
+slotmap = "1.1.1"
+smallvec = "2.0.0-alpha.12"
+tinyvec = { version = "1.10.0", features = ["alloc"] }
+arrayvec = "0.7.6"

@@ -194,6 +194,7 @@ pub enum ErrorCategory {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Domain {
 	Query,
+	Value,
 	Graph,
 	Storage,
 	Transaction,
@@ -476,6 +477,149 @@ define_status_codes!(
 		subcondition: "temporal value processing failed",
 		message: "The temporal value could not be processed.",
 	},
+	InvalidTextBoundary, "FG-22F05" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "invalid UTF-8 character boundary",
+		message: "Byte index {index} is not a UTF-8 character boundary for a string of {length} bytes.",
+		params: {
+			index: u64 => DisplayValue,
+			length: u64 => DisplayValue,
+		},
+	},
+	InvalidGeometryCoordinateDimension, "FG-22F06" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "invalid geometry coordinate dimension",
+		message: "A WGS-84 position must contain exactly two coordinates, but found {actual}.",
+		params: {
+			actual: u64 => DisplayValue,
+		},
+	},
+	NonFiniteGeometryCoordinate, "FG-22F07" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "non-finite geometry coordinate",
+		message: "The geometry coordinate at index {index} must be finite.",
+		params: {
+			index: u64 => DisplayValue,
+		},
+	},
+	GeometryCoordinateOutOfBounds, "FG-22F08" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "geometry coordinate out of bounds",
+		message: "Geometry coordinate {component} must be in the range {lower} to {upper}, but found {value}.",
+		params: {
+			component: String => Identifier,
+			lower: i64 => DisplayValue,
+			upper: i64 => DisplayValue,
+			value: f64 => DisplayValue,
+		},
+	},
+	InvalidGeoJsonGeometry, "FG-22F09" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Syntax,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "invalid GeoJSON geometry",
+		message: "The input is not valid GeoJSON geometry syntax.",
+	},
+	ExpectedGeoJsonGeometry, "FG-22F10" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "expected GeoJSON geometry",
+		message: "Expected a GeoJSON geometry, but found {actual}.",
+		params: {
+			actual: String => ValueType,
+		},
+	},
+	InvalidRecordIdSyntax, "FG-22F11" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Syntax,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "invalid record ID syntax",
+		message: "A record ID must use the table:id form.",
+	},
+	EmptyRecordIdTable, "FG-22F12" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "empty record ID table",
+		message: "The table component of a record ID cannot be empty.",
+	},
+	EmptyRecordIdPart, "FG-22F13" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "empty record ID part",
+		message: "The value component of a record ID cannot be empty.",
+	},
+	InvalidRecordIdPart, "FG-22F14" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "invalid record ID part",
+		message: "A value of type {value_type} cannot be used in a record ID.",
+		params: {
+			value_type: String => ValueType,
+		},
+	},
+	InvalidCompositeRecordId, "FG-22F15" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Syntax,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "invalid composite record ID",
+		message: "A composite record ID must contain a valid JSON string, array, or object.",
+	},
 	AtomDoesNotExist, "FG-G1F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -491,7 +635,7 @@ define_status_codes!(
 			id: String => DisplayValue,
 		},
 	},
-	EmptyEdgeTargets, "FG-G2F01" => {
+	EmptyEdgeEndpoints, "FG-G2F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
 			category: ErrorCategory::Runtime,
@@ -499,8 +643,8 @@ define_status_codes!(
 		},
 		condition: Condition::GraphTypeViolation,
 		domain: Domain::Graph,
-		subcondition: "edge targets are empty",
-		message: "An edge must have at least one target.",
+		subcondition: "edge endpoints are empty",
+		message: "An edge must have at least one endpoint.",
 	},
 	EdgeCreationError, "FG-G2F02" => {
 		kind: Error {
@@ -511,6 +655,23 @@ define_status_codes!(
 		condition: Condition::GraphTypeViolation,
 		domain: Domain::Graph,
 		subcondition: "cannot create edge",
+		message: "The edge could not be created.",
+	},
+	AtomKindMismatch, "FG-G2F03" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::GraphTypeViolation,
+		domain: Domain::Graph,
+		subcondition: "atom kind mismatch",
+		message: "Atom {id} has type {actual}, but this operation requires {expected}.",
+		params: {
+			id: String => DisplayValue,
+			actual: String => ValueType,
+			expected: String => ValueType,
+		},
 	},
 	QueryTooLarge, "FG-54F01" => {
 		kind: Error {
@@ -522,6 +683,34 @@ define_status_codes!(
 		domain: Domain::Query,
 		subcondition: "query too large",
 		message: "The query exceeds the maximum supported size of 4,294,967,295 bytes.",
+	},
+	RecordIdNestingTooDeep, "FG-54F02" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Value,
+		subcondition: "record ID nesting limit exceeded",
+		message: "Record ID nesting exceeds the maximum depth of {maximum_depth}.",
+		params: {
+			maximum_depth: u64 => DisplayValue,
+		},
+	},
+	GraphCapacityExceeded, "FG-54F03" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Graph,
+		subcondition: "graph capacity exceeded",
+		message: "The graph has exhausted the available {atom_type} slot space.",
+		params: {
+			atom_type: String => ValueType,
+		},
 	},
 	QueryParseError, "FG-42001" => {
 		kind: Error {
@@ -732,5 +921,21 @@ mod tests {
 	fn status_object_builds_full_description() {
 		let status = StatusObject::new(Status::division_by_zero());
 		assert_eq!(status.to_string(), "FG-22012: error: data exception - division by zero");
+	}
+
+	#[test]
+	fn value_and_graph_limits_have_structured_domains() {
+		let value = StatusObject::new(Status::invalid_text_boundary(1, 4));
+		assert_eq!(value.code().to_string(), "FG-22F05");
+		assert_eq!(value.domain(), Domain::Value);
+		assert_eq!(
+			value.message().as_deref(),
+			Some("Byte index 1 is not a UTF-8 character boundary for a string of 4 bytes."),
+		);
+
+		let graph = StatusObject::new(Status::graph_capacity_exceeded("node"));
+		assert_eq!(graph.code().to_string(), "FG-54F03");
+		assert_eq!(graph.condition(), Condition::ProgramLimitExceeded);
+		assert_eq!(graph.domain(), Domain::Graph);
 	}
 }

@@ -71,7 +71,7 @@ DiagnosticRecord (контекст события)
 - `NotificationClassification` — фильтрация уведомлений.
 - `ErrorCategory` — стадия/характер ошибки из `gql_spec.md`:
   syntax, semantic, type, transaction, planning или runtime.
-- `Domain` — подсистема-владелец: query, graph, storage, transaction, I/O,
+- `Domain` — подсистема-владелец: query, value, graph, storage, transaction, I/O,
   configuration, security или external.
 - `Severity` — важность конкретной диагностики. Completion не имеет severity;
   notification допускает information/warning, error — error/critical.
