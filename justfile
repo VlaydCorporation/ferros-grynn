@@ -8,6 +8,12 @@ build:
 check:
     cargo check
 
+[group('dev')]
+all-check:
+    cargo check
+    cargo +nightly fmt
+    cargo clippy
+
 # Run tests
 [group('dev')]
 test filter="":

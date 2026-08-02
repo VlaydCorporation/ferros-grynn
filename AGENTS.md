@@ -1,16 +1,29 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance and essential context for AI assistants when working with Ferros-Grynn codebase.
 
-## Project
+## Project Overview
 
-Ferros-Grynn is an embedded **metagraph** database engine in Rust. The graph model is universal: it aims to represent metagraphs, hypergraphs, multigraphs, trees, DAGs and plain graphs uniformly, supporting every kind of incidence (vertex–vertex, vertex–edge, edge–edge), graphs nested inside atoms (nodes/edges), and cross-level incidence between nested graphs. It ships its own storage layer (Direct I/O with an optional Async I/O wrapper) and a query language (GQL) that blends Cypher, Gremlin and SurrealQL — SQL-like queries, graphs-as-tables, path matching, and imperative traverser-based pipelines.
+Ferros-Grynn is a **metagraph** engine with embedded data storage its own GQL query language, and a system for interacting with other databases.
+The graph model is universal: it aims to represent metagraphs, hypergraphs, multigraphs, trees, DAGs and plain graphs uniformly (including their oriented, undirected, weighted, probabilistic, and attributed versions), supporting every kind of incidence (vertex–vertex, vertex–edge, edge–edge), graphs nested inside atoms (nodes/edges), and cross-level incidence between nested graphs. 
+It ships its own storage layer (Direct I/O with an optional Async I/O wrapper) and a query language (GQL) that blends Cypher, Gremlin and SurrealQL — SQL-like queries, graphs-as-tables, path matching, and imperative traverser-based pipelines.
 
-Most design docs, code comments, and `implementation_notes.md` are written in **Russian** — preserve that language when editing them.
+Most design docs, code comments, and `docs/implementation_notes.md` are written in **Russian** — preserve that language when editing them.
+
+
+## Project Structure
+```
+src/                          # Main Rust SDK source files
+docs/                         # Document and specification files
+ferros-grynn-bench/           # Ferros-Grynn benchmarks
+crates/ferros-grynn-macros/   # Procedural macros
+tests/                        # Integration tests
+```
+
 
 ## Repository state — read this first
 
-The repo is mid-migration (branch `mvp`, on top of `WIP: First MVP`). Do not assume the main crate builds end-to-end.
+The repo is mid-migration (branch `mvp`). Do not assume the main crate builds end-to-end.
 
 - **`crates/fg-meta`** (`ferros-grynn-meta`, a *separate* Cargo workspace with its own `Cargo.lock`) is the **mature reference implementation** / prototype. It contains the working graph core, traversal algorithms, MVCC, persistence, and I/O subsystem. Consult it to understand how a subsystem is intended to work before (re)implementing it in the main crate. It is being either merged into the main crate or promoted to a standalone core crate.
 - The **root crate `ferros-grynn`** is where the production version is being rebuilt. In `src/lib.rs` **most top-level modules are commented out**; currently only `values` compiles. When you add code, expect to un-comment and fix modules incrementally — don't assume a module referenced in a `use` is actually wired in.
@@ -18,47 +31,16 @@ The repo is mid-migration (branch `mvp`, on top of `WIP: First MVP`). Do not ass
 
 When a subsystem exists in both `fg-meta` and `src/`, the `src/` version is the target and `fg-meta` is the source of truth for behavior.
 
-## Commands
-
-Toolchain: **Rust edition 2024** (needs Rust 1.85+). A **nightly** toolchain is required for `cargo fmt` — `.rustfmt.toml` sets `unstable_features = true`. `.cargo/config.toml` passes `--cfg tokio_unstable` globally and static-CRT link args for the `x86_64-pc-windows-msvc` target.
-
-Common tasks are wrapped in a `justfile` (run `just <task>`):
-
-```
-just build          # cargo build
-just check          # cargo check
-just test           # cargo test
-just test <filter>  # cargo test <filter>   (single test / module)
-```
-
-Directly:
-```
-cargo check
-cargo test <name>                       # run a single test by substring
-cargo +nightly fmt                      # format (nightly rustfmt required)
-cargo bench -p ferros-grynn-bench       # workspace benchmarks (criterion + divan)
-```
-
-Working inside the prototype (its own workspace — cd into it):
-```
-cd crates/fg-meta
-cargo test
-cargo test --features async-uring       # enable io_uring / tokio-uring async I/O
-cargo bench --bench bench_graph         # graph benchmarks
-```
-`fg-meta` feature flags: `iouring`, `async-uring` (implies `iouring`), `async-ioring`, `spdk` (all default off; SPDK/async paths are Linux-only).
-
-The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optimized builds are slow; prefer `cargo check`/debug builds while iterating.
 
 ## Architecture
 
 ### Allocator & platform I/O (compile-time selected)
 - **Global allocator**: `mimalloc` on MSVC targets, `tikv-jemallocator` elsewhere (set in `src/lib.rs`).
-- **Direct I/O** is the storage foundation: `O_DIRECT`/`F_NOCACHE` on Unix, `FILE_FLAG_NO_BUFFERING` on Windows. Async I/O is a wrapper over `io_uring`/`tokio-uring` on Linux and a custom Tokio↔Windows `IoRing` bridge on Windows. In `fg-meta` the only public I/O types are `SyncIo` and `AsyncIo`; page size and `BufferPool` are shared. The new home for this is `crates/storage_engine` (`io`, `layout`, `store` submodules).
+- **Direct I/O** is the storage foundation: `O_DIRECT`/`F_NOCACHE` on Unix, `FILE_FLAG_NO_BUFFERING` on Windows. Async I/O is a wrapper over `io_uring`/`tokio-uring` on Linux and a custom Tokio <-> Windows `IoRing` bridge on Windows. In `fg-meta` the only public I/O types are `SyncIo` and `AsyncIo`; page size and `BufferPool` are shared. The new home for this is `crates/storage_engine` (`io`, `layout`, `store` submodules).
 
 ### Graph core (`fg-meta`, target: `src/values/runtime/graph`)
 - Data model `MG = ⟨V, MV, E, ME⟩` (Basu–Blanning + Chernenko–Gapanyuk extensions). Stored **struct-of-arrays (SoA)**.
-- **`AtomId`** is the central handle. The production layout is `gen(23) | kind(1) | slot(40)` per `disk_storage_spec.md` §9; `fg-meta` still uses the legacy `gen(32) | kind(1) | slot(31)` prototype layout. Slots are handed out by a `SlotAllocator`. Nodes and edges are both "atoms". `MetaGraph` is the container; `traversal` holds the algorithms (BFS/DFS, topo sort, SCC/WCC, Dijkstra, Bellman–Ford with negative-cycle detection, MST, cuts, binary-lifting LCA); `subgraph` extracts typed subgraphs (`TreeSubGraph`, `ForestSubGraph`, `DagSubGraph`, `HyperSubGraph`) plus generic `SubGraph`; `matrix` provides `AdjacencyMatrix`, `IncidenceMatrix`, `MetaAdjacencyMatrix`, `IncidenceTensor` (via `nalgebra`).
+- **`AtomId`** is the central handle. The production layout is `gen(23) | kind(1) | slot(40)` per `docs/disk_storage_spec.md` §9; `fg-meta` still uses the legacy `gen(32) | kind(1) | slot(31)` prototype layout. Slots are handed out by a `SlotAllocator`. Nodes and edges are both "atoms". `MetaGraph` is the container; `traversal` holds the algorithms (BFS/DFS, topo sort, SCC/WCC, Dijkstra, Bellman–Ford with negative-cycle detection, MST, cuts, binary-lifting LCA); `subgraph` extracts typed subgraphs (`TreeSubGraph`, `ForestSubGraph`, `DagSubGraph`, `HyperSubGraph`) plus generic `SubGraph`; `matrix` provides `AdjacencyMatrix`, `IncidenceMatrix`, `MetaAdjacencyMatrix`, `IncidenceTensor` (via `nalgebra`).
 - An **ECS layer** (`SparseSet`, `AnyPool`, component registries, `join!`-style iterators) attaches components (positions, PageRank, feature vectors, weights…) to atoms for analytics/ML.
 
 ### Values (`src/values`, the one module currently active in the main crate)
@@ -82,6 +64,7 @@ This is the project-wide diagnostics/error mechanism — **not** just query erro
 ### Query language (`src/gql`, `src/syn`)
 Early-stage. `src/syn` is the syntax front end (`lexer`, `token`, `parser`, and its own `error` with source-location rendering). `src/gql` holds the AST/expression/dataset/traversal scaffolding. This is designed against the specs below and will be reworked after the specs settle.
 
+
 ## Specs (`docs/`) — design authority
 
 These `.md` files are the design authority for sensitive subsystems; when implementing those areas, treat the spec as the contract and keep code in sync.
@@ -91,9 +74,51 @@ These `.md` files are the design authority for sensitive subsystems; when implem
 - `gql_grammar.md` — EBNF grammar (not yet filled in).
 - `graphs.md` — the graph taxonomy the engine must cover.
 
+
 ## Conventions
 
 - All comments in the code must be in English.
 - Formatting is enforced by `.rustfmt.toml`: **hard tabs**, block indentation, crate-granularity imports grouped `StdExternalCrate`, `use_small_heuristics = "Off"`. Always run `cargo +nightly fmt` and `cargo clippy` after edits.
 - `slotmap`/`slot-cell` back atom storage; `smallvec` (alpha 2.0) for inline adjacency; `rapidhash`/`rustc-hash` for hashing; `parking_lot`/`dashmap`/`crossbeam` for concurrency; `rayon` for data parallelism.
 - Serialization uses `binrw` (disk layout) and `rkyv`; the graph binary codec lives in `fg-meta`'s `serial` module.
+
+
+## Common Commands
+
+Toolchain: **Rust edition 2024** (needs Rust 1.85+). A **nightly** toolchain is required for `cargo fmt` — `.rustfmt.toml` sets `unstable_features = true`. `.cargo/config.toml` passes `--cfg tokio_unstable` globally and static-CRT link args for the `x86_64-pc-windows-msvc` target.
+
+```
+# Build lib
+cargo build
+
+# Full code verification (REQUIRED before commits)
+just all-check
+
+# Run all tests
+cargo test
+
+# Run a single test by substring
+cargo test <name>
+
+# Workspace benchmarks (criterion + divan)
+cargo bench -p ferros-grynn-bench
+
+```
+
+Working inside the prototype (its own workspace — cd into it):
+```
+cd crates/fg-meta
+cargo test
+cargo test --features async-uring       # enable io_uring / tokio-uring async I/O
+cargo bench --bench bench_graph         # graph benchmarks
+```
+`fg-meta` feature flags: `iouring`, `async-uring` (implies `iouring`), `async-ioring`, `spdk` (all default off; SPDK/async paths are Linux-only).
+
+The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optimized builds are slow; prefer `cargo check`/debug builds while iterating.
+
+## Code Quality Rules
+
+- Use types errors from `src/gql_status` for fallible APIs, don't use `anyhow` - it erases errors.
+- Never use `.unwrap_or_default()` when debugging - it masks errors.
+- Performance matters: think about impact of every change.
+- Don't add dependencies without confirmation.
