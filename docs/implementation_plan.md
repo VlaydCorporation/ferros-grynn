@@ -352,8 +352,8 @@ smallvec.workspace = true                               # adjacency/traversal bu
 rapidhash.workspace = true                              # registries, indexes and ECS pools
 rkyv = { workspace = true, features = ["bytecheck"] }   # snapshots/caches, не canonical codec
 zerocopy.workspace = true                               # fixed page headers/slots
-arrow.workspace = true                                  # PropertyBatch
-datafusion.workspace = true                             # только columnar adapter
+arrow = { workspace = true, optional = true }           # PropertyBatch; workspace 58.4
+datafusion = { workspace = true, optional = true }      # adapter; workspace 54.1
 xxhash-rust = { version = "0.8", features = ["xxh3"] }  # Page checksum
 geo = { version = "0.33" }                              # planar geometry
 geojson = { version = "1.0.0" }                         # GeoJSON
@@ -410,10 +410,12 @@ pub struct GraphWorkspace<G> {
 зависимости и состав работ. Детализация по существующим файлам (`fg-meta` / `src`) взята из
 `disk_storage_spec.md` §30.1–§30.7.
 
-**Этапы 1–2 плана `values`: ✅ завершены.** Спецификации синхронизированы; реализованы
+**Этапы 1–3 плана `values`: ✅ завершены.** Спецификации синхронизированы; реализованы
 runtime scalars и collections, `Value`/`ValueKind`/`Type`, exact `Number`, temporal,
-UUID/ULID, `RecordId`, geometry/vector, runtime-only identity и graph foundation.
-Следующий исполняемый этап — `PropertyMap` dictionary/benchmarks и columnar materialization.
+UUID/ULID, `RecordId`, geometry/vector, runtime-only identity, graph foundation,
+generation-aware ECS и Arrow/DataFusion property materialization. Следующий исполняемый этап —
+графовое ядро и `GraphWorkspace`; `Binary(StorageValue)` columnar fallback появляется вместе с
+codec на этапе 5.
 
 ### Область A. Система типов и значения — P1 (блокирующая)
 
@@ -426,18 +428,21 @@ UUID/ULID, `RecordId`, geometry/vector, runtime-only identity и graph foundatio
   `technical_source`.
 - **`src/values/runtime/record_id.rs`** 🟢 — `RecordId`, `RecordIdPart`; object-ID хранит
   строковые ключи и имеет канонический UTF-8 порядок.
-- **`src/values/runtime/property_map.rs`** 🟡 — реализованы `PropertyKeyId` и однословный sorted
+- **`src/values/runtime/property_map.rs`** 🟢 — реализованы `PropertyKeyId`, двунаправленный
+  `PropertyDictionary` и однословный sorted
   `ThinVec`. Benchmark отверг boxed/tagged `SmallVec`/`RapidHashMap`: первая вставка выделяла
   656 B, а настоящий inline union занимал 672 B на каждом атоме. Empty не аллоцирует, non-empty
-  имеет один contiguous allocation и canonical order без временной сортировки. Dictionary
-  относится к следующему этапу.
-- **`src/ecs`** 🟡 — перенесённый `Registry<Entity>` является временным каркасом. Заменить на
-  paged generation-aware `SparseSet<AtomId>`, `WorldComponents`, property pools и
-  `GraphWorkspace`; не подключать независимый entity allocator к графу.
+  имеет один contiguous allocation и canonical order без временной сортировки.
+- **`src/ecs`** 🟢/🟡 — реализованы paged generation-aware `SparseSet<AtomId>` с отдельными
+  node/edge slot spaces, `AnyPool`, `WorldComponents`, `(PropertyKeyId, TypeId)` property pools,
+  independent presence/validity и smallest-pool read-only joins. Независимого entity allocator
+  нет. Revision-bound `GraphWorkspace` остаётся этапом 4.
 - **`src/values/storage`** 🔴 — `StorageValue`, borrowed `StorageValueRef`, encode/decode
   contexts, `TypeTag` из `disk_storage_spec.md` §5.2, canonical codec v1 и `DecodeLimits`.
-- **`src/values/columnar`** 🔴 — `PropertyBatch`, presence bitmaps, Arrow conversion и
-  DataFusion adapter; runtime от этого слоя не зависит.
+- **`src/values/columnar`** 🟢/🟡 — реализованы `PropertyBatch`, presence bitmaps,
+  `PropertyKeyId ↔ Arrow field`, metadata validation, native scalar arrays, dense union,
+  Arrow round-trip и DataFusion `MemTable` со скрытыми presence-полями. Модули feature-gated,
+  runtime от них не зависит. Nested `Binary(StorageValue)` fallback заблокирован до этапа codec.
 - **`src/values/runtime/graph`** 🟡/🟢 reference — реализованы general SoA foundation,
   bit-packed `AtomId`, node/edge и edge/edge incidence, identity/revision,
   `Graph<Mutable>`/`Graph<Frozen>` и корневой re-export; специализированные storage families,
@@ -601,9 +606,9 @@ Disk-backed режим 2. Зависит от A.
 | **P1** (блокирующий) | A       | `src/values/runtime`                      | ✅ Runtime-фундамент, `ValueKind`, scalars и collections            |
 | **P1**               | A       | `src/values/storage`                      | `StorageValue`, `TypeTag`, canonical codec и decode limits          |
 | **P1**               | A       | `src/values/runtime/record_id.rs`         | ✅ `RecordId`, `RecordIdPart`                                       |
-| **P2**               | A       | `src/values/columnar`                     | `PropertyBatch`, Arrow/presence, затем DataFusion                   |
+| **P2**               | A       | `src/values/columnar`                     | ✅ `PropertyBatch`, Arrow/presence и DataFusion adapter             |
 | **P2**               | A       | `src/values/runtime/graph`                | Graph family/type-state, Path и query return contracts              |
-| **P2**               | A       | `src/ecs`                                 | SparseSet, WorldComponents, PropertyColumn и GraphWorkspace         |
+| **P2**               | A       | `src/ecs`                                 | ✅ ECS foundation; далее revision-bound `GraphWorkspace`           |
 | **P2** (высокий)     | B       | `src/storage/`                            | `PageManager`, `DiskMetaGraph`, все типы страниц                    |
 | **P2**               | C       | frame-WAL                                 | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
 | **P2**               | H, I    | `src/syn`, binder, typechecker, lowering  | Фронтенд → AST → IR                                                 |
@@ -623,9 +628,9 @@ Disk-backed режим 2. Зависит от A.
 
 - **Фаза 0 — синхронизация спецификаций**: ✅ завершена; нормативные контракты values,
   graph/path/live и storage codec согласованы.
-- **Фаза 1 — фундамент типов** (P1): runtime-часть Области A, затем StorageValue/codec.
-- **Фаза 1.5 — свойства и ECS sidecar** (P2): PropertyMap benchmarks/dictionary,
-  generation-aware SparseSet, PropertyColumn и GraphWorkspace foundation.
+- **Фаза 1 — фундамент типов** (P1): ✅ runtime-часть Области A; далее StorageValue/codec.
+- **Фаза 1.5 — свойства и ECS sidecar** (P2): ✅ PropertyMap benchmarks/dictionary,
+  generation-aware SparseSet и PropertyColumn; `GraphWorkspace` продолжается в этапе 4.
 - **Фаза 2 — страничное хранилище** (P2): Область B + интеграция BufferPool.
 - **Фаза 3 — журнал и восстановление** (P2): Область C + D (снимки, чтение на снимке).
 - **Фаза 4 — query-конвейер MVP** (P2–P3): H → I → J/K/L, доведение `Datastore::execute`

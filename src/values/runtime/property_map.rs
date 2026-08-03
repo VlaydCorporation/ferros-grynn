@@ -26,6 +26,12 @@ impl PropertyKeyId {
 	}
 }
 
+impl fmt::Display for PropertyKeyId {
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+		fmt::Display::fmt(&self.0, formatter)
+	}
+}
+
 impl From<u32> for PropertyKeyId {
 	fn from(value: u32) -> Self {
 		Self(value)

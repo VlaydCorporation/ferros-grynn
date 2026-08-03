@@ -620,6 +620,51 @@ define_status_codes!(
 		subcondition: "invalid composite record ID",
 		message: "A composite record ID must contain a valid JSON string, array, or object.",
 	},
+	ColumnarTypeConflict, "FG-22F16" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "incompatible property column values",
+		message: "Property {key_id} cannot be materialized as one Arrow column because types {left} and {right} are incompatible.",
+		params: {
+			key_id: u64 => DisplayValue,
+			left: String => ValueType,
+			right: String => ValueType,
+		},
+	},
+	UnsupportedColumnarValue, "FG-22F17" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "unsupported property column value",
+		message: "Property {key_id} contains {value_type}, which cannot yet be materialized in an Arrow property batch.",
+		params: {
+			key_id: u64 => DisplayValue,
+			value_type: String => ValueType,
+		},
+	},
+	InvalidPropertyBatch, "FG-22F18" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "invalid property batch",
+		message: "The property batch is invalid: {reason}.",
+		params: {
+			reason: String => DisplayValue,
+		},
+	},
 	AtomDoesNotExist, "FG-G1F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -712,6 +757,17 @@ define_status_codes!(
 			atom_type: String => ValueType,
 		},
 	},
+	PropertyDictionaryCapacityExceeded, "FG-54F04" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Value,
+		subcondition: "property dictionary capacity exceeded",
+		message: "The property dictionary has exhausted the available 32-bit key space.",
+	},
 	QueryParseError, "FG-42001" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -738,6 +794,34 @@ define_status_codes!(
 		message: "Component {component} failed while performing {operation}.",
 		params: {
 			component: String => Identifier,
+			operation: String => StringLiteral,
+		},
+	},
+	ArrowPropertyBatchFailure, "FG-50F01" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GeneralProcessingException,
+		domain: Domain::Value,
+		subcondition: "Arrow property batch processing failed",
+		message: "Apache Arrow failed while attempting to {operation} a property batch.",
+		params: {
+			operation: String => StringLiteral,
+		},
+	},
+	DataFusionPropertyBatchFailure, "FG-50F02" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GeneralProcessingException,
+		domain: Domain::Value,
+		subcondition: "DataFusion property batch processing failed",
+		message: "Apache DataFusion failed while attempting to {operation} a property batch.",
+		params: {
 			operation: String => StringLiteral,
 		},
 	}
@@ -937,5 +1021,14 @@ mod tests {
 		assert_eq!(graph.code().to_string(), "FG-54F03");
 		assert_eq!(graph.condition(), Condition::ProgramLimitExceeded);
 		assert_eq!(graph.domain(), Domain::Graph);
+
+		let columnar = StatusObject::new(Status::columnar_type_conflict(7, "integer", "string"));
+		assert_eq!(columnar.code().to_string(), "FG-22F16");
+		assert_eq!(columnar.domain(), Domain::Value);
+
+		let dictionary = StatusObject::new(Status::property_dictionary_capacity_exceeded());
+		assert_eq!(dictionary.code().to_string(), "FG-54F04");
+		assert_eq!(dictionary.condition(), Condition::ProgramLimitExceeded);
+		assert_eq!(dictionary.domain(), Domain::Value);
 	}
 }

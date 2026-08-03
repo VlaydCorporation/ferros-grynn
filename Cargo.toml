@@ -5,8 +5,10 @@ members = [
 ]
 
 [workspace.dependencies]
-ferros-grynn = { path = "." }
+ferros-grynn = { path = ".", default-features = false }
 ferros-grynn-macros = { path = "crates/ferros-grynn-macros" }
+arrow = { version = "58.4.0", default-features = false }
+datafusion = { version = "54.1.0", default-features = false }
 
 
 [package]
@@ -24,6 +26,11 @@ keywords = [
     "graph-store",
 ]
 categories = ["database-implementations", "data-structures", "embedded"]
+
+[features]
+default = ["columnar", "datafusion"]
+columnar = ["dep:arrow"]
+datafusion = ["columnar", "dep:datafusion"]
 
 # -------------------- System API --------------------
 [target.'cfg(windows)'.dependencies]
@@ -71,6 +78,8 @@ thin-vec = "0.2.19"
 reblessive = "0.4.3"
 
 # --------- Data ---------
+arrow = { workspace = true, optional = true }
+datafusion = { workspace = true, optional = true }
 bytes = "1.12.1"
 compact_str = { version = "0.9.1", features = ["rkyv"] }
 geo = "0.33.1"

@@ -112,6 +112,19 @@ present=1, valid=1    → значение
 - Schemafull-свойства материализуются в нативные Arrow arrays.
 - Schemaless-колонка получает вычисленный общий тип; несовместимые значения кодируются как dense union либо `Binary(StorageValue)` по явно зафиксированному fallback.
 - DataFusion подключается только к batch-слою. Его `ScalarValue` не используется внутри `Value`: nested scalar фактически хранится как одноэлементный Arrow array, а документация рекомендует пакетные arrays для производительности. [ScalarValue](https://docs.rs/datafusion/latest/datafusion/common/scalar/enum.ScalarValue.html).
+- Реализация использует совместимую линейку `arrow 58.4` + `datafusion 54.1`; зависимости
+  feature-gated (`columnar`, `datafusion`), поэтому runtime можно собирать без аналитического
+  стека.
+- Текущий Arrow round-trip нативно покрывает `bool`, `int`, `float`, `decimal`, `string`,
+  `bytes`, `uuid`, `ulid`; несовместимые поддержанные scalar-типы сохраняются как dense union
+  без неявной coercion. Nested/runtime-only значения получают доменную ошибку до появления
+  `Binary(StorageValue)` fallback на этапе 5.
+- DataFusion получает отдельные скрытые `__fg_presence_<key_id>` boolean-поля: планировщик
+  по-прежнему может различить `IS NONE` и `IS NULL`, хотя Arrow validity представляет оба
+  состояния как null.
+- Parquet persistence не входит в этот этап. Когда появится его контракт, использовать
+  официальный `parquet` Arrow API (`ArrowWriter`/batch reader). `parquet_derive` предназначен
+  для простых плоских Rust-records и не заменяет `PropertyBatch` с presence sidecars.
 
 ### ECS и материализованные свойства
 
@@ -363,7 +376,7 @@ pub struct LiveGraph<State = Frozen>;
 - конфликтующее обновление не применяется и не коммитится автоматически;
 - event stream возвращает отдельную ветку:
 
-```rust
+```ignore
 LiveEvent::Conflict {
     incoming_changes,
     local_changes,
@@ -428,23 +441,31 @@ LiveEvent::Conflict {
     - Реализованы `Array`, `Bytes`, `Set`, `Object`, `Range`.
     - Реализован `RecordId` с int/string/uuid/ulid/array/object частями, parsing и рекурсивной проверкой допустимости.
     - Из `fg-meta` перенесён необходимый graph foundation: bit-packed `AtomId` в актуальной раскладке `gen(23) | kind(1) | slot(40)`, general SoA, node/edge и edge/edge incidence, identity/revision, `Graph<Mutable>`/`Graph<Frozen>`, `GraphRef`; API реэкспортирован как корневой `graph`. Алгоритмы, специализированные storage families, Path и LiveGraph остаются этапом 4.
-    - Добавлены отдельный sorted `ThinVec`-based `PropertyMap` и `PropertyKeyId`, необходимые graph foundation; dictionary и columnar integration остаются этапом 3.
+    - Добавлены отдельный sorted `ThinVec`-based `PropertyMap` и `PropertyKeyId`, необходимые graph foundation; dictionary и columnar integration реализованы следующим этапом 3.
     - Fallible API `Text`, `Geometry`, `RecordId` и graph foundation возвращает
       `FerrosGrynnResult`; value-ошибки имеют `Domain::Value`, а ошибки внешних parser crates
       сохраняются только как redacted `technical_source`.
     - Runtime-only `Closure` и `Regex` добавлены последними; `Value::ensure_storable` отклоняет runtime-only и материализованные graph-значения диагностической ошибкой.
     - Runtime покрыт unit- и property-based тестами законов `Eq`/`Ord`/`Hash`; `cargo check`, Clippy и library/integration tests проходят.
 
-3. **PropertyMap и columnar**
-    - Реализовать dictionary; benchmark target сравнивает production sorted `ThinVec`, прежний
-      boxed/tagged hybrid, настоящий inline hybrid, `Vec`, `BTreeMap` и `RapidHashMap` на размерах
-      0/1/4/8/9/16/32/128.
-    - По измерениям latency/throughput/allocation пересматривать representation, не меняя
-      публичный API или disk format. Порог inline → hash больше не является исходным допущением.
-    - Реализовать ECS foundation: paged generation-aware `SparseSet`, `AnyPool`,
-      `WorldComponents` и `(PropertyKeyId, TypeId)` materialized property pools.
-    - Реализовать `PropertyBatch`, presence bitmaps и Arrow conversion.
-    - Подключить DataFusion только после проверки Arrow round-trip и `none`/`null`.
+3. **PropertyMap и columnar — ✅ выполнено**
+    - Реализован двунаправленный `PropertyDictionary`; benchmark target сравнивает production
+      sorted `ThinVec`, прежний boxed/tagged hybrid, настоящий inline hybrid, `Vec`, `BTreeMap` и
+      `RapidHashMap` на размерах 0/1/4/8/9/16/32/128.
+    - Representation остаётся pointer-sized sorted `ThinVec` по результатам измерений;
+      публичный API и disk format от representation не зависят.
+    - Старый `Registry<Entity>` заменён на paged generation-aware `SparseSet<AtomId>` с
+      отдельными node/edge sparse pages, полной проверкой generation, `AnyPool`,
+      `WorldComponents`, `(PropertyKeyId, TypeId)` property pools и read-only join по фактически
+      наименьшему pool.
+    - Реализован `PropertyColumn<T>` с независимыми presence/validity и тремя состояниями
+      `none`/`null`/value.
+    - Добавлен Criterion target `ecs`: paged `SparseSet` сравнивается с `RapidHashMap` по build,
+      lookup и dense iteration на 128/4096/65536 компонентах.
+    - Реализован `PropertyBatch`: `RecordBatch`, битовые presence sidecars, двунаправленный
+      `PropertyKeyId ↔ Arrow field`, metadata validation, native scalar arrays и dense union.
+    - DataFusion подключён только поверх прошедшего Arrow round-trip; memory table получает
+      скрытые presence-поля. Nested `Binary(StorageValue)` fallback зависит от этапа 5.
 
 4. **Графовое ядро**
     - Перенести универсальное поведение `fg-meta`.
@@ -520,6 +541,8 @@ LiveEvent::Conflict {
 - `Object`: `BTreeMap`, `RapidHashMap`, `IndexMap`;
 - `PropertyMap`: production sorted `ThinVec`, boxed/tagged hybrid, direct inline hybrid,
   sorted `Vec`, `BTreeMap`, `RapidHashMap`;
+- ECS component pool: paged generation-aware `SparseSet` против `RapidHashMap` по build,
+  all-hit lookup и dense iteration;
 - mutable/frozen representations каждой storage family;
 - traversal general Graph против Tree/Forest/Dag;
 - freeze/thaw и cross-family conversion;

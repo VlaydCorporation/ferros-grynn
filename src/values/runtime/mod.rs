@@ -6,6 +6,7 @@ pub mod graph;
 mod id;
 mod number;
 mod object;
+mod property_dictionary;
 mod property_map;
 mod range;
 mod record_id;
@@ -42,6 +43,7 @@ pub use graph::{
 pub use id::{Ulid, Uuid};
 pub use number::Number;
 pub use object::Object;
+pub use property_dictionary::PropertyDictionary;
 pub use property_map::{PropertyIter, PropertyKeyId, PropertyMap};
 pub use range::Range;
 pub use record_id::{RecordId, RecordIdPart};

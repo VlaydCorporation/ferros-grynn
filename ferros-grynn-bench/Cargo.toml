@@ -12,8 +12,12 @@ harness = false
 name = "property_map"
 harness = false
 
+[[bench]]
+name = "ecs"
+harness = false
+
 [dependencies]
-ferros-grynn = { workspace = true }
+ferros-grynn = { workspace = true, default-features = false }
 
 [dev-dependencies]
 # benchmarking helpers

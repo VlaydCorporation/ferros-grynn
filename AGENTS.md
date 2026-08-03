@@ -118,7 +118,7 @@ The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optim
 
 ## Code Quality Rules
 
-- Use types errors from `src/gql_status` for fallible APIs, don't use `anyhow` - it erases errors.
+- Use types errors from `src/gql_status` for fallible APIs, don't use `anyhow` - it erases errors; NEWER use `.expect()` or another panics.
 - Never use `.unwrap_or_default()` when debugging - it masks errors.
 - Performance matters: think about impact of every change.
 - Don't add dependencies without confirmation.

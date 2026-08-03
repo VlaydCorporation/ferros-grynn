@@ -101,7 +101,7 @@ Proc-macro обязан отклонять неверный формат, дуб
 
 Статусы объявляются только через `define_status_codes!`:
 
-```rust
+```ignore
 ConversionError, "FG-22N37" => {
 	kind: Error {
 		classification: ErrorClassification::ClientError,
