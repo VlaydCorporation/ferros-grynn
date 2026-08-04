@@ -1369,6 +1369,13 @@ RELATE @from_atom [<- | - | ->] @edge_atom [<- | - | ->] @to_atom
 ;
 ```
 
+По умолчанию оба endpoint'а бинарного `RELATE` после binding должны быть vertex-атомами.
+`RELATE ATOM` использует incidence-маркеры: `(...)` требует vertex endpoint, `[...]` —
+edge/metaedge endpoint. Это разрешает V–E, E–V и E–E endpoint-инцидентность; несовпадение
+маркера с фактическим kind является semantic error до мутации. Направления `~[...]~>`,
+`<~[...]~`, `~[...]~`, `<~[...]~>` зеркальны четырём направлениям обычного `RELATE`.
+`ATOM` не превращает ребро в гиперребро и не снимает проверку существования endpoint'ов.
+
 **Направление** задаётся стрелками вокруг метки ребра:
 
 | Синтаксис        | Топология                   |
@@ -2995,17 +3002,22 @@ Pipeline начинается с исходного набора и послед
 `TRAVERSE` — явный старт traversal pipeline.
 
 ```
-TRAVERSE [ ATOM ] @source
+TRAVERSE [ ATOM ] [ CONSTRAINTS <@path_constraints> ] @source
     |> step(...)
     |> step(...)
 ;
 
-@source ::= 
+@source ::=
     FROM @graph |> @source_step    -- Граф-источник, за которым обязательно следует шаг, генерирующий исходный набор (см. "Навигация" в §13.4)
     | FROM @record_id           -- Начать с конкретного атома
     | FROM MATCH @pattern       -- Использовать MATCH как источник (смешанный стиль)
     | FROM SELECT ...           -- Использловать SELECT как источник (смешанный стиль)
 ```
+
+Глобальные `CONSTRAINTS` применяются ко всем шагам, которые порождают путь. Для шага без
+собственного path mode действует `TRAIL`; локальный mode/objective/filter шага переопределяет
+соответствующую глобальную составляющую. Несовместимые objective или несколько path mode на
+одном уровне являются ошибкой semantic analysis, а не правилом «последний победил».
 
 #### Роль TRAVERSE и отличия от SELECT и MATCH
 
@@ -4984,7 +4996,7 @@ Scan(a)
         edge_labels=[F],
         min=1,
         max=3,
-        mode=Walk,
+        mode=Trail,
         alias_path=p,
         alias_end=b
    )

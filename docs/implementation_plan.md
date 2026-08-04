@@ -65,17 +65,17 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | Direct/Async I/O, BufferPool (Clock-Pro)                                                                                             | `disk` §2                              | `fg-meta` `io_sync`/`io_async`/`async_io`, `buffer_pool.rs`; `crates/storage_engine/io`                      | 🟢 / 🟡                                                     |
 | Подграфы (`SubGraph`, `TreeSubGraph`, `DagSubGraph`, …)                                                                              | `gql_spec` §16                         | `fg-meta` `subgraph.rs`                                                                                      | 🟢 референс                                                 |
 | Алгоритмы traversal (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA/MST/cuts)                                                                 | `gql_spec` §13.4                       | `fg-meta` `traversal.rs`                                                                                     | 🟢 референс                                                 |
-| Лексер / парсер (reblessive, `TokenBuffer<4>`)                                                                                       | `gql_grammar`                          | `src/syn` (`lexer`/`parser`/`token`/`error`)                                                                 | 🟡 каркас                                                   |
-| AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/gql/ast.rs`, `src/gql/expression.rs`                                                                    | 🟡 каркас                                                   |
-| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/gql/ds.rs`                                                                                              | 🟡 тело TODO                                                |
-| Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql/traversal`                                                                                          | 🟡 каркас                                                   |
+| Лексер / парсер (reblessive, `TokenBuffer<4>`)                                                                                       | `gql_grammar`                          | `src/syn` (`lexer.rs`, `parser.rs`, `ast.rs`)                                                                | 🟡 read-only срез                                           |
+| AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/syn/ast.rs`; публичный вход `gql::parse`                                                                | 🟡 read-only срез                                           |
+| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/gql`; `QueryResult` готов, `Datastore` ещё не подключён                                                 | 🟡 внутренний executor                                     |
+| Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql` (будущий вертикальный этап)                                                                        | 🔴 новое                                                    |
 | `PageManager` / `DiskMetaGraph` / disk-страницы                                                                                      | `gql_tech` §10; формат — `disk` §9–§21 | `crates/storage_engine` (`store`, `layout`): `NodeRecord`/`EdgeRecord`/`PropertyRecord`, `FerrosGrynnLayout` | 🟡 каркас                                                   |
 | `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`                                                    | 🟡 runtime `RecordId` готов; disk refs — новые              |
 | `SchemaCatalog`                                                                                                                      | `disk` §18                             | `src/schema` (нов.)                                                                                          | 🔴 новое                                                    |
 | `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats` (нов.)                                                                                           | 🔴 новое                                                    |
 | Индексы (Label/BTree/Count/Fulltext/HNSW/R-tree/…)                                                                                   | `disk` §20                             | `src/index` (нов.)                                                                                           | 🔴 новое                                                    |
 | Changefeed / Live                                                                                                                    | `gql_spec` §21, `disk` §21             | `src/changefeed` (нов.)                                                                                      | 🔴 новое                                                    |
-| Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql`                                                                                                    | 🔴 новое                                                    |
+| Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql` (`analysis.rs`, `ir.rs`, `execution.rs`)                                                           | 🟡 read-only срез; optimizer/traversal впереди              |
 
 ### 1.2. Требует согласования / открытые вопросы
 
@@ -187,7 +187,7 @@ src/
 
 ### 3.1. `Value` — система типов значений (🟢 P1)
 
-Детальный порядок работ — [plan.md](plan.md). Публичный runtime использует типы без суффикса
+Детальный порядок работ — [values_plan.md](values_plan.md). Публичный runtime использует типы без суффикса
 `Value`: `Array`, `Bytes`, `Set`, `Object`, `Range`, `Duration`, `DateTime`, `Path`, `Graph`
 и т. д. Строки — доменный `Text` над `CompactString`; decimal — `rust_decimal::Decimal` внутри `Number`.
 
@@ -211,7 +211,7 @@ pub enum Value {
     Range(Range),
     Geometry(Geometry),
     Vector(Vector),
-    // graph/domain/runtime-only variants добавляются по этапам plan.md
+    // graph/domain/runtime-only variants добавляются по этапам values_plan.md
 }
 ```
 
@@ -446,7 +446,7 @@ codec на этапе 5.
 - **`src/values/runtime/graph`** 🟡/🟢 reference — реализованы general SoA foundation,
   bit-packed `AtomId`, node/edge и edge/edge incidence, identity/revision,
   `Graph<Mutable>`/`Graph<Frozen>` и корневой re-export; специализированные storage families,
-  conversions, PathTrace/Path и LiveGraph остаются этапом 4 [plan.md](plan.md).
+  conversions, PathTrace/Path и LiveGraph остаются этапом 4 [plan.md](values_plan.md).
 - **`src/storage`** 🟡 — `DiskAtomRef(u64)` и
   `QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }`; перенос `crates/storage_engine`
   выполняется после стабилизации value codec.
@@ -526,18 +526,25 @@ Disk-backed режим 2. Зависит от A.
 
 ### Область H. Query frontend (лексер / парсер) — P2
 
-- **`src/syn`** 🟡 — довести лексер/парсер (reblessive, stackless, `TokenBuffer<4>`) до полной
-  грамматики (`gql_grammar.md`) → `AST`; ошибки с рендерингом позиции.
+- **`src/syn`** 🟡 — реализован fail-fast lexer/parser (reblessive, stackless,
+  `TokenBuffer<4>`) для `LET`, `RETURN`, read-only `SELECT`, выражений, массивов/объектов,
+  postfix/cast и record target. AST владеет строками и `TextSpan`, но не source/runtime values.
+  Известные неподдержанные statements возвращают `QueryFeatureNotSupported`; следующие семьи
+  добавляются только вместе с analysis/IR/execution-потребителем.
+- **Проверки** 🟢 — Unicode byte spans, greedy operators, gap-sensitive `table:id`, приоритеты,
+  незакрытый delimiter с related location, лимит глубины и proptest `parser never panics`.
 
 ### Область I. Семантический анализ (binding / typing / lowering) — P2
 
 Зависит от H, A.
 
-- **Binder** 🔴 — scope/alias (`gql_tech_spec.md` §4.1).
-- **Typechecker** 🔴 — type inference, разрешение перегрузки `number` (`int`/`float`/`decimal`) на
-  этапе анализа, двухзначная sentinel-семантика `null`/`none`, classification purity, проверка
-  computed-полей; `option<T>` стирается в `T | none`.
-- **Lowering AST → IR** 🔴 — логический IR (§5), две под-алгебры (join engine ↔ traversal VM).
+- **Binder** 🟡 — реализованы slots для входных параметров/`LET` и позиционные slots колонок
+  источника; unknown field/parameter завершается в `SemanticAnalysis` до запуска cursor.
+- **Typechecker** 🟡 — реализован направленный вывод для первого среза и локальная унификация
+  `number`, `option` и union. Общий HM-solver откладывается до closures/UDF.
+- **Lowering AST → IR** 🟡 — arena `Vec<LogicalNode>` + `NodeId`; узлы `Scan`, `Filter`,
+  `Project`, `Limit`, отдельные logical statements для `LET`/`RETURN`. IR хранит типы и spans,
+  но не токены и lexemes.
 
 ### Область J. Оптимизатор — P3
 
@@ -549,12 +556,17 @@ Disk-backed режим 2. Зависит от A.
 
 ### Область K. Физическое исполнение — P3
 
-Зависит от J, B.
+Первый эталонный read-only путь не зависит от optimizer или незрелого storage engine; реальная
+storage-интеграция зависит от B.
 
-- **Физические операторы** 🔴 — Scan, Filter, Expand/PathExpand, Join (Index NL для MVP; Hash),
-  Project; late materialization и доступ к свойствам; vectorized (`next_batch`) + push-based
-  (§3.4); pipeline-breakers (Join build, GROUP BY, SORT, DISTINCT).
-- **`Datastore::execute`** 🟡 — собрать тело: план → операторы → `Vec<QueryResult>`.
+- **Физические операторы** 🟡 — эталонный sync pull `RowCursor::next`; реализованы
+  `ScanCursor`, `FilterCursor`, `ProjectCursor`, `LimitCursor`, позиционный `Row<Vec<Value>>`.
+- **Storage boundary** 🟡 — crate-private `QueryRead` (`snapshot`, `catalog`, `scan`, `get`) и
+  тестовый adapter; наружу идут только декодированные `Value` и `RecordId`, не `TypeTag`/`AtomId`.
+- **`QueryResult`** 🟡 — kind, elapsed time и `FerrosGrynnResult<Outcome<Value>>`; подключение
+  `Datastore::execute` выполняется после утверждения `PageManager` adapter.
+- **Batch/Arrow/async/parallel** 🔴 — только после измерений; row pull остаётся эталоном
+  корректности.
 - Кооперативная отмена и таймауты (`TIMEOUT`/`statement_timeout_ms`).
 
 ### Область L. Traversal VM — P3
@@ -611,10 +623,10 @@ Disk-backed режим 2. Зависит от A.
 | **P2**               | A       | `src/ecs`                                 | ✅ ECS foundation; далее revision-bound `GraphWorkspace`           |
 | **P2** (высокий)     | B       | `src/storage/`                            | `PageManager`, `DiskMetaGraph`, все типы страниц                    |
 | **P2**               | C       | frame-WAL                                 | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
-| **P2**               | H, I    | `src/syn`, binder, typechecker, lowering  | Фронтенд → AST → IR                                                 |
+| **P2**               | H, I, K | `src/syn`, analysis, IR, sync pull        | ✅ read-only `LET`/`RETURN`/`SELECT`; далее clauses/MATCH            |
 | **P3** (средний)     | E       | `src/schema/`                             | `SchemaCatalog`                                                     |
 | **P3**               | G       | `src/index/`                              | `LabelIndex`, `BTreeIndex`, `CountIndex`, bulk-сборка               |
-| **P3**               | J, K, L | оптимизатор, физ. операторы, Traversal VM | `Datastore::execute` end-to-end (режим 1)                           |
+| **P3**               | J, K, L | optimizer, storage adapter, Traversal VM  | `Datastore::execute` поверх утверждённого `PageManager`             |
 | **P4** (нормальный)  | F       | `src/stats/`                              | `StatisticsStore`                                                   |
 | **P4**               | G       | `src/index/fulltext.rs`                   | `FulltextIndex` (BM25)                                              |
 | **P4**               | N       | `fg-meta` граф-ядро                       | Полная инцидентность                                                |

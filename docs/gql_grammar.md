@@ -396,7 +396,7 @@ delete_stmt ::= "DELETE" target_list
 ### 5.4. RELATE
 
 ```ebnf
-relate_stmt ::= "RELATE" ( relate_binary | relate_hyper )
+relate_stmt ::= "RELATE" ( relate_binary | relate_atom | relate_hyper )
                 [ "WEIGHTED" expr ]
                 [ content_or_set ]
                 [ mutate_return ]
@@ -411,6 +411,14 @@ edge_dir_left  ::= "<-" | "-"
 edge_dir_right ::= "->" | "-"
 (* Комбинации: -[:E]->  (a→b) | <-[:E]-  (b→a) | -[:E]-  (undirected) | <-[:E]->  (bidirectional) *)
 
+relate_atom ::= "ATOM" atom_relate_endpoint atom_edge_dir_left
+                edge_atom atom_edge_dir_right atom_relate_endpoint
+atom_relate_endpoint ::= "(" ( record_id | idiom | param ) ")"
+                       | "[" ( record_id | idiom | param ) "]"
+atom_edge_dir_left  ::= "<~" | "~"
+atom_edge_dir_right ::= "~>" | "~"
+(* () требует vertex endpoint; [] требует edge endpoint. Направления зеркальны relate_binary. *)
+
 relate_hyper ::= "HYPER" edge_atom "TARGETS" "[" relate_target_list "]"
                  [ hyper_direction ]
 relate_target_list ::= relate_endpoint { "," relate_endpoint }
@@ -421,6 +429,9 @@ hyper_headtail ::= "(" "head" ":" expr "," "tail" ":" array_lit ")"
 ```
 
 `WEIGHTED` задаёт вес (`duration` — для темпоральных графов, иначе `number`).
+Обычный `relate_binary` после binding требует vertex endpoint'ы. В `relate_atom` скобки `(...)`
+требуют vertex, `[...]` — edge/metaedge. Маркеры участвуют в typecheck, но не являются частью
+`RecordId`. `ATOM` не меняет тип создаваемого ребра и не применяется к `relate_hyper`.
 
 ---
 
@@ -544,7 +555,8 @@ edge_inner     ::= [ alias ] [ ":" label_expr ]
 ## 7. Traversal Pipeline
 
 ```ebnf
-traverse_stmt ::= "TRAVERSE" [ "ATOM" ] traverse_source pipeline_tail [ traverse_return ]
+traverse_stmt ::= "TRAVERSE" [ "ATOM" ] [ constraints_clause ]
+                  traverse_source pipeline_tail [ traverse_return ]
 
 traverse_source ::=
       "FROM" graph_expr pipeline_step        (* граф-источник + первый порождающий шаг *)
@@ -994,7 +1006,7 @@ arg       ::= [ ident "=" ] expr                (* именованные арг
 ```ebnf
 closure        ::= "|" [ closure_param_list ] "|" [ "->" type ] closure_body
 closure_param_list ::= closure_param { "," closure_param }
-closure_param  ::= param [ ":" type ]
+closure_param  ::= ( param | ident ) [ ":" type ]
 closure_body   ::= block | expr
 ```
 

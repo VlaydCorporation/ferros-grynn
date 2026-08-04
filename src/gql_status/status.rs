@@ -782,6 +782,48 @@ define_status_codes!(
 			message: String => DisplayValue,
 		},
 	},
+	QueryFeatureNotSupported, "FG-50F03" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Planning,
+			severity: Severity::Error,
+		},
+		condition: Condition::GeneralProcessingException,
+		domain: Domain::Query,
+		subcondition: "feature not supported",
+		message: "Query feature {feature} is not supported yet.",
+		params: {
+			feature: String => Identifier,
+		},
+	},
+	QueryTextTooLarge, "FG-54F05" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Syntax,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Query,
+		subcondition: "query text size limit exceeded",
+		message: "Query text exceeds the maximum size of {maximum_bytes} bytes.",
+		params: {
+			maximum_bytes: u64 => DisplayValue,
+		},
+	},
+	QueryNestingTooDeep, "FG-54F06" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Syntax,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Query,
+		subcondition: "query nesting limit exceeded",
+		message: "Query nesting exceeds the maximum depth of {maximum_depth}.",
+		params: {
+			maximum_depth: u64 => DisplayValue,
+		},
+	},
 	UnexpectedExternalFailure, "FG-50F00" => {
 		kind: Error {
 			classification: ErrorClassification::DatabaseError,

@@ -67,7 +67,9 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 - **`PageManager`** ([implementation_plan.md](implementation_plan.md) §3.3) — страничный I/O под frame-WAL: `begin_tx`/`commit_tx`/`abort_tx`, `alloc_page`, `free_page`, `read_page` (параметризовано снимком), `write_frame`, `checkpoint`.
 - **`Index`** (`disk_storage_spec.md` §20.1) — единый интерфейс индексов: `insert`, `delete`, `lookup`, `range`, `rebuild`, `status`.
 - **`TransactionLogSink`** — приёмник WAL-записей (append + fsync-барьеры).
-- **`Operator`** (§7, §9) — узел плана исполнения: `next_batch() -> Option<Batch>`.
+- **`RowCursor`** (§7, §9) — эталонный sync pull-контракт:
+  `next() -> FerrosGrynnResult<Option<Row>>`. Batch-оператор добавляется поверх него после
+  измерений и не меняет семантику плана.
 - **`StorageIo`** (`SyncIo` / `AsyncIo` из `fg-meta`) — Direct I/O с опциональной async-обёрткой.
 
 Интерфейсы фиксируют, что система обязана уметь, где проходят её границы, и какие инварианты держатся.
@@ -84,7 +86,10 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 ## 2. Конвейер обработки запроса
 
-Точка входа — `Datastore::execute(text: &str, vars: Option<Variables>) -> Vec<QueryResult>` (`src/gql/ds.rs`). Каждый оператор верхнего уровня возвращает свой `QueryResult { time, query_type, result: FerrosGrynnResult<Value> }` (`src/dbs/response.rs`).
+Публичный parser-вход — `gql::parse(text, ParserSettings) -> FerrosGrynnResult<Program>`.
+После подключения datastore точкой исполнения становится
+`Datastore::execute(text, variables) -> Vec<QueryResult>`. Каждый оператор верхнего уровня
+возвращает `QueryResult { kind, elapsed, result: FerrosGrynnResult<Outcome<Value>> }`.
 
 Конвейер (соответствует диаграмме §22.1 `gql_spec.md`):
 
@@ -119,24 +124,30 @@ QueryResult (Value)
 
 ## 3. Фронтенд: лексер и парсер
 
-Реализация — `src/syn` (`lexer`, `token`, `parser`, `error`). Архитектура заимствована из SurrealQL-подхода и адаптирована под GrynQL-грамматику.
+Реализация — `src/syn` (`lexer.rs`, `ast.rs`, `parser.rs`). AST и parser не зависят от storage и
+runtime `Value`; публичный facade находится в `src/gql/mod.rs`.
 
 ### 3.1. Лексер
 
-- Токены соответствуют лексической грамматике `gql_grammar.md` §2: идентификаторы (в т.ч. `` `quoted` ``), параметры `$x`, пространства имён `ns::ident`, числа (`int`/`float`), строки (`'…'`, `"…"`, `"""…"""`), темпоральные литералы (`d'…'`, длительности), `record_id`, коллекции.
-- **Span** — `{ offset: u32, len: u32 }` (`src/syn/token`). Ограничение: запрос ≤ `u32::MAX` байт (иначе `FerrosGrynnError::query_too_large()`).
-- Составные токены (`d'…'`, regex, длительности) лексируются лениво через `lex_compound` — по стартовому токену вызывается специализированный дочерний лексер.
-- Пробелы значимы **только** между соседними токенами там, где грамматика это требует (`record_id` = `table:id` без пробела; `follows_from` в парсере). Для этого лексер сохраняет whitespace-разделение, а `peek_whitespace*` в парсере это учитывает.
+- Первый срез лексирует Unicode/quoted identifiers, параметры, числа, строки, комментарии,
+  delimiters и жадные семейства операторов. Темпоральные/regex/прочие compound literals
+  добавляются вместе с соответствующей parser + analysis + execution веткой.
+- **Span** — `gql_status::TextSpan { offset: u32, len: u32 }` в UTF-8 байтах. Запрос длиннее
+  `u32::MAX` отклоняется до лексинга статусом `QueryTextTooLarge`.
+- Пробелы/комментарии значимы **только** между соседними токенами там, где грамматика это
+  требует (`record_id` = `table:id` без gap). Токен хранит `gap_before`; исходный текст в AST
+  не удерживается.
 
 ### 3.2. Парсер
 
 `Parser<'a>` (`src/syn/parser`) — рекурсивный нисходящий парсер поверх **`reblessive`** (stackless async-рекурсия). Это принципиально: GrynQL допускает глубоко вложенные подзапросы, блоки, объекты и pipeline; stackless-стек (`Stk`) избегает переполнения нативного стека на патологически вложенных запросах.
 
 Механика:
-- **`TokenBuffer<4>`** — буфер на 4 токена вперёд: `peek`, `peek1`, `peek2`, `peek_token_at(n)`. Даёт до `LL(4)` look-ahead без отката.
-- **`speculate()`** — спекулятивный разбор ветки с откатом (`backup_after`). Применяется только там, где ветку нельзя определить по n-му токену (см. неоднозначности `gql_grammar.md` §16). Отмечен как «мощный, но с недостатками» — по возможности предпочитать `peek`.
-- **`table_as_field`** — контекстный флаг для разрешения `ident` как имени таблицы vs поля.
-- Расширенные операторы разбираются по таблице приоритетов `gql_grammar.md` §12.1 методом **precedence-climbing (Pratt)**; результат — `Expr` (`src/gql/expression.rs`): `Literal`/`Param`/`Table`/`Range`/`Block`/`Constant`/`PrefixOp`/`PostfixOp`/`BinaryOp`/…
+- **`TokenBuffer<4>`** — look-ahead до четырёх токенов через `peek(n)` без отката.
+- Первый срез использует fail-fast recursive descent без recovery/speculation; неоднозначности
+  разрешаются позицией, look-ahead и gap-флагом.
+- Операторы выражений разбираются по точной таблице приоритетов `gql_grammar.md` §12.1 методом
+  Pratt; результат — owned `Expr` из `src/syn/ast.rs`.
 
 ### 3.3. Разрешение синтаксических неоднозначностей
 
@@ -153,13 +164,15 @@ QueryResult (Value)
 
 ### 3.4. Пределы разбора
 
-`ParserSettings` (`src/syn/parser`): `object_recursion_limit` (default 100 — глубина объектов/массивов), `query_recursion_limit` (default 20 — глубина вложенных операторов/блоков). Значения берутся из `Config` (`max_object_parsing_depth`, `max_query_parsing_depth`) через `settings_from_capabilities`. Эти лимиты — часть контракта предсказуемости (§1.1): защита от стек-бомб и от планов недопустимой сложности.
+`ParserSettings`: `max_object_parsing_depth` (default 100) и
+`max_query_parsing_depth` (default 20). Defaults берутся из одноимённых полей `Config`.
 
 ### 3.5. Ошибки парсинга
 
-Ошибки — `SyntaxError { diagnostic: Box<Diagnostic> }` (`src/syn/error`). `Diagnostic` — **цепочка** записей `DiagnosticKind::{Cause, Span{kind, span, label}}` (связаны через `next`), что позволяет накапливать контекст («ожидался разделитель», «этот делимитер должен был закрыться здесь»). При выдаче ошибка рендерится на исходных байтах (`render_on_bytes` → `RenderedError`/`Snippet`/`Location`, с подсветкой участка) и конвертируется в `FerrosGrynnError::query_parse_error(...)`.
-
-Это — часть общей диагностической системы `gql_status`: `StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError` (см. CLAUDE.md, `src/gql_status`). Синтаксические статусы — подкласс `ClientError` (§4.7 gql_spec).
+Парсер сразу возвращает `FerrosGrynnError`: `QueryParseError` с primary location и
+`ExecutionPhase::Parsing`; незакрытый delimiter добавляет related location открытия.
+Превышение лимитов и известная неподдержанная семья используют генерируемые
+`QueryNestingTooDeep`/`QueryFeatureNotSupported`. Локальной иерархии `SyntaxError` нет.
 
 ---
 
@@ -176,7 +189,9 @@ QueryResult (Value)
 
 ### 4.2. Фаза 2 — Type inference
 
-Типизация `Γ ⊢ expr : T` (§24 gql_spec). Алгоритм — Hindley–Milner с расширениями для графовых и record-типов.
+Типизация `Γ ⊢ expr : T` (§24 gql_spec). Первый read-only срез использует направленный вывод и
+локальную унификацию `number`, `option` и union. Общий Hindley–Milner solver вводится вместе с
+closures/UDF, когда появится его первый потребитель.
 
 Типовые домены (§59.2 gql_spec):
 1. Value: `int | float | decimal | string | bool | bytes | datetime | duration | …`
@@ -356,7 +371,8 @@ Cost-model **обязан** иметь degree statistics — без них гр�
 
 ### 7.1. Общая модель
 
-Все физические операторы — `Iterator<Row>` (async: `Stream<Row>`), собираемые в конвейер (§9). Row:
+Эталонный контракт физических операторов — синхронный pull:
+`RowCursor::next() -> FerrosGrynnResult<Option<Row>>`. Операторы собираются в конвейер (§9). Row:
 ```
 Row = { values: Vec<Value>, env: Env?, path: Path? }
 ```
@@ -497,15 +513,18 @@ VM поддерживает (§13.10): **data parallelism** (партицион�
 
 ## 9. Модель исполнения
 
-### 9.1. Гибрид vectorized + push-based
+### 9.1. Эталонный sync pull и последующая векторизация
 
 ```
 Execution = Pattern Engine (MATCH) + Traversal VM + Relational Engine
-Модель: vectorized (next_batch() → Batch) + push-based (operator pushes downstream)
+Baseline: sync pull (RowCursor::next() → Option<Row>)
 ```
-Vectorized даёт SIMD и cache-locality; push-based даёт pipeline-fusion и низкую latency. Оператор:
+Первый срез реализует `ScanCursor`, `FilterCursor`, `ProjectCursor`, `LimitCursor`. Он остаётся
+эталоном корректности. Vectorized даёт SIMD и cache-locality, но вводится только после измерений:
 ```rust
-trait Operator { fn next_batch(&mut self) -> Option<Batch>; }
+trait BatchOperator {
+    fn next_batch(&mut self) -> FerrosGrynnResult<Option<Batch>>;
+}
 ```
 
 ### 9.2. Данные исполнения
@@ -537,6 +556,11 @@ Runtime-решения: batch too large → split; skew → rebalance; выбо�
 ## 10. Взаимодействие исполнителя с хранилищем
 
 Этот раздел связывает исполнителя (§7–§9) с дисковым форматом (`disk_storage_spec.md`). Три режима хранения (`disk_storage_spec.md` §2).
+
+До подключения `PageManager` executor использует crate-private query-facing границу `QueryRead`:
+один `snapshot` на весь запрос, `catalog`, `scan` и `get`. `expand` добавляется с первым `MATCH`.
+Adapter обязан вернуть уже декодированные runtime `Value`; `StorageValue`, `TypeTag` и внутренний
+`AtomId` выше этой границы не проходят. На входе `get` используется публичный `RecordId`.
 
 ### 10.1. Режимы хранения
 
