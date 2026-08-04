@@ -1,0 +1,32 @@
+accept-comment-above-attributes = true
+accept-comment-above-statement = true
+allow-expect-in-consts = false
+allow-unwrap-in-consts = true
+
+min-ident-chars-threshold = 2
+allowed-idents-below-min-chars = ["..", "k", "id", "db", "tx"]
+
+cognitive-complexity-threshold = 30
+
+source-item-ordering = ["enum", "impl", "module", "struct", "trait"]
+trait-assoc-item-kinds-order = ["const", "type", "fn"]
+module-item-order-groupings = [
+    ["modules", [ "extern_crate", "mod", "foreign_mod", ]],
+
+    ["imports", [  "use", ]],
+
+    ["statics-and-constants", [ "static", ]],
+
+    ["type-aliases", [ "ty_alias", "opaque_ty", "trait_alias", ]],
+
+    ["types", [ "trait", "enum", "struct", "union", ]],
+
+    ["other", [ "macro", "global_asm", ]],
+
+    ["implementations", [ "impl", ]],
+
+    ["functions", [ "fn", ]],
+]
+module-items-ordered-within-groupings = "none"
+
+inherent-impl-lint-scope = "file"
