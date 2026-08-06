@@ -91,6 +91,12 @@ name         ::= ident | quoted_ident
 Обратные кавычки позволяют использовать произвольные Unicode-символы и зарезервированные слова как имена
 (таблиц, полей, меток, идентификаторов записей).
 
+`name` задаёт только лексическую форму имени. Использующие её нетерминалы относятся к
+разным пространствам имён: `alias` — локальный binding, `label` — ограничение типа атома,
+`table_name` — имя таблицы. Поэтому `alias:Label` внутри паттерна `MATCH` не является
+`record_id` и не зависит от него: одинаковый символ `:` разбирается по синтаксическому
+контексту.
+
 ### 2.3. Параметры
 
 ```ebnf
@@ -396,51 +402,67 @@ delete_stmt ::= "DELETE" target_list
 ### 5.4. RELATE
 
 ```ebnf
-relate_stmt ::= "RELATE" ( relate_binary | relate_atom | relate_hyper )
-                [ "WEIGHTED" expr ]
-                [ content_or_set ]
+relate_stmt ::= "RELATE" ( relate_binary
+                          | "ATOM" ( atom_relate_binary | atom_relate_hyper )
+                          | relate_hyper )
+                 [ "WEIGHTED" expr ]
+                 [ content_or_set ]
                 [ mutate_return ]
                 [ expect_clause ]
                 [ timeout_clause ]
 
+endpoint_ref   ::= record_id | idiom | param
 relate_binary ::= relate_endpoint edge_dir_left edge_atom edge_dir_right relate_endpoint
-relate_endpoint ::= "(" ( record_id | idiom | param ) ")" | record_id | idiom | param
+relate_endpoint ::= "(" endpoint_ref ")" | endpoint_ref
 edge_atom     ::= "[" [ alias ] ":" label_expr [ object_lit ] "]"
                 | "(" record_id ")"
 edge_dir_left  ::= "<-" | "-"
 edge_dir_right ::= "->" | "-"
 (* Комбинации: -[:E]->  (a→b) | <-[:E]-  (b→a) | -[:E]-  (undirected) | <-[:E]->  (bidirectional) *)
 
-relate_atom ::= "ATOM" atom_relate_endpoint atom_edge_dir_left
-                edge_atom atom_edge_dir_right atom_relate_endpoint
-atom_relate_endpoint ::= "(" ( record_id | idiom | param ) ")"
-                       | "[" ( record_id | idiom | param ) "]"
+atom_relate_binary ::= atom_endpoint_ref atom_edge_dir_left
+                       edge_atom atom_edge_dir_right atom_endpoint_ref
+atom_endpoint_ref ::= atom_vertex_ref | atom_edge_ref
+atom_vertex_ref   ::= "<" "(" endpoint_ref ")" ">"
+atom_edge_ref     ::= "<" "[" endpoint_ref "]" ">"
 atom_edge_dir_left  ::= "<~" | "~"
 atom_edge_dir_right ::= "~>" | "~"
-(* () требует vertex endpoint; [] требует edge endpoint. Направления зеркальны relate_binary. *)
+(* В ATOM-режиме kind endpoint'а всегда явен: <(...)> — vertex, <[...]> — edge. *)
 
 relate_hyper ::= "HYPER" edge_atom "TARGETS" "[" relate_target_list "]"
-                 [ hyper_direction ]
-relate_target_list ::= relate_endpoint { "," relate_endpoint }
+                 [ hyper_direction ] [ hyper_endpoint_order ]
+atom_relate_hyper ::= "HYPER" edge_atom "TARGETS" "[" atom_relate_target_list "]"
+                      [ hyper_direction ] [ hyper_endpoint_order ]
+relate_target_list ::= relate_target { "," relate_target }
+relate_target      ::= [ alias "=" ] relate_endpoint
+atom_relate_target_list ::= atom_relate_target { "," atom_relate_target }
+atom_relate_target      ::= [ alias "=" ] atom_endpoint_ref
 hyper_direction ::= "AS" "DIRECTED"   [ hyper_headtail ]
                   | "AS" "UNDIRECTED"
                   | "AS" "BOTH"       [ hyper_headtail ]
-hyper_headtail ::= "(" "head" ":" expr "," "tail" ":" array_lit ")"
+hyper_headtail ::= "(" "head" ":" alias_array "," "tail" ":" alias_array ")"
+alias_array    ::= "[" alias { "," alias } "]"
+hyper_endpoint_order ::= "ORDER" "BY" ( "TAIL" | "TARGETS" )
 ```
 
 `WEIGHTED` задаёт вес (`duration` — для темпоральных графов, иначе `number`).
-Обычный `relate_binary` после binding требует vertex endpoint'ы. В `relate_atom` скобки `(...)`
-требуют vertex, `[...]` — edge/metaedge. Маркеры участвуют в typecheck, но не являются частью
-`RecordId`. `ATOM` не меняет тип создаваемого ребра и не применяется к `relate_hyper`.
+Обычные `relate_binary`/`relate_hyper` после binding требуют vertex endpoint'ы. `ATOM`
+расширяет endpoint domain до всех атомов и ортогонален `HYPER`; `[...]` всегда обозначает
+создаваемое связывающее ребро. В `RELATE` содержимое endpoint'а — вычисляемая ссылка на
+существующий атом: `record_id`, параметр или idiom с ранее связанным значением. Это не
+паттерн `alias:Label`; выбор по label выполняется отдельным `MATCH`, после которого его alias
+можно передать в `RELATE`. В `hyper_headtail` оба массива непусты и содержат только явно
+объявленные алиасы из `TARGETS`. Без него первый endpoint становится единственным `head`, остальные — `tail`.
+`ORDER BY TAIL` допустим только с явным `tail`, `ORDER BY TARGETS` — только без явного
+разбиения. Без предложения порядок веток не определён.
 
 ---
 
 ## 6. MATCH и паттерны графа
 
 ```ebnf
-match_stmt ::= "MATCH" [ match_cardinality ] [ match_mode ] [ atom_kw ] [ match_scope ]
-               [ constraints_clause ]
-               match_pattern_list
+match_stmt ::= "MATCH" [ match_cardinality ] [ match_mode ]
+               ( match_standard_head | match_atom_head )
                [ from_clause ]
                [ where_clause ]
                [ contains_clause ]
@@ -454,11 +476,14 @@ match_stmt ::= "MATCH" [ match_cardinality ] [ match_mode ] [ atom_kw ] [ match_
 
 match_cardinality ::= "OPTIONAL" | "DISTINCT"
 match_mode        ::= "REPEATABLE" "ELEMENTS" | "DIFFERENT" "EDGES" | "DIFFERENT" "ATOMS"
-atom_kw           ::= "ATOM"                        (* включает AtomWalk-режим *)
 match_scope       ::= "HYPER" | "META" | "METAVERTEX" | "METAEDGE"
 
+match_standard_head ::= [ match_scope ] [ constraints_clause ] match_pattern_list
+match_atom_head     ::= "ATOM" [ match_scope ] [ constraints_clause ] atom_match_pattern_list
 match_pattern_list ::= match_pattern { "," match_pattern }
-match_pattern      ::= [ alias "=" ] ( graph_pattern | atomwalk_pattern | hyper_pattern )
+match_pattern      ::= [ alias "=" ] ( graph_pattern | hyper_pattern )
+atom_match_pattern_list ::= atom_match_pattern { "," atom_match_pattern }
+atom_match_pattern ::= [ alias "=" ] ( atomwalk_pattern | hyper_pattern )
 
 maxdepth_clause    ::= "MAXDEPTH" integer
 constraints_clause ::= "CONSTRAINTS" "<" path_constraint { path_constraint } ">"
@@ -519,44 +544,53 @@ path_filter     ::= "WEIGHTED" | "META" | "METAVERTICES" | "METAEDGES"
 ### 6.3. Гипер-паттерны
 
 ```ebnf
-hyper_pattern ::= "HYPER" edge_atom                   (* MATCH HYPER [e:TYPE] ... *)
+hyper_pattern ::= edge_atom                           (* HYPER уже прочитан как match_scope *)
 
 contains_clause ::= "CONTAINS" contains_arg { "," contains_arg }
-contains_arg    ::= [ "START" | "END" ] contains_atoms
-contains_atoms  ::= "[" node_pattern { "," node_pattern } "]"
-                  | node_pattern
+contains_arg    ::= [ "HEAD" | "TAIL" ] contains_atoms
+contains_atoms  ::= "[" contains_atom { "," contains_atom } "]"
+                  | contains_atom
+contains_atom   ::= node_pattern
+                  | atom_endpoint_pattern
                   | record_id
 ```
 
 ### 6.4. AtomWalk-паттерны
 
 ```ebnf
-atomwalk_pattern ::= atom_node { atomwalk_step atom_node }
+atomwalk_pattern ::= atom_endpoint_pattern { atomwalk_step atom_endpoint_pattern }
 
-atom_node      ::= node_pattern
-                 | edge_as_node
-                 | "<" "(" [ alias ] ":" type_name ")" ">"    (* <(x:edge)> — атом заданного подтипа *)
-edge_as_node   ::= "[" [ alias ] [ ":" label_expr ] "]"
+atom_endpoint_pattern ::= atom_vertex_pattern | atom_edge_pattern
+atom_vertex_pattern ::= "<" "(" [ alias ] [ ":" label_expr ] [ node_filter ] ")" ">"
+atom_edge_pattern   ::= "<" "[" [ alias ] [ ":" label_expr ] [ node_filter ] "]" ">"
 
-atomwalk_step  ::= endpoint_incidence | participation_incidence
-endpoint_incidence ::=
+atomwalk_step  ::=
       "~[" edge_inner "]~>"      (* Source → Target *)
     | "~[" edge_inner "]~"       (* ненаправленная endpoint-инцидентность *)
     | "<~[" edge_inner "]~"      (* Target ← Source *)
-    | edge_pattern               (* классические ->, <-, - тоже допустимы *)
-participation_incidence ::=
-      "~>"                       (* participation Source→Target (между рёбрами) *)
-    | "~~"                       (* participation любой роли *)
-edge_inner     ::= [ alias ] [ ":" label_expr ]
+    | "<~[" edge_inner "]~>"     (* двунаправленная endpoint-инцидентность *)
+edge_inner     ::= alias [ ":" label_expr ] | ":" label_expr
 ```
+
+В AtomWalk каждый endpoint обязательно записывается как `<(...)>` для vertex-атома или
+`<[...]>` для edge-атома. Внутри действует обычная семантика паттерна: первая позиция —
+alias, `:label_expr` — необязательное ограничение по label. `atomwalk_step` всегда содержит
+явное связывающее ребро с alias и/или label; пустое `[]` и формы без `[...]` недопустимы.
+Классические `-`/`->` относятся только к `graph_pattern`. В `MATCH HYPER` `contains_atom` проверяется как vertex, а в
+`MATCH ATOM HYPER` каждый `contains_atom` обязан быть `atom_endpoint_pattern`.
+Kind задают delimiters, а не текст label: `<(x:edge)>` остаётся vertex-паттерном с label
+`edge`; edge-паттерн записывается как `<[x:edge]>`.
 
 ---
 
 ## 7. Traversal Pipeline
 
 ```ebnf
-traverse_stmt ::= "TRAVERSE" [ "ATOM" ] [ constraints_clause ]
-                  traverse_source pipeline_tail [ traverse_return ]
+traverse_stmt ::= "TRAVERSE" ( traverse_input | "ATOM" atom_traverse_input )
+                  [ traverse_return ]
+
+traverse_input ::= [ constraints_clause ] traverse_source pipeline_tail
+atom_traverse_input ::= [ constraints_clause ] atom_traverse_source pipeline_tail
 
 traverse_source ::=
       "FROM" graph_expr pipeline_step        (* граф-источник + первый порождающий шаг *)
@@ -564,6 +598,13 @@ traverse_source ::=
     | "FROM" match_stmt                       (* MATCH как источник *)
     | "FROM" select_stmt                      (* SELECT как источник *)
     | "(" node_pattern ")"                    (* краткая форма: TRAVERSE (p:Person {...}) *)
+
+atom_traverse_source ::=
+      "FROM" graph_expr pipeline_step
+    | "FROM" atom_endpoint_ref                (* kind стартового атома указан обёрткой *)
+    | "FROM" match_stmt
+    | "FROM" select_stmt
+    | atom_endpoint_pattern
 
 graph_expr ::= name                           (* именованный граф *)
              | param
@@ -577,6 +618,10 @@ step_name      ::= [ "tv" "::" ] ident            (* префикс tv:: нео�
 
 traverse_return ::= "RETURN" return_item_list
 ```
+
+В `TRAVERSE ATOM` непосредственно записанный стартовый атом использует
+`atom_endpoint_ref`: `<(...)>` для vertex или `<[...]>` для edge. Источники-запросы и
+графовые выражения не получают дополнительной обёртки.
 
 Pipeline-оператор `|>` лево-ассоциативен (§12.10). Источником pipeline может быть любой оператор,
 возвращающий набор (`SELECT`, `MATCH`, `TRAVERSE`, массив, переменная).
@@ -1041,7 +1086,7 @@ case_expr ::= "CASE" [ expr ] { "WHEN" expr "THEN" expr } [ "ELSE" expr ] "END"
 ### 12.10. Alias
 
 ```ebnf
-alias ::= ident | quoted_ident
+alias ::= name
 ```
 
 ---
@@ -1121,10 +1166,10 @@ domain_type ::=
 **Операторы чтения/записи:** `SELECT`, `ONLY`, `VALUE`, `FROM`, `WHERE`, `SPLIT`, `GROUP`, `ORDER`, `LIMIT`,
 `START`, `FETCH`, `OMIT`, `TIMEOUT`, `TEMPFILES`, `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `RELATE`, `CONTENT`,
 `SET`, `UNSET`, `MERGE`, `PATCH`, `REPLACE`, `RETURN`, `NONE`, `BEFORE`, `AFTER`, `DIFF`, `WEIGHTED`, `HYPER`,
-`TARGETS`, `AS`, `DIRECTED`, `UNDIRECTED`, `BOTH`.
+`TARGETS`, `HEAD`, `TAIL`, `AS`, `DIRECTED`, `UNDIRECTED`, `BOTH`.
 
 **Паттерн-матчинг / traversal:** `MATCH`, `OPTIONAL`, `DISTINCT`, `ATOM`, `META`, `METAVERTEX`,
-`METAEDGE`, `CONTAINS`, `START`, `END`, `CONSTRAINTS`, `MAXDEPTH`, `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC`,
+`METAEDGE`, `CONTAINS`, `HEAD`, `TAIL`, `CONSTRAINTS`, `MAXDEPTH`, `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC`,
 `SHORTEST`, `METAVERTICES`, `METAEDGES`, `HYPEREDGES`, `CROSS_LEVEL`, `CROSS-LEVEL`, `COST`, `TRAVERSE`,
 `KEEP`, `LEVELPATH`.
 
@@ -1174,12 +1219,14 @@ domain_type ::=
 Символы `<`, `|`, `~`, `@` и стрелки перегружены; их однозначная интерпретация требует контекстно-зависимого
 разбора (обычно — Pratt-парсер с look-ahead).
 
-1. **`<` — четыре роли:**
+1. **`<` — структурно различимые роли:**
    - меньше: `a < b`;
    - каст: `<int> expr` (за `<` следует `type`, затем `>` и операнд);
    - дженерик вызова: `type::is<edge>(x)` (после `ident<`);
    - аннотация графа: `RETURN GRAPH <dag> { … }`, `MATCH … CONSTRAINTS <SIMPLE SHORTEST>`;
-   - открытие метавершины: `<(n)>`, метаребра `<[e]>`, атом-узла AtomWalk `<(x:edge)>`.
+   - открытие meta-атома вне AtomWalk либо endpoint'а внутри AtomWalk: `<(v:Label)>` для
+     vertex и `<[e:Label]>` для edge. После `MATCH ATOM` эти формы всегда означают
+     AtomWalk endpoint; после `RELATE ATOM` — типизированную ссылку на endpoint.
 
    Стратегия: решать по позиции (после `RETURN GRAPH` / `CONSTRAINTS` / `<` перед `(`|`[` → структурная роль;
    в позиции унарного операнда → каст; иначе — сравнение).
@@ -1191,15 +1238,22 @@ domain_type ::=
 
 4. **`<|  … |>`** — KNN-оператор; открывающий `<|` и закрывающий `|>` — единые токены. Не путать с pipe `|>`.
 
-5. **`~`-семейство (AtomWalk):** `~>`, `~~`, `~[`, `]~>`, `]~`, `<~[` токенизируются жадно, только в
-   AtomWalk-контексте (после `MATCH ATOM` / `TRAVERSE ATOM`).
+5. **`~`-семейство (AtomWalk):** `~[`, `]~>`, `]~`, `<~[`
+   токенизируются жадно только в AtomWalk-контексте (после `MATCH ATOM`, `TRAVERSE ATOM`
+   или `RELATE ATOM`). Между операторами всегда разбирается непустая синтаксическая форма
+   ребра `[alias]`, `[:Label]` или `[alias:Label]`; анонимных `~~`, `~>`, `~[]~>` и подобных
+   связей нет.
 
 6. **Стрелки:** `->`, `<-`, `<->` разбираются как части `edge_pattern`; в `RELATE` они же задают направление.
 
 7. **`@`-операторы:** `@@`, `@AND@`, `@OR@`, `@1@` (индексируемый) — единые токены полнотекстового поиска.
 
-8. **`record_id` vs `label`:** `table:id` (двоеточие без пробела) — литерал записи; `:Label` (после `(`/`[`) —
-   метка в паттерне. Различаются по контексту (внутри паттерна vs выражение).
+8. **`record_id` vs `alias:Label`:** в `MATCH` тело `(alias:Label)`/`[alias:Label]` объявляет
+   binding и ограничение по label. В `RELATE` тело endpoint'а содержит `endpoint_ref`, поэтому
+   `table:id` — литерал ссылки на запись, а один `alias` — idiom с ранее связанным значением.
+   `name` задаёт лишь общую лексическую форму этих разных сущностей. Окружающее правило
+   выбирает семантику раньше проверки gap; отсутствие gap затем требуется только между
+   `table`, `:` и `id` внутри уже выбранного `record_id`.
 
 9. **`record_range` vs числовой диапазон / `..`:** `..`/`..=` внутри `id`-части активны только в позиции цели
    (`FROM`, `CREATE`, `UPDATE`, …).

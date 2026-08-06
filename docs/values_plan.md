@@ -246,7 +246,7 @@ pub struct GraphWorkspace<G> {
 
 1. `GeneralStorage`
     - Универсальный multi-hyper-meta graph.
-    - Отдельные SoA-пулы атомов, endpoint- и participation-incidence, вложенные графы.
+    - Отдельные SoA-пулы атомов, единая `source`/`target` endpoint-incidence и вложенные графы.
     - Основа `Graph` и `Metagraph`; `Metagraph` добавляет invariant/API, но первоначально разделяет физический layout с `Graph`.
 
 2. `ForestStorage`

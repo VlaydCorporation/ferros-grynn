@@ -148,19 +148,22 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
   разрешаются позицией, look-ahead и gap-флагом.
 - Операторы выражений разбираются по точной таблице приоритетов `gql_grammar.md` §12.1 методом
   Pratt; результат — owned `Expr` из `src/syn/ast.rs`.
+- AST различает pattern и reference: endpoint паттерна хранит `kind`, optional alias,
+  `label_expr` и фильтр, а endpoint-ссылка — `kind` и выражение `record_id | idiom | param`.
+  Совпадающий текст `a:b` не объединяется в общий узел с контекстным флагом.
 
 ### 3.3. Разрешение синтаксических неоднозначностей
 
 Парсер обязан однозначно разрешать перегруженные символы из `gql_grammar.md` §16:
 
-| Символ            | Роли                                                                                        | Стратегия                                                                                                                                        |
-|-------------------|---------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
-| `<`               | меньше / cast `<T> e` / дженерик `is<T>(…)` / аннотация графа `<dag>` / метавершина `<(…)>` | по позиции: после `RETURN GRAPH`/`CONSTRAINTS` → структурная; в позиции унарного операнда → cast; `<` перед `(`/`[` → мета-атом; иначе сравнение |
-| `\|`              | OR `\|\|` / альтернатива меток `:A\|B` / замыкание `\|$x\|` / range-генератор `\|t:n\|`     | `\|\|` — единый токен OR; остальное — по контексту                                                                                               |
-| `\|>` / `<\|…\|>` | pipe / KNN                                                                                  | `\|>` и `<\|`,`\|>` — единые токены                                                                                                              |
-| `~`               | AtomWalk (`~>`, `~~`, `~[`, `]~>`, `<~[`)                                                   | жадная токенизация только после `MATCH ATOM`/`TRAVERSE ATOM`                                                                                     |
-| `@`               | fulltext (`@@`, `@1@`, `@AND@`, `@OR@`)                                                     | единые токены                                                                                                                                    |
-| стрелки           | `->`, `<-`, `<->` в паттернах и `RELATE`                                                    | часть `edge_pattern`                                                                                                                             |
+| Символ            | Роли                                                                                    | Стратегия                                                                                                                                                            |
+|-------------------|-----------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `<`               | меньше / cast `<T> e` / generic / аннотация графа / meta-атом / AtomWalk endpoint       | по позиции и режиму: после `ATOM` формы `<(…)>`/`<[…]>` задают vertex/edge endpoint; вне него сохраняют meta-семантику; иначе cast, generic, аннотация или сравнение |
+| `\|`              | OR `\|\|` / альтернатива меток `:A\|B` / замыкание `\|$x\|` / range-генератор `\|t:n\|` | `\|\|` — единый токен OR; остальное — по контексту                                                                                                                   |
+| `\|>` / `<\|…\|>` | pipe / KNN                                                                              | `\|>` и `<\|`,`\|>` — единые токены                                                                                                                                  |
+| `~`               | AtomWalk (`~[`, `]~>`, `]~`, `<~[`)                                                     | жадная токенизация после `MATCH ATOM`/`TRAVERSE ATOM`/`RELATE ATOM`; каждый шаг содержит непустое тело ребра с alias и/или label                                     |
+| `@`               | fulltext (`@@`, `@1@`, `@AND@`, `@OR@`)                                                 | единые токены                                                                                                                                                        |
+| стрелки           | `->`, `<-`, `<->` в паттернах и `RELATE`                                                | часть `edge_pattern`                                                                                                                                                 |
 
 ### 3.4. Пределы разбора
 
@@ -184,6 +187,9 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
 
 - Построение областей видимости биндингов: `Env = Map<Alias, Value>` (§14 gql_spec).
 - Правила биндингов §14.2: объявление `(a:Person)` → `Env[a] = vertex<Person>`; повторный alias — это **ограничение**, не присваивание; `MATCH` создаёт новый scope, `WITH`/`LET` — сужают/расширяют.
+- `MATCH ATOM <(a:Person)>` связывает vertex alias `a` с label-ограничением `Person`, а
+  `MATCH ATOM <[e:FRIEND]>` — edge alias `e`. В `RELATE ATOM <(person:alice)>` та же
+  пунктуация окружает ссылку `record_id`; новый binding там не создаётся.
 - Проверка неопределённых алиасов, shadowing (§14.3): внутренний alias перекрывает внешний; при передаче через `WITH a, b` — проекция биндингов.
 - Разрешение `record_id` (`table:id`) в публичную ссылку; проверка существования таблиц/графов через каталог (§10, `SchemaCatalog`, `GraphSuperblock`).
 
@@ -203,9 +209,12 @@ closures/UDF, когда появится его первый потребите
 Правила вывода — §24.9 gql_spec (T-Var, T-Field, T-FunctionCall, T-SELECT, T-MATCH, T-Traversal, T-Join). Idiom-навигация типизируется через `field(T, f) = τ`.
 
 Graph-специфичные проверки:
-- `MATCH`: согласованность меток, совместимость рёбер, endpoint-типы.
+- `MATCH`: согласованность меток, совместимость рёбер и endpoint-типы. Без `ATOM` домен
+  endpoint'ов равен $V \cup MV$; с `ATOM` — $V \cup MV \cup E \cup ME$. В обоих случаях
+  шаг содержит отдельное связывающее ребро.
 - Traversal-шаг: `out('FRIEND') : vertex<record<Person>> -> vertex<record<Person>>`.
-- `path<T> = sequence(vertex<T>)`; функции `path::nodes/edges/atoms/length/cost` типизируются по типу пути (§15.6 gql_spec).
+- `StandardPath` чередует vertex/edge, `AtomWalk` — atom/edge; функции
+  `path::nodes/edges/atoms/length/cost` типизируются по фактическому виду пути (§15.6 gql_spec).
 - `RETURN GRAPH <constraint> {…}`: тип результата — `subgraph` или заявленный тип графа; **система типов не делает неявных преобразований** (запрос `rooted_tree` при фактическом `forest` → ошибка; проверка **после** построения результата, §16.1 gql_spec).
 
 `option<T>` существует только в Typed AST: `Some(v)` понижается в `v`, `None` — в
@@ -214,15 +223,15 @@ Graph-специфичные проверки:
 
 Контракт graph/query результатов фиксируется уже при типизации:
 
-| Оператор | Typed result |
-|----------|--------------|
-| `RETURN atom` | stable atom/record ref |
-| `RETURN path` | materialized `Path` |
-| `RETURN GRAPH {…}` | `Subgraph<Frozen>` |
-| `RETURN GRAPH <T> {…}` | точный `T<Frozen>` |
-| именованный `BUILD GRAPH <T>` | `GraphRef<T>` после commit |
-| анонимный `BUILD GRAPH <T>` | session-owned `T<Frozen>` |
-| `graph::inner` внутри плана | borrowed graph/subgraph view |
+| Оператор                      | Typed result                 |
+|-------------------------------|------------------------------|
+| `RETURN atom`                 | stable atom/record ref       |
+| `RETURN path`                 | materialized `Path`          |
+| `RETURN GRAPH {…}`            | `Subgraph<Frozen>`           |
+| `RETURN GRAPH <T> {…}`        | точный `T<Frozen>`           |
+| именованный `BUILD GRAPH <T>` | `GraphRef<T>` после commit   |
+| анонимный `BUILD GRAPH <T>`   | session-owned `T<Frozen>`    |
+| `graph::inner` внутри плана   | borrowed graph/subgraph view |
 
 Backend-dispatch не меняет Typed result и остаётся внутренним.
 
@@ -265,29 +274,34 @@ LogicalProps  = { estimated_cardinality, ordering, distinct, keys, path_info }
 
 ### 5.1. Логические операторы
 
-Минимальный набор (§22.2, §26 gql_spec): `Scan(source, filter?)`, `IndexScan(index, key_range, filter?)`, `Filter(pred)`, `Project(exprs)`, `Join(kind, cond)` (`Inner|Left|Semi|Anti`), `Expand(dir, edge_labels?, node_labels?, alias_node, alias_edge?)`, `ExpandEdge(dir, labels?, alias_edge)`, `PathExpand(dir, edge_labels?, min, max, mode, objective?, filters, alias_path, alias_end)`, `Aggregate(group_by, aggregates)`, `Sort(keys)`, `Limit(n, offset)`, `Dedup(keys)`, `Unwind(expr, alias)` (для `SPLIT`), `TraversalStep(step)`.
+Минимальный набор (§22.2, §26 gql_spec): `Scan(source, filter?)`, `IndexScan(index, key_range, filter?)`, `Filter(pred)`, `Project(exprs)`, `Join(kind, cond)` (`Inner|Left|Semi|Anti`), `Expand(dir, endpoint_domain, edge_labels?, target_labels?, alias_target, alias_edge?)`, `ExpandEdge(dir, labels?, alias_edge)`, `PathExpand(dir, endpoint_domain, edge_labels?, min, max, mode, objective?, filters, alias_path, alias_end)`, `Aggregate(group_by, aggregates)`, `Sort(keys)`, `Limit(n, offset)`, `Dedup(keys)`, `Unwind(expr, alias)` (для `SPLIT`), `TraversalStep(step)`.
+
+`endpoint_domain = VerticesOnly | Atoms`; отдельного оператора для E–E-инцидентности нет.
+Hyper- и binary-рёбра раскрываются тем же `Expand`, но hyper-ребро может выдать несколько
+попарных веток.
 
 ### 5.2. Правила понижения (grammar → IR)
 
 Понижение связывает конструкции грамматики с операторами IR:
 
-| Конструкция GrynQL                   | Понижение в IR                                                                   |
-|--------------------------------------|----------------------------------------------------------------------------------|
-| `SELECT f FROM t WHERE p`            | `Scan(t) → Filter(p) → Project(f)`                                               |
-| `FROM a, b` (union)                  | `Union(Scan a, Scan b)`                                                          |
-| `FROM a & b` (cross)                 | `Join(Inner, true)`                                                              |
-| `SPLIT field`                        | `Unwind(field)`                                                                  |
-| `GROUP [ALL\|BY]`                    | `Aggregate(group_by, aggs)`                                                      |
-| `ORDER BY`                           | `Sort(keys)`                                                                     |
-| `LIMIT n START s`                    | `Limit(n, s)`                                                                    |
-| `(a:L)-[:E]->(b:L2)`                 | `Scan(L as a) → Expand(Out, E, b) → Filter(label(b)=L2)` (§26.3, §54.5 gql_spec) |
-| `(a)-[:E*min..max mode]->(b)`        | `PathExpand(Out, E, min, max, mode, …)`                                          |
-| `OPTIONAL MATCH`                     | `Join(Left, …)` (§23.5 инвариант 6)                                              |
-| `MATCH DISTINCT` / `RETURN DISTINCT` | `Dedup(keys)`                                                                    |
-| `RETURN GRAPH {nodes, edges}`        | `GraphAssemble(constraint?)` (терминальная проекция в `subgraph`)                |
-| `BUILD GRAPH … FROM …`               | `GraphAssemble` + материализация в каталог                                       |
-| `src \|> tv::step(...)`              | `TraversalStep(step)` поверх источника                                           |
-| `TRAVERSE FROM g \|> …`              | цепочка `TraversalStep` над graph-источником                                     |
+| Конструкция GrynQL                                 | Понижение в IR                                                                   |
+|----------------------------------------------------|----------------------------------------------------------------------------------|
+| `SELECT f FROM t WHERE p`                          | `Scan(t) → Filter(p) → Project(f)`                                               |
+| `FROM a, b` (union)                                | `Union(Scan a, Scan b)`                                                          |
+| `FROM a & b` (cross)                               | `Join(Inner, true)`                                                              |
+| `SPLIT field`                                      | `Unwind(field)`                                                                  |
+| `GROUP [ALL\|BY]`                                  | `Aggregate(group_by, aggs)`                                                      |
+| `ORDER BY`                                         | `Sort(keys)`                                                                     |
+| `LIMIT n START s`                                  | `Limit(n, s)`                                                                    |
+| `(a:L)-[:E]->(b:L2)`                               | `Scan(L as a) → Expand(Out, E, b) → Filter(label(b)=L2)` (§26.3, §54.5 gql_spec) |
+| `MATCH ATOM <[a:STEP]>~[r:DEPENDS_ON]~><[b:STEP]>` | `Scan(STEP as a) → Expand(Out, Atoms, DEPENDS_ON as r, STEP as b)`               |
+| `(a)-[:E*min..max mode]->(b)`                      | `PathExpand(Out, E, min, max, mode, …)`                                          |
+| `OPTIONAL MATCH`                                   | `Join(Left, …)` (§23.5 инвариант 6)                                              |
+| `MATCH DISTINCT` / `RETURN DISTINCT`               | `Dedup(keys)`                                                                    |
+| `RETURN GRAPH {nodes, edges}`                      | `GraphAssemble(constraint?)` (терминальная проекция в `subgraph`)                |
+| `BUILD GRAPH … FROM …`                             | `GraphAssemble` + материализация в каталог                                       |
+| `src \|> tv::step(...)`                            | `TraversalStep(step)` поверх источника                                           |
+| `TRAVERSE FROM g \|> …`                            | цепочка `TraversalStep` над graph-источником                                     |
 
 ### 5.3. Две под-алгебры под одной крышей
 
@@ -385,13 +399,16 @@ Row = { values: Vec<Value>, env: Env?, path: Path? }
 
 ### 7.3. Expand-операторы
 
-- **`ExpandOp { input, adjacency, direction, label_filter }`** — одношаговое расширение по смежности:
+- **`ExpandOp { input, adjacency, direction, endpoint_domain, label_filter }`** — одношаговое расширение по смежности:
   ```
-  for each input node:
-      for each edge in adjacency(node, direction, label):
-          yield (node, edge, neighbor)
+  for each input atom:
+      for each edge in adjacency(atom, direction, label):
+          yield (atom, edge, endpoint)
   ```
-  Оптимизации: adjacency-кеш; сжатое хранение рёбер (inline + overflow, §10.4); degree-aware batching.
+  В `VerticesOnly` вход и выход проверяются как vertex/meta-vertex. В `Atoms` для edge-атома
+  обратный список рёбер берётся из `EdgeEndpointIndex`; сами endpoint'ы читаются из
+  `source`/`target` связывающего ребра. Оптимизации: adjacency-кеш; inline + overflow;
+  degree-aware batching.
 - **`ExpandEdgeOp`** — возвращает рёбра (для `tv::outE/inE/bothE`, §13.4 gql_spec).
 
 ### 7.4. PathExpand-оператор
@@ -403,7 +420,7 @@ PathExpandOp { input, adjacency, min_depth, max_depth, mode, objective?, frontie
 - **DFS** — для перечисления путей и constrained-search с pruning.
 - **Shortest** — BFS (невзвешенный) / Dijkstra (взвешенный), `weight(NaN) = 1` (§15.1 gql_spec).
 - Во время поиска path хранится в `PathTraceArena`: узел trace содержит `previous`,
-  stable atom ref, optional via-edge, direction/role и cumulative cost. Общие prefixes
+  stable atom ref, optional via-edge, direction и cumulative cost. Общие prefixes
   разделяются, append выполняется за `O(1)`.
 
 ### 7.5. Соединения (Join)
@@ -614,7 +631,7 @@ inline-adjacency и ссылку на свойства (`props_page`/`props_slot
 **Adjacency traversal.** Операторы `Expand`/`PathExpand` читают смежность так (`disk_storage_spec.md` §25.2, `out_neighbors`):
 ```
 1. Прочитать NodeHotSlot(node_slot).
-2. Взять adj_out[..min(adj_out_count, 16)] до первого NULL_SLOT — inline edge DiskAtomRef'ы.
+2. Взять adj_out[..min(adj_out_count, 4)] до первого NULL_SLOT — inline edge DiskAtomRef'ы.
 3. Если adjacency не помещается inline — идти по цепочке overflow:
      каждая AdjacencyOverflowPage: entries[..count] (DiskAtomRef/u64), затем next_page,
      пока != NULL_PAGE.
@@ -635,11 +652,17 @@ Late materialization (§7.6): свойства читаются только д�
 использовать `PropertyColumnCachePage`; DataFusion подключается только к batch-слою и не
 проникает в runtime `Value`.
 
-**Рёбра-endpoint'ы и MetaEdge.** `EdgeHotSlot` держит inline `inv_inline`/`out_inline` (по 4), overflow-цепочки, `weight` (NaN = нет веса), `transition_gid` (для MetaEdge с transition-подграфом), `inc_page` (список `EdgeIncidence`, ≠ NULL ⇒ MetaEdge). Participation-инцидентность (`EdgeIncidencePage`, роли Source/Target/Control) читается отдельно от endpoint-инцидентности — два независимых механизма (§3.8 gql_spec).
+**Endpoint'ы рёбер.** `EdgeHotSlot` держит `source_inline`/`target_inline`, соответствующие
+overflow-цепочки, `weight` (NaN = нет веса) и `transition_gid`. Все V–V, V–E, E–V, E–E,
+hyper- и cross-level-связи используют эти два массива. `EdgeEndpointIndex` — производный
+обратный индекс для endpoint'ов-edge; отдельной страницы или IR-ветки инцидентности нет.
 
 **Метки и схема.** `string ↔ id` разрешается через `LabelDictionary` (`HashIndexPage`, string→id на этапе разбора/плана/вставки; `DictEntryPage`, id→string при материализации), кешируется LRU (`FG_LABEL_DICT_CACHE_MB`). Определения DDL (Table/Field/Index/Event/Function/Analyzer/LiveSelect) — в `SchemaCatalog`; входная точка на именованный граф — `GraphSuperblock` (даёт `node_count`/`edge_count` для cost-model и root-страницы схемы/статистики).
 
-**Мета-атомы.** `metavertex`/`metaedge` — не отдельные типы хранения, а обычные vertex/edge с флагом `is_meta` / ненулевым `inc_page` / `subgraph_slot`. Вложенные подграфы — через `SubgraphDirPage`; доступ из GrynQL — функциями `graph::inner/nodes/edges` (§15.10 gql_spec).
+**Мета-атомы.** `metavertex`/`metaedge` — не отдельные типы хранения, а обычные vertex/edge
+с флагом `is_meta` и `subgraph_slot`/`transition_gid`. Edge-to-edge endpoint сам по себе не
+делает ребро метаребром. Вложенные подграфы — через `SubgraphDirPage`; доступ из GrynQL —
+функциями `graph::inner/nodes/edges` (§15.10 gql_spec).
 
 ### 10.5. Доступ к статистике
 
@@ -648,7 +671,7 @@ Late materialization (§7.6): свойства читаются только д�
 ### 10.6. Режим 3 — `query_to_memory`
 
 Высокоуровневый API для гибридного режима:
-```rust
+```ignorel
 let graph: Dag<Frozen> = db
     .query_to_memory::<Dag<Frozen>>(query, vars, settings)
     .await?;

@@ -67,7 +67,7 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | Алгоритмы traversal (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA/MST/cuts)                                                                 | `gql_spec` §13.4                       | `fg-meta` `traversal.rs`                                                                                     | 🟢 референс                                                 |
 | Лексер / парсер (reblessive, `TokenBuffer<4>`)                                                                                       | `gql_grammar`                          | `src/syn` (`lexer.rs`, `parser.rs`, `ast.rs`)                                                                | 🟡 read-only срез                                           |
 | AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/syn/ast.rs`; публичный вход `gql::parse`                                                                | 🟡 read-only срез                                           |
-| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/gql`; `QueryResult` готов, `Datastore` ещё не подключён                                                 | 🟡 внутренний executor                                     |
+| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/gql`; `QueryResult` готов, `Datastore` ещё не подключён                                                 | 🟡 внутренний executor                                      |
 | Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql` (будущий вертикальный этап)                                                                        | 🔴 новое                                                    |
 | `PageManager` / `DiskMetaGraph` / disk-страницы                                                                                      | `gql_tech` §10; формат — `disk` §9–§21 | `crates/storage_engine` (`store`, `layout`): `NodeRecord`/`EdgeRecord`/`PropertyRecord`, `FerrosGrynnLayout` | 🟡 каркас                                                   |
 | `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`                                                    | 🟡 runtime `RecordId` готов; disk refs — новые              |
@@ -87,7 +87,7 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | WAL recovery         | Ранний документ описывал ARIES 3-phase. Действует **frame-WAL** с single-pass REDO по LSN; ARIES/UNDO не нужен (см. таблицу решений).                           |
 | `PropertyMap`        | Решено по benchmark evidence: отдельный от `Object` pointer-sized sorted `ThinVec` по `PropertyKeyId`; Arrow используется только в `PropertyBatch`.             |
 | `GraphId` / `AtomId` | Внутренние идентификаторы не экспонируются в GrynQL; публичная форма — `table:id` (`RecordId`).                                                                 |
-| Гиперрёбра           | Реализованы (`HyperDirected`, `HyperUndirected` в `edge.rs`). Синтаксис `RELATE HYPER` / `MATCH HYPER` — новый, требует согласования.                           |
+| Гиперрёбра           | Попарная traversal-семантика и ортогональные `ATOM HYPER` согласованы; прототипные поля endpoint'ов требуют миграции на `source`/`target`.                      |
 | Метаатомы в GQL      | `MetaGraph.promote_to_meta()` реализован; GrynQL-синтаксис (`graph::inner`/`graph::nodes`) требует реализации функций.                                          |
 | ECS-компоненты       | `src/ecs` — AtomId-keyed runtime/ML sidecar; `GraphWorkspace` доступен Rust SDK, но не является `Value` и не экспонирует произвольные компоненты в GrynQL.      |
 
@@ -139,7 +139,6 @@ src/
     node_pages.rs     -- NodeHotSlot, NodeHotPage
     edge_pages.rs     -- EdgeHotSlot, EdgeHotPage
     adj_overflow.rs   -- AdjacencyOverflowPage, CrossLevelAdjacencyOverflowPage
-    edge_incidence.rs -- EdgeIncidencePage, CrossLevelEdgeIncidencePage
     prop_heap.rs      -- PropHeapPage, slotted page
     subgraph_dir.rs   -- SubgraphDirPage
     freelist.rs       -- FreelistPage
@@ -273,11 +272,12 @@ pub trait PageManager: Send + Sync {
 `Array<T> = { data: Vec<T>, validity: Bitmap }`, а `Sel = { indices: Vec<u32> }` — selection
 vector для фильтрации без копирования. Подробности — в спецификации.
 
-### 3.5. Тензорные представления — `EndpointTensor` / `ParticipationTensor` (🔴 P5)
+### 3.5. Тензорное представление — `EndpointTensor` (🔴 P5)
 
-Из `gql_spec.md` §3.8 (математика — `IncidenceTensor`, матрицы `B_ep`, `D` — остаётся в спеке).
-`IncidenceMatrix`/`IncidenceTensor` сохраняются для обратной совместимости; эти два — новые
-компоненты для полной инцидентности (все атомы, не только вершины).
+Из `gql_spec.md` §3.8. `IncidenceMatrix`/`IncidenceTensor` сохраняются как vertex-only views;
+`EndpointTensor` охватывает все атомы единого endpoint-механизма. `from_graph` логически
+помещает endpoint неориентированного ребра в обе стороны тензора, даже если storage хранит
+единый массив `source`.
 
 ```rust
 /// Endpoint-тензор: atom × edge × 2 (Source/Target).
@@ -290,10 +290,10 @@ pub struct EndpointTensor {
 }
 
 impl EndpointTensor {
-    /// matrix[(atom_i, edge_j * 2 + role)] = 0 или 1
-    /// role: 0=Source (∈ inv), 1=Target (∈ out)
+    /// matrix[(atom_i, edge_j * 2 + side)] = 0 или 1
+    /// side: 0=Source, 1=Target
     pub fn from_graph(g: &MetaGraph) -> Self { ... }
-    pub fn get(&self, atom_i: usize, edge_j: usize, role: usize) -> u8 { ... }
+    pub fn get(&self, atom_i: usize, edge_j: usize, side: usize) -> u8 { ... }
     /// Atom adjacency: C = B[:,:,0] × B[:,:,1]^T (binary)
     pub fn atom_adjacency_binary(&self) -> DMatrix<u8> { ... }
     /// Weighted atom adjacency с весами рёбер
@@ -303,20 +303,6 @@ impl EndpointTensor {
     pub fn submatrix_ve(&self, g: &MetaGraph) -> DMatrix<u8> { ... }
     pub fn submatrix_ev(&self, g: &MetaGraph) -> DMatrix<u8> { ... }
     pub fn submatrix_ee(&self, g: &MetaGraph) -> DMatrix<u8> { ... }
-}
-
-/// Participation-тензор: edge × edge × 3 (Source/Target/Control).
-pub struct ParticipationTensor {
-    pub matrix:     DMatrix<u8>,               // shape: (|E|, |E| × 3)
-    pub edge_index: FxHashMap<AtomId, usize>,
-    pub index_edge: Vec<AtomId>,
-}
-
-impl ParticipationTensor {
-    pub fn from_graph(g: &MetaGraph) -> Self { ... }
-    pub fn get(&self, e1_i: usize, e2_j: usize, role: usize) -> u8 { ... }
-    /// Edge participation adjacency (Source+Target роли, без Control)
-    pub fn participation_adjacency(&self) -> DMatrix<u8> { ... }
 }
 ```
 
@@ -444,7 +430,8 @@ codec на этапе 5.
   Arrow round-trip и DataFusion `MemTable` со скрытыми presence-полями. Модули feature-gated,
   runtime от них не зависит. Nested `Binary(StorageValue)` fallback заблокирован до этапа codec.
 - **`src/values/runtime/graph`** 🟡/🟢 reference — реализованы general SoA foundation,
-  bit-packed `AtomId`, node/edge и edge/edge incidence, identity/revision,
+  bit-packed `AtomId`, endpoint'ы и identity/revision; прототипный второй путь edge/edge
+  incidence является legacy и должен быть удалён при миграции на единые `source`/`target`,
   `Graph<Mutable>`/`Graph<Frozen>` и корневой re-export; специализированные storage families,
   conversions, PathTrace/Path и LiveGraph остаются этапом 4 [plan.md](values_plan.md).
 - **`src/storage`** 🟡 — `DiskAtomRef(u64)` и
@@ -457,7 +444,7 @@ Disk-backed режим 2. Зависит от A.
 
 - **`PageManager`** 🔴 (§3.3) — реализация поверх `BufferPool` (Clock-Pro) и `SyncIo`/`AsyncIo`.
 - **`DiskMetaGraph`** 🔴 — фасад над страницами (`storage/disk_graph.rs`).
-- **Disk-страницы** 🟡→🔴 — `NodeHotSlot`/`EdgeHotSlot`, `AdjacencyOverflowPage`, `EdgeIncidence`,
+- **Disk-страницы** 🟡→🔴 — `NodeHotSlot`/`EdgeHotSlot`, `AdjacencyOverflowPage`,
   `PropHeapPage` (slotted), `SubgraphDirPage`, `FreelistPage`, `LabelDictionary`. Каркас есть в
   `crates/storage_engine` (`store`, `layout`).
 - **`store.rs`** 🟢/🔴 — существующие `create_graph`/`open_graph` (режим 1) без изменений;
@@ -597,9 +584,10 @@ storage-интеграция зависит от B.
 | `graph.rs::EdgeFlags`             | Добавить `CROSS_LEVEL = 0b0100_0000`                                                                                |
 | `graph.rs::add_cross_meta_edge()` | Ставить `CROSS_LEVEL`; убрать `__from_inner`/`__to_inner`; использовать `source_atom_ref`/`target_atom_ref` в props |
 | `node.rs::NodeFlags`              | Убрать бит `PORT` или пометить deprecated                                                                           |
-| `traversal.rs::neighbors()`       | Параметризовать: `NodeOnly` (текущий) vs `AtomWalk` (новый, через `EdgeEndpointIndex` + `EdgeIncidence`)            |
+| `edge.rs`                         | Переименовать legacy endpoint-поля в `source/target`; удалить role-enum и второй edge/edge incidence path           |
+| `traversal.rs::neighbors()`       | Параметризовать: `NodeOnly` (текущий) vs `AtomWalk` (через единые endpoint'ы и `EdgeEndpointIndex`)                 |
 | `traversal.rs::TarjanCuts`        | Параметризовать тип обхода; `n.is_node()` — только в `NodeOnly`                                                     |
-| `matrix.rs`                       | Добавить `EndpointTensor` и `ParticipationTensor` (§3.5)                                                            |
+| `matrix.rs`                       | Добавить `EndpointTensor` (§3.5)                                                                                    |
 | `id.rs`                           | Добавить `QualifiedAtomRef { sg_slot: u32, local_ref: DiskAtomRef }`                                                |
 
 ### Область O. Мосты (bridges) — MVP+
@@ -613,28 +601,28 @@ storage-интеграция зависит от B.
 
 Расширяет таблицу `disk_storage_spec.md` §30.8 работами query-слоя (`gql_tech_spec.md`).
 
-| Приоритет            | Область | Компоненты                                | Что делать                                                          |
-|----------------------|---------|-------------------------------------------|---------------------------------------------------------------------|
-| **P1** (блокирующий) | A       | `src/values/runtime`                      | ✅ Runtime-фундамент, `ValueKind`, scalars и collections            |
-| **P1**               | A       | `src/values/storage`                      | `StorageValue`, `TypeTag`, canonical codec и decode limits          |
-| **P1**               | A       | `src/values/runtime/record_id.rs`         | ✅ `RecordId`, `RecordIdPart`                                       |
-| **P2**               | A       | `src/values/columnar`                     | ✅ `PropertyBatch`, Arrow/presence и DataFusion adapter             |
-| **P2**               | A       | `src/values/runtime/graph`                | Graph family/type-state, Path и query return contracts              |
-| **P2**               | A       | `src/ecs`                                 | ✅ ECS foundation; далее revision-bound `GraphWorkspace`           |
-| **P2** (высокий)     | B       | `src/storage/`                            | `PageManager`, `DiskMetaGraph`, все типы страниц                    |
-| **P2**               | C       | frame-WAL                                 | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
-| **P2**               | H, I, K | `src/syn`, analysis, IR, sync pull        | ✅ read-only `LET`/`RETURN`/`SELECT`; далее clauses/MATCH            |
-| **P3** (средний)     | E       | `src/schema/`                             | `SchemaCatalog`                                                     |
-| **P3**               | G       | `src/index/`                              | `LabelIndex`, `BTreeIndex`, `CountIndex`, bulk-сборка               |
-| **P3**               | J, K, L | optimizer, storage adapter, Traversal VM  | `Datastore::execute` поверх утверждённого `PageManager`             |
-| **P4** (нормальный)  | F       | `src/stats/`                              | `StatisticsStore`                                                   |
-| **P4**               | G       | `src/index/fulltext.rs`                   | `FulltextIndex` (BM25)                                              |
-| **P4**               | N       | `fg-meta` граф-ядро                       | Полная инцидентность                                                |
-| **P5** (низкий)      | G       | `src/index/hnsw.rs`, `rtree.rs`           | `HnswIndex`, `RtreeIndex`                                           |
-| **P5**               | M       | `src/changefeed/`                         | `ChangefeedStore`, `LiveQueryRegistry`                              |
-| **P5**               | 3.5     | `matrix.rs`                               | `EndpointTensor`, `ParticipationTensor`                             |
-| **P6** (MVP+)        | B       | `store.rs`                                | `open_disk_graph` (полный режим 2)                                  |
-| **MVP+**             | O       | bridges                                   | `Bridge` trait, `SurrealBridge`                                     |
+| Приоритет            | Область | Компоненты                               | Что делать                                                          |
+|----------------------|---------|------------------------------------------|---------------------------------------------------------------------|
+| **P1** (блокирующий) | A       | `src/values/runtime`                     | ✅ Runtime-фундамент, `ValueKind`, scalars и collections            |
+| **P1**               | A       | `src/values/storage`                     | `StorageValue`, `TypeTag`, canonical codec и decode limits          |
+| **P1**               | A       | `src/values/runtime/record_id.rs`        | ✅ `RecordId`, `RecordIdPart`                                       |
+| **P2**               | A       | `src/values/columnar`                    | ✅ `PropertyBatch`, Arrow/presence и DataFusion adapter             |
+| **P2**               | A       | `src/values/runtime/graph`               | Graph family/type-state, Path и query return contracts              |
+| **P2**               | A       | `src/ecs`                                | ✅ ECS foundation; далее revision-bound `GraphWorkspace`            |
+| **P2** (высокий)     | B       | `src/storage/`                           | `PageManager`, `DiskMetaGraph`, все типы страниц                    |
+| **P2**               | C       | frame-WAL                                | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
+| **P2**               | H, I, K | `src/syn`, analysis, IR, sync pull       | ✅ read-only `LET`/`RETURN`/`SELECT`; далее clauses/MATCH           |
+| **P3** (средний)     | E       | `src/schema/`                            | `SchemaCatalog`                                                     |
+| **P3**               | G       | `src/index/`                             | `LabelIndex`, `BTreeIndex`, `CountIndex`, bulk-сборка               |
+| **P3**               | J, K, L | optimizer, storage adapter, Traversal VM | `Datastore::execute` поверх утверждённого `PageManager`             |
+| **P4** (нормальный)  | F       | `src/stats/`                             | `StatisticsStore`                                                   |
+| **P4**               | G       | `src/index/fulltext.rs`                  | `FulltextIndex` (BM25)                                              |
+| **P4**               | N       | `fg-meta` граф-ядро                      | Полная инцидентность                                                |
+| **P5** (низкий)      | G       | `src/index/hnsw.rs`, `rtree.rs`          | `HnswIndex`, `RtreeIndex`                                           |
+| **P5**               | M       | `src/changefeed/`                        | `ChangefeedStore`, `LiveQueryRegistry`                              |
+| **P5**               | 3.5     | `matrix.rs`                              | `EndpointTensor`                                                    |
+| **P6** (MVP+)        | B       | `store.rs`                               | `open_disk_graph` (полный режим 2)                                  |
+| **MVP+**             | O       | bridges                                  | `Bridge` trait, `SurrealBridge`                                     |
 
 **Фазы (укрупнённо):**
 

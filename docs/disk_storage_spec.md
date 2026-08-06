@@ -337,12 +337,13 @@ generic-параметр T (например, `vertex<Person>`) является
 | GQL тип          | Причина                                                                |
 |------------------|------------------------------------------------------------------------|
 | `metavertex<T?>` | Хранится как обычная вершина с NodeHotSlot.kind=Meta; тип=schema       |
-| `metaedge<T?>`   | Хранится как ребро с EdgeHotSlot.inc_page != NULL_PAGE                 |
+| `metaedge<T?>`   | Хранится как ребро с `META` и `transition_gid`/внутренним подграфом    |
 | `path`           | Результат запроса; не хранится как значение свойства                   |
 | graph subtypes   | Интерпретационное ограничение на граф; не самостоятельный тип хранения |
 
 Примечание: `metavertex` и `metaedge` — не отдельные хранимые типы. 
-Они отличаются от обычных vertex/edge только флагом `is_meta` в hot-слоте и наличием subgraph_slot / inc_page. 
+Они отличаются от обычных vertex/edge флагом `is_meta` и наличием
+`subgraph_slot` / `transition_gid`.
 Пользовательский код работает с ними через те же теги 0x36/0x37; meta-семантика определяется схемой и флагами.
 
 ### 3.9. QualifiedAtomRef — составной идентификатор кросс-уровневого атома
@@ -361,9 +362,11 @@ struct QualifiedAtomRef {
 
 Обычная ссылка `atom_ref` не изменяется — используется для атомов в том же графе; `qualified_atom_ref` — явный маркер кросс-уровневого адреса.
 
-При чтении `EdgeHotSlot.inv_inline[i]`:
-- Если bit 31 = 0 (DiskAtomRef.kind=Node) или 1 (kind=Edge) без флага `CROSS_LEVEL` — обычный DiskAtomRef.
-- Если `EdgeHotSlot.flags.CROSS_LEVEL = 1` — inv/out inline хранят QualifiedAtomRef своих endpoint'ов.
+При чтении `EdgeHotSlot.source_inline[i]`/`target_inline[i]`:
+- при `CROSS_LEVEL = 0` значение является обычным `DiskAtomRef` текущего графа;
+- при `CROSS_LEVEL = 1` inline хранит только `local_ref`, а соответствующий `*_sg_slot`
+  дополняет его до `QualifiedAtomRef`. Для нескольких endpoint'ов полная пара находится в
+  `CrossLevelAdjacencyOverflowPage`.
 
 ---
 
@@ -543,8 +546,6 @@ MAGIC_NODE_HOT        = 0x01_4E_48_46   -- b"FHN\x01"
 MAGIC_EDGE_HOT        = 0x01_45_48_46   -- b"FHE\x01"
 MAGIC_ADJ_OVER        = 0x01_4F_41_46   -- b"FAO\x01"
 MAGIC_ADJ_OVER_CL     = 0x01_43_41_46   -- b"FAC\x01"
-MAGIC_EDGE_INC        = 0x01_49_45_46   -- b"FEI\x01"
-MAGIC_EDGE_INC_CL     = 0x01_43_45_46   -- b"FEC\x01"
 MAGIC_PROP_HEAP       = 0x01_50_48_46   -- b"FHP\x01"
 MAGIC_SUBGR_DIR       = 0x01_47_53_46   -- b"FSG\x01"
 MAGIC_FREELIST        = 0x01_4C_46_46   -- b"FFL\x01"
@@ -602,8 +603,6 @@ STORAGE_FORMAT_VERSION = 1
         edges_hot.fgb                   -- EdgeHotPage: topo, flags, gen, label_id, weight, endpoints inline
         adj_over.fgb                    -- AdjacencyOverflowPage: для вершин с degree > 16/8
         adj_over_cl.fgb                 -- CrossLevelAdjacencyOverflowPage
-        edge_inc_over.fgb               -- EdgeIncidencePage: для атомов с degree > 16/8
-        edge_inc_over_cl.fgb            -- CrossLevelEdgeIncidencePage
         props.fgb                       -- PropHeapPage: PropertyMap в slotted-page layout
         subgraphs.fgb                   -- SubgraphDirPage: арена подграфов
         labels.fgb                      -- LabelDictionary: node/edge labels + prop keys
@@ -612,8 +611,6 @@ STORAGE_FORMAT_VERSION = 1
         freelist_props.fgb              -- FreelistPage для props.fgb
         freelist_adj.fgb                -- FreelistPage для adj_over.fgb
         freelist_adj_cl.fgb             -- FreelistPage для adj_over_cl.fgb
-        freelist_edge_inc.fgb           -- FreelistPage для edge_inc_over.fgb
-        freelist_edge_inc_cl.fgb        -- FreelistPage для edge_inc_over_cl.fgb
         freelist_subgraphs.fgb          -- FreelistPage для subgraphs.fgb
         stats/
           graph_stats.fgb               -- node/edge counts, degree histograms
@@ -728,8 +725,8 @@ Total = 32 байт
 0x0005  EdgeHot             
 0x0006  AdjacencyOverflow
 0x0007  CrossLevelAdjacencyOverflow
-0x0008  EdgeIncidence
-0x0009  CrossLevelEdgeIncidence
+0x0008  Reserved (не переиспользовать)
+0x0009  Reserved (не переиспользовать)
 0x000A  PropHeap            
 0x000B  PropLargeHeap      
 0x000C  SubgraphDir         
@@ -929,7 +926,7 @@ Offset  Size  Тип        Поле             Описание
 1       1     u8         flags            EdgeFlags: 
                                             bit 0: TOMBSTONE
                                             bit 1: VISITED
-                                            bit 2: META          -- = HAS_TRANSITION | HAS_INCIDENCES
+                                            bit 2: META          -- ребро имеет meta-семантику
                                             bit 3: MULTI
                                             bit 4: BRIDGE
                                             bit 5: IN_RESULT
@@ -937,50 +934,56 @@ Offset  Size  Тип        Поле             Описание
                                             bit 7: _reserved
 2       1     u8         edge_kind_ext    Расширенная классификация:
                                             bit 0: HAS_TRANSITION   -- transition_gid != NULL_SLOT
-                                            bit 1: HAS_INCIDENCES   -- inc_page != NULL_PAGE
-                                            bits 2-7: reserved (0)
+                                            bits 1-7: reserved (0)
 3       1     u8         _pad
 4       4     u32        gen              Поколение
-8       4     u32        inv_count        Кол-во invertex конечных точек (total, ≤2 inline)
-12      4     u32        out_count        Кол-во outvertex конечных точек (total, ≤2 inline)
+8       4     u32        source_count     Кол-во source endpoint'ов (total, ≤2 inline)
+12      4     u32        target_count     Кол-во target endpoint'ов (total, ≤2 inline)
 16      4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
 20      4     u32        table_id         Таблица (для RELATION-таблиц)
 24      8     f64        weight           NaN = нет веса
 32      4     u32        transition_gid   GraphId.index() для MetaEdge; NULL_SLOT = нет
-36      4     u32        inv_sg_slot      GraphId.index() для inv_inline[0]; NULL_SLOT = тот же граф
-40      4     u32        out_sg_slot      GraphId.index() для out_inline[0]; NULL_SLOT = тот же граф
+36      4     u32        source_sg_slot   GraphId.index() для source_inline[0]; NULL_SLOT = тот же граф
+40      4     u32        target_sg_slot   GraphId.index() для target_inline[0]; NULL_SLOT = тот же граф
 44      4     u32        props_slot       Индекс слота в SlotDirectory PropHeapPage
 48      4     u32        props_len        Длина сериализованного PropertyMap
 52      4     u32        _pad
 56      8     u64        props_page       page_no в props.fgb
-64      8     u64        inv_overflow     page_no overflow для invertex
-72      8     u64        out_overflow     page_no overflow для outvertex
-80      8     u64        inc_page         page_no EdgeIncidence list; NULL_PAGE = нет
-88      8     u64        inv_sg_overflow  page_no overflow для inv_sg_slot
-96      8     u64        out_sg_overflow  page_no overflow для out_sg_slot
+64      8     u64        source_overflow  page_no overflow для source endpoint'ов
+72      8     u64        target_overflow  page_no overflow для target endpoint'ов
+80      8     —          _reserved0       Зарезервировано; обнулить при записи
+88      8     u64        source_sg_overflow page_no overflow для source_sg_slot
+96      8     u64        target_sg_overflow page_no overflow для target_sg_slot
 104     8     —          _reserved        Выравнивание массивов endpoint'ов на 16 байт
-112     16    [u64; 2]   inv_inline       Inline invertex: DiskAtomRef
-128     16    [u64; 2]   out_inline       Inline outvertex: DiskAtomRef
+112     16    [u64; 2]   source_inline    Inline source endpoint'ы: DiskAtomRef
+128     16    [u64; 2]   target_inline    Inline target endpoint'ы: DiskAtomRef
 144     16    —          _reserved        Зарезервировано под эволюцию формата; обнулить при записи
 Total = 160 байт
 ```
 
-**Почему инлайн 2.** Бинарное ребро — подавляющее большинство — имеет ровно `inv_count = 1` и `out_count = 1`, поэтому двух inline-ячеек достаточно с запасом; гиперрёбра уходят в overflow в любом случае. Инлайн 4 при 8-байтовых ссылках стоил бы лишних 32 байта на каждое ребро ради редкого случая.
+**Почему инлайн 2.** Бинарное ребро — подавляющее большинство — имеет ровно
+`source_count = 1` и `target_count = 1`, поэтому двух inline-ячеек достаточно с запасом;
+гиперрёбра уходят в overflow в любом случае. Инлайн 4 при 8-байтовых ссылках стоил бы
+лишних 32 байта на каждое ребро ради редкого случая.
 
 **Почему счётчики u32, а не u8.** Прежний `u8` ограничивал гиперребро 255 конечными точками; для гиперграфов это произвольное и слишком низкое ограничение.
 
 **Инварианты:**
-- При `topo ∈ {Directed, Undirected, Bidirectional, Loop}`: `inv_count + out_count = 2`.
-- При `topo ∈ {HyperDirected, HyperUndirected}`: `inv_count + out_count ≥ 2`.
-- При `topo ∈ {Undirected, HyperUndirected}`: все вершины в `inv_inline`; `out_count = 0`.
-- При `inv_count > 2` или `out_count > 2` — соответствующий overflow активен.
-- `inc_page != NULL_PAGE` означает MetaEdge (edge-to-edge инциденции в отдельной странице).
+- При `topo ∈ {Directed, Undirected, Bidirectional, Loop}`: `source_count + target_count = 2`.
+- При `topo ∈ {HyperDirected, HyperUndirected}`: `source_count + target_count ≥ 2`.
+- При `topo ∈ {Undirected, HyperUndirected}`: все endpoint'ы находятся в `source_inline`/`source_overflow`; `target_count = 0`.
+- При `source_count > 2` или `target_count > 2` — соответствующий overflow активен.
+- Каждый endpoint является валидным `DiskAtomRef` любого kind; edge-endpoint не меняет флаг `META`.
+- Inline- и overflow-части логически образуют один массив на каждой стороне. `RELATE ...
+  ORDER BY TAIL/TARGETS` обязывает запись, compaction и recovery сохранять порядок этого
+  массива; без такого предложения API не обещает порядок обхода.
 
 **Хранение cross-level endpoints:**
-- Для CROSS_LEVEL=0: inv_inline/out_inline содержат DiskAtomRef (slot в пространстве текущего графа) - стандартное поведение.
-- Для CROSS_LEVEL=1: inv_inline/out_inline содержат DiskAtomRef атомов **в пространстве подграфа, которому они принадлежат**. Чтобы получить полный QualifiedAtomRef, нужен sg_slot их подграфа.
-  inv_sg_slot/out_sg_slot покрывают простейший случай: одно inv и одно out с разными уровнями.
-  Для гиперрёбер с несколькими cross-level endpoints — полные QualifiedAtomRef хранятся в overflow-странице inv_sg_overflow/out_sg_overflow (CrossLevelAdjacencyOverflowPage).
+- Для CROSS_LEVEL=0: `source_inline`/`target_inline` содержат DiskAtomRef в пространстве текущего графа.
+- Для CROSS_LEVEL=1: inline-ссылки содержат DiskAtomRef атомов **в пространстве подграфа, которому они принадлежат**. Чтобы получить полный QualifiedAtomRef, нужен `*_sg_slot`.
+  `source_sg_slot`/`target_sg_slot` покрывают простейший бинарный случай.
+  Для нескольких cross-level endpoint'ов полные QualifiedAtomRef хранятся в
+  `source_sg_overflow`/`target_sg_overflow` (CrossLevelAdjacencyOverflowPage).
 
 ### 11.2. EdgeHotPage layout
 
@@ -1004,37 +1007,11 @@ byte_offset      = 32 + slot_within_page × 160
 
 Слоты вершин и рёбер имеют одинаковый размер (160 байт) и одинаковую плотность (102 на страницу), поэтому арифметика адресации у них общая — это упрощает и код, и дефрагментацию.
 
-### 11.3. EdgeIncidencePage
+### 11.3–11.4. Зарезервированные коды
 
-Для MetaEdge (edge-to-edge инциденции).
-
-```
-PageHeader: (magic=MAGIC_EDGE_INC, type=EdgeIncidence)
-```
-
-Формат AdjacencyOverflowPage (§12), но записи имеют другой формат:
-
-```
-entry (16 байт): peer_disk_ref(u64) + role(u8) + _pad(7)
-```
-
-где `role` = 0=Source, 1=Target, 2=Control (совпадает с `EdgeRole` из `edge.rs`).
-
-### 11.4. CrossLevelEdgeIncidencePage
-
-То же самое, что и EdgeIncidencePage, но имеет другой вид entries для overflow-страницы с несколькими cross-level endpoints:
-
-```
-PageHeader: (magic=MAGIC_EDGE_INC_CL, type=CrossLevelEdgeIncidence)
-```
-
-```
-entry (16 байт):
-      sg_slot:    u32   -- GraphId.index() подграфа
-      role:       u8    -- 0=Source, 1=Target, 2=Control
-      _pad:       u8[3]
-      local_ref:  u64   -- DiskAtomRef в пространстве подграфа
-```
+Коды PageType `0x0008` и `0x0009` зарезервированы для совместимости формата и не
+переиспользуются. Отдельных страниц edge-to-edge-инцидентности нет: такие endpoint'ы
+хранятся в `EdgeHotSlot` и обычных endpoint overflow-страницах (§11–§12).
 
 ---
 
@@ -1069,7 +1046,7 @@ PageHeader: (magic=MAGIC_ADJ_OVER_CL, type=CrossLevelAdjacencyOverflow)
 ```
 overflow_entry_cl (16 байт):
       sg_slot:    u32   -- GraphId.index() подграфа
-      role:       u8    -- 0=inv, 1=out
+      side:       u8    -- 0=source, 1=target
       _pad:       u8[3]
       local_ref:  u64   -- DiskAtomRef в пространстве подграфа
 → 16336 / 16 = 1021 entries per page
@@ -2492,7 +2469,7 @@ PatternCatalogPage (patterns_root → B+tree leaf):
 
 **Структура:** B+tree.
 - Ключ: DiskAtomRef ребра-endpoint (QualifiedAtomRef при CROSS_LEVEL)
-- Значение: список записей (edge_ref, role)
+- Значение: список записей `(edge_ref, side)`
 
 ```
 Header:
@@ -2505,19 +2482,22 @@ Header:
 LeafEntry (24 байта):
   endpoint_ref:  u64  -- DiskAtomRef ребра, выступающего endpoint'ом (ключ)
   edge_ref:      u64  -- DiskAtomRef ребра, у которого оно endpoint
-  role:          u8   -- 0=inv (Source), 1=out (Target)
+  side:          u8   -- 0=source, 1=target
   _pad:          u8[7]
 ```
 
 **Создаётся автоматически** при наличии хотя бы одного ребра с is_edge(endpoint) = true.
+Для каждого edge-endpoint записывается одна строка на фактическую сторону. Insert/delete
+выполняется в той же транзакции, что и изменение `EdgeHotSlot`; vertex-endpoint'ы в индекс
+не попадают.
 
 **Использование при traversal:**
 1. Текущий атом = ребро $e_1$ (AtomWalk-режим)
-2. $`EdgeEndpointIndex.lookup(e_1)$` → список ($e_n$, role)
+2. `EdgeEndpointIndex.lookup(e_1)` → список `(e_n, side)`
 3. Для каждого $e_n$ → противоположные endpoint'ы из `EdgeHotSlot` → следующие атомы
 
-**Participation-инцидентность (EdgeIncidence)** хранится в `EdgeIncidencePage` (уже определённой в §11.3), не в `EdgeEndpointIndex`. 
-Два разных индекса для двух разных видов инцидентности.
+Это единственный дополнительный access path для edge-endpoint'ов. Источником истины остаются
+`source`/`target` ребра; индекс полностью перестраиваем.
 
 ### 20.13. Bulk-сборка индексов
 
@@ -2608,7 +2588,7 @@ target = floor(usable_leaf_space × FILL_FACTOR)
 | HNSW                                | Параллельная сборка в памяти, сериализация один раз                              | не применимо                |
 | Geometry R-tree                     | STR-упаковка (Sort-Tile-Recursive)                                               | да, 2 сортировки на уровень |
 | Reachability / Neighbourhood / Path | Вычисляются **после** загрузки; вход уже упорядочен по `DiskAtomRef`             | нет                         |
-| EdgeEndpoint                        | Сортировка `(endpoint_ref, edge_ref, role)`                                      | да                          |
+| EdgeEndpoint                        | Сортировка `(endpoint_ref, edge_ref, side)`                                      | да                          |
 
 **Проверка уникальности бесплатна.** В отсортированном потоке нарушение уникальности — это ровно пара соседних записей с равным префиксом-ключом. Одно сравнение с предыдущей записью, `O(1)` памяти, ноль обращений к диску — вместо спуска по дереву на каждую строку только ради ответа на вопрос «есть ли дубликат».
 
@@ -2966,9 +2946,9 @@ read_page(PageKey, snapshot_lsn):
 1. Построить slot_remap: HashMap<old_slot, new_slot> для живых атомов;
 2. Записать новый nodes_hot.fgb в tmp: переупорядочить слоты;
 3. Для каждого EdgeHotSlot:
-   - inv_inline[], out_inline[] — применить remap к каждому элементу;
-   - inv_sg_slot, out_sg_slot — это GraphId, не DiskAtomRef, не трогать;
-4. Применить remap к AdjacencyOverflowPage, CrossLevelAdjacencyOverflowPage (local_ref), EdgeIncidencePage (peer_disk_ref), CrossLevelEdgeIncidencePage;
+   - source_inline[], target_inline[] — применить remap к каждому элементу;
+   - source_sg_slot, target_sg_slot — это GraphId, не DiskAtomRef, не трогать;
+4. Применить remap к AdjacencyOverflowPage и CrossLevelAdjacencyOverflowPage (local_ref);
 5. NodeHotSlot adjacency (adj_out, adj_in, adj_undir) — это edge slots,
    применить remap если рёбра тоже дефрагментируются
 6. EdgeEndpointIndex — перестроить полностью (endpoint_ref и edge_ref оба меняются)
@@ -2987,7 +2967,7 @@ read_page(PageKey, snapshot_lsn):
 
 ### 24.4. Алгоритм освобождения цепочек страниц.
 
-Цепочки страниц используются в: `PropLargeChunkPage`, `AdjacencyOverflowPage` (и cross-level варианте), `EdgeIncidencePage`,
+Цепочки страниц используются в: `PropLargeChunkPage`, `AdjacencyOverflowPage` (и cross-level варианте),
 `DictEntryPage`, `SubgraphDirPage`, B+tree страницах (leaf linked list), `PostingPage`, `TermDictPage` , 
 `NeighbourhoodListPage`, `LandmarkListPage`, `VectorDataPage`, `ChangefeedPage` и так далее.
 
@@ -3109,7 +3089,8 @@ fn hot_offset(slot: u64)  -> usize { (32 + (slot % SLOTS_PER_HOT_PAGE) * HOT_SLO
 
 ## 26. Тензорные представления
 
-Дисковый формат хранения матричных и тензорных представлений графов, описанных в [gql_spec.md](gql_spec.md) §5.11.
+Дисковый формат хранения матричных и тензорных представлений графов, описанных в
+[gql_spec.md](gql_spec.md) §3.8.4.
 
 ### 26.1. Режимы хранения
 
@@ -3123,9 +3104,7 @@ fn hot_offset(slot: u64)  -> usize { (32 + (slot % SLOTS_PER_HOT_PAGE) * HOT_SLO
 
 ```
 PageHeader(32) (magic=MAGIC_TENSOR, type=TensorCache)
-  tensor_kind:  u8    -- 0=endpoint_source, 1=endpoint_target,
-                      -- 2=participation_source, 3=participation_target,
-                      -- 4=participation_control
+  tensor_kind:  u8    -- 0=endpoint_source, 1=endpoint_target
   format:       u8    -- 0=dense_u8, 1=csr_u8
   n_atoms:      u32   -- число строк (atoms)
   n_edges:      u32   -- число столбцов (edges)
@@ -3212,11 +3191,11 @@ TensorCachePage инвалидируется при любом изменени�
 
 **Статистика** (§19.5)
 
-| Параметр                        | Тип   | Default | Описание                                                    |
-|---------------------------------|-------|---------|---------------------------------------------------------------|
-| `FG_STATS_HISTOGRAM_BUCKETS`    | usize | 100     | Число корзин equi-depth гистограммы                          |
-| `FG_STATS_SAMPLE_ROWS`          | usize | 30000   | Размер выборки для `ANALYZE`, не зависит от размера таблицы  |
-| `FG_STATS_FULL_SCAN_THRESHOLD`  | usize | 32      | Таблицы меньше N страниц анализируются полным сканом         |
+| Параметр                       | Тип   | Default | Описание                                                    |
+|--------------------------------|-------|---------|-------------------------------------------------------------|
+| `FG_STATS_HISTOGRAM_BUCKETS`   | usize | 100     | Число корзин equi-depth гистограммы                         |
+| `FG_STATS_SAMPLE_ROWS`         | usize | 30000   | Размер выборки для `ANALYZE`, не зависит от размера таблицы |
+| `FG_STATS_FULL_SCAN_THRESHOLD` | usize | 32      | Таблицы меньше N страниц анализируются полным сканом        |
 
 ---
 

@@ -288,48 +288,55 @@ LET $_ = SELECT * FROM player WHERE class = 'mage';
 1. строка, именование `table`;
 2. любой допустимый для `id` тип данных.
 
-### 3.8. Полная классификация инцидентности
+### 3.8. Единая endpoint-инцидентность
 
-Ребро `e` мета-графа описывается двумя непересекающимися механизмами:
+Пусть $N = V \cup MV$ — вершины, $R = E \cup ME$ — рёбра, а $A = N \cup R$ — все атомы.
+Каждое ребро $r \in R$ хранит две стороны одного топологического отношения:
+`source(r)` и `target(r)`, элементы которых принадлежат $A$. Отдельного механизма
+инцидентности для связи рёбер с рёбрами нет.
 
-#### 3.8.1. Endpoint-инцидентность ($V_e$ и $W_e$)
+| Вид endpoint'ов  | `source(r)`   | `target(r)`   | Режим пути             |
+|------------------|---------------|---------------|------------------------|
+| V–V              | vertex        | vertex        | `StandardPath`         |
+| V–E              | vertex        | edge          | `AtomWalk`             |
+| E–V              | edge          | vertex        | `AtomWalk`             |
+| E–E              | edge          | edge          | `AtomWalk`             |
+| Hyper, смешанный | atom[]        | atom[]        | по kind'ам endpoint'ов |
+| Cross-level      | atom уровня k | atom уровня m | как выше               |
 
-Endpoint — любой атом (вершина, мета-вершина, ребро, мета-ребро, гиперребро), указанный в `invertex` (Vₑ) или `outvertex` (Wₑ) ребра.
-Endpoint-инцидентность — симметричная запись: ребро хранит ссылки на свои концы, концы не обязаны знать о ребре.
+`source` и `target` — структурные стороны направленного ребра, а не предметные роли.
+Для неориентированного ребра существует одно множество endpoint'ов; физически оно хранится
+в `source`, а `target` пуст. Для двунаправленного ребра обе стороны заданы, но переход
+разрешён в обоих направлениях.
 
-| Тип инцидентности | $V_e$                     | $W_e$                              | Пример применения                        |
-|-------------------|---------------------------|------------------------------------|------------------------------------------|
-| V–V (стандартная) | vertex                    | vertex                             | Обычное ребро между вершинами            |
-| V–E               | vertex                    | edge                               | Ребро от вершины к другому ребру         |
-| E–V               | edge                      | vertex                             | Ребро от ребра к вершине                 |
-| E–E               | edge                      | edge                               | Ребро, соединяющее два ребра напрямую    |
-| Hyper (смешанный) | atom[]                    | atom[]                             | Гиперребро: несколько атомов любых типов |
-| Cross-level       | $\text{atom}_i$ (level k) | $\text{atom}_j$ (level $m \neq k$) | Ребро пересекает уровни вложенности      |
+Путь всегда проходит через само связывающее ребро. Связь E–E имеет вид
+$e_1, r, e_2$, где $r$ — отдельное ребро, endpoint'ами которого являются $e_1$ и $e_2$.
+Формы, соединяющие два атома без промежуточного ребра, не существуют. V–E, E–V и E–E
+доступны только в `AtomWalk` (§15.2); обычное V–V-подмножество доступно в `StandardPath`.
 
-**Endpoint-инцидентность определяет путь.** Traversal следует по endpoint-связям. 
-Для V–E, E–V, E–E инцидентности требуется `AtomWalk` (см. §15.2).
+Для обратного поиска поддерживается `EdgeEndpointIndex`: по edge-атому он возвращает
+рёбра, в чьём `source` или `target` этот атом находится. Индекс не вводит новую
+инцидентность и может быть полностью восстановлен из endpoint'ов.
 
-**Кросс-уровневые рёбра** соединяют конкретные атомы независимо от уровня вложенности подграфов. 
-Ребро хранит прямые ссылки на конечные атомы; флаг `CROSS_LEVEL` указывает, что хотя бы один endpoint принадлежит другому подграфу.
+**Кросс-уровневые рёбра** соединяют конкретные атомы той же endpoint-инцидентностью независимо от уровня вложенности подграфов.
+Ребро так же хранит прямые ссылки на конечные атомы; флаг `CROSS_LEVEL` указывает, что хотя бы один endpoint принадлежит другому подграфу.
 
-#### 3.8.2. Participation-инцидентность (EdgeIncidence)
 
-Вторичный механизм MetaEdge: ребро $`e_1`$ связано с ребром $`e_2`$ через структуру `EdgeIncidence { peer, role }`. 
+#### 3.8.1. Метки, свойства и предметная семантика
 
-Роли:
+`source` и `target` — единственные структурные стороны endpoint-инцидентности. GrynQL не
+задаёт встроенных предметных ролей участников и не резервирует для них отдельный enum.
 
-| Роль      | Значение                                                                |
-|-----------|-------------------------------------------------------------------------|
-| `Source`  | $e_1$ является источником в отношении $e_2$                             |
-| `Target`  | $e_1$ является целью в отношении $e_2$                                  |
-| `Control` | $e_1$ управляет или ограничивает $e_2$ (нет направленности зависимости) |
+Предметный смысл задаётся пользовательской схемой: label связывающего ребра определяет
+вид отношения, а его свойства — дополнительные данные отношения. Для гиперребра `head`
+и `tail` также описывают только направление обхода, а не предметные роли endpoint'ов.
+Конкретные способы моделирования финансовых, юридических и иных доменов находятся вне
+этой спецификации.
 
-Participation-инцидентность **не изменяет** $V_e$ / $W_e$ ребра и не является endpoint-инцидентностью. Два отдельных механизма не смешиваются.
+#### 3.8.2. MetaEdge и transition-подграф
 
-#### 3.8.3. MetaEdge и transition-подграф
-
-MetaEdge — ребро с возможностью хранения внутреннего `transition_graph` (подграфа). 
-Ребро остаётся связью между атомами ($V_e$ / $W_e$ не изменяются), но несёт дополнительную структуру: 
+MetaEdge — ребро с возможностью хранения внутреннего `transition_graph` (подграфа).
+Ребро остаётся связью между атомами (`source`/`target` не изменяются), но несёт дополнительную структуру:
 граф, описывающий «поведение» или «протокол» данной связи.
 
 Пример: ребро `[:SEND_MESSAGE]` между двумя компонентами может хранить
@@ -337,10 +344,13 @@ MetaEdge — ребро с возможностью хранения внутр�
 
 Доступ к transition-подграфу: `graph::inner(e)` для MetaEdge.
 
-#### 3.8.4. Кросс-уровневые рёбра и LevelPath
+Наличие edge-endpoint'а само по себе не делает ребро MetaEdge. MetaEdge отличается
+внутренним подграфом и/или `transition_graph`; его endpoint'ы используют тот же механизм.
+
+#### 3.8.3. Кросс-уровневые рёбра и LevelPath
 
 Ребро помечается флагом `CROSS_LEVEL`, если хотя бы один его endpoint находится в подграфе, отличном от графа, содержащего ребро.
-Семантика ребра не изменяется: оно соединяет конкретные атомы — те, на которые напрямую указывают `invertex` и `outvertex`.
+Семантика ребра не изменяется: оно соединяет конкретные атомы из `source` и `target`.
 
 **LevelPath** — опциональная структура, записываемая в свойства атомов через `KEEP LEVELPATH`. 
 Содержит упорядоченную цепочку мета-вершин от самой верхней мета-вершины, содержащей endpoint, до самого endpoint:
@@ -359,72 +369,54 @@ KEEP LEVELPATH;
 -- inner_b.levelpath = [mv1, mv2]
 ```
 
-`KEEP LEVELPATH` **поддерживается только для бинарных кросс-уровневых связей** (inv_count = 1, out_count = 1). 
+`KEEP LEVELPATH` **поддерживается только для бинарных кросс-уровневых связей**
+(`source_count = 1`, `target_count = 1`).
 Для кросс-уровневых гиперрёбер используйте функцию `graph::level_path(edge)` вручную для каждого endpoint.
 
-#### 3.8.5. Матричные представления инцидентности
+#### 3.8.4. Матричное представление инцидентности
 
-Для MetaGraph определяются два базовых тензора и два производных:
+**$B_{ep}$ — Endpoint-тензор (atom $\times$ edge $\times$ side)**
 
-**$B_{ep}$ — Endpoint-тензор (atom $\times$ edge $\times$ role)**
+$B_{ep} \in \left\{ 0; 1 \right\}^{|A| \times |R| \times 2}$:
+- $B_{ep}[a, r, 0] = 1$, если $a \in \operatorname{source}(r)$;
+- $B_{ep}[a, r, 1] = 1$, если $a \in \operatorname{target}(r)$.
 
-$B_{ep} \in \left\{ 0; 1 \right\}^{|A| \times |E| \times 2}$, где $A = \text{Nodes} \cup \text{Edges}$:
-- $B_{ep}[a, e, 0] = 1$, если $a \in \text{inv}(e)$  (a является Source-endpoint ребра e)
-- $B_{ep}[a, e, 1] = 1$,  если $a \in \text{out}(e)$  (a является Target-endpoint ребра e)
-- Индекс по первой оси = все атомы: $\text{nodes} \cup \text{edges}$. Индекс по второй оси = только рёбра.
-
-Охватывает: V-V, V-E, E-V, E-E, Hyper endpoint-инцидентность.
-
-Не охватывает: Participation-инцидентность (EdgeIncidence).
-
-**$B_{pt}$ — Participation-тензор (edge $\times$ edge $\times$ role)**
-
-$B_{pt} \in \left\{ 0,1 \right\}^{|E| \times |E| \times 3}$:
-- $B_{pt}[e_1, e_2, 0] = 1$, если $e_1$ имеет EdgeIncidence с $e_2$, роль=Source
-- $B_{pt}[e_1, e_2, 1] = 1$, если $e_1$ имеет EdgeIncidence с $e_2$, роль=Target
-- $B_{pt}[e_1, e_2, 2] = 1$, если $e_1$ имеет EdgeIncidence с $e_2$, роль=Control
-
-Охватывает: только Participation-инцидентность (EdgeIncidence).
-
-$B_{ep}$ и $B_{pt}$ независимы и не смешиваются.
+Для неориентированного ребра логическое представление устанавливает обе компоненты для
+каждого endpoint'а, даже если дисковая запись хранит единое множество только в `source`.
+Тензор охватывает V–V, V–E, E–V, E–E, hyper- и cross-level-инцидентность.
 
 **C — Atom Adjacency Matrix**
 
-- $C[a_1, a_2] = \displaystyle\sum_e B_{ep}[a_1, e, 0] \cdot B_{ep}[a_2, e, 1] \cdot \text{weight}(e)$
-- $C[a_1, a_2] \neq 0 \Longleftrightarrow \exists e: a_1 \in \text{inv}(e) \wedge a_2 \in \text{out}(e)$.
+- $C[a_1, a_2] = \displaystyle\sum_r B_{ep}[a_1, r, 0] \cdot B_{ep}[a_2, r, 1] \cdot \text{weight}(r)$
+- $C[a_1, a_2] \neq 0 \Longleftrightarrow \exists r: a_1 \in \operatorname{source}(r) \wedge a_2 \in \operatorname{target}(r)$.
 
 Суммируется при мультирёбрах (взвешенная граф-матрица смежности).
 
-Полный atom $\times$ atom тензор восстанавливается из $B_{ep}$:
-- $C_{binary}[a_1, a_2] = \text{OR}_e (B_{ep}[a_1, e, 0] \; \text{AND} \; B_{ep}[a_2, e, 1])$
+Полная atom $\times$ atom смежность восстанавливается из $B_{ep}$:
+- $C[a_1, a_2] = \operatorname{OR}_r (B_{ep}[a_1, r, 0] \; \operatorname{AND} \; B_{ep}[a_2, r, 1])$
 
 Полная atom $\times$ atom матрица смежности $C = C_{vv} + C_{ve} + C_{ev} + C_{ee}$:
 - $C_{vv}[v_1, v_2]$ — через V-V рёбра (nodes $\times$ nodes)
 - $C_{ve}[v, e]$ — через V-E рёбра (nodes $\times$ edges)
 - $C_{ev}[e, v]$ — через E-V рёбра (edges $\times$ nodes)
-- $C_{ee}[e_1, e_2]$ — через E-E endpoint-рёбра (edges $\times$ edges, отдельно от D)
+- $C_{ee}[e_1, e_2]$ — через E-E endpoint-рёбра (edges $\times$ edges)
 
 $B_{ep}$ позволяет строить любую из этих подматриц фильтрацией по типу атома.
 
-**D — Edge Participation Adjacency**
-
-- $D[e_1, e_2] = \max(B_{pt}[e_1, e_2, 0], B_{pt}[e_1, e_2, 1])$
-- $D[e_1, e_2] = 1 \Longleftrightarrow$ $e_1$ имеет направленную Participation-инцидентность с $e_2$.
-
-**Реализация в Rust**: `EndpointTensor` и `ParticipationTensor` (структуры + методы) вынесены в [implementation_plan.md](implementation_plan.md) §3.5 «Тензорные представления». Ниже — их место в системе матриц.
+**Реализация в Rust**: `EndpointTensor` вынесен в
+[implementation_plan.md](implementation_plan.md) §3.5 «Тензорное представление».
 
 **Соотношение с существующими матрицами:**
 
-| Структура             | Тензор                  | Охват                                                     |
-|-----------------------|-------------------------|-----------------------------------------------------------|
-| `AdjacencyMatrix`     | $C_{vv}$                | node $\times$, взвешенная                                 |
-| `IncidenceMatrix`     | $B_{ep}$ (только nodes) | node $\times$ edge, {Source, Target, Both}                |
-| `IncidenceTensor`     | $B_{ep}$ (только nodes) | node $\times$ edge $\times$ role (3 роли включая Both)    |
-| `EndpointTensor`      | $B_{ep}$ (все атомы)    | **atom $\times$ edge $\times$ {Source, Target}** (полный) |
-| `ParticipationTensor` | $B_{pt}$                | **edge $\times$ edge $\times$ {Source, Target, Control}** |
+| Структура         | Тензор                  | Охват                                            |
+|-------------------|-------------------------|--------------------------------------------------|
+| `AdjacencyMatrix` | $C_{vv}$                | node $\times$ node, взвешенная                   |
+| `IncidenceMatrix` | $B_{ep}$ (только nodes) | node $\times$ edge, {Source, Target, Both}       |
+| `IncidenceTensor` | $B_{ep}$ (только nodes) | node $\times$ edge $\times$ side                 |
+| `EndpointTensor`  | $B_{ep}$ (все атомы)    | **atom $\times$ edge $\times$ {Source, Target}** |
 
 `IncidenceMatrix` и `IncidenceTensor` сохраняются для обратной совместимости.
-`EndpointTensor` и `ParticipationTensor` — новые компоненты
+`EndpointTensor` — полное представление единого механизма.
 
 ### 3.9. Ограничения типов графов
 
@@ -698,23 +690,23 @@ FROM person GROUP ALL;
 
 ### 5.4. Доменные типы
 
-| Тип              | Описание                                           |
-|------------------|----------------------------------------------------|
-| `vertex<T?>`     | Атом–вершина; T — метка (опционально)              |
-| `metavertex<T?>` | Атом–метавершина с вложенным подграфом             |
-| `edge<T?>`       | Атом–ребро                                         |
-| `hyperedge<T?>`  | Гипер–ребро                                        |
-| `metaedge<T?>`   | Атом–метаребро с transition-подграфом              |
-| `atom<T?>`       | Любой атом (vertex, edge, meta*)                   |
-| `path`           | Путь в графе                                       |
+| Тип              | Описание                                                                          |
+|------------------|-----------------------------------------------------------------------------------|
+| `vertex<T?>`     | Атом–вершина; T — метка (опционально)                                             |
+| `metavertex<T?>` | Атом–метавершина с вложенным подграфом                                            |
+| `edge<T?>`       | Атом–ребро                                                                        |
+| `hyperedge<T?>`  | Гипер–ребро                                                                       |
+| `metaedge<T?>`   | Атом–метаребро с transition-подграфом                                             |
+| `atom<T?>`       | Любой атом (vertex, edge, meta*)                                                  |
+| `path`           | Путь в графе                                                                      |
 | `subgraph`       | Самодостаточный материализованный результат с сохранением выбранной инцидентности |
-| `graph`          | Универсальный граф: multi-/hyper-/meta-граф и cross-level incidence                |
-| `tree`           | Классический vertex-edge граф с инвариантом дерева                                 |
-| `rooted_tree`    | `tree` с выбранным корнем и ориентацией                                             |
-| `forest`         | Набор классических деревьев                                                         |
-| `dag`            | Классический directed vertex-edge ациклический граф                                |
-| `hypergraph`     | Vertex-hyperedge граф без meta-атомов и cross-level incidence                      |
-| `metagraph`      | Универсальный граф с meta-атомами и вложенными графами                             |
+| `graph`          | Универсальный граф: multi-/hyper-/meta-граф и cross-level incidence               |
+| `tree`           | Классический vertex-edge граф с инвариантом дерева                                |
+| `rooted_tree`    | `tree` с выбранным корнем и ориентацией                                           |
+| `forest`         | Набор классических деревьев                                                       |
+| `dag`            | Классический directed vertex-edge ациклический граф                               |
+| `hypergraph`     | Vertex-hyperedge граф без meta-атомов и cross-level incidence                     |
+| `metagraph`      | Универсальный граф с meta-атомами и вложенными графами                            |
 
 ### 5.5. Иерархия типов (частичная)
 
@@ -852,9 +844,9 @@ GQL различает три типа путей с разной семанти
 
 Классическое чередование: $vertex_0, edge_1, vertex_1, edge_2, ..., edge_n, vertex_n$.
 
-Инварианты:
-- Нечётные позиции (0, 2, 4, ...) — только вершины (vertex или meta-vertex).
-- Чётные позиции (1, 3, 5, ...) — только рёбра.
+Инварианты (при индексации с нуля):
+- Чётные позиции (0, 2, 4, ...) — только вершины (vertex или meta-vertex).
+- Нечётные позиции (1, 3, 5, ...) — только рёбра.
 - Каждое ребро $e_i$ соединяет $vertex_{i-1}$ и $vertex_i$ через endpoint-инцидентность.
 
 Длина пути: количество рёбер (= количество шагов).
@@ -863,38 +855,49 @@ GQL различает три типа путей с разной семанти
 
 #### 5.11.2. AtomWalk
 
-Обобщение StandardPath: $atom_0, incidence_1, atom_1, incidence_2, ..., incidence_n, atom_n$.
+Расширение StandardPath: $atom_0, edge_1, atom_1, edge_2, ..., edge_n, atom_n$.
 
 Отличия от StandardPath:
-- Любые атомы в «узловых» позициях.
-- Инцидентность может быть endpoint или participation.
-- Ребро может выступать промежуточным «узлом» пути.
+- в endpoint-позициях разрешены любые атомы из $A = V \cup MV \cup E \cup ME$;
+- связывающие рёбра остаются в нечётных позициях и не исчезают из пути;
+- edge-атом может быть endpoint'ом одного ребра и связывающим ребром другого шага.
 
-Включается ключевым словом `ATOM` в MATCH или TRAVERSE:
+Включается ключевым словом `ATOM` в `MATCH`, `TRAVERSE`, `RELATE` и других операторах,
+которые принимают графовый паттерн:
 ```
-MATCH ATOM (a)~[e1]~><(e_mid:edge)>~[e2]~>(b)
+MATCH ATOM <(a:Person)>~[e1:ANNOTATES]~><[e_mid:FRIEND]>~[e2:OWNED_BY]~><(b:Person)>
 ```
 
 Синтаксис AtomWalk:
-- классические `()`, `[]`, `->`, `-`, `<-` для endpoint-инцидентности
-- `~>` — направленная participation incidence (Source→Target)
-- `~` — ненаправленная participation incidence
-- `<(x:type)>` — атом типа `type` (любой подтип типа `atom`) в узловой позиции пути
+- `~[r]~>` / `<~[r]~` — направленный шаг через явное ребро `r`;
+- `~[r]~` — неориентированный шаг;
+- `<~[r]~>` — двунаправленный шаг;
+- `<(v:Label)>` — vertex endpoint, `<[e:Label]>` — edge endpoint; внутри обёртки сохраняется
+  семантика `alias:Label`, как и для StandardPath.
 
-Длина пути: количество инцидентностей (шагов).
+Kind endpoint'а определяется только внутренними delimiters, а label остаётся пользовательским
+ограничением. Например, `<(x:edge)>` означает vertex с label `edge`, а не edge-атом; edge-атом
+с тем же label записывается как `<[x:edge]>`.
+
+Каждый endpoint в операции с ключевым словом `ATOM` обязан использовать одну из этих двух
+обёрток. Тильда и явное связывающее ребро `[alias]`, `[:Label]` или `[alias:Label]`
+обязательны, поэтому AtomWalk визуально отличается от StandardPath. Форм `~~`, `~>`,
+`~[]~>` и других анонимных связей нет.
+
+Длина пути: количество связывающих рёбер (= количество шагов), как в StandardPath.
 
 Пример: E–E incidence-путь:
 ```
--- e1 связано с e2 через Participation-инцидентность (Target-роль)
-MATCH ATOM [e1:TRANSITION]~>[e2:RESULT]
+-- flow связывает два edge-атома как source и target
+MATCH ATOM <[e1:TRANSFER]>~[flow:FLOW]~><[e2:TRANSFER]>
 RETURN e1, e2;
 ```
 
 Пример: V–E endpoint-путь:
 ```
 -- Вершина alice соединена endpoint-ребром с ребром friendship
-MATCH ATOM (alice:Person)~[annotation:ANNOTATES]~><(target:edge)>
-RETURN alice, annotation, target;
+MATCH ATOM <(alice:Person)>~[annotation:ANNOTATES]~><[friendship:FRIEND]>
+RETURN alice, annotation, friendship;
 ```
 
 #### 5.11.3. LevelPath
@@ -902,7 +905,7 @@ RETURN alice, annotation, target;
 Не traversal-механизм. Цепочка мета-вершин, описывающая иерархию вложенности от внешнего уровня до конкретного атома:
 $`\text{LevelPath} = [mv_1, mv_2, ..., mv_n, leaf_atom]``$, где $mv_1 \supset mv_2 \supset \dots \supset mvₙ \supset leaf_atom$ (вложенность).
 
-Опционально записывается в свойства ребра через `KEEP LEVELPATH` при создании или выборке кросс-уровневого ребра (см. §3.8.4). 
+Опционально записывается в свойства ребра через `KEEP LEVELPATH` при создании или выборке кросс-уровневого ребра (см. §3.8.3).
 Тип поля — `array<atom>`.
 
 `LevelPath` не участвует в traversal, к нему нельзя применять path-функции `path::nodes()`, `path::edges()`, `path::length()`. 
@@ -1359,7 +1362,10 @@ DEFINE EVENT archive_person ON TABLE person WHEN $event = "DELETE" THEN {
 Создаёт рёбра между существующими атомами.
 
 ```
-RELATE @from_atom [<- | - | ->] @edge_atom [<- | - | ->] @to_atom
+RELATE (
+      @from_vertex [<- | -] @edge_atom [-> | -] @to_vertex
+    | ATOM @from_atom [<~ | ~] @edge_atom [~> | ~] @to_atom
+)
     [ WEIGHTED @value ]
     [ CONTENT @object | SET @field = @value [, ...] ]
     [ RETURN NONE | BEFORE | AFTER | DIFF | @field [, ...] | VALUE @field ]
@@ -1370,11 +1376,25 @@ RELATE @from_atom [<- | - | ->] @edge_atom [<- | - | ->] @to_atom
 ```
 
 По умолчанию оба endpoint'а бинарного `RELATE` после binding должны быть vertex-атомами.
-`RELATE ATOM` использует incidence-маркеры: `(...)` требует vertex endpoint, `[...]` —
-edge/metaedge endpoint. Это разрешает V–E, E–V и E–E endpoint-инцидентность; несовпадение
-маркера с фактическим kind является semantic error до мутации. Направления `~[...]~>`,
-`<~[...]~`, `~[...]~`, `<~[...]~>` зеркальны четырём направлениям обычного `RELATE`.
-`ATOM` не превращает ребро в гиперребро и не снимает проверку существования endpoint'ов.
+`RELATE ATOM` расширяет их домен до любого атома и требует тильда-синтаксис:
+`~[...]~>`, `<~[...]~`, `~[...]~`, `<~[...]~>`. 
+Атомы endpoint записываются как `<(...)>` и `<[...]>` для атомов-вершин и атомов-рёбер соответственно;
+`[...]` всегда обозначает создаваемое связывающее ребро. 
+Несовпадение с фактическим kind является semantic error до мутации.
+`ATOM` не превращает ребро в гиперребро и не снимает проверку endpoint'ов.
+
+`MATCH` и `RELATE` используют разные внутренние формы endpoint'а:
+
+- в `MATCH ATOM <(alice:Person)>` имя `alice` создаёт alias, а `Person` ограничивает label;
+- в `RELATE ATOM <(person:alice)>` значение `person:alice` — `record_id` существующей
+  vertex-записи; аналогично `<[friendship:alice_bob]>` ссылается на edge-запись;
+- в `RELATE ATOM <(v)>` имя `v` — idiom с уже связанным значением, а не новый alias;
+- `[r:ANNOTATES]` между endpoint'ами задаёт alias и label создаваемого ребра.
+
+Таким образом, `name` из грамматики является лишь общей лексической формой. Alias, label,
+имя таблицы и id записи не зависят друг от друга; значение двоеточия определяется
+контекстом `MATCH` или `RELATE`. Чтобы выбрать endpoint по label, сначала выполняется
+`MATCH`, затем его alias передаётся в `RELATE`.
 
 **Направление** задаётся стрелками вокруг метки ребра:
 
@@ -1385,25 +1405,41 @@ edge/metaedge endpoint. Это разрешает V–E, E–V и E–E endpoint
 | `(a)-[:E]-(b)`   | Неориентированное ребро     |
 | `(a)<-[:E]->(b)` | Двунаправленное ребро       |
 
-**Гиперрёбра** — отдельный синтаксис через `TARGETS`:
+**Гиперрёбра** — n-арная форма того же endpoint-механизма. `ATOM` и `HYPER`
+ортогональны: `RELATE HYPER` допускает только vertex endpoint'ы, а `RELATE ATOM HYPER` —
+любые атомы.
 
 ```
-RELATE HYPER [e:E] TARGETS [(a:A), (b:B), (c:C)]
-  [ AS DIRECTED [ (head: a, tail: [b, c]) ]
+RELATE HYPER [e:E]
+  TARGETS [a=(entity:a), b=(entity:b), c=(entity:c)]
+  [ AS DIRECTED [ (head: [a], tail: [b, c]) ]
    | AS UNDIRECTED
-   | AS BOTH [ (head: a, tail: [b, c]) ]
+   | AS BOTH [ (head: [a], tail: [b, c]) ]
   ]
+  [ ORDER BY TAIL | ORDER BY TARGETS ];
+
+RELATE ATOM HYPER [e:E]
+  TARGETS [a=<(entity:a)>, link=<[relation:link]>, c=<(entity:c)>]
+  [ AS DIRECTED [ (head: [a, link], tail: [c]) ]
+   | AS UNDIRECTED
+   | AS BOTH [ (head: [a, link], tail: [c]) ]
+  ]
+  [ ORDER BY TAIL | ORDER BY TARGETS ]
 ;
 ```
 
-Для гиперрёбер с `AS DIRECTED`: 
-- первый элемент — источник (head), 
-- остальные — назначение (tail); 
-- или явное указание через `head:` / `tail:`.
+В терминологии Ferros-Grynn `head` — входная сторона (`source`), `tail` — выходная
+сторона (`target`). Обе стороны являются неотсортированными множествами, поэтому направленное гиперребро может
+иметь несколько `head`. Если разбиение не задано, первый элемент `TARGETS` становится
+единственным `head`, остальные — `tail`.
 
-Хвост (tail) обходится в заданном порядке в случае его задания, в противном случае — в порядке указания в `TARGETS`.
+Порядок порождения веток без `ORDER BY` не определён. При явном `tail` предложение
+`ORDER BY TAIL` сохраняет его порядок; без явного разбиения `ORDER BY TARGETS` использует
+порядок `TARGETS`: для directed/both — после исключения неявного `head`, для undirected —
+целиком. Эти формы взаимоисключающие и задают
+порядок endpoint'ов ребра, а не сортировку результирующих строк.
 
-Для гиперрёбер с `AS BOTH`: семантика аналогична `AS DIRECTED`, но разрешён обходи и в обратную сторону.
+Для гиперрёбер с `AS BOTH` семантика аналогична `AS DIRECTED`, но обход разрешён и в обратную сторону.
 
 `WEIGHTED @value` задаёт числовой вес ребра — обязательный атрибут для взвешенных / темпоральных / вероятностных графов.
 
@@ -1416,7 +1452,14 @@ RELATE (person:alice)-[:FRIEND { since: "2020-01-01" }]->(person:bob)
 
 -- Гиперребро
 RELATE HYPER [:COAUTHOR] TARGETS [person:alice, person:bob, person:carol]
-  AS UNDIRECTED SET paper = "paper:xyz";
+  AS UNDIRECTED ORDER BY TARGETS SET paper = "paper:xyz";
+
+-- Смешанное гиперребро: два source-атома и два target-атома
+RELATE ATOM HYPER [:ACTIVATES]
+  TARGETS [sensor=<(sensor:temperature)>, guard=<[relation:guard]>,
+           alarm=<(alarm:main)>, audit=<[relation:audit]>]
+  AS DIRECTED (head: [sensor, guard], tail: [alarm, audit])
+  ORDER BY TAIL;
 ```
 
 ### 8.6. INFO
@@ -1929,7 +1972,7 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     ]
     [ DIRECTION OUT | IN | BOTH ]
     [ COMMENT @string ]
-    [ CONCURRENTLY ]
+    [ CONCURTLY ]
     [ DEFER ]
 ;
 ```
@@ -2446,9 +2489,9 @@ $object CONTAINS $key;
 Немного в стороне стоит случай в `MATCH`-запросах с гипер-рёбрами.
 Поскольку гипер-рёбра могут соединять более двух атомов, то семантика `CONTAINS` схожа с семантикой оператора:
 он проверяет, принадлежат ли атомы справа гипер-ребру слева.
-Ключевое отличие от операторной версии в том, что для ориентированного гипер-ребра можно указать, где искать атом:
-- начало (начальные атомы): `START @atoms`;
-- конец (конечные атомы): `END @atom`;
+Ключевое отличие от операторной версии в том, что для ориентированного гиперребра можно указать сторону:
+- `HEAD @atoms` — искать в `source`;
+- `TAIL @atoms` — искать в `target`;
 - если модификатор поиска не указан, то поиск производится по всему массиву атомов ориентированного гипер-ребра.
 
 ### 10.13. KEEP LEVELPATH
@@ -2671,10 +2714,11 @@ Match mode ограничивает отображение переменных,
 ```
 MATCH [ OPTIONAL | DISTINCT ]
     [ REPEATABLE ELEMENTS | DIFFERENT EDGES | DIFFERENT ATOMS ]
-    [ CONSTRAINTS @constaints ]
-    [ FROM @source ]
+    [ ATOM ]
     [ HYPER | META | METAVERTEX | METAEDGE ]
+    [ CONSTRAINTS @constaints ]
     @pattern [ , @pattern ... ]
+    [ FROM @source ]
     [ WHERE @condition ]
     [ CONTAINS @atoms ]
     [ WITH [NOINDEX | INDEX @indexes ...] ]
@@ -2722,8 +2766,12 @@ MATCH [ OPTIONAL | DISTINCT ]
 Гиперрёбра нельзя выразить стандартной нотацией стрелок. Для них используется специальный синтаксис:
 
 ```
--- START и END указывают на начало и конец ребра
-MATCH HYPER [e:TYPE] WHERE e CONTAINS [ START [(a:TYPE), (b:TYPE)] ], [ END [(c:TYPE)] ]
+-- HEAD и TAIL фильтруют source- и target-стороны
+MATCH HYPER [e:TYPE] CONTAINS HEAD [(a:TYPE), (b:TYPE)], TAIL [(c:TYPE)]
+
+-- ATOM и HYPER ортогональны: endpoint'ом может быть edge-атом
+MATCH ATOM HYPER [e:TYPE]
+CONTAINS HEAD [<(a:TYPE)>, <[guard:GUARD]>], TAIL [<(c:TYPE)>, <[audit:AUDIT]>]
 ```
 
 Или через классическую семантику с проверкой на `HYPER`
@@ -2736,7 +2784,7 @@ MATCH (a:TYPE)-[e:TYPE]->(b:TYPE) WHERE type::is<hyperedge>(e)
 
 ```
 MATCH HYPER [e:TYPE]
-WHERE array::contains(e.invertex, a) OR array::contains(e.outvertex, a)
+WHERE array::contains(e.source, a) OR array::contains(e.target, a)
 ```
 
 #### Мета-атомы
@@ -2751,11 +2799,14 @@ RETURN m, graph::inner(m) AS subgraph;
 
 Работа с внутренними атомами мета-вершины — через функции `graph::inner(m)`, `graph::nodes(m)`, `graph::edges(m)`.
 
-Мета-ребро в паттерне
+Мета-ребро в паттерне:
 ```
--- Дополнительное условие на метаребро не нужно, так как инцидентность вида ребро-ребро
-MATCH [me1:TYPE1]->[me2:TYPE2]
+MATCH METAEDGE (a)-[me:TYPE]->(b)
+RETURN me, graph::inner(me);
 ```
+
+`METAEDGE` фильтрует связывающее ребро по наличию внутреннего/transition-графа. Связь
+edge-to-edge не делает ребро метаребром и выражается только полным AtomWalk-паттерном.
 
 #### Переход по вложенным графам
 
@@ -2910,8 +2961,8 @@ RETURN mv, fns[0] as fn1, fns[1] as fn2;
 
 #### 12.8.2. MATCH ATOM — AtomWalk-паттерн
 
-Включает AtomWalk-режим (§15.2). Атомы в узловых позициях могут быть
-любого типа; инцидентность — endpoint или participation.
+Включает AtomWalk-режим (§15.2). В endpoint-позициях допускаются любые атомы, но каждый
+шаг по-прежнему содержит отдельное связывающее ребро.
 
 Синтаксис:
 ```
@@ -2919,11 +2970,13 @@ MATCH ATOM @atomwalk_pattern ...
 ```
 
 Операторы инцидентности в AtomWalk:
-- `(a)~[e]~>(b)` — endpoint Source→Target
-- `(a)~[e]~(b)` — endpoint ненаправленный
-- `(a)<~[e]~(b)` — endpoint Target←Source
-- `[e1]~>[e2]` — participation: e1 имеет EdgeIncidence с e2 (Target-роль)
-- `[e1]~[e2]` — participation: любая роль
+- `<(a)>~[e]~><(b)>` — endpoint Source→Target
+- `<(a)>~[e]~<(b)>` — endpoint ненаправленный
+- `<(a)><~[e]~<(b)>` — endpoint Target←Source
+- `<[e1]>~[r]~><[e2]>` — E–E через связывающее ребро `r`
+
+Классические дефисы и стрелки в AtomWalk-паттерне не принимаются: тильда является
+обязательным визуальным маркером расширенного endpoint domain.
 
 ---
 
@@ -3002,7 +3055,12 @@ Pipeline начинается с исходного набора и послед
 `TRAVERSE` — явный старт traversal pipeline.
 
 ```
-TRAVERSE [ ATOM ] [ CONSTRAINTS <@path_constraints> ] @source
+TRAVERSE [ CONSTRAINTS <@path_constraints> ] @source
+    |> step(...)
+    |> step(...)
+;
+
+TRAVERSE ATOM [ CONSTRAINTS <@path_constraints> ] @atom_source
     |> step(...)
     |> step(...)
 ;
@@ -3011,8 +3069,19 @@ TRAVERSE [ ATOM ] [ CONSTRAINTS <@path_constraints> ] @source
     FROM @graph |> @source_step    -- Граф-источник, за которым обязательно следует шаг, генерирующий исходный набор (см. "Навигация" в §13.4)
     | FROM @record_id           -- Начать с конкретного атома
     | FROM MATCH @pattern       -- Использовать MATCH как источник (смешанный стиль)
-    | FROM SELECT ...           -- Использловать SELECT как источник (смешанный стиль)
+    | FROM SELECT ...           -- Использовать SELECT как источник (смешанный стиль)
+
+@atom_source ::=
+    FROM <(@endpoint_ref)>      -- Начать с vertex-атома
+    | FROM <[@endpoint_ref]>    -- Начать с edge-атома
+    | FROM MATCH @atom_pattern
+    | FROM SELECT ...
 ```
+
+В `TRAVERSE ATOM` прямой стартовый атом всегда указывает свой kind: `FROM <(@endpoint_ref)>`
+для vertex или `FROM <[@endpoint_ref]>` для edge. Например,
+`TRAVERSE ATOM FROM <[relation:depends]> |> tv::out('CAUSES')`. Запросы и графовые выражения
+в роли источника дополнительной обёртки не требуют.
 
 Глобальные `CONSTRAINTS` применяются ко всем шагам, которые порождают путь. Для шага без
 собственного path mode действует `TRAIL`; локальный mode/objective/filter шага переопределяет
@@ -3330,11 +3399,14 @@ $\text{weight}(NaN) = 1$, потому что NaN означает «вес не
 
 ### 15.2. AtomWalk
 
-Формально: $W = (a_0, i_1, a_1, i_2, a_2, \dots, i_n, a_n)$, где:
-- $a_k$ — атомы любого типа;
-- $i_k$ — инцидентности: endpoint-incidence или participation-incidence
+Формально: $W = (a_0, r_1, a_1, r_2, a_2, \dots, r_n, a_n)$, где:
+- $a_k \in A = V \cup MV \cup E \cup ME$ — endpoint-атомы;
+- $r_k \in E \cup ME$ — явные связывающие рёбра;
+- $a_{k-1} \in \operatorname{source}(r_k)$ и $a_k \in \operatorname{target}(r_k)$
+  для прямого направленного шага (с учётом обратного/двунаправленного/неориентированного режима).
 
-Длина: n (количество инцидентностей).
+Таким образом, AtomWalk отличается от StandardPath только расширенным доменом endpoint'ов.
+Длина: n (количество связывающих рёбер).
 
 ### 15.3. Модификаторы путей
 
@@ -3342,7 +3414,7 @@ $\text{weight}(NaN) = 1$, потому что NaN означает «вес не
 | Режим     | Условие                                            |
 |-----------|----------------------------------------------------|
 | `WALK`    | Без ограничений (повторы вершин и рёбер допустимы) |
-| `TRAIL`   | Рёбра/инцидентности не повторяются                 |
+| `TRAIL`   | Связывающие рёбра не повторяются                   |
 | `SIMPLE`  | Вершины/атомы не повторяются                       |
 | `ACYCLIC` | Нет циклов                                         |
 
@@ -3372,7 +3444,8 @@ RETURN path1, path2;
 | `SHORTEST`          | Минимальный по числу рёбер                         |
 | `WEIGHTED SHORTEST` | Минимальный по сумме весов рёбер                   |
 
-В AtomWalk рёбра (как атомы-узлы пути) могут иметь вес; participation-инцидентность трактуется как шаг со стоимостью 1.
+В AtomWalk стоимость шага задаёт связывающее ребро $r_k$. Вес edge-атома в endpoint-позиции
+не прибавляется отдельно.
 
 #### Path filter
 | Тип            | Ограничение                            |
@@ -3408,20 +3481,20 @@ MATCH path = (a:Person)-[:FRIEND*1..3 SIMPLE]->(b:Person)
 RETURN path, path::length(path), path::cost(path);
 ```
 
-| Функция           | Тип результата  | Описание                     |
-|-------------------|-----------------|------------------------------|
-| `path::atoms(p)`  | `array<atom>`   | Все элементы AtomWalk        |
-| `path::nodes(p)`  | `array<vertex>` | Все вершины пути             |
-| `path::edges(p)`  | `array<edge>`   | Все рёбра пути               |
-| `path::length(p)` | `int`           | Количество шагов             |
-| `path::cost(p)`   | `float`         | Сумма весов стоимостей путей |
+| Функция           | Тип результата  | Описание                               |
+|-------------------|-----------------|----------------------------------------|
+| `path::atoms(p)`  | `array<atom>`   | Полная чередующаяся последовательность |
+| `path::nodes(p)`  | `array<vertex>` | Endpoint'ы-вершины пути                |
+| `path::edges(p)`  | `array<edge>`   | Связывающие рёбра пути                 |
+| `path::length(p)` | `int`           | Количество шагов                       |
+| `path::cost(p)`   | `float`         | Сумма весов стоимостей путей           |
 
 Именованный или возвращаемый путь отслеживается с начала соответствующего обхода. Если путь
 не именован, не возвращается и не используется `tv::path()`/path-функциями, исполнитель вправе
 не создавать trace.
 
 `RETURN path` материализует самодостаточную неизменяемую структуру: identity исходного графа,
-`SnapshotId`, упорядоченные шаги со стабильными atom/edge refs, направление/роль и накопленную
+`SnapshotId`, упорядоченные шаги со стабильными atom/edge refs, направление и накопленную
 стоимость. Внутренний `AtomId` в результат не попадает. `path::nodes`, `path::edges`,
 `path::atoms`, `path::length` и `path::cost` работают без живого snapshot.
 
@@ -3451,18 +3524,23 @@ RETURN path;
 
 ### 15.8. Идентичность путей
 
-Два пути равны, если совпадает последовательность идентификаторов вершин и рёбер. `DISTINCT` по путям применяется к полной структуре пути.
+Два пути равны, если совпадает полная чередующаяся последовательность endpoint-атомов и
+связывающих рёбер. `DISTINCT` по путям применяется к этой структуре.
 
 ### 15.9. Семантика обхода гипер-рёбер
 
-Гипер-ребро `e` с множеством invertex $`V_e = {a_1, a_2, \dots}`$ и outvertex $`W_e = {b_1, b_2, \dots}`$.
+Гиперребро использует тот же endpoint-механизм, что бинарное ребро, но одна или обе его
+стороны содержат несколько атомов. `HYPER` задаёт арность, `ATOM` независимо расширяет
+домен endpoint'ов с вершин до всех атомов.
 
 #### 15.9.1. HyperDirected (topo = 3)
 
-Один шаг traversal от $a_i \in V_e$ порождает $|W_e|$ отдельных путей-веток (развилку), по одному на каждый $b_j \in W_e$.
+Пусть $S = \operatorname{source}(e)$ (`head`) и $T = \operatorname{target}(e)$ (`tail`).
+Один шаг от любого $a_i \in S$ отдельно активирует ребро и порождает $|T|$ линейных
+путей-веток — по одной на каждый $b_j \in T$. Наличие остальных элементов $S$ не требуется.
 
 ```
-Граф: e = HyperDirected { invertex: [a, c], outvertex: [b, d, f] }
+Граф: e = HyperDirected { source: [a, c], target: [b, d, f] }
 Шаг из a:
 Ветка 1: ... a, e, b ...
 Ветка 2: ... a, e, d ...
@@ -3470,18 +3548,24 @@ RETURN path;
 ```
 
 Ограничения:
-- Атомы $V_e$ не достигают друг друга через одно гипер-ребро.
-- Атомы $W_e$ не достигают друг друга через одно гипер-ребро.
+- атомы $S$ не достигают друг друга через одно гиперребро;
+- атомы $T$ не достигают друг друга через одно гиперребро;
+- каждая ветка имеет обычную форму `endpoint, edge, endpoint`.
+
+Для `AS BOTH` прямой переход использует правило $S \to T$, а обратный переход от любого
+$b_j \in T$ порождает по одной ветке к каждому $a_i \in S$.
 
 Каждая ветка - отдельный путь, как если бы из одной вершины выходило несколько рёбер.
-Тип пути зависит от вида инцидентности. Если используется модификатор ATOM, то AtomWalk разрешён как путь-ветка. 
+Если хотя бы один endpoint ветки является ребром, паттерн обязан использовать `ATOM`, а
+ветка имеет тип AtomWalk.
 
 #### 15.9.2. HyperUndirected (topo = 4)
 
-Один шаг traversal от $a_i \in V_e \cup W_e$ порождает $|V_e \cup W_e| - 1$ веток, по одной на каждый остальной атом.
+Пусть $U = \operatorname{source}(e)$ — единое множество неориентированных endpoint'ов.
+Один шаг от $a_i \in U$ порождает $|U| - 1$ веток, по одной на каждый остальной атом.
 
 ```
-Граф: e = HyperUndirected { inv: [a, b, c] }
+Граф: e = HyperUndirected { source: [a, b, c] }
 Шаг из a:
 Ветка 1: ... a, e, b, ...
 Ветка 2: ... a, e, c, ...
@@ -3504,10 +3588,27 @@ RETURN path;
 |-----------|-----------------------------------------------------------------------------------------------------------------|
 | `WALK`    | ветка может повторно пройти через то же гиперребро через другой вход — это разные шаги, порождающие разные пути |
 | `TRAIL`   | Конкретное гиперребро посещается не более одного раза                                                           |
-| `SIMPLE`  | Конкретное гиперребро посещается не более одного раза                                                           |
+| `SIMPLE`  | Endpoint-атомы ветки не повторяются; следовательно, связывающее гиперребро также не повторяется                 |
+| `ACYCLIC` | Ветка не возвращается к уже пройденному endpoint-атому                                                          |
 
-Общая мощность выхода traversal при k последовательных гиперрёбрах:
-$P(depth=k) = \displaystyle\prod_{i=1}^{k} |W_{e_i}|$
+Для k последовательных направленных гиперрёбер мощность выхода из одной входной ветки:
+$P(depth=k) = \displaystyle\prod_{i=1}^{k} |\operatorname{target}(e_i)|$.
+Для неориентированных гиперрёбер соответствующий множитель равен
+$|\operatorname{source}(e_i)| - 1$.
+
+Порядок веток без сохранённого endpoint-order не определён. `ORDER BY TAIL` при явном
+`tail` и `ORDER BY TARGETS` без явного разбиения задают этот порядок при создании ребра
+(§8.5); обычный query-level `ORDER BY` сортирует уже полученные строки.
+
+#### 15.9.4. Одновременная активация всех source
+
+Требование «перейти только после достижения всех $S$» не является путём в текущей модели:
+такой результат растёт одновременно по длине и по ширине и должен хранить несколько
+предшественников одного шага. Линейный `Path` его не аппроксимирует.
+
+Отдельный многомерный `HyperPath` пока не вводится. Он может быть добавлен независимо,
+когда будут определены его identity, length/cost, path modes, правила слияния веток и
+конкретные операторы запроса. До этого `HyperDirected` имеет только попарную семантику выше.
 
 ### 15.10. Семантика обхода мета-атомов и кросс-уровневых рёбер
 
@@ -3533,7 +3634,8 @@ RETURN mv, $inner;
 
 #### 15.10.3. Кросс-уровневые рёбра и переходы
 
-Кросс-уровневое ребро соединяет вершины на разных уровнях вложенности графов в мета-вершины. 
+Кросс-уровневое ребро соединяет атомы на разных уровнях вложенности. Если endpoint является
+ребром, его обход требует `ATOM`, как и для любой V–E/E–V/E–E связи.
 
 Свойства ребра могут содержать объект, содержащий пути по мета-вершинам от самого верхнего уровня до концов ребра.
 Для этого используется предложение `KEEP LEVELPATH`, добавляющее в свойства ребра **уровневый путь** — набор ссылок на мета-вершины, 
@@ -3559,16 +3661,14 @@ Future: `DESCEND INTO @metavertex FROM @inner_atom` зарезервирован
 
 #### 15.10.4. Мета-ребро в traversal
 
-Мета-ребро `me` (ребро с `transition_graph` или edge-to-edge инцидентностями) участвует в traversal двумя способами:
+Мета-ребро `me` — ребро с внутренним и/или `transition_graph`. Внешний traversal не
+открывает этот граф автоматически: как связывающее ребро `me` использует обычные
+`source`/`target`, а внутренний граф доступен через `graph::inner(me)`.
 
-**Как endpoint-ребро:** аналогично обычному ребру — traversal от `vertex` через `me` к следующему vertex.
-
-**Как участник edge-to-edge инцидентности:**
+MetaEdge, как и любое другое ребро, может быть endpoint'ом другого ребра в AtomWalk:
 ```
--- Найти рёбра, связанные через EdgeIncidence
--- Матчит: me2 является Target в EdgeIncidence me1
-MATCH ATOM [me1:TRANSITION]~>[me2:RESULT]
-RETURN me1, me2;
+MATCH ATOM <[me1:TRANSITION]>~[depends:DEPENDS_ON]~><[e2:RESULT]>
+RETURN me1, depends, e2;
 ```
 
 #### 15.10.5. V-E и E-V инцидентность в traversal
@@ -3576,14 +3676,13 @@ RETURN me1, me2;
 Когда конечной точкой ребра является другое ребро:
 ```
 -- Ребро e соединяет вершину v с ребром e2
-RELATE ATOM (person:alice)~[:ANNOTATES { label: "key" }]~>[friendship:alice-bob];
+RELATE ATOM <(person:alice)>~[:ANNOTATES { label: "key" }]~><[friendship:alice_bob]>;
 -- Traversal: от alice по ребру ANNOTATES достичь friendship
-MATCH (v:Person)-[:ANNOTATES]->(target)
-WHERE type::is<edge>(target)  -- target — ребро
+MATCH ATOM <(v:Person)>~[:ANNOTATES]~><[target:FRIEND]>
 RETURN v, target;
 ```
 
-Для такого traversal `target` в паттерне может быть связан с атомом `edge`-типа. Тип уточняется через `type::is<edge>(target)`.
+Обратный переход использует тот же паттерн с обратным направлением.
 
 ---
 
@@ -3594,7 +3693,8 @@ LevelPath (§5.11.3) хранится в свойствах ребра. Нет t
 
 ### 15.12. Семантика переходов в AtomWalk
 
-AtomWalk обобщает понятие шага на любые атомы. Смысл перехода зависит от типов атомов на концах и вида инцидентности.
+AtomWalk обобщает endpoint-позиции шага на любые атомы. Во всех случаях переход выполняется
+через отдельное ребро; различается только kind его endpoint'ов.
 
 Для V-E и E-V поиска требуются связи (рёбра), которые не хочется создавать руками. Этот процесс можно легко автоматизировать. 
 Как это сделать, описано в §21.4.1.
@@ -3607,9 +3707,9 @@ AtomWalk обобщает понятие шага на любые атомы. С
 
 Пример:
 ```
--- Найти все связи KNOWS, в которых участвует alice
-MATCH ATOM (alice:Person)-[conn]->[e:KNOWS]
-RETURN e, e.since;
+-- ANNOTATES связывает alice с edge-атомом knows
+MATCH ATOM <(alice:Person)>~[annotation:ANNOTATES]~><[knows:KNOWS]>
+RETURN knows, knows.since;
 ```
 
 #### E → V (endpoint): ребро — исходная точка, вершина — цель
@@ -3620,23 +3720,22 @@ RETURN e, e.since;
 
 Пример:
 ```
--- Для каждого ребра e из набора — получить его target-endpoint
-MATCH ATOM [e:KNOWS]->(target:Person)
-RETURN e, target;
+-- FROM_RELATION связывает edge-атом e с вершиной target
+MATCH ATOM <[e:RELATION]>~[link:FROM_RELATION]~><(target:Person)>
+RETURN e, link, target;
 ```
 
-#### E → E через participation: ребро связано с ребром
+#### E → E: ребро соединяет два edge-атома
 
-Participation-инцидентность (EdgeIncidence) — структурная связь между рёбрами. 
-Переход означает: «перейти к ребру, управляемому или порождаемому этим ребром».
+Переход E–E использует ту же тройку `source, edge, target`. Например, зависимость между
+операциями является отдельным ребром `CAUSES`.
 
 Применения: поиск зависимостей между операциями; анализ причинно-следственных цепей рёбер.
 
 Пример:
 ```
--- e1 участвует в e2 (e2 — результат e1)
-MATCH ATOM [e1:CAUSE]~>[e2:EFFECT]
-RETURN e1, e2;
+MATCH ATOM <[e1:EVENT]>~[cause:CAUSES]~><[e2:EVENT]>
+RETURN e1, cause, e2;
 ```
 
 ## 16. Граф как результат запроса
@@ -3721,18 +3820,18 @@ BUILD GRAPH
 
 #### Контракт результатов графовых операторов
 
-| Операция | Результат |
-|----------|-----------|
-| получение именованного графа | `GraphRef` с известными graph kind и storage mode |
-| чтение `GraphRef` внутри запроса | snapshot-bound read view |
-| `MATCH ... RETURN atom` | стабильный `RecordId`/atom ref, не внутренний `AtomId` |
-| `MATCH path = ... RETURN path` | самодостаточный структурный `path` |
-| `RETURN GRAPH { ... }` | самодостаточный `subgraph` |
-| `RETURN GRAPH <type> { ... }` | точный frozen graph type |
-| именованный `BUILD GRAPH <type>` | `GraphRef` после commit |
-| анонимный `BUILD GRAPH <type>` | session-owned frozen graph type |
-| `graph::inner(meta)` внутри запроса | snapshot-bound view |
-| возврат `graph::inner(meta)` клиенту | материализованный `subgraph` |
+| Операция                             | Результат                                              |
+|--------------------------------------|--------------------------------------------------------|
+| получение именованного графа         | `GraphRef` с известными graph kind и storage mode      |
+| чтение `GraphRef` внутри запроса     | snapshot-bound read view                               |
+| `MATCH ... RETURN atom`              | стабильный `RecordId`/atom ref, не внутренний `AtomId` |
+| `MATCH path = ... RETURN path`       | самодостаточный структурный `path`                     |
+| `RETURN GRAPH { ... }`               | самодостаточный `subgraph`                             |
+| `RETURN GRAPH <type> { ... }`        | точный frozen graph type                               |
+| именованный `BUILD GRAPH <type>`     | `GraphRef` после commit                                |
+| анонимный `BUILD GRAPH <type>`       | session-owned frozen graph type                        |
+| `graph::inner(meta)` внутри запроса  | snapshot-bound view                                    |
+| возврат `graph::inner(meta)` клиенту | материализованный `subgraph`                           |
 
 ### 16.4. Ограничение глубины и граф-результаты
 
@@ -4483,12 +4582,13 @@ DEFINE EVENT
 Внутри WHEN и THEN блоков доступны следующие параметры:
 - `$before` и `$after` недоступны (равны `null`), так как RELATE вносит изменения в граф, а не в запись.
 - `$value` имеет следующие идиомы:
-  - `$value.vertices` - вершины, участвовавшие в запросе (если ребро directed, является объектом с ключами `invertex` и `outvertex`, содержащими соответствующие массивы вершин);
+  - `$value.endpoints` — endpoint'ы созданного ребра; для directed-ребра это объект с
+    массивами `source` и `target`, для undirected — единый массив `source`;
   - `$value.edge` - ребро, участвовавшее в запросе;
   - все перечисленные идиомы являются ссылками, следовательно, материализуются только по запросу (например, при фильтрации по типу или в `@relate_stmt`).
 
-Внутри `@relate_stmt` можно создавать V-E и E-V связи между участниками запроса-триггера, однако E-E связь создать не получится,
-так как в одном RELATE запросе достипо создани одно индицентности, следовательно, там учавствует одно ребро.
+Внутри `@relate_stmt` можно создавать V–E, E–V и E–E связи, если их endpoint-атомы уже
+разрешены из `$value` или внешнего scope. Каждая такая связь создаёт отдельное обычное ребро.
 
 ---
 
@@ -4919,17 +5019,21 @@ Aggregate {
 ```
 Expand {
     direction: Out | In | Both,
+    endpoint_domain: VerticesOnly | Atoms,
     edge_labels: Option<Vec<Label>>,
-    node_labels: Option<Vec<Label>>,
-    alias_node: Symbol,
+    target_labels: Option<Vec<Label>>,
+    alias_target: Symbol,
     alias_edge: Option<Symbol>
 }
 ```
 Семантика:
 ```
-input:  stream of nodes
-output: stream of (node, edge, neighbor)
+input:  stream of endpoint atoms
+output: stream of (source_endpoint, edge, target_endpoint)
 ```
+
+`VerticesOnly` реализует StandardPath, `Atoms` — AtomWalk. Оба режима используют один
+`Expand`; гиперребро возвращает отдельную строку для каждой разрешённой ветки (§15.9).
 
 #### ExpandEdge
 Если нужно работать именно с рёбрами:
@@ -4945,6 +5049,7 @@ ExpandEdge {
 ```
 PathExpand {
     direction: Out | In | Both,
+    endpoint_domain: VerticesOnly | Atoms,
     edge_labels: Option<Vec<Label>>,
     min_depth: usize,
     max_depth: Option<usize>,
@@ -5156,10 +5261,10 @@ TRAVERSE FROM MATCH (p:Person {name: 'Alice'})
 ```
 -- Создать гиперребро "соавторство"
 RELATE HYPER [:COAUTHOR] TARGETS [person:alice, person:bob, person:carol]
-  AS UNDIRECTED SET paper = "paper:xyz";
+  AS UNDIRECTED ORDER BY TARGETS SET paper = "paper:xyz";
 
 -- Найти все соавторства Алисы
-MATCH HYPER [e:COAUTHOR] WHERE e CONTAINS (person:alice)
+MATCH HYPER [e:COAUTHOR] CONTAINS person:alice
 RETURN e, e.paper;
 ```
 
