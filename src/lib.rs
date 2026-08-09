@@ -6,6 +6,7 @@ mod collections;
 pub mod ecs;
 pub mod gql;
 pub mod gql_status;
+pub mod math;
 mod syn;
 
 #[cfg(not(target_env = "msvc"))]
