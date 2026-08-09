@@ -1,0 +1,5 @@
+/.idea
+/target
+
+/crates/configuration
+/crates/storage_engine
