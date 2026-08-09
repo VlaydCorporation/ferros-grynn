@@ -45,7 +45,7 @@ pub(super) fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult
 		tokens: TokenBuffer::new(tokens),
 	};
 	let mut stack = Stack::new();
-	stack.enter(|context| parser.program(context)).finish()
+	stack.enter(|stk| parser.program(stk)).finish()
 }
 
 struct TokenBuffer<const LOOKAHEAD: usize> {
