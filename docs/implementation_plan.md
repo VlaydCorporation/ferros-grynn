@@ -396,12 +396,13 @@ pub struct GraphWorkspace<G> {
 зависимости и состав работ. Детализация по существующим файлам (`fg-meta` / `src`) взята из
 `disk_storage_spec.md` §30.1–§30.7.
 
-**Этапы 1–3 плана `values`: ✅ завершены.** Спецификации синхронизированы; реализованы
+**Этапы 1–4 плана `values`: ✅ завершены на уровне runtime-контрактов.** Спецификации синхронизированы; реализованы
 runtime scalars и collections, `Value`/`ValueKind`/`Type`, exact `Number`, temporal,
 UUID/ULID, `RecordId`, geometry/vector, runtime-only identity, graph foundation,
-generation-aware ECS и Arrow/DataFusion property materialization. Следующий исполняемый этап —
-графовое ядро и `GraphWorkspace`; `Binary(StorageValue)` columnar fallback появляется вместе с
-codec на этапе 5.
+generation-aware ECS, Arrow/DataFusion property materialization, специализированные graph
+storage families, `GraphWorkspace`, three-mode `GraphRead`, Path и LiveGraph. Следующий
+исполняемый этап — `StorageValue`, codec v1 и перенос storage engine; `Binary(StorageValue)`
+columnar fallback появляется вместе с codec на этапе 5.
 
 ### Область A. Система типов и значения — P1 (блокирующая)
 
@@ -419,21 +420,25 @@ codec на этапе 5.
   `ThinVec`. Benchmark отверг boxed/tagged `SmallVec`/`RapidHashMap`: первая вставка выделяла
   656 B, а настоящий inline union занимал 672 B на каждом атоме. Empty не аллоцирует, non-empty
   имеет один contiguous allocation и canonical order без временной сортировки.
-- **`src/ecs`** 🟢/🟡 — реализованы paged generation-aware `SparseSet<AtomId>` с отдельными
+- **`src/ecs`** 🟢 — реализованы paged generation-aware `SparseSet<AtomId>` с отдельными
   node/edge slot spaces, `AnyPool`, `WorldComponents`, `(PropertyKeyId, TypeId)` property pools,
   independent presence/validity и smallest-pool read-only joins. Независимого entity allocator
-  нет. Revision-bound `GraphWorkspace` остаётся этапом 4.
+  нет; revision-bound `GraphWorkspace` разделяет persistent и derived sidecars и инвалидирует
+  производные pools после graph mutation.
 - **`src/values/storage`** 🔴 — `StorageValue`, borrowed `StorageValueRef`, encode/decode
   contexts, `TypeTag` из `disk_storage_spec.md` §5.2, canonical codec v1 и `DecodeLimits`.
 - **`src/values/columnar`** 🟢/🟡 — реализованы `PropertyBatch`, presence bitmaps,
   `PropertyKeyId ↔ Arrow field`, metadata validation, native scalar arrays, dense union,
   Arrow round-trip и DataFusion `MemTable` со скрытыми presence-полями. Модули feature-gated,
   runtime от них не зависит. Nested `Binary(StorageValue)` fallback заблокирован до этапа codec.
-- **`src/values/runtime/graph`** 🟡/🟢 reference — реализованы general SoA foundation,
-  bit-packed `AtomId`, endpoint'ы и identity/revision; прототипный второй путь edge/edge
-  incidence является legacy и должен быть удалён при миграции на единые `source`/`target`,
-  `Graph<Mutable>`/`Graph<Frozen>` и корневой re-export; специализированные storage families,
-  conversions, PathTrace/Path и LiveGraph остаются этапом 4 [plan.md](values_plan.md).
+- **`src/values/runtime/graph`** 🟢 — реализованы production `AtomId`, general SoA с едиными
+  `source`/`target` endpoint'ами, отдельные Forest/Dag/Hyper storage families, type-state API,
+  widening views и проверяемые owned conversions. `GraphRead` покрывает in-memory,
+  transaction-bound disk adapter и hybrid `query_to_memory`; mutable hybrid хранит origin/
+  dirty-set для explicit write-back. Добавлены `GraphWorkspace`, NodeWalk/AtomWalk traversal,
+  основные алгоритмы `fg-meta`, SCC condensation, PathTrace/Path, exact graph transport и
+  LiveGraph conflict protocol. Реальный PageManager adapter и COW-chunk storage относятся к
+  областям B/последующей benchmark-driven оптимизации [plan.md](values_plan.md).
 - **`src/storage`** 🟡 — `DiskAtomRef(u64)` и
   `QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }`; перенос `crates/storage_engine`
   выполняется после стабилизации value codec.

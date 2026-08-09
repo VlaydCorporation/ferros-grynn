@@ -28,6 +28,7 @@ pub trait AnyPool: Any + Send + Sync {
 		self.len() == 0
 	}
 	fn atoms(&self) -> &[AtomId];
+	fn retain_atoms(&mut self, predicate: &mut dyn FnMut(AtomId) -> bool);
 	fn as_any(&self) -> &dyn Any;
 	fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -47,6 +48,10 @@ impl<T: 'static + Send + Sync> AnyPool for SparseSet<T> {
 
 	fn atoms(&self) -> &[AtomId] {
 		self.atoms()
+	}
+
+	fn retain_atoms(&mut self, predicate: &mut dyn FnMut(AtomId) -> bool) {
+		self.retain(|id, _| predicate(id));
 	}
 
 	fn as_any(&self) -> &dyn Any {
@@ -203,6 +208,16 @@ impl WorldComponents {
 	pub fn clear(&mut self) {
 		self.components.clear();
 		self.property_columns.clear();
+	}
+
+	/// Drops components whose graph atom no longer exists.
+	pub fn retain_atoms(&mut self, mut predicate: impl FnMut(AtomId) -> bool) {
+		for pool in self.components.values_mut() {
+			pool.retain_atoms(&mut predicate);
+		}
+		for pool in self.property_columns.values_mut() {
+			pool.retain_atoms(&mut predicate);
+		}
 	}
 
 	fn assure_component<T>(&mut self) -> &mut SparseSet<T>

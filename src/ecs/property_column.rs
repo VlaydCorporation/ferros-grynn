@@ -152,6 +152,14 @@ impl<T: 'static + Send + Sync> AnyPool for PropertyColumn<T> {
 		self.present.atoms()
 	}
 
+	fn retain_atoms(&mut self, predicate: &mut dyn FnMut(AtomId) -> bool) {
+		let removed =
+			self.present.atoms().iter().copied().filter(|id| !predicate(*id)).collect::<Vec<_>>();
+		for id in removed {
+			self.remove(id);
+		}
+	}
+
 	fn as_any(&self) -> &dyn Any {
 		self
 	}

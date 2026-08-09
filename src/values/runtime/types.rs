@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use super::{GraphKind, Number, Text, Value, VectorKind};
+use super::{AtomKind, GraphKind, Number, Text, Value, VectorKind};
 
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
@@ -27,6 +27,8 @@ pub enum Type {
 	Record,
 	Regex,
 	Range(Box<Type>),
+	Atom(AtomKind),
+	Path,
 	Graph(GraphKind),
 	Option(Box<Type>),
 	Union(Vec<Type>),
@@ -60,6 +62,8 @@ impl Type {
 			Value::Record(_) => Self::Record,
 			Value::Regex(_) => Self::Regex,
 			Value::Range(_) => Self::Range(Box::new(Self::Any)),
+			Value::Atom(value) => Self::Atom(value.kind()),
+			Value::Path(_) => Self::Path,
 			Value::Graph(value) => Self::Graph(value.kind()),
 			Value::Closure(value) => value.signature(),
 		}
@@ -91,7 +95,9 @@ impl Display for Type {
 			Self::Record => formatter.write_str("record"),
 			Self::Regex => formatter.write_str("regex"),
 			Self::Range(value) => write!(formatter, "range<{value}>"),
-			Self::Graph(kind) => write!(formatter, "graph<{kind:?}>"),
+			Self::Atom(kind) => write!(formatter, "atom<{kind}>"),
+			Self::Path => formatter.write_str("path"),
+			Self::Graph(kind) => write!(formatter, "graph<{kind}>"),
 			Self::Option(value) => write!(formatter, "option<{value}>"),
 			Self::Union(values) => {
 				for (index, value) in values.iter().enumerate() {

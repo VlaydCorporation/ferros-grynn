@@ -16,6 +16,10 @@ harness = false
 name = "ecs"
 harness = false
 
+[[bench]]
+name = "graph_core"
+harness = false
+
 [dependencies]
 ferros-grynn = { workspace = true, default-features = false }
 

@@ -34,7 +34,7 @@ hyper-, meta- и cross-level topology. Цена универсальности �
 | `Hypergraph` | Вершины, hyperedges и incidence             | Нет meta-атомов и cross-level incidence |
 | `Dag`        | Вершины и обычные directed edges            | Нет self-loop и directed cycles         |
 | `Forest`     | Вершины и обычные edges                     | Каждый компонент является деревом       |
-| `Tree`       | Один компонент `Forest`                     | Связность и `                           |E| = |V| - 1` |
+| `Tree`       | Один компонент `Forest`                     | Связность и `\|E\| = \|V\| - 1`         |
 | `RootedTree` | `Tree` с выбранным корнем                   | Один корень и согласованная orientation |
 
 `Tree`, `RootedTree`, `Forest` и `Dag` относятся к классической vertex-edge topology. Наличие
@@ -76,18 +76,18 @@ Metagraph → GraphView
 
 ### 4.2. Owned-преобразования
 
-| Из                       | В                 | Условие                                             | Стоимость                         |
-|--------------------------|-------------------|-----------------------------------------------------|-----------------------------------|
-| `RootedTree`             | `Tree` / `Forest` | Всегда                                              | `O(1)` при общей forest family    |
-| `Tree`                   | `Forest`          | Всегда                                              | `O(1)` при общей forest family    |
-| directed `Tree`/`Forest` | `Dag`             | Всегда                                              | `O(V+E)`                          |
-| undirected `Tree`        | `Dag`             | Явно заданы root и orientation                      | `O(V+E)`                          |
-| любая узкая family       | `Graph`           | Всегда                                              | `O(V+E)` для owned general layout |
-| `Dag`                    | `Tree`            | Один root, indegree остальных = 1, связность, `     | E                                 |=|V|-1` | validation + rebuild |
-| `Graph`                  | `Dag`             | Только classic directed edges, нет циклов/self-loop | validation + rebuild              |
-| `Graph`/`Forest`         | `Tree`            | Classic topology и tree invariant                   | validation + rebuild              |
-| `Graph`                  | `Hypergraph`      | Только vertex-hyperedge topology                    | validation + rebuild              |
-| `Graph`                  | `Metagraph`       | Валидны meta/cross-level invariants                 | validation + rebuild              |
+| Из                       | В                 | Условие                                                           | Стоимость                         |
+|--------------------------|-------------------|-------------------------------------------------------------------|-----------------------------------|
+| `RootedTree`             | `Tree` / `Forest` | Всегда                                                            | `O(1)` при общей forest family    |
+| `Tree`                   | `Forest`          | Всегда                                                            | `O(1)` при общей forest family    |
+| directed `Tree`/`Forest` | `Dag`             | Всегда                                                            | `O(V+E)`                          |
+| undirected `Tree`        | `Dag`             | Явно заданы root и orientation                                    | `O(V+E)`                          |
+| любая узкая family       | `Graph`           | Всегда                                                            | `O(V+E)` для owned general layout |
+| `Dag`                    | `Tree`            | Один root, indegree остальных = 1, связность, `\|E\| = \|V\| - 1` | validation + rebuild              |
+| `Graph`                  | `Dag`             | Только classic directed edges, нет циклов/self-loop               | validation + rebuild              |
+| `Graph`/`Forest`         | `Tree`            | Classic topology и tree invariant                                 | validation + rebuild              |
+| `Graph`                  | `Hypergraph`      | Только vertex-hyperedge topology                                  | validation + rebuild              |
+| `Graph`                  | `Metagraph`       | Валидны meta/cross-level invariants                               | validation + rebuild              |
 
 Все сужающие owned-преобразования являются `TryFrom`-подобными. GQL не выполняет их неявно:
 constraint у `RETURN GRAPH`/`BUILD GRAPH` является явным запросом на validation и rebuild.

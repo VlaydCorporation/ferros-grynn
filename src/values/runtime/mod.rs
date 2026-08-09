@@ -31,14 +31,18 @@ pub use bytes::Bytes;
 pub use closure::{Closure, RuntimeId};
 pub use geometry::{Geometry, Position};
 pub use graph::{
+	AtomKind,
+	AtomRef,
 	Frozen,
 	FrozenGraph,
 	Graph,
 	GraphKind,
 	GraphRef,
 	GraphStorageMode,
+	MaterializedGraph,
 	Mutable,
 	MutableGraph,
+	Path,
 };
 pub use id::{Ulid, Uuid};
 pub use number::Number;
@@ -79,6 +83,9 @@ pub enum ValueKind {
 	Record,
 	Regex,
 	Range,
+	Atom,
+	Path,
+	Subgraph,
 	Graph,
 	Closure,
 }
@@ -105,6 +112,9 @@ impl ValueKind {
 			Self::Record => 16,
 			Self::Regex => 17,
 			Self::Range => 18,
+			Self::Atom => 19,
+			Self::Path => 20,
+			Self::Subgraph => 21,
 			Self::Graph => 22,
 			Self::Closure => 23,
 		}
@@ -132,6 +142,9 @@ impl ValueKind {
 			Self::Record => "record",
 			Self::Regex => "regex",
 			Self::Range => "range",
+			Self::Atom => "atom",
+			Self::Path => "path",
+			Self::Subgraph => "subgraph",
 			Self::Graph => "graph",
 			Self::Closure => "closure",
 		}
@@ -174,12 +187,14 @@ pub enum Value {
 	Record(Box<RecordId>),
 	Regex(Regex),
 	Range(Range),
-	Graph(Box<Graph<Frozen>>),
+	Atom(Box<AtomRef>),
+	Path(Box<Path>),
+	Graph(Box<MaterializedGraph>),
 	Closure(Box<Closure>),
 }
 
 impl Value {
-	pub const fn kind(&self) -> ValueKind {
+	pub fn kind(&self) -> ValueKind {
 		match self {
 			Self::None => ValueKind::None,
 			Self::Null => ValueKind::Null,
@@ -201,6 +216,9 @@ impl Value {
 			Self::Record(_) => ValueKind::Record,
 			Self::Regex(_) => ValueKind::Regex,
 			Self::Range(_) => ValueKind::Range,
+			Self::Atom(_) => ValueKind::Atom,
+			Self::Path(_) => ValueKind::Path,
+			Self::Graph(value) if value.kind() == GraphKind::Subgraph => ValueKind::Subgraph,
 			Self::Graph(_) => ValueKind::Graph,
 			Self::Closure(_) => ValueKind::Closure,
 		}
@@ -237,6 +255,8 @@ impl Value {
 			| Self::Record(_)
 			| Self::Regex(_)
 			| Self::Range(_)
+			| Self::Atom(_)
+			| Self::Path(_)
 			| Self::Graph(_)
 			| Self::Closure(_) => true,
 		}
@@ -358,11 +378,29 @@ impl Value {
 		}
 	}
 
-	pub const fn as_graph(&self) -> Option<&Graph<Frozen>> {
+	pub fn as_atom(&self) -> Option<&AtomRef> {
+		match self {
+			Self::Atom(value) => Some(value),
+			_ => None,
+		}
+	}
+
+	pub fn as_path(&self) -> Option<&Path> {
+		match self {
+			Self::Path(value) => Some(value),
+			_ => None,
+		}
+	}
+
+	pub fn as_materialized_graph(&self) -> Option<&MaterializedGraph> {
 		match self {
 			Self::Graph(value) => Some(value),
 			_ => None,
 		}
+	}
+
+	pub fn as_graph(&self) -> Option<&Graph<Frozen>> {
+		self.as_materialized_graph().and_then(MaterializedGraph::as_general)
 	}
 
 	pub const fn as_closure(&self) -> Option<&Closure> {
@@ -392,7 +430,7 @@ impl Value {
 				};
 				start_storable && end_storable
 			}
-			Self::Regex(_) | Self::Graph(_) | Self::Closure(_) => false,
+			Self::Regex(_) | Self::Path(_) | Self::Graph(_) | Self::Closure(_) => false,
 			_ => true,
 		}
 	}
@@ -439,6 +477,8 @@ impl Ord for Value {
 				(Self::Record(left), Self::Record(right)) => left.cmp(right),
 				(Self::Regex(left), Self::Regex(right)) => left.cmp(right),
 				(Self::Range(left), Self::Range(right)) => left.cmp(right),
+				(Self::Atom(left), Self::Atom(right)) => left.cmp(right),
+				(Self::Path(left), Self::Path(right)) => left.cmp(right),
 				(Self::Graph(left), Self::Graph(right)) => left.cmp(right),
 				(Self::Closure(left), Self::Closure(right)) => left.cmp(right),
 				_ => Ordering::Equal,
@@ -468,6 +508,8 @@ impl Hash for Value {
 			Self::Record(value) => value.hash(state),
 			Self::Regex(value) => value.hash(state),
 			Self::Range(value) => value.hash(state),
+			Self::Atom(value) => value.hash(state),
+			Self::Path(value) => value.hash(state),
 			Self::Graph(value) => value.hash(state),
 			Self::Closure(value) => value.hash(state),
 		}
@@ -517,8 +559,22 @@ impl Display for Value {
 			Self::Record(value) => Display::fmt(value, formatter),
 			Self::Regex(value) => Display::fmt(value, formatter),
 			Self::Range(value) => Display::fmt(value, formatter),
+			Self::Atom(value) => Display::fmt(value.id(), formatter),
+			Self::Path(value) => write!(
+				formatter,
+				"path({}@{}; length={})",
+				value.origin(),
+				value.snapshot(),
+				value.length(),
+			),
 			Self::Graph(value) => {
-				write!(formatter, "graph({}@{})", value.identity(), value.revision(),)
+				write!(
+					formatter,
+					"{}({}@{})",
+					value.kind().name(),
+					value.identity(),
+					value.revision(),
+				)
 			}
 			Self::Closure(value) => write!(
 				formatter,
@@ -668,11 +724,46 @@ impl From<RecordId> for Value {
 	}
 }
 
-impl From<Graph<Frozen>> for Value {
-	fn from(value: Graph<Frozen>) -> Self {
+impl From<AtomRef> for Value {
+	fn from(value: AtomRef) -> Self {
+		Self::Atom(Box::new(value))
+	}
+}
+
+impl From<Path> for Value {
+	fn from(value: Path) -> Self {
+		Self::Path(Box::new(value))
+	}
+}
+
+impl From<MaterializedGraph> for Value {
+	fn from(value: MaterializedGraph) -> Self {
 		Self::Graph(Box::new(value))
 	}
 }
+
+macro_rules! impl_graph_value {
+	($($type:ty),* $(,)?) => {
+		$(
+			impl From<$type> for Value {
+				fn from(value: $type) -> Self {
+					Self::from(MaterializedGraph::from(value))
+				}
+			}
+		)*
+	};
+}
+
+impl_graph_value!(
+	Graph<Frozen>,
+	graph::Tree<Frozen>,
+	graph::RootedTree<Frozen>,
+	graph::Forest<Frozen>,
+	graph::Dag<Frozen>,
+	graph::Hypergraph<Frozen>,
+	graph::Metagraph<Frozen>,
+	graph::Subgraph<Frozen>,
+);
 
 fn value_conversion_error(value: &Value, target: &'static str) -> FerrosGrynnError {
 	FerrosGrynnError::conversion_error(value.kind().name(), target)
@@ -808,16 +899,73 @@ impl TryFrom<Value> for RecordId {
 	}
 }
 
-impl TryFrom<Value> for Graph<Frozen> {
+impl TryFrom<Value> for AtomRef {
+	type Error = FerrosGrynnError;
+
+	fn try_from(value: Value) -> Result<Self, Self::Error> {
+		match value {
+			Value::Atom(value) => Ok(*value),
+			value => Err(value_conversion_error(&value, "AtomRef")),
+		}
+	}
+}
+
+impl TryFrom<Value> for Path {
+	type Error = FerrosGrynnError;
+
+	fn try_from(value: Value) -> Result<Self, Self::Error> {
+		match value {
+			Value::Path(value) => Ok(*value),
+			value => Err(value_conversion_error(&value, "Path")),
+		}
+	}
+}
+
+impl TryFrom<Value> for MaterializedGraph {
 	type Error = FerrosGrynnError;
 
 	fn try_from(value: Value) -> Result<Self, Self::Error> {
 		match value {
 			Value::Graph(value) => Ok(*value),
-			value => Err(value_conversion_error(&value, "Graph<Frozen>")),
+			value => Err(value_conversion_error(&value, "MaterializedGraph")),
 		}
 	}
 }
+
+impl TryFrom<Value> for Graph<Frozen> {
+	type Error = FerrosGrynnError;
+
+	fn try_from(value: Value) -> Result<Self, Self::Error> {
+		match MaterializedGraph::try_from(value)? {
+			MaterializedGraph::Graph(value) => Ok(value),
+			value => Err(FerrosGrynnError::conversion_error(value.kind().name(), "Graph<Frozen>")),
+		}
+	}
+}
+
+macro_rules! try_graph_family_from_value {
+	($($type:ty),* $(,)?) => {
+		$(
+			impl TryFrom<Value> for $type {
+				type Error = FerrosGrynnError;
+
+				fn try_from(value: Value) -> Result<Self, Self::Error> {
+					Self::try_from(MaterializedGraph::try_from(value)?)
+				}
+			}
+		)*
+	};
+}
+
+try_graph_family_from_value!(
+	graph::Tree<Frozen>,
+	graph::RootedTree<Frozen>,
+	graph::Forest<Frozen>,
+	graph::Dag<Frozen>,
+	graph::Hypergraph<Frozen>,
+	graph::Metagraph<Frozen>,
+	graph::Subgraph<Frozen>,
+);
 
 #[cfg(test)]
 mod tests {
@@ -826,6 +974,18 @@ mod tests {
 	use rust_decimal::Decimal;
 
 	use super::{Number, Text, Type, Value, ValueKind};
+	use crate::values::runtime::graph::{
+		AtomKind,
+		AtomRef,
+		Graph,
+		GraphKind,
+		Mutable,
+		Path,
+		SnapshotId,
+		Subgraph,
+		Tree,
+		TreeOrientation,
+	};
 
 	#[test]
 	fn sentinel_semantics_are_two_valued() {
@@ -910,5 +1070,39 @@ mod tests {
 			std::mem::size_of::<super::Geometry>(),
 			std::mem::size_of::<super::Closure>(),
 		);
+	}
+
+	#[test]
+	fn graph_transport_preserves_exact_type_and_typed_conversion() {
+		let tree =
+			Tree::<Mutable>::new(TreeOrientation::OutArborescence, None, super::PropertyMap::new())
+				.unwrap()
+				.freeze();
+		let value = Value::from(tree);
+		assert_eq!(value.kind(), ValueKind::Graph);
+		assert_eq!(value.value_type(), Type::Graph(GraphKind::Tree));
+		assert!(Tree::try_from(value).is_ok());
+
+		let general = Value::from(Graph::<Mutable>::new().freeze());
+		assert!(Tree::try_from(general).is_err());
+
+		let subgraph = Value::from(Subgraph::<Mutable>::new().freeze());
+		assert_eq!(subgraph.kind(), ValueKind::Subgraph);
+		assert_eq!(subgraph.value_type(), Type::Graph(GraphKind::Subgraph));
+	}
+
+	#[test]
+	fn atom_and_path_have_distinct_value_contracts() {
+		let atom = AtomRef::new(AtomKind::Node, "person:1".parse().unwrap());
+		let atom_value = Value::from(atom.clone());
+		assert_eq!(atom_value.kind(), ValueKind::Atom);
+		assert_eq!(atom_value.value_type(), Type::Atom(AtomKind::Node));
+		assert_eq!(AtomRef::try_from(atom_value).unwrap(), atom);
+
+		let path = Path::new(super::Uuid::default(), SnapshotId::new(7, 11), Vec::new(), None);
+		let path_value = Value::from(path.clone());
+		assert_eq!(path_value.kind(), ValueKind::Path);
+		assert_eq!(path_value.value_type(), Type::Path);
+		assert_eq!(Path::try_from(path_value).unwrap(), path);
 	}
 }

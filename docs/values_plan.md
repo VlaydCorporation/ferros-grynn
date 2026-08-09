@@ -467,14 +467,41 @@ LiveEvent::Conflict {
     - DataFusion подключён только поверх прошедшего Arrow round-trip; memory table получает
       скрытые presence-поля. Nested `Binary(StorageValue)` fallback зависит от этапа 5.
 
-4. **Графовое ядро**
-    - Перенести универсальное поведение `fg-meta`.
-    - Добавить `GraphWorkspace`, AtomId-keyed ECS facade, invalidation по identity/revision и
-      read-only joins по наименьшему pool.
-    - Ввести type-state API и storage families.
-    - Реализовать mutable/frozen conversions и conversion matrix.
-    - Реализовать три storage modes и `query_to_memory`.
-    - Затем добавить PathTrace/Path и LiveGraph.
+4. **Графовое ядро — ✅ выполнен функциональный контур**
+    - Универсальный `Graph` реализован как general SoA с node/edge, V–V/V–E/E–V/E–E,
+      hyper-, meta- и cross-level incidence. `AtomId` использует production-раскладку
+      `gen(23) | kind(1) | slot(40)`; удаление инвалидирует старое поколение и каскадно удаляет
+      зависимые incidence.
+    - Введены отдельные `ForestStorage`, `DagStorage` и `HyperStorage`; `Tree`, `RootedTree`,
+      `Forest`, `Dag`, `Hypergraph` не являются номинальными обёртками над general layout.
+      `Metagraph` разделяет general layout только как явно оговорённое исключение.
+    - Реализованы `Mutable`/`Frozen`, widening views и матрица owned-преобразований с полной
+      валидацией. Неориентированное дерево требует явных root/orientation для перехода в DAG;
+      недопустимые конверсии возвращают graph-статусы.
+    - `GraphRead` объединяет full in-memory, transaction-bound `DiskGraphView` и hybrid
+      materialization. `query_to_memory` возвращает точный запрошенный тип, не удерживает
+      исходный guard и для mutable-результата сохраняет origin mapping, dirty-set и explicit
+      `flush`. Подключение адаптера к реальному `PageManager` остаётся этапом 5 вместе со
+      storage engine.
+    - Добавлен `GraphWorkspace` с отдельными persistent/derived ECS pools, привязкой к
+      `(identity, revision)`, удалением компонентов освобождённых атомов и обязательной
+      invalidation derived pools после канонической мутации.
+    - Реализованы NodeWalk/AtomWalk traversal index, BFS/DFS, topological sort, SCC/WCC и
+      condensation, Dijkstra, Bellman–Ford с negative-cycle detection, directed/undirected
+      cycle checks, minimum spanning tree/forest, articulation points/bridges и binary-lifting
+      LCA. Один и тот же bidirectional/undirected step не дублируется в режиме `Both`, но
+      параллельные рёбра сохраняются.
+    - Внутренний `PathTraceArena` разделяет префиксы, публичный `Path` хранит стабильные
+      `AtomRef`, snapshot и `Arc<[PathStep]>`; resolver проверяет identity и snapshot.
+      `MaterializedGraph` и `Value` сохраняют точный graph discriminant.
+    - `LiveGraph<Frozen>` публикует новую immutable revision линейризуемой заменой `Arc`, а
+      старые guards продолжают видеть прежнюю revision. `LiveGraph<Mutable>` реализует
+      dirty-set conflicts, очередь и явные `accept_remote`/`keep_local`/`discard_local`/
+      `rebase`/`flush`/`resume`. До перехода storage на COW-chunks применение delta копирует
+      general SoA целиком; это явно измеряемый baseline, а не скрытая гарантия lock-free/COW.
+    - Добавлен Criterion target `graph_core`: traversal storage families, freeze/thaw и
+      cross-family conversions, disk-adapter против hybrid, Path `Arc` clone против копирования
+      шагов, live publication и full-SoA delta baseline.
 
 5. **StorageValue и storage engine**
     - Ввести внутренний `StorageValue`, содержащий дисковые формы: `key_id`, `table_id`, `tz_id`, `DiskAtomRef`, decimal `i128+scale` и нормализованные структуры коллекций.

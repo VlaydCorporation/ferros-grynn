@@ -58,9 +58,19 @@
 - Корневой `ferros_grynn::graph` реэкспортирует `values::runtime::graph`.
 - `Graph<Mutable>` не помещается в `Value`; `Value::Graph` принимает только `Graph<Frozen>`.
 - Графовые значения сравниваются по `(identity, revision)`, не по содержимому или изоморфизму.
-- Текущий general graph foundation поддерживает node/edge и edge/edge incidence. Tree, Forest,
-  Dag, Hypergraph и Metagraph нельзя реализовывать как номинальные обёртки над `Graph`;
-  их отдельные storage families относятся к этапу 4 `docs/plan.md`.
+- General graph поддерживает node/edge, edge/edge, hyper-, meta- и cross-level incidence.
+  `Tree`/`RootedTree`/`Forest`, `Dag` и `Hypergraph` используют отдельные storage families;
+  не заменять их номинальными обёртками над `Graph`. `Metagraph` разделяет general layout как
+  явно зафиксированное исключение.
+- Общий алгоритмический API принимает `GraphRead` и обязан давать одинаковую семантику для
+  full in-memory, transaction-bound disk view и hybrid materialization. `query_to_memory`
+  освобождает исходный guard после копирования; mutable hybrid сохраняет origin mapping и
+  dirty-set для явного write-back.
+- `GraphWorkspace` остаётся ECS-sidecar и не входит в `Value`, equality, codec или durability.
+  Derived pools привязаны к `(identity, revision)` и инвалидируются после graph mutation.
+- Публичный `Path` содержит стабильные `AtomRef`, а не `AtomId`; разрешение свойств всегда
+  проверяет origin identity и snapshot. `LiveGraph` не подменяет статический `Graph<Frozen>` и
+  требует явного conflict resolution для пересечения remote/local dirty-set.
 - Внутренний `AtomId` не является публичным GQL ID. На границе query/storage используется
   `RecordId`/`GraphRef`.
 - Production-раскладка `AtomId` — `gen(23) | kind(1) | slot(40)`; старую u31-раскладку

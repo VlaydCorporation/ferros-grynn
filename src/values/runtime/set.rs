@@ -1,4 +1,7 @@
-#![allow(clippy::mutable_key_type)]
+#![allow(
+	clippy::mutable_key_type,
+	reason = "Value has interior mutability only in opaque runtime variants with stable identity"
+)]
 
 use std::collections::{BTreeSet, btree_set::Iter};
 

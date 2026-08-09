@@ -278,6 +278,11 @@ impl StatusKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+	clippy::partial_pub_fields,
+	reason = "generated status metadata is public while the template implementation flag is \
+	          crate-internal"
+)]
 pub struct StatusDefinition {
 	pub name: &'static str,
 	pub code: StatusCode,
@@ -680,6 +685,78 @@ define_status_codes!(
 			id: String => DisplayValue,
 		},
 	},
+	GraphWriteBackUnavailable, "FG-G1F02" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Graph,
+		subcondition: "graph write-back is unavailable",
+		message: "This graph has no materialization origin and cannot be written back.",
+	},
+	GraphWorkspaceStale, "FG-G1F03" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Graph,
+		subcondition: "graph workspace is stale",
+		message: "The workspace is bound to graph {expected_identity} at revision {expected_revision}, but the graph is {actual_identity} at revision {actual_revision}.",
+		params: {
+			expected_identity: String => DisplayValue,
+			expected_revision: u64 => DisplayValue,
+			actual_identity: String => DisplayValue,
+			actual_revision: u64 => DisplayValue,
+		},
+	},
+	SnapshotUnavailable, "FG-G1F04" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Graph,
+		subcondition: "graph snapshot is unavailable",
+		message: "Graph {identity} snapshot {snapshot} is unavailable.",
+		params: {
+			identity: String => DisplayValue,
+			snapshot: String => DisplayValue,
+		},
+	},
+	GraphIdentityMismatch, "FG-G1F05" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Graph,
+		subcondition: "graph identity mismatch",
+		message: "The value belongs to graph {expected}, but resolver graph {actual} was supplied.",
+		params: {
+			expected: String => DisplayValue,
+			actual: String => DisplayValue,
+		},
+	},
+	LiveGraphStateError, "FG-G1F06" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Graph,
+		subcondition: "invalid live graph state",
+		message: "The live graph operation is invalid in its current state: {reason}.",
+		params: {
+			reason: String => DisplayValue,
+		},
+	},
 	EmptyEdgeEndpoints, "FG-G2F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -716,6 +793,21 @@ define_status_codes!(
 			id: String => DisplayValue,
 			actual: String => ValueType,
 			expected: String => ValueType,
+		},
+	},
+	GraphConstraintViolation, "FG-G2F04" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::GraphTypeViolation,
+		domain: Domain::Graph,
+		subcondition: "graph constraint violation",
+		message: "The value does not satisfy the {graph_type} graph constraint: {reason}.",
+		params: {
+			graph_type: String => ValueType,
+			reason: String => DisplayValue,
 		},
 	},
 	QueryTooLarge, "FG-54F01" => {
