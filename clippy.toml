@@ -15,9 +15,9 @@ module-item-order-groupings = [
 
     ["imports", [  "use", ]],
 
-    ["statics-and-constants", [ "static", ]],
+    ["statics-and-constants", [ "static", "const", ]],
 
-    ["type-aliases", [ "ty_alias", "opaque_ty", "trait_alias", ]],
+    ["type-aliases", [ "ty_alias", "trait_alias", ]],
 
     ["types", [ "trait", "enum", "struct", "union", ]],
 
