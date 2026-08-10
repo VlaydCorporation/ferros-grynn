@@ -68,6 +68,12 @@ graphify query "QUESTION"
 # or: graphify query "QUESTION" --dfs --budget 3000
 ```
 
+On Windows under a sandbox, a uv-installed launcher outside the workspace may
+print `Failed to canonicalize script path` even though the installation is
+healthy. Retry the same command with sandbox approval, or run
+`uv tool run --from graphifyy graphify query "QUESTION"`, before using the
+inline NetworkX fallback.
+
 If the CLI is unavailable, load `graphify-out/graph.json` and run the traversal inline:
 
 1. Find the 1-3 nodes whose label best matches the expanded tokens.

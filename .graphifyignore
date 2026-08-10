@@ -3,3 +3,4 @@
 
 /crates/configuration
 /crates/storage_engine
+/.codex/hooks.json
