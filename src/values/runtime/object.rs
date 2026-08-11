@@ -33,7 +33,11 @@ impl Object {
 		self.0.contains_key(key)
 	}
 
-	pub fn insert(&mut self, key: impl Into<Text>, value: impl Into<Value>) -> Option<Value> {
+	pub fn insert<IntoText, IntoValue>(&mut self, key: IntoText, value: IntoValue) -> Option<Value>
+	where
+		IntoText: Into<Text>,
+		IntoValue: Into<Value>,
+	{
 		self.0.insert(key.into(), value.into())
 	}
 
@@ -57,7 +61,7 @@ impl Object {
 		self.0.values()
 	}
 
-	pub fn as_map(&self) -> &BTreeMap<Text, Value> {
+	pub const fn as_map(&self) -> &BTreeMap<Text, Value> {
 		&self.0
 	}
 
@@ -89,8 +93,8 @@ where
 }
 
 impl IntoIterator for Object {
-	type IntoIter = IntoIter<Text, Value>;
 	type Item = (Text, Value);
+	type IntoIter = IntoIter<Text, Value>;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.0.into_iter()
@@ -98,11 +102,20 @@ impl IntoIterator for Object {
 }
 
 impl<'a> IntoIterator for &'a Object {
-	type IntoIter = Iter<'a, Text, Value>;
 	type Item = (&'a Text, &'a Value);
+	type IntoIter = Iter<'a, Text, Value>;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.iter()
+	}
+}
+
+impl<'a> IntoIterator for &'a mut Object {
+	type Item = (&'a Text, &'a mut Value);
+	type IntoIter = IterMut<'a, Text, Value>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.iter_mut()
 	}
 }
 

@@ -12,6 +12,7 @@ use rust_decimal::Decimal;
 use crate::gql_status::FerrosGrynnError;
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Number {
 	Int(i64),
 	Float(f64),
@@ -62,19 +63,19 @@ impl Ord for CanonicalNumber {
 impl Number {
 	pub const NAN: Self = Self::Float(f64::NAN);
 
-	pub fn is_nan(self) -> bool {
+	pub const fn is_nan(self) -> bool {
 		matches!(self, Self::Float(value) if value.is_nan())
 	}
 
-	pub fn is_int(self) -> bool {
+	pub const fn is_int(self) -> bool {
 		matches!(self, Self::Int(_))
 	}
 
-	pub fn is_float(self) -> bool {
+	pub const fn is_float(self) -> bool {
 		matches!(self, Self::Float(_))
 	}
 
-	pub fn is_decimal(self) -> bool {
+	pub const fn is_decimal(self) -> bool {
 		matches!(self, Self::Decimal(_))
 	}
 
@@ -185,11 +186,11 @@ impl Default for Number {
 }
 
 impl Display for Number {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Int(value) => Display::fmt(value, formatter),
-			Self::Float(value) => Display::fmt(value, formatter),
-			Self::Decimal(value) => Display::fmt(value, formatter),
+			Self::Int(value) => Display::fmt(value, f),
+			Self::Float(value) => Display::fmt(value, f),
+			Self::Decimal(value) => Display::fmt(value, f),
 		}
 	}
 }
@@ -306,7 +307,7 @@ impl FromStr for Number {
 			return value
 				.parse::<Decimal>()
 				.map(Self::Decimal)
-				.map_err(|_| FerrosGrynnError::conversion_error(value, "Number"));
+				.map_err(|_err| FerrosGrynnError::conversion_error(value, "Number"));
 		}
 		if let Ok(value) = value.parse::<i64>() {
 			return Ok(Self::Int(value));
@@ -325,7 +326,7 @@ impl FromStr for Number {
 		value
 			.parse::<Decimal>()
 			.map(Self::Decimal)
-			.map_err(|_| FerrosGrynnError::conversion_error(value, "Number"))
+			.map_err(|_err| FerrosGrynnError::conversion_error(value, "Number"))
 	}
 }
 

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::missing_panics_doc, reason = "pool key and concrete type must agree")]
+
 //! Runtime ECS sidecar for graph atoms.
 //!
 //! Component identity comes exclusively from graph [`AtomId`] values. This
@@ -211,7 +213,7 @@ impl WorldComponents {
 	}
 
 	/// Drops components whose graph atom no longer exists.
-	pub fn retain_atoms(&mut self, mut predicate: impl FnMut(AtomId) -> bool) {
+	pub fn retain_atoms<Pred: FnMut(AtomId) -> bool>(&mut self, mut predicate: Pred) {
 		for pool in self.components.values_mut() {
 			pool.retain_atoms(&mut predicate);
 		}

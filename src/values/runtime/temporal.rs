@@ -12,11 +12,11 @@ use jiff::{Span, Zoned};
 pub struct DateTime(Zoned);
 
 impl DateTime {
-	pub fn new(value: Zoned) -> Self {
+	pub const fn new(value: Zoned) -> Self {
 		Self(value)
 	}
 
-	pub fn as_inner(&self) -> &Zoned {
+	pub const fn as_inner(&self) -> &Zoned {
 		&self.0
 	}
 
@@ -52,8 +52,8 @@ impl FromStr for DateTime {
 }
 
 impl Display for DateTime {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		Display::fmt(&self.0, formatter)
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(&self.0, f)
 	}
 }
 
@@ -62,15 +62,15 @@ impl Display for DateTime {
 pub struct Duration(Span);
 
 impl Duration {
-	pub fn new(value: Span) -> Self {
+	pub const fn new(value: Span) -> Self {
 		Self(value)
 	}
 
-	pub fn as_inner(&self) -> &Span {
+	pub const fn as_inner(&self) -> &Span {
 		&self.0
 	}
 
-	pub fn into_inner(self) -> Span {
+	pub const fn into_inner(self) -> Span {
 		self.0
 	}
 
@@ -114,8 +114,8 @@ impl FromStr for Duration {
 }
 
 impl Display for Duration {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		Display::fmt(&self.0, formatter)
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(&self.0, f)
 	}
 }
 

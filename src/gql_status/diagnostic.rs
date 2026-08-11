@@ -13,6 +13,7 @@ use crate::gql_status::formatting::DiagnosticValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum Severity {
 	Information,
 	Warning,
@@ -22,6 +23,7 @@ pub enum Severity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ExecutionPhase {
 	Parsing,
 	SemanticAnalysis,
@@ -34,6 +36,7 @@ pub enum ExecutionPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TextSpan {
 	pub offset: u32,
 	pub len: u32,
@@ -53,6 +56,7 @@ impl TextSpan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LineColumn {
 	pub line: NonZeroU32,
 	pub column: NonZeroU32,
@@ -73,8 +77,8 @@ impl Location {
 		span: TextSpan,
 	) -> Result<Self, LocationError> {
 		let end = span.end().ok_or(LocationError::RangeOverflow)?;
-		let start_offset = usize::try_from(span.offset).map_err(|_| LocationError::OutOfBounds)?;
-		let end_offset = usize::try_from(end).map_err(|_| LocationError::OutOfBounds)?;
+		let start_offset = usize::try_from(span.offset).map_err(|_err| LocationError::OutOfBounds)?;
+		let end_offset = usize::try_from(end).map_err(|_err| LocationError::OutOfBounds)?;
 
 		if end_offset > source.len() {
 			return Err(LocationError::OutOfBounds);
@@ -122,6 +126,7 @@ impl Location {
 	}
 }
 
+#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "line starts at one & column starts at one")]
 fn line_column_at(source: &str, byte_offset: usize) -> LineColumn {
 	let mut line = 1_u32;
 	let mut column = 1_u32;
@@ -142,6 +147,7 @@ fn line_column_at(source: &str, byte_offset: usize) -> LineColumn {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocationError {
 	RangeOverflow,
 	OutOfBounds,
@@ -167,7 +173,7 @@ pub struct LabeledLocation {
 }
 
 impl LabeledLocation {
-	pub fn new(location: Location, label: Option<impl Into<Arc<str>>>) -> Self {
+	pub fn new<ArcStr: Into<Arc<str>>>(location: Location, label: Option<ArcStr>) -> Self {
 		Self {
 			location,
 			label: label.map(Into::into),
@@ -228,21 +234,21 @@ impl DiagnosticRecord {
 		self
 	}
 
-	pub fn with_timestamp(mut self, timestamp: SystemTime) -> Self {
+	pub const fn with_timestamp(mut self, timestamp: SystemTime) -> Self {
 		self.timestamp = Some(timestamp);
 		self
 	}
 
-	pub fn with_phase(mut self, phase: ExecutionPhase) -> Self {
+	pub const fn with_phase(mut self, phase: ExecutionPhase) -> Self {
 		self.phase = Some(phase);
 		self
 	}
 
-	pub(crate) fn set_severity_override(&mut self, severity: Severity) {
+	pub(crate) const fn set_severity_override(&mut self, severity: Severity) {
 		self.severity_override = Some(severity);
 	}
 
-	pub fn with_extension(mut self, key: impl Into<String>, value: DiagnosticValue) -> Self {
+	pub fn with_extension<Str: Into<String>>(mut self, key: Str, value: DiagnosticValue) -> Self {
 		self.extensions.insert(key.into(), value);
 		self
 	}

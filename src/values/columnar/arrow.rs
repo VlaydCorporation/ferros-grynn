@@ -5,17 +5,8 @@ use std::{
 
 use ::arrow::{
 	array::{
-		Array,
-		ArrayRef,
-		BinaryArray,
-		BooleanArray,
-		Decimal128Array,
-		FixedSizeBinaryArray,
-		Float64Array,
-		Int64Array,
-		NullArray,
-		StringArray,
-		UnionArray,
+		Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
+		Float64Array, Int64Array, NullArray, StringArray, UnionArray,
 		builder::FixedSizeBinaryBuilder,
 	},
 	buffer::{BooleanBuffer, ScalarBuffer},
@@ -26,24 +17,12 @@ use ::arrow::{
 use rust_decimal::Decimal;
 
 use super::{
-	ENCODING_METADATA,
-	PROPERTY_KEY_ID_METADATA,
-	PropertyBatch,
-	VALUE_KIND_METADATA,
-	invalid_batch,
+	ENCODING_METADATA, PROPERTY_KEY_ID_METADATA, PropertyBatch, VALUE_KIND_METADATA, invalid_batch,
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{
-		Bytes,
-		Number,
-		PropertyDictionary,
-		PropertyKeyId,
-		PropertyMap,
-		Text,
-		Ulid,
-		Uuid,
-		Value,
+		Bytes, Number, PropertyDictionary, PropertyKeyId, PropertyMap, Text, Ulid, Uuid, Value,
 	},
 };
 
@@ -121,6 +100,11 @@ pub(super) fn decode_rows(batch: &PropertyBatch) -> FerrosGrynnResult<Vec<Proper
 	Ok(rows)
 }
 
+#[allow(
+	clippy::expect_used,
+	clippy::missing_panics_doc,
+	reason = "one kind must have a first element"
+)]
 fn encode_column(
 	key: PropertyKeyId,
 	values: &[Option<&Value>],
@@ -140,6 +124,12 @@ fn encode_column(
 	}
 }
 
+#[allow(
+	clippy::expect_used,
+	clippy::missing_panics_doc,
+	unwrap_in_result,
+	reason = "non-sentinel has a kind & kind was collected from the same values"
+)]
 fn encode_union(
 	key: PropertyKeyId,
 	values: &[Option<&Value>],
@@ -165,11 +155,9 @@ fn encode_union(
 			_ => 0,
 		};
 		type_ids.push(child as i8);
-		offsets.push(
-			i32::try_from(child_values[child].len()).map_err(|_| {
-				FerrosGrynnError::graph_capacity_exceeded("Arrow dense union child")
-			})?,
-		);
+		offsets.push(i32::try_from(child_values[child].len()).map_err(|_err| {
+			FerrosGrynnError::graph_capacity_exceeded("Arrow dense union child")
+		})?);
 		child_values[child].push(value.filter(|value| !value.is_none() && !value.is_null()));
 	}
 
@@ -306,7 +294,7 @@ fn decode_value(array: &dyn Array, field: &Field, index: usize) -> FerrosGrynnRe
 			Ok(Value::Ulid(Ulid::from(ulid::Ulid::from_bytes(bytes))))
 		}
 		value if value.starts_with("decimal:") => {
-			let scale = value["decimal:".len()..].parse::<u32>().map_err(|_| {
+			let scale = value["decimal:".len()..].parse::<u32>().map_err(|_err| {
 				invalid_batch(format!("Arrow field {} has invalid decimal scale", field.name()))
 			})?;
 			let mantissa = downcast::<Decimal128Array>(array, field)?.value(index);
@@ -323,7 +311,7 @@ fn fixed_16(array: &dyn Array, field: &Field, index: usize) -> FerrosGrynnResult
 	downcast::<FixedSizeBinaryArray>(array, field)?
 		.value(index)
 		.try_into()
-		.map_err(|_| invalid_batch(format!("Arrow field {} is not 16 bytes wide", field.name())))
+		.map_err(|_err| invalid_batch(format!("Arrow field {} is not 16 bytes wide", field.name())))
 }
 
 fn downcast<'a, T: Array + 'static>(

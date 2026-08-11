@@ -25,6 +25,7 @@ pub use ast::{
 use crate::{config::Config, gql_status::FerrosGrynnResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParserSettings {
 	pub max_object_parsing_depth: u32,
 	pub max_query_parsing_depth: u32,

@@ -77,7 +77,7 @@ impl FerrosGrynnError {
 		self
 	}
 
-	pub fn with_extension(mut self, key: impl Into<String>, value: DiagnosticValue) -> Self {
+	pub fn with_extension<Str: Into<String>>(mut self, key: Str, value: DiagnosticValue) -> Self {
 		let state = Arc::make_mut(&mut self.inner);
 		state.status = state.status.clone().with_extension(key, value);
 		self
@@ -89,6 +89,7 @@ impl FerrosGrynnError {
 		Ok(self)
 	}
 
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "critical severity is valid for every error status")]
 	pub fn mark_critical(self) -> Self {
 		self.with_severity(Severity::Critical)
 			.expect("critical severity is valid for every error status")
@@ -107,6 +108,7 @@ impl FerrosGrynnError {
 	}
 
 	/// Returns the root structured FG status.
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "an error chain always contains itself")]
 	pub fn root(&self) -> &FerrosGrynnError {
 		self.chain().last().expect("an error chain always contains itself")
 	}
@@ -128,13 +130,18 @@ impl FerrosGrynnError {
 		Self::numeric_value_out_of_range("infinity")
 	}
 
-	pub fn out_of_range(
-		component: impl Into<String>,
-		value_type: impl Into<String>,
+	pub fn out_of_range<Str1, Str2, Str3>(
+		component: Str1,
+		value_type: Str1,
 		lower: i64,
 		upper: i64,
-		value: impl Into<String>,
-	) -> Self {
+		value: Str1,
+	) -> Self
+	where
+		Str1: Into<String>,
+		Str2: Into<String>,
+		Str3: Into<String>,
+	{
 		Self::specified_numeric_value_out_of_range(component, value_type, lower, upper, value)
 	}
 }
@@ -188,7 +195,7 @@ impl Error for FerrosGrynnError {
 pub struct NonErrorStatus(StatusObject);
 
 impl NonErrorStatus {
-	pub fn status(&self) -> &StatusObject {
+	pub const fn status(&self) -> &StatusObject {
 		&self.0
 	}
 }

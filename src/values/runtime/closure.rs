@@ -3,6 +3,7 @@ use std::{
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
 	num::NonZeroU64,
+	ops::Fn,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -10,7 +11,7 @@ use std::{
 };
 
 use super::{Text, Type, Value};
-use crate::gql_status::FerrosGrynnError;
+use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -45,12 +46,10 @@ pub struct Closure {
 }
 
 impl Closure {
-	pub fn new(
-		name: Option<Text>,
-		parameters: Vec<Type>,
-		result: Type,
-		function: impl Fn(&[Value]) -> Result<Value, FerrosGrynnError> + Send + Sync + 'static,
-	) -> Self {
+	pub fn new<Func>(name: Option<Text>, parameters: Vec<Type>, result: Type, function: Func) -> Self
+	where
+		Func: Fn(&[Value]) -> FerrosGrynnResult<Value> + Send + Sync + 'static,
+	{
 		Self {
 			id: RuntimeId::next(),
 			name,
@@ -99,9 +98,8 @@ impl Closure {
 }
 
 impl Debug for Closure {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		formatter
-			.debug_struct("Closure")
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Closure")
 			.field("id", &self.id)
 			.field("name", &self.name)
 			.field("parameters", &self.parameters)

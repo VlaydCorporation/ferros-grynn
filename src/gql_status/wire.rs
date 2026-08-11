@@ -21,6 +21,7 @@ use crate::gql_status::{
 pub const STATUS_WIRE_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StatusWireV1 {
 	pub version: u16,
 	pub code: String,
@@ -43,6 +44,7 @@ pub struct StatusWireV1 {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DiagnosticRecordWireV1 {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub position: Option<LocationWireV1>,
@@ -57,6 +59,7 @@ pub struct DiagnosticRecordWireV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LocationWireV1 {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub source_id: Option<String>,
@@ -69,6 +72,7 @@ pub struct LocationWireV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LabeledLocationWireV1 {
 	#[serde(flatten)]
 	pub location: LocationWireV1,

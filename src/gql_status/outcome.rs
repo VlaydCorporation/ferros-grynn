@@ -12,7 +12,7 @@ pub struct StatusReport {
 }
 
 impl StatusReport {
-	pub fn new(primary: impl Into<StatusObject>) -> Result<Self, StatusReportError> {
+	pub fn new<IntoSO: Into<StatusObject>>(primary: IntoSO) -> Result<Self, StatusReportError> {
 		let primary = primary.into();
 		Self::ensure_non_error(&primary)?;
 		Ok(Self {
@@ -26,7 +26,7 @@ impl StatusReport {
 		}
 	}
 
-	pub fn push(&mut self, status: impl Into<StatusObject>) -> Result<(), StatusReportError> {
+	pub fn push<IntoSO: Into<StatusObject>>(&mut self, status: IntoSO) -> Result<(), StatusReportError> {
 		let status = status.into();
 		Self::ensure_non_error(&status)?;
 		self.statuses.push(status);
@@ -34,6 +34,7 @@ impl StatusReport {
 		Ok(())
 	}
 
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "StatusReport always contains a primary status")]
 	pub fn primary(&self) -> &StatusObject {
 		self.statuses.first().expect("StatusReport always contains a primary status")
 	}
@@ -57,7 +58,7 @@ impl StatusReport {
 	}
 }
 
-fn precedence(status: &StatusObject) -> u8 {
+const fn precedence(status: &StatusObject) -> u8 {
 	match status.definition().condition {
 		Condition::NoData => 4,
 		Condition::Warning => 3,
@@ -111,15 +112,15 @@ impl<T> Outcome<T> {
 		}
 	}
 
-	pub fn with_status(
+	pub fn with_status<IntoSO: Into<StatusObject>>(
 		mut self,
-		status: impl Into<StatusObject>,
+		status: IntoSO,
 	) -> Result<Self, StatusReportError> {
 		self.statuses.push(status)?;
 		Ok(self)
 	}
 
-	pub fn map<U>(self, map: impl FnOnce(T) -> U) -> Outcome<U> {
+	pub fn map<U, MapFn: FnOnce(T) -> U>(self, map: MapFn) -> Outcome<U> {
 		Outcome {
 			value: map(self.value),
 			statuses: self.statuses,

@@ -46,10 +46,10 @@ impl PropertyBatch {
 		})
 	}
 
-	pub fn register_datafusion_table(
+	pub fn register_datafusion_table<IntoStr: Into<String>>(
 		&self,
 		context: &SessionContext,
-		name: impl Into<String>,
+		name: IntoStr,
 	) -> FerrosGrynnResult<Option<Arc<dyn TableProvider>>> {
 		let table: Arc<dyn TableProvider> = self.datafusion_table()?;
 		context.register_table(name.into(), table).map_err(|source| {

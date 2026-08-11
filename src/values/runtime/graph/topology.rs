@@ -15,7 +15,7 @@ pub struct QualifiedAtomId {
 }
 
 impl QualifiedAtomId {
-	pub fn new(scope: impl Into<Vec<AtomId>>, atom: AtomId) -> FerrosGrynnResult<Self> {
+	pub fn new<IntoVec: Into<Vec<AtomId>>>(scope: IntoVec, atom: AtomId) -> FerrosGrynnResult<Self> {
 		let scope = scope.into();
 		if scope.is_empty() {
 			return Err(FerrosGrynnError::graph_constraint_violation(
@@ -40,6 +40,7 @@ impl QualifiedAtomId {
 
 /// A local or cross-level endpoint of an edge.
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum EdgeEndpoint {
 	Local(AtomId),
 	Nested(QualifiedAtomId),
@@ -71,6 +72,7 @@ impl From<QualifiedAtomId> for EdgeEndpoint {
 }
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum EdgeDirection {
 	Directed,
 	Bidirectional,

@@ -5,7 +5,7 @@ use std::slice::Iter;
 pub struct Bytes(Vec<u8>);
 
 impl Bytes {
-	pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+	pub fn new<IntoVec: Into<Vec<u8>>>(bytes: IntoVec) -> Self {
 		Self(bytes.into())
 	}
 

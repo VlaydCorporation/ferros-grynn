@@ -410,7 +410,7 @@ fn is_ident_continue(value: char) -> bool {
 	is_ident_start(value) || value.is_numeric()
 }
 
-fn span(start: usize, end: usize) -> TextSpan {
+const fn span(start: usize, end: usize) -> TextSpan {
 	TextSpan::new(start as u32, (end - start) as u32)
 }
 

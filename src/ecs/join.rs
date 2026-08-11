@@ -1,3 +1,8 @@
+#![allow(
+	clippy::min_ident_chars,
+	reason = "short names for macro params"
+)]
+
 use std::{iter::FusedIterator, marker::PhantomData};
 
 use super::WorldComponents;
@@ -38,7 +43,7 @@ macro_rules! define_join_iter {
 				}
 			}
 
-			pub fn driver_len(&self) -> usize {
+			pub const fn driver_len(&self) -> usize {
 				self.driver.len()
 			}
 		}

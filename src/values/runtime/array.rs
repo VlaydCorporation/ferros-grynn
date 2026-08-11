@@ -42,7 +42,7 @@ impl Array {
 		self.0.get_mut(index)
 	}
 
-	pub fn push(&mut self, value: impl Into<Value>) {
+	pub fn push<IntoValue: Into<Value>>(&mut self, value: IntoValue) {
 		self.0.push(value.into());
 	}
 
@@ -56,8 +56,8 @@ impl Array {
 }
 
 impl IntoIterator for Array {
-	type IntoIter = std::vec::IntoIter<Value>;
 	type Item = Value;
+	type IntoIter = std::vec::IntoIter<Value>;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.0.into_iter()
@@ -65,11 +65,20 @@ impl IntoIterator for Array {
 }
 
 impl<'a> IntoIterator for &'a Array {
-	type IntoIter = Iter<'a, Value>;
 	type Item = &'a Value;
+	type IntoIter = Iter<'a, Value>;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.iter()
+	}
+}
+
+impl<'a> IntoIterator for &'a mut Array {
+	type Item = &'a mut Value;
+	type IntoIter = IterMut<'a, Value>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.iter_mut()
 	}
 }
 

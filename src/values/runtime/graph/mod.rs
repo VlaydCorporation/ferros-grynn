@@ -12,10 +12,6 @@
 	clippy::renamed_function_params,
 	reason = "trait implementations use domain-specific formatter and value names"
 )]
-#![allow(
-	clippy::same_name_method,
-	reason = "inherent SDK conveniences intentionally mirror the common GraphRead trait"
-)]
 
 mod dag;
 mod forest;
@@ -35,9 +31,11 @@ mod view;
 mod workspace;
 
 #[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub struct Mutable;
 
 #[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub struct Frozen;
 
 pub use dag::{Dag, FrozenDag, MutableDag};
@@ -53,6 +51,7 @@ pub use forest::{
 	Tree,
 	TreeOrientation,
 };
+pub(crate) use general::merge_transaction_graph;
 pub use general::{FrozenGraph, Graph, MutableGraph};
 pub use hypergraph::{FrozenHypergraph, Hypergraph, MutableHypergraph};
 pub use id::{AtomId, AtomKind};
@@ -74,6 +73,7 @@ pub use path::{
 )]
 pub(crate) use path::{PathTraceArena, PathTraceId};
 pub use read::{
+	AtomIds,
 	AtomRef,
 	DirtyTarget,
 	DiskGraphView,

@@ -75,7 +75,7 @@ pub struct RecordId {
 }
 
 impl RecordId {
-	pub fn new(table: impl Into<Text>, id: RecordIdPart) -> FerrosGrynnResult<Self> {
+	pub fn new<IntoText: Into<Text>>(table: IntoText, id: RecordIdPart) -> FerrosGrynnResult<Self> {
 		let table = table.into();
 		if table.is_empty() {
 			return Err(FerrosGrynnError::empty_record_id_table());
@@ -87,7 +87,7 @@ impl RecordId {
 		})
 	}
 
-	pub fn from_value(table: impl Into<Text>, id: Value) -> FerrosGrynnResult<Self> {
+	pub fn from_value<IntoText: Into<Text>>(table: IntoText, id: Value) -> FerrosGrynnResult<Self> {
 		Self::new(table, RecordIdPart::try_from_value(id)?)
 	}
 
@@ -99,7 +99,7 @@ impl RecordId {
 		&self.table
 	}
 
-	pub fn id(&self) -> &RecordIdPart {
+	pub const fn id(&self) -> &RecordIdPart {
 		&self.id
 	}
 
@@ -109,28 +109,28 @@ impl RecordId {
 }
 
 impl Display for RecordIdPart {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Int(value) => Display::fmt(value, formatter),
+			Self::Int(value) => Display::fmt(value, f),
 			Self::String(value) => {
 				if string_id_needs_quotes(value) {
-					let escaped = serde_json::to_string(value.as_str()).map_err(|_| fmt::Error)?;
-					formatter.write_str(&escaped)
+					let escaped = serde_json::to_string(value.as_str()).map_err(|_err| fmt::Error)?;
+					f.write_str(&escaped)
 				} else {
-					Display::fmt(value, formatter)
+					Display::fmt(value, f)
 				}
 			}
-			Self::Uuid(value) => Display::fmt(value, formatter),
-			Self::Ulid(value) => Display::fmt(value, formatter),
-			Self::Array(value) => Display::fmt(&Value::Array(value.clone()), formatter),
-			Self::Object(value) => Display::fmt(&Value::Object(value.clone()), formatter),
+			Self::Uuid(value) => Display::fmt(value, f),
+			Self::Ulid(value) => Display::fmt(value, f),
+			Self::Array(value) => Display::fmt(&Value::Array(value.clone()), f),
+			Self::Object(value) => Display::fmt(&Value::Object(value.clone()), f),
 		}
 	}
 }
 
 impl Display for RecordId {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{}:{}", self.table, self.id)
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(f, "{}:{}", self.table, self.id)
 	}
 }
 

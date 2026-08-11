@@ -18,7 +18,7 @@ use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 pub struct Position(Vec<f64>);
 
 impl Position {
-	pub fn new(coordinates: impl Into<Vec<f64>>) -> FerrosGrynnResult<Self> {
+	pub fn new<IntoVec: Into<Vec<f64>>>(coordinates: IntoVec) -> FerrosGrynnResult<Self> {
 		let mut coordinates = coordinates.into();
 		if coordinates.len() != 2 {
 			return Err(FerrosGrynnError::invalid_geometry_coordinate_dimension(
@@ -206,8 +206,8 @@ impl FromStr for Geometry {
 }
 
 impl Display for Geometry {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.to_geojson_string())
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		f.write_str(&self.to_geojson_string())
 	}
 }
 

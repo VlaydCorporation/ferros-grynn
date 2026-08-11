@@ -68,11 +68,11 @@ Early-stage. `src/syn` is the syntax front end (`lexer`, `token`, `parser`, and 
 ## Specs (`docs/`) — design authority
 
 These `.md` files are the design authority for sensitive subsystems; when implementing those areas, treat the spec as the contract and keep code in sync.
-- `gql_spec.md` — the query language as a whole; influences the entire architecture (kept separate for that reason). **Approve this before large GQL work.**
-- `disk_storage_spec.md` — on-disk storage format (page types, `RecordId`/`DiskAtomRef`, WAL, checkpoint/recovery, indexes).
-- `gql_tech_spec.md` — technical implementation of the query engine (planner contracts, degradation modes, resource budgets). Explicitly noted as needing rework *after* `gql_spec.md` and `disk_storage_spec.md` are approved — don't treat it as current.
-- `gql_grammar.md` — EBNF grammar (not yet filled in).
-- `graphs.md` — the graph taxonomy the engine must cover.
+- `docs/gql_spec.md` — the query language as a whole; influences the entire architecture (kept separate for that reason). **Approve this before large GQL work.**
+- `docs/disk_storage_spec.md` — on-disk storage format (page types, `RecordId`/`DiskAtomRef`, WAL, checkpoint/recovery, indexes).
+- `docs/gql_tech_spec.md` — technical implementation of the query engine (planner contracts, degradation modes, resource budgets). Explicitly noted as needing rework *after* `gql_spec.md` and `disk_storage_spec.md` are approved — don't treat it as current.
+- `docs/gql_grammar.md` — EBNF grammar (not yet filled in).
+- `docs/graphs.md` — the graph taxonomy the engine must cover.
 
 
 ## Conventions
@@ -120,6 +120,7 @@ The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optim
 
 - Use types errors from `src/gql_status` for fallible APIs, don't use `anyhow` - it erases errors; NEWER use `.expect()` or another panics.
 - Never use `.unwrap_or_default()` when debugging - it masks errors.
+- Follow the Clippy coding rules noted in `Cargo.toml` and their configurations in the `clippy.toml` file.
 - Performance matters: think about impact of every change.
 - Don't add dependencies without confirmation.
 

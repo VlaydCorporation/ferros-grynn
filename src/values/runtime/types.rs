@@ -71,65 +71,65 @@ impl Type {
 }
 
 impl Display for Type {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Any => formatter.write_str("any"),
-			Self::None => formatter.write_str("none"),
-			Self::Null => formatter.write_str("null"),
-			Self::Bool => formatter.write_str("bool"),
-			Self::Number => formatter.write_str("number"),
-			Self::Int => formatter.write_str("int"),
-			Self::Float => formatter.write_str("float"),
-			Self::Decimal => formatter.write_str("decimal"),
-			Self::String => formatter.write_str("string"),
-			Self::Duration => formatter.write_str("duration"),
-			Self::DateTime => formatter.write_str("datetime"),
-			Self::Ulid => formatter.write_str("ulid"),
-			Self::Uuid => formatter.write_str("uuid"),
-			Self::Array(value) => write!(formatter, "array<{value}>"),
-			Self::Set(value) => write!(formatter, "set<{value}>"),
-			Self::Object => formatter.write_str("object"),
-			Self::Geometry => formatter.write_str("geometry"),
-			Self::Vector(kind) => write!(formatter, "vector<{kind:?}>"),
-			Self::Bytes => formatter.write_str("bytes"),
-			Self::Record => formatter.write_str("record"),
-			Self::Regex => formatter.write_str("regex"),
-			Self::Range(value) => write!(formatter, "range<{value}>"),
-			Self::Atom(kind) => write!(formatter, "atom<{kind}>"),
-			Self::Path => formatter.write_str("path"),
-			Self::Graph(kind) => write!(formatter, "graph<{kind}>"),
-			Self::Option(value) => write!(formatter, "option<{value}>"),
+			Self::Any => f.write_str("any"),
+			Self::None => f.write_str("none"),
+			Self::Null => f.write_str("null"),
+			Self::Bool => f.write_str("bool"),
+			Self::Number => f.write_str("number"),
+			Self::Int => f.write_str("int"),
+			Self::Float => f.write_str("float"),
+			Self::Decimal => f.write_str("decimal"),
+			Self::String => f.write_str("string"),
+			Self::Duration => f.write_str("duration"),
+			Self::DateTime => f.write_str("datetime"),
+			Self::Ulid => f.write_str("ulid"),
+			Self::Uuid => f.write_str("uuid"),
+			Self::Array(value) => write!(f, "array<{value}>"),
+			Self::Set(value) => write!(f, "set<{value}>"),
+			Self::Object => f.write_str("object"),
+			Self::Geometry => f.write_str("geometry"),
+			Self::Vector(kind) => write!(f, "vector<{kind:?}>"),
+			Self::Bytes => f.write_str("bytes"),
+			Self::Record => f.write_str("record"),
+			Self::Regex => f.write_str("regex"),
+			Self::Range(value) => write!(f, "range<{value}>"),
+			Self::Atom(kind) => write!(f, "atom<{kind}>"),
+			Self::Path => f.write_str("path"),
+			Self::Graph(kind) => write!(f, "graph<{kind}>"),
+			Self::Option(value) => write!(f, "option<{value}>"),
 			Self::Union(values) => {
 				for (index, value) in values.iter().enumerate() {
 					if index > 0 {
-						formatter.write_str(" | ")?;
+						f.write_str(" | ")?;
 					}
-					Display::fmt(value, formatter)?;
+					Display::fmt(value, f)?;
 				}
 				Ok(())
 			}
 			Self::RecordShape(fields) => {
-				formatter.write_str("record<{")?;
+				f.write_str("record<{")?;
 				for (index, (name, value)) in fields.iter().enumerate() {
 					if index > 0 {
-						formatter.write_str(", ")?;
+						f.write_str(", ")?;
 					}
-					write!(formatter, "{name}: {value}")?;
+					write!(f, "{name}: {value}")?;
 				}
-				formatter.write_str("}>")
+				f.write_str("}>")
 			}
 			Self::Closure {
 				parameters,
 				result,
 			} => {
-				formatter.write_str("closure<(")?;
+				f.write_str("closure<(")?;
 				for (index, parameter) in parameters.iter().enumerate() {
 					if index > 0 {
-						formatter.write_str(", ")?;
+						f.write_str(", ")?;
 					}
-					Display::fmt(parameter, formatter)?;
+					Display::fmt(parameter, f)?;
 				}
-				write!(formatter, ") -> {result}>")
+				write!(f, ") -> {result}>")
 			}
 		}
 	}

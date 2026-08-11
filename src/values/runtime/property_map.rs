@@ -27,8 +27,8 @@ impl PropertyKeyId {
 }
 
 impl fmt::Display for PropertyKeyId {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		fmt::Display::fmt(&self.0, formatter)
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		fmt::Display::fmt(&self.0, f)
 	}
 }
 
@@ -87,7 +87,7 @@ impl PropertyMap {
 		self.find(key).is_ok()
 	}
 
-	pub fn insert(&mut self, key: PropertyKeyId, value: impl Into<Value>) -> Option<Value> {
+	pub fn insert<IntoValue: Into<Value>>(&mut self, key: PropertyKeyId, value: IntoValue) -> Option<Value> {
 		let value = value.into();
 		match self.find(key) {
 			Ok(index) => Some(std::mem::replace(&mut self.entries[index].1, value)),
@@ -126,12 +126,12 @@ impl PropertyMap {
 }
 
 impl Debug for PropertyMap {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		formatter.debug_map().entries(self.iter()).finish()
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		f.debug_map().entries(self.iter()).finish()
 	}
 }
 
-fn entry_ref(entry: &Entry) -> (PropertyKeyId, &Value) {
+const fn entry_ref(entry: &Entry) -> (PropertyKeyId, &Value) {
 	(entry.0, &entry.1)
 }
 
@@ -169,6 +169,15 @@ impl FromIterator<(PropertyKeyId, Value)> for PropertyMap {
 			result.insert(key, value);
 		}
 		result
+	}
+}
+
+impl<'a> IntoIterator for &'a PropertyMap {
+	type Item = (PropertyKeyId, &'a Value);
+	type IntoIter = PropertyIter<'a>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.iter()
 	}
 }
 

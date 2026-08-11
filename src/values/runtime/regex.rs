@@ -14,7 +14,7 @@ pub struct Regex {
 }
 
 impl Regex {
-	pub fn new(pattern: impl Into<Text>) -> Result<Self, regex::Error> {
+	pub fn new<IntoText: Into<Text>>(pattern: IntoText) -> Result<Self, regex::Error> {
 		let pattern = pattern.into();
 		let compiled = regex::Regex::new(pattern.as_str())?;
 		Ok(Self {
@@ -45,8 +45,8 @@ impl FromStr for Regex {
 }
 
 impl Display for Regex {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		write!(formatter, "/{}/", self.pattern)
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(f, "/{}/", self.pattern)
 	}
 }
 

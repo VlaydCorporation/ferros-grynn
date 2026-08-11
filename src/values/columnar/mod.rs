@@ -30,6 +30,7 @@ pub struct PropertyBatch {
 }
 
 impl PropertyBatch {
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "validated field mapping must be complete")]
 	pub fn try_new(
 		record_batch: RecordBatch,
 		presence: Vec<BooleanBuffer>,
@@ -99,7 +100,7 @@ impl PropertyBatch {
 					))
 				})?
 				.parse::<u32>()
-				.map_err(|_| {
+				.map_err(|_err| {
 					invalid_batch(format!(
 						"Arrow field {field_index} has an invalid property key ID"
 					))

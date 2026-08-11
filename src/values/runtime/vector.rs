@@ -4,6 +4,7 @@ use std::{
 };
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum VectorKind {
 	F64,
 	F32,
@@ -33,7 +34,7 @@ impl Vector {
 		}
 	}
 
-	pub fn len(&self) -> usize {
+	pub const fn len(&self) -> usize {
 		match self {
 			Self::F32(values) => values.len(),
 			Self::F64(values) => values.len(),
@@ -43,7 +44,7 @@ impl Vector {
 		}
 	}
 
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.len() == 0
 	}
 

@@ -29,12 +29,16 @@ impl LiveUpdate {
 	/// The callback must be deterministic and free of external side effects: a
 	/// mutable live graph may apply it independently to its remote base and its
 	/// local working copy.
-	pub fn new(
+	pub fn new<Targets, ApplyFn>(
 		origin: Uuid,
 		remote_revision: u64,
-		changes: impl IntoIterator<Item = DirtyTarget>,
-		apply: impl Fn(&mut Graph<Mutable>) -> FerrosGrynnResult<()> + Send + Sync + 'static,
-	) -> Self {
+		changes: Targets,
+		apply: ApplyFn,
+	) -> Self
+	where
+		Targets: IntoIterator<Item = DirtyTarget>,
+		ApplyFn: Fn(&mut Graph<Mutable>) -> FerrosGrynnResult<()> + Send + Sync + 'static,
+	{
 		Self {
 			origin,
 			remote_revision,
@@ -83,6 +87,7 @@ impl Debug for LiveUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LiveEvent {
 	Applied {
 		remote_revision: u64,
@@ -223,11 +228,15 @@ impl LiveGraph<Mutable> {
 		}
 	}
 
-	pub fn mutate_local<T>(
+	pub fn mutate_local<T, Targets, MutFn>(
 		&self,
-		changes: impl IntoIterator<Item = DirtyTarget>,
-		mutation: impl FnOnce(&mut Graph<Mutable>) -> FerrosGrynnResult<T>,
-	) -> FerrosGrynnResult<T> {
+		changes: Targets,
+		mutation: MutFn,
+	) -> FerrosGrynnResult<T>
+	where
+		Targets: IntoIterator<Item = DirtyTarget>,
+		MutFn: FnOnce(&mut Graph<Mutable>) -> FerrosGrynnResult<T>,
+	{
 		let LiveInner::Mutable(state) = &self.inner else {
 			return Err(invalid_state(
 				"a mutable operation was requested from a frozen live graph",
@@ -246,7 +255,10 @@ impl LiveGraph<Mutable> {
 		Ok(result)
 	}
 
-	pub fn with_graph<T>(&self, read: impl FnOnce(&Graph<Mutable>) -> T) -> FerrosGrynnResult<T> {
+	pub fn with_graph<T, ReadFn: FnOnce(&Graph<Mutable>) -> T>(
+		&self,
+		read: ReadFn,
+	) -> FerrosGrynnResult<T> {
 		let LiveInner::Mutable(state) = &self.inner else {
 			return Err(invalid_state("a mutable read was requested from a frozen live graph"));
 		};
@@ -313,9 +325,9 @@ impl LiveGraph<Mutable> {
 		}
 	}
 
-	pub fn rebase(
+	pub fn rebase<ReplayFn: FnOnce(&mut Graph<Mutable>) -> FerrosGrynnResult<()>>(
 		&self,
-		replay_local: impl FnOnce(&mut Graph<Mutable>) -> FerrosGrynnResult<()>,
+		replay_local: ReplayFn,
 	) -> FerrosGrynnResult<LiveEvent> {
 		let mut state = self.mutable_state()?;
 		let update =
@@ -332,7 +344,10 @@ impl LiveGraph<Mutable> {
 		resume_queue(&mut state)
 	}
 
-	pub fn flush(&self, writer: &mut impl GraphWriteBack<Graph<Mutable>>) -> FerrosGrynnResult<()> {
+	pub fn flush<GWB: GraphWriteBack<Graph<Mutable>>>(
+		&self,
+		writer: &mut GWB,
+	) -> FerrosGrynnResult<()> {
 		let mut state = self.mutable_state()?;
 		if state.paused {
 			return Err(invalid_state("a conflicted live graph cannot be flushed"));
@@ -446,8 +461,7 @@ fn invalid_state(reason: impl Into<String>) -> FerrosGrynnError {
 mod tests {
 	use super::{LiveEvent, LiveGraph, LiveUpdate};
 	use crate::values::{
-		PropertyMap,
-		Value,
+		PropertyMap, Value,
 		runtime::graph::{AtomId, DirtyTarget, Graph, GraphMut, Mutable},
 	};
 

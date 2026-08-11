@@ -18,6 +18,7 @@ struct Metadata {
 /// These IDs will still allow to access their associated objects even after
 /// inserting of removing other objects. This comes at the cost of a small
 /// overhead because of an additional indirection.
+#[allow(clippy::upper_case_acronyms, reason = "abbreviation for Stable Index Vector")]
 pub struct SIV<T> {
 	data: Vec<T>,
 	metadata: Vec<Metadata>,
@@ -77,18 +78,18 @@ impl<T> SIV<T> {
 	}
 
 	/// Returns the number of objects in the vector
-	pub fn len(&self) -> usize {
+	pub const fn len(&self) -> usize {
 		self.data.len()
 	}
 
 	/// Tells if the vector is currently empty
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.data.is_empty()
 	}
 
 	/// Returns the vector's capacity (i.e. the number of allocated slots in the
 	/// vector)
-	pub fn capacity(&self) -> usize {
+	pub const fn capacity(&self) -> usize {
 		self.data.capacity()
 	}
 
@@ -113,7 +114,7 @@ impl<T> SIV<T> {
 		self.metadata[self.indices[id]].validity_id
 	}
 
-	pub fn data(&self) -> &Vec<T> {
+	pub const fn data(&self) -> &Vec<T> {
 		&self.data
 	}
 
@@ -127,10 +128,10 @@ impl<T> SIV<T> {
 
 	pub fn clear(&mut self) {
 		self.data.clear();
-		self.metadata.iter_mut().for_each(|m| m.validity_id += 1);
+		self.metadata.iter_mut().for_each(|meta| meta.validity_id += 1);
 	}
 
-	pub fn iv_valid_id(&self, id: Id) -> bool {
+	pub const fn iv_valid_id(&self, id: Id) -> bool {
 		id < self.indices.len()
 	}
 
@@ -159,12 +160,14 @@ impl<T> SIV<T> {
 impl<T> Index<Id> for SIV<T> {
 	type Output = T;
 
+	#[allow(clippy::undocumented_unsafe_blocks, reason = "IndexMut trait requirement, left at the user's own risk")]
 	fn index(&self, index: Id) -> &Self::Output {
 		unsafe { self.data.get_unchecked(self.indices[index]) }
 	}
 }
 
 impl<T> IndexMut<Id> for SIV<T> {
+	#[allow(clippy::undocumented_unsafe_blocks, reason = "IndexMut trait requirement, left at the user's own risk")]
 	fn index_mut(&mut self, index: Id) -> &mut Self::Output {
 		unsafe { self.data.get_unchecked_mut(self.indices[index]) }
 	}
@@ -194,7 +197,7 @@ pub struct Handle<'a, T> {
 }
 
 impl<'a, T> Handle<'a, T> {
-	pub fn new(id: Id, validity_id: Id, vector: &'a SIV<T>) -> Self {
+	pub const fn new(id: Id, validity_id: Id, vector: &'a SIV<T>) -> Self {
 		Self {
 			id,
 			validity_id,
@@ -207,7 +210,7 @@ impl<'a, T> Handle<'a, T> {
 	}
 
 	/// Returns the ID of the associated object
-	pub fn id(&self) -> Id {
+	pub const fn id(&self) -> Id {
 		self.id
 	}
 
@@ -219,7 +222,7 @@ impl<'a, T> Handle<'a, T> {
 	}
 }
 
-impl<'a, T> Deref for Handle<'a, T> {
+impl<T> Deref for Handle<'_, T> {
 	type Target = T;
 
 	fn deref(&self) -> &Self::Target {

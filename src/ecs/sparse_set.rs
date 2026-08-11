@@ -21,7 +21,7 @@ impl SparsePages {
 
 	fn set(&mut self, slot: u64, dense: Option<u32>) -> FerrosGrynnResult<()> {
 		let page = usize::try_from(slot / SPARSE_PAGE_LEN as u64)
-			.map_err(|_| FerrosGrynnError::graph_capacity_exceeded("ECS sparse index"))?;
+			.map_err(|_err| FerrosGrynnError::graph_capacity_exceeded("ECS sparse index"))?;
 		let offset = slot as usize % SPARSE_PAGE_LEN;
 		if page >= self.pages.len() {
 			self.pages.resize_with(page + 1, || None);
@@ -67,11 +67,11 @@ impl<T> SparseSet<T> {
 		result
 	}
 
-	pub fn len(&self) -> usize {
+	pub const fn len(&self) -> usize {
 		self.dense_components.len()
 	}
 
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.dense_components.is_empty()
 	}
 
@@ -84,7 +84,7 @@ impl<T> SparseSet<T> {
 		}
 
 		let index = u32::try_from(self.dense_components.len())
-			.map_err(|_| FerrosGrynnError::graph_capacity_exceeded("ECS component pool"))?;
+			.map_err(|_err| FerrosGrynnError::graph_capacity_exceeded("ECS component pool"))?;
 		self.pages_mut(id)?.set(id.slot(), Some(index))?;
 		self.dense_atoms.push(id);
 		self.dense_components.push(component);
@@ -145,7 +145,7 @@ impl<T> SparseSet<T> {
 		self.dense_components.clear();
 	}
 
-	pub fn retain(&mut self, mut predicate: impl FnMut(AtomId, &mut T) -> bool) {
+	pub fn retain<Pred: FnMut(AtomId, &mut T) -> bool>(&mut self, mut predicate: Pred) {
 		let mut index = 0;
 		while index < self.len() {
 			let id = self.dense_atoms[index];

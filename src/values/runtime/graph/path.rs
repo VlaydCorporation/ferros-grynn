@@ -11,6 +11,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum PathDirection {
 	Forward,
 	Reverse,
@@ -18,6 +19,7 @@ pub enum PathDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum EndpointRole {
 	Source,
 	Target,
@@ -74,10 +76,10 @@ pub struct Path {
 }
 
 impl Path {
-	pub fn new(
+	pub fn new<Steps: Into<Arc<[PathStep]>>>(
 		origin: Uuid,
 		snapshot: SnapshotId,
-		steps: impl Into<Arc<[PathStep]>>,
+		steps: Steps,
 		cost: Option<Number>,
 	) -> Self {
 		let steps = steps.into();
@@ -195,6 +197,7 @@ impl Hash for Path {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum ResolvedAtom<'graph> {
 	Node(NodeView<'graph>),
 	Edge(EdgeView<'graph>),

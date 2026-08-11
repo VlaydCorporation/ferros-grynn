@@ -1,6 +1,6 @@
 use std::{
 	cmp::Ordering,
-	collections::{BTreeSet, BinaryHeap, VecDeque},
+	collections::{BTreeSet, BinaryHeap, VecDeque, hash_map},
 };
 
 use num_traits::ToPrimitive;
@@ -28,6 +28,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum TraversalDirection {
 	Forward,
 	Backward,
@@ -35,6 +36,7 @@ pub enum TraversalDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum TraversalSemantics {
 	/// Only vertex endpoints participate; edge atoms remain valid connectors.
 	Node,
@@ -953,11 +955,12 @@ pub fn find_cuts<R: GraphRead>(graph: &R) -> FerrosGrynnResult<CutSet> {
 				if parent_edge.get(&node).copied() == Some(edge) {
 					continue;
 				}
-				if !discovered.contains_key(&next) {
+
+				if let hash_map::Entry::Vacant(entry) = discovered.entry(next) {
 					parent.insert(next, node);
 					parent_edge.insert(next, edge);
 					*children.entry(node).or_insert(0_usize) += 1;
-					discovered.insert(next, time);
+					entry.insert(time);
 					low.insert(next, time);
 					time += 1;
 					stack.push(CutFrame {
@@ -1305,11 +1308,11 @@ fn ensure_node<R: GraphRead>(graph: &R, id: AtomId) -> FerrosGrynnResult<()> {
 	graph.node(id).map(|_| ()).ok_or_else(|| atom_does_not_exist(id))
 }
 
-fn local_steps<'index>(
-	index: &'index TraversalIndex,
+fn local_steps(
+	index: &TraversalIndex,
 	node: AtomId,
 	direction: TraversalDirection,
-) -> impl DoubleEndedIterator<Item = &'index TraversalStep> + 'index {
+) -> impl DoubleEndedIterator<Item = &TraversalStep> + '_ {
 	let empty: &[TraversalStep] = &[];
 	let endpoint = EdgeEndpoint::Local(node);
 	let forward = index.forward.get(&endpoint).map_or(empty, Vec::as_slice);
@@ -1354,9 +1357,7 @@ fn topological_sort_with_index<R: GraphRead>(
 			let Some(target) = step.target.local_id().filter(|id| id.is_node()) else {
 				continue;
 			};
-			let Some(value) = indegree.get_mut(&target) else {
-				return None;
-			};
+			let value = indegree.get_mut(&target)?;
 			*value = value.checked_sub(1)?;
 			if *value == 0 {
 				queue.push_back(target);

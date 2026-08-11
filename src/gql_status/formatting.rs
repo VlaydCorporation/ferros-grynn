@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Formats the status parameter without intermediate `String` allocation.
 pub trait ParameterFormatter<T: ?Sized> {
-	fn fmt(value: &T, f: &mut Formatter<'_>) -> fmt::Result;
+	fn fmt(values: &T, formatter: &mut Formatter<'_>) -> fmt::Result;
 }
 
 /// Adapter of the parameter to the standard [`Display`].
@@ -34,105 +34,114 @@ where
 	}
 }
 
+#[non_exhaustive]
 pub struct DisplayValue;
+#[non_exhaustive]
 pub struct Identifier;
+#[non_exhaustive]
 pub struct StringLiteral;
+#[non_exhaustive]
 pub struct Callable;
+#[non_exhaustive]
 pub struct QueryParameter;
+#[non_exhaustive]
 pub struct ValueType;
 
 impl<T: Display + ?Sized> ParameterFormatter<T> for DisplayValue {
-	fn fmt(value: &T, f: &mut Formatter<'_>) -> fmt::Result {
-		Display::fmt(value, f)
+	fn fmt(values: &T, formatter: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(values, formatter)
 	}
 }
 
-fn write_escaped(value: &str, f: &mut Formatter<'_>, delimiter: char) -> fmt::Result {
-	write!(f, "{delimiter}")?;
+fn write_escaped(value: &str, formatter: &mut Formatter<'_>, delimiter: char) -> fmt::Result {
+	write!(formatter, "{delimiter}")?;
 	for character in value.chars() {
 		if character == delimiter {
-			write!(f, "{delimiter}{delimiter}")?;
+			write!(formatter, "{delimiter}{delimiter}")?;
 		} else {
-			write!(f, "{character}")?;
+			write!(formatter, "{character}")?;
 		}
 	}
-	write!(f, "{delimiter}")
+	write!(formatter, "{delimiter}")
 }
 
 impl<T: Display + ?Sized> ParameterFormatter<T> for Identifier {
-	fn fmt(value: &T, f: &mut Formatter<'_>) -> fmt::Result {
-		write_escaped(&value.to_string(), f, '`')
+	fn fmt(values: &T, formatter: &mut Formatter<'_>) -> fmt::Result {
+		write_escaped(&values.to_string(), formatter, '`')
 	}
 }
 
 impl<T: Display + ?Sized> ParameterFormatter<T> for StringLiteral {
-	fn fmt(value: &T, f: &mut Formatter<'_>) -> fmt::Result {
-		write_escaped(&value.to_string(), f, '\'')
+	fn fmt(values: &T, formatter: &mut Formatter<'_>) -> fmt::Result {
+		write_escaped(&values.to_string(), formatter, '\'')
 	}
 }
 
 impl<T: Display + ?Sized> ParameterFormatter<T> for Callable {
-	fn fmt(value: &T, f: &mut Formatter<'_>) -> fmt::Result {
-		write!(f, "{value}()")
+	fn fmt(values: &T, formatter: &mut Formatter<'_>) -> fmt::Result {
+		write!(formatter, "{values}()")
 	}
 }
 
 impl<T: Display + ?Sized> ParameterFormatter<T> for QueryParameter {
-	fn fmt(value: &T, f: &mut Formatter<'_>) -> fmt::Result {
-		f.write_str("$")?;
-		Identifier::fmt(value, f)
+	fn fmt(values: &T, formatter: &mut Formatter<'_>) -> fmt::Result {
+		formatter.write_str("$")?;
+		Identifier::fmt(values, formatter)
 	}
 }
 
 impl<T: Display + ?Sized> ParameterFormatter<T> for ValueType {
-	fn fmt(value: &T, f: &mut Formatter<'_>) -> fmt::Result {
-		Display::fmt(value, f)
+	fn fmt(values: &T, formatter: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(values, formatter)
 	}
 }
 
 pub trait JoinSeparator {
-	fn write_between(f: &mut Formatter<'_>) -> fmt::Result;
-	fn write_last(f: &mut Formatter<'_>, has_multiple_prefix_items: bool) -> fmt::Result;
+	fn write_between(formatter: &mut Formatter<'_>) -> fmt::Result;
+	fn write_last(formatter: &mut Formatter<'_>, has_multiple_prefix_items: bool) -> fmt::Result;
 }
 
+#[non_exhaustive]
 pub struct Comma;
+#[non_exhaustive]
 pub struct And;
+#[non_exhaustive]
 pub struct Or;
 
 impl JoinSeparator for Comma {
-	fn write_between(f: &mut Formatter<'_>) -> fmt::Result {
-		f.write_str(", ")
+	fn write_between(formatter: &mut Formatter<'_>) -> fmt::Result {
+		formatter.write_str(", ")
 	}
 
-	fn write_last(f: &mut Formatter<'_>, _has_multiple_prefix_items: bool) -> fmt::Result {
-		f.write_str(", ")
+	fn write_last(formatter: &mut Formatter<'_>, _has_multiple_prefix_items: bool) -> fmt::Result {
+		formatter.write_str(", ")
 	}
 }
 
 impl JoinSeparator for And {
-	fn write_between(f: &mut Formatter<'_>) -> fmt::Result {
-		f.write_str(", ")
+	fn write_between(formatter: &mut Formatter<'_>) -> fmt::Result {
+		formatter.write_str(", ")
 	}
 
-	fn write_last(f: &mut Formatter<'_>, has_multiple_prefix_items: bool) -> fmt::Result {
+	fn write_last(formatter: &mut Formatter<'_>, has_multiple_prefix_items: bool) -> fmt::Result {
 		if has_multiple_prefix_items {
-			f.write_str(", and ")
+			formatter.write_str(", and ")
 		} else {
-			f.write_str(" and ")
+			formatter.write_str(" and ")
 		}
 	}
 }
 
 impl JoinSeparator for Or {
-	fn write_between(f: &mut Formatter<'_>) -> fmt::Result {
-		f.write_str(", ")
+	fn write_between(formatter: &mut Formatter<'_>) -> fmt::Result {
+		formatter.write_str(", ")
 	}
 
-	fn write_last(f: &mut Formatter<'_>, has_multiple_prefix_items: bool) -> fmt::Result {
+	fn write_last(formatter: &mut Formatter<'_>, has_multiple_prefix_items: bool) -> fmt::Result {
 		if has_multiple_prefix_items {
-			f.write_str(", or ")
+			formatter.write_str(", or ")
 		} else {
-			f.write_str(" or ")
+			formatter.write_str(" or ")
 		}
 	}
 }
@@ -144,16 +153,16 @@ where
 	S: JoinSeparator,
 	F: ParameterFormatter<T>,
 {
-	fn fmt(values: &[T], f: &mut Formatter<'_>) -> fmt::Result {
+	fn fmt(values: &[T], formatter: &mut Formatter<'_>) -> fmt::Result {
 		for (index, value) in values.iter().enumerate() {
 			if index > 0 {
 				if index + 1 == values.len() {
-					S::write_last(f, values.len() > 2)?;
+					S::write_last(formatter, values.len() > 2)?;
 				} else {
-					S::write_between(f)?;
+					S::write_between(formatter)?;
 				}
 			}
-			F::fmt(value, f)?;
+			F::fmt(value, formatter)?;
 		}
 		Ok(())
 	}
@@ -164,14 +173,15 @@ where
 	S: JoinSeparator,
 	F: ParameterFormatter<T>,
 {
-	fn fmt(values: &Vec<T>, f: &mut Formatter<'_>) -> fmt::Result {
-		<Self as ParameterFormatter<[T]>>::fmt(values, f)
+	fn fmt(values: &Vec<T>, formatter: &mut Formatter<'_>) -> fmt::Result {
+		<Self as ParameterFormatter<[T]>>::fmt(values, formatter)
 	}
 }
 
 /// The format is an independent parameter value for wire DTO diagnostics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum DiagnosticValue {
 	Null,
 	Bool(bool),

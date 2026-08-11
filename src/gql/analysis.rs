@@ -446,7 +446,7 @@ impl<'a> Analyzer<'a> {
 					RecordKey::Integer(value, _) => value
 						.parse::<i64>()
 						.map(RecordIdPart::Int)
-						.map_err(|_| self.semantic("Record integer ID is out of range.", *span))?,
+						.map_err(|_err| self.semantic("Record integer ID is out of range.", *span))?,
 					RecordKey::String(value, _) => RecordIdPart::String(value.as_ref().into()),
 				};
 				RecordId::new(table.value.as_ref(), key).map(ScanTarget::Record).map_err(|error| {
@@ -509,11 +509,11 @@ impl<'a> Analyzer<'a> {
 	}
 }
 
-fn is_number(ty: &Type) -> bool {
+const fn is_number(ty: &Type) -> bool {
 	matches!(ty, Type::Any | Type::Number | Type::Int | Type::Float | Type::Decimal)
 }
 
-fn is_integer(ty: &Type) -> bool {
+const fn is_integer(ty: &Type) -> bool {
 	matches!(ty, Type::Any | Type::Number | Type::Int)
 }
 

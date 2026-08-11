@@ -26,11 +26,11 @@ impl PropertyDictionary {
 		}
 	}
 
-	pub fn len(&self) -> usize {
+	pub const fn len(&self) -> usize {
 		self.names.len()
 	}
 
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.names.is_empty()
 	}
 
@@ -42,14 +42,14 @@ impl PropertyDictionary {
 		self.names.get(id.get() as usize)
 	}
 
-	pub fn intern(&mut self, name: impl Into<Text>) -> FerrosGrynnResult<PropertyKeyId> {
+	pub fn intern<IntoText: Into<Text>>(&mut self, name: IntoText) -> FerrosGrynnResult<PropertyKeyId> {
 		let name = name.into();
 		if let Some(id) = self.ids.get(name.as_str()) {
 			return Ok(*id);
 		}
 
 		let raw = u32::try_from(self.names.len())
-			.map_err(|_| FerrosGrynnError::property_dictionary_capacity_exceeded())?;
+			.map_err(|_err| FerrosGrynnError::property_dictionary_capacity_exceeded())?;
 		let id = PropertyKeyId::new(raw);
 		self.names.push(name.clone());
 		self.ids.insert(name, id);

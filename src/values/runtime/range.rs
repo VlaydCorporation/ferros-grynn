@@ -34,10 +34,11 @@ impl Range {
 		})
 	}
 
-	pub fn closed(
-		start: impl Into<Value>,
-		end: impl Into<Value>,
-	) -> Result<Self, FerrosGrynnError> {
+	pub fn closed<Start, End>(start: Start, end: End) -> Result<Self, FerrosGrynnError>
+	where
+		Start: Into<Value>,
+		End: Into<Value>,
+	{
 		Self::new(Bound::Included(start.into()), Bound::Included(end.into()))
 	}
 
@@ -90,7 +91,7 @@ fn validate_bounds(start: &Bound<Value>, end: &Bound<Value>) -> Result<(), Ferro
 	Ok(())
 }
 
-fn bound_value(bound: &Bound<Value>) -> Option<&Value> {
+const fn bound_value(bound: &Bound<Value>) -> Option<&Value> {
 	match bound {
 		Bound::Included(value) | Bound::Excluded(value) => Some(value),
 		Bound::Unbounded => None,
@@ -151,17 +152,17 @@ impl<T> BoundExt<T> for Bound<T> {
 }
 
 impl Display for Range {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
 		match self.start() {
-			Bound::Included(value) => write!(formatter, "[{value}")?,
-			Bound::Excluded(value) => write!(formatter, "({value}")?,
-			Bound::Unbounded => formatter.write_str("(-inf")?,
+			Bound::Included(value) => write!(f, "[{value}")?,
+			Bound::Excluded(value) => write!(f, "({value}")?,
+			Bound::Unbounded => f.write_str("(-inf")?,
 		}
-		formatter.write_str(", ")?;
+		f.write_str(", ")?;
 		match self.end() {
-			Bound::Included(value) => write!(formatter, "{value}]"),
-			Bound::Excluded(value) => write!(formatter, "{value})"),
-			Bound::Unbounded => formatter.write_str("+inf)"),
+			Bound::Included(value) => write!(f, "{value}]"),
+			Bound::Excluded(value) => write!(f, "{value})"),
+			Bound::Unbounded => f.write_str("+inf)"),
 		}
 	}
 }

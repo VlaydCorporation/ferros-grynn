@@ -96,12 +96,10 @@ impl<G: GraphRead> GraphWorkspace<G> {
 	/// Derived pools are revision-specific and are invalidated. Ordinary user
 	/// components survive while their complete generation-aware `AtomId`
 	/// exists.
-	pub fn mutate<T>(
-		&mut self,
-		mutation: impl FnOnce(&mut G) -> FerrosGrynnResult<T>,
-	) -> FerrosGrynnResult<T>
+	pub fn mutate<T, MutFn>(&mut self, mutation: MutFn) -> FerrosGrynnResult<T>
 	where
 		G: GraphMut,
+		MutFn: FnOnce(&mut G) -> FerrosGrynnResult<T>,
 	{
 		self.validate_binding()?;
 		let result = mutation(&mut self.graph);
@@ -109,7 +107,11 @@ impl<G: GraphRead> GraphWorkspace<G> {
 		result
 	}
 
-	pub fn map_graph<H: GraphRead>(self, map: impl FnOnce(G) -> H) -> GraphWorkspace<H> {
+	pub fn map_graph<H, MapFn>(self, map: MapFn) -> GraphWorkspace<H>
+	where
+		H: GraphRead,
+		MapFn: FnOnce(G) -> H,
+	{
 		let graph = map(self.graph);
 		let same_identity = graph.identity() == self.bound_identity;
 		let mut components = self.components;
@@ -234,10 +236,11 @@ impl<G: GraphRead> GraphRead for GraphWorkspace<G> {
 	}
 }
 
-impl<G: GraphRead> Debug for GraphWorkspace<G> {
+impl<G: GraphRead + Debug> Debug for GraphWorkspace<G> {
 	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("GraphWorkspace")
+			.field("graph", &self.graph)
 			.field("identity", &self.bound_identity)
 			.field("revision", &self.bound_revision)
 			.field("component_pools", &self.components.component_pool_count())

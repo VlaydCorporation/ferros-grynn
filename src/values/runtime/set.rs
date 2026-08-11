@@ -31,7 +31,7 @@ impl Set {
 		self.0.iter()
 	}
 
-	pub fn insert(&mut self, value: impl Into<Value>) -> bool {
+	pub fn insert<IntoValue: Into<Value>>(&mut self, value: IntoValue) -> bool {
 		self.0.insert(value.into())
 	}
 

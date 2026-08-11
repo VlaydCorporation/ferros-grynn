@@ -19,11 +19,11 @@ use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 pub struct Text(CompactString);
 
 impl Text {
-	pub fn new(value: impl AsRef<str>) -> Self {
+	pub fn new<Str: AsRef<str>>(value: Str) -> Self {
 		Self(CompactString::new(value))
 	}
 
-	pub fn as_inner(&self) -> &CompactString {
+	pub const fn as_inner(&self) -> &CompactString {
 		&self.0
 	}
 
@@ -89,8 +89,8 @@ impl Borrow<str> for Text {
 }
 
 impl Display for Text {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		formatter.write_str(self.as_str())
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		f.write_str(self.as_str())
 	}
 }
 

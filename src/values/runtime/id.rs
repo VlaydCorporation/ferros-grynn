@@ -19,11 +19,11 @@ impl Uuid {
 		Self(InnerUuid::now_v7())
 	}
 
-	pub fn as_inner(&self) -> &InnerUuid {
+	pub const fn as_inner(&self) -> &InnerUuid {
 		&self.0
 	}
 
-	pub fn into_inner(self) -> InnerUuid {
+	pub const fn into_inner(self) -> InnerUuid {
 		self.0
 	}
 }
@@ -49,8 +49,8 @@ impl FromStr for Uuid {
 }
 
 impl Display for Uuid {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		Display::fmt(&self.0, formatter)
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(&self.0, f)
 	}
 }
 
@@ -63,11 +63,11 @@ impl Ulid {
 		Self(InnerUlid::generate())
 	}
 
-	pub fn as_inner(&self) -> &InnerUlid {
+	pub const fn as_inner(&self) -> &InnerUlid {
 		&self.0
 	}
 
-	pub fn into_inner(self) -> InnerUlid {
+	pub const fn into_inner(self) -> InnerUlid {
 		self.0
 	}
 }
@@ -93,8 +93,8 @@ impl FromStr for Ulid {
 }
 
 impl Display for Ulid {
-	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-		Display::fmt(&self.0, formatter)
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(&self.0, f)
 	}
 }
 

@@ -7,6 +7,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PropertyState<T> {
 	None,
 	Null,
@@ -39,15 +40,15 @@ impl<T> PropertyColumn<T> {
 		self.key
 	}
 
-	pub fn len(&self) -> usize {
+	pub const fn len(&self) -> usize {
 		self.present.len()
 	}
 
-	pub fn value_len(&self) -> usize {
+	pub const fn value_len(&self) -> usize {
 		self.values.len()
 	}
 
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.present.is_empty()
 	}
 
@@ -63,6 +64,7 @@ impl<T> PropertyColumn<T> {
 		self.values.get(id)
 	}
 
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "a valid property slot must have a dense value")]
 	pub fn state(&self, id: AtomId) -> PropertyState<&T> {
 		let Some(index) = self.present.dense_index(id) else {
 			return PropertyState::None;
@@ -75,6 +77,7 @@ impl<T> PropertyColumn<T> {
 		)
 	}
 
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "inserted property must be present")]
 	pub fn set(&mut self, id: AtomId, value: T) -> FerrosGrynnResult<Option<T>> {
 		self.ensure_present(id)?;
 		let previous = self.values.insert(id, value)?;
@@ -83,6 +86,7 @@ impl<T> PropertyColumn<T> {
 		Ok(previous)
 	}
 
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "inserted property must be present")]
 	pub fn set_null(&mut self, id: AtomId) -> FerrosGrynnResult<Option<T>> {
 		self.ensure_present(id)?;
 		let previous = self.values.remove(id);
@@ -111,6 +115,7 @@ impl<T> PropertyColumn<T> {
 		&self.validity.words
 	}
 
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "replaced property must be present")]
 	fn ensure_present(&mut self, id: AtomId) -> FerrosGrynnResult<()> {
 		let prior = self.present.occupant(id);
 		let prior_len = self.present.len();
@@ -201,6 +206,7 @@ impl DenseBitmap {
 		}
 	}
 
+	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "non-empty bitmap must have a word")]
 	fn swap_remove(&mut self, index: usize) {
 		assert!(index < self.len, "bitmap index out of bounds");
 		let last = self.len - 1;
@@ -209,6 +215,7 @@ impl DenseBitmap {
 			self.set(index, value);
 		}
 		self.len -= 1;
+		// includes self.len == 0
 		if self.len.is_multiple_of(64) {
 			self.words.pop();
 		} else {
