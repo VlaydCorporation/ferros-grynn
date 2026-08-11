@@ -60,6 +60,7 @@ impl ToTokens for StatusInput {
 			#(#definition_statics)*
 
 			#[derive(Debug, Clone, PartialEq)]
+			#[non_exhaustive]
 			pub enum Status {
 				#(#variants,)*
 			}

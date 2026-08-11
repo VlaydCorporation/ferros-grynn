@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-08-11T23:57:04.912115+00:00",
+  "nodes": {
+    "src_values_runtime_graph_metagraph_metagraph": {
+      "code_fingerprint": "87e085f842dd05955ba427c410b9ce75dad21c4bc287c1f7b66191f45e930dd9",
+      "label": "Metagraph",
+      "last": "2026-08-10T11:48:37.217190+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-10T11:48:37.217190+00:00",
+          "outcome": "useful",
+          "q": "What is MetaGraph?"
+        }
+      ],
+      "score": 0.965805196,
+      "source_file": "src/values/runtime/graph/metagraph.rs",
+      "status": "tentative",
+      "uses": 1
+    }
+  },
+  "version": 1
+}
