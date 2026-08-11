@@ -54,7 +54,7 @@ struct TokenBuffer<const LOOKAHEAD: usize> {
 }
 
 impl<const LOOKAHEAD: usize> TokenBuffer<LOOKAHEAD> {
-	fn new(tokens: Vec<Token>) -> Self {
+	const fn new(tokens: Vec<Token>) -> Self {
 		Self {
 			tokens,
 			cursor: 0,
@@ -232,11 +232,8 @@ impl Parser<'_> {
 			} => RecordKey::String(value, token.span),
 			_ => return Err(self.syntax("Expected a record ID after `:`.", token.span)),
 		};
-		let key_span = match &key {
-			RecordKey::Integer(_, span) | RecordKey::String(_, span) => *span,
-		};
 		Ok(SelectTarget::Record {
-			span: cover(table.span, key_span),
+			span: cover(table.span, key.span()),
 			table,
 			key,
 		})

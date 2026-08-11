@@ -1,4 +1,9 @@
-use std::time::Instant;
+#![allow(
+	clippy::pattern_type_mismatch,
+	reason = "the executor intentionally uses match ergonomics for borrowed IR and runtime values"
+)]
+
+use std::{sync::Arc, time::Instant};
 
 use rust_decimal::Decimal;
 
@@ -7,17 +12,20 @@ use super::{
 	QueryStatementKind,
 	analysis::{QueryCatalog, analyze},
 	ir::{
+		Column,
 		LogicalNodeKind,
 		LogicalProgram,
 		LogicalSelect,
 		LogicalStatement,
 		NodeId,
 		ScanTarget,
+		Schema,
 		TypedExpr,
 		TypedExprKind,
 	},
 };
 use crate::{
+	datastore::{PredicateEvaluator, QuerySnapshot, QueryStorageRow, TableSchema, Transaction},
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, Outcome},
 	math::{add_exact, divide_signed_exact, multiply_exact, subtract_exact},
 	syn::{BinaryOperator, ParserSettings, Program, UnaryOperator},
@@ -33,7 +41,7 @@ pub(super) struct Row {
 }
 
 impl Row {
-	pub(super) fn new(values: Vec<Value>) -> Self {
+	pub(super) const fn new(values: Vec<Value>) -> Self {
 		Self {
 			values,
 		}
@@ -53,9 +61,126 @@ pub(super) trait QueryRead {
 		&'a self,
 		snapshot: Snapshot,
 		table: &str,
+		predicate: Option<&TypedExpr>,
+		slots: &[Value],
+		source: &str,
 	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>>;
 
 	fn get(&self, snapshot: Snapshot, record: &RecordId) -> FerrosGrynnResult<Option<Row>>;
+}
+
+pub fn execute_transaction(
+	transaction: &Transaction,
+	source: &str,
+	variables: &Object,
+	settings: ParserSettings,
+) -> FerrosGrynnResult<Vec<QueryResult>> {
+	let snapshot = transaction.query_snapshot()?;
+	execute_text(
+		&TransactionRead {
+			transaction,
+			snapshot,
+		},
+		source,
+		variables,
+		settings,
+	)
+}
+
+struct TransactionRead<'a> {
+	transaction: &'a Transaction,
+	snapshot: QuerySnapshot,
+}
+
+impl QueryCatalog for TransactionRead<'_> {
+	fn schema(&self, table: &str) -> FerrosGrynnResult<Schema> {
+		self.transaction.query_table(&self.snapshot, table).map(|schema| query_schema(&schema))
+	}
+}
+
+impl QueryRead for TransactionRead<'_> {
+	fn snapshot(&self) -> FerrosGrynnResult<Snapshot> {
+		Ok(Snapshot(self.snapshot.commit_ts()))
+	}
+
+	fn catalog(&self, _snapshot: Snapshot) -> &dyn QueryCatalog {
+		self
+	}
+
+	fn scan<'a>(
+		&'a self,
+		_snapshot: Snapshot,
+		table: &str,
+		predicate: Option<&TypedExpr>,
+		slots: &[Value],
+		source: &str,
+	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
+		let rows = self.transaction.query_rows(&self.snapshot, table)?;
+		let evaluator = Arc::new(QueryPredicate {
+			predicate: predicate.cloned(),
+			slots: slots.to_vec(),
+			source: source.to_owned(),
+		});
+		self.transaction.register_query_predicate(&self.snapshot, table, &rows, evaluator)?;
+		Ok(Box::new(StorageCursor {
+			rows: rows.into_iter(),
+		}))
+	}
+
+	fn get(&self, _snapshot: Snapshot, record: &RecordId) -> FerrosGrynnResult<Option<Row>> {
+		let row = self
+			.transaction
+			.query_rows(&self.snapshot, record.table())?
+			.into_iter()
+			.find(|row| &row.record_id == record);
+		self.transaction.register_query_point(
+			&self.snapshot,
+			record.table(),
+			record,
+			row.as_ref(),
+		)?;
+		Ok(row.map(|row| Row::new(row.values)))
+	}
+}
+
+fn query_schema(schema: &TableSchema) -> Schema {
+	let mut columns = Vec::with_capacity(schema.fields().len() + 1);
+	columns.push(Column {
+		name: "id".into(),
+		ty: Type::Record,
+	});
+	columns.extend(schema.fields().map(|field| Column {
+		name: field.name().as_str().into(),
+		ty: field.value_type().clone(),
+	}));
+	Schema {
+		columns,
+	}
+}
+
+struct QueryPredicate {
+	predicate: Option<TypedExpr>,
+	slots: Vec<Value>,
+	source: String,
+}
+
+impl PredicateEvaluator for QueryPredicate {
+	fn matches(&self, row: &QueryStorageRow) -> FerrosGrynnResult<bool> {
+		self.predicate.as_ref().map_or(Ok(true), |predicate| {
+			eval(predicate, Some(&Row::new(row.values.clone())), &self.slots, &self.source)
+				.map(|value| value.is_truthy())
+		})
+	}
+}
+
+struct StorageCursor {
+	rows: std::vec::IntoIter<QueryStorageRow>,
+}
+
+impl RowCursor for StorageCursor {
+	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
+		Ok(self.rows.next().map(|row| Row::new(row.values)))
+	}
 }
 
 pub(super) fn execute_text(
@@ -132,7 +257,14 @@ fn execute_select(
 	slots: &[Value],
 	source: &str,
 ) -> FerrosGrynnResult<Value> {
-	let mut cursor = build_cursor(read, snapshot, plan, plan.root, slots, source)?;
+	let predicate = plan.nodes.iter().find_map(|node| match &node.kind {
+		LogicalNodeKind::Filter {
+			predicate,
+			..
+		} => Some(predicate),
+		_ => None,
+	});
+	let mut cursor = build_cursor(read, snapshot, plan, plan.root, slots, source, predicate)?;
 	let schema = &plan.node(plan.root).schema;
 	let mut result = Array::new(Vec::new());
 	while let Some(row) = cursor.next().map_err(execution_phase)? {
@@ -165,6 +297,7 @@ fn build_cursor<'a>(
 	node_id: NodeId,
 	slots: &'a [Value],
 	source: &'a str,
+	scan_predicate: Option<&'a TypedExpr>,
 ) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
 	let node = plan.node(node_id);
 	match &node.kind {
@@ -172,7 +305,9 @@ fn build_cursor<'a>(
 			target,
 		} => {
 			let inner: Box<dyn RowCursor + 'a> = match target {
-				ScanTarget::Table(table) => read.scan(snapshot, table)?,
+				ScanTarget::Table(table) => {
+					read.scan(snapshot, table, scan_predicate, slots, source)?
+				}
 				ScanTarget::Record(record) => Box::new(OneRowCursor {
 					row: read.get(snapshot, record)?,
 				}),
@@ -185,7 +320,7 @@ fn build_cursor<'a>(
 			input,
 			predicate,
 		} => Ok(Box::new(FilterCursor {
-			input: build_cursor(read, snapshot, plan, *input, slots, source)?,
+			input: build_cursor(read, snapshot, plan, *input, slots, source, scan_predicate)?,
 			predicate,
 			slots,
 			source,
@@ -194,7 +329,7 @@ fn build_cursor<'a>(
 			input,
 			expressions,
 		} => Ok(Box::new(ProjectCursor {
-			input: build_cursor(read, snapshot, plan, *input, slots, source)?,
+			input: build_cursor(read, snapshot, plan, *input, slots, source, scan_predicate)?,
 			expressions,
 			slots,
 			source,
@@ -211,7 +346,7 @@ fn build_cursor<'a>(
 				.transpose()?
 				.unwrap_or(0);
 			Ok(Box::new(LimitCursor {
-				input: build_cursor(read, snapshot, plan, *input, slots, source)?,
+				input: build_cursor(read, snapshot, plan, *input, slots, source, scan_predicate)?,
 				remaining: limit,
 				skip: start,
 			}))
@@ -491,7 +626,7 @@ fn integer_arithmetic(operator: BinaryOperator, left: i64, right: i64) -> Ferros
 			left.checked_rem(right).ok_or_else(|| FerrosGrynnError::operation_overflow("%"))?
 		}
 		BinaryOperator::Power => {
-			let exponent = u32::try_from(right).map_err(|_| {
+			let exponent = u32::try_from(right).map_err(|_conversion_error| {
 				FerrosGrynnError::invalid_argument("Integer exponent must be non-negative.")
 			})?;
 			left.checked_pow(exponent).ok_or_else(|| FerrosGrynnError::operation_overflow("**"))?
@@ -543,7 +678,7 @@ fn decimal_arithmetic(
 	Ok(Value::Number(Number::Decimal(value)))
 }
 
-fn operator_name(operator: BinaryOperator) -> &'static str {
+const fn operator_name(operator: BinaryOperator) -> &'static str {
 	match operator {
 		BinaryOperator::Power => "**",
 		BinaryOperator::Multiply => "*",
@@ -585,25 +720,25 @@ fn cast(value: Value, target: &Type) -> FerrosGrynnResult<Value> {
 			Value::String(value) => value
 				.parse::<i64>()
 				.map(Value::from)
-				.map_err(|_| FerrosGrynnError::conversion_error(value.as_str(), "int")),
+				.map_err(|_parse_error| FerrosGrynnError::conversion_error(value.as_str(), "int")),
 			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "int")),
 		},
 		Type::Float => match value {
 			Value::Number(value) => f64::try_from(value).map(Value::from),
-			Value::String(value) => value
-				.parse::<f64>()
-				.map(Value::from)
-				.map_err(|_| FerrosGrynnError::conversion_error(value.as_str(), "float")),
+			Value::String(value) => value.parse::<f64>().map(Value::from).map_err(|_parse_error| {
+				FerrosGrynnError::conversion_error(value.as_str(), "float")
+			}),
 			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "float")),
 		},
 		Type::Decimal => match value {
 			Value::Number(value) => {
 				Decimal::try_from(value).map(|value| Value::Number(Number::Decimal(value)))
 			}
-			Value::String(value) => value
-				.parse::<Decimal>()
-				.map(|value| Value::Number(Number::Decimal(value)))
-				.map_err(|_| FerrosGrynnError::conversion_error(value.as_str(), "decimal")),
+			Value::String(value) => {
+				value.parse::<Decimal>().map(|value| Value::Number(Number::Decimal(value))).map_err(
+					|_parse_error| FerrosGrynnError::conversion_error(value.as_str(), "decimal"),
+				)
+			}
 			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "decimal")),
 		},
 		Type::None if matches!(value, Value::None) => Ok(value),
@@ -721,6 +856,9 @@ mod tests {
 			&'a self,
 			snapshot: Snapshot,
 			table: &str,
+			_predicate: Option<&TypedExpr>,
+			_slots: &[Value],
+			_source: &str,
 		) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
 			assert_eq!(snapshot, Snapshot(7));
 			assert_eq!(table, "person");

@@ -84,11 +84,21 @@ impl Metagraph<Mutable> {
 		}
 	}
 
-	pub fn flush(&mut self, writer: &mut impl GraphWriteBack<Self>) -> FerrosGrynnResult<()> {
+	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let (origin, dirty) = self.graph.writeback_context()?;
 		writer.flush(self, &origin, &dirty)?;
 		self.graph.finish_writeback();
 		Ok(())
+	}
+
+	pub(crate) fn transaction_dirty(&self) -> Vec<super::DirtyTarget> {
+		self.graph.transaction_dirty()
+	}
+
+	pub(crate) fn transaction_snapshot(&self) -> Metagraph<Frozen> {
+		Metagraph {
+			graph: self.graph.transaction_snapshot(),
+		}
 	}
 }
 

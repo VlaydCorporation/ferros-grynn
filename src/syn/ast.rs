@@ -1,11 +1,13 @@
 use crate::gql_status::TextSpan;
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Program {
 	pub statements: Vec<Statement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Identifier {
 	pub value: Box<str>,
 	pub quoted: bool,
@@ -13,18 +15,21 @@ pub struct Identifier {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TypeName {
 	pub value: Box<str>,
 	pub span: TextSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Statement {
 	pub kind: StatementKind,
 	pub span: TextSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum StatementKind {
 	Let(LetStatement),
 	Return(ReturnStatement),
@@ -32,6 +37,7 @@ pub enum StatementKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct LetStatement {
 	pub name: Identifier,
 	pub declared_type: Option<TypeName>,
@@ -39,12 +45,14 @@ pub struct LetStatement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ReturnStatement {
 	pub value: Expr,
 	pub alias: Option<Identifier>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SelectStatement {
 	pub only: bool,
 	pub value: bool,
@@ -56,6 +64,7 @@ pub struct SelectStatement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SelectItem {
 	Wildcard(TextSpan),
 	Expr {
@@ -65,6 +74,7 @@ pub enum SelectItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SelectTarget {
 	Table(Identifier),
 	Record {
@@ -75,18 +85,29 @@ pub enum SelectTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecordKey {
 	Integer(Box<str>, TextSpan),
 	String(Box<str>, TextSpan),
 }
 
+impl RecordKey {
+	pub(crate) const fn span(&self) -> TextSpan {
+		match self {
+			Self::Integer(_, span) | Self::String(_, span) => *span,
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Expr {
 	pub kind: ExprKind,
 	pub span: TextSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ExprKind {
 	Literal(Literal),
 	Parameter(Identifier),
@@ -127,13 +148,15 @@ pub enum ExprKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ObjectField {
 	pub name: Identifier,
 	pub value: Expr,
 	pub span: TextSpan,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Literal {
 	None,
 	Null,
@@ -143,6 +166,7 @@ pub enum Literal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnaryOperator {
 	Not,
 	Assert,
@@ -151,6 +175,7 @@ pub enum UnaryOperator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BinaryOperator {
 	Power,
 	Multiply,
@@ -175,7 +200,7 @@ pub enum BinaryOperator {
 	Pipeline,
 }
 
-pub(super) fn cover(start: TextSpan, end: TextSpan) -> TextSpan {
+pub(super) const fn cover(start: TextSpan, end: TextSpan) -> TextSpan {
 	let end = end.offset + end.len;
 	TextSpan::new(start.offset, end - start.offset)
 }

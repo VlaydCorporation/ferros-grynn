@@ -8,6 +8,7 @@ use std::{
 
 use super::{
 	AtomId,
+	AtomIds,
 	AtomKind,
 	DirtyTarget,
 	EdgeEndpoint,
@@ -26,6 +27,7 @@ use super::{
 	storage::{EdgeColumns, GraphMetadata, NodeColumns, ensure_unique_record, generated_record_id},
 };
 use crate::{
+	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{Number, PropertyMap, RecordId, Text, Uuid},
 };
@@ -34,15 +36,15 @@ use crate::{
 struct HyperStorage {
 	nodes: NodeColumns,
 	edges: EdgeColumns,
-	incidence: Vec<Vec<AtomId>>,
+	incidence: CowVec<Vec<AtomId>>,
 }
 
 impl HyperStorage {
-	const fn new() -> Self {
+	fn new() -> Self {
 		Self {
 			nodes: NodeColumns::new(),
 			edges: EdgeColumns::new(),
-			incidence: Vec::new(),
+			incidence: CowVec::new(),
 		}
 	}
 
@@ -230,7 +232,7 @@ impl Hypergraph<Mutable> {
 		}
 	}
 
-	pub fn flush(&mut self, writer: &mut impl GraphWriteBack<Self>) -> FerrosGrynnResult<()> {
+	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
 			.origin()
@@ -240,6 +242,18 @@ impl Hypergraph<Mutable> {
 		writer.flush(self, &origin, &dirty)?;
 		self.metadata.clear_dirty();
 		Ok(())
+	}
+
+	pub(crate) fn transaction_dirty(&self) -> Vec<DirtyTarget> {
+		self.metadata.dirty().cloned().collect()
+	}
+
+	pub(crate) fn transaction_snapshot(&self) -> Hypergraph<Frozen> {
+		Hypergraph {
+			metadata: self.metadata.clone().into_frozen(),
+			storage: self.storage.clone(),
+			state: PhantomData,
+		}
 	}
 }
 
@@ -311,11 +325,11 @@ impl<State> Hypergraph<State> {
 
 impl<State> GraphRead for Hypergraph<State> {
 	type EdgeIds<'a>
-		= std::iter::Copied<std::slice::Iter<'a, AtomId>>
+		= AtomIds<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
-		= std::iter::Copied<std::slice::Iter<'a, AtomId>>
+		= AtomIds<'a>
 	where
 		Self: 'a;
 
@@ -336,11 +350,11 @@ impl<State> GraphRead for Hypergraph<State> {
 	}
 
 	fn node_ids(&self) -> Self::NodeIds<'_> {
-		self.storage.nodes.ids().iter().copied()
+		AtomIds::new(self.storage.nodes.ids().iter())
 	}
 
 	fn edge_ids(&self) -> Self::EdgeIds<'_> {
-		self.storage.edges.ids().iter().copied()
+		AtomIds::new(self.storage.edges.ids().iter())
 	}
 
 	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {

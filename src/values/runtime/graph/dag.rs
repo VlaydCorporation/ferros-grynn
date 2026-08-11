@@ -4,10 +4,12 @@ use std::{
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
 	marker::PhantomData,
+	sync::Arc,
 };
 
 use super::{
 	AtomId,
+	AtomIds,
 	AtomKind,
 	DirtyTarget,
 	EdgeDirection,
@@ -30,6 +32,7 @@ use super::{
 	storage::{EdgeColumns, GraphMetadata, NodeColumns, ensure_unique_record, generated_record_id},
 };
 use crate::{
+	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{Number, PropertyMap, RecordId, Text, Uuid},
 };
@@ -41,11 +44,11 @@ struct PackedAdjacency {
 }
 
 impl PackedAdjacency {
-	fn from_rows(rows: &[Vec<AtomId>]) -> Self {
+	fn from_rows(rows: &CowVec<Vec<AtomId>>) -> Self {
 		let mut offsets = Vec::with_capacity(rows.len() + 1);
 		let mut edges = Vec::with_capacity(rows.iter().map(Vec::len).sum());
 		offsets.push(0);
-		for row in rows {
+		for row in rows.iter() {
 			edges.extend_from_slice(row);
 			offsets.push(edges.len());
 		}
@@ -63,29 +66,33 @@ impl PackedAdjacency {
 	}
 }
 
+#[allow(
+	clippy::rc_buffer,
+	reason = "the topological order is built incrementally as a Vec and shared without an additional Vec-to-Arc<[T]> allocation"
+)]
 #[derive(Debug, Clone)]
 struct DagStorage {
 	nodes: NodeColumns,
 	edges: EdgeColumns,
-	outgoing: Vec<Vec<AtomId>>,
-	incoming: Vec<Vec<AtomId>>,
-	packed_outgoing: Option<PackedAdjacency>,
-	packed_incoming: Option<PackedAdjacency>,
-	topological: Vec<AtomId>,
-	rank: Vec<Option<usize>>,
+	outgoing: CowVec<Vec<AtomId>>,
+	incoming: CowVec<Vec<AtomId>>,
+	packed_outgoing: Option<Arc<PackedAdjacency>>,
+	packed_incoming: Option<Arc<PackedAdjacency>>,
+	topological: Arc<Vec<AtomId>>,
+	rank: CowVec<Option<usize>>,
 }
 
 impl DagStorage {
-	const fn new() -> Self {
+	fn new() -> Self {
 		Self {
 			nodes: NodeColumns::new(),
 			edges: EdgeColumns::new(),
-			outgoing: Vec::new(),
-			incoming: Vec::new(),
+			outgoing: CowVec::new(),
+			incoming: CowVec::new(),
 			packed_outgoing: None,
 			packed_incoming: None,
-			topological: Vec::new(),
-			rank: Vec::new(),
+			topological: Arc::new(Vec::new()),
+			rank: CowVec::new(),
 		}
 	}
 
@@ -289,13 +296,13 @@ impl DagStorage {
 		for (rank, id) in order.iter().copied().enumerate() {
 			self.rank[id.slot() as usize] = Some(rank);
 		}
-		self.topological = order;
+		self.topological = Arc::new(order);
 		Ok(())
 	}
 
 	fn freeze_layout(&mut self) {
-		self.packed_outgoing = Some(PackedAdjacency::from_rows(&self.outgoing));
-		self.packed_incoming = Some(PackedAdjacency::from_rows(&self.incoming));
+		self.packed_outgoing = Some(Arc::new(PackedAdjacency::from_rows(&self.outgoing)));
+		self.packed_incoming = Some(Arc::new(PackedAdjacency::from_rows(&self.incoming)));
 		self.outgoing.clear();
 		self.incoming.clear();
 	}
@@ -305,8 +312,8 @@ impl DagStorage {
 			return Ok(());
 		}
 		let slots = self.rank.len();
-		self.outgoing = vec![Vec::new(); slots];
-		self.incoming = vec![Vec::new(); slots];
+		self.outgoing = vec![Vec::new(); slots].into();
+		self.incoming = vec![Vec::new(); slots].into();
 		for edge in self.edges.ids().to_vec() {
 			let Some((source, target, EdgeDirection::Directed)) =
 				self.edges.topology(edge).and_then(EdgeTopology::local_binary)
@@ -393,7 +400,7 @@ impl Dag<Mutable> {
 		}
 	}
 
-	pub fn flush(&mut self, writer: &mut impl GraphWriteBack<Self>) -> FerrosGrynnResult<()> {
+	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
 			.origin()
@@ -403,6 +410,21 @@ impl Dag<Mutable> {
 		writer.flush(self, &origin, &dirty)?;
 		self.metadata.clear_dirty();
 		Ok(())
+	}
+
+	pub(crate) fn transaction_dirty(&self) -> Vec<DirtyTarget> {
+		self.metadata.dirty().cloned().collect()
+	}
+
+	pub(crate) fn transaction_snapshot(&self) -> Dag<Frozen> {
+		let mut value = Dag {
+			metadata: self.metadata.clone(),
+			storage: self.storage.clone(),
+			state: PhantomData,
+		};
+		value.storage.freeze_layout();
+		value.metadata = value.metadata.into_frozen();
+		value
 	}
 }
 
@@ -511,11 +533,11 @@ impl<State> Dag<State> {
 
 impl<State> GraphRead for Dag<State> {
 	type EdgeIds<'a>
-		= std::iter::Copied<std::slice::Iter<'a, AtomId>>
+		= AtomIds<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
-		= std::iter::Copied<std::slice::Iter<'a, AtomId>>
+		= AtomIds<'a>
 	where
 		Self: 'a;
 
@@ -536,11 +558,11 @@ impl<State> GraphRead for Dag<State> {
 	}
 
 	fn node_ids(&self) -> Self::NodeIds<'_> {
-		self.storage.nodes.ids().iter().copied()
+		AtomIds::new(self.storage.nodes.ids().iter())
 	}
 
 	fn edge_ids(&self) -> Self::EdgeIds<'_> {
-		self.storage.edges.ids().iter().copied()
+		AtomIds::new(self.storage.edges.ids().iter())
 	}
 
 	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {

@@ -2,6 +2,7 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ferros_grynn::{
+	datastore::{Datastore, GraphWriteView, IsolationLevel, TransactionAccess, TransactionOptions},
 	graph::{
 		AtomKind,
 		AtomRef,
@@ -12,6 +13,7 @@ use ferros_grynn::{
 		Forest,
 		Frozen,
 		Graph,
+		GraphMut,
 		GraphRead,
 		GraphRef,
 		GraphStorageMode,
@@ -80,6 +82,9 @@ fn benchmark_state_and_family_conversions(criterion: &mut Criterion) {
 				|graph| black_box(graph.thaw()),
 				BatchSize::LargeInput,
 			);
+		});
+		group.bench_function(BenchmarkId::new("general_snapshot_clone", size), |bench| {
+			bench.iter(|| black_box(general.clone()));
 		});
 		group.bench_function(BenchmarkId::new("dag_thaw_rebuild_adjacency", size), |bench| {
 			bench.iter_batched(
@@ -156,7 +161,7 @@ fn benchmark_path_and_live_publication(criterion: &mut Criterion) {
 			BatchSize::LargeInput,
 		);
 	});
-	group.bench_function("live_update_full_soa_baseline/4096", |bench| {
+	group.bench_function("live_update_cow/4096", |bench| {
 		bench.iter_batched(
 			|| {
 				let (current, _) = general_chain(4_096);
@@ -169,6 +174,32 @@ fn benchmark_path_and_live_publication(criterion: &mut Criterion) {
 				(LiveGraph::new(current), update)
 			},
 			|(live, update)| black_box(live.apply_update(&update).unwrap()),
+			BatchSize::LargeInput,
+		);
+	});
+	let (graph, atom) = general_chain(4_096);
+	let store = Datastore::in_memory();
+	let mut setup = store.begin();
+	let reference = setup
+		.create_graph(
+			RecordId::new("graph", RecordIdPart::String("transaction-bench".into())).unwrap(),
+			graph.into(),
+		)
+		.unwrap();
+	setup.commit().unwrap();
+	group.bench_function("transaction_atom_commit/4096", |bench| {
+		bench.iter_batched(
+			|| {
+				let mut transaction = store.begin_with(TransactionOptions {
+					isolation: IsolationLevel::Snapshot,
+					access: TransactionAccess::ReadWrite,
+				});
+				if let GraphWriteView::Graph(graph) = transaction.edit_graph(&reference).unwrap() {
+					graph.node_properties_mut(atom).unwrap().insert(0_u32.into(), 1_i64);
+				}
+				transaction
+			},
+			|transaction| black_box(transaction.commit().unwrap()),
 			BatchSize::LargeInput,
 		);
 	});

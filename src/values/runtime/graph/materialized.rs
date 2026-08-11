@@ -4,20 +4,24 @@ use std::{
 };
 
 use super::{
+	AtomId,
 	Dag,
+	EdgeView,
 	Forest,
 	Frozen,
 	Graph,
 	GraphKind,
+	GraphRead,
 	Hypergraph,
 	Metagraph,
+	NodeView,
 	RootedTree,
 	Subgraph,
 	Tree,
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::Uuid,
+	values::runtime::{PropertyMap, Uuid},
 };
 
 /// Transport sum type for immutable graph query results.
@@ -36,6 +40,94 @@ pub enum MaterializedGraph {
 	Hypergraph(Hypergraph<Frozen>),
 	Metagraph(Metagraph<Frozen>),
 	Subgraph(Subgraph<Frozen>),
+}
+
+impl GraphRead for MaterializedGraph {
+	type NodeIds<'a>
+		= Box<dyn Iterator<Item = AtomId> + 'a>
+	where
+		Self: 'a;
+	type EdgeIds<'a>
+		= Box<dyn Iterator<Item = AtomId> + 'a>
+	where
+		Self: 'a;
+
+	fn identity(&self) -> Uuid {
+		self.identity()
+	}
+
+	fn revision(&self) -> u64 {
+		self.revision()
+	}
+
+	fn kind(&self) -> GraphKind {
+		self.kind()
+	}
+
+	fn properties(&self) -> &PropertyMap {
+		match self {
+			Self::Graph(value) => value.properties(),
+			Self::Tree(value) => value.properties(),
+			Self::RootedTree(value) => value.properties(),
+			Self::Forest(value) => value.properties(),
+			Self::Dag(value) => value.properties(),
+			Self::Hypergraph(value) => value.properties(),
+			Self::Metagraph(value) => value.properties(),
+			Self::Subgraph(value) => value.properties(),
+		}
+	}
+
+	fn node_ids(&self) -> Self::NodeIds<'_> {
+		match self {
+			Self::Graph(value) => Box::new(value.node_ids()),
+			Self::Tree(value) => Box::new(value.node_ids()),
+			Self::RootedTree(value) => Box::new(value.node_ids()),
+			Self::Forest(value) => Box::new(value.node_ids()),
+			Self::Dag(value) => Box::new(value.node_ids()),
+			Self::Hypergraph(value) => Box::new(value.node_ids()),
+			Self::Metagraph(value) => Box::new(value.node_ids()),
+			Self::Subgraph(value) => Box::new(value.node_ids()),
+		}
+	}
+
+	fn edge_ids(&self) -> Self::EdgeIds<'_> {
+		match self {
+			Self::Graph(value) => Box::new(value.edge_ids()),
+			Self::Tree(value) => Box::new(value.edge_ids()),
+			Self::RootedTree(value) => Box::new(value.edge_ids()),
+			Self::Forest(value) => Box::new(value.edge_ids()),
+			Self::Dag(value) => Box::new(value.edge_ids()),
+			Self::Hypergraph(value) => Box::new(value.edge_ids()),
+			Self::Metagraph(value) => Box::new(value.edge_ids()),
+			Self::Subgraph(value) => Box::new(value.edge_ids()),
+		}
+	}
+
+	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
+		match self {
+			Self::Graph(value) => value.node(id),
+			Self::Tree(value) => value.node(id),
+			Self::RootedTree(value) => value.node(id),
+			Self::Forest(value) => value.node(id),
+			Self::Dag(value) => value.node(id),
+			Self::Hypergraph(value) => value.node(id),
+			Self::Metagraph(value) => value.node(id),
+			Self::Subgraph(value) => value.node(id),
+		}
+	}
+
+	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
+		match self {
+			Self::Graph(value) => value.edge(id),
+			Self::Tree(value) => value.edge(id),
+			Self::RootedTree(value) => value.edge(id),
+			Self::Forest(value) => value.edge(id),
+			Self::Dag(value) => value.edge(id),
+			Self::Hypergraph(value) => value.edge(id),
+			Self::Metagraph(value) => value.edge(id),
+			Self::Subgraph(value) => value.edge(id),
+		}
+	}
 }
 
 impl MaterializedGraph {

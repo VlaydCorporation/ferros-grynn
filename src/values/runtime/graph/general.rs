@@ -4,6 +4,7 @@ use std::{
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
 	marker::PhantomData,
+	sync::Arc,
 };
 
 use rapidhash::RapidHashMap;
@@ -11,6 +12,7 @@ use smallvec::SmallVec;
 
 use super::{
 	AtomId,
+	AtomIds,
 	AtomKind,
 	DirtyTarget,
 	EdgeEndpoint,
@@ -32,6 +34,7 @@ use super::{
 	storage::{EdgeColumns, GraphMetadata, NodeColumns, ensure_unique_record, generated_record_id},
 };
 use crate::{
+	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{Number, PropertyMap, RecordId, Text, Uuid},
 };
@@ -42,9 +45,9 @@ const INLINE_INCIDENCE: usize = 4;
 pub(super) struct GeneralStorage {
 	pub(super) nodes: NodeColumns,
 	pub(super) edges: EdgeColumns,
-	node_inner: Vec<Option<Box<Graph<Frozen>>>>,
-	edge_transition: Vec<Option<Box<Graph<Frozen>>>>,
-	incidence: RapidHashMap<EdgeEndpoint, SmallVec<AtomId, INLINE_INCIDENCE>>,
+	node_inner: CowVec<Option<Arc<Graph<Frozen>>>>,
+	edge_transition: CowVec<Option<Arc<Graph<Frozen>>>>,
+	incidence: Arc<RapidHashMap<EdgeEndpoint, SmallVec<AtomId, INLINE_INCIDENCE>>>,
 }
 
 impl GeneralStorage {
@@ -52,9 +55,9 @@ impl GeneralStorage {
 		Self {
 			nodes: NodeColumns::new(),
 			edges: EdgeColumns::new(),
-			node_inner: Vec::new(),
-			edge_transition: Vec::new(),
-			incidence: RapidHashMap::default(),
+			node_inner: CowVec::new(),
+			edge_transition: CowVec::new(),
+			incidence: Arc::new(RapidHashMap::default()),
 		}
 	}
 
@@ -62,9 +65,9 @@ impl GeneralStorage {
 		Self {
 			nodes: NodeColumns::with_capacity(nodes),
 			edges: EdgeColumns::with_capacity(edges),
-			node_inner: Vec::with_capacity(nodes),
-			edge_transition: Vec::with_capacity(edges),
-			incidence: RapidHashMap::default(),
+			node_inner: CowVec::with_capacity(nodes),
+			edge_transition: CowVec::with_capacity(edges),
+			incidence: Arc::new(RapidHashMap::default()),
 		}
 	}
 
@@ -77,7 +80,7 @@ impl GeneralStorage {
 	) -> FerrosGrynnResult<AtomId> {
 		let id = self.nodes.insert_new(record_id, label, properties)?;
 		self.ensure_node_slot(id.slot() as usize);
-		self.node_inner[id.slot() as usize] = inner.map(Box::new);
+		self.node_inner[id.slot() as usize] = inner.map(Arc::new);
 		Ok(id)
 	}
 
@@ -91,7 +94,7 @@ impl GeneralStorage {
 	) -> FerrosGrynnResult<()> {
 		self.nodes.insert_at(id, record_id, label, properties)?;
 		self.ensure_node_slot(id.slot() as usize);
-		self.node_inner[id.slot() as usize] = inner.map(Box::new);
+		self.node_inner[id.slot() as usize] = inner.map(Arc::new);
 		Ok(())
 	}
 
@@ -106,7 +109,7 @@ impl GeneralStorage {
 	) -> FerrosGrynnResult<AtomId> {
 		let id = self.edges.insert_new(record_id, topology.clone(), label, properties, weight)?;
 		self.ensure_edge_slot(id.slot() as usize);
-		self.edge_transition[id.slot() as usize] = transition.map(Box::new);
+		self.edge_transition[id.slot() as usize] = transition.map(Arc::new);
 		self.register_incidence(id, &topology);
 		Ok(id)
 	}
@@ -123,7 +126,7 @@ impl GeneralStorage {
 	) -> FerrosGrynnResult<()> {
 		self.edges.insert_at(id, record_id, topology.clone(), label, properties, weight)?;
 		self.ensure_edge_slot(id.slot() as usize);
-		self.edge_transition[id.slot() as usize] = transition.map(Box::new);
+		self.edge_transition[id.slot() as usize] = transition.map(Arc::new);
 		self.register_incidence(id, &topology);
 		Ok(())
 	}
@@ -214,14 +217,16 @@ impl GeneralStorage {
 	}
 
 	fn register_incidence(&mut self, id: AtomId, topology: &EdgeTopology) {
+		let incidence = Arc::make_mut(&mut self.incidence);
 		for endpoint in topology.endpoints().cloned() {
-			self.incidence.entry(endpoint).or_default().push(id);
+			incidence.entry(endpoint).or_default().push(id);
 		}
 	}
 
 	fn unregister_incidence(&mut self, id: AtomId, topology: &EdgeTopology) {
+		let incidence = Arc::make_mut(&mut self.incidence);
 		for endpoint in topology.endpoints() {
-			let remove_entry = if let Some(edges) = self.incidence.get_mut(endpoint) {
+			let remove_entry = if let Some(edges) = incidence.get_mut(endpoint) {
 				if let Some(index) = edges.iter().position(|candidate| *candidate == id) {
 					edges.swap_remove(index);
 				}
@@ -230,7 +235,7 @@ impl GeneralStorage {
 				false
 			};
 			if remove_entry {
-				self.incidence.remove(endpoint);
+				incidence.remove(endpoint);
 			}
 		}
 	}
@@ -243,7 +248,7 @@ impl GeneralStorage {
 		}
 		pending.extend(self.incident_edges(&EdgeEndpoint::Local(id)).iter().copied());
 		if id.is_node() {
-			for (endpoint, incident) in &self.incidence {
+			for (endpoint, incident) in self.incidence.iter() {
 				if matches!(endpoint, EdgeEndpoint::Nested(value) if value.scope().first() == Some(&id))
 				{
 					pending.extend(incident.iter().copied());
@@ -402,7 +407,7 @@ impl Graph<Mutable> {
 		self.check_node(id)?;
 		self.metadata.ensure_can_bump()?;
 		let slot = &mut self.storage.node_inner[id.slot() as usize];
-		let previous = std::mem::replace(slot, inner.map(Box::new)).map(|graph| *graph);
+		let previous = std::mem::replace(slot, inner.map(Arc::new)).map(Arc::unwrap_or_clone);
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		Ok(previous)
 	}
@@ -415,7 +420,7 @@ impl Graph<Mutable> {
 		self.check_edge(id)?;
 		self.metadata.ensure_can_bump()?;
 		let slot = &mut self.storage.edge_transition[id.slot() as usize];
-		let previous = std::mem::replace(slot, transition.map(Box::new)).map(|graph| *graph);
+		let previous = std::mem::replace(slot, transition.map(Arc::new)).map(Arc::unwrap_or_clone);
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		Ok(previous)
 	}
@@ -447,7 +452,7 @@ impl Graph<Mutable> {
 		}
 	}
 
-	pub fn flush(&mut self, writer: &mut impl GraphWriteBack<Self>) -> FerrosGrynnResult<()> {
+	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
 			.origin()
@@ -484,6 +489,14 @@ impl Graph<Mutable> {
 
 	pub(crate) fn finish_writeback(&mut self) {
 		self.metadata.clear_dirty();
+	}
+
+	pub(crate) fn transaction_dirty(&self) -> Vec<DirtyTarget> {
+		self.metadata.dirty().cloned().collect()
+	}
+
+	pub(crate) fn transaction_snapshot(&self) -> Graph<Frozen> {
+		self.clone_preserving_state().freeze()
 	}
 
 	pub(crate) fn from_read_preserving<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
@@ -528,6 +541,113 @@ impl Default for Graph<Mutable> {
 	fn default() -> Self {
 		Self::new()
 	}
+}
+
+pub fn merge_transaction_graph(
+	base: &Graph<Frozen>,
+	changed: Graph<Mutable>,
+	latest: Graph<Frozen>,
+	dirty: &[DirtyTarget],
+) -> FerrosGrynnResult<Graph<Frozen>> {
+	let mut merged = latest.thaw();
+	for target in dirty {
+		if matches!(target, DirtyTarget::Graph) {
+			*merged.properties_mut()? = changed.properties().clone();
+		}
+	}
+	for kind in [AtomKind::Node, AtomKind::Edge] {
+		for target in dirty {
+			let DirtyTarget::Atom(id) = target else {
+				continue;
+			};
+			if id.kind() != Some(kind) {
+				continue;
+			}
+			merge_transaction_atom(base, &changed, &mut merged, *id)?;
+		}
+	}
+	Ok(merged.freeze())
+}
+
+fn merge_transaction_atom(
+	base: &Graph<Frozen>,
+	changed: &Graph<Mutable>,
+	merged: &mut Graph<Mutable>,
+	id: AtomId,
+) -> FerrosGrynnResult<()> {
+	let existed = base.contains(id);
+	if !changed.contains(id) {
+		if merged.contains(id) {
+			merged.remove_atom(id)?;
+		}
+		return Ok(());
+	}
+
+	match id.kind() {
+		Some(AtomKind::Node) => {
+			let node = changed.node(id).ok_or_else(|| atom_does_not_exist(id))?;
+			if !existed {
+				ensure_unique_record(
+					&merged.storage.nodes,
+					&merged.storage.edges,
+					node.record_id(),
+				)?;
+				merged.storage.insert_node_at(
+					id,
+					node.record_id().clone(),
+					node.label_text().cloned(),
+					node.properties().clone(),
+					node.inner_graph().cloned(),
+				)?;
+				merged.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+				return Ok(());
+			}
+			if !merged.contains(id) {
+				return Err(atom_does_not_exist(id));
+			}
+			*merged.node_properties_mut(id)? = node.properties().clone();
+			merged.set_node_label(id, node.label_text().cloned())?;
+			merged.replace_inner_graph(id, node.inner_graph().cloned())?;
+		}
+		Some(AtomKind::Edge) => {
+			let edge = changed.edge(id).ok_or_else(|| atom_does_not_exist(id))?;
+			if !existed {
+				ensure_unique_record(
+					&merged.storage.nodes,
+					&merged.storage.edges,
+					edge.record_id(),
+				)?;
+				merged.storage.validate_topology(edge.topology())?;
+				merged.storage.insert_edge_at(
+					id,
+					edge.record_id().clone(),
+					edge.topology().clone(),
+					edge.label_text().cloned(),
+					edge.properties().clone(),
+					edge.weight(),
+					edge.transition_graph().cloned(),
+				)?;
+				merged.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+				return Ok(());
+			}
+			if !merged.contains(id) {
+				return Err(atom_does_not_exist(id));
+			}
+			let current = merged.edge(id).ok_or_else(|| atom_does_not_exist(id))?;
+			if current.topology() != edge.topology() {
+				return Err(FerrosGrynnError::graph_constraint_violation(
+					"graph",
+					"edge topology cannot be replaced inside a transaction",
+				));
+			}
+			*merged.edge_properties_mut(id)? = edge.properties().clone();
+			merged.set_edge_label(id, edge.label_text().cloned())?;
+			merged.set_edge_weight(id, edge.weight())?;
+			merged.replace_transition_graph(id, edge.transition_graph().cloned())?;
+		}
+		None => return Err(atom_does_not_exist(id)),
+	}
+	Ok(())
 }
 
 impl Graph<Frozen> {
@@ -645,12 +765,12 @@ impl<State> Graph<State> {
 }
 
 impl<State> GraphRead for Graph<State> {
-	type NodeIds<'a>
-		= std::iter::Copied<std::slice::Iter<'a, AtomId>>
+	type EdgeIds<'a>
+		= AtomIds<'a>
 	where
 		Self: 'a;
-	type EdgeIds<'a>
-		= std::iter::Copied<std::slice::Iter<'a, AtomId>>
+	type NodeIds<'a>
+		= AtomIds<'a>
 	where
 		Self: 'a;
 
@@ -671,11 +791,11 @@ impl<State> GraphRead for Graph<State> {
 	}
 
 	fn node_ids(&self) -> Self::NodeIds<'_> {
-		self.storage.nodes.ids().iter().copied()
+		AtomIds::new(self.storage.nodes.ids().iter())
 	}
 
 	fn edge_ids(&self) -> Self::EdgeIds<'_> {
-		self.storage.edges.ids().iter().copied()
+		AtomIds::new(self.storage.edges.ids().iter())
 	}
 
 	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {

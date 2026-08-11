@@ -1,3 +1,12 @@
+#![allow(
+	clippy::pattern_type_mismatch,
+	reason = "status classification matching intentionally uses Rust match ergonomics"
+)]
+#![allow(
+	clippy::impl_trait_in_params,
+	reason = "using `impl` in the params makes it easier to generate code in a `define_status_codes` macro."
+)]
+
 use std::{
 	collections::BTreeMap,
 	error::Error,
@@ -18,6 +27,12 @@ use crate::gql_status::{
 pub struct StatusCode([u8; 5]);
 
 impl StatusCode {
+	/// Creates a validated five-byte status code body.
+	///
+	/// # Panics
+	///
+	/// Panics when `body` contains bytes outside ASCII uppercase letters and
+	/// digits.
 	pub const fn new(body: [u8; 5]) -> Self {
 		let mut index = 0;
 		while index < body.len() {
@@ -31,7 +46,7 @@ impl StatusCode {
 		Self(body)
 	}
 
-	pub fn body(&self) -> &str {
+	pub const fn body(&self) -> &str {
 		// SAFETY: constructors validate that every byte is ASCII.
 		unsafe { std::str::from_utf8_unchecked(&self.0) }
 	}
@@ -80,6 +95,7 @@ impl<'de> Deserialize<'de> for StatusCode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StatusCodeParseError {
 	MissingPrefix,
 	InvalidLength,
@@ -102,6 +118,7 @@ impl Error for StatusCodeParseError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum Condition {
 	NoData,
 	Warning,
@@ -159,6 +176,7 @@ impl Condition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum NotificationClassification {
 	Deprecation,
 	Hint,
@@ -173,6 +191,7 @@ pub enum NotificationClassification {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum ErrorClassification {
 	ClientError,
 	DatabaseError,
@@ -181,6 +200,7 @@ pub enum ErrorClassification {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum ErrorCategory {
 	Syntax,
 	Semantic,
@@ -192,6 +212,7 @@ pub enum ErrorCategory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum Domain {
 	Query,
 	Value,
@@ -206,6 +227,7 @@ pub enum Domain {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum StatusKind {
 	Completion,
 	Notification {
@@ -625,6 +647,52 @@ define_status_codes!(
 		subcondition: "invalid composite record ID",
 		message: "A composite record ID must contain a valid JSON string, array, or object.",
 	},
+	ReadOnlyTransaction, "FG-25006" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Transaction,
+		subcondition: "read-only transaction",
+		message: "Transaction {transaction} is read-only.",
+		params: {
+			transaction: u64 => DisplayValue,
+		},
+	},
+	SnapshotExpired, "FG-25F01" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Transaction,
+		subcondition: "snapshot age limit exceeded",
+		message: "Transaction {transaction} exceeded the snapshot age limit of {max_age_seconds} seconds.",
+		params: {
+			transaction: u64 => DisplayValue,
+			max_age_seconds: u64 => DisplayValue,
+		},
+		hint: "Retry the operation in a new transaction.",
+	},
+	SerializationFailure, "FG-40001" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::TransactionRollback,
+		domain: Domain::Transaction,
+		subcondition: "serialization failure",
+		message: "Transaction {transaction} could not be serialized because {reason}.",
+		params: {
+			transaction: u64 => DisplayValue,
+			reason: String => DisplayValue,
+		},
+		hint: "Retry the complete transaction.",
+	},
 	ColumnarTypeConflict, "FG-22F16" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -757,6 +825,34 @@ define_status_codes!(
 			reason: String => DisplayValue,
 		},
 	},
+	GraphDoesNotExist, "FG-G1F07" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Graph,
+		subcondition: "graph does not exist",
+		message: "Graph {graph} does not exist.",
+		params: {
+			graph: String => StringLiteral,
+		},
+	},
+	GraphAlreadyExists, "FG-G1F08" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Graph,
+		subcondition: "graph already exists",
+		message: "Graph {graph} already exists.",
+		params: {
+			graph: String => StringLiteral,
+		},
+	},
 	EmptyEdgeEndpoints, "FG-G2F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -874,6 +970,34 @@ define_status_codes!(
 			message: String => DisplayValue,
 		},
 	},
+	TableDoesNotExist, "FG-42F01" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Semantic,
+			severity: Severity::Error,
+		},
+		condition: Condition::SyntaxErrorOrAccessRuleViolation,
+		domain: Domain::Query,
+		subcondition: "table does not exist",
+		message: "Table {table} does not exist.",
+		params: {
+			table: String => Identifier,
+		},
+	},
+	TableAlreadyExists, "FG-42F02" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Semantic,
+			severity: Severity::Error,
+		},
+		condition: Condition::SyntaxErrorOrAccessRuleViolation,
+		domain: Domain::Query,
+		subcondition: "table already exists",
+		message: "Table {table} already exists.",
+		params: {
+			table: String => Identifier,
+		},
+	},
 	QueryFeatureNotSupported, "FG-50F03" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -914,6 +1038,22 @@ define_status_codes!(
 		message: "Query nesting exceeds the maximum depth of {maximum_depth}.",
 		params: {
 			maximum_depth: u64 => DisplayValue,
+		},
+	},
+	TransactionWriteSetLimitExceeded, "FG-54F07" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Transaction,
+		subcondition: "transaction write-set limit exceeded",
+		message: "Transaction {transaction} write set uses {actual_bytes} bytes, exceeding the {maximum_bytes} byte limit.",
+		params: {
+			transaction: u64 => DisplayValue,
+			actual_bytes: u64 => DisplayValue,
+			maximum_bytes: u64 => DisplayValue,
 		},
 	},
 	UnexpectedExternalFailure, "FG-50F00" => {
@@ -1066,7 +1206,7 @@ impl StatusObject {
 		self
 	}
 
-	pub fn with_extension(mut self, key: impl Into<String>, value: DiagnosticValue) -> Self {
+	pub fn with_extension<S: Into<String>>(mut self, key: S, value: DiagnosticValue) -> Self {
 		self.diagnostic = self.diagnostic.with_extension(key, value);
 		self
 	}
@@ -1100,6 +1240,7 @@ impl Display for StatusObject {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InvalidSeverity {
 	pub status: StatusCode,
 	pub severity: Severity,

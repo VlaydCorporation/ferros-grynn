@@ -11,6 +11,7 @@ use super::{
 	id::SlotAllocator,
 };
 use crate::{
+	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{Number, PropertyMap, RecordId, RecordIdPart, Text, Ulid, Uuid},
 };
@@ -138,33 +139,33 @@ impl Default for GraphMetadata {
 #[derive(Debug, Clone)]
 pub(super) struct NodeColumns {
 	allocator: SlotAllocator,
-	live: Vec<AtomId>,
-	dense_positions: Vec<Option<usize>>,
-	record_ids: Vec<Option<RecordId>>,
-	labels: Vec<Option<Text>>,
-	properties: Vec<PropertyMap>,
+	live: CowVec<AtomId>,
+	dense_positions: CowVec<Option<usize>>,
+	record_ids: CowVec<Option<RecordId>>,
+	labels: CowVec<Option<Text>>,
+	properties: CowVec<PropertyMap>,
 }
 
 impl NodeColumns {
-	pub(crate) const fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Self {
 			allocator: SlotAllocator::new(AtomKind::Node),
-			live: Vec::new(),
-			dense_positions: Vec::new(),
-			record_ids: Vec::new(),
-			labels: Vec::new(),
-			properties: Vec::new(),
+			live: CowVec::new(),
+			dense_positions: CowVec::new(),
+			record_ids: CowVec::new(),
+			labels: CowVec::new(),
+			properties: CowVec::new(),
 		}
 	}
 
 	pub(crate) fn with_capacity(capacity: usize) -> Self {
 		Self {
 			allocator: SlotAllocator::with_capacity(AtomKind::Node, capacity),
-			live: Vec::with_capacity(capacity),
-			dense_positions: Vec::with_capacity(capacity),
-			record_ids: Vec::with_capacity(capacity),
-			labels: Vec::with_capacity(capacity),
-			properties: Vec::with_capacity(capacity),
+			live: CowVec::with_capacity(capacity),
+			dense_positions: CowVec::with_capacity(capacity),
+			record_ids: CowVec::with_capacity(capacity),
+			labels: CowVec::with_capacity(capacity),
+			properties: CowVec::with_capacity(capacity),
 		}
 	}
 
@@ -213,7 +214,7 @@ impl NodeColumns {
 		self.allocator.contains(id)
 	}
 
-	pub(crate) fn ids(&self) -> &[AtomId] {
+	pub(crate) const fn ids(&self) -> &CowVec<AtomId> {
 		&self.live
 	}
 
@@ -282,39 +283,39 @@ impl Default for NodeColumns {
 #[derive(Debug, Clone)]
 pub(super) struct EdgeColumns {
 	allocator: SlotAllocator,
-	live: Vec<AtomId>,
-	dense_positions: Vec<Option<usize>>,
-	record_ids: Vec<Option<RecordId>>,
-	topologies: Vec<EdgeTopology>,
-	labels: Vec<Option<Text>>,
-	properties: Vec<PropertyMap>,
-	weights: Vec<Option<Number>>,
+	live: CowVec<AtomId>,
+	dense_positions: CowVec<Option<usize>>,
+	record_ids: CowVec<Option<RecordId>>,
+	topologies: CowVec<EdgeTopology>,
+	labels: CowVec<Option<Text>>,
+	properties: CowVec<PropertyMap>,
+	weights: CowVec<Option<Number>>,
 }
 
 impl EdgeColumns {
-	pub(crate) const fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Self {
 			allocator: SlotAllocator::new(AtomKind::Edge),
-			live: Vec::new(),
-			dense_positions: Vec::new(),
-			record_ids: Vec::new(),
-			topologies: Vec::new(),
-			labels: Vec::new(),
-			properties: Vec::new(),
-			weights: Vec::new(),
+			live: CowVec::new(),
+			dense_positions: CowVec::new(),
+			record_ids: CowVec::new(),
+			topologies: CowVec::new(),
+			labels: CowVec::new(),
+			properties: CowVec::new(),
+			weights: CowVec::new(),
 		}
 	}
 
 	pub(crate) fn with_capacity(capacity: usize) -> Self {
 		Self {
 			allocator: SlotAllocator::with_capacity(AtomKind::Edge, capacity),
-			live: Vec::with_capacity(capacity),
-			dense_positions: Vec::with_capacity(capacity),
-			record_ids: Vec::with_capacity(capacity),
-			topologies: Vec::with_capacity(capacity),
-			labels: Vec::with_capacity(capacity),
-			properties: Vec::with_capacity(capacity),
-			weights: Vec::with_capacity(capacity),
+			live: CowVec::with_capacity(capacity),
+			dense_positions: CowVec::with_capacity(capacity),
+			record_ids: CowVec::with_capacity(capacity),
+			topologies: CowVec::with_capacity(capacity),
+			labels: CowVec::with_capacity(capacity),
+			properties: CowVec::with_capacity(capacity),
+			weights: CowVec::with_capacity(capacity),
 		}
 	}
 
@@ -369,7 +370,7 @@ impl EdgeColumns {
 		self.allocator.contains(id)
 	}
 
-	pub(crate) fn ids(&self) -> &[AtomId] {
+	pub(crate) const fn ids(&self) -> &CowVec<AtomId> {
 		&self.live
 	}
 
@@ -385,6 +386,7 @@ impl EdgeColumns {
 		self.contains(id).then(|| self.topologies.get(id.slot() as usize))?
 	}
 
+	// TODO: does we need Option<Option<_>>?
 	pub(crate) fn label(&self, id: AtomId) -> Option<Option<&Text>> {
 		self.contains(id).then(|| self.labels.get(id.slot() as usize).map(Option::as_ref))?
 	}
@@ -397,14 +399,17 @@ impl EdgeColumns {
 		self.contains(id).then(|| self.properties.get_mut(id.slot() as usize))?
 	}
 
+	// TODO: does we need Option<Option<_>>?
 	pub(crate) fn label_mut(&mut self, id: AtomId) -> Option<&mut Option<Text>> {
 		self.contains(id).then(|| self.labels.get_mut(id.slot() as usize))?
 	}
 
+	// TODO: does we need Option<Option<_>>?
 	pub(crate) fn weight(&self, id: AtomId) -> Option<Option<Number>> {
 		self.contains(id).then(|| self.weights.get(id.slot() as usize).copied())?
 	}
 
+	// TODO: does we need Option<Option<_>>?
 	pub(crate) fn weight_mut(&mut self, id: AtomId) -> Option<&mut Option<Number>> {
 		self.contains(id).then(|| self.weights.get_mut(id.slot() as usize))?
 	}

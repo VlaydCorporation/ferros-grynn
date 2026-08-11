@@ -1,6 +1,9 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
-use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
+use crate::{
+	collections::cow_vec::CowVec,
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+};
 
 const KIND_SHIFT: u32 = 40;
 const GENERATION_SHIFT: u32 = 41;
@@ -9,6 +12,7 @@ const SLOT_MASK: u64 = KIND_BIT - 1;
 const GENERATION_MASK: u32 = (1 << 23) - 1;
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum AtomKind {
 	Node,
 	Edge,
@@ -113,19 +117,19 @@ impl Display for AtomId {
 #[derive(Debug, Clone)]
 pub(super) struct SlotAllocator {
 	kind: AtomKind,
-	generations: Vec<u32>,
-	occupied: Vec<bool>,
-	free: Vec<u64>,
+	generations: CowVec<u32>,
+	occupied: CowVec<bool>,
+	free: CowVec<u64>,
 	live: usize,
 }
 
 impl SlotAllocator {
-	pub(crate) const fn new(kind: AtomKind) -> Self {
+	pub(crate) fn new(kind: AtomKind) -> Self {
 		Self {
 			kind,
-			generations: Vec::new(),
-			occupied: Vec::new(),
-			free: Vec::new(),
+			generations: CowVec::new(),
+			occupied: CowVec::new(),
+			free: CowVec::new(),
 			live: 0,
 		}
 	}
@@ -133,9 +137,9 @@ impl SlotAllocator {
 	pub(crate) fn with_capacity(kind: AtomKind, capacity: usize) -> Self {
 		Self {
 			kind,
-			generations: Vec::with_capacity(capacity),
-			occupied: Vec::with_capacity(capacity),
-			free: Vec::new(),
+			generations: CowVec::with_capacity(capacity),
+			occupied: CowVec::with_capacity(capacity),
+			free: CowVec::new(),
 			live: 0,
 		}
 	}

@@ -9,6 +9,8 @@ mod ir;
 
 use std::time::Duration;
 
+pub(crate) use execution::execute_transaction;
+
 pub use crate::syn::{
 	BinaryOperator,
 	Expr,
@@ -39,6 +41,7 @@ pub fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult<Progra
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QueryStatementKind {
 	Let,
 	Return,
@@ -46,6 +49,7 @@ pub enum QueryStatementKind {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct QueryResult {
 	pub kind: QueryStatementKind,
 	pub elapsed: Duration,

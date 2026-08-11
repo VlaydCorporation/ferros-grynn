@@ -5,9 +5,38 @@ use std::{
 
 use super::{AtomId, AtomKind, EdgeTopology, Frozen, Graph};
 use crate::{
+	collections::cow_vec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{Number, PropertyMap, RecordId, Text, Uuid},
 };
+
+/// Stable iterator over atom handles in a graph snapshot.
+pub struct AtomIds<'a> {
+	inner: cow_vec::Iter<'a, AtomId>,
+}
+
+impl<'a> AtomIds<'a> {
+	pub(crate) const fn new(inner: cow_vec::Iter<'a, AtomId>) -> Self {
+		Self {
+			inner,
+		}
+	}
+}
+
+impl Iterator for AtomIds<'_> {
+	type Item = AtomId;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		self.inner.next().copied()
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		self.inner.size_hint()
+	}
+}
+
+impl ExactSizeIterator for AtomIds<'_> {}
+impl std::iter::FusedIterator for AtomIds<'_> {}
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
@@ -357,6 +386,7 @@ pub trait GraphMut: GraphRead {
 }
 
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum DirtyTarget {
 	Graph,
 	Atom(AtomId),
@@ -437,12 +467,12 @@ impl<'tx, R: GraphRead + ?Sized> GraphReadView<'tx, R> {
 }
 
 impl<R: GraphRead + ?Sized> GraphRead for GraphReadView<'_, R> {
-	type NodeIds<'a>
-		= R::NodeIds<'a>
-	where
-		Self: 'a;
 	type EdgeIds<'a>
 		= R::EdgeIds<'a>
+	where
+		Self: 'a;
+	type NodeIds<'a>
+		= R::NodeIds<'a>
 	where
 		Self: 'a;
 
@@ -520,12 +550,12 @@ impl<'tx, R: GraphRead + ?Sized> DiskGraphView<'tx, R> {
 }
 
 impl<R: GraphRead + ?Sized> GraphRead for DiskGraphView<'_, R> {
-	type NodeIds<'a>
-		= R::NodeIds<'a>
-	where
-		Self: 'a;
 	type EdgeIds<'a>
 		= R::EdgeIds<'a>
+	where
+		Self: 'a;
+	type NodeIds<'a>
+		= R::NodeIds<'a>
 	where
 		Self: 'a;
 
@@ -579,13 +609,24 @@ mod tests {
 	use std::sync::{Arc, Weak};
 
 	use super::{
-		DirtyTarget, DiskGraphView, GraphKind, GraphMut, GraphRead, GraphRef, GraphRefReader,
-		GraphStorageMode, GraphWriteBack, MaterializationOrigin, SnapshotId, query_to_memory,
+		DirtyTarget,
+		DiskGraphView,
+		GraphKind,
+		GraphMut,
+		GraphRead,
+		GraphRef,
+		GraphRefReader,
+		GraphStorageMode,
+		GraphWriteBack,
+		MaterializationOrigin,
+		SnapshotId,
+		query_to_memory,
 	};
 	use crate::{
 		gql_status::{FerrosGrynnError, FerrosGrynnResult},
 		values::runtime::{
-			PropertyMap, Value,
+			PropertyMap,
+			Value,
 			graph::{AtomId, EdgeTopology, Frozen, Graph, Mutable, TraversalDirection, bfs},
 		},
 	};

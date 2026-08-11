@@ -4,10 +4,12 @@ use std::{
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
 	marker::PhantomData,
+	sync::Arc,
 };
 
 use super::{
 	AtomId,
+	AtomIds,
 	AtomKind,
 	DirtyTarget,
 	EdgeDirection,
@@ -26,11 +28,13 @@ use super::{
 	storage::{EdgeColumns, GraphMetadata, NodeColumns, ensure_unique_record, generated_record_id},
 };
 use crate::{
+	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{Number, PropertyMap, RecordId, Text, Uuid},
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
 pub enum TreeOrientation {
 	#[default]
 	Undirected,
@@ -43,22 +47,22 @@ struct ForestStorage {
 	nodes: NodeColumns,
 	edges: EdgeColumns,
 	orientation: TreeOrientation,
-	parent: Vec<Option<AtomId>>,
-	parent_edge: Vec<Option<AtomId>>,
-	children: Vec<Vec<AtomId>>,
-	roots: BTreeSet<AtomId>,
+	parent: CowVec<Option<AtomId>>,
+	parent_edge: CowVec<Option<AtomId>>,
+	children: CowVec<Vec<AtomId>>,
+	roots: Arc<BTreeSet<AtomId>>,
 }
 
 impl ForestStorage {
-	const fn new(orientation: TreeOrientation) -> Self {
+	fn new(orientation: TreeOrientation) -> Self {
 		Self {
 			nodes: NodeColumns::new(),
 			edges: EdgeColumns::new(),
 			orientation,
-			parent: Vec::new(),
-			parent_edge: Vec::new(),
-			children: Vec::new(),
-			roots: BTreeSet::new(),
+			parent: CowVec::new(),
+			parent_edge: CowVec::new(),
+			children: CowVec::new(),
+			roots: Arc::new(BTreeSet::new()),
 		}
 	}
 
@@ -71,7 +75,7 @@ impl ForestStorage {
 		ensure_unique_record(&self.nodes, &self.edges, &record_id)?;
 		let id = self.nodes.insert_new(record_id, label, properties)?;
 		self.ensure_node_slot(id);
-		self.roots.insert(id);
+		Arc::make_mut(&mut self.roots).insert(id);
 		Ok(id)
 	}
 
@@ -85,7 +89,7 @@ impl ForestStorage {
 		ensure_unique_record(&self.nodes, &self.edges, &record_id)?;
 		self.nodes.insert_at(id, record_id, label, properties)?;
 		self.ensure_node_slot(id);
-		self.roots.insert(id);
+		Arc::make_mut(&mut self.roots).insert(id);
 		Ok(())
 	}
 
@@ -150,7 +154,7 @@ impl ForestStorage {
 		self.parent[child_slot] = Some(parent);
 		self.parent_edge[child_slot] = Some(edge);
 		self.children[parent.slot() as usize].push(child);
-		self.roots.remove(&child);
+		Arc::make_mut(&mut self.roots).remove(&child);
 	}
 
 	fn component_root(&self, mut id: AtomId) -> Option<AtomId> {
@@ -184,13 +188,12 @@ impl ForestStorage {
 			});
 		if let Some(child) = child {
 			let child_slot = child.slot() as usize;
-			if let Some(parent) = self.parent[child_slot].take() {
-				if let Some(children) = self.children.get_mut(parent.slot() as usize) {
-					children.retain(|candidate| *candidate != child);
-				}
+			if let Some(parent) = self.parent[child_slot].take()
+				&& let Some(children) = self.children.get_mut(parent.slot() as usize) {
+				children.retain(|candidate| *candidate != child);
 			}
 			self.parent_edge[child_slot] = None;
-			self.roots.insert(child);
+			Arc::make_mut(&mut self.roots).insert(child);
 		}
 		self.edges.remove(edge)
 	}
@@ -210,7 +213,7 @@ impl ForestStorage {
 		for edge in incident {
 			self.detach_edge(edge);
 		}
-		self.roots.remove(&id);
+		Arc::make_mut(&mut self.roots).remove(&id);
 		self.parent[slot] = None;
 		self.parent_edge[slot] = None;
 		self.children[slot].clear();
@@ -320,7 +323,7 @@ impl Forest<Mutable> {
 		}
 	}
 
-	pub fn flush(&mut self, writer: &mut impl GraphWriteBack<Self>) -> FerrosGrynnResult<()> {
+	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
 			.origin()
@@ -330,6 +333,18 @@ impl Forest<Mutable> {
 		writer.flush(self, &origin, &dirty)?;
 		self.metadata.clear_dirty();
 		Ok(())
+	}
+
+	pub(crate) fn transaction_dirty(&self) -> Vec<DirtyTarget> {
+		self.metadata.dirty().cloned().collect()
+	}
+
+	pub(crate) fn transaction_snapshot(&self) -> Forest<Frozen> {
+		Forest {
+			metadata: self.metadata.clone().into_frozen(),
+			storage: self.storage.clone(),
+			state: PhantomData,
+		}
 	}
 }
 
@@ -411,7 +426,7 @@ impl Tree<Mutable> {
 		}
 	}
 
-	pub fn flush(&mut self, writer: &mut impl GraphWriteBack<Self>) -> FerrosGrynnResult<()> {
+	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
 			.origin()
@@ -421,6 +436,18 @@ impl Tree<Mutable> {
 		writer.flush(self, &origin, &dirty)?;
 		self.metadata.clear_dirty();
 		Ok(())
+	}
+
+	pub(crate) fn transaction_dirty(&self) -> Vec<DirtyTarget> {
+		self.metadata.dirty().cloned().collect()
+	}
+
+	pub(crate) fn transaction_snapshot(&self) -> Tree<Frozen> {
+		Tree {
+			metadata: self.metadata.clone().into_frozen(),
+			storage: self.storage.clone(),
+			state: PhantomData,
+		}
 	}
 }
 
@@ -497,7 +524,7 @@ impl RootedTree<Mutable> {
 		}
 	}
 
-	pub fn flush(&mut self, writer: &mut impl GraphWriteBack<Self>) -> FerrosGrynnResult<()> {
+	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
 			.origin()
@@ -507,6 +534,19 @@ impl RootedTree<Mutable> {
 		writer.flush(self, &origin, &dirty)?;
 		self.metadata.clear_dirty();
 		Ok(())
+	}
+
+	pub(crate) fn transaction_dirty(&self) -> Vec<DirtyTarget> {
+		self.metadata.dirty().cloned().collect()
+	}
+
+	pub(crate) fn transaction_snapshot(&self) -> RootedTree<Frozen> {
+		RootedTree {
+			metadata: self.metadata.clone().into_frozen(),
+			storage: self.storage.clone(),
+			root: self.root,
+			state: PhantomData,
+		}
 	}
 }
 
@@ -536,11 +576,11 @@ macro_rules! impl_forest_read {
 	($type:ident, $kind:expr) => {
 		impl<State> GraphRead for $type<State> {
 			type EdgeIds<'a>
-				= std::iter::Copied<std::slice::Iter<'a, AtomId>>
+				= AtomIds<'a>
 			where
 				Self: 'a;
 			type NodeIds<'a>
-				= std::iter::Copied<std::slice::Iter<'a, AtomId>>
+				= AtomIds<'a>
 			where
 				Self: 'a;
 
@@ -561,11 +601,11 @@ macro_rules! impl_forest_read {
 			}
 
 			fn node_ids(&self) -> Self::NodeIds<'_> {
-				self.storage.nodes.ids().iter().copied()
+				AtomIds::new(self.storage.nodes.ids().iter())
 			}
 
 			fn edge_ids(&self) -> Self::EdgeIds<'_> {
-				self.storage.edges.ids().iter().copied()
+				AtomIds::new(self.storage.edges.ids().iter())
 			}
 
 			fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
@@ -877,6 +917,26 @@ impl<State> TryFrom<Graph<State>> for Tree<State> {
 	}
 }
 
+impl<State> TryFrom<Graph<State>> for RootedTree<State> {
+	type Error = FerrosGrynnError;
+
+	fn try_from(value: Graph<State>) -> Result<Self, Self::Error> {
+		let tree = Tree::try_from(value)?;
+		let root = tree
+			.storage
+			.roots
+			.first()
+			.copied()
+			.ok_or_else(|| constraint("a rooted tree must contain one root"))?;
+		Ok(Self {
+			metadata: tree.metadata,
+			storage: tree.storage,
+			root,
+			state: PhantomData,
+		})
+	}
+}
+
 impl QueryMaterialize for Forest<Mutable> {
 	fn query_from<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
 		let graph = Graph::<Mutable>::query_from(source)?;
@@ -938,7 +998,7 @@ fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<ForestStorage> {
 			return Err(constraint("bidirectional edges are not supported"));
 		}
 	};
-	let parent_map = build_parent_map(&nodes, &raw_edges, orientation)?;
+	let parent_map = build_parent_map(&nodes, &raw_edges, orientation);
 	let mut storage = ForestStorage::new(orientation);
 	for id in source.node_ids() {
 		let node = source.node(id).ok_or_else(|| atom_does_not_exist(id))?;
@@ -1026,12 +1086,12 @@ fn build_parent_map(
 	nodes: &BTreeMap<AtomId, usize>,
 	edges: &[(AtomId, AtomId, AtomId, EdgeView<'_>)],
 	orientation: TreeOrientation,
-) -> FerrosGrynnResult<BTreeMap<AtomId, (AtomId, AtomId)>> {
+) -> BTreeMap<AtomId, (AtomId, AtomId)> {
 	if orientation == TreeOrientation::OutArborescence {
-		return Ok(edges.iter().map(|(id, source, target, _)| (*id, (*source, *target))).collect());
+		return edges.iter().map(|(id, source, target, _)| (*id, (*source, *target))).collect();
 	}
 	if orientation == TreeOrientation::InArborescence {
-		return Ok(edges.iter().map(|(id, source, target, _)| (*id, (*target, *source))).collect());
+		return edges.iter().map(|(id, source, target, _)| (*id, (*target, *source))).collect();
 	}
 
 	let mut adjacency = BTreeMap::<AtomId, Vec<(AtomId, AtomId)>>::new();
@@ -1055,7 +1115,7 @@ fn build_parent_map(
 			}
 		}
 	}
-	Ok(result)
+	result
 }
 
 fn topology_for(orientation: TreeOrientation, parent: AtomId, child: AtomId) -> EdgeTopology {
