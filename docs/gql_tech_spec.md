@@ -723,7 +723,10 @@ local, conflicts и remote revision. Delta не применяется авто�
 
 ## 11. Транзакции, MVCC и снимки в исполнении
 
-Реализация — `fg-meta` (`mvcc.rs`, `mvcc_persist.rs`); поведение — §17 gql_spec, детали — `implementation_notes.md`. Модель — **логический MVCC** (версии как цепочки `VersionChain<T>` в памяти; WAL пишет операции уровня транзакции, не страницы) — **не LSM**.
+Режим 1 реализован в `src/datastore.rs`; `fg-meta/mvcc.rs` используется как набор сценариев и
+антипаттернов, но не копируется. В частности, version нельзя назначать в `begin`: поздно
+закоммиченная транзакция тогда стала бы видна старому snapshot. Persistent-часть зависит от
+frame-WAL и ещё не подключена. Поведение задаёт §17 `gql_spec.md`.
 
 ### 11.1. Уровни изоляции
 
@@ -733,7 +736,16 @@ local, conflicts и remote revision. Delta не применяется авто�
 
 **Инвариант** (§23.5 gql_spec, §55.2): `∀ op: op.snapshot = Γ.Snapshot`. Все чтения (`MATCH`, `SELECT`, traversal) одного запроса видят один снимок; если разные операторы прочитают разные снимки — возможны phantom reads. Snapshot фиксируется как `SnapshotId = (timestamp, tx_id)`.
 
-Timestamp oracle: глобальный `atomic<u64> next_ts`; при старте tx `start_ts = next_ts.load()`, при commit `commit_ts = next_ts.fetch_add(1)`. Видимость версии: `visible(v, snapshot_ts) = v.begin_ts ≤ snapshot_ts < v.end_ts`.
+Timestamp oracle режима 1 — `commit_ts` текущего immutable root. Serializable/SI-транзакция
+удерживает этот root от `BEGIN`, а Read Committed атомарно фиксирует отдельный root для каждого
+statement и не меняет его между операторами этого statement. В короткой commit-секции новый
+`commit_ts = current.commit_ts + 1` назначается только после validation. Затем все изменения базы
+публикуются одной заменой root. Поэтому версия с поздним commit физически отсутствует в более
+старом root независимо от порядка `BEGIN`.
+
+Текущий исполняемый срез считает один переданный в `Transaction::execute` AST `Program` одной
+statement execution unit. Когда появится драйвер нескольких top-level DML statements, он обязан
+запрашивать новый RC-root перед каждым statement, не меняя root внутри него.
 
 `SnapshotId` — только identity MVCC-версии. Он не владеет данными и сам по себе не позволяет
 читать граф.
@@ -742,7 +754,7 @@ Timestamp oracle: глобальный `atomic<u64> next_ts`; при старт�
 
 `GraphReadView<'tx>` — transaction-bound read guard:
 
-- в режиме 1 содержит ссылку/guard на корень in-memory MVCC version;
+- в режиме 1 содержит `Arc` на immutable root in-memory MVCC version;
 - в режиме 2 содержит `GraphRef`, `SnapshotId` и доступ к страницам через `PageManager`;
 - borrowed atom/subgraph views наследуют `'tx` и не выходят из транзакции.
 
@@ -755,30 +767,46 @@ Timestamp oracle: глобальный `atomic<u64> next_ts`; при старт�
 
 ### 11.4. Обнаружение конфликтов
 
-O(1)-индексы (`implementation_notes.md` §3): `atom_readers[atom] → [TxId]`, `atom_writers[atom] → [TxId]`, `atom_meta[atom] → AtomMeta` (label/property-кеш для phantom-matching).
+Режим 1 хранит `properties_version`, `node_set_version`, `edge_set_version` и
+`atom_versions[AtomId]` в каждом named graph. Write-write validation по известному dirty-set имеет
+`O(|write-set| log |atoms|)`. Точные предикаты не используют текущий `AtomMeta`: query adapter
+сохраняет тот же typed matcher, которым исполнялся `WHERE`, а COW-журнал графа перечисляет только
+изменившиеся после snapshot атомы.
 
 | Конфликт         | Поведение                                                                       |
 |------------------|---------------------------------------------------------------------------------|
 | Write-write      | FirstCommitterWins → abort второй                                               |
 | Read-write (SI)  | не ловится (возможен write skew)                                                |
-| Read-write (SSI) | abort при rw-цикле                                                              |
-| Phantom (SSI)    | abort через predicate locking + `AtomMeta` (точный matching, 0 false positives) |
+| Read-write (SSI) | консервативный abort при устаревшем фактически прочитанном atom                 |
+| Phantom (SSI)    | повторный typed-matcher только для изменившихся атомов; abort при смене истины  |
 
-Атомарное `write_with_meta` (§3.3 impl-notes): meta обновляется **до** записи данных → concurrent SSI phantom-check видит актуальные метаданные. При abort — `remove_atom_meta` для `tx.pending_meta`.
+Консервативный вариант намеренно завершает любую исходящую rw-антизависимость, а не только pivot
+dangerous structure. Он serializable, но может давать больше abort; усложнение оправдано только
+по метрике abort-rate. Read-only транзакции держат safe immutable root и эту проверку не проходят.
 
 ### 11.5. Протокол commit
 
-1. validate (SI write-write / SSI rw-цикл + phantom);
-2. assign `commit_ts`;
-3. install versions (private write-set → visible);
-4. WAL append `COMMIT` → `wal.sync()` (fdatasync);
-5. publish (изменения видны после `commit_ts`).
+1. проверить snapshot age и write-set budget;
+2. под коротким commit lock проверить FCW и serializable/predicate conflicts;
+3. назначить фактический `commit_ts`;
+4. слить непересекающиеся atom-delta поверх текущих графов и повторно проверить family invariant;
+5. под кратким write-guard зарегистрировать границу очистки predicate history и опубликовать
+   единый новый root базы; `BEGIN` регистрирует активный snapshot под read-guard того же root,
+   поэтому snapshot не может попасть в окно между очисткой и публикацией.
 
-Durability: ответ клиенту — только после fsync WAL (§17.6, §12.5).
+В чистом in-memory режиме шагов WAL нет и durability после завершения процесса не обещается.
+Persistent-адаптер перед публикацией обязан записать commit во frame-WAL и выполнить `fdatasync`
+(§17.6, §12.5).
 
 ### 11.6. Graph-специфичная консистентность
 
-Консистентность ребра (src/dst существуют) — валидация **на commit** (прагматичный вариант A: оба endpoint'а видимы), фоновая очистка dangling-рёбер. Удаление вершины: tombstone → lazy-delete рёбер → background GC (§29 задела). MVCC GC: `version.end_ts < min(active_tx.start_ts) → удалить`.
+Операция graph family сохраняет локальный инвариант немедленно; commit после atom-level merge
+строит/проверяет итоговый `Tree`/`RootedTree`/`Forest`/`Dag`/`Hypergraph` повторно. Удаление вершины
+каскадно удаляет incident edges в той же транзакции. История predicate changes очищается по
+минимальному `start_ts` активных транзакций; просроченная запись исключается из этой границы, а
+любая следующая операция её транзакции завершается `FG-25F01`. Удерживаемый Rust handle
+освобождает свой старый `Arc<root>` при `Drop`; фоновое принудительное уничтожение handle не
+вводится.
 
 ---
 

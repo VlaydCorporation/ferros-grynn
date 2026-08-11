@@ -161,7 +161,8 @@ generation и node/edge kind берутся только из Ferros-Grynn `Atom
 ```text
 Mode 1 — Full in-memory
 Graph<Mutable> / специализированный T<Mutable>
-MVCC + WAL + snapshot durability
+COW MVCC + единый immutable root базы
+RAM-backend без WAL; durability подключается отдельным persistent adapter
 
 Mode 2 — Disk-backed
 GraphRef + DiskGraphView<'tx>

@@ -111,7 +111,8 @@ T<Frozen>  --thaw----> T<Mutable>
 
 ## 6. Режимы доступа
 
-- Full in-memory — owned `T<Mutable/Frozen>` с MVCC/WAL.
+- Full in-memory — owned `T<Mutable/Frozen>` с COW MVCC; текущий RAM-backend не включает WAL и
+  не обещает durability после завершения процесса.
 - Disk-backed — `GraphRef` и transaction-bound `GraphReadView<'tx>`; это не materialized graph.
 - Hybrid — `query_to_memory::<T, State>` строит owned family и освобождает source snapshot.
 

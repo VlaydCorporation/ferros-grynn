@@ -58,8 +58,8 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | `AtomId` (генерационный, kind-бит, u64)                                                                                              | `disk` §9                              | `fg-meta/id.rs` → `src/values/runtime/graph`                                                                 | 🟢 foundation (`gen(23) \| kind(1) \| slot(40)`)            |
 | Значения (`Value`, runtime/storage/columnar)                                                                                         | `gql_spec` §5–§6; `disk` §5            | `src/values` (`runtime`, `storage`, `columnar`)                                                              | 🟡 активный, этап спецификаций завершён                     |
 | Диагностика (`StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError`)                                       | —                                      | `src/gql_status`                                                                                             | 🟢                                                          |
-| Изоляция SSI по умолчанию, SI/RC — opt-in                                                                                            | `gql_spec` §17.1                       | `fg-meta` `mvcc.rs`                                                                                          | 🟢                                                          |
-| MVCC + снимки, O(1)-индексы конфликтов, predicate locking                                                                            | `gql_spec` §17                         | `fg-meta` `mvcc.rs`, `mvcc_persist.rs`                                                                       | 🟢 режим 1 / 🔴 режим 2                                     |
+| Изоляция Serializable по умолчанию, SI/RC — opt-in                                                                                   | `gql_spec` §17.1                       | `src/datastore.rs`; `fg-meta` используется только как критически проверяемый референс                        | 🟢 Rust API режима 1 / 🔴 синтаксис `BEGIN`                 |
+| MVCC, COW-снимки, atom-level FCW и точные predicate reads                                                                            | `gql_spec` §17                         | `src/datastore.rs`, `src/collections/cow_vec.rs`, `src/values/runtime/graph`                                 | 🟢 RAM режима 1 / 🔴 durability и режим 2                   |
 | Журнал (frame-WAL, уровень БД)                                                                                                       | `disk` §22–§23                         | `mvcc_persist.rs` → `crates/storage_engine`                                                                  | 🟡 логический WAL режима 1 есть; frame-WAL режима 2 — новое |
 | Snapshot / store, сегментная ротация                                                                                                 | `disk` §7                              | `fg-meta` `store.rs`                                                                                         | 🟢                                                          |
 | Direct/Async I/O, BufferPool (Clock-Pro)                                                                                             | `disk` §2                              | `fg-meta` `io_sync`/`io_async`/`async_io`, `buffer_pool.rs`; `crates/storage_engine/io`                      | 🟢 / 🟡                                                     |
@@ -67,7 +67,7 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | Алгоритмы traversal (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA/MST/cuts)                                                                 | `gql_spec` §13.4                       | `fg-meta` `traversal.rs`                                                                                     | 🟢 референс                                                 |
 | Лексер / парсер (reblessive, `TokenBuffer<4>`)                                                                                       | `gql_grammar`                          | `src/syn` (`lexer.rs`, `parser.rs`, `ast.rs`)                                                                | 🟡 read-only срез                                           |
 | AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/syn/ast.rs`; публичный вход `gql::parse`                                                                | 🟡 read-only срез                                           |
-| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/gql`; `QueryResult` готов, `Datastore` ещё не подключён                                                 | 🟡 внутренний executor                                      |
+| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/datastore.rs` → `src/gql`                                                                               | 🟢 read-only `SELECT`/`LET`/`RETURN`                        |
 | Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql` (будущий вертикальный этап)                                                                        | 🔴 новое                                                    |
 | `PageManager` / `DiskMetaGraph` / disk-страницы                                                                                      | `gql_tech` §10; формат — `disk` §9–§21 | `crates/storage_engine` (`store`, `layout`): `NodeRecord`/`EdgeRecord`/`PropertyRecord`, `FerrosGrynnLayout` | 🟡 каркас                                                   |
 | `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`                                                    | 🟡 runtime `RecordId` готов; disk refs — новые              |
@@ -475,19 +475,55 @@ Disk-backed режим 2. Зависит от A.
 
 ### Область D. MVCC и транзакции (SSI) — P2
 
-Зависит от C. Референс — `fg-meta` `mvcc.rs`.
+RAM-подэтап режима 1 не зависит от C: отсутствие WAL означает отсутствие durability, но не
+должно блокировать корректные атомарность и изоляцию в пределах процесса. `fg-meta/mvcc.rs`
+остаётся референсом сценариев, а не кодом для копирования: прототип назначает version по
+`start_ts`, публикует незакоммиченные записи и имеет окно между validation и publication.
 
-- **SSI по умолчанию** 🟢 — уже реализован; SI/RC — opt-in (`ISOLATION LEVEL …`).
-- **Снимки** 🟢/🔴 — снимок на весь запрос; чтение параметризовано `snapshot: Lsn` (§3.3).
-- **`mvcc.rs` для режима 2** 🟡 — `VersionChain<T>` хранит typed T; для диска версии — bytes:
-  использовать `MvccStore<Vec<u8>, BytesCodec>` как есть (bytes = сериализованный `PropertyMap`);
-  убедиться, что `MvccManager` корректно работает с `DiskMetaGraph`. Изменения кода минимальны.
-- **Graph-специфичная консистентность** 🔴 — при явном понижении до SI обязателен
-  `ASSERT INVARIANTS` (структурные инварианты `DAG`/`TREE`/`BIPARTITE`).
+- **`Datastore` режима 1** 🟢 — единый immutable root базы, глобальные `commit_ts`, одна короткая
+  commit-секция и приватный write-set. Изменения нескольких графов, таблиц и каталога публикуются
+  одной заменой root; поздний commit не виден более старому snapshot.
+- **COW-снимки** 🟢 — `CowVec` делит chunks колонок, allocator и adjacency; immutable snapshot не
+  клонирует всю SoA. Atom-version index также chunked и различает поколения переиспользованного
+  slot. `incidence` general-графа делится целиком и копируется только при структурной записи.
+- **Уровни изоляции** 🟢 в Rust API — `Serializable` по умолчанию, явные `Snapshot` и
+  `ReadCommitted`; один вызов `Transaction::execute` всегда удерживает один immutable root, а RC
+  меняет root между вызовами. Текущий вертикальный срез считает весь переданный `Program` одной
+  execution unit; refresh между несколькими top-level statements одного `Program` и синтаксис
+  GrynQL `BEGIN ISOLATION LEVEL` остаются 🔴.
+- **Serializable validation** 🟢 — консервативный SSI-вариант: любая исходящая
+  rw-антизависимость завершает транзакцию `FG-40001`. Это корректнее прототипа и может давать
+  больше abort, чем детекция только dangerous structures; переход нужен лишь по измеренной доле
+  abort. Read-only snapshot не участвует в проверке и не получает serialization abort.
+- **Точные предикаты** 🟢 для исполняемого среза `WHERE` — matcher использует тот же typed
+  expression evaluator; commit проверяет только атомы из COW-журнала изменений после snapshot.
+  Scan идёт в стабильном порядке `RecordId`. Property-изменение строки, которая не входила и не
+  вошла в предикат, конфликт не создаёт.
+- **Fine-grained merge** 🟢 — first-committer-wins на одном atom/graph-properties; изменения
+  разных атомов одного графа сливаются поверх последнего root. После merge family заново
+  валидируется, поэтому `Tree`/`RootedTree`/`Forest`/`Dag`/`Hypergraph` не могут опубликовать
+  нарушающий тип результат даже при явных SI/RC. `GraphWriteView` является blind-write API:
+  прикладное чтение, влияющее на решение, обязано пройти через `GraphRef::read(&tx)` до mutable
+  borrow, чтобы попасть в serializable read-set; tracked family guard нужен только если этот
+  контракт окажется неудобным на практике.
+- **Ограничения ресурсов** 🟡 — логическая оценка write-set ограничена 256 MiB, возраст snapshot —
+  300 секунд по умолчанию; структурированные статусы `FG-54F07` и `FG-25F01`. Точный
+  allocation-time учёт крупных значений требует tracked write guards и остаётся 🔴; текущая
+  проверка commit не является heap quota.
+- **Durability режима 1 и режим 2** 🔴 — WAL/snapshot/recovery намеренно не входят в текущий
+  in-memory этап и зависят от C. Код `fg-meta/mvcc_persist.rs` нельзя подключать до согласования
+  frame-WAL.
 
 ### Область E. Схема и каталог — P3
 
-- **`src/schema/`** 🔴 — `SchemaCatalog`; `TableDefinition`, `FieldDefinition`, `IndexDefinition`,
+- **In-memory `TableSchema`** 🟢 — имя таблицы, `GraphRef`, `TableKind`, упорядоченные typed-поля;
+  `id: record` неявно добавляется query adapter, а scan режима 1 временно использует совпадающую
+  часть `RecordId.table` как proxy признака принадлежности таблице; отдельный membership
+  component/primary index относится к полному `src/schema/`. Имена полей заранее интернируются
+  append-only методом `Datastore::intern_property`, поэтому конкурентный commit не может переназначить
+  `PropertyKeyId`; schema и graph catalog коммитятся атомарно. Удалить graph, пока на него
+  ссылается таблица, нельзя без удаления этой таблицы в той же транзакции.
+- **Полный `src/schema/`** 🔴 — `SchemaCatalog`; `TableDefinition`, `FieldDefinition`, `IndexDefinition`,
   `EventDefinition`, `FunctionDefinition`, `AnalyzerDefinition`, `ParamDefinition`
   (`disk_storage_spec.md` §18). Хранится в системном пространстве (`graph_id = 0`).
 
@@ -553,10 +589,11 @@ storage-интеграция зависит от B.
 
 - **Физические операторы** 🟡 — эталонный sync pull `RowCursor::next`; реализованы
   `ScanCursor`, `FilterCursor`, `ProjectCursor`, `LimitCursor`, позиционный `Row<Vec<Value>>`.
-- **Storage boundary** 🟡 — crate-private `QueryRead` (`snapshot`, `catalog`, `scan`, `get`) и
-  тестовый adapter; наружу идут только декодированные `Value` и `RecordId`, не `TypeTag`/`AtomId`.
-- **`QueryResult`** 🟡 — kind, elapsed time и `FerrosGrynnResult<Outcome<Value>>`; подключение
-  `Datastore::execute` выполняется после утверждения `PageManager` adapter.
+- **Storage boundary** 🟢 для режима 1 — crate-private `QueryRead` (`snapshot`, `catalog`, `scan`,
+  `get`) подключён к `Transaction`; наружу идут только `Value` и `RecordId`, не
+  `TypeTag`/`AtomId`. Disk adapter остаётся 🔴.
+- **`QueryResult`** 🟢 для read-only среза — `Datastore::execute` и `Transaction::execute`
+  выполняют `LET`/`RETURN`/`SELECT` на одном snapshot; `SELECT` сканирует по `RecordId`.
 - **Batch/Arrow/async/parallel** 🔴 — только после измерений; row pull остаётся эталоном
   корректности.
 - Кооперативная отмена и таймауты (`TIMEOUT`/`statement_timeout_ms`).
@@ -637,9 +674,11 @@ storage-интеграция зависит от B.
 - **Фаза 1.5 — свойства и ECS sidecar** (P2): ✅ PropertyMap benchmarks/dictionary,
   generation-aware SparseSet и PropertyColumn; `GraphWorkspace` продолжается в этапе 4.
 - **Фаза 2 — страничное хранилище** (P2): Область B + интеграция BufferPool.
-- **Фаза 3 — журнал и восстановление** (P2): Область C + D (снимки, чтение на снимке).
-- **Фаза 4 — query-конвейер MVP** (P2–P3): H → I → J/K/L, доведение `Datastore::execute`
-  сначала для in-memory режима 1.
+- **Фаза 3a — in-memory MVCC** (P2): ✅ RAM-часть Области D, COW-снимки, atom-level merge,
+  serializable validation и точные предикаты.
+- **Фаза 3b — журнал и восстановление** (P2): Область C + durability-часть D.
+- **Фаза 4 — query-конвейер MVP** (P2–P3): 🟡 H → I → J/K/L; read-only
+  `Datastore::execute` для режима 1 подключён, optimizer/traversal остаются.
 - **Фаза 5 — схема, статистика, индексы** (P3–P4): E, F, G (Label/BTree/Count + bulk),
   подключение к оптимизатору.
 - **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, R-tree; N (полная
