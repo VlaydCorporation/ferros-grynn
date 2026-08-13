@@ -118,7 +118,7 @@ present=1, valid=1    → значение
 - Текущий Arrow round-trip нативно покрывает `bool`, `int`, `float`, `decimal`, `string`,
   `bytes`, `uuid`, `ulid`; несовместимые поддержанные scalar-типы сохраняются как dense union
   без неявной coercion. Nested/runtime-only значения получают доменную ошибку до появления
-  `Binary(StorageValue)` fallback на этапе 5.
+  `Binary(StorageValue)` fallback на этапе интеграции с владельцем decode-контекста batch.
 - DataFusion получает отдельные скрытые `__fg_presence_<key_id>` boolean-поля: планировщик
   по-прежнему может различить `IS NONE` и `IS NULL`, хотя Arrow validity представляет оба
   состояния как null.
@@ -466,7 +466,8 @@ LiveEvent::Conflict {
     - Реализован `PropertyBatch`: `RecordBatch`, битовые presence sidecars, двунаправленный
       `PropertyKeyId ↔ Arrow field`, metadata validation, native scalar arrays и dense union.
     - DataFusion подключён только поверх прошедшего Arrow round-trip; memory table получает
-      скрытые presence-поля. Nested `Binary(StorageValue)` fallback зависит от этапа 5.
+      скрытые presence-поля. Nested `Binary(StorageValue)` fallback зависит от владельца
+      decode-контекста batch и остаётся этапом интеграции.
 
 4. **Графовое ядро — ✅ выполнен функциональный контур**
     - Универсальный `Graph` реализован как general SoA с node/edge, V–V/V–E/E–V/E–E,
@@ -482,8 +483,8 @@ LiveEvent::Conflict {
     - `GraphRead` объединяет full in-memory, transaction-bound `DiskGraphView` и hybrid
       materialization. `query_to_memory` возвращает точный запрошенный тип, не удерживает
       исходный guard и для mutable-результата сохраняет origin mapping, dirty-set и explicit
-      `flush`. Подключение адаптера к реальному `PageManager` остаётся этапом 5 вместе со
-      storage engine.
+      `flush`. Подключение адаптера к реальному `PageManager` остаётся этапом страничного
+      хранилища вместе со storage engine.
     - Добавлен `GraphWorkspace` с отдельными persistent/derived ECS pools, привязкой к
       `(identity, revision)`, удалением компонентов освобождённых атомов и обязательной
       invalidation derived pools после канонической мутации.
@@ -504,19 +505,30 @@ LiveEvent::Conflict {
       cross-family conversions, disk-adapter против hybrid, Path `Arc` clone против копирования
       шагов, live publication и full-SoA delta baseline.
 
-5. **StorageValue и storage engine**
-    - Ввести внутренний `StorageValue`, содержащий дисковые формы: `key_id`, `table_id`, `tz_id`, `DiskAtomRef`, decimal `i128+scale` и нормализованные структуры коллекций.
-    - Преобразование разделить на:
-        - `Value → StorageValue` с mutable encode-контекстом интернирования;
-        - `StorageValue → Value` с decode-контекстом разрешения строк, таблиц, часовых поясов и ссылок.
-    - Преобразования должны потреблять `StorageValue`, чтобы переносить объекты кучи без повторных аллокаций, где представления совпадают.
-    - Реализовать ручной versioned codec для формата из `disk_storage_spec.md`: canonical LEB128, little-endian payload, UTF-8 validation, отсортированные set и object по `key_id`, проверка duplicate keys и всех размерностей.
-    - Реализовать canonical codec, decode limits и rkyv archive envelope.
-    - Добавить `DecodeLimits` для глубины, длины коллекций, строк и общего allocation budget; повреждённые данные никогда не должны приводить к panic или неконтролируемому выделению памяти.
-    - Отделить обычный value codec от order-preserving кодирования B+tree. Для object-части `RecordId` канонический порядок задаётся лексикографически по UTF-8 ключу; полное индексирование произвольного object остаётся запрещённым.
-    - Перенести `storage_engine` в основную кодовую базу, удалить его дублирующий `PropertyValue`, передавать между слоями encoded bytes.
-    - Ошибки codec/conversion оформить новыми статусами через `define_status_codes!`.
-    - Соединить Mode 1, Mode 2 и Mode 3 через общий `GraphRead`.
+5. **StorageValue и codec — ✅ выполнено**
+    - Введены внутренние `StorageValue`/`StorageValueRef`, `TypeTag`, дисковые формы
+      `key_id`, `table_id`, `tz_id`, `DiskAtomRef`, decimal `i128+scale`, graph/qualified refs и
+      нормализованные коллекции.
+    - Реализованы потребляющие преобразования `Value → StorageValue` с mutable
+      `EncodeContext` и `StorageValue → Value` с borrowed `DecodeContext`. Контексты разрешают
+      property/table/time-zone dictionaries, atom refs и graph refs; runtime-only значения
+      отклоняются доменным статусом.
+    - Ручной canonical codec v1 покрывает полный реестр `disk_storage_spec.md §5.2`: shortest
+      uLEB128/zigzag, little-endian payload, UTF-8, все geometry/vector формы, duration/range,
+      строгий порядок set, property-object по `key_id` и RecordId-object по UTF-8 ключу.
+    - `DecodeLimits` проверяет глубину, длины коллекций/строк/blob и суммарный allocation budget
+      до `reserve`; повреждённые данные возвращают `Domain::Storage`, не приводя к panic или
+      неконтролируемому выделению.
+    - Добавлен envelope rkyv-архивов v1: `FGAR + version + schema_id + payload_length +
+      CRC32/ISO-HDLC + payload`. Canonical value codec от rkyv не зависит.
+    - Обычный value codec не используется как B+tree key codec. Order-preserving codec остаётся
+      отдельной задачей области индексов.
+    - Полноценный перенос `storage_engine`, страницы, I/O, WAL и disk-backed `GraphRead` явно
+      вынесены в этап страничного хранилища; сырой `crates/storage_engine` не переносится
+      автоматически. `Binary(StorageValue)` для Arrow подключается на этапе интеграции, когда
+      batch сможет владеть нужным decode-контекстом.
+    - Добавлены статусы `FG-22S01..FG-22S07` и `FG-54S01`, round-trip всех тегов и негативные
+      тесты тегов, LEB128, UTF-8, порядка, размерностей, лимитов и archive checksum.
 
 6. **Интеграция**
     - Подключить graph/query return matrix.

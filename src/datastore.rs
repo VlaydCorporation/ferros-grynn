@@ -91,6 +91,15 @@ pub struct TransactionOptions {
 	pub access: TransactionAccess,
 }
 
+impl TransactionOptions {
+	pub fn new(isolation: IsolationLevel, access: TransactionAccess) -> Self {
+		Self {
+			isolation,
+			access,
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TableKind {
@@ -139,7 +148,9 @@ impl TableSchema {
 		kind: TableKind,
 		fields: Fields,
 	) -> FerrosGrynnResult<Self>
-	where IntoText: Into<Text>, Fields: IntoIterator<Item = TableField>
+	where
+		IntoText: Into<Text>,
+		Fields: IntoIterator<Item = TableField>,
 	{
 		let name = name.into();
 		if name.as_str().is_empty() {
@@ -397,7 +408,10 @@ impl Datastore {
 
 	/// Interns an append-only property name before it is used in graph values
 	/// or table schemas.
-	pub fn intern_property<IntoText: Into<Text>>(&self, name: IntoText) -> FerrosGrynnResult<PropertyKeyId> {
+	pub fn intern_property<IntoText: Into<Text>>(
+		&self,
+		name: IntoText,
+	) -> FerrosGrynnResult<PropertyKeyId> {
 		let name = name.into();
 		if name.as_str().is_empty() {
 			return Err(FerrosGrynnError::invalid_argument("property name must not be empty"));

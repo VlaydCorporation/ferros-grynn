@@ -121,6 +121,7 @@ The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optim
 - Use types errors from `src/gql_status` for fallible APIs, don't use `anyhow` - it erases errors; NEWER use `.expect()` or another panics.
 - Never use `.unwrap_or_default()` when debugging - it masks errors.
 - Follow the Clippy coding rules noted in `Cargo.toml` and their configurations in the `clippy.toml` file.
+- Completely cover code (includes private modules) with comments, including Panics, Errors and Safety sections, as required by Clippy.
 - Performance matters: think about impact of every change.
 - Don't add dependencies without confirmation.
 

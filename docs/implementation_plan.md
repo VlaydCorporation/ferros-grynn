@@ -396,13 +396,14 @@ pub struct GraphWorkspace<G> {
 зависимости и состав работ. Детализация по существующим файлам (`fg-meta` / `src`) взята из
 `disk_storage_spec.md` §30.1–§30.7.
 
-**Этапы 1–4 плана `values`: ✅ завершены на уровне runtime-контрактов.** Спецификации синхронизированы; реализованы
+**Этапы 1–5 плана `values`: ✅ завершены на уровне runtime и value-codec контрактов.** Спецификации синхронизированы; реализованы
 runtime scalars и collections, `Value`/`ValueKind`/`Type`, exact `Number`, temporal,
 UUID/ULID, `RecordId`, geometry/vector, runtime-only identity, graph foundation,
 generation-aware ECS, Arrow/DataFusion property materialization, специализированные graph
-storage families, `GraphWorkspace`, three-mode `GraphRead`, Path и LiveGraph. Следующий
-исполняемый этап — `StorageValue`, codec v1 и перенос storage engine; `Binary(StorageValue)`
-columnar fallback появляется вместе с codec на этапе 5.
+storage families, `GraphWorkspace`, three-mode `GraphRead`, Path и LiveGraph, а также внутренние
+`StorageValue`/контексты, canonical codec v1, `DecodeLimits` и rkyv envelope. Следующий
+исполняемый этап — интеграция query/columnar adapters; полноценные страницы, I/O и перенос
+storage engine относятся к отдельной области B.
 
 ### Область A. Система типов и значения — P1 (блокирующая)
 
@@ -425,12 +426,14 @@ columnar fallback появляется вместе с codec на этапе 5.
   independent presence/validity и smallest-pool read-only joins. Независимого entity allocator
   нет; revision-bound `GraphWorkspace` разделяет persistent и derived sidecars и инвалидирует
   производные pools после graph mutation.
-- **`src/values/storage`** 🔴 — `StorageValue`, borrowed `StorageValueRef`, encode/decode
-  contexts, `TypeTag` из `disk_storage_spec.md` §5.2, canonical codec v1 и `DecodeLimits`.
+- **`src/values/storage`** 🟢 — реализованы `StorageValue`, borrowed `StorageValueRef`,
+  encode/decode contexts, полный `TypeTag` из `disk_storage_spec.md` §5.2, canonical codec v1,
+  `DecodeLimits` и проверяемый rkyv archive envelope. Codec не зависит от storage engine.
 - **`src/values/columnar`** 🟢/🟡 — реализованы `PropertyBatch`, presence bitmaps,
   `PropertyKeyId ↔ Arrow field`, metadata validation, native scalar arrays, dense union,
   Arrow round-trip и DataFusion `MemTable` со скрытыми presence-полями. Модули feature-gated,
-  runtime от них не зависит. Nested `Binary(StorageValue)` fallback заблокирован до этапа codec.
+  runtime от них не зависит. Nested `Binary(StorageValue)` fallback подключается на этапе
+  интеграции вместе с владельцем decode-контекста batch.
 - **`src/values/runtime/graph`** 🟢 — реализованы production `AtomId`, general SoA с едиными
   `source`/`target` endpoint'ами, отдельные Forest/Dag/Hyper storage families, type-state API,
   widening views и проверяемые owned conversions. `GraphRead` покрывает in-memory,
@@ -646,7 +649,7 @@ storage-интеграция зависит от B.
 | Приоритет            | Область | Компоненты                               | Что делать                                                          |
 |----------------------|---------|------------------------------------------|---------------------------------------------------------------------|
 | **P1** (блокирующий) | A       | `src/values/runtime`                     | ✅ Runtime-фундамент, `ValueKind`, scalars и collections            |
-| **P1**               | A       | `src/values/storage`                     | `StorageValue`, `TypeTag`, canonical codec и decode limits          |
+| **P1**               | A       | `src/values/storage`                     | ✅ `StorageValue`, `TypeTag`, canonical codec и decode limits       |
 | **P1**               | A       | `src/values/runtime/record_id.rs`        | ✅ `RecordId`, `RecordIdPart`                                       |
 | **P2**               | A       | `src/values/columnar`                    | ✅ `PropertyBatch`, Arrow/presence и DataFusion adapter             |
 | **P2**               | A       | `src/values/runtime/graph`               | Graph family/type-state, Path и query return contracts              |
@@ -670,7 +673,7 @@ storage-интеграция зависит от B.
 
 - **Фаза 0 — синхронизация спецификаций**: ✅ завершена; нормативные контракты values,
   graph/path/live и storage codec согласованы.
-- **Фаза 1 — фундамент типов** (P1): ✅ runtime-часть Области A; далее StorageValue/codec.
+- **Фаза 1 — фундамент типов** (P1): ✅ runtime и `StorageValue`/codec части Области A.
 - **Фаза 1.5 — свойства и ECS sidecar** (P2): ✅ PropertyMap benchmarks/dictionary,
   generation-aware SparseSet и PropertyColumn; `GraphWorkspace` продолжается в этапе 4.
 - **Фаза 2 — страничное хранилище** (P2): Область B + интеграция BufferPool.

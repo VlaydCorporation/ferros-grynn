@@ -50,6 +50,11 @@ impl Range {
 		borrow_bound(&self.end)
 	}
 
+	/// Moves both endpoints out of the range without cloning their values.
+	pub fn into_bounds(self) -> (Bound<Value>, Bound<Value>) {
+		(unbox_bound(self.start), unbox_bound(self.end))
+	}
+
 	pub fn contains(&self, value: &Value) -> bool {
 		let compatible = self
 			.start()
@@ -102,6 +107,14 @@ fn box_bound(bound: Bound<Value>) -> Bound<Box<Value>> {
 	match bound {
 		Bound::Included(value) => Bound::Included(Box::new(value)),
 		Bound::Excluded(value) => Bound::Excluded(Box::new(value)),
+		Bound::Unbounded => Bound::Unbounded,
+	}
+}
+
+fn unbox_bound(bound: Bound<Box<Value>>) -> Bound<Value> {
+	match bound {
+		Bound::Included(value) => Bound::Included(*value),
+		Bound::Excluded(value) => Bound::Excluded(*value),
 		Bound::Unbounded => Bound::Unbounded,
 	}
 }

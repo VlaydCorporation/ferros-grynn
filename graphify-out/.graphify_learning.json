@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-11T23:57:04.912115+00:00",
+  "generated_at": "2026-08-11T23:59:49.284840+00:00",
   "nodes": {
     "src_values_runtime_graph_metagraph_metagraph": {
       "code_fingerprint": "87e085f842dd05955ba427c410b9ce75dad21c4bc287c1f7b66191f45e930dd9",
@@ -12,7 +12,7 @@
           "q": "What is MetaGraph?"
         }
       ],
-      "score": 0.965805196,
+      "score": 0.965762744,
       "source_file": "src/values/runtime/graph/metagraph.rs",
       "status": "tentative",
       "uses": 1

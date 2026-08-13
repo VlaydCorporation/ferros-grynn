@@ -4,7 +4,8 @@
 )]
 #![allow(
 	clippy::impl_trait_in_params,
-	reason = "using `impl` in the params makes it easier to generate code in a `define_status_codes` macro."
+	reason = "using `impl` in the params makes it easier to generate code in a \
+	          `define_status_codes` macro."
 )]
 
 use std::{
@@ -956,6 +957,125 @@ define_status_codes!(
 		subcondition: "property dictionary capacity exceeded",
 		message: "The property dictionary has exhausted the available 32-bit key space.",
 	},
+	UnknownStorageTypeTag, "FG-22S01" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "unknown storage value type tag",
+		message: "Storage value tag {tag} at byte offset {offset} is not defined by format version 1.",
+		params: {
+			tag: u64 => DisplayValue,
+			offset: u64 => DisplayValue,
+		},
+	},
+	InvalidStorageValueEncoding, "FG-22S02" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "invalid storage value encoding",
+		message: "Storage value at byte offset {offset} is invalid: {reason}.",
+		params: {
+			offset: u64 => DisplayValue,
+			reason: String => DisplayValue,
+		},
+	},
+	DecimalPrecisionExceeded, "FG-22S03" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "decimal precision exceeds the runtime representation",
+		message: "Decimal mantissa {mantissa} with scale {scale} cannot be represented by rust_decimal.",
+		params: {
+			mantissa: String => DisplayValue,
+			scale: u64 => DisplayValue,
+		},
+	},
+	UnresolvedStorageReference, "FG-22S04" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "unresolved storage reference",
+		message: "The {reference_type} storage reference {reference} is not present in the conversion context.",
+		params: {
+			reference_type: String => ValueType,
+			reference: String => DisplayValue,
+		},
+	},
+	UnsupportedStorageValue, "FG-22S05" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "runtime value is not persistable",
+		message: "Runtime value type {source_type} cannot be represented as StorageValue.",
+		params: {
+			source_type: String => ValueType,
+		},
+	},
+	InvalidArchiveEnvelope, "FG-22S06" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "invalid archive envelope",
+		message: "The versioned archive envelope is invalid: {reason}.",
+		params: {
+			reason: String => DisplayValue,
+		},
+	},
+	StorageContextConflict, "FG-22S07" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "conflicting storage conversion context",
+		message: "The storage conversion context contains conflicting {reference_type} mapping for {reference}.",
+		params: {
+			reference_type: String => ValueType,
+			reference: String => DisplayValue,
+		},
+	},
+	StorageDecodeLimitExceeded, "FG-54S01" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Storage,
+		subcondition: "storage value decode limit exceeded",
+		message: "Decoded {limit} is {actual}, exceeding the configured maximum of {maximum}.",
+		params: {
+			limit: String => Identifier,
+			actual: u64 => DisplayValue,
+			maximum: u64 => DisplayValue,
+		},
+	},
 	QueryParseError, "FG-42001" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -1305,5 +1425,16 @@ mod tests {
 		assert_eq!(dictionary.code().to_string(), "FG-54F04");
 		assert_eq!(dictionary.condition(), Condition::ProgramLimitExceeded);
 		assert_eq!(dictionary.domain(), Domain::Value);
+
+		let storage = StatusObject::new(Status::unknown_storage_type_tag(0x14, 9));
+		assert_eq!(storage.code().to_string(), "FG-22S01");
+		assert_eq!(storage.condition(), Condition::DataException);
+		assert_eq!(storage.domain(), Domain::Storage);
+
+		let storage_limit =
+			StatusObject::new(Status::storage_decode_limit_exceeded("nesting depth", 64, 65));
+		assert_eq!(storage_limit.code().to_string(), "FG-54S01");
+		assert_eq!(storage_limit.condition(), Condition::ProgramLimitExceeded);
+		assert_eq!(storage_limit.domain(), Domain::Storage);
 	}
 }

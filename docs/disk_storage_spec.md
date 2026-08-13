@@ -228,7 +228,7 @@ Runtime использует `rust_decimal::Decimal` напрямую внутр
 - `0` = UTC (по умолчанию)
 - `1 .. 999_999` = ID пояса в IANA timezone dictionary (§16, отдельная секция).
 Хватит на любые пополнения tzdb (2024 год: ~600 поясов).
-- `1_000_000 ..1_172_798` = Фиксированное UTC-смещение.
+- `1_000_000 ..1_172_799` = Фиксированное UTC-смещение.
 Декодирование: offset_seconds = tz_id − 1_000_000 − 86_399 (86_399 — сдвиг для представления отрицательных смещений).
 Диапазон: `−86_399 .. +86_400` секунд (≈ ±24 ч с запасом). Реальный диапазон UTC-смещений: `−43_200 .. +50_400` с.
 
@@ -501,6 +501,11 @@ qualified_atom_ref  →  0x38 + sg_slot(u32 LE) + local_ref(u64 LE)
 `option<T>` не имеет собственного кодирования: `Some(v)` кодируется как `v`, `None` — как
 `none`. Встреча `0x14` в format v1 является `UnknownTypeTag`, а не option payload.
 
+Элементы `set` сортируются лексикографически по полному каноническому байтовому
+представлению; повтор такого представления является decode error. При преобразовании в
+runtime дополнительно запрещены разные байтовые представления, равные по runtime-семантике
+`Value` (например, `int(1)` и `float(1.0)`).
+
 ### 5.3. Кодирование object-ключей
 
 В property-`object` ключи хранятся как `key_id (u32)` из `LabelDictionary` (§16).
@@ -521,11 +526,21 @@ Canonical codec из §5.2 реализуется вручную и версио
 archives, но не определяет вечный формат §5. Каждый archive имеет envelope:
 
 ```text
-magic + format_version + schema_id + payload_length + checksum + rkyv_payload
+magic[4] = "FGAR"
+format_version: u16 LE = 1
+schema_id: u32 LE
+payload_length: u64 LE
+checksum: u32 LE = CRC32/ISO-HDLC от rkyv_payload
+reserved[10] = 0
+rkyv_payload: [u8; payload_length]
 ```
 
-Изменение rkyv schema требует новой версии envelope. `bincode` и `binrw` могут использоваться
-для benchmark/reference tooling, но не задают production value format.
+Decoder требует точного совпадения длины записи, версии, `schema_id`, checksum и 16-байтового
+выравнивания payload до доступа к архивированному корню. Заголовок имеет размер 32 байта,
+поэтому payload сохраняет выравнивание rkyv при чтении всего envelope в `AlignedVec` или из
+выровненного mmap. Изменение rkyv schema требует новой версии envelope. `bincode` и `binrw`
+могут использоваться для
+benchmark/reference tooling, но не задают production value format.
 
 ---
 

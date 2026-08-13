@@ -190,10 +190,10 @@ fn benchmark_path_and_live_publication(criterion: &mut Criterion) {
 	group.bench_function("transaction_atom_commit/4096", |bench| {
 		bench.iter_batched(
 			|| {
-				let mut transaction = store.begin_with(TransactionOptions {
-					isolation: IsolationLevel::Snapshot,
-					access: TransactionAccess::ReadWrite,
-				});
+				let mut transaction = store.begin_with(TransactionOptions::new(
+					IsolationLevel::Snapshot,
+					TransactionAccess::ReadWrite,
+				));
 				if let GraphWriteView::Graph(graph) = transaction.edit_graph(&reference).unwrap() {
 					graph.node_properties_mut(atom).unwrap().insert(0_u32.into(), 1_i64);
 				}
