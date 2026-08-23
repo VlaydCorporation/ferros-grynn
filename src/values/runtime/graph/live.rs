@@ -461,7 +461,8 @@ fn invalid_state(reason: impl Into<String>) -> FerrosGrynnError {
 mod tests {
 	use super::{LiveEvent, LiveGraph, LiveUpdate};
 	use crate::values::{
-		PropertyMap, Value,
+		PropertyMap,
+		Value,
 		runtime::graph::{AtomId, DirtyTarget, Graph, GraphMut, Mutable},
 	};
 

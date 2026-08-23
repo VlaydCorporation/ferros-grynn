@@ -77,7 +77,8 @@ impl Location {
 		span: TextSpan,
 	) -> Result<Self, LocationError> {
 		let end = span.end().ok_or(LocationError::RangeOverflow)?;
-		let start_offset = usize::try_from(span.offset).map_err(|_err| LocationError::OutOfBounds)?;
+		let start_offset =
+			usize::try_from(span.offset).map_err(|_err| LocationError::OutOfBounds)?;
 		let end_offset = usize::try_from(end).map_err(|_err| LocationError::OutOfBounds)?;
 
 		if end_offset > source.len() {
@@ -126,7 +127,11 @@ impl Location {
 	}
 }
 
-#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "line starts at one & column starts at one")]
+#[allow(
+	clippy::expect_used,
+	clippy::missing_panics_doc,
+	reason = "line starts at one & column starts at one"
+)]
 fn line_column_at(source: &str, byte_offset: usize) -> LineColumn {
 	let mut line = 1_u32;
 	let mut column = 1_u32;

@@ -64,7 +64,11 @@ impl<T> PropertyColumn<T> {
 		self.values.get(id)
 	}
 
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "a valid property slot must have a dense value")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "a valid property slot must have a dense value"
+	)]
 	pub fn state(&self, id: AtomId) -> PropertyState<&T> {
 		let Some(index) = self.present.dense_index(id) else {
 			return PropertyState::None;
@@ -77,7 +81,11 @@ impl<T> PropertyColumn<T> {
 		)
 	}
 
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "inserted property must be present")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "inserted property must be present"
+	)]
 	pub fn set(&mut self, id: AtomId, value: T) -> FerrosGrynnResult<Option<T>> {
 		self.ensure_present(id)?;
 		let previous = self.values.insert(id, value)?;
@@ -86,7 +94,11 @@ impl<T> PropertyColumn<T> {
 		Ok(previous)
 	}
 
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "inserted property must be present")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "inserted property must be present"
+	)]
 	pub fn set_null(&mut self, id: AtomId) -> FerrosGrynnResult<Option<T>> {
 		self.ensure_present(id)?;
 		let previous = self.values.remove(id);
@@ -115,7 +127,11 @@ impl<T> PropertyColumn<T> {
 		&self.validity.words
 	}
 
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "replaced property must be present")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "replaced property must be present"
+	)]
 	fn ensure_present(&mut self, id: AtomId) -> FerrosGrynnResult<()> {
 		let prior = self.present.occupant(id);
 		let prior_len = self.present.len();
@@ -206,7 +222,11 @@ impl DenseBitmap {
 		}
 	}
 
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "non-empty bitmap must have a word")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "non-empty bitmap must have a word"
+	)]
 	fn swap_remove(&mut self, index: usize) {
 		assert!(index < self.len, "bitmap index out of bounds");
 		let last = self.len - 1;

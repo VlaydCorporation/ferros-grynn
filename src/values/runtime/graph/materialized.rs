@@ -43,11 +43,11 @@ pub enum MaterializedGraph {
 }
 
 impl GraphRead for MaterializedGraph {
-	type NodeIds<'a>
+	type EdgeIds<'a>
 		= Box<dyn Iterator<Item = AtomId> + 'a>
 	where
 		Self: 'a;
-	type EdgeIds<'a>
+	type NodeIds<'a>
 		= Box<dyn Iterator<Item = AtomId> + 'a>
 	where
 		Self: 'a;

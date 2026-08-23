@@ -30,7 +30,11 @@ pub struct PropertyBatch {
 }
 
 impl PropertyBatch {
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "validated field mapping must be complete")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "validated field mapping must be complete"
+	)]
 	pub fn try_new(
 		record_batch: RecordBatch,
 		presence: Vec<BooleanBuffer>,

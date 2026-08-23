@@ -42,7 +42,10 @@ impl PropertyDictionary {
 		self.names.get(id.get() as usize)
 	}
 
-	pub fn intern<IntoText: Into<Text>>(&mut self, name: IntoText) -> FerrosGrynnResult<PropertyKeyId> {
+	pub fn intern<IntoText: Into<Text>>(
+		&mut self,
+		name: IntoText,
+	) -> FerrosGrynnResult<PropertyKeyId> {
 		let name = name.into();
 		if let Some(id) = self.ids.get(name.as_str()) {
 			return Ok(*id);

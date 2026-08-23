@@ -182,12 +182,12 @@ pub trait IntoGraphWorkspace: GraphRead + Sized {
 impl<G: GraphRead> IntoGraphWorkspace for G {}
 
 impl<G: GraphRead> GraphRead for GraphWorkspace<G> {
-	type NodeIds<'a>
-		= G::NodeIds<'a>
-	where
-		Self: 'a;
 	type EdgeIds<'a>
 		= G::EdgeIds<'a>
+	where
+		Self: 'a;
+	type NodeIds<'a>
+		= G::NodeIds<'a>
 	where
 		Self: 'a;
 

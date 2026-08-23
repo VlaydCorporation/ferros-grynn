@@ -26,7 +26,10 @@ impl StatusReport {
 		}
 	}
 
-	pub fn push<IntoSO: Into<StatusObject>>(&mut self, status: IntoSO) -> Result<(), StatusReportError> {
+	pub fn push<IntoSO: Into<StatusObject>>(
+		&mut self,
+		status: IntoSO,
+	) -> Result<(), StatusReportError> {
 		let status = status.into();
 		Self::ensure_non_error(&status)?;
 		self.statuses.push(status);
@@ -34,7 +37,11 @@ impl StatusReport {
 		Ok(())
 	}
 
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "StatusReport always contains a primary status")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "StatusReport always contains a primary status"
+	)]
 	pub fn primary(&self) -> &StatusObject {
 		self.statuses.first().expect("StatusReport always contains a primary status")
 	}

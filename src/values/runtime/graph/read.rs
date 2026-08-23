@@ -315,10 +315,11 @@ impl<'a> EdgeView<'a> {
 }
 
 pub trait GraphRead {
-	type NodeIds<'a>: Iterator<Item = AtomId> + 'a
+	type EdgeIds<'a>: Iterator<Item = AtomId> + 'a
 	where
 		Self: 'a;
-	type EdgeIds<'a>: Iterator<Item = AtomId> + 'a
+
+	type NodeIds<'a>: Iterator<Item = AtomId> + 'a
 	where
 		Self: 'a;
 

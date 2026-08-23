@@ -56,8 +56,8 @@ impl Array {
 }
 
 impl IntoIterator for Array {
-	type Item = Value;
 	type IntoIter = std::vec::IntoIter<Value>;
+	type Item = Value;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.0.into_iter()
@@ -65,8 +65,8 @@ impl IntoIterator for Array {
 }
 
 impl<'a> IntoIterator for &'a Array {
-	type Item = &'a Value;
 	type IntoIter = Iter<'a, Value>;
+	type Item = &'a Value;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.iter()
@@ -74,8 +74,8 @@ impl<'a> IntoIterator for &'a Array {
 }
 
 impl<'a> IntoIterator for &'a mut Array {
-	type Item = &'a mut Value;
 	type IntoIter = IterMut<'a, Value>;
+	type Item = &'a mut Value;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.iter_mut()

@@ -68,7 +68,8 @@ impl PackedAdjacency {
 
 #[allow(
 	clippy::rc_buffer,
-	reason = "the topological order is built incrementally as a Vec and shared without an additional Vec-to-Arc<[T]> allocation"
+	reason = "the topological order is built incrementally as a Vec and shared without an \
+	          additional Vec-to-Arc<[T]> allocation"
 )]
 #[derive(Debug, Clone)]
 struct DagStorage {

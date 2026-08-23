@@ -89,7 +89,11 @@ impl FerrosGrynnError {
 		Ok(self)
 	}
 
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "critical severity is valid for every error status")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "critical severity is valid for every error status"
+	)]
 	pub fn mark_critical(self) -> Self {
 		self.with_severity(Severity::Critical)
 			.expect("critical severity is valid for every error status")
@@ -108,7 +112,11 @@ impl FerrosGrynnError {
 	}
 
 	/// Returns the root structured FG status.
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "an error chain always contains itself")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "an error chain always contains itself"
+	)]
 	pub fn root(&self) -> &FerrosGrynnError {
 		self.chain().last().expect("an error chain always contains itself")
 	}

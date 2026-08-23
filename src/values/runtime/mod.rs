@@ -568,13 +568,7 @@ impl Display for Value {
 				value.length(),
 			),
 			Self::Graph(value) => {
-				write!(
-					f,
-					"{}({}@{})",
-					value.kind().name(),
-					value.identity(),
-					value.revision(),
-				)
+				write!(f, "{}({}@{})", value.kind().name(), value.identity(), value.revision(),)
 			}
 			Self::Closure(value) => write!(
 				f,

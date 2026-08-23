@@ -87,7 +87,11 @@ impl PropertyMap {
 		self.find(key).is_ok()
 	}
 
-	pub fn insert<IntoValue: Into<Value>>(&mut self, key: PropertyKeyId, value: IntoValue) -> Option<Value> {
+	pub fn insert<IntoValue: Into<Value>>(
+		&mut self,
+		key: PropertyKeyId,
+		value: IntoValue,
+	) -> Option<Value> {
 		let value = value.into();
 		match self.find(key) {
 			Ok(index) => Some(std::mem::replace(&mut self.entries[index].1, value)),
@@ -173,8 +177,8 @@ impl FromIterator<(PropertyKeyId, Value)> for PropertyMap {
 }
 
 impl<'a> IntoIterator for &'a PropertyMap {
-	type Item = (PropertyKeyId, &'a Value);
 	type IntoIter = PropertyIter<'a>;
+	type Item = (PropertyKeyId, &'a Value);
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.iter()

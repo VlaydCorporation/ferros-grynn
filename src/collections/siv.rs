@@ -160,14 +160,20 @@ impl<T> SIV<T> {
 impl<T> Index<Id> for SIV<T> {
 	type Output = T;
 
-	#[allow(clippy::undocumented_unsafe_blocks, reason = "IndexMut trait requirement, left at the user's own risk")]
+	#[allow(
+		clippy::undocumented_unsafe_blocks,
+		reason = "IndexMut trait requirement, left at the user's own risk"
+	)]
 	fn index(&self, index: Id) -> &Self::Output {
 		unsafe { self.data.get_unchecked(self.indices[index]) }
 	}
 }
 
 impl<T> IndexMut<Id> for SIV<T> {
-	#[allow(clippy::undocumented_unsafe_blocks, reason = "IndexMut trait requirement, left at the user's own risk")]
+	#[allow(
+		clippy::undocumented_unsafe_blocks,
+		reason = "IndexMut trait requirement, left at the user's own risk"
+	)]
 	fn index_mut(&mut self, index: Id) -> &mut Self::Output {
 		unsafe { self.data.get_unchecked_mut(self.indices[index]) }
 	}

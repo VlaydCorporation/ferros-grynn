@@ -1,7 +1,4 @@
-#![allow(
-	clippy::min_ident_chars,
-	reason = "short names for macro params"
-)]
+#![allow(clippy::min_ident_chars, reason = "short names for macro params")]
 
 use std::{iter::FusedIterator, marker::PhantomData};
 

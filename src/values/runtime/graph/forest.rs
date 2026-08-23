@@ -189,7 +189,8 @@ impl ForestStorage {
 		if let Some(child) = child {
 			let child_slot = child.slot() as usize;
 			if let Some(parent) = self.parent[child_slot].take()
-				&& let Some(children) = self.children.get_mut(parent.slot() as usize) {
+				&& let Some(children) = self.children.get_mut(parent.slot() as usize)
+			{
 				children.retain(|candidate| *candidate != child);
 			}
 			self.parent_edge[child_slot] = None;

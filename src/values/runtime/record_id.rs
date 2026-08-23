@@ -114,7 +114,8 @@ impl Display for RecordIdPart {
 			Self::Int(value) => Display::fmt(value, f),
 			Self::String(value) => {
 				if string_id_needs_quotes(value) {
-					let escaped = serde_json::to_string(value.as_str()).map_err(|_err| fmt::Error)?;
+					let escaped =
+						serde_json::to_string(value.as_str()).map_err(|_err| fmt::Error)?;
 					f.write_str(&escaped)
 				} else {
 					Display::fmt(value, f)

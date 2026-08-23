@@ -5,8 +5,17 @@ use std::{
 
 use ::arrow::{
 	array::{
-		Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
-		Float64Array, Int64Array, NullArray, StringArray, UnionArray,
+		Array,
+		ArrayRef,
+		BinaryArray,
+		BooleanArray,
+		Decimal128Array,
+		FixedSizeBinaryArray,
+		Float64Array,
+		Int64Array,
+		NullArray,
+		StringArray,
+		UnionArray,
 		builder::FixedSizeBinaryBuilder,
 	},
 	buffer::{BooleanBuffer, ScalarBuffer},
@@ -17,12 +26,24 @@ use ::arrow::{
 use rust_decimal::Decimal;
 
 use super::{
-	ENCODING_METADATA, PROPERTY_KEY_ID_METADATA, PropertyBatch, VALUE_KIND_METADATA, invalid_batch,
+	ENCODING_METADATA,
+	PROPERTY_KEY_ID_METADATA,
+	PropertyBatch,
+	VALUE_KIND_METADATA,
+	invalid_batch,
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{
-		Bytes, Number, PropertyDictionary, PropertyKeyId, PropertyMap, Text, Ulid, Uuid, Value,
+		Bytes,
+		Number,
+		PropertyDictionary,
+		PropertyKeyId,
+		PropertyMap,
+		Text,
+		Ulid,
+		Uuid,
+		Value,
 	},
 };
 

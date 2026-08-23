@@ -46,7 +46,12 @@ pub struct Closure {
 }
 
 impl Closure {
-	pub fn new<Func>(name: Option<Text>, parameters: Vec<Type>, result: Type, function: Func) -> Self
+	pub fn new<Func>(
+		name: Option<Text>,
+		parameters: Vec<Type>,
+		result: Type,
+		function: Func,
+	) -> Self
 	where
 		Func: Fn(&[Value]) -> FerrosGrynnResult<Value> + Send + Sync + 'static,
 	{

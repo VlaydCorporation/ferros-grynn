@@ -93,8 +93,8 @@ where
 }
 
 impl IntoIterator for Object {
-	type Item = (Text, Value);
 	type IntoIter = IntoIter<Text, Value>;
+	type Item = (Text, Value);
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.0.into_iter()
@@ -102,8 +102,8 @@ impl IntoIterator for Object {
 }
 
 impl<'a> IntoIterator for &'a Object {
-	type Item = (&'a Text, &'a Value);
 	type IntoIter = Iter<'a, Text, Value>;
+	type Item = (&'a Text, &'a Value);
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.iter()
@@ -111,8 +111,8 @@ impl<'a> IntoIterator for &'a Object {
 }
 
 impl<'a> IntoIterator for &'a mut Object {
-	type Item = (&'a Text, &'a mut Value);
 	type IntoIter = IterMut<'a, Text, Value>;
+	type Item = (&'a Text, &'a mut Value);
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.iter_mut()

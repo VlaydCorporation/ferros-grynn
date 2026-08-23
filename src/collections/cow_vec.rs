@@ -93,7 +93,11 @@ impl<T: Clone, const CHUNK_LEN: usize> CowVec<T, CHUNK_LEN> {
 		Some(value)
 	}
 
-	#[allow(clippy::expect_used, clippy::missing_panics_doc, reason = "the bounds check guarantees a non-empty CowVec")]
+	#[allow(
+		clippy::expect_used,
+		clippy::missing_panics_doc,
+		reason = "the bounds check guarantees a non-empty CowVec"
+	)]
 	pub(crate) fn swap_remove(&mut self, index: usize) -> T {
 		assert!(index < self.len, "swap_remove index out of bounds");
 

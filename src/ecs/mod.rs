@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::missing_panics_doc, reason = "pool key and concrete type must agree")]
+#![allow(
+	clippy::expect_used,
+	clippy::missing_panics_doc,
+	reason = "pool key and concrete type must agree"
+)]
 
 //! Runtime ECS sidecar for graph atoms.
 //!
