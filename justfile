@@ -1,7 +1,7 @@
 # Build lib
 [group('dev')]
 build:
-    cargo build
+    cargo +nightly build
 
 # Check compilation
 [group('dev')]

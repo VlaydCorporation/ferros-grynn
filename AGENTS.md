@@ -89,7 +89,7 @@ Toolchain: **Rust edition 2024** (needs Rust 1.85+). A **nightly** toolchain is 
 
 ```
 # Build lib
-cargo build
+just build
 
 # Full code verification (REQUIRED before commits)
 just all-check
