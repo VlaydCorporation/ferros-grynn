@@ -122,6 +122,7 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.21"
 
 [dev-dependencies]
+memmap2 = "0.9.11"
 proptest = "1.11.0"
 
 # See: https://rust-lang.github.io/rust-clippy/master/index.html

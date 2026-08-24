@@ -52,30 +52,30 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 
 ### 1.1. Согласовано / реализовано / каркас
 
-| Область                                                                                                                              | Контракт (спека)                       | Модуль                                                                                                       | Статус                                                      |
-|--------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|--------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------|
-| Модель данных `G = ⟨V, MV, E, ME⟩`                                                                                                   | `gql_spec` §3                          | `fg-meta` `graph.rs` → `src/values/runtime/graph`                                                            | 🟢 референс                                                 |
-| `AtomId` (генерационный, kind-бит, u64)                                                                                              | `disk` §9                              | `fg-meta/id.rs` → `src/values/runtime/graph`                                                                 | 🟢 foundation (`gen(23) \| kind(1) \| slot(40)`)            |
-| Значения (`Value`, runtime/storage/columnar)                                                                                         | `gql_spec` §5–§6; `disk` §5            | `src/values` (`runtime`, `storage`, `columnar`)                                                              | 🟡 активный, этап спецификаций завершён                     |
-| Диагностика (`StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError`)                                       | —                                      | `src/gql_status`                                                                                             | 🟢                                                          |
-| Изоляция Serializable по умолчанию, SI/RC — opt-in                                                                                   | `gql_spec` §17.1                       | `src/datastore.rs`; `fg-meta` используется только как критически проверяемый референс                        | 🟢 Rust API режима 1 / 🔴 синтаксис `BEGIN`                 |
-| MVCC, COW-снимки, atom-level FCW и точные predicate reads                                                                            | `gql_spec` §17                         | `src/datastore.rs`, `src/collections/cow_vec.rs`, `src/values/runtime/graph`                                 | 🟢 RAM режима 1 / 🔴 durability и режим 2                   |
-| Журнал (frame-WAL, уровень БД)                                                                                                       | `disk` §22–§23                         | `mvcc_persist.rs` → `crates/storage_engine`                                                                  | 🟡 логический WAL режима 1 есть; frame-WAL режима 2 — новое |
-| Snapshot / store, сегментная ротация                                                                                                 | `disk` §7                              | `fg-meta` `store.rs`                                                                                         | 🟢                                                          |
-| Direct/Async I/O, BufferPool (Clock-Pro)                                                                                             | `disk` §2                              | `fg-meta` `io_sync`/`io_async`/`async_io`, `buffer_pool.rs`; `crates/storage_engine/io`                      | 🟢 / 🟡                                                     |
-| Подграфы (`SubGraph`, `TreeSubGraph`, `DagSubGraph`, …)                                                                              | `gql_spec` §16                         | `fg-meta` `subgraph.rs`                                                                                      | 🟢 референс                                                 |
-| Алгоритмы traversal (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA/MST/cuts)                                                                 | `gql_spec` §13.4                       | `fg-meta` `traversal.rs`                                                                                     | 🟢 референс                                                 |
-| Лексер / парсер (reblessive, `TokenBuffer<4>`)                                                                                       | `gql_grammar`                          | `src/syn` (`lexer.rs`, `parser.rs`, `ast.rs`)                                                                | 🟡 read-only срез                                           |
-| AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/syn/ast.rs`; публичный вход `gql::parse`                                                                | 🟡 read-only срез                                           |
-| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/datastore.rs` → `src/gql`                                                                               | 🟢 read-only `SELECT`/`LET`/`RETURN`                        |
-| Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql` (будущий вертикальный этап)                                                                        | 🔴 новое                                                    |
-| `PageManager` / `DiskMetaGraph` / disk-страницы                                                                                      | `gql_tech` §10; формат — `disk` §9–§21 | `crates/storage_engine` (`store`, `layout`): `NodeRecord`/`EdgeRecord`/`PropertyRecord`, `FerrosGrynnLayout` | 🟡 каркас                                                   |
-| `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`                                                    | 🟡 runtime `RecordId` готов; disk refs — новые              |
-| `SchemaCatalog`                                                                                                                      | `disk` §18                             | `src/schema` (нов.)                                                                                          | 🔴 новое                                                    |
-| `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats` (нов.)                                                                                           | 🔴 новое                                                    |
-| Индексы (Label/BTree/Count/Fulltext/HNSW/R-tree/…)                                                                                   | `disk` §20                             | `src/index` (нов.)                                                                                           | 🔴 новое                                                    |
-| Changefeed / Live                                                                                                                    | `gql_spec` §21, `disk` §21             | `src/changefeed` (нов.)                                                                                      | 🔴 новое                                                    |
-| Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql` (`analysis.rs`, `ir.rs`, `execution.rs`)                                                           | 🟡 read-only срез; optimizer/traversal впереди              |
+| Область                                                                                                                              | Контракт (спека)                       | Модуль                                                                                | Статус                                                      |
+|--------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|---------------------------------------------------------------------------------------|-------------------------------------------------------------|
+| Модель данных `G = ⟨V, MV, E, ME⟩`                                                                                                   | `gql_spec` §3                          | `fg-meta` `graph.rs` → `src/values/runtime/graph`                                     | 🟢 референс                                                 |
+| `AtomId` (генерационный, kind-бит, u64)                                                                                              | `disk` §9                              | `fg-meta/id.rs` → `src/values/runtime/graph`                                          | 🟢 foundation (`gen(23) \| kind(1) \| slot(40)`)            |
+| Значения (`Value`, runtime/storage/columnar)                                                                                         | `gql_spec` §5–§6; `disk` §5            | `src/values` (`runtime`, `storage`, `columnar`)                                       | 🟡 активный, этап спецификаций завершён                     |
+| Диагностика (`StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError`)                                       | —                                      | `src/gql_status`                                                                      | 🟢                                                          |
+| Изоляция Serializable по умолчанию, SI/RC — opt-in                                                                                   | `gql_spec` §17.1                       | `src/datastore.rs`; `fg-meta` используется только как критически проверяемый референс | 🟢 Rust API режима 1 / 🔴 синтаксис `BEGIN`                 |
+| MVCC, COW-снимки, atom-level FCW и точные predicate reads                                                                            | `gql_spec` §17                         | `src/datastore.rs`, `src/collections/cow_vec.rs`, `src/values/runtime/graph`          | 🟢 RAM режима 1 / 🔴 durability и режим 2                   |
+| Журнал (frame-WAL, уровень БД)                                                                                                       | `disk` §22–§23                         | `src/storage` + transport-идеи `fg-meta/mvcc_persist.rs`                              | 🟡 логический WAL режима 1 есть; frame-WAL режима 2 — новое |
+| Snapshot / store, сегментная ротация                                                                                                 | `disk` §7                              | `fg-meta` `store.rs`                                                                  | 🟢                                                          |
+| Sync Direct I/O, затем BufferPool и optional Native Async                                                                            | `disk` §2                              | production `src/storage`; `fg-meta` — только референс сценариев                       | 🟢 Windows sync-gate / 🟡 Linux+soak / 🔴 async             |
+| Подграфы (`SubGraph`, `TreeSubGraph`, `DagSubGraph`, …)                                                                              | `gql_spec` §16                         | `fg-meta` `subgraph.rs`                                                               | 🟢 референс                                                 |
+| Алгоритмы traversal (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA/MST/cuts)                                                                 | `gql_spec` §13.4                       | `fg-meta` `traversal.rs`                                                              | 🟢 референс                                                 |
+| Лексер / парсер (reblessive, `TokenBuffer<4>`)                                                                                       | `gql_grammar`                          | `src/syn` (`lexer.rs`, `parser.rs`, `ast.rs`)                                         | 🟡 read-only срез                                           |
+| AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/syn/ast.rs`; публичный вход `gql::parse`                                         | 🟡 read-only срез                                           |
+| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/datastore.rs` → `src/gql`                                                        | 🟢 read-only `SELECT`/`LET`/`RETURN`                        |
+| Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql` (будущий вертикальный этап)                                                 | 🔴 новое                                                    |
+| `PageManager` / `DiskMetaGraph` / disk-страницы                                                                                      | `gql_tech` §10; формат — `disk` §9–§21 | `src/storage`; незавершённый `crates/storage_engine` сверяется и затем удаляется      | 🟡 sync-фундамент                                           |
+| `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`                             | 🟡 runtime `RecordId` готов; disk refs — новые              |
+| `SchemaCatalog`                                                                                                                      | `disk` §18                             | `src/schema` (нов.)                                                                   | 🔴 новое                                                    |
+| `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats` (нов.)                                                                    | 🔴 новое                                                    |
+| Индексы (Label/BTree/Count/Fulltext/HNSW/R-tree/…)                                                                                   | `disk` §20                             | `src/index` (нов.)                                                                    | 🔴 новое                                                    |
+| Changefeed / Live                                                                                                                    | `gql_spec` §21, `disk` §21             | `src/changefeed` (нов.)                                                               | 🔴 новое                                                    |
+| Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql` (`analysis.rs`, `ir.rs`, `execution.rs`)                                    | 🟡 read-only срез; optimizer/traversal впереди              |
 
 ### 1.2. Требует согласования / открытые вопросы
 
@@ -134,7 +134,11 @@ src/
       datafusion.rs   -- batch integration
 
   storage/
-    mod.rs            -- PageManager trait, DataFileKind, constants
+    mod.rs            -- crate-private storage boundary
+    page.rs           -- AlignedPage, typed PageHeader fields, portable checksum codec
+    direct.rs         -- sync positional Direct I/O (Linux/Windows)
+    buffer_pool.rs    -- Clock-Pro после раннего I/O-gate
+    page_manager.rs   -- PageManager, PageGuard, StorageSnapshot
     superblock.rs     -- StorageSuperblock, NamespaceSuperblock, DatabseSuperblock, GraphSuperblock
     node_pages.rs     -- NodeHotSlot, NodeHotPage
     edge_pages.rs     -- EdgeHotSlot, EdgeHotPage
@@ -247,23 +251,35 @@ Mutable/live/snapshot-bound graph objects не помещаются в `Value`. 
 параметризовано снимком.
 
 ```rust
-pub trait PageManager: Send + Sync {
+pub(crate) struct StorageSnapshot {
+    pub(crate) commit_ts: CommitTs,
+    pub(crate) visible_lsn: Lsn,
+}
+
+pub(crate) trait PageManager: Send + Sync {
     fn begin_tx(&self) -> TxHandle;
-    fn alloc_page(&self, tx: &TxHandle, key: PageKey) -> io::Result<u64>;
-    fn free_page(&self, tx: &TxHandle, key: PageKey) -> io::Result<()>;
-    /// Чтение всегда параметризовано снимком: сначала индекс версий, затем .fgb
-    fn read_page(&self, key: PageKey, snapshot: Lsn, buf: &mut [u8; PAGE_SIZE]) -> io::Result<()>;
+    fn alloc_page(&self, tx: &TxHandle, key: PageKey) -> FerrosGrynnResult<u64>;
+    fn free_page(&self, tx: &TxHandle, key: PageKey) -> FerrosGrynnResult<()>;
+    /// Guard pin'ит immutable frame и не переживает manager/transaction.
+    fn read_page(&self, key: PageKey, snapshot: StorageSnapshot)
+        -> FerrosGrynnResult<PageGuard<'_>>;
+    fn read_pages(&self, keys: &[PageKey], snapshot: StorageSnapshot)
+        -> FerrosGrynnResult<Vec<PageGuard<'_>>>;
     /// Запись — новый фрейм в журнал; LSN назначает журнал, не вызывающий
-    fn write_frame(&self, tx: &TxHandle, key: PageKey, buf: &[u8; PAGE_SIZE]) -> io::Result<Lsn>;
-    fn commit_tx(&self, tx: TxHandle) -> io::Result<CommitTs>;
+    fn write_frame(&self, tx: &TxHandle, key: PageKey, page: &AlignedPage)
+        -> FerrosGrynnResult<Lsn>;
+    fn commit_tx(&self, tx: TxHandle) -> FerrosGrynnResult<CommitTs>;
     fn abort_tx(&self, tx: TxHandle);
-    fn checkpoint(&self, mode: CheckpointMode) -> io::Result<()>;
+    fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<()>;
 }
 ```
 
-`PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и `checksum` (xxHash3-64).
+`PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
+(seed `0`, checksum-поле обнулено при вычислении).
 `PageKey = (graph_id, file_kind, page_no)`; `graph_id = 0` — системное пространство (каталог схемы
-и графов). При рассинхроне страница восстанавливается применением фрейма из журнала.
+и графов). Версия фрейма доступна только при `commit_lsn ≤ snapshot.visible_lsn`; `commit_ts`
+используется отдельно для MVCC/SSI. Checkpoint не продвигает `.fgb` дальше самого старого живого
+reader watermark. При рассинхроне страница восстанавливается применением фрейма из журнала.
 
 ### 3.4. `Operator` — модель исполнения
 
@@ -312,7 +328,7 @@ impl EndpointTensor {
 
 | Компонент                       | Где                                      | Что делает                                    |
 |---------------------------------|------------------------------------------|-----------------------------------------------|
-| `PageManager` trait             | `storage/mod.rs`                         | Абстракция page-level I/O (frame-WAL, §3.3)   |
+| `PageManager` trait             | `storage/page_manager.rs`                | Абстракция page-level I/O (frame-WAL, §3.3)   |
 | `DiskMetaGraph`                 | `storage/disk_graph.rs`                  | Disk-backed MetaGraph                         |
 | `NodeHotSlot` / `EdgeHotSlot`   | `storage/node_pages.rs`, `edge_pages.rs` | Encode/decode hot-слотов                      |
 | `PropHeapPage`                  | `storage/prop_heap.rs`                   | Slotted-page для PropertyMap                  |
@@ -335,12 +351,10 @@ jiff = { version = "0.2", features = ["serde"] }        # DateTime, Duration
 rust_decimal = { version = "1.42" }                     # Number::Decimal
 thin-vec = "0.2.19"                                    # pointer-sized sorted PropertyMap
 smallvec.workspace = true                               # adjacency/traversal buffers
-rapidhash.workspace = true                              # registries, indexes and ECS pools
+rapidhash.workspace = true                              # registries + portable V3 disk checksum
 rkyv = { workspace = true, features = ["bytecheck"] }   # snapshots/caches, не canonical codec
-zerocopy.workspace = true                               # fixed page headers/slots
 arrow = { workspace = true, optional = true }           # PropertyBatch; workspace 58.4
 datafusion = { workspace = true, optional = true }      # adapter; workspace 54.1
-xxhash-rust = { version = "0.8", features = ["xxh3"] }  # Page checksum
 geo = { version = "0.33" }                              # planar geometry
 geojson = { version = "1.0.0" }                         # GeoJSON
 ```
@@ -444,19 +458,28 @@ storage engine относятся к отдельной области B.
   областям B/последующей benchmark-driven оптимизации [plan.md](values_plan.md).
 - **`src/storage`** 🟡 — `DiskAtomRef(u64)` и
   `QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }`; перенос `crates/storage_engine`
-  выполняется после стабилизации value codec.
+  выполняется поэтапно. Production-код сразу пишется в `src/storage`; отдельный crate удаляется
+  после сверки его незакоммиченного diff и parity-тестов.
 
 ### Область B. Страничное хранилище и I/O — P2
 
 Disk-backed режим 2. Зависит от A.
 
-- **`PageManager`** 🔴 (§3.3) — реализация поверх `BufferPool` (Clock-Pro) и `SyncIo`/`AsyncIo`.
+- **Sync Direct I/O + `BufferPool`** 🟡 — `AlignedPage`, безопасный LE page codec, RAII
+  positional exact-read/exact-write и calibrated batch в `src/storage`; Linux `O_DIRECT`, Windows
+  `FILE_FLAG_NO_BUFFERING`, без `O_SYNC`/`WRITE_THROUGH` и buffered fallback. Windows gate пройден,
+  Linux/NVMe и soak ещё обязательны.
+- **`PageManager`** 🔴 (§3.3) — read-only `SyncPageManager` уже соединяет Direct I/O и version-aware
+  `BufferPool`; полный snapshot/frame-WAL контракт относится к следующему этапу. Optional Native
+  Async добавляется только после полного sync correctness/performance gate.
 - **`DiskMetaGraph`** 🔴 — фасад над страницами (`storage/disk_graph.rs`).
 - **Disk-страницы** 🟡→🔴 — `NodeHotSlot`/`EdgeHotSlot`, `AdjacencyOverflowPage`,
-  `PropHeapPage` (slotted), `SubgraphDirPage`, `FreelistPage`, `LabelDictionary`. Каркас есть в
-  `crates/storage_engine` (`store`, `layout`).
+  `PropHeapPage` (slotted), `SubgraphDirPage`, `FreelistPage`, `LabelDictionary`. Незавершённый
+  каркас `crates/storage_engine/{store,layout}` используется только для parity-сверки; новый код
+  реализуется в `src/storage`.
 - **`store.rs`** 🟢/🔴 — существующие `create_graph`/`open_graph` (режим 1) без изменений;
-  добавить `GraphStore::open_disk_graph(name) -> io::Result<DiskMetaGraph>` (P6, MVP+).
+  минимальный `open_disk_graph` входит в текущий vertical slice режима 2. Advanced storage-функции
+  остаются последующими этапами.
 - **`graph.rs`** 🟢 — `MetaGraph` остаётся in-memory; единственное дополнение —
   `MetaGraph::from_disk_batch(...)` для эффективной пакетной загрузки атомов (P4, отложено).
 
@@ -467,10 +490,16 @@ Disk-backed режим 2. Зависит от A.
 
 - **frame-WAL** 🔴 — `WalKind` для frame-модели (`disk_storage_spec.md` §22.1: `TxBegin`,
   `TxCommit`, `TxAbort`, `PageFrame`, `PageInit`, `CheckpointBegin`, `CheckpointEnd`,
-  `GraphCreate`, `GraphDrop`); 33-байтовый заголовок записи с xxHash3-64; индекс версий страниц.
+  `GraphCreate`, `GraphDrop`); 33-байтовый заголовок записи с portable RapidHash V3, seed 0;
+  индекс версий хранит `(frame_lsn, commit_lsn, offset)`. `PageInit` описывает только пустую
+  аллокацию; первая содержательная мутация всегда пишет полный `PageFrame`.
 - **Единый журнал уровня БД** 🔴 — глобальные часы коммитов; каталог графов в `db.fgb`.
-- **checkpoint** 🔴 — бэкфилл фреймов в `.fgb` по home-адресам; prune с
-  `prunable_prefix = min(active_tx_start)`.
+- **WAL transport** 🔴 — последовательный buffered `File`/`BufWriter`; под DB commit lock фреймы и
+  `TxCommit` идут подряд, затем один `flush + sync_data`. LSN маркера становится durable
+  `visible_lsn` только после barrier; Direct I/O для WAL не используется.
+- **checkpoint** 🔴 — бэкфилл фреймов в `.fgb` по home-адресам не дальше
+  `oldest_reader_visible_lsn`; prune только после fsync data-файлов и с учётом reader/active-tx
+  watermarks.
 - **recovery** 🔴 — один проход строго по возрастанию LSN (порядок обязателен: применение в
   порядке коммитов вместо LSN давало потерю обновлений); torn-write закрывается фреймами.
 - **`mvcc_persist.rs`** 🟡 — переиспользовать `WalWriter`/`WalSegmentManager` как транспорт;
@@ -654,7 +683,7 @@ storage-интеграция зависит от B.
 | **P2**               | A       | `src/values/columnar`                    | ✅ `PropertyBatch`, Arrow/presence и DataFusion adapter             |
 | **P2**               | A       | `src/values/runtime/graph`               | Graph family/type-state, Path и query return contracts              |
 | **P2**               | A       | `src/ecs`                                | ✅ ECS foundation; далее revision-bound `GraphWorkspace`            |
-| **P2** (высокий)     | B       | `src/storage/`                           | `PageManager`, `DiskMetaGraph`, все типы страниц                    |
+| **P2** (высокий)     | B       | `src/storage/`                           | Sync Direct I/O → BufferPool gate → `PageManager` → vertical slice  |
 | **P2**               | C       | frame-WAL                                | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
 | **P2**               | H, I, K | `src/syn`, analysis, IR, sync pull       | ✅ read-only `LET`/`RETURN`/`SELECT`; далее clauses/MATCH           |
 | **P3** (средний)     | E       | `src/schema/`                            | `SchemaCatalog`                                                     |
@@ -666,7 +695,7 @@ storage-интеграция зависит от B.
 | **P5** (низкий)      | G       | `src/index/hnsw.rs`, `rtree.rs`          | `HnswIndex`, `RtreeIndex`                                           |
 | **P5**               | M       | `src/changefeed/`                        | `ChangefeedStore`, `LiveQueryRegistry`                              |
 | **P5**               | 3.5     | `matrix.rs`                              | `EndpointTensor`                                                    |
-| **P6** (MVP+)        | B       | `store.rs`                               | `open_disk_graph` (полный режим 2)                                  |
+| **P2–P3**            | B, L    | `store.rs`, storage adapter              | Минимальный `open_disk_graph` и disk-backed vertical slice          |
 | **MVP+**             | O       | bridges                                  | `Bridge` trait, `SurrealBridge`                                     |
 
 **Фазы (укрупнённо):**
@@ -676,17 +705,22 @@ storage-интеграция зависит от B.
 - **Фаза 1 — фундамент типов** (P1): ✅ runtime и `StorageValue`/codec части Области A.
 - **Фаза 1.5 — свойства и ECS sidecar** (P2): ✅ PropertyMap benchmarks/dictionary,
   generation-aware SparseSet и PropertyColumn; `GraphWorkspace` продолжается в этапе 4.
-- **Фаза 2 — страничное хранилище** (P2): Область B + интеграция BufferPool.
+- **Фаза 2a — sync Direct I/O** (P2): ✅ aligned page codec, RAII positional I/O, native проверки
+  и calibrated batch reads/writes.
+- **Фаза 2b — ранний I/O-gate** (P2): 🟡 read-only Clock-Pro + benchmark-only mmap; Windows gate
+  пройден, Linux/NVMe и soak остаются обязательными до перехода к WAL/async.
 - **Фаза 3a — in-memory MVCC** (P2): ✅ RAM-часть Области D, COW-снимки, atom-level merge,
   serializable validation и точные предикаты.
-- **Фаза 3b — журнал и восстановление** (P2): Область C + durability-часть D.
+- **Фаза 3b — журнал и восстановление** (P2): Область C + durability-часть D после sync-gate.
 - **Фаза 4 — query-конвейер MVP** (P2–P3): 🟡 H → I → J/K/L; read-only
   `Datastore::execute` для режима 1 подключён, optimizer/traversal остаются.
 - **Фаза 5 — схема, статистика, индексы** (P3–P4): E, F, G (Label/BTree/Count + bulk),
   подключение к оптимизатору.
 - **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, R-tree; N (полная
   инцидентность); M (changefeed/live).
-- **Фаза 7 — полный disk-backed режим 2 и мосты** (P6, MVP+): `open_disk_graph`, O.
+- **Фаза 7 — optional Native Async I/O и мосты** (после полного sync-gate): единый внутренний
+  page-source контракт; GrynQL pull API не меняется. Unlimited transaction spill проектируется
+  отдельно после crash/performance tests.
 
 ---
 
@@ -698,7 +732,7 @@ storage-интеграция зависит от B.
 |----------------------------------------------------------------|--------------------------------------------------------------------------------------|
 | JIT-компиляция (LLVM: expression/operator-fusion/pipeline JIT) | Не входит в контракт языка; implementation detail; после стабилизации интерпретатора |
 | Worst-Case Optimal Join (Leapfrog TrieJoin)                    | Базовый Index NL достаточен для MVP; WCOJ — для паттернов с циклами позже            |
-| Полная реализация disk-backed graph-native pages (режим 2)     | Каркас есть; полная реализация — большая работа, для in-memory MVP не нужна          |
+| Advanced disk indexes/pages сверх минимального режима 2        | После disk-backed vertical slice и полного sync-gate                                 |
 | Physical-WAL + ARIES (Undo/CLR)                                | Не требуется: frame-WAL даёт те же гарантии без UNDO/CLR                             |
 | Параллельный recovery                                          | Отложено; single-pass достаточен для MVP                                             |
 | SPDK / NVMe kernel-bypass                                      | Задел (`spdk.rs`), Linux-only, не развивается                                        |

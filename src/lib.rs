@@ -8,6 +8,11 @@ pub mod ecs;
 pub mod gql;
 pub mod gql_status;
 pub mod math;
+#[allow(
+	dead_code,
+	reason = "the crate-private storage foundation is connected by the later PageManager stage"
+)]
+pub(crate) mod storage;
 mod syn;
 
 #[cfg(not(target_env = "msvc"))]

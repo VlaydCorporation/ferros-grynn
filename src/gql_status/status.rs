@@ -1060,6 +1060,35 @@ define_status_codes!(
 			reference: String => DisplayValue,
 		},
 	},
+	InvalidStoragePage, "FG-22S08" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "invalid storage page",
+		message: "Storage page {page_no} is invalid: {reason}.",
+		params: {
+			page_no: u64 => DisplayValue,
+			reason: String => DisplayValue,
+		},
+	},
+	InvalidStorageFile, "FG-22S09" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Storage,
+		subcondition: "invalid storage file",
+		message: "The storage file layout is invalid: {reason}.",
+		params: {
+			reason: String => DisplayValue,
+		},
+	},
 	StorageDecodeLimitExceeded, "FG-54S01" => {
 		kind: Error {
 			classification: ErrorClassification::DatabaseError,
@@ -1074,6 +1103,49 @@ define_status_codes!(
 			limit: String => Identifier,
 			actual: u64 => DisplayValue,
 			maximum: u64 => DisplayValue,
+		},
+	},
+	UnsupportedStorageFormat, "FG-51S01" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::SystemConfigurationOrOperationException,
+		domain: Domain::Storage,
+		subcondition: "unsupported storage format",
+		message: "Storage format version {actual} is unsupported; this engine reads version {supported}.",
+		params: {
+			actual: u64 => DisplayValue,
+			supported: u64 => DisplayValue,
+		},
+	},
+	DirectIoUnavailable, "FG-51I01" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::SystemConfigurationOrOperationException,
+		domain: Domain::Io,
+		subcondition: "direct I/O unavailable",
+		message: "Direct I/O is unavailable: {reason}.",
+		params: {
+			reason: String => DisplayValue,
+		},
+	},
+	StorageIoFailure, "FG-51I02" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::SystemConfigurationOrOperationException,
+		domain: Domain::Io,
+		subcondition: "storage I/O failure",
+		message: "Storage I/O operation {operation} failed.",
+		params: {
+			operation: String => DisplayValue,
 		},
 	},
 	QueryParseError, "FG-42001" => {
@@ -1436,5 +1508,14 @@ mod tests {
 		assert_eq!(storage_limit.code().to_string(), "FG-54S01");
 		assert_eq!(storage_limit.condition(), Condition::ProgramLimitExceeded);
 		assert_eq!(storage_limit.domain(), Domain::Storage);
+
+		let invalid_page = StatusObject::new(Status::invalid_storage_page(7, "bad checksum"));
+		assert_eq!(invalid_page.code().to_string(), "FG-22S08");
+		assert_eq!(invalid_page.domain(), Domain::Storage);
+
+		let direct_io = StatusObject::new(Status::direct_io_unavailable("unsupported filesystem"));
+		assert_eq!(direct_io.code().to_string(), "FG-51I01");
+		assert_eq!(direct_io.condition(), Condition::SystemConfigurationOrOperationException);
+		assert_eq!(direct_io.domain(), Domain::Io);
 	}
 }

@@ -51,8 +51,7 @@
 | Компонент         | Граница                                            | При нарушении                         |
 |-------------------|----------------------------------------------------|---------------------------------------|
 | BufferPool        | `FG_PAGE_BUFFER_PAGES` — RAM-бюджет на кеш страниц | Eviction (Clock-Pro), WAL-first flush |
-| TnxWriteSet       | `tnx_max_write_set_mb` — лимит на транзакцию       | Reject DML                            |
-| UndoStore         | `undo_max_size_mb` — лимит UNDO-истории в памяти   | Reject writes                         |
+| TxWriteSet        | `FG_TX_WRITE_SET_MAX_BYTES` = 256 МиБ              | Abort до публикации; import дробится  |
 | Statement timeout | `statement_timeout_ms` / `TIMEOUT` clause          | Cancel query                          |
 | Snapshot age      | `max_snapshot_age`                                 | Force-close stale snapshots           |
 | Path expansion    | `FG_PATH_MAX_DEPTH` (30), `MAXDEPTH`               | Обрыв path-finding                    |
@@ -64,13 +63,17 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 Архитектурные контракты выражаются через код: traits, инварианты типов, паттерны. Ключевые интерфейсы-границы:
 
-- **`PageManager`** ([implementation_plan.md](implementation_plan.md) §3.3) — страничный I/O под frame-WAL: `begin_tx`/`commit_tx`/`abort_tx`, `alloc_page`, `free_page`, `read_page` (параметризовано снимком), `write_frame`, `checkpoint`.
+- **`PageManager`** ([implementation_plan.md](implementation_plan.md) §3.3) — crate-private
+  страничная граница под frame-WAL: immutable `PageGuard`, одиночное/пакетное чтение по
+  `StorageSnapshot { commit_ts, visible_lsn }`, аллокация, запись фрейма и safe checkpoint.
 - **`Index`** (`disk_storage_spec.md` §20.1) — единый интерфейс индексов: `insert`, `delete`, `lookup`, `range`, `rebuild`, `status`.
 - **`TransactionLogSink`** — приёмник WAL-записей (append + fsync-барьеры).
 - **`RowCursor`** (§7, §9) — эталонный sync pull-контракт:
   `next() -> FerrosGrynnResult<Option<Row>>`. Batch-оператор добавляется поверх него после
   измерений и не меняет семантику плана.
-- **`StorageIo`** (`SyncIo` / `AsyncIo` из `fg-meta`) — Direct I/O с опциональной async-обёрткой.
+- **`src/storage`** — production Sync Direct I/O для `.fgb`/`.fgidx`; `fg-meta` служит только
+  референсом. Опциональный Native Async I/O вводится после sync-gate и реализует тот же внутренний
+  page-source контракт.
 
 Интерфейсы фиксируют, что система обязана уметь, где проходят её границы, и какие инварианты держатся.
 
@@ -78,9 +81,13 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 Чем больше пользовательской логики живёт в хранилище, тем сложнее её тестировать, версионировать и наблюдать. Поэтому пользовательские функции (`DEFINE FUNCTION`), события (`DEFINE EVENT`), замыкания и cost-функции исполняются в **песочнице** с явными ограничениями: `MAXDEPTH` для рекурсии, запрет бесконечных циклов (`FOR`/`tv::repeat` требуют `times(n)`/`until`), классификация purity (§4.6).
 
-### 1.4. Гибридная асинхронность: сначала стабилизировать, потом ускорять
+### 1.4. Sync-first и опциональный Native Async I/O
 
-Делать всё синхронным — плохо; делать весь движок асинхронным сразу — ад для отладки (особенно при одновременной постройке storage engine, WAL, recovery, MVCC, buffer manager). Выбираем гибрид: для Storage/WAL/MVCC — отдельные интерфейсы; дефолтная реализация — sync (`SyncIo`), async (`AsyncIo`) — дополнительно. Пользователь выбирает, что использовать.
+Sync Direct I/O — обязательная базовая реализация и default. До прохождения correctness-gate и
+сравнения Direct+BufferPool с benchmark-only mmap async-код не добавляется. После gate пользователь
+может выбрать `Sync` или доступный `NativeAsync` при открытии хранилища; недоступный режим
+возвращает типизированную ошибку без fallback. Публичный query API остаётся синхронной pull-моделью.
+WAL в обоих режимах использует последовательный buffered I/O и один `flush + sync_data` на commit.
 
 ---
 
@@ -586,7 +593,8 @@ Adapter обязан вернуть уже декодированные runtime 
   строится явно через `freeze`.
 - **Режим 2 — Disk-backed**: каталог возвращает `GraphRef`; `read(&tx)` создаёт
   `DiskGraphView<'tx>` над `PageManager`, `BufferPool` и `SnapshotId`. View не является копией
-  графа и не переживает transaction guard.
+  графа и не переживает transaction guard. Фундамент режима 2 — текущая работа P2; deferred
+  остаются только advanced page/index-функции после минимального vertical slice.
 - **Режим 3 — Hybrid**: `query_to_memory::<T, State>` загружает выбранный disk-backed подграф в
   собственную storage family `T<State>`. После полной загрузки исходный disk snapshot
   освобождается.
@@ -596,9 +604,20 @@ Adapter обязан вернуть уже декодированные runtime 
 
 ### 10.2. Абстракция страничного доступа
 
-Исполнитель никогда не читает файлы напрямую — только через `PageManager` поверх `BufferPool`. Полное определение trait'а (действующая frame-WAL-редакция) — в [implementation_plan.md](implementation_plan.md) §3.3 «`PageManager` — страничный доступ». Ключевые методы: `begin_tx`/`commit_tx`/`abort_tx` (транзакции); `alloc_page`/`free_page`; `read_page(key, snapshot, buf)` — чтение всегда параметризовано снимком (сначала индекс версий, затем `.fgb`); `write_frame(tx, key, buf) -> Lsn` — запись добавляет новый фрейм в журнал, LSN назначает журнал, не вызывающий; `checkpoint(mode)`.
+Исполнитель никогда не читает файлы напрямую — только через crate-private `PageManager` поверх
+`BufferPool`. Полное определение действующей frame-WAL-редакции — в
+[implementation_plan.md](implementation_plan.md) §3.3. `read_page` возвращает immutable
+`PageGuard`, а `read_pages` даёт batch-доступ; оба принимают `StorageSnapshot { commit_ts,
+visible_lsn }`. Изменения сначала живут как atom-delta, затем `write_frame` добавляет полный образ
+страницы; LSN и checksum назначает WAL-слой, не вызывающий. Checkpoint не бэкфиллит версии новее
+самого старого живого `visible_lsn`.
 
-`PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и `checksum` (xxHash3-64). Ключ `PageKey = (graph_id, file_kind, page_no)`; `graph_id = 0` — системное пространство (каталог схемы и графов). При чтении из `.fgb` проверяются `page_no` и checksum → при рассинхроне страница восстанавливается применением фрейма из журнала (§12.4). I/O — `SyncIo`/`AsyncIo` с выровненными буферами (O_DIRECT), пакетные чтения через io_uring (§18 задела).
+`PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
+(seed `0`, поле checksum обнулено при вычислении). Ключ `PageKey = (graph_id, file_kind, page_no)`;
+`graph_id = 0` — системное пространство. При чтении `.fgb` проверяются размер/выравнивание файла,
+format version, `page_no`, reserved fields и checksum. Production I/O сейчас только sync:
+`O_DIRECT` на Linux и `FILE_FLAG_NO_BUFFERING` на Windows; WAL остаётся buffered. Benchmark-only
+mmap и optional Native Async не являются fallback.
 
 ### 10.3. Разрешение идентификаторов: `RecordId → DiskAtomRef → AtomId`
 
@@ -786,7 +805,7 @@ dangerous structure. Он serializable, но может давать больш�
 
 ### 11.5. Протокол commit
 
-1. проверить snapshot age и write-set budget;
+1. проверить snapshot age и atom-delta write-set budget (sync MVP: 256 МиБ);
 2. под коротким commit lock проверить FCW и serializable/predicate conflicts;
 3. назначить фактический `commit_ts`;
 4. слить непересекающиеся atom-delta поверх текущих графов и повторно проверить family invariant;
@@ -795,8 +814,10 @@ dangerous structure. Он serializable, но может давать больш�
    поэтому snapshot не может попасть в окно между очисткой и публикацией.
 
 В чистом in-memory режиме шагов WAL нет и durability после завершения процесса не обещается.
-Persistent-адаптер перед публикацией обязан записать commit во frame-WAL и выполнить `fdatasync`
-(§17.6, §12.5).
+Persistent-адаптер под тем же DB commit lock сливает delta в финальные страницы, последовательно
+записывает их фреймы и `TxCommit`, выполняет один buffered `flush + sync_data`, продвигает durable
+`visible_lsn` до LSN маркера и только затем публикует root (§17.6, §12). Transaction-private spill
+не входит в sync MVP: превышение 256 МиБ завершается resource error.
 
 ### 11.6. Graph-специфичная консистентность
 
@@ -816,28 +837,43 @@ Persistent-адаптер перед публикацией обязан зап�
 
 ### 12.1. Что видит исполнитель
 
-Исполнитель не пишет страницы на месте. Изменение логической страницы — это копия в scratch-фрейм и правка копии; коммит — дописать фреймы и маркер `TxCommit`, затем один `fdatasync` на всю транзакцию, сколько бы графов и файлов она ни затронула.
+Исполнитель не пишет страницы на месте. Транзакция накапливает atom-delta; под единым DB commit
+lock они сливаются в финальные страницы. Коммит дописывает полные фреймы и `TxCommit`, затем
+выполняет один buffered `flush + sync_data` на всю транзакцию, сколько бы графов и файлов она ни
+затронула. LSN маркера — `commit_lsn`; только после sync он может стать новым `visible_lsn`.
 
 Чтение страницы всегда параметризовано снимком:
 
 ```
-read_page(PageKey, snapshot_lsn) =
-    самый свежий фрейм с lsn ≤ snapshot_lsn,
+read_page(PageKey, StorageSnapshot { commit_ts, visible_lsn }) =
+    самый свежий committed-фрейм с commit_lsn ≤ visible_lsn,
     иначе страница из .fgb
 PageKey = (graph_id, file_kind, page_no)
 ```
 
 Отсюда три свойства, на которые опирается исполнение:
-1. **Снимок консистентен по всей базе.** `snapshot_lsn` сравним с `commit_ts` любой транзакции любого графа, поэтому запрос над несколькими графами (`MATCH … FROM g1, g2`) читает одну версию мира. При пографовых счётчиках это было бы невыразимо: значения из разных графов попарно несравнимы.
+1. **Снимок консистентен по всей базе.** Глобальный `commit_ts` задаёт MVCC/SSI-порядок, а
+   глобальный `visible_lsn` — durable-префикс WAL для всех графов. Они не сравниваются друг с
+   другом; видимость страницы проверяет `commit_lsn ≤ visible_lsn`.
 2. **Читатели не блокируют писателя.** Писатель дописывает фреймы, читатель смотрит на префикс журнала.
 3. **Отмена транзакции ничего не откатывает.** Отбросить scratch-фреймы и записи индекса; UNDO-лога и CLR не существует.
 
+`PageInit` регистрирует только пустую аллокацию. Как только транзакция записывает в новую страницу
+содержательные данные, commit обязан включить полный `PageFrame`; восстановление содержимого из
+«логики аллокации» не допускается.
+
 ### 12.2. Checkpoint (бэкфилл) и его влияние на планирование
 
-Checkpoint переносит **закоммиченные** фреймы обратно в `.fgb` на их штатные места, после чего обрезает журнал. Бэкфилл пографовый и планируется независимо; глобальна только обрезка:
+Checkpoint переносит **закоммиченные** фреймы обратно в `.fgb` на их штатные места, после чего
+обрезает журнал. Граница бэкфилла не может быть новее самого старого живого
+`oldest_reader_visible_lsn`: иначе fallback в обновлённый `.fgb` вернёт старому snapshot слишком
+новую страницу. Бэкфилл пографовый и планируется независимо; глобальна только обрезка:
 
 ```
-prunable_prefix = min( min по графам(backfilled_lsn), oldest_reader_mark, oldest_active_tx_first_frame )
+backfill_watermark = min(durable_visible_lsn, oldest_reader_visible_lsn)
+prunable_prefix = min( min по графам(backfilled_lsn),
+                       oldest_reader_visible_lsn,
+                       oldest_active_tx_first_frame )
 ```
 
 Практическое следствие для исполнителя: **долгий читатель удерживает журнал**. Многоминутный аналитический обход не даёт обрезать лог, и он растёт. Поэтому:
@@ -933,6 +969,8 @@ prunable_prefix = min( min по графам(backfilled_lsn), oldest_reader_mark
 | `FG_PAGE_BUFFER_PAGES`                            | размер buffer pool (страниц)         | 4096 (64 MiB) |
 | `FG_WAL_SEGMENT_SIZE`                             | размер WAL-сегмента                  | 64 MiB        |
 | `FG_CHECKPOINT_DIRTY_THRESHOLD` / `_INTERVAL_SEC` | триггеры checkpoint                  | 0.25 / 300    |
+| `FG_TX_WRITE_SET_MAX_BYTES`                       | atom-delta budget транзакции         | 256 MiB       |
+| `FG_MAX_SNAPSHOT_AGE_SEC`                         | максимальный возраст snapshot        | 300           |
 | `FG_LABEL_DICT_CACHE_MB`                          | LRU-кеш словаря меток                | 32            |
 | `FG_PROPS_COMPRESS_THRESHOLD`                     | порог LZ4-сжатия props               | 512           |
 | `FG_HNSW_CACHE_SIZE`                              | кеш HNSW                             | 256 MiB       |
@@ -1004,8 +1042,9 @@ Cost-based выбор при равенстве стоимостей разре�
 ## 18. Отложено / вне MVP
 
 > **Вынесено в [implementation_plan.md](implementation_plan.md) §6 «Отложено / вне MVP».**
-> Сводный список отложенного (JIT, WCOJ, полный disk-backed режим 2, ARIES/UNDO, параллельный
-> recovery, SPDK, SMT-верификация оптимизатора, тензорные кеши) собран там из `gql_tech_spec.md`,
+> Сводный список отложенного (JIT, WCOJ, advanced storage-функции, ARIES/UNDO, параллельный
+> recovery, optional Native Async I/O до прохождения sync-gate, SPDK, SMT-верификация
+> оптимизатора, тензорные кеши) собран там из `gql_tech_spec.md`,
 > `gql_spec.md` §32.3 и `disk_storage_spec.md`.
 
 ---
