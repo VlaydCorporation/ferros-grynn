@@ -73,6 +73,7 @@ These `.md` files are the design authority for sensitive subsystems; when implem
 - `docs/gql_tech_spec.md` — technical implementation of the query engine (planner contracts, degradation modes, resource budgets). Explicitly noted as needing rework *after* `gql_spec.md` and `disk_storage_spec.md` are approved — don't treat it as current.
 - `docs/gql_grammar.md` — EBNF grammar (not yet filled in).
 - `docs/graphs.md` — the graph taxonomy the engine must cover.
+- Use the directory `docs/reports/` to save progress reports if you create them. 
 
 
 ## Conventions
