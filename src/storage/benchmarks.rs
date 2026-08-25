@@ -22,9 +22,10 @@ use memmap2::{Mmap, MmapMut, MmapOptions};
 use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 
 use super::{
-	buffer_pool::{BufferPool, CacheSourceId, PageCacheKey},
+	buffer_pool::{BufferPool, PageCacheKey, PageCacheVersion},
 	direct::{DirectFile, SYNC_BATCH_BYTES, SYNC_BATCH_PAGES},
 	page::{AlignedPage, PAGE_HEADER_SIZE, PAGE_SIZE, PageFlags, PageLsn, PageNo, PageType},
+	types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
 };
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
@@ -680,7 +681,8 @@ fn measure_fresh_read(
 	let path = BenchPath::new(backend.label())?;
 	create_dataset(path.as_path(), workload.page_count)?;
 	let extent_pages = workload.extent_pages.get();
-	let source_id = CacheSourceId::new(1);
+	let source_id = DataFileId::new(1, DataFileKind::SystemCatalog)
+		.ok_or_else(|| io::Error::other("benchmark source identity is invalid"))?;
 
 	match backend {
 		ReadBackend::RawDirect => {
@@ -842,7 +844,7 @@ fn read_raw_direct_extent(
 fn consume_pool(
 	pool: &BufferPool,
 	direct: &DirectFile,
-	source_id: CacheSourceId,
+	source_id: DataFileId,
 	order: &[PageNo],
 	extent_pages: usize,
 	page_scratch: &mut [AlignedPage],
@@ -858,7 +860,7 @@ fn consume_pool(
 fn read_pool_extent(
 	pool: &BufferPool,
 	direct: &DirectFile,
-	source_id: CacheSourceId,
+	source_id: DataFileId,
 	pages: &[PageNo],
 	page_scratch: &mut [AlignedPage],
 	key_scratch: &mut Vec<PageCacheKey>,
@@ -875,15 +877,14 @@ fn read_pool_extent(
 	for page_no in pages.iter().copied() {
 		key_scratch.push(benchmark_key(source_id, page_no)?);
 	}
-	let guards =
-		pool.get_or_load_batch(key_scratch, page_scratch, |loaded_source, first, output| {
-			if loaded_source != source_id {
-				return Err(FerrosGrynnError::storage_io_failure(
-					"benchmark batch requested an unknown page source",
-				));
-			}
-			direct.read_pages_raw(first, output)
-		})?;
+	let guards = pool.get_or_load_batch(key_scratch, page_scratch, |first, output| {
+		if first.graph_id() != GraphId::SYSTEM || first.file_id() != source_id {
+			return Err(FerrosGrynnError::storage_io_failure(
+				"benchmark batch requested an unknown page source",
+			));
+		}
+		direct.read_pages_raw(first.page_no(), output)
+	})?;
 	for guard in guards {
 		black_box(guard.as_bytes()[PAGE_HEADER_SIZE]);
 	}
@@ -1232,8 +1233,14 @@ fn benchmark_page(page_no: PageNo) -> Result<AlignedPage, Box<dyn Error>> {
 }
 
 /// Creates the exact cache key encoded by a benchmark page.
-fn benchmark_key(source_id: CacheSourceId, page_no: PageNo) -> FerrosGrynnResult<PageCacheKey> {
-	Ok(PageCacheKey::new(source_id, page_no, benchmark_lsn(page_no)?))
+fn benchmark_key(source_id: DataFileId, page_no: PageNo) -> FerrosGrynnResult<PageCacheKey> {
+	Ok(PageCacheKey::new(
+		PageKey::new(GraphId::SYSTEM, source_id, page_no),
+		PageCacheVersion::Home {
+			generation: CheckpointGeneration::ZERO,
+			ceiling: Lsn::new(u64::MAX),
+		},
+	))
 }
 
 /// Returns the deterministic non-zero LSN for one benchmark page.

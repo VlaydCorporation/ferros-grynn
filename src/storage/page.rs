@@ -1,7 +1,7 @@
 //! Fixed-size aligned pages and the format-v1 page header codec.
 
 use bitflags::bitflags;
-use rapidhash::v3::rapidhash_v3;
+use rapidhash::v3::{DEFAULT_RAPID_SECRETS, RapidStreamHasherV3, rapidhash_v3};
 
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
@@ -127,7 +127,7 @@ macro_rules! define_page_types {
 			}
 
 			/// Decodes only page types assigned by format v1.
-			const fn from_raw(value: u16) -> Option<Self> {
+			pub(super) const fn from_raw(value: u16) -> Option<Self> {
 				match value {
 					$($value => Some(Self::$variant),)+
 					_ => None,
@@ -332,11 +332,23 @@ impl AlignedPage {
 		page_no: PageNo,
 	) -> Self {
 		let mut page = Self::zeroed();
-		let mut header = PageHeader::new(page_type, flags, page_lsn, page_no);
-		header.write_to(&mut page);
-		header.checksum = page_checksum_mut(page.as_bytes_mut());
-		header.write_to(&mut page);
+		page.reset(page_type, flags, page_lsn, page_no);
 		page
+	}
+
+	/// Reinitializes reusable aligned storage as a zero-filled sealed page.
+	pub(super) fn reset(
+		&mut self,
+		page_type: PageType,
+		flags: PageFlags,
+		page_lsn: PageLsn,
+		page_no: PageNo,
+	) {
+		self.bytes.fill(0);
+		let mut header = PageHeader::new(page_type, flags, page_lsn, page_no);
+		header.write_to(self);
+		header.checksum = page_checksum_mut(self.as_bytes_mut());
+		header.write_to(self);
 	}
 
 	/// Creates an entirely zeroed page for an exact read operation.
@@ -424,6 +436,47 @@ impl AlignedPage {
 		let header = RawPageHeader::decode(self.as_bytes()).validate(expected_page_no)?;
 		let expected_checksum = page_checksum_preserving(self.as_bytes_mut());
 		validate_checksum(header, expected_checksum, expected_page_no)
+	}
+
+	/// Copies a validated page, assigns its frame LSN, and reseals it.
+	///
+	/// WAL is the only caller allowed to assign the final page LSN. Keeping the
+	/// operation here prevents the persisted header and checksum from drifting
+	/// apart.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the source page is invalid for `expected_page_no`.
+	#[cfg(test)]
+	pub(super) fn copy_with_lsn(
+		&self,
+		expected_page_no: PageNo,
+		page_lsn: PageLsn,
+	) -> FerrosGrynnResult<Self> {
+		let mut page = Self {
+			bytes: self.bytes,
+		};
+		page.assign_lsn(expected_page_no, page_lsn)?;
+		Ok(page)
+	}
+
+	/// Assigns the WAL frame LSN and reseals reusable exclusive page storage.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the current page is invalid for `expected_page_no`.
+	pub(super) fn assign_lsn(
+		&mut self,
+		expected_page_no: PageNo,
+		page_lsn: PageLsn,
+	) -> FerrosGrynnResult<()> {
+		let mut header = self.validate_mut(expected_page_no)?;
+		header.page_lsn = page_lsn;
+		header.checksum = 0;
+		header.write_to(self);
+		header.checksum = page_checksum_mut(self.as_bytes_mut());
+		header.write_to(self);
+		Ok(())
 	}
 }
 
@@ -614,9 +667,13 @@ impl RawPageHeader {
 
 /// Computes the portable format-v1 checksum through the optimized bulk path.
 fn page_checksum(bytes: &[u8; PAGE_SIZE]) -> u64 {
-	let mut input = *bytes;
-	input[CHECKSUM_OFFSET..PAGE_NO_OFFSET].fill(0);
-	rapidhash_v3(&input)
+	const ZERO_CHECKSUM: [u8; size_of::<u64>()] = [0; size_of::<u64>()];
+
+	let mut hasher = RapidStreamHasherV3::new(&DEFAULT_RAPID_SECRETS);
+	hasher.write(&bytes[..CHECKSUM_OFFSET]);
+	hasher.write(&ZERO_CHECKSUM);
+	hasher.write(&bytes[PAGE_NO_OFFSET..]);
+	hasher.finish()
 }
 
 /// Computes the checksum while preparing a page for a new sealed header.

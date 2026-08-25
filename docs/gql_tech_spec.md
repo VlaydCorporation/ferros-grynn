@@ -63,9 +63,10 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 Архитектурные контракты выражаются через код: traits, инварианты типов, паттерны. Ключевые интерфейсы-границы:
 
-- **`PageManager`** ([implementation_plan.md](implementation_plan.md) §3.3) — crate-private
-  страничная граница под frame-WAL: immutable `PageGuard`, одиночное/пакетное чтение по
-  `StorageSnapshot { commit_ts, visible_lsn }`, аллокация, запись фрейма и safe checkpoint.
+- **`SyncPageManager`** ([implementation_plan.md](implementation_plan.md) §3.3) — единый
+  crate-private Windows-first manager под frame-WAL: `TxHandle` владеет snapshot-регистрацией,
+  `PageRead<'tx>` объединяет staged borrow и immutable `PageGuard`, а passive checkpoint/recovery
+  остаются внутренними. Trait с единственной реализацией не вводится.
 - **`Index`** (`disk_storage_spec.md` §20.1) — единый интерфейс индексов: `insert`, `delete`, `lookup`, `range`, `rebuild`, `status`.
 - **`TransactionLogSink`** — приёмник WAL-записей (append + fsync-барьеры).
 - **`RowCursor`** (§7, §9) — эталонный sync pull-контракт:
@@ -604,16 +605,16 @@ Adapter обязан вернуть уже декодированные runtime 
 
 ### 10.2. Абстракция страничного доступа
 
-Исполнитель никогда не читает файлы напрямую — только через crate-private `PageManager` поверх
-`BufferPool`. Полное определение действующей frame-WAL-редакции — в
-[implementation_plan.md](implementation_plan.md) §3.3. `read_page` возвращает immutable
-`PageGuard`, а `read_pages` даёт batch-доступ; оба принимают `StorageSnapshot { commit_ts,
-visible_lsn }`. Изменения сначала живут как atom-delta, затем `write_frame` добавляет полный образ
-страницы; LSN и checksum назначает WAL-слой, не вызывающий. Checkpoint не бэкфиллит версии новее
-самого старого живого `visible_lsn`.
+Исполнитель никогда не читает файлы напрямую — только через crate-private concrete
+`SyncPageManager` поверх `BufferPool`. Полное определение действующей frame-WAL-редакции — в
+[implementation_plan.md](implementation_plan.md) §3.3. `read_page(&TxHandle, ...)` возвращает
+`PageRead<'tx>` (staged borrow или immutable cache guard), `read_pages` сохраняет порядок и
+дубликаты. Snapshot живёт внутри зарегистрированного `TxHandle`, а не передаётся голым token.
+LSN и checksum назначает WAL-слой. Checkpoint не бэкфиллит версии новее самого старого живого
+`visible_lsn`.
 
 `PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
-(seed `0`, поле checksum обнулено при вычислении). Ключ `PageKey = (graph_id, file_kind, page_no)`;
+(seed `0`, поле checksum обнулено при вычислении). Ключ `PageKey = (GraphId, DataFileId, PageNo)`;
 `graph_id = 0` — системное пространство. При чтении `.fgb` проверяются размер/выравнивание файла,
 format version, `page_no`, reserved fields и checksum. Production I/O сейчас только sync:
 `O_DIRECT` на Linux и `FILE_FLAG_NO_BUFFERING` на Windows; WAL остаётся buffered. Benchmark-only
@@ -842,13 +843,15 @@ lock они сливаются в финальные страницы. Комм�
 выполняет один buffered `flush + sync_data` на всю транзакцию, сколько бы графов и файлов она ни
 затронула. LSN маркера — `commit_lsn`; только после sync он может стать новым `visible_lsn`.
 
-Чтение страницы всегда параметризовано снимком:
+Чтение страницы всегда привязано к `TxHandle`; голый `StorageSnapshot` не выдаётся вызывающему как
+самостоятельный долгоживущий token:
 
 ```
-read_page(PageKey, StorageSnapshot { commit_ts, visible_lsn }) =
+read_page(&TxHandle, PageKey) =
+    staged final page, если он есть,
     самый свежий committed-фрейм с commit_lsn ≤ visible_lsn,
     иначе страница из .fgb
-PageKey = (graph_id, file_kind, page_no)
+PageKey = (GraphId, DataFileId, PageNo)
 ```
 
 Отсюда три свойства, на которые опирается исполнение:
@@ -864,35 +867,36 @@ PageKey = (graph_id, file_kind, page_no)
 
 ### 12.2. Checkpoint (бэкфилл) и его влияние на планирование
 
-Checkpoint переносит **закоммиченные** фреймы обратно в `.fgb` на их штатные места, после чего
-обрезает журнал. Граница бэкфилла не может быть новее самого старого живого
-`oldest_reader_visible_lsn`: иначе fallback в обновлённый `.fgb` вернёт старому snapshot слишком
-новую страницу. Бэкфилл пографовый и планируется независимо; глобальна только обрезка:
+Passive checkpoint переносит **закоммиченные** фреймы обратно в `.fgb` на их штатные места.
+Граница не может быть новее самого старого живого reader: иначе home fallback вернёт ему слишком
+новую страницу.
 
 ```
-backfill_watermark = min(durable_visible_lsn, oldest_reader_visible_lsn)
-prunable_prefix = min( min по графам(backfilled_lsn),
-                       oldest_reader_visible_lsn,
-                       oldest_active_tx_first_frame )
+target = min(durable_visible_lsn,
+             oldest_reader_visible_lsn.unwrap_or(durable_visible_lsn))
 ```
+
+После `fsync` каждого затронутого файла и durable `CheckpointEnd` атомарно заменяются graph
+superblocks, последним — `db.fgb`; это единственный commit point. Лишь затем version index и
+закрытые сегменты `last_lsn ≤ target` можно prune. Отдельного active-tx watermark нет: до
+transaction spill `begin_tx` не пишет WAL.
 
 Практическое следствие для исполнителя: **долгий читатель удерживает журнал**. Многоминутный аналитический обход не даёт обрезать лог, и он растёт. Поэтому:
 - долгую аналитику следует выполнять через режим 3 (`query_to_memory`), который материализует подграф и **освобождает снимок**, а не держит его весь расчёт;
 - для чтения только отбэкфилленных данных предусмотрен checkpoint-stable режим: такой запрос не удерживает ни одного фрейма и видит состояние на последний checkpoint;
-- `FG_MAX_SNAPSHOT_AGE_SEC` принудительно закрывает устаревшие снимки, `FG_WAL_MAX_TOTAL_BYTES` форсирует бэкфилл отстающего графа.
+- snapshot timeout/cancellation и `CheckpointMode::Restart` добавляются в этапе 4; срез 3b никого
+  не отменяет и просто не продвигается дальше старого reader.
 
 ### 12.3. Recovery
 
 Один упорядоченный проход; каталога процедур на каждый вид записи нет — применение фрейма это `memcpy`.
 
 ```
-1. db.fgb → checkpoint_lsn
-2. Проход по журналу: построить индекс версий, отметить транзакции с TxCommit,
-   отметить graph_id, удалённые записями GraphDrop
-3. Отбросить фреймы транзакций без маркера коммита  ← весь «откат»
-4. Применить закоммиченные фреймы В ПОРЯДКЕ ВОЗРАСТАНИЯ LSN
-   (пропуская удалённые графы и страницы с page_lsn ≥ lsn)
-5. fsync → свежий checkpoint
+1. db.lock + выбор валидного max(generation, page_lsn) из db.fgb/db.fgb.tmp
+2. Seed clocks → один streaming-проход WAL `FGW1`, отказ от экспериментального `MVCE` и проверка matching CheckpointEnd
+3. Отбросить фреймы без TxCommit  ← весь «откат»
+4. Применить post-checkpoint frames В ПОРЯДКЕ ВОЗРАСТАНИЯ frame LSN через sealed registry
+5. fsync touched files, проверить home pages, выполнить свежий passive checkpoint
 ```
 
 **Порядок строго по LSN — обязателен.** Применение по порядку коммитов вместе с монотонным `page_lsn` теряет закоммиченные изменения: если транзакция с меньшим LSN коммитится позже, её правка на общей странице оказывается отфильтрована guard'ом `lsn ≤ page_lsn`. Две транзакции регулярно пересекаются на одной странице (63–102 слота на страницу, общий freelist), поэтому это не краевой случай.

@@ -1148,6 +1148,17 @@ define_status_codes!(
 			operation: String => DisplayValue,
 		},
 	},
+	LocalDatabaseBusy, "FG-51I03" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::SystemConfigurationOrOperationException,
+		domain: Domain::Io,
+		subcondition: "local database already owned",
+		message: "The local database is already open by another owner.",
+	},
 	QueryParseError, "FG-42001" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,

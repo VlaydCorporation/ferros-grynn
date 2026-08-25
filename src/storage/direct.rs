@@ -214,6 +214,32 @@ impl DirectFile {
 		Ok(())
 	}
 
+	/// Writes unchecked aligned bytes for deterministic torn-page tests.
+	///
+	/// # Errors
+	///
+	/// Returns an error for an offset gap, short I/O, or native failure.
+	#[cfg(test)]
+	pub(super) fn write_page_raw(
+		&self,
+		page_no: PageNo,
+		page: &AlignedPage,
+	) -> FerrosGrynnResult<()> {
+		let offset = checked_page_offset(page_no)?;
+		let page_count = self.page_count();
+		if page_no.get() > page_count {
+			return Err(FerrosGrynnError::invalid_storage_page(
+				page_no.get(),
+				"writing the raw test page would leave a file gap",
+			));
+		}
+		write_all_at(&self.file, page.as_bytes(), offset)?;
+		if page_no.get() == page_count {
+			self.page_count.fetch_max(page_count + 1, AtomicOrdering::Relaxed);
+		}
+		Ok(())
+	}
+
 	/// Writes one physically contiguous extent with one successful positional
 	/// operation.
 	///
@@ -273,6 +299,15 @@ impl DirectFile {
 	/// Returns an error if the operating system cannot synchronize file data.
 	pub(super) fn sync_data(&self) -> FerrosGrynnResult<()> {
 		self.file.sync_data().map_err(|source| io_failure("synchronize data file", source))
+	}
+
+	/// Makes preceding data and metadata changes durable.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the operating system cannot synchronize the file.
+	pub(super) fn sync_all(&self) -> FerrosGrynnResult<()> {
+		self.file.sync_all().map_err(|source| io_failure("synchronize complete data file", source))
 	}
 
 	/// Opens and validates a Direct I/O file in one of the supported modes.
@@ -341,9 +376,16 @@ fn configure_direct_io(options: &mut OpenOptions) -> FerrosGrynnResult<()> {
 fn configure_direct_io(options: &mut OpenOptions) -> FerrosGrynnResult<()> {
 	use std::os::windows::fs::OpenOptionsExt;
 
-	use windows::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+	use windows::Win32::Storage::FileSystem::{
+		FILE_FLAG_NO_BUFFERING,
+		FILE_SHARE_DELETE,
+		FILE_SHARE_READ,
+		FILE_SHARE_WRITE,
+	};
 
-	options.custom_flags(FILE_FLAG_NO_BUFFERING.0);
+	options
+		.custom_flags(FILE_FLAG_NO_BUFFERING.0)
+		.share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0);
 	Ok(())
 }
 

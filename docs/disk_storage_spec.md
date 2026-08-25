@@ -709,6 +709,41 @@ snapshot.visible_lsn`. Если бы эти часы выдавались лок
 - `.fcf` — Ferros-Grynn Changefeed.
 - `.chk` — Checkpoint header.
 
+### 7.3. Идентичность physical data-файла (format v1)
+
+Каждый файл, который может быть адресован из WAL, имеет закрытый `DataFileKind`:
+
+| Значение | `DataFileKind`                |
+|----------|-------------------------------|
+| `0x01`   | `SystemCatalog`               |
+| `0x02`   | `GraphSuperblock`             |
+| `0x03`   | `NodesHot`                    |
+| `0x04`   | `EdgesHot`                    |
+| `0x05`   | `AdjacencyOverflow`           |
+| `0x06`   | `CrossLevelAdjacencyOverflow` |
+| `0x07`   | `Properties`                  |
+| `0x08`   | `Subgraphs`                   |
+| `0x09`   | `Labels`                      |
+| `0x0a`   | `Freelist`                    |
+| `0x0b`   | `Statistics`                  |
+| `0x0c`   | `Index`                       |
+| `0x0d`   | `TensorCache`                 |
+
+`0x00` и `0x0e..=0xff` зарезервированы. Неизвестное значение при открытии или recovery —
+повреждение хранилища, а не forward-compatible расширение.
+
+```
+DataFileId = (instance_id << 8) | DataFileKind
+PageKey    = (GraphId, DataFileId, PageNo)
+```
+
+`instance_id` занимает 56 бит, никогда не переиспользуется и различает несколько индексов,
+freelist/statistics-файлов одного семейства. Путь не выводится из недоверенных байтов WAL:
+открыватель БД один раз строит и запечатывает registry
+`(GraphId, DataFileId) → (role, trusted path, DirectFile для WAL-backfilled role)`.
+`GraphSuperblock` не удерживает handle: на Windows это обязательно для atomic replace, а старый
+handle после rename ссылался бы на прежний file object. Отсутствующий id — fatal corruption.
+
 ---
 
 Файл `store.fgb` - глобальный суперблок хранилища:
@@ -731,12 +766,29 @@ Offset  Size  Тип   Поле            Описание
 Файл `db.fgb` - суперблок базы данных:
 ```
 Offset  Size  Тип   Поле                        Описание
-0       32    -     PageHeader (magic=MAGIC_SUPERBLOCK, type=DatabseSuperblock)
-32      32    [u8]  db_name                     -- имя database, макс. 32 символа в ASCII кодировке
+0       32    -     PageHeader (type=DatabaseSuperblock, page_no=0)
+32      32    [u8]  db_name                     -- UTF-8 NUL-terminated, max 31 bytes
 64      4     u32   format_version              -- версия формата хранилища (§6: STORAGE_FORMAT_VERSION)
 68      4     u32   last_back_compat_version    -- последняя версия, совместимая с текущей
-72      4     u32   graph_count                 -- количество графов в БД
+72      8     u64   generation
+80      8     u64   checkpoint_lsn
+88      8     u64   checkpoint_record_lsn
+96      8     u64   durable_visible_lsn
+104     8     u64   next_lsn
+112     8     u64   commit_ts
+120     8     u64   next_tx_id
+128     8     u64   next_file_instance_id       -- следующий id; 2^56 = exhausted sentinel
+136     8     u64   system_backfilled_lsn
+144     8     u64   graph_catalog_root_page     -- NULL_PAGE до этапа 4
+152     8     u64   file_catalog_root_page      -- NULL_PAGE до этапа 4
+160     4     u32   graph_count
+164     4     u32   flags                       -- format v1: 0
+168     ...   -     _reserved                   -- только нули
 ```
+
+`PageHeader.page_lsn == checkpoint_record_lsn`. Для `generation == 0` оба checkpoint-LSN равны
+нулю; `checkpoint_lsn ≤ durable_visible_lsn`, а `next_lsn` строго больше всех сохранённых WAL
+часов. Поля root до их durable population в этапе 4 обязаны быть `NULL_PAGE`.
 
 ## 8. Универсальный заголовок страницы
 
@@ -1331,7 +1383,9 @@ Total = PAGE_SIZE байт
 1. Загрузить FreelistPage в BufferPool (будет hot, если часто аллоцируем).
 2. BSF (bit-scan forward) по bitmap → первый bit=1.
 3. Если не найден — расширить файл (grow), добавить страницы, обновить bitmap.
-4. Установить bit=0 (занять), записать WAL `PageAlloc { file_kind, page_no }`.
+4. Установить bit=0 (занять), записать WAL
+   `PageInit { graph_id, file_id: DataFileId, page_type, page_no }`; первая содержательная запись
+   этой страницы обязана использовать полный `PageFrame` (§22.2).
 
 ---
 
@@ -1421,29 +1475,36 @@ HashIndexPage:
 Точка входа для каждого именованного графа. Атомарно обновляется (tmp → rename).
 
 ```
-Offset  Size  Тип    Поле                
-0       32    —      PageHeader (magic=MAGIC_SUPERBLOCK, type=GraphSuperblock)
-32      8     u64    graph_id_raw               GraphId.raw() для внешних ссылок
-40      8     u64    created_at_ms              Unix ms
-48      8     u64    updated_at_ms              Unix ms
-56      8     u64    checkpoint_lsn             LSN последнего checkpoint
-64      8     u64    wal_lsn                    LSN последней WAL-записи
-72      8     u64    node_capacity              Текущая ёмкость node pool
-80      8     u64    edge_capacity              Ёмкость edge pool
-88      8     u64    node_count                 Живых вершин
-96      8     u64    edge_count                 Живых рёбер
-104     8     u64    subgraph_capacity          Ёмкость subgraph arena
-112     8     u64    subgraph_count             Число живых подграфов
-120     8     u64    node_hot_pages             Страниц в nodes_hot.fgb
-128     8     u64    edge_hot_pages             Страниц в edges_hot.fgb
-136     8     u64    props_pages                Страниц в props.fgb
-144     8     u64    labels_size_bytes          Размер labels.fgb в байтах
-152     8     u64    flags                      bit0=encrypted, bit1=lz4_props, bit2=read_only
-160     8     u64    schema_root_page           Первая страница в schema/catalog.fgb
-168     8     u64    stats_root_page            Первая страница в stats/graph_stats.fgb
-176     128   u8[]   graph_name                 UTF-8 null-terminated, max 127 символов
-304     16080 —      _reserved
+Offset  Size  Тип    Поле
+0       32    —      PageHeader (type=GraphSuperblock, page_no=0)
+32      8     u64    graph_id
+40      4     u32    format_version
+44      4     u32    last_back_compat_version
+48      8     u64    generation
+56      8     u64    backfilled_lsn
+64      8     u64    created_at_ms              Unix ms
+72      8     u64    updated_at_ms              Unix ms
+80      8     u64    node_capacity              Текущая ёмкость node pool
+88      8     u64    edge_capacity              Ёмкость edge pool
+96      8     u64    node_count                 Живых вершин
+104     8     u64    edge_count                 Живых рёбер
+112     8     u64    subgraph_capacity          Ёмкость subgraph arena
+120     8     u64    subgraph_count             Число живых подграфов
+128     8     u64    node_hot_pages             Страниц в nodes_hot.fgb
+136     8     u64    edge_hot_pages             Страниц в edges_hot.fgb
+144     8     u64    properties_pages           Страниц в props.fgb
+152     8     u64    labels_size_bytes          Размер labels.fgb в байтах
+160     8     u64    flags                      bit0=encrypted, bit1=lz4_props, bit2=read_only
+168     8     u64    schema_root_page           Первая страница в schema/catalog.fgb
+176     8     u64    stats_root_page            Первая страница в stats/graph_stats.fgb
+184     128   u8[]   graph_name                 UTF-8 NUL-terminated, max 127 bytes
+312     ...   —      _reserved                  только нули
 ```
+
+`PageHeader.page_lsn` хранит LSN соответствующего `CheckpointEnd`. `GraphSuperblock` принадлежит
+checkpoint-протоколу: обычный `stage_frame` не имеет права писать его через WAL. Частично
+продвинутый graph superblock после crash не становится глобальной authority, пока тем же
+checkpoint не заменён `db.fgb`.
 
 ---
 
@@ -2771,7 +2832,7 @@ TxAbort         = 0x32,   // Явный откат
 PageFrame       = 0x33,   // Полный образ страницы
 PageInit        = 0x34,   // Пустая аллокация страницы после checkpoint
 CheckpointBegin = 0x35,
-CheckpointEnd   = 0x36,   // checkpoint_lsn + dirty page table
+CheckpointEnd   = 0x36,   // generation + backfill_lsn
 GraphCreate     = 0x37,   // graph_id + name
 GraphDrop       = 0x38,   // graph_id
 ```
@@ -2785,29 +2846,42 @@ GraphDrop       = 0x38,   // graph_id
 Заголовок записи:
 
 ```
-[ MVCE:4 ][ lsn:8 ][ tx_id:8 ][ kind:1 ][ payload_len:4 ][ checksum:8 ] = 33 байта
+[ FGW1:4 ][ lsn:8 ][ tx_id:8 ][ kind:1 ][ payload_len:4 ][ checksum:8 ] = 33 байта
 ```
+
+`FGW1` одновременно версионирует новый `DataFileId` payload-контракт. Экспериментальный magic
+среза 3a `MVCE` явно отклоняется: его `file_kind + pad[7]` нельзя двусмысленно принять за
+`DataFileId(instance_id = 0)`.
 
 `checksum` — portable RapidHash V3 (seed `0`, `RapidSecrets::seed_cpp(0)`) по
 `lsn ‖ tx_id ‖ kind ‖ payload_len ‖ payload`. Алгоритм и seed совпадают с checksum страницы (§8).
+`payload_len` не превышает размер `PageFrame` (16 408 байт); scanner проверяет границу до
+allocation.
 
 Payload по видам:
 
 ```
-PageFrame:       graph_id(u64) + file_kind(u8) + _pad(7) + page_no(u64) + page_bytes(PAGE_SIZE)
+PageFrame:       graph_id(u64) + file_id(u64) + page_no(u64) + page_bytes(PAGE_SIZE)
                  Total = 16408 байт
-PageInit:        graph_id(u64) + file_kind(u8) + _pad(1) + page_type(u16) + _pad(4) + page_no(u64)
+PageInit:        graph_id(u64) + file_id(u64) + page_type(u16) + reserved[6] + page_no(u64)
+                 Total = 32 байта; reserved = 0
 TxBegin:         (пусто)
 TxCommit:        commit_ts(u64) + frame_count(u32) + _pad(4)
 TxAbort:         (пусто)
 CheckpointBegin: (пусто)
-CheckpointEnd:   checkpoint_lsn(u64) + dpt_len(u32) + [ (graph_id u64, file_kind u8, _pad u8[7],
-                                                         page_no u64, rec_lsn u64) × N ]
+CheckpointEnd:   generation(u64) + backfill_lsn(u64)
 GraphCreate:     graph_id(u64) + name_len(u16) + name_utf8(variable)
 GraphDrop:       graph_id(u64)
 ```
 
-**`PageKey = (graph_id: u64, file_kind: u8, page_no: u64)`** — ключ индекса версий страниц. `graph_id = SYSTEM_GRAPH_ID = 0` адресует системное пространство (каталог схемы, каталог графов, параметры, функции), поэтому DDL и данные покрываются одним механизмом.
+`CheckpointEnd` допустим только после хотя бы одного незакрытого `CheckpointBegin`;
+`backfill_lsn` ненулевой и не превышает уже durable `TxCommit`-границу. Несколько `CheckpointBegin`
+подряд разрешены: так журнал представляет повтор после ошибки backfill до commit point.
+
+**`PageKey = (GraphId, DataFileId, PageNo)`** — ключ индекса версий страниц. `graph_id =
+SYSTEM_GRAPH_ID = 0` адресует системное пространство. Dirty-page table не хранится: recovery и
+без неё строит индекс одним streaming-проходом, а checkpoint выбирает latest eligible frame из
+этого индекса.
 
 `PageInit` разрешён только для регистрации **пустой** аллокации страницы после последнего
 checkpoint. Он не доказывает и не восстанавливает содержимое. Первая же содержательная мутация
@@ -2820,7 +2894,10 @@ checkpoint. Он не доказывает и не восстанавливае�
 для которого `commit_lsn ≤ S.visible_lsn`; если такого нет — читать `.fgb`. Фреймы без durable
 `TxCommit` в индекс видимых версий не входят.
 
-Стоимость — один хеш-поиск на промах буфер-пула. В read-heavy фазе после бэкфилла индекс пуст, поэтому доминирующая нагрузка не платит ничего. Память — порядка 16 байт на фрейм: миллион неотбэкфилленных страниц ≈ 16 МБ.
+Стоимость — один хеш-поиск на промах буфер-пула. В read-heavy фазе после бэкфилла индекс пуст,
+поэтому доминирующая нагрузка не платит ничего. Одна `FrameVersion` format v1 хранит четыре
+`u64` (32 байта) плюс overhead `HashMap`/`Vec`: миллион неотбэкфилленных версий требует не менее
+≈ 32 МиБ до учёта ключей и capacity.
 
 Индекс восстанавливается при старте одним проходом по журналу и не персистится отдельно.
 
@@ -2840,68 +2917,71 @@ checkpoint. Он не доказывает и не восстанавливае�
 
 ### 23.1. Checkpoint — бэкфилл фреймов
 
-Checkpoint переносит закоммиченные фреймы из журнала обратно в `.fgb` **на их штатные места** и затем обрезает журнал.
+Checkpoint переносит latest committed frame каждой страницы обратно в `.fgb` **на штатное
+место**. В срезе 3b поддерживается только пассивный режим:
 
-```
-1. WAL: append CheckpointBegin
-2. Вычислить backfill_watermark = min(durable_visible_lsn,
-                                      oldest_reader_visible_lsn или durable_visible_lsn)
-3. Для каждого графа (независимо, в любом порядке):
-     для каждого committed-фрейма с commit_lsn ≤ backfill_watermark
-                                  и frame_lsn > page_lsn страницы:
-         записать образ страницы по адресу page_no в соответствующий .fgb
-         page_lsn := frame_lsn
-4. fsync каждого затронутого .fgb
-5. Обновить пографовые водяные знаки: GraphSuperblock.backfilled_lsn
-6. WAL: append CheckpointEnd { checkpoint_lsn, dirty_page_table }
-7. WAL: flush + sync_data
-8. Атомарно обновить db.fgb (глобальный checkpoint_lsn), tmp → rename
-9. prune_before(prunable_prefix) — обрезать журнал
-```
+1. Полный checkpoint сериализуется отдельным mutex.
+2. Под коротким snapshot write-gate атомарно захватываются `durable_visible_lsn` и активные
+   readers: `target = min(durable_visible_lsn, oldest_reader_lsn.unwrap_or(durable_visible_lsn))`.
+3. Если `target ≤ checkpoint_lsn`, операция завершается без записей.
+4. Под WAL writer lock назначается следующая `generation`, добавляется `CheckpointBegin` и
+   фиксируется latest complete frame каждой страницы с `commit_lsn ≤ target`.
+5. Фреймы читаются в переиспользуемый aligned extent, группируются по `DataFileId` и соседним
+   home-страницам; cache/WAL metadata locks во время Direct I/O не удерживаются.
+6. Каждый затронутый data-файл синхронизируется ровно один раз.
+7. Добавляется `CheckpointEnd { generation, backfill_lsn: target }`, затем WAL выполняет
+   `flush + sync_data`; LSN этой записи становится `checkpoint_record_lsn`.
+8. Атомарно заменяются все `GraphSuperblock`, последним — `db.fgb`. Только успешная замена
+   `db.fgb` является commit point checkpoint.
+9. Под exclusive prune-gate публикуется новая home generation, из version index удаляются версии
+   с `commit_lsn ≤ target` (latest-commit metadata для FCW сохраняется), затем удаляются только
+   закрытые WAL-сегменты, чей последний LSN `≤ target`.
 
-**Что копируется.** Только фреймы транзакций с durable-маркером `TxCommit`, причём не новее
-`backfill_watermark`. Фрейм незавершённой транзакции физически не может попасть в файл данных.
-Sync MVP держит atom-delta write-set в памяти и ограничивает его 256 МиБ; unlimited spill не
-является частью текущего контракта.
+Ошибка до замены `db.fgb` не меняет version index и не разрешает prune. Ошибка удаления сегмента
+после commit point означает завершённый checkpoint с лишним, но безопасным WAL-префиксом.
 
-**Что можно делать пографово, а что нельзя.** Бэкфилл — пографовая работа и планируется независимо для каждого графа. Глобальна только **обрезка**:
+`begin_tx` удерживает shared snapshot-gate на короткой границе `snapshot capture + active
+registration`, поэтому reader не может потеряться между вычислением watermark и регистрацией.
+После захвата `target` checkpoint не ждёт старых читателей и не блокирует регистрацию новых.
+Текущая транзакция не пишет WAL до commit, поэтому отдельного
+`oldest_active_tx_first_frame` в prune-контракте нет.
 
-```
-prunable_prefix = min( min по живым графам (backfilled_lsn),
-                       oldest_reader_visible_lsn,
-                       oldest_active_tx_first_frame )
-```
+Старый reader ограничивает сам backfill: иначе обновлённый home-файл уничтожил бы его fallback-
+версию. `CheckpointMode::Restart`, snapshot timeout/cancellation и transaction spill относятся к
+этапу 4 и не входят в format-v1 срез 3b.
 
-Это стандартное ограничение любого общего журнала: PostgreSQL, InnoDB и RocksDB держат общий лог до минимума по всем объектам. Отсюда же следует патология: один граф, в который давно не было checkpoint'а, удерживает журнал целиком. Защита — `FG_WAL_MAX_TOTAL_BYTES`: при превышении принудительно запускается бэкфилл отстающего графа (аналог `max_total_wal_size` в RocksDB).
-
-**Идемпотентность и прерываемость.** Шаг 3 — чистый `memcpy` под защитой `page_lsn`, поэтому
-checkpoint можно прервать и перезапустить в любой момент без последствий. Обрезка (шаг 9)
-выполняется строго после `fsync` файлов данных: пока файл не синхронизирован, фреймы обязаны
-оставаться в журнале.
-
-**Долгие читатели.** Читатель удерживает `oldest_reader_visible_lsn`, который ограничивает и
-бэкфилл, и последующую обрезку. Перезапись `.fgb` более новой версией нарушила бы fallback-чтение
-старого снимка даже при сохранённом WAL, поэтому ограничить только prune недостаточно. Меры:
-`FG_MAX_SNAPSHOT_AGE_SEC` принудительно закрывает устаревшие снимки; режим checkpoint `Restart`
-блокирует новых читателей, чтобы дать журналу схлопнуться; для долгой аналитики предусмотрен
-режим 3 (`query_to_memory`), который материализует подграф в память и **освобождает снимок**.
+**Windows ownership и atomic replace.** Открытая локальная БД удерживает `db.lock` с
+`share_mode(0)` весь срок жизни manager; повторное открытие возвращает `LocalDatabaseBusy`
+(`FG-51I03`). Суперблок кодируется как одна aligned page в соседний `.tmp`, выполняет `sync_all`,
+закрывает handle и заменяет main через
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`. Checkpoint-owned graph
+superblocks не держат открытого handle между заменами. Unix ownership/replace в срезе 3b —
+компилируемый `unsupported`; порт и нативные crash-tests остаются release-gate.
 
 ### 23.2. Recovery
 
 Восстановление — один упорядоченный проход по журналу. Отдельных фаз analysis/redo/undo нет, каталога процедур на каждый вид записи нет.
 
 ```
-1. Прочитать db.fgb → checkpoint_lsn (при повреждении — из .tmp, иначе FATAL).
-2. Проход по журналу с checkpoint_lsn:
-     построить индекс версий страниц: PageKey → [(frame_lsn, commit_lsn, offset)]
-     зафиксировать транзакции с durable-маркером TxCommit
-     отметить graph_id, удалённые записями GraphDrop
-3. Отбросить фреймы транзакций без маркера коммита (это и есть весь «откат»).
-4. Применить закоммиченные фреймы в порядке возрастания LSN:
-     пропустить фреймы для удалённых graph_id
-     применить, если lsn > page_lsn страницы (или страница повреждена — см. §23.4)
-5. fsync файлов данных.
-6. Записать свежий checkpoint.
+1. Эксклюзивно открыть `db.lock`. Для `db.fgb` и соседнего `.tmp` проверить checksum/format/
+   clocks и выбрать максимальную пару `(generation, page_lsn)`. Равная пара с разными байтами —
+   corruption; выбранный `.tmp` продвигается в main.
+2. Передать persisted clocks выбранного `db.fgb` как seed в streaming WAL scanner. После
+   законного prune первый retained segment может начинаться не с LSN 1; gap после
+   `checkpoint_lsn` остаётся fatal.
+3. Для `generation > 0` найти совпадающий
+   `CheckpointEnd(checkpoint_record_lsn, generation, checkpoint_lsn)`.
+4. Одним проходом построить version index, отбросить транзакции без durable `TxCommit` и
+   восстановить clocks как максимум persisted seed и WAL tail. LSN, TxId, CommitTs и file
+   instance id никогда не переиспользуются.
+5. Применить committed frames с `frame_lsn > checkpoint_lsn` строго по возрастанию frame LSN.
+   Путь берётся только из sealed file registry; отсутствующий id или разрыв файла — corruption.
+   Один переиспользуемый aligned buffer ограничивает память recovery.
+6. Полный frame перезаписывает torn home page. После replay синхронизировать каждый затронутый
+   файл один раз; любая повреждённая home-страница без более нового retained frame даёт
+   `InvalidStoragePage`.
+7. Выполнить свежий passive checkpoint. До его успешного commit point менеджер не публикуется
+   вызывающему коду.
 ```
 
 **Порядок строго по LSN, а не по коммитам.** Это принципиально. Прежняя редакция буферизовала операции по транзакциям и применяла их в момент `COMMIT`, из-за чего при пересечении двух транзакций на одной странице закоммиченное изменение могло быть **молча потеряно**:

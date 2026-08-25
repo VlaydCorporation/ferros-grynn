@@ -19,7 +19,10 @@ use parking_lot::{Condvar, Mutex};
 use rapidhash::{HashMapExt, HashSetExt, RapidHashMap, RapidHashSet};
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
-use super::page::{AlignedPage, PAGE_SIZE, PageHeader, PageLsn, PageNo};
+use super::{
+	page::{AlignedPage, PAGE_SIZE, PageHeader, PageLsn, PageNo},
+	types::{CheckpointGeneration, Lsn, PageKey},
+};
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
 /// Maximum number of complete clock passes made before applying backpressure.
@@ -31,55 +34,50 @@ const PARALLEL_VALIDATION_MIN_PAGES: usize = 16;
 /// Shared immutable page backed by one permanently aligned frame allocation.
 type CachedPage = Arc<Box<AlignedPage>>;
 
-/// Identity of one physical page source within a buffer pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct CacheSourceId(u64);
-
-impl CacheSourceId {
-	/// Creates an opaque cache-source identity.
-	pub(super) const fn new(value: u64) -> Self {
-		Self(value)
-	}
-
-	/// Returns the contained identity.
-	pub(super) const fn get(self) -> u64 {
-		self.0
-	}
+/// Immutable source version represented by one cache entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum PageCacheVersion {
+	/// Exact full-page image retained in WAL.
+	Wal(PageLsn),
+	/// Home-file image under one logical checkpoint generation.
+	Home {
+		/// Generation that invalidates every older home-cache entry.
+		generation: CheckpointGeneration,
+		/// Highest page LSN permitted by the database checkpoint.
+		ceiling: Lsn,
+	},
 }
 
 /// Complete identity of one immutable page version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct PageCacheKey {
-	/// Physical source containing the page.
-	source_id: CacheSourceId,
-	/// Physical number within the source.
-	page_no: PageNo,
-	/// Exact page image version expected from the source.
-	version: PageLsn,
+	/// Complete database page identity.
+	page_key: PageKey,
+	/// WAL-exact or checkpoint-generation home version.
+	version: PageCacheVersion,
 }
 
 impl PageCacheKey {
 	/// Creates a cache key for one exact page image.
-	pub(super) const fn new(source_id: CacheSourceId, page_no: PageNo, version: PageLsn) -> Self {
+	pub(super) const fn new(page_key: PageKey, version: PageCacheVersion) -> Self {
 		Self {
-			source_id,
-			page_no,
+			page_key,
 			version,
 		}
 	}
 
-	/// Returns the physical source identity.
-	pub(super) const fn source_id(self) -> CacheSourceId {
-		self.source_id
+	/// Returns the complete physical page identity.
+	pub(super) const fn page_key(self) -> PageKey {
+		self.page_key
 	}
 
 	/// Returns the physical page number.
 	pub(super) const fn page_no(self) -> PageNo {
-		self.page_no
+		self.page_key.page_no()
 	}
 
-	/// Returns the exact page version.
-	pub(super) const fn version(self) -> PageLsn {
+	/// Returns the immutable cache-source version.
+	pub(super) const fn version(self) -> PageCacheVersion {
 		self.version
 	}
 }
@@ -189,6 +187,11 @@ impl BufferPool {
 		}
 	}
 
+	/// Returns the fixed number of permanently allocated page frames.
+	pub(super) fn capacity(&self) -> usize {
+		self.shared.state.lock().frames.len()
+	}
+
 	/// Returns a pinned page, loading and validating it on a miss.
 	///
 	/// Only one caller executes `loader` for a particular key. Other callers
@@ -275,7 +278,7 @@ impl BufferPool {
 		mut loader: Loader,
 	) -> FerrosGrynnResult<Vec<PageGuard>>
 	where
-		Loader: FnMut(CacheSourceId, PageNo, &mut [AlignedPage]) -> FerrosGrynnResult<()>,
+		Loader: FnMut(PageKey, &mut [AlignedPage]) -> FerrosGrynnResult<()>,
 	{
 		if keys.is_empty() {
 			return Ok(Vec::new());
@@ -369,7 +372,7 @@ impl BufferPool {
 		drop(batch_admission);
 
 		loading.sort_unstable_by_key(|reservation| {
-			(reservation.key.source_id().get(), reservation.key.page_no().get())
+			(reservation.key.page_key(), reservation.key.version())
 		});
 		let load_result = load_reserved_extents(&mut loading, scratch, &mut loader);
 		if let Err(error) = load_result {
@@ -583,18 +586,20 @@ fn load_reserved_extents<Loader>(
 	loader: &mut Loader,
 ) -> FerrosGrynnResult<()>
 where
-	Loader: FnMut(CacheSourceId, PageNo, &mut [AlignedPage]) -> FerrosGrynnResult<()>,
+	Loader: FnMut(PageKey, &mut [AlignedPage]) -> FerrosGrynnResult<()>,
 {
 	let mut extent_start = 0;
 	while extent_start < reservations.len() {
-		let source_id = reservations[extent_start].key.source_id();
-		let first_page = reservations[extent_start].key.page_no();
+		let first_key = reservations[extent_start].key.page_key();
+		let version = reservations[extent_start].key.version();
 		let mut extent_end = extent_start + 1;
 		while extent_end < reservations.len() && extent_end - extent_start < scratch.len() {
 			let previous = reservations[extent_end - 1].key;
 			let current = reservations[extent_end].key;
 			let adjacent = previous.page_no().get().checked_add(1) == Some(current.page_no().get());
-			if current.source_id() != source_id || !adjacent {
+			let same_file = current.page_key().graph_id() == first_key.graph_id()
+				&& current.page_key().file_id() == first_key.file_id();
+			if !same_file || current.version() != version || !adjacent {
 				break;
 			}
 			extent_end += 1;
@@ -602,7 +607,7 @@ where
 
 		let extent_len = extent_end - extent_start;
 		let extent_pages = &mut scratch[..extent_len];
-		loader(source_id, first_page, extent_pages)?;
+		loader(first_key, extent_pages)?;
 		let extent_reservations = &mut reservations[extent_start..extent_end];
 		if extent_len >= PARALLEL_VALIDATION_MIN_PAGES {
 			extent_reservations.par_iter_mut().zip(extent_pages.par_iter_mut()).try_for_each(
@@ -979,7 +984,7 @@ impl ClockPro {
 	}
 }
 
-/// Ensures a loader returned the exact immutable page version named by its key.
+/// Ensures a loader returned the immutable page version named by its key.
 fn validate_loaded_header(key: PageCacheKey, header: PageHeader) -> FerrosGrynnResult<()> {
 	if header.page_no() != key.page_no() {
 		return Err(FerrosGrynnError::invalid_storage_page(
@@ -987,15 +992,34 @@ fn validate_loaded_header(key: PageCacheKey, header: PageHeader) -> FerrosGrynnR
 			format!("loader returned page {}", header.page_no().get()),
 		));
 	}
-	if header.page_lsn() != key.version() {
-		return Err(FerrosGrynnError::invalid_storage_page(
-			key.page_no().get(),
-			format!(
-				"loader returned page LSN {}, expected {}",
-				header.page_lsn().get(),
-				key.version().get()
-			),
-		));
+	match key.version() {
+		PageCacheVersion::Wal(expected) if header.page_lsn() != expected => {
+			return Err(FerrosGrynnError::invalid_storage_page(
+				key.page_no().get(),
+				format!(
+					"loader returned page LSN {}, expected WAL LSN {}",
+					header.page_lsn().get(),
+					expected.get()
+				),
+			));
+		}
+		PageCacheVersion::Home {
+			ceiling,
+			..
+		} if header.page_lsn().get() > ceiling.get() => {
+			return Err(FerrosGrynnError::invalid_storage_page(
+				key.page_no().get(),
+				format!(
+					"home page LSN {} exceeds checkpoint ceiling {}",
+					header.page_lsn().get(),
+					ceiling.get()
+				),
+			));
+		}
+		PageCacheVersion::Wal(_)
+		| PageCacheVersion::Home {
+			..
+		} => {}
 	}
 	Ok(())
 }
@@ -1020,10 +1044,13 @@ mod tests {
 	};
 
 	use super::*;
-	use crate::storage::page::{PAGE_HEADER_SIZE, PageFlags, PageType};
+	use crate::storage::{
+		page::{PAGE_HEADER_SIZE, PageFlags, PageType},
+		types::{DataFileId, DataFileKind, GraphId},
+	};
 
-	/// Cache source used by deterministic unit tests.
-	const TEST_SOURCE: CacheSourceId = CacheSourceId::new(1);
+	/// Data file used by deterministic unit tests.
+	const TEST_FILE_ID: DataFileId = DataFileId::for_kind(DataFileKind::SystemCatalog);
 	/// Maximum time allowed for a deterministic inter-thread handoff.
 	const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1034,7 +1061,18 @@ mod tests {
 
 	/// Creates a typed cache key for the test source.
 	const fn key(page_no: u64, version: u64) -> PageCacheKey {
-		PageCacheKey::new(TEST_SOURCE, PageNo::new(page_no), PageLsn::new(version))
+		PageCacheKey::new(
+			PageKey::new(GraphId::SYSTEM, TEST_FILE_ID, PageNo::new(page_no)),
+			PageCacheVersion::Wal(PageLsn::new(version)),
+		)
+	}
+
+	/// Creates a WAL cache key for one page in the same physical file.
+	const fn file_key(first: PageKey, page_no: PageNo, version: PageLsn) -> PageCacheKey {
+		PageCacheKey::new(
+			PageKey::new(first.graph_id(), first.file_id(), page_no),
+			PageCacheVersion::Wal(version),
+		)
 	}
 
 	/// Builds and validates one sealed test page in the provided aligned frame.
@@ -1043,10 +1081,17 @@ mod tests {
 		key: PageCacheKey,
 		marker: u8,
 	) -> FerrosGrynnResult<PageHeader> {
+		let page_lsn = match key.version() {
+			PageCacheVersion::Wal(page_lsn) => page_lsn,
+			PageCacheVersion::Home {
+				ceiling,
+				..
+			} => PageLsn::new(ceiling.get()),
+		};
 		*page = AlignedPage::new(
 			PageType::StorageSuperblock,
 			PageFlags::empty(),
-			key.version(),
+			page_lsn,
 			key.page_no(),
 		);
 		page.as_bytes_mut()[PAGE_HEADER_SIZE] = marker;
@@ -1312,36 +1357,32 @@ mod tests {
 	#[test]
 	fn batch_preserves_order_duplicates_and_contiguous_extents() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(capacity(8)?);
-		let second_source = CacheSourceId::new(2);
-		let requests = [
-			key(2, 3),
-			key(0, 1),
-			key(2, 3),
-			PageCacheKey::new(second_source, PageNo::new(0), PageLsn::new(1)),
-			key(1, 2),
-			key(5, 6),
-		];
+		let second_key = PageCacheKey::new(
+			PageKey::new(GraphId::new(2), TEST_FILE_ID, PageNo::new(0)),
+			PageCacheVersion::Wal(PageLsn::new(1)),
+		);
+		let requests = [key(2, 1), key(0, 1), key(2, 1), second_key, key(1, 1), key(5, 1)];
 		let mut extents = Vec::new();
 		let mut scratch = (0..4).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
-		let pages = pool.get_or_load_batch(&requests, &mut scratch, |source, first, output| {
-			extents.push((source, first, output.len()));
+		let pages = pool.get_or_load_batch(&requests, &mut scratch, |first, output| {
+			extents.push((first, output.len()));
 			for (index, page) in output.iter_mut().enumerate() {
 				let raw_index = u64::try_from(index).map_err(|source| {
 					FerrosGrynnError::storage_io_failure(format!(
 						"test batch index conversion failed: {source}"
 					))
 				})?;
-				let page_no = PageNo::new(first.get() + raw_index);
-				let page_key = PageCacheKey::new(source, page_no, PageLsn::new(page_no.get() + 1));
+				let page_no = PageNo::new(first.page_no().get() + raw_index);
+				let page_key = file_key(first, page_no, PageLsn::new(1));
 				load_test_page(page, page_key, page_no.get() as u8)?;
 			}
 			Ok(())
 		})?;
 
 		assert_eq!(extents, [
-			(TEST_SOURCE, PageNo::new(0), 3),
-			(TEST_SOURCE, PageNo::new(5), 1),
-			(second_source, PageNo::new(0), 1),
+			(PageKey::new(GraphId::SYSTEM, TEST_FILE_ID, PageNo::new(0)), 3),
+			(PageKey::new(GraphId::SYSTEM, TEST_FILE_ID, PageNo::new(5)), 1),
+			(PageKey::new(GraphId::new(2), TEST_FILE_ID, PageNo::new(0)), 1),
 		]);
 		assert_eq!(
 			pages.iter().map(|guard| guard.as_bytes()[PAGE_HEADER_SIZE]).collect::<Vec<_>>(),
@@ -1358,15 +1399,15 @@ mod tests {
 		let requests = (0..page_count)
 			.map(|page_no| {
 				let page_no = page_no as u64;
-				key(page_no, page_no + 1)
+				key(page_no, 1)
 			})
 			.collect::<Vec<_>>();
 		let mut scratch = (0..page_count).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
 
-		let pages = pool.get_or_load_batch(&requests, &mut scratch, |source, first, output| {
+		let pages = pool.get_or_load_batch(&requests, &mut scratch, |first, output| {
 			for (index, page) in output.iter_mut().enumerate() {
-				let page_no = PageNo::new(first.get() + index as u64);
-				let page_key = PageCacheKey::new(source, page_no, PageLsn::new(page_no.get() + 1));
+				let page_no = PageNo::new(first.page_no().get() + index as u64);
+				let page_key = file_key(first, page_no, PageLsn::new(1));
 				load_test_page(page, page_key, page_no.get() as u8)?;
 			}
 			Ok(())
@@ -1389,7 +1430,7 @@ mod tests {
 		let requests = [key(0, 1), key(1, 2), key(2, 3)];
 		let mut scratch = (0..4).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
 		let error = pool
-			.get_or_load_batch(&requests, &mut scratch, |_source, _first, _pages| {
+			.get_or_load_batch(&requests, &mut scratch, |_first, _pages| {
 				Err(FerrosGrynnError::storage_io_failure("intentional batch failure"))
 			})
 			.err()
@@ -1437,8 +1478,8 @@ mod tests {
 			batch_pool.get_or_load_batch(
 				&[resident_key, loading_key, missing_key, missing_key],
 				&mut scratch,
-				|source, first, pages| {
-					if source != TEST_SOURCE || first != missing_key.page_no() || pages.len() != 1 {
+				|first, pages| {
+					if first != missing_key.page_key() || pages.len() != 1 {
 						return Err(FerrosGrynnError::storage_io_failure(
 							"batch loader received an unexpected extent",
 						));
@@ -1483,12 +1524,12 @@ mod tests {
 			let requests = [key(1, 2), key(2, 3)];
 			let mut scratch = (0..2).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
 			let result = first_pool
-				.get_or_load_batch(&requests, &mut scratch, |source, first_page, output| {
+				.get_or_load_batch(&requests, &mut scratch, |first, output| {
 					for (index, page) in output.iter_mut().enumerate() {
-						let page_no = PageNo::new(first_page.get() + index as u64);
+						let page_no = PageNo::new(first.page_no().get() + index as u64);
 						load_test_page(
 							page,
-							PageCacheKey::new(source, page_no, PageLsn::new(page_no.get() + 1)),
+							file_key(first, page_no, PageLsn::new(page_no.get() + 1)),
 							page_no.get() as u8,
 						)?;
 					}
@@ -1508,12 +1549,12 @@ mod tests {
 			let requests = [key(3, 4), key(4, 5)];
 			let mut scratch = (0..2).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
 			let result = second_pool
-				.get_or_load_batch(&requests, &mut scratch, |source, first_page, output| {
+				.get_or_load_batch(&requests, &mut scratch, |first, output| {
 					for (index, page) in output.iter_mut().enumerate() {
-						let page_no = PageNo::new(first_page.get() + index as u64);
+						let page_no = PageNo::new(first.page_no().get() + index as u64);
 						load_test_page(
 							page,
-							PageCacheKey::new(source, page_no, PageLsn::new(page_no.get() + 1)),
+							file_key(first, page_no, PageLsn::new(page_no.get() + 1)),
 							page_no.get() as u8,
 						)?;
 					}

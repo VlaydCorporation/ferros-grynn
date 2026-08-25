@@ -138,8 +138,11 @@ src/
     page.rs           -- AlignedPage, typed PageHeader fields, portable checksum codec
     direct.rs         -- sync positional Direct I/O (Linux/Windows)
     buffer_pool.rs    -- Clock-Pro после раннего I/O-gate
-    page_manager.rs   -- PageManager, PageGuard, StorageSnapshot
-    superblock.rs     -- StorageSuperblock, NamespaceSuperblock, DatabseSuperblock, GraphSuperblock
+    types.rs          -- Lsn/TxId/GraphId/DataFileId/PageKey/StorageSnapshot
+    file_registry.rs  -- sealed trusted data-file routing
+    local.rs          -- Windows db.lock + atomic superblock replace
+    page_manager.rs   -- SyncPageManager, PageRead, checkpoint/recovery
+    superblock.rs     -- DatabaseSuperblock, GraphSuperblock codecs
     node_pages.rs     -- NodeHotSlot, NodeHotPage
     edge_pages.rs     -- EdgeHotSlot, EdgeHotPage
     adj_overflow.rs   -- AdjacencyOverflowPage, CrossLevelAdjacencyOverflowPage
@@ -243,7 +246,7 @@ Mutable/live/snapshot-bound graph objects не помещаются в `Value`. 
 `from_disk_ref(r, gen)` восстанавливает `AtomId`. Материализация результата делает обратный
 маппинг.
 
-### 3.3. `PageManager` — страничный доступ (frame-WAL) (🔴 P2)
+### 3.3. `SyncPageManager` — страничный доступ (frame-WAL) (🟢 P2, Windows-first)
 
 🔄 **Действующий контракт** — из `gql_tech_spec.md` §10.2. Он заменяет более раннюю редакцию
 (`alloc/free/read/write_page_dirty/flush_*/page_count`), которая предполагала STEAL и запись
@@ -251,33 +254,33 @@ Mutable/live/snapshot-bound graph objects не помещаются в `Value`. 
 параметризовано снимком.
 
 ```rust
-pub(crate) struct StorageSnapshot {
-    pub(crate) commit_ts: CommitTs,
-    pub(crate) visible_lsn: Lsn,
+enum PageRead<'tx> {
+    Staged(&'tx AlignedPage),
+    Cached(PageGuard),
 }
 
-pub(crate) trait PageManager: Send + Sync {
-    fn begin_tx(&self) -> TxHandle;
-    fn alloc_page(&self, tx: &TxHandle, key: PageKey) -> FerrosGrynnResult<u64>;
-    fn free_page(&self, tx: &TxHandle, key: PageKey) -> FerrosGrynnResult<()>;
-    /// Guard pin'ит immutable frame и не переживает manager/transaction.
-    fn read_page(&self, key: PageKey, snapshot: StorageSnapshot)
-        -> FerrosGrynnResult<PageGuard<'_>>;
-    fn read_pages(&self, keys: &[PageKey], snapshot: StorageSnapshot)
-        -> FerrosGrynnResult<Vec<PageGuard<'_>>>;
-    /// Запись — новый фрейм в журнал; LSN назначает журнал, не вызывающий
-    fn write_frame(&self, tx: &TxHandle, key: PageKey, page: &AlignedPage)
-        -> FerrosGrynnResult<Lsn>;
-    fn commit_tx(&self, tx: TxHandle) -> FerrosGrynnResult<CommitTs>;
+impl SyncPageManager {
+    fn begin_tx(&self) -> FerrosGrynnResult<TxHandle>;
+    fn read_page<'tx>(&self, tx: &'tx TxHandle, key: PageKey)
+        -> FerrosGrynnResult<PageRead<'tx>>;
+    fn read_pages<'tx>(&self, tx: &'tx TxHandle, keys: &[PageKey])
+        -> FerrosGrynnResult<Vec<PageRead<'tx>>>;
+    fn stage_frame(&self, tx: &mut TxHandle, key: PageKey, page: &AlignedPage)
+        -> FerrosGrynnResult<()>;
+    fn commit_tx(&self, tx: TxHandle) -> FerrosGrynnResult<CommitOutcome>;
     fn abort_tx(&self, tx: TxHandle);
-    fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<()>;
+    fn checkpoint(&self) -> FerrosGrynnResult<()>;
 }
 ```
 
+Оставлен один concrete crate-private manager: trait с одной реализацией не нужен. `TxHandle`
+удерживает регистрацию snapshot; bare `StorageSnapshot` наружу не передаётся. `alloc/free`,
+durable file catalog и `CheckpointMode::Restart` входят в этап 4.
+
 `PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
 (seed `0`, checksum-поле обнулено при вычислении).
-`PageKey = (graph_id, file_kind, page_no)`; `graph_id = 0` — системное пространство (каталог схемы
-и графов). Версия фрейма доступна только при `commit_lsn ≤ snapshot.visible_lsn`; `commit_ts`
+`PageKey = (GraphId, DataFileId, PageNo)`; `graph_id = 0` — системное пространство (каталог схемы
+и графов). Версия фрейма доступна только при `commit_lsn ≤ tx.snapshot.visible_lsn`; `commit_ts`
 используется отдельно для MVCC/SSI. Checkpoint не продвигает `.fgb` дальше самого старого живого
 reader watermark. При рассинхроне страница восстанавливается применением фрейма из журнала.
 
@@ -328,7 +331,7 @@ impl EndpointTensor {
 
 | Компонент                       | Где                                      | Что делает                                    |
 |---------------------------------|------------------------------------------|-----------------------------------------------|
-| `PageManager` trait             | `storage/page_manager.rs`                | Абстракция page-level I/O (frame-WAL, §3.3)   |
+| `SyncPageManager`               | `storage/page_manager.rs`                | WAL/home page-level I/O (frame-WAL, §3.3)     |
 | `DiskMetaGraph`                 | `storage/disk_graph.rs`                  | Disk-backed MetaGraph                         |
 | `NodeHotSlot` / `EdgeHotSlot`   | `storage/node_pages.rs`, `edge_pages.rs` | Encode/decode hot-слотов                      |
 | `PropHeapPage`                  | `storage/prop_heap.rs`                   | Slotted-page для PropertyMap                  |
@@ -468,10 +471,12 @@ Disk-backed режим 2. Зависит от A.
 - **Sync Direct I/O + `BufferPool`** 🟡 — `AlignedPage`, безопасный LE page codec, RAII
   positional exact-read/exact-write и calibrated batch в `src/storage`; Linux `O_DIRECT`, Windows
   `FILE_FLAG_NO_BUFFERING`, без `O_SYNC`/`WRITE_THROUGH` и buffered fallback. Windows gate пройден,
-  Linux/NVMe и soak ещё обязательны.
-- **`PageManager`** 🔴 (§3.3) — read-only `SyncPageManager` уже соединяет Direct I/O и version-aware
-  `BufferPool`; полный snapshot/frame-WAL контракт относится к следующему этапу. Optional Native
-  Async добавляется только после полного sync correctness/performance gate.
+  Linux/NVMe реализация/прогон и soak явно отложены до появления тестового окружения и остаются
+  release-gate перед выпуском Unix-поддержки.
+- **`SyncPageManager`** 🟢 (§3.3, Windows-first) — snapshot-aware concrete manager объединяет staged/WAL/home
+  read path, versioned `BufferPool`, sealed `DataFileId` registry, passive checkpoint и recovery.
+  Публичный `Datastore`, alloc/free и durable catalog population остаются этапом 4. Optional
+  Native Async добавляется только после полного sync correctness/performance gate.
 - **`DiskMetaGraph`** 🔴 — фасад над страницами (`storage/disk_graph.rs`).
 - **Disk-страницы** 🟡→🔴 — `NodeHotSlot`/`EdgeHotSlot`, `AdjacencyOverflowPage`,
   `PropHeapPage` (slotted), `SubgraphDirPage`, `FreelistPage`, `LabelDictionary`. Незавершённый
@@ -488,20 +493,27 @@ Disk-backed режим 2. Зависит от A.
 Зависит от B. 🔄 Полностью переопределено под frame-WAL — ранняя редакция (`WalKind 0x10–0x22`,
 раздельные `MvccWal`/`DiskWal`, per-`WalKind` idempotent-redo) **отменена**.
 
-- **frame-WAL** 🔴 — `WalKind` для frame-модели (`disk_storage_spec.md` §22.1: `TxBegin`,
+- **frame-WAL** 🟢 — `WalKind` для frame-модели (`disk_storage_spec.md` §22.1: `TxBegin`,
   `TxCommit`, `TxAbort`, `PageFrame`, `PageInit`, `CheckpointBegin`, `CheckpointEnd`,
-  `GraphCreate`, `GraphDrop`); 33-байтовый заголовок записи с portable RapidHash V3, seed 0;
+  `GraphCreate`, `GraphDrop`); magic `FGW1`, 33-байтовый заголовок записи с portable RapidHash V3,
+  seed 0; экспериментальный 3a magic `MVCE` не мигрируется и отклоняется;
   индекс версий хранит `(frame_lsn, commit_lsn, offset)`. `PageInit` описывает только пустую
   аллокацию; первая содержательная мутация всегда пишет полный `PageFrame`.
-- **Единый журнал уровня БД** 🔴 — глобальные часы коммитов; каталог графов в `db.fgb`.
-- **WAL transport** 🔴 — последовательный buffered `File`/`BufWriter`; под DB commit lock фреймы и
+- **Единый журнал уровня БД** 🟢 — global clocks, generation и checkpoint authority закреплены в
+  checksummed `db.fgb`; WAL открывается с persisted seed и допускает законный prefix prune.
+- **WAL transport** 🟢 — последовательный buffered `File`/`BufWriter`; под DB commit lock фреймы и
   `TxCommit` идут подряд, затем один `flush + sync_data`. LSN маркера становится durable
   `visible_lsn` только после barrier; Direct I/O для WAL не используется.
-- **checkpoint** 🔴 — бэкфилл фреймов в `.fgb` по home-адресам не дальше
-  `oldest_reader_visible_lsn`; prune только после fsync data-файлов и с учётом reader/active-tx
-  watermarks.
-- **recovery** 🔴 — один проход строго по возрастанию LSN (порядок обязателен: применение в
-  порядке коммитов вместо LSN давало потерю обновлений); torn-write закрывается фреймами.
+- **checkpoint** 🟢 — reader-safe passive target, aligned extent backfill, один sync на touched
+  file, durable `CheckpointEnd`, graph superblocks и последний commit point `db.fgb`; prune только
+  после него под exclusive gate.
+- **recovery** 🟢 — main/tmp selection, persisted clock seed, один streaming scan, replay строго
+  по frame LSN через sealed registry, torn-page repair и свежий passive checkpoint до publication.
+
+Срез 3b реализован Windows-first в `src/storage`: typed format v1, `db.lock`, atomic replace,
+sealed registry, WAL/home manager, passive checkpoint/prune и seeded recovery. Unix runtime-port и
+нативный Linux/NVMe crash/performance gate явно отложены; non-Windows путь компилируется как
+`unsupported` и не объявляется готовым к выпуску.
 - **`mvcc_persist.rs`** 🟡 — переиспользовать `WalWriter`/`WalSegmentManager` как транспорт;
   `PersistLayer::checkpoint()` расширить на flush `.fgb`.
 
@@ -708,10 +720,12 @@ storage-интеграция зависит от B.
 - **Фаза 2a — sync Direct I/O** (P2): ✅ aligned page codec, RAII positional I/O, native проверки
   и calibrated batch reads/writes.
 - **Фаза 2b — ранний I/O-gate** (P2): 🟡 read-only Clock-Pro + benchmark-only mmap; Windows gate
-  пройден, Linux/NVMe и soak остаются обязательными до перехода к WAL/async.
+  пройден, Linux/NVMe реализация/прогон и soak отложены до доступного окружения и остаются
+  release-gate перед Unix/format-v1 выпуском, но не блокируют Windows frame-WAL срез.
 - **Фаза 3a — in-memory MVCC** (P2): ✅ RAM-часть Области D, COW-снимки, atom-level merge,
   serializable validation и точные предикаты.
-- **Фаза 3b — журнал и восстановление** (P2): Область C + durability-часть D после sync-gate.
+- **Фаза 3b — журнал и восстановление** (P2): ✅ Windows-first Область C; Unix release-gate и
+  внешний `Datastore` остаются следующими границами.
 - **Фаза 4 — query-конвейер MVP** (P2–P3): 🟡 H → I → J/K/L; read-only
   `Datastore::execute` для режима 1 подключён, optimizer/traversal остаются.
 - **Фаза 5 — схема, статистика, индексы** (P3–P4): E, F, G (Label/BTree/Count + bulk),
