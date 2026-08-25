@@ -128,11 +128,7 @@ impl QueryRead for TransactionRead<'_> {
 	}
 
 	fn get(&self, _snapshot: Snapshot, record: &RecordId) -> FerrosGrynnResult<Option<Row>> {
-		let row = self
-			.transaction
-			.query_rows(&self.snapshot, record.table())?
-			.into_iter()
-			.find(|row| &row.record_id == record);
+		let row = self.transaction.query_point(&self.snapshot, record)?;
 		self.transaction.register_query_point(
 			&self.snapshot,
 			record.table(),

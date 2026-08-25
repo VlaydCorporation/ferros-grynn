@@ -4,7 +4,7 @@ use std::{
 	sync::Arc,
 };
 
-use super::{AtomKind, AtomRef, EdgeView, GraphRead, NodeView, SnapshotId};
+use super::{AtomKind, AtomRef, GraphRead, SnapshotId};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{Number, Uuid},
@@ -128,7 +128,7 @@ impl Path {
 	pub fn resolve<'graph, R: GraphRead>(
 		&self,
 		graph: &'graph R,
-	) -> FerrosGrynnResult<ResolvedPath<'graph>> {
+	) -> FerrosGrynnResult<ResolvedPath<R::Node<'graph>, R::Edge<'graph>>> {
 		if graph.identity() != self.origin {
 			return Err(FerrosGrynnError::graph_identity_mismatch(
 				self.origin.to_string(),
@@ -196,15 +196,15 @@ impl Hash for Path {
 	}
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[non_exhaustive]
-pub enum ResolvedAtom<'graph> {
-	Node(NodeView<'graph>),
-	Edge(EdgeView<'graph>),
+pub enum ResolvedAtom<Node, Edge> {
+	Node(Node),
+	Edge(Edge),
 }
 
-impl ResolvedAtom<'_> {
-	pub const fn kind(self) -> AtomKind {
+impl<Node, Edge> ResolvedAtom<Node, Edge> {
+	pub const fn kind(&self) -> AtomKind {
 		match self {
 			Self::Node(_) => AtomKind::Node,
 			Self::Edge(_) => AtomKind::Edge,
@@ -212,40 +212,40 @@ impl ResolvedAtom<'_> {
 	}
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ResolvedPathStep<'graph> {
-	atom: ResolvedAtom<'graph>,
-	via_edge: Option<EdgeView<'graph>>,
+#[derive(Debug)]
+pub struct ResolvedPathStep<Node, Edge> {
+	atom: ResolvedAtom<Node, Edge>,
+	via_edge: Option<Edge>,
 	direction: PathDirection,
 	role: EndpointRole,
 }
 
-impl<'graph> ResolvedPathStep<'graph> {
-	pub const fn atom(self) -> ResolvedAtom<'graph> {
-		self.atom
+impl<Node, Edge> ResolvedPathStep<Node, Edge> {
+	pub const fn atom(&self) -> &ResolvedAtom<Node, Edge> {
+		&self.atom
 	}
 
-	pub const fn via_edge(self) -> Option<EdgeView<'graph>> {
-		self.via_edge
+	pub const fn via_edge(&self) -> Option<&Edge> {
+		self.via_edge.as_ref()
 	}
 
-	pub const fn direction(self) -> PathDirection {
+	pub const fn direction(&self) -> PathDirection {
 		self.direction
 	}
 
-	pub const fn role(self) -> EndpointRole {
+	pub const fn role(&self) -> EndpointRole {
 		self.role
 	}
 }
 
 #[derive(Debug)]
-pub struct ResolvedPath<'graph> {
-	steps: Vec<ResolvedPathStep<'graph>>,
+pub struct ResolvedPath<Node, Edge> {
+	steps: Vec<ResolvedPathStep<Node, Edge>>,
 	cost: Option<Number>,
 }
 
-impl<'graph> ResolvedPath<'graph> {
-	pub fn steps(&self) -> &[ResolvedPathStep<'graph>] {
+impl<Node, Edge> ResolvedPath<Node, Edge> {
+	pub fn steps(&self) -> &[ResolvedPathStep<Node, Edge>] {
 		&self.steps
 	}
 
@@ -344,18 +344,18 @@ impl PathTraceArena {
 fn resolve_atom<'graph, R: GraphRead>(
 	graph: &'graph R,
 	reference: &AtomRef,
-) -> FerrosGrynnResult<ResolvedAtom<'graph>> {
-	let id = graph.atom_id(reference).ok_or_else(|| {
+) -> FerrosGrynnResult<ResolvedAtom<R::Node<'graph>, R::Edge<'graph>>> {
+	let id = graph.atom_id(reference)?.ok_or_else(|| {
 		FerrosGrynnError::atom_does_not_exist(
 			reference.kind().to_string(),
 			reference.id().to_string(),
 		)
 	})?;
 	match reference.kind() {
-		AtomKind::Node => graph.node(id).map(ResolvedAtom::Node).ok_or_else(|| {
+		AtomKind::Node => graph.node(id)?.map(ResolvedAtom::Node).ok_or_else(|| {
 			FerrosGrynnError::atom_does_not_exist("node", reference.id().to_string())
 		}),
-		AtomKind::Edge => graph.edge(id).map(ResolvedAtom::Edge).ok_or_else(|| {
+		AtomKind::Edge => graph.edge(id)?.map(ResolvedAtom::Edge).ok_or_else(|| {
 			FerrosGrynnError::atom_does_not_exist("edge", reference.id().to_string())
 		}),
 	}
@@ -364,7 +364,7 @@ fn resolve_atom<'graph, R: GraphRead>(
 fn resolve_edge<'graph, R: GraphRead>(
 	graph: &'graph R,
 	reference: &AtomRef,
-) -> FerrosGrynnResult<EdgeView<'graph>> {
+) -> FerrosGrynnResult<R::Edge<'graph>> {
 	if reference.kind() != AtomKind::Edge {
 		return Err(FerrosGrynnError::atom_kind_mismatch(
 			reference.id().to_string(),
@@ -373,10 +373,10 @@ fn resolve_edge<'graph, R: GraphRead>(
 		));
 	}
 	let id = graph
-		.atom_id(reference)
+		.atom_id(reference)?
 		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", reference.id().to_string()))?;
 	graph
-		.edge(id)
+		.edge(id)?
 		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", reference.id().to_string()))
 }
 
@@ -400,9 +400,9 @@ mod tests {
 				PropertyMap::new(),
 			)
 			.unwrap();
-		let first_ref = graph.atom_ref(first).unwrap();
-		let second_ref = graph.atom_ref(second).unwrap();
-		let edge_ref = graph.atom_ref(edge).unwrap();
+		let first_ref = graph.atom_ref(first).unwrap().unwrap();
+		let second_ref = graph.atom_ref(second).unwrap().unwrap();
+		let edge_ref = graph.atom_ref(edge).unwrap().unwrap();
 		let mut arena = PathTraceArena::new();
 		let prefix = arena
 			.push(

@@ -1,5 +1,8 @@
 use std::{
+	borrow::Cow,
 	collections::{BTreeMap, BTreeSet},
+	num::NonZeroUsize,
+	path::Path,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -12,6 +15,19 @@ use parking_lot::{Mutex, RwLock};
 use crate::{
 	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	storage::{
+		LocalCommitGraph,
+		LocalCommitResult,
+		LocalCommitTable,
+		LocalCommitTableField,
+		LocalDatabaseSnapshot,
+		LocalEdgeRead,
+		LocalGraph,
+		LocalGraphView,
+		LocalNodeRead,
+		LocalReadTransaction,
+		LocalStore,
+	},
 	values::runtime::{
 		PropertyDictionary,
 		PropertyKeyId,
@@ -24,13 +40,19 @@ use crate::{
 		graph::{
 			AtomId,
 			AtomKind,
+			AtomRef,
 			Dag,
 			DirtyTarget,
+			EdgeDirection,
+			EdgeEndpoint,
+			EdgeRead,
+			EdgeTopology,
 			EdgeView,
 			Forest,
 			Frozen,
 			Graph,
 			GraphKind,
+			GraphMut,
 			GraphRead,
 			GraphRef,
 			GraphRefReader,
@@ -39,17 +61,97 @@ use crate::{
 			MaterializedGraph,
 			Metagraph,
 			Mutable,
+			NodeRead,
 			NodeView,
 			RootedTree,
 			SnapshotId,
 			Tree,
+			TreeOrientation,
 			merge_transaction_graph,
 		},
 	},
 };
 
+/// Default lifetime of one MVCC snapshot before cooperative cancellation.
 const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(300);
+/// Default logical transaction write-set ceiling.
 const DEFAULT_MAX_WRITE_SET_BYTES: usize = 256 * 1024 * 1024;
+/// Default 64-MiB pool measured in format-v1 pages.
+const DEFAULT_BUFFER_POOL_PAGES: usize = 4_096;
+/// Default WAL-only page ratio that triggers a passive checkpoint.
+const DEFAULT_CHECKPOINT_DIRTY_PERCENT: u8 = 25;
+/// Default maximum interval between passive checkpoint attempts.
+const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Physical I/O strategy selected for one local datastore.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IoMode {
+	/// Synchronous positional Direct I/O.
+	#[default]
+	Sync,
+	/// Native asynchronous I/O implemented by the later async storage stage.
+	NativeAsync,
+}
+
+/// Checkpoint behavior requested by an explicit maintenance call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CheckpointMode {
+	/// Advance only to the oldest active storage snapshot.
+	#[default]
+	Passive,
+	/// Cancel active storage snapshots and advance to the captured durable
+	/// tail.
+	Restart,
+}
+
+/// Automatic passive-checkpoint thresholds for a local datastore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckpointPolicy {
+	/// Percentage of the buffer-pool page count allowed to remain WAL-only.
+	pub unbackfilled_page_percent: u8,
+	/// Maximum time between checkpoint attempts while WAL-only pages exist.
+	pub interval: Duration,
+}
+
+impl Default for CheckpointPolicy {
+	fn default() -> Self {
+		Self {
+			unbackfilled_page_percent: DEFAULT_CHECKPOINT_DIRTY_PERCENT,
+			interval: DEFAULT_CHECKPOINT_INTERVAL,
+		}
+	}
+}
+
+/// Resource limits and I/O selection for a local datastore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LocalOptions {
+	/// Physical I/O implementation selected at open time.
+	pub io_mode: IoMode,
+	/// Exact number of 16-KiB frames in the bounded page cache.
+	pub buffer_pool_pages: usize,
+	/// Automatic passive-checkpoint thresholds.
+	pub checkpoint: CheckpointPolicy,
+	/// Maximum lifetime of one transaction snapshot.
+	pub max_snapshot_age: Duration,
+	/// Maximum estimated bytes in one transaction-private write set.
+	pub max_write_set_bytes: usize,
+}
+
+impl Default for LocalOptions {
+	fn default() -> Self {
+		Self {
+			io_mode: IoMode::Sync,
+			buffer_pool_pages: DEFAULT_BUFFER_POOL_PAGES,
+			checkpoint: CheckpointPolicy::default(),
+			max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
+			max_write_set_bytes: DEFAULT_MAX_WRITE_SET_BYTES,
+		}
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -64,6 +166,22 @@ impl Default for InMemoryOptions {
 			max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
 			max_write_set_bytes: DEFAULT_MAX_WRITE_SET_BYTES,
 		}
+	}
+}
+
+/// Backend and resource limits owned by one datastore instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DatastoreOptions {
+	/// Volatile in-process storage.
+	InMemory(InMemoryOptions),
+	/// Exclusively owned local disk storage.
+	Local(LocalOptions),
+}
+
+impl Default for DatastoreOptions {
+	fn default() -> Self {
+		Self::InMemory(InMemoryOptions::default())
 	}
 }
 
@@ -198,11 +316,29 @@ pub struct Datastore {
 }
 
 struct StoreInner {
-	options: InMemoryOptions,
+	options: DatastoreOptions,
+	backend: StoreBackend,
 	next_transaction: AtomicU64,
 	current: RwLock<Arc<DatabaseRoot>>,
 	commit: Mutex<()>,
 	active: Mutex<BTreeMap<u64, ActiveSnapshot>>,
+}
+
+/// Storage-specific durability owner behind the shared MVCC root.
+enum StoreBackend {
+	/// Volatile root with no durability owner.
+	InMemory,
+	/// Windows-first synchronous local durability owner.
+	Local(Box<LocalStore>),
+}
+
+impl StoreBackend {
+	fn local(&self) -> Option<&LocalStore> {
+		match self {
+			Self::InMemory => None,
+			Self::Local(store) => Some(store),
+		}
+	}
 }
 
 struct ActiveSnapshot {
@@ -222,13 +358,36 @@ struct DatabaseRoot {
 
 #[derive(Clone)]
 struct StoredGraph {
-	graph: Arc<MaterializedGraph>,
+	graph: StoredGraphValue,
+	record_index: Arc<BTreeMap<String, AtomId>>,
 	last_commit_ts: u64,
 	properties_version: u64,
 	node_set_version: u64,
 	edge_set_version: u64,
 	atom_versions: AtomVersions,
 	changes: CowVec<(u64, AtomId)>,
+}
+
+#[derive(Clone)]
+enum StoredGraphValue {
+	Materialized(Arc<MaterializedGraph>),
+	Local(Arc<LocalGraph>),
+}
+
+impl StoredGraphValue {
+	fn kind(&self) -> GraphKind {
+		match self {
+			Self::Materialized(graph) => graph.kind(),
+			Self::Local(graph) => graph.kind(),
+		}
+	}
+
+	fn materialized(&self) -> Option<&Arc<MaterializedGraph>> {
+		match self {
+			Self::Materialized(graph) => Some(graph),
+			Self::Local(_) => None,
+		}
+	}
 }
 
 #[derive(Clone, Default)]
@@ -323,6 +482,85 @@ impl Default for DatabaseRoot {
 }
 
 impl DatabaseRoot {
+	/// Rebuilds the in-process MVCC metadata around a recovered durable root.
+	fn from_local(snapshot: LocalDatabaseSnapshot) -> FerrosGrynnResult<Self> {
+		let LocalDatabaseSnapshot {
+			commit_ts,
+			property_dictionary,
+			graphs,
+			tables,
+		} = snapshot;
+		let dictionary = property_dictionary;
+		let mut root = Self {
+			commit_ts,
+			graphs: BTreeMap::new(),
+			graph_catalog_versions: BTreeMap::new(),
+			tables: BTreeMap::new(),
+			table_versions: BTreeMap::new(),
+			dictionary,
+		};
+		for entry in graphs {
+			if root.graphs.contains_key(&entry.record_id) {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"durable graph catalog contains duplicate RecordId values",
+				));
+			}
+			root.graph_catalog_versions.insert(entry.record_id.clone(), commit_ts);
+			root.graphs.insert(entry.record_id, StoredGraph {
+				graph: StoredGraphValue::Local(entry.graph),
+				record_index: Arc::new(BTreeMap::new()),
+				last_commit_ts: commit_ts,
+				properties_version: commit_ts,
+				node_set_version: commit_ts,
+				edge_set_version: commit_ts,
+				atom_versions: AtomVersions::default(),
+				changes: CowVec::new(),
+			});
+		}
+		for table in tables {
+			let stored = root.graphs.get(&table.graph).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"durable table references a graph absent from the recovered root",
+				)
+			})?;
+			let fields = table
+				.fields
+				.into_iter()
+				.map(|field| {
+					let key = PropertyKeyId::new(field.property_key);
+					if root.dictionary.get(&field.name) != Some(key) {
+						return Err(FerrosGrynnError::invalid_storage_file(
+							"durable table field disagrees with the property dictionary",
+						));
+					}
+					Ok(TableField {
+						name: field.name.into(),
+						value_type: field.value_type,
+						key: Some(key),
+					})
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let name = table.name;
+			let schema = TableSchema {
+				name: name.clone().into(),
+				graph: GraphRef::new(
+					table.graph,
+					stored.graph.kind(),
+					GraphStorageMode::DiskBacked,
+				),
+				kind: table.kind,
+				fields,
+			};
+			if root.tables.insert(name.clone(), Arc::new(schema)).is_some() {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"durable table catalog contains duplicate names",
+				));
+			}
+			root.table_versions.insert(name, commit_ts);
+		}
+		Ok(root)
+	}
+
 	fn version(&self, key: &ReadKey) -> u64 {
 		match key {
 			ReadKey::GraphCatalog(graph) => {
@@ -349,6 +587,125 @@ impl DatabaseRoot {
 	}
 }
 
+impl StoreInner {
+	/// Returns MVCC limits independent of the selected persistence backend.
+	const fn transaction_limits(&self) -> InMemoryOptions {
+		match self.options {
+			DatastoreOptions::InMemory(options) => options,
+			DatastoreOptions::Local(options) => InMemoryOptions {
+				max_snapshot_age: options.max_snapshot_age,
+				max_write_set_bytes: options.max_write_set_bytes,
+			},
+		}
+	}
+
+	/// Returns the graph-reference mode owned by this datastore.
+	const fn graph_storage_mode(&self) -> GraphStorageMode {
+		match self.backend {
+			StoreBackend::InMemory => GraphStorageMode::InMemory,
+			StoreBackend::Local(_) => GraphStorageMode::DiskBacked,
+		}
+	}
+
+	/// Makes one already validated MVCC root durable before publication.
+	fn persist_root(
+		&self,
+		expected_commit_ts: u64,
+		root: &DatabaseRoot,
+		changed_graphs: &[RecordId],
+	) -> FerrosGrynnResult<Option<LocalCommitResult>> {
+		let StoreBackend::Local(local) = &self.backend else {
+			return Ok(None);
+		};
+		let graphs = changed_graphs
+			.iter()
+			.filter_map(|record_id| root.graphs.get(record_id).map(|stored| (record_id, stored)))
+			.map(|(record_id, stored)| {
+				stored
+					.graph
+					.materialized()
+					.cloned()
+					.map(|graph| LocalCommitGraph {
+						record_id: record_id.clone(),
+						graph,
+					})
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"changed local graph has no materialized commit image",
+						)
+					})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let tables = root
+			.tables
+			.values()
+			.map(|schema| {
+				let fields = schema
+					.fields
+					.iter()
+					.map(|field| {
+						Ok(LocalCommitTableField {
+							name: field.name.as_str().to_owned(),
+							value_type: field.value_type.clone(),
+							property_key: field
+								.key
+								.ok_or_else(|| {
+									FerrosGrynnError::invalid_storage_file(
+										"table field has no interned property key",
+									)
+								})?
+								.get(),
+						})
+					})
+					.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				Ok(LocalCommitTable {
+					name: schema.name.as_str().to_owned(),
+					graph: schema.graph.id().clone(),
+					kind: schema.kind,
+					fields,
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		local
+			.commit(expected_commit_ts, &root.dictionary, &graphs, &tables, changed_graphs)
+			.map(Some)
+	}
+}
+
+#[derive(Debug)]
+struct ValidatedLocalOptions {
+	pool_pages: NonZeroUsize,
+	checkpoint_page_threshold: usize,
+}
+
+/// Validates only options implemented by the current synchronous local slice.
+fn validate_local_options(options: LocalOptions) -> FerrosGrynnResult<ValidatedLocalOptions> {
+	if options.io_mode != IoMode::Sync {
+		return Err(FerrosGrynnError::io_mode_unavailable(
+			"NativeAsync",
+			"native async I/O belongs to stage 6 and has no silent sync fallback",
+		));
+	}
+	let pool_pages = NonZeroUsize::new(options.buffer_pool_pages).ok_or_else(|| {
+		FerrosGrynnError::invalid_argument("local buffer_pool_pages must be greater than zero")
+	})?;
+	if !(1..=100).contains(&options.checkpoint.unbackfilled_page_percent) {
+		return Err(FerrosGrynnError::invalid_argument(
+			"checkpoint unbackfilled_page_percent must be in 1..=100",
+		));
+	}
+	let checkpoint_page_threshold = options
+		.buffer_pool_pages
+		.checked_mul(usize::from(options.checkpoint.unbackfilled_page_percent))
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("checkpoint page threshold overflows"))?
+		.div_ceil(100)
+		.max(1);
+	Ok(ValidatedLocalOptions {
+		pool_pages,
+		checkpoint_page_threshold,
+	})
+}
+
 impl Datastore {
 	pub fn in_memory() -> Self {
 		Self::in_memory_with(InMemoryOptions::default())
@@ -357,7 +714,8 @@ impl Datastore {
 	pub fn in_memory_with(options: InMemoryOptions) -> Self {
 		Self {
 			inner: Arc::new(StoreInner {
-				options,
+				options: DatastoreOptions::InMemory(options),
+				backend: StoreBackend::InMemory,
 				next_transaction: AtomicU64::new(1),
 				current: RwLock::new(Arc::new(DatabaseRoot::default())),
 				commit: Mutex::new(()),
@@ -366,7 +724,78 @@ impl Datastore {
 		}
 	}
 
-	pub fn options(&self) -> InMemoryOptions {
+	/// Creates a new exclusively owned local database directory.
+	///
+	/// # Errors
+	///
+	/// Returns a typed configuration, ownership, filesystem, Direct-I/O, WAL,
+	/// or storage-format error. An existing directory is never overwritten.
+	pub fn create_local<PathLike: AsRef<Path>>(
+		path: PathLike,
+		options: LocalOptions,
+	) -> FerrosGrynnResult<Self> {
+		let validated = validate_local_options(options)?;
+		let path = path.as_ref();
+		let database_name = path
+			.file_name()
+			.and_then(std::ffi::OsStr::to_str)
+			.filter(|name| !name.is_empty())
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"local database path must end with a non-empty UTF-8 name",
+				)
+			})?;
+		let local = LocalStore::create(
+			path,
+			database_name,
+			validated.pool_pages,
+			validated.checkpoint_page_threshold,
+			options.checkpoint.interval,
+		)?;
+		Ok(Self {
+			inner: Arc::new(StoreInner {
+				options: DatastoreOptions::Local(options),
+				backend: StoreBackend::Local(Box::new(local)),
+				next_transaction: AtomicU64::new(1),
+				current: RwLock::new(Arc::new(DatabaseRoot::default())),
+				commit: Mutex::new(()),
+				active: Mutex::new(BTreeMap::new()),
+			}),
+		})
+	}
+
+	/// Opens, recovers, and exclusively owns an existing local database.
+	///
+	/// # Errors
+	///
+	/// Returns a typed configuration, ownership, filesystem, Direct-I/O, WAL,
+	/// recovery, or storage-format error. Existing files are never truncated.
+	pub fn open_local<PathLike: AsRef<Path>>(
+		path: PathLike,
+		options: LocalOptions,
+	) -> FerrosGrynnResult<Self> {
+		let validated = validate_local_options(options)?;
+		let (local, snapshot) = LocalStore::open(
+			path,
+			validated.pool_pages,
+			validated.checkpoint_page_threshold,
+			options.checkpoint.interval,
+		)?;
+		let root = DatabaseRoot::from_local(snapshot)?;
+		Ok(Self {
+			inner: Arc::new(StoreInner {
+				options: DatastoreOptions::Local(options),
+				backend: StoreBackend::Local(Box::new(local)),
+				next_transaction: AtomicU64::new(1),
+				current: RwLock::new(Arc::new(root)),
+				commit: Mutex::new(()),
+				active: Mutex::new(BTreeMap::new()),
+			}),
+		})
+	}
+
+	/// Returns the selected backend and its resource limits.
+	pub fn options(&self) -> DatastoreOptions {
 		self.inner.options
 	}
 
@@ -375,10 +804,19 @@ impl Datastore {
 	}
 
 	pub fn begin_with(&self, options: TransactionOptions) -> Transaction {
+		let _commit = self.inner.commit.lock();
 		let started = Instant::now();
 		let current = self.inner.current.read();
 		let root = current.clone();
 		let id = self.inner.next_transaction.fetch_add(1, Ordering::Relaxed);
+		let limits = self.inner.transaction_limits();
+		let (storage_tx, storage_error) = match self.inner.backend.local() {
+			Some(local) => match local.begin_read(id, limits.max_snapshot_age) {
+				Ok(transaction) => (Some(Arc::new(transaction)), None),
+				Err(error) => (None, Some(error.to_string())),
+			},
+			None => (None, None),
+		};
 		if options.isolation == IsolationLevel::Serializable
 			&& options.access == TransactionAccess::ReadWrite
 		{
@@ -395,6 +833,8 @@ impl Datastore {
 			started,
 			options,
 			root,
+			storage_tx: Mutex::new(storage_tx),
+			storage_error,
 			reads: Mutex::new(BTreeMap::new()),
 			predicates: Mutex::new(Vec::new()),
 			graphs: BTreeMap::new(),
@@ -404,6 +844,23 @@ impl Datastore {
 
 	pub fn table(&self, name: &str) -> Option<Arc<TableSchema>> {
 		self.current_root().tables.get(name).cloned()
+	}
+
+	/// Runs local checkpoint maintenance with explicit reader behavior.
+	///
+	/// `Restart` invalidates active disk snapshots; their next fallible access
+	/// returns `FG-25F02`. In-memory datastores have no durable state and treat
+	/// checkpoint as a no-op.
+	///
+	/// # Errors
+	///
+	/// Returns a WAL, Direct-I/O, atomic-superblock, or prune error.
+	pub fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<()> {
+		let _commit = self.inner.commit.lock();
+		match self.inner.backend.local() {
+			Some(local) => local.checkpoint(mode),
+			None => Ok(()),
+		}
 	}
 
 	/// Interns an append-only property name before it is used in graph values
@@ -428,6 +885,9 @@ impl Datastore {
 		let mut next = (*current).clone();
 		let key = Arc::make_mut(&mut next.dictionary).intern(name)?;
 		next.commit_ts = commit_ts;
+		if let Some(persisted) = self.inner.persist_root(commit_ts, &next, &[])? {
+			next.dictionary = Arc::new(persisted.property_dictionary);
+		}
 		*self.inner.current.write() = Arc::new(next);
 		Ok(key)
 	}
@@ -490,6 +950,8 @@ pub struct Transaction {
 	started: Instant,
 	options: TransactionOptions,
 	root: Arc<DatabaseRoot>,
+	storage_tx: Mutex<Option<Arc<LocalReadTransaction>>>,
+	storage_error: Option<String>,
 	reads: Mutex<BTreeMap<ReadKey, u64>>,
 	predicates: Mutex<Vec<PredicateRead>>,
 	graphs: BTreeMap<RecordId, GraphWrite>,
@@ -566,6 +1028,142 @@ enum MutableGraphValue {
 	Dag(Dag<Mutable>),
 	Hypergraph(Hypergraph<Mutable>),
 	Metagraph(Metagraph<Mutable>),
+}
+
+/// Endpoint incidence addressed by stable public atom references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AtomRefTopology {
+	/// Directed incidence from `source` to `target`.
+	Directed {
+		/// Source endpoints.
+		source: Vec<AtomRef>,
+		/// Target endpoints.
+		target: Vec<AtomRef>,
+	},
+	/// Bidirectional incidence between the source and target groups.
+	Bidirectional {
+		/// First endpoint group.
+		source: Vec<AtomRef>,
+		/// Second endpoint group.
+		target: Vec<AtomRef>,
+	},
+	/// Undirected incidence over one endpoint group.
+	Undirected {
+		/// Unordered endpoints.
+		endpoints: Vec<AtomRef>,
+	},
+}
+
+/// Backend-neutral transaction-private point-mutation view.
+///
+/// Atom identity crosses the API boundary only as [`AtomRef`]. The view may
+/// materialize a disk graph when the first mutation starts, but subsequent
+/// operations use the same contract for local and in-memory datastores.
+pub struct GraphMutationView<'a> {
+	value: &'a mut MutableGraphValue,
+}
+
+impl GraphMutationView<'_> {
+	/// Returns the structural family of the graph being changed.
+	pub const fn kind(&self) -> GraphKind {
+		self.value.kind()
+	}
+
+	/// Creates a node with a caller-selected stable record ID.
+	///
+	/// # Errors
+	///
+	/// Returns a graph constraint error for a duplicate record ID or for graph
+	/// families that cannot add an isolated node without violating invariants.
+	pub fn create_node(
+		&mut self,
+		record_id: RecordId,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomRef> {
+		self.value.create_node(record_id, label, properties)
+	}
+
+	/// Creates an edge with stable record IDs for both the edge and endpoints.
+	///
+	/// # Errors
+	///
+	/// Returns an error when an endpoint is absent, the record ID is already in
+	/// use, or the incidence violates the graph-family constraints.
+	pub fn create_edge(
+		&mut self,
+		record_id: RecordId,
+		topology: &AtomRefTopology,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomRef> {
+		self.value.create_edge(record_id, topology, label, properties)
+	}
+
+	/// Replaces an atom label and returns the previous value.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the referenced atom does not exist.
+	pub fn set_label(
+		&mut self,
+		atom: &AtomRef,
+		label: Option<Text>,
+	) -> FerrosGrynnResult<Option<Text>> {
+		self.value.set_atom_label(atom, label)
+	}
+
+	/// Inserts or replaces one atom property and returns the previous value.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the referenced atom does not exist.
+	pub fn set_property(
+		&mut self,
+		atom: &AtomRef,
+		key: PropertyKeyId,
+		value: Value,
+	) -> FerrosGrynnResult<Option<Value>> {
+		Ok(self.value.atom_properties_mut(atom)?.insert(key, value))
+	}
+
+	/// Removes one atom property and returns its previous value when present.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the referenced atom does not exist.
+	pub fn remove_property(
+		&mut self,
+		atom: &AtomRef,
+		key: PropertyKeyId,
+	) -> FerrosGrynnResult<Option<Value>> {
+		Ok(self.value.atom_properties_mut(atom)?.remove(key))
+	}
+
+	/// Replaces the complete incidence of an existing edge.
+	///
+	/// # Errors
+	///
+	/// Returns an error when an atom is absent or the new incidence violates
+	/// the graph-family constraints.
+	pub fn replace_incidence(
+		&mut self,
+		edge: &AtomRef,
+		topology: &AtomRefTopology,
+	) -> FerrosGrynnResult<()> {
+		self.value.replace_incidence(edge, topology)
+	}
+
+	/// Removes an atom. Removing a node also removes dependent edges.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the atom is absent or removal violates a family
+	/// invariant.
+	pub fn remove_atom(&mut self, atom: &AtomRef) -> FerrosGrynnResult<()> {
+		self.value.remove_atom(atom)
+	}
 }
 
 /// A transaction-private family-specific graph write view.
@@ -675,6 +1273,184 @@ impl MutableGraphValue {
 		}
 	}
 
+	fn atom_id(&self, reference: &AtomRef) -> FerrosGrynnResult<AtomId> {
+		let id = match self {
+			Self::Graph(value) => value.atom_id(reference)?,
+			Self::Tree(value) => value.atom_id(reference)?,
+			Self::RootedTree(value) => value.atom_id(reference)?,
+			Self::Forest(value) => value.atom_id(reference)?,
+			Self::Dag(value) => value.atom_id(reference)?,
+			Self::Hypergraph(value) => value.atom_id(reference)?,
+			Self::Metagraph(value) => value.atom_id(reference)?,
+		};
+		id.ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist(
+				reference.kind().to_string(),
+				reference.id().to_string(),
+			)
+		})
+	}
+
+	fn resolve_topology(&self, topology: &AtomRefTopology) -> FerrosGrynnResult<EdgeTopology> {
+		let mut resolve = |reference: &AtomRef| self.atom_id(reference).map(EdgeEndpoint::Local);
+		Ok(match topology {
+			AtomRefTopology::Directed {
+				source,
+				target,
+			} => EdgeTopology::directed(
+				source.iter().map(&mut resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+				target.iter().map(&mut resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+			),
+			AtomRefTopology::Bidirectional {
+				source,
+				target,
+			} => EdgeTopology::bidirectional(
+				source.iter().map(&mut resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+				target.iter().map(&mut resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+			),
+			AtomRefTopology::Undirected {
+				endpoints,
+			} => EdgeTopology::undirected(
+				endpoints.iter().map(resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+			),
+		})
+	}
+
+	fn create_node(
+		&mut self,
+		record_id: RecordId,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomRef> {
+		let reference = AtomRef::new(AtomKind::Node, record_id.clone());
+		match self {
+			Self::Graph(value) => value.add_node_with_id(record_id, label, properties)?,
+			Self::Forest(value) => value.add_root_with_id(record_id, label, properties)?,
+			Self::Dag(value) => value.add_node_with_id(record_id, label, properties)?,
+			Self::Hypergraph(value) => value.add_node_with_id(record_id, label, properties)?,
+			Self::Metagraph(value) => value.add_node_with_id(record_id, label, properties)?,
+			Self::Tree(_) | Self::RootedTree(_) => {
+				return Err(FerrosGrynnError::graph_constraint_violation(
+					self.kind().name(),
+					"an isolated node would violate the single-tree invariant",
+				));
+			}
+		};
+		Ok(reference)
+	}
+
+	fn create_edge(
+		&mut self,
+		record_id: RecordId,
+		topology: &AtomRefTopology,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomRef> {
+		let resolved = self.resolve_topology(topology)?;
+		let reference = AtomRef::new(AtomKind::Edge, record_id.clone());
+		match self {
+			Self::Graph(value) => {
+				value.add_edge_with_id(record_id, resolved, label, properties)?;
+			}
+			Self::Dag(value) => {
+				let (source, target) = directed_pair(&resolved, GraphKind::Dag)?;
+				value.add_edge_with_id(source, target, record_id, label, properties)?;
+			}
+			Self::Hypergraph(value) => {
+				value.add_edge_with_id(record_id, resolved, label, properties)?;
+			}
+			Self::Metagraph(value) => {
+				value.add_edge_with_id(record_id, resolved, label, properties)?;
+			}
+			Self::Forest(value) => {
+				let (parent, child) = forest_pair(&resolved, value.orientation())?;
+				value.connect_with_id(parent, child, record_id, label, properties)?;
+			}
+			Self::Tree(_) | Self::RootedTree(_) => {
+				return Err(FerrosGrynnError::graph_constraint_violation(
+					self.kind().name(),
+					"use the family write view to add a child and edge atomically",
+				));
+			}
+		}
+		Ok(reference)
+	}
+
+	fn atom_properties_mut(&mut self, reference: &AtomRef) -> FerrosGrynnResult<&mut PropertyMap> {
+		let id = self.atom_id(reference)?;
+		match self {
+			Self::Graph(value) => atom_properties_mut(value, id),
+			Self::Tree(value) => atom_properties_mut(value, id),
+			Self::RootedTree(value) => atom_properties_mut(value, id),
+			Self::Forest(value) => atom_properties_mut(value, id),
+			Self::Dag(value) => atom_properties_mut(value, id),
+			Self::Hypergraph(value) => atom_properties_mut(value, id),
+			Self::Metagraph(value) => atom_properties_mut(value, id),
+		}
+	}
+
+	fn set_atom_label(
+		&mut self,
+		reference: &AtomRef,
+		label: Option<Text>,
+	) -> FerrosGrynnResult<Option<Text>> {
+		let id = self.atom_id(reference)?;
+		let current = match self {
+			Self::Graph(value) => atom_label_mut(value, id),
+			Self::Tree(value) => atom_label_mut(value, id),
+			Self::RootedTree(value) => atom_label_mut(value, id),
+			Self::Forest(value) => atom_label_mut(value, id),
+			Self::Dag(value) => atom_label_mut(value, id),
+			Self::Hypergraph(value) => atom_label_mut(value, id),
+			Self::Metagraph(value) => atom_label_mut(value, id),
+		}?;
+		Ok(std::mem::replace(current, label))
+	}
+
+	fn replace_incidence(
+		&mut self,
+		reference: &AtomRef,
+		topology: &AtomRefTopology,
+	) -> FerrosGrynnResult<()> {
+		if reference.kind() != AtomKind::Edge {
+			return Err(FerrosGrynnError::atom_kind_mismatch(
+				reference.id().to_string(),
+				reference.kind().to_string(),
+				AtomKind::Edge.to_string(),
+			));
+		}
+		let id = self.atom_id(reference)?;
+		let resolved = self.resolve_topology(topology)?;
+		match self {
+			Self::Graph(value) => value.replace_edge_topology(id, resolved),
+			Self::Dag(value) => {
+				let (source, target) = directed_pair(&resolved, GraphKind::Dag)?;
+				value.replace_edge_incidence(id, source, target)
+			}
+			Self::Hypergraph(value) => value.replace_edge_incidence(id, resolved),
+			Self::Metagraph(value) => value.replace_edge_incidence(id, resolved),
+			Self::Tree(_) | Self::RootedTree(_) | Self::Forest(_) => {
+				Err(FerrosGrynnError::graph_constraint_violation(
+					self.kind().name(),
+					"generic incidence replacement cannot preserve tree parent invariants",
+				))
+			}
+		}
+	}
+
+	fn remove_atom(&mut self, reference: &AtomRef) -> FerrosGrynnResult<()> {
+		let id = self.atom_id(reference)?;
+		match self {
+			Self::Graph(value) => GraphMut::remove_atom(value, id),
+			Self::Tree(value) => GraphMut::remove_atom(value, id),
+			Self::RootedTree(value) => GraphMut::remove_atom(value, id),
+			Self::Forest(value) => GraphMut::remove_atom(value, id),
+			Self::Dag(value) => GraphMut::remove_atom(value, id),
+			Self::Hypergraph(value) => GraphMut::remove_atom(value, id),
+			Self::Metagraph(value) => GraphMut::remove_atom(value, id),
+		}
+	}
+
 	fn dirty(&self) -> Vec<DirtyTarget> {
 		match self {
 			Self::Graph(value) => value.transaction_dirty(),
@@ -724,6 +1500,56 @@ impl MutableGraphValue {
 	}
 }
 
+fn atom_properties_mut(
+	graph: &mut impl GraphMut,
+	id: AtomId,
+) -> FerrosGrynnResult<&mut PropertyMap> {
+	match id.kind() {
+		Some(AtomKind::Node) => graph.node_properties_mut(id),
+		Some(AtomKind::Edge) => graph.edge_properties_mut(id),
+		None => Err(FerrosGrynnError::atom_does_not_exist("null", id.to_string())),
+	}
+}
+
+fn atom_label_mut(graph: &mut impl GraphMut, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+	match id.kind() {
+		Some(AtomKind::Node) => graph.node_label_mut(id),
+		Some(AtomKind::Edge) => graph.edge_label_mut(id),
+		None => Err(FerrosGrynnError::atom_does_not_exist("null", id.to_string())),
+	}
+}
+
+fn directed_pair(topology: &EdgeTopology, kind: GraphKind) -> FerrosGrynnResult<(AtomId, AtomId)> {
+	match topology.local_binary() {
+		Some((source, target, EdgeDirection::Directed)) => Ok((source, target)),
+		_ => Err(FerrosGrynnError::graph_constraint_violation(
+			kind.name(),
+			"the graph family requires one directed local source and target",
+		)),
+	}
+}
+
+fn forest_pair(
+	topology: &EdgeTopology,
+	orientation: TreeOrientation,
+) -> FerrosGrynnResult<(AtomId, AtomId)> {
+	let Some((source, target, direction)) = topology.local_binary() else {
+		return Err(FerrosGrynnError::graph_constraint_violation(
+			GraphKind::Forest.name(),
+			"a forest edge requires two local endpoints",
+		));
+	};
+	match (orientation, direction) {
+		(TreeOrientation::Undirected, EdgeDirection::Undirected)
+		| (TreeOrientation::OutArborescence, EdgeDirection::Directed) => Ok((source, target)),
+		(TreeOrientation::InArborescence, EdgeDirection::Directed) => Ok((target, source)),
+		_ => Err(FerrosGrynnError::graph_constraint_violation(
+			GraphKind::Forest.name(),
+			"edge direction disagrees with the forest orientation",
+		)),
+	}
+}
+
 impl Transaction {
 	pub const fn id(&self) -> u64 {
 		self.id
@@ -761,7 +1587,7 @@ impl Transaction {
 	) -> FerrosGrynnResult<GraphRef> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
-		if self.visible_graph(&id).is_some() {
+		if self.visible_graph_kind(&id).is_some() {
 			return Err(FerrosGrynnError::graph_already_exists(id.to_string()));
 		}
 		let kind = graph.kind();
@@ -771,13 +1597,13 @@ impl Transaction {
 			base_ts: self.read_root().commit_ts,
 			value: Some(value),
 		});
-		Ok(GraphRef::new(id, kind, GraphStorageMode::InMemory))
+		Ok(GraphRef::new(id, kind, self.store.inner.graph_storage_mode()))
 	}
 
 	pub fn remove_graph(&mut self, reference: &GraphRef) -> FerrosGrynnResult<()> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
-		ensure_in_memory_reference(reference)?;
+		ensure_store_reference(reference, self.store.inner.graph_storage_mode())?;
 		if self.graphs.get(reference.id()).is_some_and(|write| write.base.is_none()) {
 			self.graphs.remove(reference.id());
 			return Ok(());
@@ -790,9 +1616,6 @@ impl Transaction {
 	}
 
 	pub fn edit_graph(&mut self, reference: &GraphRef) -> FerrosGrynnResult<GraphWriteView<'_>> {
-		// ponytail: raw family views avoid mirroring every graph mutation API; add
-		// tracked family guards if callers cannot follow the explicit read-before-write
-		// contract.
 		self.ensure_writable()?;
 		self.ensure_live()?;
 		self.ensure_graph_write(reference)?;
@@ -803,20 +1626,47 @@ impl Transaction {
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(reference.id().to_string()))
 	}
 
+	/// Opens the backend-neutral point-mutation surface for one graph.
+	///
+	/// This is a blind-write surface. Reads that influence serializable
+	/// decisions must be performed through [`GraphRef::read`] before this
+	/// mutable borrow.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is read-only, expired or
+	/// cancelled, the graph reference belongs to another backend, or the graph
+	/// is absent.
+	pub fn mutate_graph(
+		&mut self,
+		reference: &GraphRef,
+	) -> FerrosGrynnResult<GraphMutationView<'_>> {
+		self.ensure_writable()?;
+		self.ensure_live()?;
+		self.ensure_graph_write(reference)?;
+		self.graphs
+			.get_mut(reference.id())
+			.and_then(|write| write.value.as_mut())
+			.map(|value| GraphMutationView {
+				value,
+			})
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(reference.id().to_string()))
+	}
+
 	pub fn define_table(&mut self, mut schema: TableSchema) -> FerrosGrynnResult<()> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
-		ensure_in_memory_reference(&schema.graph)?;
+		ensure_store_reference(&schema.graph, self.store.inner.graph_storage_mode())?;
 		if self.visible_table(schema.name.as_str()).is_some() {
 			return Err(FerrosGrynnError::table_already_exists(schema.name.as_str()));
 		}
-		let graph = self
-			.visible_graph(schema.graph.id())
+		let graph_kind = self
+			.visible_graph_kind(schema.graph.id())
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string()))?;
-		if graph.kind() != schema.graph.kind() {
+		if graph_kind != schema.graph.kind() {
 			return Err(FerrosGrynnError::conversion_error(
 				schema.graph.kind().name(),
-				graph.kind().name(),
+				graph_kind.name(),
 			));
 		}
 		let dictionary = self.read_root().dictionary.clone();
@@ -859,12 +1709,13 @@ impl Transaction {
 
 	pub fn commit(mut self) -> FerrosGrynnResult<CommitResult> {
 		self.ensure_live()?;
+		let limits = self.store.inner.transaction_limits();
 		let estimated = self.estimated_write_set_bytes();
-		if estimated > self.store.inner.options.max_write_set_bytes {
+		if estimated > limits.max_write_set_bytes {
 			return Err(FerrosGrynnError::transaction_write_set_limit_exceeded(
 				self.id,
 				estimated as u64,
-				self.store.inner.options.max_write_set_bytes as u64,
+				limits.max_write_set_bytes as u64,
 			));
 		}
 		if self.options.access == TransactionAccess::ReadOnly
@@ -937,11 +1788,26 @@ impl Transaction {
 				));
 			}
 		}
+		let mut changed_graphs = next
+			.graphs
+			.iter()
+			.filter(|(id, after)| {
+				current
+					.graphs
+					.get(*id)
+					.is_none_or(|before| before.last_commit_ts != after.last_commit_ts)
+			})
+			.map(|(id, _stored)| id.clone())
+			.collect::<Vec<_>>();
+		changed_graphs
+			.extend(current.graphs.keys().filter(|id| !next.graphs.contains_key(*id)).cloned());
+		next.commit_ts = commit_ts;
+		if let Some(persisted) = self.store.inner.persist_root(commit_ts, &next, &changed_graphs)? {
+			next.dictionary = Arc::new(persisted.property_dictionary);
+		}
 		let mut published = self.store.inner.current.write();
 		let mut active = self.store.inner.active.lock();
-		active.retain(|_, snapshot| {
-			snapshot.started.elapsed() <= self.store.inner.options.max_snapshot_age
-		});
+		active.retain(|_, snapshot| snapshot.started.elapsed() <= limits.max_snapshot_age);
 		let oldest_snapshot =
 			active.values().map(|snapshot| snapshot.start_ts).min().unwrap_or(commit_ts);
 		drop(active);
@@ -950,7 +1816,6 @@ impl Transaction {
 				stored.changes.retain(|(timestamp, _)| *timestamp > oldest_snapshot);
 			}
 		}
-		next.commit_ts = commit_ts;
 		*published = Arc::new(next);
 		Ok(CommitResult {
 			transaction: self.id,
@@ -968,13 +1833,34 @@ impl Transaction {
 	}
 
 	fn ensure_live(&self) -> FerrosGrynnResult<()> {
-		if self.started.elapsed() > self.store.inner.options.max_snapshot_age {
+		if let Some(error) = &self.storage_error {
+			return Err(FerrosGrynnError::invalid_storage_file(format!(
+				"failed to register the local storage snapshot: {error}"
+			)));
+		}
+		let limits = self.store.inner.transaction_limits();
+		if self.started.elapsed() > limits.max_snapshot_age {
+			let transaction = self.storage_tx.lock().take();
+			if let Some(transaction) = transaction {
+				transaction.cancel();
+			}
 			return Err(FerrosGrynnError::snapshot_expired(
 				self.id,
-				self.store.inner.options.max_snapshot_age.as_secs(),
+				limits.max_snapshot_age.as_secs(),
 			));
 		}
+		let transaction = self.storage_tx.lock().as_ref().cloned();
+		if let Some(transaction) = transaction {
+			transaction.ensure_live()?;
+		}
 		Ok(())
+	}
+
+	fn local_snapshot(&self) -> FerrosGrynnResult<Arc<LocalReadTransaction>> {
+		self.ensure_live()?;
+		self.storage_tx.lock().as_ref().cloned().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("local transaction has no storage snapshot")
+		})
 	}
 
 	fn read_root(&self) -> Arc<DatabaseRoot> {
@@ -985,11 +1871,11 @@ impl Transaction {
 		}
 	}
 
-	fn visible_graph(&self, id: &RecordId) -> Option<Arc<MaterializedGraph>> {
+	fn visible_graph_kind(&self, id: &RecordId) -> Option<GraphKind> {
 		if let Some(write) = self.graphs.get(id) {
-			return write.value.as_ref().map(|value| Arc::new(value.snapshot()));
+			return write.value.as_ref().map(MutableGraphValue::kind);
 		}
-		self.read_root().graphs.get(id).map(|stored| stored.graph.clone())
+		self.read_root().graphs.get(id).map(|stored| stored.graph.kind())
 	}
 
 	fn visible_table(&self, name: &str) -> Option<Arc<TableSchema>> {
@@ -1001,7 +1887,7 @@ impl Transaction {
 	}
 
 	fn ensure_graph_write(&mut self, reference: &GraphRef) -> FerrosGrynnResult<()> {
-		ensure_in_memory_reference(reference)?;
+		ensure_store_reference(reference, self.store.inner.graph_storage_mode())?;
 		if self.graphs.contains_key(reference.id()) {
 			return Ok(());
 		}
@@ -1016,10 +1902,21 @@ impl Transaction {
 				stored.graph.kind().name(),
 			));
 		}
+		let base = match &stored.graph {
+			StoredGraphValue::Materialized(graph) => graph.clone(),
+			StoredGraphValue::Local(graph) => {
+				let local = self.store.inner.backend.local().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"local graph is attached to an in-memory backend",
+					)
+				})?;
+				Arc::new(local.materialize_graph(self.local_snapshot()?, graph)?)
+			}
+		};
 		self.graphs.insert(reference.id().clone(), GraphWrite {
-			base: Some(stored.graph.clone()),
+			base: Some(base.clone()),
 			base_ts: root.commit_ts,
-			value: Some(MutableGraphValue::from_frozen(&stored.graph)?),
+			value: Some(MutableGraphValue::from_frozen(&base)?),
 		});
 		Ok(())
 	}
@@ -1075,8 +1972,8 @@ impl Transaction {
 			})
 			.collect::<BTreeSet<_>>();
 		for atom in changed {
-			let before = self.predicate_row(&predicate.root, &schema, atom);
-			let after = self.predicate_row(current, &schema, atom);
+			let before = self.predicate_row(&predicate.root, &schema, atom)?;
+			let after = self.predicate_row(current, &schema, atom)?;
 			let before_matches = before
 				.as_ref()
 				.map(|row| predicate.matcher.matches(row))
@@ -1102,22 +1999,63 @@ impl Transaction {
 		root: &DatabaseRoot,
 		schema: &TableSchema,
 		atom: AtomId,
-	) -> Option<QueryStorageRow> {
+	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
 		if let Some(write) = self.graphs.get(schema.graph.id()) {
 			let dirty = write
 				.value
 				.as_ref()
 				.is_some_and(|value| value.dirty().contains(&DirtyTarget::Atom(atom)));
 			if dirty {
-				return write
+				return Ok(write
 					.value
 					.as_ref()
-					.and_then(|value| materialize_atom(&value.snapshot(), schema, atom));
+					.and_then(|value| materialize_atom(&value.snapshot(), schema, atom)));
 			}
 		}
-		root.graphs
-			.get(schema.graph.id())
-			.and_then(|stored| materialize_atom(&stored.graph, schema, atom))
+		let Some(stored) = root.graphs.get(schema.graph.id()) else {
+			return Ok(None);
+		};
+		match &stored.graph {
+			StoredGraphValue::Materialized(graph) => Ok(materialize_atom(graph, schema, atom)),
+			StoredGraphValue::Local(graph) => {
+				let local = self.store.inner.backend.local().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"local graph is attached to an in-memory backend",
+					)
+				})?;
+				let transaction = self.local_snapshot()?;
+				let view = local.graph_view(transaction, graph.clone());
+				let row = match atom.kind() {
+					Some(AtomKind::Node)
+						if matches!(schema.kind, TableKind::Any | TableKind::Normal) =>
+					{
+						view.node(atom)?
+							.map(|node| {
+								let record = node.record_id()?.into_owned();
+								let properties = node.properties()?.into_owned();
+								Ok::<_, FerrosGrynnError>((record, properties))
+							})
+							.transpose()?
+					}
+					Some(AtomKind::Edge)
+						if matches!(schema.kind, TableKind::Any | TableKind::Relation) =>
+					{
+						view.edge(atom)?
+							.map(|edge| {
+								let record = edge.record_id()?.into_owned();
+								let properties = edge.properties()?.into_owned();
+								Ok::<_, FerrosGrynnError>((record, properties))
+							})
+							.transpose()?
+					}
+					_ => None,
+				};
+				Ok(row.and_then(|(record, properties)| {
+					(record.table() == schema.name.as_str())
+						.then(|| row_from_properties(atom, &record, &properties, schema))
+				}))
+			}
+		}
 	}
 
 	fn validate_writes(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
@@ -1194,7 +2132,7 @@ impl Transaction {
 		let dirty = if write.base.is_some() {
 			value.dirty()
 		} else {
-			all_dirty(&value.snapshot())
+			all_dirty(&value.snapshot())?
 		};
 		if dirty.is_empty() && write.base.is_some() {
 			return Ok(());
@@ -1202,13 +2140,19 @@ impl Transaction {
 
 		let graph = match (&write.base, current.graphs.get(&id)) {
 			(Some(base), Some(latest)) if latest.last_commit_ts > write.base_ts => {
-				merge_materialized(self.id, base, value, &latest.graph, &dirty)?
+				let latest = latest.graph.materialized().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"newer graph revision has no materialized merge image",
+					)
+				})?;
+				merge_materialized(self.id, base, value, latest, &dirty)?
 			}
 			_ => value.freeze(),
 		};
 		let graph = Arc::new(graph);
 		let mut stored = current.graphs.get(&id).cloned().unwrap_or_else(|| StoredGraph {
-			graph: graph.clone(),
+			graph: StoredGraphValue::Materialized(graph.clone()),
+			record_index: Arc::new(BTreeMap::new()),
 			last_commit_ts: 0,
 			properties_version: 0,
 			node_set_version: 0,
@@ -1239,7 +2183,8 @@ impl Transaction {
 			stored.node_set_version = commit_ts;
 			stored.edge_set_version = commit_ts;
 		}
-		stored.graph = graph;
+		stored.graph = StoredGraphValue::Materialized(graph.clone());
+		stored.record_index = Arc::new(build_record_index(&graph)?);
 		stored.last_commit_ts = commit_ts;
 		next.graphs.insert(id.clone(), stored);
 		if created {
@@ -1282,15 +2227,92 @@ impl Transaction {
 		self.ensure_live()?;
 		let schema = self.query_table(snapshot, table)?;
 		self.record_read(&snapshot.root, ReadKey::GraphCatalog(schema.graph.id().clone()));
-		let graph = self
-			.graphs
-			.get(schema.graph.id())
-			.map_or_else(
-				|| snapshot.root.graphs.get(schema.graph.id()).map(|stored| stored.graph.clone()),
-				|write| write.value.as_ref().map(|value| Arc::new(value.snapshot())),
-			)
-			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string()))?;
-		Ok(materialize_rows(&graph, &schema))
+		if let Some(write) = self.graphs.get(schema.graph.id()) {
+			let graph = write.value.as_ref().map(MutableGraphValue::snapshot).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
+			})?;
+			return materialize_rows(&graph, &schema);
+		}
+		let stored =
+			snapshot.root.graphs.get(schema.graph.id()).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
+			})?;
+		match &stored.graph {
+			StoredGraphValue::Materialized(graph) => materialize_rows(graph, &schema),
+			StoredGraphValue::Local(graph) => {
+				let local = self.store.inner.backend.local().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"local graph is attached to an in-memory backend",
+					)
+				})?;
+				let transaction = self.local_snapshot()?;
+				let mut rows = Vec::new();
+				local.visit_table(
+					&transaction,
+					graph,
+					schema.name.as_str(),
+					schema.kind,
+					|atom| {
+						rows.push(row_from_properties(
+							atom.atom_id,
+							&atom.record_id,
+							&atom.properties,
+							&schema,
+						));
+						Ok(())
+					},
+				)?;
+				rows.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
+				Ok(rows)
+			}
+		}
+	}
+
+	/// Resolves one record without scanning the table when the graph comes from
+	/// a published snapshot. Transaction-private graph writes use the compact
+	/// materialized fallback because they have not built a durable index yet.
+	pub(crate) fn query_point(
+		&self,
+		snapshot: &QuerySnapshot,
+		record: &RecordId,
+	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
+		self.ensure_live()?;
+		let schema = self.query_table(snapshot, record.table())?;
+		self.record_read(&snapshot.root, ReadKey::GraphCatalog(schema.graph.id().clone()));
+		if let Some(write) = self.graphs.get(schema.graph.id()) {
+			let Some(graph) = write.value.as_ref().map(MutableGraphValue::snapshot) else {
+				return Ok(None);
+			};
+			let atom =
+				if let Some(atom) = graph.atom_id(&AtomRef::new(AtomKind::Node, record.clone()))? {
+					Some(atom)
+				} else {
+					graph.atom_id(&AtomRef::new(AtomKind::Edge, record.clone()))?
+				};
+			return Ok(atom.and_then(|atom| materialize_atom(&graph, &schema, atom)));
+		}
+		let stored =
+			snapshot.root.graphs.get(schema.graph.id()).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
+			})?;
+		match &stored.graph {
+			StoredGraphValue::Materialized(graph) => Ok(stored
+				.record_index
+				.get(&record.to_string())
+				.copied()
+				.and_then(|atom| materialize_atom(graph, &schema, atom))),
+			StoredGraphValue::Local(graph) => {
+				let local = self.store.inner.backend.local().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"local graph is attached to an in-memory backend",
+					)
+				})?;
+				let transaction = self.local_snapshot()?;
+				Ok(local.lookup_record(&transaction, graph, record, schema.kind)?.map(|atom| {
+					row_from_properties(atom.atom_id, &atom.record_id, &atom.properties, &schema)
+				}))
+			}
+		}
 	}
 
 	pub(crate) fn register_query_predicate(
@@ -1379,19 +2401,35 @@ impl GraphRefReader for Transaction {
 
 	fn read_graph(&self, reference: &GraphRef) -> FerrosGrynnResult<Self::View<'_>> {
 		self.ensure_live()?;
-		ensure_in_memory_reference(reference)?;
+		ensure_store_reference(reference, self.store.inner.graph_storage_mode())?;
 		let root = self.read_root();
 		self.record_read(&root, ReadKey::GraphCatalog(reference.id().clone()));
-		let graph =
-			if let Some(write) = self.graphs.get(reference.id()) {
+		let graph = if let Some(write) = self.graphs.get(reference.id()) {
+			let graph =
 				write.value.as_ref().map(|value| Arc::new(value.snapshot())).ok_or_else(|| {
 					FerrosGrynnError::graph_does_not_exist(reference.id().to_string())
-				})?
-			} else {
-				root.graphs.get(reference.id()).map(|stored| stored.graph.clone()).ok_or_else(
-					|| FerrosGrynnError::graph_does_not_exist(reference.id().to_string()),
-				)?
-			};
+				})?;
+			TransactionGraphSource::Materialized(graph)
+		} else {
+			let stored = root.graphs.get(reference.id()).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(reference.id().to_string())
+			})?;
+			match &stored.graph {
+				StoredGraphValue::Materialized(graph) => {
+					TransactionGraphSource::Materialized(graph.clone())
+				}
+				StoredGraphValue::Local(graph) => {
+					let local = self.store.inner.backend.local().ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"local graph is attached to an in-memory backend",
+						)
+					})?;
+					TransactionGraphSource::Local(
+						local.graph_view(self.local_snapshot()?, graph.clone()),
+					)
+				}
+			}
+		};
 		if graph.kind() != reference.kind() {
 			return Err(FerrosGrynnError::conversion_error(
 				reference.kind().name(),
@@ -1408,12 +2446,141 @@ impl GraphRefReader for Transaction {
 	}
 }
 
+enum TransactionGraphSource<'tx> {
+	Materialized(Arc<MaterializedGraph>),
+	Local(LocalGraphView<'tx>),
+}
+
+impl TransactionGraphSource<'_> {
+	fn kind(&self) -> GraphKind {
+		match self {
+			Self::Materialized(graph) => graph.kind(),
+			Self::Local(graph) => graph.kind(),
+		}
+	}
+}
+
+/// Snapshot-bound graph view that preserves the selected storage backend.
 pub struct TransactionGraphView<'tx> {
-	graph: Arc<MaterializedGraph>,
+	graph: TransactionGraphSource<'tx>,
 	reference: GraphRef,
 	snapshot: SnapshotId,
 	root: Arc<DatabaseRoot>,
 	reads: &'tx Mutex<BTreeMap<ReadKey, u64>>,
+}
+
+/// Backend-neutral node read returned by a transaction graph view.
+#[non_exhaustive]
+#[expect(
+	clippy::large_enum_variant,
+	reason = "boxing a page-guard-backed node would allocate on every point read"
+)]
+pub enum TransactionNodeRead<'tx> {
+	/// Borrowed projection from an in-memory graph.
+	Memory(NodeView<'tx>),
+	/// Page-guard-backed projection from a local graph.
+	Local(LocalNodeRead<'tx>),
+}
+
+impl NodeRead for TransactionNodeRead<'_> {
+	fn id(&self) -> AtomId {
+		match self {
+			Self::Memory(node) => node.id(),
+			Self::Local(node) => node.id(),
+		}
+	}
+
+	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
+		match self {
+			Self::Memory(node) => NodeRead::record_id(node),
+			Self::Local(node) => node.record_id(),
+		}
+	}
+
+	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
+		match self {
+			Self::Memory(node) => NodeRead::label_text(node),
+			Self::Local(node) => node.label_text(),
+		}
+	}
+
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		match self {
+			Self::Memory(node) => NodeRead::properties(node),
+			Self::Local(node) => node.properties(),
+		}
+	}
+
+	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
+		match self {
+			Self::Memory(node) => NodeRead::inner_graph_ref(node),
+			Self::Local(node) => node.inner_graph_ref(),
+		}
+	}
+}
+
+/// Backend-neutral edge read returned by a transaction graph view.
+#[non_exhaustive]
+#[expect(
+	clippy::large_enum_variant,
+	reason = "boxing a page-guard-backed edge would allocate on every point read"
+)]
+pub enum TransactionEdgeRead<'tx> {
+	/// Borrowed projection from an in-memory graph.
+	Memory(EdgeView<'tx>),
+	/// Page-guard-backed projection from a local graph.
+	Local(LocalEdgeRead<'tx>),
+}
+
+impl EdgeRead for TransactionEdgeRead<'_> {
+	fn id(&self) -> AtomId {
+		match self {
+			Self::Memory(edge) => edge.id(),
+			Self::Local(edge) => edge.id(),
+		}
+	}
+
+	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
+		match self {
+			Self::Memory(edge) => EdgeRead::record_id(edge),
+			Self::Local(edge) => edge.record_id(),
+		}
+	}
+
+	fn topology(&self) -> FerrosGrynnResult<Cow<'_, crate::values::runtime::graph::EdgeTopology>> {
+		match self {
+			Self::Memory(edge) => EdgeRead::topology(edge),
+			Self::Local(edge) => edge.topology(),
+		}
+	}
+
+	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
+		match self {
+			Self::Memory(edge) => EdgeRead::label_text(edge),
+			Self::Local(edge) => edge.label_text(),
+		}
+	}
+
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		match self {
+			Self::Memory(edge) => EdgeRead::properties(edge),
+			Self::Local(edge) => edge.properties(),
+		}
+	}
+
+	fn weight(&self) -> Option<crate::values::runtime::Number> {
+		match self {
+			Self::Memory(edge) => edge.weight(),
+			Self::Local(edge) => edge.weight(),
+		}
+	}
+
+	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
+		match self {
+			Self::Memory(edge) => EdgeRead::transition_graph_ref(edge),
+			Self::Local(edge) => edge.transition_graph_ref(),
+		}
+	}
 }
 
 impl TransactionGraphView<'_> {
@@ -1424,50 +2591,91 @@ impl TransactionGraphView<'_> {
 }
 
 impl GraphRead for TransactionGraphView<'_> {
+	type Edge<'a>
+		= TransactionEdgeRead<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
-		= Box<dyn Iterator<Item = AtomId> + 'a>
+		= Box<dyn Iterator<Item = FerrosGrynnResult<AtomId>> + 'a>
+	where
+		Self: 'a;
+	type Node<'a>
+		= TransactionNodeRead<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
-		= Box<dyn Iterator<Item = AtomId> + 'a>
+		= Box<dyn Iterator<Item = FerrosGrynnResult<AtomId>> + 'a>
 	where
 		Self: 'a;
 
 	fn identity(&self) -> Uuid {
-		self.graph.identity()
+		match &self.graph {
+			TransactionGraphSource::Materialized(graph) => graph.identity(),
+			TransactionGraphSource::Local(graph) => graph.identity(),
+		}
 	}
 
 	fn revision(&self) -> u64 {
-		self.graph.revision()
+		match &self.graph {
+			TransactionGraphSource::Materialized(graph) => graph.revision(),
+			TransactionGraphSource::Local(graph) => graph.revision(),
+		}
 	}
 
 	fn kind(&self) -> GraphKind {
 		self.graph.kind()
 	}
 
-	fn properties(&self) -> &PropertyMap {
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		self.record(ReadKey::GraphProperties(self.reference.id().clone()));
-		self.graph.properties()
+		match &self.graph {
+			TransactionGraphSource::Materialized(graph) => Ok(Cow::Borrowed(graph.properties())),
+			TransactionGraphSource::Local(graph) => graph.properties(),
+		}
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		self.record(ReadKey::NodeSet(self.reference.id().clone()));
-		Box::new(self.graph.node_ids())
+		match &self.graph {
+			TransactionGraphSource::Materialized(graph) => {
+				Ok(Box::new(GraphRead::node_ids(graph.as_ref())?))
+			}
+			TransactionGraphSource::Local(graph) => Ok(Box::new(graph.node_ids()?)),
+		}
 	}
 
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 		self.record(ReadKey::EdgeSet(self.reference.id().clone()));
-		Box::new(self.graph.edge_ids())
+		match &self.graph {
+			TransactionGraphSource::Materialized(graph) => {
+				Ok(Box::new(GraphRead::edge_ids(graph.as_ref())?))
+			}
+			TransactionGraphSource::Local(graph) => Ok(Box::new(graph.edge_ids()?)),
+		}
 	}
 
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 		self.record(ReadKey::Atom(self.reference.id().clone(), id));
-		self.graph.node(id)
+		match &self.graph {
+			TransactionGraphSource::Materialized(graph) => {
+				Ok(graph.node(id).map(TransactionNodeRead::Memory))
+			}
+			TransactionGraphSource::Local(graph) => {
+				Ok(graph.node(id)?.map(TransactionNodeRead::Local))
+			}
+		}
 	}
 
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 		self.record(ReadKey::Atom(self.reference.id().clone(), id));
-		self.graph.edge(id)
+		match &self.graph {
+			TransactionGraphSource::Materialized(graph) => {
+				Ok(graph.edge(id).map(TransactionEdgeRead::Memory))
+			}
+			TransactionGraphSource::Local(graph) => {
+				Ok(graph.edge(id)?.map(TransactionEdgeRead::Local))
+			}
+		}
 	}
 
 	fn snapshot_id(&self) -> SnapshotId {
@@ -1479,42 +2687,77 @@ impl GraphRead for TransactionGraphView<'_> {
 	}
 }
 
-fn all_dirty(graph: &MaterializedGraph) -> Vec<DirtyTarget> {
-	std::iter::once(DirtyTarget::Graph)
-		.chain(graph.node_ids().map(DirtyTarget::Atom))
-		.chain(graph.edge_ids().map(DirtyTarget::Atom))
-		.collect()
+fn all_dirty(graph: &MaterializedGraph) -> FerrosGrynnResult<Vec<DirtyTarget>> {
+	let mut dirty = Vec::with_capacity(graph.node_count() + graph.edge_count() + 1);
+	dirty.push(DirtyTarget::Graph);
+	for atom in GraphRead::node_ids(graph)? {
+		dirty.push(DirtyTarget::Atom(atom?));
+	}
+	for atom in GraphRead::edge_ids(graph)? {
+		dirty.push(DirtyTarget::Atom(atom?));
+	}
+	Ok(dirty)
 }
 
-fn ensure_in_memory_reference(reference: &GraphRef) -> FerrosGrynnResult<()> {
-	if reference.storage_mode() != GraphStorageMode::InMemory {
-		return Err(FerrosGrynnError::invalid_argument(
-			"the in-memory datastore accepts only in-memory graph references",
-		));
+/// Builds the runtime mirror of the durable primary RecordId index.
+fn build_record_index(graph: &MaterializedGraph) -> FerrosGrynnResult<BTreeMap<String, AtomId>> {
+	let mut index = BTreeMap::new();
+	for atom in GraphRead::node_ids(graph)?.chain(GraphRead::edge_ids(graph)?) {
+		let atom = atom?;
+		let reference = graph.atom_ref(atom)?.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("live graph atom has no RecordId")
+		})?;
+		if index.insert(reference.id().to_string(), atom).is_some() {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				"record id",
+				format!("duplicate RecordId '{}' in one graph", reference.id()),
+			));
+		}
+	}
+	Ok(index)
+}
+
+fn ensure_store_reference(
+	reference: &GraphRef,
+	expected: GraphStorageMode,
+) -> FerrosGrynnResult<()> {
+	if reference.storage_mode() != expected {
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"graph reference mode {:?} does not belong to this {:?} datastore",
+			reference.storage_mode(),
+			expected
+		)));
 	}
 	Ok(())
 }
 
-fn materialize_rows(graph: &MaterializedGraph, schema: &TableSchema) -> Vec<QueryStorageRow> {
+fn materialize_rows(
+	graph: &MaterializedGraph,
+	schema: &TableSchema,
+) -> FerrosGrynnResult<Vec<QueryStorageRow>> {
 	let mut rows = Vec::new();
 	if matches!(schema.kind, TableKind::Any | TableKind::Normal) {
-		rows.extend(graph.node_ids().filter_map(|id| {
-			graph
-				.node(id)
-				.filter(|node| node.record_id().table() == schema.name.as_str())
-				.map(|node| row_from_properties(id, node.record_id(), node.properties(), schema))
-		}));
+		for id in GraphRead::node_ids(graph)? {
+			let id = id?;
+			if let Some(node) = graph.node(id)
+				&& node.record_id().table() == schema.name.as_str()
+			{
+				rows.push(row_from_properties(id, node.record_id(), node.properties(), schema));
+			}
+		}
 	}
 	if matches!(schema.kind, TableKind::Any | TableKind::Relation) {
-		rows.extend(graph.edge_ids().filter_map(|id| {
-			graph
-				.edge(id)
-				.filter(|edge| edge.record_id().table() == schema.name.as_str())
-				.map(|edge| row_from_properties(id, edge.record_id(), edge.properties(), schema))
-		}));
+		for id in GraphRead::edge_ids(graph)? {
+			let id = id?;
+			if let Some(edge) = graph.edge(id)
+				&& edge.record_id().table() == schema.name.as_str()
+			{
+				rows.push(row_from_properties(id, edge.record_id(), edge.properties(), schema));
+			}
+		}
 	}
 	rows.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
-	rows
+	Ok(rows)
 }
 
 fn materialize_atom(
@@ -1613,7 +2856,37 @@ fn merge_materialized(
 )]
 mod tests {
 	use super::*;
-	use crate::values::runtime::{Value, graph::GraphMut};
+	use crate::values::runtime::{
+		Value,
+		graph::{EdgeTopology, GraphMut},
+	};
+
+	/// Unique database directory removed after the Windows integration test.
+	#[cfg(windows)]
+	struct LocalTestDirectory(std::path::PathBuf);
+
+	#[cfg(windows)]
+	impl LocalTestDirectory {
+		/// Reserves a unique path without creating it before `create_local`.
+		fn new() -> Self {
+			Self(
+				std::env::temp_dir()
+					.join(format!("fgdb-{:016x}", Uuid::now_v7().as_inner().as_u128() as u64)),
+			)
+		}
+
+		/// Returns the exact database path.
+		fn path(&self) -> &Path {
+			&self.0
+		}
+	}
+
+	#[cfg(windows)]
+	impl Drop for LocalTestDirectory {
+		fn drop(&mut self) {
+			drop(std::fs::remove_dir_all(&self.0));
+		}
+	}
 
 	fn graph_id(name: &str) -> RecordId {
 		format!("graph:{name}").parse().expect("test graph ID must be valid")
@@ -1651,7 +2924,11 @@ mod tests {
 		graph.add_node_with_id("account:mallory".parse().unwrap(), None, unrelated).unwrap();
 		let carol = graph
 			.node_ids()
-			.find(|id| graph.node(*id).unwrap().record_id().to_string() == "person:carol")
+			.unwrap()
+			.find_map(|id| {
+				let id = id.unwrap();
+				(graph.node(id).unwrap().record_id().to_string() == "person:carol").then_some(id)
+			})
 			.unwrap();
 		let mut tx = store.begin();
 		let reference = tx.create_graph(graph_id("people"), graph.freeze().into()).unwrap();
@@ -1665,6 +2942,390 @@ mod tests {
 		.unwrap();
 		tx.commit().unwrap();
 		(store, reference, carol)
+	}
+
+	/// The first public local slice survives close/recovery and remains visible
+	/// through both the Rust graph API and the read-only query adapter.
+	#[cfg(windows)]
+	#[test]
+	fn local_graph_table_and_edge_survive_reopen() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		assert_eq!(store.options(), DatastoreOptions::Local(options));
+		let name = store.intern_property("name").unwrap();
+		let age = store.intern_property("age").unwrap();
+
+		let mut graph = Graph::<Mutable>::new();
+		let mut alice_properties = PropertyMap::new();
+		alice_properties.insert(name, "Alice");
+		alice_properties.insert(age, 30_i64);
+		let alice = graph
+			.add_node_with_id(
+				"person:alice".parse().unwrap(),
+				Some("Person".into()),
+				alice_properties,
+			)
+			.unwrap();
+		let mut bob_properties = PropertyMap::new();
+		bob_properties.insert(name, "Bob");
+		bob_properties.insert(age, 20_i64);
+		let bob = graph
+			.add_node_with_id("person:bob".parse().unwrap(), Some("Person".into()), bob_properties)
+			.unwrap();
+		graph
+			.add_edge_with_id(
+				"knows:alice-bob".parse().unwrap(),
+				EdgeTopology::directed([alice], [bob]),
+				Some("KNOWS".into()),
+				PropertyMap::new(),
+			)
+			.unwrap();
+
+		let mut transaction = store.begin();
+		let reference =
+			transaction.create_graph(graph_id("people"), graph.freeze().into()).unwrap();
+		assert_eq!(reference.storage_mode(), GraphStorageMode::DiskBacked);
+		transaction
+			.define_table(
+				TableSchema::new("person", reference, TableKind::Normal, [
+					TableField::new("name", Type::String),
+					TableField::new("age", Type::Int),
+				])
+				.unwrap(),
+			)
+			.unwrap();
+		transaction.commit().unwrap();
+
+		let busy = match Datastore::open_local(directory.path(), options) {
+			Ok(_unexpected) => panic!("a live local owner must keep db.lock exclusive"),
+			Err(error) => error,
+		};
+		assert_eq!(busy.status().code().to_string(), "FG-51I03");
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let schema = reopened.table("person").unwrap();
+		let transaction = reopened.begin();
+		let view = schema.graph().read(&transaction).unwrap();
+		assert_eq!(view.node_count().unwrap(), 2);
+		assert_eq!(view.edge_count().unwrap(), 1);
+		assert_eq!(
+			view.node(alice).unwrap().unwrap().properties().unwrap().get(name),
+			Some(&Value::from("Alice"))
+		);
+		drop(transaction);
+
+		let results = reopened
+			.execute("SELECT VALUE name FROM person WHERE age >= 18", &crate::values::Object::new())
+			.unwrap();
+		let Value::Array(rows) = results[0].result.as_ref().unwrap().value() else {
+			panic!("SELECT must return an array");
+		};
+		assert_eq!(rows.as_slice(), &[Value::from("Alice"), Value::from("Bob")]);
+		let point = reopened
+			.execute("SELECT VALUE name FROM person:alice", &crate::values::Object::new())
+			.unwrap();
+		let Value::Array(rows) = point[0].result.as_ref().unwrap().value() else {
+			panic!("point SELECT must return an array");
+		};
+		assert_eq!(rows.as_slice(), &[Value::from("Alice")]);
+
+		let mut update = reopened.begin();
+		if let GraphWriteView::Graph(graph) = update.edit_graph(schema.graph()).unwrap() {
+			graph.node_properties_mut(alice).unwrap().insert(age, 31_i64);
+		}
+		update.commit().unwrap();
+		drop(schema);
+		drop(reopened);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let changed = reopened
+			.execute("SELECT VALUE age FROM person:alice", &crate::values::Object::new())
+			.unwrap();
+		let Value::Array(rows) = changed[0].result.as_ref().unwrap().value() else {
+			panic!("updated point SELECT must return an array");
+		};
+		assert_eq!(rows.as_slice(), &[Value::from(31_i64)]);
+	}
+
+	/// Stable AtomRef point mutations preserve incidence and properties across
+	/// close/recovery without exposing transaction-local AtomId handles.
+	#[cfg(windows)]
+	#[test]
+	fn local_point_mutations_survive_reopen() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let score = store.intern_property("score").unwrap();
+		let transient = store.intern_property("transient").unwrap();
+		let mut create = store.begin();
+		let graph = create
+			.create_graph(graph_id("mutations"), Graph::<Mutable>::new().freeze().into())
+			.unwrap();
+		create.commit().unwrap();
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		let mut transaction = store.begin();
+		let mut mutation = transaction.mutate_graph(&graph).unwrap();
+		let alpha = mutation
+			.create_node("item:alpha".parse().unwrap(), Some("Item".into()), PropertyMap::new())
+			.unwrap();
+		let beta =
+			mutation.create_node("item:beta".parse().unwrap(), None, PropertyMap::new()).unwrap();
+		let gamma =
+			mutation.create_node("item:gamma".parse().unwrap(), None, PropertyMap::new()).unwrap();
+		let edge = mutation
+			.create_edge(
+				"link:one".parse().unwrap(),
+				&AtomRefTopology::Directed {
+					source: vec![alpha.clone()],
+					target: vec![beta.clone()],
+				},
+				None,
+				PropertyMap::new(),
+			)
+			.unwrap();
+		mutation.set_property(&alpha, score, Value::from(7_i64)).unwrap();
+		assert_eq!(
+			mutation.set_label(&alpha, Some("Changed".into())).unwrap(),
+			Some("Item".into())
+		);
+		mutation.set_property(&alpha, transient, Value::from(true)).unwrap();
+		assert_eq!(mutation.remove_property(&alpha, transient).unwrap(), Some(Value::from(true)));
+		mutation
+			.replace_incidence(&edge, &AtomRefTopology::Directed {
+				source: vec![alpha.clone()],
+				target: vec![gamma.clone()],
+			})
+			.unwrap();
+		mutation.remove_atom(&beta).unwrap();
+		drop(mutation);
+		transaction.commit().unwrap();
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		let transaction = store.begin();
+		let view = graph.read(&transaction).unwrap();
+		let alpha_id = view.atom_id(&alpha).unwrap().unwrap();
+		let gamma_id = view.atom_id(&gamma).unwrap().unwrap();
+		let edge_id = view.atom_id(&edge).unwrap().unwrap();
+		assert!(view.atom_id(&beta).unwrap().is_none());
+		assert_eq!(
+			view.node(alpha_id).unwrap().unwrap().properties().unwrap().get(score),
+			Some(&Value::from(7_i64))
+		);
+		assert_eq!(
+			view.node(alpha_id).unwrap().unwrap().label_text().unwrap().as_deref(),
+			Some(&Text::from("Changed"))
+		);
+		assert_eq!(
+			view.edge(edge_id).unwrap().unwrap().topology().unwrap().local_binary(),
+			Some((alpha_id, gamma_id, EdgeDirection::Directed))
+		);
+	}
+
+	/// The public local path reads large property chains and adjacency
+	/// overflow, while an aborted materialized mutation remains
+	/// transaction-private.
+	#[cfg(windows)]
+	#[test]
+	fn local_large_properties_overflow_and_abort_round_trip() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let payload_key = store.intern_property("payload").unwrap();
+		let payload = Text::from("x".repeat(10_000));
+		let mut graph = Graph::<Mutable>::new();
+		let mut source = Vec::new();
+		let mut target = Vec::new();
+		for index in 0..6 {
+			let mut properties = PropertyMap::new();
+			if index == 0 {
+				properties.insert(payload_key, payload.clone());
+			}
+			source.push(
+				graph
+					.add_node_with_id(
+						format!("item:source-{index}").parse().unwrap(),
+						None,
+						properties,
+					)
+					.unwrap(),
+			);
+			target.push(
+				graph
+					.add_node_with_id(
+						format!("item:target-{index}").parse().unwrap(),
+						None,
+						PropertyMap::new(),
+					)
+					.unwrap(),
+			);
+		}
+		let edge = graph
+			.add_edge_with_id(
+				"link:wide".parse().unwrap(),
+				EdgeTopology::directed(source.clone(), target.clone()),
+				None,
+				PropertyMap::new(),
+			)
+			.unwrap();
+		let mut create = store.begin();
+		let reference = create.create_graph(graph_id("wide"), graph.freeze().into()).unwrap();
+		create.commit().unwrap();
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		let read = store.begin();
+		let view = reference.read(&read).unwrap();
+		let node = view.node(source[0]).unwrap().unwrap();
+		assert_eq!(
+			node.properties().unwrap().get(payload_key),
+			Some(&Value::from(payload.clone()))
+		);
+		let wide_edge = view.edge(edge).unwrap().unwrap();
+		let topology = wide_edge.topology().unwrap();
+		let EdgeTopology::Directed {
+			source: decoded_source,
+			target: decoded_target,
+		} = topology.as_ref()
+		else {
+			panic!("wide directed edge changed topology");
+		};
+		assert_eq!(decoded_source.len(), source.len());
+		assert_eq!(decoded_target.len(), target.len());
+		drop(view);
+		drop(read);
+
+		let source_ref = AtomRef::new(AtomKind::Node, "item:source-0".parse().unwrap());
+		let mut aborted = store.begin();
+		aborted
+			.mutate_graph(&reference)
+			.unwrap()
+			.set_property(&source_ref, payload_key, Value::from("discarded"))
+			.unwrap();
+		aborted.abort();
+		let read = store.begin();
+		let view = reference.read(&read).unwrap();
+		assert_eq!(
+			view.node(source[0]).unwrap().unwrap().properties().unwrap().get(payload_key),
+			Some(&Value::from(payload))
+		);
+	}
+
+	/// A disk tombstone preserves the allocator generation across reopen, so a
+	/// reused slot cannot make an old transaction-local handle valid again.
+	#[cfg(windows)]
+	#[test]
+	fn local_reopen_preserves_reused_slot_generation() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut graph = Graph::<Mutable>::new();
+		let stale = graph
+			.add_node_with_id("item:stale".parse().unwrap(), None, PropertyMap::new())
+			.unwrap();
+		graph.add_node_with_id("item:kept".parse().unwrap(), None, PropertyMap::new()).unwrap();
+		let mut create = store.begin();
+		let reference = create.create_graph(graph_id("slots"), graph.freeze().into()).unwrap();
+		create.commit().unwrap();
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let mut remove = reopened.begin();
+		if let GraphWriteView::Graph(graph) = remove.edit_graph(&reference).unwrap() {
+			graph.remove_atom(stale).unwrap();
+		}
+		remove.commit().unwrap();
+		drop(reopened);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let mut reuse = reopened.begin();
+		let replacement = match reuse.edit_graph(&reference).unwrap() {
+			GraphWriteView::Graph(graph) => graph
+				.add_node_with_id("item:replacement".parse().unwrap(), None, PropertyMap::new())
+				.unwrap(),
+			_other => panic!("general graph must keep its family"),
+		};
+		assert_eq!(replacement.slot(), stale.slot());
+		assert_eq!(replacement.generation(), stale.generation() + 1);
+		reuse.commit().unwrap();
+		drop(reopened);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let generation_count = std::fs::read_dir(directory.path().join("graphs"))
+			.unwrap()
+			.flat_map(|graph| std::fs::read_dir(graph.unwrap().path()).unwrap())
+			.count();
+		assert_eq!(generation_count, 1);
+		let read = reopened.begin();
+		let view = reference.read(&read).unwrap();
+		assert!(view.node(stale).unwrap().is_none());
+		assert!(view.node(replacement).unwrap().is_some());
+	}
+
+	/// Passive checkpoint preserves a reader snapshot while Restart invalidates
+	/// it and makes the complete durable tail recoverable from home files.
+	#[cfg(windows)]
+	#[test]
+	fn local_restart_checkpoint_cancels_old_snapshot() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let value = store.intern_property("value").unwrap();
+		let mut properties = PropertyMap::new();
+		properties.insert(value, 1_i64);
+		let mut graph = Graph::<Mutable>::new();
+		let node = graph.add_node_with_id("item:one".parse().unwrap(), None, properties).unwrap();
+		let mut create = store.begin();
+		let reference = create.create_graph(graph_id("checkpoint"), graph.freeze().into()).unwrap();
+		create.commit().unwrap();
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		let old = store.begin();
+		let old_view = reference.read(&old).unwrap();
+		let mut writer = store.begin();
+		if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
+			graph.node_properties_mut(node).unwrap().insert(value, 2_i64);
+		}
+		writer.commit().unwrap();
+
+		store.checkpoint(CheckpointMode::Passive).unwrap();
+		assert_eq!(
+			old_view.node(node).unwrap().unwrap().properties().unwrap().get(value),
+			Some(&Value::from(1_i64))
+		);
+		store.checkpoint(CheckpointMode::Restart).unwrap();
+		assert_eq!(old_view.node_count().unwrap_err().status().code().to_string(), "FG-25F02");
+		drop(old_view);
+		drop(old);
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		let fresh = store.begin();
+		let view = reference.read(&fresh).unwrap();
+		assert_eq!(
+			view.node(node).unwrap().unwrap().properties().unwrap().get(value),
+			Some(&Value::from(2_i64))
+		);
 	}
 
 	#[test]
@@ -1689,6 +3350,32 @@ mod tests {
 		versions.insert(reused, 5);
 		assert_eq!(versions.get(old), 3);
 		assert_eq!(versions.get(reused), 5);
+	}
+
+	#[test]
+	fn local_checkpoint_policy_validates_percent_and_rounds_up() {
+		let validated = validate_local_options(LocalOptions {
+			buffer_pool_pages: 10,
+			checkpoint: CheckpointPolicy {
+				unbackfilled_page_percent: 25,
+				interval: Duration::ZERO,
+			},
+			..LocalOptions::default()
+		})
+		.unwrap();
+		assert_eq!(validated.checkpoint_page_threshold, 3);
+		for percent in [0, 101] {
+			assert!(
+				validate_local_options(LocalOptions {
+					checkpoint: CheckpointPolicy {
+						unbackfilled_page_percent: percent,
+						..CheckpointPolicy::default()
+					},
+					..LocalOptions::default()
+				})
+				.is_err()
+			);
+		}
 	}
 
 	#[test]
@@ -1753,15 +3440,21 @@ mod tests {
 
 		let tx = store.begin();
 		let view = reference.read(&tx).unwrap();
-		assert_eq!(view.node(left).unwrap().properties().get(key), Some(&Value::from(1_i64)));
-		assert_eq!(view.node(right).unwrap().properties().get(key), Some(&Value::from(2_i64)));
+		assert_eq!(
+			view.node(left).unwrap().unwrap().properties().unwrap().get(key),
+			Some(&Value::from(1_i64))
+		);
+		assert_eq!(
+			view.node(right).unwrap().unwrap().properties().unwrap().get(key),
+			Some(&Value::from(2_i64))
+		);
 	}
 
 	#[test]
 	fn serializable_reader_aborts_after_concurrent_change() {
 		let (store, reference, left, _) = seeded_store();
 		let reader = store.begin();
-		assert!(reference.read(&reader).unwrap().node(left).is_some());
+		assert!(reference.read(&reader).unwrap().node(left).unwrap().is_some());
 
 		let mut writer = store.begin();
 		if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
@@ -1780,7 +3473,7 @@ mod tests {
 			isolation: IsolationLevel::Serializable,
 			access: TransactionAccess::ReadOnly,
 		});
-		assert!(reference.read(&reader).unwrap().node(left).is_some());
+		assert!(reference.read(&reader).unwrap().node(left).unwrap().is_some());
 		let mut writer = store.begin();
 		if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
 			graph.node_properties_mut(left).unwrap().insert(0_u32.into(), 1_i64);
@@ -1857,5 +3550,15 @@ mod tests {
 			max_write_set_bytes: DEFAULT_MAX_WRITE_SET_BYTES,
 		});
 		assert_eq!(store.begin().commit().unwrap_err().status().code().to_string(), "FG-25F01");
+	}
+
+	#[test]
+	fn unavailable_native_async_mode_has_no_sync_fallback() {
+		let error = validate_local_options(LocalOptions {
+			io_mode: IoMode::NativeAsync,
+			..LocalOptions::default()
+		})
+		.unwrap_err();
+		assert_eq!(error.status().code().to_string(), "FG-51I04");
 	}
 }

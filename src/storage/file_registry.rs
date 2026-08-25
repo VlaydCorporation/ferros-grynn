@@ -20,6 +20,7 @@ pub(super) enum DataFileRole {
 }
 
 /// Bootstrap description supplied by the local database opener.
+#[derive(Debug, Clone)]
 pub(super) struct DataFileRegistration {
 	/// Graph or system address space.
 	pub(super) graph_id: GraphId,
@@ -68,7 +69,7 @@ impl RegisteredDataFile {
 /// Immutable registry sealed after all trusted paths are opened.
 pub(super) struct FileRegistry {
 	/// Files keyed by their complete persisted identity.
-	files: RapidHashMap<(GraphId, DataFileId), RegisteredDataFile>,
+	files: RapidHashMap<(GraphId, DataFileId), Arc<RegisteredDataFile>>,
 }
 
 impl FileRegistry {
@@ -81,36 +82,48 @@ impl FileRegistry {
 	pub(super) fn open(registrations: Vec<DataFileRegistration>) -> FerrosGrynnResult<Self> {
 		let mut files = RapidHashMap::with_capacity(registrations.len());
 		for registration in registrations {
-			validate_role(registration.file_id, registration.role)?;
-			let opened = DirectFile::open_read_write(&registration.path)?;
-			let file = if registration.role == DataFileRole::GraphSuperblock {
-				if opened.page_count() != 1 {
-					return Err(FerrosGrynnError::invalid_storage_file(
-						"registered GraphSuperblock file must contain exactly one page",
-					));
-				}
-				drop(opened);
-				None
-			} else {
-				Some(Arc::new(opened))
-			};
 			let key = (registration.graph_id, registration.file_id);
-			if files
-				.insert(key, RegisteredDataFile {
-					role: registration.role,
-					path: registration.path,
-					file,
-				})
-				.is_some()
-			{
+			if files.contains_key(&key) {
 				return Err(FerrosGrynnError::invalid_storage_file(
 					"duplicate data-file identity in sealed registry",
 				));
 			}
+			files.insert(key, Arc::new(open_registration(registration)?));
 		}
 		Ok(Self {
 			files,
 		})
+	}
+
+	/// Adds a fully created layout after its files are durable but before the
+	/// transaction can stage frames for them.
+	pub(super) fn insert(
+		&mut self,
+		registrations: Vec<DataFileRegistration>,
+	) -> FerrosGrynnResult<()> {
+		let mut opened = Vec::with_capacity(registrations.len());
+		let mut keys = RapidHashMap::with_capacity(registrations.len());
+		for registration in registrations {
+			let key = (registration.graph_id, registration.file_id);
+			if self.files.contains_key(&key) || keys.insert(key, ()).is_some() {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"duplicate data-file identity in registry extension",
+				));
+			}
+			opened.push((key, Arc::new(open_registration(registration)?)));
+		}
+		for (key, file) in opened {
+			self.files.insert(key, file);
+		}
+		Ok(())
+	}
+
+	/// Removes registrations that never became reachable from a durable
+	/// catalog root.
+	pub(super) fn remove(&mut self, keys: &[(GraphId, DataFileId)]) {
+		for key in keys {
+			self.files.remove(key);
+		}
 	}
 
 	/// Resolves a page key without deriving or opening a path from WAL bytes.
@@ -118,7 +131,7 @@ impl FileRegistry {
 	/// # Errors
 	///
 	/// Returns fatal storage corruption when the persisted identity is absent.
-	pub(super) fn resolve(&self, key: PageKey) -> FerrosGrynnResult<&RegisteredDataFile> {
+	pub(super) fn resolve(&self, key: PageKey) -> FerrosGrynnResult<Arc<RegisteredDataFile>> {
 		self.resolve_file(key.graph_id(), key.file_id())
 	}
 
@@ -131,8 +144,8 @@ impl FileRegistry {
 		&self,
 		graph_id: GraphId,
 		file_id: DataFileId,
-	) -> FerrosGrynnResult<&RegisteredDataFile> {
-		self.files.get(&(graph_id, file_id)).ok_or_else(|| {
+	) -> FerrosGrynnResult<Arc<RegisteredDataFile>> {
+		self.files.get(&(graph_id, file_id)).cloned().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file(format!(
 				"unregistered data file graph={} id={:#018x}",
 				graph_id.get(),
@@ -142,11 +155,31 @@ impl FileRegistry {
 	}
 
 	/// Iterates over the sealed registry without permitting mutation.
-	pub(super) fn iter(
-		&self,
-	) -> impl Iterator<Item = ((GraphId, DataFileId), &RegisteredDataFile)> {
-		self.files.iter().map(|(key, file)| (*key, file))
+	pub(super) fn snapshot(&self) -> Vec<((GraphId, DataFileId), Arc<RegisteredDataFile>)> {
+		self.files.iter().map(|(key, file)| (*key, file.clone())).collect()
 	}
+}
+
+/// Opens one trusted registration without publishing a partial registry.
+fn open_registration(registration: DataFileRegistration) -> FerrosGrynnResult<RegisteredDataFile> {
+	validate_role(registration.file_id, registration.role)?;
+	let opened = DirectFile::open_read_write(&registration.path)?;
+	let file = if registration.role == DataFileRole::GraphSuperblock {
+		if opened.page_count() != 1 {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"registered GraphSuperblock file must contain exactly one page",
+			));
+		}
+		drop(opened);
+		None
+	} else {
+		Some(Arc::new(opened))
+	};
+	Ok(RegisteredDataFile {
+		role: registration.role,
+		path: registration.path,
+		file,
+	})
 }
 
 /// Validates that checkpoint ownership agrees with the persisted file kind.

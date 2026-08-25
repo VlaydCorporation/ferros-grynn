@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	collections::BTreeMap,
 	fmt::{self, Display, Formatter},
 };
@@ -37,6 +38,38 @@ impl Iterator for AtomIds<'_> {
 
 impl ExactSizeIterator for AtomIds<'_> {}
 impl std::iter::FusedIterator for AtomIds<'_> {}
+
+/// Adapts an infallible in-memory atom iterator to the fallible storage
+/// contract without allocating or boxing it.
+pub struct FallibleAtomIds<Inner> {
+	inner: Inner,
+}
+
+impl<Inner> FallibleAtomIds<Inner> {
+	pub(crate) const fn new(inner: Inner) -> Self {
+		Self {
+			inner,
+		}
+	}
+}
+
+impl<Inner: Iterator<Item = AtomId>> Iterator for FallibleAtomIds<Inner> {
+	type Item = FerrosGrynnResult<AtomId>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		self.inner.next().map(Ok)
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		self.inner.size_hint()
+	}
+}
+
+impl<Inner: ExactSizeIterator<Item = AtomId>> ExactSizeIterator for FallibleAtomIds<Inner> {}
+impl<Inner: std::iter::FusedIterator<Item = AtomId>> std::iter::FusedIterator
+	for FallibleAtomIds<Inner>
+{
+}
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
@@ -241,6 +274,52 @@ impl<'a> NodeView<'a> {
 	}
 }
 
+/// Read-only node projection whose cold fields may require storage I/O.
+pub trait NodeRead {
+	fn id(&self) -> AtomId;
+	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>>;
+	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>>;
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>>;
+	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>>;
+
+	fn atom_ref(&self) -> FerrosGrynnResult<AtomRef> {
+		Ok(AtomRef::new(AtomKind::Node, self.record_id()?.into_owned()))
+	}
+
+	fn label(&self) -> FerrosGrynnResult<Option<Cow<'_, str>>> {
+		Ok(self.label_text()?.map(|label| match label {
+			Cow::Borrowed(label) => Cow::Borrowed(label.as_str()),
+			Cow::Owned(label) => Cow::Owned(label.as_str().to_owned()),
+		}))
+	}
+
+	fn is_meta(&self) -> FerrosGrynnResult<bool> {
+		Ok(self.inner_graph_ref()?.is_some())
+	}
+}
+
+impl NodeRead for NodeView<'_> {
+	fn id(&self) -> AtomId {
+		self.id
+	}
+
+	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
+		Ok(Cow::Borrowed(self.record_id))
+	}
+
+	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
+		Ok(self.label.map(Cow::Borrowed))
+	}
+
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		Ok(Cow::Borrowed(self.properties))
+	}
+
+	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
+		Ok(self.inner_graph.and_then(GraphRead::graph_ref).map(Cow::Borrowed))
+	}
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeView<'a> {
 	id: AtomId,
@@ -314,23 +393,85 @@ impl<'a> EdgeView<'a> {
 	}
 }
 
+/// Read-only edge projection whose topology and cold fields may require
+/// storage I/O.
+pub trait EdgeRead {
+	fn id(&self) -> AtomId;
+	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>>;
+	fn topology(&self) -> FerrosGrynnResult<Cow<'_, EdgeTopology>>;
+	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>>;
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>>;
+	fn weight(&self) -> Option<Number>;
+	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>>;
+
+	fn atom_ref(&self) -> FerrosGrynnResult<AtomRef> {
+		Ok(AtomRef::new(AtomKind::Edge, self.record_id()?.into_owned()))
+	}
+
+	fn label(&self) -> FerrosGrynnResult<Option<Cow<'_, str>>> {
+		Ok(self.label_text()?.map(|label| match label {
+			Cow::Borrowed(label) => Cow::Borrowed(label.as_str()),
+			Cow::Owned(label) => Cow::Owned(label.as_str().to_owned()),
+		}))
+	}
+
+	fn is_meta(&self) -> FerrosGrynnResult<bool> {
+		Ok(self.transition_graph_ref()?.is_some())
+	}
+}
+
+impl EdgeRead for EdgeView<'_> {
+	fn id(&self) -> AtomId {
+		self.id
+	}
+
+	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
+		Ok(Cow::Borrowed(self.record_id))
+	}
+
+	fn topology(&self) -> FerrosGrynnResult<Cow<'_, EdgeTopology>> {
+		Ok(Cow::Borrowed(self.topology))
+	}
+
+	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
+		Ok(self.label.map(Cow::Borrowed))
+	}
+
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		Ok(Cow::Borrowed(self.properties))
+	}
+
+	fn weight(&self) -> Option<Number> {
+		self.weight
+	}
+
+	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
+		Ok(self.transition_graph.and_then(GraphRead::graph_ref).map(Cow::Borrowed))
+	}
+}
+
 pub trait GraphRead {
-	type EdgeIds<'a>: Iterator<Item = AtomId> + 'a
+	type Edge<'a>: EdgeRead + 'a
 	where
 		Self: 'a;
-
-	type NodeIds<'a>: Iterator<Item = AtomId> + 'a
+	type EdgeIds<'a>: Iterator<Item = FerrosGrynnResult<AtomId>> + 'a
+	where
+		Self: 'a;
+	type Node<'a>: NodeRead + 'a
+	where
+		Self: 'a;
+	type NodeIds<'a>: Iterator<Item = FerrosGrynnResult<AtomId>> + 'a
 	where
 		Self: 'a;
 
 	fn identity(&self) -> Uuid;
 	fn revision(&self) -> u64;
 	fn kind(&self) -> GraphKind;
-	fn properties(&self) -> &PropertyMap;
-	fn node_ids(&self) -> Self::NodeIds<'_>;
-	fn edge_ids(&self) -> Self::EdgeIds<'_>;
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>>;
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>>;
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>>;
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>>;
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>>;
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>>;
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>>;
 
 	fn storage_mode(&self) -> GraphStorageMode {
 		GraphStorageMode::InMemory
@@ -344,44 +485,65 @@ pub trait GraphRead {
 		None
 	}
 
-	fn contains(&self, id: AtomId) -> bool {
-		match id.kind() {
-			Some(AtomKind::Node) => self.node(id).is_some(),
-			Some(AtomKind::Edge) => self.edge(id).is_some(),
+	fn contains(&self, id: AtomId) -> FerrosGrynnResult<bool> {
+		Ok(match id.kind() {
+			Some(AtomKind::Node) => self.node(id)?.is_some(),
+			Some(AtomKind::Edge) => self.edge(id)?.is_some(),
 			None => false,
+		})
+	}
+
+	fn node_count(&self) -> FerrosGrynnResult<usize> {
+		self.node_ids()?.try_fold(0_usize, |count, id| id.map(|_id| count + 1))
+	}
+
+	fn edge_count(&self) -> FerrosGrynnResult<usize> {
+		self.edge_ids()?.try_fold(0_usize, |count, id| id.map(|_id| count + 1))
+	}
+
+	fn atom_ref(&self, id: AtomId) -> FerrosGrynnResult<Option<AtomRef>> {
+		match id.kind() {
+			Some(AtomKind::Node) => self.node(id)?.map(|node| node.atom_ref()).transpose(),
+			Some(AtomKind::Edge) => self.edge(id)?.map(|edge| edge.atom_ref()).transpose(),
+			None => Ok(None),
 		}
 	}
 
-	fn node_count(&self) -> usize {
-		self.node_ids().count()
-	}
-
-	fn edge_count(&self) -> usize {
-		self.edge_ids().count()
-	}
-
-	fn atom_ref(&self, id: AtomId) -> Option<AtomRef> {
-		match id.kind()? {
-			AtomKind::Node => self.node(id).map(NodeView::atom_ref),
-			AtomKind::Edge => self.edge(id).map(EdgeView::atom_ref),
+	fn atom_id(&self, reference: &AtomRef) -> FerrosGrynnResult<Option<AtomId>> {
+		let mut ids = match reference.kind() {
+			AtomKind::Node => self.node_ids()?,
+			AtomKind::Edge => return self.edge_id(reference),
+		};
+		while let Some(id) = ids.next() {
+			let id = id?;
+			if let Some(node) = self.node(id)?
+				&& node.record_id()?.as_ref() == reference.id()
+			{
+				return Ok(Some(id));
+			}
 		}
+		Ok(None)
 	}
 
-	fn atom_id(&self, reference: &AtomRef) -> Option<AtomId> {
-		match reference.kind() {
-			AtomKind::Node => self
-				.node_ids()
-				.find(|id| self.node(*id).is_some_and(|node| node.record_id() == reference.id())),
-			AtomKind::Edge => self
-				.edge_ids()
-				.find(|id| self.edge(*id).is_some_and(|edge| edge.record_id() == reference.id())),
+	fn edge_id(&self, reference: &AtomRef) -> FerrosGrynnResult<Option<AtomId>> {
+		let mut ids = self.edge_ids()?;
+		while let Some(id) = ids.next() {
+			let id = id?;
+			if let Some(edge) = self.edge(id)?
+				&& edge.record_id()?.as_ref() == reference.id()
+			{
+				return Ok(Some(id));
+			}
 		}
+		Ok(None)
 	}
 }
 
 pub trait GraphMut: GraphRead {
 	fn properties_mut(&mut self) -> FerrosGrynnResult<&mut PropertyMap>;
+	fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>>;
 	fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap>;
+	fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>>;
 	fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap>;
 	fn remove_atom(&mut self, id: AtomId) -> FerrosGrynnResult<()>;
 }
@@ -468,8 +630,16 @@ impl<'tx, R: GraphRead + ?Sized> GraphReadView<'tx, R> {
 }
 
 impl<R: GraphRead + ?Sized> GraphRead for GraphReadView<'_, R> {
+	type Edge<'a>
+		= R::Edge<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
 		= R::EdgeIds<'a>
+	where
+		Self: 'a;
+	type Node<'a>
+		= R::Node<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
@@ -489,23 +659,23 @@ impl<R: GraphRead + ?Sized> GraphRead for GraphReadView<'_, R> {
 		self.source.kind()
 	}
 
-	fn properties(&self) -> &PropertyMap {
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		self.source.properties()
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		self.source.node_ids()
 	}
 
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 		self.source.edge_ids()
 	}
 
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 		self.source.node(id)
 	}
 
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 		self.source.edge(id)
 	}
 
@@ -551,8 +721,16 @@ impl<'tx, R: GraphRead + ?Sized> DiskGraphView<'tx, R> {
 }
 
 impl<R: GraphRead + ?Sized> GraphRead for DiskGraphView<'_, R> {
+	type Edge<'a>
+		= R::Edge<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
 		= R::EdgeIds<'a>
+	where
+		Self: 'a;
+	type Node<'a>
+		= R::Node<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
@@ -572,23 +750,23 @@ impl<R: GraphRead + ?Sized> GraphRead for DiskGraphView<'_, R> {
 		self.graph_ref.kind()
 	}
 
-	fn properties(&self) -> &PropertyMap {
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		self.view.properties()
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		self.view.node_ids()
 	}
 
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 		self.view.edge_ids()
 	}
 
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 		self.view.node(id)
 	}
 
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 		self.view.edge(id)
 	}
 
@@ -620,6 +798,7 @@ mod tests {
 		GraphStorageMode,
 		GraphWriteBack,
 		MaterializationOrigin,
+		NodeRead,
 		SnapshotId,
 		query_to_memory,
 	};
@@ -699,7 +878,7 @@ mod tests {
 
 		assert_snapshot_released(&weak);
 		assert_eq!(hybrid.storage_mode(), GraphStorageMode::Hybrid);
-		let hybrid_root = hybrid.node_ids().next().unwrap();
+		let hybrid_root = hybrid.node_ids().unwrap().next().unwrap().unwrap();
 		assert_eq!(stable_bfs(&hybrid, hybrid_root), source_order);
 		assert!(hybrid.graph_ref().is_some());
 	}
@@ -721,7 +900,7 @@ mod tests {
 		};
 		let view = reference.read(&transaction).unwrap();
 		let mut hybrid = query_to_memory::<Graph<Mutable>, _>(&view).unwrap();
-		let local = hybrid.node_ids().next().unwrap();
+		let local = hybrid.node_ids().unwrap().next().unwrap().unwrap();
 		assert!(
 			hybrid.materialization_origin().and_then(|origin| origin.source_atom(local)).is_some()
 		);
@@ -742,8 +921,9 @@ mod tests {
 	fn cascade_removal_marks_removed_incident_edges_dirty() {
 		let (source, _) = sample_graph();
 		let mut hybrid = query_to_memory::<Graph<Mutable>, _>(&source).unwrap();
-		let removed_node = hybrid.node_ids().nth(1).unwrap();
-		let removed_edges = hybrid.edge_ids().collect::<Vec<_>>();
+		let removed_node = hybrid.node_ids().unwrap().nth(1).unwrap().unwrap();
+		let removed_edges =
+			hybrid.edge_ids().unwrap().collect::<FerrosGrynnResult<Vec<_>>>().unwrap();
 
 		GraphMut::remove_atom(&mut hybrid, removed_node).unwrap();
 
@@ -774,7 +954,7 @@ mod tests {
 		bfs(graph, root, TraversalDirection::Forward, None)
 			.unwrap()
 			.into_iter()
-			.map(|id| graph.node(id).unwrap().record_id().to_string())
+			.map(|id| graph.node(id).unwrap().unwrap().record_id().unwrap().to_string())
 			.collect()
 	}
 

@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	cmp::Ordering,
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
@@ -6,6 +7,8 @@ use std::{
 
 use super::{
 	AtomId,
+	AtomKind,
+	EdgeRead,
 	EdgeTopology,
 	EdgeView,
 	Frozen,
@@ -15,6 +18,7 @@ use super::{
 	GraphRead,
 	GraphWriteBack,
 	Mutable,
+	NodeRead,
 	NodeView,
 	QueryMaterialize,
 };
@@ -50,6 +54,15 @@ impl Metagraph<Mutable> {
 		self.graph.add_node(label, properties)
 	}
 
+	pub(crate) fn add_node_with_id(
+		&mut self,
+		record_id: crate::values::runtime::RecordId,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomId> {
+		self.graph.add_node_with_id(record_id, label, properties)
+	}
+
 	pub fn add_metavertex(
 		&mut self,
 		inner: Graph<Frozen>,
@@ -66,6 +79,24 @@ impl Metagraph<Mutable> {
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomId> {
 		self.graph.add_edge(topology, label, properties)
+	}
+
+	pub(crate) fn add_edge_with_id(
+		&mut self,
+		record_id: crate::values::runtime::RecordId,
+		topology: EdgeTopology,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomId> {
+		self.graph.add_edge_with_id(record_id, topology, label, properties)
+	}
+
+	pub(crate) fn replace_edge_incidence(
+		&mut self,
+		id: AtomId,
+		topology: EdgeTopology,
+	) -> FerrosGrynnResult<()> {
+		self.graph.replace_edge_topology(id, topology)
 	}
 
 	pub fn add_metaedge(
@@ -125,6 +156,23 @@ impl Clone for Metagraph<Frozen> {
 }
 
 impl<State> Metagraph<State> {
+	pub(crate) fn restore_free_slot(
+		&mut self,
+		kind: AtomKind,
+		slot: u64,
+		generation: u32,
+	) -> FerrosGrynnResult<()> {
+		self.graph.restore_free_slot(kind, slot, generation)
+	}
+
+	pub(crate) fn slot_capacity(&self, kind: AtomKind) -> usize {
+		self.graph.slot_capacity(kind)
+	}
+
+	pub(crate) fn slot_generation(&self, kind: AtomKind, slot: usize) -> Option<u32> {
+		self.graph.slot_generation(kind, slot)
+	}
+
 	pub const fn kind(&self) -> GraphKind {
 		GraphKind::Metagraph
 	}
@@ -170,8 +218,16 @@ impl<State> Metagraph<State> {
 }
 
 impl<State> GraphRead for Metagraph<State> {
+	type Edge<'a>
+		= <Graph<State> as GraphRead>::Edge<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
 		= <Graph<State> as GraphRead>::EdgeIds<'a>
+	where
+		Self: 'a;
+	type Node<'a>
+		= <Graph<State> as GraphRead>::Node<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
@@ -191,24 +247,24 @@ impl<State> GraphRead for Metagraph<State> {
 		GraphKind::Metagraph
 	}
 
-	fn properties(&self) -> &PropertyMap {
-		self.graph.properties()
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		GraphRead::properties(&self.graph)
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
-		self.graph.node_ids()
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
+		GraphRead::node_ids(&self.graph)
 	}
 
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
-		self.graph.edge_ids()
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
+		GraphRead::edge_ids(&self.graph)
 	}
 
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
-		self.graph.node(id)
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
+		GraphRead::node(&self.graph, id)
 	}
 
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
-		self.graph.edge(id)
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
+		GraphRead::edge(&self.graph, id)
 	}
 
 	fn storage_mode(&self) -> super::GraphStorageMode {
@@ -229,8 +285,16 @@ impl GraphMut for Metagraph<Mutable> {
 		self.graph.properties_mut()
 	}
 
+	fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		self.graph.node_label_mut(id)
+	}
+
 	fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		self.graph.node_properties_mut(id)
+	}
+
+	fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		self.graph.edge_label_mut(id)
 	}
 
 	fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
@@ -302,11 +366,13 @@ impl<State> Hash for Metagraph<State> {
 }
 
 fn validate_nested_references<R: GraphRead>(graph: &R) -> FerrosGrynnResult<()> {
-	for id in graph.edge_ids() {
-		let edge = graph.edge(id).ok_or_else(|| {
+	for id in graph.edge_ids()? {
+		let id = id?;
+		let edge = graph.edge(id)?.ok_or_else(|| {
 			crate::gql_status::FerrosGrynnError::atom_does_not_exist("edge", id.to_string())
 		})?;
-		for endpoint in edge.topology().endpoints() {
+		let topology = edge.topology()?;
+		for endpoint in topology.endpoints() {
 			if let super::EdgeEndpoint::Nested(qualified) = endpoint {
 				let Some(first) = qualified.scope().first().copied() else {
 					return Err(crate::gql_status::FerrosGrynnError::graph_constraint_violation(
@@ -314,7 +380,11 @@ fn validate_nested_references<R: GraphRead>(graph: &R) -> FerrosGrynnResult<()> 
 						"a qualified endpoint has an empty scope",
 					));
 				};
-				if !graph.node(first).is_some_and(NodeView::is_meta) {
+				let is_meta = match graph.node(first)? {
+					Some(node) => node.is_meta()?,
+					None => false,
+				};
+				if !is_meta {
 					return Err(crate::gql_status::FerrosGrynnError::graph_constraint_violation(
 						"metagraph",
 						format!("qualified endpoint scope starts at non-meta atom {first}"),

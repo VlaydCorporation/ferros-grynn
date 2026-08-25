@@ -10,6 +10,7 @@ use super::{
 	AtomId,
 	AtomKind,
 	EdgeEndpoint,
+	EdgeRead,
 	EdgeTopology,
 	EndpointRole,
 	Forest,
@@ -94,23 +95,25 @@ impl TraversalIndex {
 			backward: RapidHashMap::default(),
 		};
 
-		for id in graph.node_ids() {
-			index.register_endpoint(EdgeEndpoint::Local(id));
+		for id in graph.node_ids()? {
+			index.register_endpoint(EdgeEndpoint::Local(id?));
 		}
 		if semantics == TraversalSemantics::Atom {
-			for id in graph.edge_ids() {
-				index.register_endpoint(EdgeEndpoint::Local(id));
+			for id in graph.edge_ids()? {
+				index.register_endpoint(EdgeEndpoint::Local(id?));
 			}
 		}
 
-		for id in graph.edge_ids() {
-			let edge = graph.edge(id).ok_or_else(|| {
+		for id in graph.edge_ids()? {
+			let id = id?;
+			let edge = graph.edge(id)?.ok_or_else(|| {
 				algorithm_failure(
 					"traversal index",
 					format!("edge iterator yielded missing edge {id}"),
 				)
 			})?;
-			index.register_topology(id, edge.topology());
+			let topology = edge.topology()?;
+			index.register_topology(id, topology.as_ref());
 		}
 		Ok(index)
 	}
@@ -389,7 +392,7 @@ pub fn dfs<R: GraphRead>(
 
 pub fn topological_sort<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Vec<AtomId>> {
 	let index = TraversalIndex::new(graph, TraversalSemantics::Node)?;
-	topological_sort_with_index(graph, &index).ok_or_else(|| {
+	topological_sort_with_index(graph, &index)?.ok_or_else(|| {
 		algorithm_failure("topological sort", "the local vertex projection contains a cycle")
 	})
 }
@@ -398,7 +401,7 @@ pub fn strongly_connected_components<R: GraphRead>(
 	graph: &R,
 ) -> FerrosGrynnResult<Vec<Vec<AtomId>>> {
 	let index = TraversalIndex::new(graph, TraversalSemantics::Node)?;
-	let nodes = graph.node_ids().collect::<Vec<_>>();
+	let nodes = collect_node_ids(graph)?;
 	let mut visited = RapidHashSet::default();
 	let mut finish = Vec::with_capacity(nodes.len());
 
@@ -489,7 +492,8 @@ pub fn condensation<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Condensation> 
 
 	let index = TraversalIndex::new(graph, TraversalSemantics::Node)?;
 	let mut edges = BTreeSet::new();
-	for source in graph.node_ids() {
+	for source in graph.node_ids()? {
+		let source = source?;
 		let source_component = component_of.get(&source).copied().ok_or_else(|| {
 			algorithm_failure("condensation", format!("node {source} has no component"))
 		})?;
@@ -521,7 +525,8 @@ pub fn weakly_connected_components<R: GraphRead>(graph: &R) -> FerrosGrynnResult
 	let index = TraversalIndex::new(graph, TraversalSemantics::Node)?;
 	let mut visited = RapidHashSet::default();
 	let mut components = Vec::new();
-	for start in graph.node_ids() {
+	for start in graph.node_ids()? {
+		let start = start?;
 		if !visited.insert(start) {
 			continue;
 		}
@@ -608,7 +613,7 @@ impl ShortestPaths {
 		};
 		let mut steps = Vec::with_capacity(path.len());
 		for (index, (atom, predecessor)) in path.into_iter().enumerate() {
-			let atom_ref = graph.atom_ref(atom).ok_or_else(|| atom_does_not_exist(atom))?;
+			let atom_ref = graph.atom_ref(atom)?.ok_or_else(|| atom_does_not_exist(atom))?;
 			if index == 0 {
 				steps.push(PathStep::new(
 					atom_ref,
@@ -622,7 +627,7 @@ impl ShortestPaths {
 				algorithm_failure("shortest path", "predecessor chain is incomplete")
 			})?;
 			let edge_ref = graph
-				.atom_ref(predecessor.step.via_edge)
+				.atom_ref(predecessor.step.via_edge)?
 				.ok_or_else(|| atom_does_not_exist(predecessor.step.via_edge))?;
 			steps.push(PathStep::new(
 				atom_ref,
@@ -750,7 +755,7 @@ pub fn bellman_ford<R: GraphRead>(
 	let mut predecessors = RapidHashMap::default();
 	distances.insert(source, 0.0);
 
-	for _ in 0..graph.node_count().saturating_sub(1) {
+	for _ in 0..graph.node_count()?.saturating_sub(1) {
 		let mut changed = false;
 		for arc in &arcs {
 			let Some(distance) = distances.get(&arc.from).copied() else {
@@ -790,11 +795,11 @@ pub fn bellman_ford<R: GraphRead>(
 
 pub fn has_cycle_directed<R: GraphRead>(graph: &R) -> FerrosGrynnResult<bool> {
 	let index = TraversalIndex::new(graph, TraversalSemantics::Node)?;
-	Ok(topological_sort_with_index(graph, &index).is_none())
+	Ok(topological_sort_with_index(graph, &index)?.is_none())
 }
 
 pub fn has_cycle_undirected<R: GraphRead>(graph: &R) -> FerrosGrynnResult<bool> {
-	let nodes = graph.node_ids().collect::<Vec<_>>();
+	let nodes = collect_node_ids(graph)?;
 	let positions =
 		nodes.iter().enumerate().map(|(index, id)| (*id, index)).collect::<RapidHashMap<_, _>>();
 	let mut sets = DisjointSets::new(nodes.len());
@@ -837,7 +842,7 @@ impl SpanningForest {
 }
 
 pub fn minimum_spanning_forest<R: GraphRead>(graph: &R) -> FerrosGrynnResult<SpanningForest> {
-	let nodes = graph.node_ids().collect::<Vec<_>>();
+	let nodes = collect_node_ids(graph)?;
 	let positions =
 		nodes.iter().enumerate().map(|(index, id)| (*id, index)).collect::<RapidHashMap<_, _>>();
 	let weights = collect_weights(graph, true, "minimum spanning forest")?;
@@ -915,8 +920,10 @@ impl CutSet {
 }
 
 pub fn find_cuts<R: GraphRead>(graph: &R) -> FerrosGrynnResult<CutSet> {
-	let mut adjacency = graph
-		.node_ids()
+	let nodes = collect_node_ids(graph)?;
+	let mut adjacency = nodes
+		.iter()
+		.copied()
 		.map(|id| (id, Vec::<(AtomId, AtomId)>::new()))
 		.collect::<RapidHashMap<_, _>>();
 	for edge in binary_edges(graph)? {
@@ -933,7 +940,7 @@ pub fn find_cuts<R: GraphRead>(graph: &R) -> FerrosGrynnResult<CutSet> {
 	let mut bridges = Vec::new();
 	let mut time = 0_usize;
 
-	for root in graph.node_ids() {
+	for root in nodes {
 		if discovered.contains_key(&root) {
 			continue;
 		}
@@ -1115,7 +1122,7 @@ impl BinaryLiftingIndex {
 		graph: &R,
 		mut parent_of: impl FnMut(AtomId) -> Option<AtomId>,
 	) -> FerrosGrynnResult<Self> {
-		let nodes = graph.node_ids().collect::<Vec<_>>();
+		let nodes = collect_node_ids(graph)?;
 		let positions = nodes
 			.iter()
 			.enumerate()
@@ -1305,7 +1312,11 @@ fn ensure_node<R: GraphRead>(graph: &R, id: AtomId) -> FerrosGrynnResult<()> {
 	if id.kind() != Some(AtomKind::Node) {
 		return Err(atom_kind_mismatch(id, AtomKind::Node));
 	}
-	graph.node(id).map(|_| ()).ok_or_else(|| atom_does_not_exist(id))
+	graph.node(id)?.map(|_| ()).ok_or_else(|| atom_does_not_exist(id))
+}
+
+fn collect_node_ids<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Vec<AtomId>> {
+	graph.node_ids()?.collect()
 }
 
 fn local_steps(
@@ -1335,8 +1346,8 @@ fn deduplicated_steps<'index>(
 fn topological_sort_with_index<R: GraphRead>(
 	graph: &R,
 	index: &TraversalIndex,
-) -> Option<Vec<AtomId>> {
-	let nodes = graph.node_ids().collect::<Vec<_>>();
+) -> FerrosGrynnResult<Option<Vec<AtomId>>> {
+	let nodes = collect_node_ids(graph)?;
 	let mut indegree = nodes.iter().map(|node| (*node, 0_usize)).collect::<RapidHashMap<_, _>>();
 	for source in &nodes {
 		for step in local_steps(index, *source, TraversalDirection::Forward) {
@@ -1357,14 +1368,19 @@ fn topological_sort_with_index<R: GraphRead>(
 			let Some(target) = step.target.local_id().filter(|id| id.is_node()) else {
 				continue;
 			};
-			let value = indegree.get_mut(&target)?;
-			*value = value.checked_sub(1)?;
+			let Some(value) = indegree.get_mut(&target) else {
+				return Ok(None);
+			};
+			let Some(next) = value.checked_sub(1) else {
+				return Ok(None);
+			};
+			*value = next;
 			if *value == 0 {
 				queue.push_back(target);
 			}
 		}
 	}
-	(order.len() == nodes.len()).then_some(order)
+	Ok((order.len() == nodes.len()).then_some(order))
 }
 
 fn collect_weights<R: GraphRead>(
@@ -1373,8 +1389,9 @@ fn collect_weights<R: GraphRead>(
 	algorithm: &'static str,
 ) -> FerrosGrynnResult<RapidHashMap<AtomId, f64>> {
 	let mut weights = RapidHashMap::default();
-	for id in graph.edge_ids() {
-		let edge = graph.edge(id).ok_or_else(|| {
+	for id in graph.edge_ids()? {
+		let id = id?;
+		let edge = graph.edge(id)?.ok_or_else(|| {
 			algorithm_failure(algorithm, format!("edge iterator yielded missing edge {id}"))
 		})?;
 		let weight = match edge.weight() {
@@ -1406,7 +1423,8 @@ fn local_arcs<R: GraphRead>(
 	direction: TraversalDirection,
 ) -> FerrosGrynnResult<Vec<WeightedArc>> {
 	let mut arcs = Vec::new();
-	for from in graph.node_ids() {
+	for from in graph.node_ids()? {
+		let from = from?;
 		for step in local_steps(index, from, direction) {
 			let Some(to) = step.target.local_id().filter(|id| id.is_node()) else {
 				continue;
@@ -1444,12 +1462,14 @@ fn shortest_paths<R: GraphRead>(
 }
 
 fn binary_edges<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Vec<BinaryEdge>> {
-	let mut edges = Vec::with_capacity(graph.edge_count());
-	for id in graph.edge_ids() {
-		let edge = graph.edge(id).ok_or_else(|| {
+	let mut edges = Vec::with_capacity(graph.edge_count()?);
+	for id in graph.edge_ids()? {
+		let id = id?;
+		let edge = graph.edge(id)?.ok_or_else(|| {
 			algorithm_failure("binary graph algorithm", format!("missing edge {id}"))
 		})?;
-		let Some((left, right, direction)) = edge.topology().local_binary() else {
+		let topology = edge.topology()?;
+		let Some((left, right, direction)) = topology.local_binary() else {
 			return Err(algorithm_failure(
 				"binary graph algorithm",
 				format!("edge {id} is hyper, meta or cross-level"),

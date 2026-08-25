@@ -59,8 +59,8 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | Значения (`Value`, runtime/storage/columnar)                                                                                         | `gql_spec` §5–§6; `disk` §5            | `src/values` (`runtime`, `storage`, `columnar`)                                       | 🟡 активный, этап спецификаций завершён                     |
 | Диагностика (`StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError`)                                       | —                                      | `src/gql_status`                                                                      | 🟢                                                          |
 | Изоляция Serializable по умолчанию, SI/RC — opt-in                                                                                   | `gql_spec` §17.1                       | `src/datastore.rs`; `fg-meta` используется только как критически проверяемый референс | 🟢 Rust API режима 1 / 🔴 синтаксис `BEGIN`                 |
-| MVCC, COW-снимки, atom-level FCW и точные predicate reads                                                                            | `gql_spec` §17                         | `src/datastore.rs`, `src/collections/cow_vec.rs`, `src/values/runtime/graph`          | 🟢 RAM режима 1 / 🔴 durability и режим 2                   |
-| Журнал (frame-WAL, уровень БД)                                                                                                       | `disk` §22–§23                         | `src/storage` + transport-идеи `fg-meta/mvcc_persist.rs`                              | 🟡 логический WAL режима 1 есть; frame-WAL режима 2 — новое |
+| MVCC, COW-снимки, atom-level FCW и точные predicate reads                                                                            | `gql_spec` §17                         | `src/datastore.rs`, `src/collections/cow_vec.rs`, `src/values/runtime/graph`          | 🟢 RAM и Windows local                                      |
+| Журнал (frame-WAL, уровень БД)                                                                                                       | `disk` §22–§23                         | `src/storage`                                                                          | 🟢 Windows-first frame-WAL/checkpoint/recovery              |
 | Snapshot / store, сегментная ротация                                                                                                 | `disk` §7                              | `fg-meta` `store.rs`                                                                  | 🟢                                                          |
 | Sync Direct I/O, затем BufferPool и optional Native Async                                                                            | `disk` §2                              | production `src/storage`; `fg-meta` — только референс сценариев                       | 🟢 Windows sync-gate / 🟡 Linux+soak / 🔴 async             |
 | Подграфы (`SubGraph`, `TreeSubGraph`, `DagSubGraph`, …)                                                                              | `gql_spec` §16                         | `fg-meta` `subgraph.rs`                                                               | 🟢 референс                                                 |
@@ -69,11 +69,11 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/syn/ast.rs`; публичный вход `gql::parse`                                         | 🟡 read-only срез                                           |
 | `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/datastore.rs` → `src/gql`                                                        | 🟢 read-only `SELECT`/`LET`/`RETURN`                        |
 | Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql` (будущий вертикальный этап)                                                 | 🔴 новое                                                    |
-| `PageManager` / `DiskMetaGraph` / disk-страницы                                                                                      | `gql_tech` §10; формат — `disk` §9–§21 | `src/storage`; незавершённый `crates/storage_engine` сверяется и затем удаляется      | 🟡 sync-фундамент                                           |
-| `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`                             | 🟡 runtime `RecordId` готов; disk refs — новые              |
-| `SchemaCatalog`                                                                                                                      | `disk` §18                             | `src/schema` (нов.)                                                                   | 🔴 новое                                                    |
-| `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats` (нов.)                                                                    | 🔴 новое                                                    |
-| Индексы (Label/BTree/Count/Fulltext/HNSW/R-tree/…)                                                                                   | `disk` §20                             | `src/index` (нов.)                                                                    | 🔴 новое                                                    |
+| `PageManager` / disk-страницы                                                                                                        | `gql_tech` §10; формат — `disk` §9–§21 | `src/storage`                                                                          | 🟢 Windows manager/codecs/lazy graph adapter                |
+| `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`                             | 🟢 идентификаторы и primary lookup первого среза            |
+| `SchemaCatalog`                                                                                                                      | `disk` §18                             | `src/storage/catalog.rs`; полный DDL — будущий `src/schema`                           | 🟡 durable tables/fields первого среза                      |
+| `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/storage/graph_pages.rs`; полный store — будущий `src/stats`                      | 🟡 минимальная graph/count statistics                      |
+| Индексы (Label/BTree/Count/Fulltext/HNSW/R-tree/…)                                                                                   | `disk` §20                             | `src/storage/graph_index.rs`; advanced — будущий `src/index`                          | 🟡 label dictionary + primary B+tree                       |
 | Changefeed / Live                                                                                                                    | `gql_spec` §21, `disk` §21             | `src/changefeed` (нов.)                                                               | 🔴 новое                                                    |
 | Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql` (`analysis.rs`, `ir.rs`, `execution.rs`)                                    | 🟡 read-only срез; optimizer/traversal впереди              |
 
@@ -269,13 +269,14 @@ impl SyncPageManager {
         -> FerrosGrynnResult<()>;
     fn commit_tx(&self, tx: TxHandle) -> FerrosGrynnResult<CommitOutcome>;
     fn abort_tx(&self, tx: TxHandle);
-    fn checkpoint(&self) -> FerrosGrynnResult<()>;
+    fn checkpoint(&self) -> FerrosGrynnResult<bool>;
+    fn restart_checkpoint(&self) -> FerrosGrynnResult<bool>;
 }
 ```
 
 Оставлен один concrete crate-private manager: trait с одной реализацией не нужен. `TxHandle`
-удерживает регистрацию snapshot; bare `StorageSnapshot` наружу не передаётся. `alloc/free`,
-durable file catalog и `CheckpointMode::Restart` входят в этап 4.
+удерживает регистрацию snapshot; bare `StorageSnapshot` наружу не передаётся. Durable file
+catalog, atom-slot alloc/free и `CheckpointMode::Restart` подключены этапом 4.
 
 `PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
 (seed `0`, checksum-поле обнулено при вычислении).
@@ -457,12 +458,12 @@ storage engine относятся к отдельной области B.
   transaction-bound disk adapter и hybrid `query_to_memory`; mutable hybrid хранит origin/
   dirty-set для explicit write-back. Добавлены `GraphWorkspace`, NodeWalk/AtomWalk traversal,
   основные алгоритмы `fg-meta`, SCC condensation, PathTrace/Path, exact graph transport и
-  LiveGraph conflict protocol. Реальный PageManager adapter и COW-chunk storage относятся к
-  областям B/последующей benchmark-driven оптимизации [plan.md](values_plan.md).
-- **`src/storage`** 🟡 — `DiskAtomRef(u64)` и
-  `QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }`; перенос `crates/storage_engine`
-  выполняется поэтапно. Production-код сразу пишется в `src/storage`; отдельный crate удаляется
-  после сверки его незакоммиченного diff и parity-тестов.
+  LiveGraph conflict protocol. PageManager-backed local adapter подключён в области B; дальнейшая
+  data-layout оптимизация остаётся benchmark-driven [plan.md](values_plan.md).
+- **`src/storage`** 🟢 для Windows этапа 4 — `DiskAtomRef(u64)`,
+  `QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }`, Direct I/O/BufferPool, frame-WAL,
+  checkpoint/recovery, durable catalogs и lazy graph adapter находятся в production `src/storage`.
+  Unix runtime-port и optional async остаются отдельными gates.
 
 ### Область B. Страничное хранилище и I/O — P2
 
@@ -475,16 +476,18 @@ Disk-backed режим 2. Зависит от A.
   release-gate перед выпуском Unix-поддержки.
 - **`SyncPageManager`** 🟢 (§3.3, Windows-first) — snapshot-aware concrete manager объединяет staged/WAL/home
   read path, versioned `BufferPool`, sealed `DataFileId` registry, passive checkpoint и recovery.
-  Публичный `Datastore`, alloc/free и durable catalog population остаются этапом 4. Optional
-  Native Async добавляется только после полного sync correctness/performance gate.
-- **`DiskMetaGraph`** 🔴 — фасад над страницами (`storage/disk_graph.rs`).
-- **Disk-страницы** 🟡→🔴 — `NodeHotSlot`/`EdgeHotSlot`, `AdjacencyOverflowPage`,
-  `PropHeapPage` (slotted), `SubgraphDirPage`, `FreelistPage`, `LabelDictionary`. Незавершённый
-  каркас `crates/storage_engine/{store,layout}` используется только для parity-сверки; новый код
-  реализуется в `src/storage`.
-- **`store.rs`** 🟢/🔴 — существующие `create_graph`/`open_graph` (режим 1) без изменений;
-  минимальный `open_disk_graph` входит в текущий vertical slice режима 2. Advanced storage-функции
-  остаются последующими этапами.
+  Durable catalog population и Windows local composition подключены; optional Native Async
+  добавляется только после полного sync correctness/performance gate.
+- **Disk graph adapter** 🟢 для этапа 4 — `storage/store.rs` открывает immutable поколения как
+  transaction-bound `LocalGraphView`: hot-поля читаются через `PageGuard`, primary lookup и scan
+  остаются потоковыми, property heap загружается поздно. Материализация выполняется только перед
+  явной мутацией или `query_to_memory`.
+- **Disk-страницы** 🟢 для первого среза — `NodeHotSlot`/`EdgeHotSlot`, overflow adjacency,
+  slotted property heap/large objects, subgraph directory, freelist, label dictionary, primary
+  B+tree и graph statistics имеют checksummed codecs в `src/storage`.
+- **`store.rs`** 🟢 для этапа 4 — публичные `create_local/open_local`, backend-neutral
+  `GraphMutationView`, stable-layout page delta, безопасный COW fallback при смене layout и
+  startup-GC старых поколений подключены и покрыты reopen-тестами.
 - **`graph.rs`** 🟢 — `MetaGraph` остаётся in-memory; единственное дополнение —
   `MetaGraph::from_disk_batch(...)` для эффективной пакетной загрузки атомов (P4, отложено).
 
@@ -506,7 +509,8 @@ Disk-backed режим 2. Зависит от A.
   `visible_lsn` только после barrier; Direct I/O для WAL не используется.
 - **checkpoint** 🟢 — reader-safe passive target, aligned extent backfill, один sync на touched
   file, durable `CheckpointEnd`, graph superblocks и последний commit point `db.fgb`; prune только
-  после него под exclusive gate.
+  после него под exclusive gate. Этап 4 добавил публичные Passive/Restart, автоматическую policy и
+  кооперативную отмену просроченных/Restart-снимков.
 - **recovery** 🟢 — main/tmp selection, persisted clock seed, один streaming scan, replay строго
   по frame LSN через sealed registry, torn-page repair и свежий passive checkpoint до publication.
 
@@ -554,9 +558,11 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
   300 секунд по умолчанию; структурированные статусы `FG-54F07` и `FG-25F01`. Точный
   allocation-time учёт крупных значений требует tracked write guards и остаётся 🔴; текущая
   проверка commit не является heap quota.
-- **Durability режима 1 и режим 2** 🔴 — WAL/snapshot/recovery намеренно не входят в текущий
-  in-memory этап и зависят от C. Код `fg-meta/mvcc_persist.rs` нельзя подключать до согласования
-  frame-WAL.
+- **Durability режима 2** 🟢 для этапа 4 — Windows local backend сохраняет graph generations,
+  переключает durable catalogs через frame-WAL и публикует новый MVCC root только после commit.
+  Datastore сливает atom-level delta поверх последнего root; неизменный layout записывает только
+  отличающиеся страницы, а структурный рост использует безопасный COW fallback. Чистый in-memory
+  режим 1 по-прежнему не обещает durability.
 
 ### Область E. Схема и каталог — P3
 
@@ -633,9 +639,10 @@ storage-интеграция зависит от B.
 
 - **Физические операторы** 🟡 — эталонный sync pull `RowCursor::next`; реализованы
   `ScanCursor`, `FilterCursor`, `ProjectCursor`, `LimitCursor`, позиционный `Row<Vec<Value>>`.
-- **Storage boundary** 🟢 для режима 1 — crate-private `QueryRead` (`snapshot`, `catalog`, `scan`,
-  `get`) подключён к `Transaction`; наружу идут только `Value` и `RecordId`, не
-  `TypeTag`/`AtomId`. Disk adapter остаётся 🔴.
+- **Storage boundary** 🟢 для режимов 1 и 2 — crate-private `QueryRead` (`snapshot`, `catalog`,
+  `scan`, `get`) подключён к `Transaction`; local adapter выполняет primary point lookup,
+  потоковый scan и позднюю загрузку свойств. Наружу идут только `Value` и `RecordId`, не
+  `TypeTag`/`AtomId`.
 - **`QueryResult`** 🟢 для read-only среза — `Datastore::execute` и `Transaction::execute`
   выполняют `LET`/`RETURN`/`SELECT` на одном snapshot; `SELECT` сканирует по `RecordId`.
 - **Batch/Arrow/async/parallel** 🔴 — только после измерений; row pull остаётся эталоном
@@ -669,7 +676,7 @@ storage-интеграция зависит от B.
 | `graph.rs::register_adjacency()`  | Путь для edge-endpoints: регистрировать в `EdgeEndpointIndex`, а не игнорировать                                    |
 | `graph.rs::EdgeFlags`             | Добавить `CROSS_LEVEL = 0b0100_0000`                                                                                |
 | `graph.rs::add_cross_meta_edge()` | Ставить `CROSS_LEVEL`; убрать `__from_inner`/`__to_inner`; использовать `source_atom_ref`/`target_atom_ref` в props |
-| `node.rs::NodeFlags`              | Убрать бит `PORT` или пометить deprecated                                                                           |
+| `node.rs::NodeFlags`              | Убрать legacy-бит `PORT`; в disk format v1 значение `0x10` зарезервировано                                          |
 | `edge.rs`                         | Переименовать legacy endpoint-поля в `source/target`; удалить role-enum и второй edge/edge incidence path           |
 | `traversal.rs::neighbors()`       | Параметризовать: `NodeOnly` (текущий) vs `AtomWalk` (через единые endpoint'ы и `EdgeEndpointIndex`)                 |
 | `traversal.rs::TarjanCuts`        | Параметризовать тип обхода; `n.is_node()` — только в `NodeOnly`                                                     |
@@ -724,10 +731,13 @@ storage-интеграция зависит от B.
   release-gate перед Unix/format-v1 выпуском, но не блокируют Windows frame-WAL срез.
 - **Фаза 3a — in-memory MVCC** (P2): ✅ RAM-часть Области D, COW-снимки, atom-level merge,
   serializable validation и точные предикаты.
-- **Фаза 3b — журнал и восстановление** (P2): ✅ Windows-first Область C; Unix release-gate и
-  внешний `Datastore` остаются следующими границами.
-- **Фаза 4 — query-конвейер MVP** (P2–P3): 🟡 H → I → J/K/L; read-only
-  `Datastore::execute` для режима 1 подключён, optimizer/traversal остаются.
+- **Фаза 3b — журнал и восстановление** (P2): ✅ Windows-first Область C; Unix release-gate
+  остаётся отложенной границей.
+- **Фаза 4a — local disk vertical slice** (P2–P3): ✅ Windows public create/open, durable
+  catalogs, concrete graph pages, lazy page-backed adapter, point mutations, page delta,
+  checkpoint policy/Restart и read/write/reopen E2E.
+- **Фаза 4b — query-конвейер MVP** (P2–P3): 🟡 H → I → J/K/L; read-only
+  `Datastore::execute` подключён для RAM и materialized local root, optimizer/traversal остаются.
 - **Фаза 5 — схема, статистика, индексы** (P3–P4): E, F, G (Label/BTree/Count + bulk),
   подключение к оптимизатору.
 - **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, R-tree; N (полная

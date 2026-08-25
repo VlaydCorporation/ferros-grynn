@@ -192,6 +192,18 @@ impl NodeColumns {
 		Ok(())
 	}
 
+	pub(crate) fn restore_free(&mut self, slot: u64, generation: u32) -> FerrosGrynnResult<()> {
+		self.allocator.restore_free(slot, generation)
+	}
+
+	pub(crate) fn slot_capacity(&self) -> usize {
+		self.allocator.capacity()
+	}
+
+	pub(crate) fn slot_generation(&self, slot: usize) -> Option<u32> {
+		self.allocator.generation(slot)
+	}
+
 	pub(crate) fn remove(&mut self, id: AtomId) -> bool {
 		if !self.allocator.free(id) {
 			return false;
@@ -346,6 +358,18 @@ impl EdgeColumns {
 		Ok(())
 	}
 
+	pub(crate) fn restore_free(&mut self, slot: u64, generation: u32) -> FerrosGrynnResult<()> {
+		self.allocator.restore_free(slot, generation)
+	}
+
+	pub(crate) fn slot_capacity(&self) -> usize {
+		self.allocator.capacity()
+	}
+
+	pub(crate) fn slot_generation(&self, slot: usize) -> Option<u32> {
+		self.allocator.generation(slot)
+	}
+
 	pub(crate) fn remove(&mut self, id: AtomId) -> bool {
 		if !self.allocator.free(id) {
 			return false;
@@ -384,6 +408,10 @@ impl EdgeColumns {
 
 	pub(crate) fn topology(&self, id: AtomId) -> Option<&EdgeTopology> {
 		self.contains(id).then(|| self.topologies.get(id.slot() as usize))?
+	}
+
+	pub(crate) fn topology_mut(&mut self, id: AtomId) -> Option<&mut EdgeTopology> {
+		self.contains(id).then(|| self.topologies.get_mut(id.slot() as usize))?
 	}
 
 	// TODO: does we need Option<Option<_>>?

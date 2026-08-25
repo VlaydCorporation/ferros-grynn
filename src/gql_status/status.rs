@@ -678,6 +678,21 @@ define_status_codes!(
 		},
 		hint: "Retry the operation in a new transaction.",
 	},
+	SnapshotCancelled, "FG-25F02" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Transaction,
+		subcondition: "snapshot cancelled",
+		message: "Transaction {transaction} was cancelled by storage maintenance.",
+		params: {
+			transaction: u64 => DisplayValue,
+		},
+		hint: "Retry the operation in a new transaction.",
+	},
 	SerializationFailure, "FG-40001" => {
 		kind: Error {
 			classification: ErrorClassification::TransientError,
@@ -1158,6 +1173,21 @@ define_status_codes!(
 		domain: Domain::Io,
 		subcondition: "local database already owned",
 		message: "The local database is already open by another owner.",
+	},
+	IoModeUnavailable, "FG-51I04" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::SystemConfigurationOrOperationException,
+		domain: Domain::Io,
+		subcondition: "storage I/O mode unavailable",
+		message: "Storage I/O mode {mode} is unavailable: {reason}.",
+		params: {
+			mode: String => Identifier,
+			reason: String => DisplayValue,
+		},
 	},
 	QueryParseError, "FG-42001" => {
 		kind: Error {

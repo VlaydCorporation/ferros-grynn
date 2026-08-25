@@ -13,8 +13,9 @@ use std::{
 	sync::{
 		Arc,
 		Weak,
-		atomic::{AtomicU64, Ordering as AtomicOrdering},
+		atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
 	},
+	time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -437,6 +438,16 @@ struct StagedPage {
 	page: Box<AlignedPage>,
 }
 
+/// Snapshot registration shared with checkpoint cancellation.
+struct ActiveSnapshot {
+	/// Durable visibility captured at transaction begin.
+	snapshot: StorageSnapshot,
+	/// Shared liveness flag observed by every use of the handle.
+	active: Arc<AtomicBool>,
+	/// Cooperative expiry used by passive checkpoint maintenance.
+	expires_at: Option<Instant>,
+}
+
 /// Private frame write-set and snapshot registration.
 pub(super) struct TxHandle {
 	/// Database-wide transaction identity.
@@ -449,8 +460,12 @@ pub(super) struct TxHandle {
 	staged_bytes: usize,
 	/// WAL that owns the active snapshot registration.
 	owner: Weak<FrameWalInner>,
-	/// Whether drop must unregister this snapshot.
-	active: bool,
+	/// Shared liveness changed by drop, timeout, or restart checkpoint.
+	active: Arc<AtomicBool>,
+	/// Cooperative expiry checked before every storage operation.
+	expires_at: Option<Instant>,
+	/// Configured age reported by the typed timeout status.
+	max_age_seconds: Option<u64>,
 }
 
 impl TxHandle {
@@ -462,6 +477,17 @@ impl TxHandle {
 	/// Returns the snapshot captured at begin.
 	pub(super) const fn snapshot(&self) -> StorageSnapshot {
 		self.snapshot
+	}
+
+	/// Returns whether this snapshot remains registered and unexpired.
+	pub(super) fn is_active(&self) -> bool {
+		self.active.load(AtomicOrdering::Acquire)
+			&& !self.expires_at.is_some_and(|deadline| Instant::now() >= deadline)
+	}
+
+	/// Cancels this snapshot and releases its checkpoint watermark.
+	pub(super) fn cancel(&self) {
+		self.release_snapshot();
 	}
 
 	/// Stages the final complete image for one physical page.
@@ -511,14 +537,13 @@ impl TxHandle {
 	}
 
 	/// Releases the active snapshot registration exactly once.
-	fn release_snapshot(&mut self) {
-		if !self.active {
+	fn release_snapshot(&self) {
+		if !self.active.swap(false, AtomicOrdering::AcqRel) {
 			return;
 		}
 		if let Some(owner) = self.owner.upgrade() {
 			owner.active_snapshots.lock().remove(&self.id);
 		}
-		self.active = false;
 	}
 }
 
@@ -547,7 +572,7 @@ struct FrameWalInner {
 	/// Durable versions visible to snapshots.
 	published: RwLock<PublishedState>,
 	/// Active snapshots used by the future checkpoint watermark.
-	active_snapshots: Mutex<RapidHashMap<TxId, StorageSnapshot>>,
+	active_snapshots: Mutex<RapidHashMap<TxId, ActiveSnapshot>>,
 	/// Serializes snapshot capture+registration against watermark capture.
 	snapshot_gate: RwLock<()>,
 	/// Protects resolved frame loading against index and segment pruning.
@@ -740,6 +765,14 @@ impl FrameWal {
 	///
 	/// Returns an error when the transaction identity clock is exhausted.
 	pub(super) fn begin_tx(&self) -> FerrosGrynnResult<TxHandle> {
+		self.begin_tx_with_max_age(None)
+	}
+
+	/// Starts a private write-set whose snapshot expires after `max_age`.
+	pub(super) fn begin_tx_with_max_age(
+		&self,
+		max_age: Option<Duration>,
+	) -> FerrosGrynnResult<TxHandle> {
 		let _snapshot_gate = self.inner.snapshot_gate.read();
 		let raw_tx_id = self
 			.inner
@@ -752,14 +785,28 @@ impl FrameWal {
 			})?;
 		let id = TxId::new(raw_tx_id);
 		let snapshot = self.snapshot();
-		self.inner.active_snapshots.lock().insert(id, snapshot);
+		let expires_at = max_age
+			.map(|age| {
+				Instant::now().checked_add(age).ok_or_else(|| {
+					invalid_wal("the configured snapshot age exceeds the monotonic clock range")
+				})
+			})
+			.transpose()?;
+		let active = Arc::new(AtomicBool::new(true));
+		self.inner.active_snapshots.lock().insert(id, ActiveSnapshot {
+			snapshot,
+			active: active.clone(),
+			expires_at,
+		});
 		Ok(TxHandle {
 			id,
 			snapshot,
 			staged: BTreeMap::new(),
 			staged_bytes: 0,
 			owner: Arc::downgrade(&self.inner),
-			active: true,
+			active,
+			expires_at,
+			max_age_seconds: max_age.map(|age| age.as_secs()),
 		})
 	}
 
@@ -769,11 +816,20 @@ impl FrameWal {
 	///
 	/// Returns a storage error for a handle created by another manager.
 	pub(super) fn validate_tx(&self, tx: &TxHandle) -> FerrosGrynnResult<()> {
-		if Weak::ptr_eq(&tx.owner, &Arc::downgrade(&self.inner)) {
-			Ok(())
-		} else {
-			Err(invalid_wal("transaction belongs to another WAL"))
+		if !Weak::ptr_eq(&tx.owner, &Arc::downgrade(&self.inner)) {
+			return Err(invalid_wal("transaction belongs to another WAL"));
 		}
+		if tx.expires_at.is_some_and(|deadline| Instant::now() >= deadline) {
+			tx.cancel();
+			return Err(FerrosGrynnError::snapshot_expired(
+				tx.id.get(),
+				tx.max_age_seconds.unwrap_or(0),
+			));
+		}
+		if !tx.active.load(AtomicOrdering::Acquire) {
+			return Err(invalid_wal("storage snapshot was cancelled"));
+		}
+		Ok(())
 	}
 
 	/// Discards a private in-memory write-set without writing WAL records.
@@ -781,9 +837,9 @@ impl FrameWal {
 
 	/// Commits all staged pages as one contiguous and durable WAL batch.
 	///
-	/// The current slice performs conservative page-level first-committer-wins.
-	/// Atom-level merge and SSI validation belong to the page-layout adapter in
-	/// stage 4.
+	/// This transport enforces conservative page-level first-committer-wins.
+	/// The datastore performs atom-level merge and SSI validation before
+	/// opening the fresh serialized storage commit that reaches this layer.
 	///
 	/// # Errors
 	///
@@ -817,8 +873,9 @@ impl FrameWal {
 					.get(key)
 					.is_some_and(|latest| *latest > tx.snapshot.visible_lsn())
 				{
-					// ponytail: page-level FCW is deliberately conservative; replace it
-					// with atom-level rebase when stage 4 owns concrete page layouts.
+					// The higher datastore layer rebases atom deltas before opening this
+					// serialized storage transaction; this guard still protects direct
+					// PageManager callers.
 					return Err(FerrosGrynnError::serialization_failure(
 						tx.id.get(),
 						format!("page {:?} changed after the transaction snapshot", key),
@@ -959,19 +1016,50 @@ impl FrameWal {
 	/// Returns `None` when no reader-safe progress beyond the committed home
 	/// watermark exists.
 	pub(super) fn capture_checkpoint_target(&self) -> Option<Lsn> {
+		self.capture_checkpoint_target_with_cancellation(false)
+	}
+
+	/// Captures the durable tail after cancelling every active reader.
+	pub(super) fn capture_restart_checkpoint_target(&self) -> Option<Lsn> {
+		self.capture_checkpoint_target_with_cancellation(true)
+	}
+
+	fn capture_checkpoint_target_with_cancellation(&self, restart: bool) -> Option<Lsn> {
 		let _snapshot_gate = self.inner.snapshot_gate.write();
 		let published = self.inner.published.read();
 		let durable = Lsn::new(published.durable_visible_lsn);
-		let oldest = self
-			.inner
-			.active_snapshots
-			.lock()
+		if durable <= Lsn::new(published.checkpoint_lsn) {
+			return None;
+		}
+		let now = Instant::now();
+		let mut active = self.inner.active_snapshots.lock();
+		active.retain(|_tx_id, registration| {
+			let keep = !registration.expires_at.is_some_and(|deadline| now >= deadline);
+			if !keep {
+				registration.active.store(false, AtomicOrdering::Release);
+			}
+			keep
+		});
+		if restart {
+			for registration in active.values() {
+				registration.active.store(false, AtomicOrdering::Release);
+			}
+			active.clear();
+		}
+		let oldest = active
 			.values()
-			.map(|snapshot| snapshot.visible_lsn())
+			.map(|registration| registration.snapshot.visible_lsn())
 			.min()
 			.unwrap_or(durable);
 		let target = durable.min(oldest);
 		(target > Lsn::new(published.checkpoint_lsn)).then_some(target)
+	}
+
+	/// Counts unique pages whose latest durable version is not yet in home.
+	pub(super) fn unbackfilled_page_count(&self) -> usize {
+		let published = self.inner.published.read();
+		let checkpoint = Lsn::new(published.checkpoint_lsn);
+		published.latest_commit.values().filter(|commit| **commit > checkpoint).count()
 	}
 
 	/// Appends CheckpointBegin and snapshots the latest eligible frame per
@@ -1157,7 +1245,12 @@ impl FrameWal {
 
 	/// Returns the oldest active reader boundary for checkpoint planning.
 	fn oldest_reader_lsn(&self) -> Option<Lsn> {
-		self.inner.active_snapshots.lock().values().map(|snapshot| snapshot.visible_lsn()).min()
+		self.inner
+			.active_snapshots
+			.lock()
+			.values()
+			.map(|registration| registration.snapshot.visible_lsn())
+			.min()
 	}
 }
 

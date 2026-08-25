@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	cmp::Ordering,
 	collections::{BTreeMap, BTreeSet},
 	fmt::{self, Debug, Formatter},
@@ -13,8 +14,10 @@ use super::{
 	AtomKind,
 	DirtyTarget,
 	EdgeDirection,
+	EdgeRead,
 	EdgeTopology,
 	EdgeView,
+	FallibleAtomIds,
 	Frozen,
 	Graph,
 	GraphKind,
@@ -22,6 +25,7 @@ use super::{
 	GraphRead,
 	GraphWriteBack,
 	Mutable,
+	NodeRead,
 	NodeView,
 	QueryMaterialize,
 	general::{atom_does_not_exist, atom_kind_mismatch},
@@ -272,6 +276,42 @@ pub type FrozenTree = Tree<Frozen>;
 pub type MutableRootedTree = RootedTree<Mutable>;
 pub type FrozenRootedTree = RootedTree<Frozen>;
 
+macro_rules! impl_slot_state {
+	($type:ident) => {
+		impl<State> $type<State> {
+			pub(crate) fn restore_free_slot(
+				&mut self,
+				kind: AtomKind,
+				slot: u64,
+				generation: u32,
+			) -> FerrosGrynnResult<()> {
+				match kind {
+					AtomKind::Node => self.storage.nodes.restore_free(slot, generation),
+					AtomKind::Edge => self.storage.edges.restore_free(slot, generation),
+				}
+			}
+
+			pub(crate) fn slot_capacity(&self, kind: AtomKind) -> usize {
+				match kind {
+					AtomKind::Node => self.storage.nodes.slot_capacity(),
+					AtomKind::Edge => self.storage.edges.slot_capacity(),
+				}
+			}
+
+			pub(crate) fn slot_generation(&self, kind: AtomKind, slot: usize) -> Option<u32> {
+				match kind {
+					AtomKind::Node => self.storage.nodes.slot_generation(slot),
+					AtomKind::Edge => self.storage.edges.slot_generation(slot),
+				}
+			}
+		}
+	};
+}
+
+impl_slot_state!(Forest);
+impl_slot_state!(Tree);
+impl_slot_state!(RootedTree);
+
 impl Forest<Mutable> {
 	pub fn new(orientation: TreeOrientation) -> Self {
 		Self {
@@ -286,12 +326,17 @@ impl Forest<Mutable> {
 		label: Option<Text>,
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomId> {
+		self.add_root_with_id(generated_record_id(AtomKind::Node)?, label, properties)
+	}
+
+	pub(crate) fn add_root_with_id(
+		&mut self,
+		record_id: RecordId,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomId> {
 		self.metadata.ensure_can_bump()?;
-		let id = self.storage.insert_root_new(
-			generated_record_id(AtomKind::Node)?,
-			label,
-			properties,
-		)?;
+		let id = self.storage.insert_root_new(record_id, label, properties)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		Ok(id)
 	}
@@ -303,15 +348,19 @@ impl Forest<Mutable> {
 		label: Option<Text>,
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomId> {
+		self.connect_with_id(parent, child, generated_record_id(AtomKind::Edge)?, label, properties)
+	}
+
+	pub(crate) fn connect_with_id(
+		&mut self,
+		parent: AtomId,
+		child: AtomId,
+		record_id: RecordId,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomId> {
 		self.metadata.ensure_can_bump()?;
-		let edge = self.storage.connect_new(
-			parent,
-			child,
-			generated_record_id(AtomKind::Edge)?,
-			label,
-			properties,
-			None,
-		)?;
+		let edge = self.storage.connect_new(parent, child, record_id, label, properties, None)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(edge)))?;
 		Ok(edge)
 	}
@@ -576,12 +625,20 @@ impl Clone for RootedTree<Frozen> {
 macro_rules! impl_forest_read {
 	($type:ident, $kind:expr) => {
 		impl<State> GraphRead for $type<State> {
+			type Edge<'a>
+				= EdgeView<'a>
+			where
+				Self: 'a;
 			type EdgeIds<'a>
-				= AtomIds<'a>
+				= FallibleAtomIds<AtomIds<'a>>
+			where
+				Self: 'a;
+			type Node<'a>
+				= NodeView<'a>
 			where
 				Self: 'a;
 			type NodeIds<'a>
-				= AtomIds<'a>
+				= FallibleAtomIds<AtomIds<'a>>
 			where
 				Self: 'a;
 
@@ -597,38 +654,48 @@ macro_rules! impl_forest_read {
 				$kind
 			}
 
-			fn properties(&self) -> &PropertyMap {
-				self.metadata.properties()
+			fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+				Ok(Cow::Borrowed(self.metadata.properties()))
 			}
 
-			fn node_ids(&self) -> Self::NodeIds<'_> {
-				AtomIds::new(self.storage.nodes.ids().iter())
+			fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
+				Ok(FallibleAtomIds::new(AtomIds::new(self.storage.nodes.ids().iter())))
 			}
 
-			fn edge_ids(&self) -> Self::EdgeIds<'_> {
-				AtomIds::new(self.storage.edges.ids().iter())
+			fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
+				Ok(FallibleAtomIds::new(AtomIds::new(self.storage.edges.ids().iter())))
 			}
 
-			fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
-				Some(NodeView::new(
-					id,
-					self.storage.nodes.record_id(id)?,
-					self.storage.nodes.label(id)?,
-					self.storage.nodes.properties(id)?,
-					None,
-				))
+			fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
+				let Some(record_id) = self.storage.nodes.record_id(id) else {
+					return Ok(None);
+				};
+				let Some(label) = self.storage.nodes.label(id) else {
+					return Ok(None);
+				};
+				let Some(properties) = self.storage.nodes.properties(id) else {
+					return Ok(None);
+				};
+				Ok(Some(NodeView::new(id, record_id, label, properties, None)))
 			}
 
-			fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
-				Some(EdgeView::new(
-					id,
-					self.storage.edges.record_id(id)?,
-					self.storage.edges.topology(id)?,
-					self.storage.edges.label(id)?,
-					self.storage.edges.properties(id)?,
-					self.storage.edges.weight(id)?,
-					None,
-				))
+			fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
+				let Some(record_id) = self.storage.edges.record_id(id) else {
+					return Ok(None);
+				};
+				let Some(topology) = self.storage.edges.topology(id) else {
+					return Ok(None);
+				};
+				let Some(label) = self.storage.edges.label(id) else {
+					return Ok(None);
+				};
+				let Some(properties) = self.storage.edges.properties(id) else {
+					return Ok(None);
+				};
+				let Some(weight) = self.storage.edges.weight(id) else {
+					return Ok(None);
+				};
+				Ok(Some(EdgeView::new(id, record_id, topology, label, properties, weight, None)))
 			}
 
 			fn storage_mode(&self) -> super::GraphStorageMode {
@@ -674,11 +741,25 @@ macro_rules! impl_forest_common {
 			}
 
 			pub fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
-				<Self as GraphRead>::node(self, id)
+				Some(NodeView::new(
+					id,
+					self.storage.nodes.record_id(id)?,
+					self.storage.nodes.label(id)?,
+					self.storage.nodes.properties(id)?,
+					None,
+				))
 			}
 
 			pub fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
-				<Self as GraphRead>::edge(self, id)
+				Some(EdgeView::new(
+					id,
+					self.storage.edges.record_id(id)?,
+					self.storage.edges.topology(id)?,
+					self.storage.edges.label(id)?,
+					self.storage.edges.properties(id)?,
+					self.storage.edges.weight(id)?,
+					None,
+				))
 			}
 
 			pub fn parent(&self, id: AtomId) -> Option<AtomId> {
@@ -753,6 +834,17 @@ impl GraphMut for Forest<Mutable> {
 		self.metadata.properties_mut()
 	}
 
+	fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		if id.kind() != Some(AtomKind::Node) {
+			return Err(atom_kind_mismatch(id, AtomKind::Node));
+		}
+		if !self.storage.nodes.contains(id) {
+			return Err(atom_does_not_exist(id));
+		}
+		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+		self.storage.nodes.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
+	}
+
 	fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		if id.kind() != Some(AtomKind::Node) {
 			return Err(atom_kind_mismatch(id, AtomKind::Node));
@@ -762,6 +854,17 @@ impl GraphMut for Forest<Mutable> {
 		}
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		self.storage.nodes.properties_mut(id).ok_or_else(|| atom_does_not_exist(id))
+	}
+
+	fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		if id.kind() != Some(AtomKind::Edge) {
+			return Err(atom_kind_mismatch(id, AtomKind::Edge));
+		}
+		if !self.storage.edges.contains(id) {
+			return Err(atom_does_not_exist(id));
+		}
+		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+		self.storage.edges.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
 	fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
@@ -804,6 +907,17 @@ macro_rules! impl_tree_mut {
 				self.metadata.properties_mut()
 			}
 
+			fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+				if id.kind() != Some(AtomKind::Node) {
+					return Err(atom_kind_mismatch(id, AtomKind::Node));
+				}
+				if !self.storage.nodes.contains(id) {
+					return Err(atom_does_not_exist(id));
+				}
+				self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+				self.storage.nodes.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
+			}
+
 			fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 				if id.kind() != Some(AtomKind::Node) {
 					return Err(atom_kind_mismatch(id, AtomKind::Node));
@@ -813,6 +927,17 @@ macro_rules! impl_tree_mut {
 				}
 				self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 				self.storage.nodes.properties_mut(id).ok_or_else(|| atom_does_not_exist(id))
+			}
+
+			fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+				if id.kind() != Some(AtomKind::Edge) {
+					return Err(atom_kind_mismatch(id, AtomKind::Edge));
+				}
+				if !self.storage.edges.contains(id) {
+					return Err(atom_does_not_exist(id));
+				}
+				self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+				self.storage.edges.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
 			}
 
 			fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
@@ -963,16 +1088,26 @@ impl QueryMaterialize for Tree<Frozen> {
 	}
 }
 
+struct MaterializedEdge {
+	record_id: RecordId,
+	topology: EdgeTopology,
+	label: Option<Text>,
+	properties: PropertyMap,
+	weight: Option<Number>,
+}
+
 fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<ForestStorage> {
-	let mut raw_edges = Vec::with_capacity(source.edge_count());
+	let mut raw_edges = Vec::with_capacity(source.edge_count()?);
 	let mut direction = None;
 	let mut nodes = BTreeMap::new();
-	for (index, id) in source.node_ids().enumerate() {
-		nodes.insert(id, index);
+	for (index, id) in source.node_ids()?.enumerate() {
+		nodes.insert(id?, index);
 	}
-	for id in source.edge_ids() {
-		let edge = source.edge(id).ok_or_else(|| atom_does_not_exist(id))?;
-		let (left, right, edge_direction) = edge.topology().local_binary().ok_or_else(|| {
+	for id in source.edge_ids()? {
+		let id = id?;
+		let edge = source.edge(id)?.ok_or_else(|| atom_does_not_exist(id))?;
+		let topology = edge.topology()?.into_owned();
+		let (left, right, edge_direction) = topology.local_binary().ok_or_else(|| {
 			constraint("forest edges must be local binary vertex-to-vertex edges")
 		})?;
 		if !nodes.contains_key(&left) || !nodes.contains_key(&right) {
@@ -988,7 +1123,13 @@ fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<ForestStorage> {
 		} else {
 			direction = Some(edge_direction);
 		}
-		raw_edges.push((id, left, right, edge));
+		raw_edges.push((id, left, right, MaterializedEdge {
+			record_id: edge.record_id()?.into_owned(),
+			topology,
+			label: edge.label_text()?.map(Cow::into_owned),
+			properties: edge.properties()?.into_owned(),
+			weight: edge.weight(),
+		}));
 	}
 
 	validate_acyclic(&nodes, &raw_edges)?;
@@ -1001,13 +1142,14 @@ fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<ForestStorage> {
 	};
 	let parent_map = build_parent_map(&nodes, &raw_edges, orientation);
 	let mut storage = ForestStorage::new(orientation);
-	for id in source.node_ids() {
-		let node = source.node(id).ok_or_else(|| atom_does_not_exist(id))?;
+	for id in source.node_ids()? {
+		let id = id?;
+		let node = source.node(id)?.ok_or_else(|| atom_does_not_exist(id))?;
 		storage.insert_root_at(
 			id,
-			node.record_id().clone(),
-			node.label_text().cloned(),
-			node.properties().clone(),
+			node.record_id()?.into_owned(),
+			node.label_text()?.map(Cow::into_owned),
+			node.properties()?.into_owned(),
 		)?;
 	}
 	for (id, left, right, edge) in raw_edges {
@@ -1016,11 +1158,11 @@ fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<ForestStorage> {
 			id,
 			parent,
 			child,
-			edge.record_id().clone(),
-			edge.topology().clone(),
-			edge.label_text().cloned(),
-			edge.properties().clone(),
-			edge.weight(),
+			edge.record_id,
+			edge.topology,
+			edge.label,
+			edge.properties,
+			edge.weight,
 		)?;
 	}
 	Ok(storage)
@@ -1028,7 +1170,7 @@ fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<ForestStorage> {
 
 fn validate_acyclic(
 	nodes: &BTreeMap<AtomId, usize>,
-	edges: &[(AtomId, AtomId, AtomId, EdgeView<'_>)],
+	edges: &[(AtomId, AtomId, AtomId, MaterializedEdge)],
 ) -> FerrosGrynnResult<()> {
 	let mut parent = (0..nodes.len()).collect::<Vec<_>>();
 	let mut pairs = BTreeSet::new();
@@ -1066,7 +1208,7 @@ fn find_root(parent: &mut [usize], mut index: usize) -> usize {
 
 fn infer_directed_orientation(
 	nodes: &BTreeMap<AtomId, usize>,
-	edges: &[(AtomId, AtomId, AtomId, EdgeView<'_>)],
+	edges: &[(AtomId, AtomId, AtomId, MaterializedEdge)],
 ) -> FerrosGrynnResult<TreeOrientation> {
 	let mut inbound = vec![0_u32; nodes.len()];
 	let mut outbound = vec![0_u32; nodes.len()];
@@ -1085,7 +1227,7 @@ fn infer_directed_orientation(
 
 fn build_parent_map(
 	nodes: &BTreeMap<AtomId, usize>,
-	edges: &[(AtomId, AtomId, AtomId, EdgeView<'_>)],
+	edges: &[(AtomId, AtomId, AtomId, MaterializedEdge)],
 	orientation: TreeOrientation,
 ) -> BTreeMap<AtomId, (AtomId, AtomId)> {
 	if orientation == TreeOrientation::OutArborescence {

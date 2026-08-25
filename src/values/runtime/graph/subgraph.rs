@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	cmp::Ordering,
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
@@ -6,7 +7,7 @@ use std::{
 
 use super::{
 	AtomId,
-	EdgeView,
+	AtomKind,
 	Frozen,
 	Graph,
 	GraphKind,
@@ -14,12 +15,11 @@ use super::{
 	GraphRead,
 	GraphWriteBack,
 	Mutable,
-	NodeView,
 	QueryMaterialize,
 };
 use crate::{
 	gql_status::FerrosGrynnResult,
-	values::runtime::{PropertyMap, Uuid},
+	values::runtime::{PropertyMap, Text, Uuid},
 };
 
 /// Self-contained materialized query result.
@@ -77,6 +77,23 @@ impl Clone for Subgraph<Frozen> {
 }
 
 impl<State> Subgraph<State> {
+	pub(crate) fn restore_free_slot(
+		&mut self,
+		kind: AtomKind,
+		slot: u64,
+		generation: u32,
+	) -> FerrosGrynnResult<()> {
+		self.graph.restore_free_slot(kind, slot, generation)
+	}
+
+	pub(crate) fn slot_capacity(&self, kind: AtomKind) -> usize {
+		self.graph.slot_capacity(kind)
+	}
+
+	pub(crate) fn slot_generation(&self, kind: AtomKind, slot: usize) -> Option<u32> {
+		self.graph.slot_generation(kind, slot)
+	}
+
 	pub const fn from_graph(graph: Graph<State>) -> Self {
 		Self {
 			graph,
@@ -101,8 +118,16 @@ impl<State> Subgraph<State> {
 }
 
 impl<State> GraphRead for Subgraph<State> {
+	type Edge<'a>
+		= <Graph<State> as GraphRead>::Edge<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
 		= <Graph<State> as GraphRead>::EdgeIds<'a>
+	where
+		Self: 'a;
+	type Node<'a>
+		= <Graph<State> as GraphRead>::Node<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
@@ -122,24 +147,24 @@ impl<State> GraphRead for Subgraph<State> {
 		GraphKind::Subgraph
 	}
 
-	fn properties(&self) -> &PropertyMap {
-		self.graph.properties()
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		GraphRead::properties(&self.graph)
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
-		self.graph.node_ids()
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
+		GraphRead::node_ids(&self.graph)
 	}
 
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
-		self.graph.edge_ids()
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
+		GraphRead::edge_ids(&self.graph)
 	}
 
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
-		self.graph.node(id)
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
+		GraphRead::node(&self.graph, id)
 	}
 
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
-		self.graph.edge(id)
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
+		GraphRead::edge(&self.graph, id)
 	}
 
 	fn storage_mode(&self) -> super::GraphStorageMode {
@@ -160,8 +185,16 @@ impl GraphMut for Subgraph<Mutable> {
 		self.graph.properties_mut()
 	}
 
+	fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		self.graph.node_label_mut(id)
+	}
+
 	fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		self.graph.node_properties_mut(id)
+	}
+
+	fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		self.graph.edge_label_mut(id)
 	}
 
 	fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
@@ -237,6 +270,6 @@ mod tests {
 		let mut graph = Subgraph::<Mutable>::new();
 		graph.graph.add_node(None, PropertyMap::new()).unwrap();
 		assert_eq!(graph.kind(), GraphKind::Subgraph);
-		assert_eq!(graph.node_count(), 1);
+		assert_eq!(graph.node_count().unwrap(), 1);
 	}
 }

@@ -54,6 +54,7 @@
 | TxWriteSet        | `FG_TX_WRITE_SET_MAX_BYTES` = 256 МиБ              | Abort до публикации; import дробится  |
 | Statement timeout | `statement_timeout_ms` / `TIMEOUT` clause          | Cancel query                          |
 | Snapshot age      | `max_snapshot_age`                                 | Force-close stale snapshots           |
+| Checkpoint        | `CheckpointPolicy` = 25% / 300 секунд              | Passive backfill; Restart — явно      |
 | Path expansion    | `FG_PATH_MAX_DEPTH` (30), `MAXDEPTH`               | Обрыв path-finding                    |
 | Graph expansion   | `FG_GRAPH_EXPANSION_MAX_NODES/EDGES`               | Обрыв построения графа                |
 
@@ -65,8 +66,9 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 - **`SyncPageManager`** ([implementation_plan.md](implementation_plan.md) §3.3) — единый
   crate-private Windows-first manager под frame-WAL: `TxHandle` владеет snapshot-регистрацией,
-  `PageRead<'tx>` объединяет staged borrow и immutable `PageGuard`, а passive checkpoint/recovery
-  остаются внутренними. Trait с единственной реализацией не вводится.
+  `PageRead<'tx>` объединяет staged borrow и immutable `PageGuard`; recovery остаётся внутренним,
+  а checkpoint доступен через `Datastore::checkpoint(Passive | Restart)`. Trait с единственной
+  реализацией не вводится.
 - **`Index`** (`disk_storage_spec.md` §20.1) — единый интерфейс индексов: `insert`, `delete`, `lookup`, `range`, `rebuild`, `status`.
 - **`TransactionLogSink`** — приёмник WAL-записей (append + fsync-барьеры).
 - **`RowCursor`** (§7, §9) — эталонный sync pull-контракт:
@@ -587,6 +589,12 @@ Runtime-решения: batch too large → split; skew → rebalance; выбо�
 Adapter обязан вернуть уже декодированные runtime `Value`; `StorageValue`, `TypeTag` и внутренний
 `AtomId` выше этой границы не проходят. На входе `get` используется публичный `RecordId`.
 
+Состояние Windows-first среза на 2026-08-25: local backend подключён к `QueryRead` и открывает
+immutable graph generation как transaction-bound `LocalGraphView`, не материализуя граф при
+`open_local`. Point `get` использует primary `RecordId` index, scan читает его leaf-цепочку
+потоково, а property heap загружается только для выбранных атомов. Полная materialization нужна
+только явной мутации или режиму 3.
+
 ### 10.1. Режимы хранения
 
 - **Режим 1 — Full in-memory**: `Graph<Mutable>` или специализированный `T<Mutable>` хранит
@@ -743,10 +751,10 @@ local, conflicts и remote revision. Delta не применяется авто�
 
 ## 11. Транзакции, MVCC и снимки в исполнении
 
-Режим 1 реализован в `src/datastore.rs`; `fg-meta/mvcc.rs` используется как набор сценариев и
-антипаттернов, но не копируется. В частности, version нельзя назначать в `begin`: поздно
-закоммиченная транзакция тогда стала бы видна старому snapshot. Persistent-часть зависит от
-frame-WAL и ещё не подключена. Поведение задаёт §17 `gql_spec.md`.
+Режим 1 и Windows-first persistent-часть режима 2 реализованы в `src/datastore.rs` и
+`src/storage`; `fg-meta/mvcc.rs` используется как набор сценариев и антипаттернов, но не
+копируется. В частности, version нельзя назначать в `begin`: поздно закоммиченная транзакция
+тогда стала бы видна старому snapshot. Поведение задаёт §17 `gql_spec.md`.
 
 ### 11.1. Уровни изоляции
 
@@ -884,8 +892,10 @@ transaction spill `begin_tx` не пишет WAL.
 Практическое следствие для исполнителя: **долгий читатель удерживает журнал**. Многоминутный аналитический обход не даёт обрезать лог, и он растёт. Поэтому:
 - долгую аналитику следует выполнять через режим 3 (`query_to_memory`), который материализует подграф и **освобождает снимок**, а не держит его весь расчёт;
 - для чтения только отбэкфилленных данных предусмотрен checkpoint-stable режим: такой запрос не удерживает ни одного фрейма и видит состояние на последний checkpoint;
-- snapshot timeout/cancellation и `CheckpointMode::Restart` добавляются в этапе 4; срез 3b никого
-  не отменяет и просто не продвигается дальше старого reader.
+- `max_snapshot_age` кооперативно отменяет просроченный storage snapshot (`FG-25F01`), а явный
+  `CheckpointMode::Restart` отменяет зарегистрированных readers (`FG-25F02`) под коротким
+  snapshot-gate и продвигает target к захваченному durable tail. Новые readers после захвата target
+  не блокируются; Passive сохраняет непросроченные снимки.
 
 ### 12.3. Recovery
 
@@ -972,7 +982,7 @@ transaction spill `begin_tx` не пишет WAL.
 |---------------------------------------------------|--------------------------------------|---------------|
 | `FG_PAGE_BUFFER_PAGES`                            | размер buffer pool (страниц)         | 4096 (64 MiB) |
 | `FG_WAL_SEGMENT_SIZE`                             | размер WAL-сегмента                  | 64 MiB        |
-| `FG_CHECKPOINT_DIRTY_THRESHOLD` / `_INTERVAL_SEC` | триггеры checkpoint                  | 0.25 / 300    |
+| `LocalOptions.checkpoint`                         | доля WAL-only страниц / интервал     | 25% / 300 sec |
 | `FG_TX_WRITE_SET_MAX_BYTES`                       | atom-delta budget транзакции         | 256 MiB       |
 | `FG_MAX_SNAPSHOT_AGE_SEC`                         | максимальный возраст snapshot        | 300           |
 | `FG_LABEL_DICT_CACHE_MB`                          | LRU-кеш словаря меток                | 32            |

@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	cmp::Ordering,
 	collections::{BTreeMap, BTreeSet},
 	fmt::{self, Debug, Formatter},
@@ -16,8 +17,10 @@ use super::{
 	AtomKind,
 	DirtyTarget,
 	EdgeEndpoint,
+	EdgeRead,
 	EdgeTopology,
 	EdgeView,
+	FallibleAtomIds,
 	Frozen,
 	GraphKind,
 	GraphMut,
@@ -27,6 +30,7 @@ use super::{
 	GraphWriteBack,
 	MaterializationOrigin,
 	Mutable,
+	NodeRead,
 	NodeView,
 	QualifiedAtomId,
 	QueryMaterialize,
@@ -140,6 +144,15 @@ impl GeneralStorage {
 		if let Some(transition) = self.edge_transition.get_mut(id.slot() as usize) {
 			*transition = None;
 		}
+	}
+
+	fn set_edge_topology(&mut self, id: AtomId, topology: EdgeTopology) -> FerrosGrynnResult<()> {
+		self.validate_topology(&topology)?;
+		let previous = self.edges.topology(id).cloned().ok_or_else(|| atom_does_not_exist(id))?;
+		self.unregister_incidence(id, &previous);
+		*self.edges.topology_mut(id).ok_or_else(|| atom_does_not_exist(id))? = topology.clone();
+		self.register_incidence(id, &topology);
+		Ok(())
 	}
 
 	fn node_inner(&self, id: AtomId) -> Option<&Graph<Frozen>> {
@@ -396,6 +409,17 @@ impl Graph<Mutable> {
 		if let Some(slot) = self.storage.edges.weight_mut(id) {
 			*slot = weight.filter(|value| !value.is_nan());
 		}
+		self.metadata.bump(Some(DirtyTarget::Atom(id)))
+	}
+
+	pub(crate) fn replace_edge_topology(
+		&mut self,
+		id: AtomId,
+		topology: EdgeTopology,
+	) -> FerrosGrynnResult<()> {
+		self.check_edge(id)?;
+		self.metadata.ensure_can_bump()?;
+		self.storage.set_edge_topology(id, topology)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))
 	}
 
@@ -671,6 +695,32 @@ impl Clone for Graph<Frozen> {
 }
 
 impl<State> Graph<State> {
+	pub(crate) fn restore_free_slot(
+		&mut self,
+		kind: AtomKind,
+		slot: u64,
+		generation: u32,
+	) -> FerrosGrynnResult<()> {
+		match kind {
+			AtomKind::Node => self.storage.nodes.restore_free(slot, generation),
+			AtomKind::Edge => self.storage.edges.restore_free(slot, generation),
+		}
+	}
+
+	pub(crate) fn slot_capacity(&self, kind: AtomKind) -> usize {
+		match kind {
+			AtomKind::Node => self.storage.nodes.slot_capacity(),
+			AtomKind::Edge => self.storage.edges.slot_capacity(),
+		}
+	}
+
+	pub(crate) fn slot_generation(&self, kind: AtomKind, slot: usize) -> Option<u32> {
+		match kind {
+			AtomKind::Node => self.storage.nodes.slot_generation(slot),
+			AtomKind::Edge => self.storage.edges.slot_generation(slot),
+		}
+	}
+
 	pub const fn identity(&self) -> Uuid {
 		self.metadata.identity()
 	}
@@ -700,11 +750,25 @@ impl<State> Graph<State> {
 	}
 
 	pub fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
-		<Self as GraphRead>::node(self, id)
+		Some(NodeView::new(
+			id,
+			self.storage.nodes.record_id(id)?,
+			self.storage.nodes.label(id)?,
+			self.storage.nodes.properties(id)?,
+			self.storage.node_inner(id),
+		))
 	}
 
 	pub fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
-		<Self as GraphRead>::edge(self, id)
+		Some(EdgeView::new(
+			id,
+			self.storage.edges.record_id(id)?,
+			self.storage.edges.topology(id)?,
+			self.storage.edges.label(id)?,
+			self.storage.edges.properties(id)?,
+			self.storage.edges.weight(id)?,
+			self.storage.edge_transition(id),
+		))
 	}
 
 	pub fn nodes(&self) -> impl Iterator<Item = NodeView<'_>> {
@@ -765,12 +829,20 @@ impl<State> Graph<State> {
 }
 
 impl<State> GraphRead for Graph<State> {
+	type Edge<'a>
+		= EdgeView<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
-		= AtomIds<'a>
+		= FallibleAtomIds<AtomIds<'a>>
+	where
+		Self: 'a;
+	type Node<'a>
+		= NodeView<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
-		= AtomIds<'a>
+		= FallibleAtomIds<AtomIds<'a>>
 	where
 		Self: 'a;
 
@@ -786,38 +858,56 @@ impl<State> GraphRead for Graph<State> {
 		GraphKind::Graph
 	}
 
-	fn properties(&self) -> &PropertyMap {
-		self.properties()
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		Ok(Cow::Borrowed(self.properties()))
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
-		AtomIds::new(self.storage.nodes.ids().iter())
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
+		Ok(FallibleAtomIds::new(AtomIds::new(self.storage.nodes.ids().iter())))
 	}
 
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
-		AtomIds::new(self.storage.edges.ids().iter())
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
+		Ok(FallibleAtomIds::new(AtomIds::new(self.storage.edges.ids().iter())))
 	}
 
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
-		Some(NodeView::new(
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
+		let Some(record_id) = self.storage.nodes.record_id(id) else {
+			return Ok(None);
+		};
+		let Some(label) = self.storage.nodes.label(id) else {
+			return Ok(None);
+		};
+		let Some(properties) = self.storage.nodes.properties(id) else {
+			return Ok(None);
+		};
+		Ok(Some(NodeView::new(id, record_id, label, properties, self.storage.node_inner(id))))
+	}
+
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
+		let Some(record_id) = self.storage.edges.record_id(id) else {
+			return Ok(None);
+		};
+		let Some(topology) = self.storage.edges.topology(id) else {
+			return Ok(None);
+		};
+		let Some(label) = self.storage.edges.label(id) else {
+			return Ok(None);
+		};
+		let Some(properties) = self.storage.edges.properties(id) else {
+			return Ok(None);
+		};
+		let Some(weight) = self.storage.edges.weight(id) else {
+			return Ok(None);
+		};
+		Ok(Some(EdgeView::new(
 			id,
-			self.storage.nodes.record_id(id)?,
-			self.storage.nodes.label(id)?,
-			self.storage.nodes.properties(id)?,
-			self.storage.node_inner(id),
-		))
-	}
-
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
-		Some(EdgeView::new(
-			id,
-			self.storage.edges.record_id(id)?,
-			self.storage.edges.topology(id)?,
-			self.storage.edges.label(id)?,
-			self.storage.edges.properties(id)?,
-			self.storage.edges.weight(id)?,
+			record_id,
+			topology,
+			label,
+			properties,
+			weight,
 			self.storage.edge_transition(id),
-		))
+		)))
 	}
 
 	fn storage_mode(&self) -> GraphStorageMode {
@@ -834,10 +924,22 @@ impl GraphMut for Graph<Mutable> {
 		self.metadata.properties_mut()
 	}
 
+	fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		self.check_node(id)?;
+		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+		self.storage.nodes.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
+	}
+
 	fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		self.check_node(id)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		self.storage.nodes.properties_mut(id).ok_or_else(|| atom_does_not_exist(id))
+	}
+
+	fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		self.check_edge(id)?;
+		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+		self.storage.edges.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
 	fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
@@ -906,73 +1008,77 @@ fn copy_from_read<R: GraphRead>(
 	source: &R,
 	preserve_ids: bool,
 ) -> FerrosGrynnResult<Graph<Mutable>> {
+	let properties = source.properties()?.into_owned();
 	let metadata = if preserve_ids {
-		GraphMetadata::with_identity(
-			source.identity(),
-			source.revision(),
-			source.properties().clone(),
-		)
+		GraphMetadata::with_identity(source.identity(), source.revision(), properties)
 	} else {
-		GraphMetadata::with_identity(Uuid::now_v7(), 0, source.properties().clone())
+		GraphMetadata::with_identity(Uuid::now_v7(), 0, properties)
 	};
 	let mut result = Graph {
 		metadata,
-		storage: GeneralStorage::with_capacity(source.node_count(), source.edge_count()),
+		storage: GeneralStorage::with_capacity(source.node_count()?, source.edge_count()?),
 		state: PhantomData,
 	};
 	let mut ids = BTreeMap::new();
 	let mut source_atoms = BTreeMap::new();
 
-	for source_id in source.node_ids() {
-		let node = source.node(source_id).ok_or_else(|| atom_does_not_exist(source_id))?;
+	for source_id in source.node_ids()? {
+		let source_id = source_id?;
+		let node = source.node(source_id)?.ok_or_else(|| atom_does_not_exist(source_id))?;
+		if node.inner_graph_ref()?.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"query materialization of nested graphs belongs to stage 5",
+			));
+		}
+		let record_id = node.record_id()?.into_owned();
+		let label = node.label_text()?.map(Cow::into_owned);
+		let properties = node.properties()?.into_owned();
 		let local_id = if preserve_ids {
-			result.storage.insert_node_at(
-				source_id,
-				node.record_id().clone(),
-				node.label_text().cloned(),
-				node.properties().clone(),
-				node.inner_graph().cloned(),
-			)?;
+			result.storage.insert_node_at(source_id, record_id, label, properties, None)?;
 			source_id
 		} else {
-			result.storage.insert_node_new(
-				node.record_id().clone(),
-				node.label_text().cloned(),
-				node.properties().clone(),
-				node.inner_graph().cloned(),
-			)?
+			result.storage.insert_node_new(record_id, label, properties, None)?
 		};
 		ids.insert(source_id, local_id);
-		source_atoms.insert(local_id, node.atom_ref());
+		source_atoms.insert(local_id, node.atom_ref()?);
 	}
 
-	for source_id in source.edge_ids() {
-		let edge = source.edge(source_id).ok_or_else(|| atom_does_not_exist(source_id))?;
-		let topology = remap_topology(edge.topology(), &ids)?;
+	for source_id in source.edge_ids()? {
+		let source_id = source_id?;
+		let edge = source.edge(source_id)?.ok_or_else(|| atom_does_not_exist(source_id))?;
+		if edge.transition_graph_ref()?.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"query materialization of transition graphs belongs to stage 5",
+			));
+		}
+		let topology = remap_topology(edge.topology()?.as_ref(), &ids)?;
 		result.storage.validate_topology(&topology)?;
+		let record_id = edge.record_id()?.into_owned();
+		let label = edge.label_text()?.map(Cow::into_owned);
+		let properties = edge.properties()?.into_owned();
 		let local_id = if preserve_ids {
 			result.storage.insert_edge_at(
 				source_id,
-				edge.record_id().clone(),
+				record_id,
 				topology,
-				edge.label_text().cloned(),
-				edge.properties().clone(),
+				label,
+				properties,
 				edge.weight(),
-				edge.transition_graph().cloned(),
+				None,
 			)?;
 			source_id
 		} else {
 			result.storage.insert_edge_new(
-				edge.record_id().clone(),
+				record_id,
 				topology,
-				edge.label_text().cloned(),
-				edge.properties().clone(),
+				label,
+				properties,
 				edge.weight(),
-				edge.transition_graph().cloned(),
+				None,
 			)?
 		};
 		ids.insert(source_id, local_id);
-		source_atoms.insert(local_id, edge.atom_ref());
+		source_atoms.insert(local_id, edge.atom_ref()?);
 	}
 
 	if !preserve_ids {

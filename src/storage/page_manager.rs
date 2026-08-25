@@ -2,6 +2,7 @@
 
 use std::{
 	cmp,
+	fs,
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
 };
@@ -11,6 +12,14 @@ use rapidhash::{RapidHashMap, RapidHashSet};
 
 use super::{
 	buffer_pool::{BufferPool, PageCacheKey, PageCacheVersion, PageGuard},
+	catalog::{
+		CatalogUpdatePages,
+		DatabaseCatalog,
+		FileCatalog,
+		SYSTEM_CATALOG_PATH,
+		encode_bootstrap_catalogs,
+		read_catalogs_with,
+	},
 	direct::SYNC_BATCH_PAGES,
 	file_registry::{DataFileRegistration, DataFileRole, FileRegistry, RegisteredDataFile},
 	local::{
@@ -21,7 +30,7 @@ use super::{
 	},
 	page::{AlignedPage, PAGE_SIZE, PageLsn, PageNo},
 	superblock::{DatabaseSuperblock, GraphSuperblock},
-	types::{GraphId, PageKey},
+	types::{CheckpointGeneration, CommitTs, GraphId, Lsn, PageKey, TxId},
 	wal::{CommitOutcome, FrameWal, RecoverySeed, ResolvedFrame, TxHandle},
 };
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
@@ -40,12 +49,17 @@ pub(super) enum PageRead<'tx> {
 }
 
 impl PageRead<'_> {
+	/// Returns the complete immutable aligned page.
+	pub(super) fn as_page(&self) -> &AlignedPage {
+		match self {
+			Self::Staged(page) => page,
+			Self::Cached(page) => page.as_page(),
+		}
+	}
+
 	/// Returns the complete immutable page bytes.
 	pub(super) fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
-		match self {
-			Self::Staged(page) => page.as_bytes(),
-			Self::Cached(page) => page.as_bytes(),
-		}
+		self.as_page().as_bytes()
 	}
 }
 
@@ -65,7 +79,7 @@ pub(super) struct SyncPageManager {
 	/// Main database-superblock path used as the checkpoint commit point.
 	database_path: PathBuf,
 	/// Trusted, sealed mapping from persisted identities to open files.
-	registry: FileRegistry,
+	registry: RwLock<FileRegistry>,
 	/// Database-level frame WAL and snapshot registry.
 	wal: FrameWal,
 	/// Fixed-budget immutable page cache.
@@ -81,11 +95,140 @@ pub(super) struct SyncPageManager {
 }
 
 impl SyncPageManager {
+	/// Returns the currently durable logical commit clock.
+	pub(super) fn current_commit_ts(&self) -> u64 {
+		self.wal.snapshot().commit_ts().get()
+	}
+
+	/// Creates a new cataloged local database without replacing an existing
+	/// directory, then opens its recovery core while retaining ownership.
+	///
+	/// # Errors
+	///
+	/// Returns a typed filesystem, Direct-I/O, catalog, superblock, WAL, or
+	/// manager initialization error. A failed creation removes only the exact
+	/// directory successfully created by this call.
+	pub(super) fn create_cataloged(
+		database_directory: impl AsRef<Path>,
+		database_name: &str,
+		pool_pages: NonZeroUsize,
+	) -> FerrosGrynnResult<(Self, DatabaseCatalog, FileCatalog)> {
+		let database_directory = database_directory.as_ref();
+		fs::create_dir(database_directory)
+			.map_err(|source| local_io("create local database directory", source))?;
+		let mut creation = CreatedDatabaseDirectory::new(database_directory.to_path_buf());
+		let database_lock = DatabaseLock::acquire(database_directory)?;
+
+		let schema_directory = database_directory.join("schema");
+		fs::create_dir(&schema_directory)
+			.map_err(|source| local_io("create local schema directory", source))?;
+		let database_catalog = DatabaseCatalog::empty();
+		let file_catalog = FileCatalog::bootstrap()?;
+		let catalogs = encode_bootstrap_catalogs(&database_catalog, &file_catalog)?;
+		let catalog_path = database_directory.join(SYSTEM_CATALOG_PATH);
+		let catalog_file = super::direct::DirectFile::create_new(&catalog_path)?;
+		catalog_file.write_pages(PageNo::new(0), &catalogs.pages)?;
+		catalog_file.sync_all()?;
+		drop(catalog_file);
+
+		let database = DatabaseSuperblock {
+			db_name: database_name.to_owned(),
+			generation: CheckpointGeneration::ZERO,
+			checkpoint_lsn: Lsn::ZERO,
+			checkpoint_record_lsn: Lsn::ZERO,
+			durable_visible_lsn: Lsn::ZERO,
+			next_lsn: Lsn::FIRST,
+			commit_ts: CommitTs::ZERO,
+			next_tx_id: TxId::new(1),
+			next_file_instance_id: 1,
+			system_backfilled_lsn: Lsn::ZERO,
+			graph_catalog_root_page: catalogs.database_root,
+			file_catalog_root_page: catalogs.file_root,
+			graph_count: 0,
+		};
+		let database_file = super::direct::DirectFile::create_new(
+			database_directory.join(DATABASE_SUPERBLOCK_FILE),
+		)?;
+		database_file.write_page(PageNo::new(0), &database.encode()?)?;
+		database_file.sync_all()?;
+		drop(database_file);
+		drop(FrameWal::create_new(database_directory.join(WAL_DIRECTORY))?);
+
+		let registrations = file_catalog.registrations(database_directory);
+		validate_registration_paths(database_directory, &registrations)?;
+		let manager = Self::open_owned(
+			database_directory,
+			registrations,
+			pool_pages,
+			database_lock,
+			database,
+		)?;
+		creation.disarm();
+		Ok((manager, database_catalog, file_catalog))
+	}
+
+	/// Opens a database whose sealed registry is discovered from its durable
+	/// file catalog rather than supplied by a caller.
+	///
+	/// # Errors
+	///
+	/// Returns an ownership, catalog, path-containment, registry, WAL,
+	/// recovery, validation, or checkpoint error.
+	pub(super) fn open_cataloged(
+		database_directory: impl AsRef<Path>,
+		pool_pages: NonZeroUsize,
+	) -> FerrosGrynnResult<(Self, DatabaseCatalog, FileCatalog)> {
+		let database_directory = database_directory.as_ref();
+		let database_lock = DatabaseLock::acquire(database_directory)?;
+		let mut database =
+			select_database_superblock(&database_directory.join(DATABASE_SUPERBLOCK_FILE))?;
+		let catalog_file = super::direct::DirectFile::open_read_only(
+			database_directory.join(SYSTEM_CATALOG_PATH),
+		)?;
+		let wal = FrameWal::open_with_seed(
+			database_directory.join(WAL_DIRECTORY),
+			recovery_seed(&database),
+		)?;
+		let catalog_tx = wal.begin_tx()?;
+		let (database_catalog, file_catalog) = read_catalogs_with(
+			|page_no, page| {
+				let key =
+					PageKey::new(GraphId::SYSTEM, super::catalog::SYSTEM_CATALOG_FILE_ID, page_no);
+				let visible = wal.visible_frames(&[key], catalog_tx.snapshot());
+				if let Some(frame) = visible.frames()[0] {
+					visible.read_frame(frame, page).map(|_header| ())
+				} else {
+					catalog_file.read_page(page_no, page).map(|_header| ())
+				}
+			},
+			database.graph_catalog_root_page,
+			database.file_catalog_root_page,
+		)?;
+		FrameWal::abort_tx(catalog_tx);
+		drop(catalog_file);
+		database.graph_count = u32::try_from(database_catalog.graphs.len()).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("durable graph count exceeds u32")
+		})?;
+		database.next_file_instance_id =
+			database.next_file_instance_id.max(file_catalog.next_file_instance_id);
+		let registrations = file_catalog.registrations(database_directory);
+		validate_registration_paths(database_directory, &registrations)?;
+		let manager = Self::open_owned_with_wal(
+			database_directory,
+			registrations,
+			pool_pages,
+			database_lock,
+			database,
+			wal,
+		)?;
+		Ok((manager, database_catalog, file_catalog))
+	}
+
 	/// Opens a sealed local layout, recovers committed WAL frames, validates
 	/// home files, and checkpoints recovery before publishing the manager.
 	///
-	/// This is crate-private because durable catalog discovery and the public
-	/// `Datastore::open_local` composition root belong to stage 4.
+	/// This remains crate-private because [`crate::datastore::Datastore`] owns
+	/// durable catalog discovery and the public local composition root.
 	///
 	/// # Errors
 	///
@@ -100,6 +243,43 @@ impl SyncPageManager {
 		let database_lock = DatabaseLock::acquire(database_directory)?;
 		let database_path = database_directory.join(DATABASE_SUPERBLOCK_FILE);
 		let database = select_database_superblock(&database_path)?;
+		Self::open_owned(database_directory, registrations, pool_pages, database_lock, database)
+	}
+
+	/// Initializes the manager after ownership, database authority, and trusted
+	/// registrations have already been selected.
+	fn open_owned(
+		database_directory: &Path,
+		registrations: Vec<DataFileRegistration>,
+		pool_pages: NonZeroUsize,
+		database_lock: DatabaseLock,
+		database: DatabaseSuperblock,
+	) -> FerrosGrynnResult<Self> {
+		let wal = FrameWal::open_with_seed(
+			database_directory.join(WAL_DIRECTORY),
+			recovery_seed(&database),
+		)?;
+		Self::open_owned_with_wal(
+			database_directory,
+			registrations,
+			pool_pages,
+			database_lock,
+			database,
+			wal,
+		)
+	}
+
+	/// Initializes the manager with an already scanned WAL used for catalog
+	/// discovery before the sealed registry exists.
+	fn open_owned_with_wal(
+		database_directory: &Path,
+		registrations: Vec<DataFileRegistration>,
+		pool_pages: NonZeroUsize,
+		database_lock: DatabaseLock,
+		database: DatabaseSuperblock,
+		wal: FrameWal,
+	) -> FerrosGrynnResult<Self> {
+		let database_path = database_directory.join(DATABASE_SUPERBLOCK_FILE);
 
 		let mut graphs = RapidHashMap::default();
 		for registration in &registrations {
@@ -145,21 +325,10 @@ impl SyncPageManager {
 		}
 
 		let registry = FileRegistry::open(registrations)?;
-		let seed = RecoverySeed::new(
-			database.generation,
-			database.checkpoint_lsn,
-			database.checkpoint_record_lsn,
-			database.durable_visible_lsn,
-			database.next_lsn,
-			database.commit_ts,
-			database.next_tx_id,
-			database.next_file_instance_id,
-		);
-		let wal = FrameWal::open_with_seed(database_directory.join(WAL_DIRECTORY), seed)?;
 		let manager = Self {
 			_database_lock: database_lock,
 			database_path,
-			registry,
+			registry: RwLock::new(registry),
 			wal,
 			pool: BufferPool::new(pool_pages),
 			read_scratch: Mutex::new(aligned_extent()),
@@ -183,6 +352,14 @@ impl SyncPageManager {
 	/// Returns an error when the transaction-identity clock is exhausted.
 	pub(super) fn begin_tx(&self) -> FerrosGrynnResult<TxHandle> {
 		self.wal.begin_tx()
+	}
+
+	/// Starts a storage transaction with a bounded snapshot lifetime.
+	pub(super) fn begin_tx_with_max_age(
+		&self,
+		max_age: std::time::Duration,
+	) -> FerrosGrynnResult<TxHandle> {
+		self.wal.begin_tx_with_max_age(Some(max_age))
 	}
 
 	/// Reads one page using read-your-writes, visible WAL, then home order.
@@ -335,6 +512,126 @@ impl SyncPageManager {
 		FrameWal::abort_tx(tx);
 	}
 
+	/// Opens newly created trusted files so the same transaction may address
+	/// them before their catalog head becomes visible.
+	pub(super) fn register_files(
+		&self,
+		registrations: Vec<DataFileRegistration>,
+	) -> FerrosGrynnResult<()> {
+		let database_directory = self.database_path.parent().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("database superblock has no parent directory")
+		})?;
+		validate_registration_paths(database_directory, &registrations)?;
+		self.registry.write().insert(registrations)
+	}
+
+	/// Drops newly opened files when their catalog-root transaction did not
+	/// commit.
+	pub(super) fn unregister_files(&self, keys: &[(GraphId, super::types::DataFileId)]) {
+		self.registry.write().remove(keys);
+	}
+
+	/// Writes fresh immutable catalog tails, synchronizes them, and stages only
+	/// the fixed root-page switch in the caller's WAL transaction.
+	pub(super) fn stage_catalog_update(
+		&self,
+		tx: &mut TxHandle,
+		update: CatalogUpdatePages,
+	) -> FerrosGrynnResult<()> {
+		let file = self.transactional_file(PageKey::new(
+			GraphId::SYSTEM,
+			super::catalog::SYSTEM_CATALOG_FILE_ID,
+			PageNo::new(0),
+		))?;
+		let file = file.file()?;
+		if update.required_page_count > file.page_count() {
+			file.resize_pages(update.required_page_count)?;
+		}
+		for (page_no, page) in
+			update.database_pages.iter().skip(1).chain(update.file_pages.iter().skip(1))
+		{
+			file.write_page(*page_no, page)?;
+		}
+		if update.database_pages.len() > 1 || update.file_pages.len() > 1 {
+			file.sync_data()?;
+		}
+		for pages in [&update.database_pages, &update.file_pages] {
+			let (page_no, page) = pages.first().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("catalog update has no root page")
+			})?;
+			self.stage_frame(
+				tx,
+				PageKey::new(GraphId::SYSTEM, super::catalog::SYSTEM_CATALOG_FILE_ID, *page_no),
+				page,
+			)?;
+		}
+		Ok(())
+	}
+
+	/// Returns stable catalog roots and the next append-only tail page.
+	pub(super) fn catalog_allocation(&self) -> FerrosGrynnResult<(PageNo, PageNo, PageNo)> {
+		let authority = self.authority.read();
+		let file = self.transactional_file(PageKey::new(
+			GraphId::SYSTEM,
+			super::catalog::SYSTEM_CATALOG_FILE_ID,
+			PageNo::new(0),
+		))?;
+		Ok((
+			authority.database.graph_catalog_root_page,
+			authority.database.file_catalog_root_page,
+			PageNo::new(file.file()?.page_count()),
+		))
+	}
+
+	/// Returns the physical page count of one registered WAL-backfilled file.
+	pub(super) fn file_page_count(
+		&self,
+		graph_id: GraphId,
+		file_id: super::types::DataFileId,
+	) -> FerrosGrynnResult<u64> {
+		Ok(self
+			.transactional_file(PageKey::new(graph_id, file_id, PageNo::new(0)))?
+			.file()?
+			.page_count())
+	}
+
+	/// Extends one registered WAL-backfilled file before frames may address its
+	/// new tail. Existing bytes are never truncated.
+	pub(super) fn ensure_file_pages(
+		&self,
+		graph_id: GraphId,
+		file_id: super::types::DataFileId,
+		required: u64,
+	) -> FerrosGrynnResult<()> {
+		let registration =
+			self.transactional_file(PageKey::new(graph_id, file_id, PageNo::new(0)))?;
+		let file = registration.file()?;
+		if file.page_count() < required {
+			file.resize_pages(required)?;
+		}
+		Ok(())
+	}
+
+	/// Publishes checkpoint-owned metadata only after the matching catalog and
+	/// graph pages are durable in the frame WAL.
+	pub(super) fn publish_graph_authority(
+		&self,
+		graphs: impl IntoIterator<Item = GraphSuperblock>,
+		active_graphs: impl IntoIterator<Item = GraphId>,
+		graph_count: u32,
+		next_file_instance_id: u64,
+	) {
+		let mut authority = self.authority.write();
+		for graph in graphs {
+			authority.graphs.insert(graph.graph_id, graph);
+		}
+		let active = active_graphs.into_iter().collect::<RapidHashSet<_>>();
+		authority.graphs.retain(|graph_id, _graph| active.contains(graph_id));
+		authority.database.graph_count = graph_count;
+		authority.database.next_file_instance_id =
+			authority.database.next_file_instance_id.max(next_file_instance_id);
+	}
+
 	/// Runs one non-blocking passive checkpoint when reader-safe progress
 	/// exists.
 	///
@@ -346,10 +643,25 @@ impl SyncPageManager {
 	///
 	/// Returns WAL, file routing, Direct-I/O, superblock, atomic-replace, or
 	/// prune errors.
-	pub(super) fn checkpoint(&self) -> FerrosGrynnResult<()> {
+	pub(super) fn checkpoint(&self) -> FerrosGrynnResult<bool> {
+		self.checkpoint_inner(false)
+	}
+
+	/// Cancels existing storage snapshots and checkpoints the complete durable
+	/// tail captured before new readers may register.
+	pub(super) fn restart_checkpoint(&self) -> FerrosGrynnResult<bool> {
+		self.checkpoint_inner(true)
+	}
+
+	fn checkpoint_inner(&self, restart: bool) -> FerrosGrynnResult<bool> {
 		let _checkpoint = self.checkpoint_mutex.lock();
-		let Some(target) = self.wal.capture_checkpoint_target() else {
-			return Ok(());
+		let target = if restart {
+			self.wal.capture_restart_checkpoint_target()
+		} else {
+			self.wal.capture_checkpoint_target()
+		};
+		let Some(target) = target else {
+			return Ok(false);
 		};
 		let authority = self.authority.read();
 		let generation_floor = authority
@@ -396,7 +708,8 @@ impl SyncPageManager {
 		next_database.next_lsn = clocks.next_lsn;
 		next_database.commit_ts = clocks.commit_ts;
 		next_database.next_tx_id = clocks.next_tx_id;
-		next_database.next_file_instance_id = clocks.next_file_instance_id;
+		next_database.next_file_instance_id =
+			next_database.next_file_instance_id.max(clocks.next_file_instance_id);
 		next_database.system_backfilled_lsn = checkpoint.target();
 		next_database.encode_into(superblock_page)?;
 		write_superblock_atomic(&self.database_path, superblock_page)?;
@@ -407,7 +720,14 @@ impl SyncPageManager {
 			authority.database = next_database;
 			authority.graphs = next_graphs;
 		}
-		self.wal.publish_checkpoint(&checkpoint)
+		self.wal.publish_checkpoint(&checkpoint)?;
+		Ok(true)
+	}
+
+	/// Returns the number of unique durable pages still represented only in
+	/// WAL.
+	pub(super) fn unbackfilled_page_count(&self) -> usize {
+		self.wal.unbackfilled_page_count()
 	}
 
 	/// Returns the logical home-cache generation and checkpoint ceiling.
@@ -420,8 +740,11 @@ impl SyncPageManager {
 	}
 
 	/// Resolves a transactional file and rejects checkpoint-owned metadata.
-	fn transactional_file(&self, key: PageKey) -> FerrosGrynnResult<&RegisteredDataFile> {
-		let file = self.registry.resolve(key)?;
+	fn transactional_file(
+		&self,
+		key: PageKey,
+	) -> FerrosGrynnResult<std::sync::Arc<RegisteredDataFile>> {
+		let file = self.registry.read().resolve(key)?;
 		if file.role() != DataFileRole::WalBackfilled {
 			return Err(FerrosGrynnError::invalid_storage_file(
 				"transactional access targeted checkpoint-owned metadata",
@@ -431,13 +754,19 @@ impl SyncPageManager {
 	}
 
 	/// Resolves the sole checkpoint-owned metadata file for one graph.
-	fn graph_superblock_file(&self, graph_id: GraphId) -> FerrosGrynnResult<&RegisteredDataFile> {
+	fn graph_superblock_file(
+		&self,
+		graph_id: GraphId,
+	) -> FerrosGrynnResult<std::sync::Arc<RegisteredDataFile>> {
 		self.registry
-			.iter()
-			.find_map(|((registered_graph, _file_id), file)| {
-				(registered_graph == graph_id && file.role() == DataFileRole::GraphSuperblock)
-					.then_some(file)
+			.read()
+			.snapshot()
+			.into_iter()
+			.filter(|((registered_graph, _file_id), file)| {
+				*registered_graph == graph_id && file.role() == DataFileRole::GraphSuperblock
 			})
+			.max_by_key(|((_, file_id), _file)| file_id.instance_id())
+			.map(|(_key, file)| file)
 			.ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file(
 					"graph checkpoint authority has no registered GraphSuperblock",
@@ -480,7 +809,7 @@ impl SyncPageManager {
 			start = end;
 		}
 		for (graph_id, file_id) in touched {
-			self.registry.resolve_file(graph_id, file_id)?.file()?.sync_data()?;
+			self.registry.read().resolve_file(graph_id, file_id)?.file()?.sync_data()?;
 		}
 		Ok(())
 	}
@@ -500,7 +829,7 @@ impl SyncPageManager {
 			touched.insert((key.graph_id(), key.file_id()));
 		}
 		for (graph_id, file_id) in touched {
-			self.registry.resolve_file(graph_id, file_id)?.file()?.sync_data()?;
+			self.registry.read().resolve_file(graph_id, file_id)?.file()?.sync_data()?;
 		}
 		Ok(())
 	}
@@ -508,7 +837,8 @@ impl SyncPageManager {
 	/// Validates every initialized transactional home page after WAL replay.
 	fn validate_home_files(&self) -> FerrosGrynnResult<()> {
 		let mut scratch = self.checkpoint_scratch.lock();
-		for ((_graph_id, _file_id), registration) in self.registry.iter() {
+		let registrations = self.registry.read().snapshot();
+		for ((_graph_id, _file_id), registration) in registrations {
 			if registration.role() != DataFileRole::WalBackfilled {
 				continue;
 			}
@@ -537,6 +867,77 @@ impl SyncPageManager {
 		}
 		Ok(())
 	}
+}
+
+/// Converts the selected database authority into WAL recovery floors.
+const fn recovery_seed(database: &DatabaseSuperblock) -> RecoverySeed {
+	RecoverySeed::new(
+		database.generation,
+		database.checkpoint_lsn,
+		database.checkpoint_record_lsn,
+		database.durable_visible_lsn,
+		database.next_lsn,
+		database.commit_ts,
+		database.next_tx_id,
+		database.next_file_instance_id,
+	)
+}
+
+/// Cleanup guard armed only after this process creates a new DB directory.
+struct CreatedDatabaseDirectory {
+	/// Exact newly-created target; never derived from persisted catalog bytes.
+	path: PathBuf,
+	/// Successful publication transfers ownership to the returned manager.
+	armed: bool,
+}
+
+impl CreatedDatabaseDirectory {
+	/// Arms cleanup for one exact directory created by the caller.
+	const fn new(path: PathBuf) -> Self {
+		Self {
+			path,
+			armed: true,
+		}
+	}
+
+	/// Retains the completed database directory.
+	const fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for CreatedDatabaseDirectory {
+	/// Removes only incomplete content below the exact directory this call
+	/// successfully created. All subsequently opened handles drop first.
+	fn drop(&mut self) {
+		if self.armed {
+			drop(fs::remove_dir_all(&self.path));
+		}
+	}
+}
+
+/// Rejects reparse-point or symlink targets that leave the owned DB root.
+fn validate_registration_paths(
+	database_directory: &Path,
+	registrations: &[DataFileRegistration],
+) -> FerrosGrynnResult<()> {
+	let root = fs::canonicalize(database_directory)
+		.map_err(|source| local_io("canonicalize local database directory", source))?;
+	for registration in registrations {
+		let path = fs::canonicalize(&registration.path)
+			.map_err(|source| local_io("canonicalize cataloged data file", source))?;
+		if !path.starts_with(&root) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"cataloged data file resolves outside the local database directory",
+			));
+		}
+	}
+	Ok(())
+}
+
+/// Preserves a native local-layout failure behind the storage status boundary.
+fn local_io(operation: impl Into<String>, source: std::io::Error) -> FerrosGrynnError {
+	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
 }
 
 /// Allocates one fixed calibrated aligned extent during manager initialization.
@@ -597,6 +998,32 @@ mod tests {
 		files: Vec<(DataFileId, PathBuf)>,
 		/// Checkpoint-owned graph metadata path.
 		graph_superblock: PathBuf,
+	}
+
+	/// Unique not-yet-created path owned by one cataloged-database test.
+	struct TestDatabasePath(PathBuf);
+
+	impl TestDatabasePath {
+		/// Reserves a process-unique path without creating it.
+		fn new(label: &str) -> FerrosGrynnResult<Self> {
+			let suffix = NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed);
+			let path = std::env::current_dir()
+				.map_err(|source| test_io("resolve cataloged manager test directory", source))?
+				.join(format!(".ferros-grynn-{label}-{}-{suffix}", std::process::id()));
+			Ok(Self(path))
+		}
+
+		/// Returns the exact test path.
+		fn path(&self) -> &Path {
+			&self.0
+		}
+	}
+
+	impl Drop for TestDatabasePath {
+		/// Removes the directory only when the tested creation produced it.
+		fn drop(&mut self) {
+			drop(fs::remove_dir_all(&self.0));
+		}
 	}
 
 	impl TestDatabase {
@@ -684,6 +1111,32 @@ mod tests {
 		fn key(&self, index: usize) -> PageKey {
 			PageKey::new(TEST_GRAPH, self.files[index].0, PageNo::new(0))
 		}
+	}
+
+	/// Catalog bootstrap is sufficient to reopen an empty database without
+	/// caller-supplied physical registrations.
+	#[test]
+	fn cataloged_database_create_reopen_and_exclusive_create() -> Result<(), Box<dyn Error>> {
+		let path = TestDatabasePath::new("cataloged-manager")?;
+		let capacity = NonZeroUsize::new(8)
+			.ok_or_else(|| io::Error::other("cataloged test capacity must be non-zero"))?;
+		let (manager, database_catalog, file_catalog) =
+			SyncPageManager::create_cataloged(path.path(), "cataloged", capacity)?;
+		assert!(database_catalog.graphs.is_empty());
+		assert_eq!(file_catalog.files.len(), 1);
+		assert!(SyncPageManager::create_cataloged(path.path(), "replacement", capacity).is_err());
+		drop(manager);
+
+		let (reopened, database_catalog, file_catalog) =
+			SyncPageManager::open_cataloged(path.path(), capacity)?;
+		assert!(database_catalog.graphs.is_empty());
+		assert_eq!(file_catalog.files.len(), 1);
+		assert_eq!(
+			select_database_superblock(&path.path().join(DATABASE_SUPERBLOCK_FILE))?.db_name,
+			"cataloged"
+		);
+		drop(reopened);
+		Ok(())
 	}
 
 	impl Drop for TestDatabase {
@@ -786,6 +1239,47 @@ mod tests {
 		assert_eq!(pages[0].as_bytes()[PAGE_HEADER_SIZE], 7);
 		assert!(std::ptr::eq(pages[0].as_bytes(), pages[1].as_bytes()));
 		assert_eq!(manager.pool.stats().page_buffer_allocations(), 8);
+		Ok(())
+	}
+
+	/// Restart mode invalidates existing readers and checkpoints the complete
+	/// durable tail captured before a new reader may register.
+	#[test]
+	fn restart_checkpoint_cancels_reader_and_advances_to_tail() -> Result<(), Box<dyn Error>> {
+		let file_id = DataFileId::new(1, DataFileKind::Index)
+			.ok_or_else(|| io::Error::other("invalid test file id"))?;
+		let fixture = TestDatabase::create(&[file_id])?;
+		let manager = fixture.open()?;
+		let old_reader = manager.begin_tx()?;
+		let mut writer = manager.begin_tx()?;
+		manager.stage_frame(&mut writer, fixture.key(0), &marked_page(0, 0, 12)?)?;
+		let commit = manager.commit_tx(writer)?;
+
+		assert!(manager.restart_checkpoint()?);
+		assert!(!old_reader.is_active());
+		let authority =
+			select_database_superblock(&fixture.directory.join(DATABASE_SUPERBLOCK_FILE))?;
+		assert_eq!(authority.checkpoint_lsn, commit.commit_lsn());
+		Ok(())
+	}
+
+	/// Passive maintenance drops already expired registrations without sleeps.
+	#[test]
+	fn passive_checkpoint_cancels_expired_reader() -> Result<(), Box<dyn Error>> {
+		let file_id = DataFileId::new(1, DataFileKind::Index)
+			.ok_or_else(|| io::Error::other("invalid test file id"))?;
+		let fixture = TestDatabase::create(&[file_id])?;
+		let manager = fixture.open()?;
+		let expired = manager.begin_tx_with_max_age(std::time::Duration::ZERO)?;
+		let mut writer = manager.begin_tx()?;
+		manager.stage_frame(&mut writer, fixture.key(0), &marked_page(0, 0, 13)?)?;
+		let commit = manager.commit_tx(writer)?;
+
+		assert!(manager.checkpoint()?);
+		assert!(!expired.is_active());
+		let authority =
+			select_database_superblock(&fixture.directory.join(DATABASE_SUPERBLOCK_FILE))?;
+		assert_eq!(authority.checkpoint_lsn, commit.commit_lsn());
 		Ok(())
 	}
 

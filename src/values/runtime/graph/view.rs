@@ -1,12 +1,13 @@
+use std::borrow::Cow;
+
 use super::{
 	AtomId,
 	Dag,
 	EdgeDirection,
-	EdgeView,
+	EdgeRead,
 	Forest,
 	GraphKind,
 	GraphRead,
-	NodeView,
 	RootedTree,
 	Tree,
 	TreeOrientation,
@@ -35,8 +36,16 @@ macro_rules! define_family_view {
 		}
 
 		impl<R: GraphRead + ?Sized> GraphRead for $name<'_, R> {
+			type Edge<'a>
+				= R::Edge<'a>
+			where
+				Self: 'a;
 			type EdgeIds<'a>
 				= R::EdgeIds<'a>
+			where
+				Self: 'a;
+			type Node<'a>
+				= R::Node<'a>
 			where
 				Self: 'a;
 			type NodeIds<'a>
@@ -56,23 +65,23 @@ macro_rules! define_family_view {
 				$kind
 			}
 
-			fn properties(&self) -> &PropertyMap {
+			fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 				self.source.properties()
 			}
 
-			fn node_ids(&self) -> Self::NodeIds<'_> {
+			fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 				self.source.node_ids()
 			}
 
-			fn edge_ids(&self) -> Self::EdgeIds<'_> {
+			fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 				self.source.edge_ids()
 			}
 
-			fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
+			fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 				self.source.node(id)
 			}
 
-			fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
+			fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 				self.source.edge(id)
 			}
 
@@ -158,11 +167,12 @@ impl<State> super::Metagraph<State> {
 
 impl<'graph, R: GraphRead + ?Sized> DagView<'graph, R> {
 	pub fn try_new(source: &'graph R) -> FerrosGrynnResult<Self> {
-		for id in source.edge_ids() {
+		for id in source.edge_ids()? {
+			let id = id?;
 			let edge = source
-				.edge(id)
+				.edge(id)?
 				.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", id.to_string()))?;
-			if !matches!(edge.topology().local_binary(), Some((_, _, EdgeDirection::Directed))) {
+			if !matches!(edge.topology()?.local_binary(), Some((_, _, EdgeDirection::Directed))) {
 				return Err(FerrosGrynnError::graph_constraint_violation(
 					"dag view",
 					"all edges must be local binary directed edges",

@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	cmp::Ordering,
 	collections::BTreeSet,
 	fmt::{self, Debug, Formatter},
@@ -12,8 +13,10 @@ use super::{
 	AtomKind,
 	DirtyTarget,
 	EdgeEndpoint,
+	EdgeRead,
 	EdgeTopology,
 	EdgeView,
+	FallibleAtomIds,
 	Frozen,
 	Graph,
 	GraphKind,
@@ -21,6 +24,7 @@ use super::{
 	GraphRead,
 	GraphWriteBack,
 	Mutable,
+	NodeRead,
 	NodeView,
 	QueryMaterialize,
 	general::{atom_does_not_exist, atom_kind_mismatch},
@@ -147,6 +151,17 @@ impl HyperStorage {
 		self.edges.remove(id)
 	}
 
+	fn set_edge_topology(&mut self, id: AtomId, topology: EdgeTopology) -> FerrosGrynnResult<()> {
+		self.validate_topology(&topology)?;
+		let previous = self.edges.topology(id).cloned().ok_or_else(|| atom_does_not_exist(id))?;
+		for node in previous.endpoints().filter_map(EdgeEndpoint::local_id) {
+			self.incidence[node.slot() as usize].retain(|edge| *edge != id);
+		}
+		*self.edges.topology_mut(id).ok_or_else(|| atom_does_not_exist(id))? = topology;
+		self.register(id);
+		Ok(())
+	}
+
 	fn remove_node(&mut self, id: AtomId) -> bool {
 		if !self.nodes.contains(id) {
 			return false;
@@ -196,12 +211,17 @@ impl Hypergraph<Mutable> {
 		label: Option<Text>,
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomId> {
+		self.add_node_with_id(generated_record_id(AtomKind::Node)?, label, properties)
+	}
+
+	pub(crate) fn add_node_with_id(
+		&mut self,
+		record_id: RecordId,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomId> {
 		self.metadata.ensure_can_bump()?;
-		let id = self.storage.insert_node_new(
-			generated_record_id(AtomKind::Node)?,
-			label,
-			properties,
-		)?;
+		let id = self.storage.insert_node_new(record_id, label, properties)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		Ok(id)
 	}
@@ -212,16 +232,30 @@ impl Hypergraph<Mutable> {
 		label: Option<Text>,
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomId> {
+		self.add_edge_with_id(generated_record_id(AtomKind::Edge)?, topology, label, properties)
+	}
+
+	pub(crate) fn add_edge_with_id(
+		&mut self,
+		record_id: RecordId,
+		topology: EdgeTopology,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomId> {
 		self.metadata.ensure_can_bump()?;
-		let id = self.storage.insert_edge_new(
-			topology,
-			generated_record_id(AtomKind::Edge)?,
-			label,
-			properties,
-			None,
-		)?;
+		let id = self.storage.insert_edge_new(topology, record_id, label, properties, None)?;
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		Ok(id)
+	}
+
+	pub(crate) fn replace_edge_incidence(
+		&mut self,
+		id: AtomId,
+		topology: EdgeTopology,
+	) -> FerrosGrynnResult<()> {
+		self.metadata.ensure_can_bump()?;
+		self.storage.set_edge_topology(id, topology)?;
+		self.metadata.bump(Some(DirtyTarget::Atom(id)))
 	}
 
 	pub fn freeze(self) -> Hypergraph<Frozen> {
@@ -284,6 +318,32 @@ impl Clone for Hypergraph<Frozen> {
 }
 
 impl<State> Hypergraph<State> {
+	pub(crate) fn restore_free_slot(
+		&mut self,
+		kind: AtomKind,
+		slot: u64,
+		generation: u32,
+	) -> FerrosGrynnResult<()> {
+		match kind {
+			AtomKind::Node => self.storage.nodes.restore_free(slot, generation),
+			AtomKind::Edge => self.storage.edges.restore_free(slot, generation),
+		}
+	}
+
+	pub(crate) fn slot_capacity(&self, kind: AtomKind) -> usize {
+		match kind {
+			AtomKind::Node => self.storage.nodes.slot_capacity(),
+			AtomKind::Edge => self.storage.edges.slot_capacity(),
+		}
+	}
+
+	pub(crate) fn slot_generation(&self, kind: AtomKind, slot: usize) -> Option<u32> {
+		match kind {
+			AtomKind::Node => self.storage.nodes.slot_generation(slot),
+			AtomKind::Edge => self.storage.edges.slot_generation(slot),
+		}
+	}
+
 	pub const fn identity(&self) -> Uuid {
 		self.metadata.identity()
 	}
@@ -305,11 +365,25 @@ impl<State> Hypergraph<State> {
 	}
 
 	pub fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
-		<Self as GraphRead>::node(self, id)
+		Some(NodeView::new(
+			id,
+			self.storage.nodes.record_id(id)?,
+			self.storage.nodes.label(id)?,
+			self.storage.nodes.properties(id)?,
+			None,
+		))
 	}
 
 	pub fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
-		<Self as GraphRead>::edge(self, id)
+		Some(EdgeView::new(
+			id,
+			self.storage.edges.record_id(id)?,
+			self.storage.edges.topology(id)?,
+			self.storage.edges.label(id)?,
+			self.storage.edges.properties(id)?,
+			self.storage.edges.weight(id)?,
+			None,
+		))
 	}
 
 	pub fn incident_edges(&self, id: AtomId) -> &[AtomId] {
@@ -324,12 +398,20 @@ impl<State> Hypergraph<State> {
 }
 
 impl<State> GraphRead for Hypergraph<State> {
+	type Edge<'a>
+		= EdgeView<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
-		= AtomIds<'a>
+		= FallibleAtomIds<AtomIds<'a>>
+	where
+		Self: 'a;
+	type Node<'a>
+		= NodeView<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
-		= AtomIds<'a>
+		= FallibleAtomIds<AtomIds<'a>>
 	where
 		Self: 'a;
 
@@ -345,38 +427,48 @@ impl<State> GraphRead for Hypergraph<State> {
 		GraphKind::Hypergraph
 	}
 
-	fn properties(&self) -> &PropertyMap {
-		self.properties()
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		Ok(Cow::Borrowed(self.properties()))
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
-		AtomIds::new(self.storage.nodes.ids().iter())
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
+		Ok(FallibleAtomIds::new(AtomIds::new(self.storage.nodes.ids().iter())))
 	}
 
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
-		AtomIds::new(self.storage.edges.ids().iter())
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
+		Ok(FallibleAtomIds::new(AtomIds::new(self.storage.edges.ids().iter())))
 	}
 
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
-		Some(NodeView::new(
-			id,
-			self.storage.nodes.record_id(id)?,
-			self.storage.nodes.label(id)?,
-			self.storage.nodes.properties(id)?,
-			None,
-		))
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
+		let Some(record_id) = self.storage.nodes.record_id(id) else {
+			return Ok(None);
+		};
+		let Some(label) = self.storage.nodes.label(id) else {
+			return Ok(None);
+		};
+		let Some(properties) = self.storage.nodes.properties(id) else {
+			return Ok(None);
+		};
+		Ok(Some(NodeView::new(id, record_id, label, properties, None)))
 	}
 
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
-		Some(EdgeView::new(
-			id,
-			self.storage.edges.record_id(id)?,
-			self.storage.edges.topology(id)?,
-			self.storage.edges.label(id)?,
-			self.storage.edges.properties(id)?,
-			self.storage.edges.weight(id)?,
-			None,
-		))
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
+		let Some(record_id) = self.storage.edges.record_id(id) else {
+			return Ok(None);
+		};
+		let Some(topology) = self.storage.edges.topology(id) else {
+			return Ok(None);
+		};
+		let Some(label) = self.storage.edges.label(id) else {
+			return Ok(None);
+		};
+		let Some(properties) = self.storage.edges.properties(id) else {
+			return Ok(None);
+		};
+		let Some(weight) = self.storage.edges.weight(id) else {
+			return Ok(None);
+		};
+		Ok(Some(EdgeView::new(id, record_id, topology, label, properties, weight, None)))
 	}
 
 	fn storage_mode(&self) -> super::GraphStorageMode {
@@ -393,6 +485,17 @@ impl GraphMut for Hypergraph<Mutable> {
 		self.metadata.properties_mut()
 	}
 
+	fn node_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		if id.kind() != Some(AtomKind::Node) {
+			return Err(atom_kind_mismatch(id, AtomKind::Node));
+		}
+		if !self.storage.nodes.contains(id) {
+			return Err(atom_does_not_exist(id));
+		}
+		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+		self.storage.nodes.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
+	}
+
 	fn node_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
 		if id.kind() != Some(AtomKind::Node) {
 			return Err(atom_kind_mismatch(id, AtomKind::Node));
@@ -402,6 +505,17 @@ impl GraphMut for Hypergraph<Mutable> {
 		}
 		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
 		self.storage.nodes.properties_mut(id).ok_or_else(|| atom_does_not_exist(id))
+	}
+
+	fn edge_label_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut Option<Text>> {
+		if id.kind() != Some(AtomKind::Edge) {
+			return Err(atom_kind_mismatch(id, AtomKind::Edge));
+		}
+		if !self.storage.edges.contains(id) {
+			return Err(atom_does_not_exist(id));
+		}
+		self.metadata.bump(Some(DirtyTarget::Atom(id)))?;
+		self.storage.edges.label_mut(id).ok_or_else(|| atom_does_not_exist(id))
 	}
 
 	fn edge_properties_mut(&mut self, id: AtomId) -> FerrosGrynnResult<&mut PropertyMap> {
@@ -504,29 +618,31 @@ impl<State> Hash for Hypergraph<State> {
 
 fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<HyperStorage> {
 	let mut storage = HyperStorage::new();
-	for id in source.node_ids() {
-		let node = source.node(id).ok_or_else(|| atom_does_not_exist(id))?;
-		if node.is_meta() {
+	for id in source.node_ids()? {
+		let id = id?;
+		let node = source.node(id)?.ok_or_else(|| atom_does_not_exist(id))?;
+		if node.is_meta()? {
 			return Err(constraint("hypergraph vertices cannot contain nested graphs"));
 		}
 		storage.insert_node_at(
 			id,
-			node.record_id().clone(),
-			node.label_text().cloned(),
-			node.properties().clone(),
+			node.record_id()?.into_owned(),
+			node.label_text()?.map(Cow::into_owned),
+			node.properties()?.into_owned(),
 		)?;
 	}
-	for id in source.edge_ids() {
-		let edge = source.edge(id).ok_or_else(|| atom_does_not_exist(id))?;
-		if edge.is_meta() {
+	for id in source.edge_ids()? {
+		let id = id?;
+		let edge = source.edge(id)?.ok_or_else(|| atom_does_not_exist(id))?;
+		if edge.is_meta()? {
 			return Err(constraint("hypergraph edges cannot contain transition graphs"));
 		}
 		storage.insert_edge_at(
 			id,
-			edge.topology().clone(),
-			edge.record_id().clone(),
-			edge.label_text().cloned(),
-			edge.properties().clone(),
+			edge.topology()?.into_owned(),
+			edge.record_id()?.into_owned(),
+			edge.label_text()?.map(Cow::into_owned),
+			edge.properties()?.into_owned(),
 			edge.weight(),
 		)?;
 	}

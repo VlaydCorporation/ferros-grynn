@@ -141,9 +141,14 @@ pub(super) struct PageGuard {
 }
 
 impl PageGuard {
+	/// Returns the pinned immutable aligned page.
+	pub(super) fn as_page(&self) -> &AlignedPage {
+		self.page.as_ref().as_ref()
+	}
+
 	/// Returns the pinned immutable page without copying it.
 	pub(super) fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
-		self.page.as_ref().as_ref().as_bytes()
+		self.as_page().as_bytes()
 	}
 }
 

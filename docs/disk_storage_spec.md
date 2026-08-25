@@ -966,7 +966,7 @@ Offset  Size  Тип        Поле             Описание
 20      4     u32        adj_in_count     Общее кол-во входящих рёбер
 24      4     u32        adj_undir_count  Общее кол-во неориентированных рёбер
 28      1     u8         kind_flags       Биты: [7]=is_meta; [6]=tombstone; [5]=visited;
-                                          [4]=port; [3]=in_result; [2]=cut_vertex; [1]=reserved
+                                          [4]=reserved; [3]=in_result; [2]=cut_vertex; [1:0]=reserved
 29      3     u8[3]      _pad
 32      8     u64        overflow_out     page_no overflow для out; NULL_PAGE = нет
 40      8     u64        overflow_in      page_no overflow для in
@@ -2947,8 +2947,11 @@ registration`, поэтому reader не может потеряться меж
 `oldest_active_tx_first_frame` в prune-контракте нет.
 
 Старый reader ограничивает сам backfill: иначе обновлённый home-файл уничтожил бы его fallback-
-версию. `CheckpointMode::Restart`, snapshot timeout/cancellation и transaction spill относятся к
-этапу 4 и не входят в format-v1 срез 3b.
+версию. Обычный `CheckpointMode::Passive` сохраняет непросроченные снимки и отменяет только
+достигшие `max_snapshot_age` (`FG-25F01`). Явный `CheckpointMode::Restart` под snapshot write-gate
+отменяет все зарегистрированные storage snapshots (`FG-25F02`), фиксирует durable tail как target
+и после выхода из gate не мешает регистрации новых readers. Transaction spill остаётся отдельным
+этапом 7 и до него транзакция не пишет WAL раньше commit.
 
 **Windows ownership и atomic replace.** Открытая локальная БД удерживает `db.lock` с
 `share_mode(0)` весь срок жизни manager; повторное открытие возвращает `LocalDatabaseBusy`

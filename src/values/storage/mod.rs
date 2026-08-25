@@ -714,9 +714,14 @@ impl StringDictionary {
 	fn resolve(&self, id: u32, first_id: u32) -> Option<&Text> {
 		id.checked_sub(first_id).and_then(|index| self.names.get(index as usize))
 	}
+
+	fn names(&self) -> impl ExactSizeIterator<Item = &Text> {
+		self.names.iter()
+	}
 }
 
-/// Mutable dictionary and reference context used while converting runtime values.
+/// Mutable dictionary and reference context used while converting runtime
+/// values.
 #[derive(Debug, Default)]
 pub struct EncodeContext {
 	properties: PropertyDictionary,
@@ -738,6 +743,26 @@ impl EncodeContext {
 
 	pub const fn property_dictionary(&self) -> &PropertyDictionary {
 		&self.properties
+	}
+
+	/// Registers one table name in the stable order persisted by LabelDict.
+	pub(crate) fn register_table_name(&mut self, name: Text) -> FerrosGrynnResult<u32> {
+		self.tables.intern(name, 0, u32::MAX)
+	}
+
+	/// Iterates table names in their persisted identifier order.
+	pub(crate) fn table_names(&self) -> impl ExactSizeIterator<Item = &Text> {
+		self.tables.names()
+	}
+
+	/// Registers one IANA time-zone name in its persisted identifier order.
+	pub(crate) fn register_time_zone_name(&mut self, name: Text) -> FerrosGrynnResult<u32> {
+		self.time_zones.intern(name, 1, MAX_IANA_TIME_ZONE_ID)
+	}
+
+	/// Iterates IANA time-zone names in their persisted identifier order.
+	pub(crate) fn time_zone_names(&self) -> impl ExactSizeIterator<Item = &Text> {
+		self.time_zones.names()
 	}
 
 	pub fn register_atom(&mut self, runtime: AtomRef, disk: DiskAtomRef) -> FerrosGrynnResult<()> {

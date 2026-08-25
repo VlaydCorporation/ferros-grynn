@@ -195,6 +195,33 @@ impl SlotAllocator {
 		Ok(())
 	}
 
+	pub(crate) fn restore_free(&mut self, slot: u64, generation: u32) -> FerrosGrynnResult<()> {
+		if slot > SLOT_MASK || generation > GENERATION_MASK {
+			return Err(FerrosGrynnError::graph_capacity_exceeded(self.kind.to_string()));
+		}
+		let index = usize::try_from(slot).map_err(|_conversion_error| {
+			FerrosGrynnError::graph_capacity_exceeded(self.kind.to_string())
+		})?;
+		while self.generations.len() <= index {
+			let free_slot = self.generations.len() as u64;
+			self.generations.push(0);
+			self.occupied.push(false);
+			self.free.push(free_slot);
+		}
+		if self.occupied[index] {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				"graph",
+				format!("atom slot {slot} is occupied"),
+			));
+		}
+		self.generations[index] = generation;
+		self.free.retain(|free_slot| *free_slot != slot);
+		if generation < GENERATION_MASK {
+			self.free.push(slot);
+		}
+		Ok(())
+	}
+
 	pub(crate) fn free(&mut self, id: AtomId) -> bool {
 		if !self.contains(id) {
 			return false;
@@ -218,6 +245,14 @@ impl SlotAllocator {
 		};
 		self.occupied.get(index).copied().unwrap_or(false)
 			&& self.generations.get(index).copied() == Some(id.generation())
+	}
+
+	pub(crate) fn capacity(&self) -> usize {
+		self.generations.len()
+	}
+
+	pub(crate) fn generation(&self, slot: usize) -> Option<u32> {
+		self.generations.get(slot).copied()
 	}
 
 	pub(crate) const fn live_len(&self) -> usize {

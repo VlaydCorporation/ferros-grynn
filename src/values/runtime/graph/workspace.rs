@@ -1,6 +1,10 @@
-use std::fmt::{self, Debug, Formatter};
+use std::{
+	borrow::Cow,
+	collections::BTreeSet,
+	fmt::{self, Debug, Formatter},
+};
 
-use super::{AtomId, EdgeView, GraphKind, GraphMut, GraphRead, NodeView};
+use super::{AtomId, GraphKind, GraphMut, GraphRead};
 use crate::{
 	ecs::WorldComponents,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -103,7 +107,7 @@ impl<G: GraphRead> GraphWorkspace<G> {
 	{
 		self.validate_binding()?;
 		let result = mutation(&mut self.graph);
-		self.synchronize_after_mutation();
+		self.synchronize_after_mutation()?;
 		result
 	}
 
@@ -147,7 +151,7 @@ impl<G: GraphRead> GraphWorkspace<G> {
 
 	fn validate_atom(&self, id: AtomId) -> FerrosGrynnResult<()> {
 		self.validate_binding()?;
-		if !self.graph.contains(id) {
+		if !self.graph.contains(id)? {
 			return Err(FerrosGrynnError::atom_does_not_exist(
 				id.kind().map_or_else(|| "null".to_owned(), |kind| kind.to_string()),
 				id.to_string(),
@@ -156,20 +160,25 @@ impl<G: GraphRead> GraphWorkspace<G> {
 		Ok(())
 	}
 
-	fn synchronize_after_mutation(&mut self) {
+	fn synchronize_after_mutation(&mut self) -> FerrosGrynnResult<()> {
 		let identity = self.graph.identity();
 		let revision = self.graph.revision();
 		if identity != self.bound_identity {
 			self.components.clear();
 		} else if revision != self.bound_revision {
-			let graph = &self.graph;
-			self.components.retain_atoms(|id| graph.contains(id));
+			let live = self
+				.graph
+				.node_ids()?
+				.chain(self.graph.edge_ids()?)
+				.collect::<FerrosGrynnResult<BTreeSet<_>>>()?;
+			self.components.retain_atoms(|id| live.contains(&id));
 		}
 		if identity != self.bound_identity || revision != self.bound_revision {
 			self.derived.clear();
 			self.bound_identity = identity;
 			self.bound_revision = revision;
 		}
+		Ok(())
 	}
 }
 
@@ -182,8 +191,16 @@ pub trait IntoGraphWorkspace: GraphRead + Sized {
 impl<G: GraphRead> IntoGraphWorkspace for G {}
 
 impl<G: GraphRead> GraphRead for GraphWorkspace<G> {
+	type Edge<'a>
+		= G::Edge<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
 		= G::EdgeIds<'a>
+	where
+		Self: 'a;
+	type Node<'a>
+		= G::Node<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
@@ -203,23 +220,23 @@ impl<G: GraphRead> GraphRead for GraphWorkspace<G> {
 		self.graph.kind()
 	}
 
-	fn properties(&self) -> &PropertyMap {
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		self.graph.properties()
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		self.graph.node_ids()
 	}
 
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
 		self.graph.edge_ids()
 	}
 
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 		self.graph.node(id)
 	}
 
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 		self.graph.edge(id)
 	}
 

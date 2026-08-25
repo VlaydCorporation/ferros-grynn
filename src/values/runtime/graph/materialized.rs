@@ -1,10 +1,12 @@
 use std::{
+	borrow::Cow,
 	cmp::Ordering,
 	hash::{Hash, Hasher},
 };
 
 use super::{
 	AtomId,
+	AtomKind,
 	Dag,
 	EdgeView,
 	Forest,
@@ -43,12 +45,20 @@ pub enum MaterializedGraph {
 }
 
 impl GraphRead for MaterializedGraph {
+	type Edge<'a>
+		= EdgeView<'a>
+	where
+		Self: 'a;
 	type EdgeIds<'a>
-		= Box<dyn Iterator<Item = AtomId> + 'a>
+		= Box<dyn Iterator<Item = FerrosGrynnResult<AtomId>> + 'a>
+	where
+		Self: 'a;
+	type Node<'a>
+		= NodeView<'a>
 	where
 		Self: 'a;
 	type NodeIds<'a>
-		= Box<dyn Iterator<Item = AtomId> + 'a>
+		= Box<dyn Iterator<Item = FerrosGrynnResult<AtomId>> + 'a>
 	where
 		Self: 'a;
 
@@ -64,7 +74,125 @@ impl GraphRead for MaterializedGraph {
 		self.kind()
 	}
 
-	fn properties(&self) -> &PropertyMap {
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		Ok(Cow::Borrowed(Self::properties(self)))
+	}
+
+	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
+		match self {
+			Self::Graph(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
+			Self::Tree(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
+			Self::RootedTree(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
+			Self::Forest(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
+			Self::Dag(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
+			Self::Hypergraph(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
+			Self::Metagraph(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
+			Self::Subgraph(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
+		}
+	}
+
+	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
+		match self {
+			Self::Graph(value) => Ok(Box::new(GraphRead::edge_ids(value)?)),
+			Self::Tree(value) => Ok(Box::new(GraphRead::edge_ids(value)?)),
+			Self::RootedTree(value) => Ok(Box::new(GraphRead::edge_ids(value)?)),
+			Self::Forest(value) => Ok(Box::new(GraphRead::edge_ids(value)?)),
+			Self::Dag(value) => Ok(Box::new(GraphRead::edge_ids(value)?)),
+			Self::Hypergraph(value) => Ok(Box::new(GraphRead::edge_ids(value)?)),
+			Self::Metagraph(value) => Ok(Box::new(GraphRead::edge_ids(value)?)),
+			Self::Subgraph(value) => Ok(Box::new(GraphRead::edge_ids(value)?)),
+		}
+	}
+
+	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
+		Ok(Self::node(self, id))
+	}
+
+	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
+		Ok(Self::edge(self, id))
+	}
+}
+
+impl MaterializedGraph {
+	pub(crate) fn restore_free_slot(
+		&mut self,
+		kind: AtomKind,
+		slot: u64,
+		generation: u32,
+	) -> FerrosGrynnResult<()> {
+		match self {
+			Self::Graph(value) => value.restore_free_slot(kind, slot, generation),
+			Self::Tree(value) => value.restore_free_slot(kind, slot, generation),
+			Self::RootedTree(value) => value.restore_free_slot(kind, slot, generation),
+			Self::Forest(value) => value.restore_free_slot(kind, slot, generation),
+			Self::Dag(value) => value.restore_free_slot(kind, slot, generation),
+			Self::Hypergraph(value) => value.restore_free_slot(kind, slot, generation),
+			Self::Metagraph(value) => value.restore_free_slot(kind, slot, generation),
+			Self::Subgraph(value) => value.restore_free_slot(kind, slot, generation),
+		}
+	}
+
+	pub(crate) fn slot_capacity(&self, kind: AtomKind) -> usize {
+		match self {
+			Self::Graph(value) => value.slot_capacity(kind),
+			Self::Tree(value) => value.slot_capacity(kind),
+			Self::RootedTree(value) => value.slot_capacity(kind),
+			Self::Forest(value) => value.slot_capacity(kind),
+			Self::Dag(value) => value.slot_capacity(kind),
+			Self::Hypergraph(value) => value.slot_capacity(kind),
+			Self::Metagraph(value) => value.slot_capacity(kind),
+			Self::Subgraph(value) => value.slot_capacity(kind),
+		}
+	}
+
+	pub(crate) fn slot_generation(&self, kind: AtomKind, slot: usize) -> Option<u32> {
+		match self {
+			Self::Graph(value) => value.slot_generation(kind, slot),
+			Self::Tree(value) => value.slot_generation(kind, slot),
+			Self::RootedTree(value) => value.slot_generation(kind, slot),
+			Self::Forest(value) => value.slot_generation(kind, slot),
+			Self::Dag(value) => value.slot_generation(kind, slot),
+			Self::Hypergraph(value) => value.slot_generation(kind, slot),
+			Self::Metagraph(value) => value.slot_generation(kind, slot),
+			Self::Subgraph(value) => value.slot_generation(kind, slot),
+		}
+	}
+
+	pub fn node_count(&self) -> usize {
+		match self {
+			Self::Graph(value) => value.node_count(),
+			Self::Tree(value) => value.node_count(),
+			Self::RootedTree(value) => value.node_count(),
+			Self::Forest(value) => value.node_count(),
+			Self::Dag(value) => value.node_count(),
+			Self::Hypergraph(value) => value.node_count(),
+			Self::Metagraph(value) => value.node_count(),
+			Self::Subgraph(value) => value.as_graph().node_count(),
+		}
+	}
+
+	pub fn edge_count(&self) -> usize {
+		match self {
+			Self::Graph(value) => value.edge_count(),
+			Self::Tree(value) => value.edge_count(),
+			Self::RootedTree(value) => value.edge_count(),
+			Self::Forest(value) => value.edge_count(),
+			Self::Dag(value) => value.edge_count(),
+			Self::Hypergraph(value) => value.edge_count(),
+			Self::Metagraph(value) => value.edge_count(),
+			Self::Subgraph(value) => value.as_graph().edge_count(),
+		}
+	}
+
+	pub fn contains(&self, id: AtomId) -> bool {
+		match id.kind() {
+			Some(super::AtomKind::Node) => self.node(id).is_some(),
+			Some(super::AtomKind::Edge) => self.edge(id).is_some(),
+			None => false,
+		}
+	}
+
+	pub fn properties(&self) -> &PropertyMap {
 		match self {
 			Self::Graph(value) => value.properties(),
 			Self::Tree(value) => value.properties(),
@@ -72,38 +200,12 @@ impl GraphRead for MaterializedGraph {
 			Self::Forest(value) => value.properties(),
 			Self::Dag(value) => value.properties(),
 			Self::Hypergraph(value) => value.properties(),
-			Self::Metagraph(value) => value.properties(),
-			Self::Subgraph(value) => value.properties(),
+			Self::Metagraph(value) => value.as_graph().properties(),
+			Self::Subgraph(value) => value.as_graph().properties(),
 		}
 	}
 
-	fn node_ids(&self) -> Self::NodeIds<'_> {
-		match self {
-			Self::Graph(value) => Box::new(value.node_ids()),
-			Self::Tree(value) => Box::new(value.node_ids()),
-			Self::RootedTree(value) => Box::new(value.node_ids()),
-			Self::Forest(value) => Box::new(value.node_ids()),
-			Self::Dag(value) => Box::new(value.node_ids()),
-			Self::Hypergraph(value) => Box::new(value.node_ids()),
-			Self::Metagraph(value) => Box::new(value.node_ids()),
-			Self::Subgraph(value) => Box::new(value.node_ids()),
-		}
-	}
-
-	fn edge_ids(&self) -> Self::EdgeIds<'_> {
-		match self {
-			Self::Graph(value) => Box::new(value.edge_ids()),
-			Self::Tree(value) => Box::new(value.edge_ids()),
-			Self::RootedTree(value) => Box::new(value.edge_ids()),
-			Self::Forest(value) => Box::new(value.edge_ids()),
-			Self::Dag(value) => Box::new(value.edge_ids()),
-			Self::Hypergraph(value) => Box::new(value.edge_ids()),
-			Self::Metagraph(value) => Box::new(value.edge_ids()),
-			Self::Subgraph(value) => Box::new(value.edge_ids()),
-		}
-	}
-
-	fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
+	pub fn node(&self, id: AtomId) -> Option<NodeView<'_>> {
 		match self {
 			Self::Graph(value) => value.node(id),
 			Self::Tree(value) => value.node(id),
@@ -112,11 +214,11 @@ impl GraphRead for MaterializedGraph {
 			Self::Dag(value) => value.node(id),
 			Self::Hypergraph(value) => value.node(id),
 			Self::Metagraph(value) => value.node(id),
-			Self::Subgraph(value) => value.node(id),
+			Self::Subgraph(value) => value.as_graph().node(id),
 		}
 	}
 
-	fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
+	pub fn edge(&self, id: AtomId) -> Option<EdgeView<'_>> {
 		match self {
 			Self::Graph(value) => value.edge(id),
 			Self::Tree(value) => value.edge(id),
@@ -125,12 +227,10 @@ impl GraphRead for MaterializedGraph {
 			Self::Dag(value) => value.edge(id),
 			Self::Hypergraph(value) => value.edge(id),
 			Self::Metagraph(value) => value.edge(id),
-			Self::Subgraph(value) => value.edge(id),
+			Self::Subgraph(value) => value.as_graph().edge(id),
 		}
 	}
-}
 
-impl MaterializedGraph {
 	pub const fn kind(&self) -> GraphKind {
 		match self {
 			Self::Graph(_) => GraphKind::Graph,

@@ -30,7 +30,7 @@ const PAGE_LSN_OFFSET: usize = FLAGS_OFFSET + size_of::<u16>();
 const CHECKSUM_OFFSET: usize = PAGE_LSN_OFFSET + size_of::<u64>();
 
 /// Byte offset of the physical page number.
-const PAGE_NO_OFFSET: usize = CHECKSUM_OFFSET + size_of::<u64>();
+pub(super) const PAGE_NO_OFFSET: usize = CHECKSUM_OFFSET + size_of::<u64>();
 
 /// Exclusive end of the common page header.
 const PAGE_HEADER_END: usize = PAGE_NO_OFFSET + size_of::<u64>();
