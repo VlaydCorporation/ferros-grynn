@@ -999,7 +999,7 @@ impl FrameWal {
 		file.seek(SeekFrom::Start(frame.version.location.page_bytes_offset))
 			.map_err(|source| io_failure("seek to WAL page frame", source))?;
 		read_exact_required(&mut file, output.as_bytes_mut(), "read WAL page frame")?;
-		let header = output.validate_mut(frame.key.page_no())?;
+		let header = output.validate(frame.key.page_no())?;
 		if header.page_lsn().get() != frame.version.frame_lsn.get() {
 			return Err(invalid_wal(format!(
 				"frame {} contains page LSN {}",

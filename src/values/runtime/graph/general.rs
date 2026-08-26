@@ -1025,19 +1025,15 @@ fn copy_from_read<R: GraphRead>(
 	for source_id in source.node_ids()? {
 		let source_id = source_id?;
 		let node = source.node(source_id)?.ok_or_else(|| atom_does_not_exist(source_id))?;
-		if node.inner_graph_ref()?.is_some() {
-			return Err(FerrosGrynnError::invalid_argument(
-				"query materialization of nested graphs belongs to stage 5",
-			));
-		}
+		let inner_graph = node.inner_graph()?.map(Cow::into_owned);
 		let record_id = node.record_id()?.into_owned();
 		let label = node.label_text()?.map(Cow::into_owned);
 		let properties = node.properties()?.into_owned();
 		let local_id = if preserve_ids {
-			result.storage.insert_node_at(source_id, record_id, label, properties, None)?;
+			result.storage.insert_node_at(source_id, record_id, label, properties, inner_graph)?;
 			source_id
 		} else {
-			result.storage.insert_node_new(record_id, label, properties, None)?
+			result.storage.insert_node_new(record_id, label, properties, inner_graph)?
 		};
 		ids.insert(source_id, local_id);
 		source_atoms.insert(local_id, node.atom_ref()?);
@@ -1046,11 +1042,7 @@ fn copy_from_read<R: GraphRead>(
 	for source_id in source.edge_ids()? {
 		let source_id = source_id?;
 		let edge = source.edge(source_id)?.ok_or_else(|| atom_does_not_exist(source_id))?;
-		if edge.transition_graph_ref()?.is_some() {
-			return Err(FerrosGrynnError::invalid_argument(
-				"query materialization of transition graphs belongs to stage 5",
-			));
-		}
+		let transition_graph = edge.transition_graph()?.map(Cow::into_owned);
 		let topology = remap_topology(edge.topology()?.as_ref(), &ids)?;
 		result.storage.validate_topology(&topology)?;
 		let record_id = edge.record_id()?.into_owned();
@@ -1064,7 +1056,7 @@ fn copy_from_read<R: GraphRead>(
 				label,
 				properties,
 				edge.weight(),
-				None,
+				transition_graph,
 			)?;
 			source_id
 		} else {
@@ -1074,7 +1066,7 @@ fn copy_from_read<R: GraphRead>(
 				label,
 				properties,
 				edge.weight(),
-				None,
+				transition_graph,
 			)?
 		};
 		ids.insert(source_id, local_id);

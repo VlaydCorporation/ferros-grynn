@@ -74,6 +74,10 @@
 | Стабильный дисковый ID          | `DiskAtomRef = u64` (kind-бит + 40-битный slot-индекс, без поколения)             |
 | RecordId                        | Публичный идентификатор записи отделён от внутреннего AtomId                      |
 
+Windows-first implementation использует `FILE_FLAG_NO_BUFFERING`. Linux `O_DIRECT` в таблице —
+обязательный целевой контракт, но Unix runtime сейчас является typed unsupported stub и не
+считается выпущенным до отдельного Linux/NVMe gate.
+
 ### 1.3. Что требует изменения в кодовой базе
 
 Принципиально: `value.rs`, `serial.rs`, `mvcc_persist.rs`, `id.rs` не удовлетворяют полной системе типов GQL.
@@ -372,7 +376,7 @@ generic-параметр T (например, `vertex<Person>`) является
 // DiskAtomRef — для endpoints в том же графе (u64)
 // QualifiedAtomRef — для cross-level endpoints
 struct QualifiedAtomRef {
-    sg_slot:    u32,   // GraphId.index() подграфа, содержащего атом
+    sg_slot:    u32,   // root-arena slot подграфа, содержащего атом
     local_ref:  u64,   // DiskAtomRef в координатах подграфа
 }
 ```
@@ -382,8 +386,8 @@ struct QualifiedAtomRef {
 При чтении `EdgeHotSlot.source_inline[i]`/`target_inline[i]`:
 - при `CROSS_LEVEL = 0` значение является обычным `DiskAtomRef` текущего графа;
 - при `CROSS_LEVEL = 1` inline хранит только `local_ref`, а соответствующий `*_sg_slot`
-  дополняет его до `QualifiedAtomRef`. Для нескольких endpoint'ов полная пара находится в
-  `CrossLevelAdjacencyOverflowPage`.
+  дополняет его до `QualifiedAtomRef`. Inline допустим лишь для не более двух endpoint'ов одного
+  graph slot; иначе вся сторона находится в `CrossLevelAdjacencyOverflowPage`.
 
 ---
 
@@ -447,7 +451,8 @@ Object-часть `RecordId` не использует `LabelDictionary`: её �
 - `DiskAtomRef` — стабильный дисковый (kind + slot без generation, u64).
 
 Маппинг `RecordId → DiskAtomRef` хранится в B+tree индексе
-(`idx/pk_<table_id>.fgidx`), который является **первичным индексом** каждой таблицы.
+`primary.fgidx`, общем для всех таблиц одного graph address space. Ключ включает canonical
+table name, поэтому одинаковые id-part разных таблиц не конфликтуют.
 
 ### 4.4. Генерация ID по умолчанию
 
@@ -608,6 +613,42 @@ STORAGE_FORMAT_VERSION = 1
 
 ## 7. Файловая организация
 
+Нормативная Windows-first организация format-v1 candidate:
+
+```
+<database>/
+  db.lock                               -- exclusive ownership handle
+  db.fgb                                -- атомарно заменяемый DatabaseSuperblock
+  db.fgb.tmp                            -- кандидат незавершённой atomic replace
+  wal/
+    <first_lsn:016x>.wal                -- единый frame-WAL уровня БД
+  schema/
+    catalog.fgb                         -- DatabaseCatalog + FileCatalog
+  graphs/
+    <graph_id:016x>/
+      <generation_uuid>/                -- immutable COW-поколение address space
+        graph.fgb
+        nodes_hot.fgb
+        edges_hot.fgb
+        adjacency_overflow.fgb
+        adj_over_cl.fgb
+        properties.fgb
+        subgraphs.fgb
+        labels.fgb
+        freelist.fgb
+        statistics.fgb
+        primary.fgidx                   -- общий unique RecordId → DiskAtomRef
+        scalar_<ordinal:04>.fgidx       -- standard/unique scalar B+tree
+```
+
+Путь поколения и каждый `DataFileId` публикуются только через каталоги; пользовательские имена
+в filesystem path не попадают. Старые поколения удаляются startup-GC после захвата `db.lock` и
+только если они недостижимы из durable catalog.
+
+Следующее дерево — ненормативный целевой эскиз для namespace/store-контейнеров, snapshots,
+changefeed и специализированных индексов последующих этапов; перечисленные в нём файлы не
+входят в текущий format-v1 candidate:
+
 ```
 <store_dir>/
   store.fgb                             -- глобальный суперблок хранилища (engine version, magic)
@@ -696,9 +737,34 @@ snapshot.visible_lsn`. Если бы эти часы выдавались лок
 
 ### 7.2. Каталог графов
 
-`db.fgb` содержит не только счётчик `graph_count`, но и сам список графов: `(graph_id: u64, name: [u8; 128], flags: u32, created_lsn: u64)`. Создание и удаление графа журналируются записями `GraphCreate` / `GraphDrop` (§22.1).
+`db.fgb` хранит только две root-page ссылки. Сами канонические каталоги лежат в
+`schema/catalog.fgb` и публикуются тем же frame-WAL commit, что graph pages:
 
-Запись `GraphDrop` обязательна: при восстановлении фреймы, адресующие удалённый `graph_id`, должны отбрасываться, иначе воспроизведение упрётся в отсутствующий файл. Физическое удаление каталога графа откладывается до момента, когда запись `GraphDrop` durable и старше самого раннего живого читателя.
+- `DatabaseCatalog` (`FGDC`, payload version 3): `next_graph_id`, database-wide словарь
+  property keys, graph address spaces и таблицы;
+- `FileCatalog` (`FGFC`, payload version 3): sealed mapping
+  `(GraphId, DataFileId) → (role, validated relative path)`.
+
+Оба payload разбиты на chain страниц `SystemCatalog`. Каждая страница содержит `FGC1`, kind,
+page-codec version 1, `next_page`, `chunk_len`, `total_len` и нулевые reserved/trailing bytes;
+суммарный payload ограничен 16 МиБ до allocation.
+
+Запись корневого графа хранит `graph_id`, family, `created_lsn`, стабильный UUID и revision,
+primary-index `(DataFileId, root)`, graph properties и UTF-8 `RecordId`/name. Для внутреннего
+вложенного address space дополнительно обязательна тройка
+`(parent_graph_id, subgraph_slot, parent_atom)`; у корня все три поля отсутствуют. Slot 0
+зарезервирован за текущим графом, nested slots начинаются с 1 и уникальны во всём дереве одного
+root-графа. Внутренние записи используют зарезервированную таблицу `__fg_nested`, не появляются
+в публичном списке именованных графов и не могут быть созданы пользовательским API.
+
+Запись таблицы хранит owning `GraphId`, kind, поля `(name, PropertyKeyId, Type)` и scalar-index
+metadata `(name, standard|unique, ordered PropertyKeyId[], DataFileId, root)`. Индексы внутри
+таблицы отсортированы по имени. `DatabaseSuperblock.graph_count` считает все физические graph
+address spaces, включая вложенные; публичный каталог фильтрует только root-записи.
+
+Удаление графа атомарно удаляет из нового каталога корень, все его nested address spaces,
+таблицы и file bindings. До публикации нового каталога старые WAL frames остаются разрешимыми;
+после публикации недостижимые COW-поколения удаляет startup-GC.
 
 **Расширения файлов:**
 
@@ -779,8 +845,8 @@ Offset  Size  Тип   Поле                        Описание
 120     8     u64   next_tx_id
 128     8     u64   next_file_instance_id       -- следующий id; 2^56 = exhausted sentinel
 136     8     u64   system_backfilled_lsn
-144     8     u64   graph_catalog_root_page     -- NULL_PAGE до этапа 4
-152     8     u64   file_catalog_root_page      -- NULL_PAGE до этапа 4
+144     8     u64   graph_catalog_root_page     -- root DatabaseCatalog chain
+152     8     u64   file_catalog_root_page      -- root FileCatalog chain
 160     4     u32   graph_count
 164     4     u32   flags                       -- format v1: 0
 168     ...   -     _reserved                   -- только нули
@@ -788,7 +854,8 @@ Offset  Size  Тип   Поле                        Описание
 
 `PageHeader.page_lsn == checkpoint_record_lsn`. Для `generation == 0` оба checkpoint-LSN равны
 нулю; `checkpoint_lsn ≤ durable_visible_lsn`, а `next_lsn` строго больше всех сохранённых WAL
-часов. Поля root до их durable population в этапе 4 обязаны быть `NULL_PAGE`.
+часов. Для bootstrap generation 0 поля root могут быть `NULL_PAGE`; `create_local` публикует обе
+не-NULL chain roots до возврата пользователю. После этого missing root — corruption.
 
 ## 8. Универсальный заголовок страницы
 
@@ -959,7 +1026,7 @@ fn from_disk_ref(r: DiskAtomRef, gen: u32) -> AtomId {
 ```
 Offset  Size  Тип        Поле             Описание
 0       4     u32        gen              Поколение для восстановления AtomId
-4       4     u32        subgraph_slot    GraphId.index() если is_meta; NULL_SLOT иначе
+4       4     u32        subgraph_slot    root-arena slot внутреннего графа; NULL_SLOT иначе
 8       4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
 12      4     u32        table_id         Таблица, которой принадлежит запись; NULL_TABLE = нет
 16      4     u32        adj_out_count    Общее кол-во исходящих рёбер (inline + overflow)
@@ -1043,9 +1110,9 @@ Offset  Size  Тип        Поле             Описание
 16      4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
 20      4     u32        table_id         Таблица (для RELATION-таблиц)
 24      8     f64        weight           NaN = нет веса
-32      4     u32        transition_gid   GraphId.index() для MetaEdge; NULL_SLOT = нет
-36      4     u32        source_sg_slot   GraphId.index() для source_inline[0]; NULL_SLOT = тот же граф
-40      4     u32        target_sg_slot   GraphId.index() для target_inline[0]; NULL_SLOT = тот же граф
+32      4     u32        transition_gid   root-arena slot transition graph; NULL_SLOT = нет
+36      4     u32        source_sg_slot   root-arena slot всех source_inline; NULL_SLOT = текущий граф
+40      4     u32        target_sg_slot   root-arena slot всех target_inline; NULL_SLOT = текущий граф
 44      4     u32        props_slot       Индекс слота в SlotDirectory PropHeapPage
 48      4     u32        props_len        Длина сериализованного PropertyMap
 52      4     u32        _pad
@@ -1081,10 +1148,13 @@ Total = 160 байт
 
 **Хранение cross-level endpoints:**
 - Для CROSS_LEVEL=0: `source_inline`/`target_inline` содержат DiskAtomRef в пространстве текущего графа.
-- Для CROSS_LEVEL=1: inline-ссылки содержат DiskAtomRef атомов **в пространстве подграфа, которому они принадлежат**. Чтобы получить полный QualifiedAtomRef, нужен `*_sg_slot`.
-  `source_sg_slot`/`target_sg_slot` покрывают простейший бинарный случай.
-  Для нескольких cross-level endpoint'ов полные QualifiedAtomRef хранятся в
-  `source_sg_overflow`/`target_sg_overflow` (CrossLevelAdjacencyOverflowPage).
+- Для CROSS_LEVEL=1 сторона остаётся inline только когда содержит не более двух endpoint'ов и
+  все они принадлежат одному graph slot. Тогда `*_sg_slot` относится ко всем inline-ссылкам.
+- Если на стороне больше двух endpoint'ов либо встречаются разные graph slots, **вся сторона**
+  записывается в `*_sg_overflow` как ordered `QualifiedAtomRef`; inline и обычный overflow для
+  этой стороны пусты. Делить одну логическую сторону между local и qualified storage запрещено.
+- Slot 0 означает текущий graph address space. Slots `1..=u32::MAX-1` назначаются единой
+  root-arena и не переиспользуются другим вложенным графом того же root, даже на иной глубине.
 
 ### 11.2. EdgeHotPage layout
 
@@ -1146,7 +1216,7 @@ PageHeader: (magic=MAGIC_ADJ_OVER_CL, type=CrossLevelAdjacencyOverflow)
 
 ```
 overflow_entry_cl (16 байт):
-      sg_slot:    u32   -- GraphId.index() подграфа
+      sg_slot:    u32   -- root-arena slot подграфа; 0 = текущий граф
       side:       u8    -- 0=source, 1=target
       _pad:       u8[3]
       local_ref:  u64   -- DiskAtomRef в пространстве подграфа
@@ -1154,6 +1224,8 @@ overflow_entry_cl (16 байт):
 ```
 
 `QualifiedAtomRef` = `{ sg_slot: u32, local_ref: u64 }` — 16 байт с учётом выравнивания.
+Entries одной стороны сохраняют пользовательский порядок; `side` обязан совпадать с chain,
+указанной соответствующим полем hot-slot.
 
 ---
 
@@ -1331,14 +1403,16 @@ Arrow без копирования; DataFusion работает только п
 
 ## 14. SubgraphDirPage — директория подграфов
 
-Хранит информацию о каждом вложенном подграфе (arena subgraphs).
+Хранит компактную проверяемую привязку **непосредственных** дочерних графов текущего address
+space. Полное дерево получается рекурсивным обходом дочерних address spaces; содержимое графа в
+эти 32 байта не встраивается.
 
 ### 14.1. SubgraphDirEntry (32 байт)
 
 ```
 Offset  Size  Тип    Поле           Описание
-0       4     u32    sg_slot        GraphId.index()
-4       4     u32    gen            Поколение
+0       4     u32    sg_slot        Уникальный slot единой root-arena; 0 зарезервирован
+4       4     u32    gen            Поколение container-атома в родительском графе
 8       8     u64    node_capacity  Ёмкость node pool подграфа
 16      8     u64    edge_capacity  Ёмкость edge pool подграфа
 24      4     u32    node_count     Число живых вершин
@@ -1358,6 +1432,13 @@ Offset  Size   Содержимое
 64      16320  510 × SubgraphDirEntry (510 × 32 = 16320 байт)
 Total = PAGE_SIZE байт
 ```
+
+`SubgraphDirEntry` не является authority для filesystem path. Durable binding хранится в
+`DatabaseCatalog`: дочерняя запись содержит собственный `GraphId` и обязательные
+`parent_graph_id`, `subgraph_slot`, `parent_atom`. При открытии обе стороны сверяются, включая
+kind/generation container-атома. Несовпадение, duplicate slot или ссылка на отсутствующий child
+считаются corruption. Вложенный и transition graph имеют полный обычный набор Direct-I/O файлов,
+собственный primary index и graph superblock, но скрыты от публичного named-graph каталога.
 
 ---
 
@@ -1745,21 +1826,17 @@ buckets:   [min_degree(u32) + max_degree(u32) + node_count(u64)] × bucket_count
 
 ### 20.1. Общий контракт Index
 
-Каждый индекс реализует:
+Format-v1 candidate не вводит public trait с одной реализацией. Внутреннее ядро предоставляет
+bulk builder, exact lookup и bounded range scan над standard/unique B+tree. Leaf mode является
+частью metadata и проверяется при каждом чтении.
 
-```rust
-trait Index {
-    fn insert(&mut self , tx: &MvccTransaction, key: &IndexKey, atom: DiskAtomRef) -> io::Result<()>;
-    fn delete(&mut self , tx: &MvccTransaction, key: &IndexKey, atom: DiskAtomRef) -> io::Result<()>;
-    fn lookup(&self , key: &IndexKey) -> io::Result<Vec<DiskAtomRef>>;
-    fn range(&self , lo: &IndexKey, hi: &IndexKey, inclusive: (bool, bool)) -> io::Result<Box<dyn Iterator<Item=DiskAtomRef>>>;
-    fn rebuild(&mut self , source: &DiskMetaGraph) -> io::Result<()>;
-    fn status(&self ) -> IndexStatus;
-}
-```
-
-**Транзакционная консистентность**: standard, unique, count, fulltext — обновляются в той же транзакции (WAL + страница).  
-**Eventually consistent**: HNSW (по умолчанию) или транзакционный (при `CONCURRENTLY` = false).
+Scalar index строится как immutable side-file generation. Graph image и все его scalar indexes
+сначала полностью синхронизируются, затем один catalog/frame-WAL commit делает новые
+`DataFileId` и roots достижимыми. Unique violation прерывает commit до публикации. Пока граф
+содержит scalar indexes, его изменение строит новое COW-поколение целиком; incremental page-WAL
+maintenance добавляется только после измеренного bottleneck indexed writes. Count/fulltext/HNSW/
+R-tree и остальные специализированные индексы ниже описывают последующие этапы и не маскируют
+своё отсутствие: планировщик использует корректный primary/table scan.
 
 ### 20.2. B+tree Property Index (standard и unique)
 
@@ -1767,17 +1844,16 @@ trait Index {
 
 ── Скалярные типы ──────────────────────────────────────────────────────
 ```
-none      → 0xFF (sorts last)
-null      → 0xFE
+outer     → 0x00 для none; 0x01 для null; 0x02 || payload для present value
 bool      → 0x00 (false) / 0x01 (true)
 int       → big-endian i64 с инвертированным MSB: v ^ 0x8000_0000_0000_0000
-float     → IEEE 754 order-preserving: (v - битовое представление f64, NaN в индексе - ошибка валидации)
+float     → IEEE 754 order-preserving (`-0.0` канонизируется в `+0.0`; NaN — ошибка валидации)
               if positive: flip MSB    → v ^ 0x8000_0000_0000_0000
               if negative: flip all    → v ^ 0xFFFF_FFFF_FFFF_FFFF
 decimal   → см. §20.2.1.1 (наивная схема «sign + coefficient + exponent» НЕ сохраняет порядок)
-string    → raw UTF-8 (encoding зависит от позиции в composite key, см. §20.2.6)
+string    → raw UTF-8 + 0x00 terminal sentinel
 bytes     → raw + 0x00 sentinel
-datetime  → big-endian i64(seconds) + u32(nanos) [tz не индексируется]
+datetime  → ordered big-endian i64(seconds) + big-endian u32(nanos) [tz не индексируется]
 duration  → нормализация из UnitSet-bitmask (формат хранения, §3.4) в 3 компонента:
              total_months = years×12 + months
              total_days   = weeks×7 + days
@@ -1790,10 +1866,12 @@ duration  → нормализация из UnitSet-bitmask (формат хра
              Примечание: "1 месяц 0 дней" > "0 месяцев 31 день" — это намеренное
              соглашение, не зависящее от длины конкретного месяца.
 uuid/ulid → big-endian 16 байт (UUIDv7/ULID монотонны по времени в big-endian)
-record_id → table_id(4 байта BE) + id_part_encoding(variable)
+record_id → escaped canonical UTF-8 table name + terminator + tagged id_part encoding
 ```
 
-При попытке вставить `NaN` значение в индекс происходит **ошибка валидации**.
+Outer prefix обязателен для каждого поля, поэтому `none < null < present` совпадает с runtime
+`Value::Ord`. Он также не позволяет `none`/`null` столкнуться с валидным payload. При попытке
+вставить `NaN` значение в индекс происходит **ошибка валидации**.
 В `PropHeapPage` `NaN` хранится как `edge weight sentinel`; в B+tree индексе он недопустим.
 
 #### 20.2.1.1. Order-preserving ключ для `decimal`
@@ -1803,7 +1881,7 @@ record_id → table_id(4 байта BE) + id_part_encoding(variable)
 1. Численно равные значения с разным масштабом (`1.0` при `scale=1` и `1.00` при `scale=2`) дают **разные** ключи. Для unique-индекса это означает, что дубликат пройдёт проверку.
 2. Сравнение сырых мантисс при разных экспонентах даёт неверный порядок: `5e-1` (мантисса 5) окажется больше `1e0` (мантисса 1), хотя `0.5 < 1.0`.
 
-**Схема для schemaless-полей** (масштаб заранее не известен):
+Format v1 использует одну схему независимо от schema declaration:
 
 ```
 1. Нормализовать: убрать хвостовые нули → канонические (mantissa, scale).
@@ -1816,48 +1894,47 @@ record_id → table_id(4 байта BE) + id_part_encoding(variable)
 5. Для отрицательных значений все байты ПОСЛЕ sign_byte инвертируются побитово.
 ```
 
-Порядок при таком кодировании лексикографический: сначала различает знак, затем десятичный порядок, затем значащие цифры слева направо. Нормализация на шаге 1 гарантирует, что численно равные значения дают побайтово равные ключи.
-
-**Схема для schemafull-полей** (в `DEFINE FIELD` объявлен фиксированный масштаб): значение приводится к каноническому масштабу столбца, после чего ключ — просто
-
-```
-(mantissa as i128) ^ 0x8000_0000_0000_0000_0000_0000_0000_0000, big-endian, 16 байт
-```
-
-Это тот же приём, что уже применяется к `int`, он тривиально сохраняет порядок и вдвое короче. Схема выбирается по индексу: при объявленном масштабе — вторая, иначе — первая.
+Порядок при таком кодировании лексикографический: сначала различает знак, затем десятичный
+порядок, затем значащие цифры слева направо. Нормализация на шаге 1 гарантирует, что численно
+равные значения дают побайтово равные ключи. Альтернативного fixed-scale представления в format
+v1 нет: два encodings одного логического decimal нарушили бы unique и reopen-контракт.
 
 ── Составные типы ──────────────────────────────────────────────────────
 ```
 option<T> → отдельного ключа нет: None кодируется как none, Some(v) как encode(v)
-array<T>  → element-wise: encode(elem[0]) + 0x01 + encode(elem[1]) + ... + 0x00
+array<T>  → escaped encode(elem[0]) + 0x00 0x01 + ... + 0x00 0x00
 set<T>    → то же что array, элементы уже отсортированы (set = sorted unique)
 object    → индексирование object целиком не поддерживается;
             для composite index используются отдельные поля
+range<T>  → start_encoding || end_encoding:
+            start: 0x00 unbounded; иначе 0x01 || escaped(value) || 0x00 || bound_kind
+            end:   0x01 unbounded; иначе 0x00 || escaped(value) || 0x00 || bound_kind
+            bound_kind: 0x00 included, 0x01 excluded
 ```
+
+Такой range key воспроизводит runtime-порядок: start сравнивается раньше end, значение bound —
+раньше included/excluded, unbounded start минимален, unbounded end максимален.
 
 ── Доменные типы ───────────────────────────────────────────────────────
 ```
-vertex/edge/atom ref → big-endian u64 (DiskAtomRef; порядок по kind, затем slot_index)
-                       (семантический порядок вставки, не семантический)
+record ref           → canonical table name + canonical RecordId part
+vertex/edge/atom ref → canonical RecordId соответствующего AtomRef
 ```
+
+Dictionary id и физический `DiskAtomRef` намеренно не входят в key: они зависят от порядка
+интернирования/аллокации и не являются стабильным runtime-порядком. Для atom field kind уже
+зафиксирован схемой `Type::Atom(kind)`; отсутствующая mapping в `EncodeContext` — ошибка.
 
 ── Неиндексируемые типы ────────────────────────────────────────────────
 ```
 geometry  → не поддерживается в B+tree; используется R-tree index (§20.7)
 vector    → не поддерживается в B+tree; используется HNSW index (§20.6)
-range<T>  → bounds_byte(u8) + [encode(lo)] + [encode(hi)]
-            bounds_byte: bit0=lo_inclusive, bit1=hi_inclusive,
-                         bit2=lo_unbounded, bit3=hi_unbounded
-            Unbounded lo: lo-часть опускается, prefix 0x00 (sorts first)
-            Unbounded hi: hi-часть опускается, suffix 0xFF (sorts last)
-            Порядок: по lo, затем по hi; None lo < любого значения
-graph_ref → big-endian u64 (sg_slot(u32 BE) + sg_gen(u32 BE))
-            Полезен для equality lookup; диапазонные запросы семантически
-            не осмысленны (порядок аллокации ≠ смысловой порядок).
-
+any/number/object/regex/path/graph/union/record-shape/closure → не поддерживаются
 ```
 
-Эта кодировка гарантирует: `a < b ⟺ encode(a) < encode(b)` лексикографически.
+`Array<T>`, `Set<T>`, `Range<T>` и `Option<T>` индексируемы только если `T` индексируем. Эта
+кодировка гарантирует для одного schema type: `a < b ⟺ encode(a) < encode(b)`
+лексикографически.
 
 #### 20.2.2. BTree Internal Page
 
@@ -1911,20 +1988,22 @@ Binary search (O(log num_keys)):
 [40..42]        num_entries (u16)
 [42..44]        _pad
 [44..44+2n]     entry_offsets: u16[num_entries]   -- смещения от начала entry_area (= offset 44+2n)
-[44+2n..]       entry_area: [LeafEntry] × num_entries
+[44+2n..]       free/entry_area; записи плотно упакованы с конца страницы
 
 LeafEntry (variable):
   encoded_key:     variable                     -- order-preserving (§20.2.1)
-  inline_count:    u32                          -- общее число DiskAtomRef в индексе для этого ключа (inline + posting_pages)
-  atom_refs:       u64 × min(8, inline_count)   -- DiskAtomRef inline, только первые 8 (или меньше) хранятся inline
-  posting_page:    u64                          -- только если inline_count > 8; первая PostingPage
+  atom_refs:       u64 × min(8, total_count)    -- первые ссылки inline
+  key_len:         u16
+  inline_count:    u16
+  total_count:     u32
+  posting_page:    u64                          -- NULL_PAGE при total_count ≤ 8
 ```
 
 Свободное место: `PAGE_SIZE − 44 − 2n − Σ(entry_len_i)`.
 
 ```
 Binary search: 
-  entry_offsets[mid] → decode encoded_key → compare.
+  entry_offsets[mid] + key_len → прямой memcmp, без decode.
 ```
 
 #### 20.2.4. BTree Leaf Page (Unique)
@@ -1973,20 +2052,22 @@ Composite index строится по нескольким полям однов
 `WHERE B = y`                       → full index scan (нет использования порядка A) ✗
 `WHERE B = y AND C = z`             → full index scan ✗
 
-**Формирование ключа**:
-- Ключ = конкатенация order-preserving encodings всех компонент.
-- Порядок сортировки: по первому компоненту, при равенстве — по второму и т.д.
-- Каждый компонент кодируется по правилам §20.2.1.
+Format-v1 tree поддерживает эти byte ranges. Текущий sync vertical slice выбирает single-field
+index для equality/range и composite index только при equality по всем его полям. Остальные
+prefix/composite формы намеренно деградируют к корректному table scan до появления cost-based
+planner; полный predicate и SSI registration выполняются независимо от выбранного access path.
 
-Для определения длины каждого компонента при декодировании:
-- Скалярные типы (int, float, decimal, datetime, uuid, ulid): фиксированная длина.
-- String, bytes: до первого терминирующего sentinel (правила ниже).
-- Составные типы (array, set): self-delimiting через TypeTag + length prefix.
+**Формирование ключа**:
+- Ключ = конкатенация полных typed order-preserving encodings всех компонент.
+- Порядок сортировки: по первому компоненту, при равенстве — по второму и т.д.
+- Последний компонент записывается как есть. Каждый non-terminal компонент целиком экранируется:
+  `0x00 → 0x00 0xFF`, затем добавляется `0x00 0x00`.
+- B+tree никогда не декодирует component boundaries: lookup и range используют только `memcmp`.
 
 **Кодирование строк в composite key**:
 
-Строки в non-terminal позиции composite key требуют экранирования,
-потому что сырой UTF-8 + 0x00 sentinel конфликтует с байтами следующего компонента.
+Ниже строка показывает общий механизм экранирования non-terminal компонента; те же правила
+применяются к полному typed encoding любого другого переменного или фиксированного типа.
 
 Правила:
 - **Terminal-компонент** (последнее или единственное поле индекса): raw UTF-8 + 0x00 (стандартный sentinel, без экранирования).
@@ -2048,11 +2129,13 @@ fn encode_string_terminal(s: &str) -> Vec<u8> {
 }
 ```
 
-#### 20.2.7. Primary Index (pk_<table_id>.fgidx)
+#### 20.2.7. Primary Index (`primary.fgidx`)
 
-Обязательный unique B+tree: `RecordId.id_part → DiskAtomRef`.
-Ключ = order-preserving encoding `id_part` (Int, String, Uuid, Array, Object).
-Создаётся автоматически для каждой таблицы при `DEFINE TABLE`.
+Каждый graph address space содержит один обязательный unique B+tree
+`canonical full RecordId → DiskAtomRef`. Имя таблицы кодируется фактическим UTF-8, а не локальным
+dictionary id; id-part поддерживает Int, String, Uuid, Ulid, Array и Object. Поэтому один primary
+index обслуживает все node/relation tables графа и остаётся стабильным при ином порядке
+интернирования после reopen.
 
 #### 20.2.8. Альтернативы B+tree и обоснование выбора
 
@@ -3113,7 +3196,7 @@ read_page(PageKey, snapshot):
 2. Записать новый nodes_hot.fgb в tmp: переупорядочить слоты;
 3. Для каждого EdgeHotSlot:
    - source_inline[], target_inline[] — применить remap к каждому элементу;
-   - source_sg_slot, target_sg_slot — это GraphId, не DiskAtomRef, не трогать;
+   - source_sg_slot, target_sg_slot — это root-arena slot, не DiskAtomRef, не трогать;
 4. Применить remap к AdjacencyOverflowPage и CrossLevelAdjacencyOverflowPage (local_ref);
 5. NodeHotSlot adjacency (adj_out, adj_in, adj_undir) — это edge slots,
    применить remap если рёбра тоже дефрагментируются
@@ -3122,7 +3205,7 @@ read_page(PageKey, snapshot):
 8. Все B+tree индексы (primary, standard, unique):
    - leaf values (DiskAtomRef) — применить remap
    - ee_endpoint.fgidx — перестроить
-9. SubgraphDirPage — sg_slot это GraphId арены подграфов, не DiskAtomRef;
+9. SubgraphDirPage — sg_slot это root-arena slot подграфов, не DiskAtomRef;
    если подграфы тоже дефрагментируются — отдельная процедура
 10. Changefeed entries — atom_ref применить remap
 11. Обновить GraphSuperblock

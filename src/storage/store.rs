@@ -5,6 +5,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	fs,
 	num::NonZeroUsize,
+	ops::Bound,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,6 +22,7 @@ use super::{
 		GraphCatalogEntry,
 		TableCatalogEntry,
 		TableFieldCatalogEntry,
+		TableIndexCatalogEntry,
 		encode_catalog_update,
 	},
 	direct::DirectFile,
@@ -28,17 +30,24 @@ use super::{
 	graph_index::{
 		LabelDictionary,
 		PrimaryIndexEntry,
+		ScalarIndexEntry,
+		ScalarIndexMode,
 		build_primary_index,
+		build_scalar_index,
 		decode_label_dictionary,
 		encode_label_dictionary,
 		lookup_primary_index,
+		lookup_scalar_index,
+		range_scalar_index,
 		scan_primary_index,
 		visit_primary_index,
 	},
 	graph_pages::{
+		CROSS_LEVEL_REFS_PER_PAGE,
 		EdgeHotSlot,
 		EdgeSlotFlags,
 		EdgeTopologyCode,
+		EndpointSide,
 		GraphStatistics,
 		HOT_SLOTS_PER_PAGE,
 		LARGE_PROPERTY_CHUNK_BYTES,
@@ -48,13 +57,18 @@ use super::{
 		OVERFLOW_REFS_PER_PAGE,
 		PropertyLocation,
 		PropertyPageBuilder,
+		QualifiedDiskAtomRef,
+		SUBGRAPHS_PER_PAGE,
+		SubgraphEntry,
 		decode_adjacency_overflow,
+		decode_cross_level_overflow,
 		decode_freelist,
 		decode_graph_statistics,
 		decode_large_property,
 		decode_property_map,
 		decode_subgraph_directory,
 		encode_adjacency_overflow,
+		encode_cross_level_overflow,
 		encode_freelist,
 		encode_graph_statistics,
 		encode_large_property,
@@ -77,10 +91,17 @@ use super::{
 	wal::TxHandle,
 };
 use crate::{
-	datastore::{CheckpointMode, TableKind},
+	datastore::{
+		CheckpointMode,
+		INTERNAL_NESTED_GRAPH_TABLE,
+		ScalarComparison,
+		TableIndexKind,
+		TableKind,
+	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::{
 		PropertyDictionary,
+		PropertyKeyId,
 		PropertyMap,
 		RecordId,
 		Text,
@@ -110,6 +131,7 @@ use crate::{
 			Mutable,
 			NodeRead,
 			NodeView,
+			QualifiedAtomId,
 			RootedTree,
 			SnapshotId,
 			Subgraph,
@@ -120,16 +142,18 @@ use crate::{
 			EncodeContext,
 			StorageValue,
 			codec::{CanonicalCodec, DecodeLimits},
+			encode_index_key,
 		},
 	},
 };
 
 /// Files produced for every immutable graph generation.
-const GRAPH_FILE_KINDS: [(DataFileKind, &str); 10] = [
+const GRAPH_FILE_KINDS: [(DataFileKind, &str); 11] = [
 	(DataFileKind::GraphSuperblock, "graph.fgb"),
 	(DataFileKind::NodesHot, "nodes_hot.fgb"),
 	(DataFileKind::EdgesHot, "edges_hot.fgb"),
 	(DataFileKind::AdjacencyOverflow, "adjacency_overflow.fgb"),
+	(DataFileKind::CrossLevelAdjacencyOverflow, "adj_over_cl.fgb"),
 	(DataFileKind::Properties, "properties.fgb"),
 	(DataFileKind::Subgraphs, "subgraphs.fgb"),
 	(DataFileKind::Labels, "labels.fgb"),
@@ -149,6 +173,8 @@ pub struct LocalCommitGraph {
 /// Opaque durable graph descriptor retained without materializing its atoms.
 pub struct LocalGraph {
 	graph_id: GraphId,
+	subgraph_slot: Option<u32>,
+	parent_atom: Option<DiskAtomRef>,
 	reference: GraphRef,
 	identity: Uuid,
 	revision: u64,
@@ -159,6 +185,17 @@ pub struct LocalGraph {
 	labels: LabelDictionary,
 	property_dictionary: Arc<PropertyDictionary>,
 	decode_context: Mutex<Option<Arc<EncodeContext>>>,
+	scalar_indexes: BTreeMap<String, Vec<LocalScalarIndex>>,
+	children: BTreeMap<u32, Arc<LocalGraph>>,
+}
+
+#[derive(Clone)]
+struct LocalScalarIndex {
+	name: String,
+	kind: TableIndexKind,
+	fields: Vec<(PropertyKeyId, Type)>,
+	file_id: DataFileId,
+	root: PageNo,
 }
 
 impl LocalGraph {
@@ -190,6 +227,10 @@ impl LocalGraph {
 		page_no: PageNo,
 	) -> FerrosGrynnResult<super::types::PageKey> {
 		Ok(super::types::PageKey::new(self.graph_id, self.file_id(kind)?, page_no))
+	}
+
+	fn index_page_key(&self, file_id: DataFileId, page_no: PageNo) -> super::types::PageKey {
+		super::types::PageKey::new(self.graph_id, file_id, page_no)
 	}
 
 	fn base_context(&self) -> FerrosGrynnResult<EncodeContext> {
@@ -293,6 +334,17 @@ pub struct LocalCommitTableField {
 	pub property_key: u32,
 }
 
+/// One scalar index supplied by the MVCC schema catalog.
+#[derive(Clone)]
+pub struct LocalCommitTableIndex {
+	/// Table-local index name.
+	pub name: String,
+	/// Standard or unique key contract.
+	pub kind: TableIndexKind,
+	/// Composite fields as dense property-key identifiers.
+	pub fields: Vec<u32>,
+}
+
 /// One durable table supplied by the MVCC layer.
 #[derive(Clone)]
 pub struct LocalCommitTable {
@@ -304,6 +356,8 @@ pub struct LocalCommitTable {
 	pub kind: TableKind,
 	/// Ordered explicit fields after implicit `id`.
 	pub fields: Vec<LocalCommitTableField>,
+	/// Scalar indexes in definition order.
+	pub indexes: Vec<LocalCommitTableIndex>,
 }
 
 /// Recovered local state used to seed the existing MVCC root.
@@ -511,35 +565,172 @@ impl LocalStore {
 			if record_id.table() != table || !table_kind_accepts(kind, disk.kind()) {
 				return Ok(());
 			}
-			let atom_id = local_atom_id(self, transaction, graph, disk)?;
-			let properties = match disk.kind() {
-				AtomKind::Node => {
-					read_local_node(self, transaction, graph, atom_id, record_id.clone())?
-						.ok_or_else(|| {
-							FerrosGrynnError::invalid_storage_file(
-								"primary index references a missing node",
-							)
-						})?
-						.properties()?
-						.into_owned()
-				}
-				AtomKind::Edge => {
-					read_local_edge(self, transaction, graph, atom_id, record_id.clone())?
-						.ok_or_else(|| {
-							FerrosGrynnError::invalid_storage_file(
-								"primary index references a missing edge",
-							)
-						})?
-						.properties()?
-						.into_owned()
-				}
-			};
-			visit(LocalQueryAtom {
-				atom_id,
-				record_id,
-				properties,
-			})
+			visit(local_query_atom(self, transaction, graph, record_id, disk)?)
 		})
+	}
+
+	/// Visits candidates through the widest composite index covered by exact
+	/// equality constraints. `false` keeps the caller on its scan fallback.
+	pub(crate) fn visit_table_composite_index(
+		&self,
+		transaction: &LocalReadTransaction,
+		graph: &Arc<LocalGraph>,
+		table: &str,
+		kind: TableKind,
+		equalities: &[(PropertyKeyId, &Value)],
+		visit: impl FnMut(LocalQueryAtom) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<bool> {
+		let Some(index) = graph.scalar_indexes.get(table).and_then(|indexes| {
+			indexes
+				.iter()
+				.filter(|index| {
+					index.fields.len() > 1
+						&& index.fields.iter().all(|(field, _value_type)| {
+							equalities.iter().any(|(key, _)| key == field)
+						})
+				})
+				.max_by_key(|index| index.fields.len())
+		}) else {
+			return Ok(false);
+		};
+		let mut context = graph.base_context()?;
+		let components = index
+			.fields
+			.iter()
+			.map(|(field, value_type)| {
+				equalities
+					.iter()
+					.find(|(key, _value)| key == field)
+					.map(|(_key, value)| (*value, value_type))
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"selected composite index has no equality value",
+						)
+					})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let key = match encode_index_key(&components, &mut context) {
+			Ok(key) => key,
+			Err(_error) => return Ok(false),
+		};
+		let mode = match index.kind {
+			TableIndexKind::Standard => ScalarIndexMode::Standard,
+			TableIndexKind::Unique => ScalarIndexMode::Unique,
+		};
+		let atoms = lookup_scalar_index(
+			|page_no, output| {
+				copy_local_index_page(self, transaction, graph, index.file_id, page_no, output)
+			},
+			index.root,
+			mode,
+			&key,
+		)?;
+		self.visit_scalar_index_atoms(transaction, graph, table, kind, &index.name, atoms, visit)?;
+		Ok(true)
+	}
+
+	/// Visits candidates from a usable single-field scalar index. `false`
+	/// means that the caller must perform the normal table scan.
+	pub(crate) fn visit_table_index(
+		&self,
+		transaction: &LocalReadTransaction,
+		graph: &Arc<LocalGraph>,
+		table: &str,
+		kind: TableKind,
+		property_key: PropertyKeyId,
+		comparison: ScalarComparison,
+		value: &Value,
+		visit: impl FnMut(LocalQueryAtom) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<bool> {
+		let Some(index) = graph.scalar_indexes.get(table).and_then(|indexes| {
+			indexes
+				.iter()
+				.find(|index| index.fields.len() == 1 && index.fields[0].0 == property_key)
+		}) else {
+			return Ok(false);
+		};
+		let mut context = graph.base_context()?;
+		let key = match encode_index_key(&[(value, &index.fields[0].1)], &mut context) {
+			Ok(key) => key,
+			Err(_error) => return Ok(false),
+		};
+		let mode = match index.kind {
+			TableIndexKind::Standard => ScalarIndexMode::Standard,
+			TableIndexKind::Unique => ScalarIndexMode::Unique,
+		};
+		let mut read_page = |page_no, output: &mut AlignedPage| {
+			copy_local_index_page(self, transaction, graph, index.file_id, page_no, output)
+		};
+		let atoms = match comparison {
+			ScalarComparison::Equal => lookup_scalar_index(&mut read_page, index.root, mode, &key)?,
+			ScalarComparison::Less => range_scalar_index(
+				&mut read_page,
+				index.root,
+				mode,
+				Bound::Unbounded,
+				Bound::Excluded(key.as_slice()),
+			)?,
+			ScalarComparison::LessOrEqual => range_scalar_index(
+				&mut read_page,
+				index.root,
+				mode,
+				Bound::Unbounded,
+				Bound::Included(key.as_slice()),
+			)?,
+			ScalarComparison::Greater => range_scalar_index(
+				&mut read_page,
+				index.root,
+				mode,
+				Bound::Excluded(key.as_slice()),
+				Bound::Unbounded,
+			)?,
+			ScalarComparison::GreaterOrEqual => range_scalar_index(
+				&mut read_page,
+				index.root,
+				mode,
+				Bound::Included(key.as_slice()),
+				Bound::Unbounded,
+			)?,
+		};
+
+		self.visit_scalar_index_atoms(transaction, graph, table, kind, &index.name, atoms, visit)?;
+		Ok(true)
+	}
+
+	fn visit_scalar_index_atoms(
+		&self,
+		transaction: &LocalReadTransaction,
+		graph: &Arc<LocalGraph>,
+		table: &str,
+		kind: TableKind,
+		index_name: &str,
+		atoms: Vec<DiskAtomRef>,
+		mut visit: impl FnMut(LocalQueryAtom) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<()> {
+		let context = graph.decode_context(self, transaction)?;
+		let mut seen = BTreeSet::new();
+		for atom in atoms {
+			if !seen.insert(atom) {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"scalar index contains duplicate atom references",
+				));
+			}
+			let reference = context.registered_atom(atom).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(format!(
+					"scalar index '{}.{}' references an atom absent from the primary index",
+					table, index_name
+				))
+			})?;
+			let record = reference.id();
+			if record.table() != table || !table_kind_accepts(kind, atom.kind()) {
+				return Err(FerrosGrynnError::invalid_storage_file(format!(
+					"scalar index '{}.{}' references an atom outside its table",
+					table, index_name
+				)));
+			}
+			visit(local_query_atom(self, transaction, graph, record.clone(), atom)?)?;
+		}
+		Ok(())
 	}
 
 	/// Resolves one table record through the logarithmic primary lookup.
@@ -562,34 +753,7 @@ impl LocalStore {
 		let Some(disk) = disk.filter(|disk| table_kind_accepts(kind, disk.kind())) else {
 			return Ok(None);
 		};
-		let atom_id = local_atom_id(self, transaction, graph, disk)?;
-		let properties = match disk.kind() {
-			AtomKind::Node => {
-				read_local_node(self, transaction, graph, atom_id, record_id.clone())?
-					.ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file(
-							"primary index references a missing node",
-						)
-					})?
-					.properties()?
-					.into_owned()
-			}
-			AtomKind::Edge => {
-				read_local_edge(self, transaction, graph, atom_id, record_id.clone())?
-					.ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file(
-							"primary index references a missing edge",
-						)
-					})?
-					.properties()?
-					.into_owned()
-			}
-		};
-		Ok(Some(LocalQueryAtom {
-			atom_id,
-			record_id: record_id.clone(),
-			properties,
-		}))
+		local_query_atom(self, transaction, graph, record_id.clone(), disk).map(Some)
 	}
 
 	/// Publishes one MVCC root by switching only the two fixed catalog heads in
@@ -609,7 +773,8 @@ impl LocalStore {
 				"MVCC and frame-WAL commit clocks diverged",
 			));
 		}
-		let mut database = catalogs.database.clone();
+		let previous_database = catalogs.database.clone();
+		let mut database = previous_database.clone();
 		let mut files = catalogs.files.clone();
 		let mut dictionary = database_property_dictionary(&database)?;
 		for (expected_id, name) in property_dictionary.iter() {
@@ -623,10 +788,13 @@ impl LocalStore {
 
 		let mut registrations = Vec::new();
 		let mut new_superblocks = Vec::new();
+		let mut new_indexes = Vec::new();
 		let mut transaction = self.manager.begin_tx()?;
 		for record_id in changed_graphs {
-			let existing =
-				database.graphs.iter().position(|entry| entry.record_id == record_id.to_string());
+			let record_text = record_id.to_string();
+			let existing = database.graphs.iter().position(|entry| {
+				entry.parent_graph_id.is_none() && entry.record_id == record_text
+			});
 			// ponytail: changed-graph lookup is linear in the catalog snapshot;
 			// add a temporary string-keyed map only if bulk multi-graph commits
 			// make this visible in profiles.
@@ -634,8 +802,10 @@ impl LocalStore {
 				graphs.iter().find(|entry| &entry.record_id == record_id).map(|entry| &entry.graph)
 			else {
 				if let Some(index) = existing {
-					let graph_id = database.graphs.remove(index).graph_id;
-					files.files.retain(|entry| entry.graph_id != graph_id);
+					let graph_id = database.graphs[index].graph_id;
+					let removed = graph_tree_ids(&database, graph_id);
+					database.graphs.retain(|entry| !removed.contains(&entry.graph_id));
+					files.files.retain(|entry| !removed.contains(&entry.graph_id));
 				}
 				continue;
 			};
@@ -643,31 +813,52 @@ impl LocalStore {
 				Some(index) => database.graphs[index].graph_id,
 				None => allocate_graph_id(&mut database)?,
 			};
-			let mut image = build_graph_image(graph_id, record_id, graph, &mut dictionary)?;
-			let in_place = if let Some(index) = existing {
-				prepare_in_place_image(&self.root, &database.graphs[index], &files, &mut image)?
+			let plan = plan_graph_tree(&mut database, graph_id, record_id, graph)?;
+			let mut images = build_graph_images(&plan, &mut dictionary, tables)?;
+			let in_place = if images.len() == 1
+				&& let Some(index) = existing
+			{
+				prepare_in_place_image(&self.root, &database.graphs[index], &files, &mut images[0])?
 			} else {
 				false
 			};
 			if in_place {
+				let image = images.pop().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("planned graph image is absent")
+				})?;
 				stage_graph_image(&self.manager, &mut transaction, &files, &image)?;
 				new_superblocks.push(image.superblock.clone());
 				if let Some(index) = existing {
 					database.graphs[index] = image.catalog_entry;
 				}
 			} else {
-				let generation = write_new_graph_generation(
-					&self.root,
-					image,
-					&mut files.next_file_instance_id,
-				)?;
-				files.files.retain(|entry| entry.graph_id != graph_id);
-				files.files.extend(generation.file_entries);
-				registrations.extend(generation.registrations);
-				new_superblocks.push(generation.superblock);
-				match existing {
-					Some(index) => database.graphs[index] = generation.catalog_entry,
-					None => database.graphs.push(generation.catalog_entry),
+				let removed =
+					existing.map(|_index| graph_tree_ids(&database, graph_id)).unwrap_or_default();
+				files.files.retain(|entry| !removed.contains(&entry.graph_id));
+				database.graphs.retain(|entry| {
+					entry.graph_id == graph_id || !removed.contains(&entry.graph_id)
+				});
+				for image in images {
+					let generation = write_new_graph_generation(
+						&self.root,
+						image,
+						&mut files.next_file_instance_id,
+					)?;
+					files.files.extend(generation.file_entries);
+					registrations.extend(generation.registrations);
+					new_superblocks.push(generation.superblock);
+					new_indexes.extend(generation.indexes);
+					if generation.catalog_entry.graph_id == graph_id {
+						if let Some(index) =
+							database.graphs.iter().position(|entry| entry.graph_id == graph_id)
+						{
+							database.graphs[index] = generation.catalog_entry;
+						} else {
+							database.graphs.push(generation.catalog_entry);
+						}
+					} else {
+						database.graphs.push(generation.catalog_entry);
+					}
 				}
 			}
 		}
@@ -675,7 +866,7 @@ impl LocalStore {
 		files.files.sort_unstable_by_key(|entry| (entry.graph_id, entry.file_id));
 		database.property_keys =
 			dictionary.iter().map(|(_id, name)| name.as_str().to_owned()).collect();
-		database.tables = encode_tables(tables, &database)?;
+		database.tables = encode_tables(tables, &database, &previous_database, &new_indexes)?;
 
 		let graph_count = u32::try_from(database.graphs.len()).map_err(|_error| {
 			FerrosGrynnError::invalid_storage_file("durable graph count exceeds u32")
@@ -812,6 +1003,7 @@ pub struct LocalNodeRead<'tx> {
 	store: &'tx LocalStore,
 	transaction: &'tx LocalReadTransaction,
 	graph: &'tx LocalGraph,
+	transaction_owner: Option<Arc<LocalReadTransaction>>,
 	id: AtomId,
 	record_id: RecordId,
 	label: Option<Text>,
@@ -841,12 +1033,36 @@ impl NodeRead for LocalNodeRead<'_> {
 
 	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
 		self.transaction.ensure_live()?;
-		if self.slot.flags.contains(NodeSlotFlags::META) || self.slot.subgraph_slot.is_some() {
-			return Err(FerrosGrynnError::invalid_storage_file(
-				"nested node requires the stage-5 subgraph materializer",
-			));
-		}
-		Ok(None)
+		self.slot
+			.subgraph_slot
+			.map(|slot| {
+				self.graph
+					.children
+					.get(&slot)
+					.map(|child| Cow::Borrowed(child.reference()))
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"node references an unknown nested graph slot",
+						)
+					})
+			})
+			.transpose()
+	}
+
+	fn inner_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
+		let Some(slot) = self.slot.subgraph_slot else {
+			return Ok(None);
+		};
+		let child = self.graph.children.get(&slot).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("node references an unknown nested graph slot")
+		})?;
+		let transaction = self.transaction_owner.clone().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"nested graph contents require an owning transaction view",
+			)
+		})?;
+		let graph = self.store.materialize_graph(transaction, child)?.into_general()?;
+		Ok(Some(Cow::Owned(graph)))
 	}
 }
 
@@ -855,6 +1071,7 @@ pub struct LocalEdgeRead<'tx> {
 	store: &'tx LocalStore,
 	transaction: &'tx LocalReadTransaction,
 	graph: &'tx LocalGraph,
+	transaction_owner: Option<Arc<LocalReadTransaction>>,
 	id: AtomId,
 	record_id: RecordId,
 	label: Option<Text>,
@@ -892,12 +1109,38 @@ impl EdgeRead for LocalEdgeRead<'_> {
 
 	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
 		self.transaction.ensure_live()?;
-		if self.slot.has_transition || self.slot.flags.contains(EdgeSlotFlags::META) {
-			return Err(FerrosGrynnError::invalid_storage_file(
-				"transition edge requires the stage-5 subgraph materializer",
-			));
-		}
-		Ok(None)
+		self.slot
+			.transition_graph
+			.map(|slot| {
+				self.graph
+					.children
+					.get(&slot)
+					.map(|child| Cow::Borrowed(child.reference()))
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"edge references an unknown transition graph slot",
+						)
+					})
+			})
+			.transpose()
+	}
+
+	fn transition_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
+		let Some(slot) = self.slot.transition_graph else {
+			return Ok(None);
+		};
+		let child = self.graph.children.get(&slot).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"edge references an unknown transition graph slot",
+			)
+		})?;
+		let transaction = self.transaction_owner.clone().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"transition graph contents require an owning transaction view",
+			)
+		})?;
+		let graph = self.store.materialize_graph(transaction, child)?.into_general()?;
+		Ok(Some(Cow::Owned(graph)))
 	}
 }
 
@@ -960,7 +1203,14 @@ impl GraphRead for LocalGraphView<'_> {
 		else {
 			return Ok(None);
 		};
-		read_local_node(self.store, &self.transaction, self.graph.as_ref(), id, record_id)
+		read_local_node(
+			self.store,
+			&self.transaction,
+			self.graph.as_ref(),
+			id,
+			record_id,
+			Some(self.transaction.clone()),
+		)
 	}
 
 	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
@@ -972,7 +1222,14 @@ impl GraphRead for LocalGraphView<'_> {
 		else {
 			return Ok(None);
 		};
-		read_local_edge(self.store, &self.transaction, self.graph.as_ref(), id, record_id)
+		read_local_edge(
+			self.store,
+			&self.transaction,
+			self.graph.as_ref(),
+			id,
+			record_id,
+			Some(self.transaction.clone()),
+		)
 	}
 
 	fn storage_mode(&self) -> GraphStorageMode {
@@ -1028,6 +1285,21 @@ fn copy_local_page(
 	Ok(())
 }
 
+fn copy_local_index_page(
+	store: &LocalStore,
+	transaction: &LocalReadTransaction,
+	graph: &LocalGraph,
+	file_id: DataFileId,
+	page_no: PageNo,
+	output: &mut AlignedPage,
+) -> FerrosGrynnResult<()> {
+	transaction.ensure_live()?;
+	let page =
+		store.manager.read_page(&transaction.inner, graph.index_page_key(file_id, page_no))?;
+	output.as_bytes_mut().copy_from_slice(page.as_bytes());
+	Ok(())
+}
+
 fn visit_local_primary(
 	store: &LocalStore,
 	transaction: &LocalReadTransaction,
@@ -1057,6 +1329,43 @@ fn encode_record_key(record: &RecordId, context: &mut EncodeContext) -> FerrosGr
 	CanonicalCodec::encode(
 		StorageValue::from_runtime(Value::Record(Box::new(record.clone())), context)?.as_ref(),
 	)
+}
+
+fn local_query_atom(
+	store: &LocalStore,
+	transaction: &LocalReadTransaction,
+	graph: &LocalGraph,
+	record_id: RecordId,
+	disk: DiskAtomRef,
+) -> FerrosGrynnResult<LocalQueryAtom> {
+	let atom_id = local_atom_id(store, transaction, graph, disk)?;
+	let properties = match disk.kind() {
+		AtomKind::Node => {
+			read_local_node(store, transaction, graph, atom_id, record_id.clone(), None)?
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"primary index references a missing node",
+					)
+				})?
+				.properties()?
+				.into_owned()
+		}
+		AtomKind::Edge => {
+			read_local_edge(store, transaction, graph, atom_id, record_id.clone(), None)?
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"primary index references a missing edge",
+					)
+				})?
+				.properties()?
+				.into_owned()
+		}
+	};
+	Ok(LocalQueryAtom {
+		atom_id,
+		record_id,
+		properties,
+	})
 }
 
 fn lookup_local_atom(
@@ -1095,17 +1404,8 @@ fn record_for_local_atom(
 		id.kind().ok_or_else(|| FerrosGrynnError::invalid_argument("invalid AtomId kind"))?,
 		id.slot(),
 	)?;
-	let context = graph.base_context()?;
-	let mut record = None;
-	// ponytail: reverse RecordId lookup scans the immutable primary index; add
-	// a reverse index only if arbitrary AtomId lookups dominate profiles.
-	visit_local_primary(store, transaction, graph, |key, atom| {
-		if atom == disk {
-			record = Some(decode_record_key(key, &context)?);
-		}
-		Ok(())
-	})?;
-	Ok(record)
+	let context = graph.decode_context(store, transaction)?;
+	Ok(context.registered_atom(disk).map(|reference| reference.id().clone()))
 }
 
 fn local_atom_id(
@@ -1145,6 +1445,7 @@ fn read_local_node<'tx>(
 	graph: &'tx LocalGraph,
 	id: AtomId,
 	record_id: RecordId,
+	transaction_owner: Option<Arc<LocalReadTransaction>>,
 ) -> FerrosGrynnResult<Option<LocalNodeRead<'tx>>> {
 	let (page_no, slot_index) = hot_slot_address(id.slot())?;
 	let page = read_local_page(store, transaction, graph, DataFileKind::NodesHot, page_no)?;
@@ -1158,6 +1459,7 @@ fn read_local_node<'tx>(
 		store,
 		transaction,
 		graph,
+		transaction_owner,
 		id,
 		record_id,
 		label,
@@ -1172,6 +1474,7 @@ fn read_local_edge<'tx>(
 	graph: &'tx LocalGraph,
 	id: AtomId,
 	record_id: RecordId,
+	transaction_owner: Option<Arc<LocalReadTransaction>>,
 ) -> FerrosGrynnResult<Option<LocalEdgeRead<'tx>>> {
 	let (page_no, slot_index) = hot_slot_address(id.slot())?;
 	let page = read_local_page(store, transaction, graph, DataFileKind::EdgesHot, page_no)?;
@@ -1185,6 +1488,7 @@ fn read_local_edge<'tx>(
 		store,
 		transaction,
 		graph,
+		transaction_owner,
 		id,
 		record_id,
 		label,
@@ -1352,6 +1656,11 @@ fn read_local_refs(
 		}
 		next = following;
 	}
+	if next.is_some() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"adjacency overflow contains entries beyond its declared count",
+		));
+	}
 	Ok(entries)
 }
 
@@ -1362,9 +1671,27 @@ fn decode_local_topology(
 	edge: &EdgeHotSlot,
 ) -> FerrosGrynnResult<EdgeTopology> {
 	if edge.flags.contains(EdgeSlotFlags::CROSS_LEVEL) {
-		return Err(FerrosGrynnError::invalid_storage_file(
-			"cross-level edge requires the stage-5 incidence materializer",
-		));
+		let source = decode_cross_level_side(
+			store,
+			transaction,
+			graph,
+			edge.source_count,
+			&edge.source_inline,
+			edge.source_graph,
+			edge.source_graph_overflow,
+			EndpointSide::Source,
+		)?;
+		let target = decode_cross_level_side(
+			store,
+			transaction,
+			graph,
+			edge.target_count,
+			&edge.target_inline,
+			edge.target_graph,
+			edge.target_graph_overflow,
+			EndpointSide::Target,
+		)?;
+		return topology_from_sides(edge.topology, source, target);
 	}
 	let source = read_local_refs(
 		store,
@@ -1388,7 +1715,15 @@ fn decode_local_topology(
 	.into_iter()
 	.map(|atom| local_atom_id(store, transaction, graph, atom).map(EdgeEndpoint::Local))
 	.collect::<FerrosGrynnResult<Vec<_>>>()?;
-	Ok(match edge.topology {
+	topology_from_sides(edge.topology, source, target)
+}
+
+fn topology_from_sides(
+	topology: EdgeTopologyCode,
+	source: Vec<EdgeEndpoint>,
+	target: Vec<EdgeEndpoint>,
+) -> FerrosGrynnResult<EdgeTopology> {
+	Ok(match topology {
 		EdgeTopologyCode::Directed | EdgeTopologyCode::HyperDirected => {
 			EdgeTopology::directed(source, target)
 		}
@@ -1412,6 +1747,150 @@ fn decode_local_topology(
 	})
 }
 
+fn decode_cross_level_side(
+	store: &LocalStore,
+	transaction: &LocalReadTransaction,
+	graph: &LocalGraph,
+	count: u32,
+	inline: &[Option<DiskAtomRef>; 2],
+	graph_slot: Option<u32>,
+	graph_overflow: Option<PageNo>,
+	side: EndpointSide,
+) -> FerrosGrynnResult<Vec<EdgeEndpoint>> {
+	let count = usize::try_from(count)
+		.map_err(|_error| FerrosGrynnError::invalid_storage_file("endpoint count exceeds usize"))?;
+	let encoded = if let Some(first) = graph_overflow {
+		let mut entries = Vec::with_capacity(count);
+		let mut next = Some(first);
+		let mut visited = BTreeSet::new();
+		while entries.len() < count {
+			let page_no = next.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("cross-level overflow ended too early")
+			})?;
+			if !visited.insert(page_no) {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"cross-level overflow contains a cycle",
+				));
+			}
+			let page = read_local_page(
+				store,
+				transaction,
+				graph,
+				DataFileKind::CrossLevelAdjacencyOverflow,
+				page_no,
+			)?;
+			let (following, chunk) = decode_cross_level_overflow(page.as_page(), page_no)?;
+			if chunk.iter().any(|entry| entry.side != side) {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"cross-level overflow contains the wrong endpoint side",
+				));
+			}
+			entries.extend(chunk);
+			if entries.len() > count {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"cross-level overflow exceeds its declared count",
+				));
+			}
+			next = following;
+		}
+		if next.is_some() {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"cross-level overflow contains entries beyond its declared count",
+			));
+		}
+		entries
+	} else {
+		let slot = if count == 0 {
+			return Ok(Vec::new());
+		} else {
+			graph_slot.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"inline cross-level endpoints have no graph slot",
+				)
+			})?
+		};
+		inline
+			.iter()
+			.take(count)
+			.map(|atom| {
+				atom.map(|atom| QualifiedDiskAtomRef {
+					graph_slot: slot,
+					side,
+					atom,
+				})
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("inline cross-level endpoint is absent")
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?
+	};
+	encoded
+		.into_iter()
+		.map(|endpoint| {
+			if endpoint.graph_slot == 0 {
+				local_atom_id(store, transaction, graph, endpoint.atom).map(EdgeEndpoint::Local)
+			} else {
+				resolve_qualified_atom(
+					store,
+					transaction,
+					graph,
+					endpoint.graph_slot,
+					endpoint.atom,
+				)
+				.map(EdgeEndpoint::Nested)
+			}
+		})
+		.collect()
+}
+
+fn resolve_qualified_atom(
+	store: &LocalStore,
+	transaction: &LocalReadTransaction,
+	graph: &LocalGraph,
+	graph_slot: u32,
+	atom: DiskAtomRef,
+) -> FerrosGrynnResult<QualifiedAtomId> {
+	let mut scope = Vec::new();
+	let target = find_qualified_atom(store, transaction, graph, graph_slot, atom, &mut scope)?
+		.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"qualified endpoint references an unknown subgraph slot",
+			)
+		})?;
+	QualifiedAtomId::new(scope, target)
+}
+
+fn find_qualified_atom(
+	store: &LocalStore,
+	transaction: &LocalReadTransaction,
+	graph: &LocalGraph,
+	graph_slot: u32,
+	atom: DiskAtomRef,
+	scope: &mut Vec<AtomId>,
+) -> FerrosGrynnResult<Option<AtomId>> {
+	for child in graph.children.values() {
+		let container = local_atom_id(
+			store,
+			transaction,
+			graph,
+			child.parent_atom.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("nested graph has no parent atom")
+			})?,
+		)?;
+		scope.push(container);
+		if child.subgraph_slot == Some(graph_slot) {
+			return local_atom_id(store, transaction, child, atom).map(Some);
+		}
+		if let Some(target) =
+			find_qualified_atom(store, transaction, child, graph_slot, atom, scope)?
+		{
+			return Ok(Some(target));
+		}
+		scope.pop();
+	}
+	Ok(None)
+}
+
 const fn table_kind_accepts(table: TableKind, atom: AtomKind) -> bool {
 	matches!(
 		(table, atom),
@@ -1427,12 +1906,45 @@ struct BuiltGraphGeneration {
 	file_entries: Vec<FileCatalogEntry>,
 	registrations: Vec<DataFileRegistration>,
 	superblock: GraphSuperblock,
+	indexes: Vec<BuiltTableIndexBinding>,
 }
 
 struct BuiltGraphImage {
 	catalog_entry: GraphCatalogEntry,
 	superblock: GraphSuperblock,
 	payloads: BTreeMap<DataFileKind, Vec<AlignedPage>>,
+	indexes: Vec<BuiltScalarIndexImage>,
+}
+
+struct PlannedGraph {
+	graph_id: GraphId,
+	record_id: RecordId,
+	kind: GraphKind,
+	graph: Graph<Frozen>,
+	parent_graph_id: Option<GraphId>,
+	subgraph_slot: Option<u32>,
+	parent_atom: Option<DiskAtomRef>,
+	children: Vec<PlannedChild>,
+}
+
+struct PlannedChild {
+	container: AtomId,
+	slot: u32,
+	graph: Box<PlannedGraph>,
+}
+
+struct BuiltScalarIndexImage {
+	table: String,
+	name: String,
+	kind: TableIndexKind,
+	fields: Vec<u32>,
+	root: PageNo,
+	pages: Vec<AlignedPage>,
+}
+
+struct BuiltTableIndexBinding {
+	table: String,
+	index: TableIndexCatalogEntry,
 }
 
 fn database_property_dictionary(
@@ -1461,9 +1973,136 @@ fn allocate_graph_id(database: &mut DatabaseCatalog) -> FerrosGrynnResult<GraphI
 	Ok(graph_id)
 }
 
+fn plan_graph_tree(
+	database: &mut DatabaseCatalog,
+	graph_id: GraphId,
+	record_id: &RecordId,
+	graph: &MaterializedGraph,
+) -> FerrosGrynnResult<PlannedGraph> {
+	let mut next_subgraph_slot = 1_u32;
+	plan_graph(
+		database,
+		graph_id,
+		record_id.clone(),
+		graph.kind(),
+		graph.clone().into_general()?,
+		None,
+		None,
+		None,
+		&mut next_subgraph_slot,
+	)
+}
+
+fn plan_graph(
+	database: &mut DatabaseCatalog,
+	graph_id: GraphId,
+	record_id: RecordId,
+	kind: GraphKind,
+	graph: Graph<Frozen>,
+	parent_graph_id: Option<GraphId>,
+	subgraph_slot: Option<u32>,
+	parent_atom: Option<DiskAtomRef>,
+	next_subgraph_slot: &mut u32,
+) -> FerrosGrynnResult<PlannedGraph> {
+	let mut nested = Vec::new();
+	for id in GraphRead::node_ids(&graph)? {
+		let id = id?;
+		let node = graph.node(id).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("nested container disappeared")
+		})?;
+		if let Some(inner) = node.inner_graph() {
+			nested.push((id, inner.clone()));
+		}
+	}
+	for id in GraphRead::edge_ids(&graph)? {
+		let id = id?;
+		let edge = graph.edge(id).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("transition container disappeared")
+		})?;
+		if let Some(transition) = edge.transition_graph() {
+			nested.push((id, transition.clone()));
+		}
+	}
+	nested.sort_unstable_by_key(|(id, _graph)| *id);
+	let mut children = Vec::with_capacity(nested.len());
+	for (container, nested_graph) in nested {
+		if *next_subgraph_slot == u32::MAX {
+			return Err(FerrosGrynnError::graph_capacity_exceeded("subgraph"));
+		}
+		let slot = *next_subgraph_slot;
+		*next_subgraph_slot = next_subgraph_slot
+			.checked_add(1)
+			.ok_or_else(|| FerrosGrynnError::graph_capacity_exceeded("subgraph"))?;
+		let child_id = allocate_graph_id(database)?;
+		let child_record: RecordId =
+			format!("{INTERNAL_NESTED_GRAPH_TABLE}:{}", child_id.get()).parse()?;
+		let container_disk = DiskAtomRef::from_parts(
+			container.kind().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("nested container has an invalid kind")
+			})?,
+			container.slot(),
+		)?;
+		let child = plan_graph(
+			database,
+			child_id,
+			child_record,
+			GraphKind::Graph,
+			nested_graph,
+			Some(graph_id),
+			Some(slot),
+			Some(container_disk),
+			next_subgraph_slot,
+		)?;
+		children.push(PlannedChild {
+			container,
+			slot,
+			graph: Box::new(child),
+		});
+	}
+	Ok(PlannedGraph {
+		graph_id,
+		record_id,
+		kind,
+		graph,
+		parent_graph_id,
+		subgraph_slot,
+		parent_atom,
+		children,
+	})
+}
+
+fn graph_tree_ids(database: &DatabaseCatalog, root: GraphId) -> BTreeSet<GraphId> {
+	let mut ids = BTreeSet::from([root]);
+	loop {
+		let before = ids.len();
+		for graph in &database.graphs {
+			if graph.parent_graph_id.is_some_and(|parent| ids.contains(&parent)) {
+				ids.insert(graph.graph_id);
+			}
+		}
+		if ids.len() == before {
+			return ids;
+		}
+	}
+}
+
+fn build_graph_images(
+	plan: &PlannedGraph,
+	dictionary: &mut PropertyDictionary,
+	tables: &[LocalCommitTable],
+) -> FerrosGrynnResult<Vec<BuiltGraphImage>> {
+	let mut images = vec![build_graph_image(plan, dictionary, tables)?];
+	for child in &plan.children {
+		images.extend(build_graph_images(&child.graph, dictionary, tables)?);
+	}
+	Ok(images)
+}
+
 fn encode_tables(
 	tables: &[LocalCommitTable],
 	database: &DatabaseCatalog,
+	previous: &DatabaseCatalog,
+	new_indexes: &[BuiltTableIndexBinding],
 ) -> FerrosGrynnResult<Vec<TableCatalogEntry>> {
 	let graph_ids = database
 		.graphs
@@ -1479,6 +2118,36 @@ fn encode_tables(
 					table.name
 				))
 			})?;
+		let mut indexes = Vec::with_capacity(table.indexes.len());
+		for definition in &table.indexes {
+			let candidate = new_indexes
+				.iter()
+				.find(|candidate| {
+					candidate.table == table.name && candidate.index.name == definition.name
+				})
+				.map(|candidate| &candidate.index)
+				.or_else(|| {
+					previous.tables.iter().find(|existing| existing.name == table.name).and_then(
+						|existing| {
+							existing.indexes.iter().find(|index| index.name == definition.name)
+						},
+					)
+				})
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(format!(
+						"scalar index '{}.{}' has no built physical generation",
+						table.name, definition.name
+					))
+				})?;
+			if candidate.kind != definition.kind || candidate.fields != definition.fields {
+				return Err(FerrosGrynnError::invalid_storage_file(format!(
+					"scalar index '{}.{}' physical definition is stale",
+					table.name, definition.name
+				)));
+			}
+			indexes.push(candidate.clone());
+		}
+		indexes.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 		encoded.push(TableCatalogEntry {
 			name: table.name.clone(),
 			graph_id,
@@ -1492,6 +2161,7 @@ fn encode_tables(
 					property_key: field.property_key,
 				})
 				.collect(),
+			indexes,
 		});
 	}
 	encoded.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -1507,8 +2177,10 @@ fn load_database(
 	files: &FileCatalog,
 ) -> FerrosGrynnResult<LocalDatabaseSnapshot> {
 	let dictionary = Arc::new(database_property_dictionary(database)?);
-	let mut graphs = Vec::with_capacity(database.graphs.len());
-	for entry in &database.graphs {
+	let mut graphs = Vec::with_capacity(
+		database.graphs.iter().filter(|entry| entry.parent_graph_id.is_none()).count(),
+	);
+	for entry in database.graphs.iter().filter(|entry| entry.parent_graph_id.is_none()) {
 		let record_id: RecordId = entry.record_id.parse()?;
 		graphs.push(LocalSnapshotGraph {
 			record_id: record_id.clone(),
@@ -1517,7 +2189,9 @@ fn load_database(
 				manager,
 				transaction,
 				entry,
+				database,
 				files,
+				&database.tables,
 				record_id,
 				dictionary.clone(),
 			)?),
@@ -1546,6 +2220,15 @@ fn load_database(
 					property_key: field.property_key,
 				})
 				.collect(),
+			indexes: table
+				.indexes
+				.iter()
+				.map(|index| LocalCommitTableIndex {
+					name: index.name.clone(),
+					kind: index.kind,
+					fields: index.fields.clone(),
+				})
+				.collect(),
 		});
 	}
 	Ok(LocalDatabaseSnapshot {
@@ -1561,12 +2244,39 @@ fn open_local_graph(
 	manager: &SyncPageManager,
 	transaction: &TxHandle,
 	entry: &GraphCatalogEntry,
+	database: &DatabaseCatalog,
 	files: &FileCatalog,
+	tables: &[TableCatalogEntry],
 	record_id: RecordId,
 	property_dictionary: Arc<PropertyDictionary>,
 ) -> FerrosGrynnResult<LocalGraph> {
-	let paths = graph_file_paths(root, entry.graph_id, files)?;
-	let file_ids = graph_file_ids(entry.graph_id, files)?;
+	let mut children = BTreeMap::new();
+	for child in
+		database.graphs.iter().filter(|child| child.parent_graph_id == Some(entry.graph_id))
+	{
+		let slot = child.subgraph_slot.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("nested graph has no subgraph slot")
+		})?;
+		let child_record: RecordId = child.record_id.parse()?;
+		let graph = Arc::new(open_local_graph(
+			root,
+			manager,
+			transaction,
+			child,
+			database,
+			files,
+			tables,
+			child_record,
+			property_dictionary.clone(),
+		)?);
+		if children.insert(slot, graph).is_some() {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"nested graph slots are not unique",
+			));
+		}
+	}
+	let paths = graph_file_paths(root, entry, files)?;
+	let file_ids = graph_file_ids(entry, files)?;
 	let superblock_path = paths.get(&DataFileKind::GraphSuperblock).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file("graph superblock file is missing")
 	})?;
@@ -1598,8 +2308,48 @@ fn open_local_graph(
 		output.as_bytes_mut().copy_from_slice(page.as_bytes());
 		Ok(())
 	})?;
-	Ok(LocalGraph {
+	let mut scalar_indexes = BTreeMap::<String, Vec<LocalScalarIndex>>::new();
+	for table in tables.iter().filter(|table| table.graph_id == entry.graph_id) {
+		for index in &table.indexes {
+			if !files
+				.files
+				.iter()
+				.any(|file| file.graph_id == entry.graph_id && file.file_id == index.file_id)
+			{
+				return Err(FerrosGrynnError::invalid_storage_file(format!(
+					"scalar index '{}.{}' references an unregistered file",
+					table.name, index.name
+				)));
+			}
+			let fields = index
+				.fields
+				.iter()
+				.map(|property_key| {
+					table
+						.fields
+						.iter()
+						.find(|field| field.property_key == *property_key)
+						.map(|field| (PropertyKeyId::new(*property_key), field.value_type.clone()))
+						.ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"scalar index references an unknown table field",
+							)
+						})
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			scalar_indexes.entry(table.name.clone()).or_default().push(LocalScalarIndex {
+				name: index.name.clone(),
+				kind: index.kind,
+				fields,
+				file_id: index.file_id,
+				root: index.root,
+			});
+		}
+	}
+	let graph = LocalGraph {
 		graph_id: entry.graph_id,
+		subgraph_slot: entry.subgraph_slot,
+		parent_atom: entry.parent_atom,
 		reference: GraphRef::new(record_id, entry.kind, GraphStorageMode::DiskBacked),
 		identity: uuid::Uuid::from_bytes(entry.identity).into(),
 		revision: entry.revision,
@@ -1610,18 +2360,105 @@ fn open_local_graph(
 		labels,
 		property_dictionary,
 		decode_context: Mutex::new(None),
-	})
+		scalar_indexes,
+		children,
+	};
+	validate_local_subgraphs(manager, transaction, &graph)?;
+	Ok(graph)
+}
+
+fn validate_local_subgraphs(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	graph: &LocalGraph,
+) -> FerrosGrynnResult<()> {
+	let file_id = graph.file_id(DataFileKind::Subgraphs)?;
+	let mut page_no = PageNo::new(0);
+	let mut visited = BTreeSet::new();
+	let mut entries = BTreeMap::new();
+	loop {
+		if !visited.insert(page_no) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"subgraph directory contains a page cycle",
+			));
+		}
+		let page = manager
+			.read_page(transaction, super::types::PageKey::new(graph.graph_id, file_id, page_no))?;
+		let (next, chunk) = decode_subgraph_directory(page.as_page(), page_no)?;
+		for entry in chunk {
+			if entry.slot == 0 || entries.insert(entry.slot, entry).is_some() {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"subgraph directory contains a reserved or duplicate slot",
+				));
+			}
+		}
+		let Some(next) = next else {
+			break;
+		};
+		page_no = next;
+	}
+	if entries.len() != graph.children.len()
+		|| u64::try_from(entries.len()).ok() != Some(graph.superblock.subgraph_count)
+	{
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"subgraph directory disagrees with the catalog or superblock",
+		));
+	}
+	for (slot, child) in &graph.children {
+		let entry = entries.get(slot).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("nested graph is absent from its directory")
+		})?;
+		if entry.node_capacity != child.superblock.node_capacity
+			|| entry.edge_capacity != child.superblock.edge_capacity
+			|| u64::from(entry.node_count) != child.superblock.node_count
+			|| u64::from(entry.edge_count) != child.superblock.edge_count
+		{
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"subgraph directory counts disagree with the nested graph",
+			));
+		}
+		let parent = child.parent_atom.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("nested graph has no parent atom")
+		})?;
+		let (hot_page, hot_slot) = hot_slot_address(parent.slot())?;
+		match parent.kind() {
+			AtomKind::Node => {
+				let page = manager
+					.read_page(transaction, graph.page_key(DataFileKind::NodesHot, hot_page)?)?;
+				let value = read_node_hot_slot(page.as_page(), hot_page, hot_slot)?;
+				if value.generation != entry.generation || value.subgraph_slot != Some(*slot) {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"node nested-graph binding disagrees with SubgraphDir",
+					));
+				}
+			}
+			AtomKind::Edge => {
+				let page = manager
+					.read_page(transaction, graph.page_key(DataFileKind::EdgesHot, hot_page)?)?;
+				let value = read_edge_hot_slot(page.as_page(), hot_page, hot_slot)?;
+				if value.generation != entry.generation || value.transition_graph != Some(*slot) {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"edge transition binding disagrees with SubgraphDir",
+					));
+				}
+			}
+		}
+	}
+	Ok(())
 }
 
 fn graph_file_ids(
-	graph_id: GraphId,
+	graph: &GraphCatalogEntry,
 	files: &FileCatalog,
 ) -> FerrosGrynnResult<BTreeMap<DataFileKind, DataFileId>> {
 	let mut ids = BTreeMap::new();
-	for entry in files.files.iter().filter(|entry| entry.graph_id == graph_id) {
+	for entry in files.files.iter().filter(|entry| entry.graph_id == graph.graph_id) {
 		let kind = entry.file_id.kind().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("graph file has an unknown kind")
 		})?;
+		if kind == DataFileKind::Index && entry.file_id != graph.primary_index_file_id {
+			continue;
+		}
 		if ids.insert(kind, entry.file_id).is_some() {
 			return Err(FerrosGrynnError::invalid_storage_file(
 				"graph catalog contains duplicate file kinds",
@@ -1807,16 +2644,74 @@ struct NodeAdjacency {
 
 struct EncodedTopology {
 	code: EdgeTopologyCode,
-	source: Vec<DiskAtomRef>,
-	target: Vec<DiskAtomRef>,
+	source: Vec<EncodedEndpoint>,
+	target: Vec<EncodedEndpoint>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EncodedEndpoint {
+	graph_slot: u32,
+	atom: DiskAtomRef,
+}
+
+#[derive(Default)]
+struct CrossLevelOverflowStoreBuilder {
+	pages: Vec<AlignedPage>,
+}
+
+impl CrossLevelOverflowStoreBuilder {
+	fn append(
+		&mut self,
+		entries: &[EncodedEndpoint],
+		side: EndpointSide,
+	) -> FerrosGrynnResult<Option<PageNo>> {
+		if entries.is_empty() {
+			return Ok(None);
+		}
+		let first = PageNo::new(u64::try_from(self.pages.len()).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("cross-level page count exceeds u64")
+		})?);
+		let encoded = entries
+			.iter()
+			.map(|entry| QualifiedDiskAtomRef {
+				graph_slot: entry.graph_slot,
+				side,
+				atom: entry.atom,
+			})
+			.collect::<Vec<_>>();
+		let chunks = encoded.chunks(CROSS_LEVEL_REFS_PER_PAGE).collect::<Vec<_>>();
+		for (index, chunk) in chunks.iter().enumerate() {
+			let page_no = PageNo::new(
+				first
+					.get()
+					.checked_add(u64::try_from(index).map_err(|_error| {
+						FerrosGrynnError::invalid_storage_file("cross-level page index exceeds u64")
+					})?)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("cross-level page number overflows")
+					})?,
+			);
+			let next = if index + 1 < chunks.len() {
+				Some(PageNo::new(page_no.get().checked_add(1).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("cross-level page link overflows")
+				})?))
+			} else {
+				None
+			};
+			self.pages.push(encode_cross_level_overflow(page_no, PageLsn::ZERO, next, chunk)?);
+		}
+		Ok(Some(first))
+	}
 }
 
 fn build_graph_image(
-	graph_id: GraphId,
-	record_id: &RecordId,
-	graph: &MaterializedGraph,
+	plan: &PlannedGraph,
 	dictionary: &mut PropertyDictionary,
+	tables: &[LocalCommitTable],
 ) -> FerrosGrynnResult<BuiltGraphImage> {
+	let graph_id = plan.graph_id;
+	let record_id = &plan.record_id;
+	let graph = &plan.graph;
 	let node_ids = GraphRead::node_ids(graph)?.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let edge_ids = GraphRead::edge_ids(graph)?.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let mut disk_refs = BTreeMap::new();
@@ -1840,11 +2735,6 @@ fn build_graph_image(
 		let node = graph
 			.node(*id)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("graph node disappeared"))?;
-		if node.inner_graph().is_some() {
-			return Err(FerrosGrynnError::invalid_argument(
-				"nested graphs require the stage-5 generic-incidence slice",
-			));
-		}
 		if let Some(label) = node.label() {
 			node_labels.insert(label.to_owned());
 		}
@@ -1853,11 +2743,6 @@ fn build_graph_image(
 		let edge = graph
 			.edge(*id)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("graph edge disappeared"))?;
-		if edge.transition_graph().is_some() || edge.topology().is_cross_level() {
-			return Err(FerrosGrynnError::invalid_argument(
-				"transition and cross-level edges require the stage-5 generic-incidence slice",
-			));
-		}
 		if let Some(label) = edge.label() {
 			edge_labels.insert(label.to_owned());
 		}
@@ -1910,6 +2795,7 @@ fn build_graph_image(
 		);
 	}
 	let property_pages = properties.finish()?;
+	let indexes = build_scalar_indexes(record_id, graph, tables, &disk_refs, &mut context)?;
 
 	let node_label_ids = dense_ids(node_labels)?;
 	let edge_label_ids = dense_ids(edge_labels)?;
@@ -1943,7 +2829,7 @@ fn build_graph_image(
 		let edge = graph
 			.edge(*id)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("graph edge disappeared"))?;
-		let topology = encode_topology(edge.topology(), &disk_refs)?;
+		let topology = encode_topology(edge.topology(), &disk_refs, plan)?;
 		record_node_adjacency(
 			edge.topology(),
 			disk_refs.get(id).copied().ok_or_else(|| {
@@ -1993,6 +2879,7 @@ fn build_graph_image(
 		)?;
 	}
 	let mut overflow = OverflowStoreBuilder::default();
+	let mut cross_level_overflow = CrossLevelOverflowStoreBuilder::default();
 	for id in &node_ids {
 		let node = graph
 			.node(*id)
@@ -2000,9 +2887,11 @@ fn build_graph_image(
 		let adjacency = node_adjacency.get(id).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("node adjacency was not initialized")
 		})?;
+		let subgraph_slot =
+			plan.children.iter().find(|child| child.container == *id).map(|child| child.slot);
 		let value = NodeHotSlot {
 			generation: id.generation(),
-			subgraph_slot: None,
+			subgraph_slot,
 			label_id: node
 				.label()
 				.map(|label| {
@@ -2017,7 +2906,11 @@ fn build_graph_image(
 			out_count: checked_u32(adjacency.outgoing.len(), "outgoing adjacency")?,
 			in_count: checked_u32(adjacency.incoming.len(), "incoming adjacency")?,
 			undirected_count: checked_u32(adjacency.undirected.len(), "undirected adjacency")?,
-			flags: NodeSlotFlags::empty(),
+			flags: if subgraph_slot.is_some() {
+				NodeSlotFlags::META
+			} else {
+				NodeSlotFlags::empty()
+			},
 			out_overflow: overflow.append(adjacency.outgoing.get(4..).unwrap_or(&[]))?,
 			in_overflow: overflow.append(adjacency.incoming.get(4..).unwrap_or(&[]))?,
 			undirected_overflow: overflow.append(adjacency.undirected.get(2..).unwrap_or(&[]))?,
@@ -2053,10 +2946,35 @@ fn build_graph_image(
 				})
 			})
 			.transpose()?;
+		let cross_level =
+			topology.source.iter().chain(&topology.target).any(|endpoint| endpoint.graph_slot != 0);
+		let source = encode_hot_endpoint_side(
+			&topology.source,
+			EndpointSide::Source,
+			cross_level,
+			&mut overflow,
+			&mut cross_level_overflow,
+		)?;
+		let target = encode_hot_endpoint_side(
+			&topology.target,
+			EndpointSide::Target,
+			cross_level,
+			&mut overflow,
+			&mut cross_level_overflow,
+		)?;
+		let transition_graph =
+			plan.children.iter().find(|child| child.container == *id).map(|child| child.slot);
+		let mut flags = EdgeSlotFlags::empty();
+		if transition_graph.is_some() {
+			flags |= EdgeSlotFlags::META;
+		}
+		if cross_level {
+			flags |= EdgeSlotFlags::CROSS_LEVEL;
+		}
 		let value = EdgeHotSlot {
 			topology: topology.code,
-			flags: EdgeSlotFlags::empty(),
-			has_transition: false,
+			flags,
+			has_transition: transition_graph.is_some(),
 			generation: id.generation(),
 			source_count: checked_u32(topology.source.len(), "edge sources")?,
 			target_count: checked_u32(topology.target.len(), "edge targets")?,
@@ -2072,18 +2990,18 @@ fn build_graph_image(
 				FerrosGrynnError::invalid_storage_file("edge table was not interned")
 			})?),
 			weight,
-			transition_graph: None,
-			source_graph: None,
-			target_graph: None,
+			transition_graph,
+			source_graph: source.graph_slot,
+			target_graph: target.graph_slot,
 			properties: edge_properties.get(id).copied().ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file("edge property location is absent")
 			})?,
-			source_overflow: overflow.append(topology.source.get(2..).unwrap_or(&[]))?,
-			target_overflow: overflow.append(topology.target.get(2..).unwrap_or(&[]))?,
-			source_graph_overflow: None,
-			target_graph_overflow: None,
-			source_inline: inline_refs(&topology.source),
-			target_inline: inline_refs(&topology.target),
+			source_overflow: source.local_overflow,
+			target_overflow: target.local_overflow,
+			source_graph_overflow: source.graph_overflow,
+			target_graph_overflow: target.graph_overflow,
+			source_inline: source.inline,
+			target_inline: target.inline,
 		};
 		let (page_no, slot) = hot_slot_address(id.slot())?;
 		let page_index = checked_page_index(page_no, edge_pages.len())?;
@@ -2098,7 +3016,33 @@ fn build_graph_image(
 
 	let statistics = graph_statistics(&node_adjacency, edge_ids.len())?;
 	let statistic_pages = vec![encode_graph_statistics(statistics, PageLsn::ZERO)?];
-	let subgraph_pages = vec![encode_subgraph_directory(PageNo::new(0), PageLsn::ZERO, None, &[])?];
+	let subgraph_entries = plan
+		.children
+		.iter()
+		.map(|child| {
+			Ok(SubgraphEntry {
+				slot: child.slot,
+				generation: child.container.generation(),
+				node_capacity: u64::try_from(child.graph.graph.slot_capacity(AtomKind::Node))
+					.map_err(|_error| {
+						FerrosGrynnError::invalid_storage_file("nested node capacity exceeds u64")
+					})?,
+				edge_capacity: u64::try_from(child.graph.graph.slot_capacity(AtomKind::Edge))
+					.map_err(|_error| {
+						FerrosGrynnError::invalid_storage_file("nested edge capacity exceeds u64")
+					})?,
+				node_count: checked_u32(
+					GraphRead::node_count(&child.graph.graph)?,
+					"nested node count",
+				)?,
+				edge_count: checked_u32(
+					GraphRead::edge_count(&child.graph.graph)?,
+					"nested edge count",
+				)?,
+			})
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let subgraph_pages = encode_subgraph_pages(&subgraph_entries)?;
 	let freelist_pages = vec![encode_freelist(PageNo::new(0), PageLsn::ZERO, 0, None, &[])?];
 	let graph_name = record_id.id().to_string();
 	let now = unix_time_ms()?;
@@ -2115,8 +3059,10 @@ fn build_graph_image(
 			.map_err(|_error| FerrosGrynnError::invalid_storage_file("node count exceeds u64"))?,
 		edge_count: u64::try_from(edge_ids.len())
 			.map_err(|_error| FerrosGrynnError::invalid_storage_file("edge count exceeds u64"))?,
-		subgraph_capacity: 0,
-		subgraph_count: 0,
+		subgraph_capacity: subgraph_entries.last().map_or(0, |entry| u64::from(entry.slot) + 1),
+		subgraph_count: u64::try_from(subgraph_entries.len()).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("subgraph count exceeds u64")
+		})?,
 		node_hot_pages: u64::try_from(node_pages.len()).map_err(|_error| {
 			FerrosGrynnError::invalid_storage_file("node page count exceeds u64")
 		})?,
@@ -2141,6 +3087,7 @@ fn build_graph_image(
 	payloads.insert(DataFileKind::NodesHot, node_pages);
 	payloads.insert(DataFileKind::EdgesHot, edge_pages);
 	payloads.insert(DataFileKind::AdjacencyOverflow, overflow.pages);
+	payloads.insert(DataFileKind::CrossLevelAdjacencyOverflow, cross_level_overflow.pages);
 	payloads.insert(DataFileKind::Properties, property_pages);
 	payloads.insert(DataFileKind::Subgraphs, subgraph_pages);
 	payloads.insert(DataFileKind::Labels, label_pages);
@@ -2152,18 +3099,132 @@ fn build_graph_image(
 	Ok(BuiltGraphImage {
 		catalog_entry: GraphCatalogEntry {
 			graph_id,
+			parent_graph_id: plan.parent_graph_id,
+			subgraph_slot: plan.subgraph_slot,
+			parent_atom: plan.parent_atom,
 			record_id: record_id.to_string(),
 			name: record_id.id().to_string(),
-			kind: graph.kind(),
+			kind: plan.kind,
 			created_lsn: Lsn::ZERO,
 			identity: *identity.as_inner().as_bytes(),
 			revision: graph.revision(),
 			primary_index_root: primary.root,
+			primary_index_file_id: DataFileId::for_kind(DataFileKind::Index),
 			properties: graph_properties,
 		},
 		superblock,
 		payloads,
+		indexes,
 	})
+}
+
+fn build_scalar_indexes(
+	record_id: &RecordId,
+	graph: &Graph<Frozen>,
+	tables: &[LocalCommitTable],
+	disk_refs: &BTreeMap<AtomId, DiskAtomRef>,
+	context: &mut EncodeContext,
+) -> FerrosGrynnResult<Vec<BuiltScalarIndexImage>> {
+	let mut built = Vec::new();
+	for table in tables.iter().filter(|table| table.graph == *record_id) {
+		for index in &table.indexes {
+			let fields = index
+				.fields
+				.iter()
+				.map(|property_key| {
+					table
+						.fields
+						.iter()
+						.find(|field| field.property_key == *property_key)
+						.map(|field| (PropertyKeyId::new(*property_key), &field.value_type))
+						.ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"scalar index references a field absent from its table",
+							)
+						})
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let mut grouped = BTreeMap::<Vec<u8>, Vec<DiskAtomRef>>::new();
+			for kind in [AtomKind::Node, AtomKind::Edge] {
+				if !table_kind_accepts(table.kind, kind) {
+					continue;
+				}
+				let ids = match kind {
+					AtomKind::Node => {
+						GraphRead::node_ids(graph)?.collect::<FerrosGrynnResult<Vec<_>>>()?
+					}
+					AtomKind::Edge => {
+						GraphRead::edge_ids(graph)?.collect::<FerrosGrynnResult<Vec<_>>>()?
+					}
+				};
+				for id in ids {
+					let (atom_record, properties) = match kind {
+						AtomKind::Node => {
+							let node = graph.node(id).ok_or_else(|| {
+								FerrosGrynnError::invalid_storage_file(
+									"indexed node disappeared during graph encoding",
+								)
+							})?;
+							(node.record_id(), node.properties())
+						}
+						AtomKind::Edge => {
+							let edge = graph.edge(id).ok_or_else(|| {
+								FerrosGrynnError::invalid_storage_file(
+									"indexed edge disappeared during graph encoding",
+								)
+							})?;
+							(edge.record_id(), edge.properties())
+						}
+					};
+					if atom_record.table() != table.name {
+						continue;
+					}
+					let missing = Value::None;
+					let components = fields
+						.iter()
+						.map(|(property_key, value_type)| {
+							(properties.get(*property_key).unwrap_or(&missing), *value_type)
+						})
+						.collect::<Vec<_>>();
+					let key = encode_index_key(&components, context)?;
+					let atom = disk_refs.get(&id).copied().ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"indexed atom has no assigned disk reference",
+						)
+					})?;
+					grouped.entry(key).or_default().push(atom);
+				}
+			}
+			let entries = grouped
+				.into_iter()
+				.map(|(key, mut atoms)| {
+					atoms.sort_unstable();
+					atoms.dedup();
+					ScalarIndexEntry {
+						key,
+						atoms,
+					}
+				})
+				.collect::<Vec<_>>();
+			let mode = match index.kind {
+				TableIndexKind::Standard => ScalarIndexMode::Standard,
+				TableIndexKind::Unique => ScalarIndexMode::Unique,
+			};
+			let tree = build_scalar_index(&entries, mode, PageLsn::ZERO)?;
+			built.push(BuiltScalarIndexImage {
+				table: table.name.clone(),
+				name: index.name.clone(),
+				kind: index.kind,
+				fields: index.fields.clone(),
+				root: tree.root,
+				pages: tree.pages,
+			});
+		}
+	}
+	built.sort_unstable_by(|left, right| {
+		(left.table.as_str(), left.name.as_str()).cmp(&(right.table.as_str(), right.name.as_str()))
+	});
+	Ok(built)
 }
 
 fn write_new_graph_generation(
@@ -2178,11 +3239,15 @@ fn write_new_graph_generation(
 		root.join(relative_directory.replace('/', std::path::MAIN_SEPARATOR_STR));
 	fs::create_dir_all(&absolute_directory)
 		.map_err(|source| storage_io("create graph generation directory", source))?;
+	let mut catalog_entry = image.catalog_entry;
 	let mut payloads = image.payloads;
-	let mut file_entries = Vec::with_capacity(GRAPH_FILE_KINDS.len());
-	let mut registrations = Vec::with_capacity(GRAPH_FILE_KINDS.len());
+	let mut file_entries = Vec::with_capacity(GRAPH_FILE_KINDS.len() + image.indexes.len());
+	let mut registrations = Vec::with_capacity(GRAPH_FILE_KINDS.len() + image.indexes.len());
 	for (kind, filename) in GRAPH_FILE_KINDS {
 		let file_id = allocate_file_id(next_file_instance_id, kind)?;
+		if kind == DataFileKind::Index {
+			catalog_entry.primary_index_file_id = file_id;
+		}
 		let relative = format!("{relative_directory}/{filename}");
 		let catalog_path = CatalogPath::parse(&relative)?;
 		let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -2208,11 +3273,48 @@ fn write_new_graph_generation(
 			path: absolute,
 		});
 	}
+	if !payloads.is_empty() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"graph generation contains an unregistered base payload",
+		));
+	}
+	let mut indexes = Vec::with_capacity(image.indexes.len());
+	for (ordinal, index) in image.indexes.into_iter().enumerate() {
+		let file_id = allocate_file_id(next_file_instance_id, DataFileKind::Index)?;
+		let filename = format!("scalar_{ordinal:04}.fgidx");
+		let relative = format!("{relative_directory}/{filename}");
+		let catalog_path = CatalogPath::parse(&relative)?;
+		let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+		write_pages(&absolute, &index.pages)?;
+		file_entries.push(FileCatalogEntry {
+			graph_id,
+			file_id,
+			role: DataFileRole::WalBackfilled,
+			path: catalog_path,
+		});
+		registrations.push(DataFileRegistration {
+			graph_id,
+			file_id,
+			role: DataFileRole::WalBackfilled,
+			path: absolute,
+		});
+		indexes.push(BuiltTableIndexBinding {
+			table: index.table,
+			index: TableIndexCatalogEntry {
+				name: index.name,
+				kind: index.kind,
+				fields: index.fields,
+				file_id,
+				root: index.root,
+			},
+		});
+	}
 	Ok(BuiltGraphGeneration {
-		catalog_entry: image.catalog_entry,
+		catalog_entry,
 		file_entries,
 		registrations,
 		superblock: image.superblock,
+		indexes,
 	})
 }
 
@@ -2222,7 +3324,12 @@ fn prepare_in_place_image(
 	files: &FileCatalog,
 	image: &mut BuiltGraphImage,
 ) -> FerrosGrynnResult<bool> {
-	let paths = graph_file_paths(root, current.graph_id, files)?;
+	// ponytail: scalar indexes use immutable bulk generations; add incremental
+	// WAL page maintenance only after indexed-write profiles justify it.
+	if !image.indexes.is_empty() {
+		return Ok(false);
+	}
+	let paths = graph_file_paths(root, current, files)?;
 	let path = paths.get(&DataFileKind::GraphSuperblock).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file("graph superblock file is missing")
 	})?;
@@ -2245,6 +3352,7 @@ fn prepare_in_place_image(
 		return Ok(false);
 	}
 	image.catalog_entry.created_lsn = current.created_lsn;
+	image.catalog_entry.primary_index_file_id = current.primary_index_file_id;
 	image.superblock.generation = previous.generation;
 	image.superblock.backfilled_lsn = previous.backfilled_lsn;
 	image.superblock.checkpoint_record_lsn = previous.checkpoint_record_lsn;
@@ -2259,7 +3367,7 @@ fn stage_graph_image(
 	image: &BuiltGraphImage,
 ) -> FerrosGrynnResult<()> {
 	let graph_id = image.catalog_entry.graph_id;
-	let file_ids = graph_file_ids(graph_id, files)?;
+	let file_ids = graph_file_ids(&image.catalog_entry, files)?;
 	for (kind, pages) in &image.payloads {
 		if *kind == DataFileKind::GraphSuperblock {
 			continue;
@@ -2356,6 +3464,31 @@ fn checked_u32(value: usize, field: &str) -> FerrosGrynnResult<u32> {
 		.map_err(|_error| FerrosGrynnError::invalid_storage_file(format!("{field} exceeds u32")))
 }
 
+fn encode_subgraph_pages(entries: &[SubgraphEntry]) -> FerrosGrynnResult<Vec<AlignedPage>> {
+	let chunks = if entries.is_empty() {
+		vec![&[][..]]
+	} else {
+		entries.chunks(SUBGRAPHS_PER_PAGE).collect::<Vec<_>>()
+	};
+	chunks
+		.iter()
+		.enumerate()
+		.map(|(index, entries)| {
+			let page_no = PageNo::new(u64::try_from(index).map_err(|_error| {
+				FerrosGrynnError::invalid_storage_file("subgraph directory page exceeds u64")
+			})?);
+			let next = if index + 1 < chunks.len() {
+				Some(PageNo::new(page_no.get().checked_add(1).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("subgraph directory page link overflows")
+				})?))
+			} else {
+				None
+			};
+			encode_subgraph_directory(page_no, PageLsn::ZERO, next, entries)
+		})
+		.collect()
+}
+
 fn inline_refs<const N: usize>(entries: &[DiskAtomRef]) -> [Option<DiskAtomRef>; N] {
 	let mut inline = [None; N];
 	for (target, value) in inline.iter_mut().zip(entries) {
@@ -2364,17 +3497,62 @@ fn inline_refs<const N: usize>(entries: &[DiskAtomRef]) -> [Option<DiskAtomRef>;
 	inline
 }
 
+struct EncodedHotEndpointSide {
+	inline: [Option<DiskAtomRef>; 2],
+	local_overflow: Option<PageNo>,
+	graph_slot: Option<u32>,
+	graph_overflow: Option<PageNo>,
+}
+
+fn encode_hot_endpoint_side(
+	entries: &[EncodedEndpoint],
+	side: EndpointSide,
+	cross_level: bool,
+	local: &mut OverflowStoreBuilder,
+	qualified: &mut CrossLevelOverflowStoreBuilder,
+) -> FerrosGrynnResult<EncodedHotEndpointSide> {
+	if !cross_level {
+		let atoms = entries.iter().map(|entry| entry.atom).collect::<Vec<_>>();
+		return Ok(EncodedHotEndpointSide {
+			inline: inline_refs(&atoms),
+			local_overflow: local.append(atoms.get(2..).unwrap_or(&[]))?,
+			graph_slot: None,
+			graph_overflow: None,
+		});
+	}
+	let one_graph = entries
+		.first()
+		.map(|first| entries.iter().all(|entry| entry.graph_slot == first.graph_slot))
+		.unwrap_or(true);
+	if entries.len() <= 2 && one_graph {
+		let atoms = entries.iter().map(|entry| entry.atom).collect::<Vec<_>>();
+		return Ok(EncodedHotEndpointSide {
+			inline: inline_refs(&atoms),
+			local_overflow: None,
+			graph_slot: entries.first().map(|entry| entry.graph_slot),
+			graph_overflow: None,
+		});
+	}
+	Ok(EncodedHotEndpointSide {
+		inline: [None; 2],
+		local_overflow: None,
+		graph_slot: None,
+		graph_overflow: qualified.append(entries, side)?,
+	})
+}
+
 fn encode_topology(
 	topology: &EdgeTopology,
 	disk_refs: &BTreeMap<AtomId, DiskAtomRef>,
+	plan: &PlannedGraph,
 ) -> FerrosGrynnResult<EncodedTopology> {
 	match topology {
 		EdgeTopology::Directed {
 			source,
 			target,
 		} => {
-			let source = local_disk_refs(source, disk_refs)?;
-			let target = local_disk_refs(target, disk_refs)?;
+			let source = encode_endpoints(source, disk_refs, plan)?;
+			let target = encode_endpoints(target, disk_refs, plan)?;
 			let code = if source.len() == 1 && target.len() == 1 && source == target {
 				EdgeTopologyCode::Loop
 			} else if source.len() + target.len() == 2 {
@@ -2392,8 +3570,8 @@ fn encode_topology(
 			source,
 			target,
 		} => {
-			let source = local_disk_refs(source, disk_refs)?;
-			let target = local_disk_refs(target, disk_refs)?;
+			let source = encode_endpoints(source, disk_refs, plan)?;
+			let target = encode_endpoints(target, disk_refs, plan)?;
 			if source.len() + target.len() != 2 {
 				return Err(FerrosGrynnError::invalid_argument(
 					"bidirectional hyperedges require a format extension",
@@ -2408,7 +3586,7 @@ fn encode_topology(
 		EdgeTopology::Undirected {
 			endpoints,
 		} => {
-			let source = local_disk_refs(endpoints, disk_refs)?;
+			let source = encode_endpoints(endpoints, disk_refs, plan)?;
 			let code = if source.len() == 2 {
 				EdgeTopologyCode::Undirected
 			} else {
@@ -2423,23 +3601,73 @@ fn encode_topology(
 	}
 }
 
-fn local_disk_refs(
+fn encode_endpoints(
 	endpoints: &[EdgeEndpoint],
 	disk_refs: &BTreeMap<AtomId, DiskAtomRef>,
-) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+	plan: &PlannedGraph,
+) -> FerrosGrynnResult<Vec<EncodedEndpoint>> {
 	endpoints
 		.iter()
-		.map(|endpoint| {
-			let id = endpoint.local_id().ok_or_else(|| {
-				FerrosGrynnError::invalid_argument(
-					"cross-level endpoints require the stage-5 generic-incidence slice",
-				)
-			})?;
-			disk_refs.get(&id).copied().ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file("edge endpoint references an unknown atom")
-			})
+		.map(|endpoint| match endpoint {
+			EdgeEndpoint::Local(id) => disk_refs
+				.get(id)
+				.copied()
+				.map(|atom| EncodedEndpoint {
+					graph_slot: 0,
+					atom,
+				})
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"edge endpoint references an unknown local atom",
+					)
+				}),
+			EdgeEndpoint::Nested(qualified) => encode_qualified_endpoint(plan, qualified),
 		})
 		.collect()
+}
+
+fn encode_qualified_endpoint(
+	plan: &PlannedGraph,
+	qualified: &QualifiedAtomId,
+) -> FerrosGrynnResult<EncodedEndpoint> {
+	let mut current = plan;
+	let mut graph_slot = None;
+	for container in qualified.scope() {
+		let child =
+			current.children.iter().find(|child| child.container == *container).ok_or_else(
+				|| {
+					FerrosGrynnError::graph_constraint_violation(
+						"metagraph",
+						"qualified endpoint scope does not identify a nested graph",
+					)
+				},
+			)?;
+		graph_slot = Some(child.slot);
+		current = &child.graph;
+	}
+	let atom = qualified.atom();
+	let exists = match atom.kind() {
+		Some(AtomKind::Node) => current.graph.node(atom).is_some(),
+		Some(AtomKind::Edge) => current.graph.edge(atom).is_some(),
+		None => false,
+	};
+	if !exists {
+		return Err(FerrosGrynnError::graph_constraint_violation(
+			"metagraph",
+			"qualified endpoint atom is absent from its nested graph",
+		));
+	}
+	Ok(EncodedEndpoint {
+		graph_slot: graph_slot.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("qualified endpoint has no nested graph slot")
+		})?,
+		atom: DiskAtomRef::from_parts(
+			atom.kind().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("qualified endpoint has an invalid kind")
+			})?,
+			atom.slot(),
+		)?,
+	})
 }
 
 fn record_node_adjacency(
@@ -2452,11 +3680,9 @@ fn record_node_adjacency(
 	                  input: bool,
 	                  undirected: bool|
 	 -> FerrosGrynnResult<()> {
-		let id = endpoint.local_id().ok_or_else(|| {
-			FerrosGrynnError::invalid_argument(
-				"cross-level endpoints require the stage-5 generic-incidence slice",
-			)
-		})?;
+		let Some(id) = endpoint.local_id() else {
+			return Ok(());
+		};
 		if id.kind() != Some(AtomKind::Node) {
 			return Ok(());
 		}
@@ -2696,7 +3922,7 @@ fn load_graph(
 	files: &FileCatalog,
 	dictionary: &PropertyDictionary,
 ) -> FerrosGrynnResult<MaterializedGraph> {
-	let paths = graph_file_paths(root, entry.graph_id, files)?;
+	let paths = graph_file_paths(root, entry, files)?;
 	let superblock_path = paths.get(&DataFileKind::GraphSuperblock).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file("graph superblock file is missing")
 	})?;
@@ -2921,14 +4147,17 @@ fn load_graph(
 
 fn graph_file_paths(
 	root: &Path,
-	graph_id: GraphId,
+	graph: &GraphCatalogEntry,
 	files: &FileCatalog,
 ) -> FerrosGrynnResult<BTreeMap<DataFileKind, PathBuf>> {
 	let mut paths = BTreeMap::new();
-	for entry in files.files.iter().filter(|entry| entry.graph_id == graph_id) {
+	for entry in files.files.iter().filter(|entry| entry.graph_id == graph.graph_id) {
 		let kind = entry.file_id.kind().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("graph file has an unknown kind")
 		})?;
+		if kind == DataFileKind::Index && entry.file_id != graph.primary_index_file_id {
+			continue;
+		}
 		if paths.insert(kind, entry.path.resolve(root)).is_some() {
 			return Err(FerrosGrynnError::invalid_storage_file(
 				"graph catalog contains duplicate file kinds",

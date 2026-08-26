@@ -403,7 +403,7 @@ Row = { values: Vec<Value>, env: Env?, path: Path? }
 
 ### 7.2. Scan-операторы
 
-- **`TableScan { table_id, projection, predicate }`** — скан таблицы; predicate/projection проброшены внутрь (§16.1, §16.3). На диске — обход через `Label index` (`lbl_node_<id>.fgidx`) или primary index (`pk_<table_id>.fgidx`), затем чтение hot-slot (§10.4).
+- **`TableScan { table_id, projection, predicate }`** — скан таблицы; predicate/projection проброшены внутрь (§16.1, §16.3). В текущем local backend — ordered обход graph-wide `primary.fgidx`, фильтрация table/kind и затем чтение hot-slot (§10.4); label-index остаётся следующим срезом.
 - **`IndexScan { index_id, key_range, predicate }`** — доступ через `Index::range/lookup` (§13).
 - **`GraphScan { atom_type, label_filter }`** — старт с множества атомов графа по метке (`tv::V([labels])`).
 
@@ -589,11 +589,12 @@ Runtime-решения: batch too large → split; skew → rebalance; выбо�
 Adapter обязан вернуть уже декодированные runtime `Value`; `StorageValue`, `TypeTag` и внутренний
 `AtomId` выше этой границы не проходят. На входе `get` используется публичный `RecordId`.
 
-Состояние Windows-first среза на 2026-08-25: local backend подключён к `QueryRead` и открывает
+Состояние Windows-first среза на 2026-08-26: local backend подключён к `QueryRead` и открывает
 immutable graph generation как transaction-bound `LocalGraphView`, не материализуя граф при
 `open_local`. Point `get` использует primary `RecordId` index, scan читает его leaf-цепочку
-потоково, а property heap загружается только для выбранных атомов. Полная materialization нужна
-только явной мутации или режиму 3.
+потоково, а property heap загружается только для выбранных атомов. Scalar equality/range может
+выбрать B+tree, но полный predicate и SSI registration всё равно выполняются executor. Полная
+materialization нужна только явной мутации или режиму 3.
 
 ### 10.1. Режимы хранения
 
@@ -602,8 +603,8 @@ immutable graph generation как transaction-bound `LocalGraphView`, не ма�
   строится явно через `freeze`.
 - **Режим 2 — Disk-backed**: каталог возвращает `GraphRef`; `read(&tx)` создаёт
   `DiskGraphView<'tx>` над `PageManager`, `BufferPool` и `SnapshotId`. View не является копией
-  графа и не переживает transaction guard. Фундамент режима 2 — текущая работа P2; deferred
-  остаются только advanced page/index-функции после минимального vertical slice.
+  графа и не переживает transaction guard. Windows sync vertical slice завершён; Unix runtime,
+  optional async и advanced specialized indexes остаются отдельными release gates.
 - **Режим 3 — Hybrid**: `query_to_memory::<T, State>` загружает выбранный disk-backed подграф в
   собственную storage family `T<State>`. После полной загрузки исходный disk snapshot
   освобождается.
@@ -624,9 +625,10 @@ LSN и checksum назначает WAL-слой. Checkpoint не бэкфилл�
 `PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
 (seed `0`, поле checksum обнулено при вычислении). Ключ `PageKey = (GraphId, DataFileId, PageNo)`;
 `graph_id = 0` — системное пространство. При чтении `.fgb` проверяются размер/выравнивание файла,
-format version, `page_no`, reserved fields и checksum. Production I/O сейчас только sync:
-`O_DIRECT` на Linux и `FILE_FLAG_NO_BUFFERING` на Windows; WAL остаётся buffered. Benchmark-only
-mmap и optional Native Async не являются fallback.
+format version, `page_no`, reserved fields и checksum. Production runtime сейчас Windows sync с
+`FILE_FLAG_NO_BUFFERING`; Unix компилируется как typed unsupported stub до нативной проверки
+`O_DIRECT`. WAL остаётся buffered. Benchmark-only mmap и optional Native Async не являются
+fallback.
 
 ### 10.3. Разрешение идентификаторов: `RecordId → DiskAtomRef → AtomId`
 
@@ -637,14 +639,18 @@ mmap и optional Native Async не являются fallback.
 
 Разрешение при выполнении:
 ```
-RecordId --(primary B+tree pk_<table_id>.fgidx)--> DiskAtomRef --(read hot slot → gen)--> AtomId
+RecordId --(graph-wide primary.fgidx)--> DiskAtomRef --(read hot slot → gen)--> AtomId
 ```
-`from_disk_ref(r, gen)` восстанавливает `AtomId` из `DiskAtomRef` + generation, прочитанной из hot-slot. Материализация результата (§4.2) выполняет обратный маппинг `AtomId → DiskAtomRef → RecordId` и разыменование `id`-свойства.
+`from_disk_ref(r, gen)` восстанавливает `AtomId` из `DiskAtomRef` + generation, прочитанной из
+hot-slot. Обратный `DiskAtomRef → RecordId` лениво строится одним streaming-проходом primary
+B+tree и кэшируется внутри immutable graph generation; последующая материализация не сканирует
+primary index для каждого атома.
 
 Кросс-уровневые endpoint'ы адресуются
 `QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }` (§3.9 disk-spec): когда
-`EdgeHotSlot.flags.CROSS_LEVEL = 1`, inline/overflow endpoint'ы разрешаются как qualified refs,
-иначе используются plain `DiskAtomRef`.
+`EdgeHotSlot.flags.CROSS_LEVEL = 1`, сторона остаётся inline только для ≤2 endpoint'ов одного
+root-arena slot; иначе вся ordered сторона читается из cross-level overflow. Для локальной
+стороны используются plain `DiskAtomRef`.
 
 ### 10.4. Как операторы читают данные
 
@@ -690,7 +696,9 @@ hyper- и cross-level-связи используют эти два массив
 **Мета-атомы.** `metavertex`/`metaedge` — не отдельные типы хранения, а обычные vertex/edge
 с флагом `is_meta` и `subgraph_slot`/`transition_gid`. Edge-to-edge endpoint сам по себе не
 делает ребро метаребром. Вложенные подграфы — через `SubgraphDirPage`; доступ из GrynQL —
-функциями `graph::inner/nodes/edges` (§15.10 gql_spec).
+функциями `graph::inner/nodes/edges` (§15.10 gql_spec). Каждый nested/transition graph имеет
+собственный скрытый Direct-I/O address space, а `LocalNodeRead::inner_graph` и
+`LocalEdgeRead::transition_graph` материализуют его только по явному вызову в рамках транзакции.
 
 ### 10.5. Доступ к статистике
 
@@ -699,18 +707,14 @@ hyper- и cross-level-связи используют эти два массив
 ### 10.6. Режим 3 — `query_to_memory`
 
 Высокоуровневый API для гибридного режима:
-```ignorel
-let graph: Dag<Frozen> = db
-    .query_to_memory::<Dag<Frozen>>(query, vars, settings)
-    .await?;
-
-let working: Dag<Mutable> = db
-    .query_to_memory::<Dag<Mutable>>(query, vars, write_back_settings)
-    .await?;
+```rust,ignore
+let view = graph_ref.read(&transaction)?;
+let graph = query_to_memory::<Dag<Frozen>, _>(&view)?;
+let working = query_to_memory::<Dag<Mutable>, _>(&view)?;
 ```
 
-- Загрузка выполняет запрос на одном `SnapshotId`, в два прохода материализует атомы и
-  инцидентность, проверяет constraint `T`, строит нужную storage family и source mapping.
+- Загрузка читает один transaction snapshot, материализует атомы, generic incidence,
+  nested/transition graphs, проверяет constraint `T` и строит нужную storage family.
 - После успешной загрузки `GraphReadView<'tx>` закрывается. Возвращаемый граф не зависит от
   доступности исторического disk snapshot.
 - `T<Frozen>` не содержит dirty-set и flush API.
@@ -921,13 +925,14 @@ transaction spill `begin_tx` не пишет WAL.
 
 ## 13. Индексы в исполнении
 
-Единый интерфейс `Index` (`disk_storage_spec.md` §20.1): `insert`, `delete`, `lookup(key) -> [DiskAtomRef]`, `range(lo, hi, incl) -> Iterator<DiskAtomRef>`, `rebuild(source)`, `status()`.
+Текущий internal API (`disk_storage_spec.md` §20.1) минимален: bulk build, exact lookup и bounded
+range scan. Public trait с единственной реализацией не вводится.
 
 ### 13.1. Типы индексов
 
 | Тип (GrynQL §9.6)  | On-disk (disk-spec §20)       | Применение в исполнении                        |
 |--------------------|-------------------------------|------------------------------------------------|
-| primary (implicit) | B+tree `pk_<table_id>.fgidx`  | `RecordId → DiskAtomRef` (§10.3)               |
+| primary (implicit) | graph-wide `primary.fgidx`    | `RecordId → DiskAtomRef` (§10.3)               |
 | label (implicit)   | `lbl_node/edge_<id>.fgidx`    | `Scan` по метке, `tv::V([labels])`             |
 | standard / unique  | B+tree (order-preserving key) | `IndexScan`, точечный/range-lookup, uniqueness |
 | count              | одностраничный счётчик        | `count() … GROUP ALL` без скана                |
@@ -941,21 +946,35 @@ transaction spill `begin_tx` не пишет WAL.
 
 ### 13.2. Использование планировщиком
 
-Планировщик заменяет `TableScan` на `IndexScan` при выигрыше по кардинальности; при нескольких индексах выбирает наименьшую кардинальность (§10.3 gql_spec). `WITH INDEX @i` — принудительно; `WITH NOINDEX` — table scan. Adjacency-обход (`out/in/both`) идёт через inline+overflow (§10.4), а не через отдельный индекс — smežность встроена в hot-slot.
+Windows sync vertical slice извлекает scalar constraints только из конъюнкции `AND`: single-field
+index обслуживает equality/range, самый широкий полностью покрытый equality composite — exact
+lookup. Index возвращает candidates; затем обычный executor повторно проверяет полный predicate и
+регистрирует тот же SSI predicate, поэтому access path не меняет семантику. Неподдержанный prefix,
+отсутствующий/несовместимый specialized index или transaction-private graph write корректно
+деградирует к primary table scan. Cost model и `WITH INDEX` относятся к последующему planner
+срезу. Adjacency-обход идёт через inline+overflow, а не через отдельный индекс.
 
 ### 13.3. Консистентность и обслуживание
 
-- Primary/secondary/count/fulltext — транзакционно-консистентны (обновляются в той же транзакции: WAL `IndexInsert/Delete` + страница).
+- Primary и scalar standard/unique транзакционно-консистентны: immutable side-files становятся
+  достижимы только вместе с новым graph/catalog поколением. Unique проверяется до publication.
+- Incremental `IndexInsert/Delete`, count/fulltext и background maintenance в текущий срез не
+  входят; indexed graph write пока перестраивает COW-поколение целиком.
 - HNSW/fulltext — опционально eventually-consistent (§19.1 gql_spec).
 - **`DEFER`** — обновление откладывается в фоновую очередь (`IndexPendingQueue`), eventual consistency; несовместимо с `UNIQUE`.
 - **`CONCURRENTLY`** — двухфазная постройка без блокировки таблицы: initial (индексация существующих; новые изменения копятся как `pending`) → update (обработка pending); статус (`building_initial`/`building_update`/`ready`/`error`) виден через `INFO FOR INDEX` (§9.6 gql_spec).
 - **`REBUILD INDEX`** — перестройка (актуально для HNSW после многих обновлений).
 
-Индекс тоже MVCC-aware: `(index entry, ts)`; видимость записи индекса согласована со снимком (§17 gql_spec).
+В текущем immutable-generation пути entry не хранит отдельный timestamp: snapshot разрешает
+видимый catalog root/DataFileId, и всё дерево принадлежит этому commit. Это и обеспечивает MVCC
+видимость без per-entry metadata.
 
 **Разделение ролей `DEFER` и bulk-сборки.** `DEFER` переносит ту же построчную работу в фон — это оптимизация **малой** дельты, а не замена массовому пути: на загрузке в сотни миллионов строк он даёт очередь того же порядка. Поэтому очередь ограничена `FG_INDEX_PENDING_MAX`, а при переполнении происходит эскалация: очередь сбрасывается, индекс помечается `stale`, планируется полная bulk-пересборка. Это crash-safe по построению — устаревший индекс всё равно строится заново из базовых данных, поэтому персистентная очередь (которая незаметно превратилась бы в L0 LSM-дерева) не нужна.
 
 ### 13.4. Bulk-путь построения индексов
+
+Оставшаяся часть §13.3 и этот подраздел задают целевой advanced-index pipeline; во Windows sync
+vertical slice реализован только in-memory sort + bottom-up packer + durable side-file generation.
 
 Построчное сопровождение — правильный steady state для read-heavy нагрузки на NVMe (прецеденты-предостережения: GIN `fastupdate` и InnoDB change buffer решали проблему медленных случайных чтений на HDD, которой здесь нет). Отдельный **bulk-путь** нужен для другого сценария — загрузки и пересборки.
 

@@ -20,16 +20,18 @@ mod superblock;
 mod types;
 mod wal;
 
-pub(crate) use store::{
+pub use store::{
 	LocalCommitGraph,
 	LocalCommitResult,
 	LocalCommitTable,
 	LocalCommitTableField,
+	LocalCommitTableIndex,
 	LocalDatabaseSnapshot,
 	LocalEdgeRead,
 	LocalGraph,
 	LocalGraphView,
 	LocalNodeRead,
+	LocalQueryAtom,
 	LocalReadTransaction,
 	LocalStore,
 };

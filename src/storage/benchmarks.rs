@@ -41,6 +41,8 @@ const DEFAULT_POOL_PAGES: usize = 4096;
 const DATASET_POOL_MULTIPLIER: usize = 4;
 /// Number of independently created files measured for every result.
 const DEFAULT_REPETITIONS: usize = 3;
+/// Maximum sparse-miss sample size relative to the configured pool.
+const SPARSE_SAMPLE_POOL_MULTIPLIER: usize = 4;
 /// Number of complete oversized-working-set passes.
 const WORKING_SET_PASSES: usize = 2;
 /// Resident-set passes used for stable hit distributions.
@@ -71,6 +73,8 @@ const MAX_CALIBRATED_P99_RATIO: f64 = 1.25;
 const CALIBRATION_DATASET_MIB: usize = 256;
 /// Candidate extent sizes required by the stage-2 plan.
 const BATCH_CANDIDATE_KIB: [usize; 5] = [16, 64, 256, 1024, 2048];
+/// Rotates SSD temperature/GC position across calibration candidates.
+const BATCH_CANDIDATE_ORDERS: [[usize; 5]; 3] = [[0, 1, 2, 3, 4], [4, 2, 0, 3, 1], [3, 1, 4, 2, 0]];
 /// Largest calibrated extent, also the minimum calibration dataset.
 const MAX_BATCH_BYTES: usize = 2048 * KIBIBYTE;
 /// Nearest-rank percentile denominator.
@@ -79,6 +83,9 @@ const PERCENTILE_DENOMINATOR: usize = 100;
 const RESIDENT_WORKLOAD: &str = "resident hit";
 /// Stable sparse-random workload label.
 const SPARSE_RANDOM_WORKLOAD: &str = "sparse random QD1";
+/// Disjoint page offset used to pre-initialize every pool frame before sparse
+/// misses.
+const SPARSE_PRELOAD_PAGE_OFFSET: u64 = 1;
 /// Stable full-random workload label.
 const RANDOM_FULL_WORKLOAD: &str = "random full coverage";
 /// Stable scalar-scan workload label.
@@ -129,8 +136,8 @@ impl ReadBackend {
 /// Rotating orders used by successive repetitions.
 const READ_BACKEND_ORDERS: [[ReadBackend; 4]; 3] = [
 	[ReadBackend::RawDirect, ReadBackend::PooledDirect, ReadBackend::Buffered, ReadBackend::Mmap],
-	[ReadBackend::Mmap, ReadBackend::Buffered, ReadBackend::PooledDirect, ReadBackend::RawDirect],
-	[ReadBackend::Buffered, ReadBackend::RawDirect, ReadBackend::Mmap, ReadBackend::PooledDirect],
+	[ReadBackend::Mmap, ReadBackend::RawDirect, ReadBackend::Buffered, ReadBackend::PooledDirect],
+	[ReadBackend::PooledDirect, ReadBackend::Buffered, ReadBackend::Mmap, ReadBackend::RawDirect],
 ];
 
 /// Independently measured durable write paths.
@@ -161,8 +168,8 @@ impl WriteBackend {
 /// Rotating durable-write orders.
 const WRITE_BACKEND_ORDERS: [[WriteBackend; 3]; 3] = [
 	[WriteBackend::Direct, WriteBackend::Buffered, WriteBackend::Mmap],
-	[WriteBackend::Mmap, WriteBackend::Buffered, WriteBackend::Direct],
-	[WriteBackend::Buffered, WriteBackend::Direct, WriteBackend::Mmap],
+	[WriteBackend::Mmap, WriteBackend::Direct, WriteBackend::Buffered],
+	[WriteBackend::Buffered, WriteBackend::Mmap, WriteBackend::Direct],
 ];
 
 /// Whether useful work is a marker lookup or complete page processing.
@@ -491,7 +498,7 @@ impl BufferedPageSource {
 			checked_page_offset(first)?,
 		)?;
 		for (page_no, page) in pages.iter().copied().zip(output) {
-			let header = page.validate_mut(page_no)?;
+			let header = page.validate(page_no)?;
 			validate_benchmark_version(page_no, header.page_lsn())?;
 			black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
 		}
@@ -554,6 +561,8 @@ fn read_workloads(config: &BenchmarkConfig) -> Result<Vec<ReadWorkload>, Box<dyn
 		.map_err(|source| conversion_error("pool page count does not fit u64", source))?;
 	let resident_preload = sequential_order(resident_pages)?;
 	let resident_order = random_order(resident_pages)?.repeat(RESIDENT_PASSES);
+	let sparse_order = sparse_random_order(config.dataset_pages, config.pool_pages)?;
+	let sparse_preload = sparse_preload_order(&sparse_order, config.dataset_pages)?;
 	let random_full = random_order(config.dataset_pages)?;
 	let working_pages = config
 		.pool_pages
@@ -589,8 +598,8 @@ fn read_workloads(config: &BenchmarkConfig) -> Result<Vec<ReadWorkload>, Box<dyn
 		ReadWorkload {
 			name: SPARSE_RANDOM_WORKLOAD,
 			page_count: config.dataset_pages,
-			preload: Vec::new(),
-			order: sparse_random_order(config.dataset_pages, config.pool_pages)?,
+			preload: sparse_preload,
+			order: sparse_order,
 			extent_pages: scalar_extent,
 			unit: MetricUnit::Page,
 			hot_accesses: 0,
@@ -991,25 +1000,35 @@ fn percentile(sorted: &[Duration], numerator: usize) -> io::Result<Duration> {
 fn calibrate_batch_size(config: &BenchmarkConfig) -> Result<BatchCalibration, Box<dyn Error>> {
 	let calibration_pages = calibration_page_count(config.dataset_pages)?;
 	let order = sequential_order(calibration_pages)?;
-	let mut candidates = Vec::with_capacity(BATCH_CANDIDATE_KIB.len());
-	for kib in BATCH_CANDIDATE_KIB {
-		let bytes = kib
-			.checked_mul(KIBIBYTE)
-			.ok_or_else(|| io::Error::other("calibration extent byte count overflow"))?;
-		if !bytes.is_multiple_of(PAGE_SIZE) {
-			return Err(io::Error::other("calibration extent is not page-aligned").into());
-		}
-		let extent_pages = bytes / PAGE_SIZE;
-		let mut samples = Vec::with_capacity(config.repetitions);
-		for _ in 0..config.repetitions {
+	let mut sample_sets: [Vec<Metrics>; BATCH_CANDIDATE_KIB.len()] =
+		std::array::from_fn(|_index| Vec::with_capacity(config.repetitions));
+	for repetition in 0..config.repetitions {
+		for candidate in BATCH_CANDIDATE_ORDERS[repetition % BATCH_CANDIDATE_ORDERS.len()] {
+			let kib = BATCH_CANDIDATE_KIB[candidate];
+			let bytes = kib
+				.checked_mul(KIBIBYTE)
+				.ok_or_else(|| io::Error::other("calibration extent byte count overflow"))?;
+			if !bytes.is_multiple_of(PAGE_SIZE) {
+				return Err(io::Error::other("calibration extent is not page-aligned").into());
+			}
+			let extent_pages = bytes / PAGE_SIZE;
 			let path = BenchPath::new("calibration")?;
 			create_dataset(path.as_path(), calibration_pages)?;
 			let direct = DirectFile::open_read_only(path.as_path())?;
 			let mut scratch = aligned_pages(extent_pages);
-			samples.push(measure_order(&order, extent_pages, MetricUnit::Page, |pages| {
-				read_raw_direct_extent(&direct, pages, &mut scratch)
-			})?);
+			sample_sets[candidate].push(measure_order(
+				&order,
+				extent_pages,
+				MetricUnit::Page,
+				|pages| read_raw_direct_extent(&direct, pages, &mut scratch),
+			)?);
 		}
+	}
+	let mut candidates = Vec::with_capacity(BATCH_CANDIDATE_KIB.len());
+	for (kib, mut samples) in BATCH_CANDIDATE_KIB.into_iter().zip(sample_sets) {
+		let bytes = kib
+			.checked_mul(KIBIBYTE)
+			.ok_or_else(|| io::Error::other("calibration extent byte count overflow"))?;
 		samples.sort_unstable_by_key(|metrics| metrics.elapsed);
 		candidates.push(CalibrationResult {
 			bytes,
@@ -1285,15 +1304,41 @@ fn random_order(page_count: u64) -> io::Result<Vec<PageNo>> {
 
 /// Creates one widely spaced random QD1 sample across the full file.
 fn sparse_random_order(page_count: u64, pool_pages: NonZeroUsize) -> io::Result<Vec<PageNo>> {
-	let sample_count = u64::try_from(pool_pages.get())
+	let pool_page_count = u64::try_from(pool_pages.get())
 		.map_err(|source| conversion_error("sparse sample count does not fit u64", source))?;
-	if page_count < sample_count {
-		return Err(io::Error::other("dataset is smaller than sparse sample"));
+	let desired_sample_count = pool_pages
+		.get()
+		.checked_mul(SPARSE_SAMPLE_POOL_MULTIPLIER)
+		.ok_or_else(|| io::Error::other("sparse sample count overflow"))?;
+	let desired_sample_count = u64::try_from(desired_sample_count)
+		.map_err(|source| conversion_error("sparse sample count does not fit u64", source))?;
+	let minimum_page_count = pool_page_count
+		.checked_mul(2)
+		.ok_or_else(|| io::Error::other("sparse minimum dataset size overflow"))?;
+	if page_count < minimum_page_count {
+		return Err(io::Error::other("dataset is too small for disjoint sparse preload"));
 	}
+	let sample_count = desired_sample_count.min(page_count / 2);
 	let stride = page_count / sample_count;
 	let mut pages = (0..sample_count).map(|index| PageNo::new(index * stride)).collect::<Vec<_>>();
 	shuffle(&mut pages, RANDOM_SEED ^ page_count)?;
 	Ok(pages)
+}
+
+/// Builds a disjoint warm-up set so sparse misses measure frame reuse, not
+/// first-touch allocation.
+fn sparse_preload_order(order: &[PageNo], page_count: u64) -> io::Result<Vec<PageNo>> {
+	order
+		.iter()
+		.map(|page_no| {
+			page_no
+				.get()
+				.checked_add(SPARSE_PRELOAD_PAGE_OFFSET)
+				.filter(|page_no| *page_no < page_count)
+				.map(PageNo::new)
+				.ok_or_else(|| io::Error::other("sparse preload page is outside the dataset"))
+		})
+		.collect()
 }
 
 /// Deterministically shuffles one page vector.
@@ -1747,6 +1792,75 @@ mod tests {
 			for backend in ReadBackend::ALL {
 				assert_eq!(order.iter().filter(|candidate| **candidate == backend).count(), 1);
 			}
+		}
+		let read_position_sum = |backend| {
+			READ_BACKEND_ORDERS
+				.iter()
+				.map(|order| {
+					order
+						.iter()
+						.position(|candidate| *candidate == backend)
+						.map_or(0, |index| index + 1)
+				})
+				.sum::<usize>()
+		};
+		assert_eq!(
+			read_position_sum(ReadBackend::RawDirect),
+			read_position_sum(ReadBackend::PooledDirect)
+		);
+
+		for order in WRITE_BACKEND_ORDERS {
+			for backend in WriteBackend::ALL {
+				assert_eq!(order.iter().filter(|candidate| **candidate == backend).count(), 1);
+			}
+		}
+		let write_position_sum = |backend| {
+			WRITE_BACKEND_ORDERS
+				.iter()
+				.map(|order| {
+					order
+						.iter()
+						.position(|candidate| *candidate == backend)
+						.map_or(0, |index| index + 1)
+				})
+				.sum::<usize>()
+		};
+		assert_eq!(
+			write_position_sum(WriteBackend::Direct),
+			write_position_sum(WriteBackend::Mmap)
+		);
+	}
+
+	#[test]
+	fn sparse_preload_is_disjoint_and_in_bounds() -> io::Result<()> {
+		let pool_pages =
+			NonZeroUsize::new(4).ok_or_else(|| io::Error::other("test pool must be non-zero"))?;
+		let order = sparse_random_order(64, pool_pages)?;
+		let preload = sparse_preload_order(&order, 64)?;
+		assert_eq!(order.len(), 16);
+		assert_eq!(preload.len(), order.len());
+		assert!(preload.iter().all(|page_no| page_no.get() < 64));
+		assert!(preload.iter().all(|page_no| !order.contains(page_no)));
+		Ok(())
+	}
+
+	#[test]
+	fn batch_orders_measure_every_candidate_once() {
+		for order in BATCH_CANDIDATE_ORDERS {
+			for candidate in 0..BATCH_CANDIDATE_KIB.len() {
+				assert_eq!(order.iter().filter(|entry| **entry == candidate).count(), 1);
+			}
+		}
+		let position_sum = |candidate| {
+			BATCH_CANDIDATE_ORDERS
+				.iter()
+				.map(|order| {
+					order.iter().position(|entry| *entry == candidate).map_or(0, |index| index + 1)
+				})
+				.sum::<usize>()
+		};
+		for candidate in 1..BATCH_CANDIDATE_KIB.len() {
+			assert_eq!(position_sum(candidate), position_sum(0));
 		}
 	}
 

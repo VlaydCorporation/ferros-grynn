@@ -17,7 +17,12 @@ use std::{
 
 use parking_lot::{Condvar, Mutex};
 use rapidhash::{HashMapExt, HashSetExt, RapidHashMap, RapidHashSet};
-use rayon::prelude::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::prelude::{
+	IndexedParallelIterator,
+	IntoParallelRefIterator,
+	IntoParallelRefMutIterator,
+	ParallelIterator,
+};
 
 use super::{
 	page::{AlignedPage, PAGE_SIZE, PageHeader, PageLsn, PageNo},
@@ -615,11 +620,13 @@ where
 		loader(first_key, extent_pages)?;
 		let extent_reservations = &mut reservations[extent_start..extent_end];
 		if extent_len >= PARALLEL_VALIDATION_MIN_PAGES {
-			extent_reservations.par_iter_mut().zip(extent_pages.par_iter_mut()).try_for_each(
+			extent_reservations.par_iter_mut().zip(extent_pages.par_iter()).try_for_each(
 				|(reservation, loaded_page)| install_loaded_page(reservation, loaded_page),
 			)?;
 		} else {
-			for (reservation, loaded_page) in extent_reservations.iter_mut().zip(extent_pages) {
+			for (reservation, loaded_page) in
+				extent_reservations.iter_mut().zip(extent_pages.iter())
+			{
 				install_loaded_page(reservation, loaded_page)?;
 			}
 		}
@@ -631,9 +638,9 @@ where
 /// Validates one loaded image and copies it into its permanent frame.
 fn install_loaded_page(
 	reservation: &mut BatchLoadReservation,
-	loaded_page: &mut AlignedPage,
+	loaded_page: &AlignedPage,
 ) -> FerrosGrynnResult<()> {
-	let header = loaded_page.validate_mut(reservation.key.page_no())?;
+	let header = loaded_page.validate(reservation.key.page_no())?;
 	validate_loaded_header(reservation.key, header)?;
 	let frame = Arc::get_mut(&mut reservation.page).ok_or_else(|| {
 		FerrosGrynnError::storage_io_failure("buffer-pool batch frame was not uniquely owned")

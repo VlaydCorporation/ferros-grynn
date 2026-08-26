@@ -106,7 +106,7 @@ impl DirectFile {
 		page: &mut AlignedPage,
 	) -> FerrosGrynnResult<PageHeader> {
 		self.read_page_raw(page_no, page)?;
-		page.validate_mut(page_no)
+		page.validate(page_no)
 	}
 
 	/// Reads one complete page without decoding its header or checksum.
@@ -157,7 +157,7 @@ impl DirectFile {
 						"batch page number overflow",
 					)
 				})?;
-			headers.push(page.validate_mut(page_no)?);
+			headers.push(page.validate(page_no)?);
 		}
 		Ok(headers)
 	}

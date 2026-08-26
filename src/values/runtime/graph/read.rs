@@ -282,6 +282,15 @@ pub trait NodeRead {
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>>;
 	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>>;
 
+	fn inner_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
+		if self.inner_graph_ref()?.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"this graph reader exposes nested metadata but not nested graph contents",
+			));
+		}
+		Ok(None)
+	}
+
 	fn atom_ref(&self) -> FerrosGrynnResult<AtomRef> {
 		Ok(AtomRef::new(AtomKind::Node, self.record_id()?.into_owned()))
 	}
@@ -317,6 +326,10 @@ impl NodeRead for NodeView<'_> {
 
 	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
 		Ok(self.inner_graph.and_then(GraphRead::graph_ref).map(Cow::Borrowed))
+	}
+
+	fn inner_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
+		Ok(self.inner_graph.map(Cow::Borrowed))
 	}
 }
 
@@ -404,6 +417,15 @@ pub trait EdgeRead {
 	fn weight(&self) -> Option<Number>;
 	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>>;
 
+	fn transition_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
+		if self.transition_graph_ref()?.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"this graph reader exposes transition metadata but not transition graph contents",
+			));
+		}
+		Ok(None)
+	}
+
 	fn atom_ref(&self) -> FerrosGrynnResult<AtomRef> {
 		Ok(AtomRef::new(AtomKind::Edge, self.record_id()?.into_owned()))
 	}
@@ -447,6 +469,10 @@ impl EdgeRead for EdgeView<'_> {
 
 	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
 		Ok(self.transition_graph.and_then(GraphRead::graph_ref).map(Cow::Borrowed))
+	}
+
+	fn transition_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
+		Ok(self.transition_graph.map(Cow::Borrowed))
 	}
 }
 
@@ -510,11 +536,11 @@ pub trait GraphRead {
 	}
 
 	fn atom_id(&self, reference: &AtomRef) -> FerrosGrynnResult<Option<AtomId>> {
-		let mut ids = match reference.kind() {
+		let ids = match reference.kind() {
 			AtomKind::Node => self.node_ids()?,
 			AtomKind::Edge => return self.edge_id(reference),
 		};
-		while let Some(id) = ids.next() {
+		for id in ids {
 			let id = id?;
 			if let Some(node) = self.node(id)?
 				&& node.record_id()?.as_ref() == reference.id()
@@ -526,8 +552,7 @@ pub trait GraphRead {
 	}
 
 	fn edge_id(&self, reference: &AtomRef) -> FerrosGrynnResult<Option<AtomId>> {
-		let mut ids = self.edge_ids()?;
-		while let Some(id) = ids.next() {
+		for id in self.edge_ids()? {
 			let id = id?;
 			if let Some(edge) = self.edge(id)?
 				&& edge.record_id()?.as_ref() == reference.id()

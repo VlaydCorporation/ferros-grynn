@@ -11,6 +11,7 @@
 //! Crate-private storage DTOs and runtime conversion contexts.
 
 pub mod codec;
+mod order_key;
 
 use std::{
 	collections::BTreeMap,
@@ -23,6 +24,7 @@ use jiff::{
 	Timestamp,
 	tz::{Offset, TimeZone},
 };
+pub use order_key::{encode_index_key, validate_index_type};
 use rust_decimal::Decimal;
 
 use super::runtime::{
@@ -594,7 +596,10 @@ impl StorageDateTime {
 }
 
 impl StorageRecordId {
-	fn from_runtime(value: RecordId, context: &mut EncodeContext) -> FerrosGrynnResult<Self> {
+	pub(crate) fn from_runtime(
+		value: RecordId,
+		context: &mut EncodeContext,
+	) -> FerrosGrynnResult<Self> {
 		let (table, part) = value.into_parts();
 		let table_id = context.tables.intern(table, 0, u32::MAX)?;
 		let part = match part {
@@ -755,6 +760,11 @@ impl EncodeContext {
 		self.tables.names()
 	}
 
+	/// Resolves one table identifier while constructing an order key.
+	pub(crate) fn table_name(&self, id: u32) -> Option<&Text> {
+		self.tables.resolve(id, 0)
+	}
+
 	/// Registers one IANA time-zone name in its persisted identifier order.
 	pub(crate) fn register_time_zone_name(&mut self, name: Text) -> FerrosGrynnResult<u32> {
 		self.time_zones.intern(name, 1, MAX_IANA_TIME_ZONE_ID)
@@ -775,6 +785,11 @@ impl EncodeContext {
 		self.atoms_to_disk.insert(runtime.clone(), disk);
 		self.atoms_from_disk.insert(disk, runtime);
 		Ok(())
+	}
+
+	/// Resolves a registered disk address to its stable runtime identity.
+	pub(crate) fn registered_atom(&self, disk: DiskAtomRef) -> Option<&AtomRef> {
+		self.atoms_from_disk.get(&disk)
 	}
 
 	pub fn register_graph(

@@ -20,55 +20,60 @@ use crate::{
 		LocalCommitResult,
 		LocalCommitTable,
 		LocalCommitTableField,
+		LocalCommitTableIndex,
 		LocalDatabaseSnapshot,
 		LocalEdgeRead,
 		LocalGraph,
 		LocalGraphView,
 		LocalNodeRead,
+		LocalQueryAtom,
 		LocalReadTransaction,
 		LocalStore,
 	},
-	values::runtime::{
-		PropertyDictionary,
-		PropertyKeyId,
-		PropertyMap,
-		RecordId,
-		Text,
-		Type,
-		Uuid,
-		Value,
-		graph::{
-			AtomId,
-			AtomKind,
-			AtomRef,
-			Dag,
-			DirtyTarget,
-			EdgeDirection,
-			EdgeEndpoint,
-			EdgeRead,
-			EdgeTopology,
-			EdgeView,
-			Forest,
-			Frozen,
-			Graph,
-			GraphKind,
-			GraphMut,
-			GraphRead,
-			GraphRef,
-			GraphRefReader,
-			GraphStorageMode,
-			Hypergraph,
-			MaterializedGraph,
-			Metagraph,
-			Mutable,
-			NodeRead,
-			NodeView,
-			RootedTree,
-			SnapshotId,
-			Tree,
-			TreeOrientation,
-			merge_transaction_graph,
+	values::{
+		runtime::{
+			PropertyDictionary,
+			PropertyKeyId,
+			PropertyMap,
+			RecordId,
+			Text,
+			Type,
+			Uuid,
+			Value,
+			graph::{
+				AtomId,
+				AtomKind,
+				AtomRef,
+				Dag,
+				DirtyTarget,
+				EdgeDirection,
+				EdgeEndpoint,
+				EdgeRead,
+				EdgeTopology,
+				EdgeView,
+				Forest,
+				Frozen,
+				Graph,
+				GraphKind,
+				GraphMut,
+				GraphRead,
+				GraphRef,
+				GraphRefReader,
+				GraphStorageMode,
+				Hypergraph,
+				MaterializedGraph,
+				Metagraph,
+				Mutable,
+				NodeRead,
+				NodeView,
+				RootedTree,
+				SnapshotId,
+				Tree,
+				TreeOrientation,
+				merge_transaction_graph,
+			},
 		},
+		storage::validate_index_type,
 	},
 };
 
@@ -82,6 +87,8 @@ const DEFAULT_BUFFER_POOL_PAGES: usize = 4_096;
 const DEFAULT_CHECKPOINT_DIRTY_PERCENT: u8 = 25;
 /// Default maximum interval between passive checkpoint attempts.
 const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(300);
+/// Reserved table name used for hidden durable nested-graph identities.
+pub(crate) const INTERNAL_NESTED_GRAPH_TABLE: &str = "__fg_nested";
 
 /// Physical I/O strategy selected for one local datastore.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +233,80 @@ pub enum TableKind {
 	Relation,
 }
 
+/// Scalar B+tree uniqueness contract for one table index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TableIndexKind {
+	/// One key may reference multiple atoms.
+	Standard,
+	/// One key may reference at most one atom.
+	Unique,
+}
+
+/// Declarative scalar B+tree attached to one table schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableIndex {
+	/// Table-local index name.
+	name: Text,
+	/// Whether duplicate keys are permitted.
+	kind: TableIndexKind,
+	/// Indexed fields in composite-key order.
+	fields: Vec<Text>,
+}
+
+impl TableIndex {
+	/// Creates an index definition; field existence is checked by
+	/// [`TableSchema::with_index`].
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-argument error when the index name or field list is
+	/// empty, names the synthetic `id` column, or repeats a field.
+	pub fn new<IntoText, Fields>(
+		name: IntoText,
+		kind: TableIndexKind,
+		fields: Fields,
+	) -> FerrosGrynnResult<Self>
+	where
+		IntoText: Into<Text>,
+		Fields: IntoIterator,
+		Fields::Item: Into<Text>,
+	{
+		let name = name.into();
+		let fields = fields.into_iter().map(Into::into).collect::<Vec<_>>();
+		let mut unique = BTreeSet::new();
+		if name.is_empty()
+			|| fields.is_empty()
+			|| fields.iter().any(|field| {
+				field.is_empty() || field.as_str() == "id" || !unique.insert(field.clone())
+			}) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"an index requires a non-empty name and unique explicit table fields",
+			));
+		}
+		Ok(Self {
+			name,
+			kind,
+			fields,
+		})
+	}
+
+	/// Returns the table-local index name.
+	pub const fn name(&self) -> &Text {
+		&self.name
+	}
+
+	/// Returns the standard or unique key contract.
+	pub const fn kind(&self) -> TableIndexKind {
+		self.kind
+	}
+
+	/// Returns fields in composite-key order.
+	pub fn fields(&self) -> impl ExactSizeIterator<Item = &Text> {
+		self.fields.iter()
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableField {
 	name: Text,
@@ -257,6 +338,8 @@ pub struct TableSchema {
 	graph: GraphRef,
 	kind: TableKind,
 	fields: Vec<TableField>,
+	/// Scalar indexes in declaration order.
+	indexes: Vec<TableIndex>,
 }
 
 impl TableSchema {
@@ -290,7 +373,34 @@ impl TableSchema {
 			graph,
 			kind,
 			fields,
+			indexes: Vec::new(),
 		})
+	}
+
+	/// Adds one validated scalar B+tree definition.
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-argument error when the name is duplicated, a field
+	/// is absent, or its value type has no stable format-v1 scalar order.
+	pub fn with_index(mut self, index: TableIndex) -> FerrosGrynnResult<Self> {
+		if self.indexes.iter().any(|existing| existing.name == index.name) {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"table '{}' contains duplicate index '{}'",
+				self.name, index.name
+			)));
+		}
+		for name in &index.fields {
+			let field = self.fields.iter().find(|field| field.name == *name).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(format!(
+					"index '{}' references unknown field '{}'",
+					index.name, name
+				))
+			})?;
+			validate_index_type(&field.value_type)?;
+		}
+		self.indexes.push(index);
+		Ok(self)
 	}
 
 	pub const fn name(&self) -> &Text {
@@ -307,6 +417,11 @@ impl TableSchema {
 
 	pub fn fields(&self) -> impl ExactSizeIterator<Item = &TableField> {
 		self.fields.iter()
+	}
+
+	/// Returns scalar indexes in definition order.
+	pub fn indexes(&self) -> impl ExactSizeIterator<Item = &TableIndex> {
+		self.indexes.iter()
 	}
 }
 
@@ -523,6 +638,7 @@ impl DatabaseRoot {
 					"durable table references a graph absent from the recovered root",
 				)
 			})?;
+			let durable_indexes = table.indexes;
 			let fields = table
 				.fields
 				.into_iter()
@@ -541,7 +657,7 @@ impl DatabaseRoot {
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			let name = table.name;
-			let schema = TableSchema {
+			let mut schema = TableSchema {
 				name: name.clone().into(),
 				graph: GraphRef::new(
 					table.graph,
@@ -550,7 +666,28 @@ impl DatabaseRoot {
 				),
 				kind: table.kind,
 				fields,
+				indexes: Vec::new(),
 			};
+			for index in durable_indexes {
+				let field_names = index
+					.fields
+					.iter()
+					.map(|property_key| {
+						schema
+							.fields
+							.iter()
+							.find(|field| field.key.map(PropertyKeyId::get) == Some(*property_key))
+							.map(|field| field.name.clone())
+							.ok_or_else(|| {
+								FerrosGrynnError::invalid_storage_file(
+									"durable scalar index references an unknown table field",
+								)
+							})
+					})
+					.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				schema =
+					schema.with_index(TableIndex::new(index.name, index.kind, field_names)?)?;
+			}
 			if root.tables.insert(name.clone(), Arc::new(schema)).is_some() {
 				return Err(FerrosGrynnError::invalid_storage_file(
 					"durable table catalog contains duplicate names",
@@ -663,6 +800,34 @@ impl StoreInner {
 					graph: schema.graph.id().clone(),
 					kind: schema.kind,
 					fields,
+					indexes: schema
+						.indexes
+						.iter()
+						.map(|index| {
+							let fields = index
+								.fields
+								.iter()
+								.map(|name| {
+									schema
+										.fields
+										.iter()
+										.find(|field| field.name == *name)
+										.and_then(|field| field.key)
+										.map(PropertyKeyId::get)
+										.ok_or_else(|| {
+											FerrosGrynnError::invalid_storage_file(
+												"table index field has no interned property key",
+											)
+										})
+								})
+								.collect::<FerrosGrynnResult<Vec<_>>>()?;
+							Ok(LocalCommitTableIndex {
+								name: index.name.as_str().to_owned(),
+								kind: index.kind,
+								fields,
+							})
+						})
+						.collect::<FerrosGrynnResult<Vec<_>>>()?,
 				})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
@@ -980,6 +1145,31 @@ pub(crate) struct QueryStorageRow {
 	pub(crate) values: Vec<Value>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScalarComparison {
+	/// Exact equality.
+	Equal,
+	/// Strictly less than.
+	Less,
+	/// Less than or equal.
+	LessOrEqual,
+	/// Strictly greater than.
+	Greater,
+	/// Greater than or equal.
+	GreaterOrEqual,
+}
+
+/// One scalar predicate that may be satisfied by a durable table index.
+#[derive(Debug, Clone)]
+pub(crate) struct ScalarIndexConstraint {
+	/// Query row column; zero is the synthetic record id.
+	pub(crate) column: usize,
+	/// Ordered comparison to apply.
+	pub(crate) comparison: ScalarComparison,
+	/// Runtime scalar encoded into an order-preserving index key.
+	pub(crate) value: Value,
+}
+
 pub(crate) struct QuerySnapshot {
 	root: Arc<DatabaseRoot>,
 }
@@ -1018,6 +1208,8 @@ struct GraphWrite {
 	base: Option<Arc<MaterializedGraph>>,
 	base_ts: u64,
 	value: Option<MutableGraphValue>,
+	/// Rebuilds durable secondary indexes even when graph pages are unchanged.
+	force_persist: bool,
 }
 
 enum MutableGraphValue {
@@ -1587,6 +1779,11 @@ impl Transaction {
 	) -> FerrosGrynnResult<GraphRef> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
+		if id.table() == INTERNAL_NESTED_GRAPH_TABLE {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"RecordId table '{INTERNAL_NESTED_GRAPH_TABLE}' is reserved for nested graphs"
+			)));
+		}
 		if self.visible_graph_kind(&id).is_some() {
 			return Err(FerrosGrynnError::graph_already_exists(id.to_string()));
 		}
@@ -1596,6 +1793,7 @@ impl Transaction {
 			base: None,
 			base_ts: self.read_root().commit_ts,
 			value: Some(value),
+			force_persist: false,
 		});
 		Ok(GraphRef::new(id, kind, self.store.inner.graph_storage_mode()))
 	}
@@ -1678,6 +1876,12 @@ impl Transaction {
 				))
 			})?);
 		}
+		if !schema.indexes.is_empty() {
+			self.ensure_graph_write(&schema.graph)?;
+			if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
+				write.force_persist = true;
+			}
+		}
 		self.tables.insert(schema.name.as_str().to_owned(), Some(schema));
 		Ok(())
 	}
@@ -1685,8 +1889,13 @@ impl Transaction {
 	pub fn remove_table(&mut self, name: &str) -> FerrosGrynnResult<()> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
-		if self.visible_table(name).is_none() {
-			return Err(FerrosGrynnError::table_does_not_exist(name));
+		let schema =
+			self.visible_table(name).ok_or_else(|| FerrosGrynnError::table_does_not_exist(name))?;
+		if !schema.indexes.is_empty() {
+			self.ensure_graph_write(&schema.graph)?;
+			if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
+				write.force_persist = true;
+			}
 		}
 		self.tables.insert(name.to_owned(), None);
 		Ok(())
@@ -1917,6 +2126,7 @@ impl Transaction {
 			base: Some(base.clone()),
 			base_ts: root.commit_ts,
 			value: Some(MutableGraphValue::from_frozen(&base)?),
+			force_persist: false,
 		});
 		Ok(())
 	}
@@ -2134,7 +2344,7 @@ impl Transaction {
 		} else {
 			all_dirty(&value.snapshot())?
 		};
-		if dirty.is_empty() && write.base.is_some() {
+		if dirty.is_empty() && write.base.is_some() && !write.force_persist {
 			return Ok(());
 		}
 
@@ -2223,6 +2433,7 @@ impl Transaction {
 		&self,
 		snapshot: &QuerySnapshot,
 		table: &str,
+		constraints: &[ScalarIndexConstraint],
 	) -> FerrosGrynnResult<Vec<QueryStorageRow>> {
 		self.ensure_live()?;
 		let schema = self.query_table(snapshot, table)?;
@@ -2247,21 +2458,66 @@ impl Transaction {
 				})?;
 				let transaction = self.local_snapshot()?;
 				let mut rows = Vec::new();
-				local.visit_table(
+				let collect = |atom: LocalQueryAtom, rows: &mut Vec<QueryStorageRow>| {
+					rows.push(row_from_properties(
+						atom.atom_id,
+						&atom.record_id,
+						&atom.properties,
+						&schema,
+					));
+					Ok(())
+				};
+				let equalities = constraints
+					.iter()
+					.filter(|constraint| matches!(constraint.comparison, ScalarComparison::Equal))
+					.filter_map(|constraint| {
+						constraint
+							.column
+							.checked_sub(1)
+							.and_then(|column| schema.fields.get(column))
+							.and_then(|field| field.key)
+							.map(|key| (key, &constraint.value))
+					})
+					.collect::<Vec<_>>();
+				let mut indexed = local.visit_table_composite_index(
 					&transaction,
 					graph,
 					schema.name.as_str(),
 					schema.kind,
-					|atom| {
-						rows.push(row_from_properties(
-							atom.atom_id,
-							&atom.record_id,
-							&atom.properties,
-							&schema,
-						));
-						Ok(())
-					},
+					&equalities,
+					|atom| collect(atom, &mut rows),
 				)?;
+				for constraint in constraints {
+					if indexed {
+						break;
+					}
+					let field = constraint
+						.column
+						.checked_sub(1)
+						.and_then(|column| schema.fields.get(column))
+						.and_then(|field| field.key);
+					if let Some(property_key) = field {
+						indexed = local.visit_table_index(
+							&transaction,
+							graph,
+							schema.name.as_str(),
+							schema.kind,
+							property_key,
+							constraint.comparison,
+							&constraint.value,
+							|atom| collect(atom, &mut rows),
+						)?;
+					}
+				}
+				if !indexed {
+					local.visit_table(
+						&transaction,
+						graph,
+						schema.name.as_str(),
+						schema.kind,
+						|atom| collect(atom, &mut rows),
+					)?;
+				}
 				rows.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
 				Ok(rows)
 			}
@@ -2517,6 +2773,13 @@ impl NodeRead for TransactionNodeRead<'_> {
 			Self::Local(node) => node.inner_graph_ref(),
 		}
 	}
+
+	fn inner_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
+		match self {
+			Self::Memory(node) => NodeRead::inner_graph(node),
+			Self::Local(node) => node.inner_graph(),
+		}
+	}
 }
 
 /// Backend-neutral edge read returned by a transaction graph view.
@@ -2579,6 +2842,13 @@ impl EdgeRead for TransactionEdgeRead<'_> {
 		match self {
 			Self::Memory(edge) => EdgeRead::transition_graph_ref(edge),
 			Self::Local(edge) => edge.transition_graph_ref(),
+		}
+	}
+
+	fn transition_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
+		match self {
+			Self::Memory(edge) => EdgeRead::transition_graph(edge),
+			Self::Local(edge) => edge.transition_graph(),
 		}
 	}
 }
@@ -2855,10 +3125,25 @@ fn merge_materialized(
 	reason = "tests fail immediately when compact setup or assertions return an unexpected error"
 )]
 mod tests {
+	use std::ops::Bound;
+
+	use rust_decimal::Decimal;
+
 	use super::*;
 	use crate::values::runtime::{
+		Array,
+		Bytes,
+		DateTime,
+		Duration as ValueDuration,
+		Geometry,
+		Object,
+		Position,
+		Range,
+		Set,
+		Ulid,
 		Value,
-		graph::{EdgeTopology, GraphMut},
+		Vector,
+		graph::{EdgeTopology, GraphMut, QualifiedAtomId, query_to_memory},
 	};
 
 	/// Unique database directory removed after the Windows integration test.
@@ -2995,6 +3280,15 @@ mod tests {
 					TableField::new("name", Type::String),
 					TableField::new("age", Type::Int),
 				])
+				.unwrap()
+				.with_index(
+					TableIndex::new("person_age", TableIndexKind::Standard, ["age"]).unwrap(),
+				)
+				.unwrap()
+				.with_index(
+					TableIndex::new("person_name_age", TableIndexKind::Unique, ["name", "age"])
+						.unwrap(),
+				)
 				.unwrap(),
 			)
 			.unwrap();
@@ -3026,6 +3320,16 @@ mod tests {
 			panic!("SELECT must return an array");
 		};
 		assert_eq!(rows.as_slice(), &[Value::from("Alice"), Value::from("Bob")]);
+		let composite = reopened
+			.execute(
+				"SELECT VALUE id FROM person WHERE name = 'Alice' AND age = 30",
+				&crate::values::Object::new(),
+			)
+			.unwrap();
+		let Value::Array(rows) = composite[0].result.as_ref().unwrap().value() else {
+			panic!("composite-index SELECT must return an array");
+		};
+		assert_eq!(rows.as_slice(), &[Value::from("person:alice".parse::<RecordId>().unwrap())]);
 		let point = reopened
 			.execute("SELECT VALUE name FROM person:alice", &crate::values::Object::new())
 			.unwrap();
@@ -3050,6 +3354,195 @@ mod tests {
 			panic!("updated point SELECT must return an array");
 		};
 		assert_eq!(rows.as_slice(), &[Value::from(31_i64)]);
+	}
+
+	/// Nested graphs, transition graphs and cross-level incidence remain
+	/// readable after recovery and through explicit hybrid materialization.
+	#[cfg(windows)]
+	#[test]
+	fn local_metagraph_round_trips_nested_content_and_cross_level_incidence() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut inner = Graph::<Mutable>::new();
+		let inner_node = inner
+			.add_node_with_id("inner:node".parse().unwrap(), None, PropertyMap::new())
+			.unwrap();
+		let inner_second = inner
+			.add_node_with_id("inner:second".parse().unwrap(), None, PropertyMap::new())
+			.unwrap();
+		let mut transition = Graph::<Mutable>::new();
+		let transition_node = transition
+			.add_node_with_id("transition:node".parse().unwrap(), None, PropertyMap::new())
+			.unwrap();
+		let mut graph = Metagraph::<Mutable>::new();
+		let meta = graph.add_metavertex(inner.freeze(), None, PropertyMap::new()).unwrap();
+		let local = graph.add_node(None, PropertyMap::new()).unwrap();
+		let nested = QualifiedAtomId::new([meta], inner_node).unwrap();
+		let nested_second = QualifiedAtomId::new([meta], inner_second).unwrap();
+		let cross_topology = EdgeTopology::directed(
+			[
+				EdgeEndpoint::Nested(nested.clone()),
+				EdgeEndpoint::Nested(nested_second),
+				EdgeEndpoint::Local(meta),
+			],
+			[EdgeEndpoint::Local(local)],
+		);
+		let cross = graph.add_edge(cross_topology.clone(), None, PropertyMap::new()).unwrap();
+		let connector = graph
+			.add_edge(EdgeTopology::directed([cross], [local]), None, PropertyMap::new())
+			.unwrap();
+		let metaedge = graph
+			.add_metaedge(
+				EdgeTopology::directed([meta], [local]),
+				transition.freeze(),
+				None,
+				PropertyMap::new(),
+			)
+			.unwrap();
+		let mut create = store.begin();
+		let reference = create.create_graph(graph_id("meta"), graph.freeze().into()).unwrap();
+		create.commit().unwrap();
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		let read = store.begin();
+		let view = reference.read(&read).unwrap();
+		let meta_node = view.node(meta).unwrap().unwrap();
+		let inner = meta_node.inner_graph().unwrap().unwrap();
+		assert!(inner.node(inner_node).is_some());
+		assert!(inner.node(inner_second).is_some());
+		assert_eq!(
+			view.edge(cross).unwrap().unwrap().topology().unwrap().as_ref(),
+			&cross_topology
+		);
+		assert_eq!(
+			view.edge(connector).unwrap().unwrap().topology().unwrap().local_binary(),
+			Some((cross, local, EdgeDirection::Directed))
+		);
+		let meta_edge = view.edge(metaedge).unwrap().unwrap();
+		let transition = meta_edge.transition_graph().unwrap().unwrap();
+		assert!(transition.node(transition_node).is_some());
+
+		let hybrid = query_to_memory::<Graph<Frozen>, _>(&view).unwrap();
+		assert_eq!(hybrid.node_count(), 2);
+		assert_eq!(hybrid.edge_count(), 3);
+		assert!(hybrid.node_ids().unwrap().any(|id| {
+			let id = id.unwrap();
+			hybrid.node(id).unwrap().inner_graph().is_some()
+		}));
+		assert!(hybrid.edge_ids().unwrap().any(|id| {
+			let id = id.unwrap();
+			hybrid.edge(id).unwrap().transition_graph().is_some()
+		}));
+	}
+
+	/// One WAL commit publishes two graphs atomically, and a concurrent update
+	/// to another atom in the same hot page merges against that durable image.
+	#[cfg(windows)]
+	#[test]
+	fn local_multi_graph_commit_and_same_page_merge_survive_reopen() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let value = store.intern_property("value").unwrap();
+		let mut first_graph = Graph::<Mutable>::new();
+		let left = first_graph.add_node(None, PropertyMap::new()).unwrap();
+		let right = first_graph.add_node(None, PropertyMap::new()).unwrap();
+		let mut second_graph = Graph::<Mutable>::new();
+		let other = second_graph.add_node(None, PropertyMap::new()).unwrap();
+		let mut create = store.begin();
+		let first_ref =
+			create.create_graph(graph_id("first"), first_graph.freeze().into()).unwrap();
+		let second_ref =
+			create.create_graph(graph_id("second"), second_graph.freeze().into()).unwrap();
+		create.commit().unwrap();
+
+		let transaction_options = TransactionOptions {
+			isolation: IsolationLevel::Snapshot,
+			access: TransactionAccess::ReadWrite,
+		};
+		let mut multi_graph = store.begin_with(transaction_options);
+		let mut same_page = store.begin_with(transaction_options);
+		if let GraphWriteView::Graph(graph) = multi_graph.edit_graph(&first_ref).unwrap() {
+			graph.node_properties_mut(left).unwrap().insert(value, 1_i64);
+		}
+		if let GraphWriteView::Graph(graph) = multi_graph.edit_graph(&second_ref).unwrap() {
+			graph.node_properties_mut(other).unwrap().insert(value, 2_i64);
+		}
+		if let GraphWriteView::Graph(graph) = same_page.edit_graph(&first_ref).unwrap() {
+			graph.node_properties_mut(right).unwrap().insert(value, 3_i64);
+		}
+		multi_graph.commit().unwrap();
+		same_page.commit().unwrap();
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		let read = store.begin();
+		let first = first_ref.read(&read).unwrap();
+		assert_eq!(
+			first.node(left).unwrap().unwrap().properties().unwrap().get(value),
+			Some(&Value::from(1_i64))
+		);
+		assert_eq!(
+			first.node(right).unwrap().unwrap().properties().unwrap().get(value),
+			Some(&Value::from(3_i64))
+		);
+		let second = second_ref.read(&read).unwrap();
+		assert_eq!(
+			second.node(other).unwrap().unwrap().properties().unwrap().get(value),
+			Some(&Value::from(2_i64))
+		);
+	}
+
+	/// A failed unique-index build publishes neither its graph nor schema,
+	/// including after reopening the database.
+	#[cfg(windows)]
+	#[test]
+	fn local_unique_index_violation_rolls_back_publication() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let email = store.intern_property("email").unwrap();
+		let mut graph = Graph::<Mutable>::new();
+		for id in ["first", "second"] {
+			let mut properties = PropertyMap::new();
+			properties.insert(email, "same@example.test");
+			graph
+				.add_node_with_id(format!("person:{id}").parse().unwrap(), None, properties)
+				.unwrap();
+		}
+		let mut create = store.begin();
+		let reference = create.create_graph(graph_id("duplicates"), graph.freeze().into()).unwrap();
+		create
+			.define_table(
+				TableSchema::new("person", reference.clone(), TableKind::Normal, [
+					TableField::new("email", Type::String),
+				])
+				.unwrap()
+				.with_index(
+					TableIndex::new("person_email", TableIndexKind::Unique, ["email"]).unwrap(),
+				)
+				.unwrap(),
+			)
+			.unwrap();
+		assert!(create.commit().is_err());
+		assert!(store.table("person").is_none());
+		assert!(reference.read(&store.begin()).is_err());
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		assert!(store.table("person").is_none());
+		assert!(reference.read(&store.begin()).is_err());
 	}
 
 	/// Stable AtomRef point mutations preserve incidence and properties across
@@ -3224,6 +3717,86 @@ mod tests {
 		);
 	}
 
+	/// Every runtime Value variant admitted by the format-v1 property codec
+	/// survives the complete local commit, recovery and reference-resolution
+	/// path.
+	#[cfg(windows)]
+	#[test]
+	fn local_persistable_value_tags_round_trip() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let all = store.intern_property("all").unwrap();
+		let anchor_record: RecordId = "value:anchor".parse().unwrap();
+		let anchor_ref = AtomRef::new(AtomKind::Node, anchor_record.clone());
+		let point = Position::new([10.0, 20.0]).unwrap();
+		let second = Position::new([-10.0, -20.0]).unwrap();
+		let mut values = Object::new();
+		values.insert("none", Value::None);
+		values.insert("null", Value::Null);
+		values.insert("false", false);
+		values.insert("true", true);
+		values.insert("int", i64::MIN);
+		values.insert("float", 1.5_f64);
+		values.insert("decimal", "-123.45".parse::<Decimal>().unwrap());
+		values.insert("string", "hello");
+		values.insert("bytes", Bytes::from([0_u8, 255]));
+		values.insert(
+			"datetime",
+			"1969-12-31T23:59:59.500000000+00:00[UTC]".parse::<DateTime>().unwrap(),
+		);
+		values.insert("duration", "P1DT2H".parse::<ValueDuration>().unwrap());
+		values.insert("uuid", Uuid::new_v4());
+		values.insert("ulid", Ulid::new());
+		values.insert("record", "person:stored".parse::<RecordId>().unwrap());
+		values.insert("array", Array::new(vec![Value::from(1_i64), Value::from("x")]));
+		values.insert("set", Set::from(vec![1_i64, 2]));
+		values.insert("object", Object::from_iter([("nested", Value::from("value"))]));
+		values.insert(
+			"range",
+			Range::new(Bound::Included(1_i64.into()), Bound::Excluded(3_i64.into())).unwrap(),
+		);
+		values.insert("point", Geometry::Point(point.clone()));
+		values.insert("line", Geometry::LineString(vec![point.clone(), second.clone()]));
+		values.insert("polygon", Geometry::Polygon(vec![vec![point.clone(), second.clone()]]));
+		values.insert("multipoint", Geometry::MultiPoint(vec![point.clone(), second.clone()]));
+		values.insert(
+			"multiline",
+			Geometry::MultiLineString(vec![vec![point.clone(), second.clone()]]),
+		);
+		values.insert(
+			"multipolygon",
+			Geometry::MultiPolygon(vec![vec![vec![point.clone(), second.clone()]]]),
+		);
+		values.insert("geometry_collection", Geometry::Collection(vec![Geometry::Point(point)]));
+		values.insert("vector_f64", Vector::F64(vec![1.0, 2.0]));
+		values.insert("vector_f32", Vector::F32(vec![1.0, 2.0]));
+		values.insert("vector_i64", Vector::I64(vec![1, 2]));
+		values.insert("vector_i32", Vector::I32(vec![1, 2]));
+		values.insert("vector_i16", Vector::I16(vec![1, 2]));
+		values.insert("atom", anchor_ref);
+
+		let mut properties = PropertyMap::new();
+		properties.insert(all, Value::Object(values.clone()));
+		let mut graph = Graph::<Mutable>::new();
+		let anchor = graph.add_node_with_id(anchor_record, None, properties).unwrap();
+		let mut create = store.begin();
+		let reference = create.create_graph(graph_id("values"), graph.freeze().into()).unwrap();
+		create.commit().unwrap();
+		drop(store);
+
+		let store = Datastore::open_local(directory.path(), options).unwrap();
+		let read = store.begin();
+		let view = reference.read(&read).unwrap();
+		assert_eq!(
+			view.node(anchor).unwrap().unwrap().properties().unwrap().get(all),
+			Some(&Value::Object(values))
+		);
+	}
+
 	/// A disk tombstone preserves the allocator generation across reopen, so a
 	/// reused slot cannot make an old transaction-local handle valid again.
 	#[cfg(windows)]
@@ -3393,13 +3966,13 @@ mod tests {
 		}
 		writer.commit().unwrap();
 
-		let old_rows = reader.query_rows(&statement, "person").unwrap();
+		let old_rows = reader.query_rows(&statement, "person", &[]).unwrap();
 		let old_carol =
 			old_rows.iter().find(|row| row.record_id.to_string() == "person:carol").unwrap();
 		assert_eq!(old_carol.values[2], Value::from(17_i64));
 
 		let fresh = reader.query_snapshot().unwrap();
-		let fresh_rows = reader.query_rows(&fresh, "person").unwrap();
+		let fresh_rows = reader.query_rows(&fresh, "person", &[]).unwrap();
 		let fresh_carol =
 			fresh_rows.iter().find(|row| row.record_id.to_string() == "person:carol").unwrap();
 		assert_eq!(fresh_carol.values[2], Value::from(21_i64));
@@ -3448,6 +4021,25 @@ mod tests {
 			view.node(right).unwrap().unwrap().properties().unwrap().get(key),
 			Some(&Value::from(2_i64))
 		);
+	}
+
+	#[test]
+	fn concurrent_writes_to_the_same_atom_fail_first_committer_wins() {
+		let (store, reference, left, _) = seeded_store();
+		let options = TransactionOptions {
+			isolation: IsolationLevel::Snapshot,
+			access: TransactionAccess::ReadWrite,
+		};
+		let mut first = store.begin_with(options);
+		let mut second = store.begin_with(options);
+		if let GraphWriteView::Graph(graph) = first.edit_graph(&reference).unwrap() {
+			graph.node_properties_mut(left).unwrap().insert(0_u32.into(), 1_i64);
+		}
+		if let GraphWriteView::Graph(graph) = second.edit_graph(&reference).unwrap() {
+			graph.node_properties_mut(left).unwrap().insert(0_u32.into(), 2_i64);
+		}
+		first.commit().unwrap();
+		assert_eq!(second.commit().unwrap_err().status().code().to_string(), "FG-40001");
 	}
 
 	#[test]

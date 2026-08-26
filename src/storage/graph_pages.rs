@@ -1217,18 +1217,37 @@ fn validate_edge_slot(value: &EdgeHotSlot) -> FerrosGrynnResult<()> {
 	if !topology_valid {
 		return Err(invalid_page(0, "edge endpoint counts do not match topology"));
 	}
-	validate_inline_count(
-		value.source_count,
-		&value.source_inline,
-		value.source_overflow,
-		"edge source",
-	)?;
-	validate_inline_count(
-		value.target_count,
-		&value.target_inline,
-		value.target_overflow,
-		"edge target",
-	)?;
+	if value.flags.contains(EdgeSlotFlags::CROSS_LEVEL) {
+		validate_cross_level_side(
+			value.source_count,
+			&value.source_inline,
+			value.source_overflow,
+			value.source_graph,
+			value.source_graph_overflow,
+			"edge source",
+		)?;
+		validate_cross_level_side(
+			value.target_count,
+			&value.target_inline,
+			value.target_overflow,
+			value.target_graph,
+			value.target_graph_overflow,
+			"edge target",
+		)?;
+	} else {
+		validate_inline_count(
+			value.source_count,
+			&value.source_inline,
+			value.source_overflow,
+			"edge source",
+		)?;
+		validate_inline_count(
+			value.target_count,
+			&value.target_inline,
+			value.target_overflow,
+			"edge target",
+		)?;
+	}
 	if value.has_transition != value.transition_graph.is_some() {
 		return Err(invalid_page(0, "edge transition bit disagrees with transition graph"));
 	}
@@ -1241,6 +1260,35 @@ fn validate_edge_slot(value: &EdgeHotSlot) -> FerrosGrynnResult<()> {
 		return Err(invalid_page(0, "local edge contains cross-level graph addresses"));
 	}
 	Ok(())
+}
+
+fn validate_cross_level_side(
+	count: u32,
+	inline: &[Option<crate::values::storage::DiskAtomRef>; 2],
+	local_overflow: Option<PageNo>,
+	graph_slot: Option<u32>,
+	graph_overflow: Option<PageNo>,
+	field: &str,
+) -> FerrosGrynnResult<()> {
+	if local_overflow.is_some() {
+		return Err(invalid_page(
+			0,
+			format!("{field} uses a plain overflow for qualified endpoints"),
+		));
+	}
+	if graph_overflow.is_some() {
+		if graph_slot.is_some() || inline.iter().any(Option::is_some) || count == 0 {
+			return Err(invalid_page(
+				0,
+				format!("{field} qualified overflow fields are not canonical"),
+			));
+		}
+		return Ok(());
+	}
+	if count > 2 || graph_slot.is_some() != (count != 0) {
+		return Err(invalid_page(0, format!("{field} inline qualified endpoint count is invalid")));
+	}
+	validate_inline_count(count, inline, None, field)
 }
 
 /// Validates inline population and its required continuation pointer.

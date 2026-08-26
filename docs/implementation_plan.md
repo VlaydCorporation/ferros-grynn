@@ -460,32 +460,33 @@ storage engine относятся к отдельной области B.
   основные алгоритмы `fg-meta`, SCC condensation, PathTrace/Path, exact graph transport и
   LiveGraph conflict protocol. PageManager-backed local adapter подключён в области B; дальнейшая
   data-layout оптимизация остаётся benchmark-driven [plan.md](values_plan.md).
-- **`src/storage`** 🟢 для Windows этапа 4 — `DiskAtomRef(u64)`,
+- **`src/storage`** 🟢 для Windows этапа 5 — `DiskAtomRef(u64)`,
   `QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }`, Direct I/O/BufferPool, frame-WAL,
-  checkpoint/recovery, durable catalogs и lazy graph adapter находятся в production `src/storage`.
-  Unix runtime-port и optional async остаются отдельными gates.
+  checkpoint/recovery, durable catalogs, scalar B+tree, generic incidence, nested graph address
+  spaces и lazy graph adapter находятся в production `src/storage`. Unix runtime-port и
+  optional async остаются отдельными gates.
 
 ### Область B. Страничное хранилище и I/O — P2
 
 Disk-backed режим 2. Зависит от A.
 
 - **Sync Direct I/O + `BufferPool`** 🟡 — `AlignedPage`, безопасный LE page codec, RAII
-  positional exact-read/exact-write и calibrated batch в `src/storage`; Linux `O_DIRECT`, Windows
-  `FILE_FLAG_NO_BUFFERING`, без `O_SYNC`/`WRITE_THROUGH` и buffered fallback. Windows gate пройден,
+  positional exact-read/exact-write и calibrated batch в `src/storage`; Windows использует
+  `FILE_FLAG_NO_BUFFERING`, без `WRITE_THROUGH` и buffered fallback. Windows gate пройден,
   Linux/NVMe реализация/прогон и soak явно отложены до появления тестового окружения и остаются
   release-gate перед выпуском Unix-поддержки.
 - **`SyncPageManager`** 🟢 (§3.3, Windows-first) — snapshot-aware concrete manager объединяет staged/WAL/home
   read path, versioned `BufferPool`, sealed `DataFileId` registry, passive checkpoint и recovery.
   Durable catalog population и Windows local composition подключены; optional Native Async
   добавляется только после полного sync correctness/performance gate.
-- **Disk graph adapter** 🟢 для этапа 4 — `storage/store.rs` открывает immutable поколения как
+- **Disk graph adapter** 🟢 для этапа 5 — `storage/store.rs` открывает immutable поколения как
   transaction-bound `LocalGraphView`: hot-поля читаются через `PageGuard`, primary lookup и scan
-  остаются потоковыми, property heap загружается поздно. Материализация выполняется только перед
-  явной мутацией или `query_to_memory`.
-- **Disk-страницы** 🟢 для первого среза — `NodeHotSlot`/`EdgeHotSlot`, overflow adjacency,
+  остаются потоковыми, property heap загружается поздно, nested/transition graphs разрешаются
+  рекурсивно. Материализация выполняется только перед явной мутацией или `query_to_memory`.
+- **Disk-страницы** 🟢 для Windows sync среза — `NodeHotSlot`/`EdgeHotSlot`, local и cross-level overflow adjacency,
   slotted property heap/large objects, subgraph directory, freelist, label dictionary, primary
-  B+tree и graph statistics имеют checksummed codecs в `src/storage`.
-- **`store.rs`** 🟢 для этапа 4 — публичные `create_local/open_local`, backend-neutral
+  и scalar B+tree, posting pages и graph statistics имеют checksummed codecs в `src/storage`.
+- **`store.rs`** 🟢 для этапа 5 — публичные `create_local/open_local`, backend-neutral
   `GraphMutationView`, stable-layout page delta, безопасный COW fallback при смене layout и
   startup-GC старых поколений подключены и покрыты reopen-тестами.
 - **`graph.rs`** 🟢 — `MetaGraph` остаётся in-memory; единственное дополнение —
@@ -566,7 +567,8 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
 
 ### Область E. Схема и каталог — P3
 
-- **In-memory `TableSchema`** 🟢 — имя таблицы, `GraphRef`, `TableKind`, упорядоченные typed-поля;
+- **In-memory `TableSchema`** 🟢 — имя таблицы, `GraphRef`, `TableKind`, упорядоченные typed-поля и
+  validated standard/unique scalar indexes;
   `id: record` неявно добавляется query adapter, а scan режима 1 временно использует совпадающую
   часть `RecordId.table` как proxy признака принадлежности таблице; отдельный membership
   component/primary index относится к полному `src/schema/`. Имена полей заранее интернируются
@@ -589,9 +591,11 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
 
 Зависит от A, B, E.
 
-- **`LabelIndex`** 🔴 (обязательный, неявный), **`BTreeIndex`** (standard/unique), **`CountIndex`**
-  — P3.
-- **Bulk-сборка** 🔴 — P3, критично: внешняя сортировка (memcmp по order-preserving ключам) +
+- **Local scalar `BTreeIndex`** 🟢 для Windows sync — standard/unique, order-preserving
+  scalar/composite keys, posting pages, exact/range reads, catalog/reopen и scan fallback.
+  Primary graph-wide B+tree также 🟢. **`LabelIndex`** и **`CountIndex`** остаются 🔴.
+- **Bulk-сборка** 🟡 — реализованы in-memory sort, bottom-up packer и durable side-file/COW
+  generation. Внешняя сортировка +
   bottom-up packer + side-file / одна WAL-запись / смена поколения + import-эпоха
   (`BEGIN IMPORT`). Планировщик обязан задействовать bulk-путь автоматически при `DEFINE INDEX` на
   непустой таблице, `REBUILD INDEX`, `COMPACT INDEX`; `CONCURRENTLY` — поверх (снимок → side-file →
@@ -668,8 +672,10 @@ storage-интеграция зависит от B.
 
 ### Область N. Полная инцидентность (граф-ядро) — P4
 
-Из `disk_storage_spec.md` §30.9. Правки референс-ядра (`fg-meta`) для vertex–edge / edge–edge
-инцидентности и кросс-уровневых рёбер.
+Production `src/values/runtime/graph` и Windows `src/storage` уже сохраняют V–V/V–E/E–V/E–E,
+hyper- и cross-level endpoints едиными `source/target`, включая root-wide nested slots и
+qualified overflow. Таблица ниже теперь относится к оставшейся аналитической/derived-index
+работе и к необязательному выравниванию референсного `fg-meta`, а не к correctness local store.
 
 | Компонент                         | Что исправить                                                                                                       |
 |-----------------------------------|---------------------------------------------------------------------------------------------------------------------|
@@ -738,10 +744,14 @@ storage-интеграция зависит от B.
   checkpoint policy/Restart и read/write/reopen E2E.
 - **Фаза 4b — query-конвейер MVP** (P2–P3): 🟡 H → I → J/K/L; read-only
   `Datastore::execute` подключён для RAM и materialized local root, optimizer/traversal остаются.
-- **Фаза 5 — схема, статистика, индексы** (P3–P4): E, F, G (Label/BTree/Count + bulk),
-  подключение к оптимизатору.
-- **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, R-tree; N (полная
-  инцидентность); M (changefeed/live).
+- **Фаза 5a — Windows sync storage completion** (P3–P4): ✅ scalar B+tree, generic incidence,
+  nested graphs, recursive `query_to_memory`, atomicity/FCW/SSI/family E2E. Correctness gate
+  пройден, но повторный Windows performance gate этапа 5 не прошёл sparse/scan throughput;
+  format v1 остаётся candidate также до устранения этой регрессии, Linux/NVMe и soak release-gate.
+- **Фаза 5b — полная схема/статистика/optimizer indexes** (P3–P4): E, F, оставшаяся G
+  (Label/Count, external bulk и cost-based planner).
+- **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, R-tree,
+  derived incidence indexes и M (changefeed/live).
 - **Фаза 7 — optional Native Async I/O и мосты** (после полного sync-gate): единый внутренний
   page-source контракт; GrynQL pull API не меняется. Unlimited transaction spill проектируется
   отдельно после crash/performance tests.

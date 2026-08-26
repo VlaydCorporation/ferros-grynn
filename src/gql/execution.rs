@@ -25,7 +25,15 @@ use super::{
 	},
 };
 use crate::{
-	datastore::{PredicateEvaluator, QuerySnapshot, QueryStorageRow, TableSchema, Transaction},
+	datastore::{
+		PredicateEvaluator,
+		QuerySnapshot,
+		QueryStorageRow,
+		ScalarComparison,
+		ScalarIndexConstraint,
+		TableSchema,
+		Transaction,
+	},
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, Outcome},
 	math::{add_exact, divide_signed_exact, multiply_exact, subtract_exact},
 	syn::{BinaryOperator, ParserSettings, Program, UnaryOperator},
@@ -115,7 +123,11 @@ impl QueryRead for TransactionRead<'_> {
 		slots: &[Value],
 		source: &str,
 	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
-		let rows = self.transaction.query_rows(&self.snapshot, table)?;
+		let mut constraints = Vec::new();
+		if let Some(predicate) = predicate {
+			collect_scalar_constraints(predicate, slots, &mut constraints);
+		}
+		let rows = self.transaction.query_rows(&self.snapshot, table, &constraints)?;
 		let evaluator = Arc::new(QueryPredicate {
 			predicate: predicate.cloned(),
 			slots: slots.to_vec(),
@@ -136,6 +148,65 @@ impl QueryRead for TransactionRead<'_> {
 			row.as_ref(),
 		)?;
 		Ok(row.map(|row| Row::new(row.values)))
+	}
+}
+
+fn collect_scalar_constraints(
+	expr: &TypedExpr,
+	slots: &[Value],
+	constraints: &mut Vec<ScalarIndexConstraint>,
+) {
+	let TypedExprKind::Binary {
+		left,
+		op,
+		right,
+	} = &expr.kind
+	else {
+		return;
+	};
+	if matches!(op, BinaryOperator::And) {
+		collect_scalar_constraints(left, slots, constraints);
+		collect_scalar_constraints(right, slots, constraints);
+		return;
+	}
+	let comparison = match op {
+		BinaryOperator::Equal | BinaryOperator::Is => ScalarComparison::Equal,
+		BinaryOperator::Less => ScalarComparison::Less,
+		BinaryOperator::LessOrEqual => ScalarComparison::LessOrEqual,
+		BinaryOperator::Greater => ScalarComparison::Greater,
+		BinaryOperator::GreaterOrEqual => ScalarComparison::GreaterOrEqual,
+		_ => return,
+	};
+	if let (TypedExprKind::Column(column), Some(value)) =
+		(&left.kind, scalar_constraint_value(right, slots))
+	{
+		constraints.push(ScalarIndexConstraint {
+			column: *column,
+			comparison,
+			value,
+		});
+	} else if let (Some(value), TypedExprKind::Column(column)) =
+		(scalar_constraint_value(left, slots), &right.kind)
+	{
+		constraints.push(ScalarIndexConstraint {
+			column: *column,
+			comparison: match comparison {
+				ScalarComparison::Equal => ScalarComparison::Equal,
+				ScalarComparison::Less => ScalarComparison::Greater,
+				ScalarComparison::LessOrEqual => ScalarComparison::GreaterOrEqual,
+				ScalarComparison::Greater => ScalarComparison::Less,
+				ScalarComparison::GreaterOrEqual => ScalarComparison::LessOrEqual,
+			},
+			value,
+		});
+	}
+}
+
+fn scalar_constraint_value(expr: &TypedExpr, slots: &[Value]) -> Option<Value> {
+	match &expr.kind {
+		TypedExprKind::Constant(value) => Some(value.clone()),
+		TypedExprKind::Slot(slot) => slots.get(usize::try_from(*slot).ok()?).cloned(),
+		_ => None,
 	}
 }
 

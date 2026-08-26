@@ -860,7 +860,7 @@ impl SyncPageManager {
 							"home validation offset does not fit u64: {source}"
 						))
 					})?;
-					page.validate_mut(PageNo::new(first + offset))?;
+					page.validate(PageNo::new(first + offset))?;
 				}
 				first += count as u64;
 			}

@@ -1,7 +1,7 @@
 //! Durable database and physical-file catalog pages.
 
 use std::{
-	collections::BTreeSet,
+	collections::{BTreeMap, BTreeSet},
 	path::{Component, Path, PathBuf},
 };
 
@@ -13,7 +13,7 @@ use super::{
 	types::{DataFileId, DataFileKind, GraphId, Lsn},
 };
 use crate::{
-	datastore::TableKind,
+	datastore::{TableIndexKind, TableKind},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{
 		Type,
@@ -58,11 +58,13 @@ const DATABASE_CATALOG_MAGIC: [u8; 4] = *b"FGDC";
 /// File-catalog payload marker.
 const FILE_CATALOG_MAGIC: [u8; 4] = *b"FGFC";
 /// Payload codec version shared by both catalog values.
-const CATALOG_PAYLOAD_VERSION: u16 = 1;
+const CATALOG_PAYLOAD_VERSION: u16 = 3;
 /// Maximum persisted graph name in UTF-8 bytes.
 const MAX_GRAPH_NAME_BYTES: usize = 128;
 /// Maximum canonical `RecordId` text retained for a graph identity.
 const MAX_GRAPH_RECORD_ID_BYTES: usize = 4096;
+/// Bytes before the two variable UTF-8 fields in one graph entry.
+const GRAPH_CATALOG_FIXED_BYTES: usize = 112;
 /// Maximum trusted relative file path in UTF-8 bytes.
 const MAX_CATALOG_PATH_BYTES: usize = 1024;
 /// Maximum one catalog-owned schema name in UTF-8 bytes.
@@ -181,6 +183,12 @@ impl SchemaTypeTag {
 pub(super) struct GraphCatalogEntry {
 	/// Storage address-space identity.
 	pub(super) graph_id: GraphId,
+	/// Owning graph for an internal nested graph; absent for named roots.
+	pub(super) parent_graph_id: Option<GraphId>,
+	/// Root-arena subgraph slot used by hot pages and qualified endpoints.
+	pub(super) subgraph_slot: Option<u32>,
+	/// Container node or edge in the parent graph.
+	pub(super) parent_atom: Option<crate::values::storage::DiskAtomRef>,
 	/// External graph `RecordId` in its canonical display form.
 	pub(super) record_id: String,
 	/// User-visible graph name.
@@ -195,6 +203,8 @@ pub(super) struct GraphCatalogEntry {
 	pub(super) revision: u64,
 	/// Root page of the graph's immutable primary-index generation.
 	pub(super) primary_index_root: PageNo,
+	/// Exact physical file containing the primary index.
+	pub(super) primary_index_file_id: DataFileId,
 	/// Canonical graph-level property map.
 	pub(super) properties: Option<PropertyLocation>,
 }
@@ -210,6 +220,21 @@ pub(super) struct TableFieldCatalogEntry {
 	pub(super) property_key: u32,
 }
 
+/// One durable scalar B+tree definition and physical root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TableIndexCatalogEntry {
+	/// Table-local index name.
+	pub(super) name: String,
+	/// Standard or unique leaf contract.
+	pub(super) kind: TableIndexKind,
+	/// Composite fields as database property-key identifiers.
+	pub(super) fields: Vec<u32>,
+	/// Exact physical index file.
+	pub(super) file_id: DataFileId,
+	/// Root page of the immutable B+tree generation.
+	pub(super) root: PageNo,
+}
+
 /// One durable table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TableCatalogEntry {
@@ -221,6 +246,8 @@ pub(super) struct TableCatalogEntry {
 	pub(super) kind: TableKind,
 	/// Fields in query-visible order.
 	pub(super) fields: Vec<TableFieldCatalogEntry>,
+	/// Scalar B+trees in strict name order.
+	pub(super) indexes: Vec<TableIndexCatalogEntry>,
 }
 
 /// Durable graph catalog owned by the system file.
@@ -279,10 +306,17 @@ impl DatabaseCatalog {
 			output.extend_from_slice(&graph.graph_id.get().to_le_bytes());
 			output.push(graph_kind_byte(graph.kind));
 			output.extend_from_slice(&[0_u8; 7]);
+			output.extend_from_slice(
+				&graph.parent_graph_id.map_or(GraphId::SYSTEM.get(), GraphId::get).to_le_bytes(),
+			);
+			output.extend_from_slice(&graph.subgraph_slot.unwrap_or(u32::MAX).to_le_bytes());
+			output.extend_from_slice(&0_u32.to_le_bytes());
+			output.extend_from_slice(&graph.parent_atom.map_or(0, |atom| atom.raw()).to_le_bytes());
 			output.extend_from_slice(&graph.created_lsn.get().to_le_bytes());
 			output.extend_from_slice(&graph.identity);
 			output.extend_from_slice(&graph.revision.to_le_bytes());
 			output.extend_from_slice(&graph.primary_index_root.get().to_le_bytes());
+			output.extend_from_slice(&graph.primary_index_file_id.get().to_le_bytes());
 			encode_property_location(&mut output, graph.properties)?;
 			output.extend_from_slice(&record_len.to_le_bytes());
 			output.extend_from_slice(&name_len.to_le_bytes());
@@ -300,10 +334,31 @@ impl DatabaseCatalog {
 					.map_err(|_error| invalid_catalog("table field count exceeds u32"))?
 					.to_le_bytes(),
 			);
+			output.extend_from_slice(
+				&u32::try_from(table.indexes.len())
+					.map_err(|_error| invalid_catalog("table index count exceeds u32"))?
+					.to_le_bytes(),
+			);
+			output.extend_from_slice(&0_u32.to_le_bytes());
 			for field in &table.fields {
 				write_catalog_string(&mut output, &field.name, "field name")?;
 				output.extend_from_slice(&field.property_key.to_le_bytes());
 				encode_type(&mut output, &field.value_type, 0)?;
+			}
+			for index in &table.indexes {
+				write_catalog_string(&mut output, &index.name, "index name")?;
+				output.push(table_index_kind_byte(index.kind));
+				output.extend_from_slice(&[0_u8; 3]);
+				output.extend_from_slice(
+					&u32::try_from(index.fields.len())
+						.map_err(|_error| invalid_catalog("index field count exceeds u32"))?
+						.to_le_bytes(),
+				);
+				output.extend_from_slice(&index.file_id.get().to_le_bytes());
+				output.extend_from_slice(&index.root.get().to_le_bytes());
+				for field in &index.fields {
+					output.extend_from_slice(&field.to_le_bytes());
+				}
 			}
 		}
 		validate_catalog_size(output.len())?;
@@ -328,11 +383,10 @@ impl DatabaseCatalog {
 		}
 		let count = usize::try_from(graph_count)
 			.map_err(|_error| invalid_catalog("graph count does not fit usize"))?;
-		let minimum =
-			count
-				.checked_mul(56)
-				.and_then(|bytes| decoder.position.checked_add(bytes))
-				.ok_or_else(|| invalid_catalog("database catalog entry area overflows usize"))?;
+		let minimum = count
+			.checked_mul(GRAPH_CATALOG_FIXED_BYTES)
+			.and_then(|bytes| decoder.position.checked_add(bytes))
+			.ok_or_else(|| invalid_catalog("database catalog entry area overflows usize"))?;
 		if minimum > bytes.len() {
 			return Err(invalid_catalog("database catalog count exceeds its payload"));
 		}
@@ -341,12 +395,30 @@ impl DatabaseCatalog {
 			let graph_id = GraphId::new(decoder.read_u64()?);
 			let kind = decode_graph_kind(decoder.read_u8()?)?;
 			decoder.expect_zero(7, "graph catalog entry padding")?;
+			let raw_parent = GraphId::new(decoder.read_u64()?);
+			let raw_subgraph_slot = decoder.read_u32()?;
+			decoder.expect_zero(size_of::<u32>(), "graph parent reserved bytes")?;
+			let raw_parent_atom = decoder.read_u64()?;
+			let parent_graph_id = (raw_parent != GraphId::SYSTEM).then_some(raw_parent);
+			let subgraph_slot = (raw_subgraph_slot != u32::MAX).then_some(raw_subgraph_slot);
+			let parent_atom = if parent_graph_id.is_some() {
+				Some(crate::values::storage::DiskAtomRef::from_raw(raw_parent_atom)?)
+			} else {
+				if raw_parent_atom != 0 {
+					return Err(invalid_catalog("root graph contains a nested parent atom"));
+				}
+				None
+			};
 			let created_lsn = Lsn::new(decoder.read_u64()?);
 			let identity: [u8; 16] = decoder.read_exact(16)?.try_into().map_err(|source| {
 				invalid_catalog(format!("graph UUID width mismatch: {source}"))
 			})?;
 			let revision = decoder.read_u64()?;
 			let primary_index_root = PageNo::new(decoder.read_u64()?);
+			let primary_index_file_id =
+				DataFileId::from_raw(decoder.read_u64()?).ok_or_else(|| {
+					invalid_catalog("graph catalog contains an unknown primary-index file id")
+				})?;
 			let properties = decode_property_location(&mut decoder)?;
 			let record_len = usize::from(decoder.read_u16()?);
 			let name_len = usize::from(decoder.read_u16()?);
@@ -358,6 +430,9 @@ impl DatabaseCatalog {
 			let name = decoder.read_utf8(name_len, "graph name")?.to_owned();
 			graphs.push(GraphCatalogEntry {
 				graph_id,
+				parent_graph_id,
+				subgraph_slot,
+				parent_atom,
 				record_id,
 				name,
 				kind,
@@ -365,6 +440,7 @@ impl DatabaseCatalog {
 				identity,
 				revision,
 				primary_index_root,
+				primary_index_file_id,
 				properties,
 			});
 		}
@@ -378,6 +454,9 @@ impl DatabaseCatalog {
 			decoder.expect_zero(3, "table catalog padding")?;
 			let field_count = usize::try_from(decoder.read_u32()?)
 				.map_err(|_error| invalid_catalog("field count does not fit usize"))?;
+			let index_count = usize::try_from(decoder.read_u32()?)
+				.map_err(|_error| invalid_catalog("index count does not fit usize"))?;
+			decoder.expect_zero(size_of::<u32>(), "table catalog reserved bytes")?;
 			if field_count > MAX_TYPE_MEMBERS {
 				return Err(invalid_catalog("table field count exceeds its format limit"));
 			}
@@ -389,11 +468,40 @@ impl DatabaseCatalog {
 					value_type: decode_type(&mut decoder, 0)?,
 				});
 			}
+			if index_count > MAX_TYPE_MEMBERS {
+				return Err(invalid_catalog("table index count exceeds its format limit"));
+			}
+			let mut indexes = Vec::with_capacity(index_count);
+			for _ in 0..index_count {
+				let name = read_catalog_string(&mut decoder, "index name")?;
+				let kind = decode_table_index_kind(decoder.read_u8()?)?;
+				decoder.expect_zero(3, "table index padding")?;
+				let field_count = usize::try_from(decoder.read_u32()?)
+					.map_err(|_error| invalid_catalog("index field count does not fit usize"))?;
+				if field_count == 0 || field_count > MAX_TYPE_MEMBERS {
+					return Err(invalid_catalog("index field count exceeds its format limit"));
+				}
+				let file_id = DataFileId::from_raw(decoder.read_u64()?)
+					.ok_or_else(|| invalid_catalog("table index contains an unknown DataFileId"))?;
+				let root = PageNo::new(decoder.read_u64()?);
+				let mut index_fields = Vec::with_capacity(field_count);
+				for _ in 0..field_count {
+					index_fields.push(decoder.read_u32()?);
+				}
+				indexes.push(TableIndexCatalogEntry {
+					name,
+					kind,
+					fields: index_fields,
+					file_id,
+					root,
+				});
+			}
 			tables.push(TableCatalogEntry {
 				name,
 				graph_id,
 				kind,
 				fields,
+				indexes,
 			});
 		}
 		decoder.finish()?;
@@ -1099,8 +1207,18 @@ fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 	}
 	let mut previous = GraphId::SYSTEM;
 	let mut graph_ids = BTreeSet::new();
+	let mut graph_roots = BTreeMap::new();
 	let mut graph_records = BTreeSet::new();
+	let mut nested_slots = BTreeSet::new();
 	for graph in &catalog.graphs {
+		let root_graph_id = match (graph.parent_graph_id, graph.subgraph_slot, graph.parent_atom) {
+			(None, None, None) => Some(graph.graph_id),
+			(Some(parent), Some(slot), Some(_atom)) if slot != 0 && parent < graph.graph_id => {
+				graph_roots.get(&parent).copied().filter(|root| nested_slots.insert((*root, slot)))
+			}
+			_ => None,
+		}
+		.ok_or_else(|| invalid_catalog("graph catalog entry violates a format-v1 bound"))?;
 		if graph.graph_id == GraphId::SYSTEM || graph.graph_id <= previous {
 			return Err(invalid_catalog("graph catalog entries are not in strict id order"));
 		}
@@ -1112,9 +1230,12 @@ fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			|| graph.name.contains('\0')
 			|| !graph_ids.insert(graph.graph_id)
 			|| !graph_records.insert(graph.record_id.as_str())
+			|| graph.primary_index_file_id.kind() != Some(DataFileKind::Index)
+			|| graph.primary_index_root == PageNo::NULL
 		{
 			return Err(invalid_catalog("graph catalog entry violates a format-v1 bound"));
 		}
+		graph_roots.insert(graph.graph_id, root_graph_id);
 		previous = graph.graph_id;
 	}
 	let mut property_names = BTreeSet::new();
@@ -1135,6 +1256,7 @@ fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			|| previous_table.is_some_and(|previous: &str| previous >= table.name.as_str())
 			|| !graph_ids.contains(&table.graph_id)
 			|| table.fields.len() > MAX_TYPE_MEMBERS
+			|| table.indexes.len() > MAX_TYPE_MEMBERS
 		{
 			return Err(invalid_catalog("table catalog entry violates a format-v1 bound"));
 		}
@@ -1151,6 +1273,31 @@ fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			{
 				return Err(invalid_catalog("table field violates its property-key contract"));
 			}
+		}
+		let mut previous_index = None;
+		for index in &table.indexes {
+			if index.name.is_empty()
+				|| index.name.contains('\0')
+				|| index.name.len() > MAX_SCHEMA_NAME_BYTES
+				|| previous_index.is_some_and(|previous: &str| previous >= index.name.as_str())
+				|| index.fields.is_empty()
+				|| index.fields.len() > MAX_TYPE_MEMBERS
+				|| index.file_id.kind() != Some(DataFileKind::Index)
+				|| index.root == PageNo::NULL
+			{
+				return Err(invalid_catalog("table index violates a format-v1 bound"));
+			}
+			let mut index_fields = BTreeSet::new();
+			for property_key in &index.fields {
+				if !index_fields.insert(*property_key)
+					|| !table.fields.iter().any(|field| field.property_key == *property_key)
+				{
+					return Err(invalid_catalog(
+						"table index references an unknown or duplicate field",
+					));
+				}
+			}
+			previous_index = Some(index.name.as_str());
 		}
 		previous_table = Some(table.name.as_str());
 	}
@@ -1240,6 +1387,23 @@ fn decode_table_kind(value: u8) -> FerrosGrynnResult<TableKind> {
 		1 => Ok(TableKind::Normal),
 		2 => Ok(TableKind::Relation),
 		_ => Err(invalid_catalog("table catalog contains an unknown TableKind")),
+	}
+}
+
+/// Maps scalar-index uniqueness to stable catalog bytes.
+const fn table_index_kind_byte(kind: TableIndexKind) -> u8 {
+	match kind {
+		TableIndexKind::Standard => 0,
+		TableIndexKind::Unique => 1,
+	}
+}
+
+/// Rejects unassigned scalar-index kind bytes.
+fn decode_table_index_kind(value: u8) -> FerrosGrynnResult<TableIndexKind> {
+	match value {
+		0 => Ok(TableIndexKind::Standard),
+		1 => Ok(TableIndexKind::Unique),
+		_ => Err(invalid_catalog("table catalog contains an unknown TableIndexKind")),
 	}
 }
 
@@ -1512,6 +1676,9 @@ mod tests {
 			next_graph_id: 2,
 			graphs: vec![GraphCatalogEntry {
 				graph_id: GraphId::new(1),
+				parent_graph_id: None,
+				subgraph_slot: None,
+				parent_atom: None,
 				record_id: "graph:people".to_owned(),
 				name: "people".to_owned(),
 				kind: GraphKind::Graph,
@@ -1519,6 +1686,7 @@ mod tests {
 				identity: [7; 16],
 				revision: 9,
 				primary_index_root: PageNo::new(4),
+				primary_index_file_id: DataFileId::for_kind(DataFileKind::Index),
 				properties: Some(PropertyLocation::Inline {
 					page_no: PageNo::new(2),
 					slot: 1,
@@ -1542,6 +1710,7 @@ mod tests {
 						property_key: 1,
 					},
 				],
+				indexes: Vec::new(),
 			}],
 		};
 		let files = FileCatalog::bootstrap()?;
@@ -1621,5 +1790,60 @@ mod tests {
 			assert_eq!(page.validate(*page_no)?.page_type(), PageType::SchemaRoot);
 		}
 		Ok(())
+	}
+
+	#[test]
+	fn nested_catalog_reserves_local_slot_and_rejects_root_wide_collisions() -> FerrosGrynnResult<()>
+	{
+		let root = nested_graph_entry(1, None, None)?;
+		let slot_zero = DatabaseCatalog {
+			next_graph_id: 3,
+			graphs: vec![root.clone(), nested_graph_entry(2, Some(1), Some(0))?],
+			property_keys: Vec::new(),
+			tables: Vec::new(),
+		};
+		assert!(slot_zero.encode().is_err());
+
+		let duplicate = DatabaseCatalog {
+			next_graph_id: 4,
+			graphs: vec![
+				root,
+				nested_graph_entry(2, Some(1), Some(1))?,
+				nested_graph_entry(3, Some(2), Some(1))?,
+			],
+			property_keys: Vec::new(),
+			tables: Vec::new(),
+		};
+		assert!(duplicate.encode().is_err());
+		Ok(())
+	}
+
+	fn nested_graph_entry(
+		graph_id: u64,
+		parent_graph_id: Option<u64>,
+		subgraph_slot: Option<u32>,
+	) -> FerrosGrynnResult<GraphCatalogEntry> {
+		Ok(GraphCatalogEntry {
+			graph_id: GraphId::new(graph_id),
+			parent_graph_id: parent_graph_id.map(GraphId::new),
+			subgraph_slot,
+			parent_atom: parent_graph_id
+				.map(|_| {
+					crate::values::storage::DiskAtomRef::from_parts(
+						crate::values::runtime::graph::AtomKind::Node,
+						0,
+					)
+				})
+				.transpose()?,
+			record_id: format!("graph:{graph_id}"),
+			name: format!("graph-{graph_id}"),
+			kind: GraphKind::Graph,
+			created_lsn: Lsn::new(1),
+			identity: [0; 16],
+			revision: 0,
+			primary_index_root: PageNo::new(1),
+			primary_index_file_id: DataFileId::for_kind(DataFileKind::Index),
+			properties: None,
+		})
 	}
 }

@@ -122,7 +122,7 @@ fn benchmark_access_modes(criterion: &mut Criterion) {
 		);
 		let disk = DiskGraphView::new(&reference, &source, SnapshotId::new(1, 1)).unwrap();
 		let hybrid = query_to_memory::<Graph<Frozen>, _>(&disk).unwrap();
-		let hybrid_root = hybrid.node_ids().next().unwrap();
+		let hybrid_root = hybrid.node_ids().unwrap().next().unwrap().unwrap();
 		group.throughput(Throughput::Elements(size as u64));
 		group.bench_function(BenchmarkId::new("disk_view_adapter_traversal", size), |bench| {
 			bench.iter(|| black_box(bfs(&disk, root, TraversalDirection::Forward, None).unwrap()));

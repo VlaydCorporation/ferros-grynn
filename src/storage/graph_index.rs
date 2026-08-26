@@ -1,6 +1,9 @@
 //! Format-v1 label dictionary and bulk-built primary B+tree.
 
-use std::collections::BTreeSet;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	ops::Bound,
+};
 
 use super::page::{
 	AlignedPage,
@@ -38,6 +41,13 @@ const INTERNAL_KEY_BYTES_OFFSET: usize = 34;
 const INTERNAL_OFFSETS_OFFSET: usize = 36;
 const MAX_BTREE_DEPTH: usize = 64;
 const DISK_ATOM_REF_BYTES: usize = size_of::<u64>();
+const STANDARD_ENTRY_TRAILER_BYTES: usize = 16;
+const STANDARD_INLINE_ATOMS: usize = 8;
+const POSTING_NEXT_OFFSET: usize = PAGE_HEADER_SIZE;
+const POSTING_COUNT_OFFSET: usize = 40;
+const POSTING_RESERVED_OFFSET: usize = 44;
+const POSTING_ATOMS_OFFSET: usize = 48;
+const POSTING_ATOMS_PER_PAGE: usize = (PAGE_SIZE - POSTING_ATOMS_OFFSET) / DISK_ATOM_REF_BYTES;
 
 /// Four dictionary sections persisted by the first local slice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -182,6 +192,28 @@ pub(super) struct BuiltPrimaryIndex {
 	pub(super) pages: Vec<AlignedPage>,
 }
 
+/// Closed physical representation of one scalar B+tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScalarIndexMode {
+	/// Multiple atoms may share one key and spill into posting pages.
+	Standard,
+	/// Every key maps to exactly one atom.
+	Unique,
+}
+
+/// One sorted scalar-index key and its sorted, non-empty atom set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ScalarIndexEntry {
+	pub(super) key: Vec<u8>,
+	pub(super) atoms: Vec<DiskAtomRef>,
+}
+
+/// Complete immutable scalar B+tree generation.
+pub(super) struct BuiltScalarIndex {
+	pub(super) root: PageNo,
+	pub(super) pages: Vec<AlignedPage>,
+}
+
 /// Bulk-builds a unique B+tree from strictly sorted canonical RecordId bytes.
 pub(super) fn build_primary_index(
 	entries: &[PrimaryIndexEntry],
@@ -321,6 +353,202 @@ pub(super) fn visit_primary_index(
 		page_no = PageNo::new(read_u64(bytes, LEAF_NEXT_OFFSET));
 	}
 	Ok(())
+}
+
+/// Bulk-builds a standard or unique scalar B+tree from canonical entries.
+pub(super) fn build_scalar_index(
+	entries: &[ScalarIndexEntry],
+	mode: ScalarIndexMode,
+	page_lsn: PageLsn,
+) -> FerrosGrynnResult<BuiltScalarIndex> {
+	validate_scalar_entries(entries, mode)?;
+	if mode == ScalarIndexMode::Unique {
+		let primary = entries
+			.iter()
+			.map(|entry| PrimaryIndexEntry {
+				key: entry.key.clone(),
+				atom: entry.atoms[0],
+			})
+			.collect::<Vec<_>>();
+		let built = build_primary_index(&primary, page_lsn)?;
+		return Ok(BuiltScalarIndex {
+			root: built.root,
+			pages: built.pages,
+		});
+	}
+
+	let leaf_groups = partition_standard_leaf_entries(entries)?;
+	let leaf_count = leaf_groups.len();
+	let mut next_page = u64::try_from(leaf_count)
+		.map_err(|_error| invalid_index("scalar leaf count exceeds u64"))?;
+	let mut posting_roots = BTreeMap::new();
+	let mut posting_pages = Vec::new();
+	for entry in entries {
+		if entry.atoms.len() <= STANDARD_INLINE_ATOMS {
+			continue;
+		}
+		let root = PageNo::new(next_page);
+		posting_roots.insert(entry.key.as_slice(), root);
+		let chunks =
+			entry.atoms[STANDARD_INLINE_ATOMS..].chunks(POSTING_ATOMS_PER_PAGE).collect::<Vec<_>>();
+		for (index, chunk) in chunks.iter().enumerate() {
+			let page_no = PageNo::new(next_page);
+			next_page = next_page
+				.checked_add(1)
+				.ok_or_else(|| invalid_index("scalar posting page number overflows u64"))?;
+			let next = (index + 1 < chunks.len()).then(|| PageNo::new(next_page));
+			posting_pages.push(encode_posting_page(page_no, page_lsn, next, chunk)?);
+		}
+	}
+
+	let mut pages = Vec::new();
+	let mut level = Vec::with_capacity(leaf_count);
+	for (index, group) in leaf_groups.iter().enumerate() {
+		let page_no = PageNo::new(
+			u64::try_from(index)
+				.map_err(|_error| invalid_index("scalar leaf index exceeds u64"))?,
+		);
+		let next = (index + 1 < leaf_count).then(|| PageNo::new(page_no.get() + 1));
+		pages.push(encode_standard_leaf(page_no, page_lsn, next, group, &posting_roots)?);
+		level.push(ChildPage {
+			page_no,
+			min_key: group.first().map_or_else(Vec::new, |entry| entry.key.clone()),
+		});
+	}
+	pages.extend(posting_pages);
+	while level.len() > 1 {
+		let groups = partition_internal_children(&level)?;
+		if groups.len() == level.len() {
+			return Err(invalid_index("scalar separator key exceeds internal-page capacity"));
+		}
+		let mut next_level = Vec::with_capacity(groups.len());
+		for group in groups {
+			if group.len() == 1 {
+				next_level.push(group[0].clone());
+				continue;
+			}
+			let page_no = PageNo::new(
+				u64::try_from(pages.len())
+					.map_err(|_error| invalid_index("scalar B+tree page index exceeds u64"))?,
+			);
+			pages.push(encode_internal_page(page_no, page_lsn, group)?);
+			next_level.push(ChildPage {
+				page_no,
+				min_key: group[0].min_key.clone(),
+			});
+		}
+		level = next_level;
+	}
+	Ok(BuiltScalarIndex {
+		root: level.first().map_or(PageNo::new(0), |child| child.page_no),
+		pages,
+	})
+}
+
+/// Looks up one exact scalar key and validates every referenced posting page.
+pub(super) fn lookup_scalar_index(
+	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	root: PageNo,
+	mode: ScalarIndexMode,
+	target: &[u8],
+) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+	if mode == ScalarIndexMode::Unique {
+		return lookup_primary_index(read_page, root, target)
+			.map(|atom| atom.into_iter().collect());
+	}
+	let leaf = descend_to_leaf(&mut read_page, root, target, PageType::IndexNonUniqueBtreeLeaf)?;
+	let mut page = AlignedPage::zeroed();
+	read_page(leaf, &mut page)?;
+	lookup_standard_leaf(&mut read_page, &page, target)
+}
+
+/// Returns scalar-index atoms in key order for one bounded range.
+pub(super) fn range_scalar_index(
+	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	root: PageNo,
+	mode: ScalarIndexMode,
+	lower: Bound<&[u8]>,
+	upper: Bound<&[u8]>,
+) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+	if invalid_bounds(&lower, &upper) {
+		return Ok(Vec::new());
+	}
+	if mode == ScalarIndexMode::Unique {
+		return range_unique_index(&mut read_page, root, &lower, &upper);
+	}
+
+	let target = match lower {
+		Bound::Included(key) | Bound::Excluded(key) => key,
+		Bound::Unbounded => &[],
+	};
+	let mut page_no =
+		descend_to_leaf(&mut read_page, root, target, PageType::IndexNonUniqueBtreeLeaf)?;
+	let mut visited = BTreeSet::new();
+	let mut result = Vec::new();
+	while page_no != PageNo::NULL {
+		if !visited.insert(page_no) {
+			return Err(invalid_index("scalar B+tree leaf chain contains a cycle"));
+		}
+		let mut page = AlignedPage::zeroed();
+		read_page(page_no, &mut page)?;
+		let entries = decode_standard_leaf_entries(&mut read_page, &page)?;
+		for entry in entries {
+			if upper_exceeded(&entry.key, &upper) {
+				return Ok(result);
+			}
+			if key_in_bounds(&entry.key, &lower, &upper) {
+				result.extend(entry.atoms);
+			}
+		}
+		page_no = PageNo::new(read_u64(page.as_bytes(), LEAF_NEXT_OFFSET));
+	}
+	Ok(result)
+}
+
+fn range_unique_index(
+	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	root: PageNo,
+	lower: &Bound<&[u8]>,
+	upper: &Bound<&[u8]>,
+) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+	let target = match lower {
+		Bound::Included(key) | Bound::Excluded(key) => *key,
+		Bound::Unbounded => &[],
+	};
+	let mut page_no = descend_to_leaf(read_page, root, target, PageType::IndexUniqueBtreeLeaf)?;
+	let mut visited = BTreeSet::new();
+	let mut previous_key = None::<Vec<u8>>;
+	let mut result = Vec::new();
+	while page_no != PageNo::NULL {
+		if !visited.insert(page_no) {
+			return Err(invalid_index("unique scalar B+tree leaf chain contains a cycle"));
+		}
+		let mut page = AlignedPage::zeroed();
+		read_page(page_no, &mut page)?;
+		let header = page.validate(page_no)?;
+		if header.page_type() != PageType::IndexUniqueBtreeLeaf {
+			return Err(invalid_index("unique scalar B+tree leaf link targets an invalid page"));
+		}
+		let bytes = page.as_bytes();
+		let (count, area_start) = validate_leaf_layout(&page)?;
+		for index in 0..count {
+			let (key, atom) = leaf_entry(bytes, area_start, count, index)?;
+			if previous_key.as_deref().is_some_and(|previous| previous >= key) {
+				return Err(invalid_index(
+					"unique scalar B+tree leaf keys are not strictly ordered",
+				));
+			}
+			if upper_exceeded(key, upper) {
+				return Ok(result);
+			}
+			if key_in_bounds(key, lower, upper) {
+				result.push(DiskAtomRef::from_raw(atom)?);
+			}
+			previous_key = Some(key.to_vec());
+		}
+		page_no = PageNo::new(read_u64(bytes, LEAF_NEXT_OFFSET));
+	}
+	Ok(result)
 }
 
 #[derive(Clone)]
@@ -499,6 +727,368 @@ fn validate_primary_entries(entries: &[PrimaryIndexEntry]) -> FerrosGrynnResult<
 		}
 	}
 	Ok(())
+}
+
+fn validate_scalar_entries(
+	entries: &[ScalarIndexEntry],
+	mode: ScalarIndexMode,
+) -> FerrosGrynnResult<()> {
+	for (index, entry) in entries.iter().enumerate() {
+		if entry.key.is_empty() || entry.atoms.is_empty() {
+			return Err(invalid_index("scalar index contains an empty key or atom set"));
+		}
+		if index > 0 && entries[index - 1].key >= entry.key {
+			return Err(invalid_index("scalar index keys are not strictly ordered"));
+		}
+		if mode == ScalarIndexMode::Unique && entry.atoms.len() != 1 {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				"scalar index",
+				"unique scalar index contains a duplicate key",
+			));
+		}
+		if entry.atoms.windows(2).any(|pair| pair[0] >= pair[1]) {
+			return Err(invalid_index("scalar index atoms are not strictly ordered"));
+		}
+	}
+	Ok(())
+}
+
+fn partition_standard_leaf_entries(
+	entries: &[ScalarIndexEntry],
+) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry]>> {
+	if entries.is_empty() {
+		return Ok(vec![entries]);
+	}
+	let mut groups = Vec::new();
+	let mut start = 0;
+	while start < entries.len() {
+		let mut end = start;
+		let mut data_bytes = 0_usize;
+		while end < entries.len() {
+			let inline = entries[end].atoms.len().min(STANDARD_INLINE_ATOMS);
+			let entry_bytes = entries[end]
+				.key
+				.len()
+				.checked_add(inline * DISK_ATOM_REF_BYTES)
+				.and_then(|bytes| bytes.checked_add(STANDARD_ENTRY_TRAILER_BYTES))
+				.ok_or_else(|| invalid_index("scalar leaf entry length overflows usize"))?;
+			let count = end - start + 1;
+			let total = LEAF_OFFSETS_OFFSET
+				.checked_add(count * size_of::<u16>())
+				.and_then(|fixed| fixed.checked_add(data_bytes))
+				.and_then(|used| used.checked_add(entry_bytes))
+				.ok_or_else(|| invalid_index("scalar leaf size overflows usize"))?;
+			if total > PAGE_SIZE {
+				break;
+			}
+			data_bytes += entry_bytes;
+			end += 1;
+		}
+		if end == start {
+			return Err(invalid_index("one scalar key exceeds leaf-page capacity"));
+		}
+		groups.push(&entries[start..end]);
+		start = end;
+	}
+	Ok(groups)
+}
+
+fn encode_standard_leaf(
+	page_no: PageNo,
+	page_lsn: PageLsn,
+	next: Option<PageNo>,
+	entries: &[ScalarIndexEntry],
+	posting_roots: &BTreeMap<&[u8], PageNo>,
+) -> FerrosGrynnResult<AlignedPage> {
+	let count = u16::try_from(entries.len())
+		.map_err(|_error| invalid_index("scalar leaf entry count exceeds u16"))?;
+	let area_start = LEAF_OFFSETS_OFFSET + entries.len() * size_of::<u16>();
+	let data_bytes = entries.iter().try_fold(0_usize, |total, entry| {
+		let inline = entry.atoms.len().min(STANDARD_INLINE_ATOMS);
+		total
+			.checked_add(entry.key.len())
+			.and_then(|total| total.checked_add(inline * DISK_ATOM_REF_BYTES))
+			.and_then(|total| total.checked_add(STANDARD_ENTRY_TRAILER_BYTES))
+			.ok_or_else(|| invalid_index("scalar leaf data length overflows usize"))
+	})?;
+	let data_start = PAGE_SIZE
+		.checked_sub(data_bytes)
+		.filter(|start| *start >= area_start)
+		.ok_or_else(|| invalid_index("scalar leaf data overlaps its directory"))?;
+	let mut page =
+		AlignedPage::new(PageType::IndexNonUniqueBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
+	write_u64(page.as_bytes_mut(), LEAF_NEXT_OFFSET, next.unwrap_or(PageNo::NULL).get());
+	write_u16(page.as_bytes_mut(), LEAF_COUNT_OFFSET, count);
+	let mut area_offset = 0_usize;
+	for (index, entry) in entries.iter().enumerate() {
+		let persisted_offset = data_start + area_offset - area_start;
+		write_u16(
+			page.as_bytes_mut(),
+			LEAF_OFFSETS_OFFSET + index * size_of::<u16>(),
+			u16::try_from(persisted_offset)
+				.map_err(|_error| invalid_index("scalar leaf offset exceeds u16"))?,
+		);
+		let start = data_start + area_offset;
+		page.as_bytes_mut()[start..start + entry.key.len()].copy_from_slice(&entry.key);
+		let mut offset = start + entry.key.len();
+		for atom in entry.atoms.iter().take(STANDARD_INLINE_ATOMS) {
+			write_u64(page.as_bytes_mut(), offset, atom.raw());
+			offset += DISK_ATOM_REF_BYTES;
+		}
+		write_u16(
+			page.as_bytes_mut(),
+			offset,
+			u16::try_from(entry.key.len())
+				.map_err(|_error| invalid_index("scalar key length exceeds u16"))?,
+		);
+		write_u16(
+			page.as_bytes_mut(),
+			offset + size_of::<u16>(),
+			u16::try_from(entry.atoms.len().min(STANDARD_INLINE_ATOMS))
+				.map_err(|_error| invalid_index("scalar inline count exceeds u16"))?,
+		);
+		write_u32(
+			page.as_bytes_mut(),
+			offset + 2 * size_of::<u16>(),
+			u32::try_from(entry.atoms.len())
+				.map_err(|_error| invalid_index("scalar atom count exceeds u32"))?,
+		);
+		write_u64(
+			page.as_bytes_mut(),
+			offset + 2 * size_of::<u16>() + size_of::<u32>(),
+			posting_roots.get(entry.key.as_slice()).copied().unwrap_or(PageNo::NULL).get(),
+		);
+		area_offset = offset + STANDARD_ENTRY_TRAILER_BYTES - data_start;
+	}
+	page.seal()?;
+	Ok(page)
+}
+
+fn encode_posting_page(
+	page_no: PageNo,
+	page_lsn: PageLsn,
+	next: Option<PageNo>,
+	atoms: &[DiskAtomRef],
+) -> FerrosGrynnResult<AlignedPage> {
+	if atoms.is_empty() || atoms.len() > POSTING_ATOMS_PER_PAGE {
+		return Err(invalid_index("scalar posting page has an invalid atom count"));
+	}
+	let mut page =
+		AlignedPage::new(PageType::IndexPostingBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
+	write_u64(page.as_bytes_mut(), POSTING_NEXT_OFFSET, next.unwrap_or(PageNo::NULL).get());
+	write_u32(
+		page.as_bytes_mut(),
+		POSTING_COUNT_OFFSET,
+		u32::try_from(atoms.len()).map_err(|_error| invalid_index("posting count exceeds u32"))?,
+	);
+	for (index, atom) in atoms.iter().enumerate() {
+		write_u64(
+			page.as_bytes_mut(),
+			POSTING_ATOMS_OFFSET + index * DISK_ATOM_REF_BYTES,
+			atom.raw(),
+		);
+	}
+	page.seal()?;
+	Ok(page)
+}
+
+fn descend_to_leaf(
+	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	root: PageNo,
+	target: &[u8],
+	leaf_type: PageType,
+) -> FerrosGrynnResult<PageNo> {
+	let mut page_no = root;
+	let mut visited = BTreeSet::new();
+	for _depth in 0..MAX_BTREE_DEPTH {
+		if page_no == PageNo::NULL || !visited.insert(page_no) {
+			return Err(invalid_index("scalar B+tree contains a null link or cycle"));
+		}
+		let mut page = AlignedPage::zeroed();
+		read_page(page_no, &mut page)?;
+		match page.validate(page_no)?.page_type() {
+			page_type if page_type == leaf_type => return Ok(page_no),
+			PageType::IndexBtreeInternal => page_no = select_internal_child(&page, target)?,
+			_ => return Err(invalid_index("scalar B+tree contains an invalid page type")),
+		}
+	}
+	Err(invalid_index("scalar B+tree exceeds its maximum depth"))
+}
+
+fn lookup_standard_leaf(
+	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	page: &AlignedPage,
+	target: &[u8],
+) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+	let (count, area_start) = validate_standard_leaf_layout(page)?;
+	let mut low = 0;
+	let mut high = count;
+	while low < high {
+		let middle = low + (high - low) / 2;
+		let raw = standard_leaf_entry(page.as_bytes(), area_start, count, middle)?;
+		match raw.key.cmp(target) {
+			std::cmp::Ordering::Less => low = middle + 1,
+			std::cmp::Ordering::Greater => high = middle,
+			std::cmp::Ordering::Equal => return decode_scalar_atoms(read_page, raw),
+		}
+	}
+	Ok(Vec::new())
+}
+
+fn decode_standard_leaf_entries(
+	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	page: &AlignedPage,
+) -> FerrosGrynnResult<Vec<ScalarIndexEntry>> {
+	let (count, area_start) = validate_standard_leaf_layout(page)?;
+	let mut entries = Vec::with_capacity(count);
+	for index in 0..count {
+		let raw = standard_leaf_entry(page.as_bytes(), area_start, count, index)?;
+		entries.push(ScalarIndexEntry {
+			key: raw.key.to_vec(),
+			atoms: decode_scalar_atoms(read_page, raw)?,
+		});
+	}
+	Ok(entries)
+}
+
+struct StandardLeafEntry<'a> {
+	key: &'a [u8],
+	inline: &'a [u8],
+	total_count: usize,
+	posting: PageNo,
+}
+
+fn standard_leaf_entry(
+	bytes: &[u8; PAGE_SIZE],
+	area_start: usize,
+	count: usize,
+	index: usize,
+) -> FerrosGrynnResult<StandardLeafEntry<'_>> {
+	let start = area_start + usize::from(read_u16(bytes, LEAF_OFFSETS_OFFSET + index * 2));
+	let end = if index + 1 == count {
+		PAGE_SIZE
+	} else {
+		area_start + usize::from(read_u16(bytes, LEAF_OFFSETS_OFFSET + (index + 1) * 2))
+	};
+	if start > end || end > PAGE_SIZE || end.saturating_sub(start) <= STANDARD_ENTRY_TRAILER_BYTES {
+		return Err(invalid_index("scalar leaf entry range is invalid"));
+	}
+	let trailer = end - STANDARD_ENTRY_TRAILER_BYTES;
+	let key_len = usize::from(read_u16(bytes, trailer));
+	let inline_count = usize::from(read_u16(bytes, trailer + size_of::<u16>()));
+	let total_count = usize::try_from(read_u32(bytes, trailer + 2 * size_of::<u16>()))
+		.map_err(|_error| invalid_index("scalar atom count does not fit usize"))?;
+	let posting = PageNo::new(read_u64(bytes, trailer + 2 * size_of::<u16>() + size_of::<u32>()));
+	let inline_bytes = inline_count
+		.checked_mul(DISK_ATOM_REF_BYTES)
+		.ok_or_else(|| invalid_index("scalar inline atom bytes overflow usize"))?;
+	if key_len == 0
+		|| inline_count > STANDARD_INLINE_ATOMS
+		|| inline_count != total_count.min(STANDARD_INLINE_ATOMS)
+		|| start.checked_add(key_len).and_then(|end| end.checked_add(inline_bytes)) != Some(trailer)
+		|| (total_count > STANDARD_INLINE_ATOMS) != (posting != PageNo::NULL)
+	{
+		return Err(invalid_index("scalar leaf entry metadata is inconsistent"));
+	}
+	Ok(StandardLeafEntry {
+		key: &bytes[start..start + key_len],
+		inline: &bytes[start + key_len..trailer],
+		total_count,
+		posting,
+	})
+}
+
+fn validate_standard_leaf_layout(page: &AlignedPage) -> FerrosGrynnResult<(usize, usize)> {
+	let bytes = page.as_bytes();
+	let header = page.validate(PageNo::new(read_u64(bytes, PAGE_NO_OFFSET)))?;
+	if header.page_type() != PageType::IndexNonUniqueBtreeLeaf
+		|| header.flags() != PageFlags::LEAF
+		|| read_u16(bytes, LEAF_RESERVED_OFFSET) != 0
+	{
+		return Err(invalid_index("invalid standard scalar leaf header or padding"));
+	}
+	let count = usize::from(read_u16(bytes, LEAF_COUNT_OFFSET));
+	let area_start = LEAF_OFFSETS_OFFSET
+		.checked_add(count * size_of::<u16>())
+		.ok_or_else(|| invalid_index("scalar leaf directory overflows usize"))?;
+	if area_start > PAGE_SIZE {
+		return Err(invalid_index("scalar leaf directory exceeds its page"));
+	}
+	Ok((count, area_start))
+}
+
+fn decode_scalar_atoms(
+	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	entry: StandardLeafEntry<'_>,
+) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+	let mut atoms = entry
+		.inline
+		.chunks_exact(DISK_ATOM_REF_BYTES)
+		.map(|bytes| DiskAtomRef::from_raw(read_u64(bytes, 0)))
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let mut page_no = entry.posting;
+	let mut visited = BTreeSet::new();
+	while atoms.len() < entry.total_count {
+		if page_no == PageNo::NULL || !visited.insert(page_no) {
+			return Err(invalid_index("scalar posting chain ended early or contains a cycle"));
+		}
+		let mut page = AlignedPage::zeroed();
+		read_page(page_no, &mut page)?;
+		let header = page.validate(page_no)?;
+		let bytes = page.as_bytes();
+		if header.page_type() != PageType::IndexPostingBtreeLeaf
+			|| header.flags() != PageFlags::LEAF
+			|| read_u32(bytes, POSTING_RESERVED_OFFSET) != 0
+		{
+			return Err(invalid_index("invalid scalar posting page header or padding"));
+		}
+		let count = usize::try_from(read_u32(bytes, POSTING_COUNT_OFFSET))
+			.map_err(|_error| invalid_index("posting count does not fit usize"))?;
+		if count == 0 || count > POSTING_ATOMS_PER_PAGE || atoms.len() + count > entry.total_count {
+			return Err(invalid_index("scalar posting page count is inconsistent"));
+		}
+		for index in 0..count {
+			atoms.push(DiskAtomRef::from_raw(read_u64(
+				bytes,
+				POSTING_ATOMS_OFFSET + index * DISK_ATOM_REF_BYTES,
+			))?);
+		}
+		validate_zero(
+			&bytes[POSTING_ATOMS_OFFSET + count * DISK_ATOM_REF_BYTES..],
+			"scalar posting trailing bytes",
+		)?;
+		page_no = PageNo::new(read_u64(bytes, POSTING_NEXT_OFFSET));
+	}
+	if page_no != PageNo::NULL || atoms.windows(2).any(|pair| pair[0] >= pair[1]) {
+		return Err(invalid_index("scalar posting chain has a tail or unordered atoms"));
+	}
+	Ok(atoms)
+}
+
+fn invalid_bounds(lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
+	match (lower, upper) {
+		(Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+		(Bound::Included(lower) | Bound::Excluded(lower), Bound::Excluded(upper))
+		| (Bound::Excluded(lower), Bound::Included(upper)) => lower >= upper,
+		_ => false,
+	}
+}
+
+fn key_in_bounds(key: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
+	let lower = match lower {
+		Bound::Included(lower) => key >= *lower,
+		Bound::Excluded(lower) => key > *lower,
+		Bound::Unbounded => true,
+	};
+	lower && !upper_exceeded(key, upper)
+}
+
+fn upper_exceeded(key: &[u8], upper: &Bound<&[u8]>) -> bool {
+	match upper {
+		Bound::Included(upper) => key > *upper,
+		Bound::Excluded(upper) => key >= *upper,
+		Bound::Unbounded => false,
+	}
 }
 
 fn partition_leaf_entries(
@@ -878,6 +1468,105 @@ mod tests {
 			},
 		];
 		assert!(build_primary_index(&entries, PageLsn::ZERO).is_err());
+		Ok(())
+	}
+
+	#[test]
+	fn standard_scalar_tree_round_trips_postings_and_bounded_ranges() -> FerrosGrynnResult<()> {
+		let repeated = (0..4_100_u64)
+			.map(|slot| DiskAtomRef::from_parts(AtomKind::Node, slot))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let entries = vec![
+			ScalarIndexEntry {
+				key: b"alpha".to_vec(),
+				atoms: vec![DiskAtomRef::from_parts(AtomKind::Edge, 1)?],
+			},
+			ScalarIndexEntry {
+				key: b"middle".to_vec(),
+				atoms: repeated.clone(),
+			},
+			ScalarIndexEntry {
+				key: b"zulu".to_vec(),
+				atoms: vec![DiskAtomRef::from_parts(AtomKind::Edge, 2)?],
+			},
+		];
+		let built = build_scalar_index(&entries, ScalarIndexMode::Standard, PageLsn::ZERO)?;
+		let read = |page_no: PageNo, output: &mut AlignedPage| {
+			let page = built
+				.pages
+				.get(page_no.get() as usize)
+				.ok_or_else(|| invalid_index("test scalar page missing"))?;
+			output.as_bytes_mut().copy_from_slice(page.as_bytes());
+			Ok(())
+		};
+		assert_eq!(
+			lookup_scalar_index(read, built.root, ScalarIndexMode::Standard, b"middle")?,
+			repeated
+		);
+		let range = range_scalar_index(
+			|page_no, output| {
+				let page = built
+					.pages
+					.get(page_no.get() as usize)
+					.ok_or_else(|| invalid_index("test scalar page missing"))?;
+				output.as_bytes_mut().copy_from_slice(page.as_bytes());
+				Ok(())
+			},
+			built.root,
+			ScalarIndexMode::Standard,
+			Bound::Included(b"middle"),
+			Bound::Excluded(b"zulu"),
+		)?;
+		assert_eq!(range.len(), 4_100);
+		Ok(())
+	}
+
+	#[test]
+	fn unique_scalar_tree_rejects_more_than_one_atom_per_key() -> FerrosGrynnResult<()> {
+		let entries = vec![ScalarIndexEntry {
+			key: b"duplicate".to_vec(),
+			atoms: vec![
+				DiskAtomRef::from_parts(AtomKind::Node, 1)?,
+				DiskAtomRef::from_parts(AtomKind::Node, 2)?,
+			],
+		}];
+		assert!(build_scalar_index(&entries, ScalarIndexMode::Unique, PageLsn::ZERO).is_err());
+		Ok(())
+	}
+
+	#[test]
+	fn unique_scalar_range_descends_to_its_lower_bound() -> FerrosGrynnResult<()> {
+		let entries = (0..4_000_u64)
+			.map(|slot| {
+				Ok(ScalarIndexEntry {
+					key: format!("{slot:08}").into_bytes(),
+					atoms: vec![DiskAtomRef::from_parts(AtomKind::Node, slot)?],
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let built = build_scalar_index(&entries, ScalarIndexMode::Unique, PageLsn::ZERO)?;
+		assert!(built.root != PageNo::new(0));
+		let mut first_leaf_read = false;
+		let atoms = range_scalar_index(
+			|page_no, output| {
+				first_leaf_read |= page_no == PageNo::new(0);
+				let page = built
+					.pages
+					.get(page_no.get() as usize)
+					.ok_or_else(|| invalid_index("test scalar page missing"))?;
+				output.as_bytes_mut().copy_from_slice(page.as_bytes());
+				Ok(())
+			},
+			built.root,
+			ScalarIndexMode::Unique,
+			Bound::Included(b"00003990"),
+			Bound::Included(b"00003995"),
+		)?;
+		assert_eq!(
+			atoms.iter().map(|atom| atom.slot()).collect::<Vec<_>>(),
+			(3_990..=3_995).collect::<Vec<_>>(),
+		);
+		assert!(!first_leaf_read);
 		Ok(())
 	}
 }

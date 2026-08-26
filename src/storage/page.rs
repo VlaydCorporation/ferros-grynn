@@ -421,23 +421,6 @@ impl AlignedPage {
 		validate_page_bytes(self.as_bytes(), expected_page_no)
 	}
 
-	/// Decodes and validates a page owned exclusively by the caller.
-	///
-	/// Unlike [`Self::validate`], this path avoids copying the complete page by
-	/// temporarily clearing and then restoring the persisted checksum field.
-	///
-	/// # Errors
-	///
-	/// Returns the same format and checksum errors as [`Self::validate`].
-	pub(super) fn validate_mut(
-		&mut self,
-		expected_page_no: PageNo,
-	) -> FerrosGrynnResult<PageHeader> {
-		let header = RawPageHeader::decode(self.as_bytes()).validate(expected_page_no)?;
-		let expected_checksum = page_checksum_preserving(self.as_bytes_mut());
-		validate_checksum(header, expected_checksum, expected_page_no)
-	}
-
 	/// Copies a validated page, assigns its frame LSN, and reseals it.
 	///
 	/// WAL is the only caller allowed to assign the final page LSN. Keeping the
@@ -470,7 +453,7 @@ impl AlignedPage {
 		expected_page_no: PageNo,
 		page_lsn: PageLsn,
 	) -> FerrosGrynnResult<()> {
-		let mut header = self.validate_mut(expected_page_no)?;
+		let mut header = self.validate(expected_page_no)?;
 		header.page_lsn = page_lsn;
 		header.checksum = 0;
 		header.write_to(self);
@@ -682,16 +665,6 @@ fn page_checksum_mut(bytes: &mut [u8; PAGE_SIZE]) -> u64 {
 	rapidhash_v3(bytes)
 }
 
-/// Computes a checksum in exclusive storage and restores the persisted bytes.
-fn page_checksum_preserving(bytes: &mut [u8; PAGE_SIZE]) -> u64 {
-	let mut stored_checksum = [0; size_of::<u64>()];
-	stored_checksum.copy_from_slice(&bytes[CHECKSUM_OFFSET..PAGE_NO_OFFSET]);
-	bytes[CHECKSUM_OFFSET..PAGE_NO_OFFSET].fill(0);
-	let checksum = rapidhash_v3(bytes);
-	bytes[CHECKSUM_OFFSET..PAGE_NO_OFFSET].copy_from_slice(&stored_checksum);
-	checksum
-}
-
 /// Reads one little-endian `u16` from a format-defined fixed offset.
 fn read_u16_le(bytes: &[u8; PAGE_SIZE], offset: usize) -> u16 {
 	let mut encoded = [0; size_of::<u16>()];
@@ -793,23 +766,6 @@ mod tests {
 			.err()
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_page(0, "corruption was accepted"))?;
 		assert_eq!(error.status().code().to_string(), "FG-22S08");
-		Ok(())
-	}
-
-	#[test]
-	fn mutable_validation_restores_persisted_checksum() -> FerrosGrynnResult<()> {
-		let mut page = AlignedPage::new(
-			PageType::NodeHot,
-			PageFlags::empty(),
-			PageLsn::new(1),
-			PageNo::new(0),
-		);
-		let checksum = page.as_bytes()[CHECKSUM_OFFSET..PAGE_NO_OFFSET].to_owned();
-
-		let header = page.validate_mut(PageNo::new(0))?;
-
-		assert_eq!(page.as_bytes()[CHECKSUM_OFFSET..PAGE_NO_OFFSET], checksum);
-		assert_eq!(page.validate(PageNo::new(0))?, header);
 		Ok(())
 	}
 
