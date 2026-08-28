@@ -29,6 +29,7 @@ use crate::{
 		LocalQueryAtom,
 		LocalReadTransaction,
 		LocalStore,
+		PageIoMode,
 	},
 	values::{
 		runtime::{
@@ -97,7 +98,7 @@ pub enum IoMode {
 	/// Synchronous positional Direct I/O.
 	#[default]
 	Sync,
-	/// Native asynchronous I/O implemented by the later async storage stage.
+	/// Windows IoRing Direct I/O when the `native-async-io` feature is enabled.
 	NativeAsync,
 }
 
@@ -841,16 +842,27 @@ impl StoreInner {
 struct ValidatedLocalOptions {
 	pool_pages: NonZeroUsize,
 	checkpoint_page_threshold: usize,
+	io_mode: PageIoMode,
 }
 
-/// Validates only options implemented by the current synchronous local slice.
+/// Validates local resource limits and compile-time I/O availability.
 fn validate_local_options(options: LocalOptions) -> FerrosGrynnResult<ValidatedLocalOptions> {
-	if options.io_mode != IoMode::Sync {
-		return Err(FerrosGrynnError::io_mode_unavailable(
-			"NativeAsync",
-			"native async I/O belongs to stage 6 and has no silent sync fallback",
-		));
-	}
+	let io_mode = match options.io_mode {
+		IoMode::Sync => PageIoMode::Sync,
+		IoMode::NativeAsync => {
+			#[cfg(all(windows, feature = "native-async-io"))]
+			{
+				PageIoMode::NativeAsync
+			}
+			#[cfg(not(all(windows, feature = "native-async-io")))]
+			{
+				return Err(FerrosGrynnError::io_mode_unavailable(
+					"NativeAsync",
+					"Windows IoRing support requires a Windows build with feature native-async-io",
+				));
+			}
+		}
+	};
 	let pool_pages = NonZeroUsize::new(options.buffer_pool_pages).ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("local buffer_pool_pages must be greater than zero")
 	})?;
@@ -868,6 +880,7 @@ fn validate_local_options(options: LocalOptions) -> FerrosGrynnResult<ValidatedL
 	Ok(ValidatedLocalOptions {
 		pool_pages,
 		checkpoint_page_threshold,
+		io_mode,
 	})
 }
 
@@ -914,6 +927,7 @@ impl Datastore {
 			path,
 			database_name,
 			validated.pool_pages,
+			validated.io_mode,
 			validated.checkpoint_page_threshold,
 			options.checkpoint.interval,
 		)?;
@@ -943,6 +957,7 @@ impl Datastore {
 		let (local, snapshot) = LocalStore::open(
 			path,
 			validated.pool_pages,
+			validated.io_mode,
 			validated.checkpoint_page_threshold,
 			options.checkpoint.interval,
 		)?;
@@ -3356,6 +3371,39 @@ mod tests {
 		assert_eq!(rows.as_slice(), &[Value::from(31_i64)]);
 	}
 
+	/// The public NativeAsync selector drives IoRing through WAL commit,
+	/// checkpoint backfill, close, and reopen without changing query semantics.
+	#[cfg(all(windows, feature = "native-async-io"))]
+	#[test]
+	fn native_async_local_checkpoint_survives_reopen() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 32,
+			io_mode: IoMode::NativeAsync,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut graph = Graph::<Mutable>::new();
+		for index in 0..16 {
+			graph
+				.add_node_with_id(
+					format!("native:{index}").parse().unwrap(),
+					None,
+					PropertyMap::new(),
+				)
+				.unwrap();
+		}
+		let mut transaction = store.begin();
+		let graph = transaction.create_graph(graph_id("native"), graph.freeze().into()).unwrap();
+		transaction.commit().unwrap();
+		store.checkpoint(CheckpointMode::Restart).unwrap();
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let transaction = reopened.begin();
+		assert_eq!(graph.read(&transaction).unwrap().node_count().unwrap(), 16);
+	}
+
 	/// Nested graphs, transition graphs and cross-level incidence remain
 	/// readable after recovery and through explicit hybrid materialization.
 	#[cfg(windows)]
@@ -4144,6 +4192,7 @@ mod tests {
 		assert_eq!(store.begin().commit().unwrap_err().status().code().to_string(), "FG-25F01");
 	}
 
+	#[cfg(not(all(windows, feature = "native-async-io")))]
 	#[test]
 	fn unavailable_native_async_mode_has_no_sync_fallback() {
 		let error = validate_local_options(LocalOptions {

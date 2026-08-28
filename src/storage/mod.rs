@@ -14,12 +14,14 @@ mod graph_index;
 mod graph_pages;
 mod local;
 mod page;
+mod page_io;
 mod page_manager;
 mod store;
 mod superblock;
 mod types;
 mod wal;
 
+pub use page_io::PageIoMode;
 pub use store::{
 	LocalCommitGraph,
 	LocalCommitResult,

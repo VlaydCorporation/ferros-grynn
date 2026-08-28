@@ -5,6 +5,7 @@ use std::{
 	fs,
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -29,6 +30,7 @@ use super::{
 		write_superblock_atomic,
 	},
 	page::{AlignedPage, PAGE_SIZE, PageLsn, PageNo},
+	page_io::{FilePageExtent, PageIo, PageIoMode},
 	superblock::{DatabaseSuperblock, GraphSuperblock},
 	types::{CheckpointGeneration, CommitTs, GraphId, Lsn, PageKey, TxId},
 	wal::{CommitOutcome, FrameWal, RecoverySeed, ResolvedFrame, TxHandle},
@@ -84,6 +86,8 @@ pub(super) struct SyncPageManager {
 	wal: FrameWal,
 	/// Fixed-budget immutable page cache.
 	pool: BufferPool,
+	/// User-selected physical page transport.
+	page_io: PageIo,
 	/// Reusable calibrated extent for mixed home-file batch reads.
 	read_scratch: Mutex<Vec<AlignedPage>>,
 	/// Reusable calibrated extent for recovery and checkpoint backfill.
@@ -112,6 +116,7 @@ impl SyncPageManager {
 		database_directory: impl AsRef<Path>,
 		database_name: &str,
 		pool_pages: NonZeroUsize,
+		io_mode: PageIoMode,
 	) -> FerrosGrynnResult<(Self, DatabaseCatalog, FileCatalog)> {
 		let database_directory = database_directory.as_ref();
 		fs::create_dir(database_directory)
@@ -160,6 +165,7 @@ impl SyncPageManager {
 			database_directory,
 			registrations,
 			pool_pages,
+			io_mode,
 			database_lock,
 			database,
 		)?;
@@ -177,6 +183,7 @@ impl SyncPageManager {
 	pub(super) fn open_cataloged(
 		database_directory: impl AsRef<Path>,
 		pool_pages: NonZeroUsize,
+		io_mode: PageIoMode,
 	) -> FerrosGrynnResult<(Self, DatabaseCatalog, FileCatalog)> {
 		let database_directory = database_directory.as_ref();
 		let database_lock = DatabaseLock::acquire(database_directory)?;
@@ -217,6 +224,7 @@ impl SyncPageManager {
 			database_directory,
 			registrations,
 			pool_pages,
+			io_mode,
 			database_lock,
 			database,
 			wal,
@@ -238,12 +246,20 @@ impl SyncPageManager {
 		database_directory: impl AsRef<Path>,
 		registrations: Vec<DataFileRegistration>,
 		pool_pages: NonZeroUsize,
+		io_mode: PageIoMode,
 	) -> FerrosGrynnResult<Self> {
 		let database_directory = database_directory.as_ref();
 		let database_lock = DatabaseLock::acquire(database_directory)?;
 		let database_path = database_directory.join(DATABASE_SUPERBLOCK_FILE);
 		let database = select_database_superblock(&database_path)?;
-		Self::open_owned(database_directory, registrations, pool_pages, database_lock, database)
+		Self::open_owned(
+			database_directory,
+			registrations,
+			pool_pages,
+			io_mode,
+			database_lock,
+			database,
+		)
 	}
 
 	/// Initializes the manager after ownership, database authority, and trusted
@@ -252,6 +268,7 @@ impl SyncPageManager {
 		database_directory: &Path,
 		registrations: Vec<DataFileRegistration>,
 		pool_pages: NonZeroUsize,
+		io_mode: PageIoMode,
 		database_lock: DatabaseLock,
 		database: DatabaseSuperblock,
 	) -> FerrosGrynnResult<Self> {
@@ -263,6 +280,7 @@ impl SyncPageManager {
 			database_directory,
 			registrations,
 			pool_pages,
+			io_mode,
 			database_lock,
 			database,
 			wal,
@@ -275,6 +293,7 @@ impl SyncPageManager {
 		database_directory: &Path,
 		registrations: Vec<DataFileRegistration>,
 		pool_pages: NonZeroUsize,
+		io_mode: PageIoMode,
 		database_lock: DatabaseLock,
 		database: DatabaseSuperblock,
 		wal: FrameWal,
@@ -324,13 +343,15 @@ impl SyncPageManager {
 			));
 		}
 
-		let registry = FileRegistry::open(registrations)?;
+		let page_io = PageIo::new(io_mode)?;
+		let registry = FileRegistry::open(registrations, page_io.file_open_mode())?;
 		let manager = Self {
 			_database_lock: database_lock,
 			database_path,
 			registry: RwLock::new(registry),
 			wal,
 			pool: BufferPool::new(pool_pages),
+			page_io,
 			read_scratch: Mutex::new(aligned_extent()),
 			checkpoint_scratch: Mutex::new(aligned_extent()),
 			checkpoint_mutex: Mutex::new(()),
@@ -394,7 +415,7 @@ impl SyncPageManager {
 		let file = self.transactional_file(key)?;
 		self.pool
 			.get_or_load(PageCacheKey::new(key, version), |output| {
-				file.file()?.read_page(key.page_no(), output)
+				self.page_io.read_page(file.file()?, key.page_no(), output)
 			})
 			.map(PageRead::Cached)
 	}
@@ -465,11 +486,24 @@ impl SyncPageManager {
 
 		if !home_keys.is_empty() {
 			let mut scratch = self.read_scratch.lock();
-			let guards =
-				self.pool.get_or_load_batch(&home_keys, &mut scratch, |first, pages| {
-					let file = self.transactional_file(first)?;
-					file.file()?.read_pages_raw(first.page_no(), pages)
-				})?;
+			let guards = self.pool.get_or_load_batch_extents(
+				&home_keys,
+				&mut scratch,
+				|load_extents, pages| {
+					let mut io_extents = Vec::with_capacity(load_extents.len());
+					for extent in load_extents {
+						let first = extent.first_key();
+						let file = self.transactional_file(first)?;
+						io_extents.push(FilePageExtent::new(
+							Arc::clone(file.file()?),
+							first.page_no(),
+							extent.buffer_start(),
+							extent.page_count(),
+						));
+					}
+					self.page_io.read_extents(&io_extents, pages)
+				},
+			)?;
 			for (position, guard) in home_positions.into_iter().zip(guards) {
 				output[position] = Some(PageRead::Cached(guard));
 			}
@@ -522,7 +556,7 @@ impl SyncPageManager {
 			FerrosGrynnError::invalid_storage_file("database superblock has no parent directory")
 		})?;
 		validate_registration_paths(database_directory, &registrations)?;
-		self.registry.write().insert(registrations)
+		self.registry.write().insert(registrations, self.page_io.file_open_mode())
 	}
 
 	/// Drops newly opened files when their catalog-root transaction did not
@@ -781,32 +815,47 @@ impl SyncPageManager {
 		let mut scratch = self.checkpoint_scratch.lock();
 		let mut start = 0;
 		while start < frames.len() {
-			let first = frames[start];
-			let mut end = start + 1;
-			while end < frames.len() && end - start < scratch.len() {
-				let previous = frames[end - 1].key();
-				let current = frames[end].key();
-				let adjacent = previous
-					.page_no()
-					.get()
-					.checked_add(1)
-					.is_some_and(|next| next == current.page_no().get());
-				if current.graph_id() != first.key().graph_id()
-					|| current.file_id() != first.key().file_id()
-					|| !adjacent
-				{
-					break;
+			let mut buffer_pages = 0;
+			let mut io_extents = Vec::new();
+			while start < frames.len() && buffer_pages < scratch.len() {
+				let first = frames[start];
+				let remaining_buffer = scratch.len() - buffer_pages;
+				let mut end = start + 1;
+				while end < frames.len() && end - start < remaining_buffer {
+					let previous = frames[end - 1].key();
+					let current = frames[end].key();
+					let adjacent = previous
+						.page_no()
+						.get()
+						.checked_add(1)
+						.is_some_and(|next| next == current.page_no().get());
+					if current.graph_id() != first.key().graph_id()
+						|| current.file_id() != first.key().file_id()
+						|| !adjacent
+					{
+						break;
+					}
+					end += 1;
 				}
-				end += 1;
+				let extent = &frames[start..end];
+				let buffer_end = buffer_pages + extent.len();
+				for (frame, page) in
+					extent.iter().copied().zip(&mut scratch[buffer_pages..buffer_end])
+				{
+					self.wal.read_frame(frame, page)?;
+				}
+				let file = self.transactional_file(first.key())?;
+				io_extents.push(FilePageExtent::new(
+					Arc::clone(file.file()?),
+					first.key().page_no(),
+					buffer_pages,
+					extent.len(),
+				));
+				touched.insert((first.key().graph_id(), first.key().file_id()));
+				buffer_pages = buffer_end;
+				start = end;
 			}
-			let extent = &frames[start..end];
-			for (frame, page) in extent.iter().copied().zip(&mut scratch[..extent.len()]) {
-				self.wal.read_frame(frame, page)?;
-			}
-			let file = self.transactional_file(first.key())?;
-			file.file()?.write_pages(first.key().page_no(), &scratch[..extent.len()])?;
-			touched.insert((first.key().graph_id(), first.key().file_id()));
-			start = end;
+			self.page_io.write_extents(&io_extents, &scratch[..buffer_pages])?;
 		}
 		for (graph_id, file_id) in touched {
 			self.registry.read().resolve_file(graph_id, file_id)?.file()?.sync_data()?;
@@ -825,7 +874,8 @@ impl SyncPageManager {
 		for frame in frames {
 			self.wal.read_frame(frame, page)?;
 			let key = frame.key();
-			self.transactional_file(key)?.file()?.write_page(key.page_no(), page)?;
+			let file = self.transactional_file(key)?;
+			self.page_io.write_page(file.file()?, key.page_no(), page)?;
 			touched.insert((key.graph_id(), key.file_id()));
 		}
 		for (graph_id, file_id) in touched {
@@ -853,7 +903,8 @@ impl SyncPageManager {
 						))
 					})?;
 				let pages = &mut scratch[..count];
-				file.read_pages_raw(PageNo::new(first), pages)?;
+				let extent = FilePageExtent::new(Arc::clone(file), PageNo::new(first), 0, count);
+				self.page_io.read_extents(std::slice::from_ref(&extent), pages)?;
 				for (offset, page) in pages.iter_mut().enumerate() {
 					let offset = u64::try_from(offset).map_err(|source| {
 						FerrosGrynnError::storage_io_failure(format!(
@@ -1104,7 +1155,12 @@ mod tests {
 			let capacity = NonZeroUsize::new(pages).ok_or_else(|| {
 				FerrosGrynnError::storage_io_failure("manager test capacity is zero")
 			})?;
-			SyncPageManager::open_local(&self.directory, self.registrations(), capacity)
+			SyncPageManager::open_local(
+				&self.directory,
+				self.registrations(),
+				capacity,
+				PageIoMode::Sync,
+			)
 		}
 
 		/// Returns one physical key in a fixture file.
@@ -1120,15 +1176,27 @@ mod tests {
 		let path = TestDatabasePath::new("cataloged-manager")?;
 		let capacity = NonZeroUsize::new(8)
 			.ok_or_else(|| io::Error::other("cataloged test capacity must be non-zero"))?;
-		let (manager, database_catalog, file_catalog) =
-			SyncPageManager::create_cataloged(path.path(), "cataloged", capacity)?;
+		let (manager, database_catalog, file_catalog) = SyncPageManager::create_cataloged(
+			path.path(),
+			"cataloged",
+			capacity,
+			PageIoMode::Sync,
+		)?;
 		assert!(database_catalog.graphs.is_empty());
 		assert_eq!(file_catalog.files.len(), 1);
-		assert!(SyncPageManager::create_cataloged(path.path(), "replacement", capacity).is_err());
+		assert!(
+			SyncPageManager::create_cataloged(
+				path.path(),
+				"replacement",
+				capacity,
+				PageIoMode::Sync,
+			)
+			.is_err()
+		);
 		drop(manager);
 
 		let (reopened, database_catalog, file_catalog) =
-			SyncPageManager::open_cataloged(path.path(), capacity)?;
+			SyncPageManager::open_cataloged(path.path(), capacity, PageIoMode::Sync)?;
 		assert!(database_catalog.graphs.is_empty());
 		assert_eq!(file_catalog.files.len(), 1);
 		assert_eq!(

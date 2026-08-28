@@ -28,13 +28,26 @@ pub(super) const SYNC_BATCH_BYTES: usize = 256 * KIBIBYTE;
 /// Number of complete pages in the calibrated synchronous extent.
 pub(super) const SYNC_BATCH_PAGES: usize = SYNC_BATCH_BYTES / PAGE_SIZE;
 
-/// A data file opened with the native synchronous Direct I/O flag.
+/// Windows handle behavior selected by the page transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DirectFileOpenMode {
+	/// Synchronous positional operations on a non-overlapped handle.
+	Synchronous,
+	/// Native queued operations on a `FILE_FLAG_OVERLAPPED` handle.
+	Overlapped,
+}
+
+/// A data file opened with native Direct I/O flags.
 ///
 /// The owned [`File`] closes automatically. Every operation uses an explicit
 /// byte offset; no shared file cursor participates in page I/O.
 pub(super) struct DirectFile {
 	/// Native RAII file handle.
 	file: File,
+	/// Companion handle used only for queued Windows submissions; the primary
+	/// handle keeps scalar positional I/O synchronous.
+	#[cfg(windows)]
+	overlapped_file: Option<File>,
 	/// Cached file length in pages.
 	///
 	/// Relaxed ordering is sufficient: this value is only a numeric bound and
@@ -50,7 +63,7 @@ impl DirectFile {
 	/// Returns a structured I/O error if creation fails, or Direct I/O is not
 	/// available on the target platform or filesystem.
 	pub(super) fn create_new(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
-		Self::open(path.as_ref(), OpenMode::CreateNew)
+		Self::open(path.as_ref(), OpenMode::CreateNew, DirectFileOpenMode::Synchronous)
 	}
 
 	/// Opens an existing data file for positional reads.
@@ -60,7 +73,7 @@ impl DirectFile {
 	/// Returns an error if opening fails, Direct I/O is unavailable, or the
 	/// existing file length is not a multiple of [`PAGE_SIZE`].
 	pub(super) fn open_read_only(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
-		Self::open(path.as_ref(), OpenMode::ReadOnly)
+		Self::open(path.as_ref(), OpenMode::ReadOnly, DirectFileOpenMode::Synchronous)
 	}
 
 	/// Opens an existing data file for positional reads and writes.
@@ -70,7 +83,21 @@ impl DirectFile {
 	/// Returns an error if opening fails, Direct I/O is unavailable, or the
 	/// existing file length is not a multiple of [`PAGE_SIZE`].
 	pub(super) fn open_read_write(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
-		Self::open(path.as_ref(), OpenMode::ReadWrite)
+		Self::open(path.as_ref(), OpenMode::ReadWrite, DirectFileOpenMode::Synchronous)
+	}
+
+	/// Opens an existing read-write file with the requested native handle
+	/// behavior.
+	///
+	/// # Errors
+	///
+	/// Returns an error if opening fails, Direct I/O is unavailable, or the
+	/// existing file length is not a multiple of [`PAGE_SIZE`].
+	pub(super) fn open_read_write_with_mode(
+		path: impl AsRef<Path>,
+		io_mode: DirectFileOpenMode,
+	) -> FerrosGrynnResult<Self> {
+		Self::open(path.as_ref(), OpenMode::ReadWrite, io_mode)
 	}
 
 	/// Returns the number of complete pages known to this handle.
@@ -178,13 +205,7 @@ impl DirectFile {
 		if pages.is_empty() {
 			return Ok(());
 		}
-		let page_count = u64::try_from(pages.len()).map_err(|source| {
-			FerrosGrynnError::invalid_storage_page(
-				first_page.get(),
-				format!("batch page count does not fit u64: {source}"),
-			)
-		})?;
-		let offset = checked_page_extent(first_page, page_count, self.page_count())?;
+		let offset = self.prepare_read_extent(first_page, pages.len())?;
 		read_extent_at(&self.file, AlignedPage::slice_as_bytes_mut(pages), offset)
 	}
 
@@ -259,6 +280,56 @@ impl DirectFile {
 		if pages.is_empty() {
 			return Ok(());
 		}
+		let (offset, end_page) = self.prepare_write_extent(first_page, pages)?;
+		write_extent_at(&self.file, AlignedPage::slice_as_bytes(pages), offset)?;
+		self.complete_write_extent(end_page);
+		Ok(())
+	}
+
+	/// Validates one raw read extent and returns its byte offset.
+	///
+	/// # Errors
+	///
+	/// Returns an error for an empty or out-of-range extent, conversion
+	/// failure, or arithmetic overflow.
+	pub(super) fn prepare_read_extent(
+		&self,
+		first_page: PageNo,
+		page_count: usize,
+	) -> FerrosGrynnResult<u64> {
+		if page_count == 0 {
+			return Err(FerrosGrynnError::invalid_storage_page(
+				first_page.get(),
+				"Direct-I/O read extent must not be empty",
+			));
+		}
+		let page_count = u64::try_from(page_count).map_err(|source| {
+			FerrosGrynnError::invalid_storage_page(
+				first_page.get(),
+				format!("batch page count does not fit u64: {source}"),
+			)
+		})?;
+		checked_page_extent(first_page, page_count, self.page_count())
+	}
+
+	/// Validates pages for one queued write and returns its byte offset and
+	/// exclusive ending page number.
+	///
+	/// # Errors
+	///
+	/// Returns an error for an empty or invalid extent, a file gap, conversion
+	/// failure, or arithmetic overflow.
+	pub(super) fn prepare_write_extent(
+		&self,
+		first_page: PageNo,
+		pages: &[AlignedPage],
+	) -> FerrosGrynnResult<(u64, u64)> {
+		if pages.is_empty() {
+			return Err(FerrosGrynnError::invalid_storage_page(
+				first_page.get(),
+				"Direct-I/O write extent must not be empty",
+			));
+		}
 		let page_count = u64::try_from(pages.len()).map_err(|source| {
 			FerrosGrynnError::invalid_storage_page(
 				first_page.get(),
@@ -282,13 +353,34 @@ impl DirectFile {
 					format!("batch page index does not fit u64: {source}"),
 				)
 			})?;
-			let page_no = PageNo::new(first_page.get() + index);
-			page.validate(page_no)?;
+			page.validate(PageNo::new(first_page.get() + index))?;
 		}
-		let offset = checked_page_offset(first_page)?;
-		write_extent_at(&self.file, AlignedPage::slice_as_bytes(pages), offset)?;
+		Ok((checked_page_offset(first_page)?, end_page))
+	}
+
+	/// Publishes a successfully written extent to the cached length bound.
+	pub(super) fn complete_write_extent(&self, end_page: u64) {
 		self.page_count.fetch_max(end_page, AtomicOrdering::Relaxed);
-		Ok(())
+	}
+
+	/// Borrows the native Windows handle for an IoRing submission.
+	///
+	/// # Errors
+	///
+	/// Returns an error when this file was not opened with its overlapped
+	/// companion handle.
+	#[cfg(all(windows, feature = "native-async-io"))]
+	pub(super) fn raw_handle(&self) -> FerrosGrynnResult<windows::Win32::Foundation::HANDLE> {
+		use std::os::windows::io::AsRawHandle;
+
+		self.overlapped_file
+			.as_ref()
+			.map(|file| windows::Win32::Foundation::HANDLE(file.as_raw_handle()))
+			.ok_or_else(|| {
+				FerrosGrynnError::storage_io_failure(
+					"Windows IoRing requested a file without an overlapped companion handle",
+				)
+			})
 	}
 
 	/// Makes preceding data-file writes durable at an explicit protocol
@@ -298,7 +390,9 @@ impl DirectFile {
 	///
 	/// Returns an error if the operating system cannot synchronize file data.
 	pub(super) fn sync_data(&self) -> FerrosGrynnResult<()> {
-		self.file.sync_data().map_err(|source| io_failure("synchronize data file", source))
+		self.durability_handle()
+			.sync_data()
+			.map_err(|source| io_failure("synchronize data file", source))
 	}
 
 	/// Makes preceding data and metadata changes durable.
@@ -307,23 +401,55 @@ impl DirectFile {
 	///
 	/// Returns an error if the operating system cannot synchronize the file.
 	pub(super) fn sync_all(&self) -> FerrosGrynnResult<()> {
-		self.file.sync_all().map_err(|source| io_failure("synchronize complete data file", source))
+		self.durability_handle()
+			.sync_all()
+			.map_err(|source| io_failure("synchronize complete data file", source))
+	}
+
+	/// Selects the handle that receives queued writes in native mode.
+	fn durability_handle(&self) -> &File {
+		#[cfg(windows)]
+		if let Some(file) = self.overlapped_file.as_ref() {
+			return file;
+		}
+		&self.file
 	}
 
 	/// Opens and validates a Direct I/O file in one of the supported modes.
-	fn open(path: &Path, mode: OpenMode) -> FerrosGrynnResult<Self> {
-		let mut options = OpenOptions::new();
-		mode.configure(&mut options);
-		configure_direct_io(&mut options)?;
-		let file = options.open(path).map_err(map_open_error)?;
+	fn open(path: &Path, mode: OpenMode, io_mode: DirectFileOpenMode) -> FerrosGrynnResult<Self> {
+		#[cfg(windows)]
+		let file = open_native_file(path, mode, DirectFileOpenMode::Synchronous)?;
+		#[cfg(not(windows))]
+		let file = open_native_file(path, mode, io_mode)?;
+		#[cfg(windows)]
+		let overlapped_file = match io_mode {
+			DirectFileOpenMode::Synchronous => None,
+			DirectFileOpenMode::Overlapped => {
+				Some(open_native_file(path, OpenMode::ReadWrite, io_mode)?)
+			}
+		};
 		let length =
 			file.metadata().map_err(|source| io_failure("read data-file metadata", source))?.len();
 		validate_file_length(length)?;
 		Ok(Self {
 			file,
+			#[cfg(windows)]
+			overlapped_file,
 			page_count: AtomicU64::new(length / PAGE_SIZE as u64),
 		})
 	}
+}
+
+/// Opens one native handle with explicit access and cache flags.
+fn open_native_file(
+	path: &Path,
+	mode: OpenMode,
+	io_mode: DirectFileOpenMode,
+) -> FerrosGrynnResult<File> {
+	let mut options = OpenOptions::new();
+	mode.configure(&mut options);
+	configure_direct_io(&mut options, io_mode)?;
+	options.open(path).map_err(map_open_error)
 }
 
 /// Supported file-open contracts without ambiguous boolean combinations.
@@ -360,7 +486,10 @@ impl OpenMode {
 	clippy::unnecessary_wraps,
 	reason = "all platform shims share the fallible signature used by unsupported targets"
 )]
-fn configure_direct_io(options: &mut OpenOptions) -> FerrosGrynnResult<()> {
+fn configure_direct_io(
+	options: &mut OpenOptions,
+	_io_mode: DirectFileOpenMode,
+) -> FerrosGrynnResult<()> {
 	use std::os::unix::fs::OpenOptionsExt;
 
 	options.custom_flags(nix::libc::O_DIRECT | nix::libc::O_CLOEXEC);
@@ -373,25 +502,36 @@ fn configure_direct_io(options: &mut OpenOptions) -> FerrosGrynnResult<()> {
 	clippy::unnecessary_wraps,
 	reason = "all platform shims share the fallible signature used by unsupported targets"
 )]
-fn configure_direct_io(options: &mut OpenOptions) -> FerrosGrynnResult<()> {
+fn configure_direct_io(
+	options: &mut OpenOptions,
+	io_mode: DirectFileOpenMode,
+) -> FerrosGrynnResult<()> {
 	use std::os::windows::fs::OpenOptionsExt;
 
 	use windows::Win32::Storage::FileSystem::{
 		FILE_FLAG_NO_BUFFERING,
+		FILE_FLAG_OVERLAPPED,
 		FILE_SHARE_DELETE,
 		FILE_SHARE_READ,
 		FILE_SHARE_WRITE,
 	};
 
+	let flags = match io_mode {
+		DirectFileOpenMode::Synchronous => FILE_FLAG_NO_BUFFERING,
+		DirectFileOpenMode::Overlapped => FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
+	};
 	options
-		.custom_flags(FILE_FLAG_NO_BUFFERING.0)
+		.custom_flags(flags.0)
 		.share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0);
 	Ok(())
 }
 
 /// Rejects platforms for which format-v1 Direct I/O is not specified.
 #[cfg(not(any(target_os = "linux", windows)))]
-fn configure_direct_io(_options: &mut OpenOptions) -> FerrosGrynnResult<()> {
+fn configure_direct_io(
+	_options: &mut OpenOptions,
+	_io_mode: DirectFileOpenMode,
+) -> FerrosGrynnResult<()> {
 	Err(FerrosGrynnError::direct_io_unavailable(format!(
 		"target {} is not supported; format-v1 data files require Linux or Windows",
 		std::env::consts::OS

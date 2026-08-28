@@ -290,6 +290,31 @@ impl BufferPool {
 	where
 		Loader: FnMut(PageKey, &mut [AlignedPage]) -> FerrosGrynnResult<()>,
 	{
+		self.get_or_load_batch_extents(keys, scratch, |extents, pages| {
+			for extent in extents {
+				let end = extent.buffer_start + extent.page_count;
+				loader(extent.first_key, &mut pages[extent.buffer_start..end])?;
+			}
+			Ok(())
+		})
+	}
+
+	/// Returns a batch while exposing all independent extents to one loader so
+	/// a native transport may submit them concurrently.
+	///
+	/// # Errors
+	///
+	/// Returns the same admission, load, validation, and metadata errors as
+	/// [`Self::get_or_load_batch`].
+	pub(super) fn get_or_load_batch_extents<Loader>(
+		&self,
+		keys: &[PageCacheKey],
+		scratch: &mut [AlignedPage],
+		mut loader: Loader,
+	) -> FerrosGrynnResult<Vec<PageGuard>>
+	where
+		Loader: FnMut(&[PageLoadExtent], &mut [AlignedPage]) -> FerrosGrynnResult<()>,
+	{
 		if keys.is_empty() {
 			return Ok(Vec::new());
 		}
@@ -589,6 +614,33 @@ struct BatchLoadReservation {
 	page: CachedPage,
 }
 
+/// One source-local extent and its assigned range in a shared batch buffer.
+pub(super) struct PageLoadExtent {
+	/// First physical page identity in this extent.
+	first_key: PageKey,
+	/// First page in the shared scratch buffer.
+	buffer_start: usize,
+	/// Number of physically adjacent pages.
+	page_count: usize,
+}
+
+impl PageLoadExtent {
+	/// Returns the first physical page identity.
+	pub(super) const fn first_key(&self) -> PageKey {
+		self.first_key
+	}
+
+	/// Returns the first assigned page in the batch buffer.
+	pub(super) const fn buffer_start(&self) -> usize {
+		self.buffer_start
+	}
+
+	/// Returns the number of consecutive pages.
+	pub(super) const fn page_count(&self) -> usize {
+		self.page_count
+	}
+}
+
 /// Loads sorted reservations as adjacent, source-local extents.
 fn load_reserved_extents<Loader>(
 	reservations: &mut [BatchLoadReservation],
@@ -596,41 +648,62 @@ fn load_reserved_extents<Loader>(
 	loader: &mut Loader,
 ) -> FerrosGrynnResult<()>
 where
-	Loader: FnMut(PageKey, &mut [AlignedPage]) -> FerrosGrynnResult<()>,
+	Loader: FnMut(&[PageLoadExtent], &mut [AlignedPage]) -> FerrosGrynnResult<()>,
 {
-	let mut extent_start = 0;
-	while extent_start < reservations.len() {
-		let first_key = reservations[extent_start].key.page_key();
-		let version = reservations[extent_start].key.version();
-		let mut extent_end = extent_start + 1;
-		while extent_end < reservations.len() && extent_end - extent_start < scratch.len() {
-			let previous = reservations[extent_end - 1].key;
-			let current = reservations[extent_end].key;
-			let adjacent = previous.page_no().get().checked_add(1) == Some(current.page_no().get());
-			let same_file = current.page_key().graph_id() == first_key.graph_id()
-				&& current.page_key().file_id() == first_key.file_id();
-			if !same_file || current.version() != version || !adjacent {
-				break;
+	let mut next_reservation = 0;
+	while next_reservation < reservations.len() {
+		let batch_start = next_reservation;
+		let mut buffer_pages = 0;
+		let mut extents = Vec::new();
+		while next_reservation < reservations.len() && buffer_pages < scratch.len() {
+			let extent_start = next_reservation;
+			let first_key = reservations[extent_start].key.page_key();
+			let version = reservations[extent_start].key.version();
+			let remaining_buffer = scratch.len() - buffer_pages;
+			let mut extent_end = extent_start + 1;
+			while extent_end < reservations.len() && extent_end - extent_start < remaining_buffer {
+				let previous = reservations[extent_end - 1].key;
+				let current = reservations[extent_end].key;
+				let adjacent =
+					previous.page_no().get().checked_add(1) == Some(current.page_no().get());
+				let same_file = current.page_key().graph_id() == first_key.graph_id()
+					&& current.page_key().file_id() == first_key.file_id();
+				if !same_file || current.version() != version || !adjacent {
+					break;
+				}
+				extent_end += 1;
 			}
-			extent_end += 1;
+			let extent_len = extent_end - extent_start;
+			extents.push(PageLoadExtent {
+				first_key,
+				buffer_start: buffer_pages,
+				page_count: extent_len,
+			});
+			buffer_pages += extent_len;
+			next_reservation = extent_end;
 		}
 
-		let extent_len = extent_end - extent_start;
-		let extent_pages = &mut scratch[..extent_len];
-		loader(first_key, extent_pages)?;
-		let extent_reservations = &mut reservations[extent_start..extent_end];
-		if extent_len >= PARALLEL_VALIDATION_MIN_PAGES {
-			extent_reservations.par_iter_mut().zip(extent_pages.par_iter()).try_for_each(
-				|(reservation, loaded_page)| install_loaded_page(reservation, loaded_page),
-			)?;
-		} else {
-			for (reservation, loaded_page) in
-				extent_reservations.iter_mut().zip(extent_pages.iter())
-			{
-				install_loaded_page(reservation, loaded_page)?;
+		let batch_pages = &mut scratch[..buffer_pages];
+		loader(&extents, batch_pages)?;
+		let mut loaded_reservation = batch_start;
+		for extent in extents {
+			let extent_end = loaded_reservation + extent.page_count;
+			let buffer_end = extent.buffer_start + extent.page_count;
+			let extent_pages = &batch_pages[extent.buffer_start..buffer_end];
+			let extent_reservations = &mut reservations[loaded_reservation..extent_end];
+			if extent.page_count >= PARALLEL_VALIDATION_MIN_PAGES {
+				extent_reservations.par_iter_mut().zip(extent_pages.par_iter()).try_for_each(
+					|(reservation, loaded_page)| install_loaded_page(reservation, loaded_page),
+				)?;
+			} else {
+				for (reservation, loaded_page) in
+					extent_reservations.iter_mut().zip(extent_pages.iter())
+				{
+					install_loaded_page(reservation, loaded_page)?;
+				}
 			}
+			loaded_reservation = extent_end;
 		}
-		extent_start = extent_end;
 	}
 	Ok(())
 }

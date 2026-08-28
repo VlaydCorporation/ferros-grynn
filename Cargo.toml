@@ -31,6 +31,7 @@ categories = ["database-implementations", "data-structures", "embedded"]
 default = ["columnar", "datafusion"]
 columnar = ["dep:arrow"]
 datafusion = ["columnar", "dep:datafusion"]
+native-async-io = []
 
 # -------------------- System API --------------------
 [target.'cfg(windows)'.dependencies]

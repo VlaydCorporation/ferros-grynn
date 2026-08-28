@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 use rapidhash::{HashMapExt, RapidHashMap};
 
 use super::{
-	direct::DirectFile,
+	direct::{DirectFile, DirectFileOpenMode},
 	types::{DataFileId, DataFileKind, GraphId, PageKey},
 };
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
@@ -79,7 +79,10 @@ impl FileRegistry {
 	///
 	/// Returns an error for duplicate identities, a role/kind mismatch, an
 	/// invalid graph-superblock length, or any Direct-I/O open failure.
-	pub(super) fn open(registrations: Vec<DataFileRegistration>) -> FerrosGrynnResult<Self> {
+	pub(super) fn open(
+		registrations: Vec<DataFileRegistration>,
+		io_mode: DirectFileOpenMode,
+	) -> FerrosGrynnResult<Self> {
 		let mut files = RapidHashMap::with_capacity(registrations.len());
 		for registration in registrations {
 			let key = (registration.graph_id, registration.file_id);
@@ -88,7 +91,7 @@ impl FileRegistry {
 					"duplicate data-file identity in sealed registry",
 				));
 			}
-			files.insert(key, Arc::new(open_registration(registration)?));
+			files.insert(key, Arc::new(open_registration(registration, io_mode)?));
 		}
 		Ok(Self {
 			files,
@@ -100,6 +103,7 @@ impl FileRegistry {
 	pub(super) fn insert(
 		&mut self,
 		registrations: Vec<DataFileRegistration>,
+		io_mode: DirectFileOpenMode,
 	) -> FerrosGrynnResult<()> {
 		let mut opened = Vec::with_capacity(registrations.len());
 		let mut keys = RapidHashMap::with_capacity(registrations.len());
@@ -110,7 +114,7 @@ impl FileRegistry {
 					"duplicate data-file identity in registry extension",
 				));
 			}
-			opened.push((key, Arc::new(open_registration(registration)?)));
+			opened.push((key, Arc::new(open_registration(registration, io_mode)?)));
 		}
 		for (key, file) in opened {
 			self.files.insert(key, file);
@@ -161,9 +165,12 @@ impl FileRegistry {
 }
 
 /// Opens one trusted registration without publishing a partial registry.
-fn open_registration(registration: DataFileRegistration) -> FerrosGrynnResult<RegisteredDataFile> {
+fn open_registration(
+	registration: DataFileRegistration,
+	io_mode: DirectFileOpenMode,
+) -> FerrosGrynnResult<RegisteredDataFile> {
 	validate_role(registration.file_id, registration.role)?;
-	let opened = DirectFile::open_read_write(&registration.path)?;
+	let opened = DirectFile::open_read_write_with_mode(&registration.path, io_mode)?;
 	let file = if registration.role == DataFileRole::GraphSuperblock {
 		if opened.page_count() != 1 {
 			return Err(FerrosGrynnError::invalid_storage_file(

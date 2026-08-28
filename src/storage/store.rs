@@ -85,6 +85,7 @@ use super::{
 	},
 	local::select_graph_superblock,
 	page::{AlignedPage, PAGE_SIZE, PageLsn, PageNo},
+	page_io::PageIoMode,
 	page_manager::{PageRead, SyncPageManager},
 	superblock::{GraphSuperblock, GraphSuperblockFlags},
 	types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn},
@@ -407,12 +408,13 @@ impl LocalStore {
 		path: PathLike,
 		database_name: &str,
 		pool_pages: NonZeroUsize,
+		io_mode: PageIoMode,
 		checkpoint_page_threshold: usize,
 		checkpoint_interval: Duration,
 	) -> FerrosGrynnResult<Self> {
 		let root = path.as_ref().to_path_buf();
 		let (manager, database, files) =
-			SyncPageManager::create_cataloged(&root, database_name, pool_pages)?;
+			SyncPageManager::create_cataloged(&root, database_name, pool_pages, io_mode)?;
 		Ok(Self {
 			root,
 			manager,
@@ -430,11 +432,13 @@ impl LocalStore {
 	pub fn open<PathLike: AsRef<Path>>(
 		path: PathLike,
 		pool_pages: NonZeroUsize,
+		io_mode: PageIoMode,
 		checkpoint_page_threshold: usize,
 		checkpoint_interval: Duration,
 	) -> FerrosGrynnResult<(Self, LocalDatabaseSnapshot)> {
 		let root = path.as_ref().to_path_buf();
-		let (manager, database, files) = SyncPageManager::open_cataloged(&root, pool_pages)?;
+		let (manager, database, files) =
+			SyncPageManager::open_cataloged(&root, pool_pages, io_mode)?;
 		let transaction = manager.begin_tx()?;
 		let snapshot = load_database(
 			&root,
