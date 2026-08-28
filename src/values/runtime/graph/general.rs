@@ -1130,6 +1130,7 @@ mod tests {
 		gql_status::Domain,
 		values::{
 			PropertyMap,
+			RecordId,
 			runtime::graph::{
 				EdgeDirection,
 				EdgeEndpoint,
@@ -1238,5 +1239,36 @@ mod tests {
 		assert_eq!(graph.revision(), revision);
 		assert!(graph.contains(left));
 		assert!(graph.contains(edge));
+	}
+
+	#[test]
+	fn record_index_rejects_cross_kind_duplicates_and_releases_removed_ids() {
+		let mut graph = Graph::<Mutable>::new();
+		let left = graph.add_node(None, PropertyMap::new()).unwrap();
+		let right = graph.add_node(None, PropertyMap::new()).unwrap();
+		let record = "atom:stable".parse::<RecordId>().unwrap();
+		let duplicate = graph.add_node_with_id(record.clone(), None, PropertyMap::new()).unwrap();
+
+		assert!(
+			graph
+				.add_edge_with_id(
+					record.clone(),
+					EdgeTopology::directed([left], [right]),
+					None,
+					PropertyMap::new(),
+				)
+				.is_err()
+		);
+		graph.remove_atom(duplicate).unwrap();
+		assert!(
+			graph
+				.add_edge_with_id(
+					record,
+					EdgeTopology::directed([left], [right]),
+					None,
+					PropertyMap::new(),
+				)
+				.is_ok()
+		);
 	}
 }

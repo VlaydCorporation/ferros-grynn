@@ -666,6 +666,15 @@ impl SyncPageManager {
 			authority.database.next_file_instance_id.max(next_file_instance_id);
 	}
 
+	/// Returns the current WAL-authoritative metadata for one graph.
+	pub(super) fn graph_superblock(&self, graph_id: GraphId) -> FerrosGrynnResult<GraphSuperblock> {
+		self.authority.read().graphs.get(&graph_id).cloned().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"graph catalog references missing authoritative metadata",
+			)
+		})
+	}
+
 	/// Runs one non-blocking passive checkpoint when reader-safe progress
 	/// exists.
 	///

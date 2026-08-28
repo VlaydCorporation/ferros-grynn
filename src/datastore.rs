@@ -82,6 +82,14 @@ use crate::{
 const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(300);
 /// Default logical transaction write-set ceiling.
 const DEFAULT_MAX_WRITE_SET_BYTES: usize = 256 * 1024 * 1024;
+/// Fixed metadata charge for one dirty graph or atom target.
+const DIRTY_TARGET_WRITE_BYTES: usize = 256;
+/// Fixed metadata charge for a deleted catalog entry.
+const CATALOG_DELETE_WRITE_BYTES: usize = 64;
+/// Fixed metadata charge for one changed table schema.
+const TABLE_SCHEMA_WRITE_BYTES: usize = 128;
+/// Fixed metadata charge for one table field.
+const TABLE_FIELD_WRITE_BYTES: usize = 64;
 /// Default 64-MiB pool measured in format-v1 pages.
 const DEFAULT_BUFFER_POOL_PAGES: usize = 4_096;
 /// Default WAL-only page ratio that triggers a passive checkpoint.
@@ -1066,7 +1074,7 @@ impl Datastore {
 		let key = Arc::make_mut(&mut next.dictionary).intern(name)?;
 		next.commit_ts = commit_ts;
 		if let Some(persisted) = self.inner.persist_root(commit_ts, &next, &[])? {
-			next.dictionary = Arc::new(persisted.property_dictionary);
+			next.dictionary = persisted.property_dictionary;
 		}
 		*self.inner.current.write() = Arc::new(next);
 		Ok(key)
@@ -1934,12 +1942,12 @@ impl Transaction {
 	pub fn commit(mut self) -> FerrosGrynnResult<CommitResult> {
 		self.ensure_live()?;
 		let limits = self.store.inner.transaction_limits();
-		let estimated = self.estimated_write_set_bytes();
+		let estimated = self.estimated_write_set_bytes()?;
 		if estimated > limits.max_write_set_bytes {
 			return Err(FerrosGrynnError::transaction_write_set_limit_exceeded(
 				self.id,
-				estimated as u64,
-				limits.max_write_set_bytes as u64,
+				u64::try_from(estimated).unwrap_or(u64::MAX),
+				u64::try_from(limits.max_write_set_bytes).unwrap_or(u64::MAX),
 			));
 		}
 		if self.options.access == TransactionAccess::ReadOnly
@@ -2027,7 +2035,16 @@ impl Transaction {
 			.extend(current.graphs.keys().filter(|id| !next.graphs.contains_key(*id)).cloned());
 		next.commit_ts = commit_ts;
 		if let Some(persisted) = self.store.inner.persist_root(commit_ts, &next, &changed_graphs)? {
-			next.dictionary = Arc::new(persisted.property_dictionary);
+			next.dictionary = persisted.property_dictionary;
+			for entry in persisted.graphs {
+				let stored = next.graphs.get_mut(&entry.record_id).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"durable commit returned an unknown graph descriptor",
+					)
+				})?;
+				stored.graph = StoredGraphValue::Local(entry.graph);
+				stored.record_index = Arc::new(BTreeMap::new());
+			}
 		}
 		let mut published = self.store.inner.current.write();
 		let mut active = self.store.inner.active.lock();
@@ -2085,6 +2102,25 @@ impl Transaction {
 		self.storage_tx.lock().as_ref().cloned().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("local transaction has no storage snapshot")
 		})
+	}
+
+	fn materialize_stored_graph(
+		&self,
+		graph: &StoredGraphValue,
+	) -> FerrosGrynnResult<Arc<MaterializedGraph>> {
+		match graph {
+			StoredGraphValue::Materialized(graph) => Ok(graph.clone()),
+			StoredGraphValue::Local(graph) => {
+				let local = self.store.inner.backend.local().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"local graph is attached to an in-memory backend",
+					)
+				})?;
+				let limits = self.store.inner.transaction_limits();
+				let transaction = Arc::new(local.begin_read(self.id, limits.max_snapshot_age)?);
+				local.materialize_graph(transaction, graph).map(Arc::new)
+			}
+		}
 	}
 
 	fn read_root(&self) -> Arc<DatabaseRoot> {
@@ -2365,12 +2401,8 @@ impl Transaction {
 
 		let graph = match (&write.base, current.graphs.get(&id)) {
 			(Some(base), Some(latest)) if latest.last_commit_ts > write.base_ts => {
-				let latest = latest.graph.materialized().ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"newer graph revision has no materialized merge image",
-					)
-				})?;
-				merge_materialized(self.id, base, value, latest, &dirty)?
+				let latest = self.materialize_stored_graph(&latest.graph)?;
+				merge_materialized(self.id, base, value, &latest, &dirty)?
 			}
 			_ => value.freeze(),
 		};
@@ -2639,28 +2671,45 @@ impl Transaction {
 		Ok(())
 	}
 
-	fn estimated_write_set_bytes(&self) -> usize {
-		// ponytail: this is a logical dirty-target budget, not recursive heap
-		// accounting; enforce allocation-time bytes in tracked family guards if large
-		// values become a problem.
-		let graphs = self.graphs.values().map(|write| {
-			write.value.as_ref().map_or(64, |value| {
-				let snapshot = value.snapshot();
-				let targets = if write.base.is_some() {
-					value.dirty().len()
-				} else {
-					snapshot.node_count() + snapshot.edge_count() + 1
+	fn estimated_write_set_bytes(&self) -> FerrosGrynnResult<usize> {
+		let mut estimated = 0_usize;
+		for write in self.graphs.values() {
+			let Some(value) = write.value.as_ref() else {
+				estimated = estimated.saturating_add(CATALOG_DELETE_WRITE_BYTES);
+				continue;
+			};
+			let snapshot = value.snapshot();
+			let dirty = if write.base.is_some() {
+				value.dirty()
+			} else {
+				all_dirty(&snapshot)?
+			};
+			estimated =
+				estimated.saturating_add(dirty.len().saturating_mul(DIRTY_TARGET_WRITE_BYTES));
+			for target in dirty {
+				let properties = match target {
+					DirtyTarget::Graph => Some(snapshot.properties()),
+					DirtyTarget::Atom(atom) => match atom.kind() {
+						Some(AtomKind::Node) => snapshot.node(atom).map(|node| node.properties()),
+						Some(AtomKind::Edge) => snapshot.edge(atom).map(|edge| edge.properties()),
+						None => None,
+					},
 				};
-				targets.saturating_mul(256)
-			})
-		});
-		graphs
-			.chain(
-				self.tables.values().map(|schema| {
-					schema.as_ref().map_or(64, |schema| 128 + schema.fields.len() * 64)
-				}),
-			)
-			.fold(0_usize, usize::saturating_add)
+				if let Some(properties) = properties {
+					estimated = estimated.saturating_add(properties.estimated_heap_bytes());
+				}
+			}
+		}
+		for schema in self.tables.values() {
+			estimated = estimated.saturating_add(schema.as_ref().map_or(
+				CATALOG_DELETE_WRITE_BYTES,
+				|schema| {
+					TABLE_SCHEMA_WRITE_BYTES
+						.saturating_add(schema.fields.len().saturating_mul(TABLE_FIELD_WRITE_BYTES))
+				},
+			));
+		}
+		Ok(estimated)
 	}
 }
 
@@ -3511,6 +3560,14 @@ mod tests {
 		let second_ref =
 			create.create_graph(graph_id("second"), second_graph.freeze().into()).unwrap();
 		create.commit().unwrap();
+		assert!(matches!(
+			&store.current_root().graphs.get(first_ref.id()).unwrap().graph,
+			StoredGraphValue::Local(_)
+		));
+		assert!(matches!(
+			&store.current_root().graphs.get(second_ref.id()).unwrap().graph,
+			StoredGraphValue::Local(_)
+		));
 
 		let transaction_options = TransactionOptions {
 			isolation: IsolationLevel::Snapshot,
@@ -3528,6 +3585,10 @@ mod tests {
 			graph.node_properties_mut(right).unwrap().insert(value, 3_i64);
 		}
 		multi_graph.commit().unwrap();
+		assert!(matches!(
+			&store.current_root().graphs.get(first_ref.id()).unwrap().graph,
+			StoredGraphValue::Local(_)
+		));
 		same_page.commit().unwrap();
 		drop(store);
 
@@ -4190,6 +4251,32 @@ mod tests {
 			max_write_set_bytes: DEFAULT_MAX_WRITE_SET_BYTES,
 		});
 		assert_eq!(store.begin().commit().unwrap_err().status().code().to_string(), "FG-25F01");
+	}
+
+	#[test]
+	fn write_set_limit_counts_large_property_payload_before_publication() {
+		let store = Datastore::in_memory_with(InMemoryOptions {
+			max_snapshot_age: Duration::from_secs(300),
+			max_write_set_bytes: 1_024,
+		});
+		let payload = store.intern_property("payload").unwrap();
+		let mut create = store.begin();
+		let graph = create
+			.create_graph(graph_id("large-write"), Graph::<Mutable>::new().freeze().into())
+			.unwrap();
+		create.commit().unwrap();
+
+		let mut transaction = store.begin();
+		let GraphWriteView::Graph(write) = transaction.edit_graph(&graph).unwrap() else {
+			panic!("test graph must keep the general graph family");
+		};
+		let mut properties = PropertyMap::new();
+		properties.insert(payload, Bytes::from(vec![0_u8; 2_048]));
+		write.add_node(None, properties).unwrap();
+		assert_eq!(transaction.commit().unwrap_err().status().code().to_string(), "FG-54F07");
+
+		let read = store.begin();
+		assert_eq!(graph.read(&read).unwrap().node_count().unwrap(), 0);
 	}
 
 	#[cfg(not(all(windows, feature = "native-async-io")))]

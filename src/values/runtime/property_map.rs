@@ -3,6 +3,7 @@ use std::{
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
 	iter::FusedIterator,
+	mem::size_of,
 	slice::Iter as SliceIter,
 };
 
@@ -122,6 +123,16 @@ impl PropertyMap {
 
 	pub fn values(&self) -> impl DoubleEndedIterator<Item = &Value> + ExactSizeIterator {
 		self.entries.iter().map(|(_, value)| value)
+	}
+
+	/// Estimates memory owned by the map allocation and nested value payloads.
+	pub(crate) fn estimated_heap_bytes(&self) -> usize {
+		self.entries.capacity().saturating_mul(size_of::<Entry>()).saturating_add(
+			self.entries
+				.iter()
+				.map(|(_key, value)| value.estimated_heap_bytes())
+				.fold(0_usize, usize::saturating_add),
+		)
 	}
 
 	fn find(&self, key: PropertyKeyId) -> Result<usize, usize> {

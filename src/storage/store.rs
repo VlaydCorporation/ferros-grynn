@@ -377,7 +377,9 @@ pub struct LocalDatabaseSnapshot {
 /// canonical values.
 pub struct LocalCommitResult {
 	/// Durable dictionary including names discovered while encoding values.
-	pub property_dictionary: PropertyDictionary,
+	pub property_dictionary: Arc<PropertyDictionary>,
+	/// Fresh disk-backed descriptors for graphs changed by this commit.
+	pub graphs: Vec<LocalSnapshotGraph>,
 }
 
 /// Catalog state changes only after its matching WAL commit is durable.
@@ -891,6 +893,29 @@ impl LocalStore {
 			self.manager.unregister_files(&registration_keys);
 			return Err(error);
 		}
+		let dictionary = Arc::new(dictionary);
+		let superblocks = new_superblocks
+			.iter()
+			.cloned()
+			.map(|superblock| (superblock.graph_id, superblock))
+			.collect::<BTreeMap<_, _>>();
+		let graphs = match load_changed_graphs(
+			&self.root,
+			&self.manager,
+			&transaction,
+			&database,
+			&files,
+			changed_graphs,
+			dictionary.clone(),
+			&superblocks,
+		) {
+			Ok(graphs) => graphs,
+			Err(error) => {
+				self.manager.abort_tx(transaction);
+				self.manager.unregister_files(&registration_keys);
+				return Err(error);
+			}
+		};
 		if let Err(error) = self.manager.commit_tx(transaction) {
 			self.manager.unregister_files(&registration_keys);
 			return Err(error);
@@ -906,6 +931,7 @@ impl LocalStore {
 		catalogs.files = files;
 		Ok(LocalCommitResult {
 			property_dictionary: dictionary,
+			graphs,
 		})
 	}
 }
@@ -2198,6 +2224,7 @@ fn load_database(
 				&database.tables,
 				record_id,
 				dictionary.clone(),
+				None,
 			)?),
 		});
 	}
@@ -2243,6 +2270,45 @@ fn load_database(
 	})
 }
 
+fn load_changed_graphs(
+	root: &Path,
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	database: &DatabaseCatalog,
+	files: &FileCatalog,
+	changed_graphs: &[RecordId],
+	property_dictionary: Arc<PropertyDictionary>,
+	superblocks: &BTreeMap<GraphId, GraphSuperblock>,
+) -> FerrosGrynnResult<Vec<LocalSnapshotGraph>> {
+	let mut graphs = Vec::with_capacity(changed_graphs.len());
+	for record_id in changed_graphs {
+		let record_text = record_id.to_string();
+		let Some(entry) = database
+			.graphs
+			.iter()
+			.find(|entry| entry.parent_graph_id.is_none() && entry.record_id == record_text)
+		else {
+			continue;
+		};
+		graphs.push(LocalSnapshotGraph {
+			record_id: record_id.clone(),
+			graph: Arc::new(open_local_graph(
+				root,
+				manager,
+				transaction,
+				entry,
+				database,
+				files,
+				&database.tables,
+				record_id.clone(),
+				property_dictionary.clone(),
+				Some(superblocks),
+			)?),
+		});
+	}
+	Ok(graphs)
+}
+
 fn open_local_graph(
 	root: &Path,
 	manager: &SyncPageManager,
@@ -2253,6 +2319,7 @@ fn open_local_graph(
 	tables: &[TableCatalogEntry],
 	record_id: RecordId,
 	property_dictionary: Arc<PropertyDictionary>,
+	superblocks: Option<&BTreeMap<GraphId, GraphSuperblock>>,
 ) -> FerrosGrynnResult<LocalGraph> {
 	let mut children = BTreeMap::new();
 	for child in
@@ -2272,6 +2339,7 @@ fn open_local_graph(
 			tables,
 			child_record,
 			property_dictionary.clone(),
+			superblocks,
 		)?);
 		if children.insert(slot, graph).is_some() {
 			return Err(FerrosGrynnError::invalid_storage_file(
@@ -2281,10 +2349,12 @@ fn open_local_graph(
 	}
 	let paths = graph_file_paths(root, entry, files)?;
 	let file_ids = graph_file_ids(entry, files)?;
-	let superblock_path = paths.get(&DataFileKind::GraphSuperblock).ok_or_else(|| {
+	paths.get(&DataFileKind::GraphSuperblock).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file("graph superblock file is missing")
 	})?;
-	let superblock = select_graph_superblock(superblock_path)?;
+	let superblock = superblocks
+		.and_then(|superblocks| superblocks.get(&entry.graph_id).cloned())
+		.map_or_else(|| manager.graph_superblock(entry.graph_id), Ok)?;
 	if superblock.graph_id != entry.graph_id
 		|| superblock.node_count > superblock.node_capacity
 		|| superblock.edge_count > superblock.edge_capacity
@@ -3442,16 +3512,25 @@ fn make_hot_pages(
 	count: usize,
 	new_page: fn(PageNo, PageLsn) -> FerrosGrynnResult<AlignedPage>,
 ) -> FerrosGrynnResult<Vec<AlignedPage>> {
-	(0..count)
-		.map(|index| {
-			u64::try_from(index)
-				.map(PageNo::new)
-				.map_err(|_error| {
-					FerrosGrynnError::invalid_storage_file("hot page index exceeds u64")
-				})
-				.and_then(|page_no| new_page(page_no, PageLsn::ZERO))
-		})
-		.collect()
+	let mut pages = Vec::with_capacity(count);
+	for index in 0..count {
+		let page_no = u64::try_from(index).map(PageNo::new).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("hot page index exceeds u64")
+		})?;
+		let page = new_page(page_no, PageLsn::ZERO)?;
+		pages.push(page);
+	}
+	Ok(pages)
+}
+
+/// Multiple over-aligned hot pages retain complete headers when collected.
+#[cfg(test)]
+#[test]
+fn hot_page_builder_preserves_aligned_page_headers() -> FerrosGrynnResult<()> {
+	let pages = make_hot_pages(2, new_node_hot_page)?;
+	pages[0].validate(PageNo::new(0))?;
+	pages[1].validate(PageNo::new(1))?;
+	Ok(())
 }
 
 fn checked_page_index(page_no: PageNo, page_count: usize) -> FerrosGrynnResult<usize> {

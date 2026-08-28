@@ -145,9 +145,19 @@ sync-точки протокола.
 WAL является единственным исключением: это последовательный buffered-файл, где commit сначала
 дописывает все `PageFrame` и `TxCommit`, затем выполняет один `flush` и один `sync_data`.
 Production `mmap` не входит в архитектуру; он допустим только как benchmark page source.
-Native async I/O может появиться после прохождения sync correctness/performance gate и не меняет
-синхронную pull-модель запросов. Пользователь выбирает доступный I/O-режим при открытии
-хранилища; недоступный режим завершается ошибкой, а не fallback.
+Windows Native Async I/O включается feature `native-async-io` и не меняет синхронную pull-модель
+запросов. Он использует IoRing через сгенерированные bindings
+`windows::Win32::Storage::FileSystem` и companion handle с
+`FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`. Менеджер может поставить несколько независимых
+extent-ов в одну очередь, но возвращает управление только после извлечения всех CQE; поэтому
+borrowed aligned buffers и file handles живут до завершения операций. Для одного extent допустим
+синхронный positional fast path на отдельном non-overlapped handle, если он не нарушает выбранную
+Direct-I/O и durability семантику.
+
+IoRing-режим требует Windows build 22000 или новее и runtime-поддержку read/write. Пользователь
+выбирает режим при открытии хранилища; отсутствие compile-time feature или runtime-возможности
+завершается `FG-51I04`, без IOCP/buffered fallback. Linux Native Async и `tokio-uring` отложены до
+нативной проверки; непроверенная Unix async-реализация не входит в format v1.
 
 ---
 

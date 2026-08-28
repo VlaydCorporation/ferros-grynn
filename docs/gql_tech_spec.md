@@ -75,8 +75,8 @@ Fail-closed неприятнее в моменте, но честнее в эк�
   `next() -> FerrosGrynnResult<Option<Row>>`. Batch-оператор добавляется поверх него после
   измерений и не меняет семантику плана.
 - **`src/storage`** — production Sync Direct I/O для `.fgb`/`.fgidx`; `fg-meta` служит только
-  референсом. Опциональный Native Async I/O вводится после sync-gate и реализует тот же внутренний
-  page-source контракт.
+  референсом. Windows Native Async использует тот же внутренний page-source контракт через IoRing;
+  Linux async остаётся отложенным до нативного тестового окружения.
 
 Интерфейсы фиксируют, что система обязана уметь, где проходят её границы, и какие инварианты держатся.
 
@@ -86,11 +86,12 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 ### 1.4. Sync-first и опциональный Native Async I/O
 
-Sync Direct I/O — обязательная базовая реализация и default. До прохождения correctness-gate и
-сравнения Direct+BufferPool с benchmark-only mmap async-код не добавляется. После gate пользователь
-может выбрать `Sync` или доступный `NativeAsync` при открытии хранилища; недоступный режим
-возвращает типизированную ошибку без fallback. Публичный query API остаётся синхронной pull-моделью.
-WAL в обоих режимах использует последовательный buffered I/O и один `flush + sync_data` на commit.
+Sync Direct I/O — обязательная базовая реализация и default. Windows-пользователь может выбрать
+`NativeAsync`, собранный feature `native-async-io`: data-файлы используют IoRing и overlapped
+Direct-I/O handle, а единичное чтение может пройти через измеренный sync fast path. Недоступный
+режим возвращает типизированную ошибку без fallback. Публичный query API остаётся синхронной
+pull-моделью. WAL в обоих режимах использует последовательный buffered I/O и один
+`flush + sync_data` на commit. Linux Native Async отложен до нативной проверки.
 
 ---
 
@@ -625,10 +626,11 @@ LSN и checksum назначает WAL-слой. Checkpoint не бэкфилл�
 `PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
 (seed `0`, поле checksum обнулено при вычислении). Ключ `PageKey = (GraphId, DataFileId, PageNo)`;
 `graph_id = 0` — системное пространство. При чтении `.fgb` проверяются размер/выравнивание файла,
-format version, `page_no`, reserved fields и checksum. Production runtime сейчас Windows sync с
-`FILE_FLAG_NO_BUFFERING`; Unix компилируется как typed unsupported stub до нативной проверки
-`O_DIRECT`. WAL остаётся buffered. Benchmark-only mmap и optional Native Async не являются
-fallback.
+format version, `page_no`, reserved fields и checksum. Production runtime поддерживает Windows
+Sync (`FILE_FLAG_NO_BUFFERING`) и optional NativeAsync (IoRing +
+`FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`, Windows build 22000+). Unix компилируется как
+typed unsupported stub до нативной проверки `O_DIRECT`; Linux/tokio-uring отложен. WAL остаётся
+buffered. Benchmark-only mmap и NativeAsync не являются fallback.
 
 ### 10.3. Разрешение идентификаторов: `RecordId → DiskAtomRef → AtomId`
 
@@ -1076,7 +1078,7 @@ Cost-based выбор при равенстве стоимостей разре�
 
 > **Вынесено в [implementation_plan.md](implementation_plan.md) §6 «Отложено / вне MVP».**
 > Сводный список отложенного (JIT, WCOJ, advanced storage-функции, ARIES/UNDO, параллельный
-> recovery, optional Native Async I/O до прохождения sync-gate, SPDK, SMT-верификация
+> recovery, Linux Native Async I/O, SPDK, SMT-верификация
 > оптимизатора, тензорные кеши) собран там из `gql_tech_spec.md`,
 > `gql_spec.md` §32.3 и `disk_storage_spec.md`.
 

@@ -11,7 +11,7 @@ use std::{
 	fs::{File, OpenOptions},
 	hint::black_box,
 	io,
-	mem::size_of_val,
+	mem::{size_of, size_of_val},
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
 	sync::atomic::{AtomicU64, Ordering},
@@ -27,7 +27,12 @@ use super::{
 	page::{AlignedPage, PAGE_HEADER_SIZE, PAGE_SIZE, PageFlags, PageLsn, PageNo, PageType},
 	types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
 };
-use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
+use crate::{
+	datastore::{Datastore, GraphWriteView, LocalOptions},
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	graph::{Graph, GraphRead, Mutable},
+	values::{Bytes, PropertyMap},
+};
 
 /// Binary kibibyte used by batch-size candidates.
 const KIBIBYTE: usize = 1024;
@@ -102,6 +107,22 @@ const DATASET_MIB_ENV: &str = "FG_STAGE2_BENCH_MIB";
 const POOL_PAGES_ENV: &str = "FG_STAGE2_POOL_PAGES";
 /// Optional non-normative repetition-count override.
 const REPETITIONS_ENV: &str = "FG_STAGE2_REPETITIONS";
+/// Total incompressible property payload used by the stage-7 probe.
+const STAGE7_PAYLOAD_MIB_ENV: &str = "FG_STAGE7_PAYLOAD_MIB";
+/// Payload committed per transaction by the segmented stage-7 probe.
+const STAGE7_BATCH_MIB_ENV: &str = "FG_STAGE7_BATCH_MIB";
+/// Selects either one atomic transaction or the current segmented fallback.
+const STAGE7_MODE_ENV: &str = "FG_STAGE7_MODE";
+/// Selects large property bytes or the current dirty-target charge model.
+const STAGE7_WORKLOAD_ENV: &str = "FG_STAGE7_WORKLOAD";
+/// Optional exact atom count used to shrink the dirty-target probe.
+const STAGE7_ATOMS_ENV: &str = "FG_STAGE7_ATOMS";
+/// Transaction size required by the stage-7 plan before spill is considered.
+const DEFAULT_STAGE7_PAYLOAD_MIB: usize = 320;
+/// Current bounded fallback used by bulk-style workloads.
+const DEFAULT_STAGE7_BATCH_MIB: usize = 64;
+/// Logical charge assigned to one dirty atom by the current transaction limit.
+const DIRTY_ATOM_CHARGE_BYTES: usize = 256;
 /// Unique suffix source for benchmark files within one process.
 static NEXT_BENCH_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -400,6 +421,24 @@ impl Drop for BenchPath {
 	}
 }
 
+/// RAII-owned unique local-database directory used by large transaction probes.
+struct BenchDirectory(PathBuf);
+
+impl BenchDirectory {
+	/// Returns a collision-resistant directory path in the workspace.
+	fn path(label: &str) -> io::Result<PathBuf> {
+		let suffix = NEXT_BENCH_FILE.fetch_add(1, Ordering::Relaxed);
+		let name = format!(".fg-{label}-{}-{suffix}", std::process::id());
+		Ok(env::current_dir()?.join(name))
+	}
+}
+
+impl Drop for BenchDirectory {
+	fn drop(&mut self) {
+		drop(std::fs::remove_dir_all(&self.0));
+	}
+}
+
 /// Read-only mapping of one immutable benchmark file.
 struct MmapPageSource {
 	/// Complete immutable mapping.
@@ -553,6 +592,176 @@ fn disk_storage_stage2_batch_probe() -> Result<(), Box<dyn Error>> {
 		throughput_ratio(pooled, raw),
 	);
 	Ok(())
+}
+
+/// Measures whether transaction-private spill has a material workload on the
+/// current local storage path before production spill code is introduced.
+#[test]
+#[ignore = "allocates and writes more than 256 MiB; run natively in release mode"]
+fn disk_storage_stage7_spill_probe() -> Result<(), Box<dyn Error>> {
+	let payload_mib = optional_usize(STAGE7_PAYLOAD_MIB_ENV)?.unwrap_or(DEFAULT_STAGE7_PAYLOAD_MIB);
+	let batch_mib = optional_usize(STAGE7_BATCH_MIB_ENV)?.unwrap_or(DEFAULT_STAGE7_BATCH_MIB);
+	if payload_mib == 0 || batch_mib == 0 {
+		return Err(io::Error::other("stage-7 payload and batch sizes must be non-zero").into());
+	}
+	let mode = env::var(STAGE7_MODE_ENV).unwrap_or_else(|_| "atomic".to_owned());
+	if mode != "atomic" && mode != "segmented" {
+		return Err(io::Error::other("FG_STAGE7_MODE must be 'atomic' or 'segmented'").into());
+	}
+	let workload = env::var(STAGE7_WORKLOAD_ENV).unwrap_or_else(|_| "properties".to_owned());
+	if workload != "properties" && workload != "atoms" {
+		return Err(io::Error::other("FG_STAGE7_WORKLOAD must be 'properties' or 'atoms'").into());
+	}
+	let large_properties = workload == "properties";
+	let exact_atoms = optional_usize(STAGE7_ATOMS_ENV)?;
+	if exact_atoms == Some(0) {
+		return Err(io::Error::other("FG_STAGE7_ATOMS must be non-zero").into());
+	}
+
+	let directory_path = BenchDirectory::path("s7")?;
+	let store = Datastore::create_local(&directory_path, LocalOptions::default())?;
+	let _directory = BenchDirectory(directory_path);
+	let payload_key = store.intern_property("stage7_payload")?;
+	let mut create = store.begin();
+	let graph = create
+		.create_graph("graph:stage7-spill".parse()?, Graph::<Mutable>::new().freeze().into())?;
+	create.commit()?;
+
+	let baseline_rss = process_rss()?;
+	let started = Instant::now();
+	let mut staged_elapsed = Duration::ZERO;
+	let mut commit_elapsed = Duration::ZERO;
+	let mut max_staged_rss = baseline_rss;
+	let mut committed_mib = 0_usize;
+	let mut committed_nodes = 0_usize;
+	let mut attempted_mib = 0_usize;
+	let mut attempted_nodes = 0_usize;
+	let mut commit_status = "committed".to_owned();
+	let batch_limit = if mode == "atomic" {
+		payload_mib
+	} else {
+		batch_mib.min(payload_mib)
+	};
+
+	while committed_mib < payload_mib {
+		let current_mib = batch_limit.min(payload_mib - committed_mib);
+		let current_nodes = if large_properties {
+			current_mib
+		} else if let Some(exact_atoms) = exact_atoms {
+			exact_atoms
+		} else {
+			current_mib
+				.checked_mul(MEBIBYTE_BYTES / DIRTY_ATOM_CHARGE_BYTES)
+				.ok_or_else(|| io::Error::other("stage-7 dirty-atom count overflow"))?
+		};
+		let next_committed_nodes = committed_nodes
+			.checked_add(current_nodes)
+			.ok_or_else(|| io::Error::other("stage-7 committed node count overflow"))?;
+		attempted_mib = committed_mib
+			.checked_add(current_mib)
+			.ok_or_else(|| io::Error::other("stage-7 attempted MiB count overflow"))?;
+		attempted_nodes = next_committed_nodes;
+		let stage_started = Instant::now();
+		let mut transaction = store.begin();
+		let view = transaction.edit_graph(&graph)?;
+		let GraphWriteView::Graph(graph_write) = view else {
+			return Err(io::Error::other("stage-7 benchmark graph changed family").into());
+		};
+		for offset in 0..current_nodes {
+			let mut properties = PropertyMap::new();
+			if large_properties {
+				let ordinal = committed_nodes
+					.checked_add(offset)
+					.ok_or_else(|| io::Error::other("stage-7 payload ordinal overflow"))?;
+				properties.insert(payload_key, Bytes::from(incompressible_mebibyte(ordinal)?));
+			}
+			graph_write.add_node(None, properties)?;
+		}
+		staged_elapsed += stage_started.elapsed();
+		max_staged_rss = max_staged_rss.max(process_rss()?);
+
+		let commit_started = Instant::now();
+		let failed = match transaction.commit() {
+			Ok(_) => {
+				committed_mib += current_mib;
+				committed_nodes = next_committed_nodes;
+				false
+			}
+			Err(error) => {
+				commit_status = error.status().code().to_string();
+				if commit_status != "FG-54F07" {
+					return Err(error.into());
+				}
+				true
+			}
+		};
+		commit_elapsed += commit_started.elapsed();
+		if failed || mode == "atomic" {
+			break;
+		}
+	}
+
+	let after_rss = process_rss()?;
+	let read = store.begin();
+	let visible_nodes = graph.read(&read)?.node_count()?;
+	let expected_nodes = committed_nodes;
+	if visible_nodes != expected_nodes {
+		return Err(io::Error::other(format!(
+			"stage-7 visibility mismatch: expected {expected_nodes} nodes, found {visible_nodes}",
+		))
+		.into());
+	}
+	let logical_attempted_mib =
+		stage7_logical_mib(large_properties, attempted_mib, attempted_nodes);
+	let logical_committed_mib =
+		stage7_logical_mib(large_properties, committed_mib, committed_nodes);
+
+	println!(
+		"stage7 workload={workload} mode={mode} payload_mib={payload_mib} batch_mib={batch_limit} \
+		 logical_attempted_mib={logical_attempted_mib:.2} \
+		 logical_committed_mib={logical_committed_mib:.2} attempted_nodes={attempted_nodes} \
+		 committed_nodes={committed_nodes} status={commit_status} staged_ms={:.3} commit_ms={:.3} \
+		 total_ms={:.3} staged_rss_delta_mib={:.2} after_rss_delta_mib={:.2}",
+		staged_elapsed.as_secs_f64() * 1_000.0,
+		commit_elapsed.as_secs_f64() * 1_000.0,
+		started.elapsed().as_secs_f64() * 1_000.0,
+		bytes_to_mib(max_staged_rss.saturating_sub(baseline_rss)),
+		bytes_to_mib(after_rss.saturating_sub(baseline_rss)),
+	);
+	Ok(())
+}
+
+/// Produces deterministic bytes that do not collapse under property
+/// compression and therefore exercise the physical transaction limit.
+fn incompressible_mebibyte(ordinal: usize) -> io::Result<Vec<u8>> {
+	let mut value = vec![0_u8; MEBIBYTE_BYTES];
+	let mut state = RANDOM_SEED
+		^ u64::try_from(ordinal).map_err(|source| {
+			conversion_error("stage-7 payload ordinal does not fit u64", source)
+		})?;
+	for bytes in value.chunks_exact_mut(size_of::<u64>()) {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		bytes.copy_from_slice(&state.to_le_bytes());
+	}
+	Ok(value)
+}
+
+/// Converts the benchmark's logical charge into a diagnostic MiB value.
+#[allow(clippy::cast_precision_loss, reason = "stage-7 output needs only two-decimal reporting")]
+fn stage7_logical_mib(large_properties: bool, committed_mib: usize, nodes: usize) -> f64 {
+	if large_properties {
+		committed_mib as f64
+	} else {
+		nodes as f64 * DIRTY_ATOM_CHARGE_BYTES as f64 / MEBIBYTE_BYTES as f64
+	}
+}
+
+/// Converts an exact byte counter into a human-readable MiB value.
+#[allow(clippy::cast_precision_loss, reason = "benchmark RSS needs only two-decimal reporting")]
+fn bytes_to_mib(bytes: u64) -> f64 {
+	bytes as f64 / MEBIBYTE_BYTES as f64
 }
 
 /// Builds every required deterministic workload.

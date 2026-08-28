@@ -1,4 +1,6 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
+
+use rapidhash::{HashSetExt, RapidHashSet};
 
 use super::{
 	AtomId,
@@ -142,6 +144,7 @@ pub(super) struct NodeColumns {
 	live: CowVec<AtomId>,
 	dense_positions: CowVec<Option<usize>>,
 	record_ids: CowVec<Option<RecordId>>,
+	record_index: Arc<RapidHashSet<RecordId>>,
 	labels: CowVec<Option<Text>>,
 	properties: CowVec<PropertyMap>,
 }
@@ -153,6 +156,7 @@ impl NodeColumns {
 			live: CowVec::new(),
 			dense_positions: CowVec::new(),
 			record_ids: CowVec::new(),
+			record_index: Arc::new(RapidHashSet::default()),
 			labels: CowVec::new(),
 			properties: CowVec::new(),
 		}
@@ -164,6 +168,7 @@ impl NodeColumns {
 			live: CowVec::with_capacity(capacity),
 			dense_positions: CowVec::with_capacity(capacity),
 			record_ids: CowVec::with_capacity(capacity),
+			record_index: Arc::new(RapidHashSet::with_capacity(capacity)),
 			labels: CowVec::with_capacity(capacity),
 			properties: CowVec::with_capacity(capacity),
 		}
@@ -209,7 +214,9 @@ impl NodeColumns {
 			return false;
 		}
 		let index = id.slot() as usize;
-		self.record_ids[index] = None;
+		if let Some(record_id) = self.record_ids[index].take() {
+			Arc::make_mut(&mut self.record_index).remove(&record_id);
+		}
 		self.labels[index] = None;
 		self.properties[index].clear();
 		let Some(dense) = self.dense_positions[index].take() else {
@@ -255,9 +262,7 @@ impl NodeColumns {
 	}
 
 	pub(crate) fn contains_record(&self, record_id: &RecordId) -> bool {
-		self.live
-			.iter()
-			.any(|id| self.record_id(*id).is_some_and(|candidate| candidate == record_id))
+		self.record_index.contains(record_id)
 	}
 
 	fn populate(
@@ -269,6 +274,8 @@ impl NodeColumns {
 	) {
 		self.ensure_slot(id.slot() as usize);
 		let index = id.slot() as usize;
+		let inserted = Arc::make_mut(&mut self.record_index).insert(record_id.clone());
+		debug_assert!(inserted, "record ID uniqueness must be checked before insertion");
 		self.record_ids[index] = Some(record_id);
 		self.labels[index] = label;
 		self.properties[index] = properties;
@@ -298,6 +305,7 @@ pub(super) struct EdgeColumns {
 	live: CowVec<AtomId>,
 	dense_positions: CowVec<Option<usize>>,
 	record_ids: CowVec<Option<RecordId>>,
+	record_index: Arc<RapidHashSet<RecordId>>,
 	topologies: CowVec<EdgeTopology>,
 	labels: CowVec<Option<Text>>,
 	properties: CowVec<PropertyMap>,
@@ -311,6 +319,7 @@ impl EdgeColumns {
 			live: CowVec::new(),
 			dense_positions: CowVec::new(),
 			record_ids: CowVec::new(),
+			record_index: Arc::new(RapidHashSet::default()),
 			topologies: CowVec::new(),
 			labels: CowVec::new(),
 			properties: CowVec::new(),
@@ -324,6 +333,7 @@ impl EdgeColumns {
 			live: CowVec::with_capacity(capacity),
 			dense_positions: CowVec::with_capacity(capacity),
 			record_ids: CowVec::with_capacity(capacity),
+			record_index: Arc::new(RapidHashSet::with_capacity(capacity)),
 			topologies: CowVec::with_capacity(capacity),
 			labels: CowVec::with_capacity(capacity),
 			properties: CowVec::with_capacity(capacity),
@@ -375,7 +385,9 @@ impl EdgeColumns {
 			return false;
 		}
 		let index = id.slot() as usize;
-		self.record_ids[index] = None;
+		if let Some(record_id) = self.record_ids[index].take() {
+			Arc::make_mut(&mut self.record_index).remove(&record_id);
+		}
 		self.topologies[index] = empty_topology();
 		self.labels[index] = None;
 		self.properties[index].clear();
@@ -443,9 +455,7 @@ impl EdgeColumns {
 	}
 
 	pub(crate) fn contains_record(&self, record_id: &RecordId) -> bool {
-		self.live
-			.iter()
-			.any(|id| self.record_id(*id).is_some_and(|candidate| candidate == record_id))
+		self.record_index.contains(record_id)
 	}
 
 	fn populate(
@@ -459,6 +469,8 @@ impl EdgeColumns {
 	) {
 		self.ensure_slot(id.slot() as usize);
 		let index = id.slot() as usize;
+		let inserted = Arc::make_mut(&mut self.record_index).insert(record_id.clone());
+		debug_assert!(inserted, "record ID uniqueness must be checked before insertion");
 		self.record_ids[index] = Some(record_id);
 		self.topologies[index] = topology;
 		self.labels[index] = label;
