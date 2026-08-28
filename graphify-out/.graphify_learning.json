@@ -1,19 +1,88 @@
 {
-  "generated_at": "2026-08-11T23:59:49.284840+00:00",
+  "generated_at": "2026-08-28T21:33:25.553254+00:00",
   "nodes": {
-    "src_values_runtime_graph_metagraph_metagraph": {
-      "code_fingerprint": "87e085f842dd05955ba427c410b9ce75dad21c4bc287c1f7b66191f45e930dd9",
-      "label": "Metagraph",
-      "last": "2026-08-10T11:48:37.217190+00:00",
+    "src_datastore_datastore": {
+      "code_fingerprint": "722c215b9447b4d5a826657e07c2765f86b4b28f8b1e074cba2ec054ceb24b64",
+      "label": "Datastore",
+      "last": "2026-08-28T21:19:39.115264+00:00",
       "provenance": [
+        {
+          "date": "2026-08-28T21:19:39.115264+00:00",
+          "outcome": "useful",
+          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
+        }
+      ],
+      "score": 0.99977902,
+      "source_file": "src/datastore.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_datastore_write_set_limit_counts_large_property_payload_before_publication": {
+      "code_fingerprint": "722c215b9447b4d5a826657e07c2765f86b4b28f8b1e074cba2ec054ceb24b64",
+      "label": "write_set_limit_counts_large_property_payload_before_publication()",
+      "last": "2026-08-28T21:19:39.115264+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T21:19:39.115264+00:00",
+          "outcome": "useful",
+          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
+        }
+      ],
+      "score": 0.99977902,
+      "source_file": "src/datastore.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_storage_store_localsnapshotgraph": {
+      "code_fingerprint": "84ea3f76ea17b7918dd014a672b6194908b509c5b1436c6bc1eaf8b91c3ebc3d",
+      "label": "LocalSnapshotGraph",
+      "last": "2026-08-28T21:19:39.115264+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T21:19:39.115264+00:00",
+          "outcome": "useful",
+          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
+        }
+      ],
+      "score": 0.99977902,
+      "source_file": "src/storage/store.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_values_runtime_graph_general_graph": {
+      "code_fingerprint": "c7f74ba99e85fad0a11f518e1b373bf961497dffe2acf77cdec9fd128cdccd0b",
+      "label": "Graph",
+      "last": "2026-08-28T21:19:39.115264+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T21:19:39.115264+00:00",
+          "outcome": "useful",
+          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
+        },
         {
           "date": "2026-08-10T11:48:37.217190+00:00",
           "outcome": "useful",
           "q": "What is MetaGraph?"
         }
       ],
-      "score": 0.965762744,
-      "source_file": "src/values/runtime/graph/metagraph.rs",
+      "score": 1.653371293,
+      "source_file": "src/values/runtime/graph/general.rs",
+      "status": "preferred",
+      "uses": 2
+    },
+    "src_values_runtime_mod_estimated_values_heap_bytes": {
+      "code_fingerprint": "1d26fcef6694bd207a92dc605c70f74acd09f18abee551dc27fcce25c91d6523",
+      "label": "estimated_values_heap_bytes()",
+      "last": "2026-08-28T21:19:39.115264+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-28T21:19:39.115264+00:00",
+          "outcome": "useful",
+          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
+        }
+      ],
+      "score": 0.99977902,
+      "source_file": "src/values/runtime/mod.rs",
       "status": "tentative",
       "uses": 1
     }

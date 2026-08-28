@@ -165,8 +165,8 @@
     "semantic_hash": "29291a6b9a074eecd3d91cb579617e8e"
   },
   "ferros-grynn-bench/benches/graph_core.rs": {
-    "mtime": 1786618416.8021982,
-    "ast_hash": "1087031e9f7a495f22f445e6bf133e16",
+    "mtime": 1787677312.1792464,
+    "ast_hash": "56fbb547d072ff43a41096793b28f10d",
     "semantic_hash": ""
   },
   "ferros-grynn-bench/benches/property_map.rs": {
@@ -175,9 +175,9 @@
     "semantic_hash": "6d7956aec279b1e5d1e912a0b3a11877"
   },
   "ferros-grynn-bench/src/lib.rs": {
-    "mtime": 1786298618.2481272,
-    "ast_hash": "ddf835a7726a00201c66c0cbc25b8740",
-    "semantic_hash": "ddf835a7726a00201c66c0cbc25b8740"
+    "mtime": 1787648672.2545602,
+    "ast_hash": "aadff03a7527ded4b711f3a7fdd472b5",
+    "semantic_hash": ""
   },
   "src/collections/mod.rs": {
     "mtime": 1786360178.2926116,
@@ -275,8 +275,8 @@
     "semantic_hash": ""
   },
   "src/gql/execution.rs": {
-    "mtime": 1786360549.14456,
-    "ast_hash": "88f3737b473cce928eba2372c0cecc97",
+    "mtime": 1787693588.2850678,
+    "ast_hash": "f8e7877ef5ec7969bc1874d2759f5137",
     "semantic_hash": ""
   },
   "src/gql/ir.rs": {
@@ -315,8 +315,8 @@
     "semantic_hash": ""
   },
   "src/gql_status/status.rs": {
-    "mtime": 1786618659.4167457,
-    "ast_hash": "c7aaa032619d42a122c6b47b7c3ca4e4",
+    "mtime": 1787675329.7141986,
+    "ast_hash": "ccef02feda33b0d183edf5942690c20f",
     "semantic_hash": ""
   },
   "src/gql_status/wire.rs": {
@@ -325,8 +325,8 @@
     "semantic_hash": ""
   },
   "src/lib.rs": {
-    "mtime": 1786381292.324,
-    "ast_hash": "6884339cb8b51499e506a7d605d22e51",
+    "mtime": 1787526192.231518,
+    "ast_hash": "5dca54c1a5c5be92cefc3106ca184ae7",
     "semantic_hash": ""
   },
   "src/macros/mod.rs": {
@@ -425,28 +425,28 @@
     "semantic_hash": ""
   },
   "src/values/runtime/graph/dag.rs": {
-    "mtime": 1786618417.300605,
-    "ast_hash": "debd7b29e49ee7446f4d8288c73a72e2",
+    "mtime": 1787676866.3902729,
+    "ast_hash": "6869ab9303923bbf1c375b3dd6f2ace8",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/forest.rs": {
-    "mtime": 1786618417.3190224,
-    "ast_hash": "52eb52360aa4d7fe6cdd372dc2d33f6b",
+    "mtime": 1787676889.4561844,
+    "ast_hash": "41bdbd0d7088da1773f490047c50ceca",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/general.rs": {
-    "mtime": 1786469527.017,
-    "ast_hash": "cdc26cab629589a99eb372fd1a46ae19",
+    "mtime": 1787940268.4872062,
+    "ast_hash": "70c8ea46d512fd165d6ded020d870456",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/hypergraph.rs": {
-    "mtime": 1786469513.952,
-    "ast_hash": "3b556887184483973b166b87b761c3d5",
+    "mtime": 1787676867.2339134,
+    "ast_hash": "1054c20043c2f782e196c2413432d9cf",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/id.rs": {
-    "mtime": 1786468221.364,
-    "ast_hash": "66f80a05069b52102becb9a63d06a8a1",
+    "mtime": 1787674524.1912017,
+    "ast_hash": "17cb1ecb2927274d250ccc9b7e4105cb",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/live.rs": {
@@ -455,38 +455,38 @@
     "semantic_hash": ""
   },
   "src/values/runtime/graph/materialized.rs": {
-    "mtime": 1786618417.3650103,
-    "ast_hash": "542ce77741792a3ccaf1db8b280fabc3",
+    "mtime": 1787674635.7167606,
+    "ast_hash": "8882ef4547bd3d6ea5d28b636cf3724e",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/metagraph.rs": {
-    "mtime": 1786452839.614,
-    "ast_hash": "d465170c4db5ead2c5848976cb086338",
+    "mtime": 1787676868.0345197,
+    "ast_hash": "7baa16c7d9c0c743c19f1cb9ef2e8342",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/mod.rs": {
-    "mtime": 1786472020.281,
-    "ast_hash": "894b787ee8e47ca4e88ed4c5a21b8707",
+    "mtime": 1787671663.4251013,
+    "ast_hash": "b954b380bc23d5b6ac18d8d9400dc01f",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/path.rs": {
-    "mtime": 1786452824.483,
-    "ast_hash": "67b167a6f3bf349bcee63701da8a3812",
+    "mtime": 1787676677.2143238,
+    "ast_hash": "a94e2a26bcbc9c4183ccb04966eb9bf4",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/read.rs": {
-    "mtime": 1786447585.059,
-    "ast_hash": "e077fea635a4ca6109afadc761822f65",
+    "mtime": 1787700750.9618237,
+    "ast_hash": "3f062128978d4e957d26e8f988cd6d53",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/storage.rs": {
-    "mtime": 1786447573.353,
-    "ast_hash": "5828f44fe9121c0b047c44da155e94b8",
+    "mtime": 1787939418.0767753,
+    "ast_hash": "4403bbac3296c0cdbba14afca3ff7672",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/subgraph.rs": {
-    "mtime": 1786447489.659,
-    "ast_hash": "c86f6ea084511668656e1cf2fa6ae17f",
+    "mtime": 1787677005.801795,
+    "ast_hash": "d6320566f34fdfd3cb163b4eb4288049",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/topology.rs": {
@@ -495,18 +495,18 @@
     "semantic_hash": ""
   },
   "src/values/runtime/graph/traversal.rs": {
-    "mtime": 1786447429.887,
-    "ast_hash": "e9ca7647c4be987816b1db0fb515c2a4",
+    "mtime": 1787676677.317145,
+    "ast_hash": "67e2ac084635fb53c0473734aa273ed7",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/view.rs": {
-    "mtime": 1786315067.905,
-    "ast_hash": "f9ac399feaeb90c546d14d7310572693",
+    "mtime": 1787676677.3231514,
+    "ast_hash": "b2ff911c3583f92432dbf46cee8d743e",
     "semantic_hash": ""
   },
   "src/values/runtime/graph/workspace.rs": {
-    "mtime": 1786618417.5053434,
-    "ast_hash": "b27694f99370dc097c6b0bfc9f6c67d4",
+    "mtime": 1787672620.3747914,
+    "ast_hash": "f758b9e840777f315934375b5819dd59",
     "semantic_hash": ""
   },
   "src/values/runtime/id.rs": {
@@ -520,8 +520,8 @@
     "semantic_hash": "e73ab43f51d92102b465bba6a993cc33"
   },
   "src/values/runtime/mod.rs": {
-    "mtime": 1786618417.528767,
-    "ast_hash": "41c37f3025e1f3e2f371b36c9c5b2beb",
+    "mtime": 1787940268.646112,
+    "ast_hash": "f238cedd4bd4b8ee5f41cb24a561b32d",
     "semantic_hash": ""
   },
   "src/values/runtime/number.rs": {
@@ -540,8 +540,8 @@
     "semantic_hash": ""
   },
   "src/values/runtime/property_map.rs": {
-    "mtime": 1786618417.5564654,
-    "ast_hash": "3e38f21d1cba4a690eb9e52db18bcec3",
+    "mtime": 1787940268.669005,
+    "ast_hash": "c1c1d9bee334efefce240c46111095f1",
     "semantic_hash": ""
   },
   "src/values/runtime/range.rs": {
@@ -585,8 +585,8 @@
     "semantic_hash": ""
   },
   "src/values/storage/mod.rs": {
-    "mtime": 1786619666.101892,
-    "ast_hash": "7ded4c031c0c98442677eac45438fad9",
+    "mtime": 1787700748.53632,
+    "ast_hash": "57a602371349e08b509c0b17cf164679",
     "semantic_hash": ""
   },
   "src/values/utils/mod.rs": {
@@ -598,11 +598,6 @@
     "mtime": 1784930814.6414897,
     "ast_hash": "81337e470f4539114d332d6883f7db28",
     "semantic_hash": "81337e470f4539114d332d6883f7db28"
-  },
-  "tests/struct_size.rs": {
-    "mtime": 1785710683.5461695,
-    "ast_hash": "fc96dbeea75ceabdf0c80899f35cfeef",
-    "semantic_hash": "fc96dbeea75ceabdf0c80899f35cfeef"
   },
   ".agents/skills/just/SKILL.md": {
     "mtime": 1785710421.551,
@@ -655,8 +650,8 @@
     "semantic_hash": "9378bd03d56baaf78bd738ab3848f142"
   },
   "AGENTS.md": {
-    "mtime": 1786527541.457,
-    "ast_hash": "05901a82690b3c11f96205870682b5cc",
+    "mtime": 1787606626.369,
+    "ast_hash": "875ca3b6115f4629abba353ce1b35c08",
     "semantic_hash": ""
   },
   "CLAUDE.md": {
@@ -675,8 +670,8 @@
     "semantic_hash": "79d4c8d1eacd4e6aba4a8917037efd65"
   },
   "docs/disk_storage_spec.md": {
-    "mtime": 1786620029.4184606,
-    "ast_hash": "2463b6812f13307b8c2a3126d0cee6ab",
+    "mtime": 1787932658.7753487,
+    "ast_hash": "3b0fc1493331f46c7314bc311f2be0fc",
     "semantic_hash": ""
   },
   "docs/gql_grammar.md": {
@@ -685,13 +680,13 @@
     "semantic_hash": "9ba80c8135ef2f703978760b06bfd884"
   },
   "docs/gql_spec.md": {
-    "mtime": 1786360686.8194554,
-    "ast_hash": "a6bbc9f8ddae1a4234058e6a4f0acb75",
+    "mtime": 1787606354.638,
+    "ast_hash": "812c4571b9b14336bd91c7ecb6d3e2c1",
     "semantic_hash": ""
   },
   "docs/gql_tech_spec.md": {
-    "mtime": 1786361529.0402377,
-    "ast_hash": "8c6cc5bf41591d1bd2e17fe01b275f66",
+    "mtime": 1787932660.0869012,
+    "ast_hash": "6116aca316e3dd7ab00650c7609384a2",
     "semantic_hash": ""
   },
   "docs/graphs.md": {
@@ -700,8 +695,8 @@
     "semantic_hash": ""
   },
   "docs/implementation_plan.md": {
-    "mtime": 1786619049.8396235,
-    "ast_hash": "bddc3721b88ce1eda3338fe4a9d90e59",
+    "mtime": 1787952537.359,
+    "ast_hash": "f464d81769d348310900c245be286fea",
     "semantic_hash": ""
   },
   "docs/values_plan.md": {
@@ -735,8 +730,8 @@
     "semantic_hash": ""
   },
   "src/datastore.rs": {
-    "mtime": 1786618416.971626,
-    "ast_hash": "09a33eba25ceaf38b4118b6248313e59",
+    "mtime": 1787940266.8407204,
+    "ast_hash": "feff8463b88fc27d6bbedfc7a303c7bd",
     "semantic_hash": ""
   },
   "graphify-out/memory/query_20260810_114837_what_is_metagraph.md": {
@@ -747,6 +742,121 @@
   "src/values/storage/codec.rs": {
     "mtime": 1786619962.7846699,
     "ast_hash": "958b3871ca1abe8ee0f3259b2ee04f27",
+    "semantic_hash": ""
+  },
+  "docs/disk_storage_plan.md": {
+    "mtime": 1787941308.5696864,
+    "ast_hash": "f6e96ff135cf41ebf034deb1cecaf03a",
+    "semantic_hash": ""
+  },
+  "src/storage/direct.rs": {
+    "mtime": 1787933918.8031118,
+    "ast_hash": "31fb12cf42f566da63e5b23e72ae98d5",
+    "semantic_hash": ""
+  },
+  "src/storage/mod.rs": {
+    "mtime": 1787933703.5727963,
+    "ast_hash": "b2e9b5aa8ed7c70f06ab9dfde4c75f31",
+    "semantic_hash": ""
+  },
+  "src/storage/page.rs": {
+    "mtime": 1787706033.2609084,
+    "ast_hash": "2e2af4650467066c2f8d1e106f830c3a",
+    "semantic_hash": ""
+  },
+  "src/storage/benchmarks.rs": {
+    "mtime": 1787952049.2602427,
+    "ast_hash": "9fa82e6e3705957e9efb5f1f2954ae2d",
+    "semantic_hash": ""
+  },
+  "src/storage/buffer_pool.rs": {
+    "mtime": 1787932786.468228,
+    "ast_hash": "5932387375dfe29dfdc155872cf08be8",
+    "semantic_hash": ""
+  },
+  "src/storage/page_manager.rs": {
+    "mtime": 1787940267.745547,
+    "ast_hash": "34c050506c8493ac11028e8a4bf733c0",
+    "semantic_hash": ""
+  },
+  "docs/reports/disk_storage_stage2_report.md": {
+    "mtime": 1787606639.454,
+    "ast_hash": "29a03eacd4afb774c9fbd1aaf4352bf6",
+    "semantic_hash": ""
+  },
+  "src/storage/wal.rs": {
+    "mtime": 1787706034.175453,
+    "ast_hash": "06093f64a07ad77d84af571b07e6e65f",
+    "semantic_hash": ""
+  },
+  "src/storage/file_registry.rs": {
+    "mtime": 1787929838.9444315,
+    "ast_hash": "d405bcd14ab0ab09b271dac6785f7ba8",
+    "semantic_hash": ""
+  },
+  "src/storage/local.rs": {
+    "mtime": 1787620867.632624,
+    "ast_hash": "c947c1f101a2e82c05e748e3487791c4",
+    "semantic_hash": ""
+  },
+  "src/storage/superblock.rs": {
+    "mtime": 1787930596.374,
+    "ast_hash": "396f8a9f3432a0aa1ecb8ab79d18db5b",
+    "semantic_hash": ""
+  },
+  "src/storage/types.rs": {
+    "mtime": 1787620787.5753973,
+    "ast_hash": "cba96ac597e6b2f994a615c213740a0f",
+    "semantic_hash": ""
+  },
+  "src/storage/catalog.rs": {
+    "mtime": 1787696948.0191166,
+    "ast_hash": "c91eacdfa7b310b9e288ad6e16deb6f8",
+    "semantic_hash": ""
+  },
+  "src/storage/graph_index.rs": {
+    "mtime": 1787700751.7642558,
+    "ast_hash": "d31f875a9f462e353508202eb93cdf21",
+    "semantic_hash": ""
+  },
+  "src/storage/graph_pages.rs": {
+    "mtime": 1787696948.246765,
+    "ast_hash": "f733f1f60ff9ccd1b7b8331cf324e8da",
+    "semantic_hash": ""
+  },
+  "src/storage/store.rs": {
+    "mtime": 1787940268.1658337,
+    "ast_hash": "295057658d44af17e9333c974f0ec161",
+    "semantic_hash": ""
+  },
+  "src/values/storage/order_key.rs": {
+    "mtime": 1787700749.3747828,
+    "ast_hash": "9d5f74aec8a8710f70ca0a04d264bdf6",
+    "semantic_hash": ""
+  },
+  "docs/reports/disk_storage_stage5_report.md": {
+    "mtime": 1787734658.739,
+    "ast_hash": "a7d7dc6136c068cba270937bafcb5896",
+    "semantic_hash": ""
+  },
+  "src/storage/page_io.rs": {
+    "mtime": 1787933794.607524,
+    "ast_hash": "c6d5f3f1cc71457086394a6edc67dd39",
+    "semantic_hash": ""
+  },
+  "docs/reports/disk_storage_stage6_report.md": {
+    "mtime": 1787934667.77,
+    "ast_hash": "b7bfee65b7035dc7242d10314fe355db",
+    "semantic_hash": ""
+  },
+  "docs/reports/disk_storage_stage7_report.md": {
+    "mtime": 1787951919.662076,
+    "ast_hash": "d75ee4ddd7468579591e95b47d0f3287",
+    "semantic_hash": ""
+  },
+  "graphify-out/memory/query_20260828_211939_\u043a\u0430\u043a_\u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u044f_\u044d\u0442\u0430\u043f\u0430_7_\u0441\u0432\u044f\u0437\u044b\u0432\u0430\u044e\u0442_\u043b\u0438\u043c\u0438\u0442_write_set__\u0438.md": {
+    "mtime": 1787951979.115704,
+    "ast_hash": "dbe4bfc92dde74785cdd85d51f2bfbe2",
     "semantic_hash": ""
   }
 }
