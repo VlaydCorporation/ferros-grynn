@@ -7,6 +7,33 @@ Rust и к планированию работ, который ранее был
 **контракт** (язык, формат, семантику); этот файл описывает, **как** и **в каком порядке** его
 строить.
 
+## Утверждённый срез GrynQL P0–P2
+
+**Статус:** `approved-for-implementation`, реализация завершена в текущем срезе. Полный
+GrynQL остаётся `draft`; P3 выполняется отдельной задачей.
+
+P0 синхронизирует [gql_spec.md](gql_spec.md), [gql_grammar.md](gql_grammar.md) и
+[gql_tech_spec.md](gql_tech_spec.md) вокруг обязательного
+`MATCH ... FROM graph_name ... RETURN ...`. Каталог получил
+`Transaction::create_named_graph`; совместимый `create_graph` использует `id.id()` как
+имя. Проверяются уникальность в базе, непустота, отсутствие NUL и предел 128 UTF-8 байт;
+дисковый формат и версия не меняются.
+
+P1–P2 реализуют:
+
+- публичный MATCH AST, parser обеих нотаций и семантическое понижение в `LogicalMatch`;
+- StandardPath/AtomWalk, labels, цепочки, несколько паттернов, equi-join общих alias и
+  декартово произведение несвязанных паттернов;
+- конечные `TRAIL`-пути до глубины 30 и существующий `Value::Path`;
+- snapshot-bound GAT `QueryRead`, sync pull `RowCursor`, общие через `Rc` graph-view и
+  `TraversalIndex`, filter/project и публичный `array<object>`;
+- runtime ordering по связности alias и оценкам из точных `V`/`E`, без stats-модуля.
+
+Критерии среза покрываются parser, semantic, execution, path, MVCC и Windows reopen
+тестами. P3 намеренно не включает в этот этап storage-backed adjacency, persistent stats,
+async/spill, Traversal VM, изменение storage/WAL, P3-бенчмарки, Linux/NVMe/soak и
+исправление исторических performance-gates.
+
 ## Назначение и границы
 
 Что здесь есть:
@@ -712,7 +739,7 @@ qualified overflow. Таблица ниже теперь относится к �
 | **P2**               | A       | `src/ecs`                                | ✅ ECS foundation; далее revision-bound `GraphWorkspace`            |
 | **P2** (высокий)     | B       | `src/storage/`                           | Sync Direct I/O → BufferPool gate → `PageManager` → vertical slice  |
 | **P2**               | C       | frame-WAL                                | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
-| **P2**               | H, I, K | `src/syn`, analysis, IR, sync pull       | ✅ read-only `LET`/`RETURN`/`SELECT`; далее clauses/MATCH           |
+| **P2**               | H, I, K | `src/syn`, analysis, IR, sync pull       | ✅ read-only `LET`/`RETURN`/`SELECT` и GrynQL MATCH P0–P2           |
 | **P3** (средний)     | E       | `src/schema/`                            | `SchemaCatalog`                                                     |
 | **P3**               | G       | `src/index/`                             | `LabelIndex`, `BTreeIndex`, `CountIndex`, bulk-сборка               |
 | **P3**               | J, K, L | optimizer, storage adapter, Traversal VM | `Datastore::execute` поверх утверждённого `PageManager`             |
@@ -744,8 +771,9 @@ qualified overflow. Таблица ниже теперь относится к �
 - **Фаза 4a — local disk vertical slice** (P2–P3): ✅ Windows public create/open, durable
   catalogs, concrete graph pages, lazy page-backed adapter, point mutations, page delta,
   checkpoint policy/Restart и read/write/reopen E2E.
-- **Фаза 4b — query-конвейер MVP** (P2–P3): 🟡 H → I → J/K/L; read-only
-  `Datastore::execute` подключён для RAM и materialized local root, optimizer/traversal остаются.
+- **Фаза 4b — query-конвейер MVP** (P2–P3): ✅ P0–P2 read-only MATCH подключён для RAM
+  и snapshot-bound local root: parser, analysis, `LogicalMatch`, минимальный runtime-
+  optimizer и sync pull исполнение. P3 stats/index optimizer и Traversal VM остаются.
 - **Фаза 5a — Windows sync storage completion** (P3–P4): ✅ scalar B+tree, generic incidence,
   nested graphs, recursive `query_to_memory`, atomicity/FCW/SSI/family E2E. Correctness gate
   пройден, но повторный Windows performance gate этапа 5 не прошёл sparse/scan throughput;

@@ -5,6 +5,49 @@
 
 ---
 
+## Утверждённый профиль P0–P2 (GrynQL MVP)
+
+**Статус профиля:** `approved-for-implementation`. Полный язык, описанный остальными
+разделами этого документа, сохраняет статус `draft`; до отдельного утверждения он не
+расширяет текущий исполнимый профиль.
+
+Профиль P0–P2 определяет один read-only statement обязательной формы:
+
+```grynql
+MATCH [ATOM] pattern [, pattern ...]
+FROM graph_name
+[WHERE expression]
+RETURN expression [AS alias] [, expression [AS alias] ...]
+```
+
+`graph_name` является значением `Text` каталога, регистрозависимо разрешаемым в
+`GraphRef` из единого снимка запроса. `RecordId`, внутренний `AtomId` и storage-типы не
+являются именами графов и не выходят в синтаксис или публичный результат. Каталог
+поддерживает `Transaction::create_named_graph(name, id, graph)`; совместимый
+`create_graph(id, graph)` использует `id.id()` как имя. Имя уникально в базе данных,
+непусто, не содержит NUL и занимает не более 128 байт UTF-8. Оно сохраняется через уже
+существующее поле имени дискового каталога без изменения формата или его версии.
+
+В утверждённый профиль входят:
+
+- StandardPath с node-endpoint'ами, четырьмя направлениями, сокращёнными анонимными
+  рёбрами, альтернативами label через `|`, цепочками и несколькими паттернами;
+- AtomWalk с явными `<(...)>`/`<[...]>` и четырьмя `~[...]~`-операторами, включая
+  инцидентность vertex–edge и edge–edge и пары endpoint'ов гиперребра;
+- общий alias как equi-join и несвязанные паттерны как декартово произведение;
+- `WHERE`/`RETURN` над alias, `alias.id`, `alias.label` и свойствами из
+  `PropertyDictionary`; отсутствующее свойство имеет значение `none`;
+- конечные StandardPath-диапазоны `*n`, `*min..max`, `*..max` с `min = 0`, максимумом
+  30 и режимом `TRAIL`. Alias переменного connector-edge запрещён; такой путь
+  возвращается через `path = ...` как `Value::Path`;
+- мультимножество результатов и `DIFFERENT EDGES` по умолчанию для всех цепочек одного
+  `MATCH`. Результат statement имеет публичную форму `array<object>`.
+
+В P0–P2 явно **не поддерживаются** `OPTIONAL`, явные match/path modes,
+`RETURN DISTINCT`, `HYPER`/`META`/`WITHIN`, cross-level matching, inline property
+objects, неограниченные и shortest/weighted paths, DDL/DML, Traversal VM и graph-return.
+Их описание ниже остаётся проектом полного языка, а не обещанием текущего runtime.
+
 ## Содержание
 
 1. [Цели языка](#1-цели-языка)

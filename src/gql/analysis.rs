@@ -2,11 +2,18 @@ use std::collections::BTreeMap;
 
 use super::ir::{
 	Column,
+	EndpointDomain,
+	Expand,
+	LogicalMatch,
+	LogicalMatchPattern,
 	LogicalNode,
 	LogicalNodeKind,
 	LogicalProgram,
 	LogicalSelect,
 	LogicalStatement,
+	MatchBinding,
+	MatchOp,
+	PathExpand,
 	ScanTarget,
 	Schema,
 	TypedExpr,
@@ -19,6 +26,10 @@ use crate::{
 		Expr,
 		ExprKind,
 		Literal,
+		MatchEndpoint,
+		MatchEndpointKind,
+		MatchPattern,
+		MatchStatement,
 		Program,
 		RecordKey,
 		SelectItem,
@@ -27,11 +38,16 @@ use crate::{
 		TypeName,
 		UnaryOperator,
 	},
-	values::{Number, Object, RecordId, RecordIdPart, Type, Value},
+	values::{AtomKind, GraphRef, Number, Object, RecordId, RecordIdPart, Type, Value},
 };
+
+/// Maximum finite path depth accepted by the MVP analyzer.
+const MAX_MATCH_PATH_DEPTH: u32 = 30;
 
 pub(super) trait QueryCatalog {
 	fn schema(&self, table: &str) -> FerrosGrynnResult<Schema>;
+	/// Resolves a case-sensitive named graph.
+	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef>;
 }
 
 pub(super) fn analyze(
@@ -54,6 +70,24 @@ struct Analyzer<'a> {
 struct Slot {
 	id: u32,
 	ty: Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Semantic category assigned to a MATCH alias.
+enum MatchAliasKind {
+	/// An atom endpoint with a fixed domain.
+	Endpoint(EndpointDomain),
+	/// A public path value.
+	Path,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Existing MATCH alias metadata used for equi-joins.
+struct MatchAlias {
+	/// Binding-column index.
+	column: usize,
+	/// Alias semantic category.
+	kind: MatchAliasKind,
 }
 
 impl<'a> Analyzer<'a> {
@@ -102,6 +136,9 @@ impl<'a> Analyzer<'a> {
 						value: self.expr(&statement.value, None)?,
 					});
 				}
+				StatementKind::Match(statement) => {
+					statements.push(LogicalStatement::Match(self.match_statement(statement)?));
+				}
 				StatementKind::Select(select) => {
 					statements.push(LogicalStatement::Select(self.select(select, statement.span)?));
 				}
@@ -112,6 +149,220 @@ impl<'a> Analyzer<'a> {
 			initial_slots: self.initial_slots,
 			slot_count: self.slots.len(),
 		})
+	}
+
+	/// Analyzes a complete MATCH statement.
+	fn match_statement(&self, statement: &MatchStatement) -> FerrosGrynnResult<LogicalMatch> {
+		let graph = self.catalog.graph(&statement.source.value).map_err(|error| {
+			self.locate(error.with_phase(ExecutionPhase::SemanticAnalysis), statement.source.span)
+		})?;
+		let mut aliases = BTreeMap::new();
+		let mut bindings = Schema::default();
+		let mut patterns = Vec::with_capacity(statement.patterns.len());
+		for (original_index, pattern) in statement.patterns.iter().enumerate() {
+			patterns.push(self.match_pattern(
+				pattern,
+				original_index,
+				&mut aliases,
+				&mut bindings,
+			)?);
+		}
+
+		let filter = statement
+			.filter
+			.as_ref()
+			.map(|filter| self.expr(filter, Some(&bindings)))
+			.transpose()?;
+		let mut projection = Vec::with_capacity(statement.projection.len());
+		let mut columns = Vec::with_capacity(statement.projection.len());
+		for (index, item) in statement.projection.iter().enumerate() {
+			let typed = self.expr(&item.expr, Some(&bindings))?;
+			let name = item
+				.alias
+				.as_ref()
+				.map(|alias| alias.value.clone())
+				.or_else(|| match &item.expr.kind {
+					ExprKind::Name(name) => Some(name.value.clone()),
+					_ => None,
+				})
+				.unwrap_or_else(|| format!("value_{index}").into_boxed_str());
+			columns.push(Column {
+				name,
+				ty: typed.ty.clone(),
+			});
+			projection.push(typed);
+		}
+		Ok(LogicalMatch {
+			graph,
+			patterns,
+			bindings,
+			filter,
+			projection,
+			result: Schema {
+				columns,
+			},
+		})
+	}
+
+	/// Lowers one source pattern into linear expansion operations.
+	fn match_pattern(
+		&self,
+		pattern: &MatchPattern,
+		original_index: usize,
+		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
+		bindings: &mut Schema,
+	) -> FerrosGrynnResult<LogicalMatchPattern> {
+		let path_column = pattern
+			.path_alias
+			.as_ref()
+			.map(|alias| {
+				self.bind_match_alias(alias, MatchAliasKind::Path, Type::Path, aliases, bindings)
+			})
+			.transpose()?;
+		if path_column.is_some()
+			&& (pattern.steps.len() != 1 || pattern.steps[0].edge.length.is_none())
+		{
+			return Err(self.semantic(
+				"The MVP path alias requires exactly one variable-length step.",
+				pattern.span,
+			));
+		}
+		let start = self.match_endpoint(&pattern.start, aliases, bindings)?;
+		let mut source = start.clone();
+		let mut ops = Vec::with_capacity(pattern.steps.len());
+		for step in &pattern.steps {
+			let target = self.match_endpoint(&step.target, aliases, bindings)?;
+			if let Some(length) = step.edge.length {
+				if let Some(alias) = &step.edge.alias {
+					return Err(self.semantic(
+						"A variable-length MATCH edge cannot have an alias; bind the path instead.",
+						alias.span,
+					));
+				}
+				if length.min > length.max {
+					return Err(
+						self.semantic("MATCH path minimum exceeds its maximum.", length.span)
+					);
+				}
+				if length.max > MAX_MATCH_PATH_DEPTH {
+					return Err(self.semantic(
+						&format!(
+							"MATCH path depth exceeds the MVP maximum of {MAX_MATCH_PATH_DEPTH}."
+						),
+						length.span,
+					));
+				}
+				ops.push(MatchOp::PathExpand(PathExpand {
+					source: source.clone(),
+					target: target.clone(),
+					edge_labels: step.edge.labels.iter().map(|label| label.value.clone()).collect(),
+					direction: step.direction,
+					min: length.min,
+					max: length.max,
+					path_column,
+				}));
+			} else {
+				let edge = self.match_binding(
+					step.edge.alias.as_ref(),
+					&step.edge.labels,
+					EndpointDomain::Edge,
+					aliases,
+					bindings,
+				)?;
+				ops.push(MatchOp::Expand(Expand {
+					source: source.clone(),
+					edge,
+					target: target.clone(),
+					direction: step.direction,
+				}));
+			}
+			source = target;
+		}
+		Ok(LogicalMatchPattern {
+			start,
+			ops,
+			original_index,
+		})
+	}
+
+	/// Converts one endpoint into a typed binding.
+	fn match_endpoint(
+		&self,
+		endpoint: &MatchEndpoint,
+		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
+		bindings: &mut Schema,
+	) -> FerrosGrynnResult<MatchBinding> {
+		let domain = match endpoint.kind {
+			MatchEndpointKind::Node => EndpointDomain::Node,
+			MatchEndpointKind::Edge => EndpointDomain::Edge,
+		};
+		self.match_binding(endpoint.alias.as_ref(), &endpoint.labels, domain, aliases, bindings)
+	}
+
+	/// Builds a binding and registers its alias when present.
+	fn match_binding(
+		&self,
+		alias: Option<&crate::syn::Identifier>,
+		labels: &[crate::syn::Identifier],
+		domain: EndpointDomain,
+		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
+		bindings: &mut Schema,
+	) -> FerrosGrynnResult<MatchBinding> {
+		let column = alias
+			.map(|alias| {
+				let ty = Type::Atom(match domain {
+					EndpointDomain::Node => AtomKind::Node,
+					EndpointDomain::Edge => AtomKind::Edge,
+				});
+				self.bind_match_alias(
+					alias,
+					MatchAliasKind::Endpoint(domain),
+					ty,
+					aliases,
+					bindings,
+				)
+			})
+			.transpose()?;
+		Ok(MatchBinding {
+			domain,
+			column,
+			labels: labels.iter().map(|label| label.value.clone()).collect(),
+		})
+	}
+
+	/// Reuses or creates one alias column while enforcing its kind.
+	fn bind_match_alias(
+		&self,
+		alias: &crate::syn::Identifier,
+		kind: MatchAliasKind,
+		ty: Type,
+		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
+		bindings: &mut Schema,
+	) -> FerrosGrynnResult<usize> {
+		let key: Box<str> = if alias.quoted {
+			alias.value.clone()
+		} else {
+			alias.value.to_ascii_lowercase().into_boxed_str()
+		};
+		if let Some(existing) = aliases.get(&key) {
+			if existing.kind != kind {
+				return Err(self.semantic(
+					&format!("MATCH alias `{}` is reused with a conflicting kind.", alias.value),
+					alias.span,
+				));
+			}
+			return Ok(existing.column);
+		}
+		let column = bindings.columns.len();
+		bindings.columns.push(Column {
+			name: alias.value.clone(),
+			ty,
+		});
+		aliases.insert(key, MatchAlias {
+			column,
+			kind,
+		});
+		Ok(column)
 	}
 
 	fn select(

@@ -18,6 +18,15 @@ pub use crate::syn::{
 	Identifier,
 	LetStatement,
 	Literal,
+	MatchDirection,
+	MatchEdge,
+	MatchEndpoint,
+	MatchEndpointKind,
+	MatchLength,
+	MatchPattern,
+	MatchReturnItem,
+	MatchStatement,
+	MatchStep,
 	ObjectField,
 	ParserSettings,
 	Program,
@@ -44,6 +53,7 @@ pub fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult<Progra
 #[non_exhaustive]
 pub enum QueryStatementKind {
 	Let,
+	Match,
 	Return,
 	Select,
 }

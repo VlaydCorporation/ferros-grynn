@@ -167,6 +167,8 @@ const GRAPH_FILE_KINDS: [(DataFileKind, &str); 11] = [
 pub struct LocalCommitGraph {
 	/// Stable catalog identity of the named graph.
 	pub record_id: RecordId,
+	/// Case-sensitive user-visible graph name.
+	pub name: String,
 	/// Immutable MVCC graph image being published.
 	pub graph: Arc<MaterializedGraph>,
 }
@@ -282,6 +284,8 @@ impl LocalGraph {
 /// One named graph recovered from the durable catalog.
 pub struct LocalSnapshotGraph {
 	pub record_id: RecordId,
+	/// Case-sensitive name recovered from the existing catalog field.
+	pub name: String,
 	pub graph: Arc<LocalGraph>,
 }
 
@@ -804,8 +808,7 @@ impl LocalStore {
 			// ponytail: changed-graph lookup is linear in the catalog snapshot;
 			// add a temporary string-keyed map only if bulk multi-graph commits
 			// make this visible in profiles.
-			let Some(graph) =
-				graphs.iter().find(|entry| &entry.record_id == record_id).map(|entry| &entry.graph)
+			let Some(commit_graph) = graphs.iter().find(|entry| &entry.record_id == record_id)
 			else {
 				if let Some(index) = existing {
 					let graph_id = database.graphs[index].graph_id;
@@ -819,7 +822,13 @@ impl LocalStore {
 				Some(index) => database.graphs[index].graph_id,
 				None => allocate_graph_id(&mut database)?,
 			};
-			let plan = plan_graph_tree(&mut database, graph_id, record_id, graph)?;
+			let plan = plan_graph_tree(
+				&mut database,
+				graph_id,
+				record_id,
+				&commit_graph.name,
+				&commit_graph.graph,
+			)?;
 			let mut images = build_graph_images(&plan, &mut dictionary, tables)?;
 			let in_place = if images.len() == 1
 				&& let Some(index) = existing
@@ -1949,6 +1958,8 @@ struct BuiltGraphImage {
 struct PlannedGraph {
 	graph_id: GraphId,
 	record_id: RecordId,
+	/// Name written into the existing graph catalog entry.
+	name: String,
 	kind: GraphKind,
 	graph: Graph<Frozen>,
 	parent_graph_id: Option<GraphId>,
@@ -2007,13 +2018,14 @@ fn plan_graph_tree(
 	database: &mut DatabaseCatalog,
 	graph_id: GraphId,
 	record_id: &RecordId,
+	name: &str,
 	graph: &MaterializedGraph,
 ) -> FerrosGrynnResult<PlannedGraph> {
 	let mut next_subgraph_slot = 1_u32;
 	plan_graph(
 		database,
 		graph_id,
-		record_id.clone(),
+		(record_id.clone(), name.to_owned()),
 		graph.kind(),
 		graph.clone().into_general()?,
 		None,
@@ -2026,7 +2038,7 @@ fn plan_graph_tree(
 fn plan_graph(
 	database: &mut DatabaseCatalog,
 	graph_id: GraphId,
-	record_id: RecordId,
+	catalog_identity: (RecordId, String),
 	kind: GraphKind,
 	graph: Graph<Frozen>,
 	parent_graph_id: Option<GraphId>,
@@ -2034,6 +2046,7 @@ fn plan_graph(
 	parent_atom: Option<DiskAtomRef>,
 	next_subgraph_slot: &mut u32,
 ) -> FerrosGrynnResult<PlannedGraph> {
+	let (record_id, name) = catalog_identity;
 	let mut nested = Vec::new();
 	for id in GraphRead::node_ids(&graph)? {
 		let id = id?;
@@ -2072,10 +2085,11 @@ fn plan_graph(
 			})?,
 			container.slot(),
 		)?;
+		let child_name = child_record.id().to_string();
 		let child = plan_graph(
 			database,
 			child_id,
-			child_record,
+			(child_record, child_name),
 			GraphKind::Graph,
 			nested_graph,
 			Some(graph_id),
@@ -2092,6 +2106,7 @@ fn plan_graph(
 	Ok(PlannedGraph {
 		graph_id,
 		record_id,
+		name,
 		kind,
 		graph,
 		parent_graph_id,
@@ -2214,6 +2229,7 @@ fn load_database(
 		let record_id: RecordId = entry.record_id.parse()?;
 		graphs.push(LocalSnapshotGraph {
 			record_id: record_id.clone(),
+			name: entry.name.clone(),
 			graph: Arc::new(open_local_graph(
 				root,
 				manager,
@@ -2292,6 +2308,7 @@ fn load_changed_graphs(
 		};
 		graphs.push(LocalSnapshotGraph {
 			record_id: record_id.clone(),
+			name: entry.name.clone(),
 			graph: Arc::new(open_local_graph(
 				root,
 				manager,
@@ -3118,7 +3135,7 @@ fn build_graph_image(
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let subgraph_pages = encode_subgraph_pages(&subgraph_entries)?;
 	let freelist_pages = vec![encode_freelist(PageNo::new(0), PageLsn::ZERO, 0, None, &[])?];
-	let graph_name = record_id.id().to_string();
+	let graph_name = plan.name.clone();
 	let now = unix_time_ms()?;
 	let superblock = GraphSuperblock {
 		graph_id,
@@ -3177,7 +3194,7 @@ fn build_graph_image(
 			subgraph_slot: plan.subgraph_slot,
 			parent_atom: plan.parent_atom,
 			record_id: record_id.to_string(),
-			name: record_id.id().to_string(),
+			name: plan.name.clone(),
 			kind: plan.kind,
 			created_lsn: Lsn::ZERO,
 			identity: *identity.as_inner().as_bytes(),

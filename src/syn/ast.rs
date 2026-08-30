@@ -32,8 +32,87 @@ pub struct Statement {
 #[non_exhaustive]
 pub enum StatementKind {
 	Let(LetStatement),
+	Match(MatchStatement),
 	Return(ReturnStatement),
 	Select(SelectStatement),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MatchStatement {
+	pub atom: bool,
+	pub patterns: Vec<MatchPattern>,
+	pub source: Identifier,
+	pub filter: Option<Expr>,
+	pub projection: Vec<MatchReturnItem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MatchPattern {
+	pub path_alias: Option<Identifier>,
+	pub start: MatchEndpoint,
+	pub steps: Vec<MatchStep>,
+	pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MatchEndpoint {
+	pub kind: MatchEndpointKind,
+	pub alias: Option<Identifier>,
+	pub labels: Vec<Identifier>,
+	pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MatchEndpointKind {
+	Node,
+	Edge,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MatchStep {
+	pub direction: MatchDirection,
+	pub edge: MatchEdge,
+	pub target: MatchEndpoint,
+	pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MatchEdge {
+	pub alias: Option<Identifier>,
+	pub labels: Vec<Identifier>,
+	pub length: Option<MatchLength>,
+	pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MatchDirection {
+	Forward,
+	Backward,
+	Undirected,
+	Bidirectional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MatchLength {
+	pub min: u32,
+	pub max: u32,
+	pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct MatchReturnItem {
+	pub expr: Expr,
+	pub alias: Option<Identifier>,
+	pub span: TextSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]

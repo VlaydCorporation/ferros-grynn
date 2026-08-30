@@ -1,6 +1,6 @@
 use crate::{
 	gql_status::TextSpan,
-	values::{RecordId, Type, Value},
+	values::{GraphRef, RecordId, Type, Value},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,7 +22,98 @@ pub(super) enum LogicalStatement {
 	Return {
 		value: TypedExpr,
 	},
+	/// Executes a read-only graph pattern match.
+	Match(LogicalMatch),
 	Select(LogicalSelect),
+}
+
+#[derive(Debug, Clone)]
+/// An analyzed MATCH statement tied to one catalog graph.
+pub(super) struct LogicalMatch {
+	/// Resolved graph reference captured during analysis.
+	pub(super) graph: GraphRef,
+	/// Analyzed patterns in their source order.
+	pub(super) patterns: Vec<LogicalMatchPattern>,
+	/// Columns bound by aliases in all patterns.
+	pub(super) bindings: Schema,
+	/// Optional row predicate.
+	pub(super) filter: Option<TypedExpr>,
+	/// Expressions evaluated for each surviving row.
+	pub(super) projection: Vec<TypedExpr>,
+	/// Public result-column schema.
+	pub(super) result: Schema,
+}
+
+#[derive(Debug, Clone)]
+/// One linear MATCH pattern before runtime reordering.
+pub(super) struct LogicalMatchPattern {
+	/// Initial endpoint binding.
+	pub(super) start: MatchBinding,
+	/// Linear expansion operations.
+	pub(super) ops: Vec<MatchOp>,
+	/// Stable source-order tie breaker for the optimizer.
+	pub(super) original_index: usize,
+}
+
+#[derive(Debug, Clone)]
+/// A linear MATCH expansion operation.
+pub(super) enum MatchOp {
+	/// Expands through exactly one connector edge.
+	Expand(Expand),
+	/// Expands through a finite TRAIL path.
+	PathExpand(PathExpand),
+}
+
+#[derive(Debug, Clone)]
+/// A fixed-length connector expansion.
+pub(super) struct Expand {
+	/// Source endpoint binding.
+	pub(super) source: MatchBinding,
+	/// Connector-edge binding.
+	pub(super) edge: MatchBinding,
+	/// Target endpoint binding.
+	pub(super) target: MatchBinding,
+	/// Required traversal direction.
+	pub(super) direction: crate::syn::MatchDirection,
+}
+
+#[derive(Debug, Clone)]
+/// A bounded variable-length TRAIL expansion.
+pub(super) struct PathExpand {
+	/// Source endpoint binding.
+	pub(super) source: MatchBinding,
+	/// Target endpoint binding.
+	pub(super) target: MatchBinding,
+	/// Accepted connector labels.
+	pub(super) edge_labels: Vec<Box<str>>,
+	/// Required traversal direction.
+	pub(super) direction: crate::syn::MatchDirection,
+	/// Inclusive minimum hop count.
+	pub(super) min: u32,
+	/// Inclusive maximum hop count.
+	pub(super) max: u32,
+	/// Optional column receiving the public path value.
+	pub(super) path_column: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Runtime domain accepted by a MATCH endpoint.
+pub(super) enum EndpointDomain {
+	/// Node atoms only.
+	Node,
+	/// Edge atoms only.
+	Edge,
+}
+
+#[derive(Debug, Clone)]
+/// Alias and label constraints for one MATCH atom.
+pub(super) struct MatchBinding {
+	/// Required atom domain.
+	pub(super) domain: EndpointDomain,
+	/// Optional binding-column index.
+	pub(super) column: Option<usize>,
+	/// Alternative accepted labels.
+	pub(super) labels: Vec<Box<str>>,
 }
 
 #[derive(Debug, Clone)]

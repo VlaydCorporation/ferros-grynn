@@ -6,6 +6,59 @@
 
 ---
 
+## Утверждённая грамматика P0–P2
+
+**Статус профиля:** `approved-for-implementation`. Полная EBNF ниже остаётся `draft`.
+Следующие правила имеют приоритет для текущего parser/runtime и намеренно задают
+меньшее подмножество языка:
+
+```ebnf
+mvp_match_stmt ::= "MATCH" [ "ATOM" ] mvp_match_pattern_list
+                   "FROM" graph_name
+                   [ "WHERE" expr ]
+                   "RETURN" mvp_return_item { "," mvp_return_item }
+
+mvp_match_pattern_list ::= mvp_match_pattern { "," mvp_match_pattern }
+mvp_match_pattern      ::= [ alias "=" ]
+                           ( mvp_standard_path | mvp_atomwalk_path )
+
+mvp_standard_path ::= mvp_node_endpoint { mvp_standard_step mvp_node_endpoint }
+mvp_node_endpoint ::= "(" [ alias ] [ ":" mvp_labels ] ")"
+mvp_standard_step ::= "-["  mvp_edge_body "]->"
+                    | "<-[" mvp_edge_body "]-"
+                    | "-["  mvp_edge_body "]-"
+                    | "<-[" mvp_edge_body "]->"
+                    | "->" | "<-" | "-" | "<->"
+
+mvp_atomwalk_path ::= mvp_atom_endpoint { mvp_atom_step mvp_atom_endpoint }
+mvp_atom_endpoint ::= "<(" [ alias ] [ ":" mvp_labels ] ")>"
+                    | "<[" [ alias ] [ ":" mvp_labels ] "]>"
+mvp_atom_step ::= "~["  mvp_fixed_edge_body "]~>"
+                | "<~[" mvp_fixed_edge_body "]~"
+                | "~["  mvp_fixed_edge_body "]~"
+                | "<~[" mvp_fixed_edge_body "]~>"
+
+mvp_edge_body       ::= [ alias ] [ ":" mvp_labels ] [ mvp_length ]
+mvp_fixed_edge_body ::= [ alias ] [ ":" mvp_labels ]
+mvp_labels          ::= label { "|" label }
+mvp_length          ::= "*" integer
+                      | "*" integer ".." integer
+                      | "*" ".." integer
+mvp_return_item ::= expr [ "AS" alias ]
+graph_name      ::= name
+```
+
+`mvp_match_pattern` выбирается по режиму statement: без `ATOM` допустим только
+StandardPath, с `ATOM` — только AtomWalk. Все диапазоны конечны; семантические границы —
+`min <= max <= 30`, а пропущенный минимум в `*..max` равен `1`. `*0` и `*0..max`
+допустимы. Alias variable-length edge запрещён. Имена graph/alias/label допускают UTF-8;
+ключевые слова остаются регистронезависимыми, имя графа — регистрозависимым.
+
+Не входящие в эту EBNF `OPTIONAL`, match/path modes, `RETURN DISTINCT`, scopes
+`HYPER`/`META`, `WITHIN`, inline property objects, открытые диапазоны, path objectives,
+DDL/DML, traversal и graph-return должны завершаться диагностикой unsupported, а не
+молчаливым разбором по более широкой draft-грамматике.
+
 ## О названии
 
 Язык запросов движка Ferros-Grynn называется **GrynQL** (*Grynn Query Language*, произносится «грин-кью-эл»).

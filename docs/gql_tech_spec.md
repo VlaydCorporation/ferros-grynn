@@ -6,6 +6,49 @@
 
 ---
 
+## Утверждённый технический профиль P0–P2
+
+**Статус профиля:** `approved-for-implementation`. Остальные механизмы полного языка в
+этом документе сохраняют статус `draft` и не являются зависимостями P0–P2.
+
+Вертикальный read-only срез имеет границы `text -> AST -> analysis -> LogicalMatch ->
+RowCursor -> array<object>`. Публичный AST содержит `MatchStatement`, `MatchPattern`,
+`MatchEndpoint`, `MatchEndpointKind`, `MatchStep`, `MatchEdge`, `MatchDirection`,
+`MatchLength`, `MatchReturnItem`; `StatementKind` и `QueryStatementKind` получают
+`Match`, сохраняя `#[non_exhaustive]`.
+
+Семантический анализ регистрозависимо разрешает обязательный `FROM graph_name` как
+`Text -> GraphRef` в `QuerySnapshot`, проверяет alias-kind, область имён и конечные
+диапазоны. В IR один `LogicalMatch` содержит линейные `MatchOp::Expand`/
+`MatchOp::PathExpand`. `Expand` несёт endpoint-domain, направление, labels и binding-
+колонки; отдельный универсальный join engine не вводится.
+
+`QueryRead` статически диспетчеризуется и задаёт graph-view через GAT. Граф открывается
+только из переданного `QuerySnapshot`, поэтому всё выражение, включая Read Committed,
+использует один snapshot и регистрирует graph/set/atom reads. Граф и один построенный для
+цепочек/путей `TraversalIndex` разделяются через `Rc`; `MaterializedGraph` не является
+промежуточным представлением.
+
+Физическое исполнение — sync pull: `SeedCursor`, затем expand/path-expand, filter и
+project. Фиксированный шаг один раз получает `edge_ids` и лениво читает topology,
+labels/properties. `PathExpandCursor` выполняет инкрементальный DFS и хранит только
+активный `TRAIL`; верхняя граница 30, connector-edge не повторяется между цепочками
+одного `MATCH`, результат пути — `Value::Path`. Общие alias сравниваются при расширении,
+несвязанные паттерны образуют cursor-based декартово произведение. Семантика строк —
+bag, итог statement — `array<object>` без внутренних идентификаторов.
+
+Минимальный runtime-optimizer не вводит stats-модуль: он читает точные `V = node_count`
+и `E = edge_count` из `GraphRead`, оценивает первый hop как `E`, каждый следующий как
+`ceil(2E / max(V, 1))` с saturating arithmetic. Сначала выбираются паттерны, связанные с
+известным alias, затем минимальная оценка; равенство сохраняет исходный порядок. Labels
+не меняют оценку до появления гистограмм.
+
+Профиль не меняет storage format/version, I/O, WAL, мутацию графов или release-gates.
+Имя графа проводится через существующее поле каталога; `create_named_graph` проверяет
+уникальность, непустоту, NUL и лимит 128 UTF-8 байт. `OPTIONAL`, явные modes,
+`RETURN DISTINCT`, `HYPER`/`META`/`WITHIN`, cross-level, inline property objects,
+неограниченные/shortest/weighted paths, DDL/DML, Traversal VM и graph-return отложены.
+
 ## 0. Введение и охват
 
 Этот документ описывает **техническую реализацию** языка запросов GrynQL и то, как исполнительная система движка связывается с хранилищем. Он вторичен по отношению к трём базовым спецификациям и не должен им противоречить:

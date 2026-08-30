@@ -98,6 +98,8 @@ const DEFAULT_CHECKPOINT_DIRTY_PERCENT: u8 = 25;
 const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(300);
 /// Reserved table name used for hidden durable nested-graph identities.
 pub(crate) const INTERNAL_NESTED_GRAPH_TABLE: &str = "__fg_nested";
+/// Maximum UTF-8 byte length of a catalog graph name.
+const MAX_GRAPH_NAME_BYTES: usize = 128;
 
 /// Physical I/O strategy selected for one local datastore.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -474,6 +476,8 @@ struct ActiveSnapshot {
 struct DatabaseRoot {
 	commit_ts: u64,
 	graphs: BTreeMap<RecordId, StoredGraph>,
+	/// Case-sensitive top-level graph names mapped to their records.
+	graph_names: BTreeMap<String, RecordId>,
 	graph_catalog_versions: BTreeMap<RecordId, u64>,
 	tables: BTreeMap<String, Arc<TableSchema>>,
 	table_versions: BTreeMap<String, u64>,
@@ -482,6 +486,8 @@ struct DatabaseRoot {
 
 #[derive(Clone)]
 struct StoredGraph {
+	/// Durable top-level catalog name.
+	name: String,
 	graph: StoredGraphValue,
 	record_index: Arc<BTreeMap<String, AtomId>>,
 	last_commit_ts: u64,
@@ -597,6 +603,7 @@ impl Default for DatabaseRoot {
 		Self {
 			commit_ts: 0,
 			graphs: BTreeMap::new(),
+			graph_names: BTreeMap::new(),
 			graph_catalog_versions: BTreeMap::new(),
 			tables: BTreeMap::new(),
 			table_versions: BTreeMap::new(),
@@ -618,6 +625,7 @@ impl DatabaseRoot {
 		let mut root = Self {
 			commit_ts,
 			graphs: BTreeMap::new(),
+			graph_names: BTreeMap::new(),
 			graph_catalog_versions: BTreeMap::new(),
 			tables: BTreeMap::new(),
 			table_versions: BTreeMap::new(),
@@ -629,8 +637,14 @@ impl DatabaseRoot {
 					"durable graph catalog contains duplicate RecordId values",
 				));
 			}
+			if root.graph_names.insert(entry.name.clone(), entry.record_id.clone()).is_some() {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"durable graph catalog contains duplicate names",
+				));
+			}
 			root.graph_catalog_versions.insert(entry.record_id.clone(), commit_ts);
 			root.graphs.insert(entry.record_id, StoredGraph {
+				name: entry.name,
 				graph: StoredGraphValue::Local(entry.graph),
 				record_index: Arc::new(BTreeMap::new()),
 				last_commit_ts: commit_ts,
@@ -773,6 +787,7 @@ impl StoreInner {
 					.cloned()
 					.map(|graph| LocalCommitGraph {
 						record_id: record_id.clone(),
+						name: stored.name.clone(),
 						graph,
 					})
 					.ok_or_else(|| {
@@ -1201,6 +1216,11 @@ impl QuerySnapshot {
 	pub(crate) fn commit_ts(&self) -> u64 {
 		self.root.commit_ts
 	}
+
+	/// Returns the property dictionary captured by this query snapshot.
+	pub(crate) fn property_dictionary(&self) -> Arc<PropertyDictionary> {
+		self.root.dictionary.clone()
+	}
 }
 
 pub(crate) trait PredicateEvaluator {
@@ -1228,6 +1248,8 @@ impl PredicateMatcher {
 }
 
 struct GraphWrite {
+	/// Catalog name published with this graph write.
+	name: String,
 	base: Option<Arc<MaterializedGraph>>,
 	base_ts: u64,
 	value: Option<MutableGraphValue>,
@@ -1795,13 +1817,37 @@ impl Transaction {
 		crate::gql::execute_transaction(self, source, variables, settings)
 	}
 
+	/// Creates a graph using its record value as the default catalog name.
+	///
+	/// # Errors
+	///
+	/// Returns an error under the same conditions as
+	/// [`Self::create_named_graph`].
 	pub fn create_graph(
 		&mut self,
 		id: RecordId,
 		graph: MaterializedGraph,
 	) -> FerrosGrynnResult<GraphRef> {
+		let name = id.id().to_string();
+		self.create_named_graph(name, id, graph)
+	}
+
+	/// Creates a graph with an explicit case-sensitive catalog name.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable, the record or
+	/// name already exists, or the name violates the named-graph bounds.
+	pub fn create_named_graph<IntoText: Into<Text>>(
+		&mut self,
+		name: IntoText,
+		id: RecordId,
+		graph: MaterializedGraph,
+	) -> FerrosGrynnResult<GraphRef> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
+		let name = name.into();
+		validate_graph_name(name.as_str())?;
 		if id.table() == INTERNAL_NESTED_GRAPH_TABLE {
 			return Err(FerrosGrynnError::invalid_argument(format!(
 				"RecordId table '{INTERNAL_NESTED_GRAPH_TABLE}' is reserved for nested graphs"
@@ -1810,11 +1856,24 @@ impl Transaction {
 		if self.visible_graph_kind(&id).is_some() {
 			return Err(FerrosGrynnError::graph_already_exists(id.to_string()));
 		}
+		if self.graphs.iter().any(|(record_id, write)| {
+			record_id != &id && write.value.is_some() && write.name == name.as_str()
+		}) {
+			return Err(FerrosGrynnError::graph_already_exists(name.as_str()));
+		}
+		let root = self.read_root();
+		if let Some(record_id) = root.graph_names.get(name.as_str())
+			&& record_id != &id
+			&& !self.graphs.get(record_id).is_some_and(|write| write.value.is_none())
+		{
+			return Err(FerrosGrynnError::graph_already_exists(name.as_str()));
+		}
 		let kind = graph.kind();
 		let value = MutableGraphValue::from_frozen(&graph)?;
 		self.graphs.insert(id.clone(), GraphWrite {
+			name: name.as_str().to_owned(),
 			base: None,
-			base_ts: self.read_root().commit_ts,
+			base_ts: root.commit_ts,
 			value: Some(value),
 			force_persist: false,
 		});
@@ -2174,6 +2233,7 @@ impl Transaction {
 			}
 		};
 		self.graphs.insert(reference.id().clone(), GraphWrite {
+			name: stored.name.clone(),
 			base: Some(base.clone()),
 			base_ts: root.commit_ts,
 			value: Some(MutableGraphValue::from_frozen(&base)?),
@@ -2329,6 +2389,15 @@ impl Transaction {
 					{
 						return Err(self.write_conflict("a graph name was concurrently created"));
 					}
+					if current.graph_names.get(&write.name).is_some_and(|record_id| {
+						record_id != id
+							&& !self
+								.graphs
+								.get(record_id)
+								.is_some_and(|pending| pending.value.is_none())
+					}) {
+						return Err(self.write_conflict("a named graph was concurrently created"));
+					}
 				}
 				(Some(_), None) => {
 					let stored = current
@@ -2385,8 +2454,12 @@ impl Transaction {
 		commit_ts: u64,
 	) -> FerrosGrynnResult<()> {
 		let created = write.base.is_none();
+		let name = write.name.clone();
 		let Some(value) = write.value else {
 			next.graphs.remove(&id);
+			if next.graph_names.get(&name) == Some(&id) {
+				next.graph_names.remove(&name);
+			}
 			next.graph_catalog_versions.insert(id, commit_ts);
 			return Ok(());
 		};
@@ -2408,6 +2481,7 @@ impl Transaction {
 		};
 		let graph = Arc::new(graph);
 		let mut stored = current.graphs.get(&id).cloned().unwrap_or_else(|| StoredGraph {
+			name: name.clone(),
 			graph: StoredGraphValue::Materialized(graph.clone()),
 			record_index: Arc::new(BTreeMap::new()),
 			last_commit_ts: 0,
@@ -2440,9 +2514,11 @@ impl Transaction {
 			stored.node_set_version = commit_ts;
 			stored.edge_set_version = commit_ts;
 		}
+		stored.name = name.clone();
 		stored.graph = StoredGraphValue::Materialized(graph.clone());
 		stored.record_index = Arc::new(build_record_index(&graph)?);
 		stored.last_commit_ts = commit_ts;
+		next.graph_names.insert(name, id.clone());
 		next.graphs.insert(id.clone(), stored);
 		if created {
 			next.graph_catalog_versions.insert(id, commit_ts);
@@ -2474,6 +2550,52 @@ impl Transaction {
 				.cloned()
 				.ok_or_else(|| FerrosGrynnError::table_does_not_exist(name)),
 		}
+	}
+
+	/// Resolves a named graph against transaction-local writes and one
+	/// snapshot.
+	pub(crate) fn query_named_graph(
+		&self,
+		snapshot: &QuerySnapshot,
+		name: &str,
+	) -> FerrosGrynnResult<GraphRef> {
+		self.ensure_live()?;
+		if let Some((record_id, write)) = self
+			.graphs
+			.iter()
+			.find(|(_record_id, write)| write.name == name && write.value.is_some())
+		{
+			let kind = write
+				.value
+				.as_ref()
+				.map(MutableGraphValue::kind)
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
+			self.record_read(&snapshot.root, ReadKey::GraphCatalog(record_id.clone()));
+			return Ok(GraphRef::new(
+				record_id.clone(),
+				kind,
+				self.store.inner.graph_storage_mode(),
+			));
+		}
+		if self.graphs.values().any(|write| write.name == name && write.value.is_none()) {
+			return Err(FerrosGrynnError::graph_does_not_exist(name));
+		}
+		let record_id = snapshot
+			.root
+			.graph_names
+			.get(name)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
+		let stored = snapshot.root.graphs.get(record_id).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"named graph catalog points to an absent graph record",
+			)
+		})?;
+		self.record_read(&snapshot.root, ReadKey::GraphCatalog(record_id.clone()));
+		Ok(GraphRef::new(
+			record_id.clone(),
+			stored.graph.kind(),
+			self.store.inner.graph_storage_mode(),
+		))
 	}
 
 	pub(crate) fn query_rows(
@@ -2711,18 +2833,24 @@ impl Transaction {
 		}
 		Ok(estimated)
 	}
-}
 
-impl GraphRefReader for Transaction {
-	type View<'tx>
-		= TransactionGraphView<'tx>
-	where
-		Self: 'tx;
+	/// Opens a graph from the exact catalog root captured for the query.
+	pub(crate) fn query_graph<'tx>(
+		&'tx self,
+		snapshot: &QuerySnapshot,
+		reference: &GraphRef,
+	) -> FerrosGrynnResult<TransactionGraphView<'tx>> {
+		self.graph_view_at(snapshot.root.clone(), reference)
+	}
 
-	fn read_graph(&self, reference: &GraphRef) -> FerrosGrynnResult<Self::View<'_>> {
+	/// Builds a graph view without refreshing the transaction snapshot.
+	fn graph_view_at<'tx>(
+		&'tx self,
+		root: Arc<DatabaseRoot>,
+		reference: &GraphRef,
+	) -> FerrosGrynnResult<TransactionGraphView<'tx>> {
 		self.ensure_live()?;
 		ensure_store_reference(reference, self.store.inner.graph_storage_mode())?;
-		let root = self.read_root();
 		self.record_read(&root, ReadKey::GraphCatalog(reference.id().clone()));
 		let graph = if let Some(write) = self.graphs.get(reference.id()) {
 			let graph =
@@ -2763,6 +2891,18 @@ impl GraphRefReader for Transaction {
 			root,
 			reads: &self.reads,
 		})
+	}
+}
+
+impl GraphRefReader for Transaction {
+	type View<'tx>
+		= TransactionGraphView<'tx>
+	where
+		Self: 'tx;
+
+	fn read_graph(&self, reference: &GraphRef) -> FerrosGrynnResult<Self::View<'_>> {
+		let root = self.read_root();
+		self.graph_view_at(root, reference)
 	}
 }
 
@@ -3051,6 +3191,22 @@ fn build_record_index(graph: &MaterializedGraph) -> FerrosGrynnResult<BTreeMap<S
 	Ok(index)
 }
 
+/// Validates the public catalog-name bounds.
+fn validate_graph_name(name: &str) -> FerrosGrynnResult<()> {
+	if name.is_empty() {
+		return Err(FerrosGrynnError::invalid_argument("graph name must not be empty"));
+	}
+	if name.contains('\0') {
+		return Err(FerrosGrynnError::invalid_argument("graph name must not contain NUL"));
+	}
+	if name.len() > MAX_GRAPH_NAME_BYTES {
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"graph name exceeds {MAX_GRAPH_NAME_BYTES} UTF-8 bytes"
+		)));
+	}
+	Ok(())
+}
+
 fn ensure_store_reference(
 	reference: &GraphRef,
 	expected: GraphStorageMode,
@@ -3293,6 +3449,98 @@ mod tests {
 		(store, reference, carol)
 	}
 
+	#[test]
+	fn named_graphs_validate_names_and_are_visible_to_the_creating_transaction() {
+		let store = Datastore::in_memory();
+		let mut transaction = store.begin();
+		let reference = transaction
+			.create_named_graph(
+				"social",
+				graph_id("internal"),
+				Graph::<Mutable>::new().freeze().into(),
+			)
+			.unwrap();
+		let snapshot = transaction.query_snapshot().unwrap();
+		assert_eq!(transaction.query_named_graph(&snapshot, "social").unwrap(), reference);
+		assert!(
+			transaction
+				.create_named_graph(
+					"social",
+					graph_id("duplicate"),
+					Graph::<Mutable>::new().freeze().into(),
+				)
+				.is_err()
+		);
+		for invalid in ["", "nul\0name"] {
+			assert!(
+				transaction
+					.create_named_graph(
+						invalid,
+						graph_id("invalid"),
+						Graph::<Mutable>::new().freeze().into(),
+					)
+					.is_err()
+			);
+		}
+		assert!(
+			transaction
+				.create_named_graph(
+					"я".repeat(65),
+					graph_id("too-long"),
+					Graph::<Mutable>::new().freeze().into(),
+				)
+				.is_err()
+		);
+		transaction.remove_graph(&reference).unwrap();
+		let snapshot = transaction.query_snapshot().unwrap();
+		assert!(transaction.query_named_graph(&snapshot, "social").is_err());
+	}
+
+	#[test]
+	fn named_graph_names_are_database_wide_and_first_committer_wins() {
+		let store = Datastore::in_memory();
+		let mut first = store.begin();
+		first
+			.create_named_graph(
+				"shared",
+				graph_id("first"),
+				Graph::<Mutable>::new().freeze().into(),
+			)
+			.unwrap();
+		let mut second = store.begin();
+		second
+			.create_named_graph(
+				"shared",
+				graph_id("second"),
+				Graph::<Mutable>::new().freeze().into(),
+			)
+			.unwrap();
+		first.commit().unwrap();
+		assert!(second.commit().is_err());
+
+		let mut after_commit = store.begin();
+		assert!(
+			after_commit
+				.create_named_graph(
+					"shared",
+					graph_id("third"),
+					Graph::<Mutable>::new().freeze().into(),
+				)
+				.is_err()
+		);
+	}
+
+	#[test]
+	fn create_graph_uses_the_record_value_as_its_default_name() {
+		let store = Datastore::in_memory();
+		let mut transaction = store.begin();
+		let reference = transaction
+			.create_graph(graph_id("default-name"), Graph::<Mutable>::new().freeze().into())
+			.unwrap();
+		let snapshot = transaction.query_snapshot().unwrap();
+		assert_eq!(transaction.query_named_graph(&snapshot, "default-name").unwrap(), reference);
+	}
+
 	/// The first public local slice survives close/recovery and remains visible
 	/// through both the Rust graph API and the read-only query adapter.
 	#[cfg(windows)]
@@ -3418,6 +3666,33 @@ mod tests {
 			panic!("updated point SELECT must return an array");
 		};
 		assert_eq!(rows.as_slice(), &[Value::from(31_i64)]);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn local_named_graph_resolves_to_the_same_reference_after_reopen() {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 16,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut create = store.begin();
+		let reference = create
+			.create_named_graph(
+				"Пользовательский граф",
+				graph_id("durable-name"),
+				Graph::<Mutable>::new().freeze().into(),
+			)
+			.unwrap();
+		create.commit().unwrap();
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let transaction = reopened.begin();
+		let snapshot = transaction.query_snapshot().unwrap();
+		let resolved = transaction.query_named_graph(&snapshot, "Пользовательский граф").unwrap();
+		assert_eq!(resolved, reference);
 	}
 
 	/// The public NativeAsync selector drives IoRing through WAL commit,

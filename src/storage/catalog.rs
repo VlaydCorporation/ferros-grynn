@@ -1209,6 +1209,7 @@ fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 	let mut graph_ids = BTreeSet::new();
 	let mut graph_roots = BTreeMap::new();
 	let mut graph_records = BTreeSet::new();
+	let mut graph_names = BTreeSet::new();
 	let mut nested_slots = BTreeSet::new();
 	for graph in &catalog.graphs {
 		let root_graph_id = match (graph.parent_graph_id, graph.subgraph_slot, graph.parent_atom) {
@@ -1230,6 +1231,7 @@ fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			|| graph.name.contains('\0')
 			|| !graph_ids.insert(graph.graph_id)
 			|| !graph_records.insert(graph.record_id.as_str())
+			|| (graph.parent_graph_id.is_none() && !graph_names.insert(graph.name.as_str()))
 			|| graph.primary_index_file_id.kind() != Some(DataFileKind::Index)
 			|| graph.primary_index_root == PageNo::NULL
 		{
