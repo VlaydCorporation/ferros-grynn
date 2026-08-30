@@ -2,11 +2,13 @@
 
 ## Итоговая архитектура
 
-- Production-код размещается в `src/storage`; незавершённый `crates/storage_engine` удаляется после сверки его незакоммиченного diff. `fg-meta` остаётся только источником идей и тестовых сценариев.
+- Production-код размещается в `src/storage`; незавершённый `crates/storage_engine` удаляется после сверки его незакоммиченного diff. `fg-meta` — сырой пример для проверки отдельных гипотез и сценариев, не источник требований или готовой реализации.
 - `.fgb`/`.fgidx` используют Direct I/O: `O_DIRECT` на Linux, `FILE_FLAG_NO_BUFFERING` на Windows (macOS в поддержку не входит). WAL остаётся последовательным buffered I/O: commit записывает фреймы и `TxCommit`, затем выполняет один `flush + sync_data`.
 - `PAGE_SIZE = 16384`, `PageHeader = 32` байта. Checksum format v1 — portable `RapidHash V3`, seed `0`, с нормативными тестовыми векторами. `xxhash-rust` и `zerocopy` не добавляются; фиксированные LE-layout кодируются безопасными stdlib-функциями.
 - Sync — обязательный и стандартный режим. `mmap` существует только в бенчмарках через согласованный dev-only `memmap2`.
 - Нормальный release-gate требует сначала пройти полный sync-gate. Этап 6 начат отдельным явным решением владельца проекта при зафиксированных регрессиях этапа 5; это не фиксирует format v1 и не отменяет sync-gate. Публичная query-модель остаётся синхронной pull-моделью; пользователь выбирает I/O для экземпляра хранилища через настройки.
+- Linux/NVMe и Unix soak блокируют только объявление Unix-поддержки. Они не блокируют Windows
+  GA или freeze core format v1; после freeze несовместимый Linux layout требует v2 и миграции.
 
 ## Контракты и публичный API
 
@@ -52,7 +54,7 @@
 	- Не держать metadata lock во время I/O; одинаковые concurrent misses объединять. При всех pinned/loading frames применять backpressure, не превышать бюджет и освобождать все reservations после ошибки batch.
 	- Добавить raw Direct, Direct+BufferPool, обычный buffered positional и benchmark-only mmap backends; каждый repetition использует отдельные fresh-файлы и ротацию порядка.
 	- Реализовать calibrated batch Direct I/O и `SyncPageManager::read_pages`: соседние страницы читаются одним syscall, порядок и дубликаты сохраняются, checksum проверяется до публикации.
-	- Состояние на 2026-08-25: нативный Windows gate пройден. По явному решению для текущей Windows-разработки Linux/NVMe реализация и прогон, а также soak на dataset `≥ 1,25 × physical RAM`, отложены и больше не блокируют начало frame-WAL. Они остаются обязательным release-gate до фиксации format v1 и выпуска Unix-поддержки. Результаты Windows: [disk_storage_stage2_report.md](reports/disk_storage_stage2_report.md).
+	- Состояние на 2026-08-25: нативный Windows gate пройден. По явному решению для текущей Windows-разработки Linux/NVMe реализация и прогон, а также soak на dataset `≥ 1,25 × physical RAM`, отложены и больше не блокируют начало frame-WAL или будущую фиксацию Windows format v1. Они остаются обязательным release-gate выпуска Unix-поддержки. Результаты Windows: [disk_storage_stage2_report.md](reports/disk_storage_stage2_report.md).
 
 4. **Этап 3 — frame-WAL, MVCC и recovery**
     - Транзакция хранит логические atom-delta до 256 МиБ. Под единым DB commit lock выполняются SSI/FCW, merge поверх последних страниц и повторная проверка graph-family invariants.

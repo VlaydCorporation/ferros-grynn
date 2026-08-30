@@ -3,6 +3,9 @@
 **Версия:** 0.2-draft
 **Статус:** проектирование
 **Основано на:** [gql_spec.md](gql_spec.md) v0.2-draft
+**Нормативная область:** точный синтаксис каждого утверждённого профиля. Семантику конструкций
+задаёт [gql_spec.md](gql_spec.md), storage-контракт —
+[disk_storage_spec.md](disk_storage_spec.md), реализацию — [gql_tech_spec.md](gql_tech_spec.md).
 
 ---
 
@@ -83,7 +86,7 @@ DDL/DML, traversal и graph-return должны завершаться диаг�
 6. [MATCH и паттерны графа](#6-match-и-паттерны-графа)
 7. [Traversal Pipeline](#7-traversal-pipeline)
 8. [Граф как результат](#8-граф-как-результат)
-9. [DDL — DEFINE / REMOVE](#9-ddl--define--remove)
+9. [DDL — DEFINE / REMOVE / ALTER](#9-ddl--define--remove--alter)
 10. [Административные и live-операторы](#10-административные-и-live-операторы)
 11. [Общие clauses](#11-select-и-общие-clauses)
 12. [Выражения](#12-выражения)
@@ -283,7 +286,7 @@ statement ::=
     | explain_stmt
     | assert_invariants_stmt
     | import_stmt
-    | alter_index_stmt
+    | alter_stmt
     | compact_stmt
     | define_stmt
     | remove_stmt
@@ -719,7 +722,7 @@ build_source     ::= match_stmt | select_stmt | traverse_stmt | "(" statement ")
 
 ---
 
-## 9. DDL — DEFINE / REMOVE
+## 9. DDL — DEFINE / REMOVE / ALTER
 
 ```ebnf
 define_stmt ::= define_table | define_field | define_param | define_function
@@ -793,22 +796,26 @@ define_index ::= define_table_index | define_graph_index
 (* --- Табличные индексы --- *)
 define_table_index ::= "DEFINE" "INDEX" [ overwrite_or_ifne ] name
                        "ON" [ "TABLE" ] name
-                       ( "FIELDS" | "COLUMNS" ) idiom_list
-                       [ table_index_kind ]
+                       ( "COUNT"
+                       | ( "FIELDS" | "COLUMNS" ) idiom_list [ field_index_kind ] )
                        [ "COMMENT" string_lit ]
                        [ "CONCURRENTLY" ]
-                       [ with_options ]
                        [ "DEFER" ]
+                       [ with_options ]
 
-table_index_kind ::=
+field_index_kind ::=
       "UNIQUE"
-    | "COUNT"
     | "FULLTEXT" "ANALYZER" name [ "BM25" [ "(" number_lit "," number_lit ")" ] ] [ "HIGHLIGHTS" ]
-    | "HNSW" "DIMENSION" integer [ "TYPE" vector_type ] [ "DIST" distance ]
+    | "HNSW" "DIMENSION" integer [ "TYPE" hnsw_vector_type ] [ "DIST" hnsw_distance ]
              [ "EFC" integer ] [ "M" integer ]
+    | "DISKANN" "DIMENSION" integer [ "TYPE" diskann_vector_type ]
+                [ "DIST" diskann_distance ] [ "DEGREE" integer ]
+                [ "L_BUILD" integer ] [ "ALPHA" number_lit ] [ "HASHED_VECTOR" ]
     | "GEOMETRY" [ "TYPE" name ]
-vector_type ::= "F64" | "F32" | "I64" | "I32" | "I16"
-distance    ::= "COSINE" | "EUCLIDEAN" | "MANHATTAN" | "MINKOWSKI" | fn_name
+hnsw_vector_type    ::= "F64" | "F32" | "I64" | "I32" | "I16"
+diskann_vector_type ::= "F32" | "F16" | "I8" | "U8"
+hnsw_distance       ::= "COSINE" | "EUCLIDEAN" | "MANHATTAN" | "MINKOWSKI" | fn_name
+diskann_distance    ::= "EUCLIDEAN" | "COSINE" | "INNER_PRODUCT" | "COSINE_NORMALIZED"
 
 (* --- Графовые индексы --- *)
 define_graph_index ::= "DEFINE" "INDEX" [ overwrite_or_ifne ] name
@@ -883,6 +890,62 @@ remove_target ::=
     | "PARAM"    [ if_exists ] param
 ```
 
+### 9.10. ALTER
+
+```ebnf
+alter_stmt ::= alter_analyzer | alter_database | alter_event | alter_field
+             | alter_function | alter_index | alter_param | alter_table
+
+alter_analyzer ::= "ALTER" "ANALYZER" [ if_exists ] name
+                   alter_analyzer_action { alter_analyzer_action }
+alter_analyzer_action ::= "FUNCTION" user_fn | "DROP" "FUNCTION"
+                        | "TOKENIZERS" tokenizer_list | "DROP" "TOKENIZERS"
+                        | "FILTERS" filter_list | "DROP" "FILTERS"
+                        | "COMMENT" string_lit | "DROP" "COMMENT"
+
+alter_database ::= "ALTER" "DATABASE" "COMPACT"
+
+alter_event ::= "ALTER" "EVENT" [ if_exists ] name "ON" [ "TABLE" ] name
+                alter_event_action { alter_event_action }
+alter_event_action ::= "ASYNC" [ "RETRY" integer ] [ "MAXDEPTH" integer ]
+                     | "DROP" "ASYNC"
+                     | "WHEN" expr | "DROP" "WHEN"
+                     | "THEN" ( block | expr_list ) | "DROP" "THEN"
+                     | "COMMENT" string_lit | "DROP" "COMMENT"
+
+alter_field ::= "ALTER" "FIELD" [ if_exists ] name "ON" [ "TABLE" ] name
+                alter_field_action { alter_field_action }
+alter_field_action ::= "DROP" ( "TYPE" | "FLEXIBLE" | "READONLY" | "VALUE"
+                                      | "ASSERT" | "DEFAULT" | "COMMENT" | "REFERENCE" )
+                     | "FLEXIBLE" | "READONLY" | "REFERENCE"
+                     | "TYPE" type | "VALUE" expr | "ASSERT" expr
+                     | "DEFAULT" [ "ALWAYS" ] expr | "COMMENT" string_lit
+
+alter_function ::= "ALTER" "FUNCTION" [ if_exists ] user_fn
+                   alter_function_action { alter_function_action }
+alter_function_action ::= "(" [ fn_param_list ] ")"
+                        | "->" type | "DROP" "RETURNS"
+                        | block | "COMMENT" string_lit | "DROP" "COMMENT"
+
+alter_index ::= "ALTER" "INDEX" name "ON" "TABLE" name
+                ( "COMMENT" string_lit | "PREPARE" "REMOVE" | "DROP" "COMMENT" )
+
+alter_param ::= "ALTER" "PARAM" [ if_exists ] param
+                alter_param_action { alter_param_action }
+alter_param_action ::= "VALUE" expr | "COMMENT" string_lit | "DROP" "COMMENT"
+
+alter_table ::= "ALTER" "TABLE" [ if_exists ] name
+                alter_table_action { alter_table_action }
+alter_table_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
+                     | "COMPACT" | "SCHEMAFULL" | "SCHEMALESS"
+                     | "CHANGEFEED" duration_lit | "COMMENT" string_lit
+```
+
+Каждый `ALTER` содержит хотя бы одно действие. Повтор одного свойства и несовместимые действия
+для него отклоняются семантическим анализом. `ALTER GRAPH` и прежняя форма
+`ALTER INDEX ... SET ENABLED|DISABLED|READ_ONLY` не имеют семантического контракта в
+`gql_spec.md` и потому не входят в EBNF.
+
 ---
 
 ## 10. Административные и live-операторы
@@ -903,8 +966,6 @@ kill_stmt ::= "KILL" ( param | expr )
 
 rebuild_stmt ::= "REBUILD" "INDEX" [ if_exists ] name "ON" [ "TABLE" ] name
                  [ "CONCURRENTLY" ] [ with_options ]
-
-alter_index_stmt ::= "ALTER" "INDEX" name "SET" ( "ENABLED" | "DISABLED" | "READ_ONLY" )
 
 compact_stmt ::= "COMPACT" ( "INDEX" name | "GRAPH" name ) [ "CONCURRENTLY" ]
 
@@ -1236,9 +1297,12 @@ domain_type ::=
 **DDL:** `DEFINE`, `REMOVE`, `TABLE`, `FIELD`, `PARAM`, `FUNCTION`, `EVENT`, `INDEX`, `ANALYZER`, `DATABASE`,
 `OVERWRITE`, `EXISTS`, `NOT`, `TYPE`, `NORMAL`, `RELATION`, `SCHEMALESS`, `SCHEMAFULL`, `ANY`, `DROP`,
 `CHANGEFEED`, `COMMENT`, `COMPUTED`, `DEFAULT`, `READONLY`, `PURE`, `STABLE`, `IMPURE`, `ASYNC`, `RETRY`,
-`FIELDS`, `COLUMNS`, `UNIQUE`, `COUNT`, `FULLTEXT`, `SEARCH`, `BM25`, `HIGHLIGHTS`, `HNSW`, `DIMENSION`,
-`DIST`, `EFC`, `M`, `CONCURRENTLY`, `DEFER`, `PATH`, `REACHABILITY`, `NEIGHBOURHOOD`, `ALGORITHM`, `DIRECTION`,
-`OUT`, `PATTERNS`, `TOKENIZERS`, `FILTERS`, `ROOT`, `ROOTS`, `VALIDATE`, `ON_MUTATION`, `DEFERRED`.
+`FIELDS`, `COLUMNS`, `UNIQUE`, `COUNT`, `FULLTEXT`, `SEARCH`, `BM25`, `HIGHLIGHTS`, `HNSW`, `DISKANN`,
+`DIMENSION`, `DIST`, `EFC`, `M`, `DEGREE`, `L_BUILD`, `ALPHA`, `HASHED_VECTOR`, `INNER_PRODUCT`,
+`COSINE_NORMALIZED`, `CONCURRENTLY`, `DEFER`, `PATH`, `REACHABILITY`, `NEIGHBOURHOOD`, `ALGORITHM`,
+`DIRECTION`, `OUT`, `PATTERNS`, `TOKENIZERS`, `FILTERS`, `ROOT`, `ROOTS`, `VALIDATE`, `ON_MUTATION`,
+`DEFERRED`, `FLEXIBLE`, `REFERENCE`, `RETURNS`, `PREPARE`, `ALWAYS`, `F64`, `F32`, `F16`, `I64`,
+`I32`, `I16`, `I8`, `U8`, `EUCLIDEAN`, `COSINE`, `MANHATTAN`, `MINKOWSKI`.
 
 **Индексы/графы (типы):** `ROOTED_TREE`, `FOREST`, `DAG`, `BIPARTITE`, `COMPLETE`, `TREE`.
 
@@ -1256,7 +1320,7 @@ domain_type ::=
 
 **Режимы исполнения:** `EXECUTION`, `MODE`, `DETERMINISTIC`, `BEST_EFFORT`, `FAST`, `ONLY`.
 
-**Обслуживание индексов:** `ALTER`, `COMPACT`, `ENABLED`, `DISABLED`, `READ_ONLY`, `GEOMETRY`.
+**Обслуживание индексов:** `ALTER`, `COMPACT`, `GEOMETRY`.
 
 **Литералы:** `true`, `false`, `null`, `none`.
 

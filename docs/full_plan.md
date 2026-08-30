@@ -10,6 +10,16 @@
 
 Нумерация этапов ниже топологически отсортирована: каждый этап расположен после всех указанных зависимостей. Работа ведётся вертикальными срезами `grammar → AST → analysis → IR → execution → storage → tests`, без создания каркасов «на будущее».
 
+## Обязательный контекст реализации
+
+Перед началом каждого этапа агент должен сверить выбранный срез со следующими источниками:
+
+- корневым [`AGENTS.md`](../AGENTS.md) и ближайшим `AGENTS.md` затрагиваемого модуля — это актуальная карта владельцев кода, границ и локальных правил;
+- [`codebase_analysis_stage_1_6.md`](reports/codebase_analysis_stage_1_6.md) — снимок текущей связности, зрелости и рисков кода и зависимостей;
+- [`future_capability_analysis_stage_1_6.md`](reports/future_capability_analysis_stage_1_6.md) — каталог будущих областей применения существующего кода, подключённых крейтов и локальных reference-crates; раздел 6 задаёт карту глобальных модулей, а разделы 7–10 — варианты для последующих решений.
+
+Отчёты пункта 1.6 являются навигационным и аналитическим контекстом, а не заменой спецификаций. При расхождении нормативный контракт задают утверждённые спецификации и актуальные пункты этого плана.
+
 ## Этап 1 — архитектурное разбиение production-кода
 
 **Зависимости:** нет.
@@ -137,10 +147,9 @@ types при необходимости расширяется общими ти
 
 ### 1.6. Анализ кодовой базы
 
-Необходимо написать аналитический отчёт в [`reports`](/D:/Programming/Rust/ferros-grynn/docs/reports), в котором
-должно быть отражено:
+Результаты анализа хранятся в [`reports`](/D:/Programming/Rust/ferros-grynn/docs/reports) и должны отражать:
 
-1. Создать `AGENTS.md` файлы для крупных модулей, описать их и прилинковать к главному [`AGENTS.md`](/D:/Programming/Rust/ferros-grynn/AGENTS.md).
+1. Создать `AGENTS.md` для каждого модуля верхнего уровня `src/`, описать его ответственность и подмодули и прилинковать к главному [`AGENTS.md`](/D:/Programming/Rust/ferros-grynn/AGENTS.md); файловый `src/sys.rs` описать в корневом документе.
 2. Проанализировать КАЖДЫЙ установленные крейты в [`Cargo.toml`](/D:/Programming/Rust/ferros-grynn/Cargo.toml) и прочий код в `src/`, не относящийся к пунктам выше;
    отметить, что из установленных крейтов и кода может пригодиться в будущем и в какой области.
 3. Рассмотреть возможность использовать крейта вроде [`logos`](https://crates.io/crates/logos) в качестве лексера 
@@ -154,10 +163,17 @@ types при необходимости расширяется общими ти
 8. Что полезного можно позаимствовать из [`surrealmx`](/D:/Programming/Rust/ferros-grynn/crates/surrealmx)?
 9. Что полезного можно позаимствовать из [`ferntree`](/D:/Programming/Rust/ferros-grynn/crates/ferntree)?
 
+Результат анализа закреплён двумя взаимодополняющими документами:
+
+- [`codebase_analysis_stage_1_6.md`](reports/codebase_analysis_stage_1_6.md) фиксирует фактическое состояние, связность и непосредственные риски;
+- [`future_capability_analysis_stage_1_6.md`](reports/future_capability_analysis_stage_1_6.md) даёт прогноз областей применения и набор вариантов, которые необходимо повторно оценивать в контексте конкретного этапа.
+
 ### 1.7. Правила выполнения и критерии готовности
 
 - Сначала перемещение и реэкспорты, затем проверка, и только отдельным изменением — сужение visibility или удаление дублей.
-- Не добавлять crates, зависимости, traits с одной реализацией и пустые расширительные точки.
+- Не добавлять неоправданные crates, зависимости, traits с одной реализацией и пустые расширительные точки.
+- Использование любого крейта — уже подключённого, локального reference-crate или нового — должно быть обосновано требованиями и сравнением с ручной реализацией. Ручная реализация требует такого же обоснования; итоговый выбор согласуется с выводом `rust-workflow` для текущего среза.
+- Перед использованием кода из непроверенных модулей (`asynchronous`, частей `collections`, `unsafed` и других отмеченных в отчётах областей) провести предметный аудит и довести выбранный код до production-состояния: подтвердить API и ошибки, safety/concurrency/platform-инварианты, необходимые тесты и включение в обычные проверки проекта.
 - Использовать принятую в проекте схему каталогов с `mod.rs`.
 - Не должно остаться рукописных production-файлов свыше 2000 строк; файл свыше 1000 строк допустим только при одной явно сформулированной ответственности.
 - После каждого подэтапа должны проходить соответствующие `cargo check` и targeted tests.
@@ -191,7 +207,7 @@ types при необходимости расширяется общими ти
    Завершить standard/unique B+tree, Label и Count indexes, order-preserving key codec, generation side-files, crash-safe publication и `stale` fallback. Bulk build выполняется внешней сортировкой и bottom-up packing; WAL хранит только атомарную публикацию поколения.
 
 8. **Core DDL vertical slices** — зависит от **5, 7**.  
-   Последовательно реализовать `DEFINE/REMOVE/ALTER` для GRAPH, TABLE, FIELD и базовых INDEX. Каждый slice проходит parser, typing, IR, transactional catalog update, recovery и `INFO`-представление. Неподдерживаемые advanced index kinds пока возвращают явный статус.
+   Последовательно реализовать `DEFINE/REMOVE` для GRAPH и `DEFINE/REMOVE/ALTER` для TABLE, FIELD и базовых INDEX. `ALTER GRAPH` не реализовывать до появления и отдельного утверждения его семантики в `gql_spec`. Каждый slice проходит parser, typing, IR, transactional catalog update, recovery и `INFO`-представление. Неподдерживаемые advanced index kinds пока возвращают явный статус.
 
 9. **DML vertical slices** — зависит от **4, 8**.  
    Реализовать `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `RELATE`, `EXPECT` и DML-return clauses для таблиц и графов. `UPSERT` синтаксически требует ID или `WHERE`; commit повторно проверяет graph-family invariants при любом isolation level.
@@ -228,40 +244,40 @@ types при необходимости расширяется общими ти
 
 ### Рубеж B — полная draft-conformance
 
-20. **Фоновые задания и admin surface** — зависит от **19, 21**.  
+20. **Фоновые задания и admin surface** — зависит от **19**.
     Реализовать durable job state для `CONCURRENTLY`, ограниченный `DEFER`, `REBUILD INDEX`, `INFO`, `KILL` и обслуживающих операций. После crash незавершённая сборка становится `stale`, а не молча `ready`.
 
-21. **Параметры, UDF и оставшийся язык** — зависит от **12, 22**.  
+21. **Параметры, UDF и оставшийся язык** — зависит от **12, 20**.
     Реализовать `DEFINE PARAM/FUNCTION`, closures, overload resolution, purity/security rules, recursion `MAXDEPTH`, object constructors и оставшиеся административные выражения.
 
-22. **Analyzers и Fulltext** — зависит от **7, 22, 23**.  
+22. **Analyzers и Fulltext** — зависит от **7, 20, 21**.
     Реализовать tokenizer/filter pipeline, inverted index, BM25, highlights, transactional/deferred updates и bulk build. Проверить Unicode normalization, analyzer versioning и одинаковость incremental/bulk результатов.
 
-23. **Vector indexes** — зависит от **7, 22, 23**.  
-    Последовательно реализовать HNSW, затем DiskANN, типы векторов, метрики и KNN/ANN operators. Для каждого алгоритма зафиксировать recall/latency/memory/build gates; custom distance использует утверждённый pure UDF contract.
+23. **Vector indexes** — зависит от **7, 20, 21**.
+    Последовательно реализовать HNSW, затем DiskANN, типы векторов, метрики и KNN/ANN operators. До начала DiskANN отдельно утвердить `HASHED_VECTOR`, catalog payload, recovery и отдельно версионируемый side-file contract из `disk_storage_spec` §20.6.4; DiskANN не входит в core format v1. Для каждого алгоритма зафиксировать recall/latency/memory/build gates; custom distance использует утверждённый pure UDF contract.
 
-24. **Geometry R-tree** — зависит от **7, 22**.  
+24. **Geometry R-tree** — зависит от **7, 20**.
     Реализовать geometry validation, STR bulk packing, spatial predicates, planner selectivity и exact post-filter после MBR lookup.
 
-25. **Производные графовые индексы** — зависит от **16, 17, 22**.  
+25. **Производные графовые индексы** — зависит от **16, 17, 20**.
     Реализовать EdgeEndpoint, Path, Reachability и Neighbourhood indexes. Производные индексы являются snapshot artifacts с `build_lsn`; topology mutation переводит их в `stale`, после чего planner использует `ON_DEMAND`.
 
 26. **EndpointTensor и аналитические представления** — зависит от **16, 17**.  
     Добавить нормативные tensor/matrix views поверх полной incidence-модели без изменения runtime/storage границ. Кеширование допускается только как revision-bound derived data.
 
-27. **Durable Changefeed** — зависит от **9, 19, 22**.  
+27. **Durable Changefeed** — зависит от **9, 19, 20**.
     Добавить глобальный versionstamp, before/after entries, retention, rotation, resume cursor и WAL-coordinated publication. Доставка — at-least-once; потеря истории выражается явным GAP.
 
-28. **LIVE SELECT** — зависит от **13, 29**.  
+28. **LIVE SELECT** — зависит от **13, 27**.
     Реализовать registry подписок, сериализованный predicate IR, bounded per-session queue, resume и output modes. Публичный Rust API остаётся pull-based: subscription id, `next`, `resume` и `close`; silent event loss запрещён.
 
-29. **Events и LiveGraph integration** — зависит от **12, 22, 29, 30**.  
+29. **Events и LiveGraph integration** — зависит от **12, 20, 27, 28**.
     Реализовать `DEFINE EVENT`, sync/async execution, retry, `MAXDEPTH`, idempotency guidance и генерацию AtomWalk-рёбер. Mutable LiveGraph применяет remote delta только после явного conflict resolution и повторной проверки family invariants.
 
-30. **Bridges** — зависит от **18, 23, 31**.  
+30. **Bridges** — зависит от **18, 21, 29**.
     Реализовать нормативные `Bridge`, `.use_bridge(...)` и `BridgeData`, затем `SurrealBridge`, включая RecordOrTable, ExternalQuery, InternalQuery, RELATE и graph construction. Bridge boundary преобразует данные только в публичные `Value`/`RecordId`/graph-типы.
 
-31. **Финальный conformance gate** — зависит от **20–32**.  
+31. **Финальный conformance gate** — зависит от **20–30**.
     Каждая строка conformance-матрицы должна быть реализована, протестирована либо явно помечена как ненормативная/out-of-scope. Прогнать обе платформы, все feature-комбинации, fuzz/crash/soak/performance suites, examples и cross-document audit. Выпустить итоговый русскоязычный отчёт.
 
 ### Рубеж C — Linux
@@ -269,7 +285,7 @@ types при необходимости расширяется общими ти
 32. **Linux sync parity** — зависит от **19**.  
     Реализовать Unix ownership/locking, atomic superblock replacement и Direct I/O. Проверить byte-identical format-v1 vectors, recovery, NVMe performance и soak на dataset не меньше `1,25 × RAM`. Если Linux требует несовместимого layout, format v1 не изменять: выпускать format v2 с явной миграцией.
 
-33. **Linux NativeAsync** — зависит от **20**.  
+33. **Linux NativeAsync** — зависит от **32**.
     Добавить проверенный tokio-uring backend под `native-async-io`, сохранив Sync default и синхронный query API. Недоступный явно выбранный режим возвращает typed error без fallback.
 
 ## Публичные границы
@@ -307,9 +323,9 @@ GrynQL text
 
 ## Зафиксированные допущения
 
-- Первый архитектурный этап касается только `src/` и связанных тестов; `fg-meta` остаётся read-only reference.
+- Первый архитектурный этап касается только `src/` и связанных тестов; `fg-meta` остаётся сырым read-only примером реализации, а не источником требований или готовым production-кодом.
 - Windows GA не ждёт Linux. После Windows freeze несовместимость Linux решается format v2 и миграцией.
 - Production spill не создаётся без измеренного неделимого workload; стандартный bulk-путь — segmented import.
-- Новые dependencies требуют отдельного подтверждения; сначала используются stdlib и уже подключённые crates.
+- Новые dependencies требуют отдельного подтверждения. Предпочтение stdlib или уже подключённому крейту не отменяет проверки соответствия задаче; ручная реализация также не выбирается без обоснования и вывода `rust-workflow`.
 - macOS, distributed execution, SPDK, ARIES/UNDO, JIT, SMT optimizer verification и parallel recovery остаются вне плана.
 - Документы и отчёты пишутся по-русски, комментарии Rust-кода — по-английски.

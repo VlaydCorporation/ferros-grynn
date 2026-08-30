@@ -117,9 +117,10 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 - **`RowCursor`** (§7, §9) — эталонный sync pull-контракт:
   `next() -> FerrosGrynnResult<Option<Row>>`. Batch-оператор добавляется поверх него после
   измерений и не меняет семантику плана.
-- **`src/storage`** — production Sync Direct I/O для `.fgb`/`.fgidx`; `fg-meta` служит только
-  референсом. Windows Native Async использует тот же внутренний page-source контракт через IoRing;
-  Linux async остаётся отложенным до нативного тестового окружения.
+- **`src/storage`** — production Sync Direct I/O для `.fgb`/`.fgidx`; `fg-meta` — сырой пример
+  для проверки гипотез, не источник требований или готового кода. Windows NativeAsync использует
+  тот же внутренний page-source контракт через IoRing; Linux async остаётся отложенным до
+  нативного тестового окружения.
 
 Интерфейсы фиксируют, что система обязана уметь, где проходят её границы, и какие инварианты держатся.
 
@@ -134,7 +135,8 @@ Sync Direct I/O — обязательная базовая реализация
 Direct-I/O handle, а единичное чтение может пройти через измеренный sync fast path. Недоступный
 режим возвращает типизированную ошибку без fallback. Публичный query API остаётся синхронной
 pull-моделью. WAL в обоих режимах использует последовательный buffered I/O и один
-`flush + sync_data` на commit. Linux Native Async отложен до нативной проверки.
+`flush + sync_data` на commit. Windows backend реализован и прошёл отдельный QD-gate; Linux
+NativeAsync отложен до нативной проверки. Backend не меняет storage format/version.
 
 ---
 
@@ -647,8 +649,9 @@ materialization нужна только явной мутации или реж�
   строится явно через `freeze`.
 - **Режим 2 — Disk-backed**: каталог возвращает `GraphRef`; `read(&tx)` создаёт
   `DiskGraphView<'tx>` над `PageManager`, `BufferPool` и `SnapshotId`. View не является копией
-  графа и не переживает transaction guard. Windows sync vertical slice завершён; Unix runtime,
-  optional async и advanced specialized indexes остаются отдельными release gates.
+  графа и не переживает transaction guard. Windows sync vertical slice и optional Windows
+  NativeAsync завершены; Unix runtime/async и advanced specialized indexes остаются отдельными
+  release gates.
 - **Режим 3 — Hybrid**: `query_to_memory::<T, State>` загружает выбранный disk-backed подграф в
   собственную storage family `T<State>`. После полной загрузки исходный disk snapshot
   освобождается.
@@ -983,6 +986,7 @@ range scan. Public trait с единственной реализацией не
 | count              | одностраничный счётчик        | `count() … GROUP ALL` без скана                |
 | fulltext (BM25)    | inverted index                | `@@`/`@AND@`/`@OR@`, `search::score/highlight` |
 | HNSW (vector)      | in-memory + blob на диске     | KNN `<\|k,metric\|>`, ANN                      |
+| DiskANN (vector)   | не определён; вне core v1     | draft KNN; запрещён до storage approval        |
 | geometry (R-tree)  | R-tree                        | `INSIDE`/`INTERSECTS`, `geo::*`                |
 | reachability       | tree_cover/GRAIL/FERRARI/BFL  | «достижима ли B из A?»                         |
 | neighbourhood      | EXACT/SKETCH/LANDMARK         | `[:E*1..k]`, `k_hop_neighbourhood`             |
@@ -1006,6 +1010,9 @@ lookup. Index возвращает candidates; затем обычный executo
 - Incremental `IndexInsert/Delete`, count/fulltext и background maintenance в текущий срез не
   входят; indexed graph write пока перестраивает COW-поколение целиком.
 - HNSW/fulltext — опционально eventually-consistent (§19.1 gql_spec).
+- DiskANN остаётся draft-контрактом: parser может распознать форму только в будущем одобренном
+  профиле, но planner/storage не имеют права объявлять индекс доступным до определения
+  `disk_storage_spec.md` §20.6.4.
 - **`DEFER`** — обновление откладывается в фоновую очередь (`IndexPendingQueue`), eventual consistency; несовместимо с `UNIQUE`.
 - **`CONCURRENTLY`** — двухфазная постройка без блокировки таблицы: initial (индексация существующих; новые изменения копятся как `pending`) → update (обработка pending); статус (`building_initial`/`building_update`/`ready`/`error`) виден через `INFO FOR INDEX` (§9.6 gql_spec).
 - **`REBUILD INDEX`** — перестройка (актуально для HNSW после многих обновлений).

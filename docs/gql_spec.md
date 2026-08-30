@@ -2,6 +2,10 @@
 
 **Версия:** 0.2-draft  
 **Статус:** проектирование
+**Нормативная область:** семантика языка, типы, транзакционное поведение и наблюдаемые
+результаты. Точный принимаемый синтаксис задаёт [gql_grammar.md](gql_grammar.md), physical
+storage/durability — [disk_storage_spec.md](disk_storage_spec.md), реализацию —
+[gql_tech_spec.md](gql_tech_spec.md).
 
 ---
 
@@ -58,7 +62,7 @@ objects, неограниченные и shortest/weighted paths, DDL/DML, Trave
 6. [Выражения и операторы](#6-выражения-и-операторы)
 7. [Управляющие операторы](#7-управляющие-операторы)
 8. [DML: мутации](#8-dml-мутации)
-9. [DDL: DEFINE / REMOVE](#9-ddl-define--remove)
+9. [DDL: DEFINE / REMOVE / ALTER](#9-ddl-define--remove--alter)
 10. [Clauses](#10-clauses)
 11. [SELECT](#11-select)
 12. [MATCH — паттерн-матчинг](#12-match--паттерн-матчинг)
@@ -1641,7 +1645,7 @@ REBUILD [
 
 ---
 
-## 9. DDL: DEFINE / REMOVE
+## 9. DDL: DEFINE / REMOVE / ALTER
 
 ### 9.1. DEFINE TABLE
 
@@ -1797,15 +1801,17 @@ DEFINE EVENT
 
 ```
 DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
-    ON [ TABLE ] @table 
-    [ FIELDS | COLUMNS ] @fields
-    [ UNIQUE
-      | COUNT
-      | FULLTEXT ANALYZER @analyzer [ BM25 [(@k1, @b)] ] [ HIGHLIGHTS ]
-      | HNSW DIMENSION @dimension [ TYPE @type ] [DIST @distance] [ EFC @efc ] [ M @m ]
-      | DISKANN DIMENSION @dimension [ TYPE @type ] [ DIST @distance ] [ DEGREE @degree ] [ L_BUILD @l_build ] [ ALPHA @alpha ] [ HASHED_VECTOR ]
-      | GEOMETRY [ TYPE @geometry_type ]
-    ]
+    ON [ TABLE ] @table
+    (
+        COUNT
+      | ( FIELDS | COLUMNS ) @fields
+        [ UNIQUE
+          | FULLTEXT ANALYZER @analyzer [ BM25 [(@k1, @b)] ] [ HIGHLIGHTS ]
+          | HNSW DIMENSION @dimension [ TYPE @type ] [ DIST @distance ] [ EFC @efc ] [ M @m ]
+          | DISKANN DIMENSION @dimension [ TYPE @type ] [ DIST @distance ] [ DEGREE @degree ] [ L_BUILD @l_build ] [ ALPHA @alpha ] [ HASHED_VECTOR ]
+          | GEOMETRY [ TYPE @geometry_type ]
+        ]
+    )
     [ COMMENT @string ]
     [ CONCURRENTLY ]
     [ DEFER ]
@@ -1939,11 +1945,17 @@ HNSW (иерархически управляемый малый мир) — м�
 
 Параметр `ALPHA` (default 1.2): Параметр отсева в DiskANN.
 
-Параметр `HASHED_VECTOR` (default `off`): Та же семантика, что и в `HNSW` — хеш-стабилизированные векторно-документные ключи.
+`HASHED_VECTOR` зарезервирован в полном draft-профиле. Его алгоритмическая семантика и
+совместимость с точными векторами ещё не определены; до отдельного утверждения DiskANN-среза
+реализация обязана отклонять эту опцию как unsupported, а не выбирать поведение самостоятельно.
 
-В запросах используется **та же** форма оператора `KNN`, что и в `HNSW`: `` (приблизительное значение) или ``, 
-если расстояние соответствует индексу, что позволяет оптимизатору выбрать граф `DISKANN`. 
-Второе число в приблизительной форме ограничивает динамический список кандидатов во время поиска (аналогично `HNSW` `EF`).
+В запросах используется **та же** форма оператора `KNN`, что и в `HNSW`: `<| K |>`,
+`<| K, DISTANCE |>` или `<| K, EF SEARCH_LIST_SIZE |>`. Если метрика совместима с индексом,
+оптимизатор может выбрать `DISKANN`; `EF` задаёт размер динамического списка кандидатов поиска.
+
+Раздел задаёт только семантику полного draft-языка. Physical layout, catalog payload и recovery
+DiskANN отсутствуют в `disk_storage_spec.md` §20.6.4, поэтому `DEFINE INDEX ... DISKANN` не входит
+ни в утверждённый P0–P2, ни в core format v1 и до отдельного approval возвращает unsupported.
 
 **Модель памяти и размер кэша**:
 
@@ -2167,14 +2179,14 @@ REMOVE [
 
 Оператор ALTER используется для изменения глобальных параметров, конфигураций сущностей, событий, определений схемы и индексов.
 
-Есть два основных случая использования оператора `ALTER`:
-- Изменение ранее определенных ресурсов. 
-  В настоящее время это можно использовать для изменения таблиц и полей. 
-  Для других подобных изменений используйте предложение `OVERWRITE` в других операторах `DEFINE`.
-- Изменение других ресурсов с помощью предложений, отсутствующих в других `DEFINE` операторах. 
-  Примерами таких предложений являются `PREPARE REMOVE` для подготовки индекса к удалению, 
-  `COMPACT` для сжатия системы/пространства имен/базы данных/отдельной таблицы 
-  и `QUERY_TIMEOUT` для определения или отмены тайм-аута запроса для всего хранилища данных.
+Полный draft-профиль содержит только перечисленные ниже формы. Они не входят в утверждённый
+P0–P2 и требуют approval соответствующего вертикального среза. `ALTER GRAPH` пока не определён:
+для графов доступны `DEFINE ... OVERWRITE` и `REMOVE`, а новая ALTER-семантика должна сначала
+появиться в этом разделе. Точный синтаксис форм ниже задаёт `gql_grammar.md` §9.10.
+
+Каждый `ALTER` содержит хотя бы одно действие. `[...]` после группы действий ниже означает
+повтор группы; повтор одного свойства и несовместимые действия для него являются семантической
+ошибкой.
 
 #### ALTER ANALYZER
 
@@ -2182,10 +2194,12 @@ REMOVE [
 
 ```
 ALTER ANALYZER [ IF EXISTS ] @name
-  [ FUNCTION fn::@function | DROP FUNCTION ]
-  [ TOKENIZERS @tokenizer, ... | DROP TOKENIZERS ]
-  [ FILTERS @filter, ... | DROP FILTERS ]
-  [ COMMENT @string | DROP COMMENT ]
+  (
+      FUNCTION fn::@function | DROP FUNCTION
+    | TOKENIZERS @tokenizer, ... | DROP TOKENIZERS
+    | FILTERS @filter, ... | DROP FILTERS
+    | COMMENT @string | DROP COMMENT
+  ) [...]
 ;
 ```
 
@@ -2194,7 +2208,7 @@ ALTER ANALYZER [ IF EXISTS ] @name
 Используется для сжатия текущей базы данных.
 
 ```
-ALTER DATABASE COMPACT
+ALTER DATABASE COMPACT;
 ```
 
 #### ALTER EVENT
@@ -2203,10 +2217,13 @@ ALTER DATABASE COMPACT
 
 ```
 ALTER EVENT [ IF EXISTS ] @name ON [ TABLE ] @table
-  [ ASYNC [ RETRY @retry ] [ MAXDEPTH @max_depth ] | DROP ASYNC ]
-  [ WHEN @condition | DROP WHEN ]
-  [ THEN @action, ... | DROP THEN ]
-  [ COMMENT @string | DROP COMMENT ]
+  (
+      ASYNC [ RETRY @retry ] [ MAXDEPTH @max_depth ] | DROP ASYNC
+    | WHEN @condition | DROP WHEN
+    | THEN @action, ... | DROP THEN
+    | COMMENT @string | DROP COMMENT
+  ) [...]
+;
 ```
 
 #### ALTER FIELD
@@ -2214,8 +2231,8 @@ ALTER EVENT [ IF EXISTS ] @name ON [ TABLE ] @table
 Используется для изменения или полного удаления условий определенного поля в таблице.
 
 ```
-ALTER FIELD [ IF EXISTS ] ON [ TABLE ] @table 
-[ 
+ALTER FIELD [ IF EXISTS ] @name ON [ TABLE ] @table
+(
     DROP TYPE |
     DROP FLEXIBLE |
     DROP READONLY |
@@ -2231,8 +2248,9 @@ ALTER FIELD [ IF EXISTS ] ON [ TABLE ] @table
     VALUE @value |
     ASSERT @expression |
     DEFAULT [ ALWAYS ] @expression |
-    COMMENT @string |
-]
+    COMMENT @string
+) [...]
+;
 ```
 
 #### ALTER FUNCTION
@@ -2241,9 +2259,13 @@ ALTER FIELD [ IF EXISTS ] ON [ TABLE ] @table
 
 ```
 ALTER FUNCTION [ IF EXISTS ] fn::@name
-  [ ( [ $argument: @type, ... ] ) ] [ -> @type | DROP RETURNS ]
-  [ { @query ... } ]
-  [ COMMENT @string | DROP COMMENT ]
+  (
+      ( [ $argument: @type, ... ] )
+    | -> @type | DROP RETURNS
+    | { @query ... }
+    | COMMENT @string | DROP COMMENT
+  ) [...]
+;
 ```
 
 #### ALTER INDEX
@@ -2252,9 +2274,8 @@ ALTER FUNCTION [ IF EXISTS ] fn::@name
 
 ```
 ALTER INDEX @name ON TABLE @table
-    COMMENT @string |
-    PREPARE REMOVE |
-    DROP COMMENT
+    ( COMMENT @string | PREPARE REMOVE | DROP COMMENT )
+;
 ```
 
 `PREPARE REMOVE` изменяет индекс, чтобы подготовить его к удалению.
@@ -2268,8 +2289,8 @@ ALTER INDEX @name ON TABLE @table
 
 ```
 ALTER PARAM [ IF EXISTS ] $name
-  [ VALUE @value ]
-  [ COMMENT @string | DROP COMMENT ]
+  ( VALUE @value | COMMENT @string | DROP COMMENT ) [...]
+;
 ```
 
 Не поддерживает `DROP VALUE`, так как параметр без значения существовать не может.
@@ -2279,19 +2300,21 @@ ALTER PARAM [ IF EXISTS ] $name
 Используется для изменения существующей таблицы
 
 ```
-ALTER TABLE [
-	[ IF EXISTS ] @name
-		[ DROP COMMENT ]
-        [ DROP CHANGEFEED ]
-        [ COMPACT ]
-		[ SCHEMAFULL | SCHEMALESS ] ]
-    [ CHANGEFEED @duration ]
-    [ COMMENT @string ] 
-    [ CHANGEFEED ]
-]
+ALTER TABLE [ IF EXISTS ] @name
+    (
+        DROP COMMENT
+      | DROP CHANGEFEED
+      | COMPACT
+      | SCHEMAFULL
+      | SCHEMALESS
+      | CHANGEFEED @duration
+      | COMMENT @string
+    ) [...]
+;
 ```
 
 `COMPACT` выполняет сжатие хранилища в определенном пространстве ключей таблицы.
+Порядок действий не превращает один statement в последовательность промежуточных схем.
 
 ---
 

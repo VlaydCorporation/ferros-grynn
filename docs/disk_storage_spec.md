@@ -2,6 +2,14 @@
 
 **Версия:** 0.1
 **Статус:** проектирование
+**Нормативная область:** байтовый формат, page/index layouts, WAL, checkpoint/recovery и
+durability. Семантику GrynQL задаёт [gql_spec.md](gql_spec.md), точный синтаксис —
+[gql_grammar.md](gql_grammar.md), техническую реализацию — [gql_tech_spec.md](gql_tech_spec.md).
+
+**Статус core format v1:** Windows-кандидат. Он фиксируется только после Windows sync
+performance gate и Windows GA-core gate из [full_plan.md](full_plan.md) (этапы 3 и 19). Linux
+sync/NativeAsync не блокируют эту фиксацию: после неё несовместимый Linux layout требует format
+v2 и явной миграции.
 
 ---
 
@@ -50,8 +58,10 @@
   mutable/live и transaction-bound значения отклоняются явно.
 - Обеспечить хранение **схемы** (таблицы, поля, индексы, события, функции, анализаторы, параметры).
 - Обеспечить хранение **статистики** для cost model планировщика (степени, гистограммы, selectivity).
-- Поддержать **все виды индексов**: standard, unique, count, fulltext (BM25), HNSW vector, path, reachability,
-  neighbourhood.
+- Поддержать в core format-v1 candidate primary и scalar standard/unique B+tree. Для count,
+  fulltext (BM25), HNSW, geometry, path, reachability и neighbourhood задать целевые
+  отдельно версионируемые side-file контракты последующих этапов. `DISKANN` остаётся
+  draft-возможностью языка; его physical layout ещё не определён (§20.6.4).
 - Поддержать **changefeed** и инфраструктуру live-запросов.
 - Сохранить **SoA-дизайн** кодовой базы: горячие данные обхода (`flags`, `kinds`, `adjacency`) — отдельно от холодных (
   `props`).
@@ -86,8 +96,9 @@ Windows-first implementation использует `FILE_FLAG_NO_BUFFERING`. Linu
 ### 1.4. Что остаётся без изменений
 
 - `PAGE_SIZE = 16384` — используется без изменений.
-- `fg-meta` остаётся референсом сценариев, но его `DirectFile`, `BufferPool` и async-код не
-  используются напрямую. Production-реализация находится в `src/storage`.
+- `fg-meta` остаётся сырым примером для проверки гипотез и сценариев, но не источником
+  требований или production-гарантий. Его `DirectFile`, `BufferPool` и async-код напрямую не
+  используются. Production-реализация находится в `src/storage`.
 - `store.rs` — по-прежнему управляет именованными графами и WAL Mode 1.
 - `AtomId` — без изменений; поколение (`gen`) хранится в hot-слоте и восстанавливается при загрузке.
 
@@ -156,8 +167,10 @@ Direct-I/O и durability семантику.
 
 IoRing-режим требует Windows build 22000 или новее и runtime-поддержку read/write. Пользователь
 выбирает режим при открытии хранилища; отсутствие compile-time feature или runtime-возможности
-завершается `FG-51I04`, без IOCP/buffered fallback. Linux Native Async и `tokio-uring` отложены до
-нативной проверки; непроверенная Unix async-реализация не входит в format v1.
+завершается `FG-51I04`, без IOCP/buffered fallback. Windows NativeAsync реализован и прошёл
+собственный QD-gate; Linux NativeAsync и `tokio-uring` отложены до нативной проверки.
+I/O-backend не является частью байтового формата и не меняет его версию: любой будущий backend
+обязан доказать те же Direct-I/O и durability-инварианты на тех же format-v1 bytes.
 
 ---
 
@@ -723,6 +736,11 @@ changefeed и специализированных индексов послед
         changefeed/
           <table_id>_<since_lsn>.fcf    -- changefeed log segments
 ```
+
+Соответственно, наличие magic/page layout в §20.3–§20.13 описывает draft-контракт будущего
+side-file, но не включает его в core format v1 и не означает implementation/release status.
+Каждый такой индекс получает собственную версию и отдельный conformance gate; изменение core
+страниц или catalog layout после Windows freeze требует format v2.
 
 ### 7.1. Домен журналирования — база данных, а не граф
 
@@ -1688,7 +1706,8 @@ COMPUTED-поле не хранится в PropHeapPage. При SELECT executor 
 ```
 index_name_id: u32
 index_kind:    u8  -- 0=Standard, 1=Unique, 2=Count, 3=Fulltext,
-                   -- 4=HNSW, 5=DiskANN, 6=Geometry, 7=Reachability, 8=Neighbourhood, 9=Path
+                   -- 4=HNSW, 5=reserved for DiskANN, 6=Geometry,
+                   -- 7=Reachability, 8=Neighbourhood, 9=Path
 field_count:   u8
 field_ids:     [u32] × field_count
 flags:         u8  -- bit0=CONCURRENT, bit1=DEFERRED
@@ -1696,8 +1715,13 @@ status:        u8  -- 0=building_initial, 1=building_update, 2=ready, 3=error
 [fulltext_params]  -- если kind=3: analyzer_id(u32) + bm25_k1(f32) + bm25_b(f32) + highlights(u8)
 [hnsw_params]      -- если kind=4: dimensions(u32) + elem_type(u8: F64/F32/I64/I32/I16)
                    --              dist_metric(u8) + efc(u32) + m(u32) + m0(u32) + lm_scaled(f32)
-[geo_params]       -- если kind=5: geometry_field_type(u8)
+[geo_params]       -- если kind=6: geometry_field_type(u8)
 ```
+
+Значение `index_kind = 5` зарезервировано, но writer core format v1 не имеет права его
+сериализовать: layout параметров и side-file `DISKANN` ещё не определён (§20.6.4). Reader той же
+версии обязан вернуть typed unsupported-format status, а не интерпретировать payload как
+`Geometry`.
 
 ### 18.6. EventDefinition
 
@@ -2420,7 +2444,20 @@ data:       [u8] × 16336   -- сырые байты сериализованн�
 
 **Граница деградации.** Если журнал с `build_lsn` недоступен (обрезан, повреждён) — индекс помечается `stale`. Устаревший вектор-индекс **не используется молча**: планировщик либо отказывается от него (точный перебор, если это допустимо по стоимости), либо возвращает ошибку, требуя `REBUILD INDEX`. Молчаливая выдача неполных результатов ANN-поиска недопустима — она неотличима от нормальной работы.
 
-**Память при сборке.** `FG_HNSW_CACHE_SIZE` (256 МиБ) — бюджет **обслуживания**, а не построения. Для построения выделяется отдельный `FG_HNSW_BUILD_MEM` (по умолчанию 2 ГиБ). При нехватке бюджета сборка завершается явной ошибкой ресурса; для наборов, не помещающихся в память, предназначен `DISKANN` (§20.6.4 `gql_spec` §9.6) — он изначально спроектирован как out-of-core и в этом сценарии предпочтителен шардированию HNSW.
+**Память при сборке.** `FG_HNSW_CACHE_SIZE` (256 МиБ) — бюджет **обслуживания**, а не построения. Для построения выделяется отдельный `FG_HNSW_BUILD_MEM` (по умолчанию 2 ГиБ). При нехватке бюджета сборка завершается явной ошибкой ресурса. `DISKANN` предусмотрен семантической спецификацией (`gql_spec` §9.6) как будущий out-of-core вариант, но до утверждения §20.6.4 запрос на его создание завершается явной диагностикой unsupported.
+
+#### 20.6.4. DiskANN — граница draft-контракта
+
+GrynQL-семантика и draft-синтаксис `DEFINE INDEX ... DISKANN` описаны в `gql_spec.md` §9.6 и
+`gql_grammar.md` §9.6. Physical layout, параметрический catalog payload, алгоритм crash recovery,
+incremental/bulk parity и формат отдельно версионируемого side-file намеренно **не определены**.
+Поэтому DiskANN не входит в core format v1 и не может считаться доступным только по наличию
+`index_kind = 5`.
+
+До реализации этапа 23 `full_plan.md` требуется отдельное утверждение storage-контракта. Оно
+должно либо доказать backward-compatible отдельно версионируемое расширение, либо повысить core
+format version и задать миграцию. Придумывать page layout из существующего HNSW/KV-кода
+запрещено.
 
 ### 20.7. Geometry R-tree Index
 
@@ -3463,6 +3500,12 @@ TensorCachePage инвалидируется при любом изменени�
 ### 28.1. Версионирование
 
 `STORAGE_FORMAT_VERSION` хранится в `GraphSuperblock.format_version`.
+
+Пока не пройдены Windows sync performance gate и Windows GA-core gate, значение `1` обозначает
+кандидат и не является обещанием замороженной совместимости. После Windows freeze Linux должен
+читать и записывать те же bytes; несовместимая адаптация layout выпускается только как format v2
+с миграцией. Отсутствие Linux-окружения не задерживает Windows freeze и не позволяет объявлять
+Unix-поддержку проверенной.
 
 | Условие                                       | Действие                       |
 |-----------------------------------------------|--------------------------------|

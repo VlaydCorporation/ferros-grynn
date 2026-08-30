@@ -12,13 +12,34 @@ Most design docs, code comments, and `docs/implementation_notes.md` are written 
 
 
 ## Project Structure
-```
-src/                          # Main Rust SDK source files
-docs/                         # Document and specification files
+
+```text
+src/
+  asynchronous/  # Reusable async/concurrency components; disconnected until audited
+  collections/   # Reusable collections and data structures
+  datastore/     # Datastore composition, catalogs, MVCC and transactions
+  ecs/           # AtomId-keyed runtime sidecar components and property columns
+  gql/           # Semantic analysis, logical IR and query execution
+  gql_status/    # Project-wide statuses, diagnostics, outcomes and errors
+  graph/         # Public runtime graph families, views, paths and algorithms
+  math/          # Project-wide reusable mathematical operations
+  memory/        # Allocator/tracking, heap accounting and resource policy
+  storage/       # Local pages, indexes, WAL, recovery and Direct I/O
+  syn/           # GrynnQL lexer, tokens, syntax tree and parser
+  unsafed/       # Reusable unsafe primitives; disconnected until audited
+  utils/         # Small project-wide utilities, grouped by subject as they grow
+  values/        # Runtime values, storage representation and columnar adapters
+  sys.rs         # System environment: process, CPU, memory and host observations
+docs/                         # Specifications, plans and reports
 ferros-grynn-bench/           # Ferros-Grynn benchmarks
-crates/ferros-grynn-macros/   # Procedural macros
+crates/ferros-grynn-macros/   # Production procedural macros
+crates/{ferntree,storekey,surrealmx,surrealdb}/  # Read-only reference trees
 tests/                        # Integration tests
 ```
+
+New project-wide modules are allowed when a reusable responsibility has more
+than one real consumer. For example, shared declarative macros may eventually
+belong in `src/macros`; do not create an empty module tree in advance.
 
 ## Module guidance
 
@@ -38,9 +59,23 @@ area:
 - [`src/gql_status/AGENTS.md`](src/gql_status/AGENTS.md) — statuses,
   diagnostics, errors and wire DTOs;
 - [`src/collections/AGENTS.md`](src/collections/AGENTS.md) — internal and
-  experimental collections;
-- [`src/asynchronous/AGENTS.md`](src/asynchronous/AGENTS.md) — currently
-  disconnected async prototypes.
+  reusable collections;
+- [`src/asynchronous/AGENTS.md`](src/asynchronous/AGENTS.md) — reusable async
+  and concurrency components;
+- [`src/ecs/AGENTS.md`](src/ecs/AGENTS.md) — AtomId-keyed component and
+  materialized-property sidecars;
+- [`src/math/AGENTS.md`](src/math/AGENTS.md) — reusable mathematical
+  operations;
+- [`src/memory/AGENTS.md`](src/memory/AGENTS.md) — allocators, allocation
+  tracking and memory accounting;
+- [`src/unsafed/AGENTS.md`](src/unsafed/AGENTS.md) — reusable unsafe
+  primitives and their proof obligations;
+- [`src/utils/AGENTS.md`](src/utils/AGENTS.md) — small global utilities.
+
+`src/sys.rs` is a file module, so its responsibility is recorded here rather
+than in a synthetic directory: it observes the process and host environment
+(system/cgroup memory, CPU, load and available parallelism). Memory policy and
+allocator accounting remain in `src/memory`.
 
 
 ## Repository state — read this first
@@ -48,20 +83,27 @@ area:
 The repo is mid-migration (branch `mvp`). Verify the exact feature/target slice
 you touch rather than assuming every configuration is complete.
 
-- **`crates/fg-meta`** (`ferros-grynn-meta`, a *separate* Cargo workspace with its own `Cargo.lock`) is the **mature reference implementation** / prototype. It contains the working graph core, traversal algorithms, MVCC, persistence, and I/O subsystem. Consult it to understand how a subsystem is intended to work before (re)implementing it in the main crate. It is being either merged into the main crate or promoted to a standalone core crate.
 - The **root crate `ferros-grynn`** is the production target. Its active topology
-  is defined by `src/lib.rs`: values, graph, datastore, storage, GQL, statuses,
-  ECS and their support modules are connected. `common`, `asynchronous`,
-  `unsafed`, the empty `macros` tree, `values/memohash`, `values/utils` and
-  `collections/roaring_graphs` remain disconnected; code in those paths is not
-  production evidence until explicitly wired and tested.
-- `crates/configuration` is migration scaffolding outside the workspace.
-  `crates/storekey`, `crates/surrealmx`, `crates/ferntree` and
+  is defined by `src/lib.rs`: collections, values, graph, datastore, storage,
+  GQL, statuses, ECS, math, memory, system information and utilities are
+  connected. `asynchronous`, `unsafed` and `collections/roaring_graphs` remain
+  disconnected; code in those paths is not production evidence until it is
+  reviewed, prepared for production and wired into normal checks.
+- `crates/fg-meta` is a raw, unverified implementation example. It is not a
+  specification or behavioral source of truth and needs the same review as any
+  other reference before ideas or code are reused.
+- `crates/storekey`, `crates/surrealmx`, `crates/ferntree` and
   `crates/surrealdb` are local study/reference trees, not root dependencies or
-  workspace members. `crates/ferros-grynn-macros` and `ferros-grynn-bench` are
-  the actual additional workspace members.
+  workspace members. Their useful areas are summarized in
+  `docs/reports/future_capability_analysis_stage_1_6.md` §§7.3–7.6.
+  `crates/ferros-grynn-macros` and `ferros-grynn-bench` are the actual
+  additional workspace members. The removed `crates/configuration` must not be
+  treated as an available implementation source.
 
-When a subsystem exists in both `fg-meta` and `src/`, the `src/` version is the target and `fg-meta` is the source of truth for behavior.
+Current `src/`, current tests and the normative specifications control
+production behavior. Reference trees may supply hypotheses, algorithms or
+test ideas only after their assumptions have been verified against those
+contracts.
 
 
 ## Architecture
@@ -75,14 +117,13 @@ When a subsystem exists in both `fg-meta` and `src/`, the `src/` version is the 
   Synchronous I/O is the current reference path; optional native async I/O is
   added only through explicit target/feature slices.
 
-### Graph core (`src/graph`; `fg-meta` is reference material)
+### Graph core (`src/graph`)
 - Nodes and edges are atoms stored in family-specific **struct-of-arrays (SoA)**
   layouts. `Graph`, `Forest`/`Tree`, `Dag`, `Hypergraph`, `Metagraph` and
   `Subgraph` retain separate structural invariants.
 - **`AtomId`** is the materialization-local handle. The production layout is
-  `gen(23) | kind(1) | slot(40)` per `docs/disk_storage_spec.md` §9;
-  `fg-meta` still uses the legacy prototype layout. Public/snapshot-stable
-  references use `AtomRef`, `GraphRef` and `RecordId`.
+  `gen(23) | kind(1) | slot(40)` per `docs/disk_storage_spec.md` §9.
+  Public/snapshot-stable references use `AtomRef`, `GraphRef` and `RecordId`.
 - `GraphRead` is the shared read surface for in-memory, disk-bound and hybrid
   views. `traversal` owns BFS/DFS, topology/connectivity, shortest paths,
   spanning structures, cuts and binary-lifting LCA.
@@ -102,8 +143,8 @@ The property/value type system. Read `src/values/AGENTS.md` before changing it.
 The production datastore owns immutable MVCC roots, FCW/SSI validation,
 predicate tracking and RAM/local backend composition. Storage owns the
 database-level frame WAL, segment rotation, checkpoint/recovery and physical
-pages. `fg-meta` remains useful reference material, but production behavior is
-governed by current specifications and root tests. Read
+pages. Production behavior is governed by current specifications and root
+tests. Read
 `docs/implementation_notes.md` and the two module `AGENTS.md` files before
 touching MVCC, WAL or checkpoint code.
 
@@ -139,10 +180,16 @@ These `.md` files are the design authority for sensitive subsystems; when implem
 - Formatting is enforced by `.rustfmt.toml`: **hard tabs**, block indentation, crate-granularity imports grouped `StdExternalCrate`, `use_small_heuristics = "Off"`. Always run `cargo +nightly fmt` and `cargo clippy` after edits.
 - Current production choices include `smallvec` for inline graph adjacency,
   `thin-vec` for `PropertyMap`, `rapidhash` for selected hash tables,
-  `parking_lot` for locks and `rkyv` for the value envelope. Do not treat an
-  unused entry in `Cargo.toml` as an architectural commitment.
+  `parking_lot` for locks and `rkyv` for the value envelope. Both use of an
+  existing crate and a manual implementation require an explicit fit argument;
+  route the current decision through `rust-workflow` and follow its selected
+  owner profile rather than treating an unused manifest entry as a commitment.
 - Disk pages/WAL and canonical `StorageValue` bytes are explicit versioned
   formats. New derive-based serialization must not silently replace them.
+- Before reusing code from an unverified module such as `asynchronous`,
+  `collections` or `unsafed`, audit its contract, errors, safety, cancellation,
+  platform behavior and tests as applicable, then bring the selected slice
+  under ordinary production formatting, Clippy and test gates.
 
 
 ## Common Commands
@@ -166,15 +213,6 @@ cargo test <name>
 cargo bench -p ferros-grynn-bench
 
 ```
-
-Working inside the prototype (its own workspace — cd into it):
-```
-cd crates/fg-meta
-cargo test
-cargo test --features async-uring       # enable io_uring / tokio-uring async I/O
-cargo bench --bench bench_graph         # graph benchmarks
-```
-`fg-meta` feature flags: `iouring`, `async-uring` (implies `iouring`), `async-ioring`, `spdk` (all default off; SPDK/async paths are Linux-only).
 
 The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optimized builds are slow; prefer `cargo check`/debug builds while iterating.
 
