@@ -17,3 +17,8 @@ rustflags = [
     "-C", "link-arg=/DEFAULTLIB:libcmt.lib",
     "-C", "link-arg=/DEFAULTLIB:ucrt.lib"
 ]
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
