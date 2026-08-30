@@ -20,14 +20,46 @@ crates/ferros-grynn-macros/   # Procedural macros
 tests/                        # Integration tests
 ```
 
+## Module guidance
+
+Read the nearest module-specific instructions before editing a large production
+area:
+
+- [`src/storage/AGENTS.md`](src/storage/AGENTS.md) — local pages, indexes, WAL,
+  checkpoint/recovery and Direct I/O;
+- [`src/datastore/AGENTS.md`](src/datastore/AGENTS.md) — catalogs, MVCC,
+  transactions and backend composition;
+- [`src/graph/AGENTS.md`](src/graph/AGENTS.md) — runtime graph families,
+  views, paths and algorithms;
+- [`src/values/AGENTS.md`](src/values/AGENTS.md) — runtime values, storage DTOs
+  and columnar conversion;
+- [`src/syn/AGENTS.md`](src/syn/AGENTS.md) — lexer, tokens, AST and parser;
+- [`src/gql/AGENTS.md`](src/gql/AGENTS.md) — analysis, logical IR and execution;
+- [`src/gql_status/AGENTS.md`](src/gql_status/AGENTS.md) — statuses,
+  diagnostics, errors and wire DTOs;
+- [`src/collections/AGENTS.md`](src/collections/AGENTS.md) — internal and
+  experimental collections;
+- [`src/asynchronous/AGENTS.md`](src/asynchronous/AGENTS.md) — currently
+  disconnected async prototypes.
+
 
 ## Repository state — read this first
 
-The repo is mid-migration (branch `mvp`). Do not assume the main crate builds end-to-end.
+The repo is mid-migration (branch `mvp`). Verify the exact feature/target slice
+you touch rather than assuming every configuration is complete.
 
 - **`crates/fg-meta`** (`ferros-grynn-meta`, a *separate* Cargo workspace with its own `Cargo.lock`) is the **mature reference implementation** / prototype. It contains the working graph core, traversal algorithms, MVCC, persistence, and I/O subsystem. Consult it to understand how a subsystem is intended to work before (re)implementing it in the main crate. It is being either merged into the main crate or promoted to a standalone core crate.
-- The **root crate `ferros-grynn`** is where the production version is being rebuilt. In `src/lib.rs` **most top-level modules are commented out**; currently only `values` compiles. When you add code, expect to un-comment and fix modules incrementally — don't assume a module referenced in a `use` is actually wired in.
-- `crates/storage_engine` and `crates/configuration` are new scaffolding crates for the migration (not yet in the workspace `members`, may not build yet). `crates/ferros-grynn-macros` and `ferros-grynn-bench` are the actual workspace members.
+- The **root crate `ferros-grynn`** is the production target. Its active topology
+  is defined by `src/lib.rs`: values, graph, datastore, storage, GQL, statuses,
+  ECS and their support modules are connected. `common`, `asynchronous`,
+  `unsafed`, the empty `macros` tree, `values/memohash`, `values/utils` and
+  `collections/roaring_graphs` remain disconnected; code in those paths is not
+  production evidence until explicitly wired and tested.
+- `crates/configuration` is migration scaffolding outside the workspace.
+  `crates/storekey`, `crates/surrealmx`, `crates/ferntree` and
+  `crates/surrealdb` are local study/reference trees, not root dependencies or
+  workspace members. `crates/ferros-grynn-macros` and `ferros-grynn-bench` are
+  the actual additional workspace members.
 
 When a subsystem exists in both `fg-meta` and `src/`, the `src/` version is the target and `fg-meta` is the source of truth for behavior.
 
@@ -35,23 +67,45 @@ When a subsystem exists in both `fg-meta` and `src/`, the `src/` version is the 
 ## Architecture
 
 ### Allocator & platform I/O (compile-time selected)
-- **Global allocator**: `mimalloc` on MSVC targets, `tikv-jemallocator` elsewhere (set in `src/lib.rs`).
-- **Direct I/O** is the storage foundation: `O_DIRECT`/`F_NOCACHE` on Unix, `FILE_FLAG_NO_BUFFERING` on Windows. Async I/O is a wrapper over `io_uring`/`tokio-uring` on Linux and a custom Tokio <-> Windows `IoRing` bridge on Windows. In `fg-meta` the only public I/O types are `SyncIo` and `AsyncIo`; page size and `BufferPool` are shared. The new home for this is `crates/storage_engine` (`io`, `layout`, `store` submodules).
+- **Global allocator**: `mimalloc-pprof` on MSVC-compatible targets and
+  `tikv-jemallocator` on supported non-MSVC Unix targets, selected in
+  `src/memory`.
+- **Direct I/O** lives in `src/storage`: platform file access, page I/O, the
+  shared buffer pool, WAL and checkpoint/recovery use one on-disk contract.
+  Synchronous I/O is the current reference path; optional native async I/O is
+  added only through explicit target/feature slices.
 
-### Graph core (`fg-meta`, target: `src/values/runtime/graph`)
-- Data model `MG = ⟨V, MV, E, ME⟩` (Basu–Blanning + Chernenko–Gapanyuk extensions). Stored **struct-of-arrays (SoA)**.
-- **`AtomId`** is the central handle. The production layout is `gen(23) | kind(1) | slot(40)` per `docs/disk_storage_spec.md` §9; `fg-meta` still uses the legacy `gen(32) | kind(1) | slot(31)` prototype layout. Slots are handed out by a `SlotAllocator`. Nodes and edges are both "atoms". `MetaGraph` is the container; `traversal` holds the algorithms (BFS/DFS, topo sort, SCC/WCC, Dijkstra, Bellman–Ford with negative-cycle detection, MST, cuts, binary-lifting LCA); `subgraph` extracts typed subgraphs (`TreeSubGraph`, `ForestSubGraph`, `DagSubGraph`, `HyperSubGraph`) plus generic `SubGraph`; `matrix` provides `AdjacencyMatrix`, `IncidenceMatrix`, `MetaAdjacencyMatrix`, `IncidenceTensor` (via `nalgebra`).
-- An **ECS layer** (`SparseSet`, `AnyPool`, component registries, `join!`-style iterators) attaches components (positions, PageRank, feature vectors, weights…) to atoms for analytics/ML.
+### Graph core (`src/graph`; `fg-meta` is reference material)
+- Nodes and edges are atoms stored in family-specific **struct-of-arrays (SoA)**
+  layouts. `Graph`, `Forest`/`Tree`, `Dag`, `Hypergraph`, `Metagraph` and
+  `Subgraph` retain separate structural invariants.
+- **`AtomId`** is the materialization-local handle. The production layout is
+  `gen(23) | kind(1) | slot(40)` per `docs/disk_storage_spec.md` §9;
+  `fg-meta` still uses the legacy prototype layout. Public/snapshot-stable
+  references use `AtomRef`, `GraphRef` and `RecordId`.
+- `GraphRead` is the shared read surface for in-memory, disk-bound and hybrid
+  views. `traversal` owns BFS/DFS, topology/connectivity, shortest paths,
+  spanning structures, cuts and binary-lifting LCA.
+- The separate **ECS layer** attaches derived components to atom IDs for
+  analytics without changing graph durability or equality.
 
-### Values (`src/values`, the one module currently active in the main crate)
+### Values (`src/values`)
 The property/value type system. Read `src/values/AGENTS.md` before changing it.
-- `runtime` — the public Rust SDK types, collections, identifiers, runtime-only values, and graph
-  foundation (re-exported as the crate's `graph` module).
+- `runtime` — the public Rust SDK types, collections, identifiers and
+  runtime-only values; graph types are owned by `src/graph` and compatibly
+  re-exported through the values surface where required.
 - `storage` — internal on-disk DTOs, tags, conversion contexts, and codecs.
 - `columnar` — future Arrow/DataFusion batch materialization; runtime remains independent of it.
 
-### MVCC & persistence (`fg-meta`)
-Serializable Snapshot Isolation (**SSI**) with O(1) conflict indices (`atom_readers`/`atom_writers`) and predicate locking via an `AtomMeta` label/property cache for exact phantom matching. Persistence adds a **WAL with segment rotation** (`{lsn:016x}.wal`), streaming O(1)-RAM snapshot write, single-pass deferred REDO recovery, and inline compaction at checkpoint (carry-forward of only active-tx entries). The codec is generic: `BytesCodec` (identity) or `ClosureCodec<T>` (`Arc<dyn Fn>`, cloneable, supports capturing closures — needed for crash recovery). `implementation_notes.md` documents the exact algorithms, invariants, and complexity table — read it before touching MVCC/WAL/checkpoint code.
+### MVCC & persistence (`src/datastore`, `src/storage`)
+
+The production datastore owns immutable MVCC roots, FCW/SSI validation,
+predicate tracking and RAM/local backend composition. Storage owns the
+database-level frame WAL, segment rotation, checkpoint/recovery and physical
+pages. `fg-meta` remains useful reference material, but production behavior is
+governed by current specifications and root tests. Read
+`docs/implementation_notes.md` and the two module `AGENTS.md` files before
+touching MVCC, WAL or checkpoint code.
 
 ### Status & error system (`src/gql_status`)
 This is the project-wide diagnostics/error mechanism — **not** just query errors. The core unit is a `Status` (GQLSTATUS-style: `Condition` + classification). Statuses are **code-generated** by the `define_status_codes!` proc macro (in `crates/ferros-grynn-macros/src/status_codes.rs`) from declarative descriptions with `template`/`params`/`subcondition`/`descriptor`/`hint`. Wrapping chain: `Status` → `DiagnosticRecord` → `ErrorState` → `FerrosGrynnError`. Both error *and* notification statuses exist, and statuses can be chained. When adding a new status, add it to the macro invocation rather than hand-writing a variant.
@@ -62,7 +116,10 @@ This is the project-wide diagnostics/error mechanism — **not** just query erro
 - `define_status_codes!` — see the status system above.
 
 ### Query language (`src/gql`, `src/syn`)
-Early-stage. `src/syn` is the syntax front end (`lexer`, `token`, `parser`, and its own `error` with source-location rendering). `src/gql` holds the AST/expression/dataset/traversal scaffolding. This is designed against the specs below and will be reworked after the specs settle.
+`src/syn` is the syntax front end (`lexer`, `token`, `parser`, AST and statement
+nodes). `src/gql` preserves the `parse -> analyze -> logical IR -> execute`
+pipeline and uses a transaction adapter for storage access. Extend it through
+vertical slices after reconciling the specifications below.
 
 
 ## Specs (`docs/`) — design authority
@@ -80,8 +137,12 @@ These `.md` files are the design authority for sensitive subsystems; when implem
 
 - All comments in the code must be in English.
 - Formatting is enforced by `.rustfmt.toml`: **hard tabs**, block indentation, crate-granularity imports grouped `StdExternalCrate`, `use_small_heuristics = "Off"`. Always run `cargo +nightly fmt` and `cargo clippy` after edits.
-- `slotmap`/`slot-cell` back atom storage; `smallvec` (alpha 2.0) for inline adjacency; `rapidhash`/`rustc-hash` for hashing; `parking_lot`/`dashmap`/`crossbeam` for concurrency; `rayon` for data parallelism.
-- Serialization uses `binrw` (disk layout) and `rkyv`; the graph binary codec lives in `fg-meta`'s `serial` module.
+- Current production choices include `smallvec` for inline graph adjacency,
+  `thin-vec` for `PropertyMap`, `rapidhash` for selected hash tables,
+  `parking_lot` for locks and `rkyv` for the value envelope. Do not treat an
+  unused entry in `Cargo.toml` as an architectural commitment.
+- Disk pages/WAL and canonical `StorageValue` bytes are explicit versioned
+  formats. New derive-based serialization must not silently replace them.
 
 
 ## Common Commands

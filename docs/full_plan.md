@@ -1,0 +1,315 @@
+# План доведения Ferros-Grynn до Windows GA-core и полной draft-conformance
+
+## Результат
+
+Работа делится на три рубежа:
+
+1. **Windows GA-core**: стабильное локальное хранилище, schema/DDL/DML, импорт, транзакции, SELECT, MATCH, Traversal, графовые результаты, статистика, базовые индексы и оптимизатор.
+2. **Полное соответствие draft-спецификациям**: оставшийся язык, Fulltext/HNSW/DiskANN/R-tree, графовые индексы, Changefeed, Live, Events и Bridges.
+3. **Поддержка Linux**: Linux хранилище и специфичные оптимизации.
+
+Нумерация этапов ниже топологически отсортирована: каждый этап расположен после всех указанных зависимостей. Работа ведётся вертикальными срезами `grammar → AST → analysis → IR → execution → storage → tests`, без создания каркасов «на будущее».
+
+## Этап 1 — архитектурное разбиение production-кода
+
+**Зависимости:** нет.
+
+**Цель:** разделить крупные файлы в `src/` по владельцам логики, не меняя API, поведение, формат хранения, ошибки, порядок результатов или производительность. `fg-meta`, benchmark crate и proc-macro crate в этот этап не входят.
+
+### 1.1. Зафиксировать сохраняемые контракты
+
+Перед перемещением кода добавить или уточнить characterization-тесты для:
+
+- публичных путей `datastore`, `gql`, `graph`, `values`, `gql_status`;
+- RAM/local, Sync/NativeAsync и feature-комбинаций;
+- кодов статусов, сериализации, WAL/page/catalog golden vectors;
+- порядка строк, атомов, свойств и результатов запросов;
+- reopen/recovery и основных SSI/FCW сценариев;
+- контрольных storage/query benchmark smoke-профилей.
+
+Если в модуле много общих типов, то они выносятся либо в `<module>/mod.rs`, либо в `<module>/types.rs` (в зависимости от количества).
+
+Если в модуле много общих функций, которые нельзя отнести в конкретный подмодуль, 
+то они выносятся либо в `<module>/mod.rs`, либо в `<module>/utils.rs` (в зависимости от количества).
+
+Если в модуле много констант, то они выносятся в `<module>/consts.rs` и разделяются по общим признакам.
+
+Если в модуле много тестов, то они выносятся в `<module>/tests.rs` и подключаются через `#[cfg(test)]`.
+
+Переиспользуемую повторяющуюся логику (функции), разбросанную по разным модулям, необходимо вынести в отдельные утилитарные модули
+(например, `unsafed`, `math` и прочие), при необходимости разрешено создавать новые модули. 
+
+### 1.2. Разделить `datastore.rs` -> `datastore/**`
+
+Текущий крупный модуль разложить на:
+
+- `consts.rs`: константные настройки;
+- `options.rs`: options for: I/O, checkpoint, datastore и transaction;
+- `schema/mod.rs`: основная схема;
+- `schema/table.rs`: определения таблиц;
+- `schema/field.rs`: определения полей;
+- `schema/index.rs`: определения индексов;
+- `schema/graph.rs`: определения графов;
+- `root.rs`: `DatabaseRoot`, версии, snapshots и каталожное состояние;
+- `backend.rs`: выбор RAM/local и адаптация хранилища;
+- `transaction/conflict.rs`: read/write sets, FCW, SSI и commit validation;
+- `transaction/mutation.rs`: graph/table mutation views;
+- `transaction/query.rs`: `QuerySnapshot`, predicates и query adapter;
+- `transaction/graph_view.rs`: transaction-bound `GraphRead`.
+- `transaction/mod.rs`: `Transaction`.
+- `mod.rs`: сам Datastore.
+
+### 1.3. Разделить storage
+
+Разбить только подтверждённые смешанные ответственности:
+
+- `consts.rs`: константные настройки;
+- `direct_io/mod.rs`: основной кроссплатформенный фасад Direct I/O;
+- `direct_io/direct_windows.rs`: Windows-специфичный слой Direct I/O;
+- `direct_io/direct_unix.rs`: Unix-специфичный слой Direct I/O;
+- `graph_index/mod.rs`: публичный фасад и реэкспорт;
+- `graph_index/label_dict.rs`: label dictionary;
+- `graph_index/primary_idx.rs`: primary index;
+- `graph_index/scalar_idx.rs`: scalar index;
+- `graph_index/btree_idx.rs`: B+tree page codec;
+- `graph_pages/hot.rs`: hot slots;
+- `graph_pages/adjacency.rs`: adjacency;
+- `graph_pages/props.rs`: properties/overflow;
+- `graph_pages/freelist.rs`: freelist;
+- `graph_pages/subgraphs.rs`: subgraphs;
+- `graph_pages/statistics.rs`: statistics;
+- `graph_pages/mod.rs`: фасад и прочие реализации;
+- `page_io/mod.rs`: основной кроссплатформенный PageIO.
+- `page_io/page_io_windows.rs`: Windows-специфичный слой PageIO.
+- `page_io/page_io_unix.rs`: Unix-специфичный слой PageIO.
+- `page_manager/sync_manager.rs`: SyncPageManager.
+- `page_manager/mod.rs`: общие структуры и реэкспорт.
+- `store/mod.rs`: фасад, open/load;
+- `store/view.rs`: read views;
+- `store/graph.rs`: graph image build/decode;
+- `store/commit.rs`: commit/publication;
+- `store/gc.rs`: startup GC;
+- `wal/mod.rs`: фасад и реэкспорт;
+- `wal/codec.rs`: record codec;
+- `wal/state.rs`: published/version state;
+- `wal/writer.rs`: writer/segments;
+- `wal/checkpoint.rs`: checkpoint;
+- `wal/recovery.rs`: recovery;
+- `catalog/mod.rs`: file catalog;
+- `catalog/definitions.rs`: database definitions;
+- `catalog/codec.rs`: codec и validation;
+- `buffer_pool/mod.rs`: BufferPull, cache facade;
+- `buffer_pool/batch.rs`: batch loading/reservations;
+- `buffer_pool/clock_pro.rs`: Clock-Pro policy.
+
+registry, superblock и другие уже атомарные владельцы не перемещать без отдельной причины.
+types при необходимости расширяется общими типами.
+
+### 1.4. Разделить query frontend и execution
+
+- `syn/stmt/**.rs`: отдельный `.rs` файл под каждый statement (MATCH, SELECT, CREATE, RELATE и так далее).
+- `syn/token.rs`: реализация Token.
+- `syn/lexer/keywords.rs`: все доступные ключевые слова GrynnQL.
+- `syn/lexer/mod.rs`: Lexer (возможно logos).
+- `syn/parser.rs`: token buffer/parser state.
+- `syn/ast/**`: реализация AST.
+- `gql/execution/adapter.rs`: transaction adapter.
+- `gql/execution/cursor.rs`: cursor primitives, relational cursors.
+- `gql/execution/eval.rs`: expression evaluator.
+- `gql/execution/mod.rs`: parsing и executor.
+- Сохранить один parser state и существующую цепочку `parse → analyze → IR → execute`.
+- `analysis` и `ir` пока не дробить: текущий размер и ответственность этого не требуют.
+
+### 1.5. Разделить values, graph algorithms и statuses
+
+- `values/runtime/**`: kind, основной value contract, formatting и conversions.
+- `values/storage/**`: tags/refs, DTO, contexts и public facade.
+- Canonical codec: encode, decode и archive envelope.
+- `graph` переносится на верхний уровень в `src/`.
+- `graph/**`: все текущие модули графов, idx, path и topology остаются.
+- `graph/algo/**`: все алгоритмы на графах.
+- `graph/traversal/**`: index, connectivity, shortest paths, spanning structures, cuts и LCA.
+- `graph/traversal/vm/mod.rs`: TraversalVM.
+- `graph/traversal/vm/traverser.rs`: Traverser, sack, bulk, side effects.
+- `graph/traversal/vm/pipeline.rs`: traversal pipeline.
+
+Большой декларативный список `define_status_codes!` остаётся единым владельцем в `definitions`: его нельзя механически дробить по количеству строк.
+
+### 1.6. Анализ кодовой базы
+
+Необходимо написать аналитический отчёт в [`reports`](/D:/Programming/Rust/ferros-grynn/docs/reports), в котором
+должно быть отражено:
+
+1. Создать `AGENTS.md` файлы для крупных модулей, описать их и прилинковать к главному [`AGENTS.md`](/D:/Programming/Rust/ferros-grynn/AGENTS.md).
+2. Проанализировать КАЖДЫЙ установленные крейты в [`Cargo.toml`](/D:/Programming/Rust/ferros-grynn/Cargo.toml) и прочий код в `src/`, не относящийся к пунктам выше;
+   отметить, что из установленных крейтов и кода может пригодиться в будущем и в какой области.
+3. Рассмотреть возможность использовать крейта вроде [`logos`](https://crates.io/crates/logos) в качестве лексера 
+   (пример из SurrealDB: [`SurrealDB Token`](/D:/Programming/Rust/ferros-grynn/crates/surrealdb/surrealdb/token)).
+4. Рассмотреть возможность использования `VecMap` и `VecSet` из [`SurrealDB Collections`](/D:/Programming/Rust/ferros-grynn/crates/surrealdb/surrealdb/collections)
+   или их модифицированных версий, использующих другие реализации динамических массивов (SmallVec, ThinVec и так далее).
+5. Рассмотреть использование [`SurrealDB TopLevelExpression`](/D:/Programming/Rust/ferros-grynn/crates/surrealdb/surrealdb/core/src/sql/ast.rs) и 
+   макросного подхода к [`SurrealDB AST`](/D:/Programming/Rust/ferros-grynn/crates/surrealdb/surrealdb/ast).
+6. Рассмотреть использование макросного подхода к системе типов как [`SurrealValue`](/D:/Programming/Rust/ferros-grynn/crates/surrealdb/surrealdb/types/derive).
+7. Что полезного можно позаимствовать из [`storekey`](/D:/Programming/Rust/ferros-grynn/crates/storekey)?
+8. Что полезного можно позаимствовать из [`surrealmx`](/D:/Programming/Rust/ferros-grynn/crates/surrealmx)?
+9. Что полезного можно позаимствовать из [`ferntree`](/D:/Programming/Rust/ferros-grynn/crates/ferntree)?
+
+### 1.7. Правила выполнения и критерии готовности
+
+- Сначала перемещение и реэкспорты, затем проверка, и только отдельным изменением — сужение visibility или удаление дублей.
+- Не добавлять crates, зависимости, traits с одной реализацией и пустые расширительные точки.
+- Использовать принятую в проекте схему каталогов с `mod.rs`.
+- Не должно остаться рукописных production-файлов свыше 2000 строк; файл свыше 1000 строк допустим только при одной явно сформулированной ответственности.
+- После каждого подэтапа должны проходить соответствующие `cargo check` и targeted tests.
+- Финальный gate: обе I/O feature-конфигурации, library tests, rustfmt check, changed-surface Clippy, benchmark smoke и обновлённый Graphify.
+- Новую фактическую структуру записать в раздел модулей [implementation_plan.md](/D:/Programming/Rust/ferros-grynn/docs/implementation_plan.md), не перенося туда нормативные byte layouts.
+- Готовый отчёт пункта 1.6 отвечает на все вопросы и находится в [`reports`](/D:/Programming/Rust/ferros-grynn/docs/reports).
+
+## Топологический порядок дальнейших этапов
+
+### Рубеж A — Windows GA-core
+
+2. **Повторная синхронизация спецификаций** — зависит от **1**.  
+   Установить приоритет: `disk_storage_spec` задаёт байтовый формат и durability, `gql_spec` — семантику языка, `gql_grammar` — точный синтаксис, `gql_tech_spec` — реализацию. Устранить расхождения DiskANN, ALTER, NativeAsync, format-v1 gate и статусов реализованности. В `implementation_plan` добавить conformance-матрицу и получить утверждение GrynQL-срезов до их реализации.
+
+3. **Закрытие Windows sync performance gate** — зависит от **1, 2**.  
+   Воспроизвести регрессии sparse miss 77,5% и scan resistance 88,2%, снять ETW/flamegraph и исправить измеренный общий источник. 
+   Gate: не менее 90% raw Direct throughput, требуемые p99/hot-set/RSS показатели и отсутствие регрессии NativeAsync. В идеале обогнать или хотя бы приблизиться к mmap, усилить gate до 95/110 по throughput/p99. 
+   Переписывать Clock-Pro разрешается только при доказанной причине.
+   Для профилирования по необходимости использовать allocation-tracking feature для трекинга аллокации (см. `src/memory`), cargo flamegraph, pprof и mimalloc-pprof (с feature pprof), shuttle, criterion, tracing, tokio-metrics, tokio-blocked.  
+
+4. **Delta-oriented mutation foundation** — зависит от **3**.  
+   Убрать полную материализацию local-графа из обычного `edit_graph`; формировать atom/page delta непосредственно из point mutations. Учесть свойства, крупную adjacency, составные `RecordId` и nested graph payload в write-set limit. После профиля сохранить лимит 256 МиБ; private spill реализовывать только при подтверждённом неделимом workload, который нельзя обработать сегментированным импортом.
+
+5. **Полный SchemaCatalog** — зависит от **2, 4**.  
+   Довести durable definitions таблиц, полей, графов, параметров и индексов, их версии и transactional publication. Primary/label/adjacency системные индексы должны иметь каталожное представление, но не удаляться пользователем.
+
+6. **StatisticsStore** — зависит от **5**.  
+   Добавить точные table/label counts, degree statistics, distinct/null fractions и property histograms. Обновлять простые счётчики транзакционно; крупные гистограммы собирать при bulk scan. Устаревшая статистика не нарушает корректность и только ухудшает план.
+
+7. **Базовый индексный контур** — зависит от **5, 6**.  
+   Завершить standard/unique B+tree, Label и Count indexes, order-preserving key codec, generation side-files, crash-safe publication и `stale` fallback. Bulk build выполняется внешней сортировкой и bottom-up packing; WAL хранит только атомарную публикацию поколения.
+
+8. **Core DDL vertical slices** — зависит от **5, 7**.  
+   Последовательно реализовать `DEFINE/REMOVE/ALTER` для GRAPH, TABLE, FIELD и базовых INDEX. Каждый slice проходит parser, typing, IR, transactional catalog update, recovery и `INFO`-представление. Неподдерживаемые advanced index kinds пока возвращают явный статус.
+
+9. **DML vertical slices** — зависит от **4, 8**.  
+   Реализовать `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `RELATE`, `EXPECT` и DML-return clauses для таблиц и графов. `UPSERT` синтаксически требует ID или `WHERE`; commit повторно проверяет graph-family invariants при любом isolation level.
+
+10. **BEGIN IMPORT** — зависит от **7, 9**.  
+    Реализовать segmented commits, deferred constraints, rejection report, external sort, bottom-up index build и cleanup незавершённых side-files. Обычный импорт не требует unlimited transaction spill.
+
+11. **Транзакционные операторы GrynnQL** — зависит от **9**.  
+    Добавить `BEGIN/COMMIT/CANCEL`, isolation/read-only options, timeout и multi-statement write execution. `Datastore::execute` использует одну автотранзакцию, если программа не содержит явного transaction block; выполнение внутри уже открытого `Transaction` запрещает вложенные transaction statements.
+
+12. **Выражения и управляющий язык** — зависит от **11**.  
+    Завершить coercions, idioms, collections, subexpressions, built-ins, `IF/ELSE`, loops, `TRY-CATCH`, `THROW` и `ASSERT`. Установить depth/iteration/time budgets и проверять отмену на границах операторов.
+
+13. **Полный реляционный SELECT** — зависит от **6, 7, 12**.  
+    Реализовать joins/subqueries, aggregation, `GROUP`, `ORDER BY`, `START`, `LIMIT`, `FETCH`, `SPLIT`, `OMIT` и keyset cursors. Сохранить sync pull `RowCursor`; barrier-операторы используют ограниченную память и явный temporary spill.
+
+14. **Rule/CBO optimizer и EXPLAIN** — зависит от **6, 7, 13**.  
+    Ввести deterministic rule passes, scan/index/join alternatives, statistics-based costs и degradation penalties. При отсутствии или устаревании индекса всегда доступен корректный scan. `EXPLAIN` показывает logical/physical plan, estimates, selected indexes, fallbacks и resource warnings.
+
+15. **Полный StandardPath MATCH** — зависит от **13, 14**.  
+    Добавить OPTIONAL, aliases/joins, match modes, cardinality, inline labels/properties, directions, bounded variable paths, TRAIL/ACYCLIC/SIMPLE, path filters/objectives и shortest/weighted paths. Path explosion ограничивается budgets и предупреждениями планировщика.
+
+16. **AtomWalk, hyper/meta и nested MATCH** — зависит от **15**.  
+    Реализовать `ATOM`, HYPER, META, WITHIN, edge-as-endpoint, cross-level incidence, qualified refs и переходы во вложенные графы. `LevelPath` не смешивать с traversal path. На этом этапе допустим корректный scan без специализированного индекса.
+
+17. **Traversal VM** — зависит от **14, 16**.  
+    Реализовать отдельный от MATCH IR и VM: traverser, map/flat-map/filter, barriers, sack, path propagation, control flow и вызов существующих graph algorithms. Сначала однопоточный pull baseline; parallel execution добавлять только после профиля.
+
+18. **Path и graph results** — зависит от **16, 17**.  
+    Подключить `RETURN GRAPH`, `BUILD GRAPH`, path results и graph-return matrix. Публичные результаты содержат `RecordId`, `AtomRef`, `Path`, `GraphRef` или `MaterializedGraph`, никогда `DiskAtomRef`, page addresses или `StorageValue`. Результат не удерживает завершённый storage snapshot.
+
+19. **Windows GA-core gate** — зависит от **3–18**.  
+    Прогнать crash/recovery matrix, codec/parser fuzzing, RAM/local и Sync/NativeAsync differential tests, long-running SSI/checkpoint tests и storage/query benchmarks. После успеха заморозить core format v1, публичный API и поддерживаемый GrynQL-profile; advanced side-files остаются отдельно версионируемыми.
+
+### Рубеж B — полная draft-conformance
+
+20. **Фоновые задания и admin surface** — зависит от **19, 21**.  
+    Реализовать durable job state для `CONCURRENTLY`, ограниченный `DEFER`, `REBUILD INDEX`, `INFO`, `KILL` и обслуживающих операций. После crash незавершённая сборка становится `stale`, а не молча `ready`.
+
+21. **Параметры, UDF и оставшийся язык** — зависит от **12, 22**.  
+    Реализовать `DEFINE PARAM/FUNCTION`, closures, overload resolution, purity/security rules, recursion `MAXDEPTH`, object constructors и оставшиеся административные выражения.
+
+22. **Analyzers и Fulltext** — зависит от **7, 22, 23**.  
+    Реализовать tokenizer/filter pipeline, inverted index, BM25, highlights, transactional/deferred updates и bulk build. Проверить Unicode normalization, analyzer versioning и одинаковость incremental/bulk результатов.
+
+23. **Vector indexes** — зависит от **7, 22, 23**.  
+    Последовательно реализовать HNSW, затем DiskANN, типы векторов, метрики и KNN/ANN operators. Для каждого алгоритма зафиксировать recall/latency/memory/build gates; custom distance использует утверждённый pure UDF contract.
+
+24. **Geometry R-tree** — зависит от **7, 22**.  
+    Реализовать geometry validation, STR bulk packing, spatial predicates, planner selectivity и exact post-filter после MBR lookup.
+
+25. **Производные графовые индексы** — зависит от **16, 17, 22**.  
+    Реализовать EdgeEndpoint, Path, Reachability и Neighbourhood indexes. Производные индексы являются snapshot artifacts с `build_lsn`; topology mutation переводит их в `stale`, после чего planner использует `ON_DEMAND`.
+
+26. **EndpointTensor и аналитические представления** — зависит от **16, 17**.  
+    Добавить нормативные tensor/matrix views поверх полной incidence-модели без изменения runtime/storage границ. Кеширование допускается только как revision-bound derived data.
+
+27. **Durable Changefeed** — зависит от **9, 19, 22**.  
+    Добавить глобальный versionstamp, before/after entries, retention, rotation, resume cursor и WAL-coordinated publication. Доставка — at-least-once; потеря истории выражается явным GAP.
+
+28. **LIVE SELECT** — зависит от **13, 29**.  
+    Реализовать registry подписок, сериализованный predicate IR, bounded per-session queue, resume и output modes. Публичный Rust API остаётся pull-based: subscription id, `next`, `resume` и `close`; silent event loss запрещён.
+
+29. **Events и LiveGraph integration** — зависит от **12, 22, 29, 30**.  
+    Реализовать `DEFINE EVENT`, sync/async execution, retry, `MAXDEPTH`, idempotency guidance и генерацию AtomWalk-рёбер. Mutable LiveGraph применяет remote delta только после явного conflict resolution и повторной проверки family invariants.
+
+30. **Bridges** — зависит от **18, 23, 31**.  
+    Реализовать нормативные `Bridge`, `.use_bridge(...)` и `BridgeData`, затем `SurrealBridge`, включая RecordOrTable, ExternalQuery, InternalQuery, RELATE и graph construction. Bridge boundary преобразует данные только в публичные `Value`/`RecordId`/graph-типы.
+
+31. **Финальный conformance gate** — зависит от **20–32**.  
+    Каждая строка conformance-матрицы должна быть реализована, протестирована либо явно помечена как ненормативная/out-of-scope. Прогнать обе платформы, все feature-комбинации, fuzz/crash/soak/performance suites, examples и cross-document audit. Выпустить итоговый русскоязычный отчёт.
+
+### Рубеж C — Linux
+
+32. **Linux sync parity** — зависит от **19**.  
+    Реализовать Unix ownership/locking, atomic superblock replacement и Direct I/O. Проверить byte-identical format-v1 vectors, recovery, NVMe performance и soak на dataset не меньше `1,25 × RAM`. Если Linux требует несовместимого layout, format v1 не изменять: выпускать format v2 с явной миграцией.
+
+33. **Linux NativeAsync** — зависит от **20**.  
+    Добавить проверенный tokio-uring backend под `native-async-io`, сохранив Sync default и синхронный query API. Недоступный явно выбранный режим возвращает typed error без fallback.
+
+## Публичные границы
+
+Основной поток остаётся таким:
+
+```text
+GrynQL text
+  → syntax
+  → binding/type analysis
+  → logical IR
+  → rule/CBO optimizer
+  → RowCursor или Traversal VM
+  → Value / RecordId / Path / MaterializedGraph
+```
+
+- `Datastore::execute`, `Transaction`, `GraphRead` и текущие публичные пути сохраняются.
+- `QueryStatementKind` расширяется вместе с реально реализованными statements.
+- NativeAsync остаётся внутренним способом page I/O, а не отдельным async query API.
+- Schema, statistics, page/index DTO и `DiskAtomRef` остаются crate-private.
+- Несовместимое изменение core format требует новой версии и миграции; существующий v1 не переопределяется.
+
+## Общая проверочная матрица
+
+- **Структура:** public-path compile tests и проверки feature/config parity.
+- **Frontend:** positive/negative grammar cases, source spans, parser depth и fuzz без panic.
+- **Analysis/IR:** scope, type inference, lowering golden tests и одинаковые diagnostics.
+- **Query:** одинаковые результаты RAM/local Sync/NativeAsync; deterministic order только там, где он обещан.
+- **Writes:** commit/abort/reopen, FCW, SSI phantoms, multi-graph atomicity и family invariants.
+- **Storage:** malformed pages/WAL/catalog, torn tail, checkpoint watermarks, crash points и fuzz codecs.
+- **Indexes:** incremental/bulk parity, unique violations, concurrent generation publication и stale fallback.
+- **Live:** at-least-once, duplicate delivery, resume, retention expiry, GAP и backpressure.
+- **Bridges:** fake bridge contract tests и feature-gated SurrealDB integration tests.
+- **Каждый этап:** rustfmt check, focused check/test/Clippy; полный workspace gate выполняется на рубежах 19 и 33, а несвязанный существующий lint debt отчётливо отделяется.
+
+## Зафиксированные допущения
+
+- Первый архитектурный этап касается только `src/` и связанных тестов; `fg-meta` остаётся read-only reference.
+- Windows GA не ждёт Linux. После Windows freeze несовместимость Linux решается format v2 и миграцией.
+- Production spill не создаётся без измеренного неделимого workload; стандартный bulk-путь — segmented import.
+- Новые dependencies требуют отдельного подтверждения; сначала используются stdlib и уже подключённые crates.
+- macOS, distributed execution, SPDK, ARIES/UNDO, JIT, SMT optimizer verification и parallel recovery остаются вне плана.
+- Документы и отчёты пишутся по-русски, комментарии Rust-кода — по-английски.

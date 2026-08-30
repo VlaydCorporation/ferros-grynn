@@ -222,7 +222,7 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
 ### 3.4. Пределы разбора
 
 `ParserSettings`: `max_object_parsing_depth` (default 100) и
-`max_query_parsing_depth` (default 20). Defaults берутся из одноимённых полей `Config`.
+`max_query_parsing_depth` (default 20). Defaults берутся из одноимённых полей `GQLConfig`.
 
 ### 3.5. Ошибки парсинга
 

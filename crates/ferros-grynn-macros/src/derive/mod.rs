@@ -1,7 +1,6 @@
 use syn::{Attribute, Field, Token, parse::Parse, punctuated::Punctuated};
 
 pub mod measurable;
-pub mod structure_accumulator;
 
 pub fn field_has_attribute(ident: &str, field: &Field) -> bool {
 	has_attribute(ident, &field.attrs)

@@ -3,6 +3,7 @@ mod lexer;
 mod parser;
 mod stmt;
 mod token;
+pub mod config;
 
 pub use ast::{
 	BinaryOperator,
@@ -34,8 +35,9 @@ pub use stmt::{
 	Statement,
 	StatementKind,
 };
+pub use config::GQLConfig;
 
-use crate::{config::Config, gql_status::FerrosGrynnResult};
+use crate::gql_status::FerrosGrynnResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -46,12 +48,12 @@ pub struct ParserSettings {
 
 impl Default for ParserSettings {
 	fn default() -> Self {
-		Self::from(&Config::default())
+		Self::from(&GQLConfig::default())
 	}
 }
 
-impl From<&Config> for ParserSettings {
-	fn from(config: &Config) -> Self {
+impl From<&GQLConfig> for ParserSettings {
+	fn from(config: &GQLConfig) -> Self {
 		Self {
 			max_object_parsing_depth: config.max_object_parsing_depth,
 			max_query_parsing_depth: config.max_query_parsing_depth,
