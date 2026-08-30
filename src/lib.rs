@@ -7,6 +7,7 @@ mod collections;
 pub mod ecs;
 pub mod gql;
 pub mod gql_status;
+pub mod graph;
 pub mod math;
 #[allow(
 	dead_code,

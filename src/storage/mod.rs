@@ -8,7 +8,8 @@
 
 mod buffer_pool;
 mod catalog;
-mod direct;
+mod consts;
+mod direct_io;
 mod file_registry;
 mod graph_index;
 mod graph_pages;
@@ -21,6 +22,8 @@ mod superblock;
 mod types;
 mod wal;
 
+// Preserve the internal module path while callers migrate to `direct_io`.
+use direct_io as direct;
 pub use page_io::PageIoMode;
 pub use store::{
 	LocalCommitGraph,

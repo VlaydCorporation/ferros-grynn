@@ -7,31 +7,16 @@ use super::{
 		Expr,
 		ExprKind,
 		Identifier,
-		LetStatement,
 		Literal,
-		MatchDirection,
-		MatchEdge,
-		MatchEndpoint,
-		MatchEndpointKind,
-		MatchLength,
-		MatchPattern,
-		MatchReturnItem,
-		MatchStatement,
-		MatchStep,
 		ObjectField,
 		Program,
-		RecordKey,
-		ReturnStatement,
-		SelectItem,
-		SelectStatement,
-		SelectTarget,
-		Statement,
-		StatementKind,
 		TypeName,
 		UnaryOperator,
 		cover,
 	},
-	lexer::{Symbol, Token, TokenKind, lex},
+	lexer::{keywords, lex},
+	stmt::{Statement, StatementKind},
+	token::{Symbol, Token, TokenKind},
 };
 use crate::gql_status::{
 	ExecutionPhase,
@@ -57,7 +42,7 @@ pub(super) fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult
 	stack.enter(|stk| parser.program(stk)).finish()
 }
 
-struct TokenBuffer<const LOOKAHEAD: usize> {
+pub(in crate::syn) struct TokenBuffer<const LOOKAHEAD: usize> {
 	tokens: Vec<Token>,
 	cursor: usize,
 }
@@ -70,13 +55,13 @@ impl<const LOOKAHEAD: usize> TokenBuffer<LOOKAHEAD> {
 		}
 	}
 
-	fn peek(&self, offset: usize) -> &Token {
+	pub(in crate::syn) fn peek(&self, offset: usize) -> &Token {
 		debug_assert!(offset < LOOKAHEAD);
 		let index = self.cursor.saturating_add(offset).min(self.tokens.len() - 1);
 		&self.tokens[index]
 	}
 
-	fn next(&mut self) -> Token {
+	pub(in crate::syn) fn next(&mut self) -> Token {
 		let token = self.peek(0).clone();
 		if !matches!(token.kind, TokenKind::Eof) {
 			self.cursor += 1;
@@ -85,14 +70,17 @@ impl<const LOOKAHEAD: usize> TokenBuffer<LOOKAHEAD> {
 	}
 }
 
-struct Parser<'a> {
-	source: &'a str,
-	settings: ParserSettings,
-	tokens: TokenBuffer<4>,
+pub(in crate::syn) struct Parser<'a> {
+	pub(in crate::syn) source: &'a str,
+	pub(in crate::syn) settings: ParserSettings,
+	pub(in crate::syn) tokens: TokenBuffer<4>,
 }
 
 impl Parser<'_> {
-	async fn program(&mut self, context: &mut Stk) -> FerrosGrynnResult<Program> {
+	pub(in crate::syn) async fn program(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Program> {
 		let mut statements = Vec::new();
 		while !self.at_eof() {
 			while self.consume_symbol(Symbol::Semicolon).is_some() {}
@@ -109,15 +97,18 @@ impl Parser<'_> {
 		})
 	}
 
-	async fn statement(&mut self, context: &mut Stk) -> FerrosGrynnResult<Statement> {
+	pub(in crate::syn) async fn statement(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Statement> {
 		let start = self.current().span;
-		let kind = if self.consume_keyword("LET").is_some() {
+		let kind = if self.consume_keyword(keywords::LET).is_some() {
 			StatementKind::Let(context.run(|context| self.let_statement(context)).await?)
-		} else if self.consume_keyword("MATCH").is_some() {
+		} else if self.consume_keyword(keywords::MATCH).is_some() {
 			StatementKind::Match(context.run(|context| self.match_statement(context)).await?)
-		} else if self.consume_keyword("RETURN").is_some() {
+		} else if self.consume_keyword(keywords::RETURN).is_some() {
 			StatementKind::Return(context.run(|context| self.return_statement(context)).await?)
-		} else if self.consume_keyword("SELECT").is_some() {
+		} else if self.consume_keyword(keywords::SELECT).is_some() {
 			StatementKind::Select(context.run(|context| self.select_statement(context)).await?)
 		} else if let Some(feature) = self.unsupported_statement() {
 			return Err(self.unsupported(feature, start));
@@ -131,484 +122,7 @@ impl Parser<'_> {
 		})
 	}
 
-	async fn let_statement(&mut self, context: &mut Stk) -> FerrosGrynnResult<LetStatement> {
-		let name = self.parameter()?;
-		let declared_type = if self.consume_symbol(Symbol::Colon).is_some() {
-			Some(self.type_name()?)
-		} else {
-			None
-		};
-		self.expect_symbol(Symbol::Equal, "Expected `=` in LET statement.")?;
-		let value = context.run(|context| self.expression(context, 0, 1, 0)).await?;
-		Ok(LetStatement {
-			name,
-			declared_type,
-			value,
-		})
-	}
-
-	/// Parses the approved read-only MATCH statement profile.
-	async fn match_statement(&mut self, context: &mut Stk) -> FerrosGrynnResult<MatchStatement> {
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
-		let atom = self.consume_keyword("ATOM").is_some();
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
-
-		let mut patterns = Vec::new();
-		loop {
-			patterns.push(self.match_pattern(atom)?);
-			if self.consume_symbol(Symbol::Comma).is_none() {
-				break;
-			}
-			if self.at_keyword("FROM") {
-				return Err(self.syntax("Expected a MATCH pattern after `,`.", self.current().span));
-			}
-		}
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
-		self.expect_keyword("FROM", "Expected `FROM graph_name` after MATCH patterns.")?;
-		let source = self.identifier()?;
-		let filter = if self.consume_keyword("WHERE").is_some() {
-			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
-		} else {
-			None
-		};
-		self.expect_keyword("RETURN", "Expected `RETURN` in MATCH statement.")?;
-		if let Some(token) = self.consume_keyword("DISTINCT") {
-			return Err(self.unsupported("RETURN DISTINCT", token.span));
-		}
-		if self.at_keyword("GRAPH") {
-			return Err(self.unsupported("graph-return", self.current().span));
-		}
-		let mut projection = Vec::new();
-		loop {
-			let expr = context.run(|context| self.expression(context, 0, 1, 0)).await?;
-			let alias = if self.consume_keyword("AS").is_some() {
-				Some(self.identifier()?)
-			} else {
-				None
-			};
-			let span = alias.as_ref().map_or(expr.span, |alias| cover(expr.span, alias.span));
-			projection.push(MatchReturnItem {
-				expr,
-				alias,
-				span,
-			});
-			if self.consume_symbol(Symbol::Comma).is_none() {
-				break;
-			}
-		}
-		Ok(MatchStatement {
-			atom,
-			patterns,
-			source,
-			filter,
-			projection,
-		})
-	}
-
-	/// Parses one StandardPath or AtomWalk chain.
-	fn match_pattern(&mut self, atom: bool) -> FerrosGrynnResult<MatchPattern> {
-		let path_alias = if matches!(&self.current().kind, TokenKind::Word { .. })
-			&& matches!(&self.tokens.peek(1).kind, TokenKind::Symbol(Symbol::Equal))
-		{
-			let alias = self.identifier()?;
-			self.expect_symbol(Symbol::Equal, "Expected `=` after path alias.")?;
-			Some(alias)
-		} else {
-			None
-		};
-		let start = self.match_endpoint(atom)?;
-		let pattern_start = path_alias.as_ref().map_or(start.span, |alias| alias.span);
-		let mut steps = Vec::new();
-		while self.at_match_step(atom) {
-			steps.push(if atom {
-				self.atom_match_step()?
-			} else {
-				self.standard_match_step()?
-			});
-		}
-		let end = steps.last().map_or(start.span, |step| step.span);
-		Ok(MatchPattern {
-			path_alias,
-			start,
-			steps,
-			span: cover(pattern_start, end),
-		})
-	}
-
-	/// Parses one node or explicit AtomWalk edge endpoint.
-	fn match_endpoint(&mut self, atom: bool) -> FerrosGrynnResult<MatchEndpoint> {
-		let outer = atom
-			.then(|| self.expect_symbol(Symbol::Less, "Expected `<` before AtomWalk endpoint."))
-			.transpose()?;
-		let open = self.tokens.next();
-		let (kind, close_symbol, close_name) = match open.kind {
-			TokenKind::Symbol(Symbol::LeftParen) => {
-				(MatchEndpointKind::Node, Symbol::RightParen, "`)`")
-			}
-			TokenKind::Symbol(Symbol::LeftBracket) if atom => {
-				(MatchEndpointKind::Edge, Symbol::RightBracket, "`]`")
-			}
-			_ if atom => {
-				return Err(self.syntax("Expected `(` or `[` inside AtomWalk endpoint.", open.span));
-			}
-			_ => return Err(self.syntax("Expected `(` to start MATCH endpoint.", open.span)),
-		};
-		let (alias, labels) = self.match_binding()?;
-		if self.at_symbol(Symbol::LeftBrace) {
-			return Err(self.unsupported("inline MATCH property objects", self.current().span));
-		}
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
-		let close = self.close(close_symbol, open.span, close_name)?;
-		let end = if atom {
-			self.expect_symbol(Symbol::Greater, "Expected `>` after AtomWalk endpoint.")?
-		} else {
-			close
-		};
-		Ok(MatchEndpoint {
-			kind,
-			alias,
-			labels,
-			span: cover(outer.as_ref().map_or(open.span, |token| token.span), end.span),
-		})
-	}
-
-	/// Parses an optional alias followed by alternative labels.
-	fn match_binding(&mut self) -> FerrosGrynnResult<(Option<Identifier>, Vec<Identifier>)> {
-		let alias = if matches!(&self.current().kind, TokenKind::Word { .. }) {
-			Some(self.identifier()?)
-		} else {
-			None
-		};
-		let mut labels = Vec::new();
-		if self.consume_symbol(Symbol::Colon).is_some() {
-			labels.push(self.identifier()?);
-			while self.consume_symbol(Symbol::Pipe).is_some() {
-				labels.push(self.identifier()?);
-			}
-		}
-		Ok((alias, labels))
-	}
-
-	/// Parses one StandardPath connector and target endpoint.
-	fn standard_match_step(&mut self) -> FerrosGrynnResult<MatchStep> {
-		let prefix = self.tokens.next();
-		let TokenKind::Symbol(prefix_symbol) = prefix.kind else {
-			return Err(self.syntax("Expected a StandardPath edge.", prefix.span));
-		};
-		let bracketed = matches!(prefix_symbol, Symbol::Minus | Symbol::ArrowLeft)
-			&& self.at_symbol(Symbol::LeftBracket);
-		let (direction, edge) = if bracketed {
-			let open = self.expect_symbol(Symbol::LeftBracket, "Expected `[` in MATCH edge.")?;
-			let (alias, labels, length) = self.match_edge_binding(true)?;
-			if self.at_symbol(Symbol::LeftBrace) {
-				return Err(self.unsupported("inline MATCH property objects", self.current().span));
-			}
-			if let Some(feature) = self.unsupported_match_modifier() {
-				return Err(self.unsupported(feature, self.current().span));
-			}
-			self.close(Symbol::RightBracket, open.span, "`]`")?;
-			let suffix = self.tokens.next();
-			let suffix_symbol = match suffix.kind {
-				TokenKind::Symbol(Symbol::Minus) => Symbol::Minus,
-				TokenKind::Symbol(Symbol::ArrowRight) => Symbol::ArrowRight,
-				_ => {
-					return Err(self.syntax("Expected `-` or `->` after MATCH edge.", suffix.span));
-				}
-			};
-			let direction = match (prefix_symbol, suffix_symbol) {
-				(Symbol::Minus, Symbol::ArrowRight) => MatchDirection::Forward,
-				(Symbol::ArrowLeft, Symbol::Minus) => MatchDirection::Backward,
-				(Symbol::Minus, Symbol::Minus) => MatchDirection::Undirected,
-				(Symbol::ArrowLeft, Symbol::ArrowRight) => MatchDirection::Bidirectional,
-				_ => {
-					return Err(self.syntax("Invalid StandardPath direction.", suffix.span));
-				}
-			};
-			let span = cover(prefix.span, suffix.span);
-			(direction, MatchEdge {
-				alias,
-				labels,
-				length,
-				span,
-			})
-		} else {
-			let direction = match prefix_symbol {
-				Symbol::ArrowRight => MatchDirection::Forward,
-				Symbol::ArrowLeft => MatchDirection::Backward,
-				Symbol::Minus => MatchDirection::Undirected,
-				Symbol::ArrowBoth => MatchDirection::Bidirectional,
-				_ => return Err(self.syntax("Expected a StandardPath edge.", prefix.span)),
-			};
-			(direction, MatchEdge {
-				alias: None,
-				labels: Vec::new(),
-				length: None,
-				span: prefix.span,
-			})
-		};
-		let target = self.match_endpoint(false)?;
-		Ok(MatchStep {
-			direction,
-			span: cover(edge.span, target.span),
-			edge,
-			target,
-		})
-	}
-
-	/// Parses one AtomWalk connector and target endpoint.
-	fn atom_match_step(&mut self) -> FerrosGrynnResult<MatchStep> {
-		let prefix = self.tokens.next();
-		let left = match prefix.kind {
-			TokenKind::Symbol(Symbol::TildeLeftBracket) => false,
-			TokenKind::Symbol(Symbol::LeftTildeLeftBracket) => true,
-			_ => return Err(self.syntax("Expected an AtomWalk `~[...]~` edge.", prefix.span)),
-		};
-		let (alias, labels, _length) = self.match_edge_binding(false)?;
-		if self.at_symbol(Symbol::LeftBrace) {
-			return Err(self.unsupported("inline MATCH property objects", self.current().span));
-		}
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
-		let suffix = self.tokens.next();
-		let right = match suffix.kind {
-			TokenKind::Symbol(Symbol::RightBracketTilde) => false,
-			TokenKind::Symbol(Symbol::RightBracketTildeRight) => true,
-			_ => {
-				return Err(self.syntax("Expected `]~` or `]~>` after AtomWalk edge.", suffix.span));
-			}
-		};
-		let direction = match (left, right) {
-			(false, true) => MatchDirection::Forward,
-			(true, false) => MatchDirection::Backward,
-			(false, false) => MatchDirection::Undirected,
-			(true, true) => MatchDirection::Bidirectional,
-		};
-		let edge = MatchEdge {
-			alias,
-			labels,
-			length: None,
-			span: cover(prefix.span, suffix.span),
-		};
-		let target = self.match_endpoint(true)?;
-		Ok(MatchStep {
-			direction,
-			span: cover(edge.span, target.span),
-			edge,
-			target,
-		})
-	}
-
-	/// Parses connector alias, labels, and an optional finite range.
-	fn match_edge_binding(
-		&mut self,
-		allow_length: bool,
-	) -> FerrosGrynnResult<(Option<Identifier>, Vec<Identifier>, Option<MatchLength>)> {
-		let (alias, labels) = self.match_binding()?;
-		let length = if let Some(star) = self.consume_symbol(Symbol::Star) {
-			if !allow_length {
-				return Err(self.unsupported("AtomWalk variable paths", star.span));
-			}
-			Some(self.match_length(star.span)?)
-		} else {
-			None
-		};
-		Ok((alias, labels, length))
-	}
-
-	/// Parses a finite exact or bounded StandardPath length.
-	fn match_length(&mut self, star: TextSpan) -> FerrosGrynnResult<MatchLength> {
-		let first = if matches!(&self.current().kind, TokenKind::Number(_)) {
-			Some(self.match_length_bound()?)
-		} else {
-			None
-		};
-		if self.consume_symbol(Symbol::Range).is_some() {
-			let Some((max, max_span)) = (matches!(&self.current().kind, TokenKind::Number(_)))
-				.then(|| self.match_length_bound())
-				.transpose()?
-			else {
-				return Err(self.unsupported("unbounded MATCH paths", self.current().span));
-			};
-			let min = first.map_or(1, |(value, _span)| value);
-			return Ok(MatchLength {
-				min,
-				max,
-				span: cover(star, max_span),
-			});
-		}
-		let Some((value, value_span)) = first else {
-			return Err(self.unsupported("unbounded MATCH paths", star));
-		};
-		Ok(MatchLength {
-			min: value,
-			max: value,
-			span: cover(star, value_span),
-		})
-	}
-
-	/// Parses one unsigned path-length bound with its source span.
-	fn match_length_bound(&mut self) -> FerrosGrynnResult<(u32, TextSpan)> {
-		let token = self.tokens.next();
-		let TokenKind::Number(value) = token.kind else {
-			return Err(self.syntax("Expected a path length.", token.span));
-		};
-		value
-			.replace('_', "")
-			.parse::<u32>()
-			.map(|value| (value, token.span))
-			.map_err(|_error| self.syntax("Path length is out of range.", token.span))
-	}
-
-	/// Reports whether the current token starts another MATCH step.
-	fn at_match_step(&self, atom: bool) -> bool {
-		if atom {
-			self.at_symbol(Symbol::TildeLeftBracket) || self.at_symbol(Symbol::LeftTildeLeftBracket)
-		} else {
-			self.at_symbol(Symbol::Minus)
-				|| self.at_symbol(Symbol::ArrowLeft)
-				|| self.at_symbol(Symbol::ArrowRight)
-				|| self.at_symbol(Symbol::ArrowBoth)
-		}
-	}
-
-	/// Classifies deferred MATCH syntax for typed diagnostics.
-	fn unsupported_match_modifier(&self) -> Option<&'static str> {
-		[
-			"OPTIONAL",
-			"DISTINCT",
-			"REPEATABLE",
-			"DIFFERENT",
-			"HYPER",
-			"META",
-			"METAVERTEX",
-			"METAEDGE",
-			"CONSTRAINTS",
-			"WITHIN",
-			"CROSS_LEVEL",
-			"WALK",
-			"TRAIL",
-			"SIMPLE",
-			"ACYCLIC",
-			"SHORTEST",
-			"WEIGHTED",
-		]
-		.into_iter()
-		.find(|keyword| self.at_keyword(keyword))
-	}
-
-	async fn return_statement(&mut self, context: &mut Stk) -> FerrosGrynnResult<ReturnStatement> {
-		let value = context.run(|context| self.expression(context, 0, 1, 0)).await?;
-		let alias = if self.consume_keyword("AS").is_some() {
-			Some(self.identifier()?)
-		} else {
-			None
-		};
-		Ok(ReturnStatement {
-			value,
-			alias,
-		})
-	}
-
-	async fn select_statement(&mut self, context: &mut Stk) -> FerrosGrynnResult<SelectStatement> {
-		let only = self.consume_keyword("ONLY").is_some();
-		let value = self.consume_keyword("VALUE").is_some();
-		let mut projection = Vec::new();
-		loop {
-			if let Some(token) = self.consume_symbol(Symbol::Star) {
-				projection.push(SelectItem::Wildcard(token.span));
-			} else {
-				let expr = context.run(|context| self.expression(context, 0, 1, 0)).await?;
-				let alias = if self.consume_keyword("AS").is_some() {
-					Some(self.identifier()?)
-				} else {
-					None
-				};
-				projection.push(SelectItem::Expr {
-					expr,
-					alias,
-				});
-			}
-			if self.consume_symbol(Symbol::Comma).is_none() {
-				break;
-			}
-		}
-		if value && projection.len() != 1 {
-			return Err(
-				self.syntax("SELECT VALUE requires exactly one expression.", self.current().span)
-			);
-		}
-		self.expect_keyword("FROM", "Expected `FROM` after SELECT projection.")?;
-		let target = self.select_target()?;
-		let filter = if self.consume_keyword("WHERE").is_some() {
-			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
-		} else {
-			None
-		};
-		let limit = if self.consume_keyword("LIMIT").is_some() {
-			self.consume_keyword("BY");
-			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
-		} else {
-			None
-		};
-		let start = if self.consume_keyword("START").is_some() {
-			if self.consume_keyword("AFTER").is_some() {
-				return Err(self.unsupported("START AFTER", self.previous_span()));
-			}
-			self.consume_keyword("AT");
-			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
-		} else {
-			None
-		};
-		if let Some(clause) = self.unsupported_select_clause() {
-			return Err(self.unsupported(clause, self.current().span));
-		}
-		Ok(SelectStatement {
-			only,
-			value,
-			projection,
-			target,
-			filter,
-			limit,
-			start,
-		})
-	}
-
-	fn select_target(&mut self) -> FerrosGrynnResult<SelectTarget> {
-		let table = self.identifier()?;
-		if !self.at_symbol(Symbol::Colon)
-			|| self.current().gap_before
-			|| self.tokens.peek(1).gap_before
-		{
-			return Ok(SelectTarget::Table(table));
-		}
-		self.tokens.next();
-		let token = self.tokens.next();
-		let key = match token.kind {
-			TokenKind::Number(value) => RecordKey::Integer(value, token.span),
-			TokenKind::String(value) => RecordKey::String(value, token.span),
-			TokenKind::Word {
-				value,
-				..
-			} => RecordKey::String(value, token.span),
-			_ => return Err(self.syntax("Expected a record ID after `:`.", token.span)),
-		};
-		Ok(SelectTarget::Record {
-			span: cover(table.span, key.span()),
-			table,
-			key,
-		})
-	}
-
-	async fn expression(
+	pub(in crate::syn) async fn expression(
 		&mut self,
 		context: &mut Stk,
 		minimum_binding_power: u8,
@@ -670,7 +184,7 @@ impl Parser<'_> {
 		Ok(left)
 	}
 
-	async fn prefix(
+	pub(in crate::syn) async fn prefix(
 		&mut self,
 		context: &mut Stk,
 		depth: u32,
@@ -697,35 +211,35 @@ impl Parser<'_> {
 			TokenKind::Word {
 				value,
 				quoted,
-			} if !quoted && value.eq_ignore_ascii_case("NONE") => Ok(Expr {
+			} if !quoted && value.eq_ignore_ascii_case(keywords::NONE) => Ok(Expr {
 				kind: ExprKind::Literal(Literal::None),
 				span: token.span,
 			}),
 			TokenKind::Word {
 				value,
 				quoted,
-			} if !quoted && value.eq_ignore_ascii_case("NULL") => Ok(Expr {
+			} if !quoted && value.eq_ignore_ascii_case(keywords::NULL) => Ok(Expr {
 				kind: ExprKind::Literal(Literal::Null),
 				span: token.span,
 			}),
 			TokenKind::Word {
 				value,
 				quoted,
-			} if !quoted && value.eq_ignore_ascii_case("TRUE") => Ok(Expr {
+			} if !quoted && value.eq_ignore_ascii_case(keywords::TRUE) => Ok(Expr {
 				kind: ExprKind::Literal(Literal::Bool(true)),
 				span: token.span,
 			}),
 			TokenKind::Word {
 				value,
 				quoted,
-			} if !quoted && value.eq_ignore_ascii_case("FALSE") => Ok(Expr {
+			} if !quoted && value.eq_ignore_ascii_case(keywords::FALSE) => Ok(Expr {
 				kind: ExprKind::Literal(Literal::Bool(false)),
 				span: token.span,
 			}),
 			TokenKind::Word {
 				value,
 				quoted,
-			} if !quoted && value.eq_ignore_ascii_case("NOT") => {
+			} if !quoted && value.eq_ignore_ascii_case(keywords::NOT) => {
 				self.unary(context, token.span, UnaryOperator::Not, depth, object_depth).await
 			}
 			TokenKind::Word {
@@ -785,7 +299,7 @@ impl Parser<'_> {
 		}
 	}
 
-	async fn unary(
+	pub(in crate::syn) async fn unary(
 		&mut self,
 		context: &mut Stk,
 		start: TextSpan,
@@ -804,7 +318,7 @@ impl Parser<'_> {
 		})
 	}
 
-	async fn array(
+	pub(in crate::syn) async fn array(
 		&mut self,
 		context: &mut Stk,
 		open: TextSpan,
@@ -831,7 +345,7 @@ impl Parser<'_> {
 		})
 	}
 
-	async fn object(
+	pub(in crate::syn) async fn object(
 		&mut self,
 		context: &mut Stk,
 		open: TextSpan,
@@ -866,7 +380,7 @@ impl Parser<'_> {
 		})
 	}
 
-	async fn postfix(
+	pub(in crate::syn) async fn postfix(
 		&mut self,
 		context: &mut Stk,
 		base: Expr,
@@ -927,7 +441,7 @@ impl Parser<'_> {
 		}))
 	}
 
-	fn binary_operator(&self) -> Option<(BinaryOperator, u8, u8, usize)> {
+	pub(in crate::syn) fn binary_operator(&self) -> Option<(BinaryOperator, u8, u8, usize)> {
 		let symbol = match self.current().kind {
 			TokenKind::Symbol(symbol) => Some(symbol),
 			_ => None,
@@ -952,14 +466,14 @@ impl Parser<'_> {
 			Some(Symbol::Slash) => (BinaryOperator::Divide, 15, 16, 1),
 			Some(Symbol::Percent) => (BinaryOperator::Remainder, 15, 16, 1),
 			Some(Symbol::Power) => (BinaryOperator::Power, 17, 17, 1),
-			_ if self.at_keyword("OR") => (BinaryOperator::Or, 5, 6, 1),
-			_ if self.at_keyword("AND") => (BinaryOperator::And, 7, 8, 1),
-			_ if self.at_keyword("IS") => (BinaryOperator::Is, 9, 10, 1),
-			_ if self.at_keyword("IN") => (BinaryOperator::In, 9, 10, 1),
-			_ if self.at_keyword("NOT") && self.peek_keyword(1, "IS") => {
+			_ if self.at_keyword(keywords::OR) => (BinaryOperator::Or, 5, 6, 1),
+			_ if self.at_keyword(keywords::AND) => (BinaryOperator::And, 7, 8, 1),
+			_ if self.at_keyword(keywords::IS) => (BinaryOperator::Is, 9, 10, 1),
+			_ if self.at_keyword(keywords::IN) => (BinaryOperator::In, 9, 10, 1),
+			_ if self.at_keyword(keywords::NOT) && self.peek_keyword(1, keywords::IS) => {
 				(BinaryOperator::NotIs, 9, 10, 2)
 			}
-			_ if self.at_keyword("NOT") && self.peek_keyword(1, "IN") => {
+			_ if self.at_keyword(keywords::NOT) && self.peek_keyword(1, keywords::IN) => {
 				(BinaryOperator::NotIn, 9, 10, 2)
 			}
 			_ => return None,
@@ -967,7 +481,7 @@ impl Parser<'_> {
 		Some(operator)
 	}
 
-	fn identifier(&mut self) -> FerrosGrynnResult<Identifier> {
+	pub(in crate::syn) fn identifier(&mut self) -> FerrosGrynnResult<Identifier> {
 		let token = self.tokens.next();
 		match token.kind {
 			TokenKind::Word {
@@ -982,7 +496,7 @@ impl Parser<'_> {
 		}
 	}
 
-	fn parameter(&mut self) -> FerrosGrynnResult<Identifier> {
+	pub(in crate::syn) fn parameter(&mut self) -> FerrosGrynnResult<Identifier> {
 		let token = self.tokens.next();
 		match token.kind {
 			TokenKind::Parameter(value) => Ok(Identifier {
@@ -994,7 +508,7 @@ impl Parser<'_> {
 		}
 	}
 
-	fn type_name(&mut self) -> FerrosGrynnResult<TypeName> {
+	pub(in crate::syn) fn type_name(&mut self) -> FerrosGrynnResult<TypeName> {
 		let identifier = self.identifier()?;
 		Ok(TypeName {
 			value: identifier.value,
@@ -1002,7 +516,7 @@ impl Parser<'_> {
 		})
 	}
 
-	fn close(
+	pub(in crate::syn) fn close(
 		&mut self,
 		symbol: Symbol,
 		open: TextSpan,
@@ -1020,50 +534,58 @@ impl Parser<'_> {
 		Err(error)
 	}
 
-	fn expect_symbol(&mut self, symbol: Symbol, message: &str) -> FerrosGrynnResult<Token> {
+	pub(in crate::syn) fn expect_symbol(
+		&mut self,
+		symbol: Symbol,
+		message: &str,
+	) -> FerrosGrynnResult<Token> {
 		self.consume_symbol(symbol).ok_or_else(|| self.syntax(message, self.current().span))
 	}
 
-	fn expect_keyword(&mut self, keyword: &str, message: &str) -> FerrosGrynnResult<Token> {
+	pub(in crate::syn) fn expect_keyword(
+		&mut self,
+		keyword: &str,
+		message: &str,
+	) -> FerrosGrynnResult<Token> {
 		self.consume_keyword(keyword).ok_or_else(|| self.syntax(message, self.current().span))
 	}
 
-	fn consume_symbol(&mut self, symbol: Symbol) -> Option<Token> {
+	pub(in crate::syn) fn consume_symbol(&mut self, symbol: Symbol) -> Option<Token> {
 		self.at_symbol(symbol).then(|| self.tokens.next())
 	}
 
-	fn consume_keyword(&mut self, keyword: &str) -> Option<Token> {
+	pub(in crate::syn) fn consume_keyword(&mut self, keyword: &str) -> Option<Token> {
 		self.at_keyword(keyword).then(|| self.tokens.next())
 	}
 
-	fn at_symbol(&self, symbol: Symbol) -> bool {
+	pub(in crate::syn) fn at_symbol(&self, symbol: Symbol) -> bool {
 		matches!(self.current().kind, TokenKind::Symbol(current) if current == symbol)
 	}
 
-	fn at_keyword(&self, keyword: &str) -> bool {
+	pub(in crate::syn) fn at_keyword(&self, keyword: &str) -> bool {
 		self.peek_keyword(0, keyword)
 	}
 
-	fn peek_keyword(&self, offset: usize, keyword: &str) -> bool {
+	pub(in crate::syn) fn peek_keyword(&self, offset: usize, keyword: &str) -> bool {
 		matches!(
 			&self.tokens.peek(offset).kind,
 			TokenKind::Word { value, quoted: false } if value.eq_ignore_ascii_case(keyword)
 		)
 	}
 
-	fn at_eof(&self) -> bool {
+	pub(in crate::syn) fn at_eof(&self) -> bool {
 		matches!(self.current().kind, TokenKind::Eof)
 	}
 
-	fn current(&self) -> &Token {
+	pub(in crate::syn) fn current(&self) -> &Token {
 		self.tokens.peek(0)
 	}
 
-	fn previous_span(&self) -> TextSpan {
+	pub(in crate::syn) fn previous_span(&self) -> TextSpan {
 		self.tokens.tokens[self.tokens.cursor.saturating_sub(1)].span
 	}
 
-	fn ensure_depth(&self, depth: u32) -> FerrosGrynnResult<()> {
+	pub(in crate::syn) fn ensure_depth(&self, depth: u32) -> FerrosGrynnResult<()> {
 		if depth > self.settings.max_query_parsing_depth {
 			Err(self.nesting_error(self.settings.max_query_parsing_depth, self.current().span))
 		} else {
@@ -1071,38 +593,29 @@ impl Parser<'_> {
 		}
 	}
 
-	fn unsupported_statement(&self) -> Option<&'static str> {
-		[
-			"IF", "CASE", "FOR", "WHILE", "BREAK", "CONTINUE", "THROW", "TRY", "BEGIN", "COMMIT",
-			"CANCEL", "EXPLAIN", "CREATE", "UPDATE", "UPSERT", "DELETE", "RELATE", "OPTIONAL",
-			"TRAVERSE", "BUILD", "DEFINE", "REMOVE", "INFO", "SHOW", "KILL", "REBUILD", "ALTER",
-			"COMPACT", "LIVE",
-		]
-		.into_iter()
-		.find(|keyword| self.at_keyword(keyword))
+	pub(in crate::syn) fn unsupported_statement(&self) -> Option<&'static str> {
+		keywords::UNSUPPORTED_STATEMENTS.iter().copied().find(|keyword| self.at_keyword(keyword))
 	}
 
-	fn unsupported_select_clause(&self) -> Option<&'static str> {
-		["WITH", "SPLIT", "GROUP", "ORDER", "FETCH", "OMIT", "TIMEOUT", "TEMPFILES"]
-			.into_iter()
-			.find(|keyword| self.at_keyword(keyword))
-	}
-
-	fn syntax(&self, message: &str, span: TextSpan) -> FerrosGrynnError {
+	pub(in crate::syn) fn syntax(&self, message: &str, span: TextSpan) -> FerrosGrynnError {
 		let error =
 			FerrosGrynnError::query_parse_error(message).with_phase(ExecutionPhase::Parsing);
 		Location::from_source(None, self.source, span)
 			.map_or(error.clone(), |location| error.with_location(location))
 	}
 
-	fn unsupported(&self, feature: &str, span: TextSpan) -> FerrosGrynnError {
+	pub(in crate::syn) fn unsupported(&self, feature: &str, span: TextSpan) -> FerrosGrynnError {
 		let error = FerrosGrynnError::query_feature_not_supported(feature)
 			.with_phase(ExecutionPhase::Parsing);
 		Location::from_source(None, self.source, span)
 			.map_or(error.clone(), |location| error.with_location(location))
 	}
 
-	fn nesting_error(&self, maximum_depth: u32, span: TextSpan) -> FerrosGrynnError {
+	pub(in crate::syn) fn nesting_error(
+		&self,
+		maximum_depth: u32,
+		span: TextSpan,
+	) -> FerrosGrynnError {
 		let error = FerrosGrynnError::query_nesting_too_deep(u64::from(maximum_depth))
 			.with_phase(ExecutionPhase::Parsing);
 		Location::from_source(None, self.source, span)

@@ -51,7 +51,11 @@ DiagnosticRecord (контекст события)
 
 ## Карта файлов
 
-- `status.rs` — код, таксономия, определения, каталог и `StatusObject`;
+- `status/code.rs` — `StatusCode` и parse/wire contract;
+- `status/taxonomy.rs` — condition, classification, domain и kind;
+- `status/definitions.rs` — единый каталог `define_status_codes!`;
+- `status/object.rs` — `StatusObject` и severity validation;
+- `status/mod.rs` — совместимый фасад и реэкспорты;
 - `formatting.rs` — formatter-маркеры и wire-значения параметров;
 - `diagnostic.rs` — severity, execution phase и source locations;
 - `error.rs` — `FerrosGrynnError`, cause и адаптеры внешних ошибок;

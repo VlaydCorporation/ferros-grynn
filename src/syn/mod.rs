@@ -1,14 +1,22 @@
 mod ast;
 mod lexer;
 mod parser;
+mod stmt;
+mod token;
 
 pub use ast::{
 	BinaryOperator,
 	Expr,
 	ExprKind,
 	Identifier,
-	LetStatement,
 	Literal,
+	ObjectField,
+	Program,
+	TypeName,
+	UnaryOperator,
+};
+pub use stmt::{
+	LetStatement,
 	MatchDirection,
 	MatchEdge,
 	MatchEndpoint,
@@ -18,8 +26,6 @@ pub use ast::{
 	MatchReturnItem,
 	MatchStatement,
 	MatchStep,
-	ObjectField,
-	Program,
 	RecordKey,
 	ReturnStatement,
 	SelectItem,
@@ -27,8 +33,6 @@ pub use ast::{
 	SelectTarget,
 	Statement,
 	StatementKind,
-	TypeName,
-	UnaryOperator,
 };
 
 use crate::{config::Config, gql_status::FerrosGrynnResult};

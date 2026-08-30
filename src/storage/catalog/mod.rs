@@ -1,0 +1,331 @@
+//! Durable database and physical-file catalog pages.
+
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	path::{Component, Path, PathBuf},
+};
+
+use super::{
+	direct::DirectFile,
+	file_registry::{DataFileRegistration, DataFileRole},
+	graph_pages::{LARGE_PROPERTY_SLOT, PropertyLocation},
+	page::{AlignedPage, PAGE_HEADER_SIZE, PAGE_SIZE, PageFlags, PageLsn, PageNo, PageType},
+	types::{DataFileId, DataFileKind, GraphId, Lsn},
+};
+use crate::{
+	datastore::{TableIndexKind, TableKind},
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	values::runtime::{
+		Type,
+		VectorKind,
+		graph::{AtomKind, GraphKind},
+	},
+};
+
+/// Catalog page and value codecs.
+mod codec;
+/// Durable catalog definitions and update plans.
+mod definitions;
+
+#[allow(
+	clippy::wildcard_imports,
+	reason = "catalog definitions share the private format codec"
+)]
+use codec::*;
+#[cfg(test)]
+use definitions::read_catalogs;
+use definitions::{CatalogKind, SchemaTypeTag};
+pub(super) use definitions::{
+	CatalogPath,
+	CatalogUpdatePages,
+	DatabaseCatalog,
+	FileCatalog,
+	FileCatalogEntry,
+	GraphCatalogEntry,
+	TableCatalogEntry,
+	TableFieldCatalogEntry,
+	TableIndexCatalogEntry,
+	encode_bootstrap_catalogs,
+	encode_catalog_update,
+	read_catalogs_with,
+};
+
+/// Trusted relative path of the format-v1 system catalog.
+pub(super) const SYSTEM_CATALOG_PATH: &str = "schema/catalog.fgb";
+/// Stable singleton identity of the system catalog file.
+pub(super) const SYSTEM_CATALOG_FILE_ID: DataFileId =
+	DataFileId::for_kind(DataFileKind::SystemCatalog);
+
+/// Catalog-page marker stored after the common page header.
+const CATALOG_PAGE_MAGIC: [u8; 4] = *b"FGC1";
+/// Catalog-page codec version.
+const CATALOG_PAGE_VERSION: u8 = 1;
+/// Catalog kind byte offset.
+const CATALOG_KIND_OFFSET: usize = PAGE_HEADER_SIZE + CATALOG_PAGE_MAGIC.len();
+/// Catalog codec-version byte offset.
+const CATALOG_VERSION_OFFSET: usize = CATALOG_KIND_OFFSET + size_of::<u8>();
+/// Reserved bytes after the catalog version.
+const CATALOG_RESERVED_A_OFFSET: usize = CATALOG_VERSION_OFFSET + size_of::<u8>();
+/// Next page in the same catalog chain.
+const CATALOG_NEXT_PAGE_OFFSET: usize = CATALOG_RESERVED_A_OFFSET + size_of::<u16>();
+/// Bytes used by this page's payload chunk.
+const CATALOG_CHUNK_LEN_OFFSET: usize = CATALOG_NEXT_PAGE_OFFSET + size_of::<u64>();
+/// Complete logical catalog length repeated on every page.
+const CATALOG_TOTAL_LEN_OFFSET: usize = CATALOG_CHUNK_LEN_OFFSET + size_of::<u32>();
+/// Reserved bytes before the payload chunk.
+const CATALOG_RESERVED_B_OFFSET: usize = CATALOG_TOTAL_LEN_OFFSET + size_of::<u32>();
+/// First byte of a catalog payload chunk.
+const CATALOG_PAYLOAD_OFFSET: usize = CATALOG_RESERVED_B_OFFSET + size_of::<u64>();
+/// Bytes available to one catalog payload chunk.
+const CATALOG_PAYLOAD_BYTES: usize = PAGE_SIZE - CATALOG_PAYLOAD_OFFSET;
+/// Maximum logical catalog accepted before allocation.
+const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+
+/// Database-catalog payload marker.
+const DATABASE_CATALOG_MAGIC: [u8; 4] = *b"FGDC";
+/// File-catalog payload marker.
+const FILE_CATALOG_MAGIC: [u8; 4] = *b"FGFC";
+/// Payload codec version shared by both catalog values.
+const CATALOG_PAYLOAD_VERSION: u16 = 3;
+/// Maximum persisted graph name in UTF-8 bytes.
+const MAX_GRAPH_NAME_BYTES: usize = 128;
+/// Maximum canonical `RecordId` text retained for a graph identity.
+const MAX_GRAPH_RECORD_ID_BYTES: usize = 4096;
+/// Bytes before the two variable UTF-8 fields in one graph entry.
+const GRAPH_CATALOG_FIXED_BYTES: usize = 112;
+/// Maximum trusted relative file path in UTF-8 bytes.
+const MAX_CATALOG_PATH_BYTES: usize = 1024;
+/// Maximum one catalog-owned schema name in UTF-8 bytes.
+const MAX_SCHEMA_NAME_BYTES: usize = 1024;
+/// Maximum recursive type nesting accepted from storage.
+const MAX_TYPE_DEPTH: usize = 64;
+/// Maximum number of members in one schema type node.
+const MAX_TYPE_MEMBERS: usize = 4096;
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		fs,
+		path::{Path, PathBuf},
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::*;
+
+	/// Unique suffix for catalog filesystem fixtures.
+	static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+	/// Exact temporary directory removed during unwind as well as success.
+	struct TestDirectory(PathBuf);
+
+	impl TestDirectory {
+		/// Creates one empty fixture directory below the current workspace.
+		fn new(label: &str) -> FerrosGrynnResult<Self> {
+			let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+			let path = std::env::current_dir()
+				.map_err(|source| test_io("resolve catalog test directory", source))?
+				.join(format!(".ferros-grynn-{label}-{}-{suffix}", std::process::id()));
+			fs::create_dir(&path)
+				.map_err(|source| test_io("create catalog test directory", source))?;
+			Ok(Self(path))
+		}
+
+		/// Returns the exact fixture path.
+		fn path(&self) -> &Path {
+			&self.0
+		}
+	}
+
+	impl Drop for TestDirectory {
+		/// Best-effort cleanup owns only the uniquely created fixture
+		/// directory.
+		fn drop(&mut self) {
+			drop(fs::remove_dir_all(&self.0));
+		}
+	}
+
+	/// Preserves one native test I/O source behind the storage status boundary.
+	fn test_io(operation: &str, source: std::io::Error) -> FerrosGrynnError {
+		FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
+	}
+
+	/// Both logical catalogs round-trip through checksummed chained pages.
+	#[test]
+	fn bootstrap_catalogs_round_trip_through_direct_file() -> FerrosGrynnResult<()> {
+		let directory = TestDirectory::new("catalog-roundtrip")?;
+		let path = directory.path().join("catalog.fgb");
+		let database = DatabaseCatalog {
+			next_graph_id: 2,
+			graphs: vec![GraphCatalogEntry {
+				graph_id: GraphId::new(1),
+				parent_graph_id: None,
+				subgraph_slot: None,
+				parent_atom: None,
+				record_id: "graph:people".to_owned(),
+				name: "people".to_owned(),
+				kind: GraphKind::Graph,
+				created_lsn: Lsn::new(3),
+				identity: [7; 16],
+				revision: 9,
+				primary_index_root: PageNo::new(4),
+				primary_index_file_id: DataFileId::for_kind(DataFileKind::Index),
+				properties: Some(PropertyLocation::Inline {
+					page_no: PageNo::new(2),
+					slot: 1,
+					length: 17,
+				}),
+			}],
+			property_keys: vec!["name".to_owned(), "tags".to_owned()],
+			tables: vec![TableCatalogEntry {
+				name: "person".to_owned(),
+				graph_id: GraphId::new(1),
+				kind: TableKind::Normal,
+				fields: vec![
+					TableFieldCatalogEntry {
+						name: "name".to_owned(),
+						value_type: Type::String,
+						property_key: 0,
+					},
+					TableFieldCatalogEntry {
+						name: "tags".to_owned(),
+						value_type: Type::Option(Box::new(Type::Array(Box::new(Type::String)))),
+						property_key: 1,
+					},
+				],
+				indexes: Vec::new(),
+			}],
+		};
+		let files = FileCatalog::bootstrap()?;
+		let encoded = encode_bootstrap_catalogs(&database, &files)?;
+		let file = DirectFile::create_new(&path)?;
+		file.write_pages(PageNo::new(0), &encoded.pages)?;
+		file.sync_data()?;
+
+		let actual = read_catalogs(&file, encoded.database_root, encoded.file_root)?;
+		assert_eq!(actual, (database, files));
+		Ok(())
+	}
+
+	/// Catalog paths reject every form that can escape or alias the DB root.
+	#[test]
+	fn catalog_path_rejects_traversal_and_windows_aliases() {
+		for invalid in [
+			"",
+			"/absolute",
+			"../escape",
+			"schema/../escape",
+			"schema\\catalog.fgb",
+			"C:/outside",
+			"schema/NUL.fgb",
+			"schema/catalog.fgb.",
+		] {
+			assert!(CatalogPath::parse(invalid).is_err(), "accepted {invalid:?}");
+		}
+		assert_eq!(
+			CatalogPath::parse(SYSTEM_CATALOG_PATH).ok().map(|path| path.as_str().to_owned()),
+			Some(SYSTEM_CATALOG_PATH.to_owned())
+		);
+	}
+
+	/// Decode validates reserved bytes after checksum validation.
+	#[test]
+	fn catalog_page_rejects_non_zero_reserved_bytes() -> FerrosGrynnResult<()> {
+		let files = FileCatalog::bootstrap()?;
+		let mut pages = encode_page_chain(
+			CatalogKind::Files,
+			PageNo::new(0),
+			PageNo::new(1),
+			&files.encode()?,
+			PageLsn::ZERO,
+		)?;
+		pages[0].1.as_bytes_mut()[CATALOG_RESERVED_B_OFFSET] = 1;
+		pages[0].1.seal()?;
+		let directory = TestDirectory::new("catalog-reserved")?;
+		let path = directory.path().join("catalog.fgb");
+		let file = DirectFile::create_new(path)?;
+		let pages = pages.into_iter().map(|(_page_no, page)| page).collect::<Vec<_>>();
+		file.write_pages(PageNo::new(0), &pages)?;
+		let mut read_page =
+			|page_no, page: &mut AlignedPage| file.read_page(page_no, page).map(|_header| ());
+		assert!(decode_page_chain(&mut read_page, PageNo::new(0), CatalogKind::Files).is_err());
+		Ok(())
+	}
+
+	/// Retaining both over-aligned roots in their page-chain vectors preserves
+	/// complete headers and checksums across the update boundary.
+	#[test]
+	fn catalog_update_root_container_preserves_aligned_pages() -> FerrosGrynnResult<()> {
+		let mut database = DatabaseCatalog::empty();
+		database.property_keys.push("name".to_owned());
+		let files = FileCatalog::bootstrap()?;
+		let update = encode_catalog_update(
+			&database,
+			&files,
+			PageNo::new(0),
+			PageNo::new(1),
+			PageNo::new(2),
+		)?;
+		for pages in [&update.database_pages, &update.file_pages] {
+			let (page_no, page) = pages
+				.first()
+				.ok_or_else(|| invalid_catalog("catalog update test root is absent"))?;
+			assert_eq!(page.validate(*page_no)?.page_type(), PageType::SchemaRoot);
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn nested_catalog_reserves_local_slot_and_rejects_root_wide_collisions() -> FerrosGrynnResult<()>
+	{
+		let root = nested_graph_entry(1, None, None)?;
+		let slot_zero = DatabaseCatalog {
+			next_graph_id: 3,
+			graphs: vec![root.clone(), nested_graph_entry(2, Some(1), Some(0))?],
+			property_keys: Vec::new(),
+			tables: Vec::new(),
+		};
+		assert!(slot_zero.encode().is_err());
+
+		let duplicate = DatabaseCatalog {
+			next_graph_id: 4,
+			graphs: vec![
+				root,
+				nested_graph_entry(2, Some(1), Some(1))?,
+				nested_graph_entry(3, Some(2), Some(1))?,
+			],
+			property_keys: Vec::new(),
+			tables: Vec::new(),
+		};
+		assert!(duplicate.encode().is_err());
+		Ok(())
+	}
+
+	fn nested_graph_entry(
+		graph_id: u64,
+		parent_graph_id: Option<u64>,
+		subgraph_slot: Option<u32>,
+	) -> FerrosGrynnResult<GraphCatalogEntry> {
+		Ok(GraphCatalogEntry {
+			graph_id: GraphId::new(graph_id),
+			parent_graph_id: parent_graph_id.map(GraphId::new),
+			subgraph_slot,
+			parent_atom: parent_graph_id
+				.map(|_| {
+					crate::values::storage::DiskAtomRef::from_parts(
+						crate::values::runtime::graph::AtomKind::Node,
+						0,
+					)
+				})
+				.transpose()?,
+			record_id: format!("graph:{graph_id}"),
+			name: format!("graph-{graph_id}"),
+			kind: GraphKind::Graph,
+			created_lsn: Lsn::new(1),
+			identity: [0; 16],
+			revision: 0,
+			primary_index_root: PageNo::new(1),
+			primary_index_file_id: DataFileId::for_kind(DataFileKind::Index),
+			properties: None,
+		})
+	}
+}

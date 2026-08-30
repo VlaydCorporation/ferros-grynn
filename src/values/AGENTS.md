@@ -55,7 +55,8 @@
 
 ## Graph surface
 
-- Корневой `ferros_grynn::graph` реэкспортирует `values::runtime::graph`.
+- Корневой `ferros_grynn::graph` владеет graph SDK; `values::runtime::graph`
+  остаётся совместимым реэкспортом.
 - `Graph<Mutable>` не помещается в `Value`; `Value::Graph` принимает только `Graph<Frozen>`.
 - Графовые значения сравниваются по `(identity, revision)`, не по содержимому или изоморфизму.
 - General graph поддерживает node/edge, edge/edge, hyper-, meta- и cross-level incidence.
