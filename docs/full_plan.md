@@ -190,9 +190,31 @@ types при необходимости расширяется общими ти
 
 3. **Закрытие Windows sync performance gate** — зависит от **1, 2**.  
    Воспроизвести регрессии sparse miss 77,5% и scan resistance 88,2%, снять ETW/flamegraph и исправить измеренный общий источник. 
-   Gate: не менее 90% raw Direct throughput, требуемые p99/hot-set/RSS показатели и отсутствие регрессии NativeAsync. В идеале обогнать или хотя бы приблизиться к mmap, усилить gate до 95/110 по throughput/p99. 
+   Gate: не менее 90% raw Direct throughput, требуемые p99/hot-set/RSS показатели и отсутствие регрессии NativeAsync.
+   Необходимо произвести калибровки, профилирование и оптимизацию Direct I/O, BufferPool и других связанных механизмов.
+   Задача обогнать или хотя бы приблизиться к mmap, хорошим результатом будет 95/110, при этом hot-set и RSS тоже должны быть на высоком уровне, а отставание от raw Direct - минимальным.
    Переписывать Clock-Pro разрешается только при доказанной причине.
-   Для профилирования по необходимости использовать allocation-tracking feature для трекинга аллокации (см. `src/memory`), cargo flamegraph, pprof и mimalloc-pprof (с feature pprof), shuttle, criterion, tracing, tokio-metrics, tokio-blocked.  
+   Замеры имеет смысл производить на файлах разных размеров. Поскольку одна страница - это 16384 байта, то есть 16 килобайт, лучше разделять тестовые файлы по количеству страниц. Например: 1, 10, 50, 130, 300, 1000, 10000, 100000, 300000 страниц.
+   Для профилирования по необходимости использовать все доступные инструменты (+ навык профилирования из `rust-engineering` и профиль сборки `profiling`):
+   - `allocation-tracking` feature для трекинга аллокации (см. `src/memory`),
+   - `cargo flamegraph`,
+   - `mimalloc-pprof` (с `pprof` feature или runtime переменной, смотри документацию),
+   - `Tracy Profiler` (исполняемые файлы Tracy доступны через `PATH` или по пути `D:/Programming/Tools/tracy-0.14.1`),
+   - `Intel VTune Profiler` (через скрипт `D:/Programming/Tools/Intel/oneAPI/setvars.bat`; тут важно, что `.bat` работает через `cmd`, поэтому, если будешь открывать его через `PowerShell`, используй скрипт: `C:\Program Files\PowerShell\7\pwsh.exe -NoExit -Command "& { cmd /c '""D:\Programming\Tools\Intel\oneAPI\setvars.bat"" intel64 vs2022 > nul && set' | ForEach-Object { $n, $v = $_ -split '=', 2; Set-Item -Path Env:$n -Value $v } }"`),
+   - `shuttle`,
+   - `criterion`,
+   - `tracing`,
+   - `tokio-metrics`, `tokio-blocked`,
+   - `sanitizers`,
+   - `Windows Performance Recorder` + `Windows Performance Analyzer`.
+
+   **Статус (2026-08-31): Windows sync gate закрыт.** Исправлена методика
+   сравнения на одном immutable-файле с парными repetition; нормативный gate,
+   bounded RSS и NativeAsync gate пройдены. Clock-Pro не переписывался, так как
+   профили не подтвердили его причиной прежней регрессии. Результаты, сравнение
+   трёх Direct-путей и mmap, разбор RSS/resident hit и процедура калибровки
+   многфайлового `buffer_pool_pages` зафиксированы в
+   [`disk_storage_stage3_report.md`](reports/disk_storage_stage3_report.md).
 
 4. **Delta-oriented mutation foundation** — зависит от **3**.  
    Убрать полную материализацию local-графа из обычного `edit_graph`; формировать atom/page delta непосредственно из point mutations. Учесть свойства, крупную adjacency, составные `RecordId` и nested graph payload в write-set limit. После профиля сохранить лимит 256 МиБ; private spill реализовывать только при подтверждённом неделимом workload, который нельзя обработать сегментированным импортом.

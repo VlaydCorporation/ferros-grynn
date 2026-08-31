@@ -1,8 +1,9 @@
 //! Native performance gate for the synchronous page source.
 //!
-//! Every backend/workload/repetition owns a fresh file written through
-//! [`DirectFile`] and closed before measurement. Backend order rotates between
-//! repetitions so mmap or buffered reads cannot warm a later Direct-I/O run.
+//! Every workload repetition owns one fresh immutable file written through
+//! [`DirectFile`] and closed before measurement. All backends read that same
+//! file, while backend order rotates between repetitions to control warm-cache
+//! and SSD-position bias.
 
 use std::{
 	collections::HashMap,
@@ -14,11 +15,16 @@ use std::{
 	mem::{size_of, size_of_val},
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
-	sync::atomic::{AtomicU64, Ordering},
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
+use parking_lot::Mutex;
+use rapidhash::{HashMapExt, RapidHashMap};
 use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 
 use super::{
@@ -126,11 +132,13 @@ const DIRTY_ATOM_CHARGE_BYTES: usize = 256;
 /// Unique suffix source for benchmark files within one process.
 static NEXT_BENCH_FILE: AtomicU64 = AtomicU64::new(0);
 
-/// Four independently measured read paths.
+/// Five independently measured read paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ReadBackend {
 	/// Direct transport only, without page validation.
 	RawDirect,
+	/// Direct transport with production page validation but without caching.
+	ValidatedDirect,
 	/// Production Direct I/O through BufferPool with full validation.
 	PooledDirect,
 	/// Ordinary cached positional file reads with full validation.
@@ -141,12 +149,14 @@ enum ReadBackend {
 
 impl ReadBackend {
 	/// Stable backend order for aggregation and reports.
-	const ALL: [Self; 4] = [Self::RawDirect, Self::PooledDirect, Self::Buffered, Self::Mmap];
+	const ALL: [Self; 5] =
+		[Self::RawDirect, Self::ValidatedDirect, Self::PooledDirect, Self::Buffered, Self::Mmap];
 
 	/// Returns a stable report and temporary-file label.
 	const fn label(self) -> &'static str {
 		match self {
 			Self::RawDirect => "raw-direct",
+			Self::ValidatedDirect => "validated-direct",
 			Self::PooledDirect => "direct-pool",
 			Self::Buffered => "buffered",
 			Self::Mmap => "mmap",
@@ -155,10 +165,28 @@ impl ReadBackend {
 }
 
 /// Rotating orders used by successive repetitions.
-const READ_BACKEND_ORDERS: [[ReadBackend; 4]; 3] = [
-	[ReadBackend::RawDirect, ReadBackend::PooledDirect, ReadBackend::Buffered, ReadBackend::Mmap],
-	[ReadBackend::Mmap, ReadBackend::RawDirect, ReadBackend::Buffered, ReadBackend::PooledDirect],
-	[ReadBackend::PooledDirect, ReadBackend::Buffered, ReadBackend::Mmap, ReadBackend::RawDirect],
+const READ_BACKEND_ORDERS: [[ReadBackend; 5]; 3] = [
+	[
+		ReadBackend::RawDirect,
+		ReadBackend::ValidatedDirect,
+		ReadBackend::Buffered,
+		ReadBackend::Mmap,
+		ReadBackend::PooledDirect,
+	],
+	[
+		ReadBackend::PooledDirect,
+		ReadBackend::RawDirect,
+		ReadBackend::Mmap,
+		ReadBackend::ValidatedDirect,
+		ReadBackend::Buffered,
+	],
+	[
+		ReadBackend::Buffered,
+		ReadBackend::PooledDirect,
+		ReadBackend::ValidatedDirect,
+		ReadBackend::Mmap,
+		ReadBackend::RawDirect,
+	],
 ];
 
 /// Independently measured durable write paths.
@@ -336,7 +364,7 @@ struct BackendResult {
 	hot_hit_ratio: Option<f64>,
 }
 
-/// Complete four-backend result for one access pattern.
+/// Complete backend result for one access pattern.
 struct ReadComparison {
 	/// Stable workload label.
 	name: &'static str,
@@ -344,6 +372,10 @@ struct ReadComparison {
 	unit: MetricUnit,
 	/// Median result for every backend.
 	backends: Vec<BackendResult>,
+	/// Median of same-repetition pool/raw throughput ratios.
+	paired_pool_raw_throughput_ratio: f64,
+	/// Median of same-repetition pool/raw p99 ratios.
+	paired_pool_raw_p99_ratio: f64,
 }
 
 impl ReadComparison {
@@ -559,6 +591,318 @@ fn disk_storage_stage2_gate() -> Result<(), Box<dyn Error>> {
 	let writes = run_durable_writes(&config)?;
 	print_report(&config, &reads, &calibration, &writes)?;
 	apply_gate(&config, &reads, &calibration, &writes)
+}
+
+/// Profiles the sparse QD1 miss path while separating validation from cache
+/// metadata.
+#[test]
+#[ignore = "native release-mode probe for sparse Direct-I/O misses"]
+fn disk_storage_stage3_sparse_probe() -> Result<(), Box<dyn Error>> {
+	let config = BenchmarkConfig::from_environment()?;
+	let workload = read_workloads(&config)?
+		.into_iter()
+		.find(|workload| workload.name == SPARSE_RANDOM_WORKLOAD)
+		.ok_or_else(|| io::Error::other("sparse benchmark workload is missing"))?;
+	let comparison = run_read_workload(&config, &workload, 0)?;
+	let raw = comparison.backend(ReadBackend::RawDirect)?.metrics;
+	let validated = comparison.backend(ReadBackend::ValidatedDirect)?.metrics;
+	let pooled = comparison.backend(ReadBackend::PooledDirect)?.metrics;
+	println!(
+		"stage3_sparse_probe dataset_pages={} pool_pages={} repetitions={} raw_mib_s={:.2} \
+		 validated_mib_s={:.2} pooled_mib_s={:.2} validated_raw_ratio={:.4} \
+		 pooled_validated_ratio={:.4} pooled_raw_ratio={:.4} pooled_raw_p99_ratio={:.4} \
+		 paired_pooled_raw_ratio={:.4} paired_pooled_raw_p99_ratio={:.4}",
+		config.dataset_pages,
+		config.pool_pages,
+		config.repetitions,
+		raw.throughput_mib_per_second(),
+		validated.throughput_mib_per_second(),
+		pooled.throughput_mib_per_second(),
+		throughput_ratio(validated, raw),
+		throughput_ratio(pooled, validated),
+		throughput_ratio(pooled, raw),
+		latency_ratio(pooled.p99, raw.p99),
+		comparison.paired_pool_raw_throughput_ratio,
+		comparison.paired_pool_raw_p99_ratio,
+	);
+	Ok(())
+}
+
+/// Profiles the fully resident scalar hit path against a warmed mapping.
+#[test]
+#[ignore = "native release-mode probe for resident page-cache hits"]
+fn disk_storage_stage3_resident_probe() -> Result<(), Box<dyn Error>> {
+	let config = BenchmarkConfig::from_environment()?;
+	let workload = read_workloads(&config)?
+		.into_iter()
+		.find(|workload| workload.name == RESIDENT_WORKLOAD)
+		.ok_or_else(|| io::Error::other("resident benchmark workload is missing"))?;
+	let comparison = run_read_workload(&config, &workload, 0)?;
+	let pooled = comparison.backend(ReadBackend::PooledDirect)?.metrics;
+	let mapped = comparison.backend(ReadBackend::Mmap)?.metrics;
+	println!(
+		"stage3_resident_probe pool_pages={} repetitions={} pooled_ops_s={:.0} mmap_ops_s={:.0} \
+		 pooled_mmap_ratio={:.4} pooled_p99_us={:.3} mmap_p99_us={:.3}",
+		config.pool_pages,
+		config.repetitions,
+		pooled.operations_per_second(),
+		mapped.operations_per_second(),
+		pooled.operations_per_second() / mapped.operations_per_second(),
+		pooled.p99_micros(),
+		mapped.p99_micros(),
+	);
+	Ok(())
+}
+
+/// Compares the current cache index with compact ordered and dense lookup
+/// candidates on the real cache key, including replacement churn.
+#[test]
+#[ignore = "native release-mode probe for buffer-pool cache-index layout"]
+fn disk_storage_stage3_cache_index_probe() -> Result<(), Box<dyn Error>> {
+	const LOOKUP_SAMPLES: usize = 5;
+	const MIN_LOOKUPS: usize = 1_000_000;
+	const CHURN_OPERATIONS: usize = 32_768;
+
+	fn rank(key: PageCacheKey) -> (PageKey, PageCacheVersion) {
+		(key.page_key(), key.version())
+	}
+
+	fn keys(entry_count: usize, file_count: usize) -> io::Result<Vec<PageCacheKey>> {
+		let file_ids = (0..file_count)
+			.map(|index| {
+				let instance = u64::try_from(index + 1).map_err(|source| {
+					conversion_error("cache-index file id does not fit u64", source)
+				})?;
+				DataFileId::new(instance, DataFileKind::Index)
+					.ok_or_else(|| io::Error::other("cache-index file id is outside format-v1"))
+			})
+			.collect::<io::Result<Vec<_>>>()?;
+		(0..entry_count)
+			.map(|index| {
+				let page_no = u64::try_from(index / file_count).map_err(|source| {
+					conversion_error("cache-index page number does not fit u64", source)
+				})?;
+				Ok(PageCacheKey::new(
+					PageKey::new(
+						GraphId::SYSTEM,
+						file_ids[index % file_count],
+						PageNo::new(page_no),
+					),
+					PageCacheVersion::Home {
+						generation: CheckpointGeneration::new(1),
+						ceiling: Lsn::new(1),
+					},
+				))
+			})
+			.collect()
+	}
+
+	fn lookup_order(entries: &[PageCacheKey]) -> io::Result<Vec<PageCacheKey>> {
+		let page_count = u64::try_from(entries.len()).map_err(|source| {
+			conversion_error("cache-index entry count does not fit u64", source)
+		})?;
+		random_order(page_count)?
+			.into_iter()
+			.map(|page_no| {
+				let index = usize::try_from(page_no.get()).map_err(|source| {
+					conversion_error("cache-index lookup index does not fit usize", source)
+				})?;
+				entries
+					.get(index)
+					.copied()
+					.ok_or_else(|| io::Error::other("cache-index lookup index is outside entries"))
+			})
+			.collect()
+	}
+
+	fn median_lookup_ns(
+		order: &[PageCacheKey],
+		mut lookup: impl FnMut(PageCacheKey) -> Option<usize>,
+	) -> io::Result<f64> {
+		if order.is_empty() {
+			return Err(io::Error::other("cache-index lookup order must not be empty"));
+		}
+		let rounds = MIN_LOOKUPS.div_ceil(order.len());
+		let operations = rounds
+			.checked_mul(order.len())
+			.ok_or_else(|| io::Error::other("cache-index lookup count overflow"))?;
+		let operations = u32::try_from(operations).map_err(|source| {
+			conversion_error("cache-index lookup count does not fit u32", source)
+		})?;
+		let mut samples = [0.0; LOOKUP_SAMPLES];
+		for sample in &mut samples {
+			for key in order.iter().copied() {
+				black_box(lookup(black_box(key)));
+			}
+			let started = Instant::now();
+			for _ in 0..rounds {
+				for key in order.iter().copied() {
+					black_box(lookup(black_box(key)));
+				}
+			}
+			*sample = started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(operations);
+		}
+		samples.sort_unstable_by(f64::total_cmp);
+		Ok(samples[LOOKUP_SAMPLES / 2])
+	}
+
+	println!("cache_index_probe key_bytes={}", size_of::<PageCacheKey>());
+	for entry_count in [64, 1_024, 4_096] {
+		for file_count in [1, 8] {
+			let entries = keys(entry_count, file_count)?;
+			let order = lookup_order(&entries)?;
+
+			let mut hash = RapidHashMap::with_capacity(entry_count);
+			hash.extend(entries.iter().copied().zip(0..entry_count));
+			let hash = Mutex::new(hash);
+			let hash_ns = median_lookup_ns(&order, |key| hash.lock().get(&key).copied())?;
+
+			let mut ordered = entries.iter().copied().zip(0..entry_count).collect::<Vec<_>>();
+			ordered.sort_unstable_by_key(|(key, _)| rank(*key));
+			let ordered = Mutex::new(ordered);
+			let ordered_ns = median_lookup_ns(&order, |key| {
+				let entries = ordered.lock();
+				if entries.len() <= 64 {
+					entries.iter().find(|(candidate, _)| *candidate == key).map(|(_, value)| *value)
+				} else {
+					entries
+						.binary_search_by_key(&rank(key), |(candidate, _)| rank(*candidate))
+						.ok()
+						.map(|index| entries[index].1)
+				}
+			})?;
+
+			let dense_ns = if file_count == 1 {
+				let dense = entries
+					.iter()
+					.copied()
+					.enumerate()
+					.map(|(frame, key)| (key.version(), frame))
+					.collect::<Vec<_>>();
+				let dense = Mutex::new(dense);
+				Some(median_lookup_ns(&order, |key| {
+					let index = usize::try_from(key.page_no().get()).ok()?;
+					dense
+						.lock()
+						.get(index)
+						.filter(|(version, _)| *version == key.version())
+						.map(|(_, frame)| *frame)
+				})?)
+			} else {
+				None
+			};
+
+			println!(
+				"cache_index_probe entries={entry_count} files={file_count} hash_ns={hash_ns:.2} \
+				 ordered_ns={ordered_ns:.2} dense_one_source_ns={dense_ns:?}"
+			);
+		}
+	}
+
+	let initial = keys(4_096, 1)?;
+	let replacements =
+		keys(4_096 + CHURN_OPERATIONS, 1)?.into_iter().skip(4_096).collect::<Vec<_>>();
+	let mut active = initial.clone();
+	let mut hash = RapidHashMap::with_capacity(initial.len());
+	hash.extend(initial.iter().copied().zip(0..initial.len()));
+	let hash = Mutex::new(hash);
+	let started = Instant::now();
+	for (operation, replacement) in replacements.iter().copied().enumerate() {
+		let slot = operation % active.len();
+		let old = std::mem::replace(&mut active[slot], replacement);
+		let mut entries = hash.lock();
+		black_box(entries.remove(&old));
+		black_box(entries.insert(replacement, slot));
+	}
+	let churn_operations = u32::try_from(CHURN_OPERATIONS)
+		.map_err(|source| conversion_error("cache-index churn count does not fit u32", source))?;
+	let hash_churn_ns =
+		started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(churn_operations);
+
+	let mut active = initial.clone();
+	let mut ordered = initial.iter().copied().zip(0..initial.len()).collect::<Vec<_>>();
+	ordered.sort_unstable_by_key(|(key, _)| rank(*key));
+	let ordered = Mutex::new(ordered);
+	let started = Instant::now();
+	for (operation, replacement) in replacements.iter().copied().enumerate() {
+		let slot = operation % active.len();
+		let old = std::mem::replace(&mut active[slot], replacement);
+		let mut entries = ordered.lock();
+		let Ok(old_index) =
+			entries.binary_search_by_key(&rank(old), |(candidate, _)| rank(*candidate))
+		else {
+			return Err(io::Error::other("ordered cache-index churn lost an active key").into());
+		};
+		black_box(entries.remove(old_index));
+		let Err(insertion) =
+			entries.binary_search_by_key(&rank(replacement), |(candidate, _)| rank(*candidate))
+		else {
+			return Err(io::Error::other(
+				"ordered cache-index churn generated a duplicate replacement key",
+			)
+			.into());
+		};
+		entries.insert(insertion, (replacement, slot));
+	}
+	let ordered_churn_ns =
+		started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(churn_operations);
+	println!(
+		"cache_index_probe churn_entries=4096 hash_ns={hash_churn_ns:.2} \
+		 ordered_ns={ordered_churn_ns:.2}"
+	);
+
+	let entries = keys(4_096, 1)?;
+	let order = lookup_order(&entries)?;
+	let pages = (0..entries.len())
+		.map(|index| {
+			let mut page = AlignedPage::zeroed();
+			page.as_bytes_mut()[PAGE_HEADER_SIZE] = index.to_le_bytes()[0];
+			Arc::new(Box::new(page))
+		})
+		.collect::<Vec<_>>();
+	let mut hash = RapidHashMap::with_capacity(entries.len());
+	hash.extend(entries.iter().copied().zip(0..entries.len()));
+	let hash = Mutex::new(hash);
+	let hash_payload_ns = median_lookup_ns(&order, |key| {
+		let frame = hash.lock().get(&key).copied()?;
+		let page = Arc::clone(pages.get(frame)?);
+		Some(usize::from(page.as_bytes()[PAGE_HEADER_SIZE]))
+	})?;
+	let mut ordered = entries.iter().copied().zip(0..entries.len()).collect::<Vec<_>>();
+	ordered.sort_unstable_by_key(|(key, _)| rank(*key));
+	let ordered = Mutex::new(ordered);
+	let ordered_payload_ns = median_lookup_ns(&order, |key| {
+		let entries = ordered.lock();
+		let frame = entries
+			.binary_search_by_key(&rank(key), |(candidate, _)| rank(*candidate))
+			.ok()
+			.map(|index| entries[index].1)?;
+		let page = Arc::clone(pages.get(frame)?);
+		Some(usize::from(page.as_bytes()[PAGE_HEADER_SIZE]))
+	})?;
+	let dense = Mutex::new(
+		entries
+			.iter()
+			.copied()
+			.enumerate()
+			.map(|(frame, key)| (key.version(), frame))
+			.collect::<Vec<_>>(),
+	);
+	let dense_payload_ns = median_lookup_ns(&order, |key| {
+		let index = usize::try_from(key.page_no().get()).ok()?;
+		let frame = dense
+			.lock()
+			.get(index)
+			.filter(|(version, _)| *version == key.version())
+			.map(|(_, frame)| *frame)?;
+		let page = Arc::clone(pages.get(frame)?);
+		Some(usize::from(page.as_bytes()[PAGE_HEADER_SIZE]))
+	})?;
+	println!(
+		"cache_index_probe payload_entries=4096 hash_ns={hash_payload_ns:.2} \
+		 ordered_ns={ordered_payload_ns:.2} dense_one_source_ns={dense_payload_ns:.2}"
+	);
+	Ok(())
 }
 
 /// Profiles only the comparable sequential batch paths with the normal
@@ -861,7 +1205,7 @@ fn read_workloads(config: &BenchmarkConfig) -> Result<Vec<ReadWorkload>, Box<dyn
 	])
 }
 
-/// Measures every backend with a fresh file and rotating order.
+/// Measures every backend against the same immutable file with rotating order.
 fn run_read_workload(
 	config: &BenchmarkConfig,
 	workload: &ReadWorkload,
@@ -869,12 +1213,16 @@ fn run_read_workload(
 ) -> Result<ReadComparison, Box<dyn Error>> {
 	let mut samples = HashMap::<ReadBackend, Vec<ReadSample>>::new();
 	for repetition in 0..config.repetitions {
+		let path = BenchPath::new("shared-read")?;
+		create_dataset(path.as_path(), workload.page_count)?;
 		let order = READ_BACKEND_ORDERS[(repetition + ordinal) % READ_BACKEND_ORDERS.len()];
 		for backend in order {
-			let sample = measure_fresh_read(config, workload, backend)?;
+			let sample = measure_read(config, workload, backend, path.as_path())?;
 			samples.entry(backend).or_default().push(sample);
 		}
 	}
+	let (paired_pool_raw_throughput_ratio, paired_pool_raw_p99_ratio) =
+		paired_pool_raw_ratios(&samples)?;
 
 	let mut backends = Vec::with_capacity(ReadBackend::ALL.len());
 	for backend in ReadBackend::ALL {
@@ -887,24 +1235,53 @@ fn run_read_workload(
 		name: workload.name,
 		unit: workload.unit,
 		backends,
+		paired_pool_raw_throughput_ratio,
+		paired_pool_raw_p99_ratio,
 	})
 }
 
-/// Creates and measures one isolated backend file.
-fn measure_fresh_read(
+/// Returns medians of pool/raw ratios while preserving repetition pairing.
+fn paired_pool_raw_ratios(
+	samples: &HashMap<ReadBackend, Vec<ReadSample>>,
+) -> io::Result<(f64, f64)> {
+	let raw = samples
+		.get(&ReadBackend::RawDirect)
+		.ok_or_else(|| io::Error::other("missing raw Direct samples for pairing"))?;
+	let pooled = samples
+		.get(&ReadBackend::PooledDirect)
+		.ok_or_else(|| io::Error::other("missing pooled Direct samples for pairing"))?;
+	if raw.len() != pooled.len() || raw.is_empty() {
+		return Err(io::Error::other("raw and pooled Direct samples cannot be paired"));
+	}
+	let mut throughput = raw
+		.iter()
+		.zip(pooled)
+		.map(|(raw, pooled)| throughput_ratio(pooled.metrics, raw.metrics))
+		.collect::<Vec<_>>();
+	let mut p99 = raw
+		.iter()
+		.zip(pooled)
+		.map(|(raw, pooled)| latency_ratio(pooled.metrics.p99, raw.metrics.p99))
+		.collect::<Vec<_>>();
+	throughput.sort_unstable_by(f64::total_cmp);
+	p99.sort_unstable_by(f64::total_cmp);
+	Ok((throughput[throughput.len() / 2], p99[p99.len() / 2]))
+}
+
+/// Measures one backend against an already-created immutable dataset.
+fn measure_read(
 	config: &BenchmarkConfig,
 	workload: &ReadWorkload,
 	backend: ReadBackend,
+	path: &Path,
 ) -> Result<ReadSample, Box<dyn Error>> {
-	let path = BenchPath::new(backend.label())?;
-	create_dataset(path.as_path(), workload.page_count)?;
 	let extent_pages = workload.extent_pages.get();
 	let source_id = DataFileId::new(1, DataFileKind::SystemCatalog)
 		.ok_or_else(|| io::Error::other("benchmark source identity is invalid"))?;
 
 	match backend {
 		ReadBackend::RawDirect => {
-			let direct = DirectFile::open_read_only(path.as_path())?;
+			let direct = DirectFile::open_read_only(path)?;
 			let mut scratch = aligned_pages(extent_pages);
 			consume_raw_direct(&direct, &workload.preload, extent_pages, &mut scratch)?;
 			let metrics = measure_order(&workload.order, extent_pages, workload.unit, |pages| {
@@ -916,8 +1293,21 @@ fn measure_fresh_read(
 				hot_hits: 0,
 			})
 		}
+		ReadBackend::ValidatedDirect => {
+			let direct = DirectFile::open_read_only(path)?;
+			let mut scratch = aligned_pages(extent_pages);
+			consume_validated_direct(&direct, &workload.preload, extent_pages, &mut scratch)?;
+			let metrics = measure_order(&workload.order, extent_pages, workload.unit, |pages| {
+				read_validated_direct_extent(&direct, pages, &mut scratch)
+			})?;
+			Ok(ReadSample {
+				metrics,
+				rss_delta: 0,
+				hot_hits: 0,
+			})
+		}
 		ReadBackend::PooledDirect => {
-			let direct = DirectFile::open_read_only(path.as_path())?;
+			let direct = DirectFile::open_read_only(path)?;
 			let rss_before = process_rss()?;
 			let pool = BufferPool::new(config.pool_pages);
 			let mut page_scratch = aligned_pages(extent_pages);
@@ -959,7 +1349,7 @@ fn measure_fresh_read(
 			})
 		}
 		ReadBackend::Buffered => {
-			let source = BufferedPageSource::open(path.as_path(), workload.page_count)?;
+			let source = BufferedPageSource::open(path, workload.page_count)?;
 			let mut scratch = aligned_pages(extent_pages);
 			consume_buffered(&source, &workload.preload, extent_pages, &mut scratch)?;
 			let metrics = measure_order(&workload.order, extent_pages, workload.unit, |pages| {
@@ -973,7 +1363,7 @@ fn measure_fresh_read(
 		}
 		ReadBackend::Mmap => {
 			let rss_before = process_rss()?;
-			let mut source = MmapPageSource::open(path.as_path(), workload.page_count)?;
+			let mut source = MmapPageSource::open(path, workload.page_count)?;
 			consume_mmap(&mut source, &workload.preload, extent_pages)?;
 			let metrics = measure_order(&workload.order, extent_pages, workload.unit, |pages| {
 				for page_no in pages.iter().copied() {
@@ -1058,6 +1448,44 @@ fn read_raw_direct_extent(
 	Ok(())
 }
 
+/// Preloads validated Direct pages without including them in measured latency.
+fn consume_validated_direct(
+	direct: &DirectFile,
+	order: &[PageNo],
+	extent_pages: usize,
+	scratch: &mut [AlignedPage],
+) -> Result<(), Box<dyn Error>> {
+	for pages in order.chunks(extent_pages) {
+		read_validated_direct_extent(direct, pages, scratch)?;
+	}
+	Ok(())
+}
+
+/// Reads and validates one Direct extent without BufferPool metadata or copies.
+fn read_validated_direct_extent(
+	direct: &DirectFile,
+	pages: &[PageNo],
+	scratch: &mut [AlignedPage],
+) -> Result<(), Box<dyn Error>> {
+	let first = first_contiguous_page(pages, direct.page_count())?;
+	let output = scratch
+		.get_mut(..pages.len())
+		.ok_or_else(|| io::Error::other("validated Direct scratch space is too small"))?;
+	if pages.len() == 1 {
+		let header = direct.read_page(first, &mut output[0])?;
+		validate_benchmark_version(first, header.page_lsn())?;
+		black_box(output[0].as_bytes()[PAGE_HEADER_SIZE]);
+		return Ok(());
+	}
+	direct.read_pages_raw(first, output)?;
+	for (page_no, page) in pages.iter().copied().zip(output) {
+		let header = page.validate(page_no)?;
+		validate_benchmark_version(page_no, header.page_lsn())?;
+		black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+	}
+	Ok(())
+}
+
 /// Preloads production pages without timing them.
 fn consume_pool(
 	pool: &BufferPool,
@@ -1085,7 +1513,7 @@ fn read_pool_extent(
 ) -> Result<(), Box<dyn Error>> {
 	if pages.len() == 1 {
 		let page_no = pages[0];
-		let key = benchmark_key(source_id, page_no)?;
+		let key = benchmark_key(source_id, page_no);
 		let guard = pool.get_or_load(key, |page| direct.read_page(page_no, page))?;
 		black_box(guard.as_bytes()[PAGE_HEADER_SIZE]);
 		return Ok(());
@@ -1093,7 +1521,7 @@ fn read_pool_extent(
 	first_contiguous_page(pages, direct.page_count())?;
 	key_scratch.clear();
 	for page_no in pages.iter().copied() {
-		key_scratch.push(benchmark_key(source_id, page_no)?);
+		key_scratch.push(benchmark_key(source_id, page_no));
 	}
 	let guards = pool.get_or_load_batch(key_scratch, page_scratch, |first, output| {
 		if first.graph_id() != GraphId::SYSTEM || first.file_id() != source_id {
@@ -1461,14 +1889,11 @@ fn benchmark_page(page_no: PageNo) -> Result<AlignedPage, Box<dyn Error>> {
 }
 
 /// Creates the exact cache key encoded by a benchmark page.
-fn benchmark_key(source_id: DataFileId, page_no: PageNo) -> FerrosGrynnResult<PageCacheKey> {
-	Ok(PageCacheKey::new(
-		PageKey::new(GraphId::SYSTEM, source_id, page_no),
-		PageCacheVersion::Home {
-			generation: CheckpointGeneration::ZERO,
-			ceiling: Lsn::new(u64::MAX),
-		},
-	))
+fn benchmark_key(source_id: DataFileId, page_no: PageNo) -> PageCacheKey {
+	PageCacheKey::new(PageKey::new(GraphId::SYSTEM, source_id, page_no), PageCacheVersion::Home {
+		generation: CheckpointGeneration::ZERO,
+		ceiling: Lsn::new(u64::MAX),
+	})
 }
 
 /// Returns the deterministic non-zero LSN for one benchmark page.
@@ -1708,6 +2133,12 @@ fn print_report(
 		if let Some(hit_ratio) = comparison.backend(ReadBackend::PooledDirect)?.hot_hit_ratio {
 			println!("scan_hot_hit_ratio={hit_ratio:.5}");
 		}
+		println!(
+			"paired_pool_raw workload={:?} throughput_ratio={:.5} p99_ratio={:.5}",
+			comparison.name,
+			comparison.paired_pool_raw_throughput_ratio,
+			comparison.paired_pool_raw_p99_ratio,
+		);
 	}
 	println!("| batch KiB | raw Direct MiB/s | p99 us |");
 	println!("|---:|---:|---:|");
@@ -1754,12 +2185,10 @@ fn apply_gate(
 	}
 	let mut failures = Vec::new();
 	let sparse = comparison(reads, SPARSE_RANDOM_WORKLOAD)?;
-	let raw_sparse = sparse.backend(ReadBackend::RawDirect)?.metrics;
-	let pool_sparse = sparse.backend(ReadBackend::PooledDirect)?.metrics;
-	if throughput_ratio(pool_sparse, raw_sparse) < MIN_RAW_DIRECT_RATIO {
+	if sparse.paired_pool_raw_throughput_ratio < MIN_RAW_DIRECT_RATIO {
 		failures.push("single-page miss throughput/raw Direct");
 	}
-	if latency_ratio(pool_sparse.p99, raw_sparse.p99) > MAX_RAW_DIRECT_P99_RATIO {
+	if sparse.paired_pool_raw_p99_ratio > MAX_RAW_DIRECT_P99_RATIO {
 		failures.push("single-page miss p99/raw Direct");
 	}
 
@@ -1779,11 +2208,10 @@ fn apply_gate(
 
 	let scan = comparison(reads, SCAN_HOT_WORKLOAD)?;
 	let pool_scan = scan.backend(ReadBackend::PooledDirect)?;
-	let raw_scan = scan.backend(ReadBackend::RawDirect)?;
 	if pool_scan.hot_hit_ratio.unwrap_or(0.0) < MIN_SCAN_HIT_RATIO {
 		failures.push("scan hot-set hit ratio");
 	}
-	if throughput_ratio(pool_scan.metrics, raw_scan.metrics) < MIN_RAW_DIRECT_RATIO {
+	if scan.paired_pool_raw_throughput_ratio < MIN_RAW_DIRECT_RATIO {
 		failures.push("scan-resistant throughput/raw batched Direct");
 	}
 
@@ -2038,6 +2466,30 @@ mod tests {
 			write_position_sum(WriteBackend::Direct),
 			write_position_sum(WriteBackend::Mmap)
 		);
+	}
+
+	#[test]
+	fn direct_ratios_keep_same_repetition_pairs() -> io::Result<()> {
+		let sample = |elapsed_micros, p99_micros| ReadSample {
+			metrics: Metrics {
+				operations: 1,
+				useful_bytes: 1,
+				elapsed: Duration::from_micros(elapsed_micros),
+				p50: Duration::ZERO,
+				p95: Duration::ZERO,
+				p99: Duration::from_micros(p99_micros),
+			},
+			rss_delta: 0,
+			hot_hits: 0,
+		};
+		let samples = HashMap::from([
+			(ReadBackend::RawDirect, vec![sample(10, 10), sample(100, 100), sample(1_000, 1_000)]),
+			(ReadBackend::PooledDirect, vec![sample(20, 20), sample(50, 50), sample(1_000, 1_000)]),
+		]);
+		let (throughput, p99) = paired_pool_raw_ratios(&samples)?;
+		assert!((throughput - 1.0).abs() < f64::EPSILON);
+		assert!((p99 - 1.0).abs() < f64::EPSILON);
+		Ok(())
 	}
 
 	#[test]

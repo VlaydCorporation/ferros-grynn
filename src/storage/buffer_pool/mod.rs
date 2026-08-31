@@ -767,6 +767,38 @@ mod tests {
 	}
 
 	#[test]
+	fn keys_from_different_files_share_capacity_without_aliasing() -> Result<(), Box<dyn Error>> {
+		let first_file = DataFileId::new(1, DataFileKind::Index)
+			.ok_or_else(|| io::Error::other("invalid first cache test file id"))?;
+		let second_file = DataFileId::new(2, DataFileKind::Index)
+			.ok_or_else(|| io::Error::other("invalid second cache test file id"))?;
+		let page_no = PageNo::new(7);
+		let version = PageCacheVersion::Wal(PageLsn::new(11));
+		let first_key =
+			PageCacheKey::new(PageKey::new(GraphId::SYSTEM, first_file, page_no), version);
+		let second_key =
+			PageCacheKey::new(PageKey::new(GraphId::SYSTEM, second_file, page_no), version);
+		let pool = BufferPool::new(capacity(2)?);
+
+		drop(pool.get_or_load(first_key, |page| load_test_page(page, first_key, 1))?);
+		drop(pool.get_or_load(second_key, |page| load_test_page(page, second_key, 2))?);
+		let first = pool.get_or_load(first_key, |_page| {
+			Err(FerrosGrynnError::storage_io_failure("first resident loader was called"))
+		})?;
+		let second = pool.get_or_load(second_key, |_page| {
+			Err(FerrosGrynnError::storage_io_failure("second resident loader was called"))
+		})?;
+
+		assert_eq!(first.as_bytes()[PAGE_HEADER_SIZE], 1);
+		assert_eq!(second.as_bytes()[PAGE_HEADER_SIZE], 2);
+		assert!(!std::ptr::eq(first.as_bytes(), second.as_bytes()));
+		assert_eq!(pool.frame_count(), 2);
+		assert_eq!(pool.stats().hits(), 2);
+		assert_eq!(pool.stats().misses(), 2);
+		Ok(())
+	}
+
+	#[test]
 	fn concurrent_miss_coalesces_without_holding_metadata_lock() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(capacity(2)?);
 		let hot_key = key(0, 1);

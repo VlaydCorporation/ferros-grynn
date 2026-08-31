@@ -10,8 +10,19 @@ use rust_decimal::Decimal;
 
 use super::{consts::DEFAULT_MAX_WRITE_SET_BYTES, *};
 use crate::values::runtime::{
-	Array, Bytes, DateTime, Duration as ValueDuration, Geometry, Object, Position, Range, Set,
-	Type, Ulid, Value, Vector,
+	Array,
+	Bytes,
+	DateTime,
+	Duration as ValueDuration,
+	Geometry,
+	Object,
+	Position,
+	Range,
+	Set,
+	Type,
+	Ulid,
+	Value,
+	Vector,
 	graph::{EdgeTopology, GraphMut, QualifiedAtomId, query_to_memory},
 };
 
@@ -85,12 +96,10 @@ fn seeded_table() -> (Datastore, GraphRef, AtomId) {
 	let mut tx = store.begin();
 	let reference = tx.create_graph(graph_id("people"), graph.freeze().into()).unwrap();
 	tx.define_table(
-		TableSchema::new(
-			"person",
-			reference.clone(),
-			TableKind::Normal,
-			[TableField::new("name", Type::String), TableField::new("age", Type::Int)],
-		)
+		TableSchema::new("person", reference.clone(), TableKind::Normal, [
+			TableField::new("name", Type::String),
+			TableField::new("age", Type::Int),
+		])
 		.unwrap(),
 	)
 	.unwrap();
@@ -220,12 +229,10 @@ fn local_graph_table_and_edge_survive_reopen() {
 	assert_eq!(reference.storage_mode(), GraphStorageMode::DiskBacked);
 	transaction
 		.define_table(
-			TableSchema::new(
-				"person",
-				reference,
-				TableKind::Normal,
-				[TableField::new("name", Type::String), TableField::new("age", Type::Int)],
-			)
+			TableSchema::new("person", reference, TableKind::Normal, [
+				TableField::new("name", Type::String),
+				TableField::new("age", Type::Int),
+			])
 			.unwrap()
 			.with_index(TableIndex::new("person_age", TableIndexKind::Standard, ["age"]).unwrap())
 			.unwrap()
@@ -527,12 +534,10 @@ fn local_unique_index_violation_rolls_back_publication() {
 	let reference = create.create_graph(graph_id("duplicates"), graph.freeze().into()).unwrap();
 	create
 		.define_table(
-			TableSchema::new(
-				"person",
-				reference.clone(),
-				TableKind::Normal,
-				[TableField::new("email", Type::String)],
-			)
+			TableSchema::new("person", reference.clone(), TableKind::Normal, [TableField::new(
+				"email",
+				Type::String,
+			)])
 			.unwrap()
 			.with_index(TableIndex::new("person_email", TableIndexKind::Unique, ["email"]).unwrap())
 			.unwrap(),
@@ -594,13 +599,10 @@ fn local_point_mutations_survive_reopen() {
 	mutation.set_property(&alpha, transient, Value::from(true)).unwrap();
 	assert_eq!(mutation.remove_property(&alpha, transient).unwrap(), Some(Value::from(true)));
 	mutation
-		.replace_incidence(
-			&edge,
-			&AtomRefTopology::Directed {
-				source: vec![alpha.clone()],
-				target: vec![gamma.clone()],
-			},
-		)
+		.replace_incidence(&edge, &AtomRefTopology::Directed {
+			source: vec![alpha.clone()],
+			target: vec![gamma.clone()],
+		})
 		.unwrap();
 	mutation.remove_atom(&beta).unwrap();
 	drop(mutation);
