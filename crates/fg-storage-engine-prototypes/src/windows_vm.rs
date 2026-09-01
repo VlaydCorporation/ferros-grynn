@@ -11,6 +11,13 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use ferros_grynn::{
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	storage_engine_prototype_api::{
+		buffer_pool::{PageCacheKey, PageCacheVersion, validate_loaded_header},
+		page::{AlignedPage, PAGE_SIZE, PageHeader},
+	},
+};
 use parking_lot::{Condvar, Mutex};
 use rapidhash::{HashMapExt, RapidHashMap};
 use windows::Win32::System::Memory::{
@@ -28,13 +35,6 @@ use super::{
 	SourceEpoch,
 	SourceIdentity,
 	atomic_arena::{AtomicArenaBufferPool, AtomicPageGuard, ResolvedFrameHandle},
-};
-use crate::{
-	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	storage::{
-		buffer_pool::{PageCacheKey, PageCacheVersion, validate_loaded_header},
-		page::{AlignedPage, PAGE_SIZE, PageHeader},
-	},
 };
 
 /// Number of complete home-frame clock scans before applying backpressure.
@@ -1697,7 +1697,7 @@ fn pin_exhausted(key: PageCacheKey) -> FerrosGrynnError {
 
 /// Preserves a native memory error behind a project storage error.
 fn windows_failure(operation: &'static str, source: windows::core::Error) -> FerrosGrynnError {
-	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
+	ferros_grynn::storage_engine_prototype_api::storage_io_failure_with_source(operation, source)
 }
 
 #[cfg(test)]
@@ -1719,15 +1719,16 @@ mod tests {
 		time::Duration,
 	};
 
-	use super::{HomeSourceSpec, VmCache, VmReservation, probe_vm_lifecycle};
-	use crate::{
+	use ferros_grynn::{
 		gql_status::{FerrosGrynnError, FerrosGrynnResult},
-		storage::{
+		storage_engine_prototype_api::{
 			buffer_pool::{PageCacheKey, PageCacheVersion},
 			page::{AlignedPage, PageFlags, PageHeader, PageLsn, PageNo, PageType},
 			types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
 		},
 	};
+
+	use super::{HomeSourceSpec, VmCache, VmReservation, probe_vm_lifecycle};
 
 	/// Creates one exact home key for deterministic VM tests.
 	fn home_key(
@@ -1813,7 +1814,10 @@ mod tests {
 		assert!(cache.get_resolved(&old_handle)?.is_none());
 		let reloaded = cache.get_or_load(key0, |page| load(key0, page))?;
 		assert_eq!(old_address, reloaded.as_page() as *const AlignedPage as usize);
-		assert_eq!(cache.committed_bytes(), crate::storage::page::PAGE_SIZE);
+		assert_eq!(
+			cache.committed_bytes(),
+			ferros_grynn::storage_engine_prototype_api::page::PAGE_SIZE
+		);
 		Ok(())
 	}
 
@@ -2082,7 +2086,10 @@ mod tests {
 		});
 		let first_error = first.err().ok_or("injected rollback failure unexpectedly succeeded")?;
 		assert!(first_error.to_string().contains("remains quarantined"));
-		assert_eq!(cache.committed_bytes(), crate::storage::page::PAGE_SIZE);
+		assert_eq!(
+			cache.committed_bytes(),
+			ferros_grynn::storage_engine_prototype_api::page::PAGE_SIZE
+		);
 		assert_eq!(
 			super::lifecycle(cache.sources[0].metadata[0].state.load(Ordering::Acquire)),
 			super::VmLifecycle::Evicting
@@ -2099,14 +2106,20 @@ mod tests {
 			retry.err().ok_or("quarantined cleanup failure unexpectedly succeeded")?;
 		assert!(retry_error.to_string().contains("quarantined home-page cleanup retry failed"));
 		assert_eq!(loader_calls.load(Ordering::Relaxed), 0);
-		assert_eq!(cache.committed_bytes(), crate::storage::page::PAGE_SIZE);
+		assert_eq!(
+			cache.committed_bytes(),
+			ferros_grynn::storage_engine_prototype_api::page::PAGE_SIZE
+		);
 
 		drop(cache.get_or_load(key, |page| {
 			loader_calls.fetch_add(1, Ordering::Relaxed);
 			load(key, page)
 		})?);
 		assert_eq!(loader_calls.load(Ordering::Relaxed), 1);
-		assert_eq!(cache.committed_bytes(), crate::storage::page::PAGE_SIZE);
+		assert_eq!(
+			cache.committed_bytes(),
+			ferros_grynn::storage_engine_prototype_api::page::PAGE_SIZE
+		);
 		assert_eq!(
 			super::lifecycle(cache.sources[0].metadata[0].state.load(Ordering::Acquire)),
 			super::VmLifecycle::Resident
@@ -2225,9 +2238,15 @@ mod tests {
 		let cache = VmCache::new(&specs, NonZeroUsize::new(4).ok_or("zero")?, 0)?;
 		for key in keys {
 			drop(cache.get_or_load(key, |page| load(key, page))?);
-			assert!(cache.committed_bytes() <= 4 * crate::storage::page::PAGE_SIZE);
+			assert!(
+				cache.committed_bytes()
+					<= 4 * ferros_grynn::storage_engine_prototype_api::page::PAGE_SIZE
+			);
 		}
-		assert_eq!(cache.reserved_bytes(), 9 * crate::storage::page::PAGE_SIZE);
+		assert_eq!(
+			cache.reserved_bytes(),
+			9 * ferros_grynn::storage_engine_prototype_api::page::PAGE_SIZE
+		);
 		Ok(())
 	}
 

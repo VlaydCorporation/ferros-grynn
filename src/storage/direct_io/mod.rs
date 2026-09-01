@@ -42,7 +42,7 @@ pub(super) const SYNC_BATCH_PAGES: usize = SYNC_BATCH_BYTES / PAGE_SIZE;
 
 /// Windows handle behavior selected by the page transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DirectFileOpenMode {
+pub enum DirectFileOpenMode {
 	/// Synchronous positional operations on a non-overlapped handle.
 	Synchronous,
 	/// Native queued operations on a `FILE_FLAG_OVERLAPPED` handle.
@@ -53,7 +53,7 @@ pub(super) enum DirectFileOpenMode {
 ///
 /// The owned [`File`] closes automatically. Every operation uses an explicit
 /// byte offset; no shared file cursor participates in page I/O.
-pub(super) struct DirectFile {
+pub struct DirectFile {
 	/// Native RAII file handle.
 	file: File,
 	/// Companion handle used only for queued Windows submissions; the primary
@@ -74,7 +74,7 @@ impl DirectFile {
 	///
 	/// Returns a structured I/O error if creation fails, or Direct I/O is not
 	/// available on the target platform or filesystem.
-	pub(super) fn create_new(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
+	pub fn create_new(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
 		Self::open(path.as_ref(), OpenMode::CreateNew, DirectFileOpenMode::Synchronous)
 	}
 
@@ -84,7 +84,7 @@ impl DirectFile {
 	///
 	/// Returns an error if opening fails, Direct I/O is unavailable, or the
 	/// existing file length is not a multiple of [`PAGE_SIZE`].
-	pub(super) fn open_read_only(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
+	pub fn open_read_only(path: impl AsRef<Path>) -> FerrosGrynnResult<Self> {
 		Self::open(path.as_ref(), OpenMode::ReadOnly, DirectFileOpenMode::Synchronous)
 	}
 
@@ -105,7 +105,7 @@ impl DirectFile {
 	///
 	/// Returns an error if opening fails, Direct I/O is unavailable, or the
 	/// existing file length is not a multiple of [`PAGE_SIZE`].
-	pub(super) fn open_read_write_with_mode(
+	pub fn open_read_write_with_mode(
 		path: impl AsRef<Path>,
 		io_mode: DirectFileOpenMode,
 	) -> FerrosGrynnResult<Self> {
@@ -126,7 +126,7 @@ impl DirectFile {
 	///
 	/// Returns an error if the requested length overflows the supported file
 	/// offset range or the operating system rejects the resize.
-	pub(super) fn resize_pages(&self, page_count: u64) -> FerrosGrynnResult<()> {
+	pub fn resize_pages(&self, page_count: u64) -> FerrosGrynnResult<()> {
 		let length = checked_file_length(page_count)?;
 		self.file.set_len(length).map_err(|source| io_failure("resize data file", source))?;
 		self.page_count.store(page_count, AtomicOrdering::Relaxed);
@@ -157,11 +157,7 @@ impl DirectFile {
 	///
 	/// Returns an error for an out-of-range page, short I/O, offset overflow,
 	/// or an operating-system failure.
-	pub(super) fn read_page_raw(
-		&self,
-		page_no: PageNo,
-		page: &mut AlignedPage,
-	) -> FerrosGrynnResult<()> {
+	pub fn read_page_raw(&self, page_no: PageNo, page: &mut AlignedPage) -> FerrosGrynnResult<()> {
 		let offset = checked_page_extent(page_no, 1, self.page_count())?;
 		read_exact_at(&self.file, page.as_bytes_mut(), offset)
 	}
@@ -209,7 +205,7 @@ impl DirectFile {
 	///
 	/// Returns an error for a range outside the file, arithmetic overflow,
 	/// short I/O, or an operating-system failure.
-	pub(super) fn read_pages_raw(
+	pub fn read_pages_raw(
 		&self,
 		first_page: PageNo,
 		pages: &mut [AlignedPage],
@@ -284,11 +280,7 @@ impl DirectFile {
 	///
 	/// Returns an error for an invalid page, an offset gap, arithmetic
 	/// overflow, short I/O, or an operating-system failure.
-	pub(super) fn write_pages(
-		&self,
-		first_page: PageNo,
-		pages: &[AlignedPage],
-	) -> FerrosGrynnResult<()> {
+	pub fn write_pages(&self, first_page: PageNo, pages: &[AlignedPage]) -> FerrosGrynnResult<()> {
 		if pages.is_empty() {
 			return Ok(());
 		}
@@ -304,7 +296,7 @@ impl DirectFile {
 	///
 	/// Returns an error for an empty or out-of-range extent, conversion
 	/// failure, or arithmetic overflow.
-	pub(super) fn prepare_read_extent(
+	pub fn prepare_read_extent(
 		&self,
 		first_page: PageNo,
 		page_count: usize,
@@ -382,7 +374,7 @@ impl DirectFile {
 	/// Returns an error when this file was not opened with its overlapped
 	/// companion handle.
 	#[cfg(all(windows, feature = "native-async-io"))]
-	pub(super) fn raw_handle(&self) -> FerrosGrynnResult<windows::Win32::Foundation::HANDLE> {
+	pub fn raw_handle(&self) -> FerrosGrynnResult<windows::Win32::Foundation::HANDLE> {
 		use std::os::windows::io::AsRawHandle;
 
 		self.overlapped_file
@@ -401,7 +393,7 @@ impl DirectFile {
 	/// # Errors
 	///
 	/// Returns an error if the operating system cannot synchronize file data.
-	pub(super) fn sync_data(&self) -> FerrosGrynnResult<()> {
+	pub fn sync_data(&self) -> FerrosGrynnResult<()> {
 		self.durability_handle()
 			.sync_data()
 			.map_err(|source| io_failure("synchronize data file", source))

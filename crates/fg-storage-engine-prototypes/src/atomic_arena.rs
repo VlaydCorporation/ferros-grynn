@@ -7,20 +7,22 @@ use std::{
 	num::NonZeroUsize,
 	sync::{
 		Arc,
+		OnceLock,
 		atomic::{AtomicU64, AtomicUsize, Ordering},
 	},
 };
 
-use parking_lot::{Condvar, Mutex, RwLock};
-use rapidhash::{HashMapExt, RapidHashMap};
-
-use crate::{
+use ferros_grynn::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	storage::{
+	storage_engine_prototype_api::{
 		buffer_pool::{PageCacheKey, PageCacheVersion, validate_loaded_header},
 		page::{AlignedPage, PAGE_SIZE, PageHeader},
 	},
 };
+use parking_lot::{Condvar, Mutex, RwLock};
+use rapidhash::{HashMapExt, RapidHashMap};
+
+use super::{SourceEpoch, SourceIdentity};
 
 /// Number of independently locked directory partitions.
 const DIRECTORY_SHARDS: usize = 64;
@@ -68,6 +70,14 @@ const MAX_PINS: u64 = (1_u64 << PIN_BITS) - 1;
 const MAX_USAGE: u64 = (1_u64 << USAGE_BITS) - 1;
 /// Largest non-wrapping frame generation.
 const MAX_GENERATION: u64 = (1_u64 << GENERATION_BITS) - 1;
+/// Frame-index bits retained in one compact source-bound locator.
+const DENSE_LOCATOR_INDEX_BITS: u32 = 24;
+/// Largest frame index retained in one compact source-bound locator.
+const DENSE_LOCATOR_INDEX_MASK: u64 = (1_u64 << DENSE_LOCATOR_INDEX_BITS) - 1;
+/// Presence bit distinguishing an empty dense slot from generation zero.
+const DENSE_LOCATOR_VALID: u64 = 1_u64 << 63;
+/// Slots allocated together by the sparse two-level locator.
+const DENSE_LOCATOR_LEAF_SLOTS: usize = 1_024;
 
 /// Lifecycle of one arena frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +136,221 @@ impl ResolvedFrameHandle {
 	fn matches(&self, key: PageCacheKey) -> bool {
 		self.key == key
 	}
+}
+
+/// Physical layout of one source-bound page-number locator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DenseLocatorLayout {
+	/// One compact atomic slot for every page in the source.
+	Flat,
+	/// Lazily allocated 1,024-slot leaves behind a compact root table.
+	TwoLevel,
+}
+
+/// Compact locator slots owned by one exact immutable source epoch.
+enum DenseLocatorSlots {
+	/// Direct page-number indexing.
+	Flat(Box<[AtomicU64]>),
+	/// Sparse page-number indexing without allocating untouched leaves.
+	TwoLevel(Box<[OnceLock<Box<[AtomicU64]>>]>),
+}
+
+/// Source-bound translation from page number to arena frame generation.
+///
+/// The source and epoch are stored once rather than repeated in every slot.
+/// A stale slot is harmless: the arena generation check rejects it before any
+/// page bytes are exposed.
+pub(super) struct SourceBoundLocator {
+	/// Arena that produced every stored frame locator.
+	arena_id: u64,
+	/// Stable physical source identity.
+	source: SourceIdentity,
+	/// Exact immutable source version.
+	epoch: SourceEpoch,
+	/// Number of addressable pages in this source.
+	page_count: usize,
+	/// Selected dense or sparse slot layout.
+	slots: DenseLocatorSlots,
+}
+
+impl SourceBoundLocator {
+	/// Creates an empty locator for one exact source epoch.
+	///
+	/// # Errors
+	///
+	/// Rejects an arena whose frame indices cannot fit the compact locator.
+	pub(super) fn new(
+		pool: &AtomicArenaBufferPool,
+		first_key: PageCacheKey,
+		page_count: NonZeroUsize,
+		layout: DenseLocatorLayout,
+	) -> FerrosGrynnResult<Self> {
+		if pool.capacity().saturating_sub(1) as u64 > DENSE_LOCATOR_INDEX_MASK {
+			return Err(FerrosGrynnError::storage_io_failure(
+				"atomic-arena capacity exceeds the compact dense-locator index",
+			));
+		}
+		let page_count = page_count.get();
+		let slots = match layout {
+			DenseLocatorLayout::Flat => DenseLocatorSlots::Flat(
+				(0..page_count).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice(),
+			),
+			DenseLocatorLayout::TwoLevel => DenseLocatorSlots::TwoLevel(
+				(0..page_count.div_ceil(DENSE_LOCATOR_LEAF_SLOTS))
+					.map(|_| OnceLock::new())
+					.collect::<Vec<_>>()
+					.into_boxed_slice(),
+			),
+		};
+		Ok(Self {
+			arena_id: pool.arena_id,
+			source: SourceIdentity::from_key(first_key),
+			epoch: SourceEpoch::from_key(first_key),
+			page_count,
+			slots,
+		})
+	}
+
+	/// Refreshes one slot from the arena's authoritative directory.
+	///
+	/// Returns `false` when the key is outside this source epoch or is not
+	/// resident. A nonresident exact slot is cleared.
+	pub(super) fn refresh(&self, pool: &AtomicArenaBufferPool, key: PageCacheKey) -> bool {
+		let Some(index) = self.exact_index(pool, key) else {
+			return false;
+		};
+		let Some(handle) = pool.resolve(key) else {
+			if let Some(slot) = self.slot_for_read(index) {
+				slot.store(0, Ordering::Release);
+			}
+			return false;
+		};
+		self.slot_for_write(index).store(pack_dense_locator(handle.locator), Ordering::Release);
+		true
+	}
+
+	/// Pins a resident page through one compact source-local lookup.
+	///
+	/// # Errors
+	///
+	/// Returns an internal storage error only when the packed pin counter is
+	/// exhausted.
+	pub(super) fn get_resolved<'pool>(
+		&self,
+		pool: &'pool AtomicArenaBufferPool,
+		key: PageCacheKey,
+	) -> FerrosGrynnResult<Option<AtomicPageGuard<'pool>>> {
+		let Some(index) = self.exact_index(pool, key) else {
+			return Ok(None);
+		};
+		let Some(locator) = self.load_locator(index) else {
+			return Ok(None);
+		};
+		match pool.try_pin(locator) {
+			PinResult::Pinned => {
+				pool.record_hit(key);
+				Ok(Some(pool.guard(locator)))
+			}
+			PinResult::Stale => Ok(None),
+			PinResult::Exhausted => Err(pin_exhausted(key)),
+		}
+	}
+
+	/// Uses a compact slot when valid and refreshes it through the normal miss
+	/// path after eviction or frame reuse.
+	///
+	/// # Errors
+	///
+	/// Rejects a different source epoch and otherwise returns the same errors
+	/// as [`AtomicArenaBufferPool::get_or_load`].
+	pub(super) fn get_or_load<'pool, Loader>(
+		&self,
+		pool: &'pool AtomicArenaBufferPool,
+		key: PageCacheKey,
+		loader: Loader,
+	) -> FerrosGrynnResult<AtomicPageGuard<'pool>>
+	where
+		Loader: FnOnce(&mut AlignedPage) -> FerrosGrynnResult<PageHeader>,
+	{
+		let Some(index) = self.exact_index(pool, key) else {
+			return Err(FerrosGrynnError::invalid_storage_page(
+				key.page_no().get(),
+				"source-bound locator received a different source epoch or page range",
+			));
+		};
+		if let Some(locator) = self.load_locator(index) {
+			match pool.try_pin(locator) {
+				PinResult::Pinned => {
+					pool.record_hit(key);
+					return Ok(pool.guard(locator));
+				}
+				PinResult::Stale => {}
+				PinResult::Exhausted => return Err(pin_exhausted(key)),
+			}
+		}
+		let guard = pool.get_or_load(key, loader)?;
+		self.slot_for_write(index).store(pack_dense_locator(guard.locator), Ordering::Release);
+		Ok(guard)
+	}
+
+	/// Returns the exact page-number slot only for this arena and source epoch.
+	fn exact_index(&self, pool: &AtomicArenaBufferPool, key: PageCacheKey) -> Option<usize> {
+		if pool.arena_id != self.arena_id
+			|| SourceIdentity::from_key(key) != self.source
+			|| SourceEpoch::from_key(key) != self.epoch
+		{
+			return None;
+		}
+		let index = usize::try_from(key.page_no().get()).ok()?;
+		(index < self.page_count).then_some(index)
+	}
+
+	/// Returns one already allocated slot without allocating a sparse leaf.
+	fn slot_for_read(&self, index: usize) -> Option<&AtomicU64> {
+		match &self.slots {
+			DenseLocatorSlots::Flat(slots) => slots.get(index),
+			DenseLocatorSlots::TwoLevel(root) => {
+				let leaf = root.get(index / DENSE_LOCATOR_LEAF_SLOTS)?.get()?;
+				leaf.get(index % DENSE_LOCATOR_LEAF_SLOTS)
+			}
+		}
+	}
+
+	/// Returns one writable slot, allocating its sparse leaf at most once.
+	fn slot_for_write(&self, index: usize) -> &AtomicU64 {
+		match &self.slots {
+			DenseLocatorSlots::Flat(slots) => &slots[index],
+			DenseLocatorSlots::TwoLevel(root) => {
+				let leaf = root[index / DENSE_LOCATOR_LEAF_SLOTS].get_or_init(dense_locator_leaf);
+				&leaf[index % DENSE_LOCATOR_LEAF_SLOTS]
+			}
+		}
+	}
+
+	/// Loads and decodes one compact locator slot.
+	fn load_locator(&self, index: usize) -> Option<FrameLocator> {
+		unpack_dense_locator(self.slot_for_read(index)?.load(Ordering::Acquire))
+	}
+}
+
+/// Allocates one zeroed sparse locator leaf.
+fn dense_locator_leaf() -> Box<[AtomicU64]> {
+	(0..DENSE_LOCATOR_LEAF_SLOTS).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice()
+}
+
+/// Packs one arena locator while preserving every frame-generation bit.
+fn pack_dense_locator(locator: FrameLocator) -> u64 {
+	debug_assert!(locator.index as u64 <= DENSE_LOCATOR_INDEX_MASK);
+	debug_assert!(locator.generation <= MAX_GENERATION);
+	DENSE_LOCATOR_VALID | (locator.generation << DENSE_LOCATOR_INDEX_BITS) | locator.index as u64
+}
+
+/// Decodes one nonempty compact arena locator.
+fn unpack_dense_locator(raw: u64) -> Option<FrameLocator> {
+	(raw & DENSE_LOCATOR_VALID != 0).then_some(FrameLocator {
+		index: (raw & DENSE_LOCATOR_INDEX_MASK) as usize,
+		generation: (raw & !DENSE_LOCATOR_VALID) >> DENSE_LOCATOR_INDEX_BITS,
+	})
 }
 
 /// One immutable directory value.
@@ -1388,10 +1613,9 @@ mod tests {
 		time::{Duration, Instant},
 	};
 
-	use super::{AtomicArenaBufferPool, CounterMode, Lifecycle, pack_state};
-	use crate::{
+	use ferros_grynn::{
 		gql_status::{FerrosGrynnError, FerrosGrynnResult},
-		storage::{
+		storage_engine_prototype_api::{
 			buffer_pool::{PageCacheKey, PageCacheVersion},
 			page::{
 				AlignedPage,
@@ -1404,6 +1628,15 @@ mod tests {
 			},
 			types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
 		},
+	};
+
+	use super::{
+		AtomicArenaBufferPool,
+		CounterMode,
+		DenseLocatorLayout,
+		Lifecycle,
+		SourceBoundLocator,
+		pack_state,
 	};
 
 	/// Creates one exact home cache key for test data.
@@ -1515,6 +1748,49 @@ mod tests {
 		assert!(pool.hit_count() >= 1);
 		assert_eq!(pool.slow_path_counts().0, 3);
 		assert!(pool.slow_path_counts().2 >= 2);
+		Ok(())
+	}
+
+	#[test]
+	fn source_bound_locators_reject_stale_frames_and_wrong_epochs() -> Result<(), Box<dyn Error>> {
+		for layout in [DenseLocatorLayout::Flat, DenseLocatorLayout::TwoLevel] {
+			let pool = AtomicArenaBufferPool::new(NonZeroUsize::MIN);
+			let first = home_key(1, 1)?;
+			let second = home_key(1, 2)?;
+			let locator = SourceBoundLocator::new(
+				&pool,
+				first,
+				NonZeroUsize::new(3).ok_or("zero source pages")?,
+				layout,
+			)?;
+
+			drop(pool.get_or_load(first, |page| load_valid(first, page))?);
+			assert!(locator.refresh(&pool, first));
+			let first_guard =
+				locator.get_resolved(&pool, first)?.ok_or("fresh dense locator was stale")?;
+			assert_eq!(first_guard.as_page().validate(first.page_no())?.page_no(), first.page_no());
+			drop(first_guard);
+
+			drop(pool.get_or_load(second, |page| load_valid(second, page))?);
+			assert!(locator.get_resolved(&pool, first)?.is_none());
+			let fallback_loads = AtomicUsize::new(0);
+			let reloaded = locator.get_or_load(&pool, first, |page| {
+				fallback_loads.fetch_add(1, Ordering::Relaxed);
+				load_valid(first, page)
+			})?;
+			assert_eq!(fallback_loads.load(Ordering::Relaxed), 1);
+			assert_eq!(reloaded.as_page().validate(first.page_no())?.page_no(), first.page_no());
+			drop(reloaded);
+			assert!(locator.get_resolved(&pool, first)?.is_some());
+
+			let wrong_source = home_key(2, 1)?;
+			assert!(locator.get_resolved(&pool, wrong_source)?.is_none());
+			let wrong_epoch = PageCacheKey::new(first.page_key(), PageCacheVersion::Home {
+				generation: CheckpointGeneration::new(12),
+				ceiling: Lsn::new(100),
+			});
+			assert!(locator.get_resolved(&pool, wrong_epoch)?.is_none());
+		}
 		Ok(())
 	}
 

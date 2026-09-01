@@ -52,7 +52,7 @@ type CachedPage = Arc<Box<AlignedPage>>;
 
 /// Immutable source version represented by one cache entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) enum PageCacheVersion {
+pub enum PageCacheVersion {
 	/// Exact full-page image retained in WAL.
 	Wal(PageLsn),
 	/// Home-file image under one logical checkpoint generation.
@@ -66,7 +66,7 @@ pub(super) enum PageCacheVersion {
 
 /// Complete identity of one immutable page version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct PageCacheKey {
+pub struct PageCacheKey {
 	/// Complete database page identity.
 	page_key: PageKey,
 	/// WAL-exact or checkpoint-generation home version.
@@ -75,7 +75,7 @@ pub(super) struct PageCacheKey {
 
 impl PageCacheKey {
 	/// Creates a cache key for one exact page image.
-	pub(super) const fn new(page_key: PageKey, version: PageCacheVersion) -> Self {
+	pub const fn new(page_key: PageKey, version: PageCacheVersion) -> Self {
 		Self {
 			page_key,
 			version,
@@ -83,17 +83,17 @@ impl PageCacheKey {
 	}
 
 	/// Returns the complete physical page identity.
-	pub(super) const fn page_key(self) -> PageKey {
+	pub const fn page_key(self) -> PageKey {
 		self.page_key
 	}
 
 	/// Returns the physical page number.
-	pub(super) const fn page_no(self) -> PageNo {
+	pub const fn page_no(self) -> PageNo {
 		self.page_key.page_no()
 	}
 
 	/// Returns the immutable cache-source version.
-	pub(super) const fn version(self) -> PageCacheVersion {
+	pub const fn version(self) -> PageCacheVersion {
 		self.version
 	}
 }
@@ -148,7 +148,7 @@ impl BufferPoolStats {
 }
 
 /// RAII pin for one immutable resident page.
-pub(super) struct PageGuard {
+pub struct PageGuard {
 	/// Shared resident page, declared first so its pin drops before
 	/// notification.
 	page: CachedPage,
@@ -158,12 +158,12 @@ pub(super) struct PageGuard {
 
 impl PageGuard {
 	/// Returns the pinned immutable aligned page.
-	pub(super) fn as_page(&self) -> &AlignedPage {
+	pub fn as_page(&self) -> &AlignedPage {
 		self.page.as_ref().as_ref()
 	}
 
 	/// Returns the pinned immutable page without copying it.
-	pub(super) fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
+	pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
 		self.as_page().as_bytes()
 	}
 }
@@ -190,14 +190,14 @@ impl Drop for ReleaseNotifier {
 
 /// Thread-safe bounded page cache.
 #[derive(Clone)]
-pub(super) struct BufferPool {
+pub struct BufferPool {
 	/// Shared metadata and wait queues retained by page guards.
 	shared: Arc<Shared>,
 }
 
 impl BufferPool {
 	/// Creates a cache with an exact non-zero frame budget.
-	pub(super) fn new(capacity: NonZeroUsize) -> Self {
+	pub fn new(capacity: NonZeroUsize) -> Self {
 		Self {
 			shared: Arc::new(Shared {
 				state: Mutex::new(ClockPro::new(capacity)),
@@ -225,7 +225,7 @@ impl BufferPool {
 	/// Returns the loader error, an invalid-page error when the loaded header
 	/// does not match the key, or an internal storage error if cache metadata
 	/// is inconsistent.
-	pub(super) fn get_or_load<Loader>(
+	pub fn get_or_load<Loader>(
 		&self,
 		key: PageCacheKey,
 		loader: Loader,
@@ -612,10 +612,7 @@ enum AccessDecision {
 }
 
 /// Ensures a loader returned the immutable page version named by its key.
-pub(in crate::storage) fn validate_loaded_header(
-	key: PageCacheKey,
-	header: PageHeader,
-) -> FerrosGrynnResult<()> {
+pub fn validate_loaded_header(key: PageCacheKey, header: PageHeader) -> FerrosGrynnResult<()> {
 	if header.page_no() != key.page_no() {
 		return Err(FerrosGrynnError::invalid_storage_page(
 			key.page_no().get(),

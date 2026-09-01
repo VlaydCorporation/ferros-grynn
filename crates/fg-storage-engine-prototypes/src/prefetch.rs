@@ -10,7 +10,7 @@ use std::{
 	thread::{self, JoinHandle},
 };
 
-use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
+use ferros_grynn::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
 /// Ordered result produced by the prefetch worker.
 struct PrefetchMessage<Extent> {
@@ -159,8 +159,9 @@ mod tests {
 		time::{Duration, Instant},
 	};
 
+	use ferros_grynn::gql_status::FerrosGrynnError;
+
 	use super::PrototypePrefetchCursor;
-	use crate::gql_status::FerrosGrynnError;
 
 	/// Owned reservation token used to prove queued and failed sends are
 	/// dropped.

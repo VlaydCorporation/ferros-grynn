@@ -752,11 +752,183 @@ VTune разрешил полные Rust symbol и source file для test execu
 экспорт функций — в соседнем файле
 `vtune-r3-resolved-profiling-20260901-142639-admin-hotspots.csv`.
 
+### Перенос прототипов в отдельный крейт
+
+Перед продолжением resident-эксперимента все test-only реализации перенесены
+из `src/storage/prototypes` в workspace-крейт
+`crates/fg-storage-engine-prototypes`. Основной `ferros-grynn` остаётся
+production dependency и временно открывает только реально используемые page,
+Direct-I/O, BufferPool и Windows IoRing элементы через скрытый feature
+`storage-engine-prototype-api`. Production path прототипы не импортирует.
+
+Проверка нового boundary:
+
+- `cargo test --locked -p fg-storage-engine-prototypes --features
+  native-async-io --lib` — 68 PASS, 8 benchmark probes ignored;
+- `cargo +nightly fmt --all -- --check` — PASS;
+- `cargo clippy --locked --no-deps -p fg-storage-engine-prototypes --lib
+  --tests --features native-async-io` — PASS с предупреждениями сохранённых
+  экспериментальных ветвей; обычный проход с dependencies по-прежнему
+  блокируется существующим lint-долгом root crate;
+- прежние root-crate VTune captures остаются историческими evidence, но все
+  новые captures должны собирать package `fg-storage-engine-prototypes`.
+
+Точная новая профильная команда:
+
+```powershell
+cargo test `
+  --locked `
+  --profile profiling `
+  -p fg-storage-engine-prototypes `
+  --lib `
+  --features native-async-io `
+  storage_engine_prototype_resident_next_probe `
+  --no-run
+```
+
+Она завершилась за 3 мин 31 с и создала согласованную пару:
+
+| Артефакт                                            |      Размер | Время создания |
+|-----------------------------------------------------|------------:|---------------:|
+| `fg_storage_engine_prototypes-2f84a08089d7fad2.exe` |  3 336 192 B |       23:46:28 |
+| `fg_storage_engine_prototypes-2f84a08089d7fad2.pdb` | 27 873 280 B |       23:46:28 |
+
+Оба файла находятся в `target/profiling/deps` и имеют один stem; для VTune
+нельзя подменять этот PDB артефактом другого build/profile.
+
+### Продолжение resident-эксперимента: source-bound locator и run ownership
+
+После переноса выполнено девять paired repetitions на `65 536` страницах,
+hot set/pool `4096`, по `2 000 000` логических чтений на строку. `run` означает
+число чтений разных полей/слотов одной физической страницы под одним pin.
+Проценты — median парного отношения к mmap той же repetition, а не отношение
+отдельно вычисленных median.
+
+| Run | Кандидат | Median Mops/s | Median к mmap | p99 |
+|---:|---|---:|---:|---:|
+| 1 | mmap | 25,798 | 100% | 76 ns |
+| 1 | R3 resolved run | 11,111 | 41,9% | 167 ns |
+| 1 | R6 dense flat run | 12,512 | 43,1% | 167 ns |
+| 1 | R7 dense two-level run | 10,219 | 40,4% | 182 ns |
+| 4 | mmap | 65,633 | 100% | 31 ns |
+| 4 | R3 resolved run | 30,348 | 46,3% | 67 ns |
+| 4 | R6 dense flat run | 31,645 | 47,6% | 65 ns |
+| 4 | R7 dense two-level run | 32,867 | 52,2% | 67 ns |
+| 16 | mmap | 101,996 | 100% | 16 ns |
+| 16 | R3 resolved run | 69,056 | 71,7% | 25 ns |
+| 16 | R6 dense flat run | 73,421 | 66,6% | 25 ns |
+| 16 | R7 dense two-level run | 69,646 | 62,1% | 24 ns |
+| 64 | mmap | 179,144 | 100% | 9 ns |
+| 64 | R3 resolved run | 139,381 | 78,4% | 11 ns |
+| 64 | **R6 dense flat run** | **163,818** | **93,3%** | **10 ns** |
+| 64 | R7 dense two-level run | 147,332 | 85,3% | 12 ns |
+
+R6 при run `64` впервые прошёл минимальный resident floor `90%` и p99 gate,
+но не целевой `95%`. Это не универсальная победа: при pin/drop на каждое
+чтение R3/R6/R7 дают только `19,6%/18,7%/18,5%` mmap и p99
+`54/54/56 ns`. Следовательно, dense directory сама по себе проблему не
+решает. Рабочий механизм — ownership физической страницы query/storage
+cursor-ом и амортизация pin/generation validation на несколько полезных
+чтений.
+
+### VTune Hotspots для R6 в новом крейте
+
+После добавления page-fault probe профильная сборка повторно создала точную
+одноимённую пару:
+
+| Артефакт | Размер | Время создания |
+|---|---:|---:|
+| `fg_storage_engine_prototypes-2f84a08089d7fad2.exe` | 3 354 112 B | 00:10:50 |
+| `fg_storage_engine_prototypes-2f84a08089d7fad2.pdb` | 31 404 032 B | 00:10:50 |
+
+VTune 2026.4 hardware Hotspots запускался с administrator rights на этом EXE:
+единственный `R6_dense_flat_run`, `250 000 000` логических операций для run
+`1/4/16/64`. Collection завершилась за `44,685 s` wall и `40,470 s` CPU;
+event-based sampling driver работал. Rust functions и source files разрешены:
+
+| Hotspot | CPU time | Доля CPU |
+|---|---:|---:|
+| `harness::measure_resident_runs` | 28,053 s | 69,3% |
+| `AtomicArenaBufferPool::try_pin` | 2,661 s | 6,6% |
+| `AtomicArenaBufferPool::release_pin` | 2,611 s | 6,5% |
+| `core::sync::atomic::atomic_load` | 1,365 s | 3,4% |
+| `SourceBoundLocator::get_resolved` | 0,883 s | 2,2% |
+
+`measure_resident_runs` включает inlined closure с вычислением страницы и
+самими marker reads; это не 69,3% чистого harness overhead. Явно
+разрешившиеся pin/release/locator операции составляют не менее 15,3% CPU и
+выполняются один раз на run. Поэтому профиль согласуется с измерениями:
+увеличение числа полезных чтений под одним guard быстро амортизирует
+фиксированную атомарную стоимость. Missing PDB warnings относятся только к
+Windows DLL/SYS, не к prototype EXE. База и два экспорта находятся в
+`target/storage-engine-prototype/profilers/vtune-r6-dense-flat-run-profiling-20260902-0018-admin*`.
+
+### mmap при first touch и вытеснении
+
+Добавлен Windows-only ignored probe, который создаёт immutable dataset через
+`NO_BUFFERING`, заранее выделяет Direct scratch, затем выполняет полностью
+одинаковую checksum validation всех страниц. Порядок намеренно фиксирован:
+validated Direct перед mmap не наполняет системный file cache. Измерение mmap
+включает first touch. `PageFaultCount` из `GetProcessMemoryInfo` является
+совокупным process counter и не различает soft и hard faults; поэтому ниже не
+делается вывод о числе физических disk faults.
+
+| Dataset | Кандидат | MiB/s | Process faults | Faults/DB page | Working-set delta |
+|---:|---|---:|---:|---:|---:|
+| 128 MiB (`0,008x RAM`) | validated Direct | 1 928,5 | 2 | 0,0002 | 8 KiB |
+| 128 MiB (`0,008x RAM`) | mmap first touch | 869,4 | 32 831 | 4,0077 | 128 MiB |
+| 18,31 GiB (`1,165x RAM`) | validated Direct | 1 936,3 | 2 | 0,000002 | 8 KiB |
+| 18,31 GiB (`1,165x RAM`) | mmap first touch | 606,2 | 4 809 466 | 4,0079 | 8,76 GiB |
+
+На большом файле mmap сохранил только `31,3%` validated Direct throughput;
+на холодных 128 MiB — `45,1%`. Временный файл `19 660 800 000 B` после теста
+удалён. Это объясняет кажущееся противоречие с исследованиями, где Direct I/O
+обгоняет mmap: прежний resident control предварительно валидировал и
+резидентно прогревал каждую mmap-страницу, то есть измерял лучший возможный
+hit, а не fault/eviction path.
+
+Архитектурный вывод теперь разделён по workload:
+
+- для hot point/traversal mmap всё ещё задаёт верхнюю границу, а R6
+  приближается к ней только при cursor-owned physical runs;
+- для one-shot и oversubscribed scan явный Direct transport с bypass является
+  существенно более сильной базой, чем demand-paged mmap;
+- единый backend для обоих режимов не нужен: cache-all hot roots/pages и
+  cursor-owned guards должны сочетаться с bypass/prefetch cold leaf/scan.
+
+### Дальнейший dependency-ordered план
+
+1. Изолировать R6 и mmap в отдельных процессах, добавить run `32/128` и
+   подтвердить crossover минимум девятью paired repetitions без profiler
+   overhead.
+2. Реализовать test-only R8 read epoch: один RAII epoch на physical cursor,
+   borrowed resolved address без pin/drop на каждую страницу и deferred frame
+   reuse до выхода reader. Сначала проверить stale generation, eviction,
+   bounded retired frames и backpressure, затем point/graph/B+tree workloads.
+3. Если R8 не покрывает короткие point reads, проверить R9 miss-side waiting:
+   убрать `capacity_waiters` load из каждого resident drop, а исчерпание всех
+   frames обрабатывать bounded yield/backoff на miss. `WaitOnAddress` добавлять
+   только при измеренной miss-regression; lost wakeup недопустим.
+4. Расширить oversubscribed probe только финалистами transport: raw Direct,
+   validated T0, лучший `A1 + scatter + P1` и mmap. Сравнить throughput, CPU,
+   total faults и working set на `0,5x/1x/1,15x/2x RAM`.
+5. Для лучшего Direct и mmap прогона снять WPR/ETW Memory+Disk I/O и отделить
+   hard faults от transition/soft faults; WPA не заменять суммарным counter.
+6. Собрать mixed DB workloads: cache-all B+tree roots плюс bypass/prefetch leaf
+   chain, graph frontier с epoch-owned hot adjacency и sparse cold Direct
+   transitions, interleaved 1/4/8 files под общим budget.
+7. Только после этих gates выбрать Pareto winner и написать отдельный
+   production migration plan; текущие BufferPool и storage API до этого не
+   менять.
+
 ## Индекс артефактов
 
 - `docs/storage_engine_prototype_plan.md` — утверждённый порядок;
-- `docs/reports/storage_engine_prototype_results.csv` — 156 compact groups;
-- `target/storage-engine-prototype/results.csv` — 1089 raw schema-v2 rows;
+- `crates/fg-storage-engine-prototypes` — текущий test-only code и probes;
+- `docs/reports/storage_engine_prototype_results.csv` — 164 compact groups;
+- `target/storage-engine-prototype/results.csv` — 1418 raw schema-v2 rows;
+- `target/storage-engine-prototype/page-fault-results.csv` — Windows process
+  faults и working set для cold/oversubscribed mmap comparison;
 - `target/storage-engine-prototype/run.log` — log основной campaign;
 - `target/storage-engine-prototype/combination-controls-schema2-results.csv` и
   `combination-controls-schema2-run.log` — повтор combination-фазы с controls;

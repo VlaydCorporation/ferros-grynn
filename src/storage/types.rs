@@ -12,7 +12,7 @@ const MAX_FILE_INSTANCE_ID: u64 = u64::MAX >> u8::BITS;
 /// A non-zero position in the database WAL record stream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(super) struct Lsn(u64);
+pub struct Lsn(u64);
 
 impl Lsn {
 	/// First assignable WAL record position.
@@ -21,12 +21,12 @@ impl Lsn {
 	pub(super) const ZERO: Self = Self(0);
 
 	/// Creates an LSN from a persisted integer.
-	pub(super) const fn new(value: u64) -> Self {
+	pub const fn new(value: u64) -> Self {
 		Self(value)
 	}
 
 	/// Returns the persisted integer value.
-	pub(super) const fn get(self) -> u64 {
+	pub const fn get(self) -> u64 {
 		self.0
 	}
 
@@ -86,19 +86,19 @@ impl TxId {
 /// Stable database graph identity used in a physical page key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(super) struct GraphId(u64);
+pub struct GraphId(u64);
 
 impl GraphId {
 	/// System catalog and database metadata address space.
-	pub(super) const SYSTEM: Self = Self(0);
+	pub const SYSTEM: Self = Self(0);
 
 	/// Creates a graph identity from its stable integer.
-	pub(super) const fn new(value: u64) -> Self {
+	pub const fn new(value: u64) -> Self {
 		Self(value)
 	}
 
 	/// Returns the persisted integer value.
-	pub(super) const fn get(self) -> u64 {
+	pub const fn get(self) -> u64 {
 		self.0
 	}
 }
@@ -106,19 +106,19 @@ impl GraphId {
 /// Monotonic checkpoint generation committed by the database superblock.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(super) struct CheckpointGeneration(u64);
+pub struct CheckpointGeneration(u64);
 
 impl CheckpointGeneration {
 	/// Generation before the first completed checkpoint.
-	pub(super) const ZERO: Self = Self(0);
+	pub const ZERO: Self = Self(0);
 
 	/// Creates a checkpoint generation from a persisted integer.
-	pub(super) const fn new(value: u64) -> Self {
+	pub const fn new(value: u64) -> Self {
 		Self(value)
 	}
 
 	/// Returns the persisted integer value.
-	pub(super) const fn get(self) -> u64 {
+	pub const fn get(self) -> u64 {
 		self.0
 	}
 
@@ -137,7 +137,7 @@ impl CheckpointGeneration {
 /// Closed format-v1 physical file role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
-pub(super) enum DataFileKind {
+pub enum DataFileKind {
 	/// Database system catalog.
 	SystemCatalog = 0x01,
 	/// Checkpoint-owned graph superblock.
@@ -168,12 +168,12 @@ pub(super) enum DataFileKind {
 
 impl DataFileKind {
 	/// Returns the assigned format-v1 discriminant.
-	pub(super) const fn get(self) -> u8 {
+	pub const fn get(self) -> u8 {
 		self as u8
 	}
 
 	/// Decodes only format-v1 assigned discriminants.
-	pub(super) const fn from_raw(value: u8) -> Option<Self> {
+	pub const fn from_raw(value: u8) -> Option<Self> {
 		if value == Self::SystemCatalog.get() {
 			Some(Self::SystemCatalog)
 		} else if value == Self::GraphSuperblock.get() {
@@ -212,7 +212,7 @@ impl DataFileKind {
 /// holds the closed [`DataFileKind`] discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(super) struct DataFileId(u64);
+pub struct DataFileId(u64);
 
 impl DataFileId {
 	/// First unassignable value used as the exhausted next-id clock.
@@ -226,7 +226,7 @@ impl DataFileId {
 	}
 
 	/// Creates an identity when `instance_id` fits the format-v1 56-bit field.
-	pub(super) const fn new(instance_id: u64, kind: DataFileKind) -> Option<Self> {
+	pub const fn new(instance_id: u64, kind: DataFileKind) -> Option<Self> {
 		if instance_id > MAX_FILE_INSTANCE_ID {
 			None
 		} else {
@@ -245,7 +245,7 @@ impl DataFileId {
 	}
 
 	/// Returns the complete persisted integer value.
-	pub(super) const fn get(self) -> u64 {
+	pub const fn get(self) -> u64 {
 		self.0
 	}
 
@@ -262,7 +262,7 @@ impl DataFileId {
 
 /// Complete physical identity of a page in the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct PageKey {
+pub struct PageKey {
 	/// Graph or system address space.
 	graph_id: GraphId,
 	/// Stable physical data-file identity.
@@ -273,7 +273,7 @@ pub(super) struct PageKey {
 
 impl PageKey {
 	/// Creates a physical page key.
-	pub(super) const fn new(graph_id: GraphId, file_id: DataFileId, page_no: PageNo) -> Self {
+	pub const fn new(graph_id: GraphId, file_id: DataFileId, page_no: PageNo) -> Self {
 		Self {
 			graph_id,
 			file_id,
@@ -282,17 +282,17 @@ impl PageKey {
 	}
 
 	/// Returns the graph identity.
-	pub(super) const fn graph_id(self) -> GraphId {
+	pub const fn graph_id(self) -> GraphId {
 		self.graph_id
 	}
 
 	/// Returns the stable physical file identity.
-	pub(super) const fn file_id(self) -> DataFileId {
+	pub const fn file_id(self) -> DataFileId {
 		self.file_id
 	}
 
 	/// Returns the physical page number.
-	pub(super) const fn page_no(self) -> PageNo {
+	pub const fn page_no(self) -> PageNo {
 		self.page_no
 	}
 }

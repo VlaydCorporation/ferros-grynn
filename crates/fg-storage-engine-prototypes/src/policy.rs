@@ -6,21 +6,21 @@ use std::{
 	sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(windows)]
+use ferros_grynn::storage_engine_prototype_api::page::PAGE_SIZE;
+use ferros_grynn::{
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	storage_engine_prototype_api::{
+		buffer_pool::{PageCacheKey, validate_loaded_header},
+		page::{AlignedPage, PageHeader},
+	},
+};
 use parking_lot::Mutex;
 use rapidhash::{HashMapExt, RapidHashMap};
 
 use super::atomic_arena::AtomicArenaBufferPool;
 #[cfg(windows)]
 use super::windows_vm::{HomeSourceSpec, VmCache};
-#[cfg(windows)]
-use crate::storage::page::PAGE_SIZE;
-use crate::{
-	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	storage::{
-		buffer_pool::{PageCacheKey, validate_loaded_header},
-		page::{AlignedPage, PageHeader},
-	},
-};
 
 /// Unique epoch source for independently created storage cursors.
 static NEXT_CURSOR_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -659,21 +659,22 @@ mod tests {
 		time::Duration,
 	};
 
-	#[cfg(windows)]
-	use super::VmPrototypeReadCache;
-	use super::{PrototypeReadCache, PrototypeScanCursor, ReadIntent, ReadPolicy};
-	#[cfg(debug_assertions)]
-	use crate::storage::prototypes::atomic_arena::publication_validation_count;
-	#[cfg(windows)]
-	use crate::storage::prototypes::windows_vm::HomeSourceSpec;
-	use crate::{
+	use ferros_grynn::{
 		gql_status::{FerrosGrynnError, FerrosGrynnResult},
-		storage::{
+		storage_engine_prototype_api::{
 			buffer_pool::{PageCacheKey, PageCacheVersion},
 			page::{AlignedPage, PageFlags, PageHeader, PageLsn, PageNo, PageType},
 			types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
 		},
 	};
+
+	#[cfg(windows)]
+	use super::VmPrototypeReadCache;
+	use super::{PrototypeReadCache, PrototypeScanCursor, ReadIntent, ReadPolicy};
+	#[cfg(debug_assertions)]
+	use crate::atomic_arena::publication_validation_count;
+	#[cfg(windows)]
+	use crate::windows_vm::HomeSourceSpec;
 
 	/// Creates a home key for one deterministic test page.
 	fn key(page_no: u64) -> FerrosGrynnResult<PageCacheKey> {
@@ -1109,7 +1110,10 @@ mod tests {
 		assert_eq!(loader_calls.load(Ordering::Relaxed), 1);
 		assert_eq!(cache.hot_resident_count(), 1);
 		assert_eq!(cache.cold_resident_count(), 0);
-		assert_eq!(cache.committed_bytes(), crate::storage::page::PAGE_SIZE);
+		assert_eq!(
+			cache.committed_bytes(),
+			ferros_grynn::storage_engine_prototype_api::page::PAGE_SIZE
+		);
 		Ok(())
 	}
 

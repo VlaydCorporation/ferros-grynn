@@ -6,10 +6,10 @@ use rapidhash::v3::{DEFAULT_RAPID_SECRETS, RapidStreamHasherV3, rapidhash_v3};
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
 /// Size of every data and index page, in bytes.
-pub(super) const PAGE_SIZE: usize = 16_384;
+pub const PAGE_SIZE: usize = 16_384;
 
 /// Size of the header shared by every page, in bytes.
-pub(super) const PAGE_HEADER_SIZE: usize = 32;
+pub const PAGE_HEADER_SIZE: usize = 32;
 
 /// Current provisional disk format version.
 pub(super) const STORAGE_FORMAT_VERSION: u8 = 1;
@@ -113,7 +113,7 @@ macro_rules! define_page_types {
 		/// A validated format-v1 page type.
 		#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 		#[repr(u16)]
-		pub(super) enum PageType {
+		pub enum PageType {
 			$(
 				$(#[$metadata])*
 				$variant = $value,
@@ -260,7 +260,7 @@ define_page_types! {
 bitflags! {
 	/// Valid format-v1 flags persisted in the common page header.
 	#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-	pub(super) struct PageFlags: u16 {
+	pub struct PageFlags: u16 {
 		/// Page is dirty in the runtime buffer pool.
 		const DIRTY = 0x0001;
 		/// Page payload is compressed.
@@ -279,19 +279,19 @@ bitflags! {
 /// The WAL position whose image is stored in a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(super) struct PageLsn(u64);
+pub struct PageLsn(u64);
 
 impl PageLsn {
 	/// LSN used for a page that has not yet been written by WAL replay.
 	pub(super) const ZERO: Self = Self(0);
 
 	/// Creates a page LSN from the storage engine's WAL position.
-	pub(super) const fn new(value: u64) -> Self {
+	pub const fn new(value: u64) -> Self {
 		Self(value)
 	}
 
 	/// Returns the persisted integer value.
-	pub(super) const fn get(self) -> u64 {
+	pub const fn get(self) -> u64 {
 		self.0
 	}
 }
@@ -299,38 +299,33 @@ impl PageLsn {
 /// A physical page number within one data or index file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(super) struct PageNo(u64);
+pub struct PageNo(u64);
 
 impl PageNo {
 	/// Sentinel used by disk structures to denote the absence of a page.
 	pub(super) const NULL: Self = Self(u64::MAX);
 
 	/// Creates a physical page number.
-	pub(super) const fn new(value: u64) -> Self {
+	pub const fn new(value: u64) -> Self {
 		Self(value)
 	}
 
 	/// Returns the persisted integer value.
-	pub(super) const fn get(self) -> u64 {
+	pub const fn get(self) -> u64 {
 		self.0
 	}
 }
 
 /// A zero-initialized page whose address satisfies Direct I/O alignment.
 #[repr(C, align(16384))]
-pub(super) struct AlignedPage {
+pub struct AlignedPage {
 	/// Complete page bytes, including the header.
 	bytes: [u8; PAGE_SIZE],
 }
 
 impl AlignedPage {
 	/// Creates a zeroed page with a valid typed and sealed header.
-	pub(super) fn new(
-		page_type: PageType,
-		flags: PageFlags,
-		page_lsn: PageLsn,
-		page_no: PageNo,
-	) -> Self {
+	pub fn new(page_type: PageType, flags: PageFlags, page_lsn: PageLsn, page_no: PageNo) -> Self {
 		let mut page = Self::zeroed();
 		page.reset(page_type, flags, page_lsn, page_no);
 		page
@@ -352,26 +347,26 @@ impl AlignedPage {
 	}
 
 	/// Creates an entirely zeroed page for an exact read operation.
-	pub(super) const fn zeroed() -> Self {
+	pub const fn zeroed() -> Self {
 		Self {
 			bytes: [0; PAGE_SIZE],
 		}
 	}
 
 	/// Returns the complete immutable page bytes.
-	pub(super) const fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
+	pub const fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
 		&self.bytes
 	}
 
 	/// Returns the complete mutable page bytes.
 	///
 	/// Call [`Self::seal`] after changing persisted bytes.
-	pub(super) const fn as_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+	pub const fn as_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
 		&mut self.bytes
 	}
 
 	/// Views a contiguous slice of aligned pages as one immutable byte extent.
-	pub(super) fn slice_as_bytes(pages: &[Self]) -> &[u8] {
+	pub fn slice_as_bytes(pages: &[Self]) -> &[u8] {
 		let byte_len = size_of_val(pages);
 		let bytes = pages.as_ptr().cast::<u8>();
 		// SAFETY: the same layout proof as in `slice_as_bytes_mut` applies;
@@ -384,7 +379,7 @@ impl AlignedPage {
 	/// This is the only raw-memory conversion needed by batched Direct I/O.
 	/// The returned slice has the same lifetime and exclusive borrow as
 	/// `pages`.
-	pub(super) fn slice_as_bytes_mut(pages: &mut [Self]) -> &mut [u8] {
+	pub fn slice_as_bytes_mut(pages: &mut [Self]) -> &mut [u8] {
 		let byte_len = size_of_val(pages);
 		let bytes = pages.as_mut_ptr().cast::<u8>();
 		// SAFETY: a slice stores `AlignedPage` values contiguously; the const
@@ -402,7 +397,7 @@ impl AlignedPage {
 	///
 	/// Returns an error when raw header bytes contain an unsupported format,
 	/// unknown page type, mismatched magic, or reserved flag bit.
-	pub(super) fn seal(&mut self) -> FerrosGrynnResult<()> {
+	pub fn seal(&mut self) -> FerrosGrynnResult<()> {
 		let raw_header = RawPageHeader::decode(self.as_bytes());
 		let mut header = raw_header.validate(PageNo::new(raw_header.page_no))?;
 		header.checksum = page_checksum_mut(self.as_bytes_mut());
@@ -417,7 +412,7 @@ impl AlignedPage {
 	/// Returns an error for an unsupported format version, unknown page type,
 	/// mismatched page-family magic, non-zero reserved flag bits, a mismatched
 	/// page number, or a checksum mismatch.
-	pub(super) fn validate(&self, expected_page_no: PageNo) -> FerrosGrynnResult<PageHeader> {
+	pub fn validate(&self, expected_page_no: PageNo) -> FerrosGrynnResult<PageHeader> {
 		validate_page_bytes(self.as_bytes(), expected_page_no)
 	}
 
@@ -464,7 +459,7 @@ impl AlignedPage {
 }
 
 /// Validates one complete page image without imposing Direct-I/O alignment.
-pub(super) fn validate_page_bytes(
+pub fn validate_page_bytes(
 	bytes: &[u8; PAGE_SIZE],
 	expected_page_no: PageNo,
 ) -> FerrosGrynnResult<PageHeader> {
@@ -493,7 +488,7 @@ fn validate_checksum(
 
 /// The validated common header of a format-v1 page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PageHeader {
+pub struct PageHeader {
 	/// Validated page-family magic.
 	magic: PageMagic,
 	/// Assigned format-v1 page type.
@@ -542,17 +537,17 @@ impl PageHeader {
 	}
 
 	/// Returns the frame LSN persisted in the page.
-	pub(super) const fn page_lsn(self) -> PageLsn {
+	pub const fn page_lsn(self) -> PageLsn {
 		self.page_lsn
 	}
 
 	/// Returns the stored page checksum.
-	pub(super) const fn checksum(self) -> u64 {
+	pub const fn checksum(self) -> u64 {
 		self.checksum
 	}
 
 	/// Returns the physical page number.
-	pub(super) const fn page_no(self) -> PageNo {
+	pub const fn page_no(self) -> PageNo {
 		self.page_no
 	}
 

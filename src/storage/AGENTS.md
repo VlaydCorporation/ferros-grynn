@@ -14,6 +14,11 @@
 - Не переносить layout из `fg-meta` без сверки с production-спецификацией.
 - Native async I/O подключать только отдельным вертикальным срезом, сохраняя
   один page/WAL contract.
+- Test-only storage-engine прототипы принадлежат
+  `crates/fg-storage-engine-prototypes`, а не `src/storage`. Временный скрытый
+  `prototype_api` открывает этому крейту только необходимые production-типы и
+  методы под feature `storage-engine-prototype-api`; не расширять фасад без
+  фактического использования и не подключать его в production path.
 
 ## Карта владельцев
 

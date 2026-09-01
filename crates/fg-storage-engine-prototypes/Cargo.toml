@@ -1,0 +1,31 @@
+[package]
+name = "fg-storage-engine-prototypes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+native-async-io = ["ferros-grynn/native-async-io"]
+
+[dependencies]
+ferros-grynn = { workspace = true, features = ["storage-engine-prototype-api"] }
+memmap2 = "0.9.11"
+parking_lot = "0.12.5"
+rapidhash = "4.2.2"
+sysinfo = "0.39.6"
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+shuttle = "0.9.3"

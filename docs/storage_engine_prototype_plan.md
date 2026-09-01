@@ -17,9 +17,13 @@ gate этапа 3. Его цель — проверить несколько а�
   physical cursor.
 
 Текущие `BufferPool`, `SyncPageManager`, on-disk format и GQL plumbing не
-изменяются. Все новые реализации находятся внутри `src/storage` под
-`#[cfg(test)]`; mmap остаётся только benchmark-control. `radixdb`, `fg-meta` и
-reference crates не используются. Новая зависимость либо код из
+изменяются. Все прототипы и их тесты находятся в отдельном workspace-крейте
+`crates/fg-storage-engine-prototypes`; production-крейт подключён к нему как
+зависимость через узкий временный feature-gated фасад
+`storage-engine-prototype-api`. Фасад не подключает прототипы к production path
+и удаляется вместе с экспериментальным крейтом после выбора архитектуры. mmap
+остаётся только benchmark-control. `radixdb`, `fg-meta` и reference crates не
+используются. Новая зависимость либо код из
 `src/asynchronous`/`src/collections` допустимы только после проверки контракта,
 тестов и измеримого преимущества над существующими средствами; сам факт их
 наличия не является основанием для подключения.
@@ -147,9 +151,11 @@ mapping и atomic state. Resident mean измеряется агрегатно �
 Screening использует 1-ГиБ dataset, resident hot sets `1/64/1024/4096`,
 1/4/8 files, `1/2/4/8/12` threads и pool `0.5/0.75/1/1.25/1.5` от общего hot
 set. Финалисты проходят размеры `1`, `10`, `50`, `130`, `300`, `1000`,
-`10000`, `65536`, `100000`, `300000` pages и mixed workloads: sequential,
-fixed-hot scan, 4x working set, B+tree, graph frontier, sparse properties и
-concurrent home/WAL versions.
+`10000`, `65536`, `100000`, `300000` pages, а mmap дополнительно проверяется
+на динамическом размере не менее `1.15x` установленной RAM, чтобы измерить
+режим вытеснения и page faults. Mixed workloads: sequential, fixed-hot scan,
+4x working set, B+tree, graph frontier, sparse properties и concurrent
+home/WAL versions.
 
 Resident screening содержит не менее девяти paired runs, финал — пятнадцать;
 I/O screening — не менее пяти, финал — семи. Backend order ротируется. В
@@ -183,6 +189,8 @@ publish и committed memory не более `110%` pool budget плюс отде
 
 Итоговые артефакты:
 
+- `crates/fg-storage-engine-prototypes` — изолированные реализации, tests и
+  benchmark probes;
 - `docs/reports/storage_engine_prototype_report.md`;
 - `docs/reports/storage_engine_prototype_results.csv`;
 - полные локальные logs/profiles в `target/storage-engine-prototype/`.

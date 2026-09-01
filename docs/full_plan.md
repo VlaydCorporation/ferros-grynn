@@ -240,6 +240,25 @@ types при необходимости расширяется общими ти
    поэтому production path не изменён, а полный size sweep финалистов условно
    пропущен.
 
+   **Продолжение (2026-09-01):** экспериментальная кампания возобновлена для
+   dense locator, batch/run ownership и больших mmap-наборов с page faults.
+   Прототипы перенесены из production source tree в отдельный workspace-крейт
+   `crates/fg-storage-engine-prototypes`; основной крейт предоставляет ему
+   только временный feature-gated `storage-engine-prototype-api`. Все следующие
+   tests, benchmarks и profiler runs выполняются из нового крейта, production
+   path остаётся неизменным.
+
+   **Промежуточный результат (2026-09-02):** source-bound dense locator с
+   одним pin на 64 логических чтения страницы достиг median `93,3%` mmap и
+   p99 `10 ns` против `9 ns`, но per-access путь остался на `18,7%`; это
+   подтверждает необходимость cursor/run ownership, а не замены hash table
+   самой по себе. На fully validated scan файла `18,31 GiB` (`1,165x` RAM)
+   sync Direct сохранил `1936 MiB/s`, тогда как mmap снизился до `606 MiB/s`
+   при `4 809 466` process page faults. Production path не менялся;
+   дальнейший порядок — epoch-scoped borrowed read для point/traversal,
+   перенос waiter bookkeeping с resident release path и oversubscribed
+   сравнение Direct/scatter/prefetch — зафиксирован в итоговом разделе отчёта.
+
 4. **Delta-oriented mutation foundation** — зависит от **3**.  
    Убрать полную материализацию local-графа из обычного `edit_graph`; формировать atom/page delta непосредственно из point mutations. Учесть свойства, крупную adjacency, составные `RecordId` и nested graph payload в write-set limit. После профиля сохранить лимит 256 МиБ; private spill реализовывать только при подтверждённом неделимом workload, который нельзя обработать сегментированным импортом.
 

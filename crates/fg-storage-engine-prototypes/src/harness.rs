@@ -19,35 +19,14 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use memmap2::{Mmap, MmapOptions};
-use parking_lot::Mutex;
-use rapidhash::{HashMapExt, RapidHashMap};
-use sysinfo::{ProcessesToUpdate, System, get_current_pid};
-#[cfg(windows)]
-use windows::Win32::{
-	Foundation::FILETIME,
-	System::Threading::{GetCurrentProcess, GetProcessTimes},
-};
-
 #[cfg(all(windows, feature = "native-async-io"))]
-use super::policy::VmPrototypeReadCache;
-#[cfg(all(windows, feature = "native-async-io"))]
-use super::windows_transport::ScatterReader;
-#[cfg(windows)]
-use super::windows_vm::{HomeSourceSpec, VmCache, VmResolvedHandle, probe_vm_lifecycle};
-use super::{
-	atomic_arena::{AtomicArenaBufferPool, CounterMode},
-	policy::{PrototypeReadCache, PrototypeScanCursor, ReadIntent, ReadPolicy},
-	prefetch::PrototypePrefetchCursor,
-};
-#[cfg(all(windows, feature = "native-async-io"))]
-use crate::storage::{
+use ferros_grynn::storage_engine_prototype_api::{
 	direct::DirectFileOpenMode,
 	page_io::{FilePageExtent, FrameRead, IoRingSubmissionStats, WindowsIoRing},
 };
-use crate::{
+use ferros_grynn::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	storage::{
+	storage_engine_prototype_api::{
 		buffer_pool::{BufferPool, PageCacheKey, PageCacheVersion},
 		direct::DirectFile,
 		page::{
@@ -64,6 +43,30 @@ use crate::{
 		types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
 	},
 };
+use memmap2::{Mmap, MmapOptions};
+use parking_lot::Mutex;
+use rapidhash::{HashMapExt, RapidHashMap};
+use sysinfo::{ProcessesToUpdate, System, get_current_pid};
+#[cfg(windows)]
+use windows::Win32::{
+	Foundation::FILETIME,
+	System::{
+		ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+		Threading::{GetCurrentProcess, GetProcessTimes},
+	},
+};
+
+#[cfg(all(windows, feature = "native-async-io"))]
+use super::policy::VmPrototypeReadCache;
+#[cfg(all(windows, feature = "native-async-io"))]
+use super::windows_transport::ScatterReader;
+#[cfg(windows)]
+use super::windows_vm::{HomeSourceSpec, VmCache, VmResolvedHandle, probe_vm_lifecycle};
+use super::{
+	atomic_arena::{AtomicArenaBufferPool, CounterMode, DenseLocatorLayout, SourceBoundLocator},
+	policy::{PrototypeReadCache, PrototypeScanCursor, ReadIntent, ReadPolicy},
+	prefetch::PrototypePrefetchCursor,
+};
 
 /// Artifact schema revision.
 const CSV_SCHEMA_VERSION: u32 = 2;
@@ -75,6 +78,8 @@ const DEFAULT_POOL_PAGES: usize = 4_096;
 const DEFAULT_RESIDENT_OPERATIONS: u64 = 2_000_000;
 /// Default normalized-latency batch size.
 const DEFAULT_LATENCY_BATCH: usize = 1_024;
+/// Logical accesses amortized by one resident page pin.
+const RESIDENT_RUN_LENGTHS: [usize; 4] = [1, 4, 16, 64];
 /// Default Direct-I/O extent size.
 const DEFAULT_EXTENT_PAGES: usize = 128;
 /// Immutable bounded prefetch-depth screening order.
@@ -422,6 +427,16 @@ struct MeasurementTimer {
 	cpu_started: Duration,
 }
 
+/// Cumulative Windows process-memory counters around one measured scan.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct ProcessMemorySnapshot {
+	/// Total process page faults since process start.
+	page_fault_count: u32,
+	/// Current resident working-set bytes.
+	working_set_bytes: u64,
+}
+
 impl MeasurementTimer {
 	/// Captures the process-CPU snapshot immediately before the wall start.
 	fn start() -> io::Result<Self> {
@@ -601,6 +616,58 @@ impl Artifacts {
 	}
 }
 
+/// Opens the compact page-fault result stream and writes its header once.
+#[cfg(windows)]
+fn open_page_fault_csv() -> io::Result<File> {
+	let path = artifact_directory().join("page-fault-results.csv");
+	let needs_header = !path.exists() || path.metadata()?.len() == 0;
+	let mut csv = OpenOptions::new().create(true).append(true).open(path)?;
+	if needs_header {
+		writeln!(
+			csv,
+			"schema_version,candidate,repetition,dataset_pages,dataset_bytes,ram_bytes,\
+			 dataset_ram_ratio,extent_pages,elapsed_ns,cpu_time_ns,cpu_wall_ratio,mib_per_second,\
+			 page_fault_count_before,page_fault_count_after,page_fault_delta,\
+			 page_faults_per_db_page,working_set_before_bytes,working_set_after_bytes,status"
+		)?;
+	}
+	Ok(csv)
+}
+
+/// Appends one page-fault observation outside the measured scan scope.
+#[cfg(windows)]
+fn record_page_fault_sample(
+	csv: &mut File,
+	candidate: &str,
+	repetition: usize,
+	config: HarnessConfig,
+	extent_pages: usize,
+	ram_bytes: u64,
+	measurement: Measurement,
+	before: ProcessMemorySnapshot,
+	after: ProcessMemorySnapshot,
+) -> io::Result<()> {
+	let dataset_bytes = config.dataset_pages.saturating_mul(PAGE_SIZE as u64);
+	let page_fault_delta = after.page_fault_count.wrapping_sub(before.page_fault_count);
+	writeln!(
+		csv,
+		"1,{candidate},{repetition},{},{dataset_bytes},{ram_bytes},{:.6},{},{},{},{:.6},{:.3},{},\
+		 {},{page_fault_delta},{:.6},{},{},ok",
+		config.dataset_pages,
+		dataset_bytes as f64 / ram_bytes.max(1) as f64,
+		extent_pages,
+		measurement.elapsed.as_nanos(),
+		measurement.cpu_time.as_nanos(),
+		measurement.cpu_wall_ratio(),
+		measurement.mib_per_second(),
+		before.page_fault_count,
+		after.page_fault_count,
+		f64::from(page_fault_delta) / config.dataset_pages as f64,
+		before.working_set_bytes,
+		after.working_set_bytes,
+	)
+}
+
 /// Immutable benchmark dataset removed when its harness test ends.
 struct Dataset {
 	/// Unique target-local file path.
@@ -699,6 +766,13 @@ struct MmapControl {
 impl MmapControl {
 	/// Maps and validates every page before resident timing.
 	fn open(dataset: &Dataset) -> Result<Self, Box<dyn Error>> {
+		let control = Self::map_unvalidated(dataset)?;
+		control.validate_all()?;
+		Ok(control)
+	}
+
+	/// Maps the immutable file without touching its page contents.
+	fn map_unvalidated(dataset: &Dataset) -> Result<Self, Box<dyn Error>> {
 		let file = File::open(&dataset.path)?;
 		// SAFETY: the read-only file remains immutable for the mapping lifetime,
 		// and `Mmap` owns the mapping independently of the local file handle.
@@ -706,21 +780,38 @@ impl MmapControl {
 		if mapping.len() != usize::try_from(dataset.page_count)?.saturating_mul(PAGE_SIZE) {
 			return Err(io::Error::other("mmap dataset length mismatch").into());
 		}
-		for raw_page in 0..dataset.page_count {
-			let page_no = PageNo::new(raw_page);
-			validate_page_bytes(mapping_page(&mapping, page_no)?, page_no)?;
-		}
 		Ok(Self {
 			mapping,
 			page_count: dataset.page_count,
 		})
 	}
 
+	/// Validates every mapped page in physical order.
+	fn validate_all(&self) -> FerrosGrynnResult<()> {
+		for raw_page in 0..self.page_count {
+			let page_no = PageNo::new(raw_page);
+			validate_page_bytes(
+				mapping_page(&self.mapping, page_no).map_err(|error| {
+					FerrosGrynnError::storage_io_failure(format!(
+						"mmap page lookup failed: {error}"
+					))
+				})?,
+				page_no,
+			)?;
+		}
+		Ok(())
+	}
+
 	/// Reads one resident marker without validation or mutable metadata.
 	fn marker(&self, page_no: PageNo) -> u8 {
+		self.marker_at(page_no, 0)
+	}
+
+	/// Reads one resident marker at a deterministic field-like page offset.
+	fn marker_at(&self, page_no: PageNo, logical_offset: usize) -> u8 {
 		debug_assert!(page_no.get() < self.page_count);
 		let start = page_no.get() as usize * PAGE_SIZE;
-		self.mapping[start + PAGE_HEADER_SIZE]
+		self.mapping[start + resident_marker_offset(logical_offset)]
 	}
 }
 
@@ -764,6 +855,51 @@ impl ResidentCandidate {
 		}
 	}
 }
+
+/// Candidates for the source-bound locator and batch-pin experiment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentNextCandidate {
+	/// Direct pointer access to the prevalidated mapping.
+	Mmap,
+	/// Cached frame handle with a pin and drop for every logical access.
+	ResolvedPerAccess,
+	/// Flat source-bound locator with a pin and drop for every access.
+	DenseFlatPerAccess,
+	/// Sparse two-level locator with a pin and drop for every access.
+	DenseTwoLevelPerAccess,
+	/// Cached frame handle pinned once for a physical run.
+	ResolvedRun,
+	/// Flat source-bound locator pinned once for a physical run.
+	DenseFlatRun,
+	/// Sparse two-level locator pinned once for a physical run.
+	DenseTwoLevelRun,
+}
+
+impl ResidentNextCandidate {
+	/// Stable CSV and profiler label.
+	const fn label(self) -> &'static str {
+		match self {
+			Self::Mmap => "R0_mmap",
+			Self::ResolvedPerAccess => "R3_resolved_per_access",
+			Self::DenseFlatPerAccess => "R6_dense_flat_per_access",
+			Self::DenseTwoLevelPerAccess => "R7_dense_two_level_per_access",
+			Self::ResolvedRun => "R3_resolved_run",
+			Self::DenseFlatRun => "R6_dense_flat_run",
+			Self::DenseTwoLevelRun => "R7_dense_two_level_run",
+		}
+	}
+}
+
+/// Stable order used for paired resident-next measurements.
+const RESIDENT_NEXT_CANDIDATES: [ResidentNextCandidate; 7] = [
+	ResidentNextCandidate::Mmap,
+	ResidentNextCandidate::ResolvedPerAccess,
+	ResidentNextCandidate::DenseFlatPerAccess,
+	ResidentNextCandidate::DenseTwoLevelPerAccess,
+	ResidentNextCandidate::ResolvedRun,
+	ResidentNextCandidate::DenseFlatRun,
+	ResidentNextCandidate::DenseTwoLevelRun,
+];
 
 /// Memory attributed to one candidate's fixture construction and preload,
 /// including resolved handles when that candidate owns them.
@@ -1175,6 +1311,239 @@ fn storage_engine_prototype_resident_probe() -> Result<(), Box<dyn Error>> {
 		 Dataset headers and publication performs the only validation of bytes read"
 	)?;
 	Ok(())
+}
+
+/// Compares compact source-local resolution and one-pin physical runs against
+/// the existing resolved handle and mmap control.
+#[test]
+#[ignore = "storage-engine prototype benchmark; run explicitly in release/bench profile"]
+fn storage_engine_prototype_resident_next_probe() -> Result<(), Box<dyn Error>> {
+	let config = HarnessConfig::from_env()?;
+	let mut artifacts = Artifacts::open(config)?;
+	let supported =
+		RESIDENT_NEXT_CANDIDATES.iter().map(|candidate| candidate.label()).collect::<Vec<_>>();
+	let selector = candidate_selector_from_env("resident_next", &supported)?;
+	let mut candidates = RESIDENT_NEXT_CANDIDATES.to_vec();
+	if let Some(selected) = selector.as_deref() {
+		candidates.retain(|candidate| candidate.label() == selected);
+	}
+	artifacts.selector("resident_next", selector.as_deref())?;
+
+	let dataset = Dataset::create("resident-next", config.dataset_pages)?;
+	let direct = DirectFile::open_read_only(&dataset.path)?;
+	let hot_pages = config.pool_pages.min(usize::try_from(config.dataset_pages)?);
+	let capacity = NonZeroUsize::new(hot_pages).ok_or("zero resident hot set")?;
+	let source_pages =
+		NonZeroUsize::new(usize::try_from(dataset.page_count)?).ok_or("zero source pages")?;
+	let mmap = MmapControl::open(&dataset)?;
+	let pool = AtomicArenaBufferPool::new(capacity);
+	for raw_page in 0..hot_pages {
+		let page_no = PageNo::new(raw_page as u64);
+		drop(pool.get_or_load(dataset.key(page_no), |page| {
+			read_raw_reported(&dataset, &direct, page_no, page)
+		})?);
+	}
+
+	let handles_rss_before = process_rss()?;
+	let handles_timer = MeasurementTimer::start()?;
+	let handles = (0..hot_pages)
+		.map(|raw_page| {
+			pool.resolve(dataset.key(PageNo::new(raw_page as u64)))
+				.ok_or_else(|| io::Error::other("resident page did not resolve"))
+		})
+		.collect::<io::Result<Vec<_>>>()?;
+	let handles_timing = handles_timer.finish()?;
+	let handles_rss = process_rss()?.saturating_sub(handles_rss_before);
+	artifacts.sample(
+		resident_next_meta("resolve_once", "R3_resolved_handle_build", 0, 0, config, hot_pages, 1),
+		aggregate_measurement(handles_timing, hot_pages as u64, 0, handles_rss),
+	)?;
+
+	let flat_rss_before = process_rss()?;
+	let flat_timer = MeasurementTimer::start()?;
+	let flat = SourceBoundLocator::new(
+		&pool,
+		dataset.key(PageNo::new(0)),
+		source_pages,
+		DenseLocatorLayout::Flat,
+	)?;
+	for raw_page in 0..hot_pages {
+		if !flat.refresh(&pool, dataset.key(PageNo::new(raw_page as u64))) {
+			return Err(io::Error::other("flat dense locator failed to resolve preload").into());
+		}
+	}
+	let flat_timing = flat_timer.finish()?;
+	let flat_rss = process_rss()?.saturating_sub(flat_rss_before);
+	artifacts.sample(
+		resident_next_meta("resolve_once", "R6_dense_flat_build", 0, 0, config, hot_pages, 1),
+		aggregate_measurement(flat_timing, hot_pages as u64, 0, flat_rss),
+	)?;
+
+	let two_level_rss_before = process_rss()?;
+	let two_level_timer = MeasurementTimer::start()?;
+	let two_level = SourceBoundLocator::new(
+		&pool,
+		dataset.key(PageNo::new(0)),
+		source_pages,
+		DenseLocatorLayout::TwoLevel,
+	)?;
+	for raw_page in 0..hot_pages {
+		if !two_level.refresh(&pool, dataset.key(PageNo::new(raw_page as u64))) {
+			return Err(io::Error::other("two-level locator failed to resolve preload").into());
+		}
+	}
+	let two_level_timing = two_level_timer.finish()?;
+	let two_level_rss = process_rss()?.saturating_sub(two_level_rss_before);
+	artifacts.sample(
+		resident_next_meta("resolve_once", "R7_dense_two_level_build", 0, 0, config, hot_pages, 1),
+		aggregate_measurement(two_level_timing, hot_pages as u64, 0, two_level_rss),
+	)?;
+
+	for run_length in RESIDENT_RUN_LENGTHS {
+		for repetition in 0..config.repetitions {
+			for (order_position, candidate) in
+				rotated_order(&candidates, repetition + run_length).into_iter().enumerate()
+			{
+				let measurement = measure_resident_next_candidate(
+					candidate, config, run_length, hot_pages, &dataset, &mmap, &pool, &handles,
+					&flat, &two_level,
+				)?;
+				artifacts.sample(
+					resident_next_meta(
+						"warm_physical_run",
+						candidate.label(),
+						repetition,
+						order_position,
+						config,
+						hot_pages,
+						run_length,
+					),
+					measurement,
+				)?;
+			}
+		}
+	}
+	writeln!(
+		artifacts.log,
+		"resident_next_contract=operations are logical field/edge marker reads; extent_pages \
+		 records the logical accesses sharing one physical page; per_access candidates pin/drop \
+		 each marker; run candidates reuse one existing AtomicPageGuard for the whole page run"
+	)?;
+	Ok(())
+}
+
+/// Builds one resident-next metadata row without changing the shared CSV
+/// schema.
+fn resident_next_meta<'label>(
+	workload: &'label str,
+	candidate: &'label str,
+	repetition: usize,
+	order_position: usize,
+	config: HarnessConfig,
+	hot_pages: usize,
+	run_length: usize,
+) -> SampleMeta<'label> {
+	SampleMeta {
+		phase: "resident_next",
+		workload,
+		candidate,
+		repetition,
+		order_position,
+		dataset_pages: config.dataset_pages,
+		pool_pages: config.pool_pages,
+		hot_pages,
+		file_count: 1,
+		threads: 1,
+		queue_depth: 0,
+		extent_pages: run_length,
+		prefetch_depth: 0,
+		vm_reserved_bytes: 0,
+		vm_committed_bytes: 0,
+		hit_ratio: 1.0,
+	}
+}
+
+/// Measures one resident-next candidate while keeping logical operation count
+/// identical across per-access and one-pin-run variants.
+#[allow(clippy::too_many_arguments, reason = "benchmark controls remain explicit and monomorphic")]
+fn measure_resident_next_candidate(
+	candidate: ResidentNextCandidate,
+	config: HarnessConfig,
+	run_length: usize,
+	hot_pages: usize,
+	dataset: &Dataset,
+	mmap: &MmapControl,
+	pool: &AtomicArenaBufferPool,
+	handles: &[super::atomic_arena::ResolvedFrameHandle],
+	flat: &SourceBoundLocator,
+	two_level: &SourceBoundLocator,
+) -> Result<Measurement, Box<dyn Error>> {
+	measure_resident_runs(
+		config.resident_operations,
+		config.latency_batch,
+		run_length,
+		|run, logical_count| {
+			let page_no = resident_page(run, hot_pages);
+			let index = page_no.get() as usize;
+			let key = dataset.key(page_no);
+			match candidate {
+				ResidentNextCandidate::Mmap => {
+					for logical in 0..logical_count {
+						black_box(mmap.marker_at(page_no, logical));
+					}
+				}
+				ResidentNextCandidate::ResolvedPerAccess => {
+					for logical in 0..logical_count {
+						let guard = pool.get_resolved(&handles[index])?.ok_or_else(|| {
+							FerrosGrynnError::storage_io_failure("resolved handle became stale")
+						})?;
+						black_box(guard.as_bytes()[resident_marker_offset(logical)]);
+					}
+				}
+				ResidentNextCandidate::DenseFlatPerAccess => {
+					for logical in 0..logical_count {
+						let guard = flat.get_resolved(pool, key)?.ok_or_else(|| {
+							FerrosGrynnError::storage_io_failure("flat locator became stale")
+						})?;
+						black_box(guard.as_bytes()[resident_marker_offset(logical)]);
+					}
+				}
+				ResidentNextCandidate::DenseTwoLevelPerAccess => {
+					for logical in 0..logical_count {
+						let guard = two_level.get_resolved(pool, key)?.ok_or_else(|| {
+							FerrosGrynnError::storage_io_failure("two-level locator became stale")
+						})?;
+						black_box(guard.as_bytes()[resident_marker_offset(logical)]);
+					}
+				}
+				ResidentNextCandidate::ResolvedRun => {
+					let guard = pool.get_resolved(&handles[index])?.ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure("resolved run handle became stale")
+					})?;
+					for logical in 0..logical_count {
+						black_box(guard.as_bytes()[resident_marker_offset(logical)]);
+					}
+				}
+				ResidentNextCandidate::DenseFlatRun => {
+					let guard = flat.get_resolved(pool, key)?.ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure("flat run locator became stale")
+					})?;
+					for logical in 0..logical_count {
+						black_box(guard.as_bytes()[resident_marker_offset(logical)]);
+					}
+				}
+				ResidentNextCandidate::DenseTwoLevelRun => {
+					let guard = two_level.get_resolved(pool, key)?.ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure("two-level run locator became stale")
+					})?;
+					for logical in 0..logical_count {
+						black_box(guard.as_bytes()[resident_marker_offset(logical)]);
+					}
+				}
+			}
+			Ok(())
+		},
+	)
 }
 
 /// Screens CacheAll, Rocks-like bypass, and bounded cold admission.
@@ -2115,6 +2484,99 @@ fn storage_engine_prototype_prefetch_probe() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Compares fully validated Direct I/O with mmap while recording Windows page
+/// faults. The generated file is written through NO_BUFFERING, and Direct runs
+/// first so it cannot prepopulate the system file cache used by mmap.
+#[cfg(windows)]
+#[test]
+#[ignore = "large Windows page-fault benchmark; run explicitly in profiling profile"]
+fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
+	let config = HarnessConfig::from_env()?;
+	let mut artifacts = Artifacts::open(config)?;
+	let mut candidates = vec!["T0_validated_preallocated", "R0_mmap_validated_first_touch"];
+	let selector = candidate_selector_from_env("page_fault", &candidates)?;
+	if let Some(selected) = selector.as_deref() {
+		candidates.retain(|candidate| *candidate == selected);
+	}
+	artifacts.selector("page_fault", selector.as_deref())?;
+
+	let dataset = Dataset::create("page-fault", config.dataset_pages)?;
+	let direct = DirectFile::open_read_only(&dataset.path)?;
+	let mmap = MmapControl::map_unvalidated(&dataset)?;
+	let scan_pages = usize::try_from(config.dataset_pages)?;
+	let extent_pages = config.extent_pages.min(scan_pages).max(1);
+	let extents = extent_inputs(scan_pages, extent_pages);
+	let mut scratch = aligned_pages(maximum_extent_pages(&extents)?);
+	let ram_bytes = System::new_all().total_memory();
+	let dataset_bytes = config.dataset_pages.saturating_mul(PAGE_SIZE as u64);
+	let mut page_fault_csv = open_page_fault_csv()?;
+
+	for repetition in 0..io_repetitions(config) {
+		for (order_position, candidate) in candidates.iter().copied().enumerate() {
+			let before = process_memory_snapshot()?;
+			let mut measurement = match candidate {
+				"T0_validated_preallocated" => {
+					measure_validated_direct_scan(&direct, &extents, &mut scratch, scan_pages)?
+				}
+				"R0_mmap_validated_first_touch" => measure_validated_mmap_scan(&mmap)?,
+				_ => return Err(io::Error::other("unknown page-fault candidate").into()),
+			};
+			let after = process_memory_snapshot()?;
+			measurement.rss_delta =
+				after.working_set_bytes.saturating_sub(before.working_set_bytes);
+			record_page_fault_sample(
+				&mut page_fault_csv,
+				candidate,
+				repetition,
+				config,
+				extent_pages,
+				ram_bytes,
+				measurement,
+				before,
+				after,
+			)?;
+			artifacts.sample(
+				SampleMeta {
+					phase: "page_fault",
+					workload: "full_validated_scan",
+					candidate,
+					repetition,
+					order_position,
+					dataset_pages: config.dataset_pages,
+					pool_pages: 0,
+					hot_pages: 0,
+					file_count: 1,
+					threads: 1,
+					queue_depth: 1,
+					extent_pages,
+					prefetch_depth: 0,
+					vm_reserved_bytes: 0,
+					vm_committed_bytes: 0,
+					hit_ratio: 0.0,
+				},
+				measurement,
+			)?;
+			writeln!(
+				artifacts.log,
+				"page_fault candidate={candidate} repetition={repetition} faults={} \
+				 working_set_before={} working_set_after={}",
+				after.page_fault_count.wrapping_sub(before.page_fault_count),
+				before.working_set_bytes,
+				after.working_set_bytes,
+			)?;
+		}
+	}
+	writeln!(
+		artifacts.log,
+		"page_fault_contract=dataset_bytes={dataset_bytes} ram_bytes={ram_bytes} ratio={:.6}; \
+		 PageFaultCount is the cumulative process total and does not distinguish soft from hard \
+		 faults; candidate order is fixed Direct-before-mmap because NO_BUFFERING Direct reads do \
+		 not populate mmap's system file cache",
+		dataset_bytes as f64 / ram_bytes.max(1) as f64,
+	)?;
+	Ok(())
+}
+
 /// Screens the mandatory compatible engine, policy, transport, and prefetch
 /// combinations without constructing the full Cartesian product.
 #[cfg(all(windows, feature = "native-async-io"))]
@@ -2710,6 +3172,40 @@ fn extent_keys(dataset: &Dataset, first: PageNo, count: usize) -> Vec<PageCacheK
 	(0..count).map(|offset| dataset.key(PageNo::new(first.get() + offset as u64))).collect()
 }
 
+/// Measures one complete synchronous Direct scan into a preallocated extent.
+fn measure_validated_direct_scan(
+	file: &DirectFile,
+	extents: &[(PageNo, usize)],
+	pages: &mut [AlignedPage],
+	scan_pages: usize,
+) -> Result<Measurement, Box<dyn Error>> {
+	let timer = MeasurementTimer::start()?;
+	for (first, count) in extents.iter().copied() {
+		file.read_pages_raw(first, &mut pages[..count])?;
+		validate_extent(first, &pages[..count])?;
+		black_box(pages[0].as_bytes()[PAGE_HEADER_SIZE]);
+	}
+	Ok(aggregate_measurement(
+		timer.finish()?,
+		extents.len() as u64,
+		scan_pages as u64 * PAGE_SIZE as u64,
+		0,
+	))
+}
+
+/// Measures one complete mapped scan including checksum validation and faults.
+#[cfg(windows)]
+fn measure_validated_mmap_scan(control: &MmapControl) -> Result<Measurement, Box<dyn Error>> {
+	let timer = MeasurementTimer::start()?;
+	control.validate_all()?;
+	Ok(aggregate_measurement(
+		timer.finish()?,
+		control.page_count,
+		control.page_count.saturating_mul(PAGE_SIZE as u64),
+		0,
+	))
+}
+
 /// Measures one complete contiguous Direct prefetch scan.
 fn measure_direct_prefetch(
 	file: Arc<DirectFile>,
@@ -2721,20 +3217,11 @@ fn measure_direct_prefetch(
 	let max_extent_pages = maximum_extent_pages(extents)?;
 	if depth == 0 {
 		let mut pages = aligned_pages(max_extent_pages);
-		let timer = MeasurementTimer::start()?;
-		for (first, count) in extents.iter().copied() {
-			file.read_pages_raw(first, &mut pages[..count])?;
-			validate_extent(first, &pages[..count])?;
-			black_box(pages[0].as_bytes()[PAGE_HEADER_SIZE]);
-		}
-		let timing = timer.finish()?;
+		let mut measurement =
+			measure_validated_direct_scan(&file, extents, &mut pages, scan_pages)?;
 		let rss_after = process_rss()?;
-		return Ok(aggregate_measurement(
-			timing,
-			extents.len() as u64,
-			scan_pages as u64 * PAGE_SIZE as u64,
-			rss_after.saturating_sub(rss_before),
-		));
+		measurement.rss_delta = rss_after.saturating_sub(rss_before);
+		return Ok(measurement);
 	} else {
 		let set_count = depth
 			.checked_add(1)
@@ -3886,6 +4373,54 @@ where
 	})
 }
 
+/// Measures logical operations grouped into physical page runs. Timing samples
+/// are normalized by logical reads, not by the number of acquired pins.
+fn measure_resident_runs<Run>(
+	logical_operations: u64,
+	latency_batch: usize,
+	run_length: usize,
+	mut run: Run,
+) -> Result<Measurement, Box<dyn Error>>
+where
+	Run: FnMut(u64, usize) -> Result<(), Box<dyn Error>>,
+{
+	let rss_before = process_rss()?;
+	let total_runs = logical_operations.div_ceil(run_length as u64);
+	let sample_runs = latency_batch.div_ceil(run_length).max(1) as u64;
+	let mut samples = Vec::with_capacity(total_runs.div_ceil(sample_runs) as usize);
+	let timer = MeasurementTimer::start()?;
+	let mut completed_runs = 0_u64;
+	let mut completed_operations = 0_u64;
+	while completed_runs < total_runs {
+		let runs_in_sample = (total_runs - completed_runs).min(sample_runs);
+		let sample_started = Instant::now();
+		let sample_operations_before = completed_operations;
+		for offset in 0..runs_in_sample {
+			let remaining = logical_operations - completed_operations;
+			let logical_count = remaining.min(run_length as u64) as usize;
+			run(completed_runs + offset, logical_count)?;
+			completed_operations += logical_count as u64;
+		}
+		let sample_operations = completed_operations - sample_operations_before;
+		let elapsed = sample_started.elapsed().as_nanos();
+		samples.push(u64::try_from(elapsed / u128::from(sample_operations)).unwrap_or(u64::MAX));
+		completed_runs += runs_in_sample;
+	}
+	let timing = timer.finish()?;
+	let rss_after = process_rss()?;
+	samples.sort_unstable();
+	Ok(Measurement {
+		elapsed: timing.elapsed,
+		cpu_time: timing.cpu_time,
+		operations: logical_operations,
+		useful_bytes: logical_operations.saturating_mul(PAGE_SIZE as u64),
+		p50_ns: percentile(&samples, 50),
+		p95_ns: percentile(&samples, 95),
+		p99_ns: percentile(&samples, 99),
+		rss_delta: rss_after.saturating_sub(rss_before),
+	})
+}
+
 /// Returns one nearest-rank percentile from sorted integer samples.
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
 	if sorted.is_empty() {
@@ -3898,6 +4433,11 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
 /// Maps a deterministic operation number to a hot page.
 fn resident_page(operation: u64, hot_pages: usize) -> PageNo {
 	PageNo::new(splitmix64(operation) % hot_pages as u64)
+}
+
+/// Selects a deterministic cache-line-spaced marker inside one DB page.
+fn resident_marker_offset(logical_offset: usize) -> usize {
+	PAGE_HEADER_SIZE + logical_offset.saturating_mul(64) % (PAGE_SIZE - PAGE_HEADER_SIZE)
 }
 
 /// Applies the complete SplitMix64 output finalizer to decorrelate sequential
@@ -4075,6 +4615,25 @@ fn filetime_ticks(value: FILETIME) -> u64 {
 	(u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
 }
 
+/// Reads cumulative process page faults and current working-set bytes.
+#[cfg(windows)]
+fn process_memory_snapshot() -> io::Result<ProcessMemorySnapshot> {
+	let mut counters = PROCESS_MEMORY_COUNTERS::default();
+	counters.cb = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>())
+		.map_err(|_error| io::Error::other("process memory counter size exceeds u32"))?;
+	// SAFETY: `GetCurrentProcess` returns the documented non-owning pseudo-handle.
+	let process = unsafe { GetCurrentProcess() };
+	let counter_bytes = counters.cb;
+	// SAFETY: `process` identifies the current process and `counters` is a live,
+	// correctly sized writable `PROCESS_MEMORY_COUNTERS` value.
+	unsafe { GetProcessMemoryInfo(process, &raw mut counters, counter_bytes) }
+		.map_err(|error| io::Error::other(format!("GetProcessMemoryInfo failed: {error}")))?;
+	Ok(ProcessMemorySnapshot {
+		page_fault_count: counters.PageFaultCount,
+		working_set_bytes: counters.WorkingSetSize as u64,
+	})
+}
+
 /// Records unsupported process CPU time explicitly as zero off Windows.
 #[cfg(not(windows))]
 #[allow(clippy::unnecessary_wraps, reason = "keeps the cross-platform timer contract uniform")]
@@ -4142,7 +4701,11 @@ fn candidate_selector_from_env(
 
 /// Stable artifact root.
 fn artifact_directory() -> PathBuf {
-	Path::new("target").join("storage-engine-prototype")
+	Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("..")
+		.join("..")
+		.join("target")
+		.join("storage-engine-prototype")
 }
 
 /// Human-readable timestamp without an external date dependency.

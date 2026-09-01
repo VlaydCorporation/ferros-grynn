@@ -1,23 +1,29 @@
-//! Test-only storage-engine prototypes for the stage 3.1 experiment.
+//! Standalone storage-engine prototypes for the stage 3.1 experiment.
 //!
-//! Nothing in this module is reachable from the production storage path.
+//! Nothing in this crate is reachable from the production storage path.
 
+#[cfg(test)]
 mod atomic_arena;
+#[cfg(test)]
 mod harness;
+#[cfg(test)]
 mod policy;
+#[cfg(test)]
 mod prefetch;
-#[cfg(all(windows, feature = "native-async-io"))]
+#[cfg(all(test, windows, feature = "native-async-io"))]
 mod windows_transport;
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 mod windows_vm;
 
-use super::{
+#[cfg(test)]
+use ferros_grynn::storage_engine_prototype_api::{
 	buffer_pool::{PageCacheKey, PageCacheVersion},
 	types::{DataFileId, GraphId},
 };
 
 /// Stable identity of one prototype page source independent of its version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg(test)]
 struct SourceIdentity {
 	/// Graph address space that owns the file.
 	graph_id: GraphId,
@@ -25,6 +31,7 @@ struct SourceIdentity {
 	file_id: DataFileId,
 }
 
+#[cfg(test)]
 impl SourceIdentity {
 	/// Extracts source identity from an exact cache key.
 	const fn from_key(key: PageCacheKey) -> Self {
@@ -38,8 +45,10 @@ impl SourceIdentity {
 
 /// Exact immutable epoch of one prototype page source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg(test)]
 struct SourceEpoch(PageCacheVersion);
 
+#[cfg(test)]
 impl SourceEpoch {
 	/// Extracts the source epoch from an exact cache key.
 	const fn from_key(key: PageCacheKey) -> Self {

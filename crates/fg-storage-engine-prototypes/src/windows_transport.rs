@@ -2,6 +2,13 @@
 
 use std::ptr;
 
+use ferros_grynn::{
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	storage_engine_prototype_api::{
+		direct::DirectFile,
+		page::{AlignedPage, PAGE_SIZE, PageHeader, PageNo},
+	},
+};
 use windows::{
 	Win32::{
 		Foundation::{CloseHandle, ERROR_IO_PENDING, HANDLE},
@@ -13,14 +20,6 @@ use windows::{
 		},
 	},
 	core::{HRESULT, PCWSTR},
-};
-
-use crate::{
-	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	storage::{
-		direct::DirectFile,
-		page::{AlignedPage, PAGE_SIZE, PageHeader, PageNo},
-	},
 };
 
 /// Event retained until each overlapped scatter read fully completes.
@@ -264,7 +263,7 @@ pub(super) fn read_scatter_extent(
 
 /// Preserves the native source behind a project storage error.
 fn windows_failure(operation: &'static str, source: windows::core::Error) -> FerrosGrynnError {
-	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
+	ferros_grynn::storage_engine_prototype_api::storage_io_failure_with_source(operation, source)
 }
 
 #[cfg(test)]
@@ -276,6 +275,14 @@ fn windows_failure(operation: &'static str, source: windows::core::Error) -> Fer
 mod tests {
 	use std::{error::Error, num::NonZeroUsize, path::PathBuf, sync::Arc};
 
+	use ferros_grynn::storage_engine_prototype_api::{
+		buffer_pool::{PageCacheKey, PageCacheVersion},
+		direct::{DirectFile, DirectFileOpenMode},
+		page::{AlignedPage, PAGE_HEADER_SIZE, PAGE_SIZE, PageFlags, PageLsn, PageNo, PageType},
+		page_io::{FrameRead, WindowsIoRing},
+		types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
+	};
+
 	use super::{
 		super::{
 			atomic_arena::AtomicArenaBufferPool,
@@ -283,13 +290,6 @@ mod tests {
 		},
 		ScatterReader,
 		read_scatter_extent,
-	};
-	use crate::storage::{
-		buffer_pool::{PageCacheKey, PageCacheVersion},
-		direct::{DirectFile, DirectFileOpenMode},
-		page::{AlignedPage, PAGE_HEADER_SIZE, PAGE_SIZE, PageFlags, PageLsn, PageNo, PageType},
-		page_io::{FrameRead, WindowsIoRing},
-		types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
 	};
 
 	/// Unique path removed after each native transport test.

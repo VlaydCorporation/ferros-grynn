@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 use std::num::NonZeroUsize;
 use std::{ffi::c_void, mem, sync::Arc};
 
@@ -62,8 +62,8 @@ struct NativeRequest {
 }
 
 /// Test-only disjoint destination used by the frame-oriented IoRing probe.
-#[cfg(test)]
-pub(in crate::storage) struct FrameRead<'a> {
+#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+pub struct FrameRead<'a> {
 	/// File retained by the benchmark for the complete synchronous submission.
 	file: &'a Arc<crate::storage::direct::DirectFile>,
 	/// Physical page read by this one-frame request.
@@ -72,10 +72,10 @@ pub(in crate::storage) struct FrameRead<'a> {
 	frame: &'a mut AlignedPage,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 impl<'a> FrameRead<'a> {
 	/// Describes one frame-oriented read request.
-	pub(in crate::storage) fn new(
+	pub fn new(
 		file: &'a Arc<crate::storage::direct::DirectFile>,
 		page_no: crate::storage::page::PageNo,
 		frame: &'a mut AlignedPage,
@@ -92,9 +92,7 @@ impl<'a> FrameRead<'a> {
 	/// # Errors
 	///
 	/// Returns a page-header or checksum error.
-	pub(in crate::storage) fn validate(
-		&self,
-	) -> FerrosGrynnResult<crate::storage::page::PageHeader> {
+	pub fn validate(&self) -> FerrosGrynnResult<crate::storage::page::PageHeader> {
 		self.frame.validate(self.page_no)
 	}
 }
@@ -103,9 +101,9 @@ impl<'a> FrameRead<'a> {
 ///
 /// The limits describe software SQE batches passed to `SubmitIoRing`; they do
 /// not claim the queue depth observed by the storage device.
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::storage) struct IoRingSubmissionStats {
+pub struct IoRingSubmissionStats {
 	/// Configured queue capacity after requested and runtime capability bounds.
 	submission_capacity: u32,
 	/// Caller-requested upper bound for SQEs in one submit call.
@@ -120,35 +118,35 @@ pub(in crate::storage) struct IoRingSubmissionStats {
 	completed_cqes: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 impl IoRingSubmissionStats {
 	/// Returns the configured capacity after runtime capability bounds.
-	pub(in crate::storage) const fn submission_capacity(self) -> u32 {
+	pub const fn submission_capacity(self) -> u32 {
 		self.submission_capacity
 	}
 
 	/// Returns the requested software SQE batch limit.
-	pub(in crate::storage) const fn requested_sqe_batch_limit(self) -> usize {
+	pub const fn requested_sqe_batch_limit(self) -> usize {
 		self.requested_sqe_batch_limit
 	}
 
 	/// Returns the SQE batch limit after clamping to runtime capacity.
-	pub(in crate::storage) const fn effective_sqe_batch_limit(self) -> usize {
+	pub const fn effective_sqe_batch_limit(self) -> usize {
 		self.effective_sqe_batch_limit
 	}
 
 	/// Returns the number of successful `SubmitIoRing` calls.
-	pub(in crate::storage) const fn submit_calls(self) -> usize {
+	pub const fn submit_calls(self) -> usize {
 		self.submit_calls
 	}
 
 	/// Returns the total number of SQEs accepted by successful submissions.
-	pub(in crate::storage) const fn submitted_sqes(self) -> usize {
+	pub const fn submitted_sqes(self) -> usize {
 		self.submitted_sqes
 	}
 
 	/// Returns the total number of CQEs drained by the successful execution.
-	pub(in crate::storage) const fn completed_cqes(self) -> usize {
+	pub const fn completed_cqes(self) -> usize {
 		self.completed_cqes
 	}
 }
@@ -163,7 +161,7 @@ enum NativeOperation {
 }
 
 /// Owned Windows queue used behind one manager mutex.
-pub(in crate::storage) struct WindowsIoRing {
+pub struct WindowsIoRing {
 	/// Owned kernel ring, invalid only after a failed reset.
 	ring: HIORING,
 	/// Runtime-selected ring version.
@@ -182,7 +180,7 @@ unsafe impl Send for WindowsIoRing {}
 impl WindowsIoRing {
 	/// Queries IoRing, checks required operations, and creates one bounded
 	/// queue.
-	pub(in crate::storage) fn new() -> FerrosGrynnResult<Self> {
+	pub fn new() -> FerrosGrynnResult<Self> {
 		// SAFETY: the generated binding returns an owned capabilities value and
 		// has no caller-provided pointers.
 		let capabilities = unsafe { QueryIoRingCapabilities() }
@@ -255,15 +253,15 @@ impl WindowsIoRing {
 	/// Returns the configured submission-queue capacity used to bound chunks.
 	///
 	/// This is a software queue capacity, not an observed device queue depth.
-	#[cfg(test)]
-	pub(in crate::storage) const fn submission_capacity(&self) -> u32 {
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+	pub const fn submission_capacity(&self) -> u32 {
 		self.queue_depth
 	}
 
 	/// Forces the native extent path even for one extent, avoiding the
 	/// production QD1 synchronous bypass in controlled transport comparisons.
-	#[cfg(test)]
-	pub(in crate::storage) fn read_extents_forced(
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+	pub fn read_extents_forced(
 		&mut self,
 		extents: &[FilePageExtent],
 		pages: &mut [AlignedPage],
@@ -277,8 +275,8 @@ impl WindowsIoRing {
 	///
 	/// Returns a range, conversion, native submission, completion, or
 	/// exact-byte error. On failure no partial statistics are returned.
-	#[cfg(test)]
-	pub(in crate::storage) fn read_extents_forced_measured(
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+	pub fn read_extents_forced_measured(
 		&mut self,
 		extents: &[FilePageExtent],
 		pages: &mut [AlignedPage],
@@ -307,11 +305,8 @@ impl WindowsIoRing {
 	}
 
 	/// Reads one page per SQE into caller-owned disjoint frames.
-	#[cfg(test)]
-	pub(in crate::storage) fn read_frames(
-		&mut self,
-		reads: &mut [FrameRead<'_>],
-	) -> FerrosGrynnResult<()> {
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+	pub fn read_frames(&mut self, reads: &mut [FrameRead<'_>]) -> FerrosGrynnResult<()> {
 		let requests = Self::frame_requests(reads)?;
 		self.execute(&requests)
 	}
@@ -323,8 +318,8 @@ impl WindowsIoRing {
 	///
 	/// Returns a range, conversion, native submission, completion, or
 	/// exact-byte error. On failure no partial statistics are returned.
-	#[cfg(test)]
-	pub(in crate::storage) fn read_frames_measured(
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+	pub fn read_frames_measured(
 		&mut self,
 		reads: &mut [FrameRead<'_>],
 		sqe_batch_limit: NonZeroUsize,
@@ -334,7 +329,7 @@ impl WindowsIoRing {
 	}
 
 	/// Builds one native request per caller-owned disjoint frame.
-	#[cfg(test)]
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 	fn frame_requests(reads: &mut [FrameRead<'_>]) -> FerrosGrynnResult<Vec<NativeRequest>> {
 		let mut requests = Vec::with_capacity(reads.len());
 		for read in reads {
@@ -406,7 +401,7 @@ impl WindowsIoRing {
 
 	/// Executes requests in explicitly bounded software SQE batches and records
 	/// successful submissions without adding counters to the production path.
-	#[cfg(test)]
+	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 	fn execute_measured(
 		&mut self,
 		requests: &[NativeRequest],

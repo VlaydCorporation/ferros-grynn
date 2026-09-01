@@ -16,9 +16,9 @@ mod page_io_unix;
 mod page_io_windows;
 
 #[cfg(all(windows, feature = "native-async-io"))]
-pub(in crate::storage) use page_io_windows::WindowsIoRing;
-#[cfg(all(test, windows, feature = "native-async-io"))]
-pub(in crate::storage) use page_io_windows::{FrameRead, IoRingSubmissionStats};
+pub use page_io_windows::WindowsIoRing;
+#[cfg(all(windows, feature = "native-async-io"))]
+pub use page_io_windows::{FrameRead, IoRingSubmissionStats};
 
 /// Maximum Windows IoRing submission-queue capacity requested by the first
 /// native implementation.
@@ -35,7 +35,7 @@ pub enum PageIoMode {
 }
 
 /// One file extent and its location inside a shared aligned page buffer.
-pub(super) struct FilePageExtent {
+pub struct FilePageExtent {
 	/// File retained until every native completion has been drained.
 	file: Arc<DirectFile>,
 	/// First physical page in the file extent.
@@ -48,7 +48,7 @@ pub(super) struct FilePageExtent {
 
 impl FilePageExtent {
 	/// Describes one non-empty contiguous file extent.
-	pub(super) fn new(
+	pub fn new(
 		file: Arc<DirectFile>,
 		first_page: PageNo,
 		buffer_start: usize,
