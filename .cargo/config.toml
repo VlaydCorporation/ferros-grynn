@@ -20,5 +20,5 @@ rustflags = [
 
 [profile.profiling]
 inherits = "release"
-debug = true
-strip = false
+debug = 2
+strip = "none"
