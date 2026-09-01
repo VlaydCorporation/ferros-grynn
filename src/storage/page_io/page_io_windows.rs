@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::num::NonZeroUsize;
 use std::{ffi::c_void, mem, sync::Arc};
 
 use windows::Win32::{
@@ -57,6 +59,98 @@ struct NativeRequest {
 	file_offset: u64,
 	/// Read or write operation.
 	operation: NativeOperation,
+}
+
+/// Test-only disjoint destination used by the frame-oriented IoRing probe.
+#[cfg(test)]
+pub(in crate::storage) struct FrameRead<'a> {
+	/// File retained by the benchmark for the complete synchronous submission.
+	file: &'a Arc<crate::storage::direct::DirectFile>,
+	/// Physical page read by this one-frame request.
+	page_no: crate::storage::page::PageNo,
+	/// Direct-I/O-aligned destination frame.
+	frame: &'a mut AlignedPage,
+}
+
+#[cfg(test)]
+impl<'a> FrameRead<'a> {
+	/// Describes one frame-oriented read request.
+	pub(in crate::storage) fn new(
+		file: &'a Arc<crate::storage::direct::DirectFile>,
+		page_no: crate::storage::page::PageNo,
+		frame: &'a mut AlignedPage,
+	) -> Self {
+		Self {
+			file,
+			page_no,
+			frame,
+		}
+	}
+
+	/// Validates the completed frame against its requested page number.
+	///
+	/// # Errors
+	///
+	/// Returns a page-header or checksum error.
+	pub(in crate::storage) fn validate(
+		&self,
+	) -> FerrosGrynnResult<crate::storage::page::PageHeader> {
+		self.frame.validate(self.page_no)
+	}
+}
+
+/// Successful test-only accounting for one bounded IoRing execution.
+///
+/// The limits describe software SQE batches passed to `SubmitIoRing`; they do
+/// not claim the queue depth observed by the storage device.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage) struct IoRingSubmissionStats {
+	/// Configured queue capacity after requested and runtime capability bounds.
+	submission_capacity: u32,
+	/// Caller-requested upper bound for SQEs in one submit call.
+	requested_sqe_batch_limit: usize,
+	/// Requested limit clamped to the runtime submission capacity.
+	effective_sqe_batch_limit: usize,
+	/// Number of successful `SubmitIoRing` calls.
+	submit_calls: usize,
+	/// Number of SQEs accepted across all successful submit calls.
+	submitted_sqes: usize,
+	/// Number of CQEs drained before the execution returned success.
+	completed_cqes: usize,
+}
+
+#[cfg(test)]
+impl IoRingSubmissionStats {
+	/// Returns the configured capacity after runtime capability bounds.
+	pub(in crate::storage) const fn submission_capacity(self) -> u32 {
+		self.submission_capacity
+	}
+
+	/// Returns the requested software SQE batch limit.
+	pub(in crate::storage) const fn requested_sqe_batch_limit(self) -> usize {
+		self.requested_sqe_batch_limit
+	}
+
+	/// Returns the SQE batch limit after clamping to runtime capacity.
+	pub(in crate::storage) const fn effective_sqe_batch_limit(self) -> usize {
+		self.effective_sqe_batch_limit
+	}
+
+	/// Returns the number of successful `SubmitIoRing` calls.
+	pub(in crate::storage) const fn submit_calls(self) -> usize {
+		self.submit_calls
+	}
+
+	/// Returns the total number of SQEs accepted by successful submissions.
+	pub(in crate::storage) const fn submitted_sqes(self) -> usize {
+		self.submitted_sqes
+	}
+
+	/// Returns the total number of CQEs drained by the successful execution.
+	pub(in crate::storage) const fn completed_cqes(self) -> usize {
+		self.completed_cqes
+	}
 }
 
 /// Mutually exclusive IoRing operation encoded by one SQE.
@@ -158,6 +252,104 @@ impl WindowsIoRing {
 		self.execute(&requests)
 	}
 
+	/// Returns the configured submission-queue capacity used to bound chunks.
+	///
+	/// This is a software queue capacity, not an observed device queue depth.
+	#[cfg(test)]
+	pub(in crate::storage) const fn submission_capacity(&self) -> u32 {
+		self.queue_depth
+	}
+
+	/// Forces the native extent path even for one extent, avoiding the
+	/// production QD1 synchronous bypass in controlled transport comparisons.
+	#[cfg(test)]
+	pub(in crate::storage) fn read_extents_forced(
+		&mut self,
+		extents: &[FilePageExtent],
+		pages: &mut [AlignedPage],
+	) -> FerrosGrynnResult<()> {
+		self.read_extents(extents, pages)
+	}
+
+	/// Forces the native extent path and records software submission batches.
+	///
+	/// # Errors
+	///
+	/// Returns a range, conversion, native submission, completion, or
+	/// exact-byte error. On failure no partial statistics are returned.
+	#[cfg(test)]
+	pub(in crate::storage) fn read_extents_forced_measured(
+		&mut self,
+		extents: &[FilePageExtent],
+		pages: &mut [AlignedPage],
+		sqe_batch_limit: NonZeroUsize,
+	) -> FerrosGrynnResult<IoRingSubmissionStats> {
+		super::validate_extent_layout(extents, pages.len())?;
+		let mut requests = Vec::with_capacity(extents.len());
+		for extent in extents {
+			let range = extent.buffer_range(pages.len())?;
+			let file_offset =
+				extent.file.prepare_read_extent(extent.first_page, extent.page_count)?;
+			let byte_len = checked_byte_len(extent.page_count)?;
+			// SAFETY: the caller-validated ranges are non-empty, in bounds,
+			// ordered, and disjoint. The measured executor drains every CQE before
+			// this exclusive page borrow returns.
+			let buffer = unsafe { pages.as_mut_ptr().add(range.start).cast::<c_void>() };
+			requests.push(NativeRequest {
+				file: extent.file.raw_handle()?,
+				buffer,
+				byte_len,
+				file_offset,
+				operation: NativeOperation::Read,
+			});
+		}
+		self.execute_measured(&requests, sqe_batch_limit)
+	}
+
+	/// Reads one page per SQE into caller-owned disjoint frames.
+	#[cfg(test)]
+	pub(in crate::storage) fn read_frames(
+		&mut self,
+		reads: &mut [FrameRead<'_>],
+	) -> FerrosGrynnResult<()> {
+		let requests = Self::frame_requests(reads)?;
+		self.execute(&requests)
+	}
+
+	/// Reads one page per SQE with an explicit software batch limit and returns
+	/// successful submission accounting.
+	///
+	/// # Errors
+	///
+	/// Returns a range, conversion, native submission, completion, or
+	/// exact-byte error. On failure no partial statistics are returned.
+	#[cfg(test)]
+	pub(in crate::storage) fn read_frames_measured(
+		&mut self,
+		reads: &mut [FrameRead<'_>],
+		sqe_batch_limit: NonZeroUsize,
+	) -> FerrosGrynnResult<IoRingSubmissionStats> {
+		let requests = Self::frame_requests(reads)?;
+		self.execute_measured(&requests, sqe_batch_limit)
+	}
+
+	/// Builds one native request per caller-owned disjoint frame.
+	#[cfg(test)]
+	fn frame_requests(reads: &mut [FrameRead<'_>]) -> FerrosGrynnResult<Vec<NativeRequest>> {
+		let mut requests = Vec::with_capacity(reads.len());
+		for read in reads {
+			let file_offset = read.file.prepare_read_extent(read.page_no, 1)?;
+			requests.push(NativeRequest {
+				file: read.file.raw_handle()?,
+				buffer: (read.frame as *mut AlignedPage).cast::<c_void>(),
+				byte_len: checked_byte_len(1)?,
+				file_offset,
+				operation: NativeOperation::Read,
+			});
+		}
+		Ok(requests)
+	}
+
 	/// Builds and executes queued writes from aligned page ranges.
 	pub(super) fn write_extents(
 		&mut self,
@@ -198,18 +390,53 @@ impl WindowsIoRing {
 	/// before returning borrowed buffers to Rust.
 	fn execute(&mut self, requests: &[NativeRequest]) -> FerrosGrynnResult<()> {
 		self.ensure_ring()?;
-		let queue_depth = usize::try_from(self.queue_depth).map_err(|source| {
+		let submission_capacity = usize::try_from(self.queue_depth).map_err(|source| {
 			FerrosGrynnError::storage_io_failure(format!(
-				"Windows IoRing queue depth does not fit usize: {source}"
+				"Windows IoRing submission capacity does not fit usize: {source}"
 			))
 		})?;
-		for requests in requests.chunks(queue_depth) {
+		for requests in requests.chunks(submission_capacity) {
 			if let Err(error) = self.execute_chunk(requests) {
 				self.reset_ring();
 				return Err(error);
 			}
 		}
 		Ok(())
+	}
+
+	/// Executes requests in explicitly bounded software SQE batches and records
+	/// successful submissions without adding counters to the production path.
+	#[cfg(test)]
+	fn execute_measured(
+		&mut self,
+		requests: &[NativeRequest],
+		requested_limit: NonZeroUsize,
+	) -> FerrosGrynnResult<IoRingSubmissionStats> {
+		self.ensure_ring()?;
+		let submission_capacity = usize::try_from(self.queue_depth).map_err(|source| {
+			FerrosGrynnError::storage_io_failure(format!(
+				"Windows IoRing submission capacity does not fit usize: {source}"
+			))
+		})?;
+		let effective_limit = requested_limit.get().min(submission_capacity);
+		let mut stats = IoRingSubmissionStats {
+			submission_capacity: self.queue_depth,
+			requested_sqe_batch_limit: requested_limit.get(),
+			effective_sqe_batch_limit: effective_limit,
+			submit_calls: 0,
+			submitted_sqes: 0,
+			completed_cqes: 0,
+		};
+		for requests in requests.chunks(effective_limit) {
+			if let Err(error) = self.execute_chunk(requests) {
+				self.reset_ring();
+				return Err(error);
+			}
+			stats.submit_calls += 1;
+			stats.submitted_sqes += requests.len();
+			stats.completed_cqes += requests.len();
+		}
+		Ok(stats)
 	}
 
 	/// Executes one chunk that fits the submission queue.

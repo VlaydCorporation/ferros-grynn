@@ -216,6 +216,30 @@ types при необходимости расширяется общими ти
    многфайлового `buffer_pool_pages` зафиксированы в
    [`disk_storage_stage3_report.md`](reports/disk_storage_stage3_report.md).
 
+   **Уточнение (2026-09-01):** статус 2026-08-31 является историческим
+   результатом прежней методики. Повтор baseline на текущем checkout не
+   воспроизвёл performance/RSS gate; до production-интеграции он считается
+   непрошедшим и должен быть повторно подтверждён.
+
+3.1. **Прототипирование нового storage engine и BufferPool V2** — зависит от
+	**3**. Этап остаётся test-only и сам по себе не закрывает текущий
+	неподтверждённый production performance/RSS gate. Варианты Atomic
+   Arena, resolved handles, Windows VM cache, scan admission policies,
+   `ReadFileScatter`, frame-oriented IoRing и bounded prefetch реализуются и
+   сравниваются до выбора production-архитектуры. Подробный порядок,
+   correctness gate и измерительная матрица зафиксированы в
+   [`storage_engine_prototype_plan.md`](storage_engine_prototype_plan.md).
+
+   **Статус (2026-09-01): этап 3.1 завершён как test-only prototype
+   campaign.** Результаты находятся в
+   [`storage_engine_prototype_report.md`](reports/storage_engine_prototype_report.md),
+   компактные данные — в
+   [`storage_engine_prototype_results.csv`](reports/storage_engine_prototype_results.csv),
+   сырые логи и profiler artifacts — в `target/storage-engine-prototype/`.
+   Ни один resident candidate не достиг минимального `90% mmap` floor,
+   поэтому production path не изменён, а полный size sweep финалистов условно
+   пропущен.
+
 4. **Delta-oriented mutation foundation** — зависит от **3**.  
    Убрать полную материализацию local-графа из обычного `edit_graph`; формировать atom/page delta непосредственно из point mutations. Учесть свойства, крупную adjacency, составные `RecordId` и nested graph payload в write-set limit. После профиля сохранить лимит 256 МиБ; private spill реализовывать только при подтверждённом неделимом workload, который нельзя обработать сегментированным импортом.
 
@@ -348,6 +372,12 @@ GrynQL text
 - Первый архитектурный этап касается только `src/` и связанных тестов; `fg-meta` остаётся сырым read-only примером реализации, а не источником требований или готовым production-кодом.
 - Windows GA не ждёт Linux. После Windows freeze несовместимость Linux решается format v2 и миграцией.
 - Production spill не создаётся без измеренного неделимого workload; стандартный bulk-путь — segmented import.
-- Новые dependencies требуют отдельного подтверждения. Предпочтение stdlib или уже подключённому крейту не отменяет проверки соответствия задаче; ручная реализация также не выбирается без обоснования и вывода `rust-workflow`.
+- Новые и закомментированные dependencies разрешены для экспериментальных и
+  production-срезов, но их подключение, как и ручная реализация, требует
+  подтверждённого fit, вывода `rust-workflow`, минимального feature set и
+  измеримого преимущества. Наличие зависимости в комментариях не считается
+  архитектурным решением. Код из `src/asynchronous` и `src/collections`
+  допускается после аудита его контракта, ошибок, concurrency/safety свойств и
+  тестов; в этапе 3.1 он не понадобился.
 - macOS, distributed execution, SPDK, ARIES/UNDO, JIT, SMT optimizer verification и parallel recovery остаются вне плана.
 - Документы и отчёты пишутся по-русски, комментарии Rust-кода — по-английски.

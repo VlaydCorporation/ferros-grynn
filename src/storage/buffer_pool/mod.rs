@@ -612,7 +612,10 @@ enum AccessDecision {
 }
 
 /// Ensures a loader returned the immutable page version named by its key.
-fn validate_loaded_header(key: PageCacheKey, header: PageHeader) -> FerrosGrynnResult<()> {
+pub(in crate::storage) fn validate_loaded_header(
+	key: PageCacheKey,
+	header: PageHeader,
+) -> FerrosGrynnResult<()> {
 	if header.page_no() != key.page_no() {
 		return Err(FerrosGrynnError::invalid_storage_page(
 			key.page_no().get(),
@@ -659,16 +662,21 @@ fn validate_loaded_header(key: PageCacheKey, header: PageHeader) -> FerrosGrynnR
 mod tests {
 	use std::{
 		error::Error,
+		hint::black_box,
 		io,
 		num::NonZeroUsize,
 		sync::{
 			Arc,
+			Barrier,
 			atomic::{AtomicUsize, Ordering},
 			mpsc,
 		},
 		thread,
 		time::{Duration, Instant},
 	};
+
+	use dashmap::DashMap;
+	use rapidhash::fast::RandomState as RapidRandomState;
 
 	use super::*;
 	use crate::storage::{
@@ -680,6 +688,8 @@ mod tests {
 	const TEST_FILE_ID: DataFileId = DataFileId::for_kind(DataFileKind::SystemCatalog);
 	/// Maximum time allowed for a deterministic inter-thread handoff.
 	const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+	/// Repeated samples used by the ignored resident-hit cost probe.
+	const RESIDENT_COST_SAMPLES: usize = 7;
 
 	/// Creates a non-zero test capacity without panicking.
 	fn capacity(value: usize) -> Result<NonZeroUsize, io::Error> {
@@ -736,6 +746,76 @@ mod tests {
 			thread::yield_now();
 		}
 		false
+	}
+
+	/// Returns the median aggregate cost of one repeated diagnostic operation.
+	#[allow(
+		clippy::cast_precision_loss,
+		reason = "diagnostic nanosecond output needs only human-readable precision"
+	)]
+	fn median_ns_per_operation(iterations: usize, mut operation: impl FnMut()) -> f64 {
+		let mut samples = [0.0; RESIDENT_COST_SAMPLES];
+		for _ in 0..iterations / 10 {
+			operation();
+		}
+		for sample in &mut samples {
+			let started = Instant::now();
+			for _ in 0..iterations {
+				operation();
+			}
+			*sample = started.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64;
+		}
+		samples.sort_unstable_by(f64::total_cmp);
+		samples[samples.len() / 2]
+	}
+
+	/// Measures aggregate resident throughput with a synchronized reader set.
+	#[allow(
+		clippy::cast_precision_loss,
+		reason = "diagnostic throughput needs only human-readable precision"
+	)]
+	fn concurrent_resident_ops(
+		pool: &BufferPool,
+		keys: &[PageCacheKey],
+		thread_count: usize,
+		operations_per_thread: usize,
+		same_key: bool,
+	) -> io::Result<f64> {
+		let barrier = Arc::new(Barrier::new(thread_count + 1));
+		let elapsed = thread::scope(|scope| -> io::Result<Duration> {
+			let mut handles = Vec::with_capacity(thread_count);
+			for thread_index in 0..thread_count {
+				let barrier = Arc::clone(&barrier);
+				handles.push(scope.spawn(move || -> io::Result<()> {
+					barrier.wait();
+					for operation in 0..operations_per_thread {
+						let index = if same_key {
+							0
+						} else {
+							(thread_index + operation * thread_count) % keys.len()
+						};
+						let guard = pool
+							.get_or_load(keys[index], |_page| {
+								Err(FerrosGrynnError::storage_io_failure(
+									"concurrent resident probe unexpectedly invoked its loader",
+								))
+							})
+							.map_err(|source| io::Error::other(source.to_string()))?;
+						black_box(guard.as_bytes()[PAGE_HEADER_SIZE]);
+					}
+					Ok(())
+				}));
+			}
+			let started = Instant::now();
+			barrier.wait();
+			for handle in handles {
+				handle.join().map_err(|_panic_payload| {
+					io::Error::other("resident probe reader panicked")
+				})??;
+			}
+			Ok(started.elapsed())
+		})?;
+		Ok((thread_count * operations_per_thread) as f64 / elapsed.as_secs_f64())
 	}
 
 	#[test]
@@ -909,6 +989,193 @@ mod tests {
 		));
 		drop(state);
 		dropper.join().map_err(|_panic_payload| io::Error::other("guard dropper panicked"))?;
+		Ok(())
+	}
+
+	/// Decomposes the uncontended resident-hit path without per-operation
+	/// tracing.
+	#[test]
+	#[ignore = "release-mode diagnostic for resident buffer-pool hit costs"]
+	fn resident_hit_cost_probe() -> Result<(), Box<dyn Error>> {
+		const CAPACITY: usize = 4096;
+		const ITERATIONS: usize = 1_000_000;
+		const CONCURRENT_OPERATIONS: usize = 100_000;
+		let pool = BufferPool::new(capacity(CAPACITY)?);
+		let mut keys = Vec::with_capacity(CAPACITY);
+		for index in 0..CAPACITY {
+			let raw_index = u64::try_from(index).map_err(|source| {
+				io::Error::other(format!("resident key index overflow: {source}"))
+			})?;
+			let resident_key = key(raw_index, raw_index + 1);
+			drop(pool.get_or_load(resident_key, |page| {
+				load_test_page(page, resident_key, raw_index.to_le_bytes()[0])
+			})?);
+			keys.push(resident_key);
+		}
+		let (frame_indices, pages) = {
+			let state = pool.shared.state.lock();
+			let mut frame_indices = Vec::with_capacity(CAPACITY);
+			let mut pages = Vec::with_capacity(CAPACITY);
+			for resident_key in &keys {
+				let frame_index = state
+					.entries
+					.get(resident_key)
+					.copied()
+					.ok_or_else(|| io::Error::other("resident probe key is not indexed"))?;
+				let FrameState::Resident {
+					page,
+					..
+				} = &state.frames[frame_index]
+				else {
+					return Err(io::Error::other("resident probe frame is not resident").into());
+				};
+				frame_indices.push(frame_index);
+				pages.push(Arc::clone(page));
+			}
+			(frame_indices, pages)
+		};
+		let dash_entries = DashMap::with_capacity_and_hasher(CAPACITY, RapidRandomState::default());
+		for (resident_key, frame_index) in keys.iter().copied().zip(frame_indices.iter().copied()) {
+			dash_entries.insert(resident_key, frame_index);
+		}
+
+		let mut cursor = 0_usize;
+		let empty = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			black_box(keys[index]);
+		});
+		let mut cursor = 0_usize;
+		let lock = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			black_box(keys[index]);
+			let state = pool.shared.state.lock();
+			black_box(state.frames.len());
+		});
+		let hash = {
+			let state = pool.shared.state.lock();
+			let mut cursor = 0_usize;
+			median_ns_per_operation(ITERATIONS, || {
+				let index = cursor & (CAPACITY - 1);
+				cursor = cursor.wrapping_add(1);
+				black_box(state.entries.get(black_box(&keys[index])).copied());
+			})
+		};
+		let mut cursor = 0_usize;
+		let lock_hash = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			let state = pool.shared.state.lock();
+			black_box(state.entries.get(black_box(&keys[index])).copied());
+		});
+		let resident_update = {
+			let mut state = pool.shared.state.lock();
+			let mut cursor = 0_usize;
+			median_ns_per_operation(ITERATIONS, || {
+				let index = cursor & (CAPACITY - 1);
+				cursor = cursor.wrapping_add(1);
+				let decision = state.access_resident(frame_indices[index]);
+				black_box(decision.is_ok());
+			})
+		};
+		let mut cursor = 0_usize;
+		let prepare_access = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			let decision = pool.prepare_access(black_box(keys[index]));
+			black_box(decision.is_ok());
+		});
+		let mut cursor = 0_usize;
+		let page_arc = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			black_box(Arc::clone(&pages[index]));
+		});
+		let mut cursor = 0_usize;
+		let shared_arc = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			black_box(keys[index]);
+			black_box(Arc::clone(&pool.shared));
+		});
+		let mut cursor = 0_usize;
+		let waiter_load = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			black_box(keys[index]);
+			black_box(pool.shared.capacity_waiters.load(AtomicOrdering::Relaxed));
+		});
+		let mut cursor = 0_usize;
+		let guard = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			let guard = pool.guard(Arc::clone(&pages[index]));
+			black_box(guard.as_bytes()[PAGE_HEADER_SIZE]);
+		});
+		let mut cursor = 0_usize;
+		let full_hit = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			let result = pool.get_or_load(black_box(keys[index]), |_page| {
+				Err(FerrosGrynnError::storage_io_failure(
+					"resident probe unexpectedly invoked its loader",
+				))
+			});
+			if let Ok(guard) = result {
+				black_box(guard.as_bytes()[PAGE_HEADER_SIZE]);
+			}
+		});
+		let mut cursor = 0_usize;
+		let dash_lookup = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			black_box(dash_entries.get(black_box(&keys[index])).map(|entry| *entry));
+		});
+		let mut cursor = 0_usize;
+		let dash_lock_update = median_ns_per_operation(ITERATIONS, || {
+			let index = cursor & (CAPACITY - 1);
+			cursor = cursor.wrapping_add(1);
+			let frame_index = dash_entries.get(black_box(&keys[index])).map(|entry| *entry);
+			if let Some(frame_index) = frame_index {
+				let decision = pool.shared.state.lock().access_resident(frame_index);
+				black_box(decision.is_ok());
+			}
+		});
+
+		let final_guard = pool.get_or_load(keys[0], |_page| {
+			Err(FerrosGrynnError::storage_io_failure(
+				"resident probe unexpectedly invoked its loader",
+			))
+		})?;
+		assert_eq!(final_guard.as_bytes()[PAGE_HEADER_SIZE], 0);
+		println!(
+			"resident_hit_cost_probe entries={CAPACITY} iterations={ITERATIONS} key_bytes={} \
+			 guard_bytes={} empty_ns={empty:.2} lock_ns={lock:.2} hash_ns={hash:.2} \
+			 lock_hash_ns={lock_hash:.2} resident_update_ns={resident_update:.2} \
+			 prepare_access_ns={prepare_access:.2} page_arc_ns={page_arc:.2} \
+			 shared_arc_ns={shared_arc:.2} waiter_load_ns={waiter_load:.2} \
+			 guard_roundtrip_ns={guard:.2} full_hit_ns={full_hit:.2} \
+			 dash_lookup_ns={dash_lookup:.2} dash_lock_update_ns={dash_lock_update:.2}",
+			size_of::<PageCacheKey>(),
+			size_of::<PageGuard>(),
+		);
+		drop(final_guard);
+		let max_threads = thread::available_parallelism()?.get().min(8);
+		for thread_count in [1, 2, 4, 8] {
+			if thread_count > max_threads {
+				continue;
+			}
+			let same_key =
+				concurrent_resident_ops(&pool, &keys, thread_count, CONCURRENT_OPERATIONS, true)?;
+			let distributed =
+				concurrent_resident_ops(&pool, &keys, thread_count, CONCURRENT_OPERATIONS, false)?;
+			println!(
+				"resident_hit_concurrency threads={thread_count} same_key_ops_s={same_key:.0} \
+				 distributed_keys_ops_s={distributed:.0}"
+			);
+		}
+		assert_eq!(pool.stats().backpressure_waits(), 0);
 		Ok(())
 	}
 

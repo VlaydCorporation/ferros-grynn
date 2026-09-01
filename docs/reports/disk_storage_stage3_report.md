@@ -213,27 +213,156 @@ memory contract, что жёсткий application-level budget.
 разница throughput была меньше, что подтверждает чувствительность короткого
 resident probe к CPU frequency и состоянию host.
 
-Tracy-профиль 17 408 resident calls дал ориентиры для вложенных участков:
+Первый Tracy-профиль 17 408 resident calls дал ориентиры 47 нс для metadata
+state, 23 нс для lookup, 68 нс для resident update и 53 нс для `PageGuard`.
+Однако эти зоны были вложены, а полный instrumented `prepare_access` вырос
+примерно до 380 нс. Для участков длительностью в десятки наносекунд стоимость
+самих зон уже сравнима с полезной работой, поэтому эти числа нельзя считать
+стоимостью соответствующих Rust-операций.
 
-- захват и удержание metadata state — около 47 нс;
-- lookup реального 48-байтного `PageCacheKey` — около 23 нс;
-- resident update (`referenced`, счётчик hit, `Arc::clone`) — около 68 нс;
-- построение `PageGuard` — около 53 нс.
+### Повторная декомпозиция без per-operation instrumentation
 
-Значения вложены и частично перекрываются, поэтому их нельзя просто сложить.
-Полный instrumented `prepare_access` вырос примерно до 380 нс: это показывает,
-что Tracy заметно возмущает такой короткий путь, и его instrumented ops/s не
-использовался как итоговый benchmark.
+Добавлен ignored release-probe, который заранее заселяет настоящие 4096
+frames, циклически обращается ко всему 64-МиБ working set и измеряет каждый
+вариант агрегированно: 1 000 000 операций, семь samples, итог — median. Три
+контрольных прогона после полного отката экспериментальных production-изменений
+дали следующие диапазоны:
 
-Mutex не удерживается во время I/O. На hit он защищает lookup, reference bit,
-обычный счётчик и clone resident `Arc`; затем освобождается до создания/жизни
-guard. На QD1 профиль не обнаружил «слишком долгого» удержания. Это не доказывает
-отсутствие contention при множестве reader threads: прежде чем шардировать
-pool, нужен отдельный concurrent resident benchmark с измерением wait time.
+| Участок                                              |        Стоимость |
+|------------------------------------------------------|-----------------:|
+| Пустой цикл с выбором ключа                          |     0,93–1,41 нс |
+| Uncontended `lock` + `unlock` metadata mutex         |   18,69–19,58 нс |
+| `entries.get(&key).copied()` под заранее взятым lock |    7,29–13,84 нс |
+| `lock` + hash lookup + `unlock`                      |   19,86–23,96 нс |
+| `access_resident` без захвата mutex                  |   18,30–20,67 нс |
+| Полный `prepare_access`                              |   45,59–51,26 нс |
+| Clone/drop resident page `Arc`                       |   15,68–16,46 нс |
+| Clone/drop `Shared` `Arc`                            |   17,98–18,48 нс |
+| Relaxed read числа capacity waiters                  |     1,18–2,31 нс |
+| Полный guard round-trip с payload touch              |   35,63–40,99 нс |
+| Полный `get_or_load` resident hit                    | 112,45–117,76 нс |
+| Только `DashMap` lookup                              |   26,85–28,16 нс |
+| `DashMap` lookup + текущий locked resident update    |   59,35–65,56 нс |
 
-Счётчик hit находится под тем же уже взятым mutex и не является atomic. Его
-отдельная доминирующая стоимость не обнаружена. Удалять observability ради
-предположения не следует.
+Строки неаддитивны: они по-разному прогревают cache lines, включают возврат и
+drop временных значений, а некоторые являются вложенными. Надёжный итог здесь
+не сумма строк, а полный hit 112–118 нс, совпадающий по порядку с наблюдаемым
+отставанием от mmap.
+
+### Что именно происходит в `prepare_access`
+
+На resident hit цикл выполняет ровно одну итерацию:
+
+1. Берёт `parking_lot::Mutex<ClockPro>`.
+2. Делает `entries.get(&key).copied()`.
+3. Вызывает `access_resident(frame_index)` и выходит через `break`.
+
+`reserve`, регистрация waiter и `capacity_available.wait(&mut state)` на этой
+ветке не исполняются. Проверка после прогона подтверждает
+`backpressure_waits == 0`. Следовательно, стоимость condvar wait на resident
+hit равна нулю, а 46–51 нс — это lock, lookup, frame lookup/update и page pin,
+а не ожидание свободной capacity.
+
+Цикл нужен miss-ветке без свободного/вытесняемого frame. Первый неуспешный
+`reserve` освобождает state, регистрирует waiter и повторяет проверку, закрывая
+lost-wake окно. Только если capacity всё ещё недоступна, `Condvar::wait`
+атомарно отпускает mutex и усыпляет caller. Mutex никогда не удерживается во
+время физического I/O.
+
+Из 46–51 нс `prepare_access` около 19 нс занимает uncontended lock/unlock, а
+вся комбинация lock+lookup — около 20–24 нс. Остаток включает обращение к
+`frames[frame_index]`, проверку `FrameState`, `referenced = true`, увеличение
+обычного hit counter и clone resident `Arc`. Это QD1-стоимость короткой
+критической секции, а не 47 нс ожидания mutex.
+
+### Что означал `resident update`
+
+`access_resident` делает только match состояния frame, запись reference bit,
+увеличение `hits` и `Arc::clone(page)`. Повторный probe измеряет весь вызов
+вместе с drop возвращённого `AccessDecision` в 18–21 нс. Отдельный clone/drop
+page `Arc` занимает 16 нс, поэтому reference bit, counter и ветвление не
+являются самостоятельными десятками наносекунд. Прежние 68 нс были
+возмущённым Tracy-измерением вложенной зоны, а не фактической стоимостью
+resident update.
+
+Счётчик hit находится под уже взятым mutex и не является atomic. Перенос его в
+общий atomic добавил бы cache-line contention, а удаление ухудшило бы
+наблюдаемость. Ни одно из этих изменений не оправдано измеренным остатком.
+
+### Что стоит в `PageGuard`
+
+`PageGuard` занимает 16 байт: один `Arc` pinned page и один `Arc<Shared>` в
+`ReleaseNotifier`. Метод `guard` не клонирует page: он перемещает уже pinned
+`Arc` из `AccessDecision` и клонирует только `Shared`. Но полный жизненный цикл
+включает ранее выполненный page pin, clone `Shared`, чтение payload и drop.
+Именно этот round-trip стоит 36–41 нс; отдельно clone/drop `Shared` — около
+18 нс, page `Arc` — около 16 нс, а relaxed waiter check при drop — 1–2 нс.
+Запись двух полей структуры не объясняет прежние 53 нс: это снова был предел
+точности instrumented зоны.
+
+На drop сначала освобождается page pin, затем notifier читает число waiters.
+При нуле он не берёт mutex и не вызывает notify. Owned `Arc<Shared>` сохраняет
+важный контракт: guard можно передать другому thread и хранить независимо от
+заимствования конкретного `BufferPool`. Замена на borrowed reference ради
+одного atomic clone протащила бы lifetime через `PageRead` и существующие
+callers, поэтому это уже изменение API/lifetime contract, а не бесплатная
+оптимизация.
+
+### Нужен ли `DashMap`
+
+Нет, как прямая замена `entries` — нет. Его одиночный lookup оказался
+медленнее текущего `RapidHashMap` вместе с metadata mutex: 27–28 нс против
+20–24 нс. После lookup всё равно требуется согласованно изменить
+`FrameState::referenced`, stats и CLOCK-Pro metadata. Вариант
+`DashMap + state.lock()` дал 59–66 нс против 46–51 нс текущего
+`prepare_access`, то есть добавил второй lock layer.
+
+Настоящий lock-free/sharded resident fast path потребовал бы уже не замены map,
+а новой модели: resident directory со стабильными entry-объектами, atomic
+reference bits/counters и протоколом согласования eviction, pinning и удаления
+устаревшего frame index. Без такого протокола возникает stale-index/ABA race.
+Это допустимый будущий прототип, но не локальный безопасный fix.
+
+Контрольный concurrent probe всё же доказал, что единый metadata state станет
+пределом при большом числе reader threads:
+
+| Threads | Один сверхгорячий key | Распределённые keys |
+|--------:|----------------------:|--------------------:|
+|       1 |          13,75 Mops/s |         6,94 Mops/s |
+|       2 |           8,18 Mops/s |         7,77 Mops/s |
+|       4 |           4,14 Mops/s |         3,57 Mops/s |
+|       8 |           2,50 Mops/s |         1,72 Mops/s |
+
+Это aggregate-измерение без per-op timestamp: оно показывает отсутствие
+масштабирования, но не меняет вывод по QD1. Узкое место многопоточного пути —
+единые CLOCK-Pro invariants и изменяемые cache lines в целом, а не только
+контейнер `entries`. Шардирование следует прототипировать, когда реальный
+query workload подтвердит такой reader fan-out.
+
+### Почему разница выглядит как миллион ops/s
+
+В итоговом повторном прогоне Direct+BufferPool дал 2 607 620 ops/s
+(383,5 нс/op), mmap — 3 722 410 ops/s (268,6 нс/op). Разница 1 114 790 ops/s
+полностью следует из дополнительных 114,9 нс, потому что throughput — обратная
+величина latency: `1e9 / 268,6` и `1e9 / 383,5`. Миллион не является ещё одним
+необнаруженным этапом работы; на базе около 270 нс даже сто дополнительных
+наносекунд сильно меняют обратную величину.
+
+`measure_order` берёт `Instant` и записывает latency на каждой операции.
+Контрольный no-op через тот же harness дал 132,5 нс/op и p99 0,1 мкс. Эта
+общая стоимость входит и в pool, и в mmap, поэтому не объясняет их среднюю
+разницу, но делает абсолютные ops/s ниже и квантует короткий p99 шагом около
+0,1 мкс. Финальный p99 был 0,8 против 0,5 мкс, ранее — 0,8 против 0,4 мкс.
+Следовательно, устойчивый вывод — дополнительный хвост 0,3–0,4 мкс при
+пройденном gate `mmap + 0,5 мкс`; приписать каждую десятую микросекунды одному
+полю по этому harness нельзя.
+
+Для устранения branch/cold-path overhead был проверен минимальный production
+эксперимент: inline resident dispatch и вынос wait/load веток в cold helpers.
+Он сдвинул aggregate full-hit лишь на несколько наносекунд внутри межпрогонного
+шума и не изменил p99. Изменение полностью отменено. Production hot path и
+CLOCK-Pro остались прежними; сохранён только воспроизводимый ignored probe и
+учёт стоимости benchmark harness.
 
 ## Hash lookup, плотная память и VecMap
 
@@ -434,7 +563,11 @@ concurrency/safety ошибку. Добавлять instrumentation или за�
 - `rustfmt +nightly --edition 2024` для двух изменённых Rust-файлов — пройден.
 - `cargo +nightly fmt --all --check` — пройден.
 - `cargo test --lib --no-default-features storage::buffer_pool::tests` —
-  14 passed.
+  14 passed, диагностический resident probe ожидаемо ignored.
+- Release resident cost probe — passed; три финальных samples после отката
+  production-эксперимента дали полный hit 112,45–117,76 нс.
+- Парный resident/mmap probe после отката — passed: 2,608 против 3,722 Mops/s,
+  p99 0,8 против 0,5 мкс; no-op harness 132,5 нс/op и p99 0,1 мкс.
 - Unit-test парной агрегации — passed.
 - Release cache-index probe — passed.
 - `cargo check --tests --no-default-features` — passed.

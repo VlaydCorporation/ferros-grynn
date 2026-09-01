@@ -43,3 +43,5 @@ pub use store::{
 
 #[cfg(test)]
 mod benchmarks;
+#[cfg(test)]
+mod prototypes;

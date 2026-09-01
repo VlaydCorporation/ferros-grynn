@@ -16,10 +16,12 @@ mod page_io_unix;
 mod page_io_windows;
 
 #[cfg(all(windows, feature = "native-async-io"))]
-use page_io_windows::WindowsIoRing;
+pub(in crate::storage) use page_io_windows::WindowsIoRing;
+#[cfg(all(test, windows, feature = "native-async-io"))]
+pub(in crate::storage) use page_io_windows::{FrameRead, IoRingSubmissionStats};
 
-/// Maximum Windows IoRing submission depth requested by the first native
-/// implementation.
+/// Maximum Windows IoRing submission-queue capacity requested by the first
+/// native implementation.
 #[cfg(all(windows, feature = "native-async-io"))]
 const WINDOWS_IORING_QUEUE_DEPTH: u32 = 128;
 
@@ -332,6 +334,70 @@ mod tests {
 		{
 			page.validate(PageNo::new(raw_page_no))?;
 			assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], marker);
+		}
+		Ok(())
+	}
+
+	/// Test-only frame reads report software SQE batching independently of any
+	/// device queue-depth interpretation.
+	#[cfg(all(windows, feature = "native-async-io"))]
+	#[test]
+	fn windows_ioring_reports_bounded_frame_submissions() -> FerrosGrynnResult<()> {
+		use std::num::NonZeroUsize;
+
+		use crate::storage::page::PAGE_HEADER_SIZE;
+
+		const PAGE_COUNT: usize = 9;
+		const SQE_BATCH_LIMITS: [usize; 4] = [1, 8, 32, 128];
+
+		let path = TestPath::new()?;
+		{
+			let writer = DirectFile::create_new(path.as_path())?;
+			writer.resize_pages(PAGE_COUNT as u64)?;
+			let mut pages = Vec::with_capacity(PAGE_COUNT);
+			for raw_page_no in 0..PAGE_COUNT as u64 {
+				pages.push(test_page(raw_page_no, raw_page_no as u8)?);
+			}
+			writer.write_pages(PageNo::new(0), &pages)?;
+			writer.sync_data()?;
+		}
+
+		let file = Arc::new(DirectFile::open_read_write_with_mode(
+			path.as_path(),
+			DirectFileOpenMode::Overlapped,
+		)?);
+		let mut ring = WindowsIoRing::new()?;
+		let submission_capacity =
+			usize::try_from(ring.submission_capacity()).map_err(|source| {
+				FerrosGrynnError::storage_io_failure(format!(
+					"IoRing test submission capacity does not fit usize: {source}"
+				))
+			})?;
+		assert!(submission_capacity > 0);
+
+		for requested_limit in SQE_BATCH_LIMITS {
+			let mut frames = (0..PAGE_COUNT).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
+			let mut reads = frames
+				.iter_mut()
+				.enumerate()
+				.map(|(index, frame)| FrameRead::new(&file, PageNo::new(index as u64), frame))
+				.collect::<Vec<_>>();
+			let requested_limit = NonZeroUsize::new(requested_limit).ok_or_else(|| {
+				FerrosGrynnError::storage_io_failure("IoRing test SQE batch limit is zero")
+			})?;
+			let stats = ring.read_frames_measured(&mut reads, requested_limit)?;
+			let effective_limit = requested_limit.get().min(submission_capacity);
+			assert_eq!(stats.submission_capacity(), ring.submission_capacity());
+			assert_eq!(stats.requested_sqe_batch_limit(), requested_limit.get());
+			assert_eq!(stats.effective_sqe_batch_limit(), effective_limit);
+			assert_eq!(stats.submit_calls(), PAGE_COUNT.div_ceil(effective_limit));
+			assert_eq!(stats.submitted_sqes(), PAGE_COUNT);
+			assert_eq!(stats.completed_cqes(), PAGE_COUNT);
+			drop(reads);
+			for (index, frame) in frames.iter().enumerate() {
+				frame.validate(PageNo::new(index as u64))?;
+				assert_eq!(frame.as_bytes()[PAGE_HEADER_SIZE], index as u8);
+			}
 		}
 		Ok(())
 	}

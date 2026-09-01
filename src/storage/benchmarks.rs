@@ -640,9 +640,14 @@ fn disk_storage_stage3_resident_probe() -> Result<(), Box<dyn Error>> {
 	let comparison = run_read_workload(&config, &workload, 0)?;
 	let pooled = comparison.backend(ReadBackend::PooledDirect)?.metrics;
 	let mapped = comparison.backend(ReadBackend::Mmap)?.metrics;
+	let harness = measure_order(&workload.order, 1, MetricUnit::Marker, |_pages| {
+		black_box(0_u8);
+		Ok(())
+	})?;
 	println!(
 		"stage3_resident_probe pool_pages={} repetitions={} pooled_ops_s={:.0} mmap_ops_s={:.0} \
-		 pooled_mmap_ratio={:.4} pooled_p99_us={:.3} mmap_p99_us={:.3}",
+		 pooled_mmap_ratio={:.4} pooled_p99_us={:.3} mmap_p99_us={:.3} harness_mean_ns={:.2} \
+		 harness_p99_us={:.3}",
 		config.pool_pages,
 		config.repetitions,
 		pooled.operations_per_second(),
@@ -650,6 +655,8 @@ fn disk_storage_stage3_resident_probe() -> Result<(), Box<dyn Error>> {
 		pooled.operations_per_second() / mapped.operations_per_second(),
 		pooled.p99_micros(),
 		mapped.p99_micros(),
+		harness.nanoseconds_per_operation(),
+		harness.p99_micros(),
 	);
 	Ok(())
 }
