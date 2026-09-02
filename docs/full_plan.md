@@ -259,6 +259,18 @@ types при необходимости расширяется общими ти
    перенос waiter bookkeeping с resident release path и oversubscribed
    сравнение Direct/scatter/prefetch — зафиксирован в итоговом разделе отчёта.
 
+   **Итог продолжения (2026-09-02):** dependency-ordered эксперимент завершён.
+   Cursor-scoped `R8` read epoch достиг `97,4–105,1%` mmap в изолированном
+   resident-тесте; в общем бюджете для `1/4/8` файлов — `93,9/94,5/100,5%`
+   paired median при разнице p99 не более `12 ns`. Для B+tree leaf scan
+   комбинация `R8 + Rocks-like bypass + ReadFileScatter + P1` достигла
+   `185,4%` mmap, а для заранее известного sparse frontier комбинация
+   `R8 + frame-IoRing QD32` — `457,6–506,3%` mmap. ETW подтвердил, что mmap
+   большого файла создаёт четыре 4-КиБ fault на одну страницу БД; `99,26784%`
+   из них были transition faults. Выбранная Pareto-архитектура и
+   dependency-ordered production migration plan записаны в итоговом разделе
+   отчёта. Production path по-прежнему не изменён.
+
 4. **Delta-oriented mutation foundation** — зависит от **3**.  
    Убрать полную материализацию local-графа из обычного `edit_graph`; формировать atom/page delta непосредственно из point mutations. Учесть свойства, крупную adjacency, составные `RecordId` и nested graph payload в write-set limit. После профиля сохранить лимит 256 МиБ; private spill реализовывать только при подтверждённом неделимом workload, который нельзя обработать сегментированным импортом.
 

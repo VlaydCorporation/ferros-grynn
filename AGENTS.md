@@ -33,6 +33,7 @@ src/
 docs/                         # Specifications, plans and reports
 ferros-grynn-bench/           # Ferros-Grynn benchmarks
 crates/ferros-grynn-macros/   # Production procedural macros
+crates/fg-storage-engine-prototypes/  # Test-only storage experiments and probes
 crates/{ferntree,storekey,surrealmx,surrealdb}/  # Read-only reference trees
 tests/                        # Integration tests
 ```
@@ -92,13 +93,19 @@ you touch rather than assuming every configuration is complete.
 - `crates/fg-meta` is a raw, unverified implementation example. It is not a
   specification or behavioral source of truth and needs the same review as any
   other reference before ideas or code are reused.
+- `crates/fg-storage-engine-prototypes` owns test-only BufferPool/transport
+  experiments. It depends on the root crate through the temporary hidden
+  `storage-engine-prototype-api` feature; production code must not depend on
+  this crate, and profiling uses `--profile profiling` with the exact
+  same-stem EXE/PDB pair produced for this package.
 - `crates/storekey`, `crates/surrealmx`, `crates/ferntree` and
   `crates/surrealdb` are local study/reference trees, not root dependencies or
   workspace members. Their useful areas are summarized in
   `docs/reports/future_capability_analysis_stage_1_6.md` §§7.3–7.6.
-  `crates/ferros-grynn-macros` and `ferros-grynn-bench` are the actual
-  additional workspace members. The removed `crates/configuration` must not be
-  treated as an available implementation source.
+  `crates/ferros-grynn-macros`, `crates/fg-storage-engine-prototypes` and
+  `ferros-grynn-bench` are the actual additional workspace members. The
+  removed `crates/configuration` must not be treated as an available
+  implementation source.
 
 Current `src/`, current tests and the normative specifications control
 production behavior. Reference trees may supply hypotheses, algorithms or

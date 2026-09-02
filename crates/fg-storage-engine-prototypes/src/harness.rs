@@ -79,7 +79,9 @@ const DEFAULT_RESIDENT_OPERATIONS: u64 = 2_000_000;
 /// Default normalized-latency batch size.
 const DEFAULT_LATENCY_BATCH: usize = 1_024;
 /// Logical accesses amortized by one resident page pin.
-const RESIDENT_RUN_LENGTHS: [usize; 4] = [1, 4, 16, 64];
+const RESIDENT_RUN_LENGTHS: [usize; 6] = [1, 4, 16, 32, 64, 128];
+/// Run lengths retained in the process-isolated finalist gate.
+const RESIDENT_ISOLATED_RUN_LENGTHS: [usize; 6] = [1, 4, 16, 32, 64, 128];
 /// Default Direct-I/O extent size.
 const DEFAULT_EXTENT_PAGES: usize = 128;
 /// Immutable bounded prefetch-depth screening order.
@@ -873,6 +875,10 @@ enum ResidentNextCandidate {
 	DenseFlatRun,
 	/// Sparse two-level locator pinned once for a physical run.
 	DenseTwoLevelRun,
+	/// Cached frame handle borrowed inside one cursor-scoped read epoch.
+	EpochResolved,
+	/// Flat source-bound locator borrowed inside one cursor-scoped read epoch.
+	EpochDenseFlat,
 }
 
 impl ResidentNextCandidate {
@@ -886,12 +892,14 @@ impl ResidentNextCandidate {
 			Self::ResolvedRun => "R3_resolved_run",
 			Self::DenseFlatRun => "R6_dense_flat_run",
 			Self::DenseTwoLevelRun => "R7_dense_two_level_run",
+			Self::EpochResolved => "R8_epoch_resolved",
+			Self::EpochDenseFlat => "R8_epoch_dense_flat",
 		}
 	}
 }
 
 /// Stable order used for paired resident-next measurements.
-const RESIDENT_NEXT_CANDIDATES: [ResidentNextCandidate; 7] = [
+const RESIDENT_NEXT_CANDIDATES: [ResidentNextCandidate; 9] = [
 	ResidentNextCandidate::Mmap,
 	ResidentNextCandidate::ResolvedPerAccess,
 	ResidentNextCandidate::DenseFlatPerAccess,
@@ -899,7 +907,72 @@ const RESIDENT_NEXT_CANDIDATES: [ResidentNextCandidate; 7] = [
 	ResidentNextCandidate::ResolvedRun,
 	ResidentNextCandidate::DenseFlatRun,
 	ResidentNextCandidate::DenseTwoLevelRun,
+	ResidentNextCandidate::EpochResolved,
+	ResidentNextCandidate::EpochDenseFlat,
 ];
+
+/// Candidate fixtures permitted in the process-isolated crossover probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentIsolatedCandidate {
+	/// Fully prevalidated mapping without an arena fixture in the process.
+	Mmap,
+	/// Independent resolved pins with the original guard-side notification.
+	NotifyResolved,
+	/// Flat source-bound locator without a mapping fixture in the process.
+	DenseFlatRun,
+	/// Cached frame handles borrowed inside one cursor-scoped read epoch.
+	EpochResolved,
+	/// Flat source-bound locator borrowed inside one cursor-scoped read epoch.
+	EpochDenseFlat,
+	/// Page addresses resolved once and retained for the whole read epoch.
+	EpochPageTable,
+	/// Independent resolved pins with capacity waiting moved to the miss side.
+	MissBackoffResolved,
+}
+
+impl ResidentIsolatedCandidate {
+	/// Stable raw-CSV and selector label.
+	const fn label(self) -> &'static str {
+		match self {
+			Self::Mmap => "R0_mmap",
+			Self::NotifyResolved => "R3_notify_resolved",
+			Self::DenseFlatRun => "R6_dense_flat_run",
+			Self::EpochResolved => "R8_epoch_resolved",
+			Self::EpochDenseFlat => "R8_epoch_dense_flat",
+			Self::EpochPageTable => "R8_epoch_page_table",
+			Self::MissBackoffResolved => "R9_miss_backoff_resolved",
+		}
+	}
+}
+
+/// Exact process-isolated candidates; all other resident variants remain in
+/// the combined exploratory probe.
+const RESIDENT_ISOLATED_CANDIDATES: [ResidentIsolatedCandidate; 7] = [
+	ResidentIsolatedCandidate::Mmap,
+	ResidentIsolatedCandidate::NotifyResolved,
+	ResidentIsolatedCandidate::DenseFlatRun,
+	ResidentIsolatedCandidate::EpochResolved,
+	ResidentIsolatedCandidate::EpochDenseFlat,
+	ResidentIsolatedCandidate::EpochPageTable,
+	ResidentIsolatedCandidate::MissBackoffResolved,
+];
+
+/// Requires one exact fixture selector so one process never constructs both
+/// resident engines under comparison.
+fn require_resident_isolated_candidate(
+	requested: Option<&str>,
+) -> io::Result<ResidentIsolatedCandidate> {
+	let requested = requested.ok_or_else(|| {
+		io::Error::other(
+			"FG_STORAGE_PROTO_ONLY_CANDIDATE is required for the isolated resident probe",
+		)
+	})?;
+	RESIDENT_ISOLATED_CANDIDATES
+		.iter()
+		.copied()
+		.find(|candidate| candidate.label() == requested)
+		.ok_or_else(|| io::Error::other("isolated resident candidate was not validated"))
+}
 
 /// Memory attributed to one candidate's fixture construction and preload,
 /// including resolved handles when that candidate owns them.
@@ -1355,7 +1428,16 @@ fn storage_engine_prototype_resident_next_probe() -> Result<(), Box<dyn Error>> 
 	let handles_timing = handles_timer.finish()?;
 	let handles_rss = process_rss()?.saturating_sub(handles_rss_before);
 	artifacts.sample(
-		resident_next_meta("resolve_once", "R3_resolved_handle_build", 0, 0, config, hot_pages, 1),
+		resident_next_meta(
+			"resident_next",
+			"resolve_once",
+			"R3_resolved_handle_build",
+			0,
+			0,
+			config,
+			hot_pages,
+			1,
+		),
 		aggregate_measurement(handles_timing, hot_pages as u64, 0, handles_rss),
 	)?;
 
@@ -1375,7 +1457,16 @@ fn storage_engine_prototype_resident_next_probe() -> Result<(), Box<dyn Error>> 
 	let flat_timing = flat_timer.finish()?;
 	let flat_rss = process_rss()?.saturating_sub(flat_rss_before);
 	artifacts.sample(
-		resident_next_meta("resolve_once", "R6_dense_flat_build", 0, 0, config, hot_pages, 1),
+		resident_next_meta(
+			"resident_next",
+			"resolve_once",
+			"R6_dense_flat_build",
+			0,
+			0,
+			config,
+			hot_pages,
+			1,
+		),
 		aggregate_measurement(flat_timing, hot_pages as u64, 0, flat_rss),
 	)?;
 
@@ -1395,7 +1486,16 @@ fn storage_engine_prototype_resident_next_probe() -> Result<(), Box<dyn Error>> 
 	let two_level_timing = two_level_timer.finish()?;
 	let two_level_rss = process_rss()?.saturating_sub(two_level_rss_before);
 	artifacts.sample(
-		resident_next_meta("resolve_once", "R7_dense_two_level_build", 0, 0, config, hot_pages, 1),
+		resident_next_meta(
+			"resident_next",
+			"resolve_once",
+			"R7_dense_two_level_build",
+			0,
+			0,
+			config,
+			hot_pages,
+			1,
+		),
 		aggregate_measurement(two_level_timing, hot_pages as u64, 0, two_level_rss),
 	)?;
 
@@ -1410,6 +1510,7 @@ fn storage_engine_prototype_resident_next_probe() -> Result<(), Box<dyn Error>> 
 				)?;
 				artifacts.sample(
 					resident_next_meta(
+						"resident_next",
 						"warm_physical_run",
 						candidate.label(),
 						repetition,
@@ -1435,6 +1536,7 @@ fn storage_engine_prototype_resident_next_probe() -> Result<(), Box<dyn Error>> 
 /// Builds one resident-next metadata row without changing the shared CSV
 /// schema.
 fn resident_next_meta<'label>(
+	phase: &'label str,
 	workload: &'label str,
 	candidate: &'label str,
 	repetition: usize,
@@ -1444,7 +1546,7 @@ fn resident_next_meta<'label>(
 	run_length: usize,
 ) -> SampleMeta<'label> {
 	SampleMeta {
-		phase: "resident_next",
+		phase,
 		workload,
 		candidate,
 		repetition,
@@ -1478,6 +1580,14 @@ fn measure_resident_next_candidate(
 	flat: &SourceBoundLocator,
 	two_level: &SourceBoundLocator,
 ) -> Result<Measurement, Box<dyn Error>> {
+	let epoch = if matches!(
+		candidate,
+		ResidentNextCandidate::EpochResolved | ResidentNextCandidate::EpochDenseFlat
+	) {
+		Some(pool.read_epoch()?)
+	} else {
+		None
+	};
 	measure_resident_runs(
 		config.resident_operations,
 		config.latency_batch,
@@ -1540,10 +1650,319 @@ fn measure_resident_next_candidate(
 						black_box(guard.as_bytes()[resident_marker_offset(logical)]);
 					}
 				}
+				ResidentNextCandidate::EpochResolved => {
+					let epoch = epoch.as_ref().ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure("resolved epoch was not entered")
+					})?;
+					let page = epoch.get_resolved(&handles[index]).ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure("epoch resolved handle became stale")
+					})?;
+					for logical in 0..logical_count {
+						black_box(page.as_bytes()[resident_marker_offset(logical)]);
+					}
+				}
+				ResidentNextCandidate::EpochDenseFlat => {
+					let epoch = epoch.as_ref().ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure("dense epoch was not entered")
+					})?;
+					let page = flat.get_epoch_resolved(epoch, key).ok_or_else(|| {
+						FerrosGrynnError::storage_io_failure("epoch flat locator became stale")
+					})?;
+					for logical in 0..logical_count {
+						black_box(page.as_bytes()[resident_marker_offset(logical)]);
+					}
+				}
 			}
 			Ok(())
 		},
 	)
+}
+
+/// Measures one resident finalist in a process that constructs only its
+/// selected engine fixture. External orchestration supplies paired
+/// repetition/order indices.
+#[test]
+#[ignore = "storage-engine prototype benchmark; run explicitly with --profile profiling"]
+fn storage_engine_prototype_resident_isolated_process_probe() -> Result<(), Box<dyn Error>> {
+	let config = HarnessConfig::from_env()?;
+	let supported =
+		RESIDENT_ISOLATED_CANDIDATES.iter().map(|candidate| candidate.label()).collect::<Vec<_>>();
+	let selector = candidate_selector_from_env("resident_isolated_process", &supported)?;
+	let candidate = require_resident_isolated_candidate(selector.as_deref())?;
+	let repetition_base = env_parse("FG_STORAGE_PROTO_REPETITION_BASE", 0_usize)?;
+	let order_position = env_parse("FG_STORAGE_PROTO_ORDER_POSITION", 0_usize)?;
+	let mut artifacts = Artifacts::open(config)?;
+	artifacts.selector("resident_isolated_process", selector.as_deref())?;
+	writeln!(
+		artifacts.log,
+		"resident_isolated_process candidate={} repetition_base={} order_position={} \
+		 fixture_scope=selected engine only",
+		candidate.label(),
+		repetition_base,
+		order_position,
+	)?;
+
+	let dataset = Dataset::create("resident-isolated-process", config.dataset_pages)?;
+	let hot_pages = config.pool_pages.min(usize::try_from(config.dataset_pages)?);
+	match candidate {
+		ResidentIsolatedCandidate::Mmap => {
+			let mmap = MmapControl::open(&dataset)?;
+			record_isolated_resident_runs(
+				&mut artifacts,
+				config,
+				candidate,
+				hot_pages,
+				repetition_base,
+				order_position,
+				|run, logical_count| {
+					let page_no = resident_page(run, hot_pages);
+					for logical in 0..logical_count {
+						black_box(mmap.marker_at(page_no, logical));
+					}
+					Ok(())
+				},
+			)?;
+		}
+		ResidentIsolatedCandidate::DenseFlatRun
+		| ResidentIsolatedCandidate::NotifyResolved
+		| ResidentIsolatedCandidate::EpochResolved
+		| ResidentIsolatedCandidate::EpochDenseFlat
+		| ResidentIsolatedCandidate::EpochPageTable
+		| ResidentIsolatedCandidate::MissBackoffResolved => {
+			let direct = DirectFile::open_read_only(&dataset.path)?;
+			let capacity = NonZeroUsize::new(hot_pages).ok_or("zero resident hot set")?;
+			let source_pages = NonZeroUsize::new(usize::try_from(dataset.page_count)?)
+				.ok_or("zero source pages")?;
+			let pool = if candidate == ResidentIsolatedCandidate::MissBackoffResolved {
+				AtomicArenaBufferPool::with_miss_side_backoff(capacity)
+			} else {
+				AtomicArenaBufferPool::new(capacity)
+			};
+			for raw_page in 0..hot_pages {
+				let page_no = PageNo::new(raw_page as u64);
+				drop(pool.get_or_load(dataset.key(page_no), |page| {
+					read_raw_reported(&dataset, &direct, page_no, page)
+				})?);
+			}
+			let build_flat = || -> Result<SourceBoundLocator, Box<dyn Error>> {
+				let flat = SourceBoundLocator::new(
+					&pool,
+					dataset.key(PageNo::new(0)),
+					source_pages,
+					DenseLocatorLayout::Flat,
+				)?;
+				for raw_page in 0..hot_pages {
+					if !flat.refresh(&pool, dataset.key(PageNo::new(raw_page as u64))) {
+						return Err(io::Error::other(
+							"isolated flat locator failed to resolve preload",
+						)
+						.into());
+					}
+				}
+				Ok(flat)
+			};
+			match candidate {
+				ResidentIsolatedCandidate::DenseFlatRun => {
+					let flat = build_flat()?;
+					record_isolated_resident_runs(
+						&mut artifacts,
+						config,
+						candidate,
+						hot_pages,
+						repetition_base,
+						order_position,
+						|run, logical_count| {
+							let page_no = resident_page(run, hot_pages);
+							let key = dataset.key(page_no);
+							let guard = flat.get_resolved(&pool, key)?.ok_or_else(|| {
+								FerrosGrynnError::storage_io_failure(
+									"isolated flat locator became stale",
+								)
+							})?;
+							for logical in 0..logical_count {
+								black_box(guard.as_bytes()[resident_marker_offset(logical)]);
+							}
+							Ok(())
+						},
+					)?;
+				}
+				ResidentIsolatedCandidate::EpochDenseFlat => {
+					let flat = build_flat()?;
+					let epoch = pool.read_epoch()?;
+					record_isolated_resident_runs(
+						&mut artifacts,
+						config,
+						candidate,
+						hot_pages,
+						repetition_base,
+						order_position,
+						|run, logical_count| {
+							let page_no = resident_page(run, hot_pages);
+							let page = flat
+								.get_epoch_resolved(&epoch, dataset.key(page_no))
+								.ok_or_else(|| {
+									FerrosGrynnError::storage_io_failure(
+										"isolated epoch flat locator became stale",
+									)
+								})?;
+							for logical in 0..logical_count {
+								black_box(page.as_bytes()[resident_marker_offset(logical)]);
+							}
+							Ok(())
+						},
+					)?;
+				}
+				ResidentIsolatedCandidate::EpochResolved
+				| ResidentIsolatedCandidate::EpochPageTable
+				| ResidentIsolatedCandidate::NotifyResolved
+				| ResidentIsolatedCandidate::MissBackoffResolved => {
+					let handles = (0..hot_pages)
+						.map(|raw_page| {
+							pool.resolve(dataset.key(PageNo::new(raw_page as u64)))
+								.ok_or_else(|| io::Error::other("isolated page did not resolve"))
+						})
+						.collect::<io::Result<Vec<_>>>()?;
+					match candidate {
+						ResidentIsolatedCandidate::EpochResolved => {
+							let epoch = pool.read_epoch()?;
+							record_isolated_resident_runs(
+								&mut artifacts,
+								config,
+								candidate,
+								hot_pages,
+								repetition_base,
+								order_position,
+								|run, logical_count| {
+									let page_no = resident_page(run, hot_pages);
+									let page = epoch
+										.get_resolved(&handles[page_no.get() as usize])
+										.ok_or_else(|| {
+											FerrosGrynnError::storage_io_failure(
+												"isolated epoch handle became stale",
+											)
+										})?;
+									for logical in 0..logical_count {
+										black_box(page.as_bytes()[resident_marker_offset(logical)]);
+									}
+									Ok(())
+								},
+							)?;
+						}
+						ResidentIsolatedCandidate::EpochPageTable => {
+							let epoch = pool.read_epoch()?;
+							let pages = handles
+								.iter()
+								.map(|handle| {
+									epoch.get_resolved(handle).ok_or_else(|| {
+										io::Error::other("isolated epoch page table became stale")
+									})
+								})
+								.collect::<io::Result<Vec<_>>>()?;
+							record_isolated_resident_runs(
+								&mut artifacts,
+								config,
+								candidate,
+								hot_pages,
+								repetition_base,
+								order_position,
+								|run, logical_count| {
+									let page_no = resident_page(run, hot_pages);
+									let page = &pages[page_no.get() as usize];
+									for logical in 0..logical_count {
+										black_box(page.as_bytes()[resident_marker_offset(logical)]);
+									}
+									Ok(())
+								},
+							)?;
+						}
+						ResidentIsolatedCandidate::NotifyResolved
+						| ResidentIsolatedCandidate::MissBackoffResolved => {
+							record_isolated_resident_runs(
+								&mut artifacts,
+								config,
+								candidate,
+								hot_pages,
+								repetition_base,
+								order_position,
+								|run, logical_count| {
+									let page_no = resident_page(run, hot_pages);
+									let guard = pool
+										.get_resolved(&handles[page_no.get() as usize])?
+										.ok_or_else(|| {
+											FerrosGrynnError::storage_io_failure(
+												"isolated R9 handle became stale",
+											)
+										})?;
+									for logical in 0..logical_count {
+										black_box(
+											guard.as_bytes()[resident_marker_offset(logical)],
+										);
+									}
+									Ok(())
+								},
+							)?;
+						}
+						ResidentIsolatedCandidate::Mmap
+						| ResidentIsolatedCandidate::DenseFlatRun
+						| ResidentIsolatedCandidate::EpochDenseFlat => {
+							return Err(io::Error::other(
+								"isolated candidate entered the resolved-fixture branch",
+							)
+							.into());
+						}
+					}
+				}
+				ResidentIsolatedCandidate::Mmap => {
+					return Err(io::Error::other("mmap entered the arena fixture branch").into());
+				}
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Records the common run-length matrix for one already-isolated resident
+/// fixture without moving setup into the timed scope.
+#[allow(clippy::too_many_arguments, reason = "paired benchmark metadata remains explicit")]
+fn record_isolated_resident_runs<Access>(
+	artifacts: &mut Artifacts,
+	config: HarnessConfig,
+	candidate: ResidentIsolatedCandidate,
+	hot_pages: usize,
+	repetition_base: usize,
+	order_position: usize,
+	mut access: Access,
+) -> Result<(), Box<dyn Error>>
+where
+	Access: FnMut(u64, usize) -> Result<(), Box<dyn Error>>,
+{
+	for run_length in RESIDENT_ISOLATED_RUN_LENGTHS {
+		for local_repetition in 0..config.repetitions {
+			let repetition = repetition_base
+				.checked_add(local_repetition)
+				.ok_or_else(|| io::Error::other("isolated repetition index overflow"))?;
+			let measurement = measure_resident_runs(
+				config.resident_operations,
+				config.latency_batch,
+				run_length,
+				&mut access,
+			)?;
+			artifacts.sample(
+				resident_next_meta(
+					"resident_isolated_process",
+					"warm_physical_run",
+					candidate.label(),
+					repetition,
+					order_position,
+					config,
+					hot_pages,
+					run_length,
+				),
+				measurement,
+			)?;
+		}
+	}
+	Ok(())
 }
 
 /// Screens CacheAll, Rocks-like bypass, and bounded cold admission.
@@ -2279,6 +2698,217 @@ fn storage_engine_prototype_workload_probe() -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+/// Compares the surviving R8 design with R2 and mmap on mixed database access
+/// shapes while every repetition owns a disjoint cold page range.
+#[cfg(all(windows, feature = "native-async-io"))]
+#[test]
+#[ignore = "mixed storage-engine finalist benchmark; run explicitly with --profile profiling"]
+fn storage_engine_prototype_mixed_finalist_probe() -> Result<(), Box<dyn Error>> {
+	let config = HarnessConfig::from_env()?;
+	if config.pool_pages < 8 || config.dataset_pages <= config.pool_pages as u64 {
+		return Err(io::Error::other(
+			"mixed finalists require at least eight pool pages and a larger dataset",
+		)
+		.into());
+	}
+	let mut artifacts = Artifacts::open(config)?;
+	let repetitions = io_repetitions(config);
+	let root_pages = config.pool_pages.min(8);
+	let leaf_pages = config
+		.pool_pages
+		.saturating_mul(2)
+		.min(
+			usize::try_from(config.dataset_pages)?
+				.saturating_sub(root_pages)
+				.checked_div(repetitions)
+				.ok_or("zero mixed repetition count")?,
+		)
+		.max(1);
+	let per_auxiliary_file = config.pool_pages.div_ceil(4).max(1);
+	let mut datasets = Vec::with_capacity(8);
+	datasets.push(Dataset::create("mixed-finalist-0", config.dataset_pages)?);
+	for file_index in 1..8 {
+		datasets.push(Dataset::create(
+			&format!("mixed-finalist-{file_index}"),
+			per_auxiliary_file as u64,
+		)?);
+	}
+	let directs = datasets
+		.iter()
+		.map(|dataset| DirectFile::open_read_only(&dataset.path))
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let scatter_file = Arc::new(DirectFile::open_read_write_with_mode(
+		&datasets[0].path,
+		DirectFileOpenMode::Overlapped,
+	)?);
+
+	let graph_hot_pages = config.pool_pages.div_ceil(2);
+	let property_hot_pages = config.pool_pages.div_ceil(8);
+	let cold_start = graph_hot_pages.max(property_hot_pages);
+	let cold_pages = usize::try_from(config.dataset_pages)?.saturating_sub(cold_start);
+	let cold_region_pages = cold_pages / 2;
+	let maximum_operations =
+		cold_region_pages.checked_div(repetitions).unwrap_or(0).saturating_mul(8);
+	let workload_operations =
+		usize::try_from(config.resident_operations)?.min(32_768).min(maximum_operations).max(8);
+	let multifile_operations =
+		usize::try_from(config.resident_operations)?.min(2_000_000).max(workload_operations);
+	let cold_reads_per_repetition = workload_operations.div_ceil(8);
+	if cold_reads_per_repetition.saturating_mul(repetitions) > cold_region_pages {
+		return Err(io::Error::other("dataset cannot provide disjoint mixed cold ranges").into());
+	}
+	let graph_preload = contiguous_hot_preload(graph_hot_pages);
+	let property_preload = contiguous_hot_preload(property_hot_pages);
+
+	for repetition in 0..repetitions {
+		let leaf_first = PageNo::new((root_pages + repetition * leaf_pages) as u64);
+		let btree_candidates =
+			["R2_roots+A1_sync_bypass", "R8_epoch_roots+A1_scatter+P1", "R0_mmap_hot_roots"];
+		for (order_position, candidate) in
+			rotated_order(&btree_candidates, repetition).into_iter().enumerate()
+		{
+			let (measurement, threads, extent_pages, prefetch_depth) = match candidate {
+				"R2_roots+A1_sync_bypass" => (
+					measure_btree_sync_bypass(
+						&datasets[0],
+						&directs[0],
+						root_pages,
+						leaf_first,
+						leaf_pages,
+						config.latency_batch,
+					)?,
+					1,
+					1,
+					0,
+				),
+				"R8_epoch_roots+A1_scatter+P1" => (
+					measure_btree_epoch_scatter(
+						&datasets[0],
+						&directs[0],
+						Arc::clone(&scatter_file),
+						root_pages,
+						leaf_first,
+						leaf_pages,
+						config.extent_pages,
+					)?,
+					2,
+					config.extent_pages.min(leaf_pages),
+					1,
+				),
+				"R0_mmap_hot_roots" => (
+					measure_btree_mmap(
+						&datasets[0],
+						root_pages,
+						leaf_first,
+						leaf_pages,
+						config.latency_batch,
+					)?,
+					1,
+					1,
+					0,
+				),
+				_ => return Err(io::Error::other("unknown mixed B+tree candidate").into()),
+			};
+			artifacts.sample(
+				SampleMeta {
+					phase: "mixed_finalist",
+					workload: "btree_hot_roots_disjoint_leaf_scan",
+					candidate,
+					repetition,
+					order_position,
+					dataset_pages: datasets[0].page_count,
+					pool_pages: config.pool_pages,
+					hot_pages: root_pages,
+					file_count: 1,
+					threads,
+					queue_depth: 1,
+					extent_pages,
+					prefetch_depth,
+					vm_reserved_bytes: 0,
+					vm_committed_bytes: 0,
+					hit_ratio: root_pages.min(3) as f64 / (root_pages.min(3) + 1) as f64,
+				},
+				measurement,
+			)?;
+		}
+
+		let graph_cold_first = cold_start + repetition * cold_reads_per_repetition;
+		let graph_accesses = mixed_hot_cold_accesses(
+			workload_operations,
+			graph_hot_pages,
+			graph_cold_first,
+			cold_reads_per_repetition,
+		);
+		record_mixed_access_pair(
+			&mut artifacts,
+			config,
+			&datasets[..1],
+			&directs[..1],
+			"graph_frontier_epoch_hot_sparse_direct",
+			repetition,
+			&graph_preload,
+			&graph_accesses,
+			Some(&scatter_file),
+		)?;
+
+		let property_cold_first =
+			cold_start + cold_region_pages + repetition * cold_reads_per_repetition;
+		let property_accesses = mixed_property_accesses(
+			workload_operations,
+			property_hot_pages,
+			property_cold_first,
+			cold_reads_per_repetition,
+		);
+		record_mixed_access_pair(
+			&mut artifacts,
+			config,
+			&datasets[..1],
+			&directs[..1],
+			"properties_epoch_hot_sparse_overflow",
+			repetition,
+			&property_preload,
+			&property_accesses,
+			Some(&scatter_file),
+		)?;
+
+		for file_count in [1_usize, 4, 8] {
+			let hot_pages = config.pool_pages;
+			let preload = (0..hot_pages)
+				.map(|global| multifile_access(global, file_count, true))
+				.collect::<Vec<_>>();
+			let accesses = (0..multifile_operations)
+				.map(|operation| {
+					multifile_access(
+						resident_page(operation as u64, hot_pages).get() as usize,
+						file_count,
+						true,
+					)
+				})
+				.collect::<Vec<_>>();
+			record_mixed_access_pair(
+				&mut artifacts,
+				config,
+				&datasets[..file_count],
+				&directs[..file_count],
+				"multifile_common_budget_resident",
+				repetition,
+				&preload,
+				&accesses,
+				None,
+			)?;
+		}
+	}
+	writeln!(
+		artifacts.log,
+		"mixed_finalist_note=cold page ranges are disjoint across repetitions; R8 retains only \
+		 the declared hot table inside one read epoch and validates sparse cold pages through \
+		 reusable synchronous Direct scratch; B+tree R8 validates scatter extents before exposing \
+		 any leaf; mmap prevalidates only declared hot pages and validates each disjoint cold \
+		 page in-scope"
+	)?;
+	Ok(())
+}
+
 /// Screens synchronous Direct, forced extent IoRing, frame IoRing, scatter,
 /// and direct-to-frame Atomic/VM combinations.
 #[cfg(all(windows, feature = "native-async-io"))]
@@ -2493,7 +3123,10 @@ fn storage_engine_prototype_prefetch_probe() -> Result<(), Box<dyn Error>> {
 fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
 	let config = HarnessConfig::from_env()?;
 	let mut artifacts = Artifacts::open(config)?;
-	let mut candidates = vec!["T0_validated_preallocated", "R0_mmap_validated_first_touch"];
+	let mut candidates = vec!["T0_raw_preallocated", "T0_validated_preallocated"];
+	#[cfg(feature = "native-async-io")]
+	candidates.push("A1_rocks_bypass+T3_scatter+P1");
+	candidates.push("R0_mmap_validated_first_touch");
 	let selector = candidate_selector_from_env("page_fault", &candidates)?;
 	if let Some(selected) = selector.as_deref() {
 		candidates.retain(|candidate| *candidate == selected);
@@ -2502,6 +3135,11 @@ fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
 
 	let dataset = Dataset::create("page-fault", config.dataset_pages)?;
 	let direct = DirectFile::open_read_only(&dataset.path)?;
+	#[cfg(feature = "native-async-io")]
+	let overlapped = Arc::new(DirectFile::open_read_write_with_mode(
+		&dataset.path,
+		DirectFileOpenMode::Overlapped,
+	)?);
 	let mmap = MmapControl::map_unvalidated(&dataset)?;
 	let scan_pages = usize::try_from(config.dataset_pages)?;
 	let extent_pages = config.extent_pages.min(scan_pages).max(1);
@@ -2510,15 +3148,23 @@ fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
 	let ram_bytes = System::new_all().total_memory();
 	let dataset_bytes = config.dataset_pages.saturating_mul(PAGE_SIZE as u64);
 	let mut page_fault_csv = open_page_fault_csv()?;
+	wait_for_profiler_gate()?;
 
 	for repetition in 0..io_repetitions(config) {
 		for (order_position, candidate) in candidates.iter().copied().enumerate() {
 			let before = process_memory_snapshot()?;
-			let mut measurement = match candidate {
-				"T0_validated_preallocated" => {
-					measure_validated_direct_scan(&direct, &extents, &mut scratch, scan_pages)?
+			let (mut measurement, prefetch_depth) = match candidate {
+				"T0_raw_preallocated" => {
+					(measure_raw_direct_scan(&direct, &extents, &mut scratch, scan_pages)?, 0)
 				}
-				"R0_mmap_validated_first_touch" => measure_validated_mmap_scan(&mmap)?,
+				"T0_validated_preallocated" => {
+					(measure_validated_direct_scan(&direct, &extents, &mut scratch, scan_pages)?, 0)
+				}
+				#[cfg(feature = "native-async-io")]
+				"A1_rocks_bypass+T3_scatter+P1" => {
+					(measure_scatter_prefetch(Arc::clone(&overlapped), &extents, 1, scan_pages)?, 1)
+				}
+				"R0_mmap_validated_first_touch" => (measure_validated_mmap_scan(&mmap)?, 0),
 				_ => return Err(io::Error::other("unknown page-fault candidate").into()),
 			};
 			let after = process_memory_snapshot()?;
@@ -2546,10 +3192,14 @@ fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
 					pool_pages: 0,
 					hot_pages: 0,
 					file_count: 1,
-					threads: 1,
+					threads: if prefetch_depth == 0 {
+						1
+					} else {
+						2
+					},
 					queue_depth: 1,
 					extent_pages,
-					prefetch_depth: 0,
+					prefetch_depth,
 					vm_reserved_bytes: 0,
 					vm_committed_bytes: 0,
 					hit_ratio: 0.0,
@@ -2570,8 +3220,8 @@ fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
 		artifacts.log,
 		"page_fault_contract=dataset_bytes={dataset_bytes} ram_bytes={ram_bytes} ratio={:.6}; \
 		 PageFaultCount is the cumulative process total and does not distinguish soft from hard \
-		 faults; candidate order is fixed Direct-before-mmap because NO_BUFFERING Direct reads do \
-		 not populate mmap's system file cache",
+		 faults; candidate order is fixed raw/validated/scatter Direct before mmap because \
+		 NO_BUFFERING Direct reads do not populate mmap's system file cache",
 		dataset_bytes as f64 / ram_bytes.max(1) as f64,
 	)?;
 	Ok(())
@@ -3170,6 +3820,26 @@ fn measure_atomic_cold_direct_prefetch(
 #[cfg(all(windows, feature = "native-async-io"))]
 fn extent_keys(dataset: &Dataset, first: PageNo, count: usize) -> Vec<PageCacheKey> {
 	(0..count).map(|offset| dataset.key(PageNo::new(first.get() + offset as u64))).collect()
+}
+
+/// Measures one complete synchronous Direct scan into a preallocated extent.
+fn measure_raw_direct_scan(
+	file: &DirectFile,
+	extents: &[(PageNo, usize)],
+	pages: &mut [AlignedPage],
+	scan_pages: usize,
+) -> Result<Measurement, Box<dyn Error>> {
+	let timer = MeasurementTimer::start()?;
+	for (first, count) in extents.iter().copied() {
+		file.read_pages_raw(first, &mut pages[..count])?;
+		black_box(pages[0].as_bytes()[PAGE_HEADER_SIZE]);
+	}
+	Ok(aggregate_measurement(
+		timer.finish()?,
+		extents.len() as u64,
+		scan_pages as u64 * PAGE_SIZE as u64,
+		0,
+	))
 }
 
 /// Measures one complete synchronous Direct scan into a preallocated extent.
@@ -4186,6 +4856,587 @@ fn measure_atomic_accesses(
 	Ok((measurement, hit_ratio))
 }
 
+/// Builds the contiguous per-source hot set required by the retained page
+/// table candidate.
+fn contiguous_hot_preload(hot_pages: usize) -> Vec<WorkloadAccess> {
+	(0..hot_pages)
+		.map(|page| WorkloadAccess {
+			file_index: 0,
+			page_no: PageNo::new(page as u64),
+			hot: true,
+		})
+		.collect()
+}
+
+/// Builds a graph-like stream with seven hot frontier reads followed by one
+/// unique cold transition.
+fn mixed_hot_cold_accesses(
+	operations: usize,
+	hot_pages: usize,
+	cold_first: usize,
+	cold_pages: usize,
+) -> Vec<WorkloadAccess> {
+	(0..operations)
+		.map(|operation| {
+			if operation % 8 == 7 {
+				WorkloadAccess {
+					file_index: 0,
+					page_no: permuted_cold_page(cold_first, operation / 8, cold_pages),
+					hot: false,
+				}
+			} else {
+				WorkloadAccess {
+					file_index: 0,
+					page_no: graph_hot_page(operation as u64, hot_pages),
+					hot: true,
+				}
+			}
+		})
+		.collect()
+}
+
+/// Builds short property runs interrupted by unique overflow-page reads.
+fn mixed_property_accesses(
+	operations: usize,
+	hot_pages: usize,
+	cold_first: usize,
+	cold_pages: usize,
+) -> Vec<WorkloadAccess> {
+	(0..operations)
+		.map(|operation| {
+			if operation % 8 == 7 {
+				WorkloadAccess {
+					file_index: 0,
+					page_no: permuted_cold_page(cold_first, operation / 8, cold_pages),
+					hot: false,
+				}
+			} else {
+				let run = operation / 8;
+				let offset = operation % 4;
+				WorkloadAccess {
+					file_index: 0,
+					page_no: PageNo::new((run.wrapping_mul(17) + offset) as u64 % hot_pages as u64),
+					hot: true,
+				}
+			}
+		})
+		.collect()
+}
+
+/// Permutes one bounded cold range without repeats or sequential read-ahead.
+fn permuted_cold_page(first: usize, ordinal: usize, page_count: usize) -> PageNo {
+	const STRIDE_PRIME: u64 = 15_485_863;
+	debug_assert!(page_count > 0 && (page_count as u64) < STRIDE_PRIME);
+	let count = page_count as u64;
+	PageNo::new(first as u64 + ordinal as u64 * (STRIDE_PRIME % count) % count)
+}
+
+/// Records R2, retained R8, and mmap against one identical access stream.
+#[allow(clippy::too_many_arguments, reason = "mixed benchmark dimensions remain explicit")]
+fn record_mixed_access_pair(
+	artifacts: &mut Artifacts,
+	config: HarnessConfig,
+	datasets: &[Dataset],
+	directs: &[DirectFile],
+	workload: &str,
+	repetition: usize,
+	preload: &[WorkloadAccess],
+	accesses: &[WorkloadAccess],
+	ioring_file: Option<&Arc<DirectFile>>,
+) -> Result<(), Box<dyn Error>> {
+	let has_cold_reads = accesses.iter().any(|access| !access.hot);
+	let r8_label = if has_cold_reads {
+		"R8_epoch_hot+A1_direct_bypass"
+	} else {
+		"R8_epoch_page_table"
+	};
+	let mmap_label = if has_cold_reads {
+		"R0_mmap_hot_cold"
+	} else {
+		"R0_mmap_resident"
+	};
+	let mut candidates = vec!["R2_atomic_cache_all", r8_label];
+	if has_cold_reads && ioring_file.is_some() {
+		candidates.push("R8_epoch_hot+T2_ioring_qd32");
+	}
+	candidates.push(mmap_label);
+	for (order_position, candidate) in
+		rotated_order(&candidates, repetition).into_iter().enumerate()
+	{
+		let (measurement, hit_ratio) = match candidate {
+			"R2_atomic_cache_all" => measure_atomic_accesses(
+				datasets,
+				directs,
+				config.pool_pages,
+				preload,
+				accesses,
+				config.latency_batch,
+			)?,
+			label if label == r8_label => measure_epoch_hot_bypass_accesses(
+				datasets,
+				directs,
+				config.pool_pages,
+				preload,
+				accesses,
+				config.latency_batch,
+			)?,
+			"R8_epoch_hot+T2_ioring_qd32" => measure_epoch_hot_ioring_accesses(
+				datasets,
+				directs,
+				ioring_file.ok_or("IoRing mixed candidate has no overlapped file")?,
+				config.pool_pages,
+				preload,
+				accesses,
+				config.latency_batch,
+			)?,
+			label if label == mmap_label => {
+				measure_mmap_hot_cold_accesses(datasets, preload, accesses, config.latency_batch)?
+			}
+			_ => return Err(io::Error::other("unknown mixed access candidate").into()),
+		};
+		artifacts.sample(
+			SampleMeta {
+				phase: "mixed_finalist",
+				workload,
+				candidate,
+				repetition,
+				order_position,
+				dataset_pages: datasets.iter().map(|dataset| dataset.page_count).sum(),
+				pool_pages: config.pool_pages,
+				hot_pages: preload.len(),
+				file_count: datasets.len(),
+				threads: 1,
+				queue_depth: if candidate == "R8_epoch_hot+T2_ioring_qd32" {
+					32
+				} else {
+					1
+				},
+				extent_pages: 1,
+				prefetch_depth: 0,
+				vm_reserved_bytes: 0,
+				vm_committed_bytes: 0,
+				hit_ratio,
+			},
+			measurement,
+		)?;
+	}
+	Ok(())
+}
+
+/// Measures R8 with one cursor-owned hot page table and non-admitting Direct
+/// reads for sparse cold transitions.
+fn measure_epoch_hot_bypass_accesses(
+	datasets: &[Dataset],
+	directs: &[DirectFile],
+	pool_pages: usize,
+	preload: &[WorkloadAccess],
+	accesses: &[WorkloadAccess],
+	latency_batch: usize,
+) -> Result<(Measurement, f64), Box<dyn Error>> {
+	if datasets.len() != directs.len() || datasets.is_empty() || accesses.is_empty() {
+		return Err(io::Error::other("R8 mixed source and access sets are inconsistent").into());
+	}
+	let rss_before = process_rss()?;
+	let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(pool_pages).ok_or("zero pool")?);
+	let mut handles = (0..datasets.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+	for access in preload {
+		if !access.hot {
+			return Err(io::Error::other("R8 preload contains a cold page").into());
+		}
+		let dataset = datasets
+			.get(access.file_index)
+			.ok_or_else(|| io::Error::other("R8 preload source is outside the dataset set"))?;
+		let direct = &directs[access.file_index];
+		let expected_index = handles[access.file_index].len();
+		if usize::try_from(access.page_no.get())? != expected_index {
+			return Err(io::Error::other("R8 hot preload must be contiguous per source").into());
+		}
+		drop(pool.get_or_load(dataset.key(access.page_no), |target| {
+			read_raw_reported(dataset, direct, access.page_no, target)
+		})?);
+		handles[access.file_index].push(
+			pool.resolve(dataset.key(access.page_no))
+				.ok_or_else(|| io::Error::other("R8 hot preload did not resolve"))?,
+		);
+	}
+	let epoch = pool.read_epoch()?;
+	let mut source_offsets = Vec::with_capacity(handles.len() + 1);
+	let mut page_count = 0_usize;
+	for source in &handles {
+		source_offsets.push(page_count);
+		page_count = page_count
+			.checked_add(source.len())
+			.ok_or_else(|| io::Error::other("R8 hot page table size overflow"))?;
+	}
+	let page_table = handles
+		.iter()
+		.flatten()
+		.map(|handle| {
+			epoch
+				.get_resolved(handle)
+				.ok_or_else(|| io::Error::other("R8 hot page table became stale"))
+		})
+		.collect::<io::Result<Vec<_>>>()?;
+	let resolved_hot_indices = accesses
+		.iter()
+		.map(|access| {
+			if !access.hot {
+				return Ok(usize::MAX);
+			}
+			let source_start = *source_offsets
+				.get(access.file_index)
+				.ok_or_else(|| io::Error::other("R8 hot source has no page-table offset"))?;
+			let page_index = usize::try_from(access.page_no.get())
+				.map_err(|_source| io::Error::other("R8 hot page number does not fit usize"))?;
+			source_start
+				.checked_add(page_index)
+				.ok_or_else(|| io::Error::other("R8 hot page-table index overflow"))
+		})
+		.collect::<io::Result<Vec<_>>>()?;
+	let mut scratch = AlignedPage::zeroed();
+	let measurement = measure_operations(
+		accesses.len() as u64,
+		latency_batch.min(accesses.len()).max(1),
+		PAGE_SIZE as u64,
+		|operation| {
+			let operation = operation as usize;
+			let access = accesses[operation];
+			if access.hot {
+				let page = page_table
+					.get(resolved_hot_indices[operation])
+					.ok_or_else(|| io::Error::other("R8 hot access is outside the page table"))?;
+				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+			} else {
+				let direct = directs
+					.get(access.file_index)
+					.ok_or_else(|| io::Error::other("R8 cold source is outside the file set"))?;
+				read_validated(direct, access.page_no, &mut scratch)?;
+				black_box(scratch.as_bytes()[PAGE_HEADER_SIZE]);
+			}
+			Ok(())
+		},
+	)?;
+	Ok((finish_fixture_rss(measurement, rss_before)?, 1.0))
+}
+
+/// Measures one R8 hot table while frame-oriented IoRing fetches the known
+/// sparse misses of each cursor window with QD32.
+#[cfg(all(windows, feature = "native-async-io"))]
+#[allow(clippy::too_many_arguments, reason = "mixed IoRing dimensions remain explicit")]
+fn measure_epoch_hot_ioring_accesses(
+	datasets: &[Dataset],
+	directs: &[DirectFile],
+	file: &Arc<DirectFile>,
+	pool_pages: usize,
+	preload: &[WorkloadAccess],
+	accesses: &[WorkloadAccess],
+	latency_batch: usize,
+) -> Result<(Measurement, f64), Box<dyn Error>> {
+	const REQUESTED_QD: usize = 32;
+	const CURSOR_WINDOW: usize = REQUESTED_QD * 8;
+	if datasets.len() != 1
+		|| directs.len() != 1
+		|| accesses.is_empty()
+		|| accesses.iter().any(|access| access.file_index != 0)
+	{
+		return Err(io::Error::other("mixed IoRing currently requires one non-empty source").into());
+	}
+	let rss_before = process_rss()?;
+	let dataset = &datasets[0];
+	let direct = &directs[0];
+	let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(pool_pages).ok_or("zero pool")?);
+	let mut handles = Vec::with_capacity(preload.len());
+	for access in preload {
+		if !access.hot || usize::try_from(access.page_no.get())? != handles.len() {
+			return Err(io::Error::other("mixed IoRing hot preload must be contiguous").into());
+		}
+		drop(pool.get_or_load(dataset.key(access.page_no), |target| {
+			read_raw_reported(dataset, direct, access.page_no, target)
+		})?);
+		handles.push(
+			pool.resolve(dataset.key(access.page_no))
+				.ok_or_else(|| io::Error::other("mixed IoRing hot page did not resolve"))?,
+		);
+	}
+	let epoch = pool.read_epoch()?;
+	let page_table = handles
+		.iter()
+		.map(|handle| {
+			epoch
+				.get_resolved(handle)
+				.ok_or_else(|| io::Error::other("mixed IoRing hot page table became stale"))
+		})
+		.collect::<io::Result<Vec<_>>>()?;
+	let mut cold_slots = vec![None; accesses.len()];
+	let mut cold_pages_by_window = Vec::with_capacity(accesses.len().div_ceil(CURSOR_WINDOW));
+	for (window_index, window) in accesses.chunks(CURSOR_WINDOW).enumerate() {
+		let mut pages = Vec::with_capacity(REQUESTED_QD);
+		for (offset, access) in window.iter().enumerate() {
+			if !access.hot {
+				if pages.len() == REQUESTED_QD {
+					return Err(io::Error::other("mixed cursor window exceeds IoRing QD32").into());
+				}
+				cold_slots[window_index * CURSOR_WINDOW + offset] = Some(pages.len());
+				pages.push(access.page_no);
+			}
+		}
+		cold_pages_by_window.push(pages);
+	}
+	let requested_qd = NonZeroUsize::new(REQUESTED_QD).ok_or("zero IoRing QD")?;
+	let mut frames = (0..REQUESTED_QD).map(|_| Box::new(AlignedPage::zeroed())).collect::<Vec<_>>();
+	let mut ring = WindowsIoRing::new()?;
+	let measurement = measure_operations(
+		accesses.len() as u64,
+		latency_batch.min(accesses.len()).max(1),
+		PAGE_SIZE as u64,
+		|operation| {
+			let operation = operation as usize;
+			if operation % CURSOR_WINDOW == 0 {
+				let cold_pages = &cold_pages_by_window[operation / CURSOR_WINDOW];
+				let mut reads = frames[..cold_pages.len()]
+					.iter_mut()
+					.zip(cold_pages)
+					.map(|(frame, page_no)| FrameRead::new(file, *page_no, frame))
+					.collect::<Vec<_>>();
+				ring.read_frames_measured(&mut reads, requested_qd)?;
+				for read in &reads {
+					read.validate()?;
+				}
+				drop(reads);
+			}
+			let access = accesses[operation];
+			if access.hot {
+				let page =
+					page_table.get(usize::try_from(access.page_no.get())?).ok_or_else(|| {
+						io::Error::other("mixed IoRing hot page is outside the table")
+					})?;
+				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+			} else {
+				let slot = cold_slots[operation]
+					.ok_or_else(|| io::Error::other("mixed IoRing cold page has no frame slot"))?;
+				black_box(frames[slot].as_bytes()[PAGE_HEADER_SIZE]);
+			}
+			Ok(())
+		},
+	)?;
+	Ok((finish_fixture_rss(measurement, rss_before)?, 1.0))
+}
+
+/// Measures mmap with only the declared hot pages prefaulted and validated;
+/// every cold access keeps checksum work inside the measured path.
+fn measure_mmap_hot_cold_accesses(
+	datasets: &[Dataset],
+	preload: &[WorkloadAccess],
+	accesses: &[WorkloadAccess],
+	latency_batch: usize,
+) -> Result<(Measurement, f64), Box<dyn Error>> {
+	if datasets.is_empty() || accesses.is_empty() {
+		return Err(io::Error::other("mmap mixed source and access sets are empty").into());
+	}
+	let rss_before = process_rss()?;
+	let mappings =
+		datasets.iter().map(MmapControl::map_unvalidated).collect::<Result<Vec<_>, _>>()?;
+	for access in preload {
+		let mapping = mappings
+			.get(access.file_index)
+			.ok_or_else(|| io::Error::other("mmap preload source is outside the mapping set"))?;
+		validate_page_bytes(mapping_page(&mapping.mapping, access.page_no)?, access.page_no)?;
+	}
+	let measurement = measure_operations(
+		accesses.len() as u64,
+		latency_batch.min(accesses.len()).max(1),
+		PAGE_SIZE as u64,
+		|operation| {
+			let access = accesses[operation as usize];
+			let mapping = mappings
+				.get(access.file_index)
+				.ok_or_else(|| io::Error::other("mmap access source is outside the mapping set"))?;
+			if access.hot {
+				black_box(mapping.marker(access.page_no));
+			} else {
+				validate_page_bytes(
+					mapping_page(&mapping.mapping, access.page_no)?,
+					access.page_no,
+				)?;
+			}
+			Ok(())
+		},
+	)?;
+	Ok((finish_fixture_rss(measurement, rss_before)?, 1.0))
+}
+
+/// Measures conventional pinned R2 roots plus non-admitting one-page Direct
+/// reads for a disjoint leaf range.
+fn measure_btree_sync_bypass(
+	dataset: &Dataset,
+	direct: &DirectFile,
+	root_pages: usize,
+	leaf_first: PageNo,
+	leaf_pages: usize,
+	latency_batch: usize,
+) -> Result<Measurement, Box<dyn Error>> {
+	let rss_before = process_rss()?;
+	let roots = AtomicArenaBufferPool::new(NonZeroUsize::new(root_pages).ok_or("zero roots")?);
+	for root in 0..root_pages {
+		let page_no = PageNo::new(root as u64);
+		drop(roots.get_or_load(dataset.key(page_no), |target| {
+			read_raw_reported(dataset, direct, page_no, target)
+		})?);
+	}
+	let root_depth = root_pages.min(3);
+	let mut scratch = AlignedPage::zeroed();
+	let measurement = measure_operations(
+		leaf_pages as u64,
+		latency_batch.min(leaf_pages).max(1),
+		((root_depth + 1) * PAGE_SIZE) as u64,
+		|operation| {
+			for root in 0..root_depth {
+				let page_no = PageNo::new(root as u64);
+				let guard = roots.get_or_load(dataset.key(page_no), |_| {
+					Err(FerrosGrynnError::storage_io_failure("B+tree root stopped being resident"))
+				})?;
+				black_box(guard.as_bytes()[PAGE_HEADER_SIZE]);
+			}
+			let leaf_no = PageNo::new(leaf_first.get() + operation);
+			read_validated(direct, leaf_no, &mut scratch)?;
+			black_box(scratch.as_bytes()[PAGE_HEADER_SIZE]);
+			Ok(())
+		},
+	)?;
+	finish_fixture_rss(measurement, rss_before)
+}
+
+/// Measures an R8 root table while one scatter worker reads and validates the
+/// disjoint leaf range in bounded extent order.
+#[cfg(all(windows, feature = "native-async-io"))]
+#[allow(clippy::too_many_arguments, reason = "mixed B+tree dimensions remain explicit")]
+fn measure_btree_epoch_scatter(
+	dataset: &Dataset,
+	direct: &DirectFile,
+	file: Arc<DirectFile>,
+	root_pages: usize,
+	leaf_first: PageNo,
+	leaf_pages: usize,
+	extent_pages: usize,
+) -> Result<Measurement, Box<dyn Error>> {
+	let rss_before = process_rss()?;
+	let roots = AtomicArenaBufferPool::new(NonZeroUsize::new(root_pages).ok_or("zero roots")?);
+	let mut handles = Vec::with_capacity(root_pages);
+	for root in 0..root_pages {
+		let page_no = PageNo::new(root as u64);
+		drop(roots.get_or_load(dataset.key(page_no), |target| {
+			read_raw_reported(dataset, direct, page_no, target)
+		})?);
+		handles.push(
+			roots
+				.resolve(dataset.key(page_no))
+				.ok_or_else(|| io::Error::other("R8 B+tree root did not resolve"))?,
+		);
+	}
+	let epoch = roots.read_epoch()?;
+	let root_table = handles
+		.iter()
+		.map(|handle| {
+			epoch
+				.get_resolved(handle)
+				.ok_or_else(|| io::Error::other("R8 B+tree root table became stale"))
+		})
+		.collect::<io::Result<Vec<_>>>()?;
+	let extent_pages = extent_pages.min(leaf_pages).max(1);
+	let extents = (0..leaf_pages)
+		.step_by(extent_pages)
+		.map(|offset| {
+			(PageNo::new(leaf_first.get() + offset as u64), (leaf_pages - offset).min(extent_pages))
+		})
+		.collect::<Vec<_>>();
+	let extent_count = extents.len();
+	let buffers = ReusableBufferPool::with_factory(2, || {
+		(0..extent_pages).map(|_| Box::new(AlignedPage::zeroed())).collect::<Vec<_>>()
+	});
+	let worker_buffers = buffers.clone();
+	let worker_file = Arc::clone(&file);
+	let root_depth = root_pages.min(3);
+	let timer = MeasurementTimer::start()?;
+	let mut cursor =
+		PrototypePrefetchCursor::new(extents, NonZeroUsize::MIN, move |(first, count)| {
+			PREFETCH_SCATTER.with(|slot| {
+				let mut slot = slot.borrow_mut();
+				if slot.is_none() {
+					*slot = Some(ScatterReader::new()?);
+				}
+				let scatter = slot.as_mut().ok_or_else(|| {
+					FerrosGrynnError::storage_io_failure(
+						"mixed B+tree scatter context was not initialized",
+					)
+				})?;
+				let mut buffer = worker_buffers.take()?;
+				let mut pages =
+					buffer.buffer_mut()?[..count].iter_mut().map(Box::as_mut).collect::<Vec<_>>();
+				scatter.read_raw(&worker_file, first, &mut pages)?;
+				drop(pages);
+				Ok((first, count, buffer))
+			})
+		});
+	while let Some(result) = cursor.next() {
+		let (first, count, buffer) = result?;
+		for (offset, page) in buffer.buffer()?[..count].iter().enumerate() {
+			page.validate(PageNo::new(first.get() + offset as u64))?;
+		}
+		for page in &buffer.buffer()?[..count] {
+			for root in &root_table[..root_depth] {
+				black_box(root.as_bytes()[PAGE_HEADER_SIZE]);
+			}
+			black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+		}
+		drop(buffer);
+	}
+	cursor.finish()?;
+	let timing = timer.finish()?;
+	if extent_count == 0 {
+		return Err(io::Error::other("mixed B+tree scan produced no extents").into());
+	}
+	buffers.ensure_all_returned()?;
+	let rss_delta = process_rss()?.saturating_sub(rss_before);
+	Ok(aggregate_measurement(
+		timing,
+		leaf_pages as u64,
+		leaf_pages as u64 * (root_depth + 1) as u64 * PAGE_SIZE as u64,
+		rss_delta,
+	))
+}
+
+/// Measures mmap with hot roots prefaulted and every leaf checksum retained
+/// inside the timed disjoint scan.
+fn measure_btree_mmap(
+	dataset: &Dataset,
+	root_pages: usize,
+	leaf_first: PageNo,
+	leaf_pages: usize,
+	latency_batch: usize,
+) -> Result<Measurement, Box<dyn Error>> {
+	let rss_before = process_rss()?;
+	let mapping = MmapControl::map_unvalidated(dataset)?;
+	for root in 0..root_pages {
+		let page_no = PageNo::new(root as u64);
+		validate_page_bytes(mapping_page(&mapping.mapping, page_no)?, page_no)?;
+	}
+	let root_depth = root_pages.min(3);
+	let measurement = measure_operations(
+		leaf_pages as u64,
+		latency_batch.min(leaf_pages).max(1),
+		((root_depth + 1) * PAGE_SIZE) as u64,
+		|operation| {
+			for root in 0..root_depth {
+				black_box(mapping.marker(PageNo::new(root as u64)));
+			}
+			let leaf_no = PageNo::new(leaf_first.get() + operation);
+			validate_page_bytes(mapping_page(&mapping.mapping, leaf_no)?, leaf_no)?;
+			Ok(())
+		},
+	)?;
+	finish_fixture_rss(measurement, rss_before)
+}
+
 /// Builds one global hot-set position for an interleaved source count.
 fn multifile_access(global_page: usize, file_count: usize, hot: bool) -> WorkloadAccess {
 	WorkloadAccess {
@@ -4699,6 +5950,39 @@ fn candidate_selector_from_env(
 	}
 }
 
+/// Optionally pauses a large Windows probe after setup so WPR can start before
+/// the measured candidate runs.
+#[cfg(windows)]
+fn wait_for_profiler_gate() -> Result<(), Box<dyn Error>> {
+	let Ok(ready_path) = std::env::var("FG_STORAGE_PROTO_PROFILER_READY") else {
+		return Ok(());
+	};
+	let go_path = std::env::var("FG_STORAGE_PROTO_PROFILER_GO").map_err(|error| {
+		io::Error::other(format!("profiler ready path was set without a go path: {error}"))
+	})?;
+	let ready_path = PathBuf::from(ready_path);
+	let go_path = PathBuf::from(go_path);
+	if ready_path == go_path {
+		return Err(io::Error::other("profiler ready and go paths must differ").into());
+	}
+	if let Some(parent) = ready_path.parent() {
+		std::fs::create_dir_all(parent)?;
+	}
+	std::fs::write(&ready_path, std::process::id().to_string())?;
+	let deadline = Instant::now() + Duration::from_secs(300);
+	while !go_path.exists() {
+		if Instant::now() >= deadline {
+			return Err(io::Error::new(
+				io::ErrorKind::TimedOut,
+				"profiler go signal was not received",
+			)
+			.into());
+		}
+		thread::sleep(Duration::from_millis(10));
+	}
+	Ok(())
+}
+
 /// Stable artifact root.
 fn artifact_directory() -> PathBuf {
 	Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4909,6 +6193,42 @@ mod harness_contract_tests {
 			validate_candidate_selector("resident", Some("r2_atomic"), &supported).is_err(),
 			"candidate matching must remain case-sensitive and exact"
 		);
+	}
+
+	/// Process-isolated resident runs require exactly one of the two finalist
+	/// fixtures and never silently construct both.
+	#[test]
+	fn isolated_resident_candidate_requires_exact_finalist() {
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("R0_mmap")),
+			Ok(ResidentIsolatedCandidate::Mmap)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("R3_notify_resolved")),
+			Ok(ResidentIsolatedCandidate::NotifyResolved)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("R6_dense_flat_run")),
+			Ok(ResidentIsolatedCandidate::DenseFlatRun)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("R8_epoch_resolved")),
+			Ok(ResidentIsolatedCandidate::EpochResolved)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("R8_epoch_dense_flat")),
+			Ok(ResidentIsolatedCandidate::EpochDenseFlat)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("R8_epoch_page_table")),
+			Ok(ResidentIsolatedCandidate::EpochPageTable)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("R9_miss_backoff_resolved")),
+			Ok(ResidentIsolatedCandidate::MissBackoffResolved)
+		));
+		assert!(require_resident_isolated_candidate(None).is_err());
+		assert!(require_resident_isolated_candidate(Some("R3_resolved_run")).is_err());
 	}
 
 	/// Every paired repetition derives its order from the immutable base rather

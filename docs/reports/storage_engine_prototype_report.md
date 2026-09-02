@@ -788,8 +788,8 @@ cargo test `
 
 Она завершилась за 3 мин 31 с и создала согласованную пару:
 
-| Артефакт                                            |      Размер | Время создания |
-|-----------------------------------------------------|------------:|---------------:|
+| Артефакт                                            |       Размер | Время создания |
+|-----------------------------------------------------|-------------:|---------------:|
 | `fg_storage_engine_prototypes-2f84a08089d7fad2.exe` |  3 336 192 B |       23:46:28 |
 | `fg_storage_engine_prototypes-2f84a08089d7fad2.pdb` | 27 873 280 B |       23:46:28 |
 
@@ -804,24 +804,24 @@ hot set/pool `4096`, по `2 000 000` логических чтений на с�
 Проценты — median парного отношения к mmap той же repetition, а не отношение
 отдельно вычисленных median.
 
-| Run | Кандидат | Median Mops/s | Median к mmap | p99 |
-|---:|---|---:|---:|---:|
-| 1 | mmap | 25,798 | 100% | 76 ns |
-| 1 | R3 resolved run | 11,111 | 41,9% | 167 ns |
-| 1 | R6 dense flat run | 12,512 | 43,1% | 167 ns |
-| 1 | R7 dense two-level run | 10,219 | 40,4% | 182 ns |
-| 4 | mmap | 65,633 | 100% | 31 ns |
-| 4 | R3 resolved run | 30,348 | 46,3% | 67 ns |
-| 4 | R6 dense flat run | 31,645 | 47,6% | 65 ns |
-| 4 | R7 dense two-level run | 32,867 | 52,2% | 67 ns |
-| 16 | mmap | 101,996 | 100% | 16 ns |
-| 16 | R3 resolved run | 69,056 | 71,7% | 25 ns |
-| 16 | R6 dense flat run | 73,421 | 66,6% | 25 ns |
-| 16 | R7 dense two-level run | 69,646 | 62,1% | 24 ns |
-| 64 | mmap | 179,144 | 100% | 9 ns |
-| 64 | R3 resolved run | 139,381 | 78,4% | 11 ns |
-| 64 | **R6 dense flat run** | **163,818** | **93,3%** | **10 ns** |
-| 64 | R7 dense two-level run | 147,332 | 85,3% | 12 ns |
+| Run | Кандидат               | Median Mops/s | Median к mmap |       p99 |
+|----:|------------------------|--------------:|--------------:|----------:|
+|   1 | mmap                   |        25,798 |          100% |     76 ns |
+|   1 | R3 resolved run        |        11,111 |         41,9% |    167 ns |
+|   1 | R6 dense flat run      |        12,512 |         43,1% |    167 ns |
+|   1 | R7 dense two-level run |        10,219 |         40,4% |    182 ns |
+|   4 | mmap                   |        65,633 |          100% |     31 ns |
+|   4 | R3 resolved run        |        30,348 |         46,3% |     67 ns |
+|   4 | R6 dense flat run      |        31,645 |         47,6% |     65 ns |
+|   4 | R7 dense two-level run |        32,867 |         52,2% |     67 ns |
+|  16 | mmap                   |       101,996 |          100% |     16 ns |
+|  16 | R3 resolved run        |        69,056 |         71,7% |     25 ns |
+|  16 | R6 dense flat run      |        73,421 |         66,6% |     25 ns |
+|  16 | R7 dense two-level run |        69,646 |         62,1% |     24 ns |
+|  64 | mmap                   |       179,144 |          100% |      9 ns |
+|  64 | R3 resolved run        |       139,381 |         78,4% |     11 ns |
+|  64 | **R6 dense flat run**  |   **163,818** |     **93,3%** | **10 ns** |
+|  64 | R7 dense two-level run |       147,332 |         85,3% |     12 ns |
 
 R6 при run `64` впервые прошёл минимальный resident floor `90%` и p99 gate,
 но не целевой `95%`. Это не универсальная победа: при pin/drop на каждое
@@ -836,23 +836,23 @@ cursor-ом и амортизация pin/generation validation на неско�
 После добавления page-fault probe профильная сборка повторно создала точную
 одноимённую пару:
 
-| Артефакт | Размер | Время создания |
-|---|---:|---:|
-| `fg_storage_engine_prototypes-2f84a08089d7fad2.exe` | 3 354 112 B | 00:10:50 |
-| `fg_storage_engine_prototypes-2f84a08089d7fad2.pdb` | 31 404 032 B | 00:10:50 |
+| Артефакт                                            |       Размер | Время создания |
+|-----------------------------------------------------|-------------:|---------------:|
+| `fg_storage_engine_prototypes-2f84a08089d7fad2.exe` |  3 354 112 B |       00:10:50 |
+| `fg_storage_engine_prototypes-2f84a08089d7fad2.pdb` | 31 404 032 B |       00:10:50 |
 
 VTune 2026.4 hardware Hotspots запускался с administrator rights на этом EXE:
 единственный `R6_dense_flat_run`, `250 000 000` логических операций для run
 `1/4/16/64`. Collection завершилась за `44,685 s` wall и `40,470 s` CPU;
 event-based sampling driver работал. Rust functions и source files разрешены:
 
-| Hotspot | CPU time | Доля CPU |
-|---|---:|---:|
-| `harness::measure_resident_runs` | 28,053 s | 69,3% |
-| `AtomicArenaBufferPool::try_pin` | 2,661 s | 6,6% |
-| `AtomicArenaBufferPool::release_pin` | 2,611 s | 6,5% |
-| `core::sync::atomic::atomic_load` | 1,365 s | 3,4% |
-| `SourceBoundLocator::get_resolved` | 0,883 s | 2,2% |
+| Hotspot                              | CPU time | Доля CPU |
+|--------------------------------------|---------:|---------:|
+| `harness::measure_resident_runs`     | 28,053 s |    69,3% |
+| `AtomicArenaBufferPool::try_pin`     |  2,661 s |     6,6% |
+| `AtomicArenaBufferPool::release_pin` |  2,611 s |     6,5% |
+| `core::sync::atomic::atomic_load`    |  1,365 s |     3,4% |
+| `SourceBoundLocator::get_resolved`   |  0,883 s |     2,2% |
 
 `measure_resident_runs` включает inlined closure с вычислением страницы и
 самими marker reads; это не 69,3% чистого harness overhead. Явно
@@ -873,12 +873,12 @@ validated Direct перед mmap не наполняет системный file
 совокупным process counter и не различает soft и hard faults; поэтому ниже не
 делается вывод о числе физических disk faults.
 
-| Dataset | Кандидат | MiB/s | Process faults | Faults/DB page | Working-set delta |
-|---:|---|---:|---:|---:|---:|
-| 128 MiB (`0,008x RAM`) | validated Direct | 1 928,5 | 2 | 0,0002 | 8 KiB |
-| 128 MiB (`0,008x RAM`) | mmap first touch | 869,4 | 32 831 | 4,0077 | 128 MiB |
-| 18,31 GiB (`1,165x RAM`) | validated Direct | 1 936,3 | 2 | 0,000002 | 8 KiB |
-| 18,31 GiB (`1,165x RAM`) | mmap first touch | 606,2 | 4 809 466 | 4,0079 | 8,76 GiB |
+|                  Dataset | Кандидат         |   MiB/s | Process faults | Faults/DB page | Working-set delta |
+|-------------------------:|------------------|--------:|---------------:|---------------:|------------------:|
+|   128 MiB (`0,008x RAM`) | validated Direct | 1 928,5 |              2 |         0,0002 |             8 KiB |
+|   128 MiB (`0,008x RAM`) | mmap first touch |   869,4 |         32 831 |         4,0077 |           128 MiB |
+| 18,31 GiB (`1,165x RAM`) | validated Direct | 1 936,3 |              2 |       0,000002 |             8 KiB |
+| 18,31 GiB (`1,165x RAM`) | mmap first touch |   606,2 |      4 809 466 |         4,0079 |          8,76 GiB |
 
 На большом файле mmap сохранил только `31,3%` validated Direct throughput;
 на холодных 128 MiB — `45,1%`. Временный файл `19 660 800 000 B` после теста
@@ -921,12 +921,265 @@ hit, а не fault/eviction path.
    production migration plan; текущие BufferPool и storage API до этого не
    менять.
 
+## Исполнение dependency-ordered продолжения
+
+Все семь пунктов плана из предыдущего раздела выполнены в исходном порядке:
+
+| Пункт | Результат                                                           |
+|------:|---------------------------------------------------------------------|
+|     1 | R6/mmap изолированы; добавлены run `32/128`; crossover перепроверен |
+|     2 | Реализован и проверен `R8` cursor-scoped read epoch                 |
+|     3 | Реализован `R9` miss-side backoff; вариант отклонён по измерениям   |
+|     4 | Финалисты прогнаны на `1,15x` и `2x RAM`                            |
+|     5 | WPR/ETW разделил transition и hard faults mmap                      |
+|     6 | Добавлены B+tree, graph/property и 1/4/8-file mixed workloads       |
+|     7 | Выбран Pareto-набор и составлен production migration plan           |
+
+Production `BufferPool`, `SyncPageManager`, GQL plumbing и формат страниц не
+менялись. Все новые реализации и workload находятся в
+`crates/fg-storage-engine-prototypes`.
+
+### Контроль аппаратного окружения
+
+Во время финальных прогонов процессор работал в режиме максимальной
+производительности, ParkControl отключал парковку всех ядер, ноутбук был
+подключён к питанию. Поэтому систематический результат нельзя объяснить
+энергосберегающим режимом или parked cores. Низкий `Physical Core Utilization`
+в однопоточном VTune capture ниже трактуется как ожидание одного storage
+потока, а не как аппаратный конфликт.
+
+### R8: read epoch и таблица разрешённых страниц
+
+`R8` оставляет frame bytes в стабильной atomic arena, но переносит проверку
+владения со страницы на ограниченный физический cursor scope:
+
+1. cursor входит в `AtomicReadEpoch` один раз;
+2. `SourceBoundLocator` проверяет точные source identity, version и page range;
+3. заранее разрешённая таблица возвращает frame index/generation без hash
+   lookup, pin CAS и guard drop на каждом чтении;
+4. eviction переводит frame в retired state, а повторное использование bytes
+   откладывается до выхода последнего активного epoch;
+5. stale generation, другой source epoch и повторное использование frame не
+   открывают старые bytes.
+
+Correctness проверен обычными и детерминированными Shuttle-тестами: stale
+handle, ABA/reuse, удаление source во время epoch, backpressure и освобождение
+retired frame. Прототип намеренно использует один глобальный reader count.
+Production scope должен быть ограничен cursor batch/frontier window; более
+сложные generation buckets нужны только при измеренном miss-side
+backpressure.
+
+Девять paired repetitions, `4096` resident pages; `run` — число полезных
+логических чтений под одним physical cursor scope:
+
+| Run | R8 к mmap, paired median |       Min–max | Разница p99 |
+|----:|-------------------------:|--------------:|------------:|
+|   1 |                  105,11% | 85,79–111,49% |       -2 ns |
+|   4 |                  103,87% | 98,71–193,65% |        0 ns |
+|  16 |                   97,40% | 69,49–110,41% |       +1 ns |
+|  32 |                   99,20% | 88,92–140,66% |       +1 ns |
+|  64 |                   99,72% | 76,75–123,77% |        0 ns |
+| 128 |                  100,90% | 86,68–122,07% |        0 ns |
+
+Это закрывает исходный resident target в изолированном тесте: проблема была
+не в невозможности пользовательского pool догнать mmap, а в обязательной
+оплате directory lookup, pin и release на каждое логическое чтение.
+
+`R9` переносил waiter bookkeeping с resident release на miss-side bounded
+backoff, но сохранял per-read pin/release. Его paired median составил только
+`40,47/53,00/66,67/83,78/78,46/78,88%` mmap для run
+`1/4/16/32/64/128`, а p99 при run 1 был хуже на `79 ns`. Следовательно,
+waiter load не был остаточным bottleneck; `R9` отклонён, а `WaitOnAddress` не
+добавлялся.
+
+### Oversubscribed mmap и точная классификация page faults
+
+Финалисты читали полностью проверяемый файл больше физической RAM. Значения
+ниже — отдельные измерительные прогоны без profiler overhead:
+
+| Dataset     |   Raw Direct | Validated Direct |     Scatter + P1 | mmap first touch |
+|-------------|-------------:|-----------------:|-----------------:|-----------------:|
+| `1,15x RAM` | 1996,5 MiB/s |     1817,5 MiB/s | **2191,2 MiB/s** |      656,7 MiB/s |
+| `2x RAM`    | 1850,3 MiB/s |     1667,7 MiB/s | **1956,3 MiB/s** |      668,2 MiB/s |
+
+WPR/ETW capture для mmap `1,15x RAM` привязан к точному диапазону mapping, а
+не ко всем fault процесса:
+
+- ожидаемых и захваченных уникальных 4-КиБ страниц: `4 737 628`;
+- mapped fault events: `4 737 628`, duplicate mapped faults: `0`;
+- transition: `4 702 941` (`99,26784%`);
+- hard fault: `34 687` (`0,73216%`);
+- demand-zero/COW/guard для mapping: `0`;
+- одна 16-КиБ страница БД дала ровно четыре system-page faults;
+- hard I/O в среднем обслуживал `34,146` страницы БД (`553,032 KiB`).
+
+Профилируемый WPR-run mmap дал `499,134 MiB/s`, поэтому он используется для
+классификации fault, а не заменяет отдельный throughput run. Результат
+объясняет поведение без гипотезы о слабом SSD: большая часть стоимости —
+возврат страниц из transition list и работа memory manager, а физические
+чтения ядро укрупняет. Direct transport не платит четыре fault на каждую
+страницу БД и сохраняет bounded process RSS.
+
+### Методика mixed DB workloads
+
+Первая версия graph/property workload выдавала cold pages последовательно и
+непреднамеренно включала Windows read-ahead. Она исключена. Финальная версия
+использует уникальную детерминированную перестановку cold page range с простым
+шагом `15 485 863`; диапазон не пересекается между repetitions. Это сохраняет
+число страниц и checksum contract, но исключает reuse и последовательный
+read-ahead. B+tree leaf chain, напротив, оставлена последовательной: именно так
+выглядит range scan. Порядок кандидатов ротировался; приведены семь paired
+repetitions последней кампании.
+
+#### B+tree: hot roots и disjoint leaf chain
+
+| Кандидат                    |    Mops/s |      MiB/s |       p99 |         RSS | Paired к mmap |
+|-----------------------------|----------:|-----------:|----------:|------------:|--------------:|
+| mmap hot roots              |     0,060 |     3757,4 | 18,515 us |   128,1 MiB |          100% |
+| R2 roots + sync bypass      |     0,024 |     1501,8 | 44,094 us |     0,2 MiB |         39,1% |
+| **R8 roots + scatter + P1** | **0,111** | **6945,4** |       n/a | **8,0 MiB** |    **185,4%** |
+
+Pipeline probe пока не собирает batch-normalized p99 для scatter, поэтому
+эта строка не считается завершённым production latency gate.
+
+#### Graph frontier и sparse properties
+
+| Workload   | Кандидат             |    Mops/s |          p99 |          RSS | Paired к mmap |
+|------------|----------------------|----------:|-------------:|-------------:|--------------:|
+| Graph      | mmap                 |     0,090 |    23,001 us |     96,0 MiB |          100% |
+| Graph      | R2 cache-all         |     0,058 |    29,991 us |     65,1 MiB |         62,7% |
+| Graph      | R8 + sync bypass     |     0,063 |    20,741 us |     33,1 MiB |         72,0% |
+| Graph      | **R8 + IoRing QD32** | **0,508** | **2,791 us** | **34,3 MiB** |    **506,3%** |
+| Properties | mmap                 |     0,089 |    23,430 us |     72,0 MiB |          100% |
+| Properties | R2 cache-all         |     0,059 |    21,652 us |     64,8 MiB |         66,2% |
+| Properties | R8 + sync bypass     |     0,067 |    20,418 us |      8,9 MiB |         72,2% |
+| Properties | **R8 + IoRing QD32** | **0,401** | **2,929 us** |  **9,9 MiB** |    **457,6%** |
+
+`R8 + sync bypass` уменьшает RSS и p99 mmap, но QD1 cold miss оставляет SSD
+без очереди и проигрывает по throughput. IoRing-вариант использует окно из
+`256` cursor operations, в котором не более `32` cold pages заранее известны;
+каждая страница получает одну SQE и валидируется до выдачи. Ускорение
+`4,58–5,06x` применимо только к frontier/range, где такое lookahead реально
+существует. Непредсказуемый point miss остаётся sync Direct fallback.
+
+#### Общий resident budget для 1/4/8 файлов
+
+Каждый кандидат выполнял `2 000 000` чтений, общий hot set и pool оставались
+равны `4096` страниц независимо от числа файлов:
+
+| Файлы | Кандидат | Mops/s |    p99 |      RSS | Paired к mmap |
+|------:|----------|-------:|-------:|---------:|--------------:|
+|     1 | mmap     | 56,038 |  26 ns | 64,0 MiB |          100% |
+|     1 | R2       |  7,999 | 232 ns | 64,7 MiB |         14,4% |
+|     1 | R8       | 54,234 |  38 ns | 81,1 MiB |         93,9% |
+|     4 | mmap     | 55,552 |  42 ns | 63,8 MiB |          100% |
+|     4 | R2       |  7,237 | 228 ns | 64,9 MiB |         13,8% |
+|     4 | R8       | 53,367 |  32 ns | 81,2 MiB |         94,5% |
+|     8 | mmap     | 53,952 |  29 ns | 64,0 MiB |          100% |
+|     8 | R2       |  7,669 | 230 ns | 65,2 MiB |         13,4% |
+|     8 | R8       | 55,169 |  28 ns | 81,3 MiB |        100,5% |
+
+R8 проходит минимальный `90%` floor и удерживает p99 в пределах
+`mmap + 12 ns`; на 1/4 файлах paired median на `0,5–1,1` процентного пункта
+ниже целевого `95%`, поэтому production gate ещё требует повторения через
+реальный cursor API.
+
+Около `16 MiB` разницы RSS R8 — test-only `Vec<usize>` из двух миллионов
+заранее разрешённых индексов, то есть дубликат access plan, а не frame
+metadata. Production cursor не должен создавать второй unbounded vector:
+resolved frame index хранится в существующей записи плана либо разрешается
+ограниченными окнами. После этого cache budget остаётся общим для всех файлов.
+
+### VTune для frame-IoRing QD32
+
+Финальная профильная сборка использовала `--profile profiling` и точную пару:
+
+| Артефакт                                            |       Размер |    Время |
+|-----------------------------------------------------|-------------:|---------:|
+| `fg_storage_engine_prototypes-2f84a08089d7fad2.exe` |  3 637 248 B | 03:59:47 |
+| `fg_storage_engine_prototypes-2f84a08089d7fad2.pdb` | 35 581 952 B | 03:59:47 |
+
+Hardware Hotspots capture
+`vtune-t2-ioring-qd32-profiling-20260902-admin` завершил тест за `8,10 s`:
+`5,581 s` CPU, `18 715 008 000` instructions, CPI `0,833`,
+Microarchitecture Usage `26,0%`, Physical Core Utilization `6,9%` (`0,551/8`).
+
+| Hotspot                              | CPU time | Доля CPU |
+|--------------------------------------|---------:|---------:|
+| `RapidStreamChunkState::chunk_write` |  0,392 s |     7,0% |
+| `memcpy_repmovs`                     |  0,259 s |     4,6% |
+| `WindowsIoRing::execute_chunk`       |  0,003 s |    0,05% |
+| `WindowsIoRing::execute_measured`    |  0,001 s |    0,02% |
+
+Source-stack export разрешил `WindowsIoRing`, transport probe и исходные
+`.rs` файлы. `rapidhash` однозначно вызывается из `validate_page_bytes`;
+отдельный `page_checksum_mut` относится к генерации dataset. Для крупного
+`memcpy_repmovs` вызывающий стек не разрешён, поэтому его нельзя честно
+приписать direct-to-frame transport. Пользовательская submission/completion
+логика IoRing не является CPU bottleneck; оставшееся wall time — ожидание
+storage/kernel плюс обязательная checksum validation.
+
+VTune вернул code `1` только из-за отсутствующих symbols Windows DLL/SYS.
+Rust EXE/PDB и source symbols разрешены, CSV export завершился успешно, поэтому
+результат — **PASS** для prototype code и **WARN** для системных PDB.
+
+## Итоговая Pareto-архитектура
+
+Один backend не выигрывает на всех паттернах. Минимальная комбинация,
+подтверждённая текущими измерениями:
+
+| Hot path                                       | Выбранный механизм                                                      |
+|------------------------------------------------|-------------------------------------------------------------------------|
+| Hot point/root/adjacency в рамках cursor batch | R8 atomic arena + source-bound resolved page table + bounded read epoch |
+| B+tree leaf/range и one-shot scan              | Rocks-like bypass + `ReadFileScatter` + prefetch depth 1                |
+| Известный sparse graph/property frontier       | R8 hot pages + frame-IoRing QD32 для cold window                        |
+| Непредсказуемый одиночный miss                 | Sync validated Direct fallback                                          |
+| Несколько файлов/версий                        | Один глобальный frame budget и exact source epoch                       |
+
+`mmap` остаётся control: он очень силён на заранее resident bytes, но резко
+проигрывает Direct при first touch и наборе больше RAM. R2 и R9 отклонены как
+доминируемые; VM-address не дал уникального выигрыша, оправдывающего Windows
+commit/decommit lifecycle. Более сложная lock-free directory, hazard pointers
+и custom allocator не нужны: измеренный bottleneck уже устранён ownership и
+I/O batching.
+
+## Dependency-ordered plan production-интеграции
+
+1. **Зафиксировать внутренний read contract.** В `src/storage` определить
+   непубличные `ReadIntent` и bounded physical cursor scope. Scope обязан
+   различать exact `SourceIdentity`/`SourceEpoch`, завершаться между
+   batch/frontier windows и не переживать смену snapshot version.
+2. **Перенести минимальный R8 resident core под feature gate.** Stable arena,
+   source-bound page table, generation validation и retired frames; без R9,
+   VM cache и новой lock-free directory. Старый pool остаётся default.
+3. **Закрыть production correctness gate.** Повторить corruption, short read,
+   Home/WAL versions, ABA, concurrent eviction, cancellation, 1/4/8 files и
+   bounded-retired backpressure. Unsafe invariants оставить внутри arena
+   wrapper и проверить Shuttle.
+4. **Подключить intent policy.** Hot roots/point pages получают cache-all;
+   one-shot/bulk и последовательные leaf misses — bypass. Cold admission A2
+   добавлять только если реальный повторный leaf scan докажет reuse.
+5. **Подключить два транспорта.** Scatter + P1 для последовательного extent;
+   frame-IoRing QD32 — только когда cursor/frontier предоставляет bounded
+   future-page window. Для остальных miss сохранить sync Direct.
+6. **Убрать test-only дубликат плана.** Хранить resolved index в существующей
+   cursor entry либо разрешать окнами; отдельно учитывать frames, metadata и
+   transport buffers в одном memory budget.
+7. **Повторить performance gates через production API.** Добавить pipeline
+   p99, 1/4/8-file concurrency, long cursor cancellation и RSS без
+   `Vec<usize>`. Использовать `--profile profiling`, точную EXE/PDB пару и
+   финальный VTune/WPR capture только при регрессии.
+8. **Включить canary и затем default.** Сначала feature-gated shadow/paired
+   проверка с fallback на текущий pool. Default меняется только после
+   correctness, `>=95% mmap` resident, bounded RSS и sequential/p99 gates;
+   прежний path удаляется отдельным изменением после периода стабильности.
+
 ## Индекс артефактов
 
 - `docs/storage_engine_prototype_plan.md` — утверждённый порядок;
 - `crates/fg-storage-engine-prototypes` — текущий test-only code и probes;
-- `docs/reports/storage_engine_prototype_results.csv` — 164 compact groups;
-- `target/storage-engine-prototype/results.csv` — 1418 raw schema-v2 rows;
+- `docs/reports/storage_engine_prototype_results.csv` — 204 compact groups;
+- `target/storage-engine-prototype/results.csv` — 3210 raw schema-v2 rows;
 - `target/storage-engine-prototype/page-fault-results.csv` — Windows process
   faults и working set для cold/oversubscribed mmap comparison;
 - `target/storage-engine-prototype/run.log` — log основной campaign;
@@ -937,4 +1190,8 @@ hit, а не fault/eviction path.
 - `target/storage-engine-prototype/production-baseline-summary.txt` — повтор
   неизменённого production gate;
 - `target/storage-engine-prototype/profilers/` — VTune/WPR/Tracy evidence;
+- `target/storage-engine-prototype/profilers/wpr-all-faults-mmap-115ram-20260902-031919-summary.txt`
+  — exact mapped-fault classification;
+- `target/storage-engine-prototype/profilers/vtune-t2-ioring-qd32-profiling-20260902-admin-hotspots.csv`
+  и соседний `source-stack.csv` — финальный IoRing CPU profile;
 - остальные `pre-*`/`smoke-*` — исключённая диагностическая история.

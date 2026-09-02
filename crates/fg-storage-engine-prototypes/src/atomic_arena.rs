@@ -28,6 +28,8 @@ use super::{SourceEpoch, SourceIdentity};
 const DIRECTORY_SHARDS: usize = 64;
 /// Maximum number of full clock passes before the caller sleeps for capacity.
 const CLOCK_SCAN_PASSES: usize = 4;
+/// Busy iterations before a miss-side waiter yields its hardware thread.
+const MISS_BACKOFF_SPINS: usize = 64;
 /// Unique identity source preventing resolved handles from crossing arenas.
 static NEXT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -256,6 +258,18 @@ impl SourceBoundLocator {
 		}
 	}
 
+	/// Borrows a resident page through one compact source-local lookup while
+	/// the caller's read epoch prevents frame-byte reuse.
+	pub(super) fn get_epoch_resolved<'epoch>(
+		&self,
+		epoch: &'epoch AtomicReadEpoch<'_>,
+		key: PageCacheKey,
+	) -> Option<AtomicEpochPage<'epoch>> {
+		let index = self.exact_index(epoch.pool, key)?;
+		let locator = self.load_locator(index)?;
+		epoch.get_locator(locator)
+	}
+
 	/// Uses a compact slot when valid and refreshes it through the normal miss
 	/// path after eviction or frame reuse.
 	///
@@ -428,8 +442,9 @@ impl FrameBytes {
 
 // SAFETY: `page` is mutated only by the unique owner of a `Loading` frame.
 // A Release publication changes that frame to `Resident`; readers obtain an
-// immutable reference only after an Acquire pin CAS for the same generation.
-// Replacement requires pin count zero before the next mutation.
+// immutable reference only after an Acquire pin CAS or a counted read epoch
+// validates the same generation. Replacement requires pin count zero and
+// defers reuse of `Evicting` bytes until every read epoch exits.
 unsafe impl Sync for FrameBytes {}
 
 /// Clock hand and frame-to-key ownership protected only on miss/eviction.
@@ -659,6 +674,16 @@ enum PinResult {
 	Exhausted,
 }
 
+/// How a capacity-starved slow path waits for the last resident pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapacityWaitMode {
+	/// Register a waiter and let the last guard drop signal a condition
+	/// variable.
+	NotifyFromGuard,
+	/// Poll only on the miss side so resident guard drop has no waiter lookup.
+	MissSideBackoff,
+}
+
 /// Test-only PostgreSQL-inspired fixed frame arena.
 pub(super) struct AtomicArenaBufferPool {
 	/// Unique identity used only to reject cross-arena resolved handles.
@@ -678,6 +703,10 @@ pub(super) struct AtomicArenaBufferPool {
 	capacity_available: Condvar,
 	/// Callers currently registered to wait for capacity.
 	capacity_waiters: AtomicUsize,
+	/// Whether guard drop or the miss side owns capacity-wait coordination.
+	capacity_wait_mode: CapacityWaitMode,
+	/// Cursor-scoped readers that may retain borrowed resident page addresses.
+	active_read_epochs: AtomicUsize,
 	/// Whether resident hits update shard-local counters.
 	counter_mode: CounterMode,
 	/// Slow-path miss count.
@@ -696,8 +725,22 @@ impl AtomicArenaBufferPool {
 		Self::with_counters(capacity, CounterMode::Disabled)
 	}
 
+	/// Creates the R9 variant whose resident drop never inspects waiter state.
+	pub(super) fn with_miss_side_backoff(capacity: NonZeroUsize) -> Self {
+		Self::with_configuration(capacity, CounterMode::Disabled, CapacityWaitMode::MissSideBackoff)
+	}
+
 	/// Creates a fixed arena with the requested hit-counter mode.
 	pub(super) fn with_counters(capacity: NonZeroUsize, counter_mode: CounterMode) -> Self {
+		Self::with_configuration(capacity, counter_mode, CapacityWaitMode::NotifyFromGuard)
+	}
+
+	/// Creates one explicitly configured experimental arena.
+	fn with_configuration(
+		capacity: NonZeroUsize,
+		counter_mode: CounterMode,
+		capacity_wait_mode: CapacityWaitMode,
+	) -> Self {
 		let capacity = capacity.get();
 		let frames =
 			(0..capacity).map(|_| FrameBytes::new()).collect::<Vec<_>>().into_boxed_slice();
@@ -720,6 +763,8 @@ impl AtomicArenaBufferPool {
 			batch_admission: Mutex::new(()),
 			capacity_available: Condvar::new(),
 			capacity_waiters: AtomicUsize::new(0),
+			capacity_wait_mode,
+			active_read_epochs: AtomicUsize::new(0),
 			counter_mode,
 			misses: AtomicU64::new(0),
 			coalesced_misses: AtomicU64::new(0),
@@ -731,6 +776,22 @@ impl AtomicArenaBufferPool {
 	/// Returns the exact number of permanently allocated frames.
 	pub(super) const fn capacity(&self) -> usize {
 		self.frames.len()
+	}
+
+	/// Enters one cursor-scoped read epoch.
+	///
+	/// # Errors
+	///
+	/// Returns an internal storage error if the reader counter is exhausted.
+	pub(super) fn read_epoch(&self) -> FerrosGrynnResult<AtomicReadEpoch<'_>> {
+		self.active_read_epochs
+			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |readers| readers.checked_add(1))
+			.map_err(|_| {
+				FerrosGrynnError::storage_io_failure("atomic-arena read-epoch counter is exhausted")
+			})?;
+		Ok(AtomicReadEpoch {
+			pool: self,
+		})
 	}
 
 	/// Returns a validated pinned page, loading it on an exact-key miss.
@@ -966,6 +1027,14 @@ impl AtomicArenaBufferPool {
 			.count()
 	}
 
+	/// Counts frames retired until the current read epochs drain.
+	pub(super) fn retired_count(&self) -> usize {
+		self.metadata
+			.iter()
+			.filter(|meta| lifecycle(meta.state.load(Ordering::SeqCst)) == Lifecycle::Evicting)
+			.count()
+	}
+
 	/// Reserves a cold-miss batch for scatter or frame-oriented direct I/O.
 	///
 	/// # Errors
@@ -1066,6 +1135,12 @@ impl AtomicArenaBufferPool {
 						continue;
 					}
 					if pins(state) != 0 {
+						if self.capacity_wait_mode == CapacityWaitMode::MissSideBackoff {
+							drop(replacement);
+							bounded_capacity_backoff();
+							replacement = self.replacement.lock();
+							continue;
+						}
 						if registration.is_none() {
 							registration = Some(CapacityWaiter::new(&self.capacity_waiters));
 							continue;
@@ -1076,7 +1151,7 @@ impl AtomicArenaBufferPool {
 					let evicting = with_lifecycle(state, Lifecycle::Evicting);
 					if meta
 						.state
-						.compare_exchange(state, evicting, Ordering::AcqRel, Ordering::Acquire)
+						.compare_exchange(state, evicting, Ordering::SeqCst, Ordering::SeqCst)
 						.is_err()
 					{
 						continue;
@@ -1094,12 +1169,17 @@ impl AtomicArenaBufferPool {
 						));
 					}
 					replacement.keys[locator.index] = None;
-					meta.state.store(
-						pack_state(Lifecycle::Free, locator.generation, 0, 0),
-						Ordering::Release,
-					);
+					let reclaimed = self.active_read_epochs.load(Ordering::SeqCst) == 0;
+					if reclaimed {
+						meta.state.store(
+							pack_state(Lifecycle::Free, locator.generation, 0, 0),
+							Ordering::SeqCst,
+						);
+					}
 					drop(replacement);
-					self.capacity_available.notify_all();
+					if reclaimed {
+						self.capacity_available.notify_all();
+					}
 					return Ok(true);
 				}
 			}
@@ -1124,6 +1204,7 @@ impl AtomicArenaBufferPool {
 	fn reserve(&self, key: PageCacheKey) -> FerrosGrynnResult<ReserveDecision> {
 		let mut replacement = self.replacement.lock();
 		let mut registration = None;
+		let mut recorded_backpressure = false;
 		loop {
 			match self.lookup(key) {
 				DirectoryLookup::Resident(locator) => {
@@ -1163,8 +1244,17 @@ impl AtomicArenaBufferPool {
 				}));
 			}
 
-			if registration.is_none() {
+			if !recorded_backpressure {
 				self.backpressure_waits.fetch_add(1, Ordering::Relaxed);
+				recorded_backpressure = true;
+			}
+			if self.capacity_wait_mode == CapacityWaitMode::MissSideBackoff {
+				drop(replacement);
+				bounded_capacity_backoff();
+				replacement = self.replacement.lock();
+				continue;
+			}
+			if registration.is_none() {
 				registration = Some(CapacityWaiter::new(&self.capacity_waiters));
 				continue;
 			}
@@ -1219,7 +1309,7 @@ impl AtomicArenaBufferPool {
 					let evicting = with_lifecycle(raw, Lifecycle::Evicting);
 					if meta
 						.state
-						.compare_exchange(raw, evicting, Ordering::AcqRel, Ordering::Acquire)
+						.compare_exchange(raw, evicting, Ordering::SeqCst, Ordering::SeqCst)
 						.is_err()
 					{
 						continue;
@@ -1233,13 +1323,6 @@ impl AtomicArenaBufferPool {
 							));
 						}
 					};
-					let next_generation = match next_generation(raw, new_key) {
-						Ok(next) => next,
-						Err(error) => {
-							meta.state.store(raw, Ordering::Release);
-							return Err(error);
-						}
-					};
 					if !self.remove_resident_mapping(old_key, FrameLocator {
 						index,
 						generation: generation(raw),
@@ -1249,16 +1332,31 @@ impl AtomicArenaBufferPool {
 							"atomic-arena resident mapping changed during eviction",
 						));
 					}
-					replacement.keys[index] = Some(new_key);
-					meta.state.store(
-						pack_state(Lifecycle::Loading, next_generation, 0, 0),
-						Ordering::Release,
-					);
+					replacement.keys[index] = None;
 					self.evictions.fetch_add(1, Ordering::Relaxed);
-					return Ok(Some(FrameLocator {
-						index,
-						generation: next_generation,
-					}));
+					if self.active_read_epochs.load(Ordering::SeqCst) > 0 {
+						return Ok(None);
+					}
+				}
+				Lifecycle::Evicting if self.active_read_epochs.load(Ordering::SeqCst) == 0 => {
+					if replacement.keys[index].is_some() {
+						return Err(FerrosGrynnError::storage_io_failure(
+							"atomic-arena retired frame retained a key",
+						));
+					}
+					let next_generation = next_generation(raw, new_key)?;
+					let loading = pack_state(Lifecycle::Loading, next_generation, 0, 0);
+					if meta
+						.state
+						.compare_exchange(raw, loading, Ordering::SeqCst, Ordering::SeqCst)
+						.is_ok()
+					{
+						replacement.keys[index] = Some(new_key);
+						return Ok(Some(FrameLocator {
+							index,
+							generation: next_generation,
+						}));
+					}
 				}
 				Lifecycle::Loading | Lifecycle::Resident | Lifecycle::Evicting => {}
 			}
@@ -1450,11 +1548,18 @@ impl AtomicArenaBufferPool {
 	/// Releases one pin and wakes replacement only when it may be waiting.
 	fn release_pin(&self, locator: FrameLocator) {
 		let meta = &self.metadata[locator.index];
-		let previous = meta.state.fetch_sub(1_u64 << PIN_SHIFT, Ordering::SeqCst);
+		let previous = if self.capacity_wait_mode == CapacityWaitMode::MissSideBackoff {
+			meta.state.fetch_sub(1_u64 << PIN_SHIFT, Ordering::Release)
+		} else {
+			meta.state.fetch_sub(1_u64 << PIN_SHIFT, Ordering::SeqCst)
+		};
 		debug_assert_eq!(lifecycle(previous), Lifecycle::Resident);
 		debug_assert_eq!(generation(previous), locator.generation);
 		debug_assert!(pins(previous) > 0);
-		if pins(previous) != 1 || self.capacity_waiters.load(Ordering::SeqCst) == 0 {
+		if self.capacity_wait_mode == CapacityWaitMode::MissSideBackoff
+			|| pins(previous) != 1
+			|| self.capacity_waiters.load(Ordering::SeqCst) == 0
+		{
 			return;
 		}
 		// The waiter registers and rechecks frame state with `SeqCst` while
@@ -1467,11 +1572,101 @@ impl AtomicArenaBufferPool {
 		}
 	}
 
+	/// Leaves one cursor-scoped read epoch and releases retired frames for
+	/// miss-side reclamation after the last reader.
+	fn release_read_epoch(&self) {
+		let previous = self.active_read_epochs.fetch_sub(1, Ordering::SeqCst);
+		debug_assert!(previous > 0);
+		if self.capacity_wait_mode == CapacityWaitMode::MissSideBackoff
+			|| previous != 1
+			|| self.capacity_waiters.load(Ordering::SeqCst) == 0
+		{
+			return;
+		}
+		let _replacement = self.replacement.lock();
+		if self.capacity_waiters.load(Ordering::SeqCst) > 0 {
+			self.capacity_available.notify_all();
+		}
+	}
+
 	/// Records a hit without a global counter or lock.
 	fn record_hit(&self, key: PageCacheKey) {
 		if self.counter_mode == CounterMode::Sharded {
 			self.directory[directory_shard(key)].hits.fetch_add(1, Ordering::Relaxed);
 		}
+	}
+}
+
+/// Gives a capacity-starved miss a bounded local spin before yielding.
+fn bounded_capacity_backoff() {
+	// ponytail: this bounded spin/yield avoids a resident-side wake protocol;
+	// add `WaitOnAddress` only if measured miss CPU or tail latency requires it.
+	for _ in 0..MISS_BACKOFF_SPINS {
+		std::hint::spin_loop();
+	}
+	std::thread::yield_now();
+}
+
+/// Cursor-scoped reclamation guard for borrowed arena page addresses.
+///
+/// ponytail: one global reader count delays every retired frame; replace it
+/// with generation-bucketed epochs only if measured miss-side backpressure
+/// makes that extra machinery necessary.
+pub(super) struct AtomicReadEpoch<'pool> {
+	/// Arena whose retired bytes remain immutable until this guard drops.
+	pool: &'pool AtomicArenaBufferPool,
+}
+
+impl AtomicReadEpoch<'_> {
+	/// Borrows a page through one cached locator without per-page pin/drop.
+	pub(super) fn get_resolved<'epoch>(
+		&'epoch self,
+		handle: &ResolvedFrameHandle,
+	) -> Option<AtomicEpochPage<'epoch>> {
+		(handle.arena_id == self.pool.arena_id).then(|| self.get_locator(handle.locator)).flatten()
+	}
+
+	/// Validates one exact frame generation before exposing immutable bytes.
+	fn get_locator<'epoch>(&'epoch self, locator: FrameLocator) -> Option<AtomicEpochPage<'epoch>> {
+		let meta = self.pool.metadata.get(locator.index)?;
+		let state = meta.state.load(Ordering::SeqCst);
+		if lifecycle(state) != Lifecycle::Resident || generation(state) != locator.generation {
+			return None;
+		}
+		// SAFETY: entering this epoch precedes the SeqCst resident-generation
+		// check. Replacement first publishes `Evicting` with SeqCst and can reuse
+		// those `UnsafeCell` bytes only after the global reader count reaches zero.
+		// The returned lifetime is tied to this borrowed epoch, so safe code cannot
+		// drop the epoch while this immutable reference remains usable.
+		let page = unsafe { &*self.pool.frames[locator.index].page.get() };
+		Some(AtomicEpochPage {
+			page,
+		})
+	}
+}
+
+impl Drop for AtomicReadEpoch<'_> {
+	/// Leaves the reclamation epoch exactly once.
+	fn drop(&mut self) {
+		self.pool.release_read_epoch();
+	}
+}
+
+/// Page reference whose lifetime cannot exceed its reclamation epoch.
+pub(super) struct AtomicEpochPage<'epoch> {
+	/// Immutable validated bytes in the stable frame arena.
+	page: &'epoch AlignedPage,
+}
+
+impl AtomicEpochPage<'_> {
+	/// Returns the validated aligned page.
+	pub(super) const fn as_page(&self) -> &AlignedPage {
+		self.page
+	}
+
+	/// Returns the validated page bytes without copying them.
+	pub(super) fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
+		self.page.as_bytes()
 	}
 }
 
@@ -1795,6 +1990,81 @@ mod tests {
 	}
 
 	#[test]
+	fn read_epoch_defers_reuse_and_keeps_borrowed_page_stable() -> Result<(), Box<dyn Error>> {
+		let pool = AtomicArenaBufferPool::new(NonZeroUsize::MIN);
+		let first = home_key(1, 1)?;
+		let second = home_key(1, 2)?;
+		drop(pool.get_or_load(first, |page| load_valid(first, page))?);
+		let handle = pool.resolve(first).ok_or("resident page did not resolve")?;
+		let locator = SourceBoundLocator::new(
+			&pool,
+			first,
+			NonZeroUsize::new(3).ok_or("zero source pages")?,
+			DenseLocatorLayout::Flat,
+		)?;
+		assert!(locator.refresh(&pool, first));
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (loader_tx, loader_rx) = mpsc::channel();
+		let (done_tx, done_rx) = mpsc::channel();
+
+		thread::scope(|scope| -> Result<(), Box<dyn Error>> {
+			let epoch = pool.read_epoch()?;
+			let borrowed =
+				locator.get_epoch_resolved(&epoch, first).ok_or("fresh epoch locator was stale")?;
+			scope.spawn(|| {
+				let _ = entered_tx.send(());
+				let result = pool
+					.get_or_load(second, |page| {
+						let _ = loader_tx.send(());
+						load_valid(second, page)
+					})
+					.map(drop);
+				let _ = done_tx.send(result);
+			});
+			entered_rx.recv_timeout(Duration::from_secs(1))?;
+			let deadline = Instant::now() + Duration::from_secs(1);
+			while pool.retired_count() == 0 && Instant::now() < deadline {
+				thread::yield_now();
+			}
+			assert_eq!(pool.retired_count(), 1);
+			assert!(matches!(
+				loader_rx.recv_timeout(Duration::from_millis(30)),
+				Err(mpsc::RecvTimeoutError::Timeout)
+			));
+			assert_eq!(borrowed.as_page().validate(first.page_no())?.page_no(), first.page_no());
+			drop(borrowed);
+			drop(epoch);
+			loader_rx.recv_timeout(Duration::from_secs(1))?;
+			Ok(())
+		})?;
+		done_rx.recv_timeout(Duration::from_secs(1))??;
+		assert_eq!(pool.retired_count(), 0);
+		let stale_epoch = pool.read_epoch()?;
+		assert!(stale_epoch.get_resolved(&handle).is_none());
+		assert!(locator.get_epoch_resolved(&stale_epoch, first).is_none());
+		Ok(())
+	}
+
+	#[test]
+	fn explicit_remove_retires_epoch_borrow_before_freeing_frame() -> Result<(), Box<dyn Error>> {
+		let pool = AtomicArenaBufferPool::new(NonZeroUsize::MIN);
+		let first = home_key(1, 1)?;
+		let second = home_key(1, 2)?;
+		drop(pool.get_or_load(first, |page| load_valid(first, page))?);
+		let handle = pool.resolve(first).ok_or("resident page did not resolve")?;
+		let epoch = pool.read_epoch()?;
+		let borrowed = epoch.get_resolved(&handle).ok_or("fresh epoch handle was stale")?;
+		assert!(pool.remove_resident(first)?);
+		assert_eq!(pool.retired_count(), 1);
+		assert_eq!(borrowed.as_page().validate(first.page_no())?.page_no(), first.page_no());
+		drop(borrowed);
+		drop(epoch);
+		drop(pool.get_or_load(second, |page| load_valid(second, page))?);
+		assert_eq!(pool.retired_count(), 0);
+		Ok(())
+	}
+
+	#[test]
 	fn failed_load_is_never_published() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(1).ok_or("zero capacity")?);
 		let key = home_key(1, 9)?;
@@ -1987,6 +2257,19 @@ mod tests {
 	#[test]
 	fn pinned_frame_applies_backpressure_until_guard_drop() -> Result<(), Box<dyn Error>> {
 		let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(1).ok_or("zero capacity")?);
+		assert_pinned_frame_backpressure(pool)
+	}
+
+	#[test]
+	fn miss_side_backoff_observes_last_guard_drop() -> Result<(), Box<dyn Error>> {
+		let pool = AtomicArenaBufferPool::with_miss_side_backoff(
+			NonZeroUsize::new(1).ok_or("zero capacity")?,
+		);
+		assert_pinned_frame_backpressure(pool)
+	}
+
+	/// Confirms that either capacity-wait strategy preserves bounded admission.
+	fn assert_pinned_frame_backpressure(pool: AtomicArenaBufferPool) -> Result<(), Box<dyn Error>> {
 		let first = home_key(1, 1)?;
 		let second = home_key(1, 2)?;
 		let pinned = pool.get_or_load(first, |page| load_valid(first, page))?;
@@ -2176,6 +2459,57 @@ mod tests {
 					pin_won.load(Ordering::Relaxed) + eviction_won.load(Ordering::Relaxed),
 					2
 				);
+			},
+			None,
+		);
+	}
+
+	#[test]
+	fn shuttle_read_epoch_prevents_payload_reuse_after_resident_validation() {
+		shuttle::check_dfs(
+			|| {
+				use shuttle::{
+					sync::{
+						Arc,
+						atomic::{AtomicU64, AtomicUsize, Ordering},
+					},
+					thread,
+				};
+
+				let resident = pack_state(Lifecycle::Resident, 9, 0, 0);
+				let state = Arc::new(AtomicU64::new(resident));
+				let readers = Arc::new(AtomicUsize::new(0));
+				let payload_generation = Arc::new(AtomicU64::new(9));
+
+				let reader_state = Arc::clone(&state);
+				let reader_count = Arc::clone(&readers);
+				let reader_payload = Arc::clone(&payload_generation);
+				let reader = thread::spawn(move || {
+					reader_count.fetch_add(1, Ordering::SeqCst);
+					if reader_state.load(Ordering::SeqCst) == resident {
+						thread::yield_now();
+						assert_eq!(reader_payload.load(Ordering::SeqCst), 9);
+					}
+					reader_count.fetch_sub(1, Ordering::SeqCst);
+				});
+
+				let replacement_state = Arc::clone(&state);
+				let replacement_readers = Arc::clone(&readers);
+				let replacement_payload = Arc::clone(&payload_generation);
+				let replacement = thread::spawn(move || {
+					let evicting = pack_state(Lifecycle::Evicting, 9, 0, 0);
+					if replacement_state
+						.compare_exchange(resident, evicting, Ordering::SeqCst, Ordering::SeqCst)
+						.is_ok() && replacement_readers.load(Ordering::SeqCst) == 0
+					{
+						replacement_state
+							.store(pack_state(Lifecycle::Loading, 10, 0, 0), Ordering::SeqCst);
+						replacement_payload.store(10, Ordering::SeqCst);
+					}
+				});
+
+				assert!(reader.join().is_ok());
+				assert!(replacement.join().is_ok());
 			},
 			None,
 		);
