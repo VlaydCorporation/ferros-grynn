@@ -1,24 +1,40 @@
 {
-  "generated_at": "2026-08-28T21:33:25.553254+00:00",
+  "generated_at": "2026-09-01T22:22:26.965678+00:00",
   "nodes": {
-    "src_datastore_datastore": {
-      "code_fingerprint": "722c215b9447b4d5a826657e07c2765f86b4b28f8b1e074cba2ec054ceb24b64",
-      "label": "Datastore",
-      "last": "2026-08-28T21:19:39.115264+00:00",
+    "crates_fg_meta_src_io_async_asyncio": {
+      "code_fingerprint": "d68e39c803958c597740f9444dcc5d7b65010eb6c978fcb3a6502cb951e9f5d1",
+      "label": "AsyncIo",
+      "last": "2026-08-30T17:23:47.115005+00:00",
       "provenance": [
         {
-          "date": "2026-08-28T21:19:39.115264+00:00",
+          "date": "2026-08-30T17:23:47.115005+00:00",
           "outcome": "useful",
-          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
+          "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.99977902,
-      "source_file": "src/datastore.rs",
+      "score": 0.950276864,
+      "source_file": "crates/fg-meta/src/io_async.rs",
       "status": "tentative",
       "uses": 1
     },
-    "src_datastore_write_set_limit_counts_large_property_payload_before_publication": {
-      "code_fingerprint": "722c215b9447b4d5a826657e07c2765f86b4b28f8b1e074cba2ec054ceb24b64",
+    "crates_surrealdb_surrealdb_core_src_idx_ft_fulltext_fulltextindex": {
+      "code_fingerprint": "64a9ce31b93ecb492769d8c0102e7d9453505bd0f1d6c35afaf6b67cd4300728",
+      "label": "FullTextIndex",
+      "last": "2026-08-30T17:23:47.115005+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-30T17:23:47.115005+00:00",
+          "outcome": "useful",
+          "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
+        }
+      ],
+      "score": 0.950276864,
+      "source_file": "crates/surrealdb/surrealdb/core/src/idx/ft/fulltext.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_datastore_tests_write_set_limit_counts_large_property_payload_before_publication": {
+      "code_fingerprint": "e90e005455295033c2729f30fc20e9cd922c26c99eefa81caa71e0abc2f0d363",
       "label": "write_set_limit_counts_large_property_payload_before_publication()",
       "last": "2026-08-28T21:19:39.115264+00:00",
       "provenance": [
@@ -28,13 +44,61 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.99977902,
-      "source_file": "src/datastore.rs",
+      "score": 0.910804308,
+      "source_file": "src/datastore/tests.rs",
       "status": "tentative",
       "uses": 1
     },
-    "src_storage_store_localsnapshotgraph": {
-      "code_fingerprint": "84ea3f76ea17b7918dd014a672b6194908b509c5b1436c6bc1eaf8b91c3ebc3d",
+    "src_gql_execution_cursor_pathexpandcursor": {
+      "code_fingerprint": "0ef79eb53b3abbff4c971bf92a6617c469d05c064bd03426f4e1ff6b044ed626",
+      "label": "PathExpandCursor",
+      "last": "2026-08-30T17:23:47.115005+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-30T17:23:47.115005+00:00",
+          "outcome": "useful",
+          "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
+        }
+      ],
+      "score": 0.950276864,
+      "source_file": "src/gql/execution/cursor.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_graph_metagraph_metagraph": {
+      "code_fingerprint": "59060bea996caa33fa6b1dc4cd593311e355e6c7fad35dd171858b3b0e39eb53",
+      "label": "Metagraph",
+      "last": "2026-08-10T11:48:37.217190+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-10T11:48:37.217190+00:00",
+          "outcome": "useful",
+          "q": "What is MetaGraph?"
+        }
+      ],
+      "score": 0.595426236,
+      "source_file": "src/graph/metagraph.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_graph_traversal_index_traversalindex": {
+      "code_fingerprint": "5a8cc2b0e0e024b6359c20a64848768c43d5ff7fc162f7680a9ded479382324d",
+      "label": "TraversalIndex",
+      "last": "2026-08-30T17:23:47.115005+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-30T17:23:47.115005+00:00",
+          "outcome": "useful",
+          "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
+        }
+      ],
+      "score": 0.950276864,
+      "source_file": "src/graph/traversal/index.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_storage_store_mod_localsnapshotgraph": {
+      "code_fingerprint": "17bb88571aad2a9b4df6c333e1ec489e6e7884e98c1b31d61d04595b62375d65",
       "label": "LocalSnapshotGraph",
       "last": "2026-08-28T21:19:39.115264+00:00",
       "provenance": [
@@ -44,34 +108,13 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.99977902,
-      "source_file": "src/storage/store.rs",
+      "score": 0.910804308,
+      "source_file": "src/storage/store/mod.rs",
       "status": "tentative",
       "uses": 1
     },
-    "src_values_runtime_graph_general_graph": {
-      "code_fingerprint": "c7f74ba99e85fad0a11f518e1b373bf961497dffe2acf77cdec9fd128cdccd0b",
-      "label": "Graph",
-      "last": "2026-08-28T21:19:39.115264+00:00",
-      "provenance": [
-        {
-          "date": "2026-08-28T21:19:39.115264+00:00",
-          "outcome": "useful",
-          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
-        },
-        {
-          "date": "2026-08-10T11:48:37.217190+00:00",
-          "outcome": "useful",
-          "q": "What is MetaGraph?"
-        }
-      ],
-      "score": 1.653371293,
-      "source_file": "src/values/runtime/graph/general.rs",
-      "status": "preferred",
-      "uses": 2
-    },
-    "src_values_runtime_mod_estimated_values_heap_bytes": {
-      "code_fingerprint": "1d26fcef6694bd207a92dc605c70f74acd09f18abee551dc27fcce25c91d6523",
+    "src_values_runtime_value_estimated_values_heap_bytes": {
+      "code_fingerprint": "ad491cb2ac45c15d77e7daa8a4247a0ff21ba66616f6731c08be8bdb6346b95a",
       "label": "estimated_values_heap_bytes()",
       "last": "2026-08-28T21:19:39.115264+00:00",
       "provenance": [
@@ -81,8 +124,8 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.99977902,
-      "source_file": "src/values/runtime/mod.rs",
+      "score": 0.910804308,
+      "source_file": "src/values/runtime/value.rs",
       "status": "tentative",
       "uses": 1
     }
