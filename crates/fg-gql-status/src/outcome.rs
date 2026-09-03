@@ -4,7 +4,7 @@ use std::{
 	fmt::{self, Display, Formatter},
 };
 
-use crate::gql_status::status::{Condition, Status, StatusObject};
+use crate::status::{Condition, Status, StatusObject};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusReport {

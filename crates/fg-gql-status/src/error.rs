@@ -99,7 +99,7 @@ impl FerrosGrynnError {
 			.expect("critical severity is valid for every error status")
 	}
 
-	pub(crate) fn with_technical_source<E>(mut self, source: E) -> Self
+	pub fn with_technical_source<E>(mut self, source: E) -> Self
 	where
 		E: Error + Send + Sync + 'static,
 	{
@@ -107,7 +107,7 @@ impl FerrosGrynnError {
 		self
 	}
 
-	pub(crate) fn technical_source(&self) -> Option<&(dyn Error + Send + Sync + 'static)> {
+	pub fn technical_source(&self) -> Option<&(dyn Error + Send + Sync + 'static)> {
 		self.inner.technical_source.as_deref()
 	}
 

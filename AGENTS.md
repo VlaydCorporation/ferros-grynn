@@ -94,10 +94,7 @@ you touch rather than assuming every configuration is complete.
   specification or behavioral source of truth and needs the same review as any
   other reference before ideas or code are reused.
 - `crates/fg-storage-engine-prototypes` owns test-only BufferPool/transport
-  experiments. It depends on the root crate through the temporary hidden
-  `storage-engine-prototype-api` feature; production code must not depend on
-  this crate, and profiling uses `--profile profiling` with the exact
-  same-stem EXE/PDB pair produced for this package.
+  experiments.
 - `crates/storekey`, `crates/surrealmx`, `crates/ferntree` and
   `crates/surrealdb` are local study/reference trees, not root dependencies or
   workspace members. Their useful areas are summarized in

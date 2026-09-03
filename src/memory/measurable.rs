@@ -1,8 +1,3 @@
-use crate::common::memory::HeapEstimatorCache;
-use crate::unsafed::shallow_size_of;
-pub use ferros_grynn_macros::Measurable;
-use std::collections::HashMap;
-
 pub trait Measurable {
 	/// Gives an estimation of the heap usage in bytes for the given value.
 	fn estimated_heap_usage(&self) -> usize;
@@ -30,6 +25,24 @@ macro_rules! impl_zero_heap {
 	};
 }
 
-pub fn size_of_hash_map<K, V>(map: &HashMap<K, V>) -> usize {
-	size_of_val(map) + map.capacity() * shallow_size_of::<(K, V)>()
+pub trait HeapEstimatorCache {
+	fn new_with_same_settings() -> Self;
+	fn estimated_heap_usage(&self, measurable: &impl Measurable, estimate: usize) -> usize;
+	fn reset(&mut self);
 }
+
+struct NoHeapEstimatorCache {}
+
+impl HeapEstimatorCache for NoHeapEstimatorCache {
+	fn new_with_same_settings() -> Self {
+		Self {}
+	}
+
+	fn estimated_heap_usage(&self, _measurable: &impl Measurable, estimate: usize) -> usize {
+		estimate
+	}
+
+	fn reset(&mut self) {}
+}
+
+pub const NO_HEAP_ESTIMATOR_CACHE_INSTANCE: NoHeapEstimatorCache = NoHeapEstimatorCache {};

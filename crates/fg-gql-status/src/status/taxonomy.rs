@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::StatusCode;
-use crate::gql_status::diagnostic::Severity;
+use crate::diagnostic::Severity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

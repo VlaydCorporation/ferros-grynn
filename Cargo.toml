@@ -1,14 +1,208 @@
 [workspace]
+resolver = "3"
 members = [
-    "crates/ferros-grynn-macros",
+    "crates/ferros-grynn-macros", "crates/fg-gql-status",
     "ferros-grynn-bench"
 ]
 
 [workspace.dependencies]
+# Ferros-Grynn
 ferros-grynn = { path = ".", default-features = false }
 ferros-grynn-macros = { path = "crates/ferros-grynn-macros" }
+fg-gql-status = { path = "crates/fg-gql-status" }
+
+# --------- Platform ---------
+sysinfo = "0.39.6"
+
+# -------------------- System API --------------------
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+nix = { version = "0.31.3", features = ["fs", "uio", "feature"] }
+
+# -------------------- Custom Allocator --------------------
+tikv-jemallocator = "0.7.0"
+mimalloc-pprof = { version = "0.9.5", default-features = false }
+
+# --------- Async ---------
+#affinitypool = "0.8.0"
+#asyncband = "0.6.7"
+#async-channel = "2.5.0"
+#async-stream = "0.3.6"
+#async-fn-stream = "0.3.2"
+#async-signal = "0.2.14"
+#async-trait = "0.1.92"
+#atomic-waker = "1.1.2"
+#boxcar = "0.2.14"
+#diatomic-waker = "0.2.3"
+#dynify = { version = "0.1.2", features = ["smallvec"] }
+tokio = { version = "1.48.0", features = ["fs", "io-util", "rt", "rt-multi-thread"] }
+#tokio-executor = "0.2.0-alpha.6"
+#tokio-blocking = "0.1.1"
+#tokio-graceful = "0.2.2"
+#tokio_env = "0.1.0"
+#tokio-stream = "0.1.19"
+dashmap = "7.0.0-rc2"
+#crossbeam = "0.8.4"
+#crossfire = { version = "3.1.19", features = ["tokio"] }
+parking_lot = "0.12.5"
+#futures = "0.3.33"
+#futures-lite = "2.6.1"
+#futures-core = "0.3.34"
+#futures-concurrency = "7.7.1"
+#futures-executor = "0.3.34"
+#future-queue = "0.4.0"
+#futures-util = "0.3.34"
+#pin-init = "0.2.0"
+rayon = "1.11.0"
+#saa = "5.6.0"
+#scopeguard = "1.2.0"
+#try-lock = "0.2.5"
+#async-lock = "3.4.2"
+#event-listener = "5.4.2"
+#genawaiter = { version = "0.99.1", features = ["futures03"] }
+
+# --------- Serialization ---------
+binrw = "0.15.0"
+rkyv = { version = "0.8.14", features = [] }
+
+# --------- Collections ---------
+#fst = "0.4.7"
+#slotmap = "1.1.1"
+#slot-cell = "0.1.2"
+smallvec = "2.0.0-alpha.12"
+rapidhash = "4.2.2"
+thin-vec = "0.2.19"
+reblessive = "0.4.3"
+#arrayref = "0.3.9"
+#append-only-vec = "0.1.8"
+#indexmap = "2.14.1"
+#papaya = "0.2.5"
+#quick_cache = "0.7.0"
+#roaring = "0.11.5"
+
+# --------- Data ---------
 arrow = { version = "58.4.0", default-features = false }
 datafusion = { version = "54.1.0", default-features = false }
+bytes = "1.12.1"
+compact_str = { version = "0.9.1", features = ["rkyv"] }
+geo = "0.33.1"
+geojson = "1.0.0"
+jiff = "0.2.34"
+humantime = "2.3.0"
+rust_decimal = { version = "1.42.1" }
+uuid = { version = "1.18.1", features = ["v4", "v7"] }
+ulid = { version = "3.0.0" }
+#half = "2.7.1"
+#nalgebra = { version = "0.35.0", features = ["compare", "rand", "rayon", "rkyv", "rkyv-safe-deser", "sparse"] }
+#ndarray = { version = "0.17.2", features = ["std", "rayon", "approx", "blas", "matrixmultiply-threading"] }
+#ndarray-conv = "0.6.1"
+#ndarray-einsum = "0.9.0"
+#ndarray-histogram = "0.5.0"
+#ndarray-interp = "0.6.0"
+#ndarray-inverse = "0.1.9"
+#ndarray-linalg = "0.18.1"
+#ndarray-stats = "0.7.0"
+#ndarray-utils = "0.1.4"
+#rust-stemmers = "1.2.0"
+
+# --------- Data Processing ---------
+#deunicode = "1.6.2"
+#diskann = { version = "0.56.0", default-features = false }
+#diskann-bftree = "0.56.0"
+#diskann-inmem = "0.56.0"
+#diskann-disk = "0.56.0"
+#diskann-label-filter = "0.56.0"
+#diskann-linalg = "0.56.0"
+#diskann-quantization = "0.56.0"
+#diskann-record = "0.56.0"
+#diskann-tools = "0.56.0"
+#diskann-utils = "0.56.0"
+#diskann-vector = "0.56.0"
+#diskann-wide = "0.56.0"
+#ext-sort = "0.1.5"
+#itertools = { version = "0.15.0", features = ["use_std"] }
+#nexus-stats = { version = "6.0.1", features = ["full"] }
+#ort = { version = "2.0.0-rc.13", features = ["cuda", "webgpu"] }
+
+# --------- Error Handling ---------
+thiserror = "2.0.17"
+anyhow = "1.0.100"
+
+# --------- Utils ---------
+bitflags = "2.10.0"
+#bytecount = "0.6.9"
+#castaway = "0.2.4"
+num = { version = "0.4.3", features = ["std"] }
+num-traits = "0.2.19"
+regex = "1.12.2"
+#regex-syntax = "0.8.11"
+#once_cell = "1.21.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+#serde_arrow = "0.15.0"
+#fastcdc = "5.0.0"
+#fuzzy-matcher = "0.3.7"
+#logos = "0.16.1"
+#memchr = "2.8.3"
+#path-clean = "1.0.1"
+#phf = "0.14.0"
+#rand = "0.10.2"
+#schemars = "1.2.2"
+#semver = "1.0.28"
+#strsim = "0.11.1"
+#tempfile = "3.27.0"
+#num_cpus = "1.17.0"
+#derive-io = { version = "0.5.0", features = ["tokio"] }
+#hex = "0.4.3"
+#hex-literal = "1.1.0"
+#inplace-vec-builder = "0.1.1"
+#fnv = "1.0.7"
+
+# --------- Tracing ---------
+tracing = "0.1.41"
+tracing-subscriber = "0.3.21"
+tracing-forest = { version = "0.3.1", features = ["full"] }
+tracing-futures = "0.2.5"
+tokio-metrics = "0.5.1"
+tokio-blocked = "0.1.0"
+
+# --------- Macros Utils ---------
+#derive_more = { version = "2.1.1", features = ["full"] }
+#paste = "1"
+#macro_rules_attribute = "0.2.2"
+#magic_utils = { git = "https://github.com/VlaydDetect/magic_utils.git", features = ["derive"] }
+#pin-project = "1.1.13"
+#
+#maybe-async = "0.2.11"
+#
+#num-derive = "0.5.1"
+#
+#inventory = "0.3.21"
+
+# For tests
+async-std = "1.13.2"
+memmap2 = "0.9.11"
+proptest = "1.11.0"
+shuttle = "0.9.3"
+criterion = { version = "0.8.2", features = ["async_futures", "async_tokio", "html_reports"] }
+tracy-client = "0.19.0"
+tracing-tracy = "0.12.0"
+obey = "0.1.1"
+maplit = "1.0.2"
+thousands = "0.2.0"
+env_logger = "0.11.11"
+log = "0.4.34"
+cov-mark = "2.2.0"
+dhat = "0.3.3"
+ittapi = "0.5.0"
+pprof = { version = "0.15.0", features = ["criterion", "flamegraph", "framehop-unwinder"] }
 
 
 [package]
@@ -32,101 +226,70 @@ default = ["columnar", "datafusion"]
 columnar = ["dep:arrow"]
 datafusion = ["columnar", "dep:datafusion"]
 native-async-io = []
+allocation-tracking = []
 
 # -------------------- System API --------------------
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
-    "Win32_Storage_FileSystem",
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_IO",
-    "Win32_System_Memory",
-    "Win32_System_Threading",
-    "Win32_System_SystemInformation"
-] }
+windows = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["fs", "uio", "feature"] }
+nix = { workspace = true }
 # ----------------------------------------------------
 
 # -------------------- Custom Allocator --------------------
 [target.'cfg(target_env="msvc")'.dependencies]
-mimalloc = "0.1.48"
+mimalloc-pprof = { workspace = true }
 [target.'cfg(not(target_env="msvc"))'.dependencies]
-tikv-jemallocator = "0.7.0"
+tikv-jemallocator = { workspace = true }
 # ----------------------------------------------------------
 
 [dependencies]
-ferros-grynn-macros = { path = "crates/ferros-grynn-macros" }
+fg-gql-status = { workspace = true }
 
 # --------- Platform ---------
-sysinfo = "0.39.6"
+sysinfo = { workspace = true }
 
 # --------- Async ---------
-tokio = { version = "1.48.0", features = ["fs", "io-util", "rt", "rt-multi-thread"] }
-dashmap = "7.0.0-rc2"
-crossbeam = "0.8.4"
-parking_lot = "0.12.5"
-rayon = "1.11.0"
-futures = "0.3.33"
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
 
 # --------- Serialization ---------
-binrw = "0.15.0"
-rkyv = { version = "0.8.14", features = [] }
+rkyv = { workspace = true }
 
 # --------- Collections ---------
-slotmap = "1.1.1"
-slot-cell = "0.1.2"
-smallvec = "2.0.0-alpha.12"
-rapidhash = "4.2.2"
-thin-vec = "0.2.19"
-reblessive = "0.4.3"
+smallvec = { workspace = true }
+rapidhash = { workspace = true }
+thin-vec = { workspace = true }
+reblessive = { workspace = true }
 
 # --------- Data ---------
 arrow = { workspace = true, optional = true }
 datafusion = { workspace = true, optional = true }
-bytes = "1.12.1"
-compact_str = { version = "0.9.1", features = ["rkyv"] }
-geo = "0.33.1"
-geojson = "1.0.0"
-jiff = "0.2.34"
-humantime = "2.3.0"
-rust_decimal = { version = "1.42.1" }
-uuid = { version = "1.18.1", features = ["v4", "v7"] }
-ulid = { version = "3.0.0" }
-
-# --------- Error Handling ---------
-thiserror = "2.0.17"
-anyhow = "1.0.100"
+compact_str = { workspace = true }
+geojson = { workspace = true }
+jiff = { workspace = true }
+rust_decimal = { workspace = true }
+uuid = { workspace = true }
+ulid = { workspace = true }
 
 # --------- Utils ---------
-bitflags = "2.10.0"
-itertools = { version = "0.15.0", features = ["use_std"] }
-num = { version = "0.4.3", features = ["std"] }
-num-traits = "0.2.19"
-regex = "1.12.2"
-once_cell = "1.21.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-
-
-
-# --------- Macros Utils ---------
-derive_more = { version = "2.1.1", features = ["full"] }
-paste = "1"
-macro_rules_attribute = "0.2.2"
-magic_utils = { git = "https://github.com/VlaydDetect/magic_utils.git", features = ["derive"] }
-
-num-derive = "0.5.1"
-path-clean = "1.0.1"
-
-inventory = "0.3.21"
-
-tracing = "0.1.41"
-tracing-subscriber = "0.3.21"
+bitflags = { workspace = true }
+num = { workspace = true }
+num-traits = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
-memmap2 = "0.9.11"
-proptest = "1.11.0"
+proptest = { workspace = true }
+memmap2 = { workspace = true }
+dashmap = { workspace = true }
+
+[target.'cfg(target_env="msvc")'.dev-dependencies]
+mimalloc-pprof = { workspace = true }
+
+[target.'cfg(not(target_env="msvc"))'.dev-dependencies]
+pprof = { workspace = true }
 
 # See: https://rust-lang.github.io/rust-clippy/master/index.html
 [lints.clippy]

@@ -38,3 +38,7 @@ pub use wire::{
 	STATUS_WIRE_VERSION,
 	StatusWireV1,
 };
+
+pub mod gql_status {
+	pub use super::*;
+}

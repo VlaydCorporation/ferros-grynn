@@ -1,9 +1,9 @@
 mod ast;
+pub mod config;
 mod lexer;
 mod parser;
 mod stmt;
 mod token;
-pub mod config;
 
 pub use ast::{
 	BinaryOperator,
@@ -16,6 +16,7 @@ pub use ast::{
 	TypeName,
 	UnaryOperator,
 };
+pub use config::GQLConfig;
 pub use stmt::{
 	LetStatement,
 	MatchDirection,
@@ -35,9 +36,8 @@ pub use stmt::{
 	Statement,
 	StatementKind,
 };
-pub use config::GQLConfig;
 
-use crate::gql_status::FerrosGrynnResult;
+use fg_gql_status::FerrosGrynnResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

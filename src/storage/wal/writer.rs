@@ -146,7 +146,7 @@ impl FrameWal {
 		let raw_tx_id = self
 			.inner
 			.next_tx_id
-			.fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |current| {
+			.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |current| {
 				current.checked_add(1)
 			})
 			.map_err(|current| {

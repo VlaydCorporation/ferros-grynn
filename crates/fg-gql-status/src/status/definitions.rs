@@ -12,7 +12,7 @@ use super::{
 	StatusDefinition,
 	StatusKind,
 };
-use crate::gql_status::{
+use crate::{
 	diagnostic::Severity,
 	formatting::{DisplayValue, Identifier, StringLiteral, ValueType},
 };

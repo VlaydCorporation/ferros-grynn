@@ -1,0 +1,10 @@
+[package]
+name = "fg-gql-status"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ferros-grynn-macros = { workspace = true }
+serde = { workspace = true }
+jiff = { workspace = true }
+humantime = { workspace = true }

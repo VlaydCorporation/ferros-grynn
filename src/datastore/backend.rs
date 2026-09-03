@@ -13,13 +13,8 @@ use super::{
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
-		LocalCommitGraph,
-		LocalCommitResult,
-		LocalCommitTable,
-		LocalCommitTableField,
-		LocalCommitTableIndex,
-		LocalStore,
-		PageIoMode,
+		LocalCommitGraph, LocalCommitResult, LocalCommitTable, LocalCommitTableField,
+		LocalCommitTableIndex, LocalStore, PageIoMode,
 	},
 	values::runtime::{PropertyKeyId, RecordId, graph::GraphStorageMode},
 };
