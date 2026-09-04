@@ -12,21 +12,23 @@
 - Не выдавать наружу страницы, LSN, физические atom ID или storage DTO.
 - Не использовать `src/collections/radixdb` как второй storage engine.
 - Не переносить layout из `fg-meta` без сверки с production-спецификацией.
-- Native async I/O подключать только отдельным вертикальным срезом, сохраняя
-  один page/WAL contract.
+- Native async I/O ограничен frame-oriented IoRing для заранее известного
+  sparse-окна; синхронный Direct I/O остаётся fallback для singleton miss.
 - Test-only storage-engine прототипы принадлежат
   `crates/fg-storage-engine-prototypes`, а не `src/storage`. Временный скрытый
-  `prototype_api` открывает этому крейту только необходимые production-типы и
-  методы под feature `storage-engine-prototype-api`; не расширять фасад без
-  фактического использования и не подключать его в production path.
+  `prototype_api` открывает этому крейту только измерительные production-типы и
+  методы под feature `storage-engine-prototype-api`; feature не выбирает
+  production-поведение и не должен становиться runtime selector.
 
 ## Карта владельцев
 
 - `direct_io` — платформенные aligned Direct-I/O файлы;
-- `page_io` — единый синхронный/нативный I/O фасад;
-- `page` и `types` — общие page/LSN/file идентификаторы и проверки;
-- `buffer_pool` — pinning, reservations, Clock-Pro и batch load;
-- `page_manager` — синхронная координация page cache и WAL;
+- `page_io` — синхронный Direct transport и Windows frame-IoRing;
+- `page` и `page_cache` — page layout, exact-version cache key и проверки;
+- `hybrid_engine` — R8 Atomic Arena, source locators, read scopes, router,
+  transient budget, scatter/P1 и sparse IoRing;
+- `buffer_pool` — прежний Clock-Pro, доступный только тестам и prototype-control;
+- `page_manager` — staged/WAL/home resolution и production HybridReadEngine;
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
 - `catalog` и `superblock` — versioned database metadata;
 - `graph_pages` — физические graph page families;

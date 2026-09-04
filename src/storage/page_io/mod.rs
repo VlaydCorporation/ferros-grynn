@@ -16,9 +16,11 @@ mod page_io_unix;
 mod page_io_windows;
 
 #[cfg(all(windows, feature = "native-async-io"))]
-pub use page_io_windows::WindowsIoRing;
+pub use page_io_windows::FrameRead;
+#[cfg(all(windows, feature = "native-async-io", feature = "storage-engine-prototype-api"))]
+pub use page_io_windows::IoRingSubmissionStats;
 #[cfg(all(windows, feature = "native-async-io"))]
-pub use page_io_windows::{FrameRead, IoRingSubmissionStats};
+pub use page_io_windows::WindowsIoRing;
 
 /// Maximum Windows IoRing submission-queue capacity requested by the first
 /// native implementation.
@@ -89,6 +91,15 @@ pub(super) enum PageIo {
 }
 
 impl PageIo {
+	/// Returns the public capability mode selected when the manager opened.
+	pub(super) const fn mode(&self) -> PageIoMode {
+		match self {
+			Self::Sync => PageIoMode::Sync,
+			#[cfg(all(windows, feature = "native-async-io"))]
+			Self::NativeAsync(_) => PageIoMode::NativeAsync,
+		}
+	}
+
 	/// Creates the selected transport and performs its runtime capability
 	/// check.
 	///
@@ -123,7 +134,16 @@ impl PageIo {
 	/// Returns the handle flags required for registered data files.
 	pub(super) const fn file_open_mode(&self) -> DirectFileOpenMode {
 		match self {
-			Self::Sync => DirectFileOpenMode::Synchronous,
+			Self::Sync => {
+				#[cfg(windows)]
+				{
+					DirectFileOpenMode::Overlapped
+				}
+				#[cfg(not(windows))]
+				{
+					DirectFileOpenMode::Synchronous
+				}
+			}
 			#[cfg(all(windows, feature = "native-async-io"))]
 			Self::NativeAsync(_) => DirectFileOpenMode::Overlapped,
 		}

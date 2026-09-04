@@ -1,11 +1,12 @@
 //! Crate-private local storage primitives.
 //!
-//! The current slice contains synchronous Direct I/O, a fixed buffer pool,
+//! The current slice contains the hybrid resident/direct read engine,
 //! database-level frame WAL, sealed file routing, checkpoint/recovery, concrete
-//! graph pages, and lazy transaction-bound graph views. The Windows-first local
-//! datastore composes these primitives with durable graph generations; optional
-//! native async I/O remains a later slice.
+//! graph pages, and transaction-bound streaming views. The Windows-first local
+//! datastore uses validated scatter/prefetch for contiguous scans and optional
+//! frame-oriented IoRing for known sparse windows.
 
+#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 mod buffer_pool;
 mod catalog;
 mod consts;
@@ -13,8 +14,10 @@ mod direct_io;
 mod file_registry;
 mod graph_index;
 mod graph_pages;
+mod hybrid_engine;
 mod local;
 mod page;
+mod page_cache;
 mod page_io;
 mod page_manager;
 mod store;
@@ -38,17 +41,46 @@ pub mod prototype_api {
 	}
 
 	pub mod buffer_pool {
-		pub use super::super::buffer_pool::{
-			BufferPool,
-			PageCacheKey,
-			PageCacheVersion,
-			PageGuard,
-			validate_loaded_header,
+		pub use super::super::{
+			buffer_pool::{BufferPool, PageGuard},
+			page_cache::{PageCacheKey, PageCacheVersion, validate_loaded_header},
 		};
 	}
 
 	pub mod direct {
 		pub use super::super::direct_io::{DirectFile, DirectFileOpenMode};
+	}
+
+	/// Measurement-only access used by the external storage prototype crate.
+	pub mod hybrid {
+		#[cfg(all(windows, feature = "native-async-io"))]
+		pub use super::super::hybrid_engine::SparseReadBatch;
+		pub use super::super::hybrid_engine::{
+			AtomicArenaBufferPool,
+			AtomicBatchReservation,
+			AtomicEpochPage,
+			AtomicPageGuard,
+			HybridReadEngine,
+			MAX_IORING_QUEUE_DEPTH,
+			MAX_READ_SCOPE_OPERATIONS,
+			MAX_SCATTER_PAGES,
+			PREFETCH_DEPTH,
+			ReadIntent,
+			ReadRoute,
+			ReadScope,
+			ReadWindow,
+			ResolvedFrameHandle,
+			ResolvedPageTable,
+			ResolvedPageWindow,
+			SourceBoundLocator,
+			TransportCapabilities,
+			route_read,
+			scatter_extent_pages,
+			sparse_transient_pages,
+			transient_pages,
+		};
+		#[cfg(windows)]
+		pub use super::super::hybrid_engine::{ScatterPrefetchCursor, ValidatedScatterExtent};
 	}
 
 	pub mod page {
@@ -66,7 +98,7 @@ pub mod prototype_api {
 	}
 
 	pub mod page_io {
-		pub use super::super::page_io::FilePageExtent;
+		pub use super::super::page_io::{FilePageExtent, PageIoMode};
 		#[cfg(all(windows, feature = "native-async-io"))]
 		pub use super::super::page_io::{FrameRead, IoRingSubmissionStats, WindowsIoRing};
 	}
@@ -86,6 +118,7 @@ pub mod prototype_api {
 // Preserve the internal module path while callers migrate to `direct_io`.
 use direct_io as direct;
 pub use page_io::PageIoMode;
+pub(crate) use store::LocalTableCursor;
 pub use store::{
 	LocalCommitGraph,
 	LocalCommitResult,
@@ -97,7 +130,6 @@ pub use store::{
 	LocalGraph,
 	LocalGraphView,
 	LocalNodeRead,
-	LocalQueryAtom,
 	LocalReadTransaction,
 	LocalStore,
 };

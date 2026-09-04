@@ -70,15 +70,23 @@ impl QueryRead for TransactionRead<'_> {
 		if let Some(predicate) = predicate {
 			collect_scalar_constraints(predicate, slots, &mut constraints);
 		}
-		let rows = self.transaction.query_rows(&self.snapshot, table, &constraints)?;
-		let evaluator = Arc::new(QueryPredicate {
+		let evaluator: Arc<dyn PredicateEvaluator> = Arc::new(QueryPredicate {
 			predicate: predicate.cloned(),
 			slots: slots.to_vec(),
 			source: source.to_owned(),
 		});
-		self.transaction.register_query_predicate(&self.snapshot, table, &rows, evaluator)?;
+
+		let rows = self.transaction.query_row_cursor(&self.snapshot, table, &constraints)?;
+		let predicate_graph = self.transaction.register_streaming_query_predicate(
+			&self.snapshot,
+			table,
+			evaluator.clone(),
+		)?;
 		Ok(Box::new(StorageCursor {
-			rows: rows.into_iter(),
+			rows,
+			transaction: self.transaction,
+			snapshot: &self.snapshot,
+			predicate: predicate_graph.map(|graph| (graph, evaluator)),
 		}))
 	}
 
@@ -93,11 +101,11 @@ impl QueryRead for TransactionRead<'_> {
 		Ok(row.map(|row| Row::new(row.values)))
 	}
 
-	fn graph<'a>(
-		&'a self,
+	fn graph(
+		&self,
 		_snapshot: Snapshot,
 		reference: &GraphRef,
-	) -> FerrosGrynnResult<Self::Graph<'a>> {
+	) -> FerrosGrynnResult<Self::Graph<'_>> {
 		self.transaction.query_graph(&self.snapshot, reference)
 	}
 
@@ -195,12 +203,28 @@ impl PredicateEvaluator for QueryPredicate {
 	}
 }
 
-struct StorageCursor {
-	rows: std::vec::IntoIter<QueryStorageRow>,
+/// Streaming adapter that keeps predicate registration alive after an early
+/// LIMIT or cursor drop.
+struct StorageCursor<'a> {
+	rows: QueryStorageCursor<'a>,
+	transaction: &'a Transaction,
+	snapshot: &'a QuerySnapshot,
+	predicate: Option<(RecordId, Arc<dyn PredicateEvaluator>)>,
 }
 
-impl RowCursor for StorageCursor {
+impl RowCursor for StorageCursor<'_> {
 	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		Ok(self.rows.next().map(|row| Row::new(row.values)))
+		let Some(row) = self.rows.next_row()? else {
+			return Ok(None);
+		};
+		if let Some((graph, evaluator)) = &self.predicate {
+			self.transaction.register_streamed_query_row(
+				self.snapshot,
+				graph,
+				&row,
+				evaluator.as_ref(),
+			)?;
+		}
+		Ok(Some(Row::new(row.values)))
 	}
 }

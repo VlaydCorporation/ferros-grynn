@@ -38,9 +38,10 @@ pub(super) use label_dict::{LabelDictionary, decode_label_dictionary, encode_lab
 pub(super) use primary_idx::{
 	PrimaryIndexEntry,
 	build_primary_index,
+	leftmost_primary_leaf,
 	lookup_primary_index,
 	scan_primary_index,
-	visit_primary_index,
+	visit_primary_leaf_page,
 };
 pub(super) use scalar_idx::{
 	ScalarIndexEntry,

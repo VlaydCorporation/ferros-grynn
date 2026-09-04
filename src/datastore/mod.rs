@@ -16,11 +16,12 @@ use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
 		LocalEdgeRead,
+		LocalGraph,
 		LocalGraphView,
 		LocalNodeRead,
-		LocalQueryAtom,
 		LocalReadTransaction,
 		LocalStore,
+		LocalTableCursor,
 	},
 	values::runtime::{
 		PropertyDictionary,
@@ -113,6 +114,7 @@ pub use transaction::{
 pub(crate) use transaction::{
 	PredicateEvaluator,
 	QuerySnapshot,
+	QueryStorageCursor,
 	QueryStorageRow,
 	ReadKey,
 	ScalarComparison,

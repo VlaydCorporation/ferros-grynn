@@ -10,6 +10,102 @@ pub(crate) struct QueryStorageRow {
 	pub(crate) values: Vec<Value>,
 }
 
+/// Backend-neutral bounded row source used by the hybrid integration path.
+pub(crate) struct QueryStorageCursor<'store> {
+	source: QueryStorageSource<'store>,
+}
+
+/// Concrete cursor state without virtual dispatch inside page loops.
+enum QueryStorageSource<'store> {
+	/// Slot-wise scan of an immutable in-memory graph root.
+	Materialized(MaterializedTableCursor),
+	/// Bounded primary-leaf scan of one local graph generation.
+	Local {
+		cursor: LocalTableCursor<'store>,
+		schema: Arc<TableSchema>,
+	},
+	/// Already bounded candidates returned by a scalar index.
+	Indexed(std::vec::IntoIter<QueryStorageRow>),
+}
+
+/// Allocation-free slot cursor for Mode 1 and materialized graph writes.
+struct MaterializedTableCursor {
+	graph: Arc<MaterializedGraph>,
+	schema: Arc<TableSchema>,
+	kind_index: usize,
+	next_slot: usize,
+}
+
+impl MaterializedTableCursor {
+	/// Creates a cursor positioned before the first permitted atom kind.
+	const fn new(graph: Arc<MaterializedGraph>, schema: Arc<TableSchema>) -> Self {
+		Self {
+			graph,
+			schema,
+			kind_index: 0,
+			next_slot: 0,
+		}
+	}
+
+	/// Returns the next row without materializing the remaining graph.
+	fn next_row(&mut self) -> FerrosGrynnResult<Option<QueryStorageRow>> {
+		while self.kind_index < 2 {
+			let kind = if self.kind_index == 0 {
+				AtomKind::Node
+			} else {
+				AtomKind::Edge
+			};
+			let allowed = match kind {
+				AtomKind::Node => matches!(self.schema.kind, TableKind::Any | TableKind::Normal),
+				AtomKind::Edge => matches!(self.schema.kind, TableKind::Any | TableKind::Relation),
+			};
+			if !allowed {
+				self.kind_index += 1;
+				self.next_slot = 0;
+				continue;
+			}
+			let capacity = self.graph.slot_capacity(kind);
+			while self.next_slot < capacity {
+				let slot = self.next_slot;
+				self.next_slot += 1;
+				let Some(generation) = self.graph.slot_generation(kind, slot) else {
+					continue;
+				};
+				let slot = u64::try_from(slot).map_err(|source| {
+					FerrosGrynnError::invalid_storage_file(format!(
+						"in-memory atom slot exceeds u64: {source}"
+					))
+				})?;
+				let atom = AtomId::from_parts(kind, slot, generation)?;
+				if let Some(row) = materialize_atom(&self.graph, &self.schema, atom) {
+					return Ok(Some(row));
+				}
+			}
+			self.kind_index += 1;
+			self.next_slot = 0;
+		}
+		Ok(None)
+	}
+}
+
+impl QueryStorageCursor<'_> {
+	/// Pulls one owned storage row from the selected backend.
+	pub(crate) fn next_row(&mut self) -> FerrosGrynnResult<Option<QueryStorageRow>> {
+		match &mut self.source {
+			QueryStorageSource::Materialized(cursor) => cursor.next_row(),
+			QueryStorageSource::Local {
+				cursor,
+				schema,
+			} => cursor.next_atom().map(|atom| {
+				atom.map(|atom| {
+					row_from_properties(atom.atom_id, &atom.record_id, &atom.properties, schema)
+				})
+			}),
+			QueryStorageSource::Indexed(rows) => Ok(rows.next()),
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ScalarComparison {
 	/// Exact equality.
@@ -131,12 +227,30 @@ impl Transaction {
 		))
 	}
 
+	/// Collects the streaming path only for legacy root characterization tests.
+	#[cfg(test)]
 	pub(crate) fn query_rows(
 		&self,
 		snapshot: &QuerySnapshot,
 		table: &str,
 		constraints: &[ScalarIndexConstraint],
 	) -> FerrosGrynnResult<Vec<QueryStorageRow>> {
+		let mut cursor = self.query_row_cursor(snapshot, table, constraints)?;
+		let mut rows = Vec::new();
+		while let Some(row) = cursor.next_row()? {
+			rows.push(row);
+		}
+		rows.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
+		Ok(rows)
+	}
+
+	/// Opens a bounded backend-neutral query row cursor.
+	pub(crate) fn query_row_cursor<'store>(
+		&'store self,
+		snapshot: &QuerySnapshot,
+		table: &str,
+		constraints: &[ScalarIndexConstraint],
+	) -> FerrosGrynnResult<QueryStorageCursor<'store>> {
 		self.ensure_live()?;
 		let schema = self.query_table(snapshot, table)?;
 		self.record_read(&snapshot.root, ReadKey::GraphCatalog(schema.graph.id().clone()));
@@ -144,14 +258,24 @@ impl Transaction {
 			let graph = write.value.as_ref().map(MutableGraphValue::snapshot).ok_or_else(|| {
 				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
 			})?;
-			return materialize_rows(&graph, &schema);
+			return Ok(QueryStorageCursor {
+				source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
+					Arc::new(graph),
+					schema,
+				)),
+			});
 		}
 		let stored =
 			snapshot.root.graphs.get(schema.graph.id()).ok_or_else(|| {
 				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
 			})?;
 		match &stored.graph {
-			StoredGraphValue::Materialized(graph) => materialize_rows(graph, &schema),
+			StoredGraphValue::Materialized(graph) => Ok(QueryStorageCursor {
+				source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
+					graph.clone(),
+					schema,
+				)),
+			}),
 			StoredGraphValue::Local(graph) => {
 				let local = self.store.inner.backend.local().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
@@ -159,69 +283,25 @@ impl Transaction {
 					)
 				})?;
 				let transaction = self.local_snapshot()?;
-				let mut rows = Vec::new();
-				let collect = |atom: LocalQueryAtom, rows: &mut Vec<QueryStorageRow>| {
-					rows.push(row_from_properties(
-						atom.atom_id,
-						&atom.record_id,
-						&atom.properties,
-						&schema,
-					));
-					Ok(())
-				};
-				let equalities = constraints
-					.iter()
-					.filter(|constraint| matches!(constraint.comparison, ScalarComparison::Equal))
-					.filter_map(|constraint| {
-						constraint
-							.column
-							.checked_sub(1)
-							.and_then(|column| schema.fields.get(column))
-							.and_then(|field| field.key)
-							.map(|key| (key, &constraint.value))
-					})
-					.collect::<Vec<_>>();
-				let mut indexed = local.visit_table_composite_index(
-					&transaction,
-					graph,
-					schema.name.as_str(),
-					schema.kind,
-					&equalities,
-					|atom| collect(atom, &mut rows),
-				)?;
-				for constraint in constraints {
-					if indexed {
-						break;
-					}
-					let field = constraint
-						.column
-						.checked_sub(1)
-						.and_then(|column| schema.fields.get(column))
-						.and_then(|field| field.key);
-					if let Some(property_key) = field {
-						indexed = local.visit_table_index(
-							&transaction,
-							graph,
-							schema.name.as_str(),
+				if let Some(rows) =
+					indexed_local_rows(local, &transaction, graph, &schema, constraints)?
+				{
+					return Ok(QueryStorageCursor {
+						source: QueryStorageSource::Indexed(rows.into_iter()),
+					});
+				}
+				Ok(QueryStorageCursor {
+					source: QueryStorageSource::Local {
+						cursor: LocalTableCursor::open(
+							local,
+							transaction,
+							graph.clone(),
+							schema.name.as_str().to_owned(),
 							schema.kind,
-							property_key,
-							constraint.comparison,
-							&constraint.value,
-							|atom| collect(atom, &mut rows),
-						)?;
-					}
-				}
-				if !indexed {
-					local.visit_table(
-						&transaction,
-						graph,
-						schema.name.as_str(),
-						schema.kind,
-						|atom| collect(atom, &mut rows),
-					)?;
-				}
-				rows.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
-				Ok(rows)
+						)?,
+						schema,
+					},
+				})
 			}
 		}
 	}
@@ -273,32 +353,40 @@ impl Transaction {
 		}
 	}
 
-	pub(crate) fn register_query_predicate(
+	/// Registers the conservative predicate before a streaming scan starts and
+	/// returns the graph identity needed for row-by-row read tracking.
+	pub(crate) fn register_streaming_query_predicate(
 		&self,
 		snapshot: &QuerySnapshot,
 		table: &str,
-		rows: &[QueryStorageRow],
 		evaluator: Arc<dyn PredicateEvaluator>,
-	) -> FerrosGrynnResult<()> {
+	) -> FerrosGrynnResult<Option<RecordId>> {
 		if self.options.isolation != IsolationLevel::Serializable
 			|| self.options.access == TransactionAccess::ReadOnly
 		{
-			return Ok(());
+			return Ok(None);
 		}
 		let schema = self.query_table(snapshot, table)?;
-		for row in rows {
-			if evaluator.matches(row)? {
-				self.record_read(
-					&snapshot.root,
-					ReadKey::Atom(schema.graph.id().clone(), row.atom_id),
-				);
-			}
-		}
 		self.predicates.lock().push(PredicateRead {
 			table: table.to_owned(),
 			root: snapshot.root.clone(),
 			matcher: PredicateMatcher::Query(evaluator),
 		});
+		Ok(Some(schema.graph.id().clone()))
+	}
+
+	/// Records one actually pulled atom when it satisfies the registered query
+	/// predicate.
+	pub(crate) fn register_streamed_query_row(
+		&self,
+		snapshot: &QuerySnapshot,
+		graph: &RecordId,
+		row: &QueryStorageRow,
+		evaluator: &dyn PredicateEvaluator,
+	) -> FerrosGrynnResult<()> {
+		if evaluator.matches(row)? {
+			self.record_read(&snapshot.root, ReadKey::Atom(graph.clone(), row.atom_id));
+		}
 		Ok(())
 	}
 
@@ -327,33 +415,74 @@ impl Transaction {
 	}
 }
 
-fn materialize_rows(
-	graph: &MaterializedGraph,
-	schema: &TableSchema,
-) -> FerrosGrynnResult<Vec<QueryStorageRow>> {
+/// Returns bounded scalar-index candidates or `None` for a physical table
+/// scan.
+fn indexed_local_rows(
+	local: &LocalStore,
+	transaction: &Arc<LocalReadTransaction>,
+	graph: &Arc<LocalGraph>,
+	schema: &Arc<TableSchema>,
+	constraints: &[ScalarIndexConstraint],
+) -> FerrosGrynnResult<Option<Vec<QueryStorageRow>>> {
 	let mut rows = Vec::new();
-	if matches!(schema.kind, TableKind::Any | TableKind::Normal) {
-		for id in GraphRead::node_ids(graph)? {
-			let id = id?;
-			if let Some(node) = graph.node(id)
-				&& node.record_id().table() == schema.name.as_str()
-			{
-				rows.push(row_from_properties(id, node.record_id(), node.properties(), schema));
-			}
+	let equalities = constraints
+		.iter()
+		.filter(|constraint| matches!(constraint.comparison, ScalarComparison::Equal))
+		.filter_map(|constraint| {
+			constraint
+				.column
+				.checked_sub(1)
+				.and_then(|column| schema.fields.get(column))
+				.and_then(|field| field.key)
+				.map(|key| (key, &constraint.value))
+		})
+		.collect::<Vec<_>>();
+	let mut indexed = local.visit_table_composite_index(
+		transaction,
+		graph,
+		schema.name.as_str(),
+		schema.kind,
+		&equalities,
+		|atom| {
+			rows.push(row_from_properties(atom.atom_id, &atom.record_id, &atom.properties, schema));
+			Ok(())
+		},
+	)?;
+	for constraint in constraints {
+		if indexed {
+			break;
+		}
+		let field = constraint
+			.column
+			.checked_sub(1)
+			.and_then(|column| schema.fields.get(column))
+			.and_then(|field| field.key);
+		if let Some(property_key) = field {
+			indexed = local.visit_table_index(
+				transaction,
+				graph,
+				schema.name.as_str(),
+				schema.kind,
+				property_key,
+				constraint.comparison,
+				&constraint.value,
+				|atom| {
+					rows.push(row_from_properties(
+						atom.atom_id,
+						&atom.record_id,
+						&atom.properties,
+						schema,
+					));
+					Ok(())
+				},
+			)?;
 		}
 	}
-	if matches!(schema.kind, TableKind::Any | TableKind::Relation) {
-		for id in GraphRead::edge_ids(graph)? {
-			let id = id?;
-			if let Some(edge) = graph.edge(id)
-				&& edge.record_id().table() == schema.name.as_str()
-			{
-				rows.push(row_from_properties(id, edge.record_id(), edge.properties(), schema));
-			}
-		}
+	if !indexed {
+		return Ok(None);
 	}
 	rows.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
-	Ok(rows)
+	Ok(Some(rows))
 }
 
 pub(super) fn materialize_atom(

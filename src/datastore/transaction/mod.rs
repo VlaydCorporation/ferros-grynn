@@ -21,6 +21,7 @@ use mutation::{GraphWrite, MutableGraphValue, ensure_store_reference};
 pub(crate) use query::{
 	PredicateEvaluator,
 	QuerySnapshot,
+	QueryStorageCursor,
 	QueryStorageRow,
 	ScalarComparison,
 	ScalarIndexConstraint,
@@ -130,8 +131,8 @@ impl Transaction {
 		let commit_ts = current.commit_ts.checked_add(1).ok_or_else(|| {
 			FerrosGrynnError::serialization_failure(self.id, "the commit clock is exhausted")
 		})?;
-		// ponytail: cloning the shallow catalog is O(graphs + tables); use a persistent
-		// map only after catalog size appears in profiles.
+		// ponytail: cloning the shallow catalog is O(graphs + tables); use a
+		// persistent map only after catalog size appears in profiles.
 		let mut next = (*current).clone();
 		for (id, write) in std::mem::take(&mut self.graphs) {
 			self.apply_graph_write(&mut next, &current, id, write, commit_ts)?;

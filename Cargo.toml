@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/ferros-grynn-macros", "crates/fg-gql-status",
+    "crates/fg-storage-engine-prototypes",
     "ferros-grynn-bench"
 ]
 
@@ -227,6 +228,7 @@ columnar = ["dep:arrow"]
 datafusion = ["columnar", "dep:datafusion"]
 native-async-io = []
 allocation-tracking = []
+storage-engine-prototype-api = []
 
 # -------------------- System API --------------------
 [target.'cfg(windows)'.dependencies]

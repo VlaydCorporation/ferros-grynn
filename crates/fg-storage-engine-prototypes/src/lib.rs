@@ -7,6 +7,8 @@ mod atomic_arena;
 #[cfg(test)]
 mod harness;
 #[cfg(test)]
+mod hybrid_candidate;
+#[cfg(test)]
 mod policy;
 #[cfg(test)]
 mod prefetch;

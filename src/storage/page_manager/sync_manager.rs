@@ -15,8 +15,8 @@ pub(in crate::storage) struct SyncPageManager {
 	registry: RwLock<FileRegistry>,
 	/// Database-level frame WAL and snapshot registry.
 	pub(super) wal: FrameWal,
-	/// Fixed-budget immutable page cache.
-	pub(super) pool: BufferPool,
+	/// Fixed-budget immutable page cache and physical read router.
+	pub(super) pool: HybridReadEngine,
 	/// User-selected physical page transport.
 	page_io: PageIo,
 	/// Reusable calibrated extent for mixed home-file batch reads.
@@ -284,7 +284,7 @@ impl SyncPageManager {
 			database_path,
 			registry: RwLock::new(registry),
 			wal,
-			pool: BufferPool::new(pool_pages),
+			pool: HybridReadEngine::new(pool_pages),
 			page_io,
 			read_scratch: Mutex::new(aligned_extent()),
 			checkpoint_scratch: Mutex::new(aligned_extent()),
@@ -323,11 +323,11 @@ impl SyncPageManager {
 	///
 	/// Returns an error for a foreign transaction, unknown file, WAL or Direct
 	/// I/O failure, malformed page, or cache inconsistency.
-	pub(in crate::storage) fn read_page<'tx>(
-		&self,
-		tx: &'tx TxHandle,
+	pub(in crate::storage) fn read_page<'read>(
+		&'read self,
+		tx: &'read TxHandle,
 		key: PageKey,
-	) -> FerrosGrynnResult<PageRead<'tx>> {
+	) -> FerrosGrynnResult<PageRead<'read>> {
 		self.wal.validate_tx(tx)?;
 		if let Some(page) = tx.staged_page(key) {
 			return Ok(PageRead::Staged(page));
@@ -363,11 +363,11 @@ impl SyncPageManager {
 	///
 	/// Returns the scalar read errors, or an error when the unique home batch
 	/// exceeds the fixed pool capacity.
-	pub(in crate::storage) fn read_pages<'tx>(
-		&self,
-		tx: &'tx TxHandle,
+	pub(in crate::storage) fn read_pages<'read>(
+		&'read self,
+		tx: &'read TxHandle,
 		keys: &[PageKey],
-	) -> FerrosGrynnResult<Vec<PageRead<'tx>>> {
+	) -> FerrosGrynnResult<Vec<PageRead<'read>>> {
 		self.wal.validate_tx(tx)?;
 		if keys.is_empty() {
 			return Ok(Vec::new());
@@ -418,31 +418,224 @@ impl SyncPageManager {
 		}
 		drop(visible);
 
-		if !home_keys.is_empty() {
-			let mut scratch = self.read_scratch.lock();
-			let guards = self.pool.get_or_load_batch_extents(
-				&home_keys,
-				&mut scratch,
-				|load_extents, pages| {
-					let mut io_extents = Vec::with_capacity(load_extents.len());
-					for extent in load_extents {
-						let first = extent.first_key();
-						let file = self.transactional_file(first)?;
-						io_extents.push(FilePageExtent::new(
-							Arc::clone(file.file()?),
-							first.page_no(),
-							extent.buffer_start(),
-							extent.page_count(),
-						));
-					}
-					self.page_io.read_extents(&io_extents, pages)
-				},
-			)?;
-			for (position, guard) in home_positions.into_iter().zip(guards) {
-				output[position] = Some(PageRead::Cached(guard));
-			}
+		for (position, cache_key) in home_positions.into_iter().zip(home_keys) {
+			let key = cache_key.page_key();
+			let file = self.transactional_file(key)?;
+			let guard = self.pool.get_or_load(cache_key, |output| {
+				self.page_io.read_page(file.file()?, key.page_no(), output)
+			})?;
+			output[position] = Some(PageRead::Cached(guard));
 		}
 		collect_page_reads(output)
+	}
+
+	/// Visits one contiguous physical range without retaining cold scan pages.
+	///
+	/// Staged and exact WAL versions keep precedence. Exact home versions are
+	/// probed in R8 first; only contiguous cold runs use the bypass transport.
+	/// Callback page borrows cannot escape the bounded cursor window.
+	///
+	/// # Errors
+	///
+	/// Returns transaction, range, WAL, resident, Direct-I/O, scatter,
+	/// validation, or callback errors.
+	pub(in crate::storage) fn visit_contiguous_pages(
+		&self,
+		tx: &TxHandle,
+		first_key: PageKey,
+		page_count: usize,
+		intent: ReadIntent,
+		mut visit: impl FnMut(PageKey, &AlignedPage) -> FerrosGrynnResult<ControlFlow<()>>,
+	) -> FerrosGrynnResult<()> {
+		self.wal.validate_tx(tx)?;
+		if page_count == 0 {
+			return Ok(());
+		}
+		let file = self.transactional_file(first_key)?;
+		let home_version = self.home_cache_version();
+		let home_source_key = PageCacheKey::new(
+			PageKey::new(first_key.graph_id(), first_key.file_id(), PageNo::new(0)),
+			home_version,
+		);
+		let source_pages = usize::try_from(file.file()?.page_count()).map_err(|source| {
+			FerrosGrynnError::invalid_storage_file(format!(
+				"home source page count exceeds usize: {source}"
+			))
+		})?;
+		let source_pages = NonZeroUsize::new(source_pages).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("home source contains no complete pages")
+		})?;
+		let home_locator = self.pool.home_locator(home_source_key, source_pages)?;
+		self.pool.retire_home_versions(home_source_key)?;
+		let mut consumed = 0;
+		while consumed < page_count {
+			let window_len = (page_count - consumed).min(MAX_READ_SCOPE_OPERATIONS);
+			let window_first = contiguous_key(first_key, consumed)?;
+			let keys = (0..window_len)
+				.map(|offset| contiguous_key(window_first, offset))
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let visible = self.wal.visible_frames(&keys, tx.snapshot());
+			let home_keys =
+				keys.iter().map(|key| PageCacheKey::new(*key, home_version)).collect::<Vec<_>>();
+			let mut scope = self.pool.read_scope()?;
+			let resolved_home = scope.resolve_home_window(&home_locator, &home_keys)?;
+			let mut position = 0;
+			while position < keys.len() {
+				let key = keys[position];
+				if let Some(page) = tx.staged_page(key) {
+					if visit(key, page)?.is_break() {
+						return Ok(());
+					}
+					position += 1;
+					continue;
+				}
+				if let Some(frame) = visible.frames()[position] {
+					let cache_key = PageCacheKey::new(
+						key,
+						PageCacheVersion::Wal(PageLsn::new(frame.frame_lsn().get())),
+					);
+					let page = self
+						.pool
+						.get_or_load(cache_key, |output| visible.read_frame(frame, output))?;
+					if visit(key, page.as_page())?.is_break() {
+						return Ok(());
+					}
+					position += 1;
+					continue;
+				}
+
+				let resident_start = position;
+				let mut resident_handles = Vec::new();
+				while position < keys.len() {
+					let candidate = keys[position];
+					if tx.staged_page(candidate).is_some() || visible.frames()[position].is_some() {
+						break;
+					}
+					let Some(handle) = resolved_home[position] else {
+						break;
+					};
+					resident_handles.push(handle);
+					position += 1;
+				}
+				if !resident_handles.is_empty() {
+					let mut table = scope.prepare_resolved_table(&resident_handles)?;
+					if let Some(window) =
+						scope.get_resolved_window(&mut table, resident_handles.len())?
+					{
+						for offset in 0..window.len() {
+							let page = window.page(offset).ok_or_else(|| {
+								FerrosGrynnError::storage_io_failure(
+									"resolved resident window lost its prepared frame",
+								)
+							})?;
+							if visit(keys[resident_start + offset], page)?.is_break() {
+								return Ok(());
+							}
+						}
+						continue;
+					}
+				}
+				position = resident_start;
+
+				let run_start = position;
+				position += 1;
+				while position < keys.len() {
+					let candidate = keys[position];
+					if tx.staged_page(candidate).is_some()
+						|| visible.frames()[position].is_some()
+						|| resolved_home[position].is_some()
+					{
+						break;
+					}
+					position += 1;
+				}
+				if self
+					.visit_cold_home_run(
+						&file,
+						keys[run_start],
+						position - run_start,
+						intent,
+						&mut visit,
+					)?
+					.is_break()
+				{
+					return Ok(());
+				}
+			}
+			consumed += window_len;
+		}
+		Ok(())
+	}
+
+	/// Reads one pre-resolved cold home run without admitting its pages.
+	fn visit_cold_home_run(
+		&self,
+		file: &Arc<RegisteredDataFile>,
+		first_key: PageKey,
+		page_count: usize,
+		intent: ReadIntent,
+		visit: &mut impl FnMut(PageKey, &AlignedPage) -> FerrosGrynnResult<ControlFlow<()>>,
+	) -> FerrosGrynnResult<ControlFlow<()>> {
+		let route = self.pool.route(
+			false,
+			intent,
+			ReadWindow::Contiguous {
+				pages: page_count,
+			},
+			self.page_io.mode(),
+			TransportCapabilities::current(),
+		);
+		#[cfg(windows)]
+		if let ReadRoute::ScatterBypass {
+			..
+		} = route
+		{
+			let mut cursor = self.pool.scatter_cursor(
+				Arc::clone(file.file()?),
+				first_key.page_no(),
+				page_count,
+			)?;
+			while let Some(extent) = cursor.next_extent() {
+				let extent = extent?;
+				for (offset, page) in extent.pages().iter().enumerate() {
+					let key = PageKey::new(
+						first_key.graph_id(),
+						first_key.file_id(),
+						checked_page_add(extent.first_page(), offset)?,
+					);
+					if visit(key, page)?.is_break() {
+						drop(cursor);
+						return Ok(ControlFlow::Break(()));
+					}
+				}
+			}
+			cursor.finish()?;
+			return Ok(ControlFlow::Continue(()));
+		}
+
+		let mut completed = 0;
+		let mut scratch = self.read_scratch.lock();
+		while completed < page_count {
+			let extent_len = (page_count - completed).min(scratch.len());
+			let first_page = checked_page_add(first_key.page_no(), completed)?;
+			let pages = &mut scratch[..extent_len];
+			file.file()?.read_pages_raw(first_page, pages)?;
+			for (offset, page) in pages.iter().enumerate() {
+				page.validate(checked_page_add(first_page, offset)?)?;
+			}
+			for (offset, page) in pages.iter().enumerate() {
+				let key = PageKey::new(
+					first_key.graph_id(),
+					first_key.file_id(),
+					checked_page_add(first_page, offset)?,
+				);
+				if visit(key, page)?.is_break() {
+					return Ok(ControlFlow::Break(()));
+				}
+			}
+			completed += extent_len;
+		}
+		Ok(ControlFlow::Continue(()))
 	}
 
 	/// Stages one complete page image in a transaction-private write set.

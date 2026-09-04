@@ -15,6 +15,7 @@ use super::{
 	AtomId,
 	AtomIds,
 	AtomKind,
+	AtomRef,
 	DirtyTarget,
 	EdgeEndpoint,
 	EdgeRead,
@@ -525,6 +526,69 @@ impl Graph<Mutable> {
 
 	pub(crate) fn from_read_preserving<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
 		copy_from_read(source, true)
+	}
+
+	/// Starts an owned query result without recording construction as mutation.
+	pub(crate) fn begin_query_materialization(
+		properties: PropertyMap,
+		nodes: usize,
+		edges: usize,
+	) -> Self {
+		Self {
+			metadata: GraphMetadata::with_identity(Uuid::now_v7(), 0, properties),
+			storage: GeneralStorage::with_capacity(nodes, edges),
+			state: PhantomData,
+		}
+	}
+
+	/// Inserts one fully decoded node into a query result.
+	pub(crate) fn materialize_query_node(
+		&mut self,
+		record_id: RecordId,
+		label: Option<Text>,
+		properties: PropertyMap,
+		inner: Option<Graph<Frozen>>,
+	) -> FerrosGrynnResult<AtomId> {
+		ensure_unique_record(&self.storage.nodes, &self.storage.edges, &record_id)?;
+		self.storage.insert_node_new(record_id, label, properties, inner)
+	}
+
+	/// Reserves one decoded edge before all remapped endpoints are available.
+	pub(crate) fn reserve_query_edge(
+		&mut self,
+		record_id: RecordId,
+		label: Option<Text>,
+		properties: PropertyMap,
+		weight: Option<Number>,
+		transition: Option<Graph<Frozen>>,
+	) -> FerrosGrynnResult<AtomId> {
+		ensure_unique_record(&self.storage.nodes, &self.storage.edges, &record_id)?;
+		self.storage.insert_edge_new(
+			record_id,
+			EdgeTopology::undirected(std::iter::empty::<AtomId>()),
+			label,
+			properties,
+			weight,
+			transition,
+		)
+	}
+
+	/// Publishes and validates the final topology of a reserved query edge.
+	pub(crate) fn materialize_query_edge_topology(
+		&mut self,
+		id: AtomId,
+		topology: EdgeTopology,
+	) -> FerrosGrynnResult<()> {
+		self.storage.set_edge_topology(id, topology)
+	}
+
+	/// Attaches the exact source snapshot and clears construction state.
+	pub(crate) fn finish_query_materialization<R: GraphRead>(
+		&mut self,
+		source: &R,
+		source_atoms: BTreeMap<AtomId, AtomRef>,
+	) {
+		self.metadata.set_origin(MaterializationOrigin::new(source, source_atoms));
 	}
 
 	fn add_node_raw(
@@ -1079,7 +1143,7 @@ fn copy_from_read<R: GraphRead>(
 	Ok(result)
 }
 
-fn remap_topology(
+pub(crate) fn remap_topology(
 	topology: &EdgeTopology,
 	ids: &BTreeMap<AtomId, AtomId>,
 ) -> FerrosGrynnResult<EdgeTopology> {

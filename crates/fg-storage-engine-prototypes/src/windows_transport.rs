@@ -28,8 +28,8 @@ struct ScatterEvent(HANDLE);
 impl ScatterEvent {
 	/// Creates one reusable manual-reset event.
 	fn new() -> FerrosGrynnResult<Self> {
-		// SAFETY: no security descriptor or name is supplied; the returned event
-		// is exclusively owned by the RAII wrapper.
+		// SAFETY: no security descriptor or name is supplied; the returned
+		// event is exclusively owned by the RAII wrapper.
 		let handle = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
 			.map_err(|source| windows_failure("create ReadFileScatter event", source))?;
 		Ok(Self(handle))
@@ -37,7 +37,8 @@ impl ScatterEvent {
 
 	/// Resets the event after the preceding operation reached completion.
 	fn reset(&self) -> FerrosGrynnResult<()> {
-		// SAFETY: this is the wrapper's valid event and no operation is in flight.
+		// SAFETY: this is the wrapper's valid event and no operation is in
+		// flight.
 		unsafe { ResetEvent(self.0) }
 			.map_err(|source| windows_failure("reset ReadFileScatter event", source))
 	}
@@ -136,16 +137,18 @@ impl ScatterReader {
 				let offset = segment.checked_mul(self.system_page_size).ok_or_else(|| {
 					FerrosGrynnError::storage_io_failure("ReadFileScatter segment offset overflow")
 				})?;
-				// SAFETY: `offset < PAGE_SIZE`; each element covers one disjoint
-				// system page in an exclusively borrowed aligned frame.
+				// SAFETY: `offset < PAGE_SIZE`; each element covers one
+				// disjoint system page in an exclusively borrowed aligned
+				// frame.
 				let address = unsafe { base.add(offset) };
 				if !(address as usize).is_multiple_of(self.system_page_size) {
 					return Err(FerrosGrynnError::storage_io_failure(
 						"ReadFileScatter destination is not system-page aligned",
 					));
 				}
-				// `FILE_SEGMENT_ELEMENT` is a native PVOID64 union. Writing its u64
-				// arm zero-extends 32-bit pointers as required by ReadFileScatter.
+				// `FILE_SEGMENT_ELEMENT` is a native PVOID64 union. Writing its
+				// u64 arm zero-extends 32-bit pointers as required by
+				// ReadFileScatter.
 				self.segments.push(FILE_SEGMENT_ELEMENT {
 					Alignment: (address as usize) as u64,
 				});
@@ -180,7 +183,8 @@ impl ScatterReader {
 			}
 		}
 		let mut transferred = 0_u32;
-		// SAFETY: waiting to completion ends every native access to the buffers.
+		// SAFETY: waiting to completion ends every native access to the
+		// buffers.
 		unsafe {
 			GetOverlappedResult(handle, self.overlapped.as_ref(), &raw mut transferred, true)
 		}

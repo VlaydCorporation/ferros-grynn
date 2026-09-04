@@ -696,6 +696,9 @@ fn local_large_properties_overflow_and_abort_round_trip() {
 	};
 	assert_eq!(decoded_source.len(), source.len());
 	assert_eq!(decoded_target.len(), target.len());
+	drop(topology);
+	drop(wide_edge);
+	drop(node);
 	drop(view);
 	drop(read);
 

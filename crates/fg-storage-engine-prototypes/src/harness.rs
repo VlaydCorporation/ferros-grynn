@@ -10,6 +10,7 @@ use std::{
 	io::{self, Write},
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
+	ptr::NonNull,
 	sync::{
 		Arc,
 		Barrier,
@@ -29,6 +30,13 @@ use ferros_grynn::{
 	storage_engine_prototype_api::{
 		buffer_pool::{BufferPool, PageCacheKey, PageCacheVersion},
 		direct::DirectFile,
+		hybrid::{
+			HybridReadEngine,
+			MAX_READ_SCOPE_OPERATIONS,
+			ReadScope,
+			ResolvedFrameHandle,
+			ResolvedPageTable,
+		},
 		page::{
 			AlignedPage,
 			PAGE_HEADER_SIZE,
@@ -90,7 +98,7 @@ const PREFETCH_DEPTHS: [usize; 5] = [0, 1, 2, 4, 8];
 const READ_POLICIES: [ReadPolicy; 3] =
 	[ReadPolicy::CacheAll, ReadPolicy::RocksLikeBypass, ReadPolicy::InnodbLikeCold];
 /// Immutable interleaved standalone/direct-to-frame transport order.
-const TRANSPORT_CANDIDATES: [&str; 12] = [
+const TRANSPORT_CANDIDATES: [&str; 13] = [
 	"T0_raw",
 	"atomic_scratch_copy_publish",
 	"T0_validated",
@@ -103,6 +111,7 @@ const TRANSPORT_CANDIDATES: [&str; 12] = [
 	"T2_ioring_frame_requested_qd8",
 	"T2_ioring_frame_requested_qd32",
 	"T2_ioring_frame_requested_qd128",
+	"H11_production_scatter_p1",
 ];
 /// Unique benchmark file suffix source.
 static NEXT_DATASET: AtomicU64 = AtomicU64::new(1);
@@ -776,8 +785,9 @@ impl MmapControl {
 	/// Maps the immutable file without touching its page contents.
 	fn map_unvalidated(dataset: &Dataset) -> Result<Self, Box<dyn Error>> {
 		let file = File::open(&dataset.path)?;
-		// SAFETY: the read-only file remains immutable for the mapping lifetime,
-		// and `Mmap` owns the mapping independently of the local file handle.
+		// SAFETY: the read-only file remains immutable for the mapping
+		// lifetime, and `Mmap` owns the mapping independently of the local
+		// file handle.
 		let mapping = unsafe { MmapOptions::new().map(&file)? };
 		if mapping.len() != usize::try_from(dataset.page_count)?.saturating_mul(PAGE_SIZE) {
 			return Err(io::Error::other("mmap dataset length mismatch").into());
@@ -916,6 +926,12 @@ const RESIDENT_NEXT_CANDIDATES: [ResidentNextCandidate; 9] = [
 enum ResidentIsolatedCandidate {
 	/// Fully prevalidated mapping without an arena fixture in the process.
 	Mmap,
+	/// Production-candidate arena with one ordinary pin per physical page.
+	ProductionGeneric,
+	/// Production-candidate arena borrowed through its bounded read scope.
+	ProductionScope,
+	/// Production-candidate arena resolved once per bounded read window.
+	ProductionWindow,
 	/// Independent resolved pins with the original guard-side notification.
 	NotifyResolved,
 	/// Flat source-bound locator without a mapping fixture in the process.
@@ -935,6 +951,9 @@ impl ResidentIsolatedCandidate {
 	const fn label(self) -> &'static str {
 		match self {
 			Self::Mmap => "R0_mmap",
+			Self::ProductionGeneric => "H11_production_r8_generic",
+			Self::ProductionScope => "H11_production_r8_scope",
+			Self::ProductionWindow => "H11_production_r8_window",
 			Self::NotifyResolved => "R3_notify_resolved",
 			Self::DenseFlatRun => "R6_dense_flat_run",
 			Self::EpochResolved => "R8_epoch_resolved",
@@ -947,8 +966,11 @@ impl ResidentIsolatedCandidate {
 
 /// Exact process-isolated candidates; all other resident variants remain in
 /// the combined exploratory probe.
-const RESIDENT_ISOLATED_CANDIDATES: [ResidentIsolatedCandidate; 7] = [
+const RESIDENT_ISOLATED_CANDIDATES: [ResidentIsolatedCandidate; 10] = [
 	ResidentIsolatedCandidate::Mmap,
+	ResidentIsolatedCandidate::ProductionGeneric,
+	ResidentIsolatedCandidate::ProductionScope,
+	ResidentIsolatedCandidate::ProductionWindow,
 	ResidentIsolatedCandidate::NotifyResolved,
 	ResidentIsolatedCandidate::DenseFlatRun,
 	ResidentIsolatedCandidate::EpochResolved,
@@ -1693,10 +1715,13 @@ fn storage_engine_prototype_resident_isolated_process_probe() -> Result<(), Box<
 	let order_position = env_parse("FG_STORAGE_PROTO_ORDER_POSITION", 0_usize)?;
 	let mut artifacts = Artifacts::open(config)?;
 	artifacts.selector("resident_isolated_process", selector.as_deref())?;
+	let affinity_mask = env_parse("FG_STORAGE_PROTO_AFFINITY_MASK", 1_usize)?;
+	#[cfg(windows)]
+	let _affinity = pin_current_thread(affinity_mask)?;
 	writeln!(
 		artifacts.log,
 		"resident_isolated_process candidate={} repetition_base={} order_position={} \
-		 fixture_scope=selected engine only",
+		 fixture_scope=selected engine only affinity_mask={affinity_mask}",
 		candidate.label(),
 		repetition_base,
 		order_position,
@@ -1722,6 +1747,107 @@ fn storage_engine_prototype_resident_isolated_process_probe() -> Result<(), Box<
 					Ok(())
 				},
 			)?;
+		}
+		ResidentIsolatedCandidate::ProductionGeneric
+		| ResidentIsolatedCandidate::ProductionScope
+		| ResidentIsolatedCandidate::ProductionWindow => {
+			let direct = DirectFile::open_read_only(&dataset.path)?;
+			let capacity = NonZeroUsize::new(hot_pages).ok_or("zero resident hot set")?;
+			let engine = HybridReadEngine::new(capacity);
+			for raw_page in 0..hot_pages {
+				let page_no = PageNo::new(raw_page as u64);
+				drop(engine.get_or_load(dataset.key(page_no), |page| {
+					read_raw_reported(&dataset, &direct, page_no, page)
+				})?);
+			}
+			let handles = (0..hot_pages)
+				.map(|raw_page| {
+					engine
+						.resolve(dataset.key(PageNo::new(raw_page as u64)))
+						.ok_or_else(|| io::Error::other("production page did not resolve"))
+				})
+				.collect::<io::Result<Vec<_>>>()?;
+			match candidate {
+				ResidentIsolatedCandidate::ProductionGeneric => {
+					record_isolated_resident_runs(
+						&mut artifacts,
+						config,
+						candidate,
+						hot_pages,
+						repetition_base,
+						order_position,
+						|run, logical_count| {
+							let page_no = resident_page(run, hot_pages);
+							let guard =
+								engine.get_if_resident(dataset.key(page_no))?.ok_or_else(|| {
+									FerrosGrynnError::storage_io_failure(
+										"production generic resident page became stale",
+									)
+								})?;
+							for logical in 0..logical_count {
+								black_box(guard.as_bytes()[resident_marker_offset(logical)]);
+							}
+							Ok(())
+						},
+					)?;
+				}
+				ResidentIsolatedCandidate::ProductionScope => {
+					let mut scope = engine.read_scope()?;
+					record_isolated_resident_runs(
+						&mut artifacts,
+						config,
+						candidate,
+						hot_pages,
+						repetition_base,
+						order_position,
+						|run, logical_count| {
+							let page_no = resident_page(run, hot_pages);
+							let page = scope
+								.get_resolved(&handles[page_no.get() as usize])?
+								.ok_or_else(|| {
+									FerrosGrynnError::storage_io_failure(
+										"production scoped page became stale",
+									)
+								})?;
+							for logical in 0..logical_count {
+								black_box(page.as_bytes()[resident_marker_offset(logical)]);
+							}
+							Ok(())
+						},
+					)?;
+				}
+				ResidentIsolatedCandidate::ProductionWindow => {
+					let mut scope = engine.read_scope()?;
+					let mut table = if hot_pages <= MAX_READ_SCOPE_OPERATIONS {
+						scope.prepare_resolved_table(&handles[..hot_pages])?
+					} else {
+						scope.prepare_resolved_table(&[])?
+					};
+					record_isolated_production_windows(
+						&mut artifacts,
+						config,
+						candidate,
+						hot_pages,
+						repetition_base,
+						order_position,
+						&mut scope,
+						&handles,
+						&mut table,
+					)?;
+				}
+				ResidentIsolatedCandidate::Mmap
+				| ResidentIsolatedCandidate::NotifyResolved
+				| ResidentIsolatedCandidate::DenseFlatRun
+				| ResidentIsolatedCandidate::EpochResolved
+				| ResidentIsolatedCandidate::EpochDenseFlat
+				| ResidentIsolatedCandidate::EpochPageTable
+				| ResidentIsolatedCandidate::MissBackoffResolved => {
+					return Err(io::Error::other(
+						"non-production candidate entered the production fixture branch",
+					)
+					.into());
+				}
+			}
 		}
 		ResidentIsolatedCandidate::DenseFlatRun
 		| ResidentIsolatedCandidate::NotifyResolved
@@ -1903,6 +2029,9 @@ fn storage_engine_prototype_resident_isolated_process_probe() -> Result<(), Box<
 							)?;
 						}
 						ResidentIsolatedCandidate::Mmap
+						| ResidentIsolatedCandidate::ProductionGeneric
+						| ResidentIsolatedCandidate::ProductionScope
+						| ResidentIsolatedCandidate::ProductionWindow
 						| ResidentIsolatedCandidate::DenseFlatRun
 						| ResidentIsolatedCandidate::EpochDenseFlat => {
 							return Err(io::Error::other(
@@ -1915,10 +2044,460 @@ fn storage_engine_prototype_resident_isolated_process_probe() -> Result<(), Box<
 				ResidentIsolatedCandidate::Mmap => {
 					return Err(io::Error::other("mmap entered the arena fixture branch").into());
 				}
+				ResidentIsolatedCandidate::ProductionGeneric
+				| ResidentIsolatedCandidate::ProductionScope
+				| ResidentIsolatedCandidate::ProductionWindow => {
+					return Err(io::Error::other(
+						"production candidate entered the prototype arena fixture branch",
+					)
+					.into());
+				}
 			}
 		}
 	}
 	Ok(())
+}
+
+/// Measures one resident finalist with a separate read scope per worker.
+#[test]
+#[ignore = "storage-engine prototype benchmark; run explicitly with --profile profiling"]
+fn storage_engine_prototype_resident_isolated_concurrency_probe() -> Result<(), Box<dyn Error>> {
+	let config = HarnessConfig::from_env()?;
+	let supported = [
+		ResidentIsolatedCandidate::Mmap.label(),
+		ResidentIsolatedCandidate::ProductionWindow.label(),
+	];
+	let selector = candidate_selector_from_env("resident_isolated_concurrency", &supported)?;
+	let candidate = require_resident_isolated_candidate(selector.as_deref())?;
+	let threads = env_parse("FG_STORAGE_PROTO_THREADS", 1_usize)?;
+	if ![1_usize, 2, 4, 8, 12].contains(&threads) {
+		return Err(
+			io::Error::other("resident concurrency threads must be 1, 2, 4, 8, or 12").into()
+		);
+	}
+	if config.resident_operations < threads as u64 {
+		return Err(io::Error::other("resident operations must cover every worker").into());
+	}
+	if isolated_resident_run_length_from_env()?.is_some_and(|run_length| run_length != 1) {
+		return Err(io::Error::other("resident concurrency supports only run length 1").into());
+	}
+	let worker_affinity_masks = worker_affinity_masks_from_env(threads)?;
+	let repetition_base = env_parse("FG_STORAGE_PROTO_REPETITION_BASE", 0_usize)?;
+	let order_position = env_parse("FG_STORAGE_PROTO_ORDER_POSITION", 0_usize)?;
+	let mut artifacts = Artifacts::open(config)?;
+	artifacts.selector("resident_isolated_concurrency", selector.as_deref())?;
+	writeln!(
+		artifacts.log,
+		"resident_isolated_concurrency threads={threads} \
+		 worker_affinity_masks={worker_affinity_masks:?}"
+	)?;
+	let dataset = Dataset::create("resident-isolated-concurrency", config.dataset_pages)?;
+	let hot_pages = config.pool_pages.min(usize::try_from(config.dataset_pages)?);
+
+	match candidate {
+		ResidentIsolatedCandidate::Mmap => {
+			let mmap = MmapControl::open(&dataset)?;
+			for local_repetition in 0..config.repetitions {
+				let repetition = repetition_base
+					.checked_add(local_repetition)
+					.ok_or_else(|| io::Error::other("concurrency repetition index overflow"))?;
+				let measurement = measure_mmap_resident_concurrency(
+					&mmap,
+					hot_pages,
+					config.resident_operations,
+					threads,
+					worker_affinity_masks.as_deref(),
+				)?;
+				record_isolated_concurrency_sample(
+					&mut artifacts,
+					config,
+					candidate,
+					hot_pages,
+					threads,
+					repetition,
+					order_position,
+					measurement,
+				)?;
+			}
+		}
+		ResidentIsolatedCandidate::ProductionWindow => {
+			let direct = DirectFile::open_read_only(&dataset.path)?;
+			let capacity = NonZeroUsize::new(hot_pages).ok_or("zero resident hot set")?;
+			let engine = HybridReadEngine::new(capacity);
+			for raw_page in 0..hot_pages {
+				let page_no = PageNo::new(raw_page as u64);
+				drop(engine.get_or_load(dataset.key(page_no), |page| {
+					read_raw_reported(&dataset, &direct, page_no, page)
+				})?);
+			}
+			let handles = (0..hot_pages)
+				.map(|raw_page| {
+					engine
+						.resolve(dataset.key(PageNo::new(raw_page as u64)))
+						.ok_or_else(|| io::Error::other("production page did not resolve"))
+				})
+				.collect::<io::Result<Vec<_>>>()?;
+			for local_repetition in 0..config.repetitions {
+				let repetition = repetition_base
+					.checked_add(local_repetition)
+					.ok_or_else(|| io::Error::other("concurrency repetition index overflow"))?;
+				let measurement = measure_production_resident_concurrency(
+					&engine,
+					&handles,
+					hot_pages,
+					config.resident_operations,
+					threads,
+					worker_affinity_masks.as_deref(),
+				)?;
+				record_isolated_concurrency_sample(
+					&mut artifacts,
+					config,
+					candidate,
+					hot_pages,
+					threads,
+					repetition,
+					order_position,
+					measurement,
+				)?;
+			}
+		}
+		_ => {
+			return Err(io::Error::other("unsupported resident concurrency candidate").into());
+		}
+	}
+	Ok(())
+}
+
+/// Measures one resident finalist across one shared 1/4/8-file hot-set budget.
+#[test]
+#[ignore = "storage-engine prototype benchmark; run explicitly with --profile profiling"]
+fn storage_engine_prototype_resident_isolated_multifile_probe() -> Result<(), Box<dyn Error>> {
+	let config = HarnessConfig::from_env()?;
+	let supported = [
+		ResidentIsolatedCandidate::Mmap.label(),
+		ResidentIsolatedCandidate::ProductionWindow.label(),
+	];
+	let selector = candidate_selector_from_env("resident_isolated_multifile", &supported)?;
+	let candidate = require_resident_isolated_candidate(selector.as_deref())?;
+	let file_count = env_parse("FG_STORAGE_PROTO_FILE_COUNT", 1_usize)?;
+	if ![1_usize, 4, 8].contains(&file_count) {
+		return Err(io::Error::other("resident multi-file count must be 1, 4, or 8").into());
+	}
+	if config.pool_pages < file_count
+		|| config.pool_pages % file_count != 0
+		|| usize::try_from(config.dataset_pages)? < config.pool_pages
+		|| config.dataset_pages % file_count as u64 != 0
+	{
+		return Err(io::Error::other(
+			"resident multi-file pages and pool must be divisible by and cover every file",
+		)
+		.into());
+	}
+	let repetition_base = env_parse("FG_STORAGE_PROTO_REPETITION_BASE", 0_usize)?;
+	let order_position = env_parse("FG_STORAGE_PROTO_ORDER_POSITION", 0_usize)?;
+	let affinity_mask = env_parse("FG_STORAGE_PROTO_AFFINITY_MASK", 1_usize)?;
+	#[cfg(windows)]
+	let _affinity = pin_current_thread(affinity_mask)?;
+	let mut artifacts = Artifacts::open(config)?;
+	artifacts.selector("resident_isolated_multifile", selector.as_deref())?;
+	writeln!(
+		artifacts.log,
+		"resident_isolated_multifile candidate={} files={file_count} shared_hot_pages={} \
+		 affinity_mask={affinity_mask}",
+		candidate.label(),
+		config.pool_pages,
+	)?;
+
+	let pages_per_file = usize::try_from(config.dataset_pages)? / file_count;
+	let hot_pages_per_file = config.pool_pages / file_count;
+	let datasets = (0..file_count)
+		.map(|file_index| {
+			Dataset::create(
+				&format!("resident-isolated-multifile-{file_index}"),
+				pages_per_file as u64,
+			)
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	let table_layout = (0..file_count)
+		.flat_map(|file_index| {
+			(0..hot_pages_per_file).step_by(MAX_READ_SCOPE_OPERATIONS).map(move |first_page| {
+				(
+					file_index,
+					first_page,
+					(hot_pages_per_file - first_page).min(MAX_READ_SCOPE_OPERATIONS),
+				)
+			})
+		})
+		.collect::<Vec<_>>();
+
+	match candidate {
+		ResidentIsolatedCandidate::Mmap => {
+			let mappings = datasets.iter().map(MmapControl::open).collect::<Result<Vec<_>, _>>()?;
+			let tables = table_layout
+				.iter()
+				.map(|&(file_index, first_page, table_pages)| {
+					(first_page..first_page + table_pages)
+						.map(|raw_page| {
+							mapping_page(
+								&mappings[file_index].mapping,
+								PageNo::new(raw_page as u64),
+							)
+							.map(NonNull::from)
+						})
+						.collect::<io::Result<Vec<_>>>()
+				})
+				.collect::<io::Result<Vec<_>>>()?;
+			for local_repetition in 0..config.repetitions {
+				let repetition =
+					repetition_base.checked_add(local_repetition).ok_or_else(|| {
+						io::Error::other("resident multi-file repetition index overflow")
+					})?;
+				let measurement = measure_resident_runs(
+					config.resident_operations,
+					config.latency_batch,
+					MAX_READ_SCOPE_OPERATIONS,
+					|run, logical_count| {
+						let table = &tables[run as usize % tables.len()];
+						let logical_start = run * MAX_READ_SCOPE_OPERATIONS as u64;
+						for offset in 0..logical_count {
+							let page_index =
+								resident_page(logical_start + offset as u64, table.len()).get()
+									as usize;
+							let page = table[page_index];
+							// SAFETY: every pointer was derived from an
+							// immutable complete page in a live `Mmap`;
+							// `mappings` outlives all tables and the timed
+							// loop.
+							black_box(unsafe { page.as_ref() }[resident_marker_offset(offset)]);
+						}
+						Ok(())
+					},
+				)?;
+				record_isolated_multifile_sample(
+					&mut artifacts,
+					config,
+					candidate,
+					file_count,
+					repetition,
+					order_position,
+					measurement,
+				)?;
+			}
+		}
+		ResidentIsolatedCandidate::ProductionWindow => {
+			let directs = datasets
+				.iter()
+				.map(|dataset| DirectFile::open_read_only(&dataset.path))
+				.collect::<Result<Vec<_>, _>>()?;
+			let engine = HybridReadEngine::new(
+				NonZeroUsize::new(config.pool_pages).ok_or("zero multi-file resident budget")?,
+			);
+			let mut handles = Vec::with_capacity(file_count);
+			for (dataset, direct) in datasets.iter().zip(&directs) {
+				let mut source_handles = Vec::with_capacity(hot_pages_per_file);
+				for raw_page in 0..hot_pages_per_file {
+					let page_no = PageNo::new(raw_page as u64);
+					drop(engine.get_or_load(dataset.key(page_no), |page| {
+						read_raw_reported(dataset, direct, page_no, page)
+					})?);
+					source_handles.push(engine.resolve(dataset.key(page_no)).ok_or_else(|| {
+						io::Error::other("production multi-file page did not resolve")
+					})?);
+				}
+				handles.push(source_handles);
+			}
+			let resident_count = engine.resident_count();
+			if resident_count != config.pool_pages {
+				return Err(io::Error::other(format!(
+					"production multi-file preload retained {resident_count} of {} shared hot \
+					 pages",
+					config.pool_pages
+				))
+				.into());
+			}
+			let mut scope = engine.read_scope()?;
+			let mut tables = handles
+				.iter()
+				.flat_map(|source_handles| {
+					source_handles
+						.chunks(MAX_READ_SCOPE_OPERATIONS)
+						.map(|chunk| scope.prepare_resolved_table(chunk))
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			for local_repetition in 0..config.repetitions {
+				let repetition =
+					repetition_base.checked_add(local_repetition).ok_or_else(|| {
+						io::Error::other("resident multi-file repetition index overflow")
+					})?;
+				let measurement = measure_resident_runs(
+					config.resident_operations,
+					config.latency_batch,
+					MAX_READ_SCOPE_OPERATIONS,
+					|run, logical_count| {
+						let table_index = run as usize % tables.len();
+						let window = scope
+							.get_resolved_window(&mut tables[table_index], logical_count)?
+							.ok_or_else(|| {
+								FerrosGrynnError::storage_io_failure(
+									"production multi-file table became stale",
+								)
+							})?;
+						let logical_start = run * MAX_READ_SCOPE_OPERATIONS as u64;
+						for offset in 0..logical_count {
+							let page_index =
+								resident_page(logical_start + offset as u64, window.len()).get()
+									as usize;
+							let page = window.page(page_index).ok_or_else(|| {
+								FerrosGrynnError::storage_io_failure(
+									"production multi-file window lost a page",
+								)
+							})?;
+							black_box(page.as_bytes()[resident_marker_offset(offset)]);
+						}
+						Ok(())
+					},
+				)?;
+				record_isolated_multifile_sample(
+					&mut artifacts,
+					config,
+					candidate,
+					file_count,
+					repetition,
+					order_position,
+					measurement,
+				)?;
+			}
+		}
+		_ => return Err(io::Error::other("unsupported resident multi-file candidate").into()),
+	}
+	Ok(())
+}
+
+/// Records one process-isolated shared-budget multi-file result.
+#[allow(clippy::too_many_arguments, reason = "benchmark metadata remains explicit")]
+fn record_isolated_multifile_sample(
+	artifacts: &mut Artifacts,
+	config: HarnessConfig,
+	candidate: ResidentIsolatedCandidate,
+	file_count: usize,
+	repetition: usize,
+	order_position: usize,
+	measurement: Measurement,
+) -> io::Result<()> {
+	artifacts.sample(
+		SampleMeta {
+			phase: "hybrid_h11_multifile",
+			workload: "source_local_resident_windows",
+			candidate: candidate.label(),
+			repetition,
+			order_position,
+			dataset_pages: config.dataset_pages,
+			pool_pages: config.pool_pages,
+			hot_pages: config.pool_pages,
+			file_count,
+			threads: 1,
+			queue_depth: 0,
+			extent_pages: MAX_READ_SCOPE_OPERATIONS,
+			prefetch_depth: 0,
+			vm_reserved_bytes: 0,
+			vm_committed_bytes: 0,
+			hit_ratio: 1.0,
+		},
+		measurement,
+	)
+}
+
+/// Records one aggregate isolated concurrency result.
+#[allow(clippy::too_many_arguments, reason = "benchmark metadata remains explicit")]
+fn record_isolated_concurrency_sample(
+	artifacts: &mut Artifacts,
+	config: HarnessConfig,
+	candidate: ResidentIsolatedCandidate,
+	hot_pages: usize,
+	threads: usize,
+	repetition: usize,
+	order_position: usize,
+	measurement: Measurement,
+) -> Result<(), Box<dyn Error>> {
+	artifacts.sample(
+		SampleMeta {
+			phase: "hybrid_h11_concurrency",
+			workload: "concurrent_hot_set",
+			candidate: candidate.label(),
+			repetition,
+			order_position,
+			dataset_pages: config.dataset_pages,
+			pool_pages: config.pool_pages,
+			hot_pages,
+			file_count: 1,
+			threads,
+			queue_depth: 0,
+			extent_pages: 1,
+			prefetch_depth: 0,
+			vm_reserved_bytes: 0,
+			vm_committed_bytes: 0,
+			hit_ratio: 1.0,
+		},
+		measurement,
+	)?;
+	Ok(())
+}
+
+/// Reads an optional exact run length for focused resident profiling.
+fn isolated_resident_run_length_from_env() -> Result<Option<usize>, Box<dyn Error>> {
+	let selected = match std::env::var("FG_STORAGE_PROTO_RUN_LENGTH") {
+		Ok(value) => Some(value.parse::<usize>()?),
+		Err(std::env::VarError::NotPresent) => None,
+		Err(error) => return Err(error.into()),
+	};
+	if selected.is_some_and(|run_length| !RESIDENT_ISOLATED_RUN_LENGTHS.contains(&run_length)) {
+		return Err(io::Error::other(format!(
+			"unsupported FG_STORAGE_PROTO_RUN_LENGTH {selected:?}; supported: \
+			 {RESIDENT_ISOLATED_RUN_LENGTHS:?}"
+		))
+		.into());
+	}
+	Ok(selected)
+}
+
+/// Reads one exact nonzero Windows affinity mask per concurrency worker.
+///
+/// # Errors
+///
+/// Returns an error for malformed masks, a count different from `threads`, a
+/// zero mask, or an affinity request on a non-Windows target.
+fn worker_affinity_masks_from_env(threads: usize) -> Result<Option<Vec<usize>>, Box<dyn Error>> {
+	let value = match std::env::var("FG_STORAGE_PROTO_WORKER_AFFINITY_MASKS") {
+		Ok(value) => value,
+		Err(std::env::VarError::NotPresent) => return Ok(None),
+		Err(error) => return Err(error.into()),
+	};
+	#[cfg(not(windows))]
+	return Err(
+		io::Error::other(format!("worker affinity is Windows-only; requested {value:?}")).into()
+	);
+	#[cfg(windows)]
+	{
+		let masks = value
+			.split(',')
+			.map(|mask| {
+				mask.trim().parse::<usize>().map_err(|error| {
+					io::Error::other(format!("invalid worker affinity mask {mask:?}: {error}"))
+				})
+			})
+			.collect::<io::Result<Vec<_>>>()?;
+		if masks.len() != threads {
+			return Err(io::Error::other(format!(
+				"worker affinity mask count {} does not match threads {threads}",
+				masks.len()
+			))
+			.into());
+		}
+		if masks.contains(&0) {
+			return Err(io::Error::other("worker affinity masks must be nonzero").into());
+		}
+		Ok(Some(masks))
+	}
 }
 
 /// Records the common run-length matrix for one already-isolated resident
@@ -1936,7 +2515,11 @@ fn record_isolated_resident_runs<Access>(
 where
 	Access: FnMut(u64, usize) -> Result<(), Box<dyn Error>>,
 {
+	let selected_run_length = isolated_resident_run_length_from_env()?;
 	for run_length in RESIDENT_ISOLATED_RUN_LENGTHS {
+		if selected_run_length.is_some_and(|selected| selected != run_length) {
+			continue;
+		}
 		for local_repetition in 0..config.repetitions {
 			let repetition = repetition_base
 				.checked_add(local_repetition)
@@ -1946,6 +2529,56 @@ where
 				config.latency_batch,
 				run_length,
 				&mut access,
+			)?;
+			artifacts.sample(
+				resident_next_meta(
+					"resident_isolated_process",
+					"warm_physical_run",
+					candidate.label(),
+					repetition,
+					order_position,
+					config,
+					hot_pages,
+					run_length,
+				),
+				measurement,
+			)?;
+		}
+	}
+	Ok(())
+}
+
+/// Records production R8 reads that resolve one complete bounded page table
+/// before consuming its pages.
+#[allow(clippy::too_many_arguments, reason = "paired benchmark metadata remains explicit")]
+fn record_isolated_production_windows(
+	artifacts: &mut Artifacts,
+	config: HarnessConfig,
+	candidate: ResidentIsolatedCandidate,
+	hot_pages: usize,
+	repetition_base: usize,
+	order_position: usize,
+	scope: &mut ReadScope<'_>,
+	handles: &[ResolvedFrameHandle],
+	table: &mut ResolvedPageTable,
+) -> Result<(), Box<dyn Error>> {
+	let selected_run_length = isolated_resident_run_length_from_env()?;
+	for run_length in RESIDENT_ISOLATED_RUN_LENGTHS {
+		if selected_run_length.is_some_and(|selected| selected != run_length) {
+			continue;
+		}
+		for local_repetition in 0..config.repetitions {
+			let repetition = repetition_base
+				.checked_add(local_repetition)
+				.ok_or_else(|| io::Error::other("isolated repetition index overflow"))?;
+			let measurement = measure_production_resident_windows(
+				config.resident_operations,
+				config.latency_batch,
+				run_length,
+				hot_pages,
+				scope,
+				handles,
+				table,
 			)?;
 			artifacts.sample(
 				resident_next_meta(
@@ -2762,8 +3395,11 @@ fn storage_engine_prototype_mixed_finalist_probe() -> Result<(), Box<dyn Error>>
 
 	for repetition in 0..repetitions {
 		let leaf_first = PageNo::new((root_pages + repetition * leaf_pages) as u64);
-		let btree_candidates =
-			["R2_roots+A1_sync_bypass", "R8_epoch_roots+A1_scatter+P1", "R0_mmap_hot_roots"];
+		let btree_candidates = [
+			"R2_roots+A1_sync_bypass",
+			"H11_production_r8_scope+A1_scatter+P1",
+			"R0_mmap_hot_roots",
+		];
 		for (order_position, candidate) in
 			rotated_order(&btree_candidates, repetition).into_iter().enumerate()
 		{
@@ -2781,20 +3417,18 @@ fn storage_engine_prototype_mixed_finalist_probe() -> Result<(), Box<dyn Error>>
 					1,
 					0,
 				),
-				"R8_epoch_roots+A1_scatter+P1" => (
-					measure_btree_epoch_scatter(
+				"H11_production_r8_scope+A1_scatter+P1" => {
+					let (measurement, extent_pages) = measure_btree_hybrid_scatter(
 						&datasets[0],
 						&directs[0],
 						Arc::clone(&scatter_file),
+						config.pool_pages,
 						root_pages,
 						leaf_first,
 						leaf_pages,
-						config.extent_pages,
-					)?,
-					2,
-					config.extent_pages.min(leaf_pages),
-					1,
-				),
+					)?;
+					(measurement, 2, extent_pages, 1)
+				}
 				"R0_mmap_hot_roots" => (
 					measure_btree_mmap(
 						&datasets[0],
@@ -2909,6 +3543,88 @@ fn storage_engine_prototype_mixed_finalist_probe() -> Result<(), Box<dyn Error>>
 	Ok(())
 }
 
+/// Compares the production hybrid fixed-hot scan with raw Direct and mmap in
+/// an isolated process. External orchestration rotates candidates and supplies
+/// paired repetition/order indices.
+#[cfg(all(windows, feature = "native-async-io"))]
+#[test]
+#[ignore = "fixed-hot production benchmark; run explicitly with --profile profiling"]
+fn storage_engine_prototype_fixed_hot_scan_probe() -> Result<(), Box<dyn Error>> {
+	const CANDIDATES: [&str; 3] =
+		["T0_raw_fixed_hot", "H11_production_r8_hot+scatter_p1", "R0_mmap_fixed_hot"];
+
+	let config = HarnessConfig::from_env()?;
+	let selector = candidate_selector_from_env("fixed_hot_scan", &CANDIDATES)?;
+	let candidate = selector
+		.as_deref()
+		.ok_or_else(|| io::Error::other("fixed-hot process probe requires one exact candidate"))?;
+	let repetition = env_parse("FG_STORAGE_PROTO_REPETITION_BASE", 0_usize)?;
+	let order_position = env_parse("FG_STORAGE_PROTO_ORDER_POSITION", 0_usize)?;
+	let hot_pages = config.pool_pages / 4 / config.extent_pages * config.extent_pages;
+	if hot_pages == 0 || config.dataset_pages <= hot_pages as u64 {
+		return Err(io::Error::other(
+			"fixed-hot scan requires one complete hot extent and a larger dataset",
+		)
+		.into());
+	}
+	let runs = fixed_hot_scan_runs(
+		usize::try_from(config.dataset_pages)?,
+		hot_pages,
+		config.extent_pages,
+	)?;
+	let hot_accesses =
+		runs.iter().filter(|(_, _, hot)| *hot).map(|(_, pages, _)| *pages as u64).sum::<u64>();
+	let mut artifacts = Artifacts::open(config)?;
+	artifacts.selector("fixed_hot_scan", selector.as_deref())?;
+	let dataset = Dataset::create("fixed-hot-scan", config.dataset_pages)?;
+
+	let (measurement, hit_ratio, threads, prefetch_depth) = match candidate {
+		"T0_raw_fixed_hot" => {
+			(measure_fixed_hot_raw(&dataset, &runs, config.extent_pages)?, 0.0, 1, 0)
+		}
+		"H11_production_r8_hot+scatter_p1" => {
+			let (measurement, hot_hits) = measure_fixed_hot_hybrid(
+				&dataset,
+				&runs,
+				hot_pages,
+				config.pool_pages,
+				config.extent_pages,
+			)?;
+			(measurement, hot_hits as f64 / hot_accesses as f64, 2, 1)
+		}
+		"R0_mmap_fixed_hot" => (measure_fixed_hot_mmap(&dataset, &runs, hot_pages)?, 1.0, 1, 0),
+		_ => return Err(io::Error::other("unknown fixed-hot candidate").into()),
+	};
+	artifacts.sample(
+		SampleMeta {
+			phase: "fixed_hot_finalist",
+			workload: "scan_with_fixed_hot_set",
+			candidate,
+			repetition,
+			order_position,
+			dataset_pages: config.dataset_pages,
+			pool_pages: config.pool_pages,
+			hot_pages,
+			file_count: 1,
+			threads,
+			queue_depth: 1,
+			extent_pages: config.extent_pages,
+			prefetch_depth,
+			vm_reserved_bytes: 0,
+			vm_committed_bytes: 0,
+			hit_ratio,
+		},
+		measurement,
+	)?;
+	writeln!(
+		artifacts.log,
+		"fixed_hot_note=one cold run contains four transport extents followed by one rotating hot \
+		 extent; production cold pages use Scatter P1 without admission and hot pages use \
+		 reusable resolved tables; hit_ratio counts only declared hot accesses"
+	)?;
+	Ok(())
+}
+
 /// Screens synchronous Direct, forced extent IoRing, frame IoRing, scatter,
 /// and direct-to-frame Atomic/VM combinations.
 #[cfg(all(windows, feature = "native-async-io"))]
@@ -2930,6 +3646,9 @@ fn storage_engine_prototype_transport_probe() -> Result<(), Box<dyn Error>> {
 	)?);
 	let scan_pages = usize::try_from(config.dataset_pages)?;
 	let extent_pages = config.extent_pages.min(scan_pages).max(1);
+	let hybrid = HybridReadEngine::new(
+		NonZeroUsize::new(config.pool_pages).ok_or("zero hybrid transport budget")?,
+	);
 	for repetition in 0..io_repetitions(config) {
 		for (order_position, candidate) in
 			rotated_order(&candidates, repetition).into_iter().enumerate()
@@ -2980,7 +3699,16 @@ fn storage_engine_prototype_transport_probe() -> Result<(), Box<dyn Error>> {
 				)?;
 				continue;
 			}
-			let measurement = if let Some(queue_depth) = requested_qd {
+			let (measurement, measured_extent_pages, prefetch_depth, threads) = if candidate
+				== "H11_production_scatter_p1"
+			{
+				(
+					measure_hybrid_scatter(&hybrid, Arc::clone(&file), scan_pages)?,
+					hybrid.scatter_extent_capacity(),
+					1,
+					2,
+				)
+			} else if let Some(queue_depth) = requested_qd {
 				let (measurement, stats) =
 					measure_frame_ioring_requested_qd(&file, queue_depth, scan_pages)?;
 				writeln!(
@@ -2995,9 +3723,9 @@ fn storage_engine_prototype_transport_probe() -> Result<(), Box<dyn Error>> {
 					stats.submitted_sqes,
 					stats.completed_cqes,
 				)?;
-				measurement
+				(measurement, queue_depth, 0, 1)
 			} else {
-				measure_transport(candidate, &file, extent_pages, scan_pages)?
+				(measure_transport(candidate, &file, extent_pages, scan_pages)?, extent_pages, 0, 1)
 			};
 			artifacts.sample(
 				SampleMeta {
@@ -3010,10 +3738,10 @@ fn storage_engine_prototype_transport_probe() -> Result<(), Box<dyn Error>> {
 					pool_pages: config.pool_pages,
 					hot_pages: 0,
 					file_count: 1,
-					threads: 1,
+					threads,
 					queue_depth: requested_qd.unwrap_or(1),
-					extent_pages: requested_qd.unwrap_or(extent_pages),
-					prefetch_depth: 0,
+					extent_pages: measured_extent_pages,
+					prefetch_depth,
 					vm_reserved_bytes: 0,
 					vm_committed_bytes: 0,
 					hit_ratio: 0.0,
@@ -3125,7 +3853,7 @@ fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
 	let mut artifacts = Artifacts::open(config)?;
 	let mut candidates = vec!["T0_raw_preallocated", "T0_validated_preallocated"];
 	#[cfg(feature = "native-async-io")]
-	candidates.push("A1_rocks_bypass+T3_scatter+P1");
+	candidates.push("H11_production_scatter_p1");
 	candidates.push("R0_mmap_validated_first_touch");
 	let selector = candidate_selector_from_env("page_fault", &candidates)?;
 	if let Some(selected) = selector.as_deref() {
@@ -3140,6 +3868,11 @@ fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
 		&dataset.path,
 		DirectFileOpenMode::Overlapped,
 	)?);
+	#[cfg(feature = "native-async-io")]
+	let hybrid = HybridReadEngine::new(
+		NonZeroUsize::new(config.pool_pages)
+			.ok_or_else(|| io::Error::other("page-fault probe requires a nonzero pool"))?,
+	);
 	let mmap = MmapControl::map_unvalidated(&dataset)?;
 	let scan_pages = usize::try_from(config.dataset_pages)?;
 	let extent_pages = config.extent_pages.min(scan_pages).max(1);
@@ -3161,8 +3894,8 @@ fn storage_engine_prototype_page_fault_probe() -> Result<(), Box<dyn Error>> {
 					(measure_validated_direct_scan(&direct, &extents, &mut scratch, scan_pages)?, 0)
 				}
 				#[cfg(feature = "native-async-io")]
-				"A1_rocks_bypass+T3_scatter+P1" => {
-					(measure_scatter_prefetch(Arc::clone(&overlapped), &extents, 1, scan_pages)?, 1)
+				"H11_production_scatter_p1" => {
+					(measure_hybrid_scatter(&hybrid, Arc::clone(&overlapped), scan_pages)?, 1)
 				}
 				"R0_mmap_validated_first_touch" => (measure_validated_mmap_scan(&mmap)?, 0),
 				_ => return Err(io::Error::other("unknown page-fault candidate").into()),
@@ -3980,6 +4713,61 @@ fn measure_transport(
 		Ok((count * PAGE_SIZE) as u64)
 	})?;
 	finish_fixture_rss(measurement, rss_before)
+}
+
+/// Measures the production Rocks-like scatter path, including worker startup,
+/// ordered consumption, cancellation-safe join, and checksum validation.
+#[cfg(all(windows, feature = "native-async-io"))]
+fn measure_hybrid_scatter(
+	engine: &HybridReadEngine,
+	file: Arc<DirectFile>,
+	scan_pages: usize,
+) -> Result<Measurement, Box<dyn Error>> {
+	let rss_before = process_rss()?;
+	let extent_pages = engine.scatter_extent_capacity();
+	if extent_pages < 2 {
+		return Err(io::Error::other("hybrid transport budget cannot hold scatter P1").into());
+	}
+	let extent_count = scan_pages.div_ceil(extent_pages);
+	let timer = MeasurementTimer::start()?;
+	let mut cursor = engine.scatter_cursor(file, PageNo::new(0), scan_pages)?;
+	let mut completed_pages = 0_usize;
+	let mut samples = Vec::with_capacity(extent_count);
+	loop {
+		let extent_started = Instant::now();
+		let Some(extent) = cursor.next_extent() else {
+			break;
+		};
+		let extent = extent?;
+		if extent.first_page() != PageNo::new(u64::try_from(completed_pages)?) {
+			return Err(io::Error::other("production scatter cursor changed page order").into());
+		}
+		let page_count = extent.pages().len();
+		for page in extent.pages() {
+			black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+		}
+		completed_pages = completed_pages
+			.checked_add(page_count)
+			.ok_or_else(|| io::Error::other("production scatter page count overflow"))?;
+		samples.push(u64::try_from(extent_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+	}
+	cursor.finish()?;
+	let timing = timer.finish()?;
+	if completed_pages != scan_pages {
+		return Err(io::Error::other("production scatter cursor returned a partial scan").into());
+	}
+	let rss_after = process_rss()?;
+	let mut measurement = aggregate_measurement(
+		timing,
+		extent_count as u64,
+		scan_pages as u64 * PAGE_SIZE as u64,
+		rss_after.saturating_sub(rss_before),
+	);
+	samples.sort_unstable();
+	measurement.p50_ns = percentile(&samples, 50);
+	measurement.p95_ns = percentile(&samples, 95);
+	measurement.p99_ns = percentile(&samples, 99);
+	Ok(measurement)
 }
 
 /// Returns the explicit requested frame-SQE batch encoded by a candidate.
@@ -4956,8 +5744,9 @@ fn record_mixed_access_pair(
 		"R0_mmap_resident"
 	};
 	let mut candidates = vec!["R2_atomic_cache_all", r8_label];
+	#[cfg(all(windows, feature = "native-async-io"))]
 	if has_cold_reads && ioring_file.is_some() {
-		candidates.push("R8_epoch_hot+T2_ioring_qd32");
+		candidates.push("H11_production_r8_scope+T2_ioring_qd32");
 	}
 	candidates.push(mmap_label);
 	for (order_position, candidate) in
@@ -4980,7 +5769,8 @@ fn record_mixed_access_pair(
 				accesses,
 				config.latency_batch,
 			)?,
-			"R8_epoch_hot+T2_ioring_qd32" => measure_epoch_hot_ioring_accesses(
+			#[cfg(all(windows, feature = "native-async-io"))]
+			"H11_production_r8_scope+T2_ioring_qd32" => measure_epoch_hot_ioring_accesses(
 				datasets,
 				directs,
 				ioring_file.ok_or("IoRing mixed candidate has no overlapped file")?,
@@ -5006,7 +5796,7 @@ fn record_mixed_access_pair(
 				hot_pages: preload.len(),
 				file_count: datasets.len(),
 				threads: 1,
-				queue_depth: if candidate == "R8_epoch_hot+T2_ioring_qd32" {
+				queue_depth: if candidate == "H11_production_r8_scope+T2_ioring_qd32" {
 					32
 				} else {
 					1
@@ -5119,8 +5909,8 @@ fn measure_epoch_hot_bypass_accesses(
 	Ok((finish_fixture_rss(measurement, rss_before)?, 1.0))
 }
 
-/// Measures one R8 hot table while frame-oriented IoRing fetches the known
-/// sparse misses of each cursor window with QD32.
+/// Measures the production R8 scope while its frame-oriented IoRing fetches
+/// the known sparse misses of each cursor window with QD32.
 #[cfg(all(windows, feature = "native-async-io"))]
 #[allow(clippy::too_many_arguments, reason = "mixed IoRing dimensions remain explicit")]
 fn measure_epoch_hot_ioring_accesses(
@@ -5133,7 +5923,6 @@ fn measure_epoch_hot_ioring_accesses(
 	latency_batch: usize,
 ) -> Result<(Measurement, f64), Box<dyn Error>> {
 	const REQUESTED_QD: usize = 32;
-	const CURSOR_WINDOW: usize = REQUESTED_QD * 8;
 	if datasets.len() != 1
 		|| directs.len() != 1
 		|| accesses.is_empty()
@@ -5144,7 +5933,12 @@ fn measure_epoch_hot_ioring_accesses(
 	let rss_before = process_rss()?;
 	let dataset = &datasets[0];
 	let direct = &directs[0];
-	let pool = AtomicArenaBufferPool::new(NonZeroUsize::new(pool_pages).ok_or("zero pool")?);
+	let pool = HybridReadEngine::new(NonZeroUsize::new(pool_pages).ok_or("zero pool")?);
+	let effective_qd = pool.sparse_window_capacity().min(REQUESTED_QD);
+	if effective_qd == 0 {
+		return Err(io::Error::other("mixed IoRing transient budget has no sparse frame").into());
+	}
+	let cursor_window = effective_qd * 8;
 	let mut handles = Vec::with_capacity(preload.len());
 	for access in preload {
 		if !access.hot || usize::try_from(access.page_no.get())? != handles.len() {
@@ -5158,63 +5952,55 @@ fn measure_epoch_hot_ioring_accesses(
 				.ok_or_else(|| io::Error::other("mixed IoRing hot page did not resolve"))?,
 		);
 	}
-	let epoch = pool.read_epoch()?;
-	let page_table = handles
-		.iter()
-		.map(|handle| {
-			epoch
-				.get_resolved(handle)
-				.ok_or_else(|| io::Error::other("mixed IoRing hot page table became stale"))
-		})
-		.collect::<io::Result<Vec<_>>>()?;
+	let mut scope = pool.read_scope()?;
 	let mut cold_slots = vec![None; accesses.len()];
-	let mut cold_pages_by_window = Vec::with_capacity(accesses.len().div_ceil(CURSOR_WINDOW));
-	for (window_index, window) in accesses.chunks(CURSOR_WINDOW).enumerate() {
-		let mut pages = Vec::with_capacity(REQUESTED_QD);
+	let mut cold_reads_by_window = Vec::with_capacity(accesses.len().div_ceil(cursor_window));
+	for (window_index, window) in accesses.chunks(cursor_window).enumerate() {
+		let mut reads = Vec::with_capacity(effective_qd);
 		for (offset, access) in window.iter().enumerate() {
 			if !access.hot {
-				if pages.len() == REQUESTED_QD {
+				if reads.len() == effective_qd {
 					return Err(io::Error::other("mixed cursor window exceeds IoRing QD32").into());
 				}
-				cold_slots[window_index * CURSOR_WINDOW + offset] = Some(pages.len());
-				pages.push(access.page_no);
+				cold_slots[window_index * cursor_window + offset] = Some(reads.len());
+				reads.push((Arc::clone(file), access.page_no));
 			}
 		}
-		cold_pages_by_window.push(pages);
+		cold_reads_by_window.push(reads);
 	}
-	let requested_qd = NonZeroUsize::new(REQUESTED_QD).ok_or("zero IoRing QD")?;
-	let mut frames = (0..REQUESTED_QD).map(|_| Box::new(AlignedPage::zeroed())).collect::<Vec<_>>();
-	let mut ring = WindowsIoRing::new()?;
+	let mut cold_batch = None;
 	let measurement = measure_operations(
 		accesses.len() as u64,
 		latency_batch.min(accesses.len()).max(1),
 		PAGE_SIZE as u64,
 		|operation| {
 			let operation = operation as usize;
-			if operation % CURSOR_WINDOW == 0 {
-				let cold_pages = &cold_pages_by_window[operation / CURSOR_WINDOW];
-				let mut reads = frames[..cold_pages.len()]
-					.iter_mut()
-					.zip(cold_pages)
-					.map(|(frame, page_no)| FrameRead::new(file, *page_no, frame))
-					.collect::<Vec<_>>();
-				ring.read_frames_measured(&mut reads, requested_qd)?;
-				for read in &reads {
-					read.validate()?;
-				}
-				drop(reads);
+			if operation % cursor_window == 0 {
+				let reads = &cold_reads_by_window[operation / cursor_window];
+				cold_batch = if reads.is_empty() {
+					None
+				} else {
+					Some(pool.read_sparse_ioring(reads)?)
+				};
 			}
 			let access = accesses[operation];
 			if access.hot {
-				let page =
-					page_table.get(usize::try_from(access.page_no.get())?).ok_or_else(|| {
-						io::Error::other("mixed IoRing hot page is outside the table")
+				let handle =
+					handles.get(usize::try_from(access.page_no.get())?).ok_or_else(|| {
+						io::Error::other("mixed IoRing hot page is outside the resolved handles")
 					})?;
+				let page = scope
+					.get_resolved(handle)?
+					.ok_or_else(|| io::Error::other("mixed IoRing hot handle became stale"))?;
 				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
 			} else {
 				let slot = cold_slots[operation]
 					.ok_or_else(|| io::Error::other("mixed IoRing cold page has no frame slot"))?;
-				black_box(frames[slot].as_bytes()[PAGE_HEADER_SIZE]);
+				let page = cold_batch
+					.as_ref()
+					.and_then(|batch| batch.pages().get(slot))
+					.ok_or_else(|| io::Error::other("mixed IoRing cold page has no batch frame"))?;
+				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
 			}
 			Ok(())
 		},
@@ -5306,103 +6092,91 @@ fn measure_btree_sync_bypass(
 	finish_fixture_rss(measurement, rss_before)
 }
 
-/// Measures an R8 root table while one scatter worker reads and validates the
-/// disjoint leaf range in bounded extent order.
+/// Measures production R8 roots while the production scatter cursor reads and
+/// validates a disjoint leaf range in bounded extent order.
 #[cfg(all(windows, feature = "native-async-io"))]
 #[allow(clippy::too_many_arguments, reason = "mixed B+tree dimensions remain explicit")]
-fn measure_btree_epoch_scatter(
+fn measure_btree_hybrid_scatter(
 	dataset: &Dataset,
 	direct: &DirectFile,
 	file: Arc<DirectFile>,
+	pool_pages: usize,
 	root_pages: usize,
 	leaf_first: PageNo,
 	leaf_pages: usize,
-	extent_pages: usize,
-) -> Result<Measurement, Box<dyn Error>> {
+) -> Result<(Measurement, usize), Box<dyn Error>> {
 	let rss_before = process_rss()?;
-	let roots = AtomicArenaBufferPool::new(NonZeroUsize::new(root_pages).ok_or("zero roots")?);
+	let engine = HybridReadEngine::new(NonZeroUsize::new(pool_pages).ok_or("zero pool")?);
 	let mut handles = Vec::with_capacity(root_pages);
 	for root in 0..root_pages {
 		let page_no = PageNo::new(root as u64);
-		drop(roots.get_or_load(dataset.key(page_no), |target| {
+		drop(engine.get_or_load(dataset.key(page_no), |target| {
 			read_raw_reported(dataset, direct, page_no, target)
 		})?);
 		handles.push(
-			roots
+			engine
 				.resolve(dataset.key(page_no))
-				.ok_or_else(|| io::Error::other("R8 B+tree root did not resolve"))?,
+				.ok_or_else(|| io::Error::other("production B+tree root did not resolve"))?,
 		);
 	}
-	let epoch = roots.read_epoch()?;
-	let root_table = handles
-		.iter()
-		.map(|handle| {
-			epoch
-				.get_resolved(handle)
-				.ok_or_else(|| io::Error::other("R8 B+tree root table became stale"))
-		})
-		.collect::<io::Result<Vec<_>>>()?;
-	let extent_pages = extent_pages.min(leaf_pages).max(1);
-	let extents = (0..leaf_pages)
-		.step_by(extent_pages)
-		.map(|offset| {
-			(PageNo::new(leaf_first.get() + offset as u64), (leaf_pages - offset).min(extent_pages))
-		})
-		.collect::<Vec<_>>();
-	let extent_count = extents.len();
-	let buffers = ReusableBufferPool::with_factory(2, || {
-		(0..extent_pages).map(|_| Box::new(AlignedPage::zeroed())).collect::<Vec<_>>()
-	});
-	let worker_buffers = buffers.clone();
-	let worker_file = Arc::clone(&file);
 	let root_depth = root_pages.min(3);
+	let leaves_per_scope = MAX_READ_SCOPE_OPERATIONS.checked_div(root_depth).unwrap_or(0);
+	if leaves_per_scope == 0 {
+		return Err(io::Error::other("B+tree scope cannot cover one root path").into());
+	}
+	let extent_pages = engine.scatter_extent_capacity().min(leaf_pages);
 	let timer = MeasurementTimer::start()?;
-	let mut cursor =
-		PrototypePrefetchCursor::new(extents, NonZeroUsize::MIN, move |(first, count)| {
-			PREFETCH_SCATTER.with(|slot| {
-				let mut slot = slot.borrow_mut();
-				if slot.is_none() {
-					*slot = Some(ScatterReader::new()?);
+	let mut cursor = engine.scatter_cursor(file, leaf_first, leaf_pages)?;
+	let mut completed_pages = 0_usize;
+	let mut samples = Vec::with_capacity(leaf_pages.div_ceil(extent_pages));
+	loop {
+		let extent_started = Instant::now();
+		let Some(extent) = cursor.next_extent() else {
+			break;
+		};
+		let extent = extent?;
+		let extent_page_count = extent.pages().len();
+		for leaves in extent.pages().chunks(leaves_per_scope) {
+			let mut scope = engine.read_scope()?;
+			let mut table = scope.prepare_resolved_table(&handles[..root_depth])?;
+			let roots = scope
+				.get_resolved_window(&mut table, root_depth)?
+				.ok_or_else(|| io::Error::other("production B+tree root table became stale"))?;
+			for page in leaves {
+				for root in 0..root_depth {
+					let root = roots.page(root).ok_or_else(|| {
+						io::Error::other("production B+tree root window lost a frame")
+					})?;
+					black_box(root.as_bytes()[PAGE_HEADER_SIZE]);
 				}
-				let scatter = slot.as_mut().ok_or_else(|| {
-					FerrosGrynnError::storage_io_failure(
-						"mixed B+tree scatter context was not initialized",
-					)
-				})?;
-				let mut buffer = worker_buffers.take()?;
-				let mut pages =
-					buffer.buffer_mut()?[..count].iter_mut().map(Box::as_mut).collect::<Vec<_>>();
-				scatter.read_raw(&worker_file, first, &mut pages)?;
-				drop(pages);
-				Ok((first, count, buffer))
-			})
-		});
-	while let Some(result) = cursor.next() {
-		let (first, count, buffer) = result?;
-		for (offset, page) in buffer.buffer()?[..count].iter().enumerate() {
-			page.validate(PageNo::new(first.get() + offset as u64))?;
-		}
-		for page in &buffer.buffer()?[..count] {
-			for root in &root_table[..root_depth] {
-				black_box(root.as_bytes()[PAGE_HEADER_SIZE]);
+				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
 			}
-			black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+			completed_pages = completed_pages
+				.checked_add(leaves.len())
+				.ok_or_else(|| io::Error::other("B+tree leaf count overflow"))?;
 		}
-		drop(buffer);
+		samples.push(
+			u64::try_from(extent_started.elapsed().as_nanos() / extent_page_count as u128)
+				.unwrap_or(u64::MAX),
+		);
 	}
 	cursor.finish()?;
 	let timing = timer.finish()?;
-	if extent_count == 0 {
-		return Err(io::Error::other("mixed B+tree scan produced no extents").into());
+	if completed_pages != leaf_pages {
+		return Err(io::Error::other("production B+tree scan returned a partial leaf range").into());
 	}
-	buffers.ensure_all_returned()?;
 	let rss_delta = process_rss()?.saturating_sub(rss_before);
-	Ok(aggregate_measurement(
+	let mut measurement = aggregate_measurement(
 		timing,
 		leaf_pages as u64,
 		leaf_pages as u64 * (root_depth + 1) as u64 * PAGE_SIZE as u64,
 		rss_delta,
-	))
+	);
+	samples.sort_unstable();
+	measurement.p50_ns = percentile(&samples, 50);
+	measurement.p95_ns = percentile(&samples, 95);
+	measurement.p99_ns = percentile(&samples, 99);
+	Ok((measurement, extent_pages))
 }
 
 /// Measures mmap with hot roots prefaulted and every leaf checksum retained
@@ -5435,6 +6209,202 @@ fn measure_btree_mmap(
 		},
 	)?;
 	finish_fixture_rss(measurement, rss_before)
+}
+
+/// Builds four contiguous cold extents followed by one rotating hot extent.
+#[cfg(all(windows, feature = "native-async-io"))]
+fn fixed_hot_scan_runs(
+	page_count: usize,
+	hot_pages: usize,
+	extent_pages: usize,
+) -> Result<Vec<(PageNo, usize, bool)>, Box<dyn Error>> {
+	if extent_pages == 0
+		|| hot_pages == 0
+		|| !hot_pages.is_multiple_of(extent_pages)
+		|| page_count <= hot_pages
+	{
+		return Err(io::Error::other("invalid fixed-hot scan dimensions").into());
+	}
+	let cold_run_pages = extent_pages
+		.checked_mul(4)
+		.ok_or_else(|| io::Error::other("fixed-hot cold-run size overflow"))?;
+	let mut runs = Vec::new();
+	let mut cold_first = hot_pages;
+	let mut hot_first = 0_usize;
+	while cold_first < page_count {
+		let cold_pages = (page_count - cold_first).min(cold_run_pages);
+		runs.push((PageNo::new(cold_first as u64), cold_pages, false));
+		cold_first += cold_pages;
+		if cold_pages == cold_run_pages {
+			runs.push((PageNo::new(hot_first as u64), extent_pages, true));
+			hot_first = (hot_first + extent_pages) % hot_pages;
+		}
+	}
+	Ok(runs)
+}
+
+/// Times variable-sized physical runs while reporting latency per logical page.
+#[cfg(all(windows, feature = "native-async-io"))]
+fn measure_fixed_hot_runs<Consume>(
+	runs: &[(PageNo, usize, bool)],
+	rss_before: u64,
+	mut consume: Consume,
+) -> Result<Measurement, Box<dyn Error>>
+where
+	Consume: FnMut(PageNo, usize, bool) -> Result<(), Box<dyn Error>>,
+{
+	let operations = runs.iter().map(|(_, pages, _)| *pages as u64).sum::<u64>();
+	if operations == 0 {
+		return Err(io::Error::other("fixed-hot scan contains no logical pages").into());
+	}
+	let mut samples = Vec::with_capacity(runs.len());
+	let timer = MeasurementTimer::start()?;
+	for &(first, pages, hot) in runs {
+		let started = Instant::now();
+		consume(first, pages, hot)?;
+		samples
+			.push(u64::try_from(started.elapsed().as_nanos() / pages as u128).unwrap_or(u64::MAX));
+	}
+	let timing = timer.finish()?;
+	let mut measurement =
+		aggregate_measurement(timing, operations, operations.saturating_mul(PAGE_SIZE as u64), 0);
+	samples.sort_unstable();
+	measurement.p50_ns = percentile(&samples, 50);
+	measurement.p95_ns = percentile(&samples, 95);
+	measurement.p99_ns = percentile(&samples, 99);
+	finish_fixture_rss(measurement, rss_before)
+}
+
+/// Measures calibrated raw Direct reads for the complete fixed-hot order.
+#[cfg(all(windows, feature = "native-async-io"))]
+fn measure_fixed_hot_raw(
+	dataset: &Dataset,
+	runs: &[(PageNo, usize, bool)],
+	extent_pages: usize,
+) -> Result<Measurement, Box<dyn Error>> {
+	let rss_before = process_rss()?;
+	let direct = DirectFile::open_read_only(&dataset.path)?;
+	let mut scratch = aligned_pages(extent_pages);
+	measure_fixed_hot_runs(runs, rss_before, |first, pages, _hot| {
+		let mut completed = 0_usize;
+		while completed < pages {
+			let count = (pages - completed).min(extent_pages);
+			let page_no = PageNo::new(first.get() + completed as u64);
+			let output = &mut scratch[..count];
+			direct.read_pages_raw(page_no, output)?;
+			for page in output {
+				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+			}
+			completed += count;
+		}
+		Ok(())
+	})
+}
+
+/// Measures production R8 hot windows combined with non-admitting Scatter P1
+/// for cold scan runs.
+#[cfg(all(windows, feature = "native-async-io"))]
+fn measure_fixed_hot_hybrid(
+	dataset: &Dataset,
+	runs: &[(PageNo, usize, bool)],
+	hot_pages: usize,
+	pool_pages: usize,
+	extent_pages: usize,
+) -> Result<(Measurement, u64), Box<dyn Error>> {
+	let rss_before = process_rss()?;
+	let preload = DirectFile::open_read_only(&dataset.path)?;
+	let scatter = Arc::new(DirectFile::open_read_write_with_mode(
+		&dataset.path,
+		DirectFileOpenMode::Overlapped,
+	)?);
+	let engine = HybridReadEngine::new(NonZeroUsize::new(pool_pages).ok_or("zero pool")?);
+	for raw_page in 0..hot_pages {
+		let page_no = PageNo::new(raw_page as u64);
+		drop(engine.get_or_load(dataset.key(page_no), |target| {
+			read_raw_reported(dataset, &preload, page_no, target)
+		})?);
+	}
+	let prepare_scope = engine.read_scope()?;
+	let mut tables = Vec::with_capacity(hot_pages / extent_pages);
+	for first in (0..hot_pages).step_by(extent_pages) {
+		let handles = (first..first + extent_pages)
+			.map(|raw_page| {
+				let page_no = PageNo::new(raw_page as u64);
+				engine.resolve(dataset.key(page_no)).ok_or_else(|| {
+					io::Error::other("fixed-hot preload did not resolve a resident page")
+				})
+			})
+			.collect::<io::Result<Vec<_>>>()?;
+		tables.push(prepare_scope.prepare_resolved_table(&handles)?);
+	}
+	drop(prepare_scope);
+	let slow_path_before = engine.slow_path_counts();
+	let mut scope = engine.read_scope()?;
+	let mut hot_hits = 0_u64;
+	let measurement = measure_fixed_hot_runs(runs, rss_before, |first, pages, hot| {
+		if hot {
+			let table_index = usize::try_from(first.get())? / extent_pages;
+			let table = tables
+				.get_mut(table_index)
+				.ok_or_else(|| io::Error::other("fixed-hot table index is outside the hot set"))?;
+			let window = scope
+				.get_resolved_window(table, pages)?
+				.ok_or_else(|| io::Error::other("fixed-hot resident table became stale"))?;
+			for offset in 0..window.len() {
+				let page = window
+					.page(offset)
+					.ok_or_else(|| io::Error::other("fixed-hot resident window lost a page"))?;
+				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+			}
+			hot_hits = hot_hits.saturating_add(window.len() as u64);
+			return Ok(());
+		}
+
+		let mut cursor = engine.scatter_cursor(Arc::clone(&scatter), first, pages)?;
+		let mut completed = 0_usize;
+		while let Some(extent) = cursor.next_extent() {
+			let extent = extent?;
+			for page in extent.pages() {
+				black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+			}
+			completed = completed.saturating_add(extent.pages().len());
+		}
+		cursor.finish()?;
+		if completed != pages {
+			return Err(io::Error::other("fixed-hot scatter returned a partial cold run").into());
+		}
+		Ok(())
+	})?;
+	if engine.resident_count() != hot_pages || engine.slow_path_counts() != slow_path_before {
+		return Err(io::Error::other("fixed-hot bypass changed the resident hot set").into());
+	}
+	Ok((measurement, hot_hits))
+}
+
+/// Measures mmap with only the fixed hot set prefaulted and prevalidated.
+#[cfg(all(windows, feature = "native-async-io"))]
+fn measure_fixed_hot_mmap(
+	dataset: &Dataset,
+	runs: &[(PageNo, usize, bool)],
+	hot_pages: usize,
+) -> Result<Measurement, Box<dyn Error>> {
+	let rss_before = process_rss()?;
+	let mapping = MmapControl::map_unvalidated(dataset)?;
+	for raw_page in 0..hot_pages {
+		let page_no = PageNo::new(raw_page as u64);
+		validate_page_bytes(mapping_page(&mapping.mapping, page_no)?, page_no)?;
+	}
+	measure_fixed_hot_runs(runs, rss_before, |first, pages, hot| {
+		for offset in 0..pages {
+			let page_no = PageNo::new(first.get() + offset as u64);
+			if hot {
+				black_box(mapping.marker(page_no));
+			} else {
+				validate_page_bytes(mapping_page(&mapping.mapping, page_no)?, page_no)?;
+			}
+		}
+		Ok(())
+	})
 }
 
 /// Builds one global hot-set position for an interleaved source count.
@@ -5672,6 +6642,244 @@ where
 	})
 }
 
+/// Measures production R8 after resolving each bounded cursor window once.
+fn measure_production_resident_windows(
+	logical_operations: u64,
+	latency_batch: usize,
+	run_length: usize,
+	hot_pages: usize,
+	scope: &mut ReadScope<'_>,
+	handles: &[ResolvedFrameHandle],
+	table: &mut ResolvedPageTable,
+) -> Result<Measurement, Box<dyn Error>> {
+	let rss_before = process_rss()?;
+	let total_runs = logical_operations.div_ceil(run_length as u64);
+	let sample_runs = latency_batch.div_ceil(run_length).max(1) as u64;
+	let mut samples = Vec::with_capacity(total_runs.div_ceil(sample_runs) as usize);
+	let mut window_handles = Vec::with_capacity(MAX_READ_SCOPE_OPERATIONS);
+	let use_complete_hot_table = hot_pages <= MAX_READ_SCOPE_OPERATIONS;
+	let timer = MeasurementTimer::start()?;
+	let mut completed_runs = 0_u64;
+	let mut completed_operations = 0_u64;
+	while completed_runs < total_runs {
+		let runs_in_sample = (total_runs - completed_runs).min(sample_runs);
+		let sample_started = Instant::now();
+		let sample_operations_before = completed_operations;
+		let mut sample_offset = 0_u64;
+		while sample_offset < runs_in_sample {
+			let runs_in_window = usize::try_from(
+				(runs_in_sample - sample_offset).min(MAX_READ_SCOPE_OPERATIONS as u64),
+			)?;
+			window_handles.clear();
+			if !use_complete_hot_table {
+				for offset in 0..runs_in_window as u64 {
+					let page_no = resident_page(completed_runs + sample_offset + offset, hot_pages);
+					window_handles.push(handles[page_no.get() as usize]);
+				}
+			}
+			if !use_complete_hot_table {
+				scope.update_resolved_table_owned(table, &mut window_handles)?;
+			}
+			let window = scope.get_resolved_window(table, runs_in_window)?.ok_or_else(|| {
+				FerrosGrynnError::storage_io_failure("production window page became stale")
+			})?;
+			for offset in 0..runs_in_window {
+				let page_index = if use_complete_hot_table {
+					let run = completed_runs + sample_offset + offset as u64;
+					resident_page(run, hot_pages).get() as usize
+				} else {
+					offset
+				};
+				let page = window.page(page_index).ok_or_else(|| {
+					FerrosGrynnError::storage_io_failure(
+						"production window lost its prepared frame",
+					)
+				})?;
+				let remaining = logical_operations - completed_operations;
+				let logical_count = remaining.min(run_length as u64);
+				for logical in 0..logical_count as usize {
+					black_box(page.as_bytes()[resident_marker_offset(logical)]);
+				}
+				completed_operations += logical_count;
+			}
+			drop(window);
+			sample_offset += runs_in_window as u64;
+		}
+		let sample_operations = completed_operations - sample_operations_before;
+		let elapsed = sample_started.elapsed().as_nanos();
+		samples.push(u64::try_from(elapsed / u128::from(sample_operations)).unwrap_or(u64::MAX));
+		completed_runs += runs_in_sample;
+	}
+	let timing = timer.finish()?;
+	let rss_after = process_rss()?;
+	samples.sort_unstable();
+	Ok(Measurement {
+		elapsed: timing.elapsed,
+		cpu_time: timing.cpu_time,
+		operations: logical_operations,
+		useful_bytes: logical_operations.saturating_mul(PAGE_SIZE as u64),
+		p50_ns: percentile(&samples, 50),
+		p95_ns: percentile(&samples, 95),
+		p99_ns: percentile(&samples, 99),
+		rss_delta: rss_after.saturating_sub(rss_before),
+	})
+}
+
+/// Measures read-only mmap markers after every worker reaches the start gate.
+fn measure_mmap_resident_concurrency(
+	mmap: &MmapControl,
+	hot_pages: usize,
+	operations: u64,
+	threads: usize,
+	worker_affinity_masks: Option<&[usize]>,
+) -> Result<Measurement, Box<dyn Error>> {
+	#[cfg(not(windows))]
+	let _ = worker_affinity_masks;
+	let readiness = Barrier::new(threads + 1);
+	let timed_start = Barrier::new(threads + 1);
+	let timing = thread::scope(|scope| -> Result<MeasurementTiming, Box<dyn Error>> {
+		let mut workers = Vec::with_capacity(threads);
+		for worker in 0..threads {
+			let readiness_ref = &readiness;
+			let timed_start_ref = &timed_start;
+			let (start, count) = partition_worker_operations(operations, threads, worker);
+			workers.push(scope.spawn(move || -> io::Result<()> {
+				#[cfg(windows)]
+				let affinity = worker_affinity_masks.map(|masks| pin_current_thread(masks[worker])).transpose();
+				readiness_ref.wait();
+				timed_start_ref.wait();
+				#[cfg(windows)]
+				let _affinity = affinity?;
+				for operation in start..start + count {
+					black_box(mmap.marker(resident_page(operation, hot_pages)));
+				}
+				Ok(())
+			}));
+		}
+		readiness.wait();
+		let timer = MeasurementTimer::start()?;
+		timed_start.wait();
+		for worker in workers {
+			worker
+				.join()
+				.map_err(|_panic| io::Error::other("mmap concurrency worker panicked"))??;
+		}
+		Ok(timer.finish()?)
+	})?;
+	Ok(aggregate_measurement(timing, operations, operations.saturating_mul(PAGE_SIZE as u64), 0))
+}
+
+/// Measures production R8 windows with independent worker-owned read scopes.
+fn measure_production_resident_concurrency(
+	engine: &HybridReadEngine,
+	handles: &[ResolvedFrameHandle],
+	hot_pages: usize,
+	operations: u64,
+	threads: usize,
+	worker_affinity_masks: Option<&[usize]>,
+) -> Result<Measurement, Box<dyn Error>> {
+	#[cfg(not(windows))]
+	let _ = worker_affinity_masks;
+	let readiness = Barrier::new(threads + 1);
+	let timed_start = Barrier::new(threads + 1);
+	let timing = thread::scope(|scope| -> Result<MeasurementTiming, Box<dyn Error>> {
+		let mut workers = Vec::with_capacity(threads);
+		for worker in 0..threads {
+			let readiness_ref = &readiness;
+			let timed_start_ref = &timed_start;
+			let (start, count) = partition_worker_operations(operations, threads, worker);
+			workers.push(scope.spawn(move || -> FerrosGrynnResult<()> {
+				#[cfg(windows)]
+				let affinity = worker_affinity_masks.map(|masks| pin_current_thread(masks[worker])).transpose();
+				let prepared = (|| {
+					let scope = engine.read_scope()?;
+					let table = if hot_pages <= MAX_READ_SCOPE_OPERATIONS {
+						scope.prepare_resolved_table(&handles[..hot_pages])?
+					} else {
+						scope.prepare_resolved_table(&[])?
+					};
+					Ok::<_, FerrosGrynnError>((scope, table))
+				})();
+				readiness_ref.wait();
+				timed_start_ref.wait();
+				#[cfg(windows)]
+				let _affinity = affinity.map_err(|error| {
+					FerrosGrynnError::storage_io_failure(format!("worker affinity failed: {error}"))
+				})?;
+				let (mut scope, mut table) = prepared?;
+				consume_production_resident_operations(
+					start, count, hot_pages, &mut scope, handles, &mut table,
+				)
+			}));
+		}
+		readiness.wait();
+		let timer = MeasurementTimer::start()?;
+		timed_start.wait();
+		for worker in workers {
+			worker
+				.join()
+				.map_err(|_panic| io::Error::other("production concurrency worker panicked"))??;
+		}
+		Ok(timer.finish()?)
+	})?;
+	Ok(aggregate_measurement(timing, operations, operations.saturating_mul(PAGE_SIZE as u64), 0))
+}
+
+/// Consumes one worker's operation range through bounded production windows.
+fn consume_production_resident_operations(
+	start: u64,
+	operations: u64,
+	hot_pages: usize,
+	scope: &mut ReadScope<'_>,
+	handles: &[ResolvedFrameHandle],
+	table: &mut ResolvedPageTable,
+) -> FerrosGrynnResult<()> {
+	let use_complete_hot_table = hot_pages <= MAX_READ_SCOPE_OPERATIONS;
+	let mut window_handles = Vec::with_capacity(MAX_READ_SCOPE_OPERATIONS);
+	let mut completed = 0_u64;
+	while completed < operations {
+		let window_len =
+			usize::try_from((operations - completed).min(MAX_READ_SCOPE_OPERATIONS as u64))
+				.map_err(|error| FerrosGrynnError::storage_io_failure(error.to_string()))?;
+		window_handles.clear();
+		if !use_complete_hot_table {
+			for offset in 0..window_len as u64 {
+				let page_no = resident_page(start + completed + offset, hot_pages);
+				window_handles.push(handles[page_no.get() as usize]);
+			}
+			scope.update_resolved_table_owned(table, &mut window_handles)?;
+		}
+		let window = scope.get_resolved_window(table, window_len)?.ok_or_else(|| {
+			FerrosGrynnError::storage_io_failure("concurrent production window became stale")
+		})?;
+		for offset in 0..window_len {
+			let page_index = if use_complete_hot_table {
+				resident_page(start + completed + offset as u64, hot_pages).get() as usize
+			} else {
+				offset
+			};
+			let page = window.page(page_index).ok_or_else(|| {
+				FerrosGrynnError::storage_io_failure("concurrent production window lost its frame")
+			})?;
+			black_box(page.as_bytes()[PAGE_HEADER_SIZE]);
+		}
+		drop(window);
+		completed += window_len as u64;
+	}
+	Ok(())
+}
+
+/// Splits a fixed operation count into contiguous, non-overlapping ranges.
+fn partition_worker_operations(operations: u64, threads: usize, worker: usize) -> (u64, u64) {
+	let threads = threads as u64;
+	let worker = worker as u64;
+	let common = operations / threads;
+	let remainder = operations % threads;
+	let count = common + u64::from(worker < remainder);
+	let start = worker * common + worker.min(remainder);
+	(start, count)
+}
+
 /// Returns one nearest-rank percentile from sorted integer samples.
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
 	if sorted.is_empty() {
@@ -5872,11 +7080,12 @@ fn process_memory_snapshot() -> io::Result<ProcessMemorySnapshot> {
 	let mut counters = PROCESS_MEMORY_COUNTERS::default();
 	counters.cb = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>())
 		.map_err(|_error| io::Error::other("process memory counter size exceeds u32"))?;
-	// SAFETY: `GetCurrentProcess` returns the documented non-owning pseudo-handle.
+	// SAFETY: `GetCurrentProcess` returns the documented non-owning
+	// pseudo-handle.
 	let process = unsafe { GetCurrentProcess() };
 	let counter_bytes = counters.cb;
-	// SAFETY: `process` identifies the current process and `counters` is a live,
-	// correctly sized writable `PROCESS_MEMORY_COUNTERS` value.
+	// SAFETY: `process` identifies the current process and `counters` is a
+	// live, correctly sized writable `PROCESS_MEMORY_COUNTERS` value.
 	unsafe { GetProcessMemoryInfo(process, &raw mut counters, counter_bytes) }
 		.map_err(|error| io::Error::other(format!("GetProcessMemoryInfo failed: {error}")))?;
 	Ok(ProcessMemorySnapshot {
@@ -6042,6 +7251,50 @@ const fn supports_fenced_tsc(maximum_extended_leaf: u32, feature_edx: u32, power
 		&& power_edx & (1 << 8) != 0
 }
 
+/// Restores the current thread's previous Windows processor-affinity mask.
+#[cfg(windows)]
+struct ThreadAffinityRestore {
+	/// Current-thread pseudo-handle accepted by the affinity API.
+	thread: windows::Win32::Foundation::HANDLE,
+	/// Exact nonzero mask returned when affinity was changed.
+	mask: usize,
+}
+
+#[cfg(windows)]
+impl Drop for ThreadAffinityRestore {
+	fn drop(&mut self) {
+		use windows::Win32::System::Threading::SetThreadAffinityMask;
+
+		// SAFETY: restores the exact nonzero mask returned by Windows for the
+		// same current-thread pseudo-handle.
+		unsafe {
+			SetThreadAffinityMask(self.thread, self.mask);
+		}
+	}
+}
+
+/// Pins the calling Windows thread until the returned guard is dropped.
+#[cfg(windows)]
+fn pin_current_thread(mask: usize) -> io::Result<ThreadAffinityRestore> {
+	use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+
+	if mask == 0 {
+		return Err(io::Error::other("thread affinity mask must be nonzero"));
+	}
+	// SAFETY: returns the documented non-owning pseudo-handle for this thread.
+	let thread = unsafe { GetCurrentThread() };
+	// SAFETY: `thread` identifies the calling thread and `mask` is nonzero;
+	// Windows validates whether the selected processors belong to the process.
+	let previous = unsafe { SetThreadAffinityMask(thread, mask) };
+	if previous == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	Ok(ThreadAffinityRestore {
+		thread,
+		mask: previous,
+	})
+}
+
 /// Measures fenced TSC overhead and resolved-hit cycles on one pinned CPU.
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn tsc_resolved_probe(
@@ -6051,8 +7304,6 @@ fn tsc_resolved_probe(
 	artifacts: &mut Artifacts,
 ) -> Result<bool, Box<dyn Error>> {
 	use std::arch::x86_64::{__cpuid, __rdtscp, _mm_lfence};
-
-	use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
 
 	#[inline(always)]
 	fn fenced_tsc(aux: &mut u32) -> u64 {
@@ -6076,30 +7327,8 @@ fn tsc_resolved_probe(
 	if !supports_fenced_tsc(maximum, feature_edx, power_edx) {
 		return Ok(false);
 	}
-	// SAFETY: pseudo-handle is valid for the current thread; zero reports
-	// failure and a nonzero previous mask is restored by the local guard.
-	let thread = unsafe { GetCurrentThread() };
-	// SAFETY: `thread` is the current-thread pseudo-handle and mask one selects
-	// one valid processor on every supported Windows process.
-	let previous = unsafe { SetThreadAffinityMask(thread, 1) };
-	if previous == 0 {
+	let Ok(_restore) = pin_current_thread(1) else {
 		return Ok(false);
-	}
-	struct AffinityRestore {
-		thread: windows::Win32::Foundation::HANDLE,
-		mask: usize,
-	}
-	impl Drop for AffinityRestore {
-		fn drop(&mut self) {
-			// SAFETY: restores the exact nonzero mask returned by Windows.
-			unsafe {
-				SetThreadAffinityMask(self.thread, self.mask);
-			}
-		}
-	}
-	let _restore = AffinityRestore {
-		thread,
-		mask: previous,
 	};
 	let mut empty = Vec::with_capacity(10_000);
 	let mut resolved = Vec::with_capacity(10_000);
@@ -6202,6 +7431,18 @@ mod harness_contract_tests {
 		assert!(matches!(
 			require_resident_isolated_candidate(Some("R0_mmap")),
 			Ok(ResidentIsolatedCandidate::Mmap)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("H11_production_r8_generic")),
+			Ok(ResidentIsolatedCandidate::ProductionGeneric)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("H11_production_r8_scope")),
+			Ok(ResidentIsolatedCandidate::ProductionScope)
+		));
+		assert!(matches!(
+			require_resident_isolated_candidate(Some("H11_production_r8_window")),
+			Ok(ResidentIsolatedCandidate::ProductionWindow)
 		));
 		assert!(matches!(
 			require_resident_isolated_candidate(Some("R3_notify_resolved")),

@@ -61,8 +61,7 @@ struct NativeRequest {
 	operation: NativeOperation,
 }
 
-/// Test-only disjoint destination used by the frame-oriented IoRing probe.
-#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+/// Disjoint destination used by frame-oriented IoRing reads.
 pub struct FrameRead<'a> {
 	/// File retained by the benchmark for the complete synchronous submission.
 	file: &'a Arc<crate::storage::direct::DirectFile>,
@@ -72,7 +71,6 @@ pub struct FrameRead<'a> {
 	frame: &'a mut AlignedPage,
 }
 
-#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 impl<'a> FrameRead<'a> {
 	/// Describes one frame-oriented read request.
 	pub fn new(
@@ -235,9 +233,9 @@ impl WindowsIoRing {
 				extent.file.prepare_read_extent(extent.first_page, extent.page_count)?;
 			let byte_len = checked_byte_len(extent.page_count)?;
 			// SAFETY: validate_extent_layout proved every range is non-empty,
-			// in bounds, ordered, and disjoint. AlignedPage elements are exactly
-			// PAGE_SIZE bytes, and `pages` remains exclusively borrowed until all
-			// submitted completions are drained.
+			// in bounds, ordered, and disjoint. AlignedPage elements are
+			// exactly PAGE_SIZE bytes, and `pages` remains exclusively
+			// borrowed until all submitted completions are drained.
 			let buffer = unsafe { pages.as_mut_ptr().add(range.start).cast::<c_void>() };
 			requests.push(NativeRequest {
 				file: extent.file.raw_handle()?,
@@ -290,8 +288,8 @@ impl WindowsIoRing {
 				extent.file.prepare_read_extent(extent.first_page, extent.page_count)?;
 			let byte_len = checked_byte_len(extent.page_count)?;
 			// SAFETY: the caller-validated ranges are non-empty, in bounds,
-			// ordered, and disjoint. The measured executor drains every CQE before
-			// this exclusive page borrow returns.
+			// ordered, and disjoint. The measured executor drains every CQE
+			// before this exclusive page borrow returns.
 			let buffer = unsafe { pages.as_mut_ptr().add(range.start).cast::<c_void>() };
 			requests.push(NativeRequest {
 				file: extent.file.raw_handle()?,
@@ -305,7 +303,6 @@ impl WindowsIoRing {
 	}
 
 	/// Reads one page per SQE into caller-owned disjoint frames.
-	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 	pub fn read_frames(&mut self, reads: &mut [FrameRead<'_>]) -> FerrosGrynnResult<()> {
 		let requests = Self::frame_requests(reads)?;
 		self.execute(&requests)
@@ -329,7 +326,6 @@ impl WindowsIoRing {
 	}
 
 	/// Builds one native request per caller-owned disjoint frame.
-	#[cfg(any(test, feature = "storage-engine-prototype-api"))]
 	fn frame_requests(reads: &mut [FrameRead<'_>]) -> FerrosGrynnResult<Vec<NativeRequest>> {
 		let mut requests = Vec::with_capacity(reads.len());
 		for read in reads {
@@ -444,9 +440,10 @@ impl WindowsIoRing {
 			let buffer = raw_buffer_ref(request.buffer);
 			let result = match request.operation {
 				NativeOperation::Read => {
-					// SAFETY: the file handle is retained by FilePageExtent, the aligned
-					// buffer remains borrowed until every CQE is drained, byte lengths and
-					// offsets were checked, and this ring is exclusively mutex-owned.
+					// SAFETY: the file handle is retained by FilePageExtent,
+					// the aligned buffer remains borrowed until every CQE
+					// is drained, byte lengths and offsets were checked,
+					// and this ring is exclusively mutex-owned.
 					unsafe {
 						BuildIoRingReadFile(
 							self.ring,
@@ -460,9 +457,10 @@ impl WindowsIoRing {
 					}
 				}
 				NativeOperation::Write => {
-					// SAFETY: the file handle is retained by FilePageExtent, the aligned
-					// buffer remains borrowed until every CQE is drained, byte lengths and
-					// offsets were checked, and this ring is exclusively mutex-owned.
+					// SAFETY: the file handle is retained by FilePageExtent,
+					// the aligned buffer remains borrowed until every CQE
+					// is drained, byte lengths and offsets were checked,
+					// and this ring is exclusively mutex-owned.
 					unsafe {
 						BuildIoRingWriteFile(
 							self.ring,
@@ -486,9 +484,9 @@ impl WindowsIoRing {
 			))
 		})?;
 		let mut submitted = 0_u32;
-		// SAFETY: exactly `requests.len()` SQEs were built into this exclusively
-		// owned ring, the wait is bounded by that count, and `submitted` is a
-		// valid output pointer for the call.
+		// SAFETY: exactly `requests.len()` SQEs were built into this
+		// exclusively owned ring, the wait is bounded by that count, and
+		// `submitted` is a valid output pointer for the call.
 		unsafe {
 			SubmitIoRing(
 				self.ring,

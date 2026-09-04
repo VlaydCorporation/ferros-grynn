@@ -271,6 +271,31 @@ types при необходимости расширяется общими ти
    dependency-ordered production migration plan записаны в итоговом разделе
    отчёта. Production path по-прежнему не изменён.
 
+3.2. **Внедрение гибридного storage engine** — зависит от **3.1**.
+   Перенести в production подтверждённую Pareto-комбинацию: R8 atomic arena
+   для resident cursor windows, Rocks-like bypass + `ReadFileScatter` + P1
+   для последовательных ranges, frame-IoRing QD32 для заранее известного
+   sparse frontier и sync validated Direct для непредсказуемых miss.
+   Сохранить page/WAL/checkpoint contract и режимы Full In Memory, Full On Disk
+   и Query To Memory. После correctness/performance gates выполнить единый
+   cutover без постоянного runtime-переключателя и удалить старый Clock-Pro.
+   Подробная архитектура, порядок, gates и влияние на режимы зафиксированы в
+   [`storage_engine_hybrid_integration_plan.md`](storage_engine_hybrid_integration_plan.md).
+
+   **Статус (2026-09-04): H0-H13 выполнены, production cutover завершён.**
+   `SyncPageManager` использует единый `HybridReadEngine`; старый Clock-Pro
+   исключён из production-сборки и сохранён только как test/prototype control.
+   Query path стал streaming, Mode 3 получает owned двухпроходную
+   materialization. Correctness и обязательные performance floors пройдены;
+   точные результаты и ограничения находятся в
+   [`storage_engine_hybrid_integration_report.md`](reports/storage_engine_hybrid_integration_report.md),
+   компактные данные — в
+   [`storage_engine_hybrid_integration_results.csv`](reports/storage_engine_hybrid_integration_results.csv).
+   Known-sparse IoRing transport готов и проверен, но будет выбран production
+   router только после того, как физический graph/property cursor предоставит
+   доказуемое bounded lookahead-окно. H14 Mutable delta flush остаётся
+   отдельной работой после этапа 4.
+
 4. **Delta-oriented mutation foundation** — зависит от **3**.  
    Убрать полную материализацию local-графа из обычного `edit_graph`; формировать atom/page delta непосредственно из point mutations. Учесть свойства, крупную adjacency, составные `RecordId` и nested graph payload в write-set limit. После профиля сохранить лимит 256 МиБ; private spill реализовывать только при подтверждённом неделимом workload, который нельзя обработать сегментированным импортом.
 

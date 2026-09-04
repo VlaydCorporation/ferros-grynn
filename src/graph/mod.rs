@@ -52,8 +52,8 @@ pub use forest::{
 	Tree,
 	TreeOrientation,
 };
-pub(crate) use general::merge_transaction_graph;
 pub use general::{FrozenGraph, Graph, MutableGraph};
+pub(crate) use general::{merge_transaction_graph, remap_topology};
 pub use hypergraph::{FrozenHypergraph, Hypergraph, MutableHypergraph};
 pub use id::{AtomId, AtomKind};
 pub use live::{LiveEvent, LiveGraph, LiveReadGuard, LiveUpdate};

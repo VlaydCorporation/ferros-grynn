@@ -111,6 +111,27 @@ pub(in crate::storage) fn visit_primary_index(
 	root: PageNo,
 	mut visit: impl FnMut(&[u8], DiskAtomRef) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<()> {
+	let mut page_no = leftmost_primary_leaf(&mut read_page, root)?;
+
+	let mut previous_key = None::<Vec<u8>>;
+	let mut visited = BTreeSet::new();
+	while page_no != PageNo::NULL {
+		if !visited.insert(page_no) {
+			return Err(invalid_index("primary B+tree leaf chain contains a cycle"));
+		}
+		let mut page = AlignedPage::zeroed();
+		read_page(page_no, &mut page)?;
+		page_no = visit_primary_leaf_page(page_no, &page, &mut previous_key, &mut visit)?;
+	}
+	Ok(())
+}
+
+/// Resolves the first leaf while retaining point-read semantics for internal
+/// index pages.
+pub(in crate::storage) fn leftmost_primary_leaf(
+	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	root: PageNo,
+) -> FerrosGrynnResult<PageNo> {
 	let mut page_no = root;
 	let mut visited = BTreeSet::new();
 	for _depth in 0..MAX_BTREE_DEPTH {
@@ -121,36 +142,34 @@ pub(in crate::storage) fn visit_primary_index(
 		read_page(page_no, &mut page)?;
 		let header = page.validate(page_no)?;
 		match header.page_type() {
-			PageType::IndexUniqueBtreeLeaf => break,
+			PageType::IndexUniqueBtreeLeaf => return Ok(page_no),
 			PageType::IndexBtreeInternal => page_no = select_internal_child(&page, &[])?,
 			_ => return Err(invalid_index("primary B+tree contains an invalid page type")),
 		}
 	}
+	Err(invalid_index("primary B+tree exceeds its maximum depth"))
+}
 
-	let mut previous_key = None::<Vec<u8>>;
-	visited.clear();
-	while page_no != PageNo::NULL {
-		if !visited.insert(page_no) {
-			return Err(invalid_index("primary B+tree leaf chain contains a cycle"));
-		}
-		let mut page = AlignedPage::zeroed();
-		read_page(page_no, &mut page)?;
-		let header = page.validate(page_no)?;
-		if header.page_type() != PageType::IndexUniqueBtreeLeaf {
-			return Err(invalid_index("primary B+tree leaf link targets an invalid page"));
-		}
-		let bytes = page.as_bytes();
-		let (count, area_start) = validate_leaf_layout(&page)?;
-		for index in 0..count {
-			let (key, atom) = leaf_entry(bytes, area_start, count, index)?;
-			if previous_key.as_deref().is_some_and(|previous| previous >= key) {
-				return Err(invalid_index("primary B+tree leaf keys are not strictly ordered"));
-			}
-			let atom = DiskAtomRef::from_raw(atom)?;
-			visit(key, atom)?;
-			previous_key = Some(key.to_vec());
-		}
-		page_no = PageNo::new(read_u64(bytes, LEAF_NEXT_OFFSET));
+/// Validates and visits one unique leaf, returning its exact successor.
+pub(in crate::storage) fn visit_primary_leaf_page(
+	page_no: PageNo,
+	page: &AlignedPage,
+	previous_key: &mut Option<Vec<u8>>,
+	visit: &mut impl FnMut(&[u8], DiskAtomRef) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<PageNo> {
+	let header = page.validate(page_no)?;
+	if header.page_type() != PageType::IndexUniqueBtreeLeaf {
+		return Err(invalid_index("primary B+tree leaf link targets an invalid page"));
 	}
-	Ok(())
+	let bytes = page.as_bytes();
+	let (count, area_start) = validate_leaf_layout(page)?;
+	for index in 0..count {
+		let (key, atom) = leaf_entry(bytes, area_start, count, index)?;
+		if previous_key.as_deref().is_some_and(|previous| previous >= key) {
+			return Err(invalid_index("primary B+tree leaf keys are not strictly ordered"));
+		}
+		visit(key, DiskAtomRef::from_raw(atom)?)?;
+		*previous_key = Some(key.to_vec());
+	}
+	Ok(PageNo::new(read_u64(bytes, LEAF_NEXT_OFFSET)))
 }

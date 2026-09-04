@@ -161,7 +161,8 @@ impl VmReservation {
 			windows_failure("reserve VM home address range", windows::core::Error::from_thread())
 		})?;
 		if !(base.as_ptr() as usize).is_multiple_of(align_of::<AlignedPage>()) {
-			// SAFETY: the complete range was just reserved and no references exist.
+			// SAFETY: the complete range was just reserved and no references
+			// exist.
 			drop(unsafe { VirtualFree(base.as_ptr().cast::<c_void>(), 0, MEM_RELEASE) });
 			return Err(FerrosGrynnError::storage_io_failure(
 				"VM reservation base is not database-page aligned",
@@ -196,8 +197,8 @@ impl VmReservation {
 	/// Commits exactly one database page at its fixed reserved address.
 	fn commit(&self, page_index: usize) -> FerrosGrynnResult<NonNull<AlignedPage>> {
 		let address = self.page_address(page_index)?;
-		// SAFETY: replacement serializes commit/decommit and calls this only for
-		// a free, currently decommitted page-sized subrange.
+		// SAFETY: replacement serializes commit/decommit and calls this only
+		// for a free, currently decommitted page-sized subrange.
 		let committed = unsafe {
 			VirtualAlloc(
 				Some(address.as_ptr().cast::<c_void>()),
@@ -210,7 +211,8 @@ impl VmReservation {
 			windows_failure("commit VM home page", windows::core::Error::from_thread())
 		})?;
 		if committed != address {
-			// SAFETY: this call decommits only the unexpected page just committed.
+			// SAFETY: this call decommits only the unexpected page just
+			// committed.
 			drop(unsafe {
 				VirtualFree(committed.as_ptr().cast::<c_void>(), PAGE_SIZE, MEM_DECOMMIT)
 			});
@@ -235,8 +237,9 @@ impl VmReservation {
 			));
 		}
 		// SAFETY: cache callers hold replacement and either uniquely own a
-		// `Loading` page or reached `Evicting` with zero pins and no native I/O.
-		// Lifecycle probes likewise hold exclusive ownership of their reservation.
+		// `Loading` page or reached `Evicting` with zero pins and no native
+		// I/O. Lifecycle probes likewise hold exclusive ownership of their
+		// reservation.
 		unsafe { VirtualFree(address.as_ptr().cast::<c_void>(), PAGE_SIZE, MEM_DECOMMIT) }
 			.map_err(|source| windows_failure("decommit VM home page", source))
 	}
@@ -318,8 +321,9 @@ pub(super) fn probe_vm_lifecycle() -> FerrosGrynnResult<VmLifecycleProbe> {
 impl Drop for VmReservation {
 	/// Releases the complete range after every guard and cache operation ended.
 	fn drop(&mut self) {
-		// SAFETY: cache ownership guarantees no page guard or loader can outlive
-		// the source; `MEM_RELEASE` requires size zero for the original base.
+		// SAFETY: cache ownership guarantees no page guard or loader can
+		// outlive the source; `MEM_RELEASE` requires size zero for the
+		// original base.
 		drop(unsafe { VirtualFree(self.base.as_ptr().cast::<c_void>(), 0, MEM_RELEASE) });
 	}
 }
@@ -503,8 +507,9 @@ impl<'cache> VmBatchReservation<'cache> {
 		let mut pages = Vec::with_capacity(self.reservations.len());
 		for reservation in &self.reservations {
 			let address = self.cache.home_address(reservation.locator)?;
-			// SAFETY: each reservation owns a different global budget slot and a
-			// different fixed `Loading` page; no reader may pin it before publish.
+			// SAFETY: each reservation owns a different global budget slot and
+			// a different fixed `Loading` page; no reader may pin it before
+			// publish.
 			pages.push(unsafe { &mut *address.as_ptr() });
 		}
 		Ok(pages)
@@ -520,8 +525,9 @@ impl<'cache> VmBatchReservation<'cache> {
 		for reservation in &self.reservations {
 			let address = self.cache.home_address(reservation.locator)?;
 			// SAFETY: publication consumes the unique batch owner after every
-			// mutable page borrow has ended. The address remains committed and in
-			// `Loading`, so no reader or replacement owner can alias these bytes.
+			// mutable page borrow has ended. The address remains committed and
+			// in `Loading`, so no reader or replacement owner can alias
+			// these bytes.
 			let page = unsafe { &*address.as_ptr() };
 			let actual = page.validate(reservation.key.page_no())?;
 			validate_loaded_header(reservation.key, actual)?;
@@ -1566,10 +1572,10 @@ impl VmCache {
 		if pins(previous) != 1 || self.capacity_waiters.load(Ordering::SeqCst) == 0 {
 			return;
 		}
-		// The waiter registers and rechecks VM state with `SeqCst` while holding
-		// `replacement`. Therefore either that recheck observes this last-pin
-		// release or this load observes the registration; taking the mutex then
-		// closes the condvar enqueue window.
+		// The waiter registers and rechecks VM state with `SeqCst` while
+		// holding `replacement`. Therefore either that recheck observes this
+		// last-pin release or this load observes the registration; taking the
+		// mutex then closes the condvar enqueue window.
 		let _replacement = self.replacement.lock();
 		if self.capacity_waiters.load(Ordering::SeqCst) > 0 {
 			self.capacity_available.notify_one();

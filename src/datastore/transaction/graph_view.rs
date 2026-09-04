@@ -67,6 +67,29 @@ impl Transaction {
 			reads: &self.reads,
 		})
 	}
+
+	/// Materializes an owned general graph through the bounded local path.
+	///
+	/// The result owns every materialized atom and releases local page state
+	/// before returning.
+	#[doc(hidden)]
+	pub fn materialize_query_graph(
+		&self,
+		reference: &GraphRef,
+	) -> FerrosGrynnResult<Graph<Frozen>> {
+		let view = self.graph_view_at(self.read_root(), reference)?;
+		let TransactionGraphSource::Local(local) = &view.graph else {
+			return crate::graph::query_to_memory(&view);
+		};
+		view.record(ReadKey::GraphProperties(reference.id().clone()));
+		view.record(ReadKey::NodeSet(reference.id().clone()));
+		view.record(ReadKey::EdgeSet(reference.id().clone()));
+		let (mut graph, source_atoms) = local.materialize_query_graph(|atom| {
+			view.record(ReadKey::Atom(reference.id().clone(), atom));
+		})?;
+		graph.finish_query_materialization(&view, source_atoms);
+		Ok(graph.freeze())
+	}
 }
 
 impl GraphRefReader for Transaction {

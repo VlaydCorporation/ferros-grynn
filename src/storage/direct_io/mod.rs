@@ -367,13 +367,13 @@ impl DirectFile {
 		self.page_count.fetch_max(end_page, AtomicOrdering::Relaxed);
 	}
 
-	/// Borrows the native Windows handle for an IoRing submission.
+	/// Borrows the native Windows handle for an overlapped queued read.
 	///
 	/// # Errors
 	///
 	/// Returns an error when this file was not opened with its overlapped
 	/// companion handle.
-	#[cfg(all(windows, feature = "native-async-io"))]
+	#[cfg(windows)]
 	pub fn raw_handle(&self) -> FerrosGrynnResult<windows::Win32::Foundation::HANDLE> {
 		use std::os::windows::io::AsRawHandle;
 
@@ -382,7 +382,7 @@ impl DirectFile {
 			.map(|file| windows::Win32::Foundation::HANDLE(file.as_raw_handle()))
 			.ok_or_else(|| {
 				FerrosGrynnError::storage_io_failure(
-					"Windows IoRing requested a file without an overlapped companion handle",
+					"queued Windows read requested a file without an overlapped companion handle",
 				)
 			})
 	}
@@ -934,7 +934,8 @@ mod tests {
 		let path = TestPath::new()?;
 		let file = DirectFile::create_new(path.as_path())?;
 		// SAFETY: `file` owns a live descriptor for the duration of the call,
-		// `F_GETFL` takes no variadic argument, and does not transfer ownership.
+		// `F_GETFL` takes no variadic argument, and does not transfer
+		// ownership.
 		let flags = unsafe { nix::libc::fcntl(file.file.as_raw_fd(), nix::libc::F_GETFL) };
 		if flags == -1 {
 			return Err(io::Error::last_os_error().into());

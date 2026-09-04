@@ -245,9 +245,9 @@ impl FrameWal {
 					.get(key)
 					.is_some_and(|latest| *latest > tx.snapshot.visible_lsn())
 				{
-					// The higher datastore layer rebases atom deltas before opening this
-					// serialized storage transaction; this guard still protects direct
-					// PageManager callers.
+					// The higher datastore layer rebases atom deltas before
+					// opening this serialized storage transaction; this
+					// guard still protects direct PageManager callers.
 					return Err(FerrosGrynnError::serialization_failure(
 						tx.id.get(),
 						format!("page {:?} changed after the transaction snapshot", key),
@@ -364,8 +364,8 @@ impl FrameWal {
 		output: &mut AlignedPage,
 	) -> FerrosGrynnResult<PageHeader> {
 		let path = segment_path(&self.inner.directory, frame.version.location.segment_start_lsn);
-		// ponytail: open per cache miss; add a bounded segment-handle cache only
-		// if profiles show this open in the read-path budget.
+		// ponytail: open per cache miss; add a bounded segment-handle cache
+		// only if profiles show this open in the read-path budget.
 		let mut file =
 			File::open(path).map_err(|source| io_failure("open WAL frame segment", source))?;
 		file.seek(SeekFrom::Start(frame.version.location.page_bytes_offset))

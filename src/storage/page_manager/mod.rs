@@ -4,6 +4,7 @@ use std::{
 	cmp,
 	fs,
 	num::NonZeroUsize,
+	ops::ControlFlow,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
@@ -12,7 +13,6 @@ use parking_lot::{Mutex, RwLock};
 use rapidhash::{RapidHashMap, RapidHashSet};
 
 use super::{
-	buffer_pool::{BufferPool, PageCacheKey, PageCacheVersion, PageGuard},
 	catalog::{
 		CatalogUpdatePages,
 		DatabaseCatalog,
@@ -24,6 +24,15 @@ use super::{
 	consts::{DATABASE_SUPERBLOCK_FILE, WAL_DIRECTORY},
 	direct::SYNC_BATCH_PAGES,
 	file_registry::{DataFileRegistration, DataFileRole, FileRegistry, RegisteredDataFile},
+	hybrid_engine::{
+		AtomicPageGuard,
+		HybridReadEngine,
+		MAX_READ_SCOPE_OPERATIONS,
+		ReadIntent,
+		ReadRoute,
+		ReadWindow,
+		TransportCapabilities,
+	},
 	local::{
 		DatabaseLock,
 		select_database_superblock,
@@ -31,6 +40,7 @@ use super::{
 		write_superblock_atomic,
 	},
 	page::{AlignedPage, PAGE_SIZE, PageLsn, PageNo},
+	page_cache::{PageCacheKey, PageCacheVersion},
 	page_io::{FilePageExtent, PageIo, PageIoMode},
 	superblock::{DatabaseSuperblock, GraphSuperblock},
 	types::{CheckpointGeneration, CommitTs, GraphId, Lsn, PageKey, TxId},
@@ -47,8 +57,8 @@ pub(super) use sync_manager::SyncPageManager;
 pub(super) enum PageRead<'tx> {
 	/// Read-your-writes page borrowed from the private transaction write set.
 	Staged(&'tx AlignedPage),
-	/// Immutable WAL or home image pinned in the bounded buffer pool.
-	Cached(PageGuard),
+	/// Immutable WAL or home image pinned in the bounded R8 arena.
+	Cached(AtomicPageGuard<'tx>),
 }
 
 impl PageRead<'_> {
@@ -160,6 +170,24 @@ fn collect_page_reads(reads: Vec<Option<PageRead<'_>>>) -> FerrosGrynnResult<Vec
 			})
 		})
 		.collect()
+}
+
+/// Adds an in-file page offset without wrapping a persistent address.
+fn checked_page_add(first: PageNo, offset: usize) -> FerrosGrynnResult<PageNo> {
+	let offset = u64::try_from(offset).map_err(|source| {
+		FerrosGrynnError::invalid_storage_page(
+			first.get(),
+			format!("page-range offset does not fit u64: {source}"),
+		)
+	})?;
+	first.get().checked_add(offset).map(PageNo::new).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_page(first.get(), "page-range address overflow")
+	})
+}
+
+/// Produces one key in the same graph and immutable file.
+fn contiguous_key(first: PageKey, offset: usize) -> FerrosGrynnResult<PageKey> {
+	Ok(PageKey::new(first.graph_id(), first.file_id(), checked_page_add(first.page_no(), offset)?))
 }
 
 #[cfg(all(test, windows))]
@@ -460,7 +488,7 @@ mod tests {
 		let pages = manager.read_pages(&fresh, &[key, key])?;
 		assert_eq!(pages[0].as_bytes()[PAGE_HEADER_SIZE], 7);
 		assert!(std::ptr::eq(pages[0].as_bytes(), pages[1].as_bytes()));
-		assert_eq!(manager.pool.stats().page_buffer_allocations(), 8);
+		assert_eq!(manager.pool.resident_capacity(), 8);
 		Ok(())
 	}
 

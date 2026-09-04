@@ -384,10 +384,10 @@ impl AlignedPage {
 		let bytes = pages.as_mut_ptr().cast::<u8>();
 		// SAFETY: a slice stores `AlignedPage` values contiguously; the const
 		// assertions below prove that every element is exactly `PAGE_SIZE`
-		// initialized bytes with no trailing inter-element padding. `u8` accepts
-		// every bit pattern, `bytes` inherits the slice allocation and alignment,
-		// and the exclusive output borrow cannot outlive the exclusive input
-		// borrow.
+		// initialized bytes with no trailing inter-element padding. `u8`
+		// accepts every bit pattern, `bytes` inherits the slice allocation
+		// and alignment, and the exclusive output borrow cannot outlive the
+		// exclusive input borrow.
 		unsafe { std::slice::from_raw_parts_mut(bytes, byte_len) }
 	}
 

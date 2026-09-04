@@ -5,11 +5,12 @@ edition = "2024"
 publish = false
 
 [features]
-default = []
-native-async-io = ["ferros-grynn/native-async-io"]
+default = ["hybrid-api"]
+hybrid-api = ["ferros-grynn/storage-engine-prototype-api"]
+native-async-io = ["ferros-grynn/native-async-io", "hybrid-api"]
 
 [dependencies]
-ferros-grynn = { workspace = true, features = ["storage-engine-prototype-api"] }
+ferros-grynn.workspace = true
 memmap2 = "0.9.11"
 parking_lot = "0.12.5"
 rapidhash = "4.2.2"

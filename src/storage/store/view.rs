@@ -12,6 +12,16 @@ pub struct LocalGraphView<'tx> {
 	pub(super) graph: Arc<LocalGraph>,
 }
 
+impl LocalGraphView<'_> {
+	/// Builds owned query data without exposing local storage internals.
+	pub(crate) fn materialize_query_graph(
+		&self,
+		record_atom: impl FnMut(AtomId),
+	) -> FerrosGrynnResult<(Graph<Mutable>, BTreeMap<AtomId, AtomRef>)> {
+		self.store.materialize_query_graph(self, record_atom)
+	}
+}
+
 /// Node projection retaining the hot page pin while cold properties remain
 /// loadable through the same storage snapshot.
 pub struct LocalNodeRead<'tx> {
@@ -319,15 +329,211 @@ pub(super) fn visit_local_primary(
 	store: &LocalStore,
 	transaction: &LocalReadTransaction,
 	graph: &LocalGraph,
-	visit: impl FnMut(&[u8], DiskAtomRef) -> FerrosGrynnResult<()>,
+	mut visit: impl FnMut(&[u8], DiskAtomRef) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<()> {
-	visit_primary_index(
+	transaction.ensure_live()?;
+	let first_leaf = leftmost_primary_leaf(
 		|page_no, output| {
 			copy_local_page(store, transaction, graph, DataFileKind::Index, page_no, output)
 		},
 		graph.primary_index_root,
-		visit,
-	)
+	)?;
+	let leaf_pages = graph
+		.primary_index_root
+		.get()
+		.checked_sub(first_leaf.get())
+		.and_then(|pages| pages.checked_add(1))
+		.and_then(|pages| usize::try_from(pages).ok())
+		.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"primary B+tree bulk leaf range exceeds its root page",
+			)
+		})?;
+	let mut previous_key = None;
+	let mut reached_end = false;
+	let first_key = graph.page_key(DataFileKind::Index, first_leaf)?;
+	store.manager.visit_contiguous_pages(
+		&transaction.inner,
+		first_key,
+		leaf_pages,
+		ReadIntent::SequentialScan,
+		|key, page| {
+			let next = visit_primary_leaf_page(key.page_no(), page, &mut previous_key, &mut visit)?;
+			if next == PageNo::NULL {
+				reached_end = true;
+				return Ok(std::ops::ControlFlow::Break(()));
+			}
+			let expected = key.page_no().get().checked_add(1).map(PageNo::new);
+			if expected != Some(next) {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"bulk-built primary B+tree leaf pages are not contiguous",
+				));
+			}
+			Ok(std::ops::ControlFlow::Continue(()))
+		},
+	)?;
+	if !reached_end {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"primary B+tree leaf chain extends beyond its bulk-built page range",
+		));
+	}
+	Ok(())
+}
+
+/// Bounded pull cursor over one bulk-built local primary-index generation.
+pub(crate) struct LocalTableCursor<'store> {
+	store: &'store LocalStore,
+	transaction: Arc<LocalReadTransaction>,
+	graph: Arc<LocalGraph>,
+	table: String,
+	kind: TableKind,
+	context: EncodeContext,
+	next_leaf: PageNo,
+	remaining_leaf_pages: usize,
+	previous_key: Option<Vec<u8>>,
+	pending: std::collections::VecDeque<PrimaryIndexEntry>,
+	finished: bool,
+}
+
+impl<'store> LocalTableCursor<'store> {
+	/// Opens a cursor without materializing rows or page keys for the complete
+	/// table.
+	pub(crate) fn open(
+		store: &'store LocalStore,
+		transaction: Arc<LocalReadTransaction>,
+		graph: Arc<LocalGraph>,
+		table: String,
+		kind: TableKind,
+	) -> FerrosGrynnResult<Self> {
+		transaction.ensure_live()?;
+		let first_leaf = leftmost_primary_leaf(
+			|page_no, output| {
+				copy_local_page(store, &transaction, &graph, DataFileKind::Index, page_no, output)
+			},
+			graph.primary_index_root,
+		)?;
+		let remaining_leaf_pages = graph
+			.primary_index_root
+			.get()
+			.checked_sub(first_leaf.get())
+			.and_then(|pages| pages.checked_add(1))
+			.and_then(|pages| usize::try_from(pages).ok())
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"primary B+tree bulk leaf range exceeds its root page",
+				)
+			})?;
+		let context = graph.base_context()?;
+		Ok(Self {
+			store,
+			transaction,
+			graph,
+			table,
+			kind,
+			context,
+			next_leaf: first_leaf,
+			remaining_leaf_pages,
+			previous_key: None,
+			pending: std::collections::VecDeque::new(),
+			finished: false,
+		})
+	}
+
+	/// Returns the next table-visible atom, decoding at most one bounded page
+	/// window when the local queue is empty.
+	pub(crate) fn next_atom(&mut self) -> FerrosGrynnResult<Option<LocalQueryAtom>> {
+		loop {
+			if let Some(entry) = self.pending.pop_front() {
+				let record_id = decode_record_key(&entry.key, &self.context)?;
+				if record_id.table() == self.table
+					&& table_kind_accepts(self.kind, entry.atom.kind())
+				{
+					return local_query_atom(
+						self.store,
+						&self.transaction,
+						&self.graph,
+						record_id,
+						entry.atom,
+					)
+					.map(Some);
+				}
+				continue;
+			}
+			if self.finished {
+				return Ok(None);
+			}
+			if let Err(error) = self.fill_window() {
+				self.finished = true;
+				self.pending.clear();
+				return Err(error);
+			}
+		}
+	}
+
+	/// Decodes one bounded sequence of leaf pages into lightweight key/atom
+	/// pairs. Page guards and transient transport buffers are released before
+	/// the caller observes a row.
+	fn fill_window(&mut self) -> FerrosGrynnResult<()> {
+		if self.remaining_leaf_pages == 0 {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"primary B+tree leaf chain extends beyond its bulk-built page range",
+			));
+		}
+		let page_count = self.remaining_leaf_pages.min(MAX_READ_SCOPE_OPERATIONS);
+		let first_key = self.graph.page_key(DataFileKind::Index, self.next_leaf)?;
+		let mut pending = std::collections::VecDeque::new();
+		let mut pages_seen = 0_usize;
+		let mut next_leaf = self.next_leaf;
+		let mut reached_end = false;
+		self.store.manager.visit_contiguous_pages(
+			&self.transaction.inner,
+			first_key,
+			page_count,
+			ReadIntent::SequentialScan,
+			|key, page| {
+				if key.page_no() != next_leaf {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"bulk-built primary B+tree leaf pages are not contiguous",
+					));
+				}
+				let following = visit_primary_leaf_page(
+					key.page_no(),
+					page,
+					&mut self.previous_key,
+					&mut |key, atom| {
+						pending.push_back(PrimaryIndexEntry {
+							key: key.to_vec(),
+							atom,
+						});
+						Ok(())
+					},
+				)?;
+				pages_seen += 1;
+				if following == PageNo::NULL {
+					reached_end = true;
+					return Ok(std::ops::ControlFlow::Break(()));
+				}
+				let expected = key.page_no().get().checked_add(1).map(PageNo::new);
+				if expected != Some(following) {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"bulk-built primary B+tree leaf pages are not contiguous",
+					));
+				}
+				next_leaf = following;
+				Ok(std::ops::ControlFlow::Continue(()))
+			},
+		)?;
+		self.remaining_leaf_pages -= pages_seen;
+		self.next_leaf = next_leaf;
+		self.finished = reached_end;
+		if pages_seen == 0 || (!self.finished && self.remaining_leaf_pages == 0) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"primary B+tree leaf chain did not terminate in its bounded page range",
+			));
+		}
+		self.pending = pending;
+		Ok(())
+	}
 }
 
 pub(super) fn decode_record_key(
@@ -541,6 +747,7 @@ pub(super) fn visit_local_slots(
 	kind: AtomKind,
 	mut visit: impl FnMut(u64, u32, bool) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<()> {
+	transaction.ensure_live()?;
 	let (capacity, pages, file_kind) = match kind {
 		AtomKind::Node => (
 			graph.superblock.node_capacity,
@@ -553,9 +760,8 @@ pub(super) fn visit_local_slots(
 			DataFileKind::EdgesHot,
 		),
 	};
-	for page_index in 0..pages {
+	let mut visit_page = |page_index: u64, page: &AlignedPage| -> FerrosGrynnResult<()> {
 		let page_no = PageNo::new(page_index);
-		let page = read_local_page(store, transaction, graph, file_kind, page_no)?;
 		for within in 0..HOT_SLOTS_PER_PAGE {
 			let slot = page_index
 				.checked_mul(u64::try_from(HOT_SLOTS_PER_PAGE).map_err(|_error| {
@@ -570,18 +776,32 @@ pub(super) fn visit_local_slots(
 			}
 			let (generation, tombstone) = match kind {
 				AtomKind::Node => {
-					let value = read_node_hot_slot(page.as_page(), page_no, within)?;
+					let value = read_node_hot_slot(page, page_no, within)?;
 					(value.generation, value.flags.contains(NodeSlotFlags::TOMBSTONE))
 				}
 				AtomKind::Edge => {
-					let value = read_edge_hot_slot(page.as_page(), page_no, within)?;
+					let value = read_edge_hot_slot(page, page_no, within)?;
 					(value.generation, value.flags.contains(EdgeSlotFlags::TOMBSTONE))
 				}
 			};
 			visit(slot, generation, tombstone)?;
 		}
-	}
-	Ok(())
+		Ok(())
+	};
+
+	let page_count = usize::try_from(pages)
+		.map_err(|_error| FerrosGrynnError::invalid_storage_file("hot page count exceeds usize"))?;
+	let first_key = graph.page_key(file_kind, PageNo::new(0))?;
+	store.manager.visit_contiguous_pages(
+		&transaction.inner,
+		first_key,
+		page_count,
+		ReadIntent::SequentialScan,
+		|key, page| {
+			visit_page(key.page_no().get(), page)?;
+			Ok(std::ops::ControlFlow::Continue(()))
+		},
+	)
 }
 
 pub(super) fn read_local_properties(
@@ -590,6 +810,7 @@ pub(super) fn read_local_properties(
 	graph: &LocalGraph,
 	location: Option<PropertyLocation>,
 ) -> FerrosGrynnResult<PropertyMap> {
+	transaction.ensure_live()?;
 	let Some(location) = location else {
 		return Ok(PropertyMap::new());
 	};
@@ -620,22 +841,19 @@ pub(super) fn read_local_properties(
 			}
 			let page_count = length_usize.div_ceil(LARGE_PROPERTY_CHUNK_BYTES);
 			let mut pages = Vec::with_capacity(page_count);
-			for offset in 0..page_count {
-				let page_no = first_page
-					.get()
-					.checked_add(u64::try_from(offset).map_err(|_error| {
-						FerrosGrynnError::invalid_storage_file("large property page exceeds u64")
-					})?)
-					.map(PageNo::new)
-					.ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file("large property page overflows")
-					})?;
-				let page =
-					read_local_page(store, transaction, graph, DataFileKind::Properties, page_no)?;
-				let mut copy = AlignedPage::zeroed();
-				copy.as_bytes_mut().copy_from_slice(page.as_bytes());
-				pages.push(copy);
-			}
+			let first_key = graph.page_key(DataFileKind::Properties, first_page)?;
+			store.manager.visit_contiguous_pages(
+				&transaction.inner,
+				first_key,
+				page_count,
+				ReadIntent::SequentialScan,
+				|_key, page| {
+					let mut copy = AlignedPage::zeroed();
+					copy.as_bytes_mut().copy_from_slice(page.as_bytes());
+					pages.push(copy);
+					Ok(std::ops::ControlFlow::Continue(()))
+				},
+			)?;
 			decode_large_property(first_page, &pages, length, limits.max_total_allocation)?
 		}
 	};

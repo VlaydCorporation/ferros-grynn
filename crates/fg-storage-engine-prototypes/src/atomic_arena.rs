@@ -380,6 +380,35 @@ enum DirectoryEntry {
 	Resident(FrameLocator),
 }
 
+impl DirectoryEntry {
+	/// Copies the data needed after releasing the directory shard lock.
+	fn snapshot(&self) -> DirectoryLookup {
+		match self {
+			Self::Loading {
+				signal,
+				..
+			} => DirectoryLookup::Loading(Arc::clone(signal)),
+			Self::Resident(locator) => DirectoryLookup::Resident(*locator),
+		}
+	}
+
+	/// Returns whether this is the exact in-flight load owned by a reservation.
+	fn is_loading(&self, locator: FrameLocator, signal: &Arc<LoadSignal>) -> bool {
+		match self {
+			Self::Loading {
+				locator: current,
+				signal: current_signal,
+			} => *current == locator && Arc::ptr_eq(current_signal, signal),
+			Self::Resident(_) => false,
+		}
+	}
+
+	/// Returns whether this is the exact resident frame selected for removal.
+	fn is_resident(&self, locator: FrameLocator) -> bool {
+		matches!(self, Self::Resident(current) if *current == locator)
+	}
+}
+
 /// Owned snapshot of one directory lookup after its shard lock is released.
 enum DirectoryLookup {
 	/// No exact key is mapped.
@@ -529,9 +558,10 @@ impl<'pool> AtomicBatchReservation<'pool> {
 		let mut pages = Vec::with_capacity(self.reservations.len());
 		for reservation in &self.reservations {
 			let frame = &self.pool.frames[reservation.locator.index];
-			// SAFETY: `reserve_batch` rejects duplicate keys and every successful
-			// miss reservation owns a distinct `Loading` frame. This batch is the
-			// sole load owner, so these mutable references are pairwise disjoint.
+			// SAFETY: `reserve_batch` rejects duplicate keys and every
+			// successful miss reservation owns a distinct `Loading` frame.
+			// This batch is the sole load owner, so these mutable references
+			// are pairwise disjoint.
 			pages.push(unsafe { &mut *frame.page.get() });
 		}
 		pages
@@ -547,9 +577,9 @@ impl<'pool> AtomicBatchReservation<'pool> {
 	pub(super) fn publish(mut self) -> FerrosGrynnResult<Vec<AtomicPageGuard<'pool>>> {
 		for reservation in &self.reservations {
 			let frame = &self.pool.frames[reservation.locator.index];
-			// SAFETY: `publish` consumes the reservation after every mutable page
-			// borrow ended. The exact frame is still `Loading`, so this owner is the
-			// only code that may inspect its initialized bytes.
+			// SAFETY: `publish` consumes the reservation after every mutable
+			// page borrow ended. The exact frame is still `Loading`, so this
+			// owner is the only code that may inspect its initialized bytes.
 			let page = unsafe { &*frame.page.get() };
 			let actual = page.validate(reservation.key.page_no())?;
 			validate_loaded_header(reservation.key, actual)?;
@@ -567,12 +597,9 @@ impl<'pool> AtomicBatchReservation<'pool> {
 			}
 			let shard = &self.pool.directory[directory_shard(reservation.key)];
 			let entries = shard.entries.read();
-			let publishable = matches!(
-				entries.get(&reservation.key),
-				Some(DirectoryEntry::Loading { locator, signal })
-					if *locator == reservation.locator
-						&& Arc::ptr_eq(signal, &reservation.signal)
-			);
+			let publishable = entries
+				.get(&reservation.key)
+				.is_some_and(|entry| entry.is_loading(reservation.locator, &reservation.signal));
 			if !publishable {
 				return Err(FerrosGrynnError::storage_io_failure(
 					"atomic batch loading mapping changed before publication",
@@ -1190,14 +1217,7 @@ impl AtomicArenaBufferPool {
 	fn lookup(&self, key: PageCacheKey) -> DirectoryLookup {
 		let shard = &self.directory[directory_shard(key)];
 		let entries = shard.entries.read();
-		match entries.get(&key) {
-			Some(DirectoryEntry::Resident(locator)) => DirectoryLookup::Resident(*locator),
-			Some(DirectoryEntry::Loading {
-				signal,
-				..
-			}) => DirectoryLookup::Loading(Arc::clone(signal)),
-			None => DirectoryLookup::Absent,
-		}
+		entries.get(&key).map_or(DirectoryLookup::Absent, DirectoryEntry::snapshot)
 	}
 
 	/// Serializes only miss admission and replacement.
@@ -1368,10 +1388,7 @@ impl AtomicArenaBufferPool {
 	fn remove_resident_mapping(&self, key: PageCacheKey, locator: FrameLocator) -> bool {
 		let shard = &self.directory[directory_shard(key)];
 		let mut entries = shard.entries.write();
-		let matches = matches!(
-			entries.get(&key),
-			Some(DirectoryEntry::Resident(current)) if *current == locator
-		);
+		let matches = entries.get(&key).is_some_and(|entry| entry.is_resident(locator));
 		if matches {
 			entries.remove(&key);
 		}
@@ -1392,8 +1409,8 @@ impl AtomicArenaBufferPool {
 		let frame = &self.frames[reservation.locator.index];
 		// SAFETY: reservation is created under the replacement lock after the
 		// frame enters `Loading`. Its mapping stores exactly one load owner;
-		// resident readers cannot pin this lifecycle and replacement cannot reuse
-		// it until publication or abort.
+		// resident readers cannot pin this lifecycle and replacement cannot
+		// reuse it until publication or abort.
 		let page = unsafe { &mut *frame.page.get() };
 		let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader(page)));
 		let load_result = match loaded {
@@ -1457,11 +1474,9 @@ impl AtomicArenaBufferPool {
 
 		let shard = &self.directory[directory_shard(reservation.key)];
 		let mut entries = shard.entries.write();
-		let publishable = matches!(
-			entries.get(&reservation.key),
-			Some(DirectoryEntry::Loading { locator, signal })
-				if *locator == reservation.locator && Arc::ptr_eq(signal, &reservation.signal)
-		);
+		let publishable = entries
+			.get(&reservation.key)
+			.is_some_and(|entry| entry.is_loading(reservation.locator, &reservation.signal));
 		if !publishable {
 			meta.state.store(loading, Ordering::Release);
 			drop(entries);
@@ -1482,11 +1497,9 @@ impl AtomicArenaBufferPool {
 		let mut replacement = self.replacement.lock();
 		let shard = &self.directory[directory_shard(reservation.key)];
 		let mut entries = shard.entries.write();
-		let removable = matches!(
-			entries.get(&reservation.key),
-			Some(DirectoryEntry::Loading { locator, signal })
-				if *locator == reservation.locator && Arc::ptr_eq(signal, &reservation.signal)
-		);
+		let removable = entries
+			.get(&reservation.key)
+			.is_some_and(|entry| entry.is_loading(reservation.locator, &reservation.signal));
 		if removable {
 			entries.remove(&reservation.key);
 		}
@@ -1528,8 +1541,9 @@ impl AtomicArenaBufferPool {
 			) {
 				Ok(_) => {
 					// This CAS installs a pin in the exact resident generation.
-					// Replacement can change lifecycle/generation only after pins
-					// reach zero, so a second state load cannot invalidate success.
+					// Replacement can change lifecycle/generation only after
+					// pins reach zero, so a second state load cannot
+					// invalidate success.
 					return PinResult::Pinned;
 				}
 				Err(current) => observed = current,
@@ -1600,7 +1614,8 @@ impl AtomicArenaBufferPool {
 /// Gives a capacity-starved miss a bounded local spin before yielding.
 fn bounded_capacity_backoff() {
 	// ponytail: this bounded spin/yield avoids a resident-side wake protocol;
-	// add `WaitOnAddress` only if measured miss CPU or tail latency requires it.
+	// add `WaitOnAddress` only if measured miss CPU or tail latency requires
+	// it.
 	for _ in 0..MISS_BACKOFF_SPINS {
 		std::hint::spin_loop();
 	}
@@ -1634,10 +1649,11 @@ impl AtomicReadEpoch<'_> {
 			return None;
 		}
 		// SAFETY: entering this epoch precedes the SeqCst resident-generation
-		// check. Replacement first publishes `Evicting` with SeqCst and can reuse
-		// those `UnsafeCell` bytes only after the global reader count reaches zero.
-		// The returned lifetime is tied to this borrowed epoch, so safe code cannot
-		// drop the epoch while this immutable reference remains usable.
+		// check. Replacement first publishes `Evicting` with SeqCst and can
+		// reuse those `UnsafeCell` bytes only after the global reader count
+		// reaches zero. The returned lifetime is tied to this borrowed epoch,
+		// so safe code cannot drop the epoch while this immutable reference
+		// remains usable.
 		let page = unsafe { &*self.pool.frames[locator.index].page.get() };
 		Some(AtomicEpochPage {
 			page,
@@ -1686,8 +1702,9 @@ impl AtomicPageGuard<'_> {
 		debug_assert_eq!(generation(state), self.locator.generation);
 		debug_assert!(pins(state) > 0);
 		// SAFETY: this guard owns one pin for the exact resident generation.
-		// Replacement cannot enter `Evicting` or `Loading` until every pin drops,
-		// so no mutable reference can coexist with this immutable reference.
+		// Replacement cannot enter `Evicting` or `Loading` until every pin
+		// drops, so no mutable reference can coexist with this immutable
+		// reference.
 		unsafe { &*self.pool.frames[self.locator.index].page.get() }
 	}
 

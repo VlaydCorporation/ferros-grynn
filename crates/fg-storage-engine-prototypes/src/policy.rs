@@ -342,8 +342,8 @@ impl PrototypeReadCache {
 				return consumer(cold_guard.as_page());
 			}
 			// A qualifying promotion must re-enter through the cross-tier
-			// admission lock. Drop this speculative pin before waiting so removal
-			// cannot form a lock/pin cycle with another consumer.
+			// admission lock. Drop this speculative pin before waiting so
+			// removal cannot form a lock/pin cycle with another consumer.
 			drop(cold_guard);
 		}
 

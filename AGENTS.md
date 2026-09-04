@@ -117,9 +117,10 @@ contracts.
   `tikv-jemallocator` on supported non-MSVC Unix targets, selected in
   `src/memory`.
 - **Direct I/O** lives in `src/storage`: platform file access, page I/O, the
-  shared buffer pool, WAL and checkpoint/recovery use one on-disk contract.
-  Synchronous I/O is the current reference path; optional native async I/O is
-  added only through explicit target/feature slices.
+  production `HybridReadEngine`, WAL and checkpoint/recovery use one on-disk
+  contract. The engine combines an atomic resident arena with validated sync
+  Direct reads, sequential scatter/prefetch bypass and optional frame-IoRing
+  for known sparse windows; mmap remains a benchmark control.
 
 ### Graph core (`src/graph`)
 - Nodes and edges are atoms stored in family-specific **struct-of-arrays (SoA)**

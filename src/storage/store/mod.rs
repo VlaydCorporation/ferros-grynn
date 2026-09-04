@@ -3,6 +3,7 @@
 mod commit;
 mod gc;
 mod graph;
+mod materialize;
 mod view;
 
 use std::{
@@ -17,6 +18,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+pub(crate) use view::LocalTableCursor;
 pub use view::{LocalEdgeRead, LocalGraphView, LocalNodeRead};
 #[allow(
 	clippy::wildcard_imports,
@@ -47,11 +49,12 @@ use super::{
 		build_scalar_index,
 		decode_label_dictionary,
 		encode_label_dictionary,
+		leftmost_primary_leaf,
 		lookup_primary_index,
 		lookup_scalar_index,
 		range_scalar_index,
 		scan_primary_index,
-		visit_primary_index,
+		visit_primary_leaf_page,
 	},
 	graph_pages::{
 		CROSS_LEVEL_REFS_PER_PAGE,
@@ -94,6 +97,7 @@ use super::{
 		write_edge_hot_slot,
 		write_node_hot_slot,
 	},
+	hybrid_engine::{MAX_READ_SCOPE_OPERATIONS, ReadIntent},
 	local::select_graph_superblock,
 	page::{AlignedPage, PAGE_SIZE, PageLsn, PageNo},
 	page_io::PageIoMode,
@@ -569,6 +573,15 @@ impl LocalStore {
 			)?;
 		}
 		Ok(materialized)
+	}
+
+	/// Builds a bounded owned query result from one local snapshot.
+	pub(crate) fn materialize_query_graph(
+		&self,
+		view: &LocalGraphView<'_>,
+		record_atom: impl FnMut(AtomId),
+	) -> FerrosGrynnResult<(Graph<Mutable>, BTreeMap<AtomId, AtomRef>)> {
+		materialize::materialize_query_graph(self, view, record_atom)
 	}
 
 	/// Visits matching primary-index records in stable RecordId order.
