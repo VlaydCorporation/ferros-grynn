@@ -299,7 +299,66 @@ types при необходимости расширяется общими ти
 4. **Delta-oriented mutation foundation** — зависит от **3**.  
    Убрать полную материализацию local-графа из обычного `edit_graph`; формировать atom/page delta непосредственно из point mutations. Учесть свойства, крупную adjacency, составные `RecordId` и nested graph payload в write-set limit. После профиля сохранить лимит 256 МиБ; private spill реализовывать только при подтверждённом неделимом workload, который нельзя обработать сегментированным импортом.
 
-5. **Полный SchemaCatalog** — зависит от **2, 4**.  
+4.1. **Аудит реализованных допущений, сквозных проблем и дублирования** —
+   зависит от **2, 3.2, 4**.
+   До расширения schema/DML зафиксировать проверяемый реестр проблем уже
+   реализованных поверхностей. Это не перечень ещё не реализованных возможностей
+   этапов 5–33: сюда входят только временные допуски, расхождения спецификаций и
+   кода, скрытые fallback, измеренные потолки и пользовательские ловушки.
+
+   Для каждой записи указать: наблюдаемое поведение и источник доказательства,
+   затронутый нормативный контракт, влияние на корректность/производительность/UX,
+   минимальный воспроизводящий test или benchmark, выбранное решение, файлы
+   спецификации и кода, этап-владелец, severity, trigger пересмотра и статус.
+   Если желаемое поведение ещё не утверждено, сначала изменить соответствующую
+   спецификацию; текущее устройство кода само по себе не становится контрактом.
+   Допуск без владельца, срока или измеримого trigger считается открытой проблемой.
+
+   **Известный реестр на текущем checkout:**
+
+   | ID     | Класс                                   | Текущий допуск и риск                                                                                                                                                                                                                                                                                                                     | Обязательное решение / не позднее                                                                                                                                                                                                                                                   |
+   |--------|-----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+   | `Q-01` | Correctness + performance               | `GraphSuperblock` в format v1 принадлежит checkpoint-протоколу. Изменение count/capacity/page-count/roots корректно публикуется отдельным COW-поколением, но даже малый atom delta физически читает, переписывает и синхронизирует всё поколение                                                                                          | До DML-нагрузок этапа 9 и freeze этапа 19 утвердить транзакционно версионируемую dynamic metadata либо явно ограниченный новый format protocol; доказать crash/reopen/snapshot semantics и убрать `O(size of graph)` write amplification обычного point commit                      |
+   | `Q-02` | Functionality + UX                      | Delta-path покрывает только append nodes; edge/update/delete и совместимый `edit_graph` могут вернуться к полной materialization. Один публично похожий point edit поэтому имеет радикально разные memory/time cost                                                                                                                       | В этапе 4 выбрать и описать единый ordinary mutation contract, покрыть все atom operations page delta, а full materialization оставить только явной операцией; до этапа 9 не должно быть скрытого fallback                                                                          |
+   | `Q-03` | Resource correctness + UX               | Лимит 256 МиБ является консервативной логической оценкой при commit, а не allocation-time heap quota; крупная adjacency, составные ID и nested graph payload требуют полного учёта. Пользователь может потратить память и время до позднего `FG-54F07`                                                                                    | В этапе 4 завершить единый рекурсивный accounting, проверить его для всех payload и определить в спецификации момент отказа. До этапа 10 предоставить bounded segmented import; private spill разрешён только после доказанного неделимого workload                                 |
+   | `Q-04` | Durability + resources                  | Недостижимые COW-поколения удаляет startup-GC. Частые COW commit между reopen могут накапливать disk bytes и file registrations, тогда как активные snapshots требуют безопасно удерживать старую версию                                                                                                                                  | До этапа 19 измерить длительный churn и реализовать snapshot-aware runtime retirement/GC либо нормативно доказать жёсткую границу; crash-orphans и ошибки удаления должны иметь отдельные тесты и наблюдаемый статус                                                                |
+   | `Q-05` | Performance                             | Node append сейчас сканирует, сортирует и bulk-перестраивает primary B+tree; наличие scalar indexes переводит изменение в immutable generation COW                                                                                                                                                                                        | В этапах 7 и 9 сравнить incremental page-WAL maintenance с bulk threshold на point/batch workloads; сохранить bulk generation только там, где она измеримо выгоднее и не нарушает unique/recovery semantics                                                                         |
+   | `Q-06` | Correctness-preserving UX + concurrency | Serializable validation намеренно abort-ит любую исходящую rw-антизависимость; это корректно, но может давать лишние `FG-40001`. Blind-write `GraphWriteView` требует отдельного предварительного tracked read, что легко пропустить пользователю                                                                                         | До этапов 11/19 измерить abort rate, явно документировать read-before-write либо ввести tracked guard; dangerous-structure history добавлять только при доказанном выигрыше                                                                                                         |
+   | `Q-07` | Transaction semantics                   | `ReadCommitted` пока фиксирует один root на весь переданный `Program`, а refresh между top-level statements и GrynQL transaction statements отсутствуют                                                                                                                                                                                   | Этап 11 обязан синхронизировать observable statement boundary в `gql_spec`, Rust API и differential tests до объявления RC/TX surface завершённым                                                                                                                                   |
+   | `Q-08` | Functionality                           | In-memory table scan временно выводит membership из совпадающей части `RecordId.table`, а не из самостоятельного schema membership/primary index                                                                                                                                                                                          | Устранить в этапе 5 до DDL/DML: membership должен принадлежать `SchemaCatalog`, одинаково работать в RAM/local и не зависеть от случайной формы пользовательского ID                                                                                                                |
+   | `Q-09` | Functionality + UX                      | Mode 3 `Mutable` хранит origin/dirty state, но H14 explicit delta flush ещё отсутствует; изменение materialized graph нельзя надёжно вернуть в source                                                                                                                                                                                     | После этапа 4 и до публикации mutable write-back surface реализовать H14 с conflict check, delta-only commit и retry-safe dirty state; `Drop` никогда не flush-ит                                                                                                                   |
+   | `Q-10` | Performance                             | Frame-IoRing QD32 измеримо выигрывает на sparse frontier, но production graph/property cursors пока не предоставляют доказуемое bounded lookahead-окно, поэтому router выбирает sync Direct                                                                                                                                               | На этапах 16–17 добавить окно только из реального physical cursor и повторить paired gate; эвристическое угадывание и пользовательский transport knob не добавлять                                                                                                                  |
+   | `Q-11` | Performance + operability               | Остались измеренные границы: generic R8 hit около 74,9 нс против stretch 70 нс, один global read-epoch counter, единичный fixed-hot outlier до 65,87% raw и ручной общий `buffer_pool_pages=4096` без auto-sizing/per-file fairness                                                                                                       | До этапа 19 выполнить long-run/multi-file/concurrency sweep, вывести effective resident/transient/metadata budget и cache pressure. Directory/epoch/sharding/auto-sizing менять только по профилю representative workload                                                           |
+   | `Q-12` | Scalability                             | Известны пока не доминирующие потолки: `File::open` на WAL-frame miss, один mutex IoRing, `O(graphs + tables)` clone каталога, линейный changed-graph lookup и `O(V+E)` copy при `LiveGraph` update/conversion                                                                                                                            | Каждый владелец-потребитель обязан измерить свой потолок на соответствующем этапе; оптимизация выполняется только при заметной доле профиля, а не по одному наличию комментария в коде                                                                                              |
+   | `Q-13` | UX + configuration                      | Источники конфигурации расходятся: спецификация называет `FG_PAGE_BUFFER_PAGES`, production API использует `LocalOptions::buffer_pool_pages`, allocation tracking читает process-wide `SURREAL_MEMORY_THRESHOLD`; эффективные budget/fallback пользователю не видны                                                                       | До этапов 19–20 определить одну embeddable configuration authority, единицы и precedence, убрать чужой prefix, добавить validation и read-only introspection эффективных значений/pressure без глобальной env-зависимости                                                           |
+   | `Q-14` | Maintainability + release               | Актуальный `implementation_plan` всё ещё описывает Clock-Pro и непройденный stage-5 gate после Hybrid cutover; полный Clippy блокируется примерно 1900 старыми documentation/panic/error violations; внутренние `Option<Option<T>>` accessors не объясняют две семантические оси; скрытый prototype measurement API остаётся в repository | До этапа 19 синхронизировать текущие планы/AGENTS с кодом, не переписывая исторические отчёты; документировать либо упростить двойные `Option`, погасить или узко обосновать lint debt и удалить временные hooks, когда внешний prototype-крейт перестанет быть обязательным oracle |
+
+   **Review дублирования кода:**
+
+   - сравнить `write_new_graph_generation` и `write_delta_graph_generation`:
+     creation, catalog entries, registration, sync, abort cleanup и publication
+     должны иметь одного владельца без изменения crash contract;
+   - проверить повторение между full-image builder и delta encoders, особенно
+     properties, labels, statistics и primary/scalar indexes;
+   - свести в один источник mutation invariants, `RecordId` uniqueness и
+     write-set accounting для `GraphWriteView` и `GraphMutationView`;
+   - проверить, что recursive heap/value accounting, memory/local/index query
+     cursors и transport validation не имеют расходящихся копий одной семантики;
+   - после стабилизации production Hybrid path удалить устаревшие копии из
+     prototype/legacy control либо явно оставить минимальный oracle. Line-based
+     сходство generated status/codec tables и Windows/Linux wrappers само по себе
+     не является основанием для объединения.
+
+   Объединять код разрешается только после characterization tests и проверки, что
+   различия не выражают реальные platform, format или ownership contracts.
+   Результат этапа — русскоязычный отчёт в `docs/reports`, исправленные
+   спецификации и минимальные code changes для подтверждённых блокеров. Остальные
+   записи получают конкретный зависимый этап и trigger. Каждый последующий этап
+   добавляет вновь найденные допуски в реестр; перед этапом 19 не остаётся открытых
+   Windows GA correctness, unbounded-resource или user-visible silent-fallback
+   проблем.
+
+5. **Полный SchemaCatalog** — зависит от **2, 4.1**.
    Довести durable definitions таблиц, полей, графов, параметров и индексов, их версии и transactional publication. Primary/label/adjacency системные индексы должны иметь каталожное представление, но не удаляться пользователем.
 
 6. **StatisticsStore** — зависит от **5**.  
@@ -341,7 +400,7 @@ types при необходимости расширяется общими ти
 18. **Path и graph results** — зависит от **16, 17**.  
     Подключить `RETURN GRAPH`, `BUILD GRAPH`, path results и graph-return matrix. Публичные результаты содержат `RecordId`, `AtomRef`, `Path`, `GraphRef` или `MaterializedGraph`, никогда `DiskAtomRef`, page addresses или `StorageValue`. Результат не удерживает завершённый storage snapshot.
 
-19. **Windows GA-core gate** — зависит от **3–18**.  
+19. **Windows GA-core gate** — зависит от **3–18** и закрытия блокеров реестра **4.1**.
     Прогнать crash/recovery matrix, codec/parser fuzzing, RAM/local и Sync/NativeAsync differential tests, long-running SSI/checkpoint tests и storage/query benchmarks. После успеха заморозить core format v1, публичный API и поддерживаемый GrynQL-profile; advanced side-files остаются отдельно версионируемыми.
 
 ### Рубеж B — полная draft-conformance
@@ -421,7 +480,10 @@ GrynQL text
 - **Indexes:** incremental/bulk parity, unique violations, concurrent generation publication и stale fallback.
 - **Live:** at-least-once, duplicate delivery, resume, retention expiry, GAP и backpressure.
 - **Bridges:** fake bridge contract tests и feature-gated SurrealDB integration tests.
-- **Каждый этап:** rustfmt check, focused check/test/Clippy; полный workspace gate выполняется на рубежах 19 и 33, а несвязанный существующий lint debt отчётливо отделяется.
+- **Каждый этап:** rustfmt check, focused check/test/Clippy; найденные допуски и
+  silent fallback добавляются в реестр 4.1 с evidence, владельцем и trigger;
+  полный workspace gate выполняется на рубежах 19 и 33, а несвязанный
+  существующий lint debt отчётливо отделяется.
 
 ## Зафиксированные допущения
 
