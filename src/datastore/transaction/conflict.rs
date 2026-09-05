@@ -48,9 +48,9 @@ impl Transaction {
 	}
 
 	pub(super) fn validate_serializable(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
-		// ponytail: conservative SSI aborts every outgoing rw-antidependency. It is
-		// serializable; retain dangerous-structure history only if measured abort
-		// rates justify the machinery.
+		// ponytail: conservative SSI aborts every outgoing rw-antidependency.
+		// It is serializable; retain dangerous-structure history only if
+		// measured abort rates justify the machinery.
 		for (key, observed) in self.reads.lock().iter() {
 			if current.version(key) > *observed {
 				return Err(FerrosGrynnError::serialization_failure(
@@ -119,6 +119,13 @@ impl Transaction {
 		atom: AtomId,
 	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
 		if let Some(write) = self.graphs.get(schema.graph.id()) {
+			if let Some(local) = &write.local
+				&& let Some((record, node)) = local.delta.created_node(atom)
+			{
+				return Ok((record.table() == schema.name.as_str()
+					&& matches!(schema.kind, TableKind::Any | TableKind::Normal))
+				.then(|| row_from_properties(atom, record, &node.properties, schema)));
+			}
 			let dirty = write
 				.value
 				.as_ref()
@@ -178,6 +185,36 @@ impl Transaction {
 
 	pub(super) fn validate_writes(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
 		for (id, write) in &self.graphs {
+			if let Some(local) = &write.local {
+				let stored = current
+					.graphs
+					.get(id)
+					.ok_or_else(|| self.write_conflict("the graph was concurrently removed"))?;
+				let StoredGraphValue::Local(latest) = &stored.graph else {
+					return Err(self.write_conflict("the graph storage representation changed"));
+				};
+				if latest.identity() != local.base.identity()
+					|| latest.node_capacity() != local.base.node_capacity()
+				{
+					return Err(
+						self.write_conflict("the graph slot layout was concurrently changed")
+					);
+				}
+				for target in local.delta.dirty() {
+					let DirtyTarget::Atom(atom) = target else {
+						continue;
+					};
+					if stored.atom_versions.get(atom) > write.base_ts {
+						return Err(
+							self.write_conflict("the same graph atom was concurrently changed")
+						);
+					}
+				}
+				if local.base.kind() != stored.graph.kind() {
+					return Err(self.write_conflict("the graph family was concurrently changed"));
+				}
+				continue;
+			}
 			match (&write.base, &write.value) {
 				(None, Some(_)) => {
 					if current.graphs.contains_key(id)
@@ -188,10 +225,7 @@ impl Transaction {
 					}
 					if current.graph_names.get(&write.name).is_some_and(|record_id| {
 						record_id != id
-							&& !self
-								.graphs
-								.get(record_id)
-								.is_some_and(|pending| pending.value.is_none())
+							&& !self.graphs.get(record_id).is_some_and(|pending| !pending.exists())
 					}) {
 						return Err(self.write_conflict("a named graph was concurrently created"));
 					}
@@ -247,10 +281,52 @@ impl Transaction {
 		next: &mut DatabaseRoot,
 		current: &DatabaseRoot,
 		id: RecordId,
-		write: GraphWrite,
+		mut write: GraphWrite,
 		commit_ts: u64,
+		local_commits: &mut Vec<LocalCommitGraph>,
 	) -> FerrosGrynnResult<()> {
-		let created = write.base.is_none();
+		if !write.force_persist
+			&& let Some(local) = write.local.take()
+		{
+			if local.delta.is_empty() {
+				return Ok(());
+			}
+			let latest = current
+				.graphs
+				.get(&id)
+				.ok_or_else(|| self.write_conflict("the graph was concurrently removed"))?;
+			if let StoredGraphValue::Local(base) = &latest.graph
+				&& base.supports_node_append_delta()
+			{
+				let dirty = local.delta.dirty().collect::<Vec<_>>();
+				let nodes = local.delta.into_commit_nodes();
+				let mut stored = latest.clone();
+				for target in dirty {
+					let DirtyTarget::Atom(atom) = target else {
+						continue;
+					};
+					stored.atom_versions.insert(atom, commit_ts);
+					stored.changes.push((commit_ts, atom));
+				}
+				stored.name = write.name.clone();
+				stored.node_set_version = commit_ts;
+				stored.last_commit_ts = commit_ts;
+				next.graph_names.insert(write.name.clone(), id.clone());
+				next.graphs.insert(id.clone(), stored);
+				local_commits.push(LocalCommitGraph {
+					record_id: id,
+					name: write.name,
+					change: LocalCommitGraphChange::AppendNodes {
+						base: base.clone(),
+						nodes,
+					},
+				});
+				return Ok(());
+			}
+			write.local = Some(local);
+		}
+		write.ensure_materialized(&self.store)?;
+		let created = write.is_created();
 		let name = write.name.clone();
 		let Some(value) = write.value else {
 			next.graphs.remove(&id);

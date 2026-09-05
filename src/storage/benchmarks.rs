@@ -37,7 +37,7 @@ use crate::{
 	datastore::{Datastore, GraphWriteView, LocalOptions},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{Graph, GraphRead, Mutable},
-	values::{Bytes, PropertyMap},
+	values::{Bytes, PropertyMap, RecordId, RecordIdPart},
 };
 
 /// Binary kibibyte used by batch-size candidates.
@@ -123,6 +123,8 @@ const STAGE7_MODE_ENV: &str = "FG_STAGE7_MODE";
 const STAGE7_WORKLOAD_ENV: &str = "FG_STAGE7_WORKLOAD";
 /// Optional exact atom count used to shrink the dirty-target probe.
 const STAGE7_ATOMS_ENV: &str = "FG_STAGE7_ATOMS";
+/// Selects the legacy materialized writer or the delta-backed mutation view.
+const STAGE7_API_ENV: &str = "FG_STAGE7_API";
 /// Transaction size required by the stage-7 plan before spill is considered.
 const DEFAULT_STAGE7_PAYLOAD_MIB: usize = 320;
 /// Current bounded fallback used by bulk-style workloads.
@@ -964,6 +966,10 @@ fn disk_storage_stage7_spill_probe() -> Result<(), Box<dyn Error>> {
 		return Err(io::Error::other("FG_STAGE7_WORKLOAD must be 'properties' or 'atoms'").into());
 	}
 	let large_properties = workload == "properties";
+	let api = env::var(STAGE7_API_ENV).unwrap_or_else(|_| "mutation".to_owned());
+	if api != "edit" && api != "mutation" {
+		return Err(io::Error::other("FG_STAGE7_API must be 'edit' or 'mutation'").into());
+	}
 	let exact_atoms = optional_usize(STAGE7_ATOMS_ENV)?;
 	if exact_atoms == Some(0) {
 		return Err(io::Error::other("FG_STAGE7_ATOMS must be non-zero").into());
@@ -1014,19 +1020,27 @@ fn disk_storage_stage7_spill_probe() -> Result<(), Box<dyn Error>> {
 		attempted_nodes = next_committed_nodes;
 		let stage_started = Instant::now();
 		let mut transaction = store.begin();
-		let view = transaction.edit_graph(&graph)?;
-		let GraphWriteView::Graph(graph_write) = view else {
-			return Err(io::Error::other("stage-7 benchmark graph changed family").into());
-		};
-		for offset in 0..current_nodes {
-			let mut properties = PropertyMap::new();
-			if large_properties {
+		if api == "edit" {
+			let view = transaction.edit_graph(&graph)?;
+			let GraphWriteView::Graph(graph_write) = view else {
+				return Err(io::Error::other("stage-7 benchmark graph changed family").into());
+			};
+			for offset in 0..current_nodes {
 				let ordinal = committed_nodes
 					.checked_add(offset)
 					.ok_or_else(|| io::Error::other("stage-7 payload ordinal overflow"))?;
-				properties.insert(payload_key, Bytes::from(incompressible_mebibyte(ordinal)?));
+				let (record_id, properties) = stage7_node(ordinal, large_properties, payload_key)?;
+				graph_write.add_node_with_id(record_id, None, properties)?;
 			}
-			graph_write.add_node(None, properties)?;
+		} else {
+			let mut mutation = transaction.mutate_graph(&graph)?;
+			for offset in 0..current_nodes {
+				let ordinal = committed_nodes
+					.checked_add(offset)
+					.ok_or_else(|| io::Error::other("stage-7 payload ordinal overflow"))?;
+				let (record_id, properties) = stage7_node(ordinal, large_properties, payload_key)?;
+				mutation.create_node(record_id, None, properties)?;
+			}
 		}
 		staged_elapsed += stage_started.elapsed();
 		max_staged_rss = max_staged_rss.max(process_rss()?);
@@ -1068,8 +1082,8 @@ fn disk_storage_stage7_spill_probe() -> Result<(), Box<dyn Error>> {
 		stage7_logical_mib(large_properties, committed_mib, committed_nodes);
 
 	println!(
-		"stage7 workload={workload} mode={mode} payload_mib={payload_mib} batch_mib={batch_limit} \
-		 logical_attempted_mib={logical_attempted_mib:.2} \
+		"stage7 workload={workload} mode={mode} api={api} payload_mib={payload_mib} \
+		 batch_mib={batch_limit} logical_attempted_mib={logical_attempted_mib:.2} \
 		 logical_committed_mib={logical_committed_mib:.2} attempted_nodes={attempted_nodes} \
 		 committed_nodes={committed_nodes} status={commit_status} staged_ms={:.3} commit_ms={:.3} \
 		 total_ms={:.3} staged_rss_delta_mib={:.2} after_rss_delta_mib={:.2}",
@@ -1080,6 +1094,21 @@ fn disk_storage_stage7_spill_probe() -> Result<(), Box<dyn Error>> {
 		bytes_to_mib(after_rss.saturating_sub(baseline_rss)),
 	);
 	Ok(())
+}
+
+fn stage7_node(
+	ordinal: usize,
+	large_properties: bool,
+	payload_key: crate::values::PropertyKeyId,
+) -> Result<(RecordId, PropertyMap), Box<dyn Error>> {
+	let id = i64::try_from(ordinal)
+		.map_err(|_error| io::Error::other("stage-7 node ordinal exceeds i64"))?;
+	let record_id = RecordId::new("stage7", RecordIdPart::Int(id))?;
+	let mut properties = PropertyMap::new();
+	if large_properties {
+		properties.insert(payload_key, Bytes::from(incompressible_mebibyte(ordinal)?));
+	}
+	Ok((record_id, properties))
 }
 
 /// Produces deterministic bytes that do not collapse under property

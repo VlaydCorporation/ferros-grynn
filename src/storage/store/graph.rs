@@ -14,8 +14,12 @@ pub(super) struct PropertyStoreBuilder {
 
 impl PropertyStoreBuilder {
 	fn new() -> Self {
+		Self::starting_at(0)
+	}
+
+	fn starting_at(next_page: u64) -> Self {
 		Self {
-			next_page: 0,
+			next_page,
 			current: None,
 			current_page: None,
 			pages: Vec::new(),
@@ -111,10 +115,15 @@ impl PropertyStoreBuilder {
 		Ok(())
 	}
 
-	fn finish(mut self) -> FerrosGrynnResult<Vec<AlignedPage>> {
+	fn finish_numbered(mut self) -> FerrosGrynnResult<Vec<(PageNo, AlignedPage)>> {
 		self.finish_current()?;
 		self.pages.sort_unstable_by_key(|(page_no, _page)| *page_no);
-		for (index, (page_no, _page)) in self.pages.iter().enumerate() {
+		Ok(self.pages)
+	}
+
+	fn finish(self) -> FerrosGrynnResult<Vec<AlignedPage>> {
+		let pages = self.finish_numbered()?;
+		for (index, (page_no, _page)) in pages.iter().enumerate() {
 			if page_no.get()
 				!= u64::try_from(index).map_err(|_error| {
 					FerrosGrynnError::invalid_storage_file("property page index exceeds u64")
@@ -124,7 +133,7 @@ impl PropertyStoreBuilder {
 				));
 			}
 		}
-		Ok(self.pages.into_iter().map(|(_page_no, page)| page).collect())
+		Ok(pages.into_iter().map(|(_page_no, page)| page).collect())
 	}
 }
 
@@ -646,6 +655,360 @@ pub(super) fn build_graph_image(
 		payloads,
 		indexes,
 	})
+}
+
+pub(super) fn build_node_append_delta(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	current: &GraphCatalogEntry,
+	record_id: &RecordId,
+	name: &str,
+	base: &LocalGraph,
+	nodes: &[LocalCommitNode],
+	dictionary: &mut PropertyDictionary,
+) -> FerrosGrynnResult<BuiltGraphDelta> {
+	if nodes.is_empty()
+		|| current.parent_graph_id.is_some()
+		|| current.identity != *base.identity.as_inner().as_bytes()
+		|| current.revision != base.revision
+		|| current.graph_id != base.graph_id
+		|| current.record_id != record_id.to_string()
+		|| !base.supports_node_append_delta()
+	{
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"node append delta does not match its durable base graph",
+		));
+	}
+
+	let node_count = u64::try_from(nodes.len())
+		.map_err(|_error| FerrosGrynnError::invalid_storage_file("node delta exceeds u64"))?;
+	let next_capacity = base
+		.superblock
+		.node_capacity
+		.checked_add(node_count)
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("node capacity overflows u64"))?;
+	let next_revision = base
+		.revision
+		.checked_add(node_count)
+		.ok_or_else(|| FerrosGrynnError::graph_capacity_exceeded("revision".to_owned()))?;
+	for (offset, node) in nodes.iter().enumerate() {
+		let expected = base
+			.superblock
+			.node_capacity
+			.checked_add(u64::try_from(offset).map_err(|_error| {
+				FerrosGrynnError::invalid_storage_file("node delta offset exceeds u64")
+			})?)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("node slot overflows u64"))?;
+		if node.id.kind() != Some(AtomKind::Node)
+			|| node.id.slot() != expected
+			|| node.id.generation() != 0
+		{
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"node append delta contains a non-contiguous slot",
+			));
+		}
+	}
+
+	let mut context = EncodeContext::new(dictionary.clone());
+	for (expected, table) in base.labels.table_names.iter().enumerate() {
+		let actual = context.register_table_name(table.clone().into())?;
+		if usize::try_from(actual).ok() != Some(expected) {
+			return Err(FerrosGrynnError::invalid_storage_file("table dictionary is not dense"));
+		}
+	}
+	for (index, zone) in base.labels.time_zones.iter().enumerate() {
+		let actual = context.register_time_zone_name(zone.clone().into())?;
+		let expected = u32::try_from(index)
+			.ok()
+			.and_then(|index| index.checked_add(1))
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("time-zone id overflows"))?;
+		if actual != expected {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"time-zone dictionary is not dense",
+			));
+		}
+	}
+	for table in nodes.iter().map(|node| node.record_id.table()).collect::<BTreeSet<_>>() {
+		context.register_table_name(table.to_owned().into())?;
+	}
+
+	// ponytail: the first physical delta still bulk-rebuilds the primary
+	// B+tree. Replace this with right-edge incremental insertion only if this
+	// measured ceiling dominates after full graph materialization is gone.
+	let mut primary_entries = scan_primary_index(
+		|page_no, output| {
+			let page =
+				manager.read_page(transaction, base.page_key(DataFileKind::Index, page_no)?)?;
+			output.as_bytes_mut().copy_from_slice(page.as_bytes());
+			Ok(())
+		},
+		base.primary_index_root,
+	)?;
+	for entry in &primary_entries {
+		let stored = CanonicalCodec::decode(&entry.key, DecodeLimits::default())?;
+		let Value::Record(record) = stored.into_runtime(&context.decoder())? else {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"primary index key is not a canonical RecordId",
+			));
+		};
+		context.register_atom(AtomRef::new(entry.atom.kind(), *record), entry.atom)?;
+	}
+	for node in nodes {
+		let atom = DiskAtomRef::from_parts(AtomKind::Node, node.id.slot())?;
+		context.register_atom(AtomRef::new(AtomKind::Node, node.record_id.clone()), atom)?;
+		let key = CanonicalCodec::encode(
+			StorageValue::from_runtime(
+				Value::Record(Box::new(node.record_id.clone())),
+				&mut context,
+			)?
+			.as_ref(),
+		)?;
+		primary_entries.push(PrimaryIndexEntry {
+			key,
+			atom,
+		});
+	}
+	primary_entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+	let primary = build_primary_index(&primary_entries, PageLsn::ZERO)?;
+	for (index, page) in primary.pages.iter().enumerate() {
+		page.validate(PageNo::new(u64::try_from(index).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("primary page index exceeds u64")
+		})?))?;
+	}
+
+	let mut labels = base.labels.clone();
+	for label in nodes
+		.iter()
+		.filter_map(|node| node.label.as_ref().map(|label| label.as_str()))
+		.collect::<BTreeSet<_>>()
+	{
+		if !labels.node_labels.iter().any(|existing| existing == label) {
+			labels.node_labels.push(label.to_owned());
+		}
+	}
+	let node_label_ids = labels
+		.node_labels
+		.iter()
+		.enumerate()
+		.map(|(index, label)| {
+			u32::try_from(index).map(|index| (label.as_str(), index)).map_err(|_error| {
+				FerrosGrynnError::invalid_storage_file("node label id exceeds u32")
+			})
+		})
+		.collect::<FerrosGrynnResult<BTreeMap<_, _>>>()?;
+	let table_ids = context
+		.table_names()
+		.enumerate()
+		.map(|(index, table)| {
+			u32::try_from(index)
+				.map(|index| (table.as_str().to_owned(), index))
+				.map_err(|_error| FerrosGrynnError::invalid_storage_file("table id exceeds u32"))
+		})
+		.collect::<FerrosGrynnResult<BTreeMap<_, _>>>()?;
+
+	let mut property_store = PropertyStoreBuilder::starting_at(base.superblock.properties_pages);
+	let mut node_pages = BTreeMap::<PageNo, Box<AlignedPage>>::new();
+	for node in nodes {
+		let (page_no, within_page) = hot_slot_address(node.id.slot())?;
+		if !node_pages.contains_key(&page_no) {
+			let page = if page_no.get() < base.superblock.node_hot_pages {
+				let current = manager
+					.read_page(transaction, base.page_key(DataFileKind::NodesHot, page_no)?)?;
+				let mut page = Box::new(AlignedPage::zeroed());
+				page.as_bytes_mut().copy_from_slice(current.as_bytes());
+				page.assign_lsn(page_no, PageLsn::ZERO)?;
+				page
+			} else {
+				boxed_page(page_no, &new_node_hot_page(page_no, PageLsn::ZERO)?)?
+			};
+			node_pages.insert(page_no, page);
+		}
+		let page = node_pages
+			.get(&page_no)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("node delta page is absent"))?;
+		if !read_node_hot_slot(page, page_no, within_page)?.flags.contains(NodeSlotFlags::TOMBSTONE)
+		{
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"node append delta targets a live slot",
+			));
+		}
+	}
+	for node in nodes {
+		let properties =
+			encode_optional_properties(&node.properties, &mut context, &mut property_store)?;
+		let (page_no, within_page) = hot_slot_address(node.id.slot())?;
+		let page = node_pages
+			.get_mut(&page_no)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("node delta page is absent"))?;
+		write_node_hot_slot(page, within_page, &NodeHotSlot {
+			generation: node.id.generation(),
+			subgraph_slot: None,
+			label_id: node
+				.label
+				.as_ref()
+				.map(|label| {
+					node_label_ids.get(label.as_str()).copied().ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("node label was not interned")
+					})
+				})
+				.transpose()?,
+			table_id: Some(table_ids.get(node.record_id.table()).copied().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("node table was not interned")
+			})?),
+			out_count: 0,
+			in_count: 0,
+			undirected_count: 0,
+			flags: NodeSlotFlags::empty(),
+			out_overflow: None,
+			in_overflow: None,
+			undirected_overflow: None,
+			properties,
+			out_inline: [None; 4],
+			in_inline: [None; 4],
+			undirected_inline: [None; 2],
+		})?;
+	}
+	for (page_no, page) in &mut node_pages {
+		page.seal()?;
+		page.validate(*page_no)?;
+	}
+	let property_pages = property_store.finish_numbered()?;
+
+	labels.property_keys = context
+		.property_dictionary()
+		.iter()
+		.map(|(_id, property)| property.as_str().to_owned())
+		.collect();
+	labels.table_names = context.table_names().map(|table| table.as_str().to_owned()).collect();
+	labels.time_zones = context.time_zone_names().map(|zone| zone.as_str().to_owned()).collect();
+	let label_pages = encode_label_dictionary(&labels, PageLsn::ZERO)?;
+	*dictionary = context.property_dictionary().clone();
+
+	let mut statistics_page = AlignedPage::zeroed();
+	let statistics =
+		manager.read_page(transaction, base.page_key(DataFileKind::Statistics, PageNo::new(0))?)?;
+	statistics_page.as_bytes_mut().copy_from_slice(statistics.as_bytes());
+	let previous_statistics = decode_graph_statistics(&statistics_page)?;
+	if previous_statistics.node_count != base.superblock.node_count
+		|| previous_statistics.edge_count != base.superblock.edge_count
+	{
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"statistics counts disagree with GraphSuperblock",
+		));
+	}
+	let next_node_count = base
+		.superblock
+		.node_count
+		.checked_add(node_count)
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("node count overflows u64"))?;
+	let divisor = if next_node_count == 0 {
+		1.0
+	} else {
+		next_node_count as f64
+	};
+	let statistics = encode_graph_statistics(
+		GraphStatistics {
+			node_count: next_node_count,
+			edge_count: previous_statistics.edge_count,
+			average_out_degree: previous_statistics.average_out_degree
+				* base.superblock.node_count as f64
+				/ divisor,
+			average_in_degree: previous_statistics.average_in_degree
+				* base.superblock.node_count as f64
+				/ divisor,
+			maximum_out_degree: previous_statistics.maximum_out_degree,
+			maximum_in_degree: previous_statistics.maximum_in_degree,
+		},
+		PageLsn::ZERO,
+	)?;
+
+	let mut superblock = base.superblock.clone();
+	superblock.updated_at_ms = unix_time_ms()?;
+	superblock.node_capacity = next_capacity;
+	superblock.node_count = next_node_count;
+	superblock.node_hot_pages = u64::try_from(page_count_for_slots(next_capacity)?)
+		.map_err(|_error| FerrosGrynnError::invalid_storage_file("node page count exceeds u64"))?;
+	superblock.properties_pages = property_pages
+		.last()
+		.map_or(Some(base.superblock.properties_pages), |(page_no, _page)| {
+			page_no.get().checked_add(1)
+		})
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("property page count overflows"))?;
+	superblock.labels_size_bytes = u64::try_from(label_pages.len())
+		.ok()
+		.and_then(|pages| pages.checked_mul(PAGE_SIZE as u64))
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("label file size overflows"))?;
+	superblock.graph_name = name.to_owned();
+
+	let mut catalog_entry = current.clone();
+	catalog_entry.name = name.to_owned();
+	catalog_entry.revision = next_revision;
+	catalog_entry.primary_index_root = primary.root;
+
+	let mut payloads = BTreeMap::new();
+	payloads.insert(DataFileKind::NodesHot, node_pages.into_iter().collect());
+	if !property_pages.is_empty() {
+		payloads.insert(DataFileKind::Properties, box_numbered_pages(property_pages)?);
+	}
+	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
+	payloads.insert(DataFileKind::Statistics, vec![(
+		PageNo::new(0),
+		boxed_page(PageNo::new(0), &statistics)?,
+	)]);
+	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
+	Ok(BuiltGraphDelta {
+		catalog_entry,
+		superblock,
+		payloads,
+	})
+}
+
+fn number_pages(pages: Vec<AlignedPage>) -> FerrosGrynnResult<Vec<(PageNo, Box<AlignedPage>)>> {
+	pages
+		.iter()
+		.enumerate()
+		.map(|(index, page)| {
+			let page_no = u64::try_from(index).map(PageNo::new).map_err(|_error| {
+				FerrosGrynnError::invalid_storage_file("graph page index exceeds u64")
+			})?;
+			Ok((page_no, boxed_page(page_no, page)?))
+		})
+		.collect()
+}
+
+fn box_numbered_pages(
+	pages: Vec<(PageNo, AlignedPage)>,
+) -> FerrosGrynnResult<Vec<(PageNo, Box<AlignedPage>)>> {
+	pages.iter().map(|(page_no, page)| Ok((*page_no, boxed_page(*page_no, page)?))).collect()
+}
+
+fn boxed_page(page_no: PageNo, page: &AlignedPage) -> FerrosGrynnResult<Box<AlignedPage>> {
+	page.validate(page_no)?;
+	let mut stored = Box::new(AlignedPage::zeroed());
+	stored.as_bytes_mut().copy_from_slice(page.as_bytes());
+	stored.validate(page_no)?;
+	Ok(stored)
+}
+
+#[cfg(test)]
+#[test]
+fn numbered_delta_pages_preserve_aligned_headers() -> FerrosGrynnResult<()> {
+	let index = build_primary_index(
+		&[
+			PrimaryIndexEntry {
+				key: vec![1],
+				atom: DiskAtomRef::from_parts(AtomKind::Node, 0)?,
+			},
+			PrimaryIndexEntry {
+				key: vec![2],
+				atom: DiskAtomRef::from_parts(AtomKind::Node, 1)?,
+			},
+		],
+		PageLsn::ZERO,
+	)?;
+	let pages = number_pages(index.pages)?;
+	pages[0].1.validate(PageNo::new(0))?;
+	Ok(())
 }
 
 pub(super) fn build_scalar_indexes(

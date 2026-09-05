@@ -15,6 +15,8 @@ use crate::{
 	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
+		LocalCommitGraph,
+		LocalCommitGraphChange,
 		LocalEdgeRead,
 		LocalGraph,
 		LocalGraphView,
@@ -307,7 +309,7 @@ impl Datastore {
 		let mut next = (*current).clone();
 		let key = Arc::make_mut(&mut next.dictionary).intern(name)?;
 		next.commit_ts = commit_ts;
-		if let Some(persisted) = self.inner.persist_root(commit_ts, &next, &[])? {
+		if let Some(persisted) = self.inner.persist_root(commit_ts, &next, &[], Vec::new())? {
 			next.dictionary = persisted.property_dictionary;
 		}
 		*self.inner.current.write() = Arc::new(next);

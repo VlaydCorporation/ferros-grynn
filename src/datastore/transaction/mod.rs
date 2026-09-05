@@ -134,8 +134,9 @@ impl Transaction {
 		// ponytail: cloning the shallow catalog is O(graphs + tables); use a
 		// persistent map only after catalog size appears in profiles.
 		let mut next = (*current).clone();
+		let mut local_commits = Vec::new();
 		for (id, write) in std::mem::take(&mut self.graphs) {
-			self.apply_graph_write(&mut next, &current, id, write, commit_ts)?;
+			self.apply_graph_write(&mut next, &current, id, write, commit_ts, &mut local_commits)?;
 		}
 		for (name, schema) in std::mem::take(&mut self.tables) {
 			match schema {
@@ -190,7 +191,9 @@ impl Transaction {
 		changed_graphs
 			.extend(current.graphs.keys().filter(|id| !next.graphs.contains_key(*id)).cloned());
 		next.commit_ts = commit_ts;
-		if let Some(persisted) = self.store.inner.persist_root(commit_ts, &next, &changed_graphs)? {
+		if let Some(persisted) =
+			self.store.inner.persist_root(commit_ts, &next, &changed_graphs, local_commits)?
+		{
 			next.dictionary = persisted.property_dictionary;
 			for entry in persisted.graphs {
 				let stored = next.graphs.get_mut(&entry.record_id).ok_or_else(|| {
@@ -282,7 +285,7 @@ impl Transaction {
 
 	fn visible_graph_kind(&self, id: &RecordId) -> Option<GraphKind> {
 		if let Some(write) = self.graphs.get(id) {
-			return write.value.as_ref().map(MutableGraphValue::kind);
+			return write.kind();
 		}
 		self.read_root().graphs.get(id).map(|stored| stored.graph.kind())
 	}
@@ -298,6 +301,10 @@ impl Transaction {
 	fn estimated_write_set_bytes(&self) -> FerrosGrynnResult<usize> {
 		let mut estimated = 0_usize;
 		for write in self.graphs.values() {
+			if let Some(local) = &write.local {
+				estimated = estimated.saturating_add(local.delta.estimated_write_set_bytes());
+				continue;
+			}
 			let Some(value) = write.value.as_ref() else {
 				estimated = estimated.saturating_add(CATALOG_DELETE_WRITE_BYTES);
 				continue;
@@ -311,16 +318,45 @@ impl Transaction {
 			estimated =
 				estimated.saturating_add(dirty.len().saturating_mul(DIRTY_TARGET_WRITE_BYTES));
 			for target in dirty {
-				let properties = match target {
-					DirtyTarget::Graph => Some(snapshot.properties()),
+				match target {
+					DirtyTarget::Graph => {
+						estimated =
+							estimated.saturating_add(snapshot.properties().estimated_heap_bytes());
+					}
 					DirtyTarget::Atom(atom) => match atom.kind() {
-						Some(AtomKind::Node) => snapshot.node(atom).map(|node| node.properties()),
-						Some(AtomKind::Edge) => snapshot.edge(atom).map(|edge| edge.properties()),
-						None => None,
+						Some(AtomKind::Node) => {
+							if let Some(node) = snapshot.node(atom) {
+								estimated = estimated
+									.saturating_add(node.record_id().estimated_heap_bytes())
+									.saturating_add(node.label_text().map_or(0, Text::len))
+									.saturating_add(node.properties().estimated_heap_bytes());
+								if let Some(inner) = node.inner_graph() {
+									estimated = estimated.saturating_add(
+										crate::graph::estimated_nested_graph_heap_bytes(inner)?,
+									);
+								}
+							}
+						}
+						Some(AtomKind::Edge) => {
+							if let Some(edge) = snapshot.edge(atom) {
+								estimated = estimated
+									.saturating_add(edge.record_id().estimated_heap_bytes())
+									.saturating_add(edge.label_text().map_or(0, Text::len))
+									.saturating_add(edge.properties().estimated_heap_bytes())
+									.saturating_add(
+										edge.topology()
+											.endpoint_count()
+											.saturating_mul(std::mem::size_of::<EdgeEndpoint>()),
+									);
+								if let Some(transition) = edge.transition_graph() {
+									estimated = estimated.saturating_add(
+										crate::graph::estimated_nested_graph_heap_bytes(transition)?,
+									);
+								}
+							}
+						}
+						None => {}
 					},
-				};
-				if let Some(properties) = properties {
-					estimated = estimated.saturating_add(properties.estimated_heap_bytes());
 				}
 			}
 		}

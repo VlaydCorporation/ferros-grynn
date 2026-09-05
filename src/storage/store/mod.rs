@@ -184,8 +184,33 @@ pub struct LocalCommitGraph {
 	pub record_id: RecordId,
 	/// Case-sensitive user-visible graph name.
 	pub name: String,
-	/// Immutable MVCC graph image being published.
-	pub graph: Arc<MaterializedGraph>,
+	/// Physical change being published.
+	pub change: LocalCommitGraphChange,
+}
+
+/// Graph payload accepted by one local durable commit.
+pub enum LocalCommitGraphChange {
+	/// Complete immutable graph image used by the compatibility path.
+	Materialized(Arc<MaterializedGraph>),
+	/// Append-only node delta applied without materializing the existing graph.
+	AppendNodes {
+		/// Exact durable graph version on which the delta is based.
+		base: Arc<LocalGraph>,
+		/// New nodes in stable slot order.
+		nodes: Vec<LocalCommitNode>,
+	},
+}
+
+/// One append-only node supplied by the MVCC layer.
+pub struct LocalCommitNode {
+	/// Stable in-graph slot allocated by the transaction.
+	pub id: AtomId,
+	/// Public record identity stored in the primary index.
+	pub record_id: RecordId,
+	/// Optional node label.
+	pub label: Option<Text>,
+	/// Owned property payload.
+	pub properties: PropertyMap,
 }
 
 /// Opaque durable graph descriptor retained without materializing its atoms.
@@ -231,6 +256,14 @@ impl LocalGraph {
 
 	pub(crate) const fn reference(&self) -> &GraphRef {
 		&self.reference
+	}
+
+	pub(crate) const fn node_capacity(&self) -> u64 {
+		self.superblock.node_capacity
+	}
+
+	pub(crate) fn supports_node_append_delta(&self) -> bool {
+		self.scalar_indexes.is_empty()
 	}
 
 	fn file_id(&self, kind: DataFileKind) -> FerrosGrynnResult<DataFileId> {
@@ -842,17 +875,56 @@ impl LocalStore {
 				}
 				continue;
 			};
+			if let LocalCommitGraphChange::AppendNodes {
+				base,
+				nodes,
+			} = &commit_graph.change
+			{
+				let index = existing.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"node append delta targets a graph absent from the durable catalog",
+					)
+				})?;
+				let current = database.graphs[index].clone();
+				let delta = build_node_append_delta(
+					&self.manager,
+					&transaction,
+					&current,
+					record_id,
+					&commit_graph.name,
+					base,
+					nodes,
+					&mut dictionary,
+				)?;
+				let mut next_file_instance_id = files.next_file_instance_id;
+				let generation = write_delta_graph_generation(
+					&self.root,
+					&self.manager,
+					&transaction,
+					&current,
+					&files,
+					delta,
+					&mut next_file_instance_id,
+				)?;
+				files.next_file_instance_id = next_file_instance_id;
+				files.files.retain(|entry| entry.graph_id != current.graph_id);
+				files.files.extend(generation.file_entries);
+				registrations.extend(generation.registrations);
+				new_superblocks.push(generation.superblock);
+				database.graphs[index] = generation.catalog_entry;
+				continue;
+			}
+			let LocalCommitGraphChange::Materialized(graph) = &commit_graph.change else {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"unsupported local graph commit change",
+				));
+			};
 			let graph_id = match existing {
 				Some(index) => database.graphs[index].graph_id,
 				None => allocate_graph_id(&mut database)?,
 			};
-			let plan = plan_graph_tree(
-				&mut database,
-				graph_id,
-				record_id,
-				&commit_graph.name,
-				&commit_graph.graph,
-			)?;
+			let plan =
+				plan_graph_tree(&mut database, graph_id, record_id, &commit_graph.name, graph)?;
 			let mut images = build_graph_images(&plan, &mut dictionary, tables)?;
 			let in_place = if images.len() == 1
 				&& let Some(index) = existing

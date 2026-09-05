@@ -189,16 +189,10 @@ impl Transaction {
 		name: &str,
 	) -> FerrosGrynnResult<GraphRef> {
 		self.ensure_live()?;
-		if let Some((record_id, write)) = self
-			.graphs
-			.iter()
-			.find(|(_record_id, write)| write.name == name && write.value.is_some())
+		if let Some((record_id, write)) =
+			self.graphs.iter().find(|(_record_id, write)| write.name == name && write.exists())
 		{
-			let kind = write
-				.value
-				.as_ref()
-				.map(MutableGraphValue::kind)
-				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
+			let kind = write.kind().ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
 			self.record_read(&snapshot.root, ReadKey::GraphCatalog(record_id.clone()));
 			return Ok(GraphRef::new(
 				record_id.clone(),
@@ -206,7 +200,7 @@ impl Transaction {
 				self.store.inner.graph_storage_mode(),
 			));
 		}
-		if self.graphs.values().any(|write| write.name == name && write.value.is_none()) {
+		if self.graphs.values().any(|write| write.name == name && !write.exists()) {
 			return Err(FerrosGrynnError::graph_does_not_exist(name));
 		}
 		let record_id = snapshot
@@ -255,9 +249,7 @@ impl Transaction {
 		let schema = self.query_table(snapshot, table)?;
 		self.record_read(&snapshot.root, ReadKey::GraphCatalog(schema.graph.id().clone()));
 		if let Some(write) = self.graphs.get(schema.graph.id()) {
-			let graph = write.value.as_ref().map(MutableGraphValue::snapshot).ok_or_else(|| {
-				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
-			})?;
+			let graph = write.snapshot(&self.store)?;
 			return Ok(QueryStorageCursor {
 				source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
 					Arc::new(graph),
@@ -318,9 +310,10 @@ impl Transaction {
 		let schema = self.query_table(snapshot, record.table())?;
 		self.record_read(&snapshot.root, ReadKey::GraphCatalog(schema.graph.id().clone()));
 		if let Some(write) = self.graphs.get(schema.graph.id()) {
-			let Some(graph) = write.value.as_ref().map(MutableGraphValue::snapshot) else {
+			if !write.exists() {
 				return Ok(None);
-			};
+			}
+			let graph = write.snapshot(&self.store)?;
 			let atom =
 				if let Some(atom) = graph.atom_id(&AtomRef::new(AtomKind::Node, record.clone()))? {
 					Some(atom)

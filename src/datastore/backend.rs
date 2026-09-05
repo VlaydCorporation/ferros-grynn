@@ -13,8 +13,14 @@ use super::{
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
-		LocalCommitGraph, LocalCommitResult, LocalCommitTable, LocalCommitTableField,
-		LocalCommitTableIndex, LocalStore, PageIoMode,
+		LocalCommitGraph,
+		LocalCommitGraphChange,
+		LocalCommitResult,
+		LocalCommitTable,
+		LocalCommitTableField,
+		LocalCommitTableIndex,
+		LocalStore,
+		PageIoMode,
 	},
 	values::runtime::{PropertyKeyId, RecordId, graph::GraphStorageMode},
 };
@@ -71,30 +77,29 @@ impl StoreInner {
 		expected_commit_ts: u64,
 		root: &DatabaseRoot,
 		changed_graphs: &[RecordId],
+		mut graphs: Vec<LocalCommitGraph>,
 	) -> FerrosGrynnResult<Option<LocalCommitResult>> {
 		let StoreBackend::Local(local) = &self.backend else {
 			return Ok(None);
 		};
-		let graphs = changed_graphs
-			.iter()
-			.filter_map(|record_id| root.graphs.get(record_id).map(|stored| (record_id, stored)))
-			.map(|(record_id, stored)| {
-				stored
-					.graph
-					.materialized()
-					.cloned()
-					.map(|graph| LocalCommitGraph {
-						record_id: record_id.clone(),
-						name: stored.name.clone(),
-						graph,
-					})
-					.ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file(
-							"changed local graph has no materialized commit image",
-						)
-					})
-			})
-			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		for record_id in changed_graphs {
+			if graphs.iter().any(|graph| graph.record_id == *record_id) {
+				continue;
+			}
+			let Some(stored) = root.graphs.get(record_id) else {
+				continue;
+			};
+			let graph = stored.graph.materialized().cloned().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"changed local graph has no materialized commit image or physical delta",
+				)
+			})?;
+			graphs.push(LocalCommitGraph {
+				record_id: record_id.clone(),
+				name: stored.name.clone(),
+				change: LocalCommitGraphChange::Materialized(graph),
+			});
+		}
 		let tables = root
 			.tables
 			.values()

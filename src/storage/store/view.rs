@@ -20,6 +20,12 @@ impl LocalGraphView<'_> {
 	) -> FerrosGrynnResult<(Graph<Mutable>, BTreeMap<AtomId, AtomRef>)> {
 		self.store.materialize_query_graph(self, record_atom)
 	}
+
+	/// Checks the exact primary key without imposing an atom-kind expectation.
+	pub(crate) fn contains_record_id(&self, record_id: &RecordId) -> FerrosGrynnResult<bool> {
+		lookup_local_record(self.store, &self.transaction, self.graph.as_ref(), record_id)
+			.map(|atom| atom.is_some())
+	}
 }
 
 /// Node projection retaining the hot page pin while cold properties remain
@@ -601,15 +607,7 @@ pub(super) fn lookup_local_atom(
 	graph: &LocalGraph,
 	reference: &AtomRef,
 ) -> FerrosGrynnResult<Option<AtomId>> {
-	let mut context = graph.base_context()?;
-	let key = encode_record_key(reference.id(), &mut context)?;
-	let atom = lookup_primary_index(
-		|page_no, output| {
-			copy_local_page(store, transaction, graph, DataFileKind::Index, page_no, output)
-		},
-		graph.primary_index_root,
-		&key,
-	)?;
+	let atom = lookup_local_record(store, transaction, graph, reference.id())?;
 	let Some(atom) = atom else {
 		return Ok(None);
 	};
@@ -619,6 +617,23 @@ pub(super) fn lookup_local_atom(
 		));
 	}
 	local_atom_id(store, transaction, graph, atom).map(Some)
+}
+
+fn lookup_local_record(
+	store: &LocalStore,
+	transaction: &LocalReadTransaction,
+	graph: &LocalGraph,
+	record_id: &RecordId,
+) -> FerrosGrynnResult<Option<DiskAtomRef>> {
+	let mut context = graph.base_context()?;
+	let key = encode_record_key(record_id, &mut context)?;
+	lookup_primary_index(
+		|page_no, output| {
+			copy_local_page(store, transaction, graph, DataFileKind::Index, page_no, output)
+		},
+		graph.primary_index_root,
+		&key,
+	)
 }
 
 pub(super) fn record_for_local_atom(

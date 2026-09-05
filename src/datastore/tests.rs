@@ -630,6 +630,50 @@ fn local_point_mutations_survive_reopen() {
 	);
 }
 
+/// Appending nodes through the backend-neutral mutation view retains only the
+/// transaction delta until commit instead of materializing the local graph.
+#[cfg(windows)]
+#[test]
+fn local_node_append_stays_delta_backed_until_commit() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let mut create = store.begin();
+	let graph = create
+		.create_graph(graph_id("delta-append"), Graph::<Mutable>::new().freeze().into())
+		.unwrap();
+	create.commit().unwrap();
+
+	let payload_key = store.intern_property("payload").unwrap();
+	let payload = Bytes::from(vec![0x5a; 20_000]);
+	let composite: RecordId = r#"item:[7,{"region":"eu"}]"#.parse().unwrap();
+	let scalar: RecordId = "item:second".parse().unwrap();
+	let mut transaction = store.begin();
+	{
+		let mut mutation = transaction.mutate_graph(&graph).unwrap();
+		let mut properties = PropertyMap::new();
+		properties.insert(payload_key, payload.clone());
+		mutation.create_node(composite.clone(), Some("Composite".into()), properties).unwrap();
+		mutation.create_node(scalar.clone(), None, PropertyMap::new()).unwrap();
+	}
+	let pending = transaction.graphs.get(graph.id()).unwrap();
+	assert!(pending.is_delta_backed());
+	transaction.commit().unwrap();
+	drop(store);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	let read = reopened.begin();
+	let view = graph.read(&read).unwrap();
+	let composite = view.atom_id(&AtomRef::new(AtomKind::Node, composite)).unwrap().unwrap();
+	let composite = view.node(composite).unwrap().unwrap();
+	assert_eq!(composite.label_text().unwrap().as_deref(), Some(&Text::from("Composite")));
+	assert_eq!(composite.properties().unwrap().get(payload_key), Some(&Value::from(payload)));
+	assert!(view.atom_id(&AtomRef::new(AtomKind::Node, scalar)).unwrap().is_some());
+}
+
 /// The public local path reads large property chains and adjacency
 /// overflow, while an aborted materialized mutation remains
 /// transaction-private.

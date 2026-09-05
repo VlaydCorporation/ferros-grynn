@@ -21,6 +21,12 @@ pub(super) struct BuiltGraphImage {
 	pub(super) indexes: Vec<BuiltScalarIndexImage>,
 }
 
+pub(super) struct BuiltGraphDelta {
+	pub(super) catalog_entry: GraphCatalogEntry,
+	pub(super) superblock: GraphSuperblock,
+	pub(super) payloads: BTreeMap<DataFileKind, Vec<(PageNo, Box<AlignedPage>)>>,
+}
+
 pub(super) struct PlannedGraph {
 	pub(super) graph_id: GraphId,
 	pub(super) record_id: RecordId,
@@ -451,11 +457,12 @@ pub(super) fn open_local_graph(
 		));
 	}
 	let labels_file = open_graph_file(&paths, DataFileKind::Labels)?;
-	if labels_file.page_count().checked_mul(PAGE_SIZE as u64) != Some(superblock.labels_size_bytes)
-	{
-		return Err(FerrosGrynnError::invalid_storage_file(
-			"label file length disagrees with GraphSuperblock",
-		));
+	let labels_size = labels_file.page_count().checked_mul(PAGE_SIZE as u64);
+	if labels_size != Some(superblock.labels_size_bytes) {
+		return Err(FerrosGrynnError::invalid_storage_file(format!(
+			"label file length {:?} disagrees with GraphSuperblock {}",
+			labels_size, superblock.labels_size_bytes
+		)));
 	}
 	let labels_id = file_ids
 		.get(&DataFileKind::Labels)
@@ -726,6 +733,142 @@ pub(super) fn write_new_graph_generation(
 		registrations,
 		superblock: image.superblock,
 		indexes,
+	})
+}
+
+pub(super) fn write_delta_graph_generation(
+	root: &Path,
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	current: &GraphCatalogEntry,
+	files: &FileCatalog,
+	delta: BuiltGraphDelta,
+	next_file_instance_id: &mut u64,
+) -> FerrosGrynnResult<BuiltGraphGeneration> {
+	let graph_id = current.graph_id;
+	if delta.catalog_entry.graph_id != graph_id || delta.superblock.graph_id != graph_id {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"graph delta identity disagrees with its durable generation",
+		));
+	}
+	let source_ids = graph_file_ids(current, files)?;
+	let generation_name = Uuid::now_v7().to_string();
+	let relative_directory = format!("graphs/{:016x}/{generation_name}", graph_id.get());
+	let absolute_directory =
+		root.join(relative_directory.replace('/', std::path::MAIN_SEPARATOR_STR));
+	fs::create_dir_all(&absolute_directory)
+		.map_err(|source| storage_io("create graph delta generation directory", source))?;
+
+	let mut catalog_entry = delta.catalog_entry;
+	let mut superblock = delta.superblock;
+	let mut payloads = delta.payloads;
+	let mut file_entries = Vec::with_capacity(GRAPH_FILE_KINDS.len());
+	let mut registrations = Vec::with_capacity(GRAPH_FILE_KINDS.len());
+	for (kind, filename) in GRAPH_FILE_KINDS {
+		let file_id = allocate_file_id(next_file_instance_id, kind)?;
+		if kind == DataFileKind::Index {
+			catalog_entry.primary_index_file_id = file_id;
+		}
+		let relative = format!("{relative_directory}/{filename}");
+		let catalog_path = CatalogPath::parse(&relative)?;
+		let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+		let output = DirectFile::create_new(&absolute)?;
+		if kind == DataFileKind::GraphSuperblock {
+			superblock.generation = CheckpointGeneration::ZERO;
+			superblock.backfilled_lsn = Lsn::ZERO;
+			superblock.checkpoint_record_lsn = Lsn::ZERO;
+			output.write_page(PageNo::new(0), &superblock.encode()?)?;
+		} else {
+			let source_id = source_ids.get(&kind).copied().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(format!(
+					"graph source file {kind:?} is missing"
+				))
+			})?;
+			let source_pages = manager.file_page_count(graph_id, source_id)?;
+			let pages = payloads.remove(&kind).unwrap_or_default();
+			let required_pages = pages
+				.last()
+				.map_or(Some(source_pages), |(page_no, _page)| page_no.get().checked_add(1))
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("graph delta page count exceeds u64")
+				})?
+				.max(source_pages);
+			let mut previous = None;
+			let mut next_tail = source_pages;
+			for (page_no, page) in &pages {
+				if previous.is_some_and(|previous| previous >= page_no.get()) {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"graph delta pages are not strictly ordered",
+					));
+				}
+				previous = Some(page_no.get());
+				page.validate(*page_no)?;
+				if page_no.get() >= source_pages {
+					if page_no.get() != next_tail {
+						return Err(FerrosGrynnError::invalid_storage_file(
+							"graph delta would leave an uninitialized file gap",
+						));
+					}
+					next_tail = next_tail.checked_add(1).ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("graph delta page count exceeds u64")
+					})?;
+				}
+			}
+			if next_tail != required_pages {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"graph delta does not initialize its complete file tail",
+				));
+			}
+
+			output.resize_pages(required_pages)?;
+			for raw_page_no in 0..source_pages {
+				let page_no = PageNo::new(raw_page_no);
+				let source = manager.read_page(
+					transaction,
+					crate::storage::types::PageKey::new(graph_id, source_id, page_no),
+				)?;
+				let mut page = AlignedPage::zeroed();
+				page.as_bytes_mut().copy_from_slice(source.as_bytes());
+				page.assign_lsn(page_no, PageLsn::ZERO)?;
+				output.write_page(page_no, &page)?;
+			}
+			for (page_no, page) in pages {
+				output.write_page(page_no, &page)?;
+			}
+		}
+		output.sync_all()?;
+		let role = if kind == DataFileKind::GraphSuperblock {
+			DataFileRole::GraphSuperblock
+		} else {
+			DataFileRole::WalBackfilled
+		};
+		file_entries.push(FileCatalogEntry {
+			graph_id,
+			file_id,
+			role,
+			path: catalog_path,
+		});
+		registrations.push(DataFileRegistration {
+			graph_id,
+			file_id,
+			role,
+			path: absolute,
+		});
+	}
+	if !payloads.is_empty() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"graph delta contains an unregistered payload",
+		));
+	}
+	// ponytail: a layout-changing delta streams the complete physical
+	// generation; add block cloning only if COW copy time dominates measured
+	// point commits.
+	Ok(BuiltGraphGeneration {
+		catalog_entry,
+		file_entries,
+		registrations,
+		superblock,
+		indexes: Vec::new(),
 	})
 }
 

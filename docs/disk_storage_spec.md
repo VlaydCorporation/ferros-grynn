@@ -1615,6 +1615,16 @@ checkpoint-протоколу: обычный `stage_frame` не имеет пр
 продвинутый graph superblock после crash не становится глобальной authority, пока тем же
 checkpoint не заменён `db.fgb`.
 
+**Текущее checkpoint-owned ограничение format v1:** обычная транзакция может обновлять текущее
+поколение in-place только тогда, когда все поля `GraphSuperblock` остаются неизменными. Если
+мутация меняет `node/edge/subgraph capacity` или count, число hot/property pages, размер labels,
+flags либо schema/statistics roots, она обязана сначала построить и синхронизировать отдельное
+COW-поколение вместе с новым `GraphSuperblock`, а затем атомарно переключить на него durable
+catalog. Расширить старые data-файлы, опубликовать только их WAL-frames и заменить superblock лишь
+в in-memory authority недостаточно: после reopen checkpoint-owned home-superblock снова задаст
+старую раскладку. Снятие этого ограничения требует отдельного транзакционно версионируемого
+metadata-протокола и несовместимого изменения core format/protocol.
+
 ---
 
 ## 18. SchemaCatalog — хранилище схем

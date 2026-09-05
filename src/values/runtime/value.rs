@@ -130,7 +130,7 @@ impl Value {
 				size_of::<AtomRef>().saturating_add(estimated_record_id_heap_bytes(value.id()))
 			}
 			Self::Path(value) => size_of_val(value.as_ref()),
-			Self::Graph(value) => size_of_val(value.as_ref()),
+			Self::Graph(value) => value.estimated_heap_bytes(),
 			Self::Closure(value) => size_of_val(value.as_ref())
 				.saturating_add(value.name().map_or(0, Text::len))
 				.saturating_add(value.parameters().len().saturating_mul(size_of::<Type>())),
@@ -364,7 +364,7 @@ fn estimated_values_heap_bytes<'a>(
 	)
 }
 
-fn estimated_record_id_heap_bytes(record: &RecordId) -> usize {
+pub(super) fn estimated_record_id_heap_bytes(record: &RecordId) -> usize {
 	record.table().len().saturating_add(estimated_record_part_heap_bytes(record.id()))
 }
 

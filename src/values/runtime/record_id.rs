@@ -106,6 +106,11 @@ impl RecordId {
 	pub fn into_parts(self) -> (Text, RecordIdPart) {
 		(self.table, self.id)
 	}
+
+	/// Estimates heap bytes owned by the table and composite identifier.
+	pub(crate) fn estimated_heap_bytes(&self) -> usize {
+		super::value::estimated_record_id_heap_bytes(self)
+	}
 }
 
 impl Display for RecordIdPart {

@@ -2,12 +2,16 @@ use std::{
 	borrow::Cow,
 	cmp::Ordering,
 	hash::{Hash, Hasher},
+	mem::{size_of, size_of_val},
 };
 
 use super::{
 	AtomId,
 	AtomKind,
 	Dag,
+	EdgeEndpoint,
+	EdgeRead,
+	EdgeTopology,
 	EdgeView,
 	Forest,
 	Frozen,
@@ -16,6 +20,7 @@ use super::{
 	GraphRead,
 	Hypergraph,
 	Metagraph,
+	NodeRead,
 	NodeView,
 	RootedTree,
 	Subgraph,
@@ -23,7 +28,7 @@ use super::{
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::{PropertyMap, Uuid},
+	values::runtime::{PropertyMap, RecordId, Text, Uuid},
 };
 
 /// Transport sum type for immutable graph query results.
@@ -113,7 +118,92 @@ impl GraphRead for MaterializedGraph {
 	}
 }
 
+/// Conservatively estimates heap bytes owned by one nested general graph.
+pub(crate) fn estimated_nested_graph_heap_bytes(
+	graph: &Graph<Frozen>,
+) -> FerrosGrynnResult<usize> {
+	estimated_graph_heap_bytes(
+		graph,
+		graph.slot_capacity(AtomKind::Node),
+		graph.slot_capacity(AtomKind::Edge),
+	)
+}
+
+fn estimated_graph_heap_bytes<Reader: GraphRead>(
+	graph: &Reader,
+	node_capacity: usize,
+	edge_capacity: usize,
+) -> FerrosGrynnResult<usize> {
+	let node_slot_bytes = size_of::<Option<RecordId>>()
+		.saturating_add(size_of::<Option<Text>>())
+		.saturating_add(size_of::<PropertyMap>())
+		.saturating_add(size_of::<Option<usize>>())
+		.saturating_add(size_of::<u32>());
+	let edge_slot_bytes = node_slot_bytes
+		.saturating_add(size_of::<Option<EdgeTopology>>())
+		.saturating_add(size_of::<Option<usize>>());
+	let mut bytes = size_of_val(graph)
+		.saturating_add(node_capacity.saturating_mul(node_slot_bytes))
+		.saturating_add(edge_capacity.saturating_mul(edge_slot_bytes))
+		.saturating_add(graph.properties()?.estimated_heap_bytes());
+	for id in graph.node_ids()? {
+		let id = id?;
+		let node = graph.node(id)?.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("nested graph node disappeared during accounting")
+		})?;
+		let record_id = node.record_id()?;
+		bytes = bytes.saturating_add(record_id.estimated_heap_bytes());
+		if let Some(label) = node.label_text()? {
+			bytes = bytes.saturating_add(label.len());
+		}
+		bytes = bytes.saturating_add(node.properties()?.estimated_heap_bytes());
+		if let Some(inner) = node.inner_graph()? {
+			bytes = bytes.saturating_add(estimated_nested_graph_heap_bytes(inner.as_ref())?);
+		}
+	}
+	for id in graph.edge_ids()? {
+		let id = id?;
+		let edge = graph.edge(id)?.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("nested graph edge disappeared during accounting")
+		})?;
+		let record_id = edge.record_id()?;
+		bytes = bytes.saturating_add(record_id.estimated_heap_bytes());
+		if let Some(label) = edge.label_text()? {
+			bytes = bytes.saturating_add(label.len());
+		}
+		bytes = bytes.saturating_add(edge.properties()?.estimated_heap_bytes());
+		let topology = edge.topology()?;
+		bytes = bytes.saturating_add(
+			topology.endpoint_count().saturating_mul(size_of::<EdgeEndpoint>()),
+		);
+		for endpoint in topology.endpoints() {
+			if let EdgeEndpoint::Nested(qualified) = endpoint {
+				bytes = bytes.saturating_add(
+					qualified.scope().len().saturating_mul(size_of::<AtomId>()),
+				);
+			}
+		}
+		if let Some(transition) = edge.transition_graph()? {
+			bytes = bytes
+				.saturating_add(estimated_nested_graph_heap_bytes(transition.as_ref())?);
+		}
+	}
+	Ok(bytes)
+}
+
 impl MaterializedGraph {
+	/// Estimates owned heap bytes, rejecting a transaction on accounting failure.
+	pub(crate) fn estimated_heap_bytes(&self) -> usize {
+		match estimated_graph_heap_bytes(
+			self,
+			self.slot_capacity(AtomKind::Node),
+			self.slot_capacity(AtomKind::Edge),
+		) {
+			Ok(bytes) => bytes,
+			Err(_error) => usize::MAX,
+		}
+	}
+
 	pub(crate) fn restore_free_slot(
 		&mut self,
 		kind: AtomKind,

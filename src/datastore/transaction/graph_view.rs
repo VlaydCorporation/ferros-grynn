@@ -28,10 +28,7 @@ impl Transaction {
 		ensure_store_reference(reference, self.store.inner.graph_storage_mode())?;
 		self.record_read(&root, ReadKey::GraphCatalog(reference.id().clone()));
 		let graph = if let Some(write) = self.graphs.get(reference.id()) {
-			let graph =
-				write.value.as_ref().map(|value| Arc::new(value.snapshot())).ok_or_else(|| {
-					FerrosGrynnError::graph_does_not_exist(reference.id().to_string())
-				})?;
+			let graph = Arc::new(write.snapshot(&self.store)?);
 			TransactionGraphSource::Materialized(graph)
 		} else {
 			let stored = root.graphs.get(reference.id()).ok_or_else(|| {

@@ -121,6 +121,8 @@ pub use page_io::PageIoMode;
 pub(crate) use store::LocalTableCursor;
 pub use store::{
 	LocalCommitGraph,
+	LocalCommitGraphChange,
+	LocalCommitNode,
 	LocalCommitResult,
 	LocalCommitTable,
 	LocalCommitTableField,
