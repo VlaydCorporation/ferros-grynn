@@ -18,8 +18,8 @@ use std::{
 };
 
 use parking_lot::Mutex;
-pub(crate) use view::LocalTableCursor;
 pub use view::{LocalEdgeRead, LocalGraphView, LocalNodeRead};
+pub(crate) use view::{LocalNodeAdjacency, LocalTableCursor};
 #[allow(
 	clippy::wildcard_imports,
 	reason = "move-only module split keeps the existing private store helpers during stage 1"
@@ -199,6 +199,13 @@ pub enum LocalCommitGraphChange {
 		/// New nodes in stable slot order.
 		nodes: Vec<LocalCommitNode>,
 	},
+	/// Final states of transaction-touched atoms applied as page deltas.
+	AtomDelta {
+		/// Exact durable graph version on which the delta is based.
+		base: Arc<LocalGraph>,
+		/// Bounded atom changes in stable slot order.
+		delta: LocalCommitAtomDelta,
+	},
 }
 
 /// One append-only node supplied by the MVCC layer.
@@ -211,6 +218,88 @@ pub struct LocalCommitNode {
 	pub label: Option<Text>,
 	/// Owned property payload.
 	pub properties: PropertyMap,
+}
+
+/// Final transaction-owned atom states supplied to the local page encoder.
+pub struct LocalCommitAtomDelta {
+	/// Revision after every successful logical mutation in this transaction.
+	pub revision: u64,
+	/// Allocated node-slot boundary after the mutation.
+	pub node_capacity: u64,
+	/// Allocated edge-slot boundary after the mutation.
+	pub edge_capacity: u64,
+	/// Changed node states in stable slot order.
+	pub nodes: Vec<LocalCommitNodeChange>,
+	/// Changed edge states in stable slot order.
+	pub edges: Vec<LocalCommitEdgeChange>,
+	/// Final adjacency for every node affected by an edge mutation.
+	pub adjacency: Vec<LocalCommitNodeAdjacency>,
+}
+
+/// Final role-separated adjacency for one live local node.
+pub struct LocalCommitNodeAdjacency {
+	/// Stable node identity.
+	pub id: AtomId,
+	/// Edges for which the node has an outgoing role.
+	pub outgoing: Vec<AtomId>,
+	/// Edges for which the node has an incoming role.
+	pub incoming: Vec<AtomId>,
+	/// Edges for which the node has an undirected role.
+	pub undirected: Vec<AtomId>,
+}
+
+/// One final node state in a local atom delta.
+pub enum LocalCommitNodeChange {
+	/// A created node or the final value of an updated existing node.
+	Upsert {
+		/// Stable generation-aware atom identity.
+		id: AtomId,
+		/// Stable public record identity.
+		record_id: RecordId,
+		/// Optional final label.
+		label: Option<Text>,
+		/// Complete final property map.
+		properties: PropertyMap,
+		/// Whether this transaction allocated the slot.
+		created: bool,
+	},
+	/// A tombstone for an atom that was live or allocated in this transaction.
+	Remove {
+		/// Stable pre-removal atom identity.
+		id: AtomId,
+		/// Whether this transaction allocated the slot.
+		created: bool,
+	},
+}
+
+/// One final edge state in a local atom delta.
+pub enum LocalCommitEdgeChange {
+	/// A created edge or the final value of an updated existing edge.
+	Upsert {
+		/// Stable generation-aware atom identity.
+		id: AtomId,
+		/// Stable public record identity.
+		record_id: RecordId,
+		/// Complete final incidence.
+		topology: EdgeTopology,
+		/// Optional final label.
+		label: Option<Text>,
+		/// Complete final property map.
+		properties: PropertyMap,
+		/// Optional final numeric weight.
+		weight: Option<crate::values::runtime::Number>,
+		/// Whether this transaction allocated the slot.
+		created: bool,
+		/// Whether an existing edge's incidence changed.
+		topology_changed: bool,
+	},
+	/// A tombstone for an edge that was live or allocated in this transaction.
+	Remove {
+		/// Stable pre-removal atom identity.
+		id: AtomId,
+		/// Whether this transaction allocated the slot.
+		created: bool,
+	},
 }
 
 /// Opaque durable graph descriptor retained without materializing its atoms.
@@ -262,7 +351,11 @@ impl LocalGraph {
 		self.superblock.node_capacity
 	}
 
-	pub(crate) fn supports_node_append_delta(&self) -> bool {
+	pub(crate) const fn edge_capacity(&self) -> u64 {
+		self.superblock.edge_capacity
+	}
+
+	pub(crate) fn supports_atom_delta(&self) -> bool {
 		self.scalar_indexes.is_empty()
 	}
 
@@ -536,6 +629,7 @@ impl LocalStore {
 
 	/// Runs explicit checkpoint maintenance under the selected reader policy.
 	pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<()> {
+		let _catalogs = self.catalogs.lock();
 		let advanced = match mode {
 			CheckpointMode::Passive => self.manager.checkpoint()?,
 			CheckpointMode::Restart => self.manager.restart_checkpoint()?,
@@ -854,6 +948,7 @@ impl LocalStore {
 		}
 
 		let mut registrations = Vec::new();
+		let mut retired_superblocks = Vec::new();
 		let mut new_superblocks = Vec::new();
 		let mut new_indexes = Vec::new();
 		let mut transaction = self.manager.begin_tx()?;
@@ -875,43 +970,98 @@ impl LocalStore {
 				}
 				continue;
 			};
-			if let LocalCommitGraphChange::AppendNodes {
-				base,
-				nodes,
-			} = &commit_graph.change
-			{
+			if !matches!(commit_graph.change, LocalCommitGraphChange::Materialized(_)) {
 				let index = existing.ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
-						"node append delta targets a graph absent from the durable catalog",
+						"atom delta targets a graph absent from the durable catalog",
 					)
 				})?;
 				let current = database.graphs[index].clone();
-				let delta = build_node_append_delta(
-					&self.manager,
-					&transaction,
-					&current,
-					record_id,
-					&commit_graph.name,
-					base,
-					nodes,
-					&mut dictionary,
-				)?;
+				let delta = match &commit_graph.change {
+					LocalCommitGraphChange::AppendNodes {
+						base,
+						nodes,
+					} => build_node_append_delta(
+						&self.manager,
+						&transaction,
+						&current,
+						record_id,
+						&commit_graph.name,
+						base,
+						nodes,
+						&mut dictionary,
+					)?,
+					LocalCommitGraphChange::AtomDelta {
+						base,
+						delta,
+					} => build_atom_delta(
+						&self.manager,
+						&transaction,
+						&current,
+						record_id,
+						&commit_graph.name,
+						base,
+						delta,
+						&mut dictionary,
+					)?,
+					LocalCommitGraphChange::Materialized(_) => unreachable!(),
+				};
+				let removed_subgraph_slots = delta.removed_subgraph_slots.clone();
 				let mut next_file_instance_id = files.next_file_instance_id;
 				let generation = write_delta_graph_generation(
 					&self.root,
 					&self.manager,
-					&transaction,
+					&mut transaction,
 					&current,
 					&files,
 					delta,
 					&mut next_file_instance_id,
 				)?;
 				files.next_file_instance_id = next_file_instance_id;
-				files.files.retain(|entry| entry.graph_id != current.graph_id);
+				let previous_superblock = files
+					.files
+					.iter()
+					.find(|entry| {
+						entry.graph_id == current.graph_id
+							&& entry.file_id.kind() == Some(DataFileKind::GraphSuperblock)
+					})
+					.map(|entry| (entry.graph_id, entry.file_id))
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"graph delta has no checkpoint-owned superblock",
+						)
+					})?;
+				files.files.retain(|entry| {
+					entry.graph_id != current.graph_id
+						|| entry.file_id.kind() != Some(DataFileKind::GraphSuperblock)
+				});
 				files.files.extend(generation.file_entries);
 				registrations.extend(generation.registrations);
+				retired_superblocks.push(previous_superblock);
 				new_superblocks.push(generation.superblock);
-				database.graphs[index] = generation.catalog_entry;
+				if !removed_subgraph_slots.is_empty() {
+					let mut removed_graphs = BTreeSet::new();
+					for child in database.graphs.iter().filter(|entry| {
+						entry.parent_graph_id == Some(current.graph_id)
+							&& entry
+								.subgraph_slot
+								.is_some_and(|slot| removed_subgraph_slots.contains(&slot))
+					}) {
+						removed_graphs.extend(graph_tree_ids(&database, child.graph_id));
+					}
+					database.graphs.retain(|entry| !removed_graphs.contains(&entry.graph_id));
+					files.files.retain(|entry| !removed_graphs.contains(&entry.graph_id));
+				}
+				let root_index = database
+					.graphs
+					.iter()
+					.position(|entry| entry.graph_id == current.graph_id)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"atom delta removed its root graph catalog entry",
+						)
+					})?;
+				database.graphs[root_index] = generation.catalog_entry;
 				continue;
 			}
 			let LocalCommitGraphChange::Materialized(graph) = &commit_graph.change else {
@@ -1025,6 +1175,7 @@ impl LocalStore {
 			self.manager.unregister_files(&registration_keys);
 			return Err(error);
 		}
+		self.manager.unregister_files(&retired_superblocks);
 		let active_graphs = database.graphs.iter().map(|entry| entry.graph_id);
 		self.manager.publish_graph_authority(
 			new_superblocks,

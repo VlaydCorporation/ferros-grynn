@@ -26,6 +26,61 @@ impl LocalGraphView<'_> {
 		lookup_local_record(self.store, &self.transaction, self.graph.as_ref(), record_id)
 			.map(|atom| atom.is_some())
 	}
+
+	/// Reads the three local-node adjacency roles without materializing the
+	/// graph.
+	pub(crate) fn node_adjacency(
+		&self,
+		id: AtomId,
+	) -> FerrosGrynnResult<Option<LocalNodeAdjacency>> {
+		if id.kind() != Some(AtomKind::Node) {
+			return Ok(None);
+		}
+		let (page_no, slot_index) = hot_slot_address(id.slot())?;
+		let page = read_local_page(
+			self.store,
+			&self.transaction,
+			self.graph.as_ref(),
+			DataFileKind::NodesHot,
+			page_no,
+		)?;
+		let slot = read_node_hot_slot(page.as_page(), page_no, slot_index)?;
+		if slot.flags.contains(NodeSlotFlags::TOMBSTONE) || slot.generation != id.generation() {
+			return Ok(None);
+		}
+		let decode = |inline: &[Option<DiskAtomRef>], count, overflow| {
+			read_local_refs(
+				self.store,
+				&self.transaction,
+				self.graph.as_ref(),
+				inline,
+				count,
+				overflow,
+			)?
+			.into_iter()
+			.map(|edge| local_atom_id(self.store, &self.transaction, self.graph.as_ref(), edge))
+			.collect::<FerrosGrynnResult<Vec<_>>>()
+		};
+		Ok(Some(LocalNodeAdjacency {
+			outgoing: decode(&slot.out_inline, slot.out_count, slot.out_overflow)?,
+			incoming: decode(&slot.in_inline, slot.in_count, slot.in_overflow)?,
+			undirected: decode(
+				&slot.undirected_inline,
+				slot.undirected_count,
+				slot.undirected_overflow,
+			)?,
+		}))
+	}
+}
+
+/// Owned local-node adjacency used by the transaction point-delta overlay.
+pub(crate) struct LocalNodeAdjacency {
+	/// Edges for which this node has an outgoing role.
+	pub(crate) outgoing: Vec<AtomId>,
+	/// Edges for which this node has an incoming role.
+	pub(crate) incoming: Vec<AtomId>,
+	/// Edges for which this node has an undirected role.
+	pub(crate) undirected: Vec<AtomId>,
 }
 
 /// Node projection retaining the hot page pin while cold properties remain

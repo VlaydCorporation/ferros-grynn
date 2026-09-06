@@ -119,9 +119,7 @@ impl GraphRead for MaterializedGraph {
 }
 
 /// Conservatively estimates heap bytes owned by one nested general graph.
-pub(crate) fn estimated_nested_graph_heap_bytes(
-	graph: &Graph<Frozen>,
-) -> FerrosGrynnResult<usize> {
+pub(crate) fn estimated_nested_graph_heap_bytes(graph: &Graph<Frozen>) -> FerrosGrynnResult<usize> {
 	estimated_graph_heap_bytes(
 		graph,
 		graph.slot_capacity(AtomKind::Node),
@@ -149,7 +147,9 @@ fn estimated_graph_heap_bytes<Reader: GraphRead>(
 	for id in graph.node_ids()? {
 		let id = id?;
 		let node = graph.node(id)?.ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file("nested graph node disappeared during accounting")
+			FerrosGrynnError::invalid_storage_file(
+				"nested graph node disappeared during accounting",
+			)
 		})?;
 		let record_id = node.record_id()?;
 		bytes = bytes.saturating_add(record_id.estimated_heap_bytes());
@@ -164,7 +164,9 @@ fn estimated_graph_heap_bytes<Reader: GraphRead>(
 	for id in graph.edge_ids()? {
 		let id = id?;
 		let edge = graph.edge(id)?.ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file("nested graph edge disappeared during accounting")
+			FerrosGrynnError::invalid_storage_file(
+				"nested graph edge disappeared during accounting",
+			)
 		})?;
 		let record_id = edge.record_id()?;
 		bytes = bytes.saturating_add(record_id.estimated_heap_bytes());
@@ -172,27 +174,32 @@ fn estimated_graph_heap_bytes<Reader: GraphRead>(
 			bytes = bytes.saturating_add(label.len());
 		}
 		bytes = bytes.saturating_add(edge.properties()?.estimated_heap_bytes());
-		let topology = edge.topology()?;
-		bytes = bytes.saturating_add(
-			topology.endpoint_count().saturating_mul(size_of::<EdgeEndpoint>()),
-		);
-		for endpoint in topology.endpoints() {
-			if let EdgeEndpoint::Nested(qualified) = endpoint {
-				bytes = bytes.saturating_add(
-					qualified.scope().len().saturating_mul(size_of::<AtomId>()),
-				);
-			}
-		}
+		bytes = bytes.saturating_add(estimated_topology_heap_bytes(edge.topology()?.as_ref()));
 		if let Some(transition) = edge.transition_graph()? {
-			bytes = bytes
-				.saturating_add(estimated_nested_graph_heap_bytes(transition.as_ref())?);
+			bytes = bytes.saturating_add(estimated_nested_graph_heap_bytes(transition.as_ref())?);
 		}
 	}
 	Ok(bytes)
 }
 
+/// Estimates the recursively owned endpoint buffers of one topology.
+pub(crate) fn estimated_topology_heap_bytes(topology: &EdgeTopology) -> usize {
+	let mut bytes = topology
+		.endpoint_count()
+		.saturating_mul(size_of::<EdgeEndpoint>().saturating_add(size_of::<AtomId>()));
+	for endpoint in topology.endpoints() {
+		if let EdgeEndpoint::Nested(qualified) = endpoint {
+			bytes = bytes.saturating_add(
+				qualified.scope().len().saturating_mul(size_of::<AtomId>()).saturating_mul(2),
+			);
+		}
+	}
+	bytes
+}
+
 impl MaterializedGraph {
-	/// Estimates owned heap bytes, rejecting a transaction on accounting failure.
+	/// Estimates owned heap bytes, rejecting a transaction on accounting
+	/// failure.
 	pub(crate) fn estimated_heap_bytes(&self) -> usize {
 		match estimated_graph_heap_bytes(
 			self,

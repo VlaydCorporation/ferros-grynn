@@ -120,11 +120,19 @@ impl Transaction {
 	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
 		if let Some(write) = self.graphs.get(schema.graph.id()) {
 			if let Some(local) = &write.local
-				&& let Some((record, node)) = local.delta.created_node(atom)
+				&& let Some((record, properties, removed)) = local.delta.changed_atom(atom)
 			{
-				return Ok((record.table() == schema.name.as_str()
-					&& matches!(schema.kind, TableKind::Any | TableKind::Normal))
-				.then(|| row_from_properties(atom, record, &node.properties, schema)));
+				let kind_matches = match atom.kind() {
+					Some(AtomKind::Node) => {
+						matches!(schema.kind, TableKind::Any | TableKind::Normal)
+					}
+					Some(AtomKind::Edge) => {
+						matches!(schema.kind, TableKind::Any | TableKind::Relation)
+					}
+					None => false,
+				};
+				return Ok((!removed && kind_matches && record.table() == schema.name.as_str())
+					.then(|| row_from_properties(atom, record, properties, schema)));
 			}
 			let dirty = write
 				.value
@@ -195,6 +203,7 @@ impl Transaction {
 				};
 				if latest.identity() != local.base.identity()
 					|| latest.node_capacity() != local.base.node_capacity()
+					|| latest.edge_capacity() != local.base.edge_capacity()
 				{
 					return Err(
 						self.write_conflict("the graph slot layout was concurrently changed")
@@ -295,35 +304,72 @@ impl Transaction {
 				.graphs
 				.get(&id)
 				.ok_or_else(|| self.write_conflict("the graph was concurrently removed"))?;
-			if let StoredGraphValue::Local(base) = &latest.graph
-				&& base.supports_node_append_delta()
-			{
-				let dirty = local.delta.dirty().collect::<Vec<_>>();
-				let nodes = local.delta.into_commit_nodes();
-				let mut stored = latest.clone();
-				for target in dirty {
-					let DirtyTarget::Atom(atom) = target else {
-						continue;
-					};
-					stored.atom_versions.insert(atom, commit_ts);
-					stored.changes.push((commit_ts, atom));
-				}
-				stored.name = write.name.clone();
-				stored.node_set_version = commit_ts;
-				stored.last_commit_ts = commit_ts;
-				next.graph_names.insert(write.name.clone(), id.clone());
-				next.graphs.insert(id.clone(), stored);
-				local_commits.push(LocalCommitGraph {
-					record_id: id,
-					name: write.name,
-					change: LocalCommitGraphChange::AppendNodes {
-						base: base.clone(),
-						nodes,
-					},
-				});
-				return Ok(());
+			let StoredGraphValue::Local(base) = &latest.graph else {
+				return Err(self.write_conflict("the graph storage representation changed"));
+			};
+			if !base.supports_atom_delta() {
+				return Err(FerrosGrynnError::invalid_argument(
+					"bounded point mutation cannot maintain scalar indexes incrementally",
+				));
 			}
-			write.local = Some(local);
+			let dirty = local.delta.dirty().collect::<Vec<_>>();
+			let changes_nodes = local.delta.changes_node_membership();
+			let changes_edges = local.delta.changes_edge_membership();
+			let change = if local.delta.is_node_append() {
+				LocalCommitGraphChange::AppendNodes {
+					base: base.clone(),
+					nodes: local.delta.into_commit_nodes(),
+				}
+			} else {
+				let storage = self.store.inner.backend.local().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"local graph is attached to an in-memory backend",
+					)
+				})?;
+				let base_revision = local.base.revision();
+				let limits = self.store.inner.transaction_limits();
+				let snapshot = Arc::new(storage.begin_read(self.id, limits.max_snapshot_age)?);
+				let view = storage.graph_view(snapshot, base.clone());
+				local.delta.validate_against(&view)?;
+				let mut delta = local.delta.into_commit_delta(&view)?;
+				let revision_delta =
+					delta.revision.checked_sub(base_revision).ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"atom delta revision moved behind its snapshot",
+						)
+					})?;
+				delta.revision = base.revision().checked_add(revision_delta).ok_or_else(|| {
+					FerrosGrynnError::graph_capacity_exceeded("revision".to_owned())
+				})?;
+				LocalCommitGraphChange::AtomDelta {
+					base: base.clone(),
+					delta,
+				}
+			};
+			let mut stored = latest.clone();
+			for target in dirty {
+				let DirtyTarget::Atom(atom) = target else {
+					continue;
+				};
+				stored.atom_versions.insert(atom, commit_ts);
+				stored.changes.push((commit_ts, atom));
+			}
+			stored.name = write.name.clone();
+			if changes_nodes {
+				stored.node_set_version = commit_ts;
+			}
+			if changes_edges {
+				stored.edge_set_version = commit_ts;
+			}
+			stored.last_commit_ts = commit_ts;
+			next.graph_names.insert(write.name.clone(), id.clone());
+			next.graphs.insert(id.clone(), stored);
+			local_commits.push(LocalCommitGraph {
+				record_id: id,
+				name: write.name,
+				change,
+			});
+			return Ok(());
 		}
 		write.ensure_materialized(&self.store)?;
 		let created = write.is_created();

@@ -1021,7 +1021,7 @@ fn disk_storage_stage7_spill_probe() -> Result<(), Box<dyn Error>> {
 		let stage_started = Instant::now();
 		let mut transaction = store.begin();
 		if api == "edit" {
-			let view = transaction.edit_graph(&graph)?;
+			let view = transaction.edit_graph_materialized(&graph)?;
 			let GraphWriteView::Graph(graph_write) = view else {
 				return Err(io::Error::other("stage-7 benchmark graph changed family").into());
 			};

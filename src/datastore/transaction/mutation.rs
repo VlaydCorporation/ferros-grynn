@@ -26,24 +26,176 @@ pub(in crate::datastore) struct LocalGraphWrite {
 pub(in crate::datastore) struct LocalGraphDelta {
 	kind: GraphKind,
 	next_node_slot: u64,
+	next_edge_slot: u64,
 	next_revision: u64,
-	nodes: RapidHashMap<RecordId, LocalCreatedNode>,
+	records: RapidHashMap<RecordId, Option<AtomId>>,
+	nodes: RapidHashMap<AtomId, LocalNodeMutation>,
+	edges: RapidHashMap<AtomId, LocalEdgeMutation>,
 }
 
-pub(in crate::datastore) struct LocalCreatedNode {
-	pub(super) id: AtomId,
-	pub(super) label: Option<Text>,
-	pub(super) properties: PropertyMap,
+struct LocalNodeMutation {
+	record_id: RecordId,
+	label: Option<Text>,
+	properties: PropertyMap,
+	created: bool,
+	removed: bool,
+	dirty: bool,
+}
+
+struct LocalEdgeMutation {
+	record_id: RecordId,
+	topology: EdgeTopology,
+	previous_topology: Option<EdgeTopology>,
+	label: Option<Text>,
+	properties: PropertyMap,
+	weight: Option<crate::values::runtime::Number>,
+	created: bool,
+	removed: bool,
+	dirty: bool,
+	topology_changed: bool,
 }
 
 impl LocalGraphDelta {
-	fn new(kind: GraphKind, next_node_slot: u64, next_revision: u64) -> Self {
+	fn new(kind: GraphKind, next_node_slot: u64, next_edge_slot: u64, next_revision: u64) -> Self {
 		Self {
 			kind,
 			next_node_slot,
+			next_edge_slot,
 			next_revision,
+			records: RapidHashMap::default(),
 			nodes: RapidHashMap::default(),
+			edges: RapidHashMap::default(),
 		}
+	}
+
+	fn bump_revision(&mut self) -> FerrosGrynnResult<()> {
+		self.next_revision = self
+			.next_revision
+			.checked_add(1)
+			.ok_or_else(|| FerrosGrynnError::graph_capacity_exceeded("revision".to_owned()))?;
+		Ok(())
+	}
+
+	fn record_is_live(
+		&self,
+		base: &LocalGraphView<'_>,
+		record_id: &RecordId,
+	) -> FerrosGrynnResult<bool> {
+		if let Some(id) = self.records.get(record_id) {
+			return Ok(id.is_some());
+		}
+		base.contains_record_id(record_id)
+	}
+
+	fn atom_id(
+		&mut self,
+		base: &LocalGraphView<'_>,
+		reference: &AtomRef,
+	) -> FerrosGrynnResult<AtomId> {
+		if let Some(id) = self.records.get(reference.id()).copied() {
+			return id.filter(|id| id.kind() == Some(reference.kind())).ok_or_else(|| {
+				FerrosGrynnError::atom_does_not_exist(
+					reference.kind().to_string(),
+					reference.id().to_string(),
+				)
+			});
+		}
+		let id = base.atom_id(reference)?.ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist(
+				reference.kind().to_string(),
+				reference.id().to_string(),
+			)
+		})?;
+		self.records.insert(reference.id().clone(), Some(id));
+		Ok(id)
+	}
+
+	fn node_mut<'a>(
+		&'a mut self,
+		base: &LocalGraphView<'_>,
+		reference: &AtomRef,
+	) -> FerrosGrynnResult<(AtomId, &'a mut LocalNodeMutation)> {
+		let id = self.atom_id(base, reference)?;
+		if id.kind() != Some(AtomKind::Node) {
+			return Err(FerrosGrynnError::atom_kind_mismatch(
+				reference.id().to_string(),
+				reference.kind().to_string(),
+				AtomKind::Node.to_string(),
+			));
+		}
+		if !self.nodes.contains_key(&id) {
+			let node = base.node(id)?.ok_or_else(|| {
+				FerrosGrynnError::atom_does_not_exist(
+					AtomKind::Node.to_string(),
+					reference.id().to_string(),
+				)
+			})?;
+			self.nodes.insert(id, LocalNodeMutation {
+				record_id: node.record_id()?.into_owned(),
+				label: node.label_text()?.map(Cow::into_owned),
+				properties: node.properties()?.into_owned(),
+				created: false,
+				removed: false,
+				dirty: false,
+			});
+		}
+		let node = self
+			.nodes
+			.get_mut(&id)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("node mutation state is absent"))?;
+		if node.removed {
+			return Err(FerrosGrynnError::atom_does_not_exist(
+				AtomKind::Node.to_string(),
+				reference.id().to_string(),
+			));
+		}
+		Ok((id, node))
+	}
+
+	fn edge_mut<'a>(
+		&'a mut self,
+		base: &LocalGraphView<'_>,
+		reference: &AtomRef,
+	) -> FerrosGrynnResult<(AtomId, &'a mut LocalEdgeMutation)> {
+		let id = self.atom_id(base, reference)?;
+		if id.kind() != Some(AtomKind::Edge) {
+			return Err(FerrosGrynnError::atom_kind_mismatch(
+				reference.id().to_string(),
+				reference.kind().to_string(),
+				AtomKind::Edge.to_string(),
+			));
+		}
+		if !self.edges.contains_key(&id) {
+			let edge = base.edge(id)?.ok_or_else(|| {
+				FerrosGrynnError::atom_does_not_exist(
+					AtomKind::Edge.to_string(),
+					reference.id().to_string(),
+				)
+			})?;
+			self.edges.insert(id, LocalEdgeMutation {
+				record_id: edge.record_id()?.into_owned(),
+				topology: edge.topology()?.into_owned(),
+				previous_topology: None,
+				label: edge.label_text()?.map(Cow::into_owned),
+				properties: edge.properties()?.into_owned(),
+				weight: edge.weight(),
+				created: false,
+				removed: false,
+				dirty: false,
+				topology_changed: false,
+			});
+		}
+		let edge = self
+			.edges
+			.get_mut(&id)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("edge mutation state is absent"))?;
+		if edge.removed {
+			return Err(FerrosGrynnError::atom_does_not_exist(
+				AtomKind::Edge.to_string(),
+				reference.id().to_string(),
+			));
+		}
+		Ok((id, edge))
 	}
 
 	fn create_node(
@@ -59,9 +211,7 @@ impl LocalGraphDelta {
 				"an isolated node would violate the single-tree invariant",
 			));
 		}
-		if self.nodes.contains_key(&record_id)
-			|| (base.node_count()? != 0 && base.contains_record_id(&record_id)?)
-		{
+		if self.record_is_live(base, &record_id)? {
 			return Err(FerrosGrynnError::graph_constraint_violation(
 				"record id",
 				format!("duplicate RecordId '{record_id}' in one graph"),
@@ -72,53 +222,757 @@ impl LocalGraphDelta {
 			.next_node_slot
 			.checked_add(1)
 			.ok_or_else(|| FerrosGrynnError::graph_capacity_exceeded(AtomKind::Node.to_string()))?;
-		let next_revision = self
-			.next_revision
-			.checked_add(1)
-			.ok_or_else(|| FerrosGrynnError::graph_capacity_exceeded("revision".to_owned()))?;
 		self.next_node_slot = next_node_slot;
-		self.next_revision = next_revision;
+		self.bump_revision()?;
 		let reference = AtomRef::new(AtomKind::Node, record_id.clone());
-		self.nodes.insert(record_id, LocalCreatedNode {
-			id,
+		self.records.insert(record_id.clone(), Some(id));
+		self.nodes.insert(id, LocalNodeMutation {
+			record_id,
 			label,
 			properties,
+			created: true,
+			removed: false,
+			dirty: true,
 		});
 		Ok(reference)
 	}
 
+	fn create_edge(
+		&mut self,
+		base: &LocalGraphView<'_>,
+		record_id: RecordId,
+		topology: &AtomRefTopology,
+		label: Option<Text>,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomRef> {
+		if self.record_is_live(base, &record_id)? {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				"record id",
+				format!("duplicate RecordId '{record_id}' in one graph"),
+			));
+		}
+		let topology = self.resolve_topology(base, topology)?;
+		self.validate_topology(base, &topology, None)?;
+		let id = AtomId::from_parts(AtomKind::Edge, self.next_edge_slot, 0)?;
+		self.next_edge_slot = self
+			.next_edge_slot
+			.checked_add(1)
+			.ok_or_else(|| FerrosGrynnError::graph_capacity_exceeded(AtomKind::Edge.to_string()))?;
+		self.bump_revision()?;
+		let reference = AtomRef::new(AtomKind::Edge, record_id.clone());
+		self.records.insert(record_id.clone(), Some(id));
+		self.edges.insert(id, LocalEdgeMutation {
+			record_id,
+			topology,
+			previous_topology: None,
+			label,
+			properties,
+			weight: None,
+			created: true,
+			removed: false,
+			dirty: true,
+			topology_changed: true,
+		});
+		Ok(reference)
+	}
+
+	fn set_label(
+		&mut self,
+		base: &LocalGraphView<'_>,
+		atom: &AtomRef,
+		label: Option<Text>,
+	) -> FerrosGrynnResult<Option<Text>> {
+		let previous = match atom.kind() {
+			AtomKind::Node => {
+				let (_id, node) = self.node_mut(base, atom)?;
+				node.dirty = true;
+				std::mem::replace(&mut node.label, label)
+			}
+			AtomKind::Edge => {
+				let (_id, edge) = self.edge_mut(base, atom)?;
+				edge.dirty = true;
+				std::mem::replace(&mut edge.label, label)
+			}
+		};
+		self.bump_revision()?;
+		Ok(previous)
+	}
+
+	fn set_property(
+		&mut self,
+		base: &LocalGraphView<'_>,
+		atom: &AtomRef,
+		key: PropertyKeyId,
+		value: Value,
+	) -> FerrosGrynnResult<Option<Value>> {
+		let previous = match atom.kind() {
+			AtomKind::Node => {
+				let (_id, node) = self.node_mut(base, atom)?;
+				node.dirty = true;
+				node.properties.insert(key, value)
+			}
+			AtomKind::Edge => {
+				let (_id, edge) = self.edge_mut(base, atom)?;
+				edge.dirty = true;
+				edge.properties.insert(key, value)
+			}
+		};
+		self.bump_revision()?;
+		Ok(previous)
+	}
+
+	fn remove_property(
+		&mut self,
+		base: &LocalGraphView<'_>,
+		atom: &AtomRef,
+		key: PropertyKeyId,
+	) -> FerrosGrynnResult<Option<Value>> {
+		let previous = match atom.kind() {
+			AtomKind::Node => {
+				let (_id, node) = self.node_mut(base, atom)?;
+				node.dirty = true;
+				node.properties.remove(key)
+			}
+			AtomKind::Edge => {
+				let (_id, edge) = self.edge_mut(base, atom)?;
+				edge.dirty = true;
+				edge.properties.remove(key)
+			}
+		};
+		self.bump_revision()?;
+		Ok(previous)
+	}
+
+	fn replace_incidence(
+		&mut self,
+		base: &LocalGraphView<'_>,
+		edge: &AtomRef,
+		topology: &AtomRefTopology,
+	) -> FerrosGrynnResult<()> {
+		if edge.kind() != AtomKind::Edge {
+			return Err(FerrosGrynnError::atom_kind_mismatch(
+				edge.id().to_string(),
+				edge.kind().to_string(),
+				AtomKind::Edge.to_string(),
+			));
+		}
+		if matches!(self.kind, GraphKind::Tree | GraphKind::RootedTree | GraphKind::Forest) {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				self.kind.name(),
+				"generic incidence replacement cannot preserve tree parent invariants",
+			));
+		}
+		let id = self.atom_id(base, edge)?;
+		let topology = self.resolve_topology(base, topology)?;
+		self.validate_topology(base, &topology, Some(id))?;
+		let (_id, state) = self.edge_mut(base, edge)?;
+		if state.previous_topology.is_none() {
+			state.previous_topology = Some(state.topology.clone());
+		}
+		state.topology = topology;
+		state.topology_changed = true;
+		state.dirty = true;
+		self.bump_revision()
+	}
+
+	fn remove_atom(&mut self, base: &LocalGraphView<'_>, atom: &AtomRef) -> FerrosGrynnResult<()> {
+		let id = self.atom_id(base, atom)?;
+		if matches!(self.kind, GraphKind::Tree | GraphKind::RootedTree) {
+			self.validate_tree_removal(base, id)?;
+		}
+		let dependent = self.dependent_edges(base, id)?;
+		for edge in dependent {
+			self.mark_edge_removed(base, edge)?;
+		}
+		match id.kind() {
+			Some(AtomKind::Node) => {
+				if !self.nodes.contains_key(&id) {
+					let _ = self.node_mut(base, atom)?;
+				}
+				let node = self.nodes.get_mut(&id).ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("node mutation state is absent")
+				})?;
+				node.removed = true;
+				node.dirty = true;
+				self.records.insert(node.record_id.clone(), None);
+			}
+			Some(AtomKind::Edge) => self.mark_edge_removed(base, id)?,
+			None => {
+				return Err(FerrosGrynnError::invalid_argument("invalid AtomId kind"));
+			}
+		}
+		self.bump_revision()
+	}
+
+	fn mark_edge_removed(
+		&mut self,
+		base: &LocalGraphView<'_>,
+		id: AtomId,
+	) -> FerrosGrynnResult<()> {
+		if !self.edges.contains_key(&id) {
+			let edge = base.edge(id)?.ok_or_else(|| {
+				FerrosGrynnError::atom_does_not_exist(AtomKind::Edge.to_string(), id.to_string())
+			})?;
+			self.edges.insert(id, LocalEdgeMutation {
+				record_id: edge.record_id()?.into_owned(),
+				topology: edge.topology()?.into_owned(),
+				previous_topology: None,
+				label: edge.label_text()?.map(Cow::into_owned),
+				properties: edge.properties()?.into_owned(),
+				weight: edge.weight(),
+				created: false,
+				removed: false,
+				dirty: false,
+				topology_changed: false,
+			});
+		}
+		let edge = self
+			.edges
+			.get_mut(&id)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("edge mutation state is absent"))?;
+		edge.removed = true;
+		edge.dirty = true;
+		self.records.insert(edge.record_id.clone(), None);
+		Ok(())
+	}
+
+	fn resolve_topology(
+		&mut self,
+		base: &LocalGraphView<'_>,
+		topology: &AtomRefTopology,
+	) -> FerrosGrynnResult<EdgeTopology> {
+		let mut resolve =
+			|reference: &AtomRef| self.atom_id(base, reference).map(EdgeEndpoint::Local);
+		Ok(match topology {
+			AtomRefTopology::Directed {
+				source,
+				target,
+			} => EdgeTopology::directed(
+				source.iter().map(&mut resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+				target.iter().map(&mut resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+			),
+			AtomRefTopology::Bidirectional {
+				source,
+				target,
+			} => EdgeTopology::bidirectional(
+				source.iter().map(&mut resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+				target.iter().map(&mut resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+			),
+			AtomRefTopology::Undirected {
+				endpoints,
+			} => EdgeTopology::undirected(
+				endpoints.iter().map(resolve).collect::<FerrosGrynnResult<Vec<_>>>()?,
+			),
+		})
+	}
+
+	fn validate_topology(
+		&self,
+		base: &LocalGraphView<'_>,
+		topology: &EdgeTopology,
+		ignored_edge: Option<AtomId>,
+	) -> FerrosGrynnResult<()> {
+		if topology.endpoint_count() == 0 {
+			return Err(FerrosGrynnError::edge_creation_error()
+				.with_cause(FerrosGrynnError::empty_edge_endpoints()));
+		}
+		for group in [topology.source(), topology.target()] {
+			let mut seen = BTreeSet::new();
+			for endpoint in group {
+				if !seen.insert(endpoint) {
+					return Err(FerrosGrynnError::edge_creation_error().with_cause(
+						FerrosGrynnError::graph_constraint_violation(
+							self.kind.name(),
+							"an incidence role cannot repeat the same endpoint",
+						),
+					));
+				}
+			}
+		}
+		if matches!(topology, EdgeTopology::Bidirectional { .. }) && topology.endpoint_count() != 2
+		{
+			return Err(FerrosGrynnError::invalid_argument(
+				"bidirectional hyperedges require a format extension",
+			));
+		}
+		match self.kind {
+			GraphKind::Dag => {
+				let Some((source, target, EdgeDirection::Directed)) = topology.local_binary()
+				else {
+					return Err(FerrosGrynnError::graph_constraint_violation(
+						GraphKind::Dag.name(),
+						"DAG edges must be directed binary node-to-node edges",
+					));
+				};
+				if source == target || self.reachable(base, target, source, ignored_edge)? {
+					return Err(FerrosGrynnError::graph_constraint_violation(
+						GraphKind::Dag.name(),
+						"the edge would create a directed cycle",
+					));
+				}
+			}
+			GraphKind::Forest => {
+				let orientation = self.forest_orientation(base, Some(topology), ignored_edge)?;
+				let (parent, child) = forest_pair(topology, orientation)?;
+				if parent == child
+					|| self.forest_parent(base, child, orientation, ignored_edge)?.is_some()
+					|| self.forest_component_root(base, parent, orientation, ignored_edge)? == child
+				{
+					return Err(FerrosGrynnError::graph_constraint_violation(
+						GraphKind::Forest.name(),
+						"the edge would attach a non-root child or create a cycle",
+					));
+				}
+			}
+			GraphKind::Tree | GraphKind::RootedTree => {
+				return Err(FerrosGrynnError::graph_constraint_violation(
+					self.kind.name(),
+					"use the family materialization API to add a child and edge atomically",
+				));
+			}
+			GraphKind::Graph
+			| GraphKind::Hypergraph
+			| GraphKind::Metagraph
+			| GraphKind::Subgraph => {}
+		}
+		Ok(())
+	}
+
+	fn effective_adjacency(
+		&self,
+		base: &LocalGraphView<'_>,
+		node: AtomId,
+	) -> FerrosGrynnResult<crate::storage::LocalNodeAdjacency> {
+		let mut adjacency = if self.nodes.get(&node).is_some_and(|state| state.created) {
+			crate::storage::LocalNodeAdjacency {
+				outgoing: Vec::new(),
+				incoming: Vec::new(),
+				undirected: Vec::new(),
+			}
+		} else {
+			base.node_adjacency(node)?.ok_or_else(|| {
+				FerrosGrynnError::atom_does_not_exist(AtomKind::Node.to_string(), node.to_string())
+			})?
+		};
+		for (edge_id, edge) in &self.edges {
+			if !edge.dirty || (!edge.created && !edge.removed && !edge.topology_changed) {
+				continue;
+			}
+			for role in
+				[&mut adjacency.outgoing, &mut adjacency.incoming, &mut adjacency.undirected]
+			{
+				role.retain(|candidate| candidate != edge_id);
+			}
+			if edge.removed {
+				continue;
+			}
+			append_adjacency_roles(&mut adjacency, node, *edge_id, &edge.topology);
+		}
+		adjacency.outgoing.sort_unstable();
+		adjacency.incoming.sort_unstable();
+		adjacency.undirected.sort_unstable();
+		Ok(adjacency)
+	}
+
+	fn effective_edge_ids(&self, base: &LocalGraphView<'_>) -> FerrosGrynnResult<Vec<AtomId>> {
+		let mut ids = base.edge_ids()?.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		ids.extend(self.edges.keys().copied());
+		ids.sort_unstable();
+		ids.dedup();
+		Ok(ids)
+	}
+
+	fn effective_topology(
+		&self,
+		base: &LocalGraphView<'_>,
+		edge: AtomId,
+	) -> FerrosGrynnResult<Option<EdgeTopology>> {
+		if let Some(state) = self.edges.get(&edge) {
+			return Ok((!state.removed).then(|| state.topology.clone()));
+		}
+		base.edge(edge)?.map(|edge| edge.topology().map(Cow::into_owned)).transpose()
+	}
+
+	fn reachable(
+		&self,
+		base: &LocalGraphView<'_>,
+		start: AtomId,
+		goal: AtomId,
+		ignored_edge: Option<AtomId>,
+	) -> FerrosGrynnResult<bool> {
+		let mut pending = vec![start];
+		let mut seen = BTreeSet::new();
+		while let Some(node) = pending.pop() {
+			if node == goal {
+				return Ok(true);
+			}
+			if !seen.insert(node) {
+				continue;
+			}
+			for edge in self.effective_adjacency(base, node)?.outgoing {
+				if Some(edge) == ignored_edge {
+					continue;
+				}
+				let Some(topology) = self.effective_topology(base, edge)? else {
+					continue;
+				};
+				if let Some((source, target, EdgeDirection::Directed)) = topology.local_binary()
+					&& source == node
+				{
+					pending.push(target);
+				}
+			}
+		}
+		Ok(false)
+	}
+
+	fn forest_orientation(
+		&self,
+		base: &LocalGraphView<'_>,
+		candidate: Option<&EdgeTopology>,
+		ignored_edge: Option<AtomId>,
+	) -> FerrosGrynnResult<TreeOrientation> {
+		let mut inbound = RapidHashMap::<AtomId, u32>::default();
+		let mut outbound = RapidHashMap::<AtomId, u32>::default();
+		let mut direction = None;
+		let topologies = self
+			.effective_edge_ids(base)?
+			.into_iter()
+			.filter(|edge| Some(*edge) != ignored_edge)
+			.map(|edge| self.effective_topology(base, edge))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?
+			.into_iter()
+			.flatten()
+			.chain(candidate.cloned());
+		for topology in topologies {
+			let Some((left, right, edge_direction)) = topology.local_binary() else {
+				return Err(FerrosGrynnError::graph_constraint_violation(
+					GraphKind::Forest.name(),
+					"forest edges must be local binary node-to-node edges",
+				));
+			};
+			if edge_direction == EdgeDirection::Bidirectional
+				|| direction.is_some_and(|expected| expected != edge_direction)
+			{
+				return Err(FerrosGrynnError::graph_constraint_violation(
+					GraphKind::Forest.name(),
+					"a forest cannot mix edge orientations",
+				));
+			}
+			direction = Some(edge_direction);
+			if edge_direction == EdgeDirection::Directed {
+				*outbound.entry(left).or_default() += 1;
+				*inbound.entry(right).or_default() += 1;
+			}
+		}
+		match direction {
+			None | Some(EdgeDirection::Undirected) => Ok(TreeOrientation::Undirected),
+			Some(EdgeDirection::Directed) if inbound.values().all(|degree| *degree <= 1) => {
+				Ok(TreeOrientation::OutArborescence)
+			}
+			Some(EdgeDirection::Directed) if outbound.values().all(|degree| *degree <= 1) => {
+				Ok(TreeOrientation::InArborescence)
+			}
+			Some(EdgeDirection::Directed | EdgeDirection::Bidirectional) => {
+				Err(FerrosGrynnError::graph_constraint_violation(
+					GraphKind::Forest.name(),
+					"directed edges do not form consistently oriented arborescences",
+				))
+			}
+		}
+	}
+
+	fn forest_parent(
+		&self,
+		base: &LocalGraphView<'_>,
+		node: AtomId,
+		orientation: TreeOrientation,
+		ignored_edge: Option<AtomId>,
+	) -> FerrosGrynnResult<Option<AtomId>> {
+		let adjacency = self.effective_adjacency(base, node)?;
+		for edge in
+			adjacency.outgoing.into_iter().chain(adjacency.incoming).chain(adjacency.undirected)
+		{
+			if Some(edge) == ignored_edge {
+				continue;
+			}
+			let Some(topology) = self.effective_topology(base, edge)? else {
+				continue;
+			};
+			let (parent, child) = forest_pair(&topology, orientation)?;
+			if child == node {
+				return Ok(Some(parent));
+			}
+		}
+		Ok(None)
+	}
+
+	fn forest_component_root(
+		&self,
+		base: &LocalGraphView<'_>,
+		mut node: AtomId,
+		orientation: TreeOrientation,
+		ignored_edge: Option<AtomId>,
+	) -> FerrosGrynnResult<AtomId> {
+		let mut seen = BTreeSet::new();
+		while seen.insert(node) {
+			let Some(parent) = self.forest_parent(base, node, orientation, ignored_edge)? else {
+				return Ok(node);
+			};
+			node = parent;
+		}
+		Err(FerrosGrynnError::graph_constraint_violation(
+			GraphKind::Forest.name(),
+			"the stored forest contains a cycle",
+		))
+	}
+
+	fn validate_tree_removal(
+		&self,
+		base: &LocalGraphView<'_>,
+		id: AtomId,
+	) -> FerrosGrynnResult<()> {
+		if id.kind() != Some(AtomKind::Node) {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				self.kind.name(),
+				"only a leaf vertex can be removed without breaking the tree invariant",
+			));
+		}
+		let orientation = self.forest_orientation(base, None, None)?;
+		let adjacency = self.effective_adjacency(base, id)?;
+		for edge in
+			adjacency.outgoing.into_iter().chain(adjacency.incoming).chain(adjacency.undirected)
+		{
+			let Some(topology) = self.effective_topology(base, edge)? else {
+				continue;
+			};
+			let (parent, _child) = forest_pair(&topology, orientation)?;
+			if parent == id {
+				return Err(FerrosGrynnError::graph_constraint_violation(
+					self.kind.name(),
+					"only a leaf vertex can be removed without breaking the tree invariant",
+				));
+			}
+		}
+		let created = self.nodes.values().filter(|node| node.created && !node.removed).count();
+		let removed = self.nodes.values().filter(|node| node.removed && !node.created).count();
+		let live = base.node_count()?.saturating_add(created).saturating_sub(removed);
+		if live <= 1 {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				self.kind.name(),
+				"a tree cannot become empty",
+			));
+		}
+		if self.kind == GraphKind::RootedTree
+			&& self.forest_parent(base, id, orientation, None)?.is_none()
+		{
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				self.kind.name(),
+				"the root vertex cannot be removed",
+			));
+		}
+		Ok(())
+	}
+
+	fn dependent_edges(
+		&self,
+		base: &LocalGraphView<'_>,
+		id: AtomId,
+	) -> FerrosGrynnResult<BTreeSet<AtomId>> {
+		if matches!(
+			self.kind,
+			GraphKind::Dag | GraphKind::Forest | GraphKind::Tree | GraphKind::RootedTree
+		) {
+			if id.kind() == Some(AtomKind::Edge) {
+				return Ok(BTreeSet::from([id]));
+			}
+			let adjacency = self.effective_adjacency(base, id)?;
+			return Ok(adjacency
+				.outgoing
+				.into_iter()
+				.chain(adjacency.incoming)
+				.chain(adjacency.undirected)
+				.collect());
+		}
+		let mut removed = BTreeSet::from([id]);
+		let mut edges = BTreeSet::new();
+		loop {
+			let mut changed = false;
+			for edge in self.effective_edge_ids(base)? {
+				if edges.contains(&edge) {
+					continue;
+				}
+				let Some(topology) = self.effective_topology(base, edge)? else {
+					continue;
+				};
+				let dependent = topology.endpoints().any(|endpoint| match endpoint {
+					EdgeEndpoint::Local(atom) => removed.contains(atom),
+					EdgeEndpoint::Nested(qualified) => qualified
+						.scope()
+						.first()
+						.is_some_and(|container| removed.contains(container)),
+				});
+				if dependent {
+					edges.insert(edge);
+					removed.insert(edge);
+					changed = true;
+				}
+			}
+			if !changed {
+				break;
+			}
+		}
+		Ok(edges)
+	}
+
 	pub(super) fn dirty(&self) -> impl ExactSizeIterator<Item = DirtyTarget> + '_ {
-		self.nodes.values().map(|node| DirtyTarget::Atom(node.id))
-	}
-
-	pub(super) fn estimated_write_set_bytes(&self) -> usize {
-		self.nodes
+		let mut dirty = self
+			.nodes
 			.iter()
-			.map(|(record_id, node)| {
-				DIRTY_TARGET_WRITE_BYTES
-					.saturating_add(std::mem::size_of::<LocalCreatedNode>())
-					.saturating_add(record_id.estimated_heap_bytes())
-					.saturating_add(node.label.as_ref().map_or(0, Text::len))
-					.saturating_add(node.properties.estimated_heap_bytes())
-			})
-			.fold(0_usize, usize::saturating_add)
+			.filter(|(_id, node)| node.dirty)
+			.map(|(id, _node)| DirtyTarget::Atom(*id))
+			.chain(
+				self.edges
+					.iter()
+					.filter(|(_id, edge)| edge.dirty)
+					.map(|(id, _edge)| DirtyTarget::Atom(*id)),
+			)
+			.collect::<Vec<_>>();
+		for edge in self.edges.values().filter(|edge| edge.dirty) {
+			for topology in edge.previous_topology.iter().chain(std::iter::once(&edge.topology)) {
+				for endpoint in topology.endpoints() {
+					if let EdgeEndpoint::Local(id) = endpoint {
+						dirty.push(DirtyTarget::Atom(*id));
+					}
+				}
+			}
+		}
+		dirty.sort_unstable();
+		dirty.dedup();
+		dirty.into_iter()
 	}
 
-	pub(super) fn created_node(&self, id: AtomId) -> Option<(&RecordId, &LocalCreatedNode)> {
-		self.nodes.iter().find(|(_record_id, node)| node.id == id)
+	pub(super) fn estimated_write_set_bytes(
+		&self,
+		base: &LocalGraphView<'_>,
+	) -> FerrosGrynnResult<usize> {
+		let nodes = self.nodes.iter().map(|(_id, node)| {
+			DIRTY_TARGET_WRITE_BYTES
+				.saturating_add(std::mem::size_of::<LocalNodeMutation>())
+				.saturating_add(node.record_id.estimated_heap_bytes())
+				.saturating_add(node.label.as_ref().map_or(0, Text::len))
+				.saturating_add(node.properties.estimated_heap_bytes())
+		});
+		let edges = self.edges.iter().map(|(_id, edge)| {
+			DIRTY_TARGET_WRITE_BYTES
+				.saturating_add(std::mem::size_of::<LocalEdgeMutation>())
+				.saturating_add(edge.record_id.estimated_heap_bytes())
+				.saturating_add(edge.label.as_ref().map_or(0, Text::len))
+				.saturating_add(edge.properties.estimated_heap_bytes())
+				.saturating_add(crate::graph::estimated_topology_heap_bytes(&edge.topology))
+				.saturating_add(
+					edge.previous_topology
+						.as_ref()
+						.map_or(0, crate::graph::estimated_topology_heap_bytes),
+				)
+		});
+		let records = self
+			.records
+			.keys()
+			.map(RecordId::estimated_heap_bytes)
+			.fold(0_usize, usize::saturating_add);
+		let mut estimated = nodes.chain(edges).fold(records, usize::saturating_add);
+		for id in self.affected_adjacency_nodes() {
+			if self.nodes.get(&id).is_some_and(|node| node.removed) {
+				continue;
+			}
+			let adjacency = self.effective_adjacency(base, id)?;
+			estimated = estimated
+				.saturating_add(std::mem::size_of::<crate::storage::LocalCommitNodeAdjacency>())
+				.saturating_add(
+					adjacency
+						.outgoing
+						.len()
+						.saturating_add(adjacency.incoming.len())
+						.saturating_add(adjacency.undirected.len())
+						.saturating_mul(std::mem::size_of::<AtomId>()),
+				);
+		}
+		Ok(estimated)
+	}
+
+	fn affected_adjacency_nodes(&self) -> BTreeSet<AtomId> {
+		let mut affected = self
+			.nodes
+			.iter()
+			.filter(|(_id, node)| node.created && !node.removed)
+			.map(|(id, _node)| *id)
+			.collect::<BTreeSet<_>>();
+		for edge in self.edges.values().filter(|edge| edge.dirty) {
+			for topology in edge.previous_topology.iter().chain(std::iter::once(&edge.topology)) {
+				for endpoint in topology.endpoints() {
+					if let EdgeEndpoint::Local(id) = endpoint
+						&& id.kind() == Some(AtomKind::Node)
+					{
+						affected.insert(*id);
+					}
+				}
+			}
+		}
+		affected
+	}
+
+	/// Revalidates topology-sensitive mutations against the commit-time graph
+	/// view.
+	pub(super) fn validate_against(&self, base: &LocalGraphView<'_>) -> FerrosGrynnResult<()> {
+		if !matches!(self.kind, GraphKind::Dag | GraphKind::Forest) {
+			return Ok(());
+		}
+		for (id, edge) in self.edges.iter().filter(|(_id, edge)| {
+			edge.dirty && !edge.removed && (edge.created || edge.topology_changed)
+		}) {
+			self.validate_topology(base, &edge.topology, Some(*id))?;
+		}
+		Ok(())
+	}
+
+	/// Returns a changed atom's final record, properties and removal state.
+	pub(super) fn changed_atom(&self, id: AtomId) -> Option<(&RecordId, &PropertyMap, bool)> {
+		match id.kind() {
+			Some(AtomKind::Node) => self
+				.nodes
+				.get(&id)
+				.filter(|node| node.dirty)
+				.map(|node| (&node.record_id, &node.properties, node.removed)),
+			Some(AtomKind::Edge) => self
+				.edges
+				.get(&id)
+				.filter(|edge| edge.dirty)
+				.map(|edge| (&edge.record_id, &edge.properties, edge.removed)),
+			None => None,
+		}
 	}
 
 	pub(super) fn is_empty(&self) -> bool {
-		self.nodes.is_empty()
+		!self.nodes.values().any(|node| node.dirty) && !self.edges.values().any(|edge| edge.dirty)
+	}
+
+	pub(super) fn changes_node_membership(&self) -> bool {
+		self.nodes.values().any(|node| node.dirty && (node.created || node.removed))
+	}
+
+	pub(super) fn changes_edge_membership(&self) -> bool {
+		self.edges.values().any(|edge| edge.dirty && (edge.created || edge.removed))
 	}
 
 	pub(super) fn into_commit_nodes(self) -> Vec<crate::storage::LocalCommitNode> {
 		let mut nodes = self
 			.nodes
 			.into_iter()
-			.map(|(record_id, node)| crate::storage::LocalCommitNode {
-				id: node.id,
-				record_id,
+			.filter(|(_id, node)| node.dirty && node.created && !node.removed)
+			.map(|(id, node)| crate::storage::LocalCommitNode {
+				id,
+				record_id: node.record_id,
 				label: node.label,
 				properties: node.properties,
 			})
@@ -127,15 +981,205 @@ impl LocalGraphDelta {
 		nodes
 	}
 
+	pub(super) fn is_node_append(&self) -> bool {
+		!self.edges.values().any(|edge| edge.dirty)
+			&& self.nodes.values().all(|node| !node.dirty || (node.created && !node.removed))
+	}
+
+	pub(super) fn into_commit_delta(
+		self,
+		base: &LocalGraphView<'_>,
+	) -> FerrosGrynnResult<crate::storage::LocalCommitAtomDelta> {
+		let affected_nodes = self.affected_adjacency_nodes();
+		let mut adjacency = Vec::with_capacity(affected_nodes.len());
+		for id in affected_nodes {
+			if self.nodes.get(&id).is_some_and(|node| node.removed) {
+				continue;
+			}
+			let roles = self.effective_adjacency(base, id)?;
+			adjacency.push(crate::storage::LocalCommitNodeAdjacency {
+				id,
+				outgoing: roles.outgoing,
+				incoming: roles.incoming,
+				undirected: roles.undirected,
+			});
+		}
+		let mut nodes = self
+			.nodes
+			.into_iter()
+			.filter(|(_id, node)| node.dirty)
+			.map(|(id, node)| {
+				if node.removed {
+					crate::storage::LocalCommitNodeChange::Remove {
+						id,
+						created: node.created,
+					}
+				} else {
+					crate::storage::LocalCommitNodeChange::Upsert {
+						id,
+						record_id: node.record_id,
+						label: node.label,
+						properties: node.properties,
+						created: node.created,
+					}
+				}
+			})
+			.collect::<Vec<_>>();
+		nodes.sort_unstable_by_key(|node| match node {
+			crate::storage::LocalCommitNodeChange::Upsert {
+				id,
+				..
+			}
+			| crate::storage::LocalCommitNodeChange::Remove {
+				id,
+				..
+			} => *id,
+		});
+		let mut edges = self
+			.edges
+			.into_iter()
+			.filter(|(_id, edge)| edge.dirty)
+			.map(|(id, edge)| {
+				if edge.removed {
+					crate::storage::LocalCommitEdgeChange::Remove {
+						id,
+						created: edge.created,
+					}
+				} else {
+					crate::storage::LocalCommitEdgeChange::Upsert {
+						id,
+						record_id: edge.record_id,
+						topology: edge.topology,
+						label: edge.label,
+						properties: edge.properties,
+						weight: edge.weight,
+						created: edge.created,
+						topology_changed: edge.topology_changed,
+					}
+				}
+			})
+			.collect::<Vec<_>>();
+		edges.sort_unstable_by_key(|edge| match edge {
+			crate::storage::LocalCommitEdgeChange::Upsert {
+				id,
+				..
+			}
+			| crate::storage::LocalCommitEdgeChange::Remove {
+				id,
+				..
+			} => *id,
+		});
+		Ok(crate::storage::LocalCommitAtomDelta {
+			revision: self.next_revision,
+			node_capacity: self.next_node_slot,
+			edge_capacity: self.next_edge_slot,
+			nodes,
+			edges,
+			adjacency,
+		})
+	}
+
 	fn apply_to(&self, value: &mut MutableGraphValue) -> FerrosGrynnResult<()> {
-		for (record_id, node) in &self.nodes {
-			value.create_node(record_id.clone(), node.label.clone(), node.properties.clone())?;
+		for node in self.nodes.values().filter(|node| node.dirty && node.removed && !node.created) {
+			let reference = AtomRef::new(AtomKind::Node, node.record_id.clone());
+			if value.atom_id(&reference).is_ok() {
+				value.remove_atom(&reference)?;
+			}
+		}
+		for edge in self.edges.values().filter(|edge| edge.dirty && edge.removed && !edge.created) {
+			let reference = AtomRef::new(AtomKind::Edge, edge.record_id.clone());
+			if value.atom_id(&reference).is_ok() {
+				value.remove_atom(&reference)?;
+			}
+		}
+		for node in self.nodes.values().filter(|node| node.dirty && !node.removed) {
+			let reference = AtomRef::new(AtomKind::Node, node.record_id.clone());
+			if node.created {
+				value.create_node(
+					node.record_id.clone(),
+					node.label.clone(),
+					node.properties.clone(),
+				)?;
+			} else {
+				value.set_atom_label(&reference, node.label.clone())?;
+				*value.atom_properties_mut(&reference)? = node.properties.clone();
+			}
+		}
+		for edge in self.edges.values().filter(|edge| edge.dirty && !edge.removed) {
+			let reference = AtomRef::new(AtomKind::Edge, edge.record_id.clone());
+			if edge.created {
+				let topology = self.topology_as_refs(value, &edge.topology)?;
+				value.create_edge(
+					edge.record_id.clone(),
+					&topology,
+					edge.label.clone(),
+					edge.properties.clone(),
+				)?;
+			} else {
+				if edge.topology_changed {
+					let topology = self.topology_as_refs(value, &edge.topology)?;
+					value.replace_incidence(&reference, &topology)?;
+				}
+				value.set_atom_label(&reference, edge.label.clone())?;
+				*value.atom_properties_mut(&reference)? = edge.properties.clone();
+			}
 		}
 		Ok(())
+	}
+
+	fn topology_as_refs(
+		&self,
+		value: &MutableGraphValue,
+		topology: &EdgeTopology,
+	) -> FerrosGrynnResult<AtomRefTopology> {
+		let mut resolve = |endpoint: &EdgeEndpoint| match endpoint {
+			EdgeEndpoint::Local(id) => self.atom_ref_for_snapshot(value, *id),
+			EdgeEndpoint::Nested(_) => Err(FerrosGrynnError::invalid_argument(
+				"transaction snapshot cannot remap a nested point-mutation endpoint",
+			)),
+		};
+		Ok(match topology {
+			EdgeTopology::Directed {
+				source,
+				target,
+			} => AtomRefTopology::Directed {
+				source: source.iter().map(&mut resolve).collect::<FerrosGrynnResult<_>>()?,
+				target: target.iter().map(&mut resolve).collect::<FerrosGrynnResult<_>>()?,
+			},
+			EdgeTopology::Bidirectional {
+				source,
+				target,
+			} => AtomRefTopology::Bidirectional {
+				source: source.iter().map(&mut resolve).collect::<FerrosGrynnResult<_>>()?,
+				target: target.iter().map(&mut resolve).collect::<FerrosGrynnResult<_>>()?,
+			},
+			EdgeTopology::Undirected {
+				endpoints,
+			} => AtomRefTopology::Undirected {
+				endpoints: endpoints.iter().map(resolve).collect::<FerrosGrynnResult<_>>()?,
+			},
+		})
+	}
+
+	fn atom_ref_for_snapshot(
+		&self,
+		value: &MutableGraphValue,
+		id: AtomId,
+	) -> FerrosGrynnResult<AtomRef> {
+		if let Some(node) = self.nodes.get(&id) {
+			return Ok(AtomRef::new(AtomKind::Node, node.record_id.clone()));
+		}
+		if let Some(edge) = self.edges.get(&id) {
+			return Ok(AtomRef::new(AtomKind::Edge, edge.record_id.clone()));
+		}
+		value
+			.atom_ref(id)?
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("endpoint", id.to_string()))
 	}
 }
 
 impl GraphWrite {
+	#[cfg(test)]
 	pub(in crate::datastore) const fn is_delta_backed(&self) -> bool {
 		self.local.is_some() && self.value.is_none()
 	}
@@ -232,8 +1276,7 @@ pub enum AtomRefTopology {
 /// Backend-neutral transaction-private point-mutation view.
 ///
 /// Atom identity crosses the API boundary only as [`AtomRef`]. Local operations
-/// retain an atom delta while the selected operation has a page-delta path;
-/// unsupported operations materialize the exact transaction snapshot.
+/// retain an atom delta; this API never silently materializes a local graph.
 pub struct GraphMutationView<'a> {
 	store: Datastore,
 	kind: GraphKind,
@@ -241,6 +1284,11 @@ pub struct GraphMutationView<'a> {
 }
 
 impl GraphMutationView<'_> {
+	#[cfg(test)]
+	pub(in crate::datastore) const fn is_delta_backed(&self) -> bool {
+		self.write.is_delta_backed()
+	}
+
 	/// Returns the structural family of the graph being changed.
 	pub const fn kind(&self) -> GraphKind {
 		self.kind
@@ -267,12 +1315,7 @@ impl GraphMutationView<'_> {
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomRef> {
 		if let Some(local) = self.write.local.as_mut() {
-			let storage = self.store.inner.backend.local().ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file(
-					"local graph is attached to an in-memory backend",
-				)
-			})?;
-			let base = storage.graph_view(local.snapshot.clone(), local.base.clone());
+			let base = local_graph_view(&self.store, local)?;
 			return local.delta.create_node(&base, record_id, label, properties);
 		}
 		self.materialized()?.create_node(record_id, label, properties)
@@ -291,6 +1334,10 @@ impl GraphMutationView<'_> {
 		label: Option<Text>,
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomRef> {
+		if let Some(local) = self.write.local.as_mut() {
+			let base = local_graph_view(&self.store, local)?;
+			return local.delta.create_edge(&base, record_id, topology, label, properties);
+		}
 		self.materialized()?.create_edge(record_id, topology, label, properties)
 	}
 
@@ -304,6 +1351,10 @@ impl GraphMutationView<'_> {
 		atom: &AtomRef,
 		label: Option<Text>,
 	) -> FerrosGrynnResult<Option<Text>> {
+		if let Some(local) = self.write.local.as_mut() {
+			let base = local_graph_view(&self.store, local)?;
+			return local.delta.set_label(&base, atom, label);
+		}
 		self.materialized()?.set_atom_label(atom, label)
 	}
 
@@ -318,6 +1369,10 @@ impl GraphMutationView<'_> {
 		key: PropertyKeyId,
 		value: Value,
 	) -> FerrosGrynnResult<Option<Value>> {
+		if let Some(local) = self.write.local.as_mut() {
+			let base = local_graph_view(&self.store, local)?;
+			return local.delta.set_property(&base, atom, key, value);
+		}
 		Ok(self.materialized()?.atom_properties_mut(atom)?.insert(key, value))
 	}
 
@@ -331,6 +1386,10 @@ impl GraphMutationView<'_> {
 		atom: &AtomRef,
 		key: PropertyKeyId,
 	) -> FerrosGrynnResult<Option<Value>> {
+		if let Some(local) = self.write.local.as_mut() {
+			let base = local_graph_view(&self.store, local)?;
+			return local.delta.remove_property(&base, atom, key);
+		}
 		Ok(self.materialized()?.atom_properties_mut(atom)?.remove(key))
 	}
 
@@ -345,6 +1404,10 @@ impl GraphMutationView<'_> {
 		edge: &AtomRef,
 		topology: &AtomRefTopology,
 	) -> FerrosGrynnResult<()> {
+		if let Some(local) = self.write.local.as_mut() {
+			let base = local_graph_view(&self.store, local)?;
+			return local.delta.replace_incidence(&base, edge, topology);
+		}
 		self.materialized()?.replace_incidence(edge, topology)
 	}
 
@@ -355,8 +1418,22 @@ impl GraphMutationView<'_> {
 	/// Returns an error when the atom is absent or removal violates a family
 	/// invariant.
 	pub fn remove_atom(&mut self, atom: &AtomRef) -> FerrosGrynnResult<()> {
+		if let Some(local) = self.write.local.as_mut() {
+			let base = local_graph_view(&self.store, local)?;
+			return local.delta.remove_atom(&base, atom);
+		}
 		self.materialized()?.remove_atom(atom)
 	}
+}
+
+fn local_graph_view<'store>(
+	store: &'store Datastore,
+	local: &LocalGraphWrite,
+) -> FerrosGrynnResult<LocalGraphView<'store>> {
+	let storage = store.inner.backend.local().ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("local graph is attached to an in-memory backend")
+	})?;
+	Ok(storage.graph_view(local.snapshot.clone(), local.base.clone()))
 }
 
 /// A transaction-private family-specific graph write view.
@@ -482,6 +1559,18 @@ impl MutableGraphValue {
 				reference.id().to_string(),
 			)
 		})
+	}
+
+	fn atom_ref(&self, id: AtomId) -> FerrosGrynnResult<Option<AtomRef>> {
+		match self {
+			Self::Graph(value) => GraphRead::atom_ref(value, id),
+			Self::Tree(value) => GraphRead::atom_ref(value, id),
+			Self::RootedTree(value) => GraphRead::atom_ref(value, id),
+			Self::Forest(value) => GraphRead::atom_ref(value, id),
+			Self::Dag(value) => GraphRead::atom_ref(value, id),
+			Self::Hypergraph(value) => GraphRead::atom_ref(value, id),
+			Self::Metagraph(value) => GraphRead::atom_ref(value, id),
+		}
 	}
 
 	fn resolve_topology(&self, topology: &AtomRefTopology) -> FerrosGrynnResult<EdgeTopology> {
@@ -712,6 +1801,56 @@ fn atom_label_mut(graph: &mut impl GraphMut, id: AtomId) -> FerrosGrynnResult<&m
 	}
 }
 
+fn append_adjacency_roles(
+	adjacency: &mut crate::storage::LocalNodeAdjacency,
+	node: AtomId,
+	edge: AtomId,
+	topology: &EdgeTopology,
+) {
+	let mut append = |endpoint: &EdgeEndpoint, outgoing: bool, incoming: bool, undirected: bool| {
+		if endpoint.local_id() != Some(node) || node.kind() != Some(AtomKind::Node) {
+			return;
+		}
+		if outgoing {
+			adjacency.outgoing.push(edge);
+		}
+		if incoming {
+			adjacency.incoming.push(edge);
+		}
+		if undirected {
+			adjacency.undirected.push(edge);
+		}
+	};
+	match topology {
+		EdgeTopology::Directed {
+			source,
+			target,
+		} => {
+			for endpoint in source {
+				append(endpoint, true, false, false);
+			}
+			for endpoint in target {
+				append(endpoint, false, true, false);
+			}
+		}
+		EdgeTopology::Bidirectional {
+			source,
+			target,
+		} => {
+			for endpoint in source.iter().chain(target) {
+				append(endpoint, true, true, false);
+			}
+		}
+		EdgeTopology::Undirected {
+			endpoints,
+		} => {
+			for endpoint in endpoints {
+				append(endpoint, false, false, true);
+			}
+		}
+	}
+}
+
 fn directed_pair(topology: &EdgeTopology, kind: GraphKind) -> FerrosGrynnResult<(AtomId, AtomId)> {
 	match topology.local_binary() {
 		Some((source, target, EdgeDirection::Directed)) => Ok((source, target)),
@@ -827,7 +1966,37 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Opens the compatibility full-family mutation API.
+	///
+	/// Local graphs are materialized in full. Prefer [`Self::mutate_graph`] for
+	/// bounded point mutations or [`Self::edit_graph_materialized`] when full
+	/// family access is intentional.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is read-only, expired or
+	/// cancelled, the graph reference belongs to another backend, or the graph
+	/// is absent.
+	#[deprecated(note = "use mutate_graph for bounded point edits or edit_graph_materialized for \
+	                     explicit full materialization")]
 	pub fn edit_graph(&mut self, reference: &GraphRef) -> FerrosGrynnResult<GraphWriteView<'_>> {
+		self.edit_graph_materialized(reference)
+	}
+
+	/// Explicitly materializes a complete graph for family-specific mutation.
+	///
+	/// This operation has memory and I/O cost proportional to the complete
+	/// local graph. Use [`Self::mutate_graph`] for bounded atom changes.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is read-only, expired or
+	/// cancelled, the graph reference belongs to another backend, or the graph
+	/// is absent.
+	pub fn edit_graph_materialized(
+		&mut self,
+		reference: &GraphRef,
+	) -> FerrosGrynnResult<GraphWriteView<'_>> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
 		self.ensure_graph_write(reference)?;
@@ -1002,19 +2171,28 @@ impl Transaction {
 			StoredGraphValue::Materialized(graph) => {
 				(Some(graph.clone()), None, Some(MutableGraphValue::from_frozen(graph)?))
 			}
-			StoredGraphValue::Local(graph) => (
-				None,
-				Some(LocalGraphWrite {
-					base: graph.clone(),
-					snapshot: self.local_snapshot()?,
-					delta: LocalGraphDelta::new(
-						graph.kind(),
-						graph.node_capacity(),
-						graph.revision(),
-					),
-				}),
-				None,
-			),
+			StoredGraphValue::Local(graph) => {
+				if !graph.supports_atom_delta() {
+					return Err(FerrosGrynnError::invalid_argument(
+						"bounded point mutation is unavailable while scalar indexes require a \
+						 full rebuild; use edit_graph_materialized explicitly",
+					));
+				}
+				(
+					None,
+					Some(LocalGraphWrite {
+						base: graph.clone(),
+						snapshot: self.local_snapshot()?,
+						delta: LocalGraphDelta::new(
+							graph.kind(),
+							graph.node_capacity(),
+							graph.edge_capacity(),
+							graph.revision(),
+						),
+					}),
+					None,
+				)
+			}
 		};
 		self.graphs.insert(reference.id().clone(), GraphWrite {
 			name: stored.name.clone(),

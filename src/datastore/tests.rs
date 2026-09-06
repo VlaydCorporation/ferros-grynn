@@ -254,6 +254,9 @@ fn local_graph_table_and_edge_survive_reopen() {
 
 	let reopened = Datastore::open_local(directory.path(), options).unwrap();
 	let schema = reopened.table("person").unwrap();
+	let mut bounded = reopened.begin();
+	assert!(bounded.mutate_graph(schema.graph()).is_err());
+	drop(bounded);
 	let transaction = reopened.begin();
 	let view = schema.graph().read(&transaction).unwrap();
 	assert_eq!(view.node_count().unwrap(), 2);
@@ -290,7 +293,7 @@ fn local_graph_table_and_edge_survive_reopen() {
 	assert_eq!(rows.as_slice(), &[Value::from("Alice")]);
 
 	let mut update = reopened.begin();
-	if let GraphWriteView::Graph(graph) = update.edit_graph(schema.graph()).unwrap() {
+	if let GraphWriteView::Graph(graph) = update.edit_graph_materialized(schema.graph()).unwrap() {
 		graph.node_properties_mut(alice).unwrap().insert(age, 31_i64);
 	}
 	update.commit().unwrap();
@@ -416,6 +419,7 @@ fn local_metagraph_round_trips_nested_content_and_cross_level_incidence() {
 	let read = store.begin();
 	let view = reference.read(&read).unwrap();
 	let meta_node = view.node(meta).unwrap().unwrap();
+	let meta_ref = AtomRef::new(AtomKind::Node, meta_node.record_id().unwrap().into_owned());
 	let inner = meta_node.inner_graph().unwrap().unwrap();
 	assert!(inner.node(inner_node).is_some());
 	assert!(inner.node(inner_second).is_some());
@@ -439,6 +443,27 @@ fn local_metagraph_round_trips_nested_content_and_cross_level_incidence() {
 		let id = id.unwrap();
 		hybrid.edge(id).unwrap().transition_graph().is_some()
 	}));
+	drop(hybrid);
+	drop(meta_edge);
+	drop(inner);
+	drop(meta_node);
+	drop(view);
+	drop(read);
+
+	let mut update = store.begin();
+	let mut mutation = update.mutate_graph(&reference).unwrap();
+	mutation.remove_atom(&meta_ref).unwrap();
+	assert!(mutation.is_delta_backed());
+	drop(mutation);
+	update.commit().unwrap();
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	let read = store.begin();
+	let view = reference.read(&read).unwrap();
+	assert!(view.atom_id(&meta_ref).unwrap().is_none());
+	assert!(view.node(local).unwrap().is_some());
+	assert_eq!(view.edge_count().unwrap(), 0);
 }
 
 /// One WAL commit publishes two graphs atomically, and a concurrent update
@@ -477,13 +502,14 @@ fn local_multi_graph_commit_and_same_page_merge_survive_reopen() {
 	};
 	let mut multi_graph = store.begin_with(transaction_options);
 	let mut same_page = store.begin_with(transaction_options);
-	if let GraphWriteView::Graph(graph) = multi_graph.edit_graph(&first_ref).unwrap() {
+	if let GraphWriteView::Graph(graph) = multi_graph.edit_graph_materialized(&first_ref).unwrap() {
 		graph.node_properties_mut(left).unwrap().insert(value, 1_i64);
 	}
-	if let GraphWriteView::Graph(graph) = multi_graph.edit_graph(&second_ref).unwrap() {
+	if let GraphWriteView::Graph(graph) = multi_graph.edit_graph_materialized(&second_ref).unwrap()
+	{
 		graph.node_properties_mut(other).unwrap().insert(value, 2_i64);
 	}
-	if let GraphWriteView::Graph(graph) = same_page.edit_graph(&first_ref).unwrap() {
+	if let GraphWriteView::Graph(graph) = same_page.edit_graph_materialized(&first_ref).unwrap() {
 		graph.node_properties_mut(right).unwrap().insert(value, 3_i64);
 	}
 	multi_graph.commit().unwrap();
@@ -605,6 +631,7 @@ fn local_point_mutations_survive_reopen() {
 		})
 		.unwrap();
 	mutation.remove_atom(&beta).unwrap();
+	assert!(mutation.is_delta_backed());
 	drop(mutation);
 	transaction.commit().unwrap();
 	drop(store);
@@ -628,6 +655,274 @@ fn local_point_mutations_survive_reopen() {
 		view.edge(edge_id).unwrap().unwrap().topology().unwrap().local_binary(),
 		Some((alpha_id, gamma_id, EdgeDirection::Directed))
 	);
+
+	let mut update = store.begin();
+	let mut mutation = update.mutate_graph(&graph).unwrap();
+	assert_eq!(
+		mutation.set_property(&alpha, score, Value::from(9_i64)).unwrap(),
+		Some(Value::from(7_i64))
+	);
+	mutation.remove_atom(&gamma).unwrap();
+	assert!(mutation.is_delta_backed());
+	drop(mutation);
+	update.commit().unwrap();
+
+	assert!(view.atom_id(&gamma).unwrap().is_some());
+	assert!(view.atom_id(&edge).unwrap().is_some());
+	assert_eq!(
+		view.node(alpha_id).unwrap().unwrap().properties().unwrap().get(score),
+		Some(&Value::from(7_i64))
+	);
+	drop(view);
+	drop(transaction);
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	let transaction = store.begin();
+	let view = graph.read(&transaction).unwrap();
+	let alpha_id = view.atom_id(&alpha).unwrap().unwrap();
+	assert!(view.atom_id(&gamma).unwrap().is_none());
+	assert!(view.atom_id(&edge).unwrap().is_none());
+	assert_eq!(
+		view.node(alpha_id).unwrap().unwrap().properties().unwrap().get(score),
+		Some(&Value::from(9_i64))
+	);
+}
+
+/// Snapshot transactions that change disjoint atoms rebase their logical
+/// revision without losing either page delta.
+#[cfg(windows)]
+#[test]
+fn local_disjoint_point_mutations_merge_and_rebase_revision() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let score = store.intern_property("score").unwrap();
+	let left = AtomRef::new(AtomKind::Node, "item:left".parse().unwrap());
+	let right = AtomRef::new(AtomKind::Node, "item:right".parse().unwrap());
+	let mut graph = Graph::<Mutable>::new();
+	graph.add_node_with_id(left.id().clone(), None, PropertyMap::new()).unwrap();
+	graph.add_node_with_id(right.id().clone(), None, PropertyMap::new()).unwrap();
+	let mut create = store.begin();
+	let reference = create.create_graph(graph_id("disjoint-delta"), graph.freeze().into()).unwrap();
+	create.commit().unwrap();
+	let initial_revision = match &store.current_root().graphs.get(reference.id()).unwrap().graph {
+		StoredGraphValue::Local(graph) => graph.revision(),
+		StoredGraphValue::Materialized(_) => panic!("local graph must remain disk-backed"),
+	};
+
+	let transaction_options = TransactionOptions {
+		isolation: IsolationLevel::Snapshot,
+		access: TransactionAccess::ReadWrite,
+	};
+	let mut first = store.begin_with(transaction_options);
+	let mut second = store.begin_with(transaction_options);
+	first.mutate_graph(&reference).unwrap().set_property(&left, score, Value::from(1_i64)).unwrap();
+	second
+		.mutate_graph(&reference)
+		.unwrap()
+		.set_property(&right, score, Value::from(2_i64))
+		.unwrap();
+	first.commit().unwrap();
+	second.commit().unwrap();
+	let committed_revision = match &store.current_root().graphs.get(reference.id()).unwrap().graph {
+		StoredGraphValue::Local(graph) => graph.revision(),
+		StoredGraphValue::Materialized(_) => panic!("local graph must remain disk-backed"),
+	};
+	assert_eq!(committed_revision, initial_revision + 2);
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	let read = store.begin();
+	let view = reference.read(&read).unwrap();
+	let left = view.atom_id(&left).unwrap().unwrap();
+	let right = view.atom_id(&right).unwrap().unwrap();
+	assert_eq!(
+		view.node(left).unwrap().unwrap().properties().unwrap().get(score),
+		Some(&Value::from(1_i64))
+	);
+	assert_eq!(
+		view.node(right).unwrap().unwrap().properties().unwrap().get(score),
+		Some(&Value::from(2_i64))
+	);
+}
+
+/// Two individually valid disjoint DAG writes cannot jointly publish a cycle
+/// after the first one changes the commit-time graph.
+#[cfg(windows)]
+#[test]
+fn local_disjoint_dag_writes_revalidate_the_merged_graph() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let records =
+		["node:a", "node:b", "node:c", "node:d"].map(|record| record.parse::<RecordId>().unwrap());
+	let references = records.clone().map(|record| AtomRef::new(AtomKind::Node, record));
+	let mut dag = Dag::<Mutable>::new();
+	let nodes =
+		records.map(|record| dag.add_node_with_id(record, None, PropertyMap::new()).unwrap());
+	dag.add_edge_with_id(nodes[0], nodes[1], "edge:ab".parse().unwrap(), None, PropertyMap::new())
+		.unwrap();
+	dag.add_edge_with_id(nodes[2], nodes[3], "edge:cd".parse().unwrap(), None, PropertyMap::new())
+		.unwrap();
+	let mut create = store.begin();
+	let graph = create.create_graph(graph_id("dag-revalidation"), dag.freeze().into()).unwrap();
+	create.commit().unwrap();
+
+	let transaction_options = TransactionOptions {
+		isolation: IsolationLevel::Snapshot,
+		access: TransactionAccess::ReadWrite,
+	};
+	let mut first = store.begin_with(transaction_options);
+	let mut second = store.begin_with(transaction_options);
+	first
+		.mutate_graph(&graph)
+		.unwrap()
+		.create_edge(
+			"edge:bc".parse().unwrap(),
+			&AtomRefTopology::Directed {
+				source: vec![references[1].clone()],
+				target: vec![references[2].clone()],
+			},
+			None,
+			PropertyMap::new(),
+		)
+		.unwrap();
+	second
+		.mutate_graph(&graph)
+		.unwrap()
+		.create_edge(
+			"edge:da".parse().unwrap(),
+			&AtomRefTopology::Directed {
+				source: vec![references[3].clone()],
+				target: vec![references[0].clone()],
+			},
+			None,
+			PropertyMap::new(),
+		)
+		.unwrap();
+	first.commit().unwrap();
+	assert!(second.commit().is_err());
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	let read = store.begin();
+	let view = graph.read(&read).unwrap();
+	assert_eq!(view.edge_count().unwrap(), 3);
+	assert!(
+		view.atom_id(&AtomRef::new(AtomKind::Edge, "edge:bc".parse().unwrap())).unwrap().is_some()
+	);
+	assert!(
+		view.atom_id(&AtomRef::new(AtomKind::Edge, "edge:da".parse().unwrap())).unwrap().is_none()
+	);
+}
+
+/// Removing and recreating one stable RecordId in a transaction publishes
+/// only the replacement index binding.
+#[cfg(windows)]
+#[test]
+fn local_point_mutation_reuses_removed_record_id() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let record: RecordId = "item:replaceable".parse().unwrap();
+	let reference = AtomRef::new(AtomKind::Node, record.clone());
+	let mut graph = Graph::<Mutable>::new();
+	let previous =
+		graph.add_node_with_id(record.clone(), Some("Old".into()), PropertyMap::new()).unwrap();
+	let mut create = store.begin();
+	let graph = create.create_graph(graph_id("record-reuse"), graph.freeze().into()).unwrap();
+	create.commit().unwrap();
+
+	let old_snapshot = store.begin();
+	let mut transaction = store.begin();
+	let mut mutation = transaction.mutate_graph(&graph).unwrap();
+	mutation.remove_atom(&reference).unwrap();
+	mutation.create_node(record, Some("New".into()), PropertyMap::new()).unwrap();
+	drop(mutation);
+	transaction.commit().unwrap();
+	assert_eq!(graph.read(&old_snapshot).unwrap().atom_id(&reference).unwrap(), Some(previous));
+	drop(old_snapshot);
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	let read = store.begin();
+	let view = graph.read(&read).unwrap();
+	let replacement = view.atom_id(&reference).unwrap().unwrap();
+	assert_ne!(replacement, previous);
+	assert_eq!(
+		view.node(replacement).unwrap().unwrap().label_text().unwrap().as_deref(),
+		Some(&Text::from("New"))
+	);
+}
+
+/// Local write-set accounting includes the derived adjacency image produced
+/// by an otherwise small edge update and rejects it before publication.
+#[cfg(windows)]
+#[test]
+fn local_write_set_limit_counts_derived_adjacency_before_publication() {
+	let directory = LocalTestDirectory::new();
+	let create_options = LocalOptions {
+		buffer_pool_pages: 32,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), create_options).unwrap();
+	let marker = store.intern_property("marker").unwrap();
+	let hub_record: RecordId = "item:hub".parse().unwrap();
+	let edge_record: RecordId = "link:0".parse().unwrap();
+	let mut graph = Graph::<Mutable>::new();
+	let hub = graph.add_node_with_id(hub_record, None, PropertyMap::new()).unwrap();
+	for index in 0..256 {
+		let leaf = graph
+			.add_node_with_id(
+				format!("item:leaf-{index}").parse().unwrap(),
+				None,
+				PropertyMap::new(),
+			)
+			.unwrap();
+		graph
+			.add_edge_with_id(
+				format!("link:{index}").parse().unwrap(),
+				EdgeTopology::directed([hub], [leaf]),
+				None,
+				PropertyMap::new(),
+			)
+			.unwrap();
+	}
+	let mut create = store.begin();
+	let reference =
+		create.create_graph(graph_id("adjacency-limit"), graph.freeze().into()).unwrap();
+	create.commit().unwrap();
+	drop(store);
+
+	let limited_options = LocalOptions {
+		max_write_set_bytes: 1_024,
+		..create_options
+	};
+	let store = Datastore::open_local(directory.path(), limited_options).unwrap();
+	let before_commit_ts = store.current_root().commit_ts;
+	let edge = AtomRef::new(AtomKind::Edge, edge_record);
+	let mut transaction = store.begin();
+	transaction
+		.mutate_graph(&reference)
+		.unwrap()
+		.set_property(&edge, marker, Value::from(true))
+		.unwrap();
+	assert_eq!(transaction.commit().unwrap_err().status().code().to_string(), "FG-54F07");
+	assert_eq!(store.current_root().commit_ts, before_commit_ts);
+	let read = store.begin();
+	let view = reference.read(&read).unwrap();
+	let edge = view.atom_id(&edge).unwrap().unwrap();
+	assert!(!view.edge(edge).unwrap().unwrap().properties().unwrap().contains_key(marker));
 }
 
 /// Appending nodes through the backend-neutral mutation view retains only the
@@ -646,6 +941,7 @@ fn local_node_append_stays_delta_backed_until_commit() {
 		.create_graph(graph_id("delta-append"), Graph::<Mutable>::new().freeze().into())
 		.unwrap();
 	create.commit().unwrap();
+	let old_snapshot = store.begin();
 
 	let payload_key = store.intern_property("payload").unwrap();
 	let payload = Bytes::from(vec![0x5a; 20_000]);
@@ -662,6 +958,17 @@ fn local_node_append_stays_delta_backed_until_commit() {
 	let pending = transaction.graphs.get(graph.id()).unwrap();
 	assert!(pending.is_delta_backed());
 	transaction.commit().unwrap();
+	let mut node_hot_files = 0;
+	for graph_directory in std::fs::read_dir(directory.path().join("graphs")).unwrap() {
+		for generation in std::fs::read_dir(graph_directory.unwrap().path()).unwrap() {
+			if generation.unwrap().path().join("nodes_hot.fgb").is_file() {
+				node_hot_files += 1;
+			}
+		}
+	}
+	assert_eq!(node_hot_files, 1, "a point delta must not copy its stable data files");
+	assert_eq!(graph.read(&old_snapshot).unwrap().node_count().unwrap(), 0);
+	drop(old_snapshot);
 	drop(store);
 
 	let reopened = Datastore::open_local(directory.path(), options).unwrap();
@@ -760,6 +1067,50 @@ fn local_large_properties_overflow_and_abort_round_trip() {
 		view.node(source[0]).unwrap().unwrap().properties().unwrap().get(payload_key),
 		Some(&Value::from(payload))
 	);
+	drop(view);
+	drop(read);
+
+	let mut update = store.begin();
+	let mut mutation = update.mutate_graph(&reference).unwrap();
+	let mut source_refs = (0..6)
+		.map(|index| AtomRef::new(AtomKind::Node, format!("item:source-{index}").parse().unwrap()))
+		.collect::<Vec<_>>();
+	let target_refs = (0..6)
+		.map(|index| AtomRef::new(AtomKind::Node, format!("item:target-{index}").parse().unwrap()))
+		.collect::<Vec<_>>();
+	source_refs.push(
+		mutation
+			.create_node("item:source-extra".parse().unwrap(), None, PropertyMap::new())
+			.unwrap(),
+	);
+	mutation
+		.replace_incidence(
+			&AtomRef::new(AtomKind::Edge, "link:wide".parse().unwrap()),
+			&AtomRefTopology::Directed {
+				source: source_refs,
+				target: target_refs,
+			},
+		)
+		.unwrap();
+	assert!(mutation.is_delta_backed());
+	drop(mutation);
+	update.commit().unwrap();
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	let read = store.begin();
+	let view = reference.read(&read).unwrap();
+	let edge = view.edge(edge).unwrap().unwrap();
+	let topology = edge.topology().unwrap();
+	let EdgeTopology::Directed {
+		source: decoded_source,
+		target: decoded_target,
+	} = topology.as_ref()
+	else {
+		panic!("updated wide edge changed topology");
+	};
+	assert_eq!(decoded_source.len(), 7);
+	assert_eq!(decoded_target.len(), 6);
 }
 
 /// Every runtime Value variant admitted by the format-v1 property codec
@@ -862,7 +1213,7 @@ fn local_reopen_preserves_reused_slot_generation() {
 
 	let reopened = Datastore::open_local(directory.path(), options).unwrap();
 	let mut remove = reopened.begin();
-	if let GraphWriteView::Graph(graph) = remove.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = remove.edit_graph_materialized(&reference).unwrap() {
 		graph.remove_atom(stale).unwrap();
 	}
 	remove.commit().unwrap();
@@ -870,7 +1221,7 @@ fn local_reopen_preserves_reused_slot_generation() {
 
 	let reopened = Datastore::open_local(directory.path(), options).unwrap();
 	let mut reuse = reopened.begin();
-	let replacement = match reuse.edit_graph(&reference).unwrap() {
+	let replacement = match reuse.edit_graph_materialized(&reference).unwrap() {
 		GraphWriteView::Graph(graph) => graph
 			.add_node_with_id("item:replacement".parse().unwrap(), None, PropertyMap::new())
 			.unwrap(),
@@ -918,7 +1269,7 @@ fn local_restart_checkpoint_cancels_old_snapshot() {
 	let old = store.begin();
 	let old_view = reference.read(&old).unwrap();
 	let mut writer = store.begin();
-	if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = writer.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(node).unwrap().insert(value, 2_i64);
 	}
 	writer.commit().unwrap();
@@ -1003,7 +1354,7 @@ fn read_committed_query_uses_one_statement_snapshot() {
 	let statement = reader.query_snapshot().unwrap();
 
 	let mut writer = store.begin();
-	if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = writer.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(carol).unwrap().insert(1_u32.into(), 21_i64);
 	}
 	writer.commit().unwrap();
@@ -1044,10 +1395,10 @@ fn disjoint_atom_writes_merge() {
 	});
 	let mut second = store.begin_with(first.options());
 	let key = PropertyKeyId::new(0);
-	if let GraphWriteView::Graph(graph) = first.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = first.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(left).unwrap().insert(key, Value::from(1_i64));
 	}
-	if let GraphWriteView::Graph(graph) = second.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = second.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(right).unwrap().insert(key, Value::from(2_i64));
 	}
 	first.commit().unwrap();
@@ -1074,10 +1425,10 @@ fn concurrent_writes_to_the_same_atom_fail_first_committer_wins() {
 	};
 	let mut first = store.begin_with(options);
 	let mut second = store.begin_with(options);
-	if let GraphWriteView::Graph(graph) = first.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = first.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(left).unwrap().insert(0_u32.into(), 1_i64);
 	}
-	if let GraphWriteView::Graph(graph) = second.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = second.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(left).unwrap().insert(0_u32.into(), 2_i64);
 	}
 	first.commit().unwrap();
@@ -1091,7 +1442,7 @@ fn serializable_reader_aborts_after_concurrent_change() {
 	assert!(reference.read(&reader).unwrap().node(left).unwrap().is_some());
 
 	let mut writer = store.begin();
-	if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = writer.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(left).unwrap().insert(0_u32.into(), 1_i64);
 	}
 	writer.commit().unwrap();
@@ -1109,7 +1460,7 @@ fn read_only_snapshot_is_safe_from_serialization_aborts() {
 	});
 	assert!(reference.read(&reader).unwrap().node(left).unwrap().is_some());
 	let mut writer = store.begin();
-	if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = writer.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(left).unwrap().insert(0_u32.into(), 1_i64);
 	}
 	writer.commit().unwrap();
@@ -1136,7 +1487,7 @@ fn predicate_validation_ignores_non_matching_changes_but_catches_phantoms() {
 		.execute("SELECT VALUE name FROM person WHERE age >= 18", &crate::values::Object::new())
 		.unwrap();
 	let mut writer = store.begin();
-	if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = writer.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(carol).unwrap().insert(1_u32.into(), 17_i64);
 	}
 	writer.commit().unwrap();
@@ -1147,7 +1498,7 @@ fn predicate_validation_ignores_non_matching_changes_but_catches_phantoms() {
 		.execute("SELECT VALUE name FROM person WHERE age >= 18", &crate::values::Object::new())
 		.unwrap();
 	let mut writer = store.begin();
-	if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = writer.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(carol).unwrap().insert(1_u32.into(), 21_i64);
 	}
 	writer.commit().unwrap();
@@ -1158,7 +1509,7 @@ fn predicate_validation_ignores_non_matching_changes_but_catches_phantoms() {
 fn predicate_validation_includes_own_uncommitted_writes() {
 	let (store, reference, carol) = seeded_table();
 	let mut transaction = store.begin();
-	if let GraphWriteView::Graph(graph) = transaction.edit_graph(&reference).unwrap() {
+	if let GraphWriteView::Graph(graph) = transaction.edit_graph_materialized(&reference).unwrap() {
 		graph.node_properties_mut(carol).unwrap().insert(1_u32.into(), 21_i64);
 	}
 	transaction
@@ -1185,7 +1536,7 @@ fn configured_transaction_limits_have_domain_statuses() {
 }
 
 #[test]
-fn write_set_limit_counts_large_property_payload_before_publication() {
+fn write_set_limit_counts_recursive_graph_payload_before_publication() {
 	let store = Datastore::in_memory_with(InMemoryOptions {
 		max_snapshot_age: Duration::from_secs(300),
 		max_write_set_bytes: 1_024,
@@ -1198,7 +1549,7 @@ fn write_set_limit_counts_large_property_payload_before_publication() {
 	create.commit().unwrap();
 
 	let mut transaction = store.begin();
-	let GraphWriteView::Graph(write) = transaction.edit_graph(&graph).unwrap() else {
+	let GraphWriteView::Graph(write) = transaction.edit_graph_materialized(&graph).unwrap() else {
 		panic!("test graph must keep the general graph family");
 	};
 	let mut properties = PropertyMap::new();
@@ -1208,6 +1559,22 @@ fn write_set_limit_counts_large_property_payload_before_publication() {
 
 	let read = store.begin();
 	assert_eq!(graph.read(&read).unwrap().node_count().unwrap(), 0);
+
+	let store = Datastore::in_memory_with(InMemoryOptions {
+		max_snapshot_age: Duration::from_secs(300),
+		max_write_set_bytes: 1_024,
+	});
+	let payload = store.intern_property("nested-payload").unwrap();
+	let mut properties = PropertyMap::new();
+	properties.insert(payload, Bytes::from(vec![0_u8; 2_048]));
+	let mut inner = Graph::<Mutable>::new();
+	inner.add_node(None, properties).unwrap();
+	let mut outer = Graph::<Mutable>::new();
+	outer.add_metavertex(inner.freeze(), None, PropertyMap::new()).unwrap();
+	let mut transaction = store.begin();
+	transaction.create_graph(graph_id("nested-write"), outer.freeze().into()).unwrap();
+	assert_eq!(transaction.commit().unwrap_err().status().code().to_string(), "FG-54F07");
+	assert!(store.current_root().graphs.is_empty());
 }
 
 #[cfg(not(all(windows, feature = "native-async-io")))]

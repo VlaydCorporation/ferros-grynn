@@ -1615,15 +1615,40 @@ checkpoint-протоколу: обычный `stage_frame` не имеет пр
 продвинутый graph superblock после crash не становится глобальной authority, пока тем же
 checkpoint не заменён `db.fgb`.
 
-**Текущее checkpoint-owned ограничение format v1:** обычная транзакция может обновлять текущее
-поколение in-place только тогда, когда все поля `GraphSuperblock` остаются неизменными. Если
-мутация меняет `node/edge/subgraph capacity` или count, число hot/property pages, размер labels,
-flags либо schema/statistics roots, она обязана сначала построить и синхронизировать отдельное
-COW-поколение вместе с новым `GraphSuperblock`, а затем атомарно переключить на него durable
-catalog. Расширить старые data-файлы, опубликовать только их WAL-frames и заменить superblock лишь
-в in-memory authority недостаточно: после reopen checkpoint-owned home-superblock снова задаст
-старую раскладку. Снятие этого ограничения требует отдельного транзакционно версионируемого
-metadata-протокола и несовместимого изменения core format/protocol.
+**Checkpoint-owned протокол format v1:** обычный `stage_frame` по-прежнему не пишет
+`GraphSuperblock` в WAL. Изменение его динамических полей публикуется узким metadata COW:
+
+1. неизменяемые идентификаторы WAL-backfilled data-файлов сохраняются, а изменённые и новые
+   страницы этих файлов помещаются в ту же frame-WAL транзакцию;
+2. writer создаёт и синхронизирует отдельный одно-страничный `GraphSuperblock`, содержащий новую
+   логическую раскладку, но прежние checkpoint generation/backfill clocks;
+3. та же WAL-транзакция переключает durable catalog с прежнего superblock-файла на новый;
+4. только durable `TxCommit` одновременно делает видимыми catalog head, новый superblock и
+   data-page frames. До него действует прежняя пара catalog/superblock; после него старый snapshot
+   продолжает читать прежние версии страниц по своему `visible_lsn`;
+5. checkpoint переносит committed frames на штатные места, атомарно заменяет только текущую
+   страницу `GraphSuperblock` с новыми checkpoint clocks и последним заменяет `db.fgb`.
+
+Commit и checkpoint сериализуются одной локальной catalog critical section. Поэтому перед
+кодированием metadata COW writer берёт `generation`, `backfilled_lsn` и
+`checkpoint_record_lsn` из текущей checkpoint-authority `PageManager`, а не из потенциально
+старого MVCC-дескриптора транзакции. Логическая мутация не может откатить эти три поля; после
+снятия их снимка checkpoint не меняет authority до публикации либо отмены commit.
+
+Поэтому point delta не читает, не копирует и не синхронизирует остальные файлы поколения:
+write amplification зависит от числа изменённых страниц, полного образа перестраиваемого индекса
+и одной metadata page, а не от размера графа. Полное COW-поколение остаётся протоколом создания
+графа, явной полной materialization и несовместимого изменения набора физических файлов. Физические
+data-файлы могут быть длиннее логически достижимой версии после замены полного образа индекса;
+reader следует опубликованным page counts/roots и никогда не считает лишний tail видимыми данными.
+
+Обычная локальная мутация атомов не имеет скрытого перехода к полной materialization. Создание,
+изменение и удаление узлов/рёбер, labels, properties и incidence формируют page delta: hot-образы
+заменяются, а продолжения properties и adjacency дописываются с учётом WAL-visible длины файла.
+Новый snapshot видит эти изменения только после durable `TxCommit`, а уже открытый snapshot
+продолжает читать прежние версии. Пока scalar indexes не поддерживают atom-delta maintenance,
+bounded mutation такого графа завершается явной ошибкой до durable I/O; вызывающий код может
+отдельно запросить полную materialization, но storage никогда не выбирает её неявно.
 
 ---
 
@@ -2955,11 +2980,22 @@ snapshot.visible_lsn`. Checkpoint переносит закоммиченные 
 | Незакоммиченные данные на диске | Фреймы без durable `TxCommit` невидимы и никогда не бэкфиллятся; начальный atom-delta write-set ограничен 256 МиБ |
 | Torn write                      | Фрейм **и есть** полный образ страницы; отдельный механизм full-page-write не нужен                                                                                         |
 | Отсутствие on-disk MVCC         | Снимок видит committed-фреймы с `commit_lsn ≤ visible_lsn`; версионность появляется как побочный эффект                                                                       |
-| Потолок объёма транзакции       | При превышении 256 МиБ commit отклоняется типизированной resource error; transaction-private spill — отдельный последующий этап                                              |
+| Потолок объёма транзакции       | До commit lock вычисляется консервативный рекурсивный объём owned atom-delta; при превышении 256 МиБ commit отклоняется `FG-54F07`; transaction-private spill — отдельный последующий этап |
 | Откат                           | Отбросить scratch-фреймы и записи индекса. UNDO и CLR не нужны                                                                                                              |
 | Идемпотентность replay          | Применение фрейма — `memcpy`; повторное применение того же образа ничего не меняет                                                                                          |
 
 Ключевое отличие от «чистого COW» (LMDB): обратная запись **на штатное место** сохраняет арифметическую адресацию §25.1 (`page_no = slot / 102`) и физическую кластеризацию SoA, на которых держится аналитический путь. Data-file COW обе эти вещи разрушает.
+
+Лимит `FG_TX_WRITE_SET_MAX_BYTES` является лимитом логического transaction-private payload, а не
+перехватчиком каждой аллокации. Оценка рекурсивно включает capacity контейнеров, graph/atom
+properties, строки и составные `RecordId`, topology и adjacency representation, а также вложенные
+и transition graphs; арифметическое переполнение насыщает оценку и приводит к отказу. Проверка
+выполняется в начале `Transaction::commit` после проверки liveness, но до захвата commit lock,
+FCW/SSI validation, page encoding, WAL I/O и публикации MVCC root. Следовательно, вызывающий код
+может уже потратить память при построении крупной мутации, однако отклонённая транзакция не делает
+ни одного durable или видимого изменения. Отдельный жёсткий лимит уникальных frame-WAL страниц
+остаётся вторым fail-safe после кодирования. Для заранее крупных загрузок нормативный bounded путь
+— сегментный импорт; allocation-time quota и private spill в format v1 не обещаются.
 
 ### 22.1. Набор WalKind
 

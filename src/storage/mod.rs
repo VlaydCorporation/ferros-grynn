@@ -118,11 +118,14 @@ pub mod prototype_api {
 // Preserve the internal module path while callers migrate to `direct_io`.
 use direct_io as direct;
 pub use page_io::PageIoMode;
-pub(crate) use store::LocalTableCursor;
 pub use store::{
+	LocalCommitAtomDelta,
+	LocalCommitEdgeChange,
 	LocalCommitGraph,
 	LocalCommitGraphChange,
 	LocalCommitNode,
+	LocalCommitNodeAdjacency,
+	LocalCommitNodeChange,
 	LocalCommitResult,
 	LocalCommitTable,
 	LocalCommitTableField,
@@ -135,6 +138,7 @@ pub use store::{
 	LocalReadTransaction,
 	LocalStore,
 };
+pub(crate) use store::{LocalNodeAdjacency, LocalTableCursor};
 
 #[cfg(test)]
 mod benchmarks;

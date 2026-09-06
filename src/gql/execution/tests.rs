@@ -551,7 +551,9 @@ fn match_observes_transaction_private_graphs_and_one_read_committed_snapshot() {
 		snapshot,
 	};
 	let mut concurrent = store.begin();
-	if let GraphWriteView::Graph(graph) = concurrent.edit_graph(&reference).expect("edit graph") {
+	if let GraphWriteView::Graph(graph) =
+		concurrent.edit_graph_materialized(&reference).expect("edit graph")
+	{
 		graph
 			.add_node_with_id(
 				"person:late".parse().expect("record"),
@@ -587,7 +589,9 @@ fn match_reads_participate_in_serializable_validation() {
 		)
 		.expect("MATCH reads graph");
 	let mut concurrent = store.begin();
-	if let GraphWriteView::Graph(graph) = concurrent.edit_graph(&reference).expect("edit graph") {
+	if let GraphWriteView::Graph(graph) =
+		concurrent.edit_graph_materialized(&reference).expect("edit graph")
+	{
 		graph
 			.add_node_with_id(
 				"person:phantom".parse().expect("record"),

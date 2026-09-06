@@ -302,7 +302,13 @@ impl Transaction {
 		let mut estimated = 0_usize;
 		for write in self.graphs.values() {
 			if let Some(local) = &write.local {
-				estimated = estimated.saturating_add(local.delta.estimated_write_set_bytes());
+				let storage = self.store.inner.backend.local().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"local graph is attached to an in-memory backend",
+					)
+				})?;
+				let view = storage.graph_view(local.snapshot.clone(), local.base.clone());
+				estimated = estimated.saturating_add(local.delta.estimated_write_set_bytes(&view)?);
 				continue;
 			}
 			let Some(value) = write.value.as_ref() else {
@@ -343,14 +349,14 @@ impl Transaction {
 									.saturating_add(edge.record_id().estimated_heap_bytes())
 									.saturating_add(edge.label_text().map_or(0, Text::len))
 									.saturating_add(edge.properties().estimated_heap_bytes())
-									.saturating_add(
-										edge.topology()
-											.endpoint_count()
-											.saturating_mul(std::mem::size_of::<EdgeEndpoint>()),
-									);
+									.saturating_add(crate::graph::estimated_topology_heap_bytes(
+										edge.topology(),
+									));
 								if let Some(transition) = edge.transition_graph() {
 									estimated = estimated.saturating_add(
-										crate::graph::estimated_nested_graph_heap_bytes(transition)?,
+										crate::graph::estimated_nested_graph_heap_bytes(
+											transition,
+										)?,
 									);
 								}
 							}

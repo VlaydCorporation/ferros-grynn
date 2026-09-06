@@ -351,6 +351,19 @@ impl TxHandle {
 		self.staged.get(&key).map(|staged| staged.page.as_ref())
 	}
 
+	/// Returns the exclusive high-water page staged for one physical file.
+	pub(in crate::storage) fn staged_file_page_count(
+		&self,
+		graph_id: GraphId,
+		file_id: DataFileId,
+	) -> Option<u64> {
+		self.staged
+			.keys()
+			.filter(|key| key.graph_id() == graph_id && key.file_id() == file_id)
+			.filter_map(|key| key.page_no().get().checked_add(1))
+			.max()
+	}
+
 	/// Releases the active snapshot registration exactly once.
 	fn release_snapshot(&self) {
 		if !self.active.swap(false, AtomicOrdering::AcqRel) {

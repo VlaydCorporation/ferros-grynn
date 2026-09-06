@@ -765,6 +765,20 @@ impl SyncPageManager {
 			.page_count())
 	}
 
+	/// Returns the physical or snapshot-visible exclusive page high-water.
+	pub(in crate::storage) fn visible_file_page_count(
+		&self,
+		tx: &TxHandle,
+		graph_id: GraphId,
+		file_id: crate::storage::types::DataFileId,
+	) -> FerrosGrynnResult<u64> {
+		self.wal.validate_tx(tx)?;
+		let physical = self.file_page_count(graph_id, file_id)?;
+		Ok(physical
+			.max(self.wal.visible_file_page_count(tx.snapshot(), graph_id, file_id).unwrap_or(0))
+			.max(tx.staged_file_page_count(graph_id, file_id).unwrap_or(0)))
+	}
+
 	/// Extends one registered WAL-backfilled file before frames may address its
 	/// new tail. Existing bytes are never truncated.
 	pub(in crate::storage) fn ensure_file_pages(

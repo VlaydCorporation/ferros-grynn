@@ -342,6 +342,26 @@ impl FrameWal {
 		}
 	}
 
+	/// Returns the exclusive high-water page visible in WAL for one file.
+	pub(in crate::storage) fn visible_file_page_count(
+		&self,
+		snapshot: StorageSnapshot,
+		graph_id: GraphId,
+		file_id: DataFileId,
+	) -> Option<u64> {
+		let published = self.inner.published.read();
+		published
+			.versions
+			.iter()
+			.filter(|(key, versions)| {
+				key.graph_id() == graph_id
+					&& key.file_id() == file_id
+					&& versions.iter().any(|version| version.commit_lsn <= snapshot.visible_lsn())
+			})
+			.filter_map(|(key, _versions)| key.page_no().get().checked_add(1))
+			.max()
+	}
+
 	/// Reads and validates one previously resolved complete frame.
 	///
 	/// # Errors
