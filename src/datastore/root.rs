@@ -1,6 +1,18 @@
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
-use super::{ReadKey, TableField, TableIndex, TableSchema};
+use super::{
+	GraphSchema,
+	ReadKey,
+	SchemaCatalog,
+	SchemaId,
+	SchemaParameter,
+	SchemaVersion,
+	SystemIndex,
+	SystemIndexKind,
+	TableField,
+	TableIndex,
+	TableSchema,
+};
 use crate::{
 	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -22,11 +34,7 @@ pub(crate) struct ActiveSnapshot {
 pub(crate) struct DatabaseRoot {
 	pub(crate) commit_ts: u64,
 	pub(crate) graphs: BTreeMap<RecordId, StoredGraph>,
-	/// Case-sensitive top-level graph names mapped to their records.
-	pub(crate) graph_names: BTreeMap<String, RecordId>,
-	pub(crate) graph_catalog_versions: BTreeMap<RecordId, u64>,
-	pub(crate) tables: BTreeMap<String, Arc<TableSchema>>,
-	pub(crate) table_versions: BTreeMap<String, u64>,
+	pub(crate) schema: Arc<SchemaCatalog>,
 	pub(crate) dictionary: Arc<PropertyDictionary>,
 }
 
@@ -149,10 +157,7 @@ impl Default for DatabaseRoot {
 		Self {
 			commit_ts: 0,
 			graphs: BTreeMap::new(),
-			graph_names: BTreeMap::new(),
-			graph_catalog_versions: BTreeMap::new(),
-			tables: BTreeMap::new(),
-			table_versions: BTreeMap::new(),
+			schema: Arc::new(SchemaCatalog::default()),
 			dictionary: Arc::new(PropertyDictionary::new()),
 		}
 	}
@@ -163,18 +168,21 @@ impl DatabaseRoot {
 	pub(crate) fn from_local(snapshot: LocalDatabaseSnapshot) -> FerrosGrynnResult<Self> {
 		let LocalDatabaseSnapshot {
 			commit_ts,
+			next_schema_id,
 			property_dictionary,
 			graphs,
 			tables,
+			parameters,
 		} = snapshot;
 		let dictionary = property_dictionary;
+		let mut catalog = SchemaCatalog {
+			next_id: next_schema_id,
+			..SchemaCatalog::default()
+		};
 		let mut root = Self {
 			commit_ts,
 			graphs: BTreeMap::new(),
-			graph_names: BTreeMap::new(),
-			graph_catalog_versions: BTreeMap::new(),
-			tables: BTreeMap::new(),
-			table_versions: BTreeMap::new(),
+			schema: Arc::new(SchemaCatalog::default()),
 			dictionary,
 		};
 		for entry in graphs {
@@ -183,12 +191,38 @@ impl DatabaseRoot {
 					"durable graph catalog contains duplicate RecordId values",
 				));
 			}
-			if root.graph_names.insert(entry.name.clone(), entry.record_id.clone()).is_some() {
+			if catalog.graph_names.insert(entry.name.clone(), entry.record_id.clone()).is_some() {
 				return Err(FerrosGrynnError::invalid_storage_file(
 					"durable graph catalog contains duplicate names",
 				));
 			}
-			root.graph_catalog_versions.insert(entry.record_id.clone(), commit_ts);
+			let graph_schema = GraphSchema::new(
+				SchemaId::from_storage(entry.schema.id)?,
+				SchemaVersion::from_storage(entry.schema.version)?,
+				entry.name.clone().into(),
+				entry.graph.reference().clone(),
+				SystemIndex::from_storage(
+					SchemaId::from_storage(entry.schema.label_index.id)?,
+					SchemaVersion::from_storage(entry.schema.label_index.version)?,
+					SystemIndexKind::Label,
+				),
+				SystemIndex::from_storage(
+					SchemaId::from_storage(entry.schema.adjacency_index.id)?,
+					SchemaVersion::from_storage(entry.schema.adjacency_index.version)?,
+					SystemIndexKind::Adjacency,
+				),
+				commit_ts,
+			);
+			if catalog.graphs.insert(entry.record_id.clone(), Arc::new(graph_schema)).is_some() {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"durable graph catalog contains duplicate RecordId values",
+				));
+			}
+			catalog.graph_versions.insert(entry.record_id.clone(), commit_ts);
+			for membership in entry.memberships {
+				let table = membership.table_id.map(SchemaId::from_storage).transpose()?;
+				catalog.set_membership(&entry.record_id, membership.id, table)?;
+			}
 			root.graphs.insert(entry.record_id, StoredGraph {
 				name: entry.name,
 				graph: StoredGraphValue::Local(entry.graph),
@@ -219,6 +253,8 @@ impl DatabaseRoot {
 						));
 					}
 					Ok(TableField {
+						id: Some(SchemaId::from_storage(field.id)?),
+						version: SchemaVersion::from_storage(field.version)?,
 						name: field.name.into(),
 						value_type: field.value_type,
 						key: Some(key),
@@ -226,7 +262,9 @@ impl DatabaseRoot {
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			let name = table.name;
-			let mut schema = TableSchema {
+			let mut table_schema = TableSchema {
+				id: Some(SchemaId::from_storage(table.id)?),
+				version: SchemaVersion::from_storage(table.version)?,
 				name: name.clone().into(),
 				graph: GraphRef::new(
 					table.graph,
@@ -236,13 +274,19 @@ impl DatabaseRoot {
 				kind: table.kind,
 				fields,
 				indexes: Vec::new(),
+				primary_index: Some(SystemIndex::from_storage(
+					SchemaId::from_storage(table.primary_index.id)?,
+					SchemaVersion::from_storage(table.primary_index.version)?,
+					SystemIndexKind::Primary,
+				)),
+				published_at: commit_ts,
 			};
 			for index in durable_indexes {
 				let field_names = index
 					.fields
 					.iter()
 					.map(|property_key| {
-						schema
+						table_schema
 							.fields
 							.iter()
 							.find(|field| field.key.map(PropertyKeyId::get) == Some(*property_key))
@@ -254,41 +298,61 @@ impl DatabaseRoot {
 							})
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
-				schema =
-					schema.with_index(TableIndex::new(index.name, index.kind, field_names)?)?;
+				let mut definition = TableIndex::new(index.name, index.kind, field_names)?;
+				definition.id = Some(SchemaId::from_storage(index.id)?);
+				definition.version = SchemaVersion::from_storage(index.version)?;
+				table_schema = table_schema.with_index(definition)?;
 			}
-			if root.tables.insert(name.clone(), Arc::new(schema)).is_some() {
+			if catalog.tables.insert(name.clone(), Arc::new(table_schema)).is_some() {
 				return Err(FerrosGrynnError::invalid_storage_file(
 					"durable table catalog contains duplicate names",
 				));
 			}
-			root.table_versions.insert(name, commit_ts);
+			catalog.table_versions.insert(name, commit_ts);
 		}
+		for parameter in parameters {
+			let name = parameter.name;
+			let mut definition = SchemaParameter::new(name.clone(), parameter.value)?;
+			definition.id = Some(SchemaId::from_storage(parameter.id)?);
+			definition.version = SchemaVersion::from_storage(parameter.version)?;
+			definition.published_at = commit_ts;
+			if catalog.parameters.insert(name.clone(), Arc::new(definition)).is_some() {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"durable parameter catalog contains duplicate names",
+				));
+			}
+			catalog.parameter_versions.insert(name, commit_ts);
+		}
+		catalog.validate_memberships()?;
+		root.schema = Arc::new(catalog);
 		Ok(root)
 	}
 
 	pub(crate) fn version(&self, key: &ReadKey) -> u64 {
 		match key {
 			ReadKey::GraphCatalog(graph) => {
-				self.graph_catalog_versions.get(graph).copied().unwrap_or(0)
+				self.schema.graph_versions.get(graph).copied().unwrap_or(0)
 			}
 			ReadKey::GraphProperties(graph) => self.graphs.get(graph).map_or_else(
-				|| self.graph_catalog_versions.get(graph).copied().unwrap_or(0),
+				|| self.schema.graph_versions.get(graph).copied().unwrap_or(0),
 				|stored| stored.properties_version,
 			),
 			ReadKey::NodeSet(graph) => self.graphs.get(graph).map_or_else(
-				|| self.graph_catalog_versions.get(graph).copied().unwrap_or(0),
+				|| self.schema.graph_versions.get(graph).copied().unwrap_or(0),
 				|stored| stored.node_set_version,
 			),
 			ReadKey::EdgeSet(graph) => self.graphs.get(graph).map_or_else(
-				|| self.graph_catalog_versions.get(graph).copied().unwrap_or(0),
+				|| self.schema.graph_versions.get(graph).copied().unwrap_or(0),
 				|stored| stored.edge_set_version,
 			),
 			ReadKey::Atom(graph, atom) => self.graphs.get(graph).map_or_else(
-				|| self.graph_catalog_versions.get(graph).copied().unwrap_or(0),
+				|| self.schema.graph_versions.get(graph).copied().unwrap_or(0),
 				|stored| stored.atom_versions.get(*atom),
 			),
-			ReadKey::Table(table) => self.table_versions.get(table).copied().unwrap_or(0),
+			ReadKey::Table(table) => self.schema.table_versions.get(table).copied().unwrap_or(0),
+			ReadKey::Parameter(parameter) => {
+				self.schema.parameter_versions.get(parameter).copied().unwrap_or(0)
+			}
 		}
 	}
 }

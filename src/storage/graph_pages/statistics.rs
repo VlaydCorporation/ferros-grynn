@@ -16,7 +16,7 @@ pub(in crate::storage) struct GraphStatistics {
 pub(in crate::storage) fn encode_graph_statistics(
 	statistics: GraphStatistics,
 	page_lsn: PageLsn,
-) -> FerrosGrynnResult<AlignedPage> {
+) -> FerrosGrynnResult<Box<AlignedPage>> {
 	if !statistics.average_out_degree.is_finite()
 		|| !statistics.average_in_degree.is_finite()
 		|| statistics.average_out_degree < 0.0
@@ -24,8 +24,12 @@ pub(in crate::storage) fn encode_graph_statistics(
 	{
 		return Err(invalid_page(0, "graph degree averages must be finite and non-negative"));
 	}
-	let mut page =
-		AlignedPage::new(PageType::StatisticsRoot, PageFlags::empty(), page_lsn, PageNo::new(0));
+	let mut page = Box::new(AlignedPage::new(
+		PageType::StatisticsRoot,
+		PageFlags::empty(),
+		page_lsn,
+		PageNo::new(0),
+	));
 	let bytes = page.as_bytes_mut();
 	write_u64(bytes, STATS_NODE_COUNT_OFFSET, statistics.node_count);
 	write_u64(bytes, STATS_EDGE_COUNT_OFFSET, statistics.edge_count);

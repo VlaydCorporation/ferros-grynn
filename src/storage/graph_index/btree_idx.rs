@@ -84,12 +84,13 @@ pub(super) fn partition_standard_leaf_entries(
 }
 
 pub(super) fn encode_standard_leaf(
+	page: &mut AlignedPage,
 	page_no: PageNo,
 	page_lsn: PageLsn,
 	next: Option<PageNo>,
 	entries: &[ScalarIndexEntry],
 	posting_roots: &BTreeMap<&[u8], PageNo>,
-) -> FerrosGrynnResult<AlignedPage> {
+) -> FerrosGrynnResult<()> {
 	let count = u16::try_from(entries.len())
 		.map_err(|_error| invalid_index("scalar leaf entry count exceeds u16"))?;
 	let area_start = LEAF_OFFSETS_OFFSET + entries.len() * size_of::<u16>();
@@ -105,8 +106,7 @@ pub(super) fn encode_standard_leaf(
 		.checked_sub(data_bytes)
 		.filter(|start| *start >= area_start)
 		.ok_or_else(|| invalid_index("scalar leaf data overlaps its directory"))?;
-	let mut page =
-		AlignedPage::new(PageType::IndexNonUniqueBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
+	page.reset(PageType::IndexNonUniqueBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
 	write_u64(page.as_bytes_mut(), LEAF_NEXT_OFFSET, next.unwrap_or(PageNo::NULL).get());
 	write_u16(page.as_bytes_mut(), LEAF_COUNT_OFFSET, count);
 	let mut area_offset = 0_usize;
@@ -150,21 +150,20 @@ pub(super) fn encode_standard_leaf(
 		);
 		area_offset = offset + STANDARD_ENTRY_TRAILER_BYTES - data_start;
 	}
-	page.seal()?;
-	Ok(page)
+	page.seal()
 }
 
 pub(super) fn encode_posting_page(
+	page: &mut AlignedPage,
 	page_no: PageNo,
 	page_lsn: PageLsn,
 	next: Option<PageNo>,
 	atoms: &[DiskAtomRef],
-) -> FerrosGrynnResult<AlignedPage> {
+) -> FerrosGrynnResult<()> {
 	if atoms.is_empty() || atoms.len() > POSTING_ATOMS_PER_PAGE {
 		return Err(invalid_index("scalar posting page has an invalid atom count"));
 	}
-	let mut page =
-		AlignedPage::new(PageType::IndexPostingBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
+	page.reset(PageType::IndexPostingBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
 	write_u64(page.as_bytes_mut(), POSTING_NEXT_OFFSET, next.unwrap_or(PageNo::NULL).get());
 	write_u32(
 		page.as_bytes_mut(),
@@ -178,8 +177,7 @@ pub(super) fn encode_posting_page(
 			atom.raw(),
 		);
 	}
-	page.seal()?;
-	Ok(page)
+	page.seal()
 }
 
 pub(super) fn descend_to_leaf(
@@ -422,11 +420,12 @@ pub(super) fn partition_leaf_entries(
 }
 
 pub(super) fn encode_unique_leaf(
+	page: &mut AlignedPage,
 	page_no: PageNo,
 	page_lsn: PageLsn,
 	next: Option<PageNo>,
 	entries: &[PrimaryIndexEntry],
-) -> FerrosGrynnResult<AlignedPage> {
+) -> FerrosGrynnResult<()> {
 	let count = u16::try_from(entries.len())
 		.map_err(|_error| invalid_index("primary leaf entry count exceeds u16"))?;
 	let area_start = LEAF_OFFSETS_OFFSET + entries.len() * size_of::<u16>();
@@ -439,8 +438,7 @@ pub(super) fn encode_unique_leaf(
 		.checked_sub(data_bytes)
 		.filter(|start| *start >= area_start)
 		.ok_or_else(|| invalid_index("primary leaf data overlaps its directory"))?;
-	let mut page =
-		AlignedPage::new(PageType::IndexUniqueBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
+	page.reset(PageType::IndexUniqueBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
 	write_u64(page.as_bytes_mut(), LEAF_NEXT_OFFSET, next.unwrap_or(PageNo::NULL).get());
 	write_u16(page.as_bytes_mut(), LEAF_COUNT_OFFSET, count);
 	let mut area_offset = 0_usize;
@@ -457,8 +455,7 @@ pub(super) fn encode_unique_leaf(
 		write_u64(page.as_bytes_mut(), start + entry.key.len(), entry.atom.raw());
 		area_offset += entry.key.len() + DISK_ATOM_REF_BYTES;
 	}
-	page.seal()?;
-	Ok(page)
+	page.seal()
 }
 
 pub(super) fn partition_internal_children(
@@ -492,10 +489,11 @@ pub(super) fn partition_internal_children(
 }
 
 pub(super) fn encode_internal_page(
+	page: &mut AlignedPage,
 	page_no: PageNo,
 	page_lsn: PageLsn,
 	children: &[ChildPage],
-) -> FerrosGrynnResult<AlignedPage> {
+) -> FerrosGrynnResult<()> {
 	if children.len() < 2 {
 		return Err(invalid_index("internal page requires at least two children"));
 	}
@@ -510,8 +508,7 @@ pub(super) fn encode_internal_page(
 	if key_area + key_bytes > child_area {
 		return Err(invalid_index("internal page key and child areas overlap"));
 	}
-	let mut page =
-		AlignedPage::new(PageType::IndexBtreeInternal, PageFlags::empty(), page_lsn, page_no);
+	page.reset(PageType::IndexBtreeInternal, PageFlags::empty(), page_lsn, page_no);
 	write_u16(
 		page.as_bytes_mut(),
 		INTERNAL_COUNT_OFFSET,
@@ -539,8 +536,7 @@ pub(super) fn encode_internal_page(
 	for (index, child) in children.iter().enumerate() {
 		write_u64(page.as_bytes_mut(), child_area + index * size_of::<u64>(), child.page_no.get());
 	}
-	page.seal()?;
-	Ok(page)
+	page.seal()
 }
 
 pub(super) fn lookup_leaf(

@@ -28,7 +28,9 @@ pub(in crate::storage) fn build_primary_index(
 			u64::try_from(index).map_err(|_error| invalid_index("leaf page index exceeds u64"))?,
 		);
 		let next = (index + 1 < leaf_groups.len()).then(|| PageNo::new(page_no.get() + 1));
-		pages.push(encode_unique_leaf(page_no, page_lsn, next, group)?);
+		let page_index = pages.len();
+		pages.push(AlignedPage::zeroed());
+		encode_unique_leaf(&mut pages[page_index], page_no, page_lsn, next, group)?;
 		level.push(ChildPage {
 			page_no,
 			min_key: group.first().map_or_else(Vec::new, |entry| entry.key.clone()),
@@ -49,7 +51,9 @@ pub(in crate::storage) fn build_primary_index(
 				u64::try_from(pages.len())
 					.map_err(|_error| invalid_index("B+tree page index exceeds u64"))?,
 			);
-			pages.push(encode_internal_page(page_no, page_lsn, group)?);
+			let page_index = pages.len();
+			pages.push(AlignedPage::zeroed());
+			encode_internal_page(&mut pages[page_index], page_no, page_lsn, group)?;
 			next_level.push(ChildPage {
 				page_no,
 				min_key: group[0].min_key.clone(),

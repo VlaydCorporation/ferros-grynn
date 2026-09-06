@@ -33,6 +33,8 @@ use super::{
 		FileCatalog,
 		FileCatalogEntry,
 		GraphCatalogEntry,
+		ParameterCatalogEntry,
+		SystemIndexCatalogEntry,
 		TableCatalogEntry,
 		TableFieldCatalogEntry,
 		TableIndexCatalogEntry,
@@ -184,14 +186,43 @@ pub struct LocalCommitGraph {
 	pub record_id: RecordId,
 	/// Case-sensitive user-visible graph name.
 	pub name: String,
+	/// Versioned schema metadata for this named root graph.
+	pub schema: LocalCommitGraphSchema,
 	/// Physical change being published.
 	pub change: LocalCommitGraphChange,
+}
+
+/// Versioned schema metadata attached to one named root graph.
+#[derive(Clone, Copy)]
+pub struct LocalCommitGraphSchema {
+	/// Stable graph-definition identity.
+	pub id: u32,
+	/// Semantic graph-definition version.
+	pub version: u32,
+	/// Engine-owned label-index definition.
+	pub label_index: LocalCommitSystemIndex,
+	/// Engine-owned adjacency-index definition.
+	pub adjacency_index: LocalCommitSystemIndex,
+}
+
+/// Versioned identity of one engine-owned system index.
+#[derive(Clone, Copy)]
+pub struct LocalCommitSystemIndex {
+	/// Stable schema-catalog identity.
+	pub id: u32,
+	/// Semantic definition version.
+	pub version: u32,
 }
 
 /// Graph payload accepted by one local durable commit.
 pub enum LocalCommitGraphChange {
 	/// Complete immutable graph image used by the compatibility path.
-	Materialized(Arc<MaterializedGraph>),
+	Materialized {
+		/// Complete graph value.
+		graph: Arc<MaterializedGraph>,
+		/// Complete explicit table membership for live root atoms.
+		memberships: Vec<LocalCommitTableMembership>,
+	},
 	/// Append-only node delta applied without materializing the existing graph.
 	AppendNodes {
 		/// Exact durable graph version on which the delta is based.
@@ -218,6 +249,8 @@ pub struct LocalCommitNode {
 	pub label: Option<Text>,
 	/// Owned property payload.
 	pub properties: PropertyMap,
+	/// Explicit table schema identity; absent for an unassigned atom.
+	pub table_id: Option<u32>,
 }
 
 /// Final transaction-owned atom states supplied to the local page encoder.
@@ -234,6 +267,17 @@ pub struct LocalCommitAtomDelta {
 	pub edges: Vec<LocalCommitEdgeChange>,
 	/// Final adjacency for every node affected by an edge mutation.
 	pub adjacency: Vec<LocalCommitNodeAdjacency>,
+	/// Explicit membership changes applied after atom values.
+	pub memberships: Vec<LocalCommitTableMembership>,
+}
+
+/// One generation-aware table-membership update.
+#[derive(Clone, Copy)]
+pub struct LocalCommitTableMembership {
+	/// Stable atom identity in the root graph.
+	pub id: AtomId,
+	/// Target table schema identity, or `None` to clear membership.
+	pub table_id: Option<u32>,
 }
 
 /// Final role-separated adjacency for one live local node.
@@ -323,6 +367,7 @@ pub struct LocalGraph {
 
 #[derive(Clone)]
 struct LocalScalarIndex {
+	table_id: u32,
 	name: String,
 	kind: TableIndexKind,
 	fields: Vec<(PropertyKeyId, Type)>,
@@ -427,6 +472,10 @@ pub struct LocalSnapshotGraph {
 	pub record_id: RecordId,
 	/// Case-sensitive name recovered from the existing catalog field.
 	pub name: String,
+	/// Recovered versioned schema metadata.
+	pub schema: LocalCommitGraphSchema,
+	/// Complete explicit membership recovered from live hot slots.
+	pub memberships: Vec<LocalCommitTableMembership>,
 	pub graph: Arc<LocalGraph>,
 }
 
@@ -467,11 +516,16 @@ pub struct LocalQueryAtom {
 	pub atom_id: AtomId,
 	pub record_id: RecordId,
 	pub properties: PropertyMap,
+	pub table_id: Option<u32>,
 }
 
 /// One durable table field supplied by the MVCC layer.
 #[derive(Clone)]
 pub struct LocalCommitTableField {
+	/// Stable field-definition identity.
+	pub id: u32,
+	/// Semantic field-definition version.
+	pub version: u32,
 	/// Schema-visible field name.
 	pub name: String,
 	/// Runtime type persisted by the catalog codec.
@@ -483,6 +537,10 @@ pub struct LocalCommitTableField {
 /// One scalar index supplied by the MVCC schema catalog.
 #[derive(Clone)]
 pub struct LocalCommitTableIndex {
+	/// Stable index-definition identity.
+	pub id: u32,
+	/// Semantic index-definition version.
+	pub version: u32,
 	/// Table-local index name.
 	pub name: String,
 	/// Standard or unique key contract.
@@ -494,6 +552,10 @@ pub struct LocalCommitTableIndex {
 /// One durable table supplied by the MVCC layer.
 #[derive(Clone)]
 pub struct LocalCommitTable {
+	/// Stable table-definition identity.
+	pub id: u32,
+	/// Semantic table-definition version.
+	pub version: u32,
 	/// Unique table name.
 	pub name: String,
 	/// Named graph containing the table atoms.
@@ -504,18 +566,37 @@ pub struct LocalCommitTable {
 	pub fields: Vec<LocalCommitTableField>,
 	/// Scalar indexes in definition order.
 	pub indexes: Vec<LocalCommitTableIndex>,
+	/// Engine-owned primary-index definition.
+	pub primary_index: LocalCommitSystemIndex,
+}
+
+/// One durable global database parameter supplied by the MVCC layer.
+#[derive(Clone)]
+pub struct LocalCommitParameter {
+	/// Stable parameter-definition identity.
+	pub id: u32,
+	/// Semantic parameter-definition version.
+	pub version: u32,
+	/// Parameter name without the query-language `$` prefix.
+	pub name: String,
+	/// Owned runtime value encoded canonically by the storage layer.
+	pub value: Value,
 }
 
 /// Recovered local state used to seed the existing MVCC root.
 pub struct LocalDatabaseSnapshot {
 	/// Highest recovered durable logical commit.
 	pub commit_ts: u64,
+	/// First schema identity not allocated before this snapshot.
+	pub next_schema_id: u64,
 	/// Recovered append-only property dictionary.
 	pub property_dictionary: Arc<PropertyDictionary>,
 	/// Recovered named graphs.
 	pub graphs: Vec<LocalSnapshotGraph>,
 	/// Recovered table schemas.
 	pub tables: Vec<LocalCommitTable>,
+	/// Recovered global database parameters.
+	pub parameters: Vec<LocalCommitParameter>,
 }
 
 /// Durable commit clocks and any property names discovered inside nested
@@ -691,7 +772,7 @@ impl LocalStore {
 				&view.transaction,
 				graph,
 				kind,
-				|slot, generation, tombstone| {
+				|slot, generation, tombstone, _table_id| {
 					if tombstone {
 						materialized.restore_free_slot(kind, slot, generation)?;
 					}
@@ -716,17 +797,21 @@ impl LocalStore {
 		&self,
 		transaction: &LocalReadTransaction,
 		graph: &Arc<LocalGraph>,
-		table: &str,
+		table_id: u32,
 		kind: TableKind,
 		mut visit: impl FnMut(LocalQueryAtom) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<()> {
 		let context = graph.base_context()?;
 		visit_local_primary(self, transaction, graph, |key, disk| {
 			let record_id = decode_record_key(key, &context)?;
-			if record_id.table() != table || !table_kind_accepts(kind, disk.kind()) {
+			if !table_kind_accepts(kind, disk.kind()) {
 				return Ok(());
 			}
-			visit(local_query_atom(self, transaction, graph, record_id, disk)?)
+			let atom = local_query_atom(self, transaction, graph, record_id, disk)?;
+			if atom.table_id == Some(table_id) {
+				visit(atom)?;
+			}
+			Ok(())
 		})
 	}
 
@@ -736,6 +821,7 @@ impl LocalStore {
 		&self,
 		transaction: &LocalReadTransaction,
 		graph: &Arc<LocalGraph>,
+		table_id: u32,
 		table: &str,
 		kind: TableKind,
 		equalities: &[(PropertyKeyId, &Value)],
@@ -745,7 +831,8 @@ impl LocalStore {
 			indexes
 				.iter()
 				.filter(|index| {
-					index.fields.len() > 1
+					index.table_id == table_id
+						&& index.fields.len() > 1
 						&& index.fields.iter().all(|(field, _value_type)| {
 							equalities.iter().any(|(key, _)| key == field)
 						})
@@ -786,7 +873,16 @@ impl LocalStore {
 			mode,
 			&key,
 		)?;
-		self.visit_scalar_index_atoms(transaction, graph, table, kind, &index.name, atoms, visit)?;
+		self.visit_scalar_index_atoms(
+			transaction,
+			graph,
+			table_id,
+			table,
+			kind,
+			&index.name,
+			atoms,
+			visit,
+		)?;
 		Ok(true)
 	}
 
@@ -796,6 +892,7 @@ impl LocalStore {
 		&self,
 		transaction: &LocalReadTransaction,
 		graph: &Arc<LocalGraph>,
+		table_id: u32,
 		table: &str,
 		kind: TableKind,
 		property_key: PropertyKeyId,
@@ -804,9 +901,11 @@ impl LocalStore {
 		visit: impl FnMut(LocalQueryAtom) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<bool> {
 		let Some(index) = graph.scalar_indexes.get(table).and_then(|indexes| {
-			indexes
-				.iter()
-				.find(|index| index.fields.len() == 1 && index.fields[0].0 == property_key)
+			indexes.iter().find(|index| {
+				index.table_id == table_id
+					&& index.fields.len() == 1
+					&& index.fields[0].0 == property_key
+			})
 		}) else {
 			return Ok(false);
 		};
@@ -854,7 +953,16 @@ impl LocalStore {
 			)?,
 		};
 
-		self.visit_scalar_index_atoms(transaction, graph, table, kind, &index.name, atoms, visit)?;
+		self.visit_scalar_index_atoms(
+			transaction,
+			graph,
+			table_id,
+			table,
+			kind,
+			&index.name,
+			atoms,
+			visit,
+		)?;
 		Ok(true)
 	}
 
@@ -862,6 +970,7 @@ impl LocalStore {
 		&self,
 		transaction: &LocalReadTransaction,
 		graph: &Arc<LocalGraph>,
+		table_id: u32,
 		table: &str,
 		kind: TableKind,
 		index_name: &str,
@@ -883,13 +992,20 @@ impl LocalStore {
 				))
 			})?;
 			let record = reference.id();
-			if record.table() != table || !table_kind_accepts(kind, atom.kind()) {
+			if !table_kind_accepts(kind, atom.kind()) {
 				return Err(FerrosGrynnError::invalid_storage_file(format!(
 					"scalar index '{}.{}' references an atom outside its table",
 					table, index_name
 				)));
 			}
-			visit(local_query_atom(self, transaction, graph, record.clone(), atom)?)?;
+			let atom = local_query_atom(self, transaction, graph, record.clone(), atom)?;
+			if atom.table_id != Some(table_id) {
+				return Err(FerrosGrynnError::invalid_storage_file(format!(
+					"scalar index '{}.{}' references an atom outside its table",
+					table, index_name
+				)));
+			}
+			visit(atom)?;
 		}
 		Ok(())
 	}
@@ -900,6 +1016,7 @@ impl LocalStore {
 		transaction: &LocalReadTransaction,
 		graph: &Arc<LocalGraph>,
 		record_id: &RecordId,
+		table_id: u32,
 		kind: TableKind,
 	) -> FerrosGrynnResult<Option<LocalQueryAtom>> {
 		let mut context = graph.base_context()?;
@@ -914,7 +1031,8 @@ impl LocalStore {
 		let Some(disk) = disk.filter(|disk| table_kind_accepts(kind, disk.kind())) else {
 			return Ok(None);
 		};
-		local_query_atom(self, transaction, graph, record_id.clone(), disk).map(Some)
+		let atom = local_query_atom(self, transaction, graph, record_id.clone(), disk)?;
+		Ok((atom.table_id == Some(table_id)).then_some(atom))
 	}
 
 	/// Publishes one MVCC root by switching only the two fixed catalog heads in
@@ -922,9 +1040,11 @@ impl LocalStore {
 	pub fn commit(
 		&self,
 		expected_commit_ts: u64,
+		next_schema_id: u64,
 		property_dictionary: &PropertyDictionary,
 		graphs: &[LocalCommitGraph],
 		tables: &[LocalCommitTable],
+		parameters: &[LocalCommitParameter],
 		changed_graphs: &[RecordId],
 	) -> FerrosGrynnResult<LocalCommitResult> {
 		self.checkpoint_if_due()?;
@@ -936,6 +1056,7 @@ impl LocalStore {
 		}
 		let previous_database = catalogs.database.clone();
 		let mut database = previous_database.clone();
+		database.next_schema_id = next_schema_id;
 		let mut files = catalogs.files.clone();
 		let mut dictionary = database_property_dictionary(&database)?;
 		for (expected_id, name) in property_dictionary.iter() {
@@ -970,7 +1091,7 @@ impl LocalStore {
 				}
 				continue;
 			};
-			if !matches!(commit_graph.change, LocalCommitGraphChange::Materialized(_)) {
+			if !matches!(commit_graph.change, LocalCommitGraphChange::Materialized { .. }) {
 				let index = existing.ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
 						"atom delta targets a graph absent from the durable catalog",
@@ -1004,7 +1125,9 @@ impl LocalStore {
 						delta,
 						&mut dictionary,
 					)?,
-					LocalCommitGraphChange::Materialized(_) => unreachable!(),
+					LocalCommitGraphChange::Materialized {
+						..
+					} => unreachable!(),
 				};
 				let removed_subgraph_slots = delta.removed_subgraph_slots.clone();
 				let mut next_file_instance_id = files.next_file_instance_id;
@@ -1064,7 +1187,11 @@ impl LocalStore {
 				database.graphs[root_index] = generation.catalog_entry;
 				continue;
 			}
-			let LocalCommitGraphChange::Materialized(graph) = &commit_graph.change else {
+			let LocalCommitGraphChange::Materialized {
+				graph,
+				memberships,
+			} = &commit_graph.change
+			else {
 				return Err(FerrosGrynnError::invalid_storage_file(
 					"unsupported local graph commit change",
 				));
@@ -1073,9 +1200,15 @@ impl LocalStore {
 				Some(index) => database.graphs[index].graph_id,
 				None => allocate_graph_id(&mut database)?,
 			};
-			let plan =
-				plan_graph_tree(&mut database, graph_id, record_id, &commit_graph.name, graph)?;
-			let mut images = build_graph_images(&plan, &mut dictionary, tables)?;
+			let plan = plan_graph_tree(
+				&mut database,
+				graph_id,
+				record_id,
+				&commit_graph.name,
+				graph,
+				commit_graph.schema,
+			)?;
+			let mut images = build_graph_images(&plan, &mut dictionary, tables, memberships)?;
 			let in_place = if images.len() == 1
 				&& let Some(index) = existing
 			{
@@ -1125,9 +1258,10 @@ impl LocalStore {
 		}
 		database.graphs.sort_unstable_by_key(|entry| entry.graph_id);
 		files.files.sort_unstable_by_key(|entry| (entry.graph_id, entry.file_id));
+		database.tables = encode_tables(tables, &database, &previous_database, &new_indexes)?;
+		database.parameters = encode_parameters(parameters, &mut dictionary)?;
 		database.property_keys =
 			dictionary.iter().map(|(_id, name)| name.as_str().to_owned()).collect();
-		database.tables = encode_tables(tables, &database, &previous_database, &new_indexes)?;
 
 		let graph_count = u32::try_from(database.graphs.len()).map_err(|_error| {
 			FerrosGrynnError::invalid_storage_file("durable graph count exceeds u32")

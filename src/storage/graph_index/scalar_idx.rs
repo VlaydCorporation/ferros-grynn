@@ -65,7 +65,9 @@ pub(in crate::storage) fn build_scalar_index(
 				.checked_add(1)
 				.ok_or_else(|| invalid_index("scalar posting page number overflows u64"))?;
 			let next = (index + 1 < chunks.len()).then(|| PageNo::new(next_page));
-			posting_pages.push(encode_posting_page(page_no, page_lsn, next, chunk)?);
+			let page_index = posting_pages.len();
+			posting_pages.push(AlignedPage::zeroed());
+			encode_posting_page(&mut posting_pages[page_index], page_no, page_lsn, next, chunk)?;
 		}
 	}
 
@@ -77,7 +79,16 @@ pub(in crate::storage) fn build_scalar_index(
 				.map_err(|_error| invalid_index("scalar leaf index exceeds u64"))?,
 		);
 		let next = (index + 1 < leaf_count).then(|| PageNo::new(page_no.get() + 1));
-		pages.push(encode_standard_leaf(page_no, page_lsn, next, group, &posting_roots)?);
+		let page_index = pages.len();
+		pages.push(AlignedPage::zeroed());
+		encode_standard_leaf(
+			&mut pages[page_index],
+			page_no,
+			page_lsn,
+			next,
+			group,
+			&posting_roots,
+		)?;
 		level.push(ChildPage {
 			page_no,
 			min_key: group.first().map_or_else(Vec::new, |entry| entry.key.clone()),
@@ -99,7 +110,9 @@ pub(in crate::storage) fn build_scalar_index(
 				u64::try_from(pages.len())
 					.map_err(|_error| invalid_index("scalar B+tree page index exceeds u64"))?,
 			);
-			pages.push(encode_internal_page(page_no, page_lsn, group)?);
+			let page_index = pages.len();
+			pages.push(AlignedPage::zeroed());
+			encode_internal_page(&mut pages[page_index], page_no, page_lsn, group)?;
 			next_level.push(ChildPage {
 				page_no,
 				min_key: group[0].min_key.clone(),

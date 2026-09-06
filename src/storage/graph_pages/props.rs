@@ -4,7 +4,7 @@ use super::*;
 /// Mutable builder for one canonical property slotted page.
 pub(in crate::storage) struct PropertyPageBuilder {
 	/// Complete aligned page being filled.
-	page: AlignedPage,
+	page: Box<AlignedPage>,
 	/// Next slot-directory entry.
 	slot_count: u16,
 	/// First unused byte after the slot directory.
@@ -17,7 +17,12 @@ impl PropertyPageBuilder {
 	/// Creates one empty property page.
 	pub(in crate::storage) fn new(page_no: PageNo, page_lsn: PageLsn) -> Self {
 		Self {
-			page: AlignedPage::new(PageType::PropHeap, PageFlags::empty(), page_lsn, page_no),
+			page: Box::new(AlignedPage::new(
+				PageType::PropHeap,
+				PageFlags::empty(),
+				page_lsn,
+				page_no,
+			)),
 			slot_count: 0,
 			free_start: PROPERTY_SLOT_DIRECTORY_OFFSET as u16,
 			free_end: PAGE_SIZE as u16,
@@ -67,7 +72,7 @@ impl PropertyPageBuilder {
 	}
 
 	/// Seals metadata and returns the complete page.
-	pub(in crate::storage) fn finish(mut self) -> FerrosGrynnResult<AlignedPage> {
+	pub(in crate::storage) fn finish(mut self) -> FerrosGrynnResult<Box<AlignedPage>> {
 		let bytes = self.page.as_bytes_mut();
 		write_u16(bytes, PROPERTY_SLOT_COUNT_OFFSET, self.slot_count);
 		write_u16(bytes, PROPERTY_FREE_START_OFFSET, self.free_start);

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use super::{SchemaId, SchemaVersion};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::Text,
@@ -18,6 +19,10 @@ pub enum TableIndexKind {
 /// Declarative scalar B+tree attached to one table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableIndex {
+	/// Stable identity assigned when the containing table is published.
+	pub(crate) id: Option<SchemaId>,
+	/// Semantic definition version.
+	pub(crate) version: SchemaVersion,
 	/// Table-local index name.
 	pub(crate) name: Text,
 	/// Whether duplicate keys are permitted.
@@ -48,19 +53,35 @@ impl TableIndex {
 		let fields = fields.into_iter().map(Into::into).collect::<Vec<_>>();
 		let mut unique = BTreeSet::new();
 		if name.is_empty()
+			|| name.as_str().contains('\0')
 			|| fields.is_empty()
 			|| fields.iter().any(|field| {
-				field.is_empty() || field.as_str() == "id" || !unique.insert(field.clone())
+				field.is_empty()
+					|| field.as_str().contains('\0')
+					|| field.as_str() == "id"
+					|| !unique.insert(field.clone())
 			}) {
 			return Err(FerrosGrynnError::invalid_argument(
 				"an index requires a non-empty name and unique explicit table fields",
 			));
 		}
 		Ok(Self {
+			id: None,
+			version: SchemaVersion::INITIAL,
 			name,
 			kind,
 			fields,
 		})
+	}
+
+	/// Returns the stable identity after the containing table is published.
+	pub const fn id(&self) -> Option<SchemaId> {
+		self.id
+	}
+
+	/// Returns the semantic definition version.
+	pub const fn version(&self) -> SchemaVersion {
+		self.version
 	}
 
 	/// Returns the table-local index name.

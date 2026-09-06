@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::{TableField, TableIndex};
+use super::{SchemaId, SchemaVersion, SystemIndex, TableField, TableIndex};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::{
@@ -19,12 +19,16 @@ pub enum TableKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
+	pub(crate) id: Option<SchemaId>,
+	pub(crate) version: SchemaVersion,
 	pub(crate) name: Text,
 	pub(crate) graph: GraphRef,
 	pub(crate) kind: TableKind,
 	pub(crate) fields: Vec<TableField>,
 	/// Scalar indexes in declaration order.
 	pub(crate) indexes: Vec<TableIndex>,
+	pub(crate) primary_index: Option<SystemIndex>,
+	pub(crate) published_at: u64,
 }
 
 impl TableSchema {
@@ -39,13 +43,16 @@ impl TableSchema {
 		Fields: IntoIterator<Item = TableField>,
 	{
 		let name = name.into();
-		if name.as_str().is_empty() {
-			return Err(FerrosGrynnError::invalid_argument("table name must not be empty"));
+		if name.as_str().is_empty() || name.as_str().contains('\0') {
+			return Err(FerrosGrynnError::invalid_argument(
+				"table name must be non-empty and must not contain NUL",
+			));
 		}
 		let fields = fields.into_iter().collect::<Vec<_>>();
 		let mut names = BTreeSet::new();
 		if fields.iter().any(|field| {
 			field.name.as_str().is_empty()
+				|| field.name.as_str().contains('\0')
 				|| field.name.as_str() == "id"
 				|| !names.insert(field.name.as_str().to_owned())
 		}) {
@@ -54,12 +61,26 @@ impl TableSchema {
 			));
 		}
 		Ok(Self {
+			id: None,
+			version: SchemaVersion::INITIAL,
 			name,
 			graph,
 			kind,
 			fields,
 			indexes: Vec::new(),
+			primary_index: None,
+			published_at: 0,
 		})
+	}
+
+	/// Returns the stable identity after this definition is published.
+	pub const fn id(&self) -> Option<SchemaId> {
+		self.id
+	}
+
+	/// Returns the semantic definition version.
+	pub const fn version(&self) -> SchemaVersion {
+		self.version
 	}
 
 	/// Adds one validated scalar B+tree definition.
@@ -107,5 +128,10 @@ impl TableSchema {
 	/// Returns scalar indexes in definition order.
 	pub fn indexes(&self) -> impl ExactSizeIterator<Item = &TableIndex> {
 		self.indexes.iter()
+	}
+
+	/// Returns the engine-owned primary-index definition after publication.
+	pub const fn primary_index(&self) -> Option<&SystemIndex> {
+		self.primary_index.as_ref()
 	}
 }

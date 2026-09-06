@@ -152,6 +152,12 @@ impl NodeRead for LocalNodeRead<'_> {
 	}
 }
 
+impl LocalNodeRead<'_> {
+	pub(crate) const fn table_id(&self) -> Option<u32> {
+		self.slot.table_id
+	}
+}
+
 /// Edge projection retaining the hot page pin and resolving topology lazily.
 pub struct LocalEdgeRead<'tx> {
 	store: &'tx LocalStore,
@@ -227,6 +233,12 @@ impl EdgeRead for LocalEdgeRead<'_> {
 		})?;
 		let graph = self.store.materialize_graph(transaction, child)?.into_general()?;
 		Ok(Some(Cow::Owned(graph)))
+	}
+}
+
+impl LocalEdgeRead<'_> {
+	pub(crate) const fn table_id(&self) -> Option<u32> {
+		self.slot.table_id
 	}
 }
 
@@ -446,7 +458,7 @@ pub(crate) struct LocalTableCursor<'store> {
 	store: &'store LocalStore,
 	transaction: Arc<LocalReadTransaction>,
 	graph: Arc<LocalGraph>,
-	table: String,
+	table_id: u32,
 	kind: TableKind,
 	context: EncodeContext,
 	next_leaf: PageNo,
@@ -463,7 +475,7 @@ impl<'store> LocalTableCursor<'store> {
 		store: &'store LocalStore,
 		transaction: Arc<LocalReadTransaction>,
 		graph: Arc<LocalGraph>,
-		table: String,
+		table_id: u32,
 		kind: TableKind,
 	) -> FerrosGrynnResult<Self> {
 		transaction.ensure_live()?;
@@ -489,7 +501,7 @@ impl<'store> LocalTableCursor<'store> {
 			store,
 			transaction,
 			graph,
-			table,
+			table_id,
 			kind,
 			context,
 			next_leaf: first_leaf,
@@ -506,17 +518,17 @@ impl<'store> LocalTableCursor<'store> {
 		loop {
 			if let Some(entry) = self.pending.pop_front() {
 				let record_id = decode_record_key(&entry.key, &self.context)?;
-				if record_id.table() == self.table
-					&& table_kind_accepts(self.kind, entry.atom.kind())
-				{
-					return local_query_atom(
+				if table_kind_accepts(self.kind, entry.atom.kind()) {
+					let atom = local_query_atom(
 						self.store,
 						&self.transaction,
 						&self.graph,
 						record_id,
 						entry.atom,
-					)
-					.map(Some);
+					)?;
+					if atom.table_id == Some(self.table_id) {
+						return Ok(Some(atom));
+					}
 				}
 				continue;
 			}
@@ -627,32 +639,33 @@ pub(super) fn local_query_atom(
 	disk: DiskAtomRef,
 ) -> FerrosGrynnResult<LocalQueryAtom> {
 	let atom_id = local_atom_id(store, transaction, graph, disk)?;
-	let properties = match disk.kind() {
+	let (properties, table_id) = match disk.kind() {
 		AtomKind::Node => {
-			read_local_node(store, transaction, graph, atom_id, record_id.clone(), None)?
-				.ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"primary index references a missing node",
-					)
-				})?
-				.properties()?
-				.into_owned()
+			let node =
+				read_local_node(store, transaction, graph, atom_id, record_id.clone(), None)?
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"primary index references a missing node",
+						)
+					})?;
+			(node.properties()?.into_owned(), node.table_id())
 		}
 		AtomKind::Edge => {
-			read_local_edge(store, transaction, graph, atom_id, record_id.clone(), None)?
-				.ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"primary index references a missing edge",
-					)
-				})?
-				.properties()?
-				.into_owned()
+			let edge =
+				read_local_edge(store, transaction, graph, atom_id, record_id.clone(), None)?
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"primary index references a missing edge",
+						)
+					})?;
+			(edge.properties()?.into_owned(), edge.table_id())
 		}
 	};
 	Ok(LocalQueryAtom {
 		atom_id,
 		record_id,
 		properties,
+		table_id,
 	})
 }
 
@@ -750,7 +763,7 @@ pub(super) fn read_local_node<'tx>(
 	if slot.flags.contains(NodeSlotFlags::TOMBSTONE) || slot.generation != id.generation() {
 		return Ok(None);
 	}
-	validate_table_id(slot.table_id, &record_id, &graph.labels.table_names)?;
+	validate_table_id(slot.table_id)?;
 	let label = decode_label(slot.label_id, &graph.labels.node_labels)?;
 	Ok(Some(LocalNodeRead {
 		store,
@@ -779,7 +792,7 @@ pub(super) fn read_local_edge<'tx>(
 	if slot.flags.contains(EdgeSlotFlags::TOMBSTONE) || slot.generation != id.generation() {
 		return Ok(None);
 	}
-	validate_table_id(slot.table_id, &record_id, &graph.labels.table_names)?;
+	validate_table_id(slot.table_id)?;
 	let label = decode_label(slot.label_id, &graph.labels.edge_labels)?;
 	Ok(Some(LocalEdgeRead {
 		store,
@@ -801,12 +814,18 @@ pub(super) fn collect_local_ids(
 	kind: AtomKind,
 ) -> FerrosGrynnResult<Vec<AtomId>> {
 	let mut ids = Vec::new();
-	visit_local_slots(store, transaction, graph, kind, |slot, generation, tombstone| {
-		if !tombstone {
-			ids.push(AtomId::from_parts(kind, slot, generation)?);
-		}
-		Ok(())
-	})?;
+	visit_local_slots(
+		store,
+		transaction,
+		graph,
+		kind,
+		|slot, generation, tombstone, _table_id| {
+			if !tombstone {
+				ids.push(AtomId::from_parts(kind, slot, generation)?);
+			}
+			Ok(())
+		},
+	)?;
 	Ok(ids)
 }
 
@@ -815,7 +834,7 @@ pub(super) fn visit_local_slots(
 	transaction: &LocalReadTransaction,
 	graph: &LocalGraph,
 	kind: AtomKind,
-	mut visit: impl FnMut(u64, u32, bool) -> FerrosGrynnResult<()>,
+	mut visit: impl FnMut(u64, u32, bool, Option<u32>) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<()> {
 	transaction.ensure_live()?;
 	let (capacity, pages, file_kind) = match kind {
@@ -844,17 +863,25 @@ pub(super) fn visit_local_slots(
 			if slot >= capacity {
 				break;
 			}
-			let (generation, tombstone) = match kind {
+			let (generation, tombstone, table_id) = match kind {
 				AtomKind::Node => {
 					let value = read_node_hot_slot(page, page_no, within)?;
-					(value.generation, value.flags.contains(NodeSlotFlags::TOMBSTONE))
+					(
+						value.generation,
+						value.flags.contains(NodeSlotFlags::TOMBSTONE),
+						value.table_id,
+					)
 				}
 				AtomKind::Edge => {
 					let value = read_edge_hot_slot(page, page_no, within)?;
-					(value.generation, value.flags.contains(EdgeSlotFlags::TOMBSTONE))
+					(
+						value.generation,
+						value.flags.contains(EdgeSlotFlags::TOMBSTONE),
+						value.table_id,
+					)
 				}
 			};
-			visit(slot, generation, tombstone)?;
+			visit(slot, generation, tombstone, table_id)?;
 		}
 		Ok(())
 	};

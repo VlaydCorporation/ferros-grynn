@@ -1,7 +1,5 @@
 //! Lock-partitioned, fixed-arena resident-page prototype.
 
-#[cfg(debug_assertions)]
-use std::cell::Cell;
 use std::{
 	cell::UnsafeCell,
 	num::NonZeroUsize,
@@ -29,19 +27,6 @@ const DIRECTORY_SHARDS: usize = 64;
 const CLOCK_SCAN_PASSES: usize = 4;
 /// Unique identity source preventing resolved handles from crossing arenas.
 static NEXT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
-
-#[cfg(debug_assertions)]
-std::thread_local! {
-	/// Number of authoritative single-frame validations on the current test
-	/// thread. Release benchmark builds compile this diagnostic state out.
-	static PUBLICATION_VALIDATION_COUNT: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Returns the current debug thread's authoritative publication validations.
-#[cfg(debug_assertions)]
-pub(super) fn publication_validation_count() -> usize {
-	PUBLICATION_VALIDATION_COUNT.with(Cell::get)
-}
 
 /// Packed-state lifecycle field width.
 const LIFECYCLE_BITS: u32 = 2;
@@ -1560,8 +1545,6 @@ impl AtomicArenaBufferPool {
 		let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loader(page)));
 		let load_result = match loaded {
 			Ok(result) => result.and_then(|receipt| {
-				#[cfg(debug_assertions)]
-				PUBLICATION_VALIDATION_COUNT.with(|count| count.set(count.get() + 1));
 				let actual = page.validate(reservation.key.page_no())?;
 				validate_loaded_header(reservation.key, actual)?;
 				if matches!(receipt, LoadReceipt::Reported(reported) if actual != reported) {
@@ -1616,7 +1599,6 @@ impl AtomicArenaBufferPool {
 			self.abort_load(&reservation, error.clone());
 			return Err(error);
 		}
-
 		let shard = &self.directory[directory_shard(reservation.key)];
 		let mut entries = shard.entries.write();
 		let publishable = entries

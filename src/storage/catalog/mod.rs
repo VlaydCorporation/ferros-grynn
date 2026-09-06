@@ -42,6 +42,8 @@ pub(super) use definitions::{
 	FileCatalog,
 	FileCatalogEntry,
 	GraphCatalogEntry,
+	ParameterCatalogEntry,
+	SystemIndexCatalogEntry,
 	TableCatalogEntry,
 	TableFieldCatalogEntry,
 	TableIndexCatalogEntry,
@@ -85,14 +87,16 @@ const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const DATABASE_CATALOG_MAGIC: [u8; 4] = *b"FGDC";
 /// File-catalog payload marker.
 const FILE_CATALOG_MAGIC: [u8; 4] = *b"FGFC";
-/// Payload codec version shared by both catalog values.
-const CATALOG_PAYLOAD_VERSION: u16 = 3;
+/// Database-catalog payload codec version.
+const DATABASE_CATALOG_PAYLOAD_VERSION: u16 = 4;
+/// Physical-file catalog payload codec version.
+const FILE_CATALOG_PAYLOAD_VERSION: u16 = 3;
 /// Maximum persisted graph name in UTF-8 bytes.
 const MAX_GRAPH_NAME_BYTES: usize = 128;
 /// Maximum canonical `RecordId` text retained for a graph identity.
 const MAX_GRAPH_RECORD_ID_BYTES: usize = 4096;
 /// Bytes before the two variable UTF-8 fields in one graph entry.
-const GRAPH_CATALOG_FIXED_BYTES: usize = 112;
+const GRAPH_CATALOG_FIXED_BYTES: usize = 136;
 /// Maximum trusted relative file path in UTF-8 bytes.
 const MAX_CATALOG_PATH_BYTES: usize = 1024;
 /// Maximum one catalog-owned schema name in UTF-8 bytes.
@@ -156,8 +160,19 @@ mod tests {
 		let path = directory.path().join("catalog.fgb");
 		let database = DatabaseCatalog {
 			next_graph_id: 2,
+			next_schema_id: 8,
 			graphs: vec![GraphCatalogEntry {
 				graph_id: GraphId::new(1),
+				schema_id: 1,
+				schema_version: 1,
+				label_index: SystemIndexCatalogEntry {
+					schema_id: 2,
+					schema_version: 1,
+				},
+				adjacency_index: SystemIndexCatalogEntry {
+					schema_id: 3,
+					schema_version: 1,
+				},
 				parent_graph_id: None,
 				subgraph_slot: None,
 				parent_atom: None,
@@ -177,23 +192,34 @@ mod tests {
 			}],
 			property_keys: vec!["name".to_owned(), "tags".to_owned()],
 			tables: vec![TableCatalogEntry {
+				schema_id: 4,
+				schema_version: 1,
 				name: "person".to_owned(),
 				graph_id: GraphId::new(1),
 				kind: TableKind::Normal,
 				fields: vec![
 					TableFieldCatalogEntry {
+						schema_id: 6,
+						schema_version: 1,
 						name: "name".to_owned(),
 						value_type: Type::String,
 						property_key: 0,
 					},
 					TableFieldCatalogEntry {
+						schema_id: 7,
+						schema_version: 1,
 						name: "tags".to_owned(),
 						value_type: Type::Option(Box::new(Type::Array(Box::new(Type::String)))),
 						property_key: 1,
 					},
 				],
 				indexes: Vec::new(),
+				primary_index: SystemIndexCatalogEntry {
+					schema_id: 5,
+					schema_version: 1,
+				},
 			}],
+			parameters: Vec::new(),
 		};
 		let files = FileCatalog::bootstrap()?;
 		let encoded = encode_bootstrap_catalogs(&database, &files)?;
@@ -280,14 +306,17 @@ mod tests {
 		let root = nested_graph_entry(1, None, None)?;
 		let slot_zero = DatabaseCatalog {
 			next_graph_id: 3,
+			next_schema_id: 4,
 			graphs: vec![root.clone(), nested_graph_entry(2, Some(1), Some(0))?],
 			property_keys: Vec::new(),
 			tables: Vec::new(),
+			parameters: Vec::new(),
 		};
 		assert!(slot_zero.encode().is_err());
 
 		let duplicate = DatabaseCatalog {
 			next_graph_id: 4,
+			next_schema_id: 4,
 			graphs: vec![
 				root,
 				nested_graph_entry(2, Some(1), Some(1))?,
@@ -295,6 +324,7 @@ mod tests {
 			],
 			property_keys: Vec::new(),
 			tables: Vec::new(),
+			parameters: Vec::new(),
 		};
 		assert!(duplicate.encode().is_err());
 		Ok(())
@@ -307,6 +337,40 @@ mod tests {
 	) -> FerrosGrynnResult<GraphCatalogEntry> {
 		Ok(GraphCatalogEntry {
 			graph_id: GraphId::new(graph_id),
+			schema_id: if parent_graph_id.is_some() {
+				0
+			} else {
+				1
+			},
+			schema_version: if parent_graph_id.is_some() {
+				0
+			} else {
+				1
+			},
+			label_index: SystemIndexCatalogEntry {
+				schema_id: if parent_graph_id.is_some() {
+					0
+				} else {
+					2
+				},
+				schema_version: if parent_graph_id.is_some() {
+					0
+				} else {
+					1
+				},
+			},
+			adjacency_index: SystemIndexCatalogEntry {
+				schema_id: if parent_graph_id.is_some() {
+					0
+				} else {
+					3
+				},
+				schema_version: if parent_graph_id.is_some() {
+					0
+				} else {
+					1
+				},
+			},
 			parent_graph_id: parent_graph_id.map(GraphId::new),
 			subgraph_slot,
 			parent_atom: parent_graph_id

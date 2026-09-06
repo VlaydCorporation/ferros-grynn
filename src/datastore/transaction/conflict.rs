@@ -12,6 +12,7 @@ pub(crate) enum ReadKey {
 	EdgeSet(RecordId),
 	Atom(RecordId, AtomId),
 	Table(String),
+	Parameter(String),
 }
 
 pub(in crate::datastore) struct PredicateRead {
@@ -74,8 +75,8 @@ impl Transaction {
 			Some(Some(schema)) => schema.clone(),
 			Some(None) => return Ok(()),
 			None => current
-				.tables
-				.get(&predicate.table)
+				.schema
+				.table(&predicate.table)
 				.map(|schema| schema.as_ref().clone())
 				.ok_or_else(|| FerrosGrynnError::table_does_not_exist(&predicate.table))?,
 		};
@@ -118,6 +119,9 @@ impl Transaction {
 		schema: &TableSchema,
 		atom: AtomId,
 	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
+		let table_id = schema.id.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("published table has no schema identity")
+		})?;
 		if let Some(write) = self.graphs.get(schema.graph.id()) {
 			if let Some(local) = &write.local
 				&& let Some((record, properties, removed)) = local.delta.changed_atom(atom)
@@ -131,7 +135,12 @@ impl Transaction {
 					}
 					None => false,
 				};
-				return Ok((!removed && kind_matches && record.table() == schema.name.as_str())
+				let membership = write
+					.memberships
+					.get(&atom)
+					.copied()
+					.unwrap_or_else(|| root.schema.membership(schema.graph.id(), atom));
+				return Ok((!removed && kind_matches && membership == Some(table_id))
 					.then(|| row_from_properties(atom, record, properties, schema)));
 			}
 			let dirty = write
@@ -139,17 +148,22 @@ impl Transaction {
 				.as_ref()
 				.is_some_and(|value| value.dirty().contains(&DirtyTarget::Atom(atom)));
 			if dirty {
-				return Ok(write
-					.value
-					.as_ref()
-					.and_then(|value| materialize_atom(&value.snapshot(), schema, atom)));
+				let memberships = self.query_memberships(root, schema.graph.id())?;
+				return Ok(write.value.as_ref().and_then(|value| {
+					materialize_atom(&value.snapshot(), schema, &memberships, atom)
+				}));
 			}
 		}
 		let Some(stored) = root.graphs.get(schema.graph.id()) else {
 			return Ok(None);
 		};
 		match &stored.graph {
-			StoredGraphValue::Materialized(graph) => Ok(materialize_atom(graph, schema, atom)),
+			StoredGraphValue::Materialized(graph) => Ok(materialize_atom(
+				graph,
+				schema,
+				&root.schema.memberships(schema.graph.id()),
+				atom,
+			)),
 			StoredGraphValue::Local(graph) => {
 				let local = self.store.inner.backend.local().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
@@ -166,7 +180,7 @@ impl Transaction {
 							.map(|node| {
 								let record = node.record_id()?.into_owned();
 								let properties = node.properties()?.into_owned();
-								Ok::<_, FerrosGrynnError>((record, properties))
+								Ok::<_, FerrosGrynnError>((record, properties, node.table_id()))
 							})
 							.transpose()?
 					}
@@ -177,14 +191,14 @@ impl Transaction {
 							.map(|edge| {
 								let record = edge.record_id()?.into_owned();
 								let properties = edge.properties()?.into_owned();
-								Ok::<_, FerrosGrynnError>((record, properties))
+								Ok::<_, FerrosGrynnError>((record, properties, edge.table_id()))
 							})
 							.transpose()?
 					}
 					_ => None,
 				};
-				Ok(row.and_then(|(record, properties)| {
-					(record.table() == schema.name.as_str())
+				Ok(row.and_then(|(record, properties, membership)| {
+					(membership == Some(table_id.get()))
 						.then(|| row_from_properties(atom, &record, &properties, schema))
 				}))
 			}
@@ -219,6 +233,13 @@ impl Transaction {
 						);
 					}
 				}
+				for atom in write.memberships.keys() {
+					if stored.atom_versions.get(*atom) > write.base_ts {
+						return Err(
+							self.write_conflict("the same graph atom was concurrently changed")
+						);
+					}
+				}
 				if local.base.kind() != stored.graph.kind() {
 					return Err(self.write_conflict("the graph family was concurrently changed"));
 				}
@@ -227,12 +248,12 @@ impl Transaction {
 			match (&write.base, &write.value) {
 				(None, Some(_)) => {
 					if current.graphs.contains_key(id)
-						|| current.graph_catalog_versions.get(id).copied().unwrap_or(0)
+						|| current.schema.graph_versions.get(id).copied().unwrap_or(0)
 							> write.base_ts
 					{
 						return Err(self.write_conflict("a graph name was concurrently created"));
 					}
-					if current.graph_names.get(&write.name).is_some_and(|record_id| {
+					if current.schema.graph_names.get(&write.name).is_some_and(|record_id| {
 						record_id != id
 							&& !self.graphs.get(record_id).is_some_and(|pending| !pending.exists())
 					}) {
@@ -264,6 +285,13 @@ impl Transaction {
 							);
 						}
 					}
+					for atom in write.memberships.keys() {
+						if stored.atom_versions.get(*atom) > write.base_ts {
+							return Err(
+								self.write_conflict("the same graph atom was concurrently changed")
+							);
+						}
+					}
 					if base.kind() != stored.graph.kind() {
 						return Err(
 							self.write_conflict("the graph family was concurrently changed")
@@ -274,8 +302,15 @@ impl Transaction {
 			}
 		}
 		for name in self.tables.keys() {
-			if current.table_versions.get(name).copied().unwrap_or(0) > self.start_ts {
+			if current.schema.table_versions.get(name).copied().unwrap_or(0) > self.start_ts {
 				return Err(self.write_conflict("the same table schema was concurrently changed"));
+			}
+		}
+		for name in self.parameters.keys() {
+			if current.schema.parameter_versions.get(name).copied().unwrap_or(0) > self.start_ts {
+				return Err(
+					self.write_conflict("the same schema parameter was concurrently changed")
+				);
 			}
 		}
 		Ok(())
@@ -297,7 +332,7 @@ impl Transaction {
 		if !write.force_persist
 			&& let Some(local) = write.local.take()
 		{
-			if local.delta.is_empty() {
+			if local.delta.is_empty() && write.memberships.is_empty() {
 				return Ok(());
 			}
 			let latest = current
@@ -312,10 +347,21 @@ impl Transaction {
 					"bounded point mutation cannot maintain scalar indexes incrementally",
 				));
 			}
-			let dirty = local.delta.dirty().collect::<Vec<_>>();
+			let mut dirty = local.delta.dirty().collect::<BTreeSet<_>>();
+			dirty.extend(write.memberships.keys().copied().map(DirtyTarget::Atom));
 			let changes_nodes = local.delta.changes_node_membership();
 			let changes_edges = local.delta.changes_edge_membership();
-			let change = if local.delta.is_node_append() {
+			let removed = local.delta.removed_atoms().collect::<BTreeSet<_>>();
+			let memberships = write
+				.memberships
+				.iter()
+				.filter(|(id, _table)| !removed.contains(id))
+				.map(|(id, table)| LocalCommitTableMembership {
+					id: *id,
+					table_id: table.map(SchemaId::get),
+				})
+				.collect::<Vec<_>>();
+			let change = if write.memberships.is_empty() && local.delta.is_node_append() {
 				LocalCommitGraphChange::AppendNodes {
 					base: base.clone(),
 					nodes: local.delta.into_commit_nodes(),
@@ -331,7 +377,7 @@ impl Transaction {
 				let snapshot = Arc::new(storage.begin_read(self.id, limits.max_snapshot_age)?);
 				let view = storage.graph_view(snapshot, base.clone());
 				local.delta.validate_against(&view)?;
-				let mut delta = local.delta.into_commit_delta(&view)?;
+				let mut delta = local.delta.into_commit_delta(&view, memberships)?;
 				let revision_delta =
 					delta.revision.checked_sub(base_revision).ok_or_else(|| {
 						FerrosGrynnError::invalid_storage_file(
@@ -362,11 +408,21 @@ impl Transaction {
 				stored.edge_set_version = commit_ts;
 			}
 			stored.last_commit_ts = commit_ts;
-			next.graph_names.insert(write.name.clone(), id.clone());
+			let catalog = Arc::make_mut(&mut next.schema);
+			catalog.graph_names.insert(write.name.clone(), id.clone());
+			for (atom, table) in write.memberships {
+				if !removed.contains(&atom) {
+					catalog.set_membership(&id, atom, table)?;
+				}
+			}
+			for atom in removed {
+				catalog.set_membership(&id, atom, None)?;
+			}
 			next.graphs.insert(id.clone(), stored);
 			local_commits.push(LocalCommitGraph {
 				record_id: id,
 				name: write.name,
+				schema: local_commit_graph_schema(&write.schema)?,
 				change,
 			});
 			return Ok(());
@@ -376,17 +432,23 @@ impl Transaction {
 		let name = write.name.clone();
 		let Some(value) = write.value else {
 			next.graphs.remove(&id);
-			if next.graph_names.get(&name) == Some(&id) {
-				next.graph_names.remove(&name);
+			if next.schema.graph_names.get(&name) == Some(&id) {
+				Arc::make_mut(&mut next.schema).graph_names.remove(&name);
 			}
-			next.graph_catalog_versions.insert(id, commit_ts);
+			let catalog = Arc::make_mut(&mut next.schema);
+			catalog.graphs.remove(&id);
+			catalog.memberships.remove(&id);
+			catalog.graph_versions.insert(id.clone(), commit_ts);
 			return Ok(());
 		};
-		let dirty = if write.base.is_some() {
+		let mut dirty = if write.base.is_some() {
 			value.dirty()
 		} else {
 			all_dirty(&value.snapshot())?
 		};
+		dirty.extend(write.memberships.keys().copied().map(DirtyTarget::Atom));
+		dirty.sort_unstable();
+		dirty.dedup();
 		if dirty.is_empty() && write.base.is_some() && !write.force_persist {
 			return Ok(());
 		}
@@ -437,13 +499,51 @@ impl Transaction {
 		stored.graph = StoredGraphValue::Materialized(graph.clone());
 		stored.record_index = Arc::new(build_record_index(&graph)?);
 		stored.last_commit_ts = commit_ts;
-		next.graph_names.insert(name, id.clone());
+		let catalog = Arc::make_mut(&mut next.schema);
+		catalog.graph_names.insert(name, id.clone());
+		if created {
+			write.schema.published_at = commit_ts;
+			catalog.graphs.insert(id.clone(), Arc::new(write.schema));
+		}
+		for (atom, table) in write.memberships {
+			catalog.set_membership(&id, atom, table)?;
+		}
+		for target in &dirty {
+			if let DirtyTarget::Atom(atom) = target
+				&& !graph.contains(*atom)
+			{
+				catalog.set_membership(&id, *atom, None)?;
+			}
+		}
 		next.graphs.insert(id.clone(), stored);
 		if created {
-			next.graph_catalog_versions.insert(id, commit_ts);
+			catalog.graph_versions.insert(id, commit_ts);
 		}
 		Ok(())
 	}
+}
+
+fn local_commit_graph_schema(schema: &GraphSchema) -> FerrosGrynnResult<LocalCommitGraphSchema> {
+	let index =
+		|kind| {
+			schema.system_indexes().find(|index| index.kind() == kind).copied().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("graph system index is absent")
+			})
+		};
+	let label = index(SystemIndexKind::Label)?;
+	let adjacency = index(SystemIndexKind::Adjacency)?;
+	Ok(LocalCommitGraphSchema {
+		id: schema.id().get(),
+		version: schema.version().get(),
+		label_index: LocalCommitSystemIndex {
+			id: label.id().get(),
+			version: label.version().get(),
+		},
+		adjacency_index: LocalCommitSystemIndex {
+			id: adjacency.id().get(),
+			version: adjacency.version().get(),
+		},
+	})
 }
 
 pub(super) fn all_dirty(graph: &MaterializedGraph) -> FerrosGrynnResult<Vec<DirtyTarget>> {

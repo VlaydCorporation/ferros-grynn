@@ -57,6 +57,7 @@ pub struct Transaction {
 	pub(super) predicates: Mutex<Vec<PredicateRead>>,
 	pub(super) graphs: BTreeMap<RecordId, GraphWrite>,
 	pub(super) tables: BTreeMap<String, Option<TableSchema>>,
+	pub(super) parameters: BTreeMap<String, Option<SchemaParameter>>,
 }
 
 impl Drop for Transaction {
@@ -107,7 +108,7 @@ impl Transaction {
 			));
 		}
 		if self.options.access == TransactionAccess::ReadOnly
-			&& (!self.graphs.is_empty() || !self.tables.is_empty())
+			&& (!self.graphs.is_empty() || !self.tables.is_empty() || !self.parameters.is_empty())
 		{
 			return Err(FerrosGrynnError::read_only_transaction(self.id));
 		}
@@ -121,7 +122,7 @@ impl Transaction {
 		{
 			self.validate_serializable(&current)?;
 		}
-		if self.graphs.is_empty() && self.tables.is_empty() {
+		if self.graphs.is_empty() && self.tables.is_empty() && self.parameters.is_empty() {
 			return Ok(CommitResult {
 				transaction: self.id,
 				commit_ts: current.commit_ts,
@@ -134,27 +135,49 @@ impl Transaction {
 		// ponytail: cloning the shallow catalog is O(graphs + tables); use a
 		// persistent map only after catalog size appears in profiles.
 		let mut next = (*current).clone();
+		Arc::make_mut(&mut next.schema).next_id =
+			self.store.inner.next_schema_id.load(Ordering::Relaxed);
 		let mut local_commits = Vec::new();
 		for (id, write) in std::mem::take(&mut self.graphs) {
 			self.apply_graph_write(&mut next, &current, id, write, commit_ts, &mut local_commits)?;
 		}
 		for (name, schema) in std::mem::take(&mut self.tables) {
 			match schema {
-				Some(schema) => {
+				Some(mut schema) => {
 					if !next.graphs.contains_key(schema.graph.id()) {
 						return Err(FerrosGrynnError::graph_does_not_exist(
 							schema.graph.id().to_string(),
 						));
 					}
-					next.tables.insert(name.clone(), Arc::new(schema));
+					schema.published_at = commit_ts;
+					Arc::make_mut(&mut next.schema).tables.insert(name.clone(), Arc::new(schema));
 				}
 				None => {
-					next.tables.remove(&name);
+					let catalog = Arc::make_mut(&mut next.schema);
+					if let Some(table) = catalog.tables.remove(&name)
+						&& let Some(id) = table.id
+					{
+						catalog.clear_table_memberships(id)?;
+					}
 				}
 			}
-			next.table_versions.insert(name, commit_ts);
+			Arc::make_mut(&mut next.schema).table_versions.insert(name, commit_ts);
 		}
-		for schema in next.tables.values() {
+		for (name, parameter) in std::mem::take(&mut self.parameters) {
+			match parameter {
+				Some(mut parameter) => {
+					parameter.published_at = commit_ts;
+					Arc::make_mut(&mut next.schema)
+						.parameters
+						.insert(name.clone(), Arc::new(parameter));
+				}
+				None => {
+					Arc::make_mut(&mut next.schema).parameters.remove(&name);
+				}
+			}
+			Arc::make_mut(&mut next.schema).parameter_versions.insert(name, commit_ts);
+		}
+		for schema in next.schema.tables.values() {
 			let stored = next.graphs.get(schema.graph.id()).ok_or_else(|| {
 				FerrosGrynnError::graph_constraint_violation(
 					"catalog",
@@ -177,6 +200,7 @@ impl Transaction {
 				));
 			}
 		}
+		next.schema.validate_memberships()?;
 		let mut changed_graphs = next
 			.graphs
 			.iter()
@@ -294,13 +318,23 @@ impl Transaction {
 		match self.tables.get(name) {
 			Some(Some(schema)) => Some(Arc::new(schema.clone())),
 			Some(None) => None,
-			None => self.read_root().tables.get(name).cloned(),
+			None => self.read_root().schema.table(name),
+		}
+	}
+
+	fn visible_parameter(&self, name: &str) -> Option<Arc<SchemaParameter>> {
+		match self.parameters.get(name) {
+			Some(Some(parameter)) => Some(Arc::new(parameter.clone())),
+			Some(None) => None,
+			None => self.read_root().schema.parameter(name),
 		}
 	}
 
 	fn estimated_write_set_bytes(&self) -> FerrosGrynnResult<usize> {
 		let mut estimated = 0_usize;
 		for write in self.graphs.values() {
+			estimated = estimated
+				.saturating_add(write.memberships.len().saturating_mul(DIRTY_TARGET_WRITE_BYTES));
 			if let Some(local) = &write.local {
 				let storage = self.store.inner.backend.local().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
@@ -372,6 +406,14 @@ impl Transaction {
 				|schema| {
 					TABLE_SCHEMA_WRITE_BYTES
 						.saturating_add(schema.fields.len().saturating_mul(TABLE_FIELD_WRITE_BYTES))
+				},
+			));
+		}
+		for parameter in self.parameters.values() {
+			estimated = estimated.saturating_add(parameter.as_ref().map_or(
+				CATALOG_DELETE_WRITE_BYTES,
+				|parameter| {
+					TABLE_SCHEMA_WRITE_BYTES.saturating_add(parameter.value.estimated_heap_bytes())
 				},
 			));
 		}

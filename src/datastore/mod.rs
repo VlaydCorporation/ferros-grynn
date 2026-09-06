@@ -17,6 +17,9 @@ use crate::{
 	storage::{
 		LocalCommitGraph,
 		LocalCommitGraphChange,
+		LocalCommitGraphSchema,
+		LocalCommitSystemIndex,
+		LocalCommitTableMembership,
 		LocalEdgeRead,
 		LocalGraph,
 		LocalGraphView,
@@ -101,8 +104,21 @@ pub use options::{
 	TransactionOptions,
 };
 use root::{ActiveSnapshot, AtomVersions, DatabaseRoot, StoredGraph, StoredGraphValue};
-use schema::validate_graph_name;
-pub use schema::{TableField, TableIndex, TableIndexKind, TableKind, TableSchema};
+use schema::{AtomTableMemberships, validate_graph_name};
+pub use schema::{
+	GraphSchema,
+	SchemaCatalog,
+	SchemaId,
+	SchemaParameter,
+	SchemaVersion,
+	SystemIndex,
+	SystemIndexKind,
+	TableField,
+	TableIndex,
+	TableIndexKind,
+	TableKind,
+	TableSchema,
+};
 pub use transaction::{
 	AtomRefTopology,
 	CommitResult,
@@ -139,6 +155,7 @@ impl Datastore {
 				options: DatastoreOptions::InMemory(options),
 				backend: StoreBackend::InMemory,
 				next_transaction: AtomicU64::new(1),
+				next_schema_id: AtomicU64::new(1),
 				current: RwLock::new(Arc::new(DatabaseRoot::default())),
 				commit: Mutex::new(()),
 				active: Mutex::new(BTreeMap::new()),
@@ -180,6 +197,7 @@ impl Datastore {
 				options: DatastoreOptions::Local(options),
 				backend: StoreBackend::Local(Box::new(local)),
 				next_transaction: AtomicU64::new(1),
+				next_schema_id: AtomicU64::new(1),
 				current: RwLock::new(Arc::new(DatabaseRoot::default())),
 				commit: Mutex::new(()),
 				active: Mutex::new(BTreeMap::new()),
@@ -206,11 +224,13 @@ impl Datastore {
 			options.checkpoint.interval,
 		)?;
 		let root = DatabaseRoot::from_local(snapshot)?;
+		let next_schema_id = root.schema.next_id;
 		Ok(Self {
 			inner: Arc::new(StoreInner {
 				options: DatastoreOptions::Local(options),
 				backend: StoreBackend::Local(Box::new(local)),
 				next_transaction: AtomicU64::new(1),
+				next_schema_id: AtomicU64::new(next_schema_id),
 				current: RwLock::new(Arc::new(root)),
 				commit: Mutex::new(()),
 				active: Mutex::new(BTreeMap::new()),
@@ -263,11 +283,23 @@ impl Datastore {
 			predicates: Mutex::new(Vec::new()),
 			graphs: BTreeMap::new(),
 			tables: BTreeMap::new(),
+			parameters: BTreeMap::new(),
 		}
 	}
 
 	pub fn table(&self, name: &str) -> Option<Arc<TableSchema>> {
-		self.current_root().tables.get(name).cloned()
+		self.current_root().schema.table(name)
+	}
+
+	/// Returns an immutable snapshot of all currently visible schema
+	/// definitions.
+	pub fn schema_catalog(&self) -> Arc<SchemaCatalog> {
+		self.current_root().schema.clone()
+	}
+
+	/// Returns one currently visible global database parameter.
+	pub fn parameter(&self, name: &str) -> Option<Arc<SchemaParameter>> {
+		self.current_root().schema.parameter(name)
 	}
 
 	/// Runs local checkpoint maintenance with explicit reader behavior.

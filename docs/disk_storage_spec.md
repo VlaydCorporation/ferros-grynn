@@ -768,8 +768,9 @@ snapshot.visible_lsn`. Если бы эти часы выдавались лок
 `db.fgb` хранит только две root-page ссылки. Сами канонические каталоги лежат в
 `schema/catalog.fgb` и публикуются тем же frame-WAL commit, что graph pages:
 
-- `DatabaseCatalog` (`FGDC`, payload version 3): `next_graph_id`, database-wide словарь
-  property keys, graph address spaces и таблицы;
+- `DatabaseCatalog` (`FGDC`, payload version 4): `next_graph_id`,
+  `next_schema_id`, database-wide словарь property keys, graph address spaces,
+  versioned definitions графов/таблиц/полей/индексов и глобальные параметры;
 - `FileCatalog` (`FGFC`, payload version 3): sealed mapping
   `(GraphId, DataFileId) → (role, validated relative path)`.
 
@@ -785,10 +786,18 @@ primary-index `(DataFileId, root)`, graph properties и UTF-8 `RecordId`/name. �
 root-графа. Внутренние записи используют зарезервированную таблицу `__fg_nested`, не появляются
 в публичном списке именованных графов и не могут быть созданы пользовательским API.
 
-Запись таблицы хранит owning `GraphId`, kind, поля `(name, PropertyKeyId, Type)` и scalar-index
-metadata `(name, standard|unique, ordered PropertyKeyId[], DataFileId, root)`. Индексы внутри
-таблицы отсортированы по имени. `DatabaseSuperblock.graph_count` считает все физические graph
-address spaces, включая вложенные; публичный каталог фильтрует только root-записи.
+Запись именованного root-графа дополнительно хранит стабильные `schema_id`/`schema_version`
+и такие же пары для engine-owned `label`/`adjacency` indexes. У внутренних nested address
+spaces эти поля равны нулю: они не являются отдельными пользовательскими DDL-объектами.
+
+Запись таблицы хранит собственные `schema_id`/`schema_version`, owning `GraphId`, kind,
+versioned поля `(schema_id, schema_version, name, PropertyKeyId, Type)`, engine-owned primary
+index и versioned scalar-index metadata `(schema_id, schema_version, name,
+standard|unique, ordered PropertyKeyId[], DataFileId, root)`. Индексы внутри таблицы
+отсортированы по имени. Параметр хранит стабильные identity/version, имя и canonical
+`StorageValue` вместе с нужными словарями. `DatabaseSuperblock.graph_count` считает все
+физические graph address spaces, включая вложенные; публичный каталог фильтрует только
+root-записи.
 
 Удаление графа атомарно удаляет из нового каталога корень, все его nested address spaces,
 таблицы и file bindings. До публикации нового каталога старые WAL frames остаются разрешимыми;
@@ -1056,7 +1065,7 @@ Offset  Size  Тип        Поле             Описание
 0       4     u32        gen              Поколение для восстановления AtomId
 4       4     u32        subgraph_slot    root-arena slot внутреннего графа; NULL_SLOT иначе
 8       4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
-12      4     u32        table_id         Таблица, которой принадлежит запись; NULL_TABLE = нет
+12      4     u32        table_id         SchemaCatalog `schema_id` таблицы; NULL_TABLE = нет
 16      4     u32        adj_out_count    Общее кол-во исходящих рёбер (inline + overflow)
 20      4     u32        adj_in_count     Общее кол-во входящих рёбер
 24      4     u32        adj_undir_count  Общее кол-во неориентированных рёбер
@@ -1085,6 +1094,11 @@ Total = 160 байт
 - Если `kind_flags.tombstone = 1`, остальные поля не гарантированы (кроме `gen`).
 - Если `adj_out_count > 4`, первая overflow-страница: `overflow_out`.
 - `adj_out[]` заполняется с индекса 0; `NULL_SLOT` — конец inline части.
+- `table_id` — стабильный `SchemaId` в диапазоне `1..u32::MAX`; `u32::MAX`
+  зарезервирован как `NULL_TABLE`. Значение не является ordinal словаря и не выводится из
+  `RecordId.table`.
+- Membership относится к точному `(kind, slot, gen)`: удаление атома, переиспользование
+  slot или удаление таблицы не может оставить membership для нового поколения.
 - `table_id` используется планировщиком для быстрой фильтрации по таблице.
 
 ### 10.2. NodeHotPage layout
@@ -1136,7 +1150,7 @@ Offset  Size  Тип        Поле             Описание
 8       4     u32        source_count     Кол-во source endpoint'ов (total, ≤2 inline)
 12      4     u32        target_count     Кол-во target endpoint'ов (total, ≤2 inline)
 16      4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
-20      4     u32        table_id         Таблица (для RELATION-таблиц)
+20      4     u32        table_id         SchemaCatalog `schema_id` таблицы; NULL_TABLE = нет
 24      8     f64        weight           NaN = нет веса
 32      4     u32        transition_gid   root-arena slot transition graph; NULL_SLOT = нет
 36      4     u32        source_sg_slot   root-arena slot всех source_inline; NULL_SLOT = текущий граф
@@ -1173,6 +1187,8 @@ Total = 160 байт
 - Inline- и overflow-части логически образуют один массив на каждой стороне. `RELATE ...
   ORDER BY TAIL/TARGETS` обязывает запись, compaction и recovery сохранять порядок этого
   массива; без такого предложения API не обещает порядок обхода.
+- `table_id` подчиняется тому же generation-aware membership contract, что NodeHotSlot:
+  `u32::MAX` означает отсутствие таблицы, а `RecordId.table` не определяет membership.
 
 **Хранение cross-level endpoints:**
 - Для CROSS_LEVEL=0: `source_inline`/`target_inline` содержат DiskAtomRef в пространстве текущего графа.
@@ -1654,56 +1670,56 @@ bounded mutation такого графа завершается явной ош�
 
 ## 18. SchemaCatalog — хранилище схем
 
-Хранит все DDL-объекты: таблицы, поля, индексы, события, функции, анализаторы, параметры.
+`SchemaCatalog` — единственный логический владелец schema definitions и принадлежности атомов
+таблицам. Реализованное ядро format v1 хранит именованные root-графы, таблицы, поля,
+standard/unique indexes, глобальные параметры и engine-owned primary/label/adjacency indexes.
+События, функции, анализаторы, changefeed/live definitions и расширенные index kinds ниже
+остаются зарезервированным расширением соответствующих этапов и не сериализуются writer'ом
+format v1 до реализации их полного контракта.
 
 ### 18.1. Общая структура
 
-Каждый DDL-объект имеет:
+Каждый реализованный schema object имеет:
 
-- Уникальный `schema_id: u32` (монотонно растущий).
-- `kind: SchemaObjectKind`.
-- `version: u32` (при OVERWRITE инкрементируется).
-- `definition: Vec<u8>` — сериализованное определение (формат §18.7).
+- уникальный `schema_id: u32`, монотонно выделяемый в пределах БД и не
+  переиспользуемый после удаления;
+- ненулевой `version: u32`; семантически изменённое определение сохраняет identity и
+  увеличивает version, а новое после удаления получает новый identity;
+- owning graph/table identity там, где объект вложен в другое определение;
+- типизированное определение, которое кодируется явно, а не произвольным Rust derive.
 
-```rust
-enum SchemaObjectKind {
-    Table = 0x01,
-    Field = 0x02,
-    Index = 0x03,
-    Event = 0x04,
-    Function = 0x05,
-    Analyzer = 0x06,
-    Param = 0x07,
-    Changefeed = 0x08,
-    LiveSelect = 0x09,
-}
-```
+Identity `0` зарезервирован, а `u32::MAX` является `NULL_TABLE` в hot slots; допустимые
+`SchemaId` лежат в `1..u32::MAX`. `next_schema_id: u64` хранит первую ещё не выданную identity
+и входит в атомарно публикуемый `DatabaseCatalog`.
 
-### 18.2. SchemaCatalogPage
+### 18.2. Физическая публикация реализованного ядра
 
-```
-Offset  Size  Тип    Поле                
-0       32    —      PageHeader (magic=MAGIC_SCHEMA, type=SchemaRoot)
-32      8     u64    next_page
-40      4     u32    entry_count
-44      4     u32    _pad
-48      var   —      entries: [SchemaEntry]×N
-```
+Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 4 (§7.2). Payload
+разбит на bounded chain страниц `SchemaRoot`: общий `PageHeader`, marker `FGC1`, catalog kind,
+page-codec version, `next_page`, длина chunk/полного payload и нулевые reserved bytes.
+Checksum проверяется до декодирования, общий payload ограничен 16 МиБ.
 
-**SchemaEntry (variable):**
+| Объект | Обязательное durable определение |
+|--------|----------------------------------|
+| Root graph | identity/version, graph family, engine-owned label/adjacency identity/version и graph catalog metadata |
+| Table | identity/version, имя, owning `GraphId`, kind и engine-owned primary identity/version |
+| Field | identity/version, имя, `PropertyKeyId` и `Type` |
+| Standard/unique index | identity/version, имя, kind, ordered fields, exact `DataFileId` и root страницы immutable generation |
+| Parameter | identity/version, имя и canonical `StorageValue` bytes со словарями |
+| Atom membership | точный `(GraphId, AtomId(kind, slot, gen)) → Table SchemaId`; в local storage дублируется в соответствующем hot slot |
 
-```
-Offset  Size  Тип    Поле  
-0       4     u32    schema_id
-4       1     u8     kind
-5       4     u32    version
-9       4     u32    name_id
-13      4     u32    parent_id
-17      4     u32    def_len
-21      var   -      definition[def_len]
-```
+RAM и local backends используют один membership contract; форма пользовательского
+`RecordId` не назначает таблицу. У одного атома одновременно не более одной таблицы. Удаление
+атома или таблицы очищает membership той же транзакцией.
 
-Где `parent_id` = table schema_id для Field, Index, Event, Changefeed.
+Schema change проходит FCW validation относительно snapshot, а определения, изменённые graph
+pages/index generations и оба catalog root публикуются одним database-level WAL commit.
+Primary/label/adjacency имеют каталожную identity даже когда физически используют общий или
+inline layout; пользователь не может удалить их отдельно.
+
+Подразделы 18.3–18.7 задают логические определения для последующего расширения DDL. Их
+псевдо-layout не является byte-offset layout payload `FGDC` v4; writer format v1 кодирует
+только реализованные поля из таблицы выше и обязан отвергать ещё не поддержанные варианты.
 
 ### 18.3. TableDefinition (def format)
 

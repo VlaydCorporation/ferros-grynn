@@ -409,15 +409,57 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 	if catalog.next_graph_id == 0 {
 		return Err(invalid_catalog("graph identity zero is reserved for system metadata"));
 	}
+	if catalog.next_schema_id == 0 || catalog.next_schema_id > u64::from(u32::MAX) {
+		return Err(invalid_catalog("schema identity clock is outside its u32 domain"));
+	}
 	let mut previous = GraphId::SYSTEM;
 	let mut graph_ids = BTreeSet::new();
+	let mut root_graph_ids = BTreeSet::new();
+	let mut schema_ids = BTreeSet::new();
 	let mut graph_roots = BTreeMap::new();
 	let mut graph_records = BTreeSet::new();
 	let mut graph_names = BTreeSet::new();
 	let mut nested_slots = BTreeSet::new();
 	for graph in &catalog.graphs {
+		let root_schema = graph.parent_graph_id.is_none();
+		if root_schema {
+			validate_schema_entry(
+				graph.schema_id,
+				graph.schema_version,
+				catalog.next_schema_id,
+				&mut schema_ids,
+				"graph",
+			)?;
+			validate_schema_entry(
+				graph.label_index.schema_id,
+				graph.label_index.schema_version,
+				catalog.next_schema_id,
+				&mut schema_ids,
+				"label system index",
+			)?;
+			validate_schema_entry(
+				graph.adjacency_index.schema_id,
+				graph.adjacency_index.schema_version,
+				catalog.next_schema_id,
+				&mut schema_ids,
+				"adjacency system index",
+			)?;
+		} else if graph.schema_id != 0
+			|| graph.schema_version != 0
+			|| graph.label_index.schema_id != 0
+			|| graph.label_index.schema_version != 0
+			|| graph.adjacency_index.schema_id != 0
+			|| graph.adjacency_index.schema_version != 0
+		{
+			return Err(invalid_catalog(
+				"nested graph address space contains root schema metadata",
+			));
+		}
 		let root_graph_id = match (graph.parent_graph_id, graph.subgraph_slot, graph.parent_atom) {
-			(None, None, None) => Some(graph.graph_id),
+			(None, None, None) => {
+				root_graph_ids.insert(graph.graph_id);
+				Some(graph.graph_id)
+			}
 			(Some(parent), Some(slot), Some(_atom)) if slot != 0 && parent < graph.graph_id => {
 				graph_roots.get(&parent).copied().filter(|root| nested_slots.insert((*root, slot)))
 			}
@@ -456,11 +498,25 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 	}
 	let mut previous_table = None;
 	for table in &catalog.tables {
+		validate_schema_entry(
+			table.schema_id,
+			table.schema_version,
+			catalog.next_schema_id,
+			&mut schema_ids,
+			"table",
+		)?;
+		validate_schema_entry(
+			table.primary_index.schema_id,
+			table.primary_index.schema_version,
+			catalog.next_schema_id,
+			&mut schema_ids,
+			"primary system index",
+		)?;
 		if table.name.is_empty()
 			|| table.name.contains('\0')
 			|| table.name.len() > MAX_SCHEMA_NAME_BYTES
 			|| previous_table.is_some_and(|previous: &str| previous >= table.name.as_str())
-			|| !graph_ids.contains(&table.graph_id)
+			|| !root_graph_ids.contains(&table.graph_id)
 			|| table.fields.len() > MAX_TYPE_MEMBERS
 			|| table.indexes.len() > MAX_TYPE_MEMBERS
 		{
@@ -468,6 +524,13 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 		}
 		let mut field_names = BTreeSet::new();
 		for field in &table.fields {
+			validate_schema_entry(
+				field.schema_id,
+				field.schema_version,
+				catalog.next_schema_id,
+				&mut schema_ids,
+				"table field",
+			)?;
 			let property_index = usize::try_from(field.property_key)
 				.map_err(|_error| invalid_catalog("property key does not fit usize"))?;
 			if field.name.is_empty()
@@ -482,6 +545,13 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 		}
 		let mut previous_index = None;
 		for index in &table.indexes {
+			validate_schema_entry(
+				index.schema_id,
+				index.schema_version,
+				catalog.next_schema_id,
+				&mut schema_ids,
+				"table index",
+			)?;
 			if index.name.is_empty()
 				|| index.name.contains('\0')
 				|| index.name.len() > MAX_SCHEMA_NAME_BYTES
@@ -507,7 +577,55 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 		}
 		previous_table = Some(table.name.as_str());
 	}
+	let mut previous_parameter = None;
+	for parameter in &catalog.parameters {
+		validate_schema_entry(
+			parameter.schema_id,
+			parameter.schema_version,
+			catalog.next_schema_id,
+			&mut schema_ids,
+			"parameter",
+		)?;
+		if parameter.name.is_empty()
+			|| parameter.name.contains('\0')
+			|| parameter.name.len() > MAX_SCHEMA_NAME_BYTES
+			|| previous_parameter.is_some_and(|previous: &str| previous >= parameter.name.as_str())
+			|| parameter.value.is_empty()
+			|| parameter.table_names.len() > MAX_TYPE_MEMBERS
+			|| parameter.time_zones.len() > MAX_TYPE_MEMBERS
+			|| !valid_string_dictionary(&parameter.table_names)
+			|| !valid_string_dictionary(&parameter.time_zones)
+		{
+			return Err(invalid_catalog("parameter catalog entry violates a format-v1 bound"));
+		}
+		previous_parameter = Some(parameter.name.as_str());
+	}
 	Ok(())
+}
+
+fn validate_schema_entry(
+	id: u32,
+	version: u32,
+	next_id: u64,
+	seen: &mut BTreeSet<u32>,
+	kind: &str,
+) -> FerrosGrynnResult<()> {
+	if id == 0 || id == u32::MAX || version == 0 || u64::from(id) >= next_id || !seen.insert(id) {
+		return Err(invalid_catalog(format!(
+			"{kind} schema identity or version violates the catalog clock"
+		)));
+	}
+	Ok(())
+}
+
+fn valid_string_dictionary(values: &[String]) -> bool {
+	let mut unique = BTreeSet::new();
+	values.iter().all(|value| {
+		!value.is_empty()
+			&& !value.contains('\0')
+			&& value.len() <= MAX_SCHEMA_NAME_BYTES
+			&& unique.insert(value.as_str())
+	})
 }
 
 /// Validates ordering, roles, and the mandatory system-file registration.
@@ -747,9 +865,9 @@ impl<'a> CatalogDecoder<'a> {
 		Ok(())
 	}
 
-	/// Validates the shared version and reserved bytes.
-	pub(super) fn expect_version(&mut self) -> FerrosGrynnResult<()> {
-		if self.read_u16()? != CATALOG_PAYLOAD_VERSION {
+	/// Validates one payload version and its reserved bytes.
+	pub(super) fn expect_version(&mut self, expected: u16) -> FerrosGrynnResult<()> {
+		if self.read_u16()? != expected {
 			return Err(invalid_catalog("unsupported catalog payload version"));
 		}
 		self.expect_zero(size_of::<u16>(), "catalog payload reserved bytes")

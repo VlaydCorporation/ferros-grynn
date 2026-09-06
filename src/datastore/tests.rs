@@ -103,8 +103,111 @@ fn seeded_table() -> (Datastore, GraphRef, AtomId) {
 		.unwrap(),
 	)
 	.unwrap();
+	for id in ["carol", "alice", "bob"] {
+		tx.assign_atom_to_table(
+			&reference,
+			&AtomRef::new(AtomKind::Node, format!("person:{id}").parse().unwrap()),
+			"person",
+		)
+		.unwrap();
+	}
 	tx.commit().unwrap();
 	(store, reference, carol)
+}
+
+#[test]
+fn table_membership_is_explicit_and_record_id_independent() {
+	assert!(SchemaId::new(0).is_none());
+	assert!(SchemaId::new(u32::MAX).is_none());
+	let store = Datastore::in_memory();
+	let mut graph = Graph::<Mutable>::new();
+	graph.add_node_with_id("person:unassigned".parse().unwrap(), None, PropertyMap::new()).unwrap();
+	graph.add_node_with_id("account:assigned".parse().unwrap(), None, PropertyMap::new()).unwrap();
+	let mut transaction = store.begin();
+	let reference =
+		transaction.create_graph(graph_id("membership"), graph.freeze().into()).unwrap();
+	transaction
+		.define_table(
+			TableSchema::new(
+				"person",
+				reference.clone(),
+				TableKind::Normal,
+				Vec::<TableField>::new(),
+			)
+			.unwrap(),
+		)
+		.unwrap();
+	transaction
+		.assign_atom_to_table(
+			&reference,
+			&AtomRef::new(AtomKind::Node, "account:assigned".parse().unwrap()),
+			"person",
+		)
+		.unwrap();
+	transaction.commit().unwrap();
+
+	let result = store.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
+	let Value::Array(rows) = result[0].result.as_ref().unwrap().value() else {
+		panic!("SELECT must return an array");
+	};
+	assert_eq!(rows.as_slice(), &[Value::from("account:assigned".parse::<RecordId>().unwrap())]);
+}
+
+#[test]
+fn schema_catalog_preserves_ids_and_advances_changed_versions() {
+	let store = Datastore::in_memory();
+	store.intern_property("name").unwrap();
+	let mut create = store.begin();
+	let graph =
+		create.create_graph(graph_id("catalog"), Graph::<Mutable>::new().freeze().into()).unwrap();
+	create
+		.define_table(
+			TableSchema::new("person", graph.clone(), TableKind::Normal, [TableField::new(
+				"name",
+				Type::String,
+			)])
+			.unwrap(),
+		)
+		.unwrap();
+	create.define_parameter(SchemaParameter::new("batch", Value::from(8_i64)).unwrap()).unwrap();
+	create.commit().unwrap();
+
+	let before = store.table("person").unwrap();
+	let table_id = before.id().unwrap();
+	let field_id = before.fields().next().unwrap().id().unwrap();
+	let primary_id = before.primary_index().unwrap().id();
+	let parameter_id = store.parameter("batch").unwrap().id().unwrap();
+	let graph_schema = store.schema_catalog().graph(graph.id()).unwrap();
+	assert_eq!(graph_schema.system_indexes().count(), 2);
+
+	let mut overwrite = store.begin();
+	overwrite
+		.overwrite_table(
+			TableSchema::new("person", graph, TableKind::Normal, [TableField::new(
+				"name",
+				Type::Int,
+			)])
+			.unwrap(),
+		)
+		.unwrap();
+	overwrite
+		.overwrite_parameter(SchemaParameter::new("batch", Value::from(16_i64)).unwrap())
+		.unwrap();
+	overwrite.commit().unwrap();
+
+	let after = store.table("person").unwrap();
+	assert_eq!(after.id(), Some(table_id));
+	assert_eq!(after.version().get(), before.version().get() + 1);
+	assert_eq!(after.fields().next().unwrap().id(), Some(field_id));
+	assert_eq!(
+		after.fields().next().unwrap().version().get(),
+		before.fields().next().unwrap().version().get() + 1
+	);
+	assert_eq!(after.primary_index().unwrap().id(), primary_id);
+	let parameter = store.parameter("batch").unwrap();
+	assert_eq!(parameter.id(), Some(parameter_id));
+	assert_eq!(parameter.version().get(), 2);
+	assert_eq!(parameter.value(), &Value::from(16_i64));
 }
 
 #[test]
@@ -229,7 +332,7 @@ fn local_graph_table_and_edge_survive_reopen() {
 	assert_eq!(reference.storage_mode(), GraphStorageMode::DiskBacked);
 	transaction
 		.define_table(
-			TableSchema::new("person", reference, TableKind::Normal, [
+			TableSchema::new("person", reference.clone(), TableKind::Normal, [
 				TableField::new("name", Type::String),
 				TableField::new("age", Type::Int),
 			])
@@ -243,7 +346,36 @@ fn local_graph_table_and_edge_survive_reopen() {
 			.unwrap(),
 		)
 		.unwrap();
+	transaction
+		.define_parameter(SchemaParameter::new("batch", Value::from(64_i64)).unwrap())
+		.unwrap();
+	for id in ["alice", "bob"] {
+		transaction
+			.assign_atom_to_table(
+				&reference,
+				&AtomRef::new(AtomKind::Node, format!("person:{id}").parse().unwrap()),
+				"person",
+			)
+			.unwrap();
+	}
 	transaction.commit().unwrap();
+	let created_table = store.table("person").unwrap();
+	let table_id = created_table.id().unwrap();
+	let field_ids = created_table.fields().map(|field| field.id().unwrap()).collect::<Vec<_>>();
+	let index_ids = created_table.indexes().map(|index| index.id().unwrap()).collect::<Vec<_>>();
+	let primary_id = created_table.primary_index().unwrap().id();
+	let created_graph = store.schema_catalog().graph(reference.id()).unwrap();
+	let label_id = created_graph
+		.system_indexes()
+		.find(|index| index.kind() == SystemIndexKind::Label)
+		.unwrap()
+		.id();
+	let adjacency_id = created_graph
+		.system_indexes()
+		.find(|index| index.kind() == SystemIndexKind::Adjacency)
+		.unwrap()
+		.id();
+	let parameter_id = store.parameter("batch").unwrap().id().unwrap();
 
 	let busy = match Datastore::open_local(directory.path(), options) {
 		Ok(_unexpected) => panic!("a live local owner must keep db.lock exclusive"),
@@ -254,6 +386,30 @@ fn local_graph_table_and_edge_survive_reopen() {
 
 	let reopened = Datastore::open_local(directory.path(), options).unwrap();
 	let schema = reopened.table("person").unwrap();
+	assert_eq!(schema.id(), Some(table_id));
+	assert_eq!(schema.fields().map(|field| field.id().unwrap()).collect::<Vec<_>>(), field_ids);
+	assert_eq!(schema.indexes().map(|index| index.id().unwrap()).collect::<Vec<_>>(), index_ids);
+	assert_eq!(schema.primary_index().unwrap().id(), primary_id);
+	let reopened_graph = reopened.schema_catalog().graph(reference.id()).unwrap();
+	assert_eq!(
+		reopened_graph
+			.system_indexes()
+			.find(|index| index.kind() == SystemIndexKind::Label)
+			.unwrap()
+			.id(),
+		label_id
+	);
+	assert_eq!(
+		reopened_graph
+			.system_indexes()
+			.find(|index| index.kind() == SystemIndexKind::Adjacency)
+			.unwrap()
+			.id(),
+		adjacency_id
+	);
+	let parameter = reopened.parameter("batch").unwrap();
+	assert_eq!(parameter.id(), Some(parameter_id));
+	assert_eq!(parameter.value(), &Value::from(64_i64));
 	let mut bounded = reopened.begin();
 	assert!(bounded.mutate_graph(schema.graph()).is_err());
 	drop(bounded);
@@ -308,6 +464,193 @@ fn local_graph_table_and_edge_survive_reopen() {
 		panic!("updated point SELECT must return an array");
 	};
 	assert_eq!(rows.as_slice(), &[Value::from(31_i64)]);
+}
+
+#[cfg(windows)]
+#[test]
+fn local_membership_only_delta_survives_reopen() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let mut graph = Graph::<Mutable>::new();
+	graph.add_node_with_id("external:one".parse().unwrap(), None, PropertyMap::new()).unwrap();
+	let mut create = store.begin();
+	let reference =
+		create.create_graph(graph_id("membership-delta"), graph.freeze().into()).unwrap();
+	create
+		.define_table(
+			TableSchema::new(
+				"person",
+				reference.clone(),
+				TableKind::Normal,
+				Vec::<TableField>::new(),
+			)
+			.unwrap(),
+		)
+		.unwrap();
+	create.commit().unwrap();
+
+	let before = store.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
+	let Value::Array(rows) = before[0].result.as_ref().unwrap().value() else {
+		panic!("SELECT must return an array");
+	};
+	assert!(rows.is_empty());
+
+	let mut assign = store.begin();
+	assign
+		.assign_atom_to_table(
+			&reference,
+			&AtomRef::new(AtomKind::Node, "external:one".parse().unwrap()),
+			"person",
+		)
+		.unwrap();
+	assign.commit().unwrap();
+	drop(store);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	let after = reopened.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
+	let Value::Array(rows) = after[0].result.as_ref().unwrap().value() else {
+		panic!("SELECT must return an array");
+	};
+	assert_eq!(rows.as_slice(), &[Value::from("external:one".parse::<RecordId>().unwrap())]);
+}
+
+#[cfg(windows)]
+#[test]
+fn local_table_removal_clears_durable_membership() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let mut graph = Graph::<Mutable>::new();
+	graph.add_node_with_id("external:one".parse().unwrap(), None, PropertyMap::new()).unwrap();
+	let mut create = store.begin();
+	let graph = create.create_graph(graph_id("membership-remove"), graph.freeze().into()).unwrap();
+	create
+		.define_table(
+			TableSchema::new("person", graph.clone(), TableKind::Normal, Vec::<TableField>::new())
+				.unwrap(),
+		)
+		.unwrap();
+	create
+		.assign_atom_to_table(
+			&graph,
+			&AtomRef::new(AtomKind::Node, "external:one".parse().unwrap()),
+			"person",
+		)
+		.unwrap();
+	create.commit().unwrap();
+	let removed_id = store.table("person").unwrap().id().unwrap();
+
+	let mut remove = store.begin();
+	remove.remove_table("person").unwrap();
+	remove.commit().unwrap();
+	drop(store);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	assert!(reopened.table("person").is_none());
+	let mut recreate = reopened.begin();
+	recreate
+		.define_table(
+			TableSchema::new("person", graph, TableKind::Normal, Vec::<TableField>::new()).unwrap(),
+		)
+		.unwrap();
+	recreate.commit().unwrap();
+	assert_ne!(reopened.table("person").unwrap().id(), Some(removed_id));
+	let result = reopened.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
+	let Value::Array(rows) = result[0].result.as_ref().unwrap().value() else {
+		panic!("SELECT must return an array");
+	};
+	assert!(rows.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn local_atom_removal_clears_durable_membership() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let atom = AtomRef::new(AtomKind::Node, "external:one".parse().unwrap());
+	let mut graph = Graph::<Mutable>::new();
+	graph.add_node_with_id(atom.id().clone(), None, PropertyMap::new()).unwrap();
+	let mut create = store.begin();
+	let graph = create.create_graph(graph_id("membership-delete"), graph.freeze().into()).unwrap();
+	create
+		.define_table(
+			TableSchema::new("person", graph.clone(), TableKind::Normal, Vec::<TableField>::new())
+				.unwrap(),
+		)
+		.unwrap();
+	create.assign_atom_to_table(&graph, &atom, "person").unwrap();
+	create.commit().unwrap();
+
+	let mut remove = store.begin();
+	let mut mutation = remove.mutate_graph(&graph).unwrap();
+	mutation.remove_atom(&atom).unwrap();
+	drop(mutation);
+	remove.commit().unwrap();
+	drop(store);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	let result = reopened.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
+	let Value::Array(rows) = result[0].result.as_ref().unwrap().value() else {
+		panic!("SELECT must return an array");
+	};
+	assert!(rows.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn concurrent_table_removal_clears_new_durable_membership() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let atom = AtomRef::new(AtomKind::Node, "external:one".parse().unwrap());
+	let mut graph = Graph::<Mutable>::new();
+	graph.add_node_with_id(atom.id().clone(), None, PropertyMap::new()).unwrap();
+	let mut create = store.begin();
+	let graph = create.create_graph(graph_id("membership-race"), graph.freeze().into()).unwrap();
+	create
+		.define_table(
+			TableSchema::new("person", graph.clone(), TableKind::Normal, Vec::<TableField>::new())
+				.unwrap(),
+		)
+		.unwrap();
+	create.commit().unwrap();
+
+	let mut remove = store.begin();
+	remove.remove_table("person").unwrap();
+	let mut assign = store.begin();
+	assign.assign_atom_to_table(&graph, &atom, "person").unwrap();
+	assign.commit().unwrap();
+	remove.commit().unwrap();
+	drop(store);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	assert!(reopened.table("person").is_none());
+	let mut recreate = reopened.begin();
+	recreate
+		.define_table(
+			TableSchema::new("person", graph, TableKind::Normal, Vec::<TableField>::new()).unwrap(),
+		)
+		.unwrap();
+	recreate.commit().unwrap();
+	let result = reopened.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
+	let Value::Array(rows) = result[0].result.as_ref().unwrap().value() else {
+		panic!("SELECT must return an array");
+	};
+	assert!(rows.is_empty());
 }
 
 #[cfg(windows)]
@@ -569,6 +912,15 @@ fn local_unique_index_violation_rolls_back_publication() {
 			.unwrap(),
 		)
 		.unwrap();
+	for id in ["first", "second"] {
+		create
+			.assign_atom_to_table(
+				&reference,
+				&AtomRef::new(AtomKind::Node, format!("person:{id}").parse().unwrap()),
+				"person",
+			)
+			.unwrap();
+	}
 	assert!(create.commit().is_err());
 	assert!(store.table("person").is_none());
 	assert!(reference.read(&store.begin()).is_err());
@@ -1384,6 +1736,43 @@ fn graph_removal_preserves_table_catalog_integrity() {
 	removal.commit().unwrap();
 	assert!(store.table("person").is_none());
 	assert!(reference.read(&store.begin()).is_err());
+}
+
+#[test]
+fn schema_catalog_writes_use_first_committer_wins() {
+	let (store, graph, _, _) = seeded_store();
+	let options = TransactionOptions {
+		isolation: IsolationLevel::Snapshot,
+		access: TransactionAccess::ReadWrite,
+	};
+	let mut first = store.begin_with(options);
+	let mut second = store.begin_with(options);
+	for transaction in [&mut first, &mut second] {
+		transaction
+			.define_table(
+				TableSchema::new(
+					"person",
+					graph.clone(),
+					TableKind::Normal,
+					Vec::<TableField>::new(),
+				)
+				.unwrap(),
+			)
+			.unwrap();
+	}
+	first.commit().unwrap();
+	assert_eq!(second.commit().unwrap_err().status().code().to_string(), "FG-40001");
+
+	let mut create = store.begin();
+	create.define_parameter(SchemaParameter::new("batch", Value::from(1_i64)).unwrap()).unwrap();
+	create.commit().unwrap();
+	let mut first = store.begin_with(options);
+	let mut second = store.begin_with(options);
+	first.overwrite_parameter(SchemaParameter::new("batch", Value::from(2_i64)).unwrap()).unwrap();
+	second.overwrite_parameter(SchemaParameter::new("batch", Value::from(3_i64)).unwrap()).unwrap();
+	first.commit().unwrap();
+	assert_eq!(second.commit().unwrap_err().status().code().to_string(), "FG-40001");
+	assert_eq!(store.parameter("batch").unwrap().value(), &Value::from(2_i64));
 }
 
 #[test]

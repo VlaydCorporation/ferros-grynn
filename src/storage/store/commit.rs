@@ -34,6 +34,8 @@ pub(super) struct PlannedGraph {
 	/// Name written into the existing graph catalog entry.
 	pub(super) name: String,
 	pub(super) kind: GraphKind,
+	/// Schema metadata exists only on the named root address space.
+	pub(super) schema: Option<LocalCommitGraphSchema>,
 	pub(super) graph: Graph<Frozen>,
 	pub(super) parent_graph_id: Option<GraphId>,
 	pub(super) subgraph_slot: Option<u32>,
@@ -50,6 +52,8 @@ pub(super) struct PlannedChild {
 pub(super) struct BuiltScalarIndexImage {
 	pub(super) table: String,
 	pub(super) name: String,
+	pub(super) schema_id: u32,
+	pub(super) schema_version: u32,
 	pub(super) kind: TableIndexKind,
 	pub(super) fields: Vec<u32>,
 	pub(super) root: PageNo,
@@ -93,6 +97,7 @@ pub(super) fn plan_graph_tree(
 	record_id: &RecordId,
 	name: &str,
 	graph: &MaterializedGraph,
+	schema: LocalCommitGraphSchema,
 ) -> FerrosGrynnResult<PlannedGraph> {
 	let mut next_subgraph_slot = 1_u32;
 	plan_graph(
@@ -100,6 +105,7 @@ pub(super) fn plan_graph_tree(
 		graph_id,
 		(record_id.clone(), name.to_owned()),
 		graph.kind(),
+		Some(schema),
 		graph.clone().into_general()?,
 		None,
 		None,
@@ -113,6 +119,7 @@ pub(super) fn plan_graph(
 	graph_id: GraphId,
 	catalog_identity: (RecordId, String),
 	kind: GraphKind,
+	schema: Option<LocalCommitGraphSchema>,
 	graph: Graph<Frozen>,
 	parent_graph_id: Option<GraphId>,
 	subgraph_slot: Option<u32>,
@@ -164,6 +171,7 @@ pub(super) fn plan_graph(
 			child_id,
 			(child_record, child_name),
 			GraphKind::Graph,
+			None,
 			nested_graph,
 			Some(graph_id),
 			Some(slot),
@@ -181,6 +189,7 @@ pub(super) fn plan_graph(
 		record_id,
 		name,
 		kind,
+		schema,
 		graph,
 		parent_graph_id,
 		subgraph_slot,
@@ -208,10 +217,11 @@ pub(super) fn build_graph_images(
 	plan: &PlannedGraph,
 	dictionary: &mut PropertyDictionary,
 	tables: &[LocalCommitTable],
+	memberships: &[LocalCommitTableMembership],
 ) -> FerrosGrynnResult<Vec<BuiltGraphImage>> {
-	let mut images = vec![build_graph_image(plan, dictionary, tables)?];
+	let mut images = vec![build_graph_image(plan, dictionary, tables, memberships)?];
 	for child in &plan.children {
-		images.extend(build_graph_images(&child.graph, dictionary, tables)?);
+		images.extend(build_graph_images(&child.graph, dictionary, tables, &[])?);
 	}
 	Ok(images)
 }
@@ -267,6 +277,8 @@ pub(super) fn encode_tables(
 		}
 		indexes.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 		encoded.push(TableCatalogEntry {
+			schema_id: table.id,
+			schema_version: table.version,
 			name: table.name.clone(),
 			graph_id,
 			kind: table.kind,
@@ -274,16 +286,86 @@ pub(super) fn encode_tables(
 				.fields
 				.iter()
 				.map(|field| TableFieldCatalogEntry {
+					schema_id: field.id,
+					schema_version: field.version,
 					name: field.name.clone(),
 					value_type: field.value_type.clone(),
 					property_key: field.property_key,
 				})
 				.collect(),
-			indexes,
+			indexes: indexes
+				.into_iter()
+				.map(|mut index| {
+					let definition = table
+						.indexes
+						.iter()
+						.find(|definition| definition.name == index.name)
+						.ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"physical scalar index has no schema definition",
+							)
+						})?;
+					index.schema_id = definition.id;
+					index.schema_version = definition.version;
+					Ok(index)
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?,
+			primary_index: SystemIndexCatalogEntry {
+				schema_id: table.primary_index.id,
+				schema_version: table.primary_index.version,
+			},
 		});
 	}
 	encoded.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 	Ok(encoded)
+}
+
+pub(super) fn encode_parameters(
+	parameters: &[LocalCommitParameter],
+	dictionary: &mut PropertyDictionary,
+) -> FerrosGrynnResult<Vec<ParameterCatalogEntry>> {
+	let mut encoded = Vec::with_capacity(parameters.len());
+	for parameter in parameters {
+		let mut context = EncodeContext::new(dictionary.clone());
+		let value = StorageValue::from_runtime(parameter.value.clone(), &mut context)?;
+		encoded.push(ParameterCatalogEntry {
+			schema_id: parameter.id,
+			schema_version: parameter.version,
+			name: parameter.name.clone(),
+			value: CanonicalCodec::encode(value.as_ref())?,
+			table_names: context.table_names().map(|name| name.as_str().to_owned()).collect(),
+			time_zones: context.time_zone_names().map(|name| name.as_str().to_owned()).collect(),
+		});
+		*dictionary = context.property_dictionary().clone();
+	}
+	encoded.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+	Ok(encoded)
+}
+
+fn decode_parameters(
+	parameters: &[ParameterCatalogEntry],
+	dictionary: &PropertyDictionary,
+) -> FerrosGrynnResult<Vec<LocalCommitParameter>> {
+	parameters
+		.iter()
+		.map(|parameter| {
+			let mut context = EncodeContext::new(dictionary.clone());
+			for table in &parameter.table_names {
+				context.register_table_name(table.clone().into())?;
+			}
+			for zone in &parameter.time_zones {
+				context.register_time_zone_name(zone.clone().into())?;
+			}
+			let value = CanonicalCodec::decode(&parameter.value, DecodeLimits::default())?
+				.into_runtime(&context.decoder())?;
+			Ok(LocalCommitParameter {
+				id: parameter.schema_id,
+				version: parameter.schema_version,
+				name: parameter.name.clone(),
+				value,
+			})
+		})
+		.collect()
 }
 
 pub(super) fn load_database(
@@ -300,21 +382,24 @@ pub(super) fn load_database(
 	);
 	for entry in database.graphs.iter().filter(|entry| entry.parent_graph_id.is_none()) {
 		let record_id: RecordId = entry.record_id.parse()?;
+		let graph = Arc::new(open_local_graph(
+			root,
+			manager,
+			transaction,
+			entry,
+			database,
+			files,
+			&database.tables,
+			record_id.clone(),
+			dictionary.clone(),
+			None,
+		)?);
 		graphs.push(LocalSnapshotGraph {
 			record_id: record_id.clone(),
 			name: entry.name.clone(),
-			graph: Arc::new(open_local_graph(
-				root,
-				manager,
-				transaction,
-				entry,
-				database,
-				files,
-				&database.tables,
-				record_id,
-				dictionary.clone(),
-				None,
-			)?),
+			schema: local_graph_schema(entry),
+			memberships: load_memberships(manager, transaction, &graph)?,
+			graph,
 		});
 	}
 	let graph_records = database
@@ -328,6 +413,8 @@ pub(super) fn load_database(
 			FerrosGrynnError::invalid_storage_file("table references an unknown graph identity")
 		})?;
 		tables.push(LocalCommitTable {
+			id: table.schema_id,
+			version: table.schema_version,
 			name: table.name.clone(),
 			graph: graph.parse()?,
 			kind: table.kind,
@@ -335,6 +422,8 @@ pub(super) fn load_database(
 				.fields
 				.iter()
 				.map(|field| LocalCommitTableField {
+					id: field.schema_id,
+					version: field.schema_version,
 					name: field.name.clone(),
 					value_type: field.value_type.clone(),
 					property_key: field.property_key,
@@ -344,18 +433,27 @@ pub(super) fn load_database(
 				.indexes
 				.iter()
 				.map(|index| LocalCommitTableIndex {
+					id: index.schema_id,
+					version: index.schema_version,
 					name: index.name.clone(),
 					kind: index.kind,
 					fields: index.fields.clone(),
 				})
 				.collect(),
+			primary_index: LocalCommitSystemIndex {
+				id: table.primary_index.schema_id,
+				version: table.primary_index.schema_version,
+			},
 		});
 	}
+	let parameters = decode_parameters(&database.parameters, &dictionary)?;
 	Ok(LocalDatabaseSnapshot {
 		commit_ts,
+		next_schema_id: database.next_schema_id,
 		property_dictionary: dictionary,
 		graphs,
 		tables,
+		parameters,
 	})
 }
 
@@ -379,24 +477,106 @@ pub(super) fn load_changed_graphs(
 		else {
 			continue;
 		};
+		let graph = Arc::new(open_local_graph(
+			root,
+			manager,
+			transaction,
+			entry,
+			database,
+			files,
+			&database.tables,
+			record_id.clone(),
+			property_dictionary.clone(),
+			Some(superblocks),
+		)?);
 		graphs.push(LocalSnapshotGraph {
 			record_id: record_id.clone(),
 			name: entry.name.clone(),
-			graph: Arc::new(open_local_graph(
-				root,
-				manager,
-				transaction,
-				entry,
-				database,
-				files,
-				&database.tables,
-				record_id.clone(),
-				property_dictionary.clone(),
-				Some(superblocks),
-			)?),
+			schema: local_graph_schema(entry),
+			memberships: load_memberships(manager, transaction, &graph)?,
+			graph,
 		});
 	}
 	Ok(graphs)
+}
+
+fn local_graph_schema(entry: &GraphCatalogEntry) -> LocalCommitGraphSchema {
+	LocalCommitGraphSchema {
+		id: entry.schema_id,
+		version: entry.schema_version,
+		label_index: LocalCommitSystemIndex {
+			id: entry.label_index.schema_id,
+			version: entry.label_index.schema_version,
+		},
+		adjacency_index: LocalCommitSystemIndex {
+			id: entry.adjacency_index.schema_id,
+			version: entry.adjacency_index.schema_version,
+		},
+	}
+}
+
+fn load_memberships(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	graph: &LocalGraph,
+) -> FerrosGrynnResult<Vec<LocalCommitTableMembership>> {
+	let mut memberships = Vec::new();
+	for (kind, page_count, file_kind) in [
+		(AtomKind::Node, graph.superblock.node_hot_pages, DataFileKind::NodesHot),
+		(AtomKind::Edge, graph.superblock.edge_hot_pages, DataFileKind::EdgesHot),
+	] {
+		for page_index in 0..page_count {
+			let page_no = PageNo::new(page_index);
+			let page = manager.read_page(transaction, graph.page_key(file_kind, page_no)?)?;
+			for within in 0..HOT_SLOTS_PER_PAGE {
+				let slot = page_index
+					.checked_mul(u64::try_from(HOT_SLOTS_PER_PAGE).map_err(|_error| {
+						FerrosGrynnError::invalid_storage_file("hot slots per page exceed u64")
+					})?)
+					.and_then(|slot| slot.checked_add(within as u64))
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("hot slot address overflows")
+					})?;
+				let capacity = match kind {
+					AtomKind::Node => graph.superblock.node_capacity,
+					AtomKind::Edge => graph.superblock.edge_capacity,
+				};
+				if slot >= capacity {
+					break;
+				}
+				let (generation, tombstone, table_id) = match kind {
+					AtomKind::Node => {
+						let value = read_node_hot_slot(page.as_page(), page_no, within)?;
+						(
+							value.generation,
+							value.flags.contains(NodeSlotFlags::TOMBSTONE),
+							value.table_id,
+						)
+					}
+					AtomKind::Edge => {
+						let value = read_edge_hot_slot(page.as_page(), page_no, within)?;
+						(
+							value.generation,
+							value.flags.contains(EdgeSlotFlags::TOMBSTONE),
+							value.table_id,
+						)
+					}
+				};
+				if !tombstone && let Some(table_id) = table_id {
+					if table_id == 0 {
+						return Err(FerrosGrynnError::invalid_storage_file(
+							"live atom contains reserved table schema identity zero",
+						));
+					}
+					memberships.push(LocalCommitTableMembership {
+						id: AtomId::from_parts(kind, slot, generation)?,
+						table_id: Some(table_id),
+					});
+				}
+			}
+		}
+	}
+	Ok(memberships)
 }
 
 #[allow(
@@ -507,6 +687,7 @@ pub(super) fn open_local_graph(
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			scalar_indexes.entry(table.name.clone()).or_default().push(LocalScalarIndex {
+				table_id: table.schema_id,
 				name: index.name.clone(),
 				kind: index.kind,
 				fields,
@@ -730,6 +911,8 @@ pub(super) fn write_new_graph_generation(
 		indexes.push(BuiltTableIndexBinding {
 			table: index.table,
 			index: TableIndexCatalogEntry {
+				schema_id: index.schema_id,
+				schema_version: index.schema_version,
 				name: index.name,
 				kind: index.kind,
 				fields: index.fields,

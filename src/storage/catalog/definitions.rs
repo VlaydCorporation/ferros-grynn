@@ -110,6 +110,14 @@ impl SchemaTypeTag {
 pub(in crate::storage) struct GraphCatalogEntry {
 	/// Storage address-space identity.
 	pub(in crate::storage) graph_id: GraphId,
+	/// Stable schema identity for a named root; zero for nested address spaces.
+	pub(in crate::storage) schema_id: u32,
+	/// Semantic graph-definition version; zero for nested address spaces.
+	pub(in crate::storage) schema_version: u32,
+	/// Engine-owned label-index definition for a named root.
+	pub(in crate::storage) label_index: SystemIndexCatalogEntry,
+	/// Engine-owned adjacency-index definition for a named root.
+	pub(in crate::storage) adjacency_index: SystemIndexCatalogEntry,
 	/// Owning graph for an internal nested graph; absent for named roots.
 	pub(in crate::storage) parent_graph_id: Option<GraphId>,
 	/// Root-arena subgraph slot used by hot pages and qualified endpoints.
@@ -136,9 +144,23 @@ pub(in crate::storage) struct GraphCatalogEntry {
 	pub(in crate::storage) properties: Option<PropertyLocation>,
 }
 
+/// Durable identity and version of one engine-owned index capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage) struct SystemIndexCatalogEntry {
+	/// Stable schema identity; zero only for an internal nested address space.
+	pub(in crate::storage) schema_id: u32,
+	/// Semantic definition version; zero only for an internal nested address
+	/// space.
+	pub(in crate::storage) schema_version: u32,
+}
+
 /// One durable table field using the database property-key namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct TableFieldCatalogEntry {
+	/// Stable field-definition identity.
+	pub(in crate::storage) schema_id: u32,
+	/// Semantic field-definition version.
+	pub(in crate::storage) schema_version: u32,
 	/// User-visible field name.
 	pub(in crate::storage) name: String,
 	/// Runtime type contract.
@@ -150,6 +172,10 @@ pub(in crate::storage) struct TableFieldCatalogEntry {
 /// One durable scalar B+tree definition and physical root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct TableIndexCatalogEntry {
+	/// Stable index-definition identity.
+	pub(in crate::storage) schema_id: u32,
+	/// Semantic index-definition version.
+	pub(in crate::storage) schema_version: u32,
 	/// Table-local index name.
 	pub(in crate::storage) name: String,
 	/// Standard or unique leaf contract.
@@ -165,6 +191,10 @@ pub(in crate::storage) struct TableIndexCatalogEntry {
 /// One durable table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct TableCatalogEntry {
+	/// Stable table-definition identity.
+	pub(in crate::storage) schema_id: u32,
+	/// Semantic table-definition version.
+	pub(in crate::storage) schema_version: u32,
 	/// Unique database table name.
 	pub(in crate::storage) name: String,
 	/// Owning durable graph identity.
@@ -175,6 +205,25 @@ pub(in crate::storage) struct TableCatalogEntry {
 	pub(in crate::storage) fields: Vec<TableFieldCatalogEntry>,
 	/// Scalar B+trees in strict name order.
 	pub(in crate::storage) indexes: Vec<TableIndexCatalogEntry>,
+	/// Engine-owned primary-index definition.
+	pub(in crate::storage) primary_index: SystemIndexCatalogEntry,
+}
+
+/// One canonical global-parameter definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::storage) struct ParameterCatalogEntry {
+	/// Stable parameter-definition identity.
+	pub(in crate::storage) schema_id: u32,
+	/// Semantic parameter-definition version.
+	pub(in crate::storage) schema_version: u32,
+	/// Parameter name without the query-language `$` prefix.
+	pub(in crate::storage) name: String,
+	/// Canonical `StorageValue` bytes.
+	pub(in crate::storage) value: Vec<u8>,
+	/// RecordId table dictionary used by the canonical value.
+	pub(in crate::storage) table_names: Vec<String>,
+	/// IANA time-zone dictionary used by the canonical value.
+	pub(in crate::storage) time_zones: Vec<String>,
 }
 
 /// Durable graph catalog owned by the system file.
@@ -182,12 +231,16 @@ pub(in crate::storage) struct TableCatalogEntry {
 pub(in crate::storage) struct DatabaseCatalog {
 	/// First never-assigned graph identity.
 	pub(in crate::storage) next_graph_id: u64,
+	/// First never-assigned schema identity.
+	pub(in crate::storage) next_schema_id: u64,
 	/// Entries in strictly increasing graph-id order.
 	pub(in crate::storage) graphs: Vec<GraphCatalogEntry>,
 	/// Database-wide property names in dense identifier order.
 	pub(in crate::storage) property_keys: Vec<String>,
 	/// Tables in strict name order.
 	pub(in crate::storage) tables: Vec<TableCatalogEntry>,
+	/// Global parameters in strict name order.
+	pub(in crate::storage) parameters: Vec<ParameterCatalogEntry>,
 }
 
 impl DatabaseCatalog {
@@ -195,9 +248,11 @@ impl DatabaseCatalog {
 	pub(in crate::storage) const fn empty() -> Self {
 		Self {
 			next_graph_id: 1,
+			next_schema_id: 1,
 			graphs: Vec::new(),
 			property_keys: Vec::new(),
 			tables: Vec::new(),
+			parameters: Vec::new(),
 		}
 	}
 
@@ -213,15 +268,19 @@ impl DatabaseCatalog {
 		let table_count = u32::try_from(self.tables.len()).map_err(|_error| {
 			invalid_catalog("database catalog contains more than u32::MAX tables")
 		})?;
+		let parameter_count = u32::try_from(self.parameters.len()).map_err(|_error| {
+			invalid_catalog("database catalog contains more than u32::MAX parameters")
+		})?;
 		let mut output = Vec::new();
 		output.extend_from_slice(&DATABASE_CATALOG_MAGIC);
-		output.extend_from_slice(&CATALOG_PAYLOAD_VERSION.to_le_bytes());
+		output.extend_from_slice(&DATABASE_CATALOG_PAYLOAD_VERSION.to_le_bytes());
 		output.extend_from_slice(&0_u16.to_le_bytes());
 		output.extend_from_slice(&self.next_graph_id.to_le_bytes());
+		output.extend_from_slice(&self.next_schema_id.to_le_bytes());
 		output.extend_from_slice(&graph_count.to_le_bytes());
 		output.extend_from_slice(&property_count.to_le_bytes());
 		output.extend_from_slice(&table_count.to_le_bytes());
-		output.extend_from_slice(&0_u32.to_le_bytes());
+		output.extend_from_slice(&parameter_count.to_le_bytes());
 		for property in &self.property_keys {
 			write_catalog_string(&mut output, property, "property name")?;
 		}
@@ -231,6 +290,12 @@ impl DatabaseCatalog {
 			let name_len = u16::try_from(graph.name.len())
 				.map_err(|_error| invalid_catalog("graph name exceeds u16"))?;
 			output.extend_from_slice(&graph.graph_id.get().to_le_bytes());
+			output.extend_from_slice(&graph.schema_id.to_le_bytes());
+			output.extend_from_slice(&graph.schema_version.to_le_bytes());
+			output.extend_from_slice(&graph.label_index.schema_id.to_le_bytes());
+			output.extend_from_slice(&graph.label_index.schema_version.to_le_bytes());
+			output.extend_from_slice(&graph.adjacency_index.schema_id.to_le_bytes());
+			output.extend_from_slice(&graph.adjacency_index.schema_version.to_le_bytes());
 			output.push(graph_kind_byte(graph.kind));
 			output.extend_from_slice(&[0_u8; 7]);
 			output.extend_from_slice(
@@ -253,9 +318,13 @@ impl DatabaseCatalog {
 		}
 		for table in &self.tables {
 			write_catalog_string(&mut output, &table.name, "table name")?;
+			output.extend_from_slice(&table.schema_id.to_le_bytes());
+			output.extend_from_slice(&table.schema_version.to_le_bytes());
 			output.extend_from_slice(&table.graph_id.get().to_le_bytes());
 			output.push(table_kind_byte(table.kind));
 			output.extend_from_slice(&[0_u8; 3]);
+			output.extend_from_slice(&table.primary_index.schema_id.to_le_bytes());
+			output.extend_from_slice(&table.primary_index.schema_version.to_le_bytes());
 			output.extend_from_slice(
 				&u32::try_from(table.fields.len())
 					.map_err(|_error| invalid_catalog("table field count exceeds u32"))?
@@ -269,11 +338,15 @@ impl DatabaseCatalog {
 			output.extend_from_slice(&0_u32.to_le_bytes());
 			for field in &table.fields {
 				write_catalog_string(&mut output, &field.name, "field name")?;
+				output.extend_from_slice(&field.schema_id.to_le_bytes());
+				output.extend_from_slice(&field.schema_version.to_le_bytes());
 				output.extend_from_slice(&field.property_key.to_le_bytes());
 				encode_type(&mut output, &field.value_type, 0)?;
 			}
 			for index in &table.indexes {
 				write_catalog_string(&mut output, &index.name, "index name")?;
+				output.extend_from_slice(&index.schema_id.to_le_bytes());
+				output.extend_from_slice(&index.schema_version.to_le_bytes());
 				output.push(table_index_kind_byte(index.kind));
 				output.extend_from_slice(&[0_u8; 3]);
 				output.extend_from_slice(
@@ -288,6 +361,36 @@ impl DatabaseCatalog {
 				}
 			}
 		}
+		for parameter in &self.parameters {
+			write_catalog_string(&mut output, &parameter.name, "parameter name")?;
+			output.extend_from_slice(&parameter.schema_id.to_le_bytes());
+			output.extend_from_slice(&parameter.schema_version.to_le_bytes());
+			output.extend_from_slice(
+				&u32::try_from(parameter.value.len())
+					.map_err(|_error| invalid_catalog("parameter value exceeds u32"))?
+					.to_le_bytes(),
+			);
+			output.extend_from_slice(
+				&u32::try_from(parameter.table_names.len())
+					.map_err(|_error| invalid_catalog("parameter table dictionary exceeds u32"))?
+					.to_le_bytes(),
+			);
+			output.extend_from_slice(
+				&u32::try_from(parameter.time_zones.len())
+					.map_err(|_error| {
+						invalid_catalog("parameter time-zone dictionary exceeds u32")
+					})?
+					.to_le_bytes(),
+			);
+			output.extend_from_slice(&0_u32.to_le_bytes());
+			for table in &parameter.table_names {
+				write_catalog_string(&mut output, table, "parameter table name")?;
+			}
+			for zone in &parameter.time_zones {
+				write_catalog_string(&mut output, zone, "parameter time-zone name")?;
+			}
+			output.extend_from_slice(&parameter.value);
+		}
 		validate_catalog_size(output.len())?;
 		Ok(output)
 	}
@@ -296,12 +399,13 @@ impl DatabaseCatalog {
 	fn decode(bytes: &[u8]) -> FerrosGrynnResult<Self> {
 		let mut decoder = CatalogDecoder::new(bytes);
 		decoder.expect_magic(DATABASE_CATALOG_MAGIC, "database catalog")?;
-		decoder.expect_version()?;
+		decoder.expect_version(DATABASE_CATALOG_PAYLOAD_VERSION)?;
 		let next_graph_id = decoder.read_u64()?;
+		let next_schema_id = decoder.read_u64()?;
 		let graph_count = decoder.read_u32()?;
 		let property_count = decoder.read_u32()?;
 		let table_count = decoder.read_u32()?;
-		decoder.expect_zero(size_of::<u32>(), "database catalog reserved bytes")?;
+		let parameter_count = decoder.read_u32()?;
 		let property_count = usize::try_from(property_count)
 			.map_err(|_error| invalid_catalog("property count does not fit usize"))?;
 		let mut property_keys = Vec::with_capacity(property_count);
@@ -320,6 +424,16 @@ impl DatabaseCatalog {
 		let mut graphs = Vec::with_capacity(count);
 		for _ in 0..count {
 			let graph_id = GraphId::new(decoder.read_u64()?);
+			let schema_id = decoder.read_u32()?;
+			let schema_version = decoder.read_u32()?;
+			let label_index = SystemIndexCatalogEntry {
+				schema_id: decoder.read_u32()?,
+				schema_version: decoder.read_u32()?,
+			};
+			let adjacency_index = SystemIndexCatalogEntry {
+				schema_id: decoder.read_u32()?,
+				schema_version: decoder.read_u32()?,
+			};
 			let kind = decode_graph_kind(decoder.read_u8()?)?;
 			decoder.expect_zero(7, "graph catalog entry padding")?;
 			let raw_parent = GraphId::new(decoder.read_u64()?);
@@ -357,6 +471,10 @@ impl DatabaseCatalog {
 			let name = decoder.read_utf8(name_len, "graph name")?.to_owned();
 			graphs.push(GraphCatalogEntry {
 				graph_id,
+				schema_id,
+				schema_version,
+				label_index,
+				adjacency_index,
 				parent_graph_id,
 				subgraph_slot,
 				parent_atom,
@@ -376,9 +494,15 @@ impl DatabaseCatalog {
 		let mut tables = Vec::with_capacity(table_count);
 		for _ in 0..table_count {
 			let name = read_catalog_string(&mut decoder, "table name")?;
+			let schema_id = decoder.read_u32()?;
+			let schema_version = decoder.read_u32()?;
 			let graph_id = GraphId::new(decoder.read_u64()?);
 			let kind = decode_table_kind(decoder.read_u8()?)?;
 			decoder.expect_zero(3, "table catalog padding")?;
+			let primary_index = SystemIndexCatalogEntry {
+				schema_id: decoder.read_u32()?,
+				schema_version: decoder.read_u32()?,
+			};
 			let field_count = usize::try_from(decoder.read_u32()?)
 				.map_err(|_error| invalid_catalog("field count does not fit usize"))?;
 			let index_count = usize::try_from(decoder.read_u32()?)
@@ -391,6 +515,8 @@ impl DatabaseCatalog {
 			for _ in 0..field_count {
 				fields.push(TableFieldCatalogEntry {
 					name: read_catalog_string(&mut decoder, "field name")?,
+					schema_id: decoder.read_u32()?,
+					schema_version: decoder.read_u32()?,
 					property_key: decoder.read_u32()?,
 					value_type: decode_type(&mut decoder, 0)?,
 				});
@@ -401,6 +527,8 @@ impl DatabaseCatalog {
 			let mut indexes = Vec::with_capacity(index_count);
 			for _ in 0..index_count {
 				let name = read_catalog_string(&mut decoder, "index name")?;
+				let schema_id = decoder.read_u32()?;
+				let schema_version = decoder.read_u32()?;
 				let kind = decode_table_index_kind(decoder.read_u8()?)?;
 				decoder.expect_zero(3, "table index padding")?;
 				let field_count = usize::try_from(decoder.read_u32()?)
@@ -417,6 +545,8 @@ impl DatabaseCatalog {
 				}
 				indexes.push(TableIndexCatalogEntry {
 					name,
+					schema_id,
+					schema_version,
 					kind,
 					fields: index_fields,
 					file_id,
@@ -425,18 +555,57 @@ impl DatabaseCatalog {
 			}
 			tables.push(TableCatalogEntry {
 				name,
+				schema_id,
+				schema_version,
 				graph_id,
 				kind,
 				fields,
 				indexes,
+				primary_index,
+			});
+		}
+		let parameter_count = usize::try_from(parameter_count)
+			.map_err(|_error| invalid_catalog("parameter count does not fit usize"))?;
+		let mut parameters = Vec::with_capacity(parameter_count);
+		for _ in 0..parameter_count {
+			let name = read_catalog_string(&mut decoder, "parameter name")?;
+			let schema_id = decoder.read_u32()?;
+			let schema_version = decoder.read_u32()?;
+			let value_len = usize::try_from(decoder.read_u32()?)
+				.map_err(|_error| invalid_catalog("parameter value length does not fit usize"))?;
+			let table_count = usize::try_from(decoder.read_u32()?)
+				.map_err(|_error| invalid_catalog("parameter table count does not fit usize"))?;
+			let zone_count = usize::try_from(decoder.read_u32()?)
+				.map_err(|_error| invalid_catalog("parameter zone count does not fit usize"))?;
+			decoder.expect_zero(size_of::<u32>(), "parameter reserved bytes")?;
+			if table_count > MAX_TYPE_MEMBERS || zone_count > MAX_TYPE_MEMBERS {
+				return Err(invalid_catalog("parameter dictionary exceeds its format limit"));
+			}
+			let mut table_names = Vec::with_capacity(table_count);
+			for _ in 0..table_count {
+				table_names.push(read_catalog_string(&mut decoder, "parameter table name")?);
+			}
+			let mut time_zones = Vec::with_capacity(zone_count);
+			for _ in 0..zone_count {
+				time_zones.push(read_catalog_string(&mut decoder, "parameter time-zone name")?);
+			}
+			parameters.push(ParameterCatalogEntry {
+				schema_id,
+				schema_version,
+				name,
+				value: decoder.read_exact(value_len)?.to_vec(),
+				table_names,
+				time_zones,
 			});
 		}
 		decoder.finish()?;
 		let catalog = Self {
 			next_graph_id,
+			next_schema_id,
 			graphs,
 			property_keys,
 			tables,
+			parameters,
 		};
 		validate_graph_catalog(&catalog)?;
 		Ok(catalog)
@@ -525,7 +694,7 @@ impl FileCatalog {
 			.map_err(|_error| invalid_catalog("file catalog contains more than u32::MAX files"))?;
 		let mut output = Vec::new();
 		output.extend_from_slice(&FILE_CATALOG_MAGIC);
-		output.extend_from_slice(&CATALOG_PAYLOAD_VERSION.to_le_bytes());
+		output.extend_from_slice(&FILE_CATALOG_PAYLOAD_VERSION.to_le_bytes());
 		output.extend_from_slice(&0_u16.to_le_bytes());
 		output.extend_from_slice(&count.to_le_bytes());
 		output.extend_from_slice(&0_u32.to_le_bytes());
@@ -549,7 +718,7 @@ impl FileCatalog {
 	fn decode(bytes: &[u8]) -> FerrosGrynnResult<Self> {
 		let mut decoder = CatalogDecoder::new(bytes);
 		decoder.expect_magic(FILE_CATALOG_MAGIC, "file catalog")?;
-		decoder.expect_version()?;
+		decoder.expect_version(FILE_CATALOG_PAYLOAD_VERSION)?;
 		let count = decoder.read_u32()?;
 		decoder.expect_zero(size_of::<u32>(), "file catalog reserved bytes")?;
 		let next_file_instance_id = decoder.read_u64()?;

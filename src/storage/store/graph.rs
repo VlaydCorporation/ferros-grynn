@@ -9,7 +9,7 @@ pub(super) struct PropertyStoreBuilder {
 	next_page: u64,
 	current: Option<PropertyPageBuilder>,
 	current_page: Option<PageNo>,
-	pages: Vec<(PageNo, AlignedPage)>,
+	pages: Vec<(PageNo, Box<AlignedPage>)>,
 }
 
 impl PropertyStoreBuilder {
@@ -51,7 +51,7 @@ impl PropertyStoreBuilder {
 					.ok_or_else(|| {
 						FerrosGrynnError::invalid_storage_file("property page number overflows")
 					})?;
-				self.pages.push((page_no, page));
+				self.pages.push((page_no, Box::new(page)));
 			}
 			return Ok(PropertyLocation::Large {
 				first_page,
@@ -116,7 +116,7 @@ impl PropertyStoreBuilder {
 		Ok(())
 	}
 
-	fn finish_numbered(mut self) -> FerrosGrynnResult<Vec<(PageNo, AlignedPage)>> {
+	fn finish_numbered(mut self) -> FerrosGrynnResult<Vec<(PageNo, Box<AlignedPage>)>> {
 		self.finish_current()?;
 		self.pages.sort_unstable_by_key(|(page_no, _page)| *page_no);
 		Ok(self.pages)
@@ -134,7 +134,11 @@ impl PropertyStoreBuilder {
 				));
 			}
 		}
-		Ok(pages.into_iter().map(|(_page_no, page)| page).collect())
+		let mut output = Vec::with_capacity(pages.len());
+		for (_page_no, page) in pages {
+			output.push(*page);
+		}
+		Ok(output)
 	}
 }
 
@@ -284,12 +288,50 @@ pub(super) fn build_graph_image(
 	plan: &PlannedGraph,
 	dictionary: &mut PropertyDictionary,
 	tables: &[LocalCommitTable],
+	memberships: &[LocalCommitTableMembership],
 ) -> FerrosGrynnResult<BuiltGraphImage> {
 	let graph_id = plan.graph_id;
 	let record_id = &plan.record_id;
 	let graph = &plan.graph;
 	let node_ids = GraphRead::node_ids(graph)?.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let edge_ids = GraphRead::edge_ids(graph)?.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let live_atoms = node_ids.iter().chain(&edge_ids).copied().collect::<BTreeSet<_>>();
+	let mut table_memberships = BTreeMap::new();
+	for membership in memberships {
+		let table_id = membership.table_id.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"complete graph membership contains an explicit empty assignment",
+			)
+		})?;
+		if !live_atoms.contains(&membership.id) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"table membership references an atom absent from the graph",
+			));
+		}
+		let table = tables
+			.iter()
+			.find(|table| table.id == table_id && table.graph == *record_id)
+			.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"table membership references an absent or foreign table",
+			)
+		})?;
+		if !table_kind_accepts(
+			table.kind,
+			membership.id.kind().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("table membership has an invalid atom kind")
+			})?,
+		) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"table membership atom kind disagrees with its table",
+			));
+		}
+		if table_memberships.insert(membership.id, table_id).is_some() {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"complete graph membership contains a duplicate atom",
+			));
+		}
+	}
 	let mut disk_refs = BTreeMap::new();
 	let mut context = EncodeContext::new(dictionary.clone());
 	let mut table_names = BTreeSet::new();
@@ -371,19 +413,17 @@ pub(super) fn build_graph_image(
 		);
 	}
 	let property_pages = properties.finish()?;
-	let indexes = build_scalar_indexes(record_id, graph, tables, &disk_refs, &mut context)?;
+	let indexes = build_scalar_indexes(
+		record_id,
+		graph,
+		tables,
+		&table_memberships,
+		&disk_refs,
+		&mut context,
+	)?;
 
 	let node_label_ids = dense_ids(node_labels)?;
 	let edge_label_ids = dense_ids(edge_labels)?;
-	let table_ids = context
-		.table_names()
-		.enumerate()
-		.map(|(id, name)| {
-			u32::try_from(id)
-				.map(|id| (name.as_str().to_owned(), id))
-				.map_err(|_error| FerrosGrynnError::invalid_storage_file("table id exceeds u32"))
-		})
-		.collect::<FerrosGrynnResult<BTreeMap<_, _>>>()?;
 	let labels = LabelDictionary {
 		node_labels: node_label_ids.keys().cloned().collect(),
 		edge_labels: edge_label_ids.keys().cloned().collect(),
@@ -476,9 +516,7 @@ pub(super) fn build_graph_image(
 					})
 				})
 				.transpose()?,
-			table_id: Some(table_ids.get(node.record_id().table()).copied().ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file("node table was not interned")
-			})?),
+			table_id: table_memberships.get(id).copied(),
 			out_count: checked_u32(adjacency.outgoing.len(), "outgoing adjacency")?,
 			in_count: checked_u32(adjacency.incoming.len(), "incoming adjacency")?,
 			undirected_count: checked_u32(adjacency.undirected.len(), "undirected adjacency")?,
@@ -562,9 +600,7 @@ pub(super) fn build_graph_image(
 					})
 				})
 				.transpose()?,
-			table_id: Some(table_ids.get(edge.record_id().table()).copied().ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file("edge table was not interned")
-			})?),
+			table_id: table_memberships.get(id).copied(),
 			weight,
 			transition_graph,
 			source_graph: source.graph_slot,
@@ -591,7 +627,8 @@ pub(super) fn build_graph_image(
 	}
 
 	let statistics = graph_statistics(&node_adjacency, edge_ids.len())?;
-	let statistic_pages = vec![encode_graph_statistics(statistics, PageLsn::ZERO)?];
+	let mut statistic_pages = Vec::with_capacity(1);
+	statistic_pages.push(*encode_graph_statistics(statistics, PageLsn::ZERO)?);
 	let subgraph_entries = plan
 		.children
 		.iter()
@@ -673,9 +710,20 @@ pub(super) fn build_graph_image(
 	payloads.insert(DataFileKind::Index, primary.pages);
 
 	let identity = graph.identity();
+	let schema = plan.schema;
 	Ok(BuiltGraphImage {
 		catalog_entry: GraphCatalogEntry {
 			graph_id,
+			schema_id: schema.map_or(0, |schema| schema.id),
+			schema_version: schema.map_or(0, |schema| schema.version),
+			label_index: SystemIndexCatalogEntry {
+				schema_id: schema.map_or(0, |schema| schema.label_index.id),
+				schema_version: schema.map_or(0, |schema| schema.label_index.version),
+			},
+			adjacency_index: SystemIndexCatalogEntry {
+				schema_id: schema.map_or(0, |schema| schema.adjacency_index.id),
+				schema_version: schema.map_or(0, |schema| schema.adjacency_index.version),
+			},
 			parent_graph_id: plan.parent_graph_id,
 			subgraph_slot: plan.subgraph_slot,
 			parent_atom: plan.parent_atom,
@@ -834,16 +882,6 @@ pub(super) fn build_node_append_delta(
 			})
 		})
 		.collect::<FerrosGrynnResult<BTreeMap<_, _>>>()?;
-	let table_ids = context
-		.table_names()
-		.enumerate()
-		.map(|(index, table)| {
-			u32::try_from(index)
-				.map(|index| (table.as_str().to_owned(), index))
-				.map_err(|_error| FerrosGrynnError::invalid_storage_file("table id exceeds u32"))
-		})
-		.collect::<FerrosGrynnResult<BTreeMap<_, _>>>()?;
-
 	let mut property_store = PropertyStoreBuilder::starting_at(base.superblock.properties_pages);
 	let mut node_pages = BTreeMap::<PageNo, Box<AlignedPage>>::new();
 	for node in nodes {
@@ -890,9 +928,7 @@ pub(super) fn build_node_append_delta(
 					})
 				})
 				.transpose()?,
-			table_id: Some(table_ids.get(node.record_id.table()).copied().ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file("node table was not interned")
-			})?),
+			table_id: node.table_id,
 			out_count: 0,
 			in_count: 0,
 			undirected_count: 0,
@@ -986,13 +1022,11 @@ pub(super) fn build_node_append_delta(
 	let mut payloads = BTreeMap::new();
 	payloads.insert(DataFileKind::NodesHot, node_pages.into_iter().collect());
 	if !property_pages.is_empty() {
-		payloads.insert(DataFileKind::Properties, box_numbered_pages(property_pages)?);
+		payloads.insert(DataFileKind::Properties, property_pages);
 	}
 	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
-	payloads.insert(DataFileKind::Statistics, vec![(
-		PageNo::new(0),
-		boxed_page(PageNo::new(0), &statistics)?,
-	)]);
+	statistics.validate(PageNo::new(0))?;
+	payloads.insert(DataFileKind::Statistics, vec![(PageNo::new(0), statistics)]);
 	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
 	Ok(BuiltGraphDelta {
 		catalog_entry,
@@ -1012,7 +1046,7 @@ pub(super) fn build_atom_delta(
 	delta: &LocalCommitAtomDelta,
 	dictionary: &mut PropertyDictionary,
 ) -> FerrosGrynnResult<BuiltGraphDelta> {
-	if delta.nodes.is_empty() && delta.edges.is_empty()
+	if delta.nodes.is_empty() && delta.edges.is_empty() && delta.memberships.is_empty()
 		|| current.parent_graph_id.is_some()
 		|| current.identity != *base.identity.as_inner().as_bytes()
 		|| current.revision != base.revision
@@ -1187,16 +1221,6 @@ pub(super) fn build_atom_delta(
 	}
 	let node_label_ids = indexed_strings(&labels.node_labels, "node label")?;
 	let edge_label_ids = indexed_strings(&labels.edge_labels, "edge label")?;
-	let table_ids = context
-		.table_names()
-		.enumerate()
-		.map(|(index, table)| {
-			u32::try_from(index)
-				.map(|index| (table.as_str().to_owned(), index))
-				.map_err(|_error| FerrosGrynnError::invalid_storage_file("table id exceeds u32"))
-		})
-		.collect::<FerrosGrynnResult<BTreeMap<_, _>>>()?;
-
 	let mut property_store = PropertyStoreBuilder::starting_at(base.superblock.properties_pages);
 	let mut node_properties = BTreeMap::new();
 	for change in &delta.nodes {
@@ -1287,7 +1311,7 @@ pub(super) fn build_atom_delta(
 				page.seal()?;
 			}
 			LocalCommitNodeChange::Upsert {
-				record_id,
+				record_id: _,
 				label,
 				..
 			} => {
@@ -1306,10 +1330,6 @@ pub(super) fn build_atom_delta(
 						})
 					})
 					.transpose()?;
-				next.table_id =
-					Some(table_ids.get(record_id.table()).copied().ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file("node table was not interned")
-					})?);
 				next.properties = node_properties.get(&id).copied().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file("node property location is absent")
 				})?;
@@ -1402,7 +1422,7 @@ pub(super) fn build_atom_delta(
 				page.seal()?;
 			}
 			LocalCommitEdgeChange::Upsert {
-				record_id,
+				record_id: _,
 				topology,
 				label,
 				weight,
@@ -1424,10 +1444,6 @@ pub(super) fn build_atom_delta(
 						})
 					})
 					.transpose()?;
-				next.table_id =
-					Some(table_ids.get(record_id.table()).copied().ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file("edge table was not interned")
-					})?);
 				next.properties = edge_properties.get(&id).copied().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file("edge property location is absent")
 				})?;
@@ -1471,6 +1487,77 @@ pub(super) fn build_atom_delta(
 				}
 				write_edge_hot_slot(page, within, &next)?;
 				page.seal()?;
+			}
+		}
+	}
+	let mut membership_atoms = BTreeSet::new();
+	for membership in &delta.memberships {
+		if !membership_atoms.insert(membership.id) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"atom delta contains duplicate table memberships",
+			));
+		}
+		if membership.table_id == Some(0) {
+			return Err(FerrosGrynnError::invalid_storage_file("schema identity zero is reserved"));
+		}
+		let kind = membership.id.kind().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("table membership has an invalid atom kind")
+		})?;
+		let (file, page_count) = match kind {
+			AtomKind::Node => (DataFileKind::NodesHot, base.superblock.node_hot_pages),
+			AtomKind::Edge => (DataFileKind::EdgesHot, base.superblock.edge_hot_pages),
+		};
+		let pages = match kind {
+			AtomKind::Node => &mut node_pages,
+			AtomKind::Edge => &mut edge_pages,
+		};
+		let (page_no, within) = hot_slot_address(membership.id.slot())?;
+		let page = match kind {
+			AtomKind::Node => delta_hot_page(
+				pages,
+				manager,
+				transaction,
+				base,
+				file,
+				page_no,
+				page_count,
+				new_node_hot_page,
+			)?,
+			AtomKind::Edge => delta_hot_page(
+				pages,
+				manager,
+				transaction,
+				base,
+				file,
+				page_no,
+				page_count,
+				new_edge_hot_page,
+			)?,
+		};
+		match kind {
+			AtomKind::Node => {
+				let mut slot = read_node_hot_slot(page, page_no, within)?;
+				if slot.flags.contains(NodeSlotFlags::TOMBSTONE)
+					|| slot.generation != membership.id.generation()
+				{
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"table membership targets a stale node",
+					));
+				}
+				slot.table_id = membership.table_id;
+				write_node_hot_slot(page, within, &slot)?;
+			}
+			AtomKind::Edge => {
+				let mut slot = read_edge_hot_slot(page, page_no, within)?;
+				if slot.flags.contains(EdgeSlotFlags::TOMBSTONE)
+					|| slot.generation != membership.id.generation()
+				{
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"table membership targets a stale edge",
+					));
+				}
+				slot.table_id = membership.table_id;
+				write_edge_hot_slot(page, within, &slot)?;
 			}
 		}
 	}
@@ -1566,7 +1653,7 @@ pub(super) fn build_atom_delta(
 		payloads.insert(DataFileKind::EdgesHot, edge_pages.into_iter().collect());
 	}
 	if !property_pages.is_empty() {
-		payloads.insert(DataFileKind::Properties, box_numbered_pages(property_pages)?);
+		payloads.insert(DataFileKind::Properties, property_pages);
 	}
 	if !overflow_pages.is_empty() {
 		payloads.insert(DataFileKind::AdjacencyOverflow, box_numbered_pages(overflow_pages)?);
@@ -1575,10 +1662,8 @@ pub(super) fn build_atom_delta(
 		payloads.insert(DataFileKind::Subgraphs, number_pages(pages)?);
 	}
 	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
-	payloads.insert(DataFileKind::Statistics, vec![(
-		PageNo::new(0),
-		boxed_page(PageNo::new(0), &statistics)?,
-	)]);
+	statistics.validate(PageNo::new(0))?;
+	payloads.insert(DataFileKind::Statistics, vec![(PageNo::new(0), statistics)]);
 	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
 	Ok(BuiltGraphDelta {
 		catalog_entry,
@@ -1856,7 +1941,7 @@ fn delta_graph_statistics(
 	delta: &LocalCommitAtomDelta,
 	node_count: u64,
 	edge_count: u64,
-) -> FerrosGrynnResult<AlignedPage> {
+) -> FerrosGrynnResult<Box<AlignedPage>> {
 	let page =
 		manager.read_page(transaction, base.page_key(DataFileKind::Statistics, PageNo::new(0))?)?;
 	let previous = decode_graph_statistics(page.as_page())?;
@@ -2002,6 +2087,7 @@ pub(super) fn build_scalar_indexes(
 	record_id: &RecordId,
 	graph: &Graph<Frozen>,
 	tables: &[LocalCommitTable],
+	memberships: &BTreeMap<AtomId, u32>,
 	disk_refs: &BTreeMap<AtomId, DiskAtomRef>,
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<Vec<BuiltScalarIndexImage>> {
@@ -2038,14 +2124,14 @@ pub(super) fn build_scalar_indexes(
 					}
 				};
 				for id in ids {
-					let (atom_record, properties) = match kind {
+					let properties = match kind {
 						AtomKind::Node => {
 							let node = graph.node(id).ok_or_else(|| {
 								FerrosGrynnError::invalid_storage_file(
 									"indexed node disappeared during graph encoding",
 								)
 							})?;
-							(node.record_id(), node.properties())
+							node.properties()
 						}
 						AtomKind::Edge => {
 							let edge = graph.edge(id).ok_or_else(|| {
@@ -2053,10 +2139,10 @@ pub(super) fn build_scalar_indexes(
 									"indexed edge disappeared during graph encoding",
 								)
 							})?;
-							(edge.record_id(), edge.properties())
+							edge.properties()
 						}
 					};
-					if atom_record.table() != table.name {
+					if memberships.get(&id).copied() != Some(table.id) {
 						continue;
 					}
 					let missing = Value::None;
@@ -2094,6 +2180,8 @@ pub(super) fn build_scalar_indexes(
 			built.push(BuiltScalarIndexImage {
 				table: table.name.clone(),
 				name: index.name.clone(),
+				schema_id: index.id,
+				schema_version: index.version,
 				kind: index.kind,
 				fields: index.fields.clone(),
 				root: tree.root,
@@ -2728,7 +2816,7 @@ pub(super) fn load_graph(
 		let record_id = records.get(&disk).cloned().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("live node is absent from the primary index")
 		})?;
-		validate_table_id(value.table_id, &record_id, &labels.table_names)?;
+		validate_table_id(value.table_id)?;
 		let id = AtomId::from_parts(AtomKind::Node, slot, value.generation)?;
 		live_atoms.insert(disk, id);
 		loaded_nodes.push(LoadedNodeSlot {
@@ -2777,7 +2865,7 @@ pub(super) fn load_graph(
 		let record_id = records.get(&disk).cloned().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("live edge is absent from the primary index")
 		})?;
-		validate_table_id(value.table_id, &record_id, &labels.table_names)?;
+		validate_table_id(value.table_id)?;
 		let id = AtomId::from_parts(AtomKind::Edge, slot, value.generation)?;
 		live_atoms.insert(disk, id);
 		loaded_edges.push(LoadedEdgeSlot {
@@ -2905,20 +2993,9 @@ pub(super) fn read_all_pages(file: &DirectFile) -> FerrosGrynnResult<Vec<Aligned
 	Ok(pages)
 }
 
-pub(super) fn validate_table_id(
-	table_id: Option<u32>,
-	record_id: &RecordId,
-	tables: &[String],
-) -> FerrosGrynnResult<()> {
-	let id = table_id.ok_or_else(|| {
-		FerrosGrynnError::invalid_storage_file("live atom has no table dictionary id")
-	})?;
-	let index = usize::try_from(id)
-		.map_err(|_error| FerrosGrynnError::invalid_storage_file("table id exceeds usize"))?;
-	if tables.get(index).map(String::as_str) != Some(record_id.table()) {
-		return Err(FerrosGrynnError::invalid_storage_file(
-			"atom table id disagrees with its primary RecordId",
-		));
+pub(super) fn validate_table_id(table_id: Option<u32>) -> FerrosGrynnResult<()> {
+	if table_id == Some(0) {
+		return Err(FerrosGrynnError::invalid_storage_file("schema identity zero is reserved"));
 	}
 	Ok(())
 }

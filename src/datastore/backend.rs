@@ -9,16 +9,21 @@ use parking_lot::{Mutex, RwLock};
 use super::{
 	options::{DatastoreOptions, InMemoryOptions, IoMode, LocalOptions},
 	root::{ActiveSnapshot, DatabaseRoot},
+	schema::{SchemaId, SystemIndexKind},
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
 		LocalCommitGraph,
 		LocalCommitGraphChange,
+		LocalCommitGraphSchema,
+		LocalCommitParameter,
 		LocalCommitResult,
+		LocalCommitSystemIndex,
 		LocalCommitTable,
 		LocalCommitTableField,
 		LocalCommitTableIndex,
+		LocalCommitTableMembership,
 		LocalStore,
 		PageIoMode,
 	},
@@ -29,6 +34,7 @@ pub(crate) struct StoreInner {
 	pub(crate) options: DatastoreOptions,
 	pub(crate) backend: StoreBackend,
 	pub(crate) next_transaction: AtomicU64,
+	pub(crate) next_schema_id: AtomicU64,
 	pub(crate) current: RwLock<Arc<DatabaseRoot>>,
 	pub(crate) commit: Mutex<()>,
 	pub(crate) active: Mutex<BTreeMap<u64, ActiveSnapshot>>,
@@ -52,6 +58,24 @@ impl StoreBackend {
 }
 
 impl StoreInner {
+	pub(crate) fn allocate_schema_id(&self) -> FerrosGrynnResult<SchemaId> {
+		let id = self
+			.next_schema_id
+			.fetch_update(
+				std::sync::atomic::Ordering::Relaxed,
+				std::sync::atomic::Ordering::Relaxed,
+				|current| (current != 0 && current < u64::from(u32::MAX)).then_some(current + 1),
+			)
+			.map_err(|_current| {
+				FerrosGrynnError::invalid_argument("schema identity clock is exhausted")
+			})?;
+		let id = u32::try_from(id).map_err(|_error| {
+			FerrosGrynnError::invalid_argument("schema identity clock is exhausted")
+		})?;
+		SchemaId::new(id)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("schema identity is reserved"))
+	}
+
 	/// Returns MVCC limits independent of the selected persistence backend.
 	pub(crate) const fn transaction_limits(&self) -> InMemoryOptions {
 		match self.options {
@@ -94,13 +118,49 @@ impl StoreInner {
 					"changed local graph has no materialized commit image or physical delta",
 				)
 			})?;
+			let schema = root.schema.graph(record_id).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"changed graph has no schema-catalog definition",
+				)
+			})?;
+			let system_index = |kind| {
+				schema.system_indexes().find(|index| index.kind() == kind).copied().ok_or_else(
+					|| FerrosGrynnError::invalid_storage_file("graph system index is absent"),
+				)
+			};
+			let label = system_index(SystemIndexKind::Label)?;
+			let adjacency = system_index(SystemIndexKind::Adjacency)?;
 			graphs.push(LocalCommitGraph {
 				record_id: record_id.clone(),
 				name: stored.name.clone(),
-				change: LocalCommitGraphChange::Materialized(graph),
+				schema: LocalCommitGraphSchema {
+					id: schema.id().get(),
+					version: schema.version().get(),
+					label_index: LocalCommitSystemIndex {
+						id: label.id().get(),
+						version: label.version().get(),
+					},
+					adjacency_index: LocalCommitSystemIndex {
+						id: adjacency.id().get(),
+						version: adjacency.version().get(),
+					},
+				},
+				change: LocalCommitGraphChange::Materialized {
+					graph,
+					memberships: root
+						.schema
+						.memberships(record_id)
+						.assigned()
+						.map(|(id, table)| LocalCommitTableMembership {
+							id,
+							table_id: Some(table.get()),
+						})
+						.collect(),
+				},
 			});
 		}
 		let tables = root
+			.schema
 			.tables
 			.values()
 			.map(|schema| {
@@ -109,6 +169,15 @@ impl StoreInner {
 					.iter()
 					.map(|field| {
 						Ok(LocalCommitTableField {
+							id: field
+								.id
+								.ok_or_else(|| {
+									FerrosGrynnError::invalid_storage_file(
+										"published table field has no schema identity",
+									)
+								})?
+								.get(),
+							version: field.version.get(),
 							name: field.name.as_str().to_owned(),
 							value_type: field.value_type.clone(),
 							property_key: field
@@ -122,7 +191,21 @@ impl StoreInner {
 						})
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				let primary = schema.primary_index.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"published table has no primary system index",
+					)
+				})?;
 				Ok(LocalCommitTable {
+					id: schema
+						.id
+						.ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"published table has no schema identity",
+							)
+						})?
+						.get(),
+					version: schema.version.get(),
 					name: schema.name.as_str().to_owned(),
 					graph: schema.graph.id().clone(),
 					kind: schema.kind,
@@ -149,17 +232,58 @@ impl StoreInner {
 								})
 								.collect::<FerrosGrynnResult<Vec<_>>>()?;
 							Ok(LocalCommitTableIndex {
+								id: index
+									.id
+									.ok_or_else(|| {
+										FerrosGrynnError::invalid_storage_file(
+											"published table index has no schema identity",
+										)
+									})?
+									.get(),
+								version: index.version.get(),
 								name: index.name.as_str().to_owned(),
 								kind: index.kind,
 								fields,
 							})
 						})
 						.collect::<FerrosGrynnResult<Vec<_>>>()?,
+					primary_index: LocalCommitSystemIndex {
+						id: primary.id().get(),
+						version: primary.version().get(),
+					},
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let parameters = root
+			.schema
+			.parameters
+			.values()
+			.map(|parameter| {
+				Ok(LocalCommitParameter {
+					id: parameter
+						.id
+						.ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"published parameter has no schema identity",
+							)
+						})?
+						.get(),
+					version: parameter.version.get(),
+					name: parameter.name.as_str().to_owned(),
+					value: parameter.value.clone(),
 				})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		local
-			.commit(expected_commit_ts, &root.dictionary, &graphs, &tables, changed_graphs)
+			.commit(
+				expected_commit_ts,
+				root.schema.next_id,
+				&root.dictionary,
+				&graphs,
+				&tables,
+				&parameters,
+				changed_graphs,
+			)
 			.map(Some)
 	}
 }

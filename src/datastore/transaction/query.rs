@@ -32,16 +32,22 @@ enum QueryStorageSource<'store> {
 struct MaterializedTableCursor {
 	graph: Arc<MaterializedGraph>,
 	schema: Arc<TableSchema>,
+	memberships: AtomTableMemberships,
 	kind_index: usize,
 	next_slot: usize,
 }
 
 impl MaterializedTableCursor {
 	/// Creates a cursor positioned before the first permitted atom kind.
-	const fn new(graph: Arc<MaterializedGraph>, schema: Arc<TableSchema>) -> Self {
+	const fn new(
+		graph: Arc<MaterializedGraph>,
+		schema: Arc<TableSchema>,
+		memberships: AtomTableMemberships,
+	) -> Self {
 		Self {
 			graph,
 			schema,
+			memberships,
 			kind_index: 0,
 			next_slot: 0,
 		}
@@ -77,7 +83,9 @@ impl MaterializedTableCursor {
 					))
 				})?;
 				let atom = AtomId::from_parts(kind, slot, generation)?;
-				if let Some(row) = materialize_atom(&self.graph, &self.schema, atom) {
+				if let Some(row) =
+					materialize_atom(&self.graph, &self.schema, &self.memberships, atom)
+				{
 					return Ok(Some(row));
 				}
 			}
@@ -174,9 +182,8 @@ impl Transaction {
 			Some(None) => Err(FerrosGrynnError::table_does_not_exist(name)),
 			None => snapshot
 				.root
-				.tables
-				.get(name)
-				.cloned()
+				.schema
+				.table(name)
 				.ok_or_else(|| FerrosGrynnError::table_does_not_exist(name)),
 		}
 	}
@@ -205,6 +212,7 @@ impl Transaction {
 		}
 		let record_id = snapshot
 			.root
+			.schema
 			.graph_names
 			.get(name)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
@@ -250,10 +258,12 @@ impl Transaction {
 		self.record_read(&snapshot.root, ReadKey::GraphCatalog(schema.graph.id().clone()));
 		if let Some(write) = self.graphs.get(schema.graph.id()) {
 			let graph = write.snapshot(&self.store)?;
+			let memberships = self.query_memberships(&snapshot.root, schema.graph.id())?;
 			return Ok(QueryStorageCursor {
 				source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
 					Arc::new(graph),
 					schema,
+					memberships,
 				)),
 			});
 		}
@@ -262,12 +272,16 @@ impl Transaction {
 				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
 			})?;
 		match &stored.graph {
-			StoredGraphValue::Materialized(graph) => Ok(QueryStorageCursor {
-				source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
-					graph.clone(),
-					schema,
-				)),
-			}),
+			StoredGraphValue::Materialized(graph) => {
+				let memberships = self.query_memberships(&snapshot.root, schema.graph.id())?;
+				Ok(QueryStorageCursor {
+					source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
+						graph.clone(),
+						schema,
+						memberships,
+					)),
+				})
+			}
 			StoredGraphValue::Local(graph) => {
 				let local = self.store.inner.backend.local().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
@@ -288,7 +302,7 @@ impl Transaction {
 							local,
 							transaction,
 							graph.clone(),
-							schema.name.as_str().to_owned(),
+							schema_id(&schema)?,
 							schema.kind,
 						)?,
 						schema,
@@ -320,18 +334,22 @@ impl Transaction {
 				} else {
 					graph.atom_id(&AtomRef::new(AtomKind::Edge, record.clone()))?
 				};
-			return Ok(atom.and_then(|atom| materialize_atom(&graph, &schema, atom)));
+			let memberships = self.query_memberships(&snapshot.root, schema.graph.id())?;
+			return Ok(atom.and_then(|atom| materialize_atom(&graph, &schema, &memberships, atom)));
 		}
 		let stored =
 			snapshot.root.graphs.get(schema.graph.id()).ok_or_else(|| {
 				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
 			})?;
 		match &stored.graph {
-			StoredGraphValue::Materialized(graph) => Ok(stored
-				.record_index
-				.get(&record.to_string())
-				.copied()
-				.and_then(|atom| materialize_atom(graph, &schema, atom))),
+			StoredGraphValue::Materialized(graph) => {
+				let memberships = self.query_memberships(&snapshot.root, schema.graph.id())?;
+				Ok(stored
+					.record_index
+					.get(&record.to_string())
+					.copied()
+					.and_then(|atom| materialize_atom(graph, &schema, &memberships, atom)))
+			}
 			StoredGraphValue::Local(graph) => {
 				let local = self.store.inner.backend.local().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
@@ -339,11 +357,32 @@ impl Transaction {
 					)
 				})?;
 				let transaction = self.local_snapshot()?;
-				Ok(local.lookup_record(&transaction, graph, record, schema.kind)?.map(|atom| {
-					row_from_properties(atom.atom_id, &atom.record_id, &atom.properties, &schema)
-				}))
+				Ok(local
+					.lookup_record(&transaction, graph, record, schema_id(&schema)?, schema.kind)?
+					.map(|atom| {
+						row_from_properties(
+							atom.atom_id,
+							&atom.record_id,
+							&atom.properties,
+							&schema,
+						)
+					}))
 			}
 		}
+	}
+
+	pub(super) fn query_memberships(
+		&self,
+		root: &DatabaseRoot,
+		graph: &RecordId,
+	) -> FerrosGrynnResult<AtomTableMemberships> {
+		let mut memberships = root.schema.memberships(graph);
+		if let Some(write) = self.graphs.get(graph) {
+			for (atom, table) in &write.memberships {
+				memberships.set(*atom, *table)?;
+			}
+		}
+		Ok(memberships)
 	}
 
 	/// Registers the conservative predicate before a streaming scan starts and
@@ -433,6 +472,7 @@ fn indexed_local_rows(
 	let mut indexed = local.visit_table_composite_index(
 		transaction,
 		graph,
+		schema_id(schema)?,
 		schema.name.as_str(),
 		schema.kind,
 		&equalities,
@@ -454,6 +494,7 @@ fn indexed_local_rows(
 			indexed = local.visit_table_index(
 				transaction,
 				graph,
+				schema_id(schema)?,
 				schema.name.as_str(),
 				schema.kind,
 				property_key,
@@ -481,25 +522,29 @@ fn indexed_local_rows(
 pub(super) fn materialize_atom(
 	graph: &MaterializedGraph,
 	schema: &TableSchema,
+	memberships: &AtomTableMemberships,
 	atom: AtomId,
 ) -> Option<QueryStorageRow> {
+	if memberships.get(atom) != schema.id {
+		return None;
+	}
 	match atom.kind()? {
 		AtomKind::Node if matches!(schema.kind, TableKind::Any | TableKind::Normal) => {
 			let node = graph.node(atom)?;
-			if node.record_id().table() != schema.name.as_str() {
-				return None;
-			}
 			Some(row_from_properties(atom, node.record_id(), node.properties(), schema))
 		}
 		AtomKind::Edge if matches!(schema.kind, TableKind::Any | TableKind::Relation) => {
 			let edge = graph.edge(atom)?;
-			if edge.record_id().table() != schema.name.as_str() {
-				return None;
-			}
 			Some(row_from_properties(atom, edge.record_id(), edge.properties(), schema))
 		}
 		AtomKind::Node | AtomKind::Edge => None,
 	}
+}
+
+fn schema_id(schema: &TableSchema) -> FerrosGrynnResult<u32> {
+	schema.id.map(SchemaId::get).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("transaction-visible table has no schema identity")
+	})
 }
 
 pub(super) fn row_from_properties(

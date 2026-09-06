@@ -9,10 +9,14 @@ use super::*;
 pub(in crate::datastore) struct GraphWrite {
 	/// Catalog name published with this graph write.
 	pub(super) name: String,
+	/// Versioned catalog definition retained across graph-value changes.
+	pub(super) schema: GraphSchema,
 	pub(super) base: Option<Arc<MaterializedGraph>>,
 	pub(super) local: Option<LocalGraphWrite>,
 	pub(super) base_ts: u64,
 	pub(super) value: Option<MutableGraphValue>,
+	/// Explicit table-membership changes keyed by generation-aware atom ID.
+	pub(super) memberships: BTreeMap<AtomId, Option<SchemaId>>,
 	/// Rebuilds durable secondary indexes even when graph pages are unchanged.
 	pub(super) force_persist: bool,
 }
@@ -965,6 +969,14 @@ impl LocalGraphDelta {
 		self.edges.values().any(|edge| edge.dirty && (edge.created || edge.removed))
 	}
 
+	pub(super) fn removed_atoms(&self) -> impl Iterator<Item = AtomId> + '_ {
+		let nodes =
+			self.nodes.iter().filter_map(|(id, node)| (node.dirty && node.removed).then_some(*id));
+		let edges =
+			self.edges.iter().filter_map(|(id, edge)| (edge.dirty && edge.removed).then_some(*id));
+		nodes.chain(edges)
+	}
+
 	pub(super) fn into_commit_nodes(self) -> Vec<crate::storage::LocalCommitNode> {
 		let mut nodes = self
 			.nodes
@@ -975,6 +987,7 @@ impl LocalGraphDelta {
 				record_id: node.record_id,
 				label: node.label,
 				properties: node.properties,
+				table_id: None,
 			})
 			.collect::<Vec<_>>();
 		nodes.sort_unstable_by_key(|node| node.id);
@@ -989,6 +1002,7 @@ impl LocalGraphDelta {
 	pub(super) fn into_commit_delta(
 		self,
 		base: &LocalGraphView<'_>,
+		memberships: Vec<crate::storage::LocalCommitTableMembership>,
 	) -> FerrosGrynnResult<crate::storage::LocalCommitAtomDelta> {
 		let affected_nodes = self.affected_adjacency_nodes();
 		let mut adjacency = Vec::with_capacity(affected_nodes.len());
@@ -1076,6 +1090,7 @@ impl LocalGraphDelta {
 			nodes,
 			edges,
 			adjacency,
+			memberships,
 		})
 	}
 
@@ -1217,6 +1232,23 @@ impl GraphWrite {
 		let mut value = MutableGraphValue::from_frozen(&base)?;
 		local.delta.apply_to(&mut value)?;
 		Ok(value.snapshot())
+	}
+
+	fn atom_id(&mut self, store: &Datastore, reference: &AtomRef) -> FerrosGrynnResult<AtomId> {
+		if let Some(value) = &self.value {
+			return value.atom_id(reference);
+		}
+		let local = self
+			.local
+			.as_mut()
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(self.name.clone()))?;
+		let storage = store.inner.backend.local().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"local graph is attached to an in-memory backend",
+			)
+		})?;
+		let view = storage.graph_view(local.snapshot.clone(), local.base.clone());
+		local.delta.atom_id(&view, reference)
 	}
 
 	pub(super) fn ensure_materialized(&mut self, store: &Datastore) -> FerrosGrynnResult<()> {
@@ -1932,7 +1964,7 @@ impl Transaction {
 			return Err(FerrosGrynnError::graph_already_exists(name.as_str()));
 		}
 		let root = self.read_root();
-		if let Some(record_id) = root.graph_names.get(name.as_str())
+		if let Some(record_id) = root.schema.graph_names.get(name.as_str())
 			&& record_id != &id
 			&& !self.graphs.get(record_id).is_some_and(|write| !write.exists())
 		{
@@ -1940,15 +1972,27 @@ impl Transaction {
 		}
 		let kind = graph.kind();
 		let value = MutableGraphValue::from_frozen(&graph)?;
+		let reference = GraphRef::new(id.clone(), kind, self.store.inner.graph_storage_mode());
+		let schema = GraphSchema::new(
+			self.store.inner.allocate_schema_id()?,
+			SchemaVersion::INITIAL,
+			name.clone(),
+			reference.clone(),
+			SystemIndex::new(self.store.inner.allocate_schema_id()?, SystemIndexKind::Label),
+			SystemIndex::new(self.store.inner.allocate_schema_id()?, SystemIndexKind::Adjacency),
+			0,
+		);
 		self.graphs.insert(id.clone(), GraphWrite {
 			name: name.as_str().to_owned(),
+			schema,
 			base: None,
 			local: None,
 			base_ts: root.commit_ts,
 			value: Some(value),
+			memberships: BTreeMap::new(),
 			force_persist: false,
 		});
-		Ok(GraphRef::new(id, kind, self.store.inner.graph_storage_mode()))
+		Ok(reference)
 	}
 
 	pub fn remove_graph(&mut self, reference: &GraphRef) -> FerrosGrynnResult<()> {
@@ -2043,10 +2087,312 @@ impl Transaction {
 	pub fn define_table(&mut self, mut schema: TableSchema) -> FerrosGrynnResult<()> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
-		ensure_store_reference(&schema.graph, self.store.inner.graph_storage_mode())?;
 		if self.visible_table(schema.name.as_str()).is_some() {
 			return Err(FerrosGrynnError::table_already_exists(schema.name.as_str()));
 		}
+		self.validate_table_schema(&mut schema)?;
+		schema.id = Some(self.store.inner.allocate_schema_id()?);
+		schema.version = SchemaVersion::INITIAL;
+		schema.primary_index = Some(SystemIndex::new(
+			self.store.inner.allocate_schema_id()?,
+			SystemIndexKind::Primary,
+		));
+		for field in &mut schema.fields {
+			field.id = Some(self.store.inner.allocate_schema_id()?);
+			field.version = SchemaVersion::INITIAL;
+		}
+		for index in &mut schema.indexes {
+			index.id = Some(self.store.inner.allocate_schema_id()?);
+			index.version = SchemaVersion::INITIAL;
+		}
+		if !schema.indexes.is_empty() {
+			self.ensure_graph_write(&schema.graph)?;
+			if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
+				write.force_persist = true;
+			}
+		}
+		self.tables.insert(schema.name.as_str().to_owned(), Some(schema));
+		Ok(())
+	}
+
+	/// Replaces one table definition while retaining stable catalog identities.
+	///
+	/// Fields and user indexes with the same name retain their identities;
+	/// changed definitions advance their individual versions. Moving a table to
+	/// another graph is intentionally rejected because its migration semantics
+	/// are not part of the current storage contract.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable, the table or
+	/// graph is absent, the graph changes, a property is not interned, or a
+	/// schema identity/version clock is exhausted.
+	pub fn overwrite_table(&mut self, mut schema: TableSchema) -> FerrosGrynnResult<()> {
+		self.ensure_writable()?;
+		self.ensure_live()?;
+		let previous = self
+			.visible_table(schema.name.as_str())
+			.ok_or_else(|| FerrosGrynnError::table_does_not_exist(schema.name.as_str()))?;
+		if previous.graph != schema.graph {
+			return Err(FerrosGrynnError::invalid_argument(
+				"overwriting a table cannot move it to another graph",
+			));
+		}
+		self.validate_table_schema(&mut schema)?;
+		schema.id = previous.id;
+		schema.version = previous.version.next()?;
+		schema.primary_index = previous.primary_index;
+		for field in &mut schema.fields {
+			if let Some(old) = previous.fields.iter().find(|old| old.name == field.name) {
+				field.id = old.id;
+				field.version = if old.value_type == field.value_type {
+					old.version
+				} else {
+					old.version.next()?
+				};
+			} else {
+				field.id = Some(self.store.inner.allocate_schema_id()?);
+				field.version = SchemaVersion::INITIAL;
+			}
+		}
+		for index in &mut schema.indexes {
+			if let Some(old) = previous.indexes.iter().find(|old| old.name == index.name) {
+				index.id = old.id;
+				let field_contract_changed = index.fields.iter().any(|name| {
+					let old_field = previous.fields.iter().find(|field| field.name == *name);
+					let new_field = schema.fields.iter().find(|field| field.name == *name);
+					old_field
+						.zip(new_field)
+						.is_none_or(|(old, new)| old.value_type != new.value_type)
+				});
+				index.version = if old.kind == index.kind
+					&& old.fields == index.fields
+					&& !field_contract_changed
+				{
+					old.version
+				} else {
+					old.version.next()?
+				};
+			} else {
+				index.id = Some(self.store.inner.allocate_schema_id()?);
+				index.version = SchemaVersion::INITIAL;
+			}
+		}
+		if previous.fields != schema.fields || previous.indexes != schema.indexes {
+			self.ensure_graph_write(&schema.graph)?;
+			if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
+				write.force_persist = true;
+			}
+		}
+		self.tables.insert(schema.name.as_str().to_owned(), Some(schema));
+		Ok(())
+	}
+
+	pub fn remove_table(&mut self, name: &str) -> FerrosGrynnResult<()> {
+		self.ensure_writable()?;
+		self.ensure_live()?;
+		let schema =
+			self.visible_table(name).ok_or_else(|| FerrosGrynnError::table_does_not_exist(name))?;
+		// ponytail: table removal rebuilds the owning graph so concurrent
+		// membership additions cannot survive in hot slots. Stage 7 may replace
+		// this with incremental primary/scalar-index maintenance.
+		self.ensure_graph_write(&schema.graph)?;
+		if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
+			write.force_persist = true;
+		}
+		self.tables.insert(name.to_owned(), None);
+		Ok(())
+	}
+
+	pub fn table(&self, name: &str) -> FerrosGrynnResult<Arc<TableSchema>> {
+		self.ensure_live()?;
+		let root = self.read_root();
+		self.record_read(&root, ReadKey::Table(name.to_owned()));
+		match self.tables.get(name) {
+			Some(Some(schema)) => Ok(Arc::new(schema.clone())),
+			Some(None) => Err(FerrosGrynnError::table_does_not_exist(name)),
+			None => {
+				root.schema.table(name).ok_or_else(|| FerrosGrynnError::table_does_not_exist(name))
+			}
+		}
+	}
+
+	/// Assigns one graph atom to exactly one transaction-visible table.
+	///
+	/// The atom's public [`RecordId`] does not determine membership. Scalar
+	/// indexes still require the explicit full-materialization API until stage
+	/// 7 adds incremental index maintenance.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable or live, the
+	/// graph, atom, or table is absent, the table belongs to another graph, or
+	/// the atom kind violates the table kind.
+	pub fn assign_atom_to_table(
+		&mut self,
+		graph: &GraphRef,
+		atom: &AtomRef,
+		table: &str,
+	) -> FerrosGrynnResult<()> {
+		self.ensure_writable()?;
+		self.ensure_live()?;
+		let schema = self
+			.visible_table(table)
+			.ok_or_else(|| FerrosGrynnError::table_does_not_exist(table))?;
+		if schema.graph != *graph {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"table '{}' belongs to graph '{}', not '{}'",
+				table,
+				schema.graph.id(),
+				graph.id()
+			)));
+		}
+		let kind_matches = matches!(
+			(schema.kind, atom.kind()),
+			(TableKind::Any, _)
+				| (TableKind::Normal, AtomKind::Node)
+				| (TableKind::Relation, AtomKind::Edge)
+		);
+		if !kind_matches {
+			return Err(FerrosGrynnError::atom_kind_mismatch(
+				atom.id().to_string(),
+				atom.kind().to_string(),
+				match schema.kind {
+					TableKind::Any => "node or edge",
+					TableKind::Normal => "node",
+					TableKind::Relation => "edge",
+				}
+				.to_owned(),
+			));
+		}
+		let table_id = schema.id.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"transaction-visible table has no schema identity",
+			)
+		})?;
+		self.ensure_graph_mutation_write(graph)?;
+		let store = self.store.clone();
+		let write = self
+			.graphs
+			.get_mut(graph.id())
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.id().to_string()))?;
+		let atom_id = write.atom_id(&store, atom)?;
+		if let Some(local) = write.local.as_mut() {
+			local.delta.bump_revision()?;
+		}
+		write.memberships.insert(atom_id, Some(table_id));
+		Ok(())
+	}
+
+	/// Clears the explicit table membership of one graph atom.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable or live, or the
+	/// graph or atom is absent.
+	pub fn clear_atom_table(&mut self, graph: &GraphRef, atom: &AtomRef) -> FerrosGrynnResult<()> {
+		self.ensure_writable()?;
+		self.ensure_live()?;
+		self.ensure_graph_mutation_write(graph)?;
+		let store = self.store.clone();
+		let write = self
+			.graphs
+			.get_mut(graph.id())
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.id().to_string()))?;
+		let atom_id = write.atom_id(&store, atom)?;
+		if let Some(local) = write.local.as_mut() {
+			local.delta.bump_revision()?;
+		}
+		write.memberships.insert(atom_id, None);
+		Ok(())
+	}
+
+	/// Publishes a new global database parameter.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable or live, the name
+	/// already exists, or the schema identity clock is exhausted.
+	pub fn define_parameter(&mut self, mut parameter: SchemaParameter) -> FerrosGrynnResult<()> {
+		self.ensure_writable()?;
+		self.ensure_live()?;
+		if self.visible_parameter(parameter.name.as_str()).is_some() {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"schema parameter '{}' already exists",
+				parameter.name
+			)));
+		}
+		parameter.id = Some(self.store.inner.allocate_schema_id()?);
+		parameter.version = SchemaVersion::INITIAL;
+		self.parameters.insert(parameter.name.as_str().to_owned(), Some(parameter));
+		Ok(())
+	}
+
+	/// Replaces a global database parameter while retaining its stable
+	/// identity.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable or live, the
+	/// parameter is absent, or its version is exhausted.
+	pub fn overwrite_parameter(&mut self, mut parameter: SchemaParameter) -> FerrosGrynnResult<()> {
+		self.ensure_writable()?;
+		self.ensure_live()?;
+		let previous = self.visible_parameter(parameter.name.as_str()).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument(format!(
+				"schema parameter '{}' does not exist",
+				parameter.name
+			))
+		})?;
+		parameter.id = previous.id;
+		parameter.version = previous.version.next()?;
+		self.parameters.insert(parameter.name.as_str().to_owned(), Some(parameter));
+		Ok(())
+	}
+
+	/// Removes one global database parameter.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable or live, or the
+	/// parameter is absent.
+	pub fn remove_parameter(&mut self, name: &str) -> FerrosGrynnResult<()> {
+		self.ensure_writable()?;
+		self.ensure_live()?;
+		if self.visible_parameter(name).is_none() {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"schema parameter '{name}' does not exist"
+			)));
+		}
+		self.parameters.insert(name.to_owned(), None);
+		Ok(())
+	}
+
+	/// Reads one transaction-visible global database parameter.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is no longer live or the parameter
+	/// is absent.
+	pub fn parameter(&self, name: &str) -> FerrosGrynnResult<Arc<SchemaParameter>> {
+		self.ensure_live()?;
+		let root = self.read_root();
+		self.record_read(&root, ReadKey::Parameter(name.to_owned()));
+		match self.parameters.get(name) {
+			Some(Some(parameter)) => Ok(Arc::new(parameter.clone())),
+			Some(None) => Err(FerrosGrynnError::invalid_argument(format!(
+				"schema parameter '{name}' does not exist"
+			))),
+			None => root.schema.parameter(name).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(format!(
+					"schema parameter '{name}' does not exist"
+				))
+			}),
+		}
+	}
+
+	fn validate_table_schema(&self, schema: &mut TableSchema) -> FerrosGrynnResult<()> {
+		ensure_store_reference(&schema.graph, self.store.inner.graph_storage_mode())?;
 		let graph_kind = self
 			.visible_graph_kind(schema.graph.id())
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string()))?;
@@ -2065,44 +2411,7 @@ impl Transaction {
 				))
 			})?);
 		}
-		if !schema.indexes.is_empty() {
-			self.ensure_graph_write(&schema.graph)?;
-			if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
-				write.force_persist = true;
-			}
-		}
-		self.tables.insert(schema.name.as_str().to_owned(), Some(schema));
 		Ok(())
-	}
-
-	pub fn remove_table(&mut self, name: &str) -> FerrosGrynnResult<()> {
-		self.ensure_writable()?;
-		self.ensure_live()?;
-		let schema =
-			self.visible_table(name).ok_or_else(|| FerrosGrynnError::table_does_not_exist(name))?;
-		if !schema.indexes.is_empty() {
-			self.ensure_graph_write(&schema.graph)?;
-			if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
-				write.force_persist = true;
-			}
-		}
-		self.tables.insert(name.to_owned(), None);
-		Ok(())
-	}
-
-	pub fn table(&self, name: &str) -> FerrosGrynnResult<Arc<TableSchema>> {
-		self.ensure_live()?;
-		let root = self.read_root();
-		self.record_read(&root, ReadKey::Table(name.to_owned()));
-		match self.tables.get(name) {
-			Some(Some(schema)) => Ok(Arc::new(schema.clone())),
-			Some(None) => Err(FerrosGrynnError::table_does_not_exist(name)),
-			None => root
-				.tables
-				.get(name)
-				.cloned()
-				.ok_or_else(|| FerrosGrynnError::table_does_not_exist(name)),
-		}
 	}
 
 	fn ensure_writable(&self) -> FerrosGrynnResult<()> {
@@ -2123,6 +2432,9 @@ impl Transaction {
 			.graphs
 			.get(reference.id())
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(reference.id().to_string()))?;
+		let schema = root.schema.graph(reference.id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("stored graph has no schema-catalog definition")
+		})?;
 		if stored.graph.kind() != reference.kind() {
 			return Err(FerrosGrynnError::conversion_error(
 				reference.kind().name(),
@@ -2142,10 +2454,12 @@ impl Transaction {
 		};
 		self.graphs.insert(reference.id().clone(), GraphWrite {
 			name: stored.name.clone(),
+			schema: schema.as_ref().clone(),
 			base: Some(base.clone()),
 			local: None,
 			base_ts: root.commit_ts,
 			value: Some(MutableGraphValue::from_frozen(&base)?),
+			memberships: BTreeMap::new(),
 			force_persist: false,
 		});
 		Ok(())
@@ -2161,6 +2475,9 @@ impl Transaction {
 			.graphs
 			.get(reference.id())
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(reference.id().to_string()))?;
+		let schema = root.schema.graph(reference.id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("stored graph has no schema-catalog definition")
+		})?;
 		if stored.graph.kind() != reference.kind() {
 			return Err(FerrosGrynnError::conversion_error(
 				reference.kind().name(),
@@ -2196,10 +2513,12 @@ impl Transaction {
 		};
 		self.graphs.insert(reference.id().clone(), GraphWrite {
 			name: stored.name.clone(),
+			schema: schema.as_ref().clone(),
 			base,
 			local,
 			base_ts: root.commit_ts,
 			value,
+			memberships: BTreeMap::new(),
 			force_persist: false,
 		});
 		Ok(())
