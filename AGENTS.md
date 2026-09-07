@@ -25,6 +25,7 @@ src/
   math/          # Project-wide reusable mathematical operations
   memory/        # Allocator/tracking, heap accounting and resource policy
   storage/       # Local pages, indexes, WAL, recovery and Direct I/O
+  stats/         # Transactional planner counts and bulk-built histograms
   syn/           # GrynnQL lexer, tokens, syntax tree and parser
   unsafed/       # Reusable unsafe primitives; disconnected until audited
   utils/         # Small project-wide utilities, grouped by subject as they grow
@@ -49,6 +50,8 @@ area:
 
 - [`src/storage/AGENTS.md`](src/storage/AGENTS.md) — local pages, indexes, WAL,
   checkpoint/recovery and Direct I/O;
+- [`src/stats/AGENTS.md`](src/stats/AGENTS.md) — transactional counters and
+  bulk-built planner histograms;
 - [`src/datastore/AGENTS.md`](src/datastore/AGENTS.md) — catalogs, MVCC,
   transactions and backend composition;
 - [`src/graph/AGENTS.md`](src/graph/AGENTS.md) — runtime graph families,

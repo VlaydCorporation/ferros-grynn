@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	sync::Arc,
+	time::Instant,
+};
 
 use super::{
 	GraphSchema,
@@ -16,6 +20,14 @@ use super::{
 use crate::{
 	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	stats::{
+		GraphStatistics,
+		StatisticField,
+		StatisticsStore,
+		analyze_graph,
+		graph_encode_context,
+		update_graph_statistics,
+	},
 	storage::{LocalDatabaseSnapshot, LocalGraph},
 	values::runtime::{
 		PropertyDictionary,
@@ -35,6 +47,8 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) commit_ts: u64,
 	pub(crate) graphs: BTreeMap<RecordId, StoredGraph>,
 	pub(crate) schema: Arc<SchemaCatalog>,
+	/// Planner statistics versioned with this immutable MVCC root.
+	pub(crate) statistics: Arc<StatisticsStore>,
 	pub(crate) dictionary: Arc<PropertyDictionary>,
 }
 
@@ -158,6 +172,7 @@ impl Default for DatabaseRoot {
 			commit_ts: 0,
 			graphs: BTreeMap::new(),
 			schema: Arc::new(SchemaCatalog::default()),
+			statistics: Arc::new(StatisticsStore::default()),
 			dictionary: Arc::new(PropertyDictionary::new()),
 		}
 	}
@@ -183,6 +198,7 @@ impl DatabaseRoot {
 			commit_ts,
 			graphs: BTreeMap::new(),
 			schema: Arc::new(SchemaCatalog::default()),
+			statistics: Arc::new(StatisticsStore::default()),
 			dictionary,
 		};
 		for entry in graphs {
@@ -219,10 +235,21 @@ impl DatabaseRoot {
 				));
 			}
 			catalog.graph_versions.insert(entry.record_id.clone(), commit_ts);
+			let mut statistics = entry.statistics;
+			statistics.tables.clear();
+			for membership in &entry.memberships {
+				if let Some(table_id) = membership.table_id {
+					let count = statistics.tables.entry(table_id).or_default();
+					*count = count.checked_add(1).ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("table statistics count overflows")
+					})?;
+				}
+			}
 			for membership in entry.memberships {
 				let table = membership.table_id.map(SchemaId::from_storage).transpose()?;
 				catalog.set_membership(&entry.record_id, membership.id, table)?;
 			}
+			Arc::make_mut(&mut root.statistics).insert(entry.record_id.clone(), statistics);
 			root.graphs.insert(entry.record_id, StoredGraph {
 				name: entry.name,
 				graph: StoredGraphValue::Local(entry.graph),
@@ -326,6 +353,113 @@ impl DatabaseRoot {
 		catalog.validate_memberships()?;
 		root.schema = Arc::new(catalog);
 		Ok(root)
+	}
+
+	/// Rebuilds bulk statistics for changed materialized graphs and reconciles
+	/// exact table counts for every affected graph.
+	#[allow(clippy::mutable_key_type, reason = "RecordId is the datastore's stable graph key")]
+	pub(crate) fn refresh_statistics(
+		&mut self,
+		graphs: &BTreeSet<RecordId>,
+		bulk_graphs: &BTreeSet<RecordId>,
+	) -> FerrosGrynnResult<()> {
+		let live = self.graphs.keys().cloned().collect::<BTreeSet<_>>();
+		Arc::make_mut(&mut self.statistics).retain_graphs(&live);
+		for graph_id in graphs {
+			let Some(stored) = self.graphs.get(graph_id) else {
+				Arc::make_mut(&mut self.statistics).remove(graph_id);
+				continue;
+			};
+			let memberships = self.schema.memberships(graph_id);
+			let table_counts = memberships.assigned().try_fold(
+				BTreeMap::<u32, u64>::new(),
+				|mut counts, (_atom, table)| {
+					let count = counts.entry(table.get()).or_default();
+					*count = count.checked_add(1).ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("table statistics count overflows")
+					})?;
+					Ok::<_, FerrosGrynnError>(counts)
+				},
+			)?;
+			let StoredGraphValue::Materialized(graph) = &stored.graph else {
+				if let Some(statistics) = Arc::make_mut(&mut self.statistics).graph_mut(graph_id) {
+					statistics.tables = table_counts;
+				}
+				continue;
+			};
+			let needs_bulk = bulk_graphs.contains(graph_id)
+				|| self
+					.statistics
+					.graph(graph_id)
+					.is_none_or(|statistics| statistics.revision != graph.revision());
+			if !needs_bulk {
+				if let Some(statistics) = Arc::make_mut(&mut self.statistics).graph_mut(graph_id) {
+					statistics.tables = table_counts;
+				}
+				continue;
+			}
+			let fields = self
+				.schema
+				.tables
+				.values()
+				.filter(|table| table.graph.id() == graph_id)
+				.flat_map(|table| {
+					table.fields.iter().filter_map(|field| {
+						Some(StatisticField {
+							table_id: table.id?.get(),
+							field_id: field.id?.get(),
+							property_key: field.key?,
+							value_type: &field.value_type,
+						})
+					})
+				})
+				.collect::<Vec<_>>();
+			let mut context = graph_encode_context(graph.as_ref(), &self.dictionary)?;
+			let statistics = analyze_graph(
+				graph.as_ref(),
+				graph.revision(),
+				&fields,
+				|atom| memberships.get(atom).map(SchemaId::get),
+				&mut context,
+			)?;
+			Arc::make_mut(&mut self.statistics).insert(graph_id.clone(), statistics);
+		}
+		Ok(())
+	}
+
+	/// Applies one committed materialized graph delta to simple statistics.
+	pub(crate) fn update_materialized_statistics(
+		&mut self,
+		graph: &RecordId,
+		before: &MaterializedGraph,
+		after: &MaterializedGraph,
+		dirty: &BTreeSet<AtomId>,
+	) -> FerrosGrynnResult<()> {
+		let Some(previous) = self.statistics.graph(graph).cloned() else {
+			return Ok(());
+		};
+		let statistics = update_graph_statistics(&previous, before, after, dirty)?;
+		Arc::make_mut(&mut self.statistics).insert(graph.clone(), statistics);
+		Ok(())
+	}
+
+	/// Installs durable graph statistics and restores catalog-owned table
+	/// counts.
+	pub(crate) fn replace_statistics(
+		&mut self,
+		graph: RecordId,
+		mut statistics: GraphStatistics,
+	) -> FerrosGrynnResult<()> {
+		let memberships = self.schema.memberships(&graph);
+		statistics.tables.clear();
+		for (_atom, table) in memberships.assigned() {
+			let count = statistics.tables.entry(table.get()).or_default();
+			*count = count.checked_add(1).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("table statistics count overflows")
+			})?;
+		}
+		Arc::make_mut(&mut self.statistics).insert(graph, statistics);
+		Ok(())
 	}
 
 	pub(crate) fn version(&self, key: &ReadKey) -> u64 {

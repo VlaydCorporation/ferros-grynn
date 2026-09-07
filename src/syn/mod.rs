@@ -17,6 +17,7 @@ pub use ast::{
 	UnaryOperator,
 };
 pub use config::GQLConfig;
+use fg_gql_status::FerrosGrynnResult;
 pub use stmt::{
 	LetStatement,
 	MatchDirection,
@@ -36,8 +37,6 @@ pub use stmt::{
 	Statement,
 	StatementKind,
 };
-
-use fg_gql_status::FerrosGrynnResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

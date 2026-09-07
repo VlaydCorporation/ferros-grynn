@@ -626,9 +626,27 @@ pub(super) fn build_graph_image(
 		})?))?;
 	}
 
-	let statistics = graph_statistics(&node_adjacency, edge_ids.len())?;
-	let mut statistic_pages = Vec::with_capacity(1);
-	statistic_pages.push(*encode_graph_statistics(statistics, PageLsn::ZERO)?);
+	let statistic_fields = tables
+		.iter()
+		.filter(|table| table.graph == *record_id)
+		.flat_map(|table| {
+			table.fields.iter().map(|field| StatisticField {
+				table_id: table.id,
+				field_id: field.id,
+				property_key: PropertyKeyId::new(field.property_key),
+				value_type: &field.value_type,
+			})
+		})
+		.collect::<Vec<_>>();
+	let statistics = analyze_graph(
+		graph,
+		graph.revision(),
+		&statistic_fields,
+		|id| table_memberships.get(&id).copied(),
+		&mut context,
+	)?;
+	let statistic_pages =
+		encode_statistics(&statistics, &labels.node_labels, &labels.edge_labels, PageLsn::ZERO)?;
 	let subgraph_entries = plan
 		.children
 		.iter()
@@ -958,11 +976,14 @@ pub(super) fn build_node_append_delta(
 	let label_pages = encode_label_dictionary(&labels, PageLsn::ZERO)?;
 	*dictionary = context.property_dictionary().clone();
 
-	let mut statistics_page = AlignedPage::zeroed();
-	let statistics =
-		manager.read_page(transaction, base.page_key(DataFileKind::Statistics, PageNo::new(0))?)?;
-	statistics_page.as_bytes_mut().copy_from_slice(statistics.as_bytes());
-	let previous_statistics = decode_graph_statistics(&statistics_page)?;
+	let mut previous_statistics = base.statistics.clone();
+	hydrate_legacy_label_statistics(
+		&mut previous_statistics,
+		manager,
+		transaction,
+		base,
+		&context,
+	)?;
 	if previous_statistics.node_count != base.superblock.node_count
 		|| previous_statistics.edge_count != base.superblock.edge_count
 	{
@@ -975,24 +996,22 @@ pub(super) fn build_node_append_delta(
 		.node_count
 		.checked_add(node_count)
 		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("node count overflows u64"))?;
-	let divisor = if next_node_count == 0 {
-		1.0
-	} else {
-		next_node_count as f64
-	};
-	let statistics = encode_graph_statistics(
-		GraphStatistics {
-			node_count: next_node_count,
-			edge_count: previous_statistics.edge_count,
-			average_out_degree: previous_statistics.average_out_degree
-				* base.superblock.node_count as f64
-				/ divisor,
-			average_in_degree: previous_statistics.average_in_degree
-				* base.superblock.node_count as f64
-				/ divisor,
-			maximum_out_degree: previous_statistics.maximum_out_degree,
-			maximum_in_degree: previous_statistics.maximum_in_degree,
-		},
+	let mut next_statistics = previous_statistics;
+	next_statistics.node_count = next_node_count;
+	for node in nodes {
+		if let Some(label) = &node.label {
+			next_statistics.replace_label(
+				AtomKind::Node,
+				None,
+				Some((label, node.properties.len())),
+			)?;
+		}
+	}
+	next_statistics.mark_dirty(node_count, next_revision)?;
+	let statistics = encode_statistics(
+		&next_statistics,
+		&labels.node_labels,
+		&labels.edge_labels,
 		PageLsn::ZERO,
 	)?;
 
@@ -1025,8 +1044,7 @@ pub(super) fn build_node_append_delta(
 		payloads.insert(DataFileKind::Properties, property_pages);
 	}
 	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
-	statistics.validate(PageNo::new(0))?;
-	payloads.insert(DataFileKind::Statistics, vec![(PageNo::new(0), statistics)]);
+	payloads.insert(DataFileKind::Statistics, number_statistics_delta(statistics)?);
 	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
 	Ok(BuiltGraphDelta {
 		catalog_entry,
@@ -1098,20 +1116,25 @@ pub(super) fn build_atom_delta(
 		}),
 	)?;
 
+	let mut source_context = EncodeContext::new(dictionary.clone());
 	let mut context = EncodeContext::new(dictionary.clone());
 	for (expected, table) in base.labels.table_names.iter().enumerate() {
-		let actual = context.register_table_name(table.clone().into())?;
-		if usize::try_from(actual).ok() != Some(expected) {
+		let source = source_context.register_table_name(table.clone().into())?;
+		let target = context.register_table_name(table.clone().into())?;
+		if usize::try_from(source).ok() != Some(expected)
+			|| usize::try_from(target).ok() != Some(expected)
+		{
 			return Err(FerrosGrynnError::invalid_storage_file("table dictionary is not dense"));
 		}
 	}
 	for (index, zone) in base.labels.time_zones.iter().enumerate() {
-		let actual = context.register_time_zone_name(zone.clone().into())?;
+		let source = source_context.register_time_zone_name(zone.clone().into())?;
+		let target = context.register_time_zone_name(zone.clone().into())?;
 		let expected = u32::try_from(index)
 			.ok()
 			.and_then(|index| index.checked_add(1))
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("time-zone id overflows"))?;
-		if actual != expected {
+		if source != expected || target != expected {
 			return Err(FerrosGrynnError::invalid_storage_file(
 				"time-zone dictionary is not dense",
 			));
@@ -1129,6 +1152,18 @@ pub(super) fn build_atom_delta(
 		},
 		base.primary_index_root,
 	)?;
+	let mut source_atoms = Vec::with_capacity(primary_entries.len());
+	for entry in &primary_entries {
+		let stored = CanonicalCodec::decode(&entry.key, DecodeLimits::default())?;
+		let Value::Record(record) = stored.into_runtime(&source_context.decoder())? else {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"primary index key is not a canonical RecordId",
+			));
+		};
+		let runtime = AtomRef::new(entry.atom.kind(), *record);
+		source_context.register_atom(runtime.clone(), entry.atom)?;
+		source_atoms.push((runtime, entry.atom));
+	}
 	let removed = delta
 		.nodes
 		.iter()
@@ -1150,14 +1185,10 @@ pub(super) fn build_atom_delta(
 		}))
 		.collect::<BTreeSet<_>>();
 	primary_entries.retain(|entry| !removed.contains(&entry.atom));
-	for entry in &primary_entries {
-		let stored = CanonicalCodec::decode(&entry.key, DecodeLimits::default())?;
-		let Value::Record(record) = stored.into_runtime(&context.decoder())? else {
-			return Err(FerrosGrynnError::invalid_storage_file(
-				"primary index key is not a canonical RecordId",
-			));
-		};
-		context.register_atom(AtomRef::new(entry.atom.kind(), *record), entry.atom)?;
+	for (runtime, atom) in source_atoms {
+		if !removed.contains(&atom) {
+			context.register_atom(runtime, atom)?;
+		}
 	}
 	for (id, record) in delta_created_records(delta) {
 		context.register_table_name(record.table().to_owned().into())?;
@@ -1599,7 +1630,10 @@ pub(super) fn build_atom_delta(
 		delta,
 		next_node_count,
 		next_edge_count,
+		&source_context,
 	)?;
+	let statistics =
+		encode_statistics(&statistics, &labels.node_labels, &labels.edge_labels, PageLsn::ZERO)?;
 
 	removed_subgraph_slots.sort_unstable();
 	removed_subgraph_slots.dedup();
@@ -1662,8 +1696,7 @@ pub(super) fn build_atom_delta(
 		payloads.insert(DataFileKind::Subgraphs, number_pages(pages)?);
 	}
 	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
-	statistics.validate(PageNo::new(0))?;
-	payloads.insert(DataFileKind::Statistics, vec![(PageNo::new(0), statistics)]);
+	payloads.insert(DataFileKind::Statistics, number_statistics_delta(statistics)?);
 	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
 	Ok(BuiltGraphDelta {
 		catalog_entry,
@@ -1941,10 +1974,10 @@ fn delta_graph_statistics(
 	delta: &LocalCommitAtomDelta,
 	node_count: u64,
 	edge_count: u64,
-) -> FerrosGrynnResult<Box<AlignedPage>> {
-	let page =
-		manager.read_page(transaction, base.page_key(DataFileKind::Statistics, PageNo::new(0))?)?;
-	let previous = decode_graph_statistics(page.as_page())?;
+	context: &EncodeContext,
+) -> FerrosGrynnResult<GraphStatistics> {
+	let mut previous = base.statistics.clone();
+	hydrate_legacy_label_statistics(&mut previous, manager, transaction, base, context)?;
 	if previous.node_count != base.superblock.node_count
 		|| previous.edge_count != base.superblock.edge_count
 	{
@@ -1952,8 +1985,9 @@ fn delta_graph_statistics(
 			"statistics counts disagree with GraphSuperblock",
 		));
 	}
-	let mut total_out = (previous.average_out_degree * previous.node_count as f64).round() as i128;
-	let mut total_in = (previous.average_in_degree * previous.node_count as f64).round() as i128;
+	let mut total_out = i128::from(previous.total_out_degree);
+	let mut total_in = i128::from(previous.total_in_degree);
+	let mut total_undirected = i128::from(previous.total_undirected_degree);
 	let final_adjacency = delta
 		.adjacency
 		.iter()
@@ -1965,7 +1999,9 @@ fn delta_graph_statistics(
 			id,
 			..
 		} => Some(*id),
-		_ => None,
+		LocalCommitNodeChange::Upsert {
+			..
+		} => None,
 	}));
 	for id in affected {
 		if id.slot() < base.superblock.node_capacity {
@@ -1977,6 +2013,7 @@ fn delta_graph_statistics(
 			{
 				total_out -= i128::from(slot.out_count);
 				total_in -= i128::from(slot.in_count);
+				total_undirected -= i128::from(slot.undirected_count);
 			}
 		}
 		if let Some(adjacency) = final_adjacency.get(&id) {
@@ -1986,53 +2023,381 @@ fn delta_graph_statistics(
 			total_in += i128::try_from(adjacency.incoming.len()).map_err(|_error| {
 				FerrosGrynnError::invalid_storage_file("in-degree exceeds i128")
 			})?;
+			total_undirected += i128::try_from(adjacency.undirected.len()).map_err(|_error| {
+				FerrosGrynnError::invalid_storage_file("undirected degree exceeds i128")
+			})?;
 		}
 	}
-	if total_out < 0 || total_in < 0 {
+	if total_out < 0 || total_in < 0 || total_undirected < 0 {
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"atom delta produced negative degree totals",
 		));
 	}
-	let divisor = if node_count == 0 {
-		1.0
-	} else {
-		node_count as f64
-	};
+	let total_out = u64::try_from(total_out)
+		.map_err(|_error| FerrosGrynnError::invalid_storage_file("out-degree total exceeds u64"))?;
+	let total_in = u64::try_from(total_in)
+		.map_err(|_error| FerrosGrynnError::invalid_storage_file("in-degree total exceeds u64"))?;
+	let total_undirected = u64::try_from(total_undirected).map_err(|_error| {
+		FerrosGrynnError::invalid_storage_file("undirected-degree total exceeds u64")
+	})?;
+	let largest_added_out = final_adjacency
+		.values()
+		.map(|adjacency| adjacency.outgoing.len())
+		.max()
+		.map_or(Ok(0), |degree| {
+			u64::try_from(degree)
+				.map_err(|_error| FerrosGrynnError::invalid_storage_file("out-degree exceeds u64"))
+		})?;
+	let largest_added_in = final_adjacency
+		.values()
+		.map(|adjacency| adjacency.incoming.len())
+		.max()
+		.map_or(Ok(0), |degree| {
+			u64::try_from(degree)
+				.map_err(|_error| FerrosGrynnError::invalid_storage_file("in-degree exceeds u64"))
+		})?;
 	let maximum_out_degree = if node_count == 0 {
 		0
 	} else {
-		previous.maximum_out_degree.max(
-			final_adjacency
-				.values()
-				.map(|adjacency| adjacency.outgoing.len() as u64)
-				.max()
-				.unwrap_or(0),
-		)
+		previous.maximum_out_degree.max(largest_added_out).min(total_out)
 	};
 	let maximum_in_degree = if node_count == 0 {
 		0
 	} else {
-		previous.maximum_in_degree.max(
-			final_adjacency
-				.values()
-				.map(|adjacency| adjacency.incoming.len() as u64)
-				.max()
-				.unwrap_or(0),
-		)
+		previous.maximum_in_degree.max(largest_added_in).min(total_in)
 	};
 	// ponytail: maxima remain conservative after degree decreases. Stage 6's
 	// StatisticsStore/ANALYZE owns an exact rescan if planner quality needs it.
-	encode_graph_statistics(
-		GraphStatistics {
-			node_count,
-			edge_count,
-			average_out_degree: total_out as f64 / divisor,
-			average_in_degree: total_in as f64 / divisor,
-			maximum_out_degree,
-			maximum_in_degree,
-		},
-		PageLsn::ZERO,
-	)
+	let changed_rows = delta
+		.nodes
+		.len()
+		.checked_add(delta.edges.len())
+		.and_then(|count| count.checked_add(delta.memberships.len()))
+		.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("statistics changed-row count overflows")
+		})?;
+	let changed_rows = u64::try_from(changed_rows).map_err(|_error| {
+		FerrosGrynnError::invalid_storage_file("statistics changed-row count exceeds u64")
+	})?;
+	let mut statistics = previous;
+	statistics.node_count = node_count;
+	statistics.edge_count = edge_count;
+	statistics.total_out_degree = total_out;
+	statistics.total_in_degree = total_in;
+	statistics.total_undirected_degree = total_undirected;
+	statistics.maximum_out_degree = maximum_out_degree;
+	statistics.maximum_in_degree = maximum_in_degree;
+	update_delta_label_statistics(&mut statistics, manager, transaction, base, delta, context)?;
+	statistics.mark_dirty(changed_rows, delta.revision)?;
+	Ok(statistics)
+}
+
+/// Reconstructs exact label counters before upgrading a legacy one-page root.
+fn hydrate_legacy_label_statistics(
+	statistics: &mut GraphStatistics,
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	context: &EncodeContext,
+) -> FerrosGrynnResult<()> {
+	if statistics.revision != 0 || statistics.node_count == 0 && statistics.edge_count == 0 {
+		return Ok(());
+	}
+	statistics.labels.clear();
+	let slots_per_page = u64::try_from(HOT_SLOTS_PER_PAGE).map_err(|_error| {
+		FerrosGrynnError::invalid_storage_file("hot slots per page exceeds u64")
+	})?;
+	let mut node_count = 0_u64;
+	for raw_page in 0..base.superblock.node_hot_pages {
+		let page_no = PageNo::new(raw_page);
+		let page =
+			manager.read_page(transaction, base.page_key(DataFileKind::NodesHot, page_no)?)?;
+		for within in 0..HOT_SLOTS_PER_PAGE {
+			let within_u64 = u64::try_from(within).map_err(|_error| {
+				FerrosGrynnError::invalid_storage_file("node slot offset exceeds u64")
+			})?;
+			let slot_index = raw_page
+				.checked_mul(slots_per_page)
+				.and_then(|first| first.checked_add(within_u64))
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("node statistics slot overflows")
+				})?;
+			if slot_index >= base.superblock.node_capacity {
+				break;
+			}
+			let slot = read_node_hot_slot(page.as_page(), page_no, within)?;
+			if slot.flags.contains(NodeSlotFlags::TOMBSTONE) {
+				continue;
+			}
+			node_count = node_count.checked_add(1).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("node statistics count overflows")
+			})?;
+			if let Some(label) = decode_label(slot.label_id, &base.labels.node_labels)? {
+				let properties = read_delta_property_count(
+					manager,
+					transaction,
+					base,
+					slot.properties,
+					context,
+				)?;
+				statistics.replace_label(AtomKind::Node, None, Some((&label, properties)))?;
+			}
+		}
+	}
+	let mut edge_count = 0_u64;
+	for raw_page in 0..base.superblock.edge_hot_pages {
+		let page_no = PageNo::new(raw_page);
+		let page =
+			manager.read_page(transaction, base.page_key(DataFileKind::EdgesHot, page_no)?)?;
+		for within in 0..HOT_SLOTS_PER_PAGE {
+			let within_u64 = u64::try_from(within).map_err(|_error| {
+				FerrosGrynnError::invalid_storage_file("edge slot offset exceeds u64")
+			})?;
+			let slot_index = raw_page
+				.checked_mul(slots_per_page)
+				.and_then(|first| first.checked_add(within_u64))
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("edge statistics slot overflows")
+				})?;
+			if slot_index >= base.superblock.edge_capacity {
+				break;
+			}
+			let slot = read_edge_hot_slot(page.as_page(), page_no, within)?;
+			if slot.flags.contains(EdgeSlotFlags::TOMBSTONE) {
+				continue;
+			}
+			edge_count = edge_count.checked_add(1).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("edge statistics count overflows")
+			})?;
+			if let Some(label) = decode_label(slot.label_id, &base.labels.edge_labels)? {
+				let properties = read_delta_property_count(
+					manager,
+					transaction,
+					base,
+					slot.properties,
+					context,
+				)?;
+				statistics.replace_label(AtomKind::Edge, None, Some((&label, properties)))?;
+			}
+		}
+	}
+	if node_count != statistics.node_count || edge_count != statistics.edge_count {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"legacy statistics counts disagree with live hot slots",
+		));
+	}
+	let dirty_rows = node_count.checked_add(edge_count).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("legacy statistics dirty count overflows")
+	})?;
+	statistics.mark_dirty(dirty_rows, base.revision)?;
+	Ok(())
+}
+
+/// Applies node and edge label changes to exact persisted counters.
+fn update_delta_label_statistics(
+	statistics: &mut GraphStatistics,
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	delta: &LocalCommitAtomDelta,
+	context: &EncodeContext,
+) -> FerrosGrynnResult<()> {
+	for change in &delta.nodes {
+		match change {
+			LocalCommitNodeChange::Upsert {
+				id,
+				label,
+				properties,
+				created,
+				..
+			} => {
+				let before = if *created {
+					None
+				} else {
+					previous_label_observation(manager, transaction, base, *id, context)?
+				};
+				statistics.replace_label(
+					AtomKind::Node,
+					before.as_ref().map(|(label, count)| (label, *count)),
+					label.as_ref().map(|label| (label, properties.len())),
+				)?;
+			}
+			LocalCommitNodeChange::Remove {
+				id,
+				created,
+			} => {
+				let before = if *created {
+					None
+				} else {
+					previous_label_observation(manager, transaction, base, *id, context)?
+				};
+				statistics.replace_label(
+					AtomKind::Node,
+					before.as_ref().map(|(label, count)| (label, *count)),
+					None,
+				)?;
+			}
+		}
+	}
+	for change in &delta.edges {
+		match change {
+			LocalCommitEdgeChange::Upsert {
+				id,
+				label,
+				properties,
+				created,
+				..
+			} => {
+				let before = if *created {
+					None
+				} else {
+					previous_label_observation(manager, transaction, base, *id, context)?
+				};
+				statistics.replace_label(
+					AtomKind::Edge,
+					before.as_ref().map(|(label, count)| (label, *count)),
+					label.as_ref().map(|label| (label, properties.len())),
+				)?;
+			}
+			LocalCommitEdgeChange::Remove {
+				id,
+				created,
+			} => {
+				let before = if *created {
+					None
+				} else {
+					previous_label_observation(manager, transaction, base, *id, context)?
+				};
+				statistics.replace_label(
+					AtomKind::Edge,
+					before.as_ref().map(|(label, count)| (label, *count)),
+					None,
+				)?;
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Reads the prior label and property count for one changed hot slot.
+fn previous_label_observation(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	id: AtomId,
+	context: &EncodeContext,
+) -> FerrosGrynnResult<Option<(Text, usize)>> {
+	let (page_no, within) = hot_slot_address(id.slot())?;
+	let (generation, tombstone, label, properties) = match id.kind() {
+		Some(AtomKind::Node) => {
+			let page =
+				manager.read_page(transaction, base.page_key(DataFileKind::NodesHot, page_no)?)?;
+			let slot = read_node_hot_slot(page.as_page(), page_no, within)?;
+			(
+				slot.generation,
+				slot.flags.contains(NodeSlotFlags::TOMBSTONE),
+				decode_label(slot.label_id, &base.labels.node_labels)?,
+				slot.properties,
+			)
+		}
+		Some(AtomKind::Edge) => {
+			let page =
+				manager.read_page(transaction, base.page_key(DataFileKind::EdgesHot, page_no)?)?;
+			let slot = read_edge_hot_slot(page.as_page(), page_no, within)?;
+			(
+				slot.generation,
+				slot.flags.contains(EdgeSlotFlags::TOMBSTONE),
+				decode_label(slot.label_id, &base.labels.edge_labels)?,
+				slot.properties,
+			)
+		}
+		None => {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"statistics delta contains an invalid atom kind",
+			));
+		}
+	};
+	if tombstone || generation != id.generation() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"statistics delta references a stale atom",
+		));
+	}
+	let Some(label) = label else {
+		return Ok(None);
+	};
+	let property_count =
+		read_delta_property_count(manager, transaction, base, properties, context)?;
+	Ok(Some((label, property_count)))
+}
+
+/// Decodes one prior property record and returns its exact entry count.
+fn read_delta_property_count(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	location: Option<PropertyLocation>,
+	context: &EncodeContext,
+) -> FerrosGrynnResult<usize> {
+	let Some(location) = location else {
+		return Ok(0);
+	};
+	let limits = DecodeLimits::default();
+	let record = match location {
+		PropertyLocation::Inline {
+			page_no,
+			slot,
+			length,
+		} => {
+			let page = manager
+				.read_page(transaction, base.page_key(DataFileKind::Properties, page_no)?)?;
+			read_property_record(page.as_page(), page_no, slot, length)?.to_vec()
+		}
+		PropertyLocation::Large {
+			first_page,
+			length,
+		} => {
+			let length_usize = usize::try_from(length).map_err(|_error| {
+				FerrosGrynnError::invalid_storage_file("large property length exceeds usize")
+			})?;
+			if length_usize > limits.max_total_allocation {
+				let limit = u64::try_from(limits.max_total_allocation).map_err(|_error| {
+					FerrosGrynnError::invalid_storage_file("decode limit exceeds u64")
+				})?;
+				let actual = u64::try_from(length_usize).map_err(|_error| {
+					FerrosGrynnError::invalid_storage_file("property length exceeds u64")
+				})?;
+				return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+					"large property bytes",
+					limit,
+					actual,
+				));
+			}
+			let page_count = length_usize.div_ceil(LARGE_PROPERTY_CHUNK_BYTES);
+			let mut pages = Vec::with_capacity(page_count);
+			for offset in 0..page_count {
+				let page_no = first_page
+					.get()
+					.checked_add(u64::try_from(offset).map_err(|_error| {
+						FerrosGrynnError::invalid_storage_file(
+							"large property page offset exceeds u64",
+						)
+					})?)
+					.map(PageNo::new)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"large property page number overflows",
+						)
+					})?;
+				let page = manager
+					.read_page(transaction, base.page_key(DataFileKind::Properties, page_no)?)?;
+				let mut copy = AlignedPage::zeroed();
+				copy.as_bytes_mut().copy_from_slice(page.as_bytes());
+				pages.push(copy);
+			}
+			decode_large_property(first_page, &pages, length, limits.max_total_allocation)?
+		}
+	};
+	decode_property_map(&record, &context.decoder(), limits).map(|properties| properties.len())
 }
 
 fn number_pages(pages: Vec<AlignedPage>) -> FerrosGrynnResult<Vec<(PageNo, Box<AlignedPage>)>> {
@@ -2046,6 +2411,23 @@ fn number_pages(pages: Vec<AlignedPage>) -> FerrosGrynnResult<Vec<(PageNo, Box<A
 			Ok((page_no, boxed_page(page_no, page)?))
 		})
 		.collect()
+}
+
+/// Selects root and label pages allowed in an incremental statistics write.
+fn number_statistics_delta(
+	pages: Vec<AlignedPage>,
+) -> FerrosGrynnResult<Vec<(PageNo, Box<AlignedPage>)>> {
+	let mut output = Vec::new();
+	for (index, page) in pages.into_iter().enumerate() {
+		let page_no = u64::try_from(index).map(PageNo::new).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("statistics page index exceeds u64")
+		})?;
+		let page_type = page.validate(page_no)?.page_type();
+		if page_no.get() == 0 || page_type == crate::storage::page::PageType::LabelStatistic {
+			output.push((page_no, Box::new(page)));
+		}
+	}
+	Ok(output)
 }
 
 fn box_numbered_pages(
@@ -2565,50 +2947,6 @@ pub(super) fn record_node_adjacency(
 	Ok(())
 }
 
-pub(super) fn graph_statistics(
-	nodes: &BTreeMap<AtomId, NodeAdjacency>,
-	edge_count: usize,
-) -> FerrosGrynnResult<GraphStatistics> {
-	let total_out = nodes.values().try_fold(0_u64, |total, adjacency| {
-		total
-			.checked_add(u64::try_from(adjacency.outgoing.len()).map_err(|_error| {
-				FerrosGrynnError::invalid_storage_file("out-degree exceeds u64")
-			})?)
-			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("out-degree total overflows"))
-	})?;
-	let total_in = nodes.values().try_fold(0_u64, |total, adjacency| {
-		total
-			.checked_add(u64::try_from(adjacency.incoming.len()).map_err(|_error| {
-				FerrosGrynnError::invalid_storage_file("in-degree exceeds u64")
-			})?)
-			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("in-degree total overflows"))
-	})?;
-	let node_count = u64::try_from(nodes.len())
-		.map_err(|_error| FerrosGrynnError::invalid_storage_file("node count exceeds u64"))?;
-	let divisor = if node_count == 0 {
-		1.0
-	} else {
-		node_count as f64
-	};
-	Ok(GraphStatistics {
-		node_count,
-		edge_count: u64::try_from(edge_count)
-			.map_err(|_error| FerrosGrynnError::invalid_storage_file("edge count exceeds u64"))?,
-		average_out_degree: total_out as f64 / divisor,
-		average_in_degree: total_in as f64 / divisor,
-		maximum_out_degree: nodes
-			.values()
-			.map(|adjacency| adjacency.outgoing.len() as u64)
-			.max()
-			.unwrap_or(0),
-		maximum_in_degree: nodes
-			.values()
-			.map(|adjacency| adjacency.incoming.len() as u64)
-			.max()
-			.unwrap_or(0),
-	})
-}
-
 pub(super) struct LoadedNodeSlot {
 	id: AtomId,
 	record_id: RecordId,
@@ -2932,7 +3270,7 @@ pub(super) fn load_graph(
 		});
 	}
 	validate_node_adjacency(&loaded_nodes, &loaded_edges, &edges)?;
-	validate_auxiliary_files(&paths, &superblock)?;
+	validate_auxiliary_files(&paths, &superblock, &labels)?;
 
 	let decoded = DecodedGraph {
 		identity: uuid::Uuid::from_bytes(entry.identity).into(),
@@ -3167,13 +3505,14 @@ pub(super) fn validate_node_adjacency(
 pub(super) fn validate_auxiliary_files(
 	paths: &BTreeMap<DataFileKind, PathBuf>,
 	superblock: &GraphSuperblock,
+	labels: &LabelDictionary,
 ) -> FerrosGrynnResult<()> {
 	let subgraphs = open_graph_file(paths, DataFileKind::Subgraphs)?;
 	let freelist = open_graph_file(paths, DataFileKind::Freelist)?;
 	let statistics = open_graph_file(paths, DataFileKind::Statistics)?;
-	if subgraphs.page_count() != 1 || freelist.page_count() != 1 || statistics.page_count() != 1 {
+	if subgraphs.page_count() != 1 || freelist.page_count() != 1 || statistics.page_count() == 0 {
 		return Err(FerrosGrynnError::invalid_storage_file(
-			"stage-4 auxiliary files must contain one root page",
+			"auxiliary files have an invalid root-page count",
 		));
 	}
 	let mut page = AlignedPage::zeroed();
@@ -3190,8 +3529,12 @@ pub(super) fn validate_auxiliary_files(
 			"immutable generation freelist is not empty",
 		));
 	}
-	statistics.read_page(PageNo::new(0), &mut page)?;
-	let stats = decode_graph_statistics(&page)?;
+	let stats = decode_statistics(
+		|page_no, output| statistics.read_page(page_no, output).map(|_header| ()),
+		statistics.page_count(),
+		&labels.node_labels,
+		&labels.edge_labels,
+	)?;
 	if stats.node_count != superblock.node_count || stats.edge_count != superblock.edge_count {
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"statistics counts disagree with GraphSuperblock",

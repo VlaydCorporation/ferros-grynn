@@ -162,7 +162,7 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | `PageManager` / disk-страницы                                                                                                        | `gql_tech` §10; формат — `disk` §9–§21 | `src/storage`                                                  | 🟢 Windows manager/codecs/lazy graph adapter                    |
 | `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`      | 🟢 идентификаторы и primary lookup первого среза                |
 | `SchemaCatalog`                                                                                                                      | `disk` §18                             | `src/storage/catalog/`; полный DDL — будущий `src/schema`      | 🟡 durable tables/fields первого среза                          |
-| `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/storage/graph_pages/`; полный store — будущий `src/stats` | 🟡 минимальная graph/count statistics                           |
+| `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats`, `src/storage/graph_pages`                         | 🟢 exact counters, bulk histograms и durable reopen             |
 | Индексы (Label/BTree/Count/Fulltext/HNSW/DiskANN/R-tree/…)                                                                           | `disk` §20                             | `src/storage/graph_index/`; advanced — будущий `src/index`     | 🟡 primary/scalar B+tree; DiskANN physical contract отсутствует |
 | Changefeed / Live                                                                                                                    | `gql_spec` §21, `disk` §21             | `src/changefeed` (нов.)                                        | 🔴 новое                                                        |
 | Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql` (`analysis.rs`, `ir.rs`, `execution.rs`)             | 🟡 read-only срез; optimizer/traversal впереди                  |
@@ -762,9 +762,10 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
 
 Без статистики графовый планировщик не работает — обязательна для MVP.
 
-- **`src/stats/`** 🔴 — `StatisticsStore`: `GraphStatsPage`, `LabelStatsPage`,
-  `PropertyHistogramPage` (equi-depth), `DegreeHistogramPage`; NDV через HyperLogLog; сбор при
-  загрузке и инкрементально (per-transaction delta-счётчики), выборка фиксированного размера.
+- **`src/stats/`** 🟢 — MVCC `StatisticsStore`: точные graph/table/label counts и degree totals,
+  `PropertyHistogramPage`/`DegreeHistogramPage` с equi-depth buckets, exact NDV/null fractions при
+  full scan и per-transaction point delta со stale markers. Public `ANALYZE`, sampling/HLL и
+  bounded-memory сбор остаются будущему optimizer/import surface.
 
 ### Область G. Индексы (+ bulk-сборка) — P3–P5
 
@@ -896,7 +897,7 @@ qualified overflow. Таблица ниже теперь относится к �
 | **P3** (средний)     | E       | `src/schema/`                            | `SchemaCatalog`                                                     |
 | **P3**               | G       | `src/index/`                             | `LabelIndex`, `BTreeIndex`, `CountIndex`, bulk-сборка               |
 | **P3**               | J, K, L | optimizer, storage adapter, Traversal VM | `Datastore::execute` поверх утверждённого `PageManager`             |
-| **P4** (нормальный)  | F       | `src/stats/`                             | `StatisticsStore`                                                   |
+| **P4** (нормальный)  | F       | `src/stats/`                             | ✅ `StatisticsStore`, exact bulk + transactional counters           |
 | **P4**               | G       | `src/index/fulltext.rs`                  | `FulltextIndex` (BM25)                                              |
 | **P4**               | N       | `src/graph`, `src/index`                 | Derived incidence indexes и аналитические представления             |
 | **P5** (низкий)      | G       | `src/index/hnsw.rs`, `rtree.rs`          | `HnswIndex`, `RtreeIndex`                                           |
@@ -927,13 +928,14 @@ qualified overflow. Таблица ниже теперь относится к �
   checkpoint policy/Restart и read/write/reopen E2E.
 - **Фаза 4b — query-конвейер MVP** (P2–P3): ✅ P0–P2 read-only MATCH подключён для RAM
   и snapshot-bound local root: parser, analysis, `LogicalMatch`, минимальный runtime-
-  optimizer и sync pull исполнение. P3 stats/index optimizer и Traversal VM остаются.
+  optimizer и sync pull исполнение. StatisticsStore завершён; index-aware optimizer и Traversal
+  VM остаются.
 - **Фаза 5a — Windows sync storage completion** (P3–P4): ✅ scalar B+tree, generic incidence,
   nested graphs, recursive `query_to_memory`, atomicity/FCW/SSI/family E2E. Correctness gate
   пройден, но повторный Windows performance gate этапа 5 не прошёл sparse/scan throughput;
   format v1 остаётся candidate до устранения регрессии и Windows GA-core. Linux/NVMe и soak —
   отдельный gate Unix-выпуска, не Windows freeze.
-- **Фаза 5b — полная схема/статистика/optimizer indexes** (P3–P4): E, F, оставшаяся G
+- **Фаза 5b — полная схема/статистика/optimizer indexes** (P3–P4): ✅ E и F; оставшаяся G
   (Label/Count, external bulk и cost-based planner).
 - **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, затем отдельно утверждённый
   DiskANN, R-tree, derived incidence indexes и M (changefeed/live).

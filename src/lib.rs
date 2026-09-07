@@ -6,6 +6,7 @@ pub mod gql;
 pub mod graph;
 pub mod math;
 // mod memory;
+pub(crate) mod stats;
 pub(crate) mod storage;
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]

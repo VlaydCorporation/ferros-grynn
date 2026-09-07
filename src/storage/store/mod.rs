@@ -64,7 +64,6 @@ use super::{
 		EdgeSlotFlags,
 		EdgeTopologyCode,
 		EndpointSide,
-		GraphStatistics,
 		HOT_SLOTS_PER_PAGE,
 		LARGE_PROPERTY_CHUNK_BYTES,
 		MAX_INLINE_PROPERTY_BYTES,
@@ -79,16 +78,16 @@ use super::{
 		decode_adjacency_overflow,
 		decode_cross_level_overflow,
 		decode_freelist,
-		decode_graph_statistics,
 		decode_large_property,
 		decode_property_map,
+		decode_statistics,
 		decode_subgraph_directory,
 		encode_adjacency_overflow,
 		encode_cross_level_overflow,
 		encode_freelist,
-		encode_graph_statistics,
 		encode_large_property,
 		encode_property_map,
+		encode_statistics,
 		encode_subgraph_directory,
 		hot_slot_address,
 		new_edge_hot_page,
@@ -96,6 +95,9 @@ use super::{
 		read_edge_hot_slot,
 		read_node_hot_slot,
 		read_property_record,
+		statistics_bulk_layout_matches,
+		statistics_label_page_range,
+		statistics_page_count,
 		write_edge_hot_slot,
 		write_node_hot_slot,
 	},
@@ -117,6 +119,7 @@ use crate::{
 		TableKind,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	stats::{GraphStatistics, StatisticField, analyze_graph},
 	values::{
 		PropertyDictionary,
 		PropertyKeyId,
@@ -359,6 +362,8 @@ pub struct LocalGraph {
 	superblock: GraphSuperblock,
 	files: BTreeMap<DataFileKind, DataFileId>,
 	labels: LabelDictionary,
+	/// Statistics decoded for this exact durable graph revision.
+	statistics: GraphStatistics,
 	property_dictionary: Arc<PropertyDictionary>,
 	decode_context: Mutex<Option<Arc<EncodeContext>>>,
 	scalar_indexes: BTreeMap<String, Vec<LocalScalarIndex>>,
@@ -402,6 +407,11 @@ impl LocalGraph {
 
 	pub(crate) fn supports_atom_delta(&self) -> bool {
 		self.scalar_indexes.is_empty()
+	}
+
+	/// Returns statistics for this exact durable graph revision.
+	pub(crate) const fn statistics(&self) -> &GraphStatistics {
+		&self.statistics
 	}
 
 	fn file_id(&self, kind: DataFileKind) -> FerrosGrynnResult<DataFileId> {
@@ -476,6 +486,8 @@ pub struct LocalSnapshotGraph {
 	pub schema: LocalCommitGraphSchema,
 	/// Complete explicit membership recovered from live hot slots.
 	pub memberships: Vec<LocalCommitTableMembership>,
+	/// Recovered planner statistics for the exact graph revision.
+	pub statistics: GraphStatistics,
 	pub graph: Arc<LocalGraph>,
 }
 

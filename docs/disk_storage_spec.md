@@ -125,7 +125,7 @@ Mode 2: Disk-Backed                             (ЭТА СПЕЦИФИКАЦИЯ
     ├── subgraphs.fgb       (SubgraphDirPage)
     ├── labels.fgb          (LabelDictionary)
     ├── freelist_*.fgb      (FreelistPage per file)
-    ├── stats/              (StatisticsStore)
+    ├── statistics.fgb     (StatisticsStore)
     ├── idx/                (Index files)
     ├── changefeed/         (Changefeed logs)
     └── wal/                (WAL segments)
@@ -1699,14 +1699,14 @@ Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 4 (�
 page-codec version, `next_page`, длина chunk/полного payload и нулевые reserved bytes.
 Checksum проверяется до декодирования, общий payload ограничен 16 МиБ.
 
-| Объект | Обязательное durable определение |
-|--------|----------------------------------|
-| Root graph | identity/version, graph family, engine-owned label/adjacency identity/version и graph catalog metadata |
-| Table | identity/version, имя, owning `GraphId`, kind и engine-owned primary identity/version |
-| Field | identity/version, имя, `PropertyKeyId` и `Type` |
-| Standard/unique index | identity/version, имя, kind, ordered fields, exact `DataFileId` и root страницы immutable generation |
-| Parameter | identity/version, имя и canonical `StorageValue` bytes со словарями |
-| Atom membership | точный `(GraphId, AtomId(kind, slot, gen)) → Table SchemaId`; в local storage дублируется в соответствующем hot slot |
+| Объект                | Обязательное durable определение                                                                                     |
+|-----------------------|----------------------------------------------------------------------------------------------------------------------|
+| Root graph            | identity/version, graph family, engine-owned label/adjacency identity/version и graph catalog metadata               |
+| Table                 | identity/version, имя, owning `GraphId`, kind и engine-owned primary identity/version                                |
+| Field                 | identity/version, имя, `PropertyKeyId` и `Type`                                                                      |
+| Standard/unique index | identity/version, имя, kind, ordered fields, exact `DataFileId` и root страницы immutable generation                 |
+| Parameter             | identity/version, имя и canonical `StorageValue` bytes со словарями                                                  |
+| Atom membership       | точный `(GraphId, AtomId(kind, slot, gen)) → Table SchemaId`; в local storage дублируется в соответствующем hot slot |
 
 RAM и local backends используют один membership contract; форма пользовательского
 `RecordId` не назначает таблицу. У одного атома одновременно не более одной таблицы. Удаление
@@ -1826,21 +1826,55 @@ custom_fn_id:     u32  -- NULL_LABEL = нет пользовательской �
 
 ## 19. StatisticsStore — статистика для планировщика
 
-Планировщик (`gql_spec.md §21.4`) требует степени, гистограммы, selectivity.
-Статистика обновляется инкрементально при DML-операциях и при явном `ANALYZE`.
+Планировщик (`gql_spec.md §21.4`) использует cardinality, степени и распределения только для
+выбора плана. Ошибочная или устаревшая статистика может ухудшить план, но не меняет результаты:
+residual predicate остаётся обязательным, а статистика не является источником истины для данных.
+
+`StatisticsStore` принадлежит одному MVCC-root и хранит статистику по точной ревизии графа.
+Durable-представление одного графа — единый checksummed `statistics.fgb`: page 0 содержит
+`StatisticsRoot`, затем без разрывов идут диапазоны `DegreeHistogram`, `PropertyHistogram` и
+хвост `LabelStatistic`. Root хранит начало и длину каждого диапазона; они обязаны покрывать ровно
+весь файл. Недостижимые, переставленные и лишние страницы являются повреждением.
+
+Label-страницы находятся в хвосте, поэтому point-DML может расширять их, не сдвигая
+bulk-гистограммы. `GraphSuperblock.stats_root_page` в format v1 равен нулю.
 
 ### 19.1. GraphStatsPage
 
 ```
-PageHeader(32) (magic=MAGIC_STATS, type=StatisticsRoot)
-node_count:         u64
-edge_count:         u64
-avg_out_degree:     f64
-avg_in_degree:      f64
-max_out_degree:     u64
-max_in_degree:      u64
-degree_histogram_page: u64  -- страница с гистограммой out-degree
+Offset  Size  Тип    Поле
+0       32    —      PageHeader (magic=MAGIC_STATS, type=StatisticsRoot, page_no=0)
+32      8     u64    node_count
+40      8     u64    edge_count
+48      8     f64    avg_out_degree       -- производное, сверяется с exact total
+56      8     f64    avg_in_degree        -- производное, сверяется с exact total
+64      8     u64    max_out_degree
+72      8     u64    max_in_degree
+80      8     u64    degree_first_page    -- NULL_PAGE, если диапазон пуст
+88      8     u64    label_first_page     -- NULL_PAGE, если диапазон пуст
+96      8     u64    property_first_page  -- NULL_PAGE, если диапазон пуст
+104     4     u32    label_page_count
+108     4     u32    degree_page_count
+112     4     u32    property_page_count
+116     4     u32    statistics_layout_version = 1
+120     8     u64    analyzed_revision
+128     8     u64    dirty_rows
+136     8     u64    total_out_degree
+144     8     u64    total_in_degree
+152     8     u64    total_undirected_degree
+160     8     u64    revision
+168     ...   —      _reserved = 0
 ```
+
+`node_count`, `edge_count` и три degree totals точны для `revision`. Средние выводятся из
+целочисленных totals; записанные `f64` являются проверяемой избыточностью, а не authority.
+`max_*` точны после bulk-пересчёта и могут быть только консервативной верхней границей после
+point-DML, уменьшающего степень. `analyzed_revision == revision && dirty_rows == 0` означает, что
+bulk-распределения соответствуют текущей ревизии.
+
+Точные per-table counts входят в логический `StatisticsStore`, но не дублируются в этом файле:
+их authority — generation-aware membership в `SchemaCatalog`. При commit/reopen они
+транзакционно пересчитываются из того же catalog root.
 
 ### 19.2. LabelStatsPage
 
@@ -1849,8 +1883,14 @@ PageHeader(32) (magic=MAGIC_STATS, type=LabelStatistic)
 next_page: u64
 count:     u32
 _pad:      u32
-entries: [label_id(u32) + atom_count(u64) + avg_prop_count(f32)] × count
+entries: [combined_label_id(u32) + atom_count(u64) + property_count(u64)] × count
 ```
+
+Node labels занимают диапазон `[0, node_label_count)`, edge labels — следующий диапазон со
+смещением `node_label_count`; `u32::MAX` зарезервирован и недопустим. `property_count` — точная
+сумма числа свойств атомов метки; среднее выводится как `property_count / atom_count` без потери
+точности. Point-DML сохраняет запись с нулевым `atom_count`, чтобы не усекать файл; следующий
+bulk-пересчёт удаляет такие записи.
 
 ### 19.3. PropertyHistogramPage
 
@@ -1867,43 +1907,66 @@ Offset                  Size                Тип     Содержимое
 50                      4                   f32     null_fraction   -- доля NULL/NONE значений
 54                      2                   u16     bucket_count
 56                      8 × bucket_count    [u64]   offsets         -- массив смещений бакетов
-56 + 8 × bucket_count   -                   -       buckets: [lo_value + hi_value + freq(u64) + ndv(u64)] × bucket_count
+56 + 8 × bucket_count   -                   -       buckets: [lo_len(u16) + hi_len(u16) + lo_value + hi_value + freq(u64) + ndv(u64)] × bucket_count
 ```
 
-Bucket значения кодируются compact order-preserving encoding (§20.2.1).
+Bucket значения кодируются compact order-preserving encoding (§20.2.1). Смещения строго
+возрастают, первый bucket начинается сразу после массива offsets, а последний заканчивается до
+границы страницы; неиспользованный хвост заполнен нулями. `distinct_count`, bucket `freq` и
+bucket `ndv` точны для последнего bulk-пересчёта. `null_fraction` учитывает отсутствующие,
+`NONE` и `NULL` значения среди членов соответствующей таблицы.
+
+Один histogram занимает одну страницу. Неподдерживаемый тип, значение, которое нельзя безопасно
+закодировать индексным codec, либо распределение, не помещающееся в страницу, приводит к
+отсутствию только этой необязательной гистограммы. Пользовательская транзакция из-за этого не
+отклоняется.
 
 ### 19.4. DegreeHistogramPage
 
 ```
 PageHeader(32) (magic=MAGIC_STATS, type=DegreeHistogram)
-label_id:  u32
+label_id:  u32  -- combined node label id или u32::MAX для всего графа
 direction: u8   -- 0=out, 1=in, 2=undir
 _pad:      u8 × 2
 bucket_count: u16
 buckets:   [min_degree(u32) + max_degree(u32) + node_count(u64)] × bucket_count
 ```
 
+Per-label degree histogram допустим только для node label. В распределение входят все живые
+вершины соответствующего множества, включая вершины с нулевой степенью.
+
 ### 19.5. Метод построения гистограмм и NDV
 
 **Гистограммы — equi-depth (равнонаполненные).** Границы корзин выбираются так, чтобы в каждую попадало примерно одинаковое число строк, а не чтобы корзины были равной ширины по значению. Equi-width деградирует на перекошенных распределениях: одна корзина собирает почти всё, и оценка селективности становится бессмысленной — а перекос в графовых данных норма (степени вершин, частоты меток).
 
-Число корзин — `FG_STATS_HISTOGRAM_BUCKETS` (по умолчанию 100). Для каждой корзины хранятся границы, частота и число различных значений внутри неё (`ndv`), что позволяет оценивать и точечные предикаты, и диапазонные.
+Число корзин ограничено 100. Для `N > 0` создаётся ровно `min(100, N)` непустых корзин;
+размеры корзин отличаются не более чем на одну запись. Для каждой корзины хранятся границы,
+частота и число различных значений внутри неё (`ndv`). Текущий bulk-путь выполняет полный scan,
+сортирует значения и считает общий и bucket NDV точно.
 
-**NDV — HyperLogLog.** Точный подсчёт различных значений требует памяти порядка их количества. Вместо этого используется тот же компонент HLL, что уже применяется в neighbourhood-индексе (§20.9): фиксированные 64 байта регистров на поле, погрешность ~2%. Итог записывается в `distinct_count`.
+Приближённый HLL и sampled `ANALYZE` в format-v1 candidate не реализованы и не являются
+неявным fallback. Их добавление требует отдельно утверждённого error/memory budget. Для
+классического HLL стандартная ошибка оценивается как `1.04 / sqrt(m)`: 64 однобайтовых регистра
+дают около 13%, а 4096 — около 1.6%, поэтому прежнее допущение «64 байта ≈ 2%» неверно.
 
 ### 19.6. Обновление статистики
 
-- **Инкрементально**: счётчики (`node_count`, `edge_count`, per-label `atom_count`) обновляются **дельтой на транзакцию** — накапливаются в транзакции и применяются один раз при коммите. Обновление на каждую строку превращало бы одну страницу статистики в точку сериализации всех писателей.
-- **Полный пересчёт**: `ANALYZE [ TABLE @name | GRAPH @name ]`.
-- **Автоматический trigger**: при `dirty_row_fraction > FG_STATS_AUTO_ANALYZE_DIRTY` (0.10).
+- **Point-DML:** транзакционная дельта один раз при commit обновляет точные graph/table/label
+  counts, label `property_count` и degree totals. Membership-only delta также увеличивает
+  `dirty_rows`, поскольку меняет выборку property histogram. Root и полный label-range
+  публикуются в той же frame-WAL транзакции, что и данные. Degree/property histogram pages не
+  переписываются; `revision`, `dirty_rows` и `analyzed_revision` явно отмечают их устаревшими.
+- **Bulk-путь:** создание полного graph image и schema-affected materialized rebuild выполняют
+  один полный scan и атомарно заменяют точные counts и все распределения. Этот же анализатор
+  используется RAM и local backend.
+- **Планировщик:** при stale или отсутствующей гистограмме использует консервативную оценку либо
+  scan, но всегда сохраняет residual predicate. Корректность данных не зависит от статистики.
+- **Ошибки:** overflow точного счётчика или структурно повреждённый файл отклоняют commit/open;
+  невозможность построить отдельную optional property histogram — нет.
 
-**Выборка вместо полного скана.** `ANALYZE` не читает таблицу целиком, если она больше порога `FG_STATS_FULL_SCAN_THRESHOLD` (по умолчанию 32 страницы): для маленьких таблиц полный скан дешевле и точнее, для больших берётся **выборка фиксированного размера** `FG_STATS_SAMPLE_ROWS` (по умолчанию 30 000 случайных строк) **независимо от размера таблицы**.
-
-Фиксированный, а не пропорциональный размер выборки — принципиально: иначе `ANALYZE` растёт линейно с графом и сам становится узким местом, что прямо противоречит автоматическому триггеру при 10% изменений. Точность equi-depth гистограммы определяется размером выборки, а не долей таблицы, поэтому нескольких десятков тысяч строк достаточно и для миллиарда атомов.
-
-Алгоритм: собрать выборку → отсортировать → расставить границы корзин так, чтобы в каждой было ≈ `sample_size / bucket_count` строк → масштабировать частоты на `row_count / sample_size`. Границы корзин записываются в том же order-preserving кодировании, что и ключи индексов (§20.2.1), поэтому сравнение с предикатом не требует декодирования.
-
-**Статистика как побочный продукт bulk-сборки.** При массовой загрузке (§20.13) ключи каждого индекса и так проходят через полную сортировку, поэтому точные `distinct_count`, `null_fraction` и границы корзин вычисляются одним и тем же проходом — отдельный `ANALYZE` после импорта не нужен и выборка не требуется.
+Публичный синтаксис/политика `ANALYZE`, автоматический порог, sampling и external-memory сборка
+не входят в этот этап и должны быть утверждены вместе с optimizer/import surface. Они не
+додумываются из прежнего ненормативного эскиза.
 
 ---
 
@@ -2991,14 +3054,14 @@ snapshot.visible_lsn`. Checkpoint переносит закоммиченные 
 
 Что эта модель даёт по сравнению с журналом дельт:
 
-| Проблема                        | Решение                                                                                                                                                                     |
-|---------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Незакоммиченные данные на диске | Фреймы без durable `TxCommit` невидимы и никогда не бэкфиллятся; начальный atom-delta write-set ограничен 256 МиБ |
-| Torn write                      | Фрейм **и есть** полный образ страницы; отдельный механизм full-page-write не нужен                                                                                         |
-| Отсутствие on-disk MVCC         | Снимок видит committed-фреймы с `commit_lsn ≤ visible_lsn`; версионность появляется как побочный эффект                                                                       |
+| Проблема                        | Решение                                                                                                                                                                                    |
+|---------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Незакоммиченные данные на диске | Фреймы без durable `TxCommit` невидимы и никогда не бэкфиллятся; начальный atom-delta write-set ограничен 256 МиБ                                                                          |
+| Torn write                      | Фрейм **и есть** полный образ страницы; отдельный механизм full-page-write не нужен                                                                                                        |
+| Отсутствие on-disk MVCC         | Снимок видит committed-фреймы с `commit_lsn ≤ visible_lsn`; версионность появляется как побочный эффект                                                                                    |
 | Потолок объёма транзакции       | До commit lock вычисляется консервативный рекурсивный объём owned atom-delta; при превышении 256 МиБ commit отклоняется `FG-54F07`; transaction-private spill — отдельный последующий этап |
-| Откат                           | Отбросить scratch-фреймы и записи индекса. UNDO и CLR не нужны                                                                                                              |
-| Идемпотентность replay          | Применение фрейма — `memcpy`; повторное применение того же образа ничего не меняет                                                                                          |
+| Откат                           | Отбросить scratch-фреймы и записи индекса. UNDO и CLR не нужны                                                                                                                             |
+| Идемпотентность replay          | Применение фрейма — `memcpy`; повторное применение того же образа ничего не меняет                                                                                                         |
 
 Ключевое отличие от «чистого COW» (LMDB): обратная запись **на штатное место** сохраняет арифметическую адресацию §25.1 (`page_no = slot / 102`) и физическую кластеризацию SoA, на которых держится аналитический путь. Data-file COW обе эти вещи разрушает.
 
@@ -3521,13 +3584,13 @@ TensorCachePage инвалидируется при любом изменени�
 
 **Журнал и checkpoint** (§22–§23)
 
-| Параметр                   | Тип   | Default    | Описание                                                                                          |
-|----------------------------|-------|------------|---------------------------------------------------------------------------------------------------|
-| `FG_TX_WRITE_SET_MAX_BYTES` | u64   | 268435456  | Лимит atom-delta write-set sync MVP (256 МиБ); превышение отклоняет commit                         |
-| `FG_WAL_CHECKPOINT_FRAMES` | usize | 4096       | Порог автоматического запуска бэкфилла                                                            |
-| `FG_WAL_MAX_TOTAL_BYTES`   | u64   | 1073741824 | Жёсткий предел размера журнала (1 ГиБ) → принудительный бэкфилл отстающего графа                  |
-| `FG_WAL_SYNC_MODE`         | enum  | `full`     | `full` \| `normal` \| `off`                                                                       |
-| `FG_MAX_SNAPSHOT_AGE_SEC`  | u64   | 300        | Возраст снимка, после которого он принудительно закрывается, чтобы разблокировать обрезку журнала |
+| Параметр                    | Тип   | Default    | Описание                                                                                          |
+|-----------------------------|-------|------------|---------------------------------------------------------------------------------------------------|
+| `FG_TX_WRITE_SET_MAX_BYTES` | u64   | 268435456  | Лимит atom-delta write-set sync MVP (256 МиБ); превышение отклоняет commit                        |
+| `FG_WAL_CHECKPOINT_FRAMES`  | usize | 4096       | Порог автоматического запуска бэкфилла                                                            |
+| `FG_WAL_MAX_TOTAL_BYTES`    | u64   | 1073741824 | Жёсткий предел размера журнала (1 ГиБ) → принудительный бэкфилл отстающего графа                  |
+| `FG_WAL_SYNC_MODE`          | enum  | `full`     | `full` \| `normal` \| `off`                                                                       |
+| `FG_MAX_SNAPSHOT_AGE_SEC`   | u64   | 300        | Возраст снимка, после которого он принудительно закрывается, чтобы разблокировать обрезку журнала |
 
 **Сборка индексов и массовая загрузка** (§20.13)
 

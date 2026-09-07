@@ -137,14 +137,21 @@ fn table_membership_is_explicit_and_record_id_independent() {
 			.unwrap(),
 		)
 		.unwrap();
-	transaction
+	transaction.commit().unwrap();
+	let table_id = store.table("person").unwrap().id().unwrap().get();
+
+	let mut assign = store.begin();
+	assign
 		.assign_atom_to_table(
 			&reference,
 			&AtomRef::new(AtomKind::Node, "account:assigned".parse().unwrap()),
 			"person",
 		)
 		.unwrap();
-	transaction.commit().unwrap();
+	assign.commit().unwrap();
+	let statistics = store.current_root().statistics.graph(reference.id()).unwrap().clone();
+	assert_eq!(statistics.tables.get(&table_id), Some(&1));
+	assert_eq!(statistics.dirty_rows, 1);
 
 	let result = store.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
 	let Value::Array(rows) = result[0].result.as_ref().unwrap().value() else {
@@ -410,6 +417,33 @@ fn local_graph_table_and_edge_survive_reopen() {
 	let parameter = reopened.parameter("batch").unwrap();
 	assert_eq!(parameter.id(), Some(parameter_id));
 	assert_eq!(parameter.value(), &Value::from(64_i64));
+	{
+		let root = reopened.inner.current.read();
+		let statistics = root.statistics.graph(reference.id()).unwrap();
+		assert_eq!(statistics.revision, statistics.analyzed_revision);
+		assert_eq!(statistics.tables.get(&table_id.get()), Some(&2));
+		assert_eq!(
+			statistics
+				.labels
+				.get(&crate::stats::LabelStatisticKey {
+					kind: AtomKind::Node,
+					label: "Person".into(),
+				})
+				.map(|value| value.atom_count),
+			Some(2)
+		);
+		for field_id in &field_ids {
+			let histogram = statistics
+				.property_histograms
+				.get(&crate::stats::PropertyHistogramKey {
+					table_id: table_id.get(),
+					field_id: field_id.get(),
+				})
+				.unwrap();
+			assert_eq!(histogram.distinct_count, 2);
+			assert_eq!(histogram.null_fraction, 0.0);
+		}
+	}
 	let mut bounded = reopened.begin();
 	assert!(bounded.mutate_graph(schema.graph()).is_err());
 	drop(bounded);
@@ -492,6 +526,17 @@ fn local_membership_only_delta_survives_reopen() {
 		)
 		.unwrap();
 	create.commit().unwrap();
+	let table_id = store.table("person").unwrap().id().unwrap().get();
+	assert_eq!(
+		store
+			.current_root()
+			.statistics
+			.graph(reference.id())
+			.and_then(|statistics| statistics.tables.get(&table_id))
+			.copied()
+			.unwrap_or(0),
+		0
+	);
 
 	let before = store.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
 	let Value::Array(rows) = before[0].result.as_ref().unwrap().value() else {
@@ -508,9 +553,15 @@ fn local_membership_only_delta_survives_reopen() {
 		)
 		.unwrap();
 	assign.commit().unwrap();
+	let statistics = store.current_root().statistics.graph(reference.id()).unwrap().clone();
+	assert_eq!(statistics.tables.get(&table_id), Some(&1));
+	assert_eq!(statistics.dirty_rows, 1);
 	drop(store);
 
 	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	let statistics = reopened.current_root().statistics.graph(reference.id()).unwrap().clone();
+	assert_eq!(statistics.tables.get(&table_id), Some(&1));
+	assert_eq!(statistics.dirty_rows, 1);
 	let after = reopened.execute("SELECT VALUE id FROM person", &Object::new()).unwrap();
 	let Value::Array(rows) = after[0].result.as_ref().unwrap().value() else {
 		panic!("SELECT must return an array");
@@ -1007,6 +1058,23 @@ fn local_point_mutations_survive_reopen() {
 		view.edge(edge_id).unwrap().unwrap().topology().unwrap().local_binary(),
 		Some((alpha_id, gamma_id, EdgeDirection::Directed))
 	);
+	{
+		let root = store.inner.current.read();
+		let statistics = root.statistics.graph(graph.id()).unwrap();
+		assert_eq!((statistics.node_count, statistics.edge_count), (2, 1));
+		assert_eq!((statistics.total_out_degree, statistics.total_in_degree), (1, 1));
+		assert_eq!(
+			statistics
+				.labels
+				.get(&crate::stats::LabelStatisticKey {
+					kind: AtomKind::Node,
+					label: "Changed".into(),
+				})
+				.map(|value| (value.atom_count, value.property_count)),
+			Some((1, 1))
+		);
+		assert!(statistics.revision > statistics.analyzed_revision);
+	}
 
 	let mut update = store.begin();
 	let mut mutation = update.mutate_graph(&graph).unwrap();
@@ -1038,6 +1106,20 @@ fn local_point_mutations_survive_reopen() {
 	assert_eq!(
 		view.node(alpha_id).unwrap().unwrap().properties().unwrap().get(score),
 		Some(&Value::from(9_i64))
+	);
+	let root = store.inner.current.read();
+	let statistics = root.statistics.graph(graph.id()).unwrap();
+	assert_eq!((statistics.node_count, statistics.edge_count), (1, 0));
+	assert_eq!((statistics.total_out_degree, statistics.total_in_degree), (0, 0));
+	assert_eq!(
+		statistics
+			.labels
+			.get(&crate::stats::LabelStatisticKey {
+				kind: AtomKind::Node,
+				label: "Changed".into(),
+			})
+			.map(|value| (value.atom_count, value.property_count)),
+		Some((1, 1))
 	);
 }
 

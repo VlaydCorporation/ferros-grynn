@@ -453,6 +453,8 @@ impl Transaction {
 			return Ok(());
 		}
 
+		let statistics_base =
+			current.graphs.get(&id).and_then(|stored| stored.graph.materialized()).cloned();
 		let graph = match (&write.base, current.graphs.get(&id)) {
 			(Some(base), Some(latest)) if latest.last_commit_ts > write.base_ts => {
 				let latest = self.materialize_stored_graph(&latest.graph)?;
@@ -499,26 +501,38 @@ impl Transaction {
 		stored.graph = StoredGraphValue::Materialized(graph.clone());
 		stored.record_index = Arc::new(build_record_index(&graph)?);
 		stored.last_commit_ts = commit_ts;
-		let catalog = Arc::make_mut(&mut next.schema);
-		catalog.graph_names.insert(name, id.clone());
-		if created {
-			write.schema.published_at = commit_ts;
-			catalog.graphs.insert(id.clone(), Arc::new(write.schema));
-		}
-		for (atom, table) in write.memberships {
-			catalog.set_membership(&id, atom, table)?;
-		}
-		for target in &dirty {
-			if let DirtyTarget::Atom(atom) = target
-				&& !graph.contains(*atom)
-			{
-				catalog.set_membership(&id, *atom, None)?;
+		{
+			let catalog = Arc::make_mut(&mut next.schema);
+			catalog.graph_names.insert(name, id.clone());
+			if created {
+				write.schema.published_at = commit_ts;
+				catalog.graphs.insert(id.clone(), Arc::new(write.schema));
+			}
+			for (atom, table) in write.memberships {
+				catalog.set_membership(&id, atom, table)?;
+			}
+			for target in &dirty {
+				if let DirtyTarget::Atom(atom) = target
+					&& !graph.contains(*atom)
+				{
+					catalog.set_membership(&id, *atom, None)?;
+				}
+			}
+			if created {
+				catalog.graph_versions.insert(id.clone(), commit_ts);
 			}
 		}
-		next.graphs.insert(id.clone(), stored);
-		if created {
-			catalog.graph_versions.insert(id, commit_ts);
+		if let Some(before) = statistics_base {
+			let dirty_atoms = dirty
+				.iter()
+				.filter_map(|target| match target {
+					DirtyTarget::Atom(atom) => Some(*atom),
+					DirtyTarget::Graph => None,
+				})
+				.collect::<BTreeSet<_>>();
+			next.update_materialized_statistics(&id, &before, &graph, &dirty_atoms)?;
 		}
+		next.graphs.insert(id.clone(), stored);
 		Ok(())
 	}
 }

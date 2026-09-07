@@ -5,6 +5,18 @@ use bitflags::bitflags;
 use super::page::{AlignedPage, PAGE_HEADER_SIZE, PAGE_SIZE, PageFlags, PageLsn, PageNo, PageType};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	stats::{
+		DegreeBucket,
+		DegreeDirection,
+		DegreeHistogram,
+		DegreeHistogramKey,
+		GraphStatistics,
+		LabelStatistic,
+		LabelStatisticKey,
+		PropertyBucket,
+		PropertyHistogram,
+		PropertyHistogramKey,
+	},
 	values::{
 		PropertyMap,
 		storage::{
@@ -58,7 +70,15 @@ pub(super) use props::{
 	encode_property_map,
 	read_property_record,
 };
-pub(super) use statistics::{GraphStatistics, decode_graph_statistics, encode_graph_statistics};
+#[cfg(test)]
+use statistics::{decode_graph_statistics, encode_graph_statistics};
+pub(super) use statistics::{
+	decode_statistics,
+	encode_statistics,
+	statistics_bulk_layout_matches,
+	statistics_label_page_range,
+	statistics_page_count,
+};
 pub(super) use subgraphs::{SubgraphEntry, decode_subgraph_directory, encode_subgraph_directory};
 
 /// Fixed byte size of both hot-slot formats.
@@ -178,7 +198,48 @@ const STATS_AVG_IN_OFFSET: usize = STATS_AVG_OUT_OFFSET + size_of::<f64>();
 const STATS_MAX_OUT_OFFSET: usize = STATS_AVG_IN_OFFSET + size_of::<f64>();
 const STATS_MAX_IN_OFFSET: usize = STATS_MAX_OUT_OFFSET + size_of::<u64>();
 const STATS_DEGREE_HISTOGRAM_OFFSET: usize = STATS_MAX_IN_OFFSET + size_of::<u64>();
-const STATS_RESERVED_OFFSET: usize = STATS_DEGREE_HISTOGRAM_OFFSET + size_of::<u64>();
+const STATS_LABEL_FIRST_OFFSET: usize = STATS_DEGREE_HISTOGRAM_OFFSET + size_of::<u64>();
+const STATS_PROPERTY_FIRST_OFFSET: usize = STATS_LABEL_FIRST_OFFSET + size_of::<u64>();
+const STATS_LABEL_PAGE_COUNT_OFFSET: usize = STATS_PROPERTY_FIRST_OFFSET + size_of::<u64>();
+const STATS_DEGREE_PAGE_COUNT_OFFSET: usize = STATS_LABEL_PAGE_COUNT_OFFSET + size_of::<u32>();
+const STATS_PROPERTY_PAGE_COUNT_OFFSET: usize = STATS_DEGREE_PAGE_COUNT_OFFSET + size_of::<u32>();
+const STATS_LAYOUT_VERSION_OFFSET: usize = STATS_PROPERTY_PAGE_COUNT_OFFSET + size_of::<u32>();
+const STATS_ANALYZED_REVISION_OFFSET: usize = STATS_LAYOUT_VERSION_OFFSET + size_of::<u32>();
+const STATS_DIRTY_ROWS_OFFSET: usize = STATS_ANALYZED_REVISION_OFFSET + size_of::<u64>();
+const STATS_TOTAL_OUT_OFFSET: usize = STATS_DIRTY_ROWS_OFFSET + size_of::<u64>();
+const STATS_TOTAL_IN_OFFSET: usize = STATS_TOTAL_OUT_OFFSET + size_of::<u64>();
+const STATS_TOTAL_UNDIRECTED_OFFSET: usize = STATS_TOTAL_IN_OFFSET + size_of::<u64>();
+const STATS_REVISION_OFFSET: usize = STATS_TOTAL_UNDIRECTED_OFFSET + size_of::<u64>();
+const STATS_RESERVED_OFFSET: usize = STATS_REVISION_OFFSET + size_of::<u64>();
+
+/// Per-label statistics fields.
+const LABEL_STATS_NEXT_OFFSET: usize = PAGE_HEADER_SIZE;
+const LABEL_STATS_COUNT_OFFSET: usize = LABEL_STATS_NEXT_OFFSET + size_of::<u64>();
+const LABEL_STATS_PADDING_OFFSET: usize = LABEL_STATS_COUNT_OFFSET + size_of::<u32>();
+const LABEL_STATS_ENTRIES_OFFSET: usize = LABEL_STATS_PADDING_OFFSET + size_of::<u32>();
+const LABEL_STATS_ENTRY_BYTES: usize = size_of::<u32>() + size_of::<u64>() * 2;
+const LABEL_STATS_PER_PAGE: usize =
+	(PAGE_SIZE - LABEL_STATS_ENTRIES_OFFSET) / LABEL_STATS_ENTRY_BYTES;
+
+/// Degree-histogram fields.
+const DEGREE_STATS_LABEL_OFFSET: usize = PAGE_HEADER_SIZE;
+const DEGREE_STATS_DIRECTION_OFFSET: usize = DEGREE_STATS_LABEL_OFFSET + size_of::<u32>();
+const DEGREE_STATS_PADDING_OFFSET: usize = DEGREE_STATS_DIRECTION_OFFSET + size_of::<u8>();
+const DEGREE_STATS_BUCKET_COUNT_OFFSET: usize = DEGREE_STATS_PADDING_OFFSET + size_of::<u8>() * 2;
+const DEGREE_STATS_BUCKETS_OFFSET: usize = DEGREE_STATS_BUCKET_COUNT_OFFSET + size_of::<u16>();
+const DEGREE_STATS_BUCKET_BYTES: usize = size_of::<u32>() * 2 + size_of::<u64>();
+
+/// Property-histogram fields.
+const PROPERTY_STATS_TABLE_OFFSET: usize = PAGE_HEADER_SIZE;
+const PROPERTY_STATS_FIELD_OFFSET: usize = PROPERTY_STATS_TABLE_OFFSET + size_of::<u32>();
+const PROPERTY_STATS_TYPE_OFFSET: usize = PROPERTY_STATS_FIELD_OFFSET + size_of::<u32>();
+const PROPERTY_STATS_PADDING_OFFSET: usize = PROPERTY_STATS_TYPE_OFFSET + size_of::<u8>();
+const PROPERTY_STATS_DISTINCT_OFFSET: usize = PROPERTY_STATS_PADDING_OFFSET + size_of::<u8>();
+const PROPERTY_STATS_NULL_FRACTION_OFFSET: usize =
+	PROPERTY_STATS_DISTINCT_OFFSET + size_of::<u64>();
+const PROPERTY_STATS_BUCKET_COUNT_OFFSET: usize =
+	PROPERTY_STATS_NULL_FRACTION_OFFSET + size_of::<f32>();
+const PROPERTY_STATS_OFFSETS_OFFSET: usize = PROPERTY_STATS_BUCKET_COUNT_OFFSET + size_of::<u16>();
 
 bitflags! {
 	/// Assigned node-hot slot flags.
@@ -644,6 +705,8 @@ fn read_f64(bytes: &[u8], offset: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::BTreeMap;
+
 	use super::*;
 	use crate::values::{PropertyDictionary, Value, graph::AtomKind, storage::DiskAtomRef};
 
@@ -810,13 +873,120 @@ mod tests {
 		let expected = GraphStatistics {
 			node_count: 4,
 			edge_count: 3,
-			average_out_degree: 0.75,
-			average_in_degree: 0.75,
+			total_out_degree: 3,
+			total_in_degree: 3,
 			maximum_out_degree: 2,
 			maximum_in_degree: 2,
+			..GraphStatistics::default()
 		};
-		let page = encode_graph_statistics(expected, PageLsn::ZERO)?;
+		let page = encode_graph_statistics(&expected, PageLsn::ZERO)?;
 		assert_eq!(decode_graph_statistics(&page)?, expected);
+		Ok(())
+	}
+
+	/// A complete statistics image preserves exact counters and bulk
+	/// distributions.
+	#[test]
+	fn statistics_file_round_trips_auxiliary_pages() -> FerrosGrynnResult<()> {
+		let person = LabelStatisticKey {
+			kind: AtomKind::Node,
+			label: "Person".into(),
+		};
+		let retired = LabelStatisticKey {
+			kind: AtomKind::Edge,
+			label: "OLD".into(),
+		};
+		let expected = GraphStatistics {
+			revision: 12,
+			analyzed_revision: 10,
+			dirty_rows: 2,
+			node_count: 2,
+			edge_count: 1,
+			total_out_degree: 1,
+			total_in_degree: 1,
+			maximum_out_degree: 1,
+			maximum_in_degree: 1,
+			labels: BTreeMap::from([
+				(person.clone(), LabelStatistic {
+					atom_count: 2,
+					property_count: 4,
+				}),
+				(retired, LabelStatistic::default()),
+			]),
+			degree_histograms: BTreeMap::from([(
+				DegreeHistogramKey {
+					label: None,
+					direction: DegreeDirection::Out,
+				},
+				DegreeHistogram {
+					buckets: vec![DegreeBucket {
+						minimum: 0,
+						maximum: 1,
+						node_count: 2,
+					}],
+				},
+			)]),
+			property_histograms: BTreeMap::from([(
+				PropertyHistogramKey {
+					table_id: 7,
+					field_id: 9,
+				},
+				PropertyHistogram {
+					type_tag: TypeTag::Int.byte(),
+					distinct_count: 2,
+					null_fraction: 0.25,
+					buckets: vec![PropertyBucket {
+						lower: vec![1],
+						upper: vec![9],
+						frequency: 3,
+						distinct_count: 2,
+					}],
+				},
+			)]),
+			..GraphStatistics::default()
+		};
+		let node_labels = vec!["Person".to_owned()];
+		let edge_labels = vec!["OLD".to_owned()];
+		let mut pages = encode_statistics(&expected, &node_labels, &edge_labels, PageLsn::ZERO)?;
+		assert!(pages.len() > 1);
+		let page_count = u64::try_from(pages.len())
+			.map_err(|_error| invalid_page(0, "test page count exceeds u64"))?;
+		let decoded = decode_statistics(
+			|page_no, output| {
+				let index = usize::try_from(page_no.get()).map_err(|_error| {
+					invalid_page(page_no.get(), "test page number exceeds usize")
+				})?;
+				output.as_bytes_mut().copy_from_slice(pages[index].as_bytes());
+				Ok(())
+			},
+			page_count,
+			&node_labels,
+			&edge_labels,
+		)?;
+		assert_eq!(decoded, expected);
+
+		let label_pages = read_u32(pages[0].as_bytes(), STATS_LABEL_PAGE_COUNT_OFFSET);
+		write_u32(
+			pages[0].as_bytes_mut(),
+			STATS_LABEL_PAGE_COUNT_OFFSET,
+			label_pages.checked_add(1).ok_or_else(|| invalid_page(0, "test count overflows"))?,
+		);
+		pages[0].seal()?;
+		assert!(
+			decode_statistics(
+				|page_no, output| {
+					let index = usize::try_from(page_no.get()).map_err(|_error| {
+						invalid_page(page_no.get(), "test page number exceeds usize")
+					})?;
+					output.as_bytes_mut().copy_from_slice(pages[index].as_bytes());
+					Ok(())
+				},
+				page_count,
+				&node_labels,
+				&edge_labels,
+			)
+			.is_err()
+		);
 		Ok(())
 	}
 

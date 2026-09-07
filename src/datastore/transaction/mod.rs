@@ -137,6 +137,20 @@ impl Transaction {
 		let mut next = (*current).clone();
 		Arc::make_mut(&mut next.schema).next_id =
 			self.store.inner.next_schema_id.load(Ordering::Relaxed);
+		#[allow(clippy::mutable_key_type, reason = "RecordId is the datastore's stable graph key")]
+		let mut statistics_graphs = self.graphs.keys().cloned().collect::<BTreeSet<_>>();
+		#[allow(clippy::mutable_key_type, reason = "RecordId is the datastore's stable graph key")]
+		let mut bulk_statistics_graphs = BTreeSet::new();
+		for (name, schema) in &self.tables {
+			if let Some(previous) = current.schema.table(name) {
+				statistics_graphs.insert(previous.graph().id().clone());
+				bulk_statistics_graphs.insert(previous.graph().id().clone());
+			}
+			if let Some(schema) = schema {
+				statistics_graphs.insert(schema.graph().id().clone());
+				bulk_statistics_graphs.insert(schema.graph().id().clone());
+			}
+		}
 		let mut local_commits = Vec::new();
 		for (id, write) in std::mem::take(&mut self.graphs) {
 			self.apply_graph_write(&mut next, &current, id, write, commit_ts, &mut local_commits)?;
@@ -201,6 +215,7 @@ impl Transaction {
 			}
 		}
 		next.schema.validate_memberships()?;
+		next.refresh_statistics(&statistics_graphs, &bulk_statistics_graphs)?;
 		let mut changed_graphs = next
 			.graphs
 			.iter()
@@ -220,6 +235,7 @@ impl Transaction {
 		{
 			next.dictionary = persisted.property_dictionary;
 			for entry in persisted.graphs {
+				next.replace_statistics(entry.record_id.clone(), entry.statistics)?;
 				let stored = next.graphs.get_mut(&entry.record_id).ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
 						"durable commit returned an unknown graph descriptor",
