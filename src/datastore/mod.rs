@@ -139,6 +139,8 @@ pub(crate) use transaction::{
 	ScalarIndexConstraint,
 };
 
+use crate::stats::GraphStatistics;
+
 #[derive(Clone)]
 pub struct Datastore {
 	inner: Arc<StoreInner>,

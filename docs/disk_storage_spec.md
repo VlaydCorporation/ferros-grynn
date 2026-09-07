@@ -125,7 +125,10 @@ Mode 2: Disk-Backed                             (ЭТА СПЕЦИФИКАЦИЯ
     ├── subgraphs.fgb       (SubgraphDirPage)
     ├── labels.fgb          (LabelDictionary)
     ├── freelist_*.fgb      (FreelistPage per file)
-    ├── statistics.fgb     (StatisticsStore)
+    ├── stats/
+    │   ├── graph_stats.fgb (graph counters + degree histograms)
+    │   ├── label_stats.fgb (per-label cardinality)
+    │   └── prop_stats.fgb  (per-property histograms)
     ├── idx/                (Index files)
     ├── changefeed/         (Changefeed logs)
     └── wal/                (WAL segments)
@@ -659,7 +662,10 @@ STORAGE_FORMAT_VERSION = 1
         subgraphs.fgb
         labels.fgb
         freelist.fgb
-        statistics.fgb
+        stats/
+          graph_stats.fgb               -- graph counters + degree histograms
+          label_stats.fgb               -- per-label cardinality
+          prop_stats.fgb                -- per-property histograms
         primary.fgidx                   -- общий unique RecordId → DiskAtomRef
         scalar_<ordinal:04>.fgidx       -- standard/unique scalar B+tree
 ```
@@ -828,11 +834,13 @@ root-записи.
 | `0x08`   | `Subgraphs`                   |
 | `0x09`   | `Labels`                      |
 | `0x0a`   | `Freelist`                    |
-| `0x0b`   | `Statistics`                  |
+| `0x0b`   | `Statistics` (graph/degree)   |
 | `0x0c`   | `Index`                       |
 | `0x0d`   | `TensorCache`                 |
+| `0x0e`   | `LabelStatistics`             |
+| `0x0f`   | `PropertyStatistics`          |
 
-`0x00` и `0x0e..=0xff` зарезервированы. Неизвестное значение при открытии или recovery —
+`0x00` и `0x10..=0xff` зарезервированы. Неизвестное значение при открытии или recovery —
 повреждение хранилища, а не forward-compatible расширение.
 
 ```
@@ -1831,13 +1839,28 @@ custom_fn_id:     u32  -- NULL_LABEL = нет пользовательской �
 residual predicate остаётся обязательным, а статистика не является источником истины для данных.
 
 `StatisticsStore` принадлежит одному MVCC-root и хранит статистику по точной ревизии графа.
-Durable-представление одного графа — единый checksummed `statistics.fgb`: page 0 содержит
-`StatisticsRoot`, затем без разрывов идут диапазоны `DegreeHistogram`, `PropertyHistogram` и
-хвост `LabelStatistic`. Root хранит начало и длину каждого диапазона; они обязаны покрывать ровно
-весь файл. Недостижимые, переставленные и лишние страницы являются повреждением.
+Durable-представление одного графа разделено по частоте и назначению чтения на три checksummed
+файла:
 
-Label-страницы находятся в хвосте, поэтому point-DML может расширять их, не сдвигая
-bulk-гистограммы. `GraphSuperblock.stats_root_page` в format v1 равен нулю.
+- `stats/graph_stats.fgb`: page 0 содержит `StatisticsRoot`, а начиная с page 1 без разрывов идут
+  `DegreeHistogram`;
+- `stats/label_stats.fgb`: zero-based цепочка `LabelStatistic`;
+- `stats/prop_stats.fgb`: zero-based последовательность `PropertyHistogram`.
+
+Root хранит начало и длину каждого диапазона. `degree_first_page` равен 1 для непустого диапазона,
+а `label_first_page` и `property_first_page` равны 0 в своих файлах; для пустого диапазона start
+равен `NULL_PAGE`, а count — нулю. Объявленные длины обязаны точно совпадать с физическими длинами
+трёх файлов: `graph_stats.fgb` содержит `1 + degree_page_count` страниц, два остальных — ровно
+соответствующий count. Недостижимые, переставленные и лишние страницы являются повреждением.
+`GraphSuperblock.stats_root_page` в format v1 равен нулю.
+
+При открытии графа eager читается и проверяется только `StatisticsRoot`; degree, label и property
+части загружаются независимо при первом запросе через точный storage snapshot вызывающей
+транзакции. Успешно декодированная immutable-часть кешируется для этой durable revision.
+Повреждение auxiliary-файла поэтому не блокирует открытие и обычное чтение данных, но возвращается
+при первом обращении к соответствующей статистике. Планировщик обязан трактовать такую ошибку как
+недоступную статистику и использовать корректный консервативный план; point-DML, которому нужны
+точные label counters, отклоняет commit, если прочитать их безопасно невозможно.
 
 ### 19.1. GraphStatsPage
 
@@ -1850,9 +1873,9 @@ Offset  Size  Тип    Поле
 56      8     f64    avg_in_degree        -- производное, сверяется с exact total
 64      8     u64    max_out_degree
 72      8     u64    max_in_degree
-80      8     u64    degree_first_page    -- NULL_PAGE, если диапазон пуст
-88      8     u64    label_first_page     -- NULL_PAGE, если диапазон пуст
-96      8     u64    property_first_page  -- NULL_PAGE, если диапазон пуст
+80      8     u64    degree_first_page    -- page 1 graph_stats.fgb или NULL_PAGE
+88      8     u64    label_first_page     -- page 0 label_stats.fgb или NULL_PAGE
+96      8     u64    property_first_page  -- page 0 prop_stats.fgb или NULL_PAGE
 104     4     u32    label_page_count
 108     4     u32    degree_page_count
 112     4     u32    property_page_count
@@ -1953,16 +1976,19 @@ Per-label degree histogram допустим только для node label. В �
 
 - **Point-DML:** транзакционная дельта один раз при commit обновляет точные graph/table/label
   counts, label `property_count` и degree totals. Membership-only delta также увеличивает
-  `dirty_rows`, поскольку меняет выборку property histogram. Root и полный label-range
-  публикуются в той же frame-WAL транзакции, что и данные. Degree/property histogram pages не
-  переписываются; `revision`, `dirty_rows` и `analyzed_revision` явно отмечают их устаревшими.
+  `dirty_rows`, поскольку меняет выборку property histogram. Page 0 `graph_stats.fgb` и полный
+  `label_stats.fgb` публикуются в той же frame-WAL транзакции, что и данные. Degree pages в
+  `graph_stats.fgb` и `prop_stats.fgb` не переписываются; `revision`, `dirty_rows` и
+  `analyzed_revision` явно отмечают их устаревшими.
 - **Bulk-путь:** создание полного graph image и schema-affected materialized rebuild выполняют
-  один полный scan и атомарно заменяют точные counts и все распределения. Этот же анализатор
-  используется RAM и local backend.
+  один полный scan и атомарно публикуют все три файла с точными counts и распределениями. Если
+  новый файл короче существующего in-place файла, writer выбирает новое COW-поколение вместо
+  оставления недостижимого хвоста. Этот же анализатор используется RAM и local backend.
 - **Планировщик:** при stale или отсутствующей гистограмме использует консервативную оценку либо
   scan, но всегда сохраняет residual predicate. Корректность данных не зависит от статистики.
-- **Ошибки:** overflow точного счётчика или структурно повреждённый файл отклоняют commit/open;
-  невозможность построить отдельную optional property histogram — нет.
+- **Ошибки:** overflow точного счётчика и повреждение `StatisticsRoot` отклоняют commit/open;
+  повреждение lazy auxiliary-части возвращается при её первом чтении. Невозможность построить
+  отдельную optional property histogram не отклоняет пользовательскую транзакцию.
 
 Публичный синтаксис/политика `ANALYZE`, автоматический порог, sampling и external-memory сборка
 не входят в этот этап и должны быть утверждены вместе с optimizer/import surface. Они не

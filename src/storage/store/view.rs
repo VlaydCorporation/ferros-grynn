@@ -13,6 +13,11 @@ pub struct LocalGraphView<'tx> {
 }
 
 impl LocalGraphView<'_> {
+	/// Loads the complete planner statistics through this exact snapshot.
+	pub(crate) fn statistics(&self) -> FerrosGrynnResult<Arc<GraphStatistics>> {
+		self.graph.complete_statistics(&self.store.manager, &self.transaction.inner)
+	}
+
 	/// Builds owned query data without exposing local storage internals.
 	pub(crate) fn materialize_query_graph(
 		&self,

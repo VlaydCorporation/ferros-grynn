@@ -253,6 +253,34 @@ impl EdgeRead for TransactionEdgeRead<'_> {
 }
 
 impl TransactionGraphView<'_> {
+	/// Returns complete planner statistics for the selected backend snapshot.
+	pub(crate) fn statistics(&self) -> FerrosGrynnResult<GraphStatistics> {
+		match &self.graph {
+			TransactionGraphSource::Materialized(_) => {
+				self.root.statistics.graph(self.reference.id()).cloned().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"graph statistics are absent from the MVCC root",
+					)
+				})
+			}
+			TransactionGraphSource::Local(graph) => {
+				let mut statistics = (*graph.statistics()?).clone();
+				statistics.tables = self
+					.root
+					.statistics
+					.graph(self.reference.id())
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"graph statistics are absent from the MVCC root",
+						)
+					})?
+					.tables
+					.clone();
+				Ok(statistics)
+			}
+		}
+	}
+
 	fn record(&self, key: ReadKey) {
 		let version = self.root.version(&key);
 		self.reads.lock().entry(key).or_insert(version);

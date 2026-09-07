@@ -4,6 +4,11 @@
 	reason = "tests fail immediately when compact setup or assertions return an unexpected error"
 )]
 
+#[cfg(windows)]
+use std::{
+	fs::OpenOptions,
+	io::{Read, Seek, SeekFrom, Write},
+};
 use std::{ops::Bound, time::Duration};
 
 use rust_decimal::Decimal;
@@ -418,8 +423,8 @@ fn local_graph_table_and_edge_survive_reopen() {
 	assert_eq!(parameter.id(), Some(parameter_id));
 	assert_eq!(parameter.value(), &Value::from(64_i64));
 	{
-		let root = reopened.inner.current.read();
-		let statistics = root.statistics.graph(reference.id()).unwrap();
+		let transaction = reopened.begin();
+		let statistics = schema.graph().read(&transaction).unwrap().statistics().unwrap();
 		assert_eq!(statistics.revision, statistics.analyzed_revision);
 		assert_eq!(statistics.tables.get(&table_id.get()), Some(&2));
 		assert_eq!(
@@ -498,6 +503,57 @@ fn local_graph_table_and_edge_survive_reopen() {
 		panic!("updated point SELECT must return an array");
 	};
 	assert_eq!(rows.as_slice(), &[Value::from(31_i64)]);
+}
+
+/// Opening a local database validates only the statistics root; an auxiliary
+/// checksum failure is reported when that exact part is first requested.
+#[cfg(windows)]
+#[test]
+fn local_label_statistics_are_loaded_lazily() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let mut graph = Graph::<Mutable>::new();
+	graph
+		.add_node_with_id(
+			"person:alice".parse().unwrap(),
+			Some("Person".into()),
+			PropertyMap::new(),
+		)
+		.unwrap();
+	let mut create = store.begin();
+	let reference =
+		create.create_graph(graph_id("lazy-statistics"), graph.freeze().into()).unwrap();
+	create.commit().unwrap();
+	drop(store);
+
+	let label_statistics = std::fs::read_dir(directory.path().join("graphs"))
+		.unwrap()
+		.flat_map(|graph| std::fs::read_dir(graph.unwrap().path()).unwrap())
+		.map(|generation| generation.unwrap().path().join("stats").join("label_stats.fgb"))
+		.find(|path| path.is_file())
+		.unwrap();
+	let stats_directory = label_statistics.parent().unwrap();
+	assert!(stats_directory.join("graph_stats.fgb").is_file());
+	assert!(stats_directory.join("prop_stats.fgb").is_file());
+	let mut file = OpenOptions::new().read(true).write(true).open(label_statistics).unwrap();
+	let mut byte = [0_u8; 1];
+	file.seek(SeekFrom::Start(128)).unwrap();
+	file.read_exact(&mut byte).unwrap();
+	byte[0] ^= u8::MAX;
+	file.seek(SeekFrom::Start(128)).unwrap();
+	file.write_all(&byte).unwrap();
+	file.sync_all().unwrap();
+	drop(file);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	let transaction = reopened.begin();
+	let view = reference.read(&transaction).unwrap();
+	assert_eq!(view.node_count().unwrap(), 1);
+	assert!(view.statistics().is_err());
 }
 
 #[cfg(windows)]
@@ -1059,8 +1115,7 @@ fn local_point_mutations_survive_reopen() {
 		Some((alpha_id, gamma_id, EdgeDirection::Directed))
 	);
 	{
-		let root = store.inner.current.read();
-		let statistics = root.statistics.graph(graph.id()).unwrap();
+		let statistics = view.statistics().unwrap();
 		assert_eq!((statistics.node_count, statistics.edge_count), (2, 1));
 		assert_eq!((statistics.total_out_degree, statistics.total_in_degree), (1, 1));
 		assert_eq!(
@@ -1107,8 +1162,7 @@ fn local_point_mutations_survive_reopen() {
 		view.node(alpha_id).unwrap().unwrap().properties().unwrap().get(score),
 		Some(&Value::from(9_i64))
 	);
-	let root = store.inner.current.read();
-	let statistics = root.statistics.graph(graph.id()).unwrap();
+	let statistics = view.statistics().unwrap();
 	assert_eq!((statistics.node_count, statistics.edge_count), (1, 0));
 	assert_eq!((statistics.total_out_degree, statistics.total_in_degree), (0, 0));
 	assert_eq!(

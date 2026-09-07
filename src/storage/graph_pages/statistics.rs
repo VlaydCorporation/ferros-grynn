@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 #[allow(clippy::wildcard_imports, reason = "page codecs use the graph-page facade contract")]
 use super::*;
 use crate::{stats::HISTOGRAM_BUCKETS, values::graph::AtomKind};
@@ -5,14 +7,15 @@ use crate::{stats::HISTOGRAM_BUCKETS, values::graph::AtomKind};
 /// Current payload layout version of the statistics root.
 const STATISTICS_LAYOUT_VERSION: u32 = 1;
 
-/// Contiguous auxiliary ranges declared by the statistics root.
+/// Page ranges declared by `stats/graph_stats.fgb` for all three statistics
+/// files.
 #[derive(Clone, Copy, Default)]
-struct StatisticsLayout {
-	/// First degree-histogram page.
+pub(in crate::storage) struct StatisticsLayout {
+	/// First degree-histogram page in `graph_stats.fgb`.
 	degree_first: Option<PageNo>,
-	/// First label-statistics page.
+	/// First page in `label_stats.fgb`.
 	label_first: Option<PageNo>,
-	/// First property-histogram page.
+	/// First page in `prop_stats.fgb`.
 	property_first: Option<PageNo>,
 	/// Number of degree-histogram pages.
 	degree_pages: u32,
@@ -22,6 +25,35 @@ struct StatisticsLayout {
 	property_pages: u32,
 }
 
+impl StatisticsLayout {
+	/// Returns the declared `graph_stats.fgb` length.
+	pub(super) fn graph_pages(self) -> FerrosGrynnResult<u64> {
+		1_u64.checked_add(u64::from(self.degree_pages)).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("graph statistics page count overflows")
+		})
+	}
+
+	/// Returns the declared `label_stats.fgb` length.
+	pub(super) const fn label_pages(self) -> u64 {
+		self.label_pages as u64
+	}
+
+	/// Returns the declared `prop_stats.fgb` length.
+	pub(super) const fn property_pages(self) -> u64 {
+		self.property_pages as u64
+	}
+}
+
+/// Complete encoded statistics image split by physical responsibility.
+pub(in crate::storage) struct EncodedStatisticsFiles {
+	/// `stats/graph_stats.fgb` root and degree histograms.
+	pub(in crate::storage) graph: Vec<AlignedPage>,
+	/// `stats/label_stats.fgb` exact per-label counters.
+	pub(in crate::storage) labels: Vec<AlignedPage>,
+	/// `stats/prop_stats.fgb` property histograms.
+	pub(in crate::storage) properties: Vec<AlignedPage>,
+}
+
 /// Encodes a root page without auxiliary distributions.
 #[cfg(test)]
 pub(in crate::storage) fn encode_graph_statistics(
@@ -29,64 +61,120 @@ pub(in crate::storage) fn encode_graph_statistics(
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<Box<AlignedPage>> {
 	let mut page = Box::new(AlignedPage::zeroed());
-	encode_statistics_root(&mut page, statistics, StatisticsLayout::default(), page_lsn)?;
+	encode_statistics_root_page(&mut page, statistics, StatisticsLayout::default(), page_lsn)?;
 	Ok(page)
 }
 
-/// Encodes one complete statistics file in root, degree, property, label order.
+/// Encodes the complete three-file statistics image.
 pub(in crate::storage) fn encode_statistics(
 	statistics: &GraphStatistics,
 	node_labels: &[String],
 	edge_labels: &[String],
 	page_lsn: PageLsn,
-) -> FerrosGrynnResult<Vec<AlignedPage>> {
+) -> FerrosGrynnResult<EncodedStatisticsFiles> {
 	validate_statistics(statistics)?;
-	let mut pages = Vec::new();
-	let mut next_page = 1_u64;
-
-	let degree_first = (!statistics.degree_histograms.is_empty()).then(|| PageNo::new(next_page));
-	for (key, histogram) in &statistics.degree_histograms {
-		pages.push(encode_degree_histogram(
-			PageNo::new(next_page),
+	let mut degree_pages = Vec::with_capacity(statistics.degree_histograms.len());
+	for (index, (key, histogram)) in statistics.degree_histograms.iter().enumerate() {
+		let page_no = u64::try_from(index)
+			.ok()
+			.and_then(|index| index.checked_add(1))
+			.map(PageNo::new)
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("degree statistics page number overflows")
+			})?;
+		degree_pages.push(encode_degree_histogram(
+			page_no,
 			page_lsn,
 			key,
 			histogram,
 			node_labels,
 			edge_labels,
 		)?);
-		next_page = next_page.checked_add(1).ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file("statistics page number overflows")
-		})?;
 	}
-	let degree_pages = checked_page_count(statistics.degree_histograms.len())?;
+	let property_pages = encode_property_statistics_pages(statistics, page_lsn)?;
+	let label_pages =
+		encode_label_statistics_pages(statistics, node_labels, edge_labels, page_lsn)?;
+	let degree_page_count = checked_page_count(degree_pages.len())?;
+	let label_page_count = checked_page_count(label_pages.len())?;
+	let property_page_count = checked_page_count(property_pages.len())?;
+	let layout = StatisticsLayout {
+		degree_first: (degree_page_count != 0).then(|| PageNo::new(1)),
+		label_first: (label_page_count != 0).then(|| PageNo::new(0)),
+		property_first: (property_page_count != 0).then(|| PageNo::new(0)),
+		degree_pages: degree_page_count,
+		label_pages: label_page_count,
+		property_pages: property_page_count,
+	};
+	let mut graph_pages = Vec::with_capacity(degree_pages.len() + 1);
+	// Initialize the over-aligned root in its final slot. Moving a populated
+	// 16 KiB page here corrupted its first byte on Windows MSVC.
+	graph_pages.push(AlignedPage::zeroed());
+	encode_statistics_root_page(&mut graph_pages[0], statistics, layout, page_lsn)?;
+	graph_pages.append(&mut degree_pages);
+	Ok(EncodedStatisticsFiles {
+		graph: graph_pages,
+		labels: label_pages,
+		properties: property_pages,
+	})
+}
 
-	let property_first_candidate = PageNo::new(next_page);
-	let mut property_pages = 0_u32;
+/// Encodes the root and complete label file changed by point DML.
+///
+/// The over-aligned root is initialized in its final allocation because moving
+/// a populated 16 KiB value corrupts its first byte on Windows MSVC.
+pub(in crate::storage) fn encode_statistics_delta(
+	statistics: &GraphStatistics,
+	node_labels: &[String],
+	edge_labels: &[String],
+	previous: StatisticsLayout,
+	page_lsn: PageLsn,
+) -> FerrosGrynnResult<(Box<AlignedPage>, Vec<AlignedPage>)> {
+	validate_statistics(statistics)?;
+	let labels = encode_label_statistics_pages(statistics, node_labels, edge_labels, page_lsn)?;
+	let label_pages = checked_page_count(labels.len())?;
+	let layout = StatisticsLayout {
+		label_first: (label_pages != 0).then(|| PageNo::new(0)),
+		label_pages,
+		..previous
+	};
+	validate_layout_starts(layout)?;
+	let mut root = Box::new(AlignedPage::zeroed());
+	encode_statistics_root_page(&mut root, statistics, layout, page_lsn)?;
+	Ok((root, labels))
+}
+
+/// Encodes the property-histogram file from zero-based pages.
+fn encode_property_statistics_pages(
+	statistics: &GraphStatistics,
+	page_lsn: PageLsn,
+) -> FerrosGrynnResult<Vec<AlignedPage>> {
+	let mut pages = Vec::new();
 	for (key, histogram) in &statistics.property_histograms {
-		if let Some(page) =
-			encode_property_histogram(PageNo::new(next_page), page_lsn, *key, histogram)?
-		{
+		let page_no = PageNo::new(u64::try_from(pages.len()).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("property statistics page number exceeds u64")
+		})?);
+		if let Some(page) = encode_property_histogram(page_no, page_lsn, *key, histogram)? {
 			pages.push(page);
-			next_page = next_page.checked_add(1).ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file("statistics page number overflows")
-			})?;
-			property_pages = property_pages.checked_add(1).ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file("property histogram page count overflows")
-			})?;
 		}
 	}
-	let property_first = (property_pages != 0).then_some(property_first_candidate);
+	Ok(pages)
+}
 
+/// Encodes the exact label-counter file from zero-based pages.
+fn encode_label_statistics_pages(
+	statistics: &GraphStatistics,
+	node_labels: &[String],
+	edge_labels: &[String],
+	page_lsn: PageLsn,
+) -> FerrosGrynnResult<Vec<AlignedPage>> {
 	let label_entries = encoded_label_entries(statistics, node_labels, edge_labels)?;
 	let label_page_count = label_entries.len().div_ceil(LABEL_STATS_PER_PAGE);
-	let label_first = (label_page_count != 0).then(|| PageNo::new(next_page));
+	let mut pages = Vec::with_capacity(label_page_count);
 	for (index, entries) in label_entries.chunks(LABEL_STATS_PER_PAGE).enumerate() {
 		let index_u64 = u64::try_from(index).map_err(|_error| {
 			FerrosGrynnError::invalid_storage_file("label statistics page index exceeds u64")
 		})?;
-		let page_no = PageNo::new(next_page.checked_add(index_u64).ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file("label statistics page number overflows")
-		})?);
+		let page_no = PageNo::new(index_u64);
 		let next = if index + 1 < label_page_count {
 			Some(PageNo::new(page_no.get().checked_add(1).ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file(
@@ -98,23 +186,7 @@ pub(in crate::storage) fn encode_statistics(
 		};
 		pages.push(encode_label_statistics(page_no, page_lsn, next, entries)?);
 	}
-	let label_pages = checked_page_count(label_page_count)?;
-
-	let layout = StatisticsLayout {
-		degree_first,
-		label_first,
-		property_first,
-		degree_pages,
-		label_pages,
-		property_pages,
-	};
-	let mut encoded = Vec::with_capacity(pages.len() + 1);
-	// Initialize the over-aligned root in its final slot. Moving a populated
-	// 16 KiB page here corrupted its first byte on Windows MSVC.
-	encoded.push(AlignedPage::zeroed());
-	encode_statistics_root(&mut encoded[0], statistics, layout, page_lsn)?;
-	encoded.append(&mut pages);
-	Ok(encoded)
+	Ok(pages)
 }
 
 /// Decodes only the root counters, preserving compatibility with old one-page
@@ -123,34 +195,26 @@ pub(in crate::storage) fn encode_statistics(
 pub(in crate::storage) fn decode_graph_statistics(
 	page: &AlignedPage,
 ) -> FerrosGrynnResult<GraphStatistics> {
-	decode_statistics_root(page).map(|(statistics, _layout)| statistics)
+	decode_statistics_root_page(page).map(|(statistics, _layout)| statistics)
 }
 
-/// Returns the complete logical length declared by a statistics root.
-pub(in crate::storage) fn statistics_page_count(page: &AlignedPage) -> FerrosGrynnResult<u64> {
-	let (_statistics, layout) = decode_statistics_root(page)?;
-	let page_count = 1_u64
-		.checked_add(u64::from(layout.degree_pages))
-		.and_then(|count| count.checked_add(u64::from(layout.property_pages)))
-		.and_then(|count| count.checked_add(u64::from(layout.label_pages)))
-		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("statistics page count overflows"))?;
-	validate_layout(layout, page_count)?;
-	Ok(page_count)
-}
-
-/// Returns the only auxiliary page range point-DML may rewrite.
-pub(in crate::storage) fn statistics_label_page_range(
+/// Decodes the eager graph root and validates declared physical lengths.
+pub(in crate::storage) fn decode_statistics_summary(
 	page: &AlignedPage,
-) -> FerrosGrynnResult<std::ops::Range<u64>> {
-	let (_statistics, layout) = decode_statistics_root(page)?;
-	let page_count = 1_u64
-		.checked_add(u64::from(layout.degree_pages))
-		.and_then(|count| count.checked_add(u64::from(layout.property_pages)))
-		.and_then(|count| count.checked_add(u64::from(layout.label_pages)))
-		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("statistics page count overflows"))?;
-	validate_layout(layout, page_count)?;
-	let first = layout.label_first.map_or(page_count, PageNo::get);
-	Ok(first..page_count)
+	graph_pages: u64,
+	label_pages: u64,
+	property_pages: u64,
+) -> FerrosGrynnResult<(GraphStatistics, StatisticsLayout)> {
+	let (statistics, layout) = decode_statistics_root_page(page)?;
+	validate_layout(layout, graph_pages, label_pages, property_pages)?;
+	Ok((statistics, layout))
+}
+
+/// Returns the split-file directory declared by a statistics root.
+pub(in crate::storage) fn statistics_layout(
+	page: &AlignedPage,
+) -> FerrosGrynnResult<StatisticsLayout> {
+	decode_statistics_root_page(page).map(|(_statistics, layout)| layout)
 }
 
 /// Returns whether a point delta preserved both bulk histogram ranges.
@@ -158,58 +222,70 @@ pub(in crate::storage) fn statistics_bulk_layout_matches(
 	source: &AlignedPage,
 	target: &AlignedPage,
 ) -> FerrosGrynnResult<bool> {
-	let (_source_statistics, source) = decode_statistics_root(source)?;
-	let (_target_statistics, target) = decode_statistics_root(target)?;
+	let (_source_statistics, source) = decode_statistics_root_page(source)?;
+	let (_target_statistics, target) = decode_statistics_root_page(target)?;
 	Ok(source.degree_first == target.degree_first
 		&& source.degree_pages == target.degree_pages
 		&& source.property_first == target.property_first
 		&& source.property_pages == target.property_pages)
 }
 
-/// Decodes and validates a complete statistics file.
-pub(in crate::storage) fn decode_statistics<ReadPage>(
+/// Decodes degree histograms lazily from `graph_stats.fgb`.
+pub(in crate::storage) fn decode_degree_statistics<ReadPage>(
 	mut read_page: ReadPage,
-	page_count: u64,
+	layout: StatisticsLayout,
 	node_labels: &[String],
 	edge_labels: &[String],
-) -> FerrosGrynnResult<GraphStatistics>
+) -> FerrosGrynnResult<BTreeMap<DegreeHistogramKey, DegreeHistogram>>
 where
 	ReadPage: FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 {
-	if page_count == 0 {
-		return Err(FerrosGrynnError::invalid_storage_file(
-			"statistics file contains no root page",
-		));
-	}
 	let mut page = AlignedPage::zeroed();
-	read_page(PageNo::new(0), &mut page)?;
-	let (mut statistics, layout) = decode_statistics_root(&page)?;
-	if layout.degree_pages == 0 && layout.property_pages == 0 && layout.label_pages == 0 {
-		if page_count != 1 {
-			return Err(FerrosGrynnError::invalid_storage_file(
-				"legacy statistics root has unreachable auxiliary pages",
-			));
-		}
-		return Ok(statistics);
-	}
-	validate_layout(layout, page_count)?;
-
+	let mut histograms = BTreeMap::new();
 	for offset in 0..u64::from(layout.degree_pages) {
 		let page_no = page_at(layout.degree_first, offset, "degree histogram")?;
 		read_page(page_no, &mut page)?;
 		let (key, histogram) = decode_degree_histogram(&page, page_no, node_labels, edge_labels)?;
-		if statistics.degree_histograms.insert(key, histogram).is_some() {
+		if histograms.insert(key, histogram).is_some() {
 			return Err(invalid_page(page_no.get(), "duplicate degree histogram"));
 		}
 	}
+	Ok(histograms)
+}
+
+/// Decodes property histograms lazily from `prop_stats.fgb`.
+pub(in crate::storage) fn decode_property_statistics<ReadPage>(
+	mut read_page: ReadPage,
+	layout: StatisticsLayout,
+) -> FerrosGrynnResult<BTreeMap<PropertyHistogramKey, PropertyHistogram>>
+where
+	ReadPage: FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+{
+	let mut page = AlignedPage::zeroed();
+	let mut histograms = BTreeMap::new();
 	for offset in 0..u64::from(layout.property_pages) {
 		let page_no = page_at(layout.property_first, offset, "property histogram")?;
 		read_page(page_no, &mut page)?;
 		let (key, histogram) = decode_property_histogram(&page, page_no)?;
-		if statistics.property_histograms.insert(key, histogram).is_some() {
+		if histograms.insert(key, histogram).is_some() {
 			return Err(invalid_page(page_no.get(), "duplicate property histogram"));
 		}
 	}
+	Ok(histograms)
+}
+
+/// Decodes exact label counters lazily from `label_stats.fgb`.
+pub(in crate::storage) fn decode_label_statistics_file<ReadPage>(
+	mut read_page: ReadPage,
+	layout: StatisticsLayout,
+	node_labels: &[String],
+	edge_labels: &[String],
+) -> FerrosGrynnResult<BTreeMap<LabelStatisticKey, LabelStatistic>>
+where
+	ReadPage: FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+{
+	let mut page = AlignedPage::zeroed();
+	let mut labels = BTreeMap::new();
 	for offset in 0..u64::from(layout.label_pages) {
 		let page_no = page_at(layout.label_first, offset, "label statistics")?;
 		read_page(page_no, &mut page)?;
@@ -218,16 +294,16 @@ where
 		for (key, value) in
 			decode_label_statistics(&page, page_no, expected_next, node_labels, edge_labels)?
 		{
-			if statistics.labels.insert(key, value).is_some() {
+			if labels.insert(key, value).is_some() {
 				return Err(invalid_page(page_no.get(), "duplicate label statistics"));
 			}
 		}
 	}
-	Ok(statistics)
+	Ok(labels)
 }
 
 /// Writes exact counters and the auxiliary directory into page zero.
-fn encode_statistics_root(
+fn encode_statistics_root_page(
 	page: &mut AlignedPage,
 	statistics: &GraphStatistics,
 	layout: StatisticsLayout,
@@ -260,7 +336,7 @@ fn encode_statistics_root(
 }
 
 /// Decodes page zero and validates its scalar invariants.
-fn decode_statistics_root(
+fn decode_statistics_root_page(
 	page: &AlignedPage,
 ) -> FerrosGrynnResult<(GraphStatistics, StatisticsLayout)> {
 	let page_no = PageNo::new(0);
@@ -370,31 +446,40 @@ fn validate_statistics(statistics: &GraphStatistics) -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
-/// Requires auxiliary ranges to cover the file exactly and contiguously.
-fn validate_layout(layout: StatisticsLayout, page_count: u64) -> FerrosGrynnResult<()> {
-	let degree_start = required_start(layout.degree_first, layout.degree_pages, 1, "degree")?;
-	let property_expected = degree_start
-		.checked_add(u64::from(layout.degree_pages))
-		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("statistics page count overflows"))?;
-	let property_start = required_start(
-		layout.property_first,
-		layout.property_pages,
-		property_expected,
-		"property",
-	)?;
-	let label_expected = property_start
-		.checked_add(u64::from(layout.property_pages))
-		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("statistics page count overflows"))?;
-	let label_start =
-		required_start(layout.label_first, layout.label_pages, label_expected, "label")?;
-	let expected = label_start
-		.checked_add(u64::from(layout.label_pages))
-		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("statistics page count overflows"))?;
-	if expected != page_count {
+/// Requires each declared range to cover its physical file exactly.
+pub(in crate::storage) fn validate_statistics_file_lengths(
+	layout: StatisticsLayout,
+	graph_pages: u64,
+	label_pages: u64,
+	property_pages: u64,
+) -> FerrosGrynnResult<()> {
+	validate_layout(layout, graph_pages, label_pages, property_pages)
+}
+
+/// Requires each declared range to cover its physical file exactly.
+fn validate_layout(
+	layout: StatisticsLayout,
+	graph_pages: u64,
+	label_pages: u64,
+	property_pages: u64,
+) -> FerrosGrynnResult<()> {
+	validate_layout_starts(layout)?;
+	if layout.graph_pages()? != graph_pages
+		|| layout.label_pages() != label_pages
+		|| layout.property_pages() != property_pages
+	{
 		return Err(FerrosGrynnError::invalid_storage_file(
-			"statistics directory does not cover the complete file",
+			"statistics directory disagrees with its physical file lengths",
 		));
 	}
+	Ok(())
+}
+
+/// Validates the fixed zero-based location of every split-file range.
+fn validate_layout_starts(layout: StatisticsLayout) -> FerrosGrynnResult<()> {
+	required_start(layout.degree_first, layout.degree_pages, 1, "degree")?;
+	required_start(layout.label_first, layout.label_pages, 0, "label")?;
+	required_start(layout.property_first, layout.property_pages, 0, "property")?;
 	Ok(())
 }
 

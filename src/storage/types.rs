@@ -158,12 +158,16 @@ pub enum DataFileKind {
 	Labels = 0x09,
 	/// Freelist pages.
 	Freelist = 0x0a,
-	/// Statistics pages.
+	/// Graph counters and degree-statistics pages.
 	Statistics = 0x0b,
 	/// One index instance.
 	Index = 0x0c,
 	/// Derived tensor-cache pages.
 	TensorCache = 0x0d,
+	/// Per-label statistics pages.
+	LabelStatistics = 0x0e,
+	/// Per-property histogram pages.
+	PropertyStatistics = 0x0f,
 }
 
 impl DataFileKind {
@@ -200,6 +204,10 @@ impl DataFileKind {
 			Some(Self::Index)
 		} else if value == Self::TensorCache.get() {
 			Some(Self::TensorCache)
+		} else if value == Self::LabelStatistics.get() {
+			Some(Self::LabelStatistics)
+		} else if value == Self::PropertyStatistics.get() {
+			Some(Self::PropertyStatistics)
 		} else {
 			None
 		}
@@ -339,7 +347,7 @@ mod tests {
 		assert_eq!(id.and_then(DataFileId::kind), Some(DataFileKind::Index));
 		assert!(DataFileId::new(MAX_FILE_INSTANCE_ID + 1, DataFileKind::Index).is_none());
 		assert!(DataFileId::from_raw(0).is_none());
-		assert!(DataFileId::from_raw(0x0e).is_none());
+		assert!(DataFileId::from_raw(0x10).is_none());
 	}
 
 	/// Monotonic persisted clocks fail closed instead of wrapping to reserved

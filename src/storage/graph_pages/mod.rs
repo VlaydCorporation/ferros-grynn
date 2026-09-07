@@ -70,15 +70,20 @@ pub(super) use props::{
 	encode_property_map,
 	read_property_record,
 };
+pub(super) use statistics::{
+	StatisticsLayout,
+	decode_degree_statistics,
+	decode_label_statistics_file,
+	decode_property_statistics,
+	decode_statistics_summary,
+	encode_statistics,
+	encode_statistics_delta,
+	statistics_bulk_layout_matches,
+	statistics_layout,
+	validate_statistics_file_lengths,
+};
 #[cfg(test)]
 use statistics::{decode_graph_statistics, encode_graph_statistics};
-pub(super) use statistics::{
-	decode_statistics,
-	encode_statistics,
-	statistics_bulk_layout_matches,
-	statistics_label_page_range,
-	statistics_page_count,
-};
 pub(super) use subgraphs::{SubgraphEntry, decode_subgraph_directory, encode_subgraph_directory};
 
 /// Fixed byte size of both hot-slot formats.
@@ -947,43 +952,67 @@ mod tests {
 		};
 		let node_labels = vec!["Person".to_owned()];
 		let edge_labels = vec!["OLD".to_owned()];
-		let mut pages = encode_statistics(&expected, &node_labels, &edge_labels, PageLsn::ZERO)?;
-		assert!(pages.len() > 1);
-		let page_count = u64::try_from(pages.len())
-			.map_err(|_error| invalid_page(0, "test page count exceeds u64"))?;
-		let decoded = decode_statistics(
+		let mut files = encode_statistics(&expected, &node_labels, &edge_labels, PageLsn::ZERO)?;
+		assert!(files.graph.len() > 1);
+		assert!(!files.labels.is_empty());
+		assert!(!files.properties.is_empty());
+		let graph_pages = u64::try_from(files.graph.len())
+			.map_err(|_error| invalid_page(0, "test graph page count exceeds u64"))?;
+		let label_pages = u64::try_from(files.labels.len())
+			.map_err(|_error| invalid_page(0, "test label page count exceeds u64"))?;
+		let property_pages = u64::try_from(files.properties.len())
+			.map_err(|_error| invalid_page(0, "test property page count exceeds u64"))?;
+		let (mut decoded, layout) =
+			decode_statistics_summary(&files.graph[0], graph_pages, label_pages, property_pages)?;
+		decoded.degree_histograms = decode_degree_statistics(
 			|page_no, output| {
 				let index = usize::try_from(page_no.get()).map_err(|_error| {
 					invalid_page(page_no.get(), "test page number exceeds usize")
 				})?;
-				output.as_bytes_mut().copy_from_slice(pages[index].as_bytes());
+				output.as_bytes_mut().copy_from_slice(files.graph[index].as_bytes());
 				Ok(())
 			},
-			page_count,
+			layout,
 			&node_labels,
 			&edge_labels,
 		)?;
+		decoded.labels = decode_label_statistics_file(
+			|page_no, output| {
+				let index = usize::try_from(page_no.get()).map_err(|_error| {
+					invalid_page(page_no.get(), "test page number exceeds usize")
+				})?;
+				output.as_bytes_mut().copy_from_slice(files.labels[index].as_bytes());
+				Ok(())
+			},
+			layout,
+			&node_labels,
+			&edge_labels,
+		)?;
+		decoded.property_histograms = decode_property_statistics(
+			|page_no, output| {
+				let index = usize::try_from(page_no.get()).map_err(|_error| {
+					invalid_page(page_no.get(), "test page number exceeds usize")
+				})?;
+				output.as_bytes_mut().copy_from_slice(files.properties[index].as_bytes());
+				Ok(())
+			},
+			layout,
+		)?;
 		assert_eq!(decoded, expected);
 
-		let label_pages = read_u32(pages[0].as_bytes(), STATS_LABEL_PAGE_COUNT_OFFSET);
+		let label_pages = read_u32(files.graph[0].as_bytes(), STATS_LABEL_PAGE_COUNT_OFFSET);
 		write_u32(
-			pages[0].as_bytes_mut(),
+			files.graph[0].as_bytes_mut(),
 			STATS_LABEL_PAGE_COUNT_OFFSET,
 			label_pages.checked_add(1).ok_or_else(|| invalid_page(0, "test count overflows"))?,
 		);
-		pages[0].seal()?;
+		files.graph[0].seal()?;
 		assert!(
-			decode_statistics(
-				|page_no, output| {
-					let index = usize::try_from(page_no.get()).map_err(|_error| {
-						invalid_page(page_no.get(), "test page number exceeds usize")
-					})?;
-					output.as_bytes_mut().copy_from_slice(pages[index].as_bytes());
-					Ok(())
-				},
-				page_count,
-				&node_labels,
-				&edge_labels,
+			decode_statistics_summary(
+				&files.graph[0],
+				graph_pages,
+				u64::from(label_pages),
+				property_pages,
 			)
 			.is_err()
 		);

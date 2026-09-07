@@ -105,7 +105,7 @@ mod tests {
 	/// First currently unassigned recovery-kind byte.
 	const TEST_UNASSIGNED_KIND: u8 = WalKind::GraphDrop.get() + 1;
 	/// First reserved format-v1 data-file kind encoded as a complete identity.
-	const TEST_RESERVED_FILE_ID: u64 = DataFileKind::TensorCache.get() as u64 + 1;
+	const TEST_RESERVED_FILE_ID: u64 = DataFileKind::PropertyStatistics.get() as u64 + 1;
 	/// Monotonic suffix for collision-resistant WAL test directories.
 	static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 

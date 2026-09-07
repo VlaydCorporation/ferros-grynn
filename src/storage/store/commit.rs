@@ -399,7 +399,7 @@ pub(super) fn load_database(
 			name: entry.name.clone(),
 			schema: local_graph_schema(entry),
 			memberships: load_memberships(manager, transaction, &graph)?,
-			statistics: graph.statistics().clone(),
+			statistics: graph.statistics_summary().clone(),
 			graph,
 		});
 	}
@@ -495,7 +495,7 @@ pub(super) fn load_changed_graphs(
 			name: entry.name.clone(),
 			schema: local_graph_schema(entry),
 			memberships: load_memberships(manager, transaction, &graph)?,
-			statistics: graph.statistics().clone(),
+			statistics: graph.statistics_summary().clone(),
 			graph,
 		});
 	}
@@ -660,22 +660,36 @@ pub(super) fn open_local_graph(
 		Ok(())
 	})?;
 	let statistics_id = file_ids.get(&DataFileKind::Statistics).copied().ok_or_else(|| {
-		FerrosGrynnError::invalid_storage_file("statistics file identity is missing")
+		FerrosGrynnError::invalid_storage_file("graph statistics file identity is missing")
 	})?;
+	let label_statistics_id =
+		file_ids.get(&DataFileKind::LabelStatistics).copied().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("label statistics file identity is missing")
+		})?;
+	let property_statistics_id =
+		file_ids.get(&DataFileKind::PropertyStatistics).copied().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("property statistics file identity is missing")
+		})?;
 	let statistics_page_count =
 		manager.visible_file_page_count(transaction, entry.graph_id, statistics_id)?;
-	let statistics = decode_statistics(
-		|page_no, output| {
-			let page = manager.read_page(
-				transaction,
-				crate::storage::types::PageKey::new(entry.graph_id, statistics_id, page_no),
-			)?;
-			output.as_bytes_mut().copy_from_slice(page.as_bytes());
-			Ok(())
-		},
+	let label_statistics_page_count =
+		manager.visible_file_page_count(transaction, entry.graph_id, label_statistics_id)?;
+	let property_statistics_page_count =
+		manager.visible_file_page_count(transaction, entry.graph_id, property_statistics_id)?;
+	if statistics_page_count == 0 {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"graph statistics file contains no root page",
+		));
+	}
+	let statistics_root = manager.read_page(
+		transaction,
+		crate::storage::types::PageKey::new(entry.graph_id, statistics_id, PageNo::new(0)),
+	)?;
+	let (statistics, statistics_layout) = decode_statistics_summary(
+		statistics_root.as_page(),
 		statistics_page_count,
-		&labels.node_labels,
-		&labels.edge_labels,
+		label_statistics_page_count,
+		property_statistics_page_count,
 	)?;
 	if statistics.node_count != superblock.node_count
 		|| statistics.edge_count != superblock.edge_count
@@ -737,6 +751,8 @@ pub(super) fn open_local_graph(
 		files: file_ids,
 		labels,
 		statistics,
+		statistics_layout,
+		statistics_parts: Mutex::new(LazyStatisticsParts::default()),
 		property_dictionary,
 		decode_context: Mutex::new(None),
 		scalar_indexes,
@@ -989,6 +1005,7 @@ pub(super) fn write_delta_graph_generation(
 			"graph delta replaced its stable primary-index file",
 		));
 	}
+	validate_statistics_delta_pages(manager, transaction, graph_id, &source_ids, &delta.payloads)?;
 	for (kind, pages) in &delta.payloads {
 		if *kind == DataFileKind::GraphSuperblock {
 			return Err(FerrosGrynnError::invalid_storage_file(
@@ -1001,13 +1018,9 @@ pub(super) fn write_delta_graph_generation(
 		if *kind == DataFileKind::AdjacencyOverflow {
 			let start = manager.visible_file_page_count(transaction, graph_id, file_id)?;
 			validate_append_delta_pages(pages, start)?;
-		} else if *kind == DataFileKind::Statistics {
-			let source_pages = manager.visible_file_page_count(transaction, graph_id, file_id)?;
-			let source_root = manager.read_page(
-				transaction,
-				crate::storage::types::PageKey::new(graph_id, file_id, PageNo::new(0)),
-			)?;
-			validate_statistics_delta_pages(pages, source_pages, source_root.as_page())?;
+		} else if matches!(*kind, DataFileKind::Statistics | DataFileKind::LabelStatistics) {
+			// The coupled split-file delta was validated before any frame was
+			// staged.
 		} else {
 			validate_delta_pages(*kind, pages, &previous, &delta.superblock)?;
 		}
@@ -1073,6 +1086,8 @@ fn validate_delta_pages(
 		| DataFileKind::AdjacencyOverflow
 		| DataFileKind::CrossLevelAdjacencyOverflow
 		| DataFileKind::Statistics
+		| DataFileKind::LabelStatistics
+		| DataFileKind::PropertyStatistics
 		| DataFileKind::TensorCache
 		| DataFileKind::SystemCatalog => {
 			return Err(FerrosGrynnError::invalid_storage_file(
@@ -1131,62 +1146,96 @@ fn validate_delta_pages(
 	Ok(())
 }
 
-/// Validates the root/label-only statistics delta and its append-only tail.
+/// Validates the atomically coupled graph-root and complete label-file delta.
 fn validate_statistics_delta_pages(
-	pages: &[(PageNo, Box<AlignedPage>)],
-	source_pages: u64,
-	source_root: &AlignedPage,
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	graph_id: GraphId,
+	source_ids: &BTreeMap<DataFileKind, DataFileId>,
+	payloads: &BTreeMap<DataFileKind, Vec<(PageNo, Box<AlignedPage>)>>,
 ) -> FerrosGrynnResult<()> {
-	let root = pages
+	let graph_pages = payloads.get(&DataFileKind::Statistics).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("statistics delta has no graph root")
+	})?;
+	let label_pages = payloads.get(&DataFileKind::LabelStatistics).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("statistics delta has no complete label file")
+	})?;
+	if payloads.contains_key(&DataFileKind::PropertyStatistics) {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"point statistics delta cannot rewrite property histograms",
+		));
+	}
+	if graph_pages.len() != 1 {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"statistics delta must contain exactly one graph root",
+		));
+	}
+	let root = graph_pages
 		.first()
 		.filter(|(page_no, _page)| page_no.get() == 0)
 		.map(|(_page_no, page)| page.as_ref())
 		.ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("statistics delta has no root page")
 		})?;
-	let target_pages = statistics_page_count(root)?;
-	if statistics_page_count(source_root)? != source_pages {
-		return Err(FerrosGrynnError::invalid_storage_file(
-			"statistics source length disagrees with its root",
-		));
-	}
-	if !statistics_bulk_layout_matches(source_root, root)? {
+	let graph_file_id = source_ids.get(&DataFileKind::Statistics).copied().ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("graph statistics source file is missing")
+	})?;
+	let label_file_id =
+		source_ids.get(&DataFileKind::LabelStatistics).copied().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("label statistics source file is missing")
+		})?;
+	let property_file_id =
+		source_ids.get(&DataFileKind::PropertyStatistics).copied().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("property statistics source file is missing")
+		})?;
+	let source_graph_pages =
+		manager.visible_file_page_count(transaction, graph_id, graph_file_id)?;
+	let source_label_pages =
+		manager.visible_file_page_count(transaction, graph_id, label_file_id)?;
+	let source_property_pages =
+		manager.visible_file_page_count(transaction, graph_id, property_file_id)?;
+	let source_root = manager.read_page(
+		transaction,
+		crate::storage::types::PageKey::new(graph_id, graph_file_id, PageNo::new(0)),
+	)?;
+	let source_layout = statistics_layout(source_root.as_page())?;
+	validate_statistics_file_lengths(
+		source_layout,
+		source_graph_pages,
+		source_label_pages,
+		source_property_pages,
+	)?;
+	if !statistics_bulk_layout_matches(source_root.as_page(), root)? {
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"point statistics delta changed a bulk histogram range",
 		));
 	}
-	let label_pages = statistics_label_page_range(root)?;
-	if target_pages < source_pages {
+	let target_layout = statistics_layout(root)?;
+	let target_label_pages = u64::try_from(label_pages.len()).map_err(|_error| {
+		FerrosGrynnError::invalid_storage_file("label statistics page count exceeds u64")
+	})?;
+	validate_statistics_file_lengths(
+		target_layout,
+		source_graph_pages,
+		target_label_pages,
+		source_property_pages,
+	)?;
+	if target_label_pages < source_label_pages {
 		return Err(FerrosGrynnError::invalid_storage_file(
-			"statistics delta cannot truncate its stable file",
+			"statistics delta cannot truncate its stable label file",
 		));
 	}
-	let mut next_label = label_pages.start;
-	for (page_no, page) in pages {
-		if page_no.get() >= target_pages {
-			return Err(FerrosGrynnError::invalid_storage_file(
-				"statistics delta page exceeds its declared length",
-			));
-		}
+	for (expected, (page_no, page)) in label_pages.iter().enumerate() {
+		let expected = u64::try_from(expected).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("label statistics page index exceeds u64")
+		})?;
 		let page_type = page.validate(*page_no)?.page_type();
-		if page_no.get() == 0 {
-			continue;
-		}
-		if page_no.get() != next_label
-			|| page_type != crate::storage::page::PageType::LabelStatistic
+		if page_no.get() != expected || page_type != crate::storage::page::PageType::LabelStatistic
 		{
 			return Err(FerrosGrynnError::invalid_storage_file(
 				"point statistics delta must rewrite the complete label range",
 			));
 		}
-		next_label = next_label.checked_add(1).ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file("statistics page count overflows")
-		})?;
-	}
-	if next_label != label_pages.end {
-		return Err(FerrosGrynnError::invalid_storage_file(
-			"statistics delta omitted part of its label range",
-		));
 	}
 	Ok(())
 }
@@ -1224,6 +1273,8 @@ fn label_page_count(bytes: u64) -> FerrosGrynnResult<u64> {
 
 pub(super) fn prepare_in_place_image(
 	root: &Path,
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
 	current: &GraphCatalogEntry,
 	files: &FileCatalog,
 	image: &mut BuiltGraphImage,
@@ -1254,6 +1305,26 @@ pub(super) fn prepare_in_place_image(
 		&& previous.stats_root_page == next.stats_root_page;
 	if !stable_layout {
 		return Ok(false);
+	}
+	let file_ids = graph_file_ids(current, files)?;
+	// A committed WAL tail can be longer than the checkpointed home file.
+	for kind in
+		[DataFileKind::Statistics, DataFileKind::LabelStatistics, DataFileKind::PropertyStatistics]
+	{
+		let file_id = file_ids.get(&kind).copied().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(format!("graph file {kind:?} is missing"))
+		})?;
+		let current_pages =
+			manager.visible_file_page_count(transaction, current.graph_id, file_id)?;
+		let next_pages = image.payloads.get(&kind).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(format!("graph image has no {kind:?} payload"))
+		})?;
+		let next_page_count = u64::try_from(next_pages.len()).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("statistics page count exceeds u64")
+		})?;
+		if next_page_count < current_pages {
+			return Ok(false);
+		}
 	}
 	image.catalog_entry.created_lsn = current.created_lsn;
 	image.catalog_entry.primary_index_file_id = current.primary_index_file_id;
@@ -1329,6 +1400,10 @@ pub(super) fn unix_time_ms() -> FerrosGrynnResult<u64> {
 }
 
 pub(super) fn write_pages(path: &Path, pages: &[AlignedPage]) -> FerrosGrynnResult<()> {
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent)
+			.map_err(|source| storage_io("create graph data-file directory", source))?;
+	}
 	let file = DirectFile::create_new(path)?;
 	file.write_pages(PageNo::new(0), pages)?;
 	file.sync_all()

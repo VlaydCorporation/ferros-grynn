@@ -645,7 +645,7 @@ pub(super) fn build_graph_image(
 		|id| table_memberships.get(&id).copied(),
 		&mut context,
 	)?;
-	let statistic_pages =
+	let statistic_files =
 		encode_statistics(&statistics, &labels.node_labels, &labels.edge_labels, PageLsn::ZERO)?;
 	let subgraph_entries = plan
 		.children
@@ -724,7 +724,9 @@ pub(super) fn build_graph_image(
 	payloads.insert(DataFileKind::Subgraphs, subgraph_pages);
 	payloads.insert(DataFileKind::Labels, label_pages);
 	payloads.insert(DataFileKind::Freelist, freelist_pages);
-	payloads.insert(DataFileKind::Statistics, statistic_pages);
+	payloads.insert(DataFileKind::Statistics, statistic_files.graph);
+	payloads.insert(DataFileKind::LabelStatistics, statistic_files.labels);
+	payloads.insert(DataFileKind::PropertyStatistics, statistic_files.properties);
 	payloads.insert(DataFileKind::Index, primary.pages);
 
 	let identity = graph.identity();
@@ -976,7 +978,7 @@ pub(super) fn build_node_append_delta(
 	let label_pages = encode_label_dictionary(&labels, PageLsn::ZERO)?;
 	*dictionary = context.property_dictionary().clone();
 
-	let mut previous_statistics = base.statistics.clone();
+	let mut previous_statistics = base.statistics_with_labels(manager, transaction)?;
 	hydrate_legacy_label_statistics(
 		&mut previous_statistics,
 		manager,
@@ -1008,10 +1010,11 @@ pub(super) fn build_node_append_delta(
 		}
 	}
 	next_statistics.mark_dirty(node_count, next_revision)?;
-	let statistics = encode_statistics(
+	let (statistics_root, label_statistics) = encode_statistics_delta(
 		&next_statistics,
 		&labels.node_labels,
 		&labels.edge_labels,
+		base.statistics_layout,
 		PageLsn::ZERO,
 	)?;
 
@@ -1044,7 +1047,8 @@ pub(super) fn build_node_append_delta(
 		payloads.insert(DataFileKind::Properties, property_pages);
 	}
 	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
-	payloads.insert(DataFileKind::Statistics, number_statistics_delta(statistics)?);
+	payloads.insert(DataFileKind::Statistics, vec![(PageNo::new(0), statistics_root)]);
+	payloads.insert(DataFileKind::LabelStatistics, number_pages(label_statistics)?);
 	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
 	Ok(BuiltGraphDelta {
 		catalog_entry,
@@ -1632,8 +1636,13 @@ pub(super) fn build_atom_delta(
 		next_edge_count,
 		&source_context,
 	)?;
-	let statistics =
-		encode_statistics(&statistics, &labels.node_labels, &labels.edge_labels, PageLsn::ZERO)?;
+	let (statistics_root, label_statistics) = encode_statistics_delta(
+		&statistics,
+		&labels.node_labels,
+		&labels.edge_labels,
+		base.statistics_layout,
+		PageLsn::ZERO,
+	)?;
 
 	removed_subgraph_slots.sort_unstable();
 	removed_subgraph_slots.dedup();
@@ -1696,7 +1705,8 @@ pub(super) fn build_atom_delta(
 		payloads.insert(DataFileKind::Subgraphs, number_pages(pages)?);
 	}
 	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
-	payloads.insert(DataFileKind::Statistics, number_statistics_delta(statistics)?);
+	payloads.insert(DataFileKind::Statistics, vec![(PageNo::new(0), statistics_root)]);
+	payloads.insert(DataFileKind::LabelStatistics, number_pages(label_statistics)?);
 	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
 	Ok(BuiltGraphDelta {
 		catalog_entry,
@@ -1976,7 +1986,7 @@ fn delta_graph_statistics(
 	edge_count: u64,
 	context: &EncodeContext,
 ) -> FerrosGrynnResult<GraphStatistics> {
-	let mut previous = base.statistics.clone();
+	let mut previous = base.statistics_with_labels(manager, transaction)?;
 	hydrate_legacy_label_statistics(&mut previous, manager, transaction, base, context)?;
 	if previous.node_count != base.superblock.node_count
 		|| previous.edge_count != base.superblock.edge_count
@@ -2411,23 +2421,6 @@ fn number_pages(pages: Vec<AlignedPage>) -> FerrosGrynnResult<Vec<(PageNo, Box<A
 			Ok((page_no, boxed_page(page_no, page)?))
 		})
 		.collect()
-}
-
-/// Selects root and label pages allowed in an incremental statistics write.
-fn number_statistics_delta(
-	pages: Vec<AlignedPage>,
-) -> FerrosGrynnResult<Vec<(PageNo, Box<AlignedPage>)>> {
-	let mut output = Vec::new();
-	for (index, page) in pages.into_iter().enumerate() {
-		let page_no = u64::try_from(index).map(PageNo::new).map_err(|_error| {
-			FerrosGrynnError::invalid_storage_file("statistics page index exceeds u64")
-		})?;
-		let page_type = page.validate(page_no)?.page_type();
-		if page_no.get() == 0 || page_type == crate::storage::page::PageType::LabelStatistic {
-			output.push((page_no, Box::new(page)));
-		}
-	}
-	Ok(output)
 }
 
 fn box_numbered_pages(
@@ -3509,8 +3502,13 @@ pub(super) fn validate_auxiliary_files(
 ) -> FerrosGrynnResult<()> {
 	let subgraphs = open_graph_file(paths, DataFileKind::Subgraphs)?;
 	let freelist = open_graph_file(paths, DataFileKind::Freelist)?;
-	let statistics = open_graph_file(paths, DataFileKind::Statistics)?;
-	if subgraphs.page_count() != 1 || freelist.page_count() != 1 || statistics.page_count() == 0 {
+	let graph_statistics = open_graph_file(paths, DataFileKind::Statistics)?;
+	let label_statistics = open_graph_file(paths, DataFileKind::LabelStatistics)?;
+	let property_statistics = open_graph_file(paths, DataFileKind::PropertyStatistics)?;
+	if subgraphs.page_count() != 1
+		|| freelist.page_count() != 1
+		|| graph_statistics.page_count() == 0
+	{
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"auxiliary files have an invalid root-page count",
 		));
@@ -3529,11 +3527,28 @@ pub(super) fn validate_auxiliary_files(
 			"immutable generation freelist is not empty",
 		));
 	}
-	let stats = decode_statistics(
-		|page_no, output| statistics.read_page(page_no, output).map(|_header| ()),
-		statistics.page_count(),
+	graph_statistics.read_page(PageNo::new(0), &mut page)?;
+	let (mut stats, layout) = decode_statistics_summary(
+		&page,
+		graph_statistics.page_count(),
+		label_statistics.page_count(),
+		property_statistics.page_count(),
+	)?;
+	stats.degree_histograms = decode_degree_statistics(
+		|page_no, output| graph_statistics.read_page(page_no, output).map(|_header| ()),
+		layout,
 		&labels.node_labels,
 		&labels.edge_labels,
+	)?;
+	stats.labels = decode_label_statistics_file(
+		|page_no, output| label_statistics.read_page(page_no, output).map(|_header| ()),
+		layout,
+		&labels.node_labels,
+		&labels.edge_labels,
+	)?;
+	stats.property_histograms = decode_property_statistics(
+		|page_no, output| property_statistics.read_page(page_no, output).map(|_header| ()),
+		layout,
 	)?;
 	if stats.node_count != superblock.node_count || stats.edge_count != superblock.edge_count {
 		return Err(FerrosGrynnError::invalid_storage_file(

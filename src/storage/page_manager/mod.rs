@@ -43,7 +43,7 @@ use super::{
 	page_cache::{PageCacheKey, PageCacheVersion},
 	page_io::{FilePageExtent, PageIo, PageIoMode},
 	superblock::{DatabaseSuperblock, GraphSuperblock},
-	types::{CheckpointGeneration, CommitTs, GraphId, Lsn, PageKey, TxId},
+	types::{CheckpointGeneration, CommitTs, DataFileKind, GraphId, Lsn, PageKey, TxId},
 	wal::{CommitOutcome, FrameWal, RecoverySeed, ResolvedFrame, TxHandle},
 };
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};

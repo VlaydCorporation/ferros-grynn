@@ -245,7 +245,7 @@ impl GraphStatistics {
 				FerrosGrynnError::invalid_storage_file("label property count underflows")
 			})?;
 		// Keep zero-count entries so point deltas never need to truncate the
-		// append-only statistics file. A later full ANALYZE drops dead labels.
+		// stable label-statistics file. A later full ANALYZE drops dead labels.
 		Ok(())
 	}
 }

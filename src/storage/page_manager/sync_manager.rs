@@ -1050,14 +1050,22 @@ impl SyncPageManager {
 	fn validate_home_files(&self) -> FerrosGrynnResult<()> {
 		let mut scratch = self.checkpoint_scratch.lock();
 		let registrations = self.registry.read().snapshot();
-		for ((_graph_id, _file_id), registration) in registrations {
+		for ((_graph_id, file_id), registration) in registrations {
 			if registration.role() != DataFileRole::WalBackfilled {
 				continue;
 			}
 			let file = registration.file()?;
+			// Statistics distributions are intentionally lazy. Startup proves
+			// the graph root only; ordinary page reads validate auxiliary
+			// checksums.
+			let validation_pages = match file_id.kind() {
+				Some(DataFileKind::Statistics) => file.page_count().min(1),
+				Some(DataFileKind::LabelStatistics | DataFileKind::PropertyStatistics) => 0,
+				_ => file.page_count(),
+			};
 			let mut first = 0_u64;
-			while first < file.page_count() {
-				let remaining = file.page_count() - first;
+			while first < validation_pages {
+				let remaining = validation_pages - first;
 				let count =
 					usize::try_from(remaining.min(scratch.len() as u64)).map_err(|source| {
 						FerrosGrynnError::storage_io_failure(format!(

@@ -74,13 +74,17 @@ use super::{
 		PropertyPageBuilder,
 		QualifiedDiskAtomRef,
 		SUBGRAPHS_PER_PAGE,
+		StatisticsLayout,
 		SubgraphEntry,
 		decode_adjacency_overflow,
 		decode_cross_level_overflow,
+		decode_degree_statistics,
 		decode_freelist,
+		decode_label_statistics_file,
 		decode_large_property,
 		decode_property_map,
-		decode_statistics,
+		decode_property_statistics,
+		decode_statistics_summary,
 		decode_subgraph_directory,
 		encode_adjacency_overflow,
 		encode_cross_level_overflow,
@@ -88,6 +92,7 @@ use super::{
 		encode_large_property,
 		encode_property_map,
 		encode_statistics,
+		encode_statistics_delta,
 		encode_subgraph_directory,
 		hot_slot_address,
 		new_edge_hot_page,
@@ -96,8 +101,8 @@ use super::{
 		read_node_hot_slot,
 		read_property_record,
 		statistics_bulk_layout_matches,
-		statistics_label_page_range,
-		statistics_page_count,
+		statistics_layout,
+		validate_statistics_file_lengths,
 		write_edge_hot_slot,
 		write_node_hot_slot,
 	},
@@ -119,7 +124,17 @@ use crate::{
 		TableKind,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	stats::{GraphStatistics, StatisticField, analyze_graph},
+	stats::{
+		DegreeHistogram,
+		DegreeHistogramKey,
+		GraphStatistics,
+		LabelStatistic,
+		LabelStatisticKey,
+		PropertyHistogram,
+		PropertyHistogramKey,
+		StatisticField,
+		analyze_graph,
+	},
 	values::{
 		PropertyDictionary,
 		PropertyKeyId,
@@ -169,7 +184,7 @@ use crate::{
 };
 
 /// Files produced for every immutable graph generation.
-const GRAPH_FILE_KINDS: [(DataFileKind, &str); 11] = [
+const GRAPH_FILE_KINDS: [(DataFileKind, &str); 13] = [
 	(DataFileKind::GraphSuperblock, "graph.fgb"),
 	(DataFileKind::NodesHot, "nodes_hot.fgb"),
 	(DataFileKind::EdgesHot, "edges_hot.fgb"),
@@ -179,7 +194,9 @@ const GRAPH_FILE_KINDS: [(DataFileKind, &str); 11] = [
 	(DataFileKind::Subgraphs, "subgraphs.fgb"),
 	(DataFileKind::Labels, "labels.fgb"),
 	(DataFileKind::Freelist, "freelist.fgb"),
-	(DataFileKind::Statistics, "statistics.fgb"),
+	(DataFileKind::Statistics, "stats/graph_stats.fgb"),
+	(DataFileKind::LabelStatistics, "stats/label_stats.fgb"),
+	(DataFileKind::PropertyStatistics, "stats/prop_stats.fgb"),
 	(DataFileKind::Index, "primary.fgidx"),
 ];
 
@@ -362,12 +379,31 @@ pub struct LocalGraph {
 	superblock: GraphSuperblock,
 	files: BTreeMap<DataFileKind, DataFileId>,
 	labels: LabelDictionary,
-	/// Statistics decoded for this exact durable graph revision.
+	/// Eager graph counters decoded for this exact durable graph revision.
 	statistics: GraphStatistics,
+	/// Split-file ranges declared by the eager statistics root.
+	statistics_layout: StatisticsLayout,
+	/// Immutable auxiliary statistics loaded on first use through a snapshot.
+	statistics_parts: Mutex<LazyStatisticsParts>,
 	property_dictionary: Arc<PropertyDictionary>,
 	decode_context: Mutex<Option<Arc<EncodeContext>>>,
 	scalar_indexes: BTreeMap<String, Vec<LocalScalarIndex>>,
 	children: BTreeMap<u32, Arc<LocalGraph>>,
+}
+
+/// Successfully decoded lazy statistics parts for one exact local graph.
+// ponytail: one mutex serializes only each part's first load; split it only if
+// concurrent cold statistics reads show measurable contention.
+#[derive(Default)]
+struct LazyStatisticsParts {
+	/// Exact per-label counters decoded from `label_stats.fgb`.
+	labels: Option<Arc<BTreeMap<LabelStatisticKey, LabelStatistic>>>,
+	/// Degree histograms decoded from the tail of `graph_stats.fgb`.
+	degrees: Option<Arc<BTreeMap<DegreeHistogramKey, DegreeHistogram>>>,
+	/// Property histograms decoded from `prop_stats.fgb`.
+	properties: Option<Arc<BTreeMap<PropertyHistogramKey, PropertyHistogram>>>,
+	/// Fully assembled logical statistics after all three parts were requested.
+	complete: Option<Arc<GraphStatistics>>,
 }
 
 #[derive(Clone)]
@@ -409,9 +445,112 @@ impl LocalGraph {
 		self.scalar_indexes.is_empty()
 	}
 
-	/// Returns statistics for this exact durable graph revision.
-	pub(crate) const fn statistics(&self) -> &GraphStatistics {
+	/// Returns eagerly decoded graph counters for this durable revision.
+	pub(crate) const fn statistics_summary(&self) -> &GraphStatistics {
 		&self.statistics
+	}
+
+	/// Loads exact label counters without touching degree or property files.
+	fn label_statistics(
+		&self,
+		manager: &SyncPageManager,
+		transaction: &TxHandle,
+	) -> FerrosGrynnResult<Arc<BTreeMap<LabelStatisticKey, LabelStatistic>>> {
+		let mut parts = self.statistics_parts.lock();
+		if let Some(labels) = &parts.labels {
+			return Ok(Arc::clone(labels));
+		}
+		let labels = Arc::new(decode_label_statistics_file(
+			|page_no, output| {
+				let page = manager.read_page(
+					transaction,
+					self.page_key(DataFileKind::LabelStatistics, page_no)?,
+				)?;
+				output.as_bytes_mut().copy_from_slice(page.as_bytes());
+				Ok(())
+			},
+			self.statistics_layout,
+			&self.labels.node_labels,
+			&self.labels.edge_labels,
+		)?);
+		parts.labels = Some(Arc::clone(&labels));
+		Ok(labels)
+	}
+
+	/// Loads a mutable point-DML snapshot while leaving bulk files untouched.
+	fn statistics_with_labels(
+		&self,
+		manager: &SyncPageManager,
+		transaction: &TxHandle,
+	) -> FerrosGrynnResult<GraphStatistics> {
+		let mut statistics = self.statistics.clone();
+		statistics.labels = (*self.label_statistics(manager, transaction)?).clone();
+		Ok(statistics)
+	}
+
+	/// Loads every statistics part through the caller's exact storage snapshot.
+	fn complete_statistics(
+		&self,
+		manager: &SyncPageManager,
+		transaction: &TxHandle,
+	) -> FerrosGrynnResult<Arc<GraphStatistics>> {
+		if let Some(statistics) = &self.statistics_parts.lock().complete {
+			return Ok(Arc::clone(statistics));
+		}
+		let labels = self.label_statistics(manager, transaction)?;
+		let degrees = {
+			let mut parts = self.statistics_parts.lock();
+			if let Some(degrees) = &parts.degrees {
+				Arc::clone(degrees)
+			} else {
+				let degrees = Arc::new(decode_degree_statistics(
+					|page_no, output| {
+						let page = manager.read_page(
+							transaction,
+							self.page_key(DataFileKind::Statistics, page_no)?,
+						)?;
+						output.as_bytes_mut().copy_from_slice(page.as_bytes());
+						Ok(())
+					},
+					self.statistics_layout,
+					&self.labels.node_labels,
+					&self.labels.edge_labels,
+				)?);
+				parts.degrees = Some(Arc::clone(&degrees));
+				degrees
+			}
+		};
+		let properties = {
+			let mut parts = self.statistics_parts.lock();
+			if let Some(properties) = &parts.properties {
+				Arc::clone(properties)
+			} else {
+				let properties = Arc::new(decode_property_statistics(
+					|page_no, output| {
+						let page = manager.read_page(
+							transaction,
+							self.page_key(DataFileKind::PropertyStatistics, page_no)?,
+						)?;
+						output.as_bytes_mut().copy_from_slice(page.as_bytes());
+						Ok(())
+					},
+					self.statistics_layout,
+				)?);
+				parts.properties = Some(Arc::clone(&properties));
+				properties
+			}
+		};
+		let mut statistics = self.statistics.clone();
+		statistics.labels = (*labels).clone();
+		statistics.degree_histograms = (*degrees).clone();
+		statistics.property_histograms = (*properties).clone();
+		let statistics = Arc::new(statistics);
+		let mut parts = self.statistics_parts.lock();
+		if let Some(cached) = &parts.complete {
+			return Ok(Arc::clone(cached));
+		}
+		parts.complete = Some(Arc::clone(&statistics));
+		Ok(statistics)
 	}
 
 	fn file_id(&self, kind: DataFileKind) -> FerrosGrynnResult<DataFileId> {
@@ -486,7 +625,8 @@ pub struct LocalSnapshotGraph {
 	pub schema: LocalCommitGraphSchema,
 	/// Complete explicit membership recovered from live hot slots.
 	pub memberships: Vec<LocalCommitTableMembership>,
-	/// Recovered planner statistics for the exact graph revision.
+	/// Eager counters for the exact graph revision; auxiliary distributions
+	/// remain transaction-bound and lazy in `graph`.
 	pub statistics: GraphStatistics,
 	pub graph: Arc<LocalGraph>,
 }
@@ -1224,7 +1364,14 @@ impl LocalStore {
 			let in_place = if images.len() == 1
 				&& let Some(index) = existing
 			{
-				prepare_in_place_image(&self.root, &database.graphs[index], &files, &mut images[0])?
+				prepare_in_place_image(
+					&self.root,
+					&self.manager,
+					&transaction,
+					&database.graphs[index],
+					&files,
+					&mut images[0],
+				)?
 			} else {
 				false
 			};
