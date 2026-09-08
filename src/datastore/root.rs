@@ -263,11 +263,21 @@ impl DatabaseRoot {
 			});
 		}
 		for table in tables {
-			let stored = root.graphs.get(&table.graph).ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file(
-					"durable table references a graph absent from the recovered root",
-				)
-			})?;
+			let graph = match &table.graph {
+				Some(graph) => {
+					let stored = root.graphs.get(graph).ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"durable table references a graph absent from the recovered root",
+						)
+					})?;
+					Some(GraphRef::new(
+						graph.clone(),
+						stored.graph.kind(),
+						GraphStorageMode::DiskBacked,
+					))
+				}
+				None => None,
+			};
 			let durable_indexes = table.indexes;
 			let fields = table
 				.fields
@@ -293,12 +303,9 @@ impl DatabaseRoot {
 				id: Some(SchemaId::from_storage(table.id)?),
 				version: SchemaVersion::from_storage(table.version)?,
 				name: name.clone().into(),
-				graph: GraphRef::new(
-					table.graph,
-					stored.graph.kind(),
-					GraphStorageMode::DiskBacked,
-				),
+				graph,
 				kind: table.kind,
+				mode: table.schema_mode,
 				fields,
 				indexes: Vec::new(),
 				primary_index: Some(SystemIndex::from_storage(
@@ -328,6 +335,7 @@ impl DatabaseRoot {
 				let mut definition = TableIndex::new(index.name, index.kind, field_names)?;
 				definition.id = Some(index.id);
 				definition.version = SchemaVersion::from_storage(index.version)?;
+				definition.state = index.state;
 				table_schema = table_schema.with_index(definition)?;
 			}
 			if catalog.tables.insert(name.clone(), Arc::new(table_schema)).is_some() {
@@ -402,7 +410,7 @@ impl DatabaseRoot {
 				.schema
 				.tables
 				.values()
-				.filter(|table| table.graph.id() == graph_id)
+				.filter(|table| table.graph.as_ref().is_some_and(|graph| graph.id() == graph_id))
 				.flat_map(|table| {
 					table.fields.iter().filter_map(|field| {
 						Some(StatisticField {

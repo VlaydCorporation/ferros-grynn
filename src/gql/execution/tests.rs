@@ -99,6 +99,10 @@ impl QueryRead for TestStore {
 	fn property_dictionary(&self, _snapshot: Snapshot) -> Arc<PropertyDictionary> {
 		Arc::new(PropertyDictionary::new())
 	}
+
+	fn execute_schema(&mut self, _statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value> {
+		Err(FerrosGrynnError::query_feature_not_supported("test schema mutation"))
+	}
 }
 
 fn person(id: &str, name: &str, age: i64) -> (RecordId, Row) {
@@ -196,13 +200,13 @@ fn match_store() -> Datastore {
 	store
 }
 
-fn run(store: &TestStore, source: &str) -> FerrosGrynnResult<Vec<QueryResult>> {
-	execute_text(store, source, &Object::new(), ParserSettings::default())
+fn run(mut store: TestStore, source: &str) -> FerrosGrynnResult<Vec<QueryResult>> {
+	execute_text(&mut store, source, &Object::new(), ParserSettings::default())
 }
 
 #[test]
 fn executes_return_with_pratt_precedence() {
-	let results = run(&TestStore::people(), "RETURN 1 + 2 * 3").expect("query succeeds");
+	let results = run(TestStore::people(), "RETURN 1 + 2 * 3").expect("query succeeds");
 	assert_eq!(
 		results[0].result.as_ref().expect("statement succeeds").value(),
 		&Value::from(7_i64)
@@ -212,7 +216,7 @@ fn executes_return_with_pratt_precedence() {
 #[test]
 fn binds_let_filters_projects_and_limits() {
 	let results = run(
-		&TestStore::people(),
+		TestStore::people(),
 		"LET $min = 18; SELECT name FROM person WHERE age >= $min LIMIT 2",
 	)
 	.expect("query succeeds");
@@ -234,7 +238,7 @@ fn binds_let_filters_projects_and_limits() {
 #[test]
 fn gets_record_and_materializes_select_value() {
 	let results =
-		run(&TestStore::people(), "SELECT VALUE name FROM person:alice").expect("query succeeds");
+		run(TestStore::people(), "SELECT VALUE name FROM person:alice").expect("query succeeds");
 	let Value::Array(values) = results[0].result.as_ref().expect("SELECT succeeds").value() else {
 		panic!("expected an array result");
 	};
@@ -243,7 +247,7 @@ fn gets_record_and_materializes_select_value() {
 
 #[test]
 fn rejects_unknown_field_during_analysis() {
-	let error = run(&TestStore::people(), "SELECT missing FROM person")
+	let error = run(TestStore::people(), "SELECT missing FROM person")
 		.expect_err("unknown field must fail before execution");
 	assert_eq!(error.status().diagnostic().phase(), Some(ExecutionPhase::SemanticAnalysis));
 }
@@ -251,7 +255,7 @@ fn rejects_unknown_field_during_analysis() {
 #[test]
 fn keeps_none_and_null_distinct() {
 	let results = run(
-		&TestStore::people(),
+		TestStore::people(),
 		"RETURN none = null; RETURN [none, null]; SELECT VALUE name FROM person WHERE none = \
 		 null; SELECT VALUE name FROM person WHERE none IS none LIMIT 1",
 	)
@@ -282,7 +286,7 @@ fn keeps_none_and_null_distinct() {
 fn preserves_domain_error_and_redacts_storage_source() {
 	let mut store = TestStore::people();
 	store.fail_scan = true;
-	let results = run(&store, "SELECT name FROM person").expect("planning succeeds");
+	let results = run(store, "SELECT name FROM person").expect("planning succeeds");
 	let error = results[0].result.as_ref().expect_err("scan fails");
 	assert_eq!(error.status().code().to_string(), "FG-50F00");
 	assert!(error.technical_source().is_some());
@@ -540,14 +544,14 @@ fn match_observes_transaction_private_graphs_and_one_read_committed_snapshot() {
 	assert!(transaction.execute("MATCH (n) FROM private RETURN n", &Object::new()).is_err());
 
 	let store = match_store();
-	let read = store.begin_with(TransactionOptions {
+	let mut read = store.begin_with(TransactionOptions {
 		isolation: IsolationLevel::ReadCommitted,
 		access: TransactionAccess::ReadOnly,
 	});
 	let snapshot = read.query_snapshot().expect("statement snapshot");
 	let reference = read.query_named_graph(&snapshot, "social").expect("graph ref");
-	let adapter = TransactionRead {
-		transaction: &read,
+	let mut adapter = TransactionRead {
+		transaction: &mut read,
 		snapshot,
 	};
 	let mut concurrent = store.begin();
@@ -564,7 +568,7 @@ fn match_observes_transaction_private_graphs_and_one_read_committed_snapshot() {
 	}
 	concurrent.commit().expect("concurrent commit");
 	let results = execute_text(
-		&adapter,
+		&mut adapter,
 		"MATCH (n:Person) FROM social RETURN n.id",
 		&Object::new(),
 		ParserSettings::default(),
@@ -579,7 +583,7 @@ fn match_observes_transaction_private_graphs_and_one_read_committed_snapshot() {
 #[test]
 fn match_reads_participate_in_serializable_validation() {
 	let store = match_store();
-	let reader = store.begin();
+	let mut reader = store.begin();
 	let snapshot = reader.query_snapshot().expect("snapshot");
 	let reference = reader.query_named_graph(&snapshot, "social").expect("graph ref");
 	reader

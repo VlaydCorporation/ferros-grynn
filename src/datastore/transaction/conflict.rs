@@ -80,7 +80,10 @@ impl Transaction {
 				.map(|schema| schema.as_ref().clone())
 				.ok_or_else(|| FerrosGrynnError::table_does_not_exist(&predicate.table))?,
 		};
-		let Some(stored) = current.graphs.get(schema.graph.id()) else {
+		let Some(graph) = schema.graph() else {
+			return Ok(());
+		};
+		let Some(stored) = current.graphs.get(graph.id()) else {
 			return Ok(());
 		};
 		let changed = stored
@@ -122,7 +125,10 @@ impl Transaction {
 		let table_id = schema.id.ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("published table has no schema identity")
 		})?;
-		if let Some(write) = self.graphs.get(schema.graph.id()) {
+		let Some(graph_ref) = schema.graph() else {
+			return Ok(None);
+		};
+		if let Some(write) = self.graphs.get(graph_ref.id()) {
 			if let Some(local) = &write.local
 				&& let Some((record, properties, removed)) = local.delta.changed_atom(atom)
 			{
@@ -139,7 +145,7 @@ impl Transaction {
 					.memberships
 					.get(&atom)
 					.copied()
-					.unwrap_or_else(|| root.schema.membership(schema.graph.id(), atom));
+					.unwrap_or_else(|| root.schema.membership(graph_ref.id(), atom));
 				return Ok((!removed && kind_matches && membership == Some(table_id))
 					.then(|| row_from_properties(atom, record, properties, schema)));
 			}
@@ -148,22 +154,19 @@ impl Transaction {
 				.as_ref()
 				.is_some_and(|value| value.dirty().contains(&DirtyTarget::Atom(atom)));
 			if dirty {
-				let memberships = self.query_memberships(root, schema.graph.id())?;
+				let memberships = self.query_memberships(root, graph_ref.id())?;
 				return Ok(write.value.as_ref().and_then(|value| {
 					materialize_atom(&value.snapshot(), schema, &memberships, atom)
 				}));
 			}
 		}
-		let Some(stored) = root.graphs.get(schema.graph.id()) else {
+		let Some(stored) = root.graphs.get(graph_ref.id()) else {
 			return Ok(None);
 		};
 		match &stored.graph {
-			StoredGraphValue::Materialized(graph) => Ok(materialize_atom(
-				graph,
-				schema,
-				&root.schema.memberships(schema.graph.id()),
-				atom,
-			)),
+			StoredGraphValue::Materialized(graph) => {
+				Ok(materialize_atom(graph, schema, &root.schema.memberships(graph_ref.id()), atom))
+			}
 			StoredGraphValue::Local(graph) => {
 				let local = self.store.inner.backend.local().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(

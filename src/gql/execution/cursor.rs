@@ -75,6 +75,9 @@ pub(super) trait QueryRead {
 
 	/// Returns the property dictionary captured by the statement snapshot.
 	fn property_dictionary(&self, snapshot: Snapshot) -> Arc<PropertyDictionary>;
+
+	/// Applies one typed schema command to the transaction that owns this view.
+	fn execute_schema(&mut self, statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value>;
 }
 
 /// Pull cursor that binds the first endpoint of a pattern.

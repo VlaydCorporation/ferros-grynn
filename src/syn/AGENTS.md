@@ -30,6 +30,9 @@ state. Он не выполняет запросы и не разрешает sc
   для comments, escapes, quoted identifiers, parameters, spans и errors.
 - Syntax errors создаются через `gql_status`; semantic validation принадлежит
   `gql::analysis`.
+- `stmt/schema.rs` владеет core `DEFINE`/`REMOVE`/`ALTER` и
+  `INFO FOR DB|TABLE|INDEX`. Неподдерживаемые DDL clauses должны завершаться
+  явной диагностикой, а не создавать speculative AST variants.
 
 ## Проверка
 

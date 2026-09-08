@@ -311,12 +311,12 @@ pub(super) fn build_graph_image(
 		}
 		let table = tables
 			.iter()
-			.find(|table| table.id == table_id && table.graph == *record_id)
+			.find(|table| table.id == table_id && table.graph.as_ref() == Some(record_id))
 			.ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file(
-				"table membership references an absent or foreign table",
-			)
-		})?;
+				FerrosGrynnError::invalid_storage_file(
+					"table membership references an absent or foreign table",
+				)
+			})?;
 		if !table_kind_accepts(
 			table.kind,
 			membership.id.kind().ok_or_else(|| {
@@ -636,7 +636,7 @@ pub(super) fn build_graph_image(
 
 	let statistic_fields = tables
 		.iter()
-		.filter(|table| table.graph == *record_id)
+		.filter(|table| table.graph.as_ref() == Some(record_id))
 		.flat_map(|table| {
 			table.fields.iter().map(|field| StatisticField {
 				table_id: table.id,
@@ -2682,7 +2682,7 @@ pub(super) fn build_table_indexes(
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<Vec<BuiltTableIndexImage>> {
 	let mut built = Vec::new();
-	for table in tables.iter().filter(|table| table.graph == *record_id) {
+	for table in tables.iter().filter(|table| table.graph.as_ref() == Some(record_id)) {
 		for index in &table.indexes {
 			if index.kind == TableIndexKind::Count {
 				let atom_count = u64::try_from(

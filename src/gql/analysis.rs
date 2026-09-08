@@ -9,6 +9,7 @@ use super::ir::{
 	LogicalNode,
 	LogicalNodeKind,
 	LogicalProgram,
+	LogicalSchemaStatement,
 	LogicalSelect,
 	LogicalStatement,
 	MatchBinding,
@@ -20,11 +21,19 @@ use super::ir::{
 	TypedExprKind,
 };
 use crate::{
+	datastore::{TableIndexKind, TableKind, TableSchemaMode},
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, TextSpan},
 	syn::{
+		AlterTarget,
+		BasicIndexDefinition,
 		BinaryOperator,
+		DefineFieldStatement,
+		DefineGraphStatement,
+		DefineIndexStatement,
+		DefineTableStatement,
 		Expr,
 		ExprKind,
+		InfoTarget,
 		Literal,
 		MatchEndpoint,
 		MatchEndpointKind,
@@ -32,13 +41,16 @@ use crate::{
 		MatchStatement,
 		Program,
 		RecordKey,
+		RemoveTarget,
 		SelectItem,
 		SelectTarget,
 		StatementKind,
+		TableKindName,
+		TableSchemaModeName,
 		TypeName,
 		UnaryOperator,
 	},
-	values::{AtomKind, GraphRef, Number, Object, RecordId, RecordIdPart, Type, Value},
+	values::{AtomKind, GraphKind, GraphRef, Number, Object, RecordId, RecordIdPart, Type, Value},
 };
 
 /// Maximum finite path depth accepted by the MVP analyzer.
@@ -114,6 +126,29 @@ impl<'a> Analyzer<'a> {
 		let mut statements = Vec::with_capacity(program.statements.len());
 		for statement in &program.statements {
 			match &statement.kind {
+				StatementKind::DefineGraph(definition) => {
+					statements.push(LogicalStatement::Schema(
+						self.define_graph(definition, statement.span)?,
+					));
+				}
+				StatementKind::DefineTable(definition) => {
+					statements.push(LogicalStatement::Schema(Self::define_table(definition)));
+				}
+				StatementKind::DefineField(definition) => {
+					statements.push(LogicalStatement::Schema(self.define_field(definition)?));
+				}
+				StatementKind::DefineIndex(definition) => {
+					statements.push(LogicalStatement::Schema(Self::define_index(definition)));
+				}
+				StatementKind::Remove(statement) => {
+					statements.push(LogicalStatement::Schema(Self::remove(&statement.target)));
+				}
+				StatementKind::Alter(statement) => {
+					statements.push(LogicalStatement::Schema(self.alter(&statement.target)?));
+				}
+				StatementKind::Info(statement) => {
+					statements.push(LogicalStatement::Schema(Self::info(&statement.target)));
+				}
 				StatementKind::Let(statement) => {
 					let value = self.expr(&statement.value, None)?;
 					if let Some(declared) = &statement.declared_type {
@@ -149,6 +184,163 @@ impl<'a> Analyzer<'a> {
 			initial_slots: self.initial_slots,
 			slot_count: self.slots.len(),
 		})
+	}
+
+	fn define_graph(
+		&self,
+		definition: &DefineGraphStatement,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		let kind = match definition.constraints.as_slice() {
+			[] => GraphKind::Graph,
+			[constraint] if constraint.value.eq_ignore_ascii_case("DAG") => GraphKind::Dag,
+			[constraint] if constraint.value.eq_ignore_ascii_case("HYPER") => GraphKind::Hypergraph,
+			[constraint] if constraint.value.eq_ignore_ascii_case("META") => GraphKind::Metagraph,
+			_ => {
+				let constraints = definition
+					.constraints
+					.iter()
+					.map(|constraint| constraint.value.as_ref())
+					.collect::<Vec<_>>()
+					.join(" ");
+				return Err(self.unsupported(&format!("DEFINE GRAPH TYPE {constraints}"), span));
+			}
+		};
+		Ok(LogicalSchemaStatement::DefineGraph {
+			mode: definition.mode,
+			name: definition.name.value.clone(),
+			kind,
+		})
+	}
+
+	fn define_table(definition: &DefineTableStatement) -> LogicalSchemaStatement {
+		LogicalSchemaStatement::DefineTable {
+			mode: definition.mode,
+			name: definition.name.value.clone(),
+			kind: table_kind(definition.kind),
+			schema_mode: table_schema_mode(definition.schema_mode),
+		}
+	}
+
+	fn define_field(
+		&self,
+		definition: &DefineFieldStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		Ok(LogicalSchemaStatement::DefineField {
+			mode: definition.mode,
+			table: definition.table.value.clone(),
+			name: definition.name.value.clone(),
+			value_type: definition
+				.value_type
+				.as_ref()
+				.map_or(Ok(Type::Any), |name| self.type_name(name))?,
+		})
+	}
+
+	fn define_index(definition: &DefineIndexStatement) -> LogicalSchemaStatement {
+		let (kind, fields) = match &definition.definition {
+			BasicIndexDefinition::Standard(fields) => {
+				(TableIndexKind::Standard, fields.iter().map(|field| field.value.clone()).collect())
+			}
+			BasicIndexDefinition::Unique(fields) => {
+				(TableIndexKind::Unique, fields.iter().map(|field| field.value.clone()).collect())
+			}
+			BasicIndexDefinition::Count => (TableIndexKind::Count, Vec::new()),
+		};
+		LogicalSchemaStatement::DefineIndex {
+			mode: definition.mode,
+			table: definition.table.value.clone(),
+			name: definition.name.value.clone(),
+			kind,
+			fields,
+		}
+	}
+
+	fn remove(target: &RemoveTarget) -> LogicalSchemaStatement {
+		match target {
+			RemoveTarget::Graph {
+				if_exists,
+				name,
+			} => LogicalSchemaStatement::RemoveGraph {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+			},
+			RemoveTarget::Table {
+				if_exists,
+				name,
+			} => LogicalSchemaStatement::RemoveTable {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+			},
+			RemoveTarget::Field {
+				if_exists,
+				name,
+				table,
+			} => LogicalSchemaStatement::RemoveField {
+				if_exists: *if_exists,
+				table: table.value.clone(),
+				name: name.value.clone(),
+			},
+			RemoveTarget::Index {
+				if_exists,
+				name,
+				table,
+			} => LogicalSchemaStatement::RemoveIndex {
+				if_exists: *if_exists,
+				table: table.value.clone(),
+				name: name.value.clone(),
+			},
+		}
+	}
+
+	fn alter(&self, target: &AlterTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		match target {
+			AlterTarget::Table {
+				if_exists,
+				name,
+				schema_mode,
+			} => Ok(LogicalSchemaStatement::AlterTableMode {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+				mode: table_schema_mode(*schema_mode),
+			}),
+			AlterTarget::Field {
+				if_exists,
+				name,
+				table,
+				value_type,
+			} => Ok(LogicalSchemaStatement::AlterFieldType {
+				if_exists: *if_exists,
+				table: table.value.clone(),
+				name: name.value.clone(),
+				value_type: value_type
+					.as_ref()
+					.map_or(Ok(Type::Any), |name| self.type_name(name))?,
+			}),
+			AlterTarget::IndexPrepareRemove {
+				name,
+				table,
+			} => Ok(LogicalSchemaStatement::PrepareIndexRemoval {
+				table: table.value.clone(),
+				name: name.value.clone(),
+			}),
+		}
+	}
+
+	fn info(target: &InfoTarget) -> LogicalSchemaStatement {
+		match target {
+			InfoTarget::Database => LogicalSchemaStatement::InfoDatabase,
+			InfoTarget::Table(name) => LogicalSchemaStatement::InfoTable {
+				name: name.value.clone(),
+			},
+			InfoTarget::Index {
+				name,
+				table,
+			} => LogicalSchemaStatement::InfoIndex {
+				table: table.value.clone(),
+				name: name.value.clone(),
+			},
+		}
 	}
 
 	/// Analyzes a complete MATCH statement.
@@ -758,6 +950,21 @@ impl<'a> Analyzer<'a> {
 	fn locate(&self, error: FerrosGrynnError, span: TextSpan) -> FerrosGrynnError {
 		Location::from_source(None, self.source, span)
 			.map_or(error.clone(), |location| error.with_location(location))
+	}
+}
+
+const fn table_kind(kind: TableKindName) -> TableKind {
+	match kind {
+		TableKindName::Any => TableKind::Any,
+		TableKindName::Normal => TableKind::Normal,
+		TableKindName::Relation => TableKind::Relation,
+	}
+}
+
+const fn table_schema_mode(mode: TableSchemaModeName) -> TableSchemaMode {
+	match mode {
+		TableSchemaModeName::Schemaless => TableSchemaMode::Schemaless,
+		TableSchemaModeName::Schemafull => TableSchemaMode::Schemafull,
 	}
 }
 

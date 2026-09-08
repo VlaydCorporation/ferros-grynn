@@ -11,7 +11,7 @@ use std::{collections::BTreeSet, rc::Rc, sync::Arc, time::Instant};
 
 #[cfg(test)]
 use adapter::TransactionRead;
-pub use adapter::execute_transaction;
+pub use adapter::{execute_parsed_transaction, execute_transaction};
 use rust_decimal::Decimal;
 #[allow(
 	clippy::wildcard_imports,
@@ -32,6 +32,7 @@ use super::{
 		LogicalMatchPattern,
 		LogicalNodeKind,
 		LogicalProgram,
+		LogicalSchemaStatement,
 		LogicalSelect,
 		LogicalStatement,
 		MatchBinding,
@@ -90,7 +91,7 @@ use crate::{
 
 /// Parses and executes text through a statically dispatched read adapter.
 pub(in crate::gql::execution) fn execute_text<Read: QueryRead>(
-	read: &Read,
+	read: &mut Read,
 	source: &str,
 	variables: &Object,
 	settings: ParserSettings,
@@ -101,7 +102,7 @@ pub(in crate::gql::execution) fn execute_text<Read: QueryRead>(
 
 /// Executes an already parsed program against one captured snapshot.
 fn execute_program<Read: QueryRead>(
-	read: &Read,
+	read: &mut Read,
 	source: &str,
 	program: &Program,
 	variables: &Object,
@@ -113,6 +114,9 @@ fn execute_program<Read: QueryRead>(
 	for statement in &logical.statements {
 		let start = Instant::now();
 		let (kind, result) = match statement {
+			LogicalStatement::Schema(statement) => {
+				(statement.statement_kind(), read.execute_schema(statement).map(Outcome::success))
+			}
 			LogicalStatement::Let {
 				slot,
 				value,

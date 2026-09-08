@@ -498,7 +498,7 @@ impl SchemaCatalog {
 						"table membership references an absent schema definition",
 					)
 				})?;
-				if table.graph.id() != graph {
+				if table.graph.as_ref().map(GraphRef::id) != Some(graph) {
 					return Err(FerrosGrynnError::invalid_storage_file(
 						"table membership references a table from another graph",
 					));

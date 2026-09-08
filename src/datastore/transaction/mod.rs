@@ -79,16 +79,29 @@ impl Transaction {
 		self.options
 	}
 
+	/// Parses, analyzes, and executes a GrynQL program inside this transaction.
+	///
+	/// # Errors
+	///
+	/// Returns a parser, analysis, execution, or storage error produced by the
+	/// program.
 	pub fn execute(
-		&self,
+		&mut self,
 		source: &str,
 		variables: &crate::values::Object,
 	) -> FerrosGrynnResult<Vec<crate::gql::QueryResult>> {
 		self.execute_with_settings(source, variables, crate::gql::ParserSettings::default())
 	}
 
+	/// Executes a GrynQL program with explicit parser settings inside this
+	/// transaction.
+	///
+	/// # Errors
+	///
+	/// Returns a parser, analysis, execution, or storage error produced by the
+	/// program.
 	pub fn execute_with_settings(
-		&self,
+		&mut self,
 		source: &str,
 		variables: &crate::values::Object,
 		settings: crate::gql::ParserSettings,
@@ -142,13 +155,17 @@ impl Transaction {
 		#[allow(clippy::mutable_key_type, reason = "RecordId is the datastore's stable graph key")]
 		let mut bulk_statistics_graphs = BTreeSet::new();
 		for (name, schema) in &self.tables {
-			if let Some(previous) = current.schema.table(name) {
-				statistics_graphs.insert(previous.graph().id().clone());
-				bulk_statistics_graphs.insert(previous.graph().id().clone());
+			if let Some(previous) = current.schema.table(name)
+				&& let Some(graph) = previous.graph()
+			{
+				statistics_graphs.insert(graph.id().clone());
+				bulk_statistics_graphs.insert(graph.id().clone());
 			}
-			if let Some(schema) = schema {
-				statistics_graphs.insert(schema.graph().id().clone());
-				bulk_statistics_graphs.insert(schema.graph().id().clone());
+			if let Some(schema) = schema
+				&& let Some(graph) = schema.graph()
+			{
+				statistics_graphs.insert(graph.id().clone());
+				bulk_statistics_graphs.insert(graph.id().clone());
 			}
 		}
 		let mut local_commits = Vec::new();
@@ -158,10 +175,14 @@ impl Transaction {
 		for (name, schema) in std::mem::take(&mut self.tables) {
 			match schema {
 				Some(mut schema) => {
-					if !next.graphs.contains_key(schema.graph.id()) {
-						return Err(FerrosGrynnError::graph_does_not_exist(
-							schema.graph.id().to_string(),
-						));
+					if let Some(graph) = &schema.graph
+						&& !next.graphs.contains_key(graph.id())
+					{
+						return Err(FerrosGrynnError::graph_does_not_exist(graph.id().to_string()));
+					}
+					for field in &mut schema.fields {
+						field.key =
+							Some(Arc::make_mut(&mut next.dictionary).intern(field.name.clone())?);
 					}
 					schema.published_at = commit_ts;
 					Arc::make_mut(&mut next.schema).tables.insert(name.clone(), Arc::new(schema));
@@ -192,23 +213,22 @@ impl Transaction {
 			Arc::make_mut(&mut next.schema).parameter_versions.insert(name, commit_ts);
 		}
 		for schema in next.schema.tables.values() {
-			let stored = next.graphs.get(schema.graph.id()).ok_or_else(|| {
+			let Some(graph) = schema.graph() else {
+				continue;
+			};
+			let stored = next.graphs.get(graph.id()).ok_or_else(|| {
 				FerrosGrynnError::graph_constraint_violation(
 					"catalog",
-					format!(
-						"table '{}' references missing graph '{}'",
-						schema.name,
-						schema.graph.id()
-					),
+					format!("table '{}' references missing graph '{}'", schema.name, graph.id()),
 				)
 			})?;
-			if stored.graph.kind() != schema.graph.kind() {
+			if stored.graph.kind() != graph.kind() {
 				return Err(FerrosGrynnError::graph_constraint_violation(
 					"catalog",
 					format!(
 						"table '{}' expects graph family '{}' but found '{}'",
 						schema.name,
-						schema.graph.kind().name(),
+						graph.kind().name(),
 						stored.graph.kind().name()
 					),
 				));

@@ -179,12 +179,14 @@ pub(in crate::storage) struct TableIndexCatalogEntry {
 	pub(in crate::storage) name: String,
 	/// Physical index contract.
 	pub(in crate::storage) kind: TableIndexKind,
+	/// Persisted planner-availability state.
+	pub(in crate::storage) state: TableIndexState,
 	/// Composite fields as database property-key identifiers; empty for Count.
 	pub(in crate::storage) fields: Vec<u32>,
 	/// Exact physical index file.
-	pub(in crate::storage) file_id: DataFileId,
+	pub(in crate::storage) file_id: Option<DataFileId>,
 	/// Root page of the immutable B+tree generation.
-	pub(in crate::storage) root: PageNo,
+	pub(in crate::storage) root: Option<PageNo>,
 }
 
 /// One durable table schema.
@@ -200,6 +202,8 @@ pub(in crate::storage) struct TableCatalogEntry {
 	pub(in crate::storage) graph_id: GraphId,
 	/// Node/relation applicability.
 	pub(in crate::storage) kind: TableKind,
+	/// Record-schema validation policy.
+	pub(in crate::storage) schema_mode: TableSchemaMode,
 	/// Fields in query-visible order.
 	pub(in crate::storage) fields: Vec<TableFieldCatalogEntry>,
 	/// User-declared table indexes in strict name order.
@@ -343,7 +347,8 @@ impl DatabaseCatalog {
 			output.extend_from_slice(&table.schema_version.to_le_bytes());
 			output.extend_from_slice(&table.graph_id.get().to_le_bytes());
 			output.push(table_kind_byte(table.kind));
-			output.extend_from_slice(&[0_u8; 3]);
+			output.push(table_schema_mode_byte(table.schema_mode));
+			output.extend_from_slice(&[0_u8; 2]);
 			output.extend_from_slice(&table.primary_index.index_id.get().to_le_bytes());
 			output.extend_from_slice(&table.primary_index.schema_version.to_le_bytes());
 			output.extend_from_slice(
@@ -369,14 +374,15 @@ impl DatabaseCatalog {
 				output.extend_from_slice(&index.index_id.get().to_le_bytes());
 				output.extend_from_slice(&index.schema_version.to_le_bytes());
 				output.push(table_index_kind_byte(index.kind));
-				output.extend_from_slice(&[0_u8; 3]);
+				output.push(table_index_state_byte(index.state));
+				output.extend_from_slice(&[0_u8; 2]);
 				output.extend_from_slice(
 					&u32::try_from(index.fields.len())
 						.map_err(|_error| invalid_catalog("index field count exceeds u32"))?
 						.to_le_bytes(),
 				);
-				output.extend_from_slice(&index.file_id.get().to_le_bytes());
-				output.extend_from_slice(&index.root.get().to_le_bytes());
+				output.extend_from_slice(&index.file_id.map_or(0, DataFileId::get).to_le_bytes());
+				output.extend_from_slice(&index.root.map_or(0, PageNo::get).to_le_bytes());
 				for field in &index.fields {
 					output.extend_from_slice(&field.to_le_bytes());
 				}
@@ -417,7 +423,7 @@ impl DatabaseCatalog {
 	}
 
 	/// Decodes a bounded canonical database-catalog payload.
-	fn decode(bytes: &[u8]) -> FerrosGrynnResult<Self> {
+	pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<Self> {
 		let mut decoder = CatalogDecoder::new(bytes);
 		decoder.expect_magic(DATABASE_CATALOG_MAGIC, "database catalog")?;
 		decoder.expect_version(DATABASE_CATALOG_PAYLOAD_VERSION)?;
@@ -513,7 +519,8 @@ impl DatabaseCatalog {
 			let schema_version = decoder.read_u32()?;
 			let graph_id = GraphId::new(decoder.read_u64()?);
 			let kind = decode_table_kind(decoder.read_u8()?)?;
-			decoder.expect_zero(3, "table catalog padding")?;
+			let schema_mode = decode_table_schema_mode(decoder.read_u8()?)?;
+			decoder.expect_zero(2, "table catalog padding")?;
 			let primary_index = SystemIndexCatalogEntry {
 				index_id: IndexId::from_storage(decoder.read_u32()?)?,
 				schema_version: decoder.read_u32()?,
@@ -545,7 +552,8 @@ impl DatabaseCatalog {
 				let index_id = IndexId::from_storage(decoder.read_u32()?)?;
 				let schema_version = decoder.read_u32()?;
 				let kind = decode_table_index_kind(decoder.read_u8()?)?;
-				decoder.expect_zero(3, "table index padding")?;
+				let state = decode_table_index_state(decoder.read_u8()?)?;
+				decoder.expect_zero(2, "table index padding")?;
 				let field_count = usize::try_from(decoder.read_u32()?)
 					.map_err(|_error| invalid_catalog("index field count does not fit usize"))?;
 				if field_count > MAX_TYPE_MEMBERS
@@ -553,29 +561,41 @@ impl DatabaseCatalog {
 				{
 					return Err(invalid_catalog("index field count exceeds its format limit"));
 				}
-				let file_id = DataFileId::from_raw(decoder.read_u64()?)
-					.ok_or_else(|| invalid_catalog("table index contains an unknown DataFileId"))?;
-				let root = PageNo::new(decoder.read_u64()?);
+				let raw_file_id = decoder.read_u64()?;
+				let file_id = if raw_file_id == 0 {
+					None
+				} else {
+					Some(DataFileId::from_raw(raw_file_id).ok_or_else(|| {
+						invalid_catalog("table index contains an unknown DataFileId")
+					})?)
+				};
+				let raw_root = decoder.read_u64()?;
+				let root = file_id.map(|_file| PageNo::new(raw_root));
+				if file_id.is_none() && raw_root != 0 {
+					return Err(invalid_catalog("table index root exists without a physical file"));
+				}
 				let mut index_fields = Vec::with_capacity(field_count);
 				for _ in 0..field_count {
 					index_fields.push(decoder.read_u32()?);
 				}
 				indexes.push(TableIndexCatalogEntry {
-					name,
 					index_id,
 					schema_version,
+					name,
 					kind,
+					state,
 					fields: index_fields,
 					file_id,
 					root,
 				});
 			}
 			tables.push(TableCatalogEntry {
-				name,
 				schema_id,
 				schema_version,
+				name,
 				graph_id,
 				kind,
+				schema_mode,
 				fields,
 				indexes,
 				primary_index,

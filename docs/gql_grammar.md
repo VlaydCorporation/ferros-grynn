@@ -736,7 +736,8 @@ if_exists         ::= "IF" "EXISTS"
 
 ```ebnf
 define_table ::= "DEFINE" "TABLE" [ overwrite_or_ifne ] name
-                 [ "TYPE" ( "ANY" | "NORMAL" | "RELATION" | "SCHEMALESS" | "SCHEMAFULL" ) ]
+                 [ "TYPE" ( "ANY" | "NORMAL" | "RELATION" ) ]
+                 [ "SCHEMALESS" | "SCHEMAFULL" ]
                  [ "DROP" ]
                  [ "AS" select_stmt ]
                  [ "CHANGEFEED" duration_lit ]

@@ -17,6 +17,8 @@ pub(crate) struct QueryStorageCursor<'store> {
 
 /// Concrete cursor state without virtual dispatch inside page loops.
 enum QueryStorageSource<'store> {
+	/// Schema-only system table before the DML system-graph slice.
+	Empty,
 	/// Slot-wise scan of an immutable in-memory graph root.
 	Materialized(MaterializedTableCursor),
 	/// Bounded primary-leaf scan of one local graph generation.
@@ -100,6 +102,7 @@ impl QueryStorageCursor<'_> {
 	/// Pulls one owned storage row from the selected backend.
 	pub(crate) fn next_row(&mut self) -> FerrosGrynnResult<Option<QueryStorageRow>> {
 		match &mut self.source {
+			QueryStorageSource::Empty => Ok(None),
 			QueryStorageSource::Materialized(cursor) => cursor.next_row(),
 			QueryStorageSource::Local {
 				cursor,
@@ -229,6 +232,53 @@ impl Transaction {
 		))
 	}
 
+	/// Returns graph definitions visible to this transaction in catalog-name
+	/// order.
+	pub(crate) fn query_schema_graphs(
+		&self,
+		snapshot: &QuerySnapshot,
+	) -> FerrosGrynnResult<Vec<GraphSchema>> {
+		self.ensure_live()?;
+		let mut graphs = snapshot
+			.root
+			.schema
+			.graphs()
+			.map(|schema| (schema.name().as_str().to_owned(), schema.as_ref().clone()))
+			.collect::<BTreeMap<_, _>>();
+		for (record_id, write) in &self.graphs {
+			self.record_read(&snapshot.root, ReadKey::GraphCatalog(record_id.clone()));
+			if write.exists() {
+				graphs.insert(write.name.clone(), write.schema.clone());
+			} else {
+				graphs.remove(&write.name);
+			}
+		}
+		Ok(graphs.into_values().collect())
+	}
+
+	/// Returns table definitions visible to this transaction in name order.
+	pub(crate) fn query_schema_tables(
+		&self,
+		snapshot: &QuerySnapshot,
+	) -> FerrosGrynnResult<Vec<TableSchema>> {
+		self.ensure_live()?;
+		let mut tables = snapshot
+			.root
+			.schema
+			.tables()
+			.map(|schema| (schema.name().as_str().to_owned(), schema.as_ref().clone()))
+			.collect::<BTreeMap<_, _>>();
+		for (name, schema) in &self.tables {
+			self.record_read(&snapshot.root, ReadKey::Table(name.clone()));
+			if let Some(schema) = schema {
+				tables.insert(name.clone(), schema.clone());
+			} else {
+				tables.remove(name);
+			}
+		}
+		Ok(tables.into_values().collect())
+	}
+
 	/// Collects the streaming path only for legacy root characterization tests.
 	#[cfg(test)]
 	pub(crate) fn query_rows(
@@ -255,10 +305,15 @@ impl Transaction {
 	) -> FerrosGrynnResult<QueryStorageCursor<'store>> {
 		self.ensure_live()?;
 		let schema = self.query_table(snapshot, table)?;
-		self.record_read(&snapshot.root, ReadKey::GraphCatalog(schema.graph.id().clone()));
-		if let Some(write) = self.graphs.get(schema.graph.id()) {
+		let Some(graph_ref) = schema.graph() else {
+			return Ok(QueryStorageCursor {
+				source: QueryStorageSource::Empty,
+			});
+		};
+		self.record_read(&snapshot.root, ReadKey::GraphCatalog(graph_ref.id().clone()));
+		if let Some(write) = self.graphs.get(graph_ref.id()) {
 			let graph = write.snapshot(&self.store)?;
-			let memberships = self.query_memberships(&snapshot.root, schema.graph.id())?;
+			let memberships = self.query_memberships(&snapshot.root, graph_ref.id())?;
 			return Ok(QueryStorageCursor {
 				source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
 					Arc::new(graph),
@@ -268,12 +323,12 @@ impl Transaction {
 			});
 		}
 		let stored =
-			snapshot.root.graphs.get(schema.graph.id()).ok_or_else(|| {
-				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
+			snapshot.root.graphs.get(graph_ref.id()).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(graph_ref.id().to_string())
 			})?;
 		match &stored.graph {
 			StoredGraphValue::Materialized(graph) => {
-				let memberships = self.query_memberships(&snapshot.root, schema.graph.id())?;
+				let memberships = self.query_memberships(&snapshot.root, graph_ref.id())?;
 				Ok(QueryStorageCursor {
 					source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
 						graph.clone(),
@@ -322,8 +377,11 @@ impl Transaction {
 	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
 		self.ensure_live()?;
 		let schema = self.query_table(snapshot, record.table())?;
-		self.record_read(&snapshot.root, ReadKey::GraphCatalog(schema.graph.id().clone()));
-		if let Some(write) = self.graphs.get(schema.graph.id()) {
+		let Some(graph_ref) = schema.graph() else {
+			return Ok(None);
+		};
+		self.record_read(&snapshot.root, ReadKey::GraphCatalog(graph_ref.id().clone()));
+		if let Some(write) = self.graphs.get(graph_ref.id()) {
 			if !write.exists() {
 				return Ok(None);
 			}
@@ -334,16 +392,16 @@ impl Transaction {
 				} else {
 					graph.atom_id(&AtomRef::new(AtomKind::Edge, record.clone()))?
 				};
-			let memberships = self.query_memberships(&snapshot.root, schema.graph.id())?;
+			let memberships = self.query_memberships(&snapshot.root, graph_ref.id())?;
 			return Ok(atom.and_then(|atom| materialize_atom(&graph, &schema, &memberships, atom)));
 		}
 		let stored =
-			snapshot.root.graphs.get(schema.graph.id()).ok_or_else(|| {
-				FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string())
+			snapshot.root.graphs.get(graph_ref.id()).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(graph_ref.id().to_string())
 			})?;
 		match &stored.graph {
 			StoredGraphValue::Materialized(graph) => {
-				let memberships = self.query_memberships(&snapshot.root, schema.graph.id())?;
+				let memberships = self.query_memberships(&snapshot.root, graph_ref.id())?;
 				Ok(stored
 					.record_index
 					.get(&record.to_string())
@@ -404,7 +462,7 @@ impl Transaction {
 			root: snapshot.root.clone(),
 			matcher: PredicateMatcher::Query(evaluator),
 		});
-		Ok(Some(schema.graph.id().clone()))
+		Ok(schema.graph().map(|graph| graph.id().clone()))
 	}
 
 	/// Records one actually pulled atom when it satisfies the registered query
@@ -435,8 +493,8 @@ impl Transaction {
 			return Ok(());
 		}
 		let schema = self.query_table(snapshot, table)?;
-		if let Some(row) = row {
-			self.record_read(&snapshot.root, ReadKey::Atom(schema.graph.id().clone(), row.atom_id));
+		if let (Some(graph), Some(row)) = (schema.graph(), row) {
+			self.record_read(&snapshot.root, ReadKey::Atom(graph.id().clone(), row.atom_id));
 		}
 		self.predicates.lock().push(PredicateRead {
 			table: table.to_owned(),
@@ -457,6 +515,12 @@ fn indexed_local_rows(
 	constraints: &[ScalarIndexConstraint],
 ) -> FerrosGrynnResult<Option<Vec<QueryStorageRow>>> {
 	let mut rows = Vec::new();
+	let usable_indexes = schema
+		.indexes
+		.iter()
+		.filter(|index| index.state == TableIndexState::Ready)
+		.map(|index| index.name.as_str())
+		.collect::<Vec<_>>();
 	let equalities = constraints
 		.iter()
 		.filter(|constraint| matches!(constraint.comparison, ScalarComparison::Equal))
@@ -476,6 +540,7 @@ fn indexed_local_rows(
 		schema.name.as_str(),
 		schema.kind,
 		&equalities,
+		&usable_indexes,
 		|atom| {
 			rows.push(row_from_properties(atom.atom_id, &atom.record_id, &atom.properties, schema));
 			Ok(())
@@ -498,6 +563,7 @@ fn indexed_local_rows(
 				schema.name.as_str(),
 				schema.kind,
 				property_key,
+				&usable_indexes,
 				constraint.comparison,
 				&constraint.value,
 				|atom| {

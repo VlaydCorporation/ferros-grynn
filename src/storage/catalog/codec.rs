@@ -520,7 +520,7 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 			|| table.name.contains('\0')
 			|| table.name.len() > MAX_SCHEMA_NAME_BYTES
 			|| previous_table.is_some_and(|previous: &str| previous >= table.name.as_str())
-			|| !root_graph_ids.contains(&table.graph_id)
+			|| (table.graph_id != GraphId::SYSTEM && !root_graph_ids.contains(&table.graph_id))
 			|| table.fields.len() > MAX_TYPE_MEMBERS
 			|| table.indexes.len() > MAX_TYPE_MEMBERS
 		{
@@ -562,9 +562,19 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 				|| previous_index.is_some_and(|previous: &str| previous >= index.name.as_str())
 				|| matches!(index.kind, TableIndexKind::Count) != index.fields.is_empty()
 				|| index.fields.len() > MAX_TYPE_MEMBERS
-				|| index.file_id.kind() != Some(DataFileKind::Index)
-				|| index.root == PageNo::NULL
-			{
+				|| match (index.file_id, index.root) {
+					(Some(file_id), Some(root)) => {
+						file_id.kind() != Some(DataFileKind::Index) || root == PageNo::NULL
+					}
+					(None, None) => {
+						table.graph_id != GraphId::SYSTEM
+							|| !matches!(
+								index.state,
+								TableIndexState::Stale | TableIndexState::PreparedForRemoval
+							)
+					}
+					(Some(_), None) | (None, Some(_)) => true,
+				} {
 				return Err(invalid_catalog("table index violates a format-v1 bound"));
 			}
 			let mut index_fields = BTreeSet::new();
@@ -778,6 +788,23 @@ pub(super) fn decode_table_kind(value: u8) -> FerrosGrynnResult<TableKind> {
 	}
 }
 
+/// Maps table schema modes to stable catalog bytes.
+pub(super) const fn table_schema_mode_byte(mode: TableSchemaMode) -> u8 {
+	match mode {
+		TableSchemaMode::Schemaless => 0,
+		TableSchemaMode::Schemafull => 1,
+	}
+}
+
+/// Rejects unassigned table schema-mode bytes.
+pub(super) fn decode_table_schema_mode(value: u8) -> FerrosGrynnResult<TableSchemaMode> {
+	match value {
+		0 => Ok(TableSchemaMode::Schemaless),
+		1 => Ok(TableSchemaMode::Schemafull),
+		_ => Err(invalid_catalog("table catalog contains an unknown schema mode")),
+	}
+}
+
 /// Maps table-index kinds to stable catalog bytes.
 pub(super) const fn table_index_kind_byte(kind: TableIndexKind) -> u8 {
 	match kind {
@@ -794,6 +821,25 @@ pub(super) fn decode_table_index_kind(value: u8) -> FerrosGrynnResult<TableIndex
 		1 => Ok(TableIndexKind::Unique),
 		2 => Ok(TableIndexKind::Count),
 		_ => Err(invalid_catalog("table catalog contains an unknown TableIndexKind")),
+	}
+}
+
+/// Maps table-index availability to stable catalog bytes.
+pub(super) const fn table_index_state_byte(state: TableIndexState) -> u8 {
+	match state {
+		TableIndexState::Ready => 0,
+		TableIndexState::Stale => 1,
+		TableIndexState::PreparedForRemoval => 2,
+	}
+}
+
+/// Rejects unassigned table-index availability bytes.
+pub(super) fn decode_table_index_state(value: u8) -> FerrosGrynnResult<TableIndexState> {
+	match value {
+		0 => Ok(TableIndexState::Ready),
+		1 => Ok(TableIndexState::Stale),
+		2 => Ok(TableIndexState::PreparedForRemoval),
+		_ => Err(invalid_catalog("table catalog contains an unknown index state")),
 	}
 }
 

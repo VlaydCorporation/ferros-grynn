@@ -30,6 +30,10 @@ src/syn parse -> analysis -> logical IR -> execution -> datastore adapter
 - Сохранять детерминированный порядок statements, rows, bindings и projection.
 - Новая конструкция добавляется вертикально: grammar/token -> AST -> analysis
   -> IR -> execution -> backend tests. Пустые variants «на будущее» запрещены.
+- Core DDL проходит этой же цепочкой и изменяет транзакционный catalog через
+  datastore adapter. `INFO FOR DB|TABLE|INDEX` читает transaction-visible
+  definitions и показывает состояние индекса; расширенные index kinds и
+  неутверждённый `ALTER GRAPH` возвращают явный unsupported status.
 
 ## Спецификации и проверка
 

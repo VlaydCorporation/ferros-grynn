@@ -25,5 +25,5 @@ pub use catalog::{
 };
 pub use field::TableField;
 pub(crate) use graph::validate_graph_name;
-pub use index::{TableIndex, TableIndexKind};
-pub use table::{TableKind, TableSchema};
+pub use index::{TableIndex, TableIndexKind, TableIndexState};
+pub use table::{TableKind, TableSchema, TableSchemaMode};

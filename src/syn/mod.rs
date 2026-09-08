@@ -19,6 +19,16 @@ pub use ast::{
 pub use config::GQLConfig;
 use fg_gql_status::FerrosGrynnResult;
 pub use stmt::{
+	AlterStatement,
+	AlterTarget,
+	BasicIndexDefinition,
+	DefineFieldStatement,
+	DefineGraphStatement,
+	DefineIndexStatement,
+	DefineTableStatement,
+	DefinitionMode,
+	InfoStatement,
+	InfoTarget,
 	LetStatement,
 	MatchDirection,
 	MatchEdge,
@@ -30,12 +40,16 @@ pub use stmt::{
 	MatchStatement,
 	MatchStep,
 	RecordKey,
+	RemoveStatement,
+	RemoveTarget,
 	ReturnStatement,
 	SelectItem,
 	SelectStatement,
 	SelectTarget,
 	Statement,
 	StatementKind,
+	TableKindName,
+	TableSchemaModeName,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -786,11 +786,15 @@ snapshot.visible_lsn`. Если бы эти часы выдавались лок
 `db.fgb` хранит только две root-page ссылки. Сами канонические каталоги лежат в
 `schema/catalog.fgb` и публикуются тем же frame-WAL commit, что graph pages:
 
-- `DatabaseCatalog` (`FGDC`, payload version 4): `next_graph_id`,
+- `DatabaseCatalog` (`FGDC`, payload version 5): `next_graph_id`,
   `next_schema_id`, database-wide словарь property keys, graph address spaces,
   versioned definitions графов/таблиц/полей/индексов и глобальные параметры;
 - `FileCatalog` (`FGFC`, payload version 4): sealed mapping
   `(GraphId, DataFileId) → (companion_of, role, validated relative path)`.
+
+Декодер format-v1 принимает только `FGDC v5`; промежуточный `FGDC v4` несовместим и не
+мигрируется. Версия повышена из-за durable `SCHEMALESS|SCHEMAFULL`, состояния secondary index
+и optional physical binding, а не из-за изменения прежних `IndexId` bytes.
 
 Каждая запись `FGFC v4` имеет 32-байтовый fixed header: `graph_id: u64` по offset 0,
 `file_id: u64` по offset 8, `companion_of_file_id: u64` по offset 16 (`0` означает отсутствие),
@@ -820,10 +824,14 @@ root-графа. Внутренние записи используют заре
 и такие же пары для engine-owned `label`/`adjacency` indexes. У внутренних nested address
 spaces эти поля равны нулю: они не являются отдельными пользовательскими DDL-объектами.
 
-Запись таблицы хранит собственные `schema_id`/`schema_version`, owning `GraphId`, kind,
+Запись таблицы хранит собственные `schema_id`/`schema_version`, owning `GraphId` (`0` для
+таблицы системного графа), kind, `SCHEMALESS|SCHEMAFULL`,
 versioned поля `(schema_id, schema_version, name, PropertyKeyId, Type)`, engine-owned primary
 index и versioned scalar-index metadata `(index_id, schema_version, name,
-standard|unique, ordered PropertyKeyId[], DataFileId, root)`. Индексы внутри таблицы
+standard|unique|count, ready|stale|prepared_for_removal, ordered PropertyKeyId[],
+optional DataFileId/root)`. Отсутствующий physical binding допустим только у `stale` или
+`prepared_for_removal` secondary
+индекса таблицы системного графа. Индексы внутри таблицы
 отсортированы по имени. Параметр хранит стабильные identity/version, имя и canonical
 `StorageValue` вместе с нужными словарями. `DatabaseSuperblock.graph_count` считает все
 физические graph address spaces, включая вложенные; публичный каталог фильтрует только
@@ -853,7 +861,8 @@ root-записи.
 | `DataFileId`    | identity конкретного физического файла одного COW-поколения                                                                                                |
 | `ordinal`       | безопасная generation-local позиция по `IndexId` только для имени файла внутри UUID-поколения; Standard/Unique используют общую плотную последовательность |
 
-`IndexId` занимает прежний durable `u32`, поэтому байты `FGDC v4` не меняются. Физический
+`IndexId` занимает прежний durable `u32`; переход `FGDC v4 → v5` вызван добавлением
+`TableSchemaMode`, наблюдаемого состояния индекса и optional physical binding. Физический
 binding при commit/reopen разрешается по `IndexId`, после чего обязательно сверяются name,
 kind, ordered fields и `SchemaVersion`. Пользовательское имя служит отображению и проверке
 уникальности, но никогда не участвует в filesystem path. `DataFileId` может измениться при COW
@@ -1751,7 +1760,7 @@ Identity `0` зарезервирован, а `u32::MAX` является `NULL_
 
 ### 18.2. Физическая публикация реализованного ядра
 
-Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 4 (§7.2). Payload
+Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 5 (§7.2). Payload
 разбит на bounded chain страниц `SchemaRoot`: общий `PageHeader`, marker `FGC1`, catalog kind,
 page-codec version, `next_page`, длина chunk/полного payload и нулевые reserved bytes.
 Checksum проверяется до декодирования, общий payload ограничен 16 МиБ.
@@ -1759,9 +1768,9 @@ Checksum проверяется до декодирования, общий payl
 | Объект                | Обязательное durable определение                                                                                     |
 |-----------------------|----------------------------------------------------------------------------------------------------------------------|
 | Root graph            | identity/version, graph family, engine-owned label/adjacency identity/version и graph catalog metadata               |
-| Table                 | identity/version, имя, owning `GraphId`, kind и engine-owned primary identity/version                                |
+| Table                 | identity/version, имя, owning `GraphId`, kind, schema mode и engine-owned primary identity/version                   |
 | Field                 | identity/version, имя, `PropertyKeyId` и `Type`                                                                      |
-| Standard/Unique index | `IndexId`/version, имя, раздельный kind, ordered fields, exact `DataFileId` и root immutable generation             |
+| Standard/Unique index | `IndexId`/version, имя, раздельный kind, state, ordered fields и optional physical binding                           |
 | Parameter             | identity/version, имя и canonical `StorageValue` bytes со словарями                                                  |
 | Atom membership       | точный `(GraphId, AtomId(kind, slot, gen)) → Table SchemaId`; в local storage дублируется в соответствующем hot slot |
 
@@ -1775,7 +1784,7 @@ Primary/label/adjacency имеют каталожную identity даже ког
 inline layout; пользователь не может удалить их отдельно.
 
 Подразделы 18.3–18.7 задают логические определения для последующего расширения DDL. Их
-псевдо-layout не является byte-offset layout payload `FGDC` v4; writer format v1 кодирует
+псевдо-layout не является byte-offset layout payload `FGDC` v5; writer format v1 кодирует
 только реализованные поля из таблицы выше и обязан отвергать ещё не поддержанные варианты.
 
 ### 18.3. TableDefinition (def format)
@@ -3072,7 +3081,8 @@ authority; до этого immutable B+tree packer всегда использу
 database-level catalog commit. UUID directories, на которые не ссылается восстановленный
 catalog, удаляются. Если опубликованный secondary side-file отсутствует, не открывается или не
 проходит checksum, он исключается из physical registry и access path деградирует к scan; schema
-definition сохраняется для последующего `stale`/`REBUILD` admin surface. Та же ситуация для
+definition сохраняется, runtime state становится `stale` и наблюдается через `INFO`; последующий
+`REBUILD` может опубликовать новый binding. Та же ситуация для
 primary/base file является фатальной corruption.
 
 #### 20.13.5. Стратегия по типам индексов

@@ -2005,6 +2005,25 @@ impl Transaction {
 		self.ensure_writable()?;
 		self.ensure_live()?;
 		ensure_store_reference(reference, self.store.inner.graph_storage_mode())?;
+		let root = self.read_root();
+		let mut owned_tables = root
+			.schema
+			.tables()
+			.filter(|table| table.graph().is_some_and(|graph| graph.id() == reference.id()))
+			.map(|table| table.name().as_str().to_owned())
+			.collect::<BTreeSet<_>>();
+		for (name, table) in &self.tables {
+			if table.as_ref().is_some_and(|table| {
+				table.graph().is_some_and(|graph| graph.id() == reference.id())
+			}) {
+				owned_tables.insert(name.clone());
+			} else {
+				owned_tables.remove(name);
+			}
+		}
+		for table in owned_tables {
+			self.tables.insert(table, None);
+		}
 		if self.graphs.get(reference.id()).is_some_and(GraphWrite::is_created) {
 			self.graphs.remove(reference.id());
 			return Ok(());
@@ -2111,9 +2130,12 @@ impl Transaction {
 			index.id = Some(IndexId::from_schema_id(self.store.inner.allocate_schema_id()?));
 			index.version = SchemaVersion::INITIAL;
 		}
-		if !schema.indexes.is_empty() {
-			self.ensure_graph_write(&schema.graph)?;
-			if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
+		if !schema.indexes.is_empty()
+			&& let Some(graph) = &schema.graph
+		{
+			let graph = graph.clone();
+			self.ensure_graph_write(&graph)?;
+			if let Some(write) = self.graphs.get_mut(graph.id()) {
 				write.force_persist = true;
 			}
 		}
@@ -2173,6 +2195,7 @@ impl Transaction {
 				});
 				index.version = if old.kind == index.kind
 					&& old.fields == index.fields
+					&& old.state == index.state
 					&& !field_contract_changed
 				{
 					old.version
@@ -2184,9 +2207,12 @@ impl Transaction {
 				index.version = SchemaVersion::INITIAL;
 			}
 		}
-		if previous.fields != schema.fields || previous.indexes != schema.indexes {
-			self.ensure_graph_write(&schema.graph)?;
-			if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
+		if table_indexes_require_rebuild(&previous, &schema)
+			&& let Some(graph) = &schema.graph
+		{
+			let graph = graph.clone();
+			self.ensure_graph_write(&graph)?;
+			if let Some(write) = self.graphs.get_mut(graph.id()) {
 				write.force_persist = true;
 			}
 		}
@@ -2202,12 +2228,164 @@ impl Transaction {
 		// ponytail: table removal rebuilds the owning graph so concurrent
 		// membership additions cannot survive in hot slots. Stage 7 may replace
 		// this with incremental primary/scalar-index maintenance.
-		self.ensure_graph_write(&schema.graph)?;
-		if let Some(write) = self.graphs.get_mut(schema.graph.id()) {
-			write.force_persist = true;
+		if let Some(graph) = &schema.graph {
+			let graph = graph.clone();
+			self.ensure_graph_write(&graph)?;
+			if let Some(write) = self.graphs.get_mut(graph.id()) {
+				write.force_persist = true;
+			}
 		}
 		self.tables.insert(name.to_owned(), None);
 		Ok(())
+	}
+
+	/// Adds one field to an existing table.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable, the table is
+	/// absent, or a field with the same name already exists.
+	pub fn define_field(&mut self, table: &str, field: TableField) -> FerrosGrynnResult<()> {
+		let mut schema = self.table(table)?.as_ref().clone();
+		if schema.fields.iter().any(|existing| existing.name == field.name) {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"field '{}.{}' already exists",
+				table, field.name
+			)));
+		}
+		schema.fields.push(field);
+		self.overwrite_table(schema)
+	}
+
+	/// Replaces one field while retaining its stable identity.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable or the table or
+	/// field is absent.
+	pub fn overwrite_field(&mut self, table: &str, field: TableField) -> FerrosGrynnResult<()> {
+		let mut schema = self.table(table)?.as_ref().clone();
+		let existing =
+			schema.fields.iter_mut().find(|existing| existing.name == field.name).ok_or_else(
+				|| {
+					FerrosGrynnError::invalid_argument(format!(
+						"field '{}.{}' does not exist",
+						table, field.name
+					))
+				},
+			)?;
+		*existing = field;
+		self.overwrite_table(schema)
+	}
+
+	/// Removes one field not referenced by a table index.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable, the table or
+	/// field is absent, or an index still depends on the field.
+	pub fn remove_field(&mut self, table: &str, field: &str) -> FerrosGrynnResult<()> {
+		let mut schema = self.table(table)?.as_ref().clone();
+		if schema.indexes.iter().any(|index| index.fields.iter().any(|name| name == field)) {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"field '{table}.{field}' is referenced by an index"
+			)));
+		}
+		let before = schema.fields.len();
+		schema.fields.retain(|existing| existing.name.as_str() != field);
+		if schema.fields.len() == before {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"field '{table}.{field}' does not exist"
+			)));
+		}
+		self.overwrite_table(schema)
+	}
+
+	/// Adds one user-declared index to an existing table.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the table is absent or the index definition is
+	/// invalid or duplicated.
+	pub fn define_index(&mut self, table: &str, index: TableIndex) -> FerrosGrynnResult<()> {
+		let schema = self.table(table)?.as_ref().clone().with_index(index)?;
+		self.overwrite_table(schema)
+	}
+
+	/// Replaces one user-declared index while retaining its stable identity.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the table or index is absent or the replacement is
+	/// invalid.
+	pub fn overwrite_index(&mut self, table: &str, index: TableIndex) -> FerrosGrynnResult<()> {
+		let mut schema = self.table(table)?.as_ref().clone();
+		let position =
+			schema.indexes.iter().position(|existing| existing.name == index.name).ok_or_else(
+				|| {
+					FerrosGrynnError::invalid_argument(format!(
+						"index '{}.{}' does not exist",
+						table, index.name
+					))
+				},
+			)?;
+		schema.indexes.remove(position);
+		schema = schema.with_index(index)?;
+		self.overwrite_table(schema)
+	}
+
+	/// Removes one user-declared table index.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the table or index is absent.
+	pub fn remove_index(&mut self, table: &str, index: &str) -> FerrosGrynnResult<()> {
+		let mut schema = self.table(table)?.as_ref().clone();
+		let before = schema.indexes.len();
+		schema.indexes.retain(|existing| existing.name.as_str() != index);
+		if schema.indexes.len() == before {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"index '{table}.{index}' does not exist"
+			)));
+		}
+		self.overwrite_table(schema)
+	}
+
+	/// Changes the table schema-validation mode.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable or the table is
+	/// absent.
+	pub fn set_table_schema_mode(
+		&mut self,
+		table: &str,
+		mode: TableSchemaMode,
+	) -> FerrosGrynnResult<()> {
+		let mut schema = self.table(table)?.as_ref().clone();
+		schema.mode = mode;
+		self.overwrite_table(schema)
+	}
+
+	/// Excludes an index from planning before a later removal.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transaction is not writable or the table or
+	/// index is absent.
+	pub fn prepare_index_removal(&mut self, table: &str, index: &str) -> FerrosGrynnResult<()> {
+		let mut schema = self.table(table)?.as_ref().clone();
+		let definition = schema
+			.indexes
+			.iter_mut()
+			.find(|definition| definition.name.as_str() == index)
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(format!(
+					"index '{table}.{index}' does not exist"
+				))
+			})?;
+		definition.state = TableIndexState::PreparedForRemoval;
+		self.overwrite_table(schema)
 	}
 
 	pub fn table(&self, name: &str) -> FerrosGrynnResult<Arc<TableSchema>> {
@@ -2245,11 +2423,10 @@ impl Transaction {
 		let schema = self
 			.visible_table(table)
 			.ok_or_else(|| FerrosGrynnError::table_does_not_exist(table))?;
-		if schema.graph != *graph {
+		if schema.graph.as_ref() != Some(graph) {
 			return Err(FerrosGrynnError::invalid_argument(format!(
-				"table '{}' belongs to graph '{}', not '{}'",
+				"table '{}' does not belong to graph '{}'",
 				table,
-				schema.graph.id(),
 				graph.id()
 			)));
 		}
@@ -2398,24 +2575,21 @@ impl Transaction {
 	}
 
 	fn validate_table_schema(&self, schema: &mut TableSchema) -> FerrosGrynnResult<()> {
-		ensure_store_reference(&schema.graph, self.store.inner.graph_storage_mode())?;
-		let graph_kind = self
-			.visible_graph_kind(schema.graph.id())
-			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(schema.graph.id().to_string()))?;
-		if graph_kind != schema.graph.kind() {
-			return Err(FerrosGrynnError::conversion_error(
-				schema.graph.kind().name(),
-				graph_kind.name(),
-			));
+		if let Some(graph) = &schema.graph {
+			ensure_store_reference(graph, self.store.inner.graph_storage_mode())?;
+			let graph_kind = self
+				.visible_graph_kind(graph.id())
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.id().to_string()))?;
+			if graph_kind != graph.kind() {
+				return Err(FerrosGrynnError::conversion_error(
+					graph.kind().name(),
+					graph_kind.name(),
+				));
+			}
 		}
 		let dictionary = self.read_root().dictionary.clone();
 		for field in &mut schema.fields {
-			field.key = Some(dictionary.get(field.name.as_str()).ok_or_else(|| {
-				FerrosGrynnError::invalid_argument(format!(
-					"property '{}' must be interned before defining its table schema",
-					field.name
-				))
-			})?);
+			field.key = dictionary.get(field.name.as_str());
 		}
 		Ok(())
 	}
@@ -2529,6 +2703,34 @@ impl Transaction {
 		});
 		Ok(())
 	}
+}
+
+/// Reports whether a schema edit changes bytes owned by physical table
+/// indexes. Availability-only state changes remain catalog-only.
+fn table_indexes_require_rebuild(previous: &TableSchema, next: &TableSchema) -> bool {
+	if previous.indexes.len() != next.indexes.len() {
+		return true;
+	}
+	previous.indexes.iter().any(|old| {
+		let Some(new) = next.indexes.iter().find(|new| new.name == old.name) else {
+			return true;
+		};
+		old.kind != new.kind
+			|| old.fields != new.fields
+			|| new.fields.iter().any(|name| {
+				let old_type = previous
+					.fields
+					.iter()
+					.find(|field| field.name == *name)
+					.map(|field| &field.value_type);
+				let new_type = next
+					.fields
+					.iter()
+					.find(|field| field.name == *name)
+					.map(|field| &field.value_type);
+				old_type != new_type
+			})
+	})
 }
 
 /// Validates the public catalog-name bounds.

@@ -207,8 +207,9 @@ impl StoreInner {
 						.get(),
 					version: schema.version.get(),
 					name: schema.name.as_str().to_owned(),
-					graph: schema.graph.id().clone(),
+					graph: schema.graph.as_ref().map(|graph| graph.id().clone()),
 					kind: schema.kind,
+					schema_mode: schema.mode,
 					fields,
 					indexes: schema
 						.indexes
@@ -240,6 +241,7 @@ impl StoreInner {
 								version: index.version.get(),
 								name: index.name.as_str().to_owned(),
 								kind: index.kind,
+								state: index.state,
 								fields,
 							})
 						})

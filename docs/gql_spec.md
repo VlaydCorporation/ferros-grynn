@@ -1547,6 +1547,7 @@ INFO FOR [
   analyzers: {},
   configs: {},
   functions: {},
+  graphs: {},
   models: {},
   params: {},
   tables: {
@@ -1555,9 +1556,10 @@ INFO FOR [
 }
 ```
 
-#### ```INFO FOR TABLE @tabgle```
+#### ```INFO FOR TABLE @table```
 ```
 {
+  definition: 'DEFINE TABLE user TYPE ANY SCHEMALESS',
   events: {},
   fields: {
       name: 'DEFINE FIELD name ON user TYPE string'
@@ -1568,7 +1570,7 @@ INFO FOR [
 }
 ```
 
-#### ```INFO FOR INDEX @tabgle ON TABLE @table```
+#### ```INFO FOR INDEX @index ON TABLE @table```
 ```
 -------- Query 1 --------
 { 
@@ -1602,11 +1604,20 @@ INFO FOR [
 
 -------- Query 4 --------
 {
+  definition: 'DEFINE INDEX by_email ON TABLE user FIELDS email UNIQUE',
+  state: 'ready',
+  system: false,
   building: {
       status: 'ready'
   }
 }
 ```
+
+Для синхронно построенных базовых индексов `state` принимает `ready`, `stale` или
+`prepared_for_removal`; `building.status` повторяет это состояние для совместимости с будущим
+асинхронным build progress. Отсутствующий, неоткрываемый или checksum-corrupt secondary index
+остаётся в schema catalog со `state: 'stale'`, а запрос использует scan fallback. Повреждение
+primary/base storage остаётся фатальным и не маскируется `INFO`.
 
 ### 8.7. SHOW CHANGES
 

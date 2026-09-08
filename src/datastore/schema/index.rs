@@ -18,6 +18,18 @@ pub enum TableIndexKind {
 	Count,
 }
 
+/// Transaction-visible usability state of one declared table index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TableIndexState {
+	/// The physical index is available to query planning.
+	Ready,
+	/// The definition is retained but queries must fall back to a scan.
+	Stale,
+	/// The index is deliberately excluded before a later `REMOVE INDEX`.
+	PreparedForRemoval,
+}
+
 /// Declarative scalar B+tree attached to one table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableIndex {
@@ -29,6 +41,8 @@ pub struct TableIndex {
 	pub(crate) name: Text,
 	/// Physical index contract.
 	pub(crate) kind: TableIndexKind,
+	/// Observable planner-availability contract.
+	pub(crate) state: TableIndexState,
 	/// Indexed fields in composite-key order.
 	pub(crate) fields: Vec<Text>,
 }
@@ -77,6 +91,7 @@ impl TableIndex {
 			version: SchemaVersion::INITIAL,
 			name,
 			kind,
+			state: TableIndexState::Ready,
 			fields,
 		})
 	}
@@ -99,6 +114,11 @@ impl TableIndex {
 	/// Returns the physical index contract.
 	pub const fn kind(&self) -> TableIndexKind {
 		self.kind
+	}
+
+	/// Returns whether the index is usable, stale, or prepared for removal.
+	pub const fn state(&self) -> TableIndexState {
+		self.state
 	}
 
 	/// Returns fields in composite-key order.

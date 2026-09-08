@@ -9,13 +9,23 @@ mod ir;
 
 use std::time::Duration;
 
-pub(crate) use execution::execute_transaction;
+pub(crate) use execution::{execute_parsed_transaction, execute_transaction};
 
 pub use crate::syn::{
+	AlterStatement,
+	AlterTarget,
+	BasicIndexDefinition,
 	BinaryOperator,
+	DefineFieldStatement,
+	DefineGraphStatement,
+	DefineIndexStatement,
+	DefineTableStatement,
+	DefinitionMode,
 	Expr,
 	ExprKind,
 	Identifier,
+	InfoStatement,
+	InfoTarget,
 	LetStatement,
 	Literal,
 	MatchDirection,
@@ -31,15 +41,34 @@ pub use crate::syn::{
 	ParserSettings,
 	Program,
 	RecordKey,
+	RemoveStatement,
+	RemoveTarget,
 	ReturnStatement,
 	SelectItem,
 	SelectStatement,
 	SelectTarget,
 	Statement,
 	StatementKind,
+	TableKindName,
+	TableSchemaModeName,
 	TypeName,
 	UnaryOperator,
 };
+
+/// Returns whether a program contains a schema-mutating statement.
+pub(crate) fn program_mutates_schema(program: &Program) -> bool {
+	program.statements.iter().any(|statement| {
+		matches!(
+			statement.kind,
+			StatementKind::DefineGraph(_)
+				| StatementKind::DefineTable(_)
+				| StatementKind::DefineField(_)
+				| StatementKind::DefineIndex(_)
+				| StatementKind::Remove(_)
+				| StatementKind::Alter(_)
+		)
+	})
+}
 use crate::{
 	gql_status::{FerrosGrynnResult, Outcome},
 	values::Value,
@@ -52,6 +81,10 @@ pub fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult<Progra
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueryStatementKind {
+	Define,
+	Remove,
+	Alter,
+	Info,
 	Let,
 	Match,
 	Return,

@@ -57,6 +57,11 @@
   `FGFC v4.companion_of`. Standard и Unique называются соответственно
   `std_<ordinal:04>.fgidx` и `uniq_<ordinal:04>.fgidx`; `scalar` допустим только
   как внутреннее имя общей реализации.
+- `DatabaseCatalog` format-v1 — только `FGDC v5`. Таблица системного графа
+  кодирует owning `GraphId = 0`; её `Stale`/`PreparedForRemoval` secondary index
+  может не иметь physical binding. Missing/unopenable/checksum-corrupt
+  secondary переводится в `Stale` и даёт scan fallback, а primary/base
+  corruption остаётся фатальной.
 - Любая входная длина/счётчик проверяется до allocation; ошибки проходят через
   `gql_status` без раскрытия локальных путей и сырых страниц.
 

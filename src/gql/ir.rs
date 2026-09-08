@@ -1,6 +1,8 @@
 use crate::{
+	datastore::{TableIndexKind, TableKind, TableSchemaMode},
 	gql_status::TextSpan,
-	values::{GraphRef, RecordId, Type, Value},
+	syn::DefinitionMode,
+	values::{GraphKind, GraphRef, RecordId, Type, Value},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -15,6 +17,7 @@ pub(super) struct LogicalProgram {
 
 #[derive(Debug, Clone)]
 pub(super) enum LogicalStatement {
+	Schema(LogicalSchemaStatement),
 	Let {
 		slot: u32,
 		value: TypedExpr,
@@ -25,6 +28,123 @@ pub(super) enum LogicalStatement {
 	/// Executes a read-only graph pattern match.
 	Match(LogicalMatch),
 	Select(LogicalSelect),
+}
+
+/// Typed core schema command executed by the datastore adapter.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalSchemaStatement {
+	DefineGraph {
+		mode: DefinitionMode,
+		name: Box<str>,
+		kind: GraphKind,
+	},
+	DefineTable {
+		mode: DefinitionMode,
+		name: Box<str>,
+		kind: TableKind,
+		schema_mode: TableSchemaMode,
+	},
+	DefineField {
+		mode: DefinitionMode,
+		table: Box<str>,
+		name: Box<str>,
+		value_type: Type,
+	},
+	DefineIndex {
+		mode: DefinitionMode,
+		table: Box<str>,
+		name: Box<str>,
+		kind: TableIndexKind,
+		fields: Vec<Box<str>>,
+	},
+	RemoveGraph {
+		if_exists: bool,
+		name: Box<str>,
+	},
+	RemoveTable {
+		if_exists: bool,
+		name: Box<str>,
+	},
+	RemoveField {
+		if_exists: bool,
+		table: Box<str>,
+		name: Box<str>,
+	},
+	RemoveIndex {
+		if_exists: bool,
+		table: Box<str>,
+		name: Box<str>,
+	},
+	AlterTableMode {
+		if_exists: bool,
+		name: Box<str>,
+		mode: TableSchemaMode,
+	},
+	AlterFieldType {
+		if_exists: bool,
+		table: Box<str>,
+		name: Box<str>,
+		value_type: Type,
+	},
+	PrepareIndexRemoval {
+		table: Box<str>,
+		name: Box<str>,
+	},
+	InfoDatabase,
+	InfoTable {
+		name: Box<str>,
+	},
+	InfoIndex {
+		table: Box<str>,
+		name: Box<str>,
+	},
+}
+
+impl LogicalSchemaStatement {
+	pub(super) const fn statement_kind(&self) -> crate::gql::QueryStatementKind {
+		match self {
+			Self::DefineGraph {
+				..
+			}
+			| Self::DefineTable {
+				..
+			}
+			| Self::DefineField {
+				..
+			}
+			| Self::DefineIndex {
+				..
+			} => crate::gql::QueryStatementKind::Define,
+			Self::RemoveGraph {
+				..
+			}
+			| Self::RemoveTable {
+				..
+			}
+			| Self::RemoveField {
+				..
+			}
+			| Self::RemoveIndex {
+				..
+			} => crate::gql::QueryStatementKind::Remove,
+			Self::AlterTableMode {
+				..
+			}
+			| Self::AlterFieldType {
+				..
+			}
+			| Self::PrepareIndexRemoval {
+				..
+			} => crate::gql::QueryStatementKind::Alter,
+			Self::InfoDatabase
+			| Self::InfoTable {
+				..
+			}
+			| Self::InfoIndex {
+				..
+			} => crate::gql::QueryStatementKind::Info,
+		}
+	}
 }
 
 #[derive(Debug, Clone)]

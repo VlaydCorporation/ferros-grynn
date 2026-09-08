@@ -1,6 +1,7 @@
 mod r#let;
 mod r#match;
 mod r#return;
+mod schema;
 mod select;
 
 pub use r#let::LetStatement;
@@ -17,6 +18,22 @@ pub use r#match::{
 };
 use reblessive::Stk;
 pub use r#return::ReturnStatement;
+pub use schema::{
+	AlterStatement,
+	AlterTarget,
+	BasicIndexDefinition,
+	DefineFieldStatement,
+	DefineGraphStatement,
+	DefineIndexStatement,
+	DefineTableStatement,
+	DefinitionMode,
+	InfoStatement,
+	InfoTarget,
+	RemoveStatement,
+	RemoveTarget,
+	TableKindName,
+	TableSchemaModeName,
+};
 pub use select::{RecordKey, SelectItem, SelectStatement, SelectTarget};
 
 use super::{
@@ -37,6 +54,13 @@ pub struct Statement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StatementKind {
+	DefineGraph(DefineGraphStatement),
+	DefineTable(DefineTableStatement),
+	DefineField(DefineFieldStatement),
+	DefineIndex(DefineIndexStatement),
+	Remove(RemoveStatement),
+	Alter(AlterStatement),
+	Info(InfoStatement),
 	Let(LetStatement),
 	Match(MatchStatement),
 	Return(ReturnStatement),

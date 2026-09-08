@@ -102,7 +102,26 @@ impl Parser<'_> {
 		context: &mut Stk,
 	) -> FerrosGrynnResult<Statement> {
 		let start = self.current().span;
-		let kind = if self.consume_keyword(keywords::LET).is_some() {
+		let kind = if self.consume_keyword(keywords::DEFINE).is_some() {
+			if self.consume_keyword(keywords::GRAPH).is_some() {
+				StatementKind::DefineGraph(self.define_graph_statement()?)
+			} else if self.consume_keyword(keywords::TABLE).is_some() {
+				StatementKind::DefineTable(self.define_table_statement()?)
+			} else if self.consume_keyword(keywords::FIELD).is_some() {
+				StatementKind::DefineField(self.define_field_statement()?)
+			} else if self.consume_keyword(keywords::INDEX).is_some() {
+				StatementKind::DefineIndex(self.define_index_statement()?)
+			} else {
+				let feature = self.current_word().unwrap_or("DEFINE target");
+				return Err(self.unsupported(feature, self.current().span));
+			}
+		} else if self.consume_keyword(keywords::REMOVE).is_some() {
+			StatementKind::Remove(self.remove_statement()?)
+		} else if self.consume_keyword(keywords::ALTER).is_some() {
+			StatementKind::Alter(self.alter_statement()?)
+		} else if self.consume_keyword(keywords::INFO).is_some() {
+			StatementKind::Info(self.info_statement()?)
+		} else if self.consume_keyword(keywords::LET).is_some() {
 			StatementKind::Let(context.run(|context| self.let_statement(context)).await?)
 		} else if self.consume_keyword(keywords::MATCH).is_some() {
 			StatementKind::Match(context.run(|context| self.match_statement(context)).await?)
@@ -113,7 +132,7 @@ impl Parser<'_> {
 		} else if let Some(feature) = self.unsupported_statement() {
 			return Err(self.unsupported(feature, start));
 		} else {
-			return Err(self.syntax("Expected `LET`, `MATCH`, `RETURN`, or `SELECT`.", start));
+			return Err(self.syntax("Expected a supported GrynQL statement.", start));
 		};
 		let end = self.previous_span();
 		Ok(Statement {
@@ -766,5 +785,36 @@ mod tests {
 				.expect_err("deferred MATCH feature must be rejected");
 			assert_eq!(error.status().code().to_string(), "FG-50F03", "source: {source}");
 		}
+	}
+
+	#[test]
+	fn parses_core_schema_statements_and_rejects_advanced_indexes() {
+		let program = parse(
+			"DEFINE GRAPH social TYPE DAG; DEFINE TABLE user TYPE NORMAL SCHEMAFULL; DEFINE FIELD \
+			 email ON TABLE user TYPE string; DEFINE INDEX by_email ON TABLE user FIELDS email \
+			 UNIQUE; ALTER TABLE user SCHEMALESS; ALTER FIELD email ON user DROP TYPE; ALTER \
+			 INDEX by_email ON TABLE user PREPARE REMOVE; INFO FOR DB; INFO FOR TABLE user; INFO \
+			 FOR INDEX by_email ON TABLE user; REMOVE INDEX by_email ON TABLE user; REMOVE FIELD \
+			 email ON user; REMOVE TABLE user; REMOVE GRAPH social",
+			ParserSettings::default(),
+		)
+		.expect("core schema syntax");
+		assert_eq!(program.statements.len(), 14);
+		assert!(matches!(program.statements[0].kind, StatementKind::DefineGraph(_)));
+		assert!(matches!(program.statements[3].kind, StatementKind::DefineIndex(_)));
+		assert!(matches!(program.statements[6].kind, StatementKind::Alter(_)));
+		assert!(matches!(program.statements[9].kind, StatementKind::Info(_)));
+		assert!(matches!(program.statements[13].kind, StatementKind::Remove(_)));
+
+		let advanced = parse(
+			"DEFINE INDEX embedding ON TABLE user FIELDS vector HNSW",
+			ParserSettings::default(),
+		)
+		.expect_err("advanced index is explicit");
+		assert_eq!(advanced.status().code().to_string(), "FG-50F03");
+		let alter_graph = parse("ALTER GRAPH social", ParserSettings::default())
+			.expect_err("ALTER GRAPH has no approved semantics");
+		assert_eq!(alter_graph.status().code().to_string(), "FG-50F03");
+		assert!(parse("DEFINE TABLE user TYPE SCHEMAFULL", ParserSettings::default()).is_err());
 	}
 }

@@ -17,13 +17,25 @@ pub enum TableKind {
 	Relation,
 }
 
+/// Validation policy applied to records owned by one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TableSchemaMode {
+	/// Records may contain properties not declared as fields.
+	Schemaless,
+	/// Records may contain only properties declared as fields.
+	Schemafull,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
 	pub(crate) id: Option<SchemaId>,
 	pub(crate) version: SchemaVersion,
 	pub(crate) name: Text,
-	pub(crate) graph: GraphRef,
+	/// `None` places the table in the database system graph (`GraphId = 0`).
+	pub(crate) graph: Option<GraphRef>,
 	pub(crate) kind: TableKind,
+	pub(crate) mode: TableSchemaMode,
 	pub(crate) fields: Vec<TableField>,
 	/// User-declared indexes in declaration order.
 	pub(crate) indexes: Vec<TableIndex>,
@@ -42,7 +54,18 @@ impl TableSchema {
 		IntoText: Into<Text>,
 		Fields: IntoIterator<Item = TableField>,
 	{
-		let name = name.into();
+		Self::new_with_graph(name.into(), Some(graph), kind, fields)
+	}
+
+	fn new_with_graph<Fields>(
+		name: Text,
+		graph: Option<GraphRef>,
+		kind: TableKind,
+		fields: Fields,
+	) -> FerrosGrynnResult<Self>
+	where
+		Fields: IntoIterator<Item = TableField>,
+	{
 		if name.as_str().is_empty() || name.as_str().contains('\0') {
 			return Err(FerrosGrynnError::invalid_argument(
 				"table name must be non-empty and must not contain NUL",
@@ -66,11 +89,30 @@ impl TableSchema {
 			name,
 			graph,
 			kind,
+			mode: TableSchemaMode::Schemaless,
 			fields,
 			indexes: Vec::new(),
 			primary_index: None,
 			published_at: 0,
 		})
+	}
+
+	/// Creates a table in the database system graph.
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-argument error when the table or field definitions
+	/// violate the same contract as [`Self::new`].
+	pub fn new_system<IntoText, Fields>(
+		name: IntoText,
+		kind: TableKind,
+		fields: Fields,
+	) -> FerrosGrynnResult<Self>
+	where
+		IntoText: Into<Text>,
+		Fields: IntoIterator<Item = TableField>,
+	{
+		Self::new_with_graph(name.into(), None, kind, fields)
 	}
 
 	/// Returns the stable identity after this definition is published.
@@ -121,12 +163,24 @@ impl TableSchema {
 		&self.name
 	}
 
-	pub const fn graph(&self) -> &GraphRef {
-		&self.graph
+	/// Returns the owning named graph, or `None` for the database system graph.
+	pub const fn graph(&self) -> Option<&GraphRef> {
+		self.graph.as_ref()
 	}
 
 	pub const fn kind(&self) -> TableKind {
 		self.kind
+	}
+
+	/// Returns the record-schema validation policy.
+	pub const fn schema_mode(&self) -> TableSchemaMode {
+		self.mode
+	}
+
+	/// Sets the record-schema validation policy.
+	pub fn with_schema_mode(mut self, mode: TableSchemaMode) -> Self {
+		self.mode = mode;
+		self
 	}
 
 	pub fn fields(&self) -> impl ExactSizeIterator<Item = &TableField> {

@@ -250,15 +250,35 @@ pub(super) fn encode_tables(
 		.collect::<BTreeMap<_, _>>();
 	let mut encoded = Vec::with_capacity(tables.len());
 	for table in tables {
-		let graph_id =
-			graph_ids.get(table.graph.to_string().as_str()).copied().ok_or_else(|| {
+		let graph_id = if let Some(graph) = &table.graph {
+			graph_ids.get(graph.to_string().as_str()).copied().ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file(format!(
 					"table '{}' references a graph absent from the durable catalog",
 					table.name
 				))
-			})?;
+			})?
+		} else {
+			GraphId::SYSTEM
+		};
 		let mut indexes = Vec::with_capacity(table.indexes.len());
 		for definition in &table.indexes {
+			if graph_id == GraphId::SYSTEM {
+				indexes.push(TableIndexCatalogEntry {
+					index_id: definition.id,
+					schema_version: definition.version,
+					name: definition.name.clone(),
+					kind: definition.kind,
+					state: if definition.state == TableIndexState::PreparedForRemoval {
+						TableIndexState::PreparedForRemoval
+					} else {
+						TableIndexState::Stale
+					},
+					fields: definition.fields.clone(),
+					file_id: None,
+					root: None,
+				});
+				continue;
+			}
 			let (owner, candidate) = new_indexes
 				.iter()
 				.find(|candidate| candidate.index.index_id == definition.id)
@@ -282,14 +302,16 @@ pub(super) fn encode_tables(
 				|| candidate.name != definition.name
 				|| candidate.kind != definition.kind
 				|| candidate.fields != definition.fields
-				|| candidate.schema_version != definition.version
 			{
 				return Err(FerrosGrynnError::invalid_storage_file(format!(
 					"scalar index '{}.{}' physical definition is stale",
 					table.name, definition.name
 				)));
 			}
-			indexes.push(candidate.clone());
+			let mut candidate = candidate.clone();
+			candidate.schema_version = definition.version;
+			candidate.state = definition.state;
+			indexes.push(candidate);
 		}
 		indexes.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 		encoded.push(TableCatalogEntry {
@@ -298,6 +320,7 @@ pub(super) fn encode_tables(
 			name: table.name.clone(),
 			graph_id,
 			kind: table.kind,
+			schema_mode: table.schema_mode,
 			fields: table
 				.fields
 				.iter()
@@ -410,15 +433,20 @@ pub(super) fn load_database(
 		.collect::<BTreeMap<_, _>>();
 	let mut tables = Vec::with_capacity(database.tables.len());
 	for table in &database.tables {
-		let graph = graph_records.get(&table.graph_id).ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file("table references an unknown graph identity")
-		})?;
+		let graph = if table.graph_id == GraphId::SYSTEM {
+			None
+		} else {
+			Some(*graph_records.get(&table.graph_id).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("table references an unknown graph identity")
+			})?)
+		};
 		tables.push(LocalCommitTable {
 			id: table.schema_id,
 			version: table.schema_version,
 			name: table.name.clone(),
-			graph: graph.parse()?,
+			graph: graph.map(str::parse).transpose()?,
 			kind: table.kind,
+			schema_mode: table.schema_mode,
 			fields: table
 				.fields
 				.iter()
@@ -438,6 +466,15 @@ pub(super) fn load_database(
 					version: index.schema_version,
 					name: index.name.clone(),
 					kind: index.kind,
+					state: if index.state == TableIndexState::Ready
+						&& index
+							.file_id
+							.is_some_and(|file_id| !manager.has_file(table.graph_id, file_id))
+					{
+						TableIndexState::Stale
+					} else {
+						index.state
+					},
 					fields: index.fields.clone(),
 				})
 				.collect(),
@@ -728,10 +765,19 @@ pub(super) fn open_local_graph(
 		.collect::<BTreeMap<_, _>>();
 	for table in tables.iter().filter(|table| table.graph_id == entry.graph_id) {
 		for index in &table.indexes {
+			if index.state != TableIndexState::Ready {
+				continue;
+			}
+			let file_id = index.file_id.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("ready scalar index has no physical file")
+			})?;
+			let root_page = index.root.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("ready scalar index has no physical root")
+			})?;
 			let file = files
 				.files
 				.iter()
-				.find(|file| file.graph_id == entry.graph_id && file.file_id == index.file_id)
+				.find(|file| file.graph_id == entry.graph_id && file.file_id == file_id)
 				.ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(format!(
 						"scalar index '{}.{}' references an unregistered file",
@@ -758,21 +804,18 @@ pub(super) fn open_local_graph(
 					table.name, index.name
 				)));
 			}
-			if !manager.has_file(entry.graph_id, index.file_id) {
+			if !manager.has_file(entry.graph_id, file_id) {
 				continue;
 			}
 			if index.kind == TableIndexKind::Count {
-				if index.root != PageNo::new(0)
+				if root_page != PageNo::new(0)
 					|| !index.fields.is_empty()
-					|| manager.visible_file_page_count(
-						transaction,
-						entry.graph_id,
-						index.file_id,
-					)? != 1 || count_indexes
-					.insert(table.schema_id, LocalCountIndex {
-						file_id: index.file_id,
-					})
-					.is_some()
+					|| manager.visible_file_page_count(transaction, entry.graph_id, file_id)? != 1
+					|| count_indexes
+						.insert(table.schema_id, LocalCountIndex {
+							file_id,
+						})
+						.is_some()
 				{
 					return Err(FerrosGrynnError::invalid_storage_file(
 						"table contains an invalid or duplicate Count index",
@@ -801,8 +844,8 @@ pub(super) fn open_local_graph(
 				name: index.name.clone(),
 				kind: index.kind,
 				fields,
-				file_id: index.file_id,
-				root: index.root,
+				file_id,
+				root: root_page,
 			});
 		}
 	}
@@ -1207,9 +1250,10 @@ pub(super) fn write_new_graph_generation(
 				schema_version: index.schema_version,
 				name: index.name,
 				kind: index.kind,
+				state: TableIndexState::Ready,
 				fields: index.fields,
-				file_id,
-				root: index.root,
+				file_id: Some(file_id),
+				root: Some(index.root),
 			},
 		});
 	}

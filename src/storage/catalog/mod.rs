@@ -13,7 +13,7 @@ use super::{
 	types::{DataFileId, DataFileKind, GraphId, Lsn},
 };
 use crate::{
-	datastore::{IndexId, TableIndexKind, TableKind},
+	datastore::{IndexId, TableIndexKind, TableIndexState, TableKind, TableSchemaMode},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{
 		Type,
@@ -88,7 +88,7 @@ const DATABASE_CATALOG_MAGIC: [u8; 4] = *b"FGDC";
 /// File-catalog payload marker.
 const FILE_CATALOG_MAGIC: [u8; 4] = *b"FGFC";
 /// Database-catalog payload codec version.
-const DATABASE_CATALOG_PAYLOAD_VERSION: u16 = 4;
+const DATABASE_CATALOG_PAYLOAD_VERSION: u16 = 5;
 /// Physical-file catalog payload codec version.
 const FILE_CATALOG_PAYLOAD_VERSION: u16 = 4;
 /// Maximum persisted graph name in UTF-8 bytes.
@@ -197,6 +197,7 @@ mod tests {
 				name: "person".to_owned(),
 				graph_id: GraphId::new(1),
 				kind: TableKind::Normal,
+				schema_mode: TableSchemaMode::Schemaless,
 				fields: vec![
 					TableFieldCatalogEntry {
 						schema_id: 6,
@@ -221,6 +222,16 @@ mod tests {
 			}],
 			parameters: Vec::new(),
 		};
+		let payload = database.encode()?;
+		assert_eq!(&payload[..6], b"FGDC\x05\x00");
+		let mut version_four = payload.clone();
+		version_four[4..6].copy_from_slice(&4_u16.to_le_bytes());
+		assert_eq!(
+			DatabaseCatalog::decode(&version_four)
+				.err()
+				.map(|error| error.status().code().to_string()),
+			Some("FG-51S01".to_owned())
+		);
 		let files = FileCatalog::bootstrap()?;
 		let encoded = encode_bootstrap_catalogs(&database, &files)?;
 		let file = DirectFile::create_new(&path)?;

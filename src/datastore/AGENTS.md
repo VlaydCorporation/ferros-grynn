@@ -32,6 +32,12 @@ page/WAL layout (`storage`), graph algorithms (`graph`) или синтакси�
   путях; age/write-set limits не обходятся вспомогательным API.
 - Текущий global commit serialization является явной простой границей. Не
   заменять её lock-free MVCC без профиля bottleneck и полного anomaly suite.
+- Таблица с `graph() == None` принадлежит системному `GraphId = 0`; не создавать
+  для неё фиктивный runtime-граф. Удаление именованного графа атомарно удаляет
+  его таблицы, а системные таблицы не затрагивает.
+- DDL изменяет тот же транзакционный `SchemaCatalog`, что и Rust API. Secondary
+  index имеет одно наблюдаемое состояние `Ready`, `Stale` или
+  `PreparedForRemoval`; состояние участвует в выборе access path.
 
 ## Проверка
 

@@ -534,7 +534,7 @@ fn local_graph_table_and_edge_survive_reopen() {
 	assert_eq!(parameter.value(), &Value::from(64_i64));
 	{
 		let transaction = reopened.begin();
-		let statistics = schema.graph().read(&transaction).unwrap().statistics().unwrap();
+		let statistics = schema.graph().unwrap().read(&transaction).unwrap().statistics().unwrap();
 		assert_eq!(statistics.revision, statistics.analyzed_revision);
 		assert_eq!(statistics.tables.get(&table_id.get()), Some(&2));
 		assert_eq!(
@@ -560,10 +560,10 @@ fn local_graph_table_and_edge_survive_reopen() {
 		}
 	}
 	let mut bounded = reopened.begin();
-	assert!(bounded.mutate_graph(schema.graph()).is_err());
+	assert!(bounded.mutate_graph(schema.graph().unwrap()).is_err());
 	drop(bounded);
 	let transaction = reopened.begin();
-	let view = schema.graph().read(&transaction).unwrap();
+	let view = schema.graph().unwrap().read(&transaction).unwrap();
 	assert_eq!(view.node_count().unwrap(), 2);
 	assert_eq!(view.edge_count().unwrap(), 1);
 	assert_eq!(
@@ -598,7 +598,9 @@ fn local_graph_table_and_edge_survive_reopen() {
 	assert_eq!(rows.as_slice(), &[Value::from("Alice")]);
 
 	let mut update = reopened.begin();
-	if let GraphWriteView::Graph(graph) = update.edit_graph_materialized(schema.graph()).unwrap() {
+	if let GraphWriteView::Graph(graph) =
+		update.edit_graph_materialized(schema.graph().unwrap()).unwrap()
+	{
 		graph.node_properties_mut(alice).unwrap().insert(age, 31_i64);
 	}
 	update.commit().unwrap();
@@ -659,7 +661,23 @@ fn local_graph_table_and_edge_survive_reopen() {
 	std::fs::remove_file(label).unwrap();
 
 	let fallback = Datastore::open_local(directory.path(), options).unwrap();
-	assert_eq!(fallback.table("person").unwrap().indexes().len(), 2);
+	let fallback_table = fallback.table("person").unwrap();
+	assert_eq!(fallback_table.indexes().len(), 2);
+	assert!(fallback_table.indexes().all(|index| index.state() == TableIndexState::Stale));
+	let info = fallback.execute("INFO FOR TABLE person", &Object::new()).unwrap();
+	let indexes = info[0]
+		.result
+		.as_ref()
+		.unwrap()
+		.value()
+		.as_object()
+		.unwrap()
+		.get("indexes")
+		.and_then(Value::as_object)
+		.unwrap();
+	assert!(indexes.iter().filter(|(name, _value)| name.as_str() != "primary").all(
+		|(_name, value)| value.as_object().unwrap().get("state") == Some(&Value::from("stale"))
+	));
 	let results = fallback
 		.execute("SELECT VALUE name FROM person WHERE age >= 18", &crate::values::Object::new())
 		.unwrap();
@@ -2171,18 +2189,26 @@ fn read_committed_query_uses_one_statement_snapshot() {
 }
 
 #[test]
-fn graph_removal_preserves_table_catalog_integrity() {
+fn graph_removal_cascades_to_owned_tables() {
 	let (store, reference, _) = seeded_table();
-	let mut blocked = store.begin();
-	blocked.remove_graph(&reference).unwrap();
-	assert!(blocked.commit().is_err());
-
 	let mut removal = store.begin();
-	removal.remove_table("person").unwrap();
 	removal.remove_graph(&reference).unwrap();
 	removal.commit().unwrap();
 	assert!(store.table("person").is_none());
 	assert!(reference.read(&store.begin()).is_err());
+}
+
+#[test]
+fn graph_removal_preserves_a_table_redefined_in_the_system_graph() {
+	let (store, reference, _) = seeded_table();
+	let mut removal = store.begin();
+	removal.remove_table("person").unwrap();
+	removal
+		.define_table(TableSchema::new_system("person", TableKind::Normal, []).unwrap())
+		.unwrap();
+	removal.remove_graph(&reference).unwrap();
+	removal.commit().unwrap();
+	assert!(store.table("person").unwrap().graph().is_none());
 }
 
 #[test]
@@ -2316,9 +2342,145 @@ fn select_uses_explicit_schema_and_record_id_order() {
 }
 
 #[test]
+fn core_ddl_is_transactional_and_info_exposes_index_state() {
+	let store = Datastore::in_memory();
+	let failed = store
+		.execute(
+			"DEFINE TABLE broken; DEFINE INDEX invalid ON broken FIELDS missing",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(failed.last().unwrap().result.is_err());
+	assert!(store.table("broken").is_none());
+	let results = store
+		.execute(
+			"DEFINE GRAPH social TYPE DAG; DEFINE TABLE user TYPE NORMAL SCHEMAFULL; DEFINE FIELD \
+			 email ON TABLE user TYPE string; DEFINE INDEX by_email ON TABLE user FIELDS email \
+			 UNIQUE; ALTER TABLE user SCHEMALESS; INFO FOR TABLE user",
+			&Object::new(),
+		)
+		.unwrap();
+	assert_eq!(results.len(), 6);
+	assert!(results.iter().all(|result| result.result.is_ok()));
+	let table = store.table("user").unwrap();
+	assert!(table.graph().is_none());
+	assert_eq!(table.schema_mode(), TableSchemaMode::Schemaless);
+	assert_eq!(table.fields().next().unwrap().value_type(), &Type::String);
+	assert_eq!(table.indexes().next().unwrap().state(), TableIndexState::Stale);
+	assert_eq!(
+		store.schema_catalog().named_graph("social").unwrap().reference().kind(),
+		GraphKind::Dag
+	);
+
+	let info = results[5].result.as_ref().unwrap().value().as_object().unwrap();
+	let indexes = info.get("indexes").and_then(Value::as_object).unwrap();
+	let by_email = indexes.get("by_email").and_then(Value::as_object).unwrap();
+	assert_eq!(by_email.get("state"), Some(&Value::from("stale")));
+
+	let remove = store
+		.execute(
+			"ALTER INDEX by_email ON TABLE user PREPARE REMOVE; REMOVE INDEX by_email ON TABLE \
+			 user; REMOVE FIELD email ON TABLE user; REMOVE TABLE user; REMOVE GRAPH social",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(remove.iter().all(|result| result.result.is_ok()));
+	assert!(store.table("user").is_none());
+	assert!(store.schema_catalog().named_graph("social").is_none());
+}
+
+#[test]
+fn core_ddl_definition_modes_preserve_schema_identity() {
+	let store = Datastore::in_memory();
+	let created = store
+		.execute(
+			"DEFINE TABLE user; DEFINE FIELD email ON user TYPE string; DEFINE INDEX by_email ON \
+			 user FIELDS email UNIQUE",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(created.iter().all(|result| result.result.is_ok()));
+	let before = store.table("user").unwrap();
+	let table_id = before.id();
+	let field_id = before.fields().next().unwrap().id();
+	let index_id = before.indexes().next().unwrap().id();
+
+	let changed = store
+		.execute(
+			"DEFINE TABLE IF NOT EXISTS user TYPE NORMAL; DEFINE FIELD IF NOT EXISTS email ON \
+			 user TYPE int; DEFINE INDEX IF NOT EXISTS by_email ON user COUNT; DEFINE TABLE \
+			 OVERWRITE user TYPE RELATION SCHEMAFULL; DEFINE FIELD OVERWRITE email ON user TYPE \
+			 int; DEFINE INDEX OVERWRITE by_email ON user FIELDS email",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(changed.iter().all(|result| result.result.is_ok()));
+	let after = store.table("user").unwrap();
+	assert_eq!(after.id(), table_id);
+	assert_eq!(after.kind(), TableKind::Relation);
+	assert_eq!(after.schema_mode(), TableSchemaMode::Schemafull);
+	assert_eq!(after.fields().next().unwrap().id(), field_id);
+	assert_eq!(after.fields().next().unwrap().value_type(), &Type::Int);
+	assert_eq!(after.indexes().next().unwrap().id(), index_id);
+	assert_eq!(after.indexes().next().unwrap().kind(), TableIndexKind::Standard);
+
+	let absent = store
+		.execute(
+			"REMOVE GRAPH IF EXISTS missing; REMOVE TABLE IF EXISTS missing; REMOVE FIELD IF \
+			 EXISTS missing ON missing; REMOVE INDEX IF EXISTS missing ON missing",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(absent.iter().all(|result| result.result.is_ok()));
+}
+
+#[cfg(windows)]
+#[test]
+fn core_ddl_catalog_survives_local_reopen() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let results = store
+		.execute(
+			"DEFINE GRAPH social TYPE META; DEFINE TABLE user SCHEMAFULL TYPE NORMAL; DEFINE \
+			 FIELD email ON user TYPE string; DEFINE INDEX by_email ON user FIELDS email UNIQUE",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(results.iter().all(|result| result.result.is_ok()));
+	drop(store);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	let table = reopened.table("user").unwrap();
+	assert_eq!(table.schema_mode(), TableSchemaMode::Schemafull);
+	assert_eq!(table.indexes().next().unwrap().state(), TableIndexState::Stale);
+	assert_eq!(
+		reopened.schema_catalog().named_graph("social").unwrap().reference().kind(),
+		GraphKind::Metagraph
+	);
+	let info = reopened.execute("INFO FOR INDEX by_email ON TABLE user", &Object::new()).unwrap();
+	let value = info[0].result.as_ref().unwrap().value().as_object().unwrap();
+	assert_eq!(value.get("state"), Some(&Value::from("stale")));
+	let altered = reopened
+		.execute("ALTER INDEX by_email ON TABLE user PREPARE REMOVE", &Object::new())
+		.unwrap();
+	assert!(altered[0].result.is_ok());
+	drop(reopened);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	assert_eq!(
+		reopened.table("user").unwrap().indexes().next().unwrap().state(),
+		TableIndexState::PreparedForRemoval
+	);
+}
+
+#[test]
 fn predicate_validation_ignores_non_matching_changes_but_catches_phantoms() {
 	let (store, reference, carol) = seeded_table();
-	let reader = store.begin();
+	let mut reader = store.begin();
 	reader
 		.execute("SELECT VALUE name FROM person WHERE age >= 18", &crate::values::Object::new())
 		.unwrap();
@@ -2329,7 +2491,7 @@ fn predicate_validation_ignores_non_matching_changes_but_catches_phantoms() {
 	writer.commit().unwrap();
 	reader.commit().unwrap();
 
-	let reader = store.begin();
+	let mut reader = store.begin();
 	reader
 		.execute("SELECT VALUE name FROM person WHERE age >= 18", &crate::values::Object::new())
 		.unwrap();

@@ -131,7 +131,9 @@ use crate::{
 		IndexId,
 		ScalarComparison,
 		TableIndexKind,
+		TableIndexState,
 		TableKind,
+		TableSchemaMode,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	stats::{
@@ -700,6 +702,8 @@ pub struct LocalCommitTableIndex {
 	pub name: String,
 	/// Physical table-index contract.
 	pub kind: TableIndexKind,
+	/// Observable planner-availability state.
+	pub state: TableIndexState,
 	/// Composite fields as dense property-key identifiers; empty for Count.
 	pub fields: Vec<u32>,
 }
@@ -713,10 +717,12 @@ pub struct LocalCommitTable {
 	pub version: u32,
 	/// Unique table name.
 	pub name: String,
-	/// Named graph containing the table atoms.
-	pub graph: RecordId,
+	/// Named graph containing the table atoms; `None` means system graph zero.
+	pub graph: Option<RecordId>,
 	/// Node/edge membership class.
 	pub kind: TableKind,
+	/// Record-schema validation policy.
+	pub schema_mode: TableSchemaMode,
 	/// Ordered explicit fields after implicit `id`.
 	pub fields: Vec<LocalCommitTableField>,
 	/// User-declared indexes in definition order.
@@ -1069,6 +1075,7 @@ impl LocalStore {
 		table: &str,
 		kind: TableKind,
 		equalities: &[(PropertyKeyId, &Value)],
+		usable_indexes: &[&str],
 		visit: impl FnMut(LocalQueryAtom) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<bool> {
 		let Some(index) = graph.scalar_indexes.get(table).and_then(|indexes| {
@@ -1076,6 +1083,7 @@ impl LocalStore {
 				.iter()
 				.filter(|index| {
 					index.table_id == table_id
+						&& usable_indexes.contains(&index.name.as_str())
 						&& index.fields.len() > 1
 						&& index.fields.iter().all(|(field, _value_type)| {
 							equalities.iter().any(|(key, _)| key == field)
@@ -1141,6 +1149,7 @@ impl LocalStore {
 		table: &str,
 		kind: TableKind,
 		property_key: PropertyKeyId,
+		usable_indexes: &[&str],
 		comparison: ScalarComparison,
 		value: &Value,
 		visit: impl FnMut(LocalQueryAtom) -> FerrosGrynnResult<()>,
@@ -1148,6 +1157,7 @@ impl LocalStore {
 		let Some(index) = graph.scalar_indexes.get(table).and_then(|indexes| {
 			indexes.iter().find(|index| {
 				index.table_id == table_id
+					&& usable_indexes.contains(&index.name.as_str())
 					&& index.fields.len() == 1
 					&& index.fields[0].0 == property_key
 			})

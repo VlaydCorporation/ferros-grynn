@@ -117,8 +117,10 @@ pub use schema::{
 	TableField,
 	TableIndex,
 	TableIndexKind,
+	TableIndexState,
 	TableKind,
 	TableSchema,
+	TableSchemaMode,
 };
 pub use transaction::{
 	AtomRefTopology,
@@ -369,11 +371,17 @@ impl Datastore {
 		variables: &crate::values::Object,
 		settings: crate::gql::ParserSettings,
 	) -> FerrosGrynnResult<Vec<crate::gql::QueryResult>> {
-		let transaction = self.begin_with(TransactionOptions {
+		let program = crate::gql::parse(source, settings)?;
+		let mut transaction = self.begin_with(TransactionOptions {
 			isolation: IsolationLevel::Serializable,
-			access: TransactionAccess::ReadOnly,
+			access: if crate::gql::program_mutates_schema(&program) {
+				TransactionAccess::ReadWrite
+			} else {
+				TransactionAccess::ReadOnly
+			},
 		});
-		let results = transaction.execute_with_settings(source, variables, settings)?;
+		let results =
+			crate::gql::execute_parsed_transaction(&mut transaction, source, &program, variables)?;
 		if results.iter().any(|result| result.result.is_err()) {
 			return Ok(results);
 		}
