@@ -1,6 +1,22 @@
 {
-  "generated_at": "2026-09-01T22:22:26.965678+00:00",
+  "generated_at": "2026-09-08T09:39:13.161491+00:00",
   "nodes": {
+    "agents_design_authority": {
+      "code_fingerprint": "a348f251e7527b1e4de975c2638577066f1a9ae6e02dd57968884cb9f9325628",
+      "label": "Specification Design Authority",
+      "last": "2026-09-05T10:03:32.405089+00:00",
+      "provenance": [
+        {
+          "date": "2026-09-05T10:03:32.405089+00:00",
+          "outcome": "useful",
+          "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
+        }
+      ],
+      "score": 0.933397158,
+      "source_file": "AGENTS.md",
+      "status": "tentative",
+      "uses": 1
+    },
     "crates_fg_meta_src_io_async_asyncio": {
       "code_fingerprint": "d68e39c803958c597740f9444dcc5d7b65010eb6c978fcb3a6502cb951e9f5d1",
       "label": "AsyncIo",
@@ -12,7 +28,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.950276864,
+      "score": 0.818329542,
       "source_file": "crates/fg-meta/src/io_async.rs",
       "status": "tentative",
       "uses": 1
@@ -28,24 +44,24 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.950276864,
+      "score": 0.818329542,
       "source_file": "crates/surrealdb/surrealdb/core/src/idx/ft/fulltext.rs",
       "status": "tentative",
       "uses": 1
     },
-    "src_datastore_tests_write_set_limit_counts_large_property_payload_before_publication": {
-      "code_fingerprint": "e90e005455295033c2729f30fc20e9cd922c26c99eefa81caa71e0abc2f0d363",
-      "label": "write_set_limit_counts_large_property_payload_before_publication()",
-      "last": "2026-08-28T21:19:39.115264+00:00",
+    "docs_storage_engine_hybrid_integration_plan_correctness_gate": {
+      "code_fingerprint": "5e88d0871501fc736af81b3c7de95a2d311bb59417681f5451a79e5f23cf8fd7",
+      "label": "Correctness gate",
+      "last": "2026-09-05T10:03:32.405089+00:00",
       "provenance": [
         {
-          "date": "2026-08-28T21:19:39.115264+00:00",
+          "date": "2026-09-05T10:03:32.405089+00:00",
           "outcome": "useful",
-          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
+          "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.910804308,
-      "source_file": "src/datastore/tests.rs",
+      "score": 0.933397158,
+      "source_file": "docs/storage_engine_hybrid_integration_plan.md",
       "status": "tentative",
       "uses": 1
     },
@@ -60,13 +76,13 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.950276864,
+      "score": 0.818329542,
       "source_file": "src/gql/execution/cursor.rs",
       "status": "tentative",
       "uses": 1
     },
     "src_graph_metagraph_metagraph": {
-      "code_fingerprint": "59060bea996caa33fa6b1dc4cd593311e355e6c7fad35dd171858b3b0e39eb53",
+      "code_fingerprint": "e7b45483c416015cf7f85601385514c95f220edd6b251e4424e7bc366d3014be",
       "label": "Metagraph",
       "last": "2026-08-10T11:48:37.217190+00:00",
       "provenance": [
@@ -76,7 +92,7 @@
           "q": "What is MetaGraph?"
         }
       ],
-      "score": 0.595426236,
+      "score": 0.512750438,
       "source_file": "src/graph/metagraph.rs",
       "status": "tentative",
       "uses": 1
@@ -92,13 +108,29 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.950276864,
+      "score": 0.818329542,
       "source_file": "src/graph/traversal/index.rs",
       "status": "tentative",
       "uses": 1
     },
+    "src_storage_store_mod_localdatabasesnapshot": {
+      "code_fingerprint": "a7f1b9ccb841d2952f7612fd75a68c4d7f25f84eecf80a42dbeda8cd5a4b0783",
+      "label": "LocalDatabaseSnapshot",
+      "last": "2026-09-08T09:34:24.172911+00:00",
+      "provenance": [
+        {
+          "date": "2026-09-08T09:34:24.172911+00:00",
+          "outcome": "useful",
+          "q": "Почему один файл тестов? Лучше логически разделять тесты на несколько файлов, хотя бы два файла для local и in-memory БД."
+        }
+      ],
+      "score": 0.999922722,
+      "source_file": "src/storage/store/mod.rs",
+      "status": "tentative",
+      "uses": 1
+    },
     "src_storage_store_mod_localsnapshotgraph": {
-      "code_fingerprint": "17bb88571aad2a9b4df6c333e1ec489e6e7884e98c1b31d61d04595b62375d65",
+      "code_fingerprint": "a7f1b9ccb841d2952f7612fd75a68c4d7f25f84eecf80a42dbeda8cd5a4b0783",
       "label": "LocalSnapshotGraph",
       "last": "2026-08-28T21:19:39.115264+00:00",
       "provenance": [
@@ -108,13 +140,13 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.910804308,
+      "score": 0.784337808,
       "source_file": "src/storage/store/mod.rs",
       "status": "tentative",
       "uses": 1
     },
     "src_values_runtime_value_estimated_values_heap_bytes": {
-      "code_fingerprint": "ad491cb2ac45c15d77e7daa8a4247a0ff21ba66616f6731c08be8bdb6346b95a",
+      "code_fingerprint": "826e0c2b97622478e550620738ff82ece16174bf837ba4c8f7dd81d809d8d174",
       "label": "estimated_values_heap_bytes()",
       "last": "2026-08-28T21:19:39.115264+00:00",
       "provenance": [
@@ -124,7 +156,7 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.910804308,
+      "score": 0.784337808,
       "source_file": "src/values/runtime/value.rs",
       "status": "tentative",
       "uses": 1
