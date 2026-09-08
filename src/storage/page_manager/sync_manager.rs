@@ -13,6 +13,8 @@ pub(in crate::storage) struct SyncPageManager {
 	database_path: PathBuf,
 	/// Trusted, sealed mapping from persisted identities to open files.
 	registry: RwLock<FileRegistry>,
+	/// Cataloged secondary indexes allowed to fall back to primary scans.
+	degradable_indexes: RapidHashSet<(GraphId, crate::storage::types::DataFileId)>,
 	/// Database-level frame WAL and snapshot registry.
 	pub(super) wal: FrameWal,
 	/// Fixed-budget immutable page cache and physical read router.
@@ -95,6 +97,7 @@ impl SyncPageManager {
 		let manager = Self::open_owned(
 			database_directory,
 			registrations,
+			RapidHashSet::default(),
 			pool_pages,
 			io_mode,
 			database_lock,
@@ -152,11 +155,16 @@ impl SyncPageManager {
 		})?;
 		database.next_file_instance_id =
 			database.next_file_instance_id.max(file_catalog.next_file_instance_id);
-		let registrations = file_catalog.registrations(database_directory);
+		let degradable_indexes = degradable_index_keys(&database_catalog, &file_catalog);
+		let registrations = retain_available_indexes(
+			file_catalog.registrations(database_directory),
+			&degradable_indexes,
+		)?;
 		validate_registration_paths(database_directory, &registrations)?;
 		let manager = Self::open_owned_with_wal(
 			database_directory,
 			registrations,
+			degradable_indexes,
 			pool_pages,
 			io_mode,
 			database_lock,
@@ -189,6 +197,7 @@ impl SyncPageManager {
 		Self::open_owned(
 			database_directory,
 			registrations,
+			RapidHashSet::default(),
 			pool_pages,
 			io_mode,
 			database_lock,
@@ -201,6 +210,7 @@ impl SyncPageManager {
 	fn open_owned(
 		database_directory: &Path,
 		registrations: Vec<DataFileRegistration>,
+		degradable_indexes: RapidHashSet<(GraphId, crate::storage::types::DataFileId)>,
 		pool_pages: NonZeroUsize,
 		io_mode: PageIoMode,
 		database_lock: DatabaseLock,
@@ -213,6 +223,7 @@ impl SyncPageManager {
 		Self::open_owned_with_wal(
 			database_directory,
 			registrations,
+			degradable_indexes,
 			pool_pages,
 			io_mode,
 			database_lock,
@@ -226,6 +237,7 @@ impl SyncPageManager {
 	fn open_owned_with_wal(
 		database_directory: &Path,
 		registrations: Vec<DataFileRegistration>,
+		degradable_indexes: RapidHashSet<(GraphId, crate::storage::types::DataFileId)>,
 		pool_pages: NonZeroUsize,
 		io_mode: PageIoMode,
 		database_lock: DatabaseLock,
@@ -278,11 +290,13 @@ impl SyncPageManager {
 		}
 
 		let page_io = PageIo::new(io_mode)?;
-		let registry = FileRegistry::open(registrations, page_io.file_open_mode())?;
+		let registry =
+			FileRegistry::open(registrations, page_io.file_open_mode(), &degradable_indexes)?;
 		let manager = Self {
 			_database_lock: database_lock,
 			database_path,
 			registry: RwLock::new(registry),
+			degradable_indexes,
 			wal,
 			pool: HybridReadEngine::new(pool_pages),
 			page_io,
@@ -695,6 +709,15 @@ impl SyncPageManager {
 		self.registry.write().remove(keys);
 	}
 
+	/// Reports whether one cataloged physical file passed startup validation.
+	pub(in crate::storage) fn has_file(
+		&self,
+		graph_id: GraphId,
+		file_id: crate::storage::types::DataFileId,
+	) -> bool {
+		self.registry.read().contains(graph_id, file_id)
+	}
+
 	/// Writes fresh immutable catalog tails, synchronizes them, and stages only
 	/// the fixed root-page switch in the caller's WAL transaction.
 	pub(in crate::storage) fn stage_catalog_update(
@@ -977,6 +1000,13 @@ impl SyncPageManager {
 		let mut scratch = self.checkpoint_scratch.lock();
 		let mut start = 0;
 		while start < frames.len() {
+			let first = frames[start].key();
+			if self.degradable_indexes.contains(&(first.graph_id(), first.file_id()))
+				&& !self.registry.read().contains(first.graph_id(), first.file_id())
+			{
+				start += 1;
+				continue;
+			}
 			let mut buffer_pages = 0;
 			let mut io_extents = Vec::new();
 			while start < frames.len() && buffer_pages < scratch.len() {
@@ -1034,8 +1064,13 @@ impl SyncPageManager {
 			FerrosGrynnError::storage_io_failure("recovery extent is unexpectedly empty")
 		})?;
 		for frame in frames {
-			self.wal.read_frame(frame, page)?;
 			let key = frame.key();
+			if self.degradable_indexes.contains(&(key.graph_id(), key.file_id()))
+				&& !self.registry.read().contains(key.graph_id(), key.file_id())
+			{
+				continue;
+			}
+			self.wal.read_frame(frame, page)?;
 			let file = self.transactional_file(key)?;
 			self.page_io.write_page(file.file()?, key.page_no(), page)?;
 			touched.insert((key.graph_id(), key.file_id()));
@@ -1050,42 +1085,62 @@ impl SyncPageManager {
 	fn validate_home_files(&self) -> FerrosGrynnResult<()> {
 		let mut scratch = self.checkpoint_scratch.lock();
 		let registrations = self.registry.read().snapshot();
-		for ((_graph_id, file_id), registration) in registrations {
+		let mut unavailable = Vec::new();
+		for ((graph_id, file_id), registration) in registrations {
 			if registration.role() != DataFileRole::WalBackfilled {
 				continue;
 			}
-			let file = registration.file()?;
-			// Statistics distributions are intentionally lazy. Startup proves
-			// the graph root only; ordinary page reads validate auxiliary
-			// checksums.
-			let validation_pages = match file_id.kind() {
-				Some(DataFileKind::Statistics) => file.page_count().min(1),
-				Some(DataFileKind::LabelStatistics | DataFileKind::PropertyStatistics) => 0,
-				_ => file.page_count(),
-			};
-			let mut first = 0_u64;
-			while first < validation_pages {
-				let remaining = validation_pages - first;
-				let count =
-					usize::try_from(remaining.min(scratch.len() as u64)).map_err(|source| {
-						FerrosGrynnError::storage_io_failure(format!(
-							"home validation extent does not fit usize: {source}"
-						))
-					})?;
-				let pages = &mut scratch[..count];
-				let extent = FilePageExtent::new(Arc::clone(file), PageNo::new(first), 0, count);
-				self.page_io.read_extents(std::slice::from_ref(&extent), pages)?;
-				for (offset, page) in pages.iter_mut().enumerate() {
-					let offset = u64::try_from(offset).map_err(|source| {
-						FerrosGrynnError::storage_io_failure(format!(
-							"home validation offset does not fit u64: {source}"
-						))
-					})?;
-					page.validate(PageNo::new(first + offset))?;
+			let validation =
+				validate_home_registration(&self.page_io, file_id, &registration, &mut scratch);
+			if let Err(error) = validation {
+				if self.degradable_indexes.contains(&(graph_id, file_id)) {
+					unavailable.push((graph_id, file_id));
+					continue;
 				}
-				first += count as u64;
+				return Err(error);
 			}
 		}
+		drop(scratch);
+		self.registry.write().remove(&unavailable);
 		Ok(())
 	}
+}
+
+/// Validates the initialized pages of one open home file.
+fn validate_home_registration(
+	page_io: &PageIo,
+	file_id: crate::storage::types::DataFileId,
+	registration: &RegisteredDataFile,
+	scratch: &mut [AlignedPage],
+) -> FerrosGrynnResult<()> {
+	let file = registration.file()?;
+	// Statistics distributions are intentionally lazy. Startup proves the
+	// graph root only; ordinary page reads validate auxiliary checksums.
+	let validation_pages = match file_id.kind() {
+		Some(DataFileKind::Statistics) => file.page_count().min(1),
+		Some(DataFileKind::LabelStatistics | DataFileKind::PropertyStatistics) => 0,
+		_ => file.page_count(),
+	};
+	let mut first = 0_u64;
+	while first < validation_pages {
+		let remaining = validation_pages - first;
+		let count = usize::try_from(remaining.min(scratch.len() as u64)).map_err(|source| {
+			FerrosGrynnError::storage_io_failure(format!(
+				"home validation extent does not fit usize: {source}"
+			))
+		})?;
+		let pages = &mut scratch[..count];
+		let extent = FilePageExtent::new(Arc::clone(file), PageNo::new(first), 0, count);
+		page_io.read_extents(std::slice::from_ref(&extent), pages)?;
+		for (offset, page) in pages.iter_mut().enumerate() {
+			let offset = u64::try_from(offset).map_err(|source| {
+				FerrosGrynnError::storage_io_failure(format!(
+					"home validation offset does not fit u64: {source}"
+				))
+			})?;
+			page.validate(PageNo::new(first + offset))?;
+		}
+		first += count as u64;
+	}
+	Ok(())
 }

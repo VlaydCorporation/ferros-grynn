@@ -450,7 +450,8 @@ Row = { values: Vec<Value>, env: Env?, path: Path? }
 ### 7.2. Scan-операторы
 
 - **`TableScan { table_id, projection, predicate }`** — скан таблицы; predicate/projection проброшены внутрь (§16.1, §16.3). В текущем local backend — ordered обход graph-wide `primary.fgidx`, фильтрация table/kind и затем чтение hot-slot (§10.4); label-index остаётся следующим срезом.
-- **`IndexScan { index_id, key_range, predicate }`** — доступ через `Index::range/lookup` (§13).
+- **`IndexScan { index_id: IndexId, key_range, predicate }`** — доступ через
+  `Index::range/lookup` (§13); логическая identity не подменяется физическим `DataFileId`.
 - **`GraphScan { atom_type, label_filter }`** — старт с множества атомов графа по метке (`tv::V([labels])`).
 
 ### 7.3. Expand-операторы

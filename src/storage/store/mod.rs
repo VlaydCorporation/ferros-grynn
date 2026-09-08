@@ -1,6 +1,8 @@
 //! Crash-safe copy-on-write graph generations for the local datastore.
 
 mod commit;
+/// Canonical format-v1 graph-generation filenames.
+pub(in crate::storage) mod file_layout;
 mod gc;
 mod graph;
 mod materialize;
@@ -43,19 +45,26 @@ use super::{
 	direct::DirectFile,
 	file_registry::{DataFileRegistration, DataFileRole},
 	graph_index::{
+		CountIndexValue,
+		ExternalIndexSorter,
 		LabelDictionary,
 		PrimaryIndexEntry,
-		ScalarIndexEntry,
 		ScalarIndexMode,
+		build_label_index,
 		build_primary_index,
-		build_scalar_index,
+		build_primary_index_sorted,
+		build_scalar_index_sorted,
+		cleanup_external_index_sort,
+		decode_count_index,
 		decode_label_dictionary,
+		encode_count_index,
 		encode_label_dictionary,
 		leftmost_primary_leaf,
 		lookup_primary_index,
 		lookup_scalar_index,
 		range_scalar_index,
 		scan_primary_index,
+		visit_label_index_pages,
 		visit_primary_leaf_page,
 	},
 	graph_pages::{
@@ -119,6 +128,7 @@ use crate::{
 	datastore::{
 		CheckpointMode,
 		INTERNAL_NESTED_GRAPH_TABLE,
+		IndexId,
 		ScalarComparison,
 		TableIndexKind,
 		TableKind,
@@ -183,23 +193,6 @@ use crate::{
 	},
 };
 
-/// Files produced for every immutable graph generation.
-const GRAPH_FILE_KINDS: [(DataFileKind, &str); 13] = [
-	(DataFileKind::GraphSuperblock, "graph.fgb"),
-	(DataFileKind::NodesHot, "nodes_hot.fgb"),
-	(DataFileKind::EdgesHot, "edges_hot.fgb"),
-	(DataFileKind::AdjacencyOverflow, "adjacency_overflow.fgb"),
-	(DataFileKind::CrossLevelAdjacencyOverflow, "adj_over_cl.fgb"),
-	(DataFileKind::Properties, "properties.fgb"),
-	(DataFileKind::Subgraphs, "subgraphs.fgb"),
-	(DataFileKind::Labels, "labels.fgb"),
-	(DataFileKind::Freelist, "freelist.fgb"),
-	(DataFileKind::Statistics, "stats/graph_stats.fgb"),
-	(DataFileKind::LabelStatistics, "stats/label_stats.fgb"),
-	(DataFileKind::PropertyStatistics, "stats/prop_stats.fgb"),
-	(DataFileKind::Index, "primary.fgidx"),
-];
-
 /// One graph supplied by the MVCC layer for a durable commit.
 pub struct LocalCommitGraph {
 	/// Stable catalog identity of the named graph.
@@ -228,8 +221,8 @@ pub struct LocalCommitGraphSchema {
 /// Versioned identity of one engine-owned system index.
 #[derive(Clone, Copy)]
 pub struct LocalCommitSystemIndex {
-	/// Stable schema-catalog identity.
-	pub id: u32,
+	/// Stable logical index identity from the shared schema clock.
+	pub id: IndexId,
 	/// Semantic definition version.
 	pub version: u32,
 }
@@ -388,6 +381,11 @@ pub struct LocalGraph {
 	property_dictionary: Arc<PropertyDictionary>,
 	decode_context: Mutex<Option<Arc<EncodeContext>>>,
 	scalar_indexes: BTreeMap<String, Vec<LocalScalarIndex>>,
+	/// Whether durable schema contains any scalar index, including one whose
+	/// side-file was unavailable at open time.
+	has_declared_scalar_indexes: bool,
+	count_indexes: BTreeMap<u32, LocalCountIndex>,
+	label_indexes: BTreeMap<(AtomKind, u32), DataFileId>,
 	children: BTreeMap<u32, Arc<LocalGraph>>,
 }
 
@@ -416,6 +414,11 @@ struct LocalScalarIndex {
 	root: PageNo,
 }
 
+#[derive(Clone, Copy)]
+struct LocalCountIndex {
+	file_id: DataFileId,
+}
+
 impl LocalGraph {
 	pub(crate) const fn identity(&self) -> Uuid {
 		self.identity
@@ -442,7 +445,7 @@ impl LocalGraph {
 	}
 
 	pub(crate) fn supports_atom_delta(&self) -> bool {
-		self.scalar_indexes.is_empty()
+		!self.has_declared_scalar_indexes
 	}
 
 	/// Returns eagerly decoded graph counters for this durable revision.
@@ -690,14 +693,14 @@ pub struct LocalCommitTableField {
 #[derive(Clone)]
 pub struct LocalCommitTableIndex {
 	/// Stable index-definition identity.
-	pub id: u32,
+	pub id: IndexId,
 	/// Semantic index-definition version.
 	pub version: u32,
 	/// Table-local index name.
 	pub name: String,
-	/// Standard or unique key contract.
+	/// Physical table-index contract.
 	pub kind: TableIndexKind,
-	/// Composite fields as dense property-key identifiers.
+	/// Composite fields as dense property-key identifiers; empty for Count.
 	pub fields: Vec<u32>,
 }
 
@@ -716,7 +719,7 @@ pub struct LocalCommitTable {
 	pub kind: TableKind,
 	/// Ordered explicit fields after implicit `id`.
 	pub fields: Vec<LocalCommitTableField>,
-	/// Scalar indexes in definition order.
+	/// User-declared indexes in definition order.
 	pub indexes: Vec<LocalCommitTableIndex>,
 	/// Engine-owned primary-index definition.
 	pub primary_index: LocalCommitSystemIndex,
@@ -819,6 +822,7 @@ impl LocalStore {
 		let root = path.as_ref().to_path_buf();
 		let (manager, database, files) =
 			SyncPageManager::open_cataloged(&root, pool_pages, io_mode)?;
+		cleanup_external_index_sort(&root)?;
 		let transaction = manager.begin_tx()?;
 		let snapshot = load_database(
 			&root,
@@ -944,6 +948,94 @@ impl LocalStore {
 		materialize::materialize_query_graph(self, view, record_atom)
 	}
 
+	/// Reads an exact table-wide Count index, or returns `None` when the table
+	/// has no declared Count index.
+	pub(crate) fn table_count_index(
+		&self,
+		transaction: &LocalReadTransaction,
+		graph: &Arc<LocalGraph>,
+		table_id: u32,
+	) -> FerrosGrynnResult<Option<u64>> {
+		let Some(index) = graph.count_indexes.get(&table_id) else {
+			return Ok(None);
+		};
+		let mut page = AlignedPage::zeroed();
+		copy_local_index_page(self, transaction, graph, index.file_id, PageNo::new(0), &mut page)?;
+		let value = decode_count_index(&page)?;
+		if value.table_id != table_id {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"Count index table identity disagrees with its catalog binding",
+			));
+		}
+		Ok(Some(value.atom_count))
+	}
+
+	/// Visits one exact label side-file. `false` requests the caller's normal
+	/// graph scan because a committed mutation marked the generation stale.
+	pub(crate) fn visit_label_index(
+		&self,
+		transaction: &LocalReadTransaction,
+		graph: &Arc<LocalGraph>,
+		kind: AtomKind,
+		label: &str,
+		mut visit: impl FnMut(LocalQueryAtom) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<bool> {
+		if graph.superblock.flags.contains(GraphSuperblockFlags::LABEL_INDEX_STALE) {
+			return Ok(false);
+		}
+		let labels = match kind {
+			AtomKind::Node => &graph.labels.node_labels,
+			AtomKind::Edge => &graph.labels.edge_labels,
+		};
+		let Some(label_id) = labels.iter().position(|candidate| candidate == label) else {
+			return Ok(true);
+		};
+		let label_id = u32::try_from(label_id).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("label identity exceeds u32")
+		})?;
+		let Some(file_id) = graph.label_indexes.get(&(kind, label_id)).copied() else {
+			return Ok(false);
+		};
+		let context = graph.decode_context(self, transaction)?;
+		visit_label_index_pages(
+			|page_no, output| {
+				copy_local_index_page(self, transaction, graph, file_id, page_no, output)
+			},
+			kind,
+			|disk| {
+				let reference = context.registered_atom(disk).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"label index references an atom absent from the primary index",
+					)
+				})?;
+				let atom =
+					local_query_atom(self, transaction, graph, reference.id().clone(), disk)?;
+				let (page_no, within) = hot_slot_address(atom.atom_id.slot())?;
+				let page = self.manager.read_page(
+					&transaction.inner,
+					graph.page_key(
+						match kind {
+							AtomKind::Node => DataFileKind::NodesHot,
+							AtomKind::Edge => DataFileKind::EdgesHot,
+						},
+						page_no,
+					)?,
+				)?;
+				let actual_label = match kind {
+					AtomKind::Node => read_node_hot_slot(page.as_page(), page_no, within)?.label_id,
+					AtomKind::Edge => read_edge_hot_slot(page.as_page(), page_no, within)?.label_id,
+				};
+				if actual_label != Some(label_id) {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"label index entry disagrees with its hot atom slot",
+					));
+				}
+				visit(atom)
+			},
+		)?;
+		Ok(true)
+	}
+
 	/// Visits matching primary-index records in stable RecordId order.
 	pub(crate) fn visit_table(
 		&self,
@@ -1016,6 +1108,7 @@ impl LocalStore {
 		let mode = match index.kind {
 			TableIndexKind::Standard => ScalarIndexMode::Standard,
 			TableIndexKind::Unique => ScalarIndexMode::Unique,
+			TableIndexKind::Count => return Ok(false),
 		};
 		let atoms = lookup_scalar_index(
 			|page_no, output| {
@@ -1069,6 +1162,7 @@ impl LocalStore {
 		let mode = match index.kind {
 			TableIndexKind::Standard => ScalarIndexMode::Standard,
 			TableIndexKind::Unique => ScalarIndexMode::Unique,
+			TableIndexKind::Count => return Ok(false),
 		};
 		let mut read_page = |page_no, output: &mut AlignedPage| {
 			copy_local_index_page(self, transaction, graph, index.file_id, page_no, output)
@@ -1360,7 +1454,8 @@ impl LocalStore {
 				graph,
 				commit_graph.schema,
 			)?;
-			let mut images = build_graph_images(&plan, &mut dictionary, tables, memberships)?;
+			let mut images =
+				build_graph_images(&self.root, &plan, &mut dictionary, tables, memberships)?;
 			let in_place = if images.len() == 1
 				&& let Some(index) = existing
 			{

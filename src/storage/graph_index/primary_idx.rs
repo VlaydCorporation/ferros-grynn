@@ -36,32 +36,7 @@ pub(in crate::storage) fn build_primary_index(
 			min_key: group.first().map_or_else(Vec::new, |entry| entry.key.clone()),
 		});
 	}
-	while level.len() > 1 {
-		let groups = partition_internal_children(&level)?;
-		if groups.len() == level.len() {
-			return Err(invalid_index("separator key exceeds internal-page capacity"));
-		}
-		let mut next_level = Vec::with_capacity(groups.len());
-		for group in groups {
-			if group.len() == 1 {
-				next_level.push(group[0].clone());
-				continue;
-			}
-			let page_no = PageNo::new(
-				u64::try_from(pages.len())
-					.map_err(|_error| invalid_index("B+tree page index exceeds u64"))?,
-			);
-			let page_index = pages.len();
-			pages.push(AlignedPage::zeroed());
-			encode_internal_page(&mut pages[page_index], page_no, page_lsn, group)?;
-			next_level.push(ChildPage {
-				page_no,
-				min_key: group[0].min_key.clone(),
-			});
-		}
-		level = next_level;
-	}
-	let root = level.first().map_or(PageNo::new(0), |child| child.page_no);
+	let root = append_internal_levels(&mut pages, level, page_lsn)?;
 	Ok(BuiltPrimaryIndex {
 		root,
 		pages,

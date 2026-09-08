@@ -218,12 +218,12 @@ impl DatabaseRoot {
 				entry.name.clone().into(),
 				entry.graph.reference().clone(),
 				SystemIndex::from_storage(
-					SchemaId::from_storage(entry.schema.label_index.id)?,
+					entry.schema.label_index.id,
 					SchemaVersion::from_storage(entry.schema.label_index.version)?,
 					SystemIndexKind::Label,
 				),
 				SystemIndex::from_storage(
-					SchemaId::from_storage(entry.schema.adjacency_index.id)?,
+					entry.schema.adjacency_index.id,
 					SchemaVersion::from_storage(entry.schema.adjacency_index.version)?,
 					SystemIndexKind::Adjacency,
 				),
@@ -302,7 +302,7 @@ impl DatabaseRoot {
 				fields,
 				indexes: Vec::new(),
 				primary_index: Some(SystemIndex::from_storage(
-					SchemaId::from_storage(table.primary_index.id)?,
+					table.primary_index.id,
 					SchemaVersion::from_storage(table.primary_index.version)?,
 					SystemIndexKind::Primary,
 				)),
@@ -326,7 +326,7 @@ impl DatabaseRoot {
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				let mut definition = TableIndex::new(index.name, index.kind, field_names)?;
-				definition.id = Some(SchemaId::from_storage(index.id)?);
+				definition.id = Some(index.id);
 				definition.version = SchemaVersion::from_storage(index.version)?;
 				table_schema = table_schema.with_index(definition)?;
 			}

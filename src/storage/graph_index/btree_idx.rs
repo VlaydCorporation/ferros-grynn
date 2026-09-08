@@ -19,6 +19,7 @@ pub(super) fn validate_primary_entries(entries: &[PrimaryIndexEntry]) -> FerrosG
 	Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn validate_scalar_entries(
 	entries: &[ScalarIndexEntry],
 	mode: ScalarIndexMode,
@@ -43,6 +44,7 @@ pub(super) fn validate_scalar_entries(
 	Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn partition_standard_leaf_entries(
 	entries: &[ScalarIndexEntry],
 ) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry]>> {
@@ -537,6 +539,41 @@ pub(super) fn encode_internal_page(
 		write_u64(page.as_bytes_mut(), child_area + index * size_of::<u64>(), child.page_no.get());
 	}
 	page.seal()
+}
+
+/// Appends packed internal levels above an already encoded leaf level and
+/// returns the final root page.
+pub(super) fn append_internal_levels(
+	pages: &mut Vec<AlignedPage>,
+	mut level: Vec<ChildPage>,
+	page_lsn: PageLsn,
+) -> FerrosGrynnResult<PageNo> {
+	while level.len() > 1 {
+		let groups = partition_internal_children(&level)?;
+		if groups.len() == level.len() {
+			return Err(invalid_index("separator key exceeds internal-page capacity"));
+		}
+		let mut next_level = Vec::with_capacity(groups.len());
+		for group in groups {
+			if group.len() == 1 {
+				next_level.push(group[0].clone());
+				continue;
+			}
+			let page_no = PageNo::new(
+				u64::try_from(pages.len())
+					.map_err(|_error| invalid_index("B+tree page index exceeds u64"))?,
+			);
+			let page_index = pages.len();
+			pages.push(AlignedPage::zeroed());
+			encode_internal_page(&mut pages[page_index], page_no, page_lsn, group)?;
+			next_level.push(ChildPage {
+				page_no,
+				min_key: group[0].min_key.clone(),
+			});
+		}
+		level = next_level;
+	}
+	Ok(level.first().map_or(PageNo::new(0), |child| child.page_no))
 }
 
 pub(super) fn lookup_leaf(

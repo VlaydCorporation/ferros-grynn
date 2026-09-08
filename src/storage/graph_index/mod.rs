@@ -22,8 +22,16 @@ use crate::{
 
 /// Shared B+tree page construction and lookup primitives.
 mod btree_idx;
+/// Streaming bottom-up packing from externally sorted records.
+mod bulk_build;
+/// Single-page table count indexes.
+mod count_idx;
+/// Bounded-memory Direct-I/O run sorting for generation builds.
+mod external_sort;
 /// Label and time-zone dictionary pages.
 mod label_dict;
+/// Per-label sorted atom arrays.
+mod label_idx;
 /// Primary RecordId index.
 mod primary_idx;
 /// Standard and unique scalar indexes.
@@ -34,7 +42,20 @@ mod scalar_idx;
 	reason = "specialized indexes share one private B+tree codec"
 )]
 use btree_idx::*;
+pub(super) use bulk_build::{build_primary_index_sorted, build_scalar_index_sorted};
+pub(super) use count_idx::{
+	CountIndexValue,
+	decode_count_index,
+	encode_count_index,
+	stamp_count_index_lsn,
+};
+pub(super) use external_sort::{
+	ExternalIndexSorter,
+	SortedIndexRecords,
+	cleanup_external_index_sort,
+};
 pub(super) use label_dict::{LabelDictionary, decode_label_dictionary, encode_label_dictionary};
+pub(super) use label_idx::{build_label_index, visit_label_index_pages};
 pub(super) use primary_idx::{
 	PrimaryIndexEntry,
 	build_primary_index,
@@ -43,10 +64,11 @@ pub(super) use primary_idx::{
 	scan_primary_index,
 	visit_primary_leaf_page,
 };
+#[cfg(test)]
+use scalar_idx::build_scalar_index;
 pub(super) use scalar_idx::{
 	ScalarIndexEntry,
 	ScalarIndexMode,
-	build_scalar_index,
 	lookup_scalar_index,
 	range_scalar_index,
 };
@@ -82,8 +104,16 @@ const POSTING_ATOMS_PER_PAGE: usize = (PAGE_SIZE - POSTING_ATOMS_OFFSET) / DISK_
 
 #[cfg(test)]
 mod tests {
+	use std::{
+		fs,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
 	use super::*;
 	use crate::values::runtime::graph::AtomKind;
+
+	/// Unique external-packer fixture suffix.
+	static NEXT_SORT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 	#[test]
 	fn label_dictionary_round_trips_multiple_sections_and_pages() -> FerrosGrynnResult<()> {
@@ -260,5 +290,125 @@ mod tests {
 		);
 		assert!(!first_leaf_read);
 		Ok(())
+	}
+
+	#[test]
+	fn label_index_round_trips_multiple_pages_and_rejects_wrong_kind() -> FerrosGrynnResult<()> {
+		let atoms = (0..4_100_u64)
+			.map(|slot| DiskAtomRef::from_parts(AtomKind::Node, slot))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let pages = build_label_index(&atoms, AtomKind::Node, PageLsn::ZERO)?;
+		assert!(pages.len() > 1);
+		let mut decoded = Vec::new();
+		visit_label_index_pages(
+			|page_no, output| {
+				let page = pages
+					.get(page_no.get() as usize)
+					.ok_or_else(|| invalid_index("test label-index page missing"))?;
+				output.as_bytes_mut().copy_from_slice(page.as_bytes());
+				Ok(())
+			},
+			AtomKind::Node,
+			|atom| {
+				decoded.push(atom);
+				Ok(())
+			},
+		)?;
+		assert_eq!(decoded, atoms);
+		assert!(build_label_index(&atoms, AtomKind::Edge, PageLsn::ZERO).is_err());
+		Ok(())
+	}
+
+	#[test]
+	fn count_index_round_trips_and_rejects_trailing_bytes() -> FerrosGrynnResult<()> {
+		let value = CountIndexValue {
+			table_id: 7,
+			atom_count: 42,
+			last_updated_lsn: 11,
+			created_at_lsn: 3,
+		};
+		let mut page = encode_count_index(value, PageLsn::ZERO)?;
+		assert_eq!(decode_count_index(&page)?, value);
+		page.as_bytes_mut()[64] = 1;
+		page.seal()?;
+		assert!(decode_count_index(&page).is_err());
+		Ok(())
+	}
+
+	#[test]
+	fn count_index_wal_stamp_updates_payload_and_checksum() -> FerrosGrynnResult<()> {
+		let mut page = encode_count_index(
+			CountIndexValue {
+				table_id: 7,
+				atom_count: 42,
+				last_updated_lsn: 0,
+				created_at_lsn: 0,
+			},
+			PageLsn::ZERO,
+		)?;
+		stamp_count_index_lsn(&mut page, 19)?;
+		assert_eq!(decode_count_index(&page)?.last_updated_lsn, 19);
+		assert!(stamp_count_index_lsn(&mut page, 0).is_err());
+		Ok(())
+	}
+
+	#[test]
+	fn external_runs_feed_streaming_standard_packer() -> FerrosGrynnResult<()> {
+		let root = std::env::current_dir()
+			.map_err(|source| {
+				FerrosGrynnError::storage_io_failure("resolve external-packer test directory")
+					.with_technical_source(source)
+			})?
+			.join(format!(
+				".ferros-grynn-packer-{}-{}",
+				std::process::id(),
+				NEXT_SORT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+			));
+		fs::create_dir(&root).map_err(|source| {
+			FerrosGrynnError::storage_io_failure("create external-packer test directory")
+				.with_technical_source(source)
+		})?;
+		let result = (|| {
+			let mut sorter = ExternalIndexSorter::with_budget(&root, 160);
+			for slot in (0..4_100_u64).rev() {
+				sorter.push(
+					format!("key-{:04}", slot % 3).into_bytes(),
+					DiskAtomRef::from_parts(AtomKind::Node, slot)?,
+				)?;
+			}
+			let records = sorter.finish()?;
+			let built =
+				build_scalar_index_sorted(&records, ScalarIndexMode::Standard, PageLsn::ZERO)?;
+			let atoms = lookup_scalar_index(
+				|page_no, output| {
+					let page = built
+						.pages
+						.get(page_no.get() as usize)
+						.ok_or_else(|| invalid_index("test streaming page missing"))?;
+					output.as_bytes_mut().copy_from_slice(page.as_bytes());
+					Ok(())
+				},
+				built.root,
+				ScalarIndexMode::Standard,
+				b"key-0001",
+			)?;
+			assert_eq!(atoms.len(), 1_367);
+			assert!(atoms.windows(2).all(|pair| pair[0] < pair[1]));
+			let duplicate_atom = DiskAtomRef::from_parts(AtomKind::Node, 1)?;
+			let mut duplicates = ExternalIndexSorter::with_budget(&root, usize::MAX);
+			duplicates.push(b"duplicate".to_vec(), duplicate_atom)?;
+			duplicates.push(b"duplicate".to_vec(), duplicate_atom)?;
+			assert!(
+				build_scalar_index_sorted(
+					&duplicates.finish()?,
+					ScalarIndexMode::Standard,
+					PageLsn::ZERO,
+				)
+				.is_err()
+			);
+			Ok(())
+		})();
+		drop(fs::remove_dir_all(&root));
+		result
 	}
 }

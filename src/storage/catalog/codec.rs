@@ -423,6 +423,12 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 	for graph in &catalog.graphs {
 		let root_schema = graph.parent_graph_id.is_none();
 		if root_schema {
+			let label_index = graph
+				.label_index
+				.ok_or_else(|| invalid_catalog("root graph is missing its label system index"))?;
+			let adjacency_index = graph.adjacency_index.ok_or_else(|| {
+				invalid_catalog("root graph is missing its adjacency system index")
+			})?;
 			validate_schema_entry(
 				graph.schema_id,
 				graph.schema_version,
@@ -431,25 +437,23 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 				"graph",
 			)?;
 			validate_schema_entry(
-				graph.label_index.schema_id,
-				graph.label_index.schema_version,
+				label_index.index_id.get(),
+				label_index.schema_version,
 				catalog.next_schema_id,
 				&mut schema_ids,
 				"label system index",
 			)?;
 			validate_schema_entry(
-				graph.adjacency_index.schema_id,
-				graph.adjacency_index.schema_version,
+				adjacency_index.index_id.get(),
+				adjacency_index.schema_version,
 				catalog.next_schema_id,
 				&mut schema_ids,
 				"adjacency system index",
 			)?;
 		} else if graph.schema_id != 0
 			|| graph.schema_version != 0
-			|| graph.label_index.schema_id != 0
-			|| graph.label_index.schema_version != 0
-			|| graph.adjacency_index.schema_id != 0
-			|| graph.adjacency_index.schema_version != 0
+			|| graph.label_index.is_some()
+			|| graph.adjacency_index.is_some()
 		{
 			return Err(invalid_catalog(
 				"nested graph address space contains root schema metadata",
@@ -506,7 +510,7 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 			"table",
 		)?;
 		validate_schema_entry(
-			table.primary_index.schema_id,
+			table.primary_index.index_id.get(),
 			table.primary_index.schema_version,
 			catalog.next_schema_id,
 			&mut schema_ids,
@@ -546,7 +550,7 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 		let mut previous_index = None;
 		for index in &table.indexes {
 			validate_schema_entry(
-				index.schema_id,
+				index.index_id.get(),
 				index.schema_version,
 				catalog.next_schema_id,
 				&mut schema_ids,
@@ -556,7 +560,7 @@ pub(super) fn validate_graph_catalog(catalog: &DatabaseCatalog) -> FerrosGrynnRe
 				|| index.name.contains('\0')
 				|| index.name.len() > MAX_SCHEMA_NAME_BYTES
 				|| previous_index.is_some_and(|previous: &str| previous >= index.name.as_str())
-				|| index.fields.is_empty()
+				|| matches!(index.kind, TableIndexKind::Count) != index.fields.is_empty()
 				|| index.fields.len() > MAX_TYPE_MEMBERS
 				|| index.file_id.kind() != Some(DataFileKind::Index)
 				|| index.root == PageNo::NULL
@@ -637,6 +641,13 @@ pub(super) fn validate_file_catalog(catalog: &FileCatalog) -> FerrosGrynnResult<
 	}
 	let mut previous = None;
 	let mut system_catalogs = 0_u8;
+	let mut identities = BTreeMap::new();
+	for file in &catalog.files {
+		if identities.insert((file.graph_id, file.file_id), file).is_some() {
+			return Err(invalid_catalog("file catalog contains a duplicate identity"));
+		}
+	}
+	let mut companion_targets = BTreeSet::new();
 	for file in &catalog.files {
 		let key = (file.graph_id, file.file_id);
 		if previous.is_some_and(|previous| previous >= key) {
@@ -649,11 +660,49 @@ pub(super) fn validate_file_catalog(catalog: &FileCatalog) -> FerrosGrynnResult<
 		if file.file_id == SYSTEM_CATALOG_FILE_ID {
 			if file.graph_id != GraphId::SYSTEM
 				|| file.role != DataFileRole::WalBackfilled
+				|| file.companion_of.is_some()
 				|| file.path.as_str() != SYSTEM_CATALOG_PATH
 			{
 				return Err(invalid_catalog("system catalog registration is not canonical"));
 			}
 			system_catalogs = system_catalogs.saturating_add(1);
+		}
+		let kind = file
+			.file_id
+			.kind()
+			.ok_or_else(|| invalid_catalog("file catalog contains an unknown DataFileKind"))?;
+		if kind == DataFileKind::Freelist {
+			let target_id = file
+				.companion_of
+				.ok_or_else(|| invalid_catalog("freelist registration has no companion target"))?;
+			let target = identities
+				.get(&(file.graph_id, target_id))
+				.ok_or_else(|| invalid_catalog("freelist target is absent from the same graph"))?;
+			let target_kind = target
+				.file_id
+				.kind()
+				.ok_or_else(|| invalid_catalog("freelist target has an unknown DataFileKind"))?;
+			let expected = crate::storage::store::file_layout::freelist_filename(target_kind)
+				.ok_or_else(|| invalid_catalog("freelist targets an unsupported file kind"))?;
+			if file.path.as_str().rsplit_once('/').map(|(parent, _name)| parent)
+				!= target.path.as_str().rsplit_once('/').map(|(parent, _name)| parent)
+				|| file.path.as_str().rsplit('/').next() != Some(expected)
+			{
+				return Err(invalid_catalog(
+					"freelist and target do not share their canonical generation path",
+				));
+			}
+			if !companion_targets.insert((file.graph_id, target_id)) {
+				return Err(invalid_catalog("data file has more than one freelist companion"));
+			}
+		} else if file.companion_of.is_some() {
+			return Err(invalid_catalog("non-freelist registration contains companion_of"));
+		}
+		if kind != DataFileKind::Index
+			&& let Some(filename) = crate::storage::store::file_layout::graph_filename(kind)
+			&& !path_has_suffix(file.path.as_str(), filename)
+		{
+			return Err(invalid_catalog("graph file has a non-canonical filename"));
 		}
 		previous = Some(key);
 		if file.file_id.instance_id() >= catalog.next_file_instance_id {
@@ -663,7 +712,22 @@ pub(super) fn validate_file_catalog(catalog: &FileCatalog) -> FerrosGrynnResult<
 	if system_catalogs != 1 {
 		return Err(invalid_catalog("file catalog must contain exactly one system catalog"));
 	}
+	for file in &catalog.files {
+		let Some(kind) = file.file_id.kind() else {
+			continue;
+		};
+		if crate::storage::store::file_layout::freelist_filename(kind).is_some()
+			&& !companion_targets.contains(&(file.graph_id, file.file_id))
+		{
+			return Err(invalid_catalog("data file is missing its freelist companion"));
+		}
+	}
 	Ok(())
+}
+
+/// Tests a complete canonical path component suffix rather than a byte suffix.
+fn path_has_suffix(path: &str, suffix: &str) -> bool {
+	path == suffix || path.strip_suffix(suffix).is_some_and(|prefix| prefix.ends_with('/'))
 }
 
 /// Maps runtime graph families to stable catalog bytes.
@@ -714,19 +778,21 @@ pub(super) fn decode_table_kind(value: u8) -> FerrosGrynnResult<TableKind> {
 	}
 }
 
-/// Maps scalar-index uniqueness to stable catalog bytes.
+/// Maps table-index kinds to stable catalog bytes.
 pub(super) const fn table_index_kind_byte(kind: TableIndexKind) -> u8 {
 	match kind {
 		TableIndexKind::Standard => 0,
 		TableIndexKind::Unique => 1,
+		TableIndexKind::Count => 2,
 	}
 }
 
-/// Rejects unassigned scalar-index kind bytes.
+/// Rejects unassigned table-index kind bytes.
 pub(super) fn decode_table_index_kind(value: u8) -> FerrosGrynnResult<TableIndexKind> {
 	match value {
 		0 => Ok(TableIndexKind::Standard),
 		1 => Ok(TableIndexKind::Unique),
+		2 => Ok(TableIndexKind::Count),
 		_ => Err(invalid_catalog("table catalog contains an unknown TableIndexKind")),
 	}
 }
@@ -867,8 +933,12 @@ impl<'a> CatalogDecoder<'a> {
 
 	/// Validates one payload version and its reserved bytes.
 	pub(super) fn expect_version(&mut self, expected: u16) -> FerrosGrynnResult<()> {
-		if self.read_u16()? != expected {
-			return Err(invalid_catalog("unsupported catalog payload version"));
+		let actual = self.read_u16()?;
+		if actual != expected {
+			return Err(FerrosGrynnError::unsupported_storage_format(
+				u64::from(actual),
+				u64::from(expected),
+			));
 		}
 		self.expect_zero(size_of::<u16>(), "catalog payload reserved bytes")
 	}

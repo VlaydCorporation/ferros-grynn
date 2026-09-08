@@ -653,7 +653,7 @@ STORAGE_FORMAT_VERSION = 1
   graphs/
     <graph_id:016x>/
       <generation_uuid>/                -- immutable COW-поколение address space
-        graph.fgb
+        superblock.fgb                  -- GraphSuperblock
         nodes_hot.fgb
         edges_hot.fgb
         adjacency_overflow.fgb
@@ -661,13 +661,23 @@ STORAGE_FORMAT_VERSION = 1
         properties.fgb
         subgraphs.fgb
         labels.fgb
-        freelist.fgb
+        freelist_nodes.fgb              -- freelist для nodes_hot.fgb
+        freelist_edges.fgb              -- freelist для edges_hot.fgb
+        freelist_props.fgb              -- freelist для properties.fgb
+        freelist_adj.fgb                -- freelist для adjacency_overflow.fgb
+        freelist_adj_cl.fgb             -- freelist для adj_over_cl.fgb
+        freelist_subgraphs.fgb          -- freelist для subgraphs.fgb
         stats/
           graph_stats.fgb               -- graph counters + degree histograms
           label_stats.fgb               -- per-label cardinality
           prop_stats.fgb                -- per-property histograms
         primary.fgidx                   -- общий unique RecordId → DiskAtomRef
-        scalar_<ordinal:04>.fgidx       -- standard/unique scalar B+tree
+        idx/
+          lbl_node_<id>.fgidx           -- label index (nodes)
+          lbl_edge_<id>.fgidx           -- label index (edges)
+          std_<ordinal:04>.fgidx        -- Standard B+tree
+          uniq_<ordinal:04>.fgidx       -- Unique B+tree
+          cnt_<table_id>.fgidx          -- Count index
 ```
 
 Путь поколения и каждый `DataFileId` публикуются только через каталоги; пользовательские имена
@@ -700,53 +710,55 @@ changefeed и специализированных индексов послед
         functions.fgb                 -- DEFINE FUNCTION bodies
         analyzers.fgb                 -- DEFINE ANALYZER definitions
         params.fgb                    -- DEFINE PARAM values
-      <graph_name>/
+      graphs/<graph_id_hex>/<generation_uuid>/
         superblock.fgb                  -- GraphSuperblock (page 0 этого пространства)
         nodes_hot.fgb                   -- NodeHotPage: flags, kind, gen, label_id, adjacency inline
         edges_hot.fgb                   -- EdgeHotPage: topo, flags, gen, label_id, weight, endpoints inline
-        adj_over.fgb                    -- AdjacencyOverflowPage: для вершин с degree > 16/8
+        adjacency_overflow.fgb          -- AdjacencyOverflowPage: для вершин с degree > 16/8
         adj_over_cl.fgb                 -- CrossLevelAdjacencyOverflowPage
-        props.fgb                       -- PropHeapPage: PropertyMap в slotted-page layout
+        properties.fgb                  -- PropHeapPage: PropertyMap в slotted-page layout
         subgraphs.fgb                   -- SubgraphDirPage: арена подграфов
         labels.fgb                      -- LabelDictionary: node/edge labels + prop keys
         freelist_nodes.fgb              -- FreelistPage для nodes_hot.fgb
         freelist_edges.fgb              -- FreelistPage для edges_hot.fgb
-        freelist_props.fgb              -- FreelistPage для props.fgb
-        freelist_adj.fgb                -- FreelistPage для adj_over.fgb
+        freelist_props.fgb              -- FreelistPage для properties.fgb
+        freelist_adj.fgb                -- FreelistPage для adjacency_overflow.fgb
         freelist_adj_cl.fgb             -- FreelistPage для adj_over_cl.fgb
         freelist_subgraphs.fgb          -- FreelistPage для subgraphs.fgb
+        primary.fgidx                   -- graph-wide primary B+tree (RecordId → DiskAtomRef)
         stats/
           graph_stats.fgb               -- node/edge counts, degree histograms
           label_stats.fgb               -- per-label cardinality
           prop_stats.fgb                -- per-property histograms + selectivity
         idx/
-          pk_<table_id>.fgidx           -- primary B+tree (RecordId → DiskAtomRef)
           lbl_node_<id>.fgidx           -- label index (nodes)
           lbl_edge_<id>.fgidx           -- label index (edges)
-          std_<name>.fgidx              -- standard B+tree property index
-          uniq_<name>.fgidx             -- unique B+tree property index
+          std_<ordinal:04>.fgidx        -- Standard B+tree; identity хранится в catalog
+          uniq_<ordinal:04>.fgidx       -- Unique B+tree; identity хранится в catalog
           cnt_<table_id>.fgidx          -- count index
           ft_<label_id>_<key_id>.fgidx  -- fulltext inverted index
           vec_<label_id>_<key_id>.fgidx -- HNSW vector index
-          geo_<name>.fgidx              -- geometry R-tree index
-          reach_<name>.fgidx            -- reachability index
-          nbh_<name>.fgidx              -- neighbourhood index
+          geo_<ordinal:04>.fgidx        -- geometry R-tree index
+          reach_<ordinal:04>.fgidx      -- reachability index
+          nbh_<ordinal:04>.fgidx        -- neighbourhood index
+          path_<ordinal:04>.fgidx       -- path index
           ee_endpoint.fgidx             -- edge endpoint index
           freelists/
             freelist_pk_<table_id>.fgb
-            freelist_std_<name>.fgb
-            freelist_uniq_<name>.fgb
+            freelist_std_<ordinal:04>.fgb
+            freelist_uniq_<ordinal:04>.fgb
             freelist_ft_<id>.fgb
-            freelist_geo_<name>.fgb
+            freelist_geo_<ordinal:04>.fgb
             freelist_ee_endpoint.fgb
         changefeed/
           <table_id>_<since_lsn>.fcf    -- changefeed log segments
 ```
 
-Соответственно, наличие magic/page layout в §20.3–§20.13 описывает draft-контракт будущего
-side-file, но не включает его в core format v1 и не означает implementation/release status.
-Каждый такой индекс получает собственную версию и отдельный conformance gate; изменение core
-страниц или catalog layout после Windows freeze требует format v2.
+Primary, standard/unique scalar, Label и Count layouts из §§20.1–20.4 входят в реализуемый
+core format v1. Остальные index magic/layout ниже остаются draft-контрактами будущих side-files
+и не означают implementation/release status. Каждый такой advanced index получает собственную
+версию и отдельный conformance gate; изменение core-страниц или catalog layout после Windows
+freeze требует format v2.
 
 ### 7.1. Домен журналирования — база данных, а не граф
 
@@ -777,8 +789,20 @@ snapshot.visible_lsn`. Если бы эти часы выдавались лок
 - `DatabaseCatalog` (`FGDC`, payload version 4): `next_graph_id`,
   `next_schema_id`, database-wide словарь property keys, graph address spaces,
   versioned definitions графов/таблиц/полей/индексов и глобальные параметры;
-- `FileCatalog` (`FGFC`, payload version 3): sealed mapping
-  `(GraphId, DataFileId) → (role, validated relative path)`.
+- `FileCatalog` (`FGFC`, payload version 4): sealed mapping
+  `(GraphId, DataFileId) → (companion_of, role, validated relative path)`.
+
+Каждая запись `FGFC v4` имеет 32-байтовый fixed header: `graph_id: u64` по offset 0,
+`file_id: u64` по offset 8, `companion_of_file_id: u64` по offset 16 (`0` означает отсутствие),
+`path_len: u16` по offset 24, `role: u8` по offset 26 и пять нулевых reserved bytes по offset
+27. После header следуют ровно `path_len` байт канонического UTF-8 relative path. Декодер
+format-v1 принимает только `FGFC v4`; промежуточный `FGFC v3` несовместим и не мигрируется.
+
+`companion_of` обязателен только для `DataFileKind::Freelist`. Target обязан существовать в
+том же `GraphId` и UUID-поколении; один target имеет ровно один freelist. В format-v1 target
+может быть только `NodesHot`, `EdgesHot`, `Properties`, `AdjacencyOverflow`,
+`CrossLevelAdjacencyOverflow` или `Subgraphs`. Для каждого такого файла freelist обязателен.
+`SystemCatalog`, `GraphSuperblock`, statistics и immutable side-files companion не имеют.
 
 Оба payload разбиты на chain страниц `SystemCatalog`. Каждая страница содержит `FGC1`, kind,
 page-codec version 1, `next_page`, `chunk_len`, `total_len` и нулевые reserved/trailing bytes;
@@ -798,7 +822,7 @@ spaces эти поля равны нулю: они не являются отд�
 
 Запись таблицы хранит собственные `schema_id`/`schema_version`, owning `GraphId`, kind,
 versioned поля `(schema_id, schema_version, name, PropertyKeyId, Type)`, engine-owned primary
-index и versioned scalar-index metadata `(schema_id, schema_version, name,
+index и versioned scalar-index metadata `(index_id, schema_version, name,
 standard|unique, ordered PropertyKeyId[], DataFileId, root)`. Индексы внутри таблицы
 отсортированы по имени. Параметр хранит стабильные identity/version, имя и canonical
 `StorageValue` вместе с нужными словарями. `DatabaseSuperblock.graph_count` считает все
@@ -819,6 +843,21 @@ root-записи.
 - `.chk` — Checkpoint header.
 
 ### 7.3. Идентичность physical data-файла (format v1)
+
+Логическая identity индекса и identity его физического поколения разделены:
+
+| Значение        | Назначение                                                                                                                                                 |
+|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `IndexId`       | стабильная логическая identity определения индекса; типизированный `SchemaId` из общего `next_schema_id`                                                   |
+| `SchemaVersion` | версия определения индекса                                                                                                                                 |
+| `DataFileId`    | identity конкретного физического файла одного COW-поколения                                                                                                |
+| `ordinal`       | безопасная generation-local позиция по `IndexId` только для имени файла внутри UUID-поколения; Standard/Unique используют общую плотную последовательность |
+
+`IndexId` занимает прежний durable `u32`, поэтому байты `FGDC v4` не меняются. Физический
+binding при commit/reopen разрешается по `IndexId`, после чего обязательно сверяются name,
+kind, ordered fields и `SchemaVersion`. Пользовательское имя служит отображению и проверке
+уникальности, но никогда не участвует в filesystem path. `DataFileId` может измениться при COW
+rebuild, тогда как `IndexId` сохраняется.
 
 Каждый файл, который может быть адресован из WAL, имеет закрытый `DataFileKind`:
 
@@ -1496,7 +1535,14 @@ kind/generation container-атома. Несовпадение, duplicate slot �
 
 ## 15. FreelistPage — управление свободными страницами
 
-Каждый `.fgb` файл имеет сопутствующий `freelist_*.fgb` для отслеживания свободных страниц.
+Format-v1 создаёт отдельный `FreelistPage` только для шести изменяемых data-файлов:
+`nodes_hot.fgb`, `edges_hot.fgb`, `properties.fgb`, `adjacency_overflow.fgb`,
+`adj_over_cl.fgb` и `subgraphs.fgb`. Их companions соответственно называются
+`freelist_nodes.fgb`, `freelist_edges.fgb`, `freelist_props.fgb`, `freelist_adj.fgb`,
+`freelist_adj_cl.fgb` и `freelist_subgraphs.fgb`; связь хранится явно в `FGFC v4.companion_of`.
+Superblock, labels, statistics и immutable index side-files freelist не имеют. Пока
+incremental page allocation не реализован, каждый из шести freelist-файлов содержит одну
+валидную пустую страницу и не читается обычным index/page hot path.
 
 ### 15.1. Layout
 
@@ -1627,7 +1673,8 @@ Offset  Size  Тип    Поле
 136     8     u64    edge_hot_pages             Страниц в edges_hot.fgb
 144     8     u64    properties_pages           Страниц в props.fgb
 152     8     u64    labels_size_bytes          Размер labels.fgb в байтах
-160     8     u64    flags                      bit0=encrypted, bit1=lz4_props, bit2=read_only
+160     8     u64    flags                      bit0=encrypted, bit1=lz4_props, bit2=read_only,
+                                                 bit3=label_index_stale
 168     8     u64    schema_root_page           Первая страница в schema/catalog.fgb
 176     8     u64    stats_root_page            Первая страница в stats/graph_stats.fgb
 184     128   u8[]   graph_name                 UTF-8 NUL-terminated, max 127 bytes
@@ -1680,7 +1727,7 @@ bounded mutation такого графа завершается явной ош�
 
 `SchemaCatalog` — единственный логический владелец schema definitions и принадлежности атомов
 таблицам. Реализованное ядро format v1 хранит именованные root-графы, таблицы, поля,
-standard/unique indexes, глобальные параметры и engine-owned primary/label/adjacency indexes.
+Standard/Unique indexes, глобальные параметры и engine-owned primary/label/adjacency indexes.
 События, функции, анализаторы, changefeed/live definitions и расширенные index kinds ниже
 остаются зарезервированным расширением соответствующих этапов и не сериализуются writer'ом
 format v1 до реализации их полного контракта.
@@ -1689,7 +1736,7 @@ format v1 до реализации их полного контракта.
 
 Каждый реализованный schema object имеет:
 
-- уникальный `schema_id: u32`, монотонно выделяемый в пределах БД и не
+- уникальную identity, монотонно выделяемую общим clock в пределах БД и не
   переиспользуемый после удаления;
 - ненулевой `version: u32`; семантически изменённое определение сохраняет identity и
   увеличивает version, а новое после удаления получает новый identity;
@@ -1697,7 +1744,9 @@ format v1 до реализации их полного контракта.
 - типизированное определение, которое кодируется явно, а не произвольным Rust derive.
 
 Identity `0` зарезервирован, а `u32::MAX` является `NULL_TABLE` в hot slots; допустимые
-`SchemaId` лежат в `1..u32::MAX`. `next_schema_id: u64` хранит первую ещё не выданную identity
+`SchemaId` и `IndexId` лежат в `1..u32::MAX`. `IndexId` — отдельный публичный newtype для
+индексного контекста, но отдельного clock или второго durable integer не вводит.
+`next_schema_id: u64` хранит первую ещё не выданную identity
 и входит в атомарно публикуемый `DatabaseCatalog`.
 
 ### 18.2. Физическая публикация реализованного ядра
@@ -1712,7 +1761,7 @@ Checksum проверяется до декодирования, общий payl
 | Root graph            | identity/version, graph family, engine-owned label/adjacency identity/version и graph catalog metadata               |
 | Table                 | identity/version, имя, owning `GraphId`, kind и engine-owned primary identity/version                                |
 | Field                 | identity/version, имя, `PropertyKeyId` и `Type`                                                                      |
-| Standard/unique index | identity/version, имя, kind, ordered fields, exact `DataFileId` и root страницы immutable generation                 |
+| Standard/Unique index | `IndexId`/version, имя, раздельный kind, ordered fields, exact `DataFileId` и root immutable generation             |
 | Parameter             | identity/version, имя и canonical `StorageValue` bytes со словарями                                                  |
 | Atom membership       | точный `(GraphId, AtomId(kind, slot, gen)) → Table SchemaId`; в local storage дублируется в соответствующем hot slot |
 
@@ -2000,19 +2049,33 @@ Per-label degree histogram допустим только для node label. В �
 
 ### 20.1. Общий контракт Index
 
-Format-v1 candidate не вводит public trait с одной реализацией. Внутреннее ядро предоставляет
-bulk builder, exact lookup и bounded range scan над standard/unique B+tree. Leaf mode является
-частью metadata и проверяется при каждом чтении.
+Format-v1 не вводит public trait с одной реализацией. Внутреннее ядро предоставляет bulk
+builder, exact lookup и bounded range scan над standard/unique B+tree, immutable per-label
+массивы и одно-страничный Count index. Leaf mode является частью page metadata и проверяется при
+каждом чтении.
 
-Scalar index строится как immutable side-file generation. Graph image и все его scalar indexes
-сначала полностью синхронизируются, затем один catalog/frame-WAL commit делает новые
-`DataFileId` и roots достижимыми. Unique violation прерывает commit до публикации. Пока граф
-содержит scalar indexes, его изменение строит новое COW-поколение целиком; incremental page-WAL
-maintenance добавляется только после измеренного bottleneck indexed writes. Count/fulltext/HNSW/
+Primary, Standard/Unique, Label и Count side-files сначала строятся в новом недостижимом UUID-поколении
+графа и полностью синхронизируются. Затем один catalog/frame-WAL commit делает новые
+`DataFileId` и roots достижимыми. Unique violation прерывает commit до публикации. Count меняется
+в существующем side-file через page frame той же WAL-транзакции. Изменение label membership
+помечает immutable Label generation как `stale`; Standard/Unique index при materialized update пока
+перестраивается вместе с COW-поколением. Incremental scalar/primary page-WAL maintenance и
+измеряемый bulk threshold принадлежат DML-этапу.
+
+Отсутствующий, неоткрываемый или не прошедший checksum secondary index исключается из физического
+registry, но его schema definition сохраняется: access path обязан перейти к корректному
+primary/table scan. Недоступный primary index остаётся фатальным повреждением. Fulltext/HNSW/
 R-tree и остальные специализированные индексы ниже описывают последующие этапы и не маскируют
-своё отсутствие: планировщик использует корректный primary/table scan.
+своё отсутствие.
 
 ### 20.2. B+tree Property Index (standard и unique)
+
+`Standard` и `Unique` остаются разными `TableIndexKind` и разными физическими контрактами:
+Standard leaf хранит posting list, Unique leaf допускает ровно один atom и проверяет нарушение
+уникальности до публикации. Общий внутренний модуль/codec B+tree может называться `scalar`, но
+это не третий kind и не имя durable файла. Файлы называются `std_<ordinal:04>.fgidx` и
+`uniq_<ordinal:04>.fgidx`; ordinal вычисляется по `IndexId` среди Standard/Unique текущего
+поколения. Старые `scalar_*.fgidx` format-v1 не принимает.
 
 #### 20.2.1. Key encoding (order-preserving)
 
@@ -2359,9 +2422,16 @@ O(k) где k — длина ключа. Не предназначен для д
 
 #### 20.2.9. Сжатие страниц индекса
 
-Два независимых механизма: структурное сжатие ключей и блочное сжатие страницы. Они складываются и решают разные задачи.
+Stage-7 core layout хранит полные encoded keys и требует только `FLAG_LEAF` для листьев;
+`FLAG_COMPRESSED` у B+tree pages пока недопустим. Описанные ниже два механизма являются
+кандидатами оптимизации до format-v1 freeze, а не альтернативной интерпретацией уже записанной
+страницы. Их включение требует явного page-layout discriminator, golden vectors и сравнения
+размера/CPU на representative string/composite indexes.
 
-**Префиксное сжатие ключей (первично, применяется по умолчанию).** Ключи в листе отсортированы, поэтому соседние обычно имеют длинный общий префикс — особенно строковые и составные (§20.2.6). В листе хранится общий префикс всех ключей страницы один раз, а каждая запись содержит только суффикс:
+Два рассматриваемых механизма — структурное сжатие ключей и блочное сжатие страницы. Они
+складываются и решают разные задачи.
+
+**Префиксное сжатие ключей (предпочтительный кандидат).** Ключи в листе отсортированы, поэтому соседние обычно имеют длинный общий префикс — особенно строковые и составные (§20.2.6). В листе хранится общий префикс всех ключей страницы один раз, а каждая запись содержит только суффикс:
 
 ```
 [..]        page_prefix_len (u16)
@@ -2371,16 +2441,16 @@ O(k) где k — длина ключа. Не предназначен для д
 
 Это **не** LZ4 и вообще не универсальный компрессор: сжатие структурное и order-preserving, поэтому по сжатой странице по-прежнему работает бинарный поиск **без распаковки** — сравнивается только суффикс. Стоимость на чтении нулевая, выигрыш для строковых ключей часто двукратный.
 
-Существенно: префиксное сжатие дёшево при bulk-сборке (§20.13), где лист формируется целиком и общий префикс известен сразу, и дорого при построчной вставке — вставка в середину сжатого листа может изменить общий префикс и потребовать перекодирования всей страницы. Поэтому оно применяется при сборке и перестроении, а при точечных вставках лист может временно храниться без него до ближайшего уплотнения.
+Существенно: префиксное сжатие дёшево при bulk-сборке (§20.13), где лист формируется целиком и общий префикс известен сразу, и дорого при построчной вставке — вставка в середину сжатого листа может изменить общий префикс и потребовать перекодирования всей страницы. Если кандидат будет принят, естественная точка его применения — сборка и перестроение; stage-7 packer его не записывает.
 
-**Блочное сжатие (вторично, опционально).** Сжатие всей полезной нагрузки страницы целиком, как уже сделано для `PropHeapPage` (§13.3) через `FLAG_COMPRESSED`. Требует распаковки страницы перед любым обращением, поэтому применяется только при выигрыше — порог `FG_PROPS_COMPRESS_THRESHOLD`.
+**Блочное сжатие (вторичный кандидат).** Сжатие всей полезной нагрузки страницы целиком по аналогии с контрактом `PropHeapPage` (§13.3) через `FLAG_COMPRESSED`. Оно требует распаковки страницы перед любым обращением и не включено в текущий B+tree codec.
 
-Алгоритм настраивается **на таблицу** (`block_compressor` в `TableDefinition`), а не глобально: у разных данных разный профиль.
+Если этот вариант будет принят, выбор алгоритма должен быть табличным, а не глобальным: у разных данных разный профиль. Поле `block_compressor` в production `TableDefinition` пока отсутствует.
 
 | Значение             | Когда уместно                                                                             |
 |----------------------|-------------------------------------------------------------------------------------------|
 | `none`               | Данные уже плотные; приоритет — латентность                                               |
-| `lz4` (по умолчанию) | Универсальный компромисс; тот же кодек, что и в `PropHeapPage`                            |
+| `lz4`                | Универсальный компромисс; тот же кодек, что и в `PropHeapPage`                            |
 | `zstd`               | Холодные данные и архивные графы; заметно плотнее LZ4, дороже по CPU                      |
 | `snappy`             | Совместимость с внешними экосистемами                                                     |
 | `fsst`               | Специализированно для коротких строк — сохраняет возможность работы без полной распаковки |
@@ -2405,6 +2475,13 @@ CountIndexPage (единственная страница):
 Обновляется атомарно при каждом INSERT/DELETE в той же транзакции.
 Используется для `SELECT count() FROM @table` + `GROUP ALL` без scan.
 
+`table_id` обязан быть ненулевым, `_pad` и хвост страницы — нулевыми, а файл содержит ровно
+одну page 0. При первоначальной COW-сборке `created_at_lsn = last_updated_lsn = 0`: side-file
+становится видимым только через catalog commit, поэтому предварительно угадывать его LSN нельзя.
+При последующей membership delta WAL writer присваивает `last_updated_lsn` тот же LSN, что и
+page frame, и заново считает checksum до записи frame. Abort оставляет прежний Count видимым.
+Недоступный Count index не используется; точный результат получается обычным table scan.
+
 ### 20.4. Label Index (обязательный, неявный)
 
 Файл: `idx/lbl_node_<label_id>.fgidx` и `idx/lbl_edge_<label_id>.fgidx`.
@@ -2420,17 +2497,18 @@ Offset  Size    Содержимое
 48      16336   [DiskAtomRef(u64)] × count  → (PAGE_SIZE - 48) / 8 = 2042 per page
 ```
 
-Массив отсортирован по slot_index. Binary search + страничная навигация.
+Каждый файл уже выбран точным `(AtomKind, label_id)`, поэтому equality lookup не ищет label
+внутри файла: он последовательно читает плотную цепочку и выдаёт `DiskAtomRef` по возрастанию
+`slot_index`. `next_page` обязан указывать на физически следующую страницу, непоследняя страница
+обязана быть заполнена полностью, цикл/неверный kind/нарушение порядка являются corruption.
 
-**Lookup (equality):** Binary search по pages → O(log n) disk reads.
-
-**Insert**: append к последней странице (слоты монотонно растут для новых атомов);
-для переиспользованных слотов — insertion в sorted позицию.
-
-**Delete**: tombstone-маркер (NULL_SLOT вместо DiskAtomRef) или физическое удаление при compaction (при fragmentation > threshold).
-
-LabelIndex не имеет freelist, только tombstone + ручной compaction.
-При компакции label index нужно создавать новый файл (tmp → rename) без freelist.
+Stage-7 LabelIndex immutable и не имеет freelist или tombstone. Full graph generation строит его
+одним проходом по уже распределённым слотам, без внешней сортировки ключей. Любое добавление,
+удаление или смена label устанавливает `GraphSuperblock.flags.label_index_stale` в той же
+транзакции; пока флаг установлен, query path обязан сканировать hot slots с residual label
+check. Полная COW-пересборка создаёт новое поколение файлов и снимает флаг. Отсутствующий,
+неоткрываемый или повреждённый Label side-file эквивалентен `stale`, но не скрывает повреждение
+primary/base pages.
 
 ### 20.5. Fulltext Index (BM25)
 
@@ -2601,7 +2679,7 @@ format version и задать миграцию. Придумывать page lay
 
 ### 20.7. Geometry R-tree Index
 
-Файл: `idx/geo_<name>.fgidx`.
+Файл: `idx/geo_<ordinal:04>.fgidx`.
 
 Spatial index для `geo::` операторов: `INSIDE`, `INTERSECTS`, `OUTSIDE`, `geo::within`, `geo::distance`.
 
@@ -2643,7 +2721,7 @@ entries: [mbr_lo_lon + mbr_lo_lat + mbr_hi_lon + mbr_hi_lat (f64×4)
 
   ### 20.8. Reachability Index
 
-**Файл:** `idx/reach_<name>.fgidx`
+**Файл:** `idx/reach_<ordinal:04>.fgidx`
 
 Создаётся один файл на один именованный граф.
 Заголовок хранит ссылки на корни B+tree для каждого из видов индекса.
@@ -2705,7 +2783,7 @@ in_bitmap:  u64[ ceil(n_landmarks/64) ]   -- landmark'ы, из которых v 
 
 ### 20.9. Neighbourhood Index
 
-**Файл:** `idx/nbh_<name>.fgidx`
+**Файл:** `idx/nbh_<ordinal:04>.fgidx`
 
 Создаётся один файл на один именованный граф.
 Заголовок хранит ссылки на корни B+tree для каждого из видов индекса.
@@ -2774,7 +2852,7 @@ landmark_refs_page: LandmarkListPage в том же формате, что §20.
 
 ### 20.10. Path Index
 
-**Файл:** `idx/path_<name>.fgidx`
+**Файл:** `idx/path_<ordinal:04>.fgidx`
 
 #### PathIndexHeaderPage (страница 0)
 
@@ -2887,11 +2965,30 @@ LeafEntry (24 байта):
 
 #### 20.13.1. Внешняя сортировка
 
-Ключ сортировки — `encoded_key ‖ DiskAtomRef` (big-endian). Два следствия, оба важны:
-- кодирование ключей order-preserving (§20.2.1), поэтому компаратор — **`memcmp`**, без декодирования и диспетчеризации по типу;
-- добавление `DiskAtomRef` делает порядок **тотальным**, поэтому устойчивая сортировка не нужна, а posting-списки выходят уже упорядоченными по `DiskAtomRef` — ровно так, как требуется §20.5.4 для слияния AND/OR и §20.4 для label-массивов.
+Логический ключ сортировки — `(encoded_key, DiskAtomRef)` (сравнение raw `DiskAtomRef` как
+беззнакового числа эквивалентно сравнению его big-endian bytes). Для scalar B+tree
+`encoded_key` является order-preserving (§20.2.1), поэтому поиск сравнивает байты без
+декодирования. Graph-wide primary сохраняет отдельный canonical `RecordId` codec (§3.5):
+его byte order нужен только как стабильный внутренний порядок exact-lookup B+tree и не
+объявляется семантическим порядком `RecordId`.
 
-Алгоритм: генерация прогонов (заполнить `FG_BULK_SORT_MEM`, отсортировать `sort_unstable`, параллельно по потокам) → спиллинг прогонов в `FG_TEMPFILES_PATH` через собственный слой Direct I/O → k-путёвое слияние (`FG_BULK_SORT_MERGE_FANIN`, по умолчанию 64) деревом проигравших. Выход слияния — итератор, напрямую питающий упаковщик страниц; промежуточная материализация не нужна.
+Добавление `DiskAtomRef` делает sort order **тотальным**, поэтому устойчивая сортировка не нужна,
+а posting-списки выходят уже упорядоченными по `DiskAtomRef` — ровно так, как требуется §20.5.4
+для слияния AND/OR. Label-массивы строятся отдельно из монотонных generation-local slots.
+
+Stage-7 baseline использует фиксированный budget **256 MiB** на один run: заполнить bounded
+`Vec`, отсортировать `sort_unstable`, записать page-aligned run через `DirectFile`, затем выполнить
+k-путёвое слияние с fan-in **64** через стандартный `BinaryHeap`. Scratch принадлежит БД и лежит
+в `tmp/index-sort/<session_uuid>`; RAII удаляет session после успеха/ошибки, startup удаляет хвост
+процесса, завершившегося аварийно. Финальные не более 64 runs дают replayable stream, напрямую
+питающий двухпроходный standard packer или однопроходный unique/primary packer без materialized
+`Vec` всех sorted records.
+
+Имена `FG_BULK_SORT_MEM`, `FG_TEMPFILES_PATH` и `FG_BULK_SORT_MERGE_FANIN` не являются вторым
+скрытым источником конфигурации: до унификации configuration authority (§27) действуют указанные
+фиксированные значения и database-owned path. Loser tree и внутренняя parallel sort добавляются
+только если профиль representative import покажет, что heap/sort, а не I/O или page packing,
+является bottleneck.
 
 Параллелизм имеет смысл прежде всего **по индексам** (загрузка объявляет 5–10 независимых индексов), а не внутри слияния одного.
 
@@ -2907,55 +3004,76 @@ target = floor(usable_leaf_space × FILL_FACTOR)
 
 Ключевое отличие от построчного пути: `inline_count` известен до записи, поэтому запись не приходится переписывать и мигрировать из inline-формы в posting-страницы при пересечении порога в 8 ссылок.
 
-Физическая раскладка файла делает цепочку листьев **непрерывной**, поэтому `next_leaf = page_no + 1`, а полный скан индекса становится одним последовательным чтением:
+Физическая раскладка файла делает цепочку листьев **непрерывной**, поэтому
+`next_leaf = page_no + 1`, а полный скан индекса становится одним последовательным чтением.
+Отдельная метастраница не нужна: exact root хранится в durable catalog entry.
 
 ```
-страница 0        : метастраница
-страницы 1..L     : листья (непрерывно)
-страницы L+1..L+P : posting-страницы
+страницы 0..L-1   : листья (непрерывно)
+страницы L..L+P-1 : posting-страницы standard index
 далее             : внутренние уровни, снизу вверх
-последняя         : корень (фиксируется в метастранице)
+последняя         : корень, если дерево имеет больше одного листа
 ```
 
-Внутренние уровни строятся потоково: при запечатывании потомка в родительский строитель отдаётся разделитель (с усечением, §20.2.2); когда родитель заполняется, он рекурсивно отдаёт свой разделитель выше. Уровень, завершившийся единственной страницей, и есть корень.
+Внутренние уровни строятся снизу вверх из bounded списка `(page_no, min_key)` текущего уровня.
+Stage-7 baseline хранит полный `min_key` как разделитель; допустимое §20.2.2 усечение является
+оптимизацией размера и добавляется только после page-count/lookup профиля. Уровень,
+завершившийся одной страницей, и есть корень; для одно-листового дерева root указывает на leaf 0.
 
 #### 20.13.3. Fill factor
 
-`FG_INDEX_BTREE_FILL_FACTOR` = **0.90** (было 0.80). Плотность здесь защищает не столько от расщеплений, сколько от **физической фрагментации цепочки листьев**: первая вставка в полный лист и расщепляет его, и вытягивает физически случайную страницу из freelist в логически последовательную цепочку — после чего последовательность скана восстанавливается только полной пересборкой.
+Stage-7 immutable generation packer заполняет страницу до её физической capacity: после
+публикации он не выполняет in-place insert/split, поэтому искусственный reserve только увеличил
+бы read amplification. `FG_INDEX_BTREE_FILL_FACTOR` ещё не является production setting.
 
-| Случай                                                                 | Fill factor                                                        |
-|------------------------------------------------------------------------|--------------------------------------------------------------------|
-| По умолчанию                                                           | 0.90                                                               |
-| Монотонно возрастающий ключ (`pk_` над ULID/UUIDv7/int, `DiskAtomRef`) | 1.00 — рост идёт по правому краю, внутренних расщеплений не бывает |
-| Индекс объявлен только для чтения                                      | 1.00                                                               |
-| Заведомо случайные вставки после загрузки                              | 0.75–0.80                                                          |
+При появлении incremental page-WAL maintenance целевое начальное значение — **0.90**. Плотность
+тогда защищает не столько от расщеплений, сколько от **физической фрагментации цепочки листьев**:
+первая вставка в полный лист и расщепляет его, и вытягивает физически случайную страницу из
+freelist в логически последовательную цепочку. Этап DML обязан сравнить point/batch workloads и
+утвердить threshold вместе с единой configuration authority.
 
-Монотонность определяется автоматически: если первый ключ отсортированного потока не меньше текущего максимума индекса (или индекс пуст, а тип ключа `uuid`/`ulid`/`record_id`), fill factor повышается до 1.00.
+До измерений этапа DML сохраняются только кандидаты для сравнения, а не реализованная эвристика:
 
-Отдельно: `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` = 0.95 (внутренних страниц мало, они кэш-резидентны — плотнее упаковать почти бесплатно), `FG_INDEX_RTREE_FILL_FACTOR` = 0.95.
+| Кандидат workload                                      | Проверяемый fill factor |
+|---------------------------------------------------------|-------------------------|
+| Смешанные будущие вставки                               | 0.90                    |
+| Доказанно монотонный append-only или read-only индекс   | 1.00                    |
+| Заведомо случайные вставки после загрузки               | 0.75–0.80               |
+
+Автоопределение монотонности, отдельный internal fill factor и настройка R-tree в stage 7 не
+реализованы. Они становятся contract только после paired benchmark и выбора единой configuration
+authority; до этого immutable B+tree packer всегда использует 1.00.
 
 #### 20.13.4. Протокол side-file: журнал не растёт
 
-Тело bulk-сборки **не журналируется**. Сборка идёт в новый файл, недостижимый из закоммиченного состояния каталога, поэтому крах в процессе не может нарушить консистентность — незавершённый файл просто удаляется.
+Тело bulk-сборки **не журналируется**. Сборка идёт в новое UUID-поколение graph directory,
+недостижимое из закоммиченного состояния каталога, поэтому крах в процессе не может нарушить
+консистентность — незавершённое поколение удаляется startup-GC.
 
 ```
-1. Собрать в idx/.build/<name>.<gen>.fgidx.tmp — последовательная запись
-   мимо BufferPool и мимо WAL. Записей журнала: НОЛЬ.
-2. fsync(tmp), fsync(каталог)
-3. WAL: одна запись в той же транзакции, что и обновление каталога:
-     IndexBuildComplete { index_id, generation, root_page, leaf_count,
-                          key_count, source_visible_lsn, file_checksum }
-     SchemaDef { IndexDefinition: status = ready, file_generation = <gen> }
-4. WAL: fsync
-5. rename(tmp → idx/<name>.<gen>.fgidx), fsync(каталог)
-6. Удалить прежнее поколение, когда на него не осталось ссылок
+1. Создать `graphs/<graph_id>/<generation_uuid>/`; это имя ещё отсутствует в durable catalog.
+2. Последовательно записать base files и side-files напрямую через `DirectFile`; каждый файл
+   завершить `sync_all`. Записей page WAL для тела индекса: **ноль**.
+3. Открыть и зарегистрировать ровно эти trusted paths, но не делать их видимыми читателям.
+4. В одной транзакции записать новые database/file catalog pages и root switch; `TxCommit` +
+   WAL fsync атомарно публикуют schema definition, `DataFileId` и B+tree root.
+5. При abort снять временные registrations; недостижимые bytes удалит startup-GC. Прежнее
+   поколение удерживается активными snapshots и удаляется только после безопасного retirement.
 ```
 
 Порядок величин: сборка индекса на 3 ГБ даёт **~200 байт** журнала вместо десятков гигабайт при построчном пути.
 
-**Нумерация поколений вместо перезаписи** принципиальна для Windows (целевая платформа): открытый читателями файл нельзя удалить, а `MoveFileEx` с заменой оставляет существующие хендлы указывающими на прежний inode. Поколение в имени и указатель в каталоге снимают весь этот класс проблем на обеих платформах.
+**Нумерация поколений вместо перезаписи** принципиальна для Windows (целевая платформа):
+открытый читателями файл нельзя безопасно заменить как единственную identity. UUID directory и
+точный `DataFileId` в каталоге оставляют старые handles на прежнем поколении и снимают этот класс
+проблем на обеих платформах.
 
-Восстановление: незавершённые файлы в `idx/.build/` собираются сборщиком мусора; REDO записи `IndexBuildComplete` идемпотентен (переименовать, если источник есть, а цели нет; иначе — ничего). Если ни временного, ни финального файла нет, индекс помечается `stale` — **никогда** не `ready` молча.
+Восстановлению не нужна отдельная `IndexBuildComplete`: durability boundary уже является
+database-level catalog commit. UUID directories, на которые не ссылается восстановленный
+catalog, удаляются. Если опубликованный secondary side-file отсутствует, не открывается или не
+проходит checksum, он исключается из physical registry и access path деградирует к scan; schema
+definition сохраняется для последующего `stale`/`REBUILD` admin surface. Та же ситуация для
+primary/base file является фатальной corruption.
 
 #### 20.13.5. Стратегия по типам индексов
 
@@ -3354,19 +3472,23 @@ read_page(PageKey, snapshot):
 
 **Основной путь — инкрементальный, без ремапа.** По аналогии с `SlotAllocator` освобождение слота логическое: слот помечается tombstone и возвращается во freelist. Страница, у которой доля tombstone-слотов превысила `FG_COMPACTION_TOMBSTONE_RATIO`, становится кандидатом на реклейминг, но **живые слоты на ней не двигаются** — освобождается лишь дыра внутри уже выделенного файла, через постраничный freelist (§15). Файл физически не ужимается, зато новые вставки переиспользуют освободившиеся страницы вместо роста файла. `DiskAtomRef` при этом не меняется вообще, поэтому операция не требует ни ремапа, ни остановки читателей и выполняется в фоне.
 
-Это распространение на hot-страницы того, что уже описано для label-индекса (§24.1) и кучи свойств (§24.2).
+Для hot-страниц и кучи свойств (§24.2) это означает переиспользование стабильных физических
+слотов. Immutable Label side-files (§24.1) вместо локального reclaim пересобираются поколением.
 
 **Полный дефраг (§24.3) остаётся, но как редкая офлайн-операция** — ровно для второго сценария, когда нужно вернуть место операционной системе. Он требует эксклюзивного доступа и checkpoint'а с обеих сторон: ни один читатель не может удерживать снимок поперёк `slot_remap`.
 
 ### 24.1. Label Index Compaction
 
-**Триггер**: tombstone ratio (fragmentation) > 20% (более 20% записей в label index — tombstone-маркеры).
+Stage-7 Label index immutable и tombstone не содержит, поэтому отдельной in-place compaction у
+него нет. **Триггер пересборки** — `label_index_stale`, отсутствующий/corrupt side-file либо
+явный будущий `REBUILD INDEX`.
 
 ```
-1. Создать tmp файл
-2. Потоково скопировать только живые DiskAtomRef (без tombstone-маркеров)
-3. fsync tmp → rename
-4. WAL: IndexCompact { index_id }
+1. Зафиксировать source snapshot.
+2. Потоково распределить живые hot slots по (AtomKind, label_id).
+3. Записать плотные sorted arrays в новое недостижимое UUID-поколение и fsync файлов.
+4. Одним catalog/WAL commit опубликовать поколение и снять label_index_stale.
+5. Старое поколение удалить после завершения удерживающих его snapshots.
 ```
 
 ### 24.2. PropHeap Compaction
@@ -3619,6 +3741,11 @@ TensorCachePage инвалидируется при любом изменени�
 | `FG_MAX_SNAPSHOT_AGE_SEC`   | u64   | 300        | Возраст снимка, после которого он принудительно закрывается, чтобы разблокировать обрезку журнала |
 
 **Сборка индексов и массовая загрузка** (§20.13)
+
+Таблица ниже задаёт целевой runtime-configuration contract. В stage-7 baseline
+`FG_BULK_SORT_MEM` и `FG_BULK_SORT_MERGE_FANIN` ещё не читаются из окружения:
+действуют фиксированные значения 256 МиБ и 64 из §20.13.1;
+`FG_BULK_SORT_PARALLELISM` и fill-factor tuning ещё не подключены.
 
 | Параметр                              | Тип   | Default   | Описание                                                                       |
 |---------------------------------------|-------|-----------|--------------------------------------------------------------------------------|

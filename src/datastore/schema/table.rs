@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::{SchemaId, SchemaVersion, SystemIndex, TableField, TableIndex};
+use super::{SchemaId, SchemaVersion, SystemIndex, TableField, TableIndex, TableIndexKind};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::{
@@ -25,7 +25,7 @@ pub struct TableSchema {
 	pub(crate) graph: GraphRef,
 	pub(crate) kind: TableKind,
 	pub(crate) fields: Vec<TableField>,
-	/// Scalar indexes in declaration order.
+	/// User-declared indexes in declaration order.
 	pub(crate) indexes: Vec<TableIndex>,
 	pub(crate) primary_index: Option<SystemIndex>,
 	pub(crate) published_at: u64,
@@ -83,12 +83,12 @@ impl TableSchema {
 		self.version
 	}
 
-	/// Adds one validated scalar B+tree definition.
+	/// Adds one validated table-index definition.
 	///
 	/// # Errors
 	///
-	/// Returns an invalid-argument error when the name is duplicated, a field
-	/// is absent, or its value type has no stable format-v1 scalar order.
+	/// Returns an invalid-argument error when the name is duplicated, a scalar
+	/// field is absent, or its value type has no stable format-v1 order.
 	pub fn with_index(mut self, index: TableIndex) -> FerrosGrynnResult<Self> {
 		if self.indexes.iter().any(|existing| existing.name == index.name) {
 			return Err(FerrosGrynnError::invalid_argument(format!(
@@ -104,6 +104,14 @@ impl TableSchema {
 				))
 			})?;
 			validate_index_type(&field.value_type)?;
+		}
+		if index.kind == TableIndexKind::Count
+			&& self.indexes.iter().any(|existing| existing.kind == TableIndexKind::Count)
+		{
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"table '{}' already contains its table-wide Count index",
+				self.name
+			)));
 		}
 		self.indexes.push(index);
 		Ok(self)
@@ -125,7 +133,7 @@ impl TableSchema {
 		self.fields.iter()
 	}
 
-	/// Returns scalar indexes in definition order.
+	/// Returns table indexes in definition order.
 	pub fn indexes(&self) -> impl ExactSizeIterator<Item = &TableIndex> {
 		self.indexes.iter()
 	}

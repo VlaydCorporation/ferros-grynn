@@ -13,7 +13,7 @@ use super::{
 	types::{DataFileId, DataFileKind, GraphId, Lsn},
 };
 use crate::{
-	datastore::{TableIndexKind, TableKind},
+	datastore::{IndexId, TableIndexKind, TableKind},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{
 		Type,
@@ -90,7 +90,7 @@ const FILE_CATALOG_MAGIC: [u8; 4] = *b"FGFC";
 /// Database-catalog payload codec version.
 const DATABASE_CATALOG_PAYLOAD_VERSION: u16 = 4;
 /// Physical-file catalog payload codec version.
-const FILE_CATALOG_PAYLOAD_VERSION: u16 = 3;
+const FILE_CATALOG_PAYLOAD_VERSION: u16 = 4;
 /// Maximum persisted graph name in UTF-8 bytes.
 const MAX_GRAPH_NAME_BYTES: usize = 128;
 /// Maximum canonical `RecordId` text retained for a graph identity.
@@ -165,14 +165,14 @@ mod tests {
 				graph_id: GraphId::new(1),
 				schema_id: 1,
 				schema_version: 1,
-				label_index: SystemIndexCatalogEntry {
-					schema_id: 2,
+				label_index: Some(SystemIndexCatalogEntry {
+					index_id: IndexId::from_storage(2)?,
 					schema_version: 1,
-				},
-				adjacency_index: SystemIndexCatalogEntry {
-					schema_id: 3,
+				}),
+				adjacency_index: Some(SystemIndexCatalogEntry {
+					index_id: IndexId::from_storage(3)?,
 					schema_version: 1,
-				},
+				}),
 				parent_graph_id: None,
 				subgraph_slot: None,
 				parent_atom: None,
@@ -215,7 +215,7 @@ mod tests {
 				],
 				indexes: Vec::new(),
 				primary_index: SystemIndexCatalogEntry {
-					schema_id: 5,
+					index_id: IndexId::from_storage(5)?,
 					schema_version: 1,
 				},
 			}],
@@ -251,6 +251,165 @@ mod tests {
 			CatalogPath::parse(SYSTEM_CATALOG_PATH).ok().map(|path| path.as_str().to_owned()),
 			Some(SYSTEM_CATALOG_PATH.to_owned())
 		);
+	}
+
+	#[test]
+	fn file_catalog_v4_has_canonical_fixed_header_and_rejects_v3() -> FerrosGrynnResult<()> {
+		let catalog = FileCatalog::bootstrap()?;
+		let bytes = catalog.encode()?;
+		let mut expected = vec![
+			b'F', b'G', b'F', b'C', 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+		];
+		expected.extend_from_slice(&0_u64.to_le_bytes());
+		expected.extend_from_slice(&1_u64.to_le_bytes());
+		expected.extend_from_slice(&0_u64.to_le_bytes());
+		expected.extend_from_slice(&18_u16.to_le_bytes());
+		expected.push(role_byte(DataFileRole::WalBackfilled));
+		expected.extend_from_slice(&[0; 5]);
+		expected.extend_from_slice(SYSTEM_CATALOG_PATH.as_bytes());
+		assert_eq!(bytes, expected);
+		assert_eq!(FileCatalog::decode(&bytes)?, catalog);
+
+		let mut version_three = bytes.clone();
+		version_three[4..6].copy_from_slice(&3_u16.to_le_bytes());
+		assert_eq!(
+			FileCatalog::decode(&version_three)
+				.err()
+				.map(|error| error.status().code().to_string()),
+			Some("FG-51S01".to_owned())
+		);
+		assert!(FileCatalog::decode(&bytes[..bytes.len() - 1]).is_err());
+		let mut reserved = bytes;
+		reserved[51] = 1;
+		assert!(FileCatalog::decode(&reserved).is_err());
+		let mut invalid_companion = expected;
+		invalid_companion[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+		assert!(FileCatalog::decode(&invalid_companion).is_err());
+		Ok(())
+	}
+
+	#[test]
+	fn file_catalog_v4_validates_one_to_one_freelist_bindings() -> FerrosGrynnResult<()> {
+		let valid = valid_file_catalog()?;
+		let bytes = valid.encode()?;
+		assert_eq!(FileCatalog::decode(&bytes)?, valid);
+
+		let mut missing_target = valid.clone();
+		let freelist = missing_target
+			.files
+			.iter_mut()
+			.find(|file| file.file_id.kind() == Some(DataFileKind::Freelist))
+			.ok_or_else(|| invalid_catalog("test freelist is absent"))?;
+		freelist.companion_of = Some(test_file_id(63, DataFileKind::NodesHot)?);
+		assert!(missing_target.encode().is_err());
+
+		let mut other_graph = valid.clone();
+		let freelist = other_graph
+			.files
+			.iter_mut()
+			.find(|file| file.file_id.kind() == Some(DataFileKind::Freelist))
+			.ok_or_else(|| invalid_catalog("test freelist is absent"))?;
+		freelist.graph_id = GraphId::new(2);
+		other_graph.files.sort_unstable_by_key(|file| (file.graph_id, file.file_id));
+		assert!(other_graph.encode().is_err());
+
+		let mut duplicate = valid.clone();
+		let mut repeated = duplicate
+			.files
+			.iter()
+			.find(|file| file.file_id.kind() == Some(DataFileKind::Freelist))
+			.cloned()
+			.ok_or_else(|| invalid_catalog("test freelist is absent"))?;
+		repeated.file_id = test_file_id(63, DataFileKind::Freelist)?;
+		duplicate.files.push(repeated);
+		duplicate.files.sort_unstable_by_key(|file| (file.graph_id, file.file_id));
+		duplicate.next_file_instance_id = 64;
+		assert!(duplicate.encode().is_err());
+
+		let mut wrong_name = valid.clone();
+		let freelist = wrong_name
+			.files
+			.iter_mut()
+			.find(|file| file.file_id.kind() == Some(DataFileKind::Freelist))
+			.ok_or_else(|| invalid_catalog("test freelist is absent"))?;
+		freelist.path = CatalogPath::parse("graphs/0000000000000001/generation/freelist.fgb")?;
+		assert!(wrong_name.encode().is_err());
+
+		let mut wrong_generation = valid.clone();
+		let freelist = wrong_generation
+			.files
+			.iter_mut()
+			.find(|file| file.file_id.kind() == Some(DataFileKind::Freelist))
+			.ok_or_else(|| invalid_catalog("test freelist is absent"))?;
+		freelist.path =
+			CatalogPath::parse("graphs/0000000000000001/other-generation/freelist_nodes.fgb")?;
+		assert!(wrong_generation.encode().is_err());
+
+		let mut non_freelist_companion = valid.clone();
+		let target = non_freelist_companion
+			.files
+			.iter_mut()
+			.find(|file| file.file_id.kind() == Some(DataFileKind::NodesHot))
+			.ok_or_else(|| invalid_catalog("test target is absent"))?;
+		target.companion_of = Some(target.file_id);
+		assert!(non_freelist_companion.encode().is_err());
+
+		let mut empty_binding = valid.clone();
+		let freelist = empty_binding
+			.files
+			.iter_mut()
+			.find(|file| file.file_id.kind() == Some(DataFileKind::Freelist))
+			.ok_or_else(|| invalid_catalog("test freelist is absent"))?;
+		freelist.companion_of = None;
+		assert!(empty_binding.encode().is_err());
+
+		let mut missing_companion = valid;
+		let position = missing_companion
+			.files
+			.iter()
+			.position(|file| file.file_id.kind() == Some(DataFileKind::Freelist))
+			.ok_or_else(|| invalid_catalog("test freelist is absent"))?;
+		missing_companion.files.remove(position);
+		assert!(missing_companion.encode().is_err());
+		Ok(())
+	}
+
+	fn valid_file_catalog() -> FerrosGrynnResult<FileCatalog> {
+		let graph_id = GraphId::new(1);
+		let generation = "graphs/0000000000000001/generation";
+		let mut files = FileCatalog::bootstrap()?.files;
+		let mut instance = 1;
+		for (target_kind, freelist_name) in crate::storage::store::file_layout::FREELIST_FILES {
+			let target_id = test_file_id(instance, target_kind)?;
+			instance += 1;
+			let filename = crate::storage::store::file_layout::graph_filename(target_kind)
+				.ok_or_else(|| invalid_catalog("test target filename is absent"))?;
+			files.push(FileCatalogEntry {
+				graph_id,
+				file_id: target_id,
+				companion_of: None,
+				role: DataFileRole::WalBackfilled,
+				path: CatalogPath::parse(&format!("{generation}/{filename}"))?,
+			});
+			files.push(FileCatalogEntry {
+				graph_id,
+				file_id: test_file_id(instance, DataFileKind::Freelist)?,
+				companion_of: Some(target_id),
+				role: DataFileRole::WalBackfilled,
+				path: CatalogPath::parse(&format!("{generation}/{freelist_name}"))?,
+			});
+			instance += 1;
+		}
+		files.sort_unstable_by_key(|file| (file.graph_id, file.file_id));
+		Ok(FileCatalog {
+			next_file_instance_id: instance,
+			files,
+		})
+	}
+
+	fn test_file_id(instance: u64, kind: DataFileKind) -> FerrosGrynnResult<DataFileId> {
+		DataFileId::new(instance, kind)
+			.ok_or_else(|| invalid_catalog("test file identity exceeds the format domain"))
 	}
 
 	/// Decode validates reserved bytes after checksum validation.
@@ -347,29 +506,21 @@ mod tests {
 			} else {
 				1
 			},
-			label_index: SystemIndexCatalogEntry {
-				schema_id: if parent_graph_id.is_some() {
-					0
-				} else {
-					2
-				},
-				schema_version: if parent_graph_id.is_some() {
-					0
-				} else {
-					1
-				},
+			label_index: if parent_graph_id.is_some() {
+				None
+			} else {
+				Some(SystemIndexCatalogEntry {
+					index_id: IndexId::from_storage(2)?,
+					schema_version: 1,
+				})
 			},
-			adjacency_index: SystemIndexCatalogEntry {
-				schema_id: if parent_graph_id.is_some() {
-					0
-				} else {
-					3
-				},
-				schema_version: if parent_graph_id.is_some() {
-					0
-				} else {
-					1
-				},
+			adjacency_index: if parent_graph_id.is_some() {
+				None
+			} else {
+				Some(SystemIndexCatalogEntry {
+					index_id: IndexId::from_storage(3)?,
+					schema_version: 1,
+				})
 			},
 			parent_graph_id: parent_graph_id.map(GraphId::new),
 			subgraph_slot,

@@ -137,11 +137,11 @@ impl StoreInner {
 					id: schema.id().get(),
 					version: schema.version().get(),
 					label_index: LocalCommitSystemIndex {
-						id: label.id().get(),
+						id: label.id(),
 						version: label.version().get(),
 					},
 					adjacency_index: LocalCommitSystemIndex {
-						id: adjacency.id().get(),
+						id: adjacency.id(),
 						version: adjacency.version().get(),
 					},
 				},
@@ -232,14 +232,11 @@ impl StoreInner {
 								})
 								.collect::<FerrosGrynnResult<Vec<_>>>()?;
 							Ok(LocalCommitTableIndex {
-								id: index
-									.id
-									.ok_or_else(|| {
-										FerrosGrynnError::invalid_storage_file(
-											"published table index has no schema identity",
-										)
-									})?
-									.get(),
+								id: index.id.ok_or_else(|| {
+									FerrosGrynnError::invalid_storage_file(
+										"published table index has no schema identity",
+									)
+								})?,
 								version: index.version.get(),
 								name: index.name.as_str().to_owned(),
 								kind: index.kind,
@@ -248,7 +245,7 @@ impl StoreInner {
 						})
 						.collect::<FerrosGrynnResult<Vec<_>>>()?,
 					primary_index: LocalCommitSystemIndex {
-						id: primary.id().get(),
+						id: primary.id(),
 						version: primary.version().get(),
 					},
 				})

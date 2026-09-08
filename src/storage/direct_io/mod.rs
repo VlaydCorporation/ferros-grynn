@@ -243,12 +243,12 @@ impl DirectFile {
 		Ok(())
 	}
 
-	/// Writes unchecked aligned bytes for deterministic torn-page tests.
+	/// Writes unchecked aligned bytes for private scratch files and
+	/// deterministic torn-page tests.
 	///
 	/// # Errors
 	///
 	/// Returns an error for an offset gap, short I/O, or native failure.
-	#[cfg(test)]
 	pub(super) fn write_page_raw(
 		&self,
 		page_no: PageNo,

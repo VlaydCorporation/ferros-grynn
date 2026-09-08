@@ -18,13 +18,15 @@ pub(super) struct BuiltGraphImage {
 	pub(super) catalog_entry: GraphCatalogEntry,
 	pub(super) superblock: GraphSuperblock,
 	pub(super) payloads: BTreeMap<DataFileKind, Vec<AlignedPage>>,
-	pub(super) indexes: Vec<BuiltScalarIndexImage>,
+	pub(super) indexes: Vec<BuiltTableIndexImage>,
+	pub(super) label_indexes: Vec<BuiltLabelIndexImage>,
 }
 
 pub(super) struct BuiltGraphDelta {
 	pub(super) catalog_entry: GraphCatalogEntry,
 	pub(super) superblock: GraphSuperblock,
 	pub(super) payloads: BTreeMap<DataFileKind, Vec<(PageNo, Box<AlignedPage>)>>,
+	pub(super) index_payloads: Vec<(DataFileId, Box<AlignedPage>)>,
 	pub(super) removed_subgraph_slots: Vec<u32>,
 }
 
@@ -49,14 +51,22 @@ pub(super) struct PlannedChild {
 	pub(super) graph: Box<PlannedGraph>,
 }
 
-pub(super) struct BuiltScalarIndexImage {
+pub(super) struct BuiltTableIndexImage {
 	pub(super) table: String,
+	pub(super) table_id: u32,
 	pub(super) name: String,
-	pub(super) schema_id: u32,
+	pub(super) index_id: IndexId,
 	pub(super) schema_version: u32,
 	pub(super) kind: TableIndexKind,
 	pub(super) fields: Vec<u32>,
 	pub(super) root: PageNo,
+	pub(super) pages: Vec<AlignedPage>,
+}
+
+/// One immutable per-label side-file generation.
+pub(super) struct BuiltLabelIndexImage {
+	pub(super) kind: AtomKind,
+	pub(super) label_id: u32,
 	pub(super) pages: Vec<AlignedPage>,
 }
 
@@ -214,14 +224,15 @@ pub(super) fn graph_tree_ids(database: &DatabaseCatalog, root: GraphId) -> BTree
 }
 
 pub(super) fn build_graph_images(
+	root: &Path,
 	plan: &PlannedGraph,
 	dictionary: &mut PropertyDictionary,
 	tables: &[LocalCommitTable],
 	memberships: &[LocalCommitTableMembership],
 ) -> FerrosGrynnResult<Vec<BuiltGraphImage>> {
-	let mut images = vec![build_graph_image(plan, dictionary, tables, memberships)?];
+	let mut images = vec![build_graph_image(root, plan, dictionary, tables, memberships)?];
 	for child in &plan.children {
-		images.extend(build_graph_images(&child.graph, dictionary, tables, &[])?);
+		images.extend(build_graph_images(root, &child.graph, dictionary, tables, &[])?);
 	}
 	Ok(images)
 }
@@ -248,18 +259,18 @@ pub(super) fn encode_tables(
 			})?;
 		let mut indexes = Vec::with_capacity(table.indexes.len());
 		for definition in &table.indexes {
-			let candidate = new_indexes
+			let (owner, candidate) = new_indexes
 				.iter()
-				.find(|candidate| {
-					candidate.table == table.name && candidate.index.name == definition.name
-				})
-				.map(|candidate| &candidate.index)
+				.find(|candidate| candidate.index.index_id == definition.id)
+				.map(|candidate| (candidate.table.as_str(), &candidate.index))
 				.or_else(|| {
-					previous.tables.iter().find(|existing| existing.name == table.name).and_then(
-						|existing| {
-							existing.indexes.iter().find(|index| index.name == definition.name)
-						},
-					)
+					previous.tables.iter().find_map(|existing| {
+						existing
+							.indexes
+							.iter()
+							.find(|index| index.index_id == definition.id)
+							.map(|index| (existing.name.as_str(), index))
+					})
 				})
 				.ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(format!(
@@ -267,7 +278,12 @@ pub(super) fn encode_tables(
 						table.name, definition.name
 					))
 				})?;
-			if candidate.kind != definition.kind || candidate.fields != definition.fields {
+			if owner != table.name
+				|| candidate.name != definition.name
+				|| candidate.kind != definition.kind
+				|| candidate.fields != definition.fields
+				|| candidate.schema_version != definition.version
+			{
 				return Err(FerrosGrynnError::invalid_storage_file(format!(
 					"scalar index '{}.{}' physical definition is stale",
 					table.name, definition.name
@@ -293,25 +309,9 @@ pub(super) fn encode_tables(
 					property_key: field.property_key,
 				})
 				.collect(),
-			indexes: indexes
-				.into_iter()
-				.map(|mut index| {
-					let definition = table
-						.indexes
-						.iter()
-						.find(|definition| definition.name == index.name)
-						.ok_or_else(|| {
-							FerrosGrynnError::invalid_storage_file(
-								"physical scalar index has no schema definition",
-							)
-						})?;
-					index.schema_id = definition.id;
-					index.schema_version = definition.version;
-					Ok(index)
-				})
-				.collect::<FerrosGrynnResult<Vec<_>>>()?,
+			indexes,
 			primary_index: SystemIndexCatalogEntry {
-				schema_id: table.primary_index.id,
+				index_id: table.primary_index.id,
 				schema_version: table.primary_index.version,
 			},
 		});
@@ -397,7 +397,7 @@ pub(super) fn load_database(
 		graphs.push(LocalSnapshotGraph {
 			record_id: record_id.clone(),
 			name: entry.name.clone(),
-			schema: local_graph_schema(entry),
+			schema: local_graph_schema(entry)?,
 			memberships: load_memberships(manager, transaction, &graph)?,
 			statistics: graph.statistics_summary().clone(),
 			graph,
@@ -434,7 +434,7 @@ pub(super) fn load_database(
 				.indexes
 				.iter()
 				.map(|index| LocalCommitTableIndex {
-					id: index.schema_id,
+					id: index.index_id,
 					version: index.schema_version,
 					name: index.name.clone(),
 					kind: index.kind,
@@ -442,7 +442,7 @@ pub(super) fn load_database(
 				})
 				.collect(),
 			primary_index: LocalCommitSystemIndex {
-				id: table.primary_index.schema_id,
+				id: table.primary_index.index_id,
 				version: table.primary_index.schema_version,
 			},
 		});
@@ -493,7 +493,7 @@ pub(super) fn load_changed_graphs(
 		graphs.push(LocalSnapshotGraph {
 			record_id: record_id.clone(),
 			name: entry.name.clone(),
-			schema: local_graph_schema(entry),
+			schema: local_graph_schema(entry)?,
 			memberships: load_memberships(manager, transaction, &graph)?,
 			statistics: graph.statistics_summary().clone(),
 			graph,
@@ -502,19 +502,25 @@ pub(super) fn load_changed_graphs(
 	Ok(graphs)
 }
 
-fn local_graph_schema(entry: &GraphCatalogEntry) -> LocalCommitGraphSchema {
-	LocalCommitGraphSchema {
+fn local_graph_schema(entry: &GraphCatalogEntry) -> FerrosGrynnResult<LocalCommitGraphSchema> {
+	let label_index = entry.label_index.ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("root graph label index is absent")
+	})?;
+	let adjacency_index = entry.adjacency_index.ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("root graph adjacency index is absent")
+	})?;
+	Ok(LocalCommitGraphSchema {
 		id: entry.schema_id,
 		version: entry.schema_version,
 		label_index: LocalCommitSystemIndex {
-			id: entry.label_index.schema_id,
-			version: entry.label_index.schema_version,
+			id: label_index.index_id,
+			version: label_index.schema_version,
 		},
 		adjacency_index: LocalCommitSystemIndex {
-			id: entry.adjacency_index.schema_id,
-			version: entry.adjacency_index.schema_version,
+			id: adjacency_index.index_id,
+			version: adjacency_index.schema_version,
 		},
-	}
+	})
 }
 
 fn load_memberships(
@@ -625,10 +631,11 @@ pub(super) fn open_local_graph(
 	}
 	let paths = graph_file_paths(root, entry, files)?;
 	let file_ids = graph_file_ids(entry, files)?;
+	validate_registered_freelists(manager, transaction, entry.graph_id, files)?;
 	paths.get(&DataFileKind::GraphSuperblock).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file("graph superblock file is missing")
 	})?;
-	let superblock = superblocks
+	let mut superblock = superblocks
 		.and_then(|superblocks| superblocks.get(&entry.graph_id).cloned())
 		.map_or_else(|| manager.graph_superblock(entry.graph_id), Ok)?;
 	if superblock.graph_id != entry.graph_id
@@ -700,17 +707,78 @@ pub(super) fn open_local_graph(
 		));
 	}
 	let mut scalar_indexes = BTreeMap::<String, Vec<LocalScalarIndex>>::new();
+	let mut count_indexes = BTreeMap::new();
+	let has_declared_scalar_indexes = tables
+		.iter()
+		.filter(|table| table.graph_id == entry.graph_id)
+		.flat_map(|table| &table.indexes)
+		.any(|index| index.kind != TableIndexKind::Count);
+	let mut ordered_scalar_ids = tables
+		.iter()
+		.filter(|table| table.graph_id == entry.graph_id)
+		.flat_map(|table| &table.indexes)
+		.filter(|index| index.kind != TableIndexKind::Count)
+		.map(|index| index.index_id)
+		.collect::<Vec<_>>();
+	ordered_scalar_ids.sort_unstable();
+	let scalar_ordinals = ordered_scalar_ids
+		.into_iter()
+		.enumerate()
+		.map(|(ordinal, index_id)| (index_id, ordinal))
+		.collect::<BTreeMap<_, _>>();
 	for table in tables.iter().filter(|table| table.graph_id == entry.graph_id) {
 		for index in &table.indexes {
-			if !files
+			let file = files
 				.files
 				.iter()
-				.any(|file| file.graph_id == entry.graph_id && file.file_id == index.file_id)
-			{
+				.find(|file| file.graph_id == entry.graph_id && file.file_id == index.file_id)
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(format!(
+						"scalar index '{}.{}' references an unregistered file",
+						table.name, index.name
+					))
+				})?;
+			let ordinal = if index.kind == TableIndexKind::Count {
+				0
+			} else {
+				scalar_ordinals.get(&index.index_id).copied().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"scalar index has no generation-local ordinal",
+					)
+				})?
+			};
+			if !file_layout::table_index_path_is_canonical(
+				file.path.as_str(),
+				index.kind,
+				ordinal,
+				table.schema_id,
+			) {
 				return Err(FerrosGrynnError::invalid_storage_file(format!(
-					"scalar index '{}.{}' references an unregistered file",
+					"scalar index '{}.{}' has a non-canonical filename",
 					table.name, index.name
 				)));
+			}
+			if !manager.has_file(entry.graph_id, index.file_id) {
+				continue;
+			}
+			if index.kind == TableIndexKind::Count {
+				if index.root != PageNo::new(0)
+					|| !index.fields.is_empty()
+					|| manager.visible_file_page_count(
+						transaction,
+						entry.graph_id,
+						index.file_id,
+					)? != 1 || count_indexes
+					.insert(table.schema_id, LocalCountIndex {
+						file_id: index.file_id,
+					})
+					.is_some()
+				{
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"table contains an invalid or duplicate Count index",
+					));
+				}
+				continue;
 			}
 			let fields = index
 				.fields
@@ -738,6 +806,33 @@ pub(super) fn open_local_graph(
 			});
 		}
 	}
+	let mut label_indexes = BTreeMap::new();
+	for file in files.files.iter().filter(|file| {
+		file.graph_id == entry.graph_id && file.file_id.kind() == Some(DataFileKind::Index)
+	}) {
+		if !manager.has_file(entry.graph_id, file.file_id) {
+			continue;
+		}
+		let Some(identity) = label_index_identity(file.path.as_str())? else {
+			continue;
+		};
+		let label_count = match identity.0 {
+			AtomKind::Node => labels.node_labels.len(),
+			AtomKind::Edge => labels.edge_labels.len(),
+		};
+		if usize::try_from(identity.1).ok().is_none_or(|id| id >= label_count)
+			|| label_indexes.insert(identity, file.file_id).is_some()
+		{
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"label index identity is out of range or duplicated",
+			));
+		}
+	}
+	if !superblock.flags.contains(GraphSuperblockFlags::LABEL_INDEX_STALE)
+		&& label_indexes.len() != labels.node_labels.len() + labels.edge_labels.len()
+	{
+		superblock.flags.insert(GraphSuperblockFlags::LABEL_INDEX_STALE);
+	}
 	let graph = LocalGraph {
 		graph_id: entry.graph_id,
 		subgraph_slot: entry.subgraph_slot,
@@ -756,10 +851,73 @@ pub(super) fn open_local_graph(
 		property_dictionary,
 		decode_context: Mutex::new(None),
 		scalar_indexes,
+		has_declared_scalar_indexes,
+		count_indexes,
+		label_indexes,
 		children,
 	};
 	validate_local_subgraphs(manager, transaction, &graph)?;
 	Ok(graph)
+}
+
+/// Validates the six empty freelist roots through the snapshot-aware reader.
+fn validate_registered_freelists(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	graph_id: GraphId,
+	files: &FileCatalog,
+) -> FerrosGrynnResult<()> {
+	let freelists = files.files.iter().filter(|entry| {
+		entry.graph_id == graph_id && entry.file_id.kind() == Some(DataFileKind::Freelist)
+	});
+	let mut count = 0;
+	for entry in freelists {
+		if manager.visible_file_page_count(transaction, graph_id, entry.file_id)? != 1 {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"freelist file must contain exactly one page",
+			));
+		}
+		let page = manager.read_page(
+			transaction,
+			crate::storage::types::PageKey::new(graph_id, entry.file_id, PageNo::new(0)),
+		)?;
+		let (_first, next, bitmap) = decode_freelist(page.as_page(), PageNo::new(0))?;
+		if next.is_some() || bitmap.iter().any(|byte| *byte != 0) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"immutable generation freelist is not empty",
+			));
+		}
+		count += 1;
+	}
+	if count != file_layout::FREELIST_FILES.len() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"graph generation does not contain six freelist files",
+		));
+	}
+	Ok(())
+}
+
+/// Parses only canonical format-v1 per-label filenames.
+fn label_index_identity(path: &str) -> FerrosGrynnResult<Option<(AtomKind, u32)>> {
+	let Some(name) = path.rsplit('/').next() else {
+		return Ok(None);
+	};
+	let (kind, raw) = if let Some(raw) = name.strip_prefix("lbl_node_") {
+		(AtomKind::Node, raw)
+	} else if let Some(raw) = name.strip_prefix("lbl_edge_") {
+		(AtomKind::Edge, raw)
+	} else {
+		return Ok(None);
+	};
+	let raw = raw.strip_suffix(".fgidx").ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("label index filename has no .fgidx suffix")
+	})?;
+	let label_id = raw.parse::<u32>().map_err(|source| {
+		FerrosGrynnError::invalid_storage_file(format!(
+			"label index filename contains an invalid label id: {source}"
+		))
+	})?;
+	Ok(Some((kind, label_id)))
 }
 
 pub(super) fn validate_local_subgraphs(
@@ -863,8 +1021,22 @@ pub(super) fn graph_file_ids(
 		let kind = entry.file_id.kind().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("graph file has an unknown kind")
 		})?;
-		if kind == DataFileKind::Index && entry.file_id != graph.primary_index_file_id {
+		if kind == DataFileKind::Freelist {
 			continue;
+		}
+		if kind == DataFileKind::Index {
+			if entry.file_id != graph.primary_index_file_id {
+				continue;
+			}
+			let primary_filename =
+				file_layout::graph_filename(DataFileKind::Index).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("primary index filename is undefined")
+				})?;
+			if entry.path.as_str().rsplit('/').next() != Some(primary_filename) {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"primary index has a non-canonical filename",
+				));
+			}
 		}
 		if ids.insert(kind, entry.file_id).is_some() {
 			return Err(FerrosGrynnError::invalid_storage_file(
@@ -872,7 +1044,7 @@ pub(super) fn graph_file_ids(
 			));
 		}
 	}
-	for (kind, _name) in GRAPH_FILE_KINDS {
+	for (kind, _name) in file_layout::GRAPH_FILES {
 		if !ids.contains_key(&kind) {
 			return Err(FerrosGrynnError::invalid_storage_file(format!(
 				"graph catalog is missing {kind:?}"
@@ -896,10 +1068,25 @@ pub(super) fn write_new_graph_generation(
 		.map_err(|source| storage_io("create graph generation directory", source))?;
 	let mut catalog_entry = image.catalog_entry;
 	let mut payloads = image.payloads;
-	let mut file_entries = Vec::with_capacity(GRAPH_FILE_KINDS.len() + image.indexes.len());
-	let mut registrations = Vec::with_capacity(GRAPH_FILE_KINDS.len() + image.indexes.len());
-	for (kind, filename) in GRAPH_FILE_KINDS {
-		let file_id = allocate_file_id(next_file_instance_id, kind)?;
+	let side_file_count = image
+		.indexes
+		.len()
+		.checked_add(image.label_indexes.len())
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("index file count overflows"))?;
+	let generation_file_count = file_layout::GRAPH_FILES
+		.len()
+		.checked_add(file_layout::FREELIST_FILES.len())
+		.and_then(|count| count.checked_add(side_file_count))
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("graph file count overflows"))?;
+	let mut file_entries = Vec::with_capacity(generation_file_count);
+	let mut registrations = Vec::with_capacity(generation_file_count);
+	let base_files = file_layout::GRAPH_FILES
+		.into_iter()
+		.map(|(kind, filename)| {
+			Ok((kind, filename, allocate_file_id(next_file_instance_id, kind)?))
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	for &(kind, filename, file_id) in &base_files {
 		if kind == DataFileKind::Index {
 			catalog_entry.primary_index_file_id = file_id;
 		}
@@ -918,6 +1105,7 @@ pub(super) fn write_new_graph_generation(
 		file_entries.push(FileCatalogEntry {
 			graph_id,
 			file_id,
+			companion_of: None,
 			role,
 			path: catalog_path,
 		});
@@ -933,17 +1121,76 @@ pub(super) fn write_new_graph_generation(
 			"graph generation contains an unregistered base payload",
 		));
 	}
-	let mut indexes = Vec::with_capacity(image.indexes.len());
-	for (ordinal, index) in image.indexes.into_iter().enumerate() {
-		let file_id = allocate_file_id(next_file_instance_id, DataFileKind::Index)?;
-		let filename = format!("scalar_{ordinal:04}.fgidx");
+	for (target_kind, filename) in file_layout::FREELIST_FILES {
+		let target_id = base_files
+			.iter()
+			.find_map(|(kind, _filename, file_id)| (*kind == target_kind).then_some(*file_id))
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("freelist target file identity is missing")
+			})?;
+		let file_id = allocate_file_id(next_file_instance_id, DataFileKind::Freelist)?;
 		let relative = format!("{relative_directory}/{filename}");
+		let catalog_path = CatalogPath::parse(&relative)?;
+		let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+		let page = encode_freelist(PageNo::new(0), PageLsn::ZERO, 0, None, &[])?;
+		write_pages(&absolute, std::slice::from_ref(&page))?;
+		file_entries.push(FileCatalogEntry {
+			graph_id,
+			file_id,
+			companion_of: Some(target_id),
+			role: DataFileRole::WalBackfilled,
+			path: catalog_path,
+		});
+		registrations.push(DataFileRegistration {
+			graph_id,
+			file_id,
+			role: DataFileRole::WalBackfilled,
+			path: absolute,
+		});
+	}
+	for label in image.label_indexes {
+		let file_id = allocate_file_id(next_file_instance_id, DataFileKind::Index)?;
+		let prefix = match label.kind {
+			AtomKind::Node => "lbl_node",
+			AtomKind::Edge => "lbl_edge",
+		};
+		let relative = format!("{relative_directory}/idx/{prefix}_{}.fgidx", label.label_id);
+		let catalog_path = CatalogPath::parse(&relative)?;
+		let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+		write_pages(&absolute, &label.pages)?;
+		file_entries.push(FileCatalogEntry {
+			graph_id,
+			file_id,
+			companion_of: None,
+			role: DataFileRole::WalBackfilled,
+			path: catalog_path,
+		});
+		registrations.push(DataFileRegistration {
+			graph_id,
+			file_id,
+			role: DataFileRole::WalBackfilled,
+			path: absolute,
+		});
+	}
+	let mut indexes = Vec::with_capacity(image.indexes.len());
+	let mut scalar_ordinal = 0;
+	for index in image.indexes {
+		let file_id = allocate_file_id(next_file_instance_id, DataFileKind::Index)?;
+		let filename =
+			file_layout::table_index_filename(index.kind, scalar_ordinal, index.table_id);
+		if index.kind != TableIndexKind::Count {
+			scalar_ordinal = scalar_ordinal.checked_add(1).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("scalar index ordinal overflows usize")
+			})?;
+		}
+		let relative = format!("{relative_directory}/idx/{filename}");
 		let catalog_path = CatalogPath::parse(&relative)?;
 		let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
 		write_pages(&absolute, &index.pages)?;
 		file_entries.push(FileCatalogEntry {
 			graph_id,
 			file_id,
+			companion_of: None,
 			role: DataFileRole::WalBackfilled,
 			path: catalog_path,
 		});
@@ -956,7 +1203,7 @@ pub(super) fn write_new_graph_generation(
 		indexes.push(BuiltTableIndexBinding {
 			table: index.table,
 			index: TableIndexCatalogEntry {
-				schema_id: index.schema_id,
+				index_id: index.index_id,
 				schema_version: index.schema_version,
 				name: index.name,
 				kind: index.kind,
@@ -1032,6 +1279,24 @@ pub(super) fn write_delta_graph_generation(
 			)?;
 		}
 	}
+	let mut staged_indexes = BTreeSet::new();
+	for (file_id, page) in &delta.index_payloads {
+		if file_id.kind() != Some(DataFileKind::Index)
+			|| *file_id == current.primary_index_file_id
+			|| !staged_indexes.insert(*file_id)
+			|| !files.files.iter().any(|file| file.graph_id == graph_id && file.file_id == *file_id)
+		{
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"Count delta targets an invalid or duplicate side-file",
+			));
+		}
+		decode_count_index(page)?;
+		manager.stage_frame(
+			transaction,
+			crate::storage::types::PageKey::new(graph_id, *file_id, PageNo::new(0)),
+			page,
+		)?;
+	}
 
 	let generation_name = Uuid::now_v7().to_string();
 	let relative_directory = format!("graphs/{:016x}/{generation_name}", graph_id.get());
@@ -1040,7 +1305,10 @@ pub(super) fn write_delta_graph_generation(
 	fs::create_dir_all(&absolute_directory)
 		.map_err(|source| storage_io("create graph delta generation directory", source))?;
 	let file_id = allocate_file_id(next_file_instance_id, DataFileKind::GraphSuperblock)?;
-	let relative = format!("{relative_directory}/graph.fgb");
+	let filename = file_layout::graph_filename(DataFileKind::GraphSuperblock).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("graph superblock filename is undefined")
+	})?;
+	let relative = format!("{relative_directory}/{filename}");
 	let catalog_path = CatalogPath::parse(&relative)?;
 	let absolute = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
 	let superblock_page = delta.superblock.encode()?;
@@ -1048,6 +1316,7 @@ pub(super) fn write_delta_graph_generation(
 	let file_entry = FileCatalogEntry {
 		graph_id,
 		file_id,
+		companion_of: None,
 		role: DataFileRole::GraphSuperblock,
 		path: catalog_path,
 	};
@@ -1080,9 +1349,9 @@ fn validate_delta_pages(
 			label_page_count(previous.labels_size_bytes)?,
 			label_page_count(next.labels_size_bytes)?,
 		)),
-		DataFileKind::Freelist => Some((1, 1)),
 		DataFileKind::Subgraphs | DataFileKind::Index => None,
 		DataFileKind::GraphSuperblock
+		| DataFileKind::Freelist
 		| DataFileKind::AdjacencyOverflow
 		| DataFileKind::CrossLevelAdjacencyOverflow
 		| DataFileKind::Statistics
@@ -1279,9 +1548,16 @@ pub(super) fn prepare_in_place_image(
 	files: &FileCatalog,
 	image: &mut BuiltGraphImage,
 ) -> FerrosGrynnResult<bool> {
-	// ponytail: scalar indexes use immutable bulk generations; add incremental
-	// WAL page maintenance only after indexed-write profiles justify it.
-	if !image.indexes.is_empty() {
+	// Immutable side-files are replaced as one generation; ordinary data pages
+	// may still use the narrower in-place WAL path when no side-file exists.
+	let has_previous_label_index = files
+		.files
+		.iter()
+		.filter(|file| file.graph_id == current.graph_id)
+		.try_fold(false, |found, file| {
+			Ok::<_, FerrosGrynnError>(found || label_index_identity(file.path.as_str())?.is_some())
+		})?;
+	if !image.indexes.is_empty() || !image.label_indexes.is_empty() || has_previous_label_index {
 		return Ok(false);
 	}
 	let paths = graph_file_paths(root, current, files)?;

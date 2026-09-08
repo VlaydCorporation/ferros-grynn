@@ -15,6 +15,7 @@ mod table;
 pub(crate) use catalog::AtomTableMemberships;
 pub use catalog::{
 	GraphSchema,
+	IndexId,
 	SchemaCatalog,
 	SchemaId,
 	SchemaParameter,

@@ -115,9 +115,9 @@ pub(in crate::storage) struct GraphCatalogEntry {
 	/// Semantic graph-definition version; zero for nested address spaces.
 	pub(in crate::storage) schema_version: u32,
 	/// Engine-owned label-index definition for a named root.
-	pub(in crate::storage) label_index: SystemIndexCatalogEntry,
+	pub(in crate::storage) label_index: Option<SystemIndexCatalogEntry>,
 	/// Engine-owned adjacency-index definition for a named root.
-	pub(in crate::storage) adjacency_index: SystemIndexCatalogEntry,
+	pub(in crate::storage) adjacency_index: Option<SystemIndexCatalogEntry>,
 	/// Owning graph for an internal nested graph; absent for named roots.
 	pub(in crate::storage) parent_graph_id: Option<GraphId>,
 	/// Root-arena subgraph slot used by hot pages and qualified endpoints.
@@ -147,10 +147,9 @@ pub(in crate::storage) struct GraphCatalogEntry {
 /// Durable identity and version of one engine-owned index capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage) struct SystemIndexCatalogEntry {
-	/// Stable schema identity; zero only for an internal nested address space.
-	pub(in crate::storage) schema_id: u32,
-	/// Semantic definition version; zero only for an internal nested address
-	/// space.
+	/// Stable logical index identity.
+	pub(in crate::storage) index_id: IndexId,
+	/// Semantic definition version.
 	pub(in crate::storage) schema_version: u32,
 }
 
@@ -169,18 +168,18 @@ pub(in crate::storage) struct TableFieldCatalogEntry {
 	pub(in crate::storage) property_key: u32,
 }
 
-/// One durable scalar B+tree definition and physical root.
+/// One durable table-index definition and physical root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct TableIndexCatalogEntry {
 	/// Stable index-definition identity.
-	pub(in crate::storage) schema_id: u32,
+	pub(in crate::storage) index_id: IndexId,
 	/// Semantic index-definition version.
 	pub(in crate::storage) schema_version: u32,
 	/// Table-local index name.
 	pub(in crate::storage) name: String,
-	/// Standard or unique leaf contract.
+	/// Physical index contract.
 	pub(in crate::storage) kind: TableIndexKind,
-	/// Composite fields as database property-key identifiers.
+	/// Composite fields as database property-key identifiers; empty for Count.
 	pub(in crate::storage) fields: Vec<u32>,
 	/// Exact physical index file.
 	pub(in crate::storage) file_id: DataFileId,
@@ -203,7 +202,7 @@ pub(in crate::storage) struct TableCatalogEntry {
 	pub(in crate::storage) kind: TableKind,
 	/// Fields in query-visible order.
 	pub(in crate::storage) fields: Vec<TableFieldCatalogEntry>,
-	/// Scalar B+trees in strict name order.
+	/// User-declared table indexes in strict name order.
 	pub(in crate::storage) indexes: Vec<TableIndexCatalogEntry>,
 	/// Engine-owned primary-index definition.
 	pub(in crate::storage) primary_index: SystemIndexCatalogEntry,
@@ -241,6 +240,24 @@ pub(in crate::storage) struct DatabaseCatalog {
 	pub(in crate::storage) tables: Vec<TableCatalogEntry>,
 	/// Global parameters in strict name order.
 	pub(in crate::storage) parameters: Vec<ParameterCatalogEntry>,
+}
+
+/// Decodes the zero-pair used for a nested graph's absent system index.
+fn decode_optional_system_index(
+	decoder: &mut CatalogDecoder<'_>,
+) -> FerrosGrynnResult<Option<SystemIndexCatalogEntry>> {
+	let raw_id = decoder.read_u32()?;
+	let schema_version = decoder.read_u32()?;
+	match (raw_id, schema_version) {
+		(0, 0) => Ok(None),
+		(0, _) | (_, 0) => Err(invalid_catalog(
+			"system index identity and version must either both be zero or both be present",
+		)),
+		(index_id, schema_version) => Ok(Some(SystemIndexCatalogEntry {
+			index_id: IndexId::from_storage(index_id)?,
+			schema_version,
+		})),
+	}
 }
 
 impl DatabaseCatalog {
@@ -292,10 +309,14 @@ impl DatabaseCatalog {
 			output.extend_from_slice(&graph.graph_id.get().to_le_bytes());
 			output.extend_from_slice(&graph.schema_id.to_le_bytes());
 			output.extend_from_slice(&graph.schema_version.to_le_bytes());
-			output.extend_from_slice(&graph.label_index.schema_id.to_le_bytes());
-			output.extend_from_slice(&graph.label_index.schema_version.to_le_bytes());
-			output.extend_from_slice(&graph.adjacency_index.schema_id.to_le_bytes());
-			output.extend_from_slice(&graph.adjacency_index.schema_version.to_le_bytes());
+			for index in [graph.label_index, graph.adjacency_index] {
+				output.extend_from_slice(
+					&index.map_or(0, |index| index.index_id.get()).to_le_bytes(),
+				);
+				output.extend_from_slice(
+					&index.map_or(0, |index| index.schema_version).to_le_bytes(),
+				);
+			}
 			output.push(graph_kind_byte(graph.kind));
 			output.extend_from_slice(&[0_u8; 7]);
 			output.extend_from_slice(
@@ -323,7 +344,7 @@ impl DatabaseCatalog {
 			output.extend_from_slice(&table.graph_id.get().to_le_bytes());
 			output.push(table_kind_byte(table.kind));
 			output.extend_from_slice(&[0_u8; 3]);
-			output.extend_from_slice(&table.primary_index.schema_id.to_le_bytes());
+			output.extend_from_slice(&table.primary_index.index_id.get().to_le_bytes());
 			output.extend_from_slice(&table.primary_index.schema_version.to_le_bytes());
 			output.extend_from_slice(
 				&u32::try_from(table.fields.len())
@@ -345,7 +366,7 @@ impl DatabaseCatalog {
 			}
 			for index in &table.indexes {
 				write_catalog_string(&mut output, &index.name, "index name")?;
-				output.extend_from_slice(&index.schema_id.to_le_bytes());
+				output.extend_from_slice(&index.index_id.get().to_le_bytes());
 				output.extend_from_slice(&index.schema_version.to_le_bytes());
 				output.push(table_index_kind_byte(index.kind));
 				output.extend_from_slice(&[0_u8; 3]);
@@ -426,14 +447,8 @@ impl DatabaseCatalog {
 			let graph_id = GraphId::new(decoder.read_u64()?);
 			let schema_id = decoder.read_u32()?;
 			let schema_version = decoder.read_u32()?;
-			let label_index = SystemIndexCatalogEntry {
-				schema_id: decoder.read_u32()?,
-				schema_version: decoder.read_u32()?,
-			};
-			let adjacency_index = SystemIndexCatalogEntry {
-				schema_id: decoder.read_u32()?,
-				schema_version: decoder.read_u32()?,
-			};
+			let label_index = decode_optional_system_index(&mut decoder)?;
+			let adjacency_index = decode_optional_system_index(&mut decoder)?;
 			let kind = decode_graph_kind(decoder.read_u8()?)?;
 			decoder.expect_zero(7, "graph catalog entry padding")?;
 			let raw_parent = GraphId::new(decoder.read_u64()?);
@@ -500,7 +515,7 @@ impl DatabaseCatalog {
 			let kind = decode_table_kind(decoder.read_u8()?)?;
 			decoder.expect_zero(3, "table catalog padding")?;
 			let primary_index = SystemIndexCatalogEntry {
-				schema_id: decoder.read_u32()?,
+				index_id: IndexId::from_storage(decoder.read_u32()?)?,
 				schema_version: decoder.read_u32()?,
 			};
 			let field_count = usize::try_from(decoder.read_u32()?)
@@ -527,13 +542,15 @@ impl DatabaseCatalog {
 			let mut indexes = Vec::with_capacity(index_count);
 			for _ in 0..index_count {
 				let name = read_catalog_string(&mut decoder, "index name")?;
-				let schema_id = decoder.read_u32()?;
+				let index_id = IndexId::from_storage(decoder.read_u32()?)?;
 				let schema_version = decoder.read_u32()?;
 				let kind = decode_table_index_kind(decoder.read_u8()?)?;
 				decoder.expect_zero(3, "table index padding")?;
 				let field_count = usize::try_from(decoder.read_u32()?)
 					.map_err(|_error| invalid_catalog("index field count does not fit usize"))?;
-				if field_count == 0 || field_count > MAX_TYPE_MEMBERS {
+				if field_count > MAX_TYPE_MEMBERS
+					|| matches!(kind, TableIndexKind::Count) != (field_count == 0)
+				{
 					return Err(invalid_catalog("index field count exceeds its format limit"));
 				}
 				let file_id = DataFileId::from_raw(decoder.read_u64()?)
@@ -545,7 +562,7 @@ impl DatabaseCatalog {
 				}
 				indexes.push(TableIndexCatalogEntry {
 					name,
-					schema_id,
+					index_id,
 					schema_version,
 					kind,
 					fields: index_fields,
@@ -658,6 +675,9 @@ pub(in crate::storage) struct FileCatalogEntry {
 	pub(in crate::storage) graph_id: GraphId,
 	/// Stable physical-file identity.
 	pub(in crate::storage) file_id: DataFileId,
+	/// Base data file served by this freelist, or absent for non-freelist
+	/// files.
+	pub(in crate::storage) companion_of: Option<DataFileId>,
 	/// Checkpoint ownership contract.
 	pub(in crate::storage) role: DataFileRole,
 	/// Validated relative database path.
@@ -681,6 +701,7 @@ impl FileCatalog {
 			files: vec![FileCatalogEntry {
 				graph_id: GraphId::SYSTEM,
 				file_id: SYSTEM_CATALOG_FILE_ID,
+				companion_of: None,
 				role: DataFileRole::WalBackfilled,
 				path: CatalogPath::parse(SYSTEM_CATALOG_PATH)?,
 			}],
@@ -704,10 +725,10 @@ impl FileCatalog {
 				.map_err(|_error| invalid_catalog("file catalog path exceeds u16"))?;
 			output.extend_from_slice(&file.graph_id.get().to_le_bytes());
 			output.extend_from_slice(&file.file_id.get().to_le_bytes());
-			output.push(role_byte(file.role));
-			output.extend_from_slice(&[0_u8; 7]);
+			output.extend_from_slice(&file.companion_of.map_or(0, DataFileId::get).to_le_bytes());
 			output.extend_from_slice(&path_len.to_le_bytes());
-			output.extend_from_slice(&[0_u8; 6]);
+			output.push(role_byte(file.role));
+			output.extend_from_slice(&[0_u8; 5]);
 			output.extend_from_slice(file.path.as_str().as_bytes());
 		}
 		validate_catalog_size(output.len())?;
@@ -715,7 +736,7 @@ impl FileCatalog {
 	}
 
 	/// Decodes a bounded canonical physical-file catalog payload.
-	fn decode(bytes: &[u8]) -> FerrosGrynnResult<Self> {
+	pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<Self> {
 		let mut decoder = CatalogDecoder::new(bytes);
 		decoder.expect_magic(FILE_CATALOG_MAGIC, "file catalog")?;
 		decoder.expect_version(FILE_CATALOG_PAYLOAD_VERSION)?;
@@ -736,10 +757,17 @@ impl FileCatalog {
 			let graph_id = GraphId::new(decoder.read_u64()?);
 			let file_id = DataFileId::from_raw(decoder.read_u64()?)
 				.ok_or_else(|| invalid_catalog("file catalog contains an unknown DataFileId"))?;
-			let role = decode_role(decoder.read_u8()?)?;
-			decoder.expect_zero(7, "file catalog role padding")?;
+			let raw_companion = decoder.read_u64()?;
+			let companion_of = if raw_companion == 0 {
+				None
+			} else {
+				Some(DataFileId::from_raw(raw_companion).ok_or_else(|| {
+					invalid_catalog("file catalog contains an unknown companion DataFileId")
+				})?)
+			};
 			let path_len = usize::from(decoder.read_u16()?);
-			decoder.expect_zero(6, "file catalog path padding")?;
+			let role = decode_role(decoder.read_u8()?)?;
+			decoder.expect_zero(5, "file catalog entry reserved bytes")?;
 			if path_len > MAX_CATALOG_PATH_BYTES {
 				return Err(invalid_catalog("file catalog path exceeds its format limit"));
 			}
@@ -747,6 +775,7 @@ impl FileCatalog {
 			files.push(FileCatalogEntry {
 				graph_id,
 				file_id,
+				companion_of,
 				role,
 				path,
 			});

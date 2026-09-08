@@ -53,6 +53,57 @@ impl Display for SchemaId {
 	}
 }
 
+/// Stable identity of one index definition.
+///
+/// Index identities share the schema-catalog allocation clock with graphs,
+/// tables, fields, and parameters, but this type prevents an index identity
+/// from being confused with another catalog object's identity.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IndexId(SchemaId);
+
+impl IndexId {
+	/// Creates an index identity from its durable representation.
+	pub const fn new(value: u32) -> Option<Self> {
+		match SchemaId::new(value) {
+			Some(value) => Some(Self(value)),
+			None => None,
+		}
+	}
+
+	/// Returns the durable integer representation.
+	pub const fn get(self) -> u32 {
+		self.0.get()
+	}
+
+	/// Re-types an identity already allocated by the shared schema clock.
+	pub(crate) const fn from_schema_id(value: SchemaId) -> Self {
+		Self(value)
+	}
+
+	/// Decodes and validates the durable integer representation.
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-storage error for a reserved schema identity.
+	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
+		Self::new(value)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("index identity is reserved"))
+	}
+}
+
+impl From<IndexId> for SchemaId {
+	fn from(value: IndexId) -> Self {
+		value.0
+	}
+}
+
+impl Display for IndexId {
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), f)
+	}
+}
+
 /// Monotonic semantic version of one schema-catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaVersion(NonZeroU32);
@@ -109,13 +160,13 @@ pub enum SystemIndexKind {
 /// One engine-owned index definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemIndex {
-	id: SchemaId,
+	id: IndexId,
 	version: SchemaVersion,
 	kind: SystemIndexKind,
 }
 
 impl SystemIndex {
-	pub(crate) const fn new(id: SchemaId, kind: SystemIndexKind) -> Self {
+	pub(crate) const fn new(id: IndexId, kind: SystemIndexKind) -> Self {
 		Self {
 			id,
 			version: SchemaVersion::INITIAL,
@@ -124,7 +175,7 @@ impl SystemIndex {
 	}
 
 	pub(crate) const fn from_storage(
-		id: SchemaId,
+		id: IndexId,
 		version: SchemaVersion,
 		kind: SystemIndexKind,
 	) -> Self {
@@ -136,7 +187,7 @@ impl SystemIndex {
 	}
 
 	/// Returns the stable catalog identity.
-	pub const fn id(self) -> SchemaId {
+	pub const fn id(self) -> IndexId {
 		self.id
 	}
 

@@ -107,6 +107,7 @@ use root::{ActiveSnapshot, AtomVersions, DatabaseRoot, StoredGraph, StoredGraphV
 use schema::{AtomTableMemberships, validate_graph_name};
 pub use schema::{
 	GraphSchema,
+	IndexId,
 	SchemaCatalog,
 	SchemaId,
 	SchemaParameter,

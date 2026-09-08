@@ -59,6 +59,7 @@ pub(in crate::storage) use state::{
 use {codec::*, recovery::*};
 
 use super::{
+	graph_index::stamp_count_index_lsn,
 	page::{AlignedPage, PAGE_SIZE, PageHeader, PageLsn, PageNo, PageType, validate_page_bytes},
 	types::{
 		CheckpointGeneration,

@@ -8,6 +8,7 @@
 use std::{
 	fs::OpenOptions,
 	io::{Read, Seek, SeekFrom, Write},
+	time::Instant,
 };
 use std::{ops::Bound, time::Duration};
 
@@ -55,6 +56,48 @@ impl LocalTestDirectory {
 impl Drop for LocalTestDirectory {
 	fn drop(&mut self) {
 		drop(std::fs::remove_dir_all(&self.0));
+	}
+}
+
+/// Measures warm reopen scaling for the eager format-v1 file registry.
+#[cfg(windows)]
+#[test]
+#[ignore = "diagnostic creates up to 1,800 graph-generation files"]
+fn local_file_layout_reopen_diagnostic() {
+	for graph_count in [1_usize, 100] {
+		let directory = LocalTestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 256,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut transaction = store.begin();
+		for ordinal in 0..graph_count {
+			transaction
+				.create_graph(
+					graph_id(&format!("reopen-{ordinal}")),
+					Graph::<Mutable>::new().freeze().into(),
+				)
+				.unwrap();
+		}
+		transaction.commit().unwrap();
+		drop(store);
+
+		let mut samples = Vec::with_capacity(5);
+		for _ in 0..5 {
+			let started = Instant::now();
+			let reopened = Datastore::open_local(directory.path(), options).unwrap();
+			samples.push(started.elapsed());
+			assert_eq!(reopened.schema_catalog().graphs().len(), graph_count);
+			drop(reopened);
+		}
+		samples.sort_unstable();
+		println!(
+			"layout_reopen graphs={graph_count} median_ms={:.3} min_ms={:.3} max_ms={:.3}",
+			samples[2].as_secs_f64() * 1_000.0,
+			samples[0].as_secs_f64() * 1_000.0,
+			samples[4].as_secs_f64() * 1_000.0,
+		);
 	}
 }
 
@@ -121,9 +164,39 @@ fn seeded_table() -> (Datastore, GraphRef, AtomId) {
 }
 
 #[test]
+fn count_index_is_fieldless_and_unique_per_table() {
+	assert!(TableIndex::new("count", TableIndexKind::Count, std::iter::empty::<&str>()).is_ok());
+	assert!(TableIndex::new("count", TableIndexKind::Count, ["name"]).is_err());
+	assert!(
+		TableIndex::new("scalar", TableIndexKind::Standard, std::iter::empty::<&str>()).is_err()
+	);
+	let (_store, graph, _left, _right) = seeded_store();
+	let table = TableSchema::new("person", graph, TableKind::Normal, Vec::<TableField>::new())
+		.unwrap()
+		.with_index(
+			TableIndex::new("count", TableIndexKind::Count, std::iter::empty::<&str>()).unwrap(),
+		)
+		.unwrap();
+	assert!(
+		table
+			.with_index(
+				TableIndex::new("second_count", TableIndexKind::Count, std::iter::empty::<&str>())
+					.unwrap(),
+			)
+			.is_err()
+	);
+}
+
+#[test]
 fn table_membership_is_explicit_and_record_id_independent() {
 	assert!(SchemaId::new(0).is_none());
 	assert!(SchemaId::new(u32::MAX).is_none());
+	assert!(IndexId::new(0).is_none());
+	assert!(IndexId::new(u32::MAX).is_none());
+	let index_id = IndexId::new(7).unwrap();
+	assert_eq!(index_id.get(), 7);
+	assert_eq!(SchemaId::from(index_id).get(), 7);
+	assert_eq!(index_id.to_string(), "7");
 	let store = Datastore::in_memory();
 	let mut graph = Graph::<Mutable>::new();
 	graph.add_node_with_id("person:unassigned".parse().unwrap(), None, PropertyMap::new()).unwrap();
@@ -371,6 +444,43 @@ fn local_graph_table_and_edge_survive_reopen() {
 			.unwrap();
 	}
 	transaction.commit().unwrap();
+	{
+		let graph_directory = std::fs::read_dir(directory.path().join("graphs"))
+			.unwrap()
+			.next()
+			.unwrap()
+			.unwrap()
+			.path();
+		let generation =
+			std::fs::read_dir(graph_directory).unwrap().next().unwrap().unwrap().path();
+		let names = std::fs::read_dir(&generation)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+			.collect::<BTreeSet<_>>();
+		for required in [
+			"superblock.fgb",
+			"freelist_nodes.fgb",
+			"freelist_edges.fgb",
+			"freelist_props.fgb",
+			"freelist_adj.fgb",
+			"freelist_adj_cl.fgb",
+			"freelist_subgraphs.fgb",
+		] {
+			assert!(names.contains(required), "missing {required}");
+		}
+		assert!(!names.contains("graph.fgb"));
+		assert!(!names.contains("freelist.fgb"));
+		for freelist in names.iter().filter(|name| name.starts_with("freelist_")) {
+			assert_eq!(std::fs::metadata(generation.join(freelist)).unwrap().len(), 16 * 1024);
+		}
+		let index_names = std::fs::read_dir(generation.join("idx"))
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+			.collect::<BTreeSet<_>>();
+		assert!(index_names.contains("std_0000.fgidx"));
+		assert!(index_names.contains("uniq_0001.fgidx"));
+		assert!(!index_names.iter().any(|name| name.starts_with("scalar_")));
+	}
 	let created_table = store.table("person").unwrap();
 	let table_id = created_table.id().unwrap();
 	let field_ids = created_table.fields().map(|field| field.id().unwrap()).collect::<Vec<_>>();
@@ -503,6 +613,77 @@ fn local_graph_table_and_edge_survive_reopen() {
 		panic!("updated point SELECT must return an array");
 	};
 	assert_eq!(rows.as_slice(), &[Value::from(31_i64)]);
+	let rebuilt_table = reopened.table("person").unwrap();
+	assert_eq!(rebuilt_table.indexes().len(), 2);
+	assert_eq!(
+		rebuilt_table.indexes().map(|index| index.id().unwrap()).collect::<Vec<_>>(),
+		index_ids
+	);
+	drop(reopened);
+
+	let index_directory = std::fs::read_dir(directory.path().join("graphs"))
+		.unwrap()
+		.flat_map(|graph| std::fs::read_dir(graph.unwrap().path()).unwrap())
+		.map(|generation| generation.unwrap().path().join("idx"))
+		.find(|path| path.is_dir())
+		.unwrap();
+	let mut scalar_files = std::fs::read_dir(&index_directory)
+		.unwrap()
+		.map(|entry| entry.unwrap().path())
+		.filter(|path| {
+			path.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name.starts_with("std_") || name.starts_with("uniq_"))
+		})
+		.collect::<Vec<_>>();
+	scalar_files.sort();
+	let mut scalar = OpenOptions::new().read(true).write(true).open(&scalar_files[0]).unwrap();
+	let mut byte = [0_u8; 1];
+	scalar.seek(SeekFrom::Start(128)).unwrap();
+	scalar.read_exact(&mut byte).unwrap();
+	byte[0] ^= u8::MAX;
+	scalar.seek(SeekFrom::Start(128)).unwrap();
+	scalar.write_all(&byte).unwrap();
+	scalar.sync_all().unwrap();
+	drop(scalar);
+	OpenOptions::new().write(true).open(&scalar_files[1]).unwrap().set_len(1).unwrap();
+	let label = std::fs::read_dir(&index_directory)
+		.unwrap()
+		.map(|entry| entry.unwrap().path())
+		.find(|path| {
+			path.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name.starts_with("lbl_node_"))
+		})
+		.unwrap();
+	std::fs::remove_file(label).unwrap();
+
+	let fallback = Datastore::open_local(directory.path(), options).unwrap();
+	assert_eq!(fallback.table("person").unwrap().indexes().len(), 2);
+	let results = fallback
+		.execute("SELECT VALUE name FROM person WHERE age >= 18", &crate::values::Object::new())
+		.unwrap();
+	let Value::Array(rows) = results[0].result.as_ref().unwrap().value() else {
+		panic!("fallback SELECT must return an array");
+	};
+	assert_eq!(rows.len(), 2);
+	assert!(rows.as_slice().contains(&Value::from("Alice")));
+	assert!(rows.as_slice().contains(&Value::from("Bob")));
+	let mut bounded = fallback.begin();
+	assert!(bounded.mutate_graph(&reference).is_err());
+	drop(bounded);
+	drop(fallback);
+
+	let primary_path = index_directory.parent().unwrap().join("primary.fgidx");
+	let mut primary = OpenOptions::new().read(true).write(true).open(primary_path).unwrap();
+	primary.seek(SeekFrom::Start(128)).unwrap();
+	primary.read_exact(&mut byte).unwrap();
+	byte[0] ^= u8::MAX;
+	primary.seek(SeekFrom::Start(128)).unwrap();
+	primary.write_all(&byte).unwrap();
+	primary.sync_all().unwrap();
+	drop(primary);
+	assert!(Datastore::open_local(directory.path(), options).is_err());
 }
 
 /// Opening a local database validates only the statistics root; an auxiliary
@@ -554,6 +735,136 @@ fn local_label_statistics_are_loaded_lazily() {
 	let view = reference.read(&transaction).unwrap();
 	assert_eq!(view.node_count().unwrap(), 1);
 	assert!(view.statistics().is_err());
+}
+
+/// Label and Count side files publish with the graph generation, Count updates
+/// through the page WAL, and a changed label selects the scan fallback.
+#[cfg(windows)]
+#[test]
+fn local_label_and_count_indexes_survive_delta_and_reopen() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let mut graph = Graph::<Mutable>::new();
+	for id in ["alice", "bob"] {
+		graph
+			.add_node_with_id(
+				format!("person:{id}").parse().unwrap(),
+				Some("Person".into()),
+				PropertyMap::new(),
+			)
+			.unwrap();
+	}
+	let mut create = store.begin();
+	let reference =
+		create.create_graph(graph_id("indexed-side-files"), graph.freeze().into()).unwrap();
+	create
+		.define_table(
+			TableSchema::new(
+				"person",
+				reference.clone(),
+				TableKind::Normal,
+				Vec::<TableField>::new(),
+			)
+			.unwrap()
+			.with_index(
+				TableIndex::new("person_count", TableIndexKind::Count, std::iter::empty::<&str>())
+					.unwrap(),
+			)
+			.unwrap(),
+		)
+		.unwrap();
+	for id in ["alice", "bob"] {
+		create
+			.assign_atom_to_table(
+				&reference,
+				&AtomRef::new(AtomKind::Node, format!("person:{id}").parse().unwrap()),
+				"person",
+			)
+			.unwrap();
+	}
+	create.commit().unwrap();
+	let table_id = store.table("person").unwrap().id().unwrap().get();
+
+	let read = store.begin();
+	let local_tx = read.storage_tx.lock().as_ref().unwrap().clone();
+	let stored = read.root.graphs.get(reference.id()).unwrap();
+	let StoredGraphValue::Local(local_graph) = &stored.graph else {
+		panic!("local graph must remain disk-backed");
+	};
+	let local = store.inner.backend.local().unwrap();
+	assert_eq!(local.table_count_index(&local_tx, local_graph, table_id).unwrap(), Some(2));
+	let mut records = Vec::new();
+	assert!(
+		local
+			.visit_label_index(&local_tx, local_graph, AtomKind::Node, "Person", |atom| {
+				records.push(atom.record_id);
+				Ok(())
+			})
+			.unwrap()
+	);
+	records.sort();
+	assert_eq!(records, vec![
+		"person:alice".parse::<RecordId>().unwrap(),
+		"person:bob".parse::<RecordId>().unwrap(),
+	]);
+	drop(read);
+
+	let mut aborted = store.begin();
+	aborted
+		.clear_atom_table(&reference, &AtomRef::new(AtomKind::Node, "person:bob".parse().unwrap()))
+		.unwrap();
+	aborted.abort();
+	let read = store.begin();
+	let local_tx = read.storage_tx.lock().as_ref().unwrap().clone();
+	let stored = read.root.graphs.get(reference.id()).unwrap();
+	let StoredGraphValue::Local(local_graph) = &stored.graph else {
+		panic!("local graph must remain disk-backed");
+	};
+	assert_eq!(local.table_count_index(&local_tx, local_graph, table_id).unwrap(), Some(2));
+	drop(read);
+
+	let mut update = store.begin();
+	update
+		.clear_atom_table(&reference, &AtomRef::new(AtomKind::Node, "person:bob".parse().unwrap()))
+		.unwrap();
+	let mut mutation = update.mutate_graph(&reference).unwrap();
+	mutation
+		.set_label(
+			&AtomRef::new(AtomKind::Node, "person:alice".parse().unwrap()),
+			Some("Changed".into()),
+		)
+		.unwrap();
+	drop(mutation);
+	update.commit().unwrap();
+	drop(store);
+
+	let reopened = Datastore::open_local(directory.path(), options).unwrap();
+	let read = reopened.begin();
+	let local_tx = read.storage_tx.lock().as_ref().unwrap().clone();
+	let stored = read.root.graphs.get(reference.id()).unwrap();
+	let StoredGraphValue::Local(local_graph) = &stored.graph else {
+		panic!("reopened graph must remain disk-backed");
+	};
+	let local = reopened.inner.backend.local().unwrap();
+	assert_eq!(local.table_count_index(&local_tx, local_graph, table_id).unwrap(), Some(1));
+	assert!(
+		!local
+			.visit_label_index(&local_tx, local_graph, AtomKind::Node, "Person", |_atom| Ok(()))
+			.unwrap()
+	);
+	let view = reference.read(&read).unwrap();
+	let alice = view
+		.atom_id(&AtomRef::new(AtomKind::Node, "person:alice".parse().unwrap()))
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		view.node(alice).unwrap().unwrap().label_text().unwrap().as_deref(),
+		Some(&Text::from("Changed"))
+	);
 }
 
 #[cfg(windows)]

@@ -285,6 +285,7 @@ impl CrossLevelOverflowStoreBuilder {
 }
 
 pub(super) fn build_graph_image(
+	root: &Path,
 	plan: &PlannedGraph,
 	dictionary: &mut PropertyDictionary,
 	tables: &[LocalCommitTable],
@@ -366,7 +367,7 @@ pub(super) fn build_graph_image(
 		}
 	}
 
-	let mut index_entries = Vec::with_capacity(node_ids.len() + edge_ids.len());
+	let mut primary_sorter = ExternalIndexSorter::new(root);
 	for id in node_ids.iter().chain(&edge_ids) {
 		let atom = graph
 			.atom_ref(*id)?
@@ -375,15 +376,13 @@ pub(super) fn build_graph_image(
 			StorageValue::from_runtime(Value::Record(Box::new(atom.id().clone())), &mut context)?
 				.as_ref(),
 		)?;
-		index_entries.push(PrimaryIndexEntry {
-			key,
-			atom: disk_refs.get(id).copied().ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file("atom has no assigned disk reference")
-			})?,
-		});
+		let atom = disk_refs.get(id).copied().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("atom has no assigned disk reference")
+		})?;
+		primary_sorter.push(key, atom)?;
 	}
-	index_entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-	let primary = build_primary_index(&index_entries, PageLsn::ZERO)?;
+	let primary_records = primary_sorter.finish()?;
+	let primary = build_primary_index_sorted(&primary_records, PageLsn::ZERO)?;
 
 	let mut properties = PropertyStoreBuilder::new();
 	let graph_properties =
@@ -413,7 +412,8 @@ pub(super) fn build_graph_image(
 		);
 	}
 	let property_pages = properties.finish()?;
-	let indexes = build_scalar_indexes(
+	let indexes = build_table_indexes(
+		root,
 		record_id,
 		graph,
 		tables,
@@ -424,6 +424,14 @@ pub(super) fn build_graph_image(
 
 	let node_label_ids = dense_ids(node_labels)?;
 	let edge_label_ids = dense_ids(edge_labels)?;
+	let label_indexes = build_label_indexes(
+		graph,
+		&node_ids,
+		&edge_ids,
+		&disk_refs,
+		&node_label_ids,
+		&edge_label_ids,
+	)?;
 	let labels = LabelDictionary {
 		node_labels: node_label_ids.keys().cloned().collect(),
 		edge_labels: edge_label_ids.keys().cloned().collect(),
@@ -674,7 +682,6 @@ pub(super) fn build_graph_image(
 		})
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let subgraph_pages = encode_subgraph_pages(&subgraph_entries)?;
-	let freelist_pages = vec![encode_freelist(PageNo::new(0), PageLsn::ZERO, 0, None, &[])?];
 	let graph_name = plan.name.clone();
 	let now = unix_time_ms()?;
 	let superblock = GraphSuperblock {
@@ -723,7 +730,6 @@ pub(super) fn build_graph_image(
 	payloads.insert(DataFileKind::Properties, property_pages);
 	payloads.insert(DataFileKind::Subgraphs, subgraph_pages);
 	payloads.insert(DataFileKind::Labels, label_pages);
-	payloads.insert(DataFileKind::Freelist, freelist_pages);
 	payloads.insert(DataFileKind::Statistics, statistic_files.graph);
 	payloads.insert(DataFileKind::LabelStatistics, statistic_files.labels);
 	payloads.insert(DataFileKind::PropertyStatistics, statistic_files.properties);
@@ -736,14 +742,14 @@ pub(super) fn build_graph_image(
 			graph_id,
 			schema_id: schema.map_or(0, |schema| schema.id),
 			schema_version: schema.map_or(0, |schema| schema.version),
-			label_index: SystemIndexCatalogEntry {
-				schema_id: schema.map_or(0, |schema| schema.label_index.id),
-				schema_version: schema.map_or(0, |schema| schema.label_index.version),
-			},
-			adjacency_index: SystemIndexCatalogEntry {
-				schema_id: schema.map_or(0, |schema| schema.adjacency_index.id),
-				schema_version: schema.map_or(0, |schema| schema.adjacency_index.version),
-			},
+			label_index: schema.map(|schema| SystemIndexCatalogEntry {
+				index_id: schema.label_index.id,
+				schema_version: schema.label_index.version,
+			}),
+			adjacency_index: schema.map(|schema| SystemIndexCatalogEntry {
+				index_id: schema.adjacency_index.id,
+				schema_version: schema.adjacency_index.version,
+			}),
 			parent_graph_id: plan.parent_graph_id,
 			subgraph_slot: plan.subgraph_slot,
 			parent_atom: plan.parent_atom,
@@ -760,6 +766,7 @@ pub(super) fn build_graph_image(
 		superblock,
 		payloads,
 		indexes,
+		label_indexes,
 	})
 }
 
@@ -1001,6 +1008,12 @@ pub(super) fn build_node_append_delta(
 	let mut next_statistics = previous_statistics;
 	next_statistics.node_count = next_node_count;
 	for node in nodes {
+		if let Some(table_id) = node.table_id {
+			let count = next_statistics.tables.entry(table_id).or_default();
+			*count = count.checked_add(1).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("table statistics count overflows")
+			})?;
+		}
 		if let Some(label) = &node.label {
 			next_statistics.replace_label(
 				AtomKind::Node,
@@ -1017,8 +1030,12 @@ pub(super) fn build_node_append_delta(
 		base.statistics_layout,
 		PageLsn::ZERO,
 	)?;
+	let index_payloads = build_count_index_delta(manager, transaction, base, &next_statistics)?;
 
 	let mut superblock = base.superblock.clone();
+	if nodes.iter().any(|node| node.label.is_some()) {
+		superblock.flags.insert(GraphSuperblockFlags::LABEL_INDEX_STALE);
+	}
 	superblock.updated_at_ms = unix_time_ms()?;
 	superblock.node_capacity = next_capacity;
 	superblock.node_count = next_node_count;
@@ -1054,6 +1071,7 @@ pub(super) fn build_node_append_delta(
 		catalog_entry,
 		superblock,
 		payloads,
+		index_payloads,
 		removed_subgraph_slots: Vec::new(),
 	})
 }
@@ -1303,6 +1321,7 @@ pub(super) fn build_atom_delta(
 	let mut node_pages = BTreeMap::<PageNo, Box<AlignedPage>>::new();
 	let mut edge_pages = BTreeMap::<PageNo, Box<AlignedPage>>::new();
 	let mut removed_subgraph_slots = Vec::new();
+	let mut label_index_changed = false;
 
 	for change in &delta.nodes {
 		let (id, created) = match change {
@@ -1329,6 +1348,7 @@ pub(super) fn build_atom_delta(
 			new_node_hot_page,
 		)?;
 		let previous = read_node_hot_slot(page, page_no, within)?;
+		let previous_label_id = previous.label_id;
 		validate_delta_slot(
 			id,
 			created,
@@ -1339,6 +1359,7 @@ pub(super) fn build_atom_delta(
 			LocalCommitNodeChange::Remove {
 				..
 			} => {
+				label_index_changed |= previous.label_id.is_some();
 				if let Some(slot) = previous.subgraph_slot {
 					removed_subgraph_slots.push(slot);
 				}
@@ -1357,7 +1378,7 @@ pub(super) fn build_atom_delta(
 				};
 				next.generation = id.generation();
 				next.flags.remove(NodeSlotFlags::TOMBSTONE);
-				next.label_id = label
+				let next_label_id = label
 					.as_ref()
 					.map(|label| {
 						node_label_ids.get(label.as_str()).copied().ok_or_else(|| {
@@ -1365,6 +1386,12 @@ pub(super) fn build_atom_delta(
 						})
 					})
 					.transpose()?;
+				label_index_changed |= if created {
+					next_label_id.is_some()
+				} else {
+					previous_label_id != next_label_id
+				};
+				next.label_id = next_label_id;
 				next.properties = node_properties.get(&id).copied().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file("node property location is absent")
 				})?;
@@ -1440,6 +1467,7 @@ pub(super) fn build_atom_delta(
 			new_edge_hot_page,
 		)?;
 		let previous = read_edge_hot_slot(page, page_no, within)?;
+		let previous_label_id = previous.label_id;
 		validate_delta_slot(
 			id,
 			created,
@@ -1450,6 +1478,7 @@ pub(super) fn build_atom_delta(
 			LocalCommitEdgeChange::Remove {
 				..
 			} => {
+				label_index_changed |= previous.label_id.is_some();
 				if let Some(slot) = previous.transition_graph {
 					removed_subgraph_slots.push(slot);
 				}
@@ -1471,7 +1500,7 @@ pub(super) fn build_atom_delta(
 				};
 				next.generation = id.generation();
 				next.flags.remove(EdgeSlotFlags::TOMBSTONE);
-				next.label_id = label
+				let next_label_id = label
 					.as_ref()
 					.map(|label| {
 						edge_label_ids.get(label.as_str()).copied().ok_or_else(|| {
@@ -1479,6 +1508,12 @@ pub(super) fn build_atom_delta(
 						})
 					})
 					.transpose()?;
+				label_index_changed |= if created {
+					next_label_id.is_some()
+				} else {
+					previous_label_id != next_label_id
+				};
+				next.label_id = next_label_id;
 				next.properties = edge_properties.get(&id).copied().ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file("edge property location is absent")
 				})?;
@@ -1643,6 +1678,7 @@ pub(super) fn build_atom_delta(
 		base.statistics_layout,
 		PageLsn::ZERO,
 	)?;
+	let index_payloads = build_count_index_delta(manager, transaction, base, &statistics)?;
 
 	removed_subgraph_slots.sort_unstable();
 	removed_subgraph_slots.dedup();
@@ -1661,6 +1697,9 @@ pub(super) fn build_atom_delta(
 	};
 
 	let mut superblock = base.superblock.clone();
+	if label_index_changed {
+		superblock.flags.insert(GraphSuperblockFlags::LABEL_INDEX_STALE);
+	}
 	superblock.updated_at_ms = unix_time_ms()?;
 	superblock.node_capacity = delta.node_capacity;
 	superblock.edge_capacity = delta.edge_capacity;
@@ -1712,6 +1751,7 @@ pub(super) fn build_atom_delta(
 		catalog_entry,
 		superblock,
 		payloads,
+		index_payloads,
 		removed_subgraph_slots,
 	})
 }
@@ -2098,8 +2138,148 @@ fn delta_graph_statistics(
 	statistics.maximum_out_degree = maximum_out_degree;
 	statistics.maximum_in_degree = maximum_in_degree;
 	update_delta_label_statistics(&mut statistics, manager, transaction, base, delta, context)?;
+	update_delta_table_statistics(&mut statistics, manager, transaction, base, delta)?;
 	statistics.mark_dirty(changed_rows, delta.revision)?;
 	Ok(statistics)
+}
+
+/// Applies exact before/after membership changes without scanning the graph.
+fn update_delta_table_statistics(
+	statistics: &mut GraphStatistics,
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	delta: &LocalCommitAtomDelta,
+) -> FerrosGrynnResult<()> {
+	// Table totals are catalog-owned and therefore are not part of the
+	// statistics-root page. Hydrate only the tables that need a physical Count
+	// update; the datastore root reconciles all logical totals after commit.
+	statistics.tables.clear();
+	for (table_id, index) in &base.count_indexes {
+		let page = manager.read_page(
+			transaction,
+			crate::storage::types::PageKey::new(base.graph_id, index.file_id, PageNo::new(0)),
+		)?;
+		let count = decode_count_index(page.as_page())?;
+		if count.table_id != *table_id {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"Count index table identity disagrees with its catalog binding",
+			));
+		}
+		statistics.tables.insert(*table_id, count.atom_count);
+	}
+	let node_changes = delta
+		.nodes
+		.iter()
+		.map(|change| match change {
+			LocalCommitNodeChange::Upsert {
+				id,
+				created,
+				..
+			}
+			| LocalCommitNodeChange::Remove {
+				id,
+				created,
+			} => (*id, (change, *created)),
+		})
+		.collect::<BTreeMap<_, _>>();
+	let edge_changes = delta
+		.edges
+		.iter()
+		.map(|change| match change {
+			LocalCommitEdgeChange::Upsert {
+				id,
+				created,
+				..
+			}
+			| LocalCommitEdgeChange::Remove {
+				id,
+				created,
+			} => (*id, (change, *created)),
+		})
+		.collect::<BTreeMap<_, _>>();
+	let memberships = delta
+		.memberships
+		.iter()
+		.map(|membership| (membership.id, membership.table_id))
+		.collect::<BTreeMap<_, _>>();
+	let mut affected =
+		node_changes.keys().chain(edge_changes.keys()).copied().collect::<BTreeSet<_>>();
+	affected.extend(memberships.keys().copied());
+	for id in affected {
+		let created = node_changes
+			.get(&id)
+			.map(|(_change, created)| *created)
+			.or_else(|| edge_changes.get(&id).map(|(_change, created)| *created))
+			.unwrap_or(false);
+		let before = if created {
+			None
+		} else {
+			previous_table_membership(manager, transaction, base, id)?
+		};
+		let removed = node_changes.get(&id).is_some_and(|(change, _created)| {
+			matches!(change, LocalCommitNodeChange::Remove { .. })
+		}) || edge_changes.get(&id).is_some_and(|(change, _created)| {
+			matches!(change, LocalCommitEdgeChange::Remove { .. })
+		});
+		let mut after = (!removed).then_some(before).flatten();
+		if !removed && let Some(table_id) = memberships.get(&id) {
+			after = *table_id;
+		}
+		if before == after {
+			continue;
+		}
+		if let Some(table_id) = before {
+			if let Some(count) = statistics.tables.get_mut(&table_id) {
+				*count = count.checked_sub(1).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("Count index value underflows")
+				})?;
+			}
+		}
+		if let Some(table_id) = after {
+			if let Some(count) = statistics.tables.get_mut(&table_id) {
+				*count = count.checked_add(1).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("Count index value overflows")
+				})?;
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Reads one exact prior table membership from a live hot slot.
+fn previous_table_membership(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	id: AtomId,
+) -> FerrosGrynnResult<Option<u32>> {
+	let (page_no, within) = hot_slot_address(id.slot())?;
+	let (generation, tombstone, table_id) = match id.kind() {
+		Some(AtomKind::Node) => {
+			let page =
+				manager.read_page(transaction, base.page_key(DataFileKind::NodesHot, page_no)?)?;
+			let slot = read_node_hot_slot(page.as_page(), page_no, within)?;
+			(slot.generation, slot.flags.contains(NodeSlotFlags::TOMBSTONE), slot.table_id)
+		}
+		Some(AtomKind::Edge) => {
+			let page =
+				manager.read_page(transaction, base.page_key(DataFileKind::EdgesHot, page_no)?)?;
+			let slot = read_edge_hot_slot(page.as_page(), page_no, within)?;
+			(slot.generation, slot.flags.contains(EdgeSlotFlags::TOMBSTONE), slot.table_id)
+		}
+		None => {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"table statistics delta contains an invalid atom kind",
+			));
+		}
+	};
+	if tombstone || generation != id.generation() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"table statistics delta references a stale atom",
+		));
+	}
+	Ok(table_id)
 }
 
 /// Reconstructs exact label counters before upgrading a legacy one-page root.
@@ -2437,6 +2617,40 @@ fn boxed_page(page_no: PageNo, page: &AlignedPage) -> FerrosGrynnResult<Box<Alig
 	Ok(stored)
 }
 
+/// Builds only Count pages whose exact table total changed in this delta.
+fn build_count_index_delta(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	statistics: &GraphStatistics,
+) -> FerrosGrynnResult<Vec<(DataFileId, Box<AlignedPage>)>> {
+	let mut pages = Vec::new();
+	for (table_id, index) in &base.count_indexes {
+		let key = crate::storage::types::PageKey::new(base.graph_id, index.file_id, PageNo::new(0));
+		let current = manager.read_page(transaction, key)?;
+		let current = decode_count_index(current.as_page())?;
+		if current.table_id != *table_id {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"Count index table identity disagrees with its catalog binding",
+			));
+		}
+		let atom_count = statistics.tables.get(table_id).copied().unwrap_or(0);
+		if current.atom_count == atom_count {
+			continue;
+		}
+		let page = encode_count_index(
+			CountIndexValue {
+				atom_count,
+				last_updated_lsn: current.last_updated_lsn,
+				..current
+			},
+			PageLsn::ZERO,
+		)?;
+		pages.push((index.file_id, Box::new(page)));
+	}
+	Ok(pages)
+}
+
 #[cfg(test)]
 #[test]
 fn numbered_delta_pages_preserve_aligned_headers() -> FerrosGrynnResult<()> {
@@ -2458,17 +2672,46 @@ fn numbered_delta_pages_preserve_aligned_headers() -> FerrosGrynnResult<()> {
 	Ok(())
 }
 
-pub(super) fn build_scalar_indexes(
+pub(super) fn build_table_indexes(
+	root: &Path,
 	record_id: &RecordId,
 	graph: &Graph<Frozen>,
 	tables: &[LocalCommitTable],
 	memberships: &BTreeMap<AtomId, u32>,
 	disk_refs: &BTreeMap<AtomId, DiskAtomRef>,
 	context: &mut EncodeContext,
-) -> FerrosGrynnResult<Vec<BuiltScalarIndexImage>> {
+) -> FerrosGrynnResult<Vec<BuiltTableIndexImage>> {
 	let mut built = Vec::new();
 	for table in tables.iter().filter(|table| table.graph == *record_id) {
 		for index in &table.indexes {
+			if index.kind == TableIndexKind::Count {
+				let atom_count = u64::try_from(
+					memberships.values().filter(|table_id| **table_id == table.id).count(),
+				)
+				.map_err(|_error| {
+					FerrosGrynnError::invalid_storage_file("table count exceeds u64")
+				})?;
+				built.push(BuiltTableIndexImage {
+					table: table.name.clone(),
+					table_id: table.id,
+					name: index.name.clone(),
+					index_id: index.id,
+					schema_version: index.version,
+					kind: index.kind,
+					fields: Vec::new(),
+					root: PageNo::new(0),
+					pages: vec![encode_count_index(
+						CountIndexValue {
+							table_id: table.id,
+							atom_count,
+							last_updated_lsn: 0,
+							created_at_lsn: 0,
+						},
+						PageLsn::ZERO,
+					)?],
+				});
+				continue;
+			}
 			let fields = index
 				.fields
 				.iter()
@@ -2485,7 +2728,7 @@ pub(super) fn build_scalar_indexes(
 						})
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
-			let mut grouped = BTreeMap::<Vec<u8>, Vec<DiskAtomRef>>::new();
+			let mut sorter = ExternalIndexSorter::new(root);
 			for kind in [AtomKind::Node, AtomKind::Edge] {
 				if !table_kind_accepts(table.kind, kind) {
 					continue;
@@ -2533,29 +2776,25 @@ pub(super) fn build_scalar_indexes(
 							"indexed atom has no assigned disk reference",
 						)
 					})?;
-					grouped.entry(key).or_default().push(atom);
+					sorter.push(key, atom)?;
 				}
 			}
-			let entries = grouped
-				.into_iter()
-				.map(|(key, mut atoms)| {
-					atoms.sort_unstable();
-					atoms.dedup();
-					ScalarIndexEntry {
-						key,
-						atoms,
-					}
-				})
-				.collect::<Vec<_>>();
+			let records = sorter.finish()?;
 			let mode = match index.kind {
 				TableIndexKind::Standard => ScalarIndexMode::Standard,
 				TableIndexKind::Unique => ScalarIndexMode::Unique,
+				TableIndexKind::Count => {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"Count index reached scalar B+tree packing",
+					));
+				}
 			};
-			let tree = build_scalar_index(&entries, mode, PageLsn::ZERO)?;
-			built.push(BuiltScalarIndexImage {
+			let tree = build_scalar_index_sorted(&records, mode, PageLsn::ZERO)?;
+			built.push(BuiltTableIndexImage {
 				table: table.name.clone(),
+				table_id: table.id,
 				name: index.name.clone(),
-				schema_id: index.id,
+				index_id: index.id,
 				schema_version: index.version,
 				kind: index.kind,
 				fields: index.fields.clone(),
@@ -2564,10 +2803,52 @@ pub(super) fn build_scalar_indexes(
 			});
 		}
 	}
-	built.sort_unstable_by(|left, right| {
-		(left.table.as_str(), left.name.as_str()).cmp(&(right.table.as_str(), right.name.as_str()))
-	});
+	built.sort_unstable_by_key(|index| index.index_id);
 	Ok(built)
+}
+
+/// Builds dense immutable side-files for every label present in one graph
+/// image.
+fn build_label_indexes(
+	graph: &Graph<Frozen>,
+	node_ids: &[AtomId],
+	edge_ids: &[AtomId],
+	disk_refs: &BTreeMap<AtomId, DiskAtomRef>,
+	node_labels: &BTreeMap<String, u32>,
+	edge_labels: &BTreeMap<String, u32>,
+) -> FerrosGrynnResult<Vec<BuiltLabelIndexImage>> {
+	let mut grouped = BTreeMap::<(AtomKind, u32), Vec<DiskAtomRef>>::new();
+	for (kind, ids, labels) in
+		[(AtomKind::Node, node_ids, node_labels), (AtomKind::Edge, edge_ids, edge_labels)]
+	{
+		for id in ids {
+			let label = match kind {
+				AtomKind::Node => graph.node(*id).and_then(|node| node.label()),
+				AtomKind::Edge => graph.edge(*id).and_then(|edge| edge.label()),
+			};
+			let Some(label) = label else {
+				continue;
+			};
+			let label_id = labels.get(label).copied().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("graph label was not interned")
+			})?;
+			let atom = disk_refs.get(id).copied().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("labeled atom has no disk reference")
+			})?;
+			grouped.entry((kind, label_id)).or_default().push(atom);
+		}
+	}
+	grouped
+		.into_iter()
+		.map(|((kind, label_id), mut atoms)| {
+			atoms.sort_unstable_by_key(|atom| atom.slot());
+			Ok(BuiltLabelIndexImage {
+				kind,
+				label_id,
+				pages: build_label_index(&atoms, kind, PageLsn::ZERO)?,
+			})
+		})
+		.collect()
 }
 
 pub(super) fn encode_optional_properties(
@@ -3264,6 +3545,7 @@ pub(super) fn load_graph(
 	}
 	validate_node_adjacency(&loaded_nodes, &loaded_edges, &edges)?;
 	validate_auxiliary_files(&paths, &superblock, &labels)?;
+	validate_freelist_files(root, entry.graph_id, files)?;
 
 	let decoded = DecodedGraph {
 		identity: uuid::Uuid::from_bytes(entry.identity).into(),
@@ -3286,6 +3568,9 @@ pub(super) fn graph_file_paths(
 		let kind = entry.file_id.kind().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("graph file has an unknown kind")
 		})?;
+		if kind == DataFileKind::Freelist {
+			continue;
+		}
 		if kind == DataFileKind::Index && entry.file_id != graph.primary_index_file_id {
 			continue;
 		}
@@ -3295,7 +3580,7 @@ pub(super) fn graph_file_paths(
 			));
 		}
 	}
-	for (kind, _name) in GRAPH_FILE_KINDS {
+	for (kind, _name) in file_layout::GRAPH_FILES {
 		if !paths.contains_key(&kind) {
 			return Err(FerrosGrynnError::invalid_storage_file(format!(
 				"graph catalog is missing {kind:?}"
@@ -3501,14 +3786,10 @@ pub(super) fn validate_auxiliary_files(
 	labels: &LabelDictionary,
 ) -> FerrosGrynnResult<()> {
 	let subgraphs = open_graph_file(paths, DataFileKind::Subgraphs)?;
-	let freelist = open_graph_file(paths, DataFileKind::Freelist)?;
 	let graph_statistics = open_graph_file(paths, DataFileKind::Statistics)?;
 	let label_statistics = open_graph_file(paths, DataFileKind::LabelStatistics)?;
 	let property_statistics = open_graph_file(paths, DataFileKind::PropertyStatistics)?;
-	if subgraphs.page_count() != 1
-		|| freelist.page_count() != 1
-		|| graph_statistics.page_count() == 0
-	{
+	if subgraphs.page_count() != 1 || graph_statistics.page_count() == 0 {
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"auxiliary files have an invalid root-page count",
 		));
@@ -3518,13 +3799,6 @@ pub(super) fn validate_auxiliary_files(
 	if decode_subgraph_directory(&page, PageNo::new(0))? != (None, Vec::new()) {
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"stage-4 subgraph directory is not empty",
-		));
-	}
-	freelist.read_page(PageNo::new(0), &mut page)?;
-	let (_first, next, bitmap) = decode_freelist(&page, PageNo::new(0))?;
-	if next.is_some() || bitmap.iter().any(|byte| *byte != 0) {
-		return Err(FerrosGrynnError::invalid_storage_file(
-			"immutable generation freelist is not empty",
 		));
 	}
 	graph_statistics.read_page(PageNo::new(0), &mut page)?;
@@ -3553,6 +3827,40 @@ pub(super) fn validate_auxiliary_files(
 	if stats.node_count != superblock.node_count || stats.edge_count != superblock.edge_count {
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"statistics counts disagree with GraphSuperblock",
+		));
+	}
+	Ok(())
+}
+
+/// Validates all empty freelist roots through the legacy direct loader.
+fn validate_freelist_files(
+	root: &Path,
+	graph_id: GraphId,
+	files: &FileCatalog,
+) -> FerrosGrynnResult<()> {
+	let mut count = 0;
+	for entry in files.files.iter().filter(|entry| {
+		entry.graph_id == graph_id && entry.file_id.kind() == Some(DataFileKind::Freelist)
+	}) {
+		let file = DirectFile::open_read_only(entry.path.resolve(root))?;
+		if file.page_count() != 1 {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"freelist file must contain exactly one page",
+			));
+		}
+		let mut page = AlignedPage::zeroed();
+		file.read_page(PageNo::new(0), &mut page)?;
+		let (_first, next, bitmap) = decode_freelist(&page, PageNo::new(0))?;
+		if next.is_some() || bitmap.iter().any(|byte| *byte != 0) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"immutable generation freelist is not empty",
+			));
+		}
+		count += 1;
+	}
+	if count != file_layout::FREELIST_FILES.len() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"graph generation does not contain six freelist files",
 		));
 	}
 	Ok(())

@@ -1978,8 +1978,14 @@ impl Transaction {
 			SchemaVersion::INITIAL,
 			name.clone(),
 			reference.clone(),
-			SystemIndex::new(self.store.inner.allocate_schema_id()?, SystemIndexKind::Label),
-			SystemIndex::new(self.store.inner.allocate_schema_id()?, SystemIndexKind::Adjacency),
+			SystemIndex::new(
+				IndexId::from_schema_id(self.store.inner.allocate_schema_id()?),
+				SystemIndexKind::Label,
+			),
+			SystemIndex::new(
+				IndexId::from_schema_id(self.store.inner.allocate_schema_id()?),
+				SystemIndexKind::Adjacency,
+			),
 			0,
 		);
 		self.graphs.insert(id.clone(), GraphWrite {
@@ -2094,7 +2100,7 @@ impl Transaction {
 		schema.id = Some(self.store.inner.allocate_schema_id()?);
 		schema.version = SchemaVersion::INITIAL;
 		schema.primary_index = Some(SystemIndex::new(
-			self.store.inner.allocate_schema_id()?,
+			IndexId::from_schema_id(self.store.inner.allocate_schema_id()?),
 			SystemIndexKind::Primary,
 		));
 		for field in &mut schema.fields {
@@ -2102,7 +2108,7 @@ impl Transaction {
 			field.version = SchemaVersion::INITIAL;
 		}
 		for index in &mut schema.indexes {
-			index.id = Some(self.store.inner.allocate_schema_id()?);
+			index.id = Some(IndexId::from_schema_id(self.store.inner.allocate_schema_id()?));
 			index.version = SchemaVersion::INITIAL;
 		}
 		if !schema.indexes.is_empty() {
@@ -2174,7 +2180,7 @@ impl Transaction {
 					old.version.next()?
 				};
 			} else {
-				index.id = Some(self.store.inner.allocate_schema_id()?);
+				index.id = Some(IndexId::from_schema_id(self.store.inner.allocate_schema_id()?));
 				index.version = SchemaVersion::INITIAL;
 			}
 		}

@@ -150,6 +150,44 @@ fn validate_registration_paths(
 	Ok(())
 }
 
+/// Identifies non-primary index files whose schema may fall back to a scan.
+fn degradable_index_keys(
+	database: &DatabaseCatalog,
+	files: &FileCatalog,
+) -> RapidHashSet<(GraphId, crate::storage::types::DataFileId)> {
+	let primary = database
+		.graphs
+		.iter()
+		.map(|graph| (graph.graph_id, graph.primary_index_file_id))
+		.collect::<RapidHashSet<_>>();
+	files
+		.files
+		.iter()
+		.filter(|file| file.file_id.kind() == Some(DataFileKind::Index))
+		.map(|file| (file.graph_id, file.file_id))
+		.filter(|key| !primary.contains(key))
+		.collect()
+}
+
+/// Omits missing secondary-index files while preserving their catalog schema.
+fn retain_available_indexes(
+	registrations: Vec<DataFileRegistration>,
+	degradable: &RapidHashSet<(GraphId, crate::storage::types::DataFileId)>,
+) -> FerrosGrynnResult<Vec<DataFileRegistration>> {
+	let mut available = Vec::with_capacity(registrations.len());
+	for registration in registrations {
+		let key = (registration.graph_id, registration.file_id);
+		match registration.path.try_exists() {
+			Ok(false) if degradable.contains(&key) => continue,
+			Ok(_) => available.push(registration),
+			Err(source) => {
+				return Err(local_io("inspect cataloged data file", source));
+			}
+		}
+	}
+	Ok(available)
+}
+
 /// Preserves a native local-layout failure behind the storage status boundary.
 fn local_io(operation: impl Into<String>, source: std::io::Error) -> FerrosGrynnError {
 	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
@@ -290,7 +328,12 @@ mod tests {
 				graph_count: 1,
 			};
 			write_initial_page(&directory.join(DATABASE_SUPERBLOCK_FILE), &database.encode()?)?;
-			let graph_superblock = directory.join("graph.fgb");
+			let superblock_name =
+				crate::storage::store::file_layout::graph_filename(DataFileKind::GraphSuperblock)
+					.ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("test superblock filename is undefined")
+				})?;
+			let graph_superblock = directory.join(superblock_name);
 			write_initial_page(&graph_superblock, &test_graph_superblock()?.encode()?)?;
 
 			let mut files = Vec::with_capacity(file_ids.len());

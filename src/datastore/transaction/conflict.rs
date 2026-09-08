@@ -550,11 +550,11 @@ fn local_commit_graph_schema(schema: &GraphSchema) -> FerrosGrynnResult<LocalCom
 		id: schema.id().get(),
 		version: schema.version().get(),
 		label_index: LocalCommitSystemIndex {
-			id: label.id().get(),
+			id: label.id(),
 			version: label.version().get(),
 		},
 		adjacency_index: LocalCommitSystemIndex {
-			id: adjacency.id().get(),
+			id: adjacency.id(),
 			version: adjacency.version().get(),
 		},
 	})

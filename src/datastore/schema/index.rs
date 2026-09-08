@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
-use super::{SchemaId, SchemaVersion};
+use super::{IndexId, SchemaVersion};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::Text,
 };
 
-/// Scalar B+tree uniqueness contract for one table index.
+/// Physical contract for one user-declared table index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TableIndexKind {
@@ -14,18 +14,20 @@ pub enum TableIndexKind {
 	Standard,
 	/// One key may reference at most one atom.
 	Unique,
+	/// Exact number of live members; no fields participate in the key.
+	Count,
 }
 
 /// Declarative scalar B+tree attached to one table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableIndex {
 	/// Stable identity assigned when the containing table is published.
-	pub(crate) id: Option<SchemaId>,
+	pub(crate) id: Option<IndexId>,
 	/// Semantic definition version.
 	pub(crate) version: SchemaVersion,
 	/// Table-local index name.
 	pub(crate) name: Text,
-	/// Whether duplicate keys are permitted.
+	/// Physical index contract.
 	pub(crate) kind: TableIndexKind,
 	/// Indexed fields in composite-key order.
 	pub(crate) fields: Vec<Text>,
@@ -37,8 +39,9 @@ impl TableIndex {
 	///
 	/// # Errors
 	///
-	/// Returns an invalid-argument error when the index name or field list is
-	/// empty, names the synthetic `id` column, or repeats a field.
+	/// Returns an invalid-argument error when the name is empty, a Count index
+	/// names fields, or a scalar index has no fields, names the synthetic `id`
+	/// column, or repeats a field.
 	pub fn new<IntoText, Fields>(
 		name: IntoText,
 		kind: TableIndexKind,
@@ -52,9 +55,13 @@ impl TableIndex {
 		let name = name.into();
 		let fields = fields.into_iter().map(Into::into).collect::<Vec<_>>();
 		let mut unique = BTreeSet::new();
+		let invalid_fields = match kind {
+			TableIndexKind::Count => !fields.is_empty(),
+			TableIndexKind::Standard | TableIndexKind::Unique => fields.is_empty(),
+		};
 		if name.is_empty()
 			|| name.as_str().contains('\0')
-			|| fields.is_empty()
+			|| invalid_fields
 			|| fields.iter().any(|field| {
 				field.is_empty()
 					|| field.as_str().contains('\0')
@@ -62,7 +69,7 @@ impl TableIndex {
 					|| !unique.insert(field.clone())
 			}) {
 			return Err(FerrosGrynnError::invalid_argument(
-				"an index requires a non-empty name and unique explicit table fields",
+				"an index requires a non-empty name and fields matching its physical kind",
 			));
 		}
 		Ok(Self {
@@ -75,7 +82,7 @@ impl TableIndex {
 	}
 
 	/// Returns the stable identity after the containing table is published.
-	pub const fn id(&self) -> Option<SchemaId> {
+	pub const fn id(&self) -> Option<IndexId> {
 		self.id
 	}
 
@@ -89,7 +96,7 @@ impl TableIndex {
 		&self.name
 	}
 
-	/// Returns the standard or unique key contract.
+	/// Returns the physical index contract.
 	pub const fn kind(&self) -> TableIndexKind {
 		self.kind
 	}

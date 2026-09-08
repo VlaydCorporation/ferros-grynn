@@ -423,6 +423,9 @@ impl WriterState {
 		let mut payload = Vec::with_capacity(PAGE_FRAME_PAYLOAD_SIZE);
 		for (key, staged_page) in staged.iter_mut() {
 			let frame_lsn = self.next_lsn;
+			if staged_page.page.validate(key.page_no())?.page_type() == PageType::IndexCountSingle {
+				stamp_count_index_lsn(&mut staged_page.page, frame_lsn.get())?;
+			}
 			staged_page.page.assign_lsn(key.page_no(), PageLsn::new(frame_lsn.get()))?;
 			payload.clear();
 			encode_page_key(*key, &mut payload);

@@ -32,7 +32,9 @@
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
 - `catalog` и `superblock` — versioned database metadata;
 - `graph_pages` — физические graph page families;
-- `graph_index` — label, primary и scalar B+tree indexes;
+- `graph_index` — order-preserving primary и общий внутренний B+tree codec для
+  раздельных Standard/Unique контрактов, bounded Direct-I/O
+  external sort, bottom-up packing, immutable Label arrays и single-page Count;
 - `store` — open/load, transaction views, commit и startup GC;
 - `local` — адаптер локального datastore.
 
@@ -46,6 +48,15 @@
   семантику ошибок.
 - On-disk числа, magic, tags и checksums меняются только вместе со
   спецификацией, golden vectors и recovery tests.
+- `IndexId` — стабильная логическая identity определения из общего schema
+  clock; `SchemaVersion` — версия определения; `DataFileId` — identity
+  физического COW-файла; ordinal используется только в безопасном локальном
+  filename. Binding индекса разрешается по `IndexId`, не по имени.
+- `GraphSuperblock` хранится только в `superblock.fgb`. Ровно шесть изменяемых
+  data-файлов имеют отдельные `freelist_*.fgb`; связь target хранит
+  `FGFC v4.companion_of`. Standard и Unique называются соответственно
+  `std_<ordinal:04>.fgidx` и `uniq_<ordinal:04>.fgidx`; `scalar` допустим только
+  как внутреннее имя общей реализации.
 - Любая входная длина/счётчик проверяется до allocation; ошибки проходят через
   `gql_status` без раскрытия локальных путей и сырых страниц.
 

@@ -120,6 +120,8 @@ bitflags! {
 		const LZ4_PROPERTIES = 0x02;
 		/// Graph is opened read-only.
 		const READ_ONLY = 0x04;
+		/// Per-label side-files do not represent the current graph revision.
+		const LABEL_INDEX_STALE = 0x08;
 	}
 }
 
@@ -635,7 +637,7 @@ mod tests {
 		assert!(DatabaseSuperblock::decode(&database).is_err());
 
 		let mut graph = graph_fixture().encode()?;
-		write_u64(graph.as_bytes_mut(), GRAPH_FLAGS_OFFSET, 0x08);
+		write_u64(graph.as_bytes_mut(), GRAPH_FLAGS_OFFSET, 0x10);
 		graph.seal()?;
 		assert!(GraphSuperblock::decode(&graph).is_err());
 

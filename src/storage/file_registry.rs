@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use rapidhash::{HashMapExt, RapidHashMap};
+use rapidhash::{HashMapExt, HashSetExt, RapidHashMap, RapidHashSet};
 
 use super::{
 	direct::{DirectFile, DirectFileOpenMode},
@@ -78,20 +78,32 @@ impl FileRegistry {
 	/// # Errors
 	///
 	/// Returns an error for duplicate identities, a role/kind mismatch, an
-	/// invalid graph-superblock length, or any Direct-I/O open failure.
+	/// invalid graph-superblock length, or a required Direct-I/O open failure.
+	/// Cataloged secondary indexes in `degradable` are omitted when their
+	/// physical file cannot be opened so callers can retain schema and fall
+	/// back to a primary scan.
 	pub(super) fn open(
 		registrations: Vec<DataFileRegistration>,
 		io_mode: DirectFileOpenMode,
+		degradable: &RapidHashSet<(GraphId, DataFileId)>,
 	) -> FerrosGrynnResult<Self> {
 		let mut files = RapidHashMap::with_capacity(registrations.len());
+		let mut seen = RapidHashSet::with_capacity(registrations.len());
 		for registration in registrations {
 			let key = (registration.graph_id, registration.file_id);
-			if files.contains_key(&key) {
+			if !seen.insert(key) {
 				return Err(FerrosGrynnError::invalid_storage_file(
 					"duplicate data-file identity in sealed registry",
 				));
 			}
-			files.insert(key, Arc::new(open_registration(registration, io_mode)?));
+			validate_role(registration.file_id, registration.role)?;
+			match open_registration(registration, io_mode) {
+				Ok(file) => {
+					files.insert(key, Arc::new(file));
+				}
+				Err(_error) if degradable.contains(&key) => {}
+				Err(error) => return Err(error),
+			}
 		}
 		Ok(Self {
 			files,
@@ -128,6 +140,11 @@ impl FileRegistry {
 		for key in keys {
 			self.files.remove(key);
 		}
+	}
+
+	/// Reports whether one complete physical identity remains available.
+	pub(super) fn contains(&self, graph_id: GraphId, file_id: DataFileId) -> bool {
+		self.files.contains_key(&(graph_id, file_id))
 	}
 
 	/// Resolves a page key without deriving or opening a path from WAL bytes.

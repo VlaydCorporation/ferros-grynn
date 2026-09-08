@@ -24,6 +24,7 @@ pub(in crate::storage) struct BuiltScalarIndex {
 }
 
 /// Bulk-builds a standard or unique scalar B+tree from canonical entries.
+#[cfg(test)]
 pub(in crate::storage) fn build_scalar_index(
 	entries: &[ScalarIndexEntry],
 	mode: ScalarIndexMode,
@@ -95,33 +96,9 @@ pub(in crate::storage) fn build_scalar_index(
 		});
 	}
 	pages.extend(posting_pages);
-	while level.len() > 1 {
-		let groups = partition_internal_children(&level)?;
-		if groups.len() == level.len() {
-			return Err(invalid_index("scalar separator key exceeds internal-page capacity"));
-		}
-		let mut next_level = Vec::with_capacity(groups.len());
-		for group in groups {
-			if group.len() == 1 {
-				next_level.push(group[0].clone());
-				continue;
-			}
-			let page_no = PageNo::new(
-				u64::try_from(pages.len())
-					.map_err(|_error| invalid_index("scalar B+tree page index exceeds u64"))?,
-			);
-			let page_index = pages.len();
-			pages.push(AlignedPage::zeroed());
-			encode_internal_page(&mut pages[page_index], page_no, page_lsn, group)?;
-			next_level.push(ChildPage {
-				page_no,
-				min_key: group[0].min_key.clone(),
-			});
-		}
-		level = next_level;
-	}
+	let root = append_internal_levels(&mut pages, level, page_lsn)?;
 	Ok(BuiltScalarIndex {
-		root: level.first().map_or(PageNo::new(0), |child| child.page_no),
+		root,
 		pages,
 	})
 }
