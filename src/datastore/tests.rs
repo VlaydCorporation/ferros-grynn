@@ -560,7 +560,7 @@ fn local_graph_table_and_edge_survive_reopen() {
 		}
 	}
 	let mut bounded = reopened.begin();
-	assert!(bounded.mutate_graph(schema.graph().unwrap()).is_err());
+	assert!(bounded.mutate_graph(schema.graph().unwrap()).is_ok());
 	drop(bounded);
 	let transaction = reopened.begin();
 	let view = schema.graph().unwrap().read(&transaction).unwrap();
@@ -688,7 +688,7 @@ fn local_graph_table_and_edge_survive_reopen() {
 	assert!(rows.as_slice().contains(&Value::from("Alice")));
 	assert!(rows.as_slice().contains(&Value::from("Bob")));
 	let mut bounded = fallback.begin();
-	assert!(bounded.mutate_graph(&reference).is_err());
+	assert!(bounded.mutate_graph(&reference).is_ok());
 	drop(bounded);
 	drop(fallback);
 
@@ -1506,6 +1506,144 @@ fn local_point_mutations_survive_reopen() {
 	);
 }
 
+/// GrynQL DML keeps the graph-backed table and primary index recoverable.
+#[cfg(windows)]
+#[test]
+fn local_gql_dml_survives_reopen() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 16,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let mut create = store.begin();
+	let graph =
+		create.create_graph(graph_id("gql-dml"), Graph::<Mutable>::new().freeze().into()).unwrap();
+	create
+		.define_table(
+			TableSchema::new("person", graph, TableKind::Normal, Vec::<TableField>::new()).unwrap(),
+		)
+		.unwrap();
+	create.commit().unwrap();
+
+	let results = store
+		.execute(
+			"CREATE person:alice CONTENT {name: 'Alice', version: 1}; UPSERT person:alice SET \
+			 version = 2 RETURN AFTER EXPECT version = 1; CREATE person:bob CONTENT {name: 'Bob'} \
+			 EXPECT NOT EXISTS; DELETE person:bob RETURN BEFORE EXPECT EXISTS",
+			&Object::new(),
+		)
+		.unwrap();
+	for result in &results {
+		if let Err(error) = &result.result {
+			panic!("GrynQL DML failed: {error:?}");
+		}
+	}
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	let readback = store.execute("UPDATE person:alice RETURN *", &Object::new()).unwrap();
+	let Value::Array(rows) = readback[0].result.as_ref().unwrap().value() else {
+		panic!("expected readback rows");
+	};
+	let row = rows.get(0).and_then(Value::as_object).expect("record object");
+	assert_eq!(row.get("name"), Some(&Value::from("Alice")));
+	assert_eq!(row.get("version"), Some(&Value::from(2_i64)));
+}
+
+/// Point DML maintains ready Standard and Unique indexes in the same WAL
+/// commit and preserves their bindings across reopen.
+#[cfg(windows)]
+#[test]
+fn local_gql_dml_maintains_scalar_indexes() {
+	let directory = LocalTestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 32,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(directory.path(), options).unwrap();
+	let mut create = store.begin();
+	let graph = create
+		.create_graph(graph_id("dml-index"), Graph::<Mutable>::new().freeze().into())
+		.unwrap();
+	create
+		.define_table(
+			TableSchema::new("person", graph, TableKind::Normal, [
+				TableField::new("name", Type::String),
+				TableField::new("email", Type::String),
+				TableField::new("city", Type::String),
+			])
+			.unwrap()
+			.with_index(TableIndex::new("person_email", TableIndexKind::Unique, ["email"]).unwrap())
+			.unwrap()
+			.with_index(TableIndex::new("person_city", TableIndexKind::Standard, ["city"]).unwrap())
+			.unwrap(),
+		)
+		.unwrap();
+	create.commit().unwrap();
+
+	for statement in [
+		"CREATE person:alice CONTENT {name: 'Alice', email: 'alice@old', city: 'Moscow'}; CREATE \
+		 person:bob CONTENT {name: 'Bob', email: 'bob@old', city: 'Moscow'}",
+		"UPDATE person:alice SET email = 'alice@new', city = 'Kazan'",
+	] {
+		let result = store.execute(statement, &Object::new()).unwrap();
+		assert!(result.iter().all(|result| result.result.is_ok()), "{statement}");
+	}
+	let old = store
+		.execute("SELECT VALUE name FROM person WHERE email = 'alice@old'", &Object::new())
+		.unwrap();
+	assert_eq!(old[0].result.as_ref().unwrap().value(), &Value::Array(Array::new(Vec::new())));
+	let moscow = store
+		.execute("SELECT VALUE name FROM person WHERE city = 'Moscow'", &Object::new())
+		.unwrap();
+	assert_eq!(
+		moscow[0].result.as_ref().unwrap().value(),
+		&Value::Array(Array::new(vec![Value::from("Bob")]))
+	);
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	let current = store
+		.execute("SELECT VALUE name FROM person WHERE email = 'alice@new'", &Object::new())
+		.unwrap();
+	assert_eq!(
+		current[0].result.as_ref().unwrap().value(),
+		&Value::Array(Array::new(vec![Value::from("Alice")]))
+	);
+	let failed =
+		store.execute("UPDATE person:bob SET email = 'alice@new'", &Object::new()).unwrap_err();
+	assert_eq!(failed.status().code(), crate::gql_status::StatusCode::new(*b"G2F04"));
+	let unchanged = store.execute("SELECT VALUE email FROM person:bob", &Object::new()).unwrap();
+	assert_eq!(
+		unchanged[0].result.as_ref().unwrap().value(),
+		&Value::Array(Array::new(vec![Value::from("bob@old")]))
+	);
+	let deleted = store.execute("DELETE person:bob RETURN BEFORE", &Object::new()).unwrap();
+	assert!(deleted[0].result.is_ok());
+	let replacement = store
+		.execute(
+			"CREATE person:carol CONTENT {name: 'Carol', email: 'bob@old', city: 'Moscow'}",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(replacement[0].result.is_ok());
+	drop(store);
+
+	let store = Datastore::open_local(directory.path(), options).unwrap();
+	for query in [
+		"SELECT VALUE name FROM person WHERE email = 'bob@old'",
+		"SELECT VALUE name FROM person WHERE city = 'Moscow'",
+	] {
+		let result = store.execute(query, &Object::new()).unwrap();
+		assert_eq!(
+			result[0].result.as_ref().unwrap().value(),
+			&Value::Array(Array::new(vec![Value::from("Carol")])),
+			"{query}"
+		);
+	}
+}
+
 /// Snapshot transactions that change disjoint atoms rebase their logical
 /// revision without losing either page delta.
 #[cfg(windows)]
@@ -1584,9 +1722,13 @@ fn local_disjoint_dag_writes_revalidate_the_merged_graph() {
 	let mut dag = Dag::<Mutable>::new();
 	let nodes =
 		records.map(|record| dag.add_node_with_id(record, None, PropertyMap::new()).unwrap());
-	dag.add_edge_with_id(nodes[0], nodes[1], "edge:ab".parse().unwrap(), None, PropertyMap::new())
+	dag.add_edge_with_id(nodes[1], nodes[2], "edge:bc".parse().unwrap(), None, PropertyMap::new())
 		.unwrap();
-	dag.add_edge_with_id(nodes[2], nodes[3], "edge:cd".parse().unwrap(), None, PropertyMap::new())
+	dag.add_edge_with_id(nodes[3], nodes[0], "edge:da".parse().unwrap(), None, PropertyMap::new())
+		.unwrap();
+	dag.add_edge_with_id(nodes[1], nodes[0], "edge:x".parse().unwrap(), None, PropertyMap::new())
+		.unwrap();
+	dag.add_edge_with_id(nodes[3], nodes[2], "edge:y".parse().unwrap(), None, PropertyMap::new())
 		.unwrap();
 	let mut create = store.begin();
 	let graph = create.create_graph(graph_id("dag-revalidation"), dag.freeze().into()).unwrap();
@@ -1601,43 +1743,135 @@ fn local_disjoint_dag_writes_revalidate_the_merged_graph() {
 	first
 		.mutate_graph(&graph)
 		.unwrap()
-		.create_edge(
-			"edge:bc".parse().unwrap(),
+		.replace_incidence(
+			&AtomRef::new(AtomKind::Edge, "edge:x".parse().unwrap()),
 			&AtomRefTopology::Directed {
-				source: vec![references[1].clone()],
-				target: vec![references[2].clone()],
+				source: vec![references[0].clone()],
+				target: vec![references[1].clone()],
 			},
-			None,
-			PropertyMap::new(),
 		)
 		.unwrap();
 	second
 		.mutate_graph(&graph)
 		.unwrap()
-		.create_edge(
-			"edge:da".parse().unwrap(),
+		.replace_incidence(
+			&AtomRef::new(AtomKind::Edge, "edge:y".parse().unwrap()),
 			&AtomRefTopology::Directed {
-				source: vec![references[3].clone()],
-				target: vec![references[0].clone()],
+				source: vec![references[2].clone()],
+				target: vec![references[3].clone()],
 			},
-			None,
-			PropertyMap::new(),
 		)
 		.unwrap();
 	first.commit().unwrap();
-	assert!(second.commit().is_err());
+	assert_eq!(second.commit().unwrap_err().status().code().to_string(), "FG-G2F04");
 	drop(store);
 
 	let store = Datastore::open_local(directory.path(), options).unwrap();
 	let read = store.begin();
 	let view = graph.read(&read).unwrap();
-	assert_eq!(view.edge_count().unwrap(), 3);
-	assert!(
-		view.atom_id(&AtomRef::new(AtomKind::Edge, "edge:bc".parse().unwrap())).unwrap().is_some()
+	assert_eq!(view.edge_count().unwrap(), 4);
+	let a = view.atom_id(&references[0]).unwrap().unwrap();
+	let b = view.atom_id(&references[1]).unwrap().unwrap();
+	let c = view.atom_id(&references[2]).unwrap().unwrap();
+	let d = view.atom_id(&references[3]).unwrap().unwrap();
+	let x =
+		view.atom_id(&AtomRef::new(AtomKind::Edge, "edge:x".parse().unwrap())).unwrap().unwrap();
+	let y =
+		view.atom_id(&AtomRef::new(AtomKind::Edge, "edge:y".parse().unwrap())).unwrap().unwrap();
+	assert_eq!(
+		view.edge(x).unwrap().unwrap().topology().unwrap().as_ref(),
+		&EdgeTopology::directed([a], [b])
 	);
-	assert!(
-		view.atom_id(&AtomRef::new(AtomKind::Edge, "edge:da".parse().unwrap())).unwrap().is_none()
+	assert_eq!(
+		view.edge(y).unwrap().unwrap().topology().unwrap().as_ref(),
+		&EdgeTopology::directed([d], [c])
 	);
+}
+
+#[test]
+fn graph_family_commit_revalidation_applies_to_every_isolation_level() {
+	for isolation in
+		[IsolationLevel::ReadCommitted, IsolationLevel::Snapshot, IsolationLevel::Serializable]
+	{
+		let store = Datastore::in_memory();
+		let records = ["node:a", "node:b", "node:c", "node:d"]
+			.map(|record| record.parse::<RecordId>().unwrap());
+		let references = records.clone().map(|record| AtomRef::new(AtomKind::Node, record));
+		let mut dag = Dag::<Mutable>::new();
+		let nodes =
+			records.map(|record| dag.add_node_with_id(record, None, PropertyMap::new()).unwrap());
+		dag.add_edge_with_id(
+			nodes[1],
+			nodes[2],
+			"edge:bc".parse().unwrap(),
+			None,
+			PropertyMap::new(),
+		)
+		.unwrap();
+		dag.add_edge_with_id(
+			nodes[3],
+			nodes[0],
+			"edge:da".parse().unwrap(),
+			None,
+			PropertyMap::new(),
+		)
+		.unwrap();
+		dag.add_edge_with_id(
+			nodes[1],
+			nodes[0],
+			"edge:x".parse().unwrap(),
+			None,
+			PropertyMap::new(),
+		)
+		.unwrap();
+		dag.add_edge_with_id(
+			nodes[3],
+			nodes[2],
+			"edge:y".parse().unwrap(),
+			None,
+			PropertyMap::new(),
+		)
+		.unwrap();
+		let mut create = store.begin();
+		let graph = create.create_graph(graph_id("dag-isolation"), dag.freeze().into()).unwrap();
+		create.commit().unwrap();
+
+		let options = TransactionOptions {
+			isolation,
+			access: TransactionAccess::ReadWrite,
+		};
+		let mut first = store.begin_with(options);
+		let mut second = store.begin_with(options);
+		first
+			.mutate_graph(&graph)
+			.unwrap()
+			.replace_incidence(
+				&AtomRef::new(AtomKind::Edge, "edge:x".parse().unwrap()),
+				&AtomRefTopology::Directed {
+					source: vec![references[0].clone()],
+					target: vec![references[1].clone()],
+				},
+			)
+			.unwrap();
+		second
+			.mutate_graph(&graph)
+			.unwrap()
+			.replace_incidence(
+				&AtomRef::new(AtomKind::Edge, "edge:y".parse().unwrap()),
+				&AtomRefTopology::Directed {
+					source: vec![references[2].clone()],
+					target: vec![references[3].clone()],
+				},
+			)
+			.unwrap();
+		first.commit().unwrap();
+		let error = second.commit().expect_err("the merged graph contains a cycle");
+		assert_eq!(error.status().code().to_string(), "FG-G2F04", "{isolation:?}");
+
+		let read = store.begin();
+		let view = graph.read(&read).unwrap();
+		assert_eq!(view.edge_count().unwrap(), 4, "{isolation:?}");
+	}
 }
 
 /// Removing and recreating one stable RecordId in a transaction publishes

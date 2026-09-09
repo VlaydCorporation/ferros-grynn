@@ -4,10 +4,12 @@
 )]
 use super::*;
 
+#[derive(Clone)]
 pub(crate) struct QueryStorageRow {
 	pub(crate) record_id: RecordId,
 	pub(crate) atom_id: AtomId,
 	pub(crate) values: Vec<Value>,
+	pub(crate) properties: PropertyMap,
 }
 
 /// Backend-neutral bounded row source used by the hybrid integration path.
@@ -150,11 +152,6 @@ impl QuerySnapshot {
 	pub(crate) fn commit_ts(&self) -> u64 {
 		self.root.commit_ts
 	}
-
-	/// Returns the property dictionary captured by this query snapshot.
-	pub(crate) fn property_dictionary(&self) -> Arc<PropertyDictionary> {
-		self.root.dictionary.clone()
-	}
 }
 
 pub(crate) trait PredicateEvaluator {
@@ -166,6 +163,14 @@ pub(crate) trait PredicateEvaluator {
 	reason = "transaction responsibilities are split into cohesive modules"
 )]
 impl Transaction {
+	/// Returns the latest append-only property dictionary.
+	///
+	/// Property identities are never removed or rebound, so observing names
+	/// interned after the data snapshot cannot change row visibility.
+	pub(crate) fn query_property_dictionary(&self) -> Arc<PropertyDictionary> {
+		self.store.property_dictionary()
+	}
+
 	pub(crate) fn query_snapshot(&self) -> FerrosGrynnResult<QuerySnapshot> {
 		self.ensure_live()?;
 		Ok(QuerySnapshot {
@@ -628,5 +633,6 @@ pub(super) fn row_from_properties(
 		record_id: record_id.clone(),
 		atom_id,
 		values,
+		properties: properties.clone(),
 	}
 }

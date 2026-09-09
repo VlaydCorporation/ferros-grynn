@@ -612,7 +612,7 @@ fn streaming_limit_keeps_local_serializable_predicate() -> Result<(), Box<dyn Er
 	])?)?;
 	create.commit()?;
 
-	let reader = store.begin();
+	let mut reader = store.begin();
 	let result =
 		reader.execute("SELECT VALUE id FROM person WHERE age >= 18 LIMIT 1", &Object::new())?;
 	let Value::Array(rows) = result[0]

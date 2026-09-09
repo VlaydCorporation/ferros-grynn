@@ -374,7 +374,7 @@ impl Datastore {
 		let program = crate::gql::parse(source, settings)?;
 		let mut transaction = self.begin_with(TransactionOptions {
 			isolation: IsolationLevel::Serializable,
-			access: if crate::gql::program_mutates_schema(&program) {
+			access: if crate::gql::program_mutates_state(&program) {
 				TransactionAccess::ReadWrite
 			} else {
 				TransactionAccess::ReadOnly

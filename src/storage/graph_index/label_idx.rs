@@ -33,8 +33,9 @@ pub(in crate::storage) fn build_label_index(
 			.ok_or_else(|| invalid_index("label-index page offset overflows usize"))?;
 		let end = start.saturating_add(ATOMS_PER_PAGE).min(atoms.len());
 		let chunk = &atoms[start..end];
-		let mut page =
-			AlignedPage::new(PageType::IndexLabelArray, PageFlags::empty(), page_lsn, page_no);
+		pages.push(AlignedPage::zeroed());
+		let page = &mut pages[index];
+		page.reset(PageType::IndexLabelArray, PageFlags::empty(), page_lsn, page_no);
 		let next = (index + 1 < page_count).then(|| PageNo::new(page_no.get() + 1));
 		write_u64(page.as_bytes_mut(), NEXT_PAGE_OFFSET, next.unwrap_or(PageNo::NULL).get());
 		write_u32(
@@ -47,7 +48,6 @@ pub(in crate::storage) fn build_label_index(
 			write_u64(page.as_bytes_mut(), ATOMS_OFFSET + offset * size_of::<u64>(), atom.raw());
 		}
 		page.seal()?;
-		pages.push(page);
 	}
 	Ok(pages)
 }

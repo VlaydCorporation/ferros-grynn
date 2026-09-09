@@ -18,6 +18,7 @@ pub(super) struct LogicalProgram {
 #[derive(Debug, Clone)]
 pub(super) enum LogicalStatement {
 	Schema(LogicalSchemaStatement),
+	Dml(LogicalDmlStatement),
 	Let {
 		slot: u32,
 		value: TypedExpr,
@@ -28,6 +29,93 @@ pub(super) enum LogicalStatement {
 	/// Executes a read-only graph pattern match.
 	Match(LogicalMatch),
 	Select(LogicalSelect),
+}
+
+/// One analyzed data-mutation statement.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalDmlStatement {
+	pub(super) kind: LogicalDmlKind,
+	pub(super) targets: Vec<LogicalDmlTarget>,
+}
+
+/// Mutation operation shared by every target in a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LogicalDmlKind {
+	Create,
+	Update,
+	Upsert,
+	Delete,
+}
+
+impl LogicalDmlKind {
+	pub(super) const fn statement_kind(self) -> crate::gql::QueryStatementKind {
+		match self {
+			Self::Create => crate::gql::QueryStatementKind::Create,
+			Self::Update => crate::gql::QueryStatementKind::Update,
+			Self::Upsert => crate::gql::QueryStatementKind::Upsert,
+			Self::Delete => crate::gql::QueryStatementKind::Delete,
+		}
+	}
+}
+
+/// One table-specific mutation plan. Expressions are typed against this
+/// target because a statement may name tables with different schemas.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalDmlTarget {
+	pub(super) table: Box<str>,
+	pub(super) selector: LogicalDmlSelector,
+	pub(super) schema: Schema,
+	pub(super) data: Option<LogicalDmlData>,
+	pub(super) filter: Option<TypedExpr>,
+	pub(super) returning: LogicalDmlReturn,
+	pub(super) expect: Option<LogicalExpect>,
+}
+
+/// Records selected or generated for one DML target.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalDmlSelector {
+	Table,
+	Record(TypedExpr),
+	Range(u32),
+}
+
+/// An analyzed record mutation mode.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalDmlData {
+	Content(TypedExpr),
+	Merge(TypedExpr),
+	Patch(TypedExpr),
+	Replace(TypedExpr),
+	Set(Vec<(Box<str>, TypedExpr)>),
+	Unset(Vec<Box<str>>),
+}
+
+/// An analyzed DML result projection.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalDmlReturn {
+	None,
+	Before,
+	After,
+	Diff,
+	Fields(Vec<LogicalDmlReturnItem>),
+	Value(TypedExpr),
+}
+
+/// One object-shaped return item.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalDmlReturnItem {
+	Wildcard,
+	Expr {
+		name: Box<str>,
+		value: TypedExpr,
+	},
+}
+
+/// A pre-image requirement checked before the first mutation.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalExpect {
+	Exists(bool),
+	Predicate(TypedExpr),
 }
 
 /// Typed core schema command executed by the datastore adapter.

@@ -23,11 +23,19 @@ use {cursor::*, eval::*};
 use super::{
 	QueryResult,
 	QueryStatementKind,
-	analysis::{QueryCatalog, analyze},
+	analysis::{QueryCatalog, analyze, compatible},
 	ir::{
 		Column,
 		EndpointDomain,
 		Expand,
+		LogicalDmlData,
+		LogicalDmlKind,
+		LogicalDmlReturn,
+		LogicalDmlReturnItem,
+		LogicalDmlSelector,
+		LogicalDmlStatement,
+		LogicalDmlTarget,
+		LogicalExpect,
 		LogicalMatch,
 		LogicalMatchPattern,
 		LogicalNodeKind,
@@ -117,6 +125,10 @@ fn execute_program<Read: QueryRead>(
 			LogicalStatement::Schema(statement) => {
 				(statement.statement_kind(), read.execute_schema(statement).map(Outcome::success))
 			}
+			LogicalStatement::Dml(statement) => (
+				statement.kind.statement_kind(),
+				read.execute_dml(statement, &slots, source).map(Outcome::success),
+			),
 			LogicalStatement::Let {
 				slot,
 				value,

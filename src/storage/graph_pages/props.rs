@@ -1,5 +1,8 @@
+use std::collections::BTreeSet;
+
 #[allow(clippy::wildcard_imports, reason = "page codecs use the graph-page facade contract")]
 use super::*;
+use crate::values::PropertyKeyId;
 
 /// Mutable builder for one canonical property slotted page.
 pub(in crate::storage) struct PropertyPageBuilder {
@@ -159,6 +162,48 @@ pub(in crate::storage) fn decode_property_map(
 	context: &DecodeContext<'_>,
 	limits: DecodeLimits,
 ) -> FerrosGrynnResult<PropertyMap> {
+	let values = decode_property_entries(record, limits)?;
+	let mut properties = PropertyMap::with_capacity(values.len());
+	for (key, value) in values {
+		properties.insert(key, value.into_runtime(context)?);
+	}
+	Ok(properties)
+}
+
+/// Decodes only property keys required by a physical index update.
+///
+/// Values outside `keys` remain validated by the canonical codec but are not
+/// converted to runtime values, so unrelated atom references do not require a
+/// graph-wide decode context.
+pub(in crate::storage) fn decode_property_fields(
+	record: &[u8],
+	keys: &BTreeSet<PropertyKeyId>,
+	context: &DecodeContext<'_>,
+	limits: DecodeLimits,
+) -> FerrosGrynnResult<PropertyMap> {
+	let values = decode_property_entries(record, limits)?;
+	let mut properties = PropertyMap::with_capacity(keys.len().min(values.len()));
+	for (key, value) in values {
+		if keys.contains(&key) {
+			properties.insert(key, value.into_runtime(context)?);
+		}
+	}
+	Ok(properties)
+}
+
+/// Validates one canonical property record and returns its top-level count
+/// without resolving values that cannot affect count statistics.
+pub(in crate::storage) fn count_property_entries(
+	record: &[u8],
+	limits: DecodeLimits,
+) -> FerrosGrynnResult<usize> {
+	decode_property_entries(record, limits).map(|values| values.len())
+}
+
+fn decode_property_entries(
+	record: &[u8],
+	limits: DecodeLimits,
+) -> FerrosGrynnResult<Vec<(crate::values::PropertyKeyId, StorageValue)>> {
 	let total = record.len().checked_add(1).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_value_encoding(0, "property length overflow")
 	})?;
@@ -178,11 +223,7 @@ pub(in crate::storage) fn decode_property_map(
 			"property record is not a canonical object body",
 		));
 	};
-	let mut properties = PropertyMap::with_capacity(values.len());
-	for (key, value) in values {
-		properties.insert(key, value.into_runtime(context)?);
-	}
-	Ok(properties)
+	Ok(values)
 }
 
 /// Splits one large canonical property record into a contiguous chunk chain.

@@ -959,8 +959,16 @@ pub(super) fn read_local_properties(
 			decode_large_property(first_page, &pages, length, limits.max_total_allocation)?
 		}
 	};
-	let context = graph.decode_context(store, transaction)?;
-	decode_property_map(&record, &context.decoder(), DecodeLimits::default())
+	let limits = DecodeLimits::default();
+	let context = graph.base_context()?;
+	match decode_property_map(&record, &context.decoder(), limits) {
+		Ok(properties) => Ok(properties),
+		Err(error) if error.status().code() == crate::gql_status::StatusCode::new(*b"22S04") => {
+			let context = graph.decode_context(store, transaction)?;
+			decode_property_map(&record, &context.decoder(), limits)
+		}
+		Err(error) => Err(error),
+	}
 }
 
 pub(super) fn read_local_refs(

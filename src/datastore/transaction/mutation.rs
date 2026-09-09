@@ -1026,6 +1026,7 @@ impl LocalGraphDelta {
 				if node.removed {
 					crate::storage::LocalCommitNodeChange::Remove {
 						id,
+						record_id: node.record_id,
 						created: node.created,
 					}
 				} else {
@@ -1057,6 +1058,7 @@ impl LocalGraphDelta {
 				if edge.removed {
 					crate::storage::LocalCommitEdgeChange::Remove {
 						id,
+						record_id: edge.record_id,
 						created: edge.created,
 					}
 				} else {
@@ -2109,6 +2111,11 @@ impl Transaction {
 		})
 	}
 
+	/// Resolves one append-only property key for transaction-owned DML.
+	pub(crate) fn intern_property(&self, name: &str) -> FerrosGrynnResult<PropertyKeyId> {
+		self.store.intern_property(name)
+	}
+
 	pub fn define_table(&mut self, mut schema: TableSchema) -> FerrosGrynnResult<()> {
 		self.ensure_writable()?;
 		self.ensure_live()?;
@@ -2668,28 +2675,20 @@ impl Transaction {
 			StoredGraphValue::Materialized(graph) => {
 				(Some(graph.clone()), None, Some(MutableGraphValue::from_frozen(graph)?))
 			}
-			StoredGraphValue::Local(graph) => {
-				if !graph.supports_atom_delta() {
-					return Err(FerrosGrynnError::invalid_argument(
-						"bounded point mutation is unavailable while scalar indexes require a \
-						 full rebuild; use edit_graph_materialized explicitly",
-					));
-				}
-				(
-					None,
-					Some(LocalGraphWrite {
-						base: graph.clone(),
-						snapshot: self.local_snapshot()?,
-						delta: LocalGraphDelta::new(
-							graph.kind(),
-							graph.node_capacity(),
-							graph.edge_capacity(),
-							graph.revision(),
-						),
-					}),
-					None,
-				)
-			}
+			StoredGraphValue::Local(graph) => (
+				None,
+				Some(LocalGraphWrite {
+					base: graph.clone(),
+					snapshot: self.local_snapshot()?,
+					delta: LocalGraphDelta::new(
+						graph.kind(),
+						graph.node_capacity(),
+						graph.edge_capacity(),
+						graph.revision(),
+					),
+				}),
+				None,
+			),
 		};
 		self.graphs.insert(reference.id().clone(), GraphWrite {
 			name: stored.name.clone(),

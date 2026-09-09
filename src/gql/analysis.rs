@@ -4,6 +4,14 @@ use super::ir::{
 	Column,
 	EndpointDomain,
 	Expand,
+	LogicalDmlData,
+	LogicalDmlKind,
+	LogicalDmlReturn,
+	LogicalDmlReturnItem,
+	LogicalDmlSelector,
+	LogicalDmlStatement,
+	LogicalDmlTarget,
+	LogicalExpect,
 	LogicalMatch,
 	LogicalMatchPattern,
 	LogicalNode,
@@ -31,6 +39,11 @@ use crate::{
 		DefineGraphStatement,
 		DefineIndexStatement,
 		DefineTableStatement,
+		DmlData,
+		DmlReturn,
+		DmlReturnItem,
+		DmlTarget,
+		ExpectClause,
 		Expr,
 		ExprKind,
 		InfoTarget,
@@ -58,6 +71,7 @@ const MAX_MATCH_PATH_DEPTH: u32 = 30;
 
 pub(super) trait QueryCatalog {
 	fn schema(&self, table: &str) -> FerrosGrynnResult<Schema>;
+	fn schema_mode(&self, table: &str) -> FerrosGrynnResult<TableSchemaMode>;
 	/// Resolves a case-sensitive named graph.
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef>;
 }
@@ -126,6 +140,46 @@ impl<'a> Analyzer<'a> {
 		let mut statements = Vec::with_capacity(program.statements.len());
 		for statement in &program.statements {
 			match &statement.kind {
+				StatementKind::Create(statement) => {
+					statements.push(LogicalStatement::Dml(self.dml(
+						LogicalDmlKind::Create,
+						&statement.targets,
+						statement.data.as_ref(),
+						None,
+						statement.returning.as_ref(),
+						statement.expect.as_ref(),
+					)?));
+				}
+				StatementKind::Update(statement) => {
+					statements.push(LogicalStatement::Dml(self.dml(
+						LogicalDmlKind::Update,
+						&statement.targets,
+						statement.data.as_ref(),
+						statement.filter.as_ref(),
+						statement.returning.as_ref(),
+						statement.expect.as_ref(),
+					)?));
+				}
+				StatementKind::Upsert(statement) => {
+					statements.push(LogicalStatement::Dml(self.dml(
+						LogicalDmlKind::Upsert,
+						&statement.targets,
+						statement.data.as_ref(),
+						statement.filter.as_ref(),
+						statement.returning.as_ref(),
+						statement.expect.as_ref(),
+					)?));
+				}
+				StatementKind::Delete(statement) => {
+					statements.push(LogicalStatement::Dml(self.dml(
+						LogicalDmlKind::Delete,
+						&statement.targets,
+						None,
+						statement.filter.as_ref(),
+						statement.returning.as_ref(),
+						statement.expect.as_ref(),
+					)?));
+				}
 				StatementKind::DefineGraph(definition) => {
 					statements.push(LogicalStatement::Schema(
 						self.define_graph(definition, statement.span)?,
@@ -184,6 +238,218 @@ impl<'a> Analyzer<'a> {
 			initial_slots: self.initial_slots,
 			slot_count: self.slots.len(),
 		})
+	}
+
+	fn dml(
+		&self,
+		kind: LogicalDmlKind,
+		targets: &[DmlTarget],
+		data: Option<&DmlData>,
+		filter: Option<&Expr>,
+		returning: Option<&DmlReturn>,
+		expect: Option<&ExpectClause>,
+	) -> FerrosGrynnResult<LogicalDmlStatement> {
+		let mut plans = Vec::with_capacity(targets.len());
+		for target in targets {
+			let table = target.table().value.clone();
+			let mut schema = self.catalog.schema(&table)?;
+			let mode = self.catalog.schema_mode(&table)?;
+			self.extend_dml_schema(&mut schema, mode, data, filter, returning, expect)?;
+			let selector = match target {
+				DmlTarget::Table(_) => LogicalDmlSelector::Table,
+				DmlTarget::Record {
+					key,
+					..
+				} => LogicalDmlSelector::Record(self.expr(key, None)?),
+				DmlTarget::Range {
+					count,
+					..
+				} => LogicalDmlSelector::Range(*count),
+			};
+			let data = data.map(|data| self.dml_data(data, &schema)).transpose()?;
+			let filter = filter.map(|expr| self.expr(expr, Some(&schema))).transpose()?;
+			let returning = self.dml_return(returning, kind, &schema)?;
+			let expect = expect.map(|expect| self.expect(expect, &schema)).transpose()?;
+			plans.push(LogicalDmlTarget {
+				table,
+				selector,
+				schema,
+				data,
+				filter,
+				returning,
+				expect,
+			});
+		}
+		Ok(LogicalDmlStatement {
+			kind,
+			targets: plans,
+		})
+	}
+
+	fn extend_dml_schema(
+		&self,
+		schema: &mut Schema,
+		mode: TableSchemaMode,
+		data: Option<&DmlData>,
+		filter: Option<&Expr>,
+		returning: Option<&DmlReturn>,
+		expect: Option<&ExpectClause>,
+	) -> FerrosGrynnResult<()> {
+		let mut names = BTreeMap::<Box<str>, TextSpan>::new();
+		if let Some(data) = data {
+			match data {
+				DmlData::Content(value)
+				| DmlData::Merge(value)
+				| DmlData::Patch(value)
+				| DmlData::Replace(value) => collect_expr_names(value, &mut names),
+				DmlData::Set(assignments) => {
+					for assignment in assignments {
+						names
+							.entry(assignment.field.value.clone())
+							.or_insert(assignment.field.span);
+						collect_expr_names(&assignment.value, &mut names);
+					}
+				}
+				DmlData::Unset(fields) => {
+					for field in fields {
+						names.entry(field.value.clone()).or_insert(field.span);
+					}
+				}
+			}
+		}
+		if let Some(filter) = filter {
+			collect_expr_names(filter, &mut names);
+		}
+		if let Some(returning) = returning {
+			match returning {
+				DmlReturn::Fields(items) => {
+					for item in items {
+						if let DmlReturnItem::Expr(expr) = item {
+							collect_expr_names(expr, &mut names);
+						}
+					}
+				}
+				DmlReturn::Value(value) => collect_expr_names(value, &mut names),
+				DmlReturn::None | DmlReturn::Before | DmlReturn::After | DmlReturn::Diff => {}
+			}
+		}
+		if let Some(ExpectClause::Predicate(predicate)) = expect {
+			collect_expr_names(predicate, &mut names);
+		}
+		for (name, span) in names {
+			if schema.index_of(&name).is_some() {
+				continue;
+			}
+			if mode == TableSchemaMode::Schemafull {
+				return Err(self.semantic(&format!("Unknown field `{name}`."), span));
+			}
+			schema.columns.push(Column {
+				name,
+				ty: Type::Any,
+			});
+		}
+		Ok(())
+	}
+
+	fn dml_data(&self, data: &DmlData, schema: &Schema) -> FerrosGrynnResult<LogicalDmlData> {
+		let object = |value: &Expr| -> FerrosGrynnResult<TypedExpr> {
+			let value = self.expr(value, Some(schema))?;
+			if !compatible(&Type::Object, &value.ty) {
+				return Err(self.semantic("DML object mode requires an object value.", value.span));
+			}
+			Ok(value)
+		};
+		match data {
+			DmlData::Content(value) => object(value).map(LogicalDmlData::Content),
+			DmlData::Merge(value) => object(value).map(LogicalDmlData::Merge),
+			DmlData::Patch(value) => object(value).map(LogicalDmlData::Patch),
+			DmlData::Replace(value) => object(value).map(LogicalDmlData::Replace),
+			DmlData::Set(assignments) => assignments
+				.iter()
+				.map(|assignment| {
+					if assignment.field.value.eq_ignore_ascii_case("id") {
+						return Err(self.semantic(
+							"The implicit `id` field is read-only.",
+							assignment.field.span,
+						));
+					}
+					let value = self.expr(&assignment.value, Some(schema))?;
+					if let Some(index) = schema.index_of(&assignment.field.value)
+						&& !compatible(&schema.columns[index].ty, &value.ty)
+					{
+						return Err(self.semantic(
+							&format!(
+								"Field `{}` expects {}, found {}.",
+								assignment.field.value, schema.columns[index].ty, value.ty
+							),
+							assignment.value.span,
+						));
+					}
+					Ok((assignment.field.value.clone(), value))
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()
+				.map(LogicalDmlData::Set),
+			DmlData::Unset(fields) => {
+				if let Some(field) =
+					fields.iter().find(|field| field.value.eq_ignore_ascii_case("id"))
+				{
+					return Err(self.semantic("The implicit `id` field is read-only.", field.span));
+				}
+				Ok(LogicalDmlData::Unset(fields.iter().map(|field| field.value.clone()).collect()))
+			}
+		}
+	}
+
+	fn dml_return(
+		&self,
+		returning: Option<&DmlReturn>,
+		kind: LogicalDmlKind,
+		schema: &Schema,
+	) -> FerrosGrynnResult<LogicalDmlReturn> {
+		let Some(returning) = returning else {
+			return Ok(if kind == LogicalDmlKind::Delete {
+				LogicalDmlReturn::Before
+			} else {
+				LogicalDmlReturn::After
+			});
+		};
+		match returning {
+			DmlReturn::None => Ok(LogicalDmlReturn::None),
+			DmlReturn::Before => Ok(LogicalDmlReturn::Before),
+			DmlReturn::After => Ok(LogicalDmlReturn::After),
+			DmlReturn::Diff => Ok(LogicalDmlReturn::Diff),
+			DmlReturn::Value(value) => self.expr(value, Some(schema)).map(LogicalDmlReturn::Value),
+			DmlReturn::Fields(items) => items
+				.iter()
+				.enumerate()
+				.map(|(index, item)| match item {
+					DmlReturnItem::Wildcard(_) => Ok(LogicalDmlReturnItem::Wildcard),
+					DmlReturnItem::Expr(expr) => {
+						let name = match &expr.kind {
+							ExprKind::Name(name) => name.value.clone(),
+							_ => format!("value_{index}").into_boxed_str(),
+						};
+						Ok(LogicalDmlReturnItem::Expr {
+							name,
+							value: self.expr(expr, Some(schema))?,
+						})
+					}
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()
+				.map(LogicalDmlReturn::Fields),
+		}
+	}
+
+	fn expect(&self, expect: &ExpectClause, schema: &Schema) -> FerrosGrynnResult<LogicalExpect> {
+		match expect {
+			ExpectClause::Exists {
+				expected,
+				..
+			} => Ok(LogicalExpect::Exists(*expected)),
+			ExpectClause::Predicate(predicate) => {
+				self.expr(predicate, Some(schema)).map(LogicalExpect::Predicate)
+			}
+		}
 	}
 
 	fn define_graph(
@@ -953,6 +1219,70 @@ impl<'a> Analyzer<'a> {
 	}
 }
 
+fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
+	match &expr.kind {
+		ExprKind::Name(name) => {
+			names.entry(name.value.clone()).or_insert(name.span);
+		}
+		ExprKind::Array(values) => {
+			for value in values {
+				collect_expr_names(value, names);
+			}
+		}
+		ExprKind::Object(fields) => {
+			for field in fields {
+				collect_expr_names(&field.value, names);
+			}
+		}
+		ExprKind::Unary {
+			expr,
+			..
+		}
+		| ExprKind::Cast {
+			expr,
+			..
+		} => collect_expr_names(expr, names),
+		ExprKind::Binary {
+			left,
+			right,
+			..
+		} => {
+			collect_expr_names(left, names);
+			collect_expr_names(right, names);
+		}
+		ExprKind::Conditional {
+			condition,
+			then_value,
+			else_value,
+		} => {
+			collect_expr_names(condition, names);
+			collect_expr_names(then_value, names);
+			collect_expr_names(else_value, names);
+		}
+		ExprKind::Field {
+			base,
+			..
+		} => collect_expr_names(base, names),
+		ExprKind::Index {
+			base,
+			index,
+		} => {
+			collect_expr_names(base, names);
+			collect_expr_names(index, names);
+		}
+		ExprKind::Call {
+			callee,
+			arguments,
+		} => {
+			collect_expr_names(callee, names);
+			for argument in arguments {
+				collect_expr_names(argument, names);
+			}
+		}
+		ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
+	}
+}
+
 const fn table_kind(kind: TableKindName) -> TableKind {
 	match kind {
 		TableKindName::Any => TableKind::Any,
@@ -976,7 +1306,7 @@ const fn is_integer(ty: &Type) -> bool {
 	matches!(ty, Type::Any | Type::Number | Type::Int)
 }
 
-fn compatible(expected: &Type, actual: &Type) -> bool {
+pub(super) fn compatible(expected: &Type, actual: &Type) -> bool {
 	expected == actual
 		|| matches!(expected, Type::Any)
 		|| matches!(expected, Type::Number) && is_number(actual)

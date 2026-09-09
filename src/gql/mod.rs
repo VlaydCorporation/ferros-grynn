@@ -14,13 +14,21 @@ pub(crate) use execution::{execute_parsed_transaction, execute_transaction};
 pub use crate::syn::{
 	AlterStatement,
 	AlterTarget,
+	Assignment,
 	BasicIndexDefinition,
 	BinaryOperator,
+	CreateStatement,
 	DefineFieldStatement,
 	DefineGraphStatement,
 	DefineIndexStatement,
 	DefineTableStatement,
 	DefinitionMode,
+	DeleteStatement,
+	DmlData,
+	DmlReturn,
+	DmlReturnItem,
+	DmlTarget,
+	ExpectClause,
 	Expr,
 	ExprKind,
 	Identifier,
@@ -37,6 +45,7 @@ pub use crate::syn::{
 	MatchReturnItem,
 	MatchStatement,
 	MatchStep,
+	MutateStatement,
 	ObjectField,
 	ParserSettings,
 	Program,
@@ -55,12 +64,16 @@ pub use crate::syn::{
 	UnaryOperator,
 };
 
-/// Returns whether a program contains a schema-mutating statement.
-pub(crate) fn program_mutates_schema(program: &Program) -> bool {
+/// Returns whether a program contains a state-mutating statement.
+pub(crate) fn program_mutates_state(program: &Program) -> bool {
 	program.statements.iter().any(|statement| {
 		matches!(
 			statement.kind,
-			StatementKind::DefineGraph(_)
+			StatementKind::Create(_)
+				| StatementKind::Update(_)
+				| StatementKind::Upsert(_)
+				| StatementKind::Delete(_)
+				| StatementKind::DefineGraph(_)
 				| StatementKind::DefineTable(_)
 				| StatementKind::DefineField(_)
 				| StatementKind::DefineIndex(_)
@@ -81,6 +94,10 @@ pub fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult<Progra
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueryStatementKind {
+	Create,
+	Update,
+	Upsert,
+	Delete,
 	Define,
 	Remove,
 	Alter,

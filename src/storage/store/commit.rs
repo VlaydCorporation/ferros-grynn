@@ -26,7 +26,8 @@ pub(super) struct BuiltGraphDelta {
 	pub(super) catalog_entry: GraphCatalogEntry,
 	pub(super) superblock: GraphSuperblock,
 	pub(super) payloads: BTreeMap<DataFileKind, Vec<(PageNo, Box<AlignedPage>)>>,
-	pub(super) index_payloads: Vec<(DataFileId, Box<AlignedPage>)>,
+	pub(super) index_payloads: Vec<(DataFileId, PageNo, Box<AlignedPage>)>,
+	pub(super) indexes: Vec<BuiltTableIndexBinding>,
 	pub(super) removed_subgraph_slots: Vec<u32>,
 }
 
@@ -745,11 +746,6 @@ pub(super) fn open_local_graph(
 	}
 	let mut scalar_indexes = BTreeMap::<String, Vec<LocalScalarIndex>>::new();
 	let mut count_indexes = BTreeMap::new();
-	let has_declared_scalar_indexes = tables
-		.iter()
-		.filter(|table| table.graph_id == entry.graph_id)
-		.flat_map(|table| &table.indexes)
-		.any(|index| index.kind != TableIndexKind::Count);
 	let mut ordered_scalar_ids = tables
 		.iter()
 		.filter(|table| table.graph_id == entry.graph_id)
@@ -842,6 +838,8 @@ pub(super) fn open_local_graph(
 			scalar_indexes.entry(table.name.clone()).or_default().push(LocalScalarIndex {
 				table_id: table.schema_id,
 				name: index.name.clone(),
+				index_id: index.index_id,
+				schema_version: index.schema_version,
 				kind: index.kind,
 				fields,
 				file_id,
@@ -894,7 +892,6 @@ pub(super) fn open_local_graph(
 		property_dictionary,
 		decode_context: Mutex::new(None),
 		scalar_indexes,
-		has_declared_scalar_indexes,
 		count_indexes,
 		label_indexes,
 		children,
@@ -1323,23 +1320,75 @@ pub(super) fn write_delta_graph_generation(
 			)?;
 		}
 	}
+	let mut scalar_modes = BTreeMap::new();
+	for binding in &delta.indexes {
+		let file_id = binding.index.file_id.ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("scalar delta binding has no physical file")
+		})?;
+		if binding.index.state != TableIndexState::Ready
+			|| binding.index.root.is_none()
+			|| binding.index.fields.is_empty()
+			|| !matches!(binding.index.kind, TableIndexKind::Standard | TableIndexKind::Unique)
+			|| file_id.kind() != Some(DataFileKind::Index)
+			|| file_id == current.primary_index_file_id
+			|| !files.files.iter().any(|file| file.graph_id == graph_id && file.file_id == file_id)
+			|| scalar_modes.insert(file_id, binding.index.kind).is_some()
+		{
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"scalar delta contains an invalid or duplicate catalog binding",
+			));
+		}
+	}
 	let mut staged_indexes = BTreeSet::new();
-	for (file_id, page) in &delta.index_payloads {
+	let mut touched_scalars = BTreeSet::new();
+	for (file_id, page_no, page) in &delta.index_payloads {
 		if file_id.kind() != Some(DataFileKind::Index)
 			|| *file_id == current.primary_index_file_id
-			|| !staged_indexes.insert(*file_id)
+			|| !staged_indexes.insert((*file_id, *page_no))
 			|| !files.files.iter().any(|file| file.graph_id == graph_id && file.file_id == *file_id)
 		{
 			return Err(FerrosGrynnError::invalid_storage_file(
-				"Count delta targets an invalid or duplicate side-file",
+				"index delta targets an invalid or duplicate side-file page",
 			));
 		}
-		decode_count_index(page)?;
+		let page_type = page.validate(*page_no)?.page_type();
+		if let Some(kind) = scalar_modes.get(file_id) {
+			let valid = match kind {
+				TableIndexKind::Standard => matches!(
+					page_type,
+					PageType::IndexBtreeInternal
+						| PageType::IndexNonUniqueBtreeLeaf
+						| PageType::IndexPostingBtreeLeaf
+				),
+				TableIndexKind::Unique => matches!(
+					page_type,
+					PageType::IndexBtreeInternal | PageType::IndexUniqueBtreeLeaf
+				),
+				TableIndexKind::Count => false,
+			};
+			if !valid {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"scalar delta page type disagrees with its catalog binding",
+				));
+			}
+			touched_scalars.insert(*file_id);
+		} else if *page_no != PageNo::new(0) || page_type != PageType::IndexCountSingle {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"unbound index delta is not a single-page Count index",
+			));
+		} else {
+			decode_count_index(page)?;
+		}
 		manager.stage_frame(
 			transaction,
-			crate::storage::types::PageKey::new(graph_id, *file_id, PageNo::new(0)),
+			crate::storage::types::PageKey::new(graph_id, *file_id, *page_no),
 			page,
 		)?;
+	}
+	if touched_scalars.len() != scalar_modes.len() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"scalar delta binding has no staged pages",
+		));
 	}
 
 	let generation_name = Uuid::now_v7().to_string();
@@ -1375,7 +1424,7 @@ pub(super) fn write_delta_graph_generation(
 		file_entries: vec![file_entry],
 		registrations: vec![registration],
 		superblock: delta.superblock,
-		indexes: Vec::new(),
+		indexes: delta.indexes,
 	})
 }
 

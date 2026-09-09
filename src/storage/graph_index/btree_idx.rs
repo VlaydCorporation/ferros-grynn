@@ -19,7 +19,6 @@ pub(super) fn validate_primary_entries(entries: &[PrimaryIndexEntry]) -> FerrosG
 	Ok(())
 }
 
-#[cfg(test)]
 pub(super) fn validate_scalar_entries(
 	entries: &[ScalarIndexEntry],
 	mode: ScalarIndexMode,
@@ -44,10 +43,19 @@ pub(super) fn validate_scalar_entries(
 	Ok(())
 }
 
-#[cfg(test)]
 pub(super) fn partition_standard_leaf_entries(
 	entries: &[ScalarIndexEntry],
 ) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry]>> {
+	partition_standard_leaf_entries_with_limit(entries, PAGE_SIZE)
+}
+
+pub(super) fn partition_standard_leaf_entries_with_limit(
+	entries: &[ScalarIndexEntry],
+	maximum_bytes: usize,
+) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry]>> {
+	if maximum_bytes > PAGE_SIZE || maximum_bytes < LEAF_OFFSETS_OFFSET {
+		return Err(invalid_index("scalar leaf fill limit is outside page bounds"));
+	}
 	if entries.is_empty() {
 		return Ok(vec![entries]);
 	}
@@ -71,13 +79,19 @@ pub(super) fn partition_standard_leaf_entries(
 				.and_then(|used| used.checked_add(entry_bytes))
 				.ok_or_else(|| invalid_index("scalar leaf size overflows usize"))?;
 			if total > PAGE_SIZE {
+				if end == start {
+					return Err(invalid_index("one scalar key exceeds leaf-page capacity"));
+				}
+				break;
+			}
+			if total > maximum_bytes && end > start {
 				break;
 			}
 			data_bytes += entry_bytes;
 			end += 1;
-		}
-		if end == start {
-			return Err(invalid_index("one scalar key exceeds leaf-page capacity"));
+			if total > maximum_bytes {
+				break;
+			}
 		}
 		groups.push(&entries[start..end]);
 		start = end;
@@ -386,6 +400,16 @@ pub(super) fn upper_exceeded(key: &[u8], upper: &Bound<&[u8]>) -> bool {
 pub(super) fn partition_leaf_entries(
 	entries: &[PrimaryIndexEntry],
 ) -> FerrosGrynnResult<Vec<&[PrimaryIndexEntry]>> {
+	partition_leaf_entries_with_limit(entries, PAGE_SIZE)
+}
+
+pub(super) fn partition_leaf_entries_with_limit(
+	entries: &[PrimaryIndexEntry],
+	maximum_bytes: usize,
+) -> FerrosGrynnResult<Vec<&[PrimaryIndexEntry]>> {
+	if maximum_bytes > PAGE_SIZE || maximum_bytes < LEAF_OFFSETS_OFFSET {
+		return Err(invalid_index("primary leaf fill limit is outside page bounds"));
+	}
 	if entries.is_empty() {
 		return Ok(vec![entries]);
 	}
@@ -407,13 +431,19 @@ pub(super) fn partition_leaf_entries(
 				.and_then(|used| used.checked_add(entry_bytes))
 				.ok_or_else(|| invalid_index("primary leaf size overflows usize"))?;
 			if total > PAGE_SIZE {
+				if end == start {
+					return Err(invalid_index("one primary key exceeds leaf-page capacity"));
+				}
+				break;
+			}
+			if total > maximum_bytes && end > start {
 				break;
 			}
 			data_bytes += entry_bytes;
 			end += 1;
-		}
-		if end == start {
-			return Err(invalid_index("one primary key exceeds leaf-page capacity"));
+			if total > maximum_bytes {
+				break;
+			}
 		}
 		groups.push(&entries[start..end]);
 		start = end;

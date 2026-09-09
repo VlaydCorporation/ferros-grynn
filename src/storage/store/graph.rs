@@ -786,7 +786,6 @@ pub(super) fn build_node_append_delta(
 		|| current.revision != base.revision
 		|| current.graph_id != base.graph_id
 		|| current.record_id != record_id.to_string()
-		|| !base.supports_atom_delta()
 	{
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"node append delta does not match its durable base graph",
@@ -845,49 +844,24 @@ pub(super) fn build_node_append_delta(
 		context.register_table_name(table.to_owned().into())?;
 	}
 
-	// ponytail: the first physical delta still bulk-rebuilds the primary
-	// B+tree. Replace this with right-edge incremental insertion only if this
-	// measured ceiling dominates after full graph materialization is gone.
-	let mut primary_entries = scan_primary_index(
-		|page_no, output| {
-			let page =
-				manager.read_page(transaction, base.page_key(DataFileKind::Index, page_no)?)?;
-			output.as_bytes_mut().copy_from_slice(page.as_bytes());
-			Ok(())
-		},
-		base.primary_index_root,
-	)?;
-	for entry in &primary_entries {
-		let stored = CanonicalCodec::decode(&entry.key, DecodeLimits::default())?;
-		let Value::Record(record) = stored.into_runtime(&context.decoder())? else {
-			return Err(FerrosGrynnError::invalid_storage_file(
-				"primary index key is not a canonical RecordId",
-			));
-		};
-		context.register_atom(AtomRef::new(entry.atom.kind(), *record), entry.atom)?;
-	}
+	let mut primary_mutations = Vec::with_capacity(nodes.len());
 	for node in nodes {
 		let atom = DiskAtomRef::from_parts(AtomKind::Node, node.id.slot())?;
 		context.register_atom(AtomRef::new(AtomKind::Node, node.record_id.clone()), atom)?;
-		let key = CanonicalCodec::encode(
-			StorageValue::from_runtime(
-				Value::Record(Box::new(node.record_id.clone())),
-				&mut context,
-			)?
-			.as_ref(),
-		)?;
-		primary_entries.push(PrimaryIndexEntry {
-			key,
-			atom,
+		primary_mutations.push(PrimaryIndexMutation {
+			key: primary_index_key(&node.record_id, &mut context)?,
+			atom: Some(atom),
 		});
 	}
-	primary_entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-	let primary = build_primary_index(&primary_entries, PageLsn::ZERO)?;
-	for (index, page) in primary.pages.iter().enumerate() {
-		page.validate(PageNo::new(u64::try_from(index).map_err(|_error| {
-			FerrosGrynnError::invalid_storage_file("primary page index exceeds u64")
-		})?))?;
-	}
+	register_property_atom_references(
+		manager,
+		transaction,
+		base,
+		nodes.iter().flat_map(|node| node.properties.values()),
+		&BTreeSet::new(),
+		&mut context,
+	)?;
+	let primary = build_primary_delta(manager, transaction, base, &primary_mutations)?;
 
 	let mut labels = base.labels.clone();
 	for label in nodes
@@ -986,13 +960,7 @@ pub(super) fn build_node_append_delta(
 	*dictionary = context.property_dictionary().clone();
 
 	let mut previous_statistics = base.statistics_with_labels(manager, transaction)?;
-	hydrate_legacy_label_statistics(
-		&mut previous_statistics,
-		manager,
-		transaction,
-		base,
-		&context,
-	)?;
+	hydrate_legacy_label_statistics(&mut previous_statistics, manager, transaction, base)?;
 	if previous_statistics.node_count != base.superblock.node_count
 		|| previous_statistics.edge_count != base.superblock.edge_count
 	{
@@ -1066,12 +1034,15 @@ pub(super) fn build_node_append_delta(
 	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
 	payloads.insert(DataFileKind::Statistics, vec![(PageNo::new(0), statistics_root)]);
 	payloads.insert(DataFileKind::LabelStatistics, number_pages(label_statistics)?);
-	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
+	if !primary.pages.is_empty() {
+		payloads.insert(DataFileKind::Index, primary.pages);
+	}
 	Ok(BuiltGraphDelta {
 		catalog_entry,
 		superblock,
 		payloads,
 		index_payloads,
+		indexes: Vec::new(),
 		removed_subgraph_slots: Vec::new(),
 	})
 }
@@ -1092,7 +1063,6 @@ pub(super) fn build_atom_delta(
 		|| current.revision != base.revision
 		|| current.graph_id != base.graph_id
 		|| current.record_id != record_id.to_string()
-		|| !base.supports_atom_delta()
 		|| delta.node_capacity < base.superblock.node_capacity
 		|| delta.edge_capacity < base.superblock.edge_capacity
 		|| delta.revision <= base.revision
@@ -1138,80 +1108,55 @@ pub(super) fn build_atom_delta(
 		}),
 	)?;
 
-	let mut source_context = EncodeContext::new(dictionary.clone());
 	let mut context = EncodeContext::new(dictionary.clone());
 	for (expected, table) in base.labels.table_names.iter().enumerate() {
-		let source = source_context.register_table_name(table.clone().into())?;
-		let target = context.register_table_name(table.clone().into())?;
-		if usize::try_from(source).ok() != Some(expected)
-			|| usize::try_from(target).ok() != Some(expected)
-		{
+		let actual = context.register_table_name(table.clone().into())?;
+		if usize::try_from(actual).ok() != Some(expected) {
 			return Err(FerrosGrynnError::invalid_storage_file("table dictionary is not dense"));
 		}
 	}
 	for (index, zone) in base.labels.time_zones.iter().enumerate() {
-		let source = source_context.register_time_zone_name(zone.clone().into())?;
-		let target = context.register_time_zone_name(zone.clone().into())?;
+		let actual = context.register_time_zone_name(zone.clone().into())?;
 		let expected = u32::try_from(index)
 			.ok()
 			.and_then(|index| index.checked_add(1))
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("time-zone id overflows"))?;
-		if source != expected || target != expected {
+		if actual != expected {
 			return Err(FerrosGrynnError::invalid_storage_file(
 				"time-zone dictionary is not dense",
 			));
 		}
 	}
 
-	// ponytail: the format-v1 primary index is still replaced as one image.
-	// Q-05 owns incremental insertion/removal after point-DML profiles exist.
-	let mut primary_entries = scan_primary_index(
-		|page_no, output| {
-			let page =
-				manager.read_page(transaction, base.page_key(DataFileKind::Index, page_no)?)?;
-			output.as_bytes_mut().copy_from_slice(page.as_bytes());
-			Ok(())
-		},
-		base.primary_index_root,
-	)?;
-	let mut source_atoms = Vec::with_capacity(primary_entries.len());
-	for entry in &primary_entries {
-		let stored = CanonicalCodec::decode(&entry.key, DecodeLimits::default())?;
-		let Value::Record(record) = stored.into_runtime(&source_context.decoder())? else {
-			return Err(FerrosGrynnError::invalid_storage_file(
-				"primary index key is not a canonical RecordId",
-			));
-		};
-		let runtime = AtomRef::new(entry.atom.kind(), *record);
-		source_context.register_atom(runtime.clone(), entry.atom)?;
-		source_atoms.push((runtime, entry.atom));
-	}
-	let removed = delta
+	let removed_records = delta
 		.nodes
 		.iter()
 		.filter_map(|change| match change {
 			LocalCommitNodeChange::Remove {
-				id,
+				record_id,
 				created: false,
 				..
-			} => DiskAtomRef::from_parts(AtomKind::Node, id.slot()).ok(),
+			} => Some(record_id.clone()),
 			_ => None,
 		})
 		.chain(delta.edges.iter().filter_map(|change| match change {
 			LocalCommitEdgeChange::Remove {
-				id,
+				record_id,
 				created: false,
 				..
-			} => DiskAtomRef::from_parts(AtomKind::Edge, id.slot()).ok(),
+			} => Some(record_id.clone()),
 			_ => None,
 		}))
 		.collect::<BTreeSet<_>>();
-	primary_entries.retain(|entry| !removed.contains(&entry.atom));
-	for (runtime, atom) in source_atoms {
-		if !removed.contains(&atom) {
-			context.register_atom(runtime, atom)?;
-		}
-	}
+	let mut primary_mutations = removed_records
+		.iter()
+		.map(|record| {
+			Ok(PrimaryIndexMutation {
+				key: primary_index_key(record, &mut context)?,
+				atom: None,
+			})
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	for (id, record) in delta_created_records(delta) {
 		context.register_table_name(record.table().to_owned().into())?;
 		let atom = DiskAtomRef::from_parts(
@@ -1221,23 +1166,49 @@ pub(super) fn build_atom_delta(
 			id.slot(),
 		)?;
 		context.register_atom(AtomRef::new(atom.kind(), record.clone()), atom)?;
-		let key = CanonicalCodec::encode(
-			StorageValue::from_runtime(Value::Record(Box::new(record.clone())), &mut context)?
-				.as_ref(),
-		)?;
-		primary_entries.push(PrimaryIndexEntry {
-			key,
-			atom,
+		primary_mutations.push(PrimaryIndexMutation {
+			key: primary_index_key(record, &mut context)?,
+			atom: Some(atom),
 		});
 	}
-	primary_entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-	if primary_entries.windows(2).any(|entries| entries[0].key == entries[1].key) {
-		return Err(FerrosGrynnError::graph_constraint_violation(
-			"record id",
-			"atom delta contains a duplicate RecordId",
-		));
-	}
-	let primary = build_primary_index(&primary_entries, PageLsn::ZERO)?;
+	register_property_atom_references(
+		manager,
+		transaction,
+		base,
+		delta
+			.nodes
+			.iter()
+			.filter_map(|change| match change {
+				LocalCommitNodeChange::Upsert {
+					properties,
+					..
+				} => Some(properties.values()),
+				LocalCommitNodeChange::Remove {
+					..
+				} => None,
+			})
+			.flatten()
+			.chain(
+				delta
+					.edges
+					.iter()
+					.filter_map(|change| match change {
+						LocalCommitEdgeChange::Upsert {
+							properties,
+							..
+						} => Some(properties.values()),
+						LocalCommitEdgeChange::Remove {
+							..
+						} => None,
+					})
+					.flatten(),
+			),
+		&removed_records,
+		&mut context,
+	)?;
+	let primary = build_primary_delta(manager, transaction, base, &primary_mutations)?;
+	let (mut index_payloads, indexes) =
+		build_scalar_index_delta(manager, transaction, base, delta, &mut context)?;
 
 	let mut labels = base.labels.clone();
 	for label in delta
@@ -1606,7 +1577,7 @@ pub(super) fn build_atom_delta(
 		};
 		match kind {
 			AtomKind::Node => {
-				let mut slot = read_node_hot_slot(page, page_no, within)?;
+				let mut slot = read_unsealed_node_hot_slot(page, page_no, within)?;
 				if slot.flags.contains(NodeSlotFlags::TOMBSTONE)
 					|| slot.generation != membership.id.generation()
 				{
@@ -1618,7 +1589,7 @@ pub(super) fn build_atom_delta(
 				write_node_hot_slot(page, within, &slot)?;
 			}
 			AtomKind::Edge => {
-				let mut slot = read_edge_hot_slot(page, page_no, within)?;
+				let mut slot = read_unsealed_edge_hot_slot(page, page_no, within)?;
 				if slot.flags.contains(EdgeSlotFlags::TOMBSTONE)
 					|| slot.generation != membership.id.generation()
 				{
@@ -1669,7 +1640,6 @@ pub(super) fn build_atom_delta(
 		delta,
 		next_node_count,
 		next_edge_count,
-		&source_context,
 	)?;
 	let (statistics_root, label_statistics) = encode_statistics_delta(
 		&statistics,
@@ -1678,7 +1648,7 @@ pub(super) fn build_atom_delta(
 		base.statistics_layout,
 		PageLsn::ZERO,
 	)?;
-	let index_payloads = build_count_index_delta(manager, transaction, base, &statistics)?;
+	index_payloads.extend(build_count_index_delta(manager, transaction, base, &statistics)?);
 
 	removed_subgraph_slots.sort_unstable();
 	removed_subgraph_slots.dedup();
@@ -1746,12 +1716,15 @@ pub(super) fn build_atom_delta(
 	payloads.insert(DataFileKind::Labels, number_pages(label_pages)?);
 	payloads.insert(DataFileKind::Statistics, vec![(PageNo::new(0), statistics_root)]);
 	payloads.insert(DataFileKind::LabelStatistics, number_pages(label_statistics)?);
-	payloads.insert(DataFileKind::Index, number_pages(primary.pages)?);
+	if !primary.pages.is_empty() {
+		payloads.insert(DataFileKind::Index, primary.pages);
+	}
 	Ok(BuiltGraphDelta {
 		catalog_entry,
 		superblock,
 		payloads,
 		index_payloads,
+		indexes,
 		removed_subgraph_slots,
 	})
 }
@@ -1810,6 +1783,470 @@ fn delta_created_records(
 			} => Some((*id, record_id)),
 			_ => None,
 		}))
+}
+
+struct BuiltPrimaryDelta {
+	root: PageNo,
+	pages: Vec<(PageNo, Box<AlignedPage>)>,
+}
+
+fn primary_index_key(record: &RecordId, context: &mut EncodeContext) -> FerrosGrynnResult<Vec<u8>> {
+	CanonicalCodec::encode(
+		StorageValue::from_runtime(Value::Record(Box::new(record.clone())), context)?.as_ref(),
+	)
+}
+
+fn build_primary_delta(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	mutations: &[PrimaryIndexMutation],
+) -> FerrosGrynnResult<BuiltPrimaryDelta> {
+	if mutations.is_empty() {
+		return Ok(BuiltPrimaryDelta {
+			root: base.primary_index_root,
+			pages: Vec::new(),
+		});
+	}
+	let read_page = |page_no: PageNo, output: &mut AlignedPage| {
+		let page = manager.read_page(transaction, base.page_key(DataFileKind::Index, page_no)?)?;
+		output.as_bytes_mut().copy_from_slice(page.as_bytes());
+		Ok(())
+	};
+	if let Some(pages) =
+		mutate_primary_index_leaves(read_page, base.primary_index_root, mutations, PageLsn::ZERO)?
+	{
+		return Ok(BuiltPrimaryDelta {
+			root: base.primary_index_root,
+			pages: box_numbered_pages(pages)?,
+		});
+	}
+
+	let mut entries = scan_primary_index(read_page, base.primary_index_root)?;
+	apply_primary_mutations(&mut entries, mutations)?;
+	let built = build_primary_index(&entries, PageLsn::ZERO)?;
+	Ok(BuiltPrimaryDelta {
+		root: built.root,
+		pages: number_pages(built.pages)?,
+	})
+}
+
+struct ScalarAtomChange<'change> {
+	created: bool,
+	removed: bool,
+	properties: Option<&'change PropertyMap>,
+}
+
+struct ScalarAtomState {
+	table_id: u32,
+	properties: PropertyMap,
+}
+
+struct ScalarAtomTransition {
+	id: AtomId,
+	before: Option<ScalarAtomState>,
+	after: Option<ScalarAtomState>,
+}
+
+/// Maintains every ready scalar index touched by one bounded atom delta.
+fn build_scalar_index_delta(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	delta: &LocalCommitAtomDelta,
+	target_context: &mut EncodeContext,
+) -> FerrosGrynnResult<(Vec<(DataFileId, PageNo, Box<AlignedPage>)>, Vec<BuiltTableIndexBinding>)> {
+	if base.scalar_indexes.is_empty() {
+		return Ok((Vec::new(), Vec::new()));
+	}
+	let indexed_tables =
+		base.scalar_indexes.values().flatten().map(|index| index.table_id).collect::<BTreeSet<_>>();
+	let indexed_fields = base
+		.scalar_indexes
+		.values()
+		.flatten()
+		.flat_map(|index| index.fields.iter().map(|(key, _value_type)| *key))
+		.collect::<BTreeSet<_>>();
+	let mut changes = BTreeMap::new();
+	for change in &delta.nodes {
+		let (id, change) = match change {
+			LocalCommitNodeChange::Upsert {
+				id,
+				properties,
+				created,
+				..
+			} => (*id, ScalarAtomChange {
+				created: *created,
+				removed: false,
+				properties: Some(properties),
+			}),
+			LocalCommitNodeChange::Remove {
+				id,
+				created,
+				..
+			} => (*id, ScalarAtomChange {
+				created: *created,
+				removed: true,
+				properties: None,
+			}),
+		};
+		if changes.insert(id, change).is_some() {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"scalar delta contains a duplicate atom change",
+			));
+		}
+	}
+	for change in &delta.edges {
+		let (id, change) = match change {
+			LocalCommitEdgeChange::Upsert {
+				id,
+				properties,
+				created,
+				..
+			} => (*id, ScalarAtomChange {
+				created: *created,
+				removed: false,
+				properties: Some(properties),
+			}),
+			LocalCommitEdgeChange::Remove {
+				id,
+				created,
+				..
+			} => (*id, ScalarAtomChange {
+				created: *created,
+				removed: true,
+				properties: None,
+			}),
+		};
+		if changes.insert(id, change).is_some() {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"scalar delta contains a duplicate atom change",
+			));
+		}
+	}
+	let mut memberships = BTreeMap::new();
+	for membership in &delta.memberships {
+		if memberships.insert(membership.id, membership.table_id).is_some() {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"scalar delta contains a duplicate membership change",
+			));
+		}
+	}
+	let affected = changes.keys().chain(memberships.keys()).copied().collect::<BTreeSet<_>>();
+	let mut source_context = base.base_context()?;
+	let mut source_context_complete = false;
+	let mut transitions = Vec::with_capacity(affected.len());
+	for id in affected {
+		let change = changes.get(&id);
+		let created = change.is_some_and(|change| change.created);
+		let previous = if created {
+			None
+		} else {
+			Some(previous_scalar_metadata(manager, transaction, base, id)?)
+		};
+		let removed = change.is_some_and(|change| change.removed);
+		let after_table = if removed {
+			None
+		} else {
+			memberships
+				.get(&id)
+				.copied()
+				.unwrap_or_else(|| previous.as_ref().and_then(|(table, _location)| *table))
+		};
+		let before_indexed = previous
+			.as_ref()
+			.and_then(|(table, _location)| *table)
+			.is_some_and(|table| indexed_tables.contains(&table));
+		let after_indexed = after_table.is_some_and(|table| indexed_tables.contains(&table));
+		let needs_previous_properties = before_indexed
+			|| after_indexed && change.and_then(|change| change.properties).is_none();
+		let previous_properties = if needs_previous_properties {
+			read_delta_index_properties(
+				manager,
+				transaction,
+				base,
+				previous.as_ref().and_then(|(_table, location)| *location),
+				&indexed_fields,
+				&mut source_context,
+				&mut source_context_complete,
+			)?
+		} else {
+			PropertyMap::new()
+		};
+		let before = previous
+			.as_ref()
+			.and_then(|(table, _location)| *table)
+			.filter(|table| indexed_tables.contains(table))
+			.map(|table_id| ScalarAtomState {
+				table_id,
+				properties: previous_properties.clone(),
+			});
+		let after = after_table.filter(|table| indexed_tables.contains(table)).map(|table_id| {
+			ScalarAtomState {
+				table_id,
+				properties: change
+					.and_then(|change| change.properties)
+					.cloned()
+					.unwrap_or(previous_properties),
+			}
+		});
+		transitions.push(ScalarAtomTransition {
+			id,
+			before,
+			after,
+		});
+	}
+
+	let mut payloads = Vec::new();
+	let mut bindings = Vec::new();
+	for (table, indexes) in &base.scalar_indexes {
+		for index in indexes {
+			let mut mutations = Vec::new();
+			for transition in &transitions {
+				let before = transition
+					.before
+					.as_ref()
+					.filter(|state| state.table_id == index.table_id)
+					.map(|state| scalar_state_key(state, index, &mut source_context))
+					.transpose()?;
+				let after = transition
+					.after
+					.as_ref()
+					.filter(|state| state.table_id == index.table_id)
+					.map(|state| scalar_state_key(state, index, target_context))
+					.transpose()?;
+				if before == after {
+					continue;
+				}
+				let atom = DiskAtomRef::from_parts(
+					transition.id.kind().ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"scalar delta atom has an invalid kind",
+						)
+					})?,
+					transition.id.slot(),
+				)?;
+				if let Some(key) = before {
+					mutations.push(ScalarIndexMutation {
+						key,
+						atom,
+						insert: false,
+					});
+				}
+				if let Some(key) = after {
+					mutations.push(ScalarIndexMutation {
+						key,
+						atom,
+						insert: true,
+					});
+				}
+			}
+			if mutations.is_empty() {
+				continue;
+			}
+			let mode = match index.kind {
+				TableIndexKind::Standard => ScalarIndexMode::Standard,
+				TableIndexKind::Unique => ScalarIndexMode::Unique,
+				TableIndexKind::Count => {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"Count index reached scalar delta maintenance",
+					));
+				}
+			};
+			let read_page = |page_no: PageNo, output: &mut AlignedPage| {
+				let page =
+					manager.read_page(transaction, base.index_page_key(index.file_id, page_no))?;
+				output.as_bytes_mut().copy_from_slice(page.as_bytes());
+				Ok(())
+			};
+			let (root, pages) = if let Some(pages) =
+				mutate_scalar_index_leaves(read_page, index.root, mode, &mutations, PageLsn::ZERO)?
+			{
+				(index.root, box_numbered_pages(pages)?)
+			} else {
+				let mut entries = scan_scalar_index(read_page, index.root, mode)?;
+				apply_scalar_mutations(&mut entries, &mutations, mode)?;
+				let built = build_scalar_index(&entries, mode, PageLsn::ZERO)?;
+				(built.root, number_pages(built.pages)?)
+			};
+			payloads
+				.extend(pages.into_iter().map(|(page_no, page)| (index.file_id, page_no, page)));
+			bindings.push(BuiltTableIndexBinding {
+				table: table.clone(),
+				index: TableIndexCatalogEntry {
+					index_id: index.index_id,
+					schema_version: index.schema_version,
+					name: index.name.clone(),
+					kind: index.kind,
+					state: TableIndexState::Ready,
+					fields: index.fields.iter().map(|(key, _value_type)| key.get()).collect(),
+					file_id: Some(index.file_id),
+					root: Some(root),
+				},
+			});
+		}
+	}
+	Ok((payloads, bindings))
+}
+
+fn scalar_state_key(
+	state: &ScalarAtomState,
+	index: &LocalScalarIndex,
+	context: &mut EncodeContext,
+) -> FerrosGrynnResult<Vec<u8>> {
+	let missing = Value::None;
+	let components = index
+		.fields
+		.iter()
+		.map(|(key, value_type)| (state.properties.get(*key).unwrap_or(&missing), value_type))
+		.collect::<Vec<_>>();
+	encode_index_key(&components, context)
+}
+
+fn previous_scalar_metadata(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	id: AtomId,
+) -> FerrosGrynnResult<(Option<u32>, Option<PropertyLocation>)> {
+	let (page_no, within) = hot_slot_address(id.slot())?;
+	let (generation, tombstone, table_id, properties) = match id.kind() {
+		Some(AtomKind::Node) => {
+			let page =
+				manager.read_page(transaction, base.page_key(DataFileKind::NodesHot, page_no)?)?;
+			let slot = read_node_hot_slot(page.as_page(), page_no, within)?;
+			(
+				slot.generation,
+				slot.flags.contains(NodeSlotFlags::TOMBSTONE),
+				slot.table_id,
+				slot.properties,
+			)
+		}
+		Some(AtomKind::Edge) => {
+			let page =
+				manager.read_page(transaction, base.page_key(DataFileKind::EdgesHot, page_no)?)?;
+			let slot = read_edge_hot_slot(page.as_page(), page_no, within)?;
+			(
+				slot.generation,
+				slot.flags.contains(EdgeSlotFlags::TOMBSTONE),
+				slot.table_id,
+				slot.properties,
+			)
+		}
+		None => {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"scalar delta contains an invalid atom kind",
+			));
+		}
+	};
+	if tombstone || generation != id.generation() {
+		return Err(FerrosGrynnError::invalid_storage_file("scalar delta references a stale atom"));
+	}
+	Ok((table_id, properties))
+}
+
+fn read_delta_index_properties(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	location: Option<PropertyLocation>,
+	fields: &BTreeSet<PropertyKeyId>,
+	context: &mut EncodeContext,
+	context_complete: &mut bool,
+) -> FerrosGrynnResult<PropertyMap> {
+	let Some(record) = read_delta_property_record(manager, transaction, base, location)? else {
+		return Ok(PropertyMap::new());
+	};
+	let limits = DecodeLimits::default();
+	match decode_property_fields(&record, fields, &context.decoder(), limits) {
+		Ok(properties) => Ok(properties),
+		Err(error)
+			if !*context_complete
+				&& error.status().code() == crate::gql_status::StatusCode::new(*b"22S04") =>
+		{
+			let entries = scan_primary_index(
+				|page_no, output| {
+					let page = manager
+						.read_page(transaction, base.page_key(DataFileKind::Index, page_no)?)?;
+					output.as_bytes_mut().copy_from_slice(page.as_bytes());
+					Ok(())
+				},
+				base.primary_index_root,
+			)?;
+			for entry in entries {
+				let record = decode_record_key(&entry.key, context)?;
+				context.register_atom(AtomRef::new(entry.atom.kind(), record), entry.atom)?;
+			}
+			*context_complete = true;
+			decode_property_fields(&record, fields, &context.decoder(), limits)
+		}
+		Err(error) => Err(error),
+	}
+}
+
+fn register_property_atom_references<'value>(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	values: impl Iterator<Item = &'value Value>,
+	removed: &BTreeSet<RecordId>,
+	context: &mut EncodeContext,
+) -> FerrosGrynnResult<()> {
+	let mut references = BTreeSet::new();
+	for value in values {
+		collect_atom_references(value, &mut references);
+	}
+	for reference in references {
+		if removed.contains(reference.id()) {
+			continue;
+		}
+		let key = primary_index_key(reference.id(), context)?;
+		let atom = lookup_primary_index(
+			|page_no, output| {
+				let page =
+					manager.read_page(transaction, base.page_key(DataFileKind::Index, page_no)?)?;
+				output.as_bytes_mut().copy_from_slice(page.as_bytes());
+				Ok(())
+			},
+			base.primary_index_root,
+			&key,
+		)?;
+		if let Some(atom) = atom {
+			context.register_atom(reference, atom)?;
+		}
+	}
+	Ok(())
+}
+
+fn collect_atom_references(value: &Value, output: &mut BTreeSet<AtomRef>) {
+	match value {
+		Value::Atom(reference) => {
+			output.insert(reference.as_ref().clone());
+		}
+		Value::Array(values) => {
+			for value in values {
+				collect_atom_references(value, output);
+			}
+		}
+		Value::Set(values) => {
+			for value in values {
+				collect_atom_references(value, output);
+			}
+		}
+		Value::Object(values) => {
+			for (_key, value) in values {
+				collect_atom_references(value, output);
+			}
+		}
+		Value::Range(range) => {
+			for bound in [range.start(), range.end()] {
+				if let Bound::Included(value) | Bound::Excluded(value) = bound {
+					collect_atom_references(value, output);
+				}
+			}
+		}
+		_ => {}
+	}
 }
 
 fn indexed_strings<'value>(
@@ -2024,10 +2461,9 @@ fn delta_graph_statistics(
 	delta: &LocalCommitAtomDelta,
 	node_count: u64,
 	edge_count: u64,
-	context: &EncodeContext,
 ) -> FerrosGrynnResult<GraphStatistics> {
 	let mut previous = base.statistics_with_labels(manager, transaction)?;
-	hydrate_legacy_label_statistics(&mut previous, manager, transaction, base, context)?;
+	hydrate_legacy_label_statistics(&mut previous, manager, transaction, base)?;
 	if previous.node_count != base.superblock.node_count
 		|| previous.edge_count != base.superblock.edge_count
 	{
@@ -2137,7 +2573,7 @@ fn delta_graph_statistics(
 	statistics.total_undirected_degree = total_undirected;
 	statistics.maximum_out_degree = maximum_out_degree;
 	statistics.maximum_in_degree = maximum_in_degree;
-	update_delta_label_statistics(&mut statistics, manager, transaction, base, delta, context)?;
+	update_delta_label_statistics(&mut statistics, manager, transaction, base, delta)?;
 	update_delta_table_statistics(&mut statistics, manager, transaction, base, delta)?;
 	statistics.mark_dirty(changed_rows, delta.revision)?;
 	Ok(statistics)
@@ -2180,6 +2616,7 @@ fn update_delta_table_statistics(
 			| LocalCommitNodeChange::Remove {
 				id,
 				created,
+				..
 			} => (*id, (change, *created)),
 		})
 		.collect::<BTreeMap<_, _>>();
@@ -2195,6 +2632,7 @@ fn update_delta_table_statistics(
 			| LocalCommitEdgeChange::Remove {
 				id,
 				created,
+				..
 			} => (*id, (change, *created)),
 		})
 		.collect::<BTreeMap<_, _>>();
@@ -2288,7 +2726,6 @@ fn hydrate_legacy_label_statistics(
 	manager: &SyncPageManager,
 	transaction: &TxHandle,
 	base: &LocalGraph,
-	context: &EncodeContext,
 ) -> FerrosGrynnResult<()> {
 	if statistics.revision != 0 || statistics.node_count == 0 && statistics.edge_count == 0 {
 		return Ok(());
@@ -2323,13 +2760,8 @@ fn hydrate_legacy_label_statistics(
 				FerrosGrynnError::invalid_storage_file("node statistics count overflows")
 			})?;
 			if let Some(label) = decode_label(slot.label_id, &base.labels.node_labels)? {
-				let properties = read_delta_property_count(
-					manager,
-					transaction,
-					base,
-					slot.properties,
-					context,
-				)?;
+				let properties =
+					read_delta_property_count(manager, transaction, base, slot.properties)?;
 				statistics.replace_label(AtomKind::Node, None, Some((&label, properties)))?;
 			}
 		}
@@ -2360,13 +2792,8 @@ fn hydrate_legacy_label_statistics(
 				FerrosGrynnError::invalid_storage_file("edge statistics count overflows")
 			})?;
 			if let Some(label) = decode_label(slot.label_id, &base.labels.edge_labels)? {
-				let properties = read_delta_property_count(
-					manager,
-					transaction,
-					base,
-					slot.properties,
-					context,
-				)?;
+				let properties =
+					read_delta_property_count(manager, transaction, base, slot.properties)?;
 				statistics.replace_label(AtomKind::Edge, None, Some((&label, properties)))?;
 			}
 		}
@@ -2390,7 +2817,6 @@ fn update_delta_label_statistics(
 	transaction: &TxHandle,
 	base: &LocalGraph,
 	delta: &LocalCommitAtomDelta,
-	context: &EncodeContext,
 ) -> FerrosGrynnResult<()> {
 	for change in &delta.nodes {
 		match change {
@@ -2404,7 +2830,7 @@ fn update_delta_label_statistics(
 				let before = if *created {
 					None
 				} else {
-					previous_label_observation(manager, transaction, base, *id, context)?
+					previous_label_observation(manager, transaction, base, *id)?
 				};
 				statistics.replace_label(
 					AtomKind::Node,
@@ -2415,11 +2841,12 @@ fn update_delta_label_statistics(
 			LocalCommitNodeChange::Remove {
 				id,
 				created,
+				..
 			} => {
 				let before = if *created {
 					None
 				} else {
-					previous_label_observation(manager, transaction, base, *id, context)?
+					previous_label_observation(manager, transaction, base, *id)?
 				};
 				statistics.replace_label(
 					AtomKind::Node,
@@ -2441,7 +2868,7 @@ fn update_delta_label_statistics(
 				let before = if *created {
 					None
 				} else {
-					previous_label_observation(manager, transaction, base, *id, context)?
+					previous_label_observation(manager, transaction, base, *id)?
 				};
 				statistics.replace_label(
 					AtomKind::Edge,
@@ -2452,11 +2879,12 @@ fn update_delta_label_statistics(
 			LocalCommitEdgeChange::Remove {
 				id,
 				created,
+				..
 			} => {
 				let before = if *created {
 					None
 				} else {
-					previous_label_observation(manager, transaction, base, *id, context)?
+					previous_label_observation(manager, transaction, base, *id)?
 				};
 				statistics.replace_label(
 					AtomKind::Edge,
@@ -2475,7 +2903,6 @@ fn previous_label_observation(
 	transaction: &TxHandle,
 	base: &LocalGraph,
 	id: AtomId,
-	context: &EncodeContext,
 ) -> FerrosGrynnResult<Option<(Text, usize)>> {
 	let (page_no, within) = hot_slot_address(id.slot())?;
 	let (generation, tombstone, label, properties) = match id.kind() {
@@ -2515,8 +2942,7 @@ fn previous_label_observation(
 	let Some(label) = label else {
 		return Ok(None);
 	};
-	let property_count =
-		read_delta_property_count(manager, transaction, base, properties, context)?;
+	let property_count = read_delta_property_count(manager, transaction, base, properties)?;
 	Ok(Some((label, property_count)))
 }
 
@@ -2526,10 +2952,21 @@ fn read_delta_property_count(
 	transaction: &TxHandle,
 	base: &LocalGraph,
 	location: Option<PropertyLocation>,
-	context: &EncodeContext,
 ) -> FerrosGrynnResult<usize> {
+	let limits = DecodeLimits::default();
+	read_delta_property_record(manager, transaction, base, location)?
+		.map_or(Ok(0), |record| count_property_entries(&record, limits))
+}
+
+/// Loads one prior canonical property record through the transaction snapshot.
+fn read_delta_property_record(
+	manager: &SyncPageManager,
+	transaction: &TxHandle,
+	base: &LocalGraph,
+	location: Option<PropertyLocation>,
+) -> FerrosGrynnResult<Option<Vec<u8>>> {
 	let Some(location) = location else {
-		return Ok(0);
+		return Ok(None);
 	};
 	let limits = DecodeLimits::default();
 	let record = match location {
@@ -2587,7 +3024,7 @@ fn read_delta_property_count(
 			decode_large_property(first_page, &pages, length, limits.max_total_allocation)?
 		}
 	};
-	decode_property_map(&record, &context.decoder(), limits).map(|properties| properties.len())
+	Ok(Some(record))
 }
 
 fn number_pages(pages: Vec<AlignedPage>) -> FerrosGrynnResult<Vec<(PageNo, Box<AlignedPage>)>> {
@@ -2623,7 +3060,7 @@ fn build_count_index_delta(
 	transaction: &TxHandle,
 	base: &LocalGraph,
 	statistics: &GraphStatistics,
-) -> FerrosGrynnResult<Vec<(DataFileId, Box<AlignedPage>)>> {
+) -> FerrosGrynnResult<Vec<(DataFileId, PageNo, Box<AlignedPage>)>> {
 	let mut pages = Vec::new();
 	for (table_id, index) in &base.count_indexes {
 		let key = crate::storage::types::PageKey::new(base.graph_id, index.file_id, PageNo::new(0));
@@ -2646,7 +3083,7 @@ fn build_count_index_delta(
 			},
 			PageLsn::ZERO,
 		)?;
-		pages.push((index.file_id, Box::new(page)));
+		pages.push((index.file_id, PageNo::new(0), Box::new(page)));
 	}
 	Ok(pages)
 }

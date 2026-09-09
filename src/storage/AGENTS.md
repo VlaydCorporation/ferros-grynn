@@ -62,6 +62,10 @@
   может не иметь physical binding. Missing/unopenable/checksum-corrupt
   secondary переводится в `Stale` и даёт scan fallback, а primary/base
   corruption остаётся фатальной.
+- Immutable external-sort B+tree generations заполняют leaves до capacity.
+  Point-DML сначала применяет page-WAL leaf update при стабильных separators и
+  posting layout; bulk fallback использует measured mutable fill `0.90` для
+  primary/Unique и `0.80` для Standard. Это writer policy, не новый disk tag.
 - Любая входная длина/счётчик проверяется до allocation; ошибки проходят через
   `gql_status` без раскрытия локальных путей и сырых страниц.
 

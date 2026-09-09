@@ -345,11 +345,6 @@ impl Transaction {
 			let StoredGraphValue::Local(base) = &latest.graph else {
 				return Err(self.write_conflict("the graph storage representation changed"));
 			};
-			if !base.supports_atom_delta() {
-				return Err(FerrosGrynnError::invalid_argument(
-					"bounded point mutation cannot maintain scalar indexes incrementally",
-				));
-			}
 			let mut dirty = local.delta.dirty().collect::<BTreeSet<_>>();
 			dirty.extend(write.memberships.keys().copied().map(DirtyTarget::Atom));
 			let changes_nodes = local.delta.changes_node_membership();

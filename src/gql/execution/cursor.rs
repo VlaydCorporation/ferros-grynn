@@ -78,6 +78,14 @@ pub(super) trait QueryRead {
 
 	/// Applies one typed schema command to the transaction that owns this view.
 	fn execute_schema(&mut self, statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value>;
+
+	/// Applies one typed data-mutation statement to the owning transaction.
+	fn execute_dml(
+		&mut self,
+		statement: &LogicalDmlStatement,
+		slots: &[Value],
+		source: &str,
+	) -> FerrosGrynnResult<Value>;
 }
 
 /// Pull cursor that binds the first endpoint of a pattern.

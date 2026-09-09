@@ -409,6 +409,20 @@ define_status_codes!(
 		},
 		hint: "Retry the complete transaction.",
 	},
+	ConditionFailed, "FG-40F01" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::TransactionRollback,
+		domain: Domain::Transaction,
+		subcondition: "mutation precondition failed",
+		message: "The EXPECT precondition failed for {target}.",
+		params: {
+			target: String => DisplayValue,
+		},
+	},
 	ColumnarTypeConflict, "FG-22F16" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,

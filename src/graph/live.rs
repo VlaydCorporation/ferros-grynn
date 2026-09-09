@@ -194,8 +194,9 @@ impl LiveGraph<Frozen> {
 	pub fn apply_update(&self, update: &LiveUpdate) -> FerrosGrynnResult<()> {
 		let current = self.snapshot()?;
 		validate_update(current.as_ref(), update, current.revision())?;
-		// ponytail: this copies the general SoA until graph storage is split into
-		// copy-on-write chunks; the publication boundary already stays atomic.
+		// ponytail: this copies the general SoA until graph storage is split
+		// into copy-on-write chunks; the publication boundary already stays
+		// atomic.
 		let mut candidate = current.as_ref().clone().thaw();
 		update.apply(&mut candidate)?;
 		candidate.adopt_external_revision(update.remote_revision());

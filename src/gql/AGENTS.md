@@ -34,6 +34,10 @@ src/syn parse -> analysis -> logical IR -> execution -> datastore adapter
   datastore adapter. `INFO FOR DB|TABLE|INDEX` читает transaction-visible
   definitions и показывает состояние индекса; расширенные index kinds и
   неутверждённый `ALTER GRAPH` возвращают явный unsupported status.
+- Core DML выполняет общий preflight целей и `EXPECT` по pre-image до первой
+  мутации. Graph-backed `CREATE/UPDATE/UPSERT/DELETE` проходят typed IR;
+  `RELATE` нельзя выводить из совпадения edge label и table name — его identity
+  contract должен быть сначала утверждён в `gql_spec`.
 
 ## Спецификации и проверка
 

@@ -162,6 +162,24 @@ pub(in crate::storage) fn read_node_hot_slot(
 	if header.page_type() != PageType::NodeHot || !header.flags().is_empty() {
 		return Err(invalid_page(page_no.get(), "expected an unflagged NodeHot page"));
 	}
+	decode_node_hot_slot(page, page_no, slot)
+}
+
+/// Reads one node slot from an exclusively owned page whose header was
+/// validated before in-memory mutations began.
+pub(in crate::storage) fn read_unsealed_node_hot_slot(
+	page: &AlignedPage,
+	page_no: PageNo,
+	slot: usize,
+) -> FerrosGrynnResult<NodeHotSlot> {
+	decode_node_hot_slot(page, page_no, slot)
+}
+
+fn decode_node_hot_slot(
+	page: &AlignedPage,
+	page_no: PageNo,
+	slot: usize,
+) -> FerrosGrynnResult<NodeHotSlot> {
 	let range = hot_slot_range(page, PageType::NodeHot, slot)?;
 	let bytes = &page.as_bytes()[range];
 	validate_zero(&bytes[NODE_PADDING_OFFSET..NODE_OUT_OVERFLOW_OFFSET], page_no, "node padding")?;
@@ -255,6 +273,24 @@ pub(in crate::storage) fn read_edge_hot_slot(
 	if header.page_type() != PageType::EdgeHot || !header.flags().is_empty() {
 		return Err(invalid_page(page_no.get(), "expected an unflagged EdgeHot page"));
 	}
+	decode_edge_hot_slot(page, page_no, slot)
+}
+
+/// Reads one edge slot from an exclusively owned page whose header was
+/// validated before in-memory mutations began.
+pub(in crate::storage) fn read_unsealed_edge_hot_slot(
+	page: &AlignedPage,
+	page_no: PageNo,
+	slot: usize,
+) -> FerrosGrynnResult<EdgeHotSlot> {
+	decode_edge_hot_slot(page, page_no, slot)
+}
+
+fn decode_edge_hot_slot(
+	page: &AlignedPage,
+	page_no: PageNo,
+	slot: usize,
+) -> FerrosGrynnResult<EdgeHotSlot> {
 	let range = hot_slot_range(page, PageType::EdgeHot, slot)?;
 	let bytes = &page.as_bytes()[range];
 	validate_zero(&bytes[EDGE_PADDING_A_OFFSET..EDGE_GENERATION_OFFSET], page_no, "edge padding")?;

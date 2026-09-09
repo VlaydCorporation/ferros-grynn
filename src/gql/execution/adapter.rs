@@ -15,9 +15,9 @@ use crate::{
 		TableKind,
 		TableSchemaMode,
 	},
-	graph::{Dag, Graph, GraphKind, Hypergraph, MaterializedGraph, Metagraph, Mutable},
+	graph::{AtomRef, Dag, Graph, GraphKind, Hypergraph, MaterializedGraph, Metagraph, Mutable},
 	syn::DefinitionMode,
-	values::RecordIdPart,
+	values::{PropertyMap, RecordIdPart, Text, Ulid},
 };
 
 /// Parses, analyzes, and executes query text within an existing transaction.
@@ -64,6 +64,10 @@ pub(super) struct TransactionRead<'a> {
 impl QueryCatalog for TransactionRead<'_> {
 	fn schema(&self, table: &str) -> FerrosGrynnResult<Schema> {
 		self.transaction.query_table(&self.snapshot, table).map(|schema| query_schema(&schema))
+	}
+
+	fn schema_mode(&self, table: &str) -> FerrosGrynnResult<TableSchemaMode> {
+		self.transaction.query_table(&self.snapshot, table).map(|schema| schema.schema_mode())
 	}
 
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef> {
@@ -137,11 +141,20 @@ impl QueryRead for TransactionRead<'_> {
 	}
 
 	fn property_dictionary(&self, _snapshot: Snapshot) -> Arc<PropertyDictionary> {
-		self.snapshot.property_dictionary()
+		self.transaction.query_property_dictionary()
 	}
 
 	fn execute_schema(&mut self, statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value> {
 		execute_schema(self.transaction, &self.snapshot, statement)
+	}
+
+	fn execute_dml(
+		&mut self,
+		statement: &LogicalDmlStatement,
+		slots: &[Value],
+		source: &str,
+	) -> FerrosGrynnResult<Value> {
+		execute_dml(self.transaction, &self.snapshot, statement, slots, source)
 	}
 }
 
@@ -216,6 +229,589 @@ fn execute_schema(
 			table,
 			name,
 		} => info_index(transaction, snapshot, table, name),
+	}
+}
+
+#[derive(Clone)]
+struct DmlCandidate {
+	target: usize,
+	record_id: RecordId,
+	kind: Option<AtomKind>,
+	properties: PropertyMap,
+	before: Object,
+	row: Row,
+}
+
+impl DmlCandidate {
+	const fn exists(&self) -> bool {
+		self.kind.is_some()
+	}
+}
+
+fn execute_dml(
+	transaction: &mut Transaction,
+	snapshot: &QuerySnapshot,
+	statement: &LogicalDmlStatement,
+	slots: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<Value> {
+	let dictionary = transaction.query_property_dictionary();
+	let mut candidates = Vec::new();
+	for (target_index, target) in statement.targets.iter().enumerate() {
+		collect_dml_candidates(
+			transaction,
+			snapshot,
+			statement.kind,
+			target_index,
+			target,
+			slots,
+			source,
+			&dictionary,
+			&mut candidates,
+		)?;
+	}
+	let mut unique_targets = BTreeSet::new();
+	for candidate in &candidates {
+		if !unique_targets.insert(candidate.record_id.clone()) {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"DML target '{}' resolves more than once in one statement.",
+				candidate.record_id
+			)));
+		}
+	}
+	for candidate in &candidates {
+		let target = &statement.targets[candidate.target];
+		if !expect_matches(target.expect.as_ref(), candidate, slots, source)? {
+			return Err(FerrosGrynnError::condition_failed(candidate.record_id.to_string()));
+		}
+	}
+
+	let returns_none = statement
+		.targets
+		.first()
+		.is_some_and(|target| matches!(target.returning, LogicalDmlReturn::None));
+	let mut output = Array::new(Vec::new());
+	for candidate in candidates {
+		let target = &statement.targets[candidate.target];
+		let schema = transaction.query_table(snapshot, &target.table)?;
+		let affected = candidate.exists()
+			|| matches!(statement.kind, LogicalDmlKind::Create | LogicalDmlKind::Upsert);
+		let after = apply_dml_candidate(
+			transaction,
+			statement.kind,
+			target,
+			&schema,
+			&candidate,
+			slots,
+			source,
+			&dictionary,
+		)?;
+		if affected
+			&& !returns_none
+			&& let Some(value) = dml_return_value(
+				&target.returning,
+				&target.schema,
+				&candidate.before,
+				after.as_ref(),
+				slots,
+				source,
+			)? {
+			output.push(value);
+		}
+	}
+	if returns_none {
+		Ok(Value::None)
+	} else {
+		Ok(Value::Array(output))
+	}
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "DML preflight keeps snapshot, target, and expression state explicit"
+)]
+fn collect_dml_candidates(
+	transaction: &Transaction,
+	snapshot: &QuerySnapshot,
+	kind: LogicalDmlKind,
+	target_index: usize,
+	target: &LogicalDmlTarget,
+	slots: &[Value],
+	source: &str,
+	dictionary: &PropertyDictionary,
+	output: &mut Vec<DmlCandidate>,
+) -> FerrosGrynnResult<()> {
+	match &target.selector {
+		LogicalDmlSelector::Table if kind == LogicalDmlKind::Create => {
+			output.push(missing_candidate(
+				target_index,
+				generated_record_id(&target.table)?,
+				&target.schema,
+			));
+		}
+		LogicalDmlSelector::Range(count) => {
+			for _ in 0..*count {
+				output.push(missing_candidate(
+					target_index,
+					generated_record_id(&target.table)?,
+					&target.schema,
+				));
+			}
+		}
+		LogicalDmlSelector::Record(key) => {
+			let record_id =
+				RecordId::from_value(target.table.as_ref(), eval(key, None, slots, source, None)?)?;
+			let row = transaction.query_point(snapshot, &record_id)?;
+			transaction.register_query_point(snapshot, &target.table, &record_id, row.as_ref())?;
+			let candidate = match row {
+				Some(row) => storage_candidate(target_index, row, &target.schema, dictionary)?,
+				None => missing_candidate(target_index, record_id, &target.schema),
+			};
+			if candidate.exists() {
+				if filter_matches(target.filter.as_ref(), &candidate.row, slots, source)? {
+					output.push(candidate);
+				}
+			} else if target.filter.is_none() {
+				output.push(candidate);
+			}
+		}
+		LogicalDmlSelector::Table => {
+			let evaluator: Arc<dyn PredicateEvaluator> = Arc::new(AllRowsPredicate);
+			let predicate_graph = transaction.register_streaming_query_predicate(
+				snapshot,
+				&target.table,
+				evaluator.clone(),
+			)?;
+			let mut cursor = transaction.query_row_cursor(snapshot, &target.table, &[])?;
+			let start_len = output.len();
+			while let Some(row) = cursor.next_row()? {
+				if let Some(graph) = &predicate_graph {
+					transaction.register_streamed_query_row(
+						snapshot,
+						graph,
+						&row,
+						evaluator.as_ref(),
+					)?;
+				}
+				let candidate = storage_candidate(target_index, row, &target.schema, dictionary)?;
+				if filter_matches(target.filter.as_ref(), &candidate.row, slots, source)? {
+					output.push(candidate);
+				}
+			}
+			if kind == LogicalDmlKind::Upsert && output.len() == start_len {
+				output.push(missing_candidate(
+					target_index,
+					generated_record_id(&target.table)?,
+					&target.schema,
+				));
+			}
+		}
+	}
+	Ok(())
+}
+
+fn generated_record_id(table: &str) -> FerrosGrynnResult<RecordId> {
+	RecordId::new(table, RecordIdPart::Ulid(Ulid::new()))
+}
+
+fn missing_candidate(target: usize, record_id: RecordId, schema: &Schema) -> DmlCandidate {
+	DmlCandidate {
+		target,
+		record_id,
+		kind: None,
+		properties: PropertyMap::new(),
+		before: Object::new(),
+		row: Row::new(vec![Value::None; schema.columns.len()]),
+	}
+}
+
+fn storage_candidate(
+	target: usize,
+	row: QueryStorageRow,
+	schema: &Schema,
+	dictionary: &PropertyDictionary,
+) -> FerrosGrynnResult<DmlCandidate> {
+	let mut before = Object::new();
+	before.insert("id", Value::Record(Box::new(row.record_id.clone())));
+	for (key, value) in &row.properties {
+		let name = dictionary.resolve(key).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(format!(
+				"property dictionary does not resolve key {key}"
+			))
+		})?;
+		before.insert(name.clone(), value.clone());
+	}
+	let values = schema
+		.columns
+		.iter()
+		.map(|column| before.get(&column.name).cloned().unwrap_or(Value::None))
+		.collect();
+	Ok(DmlCandidate {
+		target,
+		record_id: row.record_id,
+		kind: row.atom_id.kind(),
+		properties: row.properties,
+		before,
+		row: Row::new(values),
+	})
+}
+
+fn filter_matches(
+	filter: Option<&TypedExpr>,
+	row: &Row,
+	slots: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<bool> {
+	filter.map_or(Ok(true), |filter| {
+		eval(filter, Some(row), slots, source, None).map(|value| value.is_truthy())
+	})
+}
+
+fn expect_matches(
+	expect: Option<&LogicalExpect>,
+	candidate: &DmlCandidate,
+	slots: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<bool> {
+	match expect {
+		None => Ok(true),
+		Some(LogicalExpect::Exists(expected)) => Ok(candidate.exists() == *expected),
+		Some(LogicalExpect::Predicate(predicate)) => {
+			eval(predicate, Some(&candidate.row), slots, source, None)
+				.map(|value| value.is_truthy())
+		}
+	}
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "the mutation boundary keeps pre-image and runtime context explicit"
+)]
+fn apply_dml_candidate(
+	transaction: &mut Transaction,
+	kind: LogicalDmlKind,
+	target: &LogicalDmlTarget,
+	schema: &TableSchema,
+	candidate: &DmlCandidate,
+	slots: &[Value],
+	source: &str,
+	dictionary: &PropertyDictionary,
+) -> FerrosGrynnResult<Option<Object>> {
+	let exists = candidate.exists();
+	if matches!(kind, LogicalDmlKind::Update | LogicalDmlKind::Delete) && !exists {
+		return Ok(None);
+	}
+	if kind == LogicalDmlKind::Create && exists {
+		return Err(FerrosGrynnError::graph_constraint_violation(
+			"record id",
+			format!("duplicate RecordId '{}'", candidate.record_id),
+		));
+	}
+	if kind == LogicalDmlKind::Delete {
+		remove_dml_atom(transaction, schema, candidate)?;
+		return Ok(None);
+	}
+
+	let mut after = if exists {
+		candidate.before.clone()
+	} else {
+		Object::new()
+	};
+	apply_dml_data(target.data.as_ref(), &candidate.row, slots, source, &mut after)?;
+	after.insert("id", Value::Record(Box::new(candidate.record_id.clone())));
+	validate_dml_object(schema, &after)?;
+	if exists {
+		if after != candidate.before {
+			update_dml_atom(transaction, schema, candidate, &after, dictionary)?;
+		}
+	} else {
+		create_dml_atom(transaction, schema, candidate, &after)?;
+	}
+	Ok(Some(after))
+}
+
+fn apply_dml_data(
+	data: Option<&LogicalDmlData>,
+	row: &Row,
+	slots: &[Value],
+	source: &str,
+	image: &mut Object,
+) -> FerrosGrynnResult<()> {
+	let Some(data) = data else {
+		return Ok(());
+	};
+	match data {
+		LogicalDmlData::Content(value) => {
+			*image = eval_object(value, row, slots, source)?;
+			image.remove("id");
+		}
+		LogicalDmlData::Replace(value) => {
+			let replacement = eval_object(value, row, slots, source)?;
+			if replacement.contains_key("id") {
+				return Err(FerrosGrynnError::invalid_argument(
+					"REPLACE cannot change the implicit read-only `id` field.",
+				));
+			}
+			*image = replacement;
+		}
+		LogicalDmlData::Merge(value) => {
+			for (name, value) in eval_object(value, row, slots, source)? {
+				if name.as_str().eq_ignore_ascii_case("id") {
+					return Err(FerrosGrynnError::invalid_argument(
+						"MERGE cannot change the implicit read-only `id` field.",
+					));
+				}
+				image.insert(name.as_ref(), value);
+			}
+		}
+		LogicalDmlData::Patch(value) => {
+			for (name, value) in eval_object(value, row, slots, source)? {
+				if name.as_str().eq_ignore_ascii_case("id") {
+					return Err(FerrosGrynnError::invalid_argument(
+						"PATCH cannot change the implicit read-only `id` field.",
+					));
+				}
+				if value == Value::None {
+					image.remove(name.as_str());
+				} else {
+					image.insert(name, value);
+				}
+			}
+		}
+		LogicalDmlData::Set(assignments) => {
+			let values = assignments
+				.iter()
+				.map(|(name, value)| {
+					eval(value, Some(row), slots, source, None).map(|value| (name.clone(), value))
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			for (name, value) in values {
+				image.insert(name.as_ref(), value);
+			}
+		}
+		LogicalDmlData::Unset(fields) => {
+			for field in fields {
+				image.remove(field);
+			}
+		}
+	}
+	Ok(())
+}
+
+fn eval_object(
+	expr: &TypedExpr,
+	row: &Row,
+	slots: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<Object> {
+	match eval(expr, Some(row), slots, source, None)? {
+		Value::Object(value) => Ok(value),
+		value => Err(FerrosGrynnError::invalid_argument(format!(
+			"DML object mode received {}",
+			value.value_type()
+		))),
+	}
+}
+
+fn validate_dml_object(schema: &TableSchema, image: &Object) -> FerrosGrynnResult<()> {
+	for (name, value) in image {
+		if name.as_str() == "id" {
+			continue;
+		}
+		let field = schema.fields().find(|field| field.name().as_str() == name.as_str());
+		if schema.schema_mode() == TableSchemaMode::Schemafull && field.is_none() {
+			return Err(FerrosGrynnError::unknown_field(name.as_str()));
+		}
+		if let Some(field) = field
+			&& !compatible(field.value_type(), &value.value_type())
+		{
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"field '{}' expects {}, found {}",
+				name,
+				field.value_type(),
+				value.value_type()
+			)));
+		}
+	}
+	Ok(())
+}
+
+fn dml_graph(schema: &TableSchema) -> FerrosGrynnResult<GraphRef> {
+	schema.graph().cloned().ok_or_else(|| {
+		FerrosGrynnError::query_feature_not_supported(
+			"DML storage for tables in the system graph (GraphId=0)",
+		)
+	})
+}
+
+fn create_dml_atom(
+	transaction: &mut Transaction,
+	schema: &TableSchema,
+	candidate: &DmlCandidate,
+	after: &Object,
+) -> FerrosGrynnResult<()> {
+	if schema.kind() == TableKind::Relation {
+		return Err(FerrosGrynnError::invalid_argument(
+			"CREATE cannot create a relation atom without endpoints; use RELATE.",
+		));
+	}
+	let graph = dml_graph(schema)?;
+	let properties = dml_property_map(transaction, after)?;
+	let atom = transaction.mutate_graph(&graph)?.create_node(
+		candidate.record_id.clone(),
+		None,
+		properties,
+	)?;
+	transaction.assign_atom_to_table(&graph, &atom, schema.name().as_str())
+}
+
+fn update_dml_atom(
+	transaction: &mut Transaction,
+	schema: &TableSchema,
+	candidate: &DmlCandidate,
+	after: &Object,
+	dictionary: &PropertyDictionary,
+) -> FerrosGrynnResult<()> {
+	let graph = dml_graph(schema)?;
+	let atom = AtomRef::new(
+		candidate.kind.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("DML update candidate has no atom kind")
+		})?,
+		candidate.record_id.clone(),
+	);
+	let removals = candidate
+		.properties
+		.iter()
+		.filter_map(|(key, _value)| {
+			dictionary
+				.resolve(key)
+				.filter(|name| !after.contains_key(name.as_str()))
+				.map(|_name| key)
+		})
+		.collect::<Vec<_>>();
+	let mut assignments = Vec::new();
+	for (name, value) in after {
+		if name.as_str() == "id" {
+			continue;
+		}
+		let key = transaction.intern_property(name.as_str())?;
+		if candidate.properties.get(key) != Some(value) {
+			assignments.push((key, value.clone()));
+		}
+	}
+	let mut mutation = transaction.mutate_graph(&graph)?;
+	for key in removals {
+		mutation.remove_property(&atom, key)?;
+	}
+	for (key, value) in assignments {
+		mutation.set_property(&atom, key, value)?;
+	}
+	Ok(())
+}
+
+fn remove_dml_atom(
+	transaction: &mut Transaction,
+	schema: &TableSchema,
+	candidate: &DmlCandidate,
+) -> FerrosGrynnResult<()> {
+	let graph = dml_graph(schema)?;
+	let atom = AtomRef::new(
+		candidate.kind.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("DML delete candidate has no atom kind")
+		})?,
+		candidate.record_id.clone(),
+	);
+	transaction.mutate_graph(&graph)?.remove_atom(&atom)
+}
+
+fn dml_property_map(transaction: &Transaction, image: &Object) -> FerrosGrynnResult<PropertyMap> {
+	image
+		.iter()
+		.filter(|(name, _value)| name.as_str() != "id")
+		.map(|(name, value)| {
+			transaction.intern_property(name.as_str()).map(|key| (key, value.clone()))
+		})
+		.collect()
+}
+
+fn dml_return_value(
+	returning: &LogicalDmlReturn,
+	schema: &Schema,
+	before: &Object,
+	after: Option<&Object>,
+	slots: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<Option<Value>> {
+	let selected = after.unwrap_or(before);
+	match returning {
+		LogicalDmlReturn::None => Ok(None),
+		LogicalDmlReturn::Before => Ok(Some(Value::Object(before.clone()))),
+		LogicalDmlReturn::After => Ok(after.cloned().map(Value::Object)),
+		LogicalDmlReturn::Diff => Ok(Some(Value::Object(dml_diff(before, after)))),
+		LogicalDmlReturn::Value(value) => {
+			let row = object_row(schema, selected);
+			eval(value, Some(&row), slots, source, None).map(Some)
+		}
+		LogicalDmlReturn::Fields(items) => {
+			let row = object_row(schema, selected);
+			let mut object = Object::new();
+			for item in items {
+				match item {
+					LogicalDmlReturnItem::Wildcard => {
+						for (name, value) in selected {
+							object.insert(name.clone(), value.clone());
+						}
+					}
+					LogicalDmlReturnItem::Expr {
+						name,
+						value,
+					} => {
+						object.insert(name.as_ref(), eval(value, Some(&row), slots, source, None)?);
+					}
+				}
+			}
+			Ok(Some(Value::Object(object)))
+		}
+	}
+}
+
+fn object_row(schema: &Schema, object: &Object) -> Row {
+	Row::new(
+		schema
+			.columns
+			.iter()
+			.map(|column| object.get(&column.name).cloned().unwrap_or(Value::None))
+			.collect(),
+	)
+}
+
+fn dml_diff(before: &Object, after: Option<&Object>) -> Object {
+	let empty = Object::new();
+	let after = after.unwrap_or(&empty);
+	before
+		.keys()
+		.chain(after.keys())
+		.map(Text::as_str)
+		.collect::<BTreeSet<_>>()
+		.into_iter()
+		.filter(|name| before.get(name) != after.get(name))
+		.map(|name| {
+			(
+				name,
+				Value::Object(Object::from_iter([
+					("before", before.get(name).cloned().unwrap_or(Value::None)),
+					("after", after.get(name).cloned().unwrap_or(Value::None)),
+				])),
+			)
+		})
+		.collect()
+}
+
+struct AllRowsPredicate;
+
+impl PredicateEvaluator for AllRowsPredicate {
+	fn matches(&self, _row: &QueryStorageRow) -> FerrosGrynnResult<bool> {
+		Ok(true)
 	}
 }
 

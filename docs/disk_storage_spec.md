@@ -3035,23 +3035,33 @@ Stage-7 immutable generation packer заполняет страницу до е�
 публикации он не выполняет in-place insert/split, поэтому искусственный reserve только увеличил
 бы read amplification. `FG_INDEX_BTREE_FILL_FACTOR` ещё не является production setting.
 
-При появлении incremental page-WAL maintenance целевое начальное значение — **0.90**. Плотность
-тогда защищает не столько от расщеплений, сколько от **физической фрагментации цепочки листьев**:
-первая вставка в полный лист и расщепляет его, и вытягивает физически случайную страницу из
-freelist в логически последовательную цепочку. Этап DML обязан сравнить point/batch workloads и
-утвердить threshold вместе с единой configuration authority.
+Stage-9 point-DML сначала пытается обновить только затронутые leaf-страницы через page WAL.
+Этот путь допустим, только если не меняются разделитель internal page, число leaf-страниц и
+posting-layout Standard index. Иначе используется существующая полная перестройка текущего
+mutable index image; unique validation выполняется до публикации, а recovery видит один
+атомарный WAL commit.
 
-До измерений этапа DML сохраняются только кандидаты для сравнения, а не реализованная эвристика:
+Paired-профиль на 50 000 записях и batch `1/32/256` подтвердил, что заполненные до capacity
+mutable leaf почти всегда немедленно уходят в полную перестройку. Поэтому format-v1 фиксирует
+следующую writer policy:
 
-| Кандидат workload                                      | Проверяемый fill factor |
-|---------------------------------------------------------|-------------------------|
-| Смешанные будущие вставки                               | 0.90                    |
-| Доказанно монотонный append-only или read-only индекс   | 1.00                    |
-| Заведомо случайные вставки после загрузки               | 0.75–0.80               |
+| Путь построения                                         | Leaf fill |
+|---------------------------------------------------------|-----------|
+| Immutable external-sort generation                      | 1.00      |
+| Mutable primary и Unique fallback image                 | 0.90      |
+| Mutable Standard fallback image                         | 0.80      |
 
-Автоопределение монотонности, отдельный internal fill factor и настройка R-tree в stage 7 не
-реализованы. Они становятся contract только после paired benchmark и выбора единой configuration
-authority; до этого immutable B+tree packer всегда использует 1.00.
+На primary при fill `0.90` leaf-only path обновлял 1 страницу вместо 100 для point mutation и
+32 страницы вместо 100 для batch 32; медианное отношение времени incremental/bulk составило
+соответственно `0.013` и `0.198`. На Standard при fill `0.80` отношения составили `0.005` и
+`0.110`; batch 256 оставался быстрее bulk (`0.127`) на измеренном распределении. При fill `1.00`
+primary batch 256 и Standard batch 256 требовали bulk fallback, который был быстрее попытки
+сохранить плотную mutable раскладку.
+
+Fill factor является политикой writer, а не новым on-disk discriminator или ограничением reader.
+Пользовательская настройка и автоопределение монотонности не вводятся: immutable packer остаётся
+плотным, а изменение этих констант требует нового paired workload и проверки page count, recovery
+и unique semantics. Отдельный internal fill factor и настройка R-tree в core format v1 не входят.
 
 #### 20.13.4. Протокол side-file: журнал не растёт
 

@@ -1,3 +1,4 @@
+mod dml;
 mod r#let;
 mod r#match;
 mod r#return;
@@ -54,6 +55,10 @@ pub struct Statement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StatementKind {
+	Create(CreateStatement),
+	Update(MutateStatement),
+	Upsert(MutateStatement),
+	Delete(DeleteStatement),
 	DefineGraph(DefineGraphStatement),
 	DefineTable(DefineTableStatement),
 	DefineField(DefineFieldStatement),
@@ -66,3 +71,14 @@ pub enum StatementKind {
 	Return(ReturnStatement),
 	Select(SelectStatement),
 }
+pub use dml::{
+	Assignment,
+	CreateStatement,
+	DeleteStatement,
+	DmlData,
+	DmlReturn,
+	DmlReturnItem,
+	DmlTarget,
+	ExpectClause,
+	MutateStatement,
+};

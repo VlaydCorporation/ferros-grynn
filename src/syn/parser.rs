@@ -115,6 +115,20 @@ impl Parser<'_> {
 				let feature = self.current_word().unwrap_or("DEFINE target");
 				return Err(self.unsupported(feature, self.current().span));
 			}
+		} else if self.consume_keyword(keywords::CREATE).is_some() {
+			StatementKind::Create(context.run(|context| self.create_statement(context)).await?)
+		} else if self.consume_keyword(keywords::UPDATE).is_some() {
+			StatementKind::Update(
+				context.run(|context| self.mutate_statement(context, false)).await?,
+			)
+		} else if self.consume_keyword(keywords::UPSERT).is_some() {
+			StatementKind::Upsert(
+				context.run(|context| self.mutate_statement(context, true)).await?,
+			)
+		} else if self.consume_keyword(keywords::DELETE).is_some() {
+			StatementKind::Delete(context.run(|context| self.delete_statement(context)).await?)
+		} else if self.consume_keyword(keywords::RELATE).is_some() {
+			return Err(self.unsupported("RELATE", start));
 		} else if self.consume_keyword(keywords::REMOVE).is_some() {
 			StatementKind::Remove(self.remove_statement()?)
 		} else if self.consume_keyword(keywords::ALTER).is_some() {
@@ -677,14 +691,45 @@ mod tests {
 
 	#[test]
 	fn reports_unsupported_statement_and_unclosed_delimiter() {
-		let unsupported = parse("CREATE person", ParserSettings::default())
-			.expect_err("CREATE is outside the read-only slice");
+		let unsupported = parse("BEGIN", ParserSettings::default())
+			.expect_err("transaction statements belong to stage 11");
 		assert_eq!(unsupported.status().code().to_string(), "FG-50F03");
+		let relate =
+			parse("RELATE (person:alice)-[:FRIEND]->(person:bob)", ParserSettings::default())
+				.expect_err("RELATE awaits its edge identity contract");
+		assert_eq!(relate.status().code().to_string(), "FG-50F03");
 
 		let unclosed =
 			parse("RETURN [1, 2", ParserSettings::default()).expect_err("array is not closed");
 		assert_eq!(unclosed.status().code().to_string(), "FG-42001");
 		assert_eq!(unclosed.status().diagnostic().related_locations().len(), 1);
+	}
+
+	#[test]
+	fn parses_core_dml_and_rejects_unbounded_upsert() {
+		let program = parse(
+			"CREATE person:alice CONTENT {name: 'Alice'} RETURN *; UPDATE person SET active = \
+			 true WHERE age >= 18 RETURN DIFF EXPECT active = false; DELETE person:alice RETURN \
+			 BEFORE EXPECT EXISTS",
+			ParserSettings::default(),
+		)
+		.expect("core DML parses");
+		assert!(matches!(program.statements[0].kind, StatementKind::Create(_)));
+		assert!(matches!(program.statements[1].kind, StatementKind::Update(_)));
+		assert!(matches!(program.statements[2].kind, StatementKind::Delete(_)));
+
+		let error = parse("UPSERT person SET active = true", ParserSettings::default())
+			.expect_err("UPSERT must be bounded by ID or WHERE");
+		assert_eq!(error.status().code().to_string(), "FG-42001");
+		for source in [
+			"CREATE person:alice MERGE {name: 'Alice'}",
+			"CREATE person:alice RETURN BEFORE",
+			"DELETE person:alice RETURN VALUE name",
+		] {
+			let error = parse(source, ParserSettings::default())
+				.expect_err("statement-specific DML grammar must be enforced");
+			assert_eq!(error.status().code().to_string(), "FG-42001", "{source}");
+		}
 	}
 
 	#[test]

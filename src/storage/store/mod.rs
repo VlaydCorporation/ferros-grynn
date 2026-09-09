@@ -49,10 +49,15 @@ use super::{
 		ExternalIndexSorter,
 		LabelDictionary,
 		PrimaryIndexEntry,
+		PrimaryIndexMutation,
 		ScalarIndexMode,
+		ScalarIndexMutation,
+		apply_primary_mutations,
+		apply_scalar_mutations,
 		build_label_index,
 		build_primary_index,
 		build_primary_index_sorted,
+		build_scalar_index,
 		build_scalar_index_sorted,
 		cleanup_external_index_sort,
 		decode_count_index,
@@ -62,8 +67,11 @@ use super::{
 		leftmost_primary_leaf,
 		lookup_primary_index,
 		lookup_scalar_index,
+		mutate_primary_index_leaves,
+		mutate_scalar_index_leaves,
 		range_scalar_index,
 		scan_primary_index,
+		scan_scalar_index,
 		visit_label_index_pages,
 		visit_primary_leaf_page,
 	},
@@ -85,12 +93,14 @@ use super::{
 		SUBGRAPHS_PER_PAGE,
 		StatisticsLayout,
 		SubgraphEntry,
+		count_property_entries,
 		decode_adjacency_overflow,
 		decode_cross_level_overflow,
 		decode_degree_statistics,
 		decode_freelist,
 		decode_label_statistics_file,
 		decode_large_property,
+		decode_property_fields,
 		decode_property_map,
 		decode_property_statistics,
 		decode_statistics_summary,
@@ -109,6 +119,8 @@ use super::{
 		read_edge_hot_slot,
 		read_node_hot_slot,
 		read_property_record,
+		read_unsealed_edge_hot_slot,
+		read_unsealed_node_hot_slot,
 		statistics_bulk_layout_matches,
 		statistics_layout,
 		validate_statistics_file_lengths,
@@ -117,7 +129,7 @@ use super::{
 	},
 	hybrid_engine::{MAX_READ_SCOPE_OPERATIONS, ReadIntent},
 	local::select_graph_superblock,
-	page::{AlignedPage, PAGE_SIZE, PageLsn, PageNo},
+	page::{AlignedPage, PAGE_SIZE, PageLsn, PageNo, PageType},
 	page_io::PageIoMode,
 	page_manager::{PageRead, SyncPageManager},
 	superblock::{GraphSuperblock, GraphSuperblockFlags},
@@ -326,6 +338,8 @@ pub enum LocalCommitNodeChange {
 	Remove {
 		/// Stable pre-removal atom identity.
 		id: AtomId,
+		/// Stable public record identity removed from the primary index.
+		record_id: RecordId,
 		/// Whether this transaction allocated the slot.
 		created: bool,
 	},
@@ -356,6 +370,8 @@ pub enum LocalCommitEdgeChange {
 	Remove {
 		/// Stable pre-removal atom identity.
 		id: AtomId,
+		/// Stable public record identity removed from the primary index.
+		record_id: RecordId,
 		/// Whether this transaction allocated the slot.
 		created: bool,
 	},
@@ -383,9 +399,6 @@ pub struct LocalGraph {
 	property_dictionary: Arc<PropertyDictionary>,
 	decode_context: Mutex<Option<Arc<EncodeContext>>>,
 	scalar_indexes: BTreeMap<String, Vec<LocalScalarIndex>>,
-	/// Whether durable schema contains any scalar index, including one whose
-	/// side-file was unavailable at open time.
-	has_declared_scalar_indexes: bool,
 	count_indexes: BTreeMap<u32, LocalCountIndex>,
 	label_indexes: BTreeMap<(AtomKind, u32), DataFileId>,
 	children: BTreeMap<u32, Arc<LocalGraph>>,
@@ -410,6 +423,8 @@ struct LazyStatisticsParts {
 struct LocalScalarIndex {
 	table_id: u32,
 	name: String,
+	index_id: IndexId,
+	schema_version: u32,
 	kind: TableIndexKind,
 	fields: Vec<(PropertyKeyId, Type)>,
 	file_id: DataFileId,
@@ -444,10 +459,6 @@ impl LocalGraph {
 
 	pub(crate) const fn edge_capacity(&self) -> u64 {
 		self.superblock.edge_capacity
-	}
-
-	pub(crate) fn supports_atom_delta(&self) -> bool {
-		!self.has_declared_scalar_indexes
 	}
 
 	/// Returns eagerly decoded graph counters for this durable revision.
@@ -1418,6 +1429,7 @@ impl LocalStore {
 				registrations.extend(generation.registrations);
 				retired_superblocks.push(previous_superblock);
 				new_superblocks.push(generation.superblock);
+				new_indexes.extend(generation.indexes);
 				if !removed_subgraph_slots.is_empty() {
 					let mut removed_graphs = BTreeSet::new();
 					for child in database.graphs.iter().filter(|entry| {

@@ -59,12 +59,16 @@ pub(super) use hot::{
 	new_node_hot_page,
 	read_edge_hot_slot,
 	read_node_hot_slot,
+	read_unsealed_edge_hot_slot,
+	read_unsealed_node_hot_slot,
 	write_edge_hot_slot,
 	write_node_hot_slot,
 };
 pub(super) use props::{
 	PropertyPageBuilder,
+	count_property_entries,
 	decode_large_property,
+	decode_property_fields,
 	decode_property_map,
 	encode_large_property,
 	encode_property_map,

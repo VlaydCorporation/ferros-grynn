@@ -38,6 +38,11 @@ page/WAL layout (`storage`), graph algorithms (`graph`) или синтакси�
 - DDL изменяет тот же транзакционный `SchemaCatalog`, что и Rust API. Secondary
   index имеет одно наблюдаемое состояние `Ready`, `Stale` или
   `PreparedForRemoval`; состояние участвует в выборе access path.
+- Graph-backed DML использует явный table membership и публикует данные,
+  statistics и ready indexes одним commit. Family invariants проверяются на
+  объединённом commit image при любом isolation level. Физический row layout
+  системного `GraphId=0` не определён; до нормативного решения такой DML
+  возвращает явную unsupported ошибку, а не создаёт скрытый graph.
 
 ## Проверка
 

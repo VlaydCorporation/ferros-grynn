@@ -1,8 +1,18 @@
-use std::{error::Error, io};
+use std::{collections::BTreeSet, error::Error, io};
 
 use super::*;
 use crate::{
-	datastore::{Datastore, GraphWriteView, IsolationLevel, TransactionAccess, TransactionOptions},
+	datastore::{
+		Datastore,
+		GraphWriteView,
+		IsolationLevel,
+		TableField,
+		TableKind,
+		TableSchema,
+		TableSchemaMode,
+		TransactionAccess,
+		TransactionOptions,
+	},
 	gql::ir::{Column, Schema},
 	gql_status::ExecutionPhase,
 	graph::{EdgeTopology, Graph, Mutable},
@@ -47,6 +57,10 @@ impl QueryCatalog for TestStore {
 		} else {
 			Err(FerrosGrynnError::invalid_argument(format!("Unknown table `{table}`.")))
 		}
+	}
+
+	fn schema_mode(&self, _table: &str) -> FerrosGrynnResult<crate::datastore::TableSchemaMode> {
+		Ok(crate::datastore::TableSchemaMode::Schemaless)
 	}
 
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef> {
@@ -102,6 +116,15 @@ impl QueryRead for TestStore {
 
 	fn execute_schema(&mut self, _statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value> {
 		Err(FerrosGrynnError::query_feature_not_supported("test schema mutation"))
+	}
+
+	fn execute_dml(
+		&mut self,
+		_statement: &LogicalDmlStatement,
+		_slots: &[Value],
+		_source: &str,
+	) -> FerrosGrynnResult<Value> {
+		Err(FerrosGrynnError::query_feature_not_supported("test data mutation"))
 	}
 }
 
@@ -200,6 +223,26 @@ fn match_store() -> Datastore {
 	store
 }
 
+fn dml_store() -> Datastore {
+	let store = Datastore::in_memory();
+	let mut create = store.begin();
+	let reference = create
+		.create_named_graph(
+			"records",
+			"graph:records".parse().expect("graph record"),
+			Graph::<Mutable>::new().freeze().into(),
+		)
+		.expect("named graph");
+	create
+		.define_table(
+			TableSchema::new("person", reference, crate::datastore::TableKind::Normal, [])
+				.expect("table schema"),
+		)
+		.expect("table");
+	create.commit().expect("commit");
+	store
+}
+
 fn run(mut store: TestStore, source: &str) -> FerrosGrynnResult<Vec<QueryResult>> {
 	execute_text(&mut store, source, &Object::new(), ParserSettings::default())
 }
@@ -210,6 +253,230 @@ fn executes_return_with_pratt_precedence() {
 	assert_eq!(
 		results[0].result.as_ref().expect("statement succeeds").value(),
 		&Value::from(7_i64)
+	);
+}
+
+#[test]
+fn executes_graph_backed_dml_with_preimage_expect_and_returns() {
+	let store = dml_store();
+	let created = store
+		.execute(
+			"CREATE person:alice CONTENT {name: 'Alice', age: 30} RETURN *; CREATE person:bob \
+			 CONTENT {name: 'Bob', age: 17} RETURN VALUE name",
+			&Object::new(),
+		)
+		.expect("CREATE executes");
+	assert_eq!(created.len(), 2);
+	let Value::Array(alice) = created[0].result.as_ref().expect("Alice created").value() else {
+		panic!("expected created rows");
+	};
+	assert_eq!(
+		alice.get(0).and_then(Value::as_object).and_then(|row| row.get("age")),
+		Some(&Value::from(30_i64))
+	);
+	let Value::Array(bob) = created[1].result.as_ref().expect("Bob created").value() else {
+		panic!("expected created values");
+	};
+	assert_eq!(bob.as_slice(), &[Value::from("Bob")]);
+
+	let failed = store
+		.execute(
+			"UPDATE person:alice, person:bob SET active = true EXPECT age >= 18",
+			&Object::new(),
+		)
+		.expect("statement failure is returned in-band");
+	assert_eq!(
+		failed[0].result.as_ref().expect_err("Bob fails EXPECT").status().code().to_string(),
+		"FG-40F01"
+	);
+	let unchanged = store
+		.execute("UPDATE person:alice RETURN *", &Object::new())
+		.expect("record remains readable");
+	let Value::Array(rows) = unchanged[0].result.as_ref().expect("readback succeeds").value()
+	else {
+		panic!("expected readback rows");
+	};
+	assert!(!rows.get(0).and_then(Value::as_object).expect("object").contains_key("active"));
+
+	let updated = store
+		.execute(
+			"UPSERT person:alice SET age = 31 RETURN DIFF EXPECT age = 30; UPSERT person:carol \
+			 CONTENT {name: 'Carol', age: 22} RETURN AFTER EXPECT NOT EXISTS; DELETE person:bob \
+			 RETURN BEFORE EXPECT EXISTS",
+			&Object::new(),
+		)
+		.expect("UPSERT and DELETE execute");
+	assert!(updated.iter().all(|result| result.result.is_ok()));
+	let Value::Array(diff) = updated[0].result.as_ref().expect("diff").value() else {
+		panic!("expected diff rows");
+	};
+	assert!(diff.get(0).and_then(Value::as_object).expect("diff object").contains_key("age"));
+	let Value::Array(deleted) = updated[2].result.as_ref().expect("before image").value() else {
+		panic!("expected deleted rows");
+	};
+	assert_eq!(
+		deleted.get(0).and_then(Value::as_object).and_then(|row| row.get("name")),
+		Some(&Value::from("Bob"))
+	);
+}
+
+#[test]
+fn rejects_duplicate_dml_targets_before_staging_a_record() {
+	let store = dml_store();
+	let mut transaction = store.begin();
+	let results = transaction
+		.execute("CREATE person:duplicate, person:duplicate SET name = 'partial'", &Object::new())
+		.expect("statement failure is returned in-band");
+	assert!(results[0].result.is_err());
+	transaction.commit().expect("failed statement staged no record");
+
+	let readback = store
+		.execute("UPDATE person:duplicate RETURN *", &Object::new())
+		.expect("missing record query succeeds");
+	assert_eq!(
+		readback[0].result.as_ref().expect("readback result").value(),
+		&Value::Array(Array::new(Vec::new()))
+	);
+}
+
+#[test]
+fn executes_dml_generators_modes_filters_and_return_contracts() {
+	let store = dml_store();
+	let generated = store
+		.execute("CREATE |person:3| SET stage = 'new' RETURN VALUE id", &Object::new())
+		.expect("generated CREATE executes");
+	let Value::Array(ids) = generated[0].result.as_ref().expect("generated rows").value() else {
+		panic!("expected generated record IDs");
+	};
+	assert_eq!(ids.len(), 3);
+	let mut unique = BTreeSet::new();
+	for value in ids {
+		let Value::Record(record) = value else {
+			panic!("generated ID must remain a RecordId");
+		};
+		assert!(matches!(record.id(), RecordIdPart::Ulid(_)));
+		assert!(unique.insert(record.to_string()));
+	}
+
+	let results = store
+		.execute(
+			"CREATE person:item CONTENT {a: 1, b: 2} RETURN NONE; UPDATE person:item MERGE {b: 3, \
+			 c: 4} RETURN BEFORE; UPDATE person:item PATCH {a: none, d: 5} RETURN DIFF; UPDATE \
+			 person:item REPLACE {only: 9} RETURN AFTER; UPDATE person:item SET only = 10, extra \
+			 = 'x' RETURN only, extra; UPDATE person:item UNSET extra RETURN VALUE only; UPDATE \
+			 person:item SET filtered = true WHERE false RETURN AFTER; DELETE person:item WHERE \
+			 false RETURN BEFORE; DELETE person:item RETURN DIFF",
+			&Object::new(),
+		)
+		.expect("all supported DML modes execute");
+	assert!(results.iter().all(|result| result.result.is_ok()));
+	assert_eq!(results[0].result.as_ref().expect("RETURN NONE").value(), &Value::None);
+
+	let before = results[1]
+		.result
+		.as_ref()
+		.expect("RETURN BEFORE")
+		.value()
+		.as_array()
+		.and_then(|rows| rows.get(0))
+		.and_then(Value::as_object)
+		.expect("before object");
+	assert_eq!(before.get("b"), Some(&Value::from(2_i64)));
+	assert!(!before.contains_key("c"));
+
+	let diff = results[2]
+		.result
+		.as_ref()
+		.expect("RETURN DIFF")
+		.value()
+		.as_array()
+		.and_then(|rows| rows.get(0))
+		.and_then(Value::as_object)
+		.expect("diff object");
+	assert_eq!(
+		diff.keys().map(|name| name.as_str()).collect::<BTreeSet<_>>(),
+		BTreeSet::from(["a", "d"])
+	);
+
+	let replaced = results[3]
+		.result
+		.as_ref()
+		.expect("RETURN AFTER")
+		.value()
+		.as_array()
+		.and_then(|rows| rows.get(0))
+		.and_then(Value::as_object)
+		.expect("replacement object");
+	assert_eq!(replaced.get("only"), Some(&Value::from(9_i64)));
+	assert!(!replaced.contains_key("b"));
+
+	let projected = results[4]
+		.result
+		.as_ref()
+		.expect("field projection")
+		.value()
+		.as_array()
+		.and_then(|rows| rows.get(0))
+		.and_then(Value::as_object)
+		.expect("projected object");
+	assert_eq!(projected.get("only"), Some(&Value::from(10_i64)));
+	assert_eq!(projected.get("extra"), Some(&Value::from("x")));
+	assert_eq!(
+		results[5].result.as_ref().expect("RETURN VALUE").value(),
+		&Value::Array(Array::new(vec![Value::from(10_i64)]))
+	);
+	for result in &results[6..8] {
+		assert_eq!(
+			result.result.as_ref().expect("filtered DML").value(),
+			&Value::Array(Array::new(Vec::new()))
+		);
+	}
+	let delete_diff = results[8]
+		.result
+		.as_ref()
+		.expect("delete diff")
+		.value()
+		.as_array()
+		.and_then(|rows| rows.get(0))
+		.and_then(Value::as_object)
+		.expect("delete diff object");
+	assert!(delete_diff.contains_key("id"));
+	assert!(delete_diff.contains_key("only"));
+}
+
+#[test]
+fn schemafull_dml_rejects_unknown_and_mistyped_fields_before_mutation() {
+	let store = Datastore::in_memory();
+	let mut create = store.begin();
+	let graph = create
+		.create_named_graph(
+			"typed-records",
+			"graph:typed-records".parse().expect("graph record"),
+			Graph::<Mutable>::new().freeze().into(),
+		)
+		.expect("named graph");
+	create
+		.define_table(
+			TableSchema::new("person", graph, TableKind::Normal, [TableField::new(
+				"name",
+				Type::String,
+			)])
+			.expect("table schema")
+			.with_schema_mode(TableSchemaMode::Schemafull),
+		)
+		.expect("table");
+	create.commit().expect("schema commit");
+
+	for source in ["CREATE person:alice SET unknown = 1", "CREATE person:alice SET name = 1"] {
+		let error = store.execute(source, &Object::new()).expect_err("analysis must reject DML");
+		assert_eq!(error.status().diagnostic().phase(), Some(ExecutionPhase::SemanticAnalysis));
+	}
+	let readback = store
+		.execute("UPDATE person:alice RETURN *", &Object::new())
+		.expect("missing record lookup succeeds");
+	assert_eq!(
+		readback[0].result.as_ref().expect("readback").value(),
+		&Value::Array(Array::new(Vec::new()))
 	);
 }
 
