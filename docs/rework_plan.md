@@ -42,19 +42,19 @@ overlay absent → вернуть base value
 
 ### Осознанные слабые места
 
-| Риск | Решение |
-|---|---|
-| Base update влияет на все наследующие graph views | Database-wide reverse membership index; обход только memberships данного атома |
-| Большое число graph memberships делает base write дорогим | Полный preflight до мутации и существующий write-set limit; никакого скрытого частичного commit |
-| Effective indexes размножают derived data | Они создаются только явным `SCOPE EFFECTIVE IN GRAPH`; хранится полный индекс только выбранного графа |
-| Graph read получает дополнительную индирекцию к base atom | Graph slot хранит внутренний `GlobalAtomId`; бит наличия overlay исключает лишнее чтение и allocation |
-| Массовый `DELETE CASCADE` может затронуть много графов | `RESTRICT` по умолчанию; explicit `CASCADE` проходит bounded preflight |
-| Schema change CLASS влияет на все графы | Kind и имя immutable; изменение fields проверяет base и затронутые effective views |
-| Один class не выражает разные роли атома в графах | Для этого сохраняется отдельный optional graph-local label |
-| Property-record не обязан быть участником графа | Ссылка не создаёт membership; в graph scope member читается как effective, non-member — как base |
-| Один edge имеет разные topology в разных графах | Это явно считается разными graph occurrences одной общей relation entity |
-| Columnar storage ускорило бы аналитику, но ухудшило point mutation | Columnar cache строится позднее как revision-bound derived data |
-| RecordId не глобален между БД | Он остаётся database-local; cross-database qualification принадлежит этапу Bridges |
+| Риск                                                               | Решение                                                                                               |
+|--------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------|
+| Base update влияет на все наследующие graph views                  | Database-wide reverse membership index; обход только memberships данного атома                        |
+| Большое число graph memberships делает base write дорогим          | Полный preflight до мутации и существующий write-set limit; никакого скрытого частичного commit       |
+| Effective indexes размножают derived data                          | Они создаются только явным `SCOPE EFFECTIVE IN GRAPH`; хранится полный индекс только выбранного графа |
+| Graph read получает дополнительную индирекцию к base atom          | Graph slot хранит внутренний `GlobalAtomId`; бит наличия overlay исключает лишнее чтение и allocation |
+| Массовый `DELETE CASCADE` может затронуть много графов             | `RESTRICT` по умолчанию; explicit `CASCADE` проходит bounded preflight                                |
+| Schema change CLASS влияет на все графы                            | Kind и имя immutable; изменение fields проверяет base и затронутые effective views                    |
+| Один class не выражает разные роли атома в графах                  | Для этого сохраняется отдельный optional graph-local label                                            |
+| Property-record не обязан быть участником графа                    | Ссылка не создаёт membership; в graph scope member читается как effective, non-member — как base      |
+| Один edge имеет разные topology в разных графах                    | Это явно считается разными graph occurrences одной общей relation entity                              |
+| Columnar storage ускорило бы аналитику, но ухудшило point mutation | Columnar cache строится позднее как revision-bound derived data                                       |
+| RecordId не глобален между БД                                      | Он остаётся database-local; cross-database qualification принадлежит этапу Bridges                    |
 
 ## 2. Нормативные контракты и API
 
@@ -250,8 +250,13 @@ Unscoped форма читает base registry. Graph-scoped форма треб
       cnt_<class_id>.fgidx
 ```
 
-- `atoms_hot.fgb` использует единый base-slot layout: generation, kind, `ClassId`, RecordId/property reference и flags.
-- Graph node/edge slots содержат `GlobalAtomId`, local generation, optional label, overlay pointer и graph-local structural state.
+- `atoms_hot.fgb` использует 48-байтовый `AtomHotSlot`: generation, kind, `ClassId`, canonical
+  RecordId reference, base PropertyMap reference и flags; он не содержит graph-local state.
+- `nodes_hot.fgb` и `edges_hot.fgb` остаются обязательными target-файлами, а их 160-байтовые
+  `NodeHotSlot`/`EdgeHotSlot` хранят occurrence: `GlobalAtomId`, local generation, optional
+  label, overlay reference и graph-local structural state. Legacy является только прежний
+  graph-owned набор полей с `table_id`/base properties и durable query-scratch flags, а не эти
+  page families.
 - `membership.fgidx` отображает `GlobalAtomId → graph-local DiskAtomRef`.
 - `memberships.fgidx` является обратным database index `GlobalAtomId → graph occurrences`.
 - Global primary отображает canonical `RecordId → GlobalAtomId`.
@@ -342,7 +347,7 @@ TABLE/system-graph layout остаётся лишь историческим imp
 | A0. Зафиксировать коррекцию ✅    | —          | Использовать этот план, обновить реестр Q-08/Q-23–Q-26 и остановить этапы 9–31 до кодового cutover                                       |
 | A1. Семантические спецификации ✅ | A0         | Переписать glossary, formal model, CLASS, RecordId, GraphRef, base/effective view, labels, references и DML                              |
 | A2. Grammar и примеры ✅          | A1         | Утвердить `CLASS`, `IN GRAPH`, `ATTACH/DETACH`, `RESET`, class/id/AS/LABEL pattern grammar                                               |
-| A3. Disk specification ✅         | A1         | Зафиксировать AtomStore, memberships, overlays, DataSpaceId, catalog versions, pages, WAL и recovery                                     |
+| A3. Disk specification ✅         | A1         | Зафиксировать AtomStore, memberships, overlays, DataSpaceId, catalog versions, exact Atom/Node/Edge hot layouts, WAL и recovery          |
 | A4. Скорректировать планы ✅      | A2, A3     | Обновить зависимости и статусы всех активных планов; исторические reports оставить                                                       |
 | A5. Типы и schema API             | A2         | Ввести ClassId/GraphId/DataSpaceId, новый GraphRef и ClassSchema; убрать TABLE compatibility surface                                     |
 | A6. In-memory logical model       | A5         | Добавить global AtomStoreRoot, graph occurrences, reverse memberships и lazy overlays                                                    |

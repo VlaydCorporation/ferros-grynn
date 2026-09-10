@@ -532,20 +532,21 @@ impl EndpointTensor {
 
 Из `disk_storage_spec.md` §29.3.
 
-| Компонент                       | Где                                      | Что делает                                    |
-|---------------------------------|------------------------------------------|-----------------------------------------------|
-| `SyncPageManager`               | `storage/page_manager.rs`                | WAL/home page-level I/O (frame-WAL, §3.3)     |
-| `DiskMetaGraph`                 | `storage/disk_graph.rs`                  | Disk-backed MetaGraph                         |
-| `NodeHotSlot` / `EdgeHotSlot`   | `storage/node_pages.rs`, `edge_pages.rs` | Encode/decode hot-слотов                      |
-| `PropHeapPage`                  | `storage/prop_heap.rs`                   | Slotted-page для PropertyMap                  |
-| `LabelDictionary`               | `storage/label_dict.rs`                  | Интернирование строк                          |
-| `LabelIndex`                    | `index/label_index.rs`                   | Sorted array index по меткам                  |
-| `BTreeIndex`                    | `index/btree.rs`                         | B+tree property index                         |
-| `FulltextIndex`                 | `index/fulltext.rs`                      | Inverted index + posting lists                |
-| `HnswIndex`                     | `index/hnsw.rs`                          | In-memory HNSW с checkpoint                   |
-| `SparseSet` / `WorldComponents` | `ecs/`                                   | AtomId-keyed typed component columns          |
-| `GraphWorkspace`                | `ecs/workspace.rs`                       | Revision-bound graph + ECS sidecar            |
-| `PropertyColumn<T>`             | `ecs/property_column.rs`                 | Typed property materialization for algorithms |
+| Компонент                            | Где                                               | Что делает                                           |
+|--------------------------------------|---------------------------------------------------|------------------------------------------------------|
+| `SyncPageManager`                    | `storage/page_manager.rs`                         | WAL/home page-level I/O (frame-WAL, §3.3)            |
+| `DiskMetaGraph`                      | `storage/disk_graph.rs`                           | Disk-backed MetaGraph                                |
+| target `AtomHotSlot`                 | A8: будущий codec в `storage`                     | Encode/decode 48-byte global base slots              |
+| target `NodeHotSlot` / `EdgeHotSlot` | A9: refactor текущих `storage/graph_pages` codecs | Encode/decode 160-byte graph occurrences             |
+| `PropHeapPage`                       | `storage/prop_heap.rs`                            | Slotted-page для canonical RecordId/base PropertyMap |
+| `LabelDictionary`                    | `storage/label_dict.rs`                           | Интернирование строк                                 |
+| `LabelIndex`                         | `index/label_index.rs`                            | Sorted array index по меткам                         |
+| `BTreeIndex`                         | `index/btree.rs`                                  | B+tree property index                                |
+| `FulltextIndex`                      | `index/fulltext.rs`                               | Inverted index + posting lists                       |
+| `HnswIndex`                          | `index/hnsw.rs`                                   | In-memory HNSW с checkpoint                          |
+| `SparseSet` / `WorldComponents`      | `ecs/`                                            | AtomId-keyed typed component columns                 |
+| `GraphWorkspace`                     | `ecs/workspace.rs`                                | Revision-bound graph + ECS sidecar                   |
+| `PropertyColumn<T>`                  | `ecs/property_column.rs`                          | Typed property materialization for algorithms        |
 
 ### 3.7. Зависимости (добавить в `Cargo.toml`)
 
@@ -687,9 +688,12 @@ Disk-backed режим 2. Зависит от A.
   transaction-bound `LocalGraphView`: hot-поля читаются через `PageGuard`, primary lookup и scan
   остаются потоковыми, property heap загружается поздно, nested/transition graphs разрешаются
   рекурсивно. Материализация выполняется только перед явной мутацией или `query_to_memory`.
-- **Disk-страницы** 🟢 для Windows sync среза — `NodeHotSlot`/`EdgeHotSlot`, local и cross-level overflow adjacency,
-  slotted property heap/large objects, subgraph directory, freelist, label dictionary, primary
-  и scalar B+tree, posting pages и graph statistics имеют checksummed codecs в `src/storage`.
+- **Disk-страницы** 🟢 для исторического Windows sync среза — текущие graph-owned
+  `NodeHotSlot`/`EdgeHotSlot`, local и cross-level overflow adjacency, slotted property
+  heap/large objects, subgraph directory, freelist, label dictionary, primary и scalar B+tree,
+  posting pages и graph statistics имеют checksummed codecs в `src/storage`. Target A8/A9
+  сохраняет page families, но заменяет payload на exact `AtomHotSlot` и graph-local occurrence
+  layouts из disk §§10–11.
 - **`store.rs`** 🟢 для этапа 5 — публичные `create_local/open_local`, backend-neutral
   `GraphMutationView`, stable-layout page delta, безопасный COW fallback при смене layout и
   startup-GC старых поколений подключены и покрыты reopen-тестами.

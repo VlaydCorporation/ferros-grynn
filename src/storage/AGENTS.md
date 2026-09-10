@@ -31,7 +31,9 @@
 - `page_manager` — staged/WAL/home resolution и production HybridReadEngine;
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
 - `catalog` и `superblock` — versioned database metadata;
-- `graph_pages` — физические graph page families;
+- `graph_pages` — текущие физические graph page families; target 8.1 сохраняет
+  `NodeHotPage`/`EdgeHotPage` как graph-local occurrence storage и добавляет
+  database-level `AtomHotPage` для global base atoms;
 - `graph_index` — order-preserving primary и общий внутренний B+tree codec для
   раздельных Standard/Unique контрактов, bounded Direct-I/O
   external sort, bottom-up packing, immutable Label arrays и single-page Count;
@@ -52,16 +54,24 @@
   clock; `SchemaVersion` — версия определения; `DataFileId` — identity
   физического COW-файла; ordinal используется только в безопасном локальном
   filename. Binding индекса разрешается по `IndexId`, не по имени.
-- `GraphSuperblock` хранится только в `superblock.fgb`. Ровно шесть изменяемых
-  data-файлов имеют отдельные `freelist_*.fgb`; связь target хранит
-  `FGFC v4.companion_of`. Standard и Unique называются соответственно
-  `std_<ordinal:04>.fgidx` и `uniq_<ordinal:04>.fgidx`; `scalar` допустим только
-  как внутреннее имя общей реализации.
-- `DatabaseCatalog` format-v1 — только `FGDC v5`. Таблица системного графа
-  кодирует owning `GraphId = 0`; её `Stale`/`PreparedForRemoval` secondary index
-  может не иметь physical binding. Missing/unopenable/checksum-corrupt
-  secondary переводится в `Stale` и даёт scan fallback, а primary/base
-  corruption остаётся фатальной.
+- `GraphSuperblock` хранится только в `superblock.fgb`. В текущем codec ровно
+  шесть изменяемых graph data-файлов имеют отдельные `freelist_*.fgb`, а binding
+  хранится в `FGFC v4.companion_of`; target 8.1 сохраняет раздельные файлы и
+  переносит binding в `FGFC v5` с `DataSpaceId`. Standard и Unique называются
+  соответственно `std_<ordinal:04>.fgidx` и `uniq_<ordinal:04>.fgidx`; `scalar`
+  допустим только как внутреннее имя общей реализации.
+- В target 8.1 `AtomHotPage` хранит только database-global class, RecordId и
+  base properties. `NodeHotPage`/`EdgeHotPage` хранят membership occurrence,
+  `GlobalAtomId`, label/overlay и topology; сами page families не являются
+  legacy. Отклонён только прежний graph-owned payload с `table_id`, base
+  properties и durable query-scratch flags. Точные offsets задают
+  `docs/disk_storage_spec.md` §§10–11.
+- Текущий implementation codec всё ещё использует `FGDC v5` и системный
+  `GraphId = 0`; это не target-инвариант. Cutover A8–A16 принимает только
+  `FGDC v6`/`FGFC v5`, использует `DataSpaceId::Database`, не создаёт системный
+  graph и сохраняет ненулевой `GraphId` для каждого graph. Missing/unopenable/
+  checksum-corrupt secondary по-прежнему переводится в `Stale` и даёт scan
+  fallback, а primary/base corruption остаётся фатальной.
 - Immutable external-sort B+tree generations заполняют leaves до capacity.
   Point-DML сначала применяет page-WAL leaf update при стабильных separators и
   posting layout; bulk fallback использует measured mutable fill `0.90` для

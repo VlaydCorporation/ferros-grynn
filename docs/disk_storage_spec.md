@@ -34,7 +34,7 @@ occurrences. При конфликте с сохранёнными ниже lega
 10. [AtomHotPage и graph-local NodeHotPage](#10-atomhotpage-и-graph-local-nodehotpage)
 11. [Graph-local EdgeHotPage](#11-graph-local-edgehotpage)
 12. [AdjacencyOverflowPage](#12-adjacencyoverflowpage)
-13. [PropHeapPage — куча свойств](#13-propheappage--куча-свойств)
+13. [PropHeapPage — куча variable records](#13-propheappage--куча-variable-records)
 14. [SubgraphDirPage — директория подграфов](#14-subgraphdirpage--директория-подграфов)
 15. [FreelistPage — управление свободными страницами](#15-freelistpage--управление-свободными-страницами)
 16. [LabelDictionary — интернирование строк](#16-labeldictionary--интернирование-строк)
@@ -375,7 +375,7 @@ generic-параметр T (например, `vertex<Person>`) является
 
 | GQL тип          | Причина                                                                |
 |------------------|------------------------------------------------------------------------|
-| `metavertex<T?>` | Хранится как обычная вершина с NodeHotSlot.kind=Meta; тип=schema       |
+| `metavertex<T?>` | Обычный node occurrence с `NodeHotSlot.flags.META`; тип задаёт schema  |
 | `metaedge<T?>`   | Хранится как ребро с `META` и `transition_gid`/внутренним подграфом    |
 | `path`           | Результат запроса; не хранится как значение свойства                   |
 | graph subtypes   | Интерпретационное ограничение на граф; не самостоятельный тип хранения |
@@ -384,29 +384,40 @@ generic-параметр T (например, `vertex<Person>`) является
 содержит `is_meta` и binding вложенного/transition graph. Пользовательская atom reference всё
 равно кодируется тегом 0x36, а самостоятельный `GraphRef` — тегом 0x37.
 
-### 3.9. QualifiedAtomRef — составной идентификатор кросс-уровневого атома
+### 3.9. QualifiedAtomRef и физический QualifiedDiskAtomRef
 
 Когда endpoint edge occurrence принадлежит другому graph space, одного graph-local
-`DiskAtomRef (u64)` недостаточно — нужно указать и `GraphId`.
+`DiskAtomRef (u64)` недостаточно. Runtime использует каталожный `GraphId`, а graph files —
+компактный root-arena `sg_slot`:
 
 ```rust
-// DiskAtomRef — для endpoints в том же графе (u64)
-// QualifiedAtomRef — для cross-level endpoints
+// Runtime identity после catalog resolution.
 struct QualifiedAtomRef {
     graph_id:   u64,   // ненулевой GraphId пространства occurrence
-    local_ref:  u64,   // DiskAtomRef в координатах подграфа
+    local_ref:  u64,   // DiskAtomRef в координатах graph
+}
+
+// Physical identity внутри одного root graph arena.
+struct QualifiedDiskAtomRef {
+    sg_slot:    u32,   // 0 = текущий graph, остальные slots разрешаются через SubgraphDir
+    reserved:   u32,   // 0
+    local_ref:  u64,
 }
 ```
 
+`sg_slot` разрешается через `SubgraphDir` и проверенную catalog binding в конкретный ненулевой
+`GraphId`; он не экспортируется из storage как публичная identity.
+
 Обычная property-ссылка `atom_ref` всегда разрешается по global `RecordId` и не зависит от
-membership. `qualified_atom_ref` является внутренним маркером cross-level topology, а не
+membership. Обе qualified формы являются внутренними маркерами cross-level topology, а не
 публичной заменой `AtomRef`.
 
 При чтении `EdgeHotSlot.source_inline[i]`/`target_inline[i]`:
 - при `CROSS_LEVEL = 0` значение является обычным `DiskAtomRef` текущего графа;
-- при `CROSS_LEVEL = 1` inline хранит только `local_ref`, а соответствующий `*_graph_id`
-  дополняет его до `QualifiedAtomRef`. Inline допустим лишь для не более двух endpoint'ов одного
-  graph space; иначе вся сторона находится в `CrossLevelAdjacencyOverflowPage`.
+- при `CROSS_LEVEL = 1` inline хранит только `local_ref`, а соответствующий `*_sg_slot`
+  дополняет его до физического `QualifiedDiskAtomRef`. Inline допустим лишь для не более двух
+  endpoint'ов одного root-arena graph slot; иначе вся сторона находится в
+  `CrossLevelAdjacencyOverflowPage`.
 
 ---
 
@@ -596,11 +607,14 @@ benchmark/reference tooling, но не задают production value format.
 PAGE_SIZE             = 16384     -- байт; совпадает с io/mod.rs
 PAGE_HEADER_SIZE      = 32        -- байт у всех страниц
 PAGE_PAYLOAD_SIZE     = 16352     -- PAGE_SIZE - PAGE_HEADER_SIZE
+GEN_MAX               = 0x7F_FFFF -- максимум u23 generation
 
 NULL_PAGE             = 0xFFFF_FFFF_FFFF_FFFF  -- u64::MAX: нет страницы
 NULL_SLOT             = 0xFFFF_FFFF            -- u32::MAX: нет слота
+NULL_ATOM_SLOT        = 0xFF_FFFF_FFFF          -- максимум u40: не выделяется
 NULL_LABEL            = 0xFFFF_FFFF            -- u32::MAX: нет метки
 NULL_CLASS            = 0xFFFF_FFFF            -- u32::MAX: нет class
+NULL_GLOBAL_ATOM      = 0xFFFF_FFFF_FFFF_FFFF  -- u64::MAX: нет global atom
 
 -- Магические числа страниц (4 байта, little-endian в поле header.magic)
 MAGIC_NODE_HOT        = 0x01_4E_48_46   -- b"FHN\x01"
@@ -973,9 +987,10 @@ Total = 32 байт
 0x003B  ClassStatistic
 ```
 
-`0x0038..=0x003B` принадлежат target layout 8.1. Их точные offset tables и golden page bytes
-должны быть добавлены в этот документ и утверждены до первого production codec на шаге A8;
-использовать Rust struct layout как временный дисковый ABI запрещено.
+`0x0038..=0x003B` принадлежат target layout 8.1. Точные `AtomHotSlot`, `NodeHotSlot` и
+`EdgeHotSlot` заданы в §§10–11. Golden page bytes для них и точный codec
+`GraphOverlayPage` добавляются до первого production codec на A8/A9; использовать Rust struct
+layout как временный дисковый ABI запрещено.
 
 **Флаги страницы (битовые):**
 
@@ -1013,8 +1028,11 @@ resolve запрещено. Для локальной `DiskAtomRef` поколе
 ```
 биты 63..41   gen         u23  (8 388 608 поколений на слот)
 бит  40       kind        0=Node, 1=Edge
-биты 39..0    slot_index  u40  (1 099 511 627 776 слотов на каждый kind)
+биты 39..0    slot_index  u40
 ```
+
+Для live ID `gen <= GEN_MAX` и `slot_index != NULL_ATOM_SLOT`; значения slot-полей hot pages
+проверяются по тем же границам до сборки Rust newtype.
 
 **DiskAtomRef = u64** — graph-local occurrence reference без поколения:
 
@@ -1024,12 +1042,22 @@ resolve запрещено. Для локальной `DiskAtomRef` поколе
 биты 63..41   зарезервированы, при записи нули
 ```
 
-Null-значения: `NULL_DISKATOMREF = u64::MAX`, `NULL_SLOT = 0xFF_FFFF_FFFF` (все 40 бит slot_index).
+Null-значение физической ссылки: `NULL_DISKATOMREF = u64::MAX`. `NULL_ATOM_SLOT` (все 40 бит
+`slot_index`) никогда не выделяется; `NULL_SLOT = u32::MAX` остаётся отдельным sentinel для
+32-битных heap/subgraph/catalog slots. Decoder распознаёт full-width null references до проверки
+зарезервированных битов.
 
-**Почему u40, а не u31.** u40 даёт ~1.1 трлн slots на kind в AtomStore либо одном graph space,
-сохраняя handle ровно `u64`; `u128` удвоил бы размер hot references и ухудшил плотность SoA.
+**Почему u40, а не u31.** u40 даёт ~1.1 трлн slots. В AtomStore это единое пространство
+слотов обоих kinds; kind-бит является быстрым type check и обязан совпадать с class и slot.
+В graph space node/edge slots разнесены по отдельным файлам, поэтому одинаковый `slot_index`
+может существовать у node и edge. `u128` удвоил бы размер hot references и ухудшил плотность
+SoA.
 
-**Адресация не переполняется.** При `slot_index` до 2⁴⁰ номер страницы `page_no = slot / 102` не превосходит ≈1.08·10¹⁰, что укладывается в `u64` с запасом (≈285 ТБ при 16 КиБ на страницу). Пространства имён `label_id`, `class_id`, `key_id` и локальные subgraph slots остаются `u32` — они нумеруют schema/graph metadata, а не атомы, и с числом атомов не связаны.
+**Адресация не переполняется.** При `slot_index < 2⁴⁰` AtomStore требует менее 3.24·10⁹
+страниц (`slot / 340`, около 53 ТБ), а каждый graph-local kind — менее 1.08·10¹⁰ страниц
+(`slot / 102`, около 177 ТБ). Оба byte offset укладываются в `u64` с запасом. Пространства имён
+`label_id`, `class_id`, `key_id` и локальные subgraph slots остаются `u32` — они нумеруют
+schema/graph metadata, а не атомы, и с числом атомов не связаны.
 
 ```rust
 const KIND_SHIFT: u32 = 40;
@@ -1059,83 +1087,124 @@ fn from_disk_ref(r: DiskAtomRef, gen: u32) -> AtomId {
 
 ## 10. AtomHotPage и graph-local NodeHotPage
 
-Target layout 8.1 хранит здесь **node occurrences**, а не owning atoms. Обязательные logical
-fields: local generation, `GlobalAtomId`, optional `LabelId`, `has_overlay` + optional overlay
-reference, graph-local adjacency, meta/nested binding и flags. `ClassId`, canonical `RecordId` и
-base properties читаются из AtomStore и в graph slot не дублируются. Если `has_overlay = 0`, read
-path не обращается к `overlays.fgb`.
+Это две разные durable families. `AtomHotPage` хранит database-level base atom, а
+`NodeHotPage` — occurrence этого атома в одном графе. Объединять их нельзя: один
+`GlobalAtomId` может одновременно иметь разные labels, overlays, adjacency и nested bindings
+в нескольких graphs.
 
-Global `AtomHotPage` (`PageType 0x0039`) хранит base atom slots: generation, immutable kind,
-`ClassId`, canonical `RecordId`/primary binding, base `PropertyRef` и flags. `GraphOverlayPage`
-(`0x003A`) хранит только sparse pairs `PropertyKeyId → Value|Hidden` для конкретной occurrence.
-`Hidden` кодируется внутренним overlay tag, которого нет в canonical `StorageValue`; он не может
-декодироваться как пользовательские `NONE` или `NULL`. Отсутствие pair означает наследование
-актуального base value, а `RESET` физически удаляет pair.
-Точные offset tables и golden bytes этих трёх target slots должны быть утверждены здесь до A8/A9.
+### 10.1. AtomHotSlot
 
-Следующий 160-байтовый layout описывает реализованный graph-owned кандидат до этапа 8.1. Он
-сохраняется как migration/debug evidence, но `FGDC v6` его не читает и новый writer его не
-создаёт.
+`AtomHotSlot` имеет размер 48 байт и не содержит graph-local данных:
 
-### 10.1. Legacy NodeHotSlot (отклонён target layout 8.1)
-
-```
-Offset  Size  Тип        Поле             Описание
-0       4     u32        gen              Поколение для восстановления AtomId
-4       4     u32        subgraph_slot    root-arena slot внутреннего графа; NULL_SLOT иначе
-8       4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
-12      4     u32        legacy_table_id  Удалённое поле graph-owned кандидата; u32::MAX = нет
-16      4     u32        adj_out_count    Общее кол-во исходящих рёбер (inline + overflow)
-20      4     u32        adj_in_count     Общее кол-во входящих рёбер
-24      4     u32        adj_undir_count  Общее кол-во неориентированных рёбер
-28      1     u8         kind_flags       Биты: [7]=is_meta; [6]=tombstone; [5]=visited;
-                                          [4]=reserved; [3]=in_result; [2]=cut_vertex; [1:0]=reserved
-29      3     u8[3]      _pad
-32      8     u64        overflow_out     page_no overflow для out; NULL_PAGE = нет
-40      8     u64        overflow_in      page_no overflow для in
-48      8     u64        overflow_undir   page_no overflow для undirected
-56      8     u64        props_page       page_no в props.fgb; NULL_PAGE = нет
-64      4     u32        props_slot       Индекс слота в SlotDirectory PropHeapPage
-68      4     u32        props_len        Длина сериализованного PropertyMap
-72      8     —          _reserved        Выравнивание массивов смежности на 16 байт
-80      32    [u64; 4]   adj_out          Inline исходящие: DiskAtomRef рёбер; NULL_SLOT = конец
-112     32    [u64; 4]   adj_in           Inline входящие
-144     16    [u64; 2]   adj_undir        Inline неориентированные
-Total = 160 байт
+```text
+Offset  Size  Тип       Поле                 Описание
+0       4     u32       generation           Поколение GlobalAtomId
+4       4     u32       class_id             ClassId; NULL_CLASS только у tombstone
+8       1     u8        flags                bit 0 TOMBSTONE; bit 1 EDGE; bits 2..7 = 0
+9       7     u8[7]     _reserved            Только нули
+16      8     u64       record_id_page        PageNo canonical RecordId; NULL_PAGE у tombstone
+24      4     u32       record_id_slot        SlotDirectory index; NULL_SLOT у tombstone
+28      4     u32       record_id_len         Длина canonical RecordId bytes
+32      8     u64       properties_page       PageNo base PropertyMap; NULL_PAGE = пустая map
+40      4     u32       properties_slot       SlotDirectory index; NULL_SLOT = пустая map
+44      4     u32       properties_len        Длина canonical PropertyMap bytes; 0 = пустая map
+Total = 48 байт
 ```
 
-**Почему инлайн 4, а не 16.** Прежние `[u32;16]` были перенесены из in-memory представления (`SmallVec<[u32;16]>`), где размер подобран под кэш-линию. Для диска оптимум другой: степенны́е распределения означают, что у подавляющего большинства вершин степень 1–3, поэтому при инлайне 16 бо́льшая часть слота — пустые `NULL_SLOT`, а хабы всё равно уходят в overflow. Инлайн 4 покрывает типичную вершину целиком и втрое уплотняет страницу (102 слота вместо 63) при том же поведении на хабах.
+Обе ссылки адресуют `properties.fgb`: `record_id_*` — canonical `RecordId` из §4.2,
+`properties_*` — запись §13.2. Контекст поля задаёт decoder, поэтому дополнительный record tag
+не нужен. Значение slot `0xFFFF_FFFE` обозначает large-object chain (§13.4).
 
-**Почему счётчики u32, а не u16.** `u16` ограничивал степень вершины 65 535, что противоречит §12, где разбирается пример со степенью 100 000, и заведомо мало для хабов.
+Инварианты live slot:
 
-**Инварианты:**
+- `record_id_*` обязателен; его class совпадает с `class_id`, а global primary содержит ровно
+  `RecordId → GlobalAtomId` этого слота;
+- `flags.EDGE`, kind-бит `GlobalAtomId` и immutable kind `ClassSchema` совпадают;
+- `properties_page = NULL_PAGE`, `properties_slot = NULL_SLOT` и `properties_len = 0`
+  кодируют пустую base map;
+- graph membership, label, topology и overlay здесь отсутствуют.
 
-- Если `kind_flags.tombstone = 1`, остальные поля не гарантированы (кроме `gen`).
-- Если `adj_out_count > 4`, первая overflow-страница: `overflow_out`.
-- `adj_out[]` заполняется с индекса 0; `NULL_SLOT` — конец inline части.
-- `legacy_table_id` не входит в target layout 8.1; class определяется global atom.
-- Legacy membership относился к точному `(kind, slot, gen)`; это поле целиком удаляется из
-  target occurrence slot.
-- target class filtering использует `cls_<class_id>.fgidx`, а не поле occurrence slot.
+Tombstone кодируется канонически: значим только новый `generation`; `class_id = NULL_CLASS`,
+установлен только `TOMBSTONE`, обе ссылки null, длины равны нулю. Неизвестные flags,
+несогласованные sentinels и ненулевые reserved bytes являются corruption.
 
-### 10.2. Legacy NodeHotPage layout
+### 10.2. AtomHotPage layout
 
-```
+```text
 Offset   Size   Содержимое
-0        32     PageHeader (magic=MAGIC_NODE_HOT, type=NodeHot)
-32       16320  102 × NodeHotSlot (102 × 160 = 16320)
-16352    32     _padding
+0        32     PageHeader (magic=MAGIC_ATOM_HOT, type=AtomHot)
+32       16320  340 × AtomHotSlot (340 × 48 = 16320)
+16352    32     _padding = 0
 Total = PAGE_SIZE байт
 ```
 
-**Слотов на страницу:** 102  
-**Покрытие:** NodeHotPage[k] содержит слоты `[102k .. 102k+101]`.
+AtomStore использует единое `slot_index` пространство для NODE и EDGE:
 
-**Адресация:**
-
+```text
+page_no          = GlobalAtomId.slot_index / 340
+slot_within_page = GlobalAtomId.slot_index % 340
+byte_offset      = 32 + slot_within_page × 48
 ```
-page_no          = slot_index / 102
-slot_within_page = slot_index % 102
+
+### 10.3. Graph-local NodeHotSlot
+
+`NodeHotSlot` имеет размер 160 байт и хранит только node occurrence:
+
+```text
+Offset  Size  Тип        Поле                Описание
+0       4     u32        generation          Поколение graph-local AtomId
+4       4     u32        subgraph_slot       root-arena slot вложенного graph; NULL_SLOT иначе
+8       4     u32        label_id            Graph-local LabelId; NULL_LABEL = нет
+12      4     u32        _reserved0          Только нули; прежний table_id удалён
+16      4     u32        adj_out_count       Полное число исходящих edges
+20      4     u32        adj_in_count        Полное число входящих edges
+24      4     u32        adj_undir_count     Полное число undirected edges
+28      1     u8         flags               [7] META [6] TOMBSTONE [4] HAS_OVERLAY;
+                                              [5], [3:0] = 0
+29      3     u8[3]      _pad                Только нули
+32      8     u64        overflow_out        Первая out overflow page; NULL_PAGE = нет
+40      8     u64        overflow_in         Первая in overflow page; NULL_PAGE = нет
+48      8     u64        overflow_undir      Первая undirected overflow page; NULL_PAGE = нет
+56      8     u64        overlay_page        PageNo в overlays.fgb; NULL_PAGE = нет overlay
+64      4     u32        overlay_slot        SlotDirectory index; NULL_SLOT = нет overlay
+68      4     u32        overlay_len         Длина canonical sparse overlay; 0 = нет overlay
+72      8     u64        global_atom         Полный generation-aware GlobalAtomId NODE
+80      32    [u64; 4]   adj_out             Inline graph-local DiskAtomRef edges
+112     32    [u64; 4]   adj_in              Inline graph-local DiskAtomRef edges
+144     16    [u64; 2]   adj_undir           Inline graph-local DiskAtomRef edges
+Total = 160 байт
+```
+
+`HAS_OVERLAY` установлен тогда и только тогда, когда `overlay_page != NULL_PAGE`,
+`overlay_slot != NULL_SLOT` и `overlay_len > 0`. При снятом флаге эта тройка имеет канонические
+значения `NULL_PAGE`/`NULL_SLOT`/`0`, а read path не открывает и не читает `overlays.fgb`.
+`META` совпадает с наличием `subgraph_slot`; `global_atom` обязан быть не `NULL_GLOBAL_ATOM`,
+иметь NODE kind и существовать в AtomStore на snapshot. Class и base properties разрешаются
+через него и в occurrence не дублируются.
+
+Inline arrays плотно заполнены от индекса 0. Для out/in count не больше 4 не имеет overflow, а
+больший count требует первую overflow page; для undirected граница равна 2. `u32` counts
+сохраняют степени выше 65 535. У tombstone значим только новый `generation`: counts равны нулю,
+`label_id = NULL_LABEL`, `subgraph_slot = NULL_SLOT`, `global_atom = NULL_GLOBAL_ATOM`, все page
+и slot references имеют null sentinel, inline arrays заполнены `NULL_DISKATOMREF`, а из flags
+установлен только `TOMBSTONE`.
+
+`VISITED`, `IN_RESULT` и `CUT_VERTEX` являются snapshot/query-local состоянием алгоритмов. Они
+хранятся в runtime/ECS sidecar и никогда не записываются в `NodeHotSlot`.
+
+### 10.4. NodeHotPage layout
+
+```text
+Offset   Size   Содержимое
+0        32     PageHeader (magic=MAGIC_NODE_HOT, type=NodeHot)
+32       16320  102 × NodeHotSlot (102 × 160 = 16320)
+16352    32     _padding = 0
+Total = PAGE_SIZE байт
+```
+
+```text
+page_no          = AtomId.slot_index / 102
+slot_within_page = AtomId.slot_index % 102
 byte_offset      = 32 + slot_within_page × 160
 ```
 
@@ -1143,113 +1212,104 @@ byte_offset      = 32 + slot_within_page × 160
 
 ## 11. Graph-local EdgeHotPage
 
-Target `EdgeHotSlot` также является occurrence. Он хранит local generation, `GlobalAtomId`,
-optional graph-local label/overlay, topology, weight, endpoint arrays и nested/transition graph
-binding. Class/kind identity и base properties принадлежат global atom; один и тот же edge
-`RecordId` может иметь разные topology/weight/label в разных graphs.
+`EdgeHotPage` хранит edge occurrences. Base identity и свойства разрешаются через
+`GlobalAtomId`, но topology, endpoints, weight, label, overlay и nested/transition binding
+принадлежат конкретному graph. Поэтому один global edge может иметь независимые occurrences в
+нескольких graphs.
 
-Ниже приведён только отклонённый graph-owned layout предыдущего кандидата.
+### 11.1. EdgeHotSlot
 
-### 11.1. Legacy EdgeHotSlot (отклонён target layout 8.1)
-
-```
-Offset  Size  Тип        Поле             Описание
-0       1     u8         topo             EdgeTopology: 0=Directed,1=Undirected,
-                                          2=Bidirectional,3=HyperDirected,
-                                          4=HyperUndirected,5=Loop
-1       1     u8         flags            EdgeFlags: 
-                                            bit 0: TOMBSTONE
-                                            bit 1: VISITED
-                                            bit 2: META          -- ребро имеет meta-семантику
-                                            bit 3: MULTI
-                                            bit 4: BRIDGE
-                                            bit 5: IN_RESULT
-                                            bit 6: CROSS_LEVEL   -- endpoint в другом подграфе
-                                            bit 7: _reserved
-2       1     u8         edge_kind_ext    Расширенная классификация:
-                                            bit 0: HAS_TRANSITION   -- transition_gid != NULL_SLOT
-                                            bits 1-7: reserved (0)
-3       1     u8         _pad
-4       4     u32        gen              Поколение
-8       4     u32        source_count     Кол-во source endpoint'ов (total, ≤2 inline)
-12      4     u32        target_count     Кол-во target endpoint'ов (total, ≤2 inline)
-16      4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
-20      4     u32        legacy_table_id  Удалённое поле graph-owned кандидата; u32::MAX = нет
-24      8     f64        weight           NaN = нет веса
-32      4     u32        transition_gid   root-arena slot transition graph; NULL_SLOT = нет
-36      4     u32        source_sg_slot   root-arena slot всех source_inline; NULL_SLOT = текущий граф
-40      4     u32        target_sg_slot   root-arena slot всех target_inline; NULL_SLOT = текущий граф
-44      4     u32        props_slot       Индекс слота в SlotDirectory PropHeapPage
-48      4     u32        props_len        Длина сериализованного PropertyMap
-52      4     u32        _pad
-56      8     u64        props_page       page_no в props.fgb
-64      8     u64        source_overflow  page_no overflow для source endpoint'ов
-72      8     u64        target_overflow  page_no overflow для target endpoint'ов
-80      8     —          _reserved0       Зарезервировано; обнулить при записи
-88      8     u64        source_sg_overflow page_no overflow для source_sg_slot
-96      8     u64        target_sg_overflow page_no overflow для target_sg_slot
-104     8     —          _reserved        Выравнивание массивов endpoint'ов на 16 байт
-112     16    [u64; 2]   source_inline    Inline source endpoint'ы: DiskAtomRef
-128     16    [u64; 2]   target_inline    Inline target endpoint'ы: DiskAtomRef
-144     16    —          _reserved        Зарезервировано под эволюцию формата; обнулить при записи
+```text
+Offset  Size  Тип        Поле                     Описание
+0       1     u8         topology                 0 Directed, 1 Undirected, 2 Bidirectional,
+                                                  3 HyperDirected, 4 HyperUndirected, 5 Loop
+1       1     u8         flags                    bit 0 TOMBSTONE; 2 META; 6 CROSS_LEVEL;
+                                                  7 HAS_OVERLAY; bits 1, 3..5 = 0
+2       1     u8         edge_kind_ext            bit 0 HAS_TRANSITION; bits 1..7 = 0
+3       1     u8         _pad                     Ноль
+4       4     u32        generation               Поколение graph-local AtomId
+8       4     u32        source_count             Полное число source endpoints
+12      4     u32        target_count             Полное число target endpoints
+16      4     u32        label_id                 Graph-local LabelId; NULL_LABEL = нет
+20      4     u32        _reserved0               Только нули; прежний table_id удалён
+24      8     f64        weight                   0x7FF8_0000_0000_0000 = веса нет
+32      4     u32        transition_sg_slot        root-arena transition slot; NULL_SLOT = нет
+36      4     u32        source_sg_slot            root-arena slot inline source side; иначе NULL_SLOT
+40      4     u32        target_sg_slot            root-arena slot inline target side; иначе NULL_SLOT
+44      4     u32        overlay_slot             SlotDirectory index; NULL_SLOT = нет overlay
+48      4     u32        overlay_len              Длина canonical sparse overlay
+52      4     u32        _pad1                    Ноль
+56      8     u64        overlay_page             PageNo в overlays.fgb; NULL_PAGE = нет overlay
+64      8     u64        source_overflow          Первая local source overflow page; иначе NULL_PAGE
+72      8     u64        target_overflow          Первая local target overflow page; иначе NULL_PAGE
+80      8     u64        global_atom              Полный generation-aware GlobalAtomId EDGE
+88      8     u64        source_sg_overflow       Qualified source overflow page; иначе NULL_PAGE
+96      8     u64        target_sg_overflow       Qualified target overflow page; иначе NULL_PAGE
+104     8     u64        _reserved1               Ноль
+112     16    [u64; 2]   source_inline            Inline graph-local DiskAtomRef endpoints
+128     16    [u64; 2]   target_inline            Inline graph-local DiskAtomRef endpoints
+144     16    u8[16]     _reserved2               Нули
 Total = 160 байт
 ```
 
-**Почему инлайн 2.** Бинарное ребро — подавляющее большинство — имеет ровно
-`source_count = 1` и `target_count = 1`, поэтому двух inline-ячеек достаточно с запасом;
-гиперрёбра уходят в overflow в любом случае. Инлайн 4 при 8-байтовых ссылках стоил бы
-лишних 32 байта на каждое ребро ради редкого случая.
+`HAS_OVERLAY` обязан точно совпадать с наличием overlay reference. `META`, `HAS_TRANSITION` и
+`transition_sg_slot != NULL_SLOT` совпадают; неизвестные bits являются corruption.
+Для отсутствующего overlay действует та же каноническая тройка `NULL_PAGE`/`NULL_SLOT`/`0`, что
+и у node occurrence. `global_atom` не равен `NULL_GLOBAL_ATOM`, имеет EDGE kind и существует в
+AtomStore на snapshot. Class/base properties не дублируются. Writer использует для отсутствия
+веса canonical quiet-NaN `0x7FF8_0000_0000_0000` (little-endian bytes
+`00 00 00 00 00 00 F8 7F`); иной NaN decoder отклоняет, а пользовательский numeric NaN остаётся
+запрещён §3.
 
-**Почему счётчики u32, а не u8.** Прежний `u8` ограничивал гиперребро 255 конечными точками; для гиперграфов это произвольное и слишком низкое ограничение.
+Инварианты topology и counts:
 
-**Инварианты:**
-- При `topo ∈ {Directed, Undirected, Bidirectional, Loop}`: `source_count + target_count = 2`.
-- При `topo ∈ {HyperDirected, HyperUndirected}`: `source_count + target_count ≥ 2`.
-- При `topo ∈ {Undirected, HyperUndirected}`: все endpoint'ы находятся в `source_inline`/`source_overflow`; `target_count = 0`.
-- При `source_count > 2` или `target_count > 2` — соответствующий overflow активен.
-- Каждый endpoint является валидным `DiskAtomRef` любого kind; edge-endpoint не меняет флаг `META`.
-- Inline- и overflow-части логически образуют один массив на каждой стороне. `RELATE ...
-  ORDER BY TAIL/TARGETS` обязывает запись, compaction и recovery сохранять порядок этого
-  массива; без такого предложения API не обещает порядок обхода.
-- `legacy_table_id` не входит в target layout 8.1; edge class определяется global atom.
+- для `Directed`, `Bidirectional` и `Loop`: `source_count + target_count = 2`;
+- для `Undirected`: сумма равна 2 и `target_count = 0`;
+- для `HyperDirected`: сумма не меньше 2;
+- для `HyperUndirected`: сумма не меньше 2 и `target_count = 0`;
+- count не больше 2 хранится inline; больший count требует соответствующий overflow;
+- каждый endpoint является graph-local `DiskAtomRef` любого kind.
 
-**Хранение cross-level endpoints:**
-- Для CROSS_LEVEL=0: `source_inline`/`target_inline` содержат DiskAtomRef в пространстве текущего графа.
-- Для CROSS_LEVEL=1 сторона остаётся inline только когда содержит не более двух endpoint'ов и
-  все они принадлежат одному graph slot. Тогда `*_sg_slot` относится ко всем inline-ссылкам.
-- Если на стороне больше двух endpoint'ов либо встречаются разные graph slots, **вся сторона**
-  записывается в `*_sg_overflow` как ordered `QualifiedAtomRef`; inline и обычный overflow для
-  этой стороны пусты. Делить одну логическую сторону между local и qualified storage запрещено.
-- Slot 0 означает текущий graph address space. Slots `1..=u32::MAX-1` назначаются единой
-  root-arena и не переиспользуются другим вложенным графом того же root, даже на иной глубине.
+При `CROSS_LEVEL = 0` inline/ordinary overflow принадлежат текущему graph, оба `*_sg_slot` равны
+`NULL_SLOT`, а оба `*_sg_overflow` — `NULL_PAGE`. При `CROSS_LEVEL = 1` непустая сторона остаётся
+inline только если все её endpoints принадлежат одному root-arena graph slot; этот slot явно
+записывается в соответствующий `*_sg_slot`. Иначе вся ordered сторона хранится как
+`QualifiedDiskAtomRef` в `*_sg_overflow`. Делить сторону между local и qualified storage
+запрещено. Slot 0 означает текущий graph; остальные root-arena slots не переиспользуются на
+другой глубине.
 
-### 11.2. Legacy EdgeHotPage layout
+У tombstone значим только новый `generation`: topology и `edge_kind_ext` кодируются нулём,
+counts и padding равны нулю, `weight` содержит canonical sentinel, `label_id`,
+`transition_sg_slot`, оба `*_sg_slot` и `overlay_slot` равны своим null sentinel,
+`overlay_len = 0`, `global_atom = NULL_GLOBAL_ATOM`, page references имеют `NULL_PAGE`, inline
+arrays заполнены `NULL_DISKATOMREF`, а из flags установлен только `TOMBSTONE`. `VISITED`,
+`IN_RESULT` и `BRIDGE` являются runtime/ECS markers и на диск не записываются.
 
-```
+### 11.2. EdgeHotPage layout
+
+```text
 Offset   Size   Содержимое
 0        32     PageHeader (magic=MAGIC_EDGE_HOT, type=EdgeHot)
 32       16320  102 × EdgeHotSlot (102 × 160 = 16320)
-16352    32     _padding
+16352    32     _padding = 0
 Total = PAGE_SIZE байт
 ```
 
-**Слотов на страницу:** 102
-
-**Адресация:**
-
-```
-page_no          = slot_index / 102
-slot_within_page = slot_index % 102
+```text
+page_no          = AtomId.slot_index / 102
+slot_within_page = AtomId.slot_index % 102
 byte_offset      = 32 + slot_within_page × 160
 ```
 
-Слоты вершин и рёбер имеют одинаковый размер (160 байт) и одинаковую плотность (102 на страницу), поэтому арифметика адресации у них общая — это упрощает и код, и дефрагментацию.
+Node и edge occurrences имеют одинаковый размер и плотность, но остаются в разных файлах:
+так direct addressing сохраняет отдельные kind-local slot spaces, а traversal не читает
+edge-only topology вместе с node adjacency.
 
-### 11.3–11.4. Зарезервированные коды
+### 11.3. Зарезервированные коды
 
 Коды PageType `0x0008` и `0x0009` зарезервированы для совместимости формата и не
-переиспользуются. Отдельных страниц edge-to-edge-инцидентности нет: такие endpoint'ы
-хранятся в `EdgeHotSlot` и обычных endpoint overflow-страницах (§11–§12).
+переиспользуются. Отдельных страниц edge-to-edge incidence нет: такие endpoints хранятся в
+`EdgeHotSlot` и обычных endpoint overflow pages (§11–§12).
 
 ---
 
@@ -1290,16 +1350,20 @@ overflow_entry_cl (16 байт):
 → 16336 / 16 = 1021 entries per page
 ```
 
-`QualifiedAtomRef` = `{ sg_slot: u32, local_ref: u64 }` — 16 байт с учётом выравнивания.
-Entries одной стороны сохраняют пользовательский порядок; `side` обязан совпадать с chain,
-указанной соответствующим полем hot-slot.
+Пара `{ sg_slot: u32, local_ref: u64 }` соответствует физическому `QualifiedDiskAtomRef`;
+overflow entry использует его четыре промежуточных байта для `side` и трёх нулевых padding
+bytes. Entries одной стороны сохраняют пользовательский порядок; `side` обязан совпадать с
+chain, указанной соответствующим полем hot-slot.
 
 ---
 
-## 13. PropHeapPage — куча свойств
+## 13. PropHeapPage — куча variable records
 
-Хранит сериализованные `PropertyMap` в **slotted page** формате: записи растут с конца к началу,
-SlotDirectory — с offset 48 к концу.
+В `AtomStore/properties.fgb` хранит canonical `RecordId` и base `PropertyMap` как отдельные
+opaque records в **slotted page** формате. Тип записи задаётся owning-полем `AtomHotSlot` и не
+дублируется внутри heap; decoder не вправе интерпретировать запись без этого контекста. В
+graph-local `overlays.fgb` тот же slotted-page принцип применяется отдельным
+`GraphOverlayPage` codec. Records растут с конца к началу, SlotDirectory — от offset 40 к концу.
 
 ### 13.1. Layout
 
@@ -1385,8 +1449,8 @@ runtime `PropertyMap` семантически незначим.
 
 ### 13.4. Мультистраничные записи (Large Objects)
 
-Если PropertyMap > `PAGE_PAYLOAD_SIZE / 2` (>8176 байт), он хранится как Large Object:
-цепочка `PropLargeChunkPage` с `next_page` указателями.
+Если canonical `RecordId` или `PropertyMap` больше `PAGE_PAYLOAD_SIZE / 2` (>8176 байт), запись
+хранится как Large Object: цепочка `PropLargeChunkPage` с `next_page` указателями.
 
 ```
 PropLargeChunkPage:
@@ -1394,26 +1458,35 @@ PropLargeChunkPage:
   next_page: u64
   data_len:  u32   -- байт данных на этой странице
   _pad:      u32
-  data:      [u8]  -- raw bytes кодированного PropertyMap
+  data:      [u8]  -- raw canonical RecordId либо PropertyMap bytes
 ```
 
-В `NodeHotSlot.props_slot = 0xFFFF_FFFE (один ниже NULL_SLOT)` означает Large Object; `props_page` указывает на первый чанк.
+В соответствующем `AtomHotSlot.*_slot = 0xFFFF_FFFE` значение `*_page` указывает на первый
+chunk. Graph overlay использует тот же sentinel в `NodeHotSlot.overlay_slot` или
+`EdgeHotSlot.overlay_slot`, но цепочка принадлежит `overlays.fgb` и сохраняет
+`MAGIC_OVERLAY`/`GraphOverlay` page type.
 
 ### 13.5. Ссылка на запись — PropertyRef
 
 ```rust
 struct PropertyRef {
-    page_no:    u64,  // props_page из hot-слота
-    slot_index: u16,  // индекс в SlotDirectory (не смещение!)
-    _len:       u32,  // props_len из hot-слота (для быстрой проверки)
+    page_no:    u64,  // *_page из owning hot-слота
+    slot_index: u32,  // индекс SlotDirectory или large-object sentinel
+    length:     u32,  // canonical byte length для быстрой проверки
 }
 ```
 
-**Замечание:** Для прямого доступа без чтения `SlotDirectory` — использовать смещение из `SlotEntry`: `SlotEntry[props_slot].record_offset`.
+Для inline record `slot_index ≤ u16::MAX`; значения `0x0001_0000..=0xFFFF_FFFD`
+зарезервированы. `NULL_SLOT` означает отсутствие, `0xFFFF_FFFE` — large object. Смещение inline
+record берётся из `SlotEntry[slot_index].record_offset` и не сохраняется в hot slot.
 
 ### 13.6. Свойства и аналитика: OLTP row-store + колоночный кэш
 
-`PropHeapPage` — **намеренно строково-ориентированное OLTP-хранилище**: все свойства атома лежат одной сериализованной записью. Это оптимально для доминирующего сценария (взять атом — получить все его свойства) и плохо для аналитического скана одного поля по миллионам атомов, где приходится читать целые записи ради одного значения.
+`PropHeapPage` — **намеренно строково-ориентированное OLTP-хранилище**. В AtomStore он
+содержит отдельно canonical `RecordId` и base `PropertyMap`, на которые ссылается
+`AtomHotSlot`; graph-local sparse overlays хранятся в `GraphOverlayPage`. Это оптимально для
+доминирующего сценария (взять атом — получить все его свойства) и плохо для аналитического
+скана одного поля по миллионам атомов, где приходится читать целые записи ради одного значения.
 
 Разрешение — не превращать `PropHeapPage` в колоночный формат, а дать **явный путь материализации**:
 
@@ -2929,7 +3002,7 @@ PatternCatalogPage (patterns_root → B+tree leaf):
 **Файл:** `idx/ee_endpoint.fgidx`
 
 **Структура:** B+tree.
-- Ключ: DiskAtomRef ребра-endpoint (QualifiedAtomRef при CROSS_LEVEL)
+- Ключ: `DiskAtomRef` edge-endpoint (`QualifiedDiskAtomRef` при `CROSS_LEVEL`)
 - Значение: список записей `(edge_ref, side)`
 
 ```
@@ -2971,7 +3044,7 @@ LeafEntry (24 байта):
 Логический ключ сортировки — `(encoded_key, DiskAtomRef)` (сравнение raw `DiskAtomRef` как
 беззнакового числа эквивалентно сравнению его big-endian bytes). Для scalar B+tree
 `encoded_key` является order-preserving (§20.2.1), поэтому поиск сравнивает байты без
-декодирования. Graph-wide primary сохраняет отдельный canonical `RecordId` codec (§3.5):
+декодирования. AtomStore primary сохраняет отдельный canonical `RecordId` codec (§4.2):
 его byte order нужен только как стабильный внутренний порядок exact-lookup B+tree и не
 объявляется семантическим порядком `RecordId`.
 
@@ -3513,20 +3586,18 @@ Stage-7 Label index immutable и tombstone не содержит, поэтому
 5. Старое поколение удалить после завершения удерживающих его snapshots.
 ```
 
-### 24.2. PropHeap Compaction
+### 24.2. PropHeap и GraphOverlay compaction
 
 **Триггер**: среднее `free_space / PAGE_SIZE > 40%`.
 
 ```
-1. Allocate новые страницы
-2. Для каждого живого атома:
-   a. Read PropertyMap из старой страницы
-   b. Write в новую страницу (компактно)
-   c. Update props_page + props_slot в NodeHotSlot / EdgeHotSlot
-   d. WAL: PropSet + NodeHotUpdate (new props_ref)
-3. Update freelist
-4. Truncate / reclaim старые страницы
-5. Checkpoint
+1. Allocate новые страницы в том же `DataSpaceId`.
+2. В AtomStore для каждого live `AtomHotSlot` переписать canonical `RecordId` и base
+   `PropertyMap`, затем обновить только его `record_id_*`/`properties_*` references.
+3. В graph space переписать только live sparse overlay records и обновить
+   `NodeHotSlot.overlay_*`/`EdgeHotSlot.overlay_*`; base properties не копировать.
+4. Записать изменённые heap/hot pages как обычные frame-WAL `PageFrame` одного commit.
+5. Обновить соответствующие freelists, reclaim старые pages и выполнить checkpoint.
 ```
 
 ### 24.3. Полный дефрагментатор (Manual COMPACT)
@@ -3534,8 +3605,9 @@ Stage-7 Label index immutable и tombstone не содержит, поэтому
 **Триггер**: `COMPACT GRAPH <name>` или tombstone ratio > 30% в hot файле (много удалений без переиспользования).
 
 ```
-1. Построить slot_remap: HashMap<old_slot, new_slot> для живых атомов;
-2. Записать новый nodes_hot.fgb в tmp: переупорядочить слоты;
+1. Построить отдельные node/edge `slot_remap` для живых occurrences выбранного graph;
+2. Записать новые `nodes_hot.fgb` и `edges_hot.fgb`: переупорядочить occurrence slots, сохранив
+   каждый `GlobalAtomId` без изменения;
 3. Для каждого EdgeHotSlot:
    - source_inline[], target_inline[] — применить remap к каждому элементу;
    - source_sg_slot, target_sg_slot — это root-arena slot, не DiskAtomRef, не трогать;
@@ -3543,15 +3615,16 @@ Stage-7 Label index immutable и tombstone не содержит, поэтому
 5. NodeHotSlot adjacency (adj_out, adj_in, adj_undir) — это edge slots,
    применить remap если рёбра тоже дефрагментируются
 6. EdgeEndpointIndex — перестроить полностью (endpoint_ref и edge_ref оба меняются)
-7. LabelIndex pages — применить remap к каждому DiskAtomRef
-8. Все B+tree индексы (primary, standard, unique):
-   - leaf values (DiskAtomRef) — применить remap
-   - ee_endpoint.fgidx — перестроить
+7. Перестроить `membership.fgidx`, class/label и explicit effective indexes этого graph;
+   global primary/base indexes не менять.
+8. Обновить database `memberships.fgidx`: `GlobalAtomId` остаётся прежним, меняется только
+   graph-local `DiskAtomRef` occurrence.
 9. SubgraphDirPage — sg_slot это root-arena slot подграфов, не DiskAtomRef;
    если подграфы тоже дефрагментируются — отдельная процедура
-10. Changefeed entries — atom_ref применить remap
-11. Обновить GraphSuperblock
-12. fsync всего → atomic rename
+10. В новых changefeed entries использовать remapped graph-local refs; уже опубликованная
+    history остаётся привязана к своей generation.
+11. Обновить GraphSuperblock.
+12. fsync всего → atomic rename.
 ```
 
 Дорогая операция; только по явному запросу или при запуске после длительной эксплуатации по расписанию.
@@ -3580,8 +3653,8 @@ fn free_page_chain(pm: &PageManager, file: DataFileKind, first_page: u64, wal: &
 ```rust
 fn free_large_object(pm: &PageManager, first_chunk: u64, wal: &WalWriter, tx: TxId) {
     free_page_chain(pm, DataFileKind::Props, first_chunk, wal, tx);
-    // После этого обновить NodeHotSlot/EdgeHotSlot:
-    // props_page = NULL_PAGE, props_slot = NULL_SLOT, props_len = 0
+    // После этого обнулить owning reference:
+    // AtomHotSlot.record_id_*/properties_* либо NodeHotSlot/EdgeHotSlot.overlay_*
 }
 ```
 
@@ -3596,7 +3669,10 @@ fn free_large_object(pm: &PageManager, first_chunk: u64, wal: &WalWriter, tx: Tx
 ### 25.1. Формулы адресации
 
 ```
-Слоты вершин и рёбер имеют одинаковый размер, поэтому формула общая:
+Для AtomHotPage (340 слотов × 48 байт):
+  page_no          = GlobalAtomId.slot_index / 340
+  slot_within_page = GlobalAtomId.slot_index % 340
+  byte_offset      = PAGE_HEADER_SIZE + slot_within_page × 48
 
 Для NodeHotPage и EdgeHotPage (102 слота × 160 байт):
   page_no          = slot_index / 102
@@ -3632,39 +3708,19 @@ fn out_neighbors(disk_graph: &DiskMetaGraph, node_slot: u64) -> Vec<DiskAtomRef>
 
 ### 25.3. Загрузка в in-memory MetaGraph (Mode 3)
 
-```rust
-fn load_subgraph(disk: &DiskMetaGraph, tx: &MvccTransaction, atom_refs: &[DiskAtomRef]) -> io::Result<MetaGraph> {
-    let mut g = MetaGraph::with_capacity(atom_refs.len(), atom_refs.len() * 4);
-    let mut ref_to_atom: HashMap<DiskAtomRef, AtomId> = HashMap::new();
-    
-    // Pass 1: load nodes
-    for &disk_ref in atom_refs {
-        let slot = disk_ref.slot();
-        let hot = disk.node_hot(slot)?;
-        if hot.kind_flags & TOMBSTONE != 0 { continue; }
-      
-        let id = AtomId::new_node(slot, hot.gen);
-        let label = if hot.label_id != NULL_LABEL {
-            Some(disk.label_dict.lookup_node(hot.label_id) ? )
-        } else { 
-            None 
-        };
-      
-        let props = if hot.props_page != NULL_PAGE {
-            disk.read_props(hot.props_page, hot.props_slot) ?
-        } else { 
-            PropertyMap::default() 
-        };
-        // ... add node to g ...
-        ref_to_atom.insert(disk_ref, id);
-    }
-    
-    // Pass 2: load edges between loaded nodes
-    // ... similar pattern ...
-    
-    Ok(g)
-}
-```
+Mode 3 выполняет bounded двухпроходную materialization:
+
+1. Для каждого выбранного node occurrence прочитать `NodeHotSlot`, затем разрешить
+   `global_atom → AtomHotSlot → base PropertyMap`. Только при `HAS_OVERLAY` прочитать overlay и
+   построить effective properties. Создать новый owning node и сохранить
+   `DiskAtomRef → materialized AtomId`.
+2. Для каждого выбранного edge occurrence аналогично разрешить base/overlay, remap endpoints
+   через таблицу первого прохода и создать owning edge с graph-local topology/weight/label.
+3. После завершения bounded окна освободить page epoch; materialized graph не удерживает
+   `GlobalAtomId`, source `DiskAtomRef` или page guard.
+
+Unattached global atom не входит в graph materialization, но остаётся доступен прямым class или
+`RecordId` read из AtomStore.
 
 ### 25.4. Прямое чтение слота (без BufferPool)
 
@@ -3727,10 +3783,10 @@ TensorCachePage инвалидируется при любом изменени�
 
 | Параметр                   | Тип   | Default | Описание                                                |
 |----------------------------|-------|---------|---------------------------------------------------------|
-| `FG_ADJ_INLINE_OUT`        | usize | 16      | Inline out-adj per node (NodeHotSlot.adj_out[])         |
-| `FG_ADJ_INLINE_IN`         | usize | 16      | Inline in-adj per node (NodeHotSlot.adj_in[])           |
-| `FG_ADJ_INLINE_UNDIR`      | usize | 8       | Inline undir-adj per node (NodeHotSlot.adj_undir[])     |
-| `FG_EDGE_INLINE_ENDPOINTS` | usize | 4       | Inline endpoints per edge side (EdgeHotSlot.*_inline[]) |
+| `FG_ADJ_INLINE_OUT`        | usize | 4       | Inline out-adj per node (NodeHotSlot.adj_out[])         |
+| `FG_ADJ_INLINE_IN`         | usize | 4       | Inline in-adj per node (NodeHotSlot.adj_in[])           |
+| `FG_ADJ_INLINE_UNDIR`      | usize | 2       | Inline undir-adj per node (NodeHotSlot.adj_undir[])     |
+| `FG_EDGE_INLINE_ENDPOINTS` | usize | 2       | Inline endpoints per edge side (EdgeHotSlot.*_inline[]) |
 
 ### 27.2. Runtime-параметры
 

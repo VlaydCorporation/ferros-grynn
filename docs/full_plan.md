@@ -502,6 +502,11 @@ types при необходимости расширяется общими ти
    sparse overlay. `GraphId` всегда ненулевой; database pages адресует
    `DataSpaceId::Database`.
 
+   `AtomHotPage` хранит только global base slots. `NodeHotPage`/`EdgeHotPage` и
+   `nodes_hot.fgb`/`edges_hot.fgb` сохраняются как graph-local occurrence storage; legacy
+   является прежний payload с `table_id`, graph-owned properties и query-scratch flags, а не
+   сами page families.
+
    **Статус (2026-09-10): 🟡 документация A0–A4 завершена; код A5–A16 не начат.**
    До A16 старые TABLE/system-graph paths могут жить только за test-only selector;
    production cutover запрещён до correctness/performance gate A15. Этапы 9–31

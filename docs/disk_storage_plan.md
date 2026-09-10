@@ -13,6 +13,8 @@ graph-first модель. Документационные шаги A0–A4 за
   memberships, base indexes и class statistics;
 - `graphs/<graph_id>/<generation>` хранит occurrences, topology, labels, sparse
   overlays, membership index и explicit effective indexes;
+- `AtomHotPage` хранит только global base atom; отдельные `NodeHotPage`/`EdgeHotPage` и файлы
+  `nodes_hot.fgb`/`edges_hot.fgb` остаются target occurrence storage и не являются legacy;
 - `RecordId = class:id` разрешается в `GlobalAtomId`; graph-local `DiskAtomRef`/
   `AtomId` не заменяет global identity;
 - `PageKey`, WAL и `FileCatalog FGFC v5` используют `DataSpaceId::Database`
