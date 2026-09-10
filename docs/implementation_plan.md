@@ -23,6 +23,25 @@ Rust и к планированию работ, который ранее был
 Код и отчёты являются evidence фактического состояния, но не переопределяют спецификации.
 `fg-meta` — сырой пример: его наличие не считается реализацией или подтверждением conformance.
 
+### Коррекция 8.1: graph-first атомы
+
+[`rework_plan.md`](rework_plan.md) — обязательный barrier перед всеми кодовыми этапами 9–31.
+Документационные шаги A0–A4 завершены 2026-09-10; реализация A5–A16 не начата.
+Целевая модель:
+
+- `CLASS`, а не TABLE, задаёт namespace `RecordId = class:id`, immutable `NODE|EDGE`
+  kind, fields и indexes;
+- global AtomStore владеет base properties; graph владеет occurrence, topology,
+  optional label и sparse overlay;
+- `GlobalAtomId` отделён от graph-local `AtomId`; `GraphRef` идентифицируется
+  ненулевым `GraphId`, а не фиктивным `RecordId`;
+- database pages и graph pages различаются `DataSpaceId`; system graph отсутствует;
+- indexes и statistics явно различают `BASE` и `EFFECTIVE IN GRAPH` scope.
+
+Все нижеследующие TABLE/system-graph статусы описывают только текущий historical
+implementation oracle и не могут использоваться как target design. Их удаление выполняется
+только после A15 в A16.
+
 ## Conformance-матрица и approval gate
 
 Три оси не смешиваются:
@@ -42,32 +61,33 @@ Rust и к планированию работ, который ранее был
 |-------------------------|----------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `STO-WIN-SYNC`          | `disk_storage_spec` §§2, 7–28; `full_plan` 3, 19                                                   | `implemented`, выпуск `gated`: correctness пройден, sparse miss 77,5% и scan resistance 88,2% ниже 90% | Закрыть stage-3 performance gate; затем Windows crash/recovery/fuzz/soak matrix в stage 19. Evidence: `reports/disk_storage_stage5_report.md`       |
 | `STO-WIN-NATIVEASYNC`   | `disk` §2.1; `gql_tech` §1.4                                                                       | optional `implemented`, QD gate пройден; sync pull API и WAL не изменены                               | Обе feature-конфигурации и Sync/NativeAsync differential suite в stage 19. Evidence: `reports/disk_storage_stage6_report.md`                        |
-| `STO-CORE-V1`           | Core layouts/durability и primary/scalar B+tree из `disk` §§6–28; advanced side-files исключены §7 | Windows `candidate`, не frozen                                                                         | Freeze только после `STO-WIN-SYNC` и stage 19. Linux не блокирует freeze; несовместимый Linux layout после него означает v2 + migration             |
+| `STO-CORE-V1`           | Core layouts/durability и primary/scalar B+tree из `disk` §§6–28; advanced side-files исключены §7 | Windows `candidate`, не frozen; graph-owned FGDC v5/FGFC v4 отклоняются target 8.1                     | A8–A10: FGDC v6, FGFC v5, AtomStore/occurrence golden bytes и recovery; freeze только после A15, `STO-WIN-SYNC` и stage 19                          |
+| `STO-ATOM-OCCURRENCE`   | AtomStore, graph occurrences, overlays, `DataSpaceId`, scoped indexes/statistics                   | `approved-for-implementation` / `missing`; docs A0–A4 завершены                                        | A5–A16 из `rework_plan.md`: byte vectors, WAL/recovery, RAM/local parity, fanout и performance gates                                                |
 | `STO-LINUX-SYNC`        | `disk` §§2.1, 28; `full_plan` 32                                                                   | `missing`, specified target                                                                            | Byte-identical v1 vectors, recovery, Linux/NVMe performance и soak; до этого Unix не released                                                       |
 | `STO-LINUX-NATIVEASYNC` | `disk` §2.1; `gql_tech` §1.4; `full_plan` 33                                                       | `draft`, `missing`                                                                                     | Нативный tokio-uring backend и тот же durability/differential contract; не блокирует Windows                                                        |
 | `IDX-DISKANN`           | `gql_spec` §9.6; `gql_grammar` §9.6; `disk` §20.6.4                                                | syntax/semantics `draft`, physical contract `missing`, core v1 `out-of-scope`                          | До stage 23 отдельно утвердить `HASHED_VECTOR`, catalog payload, side-file version, recovery, bulk/incremental parity и recall/latency/memory gates |
 
 ### GrynQL conformance
 
-| ID                 | Граница вертикального среза                                                                                               | Этап `full_plan`    | Approval / реализация                         | Минимальное доказательство завершения                                                                 |
-|--------------------|---------------------------------------------------------------------------------------------------------------------------|---------------------|-----------------------------------------------|-------------------------------------------------------------------------------------------------------|
-| `GQL-P0-P2`        | Read-only `MATCH [ATOM] ... FROM ... WHERE ... RETURN ...` в явно ограниченном профиле                                    | выполнен до этапа 2 | `approved-for-implementation` / `implemented` | Parser, analysis, IR, cursor, path, MVCC и Windows reopen tests                                       |
-| `GQL-DDL-CORE`     | `DEFINE/REMOVE GRAPH`; `DEFINE/REMOVE/ALTER TABLE`, `FIELD`, basic `INDEX`. `ALTER GRAPH` исключён до появления семантики | 8                   | `draft` / `missing`                           | Positive/negative syntax, typing, IR, atomic catalog update, recovery и `INFO`                        |
-| `GQL-DML`          | `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `RELATE`, `EXPECT`, return clauses                                                | 9                   | `draft` / `missing`                           | RAM/local parity, commit/abort/reopen, FCW/SSI и graph-family invariants                              |
-| `GQL-TX`           | `BEGIN/COMMIT/CANCEL`, isolation/read-only/timeout, multi-statement execution                                             | 11                  | `draft` / `missing`                           | Autotransaction/nesting rules, snapshot visibility и typed failures                                   |
-| `GQL-EXPR-CONTROL` | Coercions, idioms, built-ins, `IF`, loops, `TRY/CATCH`, `THROW`, `ASSERT`                                                 | 12                  | `draft` / `partial`                           | Type/lowering goldens, depth/iteration/time budgets, cancellation                                     |
-| `GQL-SELECT-FULL`  | Joins, subqueries, aggregates, clauses, cursors, optimizer/`EXPLAIN`                                                      | 13–14               | `draft` / `partial`                           | Bounded-memory operators, deterministic rules, scan fallback и plan evidence                          |
-| `GQL-MATCH-FULL`   | OPTIONAL/modes/cardinality/bounded and shortest/weighted StandardPath                                                     | 15                  | `draft` / `partial`                           | Bag/path semantics, explosion budgets, RAM/local and index/scan parity                                |
-| `GQL-ATOM-NESTED`  | `ATOM`, HYPER, META, WITHIN, edge endpoints, cross-level/nested MATCH                                                     | 16                  | `draft` / `partial`                           | Exact incidence semantics, qualified refs, nested snapshot tests                                      |
-| `GQL-TRAVERSAL`    | Отдельный traversal IR/VM, barriers, sack, control flow                                                                   | 17                  | `draft` / `missing`                           | Однопоточный pull baseline, side-effect order и resource bounds                                       |
-| `GQL-GRAPH-RESULT` | Paths, `RETURN GRAPH`, `BUILD GRAPH`, graph-return matrix                                                                 | 18                  | `draft` / `partial`                           | Только public `Value`/`RecordId`/graph types; no storage DTO or leaked snapshot                       |
-| `GQL-ADMIN`        | `CONCURRENTLY`, bounded `DEFER`, `REBUILD`, `INFO`, `KILL`, maintenance                                                   | 20                  | `draft` / `missing`                           | Durable job state, crash-to-`stale`, cancellation и observability                                     |
-| `GQL-PARAM-UDF`    | Params, functions, closures, overloads, purity/security/recursion                                                         | 21                  | `draft` / `missing`                           | Sandbox, deterministic purity checks, recursion/error boundaries                                      |
-| `GQL-FULLTEXT`     | Analyzers, inverted index, BM25, highlights                                                                               | 22                  | `draft` / `missing`                           | Unicode/analyzer versioning, incremental/bulk equality, recovery                                      |
-| `GQL-VECTOR`       | HNSW, затем отдельно DiskANN; KNN/ANN                                                                                     | 23                  | `draft` / `missing`                           | Per-algorithm recall/latency/memory/build gates; DiskANN additionally requires `IDX-DISKANN` approval |
-| `GQL-GEO-DERIVED`  | Geometry R-tree и graph-derived indexes                                                                                   | 24–25               | `draft` / `missing`                           | Exact post-filter; `build_lsn`/`stale` fallback and rebuild tests                                     |
-| `GQL-LIVE-EVENTS`  | Changefeed, `LIVE SELECT`, events, LiveGraph integration                                                                  | 27–29               | `draft` / `missing`                           | At-least-once/GAP/resume, bounded queues, retry/idempotency/conflict tests                            |
-| `GQL-BRIDGES`      | `Bridge`, `.use_bridge`, `BridgeData`, `SurrealBridge`                                                                    | 30                  | `draft` / `missing`                           | Public-value boundary, external failure mapping и cross-database E2E                                  |
+| ID                 | Граница вертикального среза                                                                           | Этап `full_plan`                                                     | Approval / реализация                                      | Минимальное доказательство завершения                                                                 |
+|--------------------|-------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------|------------------------------------------------------------|-------------------------------------------------------------------------------------------------------|
+| `GQL-P0-P2`        | Read-only `MATCH [ATOM] ... FROM ... WHERE ... RETURN ...` в явно ограниченном профиле                | выполнен до этапа 2                                                  | `approved-for-implementation` / `implemented`              | Parser, analysis, IR, cursor, path, MVCC и Windows reopen tests                                       |
+| `GQL-DDL-CORE`     | GRAPH DDL; `CLASS NODE                                                                                | EDGE`, `FIELD ON CLASS`, scope-aware `INDEX`; `TABLE` не имеет alias | 8, 8.1                                                     | GRAPH `implemented`; historical TABLE superseded; CLASS `missing`                                     | A11: syntax/typing/IR/catalog/recovery/`INFO`, затем A15–A16                                             |
+| `GQL-DML`          | Direct class DML; graph-scoped effective DML; `ATTACH`/`DETACH`; class/id-aware `RELATE ... IN GRAPH` | 8.1, 9                                                               | `approved-for-implementation` / historical slice `partial` | A12–A16: RAM/local parity, commit/abort/reopen, FCW/SSI, fanout и graph-family invariants             |
+| `GQL-TX`           | `BEGIN/COMMIT/CANCEL`, isolation/read-only/timeout, multi-statement execution                         | 11                                                                   | `draft` / `missing`                                        | Autotransaction/nesting rules, snapshot visibility и typed failures                                   |
+| `GQL-EXPR-CONTROL` | Coercions, idioms, built-ins, `IF`, loops, `TRY/CATCH`, `THROW`, `ASSERT`                             | 12                                                                   | `draft` / `partial`                                        | Type/lowering goldens, depth/iteration/time budgets, cancellation                                     |
+| `GQL-SELECT-FULL`  | Joins, subqueries, aggregates, clauses, cursors, optimizer/`EXPLAIN`                                  | 13–14                                                                | `draft` / `partial`                                        | Bounded-memory operators, deterministic rules, scan fallback и plan evidence                          |
+| `GQL-MATCH-FULL`   | OPTIONAL/modes/cardinality/bounded and shortest/weighted StandardPath                                 | 15                                                                   | `draft` / `partial`                                        | Bag/path semantics, explosion budgets, RAM/local and index/scan parity                                |
+| `GQL-ATOM-NESTED`  | `ATOM`, HYPER, META, WITHIN, edge endpoints, cross-level/nested MATCH                                 | 16                                                                   | `draft` / `partial`                                        | Exact incidence semantics, qualified refs, nested snapshot tests                                      |
+| `GQL-TRAVERSAL`    | Отдельный traversal IR/VM, barriers, sack, control flow                                               | 17                                                                   | `draft` / `missing`                                        | Однопоточный pull baseline, side-effect order и resource bounds                                       |
+| `GQL-GRAPH-RESULT` | Paths, `RETURN GRAPH`, `BUILD GRAPH`, graph-return matrix                                             | 18                                                                   | `draft` / `partial`                                        | Только public `Value`/`RecordId`/graph types; no storage DTO or leaked snapshot                       |
+| `GQL-ADMIN`        | `CONCURRENTLY`, bounded `DEFER`, `REBUILD`, `INFO`, `KILL`, maintenance                               | 20                                                                   | `draft` / `missing`                                        | Durable job state, crash-to-`stale`, cancellation и observability                                     |
+| `GQL-PARAM-UDF`    | Params, functions, closures, overloads, purity/security/recursion                                     | 21                                                                   | `draft` / `missing`                                        | Sandbox, deterministic purity checks, recursion/error boundaries                                      |
+| `GQL-FULLTEXT`     | Analyzers, inverted index, BM25, highlights                                                           | 22                                                                   | `draft` / `missing`                                        | Unicode/analyzer versioning, incremental/bulk equality, recovery                                      |
+| `GQL-VECTOR`       | HNSW, затем отдельно DiskANN; KNN/ANN                                                                 | 23                                                                   | `draft` / `missing`                                        | Per-algorithm recall/latency/memory/build gates; DiskANN additionally requires `IDX-DISKANN` approval |
+| `GQL-GEO-DERIVED`  | Geometry R-tree и graph-derived indexes                                                               | 24–25                                                                | `draft` / `missing`                                        | Exact post-filter; `build_lsn`/`stale` fallback and rebuild tests                                     |
+| `GQL-LIVE-EVENTS`  | Changefeed, `LIVE SELECT`, events, LiveGraph integration                                              | 27–29                                                                | `draft` / `missing`                                        | At-least-once/GAP/resume, bounded queues, retry/idempotency/conflict tests                            |
+| `GQL-BRIDGES`      | `Bridge`, `.use_bridge`, `BridgeData`, `SurrealBridge`                                                | 30                                                                   | `draft` / `missing`                                        | Public-value boundary, external failure mapping и cross-database E2E                                  |
 
 ## Утверждённый срез GrynQL P0–P2
 
@@ -129,6 +149,8 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | `PropHeapPage` — row-store; аналитика — `PropertyColumnCachePage`/Arrow batch                     | `disk_storage_spec.md` §13.6                           |
 | Graph results — frozen owned values; disk views ограничены lifetime транзакции                    | `gql_spec.md` §16–§17, `graphs.md`                     |
 | Массовая загрузка — `BEGIN IMPORT … END IMPORT` + bulk-сборка индексов (без LSM/delta-store)      | `gql_spec.md` §7.11, `disk_storage_spec.md` §20.13     |
+| Global atom identity — `RecordId = class:id`; graph хранит occurrence и sparse overlay            | `gql_spec.md` §2, `disk_storage_spec.md` §§4, 7, 9     |
+| Database/graph page ownership задаёт `DataSpaceId`; `GraphId` всегда ненулевой                    | `disk_storage_spec.md` §7                              |
 
 ---
 
@@ -142,44 +164,44 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 
 ### 1.1. Согласовано / реализовано / каркас
 
-| Область                                                                                                                              | Контракт (спека)                       | Модуль                                                         | Статус                                                          |
-|--------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|----------------------------------------------------------------|-----------------------------------------------------------------|
-| Модель данных `G = ⟨V, MV, E, ME⟩`                                                                                                   | `gql_spec` §3                          | `src/graph`                                                    | 🟢 production foundation                                        |
-| `AtomId` (генерационный, kind-бит, u64)                                                                                              | `disk` §9                              | `src/graph/id.rs`, `src/storage`                               | 🟢 (`gen(23) \| kind(1) \| slot(40)`)                           |
-| Значения (`Value`, runtime/storage/columnar)                                                                                         | `gql_spec` §5–§6; `disk` §5            | `src/values` (`runtime`, `storage`, `columnar`)                | 🟡 активный, этап спецификаций завершён                         |
-| Диагностика (`StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError`)                                       | —                                      | `src/gql_status`                                               | 🟢                                                              |
-| Изоляция Serializable по умолчанию, SI/RC — opt-in                                                                                   | `gql_spec` §17.1                       | `src/datastore`                                                | 🟢 Rust API режима 1 / 🔴 синтаксис `BEGIN`                     |
-| MVCC, COW-снимки, atom-level FCW и точные predicate reads                                                                            | `gql_spec` §17                         | `src/datastore`, `src/collections/cow_vec.rs`, `src/graph`     | 🟢 RAM и Windows local                                          |
-| Журнал (frame-WAL, уровень БД)                                                                                                       | `disk` §22–§23                         | `src/storage`                                                  | 🟢 Windows-first frame-WAL/checkpoint/recovery                  |
-| Snapshot / store, сегментная ротация                                                                                                 | `disk` §7                              | `src/storage/store`, `src/storage/wal`                         | 🟢 Windows-first                                                |
-| Sync Direct I/O, BufferPool и optional NativeAsync                                                                                   | `disk` §2                              | `src/storage`                                                  | 🟡 Windows functional + IoRing; sync perf gate и Linux открыты  |
-| Подграфы (`SubGraph`, `TreeSubGraph`, `DagSubGraph`, …)                                                                              | `gql_spec` §16                         | `src/graph/subgraph.rs`, graph-family modules                  | 🟢 Rust SDK / 🟡 полный GrynQL surface                          |
-| Алгоритмы traversal (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA/MST/cuts)                                                                 | `gql_spec` §13.4                       | `src/graph/traversal`                                          | 🟢 Rust SDK / 🔴 Traversal VM                                   |
-| Лексер / парсер (reblessive, `TokenBuffer<4>`)                                                                                       | `gql_grammar`                          | `src/syn` (`lexer/`, `parser.rs`, `ast/`, `stmt/`)             | 🟡 read-only срез                                               |
-| AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/syn/ast/`; публичный вход `gql::parse`                    | 🟡 read-only срез                                               |
-| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/datastore` → `src/gql/execution`                          | 🟢 read-only `SELECT`/`LET`/`RETURN`                            |
-| Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql` (будущий вертикальный этап)                          | 🔴 новое                                                        |
-| `PageManager` / disk-страницы                                                                                                        | `gql_tech` §10; формат — `disk` §9–§21 | `src/storage`                                                  | 🟢 Windows manager/codecs/lazy graph adapter                    |
-| `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`      | 🟢 идентификаторы и primary lookup первого среза                |
-| `SchemaCatalog`                                                                                                                      | `disk` §18                             | `src/storage/catalog/`; полный DDL — будущий `src/schema`      | 🟡 durable tables/fields первого среза                          |
-| `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats`, `src/storage/graph_pages`                         | 🟢 exact counters, bulk histograms и durable reopen             |
-| Индексы (Label/BTree/Count/Fulltext/HNSW/DiskANN/R-tree/…)                                                                           | `disk` §20                             | `src/storage/graph_index/`; advanced — будущий `src/index`     | 🟡 primary/scalar B+tree; DiskANN physical contract отсутствует |
-| Changefeed / Live                                                                                                                    | `gql_spec` §21, `disk` §21             | `src/changefeed` (нов.)                                        | 🔴 новое                                                        |
-| Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql` (`analysis.rs`, `ir.rs`, `execution.rs`)             | 🟡 read-only срез; optimizer/traversal впереди                  |
+| Область                                                                                                                              | Контракт (спека)                       | Модуль                                                     | Статус                                                          |
+|--------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------|------------------------------------------------------------|-----------------------------------------------------------------|
+| Модель данных `G = ⟨V, MV, E, ME⟩`                                                                                                   | `gql_spec` §3                          | `src/graph`                                                | 🟢 production foundation                                        |
+| `AtomId` (генерационный, kind-бит, u64)                                                                                              | `disk` §9                              | `src/graph/id.rs`, `src/storage`                           | 🟢 (`gen(23) \| kind(1) \| slot(40)`)                           |
+| Значения (`Value`, runtime/storage/columnar)                                                                                         | `gql_spec` §5–§6; `disk` §5            | `src/values` (`runtime`, `storage`, `columnar`)            | 🟡 активный, этап спецификаций завершён                         |
+| Диагностика (`StatusDefinition + Status + DiagnosticRecord → StatusObject → FerrosGrynnError`)                                       | —                                      | `src/gql_status`                                           | 🟢                                                              |
+| Изоляция Serializable по умолчанию, SI/RC — opt-in                                                                                   | `gql_spec` §17.1                       | `src/datastore`                                            | 🟢 Rust API режима 1 / 🔴 синтаксис `BEGIN`                     |
+| MVCC, COW-снимки, atom-level FCW и точные predicate reads                                                                            | `gql_spec` §17                         | `src/datastore`, `src/collections/cow_vec.rs`, `src/graph` | 🟢 RAM и Windows local                                          |
+| Журнал (frame-WAL, уровень БД)                                                                                                       | `disk` §22–§23                         | `src/storage`                                              | 🟢 Windows-first frame-WAL/checkpoint/recovery                  |
+| Snapshot / store, сегментная ротация                                                                                                 | `disk` §7                              | `src/storage/store`, `src/storage/wal`                     | 🟢 Windows-first                                                |
+| Sync Direct I/O, BufferPool и optional NativeAsync                                                                                   | `disk` §2                              | `src/storage`                                              | 🟡 Windows functional + IoRing; sync perf gate и Linux открыты  |
+| Подграфы (`SubGraph`, `TreeSubGraph`, `DagSubGraph`, …)                                                                              | `gql_spec` §16                         | `src/graph/subgraph.rs`, graph-family modules              | 🟢 Rust SDK / 🟡 полный GrynQL surface                          |
+| Алгоритмы traversal (BFS/DFS/Dijkstra/Bellman-Ford/SCC/LCA/MST/cuts)                                                                 | `gql_spec` §13.4                       | `src/graph/traversal`                                      | 🟢 Rust SDK / 🔴 Traversal VM                                   |
+| Лексер / парсер (reblessive, `TokenBuffer<4>`)                                                                                       | `gql_grammar`                          | `src/syn` (`lexer/`, `parser.rs`, `ast/`, `stmt/`)         | 🟡 read-only срез                                               |
+| AST / `Expr`                                                                                                                         | `gql_spec` §26                         | `src/syn/ast/`; публичный вход `gql::parse`                | 🟡 read-only срез                                               |
+| `Datastore::execute → Vec<QueryResult>`                                                                                              | `gql_tech` §2                          | `src/datastore` → `src/gql/execution`                      | 🟢 read-only `SELECT`/`LET`/`RETURN`                            |
+| Traversal VM (`TraversalMachine`, `Traverser`, `TraversalContext`)                                                                   | `gql_tech` §8                          | `src/gql` (будущий вертикальный этап)                      | 🔴 новое                                                        |
+| `PageManager` / disk-страницы                                                                                                        | `gql_tech` §10; формат — `disk` §9–§21 | `src/storage`                                              | 🟢 Windows manager/codecs/lazy graph adapter                    |
+| `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`  | 🟢 идентификаторы и primary lookup первого среза                |
+| `SchemaCatalog` / target `ClassCatalog`                                                                                              | `disk` §18                             | `src/storage/catalog/`; полный DDL — будущий `src/schema`  | 🟡 durable TABLE state реализован, CLASS cutover A5–A16 открыт  |
+| `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats`, `src/storage/graph_pages`                     | 🟢 exact counters, bulk histograms и durable reopen             |
+| Индексы (Label/BTree/Count/Fulltext/HNSW/DiskANN/R-tree/…)                                                                           | `disk` §20                             | `src/storage/graph_index/`; advanced — будущий `src/index` | 🟡 primary/scalar B+tree; DiskANN physical contract отсутствует |
+| Changefeed / Live                                                                                                                    | `gql_spec` §21, `disk` §21             | `src/changefeed` (нов.)                                    | 🔴 новое                                                        |
+| Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql` (`analysis.rs`, `ir.rs`, `execution.rs`)         | 🟡 read-only срез; optimizer/traversal впереди                  |
 
 ### 1.2. Требует согласования / открытые вопросы
 
 Из `gql_spec.md` §31.2.
 
-| Вопрос               | Описание                                                                                                                                                        |
-|----------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Формат хранилища     | Ранние документы описывали LSM (L0/L1/compaction). Действует WAL + snapshot без LSM; GQL-спека внутреннее хранилище не регламентирует — противоречие устранено. |
-| WAL recovery         | Ранний документ описывал ARIES 3-phase. Действует **frame-WAL** с single-pass REDO по LSN; ARIES/UNDO не нужен (см. таблицу решений).                           |
-| `PropertyMap`        | Решено по benchmark evidence: отдельный от `Object` pointer-sized sorted `ThinVec` по `PropertyKeyId`; Arrow используется только в `PropertyBatch`.             |
-| `GraphId` / `AtomId` | Внутренние идентификаторы не экспонируются в GrynQL; публичная форма — `table:id` (`RecordId`).                                                                 |
-| Гиперрёбра           | Попарная traversal-семантика и ортогональные `ATOM HYPER` согласованы; прототипные поля endpoint'ов требуют миграции на `source`/`target`.                      |
-| Метаатомы в GQL      | `MetaGraph.promote_to_meta()` реализован; GrynQL-синтаксис (`graph::inner`/`graph::nodes`) требует реализации функций.                                          |
-| ECS-компоненты       | `src/ecs` — AtomId-keyed runtime/ML sidecar; `GraphWorkspace` доступен Rust SDK, но не является `Value` и не экспонирует произвольные компоненты в GrynQL.      |
+| Вопрос           | Описание                                                                                                                                                        |
+|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Формат хранилища | Ранние документы описывали LSM (L0/L1/compaction). Действует WAL + snapshot без LSM; GQL-спека внутреннее хранилище не регламентирует — противоречие устранено. |
+| WAL recovery     | Ранний документ описывал ARIES 3-phase. Действует **frame-WAL** с single-pass REDO по LSN; ARIES/UNDO не нужен (см. таблицу решений).                           |
+| `PropertyMap`    | Решено по benchmark evidence: отдельный от `Object` pointer-sized sorted `ThinVec` по `PropertyKeyId`; Arrow используется только в `PropertyBatch`.             |
+| Identity         | `RecordId = class:id` — database-local global atom identity; `GlobalAtomId` и graph-local `AtomId` типово разделены; `GraphRef` использует ненулевой `GraphId`. |
+| Гиперрёбра       | Попарная traversal-семантика и ортогональные `ATOM HYPER` согласованы; прототипные поля endpoint'ов требуют миграции на `source`/`target`.                      |
+| Метаатомы в GQL  | `MetaGraph.promote_to_meta()` реализован; GrynQL-синтаксис (`graph::inner`/`graph::nodes`) требует реализации функций.                                          |
+| ECS-компоненты   | `src/ecs` — AtomId-keyed runtime/ML sidecar; `GraphWorkspace` доступен Rust SDK, но не является `Value` и не экспонирует произвольные компоненты в GrynQL.      |
 
 ---
 
@@ -207,12 +229,12 @@ src/
       field.rs
       graph.rs
       index.rs
-      table.rs
+      table.rs             -- текущий historical module; A5 заменяет его class.rs
     transaction/
       mod.rs                -- Transaction lifecycle
       conflict.rs           -- FCW, predicate/read conflict validation
       graph_view.rs         -- transaction-bound GraphRead
-      mutation.rs           -- table/graph mutations
+      mutation.rs           -- atom/graph mutations после A6–A13
       query.rs              -- snapshot query adapter
     tests.rs
 
@@ -388,6 +410,7 @@ pub enum Value {
     Uuid(Uuid),
     Ulid(Ulid),
     Record(RecordId),
+    GraphRef(GraphRef),
     Array(Array),
     Set(Set),
     Object(Object),
@@ -406,22 +429,24 @@ pub enum Value {
 Mutable/live/snapshot-bound graph objects не помещаются в `Value`. Storage conversion
 отклоняет runtime-only значения структурированной диагностикой.
 
-### 3.2. Идентификаторы — `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`
+### 3.2. Идентификаторы — global atom и graph occurrence
 
-Три уровня (`disk_storage_spec.md` §4, §9):
+Уровни (`disk_storage_spec.md` §4, §9):
 
-- **`RecordId`** (`table:id`) — публичный, единственный видимый в GrynQL; хранится как свойство `id`.
-  Отдельный публичный тип в `src/values/runtime/record_id.rs`.
-- **`DiskAtomRef`** (`u64`: бит 40 = kind, биты 39..0 = slot) — стабильный дисковый id без
-  generation. 🔄 newtype в `src/storage/mod.rs` (ранее планировался `u32`).
-- **`AtomId`** (`u64`: slot + generation) — внутренний in-memory handle; **никогда** не
-  экспонируется в GrynQL. `AtomId` и `GraphId` остаются внутренними.
-- **`QualifiedAtomRef { sg_slot: u32, local_ref: DiskAtomRef }`** — кросс-уровневый адрес
-  (`disk_storage_spec.md` §3.9); payload занимает 12 байт, Rust-структура с выравниванием — 16.
+- **`RecordId`** (`class:id`) — публичная database-local identity глобального атома;
+  первая часть выбирает `CLASS`, вторая уникальна внутри class.
+- **`GlobalAtomId`** — внутренний generation-aware handle в AtomStore; глобальный primary
+  выполняет `RecordId → GlobalAtomId`.
+- **`DiskAtomRef`/`AtomId`** — физическая и runtime identity одного graph-local occurrence;
+  они не являются identity глобального атома и не выходят в GrynQL.
+- **`QualifiedAtomRef`** — ссылка на occurrence в конкретном graph/subgraph scope; base
+  reference использует `AtomRef { kind, RecordId }`.
+- **`GraphRef`** — отдельная каталожная ссылка по ненулевому `GraphId`; она не
+  кодируется как `RecordId`.
 
-Разрешение при выполнении: `RecordId --(pk B+tree)--> DiskAtomRef --(hot slot → gen)--> AtomId`;
-`from_disk_ref(r, gen)` восстанавливает `AtomId`. Материализация результата делает обратный
-маппинг.
+Разрешение base read: `RecordId --(global primary)--> GlobalAtomId --(AtomStore slot)--> base atom`.
+Для graph scope добавляется `GlobalAtomId --(membership index)--> DiskAtomRef/AtomId`, после чего
+накладываются graph-local topology, label и sparse overlay.
 
 ### 3.3. `SyncPageManager` — страничный доступ (frame-WAL) (🟢 P2, Windows-first)
 
@@ -457,8 +482,8 @@ catalog, atom-slot alloc/free и `CheckpointMode::Restart` подключены 
 
 `PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
 (seed `0`, checksum-поле обнулено при вычислении).
-`PageKey = (GraphId, DataFileId, PageNo)`; `graph_id = 0` — системное пространство (каталог схемы
-и графов). Версия фрейма доступна только при `commit_lsn ≤ tx.snapshot.visible_lsn`; `commit_ts`
+Target A8 использует `PageKey = (DataSpaceId, DataFileId, PageNo)`, где `DataSpaceId::Database = 0`,
+а `DataSpaceId::Graph(GraphId) > 0`; нулевого `GraphId` и system graph нет. Версия фрейма доступна только при `commit_lsn ≤ tx.snapshot.visible_lsn`; `commit_ts`
 используется отдельно для MVCC/SSI. Checkpoint не продвигает `.fgb` дальше самого старого живого
 reader watermark. При рассинхроне страница восстанавливается применением фрейма из журнала.
 
@@ -709,7 +734,7 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
 `start_ts`, публикует незакоммиченные записи и имеет окно между validation и publication.
 
 - **`Datastore` режима 1** 🟢 — единый immutable root базы, глобальные `commit_ts`, одна короткая
-  commit-секция и приватный write-set. Изменения нескольких графов, таблиц и каталога публикуются
+  commit-секция и приватный write-set. В target A6 изменения AtomStore, нескольких графов, classes и каталога публикуются
   одной заменой root; поздний commit не виден более старому snapshot.
 - **COW-снимки** 🟢 — `CowVec` делит chunks колонок, allocator и adjacency; immutable snapshot не
   клонирует всю SoA. Atom-version index также chunked и различает поколения переиспользованного
@@ -746,23 +771,22 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
 
 ### Область E. Схема и каталог — P3
 
-- **In-memory `TableSchema`** 🟢 — имя таблицы, `GraphRef`, `TableKind`, упорядоченные typed-поля и
-  validated standard/unique scalar indexes;
-  `id: record` неявно добавляется query adapter, а scan режима 1 временно использует совпадающую
-  часть `RecordId.table` как proxy признака принадлежности таблице; отдельный membership
-  component/primary index относится к полному `src/schema/`. Имена полей заранее интернируются
-  append-only методом `Datastore::intern_property`, поэтому конкурентный commit не может переназначить
-  `PropertyKeyId`; schema и graph catalog коммитятся атомарно. Удалить graph, пока на него
-  ссылается таблица, нельзя без удаления этой таблицы в той же транзакции.
-- **Полный `src/schema/`** 🔴 — `SchemaCatalog`; `TableDefinition`, `FieldDefinition`, `IndexDefinition`,
-  `EventDefinition`, `FunctionDefinition`, `AnalyzerDefinition`, `ParamDefinition`
-  (`disk_storage_spec.md` §18). Хранится в системном пространстве (`graph_id = 0`).
+- **Текущий TABLE catalog** 🟡 — реализован и сохраняется как migration oracle до A16,
+  но его `TableSchema`, `GraphRef` ownership и `AtomTableMemberships` superseded.
+- **Target `ClassCatalog`** 🔴 — `ClassSchema` хранит stable `ClassId`, immutable имя и
+  `AtomKind::{Node, Edge}`, schema mode, fields и indexes с явным `Base` или
+  `Effective { graph: GraphId }` scope. `RecordId.class` сам задаёт class identity;
+  отдельного data membership в schema catalog нет.
+- `ClassCatalog`, property dictionary, AtomStore и graph catalog публикуются атомарно одним
+  database WAL. `REMOVE CLASS` использует `RESTRICT` и требует отсутствия атомов и
+  зависимостей; удаление graph не удаляет class или global atoms.
 
 ### Область F. Статистика — P3/P4
 
 Без статистики графовый планировщик не работает — обязательна для MVP.
 
-- **`src/stats/`** 🟢 — MVCC `StatisticsStore`: точные graph/table/label counts и degree totals,
+- **`src/stats/`** 🟢 — MVCC `StatisticsStore`: точные graph/class/label counts и degree totals;
+  A10 разделяет base class и effective graph scopes,
   `PropertyHistogramPage`/`DegreeHistogramPage` с equi-depth buckets, exact NDV/null fractions при
   full scan и per-transaction point delta со stale markers. Public `ANALYZE`, sampling/HLL и
   bounded-memory сбор остаются будущему optimizer/import surface.
@@ -778,7 +802,7 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
   generation. Внешняя сортировка +
   bottom-up packer + side-file / одна WAL-запись / смена поколения + import-эпоха
   (`BEGIN IMPORT`). Планировщик обязан задействовать bulk-путь автоматически при `DEFINE INDEX` на
-  непустой таблице, `REBUILD INDEX`, `COMPACT INDEX`; `CONCURRENTLY` — поверх (снимок → side-file →
+  непустом class/base или effective graph scope, `REBUILD INDEX`, `COMPACT INDEX`; `CONCURRENTLY` — поверх (снимок → side-file →
   добор небольшой очереди → атомарная подмена). `DEFER` — **не** замена bulk: переносит ту же
   построчную работу в фон (проблема латентности → проблема очереди), несовместим с `UNIQUE`.
 - **`FulltextIndex`** (BM25, inverted + posting lists) — P4.
@@ -795,7 +819,7 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
   postfix/cast и record target. AST владеет строками и `TextSpan`, но не source/runtime values.
   Известные неподдержанные statements возвращают `QueryFeatureNotSupported`; следующие семьи
   добавляются только вместе с analysis/IR/execution-потребителем.
-- **Проверки** 🟢 — Unicode byte spans, greedy operators, gap-sensitive `table:id`, приоритеты,
+- **Проверки** 🟢 — Unicode byte spans, greedy operators, gap-sensitive `class:id`, приоритеты,
   незакрытый delimiter с related location, лимит глубины и proptest `parser never panics`.
 
 ### Область I. Семантический анализ (binding / typing / lowering) — P2
@@ -883,28 +907,28 @@ qualified overflow. Таблица ниже теперь относится к �
 
 Расширяет таблицу `disk_storage_spec.md` §30.8 работами query-слоя (`gql_tech_spec.md`).
 
-| Приоритет            | Область | Компоненты                               | Что делать                                                          |
-|----------------------|---------|------------------------------------------|---------------------------------------------------------------------|
-| **P1** (блокирующий) | A       | `src/values/runtime`                     | ✅ Runtime-фундамент, `ValueKind`, scalars и collections            |
-| **P1**               | A       | `src/values/storage`                     | ✅ `StorageValue`, `TypeTag`, canonical codec и decode limits       |
-| **P1**               | A       | `src/values/runtime/record_id.rs`        | ✅ `RecordId`, `RecordIdPart`                                       |
-| **P2**               | A       | `src/values/columnar`                    | ✅ `PropertyBatch`, Arrow/presence и DataFusion adapter             |
-| **P2**               | A       | `src/graph`                              | Graph family/type-state, Path и query return contracts              |
-| **P2**               | A       | `src/ecs`                                | ✅ ECS foundation; далее revision-bound `GraphWorkspace`            |
-| **P2** (высокий)     | B       | `src/storage/`                           | Sync Direct I/O → BufferPool gate → `PageManager` → vertical slice  |
-| **P2**               | C       | frame-WAL                                | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
-| **P2**               | H, I, K | `src/syn`, analysis, IR, sync pull       | ✅ read-only `LET`/`RETURN`/`SELECT` и GrynQL MATCH P0–P2           |
-| **P3** (средний)     | E       | `src/schema/`                            | `SchemaCatalog`                                                     |
-| **P3**               | G       | `src/index/`                             | `LabelIndex`, `BTreeIndex`, `CountIndex`, bulk-сборка               |
-| **P3**               | J, K, L | optimizer, storage adapter, Traversal VM | `Datastore::execute` поверх утверждённого `PageManager`             |
-| **P4** (нормальный)  | F       | `src/stats/`                             | ✅ `StatisticsStore`, exact bulk + transactional counters           |
-| **P4**               | G       | `src/index/fulltext.rs`                  | `FulltextIndex` (BM25)                                              |
-| **P4**               | N       | `src/graph`, `src/index`                 | Derived incidence indexes и аналитические представления             |
-| **P5** (низкий)      | G       | `src/index/hnsw.rs`, `rtree.rs`          | `HnswIndex`, `RtreeIndex`                                           |
-| **P5**               | M       | `src/changefeed/`                        | `ChangefeedStore`, `LiveQueryRegistry`                              |
-| **P5**               | 3.5     | `matrix.rs`                              | `EndpointTensor`                                                    |
-| **P2–P3**            | B, L    | `store.rs`, storage adapter              | Минимальный `open_disk_graph` и disk-backed vertical slice          |
-| **MVP+**             | O       | bridges                                  | `Bridge` trait, `SurrealBridge`                                     |
+| Приоритет                | Область | Компоненты                               | Что делать                                                          |
+|--------------------------|---------|------------------------------------------|---------------------------------------------------------------------|
+| **P1** (блокирующий)     | A       | `src/values/runtime`                     | ✅ Runtime-фундамент, `ValueKind`, scalars и collections            |
+| **P1**                   | A       | `src/values/storage`                     | ✅ `StorageValue`, `TypeTag`, canonical codec и decode limits       |
+| **P1**                   | A       | `src/values/runtime/record_id.rs`        | ✅ `RecordId`, `RecordIdPart`                                       |
+| **P2**                   | A       | `src/values/columnar`                    | ✅ `PropertyBatch`, Arrow/presence и DataFusion adapter             |
+| **P2**                   | A       | `src/graph`                              | Graph family/type-state, Path и query return contracts              |
+| **P2**                   | A       | `src/ecs`                                | ✅ ECS foundation; далее revision-bound `GraphWorkspace`            |
+| **P2** (высокий)         | B       | `src/storage/`                           | Sync Direct I/O → BufferPool gate → `PageManager` → vertical slice  |
+| **P2**                   | C       | frame-WAL                                | `WalKind` frame-модели (§22.1), индекс версий, checkpoint, recovery |
+| **P2**                   | H, I, K | `src/syn`, analysis, IR, sync pull       | ✅ read-only `LET`/`RETURN`/`SELECT` и GrynQL MATCH P0–P2           |
+| **P3** (блокирующий 8.1) | E       | `src/schema/`, `src/datastore`           | A5–A7: `ClassCatalog`, global AtomStore и conflict keys             |
+| **P3**                   | G       | `src/index/`                             | `LabelIndex`, `BTreeIndex`, `CountIndex`, bulk-сборка               |
+| **P3**                   | J, K, L | optimizer, storage adapter, Traversal VM | `Datastore::execute` поверх утверждённого `PageManager`             |
+| **P4** (нормальный)      | F       | `src/stats/`                             | ✅ `StatisticsStore`, exact bulk + transactional counters           |
+| **P4**                   | G       | `src/index/fulltext.rs`                  | `FulltextIndex` (BM25)                                              |
+| **P4**                   | N       | `src/graph`, `src/index`                 | Derived incidence indexes и аналитические представления             |
+| **P5** (низкий)          | G       | `src/index/hnsw.rs`, `rtree.rs`          | `HnswIndex`, `RtreeIndex`                                           |
+| **P5**                   | M       | `src/changefeed/`                        | `ChangefeedStore`, `LiveQueryRegistry`                              |
+| **P5**                   | 3.5     | `matrix.rs`                              | `EndpointTensor`                                                    |
+| **P2–P3**                | B, L    | `store.rs`, storage adapter              | Минимальный `open_disk_graph` и disk-backed vertical slice          |
+| **MVP+**                 | O       | bridges                                  | `Bridge` trait, `SurrealBridge`                                     |
 
 **Фазы (укрупнённо):**
 
@@ -937,6 +961,9 @@ qualified overflow. Таблица ниже теперь относится к �
   отдельный gate Unix-выпуска, не Windows freeze.
 - **Фаза 5b — полная схема/статистика/optimizer indexes** (P3–P4): ✅ E и F; оставшаяся G
   (Label/Count, external bulk и cost-based planner).
+- **Коррекция 8.1 — graph-first AtomStore/occurrences**: 🟡 A0–A4 завершены
+  2026-09-10; A5–A16 — следующая блокирующая фаза. Исторические E/G и TABLE-срезы
+  остаются evidence, но не target design.
 - **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, затем отдельно утверждённый
   DiskANN, R-tree, derived incidence indexes и M (changefeed/live).
 - **Фаза 7 — optional Native Async I/O и мосты**: ✅ Windows IoRing через единый внутренний

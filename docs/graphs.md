@@ -3,7 +3,8 @@
 Этот документ фиксирует graph family Ferros-Grynn, их структурные инварианты и допустимые
 преобразования. Языковой контракт операторов находится в
 [gql_spec.md](gql_spec.md) §3.9, §15–§17; способы хранения и materialization — в
-[gql_tech_spec.md](gql_tech_spec.md) §10–§11.
+[gql_tech_spec.md](gql_tech_spec.md) §10–§11. Модель identity, membership и graph-local
+инстансинга утверждена этапом 8.1 в [rework_plan.md](rework_plan.md).
 
 ## 1. Базовая модель
 
@@ -25,6 +26,34 @@ G = ⟨V, MV, E, ME⟩
 hyper-, meta- и cross-level topology. Цена универсальности — отсутствие части
 специализированных инвариантов и layout-оптимизаций.
 
+### 1.1. Глобальный атом и graph occurrence
+
+Атом является сущностью базы данных, а не собственностью одного графа. Его стабильная публичная
+identity — `RecordId = class:id`; `CLASS` фиксирует единственный kind `NODE` или `EDGE` и схему
+base properties. Один атом может не входить ни в один граф либо одновременно иметь occurrences
+в нескольких графах. Базовые свойства при этом хранятся один раз.
+
+Graph occurrence — независимое graph-local состояние глобального атома:
+
+- membership и локальный `AtomId`;
+- необязательная label, не меняющая `CLASS`;
+- для edge — endpoint topology, orientation, weight и transition graph;
+- sparse property overlay.
+
+Поэтому один глобальный edge может соединять разные endpoint'ы в разных графах. Это две
+occurrences одной relation entity, а не две identity. Structural invariant проверяется для
+каждого графа по его occurrences; наличие глобального edge само по себе не создаёт incidence.
+
+Эффективные свойства occurrence вычисляются как `overlay value -> value`, `Hidden -> field
+absent`, `overlay absent -> base value`. Внутренний `Hidden` не равен пользовательским `none` или
+`null`; `RESET` удаляет override и восстанавливает наследование текущего base value. Ссылка на
+атом не создаёт membership: в graph scope member читается как effective view, non-member — как
+base view.
+
+`GraphRef` является отдельной ссылкой каталога (`GraphId`, имя, family и storage mode) и не
+кодируется фиктивным `RecordId`. `GraphId` всегда ненулевой; database-level данные не образуют
+«системный граф».
+
 ## 2. Graph family
 
 | Family       | Допустимая topology                         | Обязательный инвариант                  |
@@ -45,8 +74,10 @@ hyperedge, meta-атома, edge-to-edge endpoint или cross-level incidence �
 runtime family. Они могут применяться к совместимой family без обещания отдельного физического
 layout.
 
-`Subgraph` — не ещё одна storage family, а самодостаточный materialized result выбранных атомов
-и incidence. Constraint `RETURN GRAPH <T>` валидирует `Subgraph` и строит точный `T`.
+`Subgraph` — не ещё одна storage family, а самодостаточный materialized effective result
+выбранных occurrences и incidence. Constraint `RETURN GRAPH <T>` валидирует `Subgraph` и строит
+точный `T`; materialization копирует необходимые base/overlay properties и не удерживает
+membership или snapshot исходной базы.
 
 ## 3. Ориентация деревьев
 
@@ -112,9 +143,13 @@ T<Frozen>  --thaw----> T<Mutable>
 ## 6. Режимы доступа
 
 - Full in-memory — owned `T<Mutable/Frozen>` с COW MVCC; текущий RAM-backend не включает WAL и
-  не обещает durability после завершения процесса.
+  не обещает durability после завершения процесса. Встроенный datastore при этом использует
+  нормализованный database root: глобальные атомы отдельно от graph occurrences; standalone SDK
+  graph остаётся owning materialization.
 - Disk-backed — `GraphRef` и transaction-bound `GraphReadView<'tx>`; это не materialized graph.
-- Hybrid — `query_to_memory::<T, State>` строит owned family и освобождает source snapshot.
+- Hybrid — `query_to_memory::<T, State>` строит owned effective family и освобождает source
+  snapshot. Mutable flush может изменять только graph-local topology/overlay и никогда не
+  превращается в неявный base update.
 
 `SnapshotId` идентифицирует версию, но не владеет graph data. Отдельный публичный
 `GraphSnapshot` не вводится.

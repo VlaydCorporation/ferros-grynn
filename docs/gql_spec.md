@@ -1,6 +1,6 @@
 # Ferros-Grynn GQL — Спецификация языка запросов
 
-**Версия:** 0.2-draft  
+**Версия:** 0.3-draft
 **Статус:** проектирование
 **Нормативная область:** семантика языка, типы, транзакционное поведение и наблюдаемые
 результаты. Точный принимаемый синтаксис задаёт [gql_grammar.md](gql_grammar.md), physical
@@ -51,6 +51,186 @@ RETURN expression [AS alias] [, expression [AS alias] ...]
 `RETURN DISTINCT`, `HYPER`/`META`/`WITHIN`, cross-level matching, inline property
 objects, неограниченные и shortest/weighted paths, DDL/DML, Traversal VM и graph-return.
 Их описание ниже остаётся проектом полного языка, а не обещанием текущего runtime.
+
+## Утверждённая коррекция модели данных — этап 8.1
+
+**Статус профиля:** `approved-for-implementation`, реализация в текущем коде отсутствует.
+Документационные шаги A0–A4 завершены 2026-09-10; кодовые A5–A16 не начаты.
+До production cutover продолжает работать исторический TABLE-layout этапов 5–9; он является
+evidence текущего состояния, но больше не является целевой семантикой. При конфликте этого
+раздела с последующими draft-примерами правила этапа 8.1 имеют приоритет. Ключевое слово
+`TABLE` и compatibility aliases после cutover не принимаются. Точный синтаксис профиля задаёт
+[gql_grammar.md](gql_grammar.md) «Грамматика коррекции 8.1», физическую модель —
+[disk_storage_spec.md](disk_storage_spec.md) «Целевая ревизия этапа 8.1».
+
+### Модель identity и владения
+
+```text
+Database
+├── ClassCatalog
+│   └── CLASS: namespace RecordId + NODE/EDGE kind + schema + base indexes
+├── AtomStore
+│   └── RecordId -> global atom kind + base properties
+└── GraphCatalog
+    └── Graph
+        ├── memberships: global atom -> graph-local AtomId
+        ├── optional labels
+        ├── edge topology / weight / nested-graph bindings
+        └── sparse property overlays
+```
+
+Нормативные правила:
+
+1. `RecordId = class:id` идентифицирует ровно один глобальный атом в пределах базы данных.
+   Имя `CLASS` является первой, классовой частью identity, а `id` уникален внутри этого class.
+2. `CLASS` является одновременно namespace идентификаторов, schema-контрактом и источником
+   прямого scan. Каждый class неизменно имеет kind `NODE` либо `EDGE`; `ANY`, inheritance и
+   multi-class atoms отсутствуют.
+3. Каждый record class является атомом. Property-record — обычный `NODE` atom, который может не
+   иметь ни одного graph membership. Отдельного SQL-like table storage не существует.
+4. Base properties принадлежат глобальному атому. Один атом может иметь ноль, один или несколько
+   graph memberships без копирования base properties.
+5. Graph membership создаёт graph-local occurrence. Она содержит локальный `AtomId`, optional
+   label, sparse overlay и, для edge, topology, weight и nested/transition binding. Один global
+   edge может иметь разные occurrences в разных графах.
+6. Class и label независимы: class стабилен и задаёт identity/kind/schema; optional label задаёт
+   роль occurrence только в одном графе. В одной occurrence допускается не более одной label.
+7. `GraphRef` — самостоятельная каталожная ссылка по ненулевому `GraphId`, имени, `GraphKind` и
+   storage mode. Фиктивный `graph:<name>` `RecordId` не создаётся.
+8. `RecordId` database-local. Cross-database qualification определяется будущим Bridge-профилем
+   и не меняет identity внутри одной БД.
+
+### Base и effective properties
+
+Эффективное значение свойства в graph scope определяется строго:
+
+| Состояние overlay   | Наблюдаемое значение  |
+|---------------------|-----------------------|
+| конкретное `Value`  | graph-local override  |
+| внутренний `Hidden` | поле отсутствует      |
+| записи нет          | актуальное base value |
+
+`Hidden` не является пользовательским `NONE` или `NULL`. `UNSET field` в graph scope записывает
+`Hidden`; `RESET field` удаляет запись overlay и снова включает наследование base value.
+Unscoped `UPDATE` изменяет base atom и потому наблюдаем всеми memberships, кроме полей с override
+или `Hidden`. Изменение обязано либо пройти полный preflight всех затронутых effective Unique
+indexes и resource limits, либо завершиться до первой видимой мутации; частичный commit запрещён.
+
+Record reference не создаёт membership. При разыменовании в graph scope member возвращает
+effective view, а atom без membership — base view. Ссылка за пределами graph scope всегда
+возвращает base view.
+
+### DDL
+
+```gql
+DEFINE CLASS person TYPE NODE SCHEMAFULL;
+DEFINE CLASS friendship TYPE EDGE SCHEMALESS;
+DEFINE FIELD email ON CLASS person TYPE string;
+
+DEFINE INDEX by_email ON CLASS person
+  FIELDS email UNIQUE SCOPE BASE;
+
+DEFINE INDEX by_email_social ON CLASS person
+  FIELDS email UNIQUE SCOPE EFFECTIVE IN GRAPH social;
+```
+
+- `TYPE NODE|EDGE` обязателен и immutable; имя class также immutable.
+- `REMOVE CLASS` разрешён только при отсутствии atoms и schema/index/reference dependencies.
+- Standard, Unique и Count indexes обязаны явно выбирать `SCOPE BASE` либо
+  `SCOPE EFFECTIVE IN GRAPH graph_ref`; implicit scope запрещён.
+- Base index строится над глобальными atoms class. Effective index является полным graph-local
+  индексом только по memberships выбранного графа и их effective values.
+- Primary `RecordId` index принадлежит AtomStore и не объявляется пользователем. Membership,
+  class/label и adjacency indexes принадлежат движку.
+
+### Direct DML и membership
+
+```gql
+CREATE person:alice SET name = "Alice";
+UPDATE person:alice SET name = "Alice Smith";
+
+ATTACH person:alice TO GRAPH social LABEL Employee;
+UPDATE person:alice IN GRAPH social LABEL Moderator SET nickname = "Ali";
+UPDATE person:alice IN GRAPH social LABEL NONE;
+UPDATE person:alice IN GRAPH social UNSET private_note;
+UPDATE person:alice IN GRAPH social RESET private_note;
+
+DETACH person:alice FROM GRAPH social;
+DETACH person:alice FROM GRAPH social CASCADE;
+DELETE person:alice;
+DELETE person:alice CASCADE;
+```
+
+- `CREATE`, unscoped `UPDATE`/`UPSERT`/`DELETE` работают с global base atom.
+- `UPDATE ... IN GRAPH` требует membership и меняет только overlay/label. Graph-scoped
+  `UPSERT` и `DELETE` отсутствуют.
+- `ATTACH` создаёт node occurrence; edge occurrence создаётся только через `RELATE`.
+- `DETACH` по умолчанию использует `RESTRICT` и отклоняется при graph-local incidence.
+  `CASCADE` удаляет затронутые edge occurrences, но не global edge atoms.
+- `DELETE` по умолчанию использует `RESTRICT` при любом membership или reference. `CASCADE`
+  атомарно удаляет memberships, incidences и overlays и применяет объявленные `ON DELETE`
+  policies после bounded preflight.
+- Удаление graph удаляет его occurrences, topology, overlays и effective indexes, но не global
+  atoms.
+
+### RELATE и MATCH
+
+```gql
+RELATE
+  (person:alice)
+  -[friendship AS e LABEL CloseFriend]->
+  (person:bob)
+IN GRAPH social;
+
+RELATE
+  (person:alice)
+  -[friendship:alice_bob AS e LABEL CloseFriend]->
+  (person:bob)
+IN GRAPH social;
+
+MATCH
+  (person AS v1 LABEL Employee)
+  -[friendship AS e LABEL CloseFriend]->
+  (* AS v2 LABEL Moderator)
+IN GRAPH social;
+```
+
+- `[class]` в `RELATE` генерирует новый edge `RecordId`; `[class:id]` создаёт отсутствующий или
+  использует существующий global edge atom соответствующего `EDGE` class.
+- Endpoints и edge автоматически получают membership в выбранном graph, если его ещё нет.
+  Созданный base edge не остаётся после ошибки topology/family validation.
+- `SET`, `CONTENT`, `WEIGHTED` и `LABEL` в `RELATE` всегда graph-local. Повторный `RELATE` одного
+  edge в том же graph является конфликтом; rewire выражается `DETACH` + `RELATE` в одной
+  транзакции.
+- В `MATCH` первая позиция endpoint/edge body — class, exact `RecordId` либо `*`; `AS` вводит
+  alias, а `LABEL` — независимый graph-local predicate. `* AS v LABEL X` является label-only
+  lookup. Class + label выполняются как пересечение либо меньший posting stream с residual check.
+
+### Direct reads и режимы
+
+```gql
+SELECT * FROM person;
+SELECT * FROM person IN GRAPH social;
+SELECT * FROM person:alice;
+SELECT * FROM person:alice IN GRAPH social;
+```
+
+Unscoped source читает AtomStore/base view. `IN GRAPH` требует membership и возвращает effective
+view. Mode 1 использует ту же нормализованную модель database root; Mode 2 читает AtomStore и
+graph occurrences через disk engine; Mode 3 материализует effective graph в самостоятельный
+owned result. Mutable Mode 3 flush может менять graph-local topology/overlay, но никогда не
+выполняет неявный base update.
+
+### Обязательные наблюдаемые сценарии
+
+- Два graph могут разделять один node `RecordId`; base update виден обоим, overlay — только
+  владельцу occurrence, а `RESET` восстанавливает актуальное base value.
+- Один edge `RecordId` может иметь разные topology/weight/label в двух graph.
+- Unattached property-record доступен прямым `SELECT` и через record reference.
+- Class, label и class+label scan дают одинаковый результат с индексом и корректным fallback.
+- `RESTRICT` не оставляет частичной мутации; `CASCADE` либо проходит целиком, либо отклоняется до
+  публикации по resource limit/conflict/reference policy.
+- Один snapshot наблюдает согласованную комбинацию base atom, membership, overlay и topology.
 
 ## Содержание
 
@@ -152,41 +332,45 @@ Ferros-Grynn это не реляционная и не графовая БД в
 
 ### 3.1. Граф
 
-**Граф** — именованная сущность, содержащая набор атомов и набор свойств. 
-Граф идентифицируется именем, которое уникально в пределах базы данных.
+**Граф** — именованный каталожный объект, содержащий graph-local occurrences глобальных атомов,
+их incidence, optional labels, overlays и собственные свойства. Стабильная identity задаётся
+ненулевым `GraphId`; имя уникально в пределах базы и используется для разрешения `GraphRef`.
+Удаление графа не удаляет глобальные атомы.
 
 ### 3.2. Атом
 
-**Атом** — базовая сущность графа. Атомы имеют генерационный идентификатор, метку (label) и набор свойств.
+**Атом** — адресуемая сущность базы данных. Он имеет `RecordId = class:id`, неизменный
+`AtomKind::{Node, Edge}` и base properties. Optional label, topology, weight и overlay принадлежат
+не атому вообще, а его occurrence в конкретном графе.
 
-| Тип атома    | Обозначение   | Описание                                             |
-|--------------|---------------|------------------------------------------------------|
-| `vertex`     | `(n:Label)`   | Вершина — обычный узел графа                         |
-| `edge`       | `[e:Type]`    | Ребро — связь между атомами                          |
-| `metavertex` | `<(n:Label)>` | Мета-вершина — вершина, содержащая вложенный подграф |
-| `metaedge`   | `<[e:Type]>`  | Мета-ребро — ребро с transition-подграфом            |
+| Тип occurrence | Обозначение                             | Описание                                             |
+|----------------|-----------------------------------------|------------------------------------------------------|
+| `vertex`       | `(person AS n LABEL Employee)`          | Node-class atom в роли вершины данного графа         |
+| `edge`         | `[friendship AS e LABEL CloseFriend]`   | Edge-class atom как incidence данного графа          |
+| `metavertex`   | `<(person AS n LABEL Container)>`       | Node occurrence с вложенным подграфом                |
+| `metaedge`     | `<[transition AS e LABEL CrossLevel]>`  | Edge occurrence с transition-подграфом               |
 
 Рёбра могут иметь несколько конечных точек (гиперрёбра). 
 Рёбра и мета-рёбра могут соединять атомы любого типа, в том числе другие рёбра (edge-to-edge).
 
 ### 3.3. Свойства
 
-**Свойство** (Property) — пара ключ–значение, прикреплённая к атому или графу. 
-Ключ — строка; значение — любой тип из системы типов GQL ([§5](#5-система-типов)).
+**Свойство** (Property) — пара ключ–значение в base atom, graph overlay или самом graph. Ключ —
+строка; значение — любой тип из системы типов GQL ([§5](#5-система-типов)). Graph-effective
+чтение применяет override/`Hidden`/inheritance правила утверждённой коррекции 8.1.
 
-### 3.4. Таблица
+### 3.4. Класс
 
-**Таблица** (Table) — логическая коллекция записей. 
-В зависимости от конфигурации таблица представляет: 
-- набор атомов одного типа, 
-- весь граф, 
-- производное представление,
-- таблицу свойств.
+**Класс** (`CLASS`) — namespace первой части `RecordId`, schema-контракт и прямой scan source.
+Каждый class фиксирует kind `NODE` либо `EDGE`; имя и kind immutable. Class не владеет отдельным
+SQL-like хранилищем: записи всех classes находятся в общем AtomStore. Optional graph label не
+меняет class.
 
 ### 3.5. Запись
 
-**Запись** (`record`) — адресуемая единица в таблице. 
-Запись имеет идентификатор вида `table:id` и набор полей.
+**Запись** (`record`) — публично адресуемый глобальный атом. Запись имеет идентификатор вида
+`class:id` и base properties. Любая запись принадлежит ровно одному class, но может иметь ноль
+или несколько graph memberships.
 
 ### 3.6. Путь
 
@@ -196,8 +380,8 @@ Ferros-Grynn это не реляционная и не графовая БД в
 
 ### 3.7. Идентификаторы записей
 
-Запись идентифицируется парой `table:id`, где:
-- `table` — имя таблицы.
+Запись идентифицируется парой `class:id`, где:
+- `class` — имя class и namespace принадлежности;
 - `id` — внешний идентификатор.
 
 Внешний идентификатор может быть записан в виде:
@@ -217,11 +401,13 @@ weather:['London', d'2025-02-14T01:52:50.375Z']
 
 Если `id` часть не указана пользователем, она будет сгенерирована автоматически.
 
-ID хранится в поле `id` записи и автоматически индексируется уникальным B-Tree индексом.
-`id` часть идентификатора не обязана быть уникальной по всей базе данных, но обязана быть уникальной внутри своей `table`.
+ID доступен как системное поле `id` и автоматически входит в единый unique primary B+tree
+AtomStore. `id` часть не обязана быть уникальной по всей базе данных, но обязана быть уникальной
+внутри своего `class`.
 
-Внутренний AtomId (генерационный u64) — implementation detail хранилища.
-Он никогда не экспонируется в GQL.
+Внутренний `GlobalAtomId` адресует atom в database store, а graph-local `AtomId` — его occurrence.
+Оба являются implementation detail, проходят generation check и никогда не экспонируются в
+GrynQL.
 
 #### Random IDs
 
@@ -252,7 +438,7 @@ CREATE `Artykuł`:100;
 Идентификаторы записей могут состоять из массивов и даже объектов. 
 Такой идентификатор записи чаще всего используется, когда есть одно или два поля, 
 которые будут использоваться для поиска записей в диапазоне записей, что значительно повышает производительность. 
-В отличие от использования `WHERE` для фильтрации, которое предполагает сканирование таблицы.
+В отличие от использования `WHERE` для фильтрации, которое предполагает class scan.
 
 Идентификаторы могут хранить массивы значений, в том числе вложенные массивы или объекты. 
 В одном массиве могут храниться значения разных типов.
@@ -265,7 +451,7 @@ CREATE weather:['Лондон', d'2025-02-13T05:00:00Z'];
 
 При выборке данных можно использовать диапазоны записей по `id`.
 Запросы по диапазону идентификаторов записей извлекают записи в естественном порядке сортировки по идентификаторам, 
-что позволяет избежать сканирования таблицы. Это эффективнее, чем фильтрация с помощью `WHERE`.
+что позволяет избежать полного class scan. Это эффективнее, чем фильтрация с помощью `WHERE`.
 
 ```
 -- Выберите все записи о людях с идентификаторами в заданном диапазоне
@@ -332,7 +518,7 @@ LET $_ = SELECT * FROM player WHERE class = 'mage';
 
 Чтобы создать идентификатор из двух значений, можно использовать функция `type::record`.
 Она принимает два аргумента:
-1. строка, именование `table`;
+1. строка с именем `class`;
 2. любой допустимый для `id` тип данных.
 
 ### 3.8. Единая endpoint-инцидентность
@@ -564,7 +750,7 @@ Undirected `TREE → DAG` требует явно выбрать корень и
 
 ### 4.1. Идентификаторы
 
-- Имена таблиц, графов, полей, индексов, функций — идентификаторы: начинаются с буквы, содержат буквы, цифры и `_`.
+- Имена классов, графов, полей, индексов, функций — идентификаторы: начинаются с буквы, содержат буквы, цифры и `_`.
 - Параметры начинаются с `$`: `$name`, `$limit`.
 - Пользовательские функции используют пространство имён `fn::`: `fn::calc_score(...)`.
 - Встроенные функции — пространство имён по категории: `math::`, `string::`, `time::`, `array::`, `geo::`, `search::`, `graph::`, etc.
@@ -714,8 +900,8 @@ FROM person GROUP ALL;
 | `object`                  | Произвольный объект ключ–значение; ключ — строка, значение — `any`, если явно не типизировано |
 | `option<T>`               | `T` или `None`                                                                                |
 | `range<T>`                | Диапазон значений типа T; поддерживает числа и строки в лексикографическом порядке            |
-| `record<T>`               | Ссылка на запись в таблице T                                                                  |
-| `record<T1 \| T2>`        | Ссылка на запись в одной из таблиц                                                            |
+| `record<T>`               | Ссылка на глобальный атом класса T                                                            |
+| `record<T1 \| T2>`        | Ссылка на глобальный атом одного из перечисленных классов                                     |
 | `closure<(T1, ...) -> U>` | Тип функции–замыкания                                                                         |
 | `regex`                   | Регулярное выражение                                                                          |
 | `geometry`                | Геометрический объект (GeoJSON)                                                               |
@@ -866,7 +1052,7 @@ WHILE (regex::next($matcher)) {
 
 Вычисляемые (computed) выражения не хранятся, а вычисляются непосредственно в момент обращения к ним.
 ```
-DEFINE FIELD accessed_at ON TABLE user COMPUTED time::now();
+DEFINE FIELD accessed_at ON CLASS user COMPUTED time::now();
 
 CREATE user:one;
 SELECT * FROM ONLY user:one; // 01:53:04
@@ -1013,7 +1199,7 @@ SELECT * FROM NULL ?: 0 ?: false ?: 10;
 ```text
 none < null < bool < number < string < duration < datetime
      < ulid < uuid < array < set < object < geometry < bytes
-     < table < record < regex < range
+     < record < graph_ref < regex < range
      < atom < path < subgraph < graph < closure
 ```
 
@@ -1256,18 +1442,18 @@ BEGIN IMPORT [ INTO GRAPH @graph ] [ WITH ( @option = @value [, ...] ) ];
 END IMPORT [ WITH VALIDATION ];
 ```
 
-| Опция          | По умолчанию                 | Значение                                                                                                        |
-|----------------|------------------------------|-----------------------------------------------------------------------------------------------------------------|
-| `INDEXES`      | `DEFERRED`                   | `DEFERRED` — индексы отсоединяются и пересобираются в конце; `MAINTAINED` — обычное построчное сопровождение    |
-| `CONSTRAINTS`  | `DEFERRED`                   | `DEFERRED` — инварианты проверяются один раз в конце; `IMMEDIATE` — на каждой мутации                           |
-| `EVENTS`       | `OFF`                        | Выполнять ли `DEFINE EVENT`-триггеры на загружаемых записях                                                     |
-| `CHANGEFEED`   | `OFF`                        | Писать ли changefeed для загружаемых записей                                                                    |
-| `ON VIOLATION` | `ABORT`                      | `ABORT` — прервать импорт; `SKIP` — пропустить нарушающую запись; `QUARANTINE` — отвести в `@<table>__rejected` |
-| `REJECT LIMIT` | `0`                          | Сколько нарушений допустимо до принудительного `ABORT`                                                          |
-| `COMMIT EVERY` | `FG_IMPORT_COMMIT_ROWS`      | Размер сегментного коммита в строках                                                                            |
-| `FILL_FACTOR`  | `FG_INDEX_BTREE_FILL_FACTOR` | Плотность заполнения листьев при пересборке индексов                                                            |
-| `SORT_MEM`     | `FG_BULK_SORT_MEM`           | Бюджет памяти на внешнюю сортировку ключей                                                                      |
-| `PARALLELISM`  | число ядер                   | Параллелизм построения индексов                                                                                 |
+| Опция          | По умолчанию                 | Значение                                                                                                      |
+|----------------|------------------------------|---------------------------------------------------------------------------------------------------------------|
+| `INDEXES`      | `DEFERRED`                   | `DEFERRED` — индексы отсоединяются и пересобираются в конце; `MAINTAINED` — обычное построчное сопровождение  |
+| `CONSTRAINTS`  | `DEFERRED`                   | `DEFERRED` — инварианты проверяются один раз в конце; `IMMEDIATE` — на каждой мутации                         |
+| `EVENTS`       | `OFF`                        | Выполнять ли `DEFINE EVENT`-триггеры на загружаемых записях                                                   |
+| `CHANGEFEED`   | `OFF`                        | Писать ли changefeed для загружаемых записей                                                                  |
+| `ON VIOLATION` | `ABORT`                      | `ABORT` — прервать импорт; `SKIP` — пропустить нарушающий atom; `QUARANTINE` — отвести в `@<class>__rejected` |
+| `REJECT LIMIT` | `0`                          | Сколько нарушений допустимо до принудительного `ABORT`                                                        |
+| `COMMIT EVERY` | `FG_IMPORT_COMMIT_ROWS`      | Размер сегментного коммита в строках                                                                          |
+| `FILL_FACTOR`  | `FG_INDEX_BTREE_FILL_FACTOR` | Плотность заполнения листьев при пересборке индексов                                                          |
+| `SORT_MEM`     | `FG_BULK_SORT_MEM`           | Бюджет памяти на внешнюю сортировку ключей                                                                    |
+| `PARALLELISM`  | число ядер                   | Параллелизм построения индексов                                                                               |
 
 **Зачем отдельный режим.** Построчная вставка сопровождает каждый индекс отдельно: это случайные обращения к B+tree-страницам, кратная запись и объёмный WAL. Bulk-путь вместо этого собирает ключи, сортирует их вне памяти и строит каждый индекс снизу вверх, записывая каждую страницу ровно один раз ([§20.13 disk_storage_spec](disk_storage_spec.md)). Смежность записывается один раз с уже известной финальной степенью, поэтому overflow-цепочки сразу нужного размера и непрерывны.
 
@@ -1303,7 +1489,8 @@ CREATE @target [, @target ...]
 ;
 ```
 
-`target` — имя таблицы, `table:id`, или `table:{ ... }` с параметрами генерации.
+`target` — имя class, `class:id` либо `class:{ ... }` с параметрами генерации. Создаваемый
+record всегда является global base atom; graph membership этой операцией не создаётся.
 
 - `CONTENT` — задаёт запись целиком; `READONLY`-поля игнорируются.
 - `SET` — точечная инициализация отдельных полей.
@@ -1326,12 +1513,15 @@ CREATE person:alice SET name = "Alice", age = 30;
 
 ```    
 UPDATE @target [, @target ...]
+    [ IN GRAPH @graph ]
+    [ LABEL @label | LABEL NONE ]
     [ CONTENT @object
       | MERGE @object
       | PATCH @object
       | REPLACE @object
       | [ SET @field = @value, [, @field = @value ... ] 
-      | UNSET @field [, @field ...] ]
+      | UNSET @field [, @field ...]
+      | RESET @field [, @field ...] ]
     ]
     [ WHERE @condition ]
     [ RETURN NONE | RETURN BEFORE | RETURN AFTER | RETURN DIFF | RETURN @statement_param, ... | RETURN VALUE @statement_param ]
@@ -1349,6 +1539,12 @@ UPDATE @target [, @target ...]
 | `MERGE`         | Поверхностное слияние; изменяет только перечисленные поля  |
 | `PATCH`         | JSON Patch (RFC 6902) или эквивалентная патч-семантика     |
 | `SET` / `UNSET` | Детерминированные точечные изменения                       |
+| `RESET`         | Только в graph scope: удалить override и наследовать base  |
+
+Без `IN GRAPH` изменяется base atom. С `IN GRAPH` существующий membership обязателен;
+изменяются только sparse overlay и/или optional label. В graph scope `UNSET` записывает
+внутренний `Hidden`, а не удаляет base property. `CONTENT`/`REPLACE` применяются к effective
+представлению, но результат сохраняется как минимальный overlay относительно base.
 
 `RETURN`:
 - `NONE` — ничего не возвращать;
@@ -1380,11 +1576,14 @@ UPSERT @target [, @target ...]
 
 Критерий существования — идентификатор записи или условие `WHERE`. 
 Если критерий не задан явно, семантика зависит от физического плана — это запрещено: `WHERE` или явный ID обязательны для `UPSERT`.
+`UPSERT ... IN GRAPH` отсутствует: создание global atom и membership выражается отдельными
+`UPSERT`/`ATTACH` либо `RELATE`.
 
 ### 8.4. DELETE
 
 ```
 DELETE @targets
+    [ CASCADE ]
     [ WHERE @condition ]
     [ RETURN NONE | RETURN BEFORE | RETURN AFTER | RETURN DIFF | RETURN @statement_param, ... ]
     [ EXPECT @condition ]
@@ -1392,10 +1591,14 @@ DELETE @targets
 ;
 ```
 
+Обычный `DELETE` удаляет global base atom и использует `RESTRICT`: наличие membership или
+reference является ошибкой. Явный `CASCADE` удаляет все graph occurrences, incidences и overlays
+и применяет schema `ON DELETE` policies как одну транзакционную мутацию после bounded preflight.
+
 Мягкое удаление (soft delete) реализуется через события:
 
 ```
-DEFINE EVENT archive_person ON TABLE person WHEN $event = "DELETE" THEN {
+DEFINE EVENT archive_person ON CLASS person WHEN $event = "DELETE" THEN {
     CREATE deleted_person SET
         data = $before,
         deleted_at = time::now()
@@ -1406,58 +1609,51 @@ DEFINE EVENT archive_person ON TABLE person WHEN $event = "DELETE" THEN {
 
 ### 8.5. RELATE
 
-Создаёт рёбра между существующими атомами.
+Создаёт graph-local edge occurrence, используя global edge atom:
 
+```gql
+RELATE
+  (person:alice)
+  -[friendship AS e LABEL CloseFriend]->
+  (person:bob)
+IN GRAPH social
+  [ WEIGHTED @value ]
+  [ CONTENT @object | SET @field = @value [, ...] ]
+  [ RETURN NONE | BEFORE | AFTER | DIFF | @field [, ...] | VALUE @field ]
+  [ EXPECT @condition ]
+  [ TIMEOUT duration ];
 ```
-RELATE (
-      @from_vertex [<- | -] @edge_atom [-> | -] @to_vertex
-    | ATOM @from_atom [<~ | ~] @edge_atom [~> | ~] @to_atom
-)
-    [ WEIGHTED @value ]
-    [ CONTENT @object | SET @field = @value [, ...] ]
-    [ RETURN NONE | BEFORE | AFTER | DIFF | @field [, ...] | VALUE @field ]
-    [ EXPECT @condition ]
-    [ TIMEOUT duration ]
-    [ KEEP LEVELPATH [ FOR @aliases_array ] ]
-;
-```
 
-По умолчанию оба endpoint'а бинарного `RELATE` после binding должны быть vertex-атомами.
-`RELATE ATOM` расширяет их домен до любого атома и требует тильда-синтаксис:
-`~[...]~>`, `<~[...]~`, `~[...]~`, `<~[...]~>`. 
-Атомы endpoint записываются как `<(...)>` и `<[...]>` для атомов-вершин и атомов-рёбер соответственно;
-`[...]` всегда обозначает создаваемое связывающее ребро. 
-Несовпадение с фактическим kind является semantic error до мутации.
-`ATOM` не превращает ребро в гиперребро и не снимает проверку endpoint'ов.
+`[friendship]` выбирает `EDGE` class и генерирует новый `RecordId`; форма
+`[friendship:alice_bob]` создаёт отсутствующий или использует существующий global edge atom.
+`AS` вводит alias результата, `LABEL` задаёт optional graph-local label. Endpoint'ы являются
+exact `RecordId` либо ранее связанными atom values. Они и edge автоматически получают membership
+в `social`, если его нет. `CONTENT`, `SET`, `WEIGHTED` и `LABEL` изменяют только эту occurrence.
 
-`MATCH` и `RELATE` используют разные внутренние формы endpoint'а:
+По умолчанию endpoint'ы должны иметь `NODE` kind. `RELATE ATOM` расширяет их домен до любого
+атома и сохраняет тильда-синтаксис `~[...]~>`, `<~[...]~`, `~[...]~`, `<~[...]~>` с явными
+`<(...)>`/`<[...]>`. Несовпадение class kind или graph family является semantic error до
+публикации; созданный этой операцией base edge при ошибке также откатывается.
 
-- в `MATCH ATOM <(alice:Person)>` имя `alice` создаёт alias, а `Person` ограничивает label;
-- в `RELATE ATOM <(person:alice)>` значение `person:alice` — `record_id` существующей
-  vertex-записи; аналогично `<[friendship:alice_bob]>` ссылается на edge-запись;
-- в `RELATE ATOM <(v)>` имя `v` — idiom с уже связанным значением, а не новый alias;
-- `[r:ANNOTATES]` между endpoint'ами задаёт alias и label создаваемого ребра.
-
-Таким образом, `name` из грамматики является лишь общей лексической формой. Alias, label,
-имя таблицы и id записи не зависят друг от друга; значение двоеточия определяется
-контекстом `MATCH` или `RELATE`. Чтобы выбрать endpoint по label, сначала выполняется
-`MATCH`, затем его alias передаётся в `RELATE`.
+Если выбранный edge уже имеет occurrence в том же graph, возвращается conflict. Изменение
+topology выражается `DETACH edge FROM GRAPH graph` и `RELATE ... IN GRAPH graph` в одной
+транзакции.
 
 **Направление** задаётся стрелками вокруг метки ребра:
 
-| Синтаксис        | Топология                   |
-|------------------|-----------------------------|
-| `(a)-[:E]->(b)`  | Ориентированное ребро a → b |
-| `(a)<-[:E]-(b)`  | Ориентированное ребро b → a |
-| `(a)-[:E]-(b)`   | Неориентированное ребро     |
-| `(a)<-[:E]->(b)` | Двунаправленное ребро       |
+| Синтаксис                | Топология                   |
+|--------------------------|-----------------------------|
+| `(a)-[edge_class]->(b)`  | Ориентированное ребро a → b |
+| `(a)<-[edge_class]-(b)`  | Ориентированное ребро b → a |
+| `(a)-[edge_class]-(b)`   | Неориентированное ребро     |
+| `(a)<-[edge_class]->(b)` | Двунаправленное ребро       |
 
 **Гиперрёбра** — n-арная форма того же endpoint-механизма. `ATOM` и `HYPER`
 ортогональны: `RELATE HYPER` допускает только vertex endpoint'ы, а `RELATE ATOM HYPER` —
 любые атомы.
 
 ```
-RELATE HYPER [e:E]
+RELATE HYPER [edge_class AS e LABEL E]
   TARGETS [a=(entity:a), b=(entity:b), c=(entity:c)]
   [ AS DIRECTED [ (head: [a], tail: [b, c]) ]
    | AS UNDIRECTED
@@ -1465,7 +1661,7 @@ RELATE HYPER [e:E]
   ]
   [ ORDER BY TAIL | ORDER BY TARGETS ];
 
-RELATE ATOM HYPER [e:E]
+RELATE ATOM HYPER [edge_class AS e LABEL E]
   TARGETS [a=<(entity:a)>, link=<[relation:link]>, c=<(entity:c)>]
   [ AS DIRECTED [ (head: [a, link], tail: [c]) ]
    | AS UNDIRECTED
@@ -1494,31 +1690,45 @@ RELATE ATOM HYPER [e:E]
 
 ```
 -- Ориентированное ребро с весом
-RELATE (person:alice)-[:FRIEND { since: "2020-01-01" }]->(person:bob)
-  WEIGHTED 1.0;
+RELATE (person:alice)-[friendship LABEL FRIEND]->(person:bob)
+  IN GRAPH social WEIGHTED 1.0 SET since = "2020-01-01";
 
 -- Гиперребро
-RELATE HYPER [:COAUTHOR] TARGETS [person:alice, person:bob, person:carol]
-  AS UNDIRECTED ORDER BY TARGETS SET paper = "paper:xyz";
+RELATE HYPER [coauthoring LABEL COAUTHOR]
+  TARGETS [person:alice, person:bob, person:carol]
+  IN GRAPH publications AS UNDIRECTED ORDER BY TARGETS SET paper = paper:xyz;
 
 -- Смешанное гиперребро: два source-атома и два target-атома
-RELATE ATOM HYPER [:ACTIVATES]
+RELATE ATOM HYPER [activation LABEL ACTIVATES]
   TARGETS [sensor=<(sensor:temperature)>, guard=<[relation:guard]>,
            alarm=<(alarm:main)>, audit=<[relation:audit]>]
   AS DIRECTED (head: [sensor, guard], tail: [alarm, audit])
-  ORDER BY TAIL;
+  IN GRAPH automation ORDER BY TAIL;
 ```
 
-### 8.6. INFO
+### 8.6. ATTACH / DETACH
 
-Возвращает метаданные системы, базы, таблицы или индекса.
+```gql
+ATTACH @record_id TO GRAPH @graph [ LABEL @label ];
+DETACH @record_id FROM GRAPH @graph [ CASCADE ];
+```
+
+`ATTACH` принимает только global `NODE` atom и создаёт одну membership; повторное присоединение
+является конфликтом. Edge occurrence создаётся `RELATE`. Обычный `DETACH` использует `RESTRICT`
+при любой graph-local incidence. `CASCADE` удаляет затронутые edge occurrences, но сохраняет их
+global edge atoms и все occurrences в других graphs.
+
+### 8.7. INFO
+
+Возвращает метаданные системы, базы, class, graph или индекса.
 
 ```
 INFO FOR [
 	SYSTEM
 	| DB
-	| TABLE @table
-    | INDEX @index ON @table
+	| CLASS @class
+    | GRAPH @graph
+    | INDEX @index ON CLASS @class
 ];
 ```
 
@@ -1550,27 +1760,27 @@ INFO FOR [
   graphs: {},
   models: {},
   params: {},
-  tables: {
-      person: 'DEFINE TABLE person TYPE ANY SCHEMALESS'
+  classes: {
+      person: 'DEFINE CLASS person TYPE NODE SCHEMALESS'
   }
 }
 ```
 
-#### ```INFO FOR TABLE @table```
+#### ```INFO FOR CLASS @class```
 ```
 {
-  definition: 'DEFINE TABLE user TYPE ANY SCHEMALESS',
+  definition: 'DEFINE CLASS user TYPE NODE SCHEMALESS',
   events: {},
   fields: {
       name: 'DEFINE FIELD name ON user TYPE string'
   },
   indexes: {},
   lives: {},
-  tables: {}
+  classes: {}
 }
 ```
 
-#### ```INFO FOR INDEX @index ON TABLE @table```
+#### ```INFO FOR INDEX @index ON CLASS @class```
 ```
 -------- Query 1 --------
 { 
@@ -1604,7 +1814,7 @@ INFO FOR [
 
 -------- Query 4 --------
 {
-  definition: 'DEFINE INDEX by_email ON TABLE user FIELDS email UNIQUE',
+  definition: 'DEFINE INDEX by_email ON CLASS user FIELDS email UNIQUE SCOPE BASE',
   state: 'ready',
   system: false,
   building: {
@@ -1619,19 +1829,19 @@ INFO FOR [
 остаётся в schema catalog со `state: 'stale'`, а запрос использует scan fallback. Повреждение
 primary/base storage остаётся фатальным и не маскируется `INFO`.
 
-### 8.7. SHOW CHANGES
+### 8.8. SHOW CHANGES
 
 Возвращает историю изменений (changefeed). 
 Требует предварительного определения changefeed через `DEFINE`.
 
 ```
-SHOW CHANGES FOR TABLE @tablename
+SHOW CHANGES FOR CLASS @class_name
 	SINCE @timestamp | @versionstamp
 	[ LIMIT @number ]
 ;
 ```
 
-### 8.8. KILL
+### 8.9. KILL
 
 ```
 KILL @id;
@@ -1643,14 +1853,14 @@ KILL @id;
 KILL $query_id;
 ```
 
-### 8.9. REBUILD INDEX
+### 8.10. REBUILD INDEX
 
 Перестраивает индекс.
 Применяется при деградации качества, в частности для HNSW-индексов после большого числа обновлений.
 
 ```
 REBUILD [
-	INDEX [ IF EXISTS ] @name ON [ TABLE ] @table
+	INDEX [ IF EXISTS ] @name ON CLASS @class
 ]
 ```
 
@@ -1658,52 +1868,29 @@ REBUILD [
 
 ## 9. DDL: DEFINE / REMOVE / ALTER
 
-### 9.1. DEFINE TABLE
+### 9.1. DEFINE CLASS
 
-```
-DEFINE TABLE [ OVERWRITE | IF NOT EXISTS ] @name
-	[ DROP ]
+```gql
+DEFINE CLASS [ OVERWRITE | IF NOT EXISTS ] @name
+	TYPE NODE | EDGE
 	[ SCHEMAFULL | SCHEMALESS ]
-	[ TYPE [ ANY | NORMAL | RELATION [ IN | FROM ] @table [ OUT | TO ] @table [ ENFORCED ]]]
-	[ AS SELECT @projections
-		FROM @tables
-		[ WHERE @condition ]
-		[ GROUP [ BY @groups | ALL ] ]
-		[ KEEP REFERENCES ]
-	]
 	[ CHANGEFEED @duration [ INCLUDE ORIGINAL ] ]
-    [ COMMENT @string ]
-;
+    [ COMMENT @string ];
 ```
 
-Таблицы типа `RELATION` содержат атомы-рёбра.
+`TYPE` обязателен. Имя и kind class immutable: `OVERWRITE` может менять schema mode,
+changefeed/comment и зависимые definitions, но не переименовывать class и не менять `NODE` на
+`EDGE` либо обратно. `SCHEMALESS` разрешает необъявленные поля; `SCHEMAFULL` требует
+`DEFINE FIELD`. Отдельные `AS SELECT` classes не вводятся: query result/materialized graph
+выражаются существующими query и `BUILD GRAPH` контрактами.
 
-Принадлежность таблице — явное versioned состояние `SchemaCatalog`, а не следствие
-текстовой части `RecordId.table`. Поэтому атом с ID `account:alice` может принадлежать
-таблице `person`, а `person:bob` может не принадлежать ей. В одном snapshot атом относится
-не более чем к одной таблице; назначение/снятие membership, создание/удаление атома и
-удаление таблицы публикуются транзакционно. RAM и local backends обязаны давать одинаковый
-результат.
-
-`SCHEMALESS`: поля не требуют предварительного объявления. `SCHEMAFULL`: все поля должны быть объявлены через `DEFINE FIELD`.
-
-Таблицы `AS SELECT` — производные представления (materialized view или virtual view).
-Они больше всего похожи на материализованные представления с инкрементальным обновлением на основе событий.
-
-**Плюсы**:
-- События, вызванные на базовой таблице, также срабатывают для представлений.
-- При запуске первого запроса к табличному представлению он будет выполнен как обычный `SELECT`, а затем материализован.
-- Инкрементальные обновления заставляют систему отслеживать триггеры событий и выполнять наиболее эффективную операцию, чтобы результат всегда был актуальным, а не использовать `SELECT` в слепую.
-
-**Ограничения**:
-- Несмотря на эффективность последующих запросов, первый запуск больших аналитических запросов может быть медленным и потреблять много ресурсов, потому что это обычный `SELECT`, поэтому индексация и оптимизация запросов по-прежнему очень важны.
-- События обновления табличных представлений на основе сущностей, не указанных в `FROM`, (то есть связанный по ссылкам и через графы) могут быть очень затратными операциями, поэтому `KEEP REFERENCES` стоит использовать с осторожностью.
-- Табличные представления доступны только для чтения, все мутирующие операции отклоняются, записи вычисляются только на основе исходного запроса; единственное исключение - это восстановление данных БД.
+Текстовая часть `RecordId.class` непосредственно определяет class. Отдельного data membership в
+`SchemaCatalog` нет; membership относится только к участию global atom в graph.
 
 ### 9.2. DEFINE FIELD
 
 ```
-DEFINE FIELD [ OVERWRITE | IF NOT EXISTS ] @name ON [ TABLE ] @table
+DEFINE FIELD [ OVERWRITE | IF NOT EXISTS ] @name ON CLASS @class
 	[ TYPE @type [ FLEXIBLE ] ]
 	[ REFERENCE 
 		[ ON DELETE REJECT | 
@@ -1722,13 +1909,13 @@ DEFINE FIELD [ OVERWRITE | IF NOT EXISTS ] @name ON [ TABLE ] @table
 
 Для computed поля:
 ```
-DEFINE FIELD [ OVERWRITE | IF NOT EXISTS ] @name ON [ TABLE ] @table
+DEFINE FIELD [ OVERWRITE | IF NOT EXISTS ] @name ON CLASS @class
 	COMPUTED @expression
 	[ TYPE @type ]
   [ COMMENT @string ]
 ```
 
-- `FLEXIBLE`: в `SCHEMAFULL` таблице каждый `object` по умолчанию имеет жёсткую схему, определённую с помощью вложенных `DEFINE FIELD`; `FLEXIBLE` позволяет ослабить это правило 
+- `FLEXIBLE`: в `SCHEMAFULL` class каждый `object` по умолчанию имеет жёсткую схему, определённую с помощью вложенных `DEFINE FIELD`; `FLEXIBLE` позволяет ослабить это правило
 - `VALUE`: вычисляется только при изменении (создании или обновлении), но не пересчитывается во время `SELECT` запроса, который не изменяет запись; игнорирует попытки присвоить любое другое значение.
 - `COMPUTED`: computed-значение, вычисляемое только при выборе данных и их возврате клиенту.
 - `DEFAULT`: значение по умолчанию при создании записи, если оно `none` (но не `null`); добавление `ALWAYS` задаёт это поведение и для обновления записи.
@@ -1776,7 +1963,7 @@ DEFINE [ PURE | STABLE | IMPURE ] [ COST ] FUNCTION
 ```
 DEFINE EVENT 
     [ OVERWRITE | IF NOT EXISTS ] 
-    @name ON [ TABLE ] @table 
+    @name ON CLASS @class
     [ ASYNC [ RETRY @n ] [ MAXDEPTH @n ] ]
     WHEN @expression 
     THEN @expression
@@ -1813,13 +2000,13 @@ DEFINE EVENT
 ### 9.6. DEFINE INDEX
 
 Используется для определения индексов для оптимизации производительности запросов.
-Индекс может состоять из одного или нескольких полей в таблице и обеспечивать соблюдение ограничения уникальности.
+Индекс может состоять из одного или нескольких полей class и обеспечивать соблюдение ограничения уникальности.
 Если вы не хотите, чтобы индекс обеспечивал соблюдение ограничения уникальности, то выбранные вами поля для индекса
-должны иметь высокую степень кардинальности, то есть большое разнообразие данных в записях индексируемой таблицы.
+должны иметь высокую степень кардинальности, то есть большое разнообразие данных в записях индексируемого class.
 
 ```
 DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
-    ON [ TABLE ] @table
+    ON CLASS @class
     (
         COUNT
       | ( FIELDS | COLUMNS ) @fields
@@ -1830,6 +2017,7 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
           | GEOMETRY [ TYPE @geometry_type ]
         ]
     )
+    SCOPE BASE | SCOPE EFFECTIVE IN GRAPH @graph
     [ COMMENT @string ]
     [ CONCURRENTLY ]
     [ DEFER ]
@@ -1839,18 +2027,23 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
 
 #### Системные (неявные) индексы
 
-Часть индексов создаётся и поддерживается движком автоматически; их не нужно (и нельзя) объявлять через `DEFINE INDEX`, но они видны в `INFO FOR TABLE` / `INFO FOR INDEX` и участвуют в планировании наравне с пользовательскими:
+Standard/Unique/Count index обязан явно выбрать scope. `BASE` индексирует global base values;
+`EFFECTIVE IN GRAPH` строит полный индекс по memberships и effective values одного graph.
 
-| Индекс          | Назначение                                                                  | Когда создаётся                                             |
-|-----------------|-----------------------------------------------------------------------------|-------------------------------------------------------------|
-| `primary`       | `RecordId → атом`; обеспечивает уникальность `id` внутри таблицы            | Каталожная identity при `DEFINE TABLE`; physical layout может быть общим для graph |
-| `label`         | Перечисление атомов по метке; обслуживает скан по метке и `tv::V([labels])` | Каталожная identity при создании graph; physical entries заполняются лениво |
-| `edge-endpoint` | Инцидентность вида V–E / E–V / E–E для режима `ATOM` (AtomWalk)             | При первом ребре, чей endpoint сам является ребром          |
-| `adjacency`     | Смежность `out`/`in`/`both`                                                 | Каталожная identity при создании graph; физически встроена в hot/overflow pages |
+Часть индексов создаётся и поддерживается движком автоматически; их не нужно (и нельзя) объявлять через `DEFINE INDEX`, но они видны в `INFO FOR CLASS` / `INFO FOR INDEX` и участвуют в планировании наравне с пользовательскими:
+
+| Индекс          | Назначение                                                                | Когда создаётся                                                                 |
+|-----------------|---------------------------------------------------------------------------|---------------------------------------------------------------------------------|
+| `primary`       | Глобальный `RecordId → atom`; обеспечивает уникальность `id` внутри class | Один engine-owned index AtomStore                                               |
+| `class`         | Перечисление global atoms одного class                                    | Каталожная identity при `DEFINE CLASS`                                          |
+| `membership`    | `GlobalAtomId → graph-local occurrence` и обратный список occurrences     | Engine-owned при создании graph/AtomStore                                       |
+| `label`         | Перечисление occurrences по graph-local label                             | Каталожная identity при создании graph; entries заполняются лениво              |
+| `edge-endpoint` | Инцидентность вида V–E / E–V / E–E для режима `ATOM` (AtomWalk)           | При первом ребре, чей endpoint сам является ребром                              |
+| `adjacency`     | Смежность `out`/`in`/`both`                                               | Каталожная identity при создании graph; физически встроена в hot/overflow pages |
 
 Удалить системный индекс нельзя; `REBUILD INDEX` к ним применим.
 
-`CONCURRENTLY` — строит индекс без блокировки таблицы.
+`CONCURRENTLY` — строит индекс без блокировки base class или выбранного effective graph view.
 Оператор вернется немедленно, и вы сможете отслеживать процесс создания индекса, выполнив оператор `INFO`.
 
 `CONCURRENTLY` — общий модификатор длительных обслуживающих операций, а не только построения индекса. Он применим к `DEFINE INDEX`, `REBUILD INDEX` и операциям уплотнения (`COMPACT`). Семантика везде одинакова: оператор ставит фоновое задание и возвращает управление немедленно; ход выполнения виден через `INFO`, задание прерывается через `KILL` по его идентификатору. Обычные запросы (`SELECT`, `MATCH`, `TRAVERSE`) не выполняются с `CONCURRENTLY` — для них есть `TIMEOUT` и отмена на уровне сессии.
@@ -1893,10 +2086,10 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
 как идентификаторы пользователей, адреса электронной почты и другие уникальные идентификаторы.
 
 #### Count index 
-Этот индекс применяется для подсчета количества записей в таблице.
+Этот индекс применяется для подсчёта записей class в выбранном scope.
 Он используется вместе с `count()` функцией и `GROUP ALL` внутри запроса.
-Без индекса подсчета `count()` функция при вызове перебирает записи в таблице.
-Поскольку индекс счетчика объявляется для таблицы в целом, он не может использовать `FIELDS` / `COLUMNS`.
+Без Count index `count()` перебирает atoms base class либо memberships effective graph view.
+Поскольку Count index объявляется для class/scope целиком, он не использует `FIELDS` / `COLUMNS`.
 
 #### Full-text search (FULLTEXT) index
 Обеспечивает эффективный поиск по текстовым данным, поддерживая расширенные
@@ -2181,13 +2374,13 @@ DEFINE GRAPH [IF NOT EXISTS | OVERWRITE] @name
 ```
 REMOVE [
 	DATABASE [ IF EXISTS] @name
-	| EVENT [ IF EXISTS ] @name ON [ TABLE ] @table
-	| FIELD [ IF EXISTS ] @name ON [ TABLE ] @table
-	| INDEX [ IF EXISTS ] @name ON [ TABLE ] @table
+	| EVENT [ IF EXISTS ] @name ON CLASS @class
+	| FIELD [ IF EXISTS ] @name ON CLASS @class
+	| INDEX [ IF EXISTS ] @name ON CLASS @class
     | ANALYZER [ IF EXISTS ] @name
     | FUNCTION [ IF EXISTS ] fn::@name
     | PARAM [ IF EXISTS ] $@name
-	| TABLE [ IF EXISTS ] @name
+	| CLASS [ IF EXISTS ] @name
 	| GRAPH [ IF EXISTS ] @name
 ]
 ;
@@ -2234,7 +2427,7 @@ ALTER DATABASE COMPACT;
 Используется для изменения существующего определенного события.
 
 ```
-ALTER EVENT [ IF EXISTS ] @name ON [ TABLE ] @table
+ALTER EVENT [ IF EXISTS ] @name ON CLASS @class
   (
       ASYNC [ RETRY @retry ] [ MAXDEPTH @max_depth ] | DROP ASYNC
     | WHEN @condition | DROP WHEN
@@ -2246,10 +2439,10 @@ ALTER EVENT [ IF EXISTS ] @name ON [ TABLE ] @table
 
 #### ALTER FIELD
 
-Используется для изменения или полного удаления условий определенного поля в таблице.
+Используется для изменения или полного удаления условий поля class.
 
 ```
-ALTER FIELD [ IF EXISTS ] @name ON [ TABLE ] @table
+ALTER FIELD [ IF EXISTS ] @name ON CLASS @class
 (
     DROP TYPE |
     DROP FLEXIBLE |
@@ -2291,7 +2484,7 @@ ALTER FUNCTION [ IF EXISTS ] fn::@name
 Используется для изменения существующего индекса
 
 ```
-ALTER INDEX @name ON TABLE @table
+ALTER INDEX @name ON CLASS @class
     ( COMMENT @string | PREPARE REMOVE | DROP COMMENT )
 ;
 ```
@@ -2313,12 +2506,12 @@ ALTER PARAM [ IF EXISTS ] $name
 
 Не поддерживает `DROP VALUE`, так как параметр без значения существовать не может.
 
-#### ALTER TABLE
+#### ALTER CLASS
 
-Используется для изменения существующей таблицы
+Изменяет существующий class без изменения его имени или `NODE|EDGE` kind.
 
 ```
-ALTER TABLE [ IF EXISTS ] @name
+ALTER CLASS [ IF EXISTS ] @name
     (
         DROP COMMENT
       | DROP CHANGEFEED
@@ -2331,7 +2524,7 @@ ALTER TABLE [ IF EXISTS ] @name
 ;
 ```
 
-`COMPACT` выполняет сжатие хранилища в определенном пространстве ключей таблицы.
+`COMPACT` выполняет сжатие base/effective index и AtomStore-страниц выбранного class.
 Порядок действий не превращает один statement в последовательность промежуточных схем.
 
 ---
@@ -2349,7 +2542,7 @@ WHERE age >= 18 AND status = "active"
 ### 10.2. FROM
 
 Источник данных. Может быть:
-- именем таблицы: `FROM person`;
+- именем class: `FROM person`;
 - конкретной записью: `FROM person:alice`;
 - подзапросом: `FROM (SELECT ... FROM ...)`;
 - результатом MATCH: `FROM (MATCH ...)`;
@@ -2359,7 +2552,7 @@ WHERE age >= 18 AND status = "active"
 
 Явный контроль доступа к индексам, отключение индексов и использования пользовательских функций стоимости.
 
-При извлечении данных из таблицы планировщик запросов может заменить стандартный итератор таблицы
+При извлечении atoms из class планировщик запросов может заменить стандартный class scan
 одним или несколькими итераторами индексов в зависимости от структуры и требований запроса.
 Это особенно полезно при работе с большими наборами данных,
 так как позволяет значительно сократить время получения данных.
@@ -2367,19 +2560,19 @@ WHERE age >= 18 AND status = "active"
 Однако могут возникнуть ситуации, когда потребуется или
 будет желательно вручную управлять этими потенциальными оптимизациями.
 
-Предложение WITH используется для замены табличного итератора по умолчанию на индексный итератор.
-В случаях, когда мощность индекса может быть высокой и даже равняться количеству записей в таблице,
+Предложение WITH используется для замены class scan по умолчанию на индексный итератор.
+В случаях, когда мощность индекса может быть высокой и даже равняться количеству atoms в class,
 сумма записей, переданных несколькими индексами, может оказаться больше, чем количество записей,
-полученных при итерации по таблице.
+полученных при class scan.
 
 В таких случаях, если есть несколько вариантов индексов, наиболее вероятным оптимальным выбором будет
 использование индекса с наименьшей кардинальностью.
 
-Планировщик запросов может заменить стандартный итератор таблицы одним или несколькими итераторами индексов
+Планировщик запросов может заменить стандартный class scan одним или несколькими итераторами индексов
 в зависимости от структуры и требований запроса.
 
 ```
-[ WITH [ NOINDEX                -- принудительно использовать table scan
+[ WITH [ NOINDEX                -- принудительно использовать class scan
          | INDEX @indexes ...   -- использовать только указанные индексы
          | COST @const_fn       -- использовать пользовательскую функцию стоимости пути
        ]
@@ -2469,7 +2662,7 @@ SELECT id, name FROM person ORDER BY created_at DESC LIMIT 50 START AFTER $curso
 
 Правила:
 - Курсор действителен только для запроса с **тем же** `ORDER BY` и тем же набором фильтров; иначе — ошибка `InvalidCursor`. Хеш запроса в курсоре обеспечивает эту проверку.
-- Требуется детерминированный полный порядок. Если `ORDER BY` не задан или не является полным (ключи сортировки не различают строки), движок **дополняет** его стабильным идентификатором строки — парой `(table, id)` для записи и `RecordId` атома для графового результата. Без полного порядка позиция курсора не определена.
+- Требуется детерминированный полный порядок. Если `ORDER BY` не задан или не является полным (ключи сортировки не различают строки), движок **дополняет** его каноническим `RecordId = (class, id)`. Без полного порядка позиция курсора не определена.
 - По умолчанию курсор продолжает чтение **в том же снимке** (`SnapshotId` внутри курсора): страницы одной ленты консистентны между собой. Если снимок уже собран сборщиком версий (старше `max_snapshot_age`), возвращается `SnapshotExpired`; повторить с `START AFTER @cursor READ COMMITTED` — тогда чтение продолжится в свежем снимке с тем же ключом позиции, ценой возможного появления/исчезновения строк.
 - Курсор — значение в рамках сессии; он не персистентен и не переносим между базами.
 
@@ -2479,7 +2672,7 @@ SELECT id, name FROM person ORDER BY created_at DESC LIMIT 50 START AFTER $curso
 
 Жадное или контролируемое разворачивание ссылок на записи.
 
-Используется для получения связанных записей или данных из других таблиц в рамках одного запроса.
+Используется для получения связанных records или данных из других classes в рамках одного запроса.
 Это особенно удобно, когда нужно собрать данные, связанные отношениями (ссылки на записи),
 без необходимости выполнять несколько отдельных запросов.
 
@@ -2539,7 +2732,7 @@ SELECT * FROM user SPLIT emails;
 
 Исключение полей из результата.
 
-Применяется перед `FROM @table`;
+Применяется перед `FROM @class`;
 
 ```
 OMIT @fields
@@ -2674,13 +2867,13 @@ SELECT
 - как выражение в `LET`.
 
 В `SELECT` запросе в качестве элемента `@fields` может выступать:
-- идиома таблицы из `@targets`;
+- идиома class source из `@targets`;
 - `LET` параметры;
 - вычисляемые выражения
 
 Примеры:
 ```
--- Поля name и address присутствуют в таблице person.
+-- Поля name и address определены в class person.
 -- name.first это идиома.
 -- name.last это алиас, который будет добавлен в поле name результата
 -- string::upper(address) + "!!!" это вычисляемое выражение
@@ -2713,7 +2906,7 @@ SELECT address.coordinates[0] AS latitude FROM person;
 -- Select unique values from an array
 SELECT array::distinct(tags) FROM article;
 
--- Select unique values from a nested array across an entire table
+-- Select unique values from a nested array across an entire class
 SELECT array::group(tags) AS tags FROM article GROUP ALL;
 
 -- Use mathematical calculations in a select expression
@@ -2757,7 +2950,7 @@ SELECT * FROM temperature:['London', '2022-08-29T08:03:39']..;
 SELECT * FROM temperature:['London', '2022-08-29T08:03:39']..['London', '2022-08-29T08:09:31'];
 ```
 
-Использование диапазона записей более эффективно, чем `WHERE`, поскольку не требует сканирования таблицы.
+Использование диапазона записей более эффективно, чем `WHERE`, поскольку не требует полного class scan.
 
 ---
 
@@ -3012,7 +3205,7 @@ WHERE a.name = "Alice"
 #### 12.8.1. FROM для MATCH — источник графа
 
 В отличие от Neo4j в базе данных Ferros-Grynn нет глобального графа, вместо этого в базе данных может храниться множество графов, 
-каждый из которых имеет идентифицирующее имя (как имя таблицы).
+каждый из которых имеет независимые `GraphId` и каталожное имя.
 
 Граф-источник указывается через `FROM`:
 ```
@@ -3894,7 +4087,7 @@ BUILD GRAPH
 ```
 Модификатор типа `<@constraint>` — проверка после построения. Если граф не удовлетворяет типу, возвращается `ConstraintViolation`.
 
-`BUILD GRAPH` — DDL/DML-гибрид: материализует и именует новый граф верхнего уровня (как `CREATE TABLE AS SELECT`). 
+`BUILD GRAPH` — DDL/DML-гибрид: материализует и именует новый граф верхнего уровня.
 После выполнения граф с именем `@name` появляется в каталоге графов наравне с графами, созданными через DEFINE GRAPH, 
 и переживает транзакцию/сессию — он персистентен, пока не удалён явно (`REMOVE GRAPH @name`).
 Если `@name` не указано — возвращается session-owned точный frozen-тип, заданный constraint
@@ -4041,7 +4234,7 @@ persistent-режиме тот же непрозрачный snapshot также
 
 ### 17.3. GraphView
 
-В рамках одного snapshot консистентно видятся **все** графы и таблицы, а не только один граф.
+В рамках одного snapshot консистентно видятся global AtomStore и **все** графы, а не только один graph occurrence.
 Serializable/SI удерживают snapshot на всю транзакцию; Read Committed фиксирует новый snapshot
 на каждый statement, но не меняет его внутри statement:
 - Все чтения `MATCH`, `SELECT`, traversal видят один snapshot — в том числе при обращении к нескольким графам в одном запросе ([§17.7](#177-транзакции-над-несколькими-графами)).
@@ -4095,7 +4288,7 @@ COMMIT;
 
 ### 17.7. Транзакции над несколькими графами
 
-Транзакция может содержать операторы, затрагивающие произвольное число графов и таблиц в пределах **одной базы данных**. Такая транзакция **атомарна**: либо применяются изменения во всех затронутых графах, таблицах и каталоге схемы, либо ни в одном.
+Транзакция может содержать операторы, затрагивающие global atoms и произвольное число графов в пределах **одной базы данных**. Такая транзакция **атомарна**: либо применяются изменения во всех затронутых atoms, graph occurrences и каталоге схемы, либо ни в одном.
 
 В in-memory режиме гарантия обеспечивается одной атомарной публикацией root базы; в persistent
 режиме — единым журналом уровня базы данных с глобальным монотонным `LSN`. В обоих случаях
@@ -4123,11 +4316,13 @@ COMMIT;   -- оба графа и каталог обновляются атом
 
 **Граница домена.** Транзакция **не может** затрагивать более одной базы данных или более одного namespace. Такой запрос отвергается статически на этапе планирования с ошибкой `CrossDatabaseTransaction`. Это сознательное ограничение: база данных — единица журналирования и восстановления, и растягивать транзакцию за её пределы означало бы вводить двухфазный коммит между доменами, которые в одном процессе всё равно отказывают одновременно.
 
-**Таблицы.** Запись таблицы — это атом-вершина с явным generation-aware признаком
-принадлежности таблице, живущий в графе. Membership принадлежит `SchemaCatalog`, входит в
-snapshot/commit и не выводится из `RecordId.table`. Удаление атома или таблицы очищает этот
-признак в том же commit. Таблицы, объявленные без указания графа, размещаются в системном
-графе базы. Поэтому всё сказанное выше о графах распространяется на таблицы без изменений.
+**Классы, атомы и графы.** Class membership задан первой частью `RecordId` и не является
+отдельным изменяемым отношением. Глобальный атом и его base properties входят в database-level
+snapshot независимо от графов. Graph membership, topology, label и sparse overlay входят в тот
+же commit как graph-local state. Одна транзакция может атомарно изменить base atom и несколько
+его occurrences, однако обязана проверить все затронутые base/effective constraints до
+публикации. `GraphId = 0` зарезервирован за database-level `DataSpaceId::Database` и не обозначает
+системный граф; пользовательские графы всегда имеют ненулевой `GraphId`.
 
 ### 17.8. Режимы исполнения и детерминизм
 
@@ -4176,7 +4371,7 @@ BEGIN [ ISOLATION LEVEL @level ] [ EXECUTION MODE DETERMINISTIC | BEST_EFFORT | 
 | `search::`   | `search::score`, `search::highlight`, `search::analyze`                                                                           |
 | `graph::`    | `graph::nodes`, `graph::edges`, `graph::inner`, `graph::inner_nodes`, `graph::inner_edges`, `graph::parent`, `graph::level_path`  |
 | `type::`     | `type::is<T>`, `type::to<T>` (аналог <U>T),                                                                                       |
-| `meta::`     | `meta::id`, `meta::table`, `meta::type`                                                                                           |
+| `meta::`     | `meta::id`, `meta::class`, `meta::type`                                                                                           |
 | `regex::`    | `regex::matcher`, `regex::next`                                                                                                   |
 | `option::`   | `option::is_some`, `option::is_none`                                                                                              |
 | `computed::` | `computed::compute`                                                                                                               |
@@ -4574,7 +4769,8 @@ RETURN [
 
 Непрерывная подписка на изменения. Возвращает живой поток событий изменений.
 
-LIVE SELECT позволяет отслеживать создание, обновление и удаление интересующих вас записей или целых таблиц.
+LIVE SELECT позволяет отслеживать создание, обновление и удаление atoms выбранных classes или
+изменения graph-local occurrences.
 
 ```
 [LET $id =] LIVE SELECT
@@ -4591,8 +4787,8 @@ LIVE SELECT позволяет отслеживать создание, обно
 ;
 ```
 
-Оператор ```LIVE SELECT``` можно использовать для выбора данных из таблицы в режиме реального времени,
-в том числе с возможностью применения фильтров.
+Оператор ```LIVE SELECT``` можно использовать для выбора данных class или graph source в режиме
+реального времени, в том числе с возможностью применения фильтров.
 
 С практической точки зрения, когда вы выполняете ```LIVE SELECT``` запрос, запускается непрерывный сеанс,
 в ходе которого фиксируются все последующие изменения данных в режиме реального времени.
@@ -4627,7 +4823,10 @@ LIVE SELECT позволяет отслеживать создание, обно
 LET $sub = LIVE SELECT DIFF FROM person WHERE active = true SINCE $last_seen;
 ```
 
-История берётся из changefeed таблицы, поэтому `SINCE` работает лишь в пределах `CHANGEFEED @duration` (`DEFINE TABLE`). Если запрошенная позиция уже вычищена, возвращается `ChangefeedExpired` — клиенту следует перечитать состояние целиком и подписаться заново. Без `CHANGEFEED` на таблице `SINCE` недоступен, и подписка начинается с текущего момента.
+История берётся из changefeed соответствующего class/graph source, поэтому `SINCE` работает лишь
+в пределах `CHANGEFEED @duration`, заданного его DDL. Если запрошенная позиция уже вычищена,
+возвращается `ChangefeedExpired` — клиенту следует перечитать состояние целиком и подписаться
+заново. Без changefeed у source `SINCE` недоступен, и подписка начинается с текущего момента.
 
 #### 21.1.3. Backpressure и переполнение
 
@@ -4643,9 +4842,9 @@ LET $sub = LIVE SELECT DIFF FROM person WHERE active = true SINCE $last_seen;
 
 #### 21.1.4. Стоимость и ограничения
 
-- Фильтр `WHERE` подписки вычисляется на каждой мутации подходящей таблицы; сложные предикаты и `FETCH` удорожают запись. Предикат подписки вычисляется по IR (`filter_ir`), а не переразбирается.
+- Фильтр `WHERE` подписки вычисляется на каждой мутации подходящего class/graph source; сложные предикаты и `FETCH` удорожают запись. Предикат подписки вычисляется по IR (`filter_ir`), а не переразбирается.
 - Состояние подписки (`live_id`, цель, `filter_ir`, режим вывода, последний подтверждённый `versionstamp`) персистентно и переживает перезапуск; сами очереди — в памяти и после перезапуска восстанавливаются через `SINCE`.
-- Порядок между **разными** таблицами не гарантируется, если подписка не охватывает их одной целью: `versionstamp` глобален, но доставка идёт по подпискам независимо.
+- Порядок между **разными** sources не гарантируется, если подписка не охватывает их одной целью: `versionstamp` глобален, но доставка идёт по подпискам независимо.
 
 #### 21.1.5. Материализация live-графа
 
@@ -4675,20 +4874,20 @@ KILL $query_id;
 
 ### 21.3. SHOW CHANGES
 
-Требует `DEFINE TABLE ... CHANGEFEED duration`.
+Требует `CHANGEFEED duration` в определении соответствующего CLASS или GRAPH.
 
 ```
-SHOW CHANGES FOR TABLE @tablename
+SHOW CHANGES FOR CLASS @classname
     SINCE @timestamp | @versionstamp
     [ LIMIT @number ]
 ;
 ```
 
 С помощью каналов изменений можно получать и синхронизировать изменения из Ferros-Grynn с внешними системами и платформами с помощью инструкции SHOW.
-Инструкцию SHOW можно использовать для воспроизведения изменений, внесенных в таблицу.
+Инструкцию SHOW можно использовать для воспроизведения изменений, внесённых в class source.
 
 Возвращает объект с `versionstamp` и `changes`, внутри которого описывается список событий:
-`define_table`, `create`, `update`, ... с указанием имени / id.
+`define_class`, `create`, `update`, ... с указанием имени / id.
 
 ### 21.4. События (DEFINE EVENT)
 
@@ -5122,7 +5321,7 @@ LogicalProps = {
 #### Scan:
 ```
 Scan {
-    source: Table | Graph | Index,
+    source: Class | Graph | Index,
     alias: Symbol,
     filter: Option<Expr>
 }
@@ -5408,7 +5607,7 @@ RETURN e, e.paper;
 ### 28.10. Транзакция с откатом через событие
 
 ```
-DEFINE EVENT prevent_delete_admin ON TABLE person
+DEFINE EVENT prevent_delete_admin ON CLASS person
   WHEN $event = "DELETE" AND $before.role = "admin"
   THEN { THROW "Cannot delete admin user" };
 
@@ -5497,10 +5696,10 @@ Live-запросы и changefeed ([§21](#21-события-и-live-запро�
 use std::collections::HashMap;
 
 enum BridgeData<'a> {
-    /// Имя таблицы или ссылка на запись.
+    /// Имя внешнего class/source либо ссылка на запись.
     /// Первый параметр - имя (+ ':id', если запись).
     /// Второй параметр - имя в GQL запросе.
-    RecordOrTable(&'a str, &'a str),
+    RecordOrClass(&'a str, &'a str),
 
     /// Кастомный запрос к БД.
     /// Опционально - карта сопоставлений результата запроса к внешней БД с параметрами запроса GQL.
@@ -5517,8 +5716,11 @@ enum BridgeData<'a> {
 Это мост к SurrealDB.
 
 Помимо базового функционала моста, `SurrealBridge` расширяет операторы:
-- `RETURN GRAPH`, `BUILD GRAPH`: позволяет строить графы из таблице-связей SurrealDB формата: `{ id, in, out }`, автоматически связывая атомы по таблице.  
-- `RELATE`: позволяет создавать записи таблицы-связей SurrealDB, имитируя поведение соответствующего оператора в ней; не создаёт сами сущности, только записи типа `{ id, in, out }`.
+- `RETURN GRAPH`, `BUILD GRAPH`: строит графы из внешних relation-записей SurrealDB
+  формата `{ id, in, out }`; class каждого внешнего `RecordId` переводится в
+  явный Ferros-Grynn `CLASS` по bridge mapping, а не становится внутренней TABLE-моделью;
+- `RELATE`: создаёт внешнюю relation-запись SurrealDB, но не создаёт сами endpoint-сущности;
+  внутри Ferros-Grynn её identity по-прежнему задаётся `RecordId = class:id`.
 
 ## 31. Соответствие кодовой базе
 

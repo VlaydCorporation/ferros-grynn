@@ -1,5 +1,21 @@
 # План реализации `values`
 
+## Коррекция этапа 8.1
+
+Нормативная target-модель задана в [`rework_plan.md`](rework_plan.md). Документационные
+шаги A0–A4 завершены 2026-09-10; типы и код A5–A16 не изменены. Целевые границы:
+
+- `RecordId = class:id`; class — immutable namespace global atom, а не graph membership;
+- публичный `ClassId` типизирует schema identity; внутренний `GlobalAtomId`
+  отделён от graph-local `AtomId`/`DiskAtomRef`;
+- `GraphRef { id, name, kind, storage_mode }` и `Value::GraphRef` отделены от `RecordId`,
+  owning `Value::Graph` и transaction-bound graph view;
+- `AtomRef { kind, RecordId }` сохраняется как base reference; graph-qualified reference
+  указывает отдельный graph scope;
+- row-oriented base properties живут в AtomStore; graph overlay хранит только
+  `Value`, internal `Hidden` или отсутствие override. `Hidden` не является новым
+  публичным `Value` и не совпадает с `None`/`Null`.
+
 ## 1. Архитектура значений
 
 ### Границы модулей
@@ -12,8 +28,13 @@
 
 ### `Value` и типы
 
-- Использовать публичный newtype `Text` над `compact_str::CompactString` для строк, имён таблиц, меток и публичных ключей. Обёртка является местом для доменной логики и скрывает выбор SSO-реализации; собственную SSO не реализовывать. Совместимость с inner-типом предоставлять через `as_inner`, `into_inner` и `From`/`Into`. [Документация compact_str](https://docs.rs/compact_str/latest/compact_str/).
-- Публичные типы именовать `Text`, `Array`, `Bytes`, `Set`, `Object`, `Range`, `Duration`, `DateTime`, `Uuid`, `Ulid`, `RecordId`, `Geometry`, `Regex`, `Path`, `Graph`, без суффикса `Value`.
+- Использовать публичный newtype `Text` над `compact_str::CompactString` для строк, имён classes,
+  графов, меток и публичных ключей. Обёртка является местом для доменной логики и
+  скрывает выбор SSO-реализации; собственную SSO не реализовывать. Совместимость с inner-типом
+  предоставлять через `as_inner`, `into_inner` и `From`/`Into`. [Документация compact_str](https://docs.rs/compact_str/latest/compact_str/).
+- Публичные типы именовать `Text`, `Array`, `Bytes`, `Set`, `Object`, `Range`, `Duration`,
+  `DateTime`, `Uuid`, `Ulid`, `RecordId`, `ClassId`, `GraphRef`, `Geometry`, `Regex`, `Path`,
+  `Graph`, без суффикса `Value`.
 - Хранить `rust_decimal::Decimal` непосредственно внутри `Number::Decimal`.
 - `Uuid`/`Ulid` сделать newtype обёртками с `as_inner`, `into_inner`, `From`/`Into`, parsing и Ferros-Grynn API.
 - `option<T>` оставить только статическим `Type`: `Some(v)` представлен самим `v`, отсутствие — `Value::None`. Вариант `Value::Option` не вводить.
@@ -30,7 +51,8 @@
     - графовые результаты: атом, путь и граф/подграф с различением reference/materialized состояния внутри соответствующих типов.
 - Все сужающие и потенциально неточные преобразования сделать `TryFrom`; удалить преобразования, молча возвращающие `0`/default.
 - `Text`, `Bytes`, `Array` и `Object` предоставляют `as_str`/`as_ref`, итераторы, `len`, `is_empty`, consuming-конверсии и контролируемые методы изменения. Не использовать `DerefMut`, если он обходит инварианты.
-- `Set` хранить как `BTreeSet<Value>`, `Range` валидировать на совместимость границ, а `RecordId` разделить на публичные строковые `table:id` и внутренние идентификаторы словаря.
+- `Set` хранить как `BTreeSet<Value>`, `Range` валидировать на совместимость границ, а `RecordId`
+  хранить как публичные `class:id` с гибкой `RecordIdPart`; dictionary/storage IDs отделены.
 
 ### Sentinel-семантика и порядок
 
@@ -52,8 +74,8 @@ bool(null)    → false
 
 ```text
 none < null < bool < number < string < duration < datetime
-     < ulid < uuid < array < set < object < geometry < vector
-     < bytes < table < record < regex < range
+     < ulid < uuid < array < set < object < geometry < bytes
+     < record < graph_ref < regex < range
      < atom < path < subgraph < graph < closure
 ```
 
@@ -160,19 +182,21 @@ generation и node/edge kind берутся только из Ferros-Grynn `Atom
 
 ```text
 Mode 1 — Full in-memory
-Graph<Mutable> / специализированный T<Mutable>
-COW MVCC + единый immutable root базы
-RAM-backend без WAL; durability подключается отдельным persistent adapter
+DatabaseRoot = AtomStore + ClassCatalog + graph occurrences
+COW MVCC, RAM-backend без WAL
+standalone Graph<Mutable/Frozen> остаётся owning SDK-материализацией
 
 Mode 2 — Disk-backed
 GraphRef + DiskGraphView<'tx>
-PageManager + BufferPool + SnapshotId
+HybridReadEngine + DataSpaceId + SnapshotId
+base читается из AtomStore, graph state — из occurrence/overlay stores
 
 Mode 3 — Hybrid
 query_to_memory<T, State>()
 State ::= Mutable | Frozen
-дисковый подграф материализуется в T<State>
+эффективный graph view материализуется в T<State>
 исходный disk snapshot освобождается после загрузки
+Mutable flush меняет только graph-local topology/overlay, не base properties
 
 Отдельные:
 LiveGraph<Frozen> для immutable read-optimized графа с live-обновлением
@@ -183,8 +207,10 @@ LiveGraph<Mutable> полученный явно через конвертаци
 
 - `SnapshotId` — идентификатор MVCC-версии.
 - `GraphReadView<'tx>` — transaction-bound read guard.
-- В Mode 1 view ссылается на MVCC version root in-memory графа.
-- В Mode 2 view ссылается на `GraphRef`, `PageManager` и `SnapshotId`; это не срез памяти и не копия графа.
+- В Mode 1 view ссылается на один MVCC `DatabaseRoot`, нормализованный на AtomStore и
+  graph occurrences.
+- В Mode 2 view ссылается на `GraphRef`, `HybridReadEngine` и `SnapshotId`; это не срез
+  памяти и не копия графа.
 - View удерживает историю только в пределах транзакции/guard.
 - `RETURN GRAPH` и `query_to_memory` не возвращают snapshot-bound значения.
 
@@ -399,7 +425,8 @@ LiveEvent::Conflict {
 - `StorageValue` содержит только persistable data: dictionary IDs, `DiskAtomRef`, decimal coefficient+scale и нормализованные коллекции.
 - Runtime-only, mutable graph, live graph и transaction-bound view отклоняются через `TryFrom<Value>` с доменным статусом.
 - Добавить borrowed `StorageValueRef<'a>` для чтения без лишних копий.
-- Преобразования получают encode/decode context для `key_id`, `table_id`, `tz_id`, graph refs и snapshot refs.
+- Target-преобразования получают encode/decode context для `key_id`, `class_id`, `tz_id`,
+  global/graph-local atom refs и graph refs. Historical `table_id` удаляется в A5–A16.
 
 ### Кодеки
 
@@ -507,11 +534,12 @@ LiveEvent::Conflict {
 
 5. **StorageValue и codec — ✅ выполнено**
     - Введены внутренние `StorageValue`/`StorageValueRef`, `TypeTag`, дисковые формы
-      `key_id`, `table_id`, `tz_id`, `DiskAtomRef`, decimal `i128+scale`, graph/qualified refs и
+      `key_id`, historical `table_id`, `tz_id`, `DiskAtomRef`, decimal `i128+scale`, graph/qualified refs и
       нормализованные коллекции.
     - Реализованы потребляющие преобразования `Value → StorageValue` с mutable
       `EncodeContext` и `StorageValue → Value` с borrowed `DecodeContext`. Контексты разрешают
-      property/table/time-zone dictionaries, atom refs и graph refs; runtime-only значения
+      property/historical-table/time-zone dictionaries, atom refs и graph refs; A5–A16 заменяют
+      table context на class/global-atom context; runtime-only значения
       отклоняются доменным статусом.
     - Ручной canonical codec v1 покрывает полный реестр `disk_storage_spec.md §5.2`: shortest
       uLEB128/zigzag, little-endian payload, UTF-8, все geometry/vector формы, duration/range,

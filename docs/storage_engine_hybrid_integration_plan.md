@@ -19,6 +19,24 @@ checkpoint/recovery, write path и публичные query-result типы не
 компилируется только для тестов и measurement API прототипного крейта;
 постоянного runtime-переключателя между engines нет.
 
+### Addendum 8.1: database и graph data spaces
+
+[`rework_plan.md`](rework_plan.md) не меняет выбор R8/Direct/scatter/IoRing, бюджеты и
+router. Он меняет identity файлов и данных над этим engine. Документационные A0–A4
+завершены 2026-09-10; код A5–A16 не начат.
+
+- `SourceState` и `PageKey` получают `DataSpaceId`, `DataFileId` и точную
+  `PageCacheVersion`; удаляется допущение, что любой source принадлежит graph.
+- `DataSpaceId::Database` адресует AtomStore/catalog files;
+  `DataSpaceId::Graph(nonzero GraphId)` — occurrence/overlay/topology files.
+- Resident/transient budget остаётся общим для всех database/graph spaces; per-space quota
+  не добавляется.
+- Mode 1 читает нормализованный AtomStore + occurrences из одного MVCC root;
+  Mode 2 использует тот же `HybridReadEngine` для обоих data spaces; Mode 3 копирует
+  effective graph и не удерживает base/overlay page references.
+- H14 зависит от A14–A16: Mutable flush пишет только graph-local
+  topology/overlay delta; неявно менять base atom запрещено.
+
 ## Выбранная комбинация
 
 | Физический паттерн                                    | Production-механизм                                         | Причина выбора                                                                                                             |
@@ -58,7 +76,7 @@ storage cursor
 - `ReadRoute`: выбранный resident/Direct/scatter/IoRing path;
 - `ReadScope`/`PhysicalReadCursor`: read epoch, resolved table, временные
   buffers, cancellation и join;
-- `SourceState`: `(GraphId, DataFileId)` и точный `PageCacheVersion`;
+- `SourceState`: `(DataSpaceId, DataFileId)` и точный `PageCacheVersion`;
 - `TransientArena`: ограниченная память transports вне resident frames.
 
 `GraphRead`, `RowCursor`, `IoMode`, `GraphStorageMode`, `StoreBackend` и
@@ -86,7 +104,7 @@ storage cursor
 
 ### Source identity и budget
 
-Ключ всегда содержит `GraphId`, `DataFileId` и точную home/WAL version.
+Ключ всегда содержит `DataSpaceId`, `DataFileId` и точную home/WAL version.
 `buffer_pool_pages` — один общий resident budget для всех файлов и версий, без
 per-file quota.
 
@@ -141,14 +159,15 @@ cancellation и обязательный join.
 ### Mode 1 — Full In Memory
 
 `StoreBackend::InMemory` не создаёт physical read intents и не обращается к
-arena, Direct I/O или prefetch. Backend-neutral query cursor читает immutable
-in-memory root. Режим остаётся volatile; добавление snapshot/WAL durability в
-этот этап не входит. Допустимая регрессия query throughput — не более 3%.
+arena, Direct I/O или prefetch. Backend-neutral query cursor читает один immutable
+in-memory root с AtomStore и graph occurrences. Режим остаётся volatile; добавление
+snapshot/WAL durability в этот этап не входит. Допустимая регрессия query throughput —
+не более 3%.
 
 ### Mode 2 — Full On Disk
 
 Local datastore использует `HybridReadEngine` для всех физических чтений:
-hot roots/point/adjacency — R8, leaf/table/bulk ranges — bypass + scatter + P1,
+hot roots/point/adjacency — R8, leaf/class-or-occurrence/bulk ranges — bypass + scatter + P1,
 known sparse frontier — R8 + IoRing QD32, unpredictable miss — sync Direct.
 Transaction snapshot и `staged -> WAL -> home` остаются неизменными, а наружу
 выдаются owned domain/query values, не page identities.
@@ -157,37 +176,37 @@ Transaction snapshot и `staged -> WAL -> home` остаются неизмен�
 
 Mode 3 остаётся явной materialization operation, а не новым `StoreBackend`.
 Source фиксируется на одном `SnapshotId`; disk source читается через Mode 2,
-memory source — напрямую. Материализация идёт bounded окнами: сначала nodes и
-properties, затем edges/incidence через source-to-target mapping. После успеха
+memory source — напрямую. Материализация effective graph идёт bounded окнами: снача nodes и
+effective properties, затем edges/incidence через source-to-target mapping. После успеха
 source snapshot освобождается; при ошибке или cancellation partial target
 отбрасывается.
 
 Результат владеет данными, хранит origin, не удерживает page guards и сообщает
 `GraphStorageMode::Hybrid`, после чего читается как Mode 1. Frozen не получает
 flush. Mutable сохраняет source mapping и dirty state; explicit delta flush
-реализуется только после delta-oriented mutation foundation этапа 4. Flush не
+реализуется только после A14–A16 коррекции 8.1. Flush неявно не меняет base atom и не
 выполняется из `Drop`, работает в новой транзакции и очищает dirty state только
 после успешного commit.
 
 ## Dependency-ordered реализация
 
-| ID  | Зависимость     | Результат                                                                                                            |
-|-----|-----------------|----------------------------------------------------------------------------------------------------------------------|
-| H0  | Этап 3.1        | План подключён к `full_plan.md`; prototype-крейт входит в workspace; baseline и неизменяемые contracts зафиксированы |
-| H1  | H0              | Минимальный R8 core перенесён в `src/storage`, старый production path не изменён                                     |
-| H2  | H1              | Exact source lifecycle, sparse locators и единый multi-file budget                                                   |
-| H3  | H2              | Bounded read scope, router и transient budget                                                                        |
-| H4  | H3              | Point path нового engine проверен через временный test-only selector с сохранением staged/WAL/home                   |
-| H5  | H4              | Rocks-like bypass, Windows scatter и P1 pipeline                                                                     |
-| H6  | H4              | Sparse frame-IoRing QD32; H5 и H6 независимы друг от друга                                                           |
-| H7  | H5, H6          | Physical B+tree/table/graph/property cursors формируют bounded windows без полного page plan                         |
-| H8  | H7              | Eager `Vec<QueryStorageRow>` заменён внутренним memory/local stream; SSI lifecycle сохранён                          |
-| H9  | H8              | Bounded Mode 3 materialization с origin и гарантированным snapshot cleanup                                           |
-| H10 | H9              | Correctness/concurrency/platform gate пройден в `fg-storage-engine-prototypes`                                       |
-| H11 | H10             | Production-API performance gate и source-level profiling пройдены                                                    |
-| H12 | H11             | `SyncPageManager` переключён на `HybridReadEngine`; старый Clock-Pro и selector удалены                              |
-| H13 | H12             | Финальная проверка, отчёт, CSV/logs и `graphify update .`                                                            |
-| H14 | H9, H12, этап 4 | Explicit Mutable delta flush отдельным изменением                                                                    |
+| ID  | Зависимость      | Результат                                                                                                            |
+|-----|------------------|----------------------------------------------------------------------------------------------------------------------|
+| H0  | Этап 3.1         | План подключён к `full_plan.md`; prototype-крейт входит в workspace; baseline и неизменяемые contracts зафиксированы |
+| H1  | H0               | Минимальный R8 core перенесён в `src/storage`, старый production path не изменён                                     |
+| H2  | H1               | Exact source lifecycle, sparse locators и единый multi-file budget                                                   |
+| H3  | H2               | Bounded read scope, router и transient budget                                                                        |
+| H4  | H3               | Point path нового engine проверен через временный test-only selector с сохранением staged/WAL/home                   |
+| H5  | H4               | Rocks-like bypass, Windows scatter и P1 pipeline                                                                     |
+| H6  | H4               | Sparse frame-IoRing QD32; H5 и H6 независимы друг от друга                                                           |
+| H7  | H5, H6           | Physical B+tree/class/occurrence/property cursors формируют bounded windows без полного page plan                    |
+| H8  | H7               | Eager `Vec<QueryStorageRow>` заменён внутренним memory/local stream; SSI lifecycle сохранён                          |
+| H9  | H8               | Bounded Mode 3 materialization с origin и гарантированным snapshot cleanup                                           |
+| H10 | H9               | Correctness/concurrency/platform gate пройден в `fg-storage-engine-prototypes`                                       |
+| H11 | H10              | Production-API performance gate и source-level profiling пройдены                                                    |
+| H12 | H11              | `SyncPageManager` переключён на `HybridReadEngine`; старый Clock-Pro и selector удалены                              |
+| H13 | H12              | Финальная проверка, отчёт, CSV/logs и `graphify update .`                                                            |
+| H14 | H9, H12, A14–A16 | Explicit Mutable graph-local topology/overlay delta flush отдельным изменением                                       |
 
 ### Фактическое выполнение
 

@@ -1,5 +1,27 @@
 # Локальное дисковое хранилище Ferros-Grynn: sync-first
 
+## Коррекция этапа 8.1
+
+[`rework_plan.md`](rework_plan.md) заменяет graph-owned atom/TABLE layout на целевую
+graph-first модель. Документационные шаги A0–A4 завершены 2026-09-10;
+кодовые A5–A16 не начаты. Ранее выполненные этапы 1–7 ниже остаются
+историческим evidence текущего checkout, но не target format.
+
+Целевые storage-границы:
+
+- `atoms/<generation>` хранит global atoms, base properties, primary, reverse
+  memberships, base indexes и class statistics;
+- `graphs/<graph_id>/<generation>` хранит occurrences, topology, labels, sparse
+  overlays, membership index и explicit effective indexes;
+- `RecordId = class:id` разрешается в `GlobalAtomId`; graph-local `DiskAtomRef`/
+  `AtomId` не заменяет global identity;
+- `PageKey`, WAL и `FileCatalog FGFC v5` используют `DataSpaceId::Database`
+  или `DataSpaceId::Graph(nonzero GraphId)`; system graph не существует;
+- `DatabaseCatalog` повышается до FGDC v6; FGDC v5/FGFC v4 отклоняются без
+  migration, так как core format ещё не frozen;
+- один database WAL атомарно публикует base, memberships, graph topology,
+  overlays, indexes и statistics.
+
 ## Итоговая архитектура
 
 - Production-код размещается в `src/storage`; незавершённый `crates/storage_engine` удаляется после сверки его незакоммиченного diff. `fg-meta` — сырой пример для проверки отдельных гипотез и сценариев, не источник требований или готовой реализации.
@@ -71,11 +93,13 @@
 5. **Этап 4 — минимальный disk-backed vertical slice**
     - Подключить уже реализованные DB/graph superblocks к durable-каталогам и реализовать freelist, hot node/edge pages, adjacency overflow, property heap/large objects, label dictionary и subgraph directory.
     - Переиспользовать существующие `StorageValue` conversion contexts и canonical codec; decode limits проверять до allocation.
-    - Добавить primary `RecordId → DiskAtomRef` B+tree, таблицы и минимальные label/count statistics.
-    - Подключить local backend к существующим `Datastore`, `Transaction`, SSI и `QueryRead`: point lookup через primary index, потоковый table scan и поздняя загрузка свойств.
-    - Первый пользовательский срез: создать БД/граф/таблицу, записать узлы и рёбра, commit, закрыть, открыть заново, прочитать через Rust API и текущий read-only `SELECT`.
+    - Исторически этот срез добавил graph-wide primary `RecordId → DiskAtomRef`, TABLE
+      membership и graph-owned properties. A8–A13 заменяют их global primary
+      `RecordId → GlobalAtomId`, class scan и graph-occurrence/effective read.
 	- Состояние на 2026-08-25: этап 4 завершён для Windows sync. Durable DB/file catalogs связывают concrete graph pages, label dictionary, primary B+tree и минимальную статистику с публичными `Datastore::create_local/open_local`; publication следует только после WAL durability.
-	- Transaction-bound `LocalGraphView` читает hot pages через `PageGuard`, сохраняет fallible GAT `GraphRead`, выполняет point lookup по primary index, потоковый table scan и отдельно загружает property heap. Полная материализация происходит только при явной мутации/`query_to_memory`.
+	- Transaction-bound `LocalGraphView` и его table scan — historical implementation oracle.
+      Target `GraphRead` разрешает graph-local occurrence и читает наследуемый base через
+      AtomStore, а Mode 3 материализует effective view без удержания page guard.
 	- `GraphMutationView` предоставляет backend-neutral create/update/delete по `RecordId`/`AtomRef`. Datastore выполняет atom-level FCW/SSI merge, после чего stable-layout commit пишет только изменившиеся страницы; изменение layout безопасно переключает новое COW-поколение. Tombstone хранит generation и переиспользуется без ABA, а startup-GC удаляет недостижимые поколения после захвата `db.lock`.
 	- Публичные `CheckpointMode::{Passive, Restart}` и `CheckpointPolicy` подключены. Passive отменяет только просроченные снимки и сохраняет старых readers; Restart кооперативно отменяет зарегистрированные storage snapshots и продвигает backfill к durable tail.
 	- Windows reopen-тесты проходят через публичный API и отдельно покрывают large-property chain, adjacency overflow, abort без публикации, slot-generation reuse и Restart checkpoint.
@@ -111,7 +135,8 @@
 - Unit/component: golden RapidHash vectors, page codecs, malformed headers, Clock-Pro transitions, concurrent positional I/O, version resolution и WAL parser.
 - Crash matrix: сбой до WAL sync, после sync до publication, во время backfill, после data fsync до prune, truncated/corrupt WAL tail и torn data page.
 - MVCC: старый reader не видит поздний commit даже после checkpoint; read-your-writes; disjoint atom merge; same-atom conflict; phantom conflict; атомарность нескольких графов.
-- End-to-end: все persistable Value tags, overflow/large properties, reopen, rollback, point `RecordId`, table scan, nested graph и recovery без утечки storage DTO.
+- End-to-end: все persistable Value tags, overflow/large properties, reopen, rollback, point `RecordId`,
+  class/base scan, graph-occurrence/effective scan, nested graph и recovery без утечки storage DTO.
 - Performance profile: dataset `max(1 GiB, 4 × pool)`, фиксированный seed и три fresh-file repetition. Single-page miss Direct+BufferPool должен дать не менее 90% raw Direct throughput при p99 не выше 125%; resident-hit p99 может превышать mmap не более чем на 0,5 мкс.
 - Sequential batch должен дать не менее 90% fresh-file mmap first-touch throughput. Scan-resistance требует не менее 99% hits по заранее прогретому hot set и не менее 90% raw batched Direct throughput. Durable Direct writes сравниваются с mmap при одном одинаковом durability barrier.
 - Storage RSS Direct не превышает 110% buffer-pool budget. Random/oversized mmap остаются информационными: его mapped RSS и системный file cache не входят в Direct memory gate.

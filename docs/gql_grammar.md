@@ -1,8 +1,8 @@
 # GrynQL — Грамматика языка запросов Ferros-Grynn
 
-**Версия:** 0.2-draft
+**Версия:** 0.3-draft
 **Статус:** проектирование
-**Основано на:** [gql_spec.md](gql_spec.md) v0.2-draft
+**Основано на:** [gql_spec.md](gql_spec.md) v0.3-draft
 **Нормативная область:** точный синтаксис каждого утверждённого профиля. Семантику конструкций
 задаёт [gql_spec.md](gql_spec.md), storage-контракт —
 [disk_storage_spec.md](disk_storage_spec.md), реализацию — [gql_tech_spec.md](gql_tech_spec.md).
@@ -61,6 +61,150 @@ StandardPath, с `ATOM` — только AtomWalk. Все диапазоны к�
 `HYPER`/`META`, `WITHIN`, inline property objects, открытые диапазоны, path objectives,
 DDL/DML, traversal и graph-return должны завершаться диагностикой unsupported, а не
 молчаливым разбором по более широкой draft-грамматике.
+
+## Грамматика коррекции 8.1
+
+**Статус профиля:** `approved-for-implementation`; до завершения этапа 8.1 он ещё не является
+текущим runtime-профилем. Документационные A0–A4 завершены 2026-09-10; кодовые A5–A16 не
+начаты. После cutover правила ниже заменяют конфликтующие правила полного
+draft: `TABLE`, class kind `ANY|NORMAL|RELATION` и форма `alias:Label` не имеют compatibility
+alias. Остальная полная EBNF применяется лишь там, где она не противоречит этому разделу.
+
+```ebnf
+class_name      ::= name
+label_name      ::= name
+graph_ref       ::= name | param
+record_id       ::= class_name ":" id_part
+record_range    ::= class_name ":" [ range_bound ] range_op [ range_bound ]
+graph_scope     ::= "IN" "GRAPH" graph_ref
+
+class_kind      ::= "NODE" | "EDGE"
+schema_mode     ::= "SCHEMALESS" | "SCHEMAFULL"
+atom_target     ::= class_name | record_id | record_range
+index_kind      ::= field_index_kind
+update_body     ::= [ update_data ] [ where_clause ] [ mutate_return ]
+                    [ expect_clause ] [ timeout_clause ]
+update_return   ::= mutate_return
+delete_return   ::= mutate_return
+relate_return   ::= mutate_return
+edge_filter     ::= node_filter
+alter_class_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
+                     | "COMPACT"
+                     | schema_mode
+                     | "CHANGEFEED" duration_lit
+                     | "COMMENT" string_lit
+
+stage81_statement ::= define_class | define_field | define_index
+                    | alter_class | remove_class | info_class
+                    | create_atom | base_update | base_upsert | graph_update
+                    | delete_atom | attach_stmt | detach_stmt | relate_stmt
+                    | match_stmt | select_stmt
+
+define_class ::= "DEFINE" "CLASS" [ overwrite_or_ifne ] class_name
+                 "TYPE" class_kind
+                 [ schema_mode ]
+                 [ "CHANGEFEED" duration_lit ]
+                 [ "COMMENT" string_lit ]
+
+define_field ::= "DEFINE" "FIELD" [ overwrite_or_ifne ] name
+                 "ON" "CLASS" class_name
+                 [ "TYPE" type ]
+                 [ ( "VALUE" | "COMPUTED" ) expr ]
+                 [ "DEFAULT" expr ]
+                 [ "ASSERT" expr ]
+                 [ "READONLY" ]
+                 [ "COMMENT" string_lit ]
+
+index_scope ::= "SCOPE" "BASE"
+              | "SCOPE" "EFFECTIVE" "IN" "GRAPH" graph_ref
+
+define_index ::= "DEFINE" "INDEX" [ overwrite_or_ifne ] name
+                 "ON" "CLASS" class_name
+                 ( "FIELDS" idiom_list | "COLUMNS" idiom_list )
+                 index_kind
+                 index_scope
+                 [ "COMMENT" string_lit ]
+
+alter_class  ::= "ALTER" "CLASS" [ if_exists ] class_name
+                 alter_class_action { alter_class_action }
+remove_class ::= "REMOVE" "CLASS" [ if_exists ] class_name
+info_class   ::= "INFO" "FOR" "CLASS" class_name
+
+create_atom ::= "CREATE" ( record_id | class_name )
+                [ content_or_set ] [ create_return ]
+                [ expect_clause ] [ timeout_clause ]
+
+base_update ::= "UPDATE" atom_target update_body
+base_upsert ::= "UPSERT" atom_target update_body
+
+graph_update ::= "UPDATE" atom_target graph_scope
+                 [ "LABEL" ( label_name | "NONE" ) ]
+                 [ graph_property_change ]
+                 [ update_return ] [ expect_clause ] [ timeout_clause ]
+
+graph_property_change ::= "CONTENT" expr
+                        | "MERGE" expr
+                        | "PATCH" expr
+                        | "SET" assignment_list
+                        | "UNSET" idiom_list
+                        | "RESET" idiom_list
+
+delete_atom ::= "DELETE" atom_target [ "CASCADE" ]
+                [ delete_return ] [ timeout_clause ]
+
+attach_stmt ::= "ATTACH" record_id "TO" "GRAPH" graph_ref
+                [ "LABEL" label_name ]
+detach_stmt ::= "DETACH" record_id "FROM" "GRAPH" graph_ref
+                [ "CASCADE" ]
+
+node_selector ::= "*" | class_name | record_id
+edge_selector ::= "*" | class_name | record_id
+node_pattern   ::= "(" node_selector [ "AS" alias ]
+                   [ "LABEL" label_name ] [ node_filter ] ")"
+edge_pattern   ::= "[" edge_selector [ "AS" alias ]
+                   [ "LABEL" label_name ] [ edge_filter ] "]"
+
+graph_pattern ::= node_pattern { graph_step node_pattern }
+graph_step    ::= "-" edge_pattern "->"
+                | "<-" edge_pattern "-"
+                | "-" edge_pattern "-"
+                | "<-" edge_pattern "->"
+
+match_stmt ::= "MATCH" [ match_mode ] graph_pattern
+               { "," graph_pattern }
+               graph_scope
+               [ where_clause ]
+               "RETURN" return_item_list
+
+relate_stmt ::= "RELATE" node_pattern graph_step node_pattern
+                graph_scope
+                [ "CONTENT" expr | "SET" assignment_list ]
+                [ "WEIGHTED" expr ]
+                [ relate_return ] [ timeout_clause ]
+
+atom_source ::= ( class_name | record_id | record_range ) [ graph_scope ]
+select_stmt ::= "SELECT" [ "ONLY" ] select_projection
+                "FROM" atom_source { "," atom_source }
+                [ with_clause ] [ where_clause ] [ split_clause ]
+                [ group_clause | order_clause ] [ limit_clause ]
+                [ start_clause ] [ fetch_clause ] [ timeout_clause ]
+                [ "TEMPFILES" ]
+```
+
+Дополнительные синтаксические ограничения:
+
+- `TYPE NODE|EDGE` и `index_scope` обязательны; имя и kind class не меняются через
+  `ALTER CLASS`.
+- `CREATE`, `UPSERT`, `DELETE` не принимают `graph_scope`. Graph-local состояние изменяют
+  только `UPDATE ... IN GRAPH`, `ATTACH`, `DETACH` и `RELATE ... IN GRAPH`.
+- В `RELATE` node endpoints должны быть exact `record_id`; edge selector является class либо
+  exact `record_id`. `*` разрешён в `MATCH`, но не в `RELATE`.
+- `AS` вводит binding, `LABEL` задаёт только graph-local label. Двоеточие встречается только
+  внутри `record_id`/`record_range` и не кодирует label.
+- `RESET` допустим только в graph-scoped update и удаляет запись overlay; `UNSET` в том же
+  контексте записывает внутренний `Hidden`.
+- `CLASS`, `ATTACH`, `DETACH`, `TO`, `RESET`, `SCOPE`, `BASE`, `EFFECTIVE`, `LABEL` и
+  `CASCADE` являются зарезервированными словами профиля 8.1.
 
 ## О названии
 
@@ -145,13 +289,12 @@ name         ::= ident | quoted_ident
 ```
 
 Обратные кавычки позволяют использовать произвольные Unicode-символы и зарезервированные слова как имена
-(таблиц, полей, меток, идентификаторов записей).
+(classes, полей, labels, идентификаторов records).
 
 `name` задаёт только лексическую форму имени. Использующие её нетерминалы относятся к
-разным пространствам имён: `alias` — локальный binding, `label` — ограничение типа атома,
-`table_name` — имя таблицы. Поэтому `alias:Label` внутри паттерна `MATCH` не является
-`record_id` и не зависит от него: одинаковый символ `:` разбирается по синтаксическому
-контексту.
+разным пространствам имён: `alias` — локальный binding, `label_name` — graph-local label,
+`class_name` — namespace глобальных atoms. Двоеточие используется только в
+`record_id = class:id`; alias и label вводятся ключевыми словами `AS` и `LABEL`.
 
 ### 2.3. Параметры
 
@@ -224,8 +367,8 @@ expr_list    ::= expr { "," expr }
 ### 2.9. Литерал записи (record) и диапазоны
 
 ```ebnf
-record_id    ::= table_name ":" id_part
-table_name   ::= name
+record_id    ::= class_name ":" id_part
+class_name   ::= name
 id_part      ::= ident
               | quoted_ident
               | integer
@@ -236,7 +379,7 @@ id_part      ::= ident
 id_gen_fn    ::= "rand" "::" "id" "(" ")" | "ulid" "(" ")" | "uuid" "(" ")"
 
 (* Диапазоны записей — только в позиции цели (§13.1) *)
-record_range ::= table_name ":" [ range_bound ] range_op [ range_bound ]
+record_range ::= class_name ":" [ range_bound ] range_op [ range_bound ]
 range_op     ::= ".." | "..="
 range_bound  ::= id_part
 ```
@@ -298,6 +441,8 @@ statement ::=
     | update_stmt
     | upsert_stmt
     | delete_stmt
+    | attach_stmt
+    | detach_stmt
     | relate_stmt
     | build_graph_stmt
     | select_stmt
@@ -394,8 +539,8 @@ create_stmt ::= "CREATE" create_target_list
                 [ timeout_clause ]
 
 create_target_list ::= create_target { "," create_target }
-create_target ::= record_id | table_name | range_gen | "(" record_id ")"
-range_gen     ::= "|" table_name ":" integer "|"          (* |person:5| — генератор диапазона *)
+create_target ::= record_id | class_name | range_gen | "(" record_id ")"
+range_gen     ::= "|" class_name ":" integer "|"          (* |person:5| — генератор диапазона *)
 
 content_or_set ::= "CONTENT" expr
                  | "SET" assignment_list
@@ -413,6 +558,8 @@ statement_param_list ::= statement_param { "," statement_param }
 
 ```ebnf
 update_stmt ::= "UPDATE" update_target_list
+                [ graph_scope ]
+                [ "LABEL" ( label_name | "NONE" ) ]
                 [ update_data ]
                 [ where_clause ]
                 [ mutate_return ]
@@ -434,6 +581,7 @@ update_data ::= "CONTENT" expr
               | "REPLACE" expr
               | "SET"   assignment_list
               | "UNSET" idiom_list
+              | "RESET" idiom_list
 
 idiom_list  ::= idiom { "," idiom }
 
@@ -448,19 +596,32 @@ mutate_return ::= "RETURN" "NONE"
 ### 5.3. DELETE
 
 ```ebnf
-delete_stmt ::= "DELETE" target_list
+delete_stmt ::= "DELETE" target_list [ "CASCADE" ]
                 [ where_clause ]
                 [ mutate_return ]
                 [ expect_clause ]
                 [ timeout_clause ]
 ```
 
-### 5.4. RELATE
+`graph_scope`, `LABEL` и `RESET` допустимы только у `UPDATE`, но не у `UPSERT`.
+Без `graph_scope` `UPDATE` изменяет base atom; с ним — только graph-local label/overlay.
+
+### 5.4. ATTACH / DETACH
+
+```ebnf
+attach_stmt ::= "ATTACH" record_id "TO" "GRAPH" graph_ref
+                [ "LABEL" label_name ]
+detach_stmt ::= "DETACH" record_id "FROM" "GRAPH" graph_ref
+                [ "CASCADE" ]
+```
+
+### 5.5. RELATE
 
 ```ebnf
 relate_stmt ::= "RELATE" ( relate_binary
                           | "ATOM" ( atom_relate_binary | atom_relate_hyper )
                           | relate_hyper )
+                 graph_scope
                  [ "WEIGHTED" expr ]
                  [ content_or_set ]
                 [ mutate_return ]
@@ -470,8 +631,8 @@ relate_stmt ::= "RELATE" ( relate_binary
 endpoint_ref   ::= record_id | idiom | param
 relate_binary ::= relate_endpoint edge_dir_left edge_atom edge_dir_right relate_endpoint
 relate_endpoint ::= "(" endpoint_ref ")" | endpoint_ref
-edge_atom     ::= "[" [ alias ] ":" label_expr [ object_lit ] "]"
-                | "(" record_id ")"
+edge_atom     ::= "[" ( class_name | record_id ) [ "AS" alias ]
+                  [ "LABEL" label_name ] [ object_lit ] "]"
 edge_dir_left  ::= "<-" | "-"
 edge_dir_right ::= "->" | "-"
 (* Комбинации: -[:E]->  (a→b) | <-[:E]-  (b→a) | -[:E]-  (undirected) | <-[:E]->  (bidirectional) *)
@@ -501,12 +662,12 @@ alias_array    ::= "[" alias { "," alias } "]"
 hyper_endpoint_order ::= "ORDER" "BY" ( "TAIL" | "TARGETS" )
 ```
 
-`WEIGHTED` задаёт вес (`duration` — для темпоральных графов, иначе `number`).
+`WEIGHTED` задаёт graph-local вес (`duration` — для темпоральных графов, иначе `number`).
 Обычные `relate_binary`/`relate_hyper` после binding требуют vertex endpoint'ы. `ATOM`
 расширяет endpoint domain до всех атомов и ортогонален `HYPER`; `[...]` всегда обозначает
-создаваемое связывающее ребро. В `RELATE` содержимое endpoint'а — вычисляемая ссылка на
+class либо exact `RecordId` связывающего edge. В `RELATE` содержимое endpoint'а — вычисляемая ссылка на
 существующий атом: `record_id`, параметр или idiom с ранее связанным значением. Это не
-паттерн `alias:Label`; выбор по label выполняется отдельным `MATCH`, после которого его alias
+паттерн; выбор по label выполняется отдельным `MATCH`, после которого его alias
 можно передать в `RELATE`. В `hyper_headtail` оба массива непусты и содержат только явно
 объявленные алиасы из `TARGETS`. Без него первый endpoint становится единственным `head`, остальные — `tail`.
 `ORDER BY TAIL` допустим только с явным `tail`, `ORDER BY TARGETS` — только без явного
@@ -519,7 +680,7 @@ hyper_endpoint_order ::= "ORDER" "BY" ( "TAIL" | "TARGETS" )
 ```ebnf
 match_stmt ::= "MATCH" [ match_cardinality ] [ match_mode ]
                ( match_standard_head | match_atom_head )
-               [ from_clause ]
+               graph_scope
                [ where_clause ]
                [ contains_clause ]
                [ with_clause ]
@@ -558,21 +719,21 @@ graph_pattern ::= pattern_term { edge_pattern pattern_term }
 pattern_term  ::= node_pattern { within_op node_pattern }
 within_op     ::= "WITHIN" [ "*" "[" [ integer ] ".." [ integer ] "]" ]
 
-node_pattern  ::= "(" [ alias ] [ ":" label_expr ] [ node_filter ] ")"
-                | meta_vertex_pattern
-meta_vertex_pattern ::= "<" node_pattern ">"          (* <(n:Label)> *)
+node_pattern  ::= "(" node_selector [ "AS" alias ]
+                  [ "LABEL" label_name ] [ node_filter ] ")"
+                 | meta_vertex_pattern
+meta_vertex_pattern ::= "<" node_pattern ">"
 node_filter   ::= object_lit | ( "WHERE" expr )
 
 edge_pattern  ::= edge_dir_left edge_body edge_dir_right
                 | "->" | "<-" | "-"                    (* ребро без тела: -[]-> и т.п. *)
 
-edge_body     ::= "[" [ alias ] [ ":" label_expr ] [ var_length ]
+edge_body     ::= "[" edge_selector [ "AS" alias ]
+                  [ "LABEL" label_name ] [ var_length ]
                   { edge_flag } { path_constraint } [ node_filter ] [ cost_clause ] "]"
                 | meta_edge_body
-meta_edge_body ::= "<" "[" [ alias ] [ ":" label_expr ] "]" ">"   (* <[e:Type]> *)
-
-label_expr    ::= label { "|" label }                 (* :TYPE|OTHER *)
-label         ::= name
+meta_edge_body ::= "<" "[" edge_selector [ "AS" alias ]
+                   [ "LABEL" label_name ] "]" ">"
 
 var_length    ::= "*" [ length_spec ]
 length_spec   ::= integer ".." integer                (* *1..3 *)
@@ -617,25 +778,26 @@ contains_atom   ::= node_pattern
 atomwalk_pattern ::= atom_endpoint_pattern { atomwalk_step atom_endpoint_pattern }
 
 atom_endpoint_pattern ::= atom_vertex_pattern | atom_edge_pattern
-atom_vertex_pattern ::= "<" "(" [ alias ] [ ":" label_expr ] [ node_filter ] ")" ">"
-atom_edge_pattern   ::= "<" "[" [ alias ] [ ":" label_expr ] [ node_filter ] "]" ">"
+atom_vertex_pattern ::= "<" node_pattern ">"
+atom_edge_pattern   ::= "<" "[" edge_selector [ "AS" alias ]
+                       [ "LABEL" label_name ] [ node_filter ] "]" ">"
 
 atomwalk_step  ::=
       "~[" edge_inner "]~>"      (* Source → Target *)
     | "~[" edge_inner "]~"       (* ненаправленная endpoint-инцидентность *)
     | "<~[" edge_inner "]~"      (* Target ← Source *)
     | "<~[" edge_inner "]~>"     (* двунаправленная endpoint-инцидентность *)
-edge_inner     ::= alias [ ":" label_expr ] | ":" label_expr
+edge_inner     ::= edge_selector [ "AS" alias ] [ "LABEL" label_name ]
 ```
 
 В AtomWalk каждый endpoint обязательно записывается как `<(...)>` для vertex-атома или
-`<[...]>` для edge-атома. Внутри действует обычная семантика паттерна: первая позиция —
-alias, `:label_expr` — необязательное ограничение по label. `atomwalk_step` всегда содержит
-явное связывающее ребро с alias и/или label; пустое `[]` и формы без `[...]` недопустимы.
+`<[...]>` для edge-атома. Внутри действует обычная семантика паттерна: первая позиция — class,
+exact `RecordId` либо `*`; `AS` вводит alias, `LABEL` ограничивает graph-local label.
+`atomwalk_step` всегда содержит явный edge selector; пустое `[]` и формы без `[...]`
+недопустимы.
 Классические `-`/`->` относятся только к `graph_pattern`. В `MATCH HYPER` `contains_atom` проверяется как vertex, а в
 `MATCH ATOM HYPER` каждый `contains_atom` обязан быть `atom_endpoint_pattern`.
-Kind задают delimiters, а не текст label: `<(x:edge)>` остаётся vertex-паттерном с label
-`edge`; edge-паттерн записывается как `<[x:edge]>`.
+Kind задают delimiters и kind выбранного class; label никогда не меняет kind endpoint.
 
 ---
 
@@ -725,21 +887,19 @@ build_source     ::= match_stmt | select_stmt | traverse_stmt | "(" statement ")
 ## 9. DDL — DEFINE / REMOVE / ALTER
 
 ```ebnf
-define_stmt ::= define_table | define_field | define_param | define_function
+define_stmt ::= define_class | define_field | define_param | define_function
               | define_event | define_index | define_analyzer | define_graph
 
 overwrite_or_ifne ::= "OVERWRITE" | "IF" "NOT" "EXISTS"
 if_exists         ::= "IF" "EXISTS"
 ```
 
-### 9.1. DEFINE TABLE
+### 9.1. DEFINE CLASS
 
 ```ebnf
-define_table ::= "DEFINE" "TABLE" [ overwrite_or_ifne ] name
-                 [ "TYPE" ( "ANY" | "NORMAL" | "RELATION" ) ]
+define_class ::= "DEFINE" "CLASS" [ overwrite_or_ifne ] class_name
+                 "TYPE" ( "NODE" | "EDGE" )
                  [ "SCHEMALESS" | "SCHEMAFULL" ]
-                 [ "DROP" ]
-                 [ "AS" select_stmt ]
                  [ "CHANGEFEED" duration_lit ]
                  [ "COMMENT" string_lit ]
 ```
@@ -747,7 +907,8 @@ define_table ::= "DEFINE" "TABLE" [ overwrite_or_ifne ] name
 ### 9.2. DEFINE FIELD
 
 ```ebnf
-define_field ::= "DEFINE" "FIELD" [ overwrite_or_ifne ] name "ON" [ "TABLE" ] name
+define_field ::= "DEFINE" "FIELD" [ overwrite_or_ifne ] name
+                 "ON" "CLASS" class_name
                  [ "TYPE" type ]
                  [ ( "VALUE" | "COMPUTED" ) expr ]
                  [ "DEFAULT" expr ]
@@ -781,7 +942,7 @@ fn_param      ::= ( ident | param ) ":" type
 
 ```ebnf
 define_event ::= "DEFINE" "EVENT" [ overwrite_or_ifne ] name
-                 "ON" ( [ "TABLE" ] name | "GRAPH" name )
+                 "ON" ( "CLASS" class_name | "GRAPH" name )
                  [ "ASYNC" [ "RETRY" integer ] [ "MAXDEPTH" integer ] ]
                  "WHEN" expr
                  "THEN" ( block | expr )
@@ -792,13 +953,14 @@ define_event ::= "DEFINE" "EVENT" [ overwrite_or_ifne ] name
 ### 9.6. DEFINE INDEX
 
 ```ebnf
-define_index ::= define_table_index | define_graph_index
+define_index ::= define_class_index | define_graph_index
 
-(* --- Табличные индексы --- *)
-define_table_index ::= "DEFINE" "INDEX" [ overwrite_or_ifne ] name
-                       "ON" [ "TABLE" ] name
+(* --- Base/effective class indexes --- *)
+define_class_index ::= "DEFINE" "INDEX" [ overwrite_or_ifne ] name
+                       "ON" "CLASS" class_name
                        ( "COUNT"
                        | ( "FIELDS" | "COLUMNS" ) idiom_list [ field_index_kind ] )
+                       index_scope
                        [ "COMMENT" string_lit ]
                        [ "CONCURRENTLY" ]
                        [ "DEFER" ]
@@ -881,11 +1043,11 @@ graph_type       ::= "SIMPLE" | "TREE" | "ROOTED_TREE" | "FOREST" | "DAG"
 remove_stmt ::= "REMOVE" remove_target
 remove_target ::=
       "DATABASE" [ if_exists ] name
-    | "TABLE"    [ if_exists ] name
+    | "CLASS"    [ if_exists ] class_name
     | "GRAPH"    [ if_exists ] name
-    | "EVENT"    [ if_exists ] name "ON" [ "TABLE" ] name
-    | "FIELD"    [ if_exists ] name "ON" [ "TABLE" ] name
-    | "INDEX"    [ if_exists ] name "ON" [ "TABLE" ] name
+    | "EVENT"    [ if_exists ] name "ON" ( "CLASS" class_name | "GRAPH" name )
+    | "FIELD"    [ if_exists ] name "ON" "CLASS" class_name
+    | "INDEX"    [ if_exists ] name "ON" "CLASS" class_name
     | "ANALYZER" [ if_exists ] name
     | "FUNCTION" [ if_exists ] user_fn
     | "PARAM"    [ if_exists ] param
@@ -895,7 +1057,7 @@ remove_target ::=
 
 ```ebnf
 alter_stmt ::= alter_analyzer | alter_database | alter_event | alter_field
-             | alter_function | alter_index | alter_param | alter_table
+             | alter_function | alter_index | alter_param | alter_class
 
 alter_analyzer ::= "ALTER" "ANALYZER" [ if_exists ] name
                    alter_analyzer_action { alter_analyzer_action }
@@ -906,7 +1068,8 @@ alter_analyzer_action ::= "FUNCTION" user_fn | "DROP" "FUNCTION"
 
 alter_database ::= "ALTER" "DATABASE" "COMPACT"
 
-alter_event ::= "ALTER" "EVENT" [ if_exists ] name "ON" [ "TABLE" ] name
+alter_event ::= "ALTER" "EVENT" [ if_exists ] name
+                "ON" ( "CLASS" class_name | "GRAPH" name )
                 alter_event_action { alter_event_action }
 alter_event_action ::= "ASYNC" [ "RETRY" integer ] [ "MAXDEPTH" integer ]
                      | "DROP" "ASYNC"
@@ -914,7 +1077,7 @@ alter_event_action ::= "ASYNC" [ "RETRY" integer ] [ "MAXDEPTH" integer ]
                      | "THEN" ( block | expr_list ) | "DROP" "THEN"
                      | "COMMENT" string_lit | "DROP" "COMMENT"
 
-alter_field ::= "ALTER" "FIELD" [ if_exists ] name "ON" [ "TABLE" ] name
+alter_field ::= "ALTER" "FIELD" [ if_exists ] name "ON" "CLASS" class_name
                 alter_field_action { alter_field_action }
 alter_field_action ::= "DROP" ( "TYPE" | "FLEXIBLE" | "READONLY" | "VALUE"
                                       | "ASSERT" | "DEFAULT" | "COMMENT" | "REFERENCE" )
@@ -928,18 +1091,18 @@ alter_function_action ::= "(" [ fn_param_list ] ")"
                         | "->" type | "DROP" "RETURNS"
                         | block | "COMMENT" string_lit | "DROP" "COMMENT"
 
-alter_index ::= "ALTER" "INDEX" name "ON" "TABLE" name
+alter_index ::= "ALTER" "INDEX" name "ON" "CLASS" class_name
                 ( "COMMENT" string_lit | "PREPARE" "REMOVE" | "DROP" "COMMENT" )
 
 alter_param ::= "ALTER" "PARAM" [ if_exists ] param
                 alter_param_action { alter_param_action }
 alter_param_action ::= "VALUE" expr | "COMMENT" string_lit | "DROP" "COMMENT"
 
-alter_table ::= "ALTER" "TABLE" [ if_exists ] name
-                alter_table_action { alter_table_action }
-alter_table_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
-                     | "COMPACT" | "SCHEMAFULL" | "SCHEMALESS"
-                     | "CHANGEFEED" duration_lit | "COMMENT" string_lit
+alter_class ::= "ALTER" "CLASS" [ if_exists ] class_name
+                alter_class_action { alter_class_action }
+alter_class_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
+                      | "COMPACT" | "SCHEMAFULL" | "SCHEMALESS"
+                      | "CHANGEFEED" duration_lit | "COMMENT" string_lit
 ```
 
 Каждый `ALTER` содержит хотя бы одно действие. Повтор одного свойства и несовместимые действия
@@ -955,17 +1118,20 @@ alter_table_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
 info_stmt ::= "INFO" "FOR" (
                   "SYSTEM"
                 | "DB"
-                | "TABLE" name
-                | "INDEX" name "ON" [ "TABLE" ] name
+                | "CLASS" class_name
+                | "GRAPH" graph_ref
+                | "INDEX" name "ON" "CLASS" class_name
               )
 
-show_changes_stmt ::= "SHOW" "CHANGES" "FOR" "TABLE" name
+show_changes_stmt ::= "SHOW" "CHANGES" "FOR"
+                      ( "CLASS" class_name | "GRAPH" graph_ref )
                       "SINCE" ( datetime_lit | integer | expr )
                       [ "LIMIT" integer ]
 
 kill_stmt ::= "KILL" ( param | expr )
 
-rebuild_stmt ::= "REBUILD" "INDEX" [ if_exists ] name "ON" [ "TABLE" ] name
+rebuild_stmt ::= "REBUILD" "INDEX" [ if_exists ] name
+                 "ON" "CLASS" class_name
                  [ "CONCURRENTLY" ] [ with_options ]
 
 compact_stmt ::= "COMPACT" ( "INDEX" name | "GRAPH" name ) [ "CONCURRENTLY" ]
@@ -1058,7 +1224,7 @@ expect_clause  ::= "EXPECT" ( expr | "EXISTS" | "NOT" "EXISTS" )
 
 (* EXPLAIN — только префиксный оператор (§4.6); суффиксной формы нет *)
 
-target ::= record_range | record_id | table_name | param
+target ::= ( record_range | record_id | class_name ) [ graph_scope ] | param
          | "(" statement ")"          (* подзапрос / (MATCH ...) / (SELECT ...) *)
          | idiom
 ```
@@ -1212,16 +1378,17 @@ alias ::= name
 
 ```ebnf
 (* Цель мутаций и источник выборок *)
-target        ::= record_range | record_id | table_name | param
-                | "(" statement ")" | idiom
+target        ::= ( record_range | record_id | class_name ) [ graph_scope ] | param
+                 | "(" statement ")" | idiom
 
 (* Направления рёбер в паттернах *)
 edge_dir_left  ::= "<-" | "-"
 edge_dir_right ::= "->" | "-"
 
-(* Метки *)
-label_expr ::= label { "|" label }
-label      ::= name
+(* Class и graph-local label являются разными позициями *)
+class_name ::= name
+label_name ::= name
+label      ::= label_name
 ```
 
 Полный синтаксис узлов/рёбер/гипер-/мета-/AtomWalk-паттернов — в §6.
@@ -1252,11 +1419,11 @@ composite_type ::=
     | "object"
     | "option" "<" type ">"
     | "range"  "<" type ">"
-    | "record" "<" table_ref { "|" table_ref } ">"
+    | "record" "<" class_ref { "|" class_ref } ">"
     | "closure" "<" "(" [ type_list ] ")" "->" type ">"
     | "regex" | "geometry" | "error"
 type_list ::= type { "," type }
-table_ref ::= name
+class_ref ::= name
 
 utility_type ::= "computed" "<" type ">" | "formatter" | "matcher" | "cursor"
 
@@ -1279,9 +1446,10 @@ domain_type ::=
 Регистронезависимы. Не могут использоваться как идентификаторы без обрамления обратными кавычками.
 
 **Операторы чтения/записи:** `SELECT`, `ONLY`, `VALUE`, `FROM`, `WHERE`, `SPLIT`, `GROUP`, `ORDER`, `LIMIT`,
-`START`, `FETCH`, `OMIT`, `TIMEOUT`, `TEMPFILES`, `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `RELATE`, `CONTENT`,
-`SET`, `UNSET`, `MERGE`, `PATCH`, `REPLACE`, `RETURN`, `NONE`, `BEFORE`, `AFTER`, `DIFF`, `WEIGHTED`, `HYPER`,
-`TARGETS`, `HEAD`, `TAIL`, `AS`, `DIRECTED`, `UNDIRECTED`, `BOTH`.
+`START`, `FETCH`, `OMIT`, `TIMEOUT`, `TEMPFILES`, `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `RELATE`, `ATTACH`,
+`DETACH`, `TO`, `CONTENT`, `SET`, `UNSET`, `RESET`, `MERGE`, `PATCH`, `REPLACE`, `RETURN`, `NONE`, `BEFORE`,
+`AFTER`, `DIFF`, `WEIGHTED`, `HYPER`, `TARGETS`, `HEAD`, `TAIL`, `AS`, `LABEL`, `CASCADE`, `DIRECTED`,
+`UNDIRECTED`, `BOTH`.
 
 **Паттерн-матчинг / traversal:** `MATCH`, `OPTIONAL`, `DISTINCT`, `ATOM`, `META`, `METAVERTEX`,
 `METAEDGE`, `CONTAINS`, `HEAD`, `TAIL`, `CONSTRAINTS`, `MAXDEPTH`, `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC`,
@@ -1295,8 +1463,9 @@ domain_type ::=
 `READ`, `COMMITTED`, `THROW`, `SLEEP`, `TRY`, `CATCH`, `EXPLAIN`, `ANALYZE`, `FULL`, `FORMAT`, `ASSERT`,
 `INVARIANTS`.
 
-**DDL:** `DEFINE`, `REMOVE`, `TABLE`, `FIELD`, `PARAM`, `FUNCTION`, `EVENT`, `INDEX`, `ANALYZER`, `DATABASE`,
-`OVERWRITE`, `EXISTS`, `NOT`, `TYPE`, `NORMAL`, `RELATION`, `SCHEMALESS`, `SCHEMAFULL`, `ANY`, `DROP`,
+**DDL:** `DEFINE`, `REMOVE`, `CLASS`, `FIELD`, `PARAM`, `FUNCTION`, `EVENT`, `INDEX`, `ANALYZER`, `DATABASE`,
+`OVERWRITE`, `EXISTS`, `NOT`, `TYPE`, `NODE`, `EDGE`, `SCHEMALESS`, `SCHEMAFULL`, `DROP`, `SCOPE`, `BASE`,
+`EFFECTIVE`,
 `CHANGEFEED`, `COMMENT`, `COMPUTED`, `DEFAULT`, `READONLY`, `PURE`, `STABLE`, `IMPURE`, `ASYNC`, `RETRY`,
 `FIELDS`, `COLUMNS`, `UNIQUE`, `COUNT`, `FULLTEXT`, `SEARCH`, `BM25`, `HIGHLIGHTS`, `HNSW`, `DISKANN`,
 `DIMENSION`, `DIST`, `EFC`, `M`, `DEGREE`, `L_BUILD`, `ALPHA`, `HASHED_VECTOR`, `INNER_PRODUCT`,
@@ -1342,15 +1511,15 @@ domain_type ::=
    - каст: `<int> expr` (за `<` следует `type`, затем `>` и операнд);
    - дженерик вызова: `type::is<edge>(x)` (после `ident<`);
    - аннотация графа: `RETURN GRAPH <dag> { … }`, `MATCH … CONSTRAINTS <SIMPLE SHORTEST>`;
-   - открытие meta-атома вне AtomWalk либо endpoint'а внутри AtomWalk: `<(v:Label)>` для
-     vertex и `<[e:Label]>` для edge. После `MATCH ATOM` эти формы всегда означают
+   - открытие meta-атома вне AtomWalk либо endpoint'а внутри AtomWalk: `<(person AS v LABEL Employee)>`
+     для vertex и `<[friendship AS e LABEL CloseFriend]>` для edge. После `MATCH ATOM` эти формы всегда означают
      AtomWalk endpoint; после `RELATE ATOM` — типизированную ссылку на endpoint.
 
    Стратегия: решать по позиции (после `RETURN GRAPH` / `CONSTRAINTS` / `<` перед `(`|`[` → структурная роль;
    в позиции унарного операнда → каст; иначе — сравнение).
 
-2. **`|` — три роли:** логическое ИЛИ `a || b` (двойное), альтернатива меток `:A|B`, ограничители замыкания
-   `|$x| …` и range-генератора `|table:n|`. `||` всегда токенизируется как один токен OR.
+2. **`|` — роли:** логическое ИЛИ `a || b` (двойное), ограничители замыкания
+   `|$x| …` и range-генератора `|class:n|`. `||` всегда токенизируется как один токен OR.
 
 3. **`|>` против `|` `>`:** pipe-оператор `|>` — единый токен, имеет наинизший приоритет.
 
@@ -1359,19 +1528,17 @@ domain_type ::=
 5. **`~`-семейство (AtomWalk):** `~[`, `]~>`, `]~`, `<~[`
    токенизируются жадно только в AtomWalk-контексте (после `MATCH ATOM`, `TRAVERSE ATOM`
    или `RELATE ATOM`). Между операторами всегда разбирается непустая синтаксическая форма
-   ребра `[alias]`, `[:Label]` или `[alias:Label]`; анонимных `~~`, `~>`, `~[]~>` и подобных
+   ребра `[class]`, `[class AS alias]` или `[class AS alias LABEL Label]`; анонимных `~~`, `~>`, `~[]~>` и подобных
    связей нет.
 
 6. **Стрелки:** `->`, `<-`, `<->` разбираются как части `edge_pattern`; в `RELATE` они же задают направление.
 
 7. **`@`-операторы:** `@@`, `@AND@`, `@OR@`, `@1@` (индексируемый) — единые токены полнотекстового поиска.
 
-8. **`record_id` vs `alias:Label`:** в `MATCH` тело `(alias:Label)`/`[alias:Label]` объявляет
-   binding и ограничение по label. В `RELATE` тело endpoint'а содержит `endpoint_ref`, поэтому
-   `table:id` — литерал ссылки на запись, а один `alias` — idiom с ранее связанным значением.
-   `name` задаёт лишь общую лексическую форму этих разных сущностей. Окружающее правило
-   выбирает семантику раньше проверки gap; отсутствие gap затем требуется только между
-   `table`, `:` и `id` внутри уже выбранного `record_id`.
+8. **`record_id`, alias и label:** `class:id` всегда является литералом `record_id`. В pattern
+   первая позиция задаёт class, exact `record_id` либо `*`; binding вводится только через `AS`,
+   graph-local label — только через `LABEL`. Поэтому двоеточие больше не перегружено pattern
+   label-семантикой.
 
 9. **`record_range` vs числовой диапазон / `..`:** `..`/`..=` внутри `id`-части активны только в позиции цели
    (`FROM`, `CREATE`, `UPDATE`, …).

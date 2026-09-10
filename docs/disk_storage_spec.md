@@ -11,6 +11,13 @@ performance gate и Windows GA-core gate из [full_plan.md](full_plan.md) (эт
 sync/NativeAsync не блокируют эту фиксацию: после неё несовместимый Linux layout требует format
 v2 и явной миграции.
 
+**Целевая ревизия этапа 8.1:** `approved-for-implementation`, в текущем коде ещё отсутствует.
+Документационные шаги A0–A4 завершены 2026-09-10; кодовые A5–A16 не начаты.
+Она заменяет graph-owned atom/table candidate на database-level AtomStore и graph-local
+occurrences. При конфликте с сохранёнными ниже legacy layout-примечаниями действуют §§2, 4, 7,
+10–11, 17–18 и 22 в редакции 8.1. Cutover принимает только `FGDC v6`/`FGFC v5`; миграции
+промежуточных кандидатов нет.
+
 ---
 
 ## Содержание
@@ -23,16 +30,16 @@ v2 и явной миграции.
 6. [Константы и магические числа](#6-константы-и-магические-числа)
 7. [Файловая организация](#7-файловая-организация)
 8. [Универсальный заголовок страницы](#8-универсальный-заголовок-страницы)
-9. [DiskAtomRef — стабильный дисковый идентификатор](#9-diskatomref--стабильный-дисковый-идентификатор)
-10. [NodeHotPage — горячие данные вершин](#10-nodehotpage--горячие-данные-вершин)
-11. [EdgeHotPage — горячие данные рёбер](#11-edgehotpage--горячие-данные-рёбер)
+9. [GlobalAtomId и graph-local AtomId/DiskAtomRef](#9-globalatomid-и-graph-local-atomiddiskatomref)
+10. [AtomHotPage и graph-local NodeHotPage](#10-atomhotpage-и-graph-local-nodehotpage)
+11. [Graph-local EdgeHotPage](#11-graph-local-edgehotpage)
 12. [AdjacencyOverflowPage](#12-adjacencyoverflowpage)
 13. [PropHeapPage — куча свойств](#13-propheappage--куча-свойств)
 14. [SubgraphDirPage — директория подграфов](#14-subgraphdirpage--директория-подграфов)
 15. [FreelistPage — управление свободными страницами](#15-freelistpage--управление-свободными-страницами)
 16. [LabelDictionary — интернирование строк](#16-labeldictionary--интернирование-строк)
-17. [GraphSuperblock — суперблок графа](#17-graphsuperblock--суперблок-графа)
-18. [SchemaCatalog — хранилище схем](#18-schemacatalog--хранилище-схем)
+17. [AtomStoreSuperblock и GraphSuperblock](#17-atomstoresuperblock-и-graphsuperblock)
+18. [ClassCatalog и остальные schema definitions](#18-classcatalog-и-остальные-schema-definitions)
 19. [StatisticsStore — статистика для планировщика](#19-statisticsstore--статистика-для-планировщика)
 20. [Индексы](#20-индексы)
 21. [Changefeed и Live-запросы](#21-changefeed-и-live-запросы)
@@ -52,11 +59,13 @@ v2 и явной миграции.
 
 ### 1.1. Цели
 
-- Поддержать **Режим 2** (`gql_tech_spec.md §2.2`): граф не помещается в RAM; горячие страницы в Clock-Pro buffer pool.
-- Поддержать **Режим 3** (гибридный): загрузка подграфа из диска в in-memory MetaGraph через `query_to_memory`.
+- Поддержать **Режим 2** (`gql_tech_spec.md §2.2`): база не помещается в RAM;
+  горячие AtomStore/graph pages обслуживает production `HybridReadEngine`.
+- Поддержать **Режим 3** (гибридный): материализация effective graph view из
+  Mode 1/2 source в owning in-memory graph через `query_to_memory`.
 - Обеспечить хранение всех **persistable** типов GQL (`gql_spec.md §5`); runtime-only,
   mutable/live и transaction-bound значения отклоняются явно.
-- Обеспечить хранение **схемы** (таблицы, поля, индексы, события, функции, анализаторы, параметры).
+- Обеспечить хранение **схемы** (classes, поля, scoped indexes, события, функции, анализаторы, параметры).
 - Обеспечить хранение **статистики** для cost model планировщика (степени, гистограммы, selectivity).
 - Поддержать в core format-v1 candidate primary и scalar standard/unique B+tree. Для count,
   fulltext (BM25), HNSW, geometry, path, reachability и neighbourhood задать целевые
@@ -99,54 +108,36 @@ Windows-first implementation использует `FILE_FLAG_NO_BUFFERING`. Linu
 - `fg-meta` остаётся сырым примером для проверки гипотез и сценариев, но не источником
   требований или production-гарантий. Его `DirectFile`, `BufferPool` и async-код напрямую не
   используются. Production-реализация находится в `src/storage`.
-- `store.rs` — по-прежнему управляет именованными графами и WAL Mode 1.
-- `AtomId` — без изменений; поколение (`gen`) хранится в hot-слоте и восстанавливается при загрузке.
+- Единый database WAL и `HybridReadEngine` переиспользуются; их ключ расширяется до
+  `DataSpaceId`, а не заменяется новым storage framework.
+- 64-битный generation-aware layout сохраняется, но типы разделяются: `GlobalAtomId` адресует
+  AtomStore, graph-local `AtomId` — occurrence.
 
 ---
 
 ## 2. Режимы хранилища
 
-```
-Mode 1: Full In-Memory                          (текущее, без изменений)
-  MetaGraph (in-memory SoA)
-  ↓ checkpoint
-  WAL → Snapshot (.fgr + .wal через store.rs)
-  ↓ recovery
-  load snapshot → replay WAL
+```text
+Mode 1: Full In-Memory
+  DatabaseRoot
+    ├── global AtomStore: RecordId → base atom/properties
+    └── graphs: memberships + topology + labels + sparse overlays
 
-Mode 2: Disk-Backed                             (ЭТА СПЕЦИФИКАЦИЯ)
-  DiskMetaGraph
-    ├── superblock.fgb      (GraphSuperblock)
-    ├── nodes_hot.fgb       (NodeHotPage × N)
-    ├── edges_hot.fgb       (EdgeHotPage × N)
-    ├── adj_over.fgb        (AdjacencyOverflowPage)
-    ├── adj_over_cl.fgb     (CrossLevelAdjacencyOverflowPage)
-    ├── props.fgb           (PropHeapPage)
-    ├── subgraphs.fgb       (SubgraphDirPage)
-    ├── labels.fgb          (LabelDictionary)
-    ├── freelist_*.fgb      (FreelistPage per file)
-    ├── stats/
-    │   ├── graph_stats.fgb (graph counters + degree histograms)
-    │   ├── label_stats.fgb (per-label cardinality)
-    │   └── prop_stats.fgb  (per-property histograms)
-    ├── idx/                (Index files)
-    ├── changefeed/         (Changefeed logs)
-    └── wal/                (WAL segments)
+Mode 2: Disk-Backed
+  atoms/<generation>/    -- database-level AtomStore
+  graphs/<id>/<generation>/ -- graph-local occurrences
+  shared HybridReadEngine keyed by DataSpaceId
 
-Mode 3: Hybrid                                  (поверх Mode 2)
-  DiskMetaGraph (disk backend)
-  ↓ query_to_memory::<T, Frozen>()
-  T<Frozen> (самостоятельный read-optimized граф)
-  или
-  ↓ query_to_memory::<T, Mutable>()
-  T<Mutable> { source_mapping, dirty_set }
-  ↓ explicit flush в новой транзакции
-  DiskMetaGraph
+Mode 3: Query To Memory
+  effective view from Mode 1 or Mode 2
+  ↓ bounded materialization
+  T<Frozen> | T<Mutable> { origin_mapping, dirty_set }
 ```
 
-Оба варианта загружаются на одном `SnapshotId` и освобождают исходный snapshot после полной
-материализации. `Frozen` не имеет flush API; `Mutable` никогда не коммитит изменения скрыто в
-`Drop`.
+Standalone SDK graph остаётся owning materialization и не подменяет нормализованный Mode 1 root.
+Mode 3 загружается на одном `SnapshotId` и освобождает исходный snapshot после полной
+материализации. `Frozen` не имеет flush API; explicit flush `Mutable` пишет только graph-local
+topology/overlay и никогда не меняет base atom неявно или из `Drop`.
 
 ### 2.1. Выбор I/O-режима
 
@@ -198,7 +189,7 @@ I/O-backend не является частью байтового формата
 | 0x0A | `duration`                  | Временной интервал (знаковый)            | 3..18 байт (переменная)    |
 | 0x0B | `uuid`                      | UUID v7 (128 бит)                        | 17 байт                    |
 | 0x0C | `ulid`                      | ULID (128 бит)                           | 17 байт                    |
-| 0x10 | `record_id`                 | RecordId (table:id)                      | 1+переменная               |
+| 0x10 | `record_id`                 | RecordId (class:id)                      | 1+переменная               |
 | 0x11 | `array<T>`                  | Типизированный массив                    | 1+4+Σ(elements)            |
 | 0x12 | `set<T>`                    | Множество уникальных                     | 1+4+Σ(elements)            |
 | 0x13 | `object`                    | Map ключ→значение                        | 1+4+Σ(key_id+value)        |
@@ -215,9 +206,9 @@ I/O-backend не является частью байтового формата
 | 0x33 | `vector_i64`                | Вектор i64                               | 1+2+N×8 байт               |
 | 0x34 | `vector_i32`                | Вектор i32                               | 1+2+N×4 байт               |
 | 0x35 | `vector_i16`                | Вектор i16                               | 1+2+N×2 байт               |
-| 0x36 | `atom_ref`                  | disk_atom_ref(u64 LE)                    | 1 + 8 байт                 |
-| 0x37 | `graph_ref`                 | sg_slot(u32) + sg_gen(u32)               | 1 + 8 байт                 |
-| 0x38 | `qualified_atom_ref`        | sg_slot(u32 LE) + local_ref(u64 LE)      | 1 + 12 байт                |
+| 0x36 | `atom_ref`                  | kind(u8) + canonical RecordId            | переменная                 |
+| 0x37 | `graph_ref`                 | ненулевой graph_id(u64 LE)               | 1 + 8 байт                 |
+| 0x38 | `qualified_atom_ref`        | graph_id(u64 LE) + local_ref(u64 LE)     | 1 + 16 байт                |
 
 Таблица в §5.2 — единственный нормативный реестр `TypeTag`. Теги в этой таблице приведены для
 навигации и обязаны совпадать с ним. `0x14` зарезервирован в format v1 и не переиспользуется:
@@ -365,16 +356,17 @@ GQL определяет доменные типы для атомов и стр
 #### 3.8.1. Хранимые ссылочные типы
 
 Используются как значения свойств для хранения ссылок на элементы графа.
-Тип хранится в одном байте тега, `DiskAtomRef` — в `u64`.
+Тип хранится в одном байте тега. Публичная atom reference использует `RecordId`, а не
+физический slot: ссылка остаётся валидной после COW rebuild и между graph memberships.
 
-| Тег  | GQL тип          | Описание                              | Размер на диске |
-|------|------------------|---------------------------------------|-----------------|
-| 0x36 | `atom`           | Ссылка на любой атом (vertex \| edge) | 1 + 8 байт      |
-| 0x37 | `graph`          | Ссылка на подграф                     | 1 + 8 байт      |
+| Тег  | GQL тип     | Описание                                 | Размер на диске |
+|------|-------------|------------------------------------------|-----------------|
+| 0x36 | `atom`      | kind + ссылка на global atom по RecordId | переменная      |
+| 0x37 | `graph_ref` | каталожная ссылка по ненулевому GraphId  | 1 + 8 байт      |
 
 Кодирование:
-- `atom → tag(u8) + DiskAtomRef(u64)`
-- `graph → tag(u8) + sg_slot(u32) + sg_gen(u32)`
+- `atom → tag(u8) + kind(u8) + canonical RecordId`
+- `graph_ref → tag(u8) + graph_id(u64 LE)`
 
 **Семантика**: тег кодирует тип (атом или граф), разделение атомов происходит на уровне валидации схемы по kind-биту; 
 generic-параметр T (например, `vertex<Person>`) является schema-level ограничением; проверяемым при записи, и не хранится в значении — только в FieldDefinition (§18.4).
@@ -388,45 +380,47 @@ generic-параметр T (например, `vertex<Person>`) является
 | `path`           | Результат запроса; не хранится как значение свойства                   |
 | graph subtypes   | Интерпретационное ограничение на граф; не самостоятельный тип хранения |
 
-Примечание: `metavertex` и `metaedge` — не отдельные хранимые типы. 
-Они отличаются от обычных vertex/edge флагом `is_meta` и наличием
-`subgraph_slot` / `transition_gid`.
-Пользовательский код работает с ними через те же теги 0x36/0x37; meta-семантика определяется схемой и флагами.
+Примечание: `metavertex` и `metaedge` — не отдельные хранимые value types. Их graph occurrence
+содержит `is_meta` и binding вложенного/transition graph. Пользовательская atom reference всё
+равно кодируется тегом 0x36, а самостоятельный `GraphRef` — тегом 0x37.
 
 ### 3.9. QualifiedAtomRef — составной идентификатор кросс-уровневого атома
 
-Когда endpoint ребра принадлежит вложенному подграфу, одного `DiskAtomRef (u64)` недостаточно —
-нужно указать и подграф.
+Когда endpoint edge occurrence принадлежит другому graph space, одного graph-local
+`DiskAtomRef (u64)` недостаточно — нужно указать и `GraphId`.
 
 ```rust
 // DiskAtomRef — для endpoints в том же графе (u64)
 // QualifiedAtomRef — для cross-level endpoints
 struct QualifiedAtomRef {
-    sg_slot:    u32,   // root-arena slot подграфа, содержащего атом
+    graph_id:   u64,   // ненулевой GraphId пространства occurrence
     local_ref:  u64,   // DiskAtomRef в координатах подграфа
 }
 ```
 
-Обычная ссылка `atom_ref` не изменяется — используется для атомов в том же графе; `qualified_atom_ref` — явный маркер кросс-уровневого адреса.
+Обычная property-ссылка `atom_ref` всегда разрешается по global `RecordId` и не зависит от
+membership. `qualified_atom_ref` является внутренним маркером cross-level topology, а не
+публичной заменой `AtomRef`.
 
 При чтении `EdgeHotSlot.source_inline[i]`/`target_inline[i]`:
 - при `CROSS_LEVEL = 0` значение является обычным `DiskAtomRef` текущего графа;
-- при `CROSS_LEVEL = 1` inline хранит только `local_ref`, а соответствующий `*_sg_slot`
+- при `CROSS_LEVEL = 1` inline хранит только `local_ref`, а соответствующий `*_graph_id`
   дополняет его до `QualifiedAtomRef`. Inline допустим лишь для не более двух endpoint'ов одного
-  graph slot; иначе вся сторона находится в `CrossLevelAdjacencyOverflowPage`.
+  graph space; иначе вся сторона находится в `CrossLevelAdjacencyOverflowPage`.
 
 ---
 
 ## 4. RecordId — публичный идентификатор
 
-`RecordId` — публичный идентификатор записи вида `table:id`.
-Он строго отделён от внутреннего `AtomId` (генерационного u64).
+`RecordId` — публичный database-local идентификатор глобального атома вида `class:id`.
+Первая часть задаёт immutable CLASS namespace, вторая уникальна внутри этого class. `RecordId`
+не кодирует graph membership и отделён от внутренних `GlobalAtomId` и graph-local `AtomId`.
 
 ### 4.1. Структура
 
 ```rust
 struct RecordId {
-    table: TableId,   // u32: интернированное имя таблицы
+    class: Text,
     id: RecordIdPart,
 }
 
@@ -444,7 +438,7 @@ enum RecordIdPart {
 
 ```
 tag(u8) = 0x10
-table_id(u32)
+class_id(u32)             -- stable ClassId из FGDC v6
 id_kind(u8):
   0x00 = Int
   0x01 = String
@@ -463,22 +457,25 @@ Payload кодируется так:
 - `Array` — `count(uLEB128) + [StorageValue]`;
 - `Object` — `count(uLEB128) + [key_len(uLEB128) + UTF-8 key + StorageValue]`.
 
-Object-часть `RecordId` не использует `LabelDictionary`: её ключи сортируются
+Class name разрешается в стабильный `ClassId` только через snapshot `ClassCatalog`; неизвестный
+либо удалённый class является ошибкой, а не новым неявным namespace. Object-часть `RecordId` не использует `LabelDictionary`: её ключи сортируются
 лексикографически по UTF-8 bytes, duplicate keys запрещены. Это делает ID каноническим и
 переносимым между графами. Индексирование произвольного object как обычного B+tree key не
 поддерживается; primary index сравнивает канонически закодированный `RecordId`.
 
-### 4.3. Отображение RecordId ↔ AtomId
+### 4.3. Отображение RecordId ↔ global atom ↔ graph occurrence
 
-Каждая запись в таблице имеет:
+Каждый atom имеет:
 
-- `RecordId` — публичный (хранится как свойство `id` в PropHeapPage).
-- `AtomId` — внутренний (slot + generation, только in-memory).
-- `DiskAtomRef` — стабильный дисковый (kind + slot без generation, u64).
+- `RecordId` — публичный `class:id`, логически стабильный в пределах БД;
+- `GlobalAtomId` — внутренний generation-aware адрес base slot в AtomStore;
+- ноль или более graph occurrences, каждая со своим graph-local `AtomId` и `DiskAtomRef`.
 
-Маппинг `RecordId → DiskAtomRef` хранится в B+tree индексе
-`primary.fgidx`, общем для всех таблиц одного graph address space. Ключ включает canonical
-table name, поэтому одинаковые id-part разных таблиц не конфликтуют.
+AtomStore `primary.fgidx` хранит один unique mapping `canonical RecordId → GlobalAtomId` для всей
+БД. Class включён в canonical key, поэтому одинаковые id-parts разных classes не конфликтуют.
+Graph `membership.fgidx` хранит `GlobalAtomId → graph-local DiskAtomRef`, а database
+`memberships.fgidx` — обратное перечисление occurrences. Ни один из этих индексов не выводит
+membership из строки `RecordId`.
 
 ### 4.4. Генерация ID по умолчанию
 
@@ -523,7 +520,7 @@ datetime            →  0x09 + i64(seconds LE) + u32(nanos LE) + u32(tz_id LE)
 duration            →  0x0A + header(u16 LE) + [uLEB128 per unit × count]
 uuid                →  0x0B + 16 байт (raw big-endian)
 ulid                →  0x0C + 16 байт (raw big-endian)
-record_id           →  0x10 + table_id(u32 LE) + id_kind(u8) + [id_payload]
+record_id           →  0x10 + class_id(u32 LE) + id_kind(u8) + [id_payload]
 array               →  0x11 + count(uLEB128) + [StorageValue]×count
 set                 →  0x12 + count(uLEB128) + [StorageValue sorted]×count
 object              →  0x13 + count(uLEB128) + [(key_id u32 LE + StorageValue)]×count
@@ -541,9 +538,9 @@ vec_f32             →  0x32 + dim(u16 LE) + [f32 LE]×dim
 vec_i64             →  0x33 + dim(u16 LE) + [i64 LE]×dim
 vec_i32             →  0x34 + dim(u16 LE) + [i32 LE]×dim
 vec_i16             →  0x35 + dim(u16 LE) + [i16 LE]×dim
-atom_ref            →  0x36 + disk_atom_ref(u64 LE)
-graph_ref           →  0x37 + sg_slot(u32) + sg_gen(u32)
-qualified_atom_ref  →  0x38 + sg_slot(u32 LE) + local_ref(u64 LE)
+atom_ref            →  0x36 + kind(u8) + record_id_body
+graph_ref           →  0x37 + graph_id(u64 LE)
+qualified_atom_ref  →  0x38 + graph_id(u64 LE) + local_ref(u64 LE)
 ```
 
 `option<T>` не имеет собственного кодирования: `Some(v)` кодируется как `v`, `None` — как
@@ -603,7 +600,7 @@ PAGE_PAYLOAD_SIZE     = 16352     -- PAGE_SIZE - PAGE_HEADER_SIZE
 NULL_PAGE             = 0xFFFF_FFFF_FFFF_FFFF  -- u64::MAX: нет страницы
 NULL_SLOT             = 0xFFFF_FFFF            -- u32::MAX: нет слота
 NULL_LABEL            = 0xFFFF_FFFF            -- u32::MAX: нет метки
-NULL_TABLE            = 0xFFFF_FFFF            -- u32::MAX: нет таблицы
+NULL_CLASS            = 0xFFFF_FFFF            -- u32::MAX: нет class
 
 -- Магические числа страниц (4 байта, little-endian в поле header.magic)
 MAGIC_NODE_HOT        = 0x01_4E_48_46   -- b"FHN\x01"
@@ -630,6 +627,10 @@ MAGIC_IDX_PATH        = 0x01_50_49_46   -- b"FIP\x01"  (path)
 MAGIC_IDX_EE          = 0x01_45_49_46   -- b"FIE\x01"  (EdgeEndpoint)
 MAGIC_CHANGEFEED      = 0x01_46_43_46   -- b"FCF\x01"
 MAGIC_TENSOR          = 0x01_43_54_46   -- b"FTC\x01"  (TensorCache)
+MAGIC_ATOM_STORE      = 0x01_53_41_46   -- b"FAS\x01"  (AtomStoreSuperblock)
+MAGIC_ATOM_HOT        = 0x01_48_41_46   -- b"FAH\x01"  (AtomHotPage)
+MAGIC_OVERLAY         = 0x01_56_4F_46   -- b"FOV\x01"  (GraphOverlayPage)
+MAGIC_CLASS_STATS     = 0x01_53_43_46   -- b"FCS\x01"  (ClassStatistics)
 
 -- Версия формата
 STORAGE_FORMAT_VERSION = 1
@@ -639,9 +640,10 @@ STORAGE_FORMAT_VERSION = 1
 
 ## 7. Файловая организация
 
-Нормативная Windows-first организация format-v1 candidate:
+Нормативная организация target layout этапа 8.1 разделяет database-level AtomStore и
+graph-local occurrences:
 
-```
+```text
 <database>/
   db.lock                               -- exclusive ownership handle
   db.fgb                                -- атомарно заменяемый DatabaseSuperblock
@@ -650,225 +652,153 @@ STORAGE_FORMAT_VERSION = 1
     <first_lsn:016x>.wal                -- единый frame-WAL уровня БД
   schema/
     catalog.fgb                         -- DatabaseCatalog + FileCatalog
+  atoms/
+    <generation_uuid>/
+      superblock.fgb
+      atoms_hot.fgb
+      properties.fgb
+      freelist_atoms.fgb
+      freelist_props.fgb
+      primary.fgidx
+      memberships.fgidx
+      stats/
+        class_stats.fgb
+        prop_stats.fgb
+      idx/
+        std_<ordinal:04>.fgidx
+        uniq_<ordinal:04>.fgidx
+        cnt_<class_id>.fgidx
   graphs/
     <graph_id:016x>/
-      <generation_uuid>/                -- immutable COW-поколение address space
-        superblock.fgb                  -- GraphSuperblock
+      <generation_uuid>/
+        superblock.fgb
         nodes_hot.fgb
         edges_hot.fgb
         adjacency_overflow.fgb
         adj_over_cl.fgb
-        properties.fgb
+        overlays.fgb
         subgraphs.fgb
         labels.fgb
-        freelist_nodes.fgb              -- freelist для nodes_hot.fgb
-        freelist_edges.fgb              -- freelist для edges_hot.fgb
-        freelist_props.fgb              -- freelist для properties.fgb
-        freelist_adj.fgb                -- freelist для adjacency_overflow.fgb
-        freelist_adj_cl.fgb             -- freelist для adj_over_cl.fgb
-        freelist_subgraphs.fgb          -- freelist для subgraphs.fgb
+        freelist_nodes.fgb
+        freelist_edges.fgb
+        freelist_adj.fgb
+        freelist_adj_cl.fgb
+        freelist_overlays.fgb
+        freelist_subgraphs.fgb
+        membership.fgidx
         stats/
           graph_stats.fgb               -- graph counters + degree histograms
           label_stats.fgb               -- per-label cardinality
           prop_stats.fgb                -- per-property histograms
-        primary.fgidx                   -- общий unique RecordId → DiskAtomRef
         idx/
-          lbl_node_<id>.fgidx           -- label index (nodes)
-          lbl_edge_<id>.fgidx           -- label index (edges)
-          std_<ordinal:04>.fgidx        -- Standard B+tree
-          uniq_<ordinal:04>.fgidx       -- Unique B+tree
-          cnt_<table_id>.fgidx          -- Count index
+          cls_<class_id>.fgidx
+          lbl_node_<label_id>.fgidx
+          lbl_edge_<label_id>.fgidx
+          std_<ordinal:04>.fgidx
+          uniq_<ordinal:04>.fgidx
+          cnt_<class_id>.fgidx
 ```
+
+`atoms/superblock.fgb` содержит checkpoint-owned `AtomStoreSuperblock`; это не
+`GraphSuperblock`. Global primary отображает canonical `RecordId → GlobalAtomId`.
+`memberships.fgidx` является обратным database index `GlobalAtomId → graph occurrences`.
+В каждом графе `membership.fgidx` отображает `GlobalAtomId → DiskAtomRef` локальной occurrence.
+Base secondary indexes размещаются в AtomStore; explicit effective indexes — в выбранном графе.
 
 Путь поколения и каждый `DataFileId` публикуются только через каталоги; пользовательские имена
-в filesystem path не попадают. Старые поколения удаляются startup-GC после захвата `db.lock` и
-только если они недостижимы из durable catalog.
+в filesystem path не попадают. `ordinal`, `class_id` и `label_id` — проверенные числовые
+компоненты. Старые поколения удаляются startup-GC после захвата `db.lock` и только если они
+недостижимы из durable catalog.
 
-Следующее дерево — ненормативный целевой эскиз для namespace/store-контейнеров, snapshots,
-changefeed и специализированных индексов последующих этапов; перечисленные в нём файлы не
-входят в текущий format-v1 candidate:
+Primary, standard/unique scalar, class membership, Label и Count layouts входят в target core
+format v1. Specialized index layouts остаются отдельными draft side-files. Их добавление после
+freeze требует собственного conformance gate, а изменение core bytes — format v2.
 
-```
-<store_dir>/
-  store.fgb                             -- глобальный суперблок хранилища (engine version, magic)
-  <namespace>/
-    ns.fgb                              -- суперблок namespace
-    <database>/
-      db.fgb                            -- суперблок БД: format_version, last_back_compat_version,
-                                        --               глобальные LSN/TxId/CommitTs, каталог графов
-      wal/
-        <lsn_hex>.wal                   -- ЕДИНЫЙ журнал уровня БД (frame-WAL, §22)
-      snapshot/
-        <lsn_hex>.snap                  -- снимки MVCC (режим 1)
-      mvcc.chk                          -- CheckpointHeader
-      schema/
-        catalog.fgb                   -- SchemaCatalog root
-        tables.fgb                    -- DEFINE TABLE definitions
-        fields.fgb                    -- DEFINE FIELD definitions
-        indexes.fgb                   -- DEFINE INDEX metadata
-        events.fgb                    -- DEFINE EVENT definitions
-        functions.fgb                 -- DEFINE FUNCTION bodies
-        analyzers.fgb                 -- DEFINE ANALYZER definitions
-        params.fgb                    -- DEFINE PARAM values
-      graphs/<graph_id_hex>/<generation_uuid>/
-        superblock.fgb                  -- GraphSuperblock (page 0 этого пространства)
-        nodes_hot.fgb                   -- NodeHotPage: flags, kind, gen, label_id, adjacency inline
-        edges_hot.fgb                   -- EdgeHotPage: topo, flags, gen, label_id, weight, endpoints inline
-        adjacency_overflow.fgb          -- AdjacencyOverflowPage: для вершин с degree > 16/8
-        adj_over_cl.fgb                 -- CrossLevelAdjacencyOverflowPage
-        properties.fgb                  -- PropHeapPage: PropertyMap в slotted-page layout
-        subgraphs.fgb                   -- SubgraphDirPage: арена подграфов
-        labels.fgb                      -- LabelDictionary: node/edge labels + prop keys
-        freelist_nodes.fgb              -- FreelistPage для nodes_hot.fgb
-        freelist_edges.fgb              -- FreelistPage для edges_hot.fgb
-        freelist_props.fgb              -- FreelistPage для properties.fgb
-        freelist_adj.fgb                -- FreelistPage для adjacency_overflow.fgb
-        freelist_adj_cl.fgb             -- FreelistPage для adj_over_cl.fgb
-        freelist_subgraphs.fgb          -- FreelistPage для subgraphs.fgb
-        primary.fgidx                   -- graph-wide primary B+tree (RecordId → DiskAtomRef)
-        stats/
-          graph_stats.fgb               -- node/edge counts, degree histograms
-          label_stats.fgb               -- per-label cardinality
-          prop_stats.fgb                -- per-property histograms + selectivity
-        idx/
-          lbl_node_<id>.fgidx           -- label index (nodes)
-          lbl_edge_<id>.fgidx           -- label index (edges)
-          std_<ordinal:04>.fgidx        -- Standard B+tree; identity хранится в catalog
-          uniq_<ordinal:04>.fgidx       -- Unique B+tree; identity хранится в catalog
-          cnt_<table_id>.fgidx          -- count index
-          ft_<label_id>_<key_id>.fgidx  -- fulltext inverted index
-          vec_<label_id>_<key_id>.fgidx -- HNSW vector index
-          geo_<ordinal:04>.fgidx        -- geometry R-tree index
-          reach_<ordinal:04>.fgidx      -- reachability index
-          nbh_<ordinal:04>.fgidx        -- neighbourhood index
-          path_<ordinal:04>.fgidx       -- path index
-          ee_endpoint.fgidx             -- edge endpoint index
-          freelists/
-            freelist_pk_<table_id>.fgb
-            freelist_std_<ordinal:04>.fgb
-            freelist_uniq_<ordinal:04>.fgb
-            freelist_ft_<id>.fgb
-            freelist_geo_<ordinal:04>.fgb
-            freelist_ee_endpoint.fgb
-        changefeed/
-          <table_id>_<since_lsn>.fcf    -- changefeed log segments
+### 7.1. Домен журналирования и `DataSpaceId`
+
+Журнал (`wal/`), clocks и checkpoint publication принадлежат **базе данных**, а не отдельному
+графу. Один commit атомарно публикует base atoms, reverse memberships, graph occurrences,
+topology, overlays и indexes и выполняет один WAL durability barrier независимо от числа
+затронутых графов.
+
+Адресное пространство задаёт crate-private value:
+
+```text
+DataSpaceId::Database          = 0
+DataSpaceId::Graph(GraphId)    = GraphId.get(), всегда > 0
+PageKey = (DataSpaceId, DataFileId, PageNo)
 ```
 
-Primary, standard/unique scalar, Label и Count layouts из §§20.1–20.4 входят в реализуемый
-core format v1. Остальные index magic/layout ниже остаются draft-контрактами будущих side-files
-и не означают implementation/release status. Каждый такой advanced index получает собственную
-версию и отдельный conformance gate; изменение core-страниц или catalog layout после Windows
-freeze требует format v2.
+`GraphId` является `NonZeroU64`; system graph не существует. Значение `0` адресует только
+database-level AtomStore и catalog files. Транзакция не может охватывать две базы данных или два
+namespace. Backfill можно планировать по data space, но обрезка единого WAL использует общий
+watermark.
 
-### 7.1. Домен журналирования — база данных, а не граф
+### 7.2. DatabaseCatalog `FGDC v6` и FileCatalog `FGFC v5`
 
-Журнал (`wal/`), снимки и `CheckpointHeader` лежат на уровне **базы данных**, а не отдельного графа. Это следствие двух независимых требований.
+`db.fgb` хранит root-page ссылки; канонические каталоги лежат в `schema/catalog.fgb` и
+публикуются тем же frame-WAL commit, что data pages:
 
-**1. Глобальные часы обязательны для кросс-граф чтения.** Логическая видимость версии —
-`version.commit_ts ≤ snapshot.commit_ts`; видимость WAL-фрейма — `frame.commit_lsn ≤
-snapshot.visible_lsn`. Если бы эти часы выдавались локально для графа, значения двух графов были
-бы попарно **несравнимы**. `CommitTs` и LSN имеют разные назначения и друг с другом не
-сравниваются. Кросс-граф чтение (`MATCH ... FROM g1, g2`, `BUILD GRAPH x FROM MATCH ... FROM y`) —
-штатная возможность языка, поэтому глобальные `LSN` / `TxId` / `CommitTs` нужны в любом случае.
-А раз единая точка сериализации уже оплачена, per-graph журналы лишь отбирают атомарность.
+- `DatabaseCatalog` (`FGDC`, payload version 6): `next_graph_id`, `next_schema_id`,
+  database-wide property dictionary, versioned CLASS/FIELD/INDEX definitions, graph catalog,
+  AtomStore generation/bindings и глобальные параметры;
+- `FileCatalog` (`FGFC`, payload version 5): sealed mapping
+  `(DataSpaceId, DataFileId) → (companion_of, role, validated relative path)`.
 
-**2. Каталоги уровня БД не помещаются ни в один per-graph журнал.** `schema/*`, список графов и сам `db.fgb` общие для всех графов. `DEFINE GRAPH`, `BUILD GRAPH <name>`, `REMOVE GRAPH` создают или удаляют каталог графа и правят `db.fgb`: в момент создания журнала графа ещё нет, в момент удаления — уже нет. Атомарно это выразимо только в журнале уровня БД.
+Каждая запись `FGFC v5` сохраняет 32-байтовый fixed header:
 
-Следствия:
-- Транзакция атомарна над любым числом графов и таблиц одной БД; один коммит — один `fsync` независимо от числа затронутых графов ([gql_spec §17.7](gql_spec.md)).
-- Транзакция **не может** охватывать две БД или два namespace — отвергается статически.
-- `SYSTEM_GRAPH_ID = 0` — системное пространство: каталог схемы, каталог графов, параметры, функции и таблицы, объявленные без указания графа.
-- Бэкфилл (перенос фреймов в `.fgb`) остаётся **пографовым** и планируется независимо; глобальной является только обрезка журнала (§23.1).
-- Отделение графа в самостоятельный набор файлов (`DETACH GRAPH`) требует предварительного бэкфилла до состояния покоя — это административная операция, не бесплатная.
+```text
+0   8   space_id; 0 = Database, >0 = GraphId
+8   8   file_id
+16  8   companion_of_file_id; 0 = отсутствует
+24  2   path_len
+26  1   role
+27  5   reserved = 0
+32  ... canonical UTF-8 relative path
+```
 
-### 7.2. Каталог графов
+`companion_of` обязателен только для `DataFileKind::Freelist`; для прочих kinds он отсутствует.
+Target существует в том же `DataSpaceId` и UUID-generation, не является freelist, superblock,
+statistics либо immutable side-file и имеет ровно один companion. В AtomStore companions нужны
+для `AtomsHot` и `Properties`; в graph space — для `NodesHot`, `EdgesHot`,
+`AdjacencyOverflow`, `CrossLevelAdjacencyOverflow`, `Overlays` и `Subgraphs`.
 
-`db.fgb` хранит только две root-page ссылки. Сами канонические каталоги лежат в
-`schema/catalog.fgb` и публикуются тем же frame-WAL commit, что graph pages:
+Оба catalog payload разбиты на bounded chain страниц `SystemCatalog`. Каждая страница содержит
+`FGC1`, catalog kind, page-codec version, `next_page`, длину chunk/полного payload и нулевые
+reserved/trailing bytes; суммарный payload ограничен 16 МиБ до allocation.
 
-- `DatabaseCatalog` (`FGDC`, payload version 5): `next_graph_id`,
-  `next_schema_id`, database-wide словарь property keys, graph address spaces,
-  versioned definitions графов/таблиц/полей/индексов и глобальные параметры;
-- `FileCatalog` (`FGFC`, payload version 4): sealed mapping
-  `(GraphId, DataFileId) → (companion_of, role, validated relative path)`.
+Class definition хранит стабильные `ClassId`/`SchemaVersion`, immutable имя и `NODE|EDGE` kind,
+`SCHEMALESS|SCHEMAFULL`, versioned fields и metadata base indexes. Graph definition хранит
+ненулевой `GraphId`, имя, family, storage mode, generation и bindings graph-local indexes.
+`GraphRef` не кодируется как `RecordId`. Удаление graph удаляет только его catalog entry,
+occurrences, topology, overlays и effective indexes; global atoms и classes сохраняются.
 
-Декодер format-v1 принимает только `FGDC v5`; промежуточный `FGDC v4` несовместим и не
-мигрируется. Версия повышена из-за durable `SCHEMALESS|SCHEMAFULL`, состояния secondary index
-и optional physical binding, а не из-за изменения прежних `IndexId` bytes.
-
-Каждая запись `FGFC v4` имеет 32-байтовый fixed header: `graph_id: u64` по offset 0,
-`file_id: u64` по offset 8, `companion_of_file_id: u64` по offset 16 (`0` означает отсутствие),
-`path_len: u16` по offset 24, `role: u8` по offset 26 и пять нулевых reserved bytes по offset
-27. После header следуют ровно `path_len` байт канонического UTF-8 relative path. Декодер
-format-v1 принимает только `FGFC v4`; промежуточный `FGFC v3` несовместим и не мигрируется.
-
-`companion_of` обязателен только для `DataFileKind::Freelist`. Target обязан существовать в
-том же `GraphId` и UUID-поколении; один target имеет ровно один freelist. В format-v1 target
-может быть только `NodesHot`, `EdgesHot`, `Properties`, `AdjacencyOverflow`,
-`CrossLevelAdjacencyOverflow` или `Subgraphs`. Для каждого такого файла freelist обязателен.
-`SystemCatalog`, `GraphSuperblock`, statistics и immutable side-files companion не имеют.
-
-Оба payload разбиты на chain страниц `SystemCatalog`. Каждая страница содержит `FGC1`, kind,
-page-codec version 1, `next_page`, `chunk_len`, `total_len` и нулевые reserved/trailing bytes;
-суммарный payload ограничен 16 МиБ до allocation.
-
-Запись корневого графа хранит `graph_id`, family, `created_lsn`, стабильный UUID и revision,
-primary-index `(DataFileId, root)`, graph properties и UTF-8 `RecordId`/name. Для внутреннего
-вложенного address space дополнительно обязательна тройка
-`(parent_graph_id, subgraph_slot, parent_atom)`; у корня все три поля отсутствуют. Slot 0
-зарезервирован за текущим графом, nested slots начинаются с 1 и уникальны во всём дереве одного
-root-графа. Внутренние записи используют зарезервированную таблицу `__fg_nested`, не появляются
-в публичном списке именованных графов и не могут быть созданы пользовательским API.
-
-Запись именованного root-графа дополнительно хранит стабильные `schema_id`/`schema_version`
-и такие же пары для engine-owned `label`/`adjacency` indexes. У внутренних nested address
-spaces эти поля равны нулю: они не являются отдельными пользовательскими DDL-объектами.
-
-Запись таблицы хранит собственные `schema_id`/`schema_version`, owning `GraphId` (`0` для
-таблицы системного графа), kind, `SCHEMALESS|SCHEMAFULL`,
-versioned поля `(schema_id, schema_version, name, PropertyKeyId, Type)`, engine-owned primary
-index и versioned scalar-index metadata `(index_id, schema_version, name,
-standard|unique|count, ready|stale|prepared_for_removal, ordered PropertyKeyId[],
-optional DataFileId/root)`. Отсутствующий physical binding допустим только у `stale` или
-`prepared_for_removal` secondary
-индекса таблицы системного графа. Индексы внутри таблицы
-отсортированы по имени. Параметр хранит стабильные identity/version, имя и canonical
-`StorageValue` вместе с нужными словарями. `DatabaseSuperblock.graph_count` считает все
-физические graph address spaces, включая вложенные; публичный каталог фильтрует только
-root-записи.
-
-Удаление графа атомарно удаляет из нового каталога корень, все его nested address spaces,
-таблицы и file bindings. До публикации нового каталога старые WAL frames остаются разрешимыми;
-после публикации недостижимые COW-поколения удаляет startup-GC.
+Decoder target layout принимает только `FGDC v6` и `FGFC v5`. Реализованные промежуточные
+`FGDC v5`/`FGFC v4` и graph-owned atom layout возвращают typed incompatible-format error и не
+мигрируются, поскольку core format v1 ещё не заморожен.
 
 **Расширения файлов:**
 
-- `.fgb` — Ferros-Grynn Binary (данные хранилища).
-- `.fgidx` — Ferros-Grynn Index.
-- `.wal` — Write-Ahead Log.
-- `.snap` — Snapshot.
-- `.fcf` — Ferros-Grynn Changefeed.
+- `.fgb` — Ferros-Grynn Binary;
+- `.fgidx` — Ferros-Grynn Index;
+- `.wal` — Write-Ahead Log;
+- `.snap` — Snapshot;
+- `.fcf` — Ferros-Grynn Changefeed;
 - `.chk` — Checkpoint header.
 
 ### 7.3. Идентичность physical data-файла (format v1)
 
-Логическая identity индекса и identity его физического поколения разделены:
+| Значение        | Назначение                                                   |
+|-----------------|--------------------------------------------------------------|
+| `ClassId`       | стабильная logical identity class из общего `next_schema_id` |
+| `IndexId`       | стабильная logical identity index из того же schema clock    |
+| `SchemaVersion` | версия definition                                            |
+| `DataSpaceId`   | database-level либо graph-local address space                |
+| `DataFileId`    | identity конкретного physical file одного COW-generation     |
+| `ordinal`       | безопасная generation-local часть index filename             |
 
-| Значение        | Назначение                                                                                                                                                 |
-|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `IndexId`       | стабильная логическая identity определения индекса; типизированный `SchemaId` из общего `next_schema_id`                                                   |
-| `SchemaVersion` | версия определения индекса                                                                                                                                 |
-| `DataFileId`    | identity конкретного физического файла одного COW-поколения                                                                                                |
-| `ordinal`       | безопасная generation-local позиция по `IndexId` только для имени файла внутри UUID-поколения; Standard/Unique используют общую плотную последовательность |
-
-`IndexId` занимает прежний durable `u32`; переход `FGDC v4 → v5` вызван добавлением
-`TableSchemaMode`, наблюдаемого состояния индекса и optional physical binding. Физический
-binding при commit/reopen разрешается по `IndexId`, после чего обязательно сверяются name,
-kind, ordered fields и `SchemaVersion`. Пользовательское имя служит отображению и проверке
-уникальности, но никогда не участвует в filesystem path. `DataFileId` может измениться при COW
-rebuild, тогда как `IndexId` сохраняется.
-
-Каждый файл, который может быть адресован из WAL, имеет закрытый `DataFileKind`:
+Physical index binding разрешается по `IndexId`; затем сверяются name, scope, kind, ordered
+fields и `SchemaVersion`. `DataFileId` может измениться при COW rebuild, а `IndexId` сохраняется.
 
 | Значение | `DataFileKind`                |
 |----------|-------------------------------|
@@ -882,26 +812,29 @@ rebuild, тогда как `IndexId` сохраняется.
 | `0x08`   | `Subgraphs`                   |
 | `0x09`   | `Labels`                      |
 | `0x0a`   | `Freelist`                    |
-| `0x0b`   | `Statistics` (graph/degree)   |
+| `0x0b`   | `Statistics`                  |
 | `0x0c`   | `Index`                       |
 | `0x0d`   | `TensorCache`                 |
 | `0x0e`   | `LabelStatistics`             |
 | `0x0f`   | `PropertyStatistics`          |
+| `0x10`   | `AtomStoreSuperblock`         |
+| `0x11`   | `AtomsHot`                    |
+| `0x12`   | `Overlays`                    |
+| `0x13`   | `ClassStatistics`             |
 
-`0x00` и `0x10..=0xff` зарезервированы. Неизвестное значение при открытии или recovery —
-повреждение хранилища, а не forward-compatible расширение.
+`0x00` и `0x14..=0xff` зарезервированы. До написания codecs новые discriminants и соответствующие
+page types обязаны получить golden vectors. Неизвестное значение при open/recovery является
+повреждением либо incompatible format, но не молча пропускаемым расширением.
 
-```
+```text
 DataFileId = (instance_id << 8) | DataFileKind
-PageKey    = (GraphId, DataFileId, PageNo)
+PageKey    = (DataSpaceId, DataFileId, PageNo)
 ```
 
-`instance_id` занимает 56 бит, никогда не переиспользуется и различает несколько индексов,
-freelist/statistics-файлов одного семейства. Путь не выводится из недоверенных байтов WAL:
-открыватель БД один раз строит и запечатывает registry
-`(GraphId, DataFileId) → (role, trusted path, DirectFile для WAL-backfilled role)`.
-`GraphSuperblock` не удерживает handle: на Windows это обязательно для atomic replace, а старый
-handle после rename ссылался бы на прежний file object. Отсутствующий id — fatal corruption.
+`instance_id` занимает 56 бит и не переиспользуется. Registry строится только из проверенного
+`FGFC v5`: `(DataSpaceId, DataFileId) → (role, trusted path, DirectFile)`. Superblock files не
+удерживают долгоживущий Windows handle, чтобы atomic replace не оставлял ссылку на старый file
+object. Отсутствующий id является fatal corruption.
 
 ---
 
@@ -1034,7 +967,15 @@ Total = 32 байт
 0x0035  ChangefeedHeader
 0x0036  ChangefeedEntry
 0x0037  TensorCache
+0x0038  AtomStoreSuperblock
+0x0039  AtomHot
+0x003A  GraphOverlay
+0x003B  ClassStatistic
 ```
+
+`0x0038..=0x003B` принадлежат target layout 8.1. Их точные offset tables и golden page bytes
+должны быть добавлены в этот документ и утверждены до первого production codec на шаге A8;
+использовать Rust struct layout как временный дисковый ABI запрещено.
 
 **Флаги страницы (битовые):**
 
@@ -1057,14 +998,17 @@ Total = 32 байт
 
 ---
 
-## 9. DiskAtomRef — стабильный дисковый идентификатор
+## 9. GlobalAtomId и graph-local AtomId/DiskAtomRef
 
-`AtomId` (u64 из `id.rs`) содержит поколение (gen) — runtime-концепция для генерационной инвалидации.
-На диске поколение избыточно: оно хранится внутри hot-слота и восстанавливается при загрузке.
+`GlobalAtomId` и graph-local `AtomId` — разные Rust newtypes с одинаковой packed layout. Первый
+адресует base slot AtomStore, второй — occurrence slot одного graph. Смешивание типов без явного
+resolve запрещено. Для локальной `DiskAtomRef` поколение хранится в hot slot и восстанавливается
+при загрузке; database primary/reverse membership сохраняют полный generation-aware
+`GlobalAtomId`, чтобы stale global handle не мог привязаться к переиспользованному base slot.
 
 ### 9.1. Разрядность
 
-**AtomId = u64**
+**GlobalAtomId / AtomId = u64**
 
 ```
 биты 63..41   gen         u23  (8 388 608 поколений на слот)
@@ -1072,7 +1016,7 @@ Total = 32 байт
 биты 39..0    slot_index  u40  (1 099 511 627 776 слотов на каждый kind)
 ```
 
-**DiskAtomRef = u64** — то же, без поколения:
+**DiskAtomRef = u64** — graph-local occurrence reference без поколения:
 
 ```
 бит  40       kind        0=Node, 1=Edge
@@ -1082,9 +1026,10 @@ Total = 32 байт
 
 Null-значения: `NULL_DISKATOMREF = u64::MAX`, `NULL_SLOT = 0xFF_FFFF_FFFF` (все 40 бит slot_index).
 
-**Почему u40, а не u31.** Прежний `u31` давал потолок ~2.1 млрд атомов каждого вида на граф — мало для движка, заявленного как универсальный метаграфовый на масштабе. u40 даёт ~1.1 трлн, что заведомо перекрывает любой граф, помещающийся на одну машину, и при этом `AtomId` остаётся ровно `u64`: расширение до `u128` удвоило бы размер handle и ударило по кэш-локальности SoA — той самой, ради которой выбрана раскладка «горячее отдельно от холодного».
+**Почему u40, а не u31.** u40 даёт ~1.1 трлн slots на kind в AtomStore либо одном graph space,
+сохраняя handle ровно `u64`; `u128` удвоил бы размер hot references и ухудшил плотность SoA.
 
-**Адресация не переполняется.** При `slot_index` до 2⁴⁰ номер страницы `page_no = slot / 102` не превосходит ≈1.08·10¹⁰, что укладывается в `u64` с запасом (≈285 ТБ при 16 КиБ на страницу). Пространства имён `label_id`, `table_id`, `key_id`, `sg_slot` остаются `u32` — они нумеруют метки, таблицы, ключи и подграфы, а не атомы, и с числом атомов не связаны.
+**Адресация не переполняется.** При `slot_index` до 2⁴⁰ номер страницы `page_no = slot / 102` не превосходит ≈1.08·10¹⁰, что укладывается в `u64` с запасом (≈285 ТБ при 16 КиБ на страницу). Пространства имён `label_id`, `class_id`, `key_id` и локальные subgraph slots остаются `u32` — они нумеруют schema/graph metadata, а не атомы, и с числом атомов не связаны.
 
 ```rust
 const KIND_SHIFT: u32 = 40;
@@ -1112,16 +1057,34 @@ fn from_disk_ref(r: DiskAtomRef, gen: u32) -> AtomId {
 
 ---
 
-## 10. NodeHotPage — горячие данные вершин
+## 10. AtomHotPage и graph-local NodeHotPage
 
-### 10.1. NodeHotSlot (160 байт, фиксированный)
+Target layout 8.1 хранит здесь **node occurrences**, а не owning atoms. Обязательные logical
+fields: local generation, `GlobalAtomId`, optional `LabelId`, `has_overlay` + optional overlay
+reference, graph-local adjacency, meta/nested binding и flags. `ClassId`, canonical `RecordId` и
+base properties читаются из AtomStore и в graph slot не дублируются. Если `has_overlay = 0`, read
+path не обращается к `overlays.fgb`.
+
+Global `AtomHotPage` (`PageType 0x0039`) хранит base atom slots: generation, immutable kind,
+`ClassId`, canonical `RecordId`/primary binding, base `PropertyRef` и flags. `GraphOverlayPage`
+(`0x003A`) хранит только sparse pairs `PropertyKeyId → Value|Hidden` для конкретной occurrence.
+`Hidden` кодируется внутренним overlay tag, которого нет в canonical `StorageValue`; он не может
+декодироваться как пользовательские `NONE` или `NULL`. Отсутствие pair означает наследование
+актуального base value, а `RESET` физически удаляет pair.
+Точные offset tables и golden bytes этих трёх target slots должны быть утверждены здесь до A8/A9.
+
+Следующий 160-байтовый layout описывает реализованный graph-owned кандидат до этапа 8.1. Он
+сохраняется как migration/debug evidence, но `FGDC v6` его не читает и новый writer его не
+создаёт.
+
+### 10.1. Legacy NodeHotSlot (отклонён target layout 8.1)
 
 ```
 Offset  Size  Тип        Поле             Описание
 0       4     u32        gen              Поколение для восстановления AtomId
 4       4     u32        subgraph_slot    root-arena slot внутреннего графа; NULL_SLOT иначе
 8       4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
-12      4     u32        table_id         SchemaCatalog `schema_id` таблицы; NULL_TABLE = нет
+12      4     u32        legacy_table_id  Удалённое поле graph-owned кандидата; u32::MAX = нет
 16      4     u32        adj_out_count    Общее кол-во исходящих рёбер (inline + overflow)
 20      4     u32        adj_in_count     Общее кол-во входящих рёбер
 24      4     u32        adj_undir_count  Общее кол-во неориентированных рёбер
@@ -1150,14 +1113,12 @@ Total = 160 байт
 - Если `kind_flags.tombstone = 1`, остальные поля не гарантированы (кроме `gen`).
 - Если `adj_out_count > 4`, первая overflow-страница: `overflow_out`.
 - `adj_out[]` заполняется с индекса 0; `NULL_SLOT` — конец inline части.
-- `table_id` — стабильный `SchemaId` в диапазоне `1..u32::MAX`; `u32::MAX`
-  зарезервирован как `NULL_TABLE`. Значение не является ordinal словаря и не выводится из
-  `RecordId.table`.
-- Membership относится к точному `(kind, slot, gen)`: удаление атома, переиспользование
-  slot или удаление таблицы не может оставить membership для нового поколения.
-- `table_id` используется планировщиком для быстрой фильтрации по таблице.
+- `legacy_table_id` не входит в target layout 8.1; class определяется global atom.
+- Legacy membership относился к точному `(kind, slot, gen)`; это поле целиком удаляется из
+  target occurrence slot.
+- target class filtering использует `cls_<class_id>.fgidx`, а не поле occurrence slot.
 
-### 10.2. NodeHotPage layout
+### 10.2. Legacy NodeHotPage layout
 
 ```
 Offset   Size   Содержимое
@@ -1180,9 +1141,16 @@ byte_offset      = 32 + slot_within_page × 160
 
 ---
 
-## 11. EdgeHotPage — горячие данные рёбер
+## 11. Graph-local EdgeHotPage
 
-### 11.1. EdgeHotSlot (160 байт, фиксированный)
+Target `EdgeHotSlot` также является occurrence. Он хранит local generation, `GlobalAtomId`,
+optional graph-local label/overlay, topology, weight, endpoint arrays и nested/transition graph
+binding. Class/kind identity и base properties принадлежат global atom; один и тот же edge
+`RecordId` может иметь разные topology/weight/label в разных graphs.
+
+Ниже приведён только отклонённый graph-owned layout предыдущего кандидата.
+
+### 11.1. Legacy EdgeHotSlot (отклонён target layout 8.1)
 
 ```
 Offset  Size  Тип        Поле             Описание
@@ -1206,7 +1174,7 @@ Offset  Size  Тип        Поле             Описание
 8       4     u32        source_count     Кол-во source endpoint'ов (total, ≤2 inline)
 12      4     u32        target_count     Кол-во target endpoint'ов (total, ≤2 inline)
 16      4     u32        label_id         Интернированный id метки; NULL_LABEL = нет
-20      4     u32        table_id         SchemaCatalog `schema_id` таблицы; NULL_TABLE = нет
+20      4     u32        legacy_table_id  Удалённое поле graph-owned кандидата; u32::MAX = нет
 24      8     f64        weight           NaN = нет веса
 32      4     u32        transition_gid   root-arena slot transition graph; NULL_SLOT = нет
 36      4     u32        source_sg_slot   root-arena slot всех source_inline; NULL_SLOT = текущий граф
@@ -1243,8 +1211,7 @@ Total = 160 байт
 - Inline- и overflow-части логически образуют один массив на каждой стороне. `RELATE ...
   ORDER BY TAIL/TARGETS` обязывает запись, compaction и recovery сохранять порядок этого
   массива; без такого предложения API не обещает порядок обхода.
-- `table_id` подчиняется тому же generation-aware membership contract, что NodeHotSlot:
-  `u32::MAX` означает отсутствие таблицы, а `RecordId.table` не определяет membership.
+- `legacy_table_id` не входит в target layout 8.1; edge class определяется global atom.
 
 **Хранение cross-level endpoints:**
 - Для CROSS_LEVEL=0: `source_inline`/`target_inline` содержат DiskAtomRef в пространстве текущего графа.
@@ -1256,7 +1223,7 @@ Total = 160 байт
 - Slot 0 означает текущий graph address space. Slots `1..=u32::MAX-1` назначаются единой
   root-arena и не переиспользуются другим вложенным графом того же root, даже на иной глубине.
 
-### 11.2. EdgeHotPage layout
+### 11.2. Legacy EdgeHotPage layout
 
 ```
 Offset   Size   Содержимое
@@ -1548,7 +1515,8 @@ Format-v1 создаёт отдельный `FreelistPage` только для �
 `nodes_hot.fgb`, `edges_hot.fgb`, `properties.fgb`, `adjacency_overflow.fgb`,
 `adj_over_cl.fgb` и `subgraphs.fgb`. Их companions соответственно называются
 `freelist_nodes.fgb`, `freelist_edges.fgb`, `freelist_props.fgb`, `freelist_adj.fgb`,
-`freelist_adj_cl.fgb` и `freelist_subgraphs.fgb`; связь хранится явно в `FGFC v4.companion_of`.
+`freelist_adj_cl.fgb`, `freelist_overlays.fgb` и `freelist_subgraphs.fgb`; связь хранится явно
+в `FGFC v5.companion_of`.
 Superblock, labels, statistics и immutable index side-files freelist не имеют. Пока
 incremental page allocation не реализован, каждый из шести freelist-файлов содержит одну
 валидную пустую страницу и не читается обычным index/page hot path.
@@ -1572,14 +1540,15 @@ Total = PAGE_SIZE байт
 2. BSF (bit-scan forward) по bitmap → первый bit=1.
 3. Если не найден — расширить файл (grow), добавить страницы, обновить bitmap.
 4. Установить bit=0 (занять), записать WAL
-   `PageInit { graph_id, file_id: DataFileId, page_type, page_no }`; первая содержательная запись
+   `PageInit { space_id: DataSpaceId, file_id: DataFileId, page_type, page_no }`; первая содержательная запись
    этой страницы обязана использовать полный `PageFrame` (§22.2).
 
 ---
 
 ## 16. LabelDictionary — интернирование строк
 
-Интернирует: метки вершин/рёбер, имена таблиц, ключи свойств, имена полей.
+Интернирует graph-local labels, ключи свойств и имена полей. Имена classes принадлежат
+database `ClassCatalog` и не зависят от graph label dictionary.
 
 ### 16.1. Структура files labels.fgb
 
@@ -1588,7 +1557,6 @@ Page 0:      LabelDictHeader
 Page 1..N:   DictEntryPage    (NodeLabel entries)
 Page N+1..:  DictEntryPage    (EdgeLabel entries)
 ...          DictEntryPage    (PropKey entries)
-...          DictEntryPage    (TableName entries)
 ...          HashIndexPage    (string → id lookup)
 ...          TzHashIndexPage  (IANA name → tz_id)
 ...          DictEntryPage    (TzName entries)
@@ -1606,11 +1574,11 @@ Offset  Size  Тип    Поле                                 Описани�
 32      4     u32    node_label_count                     Число зарегистрированных node-меток
 36      4     u32    edge_label_count                     Число зарегистрированных edge-меток
 40      4     u32    prop_key_count
-44      4     u32    table_name_count
+44      4     —      _reserved0                            Все нули; class names живут в ClassCatalog
 48      8     u64    node_entries_first_page              Первая страница с NodeLabel entries
 56      8     u64    edge_entries_first_page
 64      8     u64    prop_key_first_page
-72      8     u64    table_name_first_page
+72      8     —      _reserved1                            Все нули
 80      8     u64    hash_index_first_page                Первая страница hash-индекса
 88      8     u64    tz_hash_index_first_page             Первая страница TzName hash-индекса
 96      8     u64    tz_entries_first_page                Первая страница TzName entries
@@ -1658,9 +1626,21 @@ HashIndexPage:
 
 ---
 
-## 17. GraphSuperblock — суперблок графа
+## 17. AtomStoreSuperblock и GraphSuperblock
 
-Точка входа для каждого именованного графа. Атомарно обновляется (tmp → rename).
+Target layout имеет два разных checkpoint-owned суперблока:
+
+- `AtomStoreSuperblock` в `atoms/<generation>/superblock.fgb` владеет counts/page ceilings
+  `atoms_hot.fgb` и `properties.fgb`, AtomStore generation и backfill clock;
+- `GraphSuperblock` в `graphs/<graph_id>/<generation>/superblock.fgb` владеет только counts/page
+  ceilings occurrence/topology/overlay/label/subgraph files данного ненулевого `GraphId`.
+
+Ни один из них не является mutable data page и не проходит через обычный `stage_frame`.
+Оба публикуются metadata COW и становятся authority только вместе с соответствующим durable
+catalog head/checkpoint. Точные target offset tables должны быть утверждены до A8/A9.
+
+Следующий offset layout является отклонённым graph-owned кандидатом и сохраняется только как
+историческая справка; `FGDC v6` его не принимает.
 
 ```
 Offset  Size  Тип    Поле
@@ -1690,24 +1670,24 @@ Offset  Size  Тип    Поле
 312     ...   —      _reserved                  только нули
 ```
 
-`PageHeader.page_lsn` хранит LSN соответствующего `CheckpointEnd`. `GraphSuperblock` принадлежит
-checkpoint-протоколу: обычный `stage_frame` не имеет права писать его через WAL. Частично
-продвинутый graph superblock после crash не становится глобальной authority, пока тем же
-checkpoint не заменён `db.fgb`.
+`PageHeader.page_lsn` target superblock хранит LSN соответствующего `CheckpointEnd`. Частично
+продвинутый AtomStore/graph superblock после crash не становится глобальной authority, пока тем
+же checkpoint не заменён `db.fgb`.
 
-**Checkpoint-owned протокол format v1:** обычный `stage_frame` по-прежнему не пишет
-`GraphSuperblock` в WAL. Изменение его динамических полей публикуется узким metadata COW:
+**Checkpoint-owned протокол format v1:** обычный `stage_frame` не пишет
+`AtomStoreSuperblock` или `GraphSuperblock` в WAL. Изменение их динамических полей публикуется
+узким metadata COW:
 
 1. неизменяемые идентификаторы WAL-backfilled data-файлов сохраняются, а изменённые и новые
    страницы этих файлов помещаются в ту же frame-WAL транзакцию;
-2. writer создаёт и синхронизирует отдельный одно-страничный `GraphSuperblock`, содержащий новую
-   логическую раскладку, но прежние checkpoint generation/backfill clocks;
+2. writer создаёт и синхронизирует отдельный одно-страничный superblock затронутого data space,
+   содержащий новую логическую раскладку, но прежние checkpoint generation/backfill clocks;
 3. та же WAL-транзакция переключает durable catalog с прежнего superblock-файла на новый;
 4. только durable `TxCommit` одновременно делает видимыми catalog head, новый superblock и
    data-page frames. До него действует прежняя пара catalog/superblock; после него старый snapshot
    продолжает читать прежние версии страниц по своему `visible_lsn`;
-5. checkpoint переносит committed frames на штатные места, атомарно заменяет только текущую
-   страницу `GraphSuperblock` с новыми checkpoint clocks и последним заменяет `db.fgb`.
+5. checkpoint переносит committed frames на штатные места, атомарно заменяет текущие
+   AtomStore/graph superblocks с новыми checkpoint clocks и последним заменяет `db.fgb`.
 
 Commit и checkpoint сериализуются одной локальной catalog critical section. Поэтому перед
 кодированием metadata COW writer берёт `generation`, `backfilled_lsn` и
@@ -1732,11 +1712,13 @@ bounded mutation такого графа завершается явной ош�
 
 ---
 
-## 18. SchemaCatalog — хранилище схем
+## 18. ClassCatalog и остальные schema definitions
 
-`SchemaCatalog` — единственный логический владелец schema definitions и принадлежности атомов
-таблицам. Реализованное ядро format v1 хранит именованные root-графы, таблицы, поля,
-Standard/Unique indexes, глобальные параметры и engine-owned primary/label/adjacency indexes.
+`SchemaCatalog` владеет schema definitions, но не data membership. `ClassCatalog` задаёт
+namespace `RecordId`, immutable `NODE|EDGE` kind, fields и base/effective index definitions.
+Принадлежность class выводится из `RecordId.class`; graph membership хранится отдельно в graph
+state. Target format v1 хранит root graphs, classes, fields, scoped Standard/Unique/Count indexes,
+глобальные параметры и engine-owned primary/class/label/adjacency indexes.
 События, функции, анализаторы, changefeed/live definitions и расширенные index kinds ниже
 остаются зарезервированным расширением соответствующих этапов и не сериализуются writer'ом
 format v1 до реализации их полного контракта.
@@ -1749,34 +1731,34 @@ format v1 до реализации их полного контракта.
   переиспользуемый после удаления;
 - ненулевой `version: u32`; семантически изменённое определение сохраняет identity и
   увеличивает version, а новое после удаления получает новый identity;
-- owning graph/table identity там, где объект вложен в другое определение;
+- owning class или graph identity там, где объект вложен в другое определение;
 - типизированное определение, которое кодируется явно, а не произвольным Rust derive.
 
-Identity `0` зарезервирован, а `u32::MAX` является `NULL_TABLE` в hot slots; допустимые
-`SchemaId` и `IndexId` лежат в `1..u32::MAX`. `IndexId` — отдельный публичный newtype для
+Identity `0` и `u32::MAX` зарезервированы; допустимые `ClassId`, `SchemaId` и `IndexId` лежат в
+`1..u32::MAX`. `ClassId` и `IndexId` — отдельные публичные newtypes для
 индексного контекста, но отдельного clock или второго durable integer не вводит.
 `next_schema_id: u64` хранит первую ещё не выданную identity
 и входит в атомарно публикуемый `DatabaseCatalog`.
 
 ### 18.2. Физическая публикация реализованного ядра
 
-Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 5 (§7.2). Payload
+Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 6 (§7.2). Payload
 разбит на bounded chain страниц `SchemaRoot`: общий `PageHeader`, marker `FGC1`, catalog kind,
 page-codec version, `next_page`, длина chunk/полного payload и нулевые reserved bytes.
 Checksum проверяется до декодирования, общий payload ограничен 16 МиБ.
 
-| Объект                | Обязательное durable определение                                                                                     |
-|-----------------------|----------------------------------------------------------------------------------------------------------------------|
-| Root graph            | identity/version, graph family, engine-owned label/adjacency identity/version и graph catalog metadata               |
-| Table                 | identity/version, имя, owning `GraphId`, kind, schema mode и engine-owned primary identity/version                   |
-| Field                 | identity/version, имя, `PropertyKeyId` и `Type`                                                                      |
-| Standard/Unique index | `IndexId`/version, имя, раздельный kind, state, ordered fields и optional physical binding                           |
-| Parameter             | identity/version, имя и canonical `StorageValue` bytes со словарями                                                  |
-| Atom membership       | точный `(GraphId, AtomId(kind, slot, gen)) → Table SchemaId`; в local storage дублируется в соответствующем hot slot |
+| Объект                | Обязательное durable определение                                                                    |
+|-----------------------|-----------------------------------------------------------------------------------------------------|
+| Root graph            | `GraphId`/version, имя, graph family/storage mode и engine-owned graph index metadata               |
+| Class                 | `ClassId`/version, immutable имя, `NODE                                                             |EDGE`, schema mode и поля                                                  |
+| Field                 | identity/version, owning `ClassId`, имя, `PropertyKeyId` и `Type`                                   |
+| Standard/Unique/Count | `IndexId`/version, owning `ClassId`, explicit scope, kind, state, ordered fields и physical binding |
+| Parameter             | identity/version, имя и canonical `StorageValue` bytes со словарями                                 |
+| Graph membership      | `GraphId + GlobalAtomId → graph-local DiskAtomRef`; data relation, не schema definition             |
 
-RAM и local backends используют один membership contract; форма пользовательского
-`RecordId` не назначает таблицу. У одного атома одновременно не более одной таблицы. Удаление
-атома или таблицы очищает membership той же транзакцией.
+RAM и local backends используют одну identity model. Один global atom принадлежит ровно одному
+class по `RecordId`, но может иметь любое число graph memberships. Удаление class требует
+отсутствия atoms и schema/index/reference dependencies; удаление graph не удаляет global atoms.
 
 Schema change проходит FCW validation относительно snapshot, а определения, изменённые graph
 pages/index generations и оба catalog root публикуются одним database-level WAL commit.
@@ -1784,19 +1766,17 @@ Primary/label/adjacency имеют каталожную identity даже ког
 inline layout; пользователь не может удалить их отдельно.
 
 Подразделы 18.3–18.7 задают логические определения для последующего расширения DDL. Их
-псевдо-layout не является byte-offset layout payload `FGDC` v5; writer format v1 кодирует
+псевдо-layout не является byte-offset layout payload `FGDC` v6; writer format v1 кодирует
 только реализованные поля из таблицы выше и обязан отвергать ещё не поддержанные варианты.
 
-### 18.3. TableDefinition (def format)
+### 18.3. ClassDefinition (def format)
 
 ```
-Offset  Size  Тип    Поле  
-0       1     u8     type_flags                                 -- ANY=0, NORMAL=1, RELATION=2, SCHEMALESS|SCHEMAFULL bits
-1       1     u8     drop_flag                                  -- DROP = 1
-2       1     u8     has_as_select
-3       1     u8    _pad
-4       8     u64    changefeed_duration_ns                     -- 0 = нет changefeed; >0 = длительность хранения в нс
-12      var   -      [as_select_query: len(u32) + utf8_bytes]   -- если has_as_select
+Offset  Size  Тип    Поле
+0       1     u8     atom_kind                  -- 0=Node, 1=Edge
+1       1     u8     schema_mode                -- 0=SCHEMALESS, 1=SCHEMAFULL
+2       2     u8[2]  reserved = 0
+4       8     u64    changefeed_duration_ns     -- 0 = нет changefeed
 ```
 
 ### 18.4. FieldDefinition
@@ -1822,6 +1802,7 @@ COMPUTED-поле не хранится в PropHeapPage. При SELECT executor 
 
 ```
 index_name_id: u32
+class_id:      u32
 index_kind:    u8  -- 0=Standard, 1=Unique, 2=Count, 3=Fulltext,
                    -- 4=HNSW, 5=reserved for DiskANN, 6=Geometry,
                    -- 7=Reachability, 8=Neighbourhood, 9=Path
@@ -1829,11 +1810,17 @@ field_count:   u8
 field_ids:     [u32] × field_count
 flags:         u8  -- bit0=CONCURRENT, bit1=DEFERRED
 status:        u8  -- 0=building_initial, 1=building_update, 2=ready, 3=error
+scope_kind:    u8  -- 0=Base, 1=Effective
+scope_graph:   u64 -- 0 для Base; ненулевой GraphId для Effective
 [fulltext_params]  -- если kind=3: analyzer_id(u32) + bm25_k1(f32) + bm25_b(f32) + highlights(u8)
 [hnsw_params]      -- если kind=4: dimensions(u32) + elem_type(u8: F64/F32/I64/I32/I16)
                    --              dist_metric(u8) + efc(u32) + m(u32) + m0(u32) + lm_scaled(f32)
 [geo_params]       -- если kind=6: geometry_field_type(u8)
 ```
+
+Для пользовательских Standard/Unique/Count `scope_kind` обязателен. Base index читает только
+global class atoms; Effective index является полным index по memberships одного `scope_graph` и
+их `overlay Value|Hidden|absent` view. Implicit scope и частичный overlay-only index запрещены.
 
 Значение `index_kind = 5` зарезервировано, но writer core format v1 не имеет права его
 сериализовать: layout параметров и side-file `DISKANN` ещё не определён (§20.6.4). Reader той же
@@ -1953,9 +1940,9 @@ Offset  Size  Тип    Поле
 point-DML, уменьшающего степень. `analyzed_revision == revision && dirty_rows == 0` означает, что
 bulk-распределения соответствуют текущей ревизии.
 
-Точные per-table counts входят в логический `StatisticsStore`, но не дублируются в этом файле:
-их authority — generation-aware membership в `SchemaCatalog`. При commit/reopen они
-транзакционно пересчитываются из того же catalog root.
+Точные per-class base counts хранятся в `atoms/stats/class_stats.fgb`; graph-local class counts
+строятся по occurrences и относятся к `graph_stats.fgb`. Ни один count не выводится из schema
+membership: class задаёт `RecordId`, graph membership — отдельный data relation.
 
 ### 19.2. LabelStatsPage
 
@@ -1975,27 +1962,31 @@ bulk-пересчёт удаляет такие записи.
 
 ### 19.3. PropertyHistogramPage
 
-Гистограмма для одного `(table_id, field_id)`:
+Гистограмма для одного `(class_id, field_id, scope)`:
 
 ```
 Offset                  Size                Тип     Содержимое
 0                       32                  -       PageHeader (magic=MAGIC_STATS, type=PropertyHistogram)
-32                      4                   u32     table_id
+32                      4                   u32     class_id
 36                      4                   u32     field_id
-40                      1                   u8      type_tag
-41                      1                   u8      _pad
-42                      8                   u64     distinct_count  -- NDV (number of distinct values)
-50                      4                   f32     null_fraction   -- доля NULL/NONE значений
-54                      2                   u16     bucket_count
-56                      8 × bucket_count    [u64]   offsets         -- массив смещений бакетов
-56 + 8 × bucket_count   -                   -       buckets: [lo_len(u16) + hi_len(u16) + lo_value + hi_value + freq(u64) + ndv(u64)] × bucket_count
+40                      1                   u8      scope_kind      -- 0=Base, 1=Effective
+41                      1                   u8      type_tag
+42                      6                   u8[6]   reserved = 0
+48                      8                   u64     scope_graph     -- 0 для Base; GraphId для Effective
+56                      8                   u64     distinct_count  -- NDV
+64                      4                   f32     null_fraction
+68                      2                   u16     bucket_count
+70                      2                   u16     reserved = 0
+72                      8 × bucket_count    [u64]   offsets
+72 + 8 × bucket_count   -                   -       buckets: [lo_len(u16) + hi_len(u16) + lo_value + hi_value + freq(u64) + ndv(u64)] × bucket_count
 ```
 
 Bucket значения кодируются compact order-preserving encoding (§20.2.1). Смещения строго
 возрастают, первый bucket начинается сразу после массива offsets, а последний заканчивается до
 границы страницы; неиспользованный хвост заполнен нулями. `distinct_count`, bucket `freq` и
 bucket `ndv` точны для последнего bulk-пересчёта. `null_fraction` учитывает отсутствующие,
-`NONE` и `NULL` значения среди членов соответствующей таблицы.
+`NONE` и `NULL` значения среди atoms соответствующего class/scope. Effective scope вычисляет
+overlay `Value|Hidden|absent` до добавления наблюдения.
 
 Один histogram занимает одну страницу. Неподдерживаемый тип, значение, которое нельзя безопасно
 закодировать индексным codec, либо распределение, не помещающееся в страницу, приводит к
@@ -2032,7 +2023,7 @@ Per-label degree histogram допустим только для node label. В �
 
 ### 19.6. Обновление статистики
 
-- **Point-DML:** транзакционная дельта один раз при commit обновляет точные graph/table/label
+- **Point-DML:** транзакционная дельта один раз при commit обновляет точные graph/class/label
   counts, label `property_count` и degree totals. Membership-only delta также увеличивает
   `dirty_rows`, поскольку меняет выборку property histogram. Page 0 `graph_stats.fgb` и полный
   `label_stats.fgb` публикуются в той же frame-WAL транзакции, что и данные. Degree pages в
@@ -2073,13 +2064,14 @@ Primary, Standard/Unique, Label и Count side-files сначала строят�
 
 Отсутствующий, неоткрываемый или не прошедший checksum secondary index исключается из физического
 registry, но его schema definition сохраняется: access path обязан перейти к корректному
-primary/table scan. Недоступный primary index остаётся фатальным повреждением. Fulltext/HNSW/
+primary/class scan или graph-occurrence scan с тем же scope. Недоступный primary index
+остаётся фатальным повреждением. Fulltext/HNSW/
 R-tree и остальные специализированные индексы ниже описывают последующие этапы и не маскируют
 своё отсутствие.
 
 ### 20.2. B+tree Property Index (standard и unique)
 
-`Standard` и `Unique` остаются разными `TableIndexKind` и разными физическими контрактами:
+`Standard` и `Unique` остаются разными `ClassIndexKind` и разными физическими контрактами:
 Standard leaf хранит posting list, Unique leaf допускает ровно один atom и проверяет нарушение
 уникальности до публикации. Общий внутренний модуль/codec B+tree может называться `scalar`, но
 это не третий kind и не имя durable файла. Файлы называются `std_<ordinal:04>.fgidx` и
@@ -2112,7 +2104,7 @@ duration  → нормализация из UnitSet-bitmask (формат хра
              Примечание: "1 месяц 0 дней" > "0 месяцев 31 день" — это намеренное
              соглашение, не зависящее от длины конкретного месяца.
 uuid/ulid → big-endian 16 байт (UUIDv7/ULID монотонны по времени в big-endian)
-record_id → escaped canonical UTF-8 table name + terminator + tagged id_part encoding
+record_id → escaped canonical UTF-8 class name + terminator + tagged id_part encoding
 ```
 
 Outer prefix обязателен для каждого поля, поэтому `none < null < present` совпадает с runtime
@@ -2163,7 +2155,7 @@ range<T>  → start_encoding || end_encoding:
 
 ── Доменные типы ───────────────────────────────────────────────────────
 ```
-record ref           → canonical table name + canonical RecordId part
+record ref           → canonical class name + canonical RecordId part
 vertex/edge/atom ref → canonical RecordId соответствующего AtomRef
 ```
 
@@ -2286,7 +2278,7 @@ Composite index строится по нескольким полям однов
 → если есть `DEFINE INDEX ON person FIELDS age, city` → один B+tree lookup
 
 **Определение**:
-`DEFINE INDEX idx_age_city ON TABLE person FIELDS age, city`
+`DEFINE INDEX idx_age_city ON CLASS person FIELDS age, city SCOPE BASE`
 
 Создаёт B+tree с составным ключом: сначала кодируется `age`, затем `city`.
 Порядок полей в `DEFINE INDEX` определяет порядок сортировки в индексе.
@@ -2300,7 +2292,7 @@ Composite index строится по нескольким полям однов
 
 Format-v1 tree поддерживает эти byte ranges. Текущий sync vertical slice выбирает single-field
 index для equality/range и composite index только при equality по всем его полям. Остальные
-prefix/composite формы намеренно деградируют к корректному table scan до появления cost-based
+prefix/composite формы намеренно деградируют к корректному class/graph-occurrence scan до появления cost-based
 planner; полный predicate и SSI registration выполняются независимо от выбранного access path.
 
 **Формирование ключа**:
@@ -2377,11 +2369,10 @@ fn encode_string_terminal(s: &str) -> Vec<u8> {
 
 #### 20.2.7. Primary Index (`primary.fgidx`)
 
-Каждый graph address space содержит один обязательный unique B+tree
-`canonical full RecordId → DiskAtomRef`. Имя таблицы кодируется фактическим UTF-8, а не локальным
-dictionary id; id-part поддерживает Int, String, Uuid, Ulid, Array и Object. Поэтому один primary
-index обслуживает все node/relation tables графа и остаётся стабильным при ином порядке
-интернирования после reopen.
+AtomStore содержит один обязательный unique B+tree
+`canonical full RecordId → GlobalAtomId`. Имя class кодируется стабильным `ClassId`, а id-part
+поддерживает Int, String, Uuid, Ulid, Array и Object. Graph address space не дублирует primary:
+он использует `membership.fgidx` (`GlobalAtomId → graph-local DiskAtomRef`).
 
 #### 20.2.8. Альтернативы B+tree и обоснование выбора
 
@@ -2454,7 +2445,7 @@ Stage-7 core layout хранит полные encoded keys и требует т�
 
 **Блочное сжатие (вторичный кандидат).** Сжатие всей полезной нагрузки страницы целиком по аналогии с контрактом `PropHeapPage` (§13.3) через `FLAG_COMPRESSED`. Оно требует распаковки страницы перед любым обращением и не включено в текущий B+tree codec.
 
-Если этот вариант будет принят, выбор алгоритма должен быть табличным, а не глобальным: у разных данных разный профиль. Поле `block_compressor` в production `TableDefinition` пока отсутствует.
+Если этот вариант будет принят, выбор алгоритма должен принадлежать конкретному class/index, а не быть глобальным: у разных данных разный профиль. Поле `block_compressor` в target `ClassDefinition` пока отсутствует.
 
 | Значение             | Когда уместно                                                                             |
 |----------------------|-------------------------------------------------------------------------------------------|
@@ -2468,28 +2459,31 @@ Stage-7 core layout хранит полные encoded keys и требует т�
 
 ### 20.3. Count Index
 
-Хранит единственное значение — число живых записей в таблице.
+Хранит число живых atoms одного class в явном Base либо Effective scope.
 
 ```
 CountIndexPage (единственная страница):
   PageHeader(32)  (magic=MAGIC_IDX_COUNT, type=IndexCountSingle)
-  table_id:    u32
-  _pad:        u32
+  class_id:    u32
+  scope_kind:  u8    -- 0=Base, 1=Effective
+  _pad:        u8[3] -- нули
+  scope_graph: u64   -- 0 для Base; ненулевой GraphId для Effective
   atom_count:  u64   -- число живых атомов
   last_updated_lsn: u64
   created_at_lsn: u64
-  _pad:        16320
+  _pad:        16312
 ```
 
 Обновляется атомарно при каждом INSERT/DELETE в той же транзакции.
-Используется для `SELECT count() FROM @table` + `GROUP ALL` без scan.
+Используется для `SELECT count() FROM @class [IN GRAPH @graph]` + `GROUP ALL` без scan.
 
-`table_id` обязан быть ненулевым, `_pad` и хвост страницы — нулевыми, а файл содержит ровно
+`class_id` обязан быть ненулевым; scope согласован с `scope_graph`; `_pad` и хвост страницы
+нулевые, а файл содержит ровно
 одну page 0. При первоначальной COW-сборке `created_at_lsn = last_updated_lsn = 0`: side-file
 становится видимым только через catalog commit, поэтому предварительно угадывать его LSN нельзя.
 При последующей membership delta WAL writer присваивает `last_updated_lsn` тот же LSN, что и
 page frame, и заново считает checksum до записи frame. Abort оставляет прежний Count видимым.
-Недоступный Count index не используется; точный результат получается обычным table scan.
+Недоступный Count index не используется; точный результат получается обычным class/membership scan.
 
 ### 20.4. Label Index (обязательный, неявный)
 
@@ -2530,7 +2524,7 @@ primary/base pages.
 ```
 PageHeader(32) (magic=MAGIC_IDX_FT, type=IndexFulltextHeader)
 index_name_id:    u32
-table_id:         u32
+class_id:         u32
 field_id:         u32
 analyzer_id:      u32
 avg_doc_len:      f32    -- средняя длина документа (обновляется)
@@ -2623,7 +2617,7 @@ IDF(t) = ln(1 + (doc_count - doc_freq(t) + 0.5) / (doc_freq(t) + 0.5))
 ```
 PageHeader(32) (magic=MAGIC_IDX_VEC, type=IndexVector)
 index_name_id:    u32
-table_id:         u32
+class_id:         u32
 field_id:         u32
 elem_type:        u8   -- 0=F64, 1=F32, 2=I64, 3=I32, 4=I16
 dist_metric:      u8   -- 0=EUCLIDEAN, 1=COSINE, 2=MANHATTAN, 3=MINKOWSKI, 4=CUSTOM
@@ -2699,7 +2693,7 @@ Spatial index для `geo::` операторов: `INSIDE`, `INTERSECTS`, `OUTS
 ```
 PageHeader(32) (magic=MAGIC_IDX_RTREE, type=IndexGeometryRtreeHeader)
 index_name_id: u32
-table_id:      u32
+class_id:      u32
 field_id:      u32
 root_page:     u64   -- корень R-tree
 node_count:    u64
@@ -2919,7 +2913,7 @@ PatternCatalogPage (patterns_root → B+tree leaf):
 - Background worker применяет их с интервалом.
 - `status` = `building_update` пока очередь непуста.
 
-При `CONCURRENTLY` — начальная индексация без блокировки таблицы:
+При `CONCURRENTLY` — начальная индексация без блокировки class source:
 
 - Snapshot существующих записей → bulk insert.
 - Параллельные changes → в PendingQueue.
@@ -2970,7 +2964,7 @@ LeafEntry (24 байта):
 
 Построчная вставка сопровождает каждый индекс отдельно: спуск по дереву за `O(log n)` **случайными** обращениями к страницам, расщепления, и WAL-запись на каждую пару (строка, индекс). При загрузке графа это доминирующая стоимость. Bulk-путь строит индекс снизу вверх, записывая каждую страницу **ровно один раз**, последовательно.
 
-Путь состоит из четырёх переиспользуемых компонентов; они одни и те же для `DEFINE INDEX` на непустой таблице, `REBUILD INDEX`, `COMPACT INDEX` и режима импорта (`gql_spec` §7.11).
+Путь состоит из четырёх переиспользуемых компонентов; они одни и те же для `DEFINE INDEX` на непустом class, `REBUILD INDEX`, `COMPACT INDEX` и режима импорта (`gql_spec` §7.11).
 
 #### 20.13.1. Внешняя сортировка
 
@@ -3116,7 +3110,7 @@ primary/base file является фатальной corruption.
 
 **STR-упаковка R-tree** (Sort-Tile-Recursive): отсортировать по координате X, разбить на `S = ceil(sqrt(P))` вертикальных полос, внутри каждой отсортировать по Y и нарезать узлами по `C` элементов; полученные MBR подать на следующий уровень. Даёт заполнение узлов ~100% против ~70% при поштучной вставке и существенно меньшее перекрытие MBR.
 
-**HNSW** сортировке не поддаётся — это инкрементальное построение графа. Bulk-режим ограничивается параллельной сборкой в памяти с **перемешиванием порядка вставки**: если поток загрузки кластеризован (по таблице, по метке, по исходному файлу), жадное построение HNSW деградирует по полноте выдачи, поскольку алгоритм рассчитан на случайный порядок поступления.
+**HNSW** сортировке не поддаётся — это инкрементальное построение графа. Bulk-режим ограничивается параллельной сборкой в памяти с **перемешиванием порядка вставки**: если поток загрузки кластеризован (по class, label или исходному файлу), жадное построение HNSW деградирует по полноте выдачи, поскольку алгоритм рассчитан на случайный порядок поступления.
 
 #### 20.13.6. Отношение к `DEFER` и `CONCURRENTLY`
 
@@ -3134,19 +3128,20 @@ primary/base file является фатальной corruption.
 
 ### 21.1. Changefeed Log
 
-Требуется `DEFINE TABLE ... CHANGEFEED @duration`.
+Требуется `CHANGEFEED @duration` в определении CLASS либо GRAPH source.
 
 **duration** — время хранения изменений (например, `CHANGEFEED 7d` хранит 7 дней).
 
 ```
-<graph_name>/changefeed/<table_id>_<since_lsn>.fcf
+changefeed/<space_id>_<class_id>_<since_lsn>.fcf
 ```
 
 #### 21.1.1. ChangefeedPage
 
 ```
 PageHeader(32) (magic=MAGIC_CHANGEFEED, type=ChangefeedHeader)
-table_id:      u32
+space_id:      u64  -- DataSpaceId
+class_id:      u32
 next_page:     u64
 entry_count:   u32
 _pad:          4
@@ -3159,8 +3154,8 @@ entries: [ChangefeedEntry]×N
 PageHeader (magic=MAGIC_CHANGEFEED, type=ChangefeedEntry)
 lsn:           u64
 versionstamp:  u64   -- монотонно растущий глобальный счётчик
-event_kind:    u8    -- 0=create, 1=update, 2=delete, 3=define_table
-atom_ref:      u64   -- DiskAtomRef
+event_kind:    u8    -- 0=create, 1=update, 2=delete, 3=define_class, 4=membership
+global_atom:   u64   -- GlobalAtomId; generation проверяется
 record_id_len: u16
 record_id:     [u8]  -- encoded RecordId
 [before_len:   u32]  -- если event_kind ∈ {1, 2}
@@ -3176,13 +3171,14 @@ Cursor `since_lsn` в имени файла позволяет быстро на
 
 ### 21.2. Live SELECT
 
-`LIVE SELECT` подписывается на изменения таблицы.
+`LIVE SELECT` подписывается на изменения class либо graph-scoped effective source.
 
 **Хранимое состояние live-запроса** (в SchemaCatalog, kind=LiveSelect):
 
 ```
 live_id:       u128  -- UUID v7 ($id для KILL)
-table_id:      u32
+space_id:      u64  -- 0 для Base; GraphId для Effective
+class_id:      u32
 filter_ir_len: u32
 filter_ir:     [u8]  -- сериализованный IR предиката WHERE
 output_mode:   u8    -- 0=full_record, 1=value_fields, 2=diff, 3=patch
@@ -3190,7 +3186,7 @@ created_at_ms: u64
 last_active_ms:u64
 ```
 
-**Delivery mechanism**: на каждый DML в таблице, если таблица имеет live-подписчиков:
+**Delivery mechanism**: на каждый DML подходящего class/graph source при наличии live-подписчиков:
 
 1. Определить matching live queries (filter IR evaluation).
 2. Добавить в `LiveEventQueue` (in-memory, per-session).
@@ -3215,6 +3211,12 @@ Live queries хранятся только в SchemaCatalog для восста�
 durable граница журнала на момент начала транзакции. Фрейм видим только если `commit_lsn ≤
 snapshot.visible_lsn`. Checkpoint переносит закоммиченные фреймы обратно **на их штатные места**
 в `.fgb` (§23.1).
+
+Одна транзакция может содержать frames `DataSpaceId::Database` и нескольких
+`DataSpaceId::Graph(_)`. Только общий `TxCommit` делает их видимыми; recovery не имеет права
+публиковать base atom без соответствующей membership/overlay/topology части или наоборот.
+Reverse membership, effective Unique preflight и graph CASCADE используют тот же bounded
+transaction-private write-set до первой durable записи.
 
 Что эта модель даёт по сравнению с журналом дельт:
 
@@ -3280,9 +3282,9 @@ allocation.
 Payload по видам:
 
 ```
-PageFrame:       graph_id(u64) + file_id(u64) + page_no(u64) + page_bytes(PAGE_SIZE)
+PageFrame:       space_id(u64) + file_id(u64) + page_no(u64) + page_bytes(PAGE_SIZE)
                  Total = 16408 байт
-PageInit:        graph_id(u64) + file_id(u64) + page_type(u16) + reserved[6] + page_no(u64)
+PageInit:        space_id(u64) + file_id(u64) + page_type(u16) + reserved[6] + page_no(u64)
                  Total = 32 байта; reserved = 0
 TxBegin:         (пусто)
 TxCommit:        commit_ts(u64) + frame_count(u32) + _pad(4)
@@ -3297,10 +3299,10 @@ GraphDrop:       graph_id(u64)
 `backfill_lsn` ненулевой и не превышает уже durable `TxCommit`-границу. Несколько `CheckpointBegin`
 подряд разрешены: так журнал представляет повтор после ошибки backfill до commit point.
 
-**`PageKey = (GraphId, DataFileId, PageNo)`** — ключ индекса версий страниц. `graph_id =
-SYSTEM_GRAPH_ID = 0` адресует системное пространство. Dirty-page table не хранится: recovery и
-без неё строит индекс одним streaming-проходом, а checkpoint выбирает latest eligible frame из
-этого индекса.
+**`PageKey = (DataSpaceId, DataFileId, PageNo)`** — ключ индекса версий страниц. `space_id = 0`
+адресует database-level AtomStore/catalog, ненулевое значение — соответствующий `GraphId`.
+System graph не вводится. Dirty-page table не хранится: recovery строит индекс одним
+streaming-проходом, а checkpoint выбирает latest eligible frame из этого индекса.
 
 `PageInit` разрешён только для регистрации **пустой** аллокации страницы после последнего
 checkpoint. Он не доказывает и не восстанавливает содержимое. Первая же содержательная мутация
@@ -3350,7 +3352,7 @@ Checkpoint переносит latest committed frame каждой страниц
 6. Каждый затронутый data-файл синхронизируется ровно один раз.
 7. Добавляется `CheckpointEnd { generation, backfill_lsn: target }`, затем WAL выполняет
    `flush + sync_data`; LSN этой записи становится `checkpoint_record_lsn`.
-8. Атомарно заменяются все `GraphSuperblock`, последним — `db.fgb`. Только успешная замена
+8. Атомарно заменяются затронутые `AtomStoreSuperblock`/`GraphSuperblock`, последним — `db.fgb`. Только успешная замена
    `db.fgb` является commit point checkpoint.
 9. Под exclusive prune-gate публикуется новая home generation, из version index удаляются версии
    с `commit_lsn ≤ target` (latest-commit metadata для FCW сохраняется), затем удаляются только
@@ -3435,7 +3437,7 @@ lsn 300: COMMIT A → 100 ≤ 101 → ПРОПУЩЕНО, хотя A заком�
 9. Освободить DB commit lock; бэкфилл — позже, при checkpoint
 ```
 
-Один `fsync` покрывает транзакцию целиком, сколько бы графов, таблиц и файлов она ни затронула.
+Один `fsync` покрывает транзакцию целиком, сколько бы global atoms, graphs и файлов она ни затронула.
 
 ### 23.4. Torn write
 
@@ -3785,11 +3787,11 @@ TensorCachePage инвалидируется при любом изменени�
 
 **Статистика** (§19.5)
 
-| Параметр                       | Тип   | Default | Описание                                                    |
-|--------------------------------|-------|---------|-------------------------------------------------------------|
-| `FG_STATS_HISTOGRAM_BUCKETS`   | usize | 100     | Число корзин equi-depth гистограммы                         |
-| `FG_STATS_SAMPLE_ROWS`         | usize | 30000   | Размер выборки для `ANALYZE`, не зависит от размера таблицы |
-| `FG_STATS_FULL_SCAN_THRESHOLD` | usize | 32      | Таблицы меньше N страниц анализируются полным сканом        |
+| Параметр                       | Тип   | Default | Описание                                                  |
+|--------------------------------|-------|---------|-----------------------------------------------------------|
+| `FG_STATS_HISTOGRAM_BUCKETS`   | usize | 100     | Число корзин equi-depth гистограммы                       |
+| `FG_STATS_SAMPLE_ROWS`         | usize | 30000   | Размер выборки для `ANALYZE`, не зависит от размера class |
+| `FG_STATS_FULL_SCAN_THRESHOLD` | usize | 32      | Таблицы меньше N страниц анализируются полным сканом      |
 
 ---
 
@@ -3797,7 +3799,8 @@ TensorCachePage инвалидируется при любом изменени�
 
 ### 28.1. Версионирование
 
-`STORAGE_FORMAT_VERSION` хранится в `GraphSuperblock.format_version`.
+`STORAGE_FORMAT_VERSION` хранится в `DatabaseSuperblock` и повторяется в каждом
+`AtomStoreSuperblock`/`GraphSuperblock`; несовпадение является corruption.
 
 Пока не пройдены Windows sync performance gate и Windows GA-core gate, значение `1` обозначает
 кандидат и не является обещанием замороженной совместимости. После Windows freeze Linux должен
@@ -3805,11 +3808,11 @@ TensorCachePage инвалидируется при любом изменени�
 с миграцией. Отсутствие Linux-окружения не задерживает Windows freeze и не позволяет объявлять
 Unix-поддержку проверенной.
 
-| Условие                                       | Действие                       |
-|-----------------------------------------------|--------------------------------|
-| `superblock.format_version > ENGINE_VERSION`  | Error: downgrade not supported |
-| `superblock.format_version < ENGINE_VERSION`  | Run migration routine          |
-| `superblock.format_version == ENGINE_VERSION` | Open normally                  |
+| Условие                                       | Действие                                                                      |
+|-----------------------------------------------|-------------------------------------------------------------------------------|
+| `superblock.format_version > ENGINE_VERSION`  | Error: downgrade not supported                                                |
+| `superblock.format_version < ENGINE_VERSION`  | Typed incompatible-format; migration для промежуточного candidate отсутствует |
+| `superblock.format_version == ENGINE_VERSION` | Open normally                                                                 |
 
 ### 28.2. Правила совместимости
 

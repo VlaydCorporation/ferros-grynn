@@ -49,6 +49,42 @@ bag, итог statement — `array<object>` без внутренних иден
 `RETURN DISTINCT`, `HYPER`/`META`/`WITHIN`, cross-level, inline property objects,
 неограниченные/shortest/weighted paths, DDL/DML, Traversal VM и graph-return отложены.
 
+## Технический профиль коррекции 8.1
+
+**Статус:** ненормативный implementation target, утверждённый нормативными разделами 8.1
+`gql_spec.md`, `gql_grammar.md` и `disk_storage_spec.md`; текущий код до A16 использует прежний
+graph-owned TABLE layout. Документационные A0–A4 завершены 2026-09-10; кодовые
+A5–A16 не начаты.
+
+Целевой read pipeline:
+
+```text
+ClassScan / RecordLookup
+  -> global AtomStore row (RecordId, kind, base properties)
+  -> optional GraphMembershipResolve(GraphId, GlobalAtomId)
+  -> graph-local label/topology and lazy sparse overlay
+  -> EffectiveProperty(base, overlay Value|Hidden|absent)
+  -> owned query row
+```
+
+- `ClassScan { class_id, scope, projection, predicate }` заменяет `TableScan`.
+- `RecordLookup` использует database primary `RecordId → GlobalAtomId`.
+- `GraphOccurrenceScan` начинает с class, label либо их пересечения и возвращает только members
+  одного ненулевого `GraphId`.
+- `QueryRead::get` принимает `RecordId` и optional graph scope. Non-member в graph scope при
+  разыменовании ссылки даёт base view; graph-scoped source, `UPDATE` и topology требуют
+  membership.
+- Base/effective indexes выбираются только по явному `IndexScope`; base update до мутации
+  выполняет bounded preflight reverse memberships и затронутых effective Unique indexes.
+- Physical cursor держит bounded read epoch и разрешает `DataSpaceId::Database` и
+  `DataSpaceId::Graph(_)` через один `HybridReadEngine`; page types наружу не выходят.
+- Mode 1 использует нормализованный `DatabaseRoot { AtomStoreRoot, GraphRoots }`; Mode 2 — те же
+  логические границы поверх disk stores; Mode 3 копирует effective graph и explicit mutable flush
+  пишет только graph-local topology/overlay.
+
+Старые `QueryStorageRow`, system-table cursor, `RecordId.table` membership и `GraphId = 0`
+удаляются на A16, а не сохраняются как runtime fallback.
+
 ## 0. Введение и охват
 
 Этот документ описывает **техническую реализацию** языка запросов GrynQL и то, как исполнительная система движка связывается с хранилищем. Он вторичен по отношению к трём базовым спецификациям и не должен им противоречить:
@@ -191,7 +227,7 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
 - **Span** — `gql_status::TextSpan { offset: u32, len: u32 }` в UTF-8 байтах. Запрос длиннее
   `u32::MAX` отклоняется до лексинга статусом `QueryTextTooLarge`.
 - Пробелы/комментарии значимы **только** между соседними токенами там, где грамматика это
-  требует (`record_id` = `table:id` без gap). Токен хранит `gap_before`; исходный текст в AST
+  требует (`record_id` = `class:id` без gap). Токен хранит `gap_before`; исходный текст в AST
   не удерживается.
 
 ### 3.2. Парсер
@@ -204,9 +240,9 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
   разрешаются позицией, look-ahead и gap-флагом.
 - Операторы выражений разбираются по точной таблице приоритетов `gql_grammar.md` §12.1 методом
   Pratt; результат — owned `Expr` из `src/syn/ast.rs`.
-- AST различает pattern и reference: endpoint паттерна хранит `kind`, optional alias,
-  `label_expr` и фильтр, а endpoint-ссылка — `kind` и выражение `record_id | idiom | param`.
-  Совпадающий текст `a:b` не объединяется в общий узел с контекстным флагом.
+- AST различает class/exact selector, `AS` alias и optional graph-local `LABEL`. Endpoint-ссылка
+  хранит `record_id | idiom | param`; `class:id` всегда является `RecordId`, а двоеточие больше
+  не кодирует pattern label.
 
 ### 3.3. Разрешение синтаксических неоднозначностей
 
@@ -215,7 +251,7 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
 | Символ            | Роли                                                                                    | Стратегия                                                                                                                                                            |
 |-------------------|-----------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `<`               | меньше / cast `<T> e` / generic / аннотация графа / meta-атом / AtomWalk endpoint       | по позиции и режиму: после `ATOM` формы `<(…)>`/`<[…]>` задают vertex/edge endpoint; вне него сохраняют meta-семантику; иначе cast, generic, аннотация или сравнение |
-| `\|`              | OR `\|\|` / альтернатива меток `:A\|B` / замыкание `\|$x\|` / range-генератор `\|t:n\|` | `\|\|` — единый токен OR; остальное — по контексту                                                                                                                   |
+| `\|`              | OR `\|\|` / замыкание `\|$x\|` / range-генератор `\|class:n\|` | `\|\|` — единый токен OR; остальное — по контексту                                                                                                                   |
 | `\|>` / `<\|…\|>` | pipe / KNN                                                                              | `\|>` и `<\|`,`\|>` — единые токены                                                                                                                                  |
 | `~`               | AtomWalk (`~[`, `]~>`, `]~`, `<~[`)                                                     | жадная токенизация после `MATCH ATOM`/`TRAVERSE ATOM`/`RELATE ATOM`; каждый шаг содержит непустое тело ребра с alias и/или label                                     |
 | `@`               | fulltext (`@@`, `@1@`, `@AND@`, `@OR@`)                                                 | единые токены                                                                                                                                                        |
@@ -247,7 +283,7 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
   `MATCH ATOM <[e:FRIEND]>` — edge alias `e`. В `RELATE ATOM <(person:alice)>` та же
   пунктуация окружает ссылку `record_id`; новый binding там не создаётся.
 - Проверка неопределённых алиасов, shadowing (§14.3): внутренний alias перекрывает внешний; при передаче через `WITH a, b` — проекция биндингов.
-- Разрешение `record_id` (`table:id`) в публичную ссылку; проверка существования таблиц/графов через каталог (§10, `SchemaCatalog`, `GraphSuperblock`).
+- Разрешение `record_id` (`class:id`) в публичную ссылку; проверка существования class/graph через snapshot catalogs (§10).
 
 ### 4.2. Фаза 2 — Type inference
 
@@ -425,7 +461,7 @@ Cost-model **обязан** иметь degree statistics — без них гр�
 
 ### 6.5. `WITH`-подсказки
 
-`WITH NOINDEX` — принудительный table scan; `WITH INDEX @i` — планировщик **обязан** использовать указанный индекс (§19.1 gql_spec), даже если optimizer предпочёл бы другой; `WITH COST fn` — пользовательская cost-функция пути (только `MATCH`/`TRAVERSE`).
+`WITH NOINDEX` — принудительный class/membership scan; `WITH INDEX @i` — планировщик **обязан** использовать указанный индекс совместимого scope (§19.1 gql_spec), даже если optimizer предпочёл бы другой; `WITH COST fn` — пользовательская cost-функция пути (только `MATCH`/`TRAVERSE`).
 
 ### 6.6. Plan caching
 
@@ -433,7 +469,10 @@ Cost-model **обязан** иметь degree statistics — без них гр�
 
 ### 6.7. Физические альтернативы
 
-Каждый логический оператор раскрывается в несколько физических (§4.2 задела): `Scan → {TableScan, IndexScan}`; `Join → {HashJoin, IndexJoin (NL), LeapfrogTrieJoin}`; `Expand → {ExpandAdjList, ExpandIndex}`; `PathExpand → {BFSExpand, DFSExpand, ShortestPathOp}`. Выбор — по cost model.
+Каждый логический оператор раскрывается в несколько физических (§4.2 задела):
+`Scan → {ClassScan, GraphOccurrenceScan, IndexScan}`; `Join → {HashJoin, IndexJoin (NL),
+LeapfrogTrieJoin}`; `Expand → {ExpandAdjList, ExpandIndex}`; `PathExpand → {BFSExpand,
+DFSExpand, ShortestPathOp}`. Выбор — по cost model.
 
 ---
 
@@ -449,10 +488,12 @@ Row = { values: Vec<Value>, env: Env?, path: Path? }
 
 ### 7.2. Scan-операторы
 
-- **`TableScan { table_id, projection, predicate }`** — скан таблицы; predicate/projection проброшены внутрь (§16.1, §16.3). В текущем local backend — ordered обход graph-wide `primary.fgidx`, фильтрация table/kind и затем чтение hot-slot (§10.4); label-index остаётся следующим срезом.
+- **`ClassScan { class_id, scope, projection, predicate }`** — base scan идёт по AtomStore class
+  posting/primary range; effective scan — по memberships выбранного graph с lazy overlay merge.
 - **`IndexScan { index_id: IndexId, key_range, predicate }`** — доступ через
   `Index::range/lookup` (§13); логическая identity не подменяется физическим `DataFileId`.
-- **`GraphScan { atom_type, label_filter }`** — старт с множества атомов графа по метке (`tv::V([labels])`).
+- **`GraphOccurrenceScan { graph_id, class_filter, label_filter }`** — старт с occurrences одного
+  graph по class, label либо пересечению posting streams (`tv::V([labels])`).
 
 ### 7.3. Expand-операторы
 
@@ -645,17 +686,15 @@ materialization нужна только явной мутации или реж�
 
 ### 10.1. Режимы хранения
 
-- **Режим 1 — Full in-memory**: `Graph<Mutable>` или специализированный `T<Mutable>` хранит
-  topology в RAM, MVCC — в памяти, WAL + snapshot обеспечивают durability. Frozen-представление
-  строится явно через `freeze`.
-- **Режим 2 — Disk-backed**: каталог возвращает `GraphRef`; `read(&tx)` создаёт
-  `DiskGraphView<'tx>` над `PageManager`, `BufferPool` и `SnapshotId`. View не является копией
-  графа и не переживает transaction guard. Windows sync vertical slice и optional Windows
-  NativeAsync завершены; Unix runtime/async и advanced specialized indexes остаются отдельными
-  release gates.
-- **Режим 3 — Hybrid**: `query_to_memory::<T, State>` загружает выбранный disk-backed подграф в
-  собственную storage family `T<State>`. После полной загрузки исходный disk snapshot
-  освобождается.
+- **Режим 1 — Full in-memory**: MVCC `DatabaseRoot` содержит global `AtomStoreRoot` и graph roots
+  с memberships/topology/labels/sparse overlays. Standalone `Graph<State>` остаётся owning SDK
+  materialization, а не каноническим database layout.
+- **Режим 2 — Disk-backed**: `GraphRef` разрешается в graph-local store, а base atoms — в
+  database AtomStore. Оба читаются одним `HybridReadEngine` по `DataSpaceId` и одному
+  `SnapshotId`; view не переживает transaction guard.
+- **Режим 3 — Query To Memory**: `query_to_memory::<T, State>` материализует effective graph
+  view и затем освобождает source snapshot. `Mutable` flush меняет только graph-local
+  topology/overlay и никогда не обновляет base неявно.
 
 Все режимы реализуют общий read-only контракт `GraphRead`. Мутация доступна только типам в
 состоянии `Mutable`; query results используют `Frozen`.
@@ -663,7 +702,7 @@ materialization нужна только явной мутации или реж�
 ### 10.2. Абстракция страничного доступа
 
 Исполнитель никогда не читает файлы напрямую — только через crate-private concrete
-`SyncPageManager` поверх `BufferPool`. Полное определение действующей frame-WAL-редакции — в
+`SyncPageManager` поверх `HybridReadEngine`. Полное определение действующей frame-WAL-редакции — в
 [implementation_plan.md](implementation_plan.md) §3.3. `read_page(&TxHandle, ...)` возвращает
 `PageRead<'tx>` (staged borrow или immutable cache guard), `read_pages` сохраняет порядок и
 дубликаты. Snapshot живёт внутри зарегистрированного `TxHandle`, а не передаётся голым token.
@@ -671,45 +710,44 @@ LSN и checksum назначает WAL-слой. Checkpoint не бэкфилл�
 `visible_lsn`.
 
 `PAGE_SIZE = 16384`; `PageHeader` (32 байта) хранит `page_lsn` и portable RapidHash V3 checksum
-(seed `0`, поле checksum обнулено при вычислении). Ключ `PageKey = (GraphId, DataFileId, PageNo)`;
-`graph_id = 0` — системное пространство. При чтении `.fgb` проверяются размер/выравнивание файла,
+(seed `0`, поле checksum обнулено при вычислении). Ключ
+`PageKey = (DataSpaceId, DataFileId, PageNo)`; `space_id = 0` означает database AtomStore/catalog,
+а ненулевое значение — `GraphId`. System graph отсутствует. При чтении `.fgb` проверяются размер/выравнивание файла,
 format version, `page_no`, reserved fields и checksum. Production runtime поддерживает Windows
 Sync (`FILE_FLAG_NO_BUFFERING`) и optional NativeAsync (IoRing +
 `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`, Windows build 22000+). Unix компилируется как
 typed unsupported stub до нативной проверки `O_DIRECT`; Linux/tokio-uring отложен. WAL остаётся
 buffered. Benchmark-only mmap и NativeAsync не являются fallback.
 
-### 10.3. Разрешение идентификаторов: `RecordId → DiskAtomRef → AtomId`
+### 10.3. Разрешение идентификаторов и occurrences
 
-Три уровня идентификаторов (`disk_storage_spec.md` §4, §9):
-- **`RecordId`** (`table:id`) — публичный, единственный, видимый в GrynQL; хранится как свойство `id`.
-- **`DiskAtomRef`** (`u64`: бит40 = kind, биты39..0 = slot) — стабильный дисковый id (без generation).
-- **`AtomId`** (`u64`: slot + generation) — внутренний in-memory handle; **никогда не экспонируется** в GrynQL (§3.7 gql_spec).
+Уровни идентификаторов (`disk_storage_spec.md` §4, §9):
+
+- **`RecordId`** (`class:id`) — публичная database-local identity global atom;
+- **`GlobalAtomId`** — внутренний generation-aware handle base slot AtomStore;
+- **graph-local `DiskAtomRef`/`AtomId`** — physical occurrence одного `GraphId`.
 
 Разрешение при выполнении:
 ```
-RecordId --(graph-wide primary.fgidx)--> DiskAtomRef --(read hot slot → gen)--> AtomId
+RecordId --(AtomStore primary.fgidx)--> GlobalAtomId
+GlobalAtomId --(graph membership.fgidx)--> DiskAtomRef --(read occurrence slot → gen)--> AtomId
 ```
-`from_disk_ref(r, gen)` восстанавливает `AtomId` из `DiskAtomRef` + generation, прочитанной из
-hot-slot. Обратный `DiskAtomRef → RecordId` лениво строится одним streaming-проходом primary
-B+tree и кэшируется внутри immutable graph generation; последующая материализация не сканирует
-primary index для каждого атома.
+Graph membership может отсутствовать. Property reference всё равно разрешает base atom по
+`RecordId`; graph-scoped scan/update/topology требует occurrence. Cursor-local resolved table
+устраняет повторный global→local lookup внутри bounded read epoch.
 
 Кросс-уровневые endpoint'ы адресуются
-`QualifiedAtomRef { sg_slot, local_ref: DiskAtomRef }` (§3.9 disk-spec): когда
+`QualifiedAtomRef { graph_id, local_ref: DiskAtomRef }` (§3.9 disk-spec): когда
 `EdgeHotSlot.flags.CROSS_LEVEL = 1`, сторона остаётся inline только для ≤2 endpoint'ов одного
 root-arena slot; иначе вся ordered сторона читается из cross-level overflow. Для локальной
 стороны используются plain `DiskAtomRef`.
 
 ### 10.4. Как операторы читают данные
 
-**Атомы (hot data).** `NodeHotSlot` и `EdgeHotSlot` имеют по 160 байт
-(102 слота/страница) и хранят «горячее»: kind-флаги, `label_id`, `table_id`, счётчики степени,
-inline-adjacency и ссылку на свойства (`props_page`/`props_slot`/`props_len`). Адресация — O(1)
-без B+tree: `page_no = slot / slots_per_page`,
-`offset = 32 + (slot % slots_per_page) × slot_size`.
-
-`table_id` в hot-slot используется планировщиком для быстрой пофильтровой выборки по таблице без обращения к props.
+**Base atom и occurrence.** AtomStore slot хранит kind, `ClassId`, `RecordId`/primary binding и
+base `PropertyRef`. Graph node/edge slot хранит `GlobalAtomId`, local generation, optional label,
+`has_overlay` и structural state. Class scan использует AtomStore class index; graph class scan —
+`cls_<class_id>.fgidx`. Class не дублируется в occurrence slot.
 
 **Adjacency traversal.** Операторы `Expand`/`PathExpand` читают смежность так (`disk_storage_spec.md` §25.2, `out_neighbors`):
 ```
@@ -722,12 +760,13 @@ inline-adjacency и ссылку на свойства (`props_page`/`props_slot
 Это зеркалит in-memory модель `fg-meta` (inline `SmallVec` + overflow) при иной стабильной
 дисковой ширине ссылок.
 
-**Свойства (cold data).** `PropHeapPage` остаётся row-oriented слоттированной страницей;
+**Свойства (cold data).** AtomStore `PropHeapPage` остаётся row-oriented слоттированной страницей;
 `PropertyMap` кодируется как `num_props(uLEB128) + [key_id(u32) + StorageValue]`
 (`disk_storage_spec.md` §13.2). Ключи интернированы и отсортированы по `key_id`; duplicate key
 при decode является ошибкой. Крупные объекты (> ½ payload) — цепочка `PropLargeChunkPage`.
 Late materialization (§7.6): свойства читаются только для строк, прошедших
-топологический/label-фильтр.
+class/topology/label-фильтр. Если `has_overlay = 0`, overlay page не читается и merge-map не
+выделяется. Иначе executor вычисляет `Value` override, `Hidden` или наследуемое base value.
 
 `PropertyMap` не заменяется `Arrow::MapArray`. Для аналитики отдельный адаптер строит
 `PropertyBatch { RecordBatch, presence bitmaps, key_id_to_field }`: `present=0` означает `none`,
@@ -740,7 +779,10 @@ overflow-цепочки, `weight` (NaN = нет веса) и `transition_gid`. �
 hyper- и cross-level-связи используют эти два массива. `EdgeEndpointIndex` — производный
 обратный индекс для endpoint'ов-edge; отдельной страницы или IR-ветки инцидентности нет.
 
-**Метки и схема.** `string ↔ id` разрешается через `LabelDictionary` (`HashIndexPage`, string→id на этапе разбора/плана/вставки; `DictEntryPage`, id→string при материализации), кешируется LRU (`FG_LABEL_DICT_CACHE_MB`). Определения DDL (Table/Field/Index/Event/Function/Analyzer/LiveSelect) — в `SchemaCatalog`; входная точка на именованный граф — `GraphSuperblock` (даёт `node_count`/`edge_count` для cost-model и root-страницы схемы/статистики).
+**Labels и schema.** Graph-local `string ↔ LabelId` разрешается через `LabelDictionary`.
+Definitions CLASS/FIELD/INDEX/EVENT/FUNCTION/ANALYZER принадлежат database `SchemaCatalog`;
+`ClassId` не зависит от label dictionary. `AtomStoreSuperblock` и `GraphSuperblock` являются
+разными checkpoint-owned entry points.
 
 **Мета-атомы.** `metavertex`/`metaedge` — не отдельные типы хранения, а обычные vertex/edge
 с флагом `is_meta` и `subgraph_slot`/`transition_gid`. Edge-to-edge endpoint сам по себе не
@@ -848,11 +890,12 @@ statement execution unit. Когда появится драйвер неско�
 
 ### 11.4. Обнаружение конфликтов
 
-Режим 1 хранит `properties_version`, `node_set_version`, `edge_set_version` и
-`atom_versions[AtomId]` в каждом named graph. Write-write validation по известному dirty-set имеет
-`O(|write-set| log |atoms|)`. Точные предикаты не используют текущий `AtomMeta`: query adapter
-сохраняет тот же typed matcher, которым исполнялся `WHERE`, а COW-журнал графа перечисляет только
-изменившиеся после snapshot атомы.
+Target Mode 1 разделяет conflict keys `BaseAtom(GlobalAtomId)`,
+`GraphMembership(GraphId, GlobalAtomId)`, `GraphOverlay(GraphId, GlobalAtomId)` и
+`GraphIncidence(GraphId, AtomId)`. Write-write validation идёт по известному dirty-set. Base
+update дополнительно перечисляет reverse memberships только данного atom, чтобы до мутации
+проверить effective Unique indexes и resource limit; scan всех graphs запрещён. Точные
+предикаты сохраняют тот же typed matcher, которым исполнялся `WHERE`.
 
 | Конфликт         | Поведение                                                                       |
 |------------------|---------------------------------------------------------------------------------|
@@ -870,7 +913,8 @@ dangerous structure. Он serializable, но может давать больш�
 1. проверить snapshot age и atom-delta write-set budget (sync MVP: 256 МиБ);
 2. под коротким commit lock проверить FCW и serializable/predicate conflicts;
 3. назначить фактический `commit_ts`;
-4. слить непересекающиеся atom-delta поверх текущих графов и повторно проверить family invariant;
+4. слить непересекающиеся base/membership/overlay/incidence delta поверх текущего database root,
+   повторно проверить scoped indexes и graph family invariants;
 5. под кратким write-guard зарегистрировать границу очистки predicate history и опубликовать
    единый новый root базы; `BEGIN` регистрирует активный snapshot под read-guard того же root,
    поэтому snapshot не может попасть в окно между очисткой и публикацией.
@@ -912,7 +956,7 @@ read_page(&TxHandle, PageKey) =
     staged final page, если он есть,
     самый свежий committed-фрейм с commit_lsn ≤ visible_lsn,
     иначе страница из .fgb
-PageKey = (GraphId, DataFileId, PageNo)
+PageKey = (DataSpaceId, DataFileId, PageNo)
 ```
 
 Отсюда три свойства, на которые опирается исполнение:
@@ -979,20 +1023,21 @@ range scan. Public trait с единственной реализацией не
 
 ### 13.1. Типы индексов
 
-| Тип (GrynQL §9.6)  | On-disk (disk-spec §20)       | Применение в исполнении                        |
-|--------------------|-------------------------------|------------------------------------------------|
-| primary (implicit) | graph-wide `primary.fgidx`    | `RecordId → DiskAtomRef` (§10.3)               |
-| label (implicit)   | `lbl_node/edge_<id>.fgidx`    | `Scan` по метке, `tv::V([labels])`             |
-| standard / unique  | B+tree (order-preserving key) | `IndexScan`, точечный/range-lookup, uniqueness |
-| count              | одностраничный счётчик        | `count() … GROUP ALL` без скана                |
-| fulltext (BM25)    | inverted index                | `@@`/`@AND@`/`@OR@`, `search::score/highlight` |
-| HNSW (vector)      | in-memory + blob на диске     | KNN `<\|k,metric\|>`, ANN                      |
-| DiskANN (vector)   | не определён; вне core v1     | draft KNN; запрещён до storage approval        |
-| geometry (R-tree)  | R-tree                        | `INSIDE`/`INTERSECTS`, `geo::*`                |
-| reachability       | tree_cover/GRAIL/FERRARI/BFL  | «достижима ли B из A?»                         |
-| neighbourhood      | EXACT/SKETCH/LANDMARK         | `[:E*1..k]`, `k_hop_neighbourhood`             |
-| path               | LANDMARK_SSSP/PATTERN_CACHE   | shortest-path, var-length                      |
-| edge-endpoint      | B+tree `ee_endpoint.fgidx`    | AtomWalk V-E/E-V/E-E (§10.4)                   |
+| Тип (GrynQL §9.6)  | Scope                         | On-disk (disk-spec §20)       | Применение в исполнении                        |
+|--------------------|-------------------------------|-------------------------------|------------------------------------------------|
+| primary (implicit) | Database/base                 | AtomStore `primary.fgidx`     | `RecordId → GlobalAtomId` (§10.3)             |
+| membership         | Один graph                   | graph `membership.fgidx`      | `GlobalAtomId → DiskAtomRef` occurrence          |
+| label (implicit)   | Один graph                   | `lbl_node/edge_<id>.fgidx`    | `Scan` по graph-local метке                 |
+| standard / unique  | Explicit Base или Effective       | B+tree (order-preserving key) | `IndexScan`, точечный/range-lookup, uniqueness |
+| count              | Explicit Base или Effective       | одностраничный счётчик        | `count() … GROUP ALL` без скана                |
+| fulltext (BM25)    | Explicit Base или Effective       | inverted index                | `@@`/`@AND@`/`@OR@`, `search::score/highlight` |
+| HNSW (vector)      | Explicit Base или Effective       | in-memory + blob на диске     | KNN `<\|k,metric\|>`, ANN                      |
+| DiskANN (vector)   | Explicit Base или Effective       | не определён; вне core v1     | draft KNN; запрещён до storage approval        |
+| geometry (R-tree)  | Explicit Base или Effective       | R-tree                        | `INSIDE`/`INTERSECTS`, `geo::*`                |
+| reachability       | Один graph                   | tree_cover/GRAIL/FERRARI/BFL  | «достижима ли B из A?»                         |
+| neighbourhood      | Один graph                   | EXACT/SKETCH/LANDMARK         | `[:E*1..k]`, `k_hop_neighbourhood`             |
+| path               | Один graph                   | LANDMARK_SSSP/PATTERN_CACHE   | shortest-path, var-length                      |
+| edge-endpoint      | Один graph                   | B+tree `ee_endpoint.fgidx`    | AtomWalk V-E/E-V/E-E (§10.4)                   |
 
 ### 13.2. Использование планировщиком
 
@@ -1001,7 +1046,7 @@ index обслуживает equality/range, самый широкий полн�
 lookup. Index возвращает candidates; затем обычный executor повторно проверяет полный predicate и
 регистрирует тот же SSI predicate, поэтому access path не меняет семантику. Неподдержанный prefix,
 отсутствующий/несовместимый specialized index или transaction-private graph write корректно
-деградирует к primary table scan. Cost model и `WITH INDEX` относятся к последующему planner
+деградирует к primary class/membership scan. Cost model и `WITH INDEX` относятся к последующему planner
 срезу. Adjacency-обход идёт через inline+overflow, а не через отдельный индекс.
 
 ### 13.3. Консистентность и обслуживание
@@ -1015,7 +1060,7 @@ lookup. Index возвращает candidates; затем обычный executo
   профиле, но planner/storage не имеют права объявлять индекс доступным до определения
   `disk_storage_spec.md` §20.6.4.
 - **`DEFER`** — обновление откладывается в фоновую очередь (`IndexPendingQueue`), eventual consistency; несовместимо с `UNIQUE`.
-- **`CONCURRENTLY`** — двухфазная постройка без блокировки таблицы: initial (индексация существующих; новые изменения копятся как `pending`) → update (обработка pending); статус (`building_initial`/`building_update`/`ready`/`error`) виден через `INFO FOR INDEX` (§9.6 gql_spec).
+- **`CONCURRENTLY`** — двухфазная постройка без блокировки class source: initial (индексация существующих; новые изменения копятся как `pending`) → update (обработка pending); статус (`building_initial`/`building_update`/`ready`/`error`) виден через `INFO FOR INDEX` (§9.6 gql_spec).
 - **`REBUILD INDEX`** — перестройка (актуально для HNSW после многих обновлений).
 
 В текущем immutable-generation пути entry не хранит отдельный timestamp: snapshot разрешает
@@ -1038,7 +1083,7 @@ vertical slice реализован только in-memory sort + bottom-up pack
 3. **Side-file + одна WAL-запись + подмена поколения.** Тело сборки не журналируется: файл недостижим из каталога, поэтому крах в процессе безвреден. Сборка индекса на 3 ГБ даёт ~200 байт журнала.
 4. **Import epoch** — отсоединённые индексы, отложенные ограничения, сегментные коммиты.
 
-Планировщик обязан задействовать bulk-путь автоматически при `DEFINE INDEX` на непустой таблице, при `REBUILD INDEX` и при `COMPACT INDEX`; `CONCURRENTLY` реализуется поверх него (снимок → сборка в side-file → добор небольшой очереди → атомарная подмена).
+Планировщик обязан задействовать bulk-путь автоматически при `DEFINE INDEX` на непустом class scope, при `REBUILD INDEX` и при `COMPACT INDEX`; `CONCURRENTLY` реализуется поверх него (снимок → сборка в side-file → добор небольшой очереди → атомарная подмена).
 
 **Отложенная проверка ограничений — условие применимости, а не оптимизация.** `VALIDATE ON_MUTATION` для `DAG` делает обход на каждое ребро, то есть `O(E·(V+E))` на загрузку; отложенная проверка — один Tarjan за `O(V+E)`. Режим импорта обязан форсировать `DEFERRED`.
 
@@ -1084,7 +1129,7 @@ Path-finding vs graph-expansion (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` прим�
 ### 15.3. Контракты DETERMINISTIC
 
 - Фиксированный снимок + фиксированный seed + стабильный порядок + канонический план.
-- Без явного `ORDER BY` — авто-`ORDER BY stable_id(record)`, `stable_id = (table_id, primary_key)`.
+- Без явного `ORDER BY` — авто-`ORDER BY stable_id(record)`, `stable_id = canonical RecordId(class, id)`.
 - Deterministic traversal: `Expand(v)` возвращает `sorted(adj[v])`; параллельный traversal — stable merge или deterministic scheduler (`task_id = hash(node_id)`).
 - `rand()` → `rand(seed, row_id)`; `time::now()` → `snapshot.timestamp`; `uuid()` → `uuid(seed, row_id)`; `seed = f(query_hash, snapshot, user_seed)`.
 - Deterministic aggregation: `sum = fold(sorted(values))`; FP — фиксированное дерево редукции (pairwise) или `decimal` для критичного.
