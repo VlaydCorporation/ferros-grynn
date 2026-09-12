@@ -52,9 +52,8 @@ bag, итог statement — `array<object>` без внутренних иден
 ## Технический профиль коррекции 8.1
 
 **Статус:** ненормативный implementation target, утверждённый нормативными разделами 8.1
-`gql_spec.md`, `gql_grammar.md` и `disk_storage_spec.md`; текущий код до A16 использует прежний
-graph-owned TABLE layout. Документационные A0–A4 завершены 2026-09-10; кодовые
-A5–A16 не начаты.
+`gql_spec.md`, `gql_grammar.md` и `disk_storage_spec.md`. Документационные A0–A4 и in-memory
+A5–A7 завершены; A8 реализует durable AtomStore, а graph occurrences остаются A9.
 
 Целевой read pipeline:
 
@@ -84,6 +83,20 @@ ClassScan / RecordLookup
 
 Старые `QueryStorageRow`, system-table cursor, `RecordId.table` membership и `GraphId = 0`
 удаляются на A16, а не сохраняются как runtime fallback.
+
+### Утверждённые технические контракты после S0–S6
+
+- `FGDC v7` не хранит property-key strings: boot идёт FileCatalog → AtomStoreSuperblock →
+  append-only `property_keys.fgb` → schema definitions.
+- AtomStore/graph superblocks — snapshot-visible full WAL frames. Checkpoint не пишет их
+  in-place, а публикует `main/.prev` COW; `.tmp` никогда не authority.
+- `ANALYZE` всегда сканирует source snapshot; FULL точен, APPROXIMATE использует HLL p=12 и
+  bounded deterministic reservoir. `CONCURRENTLY` возвращает job ID.
+- `ALTER` повторно проверяет revisions и публикует одну catalog revision; migration строит
+  недостижимые generations и не допускает partial result.
+- HNSW/DiskANN, reachability, PATTERN_CACHE и LANDMARK_SSSP используют отдельно версионируемые
+  derived side-files из `disk_storage_spec.md` §§20.6, 20.8, 20.10. Их implementation остаётся
+  будущим этапом и не является зависимостью A8.
 
 ## 0. Введение и охват
 
@@ -248,14 +261,14 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
 
 Парсер обязан однозначно разрешать перегруженные символы из `gql_grammar.md` §16:
 
-| Символ            | Роли                                                                                    | Стратегия                                                                                                                                                            |
-|-------------------|-----------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `<`               | меньше / cast `<T> e` / generic / аннотация графа / meta-атом / AtomWalk endpoint       | по позиции и режиму: после `ATOM` формы `<(…)>`/`<[…]>` задают vertex/edge endpoint; вне него сохраняют meta-семантику; иначе cast, generic, аннотация или сравнение |
-| `\|`              | OR `\|\|` / замыкание `\|$x\|` / range-генератор `\|class:n\|` | `\|\|` — единый токен OR; остальное — по контексту                                                                                                                   |
-| `\|>` / `<\|…\|>` | pipe / KNN                                                                              | `\|>` и `<\|`,`\|>` — единые токены                                                                                                                                  |
-| `~`               | AtomWalk (`~[`, `]~>`, `]~`, `<~[`)                                                     | жадная токенизация после `MATCH ATOM`/`TRAVERSE ATOM`/`RELATE ATOM`; каждый шаг содержит непустое тело ребра с alias и/или label                                     |
-| `@`               | fulltext (`@@`, `@1@`, `@AND@`, `@OR@`)                                                 | единые токены                                                                                                                                                        |
-| стрелки           | `->`, `<-`, `<->` в паттернах и `RELATE`                                                | часть `edge_pattern`                                                                                                                                                 |
+| Символ            | Роли                                                                              | Стратегия                                                                                                                                                            |
+|-------------------|-----------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `<`               | меньше / cast `<T> e` / generic / аннотация графа / meta-атом / AtomWalk endpoint | по позиции и режиму: после `ATOM` формы `<(…)>`/`<[…]>` задают vertex/edge endpoint; вне него сохраняют meta-семантику; иначе cast, generic, аннотация или сравнение |
+| `\|`              | OR `\|\|` / замыкание `\|$x\|` / range-генератор `\|class:n\|`                    | `\|\|` — единый токен OR; остальное — по контексту                                                                                                                   |
+| `\|>` / `<\|…\|>` | pipe / KNN                                                                        | `\|>` и `<\|`,`\|>` — единые токены                                                                                                                                  |
+| `~`               | AtomWalk (`~[`, `]~>`, `]~`, `<~[`)                                               | жадная токенизация после `MATCH ATOM`/`TRAVERSE ATOM`/`RELATE ATOM`; каждый шаг содержит непустое тело ребра с alias и/или label                                     |
+| `@`               | fulltext (`@@`, `@1@`, `@AND@`, `@OR@`)                                           | единые токены                                                                                                                                                        |
+| стрелки           | `->`, `<-`, `<->` в паттернах и `RELATE`                                          | часть `edge_pattern`                                                                                                                                                 |
 
 ### 3.4. Пределы разбора
 
@@ -453,7 +466,11 @@ Cost-model **обязан** иметь degree statistics — без них гр�
 | per-property NDV, `null_fraction`, гистограммы freq+NDV | `PropertyHistogramPage` |
 | per-label degree-гистограмма по направлению             | `DegreeHistogramPage`   |
 
-`selectivity(label=Person) = |Person| / |nodes|` (из `LabelStatsPage`); `selectivity(age>18)` — histogram-based (из `PropertyHistogramPage`). Обновление статистики — инкрементально на DML и полностью на `ANALYZE`; авто-триггер при `dirty_row_fraction > FG_STATS_AUTO_ANALYZE_DIRTY` (0.10).
+`selectivity(label=Person) = |Person| / |nodes|` берётся из `LabelStatsPage` по точному ключу
+`{kind,label_id}`; arithmetic edge-label offset запрещён. `selectivity(age>18)` — из
+`PropertyHistogramPage`. `ANALYZE FULL` даёт exact NDV; APPROXIMATE использует HLL p=12 и
+deterministic reservoir 30 000 (`SAMPLE 1024..=1_000_000`). Auto threshold равен
+`max(1024, ceil(population*0.10))` и никогда не блокирует DML.
 
 ### 6.4. Штрафы и деградация плана
 
@@ -981,8 +998,10 @@ target = min(durable_visible_lsn,
              oldest_reader_visible_lsn.unwrap_or(durable_visible_lsn))
 ```
 
-После `fsync` каждого затронутого файла и durable `CheckpointEnd` атомарно заменяются graph
-superblocks, последним — `db.fgb`; это единственный commit point. Лишь затем version index и
+Superblock frames логически входят в обычный commit, но исключаются из in-place backfill. После
+`fsync` обычных файлов и durable `CheckpointEnd` latest logical AtomStore/graph superblocks
+пишутся COW через `.tmp`, сохраняя прежний main как `.prev`; последним заменяется `db.fgb` —
+единственный checkpoint commit point. `.tmp` никогда не становится authority. Лишь затем version index и
 закрытые сегменты `last_lsn ≤ target` можно prune. Отдельного active-tx watermark нет: до
 transaction spill `begin_tx` не пишет WAL.
 
@@ -999,10 +1018,11 @@ transaction spill `begin_tx` не пишет WAL.
 Один упорядоченный проход; каталога процедур на каждый вид записи нет — применение фрейма это `memcpy`.
 
 ```
-1. db.lock + выбор валидного max(generation, page_lsn) из db.fgb/db.fgb.tmp
+1. db.lock + валидация main db.fgb; db.fgb.tmp никогда не продвигается
 2. Seed clocks → один streaming-проход WAL `FGW1`, отказ от экспериментального `MVCE` и проверка matching CheckpointEnd
 3. Отбросить фреймы без TxCommit  ← весь «откат»
-4. Применить post-checkpoint frames В ПОРЯДКЕ ВОЗРАСТАНИЯ frame LSN через sealed registry
+4. Выбрать допустимый main/prev superblock не новее db authority; применить post-checkpoint
+   frames В ПОРЯДКЕ ВОЗРАСТАНИЯ frame LSN через sealed registry
 5. fsync touched files, проверить home pages, выполнить свежий passive checkpoint
 ```
 
@@ -1023,21 +1043,21 @@ range scan. Public trait с единственной реализацией не
 
 ### 13.1. Типы индексов
 
-| Тип (GrynQL §9.6)  | Scope                         | On-disk (disk-spec §20)       | Применение в исполнении                        |
-|--------------------|-------------------------------|-------------------------------|------------------------------------------------|
-| primary (implicit) | Database/base                 | AtomStore `primary.fgidx`     | `RecordId → GlobalAtomId` (§10.3)             |
-| membership         | Один graph                   | graph `membership.fgidx`      | `GlobalAtomId → DiskAtomRef` occurrence          |
-| label (implicit)   | Один graph                   | `lbl_node/edge_<id>.fgidx`    | `Scan` по graph-local метке                 |
-| standard / unique  | Explicit Base или Effective       | B+tree (order-preserving key) | `IndexScan`, точечный/range-lookup, uniqueness |
-| count              | Explicit Base или Effective       | одностраничный счётчик        | `count() … GROUP ALL` без скана                |
-| fulltext (BM25)    | Explicit Base или Effective       | inverted index                | `@@`/`@AND@`/`@OR@`, `search::score/highlight` |
-| HNSW (vector)      | Explicit Base или Effective       | in-memory + blob на диске     | KNN `<\|k,metric\|>`, ANN                      |
-| DiskANN (vector)   | Explicit Base или Effective       | не определён; вне core v1     | draft KNN; запрещён до storage approval        |
-| geometry (R-tree)  | Explicit Base или Effective       | R-tree                        | `INSIDE`/`INTERSECTS`, `geo::*`                |
-| reachability       | Один graph                   | tree_cover/GRAIL/FERRARI/BFL  | «достижима ли B из A?»                         |
-| neighbourhood      | Один graph                   | EXACT/SKETCH/LANDMARK         | `[:E*1..k]`, `k_hop_neighbourhood`             |
-| path               | Один graph                   | LANDMARK_SSSP/PATTERN_CACHE   | shortest-path, var-length                      |
-| edge-endpoint      | Один graph                   | B+tree `ee_endpoint.fgidx`    | AtomWalk V-E/E-V/E-E (§10.4)                   |
+| Тип (GrynQL §9.6)  | Scope                       | On-disk (disk-spec §20)       | Применение в исполнении                        |
+|--------------------|-----------------------------|-------------------------------|------------------------------------------------|
+| primary (implicit) | Database/base               | AtomStore `primary.fgidx`     | `RecordId → GlobalAtomId` (§10.3)              |
+| membership         | Один graph                  | graph `membership.fgidx`      | `GlobalAtomId → DiskAtomRef` occurrence        |
+| label (implicit)   | Один graph                  | `lbl_node/edge_<id>.fgidx`    | `Scan` по graph-local метке                    |
+| standard / unique  | Explicit Base или Effective | B+tree (order-preserving key) | `IndexScan`, точечный/range-lookup, uniqueness |
+| count              | Explicit Base или Effective | одностраничный счётчик        | `count() … GROUP ALL` без скана                |
+| fulltext (BM25)    | Explicit Base или Effective | inverted index                | `@@`/`@AND@`/`@OR@`, `search::score/highlight` |
+| HNSW (vector)      | Explicit Base или Effective | versioned base + exact delta  | KNN `<\|k,distance\|>`, ANN                    |
+| DiskANN (vector)   | Explicit Base или Effective | disk graph + exact delta      | KNN, bounded cache, optional HASHED_VECTOR     |
+| geometry (R-tree)  | Explicit Base или Effective | R-tree                        | `INSIDE`/`INTERSECTS`, `geo::*`                |
+| reachability       | Один graph                  | TREE/GRAIL/FERRARI/BFL/CHAIN  | `Yes/No/Maybe` + exact fallback                |
+| neighbourhood      | Один graph                  | EXACT/SKETCH/LANDMARK         | `[:E*1..k]`, `k_hop_neighbourhood`             |
+| path               | Один graph                  | LANDMARK_SSSP/PATTERN_CACHE   | shortest-path, var-length                      |
+| edge-endpoint      | Один graph                  | B+tree `ee_endpoint.fgidx`    | AtomWalk V-E/E-V/E-E (§10.4)                   |
 
 ### 13.2. Использование планировщиком
 
@@ -1055,10 +1075,12 @@ lookup. Index возвращает candidates; затем обычный executo
   достижимы только вместе с новым graph/catalog поколением. Unique проверяется до publication.
 - Incremental `IndexInsert/Delete`, count/fulltext и background maintenance в текущий срез не
   входят; indexed graph write пока перестраивает COW-поколение целиком.
-- HNSW/fulltext — опционально eventually-consistent (§19.1 gql_spec).
-- DiskANN остаётся draft-контрактом: parser может распознать форму только в будущем одобренном
-  профиле, но planner/storage не имеют права объявлять индекс доступным до определения
-  `disk_storage_spec.md` §20.6.4.
+- HNSW/DiskANN имеют отдельные versioned base side-files и общий exact delta. Fingerprint mismatch
+  делает индекс stale; exact fallback сохраняет корректность. `HASHED_VECTOR` меняет только
+  collision-checked exact dictionary DiskANN.
+- Reachability accelerators работают на SCC condensation DAG. `Maybe` всегда запускает exact
+  traversal; PATTERN_CACHE возвращает exact binding rows, а LANDMARK_SSSP использует directed ALT
+  для совместимой неотрицательной additive cost model.
 - **`DEFER`** — обновление откладывается в фоновую очередь (`IndexPendingQueue`), eventual consistency; несовместимо с `UNIQUE`.
 - **`CONCURRENTLY`** — двухфазная постройка без блокировки class source: initial (индексация существующих; новые изменения копятся как `pending`) → update (обработка pending); статус (`building_initial`/`building_update`/`ready`/`error`) виден через `INFO FOR INDEX` (§9.6 gql_spec).
 - **`REBUILD INDEX`** — перестройка (актуально для HNSW после многих обновлений).

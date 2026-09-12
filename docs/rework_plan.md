@@ -276,13 +276,15 @@ DataSpaceId::Graph(GraphId) > 0
 - `PageKey`, WAL и `FileCatalog` используют crate-private `DataSpaceId`.
 - `GraphId` всегда ненулевой.
 - Database files не называются system graph и не имеют `GraphSuperblock`.
-- Добавляется checkpoint-owned `AtomStoreSuperblock`.
+- Добавляется логически WAL-versioned `AtomStoreSuperblock`; его home-page публикуется
+  checkpoint metadata COW через `.tmp/main/.prev` и не мутируется in-place.
 - Один database WAL атомарно публикует base, memberships, graph topology, overlays и indexes.
 
 Так как core format v1 ещё не заморожен:
 
 - `STORAGE_FORMAT_VERSION` остаётся candidate v1;
-- `DatabaseCatalog` повышается до `FGDC v6`;
+- `DatabaseCatalog` повышается до `FGDC v7`; property-key strings вынесены в append-only
+  `property_keys.fgb`, а catalog хранит только `PropertyKeyId`;
 - `FileCatalog` повышается до `FGFC v5` с `space_id`;
 - новые page/file kinds получают новые discriminants и golden vectors до написания их codecs;
 - текущие `FGDC v5`/`FGFC v4` и graph-owned atom layout явно отклоняются;
@@ -338,9 +340,14 @@ DataSpaceId::Graph(GraphId) > 0
 
 ## 4. Dependency-ordered реализация
 
-**Статус на 2026-09-10:** документационные шаги A0–A4 выполнены. Они утверждают целевой
-контракт, но не меняют implementation-статус. Кодовые шаги A5–A16 не начаты; до A16 текущий
-TABLE/system-graph layout остаётся лишь историческим implementation state, а не нормативной моделью.
+**Статус на 2026-09-12:** документационные A0–A4/S0–S6 и кодовые A5–A8 выполнены.
+Старый TABLE/system-graph API удалён из собираемого crate; A9 и A10 не начаты.
+
+**Результат A8:** реализованы exact `AtomStoreSuperblock`, database-global append-only
+`PropertyDictionary`, `FGFC v5` binding, единая WAL-публикация data+metadata, WAL-first reopen,
+checkpoint backfill и metadata COW `tmp/main/prev`. Golden/corruption, old-snapshot,
+abort/commit/reopen и checkpoint-recovery проверки пройдены. Подробности:
+[`reports/atom_store_stage_a8.md`](reports/atom_store_stage_a8.md).
 
 | Шаг                               | Зависит от | Работа                                                                                                                                   |
 |-----------------------------------|------------|------------------------------------------------------------------------------------------------------------------------------------------|
@@ -349,10 +356,10 @@ TABLE/system-graph layout остаётся лишь историческим imp
 | A2. Grammar и примеры ✅          | A1         | Утвердить `CLASS`, `IN GRAPH`, `ATTACH/DETACH`, `RESET`, class/id/AS/LABEL pattern grammar                                               |
 | A3. Disk specification ✅         | A1         | Зафиксировать AtomStore, memberships, overlays, DataSpaceId, catalog versions, exact Atom/Node/Edge hot layouts, WAL и recovery          |
 | A4. Скорректировать планы ✅      | A2, A3     | Обновить зависимости и статусы всех активных планов; исторические reports оставить                                                       |
-| A5. Типы и schema API             | A2         | Ввести ClassId/GraphId/DataSpaceId, новый GraphRef и ClassSchema; убрать TABLE compatibility surface                                     |
-| A6. In-memory logical model       | A5         | Добавить global AtomStoreRoot, graph occurrences, reverse memberships и lazy overlays                                                    |
-| A7. MVCC и conflicts              | A6         | Разделить BaseAtom, GraphMembership, GraphOverlay и GraphIncidence conflict keys; добавить fanout preflight                              |
-| A8. Durable AtomStore             | A3, A5     | Реализовать AtomStoreSuperblock, atom/property pages, global primary, file registry, WAL/recovery                                        |
+| A5. Типы и schema API ✅          | A2         | Ввести ClassId/GraphId/DataSpaceId, новый GraphRef и ClassSchema; убрать TABLE compatibility surface                                     |
+| A6. In-memory logical model ✅    | A5         | Добавить global AtomStoreRoot, graph occurrences, reverse memberships и lazy overlays                                                    |
+| A7. MVCC и conflicts ✅           | A6         | Разделить BaseAtom, GraphMembership, GraphOverlay и GraphIncidence conflict keys; добавить fanout preflight                              |
+| A8. Durable AtomStore ✅          | A3, A5     | Реализовать AtomStoreSuperblock, atom/property pages, global primary, file registry, WAL/recovery                                        |
 | A9. Graph storage refactor        | A7, A8     | Превратить graph slots в occurrences, вынести properties в base store, добавить overlays и membership index                              |
 | A10. Indexes и statistics         | A9         | Перенести base indexes, добавить full effective indexes, class/label indexes и scope-aware statistics                                    |
 | A11. DDL frontend                 | A5, A10    | Parser → analysis → IR → execution для CLASS/FIELD/INDEX/INFO; удалить system-table path                                                 |

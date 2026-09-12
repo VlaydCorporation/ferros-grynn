@@ -54,12 +54,12 @@ objects, неограниченные и shortest/weighted paths, DDL/DML, Trave
 
 ## Утверждённая коррекция модели данных — этап 8.1
 
-**Статус профиля:** `approved-for-implementation`, реализация в текущем коде отсутствует.
-Документационные шаги A0–A4 завершены 2026-09-10; кодовые A5–A16 не начаты.
-До production cutover продолжает работать исторический TABLE-layout этапов 5–9; он является
-evidence текущего состояния, но больше не является целевой семантикой. При конфликте этого
+**Статус профиля:** `approved-for-implementation`. Документационные шаги A0–A4/S0–S6 и
+кодовые A5–A8 завершены; graph storage, indexes, frontend и production cutover A9–A16 остаются
+открытыми. Исторический TABLE-layout больше не входит в собираемый crate и сохраняется только
+как evidence в отчётах. При конфликте этого
 раздела с последующими draft-примерами правила этапа 8.1 имеют приоритет. Ключевое слово
-`TABLE` и compatibility aliases после cutover не принимаются. Точный синтаксис профиля задаёт
+`TABLE` и compatibility aliases не принимаются. Точный синтаксис профиля задаёт
 [gql_grammar.md](gql_grammar.md) «Грамматика коррекции 8.1», физическую модель —
 [disk_storage_spec.md](disk_storage_spec.md) «Целевая ревизия этапа 8.1».
 
@@ -1245,13 +1245,15 @@ SELECT * FROM document WHERE text @@ "personal" OR text @@ "nice weather today";
 ### 6.4. KNN
 
 ```
-<| @neighbors [ , @metric | EF @value ] |>
+<| @neighbors [ , @distance | EF @value ] |>
 ```
 
 Для поиска ближайших соседей используется синтаксис `<| N |>`, где N - количество искомых соседей.
 
-Опционально можно указать метрику, по которой будет вычисляться расстояние.
-Также возможно передать в качестве метрики пользовательскую функцию или замыкание с сигнатурой `(float, float) -> float`.
+`DISTANCE` в форме `<|K, DISTANCE|>` — metavariable выражения расстояния, а не keyword и не
+переименование DDL `DIST`. Можно передать built-in distance либо функцию/замыкание подходящей
+сигнатуры. Термин distance намеренный: пользовательская функция не обязана быть математической
+метрикой.
 ```
 <|2,EUCLIDEAN|>
 
@@ -1269,6 +1271,12 @@ CREATE pts:3 SET point = [8,9,10,11];
 DEFINE INDEX mt_pts ON pts FIELDS point HNSW DIMENSION 4 DIST EUCLIDEAN EFC 150 M 12;
 SELECT id FROM pts WHERE point <|10, EF 40|> [2,3,4,5];
 ```
+
+`<|K|>` использует default EUCLIDEAN. Planner может выбрать HNSW/DiskANN только при точном
+совпадении index `DIST`, element type, dimensions, scope и field; иначе выполняется exact scan с
+тем же distance. `<|K, EF n|>` явно требует ready ANN index: `WITH INDEX` выбирает его, без hint
+допустим ровно один compatible candidate; отсутствие и неоднозначность дают typed planning
+errors. Выбранный approximate path и индекс отображаются в `EXPLAIN`.
 
 ### 6.5. Условные выражения
 
@@ -2142,7 +2150,9 @@ HNSW (иерархически управляемый малый мир) — м�
 
 #### DiskANN
 
-[DiskANN](https://arxiv.org/abs/1907.01668)-подобные индексы обеспечивают на основе дисковых данных построение приблизительных графов ближайших соседей. 
+[DiskANN](https://papers.nips.cc/paper_files/paper/2019/file/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Paper.pdf)
+индексы обеспечивают на основе дисковых данных построение приблизительных графов ближайших
+соседей; реализация сверяется с официальным [Microsoft/DiskANN](https://github.com/microsoft/DiskANN).
 Они предназначены для очень больших наборов данных для встраивания, где хранение полного графа в оперативной памяти (как в случае с HNSW) нецелесообразно: 
 векторы и структура графа сохраняются в KV-хранилище и распределяются по ограниченному кэшу, что позволяет пожертвовать некоторой задержкой ради гораздо большего рабочего набора.
 
@@ -2156,22 +2166,26 @@ HNSW (иерархически управляемый малый мир) — м�
 
 Параметр `ALPHA` (default 1.2): Параметр отсева в DiskANN.
 
-`HASHED_VECTOR` зарезервирован в полном draft-профиле. Его алгоритмическая семантика и
-совместимость с точными векторами ещё не определены; до отдельного утверждения DiskANN-среза
-реализация обязана отклонять эту опцию как unsupported, а не выбирать поведение самостоятельно.
+`HASHED_VECTOR` допустим только для `DISKANN` и меняет representation точного vector dictionary,
+но не ANN graph, distance, ranking или recall. Без флага lookup использует полные canonical
+vector bytes; с флагом — `RapidHashV3(bytes, seed=0)` и bounded collision range с обязательным
+сравнением полных bytes. `-0.0` канонизируется в `+0.0`, NaN/infinity отклоняются. Изменение
+флага создаёт новую `SchemaVersion` и COW rebuild. Hash collision никогда не считается equality,
+а exhaustion collision-scan budget возвращает resource error.
 
 В запросах используется **та же** форма оператора `KNN`, что и в `HNSW`: `<| K |>`,
 `<| K, DISTANCE |>` или `<| K, EF SEARCH_LIST_SIZE |>`. Если метрика совместима с индексом,
 оптимизатор может выбрать `DISKANN`; `EF` задаёт размер динамического списка кандидатов поиска.
 
-Раздел задаёт только семантику полного draft-языка. Physical layout, catalog payload и recovery
-DiskANN отсутствуют в `disk_storage_spec.md` §20.6.4, поэтому `DEFINE INDEX ... DISKANN` не входит
-ни в утверждённый P0–P2, ни в core format v1 и до отдельного approval возвращает unsupported.
+HNSW и DiskANN имеют разные immutable versioned base side-files и общий exact WAL-delta contract
+с inserts/deletes/tombstones. Несовместимый fingerprint делает индекс stale и требует rebuild;
+planner использует exact fallback. Формат и recovery определены в `disk_storage_spec.md` §20.6.
 
 **Модель памяти и размер кэша**:
 
-В то время как граф `HNSW` хранится в оперативной памяти, индекс `DISKANN` поддерживается KV-хранилищем. 
-Граф, его списки смежности и векторы элементов с полной точностью сохраняются в KV-хранилище и остаются достоверным источником данных. 
+В то время как граф `HNSW` может храниться в оперативной памяти, `DISKANN` использует собственный
+disk-resident side-file с bounded page cache. Граф, его списки смежности и векторы элементов с
+полной точностью сохраняются в этом side-file и exact delta.
 Только ограниченный кэш в оперативной памяти содержит «горячий» рабочий набор, в то время как «холодные» узлы и векторы передаются из KV-хранилища по запросу. 
 Таким образом, резидентная память индекса `DISKANN` ограничена размером кэша, а не размером набора данных, что делает его подходящим для задач, требующих больше памяти, чем доступно в системе.
 
@@ -2190,6 +2204,7 @@ DiskANN отсутствуют в `disk_storage_spec.md` §20.6.4, поэтом�
 DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     ON [ GRAPH ] @graph
     PATH
+    [ WEIGHTED | COST fn::@function ]
     [ EDGES @edge_label ]
     [ ALGORITHM LANDMARK_SSSP(@n) 
         | PATTERN_CACHE 
@@ -2200,21 +2215,24 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     [ COMMENT @string ]
     [ CONCURRENTLY ]
     [ DEFER ]
+    WITH ( MAX_BYTES = @bytes )
 ;
 ```
 
 **Алгоритмы:**
 
-- `LANDMARK_SSSP(n)` — предвычисляет кратчайшие пути (BFS/Dijkstra) от n landmark-вершин. 
-  Оценка distance(A, B): min по landmark_i {d(A, lm_i) + d(lm_i, B)}.
-  Точное расстояние — если A или B является landmark'ом.
-  Пространство O(n·n_landmarks), запрос O(n_landmarks).
-  `FG_PATH_MAX_DEPTH` не применяется к индексу; запросы через индекс неограничены по глубине. 
-  Применение: частые shortest-path запросы в статичных графах.
+- `LANDMARK_SSSP(n)`, `n=1..=256`, хранит направленные расстояния от и до landmarks и применяет
+  admissible ALT lower bound
+  `max(0, max_l(d(l,t)-d(l,v)), max_l(d(v,l)-d(t,l)))`. Запрос остаётся точным A* с повторным
+  открытием улучшенных states. Без modifier индексирует hop count; `WEIGHTED` — встроенный
+  неотрицательный finite edge weight; `COST fn` — ту же versioned PURE `(edge)->number`
+  additive функцию. Stateful cost поддерживается только ON_DEMAND.
 
-- `PATTERN_CACHE` — кэширует результаты конкретных паттернов пути.
-  Паттерны задаются явно через `PATTERNS`. Результат каждого паттерна хранится как subgraph. 
-  Инвалидируется при изменении топологии; пересчитывается при следующем запросе или через `REBUILD INDEX`.
+- `PATTERN_CACHE` кэширует exact binding rows, named paths и bag multiplicity для конечного
+  списка parameter-free bounded `PATTERNS`. Cache identity включает alpha-normalized IR,
+  GraphId, cost model, literals и versioned dependencies. Он не хранит `SubgraphDir`; `RETURN
+  GRAPH` выполняет обычную materialization. Любое зависимое data/schema/function изменение
+  атомарно делает definition stale.
 
 - `ON_DEMAND` — BFS/Dijkstra при каждом запросе. `FG_PATH_MAX_DEPTH` применяется. Рекомендуется для изменяемых графов.
 
@@ -2232,14 +2250,16 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     [ EDGES @edge_label ]
     [ ALGORITHM TREE_COVER
         | GRAIL [ (@k) ]
-        | FERRARI
-        | BFL [ (@landmarks) ]
+        | FERRARI [ (@max_ranges) ]
+        | BFL [ (@bits) ]
+        | CHAIN_COVER
         | ON_DEMAND 
     ]
     [ DIRECTION OUT | IN | BOTH ]
     [ COMMENT @string ]
-    [ CONCURTLY ]
+    [ CONCURRENTLY ]
     [ DEFER ]
+    [ WITH ( MAX_BYTES = @bytes ) ]
 ;
 ```
 
@@ -2247,48 +2267,50 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
 
 **Алгоритмы:**
 
-[//]: # (TODO: path-tree cover, Chain-Cover)
-
 - `TREE_COVER` — DFS-интервальные метки на остовном дереве. 
   Каждая вершина получает метку `[in_ts, out_ts]`. 
   Достижимость B из A: `in_A ≤ in_B AND out_B ≤ out_A`.
   Пространство O(n), запрос O(1), без false positives.
-  Даёт точную достижимость только для деревьев. Для DAG требуется расширение (несколько деревьев/интервалов) — иначе возможны ошибки.
+  Допустим только для TREE/ROOTED_TREE/FOREST; generic DAG отклоняется.
   Инвалидируется при мутациях.
 
-- `GRAIL(k)` — k случайных DFS-обходов, каждый порождает интервальную метку `[in_ts, out_ts]`.
-  Достижимость: $`\exists i \in [1, \cdots, k]: in_A[i] \leq in_B[i] и out_B[i] \leq out_A[i]`$.
-  k ∈ [2, 5], default k = 2. Пространство O(k·n), запрос O(k).
+- `GRAIL(k)` — k детерминированно seeded DFS-обходов, каждый порождает `[in_ts,out_ts]`.
+  Нарушение containment хотя бы в одном измерении даёт `No`; только прохождение всех k даёт
+  `Maybe` и exact traversal. `k ∈ [1,32]`, default 2.
   Возможны false positives (гарантирует отсутствие false negatives).
   Применяется к DAG; для графов с циклами требуется предварительное сжатие по SCC.
   Качество (доля false positives) сильно зависит от k: чем больше k, тем меньше ложных срабатываний, но больше размер индекса.
 
-- `FERRARI` — адаптивный индекс, комбинирующий точные и приближённые интервалы для минимизации false positives при ограниченном размере.
-  Часто использует семена (seeds), несколько интервалов на вершину и/или стратегии обрезки.
-  Размер и сложность запроса зависят от конфигурации и данных; типично: размер O(cn) при небольшом c, запрос от O(1) до O(c).
-  Обеспечивает значительно меньше false positives, чем GRAIL при близком размере индекса.
-  Для графов с циклами обычно применяется после сжатия по SCC.
+- `FERRARI(max_ranges)`, default 4, range `1..=255`, хранит bounded exact/approximate interval
+  cover. Exact hit даёт `Yes`, miss `No`, approximate hit `Maybe` с guided exact traversal.
 
-- `BFL(landmarks)` — Bidirectional labeling через landmark-вершины. 
-  Каждая вершина хранит bitmap достижимых/достигающих landmark'ов. 
-  Достижимость B из A: `out_labels(A) ∩ in_labels(B) ≠ ∅`. 
-  Работает для произвольных ориентированных графов (не только DAG). 
-  Пространство O(landmarks·n / 8) байт, запрос O(1). default landmarks = min(⌈√n⌉, 100).
+- `BFL(bits)`, default 160, range `64..=4096` кратно 8, хранит propagated Bloom labels SCC,
+  а не landmarks. Нарушение `out(target) ⊆ out(source)` либо `in(source) ⊆ in(target)` даёт
+  `No`; иначе `Maybe` и exact traversal. False negatives запрещены.
+
+- `CHAIN_COVER` хранит deterministic chain decomposition и dense
+  `lowest_reachable_position[chain]`; lookup точный O(1), storage
+  `O(component_count × chain_count)`. Для explicit выбора обязателен `MAX_BYTES`.
 
 - `ON_DEMAND` — нет предобработки; каждый запрос выполняет BFS/DFS. 
   O(1) хранилище, O(V+E) запрос. Единственный корректный вариант для графов с частыми мутациями топологии.
 
-Для всех трёх методов (`TREE_COVER`, `GRAIL`, `FERRARI`), если в графе есть циклы, стандартом является предварительное сжатие по SCC и построение индекса на DAG из компонент.
+Для произвольного directed graph сначала вычисляются SCC и condensation DAG. Ответ индекса —
+`Yes|No|Maybe`; `Maybe` всегда запускает exact bounded traversal.
 
 **Автоматический выбор алгоритма** (без ALGORITHM):
 
-| Тип графа из DEFINE GRAPH         | Размер        | Выбранный алгоритм  |
-|-----------------------------------|---------------|---------------------|
-| TREE / ROOTED_TREE / FOREST / DAG | ≤ 500K вершин | TREE_COVER          |
-| TREE / ROOTED_TREE / FOREST / DAG | > 500K вершин | GRAIL(2)            |
-| Общий ориентированный             | любой         | BFL(min(⌈√n⌉, 100)) |
-| Без ограничений типа              | любой         | ON_DEMAND           |
-| VALIDATE DEFERRED или мутабельный | любой         | ON_DEMAND           |
+| Тип/бюджет                      | Выбранный алгоритм |
+|---------------------------------|--------------------|
+| TREE / ROOTED_TREE / FOREST     | TREE_COVER         |
+| Прочие, CHAIN_COVER помещается  | CHAIN_COVER        |
+| Иначе FERRARI(4) помещается     | FERRARI(4)         |
+| Иначе BFL(160) помещается       | BFL(160)           |
+| Ни один side-file не помещается | ON_DEMAND          |
+
+`AUTO` требует `WITH (MAX_BYTES=n)`; explicit algorithm не подменяется молча при нехватке
+бюджета. Staleness, а не сам факт mutability, определяет возможность использования snapshot
+artifact.
 
 #### Neighborhood index
 
@@ -2376,7 +2398,7 @@ REMOVE [
 	DATABASE [ IF EXISTS] @name
 	| EVENT [ IF EXISTS ] @name ON CLASS @class
 	| FIELD [ IF EXISTS ] @name ON CLASS @class
-	| INDEX [ IF EXISTS ] @name ON CLASS @class
+	| INDEX [ IF EXISTS ] @name ON ( CLASS @class | GRAPH @graph )
     | ANALYZER [ IF EXISTS ] @name
     | FUNCTION [ IF EXISTS ] fn::@name
     | PARAM [ IF EXISTS ] $@name
@@ -2390,10 +2412,8 @@ REMOVE [
 
 Оператор ALTER используется для изменения глобальных параметров, конфигураций сущностей, событий, определений схемы и индексов.
 
-Полный draft-профиль содержит только перечисленные ниже формы. Они не входят в утверждённый
-P0–P2 и требуют approval соответствующего вертикального среза. `ALTER GRAPH` пока не определён:
-для графов доступны `DEFINE ... OVERWRITE` и `REMOVE`, а новая ALTER-семантика должна сначала
-появиться в этом разделе. Точный синтаксис форм ниже задаёт `gql_grammar.md` §9.10.
+Формы ниже являются утверждённым контрактом полного draft-профиля; их implementation остаётся
+dependency-ordered по активному плану. Точный синтаксис задаёт `gql_grammar.md` §9.10.
 
 Каждый `ALTER` содержит хотя бы одно действие. `[...]` после группы действий ниже означает
 повтор группы; повтор одного свойства и несовместимые действия для него являются семантической
@@ -2461,6 +2481,7 @@ ALTER FIELD [ IF EXISTS ] @name ON CLASS @class
     DEFAULT [ ALWAYS ] @expression |
     COMMENT @string
 ) [...]
+[ WITH MIGRATION ] [ CONCURRENTLY ]
 ;
 ```
 
@@ -2484,7 +2505,7 @@ ALTER FUNCTION [ IF EXISTS ] fn::@name
 Используется для изменения существующего индекса
 
 ```
-ALTER INDEX @name ON CLASS @class
+ALTER INDEX @name ON ( CLASS @class | GRAPH @graph )
     ( COMMENT @string | PREPARE REMOVE | DROP COMMENT )
 ;
 ```
@@ -2521,11 +2542,59 @@ ALTER CLASS [ IF EXISTS ] @name
       | CHANGEFEED @duration
       | COMMENT @string
     ) [...]
+[ WITH MIGRATION ] [ CONCURRENTLY ]
 ;
 ```
 
 `COMPACT` выполняет сжатие base/effective index и AtomStore-страниц выбранного class.
 Порядок действий не превращает один statement в последовательность промежуточных схем.
+
+`ALTER CLASS` и `ALTER FIELD` принимают `[WITH MIGRATION] [CONCURRENTLY]`. Без migration все
+существующие данные проверяются bounded до publication; нарушение ничего не меняет. Migration
+разрешает только standard casts, DEFAULT fill, VALUE recompute и ASSERT/REFERENCE validation,
+строит недостижимые generations и после повторной revision check публикует их одним DB commit.
+
+#### ALTER GRAPH
+
+```text
+ALTER GRAPH [IF EXISTS] @graph
+  ( TYPE @graph_constraint
+  | ROOT @record
+  | ROOTS @array
+  | DROP ROOTS
+  | VALIDATE ON_MUTATION
+  | VALIDATE DEFERRED
+  | COMMENT @string
+  | DROP COMMENT ) [...]
+;
+```
+
+TYPE/root actions только валидируют текущую topology; скрыто удалять edges, переписывать roots
+или выполнять topology migration запрещено. `ALTER INDEX`, `REMOVE INDEX` и `INFO FOR INDEX`
+имеют симметричные `ON CLASS`/`ON GRAPH` формы. Maintenance `COMPACT` не меняет SchemaVersion.
+
+Один ALTER публикует одну catalog revision. Каждый непосредственно изменённый schema object
+увеличивает собственный SchemaVersion ровно один раз; неизменившиеся dependencies — нет.
+Duplicate/conflicting actions и revision race отклоняются до atomic publication; partial ALTER
+невозможен.
+
+### 9.11. ANALYZE
+
+```text
+ANALYZE (
+    CLASS @class (BASE | EFFECTIVE IN GRAPH @graph)
+  | GRAPH @graph
+)
+[FULL | APPROXIMATE [SAMPLE @count]]
+[CONCURRENTLY]
+;
+```
+
+Операция всегда читает полный source snapshot. FULL даёт exact counters/NDV и unsampled
+histograms; APPROXIMATE сохраняет exact counters, но использует HLL p=12 и deterministic
+reservoir (default 30000, `SAMPLE` range `1024..=1_000_000`). Default — FULL до 32 visible pages,
+иначе `APPROXIMATE SAMPLE 30000`. Foreground ждёт и при revision race возвращает conflict;
+CONCURRENTLY немедленно возвращает job ID, а race перепланирует job. DML не ждёт auto-analyze.
 
 ---
 

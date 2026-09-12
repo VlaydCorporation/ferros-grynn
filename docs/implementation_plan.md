@@ -26,7 +26,7 @@ Rust и к планированию работ, который ранее был
 ### Коррекция 8.1: graph-first атомы
 
 [`rework_plan.md`](rework_plan.md) — обязательный barrier перед всеми кодовыми этапами 9–31.
-Документационные шаги A0–A4 завершены 2026-09-10; реализация A5–A16 не начата.
+Документационные A0–A4/S0–S6 и кодовые A5–A8 завершены; A9–A16 остаются открытыми.
 Целевая модель:
 
 - `CLASS`, а не TABLE, задаёт namespace `RecordId = class:id`, immutable `NODE|EDGE`
@@ -61,11 +61,11 @@ implementation oracle и не могут использоваться как tar
 |-------------------------|----------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `STO-WIN-SYNC`          | `disk_storage_spec` §§2, 7–28; `full_plan` 3, 19                                                   | `implemented`, выпуск `gated`: correctness пройден, sparse miss 77,5% и scan resistance 88,2% ниже 90% | Закрыть stage-3 performance gate; затем Windows crash/recovery/fuzz/soak matrix в stage 19. Evidence: `reports/disk_storage_stage5_report.md`       |
 | `STO-WIN-NATIVEASYNC`   | `disk` §2.1; `gql_tech` §1.4                                                                       | optional `implemented`, QD gate пройден; sync pull API и WAL не изменены                               | Обе feature-конфигурации и Sync/NativeAsync differential suite в stage 19. Evidence: `reports/disk_storage_stage6_report.md`                        |
-| `STO-CORE-V1`           | Core layouts/durability и primary/scalar B+tree из `disk` §§6–28; advanced side-files исключены §7 | Windows `candidate`, не frozen; graph-owned FGDC v5/FGFC v4 отклоняются target 8.1                     | A8–A10: FGDC v6, FGFC v5, AtomStore/occurrence golden bytes и recovery; freeze только после A15, `STO-WIN-SYNC` и stage 19                          |
-| `STO-ATOM-OCCURRENCE`   | AtomStore, graph occurrences, overlays, `DataSpaceId`, scoped indexes/statistics                   | `approved-for-implementation` / `missing`; docs A0–A4 завершены                                        | A5–A16 из `rework_plan.md`: byte vectors, WAL/recovery, RAM/local parity, fanout и performance gates                                                |
+| `STO-CORE-V1`           | Core layouts/durability и primary/scalar B+tree из `disk` §§6–28; advanced side-files версионируются отдельно | Windows `candidate`, не frozen; FGDC v5/v6 и FGFC v4 отклоняются | A8–A10: FGDC v7, FGFC v5, AtomStore/occurrence golden bytes и recovery; freeze только после A15, `STO-WIN-SYNC` и stage 19 |
+| `STO-ATOM-OCCURRENCE`   | AtomStore, graph occurrences, overlays, `DataSpaceId`, scoped indexes/statistics                   | `approved-for-implementation` / `partial`: A5–A8, включая durable AtomStore, завершены                  | A9–A16 из `rework_plan.md`: graph/overlay/index layout, RAM/local parity, fanout и performance gates                                                |
 | `STO-LINUX-SYNC`        | `disk` §§2.1, 28; `full_plan` 32                                                                   | `missing`, specified target                                                                            | Byte-identical v1 vectors, recovery, Linux/NVMe performance и soak; до этого Unix не released                                                       |
 | `STO-LINUX-NATIVEASYNC` | `disk` §2.1; `gql_tech` §1.4; `full_plan` 33                                                       | `draft`, `missing`                                                                                     | Нативный tokio-uring backend и тот же durability/differential contract; не блокирует Windows                                                        |
-| `IDX-DISKANN`           | `gql_spec` §9.6; `gql_grammar` §9.6; `disk` §20.6.4                                                | syntax/semantics `draft`, physical contract `missing`, core v1 `out-of-scope`                          | До stage 23 отдельно утвердить `HASHED_VECTOR`, catalog payload, side-file version, recovery, bulk/incremental parity и recall/latency/memory gates |
+| `IDX-DISKANN`           | `gql_spec` §9.6; `gql_grammar` §9.6; `disk` §20.6 | контракт утверждён; реализация отложена; side-file версионируется отдельно | Этап 23: HNSW/DiskANN base+delta, HASHED_VECTOR collisions, recovery и recall/latency/memory gates |
 
 ### GrynQL conformance
 
@@ -84,7 +84,7 @@ implementation oracle и не могут использоваться как tar
 | `GQL-ADMIN`        | `CONCURRENTLY`, bounded `DEFER`, `REBUILD`, `INFO`, `KILL`, maintenance                               | 20                                                                   | `draft` / `missing`                                        | Durable job state, crash-to-`stale`, cancellation и observability                                     |
 | `GQL-PARAM-UDF`    | Params, functions, closures, overloads, purity/security/recursion                                     | 21                                                                   | `draft` / `missing`                                        | Sandbox, deterministic purity checks, recursion/error boundaries                                      |
 | `GQL-FULLTEXT`     | Analyzers, inverted index, BM25, highlights                                                           | 22                                                                   | `draft` / `missing`                                        | Unicode/analyzer versioning, incremental/bulk equality, recovery                                      |
-| `GQL-VECTOR`       | HNSW, затем отдельно DiskANN; KNN/ANN                                                                 | 23                                                                   | `draft` / `missing`                                        | Per-algorithm recall/latency/memory/build gates; DiskANN additionally requires `IDX-DISKANN` approval |
+| `GQL-VECTOR`       | HNSW, затем DiskANN; KNN/ANN и HASHED_VECTOR | 23 | контракт утверждён / реализация отсутствует | Per-algorithm recall/latency/memory/build/recovery gates |
 | `GQL-GEO-DERIVED`  | Geometry R-tree и graph-derived indexes                                                               | 24–25                                                                | `draft` / `missing`                                        | Exact post-filter; `build_lsn`/`stale` fallback and rebuild tests                                     |
 | `GQL-LIVE-EVENTS`  | Changefeed, `LIVE SELECT`, events, LiveGraph integration                                              | 27–29                                                                | `draft` / `missing`                                        | At-least-once/GAP/resume, bounded queues, retry/idempotency/conflict tests                            |
 | `GQL-BRIDGES`      | `Bridge`, `.use_bridge`, `BridgeData`, `SurrealBridge`                                                | 30                                                                   | `draft` / `missing`                                        | Public-value boundary, external failure mapping и cross-database E2E                                  |
@@ -185,7 +185,7 @@ Rust-иллюстрации тензоров из §3.8. `enum BridgeData` (§30
 | `RecordId` / `DiskAtomRef` / `QualifiedAtomRef`                                                                                      | `disk` §4, §9                          | `src/values/runtime`, `src/values/storage`, `src/storage`  | 🟢 идентификаторы и primary lookup первого среза                |
 | `SchemaCatalog` / target `ClassCatalog`                                                                                              | `disk` §18                             | `src/storage/catalog/`; полный DDL — будущий `src/schema`  | 🟡 durable TABLE state реализован, CLASS cutover A5–A16 открыт  |
 | `StatisticsStore`                                                                                                                    | `disk` §19                             | `src/stats`, `src/storage/graph_pages`                     | 🟢 exact counters, bulk histograms и durable reopen             |
-| Индексы (Label/BTree/Count/Fulltext/HNSW/DiskANN/R-tree/…)                                                                           | `disk` §20                             | `src/storage/graph_index/`; advanced — будущий `src/index` | 🟡 primary/scalar B+tree; DiskANN physical contract отсутствует |
+| Индексы (Label/BTree/Count/Fulltext/HNSW/DiskANN/R-tree/…)                                                                           | `disk` §20                             | `src/storage/graph_index/`; advanced — будущий `src/index` | 🟡 primary/scalar B+tree; advanced contracts approved, implementation deferred |
 | Changefeed / Live                                                                                                                    | `gql_spec` §21, `disk` §21             | `src/changefeed` (нов.)                                    | 🔴 новое                                                        |
 | Query-слой: binder / typechecker, lowering AST→IR, RuleEngine/CostEngine, физ. операторы, стыковка Traversal VM ↔ реляционный движок | `gql_tech` §4–§9                       | `src/gql` (`analysis.rs`, `ir.rs`, `execution.rs`)         | 🟡 read-only срез; optimizer/traversal впереди                  |
 
@@ -536,7 +536,7 @@ impl EndpointTensor {
 |--------------------------------------|---------------------------------------------------|------------------------------------------------------|
 | `SyncPageManager`                    | `storage/page_manager.rs`                         | WAL/home page-level I/O (frame-WAL, §3.3)            |
 | `DiskMetaGraph`                      | `storage/disk_graph.rs`                           | Disk-backed MetaGraph                                |
-| target `AtomHotSlot`                 | A8: будущий codec в `storage`                     | Encode/decode 48-byte global base slots              |
+| `AtomHotSlot`                        | `storage/atom_page.rs`, A8 завершён               | Encode/decode 48-byte global base slots              |
 | target `NodeHotSlot` / `EdgeHotSlot` | A9: refactor текущих `storage/graph_pages` codecs | Encode/decode 160-byte graph occurrences             |
 | `PropHeapPage`                       | `storage/prop_heap.rs`                            | Slotted-page для canonical RecordId/base PropertyMap |
 | `LabelDictionary`                    | `storage/label_dict.rs`                           | Интернирование строк                                 |
@@ -691,8 +691,8 @@ Disk-backed режим 2. Зависит от A.
 - **Disk-страницы** 🟢 для исторического Windows sync среза — текущие graph-owned
   `NodeHotSlot`/`EdgeHotSlot`, local и cross-level overflow adjacency, slotted property
   heap/large objects, subgraph directory, freelist, label dictionary, primary и scalar B+tree,
-  posting pages и graph statistics имеют checksummed codecs в `src/storage`. Target A8/A9
-  сохраняет page families, но заменяет payload на exact `AtomHotSlot` и graph-local occurrence
+  posting pages и graph statistics имеют checksummed codecs в `src/storage`. A8 уже заменил
+  database-global payload на exact `AtomHotSlot`; A9 заменит graph-local payload на occurrence
   layouts из disk §§10–11.
 - **`store.rs`** 🟢 для этапа 5 — публичные `create_local/open_local`, backend-neutral
   `GraphMutationView`, stable-layout page delta, безопасный COW fallback при смене layout и
@@ -792,8 +792,9 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
 - **`src/stats/`** 🟢 — MVCC `StatisticsStore`: точные graph/class/label counts и degree totals;
   A10 разделяет base class и effective graph scopes,
   `PropertyHistogramPage`/`DegreeHistogramPage` с equi-depth buckets, exact NDV/null fractions при
-  full scan и per-transaction point delta со stale markers. Public `ANALYZE`, sampling/HLL и
-  bounded-memory сбор остаются будущему optimizer/import surface.
+  full scan и per-transaction point delta со stale markers. Public `ANALYZE`, HLL p=12,
+  deterministic reservoir и bounded semantics утверждены; реализация остаётся optimizer/admin
+  этапу.
 
 ### Область G. Индексы (+ bulk-сборка) — P3–P5
 
@@ -811,8 +812,9 @@ RAM-подэтап режима 1 не зависит от C: отсутстви
   построчную работу в фон (проблема латентности → проблема очереди), несовместим с `UNIQUE`.
 - **`FulltextIndex`** (BM25, inverted + posting lists) — P4.
 - **`HnswIndex`** — P5; durability через журналирование вставок, replay, пометка stale при разрыве.
-- **`DiskAnnIndex`** — P5 после HNSW и отдельного approval `disk_storage_spec.md` §20.6.4;
-  до определения catalog/side-file/recovery contract реализация запрещена.
+- **`DiskAnnIndex`** — P5 после HNSW по утверждённому `disk_storage_spec.md` §20.6:
+  отдельный versioned base, общий exact delta и collision-checked `HASHED_VECTOR`; implementation
+  требует recovery/recall/latency/memory gate.
 - **`RtreeIndex`** (geometry, STR-packing) — P5.
 - **`EdgeEndpointIndex`**, **`NeighbourhoodIndex`**, **`PathIndex`** — P4–P5.
 
@@ -936,9 +938,9 @@ qualified overflow. Таблица ниже теперь относится к �
 
 **Фазы (укрупнённо):**
 
-- **Фаза 0 — синхронизация спецификаций**: ✅ повторно выполнена 2026-08-31; зафиксированы
-  предметные authority, conformance/approval matrix, DiskANN draft-boundary, точный ALTER,
-  NativeAsync и Windows-first format-v1 gate. Будущие GrynQL-срезы остаются draft.
+- **Фаза 0 — синхронизация спецификаций**: ✅ повторно выполнена 2026-09-12; зафиксированы
+  superblock/dictionary/checkpoint layouts, ANALYZE/ALTER, vector/reachability/path contracts,
+  NativeAsync и Windows-first format-v1 gate. Будущие implementation-срезы остаются deferred.
 - **Фаза 1 — фундамент типов** (P1): ✅ runtime и `StorageValue`/codec части Области A.
 - **Фаза 1.5 — свойства и ECS sidecar** (P2): ✅ PropertyMap benchmarks/dictionary,
   generation-aware SparseSet и PropertyColumn; `GraphWorkspace` продолжается в этапе 4.
@@ -965,11 +967,11 @@ qualified overflow. Таблица ниже теперь относится к �
   отдельный gate Unix-выпуска, не Windows freeze.
 - **Фаза 5b — полная схема/статистика/optimizer indexes** (P3–P4): ✅ E и F; оставшаяся G
   (Label/Count, external bulk и cost-based planner).
-- **Коррекция 8.1 — graph-first AtomStore/occurrences**: 🟡 A0–A4 завершены
-  2026-09-10; A5–A16 — следующая блокирующая фаза. Исторические E/G и TABLE-срезы
-  остаются evidence, но не target design.
-- **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW, затем отдельно утверждённый
-  DiskANN, R-tree, derived incidence indexes и M (changefeed/live).
+- **Коррекция 8.1 — graph-first AtomStore/occurrences**: 🟡 A0–A8 и нормативные S0–S6
+  завершены; A9–A16 открыты. Исторические E/G и TABLE-срезы остаются evidence, но не
+  target design.
+- **Фаза 6 — продвинутые индексы и Live** (P4–P5): Fulltext, HNSW/DiskANN по утверждённым
+  side-file contracts, R-tree, derived incidence indexes и M (changefeed/live).
 - **Фаза 7 — optional Native Async I/O и мосты**: ✅ Windows IoRing через единый внутренний
   page-source контракт; GrynQL pull API не меняется. Linux/tokio-uring отложен до нативного
   окружения. Unlimited transaction spill проектируется отдельно после crash/performance tests.

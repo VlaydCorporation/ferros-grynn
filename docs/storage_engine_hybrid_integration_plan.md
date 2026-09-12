@@ -22,8 +22,8 @@ checkpoint/recovery, write path и публичные query-result типы не
 ### Addendum 8.1: database и graph data spaces
 
 [`rework_plan.md`](rework_plan.md) не меняет выбор R8/Direct/scatter/IoRing, бюджеты и
-router. Он меняет identity файлов и данных над этим engine. Документационные A0–A4
-завершены 2026-09-10; код A5–A16 не начат.
+router. Он меняет identity файлов и данных над этим engine. Документационные A0–A4 и
+код A5–A8 завершены; A9–A16 остаются открытыми.
 
 - `SourceState` и `PageKey` получают `DataSpaceId`, `DataFileId` и точную
   `PageCacheVersion`; удаляется допущение, что любой source принадлежит graph.

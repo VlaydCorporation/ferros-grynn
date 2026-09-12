@@ -64,11 +64,11 @@ DDL/DML, traversal и graph-return должны завершаться диаг�
 
 ## Грамматика коррекции 8.1
 
-**Статус профиля:** `approved-for-implementation`; до завершения этапа 8.1 он ещё не является
-текущим runtime-профилем. Документационные A0–A4 завершены 2026-09-10; кодовые A5–A16 не
-начаты. После cutover правила ниже заменяют конфликтующие правила полного
-draft: `TABLE`, class kind `ANY|NORMAL|RELATION` и форма `alias:Label` не имеют compatibility
-alias. Остальная полная EBNF применяется лишь там, где она не противоречит этому разделу.
+**Статус профиля:** `approved-for-implementation`. Документационные A0–A4/S0–S6 и кодовые
+A5–A8 завершены; parser/runtime-срезы A9–A16 ещё не завершены. Правила ниже заменяют
+конфликтующие правила полного draft: `TABLE`, class kind `ANY|NORMAL|RELATION` и форма
+`alias:Label` не имеют compatibility alias. Остальная полная EBNF применяется лишь там, где
+она не противоречит этому разделу.
 
 ```ebnf
 class_name      ::= name
@@ -429,6 +429,7 @@ statement ::=
     | explain_stmt
     | assert_invariants_stmt
     | import_stmt
+    | analyze_stmt
     | alter_stmt
     | compact_stmt
     | define_stmt
@@ -984,9 +985,10 @@ diskann_distance    ::= "EUCLIDEAN" | "COSINE" | "INNER_PRODUCT" | "COSINE_NORMA
 define_graph_index ::= "DEFINE" "INDEX" [ overwrite_or_ifne ] name
                        "ON" [ "GRAPH" ] name
                        graph_index_kind
+                       [ "WEIGHTED" | "COST" fn_name ]
                        [ "EDGES" label ]
                        [ "DIRECTION" ( "OUT" | "IN" | "BOTH" ) ]
-                       [ "PATTERNS" expr ]
+                       [ "PATTERNS" pattern_cache_list ]
                        [ "COMMENT" string_lit ]
                        [ "CONCURRENTLY" ]
                        [ with_options ]
@@ -998,10 +1000,18 @@ graph_index_kind ::=
     | "NEIGHBOURHOOD" "(" integer ")" [ "ALGORITHM" neigh_algo ]
 
 path_algo  ::= "LANDMARK_SSSP" "(" integer ")" | "PATTERN_CACHE" | "ON_DEMAND"
-reach_algo ::= "TREE_COVER" | "GRAIL" [ "(" integer ")" ] | "FERRARI"
-             | "BFL" [ "(" integer ")" ] | "ON_DEMAND"
+reach_algo ::= "TREE_COVER" | "GRAIL" [ "(" integer ")" ]
+             | "FERRARI" [ "(" integer ")" ]
+             | "BFL" [ "(" integer ")" ] | "CHAIN_COVER" | "ON_DEMAND"
 neigh_algo ::= "EXACT" | "SKETCH" | "LANDMARK" "(" integer ")" | "ON_DEMAND"
+pattern_cache_list ::= graph_pattern { "," graph_pattern }
 ```
+
+`FERRARI` parameter is `max_ranges` (`1..=255`, default 4); `BFL` parameter is bits
+(`64..=4096`, multiple of 8, default 160), never landmarks. `AUTO`, explicit `CHAIN_COVER` and
+`PATTERN_CACHE` require `WITH (MAX_BYTES=...)`. `PATTERNS` accepts only parameter-free bounded
+path patterns after semantic analysis. `WEIGHTED`/`COST` apply only to PATH; indexed COST must
+resolve to a versioned PURE additive `(edge)->number` function.
 
 ### 9.7. DEFINE ANALYZER
 
@@ -1047,7 +1057,7 @@ remove_target ::=
     | "GRAPH"    [ if_exists ] name
     | "EVENT"    [ if_exists ] name "ON" ( "CLASS" class_name | "GRAPH" name )
     | "FIELD"    [ if_exists ] name "ON" "CLASS" class_name
-    | "INDEX"    [ if_exists ] name "ON" "CLASS" class_name
+    | "INDEX"    [ if_exists ] name "ON" ( "CLASS" class_name | "GRAPH" name )
     | "ANALYZER" [ if_exists ] name
     | "FUNCTION" [ if_exists ] user_fn
     | "PARAM"    [ if_exists ] param
@@ -1057,7 +1067,7 @@ remove_target ::=
 
 ```ebnf
 alter_stmt ::= alter_analyzer | alter_database | alter_event | alter_field
-             | alter_function | alter_index | alter_param | alter_class
+             | alter_function | alter_index | alter_param | alter_class | alter_graph
 
 alter_analyzer ::= "ALTER" "ANALYZER" [ if_exists ] name
                    alter_analyzer_action { alter_analyzer_action }
@@ -1079,6 +1089,7 @@ alter_event_action ::= "ASYNC" [ "RETRY" integer ] [ "MAXDEPTH" integer ]
 
 alter_field ::= "ALTER" "FIELD" [ if_exists ] name "ON" "CLASS" class_name
                 alter_field_action { alter_field_action }
+                [ "WITH" "MIGRATION" ] [ "CONCURRENTLY" ]
 alter_field_action ::= "DROP" ( "TYPE" | "FLEXIBLE" | "READONLY" | "VALUE"
                                       | "ASSERT" | "DEFAULT" | "COMMENT" | "REFERENCE" )
                      | "FLEXIBLE" | "READONLY" | "REFERENCE"
@@ -1091,7 +1102,7 @@ alter_function_action ::= "(" [ fn_param_list ] ")"
                         | "->" type | "DROP" "RETURNS"
                         | block | "COMMENT" string_lit | "DROP" "COMMENT"
 
-alter_index ::= "ALTER" "INDEX" name "ON" "CLASS" class_name
+alter_index ::= "ALTER" "INDEX" name "ON" ( "CLASS" class_name | "GRAPH" name )
                 ( "COMMENT" string_lit | "PREPARE" "REMOVE" | "DROP" "COMMENT" )
 
 alter_param ::= "ALTER" "PARAM" [ if_exists ] param
@@ -1100,15 +1111,22 @@ alter_param_action ::= "VALUE" expr | "COMMENT" string_lit | "DROP" "COMMENT"
 
 alter_class ::= "ALTER" "CLASS" [ if_exists ] class_name
                 alter_class_action { alter_class_action }
+                [ "WITH" "MIGRATION" ] [ "CONCURRENTLY" ]
 alter_class_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
                       | "COMPACT" | "SCHEMAFULL" | "SCHEMALESS"
                       | "CHANGEFEED" duration_lit | "COMMENT" string_lit
+
+alter_graph ::= "ALTER" "GRAPH" [ if_exists ] name
+                alter_graph_action { alter_graph_action }
+alter_graph_action ::= "TYPE" graph_constraint
+                     | "ROOT" root_ref | "ROOTS" array_lit | "DROP" "ROOTS"
+                     | "VALIDATE" ( "ON_MUTATION" | "DEFERRED" )
+                     | "COMMENT" string_lit | "DROP" "COMMENT"
 ```
 
 Каждый `ALTER` содержит хотя бы одно действие. Повтор одного свойства и несовместимые действия
-для него отклоняются семантическим анализом. `ALTER GRAPH` и прежняя форма
-`ALTER INDEX ... SET ENABLED|DISABLED|READ_ONLY` не имеют семантического контракта в
-`gql_spec.md` и потому не входят в EBNF.
+для него отклоняются семантическим анализом. ALTER не публикует промежуточные schema states;
+`WITH MIGRATION` допускает только утверждённые standard casts/fill/recompute/validation.
 
 ---
 
@@ -1120,8 +1138,15 @@ info_stmt ::= "INFO" "FOR" (
                 | "DB"
                 | "CLASS" class_name
                 | "GRAPH" graph_ref
-                | "INDEX" name "ON" "CLASS" class_name
+                | "INDEX" name "ON" ( "CLASS" class_name | "GRAPH" name )
               )
+
+analyze_stmt ::= "ANALYZE"
+                 ( "CLASS" class_name
+                   ( "BASE" | "EFFECTIVE" "IN" "GRAPH" name )
+                 | "GRAPH" name )
+                 [ "FULL" | "APPROXIMATE" [ "SAMPLE" integer ] ]
+                 [ "CONCURRENTLY" ]
 
 show_changes_stmt ::= "SHOW" "CHANGES" "FOR"
                       ( "CLASS" class_name | "GRAPH" graph_ref )
@@ -1276,12 +1301,15 @@ equality_op    ::= "=" | "IS" | "!=" | "NOT" "IS" | "?=" | "*="
                  | "IN" | "NOT" "IN" | "ALLIN" | "ANYIN" | "NONEIN"
 comparison_op  ::= "<" | ">" | "<=" | ">="
                  | knn_op | fulltext_op | geo_op | contains_op
-knn_op         ::= "<|" expr [ "," ( ident | "EF" expr ) ] "|>"
+knn_op         ::= "<|" expr [ "," ( expr | "EF" expr ) ] "|>"
 fulltext_op    ::= "@@" | "@" integer "@" | "@AND@" | "@OR@"
 geo_op         ::= "INSIDE" | "NOTINSIDE" | "ALLINSIDE" | "ANYINSIDE" | "NONEINSIDE"
                  | "OUTSIDE" | "INTERSECTS"
 contains_op    ::= "CONTAINS" | "CONTAINSNOT" | "CONTAINSANY" | "CONTAINSALL"
 ```
+
+Во второй позиции KNN обычный `expr` — metavariable `DISTANCE`, не keyword `DISTANCE` и не
+замена DDL-keyword `DIST`. `EF expr` является отдельной ANN-only формой.
 
 ### 12.3. Postfix-операции и idioms
 
@@ -1460,7 +1488,8 @@ domain_type ::=
 
 **Управление / транзакции:** `LET`, `IF`, `THEN`, `ELSE`, `END`, `CASE`, `WHEN`, `FOR`, `IN`, `WHILE`, `BREAK`,
 `CONTINUE`, `BEGIN`, `COMMIT`, `CANCEL`, `WITH`, `VALIDATION`, `ISOLATION`, `LEVEL`, `SERIALIZABLE`, `SNAPSHOT`,
-`READ`, `COMMITTED`, `THROW`, `SLEEP`, `TRY`, `CATCH`, `EXPLAIN`, `ANALYZE`, `FULL`, `FORMAT`, `ASSERT`,
+`READ`, `COMMITTED`, `THROW`, `SLEEP`, `TRY`, `CATCH`, `EXPLAIN`, `ANALYZE`, `FULL`, `APPROXIMATE`,
+`SAMPLE`, `FORMAT`, `ASSERT`,
 `INVARIANTS`.
 
 **DDL:** `DEFINE`, `REMOVE`, `CLASS`, `FIELD`, `PARAM`, `FUNCTION`, `EVENT`, `INDEX`, `ANALYZER`, `DATABASE`,
@@ -1470,7 +1499,9 @@ domain_type ::=
 `FIELDS`, `COLUMNS`, `UNIQUE`, `COUNT`, `FULLTEXT`, `SEARCH`, `BM25`, `HIGHLIGHTS`, `HNSW`, `DISKANN`,
 `DIMENSION`, `DIST`, `EFC`, `M`, `DEGREE`, `L_BUILD`, `ALPHA`, `HASHED_VECTOR`, `INNER_PRODUCT`,
 `COSINE_NORMALIZED`, `CONCURRENTLY`, `DEFER`, `PATH`, `REACHABILITY`, `NEIGHBOURHOOD`, `ALGORITHM`,
-`DIRECTION`, `OUT`, `PATTERNS`, `TOKENIZERS`, `FILTERS`, `ROOT`, `ROOTS`, `VALIDATE`, `ON_MUTATION`,
+`DIRECTION`, `OUT`, `PATTERNS`, `TREE_COVER`, `GRAIL`, `FERRARI`, `BFL`, `CHAIN_COVER`,
+`LANDMARK_SSSP`, `PATTERN_CACHE`, `ON_DEMAND`, `MIGRATION`, `TOKENIZERS`, `FILTERS`, `ROOT`,
+`ROOTS`, `VALIDATE`, `ON_MUTATION`,
 `DEFERRED`, `FLEXIBLE`, `REFERENCE`, `RETURNS`, `PREPARE`, `ALWAYS`, `F64`, `F32`, `F16`, `I64`,
 `I32`, `I16`, `I8`, `U8`, `EUCLIDEAN`, `COSINE`, `MANHATTAN`, `MINKOWSKI`.
 

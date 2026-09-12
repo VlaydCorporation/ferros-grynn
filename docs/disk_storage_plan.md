@@ -3,9 +3,9 @@
 ## Коррекция этапа 8.1
 
 [`rework_plan.md`](rework_plan.md) заменяет graph-owned atom/TABLE layout на целевую
-graph-first модель. Документационные шаги A0–A4 завершены 2026-09-10;
-кодовые A5–A16 не начаты. Ранее выполненные этапы 1–7 ниже остаются
-историческим evidence текущего checkout, но не target format.
+graph-first модель. Документационные A0–A4/S0–S6 и кодовые A5–A8 завершены;
+A9–A16 остаются открытыми. Ранее выполненные этапы 1–7 ниже остаются историческим evidence,
+но не target format.
 
 Целевые storage-границы:
 
@@ -19,7 +19,7 @@ graph-first модель. Документационные шаги A0–A4 за
   `AtomId` не заменяет global identity;
 - `PageKey`, WAL и `FileCatalog FGFC v5` используют `DataSpaceId::Database`
   или `DataSpaceId::Graph(nonzero GraphId)`; system graph не существует;
-- `DatabaseCatalog` повышается до FGDC v6; FGDC v5/FGFC v4 отклоняются без
+- `DatabaseCatalog` повышается до FGDC v7; FGDC v5/v6 и FGFC v4 отклоняются без
   migration, так как core format ещё не frozen;
 - один database WAL атомарно публикует base, memberships, graph topology,
   overlays, indexes и statistics.
@@ -87,7 +87,9 @@ graph-first модель. Документационные шаги A0–A4 за
     - Recovery сканирует WAL один раз, отбрасывает незавершённый/повреждённый хвост, применяет только committed frames в порядке LSN и остаётся идемпотентным.
     - Единственный WAL writer и commit lock — осознанный MVP-предел; group commit добавляется только при измеренном bottleneck.
 	- Состояние на 2026-08-25: срез 3a реализован в `src/storage/wal.rs` — точный WAL codec, commit-batch, ротация только между транзакциями, durable publication, version index, snapshot/read-your-writes и streaming recovery. `TxBegin` записывается в том же commit-batch, а не при создании приватного write-set. Этот срез не зависит от layout конкретных графовых страниц.
-	- Состояние среза 3b на 2026-08-25: реализованы typed `DataFileKind`/`DataFileId`/`PageKey`, format-v1 DB/graph superblocks и WAL payloads, Windows `db.lock`, atomic main/tmp replace, sealed file registry, единый snapshot-aware `SyncPageManager`, passive checkpoint, доказуемый prune и seeded streaming recovery с replay до publication. `GraphSuperblock` checkpoint-owned и не пишется обычным frame.
+	- Исторический срез 3b реализовал typed file/page identity, Windows lock и frame-WAL. Target
+	  после S2 логически версионирует AtomStore/graph superblocks полным `PageFrame`, исключает их
+	  только из in-place backfill и публикует home через `.tmp/main/.prev`; `.tmp` не authority.
 	- WAL format v1 использует magic `FGW1`; экспериментальный 3a magic `MVCE` отклоняется без миграции, поскольку прежний `file_kind + pad[7]` байтово неоднозначен с `DataFileId(instance_id = 0)`.
 	- Unix runtime-реализация 3b намеренно отсутствует: non-Windows ownership/atomic replace возвращают typed `unsupported`. Linux/NVMe crash/performance tests и Unix release-gate обязательны до объявления Unix-поддержки, но не блокируют Windows-first этап 4.
 	- Перенесённые в этап 4 `Datastore::create_local/open_local`, durable file-catalog discovery, alloc/free, конкретные graph pages, atom-level merge/SSI wiring, `CheckpointMode::Restart` и snapshot timeout/cancellation реализованы в Windows-first срезе.
