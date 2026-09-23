@@ -70,33 +70,33 @@ impl RecordIdPart {
 
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 pub struct RecordId {
-	table: Text,
+	class: Text,
 	id: RecordIdPart,
 }
 
 impl RecordId {
-	pub fn new<IntoText: Into<Text>>(table: IntoText, id: RecordIdPart) -> FerrosGrynnResult<Self> {
-		let table = table.into();
-		if table.is_empty() {
-			return Err(FerrosGrynnError::empty_record_id_table());
+	pub fn new<IntoText: Into<Text>>(class: IntoText, id: RecordIdPart) -> FerrosGrynnResult<Self> {
+		let class = class.into();
+		if class.is_empty() {
+			return Err(FerrosGrynnError::empty_record_id_class());
 		}
 		id.validate()?;
 		Ok(Self {
-			table,
+			class,
 			id,
 		})
 	}
 
-	pub fn from_value<IntoText: Into<Text>>(table: IntoText, id: Value) -> FerrosGrynnResult<Self> {
-		Self::new(table, RecordIdPart::try_from_value(id)?)
+	pub fn from_value<IntoText: Into<Text>>(class: IntoText, id: Value) -> FerrosGrynnResult<Self> {
+		Self::new(class, RecordIdPart::try_from_value(id)?)
 	}
 
-	pub fn table(&self) -> &str {
-		self.table.as_str()
+	pub fn class(&self) -> &str {
+		self.class.as_str()
 	}
 
-	pub const fn table_text(&self) -> &Text {
-		&self.table
+	pub const fn class_text(&self) -> &Text {
+		&self.class
 	}
 
 	pub const fn id(&self) -> &RecordIdPart {
@@ -104,10 +104,10 @@ impl RecordId {
 	}
 
 	pub fn into_parts(self) -> (Text, RecordIdPart) {
-		(self.table, self.id)
+		(self.class, self.id)
 	}
 
-	/// Estimates heap bytes owned by the table and composite identifier.
+	/// Estimates heap bytes owned by the class name and composite identifier.
 	pub(crate) fn estimated_heap_bytes(&self) -> usize {
 		super::value::estimated_record_id_heap_bytes(self)
 	}
@@ -136,7 +136,7 @@ impl Display for RecordIdPart {
 
 impl Display for RecordId {
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-		write!(f, "{}:{}", self.table, self.id)
+		write!(f, "{}:{}", self.class, self.id)
 	}
 }
 
@@ -144,7 +144,7 @@ impl FromStr for RecordId {
 	type Err = FerrosGrynnError;
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
-		let (table, id) =
+		let (class, id) =
 			value.split_once(':').ok_or_else(FerrosGrynnError::invalid_record_id_syntax)?;
 		if id.is_empty() {
 			return Err(FerrosGrynnError::empty_record_id_part());
@@ -170,7 +170,7 @@ impl FromStr for RecordId {
 			RecordIdPart::String(id.into())
 		};
 
-		Self::new(table, id)
+		Self::new(class, id)
 	}
 }
 
@@ -259,8 +259,8 @@ mod tests {
 
 	#[test]
 	fn rejects_empty_components() {
-		let empty_table = ":id".parse::<RecordId>().unwrap_err();
-		assert_status(&empty_table, "FG-22F12");
+		let empty_class = ":id".parse::<RecordId>().unwrap_err();
+		assert_status(&empty_class, "FG-22F12");
 		let empty_part = "person:".parse::<RecordId>().unwrap_err();
 		assert_status(&empty_part, "FG-22F13");
 		let missing_separator = "person".parse::<RecordId>().unwrap_err();

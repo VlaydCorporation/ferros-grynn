@@ -21,6 +21,8 @@ pub struct CreateStatement {
 #[non_exhaustive]
 pub struct MutateStatement {
 	pub targets: Vec<DmlTarget>,
+	pub graph: Option<Identifier>,
+	pub label: Option<Option<Identifier>>,
 	pub data: Option<DmlData>,
 	pub filter: Option<Expr>,
 	pub returning: Option<DmlReturn>,
@@ -32,40 +34,41 @@ pub struct MutateStatement {
 #[non_exhaustive]
 pub struct DeleteStatement {
 	pub targets: Vec<DmlTarget>,
+	pub cascade: bool,
 	pub filter: Option<Expr>,
 	pub returning: Option<DmlReturn>,
 	pub expect: Option<ExpectClause>,
 }
 
-/// A table, exact record, or bounded record generator targeted by DML.
+/// A class, exact record, or bounded record generator targeted by DML.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum DmlTarget {
-	Table(Identifier),
+	Class(Identifier),
 	Record {
-		table: Identifier,
+		class: Identifier,
 		key: Expr,
 		span: TextSpan,
 	},
 	Range {
-		table: Identifier,
+		class: Identifier,
 		count: u32,
 		span: TextSpan,
 	},
 }
 
 impl DmlTarget {
-	pub(crate) fn table(&self) -> &Identifier {
+	pub(crate) fn class(&self) -> &Identifier {
 		match self {
-			Self::Table(table)
+			Self::Class(class)
 			| Self::Record {
-				table,
+				class,
 				..
 			}
 			| Self::Range {
-				table,
+				class,
 				..
-			} => table,
+			} => class,
 		}
 	}
 
@@ -84,6 +87,7 @@ pub enum DmlData {
 	Replace(Expr),
 	Set(Vec<Assignment>),
 	Unset(Vec<Identifier>),
+	Reset(Vec<Identifier>),
 }
 
 /// One top-level field assignment.
@@ -156,7 +160,31 @@ impl Parser<'_> {
 		upsert: bool,
 	) -> FerrosGrynnResult<MutateStatement> {
 		let targets = self.dml_targets(context, false).await?;
+		let graph = if self.consume_keyword(keywords::IN).is_some() {
+			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `IN`.")?;
+			Some(self.identifier()?)
+		} else {
+			None
+		};
+		if upsert && graph.is_some() {
+			return Err(self.syntax("UPSERT does not support `IN GRAPH`.", self.previous_span()));
+		}
+		let label = if self.consume_keyword(keywords::LABEL).is_some() {
+			if self.consume_keyword(keywords::NONE).is_some() {
+				Some(None)
+			} else {
+				Some(Some(self.identifier()?))
+			}
+		} else {
+			None
+		};
+		if label.is_some() && graph.is_none() {
+			return Err(self.syntax("LABEL update requires `IN GRAPH`.", self.previous_span()));
+		}
 		let data = self.dml_data(context).await?;
+		if matches!(data, Some(DmlData::Reset(_))) && graph.is_none() {
+			return Err(self.syntax("RESET requires `IN GRAPH`.", self.previous_span()));
+		}
 		let filter = if self.consume_keyword(keywords::WHERE).is_some() {
 			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else {
@@ -165,7 +193,7 @@ impl Parser<'_> {
 		if upsert && filter.is_none() && !targets.iter().all(DmlTarget::is_exact) {
 			return Err(self.syntax(
 				"UPSERT requires an explicit record ID or a WHERE clause.",
-				targets[0].table().span,
+				targets[0].class().span,
 			));
 		}
 		let returning = self.dml_return(context, false).await?;
@@ -177,6 +205,8 @@ impl Parser<'_> {
 		})?;
 		Ok(MutateStatement {
 			targets,
+			graph,
+			label,
 			data,
 			filter,
 			returning,
@@ -189,6 +219,7 @@ impl Parser<'_> {
 		context: &mut Stk,
 	) -> FerrosGrynnResult<DeleteStatement> {
 		let targets = self.dml_targets(context, false).await?;
+		let cascade = self.consume_keyword(keywords::CASCADE).is_some();
 		let filter = if self.consume_keyword(keywords::WHERE).is_some() {
 			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else {
@@ -203,6 +234,7 @@ impl Parser<'_> {
 		self.finish_dml("DELETE")?;
 		Ok(DeleteStatement {
 			targets,
+			cascade,
 			filter,
 			returning,
 			expect,
@@ -221,7 +253,7 @@ impl Parser<'_> {
 		Ok(targets)
 	}
 
-	async fn dml_target(
+	pub(super) async fn dml_target(
 		&mut self,
 		context: &mut Stk,
 		allow_range: bool,
@@ -230,7 +262,7 @@ impl Parser<'_> {
 			if !allow_range {
 				return Err(self.unsupported("record generators outside CREATE", open.span));
 			}
-			let table = self.identifier()?;
+			let class = self.identifier()?;
 			self.expect_symbol(Symbol::Colon, "Expected `:` in record generator.")?;
 			let token = self.tokens.next();
 			let TokenKind::Number(value) = token.kind else {
@@ -241,14 +273,32 @@ impl Parser<'_> {
 			})?;
 			let close = self.expect_symbol(Symbol::Pipe, "Expected `|` after record generator.")?;
 			return Ok(DmlTarget::Range {
-				table,
+				class,
 				count,
 				span: cover(open.span, close.span),
 			});
 		}
 		let parenthesized = self.consume_symbol(Symbol::LeftParen);
-		let table = self.identifier()?;
-		let target = if self.at_symbol(Symbol::Colon)
+		let target = self.class_or_record_target(context).await?;
+		if let Some(open) = parenthesized {
+			if !matches!(target, DmlTarget::Record { .. }) {
+				return Err(
+					self.syntax("A parenthesized DML target must be a record ID.", open.span)
+				);
+			}
+			self.close(Symbol::RightParen, open.span, "`)`")?;
+		}
+		Ok(target)
+	}
+
+	/// Parses the class or exact-record subset shared by DML and graph
+	/// patterns.
+	pub(super) async fn class_or_record_target(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<DmlTarget> {
+		let class = self.identifier()?;
+		if self.at_symbol(Symbol::Colon)
 			&& !self.current().gap_before
 			&& !self.tokens.peek(1).gap_before
 		{
@@ -269,27 +319,21 @@ impl Parser<'_> {
 			} else {
 				context.run(|context| self.expression(context, 0, 1, 0)).await?
 			};
-			let span = cover(table.span, key.span);
-			DmlTarget::Record {
-				table,
+			let span = cover(class.span, key.span);
+			Ok(DmlTarget::Record {
+				class,
 				key,
 				span,
-			}
+			})
 		} else {
-			DmlTarget::Table(table)
-		};
-		if let Some(open) = parenthesized {
-			if !matches!(target, DmlTarget::Record { .. }) {
-				return Err(
-					self.syntax("A parenthesized DML target must be a record ID.", open.span)
-				);
-			}
-			self.close(Symbol::RightParen, open.span, "`)`")?;
+			Ok(DmlTarget::Class(class))
 		}
-		Ok(target)
 	}
 
-	async fn dml_data(&mut self, context: &mut Stk) -> FerrosGrynnResult<Option<DmlData>> {
+	pub(super) async fn dml_data(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Option<DmlData>> {
 		let mode = if self.consume_keyword(keywords::CONTENT).is_some() {
 			Some(0)
 		} else if self.consume_keyword(keywords::MERGE).is_some() {
@@ -333,10 +377,17 @@ impl Parser<'_> {
 			}
 			return Ok(Some(DmlData::Unset(fields)));
 		}
+		if self.consume_keyword(keywords::RESET).is_some() {
+			let mut fields = vec![self.identifier()?];
+			while self.consume_symbol(Symbol::Comma).is_some() {
+				fields.push(self.identifier()?);
+			}
+			return Ok(Some(DmlData::Reset(fields)));
+		}
 		Ok(None)
 	}
 
-	async fn dml_return(
+	pub(super) async fn dml_return(
 		&mut self,
 		context: &mut Stk,
 		create: bool,
@@ -389,7 +440,7 @@ impl Parser<'_> {
 		Ok(Some(DmlReturn::Fields(items)))
 	}
 
-	async fn expect_clause(
+	pub(super) async fn expect_clause(
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<Option<ExpectClause>> {
@@ -414,7 +465,7 @@ impl Parser<'_> {
 			.map(Some)
 	}
 
-	fn finish_dml(&self, statement: &str) -> FerrosGrynnResult<()> {
+	pub(super) fn finish_dml(&self, statement: &str) -> FerrosGrynnResult<()> {
 		if self.at_keyword("TIMEOUT") {
 			return Err(self.unsupported("DML TIMEOUT", self.current().span));
 		}

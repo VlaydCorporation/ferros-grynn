@@ -1787,7 +1787,7 @@ fn directory_shard(key: PageCacheKey) -> usize {
 			ceiling,
 		} => generation.get().rotate_left(11) ^ ceiling.get().rotate_left(29),
 	};
-	let mut mixed = page_key.graph_id().get()
+	let mut mixed = page_key.data_space_raw()
 		^ page_key.file_id().get().rotate_left(17)
 		^ page_key.page_no().get().rotate_left(37)
 		^ version;
@@ -1856,8 +1856,10 @@ mod tests {
 		let file_id = DataFileId::new(file_instance, DataFileKind::NodesHot).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("test data-file identity is out of range")
 		})?;
+		let graph_id = GraphId::new(7)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("test graph identity is zero"))?;
 		Ok(PageCacheKey::new(
-			PageKey::new(GraphId::new(7), file_id, PageNo::new(page_no)),
+			PageKey::for_graph(graph_id, file_id, PageNo::new(page_no)),
 			PageCacheVersion::Home {
 				generation: CheckpointGeneration::new(11),
 				ceiling: Lsn::new(100),
@@ -1870,8 +1872,10 @@ mod tests {
 		let file_id = DataFileId::new(file_instance, DataFileKind::NodesHot).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("test data-file identity is out of range")
 		})?;
+		let graph_id = GraphId::new(7)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("test graph identity is zero"))?;
 		Ok(PageCacheKey::new(
-			PageKey::new(GraphId::new(7), file_id, PageNo::new(page_no)),
+			PageKey::for_graph(graph_id, file_id, PageNo::new(page_no)),
 			PageCacheVersion::Wal(PageLsn::new(page_lsn)),
 		))
 	}

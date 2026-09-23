@@ -1,91 +1,147 @@
-#[allow(
-	clippy::wildcard_imports,
-	reason = "the facade owns imports during the move-only split"
-)]
-use super::*;
+use std::{
+	borrow::Cow,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
+};
 
-#[allow(
-	clippy::multiple_inherent_impl,
-	reason = "transaction responsibilities are split into cohesive modules"
-)]
+use super::{QuerySnapshot, Transaction};
+use crate::{
+	datastore::{
+		ConflictKey,
+		DatabaseRoot,
+		GraphOccurrence,
+		GraphRoot,
+		OccurrenceState,
+		OverlayValue,
+	},
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	graph::{
+		AtomId,
+		AtomKind,
+		EdgeRead,
+		EdgeTopology,
+		GraphRead,
+		GraphRef,
+		GraphRefReader,
+		GraphStorageMode,
+		NodeRead,
+		SnapshotId,
+	},
+	values::{Number, PropertyMap, RecordId, Text, Uuid},
+};
+
+/// Snapshot-bound normalized graph view over global atoms and graph-local
+/// occurrences.
+pub struct TransactionGraphView<'tx> {
+	transaction: &'tx Transaction,
+	root: Arc<DatabaseRoot>,
+	graph: Arc<GraphRoot>,
+	reference: GraphRef,
+	snapshot: SnapshotId,
+	last_recorded: AtomicU64,
+}
+
+/// Snapshot-borrowed effective node projection returned by a transaction graph
+/// view.
+pub struct TransactionNodeRead<'view> {
+	id: AtomId,
+	record_id: &'view RecordId,
+	label: Option<&'view Text>,
+	properties: Cow<'view, PropertyMap>,
+	inner_graph: Option<&'view GraphRef>,
+}
+
+impl NodeRead for TransactionNodeRead<'_> {
+	fn id(&self) -> AtomId {
+		self.id
+	}
+
+	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
+		Ok(Cow::Borrowed(self.record_id))
+	}
+
+	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
+		Ok(self.label.map(Cow::Borrowed))
+	}
+
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		Ok(Cow::Borrowed(self.properties.as_ref()))
+	}
+
+	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
+		Ok(self.inner_graph.map(Cow::Borrowed))
+	}
+}
+
+/// Snapshot-borrowed effective edge projection returned by a transaction graph
+/// view.
+pub struct TransactionEdgeRead<'view> {
+	id: AtomId,
+	record_id: &'view RecordId,
+	topology: &'view EdgeTopology,
+	label: Option<&'view Text>,
+	properties: Cow<'view, PropertyMap>,
+	weight: Option<Number>,
+	transition_graph: Option<&'view GraphRef>,
+}
+
+impl EdgeRead for TransactionEdgeRead<'_> {
+	fn id(&self) -> AtomId {
+		self.id
+	}
+
+	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
+		Ok(Cow::Borrowed(self.record_id))
+	}
+
+	fn topology(&self) -> FerrosGrynnResult<Cow<'_, EdgeTopology>> {
+		Ok(Cow::Borrowed(self.topology))
+	}
+
+	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
+		Ok(self.label.map(Cow::Borrowed))
+	}
+
+	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
+		Ok(Cow::Borrowed(self.properties.as_ref()))
+	}
+
+	fn weight(&self) -> Option<Number> {
+		self.weight
+	}
+
+	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
+		Ok(self.transition_graph.map(Cow::Borrowed))
+	}
+}
+
 impl Transaction {
-	/// Opens a graph from the exact catalog root captured for the query.
+	/// Opens the exact graph version captured by a query snapshot.
 	pub(crate) fn query_graph<'tx>(
 		&'tx self,
 		snapshot: &QuerySnapshot,
 		reference: &GraphRef,
 	) -> FerrosGrynnResult<TransactionGraphView<'tx>> {
-		self.graph_view_at(snapshot.root.clone(), reference)
-	}
-
-	/// Builds a graph view without refreshing the transaction snapshot.
-	fn graph_view_at<'tx>(
-		&'tx self,
-		root: Arc<DatabaseRoot>,
-		reference: &GraphRef,
-	) -> FerrosGrynnResult<TransactionGraphView<'tx>> {
 		self.ensure_live()?;
-		ensure_store_reference(reference, self.store.inner.graph_storage_mode())?;
-		self.record_read(&root, ReadKey::GraphCatalog(reference.id().clone()));
-		let graph = if let Some(write) = self.graphs.get(reference.id()) {
-			let graph = Arc::new(write.snapshot(&self.store)?);
-			TransactionGraphSource::Materialized(graph)
-		} else {
-			let stored = root.graphs.get(reference.id()).ok_or_else(|| {
-				FerrosGrynnError::graph_does_not_exist(reference.id().to_string())
+		let graph =
+			snapshot.root.graphs.get(&reference.id()).cloned().ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(reference.name().to_string())
 			})?;
-			match &stored.graph {
-				StoredGraphValue::Materialized(graph) => {
-					TransactionGraphSource::Materialized(graph.clone())
-				}
-				StoredGraphValue::Local(graph) => {
-					let local = self.store.inner.backend.local().ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file(
-							"local graph is attached to an in-memory backend",
-						)
-					})?;
-					TransactionGraphSource::Local(
-						local.graph_view(self.local_snapshot()?, graph.clone()),
-					)
-				}
-			}
-		};
-		if graph.kind() != reference.kind() {
-			return Err(FerrosGrynnError::conversion_error(
-				reference.kind().name(),
-				graph.kind().name(),
+		if graph.reference() != reference {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"query graph reference disagrees with the snapshot catalog",
 			));
 		}
 		Ok(TransactionGraphView {
+			transaction: self,
+			root: snapshot.root.clone(),
 			graph,
 			reference: reference.clone(),
-			snapshot: SnapshotId::new(root.commit_ts, self.id),
-			root,
-			reads: &self.reads,
+			snapshot: SnapshotId::new(snapshot.root.commit_ts, self.id),
+			last_recorded: AtomicU64::new(AtomId::NULL.raw()),
 		})
-	}
-
-	/// Materializes an owned general graph through the bounded local path.
-	///
-	/// The result owns every materialized atom and releases local page state
-	/// before returning.
-	#[doc(hidden)]
-	pub fn materialize_query_graph(
-		&self,
-		reference: &GraphRef,
-	) -> FerrosGrynnResult<Graph<Frozen>> {
-		let view = self.graph_view_at(self.read_root(), reference)?;
-		let TransactionGraphSource::Local(local) = &view.graph else {
-			return crate::graph::query_to_memory(&view);
-		};
-		view.record(ReadKey::GraphProperties(reference.id().clone()));
-		view.record(ReadKey::NodeSet(reference.id().clone()));
-		view.record(ReadKey::EdgeSet(reference.id().clone()));
-		let (mut graph, source_atoms) = local.materialize_query_graph(|atom| {
-			view.record(ReadKey::Atom(reference.id().clone(), atom));
-		})?;
-		graph.finish_query_materialization(&view, source_atoms);
-		Ok(graph.freeze())
 	}
 }
 
@@ -96,194 +152,80 @@ impl GraphRefReader for Transaction {
 		Self: 'tx;
 
 	fn read_graph(&self, reference: &GraphRef) -> FerrosGrynnResult<Self::View<'_>> {
-		let root = self.read_root();
-		self.graph_view_at(root, reference)
-	}
-}
-
-enum TransactionGraphSource<'tx> {
-	Materialized(Arc<MaterializedGraph>),
-	Local(LocalGraphView<'tx>),
-}
-
-impl TransactionGraphSource<'_> {
-	fn kind(&self) -> GraphKind {
-		match self {
-			Self::Materialized(graph) => graph.kind(),
-			Self::Local(graph) => graph.kind(),
-		}
-	}
-}
-
-/// Snapshot-bound graph view that preserves the selected storage backend.
-pub struct TransactionGraphView<'tx> {
-	graph: TransactionGraphSource<'tx>,
-	reference: GraphRef,
-	snapshot: SnapshotId,
-	root: Arc<DatabaseRoot>,
-	reads: &'tx Mutex<BTreeMap<ReadKey, u64>>,
-}
-
-/// Backend-neutral node read returned by a transaction graph view.
-#[non_exhaustive]
-#[expect(
-	clippy::large_enum_variant,
-	reason = "boxing a page-guard-backed node would allocate on every point read"
-)]
-pub enum TransactionNodeRead<'tx> {
-	/// Borrowed projection from an in-memory graph.
-	Memory(NodeView<'tx>),
-	/// Page-guard-backed projection from a local graph.
-	Local(LocalNodeRead<'tx>),
-}
-
-impl NodeRead for TransactionNodeRead<'_> {
-	fn id(&self) -> AtomId {
-		match self {
-			Self::Memory(node) => node.id(),
-			Self::Local(node) => node.id(),
-		}
-	}
-
-	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
-		match self {
-			Self::Memory(node) => NodeRead::record_id(node),
-			Self::Local(node) => node.record_id(),
-		}
-	}
-
-	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
-		match self {
-			Self::Memory(node) => NodeRead::label_text(node),
-			Self::Local(node) => node.label_text(),
-		}
-	}
-
-	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
-		match self {
-			Self::Memory(node) => NodeRead::properties(node),
-			Self::Local(node) => node.properties(),
-		}
-	}
-
-	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
-		match self {
-			Self::Memory(node) => NodeRead::inner_graph_ref(node),
-			Self::Local(node) => node.inner_graph_ref(),
-		}
-	}
-
-	fn inner_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
-		match self {
-			Self::Memory(node) => NodeRead::inner_graph(node),
-			Self::Local(node) => node.inner_graph(),
-		}
-	}
-}
-
-/// Backend-neutral edge read returned by a transaction graph view.
-#[non_exhaustive]
-#[expect(
-	clippy::large_enum_variant,
-	reason = "boxing a page-guard-backed edge would allocate on every point read"
-)]
-pub enum TransactionEdgeRead<'tx> {
-	/// Borrowed projection from an in-memory graph.
-	Memory(EdgeView<'tx>),
-	/// Page-guard-backed projection from a local graph.
-	Local(LocalEdgeRead<'tx>),
-}
-
-impl EdgeRead for TransactionEdgeRead<'_> {
-	fn id(&self) -> AtomId {
-		match self {
-			Self::Memory(edge) => edge.id(),
-			Self::Local(edge) => edge.id(),
-		}
-	}
-
-	fn record_id(&self) -> FerrosGrynnResult<Cow<'_, RecordId>> {
-		match self {
-			Self::Memory(edge) => EdgeRead::record_id(edge),
-			Self::Local(edge) => edge.record_id(),
-		}
-	}
-
-	fn topology(&self) -> FerrosGrynnResult<Cow<'_, crate::values::runtime::graph::EdgeTopology>> {
-		match self {
-			Self::Memory(edge) => EdgeRead::topology(edge),
-			Self::Local(edge) => edge.topology(),
-		}
-	}
-
-	fn label_text(&self) -> FerrosGrynnResult<Option<Cow<'_, Text>>> {
-		match self {
-			Self::Memory(edge) => EdgeRead::label_text(edge),
-			Self::Local(edge) => edge.label_text(),
-		}
-	}
-
-	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
-		match self {
-			Self::Memory(edge) => EdgeRead::properties(edge),
-			Self::Local(edge) => edge.properties(),
-		}
-	}
-
-	fn weight(&self) -> Option<crate::values::runtime::Number> {
-		match self {
-			Self::Memory(edge) => edge.weight(),
-			Self::Local(edge) => edge.weight(),
-		}
-	}
-
-	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
-		match self {
-			Self::Memory(edge) => EdgeRead::transition_graph_ref(edge),
-			Self::Local(edge) => edge.transition_graph_ref(),
-		}
-	}
-
-	fn transition_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
-		match self {
-			Self::Memory(edge) => EdgeRead::transition_graph(edge),
-			Self::Local(edge) => edge.transition_graph(),
-		}
+		self.ensure_live()?;
+		let snapshot = QuerySnapshot {
+			root: Arc::new(self.working.clone()),
+		};
+		self.query_graph(&snapshot, reference)
 	}
 }
 
 impl TransactionGraphView<'_> {
-	/// Returns complete planner statistics for the selected backend snapshot.
-	pub(crate) fn statistics(&self) -> FerrosGrynnResult<GraphStatistics> {
-		match &self.graph {
-			TransactionGraphSource::Materialized(_) => {
-				self.root.statistics.graph(self.reference.id()).cloned().ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"graph statistics are absent from the MVCC root",
-					)
-				})
-			}
-			TransactionGraphSource::Local(graph) => {
-				let mut statistics = (*graph.statistics()?).clone();
-				statistics.tables = self
-					.root
-					.statistics
-					.graph(self.reference.id())
-					.ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file(
-							"graph statistics are absent from the MVCC root",
-						)
-					})?
-					.tables
-					.clone();
-				Ok(statistics)
-			}
-		}
+	fn record_incidence(&self, id: AtomId) {
+		self.transaction.record_read(ConflictKey::GraphIncidence(self.reference.id(), id));
 	}
 
-	fn record(&self, key: ReadKey) {
-		let version = self.root.version(&key);
-		self.reads.lock().entry(key).or_insert(version);
+	fn record_occurrence(&self, occurrence: &GraphOccurrence) {
+		let local = occurrence.local_id();
+		if self.last_recorded.load(Ordering::Acquire) == local.raw() {
+			return;
+		}
+		let graph = self.reference.id();
+		let global = occurrence.global_id();
+		self.transaction.record_reads([
+			ConflictKey::BaseAtom(global),
+			ConflictKey::GraphMembership(graph, global),
+			ConflictKey::GraphOverlay(graph, global),
+			ConflictKey::GraphIncidence(graph, local),
+		]);
+		// ponytail: cache one exact hot key; add a bounded per-view table only
+		// if alternating point-read profiles justify its metadata and lookup
+		// cost.
+		self.last_recorded.store(local.raw(), Ordering::Release);
+	}
+
+	fn occurrence(&self, id: AtomId) -> FerrosGrynnResult<Option<&GraphOccurrence>> {
+		Ok(self.graph.occurrence(id))
+	}
+
+	fn effective_properties<'view>(
+		&'view self,
+		occurrence: &'view GraphOccurrence,
+	) -> FerrosGrynnResult<Cow<'view, PropertyMap>> {
+		let atom = self.root.atom(occurrence.global_id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"graph occurrence references an absent global atom",
+			)
+		})?;
+		let Some(overlay) = occurrence.overlay() else {
+			return Ok(Cow::Borrowed(atom.properties()));
+		};
+		let mut properties = atom.properties().clone();
+		for (key, value) in overlay.iter() {
+			match value {
+				OverlayValue::Value(value) => {
+					properties.insert(key, value.clone());
+				}
+				OverlayValue::Hidden => {
+					properties.remove(key);
+				}
+			}
+		}
+		Ok(Cow::Owned(properties))
+	}
+
+	fn graph_reference<'view>(
+		&'view self,
+		id: Option<crate::graph::GraphId>,
+	) -> FerrosGrynnResult<Option<&'view GraphRef>> {
+		id.map(|id| {
+			self.root.schema.graphs.get(&id).map(|schema| schema.reference()).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"graph occurrence references an absent nested graph",
+				)
+			})
+		})
+		.transpose()
 	}
 }
 
@@ -293,7 +235,7 @@ impl GraphRead for TransactionGraphView<'_> {
 	where
 		Self: 'a;
 	type EdgeIds<'a>
-		= Box<dyn Iterator<Item = FerrosGrynnResult<AtomId>> + 'a>
+		= std::vec::IntoIter<FerrosGrynnResult<AtomId>>
 	where
 		Self: 'a;
 	type Node<'a>
@@ -301,78 +243,110 @@ impl GraphRead for TransactionGraphView<'_> {
 	where
 		Self: 'a;
 	type NodeIds<'a>
-		= Box<dyn Iterator<Item = FerrosGrynnResult<AtomId>> + 'a>
+		= std::vec::IntoIter<FerrosGrynnResult<AtomId>>
 	where
 		Self: 'a;
 
 	fn identity(&self) -> Uuid {
-		match &self.graph {
-			TransactionGraphSource::Materialized(graph) => graph.identity(),
-			TransactionGraphSource::Local(graph) => graph.identity(),
-		}
+		uuid::Uuid::from_u128(u128::from(self.reference.id().get())).into()
 	}
 
 	fn revision(&self) -> u64 {
-		match &self.graph {
-			TransactionGraphSource::Materialized(graph) => graph.revision(),
-			TransactionGraphSource::Local(graph) => graph.revision(),
-		}
+		self.snapshot.timestamp()
 	}
 
-	fn kind(&self) -> GraphKind {
-		self.graph.kind()
+	fn kind(&self) -> crate::graph::GraphKind {
+		self.reference.kind()
 	}
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
-		self.record(ReadKey::GraphProperties(self.reference.id().clone()));
-		match &self.graph {
-			TransactionGraphSource::Materialized(graph) => Ok(Cow::Borrowed(graph.properties())),
-			TransactionGraphSource::Local(graph) => graph.properties(),
-		}
+		Ok(Cow::Owned(PropertyMap::new()))
 	}
 
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
-		self.record(ReadKey::NodeSet(self.reference.id().clone()));
-		match &self.graph {
-			TransactionGraphSource::Materialized(graph) => {
-				Ok(Box::new(GraphRead::node_ids(graph.as_ref())?))
-			}
-			TransactionGraphSource::Local(graph) => Ok(Box::new(graph.node_ids()?)),
-		}
+		self.transaction
+			.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Node));
+		Ok(self
+			.graph
+			.occurrences()
+			.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Node))
+			.map(|occurrence| Ok(occurrence.local_id()))
+			.collect::<Vec<_>>()
+			.into_iter())
 	}
 
 	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
-		self.record(ReadKey::EdgeSet(self.reference.id().clone()));
-		match &self.graph {
-			TransactionGraphSource::Materialized(graph) => {
-				Ok(Box::new(GraphRead::edge_ids(graph.as_ref())?))
-			}
-			TransactionGraphSource::Local(graph) => Ok(Box::new(graph.edge_ids()?)),
-		}
+		self.transaction
+			.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Edge));
+		Ok(self
+			.graph
+			.occurrences()
+			.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Edge))
+			.map(|occurrence| Ok(occurrence.local_id()))
+			.collect::<Vec<_>>()
+			.into_iter())
 	}
 
 	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
-		self.record(ReadKey::Atom(self.reference.id().clone(), id));
-		match &self.graph {
-			TransactionGraphSource::Materialized(graph) => {
-				Ok(graph.node(id).map(TransactionNodeRead::Memory))
-			}
-			TransactionGraphSource::Local(graph) => {
-				Ok(graph.node(id)?.map(TransactionNodeRead::Local))
-			}
-		}
+		let Some(occurrence) = self.occurrence(id)? else {
+			self.record_incidence(id);
+			return Ok(None);
+		};
+		let OccurrenceState::Node {
+			nested_graph,
+		} = occurrence.state()
+		else {
+			self.record_incidence(id);
+			return Ok(None);
+		};
+		let atom = self.root.atom(occurrence.global_id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"node occurrence references an absent global atom",
+			)
+		})?;
+		self.record_occurrence(occurrence);
+		Ok(Some(TransactionNodeRead {
+			id,
+			record_id: atom.record_id(),
+			label: occurrence.label(),
+			properties: self.effective_properties(occurrence)?,
+			inner_graph: self.graph_reference(*nested_graph)?,
+		}))
 	}
 
 	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
-		self.record(ReadKey::Atom(self.reference.id().clone(), id));
-		match &self.graph {
-			TransactionGraphSource::Materialized(graph) => {
-				Ok(graph.edge(id).map(TransactionEdgeRead::Memory))
-			}
-			TransactionGraphSource::Local(graph) => {
-				Ok(graph.edge(id)?.map(TransactionEdgeRead::Local))
-			}
-		}
+		let Some(occurrence) = self.occurrence(id)? else {
+			self.record_incidence(id);
+			return Ok(None);
+		};
+		let OccurrenceState::Edge {
+			topology,
+			weight,
+			transition_graph,
+		} = occurrence.state()
+		else {
+			self.record_incidence(id);
+			return Ok(None);
+		};
+		let atom = self.root.atom(occurrence.global_id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"edge occurrence references an absent global atom",
+			)
+		})?;
+		self.record_occurrence(occurrence);
+		Ok(Some(TransactionEdgeRead {
+			id,
+			record_id: atom.record_id(),
+			topology,
+			label: occurrence.label(),
+			properties: self.effective_properties(occurrence)?,
+			weight: *weight,
+			transition_graph: self.graph_reference(*transition_graph)?,
+		}))
+	}
+
+	fn storage_mode(&self) -> GraphStorageMode {
+		self.reference.storage_mode()
 	}
 
 	fn snapshot_id(&self) -> SnapshotId {
@@ -381,5 +355,47 @@ impl GraphRead for TransactionGraphView<'_> {
 
 	fn graph_ref(&self) -> Option<&GraphRef> {
 		Some(&self.reference)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::borrow::Cow;
+
+	use super::*;
+	use crate::{
+		datastore::{ClassSchema, Datastore},
+		graph::{AtomKind, GraphKind},
+		values::{PropertyKeyId, PropertyMap, RecordId, Value},
+	};
+
+	#[test]
+	fn effective_projection_borrows_base_until_an_overlay_exists() {
+		let store = Datastore::in_memory();
+		let record = "person:shared".parse::<RecordId>().unwrap();
+		let key = PropertyKeyId::new(1);
+		let mut properties = PropertyMap::new();
+		properties.insert(key, "base");
+		let mut seed = store.begin();
+		seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+		let graph = seed.define_graph("view", GraphKind::Graph).unwrap();
+		seed.create_atom(record.clone(), properties).unwrap();
+		let local = seed.attach_node(graph.id(), &record, None, None).unwrap();
+		seed.commit().unwrap();
+
+		let read = store.begin();
+		let view = graph.read(&read).unwrap();
+		let node = view.node(local).unwrap().unwrap();
+		assert!(matches!(node.properties, Cow::Borrowed(_)));
+		drop(view);
+		drop(read);
+
+		let mut update = store.begin();
+		update.set_overlay(graph.id(), &record, key, Value::from("overlay")).unwrap();
+		update.commit().unwrap();
+		let read = store.begin();
+		let view = graph.read(&read).unwrap();
+		let node = view.node(local).unwrap().unwrap();
+		assert!(matches!(node.properties, Cow::Owned(_)));
 	}
 }

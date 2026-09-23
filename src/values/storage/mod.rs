@@ -28,6 +28,7 @@ const MAX_IANA_TIME_ZONE_ID: u32 = FIRST_FIXED_TIME_ZONE_ID - 1;
 
 pub use context::{DecodeContext, EncodeContext};
 pub use dto::{
+	StorageAtomRef,
 	StorageBound,
 	StorageDateTime,
 	StorageDecimal,
@@ -66,7 +67,6 @@ mod tests {
 	};
 
 	use super::{
-		DiskAtomRef,
 		DiskGraphRef,
 		EncodeContext,
 		StorageDecimal,
@@ -77,6 +77,7 @@ mod tests {
 		Array,
 		AtomKind,
 		AtomRef,
+		GraphId,
 		GraphKind,
 		GraphRef,
 		GraphStorageMode,
@@ -107,7 +108,7 @@ mod tests {
 		object.insert("atom", atom.clone());
 
 		let mut context = EncodeContext::default();
-		context.register_atom(atom, DiskAtomRef::from_parts(AtomKind::Node, 7).unwrap()).unwrap();
+		context.register_class_name(41, "person".into()).unwrap();
 		let storage =
 			StorageValue::from_runtime(Value::Object(object.clone()), &mut context).unwrap();
 		let encoded = CanonicalCodec::encode(storage.as_ref()).unwrap();
@@ -115,13 +116,18 @@ mod tests {
 		let runtime = storage.into_runtime(&context.decoder()).unwrap();
 		assert_eq!(runtime, Value::Object(object));
 		assert_eq!(context.property_dictionary().len(), 5);
+		assert_eq!(
+			context.class_names().map(|(id, name)| (id, name.as_str())).collect::<Vec<_>>(),
+			vec![(41, "person")]
+		);
 	}
 
 	#[test]
 	fn graph_references_use_explicit_context_mapping() {
-		let id = RecordId::new("graph", RecordIdPart::Int(1)).unwrap();
-		let graph = GraphRef::new(id, GraphKind::Dag, GraphStorageMode::DiskBacked);
-		let disk = DiskGraphRef::new(8, 2);
+		let id = GraphId::new(8).unwrap();
+		let graph =
+			GraphRef::new(id, "analytics", GraphKind::Dag, GraphStorageMode::DiskBacked).unwrap();
+		let disk = DiskGraphRef::new(id);
 		let mut context = EncodeContext::default();
 		context.register_graph(graph.clone(), disk).unwrap();
 
@@ -196,16 +202,15 @@ mod tests {
 	}
 
 	#[test]
-	fn conversion_context_rejects_conflicting_reference_mappings() {
-		let first =
+	fn atom_reference_round_trip_does_not_need_a_physical_address_mapping() {
+		let atom =
 			AtomRef::new(AtomKind::Node, RecordId::new("person", RecordIdPart::Int(1)).unwrap());
-		let second =
-			AtomRef::new(AtomKind::Node, RecordId::new("person", RecordIdPart::Int(2)).unwrap());
-		let disk = DiskAtomRef::from_parts(AtomKind::Node, 7).unwrap();
 		let mut context = EncodeContext::default();
-		context.register_atom(first, disk).unwrap();
-		let error = context.register_atom(second, disk).unwrap_err();
-		assert_eq!(error.status().code().to_string(), "FG-22S07");
+		context.register_class_name(7, "person".into()).unwrap();
+		let stored = StorageValue::from_runtime(Value::from(atom.clone()), &mut context).unwrap();
+		let bytes = CanonicalCodec::encode(stored.as_ref()).unwrap();
+		let decoded = CanonicalCodec::decode(&bytes, DecodeLimits::default()).unwrap();
+		assert_eq!(decoded.into_runtime(&context.decoder()).unwrap(), Value::from(atom));
 	}
 
 	#[test]

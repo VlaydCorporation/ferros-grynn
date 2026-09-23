@@ -1,6 +1,6 @@
 #[allow(clippy::wildcard_imports, reason = "index layers use the graph-index facade contract")]
 use super::*;
-use crate::values::runtime::graph::AtomKind;
+use crate::graph::AtomKind;
 
 const NEXT_PAGE_OFFSET: usize = PAGE_HEADER_SIZE;
 const COUNT_OFFSET: usize = NEXT_PAGE_OFFSET + size_of::<u64>();
@@ -9,13 +9,13 @@ const ATOMS_OFFSET: usize = RESERVED_OFFSET + size_of::<u32>();
 const ATOMS_PER_PAGE: usize = (PAGE_SIZE - ATOMS_OFFSET) / size_of::<u64>();
 
 /// Packs one exact label membership into immutable sorted-array pages.
-pub(in crate::storage) fn build_label_index(
-	atoms: &[DiskAtomRef],
+pub(in crate::storage) fn build_label_index<Address: PrimaryAddress>(
+	atoms: &[Address],
 	kind: AtomKind,
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<Vec<AlignedPage>> {
-	if atoms.iter().any(|atom| atom.kind() != kind)
-		|| atoms.windows(2).any(|pair| pair[0].slot() >= pair[1].slot())
+	if atoms.iter().any(|atom| atom.kind() != Some(kind))
+		|| atoms.windows(2).any(|pair| pair[0].order_key() >= pair[1].order_key())
 	{
 		return Err(invalid_index(
 			"label index atoms have the wrong kind or are not strictly ordered",
@@ -53,13 +53,13 @@ pub(in crate::storage) fn build_label_index(
 }
 
 /// Visits one exact label membership in ascending slot order.
-pub(in crate::storage) fn visit_label_index_pages(
+pub(in crate::storage) fn visit_label_index_pages<Address: PrimaryAddress>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	kind: AtomKind,
-	mut visit: impl FnMut(DiskAtomRef) -> FerrosGrynnResult<()>,
+	mut visit: impl FnMut(Address) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<()> {
 	let mut page_no = PageNo::new(0);
-	let mut previous = None::<DiskAtomRef>;
+	let mut previous = None::<Address>;
 	loop {
 		let mut page = AlignedPage::zeroed();
 		read_page(page_no, &mut page)?;
@@ -77,9 +77,9 @@ pub(in crate::storage) fn visit_label_index_pages(
 			return Err(invalid_index("label-index page count exceeds its capacity"));
 		}
 		for index in 0..count {
-			let atom = DiskAtomRef::from_raw(read_u64(bytes, ATOMS_OFFSET + index * 8))?;
-			if atom.kind() != kind
-				|| previous.is_some_and(|previous| previous.slot() >= atom.slot())
+			let atom = Address::from_raw(read_u64(bytes, ATOMS_OFFSET + index * 8))?;
+			if atom.kind() != Some(kind)
+				|| previous.is_some_and(|previous| previous.order_key() >= atom.order_key())
 			{
 				return Err(invalid_index(
 					"label index atoms have the wrong kind or are not strictly ordered",

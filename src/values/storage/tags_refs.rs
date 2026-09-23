@@ -3,7 +3,7 @@ use std::fmt::{self, Display, Formatter};
 use super::{DISK_ATOM_ALLOWED_MASK, DISK_ATOM_KIND_BIT, DISK_ATOM_SLOT_MASK};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::AtomKind,
+	values::runtime::{AtomKind, GraphId},
 };
 
 /// Stable tags of canonical storage format version 1.
@@ -102,23 +102,35 @@ impl Display for DiskAtomRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
-pub struct DiskGraphRef {
-	pub(super) slot: u32,
-	pub(super) generation: u32,
-}
+#[repr(transparent)]
+pub struct DiskGraphRef(GraphId);
 
 impl DiskGraphRef {
-	pub const fn new(slot: u32, generation: u32) -> Self {
-		Self {
-			slot,
-			generation,
-		}
+	pub const fn new(graph_id: GraphId) -> Self {
+		Self(graph_id)
+	}
+
+	pub fn from_raw(raw: u64) -> FerrosGrynnResult<Self> {
+		GraphId::new(raw).map(Self).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_value_encoding(
+				0,
+				"graph reference contains reserved graph identity zero",
+			)
+		})
+	}
+
+	pub const fn graph_id(self) -> GraphId {
+		self.0
+	}
+
+	pub const fn raw(self) -> u64 {
+		self.0.get()
 	}
 }
 
 impl Display for DiskGraphRef {
 	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-		write!(f, "{}:{}", self.slot, self.generation)
+		Display::fmt(&self.0, f)
 	}
 }
 

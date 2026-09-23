@@ -5,10 +5,15 @@
 //! contiguous transaction, performs one durability barrier, and only then
 //! publishes versions to readers.
 
+/// Checkpoint planning and WAL-prefix reclamation.
 mod checkpoint;
+/// Canonical WAL record codec.
 mod codec;
+/// Startup segment discovery and transaction replay.
 mod recovery;
+/// In-memory WAL visibility and transaction staging state.
 mod state;
+/// Single-writer commit and segment-rotation path.
 mod writer;
 
 use std::{
@@ -66,14 +71,16 @@ use super::{
 		CommitTs,
 		DataFileId,
 		DataFileKind,
-		GraphId,
 		Lsn,
 		PageKey,
 		StorageSnapshot,
 		TxId,
 	},
 };
-use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
+use crate::{
+	datastore::DataSpaceId,
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+};
 
 #[cfg(test)]
 #[allow(
@@ -97,7 +104,10 @@ mod tests {
 	use rapidhash::v3::rapidhash_v3;
 
 	use super::*;
-	use crate::storage::page::{PAGE_HEADER_SIZE, PageFlags, PageType};
+	use crate::{
+		graph::GraphId,
+		storage::page::{PAGE_HEADER_SIZE, PageFlags, PageType},
+	};
 
 	/// Stable singleton system file used by WAL fixtures.
 	const TEST_FILE_ID: DataFileId = DataFileId::for_kind(DataFileKind::SystemCatalog);
@@ -106,7 +116,7 @@ mod tests {
 	/// First currently unassigned recovery-kind byte.
 	const TEST_UNASSIGNED_KIND: u8 = WalKind::GraphDrop.get() + 1;
 	/// First reserved format-v1 data-file kind encoded as a complete identity.
-	const TEST_RESERVED_FILE_ID: u64 = DataFileKind::PropertyStatistics.get() as u64 + 1;
+	const TEST_RESERVED_FILE_ID: u64 = DataFileKind::PropertyDictionary.get() as u64 + 1;
 	/// Monotonic suffix for collision-resistant WAL test directories.
 	static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -136,7 +146,7 @@ mod tests {
 
 	/// Creates one deterministic physical test key.
 	fn page_key(page_no: u64) -> PageKey {
-		PageKey::new(GraphId::SYSTEM, TEST_FILE_ID, PageNo::new(page_no))
+		PageKey::new(DataSpaceId::Database, TEST_FILE_ID, PageNo::new(page_no))
 	}
 
 	/// Creates one sealed page carrying a marker byte.
@@ -269,12 +279,15 @@ mod tests {
 			.ok_or_else(|| io::Error::other("invalid first test file identity"))?;
 		let second_id = DataFileId::new(2, DataFileKind::Index)
 			.ok_or_else(|| io::Error::other("invalid second test file identity"))?;
-		let first = PageKey::new(GraphId::new(9), first_id, PageNo::new(17));
-		let second = PageKey::new(GraphId::new(9), second_id, PageNo::new(17));
+		let graph = DataSpaceId::Graph(
+			GraphId::new(9).ok_or_else(|| io::Error::other("invalid test graph identity"))?,
+		);
+		let first = PageKey::new(graph, first_id, PageNo::new(17));
+		let second = PageKey::new(graph, second_id, PageNo::new(17));
 		let mut encoded = Vec::new();
 		encode_page_key(first, &mut encoded);
 		assert_eq!(encoded.len(), PAGE_FRAME_PREFIX_SIZE);
-		assert_eq!(read_u64(&encoded, PAGE_FRAME_GRAPH_ID_OFFSET), 9);
+		assert_eq!(read_u64(&encoded, PAGE_FRAME_SPACE_ID_OFFSET), 9);
 		assert_eq!(read_u64(&encoded, PAGE_FRAME_FILE_ID_OFFSET), 0x010c);
 		assert_eq!(read_u64(&encoded, PAGE_FRAME_PAGE_NO_OFFSET), 17);
 		assert_eq!(decode_page_key(&encoded)?, first);
@@ -360,21 +373,40 @@ mod tests {
 		Ok(())
 	}
 
-	/// Transaction staging cannot mutate checkpoint-owned graph metadata.
+	/// Logical superblock versions use the same atomic transaction boundary as
+	/// data pages.
 	#[test]
-	fn graph_superblock_is_not_a_transaction_frame() -> Result<(), Box<dyn Error>> {
+	fn superblocks_are_transaction_frames() -> Result<(), Box<dyn Error>> {
 		let directory = TestDirectory::new()?;
 		let wal = FrameWal::create_new(directory.as_path())?;
-		let file_id = DataFileId::for_kind(DataFileKind::GraphSuperblock);
-		let key = PageKey::new(GraphId::new(1), file_id, PageNo::new(0));
-		let page = AlignedPage::new(
-			PageType::GraphSuperblock,
-			PageFlags::empty(),
-			PageLsn::ZERO,
-			PageNo::new(0),
-		);
+		let graph =
+			GraphId::new(1).ok_or_else(|| io::Error::other("invalid test graph identity"))?;
 		let mut tx = wal.begin_tx()?;
-		assert!(tx.stage_page(key, &page).is_err());
+		let mut keys = Vec::new();
+		for (space, file_kind, page_type) in [
+			(
+				DataSpaceId::Database,
+				DataFileKind::AtomStoreSuperblock,
+				PageType::AtomStoreSuperblock,
+			),
+			(DataSpaceId::Graph(graph), DataFileKind::GraphSuperblock, PageType::GraphSuperblock),
+		] {
+			let key = PageKey::new(space, DataFileId::for_kind(file_kind), PageNo::new(0));
+			let page =
+				AlignedPage::new(page_type, PageFlags::empty(), PageLsn::ZERO, PageNo::new(0));
+			tx.stage_page(key, &page)?;
+			keys.push((key, page_type));
+		}
+		wal.commit_tx(tx)?;
+		let snapshot = wal.snapshot();
+		for (key, page_type) in keys {
+			let selected = wal.visible_frames(&[key], snapshot);
+			let frame = selected.frames()[0]
+				.ok_or_else(|| io::Error::other("committed superblock frame is absent"))?;
+			let mut page = AlignedPage::zeroed();
+			let header = selected.read_frame(frame, &mut page)?;
+			assert_eq!(header.page_type(), page_type);
+		}
 		Ok(())
 	}
 
@@ -759,7 +791,7 @@ mod tests {
 			let page =
 				marked_page(0, 1)?.copy_with_lsn(PageNo::new(0), PageLsn::new(frame_lsn.get()))?;
 			let mut payload = Vec::with_capacity(PAGE_FRAME_PAYLOAD_SIZE);
-			payload.extend_from_slice(&GraphId::SYSTEM.get().to_le_bytes());
+			payload.extend_from_slice(&DataSpaceId::Database.raw().to_le_bytes());
 			payload.extend_from_slice(&TEST_RESERVED_FILE_ID.to_le_bytes());
 			payload.extend_from_slice(&0_u64.to_le_bytes());
 			payload.extend_from_slice(page.as_bytes());
@@ -852,7 +884,9 @@ mod tests {
 		let wal = FrameWal::create_new(directory.as_path())?;
 		let file_id = DataFileId::new(42, DataFileKind::Index)
 			.ok_or_else(|| io::Error::other("invalid test file identity"))?;
-		let key = PageKey::new(GraphId::new(1), file_id, PageNo::new(0));
+		let graph =
+			GraphId::new(1).ok_or_else(|| io::Error::other("invalid test graph identity"))?;
+		let key = PageKey::new(DataSpaceId::Graph(graph), file_id, PageNo::new(0));
 		let mut tx = wal.begin_tx()?;
 		tx.stage_page(key, &marked_page(0, 1)?)?;
 		let commit = wal.commit_tx(tx)?;

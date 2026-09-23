@@ -3,15 +3,15 @@ use super::*;
 
 /// One canonical primary-index item.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::storage) struct PrimaryIndexEntry {
+pub(in crate::storage) struct PrimaryIndexEntry<Address = DiskAtomRef> {
 	pub(in crate::storage) key: Vec<u8>,
-	pub(in crate::storage) atom: DiskAtomRef,
+	pub(in crate::storage) atom: Address,
 }
 
 /// One primary-index insertion or removal applied by point DML.
-pub(in crate::storage) struct PrimaryIndexMutation {
+pub(in crate::storage) struct PrimaryIndexMutation<Address = DiskAtomRef> {
 	pub(in crate::storage) key: Vec<u8>,
-	pub(in crate::storage) atom: Option<DiskAtomRef>,
+	pub(in crate::storage) atom: Option<Address>,
 }
 
 /// Complete immutable B+tree generation and its root page.
@@ -21,15 +21,15 @@ pub(in crate::storage) struct BuiltPrimaryIndex {
 }
 
 /// Bulk-builds a unique B+tree from strictly sorted canonical RecordId bytes.
-pub(in crate::storage) fn build_primary_index(
-	entries: &[PrimaryIndexEntry],
+pub(in crate::storage) fn build_primary_index<Address: PrimaryAddress>(
+	entries: &[PrimaryIndexEntry<Address>],
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<BuiltPrimaryIndex> {
 	build_primary_index_with_leaf_limit(entries, page_lsn, MUTABLE_PRIMARY_LEAF_BYTES)
 }
 
-fn build_primary_index_with_leaf_limit(
-	entries: &[PrimaryIndexEntry],
+fn build_primary_index_with_leaf_limit<Address: PrimaryAddress>(
+	entries: &[PrimaryIndexEntry<Address>],
 	page_lsn: PageLsn,
 	maximum_leaf_bytes: usize,
 ) -> FerrosGrynnResult<BuiltPrimaryIndex> {
@@ -58,8 +58,8 @@ fn build_primary_index_with_leaf_limit(
 }
 
 #[cfg(test)]
-pub(super) fn build_primary_index_with_fill(
-	entries: &[PrimaryIndexEntry],
+pub(super) fn build_primary_index_with_fill<Address: PrimaryAddress>(
+	entries: &[PrimaryIndexEntry<Address>],
 	page_lsn: PageLsn,
 	fill_percent: usize,
 ) -> FerrosGrynnResult<BuiltPrimaryIndex> {
@@ -74,11 +74,11 @@ pub(super) fn build_primary_index_with_fill(
 }
 
 /// Performs one logarithmic primary lookup without decoding the key bytes.
-pub(in crate::storage) fn lookup_primary_index(
+pub(in crate::storage) fn lookup_primary_index<Address: PrimaryAddress>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
 	target: &[u8],
-) -> FerrosGrynnResult<Option<DiskAtomRef>> {
+) -> FerrosGrynnResult<Option<Address>> {
 	let mut page_no = root;
 	let mut visited = BTreeSet::new();
 	for _depth in 0..MAX_BTREE_DEPTH {
@@ -98,10 +98,10 @@ pub(in crate::storage) fn lookup_primary_index(
 }
 
 /// Streams every primary-index entry in key order through the linked leaves.
-pub(in crate::storage) fn scan_primary_index(
+pub(in crate::storage) fn scan_primary_index<Address: PrimaryAddress>(
 	read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
-) -> FerrosGrynnResult<Vec<PrimaryIndexEntry>> {
+) -> FerrosGrynnResult<Vec<PrimaryIndexEntry<Address>>> {
 	let mut entries = Vec::new();
 	visit_primary_index(read_page, root, |key, atom| {
 		entries.push(PrimaryIndexEntry {
@@ -115,10 +115,10 @@ pub(in crate::storage) fn scan_primary_index(
 
 /// Visits primary-index entries in key order without retaining the complete
 /// index in memory.
-pub(in crate::storage) fn visit_primary_index(
+pub(in crate::storage) fn visit_primary_index<Address: PrimaryAddress>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
-	mut visit: impl FnMut(&[u8], DiskAtomRef) -> FerrosGrynnResult<()>,
+	mut visit: impl FnMut(&[u8], Address) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<()> {
 	let mut page_no = leftmost_primary_leaf(&mut read_page, root)?;
 
@@ -139,14 +139,14 @@ pub(in crate::storage) fn visit_primary_index(
 ///
 /// `None` requests the existing bulk builder because a split, an empty
 /// non-root leaf, or a changed internal separator is required.
-pub(in crate::storage) fn mutate_primary_index_leaves(
+pub(in crate::storage) fn mutate_primary_index_leaves<Address: PrimaryAddress>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
-	mutations: &[PrimaryIndexMutation],
+	mutations: &[PrimaryIndexMutation<Address>],
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<Option<Vec<(PageNo, AlignedPage)>>> {
 	let mut unique = BTreeSet::new();
-	let mut grouped = BTreeMap::<PageNo, Vec<&PrimaryIndexMutation>>::new();
+	let mut grouped = BTreeMap::<PageNo, Vec<&PrimaryIndexMutation<Address>>>::new();
 	for mutation in mutations {
 		if mutation.key.is_empty()
 			|| !unique.insert((mutation.key.as_slice(), mutation.atom.is_some()))
@@ -173,7 +173,7 @@ pub(in crate::storage) fn mutate_primary_index_leaves(
 				let (key, atom) = leaf_entry(current.as_bytes(), area_start, count, index)?;
 				Ok(PrimaryIndexEntry {
 					key: key.to_vec(),
-					atom: DiskAtomRef::from_raw(atom)?,
+					atom: Address::from_raw(atom)?,
 				})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
@@ -203,9 +203,12 @@ pub(in crate::storage) fn mutate_primary_index_leaves(
 
 /// Applies removals before insertions so one stable `RecordId` can be reused
 /// atomically with a new generation.
-pub(in crate::storage) fn apply_primary_mutations<'mutation>(
-	entries: &mut Vec<PrimaryIndexEntry>,
-	mutations: impl IntoIterator<Item = &'mutation PrimaryIndexMutation>,
+pub(in crate::storage) fn apply_primary_mutations<
+	'mutation,
+	Address: PrimaryAddress + 'mutation,
+>(
+	entries: &mut Vec<PrimaryIndexEntry<Address>>,
+	mutations: impl IntoIterator<Item = &'mutation PrimaryIndexMutation<Address>>,
 ) -> FerrosGrynnResult<()> {
 	let mutations = mutations.into_iter().collect::<Vec<_>>();
 	for insert in [false, true] {
@@ -262,11 +265,11 @@ pub(in crate::storage) fn leftmost_primary_leaf(
 }
 
 /// Validates and visits one unique leaf, returning its exact successor.
-pub(in crate::storage) fn visit_primary_leaf_page(
+pub(in crate::storage) fn visit_primary_leaf_page<Address: PrimaryAddress>(
 	page_no: PageNo,
 	page: &AlignedPage,
 	previous_key: &mut Option<Vec<u8>>,
-	visit: &mut impl FnMut(&[u8], DiskAtomRef) -> FerrosGrynnResult<()>,
+	visit: &mut impl FnMut(&[u8], Address) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<PageNo> {
 	let header = page.validate(page_no)?;
 	if header.page_type() != PageType::IndexUniqueBtreeLeaf {
@@ -279,7 +282,7 @@ pub(in crate::storage) fn visit_primary_leaf_page(
 		if previous_key.as_deref().is_some_and(|previous| previous >= key) {
 			return Err(invalid_index("primary B+tree leaf keys are not strictly ordered"));
 		}
-		visit(key, DiskAtomRef::from_raw(atom)?)?;
+		visit(key, Address::from_raw(atom)?)?;
 		*previous_key = Some(key.to_vec());
 	}
 	Ok(PageNo::new(read_u64(bytes, LEAF_NEXT_OFFSET)))

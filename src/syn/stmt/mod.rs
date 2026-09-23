@@ -1,4 +1,5 @@
 mod dml;
+mod graph_dml;
 mod r#let;
 mod r#match;
 mod r#return;
@@ -14,6 +15,7 @@ pub use r#match::{
 	MatchLength,
 	MatchPattern,
 	MatchReturnItem,
+	MatchSelector,
 	MatchStatement,
 	MatchStep,
 };
@@ -23,17 +25,18 @@ pub use schema::{
 	AlterStatement,
 	AlterTarget,
 	BasicIndexDefinition,
+	ClassKindName,
+	ClassSchemaModeName,
+	DefineClassStatement,
 	DefineFieldStatement,
 	DefineGraphStatement,
 	DefineIndexStatement,
-	DefineTableStatement,
 	DefinitionMode,
+	IndexScopeName,
 	InfoStatement,
 	InfoTarget,
 	RemoveStatement,
 	RemoveTarget,
-	TableKindName,
-	TableSchemaModeName,
 };
 pub use select::{RecordKey, SelectItem, SelectStatement, SelectTarget};
 
@@ -55,12 +58,14 @@ pub struct Statement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StatementKind {
+	Attach(AttachStatement),
 	Create(CreateStatement),
 	Update(MutateStatement),
 	Upsert(MutateStatement),
 	Delete(DeleteStatement),
+	Detach(DetachStatement),
 	DefineGraph(DefineGraphStatement),
-	DefineTable(DefineTableStatement),
+	DefineClass(DefineClassStatement),
 	DefineField(DefineFieldStatement),
 	DefineIndex(DefineIndexStatement),
 	Remove(RemoveStatement),
@@ -68,6 +73,7 @@ pub enum StatementKind {
 	Info(InfoStatement),
 	Let(LetStatement),
 	Match(MatchStatement),
+	Relate(RelateStatement),
 	Return(ReturnStatement),
 	Select(SelectStatement),
 }
@@ -82,3 +88,4 @@ pub use dml::{
 	ExpectClause,
 	MutateStatement,
 };
+pub use graph_dml::{AttachStatement, DetachStatement, RelateStatement};

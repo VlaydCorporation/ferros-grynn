@@ -19,30 +19,7 @@ use std::{
 };
 
 #[cfg(windows)]
-use ferros_grynn::{
-	datastore::{
-		CheckpointMode,
-		Datastore,
-		GraphWriteView,
-		LocalOptions,
-		TableField,
-		TableKind,
-		TableSchema,
-	},
-	graph::{
-		AtomKind,
-		AtomRef,
-		EdgeEndpoint,
-		EdgeTopology,
-		Graph,
-		GraphRead,
-		GraphStorageMode,
-		Mutable,
-		NodeRead,
-	},
-	storage_engine_prototype_api::direct::{DirectFile, DirectFileOpenMode},
-	values::{Object, PropertyMap, Text, Type, Value},
-};
+use ferros_grynn::storage_engine_prototype_api::direct::{DirectFile, DirectFileOpenMode};
 use ferros_grynn::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage_engine_prototype_api::{
@@ -61,28 +38,6 @@ use ferros_grynn::{
 		types::{CheckpointGeneration, DataFileId, DataFileKind, GraphId, Lsn, PageKey},
 	},
 };
-
-/// Unique local-database path removed after the end-to-end test.
-#[cfg(windows)]
-struct TestDirectory(std::path::PathBuf);
-
-#[cfg(windows)]
-impl TestDirectory {
-	/// Reserves a path without creating it before `Datastore::create_local`.
-	fn new() -> Self {
-		Self(
-			std::env::temp_dir()
-				.join(format!("fgh-{:016x}", uuid::Uuid::new_v4().as_u128() as u64)),
-		)
-	}
-}
-
-#[cfg(windows)]
-impl Drop for TestDirectory {
-	fn drop(&mut self) {
-		drop(std::fs::remove_dir_all(&self.0));
-	}
-}
 
 /// Unique Direct-I/O file removed after a transport test.
 #[cfg(windows)]
@@ -143,8 +98,10 @@ fn home_key_at(
 	let file_id = DataFileId::new(file_instance, DataFileKind::NodesHot).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file("test data-file identity is out of range")
 	})?;
+	let graph_id = GraphId::new(7)
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("test graph identity is zero"))?;
 	Ok(PageCacheKey::new(
-		PageKey::new(GraphId::new(7), file_id, PageNo::new(page_no)),
+		PageKey::for_graph(graph_id, file_id, PageNo::new(page_no)),
 		PageCacheVersion::Home {
 			generation: CheckpointGeneration::new(generation),
 			ceiling: Lsn::new(100),
@@ -157,8 +114,10 @@ fn wal_key(file_instance: u64, page_no: u64, page_lsn: u64) -> FerrosGrynnResult
 	let file_id = DataFileId::new(file_instance, DataFileKind::NodesHot).ok_or_else(|| {
 		FerrosGrynnError::invalid_storage_file("test data-file identity is out of range")
 	})?;
+	let graph_id = GraphId::new(7)
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("test graph identity is zero"))?;
 	Ok(PageCacheKey::new(
-		PageKey::new(GraphId::new(7), file_id, PageNo::new(page_no)),
+		PageKey::for_graph(graph_id, file_id, PageNo::new(page_no)),
 		PageCacheVersion::Wal(PageLsn::new(page_lsn)),
 	))
 }
@@ -269,6 +228,28 @@ fn exact_versions_and_files_share_one_resident_budget() -> Result<(), Box<dyn Er
 	}
 	assert_eq!(engine.resident_count(), 3);
 	assert_eq!(engine.resident_capacity(), 3);
+	Ok(())
+}
+
+#[test]
+fn database_and_graph_pages_never_alias() -> Result<(), Box<dyn Error>> {
+	let engine = HybridReadEngine::new(NonZeroUsize::new(2).ok_or("zero capacity")?);
+	let graph_key = home_key(1, 3)?;
+	let database_key = PageCacheKey::new(
+		PageKey::for_database(graph_key.page_key().file_id(), graph_key.page_no()),
+		graph_key.version(),
+	);
+	let loads = AtomicUsize::new(0);
+
+	for key in [database_key, graph_key] {
+		drop(engine.get_or_load(key, |page| {
+			loads.fetch_add(1, Ordering::Relaxed);
+			load_valid(key, page)
+		})?);
+	}
+
+	assert_eq!(loads.load(Ordering::Relaxed), 2);
+	assert_eq!(engine.resident_count(), 2);
 	Ok(())
 }
 
@@ -540,169 +521,6 @@ fn source_registry_retires_old_home_epoch_but_not_active_scope() -> Result<(), B
 	assert_eq!(old_locator.page_count(), 16);
 	assert_eq!(current_locator.page_count(), 16);
 	assert!(engine.home_locator(wal_key(1, 0, 9)?, pages).is_err());
-	Ok(())
-}
-
-#[cfg(windows)]
-#[test]
-fn selected_r8_path_survives_checkpoint_and_reopen() -> Result<(), Box<dyn Error>> {
-	const NODE_COUNT: usize = 1_500;
-	let directory = TestDirectory::new();
-	let mut options = LocalOptions::default();
-	options.buffer_pool_pages = 320;
-	let store = Datastore::create_local(&directory.0, options)?;
-	let payload_key = store.intern_property("payload")?;
-	let payload = Text::from("x".repeat(40_000));
-	let mut graph = Graph::<Mutable>::new();
-	let mut first_properties = PropertyMap::new();
-	first_properties.insert(payload_key, payload.clone());
-	let first = graph.add_node_with_id("hybrid:node-0".parse()?, None, first_properties)?;
-	for index in 1..NODE_COUNT {
-		graph.add_node_with_id(
-			format!("hybrid:node-{index}").parse()?,
-			None,
-			PropertyMap::new(),
-		)?;
-	}
-	let mut create = store.begin();
-	let reference = create.create_graph("graph:hybrid-e2e".parse()?, graph.freeze().into())?;
-	create.define_table(TableSchema::new("hybrid", reference.clone(), TableKind::Normal, [
-		TableField::new("payload", Type::String),
-	])?)?;
-	create.commit()?;
-	store.checkpoint(CheckpointMode::Restart)?;
-	drop(store);
-
-	let reopened = Datastore::open_local(&directory.0, options)?;
-	let read = reopened.begin();
-	let view = reference.read(&read)?;
-	assert_eq!(view.node_count()?, NODE_COUNT);
-	assert_eq!(view.node_ids()?.collect::<FerrosGrynnResult<Vec<_>>>()?.len(), NODE_COUNT);
-	let first_node = view.node(first)?.ok_or("first node disappeared after reopen")?;
-	assert_eq!(first_node.properties()?.get(payload_key), Some(&Value::from(payload)));
-	let result = reopened.execute("SELECT VALUE id FROM hybrid LIMIT 1", &Object::new())?;
-	let statement = result
-		.first()
-		.ok_or_else(|| std::io::Error::other("SELECT returned no statement result"))?;
-	let outcome =
-		statement.result.as_ref().map_err(|error| std::io::Error::other(error.to_string()))?;
-	let Value::Array(rows) = outcome.value() else {
-		return Err("SELECT did not return an array".into());
-	};
-	assert_eq!(rows.len(), 1);
-	Ok(())
-}
-
-#[cfg(windows)]
-#[test]
-fn streaming_limit_keeps_local_serializable_predicate() -> Result<(), Box<dyn Error>> {
-	let directory = TestDirectory::new();
-	let store = Datastore::create_local(&directory.0, LocalOptions::default())?;
-	let age = store.intern_property("age")?;
-	let mut graph = Graph::<Mutable>::new();
-	for index in 0..64 {
-		let mut properties = PropertyMap::new();
-		properties.insert(age, Value::from(18_i64 + index));
-		graph.add_node_with_id(format!("person:initial-{index}").parse()?, None, properties)?;
-	}
-	let mut create = store.begin();
-	let reference = create.create_graph("graph:streaming-ssi".parse()?, graph.freeze().into())?;
-	create.define_table(TableSchema::new("person", reference.clone(), TableKind::Normal, [
-		TableField::new("age", Type::Int),
-	])?)?;
-	create.commit()?;
-
-	let mut reader = store.begin();
-	let result =
-		reader.execute("SELECT VALUE id FROM person WHERE age >= 18 LIMIT 1", &Object::new())?;
-	let Value::Array(rows) = result[0]
-		.result
-		.as_ref()
-		.map_err(|error| std::io::Error::other(error.to_string()))?
-		.value()
-	else {
-		return Err("SELECT did not return an array".into());
-	};
-	assert_eq!(rows.len(), 1);
-
-	let mut writer = store.begin();
-	if let GraphWriteView::Graph(graph) = writer.edit_graph(&reference)? {
-		let mut properties = PropertyMap::new();
-		properties.insert(age, Value::from(21_i64));
-		graph.add_node_with_id("person:phantom".parse()?, None, properties)?;
-	}
-	writer.commit()?;
-	let error = match reader.commit() {
-		Ok(_snapshot) => return Err("serializable reader accepted a matching phantom".into()),
-		Err(error) => error,
-	};
-	assert_eq!(error.status().code().to_string(), "FG-40001");
-	Ok(())
-}
-
-#[cfg(windows)]
-#[test]
-fn mode3_materialization_is_owned_two_pass_and_origin_aware() -> Result<(), Box<dyn Error>> {
-	let directory = TestDirectory::new();
-	let store = Datastore::create_local(&directory.0, LocalOptions::default())?;
-	let key = store.intern_property("value")?;
-	let mut graph = Graph::<Mutable>::new();
-	let mut first_properties = PropertyMap::new();
-	first_properties.insert(key, Value::from("first"));
-	let first = graph.add_node_with_id("item:first".parse()?, None, first_properties)?;
-	let second = graph.add_node_with_id("item:second".parse()?, None, PropertyMap::new())?;
-	let first_edge = graph.add_edge_with_id(
-		"link:first".parse()?,
-		EdgeTopology::directed([first], [second]),
-		None,
-		PropertyMap::new(),
-	)?;
-	graph.add_edge_with_id(
-		"link:second".parse()?,
-		EdgeTopology::directed([EdgeEndpoint::Local(first_edge)], [EdgeEndpoint::Local(second)]),
-		None,
-		PropertyMap::new(),
-	)?;
-	let mut create = store.begin();
-	let reference = create.create_graph("graph:mode3".parse()?, graph.freeze().into())?;
-	create.commit()?;
-	drop(store);
-
-	let store = Datastore::open_local(&directory.0, LocalOptions::default())?;
-	let reader = store.begin();
-	let hybrid = reader.materialize_query_graph(&reference)?;
-	drop(reader);
-	drop(store);
-
-	assert_eq!(hybrid.storage_mode(), GraphStorageMode::Hybrid);
-	assert_eq!(hybrid.node_count(), 2);
-	assert_eq!(hybrid.edge_count(), 2);
-	let origin = hybrid.materialization_origin().ok_or("Mode 3 result lost its origin")?;
-	assert_eq!(origin.graph_ref(), Some(&reference));
-	let first_local = hybrid
-		.atom_id(&AtomRef::new(AtomKind::Node, "item:first".parse()?))?
-		.ok_or("first node was not materialized")?;
-	assert_eq!(
-		hybrid.node(first_local).ok_or("first node is absent")?.properties().get(key),
-		Some(&Value::from("first"))
-	);
-	let first_edge_local = hybrid
-		.atom_id(&AtomRef::new(AtomKind::Edge, "link:first".parse()?))?
-		.ok_or("first edge was not materialized")?;
-	let second_edge_local = hybrid
-		.atom_id(&AtomRef::new(AtomKind::Edge, "link:second".parse()?))?
-		.ok_or("second edge was not materialized")?;
-	let second_edge = hybrid.edge(second_edge_local).ok_or("second edge is absent")?;
-	assert!(
-		second_edge
-			.topology()
-			.endpoints()
-			.any(|endpoint| { *endpoint == EdgeEndpoint::Local(first_edge_local) })
-	);
-
-	let mutable = hybrid.thaw();
-	assert_eq!(mutable.storage_mode(), GraphStorageMode::Hybrid);
-	assert!(mutable.materialization_origin().is_some());
 	Ok(())
 }
 

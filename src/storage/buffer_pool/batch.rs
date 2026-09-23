@@ -67,7 +67,7 @@ where
 				let current = reservations[extent_end].key;
 				let adjacent =
 					previous.page_no().get().checked_add(1) == Some(current.page_no().get());
-				let same_file = current.page_key().graph_id() == first_key.graph_id()
+				let same_file = current.page_key().space_id() == first_key.space_id()
 					&& current.page_key().file_id() == first_key.file_id();
 				if !same_file || current.version() != version || !adjacent {
 					break;

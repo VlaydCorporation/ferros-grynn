@@ -5,27 +5,19 @@ use std::{
 	sync::Arc,
 };
 
-use super::{TableKind, TableSchema};
+use super::ClassSchema;
 use crate::{
-	collections::cow_vec::CowVec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::{
-		RecordId,
-		Text,
-		Value,
-		graph::{AtomId, AtomKind, GraphRef},
-	},
+	values::runtime::{GraphId, GraphRef, Text, Value},
 };
 
 /// Stable identity of one schema-catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
 pub struct SchemaId(NonZeroU32);
 
 impl SchemaId {
 	/// Creates an identity from its durable representation.
-	///
-	/// Zero is reserved by the in-memory membership table and [`u32::MAX`] is
-	/// the on-disk hot-slot sentinel for no table.
 	pub const fn new(value: u32) -> Option<Self> {
 		if value == u32::MAX {
 			return None;
@@ -53,13 +45,50 @@ impl Display for SchemaId {
 	}
 }
 
-/// Stable identity of one index definition.
-///
-/// Index identities share the schema-catalog allocation clock with graphs,
-/// tables, fields, and parameters, but this type prevents an index identity
-/// from being confused with another catalog object's identity.
-#[repr(transparent)]
+/// Stable identity of one atom class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ClassId(SchemaId);
+
+impl ClassId {
+	/// Creates a class identity from its durable representation.
+	pub const fn new(value: u32) -> Option<Self> {
+		match SchemaId::new(value) {
+			Some(value) => Some(Self(value)),
+			None => None,
+		}
+	}
+
+	/// Returns the durable integer representation.
+	pub const fn get(self) -> u32 {
+		self.0.get()
+	}
+
+	pub(crate) const fn from_schema_id(value: SchemaId) -> Self {
+		Self(value)
+	}
+
+	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
+		Self::new(value)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("class identity is reserved"))
+	}
+}
+
+impl From<ClassId> for SchemaId {
+	fn from(value: ClassId) -> Self {
+		value.0
+	}
+}
+
+impl Display for ClassId {
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), formatter)
+	}
+}
+
+/// Stable identity of one index definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
 pub struct IndexId(SchemaId);
 
 impl IndexId {
@@ -76,16 +105,10 @@ impl IndexId {
 		self.0.get()
 	}
 
-	/// Re-types an identity already allocated by the shared schema clock.
 	pub(crate) const fn from_schema_id(value: SchemaId) -> Self {
 		Self(value)
 	}
 
-	/// Decodes and validates the durable integer representation.
-	///
-	/// # Errors
-	///
-	/// Returns an invalid-storage error for a reserved schema identity.
 	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
 		Self::new(value)
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("index identity is reserved"))
@@ -99,13 +122,14 @@ impl From<IndexId> for SchemaId {
 }
 
 impl Display for IndexId {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-		Display::fmt(&self.get(), f)
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), formatter)
 	}
 }
 
 /// Monotonic semantic version of one schema-catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
 pub struct SchemaVersion(NonZeroU32);
 
 impl SchemaVersion {
@@ -145,15 +169,13 @@ impl Display for SchemaVersion {
 	}
 }
 
-/// Engine-owned index capabilities visible through the schema catalog.
+/// Engine-owned graph index capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SystemIndexKind {
-	/// Stable record identity for one table.
-	Primary,
-	/// Enumeration of graph atoms by label.
+	/// Enumeration of graph occurrences by their optional label.
 	Label,
-	/// Role-separated graph adjacency stored with atom pages.
+	/// Role-separated graph adjacency.
 	Adjacency,
 }
 
@@ -205,9 +227,7 @@ impl SystemIndex {
 /// Published schema definition of one named graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphSchema {
-	id: SchemaId,
 	version: SchemaVersion,
-	name: Text,
 	reference: GraphRef,
 	system_indexes: [SystemIndex; 2],
 	pub(crate) published_at: u64,
@@ -215,27 +235,23 @@ pub struct GraphSchema {
 
 impl GraphSchema {
 	pub(crate) const fn new(
-		id: SchemaId,
 		version: SchemaVersion,
-		name: Text,
 		reference: GraphRef,
 		label: SystemIndex,
 		adjacency: SystemIndex,
 		published_at: u64,
 	) -> Self {
 		Self {
-			id,
 			version,
-			name,
 			reference,
 			system_indexes: [label, adjacency],
 			published_at,
 		}
 	}
 
-	/// Returns the stable catalog identity.
-	pub const fn id(&self) -> SchemaId {
-		self.id
+	/// Returns the stable graph identity.
+	pub const fn id(&self) -> GraphId {
+		self.reference.id()
 	}
 
 	/// Returns the semantic definition version.
@@ -245,7 +261,7 @@ impl GraphSchema {
 
 	/// Returns the case-sensitive catalog name.
 	pub const fn name(&self) -> &Text {
-		&self.name
+		self.reference.name()
 	}
 
 	/// Returns the graph reference owned by this datastore.
@@ -313,209 +329,101 @@ impl SchemaParameter {
 	}
 }
 
-#[derive(Clone, Copy)]
-struct MembershipSlot {
-	generation: u32,
-	table_id: u32,
-}
-
-impl Default for MembershipSlot {
-	fn default() -> Self {
-		Self {
-			generation: u32::MAX,
-			table_id: 0,
-		}
-	}
-}
-
-/// Generation-aware table membership for one graph address space.
-#[derive(Clone, Default)]
-pub(crate) struct AtomTableMemberships {
-	nodes: CowVec<MembershipSlot>,
-	edges: CowVec<MembershipSlot>,
-}
-
-impl AtomTableMemberships {
-	pub(crate) fn get(&self, atom: AtomId) -> Option<SchemaId> {
-		let slot = usize::try_from(atom.slot()).ok()?;
-		let entry = match atom.kind()? {
-			AtomKind::Node => self.nodes.get(slot),
-			AtomKind::Edge => self.edges.get(slot),
-		}?;
-		(entry.generation == atom.generation()).then(|| SchemaId::new(entry.table_id)).flatten()
-	}
-
-	pub(crate) fn set(&mut self, atom: AtomId, table: Option<SchemaId>) -> FerrosGrynnResult<()> {
-		let slot = usize::try_from(atom.slot())
-			.map_err(|_error| FerrosGrynnError::graph_capacity_exceeded("table membership slot"))?;
-		let required = slot
-			.checked_add(1)
-			.ok_or_else(|| FerrosGrynnError::graph_capacity_exceeded("table membership slot"))?;
-		let slots = match atom.kind() {
-			Some(AtomKind::Node) => &mut self.nodes,
-			Some(AtomKind::Edge) => &mut self.edges,
-			None => {
-				return Err(FerrosGrynnError::invalid_argument(
-					"table membership requires a valid atom kind",
-				));
-			}
-		};
-		if slots.len() < required {
-			slots.resize_with(required, MembershipSlot::default);
-		}
-		slots[slot] = MembershipSlot {
-			generation: atom.generation(),
-			table_id: table.map_or(0, SchemaId::get),
-		};
-		Ok(())
-	}
-
-	pub(crate) fn assigned(&self) -> impl Iterator<Item = (AtomId, SchemaId)> + '_ {
-		let nodes = self.nodes.iter().enumerate().filter_map(|(slot, entry)| {
-			let slot = u64::try_from(slot).ok()?;
-			let table = SchemaId::new(entry.table_id)?;
-			AtomId::from_parts(AtomKind::Node, slot, entry.generation)
-				.ok()
-				.map(|atom| (atom, table))
-		});
-		let edges = self.edges.iter().enumerate().filter_map(|(slot, entry)| {
-			let slot = u64::try_from(slot).ok()?;
-			let table = SchemaId::new(entry.table_id)?;
-			AtomId::from_parts(AtomKind::Edge, slot, entry.generation)
-				.ok()
-				.map(|atom| (atom, table))
-		});
-		nodes.chain(edges)
-	}
-}
-
-/// Immutable MVCC snapshot of all currently visible schema definitions.
+/// Immutable MVCC snapshot of currently visible schema definitions.
 #[derive(Clone)]
 pub struct SchemaCatalog {
-	pub(crate) next_id: u64,
-	pub(crate) graphs: BTreeMap<RecordId, Arc<GraphSchema>>,
-	pub(crate) graph_names: BTreeMap<String, RecordId>,
-	pub(crate) graph_versions: BTreeMap<RecordId, u64>,
-	pub(crate) tables: BTreeMap<String, Arc<TableSchema>>,
-	pub(crate) table_versions: BTreeMap<String, u64>,
+	pub(crate) next_schema_id: u64,
+	pub(crate) next_graph_id: u64,
+	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphSchema>>,
+	pub(crate) graph_names: BTreeMap<String, GraphId>,
+	pub(crate) graph_versions: BTreeMap<GraphId, u64>,
+	pub(crate) classes: BTreeMap<ClassId, Arc<ClassSchema>>,
+	pub(crate) class_names: BTreeMap<String, ClassId>,
+	pub(crate) class_versions: BTreeMap<ClassId, u64>,
 	pub(crate) parameters: BTreeMap<String, Arc<SchemaParameter>>,
 	pub(crate) parameter_versions: BTreeMap<String, u64>,
-	pub(crate) memberships: BTreeMap<RecordId, AtomTableMemberships>,
 }
 
 impl Default for SchemaCatalog {
 	fn default() -> Self {
 		Self {
-			next_id: 1,
+			next_schema_id: 1,
+			next_graph_id: 1,
 			graphs: BTreeMap::new(),
 			graph_names: BTreeMap::new(),
 			graph_versions: BTreeMap::new(),
-			tables: BTreeMap::new(),
-			table_versions: BTreeMap::new(),
+			classes: BTreeMap::new(),
+			class_names: BTreeMap::new(),
+			class_versions: BTreeMap::new(),
 			parameters: BTreeMap::new(),
 			parameter_versions: BTreeMap::new(),
-			memberships: BTreeMap::new(),
 		}
 	}
 }
 
 impl SchemaCatalog {
-	/// Resolves a named graph definition by its stable record identity.
-	pub fn graph(&self, id: &RecordId) -> Option<Arc<GraphSchema>> {
-		self.graphs.get(id).cloned()
+	/// Resolves a graph definition by its stable identity.
+	pub fn graph(&self, id: GraphId) -> Option<Arc<GraphSchema>> {
+		self.graphs.get(&id).cloned()
 	}
 
-	/// Resolves a named graph definition by its case-sensitive catalog name.
+	/// Resolves a graph definition by its case-sensitive catalog name.
 	pub fn named_graph(&self, name: &str) -> Option<Arc<GraphSchema>> {
-		self.graph_names.get(name).and_then(|id| self.graph(id))
+		self.graph_names.get(name).and_then(|id| self.graph(*id))
 	}
 
-	/// Resolves one table definition by name.
-	pub fn table(&self, name: &str) -> Option<Arc<TableSchema>> {
-		self.tables.get(name).cloned()
+	/// Resolves one class definition by its immutable `RecordId` namespace.
+	pub fn class(&self, name: &str) -> Option<Arc<ClassSchema>> {
+		self.class_names.get(name).and_then(|id| self.class_by_id(*id))
 	}
 
-	/// Resolves one table definition by its stable catalog identity.
-	pub fn table_by_id(&self, id: SchemaId) -> Option<Arc<TableSchema>> {
-		self.tables.values().find(|table| table.id() == Some(id)).cloned()
+	/// Resolves one class definition by its stable identity.
+	pub fn class_by_id(&self, id: ClassId) -> Option<Arc<ClassSchema>> {
+		self.classes.get(&id).cloned()
 	}
 
-	/// Resolves one global parameter definition by name.
+	/// Resolves one global database parameter definition by name.
 	pub fn parameter(&self, name: &str) -> Option<Arc<SchemaParameter>> {
 		self.parameters.get(name).cloned()
 	}
 
-	/// Iterates named graph definitions in stable record-id order.
+	/// Iterates graph definitions in stable identity order.
 	pub fn graphs(&self) -> impl ExactSizeIterator<Item = &Arc<GraphSchema>> {
 		self.graphs.values()
 	}
 
-	/// Iterates table definitions in name order.
-	pub fn tables(&self) -> impl ExactSizeIterator<Item = &Arc<TableSchema>> {
-		self.tables.values()
+	/// Iterates class definitions in stable identity order.
+	pub fn classes(&self) -> impl ExactSizeIterator<Item = &Arc<ClassSchema>> {
+		self.classes.values()
 	}
 
 	/// Iterates global parameter definitions in name order.
 	pub fn parameters(&self) -> impl ExactSizeIterator<Item = &Arc<SchemaParameter>> {
 		self.parameters.values()
 	}
+}
 
-	pub(crate) fn membership(&self, graph: &RecordId, atom: AtomId) -> Option<SchemaId> {
-		self.memberships.get(graph).and_then(|memberships| memberships.get(atom))
-	}
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
 
-	pub(crate) fn memberships(&self, graph: &RecordId) -> AtomTableMemberships {
-		self.memberships.get(graph).cloned().unwrap_or_default()
-	}
+	use super::{ClassId, SchemaCatalog, SchemaId};
+	use crate::{
+		datastore::ClassSchema,
+		values::runtime::{AtomKind, Text},
+	};
 
-	pub(crate) fn set_membership(
-		&mut self,
-		graph: &RecordId,
-		atom: AtomId,
-		table: Option<SchemaId>,
-	) -> FerrosGrynnResult<()> {
-		self.memberships.entry(graph.clone()).or_default().set(atom, table)
-	}
+	#[test]
+	fn class_identity_is_not_an_untyped_schema_identity() {
+		let schema_id = SchemaId::new(7).unwrap();
+		let class_id = ClassId::from_schema_id(schema_id);
+		let mut class = ClassSchema::new("person", AtomKind::Node, []).unwrap();
+		class.id = Some(class_id);
+		let mut catalog = SchemaCatalog::default();
+		catalog.classes.insert(class_id, Arc::new(class));
+		catalog.class_names.insert(Text::from("person").to_string(), class_id);
 
-	pub(crate) fn clear_table_memberships(&mut self, table: SchemaId) -> FerrosGrynnResult<()> {
-		for memberships in self.memberships.values_mut() {
-			let atoms = memberships
-				.assigned()
-				.filter_map(|(atom, assigned)| (assigned == table).then_some(atom))
-				.collect::<Vec<_>>();
-			for atom in atoms {
-				memberships.set(atom, None)?;
-			}
-		}
-		Ok(())
-	}
-
-	pub(crate) fn validate_memberships(&self) -> FerrosGrynnResult<()> {
-		for (graph, memberships) in &self.memberships {
-			for (atom, table_id) in memberships.assigned() {
-				let table = self.table_by_id(table_id).ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"table membership references an absent schema definition",
-					)
-				})?;
-				if table.graph.as_ref().map(GraphRef::id) != Some(graph) {
-					return Err(FerrosGrynnError::invalid_storage_file(
-						"table membership references a table from another graph",
-					));
-				}
-				let kind_matches = matches!(
-					(table.kind, atom.kind()),
-					(TableKind::Any, Some(_))
-						| (TableKind::Normal, Some(AtomKind::Node))
-						| (TableKind::Relation, Some(AtomKind::Edge))
-				);
-				if !kind_matches {
-					return Err(FerrosGrynnError::invalid_storage_file(
-						"table membership atom kind disagrees with its schema",
-					));
-				}
-			}
-		}
-		Ok(())
+		assert_eq!(catalog.class("person").unwrap().id(), Some(class_id));
+		assert_eq!(SchemaId::from(class_id), schema_id);
 	}
 }

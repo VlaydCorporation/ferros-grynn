@@ -4,7 +4,7 @@ use std::{
 	fmt::{self, Display, Formatter},
 };
 
-use super::{AtomId, AtomKind, EdgeTopology, Frozen, Graph};
+use super::{AtomId, AtomKind, EdgeTopology, Frozen, Graph, GraphId};
 use crate::{
 	collections::cow_vec,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -115,22 +115,45 @@ pub enum GraphStorageMode {
 
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 pub struct GraphRef {
-	id: RecordId,
+	id: GraphId,
+	name: Text,
 	kind: GraphKind,
-	mode: GraphStorageMode,
+	storage_mode: GraphStorageMode,
 }
 
 impl GraphRef {
-	pub const fn new(id: RecordId, kind: GraphKind, mode: GraphStorageMode) -> Self {
-		Self {
-			id,
-			kind,
-			mode,
+	/// Creates a catalog graph reference.
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-argument error when the name is empty, contains NUL,
+	/// or exceeds 128 UTF-8 bytes.
+	pub fn new<IntoText: Into<Text>>(
+		id: GraphId,
+		name: IntoText,
+		kind: GraphKind,
+		storage_mode: GraphStorageMode,
+	) -> FerrosGrynnResult<Self> {
+		let name = name.into();
+		if name.is_empty() || name.as_str().contains('\0') || name.len() > 128 {
+			return Err(FerrosGrynnError::invalid_argument(
+				"graph name must contain 1..=128 UTF-8 bytes and must not contain NUL",
+			));
 		}
+		Ok(Self {
+			id,
+			name,
+			kind,
+			storage_mode,
+		})
 	}
 
-	pub const fn id(&self) -> &RecordId {
-		&self.id
+	pub const fn id(&self) -> GraphId {
+		self.id
+	}
+
+	pub const fn name(&self) -> &Text {
+		&self.name
 	}
 
 	pub const fn kind(&self) -> GraphKind {
@@ -138,7 +161,7 @@ impl GraphRef {
 	}
 
 	pub const fn storage_mode(&self) -> GraphStorageMode {
-		self.mode
+		self.storage_mode
 	}
 
 	pub fn read<'tx, T: GraphRefReader + ?Sized>(
@@ -146,6 +169,12 @@ impl GraphRef {
 		transaction: &'tx T,
 	) -> FerrosGrynnResult<T::View<'tx>> {
 		transaction.read_graph(self)
+	}
+}
+
+impl Display for GraphRef {
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(&self.name, formatter)
 	}
 }
 
@@ -613,6 +642,10 @@ impl MaterializationOrigin {
 	pub fn source_atom(&self, local: AtomId) -> Option<&AtomRef> {
 		self.source_atoms.get(&local)
 	}
+
+	pub(crate) fn source_atoms(&self) -> impl ExactSizeIterator<Item = (AtomId, &AtomRef)> {
+		self.source_atoms.iter().map(|(local, atom)| (*local, atom))
+	}
 }
 
 pub trait GraphWriteBack<G> {
@@ -815,6 +848,7 @@ mod tests {
 	use super::{
 		DirtyTarget,
 		DiskGraphView,
+		GraphId,
 		GraphKind,
 		GraphMut,
 		GraphRead,
@@ -881,10 +915,12 @@ mod tests {
 		let (source, root) = sample_graph();
 		let source_order = stable_bfs(&source, root);
 		let reference = GraphRef::new(
-			"graph:example".parse().unwrap(),
+			GraphId::new(1).unwrap(),
+			"example",
 			GraphKind::Graph,
 			GraphStorageMode::DiskBacked,
-		);
+		)
+		.unwrap();
 		let lifetime = Arc::new(());
 		let weak = Arc::downgrade(&lifetime);
 		let hybrid = {
@@ -913,10 +949,12 @@ mod tests {
 		let (source, _) = sample_graph();
 		let source_identity = source.identity();
 		let reference = GraphRef::new(
-			"graph:mutable".parse().unwrap(),
+			GraphId::new(2).unwrap(),
+			"mutable",
 			GraphKind::Graph,
 			GraphStorageMode::DiskBacked,
-		);
+		)
+		.unwrap();
 		let transaction = FakeTransaction {
 			reference: reference.clone(),
 			graph: source,

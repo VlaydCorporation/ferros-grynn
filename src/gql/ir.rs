@@ -1,8 +1,8 @@
 use crate::{
-	datastore::{TableIndexKind, TableKind, TableSchemaMode},
+	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope},
 	gql_status::TextSpan,
-	syn::DefinitionMode,
-	values::{GraphKind, GraphRef, RecordId, Type, Value},
+	syn::{DefinitionMode, MatchDirection},
+	values::{GraphKind, GraphRef, RecordId, Text, Type, Value},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,6 +19,7 @@ pub(super) struct LogicalProgram {
 pub(super) enum LogicalStatement {
 	Schema(LogicalSchemaStatement),
 	Dml(LogicalDmlStatement),
+	GraphDml(LogicalGraphDmlStatement),
 	Let {
 		slot: u32,
 		value: TypedExpr,
@@ -31,10 +32,72 @@ pub(super) enum LogicalStatement {
 	Select(LogicalSelect),
 }
 
+/// One analyzed graph-membership or graph-incidence mutation.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalGraphDmlStatement {
+	Attach {
+		record: LogicalRecordTarget,
+		graph: GraphRef,
+		label: Option<Text>,
+	},
+	Detach {
+		record: LogicalRecordTarget,
+		graph: GraphRef,
+		cascade: bool,
+	},
+	Relate {
+		atom_endpoints: bool,
+		source: LogicalRecordTarget,
+		edge: LogicalRelateEdge,
+		target: LogicalRecordTarget,
+		graph: GraphRef,
+		label: Option<Text>,
+		direction: MatchDirection,
+		weight: Option<TypedExpr>,
+	},
+}
+
+impl LogicalGraphDmlStatement {
+	pub(super) const fn statement_kind(&self) -> crate::gql::QueryStatementKind {
+		match self {
+			Self::Attach {
+				..
+			} => crate::gql::QueryStatementKind::Attach,
+			Self::Detach {
+				..
+			} => crate::gql::QueryStatementKind::Detach,
+			Self::Relate {
+				..
+			} => crate::gql::QueryStatementKind::Relate,
+		}
+	}
+}
+
+/// Exact class-qualified record target used by graph DML.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalRecordTarget {
+	pub(super) class: Box<str>,
+	pub(super) key: TypedExpr,
+}
+
+/// Edge atom and graph-local payload prepared for RELATE.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalRelateEdge {
+	pub(super) class: Box<str>,
+	pub(super) key: Option<TypedExpr>,
+	pub(super) schema: Schema,
+	pub(super) data: Option<LogicalDmlData>,
+	pub(super) returning: LogicalDmlReturn,
+	pub(super) expect: Option<LogicalExpect>,
+}
+
 /// One analyzed data-mutation statement.
 #[derive(Debug, Clone)]
 pub(super) struct LogicalDmlStatement {
 	pub(super) kind: LogicalDmlKind,
+	pub(super) graph: Option<GraphRef>,
+	pub(super) label: Option<Option<crate::values::Text>>,
+	pub(super) cascade: bool,
 	pub(super) targets: Vec<LogicalDmlTarget>,
 }
 
@@ -58,11 +121,11 @@ impl LogicalDmlKind {
 	}
 }
 
-/// One table-specific mutation plan. Expressions are typed against this
-/// target because a statement may name tables with different schemas.
+/// One class-specific mutation plan. Expressions are typed against this
+/// target because a statement may name classes with different schemas.
 #[derive(Debug, Clone)]
 pub(super) struct LogicalDmlTarget {
-	pub(super) table: Box<str>,
+	pub(super) class: Box<str>,
 	pub(super) selector: LogicalDmlSelector,
 	pub(super) schema: Schema,
 	pub(super) data: Option<LogicalDmlData>,
@@ -74,7 +137,7 @@ pub(super) struct LogicalDmlTarget {
 /// Records selected or generated for one DML target.
 #[derive(Debug, Clone)]
 pub(super) enum LogicalDmlSelector {
-	Table,
+	Class,
 	Record(TypedExpr),
 	Range(u32),
 }
@@ -88,6 +151,7 @@ pub(super) enum LogicalDmlData {
 	Replace(TypedExpr),
 	Set(Vec<(Box<str>, TypedExpr)>),
 	Unset(Vec<Box<str>>),
+	Reset(Vec<Box<str>>),
 }
 
 /// An analyzed DML result projection.
@@ -126,64 +190,65 @@ pub(super) enum LogicalSchemaStatement {
 		name: Box<str>,
 		kind: GraphKind,
 	},
-	DefineTable {
+	DefineClass {
 		mode: DefinitionMode,
 		name: Box<str>,
-		kind: TableKind,
-		schema_mode: TableSchemaMode,
+		kind: crate::values::AtomKind,
+		schema_mode: ClassSchemaMode,
 	},
 	DefineField {
 		mode: DefinitionMode,
-		table: Box<str>,
+		class: Box<str>,
 		name: Box<str>,
 		value_type: Type,
 	},
 	DefineIndex {
 		mode: DefinitionMode,
-		table: Box<str>,
+		class: Box<str>,
 		name: Box<str>,
-		kind: TableIndexKind,
+		kind: ClassIndexKind,
 		fields: Vec<Box<str>>,
+		scope: IndexScope,
 	},
 	RemoveGraph {
 		if_exists: bool,
 		name: Box<str>,
 	},
-	RemoveTable {
+	RemoveClass {
 		if_exists: bool,
 		name: Box<str>,
 	},
 	RemoveField {
 		if_exists: bool,
-		table: Box<str>,
+		class: Box<str>,
 		name: Box<str>,
 	},
 	RemoveIndex {
 		if_exists: bool,
-		table: Box<str>,
+		class: Box<str>,
 		name: Box<str>,
 	},
-	AlterTableMode {
+	AlterClassMode {
 		if_exists: bool,
 		name: Box<str>,
-		mode: TableSchemaMode,
+		mode: ClassSchemaMode,
 	},
 	AlterFieldType {
 		if_exists: bool,
-		table: Box<str>,
+		class: Box<str>,
 		name: Box<str>,
 		value_type: Type,
 	},
 	PrepareIndexRemoval {
-		table: Box<str>,
+		class: Box<str>,
 		name: Box<str>,
 	},
 	InfoDatabase,
-	InfoTable {
+	InfoClass {
 		name: Box<str>,
 	},
 	InfoIndex {
-		table: Box<str>,
+		class: Box<str>,
 		name: Box<str>,
 	},
 }
@@ -194,7 +259,7 @@ impl LogicalSchemaStatement {
 			Self::DefineGraph {
 				..
 			}
-			| Self::DefineTable {
+			| Self::DefineClass {
 				..
 			}
 			| Self::DefineField {
@@ -206,7 +271,7 @@ impl LogicalSchemaStatement {
 			Self::RemoveGraph {
 				..
 			}
-			| Self::RemoveTable {
+			| Self::RemoveClass {
 				..
 			}
 			| Self::RemoveField {
@@ -215,7 +280,7 @@ impl LogicalSchemaStatement {
 			| Self::RemoveIndex {
 				..
 			} => crate::gql::QueryStatementKind::Remove,
-			Self::AlterTableMode {
+			Self::AlterClassMode {
 				..
 			}
 			| Self::AlterFieldType {
@@ -225,7 +290,7 @@ impl LogicalSchemaStatement {
 				..
 			} => crate::gql::QueryStatementKind::Alter,
 			Self::InfoDatabase
-			| Self::InfoTable {
+			| Self::InfoClass {
 				..
 			}
 			| Self::InfoIndex {
@@ -290,10 +355,10 @@ pub(super) struct Expand {
 pub(super) struct PathExpand {
 	/// Source endpoint binding.
 	pub(super) source: MatchBinding,
+	/// Connector-edge constraints applied to every hop.
+	pub(super) edge: MatchBinding,
 	/// Target endpoint binding.
 	pub(super) target: MatchBinding,
-	/// Accepted connector labels.
-	pub(super) edge_labels: Vec<Box<str>>,
 	/// Required traversal direction.
 	pub(super) direction: crate::syn::MatchDirection,
 	/// Inclusive minimum hop count.
@@ -313,21 +378,44 @@ pub(super) enum EndpointDomain {
 	Edge,
 }
 
+impl EndpointDomain {
+	pub(super) const fn atom_kind(self) -> crate::values::AtomKind {
+		match self {
+			Self::Node => crate::values::AtomKind::Node,
+			Self::Edge => crate::values::AtomKind::Edge,
+		}
+	}
+}
+
 #[derive(Debug, Clone)]
 /// Alias and label constraints for one MATCH atom.
 pub(super) struct MatchBinding {
 	/// Required atom domain.
 	pub(super) domain: EndpointDomain,
+	/// Global class or exact-record selector.
+	pub(super) selector: LogicalMatchSelector,
 	/// Optional binding-column index.
 	pub(super) column: Option<usize>,
-	/// Alternative accepted labels.
-	pub(super) labels: Vec<Box<str>>,
+	/// Optional graph-local label predicate.
+	pub(super) label: Option<Box<str>>,
+}
+
+#[derive(Debug, Clone)]
+/// Global selector resolved before graph-local label filtering.
+pub(super) enum LogicalMatchSelector {
+	/// Any atom in the endpoint domain.
+	Any,
+	/// Any atom of one global class.
+	Class(Box<str>),
+	/// One exact global record identity.
+	Record(LogicalRecordTarget),
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct LogicalSelect {
 	pub(super) nodes: Vec<LogicalNode>,
 	pub(super) root: NodeId,
+	pub(super) graph: Option<GraphRef>,
 	pub(super) value: bool,
 	pub(super) only: bool,
 }
@@ -373,15 +461,15 @@ pub(super) enum LogicalNodeKind {
 
 #[derive(Debug, Clone)]
 pub(super) enum ScanTarget {
-	Table(Box<str>),
+	Class(Box<str>),
 	Record(RecordId),
 }
 
 impl ScanTarget {
-	pub(super) fn table(&self) -> &str {
+	pub(super) fn class(&self) -> &str {
 		match self {
-			Self::Table(table) => table,
-			Self::Record(record) => record.table(),
+			Self::Class(class) => class,
+			Self::Record(record) => record.class(),
 		}
 	}
 }

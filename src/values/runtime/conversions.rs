@@ -8,6 +8,7 @@ use super::{
 	Frozen,
 	Geometry,
 	Graph,
+	GraphRef,
 	MaterializedGraph,
 	Number,
 	Object,
@@ -131,6 +132,12 @@ impl From<Closure> for Value {
 impl From<RecordId> for Value {
 	fn from(value: RecordId) -> Self {
 		Self::Record(Box::new(value))
+	}
+}
+
+impl From<GraphRef> for Value {
+	fn from(value: GraphRef) -> Self {
+		Self::GraphRef(Box::new(value))
 	}
 }
 
@@ -305,6 +312,17 @@ impl TryFrom<Value> for RecordId {
 		match value {
 			Value::Record(value) => Ok(*value),
 			value => Err(value_conversion_error(&value, "RecordId")),
+		}
+	}
+}
+
+impl TryFrom<Value> for GraphRef {
+	type Error = FerrosGrynnError;
+
+	fn try_from(value: Value) -> Result<Self, Self::Error> {
+		match value {
+			Value::GraphRef(value) => Ok(*value),
+			value => Err(value_conversion_error(&value, "GraphRef")),
 		}
 	}
 }

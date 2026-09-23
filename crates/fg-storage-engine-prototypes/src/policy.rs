@@ -690,8 +690,10 @@ mod tests {
 		let file_id = DataFileId::new(1, DataFileKind::NodesHot).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("test data-file identity is out of range")
 		})?;
+		let graph_id = GraphId::new(1)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("test graph identity is zero"))?;
 		Ok(PageCacheKey::new(
-			PageKey::new(GraphId::new(1), file_id, PageNo::new(page_no)),
+			PageKey::for_graph(graph_id, file_id, PageNo::new(page_no)),
 			PageCacheVersion::Home {
 				generation: CheckpointGeneration::new(generation),
 				ceiling: Lsn::new(ceiling),

@@ -58,13 +58,37 @@ pub(super) trait QueryRead {
 	fn scan<'a>(
 		&'a self,
 		snapshot: Snapshot,
-		table: &str,
+		class: &str,
+		graph: Option<&GraphRef>,
 		predicate: Option<&TypedExpr>,
 		slots: &[Value],
 		source: &str,
 	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>>;
 
-	fn get(&self, snapshot: Snapshot, record: &RecordId) -> FerrosGrynnResult<Option<Row>>;
+	fn get(
+		&self,
+		snapshot: Snapshot,
+		record: &RecordId,
+		graph: Option<&GraphRef>,
+	) -> FerrosGrynnResult<Option<Row>>;
+
+	/// Returns graph-local seed candidates from primary, class, and label
+	/// indexes.
+	fn match_candidates(
+		&self,
+		snapshot: Snapshot,
+		graph: &GraphRef,
+		binding: &ResolvedMatchBinding,
+	) -> FerrosGrynnResult<Vec<AtomId>>;
+
+	/// Dereferences one record field in the statement's optional graph scope.
+	fn record_field(
+		&self,
+		snapshot: Snapshot,
+		record: &RecordId,
+		graph: Option<&GraphRef>,
+		field: &str,
+	) -> FerrosGrynnResult<Value>;
 
 	/// Opens a graph without refreshing the statement snapshot.
 	fn graph<'a>(
@@ -86,151 +110,14 @@ pub(super) trait QueryRead {
 		slots: &[Value],
 		source: &str,
 	) -> FerrosGrynnResult<Value>;
-}
 
-/// Pull cursor that binds the first endpoint of a pattern.
-pub(super) struct SeedCursor<'a, Graph> {
-	/// Upstream rows to extend.
-	input: Box<dyn RowCursor + 'a>,
-	/// Shared snapshot graph view.
-	graph: Rc<Graph>,
-	/// Endpoint constraints and optional alias column.
-	binding: MatchBinding,
-	/// Candidate atom identifiers for an unbound endpoint.
-	ids: Vec<AtomId>,
-	/// Current upstream row.
-	row: Option<Row>,
-	/// Alias-constrained atom, when already bound by another pattern.
-	bound: Option<AtomId>,
-	/// Next candidate position.
-	next_id: usize,
-}
-
-impl<'a, Graph: GraphRead> SeedCursor<'a, Graph> {
-	/// Collects the endpoint domain once and creates a seed cursor.
-	pub(super) fn new(
-		input: Box<dyn RowCursor + 'a>,
-		graph: Rc<Graph>,
-		binding: MatchBinding,
-	) -> FerrosGrynnResult<Self> {
-		let ids = match binding.domain {
-			EndpointDomain::Node => graph.node_ids()?.collect::<FerrosGrynnResult<Vec<_>>>()?,
-			EndpointDomain::Edge => graph.edge_ids()?.collect::<FerrosGrynnResult<Vec<_>>>()?,
-		};
-		Ok(Self {
-			input,
-			graph,
-			binding,
-			ids,
-			row: None,
-			bound: None,
-			next_id: 0,
-		})
-	}
-}
-
-impl<Graph: GraphRead> RowCursor for SeedCursor<'_, Graph> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		loop {
-			if self.row.is_none() {
-				let Some(row) = self.input.next()? else {
-					return Ok(None);
-				};
-				self.bound =
-					self.binding.column.and_then(|column| row.atoms.get(column).copied().flatten());
-				self.row = Some(row);
-				self.next_id = 0;
-			}
-			let candidate = if let Some(bound) = self.bound {
-				(self.next_id == 0).then_some(bound)
-			} else {
-				self.ids.get(self.next_id).copied()
-			};
-			let Some(candidate) = candidate else {
-				self.row = None;
-				continue;
-			};
-			self.next_id += 1;
-			if !atom_matches(self.graph.as_ref(), candidate, &self.binding)? {
-				continue;
-			}
-			let mut row = self.row.as_ref().cloned().ok_or_else(|| {
-				FerrosGrynnError::invalid_argument("MATCH seed lost its input row.")
-			})?;
-			if !bind_atom(&mut row, &self.binding, candidate, self.graph.as_ref())? {
-				continue;
-			}
-			row.current = Some(candidate);
-			return Ok(Some(row));
-		}
-	}
-}
-
-/// Applies endpoint-domain and alternative-label constraints.
-pub(super) fn atom_matches<Graph: GraphRead>(
-	graph: &Graph,
-	atom: AtomId,
-	binding: &MatchBinding,
-) -> FerrosGrynnResult<bool> {
-	if atom.kind()
-		!= Some(match binding.domain {
-			EndpointDomain::Node => AtomKind::Node,
-			EndpointDomain::Edge => AtomKind::Edge,
-		}) {
-		return Ok(false);
-	}
-	if binding.labels.is_empty() {
-		return Ok(true);
-	}
-	match binding.domain {
-		EndpointDomain::Node => {
-			let Some(node) = graph.node(atom)? else {
-				return Ok(false);
-			};
-			let label = node.label_text()?;
-			Ok(label.is_some_and(|label| {
-				binding.labels.iter().any(|candidate| candidate.as_ref() == label.as_str())
-			}))
-		}
-		EndpointDomain::Edge => {
-			let Some(edge) = graph.edge(atom)? else {
-				return Ok(false);
-			};
-			let label = edge.label_text()?;
-			Ok(label.is_some_and(|label| {
-				binding.labels.iter().any(|candidate| candidate.as_ref() == label.as_str())
-			}))
-		}
-	}
-}
-
-/// Binds an atom or checks equality with an existing alias binding.
-pub(super) fn bind_atom<Graph: GraphRead>(
-	row: &mut Row,
-	binding: &MatchBinding,
-	atom: AtomId,
-	graph: &Graph,
-) -> FerrosGrynnResult<bool> {
-	let Some(column) = binding.column else {
-		return Ok(true);
-	};
-	if let Some(existing) = row.atoms.get(column).copied().flatten() {
-		return Ok(existing == atom);
-	}
-	if !matches!(row.values.get(column), Some(Value::None)) {
-		return Ok(false);
-	}
-	let reference = graph.atom_ref(atom)?.ok_or_else(|| {
-		let kind = match atom.kind() {
-			Some(AtomKind::Node) => "node",
-			Some(AtomKind::Edge) => "edge",
-			None => "atom",
-		};
-		FerrosGrynnError::atom_does_not_exist(kind, atom.to_string())
-	})?;
-	row.values[column] = Value::Atom(Box::new(reference));
-	row.atoms[column] = Some(atom);
-	Ok(true)
+	/// Applies one typed graph-membership or graph-incidence mutation.
+	fn execute_graph_dml(
+		&mut self,
+		statement: &LogicalGraphDmlStatement,
+		slots: &[Value],
+		source: &str,
+	) -> FerrosGrynnResult<Value>;
 }
 
 #[derive(Clone)]
@@ -253,7 +140,7 @@ pub(super) struct EdgeExpandCursor<'a, Graph> {
 	/// Shared snapshot graph view.
 	graph: Rc<Graph>,
 	/// Fixed expansion contract.
-	expand: Expand,
+	expand: ResolvedExpand,
 	/// Connector identifiers scanned for each source row.
 	edges: Vec<AtomId>,
 	/// Current upstream row.
@@ -269,7 +156,7 @@ impl<'a, Graph: GraphRead> EdgeExpandCursor<'a, Graph> {
 	pub(super) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		graph: Rc<Graph>,
-		expand: Expand,
+		expand: ResolvedExpand,
 	) -> FerrosGrynnResult<Self> {
 		let edges = graph.edge_ids()?.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		Ok(Self {
@@ -312,7 +199,7 @@ impl<Graph: GraphRead> RowCursor for EdgeExpandCursor<'_, Graph> {
 				&self.edges,
 				source,
 				self.expand.direction,
-				&self.expand.edge.labels,
+				&self.expand.edge,
 			)?;
 			self.next_candidate = 0;
 			self.row = Some(row);
@@ -329,7 +216,7 @@ pub(super) struct IndexExpandCursor<'a, Graph> {
 	/// Shared traversal index.
 	index: Rc<TraversalIndex>,
 	/// Fixed expansion contract.
-	expand: Expand,
+	expand: ResolvedExpand,
 	/// Current upstream row.
 	row: Option<Row>,
 	/// Candidates for the current source endpoint.
@@ -344,7 +231,7 @@ impl<'a, Graph> IndexExpandCursor<'a, Graph> {
 		input: Box<dyn RowCursor + 'a>,
 		graph: Rc<Graph>,
 		index: Rc<TraversalIndex>,
-		expand: Expand,
+		expand: ResolvedExpand,
 	) -> Self {
 		Self {
 			input,
@@ -363,11 +250,7 @@ impl<Graph: GraphRead> RowCursor for IndexExpandCursor<'_, Graph> {
 		loop {
 			if let Some(candidate) = self.candidates.get(self.next_candidate).cloned() {
 				self.next_candidate += 1;
-				if !connector_matches(
-					self.graph.as_ref(),
-					candidate.edge,
-					&self.expand.edge.labels,
-				)? {
+				if !connector_matches(self.graph.as_ref(), candidate.edge, &self.expand.edge)? {
 					continue;
 				}
 				if let Some(row) = expand_row(
@@ -403,7 +286,7 @@ impl<Graph: GraphRead> RowCursor for IndexExpandCursor<'_, Graph> {
 /// Applies bindings and DIFFERENT EDGES checks to one hop.
 pub(super) fn expand_row<Graph: GraphRead>(
 	input: &Row,
-	expand: &Expand,
+	expand: &ResolvedExpand,
 	candidate: &TraversalCandidate,
 	graph: &Graph,
 ) -> FerrosGrynnResult<Option<Row>> {
@@ -430,22 +313,13 @@ pub(super) fn expand_row<Graph: GraphRead>(
 	Ok(Some(row))
 }
 
-/// Applies connector-label alternatives lazily.
+/// Applies the connector class, exact-record, and graph-label predicates.
 pub(super) fn connector_matches<Graph: GraphRead>(
 	graph: &Graph,
 	edge: AtomId,
-	labels: &[Box<str>],
+	binding: &ResolvedMatchBinding,
 ) -> FerrosGrynnResult<bool> {
-	if labels.is_empty() {
-		return Ok(true);
-	}
-	let label = graph
-		.edge(edge)?
-		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", edge.to_string()))?
-		.label_text()?
-		.map(|label| label.into_owned());
-	Ok(label
-		.is_some_and(|label| labels.iter().any(|candidate| candidate.as_ref() == label.as_str())))
+	atom_matches(graph, edge, binding)
 }
 
 /// Finds one-hop candidates by scanning connector edges.
@@ -454,11 +328,11 @@ pub(super) fn edge_candidates<Graph: GraphRead>(
 	edges: &[AtomId],
 	source: AtomId,
 	direction: crate::syn::MatchDirection,
-	labels: &[Box<str>],
+	binding: &ResolvedMatchBinding,
 ) -> FerrosGrynnResult<Vec<TraversalCandidate>> {
 	let mut candidates = Vec::new();
 	for edge_id in edges {
-		if !connector_matches(graph, *edge_id, labels)? {
+		if !connector_matches(graph, *edge_id, binding)? {
 			continue;
 		}
 		let edge = graph
@@ -622,373 +496,30 @@ pub(super) const fn direction_accepts(
 	}
 }
 
-/// Incremental depth-first traversal state for one endpoint.
-pub(super) struct DfsFrame {
-	/// Endpoint represented by this stack frame.
-	endpoint: AtomId,
-	/// Outgoing candidates computed for the endpoint.
-	candidates: Vec<TraversalCandidate>,
-	/// Next outgoing candidate position.
-	next_candidate: usize,
-	/// Whether the path ending at this endpoint was already emitted.
-	yielded: bool,
-}
+mod binding;
+mod path;
+mod pipeline;
 
-/// Bounded TRAIL cursor that retains only its active DFS path.
-pub(super) struct PathExpandCursor<'a, Graph> {
-	/// Upstream rows to extend.
-	input: Box<dyn RowCursor + 'a>,
-	/// Shared snapshot graph view.
-	graph: Rc<Graph>,
-	/// Shared traversal index.
-	index: Rc<TraversalIndex>,
-	/// Variable-length expansion contract.
-	expand: PathExpand,
-	/// Current upstream row.
-	row: Option<Row>,
-	/// Active DFS stack.
-	frames: Vec<DfsFrame>,
-	/// Active connector path aligned below the frame stack.
-	hops: Vec<TraversalCandidate>,
-}
-
-impl<'a, Graph> PathExpandCursor<'a, Graph> {
-	/// Creates an incremental path-expansion cursor.
-	pub(super) fn new(
-		input: Box<dyn RowCursor + 'a>,
-		graph: Rc<Graph>,
-		index: Rc<TraversalIndex>,
-		expand: PathExpand,
-	) -> Self {
-		Self {
-			input,
-			graph,
-			index,
-			expand,
-			row: None,
-			frames: Vec::new(),
-			hops: Vec::new(),
-		}
-	}
-}
-
-impl<Graph: GraphRead> PathExpandCursor<'_, Graph> {
-	/// Initializes traversal state for the next upstream row.
-	fn start_row(&mut self) -> FerrosGrynnResult<bool> {
-		let Some(row) = self.input.next()? else {
-			return Ok(false);
-		};
-		let source = row.current.ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("MATCH path expansion has no source endpoint.")
-		})?;
-		let candidates = index_candidates(
-			self.graph.as_ref(),
-			self.index.as_ref(),
-			source,
-			self.expand.direction,
-		)?;
-		self.frames.clear();
-		self.frames.push(DfsFrame {
-			endpoint: source,
-			candidates,
-			next_candidate: 0,
-			yielded: false,
-		});
-		self.hops.clear();
-		self.row = Some(row);
-		Ok(true)
-	}
-
-	/// Removes the deepest DFS frame and its incoming hop.
-	fn backtrack(&mut self) {
-		self.frames.pop();
-		if self.frames.is_empty() {
-			self.row = None;
-		} else {
-			self.hops.pop();
-		}
-	}
-}
-
-impl<Graph: GraphRead> RowCursor for PathExpandCursor<'_, Graph> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		loop {
-			if self.row.is_none() && !self.start_row()? {
-				return Ok(None);
-			}
-			if self.frames.is_empty() {
-				self.row = None;
-				continue;
-			}
-
-			let depth = self.hops.len();
-			let emit = {
-				let frame = self.frames.last_mut().ok_or_else(|| {
-					FerrosGrynnError::invalid_argument("MATCH DFS stack is empty.")
-				})?;
-				let emit = !frame.yielded
-					&& depth >= self.expand.min as usize
-					&& depth <= self.expand.max as usize;
-				frame.yielded = true;
-				emit
-			};
-			if emit {
-				let endpoint = self.frames.last().map(|frame| frame.endpoint).ok_or_else(|| {
-					FerrosGrynnError::invalid_argument("MATCH DFS stack is empty.")
-				})?;
-				if atom_matches(self.graph.as_ref(), endpoint, &self.expand.target)?
-					&& let Some(row) = path_row(
-						self.row.as_ref().ok_or_else(|| {
-							FerrosGrynnError::invalid_argument("MATCH path lost its input row.")
-						})?,
-						&self.expand,
-						&self.frames,
-						&self.hops,
-						self.graph.as_ref(),
-					)? {
-					return Ok(Some(row));
-				}
-			}
-
-			if depth >= self.expand.max as usize {
-				self.backtrack();
-				continue;
-			}
-			let candidate = {
-				let frame = self.frames.last_mut().ok_or_else(|| {
-					FerrosGrynnError::invalid_argument("MATCH DFS stack is empty.")
-				})?;
-				let candidate = frame.candidates.get(frame.next_candidate).cloned();
-				frame.next_candidate += usize::from(candidate.is_some());
-				candidate
-			};
-			let Some(candidate) = candidate else {
-				self.backtrack();
-				continue;
-			};
-			if candidate.target.kind()
-				!= Some(match self.expand.target.domain {
-					EndpointDomain::Node => AtomKind::Node,
-					EndpointDomain::Edge => AtomKind::Edge,
-				}) || self.row.as_ref().is_some_and(|row| row.used_edges.contains(&candidate.edge))
-				|| self.hops.iter().any(|hop| hop.edge == candidate.edge)
-				|| !connector_matches(
-					self.graph.as_ref(),
-					candidate.edge,
-					&self.expand.edge_labels,
-				)? {
-				continue;
-			}
-			let candidates = index_candidates(
-				self.graph.as_ref(),
-				self.index.as_ref(),
-				candidate.target,
-				self.expand.direction,
-			)?;
-			self.hops.push(candidate.clone());
-			self.frames.push(DfsFrame {
-				endpoint: candidate.target,
-				candidates,
-				next_candidate: 0,
-				yielded: false,
-			});
-		}
-	}
-}
-
-/// Materializes one public path value from the active DFS stack.
-pub(super) fn path_row<Graph: GraphRead>(
-	input: &Row,
-	expand: &PathExpand,
-	frames: &[DfsFrame],
-	hops: &[TraversalCandidate],
-	graph: &Graph,
-) -> FerrosGrynnResult<Option<Row>> {
-	let Some(first) = frames.first().map(|frame| frame.endpoint) else {
-		return Ok(None);
-	};
-	let Some(target) = frames.last().map(|frame| frame.endpoint) else {
-		return Ok(None);
-	};
-	let mut row = input.clone();
-	if !bind_atom(&mut row, &expand.target, target, graph)? {
-		return Ok(None);
-	}
-	let first_ref = graph
-		.atom_ref(first)?
-		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("atom", first.to_string()))?;
-	let mut steps = Vec::with_capacity(hops.len() + 1);
-	steps.push(PathStep::new(first_ref, None, PathDirection::Forward, EndpointRole::Source));
-	for hop in hops {
-		let atom = graph
-			.atom_ref(hop.target)?
-			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("atom", hop.target.to_string()))?;
-		let edge = graph
-			.atom_ref(hop.edge)?
-			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", hop.edge.to_string()))?;
-		steps.push(PathStep::new(atom, Some(edge), hop.direction, hop.role));
-	}
-	let path = Value::Path(Box::new(Path::new(graph.identity(), graph.snapshot_id(), steps, None)));
-	if let Some(column) = expand.path_column {
-		match row.values.get(column) {
-			Some(Value::None) => row.values[column] = path,
-			Some(existing) if existing == &path => {}
-			_ => return Ok(None),
-		}
-	}
-	for hop in hops {
-		if !row.used_edges.contains(&hop.edge) {
-			row.used_edges.push(hop.edge);
-		}
-	}
-	row.current = Some(target);
-	Ok(Some(row))
-}
-
-pub(super) struct ScanCursor<'a> {
-	pub(super) inner: Box<dyn RowCursor + 'a>,
-}
-
-impl RowCursor for ScanCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		self.inner.next()
-	}
-}
-
-pub(super) struct OneRowCursor {
-	pub(super) row: Option<Row>,
-}
-
-impl RowCursor for OneRowCursor {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		Ok(self.row.take())
-	}
-}
-
-/// Resolves public fields for an atom bound in a MATCH row.
-pub(super) trait AtomFieldRead {
-	/// Reads `id`, `label`, or a dictionary-backed property.
-	fn field(&self, atom: AtomId, field: &str) -> FerrosGrynnResult<Value>;
-}
-
-/// Atom field resolver sharing the current graph and property dictionary.
-pub(super) struct GraphFields<Graph> {
-	/// Snapshot graph view.
-	pub(super) graph: Rc<Graph>,
-	/// Snapshot property dictionary.
-	pub(super) dictionary: Arc<PropertyDictionary>,
-}
-
-impl<Graph: GraphRead> AtomFieldRead for GraphFields<Graph> {
-	fn field(&self, atom: AtomId, field: &str) -> FerrosGrynnResult<Value> {
-		match atom.kind() {
-			Some(AtomKind::Node) => {
-				let node = self.graph.node(atom)?.ok_or_else(|| {
-					FerrosGrynnError::atom_does_not_exist("node", atom.to_string())
-				})?;
-				match field {
-					"id" => Ok(Value::Record(Box::new(node.record_id()?.into_owned()))),
-					"label" => Ok(node
-						.label_text()?
-						.map(|label| Value::String(label.into_owned()))
-						.unwrap_or(Value::None)),
-					_ => {
-						let Some(key) = self.dictionary.get(field) else {
-							return Ok(Value::None);
-						};
-						Ok(node.properties()?.get(key).cloned().unwrap_or(Value::None))
-					}
-				}
-			}
-			Some(AtomKind::Edge) => {
-				let edge = self.graph.edge(atom)?.ok_or_else(|| {
-					FerrosGrynnError::atom_does_not_exist("edge", atom.to_string())
-				})?;
-				match field {
-					"id" => Ok(Value::Record(Box::new(edge.record_id()?.into_owned()))),
-					"label" => Ok(edge
-						.label_text()?
-						.map(|label| Value::String(label.into_owned()))
-						.unwrap_or(Value::None)),
-					_ => {
-						let Some(key) = self.dictionary.get(field) else {
-							return Ok(Value::None);
-						};
-						Ok(edge.properties()?.get(key).cloned().unwrap_or(Value::None))
-					}
-				}
-			}
-			None => Err(FerrosGrynnError::atom_does_not_exist("atom", atom.to_string())),
-		}
-	}
-}
-
-pub(super) struct FilterCursor<'a> {
-	pub(super) input: Box<dyn RowCursor + 'a>,
-	pub(super) predicate: &'a TypedExpr,
-	pub(super) slots: &'a [Value],
-	pub(super) source: &'a str,
-	/// Optional MATCH atom-field resolver.
-	pub(super) fields: Option<&'a dyn AtomFieldRead>,
-}
-
-impl RowCursor for FilterCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		while let Some(row) = self.input.next()? {
-			if eval(self.predicate, Some(&row), self.slots, self.source, self.fields)?.is_truthy() {
-				return Ok(Some(row));
-			}
-		}
-		Ok(None)
-	}
-}
-
-pub(super) struct ProjectCursor<'a> {
-	pub(super) input: Box<dyn RowCursor + 'a>,
-	pub(super) expressions: &'a [TypedExpr],
-	pub(super) slots: &'a [Value],
-	pub(super) source: &'a str,
-	/// Optional MATCH atom-field resolver.
-	pub(super) fields: Option<&'a dyn AtomFieldRead>,
-}
-
-impl RowCursor for ProjectCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		let Some(row) = self.input.next()? else {
-			return Ok(None);
-		};
-		let values = self
-			.expressions
-			.iter()
-			.map(|expression| eval(expression, Some(&row), self.slots, self.source, self.fields))
-			.collect::<FerrosGrynnResult<Vec<_>>>()?;
-		Ok(Some(Row::new(values)))
-	}
-}
-
-pub(super) struct LimitCursor<'a> {
-	pub(super) input: Box<dyn RowCursor + 'a>,
-	pub(super) remaining: Option<usize>,
-	pub(super) skip: usize,
-}
-
-impl RowCursor for LimitCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		while self.skip > 0 {
-			if self.input.next()?.is_none() {
-				return Ok(None);
-			}
-			self.skip -= 1;
-		}
-		if self.remaining == Some(0) {
-			return Ok(None);
-		}
-		let row = self.input.next()?;
-		if row.is_some()
-			&& let Some(remaining) = &mut self.remaining
-		{
-			*remaining -= 1;
-		}
-		Ok(row)
-	}
-}
+pub(super) use binding::{
+	ResolvedExpand,
+	ResolvedMatchBinding,
+	ResolvedMatchSelector,
+	ResolvedPathExpand,
+	SeedCursor,
+	atom_matches,
+	bind_atom,
+	resolve_expand,
+	resolve_match_binding,
+	resolve_path_expand,
+};
+pub(super) use path::PathExpandCursor;
+pub(super) use pipeline::{
+	AtomFieldRead,
+	FilterCursor,
+	GraphFields,
+	LimitCursor,
+	OneRowCursor,
+	ProjectCursor,
+	RecordFields,
+	ScanCursor,
+};

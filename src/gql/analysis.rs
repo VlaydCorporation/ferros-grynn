@@ -12,11 +12,15 @@ use super::ir::{
 	LogicalDmlStatement,
 	LogicalDmlTarget,
 	LogicalExpect,
+	LogicalGraphDmlStatement,
 	LogicalMatch,
 	LogicalMatchPattern,
+	LogicalMatchSelector,
 	LogicalNode,
 	LogicalNodeKind,
 	LogicalProgram,
+	LogicalRecordTarget,
+	LogicalRelateEdge,
 	LogicalSchemaStatement,
 	LogicalSelect,
 	LogicalStatement,
@@ -29,16 +33,18 @@ use super::ir::{
 	TypedExprKind,
 };
 use crate::{
-	datastore::{TableIndexKind, TableKind, TableSchemaMode},
+	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope},
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, TextSpan},
 	syn::{
 		AlterTarget,
 		BasicIndexDefinition,
 		BinaryOperator,
+		ClassKindName,
+		ClassSchemaModeName,
+		DefineClassStatement,
 		DefineFieldStatement,
 		DefineGraphStatement,
 		DefineIndexStatement,
-		DefineTableStatement,
 		DmlData,
 		DmlReturn,
 		DmlReturnItem,
@@ -46,11 +52,13 @@ use crate::{
 		ExpectClause,
 		Expr,
 		ExprKind,
+		IndexScopeName,
 		InfoTarget,
 		Literal,
 		MatchEndpoint,
 		MatchEndpointKind,
 		MatchPattern,
+		MatchSelector,
 		MatchStatement,
 		Program,
 		RecordKey,
@@ -58,20 +66,30 @@ use crate::{
 		SelectItem,
 		SelectTarget,
 		StatementKind,
-		TableKindName,
-		TableSchemaModeName,
 		TypeName,
 		UnaryOperator,
 	},
-	values::{AtomKind, GraphKind, GraphRef, Number, Object, RecordId, RecordIdPart, Type, Value},
+	values::{
+		AtomKind,
+		GraphKind,
+		GraphRef,
+		Number,
+		Object,
+		RecordId,
+		RecordIdPart,
+		Text,
+		Type,
+		Value,
+	},
 };
 
 /// Maximum finite path depth accepted by the MVP analyzer.
 const MAX_MATCH_PATH_DEPTH: u32 = 30;
 
 pub(super) trait QueryCatalog {
-	fn schema(&self, table: &str) -> FerrosGrynnResult<Schema>;
-	fn schema_mode(&self, table: &str) -> FerrosGrynnResult<TableSchemaMode>;
+	fn schema(&self, class: &str) -> FerrosGrynnResult<Schema>;
+	fn schema_mode(&self, class: &str) -> FerrosGrynnResult<ClassSchemaMode>;
+	fn class_kind(&self, class: &str) -> FerrosGrynnResult<AtomKind>;
 	/// Resolves a case-sensitive named graph.
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef>;
 }
@@ -140,34 +158,61 @@ impl<'a> Analyzer<'a> {
 		let mut statements = Vec::with_capacity(program.statements.len());
 		for statement in &program.statements {
 			match &statement.kind {
+				StatementKind::Attach(statement) => {
+					if self.catalog.class_kind(statement.record.class().value.as_ref())?
+						!= AtomKind::Node
+					{
+						return Err(self.semantic(
+							"ATTACH requires a NODE class; edge occurrences are created by RELATE.",
+							statement.record.class().span,
+						));
+					}
+					statements.push(LogicalStatement::GraphDml(LogicalGraphDmlStatement::Attach {
+						record: self.record_target(&statement.record)?,
+						graph: self.catalog.graph(&statement.graph.value)?,
+						label: statement
+							.label
+							.as_ref()
+							.map(|label| Text::from(label.value.as_ref())),
+					}));
+				}
 				StatementKind::Create(statement) => {
 					statements.push(LogicalStatement::Dml(self.dml(
 						LogicalDmlKind::Create,
 						&statement.targets,
+						None,
+						None,
 						statement.data.as_ref(),
 						None,
 						statement.returning.as_ref(),
 						statement.expect.as_ref(),
+						false,
 					)?));
 				}
 				StatementKind::Update(statement) => {
 					statements.push(LogicalStatement::Dml(self.dml(
 						LogicalDmlKind::Update,
 						&statement.targets,
+						statement.graph.as_ref(),
+						statement.label.as_ref(),
 						statement.data.as_ref(),
 						statement.filter.as_ref(),
 						statement.returning.as_ref(),
 						statement.expect.as_ref(),
+						false,
 					)?));
 				}
 				StatementKind::Upsert(statement) => {
 					statements.push(LogicalStatement::Dml(self.dml(
 						LogicalDmlKind::Upsert,
 						&statement.targets,
+						None,
+						None,
 						statement.data.as_ref(),
 						statement.filter.as_ref(),
 						statement.returning.as_ref(),
 						statement.expect.as_ref(),
+						false,
 					)?));
 				}
 				StatementKind::Delete(statement) => {
@@ -175,24 +220,34 @@ impl<'a> Analyzer<'a> {
 						LogicalDmlKind::Delete,
 						&statement.targets,
 						None,
+						None,
+						None,
 						statement.filter.as_ref(),
 						statement.returning.as_ref(),
 						statement.expect.as_ref(),
+						statement.cascade,
 					)?));
+				}
+				StatementKind::Detach(statement) => {
+					statements.push(LogicalStatement::GraphDml(LogicalGraphDmlStatement::Detach {
+						record: self.record_target(&statement.record)?,
+						graph: self.catalog.graph(&statement.graph.value)?,
+						cascade: statement.cascade,
+					}));
 				}
 				StatementKind::DefineGraph(definition) => {
 					statements.push(LogicalStatement::Schema(
 						self.define_graph(definition, statement.span)?,
 					));
 				}
-				StatementKind::DefineTable(definition) => {
-					statements.push(LogicalStatement::Schema(Self::define_table(definition)));
+				StatementKind::DefineClass(definition) => {
+					statements.push(LogicalStatement::Schema(Self::define_class(definition)));
 				}
 				StatementKind::DefineField(definition) => {
 					statements.push(LogicalStatement::Schema(self.define_field(definition)?));
 				}
 				StatementKind::DefineIndex(definition) => {
-					statements.push(LogicalStatement::Schema(Self::define_index(definition)));
+					statements.push(LogicalStatement::Schema(self.define_index(definition)?));
 				}
 				StatementKind::Remove(statement) => {
 					statements.push(LogicalStatement::Schema(Self::remove(&statement.target)));
@@ -225,6 +280,9 @@ impl<'a> Analyzer<'a> {
 						value: self.expr(&statement.value, None)?,
 					});
 				}
+				StatementKind::Relate(statement) => {
+					statements.push(LogicalStatement::GraphDml(self.relate(statement)?));
+				}
 				StatementKind::Match(statement) => {
 					statements.push(LogicalStatement::Match(self.match_statement(statement)?));
 				}
@@ -240,23 +298,127 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	fn record_target(&self, target: &DmlTarget) -> FerrosGrynnResult<LogicalRecordTarget> {
+		let DmlTarget::Record {
+			class,
+			key,
+			..
+		} = target
+		else {
+			return Err(self.semantic(
+				"Graph DML requires an exact class-qualified RecordId.",
+				target.class().span,
+			));
+		};
+		Ok(LogicalRecordTarget {
+			class: class.value.clone(),
+			key: self.expr(key, None)?,
+		})
+	}
+
+	fn relate(
+		&self,
+		statement: &crate::syn::RelateStatement,
+	) -> FerrosGrynnResult<LogicalGraphDmlStatement> {
+		for endpoint in [&statement.source, &statement.target] {
+			let kind = self.catalog.class_kind(endpoint.class().value.as_ref())?;
+			if !statement.atom_endpoints && kind != AtomKind::Node {
+				return Err(self.semantic(
+					"RELATE endpoints require NODE classes unless `RELATE ATOM` is used.",
+					endpoint.class().span,
+				));
+			}
+		}
+		if self.catalog.class_kind(statement.edge.class().value.as_ref())? != AtomKind::Edge {
+			return Err(
+				self.semantic("RELATE edge requires an EDGE class.", statement.edge.class().span)
+			);
+		}
+		let source = self.record_target(&statement.source)?;
+		let target = self.record_target(&statement.target)?;
+		let class = statement.edge.class().value.clone();
+		let mut schema = self.catalog.schema(&class)?;
+		let mode = self.catalog.schema_mode(&class)?;
+		self.extend_dml_schema(
+			&mut schema,
+			mode,
+			statement.data.as_ref(),
+			None,
+			statement.returning.as_ref(),
+			statement.expect.as_ref(),
+		)?;
+		let key = match &statement.edge {
+			DmlTarget::Class(_) => None,
+			DmlTarget::Record {
+				key,
+				..
+			} => Some(self.expr(key, None)?),
+			DmlTarget::Range {
+				..
+			} => {
+				return Err(self.semantic(
+					"RELATE edge does not accept a record generator.",
+					statement.edge.class().span,
+				));
+			}
+		};
+		let weight = statement.weight.as_ref().map(|weight| self.expr(weight, None)).transpose()?;
+		if let Some(weight) = &weight
+			&& !compatible(&Type::Number, &weight.ty)
+		{
+			return Err(self.semantic("RELATE WEIGHTED requires a number.", weight.span));
+		}
+		Ok(LogicalGraphDmlStatement::Relate {
+			atom_endpoints: statement.atom_endpoints,
+			source,
+			edge: LogicalRelateEdge {
+				class,
+				key,
+				schema: schema.clone(),
+				data: statement
+					.data
+					.as_ref()
+					.map(|data| self.dml_data(data, &schema))
+					.transpose()?,
+				returning: self.dml_return(
+					statement.returning.as_ref(),
+					LogicalDmlKind::Create,
+					&schema,
+				)?,
+				expect: statement
+					.expect
+					.as_ref()
+					.map(|expect| self.expect(expect, &schema))
+					.transpose()?,
+			},
+			target,
+			graph: self.catalog.graph(&statement.graph.value)?,
+			label: statement.label.as_ref().map(|label| Text::from(label.value.as_ref())),
+			direction: statement.direction,
+			weight,
+		})
+	}
+
 	fn dml(
 		&self,
 		kind: LogicalDmlKind,
 		targets: &[DmlTarget],
+		graph: Option<&crate::syn::Identifier>,
+		label: Option<&Option<crate::syn::Identifier>>,
 		data: Option<&DmlData>,
 		filter: Option<&Expr>,
 		returning: Option<&DmlReturn>,
 		expect: Option<&ExpectClause>,
+		cascade: bool,
 	) -> FerrosGrynnResult<LogicalDmlStatement> {
 		let mut plans = Vec::with_capacity(targets.len());
 		for target in targets {
-			let table = target.table().value.clone();
-			let mut schema = self.catalog.schema(&table)?;
-			let mode = self.catalog.schema_mode(&table)?;
+			let class = target.class().value.clone();
+			let mut schema = self.catalog.schema(&class)?;
+			let mode = self.catalog.schema_mode(&class)?;
 			self.extend_dml_schema(&mut schema, mode, data, filter, returning, expect)?;
 			let selector = match target {
-				DmlTarget::Table(_) => LogicalDmlSelector::Table,
+				DmlTarget::Class(_) => LogicalDmlSelector::Class,
 				DmlTarget::Record {
 					key,
 					..
@@ -271,7 +433,7 @@ impl<'a> Analyzer<'a> {
 			let returning = self.dml_return(returning, kind, &schema)?;
 			let expect = expect.map(|expect| self.expect(expect, &schema)).transpose()?;
 			plans.push(LogicalDmlTarget {
-				table,
+				class,
 				selector,
 				schema,
 				data,
@@ -282,6 +444,9 @@ impl<'a> Analyzer<'a> {
 		}
 		Ok(LogicalDmlStatement {
 			kind,
+			graph: graph.map(|graph| self.catalog.graph(&graph.value)).transpose()?,
+			label: label.map(|label| label.as_ref().map(|label| Text::from(label.value.as_ref()))),
+			cascade,
 			targets: plans,
 		})
 	}
@@ -289,7 +454,7 @@ impl<'a> Analyzer<'a> {
 	fn extend_dml_schema(
 		&self,
 		schema: &mut Schema,
-		mode: TableSchemaMode,
+		mode: ClassSchemaMode,
 		data: Option<&DmlData>,
 		filter: Option<&Expr>,
 		returning: Option<&DmlReturn>,
@@ -310,7 +475,7 @@ impl<'a> Analyzer<'a> {
 						collect_expr_names(&assignment.value, &mut names);
 					}
 				}
-				DmlData::Unset(fields) => {
+				DmlData::Unset(fields) | DmlData::Reset(fields) => {
 					for field in fields {
 						names.entry(field.value.clone()).or_insert(field.span);
 					}
@@ -340,7 +505,7 @@ impl<'a> Analyzer<'a> {
 			if schema.index_of(&name).is_some() {
 				continue;
 			}
-			if mode == TableSchemaMode::Schemafull {
+			if mode == ClassSchemaMode::Schemafull {
 				return Err(self.semantic(&format!("Unknown field `{name}`."), span));
 			}
 			schema.columns.push(Column {
@@ -396,6 +561,14 @@ impl<'a> Analyzer<'a> {
 					return Err(self.semantic("The implicit `id` field is read-only.", field.span));
 				}
 				Ok(LogicalDmlData::Unset(fields.iter().map(|field| field.value.clone()).collect()))
+			}
+			DmlData::Reset(fields) => {
+				if let Some(field) =
+					fields.iter().find(|field| field.value.eq_ignore_ascii_case("id"))
+				{
+					return Err(self.semantic("The implicit `id` field is read-only.", field.span));
+				}
+				Ok(LogicalDmlData::Reset(fields.iter().map(|field| field.value.clone()).collect()))
 			}
 		}
 	}
@@ -479,12 +652,12 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
-	fn define_table(definition: &DefineTableStatement) -> LogicalSchemaStatement {
-		LogicalSchemaStatement::DefineTable {
+	fn define_class(definition: &DefineClassStatement) -> LogicalSchemaStatement {
+		LogicalSchemaStatement::DefineClass {
 			mode: definition.mode,
 			name: definition.name.value.clone(),
-			kind: table_kind(definition.kind),
-			schema_mode: table_schema_mode(definition.schema_mode),
+			kind: class_kind(definition.kind),
+			schema_mode: class_schema_mode(definition.schema_mode),
 		}
 	}
 
@@ -494,7 +667,7 @@ impl<'a> Analyzer<'a> {
 	) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		Ok(LogicalSchemaStatement::DefineField {
 			mode: definition.mode,
-			table: definition.table.value.clone(),
+			class: definition.class.value.clone(),
 			name: definition.name.value.clone(),
 			value_type: definition
 				.value_type
@@ -503,23 +676,35 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
-	fn define_index(definition: &DefineIndexStatement) -> LogicalSchemaStatement {
+	fn define_index(
+		&self,
+		definition: &DefineIndexStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		let (kind, fields) = match &definition.definition {
 			BasicIndexDefinition::Standard(fields) => {
-				(TableIndexKind::Standard, fields.iter().map(|field| field.value.clone()).collect())
+				(ClassIndexKind::Standard, fields.iter().map(|field| field.value.clone()).collect())
 			}
 			BasicIndexDefinition::Unique(fields) => {
-				(TableIndexKind::Unique, fields.iter().map(|field| field.value.clone()).collect())
+				(ClassIndexKind::Unique, fields.iter().map(|field| field.value.clone()).collect())
 			}
-			BasicIndexDefinition::Count => (TableIndexKind::Count, Vec::new()),
+			BasicIndexDefinition::Count => (ClassIndexKind::Count, Vec::new()),
 		};
-		LogicalSchemaStatement::DefineIndex {
+		let scope = match &definition.scope {
+			IndexScopeName::Base => IndexScope::Base,
+			IndexScopeName::Effective {
+				graph,
+			} => IndexScope::Effective {
+				graph: self.catalog.graph(&graph.value)?.id(),
+			},
+		};
+		Ok(LogicalSchemaStatement::DefineIndex {
 			mode: definition.mode,
-			table: definition.table.value.clone(),
+			class: definition.class.value.clone(),
 			name: definition.name.value.clone(),
 			kind,
 			fields,
-		}
+			scope,
+		})
 	}
 
 	fn remove(target: &RemoveTarget) -> LogicalSchemaStatement {
@@ -531,29 +716,29 @@ impl<'a> Analyzer<'a> {
 				if_exists: *if_exists,
 				name: name.value.clone(),
 			},
-			RemoveTarget::Table {
+			RemoveTarget::Class {
 				if_exists,
 				name,
-			} => LogicalSchemaStatement::RemoveTable {
+			} => LogicalSchemaStatement::RemoveClass {
 				if_exists: *if_exists,
 				name: name.value.clone(),
 			},
 			RemoveTarget::Field {
 				if_exists,
 				name,
-				table,
+				class,
 			} => LogicalSchemaStatement::RemoveField {
 				if_exists: *if_exists,
-				table: table.value.clone(),
+				class: class.value.clone(),
 				name: name.value.clone(),
 			},
 			RemoveTarget::Index {
 				if_exists,
 				name,
-				table,
+				class,
 			} => LogicalSchemaStatement::RemoveIndex {
 				if_exists: *if_exists,
-				table: table.value.clone(),
+				class: class.value.clone(),
 				name: name.value.clone(),
 			},
 		}
@@ -561,23 +746,23 @@ impl<'a> Analyzer<'a> {
 
 	fn alter(&self, target: &AlterTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
-			AlterTarget::Table {
+			AlterTarget::Class {
 				if_exists,
 				name,
 				schema_mode,
-			} => Ok(LogicalSchemaStatement::AlterTableMode {
+			} => Ok(LogicalSchemaStatement::AlterClassMode {
 				if_exists: *if_exists,
 				name: name.value.clone(),
-				mode: table_schema_mode(*schema_mode),
+				mode: class_schema_mode(*schema_mode),
 			}),
 			AlterTarget::Field {
 				if_exists,
 				name,
-				table,
+				class,
 				value_type,
 			} => Ok(LogicalSchemaStatement::AlterFieldType {
 				if_exists: *if_exists,
-				table: table.value.clone(),
+				class: class.value.clone(),
 				name: name.value.clone(),
 				value_type: value_type
 					.as_ref()
@@ -585,9 +770,9 @@ impl<'a> Analyzer<'a> {
 			}),
 			AlterTarget::IndexPrepareRemove {
 				name,
-				table,
+				class,
 			} => Ok(LogicalSchemaStatement::PrepareIndexRemoval {
-				table: table.value.clone(),
+				class: class.value.clone(),
 				name: name.value.clone(),
 			}),
 		}
@@ -596,14 +781,14 @@ impl<'a> Analyzer<'a> {
 	fn info(target: &InfoTarget) -> LogicalSchemaStatement {
 		match target {
 			InfoTarget::Database => LogicalSchemaStatement::InfoDatabase,
-			InfoTarget::Table(name) => LogicalSchemaStatement::InfoTable {
+			InfoTarget::Class(name) => LogicalSchemaStatement::InfoClass {
 				name: name.value.clone(),
 			},
 			InfoTarget::Index {
 				name,
-				table,
+				class,
 			} => LogicalSchemaStatement::InfoIndex {
-				table: table.value.clone(),
+				class: class.value.clone(),
 				name: name.value.clone(),
 			},
 		}
@@ -690,6 +875,14 @@ impl<'a> Analyzer<'a> {
 		let mut ops = Vec::with_capacity(pattern.steps.len());
 		for step in &pattern.steps {
 			let target = self.match_endpoint(&step.target, aliases, bindings)?;
+			let edge = self.match_binding(
+				&step.edge.selector,
+				step.edge.alias.as_ref(),
+				step.edge.label.as_ref(),
+				EndpointDomain::Edge,
+				aliases,
+				bindings,
+			)?;
 			if let Some(length) = step.edge.length {
 				if let Some(alias) = &step.edge.alias {
 					return Err(self.semantic(
@@ -712,21 +905,14 @@ impl<'a> Analyzer<'a> {
 				}
 				ops.push(MatchOp::PathExpand(PathExpand {
 					source: source.clone(),
+					edge,
 					target: target.clone(),
-					edge_labels: step.edge.labels.iter().map(|label| label.value.clone()).collect(),
 					direction: step.direction,
 					min: length.min,
 					max: length.max,
 					path_column,
 				}));
 			} else {
-				let edge = self.match_binding(
-					step.edge.alias.as_ref(),
-					&step.edge.labels,
-					EndpointDomain::Edge,
-					aliases,
-					bindings,
-				)?;
 				ops.push(MatchOp::Expand(Expand {
 					source: source.clone(),
 					edge,
@@ -754,14 +940,22 @@ impl<'a> Analyzer<'a> {
 			MatchEndpointKind::Node => EndpointDomain::Node,
 			MatchEndpointKind::Edge => EndpointDomain::Edge,
 		};
-		self.match_binding(endpoint.alias.as_ref(), &endpoint.labels, domain, aliases, bindings)
+		self.match_binding(
+			&endpoint.selector,
+			endpoint.alias.as_ref(),
+			endpoint.label.as_ref(),
+			domain,
+			aliases,
+			bindings,
+		)
 	}
 
 	/// Builds a binding and registers its alias when present.
 	fn match_binding(
 		&self,
+		selector: &MatchSelector,
 		alias: Option<&crate::syn::Identifier>,
-		labels: &[crate::syn::Identifier],
+		label: Option<&crate::syn::Identifier>,
 		domain: EndpointDomain,
 		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
 		bindings: &mut Schema,
@@ -783,8 +977,51 @@ impl<'a> Analyzer<'a> {
 			.transpose()?;
 		Ok(MatchBinding {
 			domain,
+			selector: self.match_selector(selector, domain)?,
 			column,
-			labels: labels.iter().map(|label| label.value.clone()).collect(),
+			label: label.map(|label| label.value.clone()),
+		})
+	}
+
+	/// Resolves one MATCH selector and validates its class against the
+	/// delimiter domain.
+	fn match_selector(
+		&self,
+		selector: &MatchSelector,
+		domain: EndpointDomain,
+	) -> FerrosGrynnResult<LogicalMatchSelector> {
+		let (class, span) = match selector {
+			MatchSelector::Any(_) => return Ok(LogicalMatchSelector::Any),
+			MatchSelector::Class(class)
+			| MatchSelector::Record {
+				class,
+				..
+			} => (class, class.span),
+		};
+		let expected = match domain {
+			EndpointDomain::Node => AtomKind::Node,
+			EndpointDomain::Edge => AtomKind::Edge,
+		};
+		if self.catalog.class_kind(class.value.as_ref())? != expected {
+			return Err(self.semantic(
+				match domain {
+					EndpointDomain::Node => "A node pattern requires a NODE class.",
+					EndpointDomain::Edge => "An edge pattern requires an EDGE class.",
+				},
+				span,
+			));
+		}
+		Ok(match selector {
+			MatchSelector::Any(_) => LogicalMatchSelector::Any,
+			MatchSelector::Class(class) => LogicalMatchSelector::Class(class.value.clone()),
+			MatchSelector::Record {
+				class,
+				key,
+				..
+			} => LogicalMatchSelector::Record(LogicalRecordTarget {
+				class: class.value.clone(),
+				key: self.expr(key, None)?,
+			}),
 		})
 	}
 
@@ -829,10 +1066,15 @@ impl<'a> Analyzer<'a> {
 		span: TextSpan,
 	) -> FerrosGrynnResult<LogicalSelect> {
 		let target = self.scan_target(&statement.target)?;
-		let scan_schema = self.catalog.schema(target.table())?;
+		let scan_schema = self.catalog.schema(target.class())?;
 		let mut plan = LogicalSelect {
 			nodes: Vec::new(),
 			root: super::ir::NodeId(0),
+			graph: statement
+				.graph
+				.as_ref()
+				.map(|graph| self.catalog.graph(&graph.value))
+				.transpose()?,
 			value: statement.value,
 			only: statement.only,
 		};
@@ -1145,9 +1387,9 @@ impl<'a> Analyzer<'a> {
 
 	fn scan_target(&self, target: &SelectTarget) -> FerrosGrynnResult<ScanTarget> {
 		match target {
-			SelectTarget::Table(table) => Ok(ScanTarget::Table(table.value.clone())),
+			SelectTarget::Class(class) => Ok(ScanTarget::Class(class.value.clone())),
 			SelectTarget::Record {
-				table,
+				class,
 				key,
 				span,
 			} => {
@@ -1159,7 +1401,7 @@ impl<'a> Analyzer<'a> {
 					}
 					RecordKey::String(value, _) => RecordIdPart::String(value.as_ref().into()),
 				};
-				RecordId::new(table.value.as_ref(), key).map(ScanTarget::Record).map_err(|error| {
+				RecordId::new(class.value.as_ref(), key).map(ScanTarget::Record).map_err(|error| {
 					self.locate(error.with_phase(ExecutionPhase::SemanticAnalysis), *span)
 				})
 			}
@@ -1283,18 +1525,17 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 	}
 }
 
-const fn table_kind(kind: TableKindName) -> TableKind {
+const fn class_kind(kind: ClassKindName) -> AtomKind {
 	match kind {
-		TableKindName::Any => TableKind::Any,
-		TableKindName::Normal => TableKind::Normal,
-		TableKindName::Relation => TableKind::Relation,
+		ClassKindName::Node => AtomKind::Node,
+		ClassKindName::Edge => AtomKind::Edge,
 	}
 }
 
-const fn table_schema_mode(mode: TableSchemaModeName) -> TableSchemaMode {
+const fn class_schema_mode(mode: ClassSchemaModeName) -> ClassSchemaMode {
 	match mode {
-		TableSchemaModeName::Schemaless => TableSchemaMode::Schemaless,
-		TableSchemaModeName::Schemafull => TableSchemaMode::Schemafull,
+		ClassSchemaModeName::Schemaless => ClassSchemaMode::Schemaless,
+		ClassSchemaModeName::Schemafull => ClassSchemaMode::Schemafull,
 	}
 }
 

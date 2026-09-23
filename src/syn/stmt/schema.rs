@@ -14,19 +14,18 @@ pub enum DefinitionMode {
 	Overwrite,
 }
 
-/// Parsed table applicability before semantic lowering.
+/// Parsed atom kind before semantic lowering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum TableKindName {
-	Any,
-	Normal,
-	Relation,
+pub enum ClassKindName {
+	Node,
+	Edge,
 }
 
-/// Parsed table schema-validation mode.
+/// Parsed class schema-validation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum TableSchemaModeName {
+pub enum ClassSchemaModeName {
 	Schemaless,
 	Schemafull,
 }
@@ -41,14 +40,14 @@ pub struct DefineGraphStatement {
 	pub constraints: Vec<Identifier>,
 }
 
-/// Core `DEFINE TABLE` syntax.
+/// Core `DEFINE CLASS` syntax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct DefineTableStatement {
+pub struct DefineClassStatement {
 	pub mode: DefinitionMode,
 	pub name: Identifier,
-	pub kind: TableKindName,
-	pub schema_mode: TableSchemaModeName,
+	pub kind: ClassKindName,
+	pub schema_mode: ClassSchemaModeName,
 }
 
 /// Core `DEFINE FIELD` syntax.
@@ -57,11 +56,11 @@ pub struct DefineTableStatement {
 pub struct DefineFieldStatement {
 	pub mode: DefinitionMode,
 	pub name: Identifier,
-	pub table: Identifier,
+	pub class: Identifier,
 	pub value_type: Option<TypeName>,
 }
 
-/// Basic table-index kind accepted by stage 8.
+/// Basic class-index kind accepted by stage 8.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BasicIndexDefinition {
@@ -70,14 +69,25 @@ pub enum BasicIndexDefinition {
 	Count,
 }
 
+/// Explicit logical scope of a class index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IndexScopeName {
+	Base,
+	Effective {
+		graph: Identifier,
+	},
+}
+
 /// Core `DEFINE INDEX` syntax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DefineIndexStatement {
 	pub mode: DefinitionMode,
 	pub name: Identifier,
-	pub table: Identifier,
+	pub class: Identifier,
 	pub definition: BasicIndexDefinition,
+	pub scope: IndexScopeName,
 }
 
 /// Core schema object accepted by `REMOVE`.
@@ -88,19 +98,19 @@ pub enum RemoveTarget {
 		if_exists: bool,
 		name: Identifier,
 	},
-	Table {
+	Class {
 		if_exists: bool,
 		name: Identifier,
 	},
 	Field {
 		if_exists: bool,
 		name: Identifier,
-		table: Identifier,
+		class: Identifier,
 	},
 	Index {
 		if_exists: bool,
 		name: Identifier,
-		table: Identifier,
+		class: Identifier,
 	},
 }
 
@@ -115,20 +125,20 @@ pub struct RemoveStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AlterTarget {
-	Table {
+	Class {
 		if_exists: bool,
 		name: Identifier,
-		schema_mode: TableSchemaModeName,
+		schema_mode: ClassSchemaModeName,
 	},
 	Field {
 		if_exists: bool,
 		name: Identifier,
-		table: Identifier,
+		class: Identifier,
 		value_type: Option<TypeName>,
 	},
 	IndexPrepareRemove {
 		name: Identifier,
-		table: Identifier,
+		class: Identifier,
 	},
 }
 
@@ -144,10 +154,10 @@ pub struct AlterStatement {
 #[non_exhaustive]
 pub enum InfoTarget {
 	Database,
-	Table(Identifier),
+	Class(Identifier),
 	Index {
 		name: Identifier,
-		table: Identifier,
+		class: Identifier,
 	},
 }
 
@@ -195,28 +205,28 @@ impl Parser<'_> {
 		})
 	}
 
-	pub(in crate::syn) fn define_table_statement(
+	pub(in crate::syn) fn define_class_statement(
 		&mut self,
-	) -> FerrosGrynnResult<DefineTableStatement> {
+	) -> FerrosGrynnResult<DefineClassStatement> {
 		let mode = self.definition_mode()?;
 		let name = self.identifier()?;
-		let mut kind = TableKindName::Any;
-		let mut schema_mode = TableSchemaModeName::Schemaless;
+		self.expect_keyword(
+			keywords::TYPE,
+			"Expected `TYPE NODE` or `TYPE EDGE` after class name.",
+		)?;
+		let kind = if self.consume_keyword(keywords::NODE).is_some() {
+			ClassKindName::Node
+		} else if self.consume_keyword(keywords::EDGE).is_some() {
+			ClassKindName::Edge
+		} else {
+			return Err(self.syntax("Expected `NODE` or `EDGE` after `TYPE`.", self.current().span));
+		};
+		let mut schema_mode = ClassSchemaModeName::Schemaless;
 		while !self.at_statement_end() {
-			if self.consume_keyword(keywords::TYPE).is_some() {
-				let value = self.identifier()?;
-				match value.value.to_ascii_uppercase().as_str() {
-					"ANY" => kind = TableKindName::Any,
-					"NORMAL" => kind = TableKindName::Normal,
-					"RELATION" => kind = TableKindName::Relation,
-					_ => {
-						return Err(self.syntax("Unknown table type.", value.span));
-					}
-				}
-			} else if self.consume_keyword(keywords::SCHEMALESS).is_some() {
-				schema_mode = TableSchemaModeName::Schemaless;
+			if self.consume_keyword(keywords::SCHEMALESS).is_some() {
+				schema_mode = ClassSchemaModeName::Schemaless;
 			} else if self.consume_keyword(keywords::SCHEMAFULL).is_some() {
-				schema_mode = TableSchemaModeName::Schemafull;
+				schema_mode = ClassSchemaModeName::Schemafull;
 			} else if let Some(feature) =
 				[keywords::DROP, keywords::AS, keywords::CHANGEFEED, keywords::COMMENT]
 					.iter()
@@ -225,10 +235,10 @@ impl Parser<'_> {
 			{
 				return Err(self.unsupported(feature, self.current().span));
 			} else {
-				return Err(self.syntax("Unexpected DEFINE TABLE clause.", self.current().span));
+				return Err(self.syntax("Unexpected DEFINE CLASS clause.", self.current().span));
 			}
 		}
-		Ok(DefineTableStatement {
+		Ok(DefineClassStatement {
 			mode,
 			name,
 			kind,
@@ -242,8 +252,8 @@ impl Parser<'_> {
 		let mode = self.definition_mode()?;
 		let name = self.identifier()?;
 		self.expect_keyword(keywords::ON, "Expected `ON` after field name.")?;
-		self.consume_keyword(keywords::TABLE);
-		let table = self.identifier()?;
+		self.expect_keyword(keywords::CLASS, "Expected `CLASS` after `ON`.")?;
+		let class = self.identifier()?;
 		let value_type = if self.consume_keyword(keywords::TYPE).is_some() {
 			Some(self.type_name()?)
 		} else {
@@ -256,7 +266,7 @@ impl Parser<'_> {
 		Ok(DefineFieldStatement {
 			mode,
 			name,
-			table,
+			class,
 			value_type,
 		})
 	}
@@ -270,8 +280,8 @@ impl Parser<'_> {
 		if self.consume_keyword(keywords::GRAPH).is_some() {
 			return Err(self.unsupported("graph index", self.previous_span()));
 		}
-		self.consume_keyword(keywords::TABLE);
-		let table = self.identifier()?;
+		self.expect_keyword(keywords::CLASS, "Expected `CLASS` after `ON`.")?;
+		let class = self.identifier()?;
 		let definition = if self.consume_keyword(keywords::COUNT).is_some() {
 			BasicIndexDefinition::Count
 		} else if self.consume_keyword(keywords::FIELDS).is_some()
@@ -298,6 +308,23 @@ impl Parser<'_> {
 				self.syntax("Expected `COUNT`, `FIELDS`, or `COLUMNS`.", self.current().span)
 			);
 		};
+		self.expect_keyword(
+			keywords::SCOPE,
+			"Expected explicit `SCOPE BASE` or `SCOPE EFFECTIVE IN GRAPH`.",
+		)?;
+		let scope = if self.consume_keyword(keywords::BASE).is_some() {
+			IndexScopeName::Base
+		} else if self.consume_keyword(keywords::EFFECTIVE).is_some() {
+			self.expect_keyword(keywords::IN, "Expected `IN GRAPH` after `SCOPE EFFECTIVE`.")?;
+			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `SCOPE EFFECTIVE IN`.")?;
+			IndexScopeName::Effective {
+				graph: self.identifier()?,
+			}
+		} else {
+			return Err(
+				self.syntax("Expected `BASE` or `EFFECTIVE` after `SCOPE`.", self.current().span)
+			);
+		};
 		if !self.at_statement_end() {
 			let feature = self.current_word().unwrap_or("DEFINE INDEX clause");
 			return Err(self.unsupported(feature, self.current().span));
@@ -305,8 +332,9 @@ impl Parser<'_> {
 		Ok(DefineIndexStatement {
 			mode,
 			name,
-			table,
+			class,
 			definition,
+			scope,
 		})
 	}
 
@@ -317,29 +345,29 @@ impl Parser<'_> {
 				if_exists,
 				name: self.identifier()?,
 			}
-		} else if self.consume_keyword(keywords::TABLE).is_some() {
+		} else if self.consume_keyword(keywords::CLASS).is_some() {
 			let if_exists = self.if_exists()?;
-			RemoveTarget::Table {
+			RemoveTarget::Class {
 				if_exists,
 				name: self.identifier()?,
 			}
 		} else if self.consume_keyword(keywords::FIELD).is_some() {
 			let if_exists = self.if_exists()?;
 			let name = self.identifier()?;
-			let table = self.on_table()?;
+			let class = self.on_class()?;
 			RemoveTarget::Field {
 				if_exists,
 				name,
-				table,
+				class,
 			}
 		} else if self.consume_keyword(keywords::INDEX).is_some() {
 			let if_exists = self.if_exists()?;
 			let name = self.identifier()?;
-			let table = self.on_table()?;
+			let class = self.on_class()?;
 			RemoveTarget::Index {
 				if_exists,
 				name,
-				table,
+				class,
 			}
 		} else {
 			let feature = self.current_word().unwrap_or("REMOVE target");
@@ -352,18 +380,18 @@ impl Parser<'_> {
 	}
 
 	pub(in crate::syn) fn alter_statement(&mut self) -> FerrosGrynnResult<AlterStatement> {
-		let target = if self.consume_keyword(keywords::TABLE).is_some() {
+		let target = if self.consume_keyword(keywords::CLASS).is_some() {
 			let if_exists = self.if_exists()?;
 			let name = self.identifier()?;
 			let schema_mode = if self.consume_keyword(keywords::SCHEMAFULL).is_some() {
-				TableSchemaModeName::Schemafull
+				ClassSchemaModeName::Schemafull
 			} else if self.consume_keyword(keywords::SCHEMALESS).is_some() {
-				TableSchemaModeName::Schemaless
+				ClassSchemaModeName::Schemaless
 			} else {
-				let feature = self.current_word().unwrap_or("ALTER TABLE action");
+				let feature = self.current_word().unwrap_or("ALTER CLASS action");
 				return Err(self.unsupported(feature, self.current().span));
 			};
-			AlterTarget::Table {
+			AlterTarget::Class {
 				if_exists,
 				name,
 				schema_mode,
@@ -371,7 +399,7 @@ impl Parser<'_> {
 		} else if self.consume_keyword(keywords::FIELD).is_some() {
 			let if_exists = self.if_exists()?;
 			let name = self.identifier()?;
-			let table = self.on_table()?;
+			let class = self.on_class()?;
 			let value_type = if self.consume_keyword(keywords::TYPE).is_some() {
 				Some(self.type_name()?)
 			} else if self.consume_keyword(keywords::DROP).is_some() {
@@ -384,17 +412,17 @@ impl Parser<'_> {
 			AlterTarget::Field {
 				if_exists,
 				name,
-				table,
+				class,
 				value_type,
 			}
 		} else if self.consume_keyword(keywords::INDEX).is_some() {
 			let name = self.identifier()?;
-			let table = self.on_table_required()?;
+			let class = self.on_class()?;
 			self.expect_keyword(keywords::PREPARE, "Expected `PREPARE REMOVE` for ALTER INDEX.")?;
 			self.expect_keyword(keywords::REMOVE, "Expected `REMOVE` after `PREPARE`.")?;
 			AlterTarget::IndexPrepareRemove {
 				name,
-				table,
+				class,
 			}
 		} else if self.at_keyword(keywords::GRAPH) {
 			return Err(self.unsupported("ALTER GRAPH", self.current().span));
@@ -412,14 +440,14 @@ impl Parser<'_> {
 		self.expect_keyword(keywords::FOR, "Expected `FOR` after `INFO`.")?;
 		let target = if self.consume_keyword(keywords::DB).is_some() {
 			InfoTarget::Database
-		} else if self.consume_keyword(keywords::TABLE).is_some() {
-			InfoTarget::Table(self.identifier()?)
+		} else if self.consume_keyword(keywords::CLASS).is_some() {
+			InfoTarget::Class(self.identifier()?)
 		} else if self.consume_keyword(keywords::INDEX).is_some() {
 			let name = self.identifier()?;
-			let table = self.on_table()?;
+			let class = self.on_class()?;
 			InfoTarget::Index {
 				name,
-				table,
+				class,
 			}
 		} else {
 			let feature = self.current_word().unwrap_or("INFO target");
@@ -451,15 +479,9 @@ impl Parser<'_> {
 		Ok(true)
 	}
 
-	fn on_table(&mut self) -> FerrosGrynnResult<Identifier> {
-		self.expect_keyword(keywords::ON, "Expected `ON` before table name.")?;
-		self.consume_keyword(keywords::TABLE);
-		self.identifier()
-	}
-
-	fn on_table_required(&mut self) -> FerrosGrynnResult<Identifier> {
-		self.expect_keyword(keywords::ON, "Expected `ON TABLE` before table name.")?;
-		self.expect_keyword(keywords::TABLE, "Expected `TABLE` after `ON`.")?;
+	fn on_class(&mut self) -> FerrosGrynnResult<Identifier> {
+		self.expect_keyword(keywords::ON, "Expected `ON CLASS` before class name.")?;
+		self.expect_keyword(keywords::CLASS, "Expected `CLASS` after `ON`.")?;
 		self.identifier()
 	}
 

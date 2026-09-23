@@ -1,19 +1,18 @@
-//! Public versioned schema catalog and definition types.
+//! Public versioned class, graph, index, and parameter definitions.
 
-/// Versioned catalog identities, graphs, parameters, and system indexes.
+/// Catalog identities, graphs, parameters, and system indexes.
 mod catalog;
-
-/// Table field definitions.
+/// Atom-class definitions.
+mod class;
+/// Class field definitions.
 mod field;
-/// Named-graph schema constraints.
-mod graph;
-/// Scalar index definitions.
+/// Class index definitions.
 mod index;
-/// Table definitions.
-mod table;
+/// Atomic replacement and removal of published schema definitions.
+mod mutation;
 
-pub(crate) use catalog::AtomTableMemberships;
 pub use catalog::{
+	ClassId,
 	GraphSchema,
 	IndexId,
 	SchemaCatalog,
@@ -23,7 +22,6 @@ pub use catalog::{
 	SystemIndex,
 	SystemIndexKind,
 };
-pub use field::TableField;
-pub(crate) use graph::validate_graph_name;
-pub use index::{TableIndex, TableIndexKind, TableIndexState};
-pub use table::{TableKind, TableSchema, TableSchemaMode};
+pub use class::{ClassSchema, ClassSchemaMode};
+pub use field::ClassField;
+pub use index::{ClassIndex, ClassIndexKind, ClassIndexState, IndexScope};

@@ -299,9 +299,9 @@ define_status_codes!(
 		condition: Condition::DataException,
 		domain: Domain::Value,
 		subcondition: "invalid record ID syntax",
-		message: "A record ID must use the table:id form.",
+		message: "A record ID must use the class:id form.",
 	},
-	EmptyRecordIdTable, "FG-22F12" => {
+	EmptyRecordIdClass, "FG-22F12" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
 			category: ErrorCategory::Runtime,
@@ -309,8 +309,8 @@ define_status_codes!(
 		},
 		condition: Condition::DataException,
 		domain: Domain::Value,
-		subcondition: "empty record ID table",
-		message: "The table component of a record ID cannot be empty.",
+		subcondition: "empty record ID class",
+		message: "The class component of a record ID cannot be empty.",
 	},
 	EmptyRecordIdPart, "FG-22F13" => {
 		kind: Error {
@@ -917,7 +917,7 @@ define_status_codes!(
 			message: String => DisplayValue,
 		},
 	},
-	TableDoesNotExist, "FG-42F01" => {
+	ClassDoesNotExist, "FG-42F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
 			category: ErrorCategory::Semantic,
@@ -925,13 +925,13 @@ define_status_codes!(
 		},
 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
 		domain: Domain::Query,
-		subcondition: "table does not exist",
-		message: "Table {table} does not exist.",
+		subcondition: "class does not exist",
+		message: "Class {class} does not exist.",
 		params: {
-			table: String => Identifier,
+			class: String => Identifier,
 		},
 	},
-	TableAlreadyExists, "FG-42F02" => {
+	ClassAlreadyExists, "FG-42F02" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
 			category: ErrorCategory::Semantic,
@@ -939,10 +939,10 @@ define_status_codes!(
 		},
 		condition: Condition::SyntaxErrorOrAccessRuleViolation,
 		domain: Domain::Query,
-		subcondition: "table already exists",
-		message: "Table {table} already exists.",
+		subcondition: "class already exists",
+		message: "Class {class} already exists.",
 		params: {
-			table: String => Identifier,
+			class: String => Identifier,
 		},
 	},
 	QueryFeatureNotSupported, "FG-50F03" => {

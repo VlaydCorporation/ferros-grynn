@@ -1,33 +1,89 @@
-#[allow(
-	clippy::wildcard_imports,
-	reason = "the datastore facade owns imports during the move-only split"
-)]
-use super::*;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	sync::Arc,
+	time::Instant,
+};
 
-/// Serializable validation and first-committer-wins checks.
-mod conflict;
-/// Snapshot-bound graph readers.
+use parking_lot::Mutex;
+use rapidhash::RapidHashMap;
+
+use super::{
+	ClassId,
+	ClassSchema,
+	ConflictKey,
+	DatabaseRoot,
+	Datastore,
+	GlobalAtomId,
+	GraphSchema,
+	IndexId,
+	IsolationLevel,
+	OccurrenceState,
+	SchemaVersion,
+	SystemIndex,
+	SystemIndexKind,
+	TransactionAccess,
+	TransactionOptions,
+	consts::{
+		BASE_ATOM_WRITE_BYTES,
+		EFFECTIVE_FANOUT_WRITE_BYTES,
+		PROPERTY_DICTIONARY_WRITE_BYTES,
+		SCHEMA_WRITE_BYTES,
+	},
+};
+use crate::{
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	graph::{AtomId, AtomKind, EdgeTopology, GraphId, GraphKind, GraphRef, SnapshotId},
+	values::{Number, PropertyKeyId, PropertyMap, RecordId, Text, Value},
+};
+
+mod commit;
+mod graph;
 mod graph_view;
-/// Transaction-private graph and schema mutation.
-mod mutation;
-/// Query snapshots, predicates, and storage rows.
 mod query;
+mod schema;
+mod writeback;
 
-pub(crate) use conflict::ReadKey;
-use conflict::{PredicateMatcher, PredicateRead, all_dirty};
-pub use graph_view::{TransactionEdgeRead, TransactionGraphView, TransactionNodeRead};
-pub use mutation::{AtomRefTopology, GraphMutationView, GraphWriteView};
-use mutation::{GraphWrite, MutableGraphValue, ensure_store_reference};
+#[cfg(test)]
+mod tests;
+
+pub use graph_view::TransactionGraphView;
 pub(crate) use query::{
-	PredicateEvaluator,
 	QuerySnapshot,
 	QueryStorageCursor,
 	QueryStorageRow,
 	ScalarComparison,
 	ScalarIndexConstraint,
 };
-use query::{materialize_atom, row_from_properties};
 
+/// Owned database-global atom value returned by a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomSnapshot {
+	atom: Arc<super::BaseAtom>,
+}
+
+impl AtomSnapshot {
+	/// Returns the stable class-qualified identity.
+	pub fn record_id(&self) -> &RecordId {
+		self.atom.record_id()
+	}
+
+	/// Returns the immutable class identity.
+	pub fn class_id(&self) -> ClassId {
+		self.atom.class_id()
+	}
+
+	/// Returns whether the atom is a node or an edge.
+	pub fn kind(&self) -> AtomKind {
+		self.atom.kind()
+	}
+
+	/// Returns database-global base properties.
+	pub fn properties(&self) -> &PropertyMap {
+		self.atom.properties()
+	}
+}
+
+/// Timestamp published by a successful transaction commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitResult {
 	transaction: u64,
@@ -35,56 +91,167 @@ pub struct CommitResult {
 }
 
 impl CommitResult {
+	/// Returns the process-local transaction identity.
 	pub const fn transaction(self) -> u64 {
 		self.transaction
 	}
 
+	/// Returns the database-wide commit timestamp.
 	pub const fn commit_ts(self) -> u64 {
 		self.commit_ts
 	}
 }
 
-pub struct Transaction {
-	pub(super) store: Datastore,
-	pub(super) id: u64,
-	pub(super) start_ts: u64,
-	pub(super) started: Instant,
-	pub(super) options: TransactionOptions,
-	pub(super) root: Arc<DatabaseRoot>,
-	pub(super) storage_tx: Mutex<Option<Arc<LocalReadTransaction>>>,
-	pub(super) storage_error: Option<String>,
-	pub(super) reads: Mutex<BTreeMap<ReadKey, u64>>,
-	pub(super) predicates: Mutex<Vec<PredicateRead>>,
-	pub(super) graphs: BTreeMap<RecordId, GraphWrite>,
-	pub(super) tables: BTreeMap<String, Option<TableSchema>>,
-	pub(super) parameters: BTreeMap<String, Option<SchemaParameter>>,
+#[derive(Debug, Clone)]
+enum Mutation {
+	InternProperty {
+		key: PropertyKeyId,
+		name: Text,
+	},
+	DefineClass(ClassSchema),
+	DefineGraph(GraphSchema),
+	ReplaceClass(ClassSchema),
+	RemoveClass(ClassId),
+	RemoveGraph(GraphId),
+	CreateAtom {
+		id: GlobalAtomId,
+		class_id: ClassId,
+		record_id: RecordId,
+		properties: PropertyMap,
+	},
+	SetBaseProperty {
+		global: GlobalAtomId,
+		key: PropertyKeyId,
+		value: Value,
+	},
+	RemoveBaseProperty {
+		global: GlobalAtomId,
+		key: PropertyKeyId,
+	},
+	DeleteAtom {
+		global: GlobalAtomId,
+	},
+	AttachNode {
+		graph: GraphId,
+		local: AtomId,
+		global: GlobalAtomId,
+		label: Option<Text>,
+		nested_graph: Option<GraphId>,
+	},
+	AttachEdge {
+		graph: GraphId,
+		local: AtomId,
+		global: GlobalAtomId,
+		label: Option<Text>,
+		topology: EdgeTopology,
+		weight: Option<Number>,
+		transition_graph: Option<GraphId>,
+	},
+	Detach {
+		graph: GraphId,
+		global: GlobalAtomId,
+	},
+	SetOverlay {
+		graph: GraphId,
+		local: AtomId,
+		key: PropertyKeyId,
+		value: Value,
+	},
+	HideProperty {
+		graph: GraphId,
+		local: AtomId,
+		key: PropertyKeyId,
+	},
+	ResetProperty {
+		graph: GraphId,
+		local: AtomId,
+		key: PropertyKeyId,
+	},
+	SetOccurrenceLabel {
+		graph: GraphId,
+		local: AtomId,
+		label: Option<Text>,
+	},
+	ReplaceOccurrenceState {
+		graph: GraphId,
+		local: AtomId,
+		state: OccurrenceState,
+	},
 }
 
-impl Drop for Transaction {
-	fn drop(&mut self) {
-		self.store.inner.active.lock().remove(&self.id);
-	}
+/// Transaction-private normalized root with FCW and conservative SSI
+/// validation.
+pub struct Transaction {
+	store: Datastore,
+	id: u64,
+	started: Instant,
+	options: TransactionOptions,
+	snapshot: Arc<DatabaseRoot>,
+	working: DatabaseRoot,
+	reads: Mutex<RapidHashMap<ConflictKey, u64>>,
+	missing_records: Mutex<BTreeSet<RecordId>>,
+	// ponytail: one-key cache avoids the steady repeated-read lock; replace it
+	// with a bounded set only if alternating point-read profiles justify it.
+	last_base_read: Option<GlobalAtomId>,
+	range_writes: BTreeSet<ConflictKey>,
+	writes: BTreeMap<ConflictKey, u64>,
+	requirements: BTreeMap<ConflictKey, u64>,
+	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
+	write_bytes: usize,
+	mutations: Vec<Mutation>,
 }
 
 impl Transaction {
+	pub(crate) fn new(
+		store: Datastore,
+		id: u64,
+		options: TransactionOptions,
+		snapshot: Arc<DatabaseRoot>,
+	) -> Self {
+		Self {
+			store,
+			id,
+			started: Instant::now(),
+			options,
+			working: (*snapshot).clone(),
+			snapshot,
+			reads: Mutex::new(RapidHashMap::default()),
+			missing_records: Mutex::new(BTreeSet::new()),
+			last_base_read: None,
+			range_writes: BTreeSet::new(),
+			writes: BTreeMap::new(),
+			requirements: BTreeMap::new(),
+			fanout_reservations: BTreeSet::new(),
+			write_bytes: 0,
+			mutations: Vec::new(),
+		}
+	}
+
+	/// Returns the process-local transaction identity.
 	pub const fn id(&self) -> u64 {
 		self.id
 	}
 
+	/// Returns the currently visible MVCC snapshot identity.
 	pub fn snapshot_id(&self) -> SnapshotId {
-		SnapshotId::new(self.read_root().commit_ts, self.id)
+		SnapshotId::new(self.snapshot.commit_ts, self.id)
 	}
 
+	/// Returns the isolation and access policy selected at begin time.
 	pub const fn options(&self) -> TransactionOptions {
 		self.options
 	}
 
-	/// Parses, analyzes, and executes a GrynQL program inside this transaction.
+	/// Returns bytes already reserved by the logical write-set preflight.
+	pub const fn write_set_bytes(&self) -> usize {
+		self.write_bytes
+	}
+
+	/// Parses, analyzes, and executes a GrynQL program in this transaction.
 	///
 	/// # Errors
 	///
-	/// Returns a parser, analysis, execution, or storage error produced by the
-	/// program.
+	/// Returns the first parser, analysis, execution, or datastore error.
 	pub fn execute(
 		&mut self,
 		source: &str,
@@ -93,13 +260,11 @@ impl Transaction {
 		self.execute_with_settings(source, variables, crate::gql::ParserSettings::default())
 	}
 
-	/// Executes a GrynQL program with explicit parser settings inside this
-	/// transaction.
+	/// Executes a GrynQL program with explicit parser settings.
 	///
 	/// # Errors
 	///
-	/// Returns a parser, analysis, execution, or storage error produced by the
-	/// program.
+	/// Returns the first parser, analysis, execution, or datastore error.
 	pub fn execute_with_settings(
 		&mut self,
 		source: &str,
@@ -109,350 +274,498 @@ impl Transaction {
 		crate::gql::execute_transaction(self, source, variables, settings)
 	}
 
-	pub fn commit(mut self) -> FerrosGrynnResult<CommitResult> {
-		self.ensure_live()?;
-		let limits = self.store.inner.transaction_limits();
-		let estimated = self.estimated_write_set_bytes()?;
-		if estimated > limits.max_write_set_bytes {
-			return Err(FerrosGrynnError::transaction_write_set_limit_exceeded(
-				self.id,
-				u64::try_from(estimated).unwrap_or(u64::MAX),
-				u64::try_from(limits.max_write_set_bytes).unwrap_or(u64::MAX),
-			));
-		}
-		if self.options.access == TransactionAccess::ReadOnly
-			&& (!self.graphs.is_empty() || !self.tables.is_empty() || !self.parameters.is_empty())
-		{
-			return Err(FerrosGrynnError::read_only_transaction(self.id));
-		}
-
-		let _commit = self.store.inner.commit.lock();
-		self.ensure_live()?;
-		let current = self.store.current_root();
-		self.validate_writes(&current)?;
-		if self.options.isolation == IsolationLevel::Serializable
-			&& self.options.access != TransactionAccess::ReadOnly
-		{
-			self.validate_serializable(&current)?;
-		}
-		if self.graphs.is_empty() && self.tables.is_empty() && self.parameters.is_empty() {
-			return Ok(CommitResult {
-				transaction: self.id,
-				commit_ts: current.commit_ts,
-			});
-		}
-
-		let commit_ts = current.commit_ts.checked_add(1).ok_or_else(|| {
-			FerrosGrynnError::serialization_failure(self.id, "the commit clock is exhausted")
-		})?;
-		// ponytail: cloning the shallow catalog is O(graphs + tables); use a
-		// persistent map only after catalog size appears in profiles.
-		let mut next = (*current).clone();
-		Arc::make_mut(&mut next.schema).next_id =
-			self.store.inner.next_schema_id.load(Ordering::Relaxed);
-		#[allow(clippy::mutable_key_type, reason = "RecordId is the datastore's stable graph key")]
-		let mut statistics_graphs = self.graphs.keys().cloned().collect::<BTreeSet<_>>();
-		#[allow(clippy::mutable_key_type, reason = "RecordId is the datastore's stable graph key")]
-		let mut bulk_statistics_graphs = BTreeSet::new();
-		for (name, schema) in &self.tables {
-			if let Some(previous) = current.schema.table(name)
-				&& let Some(graph) = previous.graph()
-			{
-				statistics_graphs.insert(graph.id().clone());
-				bulk_statistics_graphs.insert(graph.id().clone());
-			}
-			if let Some(schema) = schema
-				&& let Some(graph) = schema.graph()
-			{
-				statistics_graphs.insert(graph.id().clone());
-				bulk_statistics_graphs.insert(graph.id().clone());
+	/// Executes one statement-sized mutation with rollback to the transaction's
+	/// prior private state when validation or execution fails.
+	pub(crate) fn atomic_mutation<T>(
+		&mut self,
+		mutate: impl FnOnce(&mut Self) -> FerrosGrynnResult<T>,
+	) -> FerrosGrynnResult<T> {
+		self.prepare_mutation()?;
+		let working = self.working.clone();
+		let reads = self.reads.lock().clone();
+		let missing_records = self.missing_records.lock().clone();
+		let range_writes = self.range_writes.clone();
+		let writes = self.writes.clone();
+		let requirements = self.requirements.clone();
+		let fanout_reservations = self.fanout_reservations.clone();
+		let write_bytes = self.write_bytes;
+		let mutation_len = self.mutations.len();
+		match mutate(self) {
+			Ok(value) => Ok(value),
+			Err(error) => {
+				self.working = working;
+				*self.reads.lock() = reads;
+				*self.missing_records.lock() = missing_records;
+				self.range_writes = range_writes;
+				self.writes = writes;
+				self.requirements = requirements;
+				self.fanout_reservations = fanout_reservations;
+				self.write_bytes = write_bytes;
+				self.mutations.truncate(mutation_len);
+				Err(error)
 			}
 		}
-		let mut local_commits = Vec::new();
-		for (id, write) in std::mem::take(&mut self.graphs) {
-			self.apply_graph_write(&mut next, &current, id, write, commit_ts, &mut local_commits)?;
-		}
-		for (name, schema) in std::mem::take(&mut self.tables) {
-			match schema {
-				Some(mut schema) => {
-					if let Some(graph) = &schema.graph
-						&& !next.graphs.contains_key(graph.id())
-					{
-						return Err(FerrosGrynnError::graph_does_not_exist(graph.id().to_string()));
-					}
-					for field in &mut schema.fields {
-						field.key =
-							Some(Arc::make_mut(&mut next.dictionary).intern(field.name.clone())?);
-					}
-					schema.published_at = commit_ts;
-					Arc::make_mut(&mut next.schema).tables.insert(name.clone(), Arc::new(schema));
-				}
-				None => {
-					let catalog = Arc::make_mut(&mut next.schema);
-					if let Some(table) = catalog.tables.remove(&name)
-						&& let Some(id) = table.id
-					{
-						catalog.clear_table_memberships(id)?;
-					}
-				}
-			}
-			Arc::make_mut(&mut next.schema).table_versions.insert(name, commit_ts);
-		}
-		for (name, parameter) in std::mem::take(&mut self.parameters) {
-			match parameter {
-				Some(mut parameter) => {
-					parameter.published_at = commit_ts;
-					Arc::make_mut(&mut next.schema)
-						.parameters
-						.insert(name.clone(), Arc::new(parameter));
-				}
-				None => {
-					Arc::make_mut(&mut next.schema).parameters.remove(&name);
-				}
-			}
-			Arc::make_mut(&mut next.schema).parameter_versions.insert(name, commit_ts);
-		}
-		for schema in next.schema.tables.values() {
-			let Some(graph) = schema.graph() else {
-				continue;
-			};
-			let stored = next.graphs.get(graph.id()).ok_or_else(|| {
-				FerrosGrynnError::graph_constraint_violation(
-					"catalog",
-					format!("table '{}' references missing graph '{}'", schema.name, graph.id()),
-				)
-			})?;
-			if stored.graph.kind() != graph.kind() {
-				return Err(FerrosGrynnError::graph_constraint_violation(
-					"catalog",
-					format!(
-						"table '{}' expects graph family '{}' but found '{}'",
-						schema.name,
-						graph.kind().name(),
-						stored.graph.kind().name()
-					),
-				));
-			}
-		}
-		next.schema.validate_memberships()?;
-		next.refresh_statistics(&statistics_graphs, &bulk_statistics_graphs)?;
-		let mut changed_graphs = next
-			.graphs
-			.iter()
-			.filter(|(id, after)| {
-				current
-					.graphs
-					.get(*id)
-					.is_none_or(|before| before.last_commit_ts != after.last_commit_ts)
-			})
-			.map(|(id, _stored)| id.clone())
-			.collect::<Vec<_>>();
-		changed_graphs
-			.extend(current.graphs.keys().filter(|id| !next.graphs.contains_key(*id)).cloned());
-		next.commit_ts = commit_ts;
-		if let Some(persisted) =
-			self.store.inner.persist_root(commit_ts, &next, &changed_graphs, local_commits)?
-		{
-			next.dictionary = persisted.property_dictionary;
-			for entry in persisted.graphs {
-				next.replace_statistics(entry.record_id.clone(), entry.statistics)?;
-				let stored = next.graphs.get_mut(&entry.record_id).ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"durable commit returned an unknown graph descriptor",
-					)
-				})?;
-				stored.graph = StoredGraphValue::Local(entry.graph);
-				stored.record_index = Arc::new(BTreeMap::new());
-			}
-		}
-		let mut published = self.store.inner.current.write();
-		let mut active = self.store.inner.active.lock();
-		active.retain(|_, snapshot| snapshot.started.elapsed() <= limits.max_snapshot_age);
-		let oldest_snapshot =
-			active.values().map(|snapshot| snapshot.start_ts).min().unwrap_or(commit_ts);
-		drop(active);
-		for stored in next.graphs.values_mut() {
-			if stored.changes.len() > 4_096 {
-				stored.changes.retain(|(timestamp, _)| *timestamp > oldest_snapshot);
-			}
-		}
-		*published = Arc::new(next);
-		Ok(CommitResult {
-			transaction: self.id,
-			commit_ts,
-		})
 	}
 
-	pub fn abort(self) {}
+	/// Publishes a new immutable class definition.
+	///
+	/// # Errors
+	///
+	/// Returns a schema, read-only, snapshot-age, identity-capacity, or
+	/// write-set-limit error.
+	pub fn define_class(&mut self, mut class: ClassSchema) -> FerrosGrynnResult<ClassId> {
+		self.prepare_mutation()?;
+		if class.id.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"define_class requires an unpublished class",
+			));
+		}
+		if self.working.schema.class(class.name().as_str()).is_some() {
+			return Err(FerrosGrynnError::class_already_exists(class.name().to_string()));
+		}
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+
+		let id = ClassId::from_schema_id(self.store.inner.allocate_schema_id()?);
+		class.id = Some(id);
+		for field in &mut class.fields {
+			if field.id.is_some() {
+				return Err(FerrosGrynnError::invalid_argument(
+					"define_class requires unpublished fields",
+				));
+			}
+			field.id = Some(self.store.inner.allocate_schema_id()?);
+			field.class_id = Some(id);
+			field.key = Some(self.intern_property(field.name().as_str())?);
+		}
+		for index in &mut class.indexes {
+			if index.id.is_some() {
+				return Err(FerrosGrynnError::invalid_argument(
+					"define_class requires unpublished indexes",
+				));
+			}
+			index.id = Some(IndexId::from_schema_id(self.store.inner.allocate_schema_id()?));
+		}
+		self.working.install_class(class.clone(), self.snapshot.commit_ts)?;
+		self.write_bytes += SCHEMA_WRITE_BYTES;
+		self.mutations.push(Mutation::DefineClass(class));
+		Ok(id)
+	}
+
+	/// Publishes an empty named graph and its system indexes.
+	///
+	/// # Errors
+	///
+	/// Returns a graph-name, read-only, snapshot-age, identity-capacity, or
+	/// write-set-limit error.
+	pub fn define_graph<IntoText: Into<Text>>(
+		&mut self,
+		name: IntoText,
+		kind: GraphKind,
+	) -> FerrosGrynnResult<GraphRef> {
+		self.prepare_mutation()?;
+		let name = name.into();
+		if self.working.schema.named_graph(name.as_str()).is_some() {
+			return Err(FerrosGrynnError::graph_already_exists(name.to_string()));
+		}
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let graph = self.store.inner.allocate_graph_id()?;
+		let reference = GraphRef::new(graph, name, kind, self.store.inner.graph_storage_mode())?;
+		let label = SystemIndex::new(
+			IndexId::from_schema_id(self.store.inner.allocate_schema_id()?),
+			SystemIndexKind::Label,
+		);
+		let adjacency = SystemIndex::new(
+			IndexId::from_schema_id(self.store.inner.allocate_schema_id()?),
+			SystemIndexKind::Adjacency,
+		);
+		let schema = GraphSchema::new(
+			SchemaVersion::INITIAL,
+			reference.clone(),
+			label,
+			adjacency,
+			self.snapshot.commit_ts,
+		);
+		self.working.install_graph(schema.clone(), self.snapshot.commit_ts)?;
+		self.write_bytes += SCHEMA_WRITE_BYTES;
+		self.mutations.push(Mutation::DefineGraph(schema));
+		Ok(reference)
+	}
+
+	/// Resolves or appends one database-global property name.
+	pub(crate) fn intern_property(&mut self, name: &str) -> FerrosGrynnResult<PropertyKeyId> {
+		self.prepare_mutation()?;
+		if let Some(key) = self.working.dictionary.get(name) {
+			return Ok(key);
+		}
+		let conflict = ConflictKey::PropertyDictionary;
+		if !self.writes.contains_key(&conflict) {
+			self.ensure_capacity(PROPERTY_DICTIONARY_WRITE_BYTES)?;
+		}
+		let name = Text::from(name);
+		let key = Arc::make_mut(&mut self.working.dictionary).intern(name.clone())?;
+		self.insert_write(conflict, PROPERTY_DICTIONARY_WRITE_BYTES);
+		self.mutations.push(Mutation::InternProperty {
+			key,
+			name,
+		});
+		Ok(key)
+	}
+
+	/// Creates one database-global atom in the class named by its `RecordId`.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the class is absent, the identity already exists,
+	/// the transaction is read-only, or its resource limit is exceeded.
+	pub fn create_atom(
+		&mut self,
+		record_id: RecordId,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomSnapshot> {
+		self.prepare_mutation()?;
+		let class = self
+			.working
+			.schema
+			.class(record_id.class())
+			.ok_or_else(|| FerrosGrynnError::class_does_not_exist(record_id.class()))?;
+		let class_id = class.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("published class is missing ClassId")
+		})?;
+		self.ensure_capacity(BASE_ATOM_WRITE_BYTES)?;
+		let global = self.working.insert_atom(&class, record_id.clone(), properties.clone())?;
+		let key = ConflictKey::BaseAtom(global);
+		self.insert_write(key, BASE_ATOM_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::BaseClassRange(class_id));
+		self.mutations.push(Mutation::CreateAtom {
+			id: global,
+			class_id,
+			record_id,
+			properties,
+		});
+		self.atom_snapshot(global)
+	}
+
+	/// Reads an atom's database-global identity and base properties.
+	///
+	/// # Errors
+	///
+	/// Returns a snapshot-age or read-committed refresh error.
+	pub fn atom(&mut self, record_id: &RecordId) -> FerrosGrynnResult<Option<AtomSnapshot>> {
+		self.prepare_read()?;
+		let Some(global) = self.working.resolve_atom(record_id) else {
+			self.record_missing(record_id);
+			return Ok(None);
+		};
+		let atom = self.atom_snapshot(global)?;
+		if self.last_base_read != Some(global) {
+			self.record_read(ConflictKey::BaseAtom(global));
+			self.last_base_read = Some(global);
+		}
+		Ok(Some(atom))
+	}
+
+	/// Replaces one database-global base property after a bounded fanout
+	/// preflight over this atom's reverse memberships.
+	///
+	/// # Errors
+	///
+	/// Returns an atom, read-only, snapshot-age, or write-set-limit error.
+	pub fn set_base_property(
+		&mut self,
+		record_id: &RecordId,
+		key: PropertyKeyId,
+		value: Value,
+	) -> FerrosGrynnResult<Option<Value>> {
+		self.prepare_mutation()?;
+		let global = self.require_atom(record_id)?;
+		let (class_id, _kind) = self.atom_domain(global)?;
+		let write = ConflictKey::BaseAtom(global);
+		let fanout = self.inherited_memberships(global, key);
+		let new_fanout = fanout
+			.iter()
+			.filter(|graph| !self.fanout_reservations.contains(&(global, **graph, key)))
+			.count();
+		let additional = (if self.writes.contains_key(&write) {
+			0
+		} else {
+			BASE_ATOM_WRITE_BYTES
+		})
+		.checked_add(
+			new_fanout
+				.checked_mul(EFFECTIVE_FANOUT_WRITE_BYTES)
+				.ok_or_else(|| self.limit_error(usize::MAX))?,
+		)
+		.ok_or_else(|| self.limit_error(usize::MAX))?;
+		self.ensure_capacity(additional)?;
+
+		let previous = self.working.set_base_property(global, key, value.clone())?;
+		self.insert_write(write, BASE_ATOM_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::BaseClassRange(class_id));
+		for graph in self
+			.working
+			.memberships(global)
+			.into_iter()
+			.flat_map(|memberships| memberships.keys().copied())
+			.collect::<Vec<_>>()
+		{
+			self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
+		}
+		for graph in fanout {
+			if self.fanout_reservations.insert((global, graph, key)) {
+				self.write_bytes += EFFECTIVE_FANOUT_WRITE_BYTES;
+			}
+		}
+		self.mutations.push(Mutation::SetBaseProperty {
+			global,
+			key,
+			value,
+		});
+		Ok(previous)
+	}
+
+	/// Removes one database-global base property.
+	///
+	/// # Errors
+	///
+	/// Returns an atom, read-only, snapshot-age, uniqueness, or write-set-limit
+	/// error.
+	pub fn remove_base_property(
+		&mut self,
+		record_id: &RecordId,
+		key: PropertyKeyId,
+	) -> FerrosGrynnResult<Option<Value>> {
+		self.prepare_mutation()?;
+		let global = self.require_atom(record_id)?;
+		let (class_id, _kind) = self.atom_domain(global)?;
+		if self.working.atom(global).and_then(|atom| atom.properties().get(key)).is_none() {
+			return Ok(None);
+		}
+		let write = ConflictKey::BaseAtom(global);
+		let fanout = self.inherited_memberships(global, key);
+		let new_fanout = fanout
+			.iter()
+			.filter(|graph| !self.fanout_reservations.contains(&(global, **graph, key)))
+			.count();
+		let additional = (if self.writes.contains_key(&write) {
+			0
+		} else {
+			BASE_ATOM_WRITE_BYTES
+		})
+		.checked_add(
+			new_fanout
+				.checked_mul(EFFECTIVE_FANOUT_WRITE_BYTES)
+				.ok_or_else(|| self.limit_error(usize::MAX))?,
+		)
+		.ok_or_else(|| self.limit_error(usize::MAX))?;
+		self.ensure_capacity(additional)?;
+		let previous = self.working.remove_base_property(global, key)?;
+		self.insert_write(write, BASE_ATOM_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::BaseClassRange(class_id));
+		for graph in self
+			.working
+			.memberships(global)
+			.into_iter()
+			.flat_map(|memberships| memberships.keys().copied())
+			.collect::<Vec<_>>()
+		{
+			self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
+		}
+		for graph in fanout {
+			if self.fanout_reservations.insert((global, graph, key)) {
+				self.write_bytes += EFFECTIVE_FANOUT_WRITE_BYTES;
+			}
+		}
+		self.mutations.push(Mutation::RemoveBaseProperty {
+			global,
+			key,
+		});
+		Ok(previous)
+	}
+
+	/// Deletes a database-global atom without graph memberships.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the atom is absent, still attached, read-only, or
+	/// exceeds the write-set limit.
+	pub fn delete_atom(&mut self, record_id: &RecordId) -> FerrosGrynnResult<()> {
+		self.delete_atom_cascade(record_id, false)
+	}
+
+	/// Deletes one database-global atom and, when requested, every graph-local
+	/// occurrence that depends on it.
+	///
+	/// # Errors
+	///
+	/// Returns an atom, membership, incidence, read-only, or write-set-limit
+	/// error without retaining a partial transaction-private deletion.
+	pub fn delete_atom_cascade(
+		&mut self,
+		record_id: &RecordId,
+		cascade: bool,
+	) -> FerrosGrynnResult<()> {
+		self.atomic_mutation(|transaction| transaction.delete_atom_inner(record_id, cascade))
+	}
+
+	fn delete_atom_inner(&mut self, record_id: &RecordId, cascade: bool) -> FerrosGrynnResult<()> {
+		let global = self.require_atom(record_id)?;
+		let (class_id, _kind) = self.atom_domain(global)?;
+		let write = ConflictKey::BaseAtom(global);
+		if !self.writes.contains_key(&write) {
+			self.ensure_capacity(BASE_ATOM_WRITE_BYTES)?;
+		}
+		let memberships = self
+			.working
+			.memberships(global)
+			.map(|memberships| memberships.keys().copied().collect::<Vec<_>>())
+			.unwrap_or_else(Vec::new);
+		if !cascade && !memberships.is_empty() {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				"atom store",
+				"DELETE requires CASCADE while the atom has graph memberships",
+			));
+		}
+		for graph in memberships {
+			self.detach_occurrence(graph, record_id, true)?;
+		}
+		self.working.remove_atom(global)?;
+		self.insert_write(write, BASE_ATOM_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::BaseClassRange(class_id));
+		self.mutations.push(Mutation::DeleteAtom {
+			global,
+		});
+		Ok(())
+	}
+
+	fn prepare_read(&mut self) -> FerrosGrynnResult<()> {
+		self.ensure_live()?;
+		self.refresh_read_committed()
+	}
+
+	fn prepare_mutation(&mut self) -> FerrosGrynnResult<()> {
+		self.ensure_live()?;
+		if self.options.access == TransactionAccess::ReadOnly {
+			return Err(FerrosGrynnError::read_only_transaction(self.id));
+		}
+		self.refresh_read_committed()
+	}
 
 	fn ensure_live(&self) -> FerrosGrynnResult<()> {
-		if let Some(error) = &self.storage_error {
-			return Err(FerrosGrynnError::invalid_storage_file(format!(
-				"failed to register the local storage snapshot: {error}"
-			)));
-		}
 		let limits = self.store.inner.transaction_limits();
 		if self.started.elapsed() > limits.max_snapshot_age {
-			let transaction = self.storage_tx.lock().take();
-			if let Some(transaction) = transaction {
-				transaction.cancel();
-			}
 			return Err(FerrosGrynnError::snapshot_expired(
 				self.id,
 				limits.max_snapshot_age.as_secs(),
 			));
 		}
-		let transaction = self.storage_tx.lock().as_ref().cloned();
-		if let Some(transaction) = transaction {
-			transaction.ensure_live()?;
+		Ok(())
+	}
+
+	fn refresh_read_committed(&mut self) -> FerrosGrynnResult<()> {
+		if self.options.isolation != IsolationLevel::ReadCommitted {
+			return Ok(());
+		}
+		let current = self.store.inner.current_root();
+		if current.commit_ts == self.snapshot.commit_ts {
+			return Ok(());
+		}
+		self.validate_write_requirements(&current)?;
+		let mut working = (*current).clone();
+		Self::apply_mutations(&mut working, &self.mutations, current.commit_ts).map_err(
+			|error| {
+				FerrosGrynnError::serialization_failure(
+					self.id,
+					"a read-committed statement could not rebase its prior writes",
+				)
+				.with_cause(error)
+			},
+		)?;
+		self.snapshot = current;
+		self.working = working;
+		self.reads.lock().clear();
+		self.missing_records.lock().clear();
+		self.last_base_read = None;
+		Ok(())
+	}
+
+	fn require_atom(&self, record_id: &RecordId) -> FerrosGrynnResult<GlobalAtomId> {
+		self.working
+			.resolve_atom(record_id)
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", record_id.to_string()))
+	}
+
+	fn atom_snapshot(&self, global: GlobalAtomId) -> FerrosGrynnResult<AtomSnapshot> {
+		let atom = self
+			.working
+			.atom_arc(global)
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
+		Ok(AtomSnapshot {
+			atom,
+		})
+	}
+
+	fn atom_domain(&self, global: GlobalAtomId) -> FerrosGrynnResult<(ClassId, AtomKind)> {
+		let atom = self
+			.working
+			.atom(global)
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
+		Ok((atom.class_id(), atom.kind()))
+	}
+
+	fn inherited_memberships(&self, global: GlobalAtomId, key: PropertyKeyId) -> Vec<GraphId> {
+		self.working
+			.memberships(global)
+			.into_iter()
+			.flat_map(|memberships| memberships.keys().copied())
+			.filter(|graph| self.working.inherits_property(*graph, global, key))
+			.collect()
+	}
+
+	fn record_read(&self, key: ConflictKey) {
+		self.record_reads([key]);
+	}
+
+	fn record_reads<const COUNT: usize>(&self, keys: [ConflictKey; COUNT]) {
+		let mut reads = self.reads.lock();
+		for key in keys {
+			reads.entry(key).or_insert_with(|| self.snapshot.version(key));
+		}
+	}
+
+	fn record_missing(&self, record: &RecordId) {
+		self.missing_records.lock().insert(record.clone());
+	}
+
+	fn mark_range_change(&mut self, key: ConflictKey) {
+		self.range_writes.insert(key);
+	}
+
+	fn record_requirement(&mut self, key: ConflictKey) {
+		self.requirements.entry(key).or_insert_with(|| self.snapshot.version(key));
+	}
+
+	fn insert_write(&mut self, key: ConflictKey, cost: usize) {
+		if self.writes.contains_key(&key) {
+			return;
+		}
+		self.writes.insert(key, self.snapshot.version(key));
+		self.write_bytes += cost;
+	}
+
+	fn ensure_capacity(&self, additional: usize) -> FerrosGrynnResult<()> {
+		let actual = self.write_bytes.checked_add(additional).unwrap_or(usize::MAX);
+		if actual > self.store.inner.transaction_limits().max_write_set_bytes {
+			return Err(self.limit_error(actual));
 		}
 		Ok(())
 	}
 
-	fn local_snapshot(&self) -> FerrosGrynnResult<Arc<LocalReadTransaction>> {
-		self.ensure_live()?;
-		self.storage_tx.lock().as_ref().cloned().ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file("local transaction has no storage snapshot")
-		})
-	}
-
-	fn materialize_stored_graph(
-		&self,
-		graph: &StoredGraphValue,
-	) -> FerrosGrynnResult<Arc<MaterializedGraph>> {
-		match graph {
-			StoredGraphValue::Materialized(graph) => Ok(graph.clone()),
-			StoredGraphValue::Local(graph) => {
-				let local = self.store.inner.backend.local().ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"local graph is attached to an in-memory backend",
-					)
-				})?;
-				let limits = self.store.inner.transaction_limits();
-				let transaction = Arc::new(local.begin_read(self.id, limits.max_snapshot_age)?);
-				local.materialize_graph(transaction, graph).map(Arc::new)
-			}
-		}
-	}
-
-	fn read_root(&self) -> Arc<DatabaseRoot> {
-		if self.options.isolation == IsolationLevel::ReadCommitted {
-			self.store.current_root()
-		} else {
-			self.root.clone()
-		}
-	}
-
-	fn visible_graph_kind(&self, id: &RecordId) -> Option<GraphKind> {
-		if let Some(write) = self.graphs.get(id) {
-			return write.kind();
-		}
-		self.read_root().graphs.get(id).map(|stored| stored.graph.kind())
-	}
-
-	fn visible_table(&self, name: &str) -> Option<Arc<TableSchema>> {
-		match self.tables.get(name) {
-			Some(Some(schema)) => Some(Arc::new(schema.clone())),
-			Some(None) => None,
-			None => self.read_root().schema.table(name),
-		}
-	}
-
-	fn visible_parameter(&self, name: &str) -> Option<Arc<SchemaParameter>> {
-		match self.parameters.get(name) {
-			Some(Some(parameter)) => Some(Arc::new(parameter.clone())),
-			Some(None) => None,
-			None => self.read_root().schema.parameter(name),
-		}
-	}
-
-	fn estimated_write_set_bytes(&self) -> FerrosGrynnResult<usize> {
-		let mut estimated = 0_usize;
-		for write in self.graphs.values() {
-			estimated = estimated
-				.saturating_add(write.memberships.len().saturating_mul(DIRTY_TARGET_WRITE_BYTES));
-			if let Some(local) = &write.local {
-				let storage = self.store.inner.backend.local().ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"local graph is attached to an in-memory backend",
-					)
-				})?;
-				let view = storage.graph_view(local.snapshot.clone(), local.base.clone());
-				estimated = estimated.saturating_add(local.delta.estimated_write_set_bytes(&view)?);
-				continue;
-			}
-			let Some(value) = write.value.as_ref() else {
-				estimated = estimated.saturating_add(CATALOG_DELETE_WRITE_BYTES);
-				continue;
-			};
-			let snapshot = value.snapshot();
-			let dirty = if write.base.is_some() {
-				value.dirty()
-			} else {
-				all_dirty(&snapshot)?
-			};
-			estimated =
-				estimated.saturating_add(dirty.len().saturating_mul(DIRTY_TARGET_WRITE_BYTES));
-			for target in dirty {
-				match target {
-					DirtyTarget::Graph => {
-						estimated =
-							estimated.saturating_add(snapshot.properties().estimated_heap_bytes());
-					}
-					DirtyTarget::Atom(atom) => match atom.kind() {
-						Some(AtomKind::Node) => {
-							if let Some(node) = snapshot.node(atom) {
-								estimated = estimated
-									.saturating_add(node.record_id().estimated_heap_bytes())
-									.saturating_add(node.label_text().map_or(0, Text::len))
-									.saturating_add(node.properties().estimated_heap_bytes());
-								if let Some(inner) = node.inner_graph() {
-									estimated = estimated.saturating_add(
-										crate::graph::estimated_nested_graph_heap_bytes(inner)?,
-									);
-								}
-							}
-						}
-						Some(AtomKind::Edge) => {
-							if let Some(edge) = snapshot.edge(atom) {
-								estimated = estimated
-									.saturating_add(edge.record_id().estimated_heap_bytes())
-									.saturating_add(edge.label_text().map_or(0, Text::len))
-									.saturating_add(edge.properties().estimated_heap_bytes())
-									.saturating_add(crate::graph::estimated_topology_heap_bytes(
-										edge.topology(),
-									));
-								if let Some(transition) = edge.transition_graph() {
-									estimated = estimated.saturating_add(
-										crate::graph::estimated_nested_graph_heap_bytes(
-											transition,
-										)?,
-									);
-								}
-							}
-						}
-						None => {}
-					},
-				}
-			}
-		}
-		for schema in self.tables.values() {
-			estimated = estimated.saturating_add(schema.as_ref().map_or(
-				CATALOG_DELETE_WRITE_BYTES,
-				|schema| {
-					TABLE_SCHEMA_WRITE_BYTES
-						.saturating_add(schema.fields.len().saturating_mul(TABLE_FIELD_WRITE_BYTES))
-				},
-			));
-		}
-		for parameter in self.parameters.values() {
-			estimated = estimated.saturating_add(parameter.as_ref().map_or(
-				CATALOG_DELETE_WRITE_BYTES,
-				|parameter| {
-					TABLE_SCHEMA_WRITE_BYTES.saturating_add(parameter.value.estimated_heap_bytes())
-				},
-			));
-		}
-		Ok(estimated)
+	fn limit_error(&self, actual: usize) -> FerrosGrynnError {
+		let limit = self.store.inner.transaction_limits().max_write_set_bytes;
+		FerrosGrynnError::transaction_write_set_limit_exceeded(
+			self.id,
+			u64::try_from(actual).unwrap_or(u64::MAX),
+			u64::try_from(limit).unwrap_or(u64::MAX),
+		)
 	}
 }

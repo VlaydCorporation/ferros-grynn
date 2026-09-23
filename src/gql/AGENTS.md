@@ -31,13 +31,20 @@ src/syn parse -> analysis -> logical IR -> execution -> datastore adapter
 - Новая конструкция добавляется вертикально: grammar/token -> AST -> analysis
   -> IR -> execution -> backend tests. Пустые variants «на будущее» запрещены.
 - Core DDL проходит этой же цепочкой и изменяет транзакционный catalog через
-  datastore adapter. `INFO FOR DB|TABLE|INDEX` читает transaction-visible
-  definitions и показывает состояние индекса; расширенные index kinds и
-  неутверждённый `ALTER GRAPH` возвращают явный unsupported status.
+  datastore adapter. `CLASS` задаёт namespace и immutable atom kind;
+  `INFO FOR DB|CLASS|INDEX` читает transaction-visible definitions и состояние
+  индекса.
 - Core DML выполняет общий preflight целей и `EXPECT` по pre-image до первой
-  мутации. Graph-backed `CREATE/UPDATE/UPSERT/DELETE` проходят typed IR;
-  `RELATE` нельзя выводить из совпадения edge label и table name — его identity
-  contract должен быть сначала утверждён в `gql_spec`.
+  мутации. Direct DML адресует global atom по `RecordId = class:id`, а
+  graph-scoped DML читает effective properties.
+- `ATTACH`, `DETACH`, class-aware `RELATE ... IN GRAPH`, graph-local `LABEL` и
+  `RESET` проходят typed IR. Alias, class и label — независимые понятия;
+  выводить class из label запрещено.
+- MATCH сначала выбирает global exact/class кандидатов, затем пересекает их с
+  graph-local label/membership indexes. Старый `(alias:label)` и `FROM graph`
+  не являются compatibility grammar.
+- Mode 3 materialization возвращает owned effective graph; mutable write-back
+  выполняется только явной delta flush operation.
 
 ## Спецификации и проверка
 

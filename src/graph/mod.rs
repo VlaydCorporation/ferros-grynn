@@ -55,7 +55,8 @@ pub use forest::{
 pub use general::{FrozenGraph, Graph, MutableGraph};
 pub(crate) use general::{merge_transaction_graph, remap_topology};
 pub use hypergraph::{FrozenHypergraph, Hypergraph, MutableHypergraph};
-pub use id::{AtomId, AtomKind};
+pub(crate) use id::SlotAllocator;
+pub use id::{AtomId, AtomKind, GraphId};
 pub use live::{LiveEvent, LiveGraph, LiveReadGuard, LiveUpdate};
 pub use materialized::MaterializedGraph;
 pub(crate) use materialized::{estimated_nested_graph_heap_bytes, estimated_topology_heap_bytes};

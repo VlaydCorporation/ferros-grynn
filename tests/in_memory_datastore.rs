@@ -14,7 +14,12 @@ mod tests {
 		graph::{GraphRef, GraphStorageMode},
 	};
 
-	use super::common::{assert_people_graph, commit_people_graph, create_uncommitted_graph};
+	use super::common::{
+		assert_people_graph,
+		commit_people_graph,
+		create_uncommitted_graph,
+		exercise_normalized_atom_model,
+	};
 
 	#[test]
 	fn commit_is_visible_through_the_public_graph_api() {
@@ -31,5 +36,11 @@ mod tests {
 		let reference = create_uncommitted_graph(&store);
 
 		assert!(GraphRef::read(&reference, &store.begin()).is_err());
+	}
+
+	#[test]
+	fn normalized_atom_model_preserves_shared_base_and_isolates_graph_state() {
+		let store = Datastore::in_memory();
+		exercise_normalized_atom_model(&store);
 	}
 }

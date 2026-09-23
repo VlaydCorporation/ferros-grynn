@@ -12,6 +12,7 @@ pub struct SelectStatement {
 	pub value: bool,
 	pub projection: Vec<SelectItem>,
 	pub target: SelectTarget,
+	pub graph: Option<Identifier>,
 	pub filter: Option<Expr>,
 	pub limit: Option<Expr>,
 	pub start: Option<Expr>,
@@ -30,9 +31,9 @@ pub enum SelectItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SelectTarget {
-	Table(Identifier),
+	Class(Identifier),
 	Record {
-		table: Identifier,
+		class: Identifier,
 		key: RecordKey,
 		span: TextSpan,
 	},
@@ -87,6 +88,12 @@ impl Parser<'_> {
 		}
 		self.expect_keyword(keywords::FROM, "Expected `FROM` after SELECT projection.")?;
 		let target = self.select_target()?;
+		let graph = if self.consume_keyword(keywords::IN).is_some() {
+			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `IN`.")?;
+			Some(self.identifier()?)
+		} else {
+			None
+		};
 		let filter = if self.consume_keyword(keywords::WHERE).is_some() {
 			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else {
@@ -115,6 +122,7 @@ impl Parser<'_> {
 			value,
 			projection,
 			target,
+			graph,
 			filter,
 			limit,
 			start,
@@ -122,12 +130,12 @@ impl Parser<'_> {
 	}
 
 	fn select_target(&mut self) -> FerrosGrynnResult<SelectTarget> {
-		let table = self.identifier()?;
+		let class = self.identifier()?;
 		if !self.at_symbol(Symbol::Colon)
 			|| self.current().gap_before
 			|| self.tokens.peek(1).gap_before
 		{
-			return Ok(SelectTarget::Table(table));
+			return Ok(SelectTarget::Class(class));
 		}
 		self.tokens.next();
 		let token = self.tokens.next();
@@ -141,8 +149,8 @@ impl Parser<'_> {
 			_ => return Err(self.syntax("Expected a record ID after `:`.", token.span)),
 		};
 		Ok(SelectTarget::Record {
-			span: cover(table.span, key.span()),
-			table,
+			span: cover(class.span, key.span()),
+			class,
 			key,
 		})
 	}

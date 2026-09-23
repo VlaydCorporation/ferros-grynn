@@ -33,6 +33,7 @@ pub use graph::{
 	Frozen,
 	FrozenGraph,
 	Graph,
+	GraphId,
 	GraphKind,
 	GraphRef,
 	GraphStorageMode,

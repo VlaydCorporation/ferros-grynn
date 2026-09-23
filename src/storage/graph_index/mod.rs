@@ -16,9 +16,55 @@ use super::page::{
 	PageType,
 };
 use crate::{
+	datastore::GlobalAtomId,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	graph::AtomKind,
 	values::storage::DiskAtomRef,
 };
+
+/// Raw-address contract shared by the global primary and graph-local indexes.
+pub(super) trait PrimaryAddress: Copy + Eq {
+	fn from_raw(raw: u64) -> FerrosGrynnResult<Self>;
+	fn raw(self) -> u64;
+	fn kind(self) -> Option<AtomKind>;
+	fn order_key(self) -> u64;
+}
+
+impl PrimaryAddress for DiskAtomRef {
+	fn from_raw(raw: u64) -> FerrosGrynnResult<Self> {
+		DiskAtomRef::from_raw(raw)
+	}
+
+	fn raw(self) -> u64 {
+		self.raw()
+	}
+
+	fn kind(self) -> Option<AtomKind> {
+		Some(self.kind())
+	}
+
+	fn order_key(self) -> u64 {
+		self.slot()
+	}
+}
+
+impl PrimaryAddress for GlobalAtomId {
+	fn from_raw(raw: u64) -> FerrosGrynnResult<Self> {
+		GlobalAtomId::from_storage(raw)
+	}
+
+	fn raw(self) -> u64 {
+		self.raw()
+	}
+
+	fn kind(self) -> Option<AtomKind> {
+		self.kind()
+	}
+
+	fn order_key(self) -> u64 {
+		self.raw()
+	}
+}
 
 /// Shared B+tree page construction and lookup primitives.
 mod btree_idx;
@@ -44,6 +90,7 @@ mod scalar_idx;
 use btree_idx::*;
 pub(super) use bulk_build::{build_primary_index_sorted, build_scalar_index_sorted};
 pub(super) use count_idx::{
+	CountIndexScope,
 	CountIndexValue,
 	decode_count_index,
 	encode_count_index,
@@ -54,11 +101,17 @@ pub(super) use external_sort::{
 	SortedIndexRecords,
 	cleanup_external_index_sort,
 };
-pub(super) use label_dict::{LabelDictionary, decode_label_dictionary, encode_label_dictionary};
+pub(super) use label_dict::{
+	LabelDictionary,
+	LabelKind,
+	decode_label_dictionary,
+	encode_label_dictionary,
+};
 pub(super) use label_idx::{build_label_index, visit_label_index_pages};
 #[cfg(test)]
 use primary_idx::build_primary_index_with_fill;
 pub(super) use primary_idx::{
+	BuiltPrimaryIndex,
 	PrimaryIndexEntry,
 	PrimaryIndexMutation,
 	apply_primary_mutations,
@@ -82,18 +135,6 @@ pub(super) use scalar_idx::{
 	range_scalar_index,
 	scan_scalar_index,
 };
-
-const LABEL_COUNT_OFFSETS: [usize; 4] = [32, 36, 40, 44];
-const LABEL_ROOT_OFFSETS: [usize; 4] = [48, 56, 64, 72];
-const LABEL_HASH_ROOT_OFFSET: usize = 80;
-const LABEL_TZ_HASH_ROOT_OFFSET: usize = 88;
-const LABEL_TZ_ROOT_OFFSET: usize = 96;
-const LABEL_HEADER_RESERVED_OFFSET: usize = 104;
-const LABEL_ENTRY_NEXT_OFFSET: usize = PAGE_HEADER_SIZE;
-const LABEL_ENTRY_COUNT_OFFSET: usize = 40;
-const LABEL_ENTRY_RESERVED_OFFSET: usize = 44;
-const LABEL_ENTRY_DATA_OFFSET: usize = 48;
-const LABEL_ENTRY_FIXED_BYTES: usize = 6;
 
 const LEAF_NEXT_OFFSET: usize = PAGE_HEADER_SIZE;
 const LEAF_COUNT_OFFSET: usize = 40;
@@ -134,9 +175,6 @@ mod tests {
 		let dictionary = LabelDictionary {
 			node_labels: (0..1_200).map(|id| format!("node-{id:04}")).collect(),
 			edge_labels: vec!["knows".to_owned()],
-			property_keys: vec!["name".to_owned(), "age".to_owned()],
-			table_names: vec!["person".to_owned()],
-			time_zones: vec!["Europe/Moscow".to_owned(), "America/New_York".to_owned()],
 		};
 		let pages = encode_label_dictionary(&dictionary, PageLsn::ZERO)?;
 		let decoded = decode_label_dictionary(|page_no, output| {
@@ -174,8 +212,8 @@ mod tests {
 			lookup_primary_index(read, built.root, b"person:00003999")?.map(DiskAtomRef::slot),
 			Some(3_999)
 		);
-		assert_eq!(lookup_primary_index(read, built.root, b"person:missing")?, None);
-		let scanned = scan_primary_index(
+		assert_eq!(lookup_primary_index::<DiskAtomRef>(read, built.root, b"person:missing")?, None);
+		let scanned: Vec<PrimaryIndexEntry<DiskAtomRef>> = scan_primary_index(
 			|page_no, output| {
 				let page = built
 					.pages
@@ -187,6 +225,30 @@ mod tests {
 			built.root,
 		)?;
 		assert_eq!(scanned, entries);
+		Ok(())
+	}
+
+	#[test]
+	fn global_primary_preserves_atom_generation() -> FerrosGrynnResult<()> {
+		let atom = GlobalAtomId::from_storage((37_u64 << 41) | (1_u64 << 40) | 19)?;
+		let entries = [PrimaryIndexEntry {
+			key: b"relationship:knows".to_vec(),
+			atom,
+		}];
+		let built = build_primary_index(&entries, PageLsn::ZERO)?;
+		let decoded = lookup_primary_index(
+			|page_no, output| {
+				output
+					.as_bytes_mut()
+					.copy_from_slice(built.pages[page_no.get() as usize].as_bytes());
+				Ok(())
+			},
+			built.root,
+			b"relationship:knows",
+		)?;
+
+		assert_eq!(decoded, Some(atom));
+		assert_eq!(decoded.map(GlobalAtomId::generation), Some(37));
 		Ok(())
 	}
 
@@ -227,7 +289,7 @@ mod tests {
 		for (page_no, page) in pages {
 			built.pages[page_no.get() as usize] = page;
 		}
-		let scanned = scan_primary_index(
+		let scanned: Vec<PrimaryIndexEntry<DiskAtomRef>> = scan_primary_index(
 			|page_no, output| {
 				output
 					.as_bytes_mut()
@@ -262,7 +324,7 @@ mod tests {
 					Ok(())
 				},
 				built.root,
-				&[PrimaryIndexMutation {
+				&[PrimaryIndexMutation::<DiskAtomRef> {
 					key: separator.to_vec(),
 					atom: None,
 				}],
@@ -529,10 +591,15 @@ mod tests {
 			Ok(())
 		};
 		assert_eq!(
-			lookup_scalar_index(read, built.root, ScalarIndexMode::Standard, b"middle")?,
+			lookup_scalar_index::<DiskAtomRef>(
+				read,
+				built.root,
+				ScalarIndexMode::Standard,
+				b"middle",
+			)?,
 			repeated
 		);
-		let range = range_scalar_index(
+		let range = range_scalar_index::<DiskAtomRef>(
 			|page_no, output| {
 				let page = built
 					.pages
@@ -619,7 +686,7 @@ mod tests {
 			built.pages[page_no.get() as usize] = page;
 		}
 		assert_eq!(
-			lookup_scalar_index(
+			lookup_scalar_index::<DiskAtomRef>(
 				|page_no, output| {
 					output
 						.as_bytes_mut()
@@ -648,7 +715,7 @@ mod tests {
 		let built = build_scalar_index(&entries, ScalarIndexMode::Unique, PageLsn::ZERO)?;
 		assert!(built.root != PageNo::new(0));
 		let mut first_leaf_read = false;
-		let atoms = range_scalar_index(
+		let atoms = range_scalar_index::<DiskAtomRef>(
 			|page_no, output| {
 				first_leaf_read |= page_no == PageNo::new(0);
 				let page = built
@@ -678,7 +745,7 @@ mod tests {
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		let pages = build_label_index(&atoms, AtomKind::Node, PageLsn::ZERO)?;
 		assert!(pages.len() > 1);
-		let mut decoded = Vec::new();
+		let mut decoded = Vec::<DiskAtomRef>::new();
 		visit_label_index_pages(
 			|page_no, output| {
 				let page = pages
@@ -701,14 +768,15 @@ mod tests {
 	#[test]
 	fn count_index_round_trips_and_rejects_trailing_bytes() -> FerrosGrynnResult<()> {
 		let value = CountIndexValue {
-			table_id: 7,
+			class_id: 7,
+			scope: CountIndexScope::Base,
 			atom_count: 42,
 			last_updated_lsn: 11,
 			created_at_lsn: 3,
 		};
 		let mut page = encode_count_index(value, PageLsn::ZERO)?;
 		assert_eq!(decode_count_index(&page)?, value);
-		page.as_bytes_mut()[64] = 1;
+		page.as_bytes_mut()[72] = 1;
 		page.seal()?;
 		assert!(decode_count_index(&page).is_err());
 		Ok(())
@@ -718,7 +786,8 @@ mod tests {
 	fn count_index_wal_stamp_updates_payload_and_checksum() -> FerrosGrynnResult<()> {
 		let mut page = encode_count_index(
 			CountIndexValue {
-				table_id: 7,
+				class_id: 7,
+				scope: CountIndexScope::Base,
 				atom_count: 42,
 				last_updated_lsn: 0,
 				created_at_lsn: 0,
@@ -758,7 +827,7 @@ mod tests {
 			let records = sorter.finish()?;
 			let built =
 				build_scalar_index_sorted(&records, ScalarIndexMode::Standard, PageLsn::ZERO)?;
-			let atoms = lookup_scalar_index(
+			let atoms = lookup_scalar_index::<DiskAtomRef>(
 				|page_no, output| {
 					let page = built
 						.pages

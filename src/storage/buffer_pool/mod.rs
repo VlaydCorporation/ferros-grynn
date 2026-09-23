@@ -589,9 +589,12 @@ mod tests {
 	use rapidhash::fast::RandomState as RapidRandomState;
 
 	use super::*;
-	use crate::storage::{
-		page::{PAGE_HEADER_SIZE, PageFlags, PageType},
-		types::{DataFileId, DataFileKind, GraphId},
+	use crate::{
+		graph::GraphId,
+		storage::{
+			page::{PAGE_HEADER_SIZE, PageFlags, PageType},
+			types::{DataFileId, DataFileKind},
+		},
 	};
 
 	/// Data file used by deterministic unit tests.
@@ -609,7 +612,7 @@ mod tests {
 	/// Creates a typed cache key for the test source.
 	const fn key(page_no: u64, version: u64) -> PageCacheKey {
 		PageCacheKey::new(
-			PageKey::new(GraphId::SYSTEM, TEST_FILE_ID, PageNo::new(page_no)),
+			PageKey::for_database(TEST_FILE_ID, PageNo::new(page_no)),
 			PageCacheVersion::Wal(PageLsn::new(version)),
 		)
 	}
@@ -617,7 +620,7 @@ mod tests {
 	/// Creates a WAL cache key for one page in the same physical file.
 	const fn file_key(first: PageKey, page_no: PageNo, version: PageLsn) -> PageCacheKey {
 		PageCacheKey::new(
-			PageKey::new(first.graph_id(), first.file_id(), page_no),
+			PageKey::new(first.space_id(), first.file_id(), page_no),
 			PageCacheVersion::Wal(version),
 		)
 	}
@@ -764,10 +767,8 @@ mod tests {
 			.ok_or_else(|| io::Error::other("invalid second cache test file id"))?;
 		let page_no = PageNo::new(7);
 		let version = PageCacheVersion::Wal(PageLsn::new(11));
-		let first_key =
-			PageCacheKey::new(PageKey::new(GraphId::SYSTEM, first_file, page_no), version);
-		let second_key =
-			PageCacheKey::new(PageKey::new(GraphId::SYSTEM, second_file, page_no), version);
+		let first_key = PageCacheKey::new(PageKey::for_database(first_file, page_no), version);
+		let second_key = PageCacheKey::new(PageKey::for_database(second_file, page_no), version);
 		let pool = BufferPool::new(capacity(2)?);
 
 		drop(pool.get_or_load(first_key, |page| load_test_page(page, first_key, 1))?);
@@ -1193,8 +1194,9 @@ mod tests {
 	#[test]
 	fn batch_preserves_order_duplicates_and_contiguous_extents() -> Result<(), Box<dyn Error>> {
 		let pool = BufferPool::new(capacity(8)?);
+		let graph_id = GraphId::new(2).ok_or("test graph identity is zero")?;
 		let second_key = PageCacheKey::new(
-			PageKey::new(GraphId::new(2), TEST_FILE_ID, PageNo::new(0)),
+			PageKey::for_graph(graph_id, TEST_FILE_ID, PageNo::new(0)),
 			PageCacheVersion::Wal(PageLsn::new(1)),
 		);
 		let requests = [key(2, 1), key(0, 1), key(2, 1), second_key, key(1, 1), key(5, 1)];
@@ -1216,9 +1218,9 @@ mod tests {
 		})?;
 
 		assert_eq!(extents, [
-			(PageKey::new(GraphId::SYSTEM, TEST_FILE_ID, PageNo::new(0)), 3),
-			(PageKey::new(GraphId::SYSTEM, TEST_FILE_ID, PageNo::new(5)), 1),
-			(PageKey::new(GraphId::new(2), TEST_FILE_ID, PageNo::new(0)), 1),
+			(PageKey::for_database(TEST_FILE_ID, PageNo::new(0)), 3),
+			(PageKey::for_database(TEST_FILE_ID, PageNo::new(5)), 1),
+			(PageKey::for_graph(graph_id, TEST_FILE_ID, PageNo::new(0)), 1),
 		]);
 		assert_eq!(
 			pages.iter().map(|guard| guard.as_bytes()[PAGE_HEADER_SIZE]).collect::<Vec<_>>(),

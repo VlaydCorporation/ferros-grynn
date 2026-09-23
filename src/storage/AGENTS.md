@@ -30,10 +30,14 @@
 - `buffer_pool` — прежний Clock-Pro, доступный только тестам и prototype-control;
 - `page_manager` — staged/WAL/home resolution и production HybridReadEngine;
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
-- `catalog` и `superblock` — versioned database metadata;
-- `graph_pages` — текущие физические graph page families; target 8.1 сохраняет
-  `NodeHotPage`/`EdgeHotPage` как graph-local occurrence storage и добавляет
-  database-level `AtomHotPage` для global base atoms;
+- `catalog` — `FGFC v5` physical registry и bounded `FGDC v7` page-chain;
+- `atom_store_superblock` — exact database-global AtomStore ceilings/counts и checkpoint tuple;
+- `property_dictionary` — append-only database-global `PropertyKeyId ↔ UTF-8` pages и hash lookup;
+- `metadata_cow` — общий checkpoint-протокол `.tmp`/main/`.prev`, не используемый обычным commit;
+- `graph_pages` — graph-local `NodeHotPage`/`EdgeHotPage` occurrences,
+  topology, labels, sparse overlays and scoped statistics;
+- `atom_page`/`atom_store_image` — database-global `AtomHotPage`, base
+  properties, global primary и reverse memberships;
 - `graph_index` — order-preserving primary и общий внутренний B+tree codec для
   раздельных Standard/Unique контрактов, bounded Direct-I/O
   external sort, bottom-up packing, immutable Label arrays и single-page Count;
@@ -56,22 +60,26 @@
   filename. Binding индекса разрешается по `IndexId`, не по имени.
 - `GraphSuperblock` хранится только в `superblock.fgb`. В текущем codec ровно
   шесть изменяемых graph data-файлов имеют отдельные `freelist_*.fgb`, а binding
-  хранится в `FGFC v4.companion_of`; target 8.1 сохраняет раздельные файлы и
-  переносит binding в `FGFC v5` с `DataSpaceId`. Standard и Unique называются
+  хранится в `FGFC v5.companion_of` вместе с `DataSpaceId`. Standard и Unique называются
   соответственно `std_<ordinal:04>.fgidx` и `uniq_<ordinal:04>.fgidx`; `scalar`
   допустим только как внутреннее имя общей реализации.
-- В target 8.1 `AtomHotPage` хранит только database-global class, RecordId и
+- `AtomHotPage` хранит только database-global class, RecordId и
   base properties. `NodeHotPage`/`EdgeHotPage` хранят membership occurrence,
-  `GlobalAtomId`, label/overlay и topology; сами page families не являются
-  legacy. Отклонён только прежний graph-owned payload с `table_id`, base
-  properties и durable query-scratch flags. Точные offsets задают
+  `GlobalAtomId`, label/overlay и topology. Точные offsets задают
   `docs/disk_storage_spec.md` §§10–11.
-- Текущий implementation codec всё ещё использует `FGDC v5` и системный
-  `GraphId = 0`; это не target-инвариант. Cutover A8–A16 принимает только
-  `FGDC v6`/`FGFC v5`, использует `DataSpaceId::Database`, не создаёт системный
-  graph и сохраняет ненулевой `GraphId` для каждого graph. Missing/unopenable/
-  checksum-corrupt secondary по-прежнему переводится в `Stale` и даёт scan
+- Собираемый target использует `FGDC v7`/`FGFC v5`, `DataSpaceId::Database` для AtomStore
+  и не создаёт системный graph; `GraphId` каждого graph ненулевой. AtomStore и
+  graph occurrences публикуются одним WAL transaction и открываются по одной
+  snapshot boundary. Missing/unopenable/checksum-corrupt secondary переводится в `Stale` и даёт scan
   fallback, а primary/base corruption остаётся фатальной.
+- Bulk builders на Windows MSVC должны сначала выделять окончательные
+  `Vec`-slots/arena и только затем заполнять 16 KiB `AlignedPage` через `&mut`.
+  В ASan-инструментированном большом builder-path наблюдалась codegen-sensitive
+  порча первого byte при возврате уже заполненной страницы по значению, хотя
+  проверенные адреса оставались выровненными. `Box` стабилизирует адрес
+  конкретного call site, но сам по себе не исключает временное stack-значение;
+  границы доказанного описаны в
+  `docs/reports/aligned_page_corruption_investigation.md`.
 - Immutable external-sort B+tree generations заполняют leaves до capacity.
   Point-DML сначала применяет page-WAL leaf update при стабильных separators и
   posting layout; bulk fallback использует measured mutable fill `0.90` для

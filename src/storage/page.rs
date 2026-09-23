@@ -43,6 +43,10 @@ pub(super) struct PageMagic(u32);
 impl PageMagic {
 	/// Adjacency overflow marker (`b"FAO\x01"`).
 	pub(super) const ADJACENCY_OVERFLOW: Self = Self(0x01_4f_41_46);
+	/// Database-global atom hot-page marker (`b"FAH\x01"`).
+	pub(super) const ATOM_HOT: Self = Self(0x01_48_41_46);
+	/// Database-global atom-store superblock marker (`b"FAS\x01"`).
+	pub(super) const ATOM_STORE: Self = Self(0x01_53_41_46);
 	/// Changefeed marker (`b"FCF\x01"`).
 	pub(super) const CHANGEFEED: Self = Self(0x01_46_43_46);
 	/// Cross-level adjacency overflow marker (`b"FAC\x01"`).
@@ -77,6 +81,8 @@ impl PageMagic {
 	pub(super) const LABEL_DICTIONARY: Self = Self(0x01_44_4c_46);
 	/// Node hot-page marker (`b"FHN\x01"`).
 	pub(super) const NODE_HOT: Self = Self(0x01_4e_48_46);
+	/// Graph-local property-overlay marker (`b"FOV\x01"`).
+	pub(super) const OVERLAY: Self = Self(0x01_56_4f_46);
 	/// Property heap marker (`b"FHP\x01"`).
 	pub(super) const PROPERTY_HEAP: Self = Self(0x01_50_48_46);
 	/// Schema catalog marker (`b"FCH\x01"`).
@@ -255,6 +261,18 @@ define_page_types! {
 	ChangefeedEntry = 0x0036 => CHANGEFEED;
 	/// Tensor-cache page.
 	TensorCache = 0x0037 => TENSOR;
+	/// Database-global atom-store superblock.
+	AtomStoreSuperblock = 0x0038 => ATOM_STORE;
+	/// Database-global fixed atom hot page.
+	AtomHot = 0x0039 => ATOM_HOT;
+	/// Graph-local sparse property-overlay page.
+	GraphOverlay = 0x003a => OVERLAY;
+	/// Per-class statistics page.
+	ClassStatistic = 0x003b => STATISTICS;
+	/// Database-global property-key dictionary root page.
+	PropertyDictionaryRoot = 0x003c => ATOM_STORE;
+	/// Database-global property-key dictionary entry page.
+	PropertyDictionaryEntry = 0x003d => ATOM_STORE;
 }
 
 bitflags! {
@@ -728,7 +746,10 @@ mod tests {
 		}
 		assert_eq!(PageType::from_raw(0x0008), None);
 		assert_eq!(PageType::from_raw(0x0009), None);
-		assert_eq!(PageType::from_raw(0x0038), None);
+		assert_eq!(PageType::from_raw(0x0038), Some(PageType::AtomStoreSuperblock));
+		assert_eq!(PageType::from_raw(0x003c), Some(PageType::PropertyDictionaryRoot));
+		assert_eq!(PageType::from_raw(0x003d), Some(PageType::PropertyDictionaryEntry));
+		assert_eq!(PageType::from_raw(0x003e), None);
 	}
 
 	#[test]

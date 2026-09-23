@@ -50,11 +50,11 @@ pub(in crate::storage::wal) const WAL_CHECKSUM_PREFIX_SIZE: usize =
 pub(in crate::storage::wal) const DEFAULT_SEGMENT_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum unique staged page bytes in one synchronous transaction.
 pub(in crate::storage::wal) const MAX_TX_WRITE_BYTES: usize = 256 * 1024 * 1024;
-/// Graph identity offset inside a PageFrame key.
-pub(in crate::storage::wal) const PAGE_FRAME_GRAPH_ID_OFFSET: usize = 0;
+/// Data-space identity offset inside a PageFrame key.
+pub(in crate::storage::wal) const PAGE_FRAME_SPACE_ID_OFFSET: usize = 0;
 /// Data-file identity offset inside a PageFrame key.
 pub(in crate::storage::wal) const PAGE_FRAME_FILE_ID_OFFSET: usize =
-	PAGE_FRAME_GRAPH_ID_OFFSET + size_of::<u64>();
+	PAGE_FRAME_SPACE_ID_OFFSET + size_of::<u64>();
 /// Page-number offset inside a PageFrame key.
 pub(in crate::storage::wal) const PAGE_FRAME_PAGE_NO_OFFSET: usize =
 	PAGE_FRAME_FILE_ID_OFFSET + size_of::<u64>();
@@ -178,7 +178,7 @@ pub(in crate::storage::wal) const fn is_logical_annotation_kind(kind: u8) -> boo
 
 /// Encodes the fixed PageFrame identity.
 pub(in crate::storage::wal) fn encode_page_key(key: PageKey, output: &mut Vec<u8>) {
-	output.extend_from_slice(&key.graph_id().get().to_le_bytes());
+	output.extend_from_slice(&key.space_id().raw().to_le_bytes());
 	output.extend_from_slice(&key.file_id().get().to_le_bytes());
 	output.extend_from_slice(&key.page_no().get().to_le_bytes());
 }
@@ -190,11 +190,9 @@ pub(in crate::storage::wal) fn decode_page_key(payload: &[u8]) -> FerrosGrynnRes
 	}
 	let file_id = DataFileId::from_raw(read_u64(payload, PAGE_FRAME_FILE_ID_OFFSET))
 		.ok_or_else(|| invalid_wal("PageFrame contains an unknown data-file identity"))?;
-	Ok(PageKey::new(
-		GraphId::new(read_u64(payload, PAGE_FRAME_GRAPH_ID_OFFSET)),
-		file_id,
-		PageNo::new(read_u64(payload, PAGE_FRAME_PAGE_NO_OFFSET)),
-	))
+	let space_id = DataSpaceId::from_raw(read_u64(payload, PAGE_FRAME_SPACE_ID_OFFSET))
+		.ok_or_else(|| invalid_wal("PageFrame contains an invalid data-space identity"))?;
+	Ok(PageKey::new(space_id, file_id, PageNo::new(read_u64(payload, PAGE_FRAME_PAGE_NO_OFFSET))))
 }
 
 /// Encodes one fixed PageInit allocation marker.
@@ -203,8 +201,8 @@ pub(in crate::storage::wal) fn encode_page_init(
 	page_type: PageType,
 ) -> [u8; PAGE_INIT_PAYLOAD_SIZE] {
 	let mut payload = [0_u8; PAGE_INIT_PAYLOAD_SIZE];
-	payload[PAGE_FRAME_GRAPH_ID_OFFSET..PAGE_FRAME_FILE_ID_OFFSET]
-		.copy_from_slice(&key.graph_id().get().to_le_bytes());
+	payload[PAGE_FRAME_SPACE_ID_OFFSET..PAGE_FRAME_FILE_ID_OFFSET]
+		.copy_from_slice(&key.space_id().raw().to_le_bytes());
 	payload[PAGE_FRAME_FILE_ID_OFFSET..PAGE_INIT_PAGE_TYPE_OFFSET]
 		.copy_from_slice(&key.file_id().get().to_le_bytes());
 	payload[PAGE_INIT_PAGE_TYPE_OFFSET..PAGE_INIT_RESERVED_OFFSET]
@@ -230,12 +228,10 @@ pub(in crate::storage::wal) fn decode_page_init(
 		.ok_or_else(|| invalid_wal("PageInit contains an unknown data-file identity"))?;
 	let page_type = PageType::from_raw(read_u16(payload, PAGE_INIT_PAGE_TYPE_OFFSET))
 		.ok_or_else(|| invalid_wal("PageInit contains an unknown page type"))?;
+	let space_id = DataSpaceId::from_raw(read_u64(payload, PAGE_FRAME_SPACE_ID_OFFSET))
+		.ok_or_else(|| invalid_wal("PageInit contains an invalid data-space identity"))?;
 	Ok((
-		PageKey::new(
-			GraphId::new(read_u64(payload, PAGE_FRAME_GRAPH_ID_OFFSET)),
-			file_id,
-			PageNo::new(read_u64(payload, PAGE_INIT_PAGE_NO_OFFSET)),
-		),
+		PageKey::new(space_id, file_id, PageNo::new(read_u64(payload, PAGE_INIT_PAGE_NO_OFFSET))),
 		page_type,
 	))
 }

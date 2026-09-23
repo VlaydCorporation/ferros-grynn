@@ -1,0 +1,162 @@
+//! Public datastore construction and immutable-snapshot entry points.
+
+use std::{
+	path::Path,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
+};
+
+use parking_lot::{Mutex, RwLock};
+
+use super::{
+	CheckpointMode,
+	ClassId,
+	ClassSchema,
+	DatabaseRoot,
+	DatastoreOptions,
+	GraphSchema,
+	InMemoryOptions,
+	LocalOptions,
+	SchemaCatalog,
+	StoreBackend,
+	StoreInner,
+	Transaction,
+	TransactionOptions,
+	validate_local_options,
+};
+use crate::{
+	gql_status::FerrosGrynnResult,
+	graph::GraphId,
+	storage::LocalStore,
+	values::PropertyDictionary,
+};
+
+/// Database owning one global atom registry and any number of graph views.
+#[derive(Clone)]
+pub struct Datastore {
+	pub(crate) inner: Arc<StoreInner>,
+}
+
+impl Datastore {
+	/// Creates a volatile datastore with default transaction limits.
+	pub fn in_memory() -> Self {
+		Self::in_memory_with(InMemoryOptions::default())
+	}
+
+	/// Creates a volatile datastore with explicit transaction limits.
+	pub fn in_memory_with(options: InMemoryOptions) -> Self {
+		Self::from_parts(
+			DatastoreOptions::InMemory(options),
+			StoreBackend::InMemory,
+			DatabaseRoot::default(),
+		)
+	}
+
+	/// Creates and exclusively opens a new local database directory.
+	pub fn create_local(path: impl AsRef<Path>, options: LocalOptions) -> FerrosGrynnResult<Self> {
+		let validated = validate_local_options(options)?;
+		let (local, root) = LocalStore::create(
+			path.as_ref(),
+			validated.pool_pages,
+			validated.io_mode,
+			validated.checkpoint_page_threshold,
+			options.checkpoint.interval,
+		)?;
+		Ok(Self::from_parts(
+			DatastoreOptions::Local(options),
+			StoreBackend::Local(Box::new(local)),
+			root,
+		))
+	}
+
+	/// Opens, recovers, and exclusively owns an existing local database.
+	pub fn open_local(path: impl AsRef<Path>, options: LocalOptions) -> FerrosGrynnResult<Self> {
+		let validated = validate_local_options(options)?;
+		let (local, root) = LocalStore::open(
+			path.as_ref(),
+			validated.pool_pages,
+			validated.io_mode,
+			validated.checkpoint_page_threshold,
+			options.checkpoint.interval,
+		)?;
+		Ok(Self::from_parts(
+			DatastoreOptions::Local(options),
+			StoreBackend::Local(Box::new(local)),
+			root,
+		))
+	}
+
+	fn from_parts(options: DatastoreOptions, backend: StoreBackend, root: DatabaseRoot) -> Self {
+		let next_schema_id = root.schema.next_schema_id;
+		let next_graph_id = root.schema.next_graph_id;
+		Self {
+			inner: Arc::new(StoreInner {
+				options,
+				backend,
+				next_transaction: AtomicU64::new(1),
+				next_schema_id: AtomicU64::new(next_schema_id),
+				next_graph_id: AtomicU64::new(next_graph_id),
+				current: RwLock::new(Arc::new(root)),
+				commit: Mutex::new(()),
+			}),
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn from_root_for_test(options: InMemoryOptions, root: DatabaseRoot) -> Self {
+		Self::from_parts(DatastoreOptions::InMemory(options), StoreBackend::InMemory, root)
+	}
+
+	/// Opens a default serializable read-write transaction.
+	pub fn begin(&self) -> Transaction {
+		self.begin_with(TransactionOptions::default())
+	}
+
+	/// Opens a transaction on one immutable database-wide snapshot.
+	pub fn begin_with(&self, options: TransactionOptions) -> Transaction {
+		let root = self.inner.current_root();
+		Transaction::new(
+			self.clone(),
+			self.inner.next_transaction.fetch_add(1, Ordering::Relaxed),
+			options,
+			root,
+		)
+	}
+
+	/// Returns the selected backend and resource limits.
+	pub fn options(&self) -> DatastoreOptions {
+		self.inner.options
+	}
+
+	/// Runs explicit local maintenance; volatile stores have no checkpoint.
+	pub fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<bool> {
+		self.inner.checkpoint(mode)
+	}
+
+	/// Returns the currently published schema catalog.
+	pub fn schema_catalog(&self) -> Arc<SchemaCatalog> {
+		self.inner.current_root().schema.clone()
+	}
+
+	/// Returns the currently published property-key dictionary.
+	pub fn property_dictionary(&self) -> Arc<PropertyDictionary> {
+		self.inner.current_root().dictionary.clone()
+	}
+
+	/// Resolves one currently published class.
+	pub fn class(&self, name: &str) -> Option<Arc<ClassSchema>> {
+		self.schema_catalog().class(name)
+	}
+
+	/// Resolves one currently published graph.
+	pub fn graph(&self, id: GraphId) -> Option<Arc<GraphSchema>> {
+		self.schema_catalog().graph(id)
+	}
+
+	/// Resolves a class by its stable identity.
+	pub fn class_by_id(&self, id: ClassId) -> Option<Arc<ClassSchema>> {
+		self.schema_catalog().class_by_id(id)
+	}
+}

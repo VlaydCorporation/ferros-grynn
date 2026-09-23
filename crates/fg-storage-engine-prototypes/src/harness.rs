@@ -729,13 +729,10 @@ impl Dataset {
 
 	/// Creates the exact immutable key for one page in this dataset.
 	fn key(&self, page_no: PageNo) -> PageCacheKey {
-		PageCacheKey::new(
-			PageKey::new(GraphId::SYSTEM, self.source_id, page_no),
-			PageCacheVersion::Home {
-				generation: CheckpointGeneration::ZERO,
-				ceiling: Lsn::new(u64::MAX),
-			},
-		)
+		PageCacheKey::new(PageKey::for_database(self.source_id, page_no), PageCacheVersion::Home {
+			generation: CheckpointGeneration::ZERO,
+			ceiling: Lsn::new(u64::MAX),
+		})
 	}
 
 	/// Returns the header sealed into one immutable generated page.
@@ -7673,9 +7670,10 @@ mod harness_contract_tests {
 	fn scoped_direct_to_frame_validation_failure_publishes_no_page() -> Result<(), Box<dyn Error>> {
 		let file_id = DataFileId::new(1, DataFileKind::NodesHot)
 			.ok_or("test data-file identity is out of range")?;
+		let graph_id = GraphId::new(1).ok_or("test graph identity is zero")?;
 		let keys = [0_u64, 1].map(|page_no| {
 			PageCacheKey::new(
-				PageKey::new(GraphId::new(1), file_id, PageNo::new(page_no)),
+				PageKey::for_graph(graph_id, file_id, PageNo::new(page_no)),
 				PageCacheVersion::Home {
 					generation: CheckpointGeneration::new(1),
 					ceiling: Lsn::new(100),

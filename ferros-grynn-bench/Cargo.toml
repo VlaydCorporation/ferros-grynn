@@ -20,6 +20,10 @@ harness = false
 name = "graph_core"
 harness = false
 
+[[bench]]
+name = "atom_model"
+harness = false
+
 [dependencies]
 ferros-grynn = { workspace = true, default-features = false }
 

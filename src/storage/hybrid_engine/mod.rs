@@ -16,11 +16,14 @@ use super::{
 	PageIoMode,
 	page::{AlignedPage, PageHeader},
 	page_cache::{PageCacheKey, PageCacheVersion},
-	types::{DataFileId, GraphId},
+	types::DataFileId,
 };
 #[cfg(windows)]
 use super::{direct_io::DirectFile, page::PageNo};
-use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
+use crate::{
+	datastore::DataSpaceId,
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+};
 
 mod arena;
 mod route;
@@ -123,8 +126,8 @@ impl SparseReadBatch {
 /// version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SourceIdentity {
-	/// Graph address space owning the file.
-	graph_id: GraphId,
+	/// Database-global or graph-local address space owning the file.
+	space_id: DataSpaceId,
 	/// Never-reused physical file identity.
 	file_id: DataFileId,
 }
@@ -134,7 +137,7 @@ impl SourceIdentity {
 	const fn from_key(key: PageCacheKey) -> Self {
 		let page_key = key.page_key();
 		Self {
-			graph_id: page_key.graph_id(),
+			space_id: page_key.space_id(),
 			file_id: page_key.file_id(),
 		}
 	}

@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ferros_grynn::{
-	datastore::{Datastore, GraphWriteView, IsolationLevel, TransactionAccess, TransactionOptions},
+	datastore::{ClassSchema, Datastore, IsolationLevel, TransactionAccess, TransactionOptions},
 	graph::{
 		AtomKind,
 		AtomRef,
@@ -13,7 +13,8 @@ use ferros_grynn::{
 		Forest,
 		Frozen,
 		Graph,
-		GraphMut,
+		GraphId,
+		GraphKind,
 		GraphRead,
 		GraphRef,
 		GraphStorageMode,
@@ -31,7 +32,7 @@ use ferros_grynn::{
 		bfs,
 		query_to_memory,
 	},
-	values::{PropertyMap, RecordId, RecordIdPart},
+	values::{PropertyKeyId, PropertyMap, RecordId, RecordIdPart},
 };
 
 const SIZES: [usize; 2] = [128, 4_096];
@@ -116,10 +117,12 @@ fn benchmark_access_modes(criterion: &mut Criterion) {
 	for size in SIZES {
 		let (source, root) = general_chain(size);
 		let reference = GraphRef::new(
-			RecordId::new("graph", RecordIdPart::Int(size as i64)).unwrap(),
-			ferros_grynn::graph::GraphKind::Graph,
+			GraphId::new(size as u64).unwrap(),
+			format!("graph-{size}"),
+			GraphKind::Graph,
 			GraphStorageMode::DiskBacked,
-		);
+		)
+		.unwrap();
 		let disk = DiskGraphView::new(&reference, &source, SnapshotId::new(1, 1)).unwrap();
 		let hybrid = query_to_memory::<Graph<Frozen>, _>(&disk).unwrap();
 		let hybrid_root = hybrid.node_ids().unwrap().next().unwrap().unwrap();
@@ -177,26 +180,23 @@ fn benchmark_path_and_live_publication(criterion: &mut Criterion) {
 			BatchSize::LargeInput,
 		);
 	});
-	let (graph, atom) = general_chain(4_096);
 	let store = Datastore::in_memory();
 	let mut setup = store.begin();
-	let reference = setup
-		.create_graph(
-			RecordId::new("graph", RecordIdPart::String("transaction-bench".into())).unwrap(),
-			graph.into(),
-		)
-		.unwrap();
+	setup.define_class(ClassSchema::new("bench_node", AtomKind::Node, []).unwrap()).unwrap();
+	let reference = setup.define_graph("transaction-bench", GraphKind::Graph).unwrap();
+	let record = RecordId::new("bench_node", RecordIdPart::String("shared".into())).unwrap();
+	setup.create_atom(record.clone(), PropertyMap::new()).unwrap();
+	setup.attach_node(reference.id(), &record, None, None).unwrap();
+	let key = PropertyKeyId::new(1);
 	setup.commit().unwrap();
-	group.bench_function("transaction_atom_commit/4096", |bench| {
+	group.bench_function("transaction_overlay_commit", |bench| {
 		bench.iter_batched(
 			|| {
 				let mut transaction = store.begin_with(TransactionOptions::new(
 					IsolationLevel::Snapshot,
 					TransactionAccess::ReadWrite,
 				));
-				if let GraphWriteView::Graph(graph) = transaction.edit_graph(&reference).unwrap() {
-					graph.node_properties_mut(atom).unwrap().insert(0_u32.into(), 1_i64);
-				}
+				transaction.set_overlay(reference.id(), &record, key, 1_i64.into()).unwrap();
 				transaction
 			},
 			|transaction| black_box(transaction.commit().unwrap()),

@@ -315,11 +315,6 @@ impl TxHandle {
 		key: PageKey,
 		page: &AlignedPage,
 	) -> FerrosGrynnResult<()> {
-		if key.file_id().kind() == Some(DataFileKind::GraphSuperblock) {
-			return Err(invalid_wal(
-				"GraphSuperblock is checkpoint-owned and cannot be staged as a transaction frame",
-			));
-		}
 		page.validate(key.page_no())?;
 		if !self.staged.contains_key(&key) {
 			let next_bytes = self.staged_bytes.checked_add(PAGE_SIZE).ok_or_else(|| {
@@ -354,12 +349,12 @@ impl TxHandle {
 	/// Returns the exclusive high-water page staged for one physical file.
 	pub(in crate::storage) fn staged_file_page_count(
 		&self,
-		graph_id: GraphId,
+		space_id: DataSpaceId,
 		file_id: DataFileId,
 	) -> Option<u64> {
 		self.staged
 			.keys()
-			.filter(|key| key.graph_id() == graph_id && key.file_id() == file_id)
+			.filter(|key| key.space_id() == space_id && key.file_id() == file_id)
 			.filter_map(|key| key.page_no().get().checked_add(1))
 			.max()
 	}

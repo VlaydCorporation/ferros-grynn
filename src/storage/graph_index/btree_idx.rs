@@ -7,7 +7,9 @@ pub(super) struct ChildPage {
 	pub(super) min_key: Vec<u8>,
 }
 
-pub(super) fn validate_primary_entries(entries: &[PrimaryIndexEntry]) -> FerrosGrynnResult<()> {
+pub(super) fn validate_primary_entries<Address: PrimaryAddress>(
+	entries: &[PrimaryIndexEntry<Address>],
+) -> FerrosGrynnResult<()> {
 	for (index, entry) in entries.iter().enumerate() {
 		if entry.key.is_empty() {
 			return Err(invalid_index("primary index contains an empty key"));
@@ -19,8 +21,8 @@ pub(super) fn validate_primary_entries(entries: &[PrimaryIndexEntry]) -> FerrosG
 	Ok(())
 }
 
-pub(super) fn validate_scalar_entries(
-	entries: &[ScalarIndexEntry],
+pub(super) fn validate_scalar_entries<Address: PrimaryAddress + Ord>(
+	entries: &[ScalarIndexEntry<Address>],
 	mode: ScalarIndexMode,
 ) -> FerrosGrynnResult<()> {
 	for (index, entry) in entries.iter().enumerate() {
@@ -43,16 +45,16 @@ pub(super) fn validate_scalar_entries(
 	Ok(())
 }
 
-pub(super) fn partition_standard_leaf_entries(
-	entries: &[ScalarIndexEntry],
-) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry]>> {
+pub(super) fn partition_standard_leaf_entries<Address: PrimaryAddress + Ord>(
+	entries: &[ScalarIndexEntry<Address>],
+) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry<Address>]>> {
 	partition_standard_leaf_entries_with_limit(entries, PAGE_SIZE)
 }
 
-pub(super) fn partition_standard_leaf_entries_with_limit(
-	entries: &[ScalarIndexEntry],
+pub(super) fn partition_standard_leaf_entries_with_limit<Address: PrimaryAddress + Ord>(
+	entries: &[ScalarIndexEntry<Address>],
 	maximum_bytes: usize,
-) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry]>> {
+) -> FerrosGrynnResult<Vec<&[ScalarIndexEntry<Address>]>> {
 	if maximum_bytes > PAGE_SIZE || maximum_bytes < LEAF_OFFSETS_OFFSET {
 		return Err(invalid_index("scalar leaf fill limit is outside page bounds"));
 	}
@@ -99,12 +101,12 @@ pub(super) fn partition_standard_leaf_entries_with_limit(
 	Ok(groups)
 }
 
-pub(super) fn encode_standard_leaf(
+pub(super) fn encode_standard_leaf<Address: PrimaryAddress + Ord>(
 	page: &mut AlignedPage,
 	page_no: PageNo,
 	page_lsn: PageLsn,
 	next: Option<PageNo>,
-	entries: &[ScalarIndexEntry],
+	entries: &[ScalarIndexEntry<Address>],
 	posting_roots: &BTreeMap<&[u8], PageNo>,
 ) -> FerrosGrynnResult<()> {
 	let count = u16::try_from(entries.len())
@@ -169,12 +171,12 @@ pub(super) fn encode_standard_leaf(
 	page.seal()
 }
 
-pub(super) fn encode_posting_page(
+pub(super) fn encode_posting_page<Address: PrimaryAddress>(
 	page: &mut AlignedPage,
 	page_no: PageNo,
 	page_lsn: PageLsn,
 	next: Option<PageNo>,
-	atoms: &[DiskAtomRef],
+	atoms: &[Address],
 ) -> FerrosGrynnResult<()> {
 	if atoms.is_empty() || atoms.len() > POSTING_ATOMS_PER_PAGE {
 		return Err(invalid_index("scalar posting page has an invalid atom count"));
@@ -219,11 +221,11 @@ pub(super) fn descend_to_leaf(
 	Err(invalid_index("scalar B+tree exceeds its maximum depth"))
 }
 
-pub(super) fn lookup_standard_leaf(
+pub(super) fn lookup_standard_leaf<Address: PrimaryAddress + Ord>(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	page: &AlignedPage,
 	target: &[u8],
-) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+) -> FerrosGrynnResult<Vec<Address>> {
 	let (count, area_start) = validate_standard_leaf_layout(page)?;
 	let mut low = 0;
 	let mut high = count;
@@ -239,10 +241,10 @@ pub(super) fn lookup_standard_leaf(
 	Ok(Vec::new())
 }
 
-pub(super) fn decode_standard_leaf_entries(
+pub(super) fn decode_standard_leaf_entries<Address: PrimaryAddress + Ord>(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	page: &AlignedPage,
-) -> FerrosGrynnResult<Vec<ScalarIndexEntry>> {
+) -> FerrosGrynnResult<Vec<ScalarIndexEntry<Address>>> {
 	let (count, area_start) = validate_standard_leaf_layout(page)?;
 	let mut entries = Vec::with_capacity(count);
 	for index in 0..count {
@@ -323,14 +325,14 @@ pub(super) fn validate_standard_leaf_layout(
 	Ok((count, area_start))
 }
 
-pub(super) fn decode_scalar_atoms(
+pub(super) fn decode_scalar_atoms<Address: PrimaryAddress + Ord>(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	entry: StandardLeafEntry<'_>,
-) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+) -> FerrosGrynnResult<Vec<Address>> {
 	let mut atoms = entry
 		.inline
 		.chunks_exact(DISK_ATOM_REF_BYTES)
-		.map(|bytes| DiskAtomRef::from_raw(read_u64(bytes, 0)))
+		.map(|bytes| Address::from_raw(read_u64(bytes, 0)))
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let mut page_no = entry.posting;
 	let mut visited = BTreeSet::new();
@@ -354,7 +356,7 @@ pub(super) fn decode_scalar_atoms(
 			return Err(invalid_index("scalar posting page count is inconsistent"));
 		}
 		for index in 0..count {
-			atoms.push(DiskAtomRef::from_raw(read_u64(
+			atoms.push(Address::from_raw(read_u64(
 				bytes,
 				POSTING_ATOMS_OFFSET + index * DISK_ATOM_REF_BYTES,
 			))?);
@@ -397,16 +399,16 @@ pub(super) fn upper_exceeded(key: &[u8], upper: &Bound<&[u8]>) -> bool {
 	}
 }
 
-pub(super) fn partition_leaf_entries(
-	entries: &[PrimaryIndexEntry],
-) -> FerrosGrynnResult<Vec<&[PrimaryIndexEntry]>> {
+pub(super) fn partition_leaf_entries<Address: PrimaryAddress>(
+	entries: &[PrimaryIndexEntry<Address>],
+) -> FerrosGrynnResult<Vec<&[PrimaryIndexEntry<Address>]>> {
 	partition_leaf_entries_with_limit(entries, PAGE_SIZE)
 }
 
-pub(super) fn partition_leaf_entries_with_limit(
-	entries: &[PrimaryIndexEntry],
+pub(super) fn partition_leaf_entries_with_limit<Address: PrimaryAddress>(
+	entries: &[PrimaryIndexEntry<Address>],
 	maximum_bytes: usize,
-) -> FerrosGrynnResult<Vec<&[PrimaryIndexEntry]>> {
+) -> FerrosGrynnResult<Vec<&[PrimaryIndexEntry<Address>]>> {
 	if maximum_bytes > PAGE_SIZE || maximum_bytes < LEAF_OFFSETS_OFFSET {
 		return Err(invalid_index("primary leaf fill limit is outside page bounds"));
 	}
@@ -451,12 +453,12 @@ pub(super) fn partition_leaf_entries_with_limit(
 	Ok(groups)
 }
 
-pub(super) fn encode_unique_leaf(
+pub(super) fn encode_unique_leaf<Address: PrimaryAddress>(
 	page: &mut AlignedPage,
 	page_no: PageNo,
 	page_lsn: PageLsn,
 	next: Option<PageNo>,
-	entries: &[PrimaryIndexEntry],
+	entries: &[PrimaryIndexEntry<Address>],
 ) -> FerrosGrynnResult<()> {
 	let count = u16::try_from(entries.len())
 		.map_err(|_error| invalid_index("primary leaf entry count exceeds u16"))?;
@@ -606,10 +608,10 @@ pub(super) fn append_internal_levels(
 	Ok(level.first().map_or(PageNo::new(0), |child| child.page_no))
 }
 
-pub(super) fn lookup_leaf(
+pub(super) fn lookup_leaf<Address: PrimaryAddress>(
 	page: &AlignedPage,
 	target: &[u8],
-) -> FerrosGrynnResult<Option<DiskAtomRef>> {
+) -> FerrosGrynnResult<Option<Address>> {
 	let bytes = page.as_bytes();
 	let (count, area_start) = validate_leaf_layout(page)?;
 	let mut low = 0;
@@ -622,7 +624,7 @@ pub(super) fn lookup_leaf(
 			std::cmp::Ordering::Greater => high = middle,
 			std::cmp::Ordering::Equal => {
 				let (_key, atom) = leaf_entry(bytes, area_start, count, middle)?;
-				return DiskAtomRef::from_raw(atom).map(Some);
+				return Address::from_raw(atom).map(Some);
 			}
 		}
 	}

@@ -79,12 +79,22 @@ impl CanonicalCodec {
 	}
 
 	pub fn decode(bytes: &[u8], limits: DecodeLimits) -> FerrosGrynnResult<StorageValue> {
-		let mut decoder = decode::Decoder::new(bytes, limits);
-		let value = decoder.decode_value(0)?;
-		if decoder.position != bytes.len() {
-			return Err(invalid(decoder.position, "trailing bytes after StorageValue"));
+		let (value, consumed) = Self::decode_prefix(bytes, limits)?;
+		if consumed != bytes.len() {
+			return Err(invalid(consumed, "trailing bytes after StorageValue"));
 		}
 		Ok(value)
+	}
+
+	/// Decodes one self-delimiting value from the beginning of a larger
+	/// canonical record.
+	pub(crate) fn decode_prefix(
+		bytes: &[u8],
+		limits: DecodeLimits,
+	) -> FerrosGrynnResult<(StorageValue, usize)> {
+		let mut decoder = decode::Decoder::new(bytes, limits);
+		let value = decoder.decode_value(0)?;
+		Ok((value, decoder.position))
 	}
 }
 
@@ -119,6 +129,7 @@ mod tests {
 		gql_status::FerrosGrynnError,
 		values::{
 			Geometry,
+			GraphId,
 			Position,
 			PropertyKeyId,
 			Text,
@@ -128,6 +139,7 @@ mod tests {
 				DiskAtomRef,
 				DiskGraphRef,
 				QualifiedAtomRef,
+				StorageAtomRef,
 				StorageBound,
 				StorageDateTime,
 				StorageDecimal,
@@ -146,7 +158,14 @@ mod tests {
 	fn all_format_v1_tags_round_trip() {
 		let point = Position::new([10.0, 20.0]).unwrap();
 		let second = Position::new([-10.0, -20.0]).unwrap();
-		let atom = DiskAtomRef::from_parts(crate::values::AtomKind::Edge, 17).unwrap();
+		let local_atom = DiskAtomRef::from_parts(crate::values::AtomKind::Edge, 17).unwrap();
+		let atom = StorageAtomRef {
+			kind: crate::values::AtomKind::Edge,
+			record_id: StorageRecordId {
+				class_id: 3,
+				part: StorageRecordIdPart::Int(17),
+			},
+		};
 		let values = vec![
 			StorageValue::None,
 			StorageValue::Null,
@@ -172,7 +191,7 @@ mod tests {
 			StorageValue::Uuid(Uuid::new_v4()),
 			StorageValue::Ulid(crate::values::Ulid::new()),
 			StorageValue::Record(StorageRecordId {
-				table_id: 3,
+				class_id: 3,
 				part: StorageRecordIdPart::Object(vec![
 					(Text::from("a"), StorageRecordValue::Int(1)),
 					(
@@ -207,8 +226,8 @@ mod tests {
 			StorageValue::Vector(Vector::I32(vec![1, 2])),
 			StorageValue::Vector(Vector::I16(vec![1, 2])),
 			StorageValue::AtomRef(atom),
-			StorageValue::GraphRef(DiskGraphRef::new(7, 2)),
-			StorageValue::QualifiedAtomRef(QualifiedAtomRef::new(9, atom)),
+			StorageValue::GraphRef(DiskGraphRef::new(GraphId::new(7).unwrap())),
+			StorageValue::QualifiedAtomRef(QualifiedAtomRef::new(9, local_atom)),
 		];
 
 		for value in values {
@@ -216,6 +235,28 @@ mod tests {
 			let decoded = CanonicalCodec::decode(&encoded, DecodeLimits::default()).unwrap();
 			assert_eq!(decoded, value);
 		}
+	}
+
+	#[test]
+	fn atom_reference_uses_kind_and_canonical_record_id_bytes() {
+		let value = StorageValue::AtomRef(StorageAtomRef {
+			kind: crate::values::AtomKind::Edge,
+			record_id: StorageRecordId {
+				class_id: 3,
+				part: StorageRecordIdPart::Int(4),
+			},
+		});
+		assert_eq!(CanonicalCodec::encode(value.as_ref()).unwrap(), [
+			TypeTag::AtomRef.byte(),
+			1,
+			TypeTag::RecordId.byte(),
+			3,
+			0,
+			0,
+			0,
+			0,
+			8
+		]);
 	}
 
 	#[test]

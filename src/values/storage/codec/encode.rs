@@ -142,12 +142,15 @@ pub(super) fn encode_value(output: &mut Vec<u8>, value: &StorageValue) -> Ferros
 		StorageValue::Vector(value) => encode_vector(output, value)?,
 		StorageValue::AtomRef(value) => {
 			output.push(TypeTag::AtomRef.byte());
-			output.extend_from_slice(&value.raw().to_le_bytes());
+			output.push(match value.kind {
+				crate::values::AtomKind::Node => 0,
+				crate::values::AtomKind::Edge => 1,
+			});
+			encode_record_id(output, &value.record_id)?;
 		}
 		StorageValue::GraphRef(value) => {
 			output.push(TypeTag::GraphRef.byte());
-			output.extend_from_slice(&value.slot.to_le_bytes());
-			output.extend_from_slice(&value.generation.to_le_bytes());
+			output.extend_from_slice(&value.raw().to_le_bytes());
 		}
 		StorageValue::QualifiedAtomRef(value) => {
 			output.push(TypeTag::QualifiedAtomRef.byte());
@@ -185,7 +188,7 @@ fn encode_duration(output: &mut Vec<u8>, value: &StorageDuration) -> FerrosGrynn
 
 fn encode_record_id(output: &mut Vec<u8>, value: &StorageRecordId) -> FerrosGrynnResult<()> {
 	output.push(TypeTag::RecordId.byte());
-	output.extend_from_slice(&value.table_id.to_le_bytes());
+	output.extend_from_slice(&value.class_id.to_le_bytes());
 	match &value.part {
 		StorageRecordIdPart::Int(value) => {
 			output.push(0x00);

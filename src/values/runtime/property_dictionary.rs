@@ -59,6 +59,29 @@ impl PropertyDictionary {
 		Ok(id)
 	}
 
+	/// Restores one exact append-only dictionary entry.
+	pub(crate) fn restore(&mut self, id: PropertyKeyId, name: Text) -> FerrosGrynnResult<()> {
+		if let Some(existing) = self.get(name.as_str()) {
+			return if existing == id {
+				Ok(())
+			} else {
+				Err(FerrosGrynnError::invalid_storage_file(
+					"property name is bound to a different key",
+				))
+			};
+		}
+		let expected = u32::try_from(self.names.len())
+			.map_err(|_error| FerrosGrynnError::property_dictionary_capacity_exceeded())?;
+		if id.get() != expected {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"property dictionary key is not the next dense identity",
+			));
+		}
+		self.names.push(name.clone());
+		self.ids.insert(name, id);
+		Ok(())
+	}
+
 	pub fn iter(&self) -> impl ExactSizeIterator<Item = (PropertyKeyId, &Text)> {
 		self.names.iter().enumerate().map(|(id, name)| (PropertyKeyId::new(id as u32), name))
 	}

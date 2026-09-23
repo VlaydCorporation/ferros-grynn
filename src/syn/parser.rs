@@ -105,8 +105,8 @@ impl Parser<'_> {
 		let kind = if self.consume_keyword(keywords::DEFINE).is_some() {
 			if self.consume_keyword(keywords::GRAPH).is_some() {
 				StatementKind::DefineGraph(self.define_graph_statement()?)
-			} else if self.consume_keyword(keywords::TABLE).is_some() {
-				StatementKind::DefineTable(self.define_table_statement()?)
+			} else if self.consume_keyword(keywords::CLASS).is_some() {
+				StatementKind::DefineClass(self.define_class_statement()?)
 			} else if self.consume_keyword(keywords::FIELD).is_some() {
 				StatementKind::DefineField(self.define_field_statement()?)
 			} else if self.consume_keyword(keywords::INDEX).is_some() {
@@ -117,6 +117,8 @@ impl Parser<'_> {
 			}
 		} else if self.consume_keyword(keywords::CREATE).is_some() {
 			StatementKind::Create(context.run(|context| self.create_statement(context)).await?)
+		} else if self.consume_keyword(keywords::ATTACH).is_some() {
+			StatementKind::Attach(context.run(|context| self.attach_statement(context)).await?)
 		} else if self.consume_keyword(keywords::UPDATE).is_some() {
 			StatementKind::Update(
 				context.run(|context| self.mutate_statement(context, false)).await?,
@@ -127,8 +129,10 @@ impl Parser<'_> {
 			)
 		} else if self.consume_keyword(keywords::DELETE).is_some() {
 			StatementKind::Delete(context.run(|context| self.delete_statement(context)).await?)
+		} else if self.consume_keyword(keywords::DETACH).is_some() {
+			StatementKind::Detach(context.run(|context| self.detach_statement(context)).await?)
 		} else if self.consume_keyword(keywords::RELATE).is_some() {
-			return Err(self.unsupported("RELATE", start));
+			StatementKind::Relate(context.run(|context| self.relate_statement(context)).await?)
 		} else if self.consume_keyword(keywords::REMOVE).is_some() {
 			StatementKind::Remove(self.remove_statement()?)
 		} else if self.consume_keyword(keywords::ALTER).is_some() {
@@ -659,7 +663,14 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
 	use super::parse;
-	use crate::syn::{BinaryOperator, ExprKind, MatchDirection, ParserSettings, StatementKind};
+	use crate::syn::{
+		BinaryOperator,
+		ExprKind,
+		MatchDirection,
+		MatchSelector,
+		ParserSettings,
+		StatementKind,
+	};
 
 	#[test]
 	fn respects_precedence_and_record_adjacency() {
@@ -694,10 +705,12 @@ mod tests {
 		let unsupported = parse("BEGIN", ParserSettings::default())
 			.expect_err("transaction statements belong to stage 11");
 		assert_eq!(unsupported.status().code().to_string(), "FG-50F03");
-		let relate =
-			parse("RELATE (person:alice)-[:FRIEND]->(person:bob)", ParserSettings::default())
-				.expect_err("RELATE awaits its edge identity contract");
-		assert_eq!(relate.status().code().to_string(), "FG-50F03");
+		let relate = parse(
+			"RELATE (person:alice)-[friendship:known LABEL Friend]->(person:bob) IN GRAPH social",
+			ParserSettings::default(),
+		)
+		.expect("RELATE has an exact edge identity contract");
+		assert!(matches!(relate.statements[0].kind, StatementKind::Relate(_)));
 
 		let unclosed =
 			parse("RETURN [1, 2", ParserSettings::default()).expect_err("array is not closed");
@@ -752,9 +765,10 @@ mod tests {
 	#[test]
 	fn parses_standard_atomwalk_chains_and_ranges() {
 		let standard = parse(
-			"MATCH (a:Человек)-[e:ЗНАЕТ|FRIEND]->(b)<-[:LIKES]-(c), path = (c)-[:NEXT*0..3]->(d) \
-			 , (u)->(v)<-(w)-(x)<->(y), (p)-[:E*2]->(q), (r)-[:E*..4]->(s) FROM social RETURN a, \
-			 path",
+			"MATCH (Человек AS a LABEL Person)-[ЗНАЕТ AS e LABEL Friend]->(* AS b)<-[LIKES]-(* AS \
+			 c), path = (* AS c)-[NEXT*0..3]->(* AS d), (* AS u)->(* AS v)<-(* AS w)-(* AS \
+			 x)<->(* AS y), (* AS p)-[E*2]->(* AS q), (* AS r)-[E*..4]->(* AS s) IN GRAPH social \
+			 RETURN a, path",
 			ParserSettings::default(),
 		)
 		.expect("valid StandardPath MATCH");
@@ -763,6 +777,15 @@ mod tests {
 		};
 		assert_eq!(statement.patterns.len(), 5);
 		assert_eq!(statement.patterns[0].steps.len(), 2);
+		assert!(matches!(statement.patterns[0].start.selector, MatchSelector::Class(_)));
+		assert_eq!(
+			statement.patterns[0].start.alias.as_ref().map(|alias| alias.value.as_ref()),
+			Some("a")
+		);
+		assert_eq!(
+			statement.patterns[0].start.label.as_ref().map(|label| label.value.as_ref()),
+			Some("Person")
+		);
 		assert_eq!(statement.patterns[0].steps[0].direction, MatchDirection::Forward);
 		assert_eq!(statement.patterns[0].steps[1].direction, MatchDirection::Backward);
 		assert_eq!(
@@ -788,8 +811,9 @@ mod tests {
 		);
 
 		let atom = parse(
-			"MATCH ATOM <(v:Person)>~[link:ANNOTATES]~><[e:FRIEND]><~[back:BACK]~<(w:Person)> \
-			 ~[u:UNDIRECTED]~<(x:Person)><~[bi:BOTH]~><(y:Person)> FROM social RETURN v, e, w",
+			"MATCH ATOM <(Person AS v)>~[ANNOTATES AS link]~><[FRIEND AS e]><~[BACK AS \
+			 back]~<(Person AS w)> ~[UNDIRECTED AS u]~<(Person AS x)><~[BOTH AS bi]~><(Person AS \
+			 y)> IN GRAPH social RETURN v, e, w",
 			ParserSettings::default(),
 		)
 		.expect("valid AtomWalk MATCH");
@@ -810,7 +834,7 @@ mod tests {
 
 	#[test]
 	fn locates_unbounded_match_range_at_missing_maximum() {
-		let source = "MATCH (a)-[:E*1..]->(b) FROM social RETURN b";
+		let source = "MATCH (* AS a)-[E*1..]->(* AS b) IN GRAPH social RETURN b";
 		let error =
 			parse(source, ParserSettings::default()).expect_err("unbounded paths are rejected");
 		let span = error.status().diagnostic().primary_location().expect("located error").span();
@@ -821,10 +845,10 @@ mod tests {
 	#[test]
 	fn classifies_deferred_match_syntax_as_unsupported() {
 		for source in [
-			"MATCH (a)-[:E TRAIL]->(b) FROM social RETURN b",
-			"MATCH (a) WITHIN (b) FROM social RETURN a",
-			"MATCH (a)-[:E CROSS_LEVEL]->(b) FROM social RETURN b",
-			"MATCH (a) FROM social RETURN GRAPH",
+			"MATCH (* AS a)-[E TRAIL]->(* AS b) IN GRAPH social RETURN b",
+			"MATCH (* AS a) WITHIN (* AS b) IN GRAPH social RETURN a",
+			"MATCH (* AS a)-[E CROSS_LEVEL]->(* AS b) IN GRAPH social RETURN b",
+			"MATCH (* AS a) IN GRAPH social RETURN GRAPH",
 		] {
 			let error = parse(source, ParserSettings::default())
 				.expect_err("deferred MATCH feature must be rejected");
@@ -833,14 +857,29 @@ mod tests {
 	}
 
 	#[test]
-	fn parses_core_schema_statements_and_rejects_advanced_indexes() {
+	fn rejects_legacy_match_source_and_treats_colon_as_record_id() {
+		let program =
+			parse("MATCH (person:alice) IN GRAPH social RETURN person", ParserSettings::default())
+				.expect("adjacent colon is the normative exact RecordId selector");
+		let StatementKind::Match(statement) = &program.statements[0].kind else {
+			panic!("expected MATCH");
+		};
+		assert!(matches!(statement.patterns[0].start.selector, MatchSelector::Record { .. }));
+		assert!(statement.patterns[0].start.alias.is_none());
+
+		parse("MATCH (Person AS a) FROM social RETURN a", ParserSettings::default())
+			.expect_err("legacy FROM source syntax must not remain available");
+	}
+
+	#[test]
+	fn parses_class_schema_statements_and_requires_explicit_index_scope() {
 		let program = parse(
-			"DEFINE GRAPH social TYPE DAG; DEFINE TABLE user TYPE NORMAL SCHEMAFULL; DEFINE FIELD \
-			 email ON TABLE user TYPE string; DEFINE INDEX by_email ON TABLE user FIELDS email \
-			 UNIQUE; ALTER TABLE user SCHEMALESS; ALTER FIELD email ON user DROP TYPE; ALTER \
-			 INDEX by_email ON TABLE user PREPARE REMOVE; INFO FOR DB; INFO FOR TABLE user; INFO \
-			 FOR INDEX by_email ON TABLE user; REMOVE INDEX by_email ON TABLE user; REMOVE FIELD \
-			 email ON user; REMOVE TABLE user; REMOVE GRAPH social",
+			"DEFINE GRAPH social TYPE DAG; DEFINE CLASS user TYPE NODE SCHEMAFULL; DEFINE FIELD \
+			 email ON CLASS user TYPE string; DEFINE INDEX by_email ON CLASS user FIELDS email \
+			 UNIQUE SCOPE BASE; ALTER CLASS user SCHEMALESS; ALTER FIELD email ON CLASS user DROP \
+			 TYPE; ALTER INDEX by_email ON CLASS user PREPARE REMOVE; INFO FOR DB; INFO FOR CLASS \
+			 user; INFO FOR INDEX by_email ON CLASS user; REMOVE INDEX by_email ON CLASS user; \
+			 REMOVE FIELD email ON CLASS user; REMOVE CLASS user; REMOVE GRAPH social",
 			ParserSettings::default(),
 		)
 		.expect("core schema syntax");
@@ -852,7 +891,7 @@ mod tests {
 		assert!(matches!(program.statements[13].kind, StatementKind::Remove(_)));
 
 		let advanced = parse(
-			"DEFINE INDEX embedding ON TABLE user FIELDS vector HNSW",
+			"DEFINE INDEX embedding ON CLASS user FIELDS vector HNSW SCOPE BASE",
 			ParserSettings::default(),
 		)
 		.expect_err("advanced index is explicit");
@@ -860,6 +899,20 @@ mod tests {
 		let alter_graph = parse("ALTER GRAPH social", ParserSettings::default())
 			.expect_err("ALTER GRAPH has no approved semantics");
 		assert_eq!(alter_graph.status().code().to_string(), "FG-50F03");
-		assert!(parse("DEFINE TABLE user TYPE SCHEMAFULL", ParserSettings::default()).is_err());
+		assert!(parse("DEFINE TABLE user TYPE NODE", ParserSettings::default()).is_err());
+		assert!(
+			parse(
+				"DEFINE INDEX by_email ON CLASS user FIELDS email UNIQUE",
+				ParserSettings::default(),
+			)
+			.is_err()
+		);
+		let effective = parse(
+			"DEFINE INDEX by_email ON CLASS user FIELDS email UNIQUE SCOPE EFFECTIVE IN GRAPH \
+			 social",
+			ParserSettings::default(),
+		)
+		.expect("effective scope");
+		assert!(matches!(effective.statements[0].kind, StatementKind::DefineIndex(_)));
 	}
 }

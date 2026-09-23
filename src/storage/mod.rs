@@ -1,29 +1,39 @@
-//! Crate-private local storage primitives.
-//!
-//! The current slice contains the hybrid resident/direct read engine,
-//! database-level frame WAL, sealed file routing, checkpoint/recovery, concrete
-//! graph pages, and transaction-bound streaming views. The Windows-first local
-//! datastore uses validated scatter/prefetch for contiguous scans and optional
-//! frame-oriented IoRing for known sparse windows.
+//! Candidate-v1 local storage for the normalized AtomStore and graph
+//! occurrences.
 
-#[cfg(any(test, feature = "storage-engine-prototype-api"))]
+mod atom_page;
+mod atom_store_image;
+mod atom_store_superblock;
+mod base_statistics;
+#[cfg(feature = "storage-engine-prototype-api")]
 mod buffer_pool;
 mod catalog;
 mod consts;
+mod database_superblock;
 mod direct_io;
 mod file_registry;
 mod graph_index;
 mod graph_pages;
+mod graph_store;
+mod graph_superblock;
 mod hybrid_engine;
+mod image_io;
 mod local;
+mod local_store;
+mod membership_index;
+mod metadata_cow;
 mod page;
 mod page_cache;
 mod page_io;
-mod page_manager;
-mod store;
-mod superblock;
+mod property_dictionary;
+mod property_page;
+mod scoped_index_image;
 mod types;
 mod wal;
+
+use direct_io as direct;
+pub(crate) use local_store::LocalStore;
+pub use page_io::PageIoMode;
 
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]
@@ -51,7 +61,6 @@ pub mod prototype_api {
 		pub use super::super::direct_io::{DirectFile, DirectFileOpenMode};
 	}
 
-	/// Measurement-only access used by the external storage prototype crate.
 	pub mod hybrid {
 		#[cfg(all(windows, feature = "native-async-io"))]
 		pub use super::super::hybrid_engine::SparseReadBatch;
@@ -108,41 +117,9 @@ pub mod prototype_api {
 			CheckpointGeneration,
 			DataFileId,
 			DataFileKind,
-			GraphId,
 			Lsn,
 			PageKey,
 		};
+		pub use crate::graph::GraphId;
 	}
 }
-
-// Preserve the internal module path while callers migrate to `direct_io`.
-use direct_io as direct;
-pub use page_io::PageIoMode;
-pub use store::{
-	LocalCommitAtomDelta,
-	LocalCommitEdgeChange,
-	LocalCommitGraph,
-	LocalCommitGraphChange,
-	LocalCommitGraphSchema,
-	LocalCommitNode,
-	LocalCommitNodeAdjacency,
-	LocalCommitNodeChange,
-	LocalCommitParameter,
-	LocalCommitResult,
-	LocalCommitSystemIndex,
-	LocalCommitTable,
-	LocalCommitTableField,
-	LocalCommitTableIndex,
-	LocalCommitTableMembership,
-	LocalDatabaseSnapshot,
-	LocalEdgeRead,
-	LocalGraph,
-	LocalGraphView,
-	LocalNodeRead,
-	LocalReadTransaction,
-	LocalStore,
-};
-pub(crate) use store::{LocalNodeAdjacency, LocalTableCursor};
-
-#[cfg(test)]
-mod benchmarks;

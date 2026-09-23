@@ -43,6 +43,7 @@ impl Display for Value {
 				f.write_str("\"")
 			}
 			Self::Record(value) => Display::fmt(value, f),
+			Self::GraphRef(value) => write!(f, "graph_ref({}#{})", value.name(), value.id()),
 			Self::Regex(value) => Display::fmt(value, f),
 			Self::Range(value) => Display::fmt(value, f),
 			Self::Atom(value) => Display::fmt(value.id(), f),

@@ -5,7 +5,6 @@ use rust_decimal::Decimal;
 
 use super::{
 	DecodeContext,
-	DiskAtomRef,
 	DiskGraphRef,
 	EncodeContext,
 	QualifiedAtomRef,
@@ -17,6 +16,8 @@ use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{
 		Array,
+		AtomKind,
+		AtomRef,
 		Bytes,
 		DateTime,
 		Duration,
@@ -193,8 +194,22 @@ pub enum StorageRecordIdPart {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageRecordId {
-	pub(super) table_id: u32,
+	pub(super) class_id: u32,
 	pub(super) part: StorageRecordIdPart,
+}
+
+/// Canonical database-stable atom reference persisted inside a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageAtomRef {
+	pub(super) kind: AtomKind,
+	pub(super) record_id: StorageRecordId,
+}
+
+impl StorageAtomRef {
+	/// Returns the immutable node or edge kind.
+	pub const fn kind(&self) -> AtomKind {
+		self.kind
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +247,7 @@ pub enum StorageValue {
 	Range(StorageRange),
 	Geometry(Geometry),
 	Vector(Vector),
-	AtomRef(DiskAtomRef),
+	AtomRef(StorageAtomRef),
 	GraphRef(DiskGraphRef),
 	QualifiedAtomRef(QualifiedAtomRef),
 }
@@ -259,6 +274,7 @@ impl StorageValue {
 			Value::Record(value) => {
 				StorageRecordId::from_runtime(*value, context).map(Self::Record)
 			}
+			Value::GraphRef(value) => context.graph_to_disk(&value).map(Self::GraphRef),
 			Value::Array(values) => values
 				.into_iter()
 				.map(|value| Self::from_runtime(value, context))
@@ -284,7 +300,7 @@ impl StorageValue {
 			Value::Range(value) => StorageRange::from_runtime(value, context).map(Self::Range),
 			Value::Geometry(value) => Ok(Self::Geometry(value)),
 			Value::Vector(value) => Ok(Self::Vector(value)),
-			Value::Atom(value) => context.atom_to_disk(&value).map(Self::AtomRef),
+			Value::Atom(value) => StorageAtomRef::from_runtime(*value, context).map(Self::AtomRef),
 			Value::Regex(_) | Value::Path(_) | Value::Graph(_) | Value::Closure(_) => {
 				Err(FerrosGrynnError::unsupported_storage_value(value.kind().to_string()))
 			}
@@ -343,9 +359,10 @@ impl StorageValue {
 			Self::Range(value) => value.into_runtime(context).map(Value::Range),
 			Self::Geometry(value) => Ok(Value::Geometry(value)),
 			Self::Vector(value) => Ok(Value::Vector(value)),
-			Self::AtomRef(value) => context.atom_from_disk(value).cloned().map(Value::from),
-			Self::GraphRef(_) | Self::QualifiedAtomRef(_) => {
-				Err(FerrosGrynnError::unsupported_storage_value("graph reference"))
+			Self::AtomRef(value) => value.into_runtime(context).map(Value::from),
+			Self::GraphRef(value) => context.graph_from_disk(value).cloned().map(Value::from),
+			Self::QualifiedAtomRef(_) => {
+				Err(FerrosGrynnError::unsupported_storage_value("qualified atom reference"))
 			}
 		}
 	}
@@ -446,8 +463,9 @@ impl StorageRecordId {
 		value: RecordId,
 		context: &mut EncodeContext,
 	) -> FerrosGrynnResult<Self> {
-		let (table, part) = value.into_parts();
-		let table_id = context.tables.intern(table, 0, u32::MAX)?;
+		let (class, part) = value.into_parts();
+		let class_id =
+			context.class_id(&class).ok_or_else(|| unresolved("class", class.to_string()))?;
 		let part = match part {
 			RecordIdPart::Int(value) => StorageRecordIdPart::Int(value),
 			RecordIdPart::String(value) => StorageRecordIdPart::String(value),
@@ -469,17 +487,17 @@ impl StorageRecordId {
 			),
 		};
 		Ok(Self {
-			table_id,
+			class_id,
 			part,
 		})
 	}
 
 	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<RecordId> {
-		let table = context
-			.tables
-			.resolve(self.table_id, 0)
+		let class = context
+			.classes
+			.resolve(self.class_id)
 			.cloned()
-			.ok_or_else(|| unresolved("table", self.table_id.to_string()))?;
+			.ok_or_else(|| unresolved("class", self.class_id.to_string()))?;
 		let part = match self.part {
 			StorageRecordIdPart::Int(value) => RecordIdPart::Int(value),
 			StorageRecordIdPart::String(value) => RecordIdPart::String(value),
@@ -492,7 +510,20 @@ impl StorageRecordId {
 				values.into_iter().map(|(key, value)| (key, value.into_runtime())).collect(),
 			),
 		};
-		RecordId::new(table, part)
+		RecordId::new(class, part)
+	}
+}
+
+impl StorageAtomRef {
+	fn from_runtime(value: AtomRef, context: &mut EncodeContext) -> FerrosGrynnResult<Self> {
+		Ok(Self {
+			kind: value.kind(),
+			record_id: StorageRecordId::from_runtime(value.id().clone(), context)?,
+		})
+	}
+
+	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<AtomRef> {
+		self.record_id.into_runtime(context).map(|id| AtomRef::new(self.kind, id))
 	}
 }
 

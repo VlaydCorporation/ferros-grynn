@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use jiff::tz::{Offset, TimeZone};
 
 use super::{
-	DiskAtomRef,
 	DiskGraphRef,
 	FIRST_FIXED_TIME_ZONE_ID,
 	FIXED_TIME_ZONE_BIAS,
@@ -13,7 +12,7 @@ use super::{
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::{AtomRef, GraphRef, PropertyDictionary, Text},
+	values::runtime::{GraphRef, PropertyDictionary, Text},
 };
 
 #[derive(Debug, Default)]
@@ -60,15 +59,49 @@ impl StringDictionary {
 	}
 }
 
+#[derive(Debug, Default)]
+pub(super) struct ClassDictionary {
+	ids: BTreeMap<Text, u32>,
+	names: BTreeMap<u32, Text>,
+}
+
+impl ClassDictionary {
+	fn register(&mut self, id: u32, name: Text) -> FerrosGrynnResult<()> {
+		if id == 0 || id == u32::MAX {
+			return Err(FerrosGrynnError::invalid_argument(
+				"class identity must be in 1..u32::MAX",
+			));
+		}
+		if self.ids.get(&name).is_some_and(|existing| *existing != id)
+			|| self.names.get(&id).is_some_and(|existing| existing != &name)
+		{
+			return Err(FerrosGrynnError::storage_context_conflict("class", id.to_string()));
+		}
+		self.ids.insert(name.clone(), id);
+		self.names.insert(id, name);
+		Ok(())
+	}
+
+	pub(super) fn id(&self, name: &Text) -> Option<u32> {
+		self.ids.get(name).copied()
+	}
+
+	pub(super) fn resolve(&self, id: u32) -> Option<&Text> {
+		self.names.get(&id)
+	}
+
+	fn entries(&self) -> impl ExactSizeIterator<Item = (u32, &Text)> {
+		self.names.iter().map(|(id, name)| (*id, name))
+	}
+}
+
 /// Mutable dictionary and reference context used while converting runtime
 /// values.
 #[derive(Debug, Default)]
 pub struct EncodeContext {
 	pub(super) properties: PropertyDictionary,
-	pub(super) tables: StringDictionary,
+	pub(super) classes: ClassDictionary,
 	time_zones: StringDictionary,
-	atoms_to_disk: BTreeMap<AtomRef, DiskAtomRef>,
-	atoms_from_disk: BTreeMap<DiskAtomRef, AtomRef>,
 	graphs_to_disk: BTreeMap<GraphRef, DiskGraphRef>,
 	graphs_from_disk: BTreeMap<DiskGraphRef, GraphRef>,
 }
@@ -85,19 +118,25 @@ impl EncodeContext {
 		&self.properties
 	}
 
-	/// Registers one table name in the stable order persisted by LabelDict.
-	pub(crate) fn register_table_name(&mut self, name: Text) -> FerrosGrynnResult<u32> {
-		self.tables.intern(name, 0, u32::MAX)
+	/// Registers one exact catalog class identity used by canonical RecordId
+	/// values.
+	pub(crate) fn register_class_name(&mut self, id: u32, name: Text) -> FerrosGrynnResult<()> {
+		self.classes.register(id, name)
 	}
 
-	/// Iterates table names in their persisted identifier order.
-	pub(crate) fn table_names(&self) -> impl ExactSizeIterator<Item = &Text> {
-		self.tables.names()
+	/// Iterates exact class identities and names in identifier order.
+	pub(crate) fn class_names(&self) -> impl ExactSizeIterator<Item = (u32, &Text)> {
+		self.classes.entries()
 	}
 
-	/// Resolves one table identifier while constructing an order key.
-	pub(crate) fn table_name(&self, id: u32) -> Option<&Text> {
-		self.tables.resolve(id, 0)
+	/// Resolves one class identifier while constructing an order key.
+	pub(crate) fn class_name(&self, id: u32) -> Option<&Text> {
+		self.classes.resolve(id)
+	}
+
+	/// Resolves one registered immutable class name to its durable identity.
+	pub(crate) fn class_id(&self, name: &Text) -> Option<u32> {
+		self.classes.id(name)
 	}
 
 	/// Registers one IANA time-zone name in its persisted identifier order.
@@ -110,21 +149,9 @@ impl EncodeContext {
 		self.time_zones.names()
 	}
 
-	pub fn register_atom(&mut self, runtime: AtomRef, disk: DiskAtomRef) -> FerrosGrynnResult<()> {
-		if runtime.kind() != disk.kind()
-			|| self.atoms_to_disk.get(&runtime).is_some_and(|existing| *existing != disk)
-			|| self.atoms_from_disk.get(&disk).is_some_and(|existing| existing != &runtime)
-		{
-			return Err(FerrosGrynnError::storage_context_conflict("atom", disk.to_string()));
-		}
-		self.atoms_to_disk.insert(runtime.clone(), disk);
-		self.atoms_from_disk.insert(disk, runtime);
-		Ok(())
-	}
-
-	/// Resolves a registered disk address to its stable runtime identity.
-	pub(crate) fn registered_atom(&self, disk: DiskAtomRef) -> Option<&AtomRef> {
-		self.atoms_from_disk.get(&disk)
+	/// Resolves a registered graph identity while constructing an order key.
+	pub(crate) fn registered_graph(&self, disk: DiskGraphRef) -> Option<&GraphRef> {
+		self.graphs_from_disk.get(&disk)
 	}
 
 	pub fn register_graph(
@@ -132,7 +159,8 @@ impl EncodeContext {
 		runtime: GraphRef,
 		disk: DiskGraphRef,
 	) -> FerrosGrynnResult<()> {
-		if self.graphs_to_disk.get(&runtime).is_some_and(|existing| *existing != disk)
+		if runtime.id() != disk.graph_id()
+			|| self.graphs_to_disk.get(&runtime).is_some_and(|existing| *existing != disk)
 			|| self.graphs_from_disk.get(&disk).is_some_and(|existing| existing != &runtime)
 		{
 			return Err(FerrosGrynnError::storage_context_conflict("graph", disk.to_string()));
@@ -145,25 +173,17 @@ impl EncodeContext {
 	pub const fn decoder(&self) -> DecodeContext<'_> {
 		DecodeContext {
 			properties: &self.properties,
-			tables: &self.tables,
+			classes: &self.classes,
 			time_zones: &self.time_zones,
-			atoms: &self.atoms_from_disk,
 			graphs: &self.graphs_from_disk,
 		}
-	}
-
-	pub(super) fn atom_to_disk(&self, value: &AtomRef) -> FerrosGrynnResult<DiskAtomRef> {
-		self.atoms_to_disk
-			.get(value)
-			.copied()
-			.ok_or_else(|| unresolved("atom", value.id().to_string()))
 	}
 
 	pub(super) fn graph_to_disk(&self, value: &GraphRef) -> FerrosGrynnResult<DiskGraphRef> {
 		self.graphs_to_disk
 			.get(value)
 			.copied()
-			.ok_or_else(|| unresolved("graph", value.id().to_string()))
+			.ok_or_else(|| unresolved("graph", value.name().to_string()))
 	}
 
 	pub(super) fn intern_time_zone(&mut self, value: &jiff::Zoned) -> FerrosGrynnResult<u32> {
@@ -192,17 +212,12 @@ impl EncodeContext {
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeContext<'a> {
 	pub(super) properties: &'a PropertyDictionary,
-	pub(super) tables: &'a StringDictionary,
+	pub(super) classes: &'a ClassDictionary,
 	time_zones: &'a StringDictionary,
-	atoms: &'a BTreeMap<DiskAtomRef, AtomRef>,
 	graphs: &'a BTreeMap<DiskGraphRef, GraphRef>,
 }
 
 impl DecodeContext<'_> {
-	pub(super) fn atom_from_disk(&self, value: DiskAtomRef) -> FerrosGrynnResult<&AtomRef> {
-		self.atoms.get(&value).ok_or_else(|| unresolved("atom", value.to_string()))
-	}
-
 	pub(super) fn graph_from_disk(&self, value: DiskGraphRef) -> FerrosGrynnResult<&GraphRef> {
 		self.graphs.get(&value).ok_or_else(|| unresolved("graph", value.to_string()))
 	}

@@ -1,4 +1,7 @@
-use std::fmt::{self, Debug, Display, Formatter};
+use std::{
+	fmt::{self, Debug, Display, Formatter},
+	num::NonZeroU64,
+};
 
 use crate::{
 	collections::cow_vec::CowVec,
@@ -10,6 +13,34 @@ const GENERATION_SHIFT: u32 = 41;
 const KIND_BIT: u64 = 1 << KIND_SHIFT;
 const SLOT_MASK: u64 = KIND_BIT - 1;
 const GENERATION_MASK: u32 = (1 << 23) - 1;
+
+/// Stable identity of one cataloged graph.
+///
+/// Zero addresses the database data space and is never a graph identity.
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[repr(transparent)]
+pub struct GraphId(NonZeroU64);
+
+impl GraphId {
+	/// Creates a graph identity from its durable representation.
+	pub const fn new(value: u64) -> Option<Self> {
+		match NonZeroU64::new(value) {
+			Some(value) => Some(Self(value)),
+			None => None,
+		}
+	}
+
+	/// Returns the durable integer representation.
+	pub const fn get(self) -> u64 {
+		self.0.get()
+	}
+}
+
+impl Display for GraphId {
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(&self.get(), formatter)
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
@@ -115,7 +146,7 @@ impl Display for AtomId {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct SlotAllocator {
+pub(crate) struct SlotAllocator {
 	kind: AtomKind,
 	generations: CowVec<u32>,
 	occupied: CowVec<bool>,

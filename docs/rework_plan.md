@@ -340,8 +340,10 @@ DataSpaceId::Graph(GraphId) > 0
 
 ## 4. Dependency-ordered реализация
 
-**Статус на 2026-09-12:** документационные A0–A4/S0–S6 и кодовые A5–A8 выполнены.
-Старый TABLE/system-graph API удалён из собираемого crate; A9 и A10 не начаты.
+**Статус на 2026-09-22: ✅ A0–A16 выполнены.** Production и test paths используют
+только graph-first Class/AtomStore/occurrence model; TABLE/system-graph fallback
+и selector удалены. Correctness/performance evidence и ограничения зафиксированы
+в [`reports/graph_first_atom_model_report.md`](reports/graph_first_atom_model_report.md).
 
 **Результат A8:** реализованы exact `AtomStoreSuperblock`, database-global append-only
 `PropertyDictionary`, `FGFC v5` binding, единая WAL-публикация data+metadata, WAL-first reopen,
@@ -349,27 +351,33 @@ checkpoint backfill и metadata COW `tmp/main/prev`. Golden/corruption, old-snap
 abort/commit/reopen и checkpoint-recovery проверки пройдены. Подробности:
 [`reports/atom_store_stage_a8.md`](reports/atom_store_stage_a8.md).
 
-| Шаг                               | Зависит от | Работа                                                                                                                                   |
-|-----------------------------------|------------|------------------------------------------------------------------------------------------------------------------------------------------|
-| A0. Зафиксировать коррекцию ✅    | —          | Использовать этот план, обновить реестр Q-08/Q-23–Q-26 и остановить этапы 9–31 до кодового cutover                                       |
-| A1. Семантические спецификации ✅ | A0         | Переписать glossary, formal model, CLASS, RecordId, GraphRef, base/effective view, labels, references и DML                              |
-| A2. Grammar и примеры ✅          | A1         | Утвердить `CLASS`, `IN GRAPH`, `ATTACH/DETACH`, `RESET`, class/id/AS/LABEL pattern grammar                                               |
-| A3. Disk specification ✅         | A1         | Зафиксировать AtomStore, memberships, overlays, DataSpaceId, catalog versions, exact Atom/Node/Edge hot layouts, WAL и recovery          |
-| A4. Скорректировать планы ✅      | A2, A3     | Обновить зависимости и статусы всех активных планов; исторические reports оставить                                                       |
-| A5. Типы и schema API ✅          | A2         | Ввести ClassId/GraphId/DataSpaceId, новый GraphRef и ClassSchema; убрать TABLE compatibility surface                                     |
-| A6. In-memory logical model ✅    | A5         | Добавить global AtomStoreRoot, graph occurrences, reverse memberships и lazy overlays                                                    |
-| A7. MVCC и conflicts ✅           | A6         | Разделить BaseAtom, GraphMembership, GraphOverlay и GraphIncidence conflict keys; добавить fanout preflight                              |
-| A8. Durable AtomStore ✅          | A3, A5     | Реализовать AtomStoreSuperblock, atom/property pages, global primary, file registry, WAL/recovery                                        |
-| A9. Graph storage refactor        | A7, A8     | Превратить graph slots в occurrences, вынести properties в base store, добавить overlays и membership index                              |
-| A10. Indexes и statistics         | A9         | Перенести base indexes, добавить full effective indexes, class/label indexes и scope-aware statistics                                    |
-| A11. DDL frontend                 | A5, A10    | Parser → analysis → IR → execution для CLASS/FIELD/INDEX/INFO; удалить system-table path                                                 |
-| A12. Direct DML                   | A7, A11    | Перевести CREATE/UPDATE/UPSERT/DELETE/SELECT на global AtomStore и effective graph view                                                  |
-| A13. Graph DML                    | A9, A12    | Реализовать ATTACH, DETACH, RELATE, graph LABEL updates, RESET и family validation                                                       |
-| A14. References и modes           | A12, A13   | Scope-aware record dereference, Mode 1/2 parity, Mode 3 materialization/write-back                                                       |
-| A15. Correctness/performance gate | A14        | Полная RAM/local/native-async/recovery/concurrency/benchmark матрица                                                                     |
-| A16. Cutover и очистка            | A15        | Удалить TableSchema/AtomTableMemberships/system graph paths, временный selector, обновить AGENTS/report/Graphify и завершить этапы 8.1/9 |
+**Результат A9:** graph-space хранит только occurrences, topology, labels и sparse overlays;
+`membership.fgidx` и database-global `memberships.fgidx` проверяются в обе стороны. AtomStore,
+graph files и membership indexes публикуются одним WAL transaction, открываются по одной snapshot
+границе и совместно backfill'ятся до COW-публикации обоих superblock. Focused A8/A9 gates пройдены.
 
-До A15 старый и новый logical layout могут сосуществовать только за test-only selector. Runtime fallback после cutover не сохраняется.
+|   | Шаг                                  | Зависит от | Работа                                                                                                                                   |
+|:--|--------------------------------------|------------|------------------------------------------------------------------------------------------------------------------------------------------|
+|   | A0. Зафиксировать коррекцию ✅       | —          | Использовать этот план, обновить реестр Q-08/Q-23–Q-26 и остановить этапы 9–31 до кодового cutover                                       |
+|   | A1. Семантические спецификации ✅    | A0         | Переписать glossary, formal model, CLASS, RecordId, GraphRef, base/effective view, labels, references и DML                              |
+|   | A2. Grammar и примеры ✅             | A1         | Утвердить `CLASS`, `IN GRAPH`, `ATTACH/DETACH`, `RESET`, class/id/AS/LABEL pattern grammar                                               |
+|   | A3. Disk specification ✅            | A1         | Зафиксировать AtomStore, memberships, overlays, DataSpaceId, catalog versions, exact Atom/Node/Edge hot layouts, WAL и recovery          |
+|   | A4. Скорректировать планы ✅         | A2, A3     | Обновить зависимости и статусы всех активных планов; исторические reports оставить                                                       |
+|   | A5. Типы и schema API ✅             | A2         | Ввести ClassId/GraphId/DataSpaceId, новый GraphRef и ClassSchema; убрать TABLE compatibility surface                                     |
+|   | A6. In-memory logical model ✅       | A5         | Добавить global AtomStoreRoot, graph occurrences, reverse memberships и lazy overlays                                                    |
+|   | A7. MVCC и conflicts ✅              | A6         | Разделить BaseAtom, GraphMembership, GraphOverlay и GraphIncidence conflict keys; добавить fanout preflight                              |
+|   | A8. Durable AtomStore ✅             | A3, A5     | Реализовать AtomStoreSuperblock, atom/property pages, global primary, file registry, WAL/recovery                                        |
+|   | A9. Graph storage refactor ✅        | A7, A8     | Превратить graph slots в occurrences, вынести properties в base store, добавить overlays и membership index                              |
+|   | A10. Indexes и statistics ✅         | A9         | Перенести base indexes, добавить full effective indexes, class/label indexes и scope-aware statistics                                    |
+|   | A11. DDL frontend ✅                 | A5, A10    | Parser → analysis → IR → execution для CLASS/FIELD/INDEX/INFO; удалить system-table path                                                 |
+|   | A12. Direct DML ✅                   | A7, A11    | Перевести CREATE/UPDATE/UPSERT/DELETE/SELECT на global AtomStore и effective graph view                                                  |
+|   | A13. Graph DML ✅                    | A9, A12    | Реализовать ATTACH, DETACH, RELATE, graph LABEL updates, RESET и family validation                                                       |
+|   | A14. References и modes ✅           | A12, A13   | Scope-aware record dereference, Mode 1/2 parity, Mode 3 materialization/write-back                                                       |
+|   | A15. Correctness/performance gate ✅ | A14        | Полная RAM/local/native-async/recovery/concurrency/benchmark матрица                                                                     |
+|   | A16. Cutover и очистка ✅            | A15        | Удалить TableSchema/AtomTableMemberships/system graph paths, временный selector, обновить AGENTS/report/Graphify и завершить этапы 8.1/9 |
+
+Runtime fallback после cutover не сохранён. Единственное упоминание `DEFINE TABLE`
+в собираемом коде является отрицательным parser regression.
 
 ## 5. Проверка и критерии завершения
 

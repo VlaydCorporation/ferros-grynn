@@ -1,7 +1,8 @@
 # Statistics module guidance
 
-`stats` хранит внутренний MVCC-контракт статистики планировщика: точные graph,
-table и label counters, degree distributions и property histograms. Он не
+`stats` хранит внутренний MVCC-контракт статистики планировщика: точные base
+class, graph-effective class и label counters, degree distributions и property
+histograms. Он не
 выбирает планы и не владеет физическими страницами: `datastore` публикует
 снимки, а `storage/graph_pages` кодирует их в `stats/graph_stats.fgb`,
 `stats/label_stats.fgb` и `stats/prop_stats.fgb`. Root загружается при открытии;

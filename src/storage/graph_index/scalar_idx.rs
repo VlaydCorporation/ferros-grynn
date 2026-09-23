@@ -12,9 +12,9 @@ pub(in crate::storage) enum ScalarIndexMode {
 
 /// One sorted scalar-index key and its sorted, non-empty atom set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::storage) struct ScalarIndexEntry {
+pub(in crate::storage) struct ScalarIndexEntry<Address = DiskAtomRef> {
 	pub(in crate::storage) key: Vec<u8>,
-	pub(in crate::storage) atoms: Vec<DiskAtomRef>,
+	pub(in crate::storage) atoms: Vec<Address>,
 }
 
 /// Complete immutable scalar B+tree generation.
@@ -24,8 +24,8 @@ pub(in crate::storage) struct BuiltScalarIndex {
 }
 
 /// Bulk-builds a standard or unique scalar B+tree from canonical entries.
-pub(in crate::storage) fn build_scalar_index(
-	entries: &[ScalarIndexEntry],
+pub(in crate::storage) fn build_scalar_index<Address: PrimaryAddress + Ord>(
+	entries: &[ScalarIndexEntry<Address>],
 	mode: ScalarIndexMode,
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<BuiltScalarIndex> {
@@ -47,8 +47,8 @@ pub(in crate::storage) fn build_scalar_index(
 	build_standard_scalar_index(entries, page_lsn, MUTABLE_STANDARD_LEAF_BYTES)
 }
 
-fn build_standard_scalar_index(
-	entries: &[ScalarIndexEntry],
+fn build_standard_scalar_index<Address: PrimaryAddress + Ord>(
+	entries: &[ScalarIndexEntry<Address>],
 	page_lsn: PageLsn,
 	maximum_leaf_bytes: usize,
 ) -> FerrosGrynnResult<BuiltScalarIndex> {
@@ -110,8 +110,8 @@ fn build_standard_scalar_index(
 }
 
 #[cfg(test)]
-pub(super) fn build_standard_scalar_index_with_fill(
-	entries: &[ScalarIndexEntry],
+pub(super) fn build_standard_scalar_index_with_fill<Address: PrimaryAddress + Ord>(
+	entries: &[ScalarIndexEntry<Address>],
 	page_lsn: PageLsn,
 	fill_percent: usize,
 ) -> FerrosGrynnResult<BuiltScalarIndex> {
@@ -123,19 +123,19 @@ pub(super) fn build_standard_scalar_index_with_fill(
 }
 
 /// One atom insertion or removal for a canonical scalar key.
-pub(in crate::storage) struct ScalarIndexMutation {
+pub(in crate::storage) struct ScalarIndexMutation<Address = DiskAtomRef> {
 	pub(in crate::storage) key: Vec<u8>,
-	pub(in crate::storage) atom: DiskAtomRef,
+	pub(in crate::storage) atom: Address,
 	pub(in crate::storage) insert: bool,
 }
 
 /// Re-encodes only scalar leaves whose separators and posting layout remain
 /// stable. `None` requests the existing bulk builder.
-pub(in crate::storage) fn mutate_scalar_index_leaves(
+pub(in crate::storage) fn mutate_scalar_index_leaves<Address: PrimaryAddress + Ord>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
 	mode: ScalarIndexMode,
-	mutations: &[ScalarIndexMutation],
+	mutations: &[ScalarIndexMutation<Address>],
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<Option<Vec<(PageNo, AlignedPage)>>> {
 	let leaf_type = match mode {
@@ -143,7 +143,7 @@ pub(in crate::storage) fn mutate_scalar_index_leaves(
 		ScalarIndexMode::Unique => PageType::IndexUniqueBtreeLeaf,
 	};
 	let mut seen = BTreeSet::new();
-	let mut grouped = BTreeMap::<PageNo, Vec<&ScalarIndexMutation>>::new();
+	let mut grouped = BTreeMap::<PageNo, Vec<&ScalarIndexMutation<Address>>>::new();
 	for mutation in mutations {
 		if mutation.key.is_empty()
 			|| !seen.insert((mutation.key.as_slice(), mutation.atom, mutation.insert))
@@ -217,11 +217,14 @@ pub(in crate::storage) fn mutate_scalar_index_leaves(
 }
 
 /// Applies removals before insertions so a valid unique-key swap is atomic.
-pub(in crate::storage) fn apply_scalar_mutations<'mutation>(
-	entries: &mut Vec<ScalarIndexEntry>,
-	mutations: impl IntoIterator<Item = &'mutation ScalarIndexMutation>,
+pub(in crate::storage) fn apply_scalar_mutations<'mutation, Address>(
+	entries: &mut Vec<ScalarIndexEntry<Address>>,
+	mutations: impl IntoIterator<Item = &'mutation ScalarIndexMutation<Address>>,
 	mode: ScalarIndexMode,
-) -> FerrosGrynnResult<()> {
+) -> FerrosGrynnResult<()>
+where
+	Address: PrimaryAddress + Ord + 'mutation,
+{
 	let mutations = mutations.into_iter().collect::<Vec<_>>();
 	for insert in [false, true] {
 		for mutation in mutations.iter().filter(|mutation| mutation.insert == insert) {
@@ -232,11 +235,11 @@ pub(in crate::storage) fn apply_scalar_mutations<'mutation>(
 }
 
 /// Reads every scalar entry in canonical key order.
-pub(in crate::storage) fn scan_scalar_index(
+pub(in crate::storage) fn scan_scalar_index<Address: PrimaryAddress + Ord>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
 	mode: ScalarIndexMode,
-) -> FerrosGrynnResult<Vec<ScalarIndexEntry>> {
+) -> FerrosGrynnResult<Vec<ScalarIndexEntry<Address>>> {
 	if mode == ScalarIndexMode::Unique {
 		return scan_primary_index(read_page, root).map(|entries| {
 			entries
@@ -259,7 +262,10 @@ pub(in crate::storage) fn scan_scalar_index(
 		let mut page = AlignedPage::zeroed();
 		read_page(page_no, &mut page)?;
 		for entry in decode_standard_leaf_entries(&mut read_page, &page)? {
-			if entries.last().is_some_and(|previous: &ScalarIndexEntry| previous.key >= entry.key) {
+			if entries
+				.last()
+				.is_some_and(|previous: &ScalarIndexEntry<Address>| previous.key >= entry.key)
+			{
 				return Err(invalid_index("scalar B+tree keys are not strictly ordered"));
 			}
 			entries.push(entry);
@@ -269,22 +275,24 @@ pub(in crate::storage) fn scan_scalar_index(
 	Ok(entries)
 }
 
-fn decode_unique_leaf_entries(page: &AlignedPage) -> FerrosGrynnResult<Vec<ScalarIndexEntry>> {
+fn decode_unique_leaf_entries<Address: PrimaryAddress>(
+	page: &AlignedPage,
+) -> FerrosGrynnResult<Vec<ScalarIndexEntry<Address>>> {
 	let (count, area_start) = validate_leaf_layout(page)?;
 	(0..count)
 		.map(|index| {
 			let (key, atom) = leaf_entry(page.as_bytes(), area_start, count, index)?;
 			Ok(ScalarIndexEntry {
 				key: key.to_vec(),
-				atoms: vec![DiskAtomRef::from_raw(atom)?],
+				atoms: vec![Address::from_raw(atom)?],
 			})
 		})
 		.collect()
 }
 
-fn apply_scalar_mutation(
-	entries: &mut Vec<ScalarIndexEntry>,
-	mutation: &ScalarIndexMutation,
+fn apply_scalar_mutation<Address: PrimaryAddress + Ord>(
+	entries: &mut Vec<ScalarIndexEntry<Address>>,
+	mutation: &ScalarIndexMutation<Address>,
 	mode: ScalarIndexMode,
 ) -> FerrosGrynnResult<()> {
 	match entries.binary_search_by(|entry| entry.key.cmp(&mutation.key)) {
@@ -333,12 +341,12 @@ fn apply_scalar_mutation(
 }
 
 /// Looks up one exact scalar key and validates every referenced posting page.
-pub(in crate::storage) fn lookup_scalar_index(
+pub(in crate::storage) fn lookup_scalar_index<Address: PrimaryAddress + Ord>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
 	mode: ScalarIndexMode,
 	target: &[u8],
-) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+) -> FerrosGrynnResult<Vec<Address>> {
 	if mode == ScalarIndexMode::Unique {
 		return lookup_primary_index(read_page, root, target)
 			.map(|atom| atom.into_iter().collect());
@@ -350,13 +358,13 @@ pub(in crate::storage) fn lookup_scalar_index(
 }
 
 /// Returns scalar-index atoms in key order for one bounded range.
-pub(in crate::storage) fn range_scalar_index(
+pub(in crate::storage) fn range_scalar_index<Address: PrimaryAddress + Ord>(
 	mut read_page: impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
 	mode: ScalarIndexMode,
 	lower: Bound<&[u8]>,
 	upper: Bound<&[u8]>,
-) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+) -> FerrosGrynnResult<Vec<Address>> {
 	if invalid_bounds(&lower, &upper) {
 		return Ok(Vec::new());
 	}
@@ -378,7 +386,7 @@ pub(in crate::storage) fn range_scalar_index(
 		}
 		let mut page = AlignedPage::zeroed();
 		read_page(page_no, &mut page)?;
-		let entries = decode_standard_leaf_entries(&mut read_page, &page)?;
+		let entries = decode_standard_leaf_entries::<Address>(&mut read_page, &page)?;
 		for entry in entries {
 			if upper_exceeded(&entry.key, &upper) {
 				return Ok(result);
@@ -392,12 +400,12 @@ pub(in crate::storage) fn range_scalar_index(
 	Ok(result)
 }
 
-fn range_unique_index(
+fn range_unique_index<Address: PrimaryAddress>(
 	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
 	root: PageNo,
 	lower: &Bound<&[u8]>,
 	upper: &Bound<&[u8]>,
-) -> FerrosGrynnResult<Vec<DiskAtomRef>> {
+) -> FerrosGrynnResult<Vec<Address>> {
 	let target = match lower {
 		Bound::Included(key) | Bound::Excluded(key) => *key,
 		Bound::Unbounded => &[],
@@ -429,7 +437,7 @@ fn range_unique_index(
 				return Ok(result);
 			}
 			if key_in_bounds(key, lower, upper) {
-				result.push(DiskAtomRef::from_raw(atom)?);
+				result.push(Address::from_raw(atom)?);
 			}
 			previous_key = Some(key.to_vec());
 		}

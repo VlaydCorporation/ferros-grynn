@@ -20,15 +20,15 @@ mod windows_vm;
 #[cfg(test)]
 use ferros_grynn::storage_engine_prototype_api::{
 	buffer_pool::{PageCacheKey, PageCacheVersion},
-	types::{DataFileId, GraphId},
+	types::DataFileId,
 };
 
 /// Stable identity of one prototype page source independent of its version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg(test)]
 struct SourceIdentity {
-	/// Graph address space that owns the file.
-	graph_id: GraphId,
+	/// Database-global or graph-local address space that owns the file.
+	space_id: u64,
 	/// Never-reused physical file identity.
 	file_id: DataFileId,
 }
@@ -39,7 +39,7 @@ impl SourceIdentity {
 	const fn from_key(key: PageCacheKey) -> Self {
 		let page_key = key.page_key();
 		Self {
-			graph_id: page_key.graph_id(),
+			space_id: page_key.data_space_raw(),
 			file_id: page_key.file_id(),
 		}
 	}

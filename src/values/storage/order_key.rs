@@ -33,6 +33,7 @@ pub fn validate_index_type(value_type: &Type) -> FerrosGrynnResult<()> {
 		| Type::Uuid
 		| Type::Bytes
 		| Type::Record
+		| Type::GraphRef(_)
 		| Type::Atom(_) => Ok(()),
 		Type::Array(element)
 		| Type::Set(element)
@@ -129,6 +130,17 @@ fn encode_typed(
 		(StorageValue::Uuid(value), Type::Uuid) => Ok(value.as_inner().as_bytes().to_vec()),
 		(StorageValue::Ulid(value), Type::Ulid) => Ok(value.as_inner().to_bytes().to_vec()),
 		(StorageValue::Record(value), Type::Record) => encode_record(value, context),
+		(StorageValue::GraphRef(value), Type::GraphRef(expected)) => {
+			let runtime = context.registered_graph(*value).ok_or_else(|| {
+				index_value_error("indexed graph reference is absent from its conversion context")
+			})?;
+			if runtime.kind() != *expected {
+				return Err(index_value_error(format!(
+					"graph reference does not match indexed field type '{value_type}'"
+				)));
+			}
+			Ok(value.raw().to_be_bytes().to_vec())
+		}
 		(StorageValue::Array(values), Type::Array(element)) => {
 			encode_sequence(values, element, context)
 		}
@@ -137,11 +149,7 @@ fn encode_typed(
 		}
 		(StorageValue::Range(value), Type::Range(element)) => encode_range(value, element, context),
 		(StorageValue::AtomRef(value), Type::Atom(expected)) if value.kind() == *expected => {
-			let runtime = context.registered_atom(*value).cloned().ok_or_else(|| {
-				index_value_error("indexed atom reference is absent from its conversion context")
-			})?;
-			let record = super::StorageRecordId::from_runtime(runtime.id().clone(), context)?;
-			encode_record(&record, context)
+			encode_record(&value.record_id, context)
 		}
 		_ => Err(index_value_error(format!(
 			"value does not match indexed field type '{value_type}'"
@@ -249,11 +257,11 @@ fn encode_record(
 	value: &super::StorageRecordId,
 	context: &EncodeContext,
 ) -> FerrosGrynnResult<Vec<u8>> {
-	let table = context
-		.table_name(value.table_id)
-		.ok_or_else(|| index_value_error("indexed RecordId table is absent from its dictionary"))?;
+	let class = context
+		.class_name(value.class_id)
+		.ok_or_else(|| index_value_error("indexed RecordId class is absent from its dictionary"))?;
 	let mut encoded = Vec::new();
-	append_escaped(&mut encoded, table.as_bytes());
+	append_escaped(&mut encoded, class.as_bytes());
 	encoded.extend_from_slice(&[ESCAPE, END]);
 	encoded.extend_from_slice(&encode_record_part(&value.part)?);
 	Ok(encoded)
@@ -406,14 +414,11 @@ mod tests {
 	use rust_decimal::Decimal;
 
 	use super::*;
-	use crate::values::{
-		runtime::{
-			PropertyDictionary,
-			Range,
-			RecordId,
-			graph::{AtomKind, AtomRef},
-		},
-		storage::DiskAtomRef,
+	use crate::values::runtime::{
+		PropertyDictionary,
+		Range,
+		RecordId,
+		graph::{AtomKind, AtomRef},
 	};
 
 	fn encode(value: &Value, value_type: &Type) -> FerrosGrynnResult<Vec<u8>> {
@@ -486,15 +491,14 @@ mod tests {
 		let late_value = Value::from(late.clone());
 		let early_value = Value::from(early.clone());
 		let mut context = EncodeContext::new(PropertyDictionary::new());
+		context.register_class_name(7, "z".into())?;
+		context.register_class_name(9, "a".into())?;
 		let late_key = encode_index_key(&[(&late_value, &Type::Record)], &mut context)?;
 		let early_key = encode_index_key(&[(&early_value, &Type::Record)], &mut context)?;
 		assert!(early_key < late_key);
 
 		let late_atom = AtomRef::new(AtomKind::Node, late);
 		let early_atom = AtomRef::new(AtomKind::Node, early);
-		let mut context = EncodeContext::new(PropertyDictionary::new());
-		context.register_atom(late_atom.clone(), DiskAtomRef::from_parts(AtomKind::Node, 0)?)?;
-		context.register_atom(early_atom.clone(), DiskAtomRef::from_parts(AtomKind::Node, 1)?)?;
 		let late_value = Value::from(late_atom);
 		let early_value = Value::from(early_atom);
 		let value_type = Type::Atom(AtomKind::Node);

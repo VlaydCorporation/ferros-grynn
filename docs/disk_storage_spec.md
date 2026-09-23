@@ -2083,20 +2083,22 @@ residual predicate остаётся обязательным, а статист�
 Durable-представление одного графа разделено по частоте и назначению чтения на три checksummed
 файла:
 
-- `stats/graph_stats.fgb`: page 0 содержит `StatisticsRoot`, а начиная с page 1 без разрывов идут
-  `DegreeHistogram`;
+- `stats/graph_stats.fgb`: page 0 содержит `StatisticsRoot`, с page 1 без разрывов идут
+  `DegreeHistogram`, а сразу после них — `ClassStatistic`;
 - `stats/label_stats.fgb`: zero-based цепочка `LabelStatistic`;
 - `stats/prop_stats.fgb`: zero-based последовательность `PropertyHistogram`.
 
 Root хранит начало и длину каждого диапазона. `degree_first_page` равен 1 для непустого диапазона,
-а `label_first_page` и `property_first_page` равны 0 в своих файлах; для пустого диапазона start
-равен `NULL_PAGE`, а count — нулю. Объявленные длины обязаны точно совпадать с физическими длинами
-трёх файлов: `graph_stats.fgb` содержит `1 + degree_page_count` страниц, два остальных — ровно
-соответствующий count. Недостижимые, переставленные и лишние страницы являются повреждением.
+`class_first_page` равен `1 + degree_page_count`, а `label_first_page` и
+`property_first_page` равны 0 в своих файлах; для пустого диапазона start равен `NULL_PAGE`, а
+count — нулю. Объявленные длины обязаны точно совпадать с физическими длинами трёх файлов:
+`graph_stats.fgb` содержит `1 + degree_page_count + class_page_count` страниц, два остальных —
+ровно соответствующий count. Недостижимые, переставленные и лишние страницы являются
+повреждением.
 Physical bindings статистических файлов находятся только в catalog; `GraphSuperblock` не
 дублирует их roots.
 
-При открытии графа eager читается и проверяется только `StatisticsRoot`; degree, label и property
+При открытии графа eager читается и проверяется только `StatisticsRoot`; degree, class, label и property
 части загружаются независимо при первом запросе через точный storage snapshot вызывающей
 транзакции. Успешно декодированная immutable-часть кешируется для этой durable revision.
 Повреждение auxiliary-файла поэтому не блокирует открытие и обычное чтение данных, но возвращается
@@ -2128,7 +2130,10 @@ Offset  Size  Тип    Поле
 144     8     u64    total_in_degree
 152     8     u64    total_undirected_degree
 160     8     u64    revision
-168     ...   —      _reserved = 0
+168     8     u64    class_first_page     -- 1 + degree_page_count или NULL_PAGE
+176     4     u32    class_page_count
+180     4     u32    reserved = 0
+184     ...   —      _reserved = 0
 ```
 
 `node_count`, `edge_count` и три degree totals точны для `revision`. Средние выводятся из
@@ -2138,8 +2143,55 @@ point-DML, уменьшающего степень. `analyzed_revision == revisi
 bulk-распределения соответствуют текущей ревизии.
 
 Точные per-class base counts хранятся в `atoms/stats/class_stats.fgb`; graph-local class counts
-строятся по occurrences и относятся к `graph_stats.fgb`. Ни один count не выводится из schema
+строятся по occurrences и хранятся в class-range `graph_stats.fgb`. Ни один count не выводится из schema
 membership: class задаёт `RecordId`, graph membership — отдельный data relation.
+
+#### 19.1.1. BaseStatisticsRoot
+
+`atoms/stats/class_stats.fgb` начинается с отдельного database-global root. Он сохраняет частые
+revision-счётчики и directory двух Base-частей, не смешивая property histograms с class counters:
+
+```text
+Offset  Size  Тип    Поле
+0       32    —      PageHeader (magic=MAGIC_STATS, type=StatisticsRoot, page_no=0)
+32      8     u64    revision
+40      8     u64    analyzed_revision
+48      8     u64    dirty_rows
+56      8     u64    class_first_page       -- page 1 class_stats.fgb или NULL_PAGE
+64      8     u64    property_first_page    -- page 0 prop_stats.fgb или NULL_PAGE
+72      4     u32    class_page_count
+76      4     u32    property_page_count
+80      4     u32    statistics_layout_version = 1
+84      ...   —      _reserved = 0
+```
+
+Class pages занимают непрерывный диапазон с page 1; property pages нумеруются с нуля в
+`atoms/stats/prop_stats.fgb`. Для пустой части start равен `NULL_PAGE`, count — нулю. Физические
+длины обязаны быть точно равны `1 + class_page_count` и `property_page_count`; лишняя,
+переставленная или недостижимая страница является corruption. При reopen root читается eager,
+обе auxiliary-части остаются непрочитанными до их потребителя в точном storage snapshot.
+
+#### 19.1.2. GraphClassStatsPage
+
+```text
+0       32    PageHeader(magic=MAGIC_CLASS_STATS, type=ClassStatistic)
+32      8     next_page
+40      4     count
+44      4     reserved = 0
+48      ...   entries[16 bytes]
+
+ClassStatisticEntry:
+0       4     class_id
+4       4     reserved = 0
+8       8     atom_count
+```
+
+Class pages занимают один непрерывный диапазон сразу после degree-range. `next_page` указывает на
+следующую физическую страницу диапазона, а в последней странице равен `NULL_PAGE`. В payload
+помещается не более 1021 записи; неиспользованный хвост равен нулю. Записи строго отсортированы по
+`class_id`, reserved/нулевой/`u32::MAX` identity и duplicate key являются corruption. Нулевая
+запись сохраняется point-DML, пока существует class definition; bulk ANALYZE может опустить class
+без живых атомов, если planner получает нулевой count из schema-aware fallback.
 
 ### 19.2. LabelStatsPage
 
@@ -3003,19 +3055,19 @@ CHAIN_COVER, `k` для GRAIL, `max_ranges` для FERRARI, `bits` для BFL.
 
 Единое пространство `section_kind`:
 
-| Код | Секция | Код | Секция |
-|----:|--------|----:|--------|
-| `0x0001` | NodeComponentMap | `0x0010` | PatternDescriptor |
-| `0x0002` | EdgeComponentMap | `0x0011` | PatternCanonicalIr |
-| `0x0003` | SccRepresentativeMap | `0x0012` | PatternBindingSchema |
-| `0x0004` | CondensationCsrOffsets | `0x0013` | PatternDependencies |
-| `0x0005` | CondensationCsrTargets | `0x0014` | PatternBindingRows |
-| `0x0006` | PathVertexMap | `0x0100` | TreeCoverIntervals |
-| `0x0007` | LandmarkRefs | `0x0101` | GrailIntervals |
-| `0x0008` | LandmarkDistanceFrom | `0x0102` | FerrariIntervals |
-| `0x0009` | LandmarkDistanceTo | `0x0103` | BflBitsets |
-| | | `0x0104` | ChainCoordinates |
-| | | `0x0105` | ChainReachabilityCells |
+|      Код | Секция                 |      Код | Секция                 |
+|---------:|------------------------|---------:|------------------------|
+| `0x0001` | NodeComponentMap       | `0x0010` | PatternDescriptor      |
+| `0x0002` | EdgeComponentMap       | `0x0011` | PatternCanonicalIr     |
+| `0x0003` | SccRepresentativeMap   | `0x0012` | PatternBindingSchema   |
+| `0x0004` | CondensationCsrOffsets | `0x0013` | PatternDependencies    |
+| `0x0005` | CondensationCsrTargets | `0x0014` | PatternBindingRows     |
+| `0x0006` | PathVertexMap          | `0x0100` | TreeCoverIntervals     |
+| `0x0007` | LandmarkRefs           | `0x0101` | GrailIntervals         |
+| `0x0008` | LandmarkDistanceFrom   | `0x0102` | FerrariIntervals       |
+| `0x0009` | LandmarkDistanceTo     | `0x0103` | BflBitsets             |
+|          |                        | `0x0104` | ChainCoordinates       |
+|          |                        | `0x0105` | ChainReachabilityCells |
 
 `0x003E` принимает только `0x0001..=0x0009`, `0x003F` — `0x0010..=0x0014`; specialized page types
 `0x0027..=0x002A` принимают соответственно только `0x0100..=0x0103`, а renamed

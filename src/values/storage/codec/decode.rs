@@ -30,6 +30,7 @@ use crate::{
 			DiskAtomRef,
 			DiskGraphRef,
 			QualifiedAtomRef,
+			StorageAtomRef,
 			StorageBound,
 			StorageDateTime,
 			StorageDecimal,
@@ -96,15 +97,24 @@ impl<'a> Decoder<'a> {
 			0x21..=0x27 => self.decode_geometry(tag, depth + 1).map(StorageValue::Geometry),
 			0x31..=0x35 => self.decode_vector(tag).map(StorageValue::Vector),
 			0x36 => {
-				let raw = self.read_u64()?;
-				DiskAtomRef::from_raw(raw).map(StorageValue::AtomRef).map_err(|cause| {
-					invalid(offset, "DiskAtomRef contains reserved bits").with_cause(cause)
-				})
+				let kind = match self.read_u8()? {
+					0 => crate::values::AtomKind::Node,
+					1 => crate::values::AtomKind::Edge,
+					_ => return Err(invalid(offset, "atom reference contains an unknown kind")),
+				};
+				if self.read_u8()? != crate::values::storage::TypeTag::RecordId.byte() {
+					return Err(invalid(
+						offset,
+						"atom reference does not contain a canonical RecordId",
+					));
+				}
+				let record_id = self.decode_record_id(depth + 1)?;
+				Ok(StorageValue::AtomRef(StorageAtomRef {
+					kind,
+					record_id,
+				}))
 			}
-			0x37 => Ok(StorageValue::GraphRef(DiskGraphRef {
-				slot: self.read_u32()?,
-				generation: self.read_u32()?,
-			})),
+			0x37 => DiskGraphRef::from_raw(self.read_u64()?).map(StorageValue::GraphRef),
 			0x38 => {
 				let graph_slot = self.read_u32()?;
 				let raw = self.read_u64()?;
@@ -169,7 +179,7 @@ impl<'a> Decoder<'a> {
 
 	fn decode_record_id(&mut self, depth: usize) -> FerrosGrynnResult<StorageRecordId> {
 		self.check_depth(depth)?;
-		let table_id = self.read_u32()?;
+		let class_id = self.read_u32()?;
 		let kind_offset = self.position;
 		let part = match self.read_u8()? {
 			0x00 => StorageRecordIdPart::Int(zigzag_decode(self.read_uleb()?)),
@@ -181,7 +191,7 @@ impl<'a> Decoder<'a> {
 			_ => return Err(invalid(kind_offset, "unknown RecordId part kind")),
 		};
 		Ok(StorageRecordId {
-			table_id,
+			class_id,
 			part,
 		})
 	}

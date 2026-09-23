@@ -77,6 +77,11 @@ pub(super) fn eval(
 			let base = eval(base, row, slots, source, fields)?;
 			match base {
 				Value::Object(object) => Ok(object.get(field).cloned().unwrap_or(Value::None)),
+				Value::Record(record) if fields.is_some() => fields
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("Record resolver is unavailable.")
+					})?
+					.record_field(&record, field),
 				Value::None | Value::Null if *null_safe => Ok(Value::None),
 				Value::None | Value::Null => Ok(Value::None),
 				value => Err(FerrosGrynnError::invalid_argument(format!(

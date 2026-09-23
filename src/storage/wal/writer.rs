@@ -346,7 +346,7 @@ impl FrameWal {
 	pub(in crate::storage) fn visible_file_page_count(
 		&self,
 		snapshot: StorageSnapshot,
-		graph_id: GraphId,
+		space_id: DataSpaceId,
 		file_id: DataFileId,
 	) -> Option<u64> {
 		let published = self.inner.published.read();
@@ -354,7 +354,7 @@ impl FrameWal {
 			.versions
 			.iter()
 			.filter(|(key, versions)| {
-				key.graph_id() == graph_id
+				key.space_id() == space_id
 					&& key.file_id() == file_id
 					&& versions.iter().any(|version| version.commit_lsn <= snapshot.visible_lsn())
 			})

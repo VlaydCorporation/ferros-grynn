@@ -6,12 +6,12 @@ pub mod gql;
 pub mod graph;
 pub mod math;
 // mod memory;
-pub(crate) mod stats;
-pub(crate) mod storage;
+pub mod stats;
+mod storage;
+pub mod syn;
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]
 pub use storage::prototype_api as storage_engine_prototype_api;
-mod syn;
 // mod sys;
 // mod utils;
 pub mod values;

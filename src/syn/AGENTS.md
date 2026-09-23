@@ -30,9 +30,15 @@ state. Он не выполняет запросы и не разрешает sc
   для comments, escapes, quoted identifiers, parameters, spans и errors.
 - Syntax errors создаются через `gql_status`; semantic validation принадлежит
   `gql::analysis`.
-- `stmt/schema.rs` владеет core `DEFINE`/`REMOVE`/`ALTER` и
-  `INFO FOR DB|TABLE|INDEX`. Неподдерживаемые DDL clauses должны завершаться
-  явной диагностикой, а не создавать speculative AST variants.
+- `stmt/schema.rs` владеет core `DEFINE`/`REMOVE`/`ALTER` для
+  `GRAPH|CLASS|FIELD|INDEX` и `INFO FOR DB|CLASS|INDEX`.
+- `stmt/dml.rs`, `stmt/graph_dml.rs` и `stmt/match.rs` разделяют direct atom
+  DML, graph occurrence DML и pattern grammar. `RecordId` selector, alias,
+  optional label и `IN GRAPH` не должны сливаться в один syntax field.
+- `TABLE`, `(alias:label)` и `FROM graph` отвергаются; test-only compatibility
+  parser не поддерживается.
+- Неподдерживаемые DDL/DML clauses завершаются явной диагностикой, а не создают
+  speculative AST variants.
 
 ## Проверка
 

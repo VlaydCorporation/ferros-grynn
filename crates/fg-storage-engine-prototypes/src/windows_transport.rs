@@ -319,9 +319,10 @@ mod tests {
 	fn home_keys() -> Result<[PageCacheKey; 2], Box<dyn Error>> {
 		let file_id =
 			DataFileId::new(1, DataFileKind::NodesHot).ok_or("invalid test data-file identity")?;
+		let graph_id = GraphId::new(1).ok_or("test graph identity is zero")?;
 		Ok([0, 1].map(|page_no| {
 			PageCacheKey::new(
-				PageKey::new(GraphId::new(1), file_id, PageNo::new(page_no)),
+				PageKey::for_graph(graph_id, file_id, PageNo::new(page_no)),
 				PageCacheVersion::Home {
 					generation: CheckpointGeneration::new(1),
 					ceiling: Lsn::new(100),

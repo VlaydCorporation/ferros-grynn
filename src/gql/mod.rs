@@ -15,15 +15,19 @@ pub use crate::syn::{
 	AlterStatement,
 	AlterTarget,
 	Assignment,
+	AttachStatement,
 	BasicIndexDefinition,
 	BinaryOperator,
+	ClassKindName,
+	ClassSchemaModeName,
 	CreateStatement,
+	DefineClassStatement,
 	DefineFieldStatement,
 	DefineGraphStatement,
 	DefineIndexStatement,
-	DefineTableStatement,
 	DefinitionMode,
 	DeleteStatement,
+	DetachStatement,
 	DmlData,
 	DmlReturn,
 	DmlReturnItem,
@@ -32,6 +36,7 @@ pub use crate::syn::{
 	Expr,
 	ExprKind,
 	Identifier,
+	IndexScopeName,
 	InfoStatement,
 	InfoTarget,
 	LetStatement,
@@ -43,6 +48,7 @@ pub use crate::syn::{
 	MatchLength,
 	MatchPattern,
 	MatchReturnItem,
+	MatchSelector,
 	MatchStatement,
 	MatchStep,
 	MutateStatement,
@@ -50,6 +56,7 @@ pub use crate::syn::{
 	ParserSettings,
 	Program,
 	RecordKey,
+	RelateStatement,
 	RemoveStatement,
 	RemoveTarget,
 	ReturnStatement,
@@ -58,8 +65,6 @@ pub use crate::syn::{
 	SelectTarget,
 	Statement,
 	StatementKind,
-	TableKindName,
-	TableSchemaModeName,
 	TypeName,
 	UnaryOperator,
 };
@@ -73,8 +78,11 @@ pub(crate) fn program_mutates_state(program: &Program) -> bool {
 				| StatementKind::Update(_)
 				| StatementKind::Upsert(_)
 				| StatementKind::Delete(_)
+				| StatementKind::Attach(_)
+				| StatementKind::Detach(_)
+				| StatementKind::Relate(_)
 				| StatementKind::DefineGraph(_)
-				| StatementKind::DefineTable(_)
+				| StatementKind::DefineClass(_)
 				| StatementKind::DefineField(_)
 				| StatementKind::DefineIndex(_)
 				| StatementKind::Remove(_)
@@ -98,6 +106,9 @@ pub enum QueryStatementKind {
 	Update,
 	Upsert,
 	Delete,
+	Attach,
+	Detach,
+	Relate,
 	Define,
 	Remove,
 	Alter,

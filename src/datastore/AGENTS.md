@@ -4,48 +4,63 @@
 
 ## Назначение
 
-`datastore` — публичный composition root для RAM/local backends, каталогов,
-MVCC-транзакций и query adapter. Он координирует домены, но не владеет
-page/WAL layout (`storage`), graph algorithms (`graph`) или синтаксисом (`syn`).
+`datastore` владеет database-wide MVCC root, глобальным реестром атомов,
+graph-local occurrences, каталогом схем и публичной транзакционной границей.
+Он не владеет page/WAL layout (`storage`), graph algorithms (`graph`) или
+синтаксисом (`syn`). Одна нормализованная модель работает для in-memory и
+local backend; local publication сохраняет AtomStore, occurrences, memberships,
+indexes и schema одним storage snapshot.
 
 ## Карта владельцев
 
-- `options` — backend, I/O, checkpoint и transaction options;
-- `schema` — graph/table/field/index definitions и validation;
-- `root` — immutable MVCC root, catalogs и version histories;
-- `backend` — in-memory/local selection и durable publication adapter;
-- `transaction/conflict` — read/write/predicate sets, FCW и SSI validation;
-- `transaction/mutation` — table/graph mutation views;
-- `transaction/query` — `QuerySnapshot` и execution adapter;
-- `transaction/graph_view` — snapshot-bound `GraphRead`;
-- `transaction/mod.rs` — lifecycle, commit/rollback и public transaction API.
+- `atom_store` — global `RecordId → GlobalAtomId`, base properties и точный
+  reverse membership index;
+- `occurrence` — graph-local `AtomId`, label, topology и ленивый sparse overlay;
+- `identity` — `DataSpaceId::Database` либо ненулевой `GraphId` для будущего WAL;
+- `schema` — `ClassSchema`, `GraphSchema` и типизированные durable identities;
+- `root` — единый immutable commit image AtomStore + graphs + logical versions;
+- `index_store` — Base и Effective index images, class/label/count lookup и
+  проверка Unique;
+- `conflict` — независимые `BaseAtom`, `GraphMembership`, `GraphOverlay` и
+  `GraphIncidence` conflict keys;
+- `transaction` — private root, FCW/SSI validation, bounded fanout preflight и
+  replay непересекающихся writes поверх актуального root;
+- `store` — datastore owner, ID clocks и один commit mutex;
+- `options`/`consts` — transaction и будущие local-storage resource limits.
 
 ## Инварианты
 
-- Commit сначала валидирует limits/conflicts, затем делает local state durable,
-  и только потом публикует новый root.
-- Read-only/query results возвращают runtime `Value`/`RecordId`, не storage DTO
-  и не `AtomId`.
-- Serializable predicate tracking покрывает scans и graph/catalog phantoms;
-  FCW остаётся отдельной write/write гарантией.
-- Активные snapshot-и регистрируются и освобождаются на всех success/error/drop
-  путях; age/write-set limits не обходятся вспомогательным API.
-- Текущий global commit serialization является явной простой границей. Не
-  заменять её lock-free MVCC без профиля bottleneck и полного anomaly suite.
-- Таблица с `graph() == None` принадлежит системному `GraphId = 0`; не создавать
-  для неё фиктивный runtime-граф. Удаление именованного графа атомарно удаляет
-  его таблицы, а системные таблицы не затрагивает.
-- DDL изменяет тот же транзакционный `SchemaCatalog`, что и Rust API. Secondary
-  index имеет одно наблюдаемое состояние `Ready`, `Stale` или
-  `PreparedForRemoval`; состояние участвует в выборе access path.
-- Graph-backed DML использует явный table membership и публикует данные,
-  statistics и ready indexes одним commit. Family invariants проверяются на
-  объединённом commit image при любом isolation level. Физический row layout
-  системного `GraphId=0` не определён; до нормативного решения такой DML
-  возвращает явную unsupported ошибку, а не создаёт скрытый graph.
+- `RecordId = class:id` задаёт ровно один immutable class; отдельного table
+  membership и system graph не существует.
+- Один base atom может не входить ни в один граф либо иметь по одному occurrence
+  в нескольких графах. Reverse memberships обновляются вместе с occurrences.
+- Base properties хранятся один раз. Effective value равен graph-local
+  `Value`, отсутствует при `Hidden` и иначе наследует актуальное base value.
+- Отсутствующий overlay не аллоцируется. `RESET` удаляет последнюю пустую overlay
+  map и возобновляет наследование.
+- Write/write validation использует точный logical target. Membership и
+  incidence не объединяются с base/overlay в одну грубую graph version.
+- Base mutation до изменения private root резервирует fanout только по reverse
+  memberships данного атома. Commit повторяет расчёт на актуальном root; выход
+  за `max_write_set_bytes` ничего не публикует.
+- Snapshot/SI читают один immutable root. Read Committed обновляет root между
+  вызовами API и replay-ит собственные непересекающиеся writes. Serializable
+  write transaction консервативно abort-ится при изменении прочитанного key.
+- Commit под одним mutex сначала проверяет FCW, structural requirements, SSI и
+  fanout, затем строит полный новый root и публикует его одной заменой `Arc`.
+- Публичные read results владеют `RecordId`, `ClassId`, `AtomKind` и
+  `PropertyMap`; crate-private `GlobalAtomId` наружу не выходит.
+- Predicate/range phantoms, scope-aware indexes, durable publication и graph
+  DML используют тот же normalized root. Не возвращать ради новых операций
+  удалённый TABLE/system-graph контур.
+- `CREATE`/`UPDATE`/`UPSERT`/`DELETE` без graph scope работают с global atom;
+  `ATTACH`/`DETACH`/`RELATE ... IN GRAPH`, labels, topology и overlays меняют
+  только graph-local occurrence, если операция явно не задаёт Base scope.
+- `query_to_memory` владеет copied effective graph. Mutable materialization
+  сохраняет origin mapping и flush-ит только явным вызовом; `Drop` не пишет.
 
 ## Проверка
 
-Для изменения запускать узкие RAM и local сценарии, затем SSI/FCW, limit,
-reopen/recovery и query tests затронутого пути. Backend-neutral поведение
-проверять на обоих backends; disk failure не должен публиковать RAM root.
+Проверять focused schema/value/root/transaction/query tests, RAM/local parity,
+reopen/recovery в обеих I/O feature-конфигурациях и effective-index/predicate
+regressions. Ошибка commit никогда не должна менять опубликованный root.

@@ -1,149 +1,110 @@
-#[allow(
-	clippy::wildcard_imports,
-	reason = "the facade owns imports during the move-only split"
-)]
-use super::*;
+use std::{marker::PhantomData, sync::Arc};
 
+use super::Transaction;
+use crate::{
+	datastore::{
+		ClassSchema,
+		DatabaseRoot,
+		GlobalAtomId,
+		GraphOccurrence,
+		GraphRoot,
+		GraphSchema,
+		OverlayValue,
+	},
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	graph::{AtomId, GraphId, GraphRef},
+	values::{AtomKind, PropertyDictionary, PropertyMap, RecordId, Text, Value},
+};
+
+/// One owned atom row passed from datastore cursors to query execution.
 #[derive(Clone)]
 pub(crate) struct QueryStorageRow {
 	pub(crate) record_id: RecordId,
-	pub(crate) atom_id: AtomId,
+	pub(crate) kind: AtomKind,
+	pub(crate) local_id: Option<AtomId>,
+	pub(crate) label: Option<Text>,
 	pub(crate) values: Vec<Value>,
+	pub(crate) base_properties: PropertyMap,
 	pub(crate) properties: PropertyMap,
 }
 
-/// Backend-neutral bounded row source used by the hybrid integration path.
-pub(crate) struct QueryStorageCursor<'store> {
-	source: QueryStorageSource<'store>,
-}
-
-/// Concrete cursor state without virtual dispatch inside page loops.
-enum QueryStorageSource<'store> {
-	/// Schema-only system table before the DML system-graph slice.
-	Empty,
-	/// Slot-wise scan of an immutable in-memory graph root.
-	Materialized(MaterializedTableCursor),
-	/// Bounded primary-leaf scan of one local graph generation.
-	Local {
-		cursor: LocalTableCursor<'store>,
-		schema: Arc<TableSchema>,
+enum QueryCursorSource {
+	Base(Vec<GlobalAtomId>),
+	Graph {
+		graph: GraphId,
+		ids: Vec<AtomId>,
 	},
-	/// Already bounded candidates returned by a scalar index.
-	Indexed(std::vec::IntoIter<QueryStorageRow>),
 }
 
-/// Allocation-free slot cursor for Mode 1 and materialized graph writes.
-struct MaterializedTableCursor {
-	graph: Arc<MaterializedGraph>,
-	schema: Arc<TableSchema>,
-	memberships: AtomTableMemberships,
-	kind_index: usize,
-	next_slot: usize,
-}
-
-impl MaterializedTableCursor {
-	/// Creates a cursor positioned before the first permitted atom kind.
-	const fn new(
-		graph: Arc<MaterializedGraph>,
-		schema: Arc<TableSchema>,
-		memberships: AtomTableMemberships,
-	) -> Self {
-		Self {
-			graph,
-			schema,
-			memberships,
-			kind_index: 0,
-			next_slot: 0,
-		}
-	}
-
-	/// Returns the next row without materializing the remaining graph.
-	fn next_row(&mut self) -> FerrosGrynnResult<Option<QueryStorageRow>> {
-		while self.kind_index < 2 {
-			let kind = if self.kind_index == 0 {
-				AtomKind::Node
-			} else {
-				AtomKind::Edge
-			};
-			let allowed = match kind {
-				AtomKind::Node => matches!(self.schema.kind, TableKind::Any | TableKind::Normal),
-				AtomKind::Edge => matches!(self.schema.kind, TableKind::Any | TableKind::Relation),
-			};
-			if !allowed {
-				self.kind_index += 1;
-				self.next_slot = 0;
-				continue;
-			}
-			let capacity = self.graph.slot_capacity(kind);
-			while self.next_slot < capacity {
-				let slot = self.next_slot;
-				self.next_slot += 1;
-				let Some(generation) = self.graph.slot_generation(kind, slot) else {
-					continue;
-				};
-				let slot = u64::try_from(slot).map_err(|source| {
-					FerrosGrynnError::invalid_storage_file(format!(
-						"in-memory atom slot exceeds u64: {source}"
-					))
-				})?;
-				let atom = AtomId::from_parts(kind, slot, generation)?;
-				if let Some(row) =
-					materialize_atom(&self.graph, &self.schema, &self.memberships, atom)
-				{
-					return Ok(Some(row));
-				}
-			}
-			self.kind_index += 1;
-			self.next_slot = 0;
-		}
-		Ok(None)
-	}
+/// Snapshot-bound cursor over database-global atoms of one class.
+pub(crate) struct QueryStorageCursor<'snapshot> {
+	root: Arc<DatabaseRoot>,
+	class: Arc<ClassSchema>,
+	source: QueryCursorSource,
+	next: usize,
+	_marker: PhantomData<&'snapshot ()>,
 }
 
 impl QueryStorageCursor<'_> {
-	/// Pulls one owned storage row from the selected backend.
+	/// Pulls one owned row without materializing the remaining class.
 	pub(crate) fn next_row(&mut self) -> FerrosGrynnResult<Option<QueryStorageRow>> {
-		match &mut self.source {
-			QueryStorageSource::Empty => Ok(None),
-			QueryStorageSource::Materialized(cursor) => cursor.next_row(),
-			QueryStorageSource::Local {
-				cursor,
-				schema,
-			} => cursor.next_atom().map(|atom| {
-				atom.map(|atom| {
-					row_from_properties(atom.atom_id, &atom.record_id, &atom.properties, schema)
-				})
-			}),
-			QueryStorageSource::Indexed(rows) => Ok(rows.next()),
-		}
+		let row = match &self.source {
+			QueryCursorSource::Base(ids) => {
+				let Some(id) = ids.get(self.next).copied() else {
+					return Ok(None);
+				};
+				let atom = self.root.atom(id).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"class index references an absent global atom",
+					)
+				})?;
+				row_from_atom(atom, &self.class)
+			}
+			QueryCursorSource::Graph {
+				graph,
+				ids,
+			} => {
+				let Some(local) = ids.get(self.next).copied() else {
+					return Ok(None);
+				};
+				let graph = self.root.graph(*graph).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"graph class index references an absent graph",
+					)
+				})?;
+				let occurrence = graph.occurrence(local).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"graph class index references an absent occurrence",
+					)
+				})?;
+				row_from_occurrence(&self.root, occurrence, &self.class)?
+			}
+		};
+		self.next += 1;
+		Ok(Some(row))
 	}
 }
 
+/// Scalar comparison available to a class-index probe.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ScalarComparison {
-	/// Exact equality.
 	Equal,
-	/// Strictly less than.
 	Less,
-	/// Less than or equal.
 	LessOrEqual,
-	/// Strictly greater than.
 	Greater,
-	/// Greater than or equal.
 	GreaterOrEqual,
 }
 
-/// One scalar predicate that may be satisfied by a durable table index.
+/// One scalar predicate that may be answered by a class index.
 #[derive(Debug, Clone)]
 pub(crate) struct ScalarIndexConstraint {
-	/// Query row column; zero is the synthetic record id.
 	pub(crate) column: usize,
-	/// Ordered comparison to apply.
 	pub(crate) comparison: ScalarComparison,
-	/// Runtime scalar encoded into an order-preserving index key.
 	pub(crate) value: Value,
 }
 
+/// Immutable root captured for one query program.
+#[derive(Clone)]
 pub(crate) struct QuerySnapshot {
 	pub(super) root: Arc<DatabaseRoot>,
 }
@@ -154,485 +115,336 @@ impl QuerySnapshot {
 	}
 }
 
-pub(crate) trait PredicateEvaluator {
-	fn matches(&self, row: &QueryStorageRow) -> FerrosGrynnResult<bool>;
-}
-
-#[allow(
-	clippy::multiple_inherent_impl,
-	reason = "transaction responsibilities are split into cohesive modules"
-)]
 impl Transaction {
-	/// Returns the latest append-only property dictionary.
-	///
-	/// Property identities are never removed or rebound, so observing names
-	/// interned after the data snapshot cannot change row visibility.
 	pub(crate) fn query_property_dictionary(&self) -> Arc<PropertyDictionary> {
-		self.store.property_dictionary()
+		self.working.dictionary.clone()
 	}
 
-	pub(crate) fn query_snapshot(&self) -> FerrosGrynnResult<QuerySnapshot> {
-		self.ensure_live()?;
+	pub(crate) fn query_snapshot(&mut self) -> FerrosGrynnResult<QuerySnapshot> {
+		self.prepare_read()?;
 		Ok(QuerySnapshot {
-			root: self.read_root(),
+			root: Arc::new(self.working.clone()),
 		})
 	}
 
-	pub(crate) fn query_table(
+	pub(crate) fn query_class(
 		&self,
 		snapshot: &QuerySnapshot,
 		name: &str,
-	) -> FerrosGrynnResult<Arc<TableSchema>> {
+	) -> FerrosGrynnResult<Arc<ClassSchema>> {
 		self.ensure_live()?;
-		self.record_read(&snapshot.root, ReadKey::Table(name.to_owned()));
-		match self.tables.get(name) {
-			Some(Some(schema)) => Ok(Arc::new(schema.clone())),
-			Some(None) => Err(FerrosGrynnError::table_does_not_exist(name)),
-			None => snapshot
-				.root
-				.schema
-				.table(name)
-				.ok_or_else(|| FerrosGrynnError::table_does_not_exist(name)),
-		}
+		snapshot.root.schema.class(name).ok_or_else(|| FerrosGrynnError::class_does_not_exist(name))
 	}
 
-	/// Resolves a named graph against transaction-local writes and one
-	/// snapshot.
 	pub(crate) fn query_named_graph(
 		&self,
 		snapshot: &QuerySnapshot,
 		name: &str,
 	) -> FerrosGrynnResult<GraphRef> {
 		self.ensure_live()?;
-		if let Some((record_id, write)) =
-			self.graphs.iter().find(|(_record_id, write)| write.name == name && write.exists())
-		{
-			let kind = write.kind().ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
-			self.record_read(&snapshot.root, ReadKey::GraphCatalog(record_id.clone()));
-			return Ok(GraphRef::new(
-				record_id.clone(),
-				kind,
-				self.store.inner.graph_storage_mode(),
-			));
-		}
-		if self.graphs.values().any(|write| write.name == name && !write.exists()) {
-			return Err(FerrosGrynnError::graph_does_not_exist(name));
-		}
-		let record_id = snapshot
+		snapshot
 			.root
 			.schema
-			.graph_names
-			.get(name)
-			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
-		let stored = snapshot.root.graphs.get(record_id).ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file(
-				"named graph catalog points to an absent graph record",
-			)
-		})?;
-		self.record_read(&snapshot.root, ReadKey::GraphCatalog(record_id.clone()));
-		Ok(GraphRef::new(
-			record_id.clone(),
-			stored.graph.kind(),
-			self.store.inner.graph_storage_mode(),
-		))
+			.named_graph(name)
+			.map(|schema| schema.reference().clone())
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))
 	}
 
-	/// Returns graph definitions visible to this transaction in catalog-name
-	/// order.
 	pub(crate) fn query_schema_graphs(
 		&self,
 		snapshot: &QuerySnapshot,
 	) -> FerrosGrynnResult<Vec<GraphSchema>> {
 		self.ensure_live()?;
-		let mut graphs = snapshot
-			.root
-			.schema
-			.graphs()
-			.map(|schema| (schema.name().as_str().to_owned(), schema.as_ref().clone()))
-			.collect::<BTreeMap<_, _>>();
-		for (record_id, write) in &self.graphs {
-			self.record_read(&snapshot.root, ReadKey::GraphCatalog(record_id.clone()));
-			if write.exists() {
-				graphs.insert(write.name.clone(), write.schema.clone());
-			} else {
-				graphs.remove(&write.name);
-			}
-		}
-		Ok(graphs.into_values().collect())
+		Ok(snapshot.root.schema.graphs().map(|graph| graph.as_ref().clone()).collect())
 	}
 
-	/// Returns table definitions visible to this transaction in name order.
-	pub(crate) fn query_schema_tables(
+	pub(crate) fn query_schema_classes(
 		&self,
 		snapshot: &QuerySnapshot,
-	) -> FerrosGrynnResult<Vec<TableSchema>> {
+	) -> FerrosGrynnResult<Vec<ClassSchema>> {
 		self.ensure_live()?;
-		let mut tables = snapshot
-			.root
-			.schema
-			.tables()
-			.map(|schema| (schema.name().as_str().to_owned(), schema.as_ref().clone()))
-			.collect::<BTreeMap<_, _>>();
-		for (name, schema) in &self.tables {
-			self.record_read(&snapshot.root, ReadKey::Table(name.clone()));
-			if let Some(schema) = schema {
-				tables.insert(name.clone(), schema.clone());
-			} else {
-				tables.remove(name);
-			}
-		}
-		Ok(tables.into_values().collect())
+		Ok(snapshot.root.schema.classes().map(|class| class.as_ref().clone()).collect())
 	}
 
-	/// Collects the streaming path only for legacy root characterization tests.
-	#[cfg(test)]
-	pub(crate) fn query_rows(
+	pub(crate) fn query_row_cursor<'snapshot>(
 		&self,
-		snapshot: &QuerySnapshot,
-		table: &str,
-		constraints: &[ScalarIndexConstraint],
-	) -> FerrosGrynnResult<Vec<QueryStorageRow>> {
-		let mut cursor = self.query_row_cursor(snapshot, table, constraints)?;
-		let mut rows = Vec::new();
-		while let Some(row) = cursor.next_row()? {
-			rows.push(row);
-		}
-		rows.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
-		Ok(rows)
-	}
-
-	/// Opens a bounded backend-neutral query row cursor.
-	pub(crate) fn query_row_cursor<'store>(
-		&'store self,
-		snapshot: &QuerySnapshot,
-		table: &str,
-		constraints: &[ScalarIndexConstraint],
-	) -> FerrosGrynnResult<QueryStorageCursor<'store>> {
-		self.ensure_live()?;
-		let schema = self.query_table(snapshot, table)?;
-		let Some(graph_ref) = schema.graph() else {
-			return Ok(QueryStorageCursor {
-				source: QueryStorageSource::Empty,
-			});
+		snapshot: &'snapshot QuerySnapshot,
+		class: &str,
+		_constraints: &[ScalarIndexConstraint],
+		graph: Option<&GraphRef>,
+	) -> FerrosGrynnResult<QueryStorageCursor<'snapshot>> {
+		let class = self.query_class(snapshot, class)?;
+		let class_id = class.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("published class is missing ClassId")
+		})?;
+		let source = if let Some(reference) = graph {
+			query_graph_root(&snapshot.root, reference)?;
+			self.record_read(crate::datastore::ConflictKey::GraphClassRange(
+				reference.id(),
+				class_id,
+			));
+			QueryCursorSource::Graph {
+				graph: reference.id(),
+				ids: snapshot.root.indexes.graph_class(reference.id(), class_id),
+			}
+		} else {
+			self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id));
+			QueryCursorSource::Base(snapshot.root.indexes.base_class(class_id))
 		};
-		self.record_read(&snapshot.root, ReadKey::GraphCatalog(graph_ref.id().clone()));
-		if let Some(write) = self.graphs.get(graph_ref.id()) {
-			let graph = write.snapshot(&self.store)?;
-			let memberships = self.query_memberships(&snapshot.root, graph_ref.id())?;
-			return Ok(QueryStorageCursor {
-				source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
-					Arc::new(graph),
-					schema,
-					memberships,
-				)),
-			});
-		}
-		let stored =
-			snapshot.root.graphs.get(graph_ref.id()).ok_or_else(|| {
-				FerrosGrynnError::graph_does_not_exist(graph_ref.id().to_string())
-			})?;
-		match &stored.graph {
-			StoredGraphValue::Materialized(graph) => {
-				let memberships = self.query_memberships(&snapshot.root, graph_ref.id())?;
-				Ok(QueryStorageCursor {
-					source: QueryStorageSource::Materialized(MaterializedTableCursor::new(
-						graph.clone(),
-						schema,
-						memberships,
-					)),
-				})
+		Ok(QueryStorageCursor {
+			root: snapshot.root.clone(),
+			class,
+			source,
+			next: 0,
+			_marker: PhantomData,
+		})
+	}
+
+	/// Selects graph-local MATCH seeds through exact, class, and label indexes.
+	pub(crate) fn query_match_candidates(
+		&self,
+		snapshot: &QuerySnapshot,
+		reference: &GraphRef,
+		kind: AtomKind,
+		class: Option<&str>,
+		record: Option<&RecordId>,
+		label: Option<&str>,
+	) -> FerrosGrynnResult<Vec<AtomId>> {
+		self.ensure_live()?;
+		let graph = query_graph_root(&snapshot.root, reference)?;
+		self.record_read(crate::datastore::ConflictKey::GraphKindRange(
+			reference.id(),
+			AtomKind::Node,
+		));
+		self.record_read(crate::datastore::ConflictKey::GraphKindRange(
+			reference.id(),
+			AtomKind::Edge,
+		));
+		if let Some(record) = record {
+			self.track_query_point(snapshot, record, Some(reference))?;
+			let Some(atom) = snapshot.root.atom_by_record(record) else {
+				return Ok(Vec::new());
+			};
+			if atom.kind() != kind {
+				return Ok(Vec::new());
 			}
-			StoredGraphValue::Local(graph) => {
-				let local = self.store.inner.backend.local().ok_or_else(|| {
+			let Some(local) = graph.local_id(atom.id()) else {
+				return Ok(Vec::new());
+			};
+			if let Some(expected) = label {
+				let occurrence = graph.occurrence(local).ok_or_else(|| {
 					FerrosGrynnError::invalid_storage_file(
-						"local graph is attached to an in-memory backend",
+						"graph membership references an absent occurrence",
 					)
 				})?;
-				let transaction = self.local_snapshot()?;
-				if let Some(rows) =
-					indexed_local_rows(local, &transaction, graph, &schema, constraints)?
-				{
-					return Ok(QueryStorageCursor {
-						source: QueryStorageSource::Indexed(rows.into_iter()),
-					});
+				if occurrence.label().map(Text::as_str) != Some(expected) {
+					return Ok(Vec::new());
 				}
-				Ok(QueryStorageCursor {
-					source: QueryStorageSource::Local {
-						cursor: LocalTableCursor::open(
-							local,
-							transaction,
-							graph.clone(),
-							schema_id(&schema)?,
-							schema.kind,
-						)?,
-						schema,
-					},
-				})
 			}
+			return Ok(vec![local]);
 		}
+
+		let class_ids = class
+			.map(|class| {
+				let schema = self.query_class(snapshot, class)?;
+				if schema.kind() != kind {
+					return Err(FerrosGrynnError::invalid_argument(
+						"MATCH selector class kind disagrees with its pattern delimiter.",
+					));
+				}
+				let class_id = schema.id().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("published class is missing ClassId")
+				})?;
+				Ok(snapshot.root.indexes.graph_class(reference.id(), class_id))
+			})
+			.transpose()?;
+		let label_ids = label.map(|label| {
+			snapshot.root.indexes.graph_label(reference.id(), kind, &Text::from(label))
+		});
+		Ok(match (class_ids, label_ids) {
+			(Some(classes), Some(labels)) => intersect_sorted(classes, labels),
+			(Some(classes), None) => classes,
+			(None, Some(labels)) => labels,
+			(None, None) => graph
+				.occurrences()
+				.filter(|occurrence| occurrence.local_id().kind() == Some(kind))
+				.map(GraphOccurrence::local_id)
+				.collect(),
+		})
 	}
 
-	/// Resolves one record without scanning the table when the graph comes from
-	/// a published snapshot. Transaction-private graph writes use the compact
-	/// materialized fallback because they have not built a durable index yet.
 	pub(crate) fn query_point(
 		&self,
 		snapshot: &QuerySnapshot,
 		record: &RecordId,
+		graph: Option<&GraphRef>,
 	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
 		self.ensure_live()?;
-		let schema = self.query_table(snapshot, record.table())?;
-		let Some(graph_ref) = schema.graph() else {
+		self.track_query_point(snapshot, record, graph)?;
+		let Some(atom) = snapshot.root.atom_by_record(record) else {
 			return Ok(None);
 		};
-		self.record_read(&snapshot.root, ReadKey::GraphCatalog(graph_ref.id().clone()));
-		if let Some(write) = self.graphs.get(graph_ref.id()) {
-			if !write.exists() {
+		let class = snapshot.root.schema.class_by_id(atom.class_id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("global atom references an absent class")
+		})?;
+		if let Some(reference) = graph {
+			let graph = query_graph_root(&snapshot.root, reference)?;
+			let Some(local) = graph.local_id(atom.id()) else {
 				return Ok(None);
-			}
-			let graph = write.snapshot(&self.store)?;
-			let atom =
-				if let Some(atom) = graph.atom_id(&AtomRef::new(AtomKind::Node, record.clone()))? {
-					Some(atom)
-				} else {
-					graph.atom_id(&AtomRef::new(AtomKind::Edge, record.clone()))?
-				};
-			let memberships = self.query_memberships(&snapshot.root, graph_ref.id())?;
-			return Ok(atom.and_then(|atom| materialize_atom(&graph, &schema, &memberships, atom)));
-		}
-		let stored =
-			snapshot.root.graphs.get(graph_ref.id()).ok_or_else(|| {
-				FerrosGrynnError::graph_does_not_exist(graph_ref.id().to_string())
+			};
+			let occurrence = graph.occurrence(local).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"graph membership references an absent occurrence",
+				)
 			})?;
-		match &stored.graph {
-			StoredGraphValue::Materialized(graph) => {
-				let memberships = self.query_memberships(&snapshot.root, graph_ref.id())?;
-				Ok(stored
-					.record_index
-					.get(&record.to_string())
-					.copied()
-					.and_then(|atom| materialize_atom(graph, &schema, &memberships, atom)))
-			}
-			StoredGraphValue::Local(graph) => {
-				let local = self.store.inner.backend.local().ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"local graph is attached to an in-memory backend",
-					)
-				})?;
-				let transaction = self.local_snapshot()?;
-				Ok(local
-					.lookup_record(&transaction, graph, record, schema_id(&schema)?, schema.kind)?
-					.map(|atom| {
-						row_from_properties(
-							atom.atom_id,
-							&atom.record_id,
-							&atom.properties,
-							&schema,
-						)
-					}))
-			}
+			return row_from_occurrence(&snapshot.root, occurrence, &class).map(Some);
 		}
+		Ok(Some(row_from_atom(atom, &class)))
 	}
 
-	pub(super) fn query_memberships(
-		&self,
-		root: &DatabaseRoot,
-		graph: &RecordId,
-	) -> FerrosGrynnResult<AtomTableMemberships> {
-		let mut memberships = root.schema.memberships(graph);
-		if let Some(write) = self.graphs.get(graph) {
-			for (atom, table) in &write.memberships {
-				memberships.set(*atom, *table)?;
-			}
-		}
-		Ok(memberships)
-	}
-
-	/// Registers the conservative predicate before a streaming scan starts and
-	/// returns the graph identity needed for row-by-row read tracking.
-	pub(crate) fn register_streaming_query_predicate(
+	/// Resolves one record field under the normative base/effective reference
+	/// rules.
+	pub(crate) fn query_record_field(
 		&self,
 		snapshot: &QuerySnapshot,
-		table: &str,
-		evaluator: Arc<dyn PredicateEvaluator>,
-	) -> FerrosGrynnResult<Option<RecordId>> {
-		if self.options.isolation != IsolationLevel::Serializable
-			|| self.options.access == TransactionAccess::ReadOnly
-		{
-			return Ok(None);
-		}
-		let schema = self.query_table(snapshot, table)?;
-		self.predicates.lock().push(PredicateRead {
-			table: table.to_owned(),
-			root: snapshot.root.clone(),
-			matcher: PredicateMatcher::Query(evaluator),
-		});
-		Ok(schema.graph().map(|graph| graph.id().clone()))
-	}
-
-	/// Records one actually pulled atom when it satisfies the registered query
-	/// predicate.
-	pub(crate) fn register_streamed_query_row(
-		&self,
-		snapshot: &QuerySnapshot,
-		graph: &RecordId,
-		row: &QueryStorageRow,
-		evaluator: &dyn PredicateEvaluator,
-	) -> FerrosGrynnResult<()> {
-		if evaluator.matches(row)? {
-			self.record_read(&snapshot.root, ReadKey::Atom(graph.clone(), row.atom_id));
-		}
-		Ok(())
-	}
-
-	pub(crate) fn register_query_point(
-		&self,
-		snapshot: &QuerySnapshot,
-		table: &str,
 		record: &RecordId,
-		row: Option<&QueryStorageRow>,
+		graph: Option<&GraphRef>,
+		field: &str,
+	) -> FerrosGrynnResult<Value> {
+		let row = match graph {
+			Some(graph) => match self.query_point(snapshot, record, Some(graph))? {
+				Some(row) => Some(row),
+				None => self.query_point(snapshot, record, None)?,
+			},
+			None => self.query_point(snapshot, record, None)?,
+		}
+		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("record", record.to_string()))?;
+
+		match field {
+			"id" => Ok(Value::Record(Box::new(row.record_id))),
+			"label" => Ok(row.label.map(Value::String).unwrap_or(Value::None)),
+			_ => {
+				let Some(key) = snapshot.root.dictionary.get(field) else {
+					return Ok(Value::None);
+				};
+				Ok(row.properties.get(key).cloned().unwrap_or(Value::None))
+			}
+		}
+	}
+
+	fn track_query_point(
+		&self,
+		snapshot: &QuerySnapshot,
+		record: &RecordId,
+		graph: Option<&GraphRef>,
 	) -> FerrosGrynnResult<()> {
-		if self.options.isolation != IsolationLevel::Serializable
-			|| self.options.access == TransactionAccess::ReadOnly
-		{
+		let Some(global) = snapshot.root.resolve_atom(record) else {
+			self.record_missing(record);
 			return Ok(());
+		};
+		self.record_read(crate::datastore::ConflictKey::BaseAtom(global));
+		if let Some(reference) = graph {
+			let graph = query_graph_root(&snapshot.root, reference)?;
+			self.record_read(crate::datastore::ConflictKey::GraphMembership(
+				reference.id(),
+				global,
+			));
+			self.record_read(crate::datastore::ConflictKey::GraphOverlay(reference.id(), global));
+			if let Some(local) = graph.local_id(global) {
+				self.record_read(crate::datastore::ConflictKey::GraphIncidence(
+					reference.id(),
+					local,
+				));
+			}
 		}
-		let schema = self.query_table(snapshot, table)?;
-		if let (Some(graph), Some(row)) = (schema.graph(), row) {
-			self.record_read(&snapshot.root, ReadKey::Atom(graph.id().clone(), row.atom_id));
-		}
-		self.predicates.lock().push(PredicateRead {
-			table: table.to_owned(),
-			root: snapshot.root.clone(),
-			matcher: PredicateMatcher::Record(record.clone()),
-		});
 		Ok(())
 	}
 }
 
-/// Returns bounded scalar-index candidates or `None` for a physical table
-/// scan.
-fn indexed_local_rows(
-	local: &LocalStore,
-	transaction: &Arc<LocalReadTransaction>,
-	graph: &Arc<LocalGraph>,
-	schema: &Arc<TableSchema>,
-	constraints: &[ScalarIndexConstraint],
-) -> FerrosGrynnResult<Option<Vec<QueryStorageRow>>> {
-	let mut rows = Vec::new();
-	let usable_indexes = schema
-		.indexes
-		.iter()
-		.filter(|index| index.state == TableIndexState::Ready)
-		.map(|index| index.name.as_str())
-		.collect::<Vec<_>>();
-	let equalities = constraints
-		.iter()
-		.filter(|constraint| matches!(constraint.comparison, ScalarComparison::Equal))
-		.filter_map(|constraint| {
-			constraint
-				.column
-				.checked_sub(1)
-				.and_then(|column| schema.fields.get(column))
-				.and_then(|field| field.key)
-				.map(|key| (key, &constraint.value))
-		})
-		.collect::<Vec<_>>();
-	let mut indexed = local.visit_table_composite_index(
-		transaction,
-		graph,
-		schema_id(schema)?,
-		schema.name.as_str(),
-		schema.kind,
-		&equalities,
-		&usable_indexes,
-		|atom| {
-			rows.push(row_from_properties(atom.atom_id, &atom.record_id, &atom.properties, schema));
-			Ok(())
-		},
-	)?;
-	for constraint in constraints {
-		if indexed {
-			break;
-		}
-		let field = constraint
-			.column
-			.checked_sub(1)
-			.and_then(|column| schema.fields.get(column))
-			.and_then(|field| field.key);
-		if let Some(property_key) = field {
-			indexed = local.visit_table_index(
-				transaction,
-				graph,
-				schema_id(schema)?,
-				schema.name.as_str(),
-				schema.kind,
-				property_key,
-				&usable_indexes,
-				constraint.comparison,
-				&constraint.value,
-				|atom| {
-					rows.push(row_from_properties(
-						atom.atom_id,
-						&atom.record_id,
-						&atom.properties,
-						schema,
-					));
-					Ok(())
-				},
-			)?;
-		}
-	}
-	if !indexed {
-		return Ok(None);
-	}
-	rows.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
-	Ok(Some(rows))
-}
-
-pub(super) fn materialize_atom(
-	graph: &MaterializedGraph,
-	schema: &TableSchema,
-	memberships: &AtomTableMemberships,
-	atom: AtomId,
-) -> Option<QueryStorageRow> {
-	if memberships.get(atom) != schema.id {
-		return None;
-	}
-	match atom.kind()? {
-		AtomKind::Node if matches!(schema.kind, TableKind::Any | TableKind::Normal) => {
-			let node = graph.node(atom)?;
-			Some(row_from_properties(atom, node.record_id(), node.properties(), schema))
-		}
-		AtomKind::Edge if matches!(schema.kind, TableKind::Any | TableKind::Relation) => {
-			let edge = graph.edge(atom)?;
-			Some(row_from_properties(atom, edge.record_id(), edge.properties(), schema))
-		}
-		AtomKind::Node | AtomKind::Edge => None,
+fn row_from_atom(atom: &crate::datastore::BaseAtom, class: &ClassSchema) -> QueryStorageRow {
+	let properties = atom.properties().clone();
+	let mut values = Vec::with_capacity(class.fields().len() + 1);
+	values.push(Value::Record(Box::new(atom.record_id().clone())));
+	values.extend(class.fields().map(|field| {
+		field.key.and_then(|key| properties.get(key).cloned()).unwrap_or(Value::None)
+	}));
+	QueryStorageRow {
+		record_id: atom.record_id().clone(),
+		kind: atom.kind(),
+		local_id: None,
+		label: None,
+		values,
+		base_properties: properties.clone(),
+		properties,
 	}
 }
 
-fn schema_id(schema: &TableSchema) -> FerrosGrynnResult<u32> {
-	schema.id.map(SchemaId::get).ok_or_else(|| {
-		FerrosGrynnError::invalid_storage_file("transaction-visible table has no schema identity")
+fn row_from_occurrence(
+	root: &DatabaseRoot,
+	occurrence: &GraphOccurrence,
+	class: &ClassSchema,
+) -> FerrosGrynnResult<QueryStorageRow> {
+	let atom = root.atom(occurrence.global_id()).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("graph occurrence references an absent global atom")
+	})?;
+	let base_properties = atom.properties().clone();
+	let mut properties = base_properties.clone();
+	if let Some(overlay) = occurrence.overlay() {
+		for (key, value) in overlay.iter() {
+			match value {
+				OverlayValue::Value(value) => {
+					properties.insert(key, value.clone());
+				}
+				OverlayValue::Hidden => {
+					properties.remove(key);
+				}
+			}
+		}
+	}
+	let mut values = Vec::with_capacity(class.fields().len() + 1);
+	values.push(Value::Record(Box::new(atom.record_id().clone())));
+	values.extend(class.fields().map(|field| {
+		field.key.and_then(|key| properties.get(key).cloned()).unwrap_or(Value::None)
+	}));
+	Ok(QueryStorageRow {
+		record_id: atom.record_id().clone(),
+		kind: atom.kind(),
+		local_id: Some(occurrence.local_id()),
+		label: occurrence.label().cloned(),
+		values,
+		base_properties,
+		properties,
 	})
 }
 
-pub(super) fn row_from_properties(
-	atom_id: AtomId,
-	record_id: &RecordId,
-	properties: &PropertyMap,
-	schema: &TableSchema,
-) -> QueryStorageRow {
-	let mut values = Vec::with_capacity(schema.fields.len() + 1);
-	values.push(Value::Record(Box::new(record_id.clone())));
-	values.extend(schema.fields.iter().map(|field| {
-		field.key.and_then(|key| properties.get(key)).cloned().unwrap_or(Value::None)
-	}));
-	QueryStorageRow {
-		record_id: record_id.clone(),
-		atom_id,
-		values,
-		properties: properties.clone(),
+fn query_graph_root<'root>(
+	root: &'root DatabaseRoot,
+	reference: &GraphRef,
+) -> FerrosGrynnResult<&'root GraphRoot> {
+	let graph = root
+		.graph(reference.id())
+		.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(reference.name().to_string()))?;
+	if graph.reference() != reference {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"query graph reference disagrees with the snapshot catalog",
+		));
 	}
+	Ok(graph)
+}
+
+fn intersect_sorted(left: Vec<AtomId>, right: Vec<AtomId>) -> Vec<AtomId> {
+	let (mut left_index, mut right_index) = (0, 0);
+	let mut intersection = Vec::with_capacity(left.len().min(right.len()));
+	while let (Some(left_id), Some(right_id)) = (left.get(left_index), right.get(right_index)) {
+		match left_id.cmp(right_id) {
+			std::cmp::Ordering::Less => left_index += 1,
+			std::cmp::Ordering::Greater => right_index += 1,
+			std::cmp::Ordering::Equal => {
+				intersection.push(*left_id);
+				left_index += 1;
+				right_index += 1;
+			}
+		}
+	}
+	intersection
 }

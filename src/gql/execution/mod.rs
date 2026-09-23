@@ -5,14 +5,18 @@
 
 mod adapter;
 mod cursor;
+mod dml;
 mod eval;
+mod schema;
 
 use std::{collections::BTreeSet, rc::Rc, sync::Arc, time::Instant};
 
 #[cfg(test)]
 use adapter::TransactionRead;
 pub use adapter::{execute_parsed_transaction, execute_transaction};
+use dml::{execute_dml, execute_graph_dml};
 use rust_decimal::Decimal;
+use schema::execute_schema;
 #[allow(
 	clippy::wildcard_imports,
 	reason = "move-only executor split keeps the existing cursor and evaluator names during stage \
@@ -36,8 +40,10 @@ use super::{
 		LogicalDmlStatement,
 		LogicalDmlTarget,
 		LogicalExpect,
+		LogicalGraphDmlStatement,
 		LogicalMatch,
 		LogicalMatchPattern,
+		LogicalMatchSelector,
 		LogicalNodeKind,
 		LogicalProgram,
 		LogicalSchemaStatement,
@@ -55,13 +61,11 @@ use super::{
 };
 use crate::{
 	datastore::{
-		PredicateEvaluator,
 		QuerySnapshot,
 		QueryStorageCursor,
 		QueryStorageRow,
 		ScalarComparison,
 		ScalarIndexConstraint,
-		TableSchema,
 		Transaction,
 		TransactionGraphView,
 	},
@@ -128,6 +132,10 @@ fn execute_program<Read: QueryRead>(
 			LogicalStatement::Dml(statement) => (
 				statement.kind.statement_kind(),
 				read.execute_dml(statement, &slots, source).map(Outcome::success),
+			),
+			LogicalStatement::GraphDml(statement) => (
+				statement.statement_kind(),
+				read.execute_graph_dml(statement, &slots, source).map(Outcome::success),
 			),
 			LogicalStatement::Let {
 				slot,
@@ -204,24 +212,32 @@ fn execute_match<Read: QueryRead>(
 	let fields = GraphFields {
 		graph: graph.clone(),
 		dictionary: read.property_dictionary(snapshot),
+		records: RecordFields {
+			read,
+			snapshot,
+			graph: Some(&plan.graph),
+		},
 	};
 	let mut cursor: Box<dyn RowCursor + '_> = Box::new(OneRowCursor {
 		row: Some(Row::bindings(plan.bindings.columns.len())),
 	});
 	for pattern in ordered {
-		cursor = Box::new(SeedCursor::new(cursor, graph.clone(), pattern.start.clone())?);
+		let start = resolve_match_binding(&pattern.start, slots, source)?;
+		let candidates = read.match_candidates(snapshot, &plan.graph, &start)?;
+		cursor = Box::new(SeedCursor::new(cursor, graph.clone(), start, candidates));
 		for op in &pattern.ops {
 			cursor = match op {
 				MatchOp::Expand(expand) => {
+					let expand = resolve_expand(expand, slots, source)?;
 					if let Some(index) = &index {
 						Box::new(IndexExpandCursor::new(
 							cursor,
 							graph.clone(),
 							index.clone(),
-							expand.clone(),
+							expand,
 						))
 					} else {
-						Box::new(EdgeExpandCursor::new(cursor, graph.clone(), expand.clone())?)
+						Box::new(EdgeExpandCursor::new(cursor, graph.clone(), expand)?)
 					}
 				}
 				MatchOp::PathExpand(expand) => Box::new(PathExpandCursor::new(
@@ -232,7 +248,7 @@ fn execute_match<Read: QueryRead>(
 							"MATCH path expansion requires a traversal index.",
 						)
 					})?,
-					expand.clone(),
+					resolve_path_expand(expand, slots, source)?,
 				)),
 			};
 		}
@@ -381,7 +397,13 @@ fn execute_select<Read: QueryRead>(
 		} => Some(predicate),
 		_ => None,
 	});
-	let mut cursor = build_cursor(read, snapshot, plan, plan.root, slots, source, predicate)?;
+	let fields = RecordFields {
+		read,
+		snapshot,
+		graph: plan.graph.as_ref(),
+	};
+	let mut cursor =
+		build_cursor(read, snapshot, plan, plan.root, slots, source, predicate, Some(&fields))?;
 	let schema = &plan.node(plan.root).schema;
 	let mut result = Array::new(Vec::new());
 	while let Some(row) = cursor.next().map_err(execution_phase)? {
@@ -416,6 +438,7 @@ fn build_cursor<'a, Read: QueryRead>(
 	slots: &'a [Value],
 	source: &'a str,
 	scan_predicate: Option<&'a TypedExpr>,
+	fields: Option<&'a dyn AtomFieldRead>,
 ) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
 	let node = plan.node(node_id);
 	match &node.kind {
@@ -423,11 +446,11 @@ fn build_cursor<'a, Read: QueryRead>(
 			target,
 		} => {
 			let inner: Box<dyn RowCursor + 'a> = match target {
-				ScanTarget::Table(table) => {
-					read.scan(snapshot, table, scan_predicate, slots, source)?
+				ScanTarget::Class(class) => {
+					read.scan(snapshot, class, plan.graph.as_ref(), scan_predicate, slots, source)?
 				}
 				ScanTarget::Record(record) => Box::new(OneRowCursor {
-					row: read.get(snapshot, record)?,
+					row: read.get(snapshot, record, plan.graph.as_ref())?,
 				}),
 			};
 			Ok(Box::new(ScanCursor {
@@ -438,21 +461,39 @@ fn build_cursor<'a, Read: QueryRead>(
 			input,
 			predicate,
 		} => Ok(Box::new(FilterCursor {
-			input: build_cursor(read, snapshot, plan, *input, slots, source, scan_predicate)?,
+			input: build_cursor(
+				read,
+				snapshot,
+				plan,
+				*input,
+				slots,
+				source,
+				scan_predicate,
+				fields,
+			)?,
 			predicate,
 			slots,
 			source,
-			fields: None,
+			fields,
 		})),
 		LogicalNodeKind::Project {
 			input,
 			expressions,
 		} => Ok(Box::new(ProjectCursor {
-			input: build_cursor(read, snapshot, plan, *input, slots, source, scan_predicate)?,
+			input: build_cursor(
+				read,
+				snapshot,
+				plan,
+				*input,
+				slots,
+				source,
+				scan_predicate,
+				fields,
+			)?,
 			expressions,
 			slots,
 			source,
-			fields: None,
+			fields,
 		})),
 		LogicalNodeKind::Limit {
 			input,
@@ -466,7 +507,16 @@ fn build_cursor<'a, Read: QueryRead>(
 				.transpose()?
 				.unwrap_or(0);
 			Ok(Box::new(LimitCursor {
-				input: build_cursor(read, snapshot, plan, *input, slots, source, scan_predicate)?,
+				input: build_cursor(
+					read,
+					snapshot,
+					plan,
+					*input,
+					slots,
+					source,
+					scan_predicate,
+					fields,
+				)?,
 				remaining: limit,
 				skip: start,
 			}))

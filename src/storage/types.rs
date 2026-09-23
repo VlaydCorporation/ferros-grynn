@@ -1,7 +1,11 @@
 //! Shared typed identities and clocks for local disk storage.
 
 use super::page::PageNo;
-use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
+use crate::{
+	datastore::DataSpaceId,
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	graph::GraphId,
+};
 
 /// First assignable WAL record position.
 const FIRST_LSN: u64 = 1;
@@ -83,26 +87,6 @@ impl TxId {
 	}
 }
 
-/// Stable database graph identity used in a physical page key.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct GraphId(u64);
-
-impl GraphId {
-	/// System catalog and database metadata address space.
-	pub const SYSTEM: Self = Self(0);
-
-	/// Creates a graph identity from its stable integer.
-	pub const fn new(value: u64) -> Self {
-		Self(value)
-	}
-
-	/// Returns the persisted integer value.
-	pub const fn get(self) -> u64 {
-		self.0
-	}
-}
-
 /// Monotonic checkpoint generation committed by the database superblock.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -140,7 +124,8 @@ impl CheckpointGeneration {
 pub enum DataFileKind {
 	/// Database system catalog.
 	SystemCatalog = 0x01,
-	/// Checkpoint-owned graph superblock.
+	/// Logically WAL-versioned graph superblock with checkpoint-COW home
+	/// storage.
 	GraphSuperblock = 0x02,
 	/// Fixed node hot pages.
 	NodesHot = 0x03,
@@ -168,6 +153,17 @@ pub enum DataFileKind {
 	LabelStatistics = 0x0e,
 	/// Per-property histogram pages.
 	PropertyStatistics = 0x0f,
+	/// Logically WAL-versioned AtomStore superblock with checkpoint-COW home
+	/// storage.
+	AtomStoreSuperblock = 0x10,
+	/// Database-global fixed atom hot pages.
+	AtomsHot = 0x11,
+	/// Graph-local sparse property-overlay pages.
+	Overlays = 0x12,
+	/// Per-class statistics pages.
+	ClassStatistics = 0x13,
+	/// Database-global append-only property-key dictionary.
+	PropertyDictionary = 0x14,
 }
 
 impl DataFileKind {
@@ -208,6 +204,16 @@ impl DataFileKind {
 			Some(Self::LabelStatistics)
 		} else if value == Self::PropertyStatistics.get() {
 			Some(Self::PropertyStatistics)
+		} else if value == Self::AtomStoreSuperblock.get() {
+			Some(Self::AtomStoreSuperblock)
+		} else if value == Self::AtomsHot.get() {
+			Some(Self::AtomsHot)
+		} else if value == Self::Overlays.get() {
+			Some(Self::Overlays)
+		} else if value == Self::ClassStatistics.get() {
+			Some(Self::ClassStatistics)
+		} else if value == Self::PropertyDictionary.get() {
+			Some(Self::PropertyDictionary)
 		} else {
 			None
 		}
@@ -271,8 +277,8 @@ impl DataFileId {
 /// Complete physical identity of a page in the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PageKey {
-	/// Graph or system address space.
-	graph_id: GraphId,
+	/// Database-global or graph-local address space.
+	space_id: DataSpaceId,
 	/// Stable physical data-file identity.
 	file_id: DataFileId,
 	/// Page number within the physical file.
@@ -281,17 +287,35 @@ pub struct PageKey {
 
 impl PageKey {
 	/// Creates a physical page key.
-	pub const fn new(graph_id: GraphId, file_id: DataFileId, page_no: PageNo) -> Self {
+	pub(crate) const fn new(space_id: DataSpaceId, file_id: DataFileId, page_no: PageNo) -> Self {
 		Self {
-			graph_id,
+			space_id,
 			file_id,
 			page_no,
 		}
 	}
 
-	/// Returns the graph identity.
-	pub const fn graph_id(self) -> GraphId {
-		self.graph_id
+	/// Creates a database-global key for the measurement-only prototype API.
+	#[doc(hidden)]
+	pub const fn for_database(file_id: DataFileId, page_no: PageNo) -> Self {
+		Self::new(DataSpaceId::Database, file_id, page_no)
+	}
+
+	/// Creates a graph-local key for the measurement-only prototype API.
+	#[doc(hidden)]
+	pub const fn for_graph(graph_id: GraphId, file_id: DataFileId, page_no: PageNo) -> Self {
+		Self::new(DataSpaceId::Graph(graph_id), file_id, page_no)
+	}
+
+	/// Returns the database-global or graph-local address space.
+	pub(crate) const fn space_id(self) -> DataSpaceId {
+		self.space_id
+	}
+
+	/// Returns the durable data-space integer for measurement-only tooling.
+	#[doc(hidden)]
+	pub const fn data_space_raw(self) -> u64 {
+		self.space_id.raw()
 	}
 
 	/// Returns the stable physical file identity.
@@ -347,7 +371,30 @@ mod tests {
 		assert_eq!(id.and_then(DataFileId::kind), Some(DataFileKind::Index));
 		assert!(DataFileId::new(MAX_FILE_INSTANCE_ID + 1, DataFileKind::Index).is_none());
 		assert!(DataFileId::from_raw(0).is_none());
-		assert!(DataFileId::from_raw(0x10).is_none());
+		assert_eq!(
+			DataFileId::from_raw(0x10).and_then(DataFileId::kind),
+			Some(DataFileKind::AtomStoreSuperblock)
+		);
+		assert_eq!(
+			DataFileId::from_raw(0x14).and_then(DataFileId::kind),
+			Some(DataFileKind::PropertyDictionary)
+		);
+		assert!(DataFileId::from_raw(0x15).is_none());
+	}
+
+	/// Page keys keep database storage distinct from every graph address space.
+	#[test]
+	fn page_key_uses_data_space_identity() {
+		let file = DataFileId::for_kind(DataFileKind::AtomsHot);
+		let database = PageKey::new(DataSpaceId::Database, file, PageNo::new(3));
+		let graph = PageKey::new(
+			DataSpaceId::Graph(crate::graph::GraphId::new(7).unwrap()),
+			file,
+			PageNo::new(3),
+		);
+
+		assert_ne!(database, graph);
+		assert_eq!(database.space_id(), DataSpaceId::Database);
 	}
 
 	/// Monotonic persisted clocks fail closed instead of wrapping to reserved
