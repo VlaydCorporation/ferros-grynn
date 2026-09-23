@@ -44,8 +44,6 @@ pub(super) const LARGE_CHUNK_BYTES: usize = PAGE_SIZE - LARGE_DATA_OFFSET;
 
 /// Mutable builder for one canonical slotted property page.
 pub(super) struct PropertyPageBuilder {
-	/// Page image under construction.
-	page: Box<AlignedPage>,
 	/// Number of populated slot entries.
 	slot_count: u16,
 	/// First unused byte in the growing slot directory.
@@ -56,18 +54,23 @@ pub(super) struct PropertyPageBuilder {
 
 impl PropertyPageBuilder {
 	/// Creates one empty property heap page.
-	pub(super) fn new(page_no: PageNo, page_lsn: PageLsn) -> Self {
-		Self::new_typed(PageType::PropHeap, page_no, page_lsn)
+	pub(super) fn new(page: &mut AlignedPage, page_no: PageNo, page_lsn: PageLsn) -> Self {
+		Self::new_typed(page, PageType::PropHeap, page_no, page_lsn)
 	}
 
 	/// Creates one empty graph-overlay slotted page.
-	pub(super) fn new_overlay(page_no: PageNo, page_lsn: PageLsn) -> Self {
-		Self::new_typed(PageType::GraphOverlay, page_no, page_lsn)
+	pub(super) fn new_overlay(page: &mut AlignedPage, page_no: PageNo, page_lsn: PageLsn) -> Self {
+		Self::new_typed(page, PageType::GraphOverlay, page_no, page_lsn)
 	}
 
-	fn new_typed(page_type: PageType, page_no: PageNo, page_lsn: PageLsn) -> Self {
+	fn new_typed(
+		page: &mut AlignedPage,
+		page_type: PageType,
+		page_no: PageNo,
+		page_lsn: PageLsn,
+	) -> Self {
+		page.reset(page_type, PageFlags::empty(), page_lsn, page_no);
 		Self {
-			page: Box::new(AlignedPage::new(page_type, PageFlags::empty(), page_lsn, page_no)),
 			slot_count: 0,
 			free_start: SLOT_DIRECTORY_OFFSET as u16,
 			free_end: PAGE_SIZE as u16,
@@ -75,7 +78,11 @@ impl PropertyPageBuilder {
 	}
 
 	/// Inserts one record and returns `None` when another page is required.
-	pub(super) fn try_insert(&mut self, record: &[u8]) -> FerrosGrynnResult<Option<u16>> {
+	pub(super) fn try_insert(
+		&mut self,
+		page: &mut AlignedPage,
+		record: &[u8],
+	) -> FerrosGrynnResult<Option<u16>> {
 		if record.len() > MAX_INLINE_BYTES {
 			return Ok(None);
 		}
@@ -93,7 +100,7 @@ impl PropertyPageBuilder {
 			.checked_sub(record_len)
 			.ok_or_else(|| invalid(0, "property page free range underflows"))?;
 		let slot_offset = usize::from(self.free_start);
-		let bytes = self.page.as_bytes_mut();
+		let bytes = page.as_bytes_mut();
 		write_u16(bytes, slot_offset, record_offset);
 		write_u16(bytes, slot_offset + 2, record_len);
 		bytes[usize::from(record_offset)..usize::from(record_offset) + record.len()]
@@ -111,14 +118,13 @@ impl PropertyPageBuilder {
 		Ok(Some(slot))
 	}
 
-	/// Seals metadata and returns the complete page.
-	pub(super) fn finish(mut self) -> FerrosGrynnResult<Box<AlignedPage>> {
-		let bytes = self.page.as_bytes_mut();
+	/// Seals metadata in the caller-owned final page.
+	pub(super) fn finish(self, page: &mut AlignedPage) -> FerrosGrynnResult<()> {
+		let bytes = page.as_bytes_mut();
 		write_u16(bytes, SLOT_COUNT_OFFSET, self.slot_count);
 		write_u16(bytes, FREE_START_OFFSET, self.free_start);
 		write_u16(bytes, FREE_END_OFFSET, self.free_end);
-		self.page.seal()?;
-		Ok(self.page)
+		page.seal()
 	}
 }
 
@@ -262,36 +268,43 @@ pub(super) fn decode_property_map(
 	Ok(properties)
 }
 
-/// Splits one non-inline record into a contiguous large-object chain.
-pub(super) fn encode_large_property(
+/// Appends one non-inline record as a contiguous large-object chain.
+pub(super) fn append_large_property(
+	pages: &mut Vec<AlignedPage>,
 	first_page: PageNo,
 	page_lsn: PageLsn,
 	record: &[u8],
-) -> FerrosGrynnResult<Vec<AlignedPage>> {
-	encode_large_record(first_page, page_lsn, record, PageType::PropLargeHeap)
+) -> FerrosGrynnResult<usize> {
+	append_large_record(pages, first_page, page_lsn, record, PageType::PropLargeHeap)
 }
 
-/// Splits one non-inline graph overlay into a contiguous overflow chain.
-pub(super) fn encode_large_overlay(
+/// Appends one non-inline graph overlay as a contiguous overflow chain.
+pub(super) fn append_large_overlay(
+	pages: &mut Vec<AlignedPage>,
 	first_page: PageNo,
 	page_lsn: PageLsn,
 	record: &[u8],
-) -> FerrosGrynnResult<Vec<AlignedPage>> {
-	encode_large_record(first_page, page_lsn, record, PageType::GraphOverlay)
+) -> FerrosGrynnResult<usize> {
+	append_large_record(pages, first_page, page_lsn, record, PageType::GraphOverlay)
 }
 
-fn encode_large_record(
+fn append_large_record(
+	pages: &mut Vec<AlignedPage>,
 	first_page: PageNo,
 	page_lsn: PageLsn,
 	record: &[u8],
 	page_type: PageType,
-) -> FerrosGrynnResult<Vec<AlignedPage>> {
+) -> FerrosGrynnResult<usize> {
 	if record.len() <= MAX_INLINE_BYTES {
 		return Err(invalid(first_page.get(), "record fits an inline property page"));
 	}
 	let page_count = record.len().div_ceil(LARGE_CHUNK_BYTES);
-	let mut pages = Vec::with_capacity(page_count);
-	for index in 0..page_count {
+	let start = pages.len();
+	let end = start
+		.checked_add(page_count)
+		.ok_or_else(|| invalid(first_page.get(), "large property page count overflows usize"))?;
+	pages.resize_with(end, AlignedPage::zeroed);
+	for (index, page) in pages[start..end].iter_mut().enumerate() {
 		let offset = u64::try_from(index)
 			.map_err(|_error| invalid(first_page.get(), "large property index exceeds u64"))?;
 		let page_no =
@@ -313,7 +326,7 @@ fn encode_large_record(
 			.ok_or_else(|| invalid(page_no.get(), "large property offset overflows usize"))?;
 		let end = start.saturating_add(LARGE_CHUNK_BYTES).min(record.len());
 		let chunk = &record[start..end];
-		let mut page = AlignedPage::new(page_type, PageFlags::OVERFLOW, page_lsn, page_no);
+		page.reset(page_type, PageFlags::OVERFLOW, page_lsn, page_no);
 		let bytes = page.as_bytes_mut();
 		write_u64(bytes, LARGE_NEXT_PAGE_OFFSET, next.get());
 		write_u32(
@@ -324,9 +337,8 @@ fn encode_large_record(
 		);
 		bytes[LARGE_DATA_OFFSET..LARGE_DATA_OFFSET + chunk.len()].copy_from_slice(chunk);
 		page.seal()?;
-		pages.push(page);
 	}
-	Ok(pages)
+	Ok(page_count)
 }
 
 /// Decodes an already loaded contiguous large-object chain.
@@ -476,11 +488,12 @@ mod tests {
 		properties.insert(PropertyKeyId::new(3), Value::from("value"));
 		let mut context = EncodeContext::new(PropertyDictionary::new());
 		let record = encode_property_map(&properties, &mut context)?;
-		let mut builder = PropertyPageBuilder::new(PageNo::new(7), PageLsn::new(11));
+		let mut page = AlignedPage::zeroed();
+		let mut builder = PropertyPageBuilder::new(&mut page, PageNo::new(7), PageLsn::new(11));
 		let slot = builder
-			.try_insert(&record)?
+			.try_insert(&mut page, &record)?
 			.ok_or_else(|| invalid(7, "test record unexpectedly requires a large page"))?;
-		let page = builder.finish()?;
+		builder.finish(&mut page)?;
 		let stored = read_property_record(
 			&page,
 			PageNo::new(7),
@@ -495,7 +508,8 @@ mod tests {
 	#[test]
 	fn large_property_chain_round_trips_and_validates_links() -> FerrosGrynnResult<()> {
 		let record = vec![0xa5; MAX_INLINE_BYTES + LARGE_CHUNK_BYTES];
-		let pages = encode_large_property(PageNo::new(9), PageLsn::new(13), &record)?;
+		let mut pages = Vec::new();
+		append_large_property(&mut pages, PageNo::new(9), PageLsn::new(13), &record)?;
 		let length =
 			u32::try_from(record.len()).map_err(|_error| invalid(9, "test record exceeds u32"))?;
 		assert_eq!(decode_large_property(PageNo::new(9), &pages, length, record.len())?, record);

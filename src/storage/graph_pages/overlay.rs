@@ -7,8 +7,8 @@ use crate::{
 			LARGE_CHUNK_BYTES,
 			MAX_INLINE_BYTES,
 			PropertyPageBuilder,
+			append_large_overlay,
 			decode_large_overlay,
-			encode_large_overlay,
 			read_overlay_record as read_inline_overlay,
 		},
 	},
@@ -120,7 +120,7 @@ pub(in crate::storage) fn decode_overlay(
 pub(in crate::storage) struct GraphOverlayStore {
 	next_page: u64,
 	current: Option<(PageNo, PropertyPageBuilder)>,
-	pages: Vec<(PageNo, AlignedPage)>,
+	pages: Vec<AlignedPage>,
 }
 
 impl GraphOverlayStore {
@@ -138,71 +138,84 @@ impl GraphOverlayStore {
 		if record.len() > MAX_INLINE_BYTES {
 			self.finish_current()?;
 			let first = PageNo::new(self.next_page);
-			let pages = encode_large_overlay(first, page_lsn, record)?;
+			let page_count = append_large_overlay(&mut self.pages, first, page_lsn, record)?;
 			self.next_page = self
 				.next_page
 				.checked_add(
-					u64::try_from(pages.len())
+					u64::try_from(page_count)
 						.map_err(|_error| invalid_page(0, "overlay page count exceeds u64"))?,
 				)
 				.ok_or_else(|| invalid_page(0, "overlay page clock is exhausted"))?;
-			for (offset, page) in pages.into_iter().enumerate() {
-				let page_no = PageNo::new(
-					first
-						.get()
-						.checked_add(
-							u64::try_from(offset)
-								.map_err(|_error| invalid_page(0, "overlay offset exceeds u64"))?,
-						)
-						.ok_or_else(|| invalid_page(0, "overlay page number overflows"))?,
-				);
-				self.pages.push((page_no, page));
-			}
 			return PropertyRef::large(first, length);
 		}
 
 		if self.current.is_none() {
 			self.start_page(page_lsn)?;
 		}
-		if let Some((page_no, page)) = self.current.as_mut()
-			&& let Some(slot) = page.try_insert(record)?
-		{
-			return PropertyRef::inline(*page_no, slot, length);
+		if let Some((page_no, builder)) = self.current.as_mut() {
+			let index = usize::try_from(page_no.get())
+				.map_err(|_error| invalid_page(0, "overlay page number exceeds usize"))?;
+			let page = self
+				.pages
+				.get_mut(index)
+				.ok_or_else(|| invalid_page(0, "current overlay page is absent"))?;
+			if let Some(slot) = builder.try_insert(page, record)? {
+				return PropertyRef::inline(*page_no, slot, length);
+			}
 		}
 		self.finish_current()?;
 		self.start_page(page_lsn)?;
-		let (page_no, page) =
+		let (page_no, builder) =
 			self.current.as_mut().ok_or_else(|| invalid_page(0, "overlay page was not started"))?;
-		let slot = page
-			.try_insert(record)?
+		let index = usize::try_from(page_no.get())
+			.map_err(|_error| invalid_page(0, "overlay page number exceeds usize"))?;
+		let page = self
+			.pages
+			.get_mut(index)
+			.ok_or_else(|| invalid_page(0, "current overlay page is absent"))?;
+		let slot = builder
+			.try_insert(page, record)?
 			.ok_or_else(|| invalid_page(0, "overlay does not fit an empty page"))?;
 		PropertyRef::inline(*page_no, slot, length)
 	}
 
 	pub(in crate::storage) fn finish(mut self) -> FerrosGrynnResult<Vec<AlignedPage>> {
 		self.finish_current()?;
-		self.pages.sort_unstable_by_key(|(page_no, _page)| *page_no);
-		for (index, (page_no, _page)) in self.pages.iter().enumerate() {
-			if page_no.get() != index as u64 {
-				return Err(invalid_page(0, "overlay pages are not contiguous"));
-			}
+		if u64::try_from(self.pages.len()).ok() != Some(self.next_page) {
+			return Err(invalid_page(0, "overlay pages are not contiguous"));
 		}
-		Ok(self.pages.into_iter().map(|(_page_no, page)| page).collect())
+		Ok(self.pages)
 	}
 
 	fn start_page(&mut self, page_lsn: PageLsn) -> FerrosGrynnResult<()> {
 		let page_no = PageNo::new(self.next_page);
+		let index = usize::try_from(page_no.get())
+			.map_err(|_error| invalid_page(0, "overlay page number exceeds usize"))?;
+		if index != self.pages.len() {
+			return Err(invalid_page(0, "overlay pages are not contiguous"));
+		}
 		self.next_page = self
 			.next_page
 			.checked_add(1)
 			.ok_or_else(|| invalid_page(0, "overlay page clock is exhausted"))?;
-		self.current = Some((page_no, PropertyPageBuilder::new_overlay(page_no, page_lsn)));
+		self.pages.push(AlignedPage::zeroed());
+		let page = self
+			.pages
+			.last_mut()
+			.ok_or_else(|| invalid_page(0, "overlay page allocation failed"))?;
+		self.current = Some((page_no, PropertyPageBuilder::new_overlay(page, page_no, page_lsn)));
 		Ok(())
 	}
 
 	fn finish_current(&mut self) -> FerrosGrynnResult<()> {
-		if let Some((page_no, page)) = self.current.take() {
-			self.pages.push((page_no, *page.finish()?));
+		if let Some((page_no, builder)) = self.current.take() {
+			let index = usize::try_from(page_no.get())
+				.map_err(|_error| invalid_page(0, "overlay page number exceeds usize"))?;
+			let page = self
+				.pages
+				.get_mut(index)
+				.ok_or_else(|| invalid_page(0, "current overlay page is absent"))?;
+			builder.finish(page)?;
 		}
 		Ok(())
 	}

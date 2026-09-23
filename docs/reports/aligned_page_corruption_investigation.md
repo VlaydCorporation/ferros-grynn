@@ -95,17 +95,17 @@ compiler toolset, а не в `System32`; это согласуется с наб
 
 ## 4. Матрица экспериментов
 
-| Проверка | До in-place fix | После fix | Вывод |
-|---|---:|---:|---|
-| Stable native, exact image builder | PASS | PASS | Обычная MSVC-сборка сама по себе не воспроизводит сбой |
-| Nightly ASan, локальный page codec | PASS | PASS | Codec не является достаточной причиной |
-| Nightly ASan, чистый graph-image builder | FAIL | PASS | I/O/WAL не нужны для сбоя |
-| Nightly ASan, полный WAL/publication test | FAIL | PASS | Исправлен исходный пользовательский сценарий |
-| Nightly ASan, отдельный final-buffer address test | не существовал | PASS | Конечный адрес стабилен и выровнен |
-| Nightly ASan + `System` allocator | FAIL | не требуется | `mimalloc` не является причиной |
-| Miri, чистый graph-image builder | PASS | PASS | В выполненной ветке UB не найден |
-| Автономный small ASan repro | PASS | PASS | Общий compiler reproducer пока не получен |
-| Диагностический print в проблемной closure | PASS | не требуется | Симптом чувствителен к codegen/layout |
+| Проверка                                          | До in-place fix |    После fix | Вывод                                                  |
+|---------------------------------------------------|----------------:|-------------:|--------------------------------------------------------|
+| Stable native, exact image builder                |            PASS |         PASS | Обычная MSVC-сборка сама по себе не воспроизводит сбой |
+| Nightly ASan, локальный page codec                |            PASS |         PASS | Codec не является достаточной причиной                 |
+| Nightly ASan, чистый graph-image builder          |            FAIL |         PASS | I/O/WAL не нужны для сбоя                              |
+| Nightly ASan, полный WAL/publication test         |            FAIL |         PASS | Исправлен исходный пользовательский сценарий           |
+| Nightly ASan, отдельный final-buffer address test |  не существовал |         PASS | Конечный адрес стабилен и выровнен                     |
+| Nightly ASan + `System` allocator                 |            FAIL | не требуется | `mimalloc` не является причиной                        |
+| Miri, чистый graph-image builder                  |            PASS |         PASS | В выполненной ветке UB не найден                       |
+| Автономный small ASan repro                       |            PASS |         PASS | Общий compiler reproducer пока не получен              |
+| Диагностический print в проблемной closure        |            PASS | не требуется | Симптом чувствителен к codegen/layout                  |
 
 Финальный отдельный ASan-тест проверяет два соседних frame и выводит для каждого
 адрес до encode, после encode и при входе в consumer loop:
@@ -348,6 +348,68 @@ adjacency, statistics и index pages. Массово переписывать и
 4. уменьшить один failing case до standalone crate без project dependencies;
 5. только после стабильного reproducer подавать issue в rustc/LLVM с IR,
    assembly и runtime export matrix.
+
+### 13.1. Результат первого bulk-builder аудита
+
+Аудит выполнен 2026-09-24 на
+`rustc 1.100.0-nightly (6bb1652a0 2026-09-22), LLVM 23.1.1` с тем же runtime
+MSVC 14.50. Реально используемыми bulk builders считались multi-page owners,
+достижимые из `local_store::image::build_generation`; одиночные superblock/freelist
+codecs в этот шаг не включались.
+
+Первый запуск дал новый воспроизводимый сбой:
+
+```text
+storage::atom_store_image::tests::atom_store_image_round_trips_global_ids_primary_and_properties
+page 1: page magic 0x01504800 does not match type PropLargeHeap
+```
+
+Перед изменением сохранены точные failing EXE/PDB в
+`target/aligned-page-investigation/failing-atom-store-715ea68f/`. Source state:
+
+```text
+HEAD: 715ea68f7319f173d003356758f70802b1a72c90
+atom_store_image.rs: f71d6c60094c0911ffac122313e91b77d5c1f11af91ec2300fc2e2bb6e1d73e6
+property_page.rs:    557c7df802d494f0f43de5371c2a063121881c60f16b400a2d791f4b5735af99
+property_dictionary.rs: dbda86718a1224decc7b3b784162a9651b7be0567dd8ce628e9ac85796897170
+```
+
+Одиночный `large_property_chain_round_trips_and_validates_links` под ASan
+проходил. Сбой требовал более сложного owner-пути: заполненные страницы
+возвращались как `Vec<AlignedPage>`, переносились в
+`Vec<(PageNo, AlignedPage)>`, сортировались и затем снова извлекались по
+значению. Частичное устранение только внутреннего return temporary убрало
+повреждение magic, но тот же AtomStore test начал получать
+`property pages are not contiguous`. Это локализовало оставшийся чувствительный
+shape в owner, а не в page codec.
+
+Общий `property_page` owner и оба его потребителя переведены на in-place
+заполнение:
+
+- `PropertyPageBuilder` хранит только metadata и пишет в caller-owned final
+  frame через `&mut AlignedPage`;
+- large property/overlay chains добавляют нулевые slots прямо в итоговый
+  `Vec<AlignedPage>` и инициализируют полученный slice на месте;
+- AtomStore и graph overlay больше не используют
+  `Vec<(PageNo, AlignedPage)>`, сортировку или извлечение заполненных страниц по
+  значению.
+
+Итоговая ASan-матрица:
+
+| Production owner                              | Regression                                                                                                         |      Результат |
+|-----------------------------------------------|--------------------------------------------------------------------------------------------------------------------|---------------:|
+| Catalog page chain                            | `exact_header_and_multi_page_round_trip`                                                                           |           PASS |
+| Property dictionary                           | `root_entry_and_hash_pages_have_exact_offsets`                                                                     |           PASS |
+| AtomStore/property store/primary              | `atom_store_image_round_trips_global_ids_primary_and_properties`                                                   | PASS после fix |
+| Graph occurrence/adjacency/labels/overlay     | `occurrence_image_round_trips_identity_topology_labels_and_overlay` и `sparse_overlay_round_trips_hidden_and_null` |           PASS |
+| Base и graph-local statistics                 | `base_statistics_round_trip_keeps_split_ranges` и `split_statistics_are_exact_and_auxiliary_files_are_lazy`        |           PASS |
+| Standard/Unique/Label/Count scoped indexes    | `scoped_images_round_trip_base_effective_class_label_and_count`                                                    |           PASS |
+| Final file image                              | `file_image_preserves_over_aligned_page_bytes`                                                                     |           PASS |
+| Полный `local_store::image::build_generation` | `commit_survives_close_and_reopen` и `normalized_atom_model_survives_restart_checkpoint_and_reopen`                |           PASS |
+
+Таким образом, пункт 1 аудита выполнен для текущих production bulk builders, а
+обнаруженный owner прошёл пункт 2. Минимизация в standalone crate и upstream
+issue в этом шаге не выполнялись.
 
 Rudra не запускался: `cargo-rudra` в среде отсутствует, а upstream repository
 [Rudra](https://github.com/sslab-gatech/Rudra) архивирован и привязан к старому

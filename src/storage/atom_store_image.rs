@@ -21,10 +21,10 @@ use super::{
 		LARGE_CHUNK_BYTES,
 		MAX_INLINE_BYTES,
 		PropertyPageBuilder,
+		append_large_property,
 		decode_large_property,
 		decode_property_map,
 		decode_record_id,
-		encode_large_property,
 		encode_property_map,
 		encode_record_id,
 		read_property_record,
@@ -731,8 +731,8 @@ struct PropertyStoreBuilder {
 	next_page: u64,
 	/// Current unsealed slotted page, if any.
 	current: Option<(PageNo, PropertyPageBuilder)>,
-	/// Completed property pages paired with their exact numbers.
-	pages: Vec<(PageNo, AlignedPage)>,
+	/// Final property-file frames in exact page-number order.
+	pages: Vec<AlignedPage>,
 }
 
 impl PropertyStoreBuilder {
@@ -741,44 +741,43 @@ impl PropertyStoreBuilder {
 		let length =
 			u32::try_from(record.len()).map_err(|_error| invalid("property record exceeds u32"))?;
 		if record.len() > MAX_INLINE_BYTES {
+			self.finish_current()?;
 			let first_page = PageNo::new(self.next_page);
-			let pages = encode_large_property(first_page, page_lsn, record)?;
+			let page_count = append_large_property(&mut self.pages, first_page, page_lsn, record)?;
 			self.next_page = self
 				.next_page
 				.checked_add(
-					u64::try_from(pages.len())
+					u64::try_from(page_count)
 						.map_err(|_error| invalid("large property page count exceeds u64"))?,
 				)
 				.ok_or_else(|| invalid("property page clock is exhausted"))?;
-			for (offset, page) in pages.into_iter().enumerate() {
-				let page_no = PageNo::new(
-					first_page
-						.get()
-						.checked_add(
-							u64::try_from(offset)
-								.map_err(|_error| invalid("large property offset exceeds u64"))?,
-						)
-						.ok_or_else(|| invalid("large property page number overflows"))?,
-				);
-				self.pages.push((page_no, page));
-			}
 			return PropertyRef::large(first_page, length);
 		}
 
 		if self.current.is_none() {
 			self.start_page(page_lsn)?;
 		}
-		if let Some((page_no, builder)) = self.current.as_mut()
-			&& let Some(slot) = builder.try_insert(record)?
-		{
-			return PropertyRef::inline(*page_no, slot, length);
+		if let Some((page_no, builder)) = self.current.as_mut() {
+			let index = usize::try_from(page_no.get())
+				.map_err(|_error| invalid("property page number exceeds usize"))?;
+			let page = self
+				.pages
+				.get_mut(index)
+				.ok_or_else(|| invalid("current property page is absent"))?;
+			if let Some(slot) = builder.try_insert(page, record)? {
+				return PropertyRef::inline(*page_no, slot, length);
+			}
 		}
 		self.finish_current()?;
 		self.start_page(page_lsn)?;
 		let (page_no, builder) =
 			self.current.as_mut().ok_or_else(|| invalid("property page was not started"))?;
+		let index = usize::try_from(page_no.get())
+			.map_err(|_error| invalid("property page number exceeds usize"))?;
+		let page =
+			self.pages.get_mut(index).ok_or_else(|| invalid("current property page is absent"))?;
 		let slot = builder
-			.try_insert(record)?
+			.try_insert(page, record)?
 			.ok_or_else(|| invalid("inline record does not fit an empty property page"))?;
 		PropertyRef::inline(*page_no, slot, length)
 	}
@@ -786,18 +785,32 @@ impl PropertyStoreBuilder {
 	/// Starts the next slotted property page.
 	fn start_page(&mut self, page_lsn: PageLsn) -> FerrosGrynnResult<()> {
 		let page_no = PageNo::new(self.next_page);
+		let index = usize::try_from(page_no.get())
+			.map_err(|_error| invalid("property page number exceeds usize"))?;
+		if index != self.pages.len() {
+			return Err(invalid("property pages are not contiguous"));
+		}
 		self.next_page = self
 			.next_page
 			.checked_add(1)
 			.ok_or_else(|| invalid("property page clock is exhausted"))?;
-		self.current = Some((page_no, PropertyPageBuilder::new(page_no, page_lsn)));
+		self.pages.push(AlignedPage::zeroed());
+		let page =
+			self.pages.last_mut().ok_or_else(|| invalid("property page allocation failed"))?;
+		self.current = Some((page_no, PropertyPageBuilder::new(page, page_no, page_lsn)));
 		Ok(())
 	}
 
 	/// Seals and retains the current slotted page when present.
 	fn finish_current(&mut self) -> FerrosGrynnResult<()> {
 		if let Some((page_no, builder)) = self.current.take() {
-			self.pages.push((page_no, *builder.finish()?));
+			let index = usize::try_from(page_no.get())
+				.map_err(|_error| invalid("property page number exceeds usize"))?;
+			let page = self
+				.pages
+				.get_mut(index)
+				.ok_or_else(|| invalid("current property page is absent"))?;
+			builder.finish(page)?;
 		}
 		Ok(())
 	}
@@ -805,16 +818,10 @@ impl PropertyStoreBuilder {
 	/// Seals the builder and returns a contiguous page-number-ordered image.
 	fn finish(mut self) -> FerrosGrynnResult<Vec<AlignedPage>> {
 		self.finish_current()?;
-		self.pages.sort_unstable_by_key(|(page_no, _page)| *page_no);
-		for (index, (page_no, _page)) in self.pages.iter().enumerate() {
-			if page_no.get()
-				!= u64::try_from(index)
-					.map_err(|_error| invalid("property page index exceeds u64"))?
-			{
-				return Err(invalid("property pages are not contiguous"));
-			}
+		if u64::try_from(self.pages.len()).ok() != Some(self.next_page) {
+			return Err(invalid("property pages are not contiguous"));
 		}
-		Ok(self.pages.into_iter().map(|(_page_no, page)| page).collect())
+		Ok(self.pages)
 	}
 }
 
