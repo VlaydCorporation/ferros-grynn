@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-08T09:39:13.161491+00:00",
+  "generated_at": "2026-09-23T21:33:35.846522+00:00",
   "nodes": {
     "agents_design_authority": {
       "code_fingerprint": "a348f251e7527b1e4de975c2638577066f1a9ae6e02dd57968884cb9f9325628",
@@ -12,7 +12,7 @@
           "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.933397158,
+      "score": 0.652489436,
       "source_file": "AGENTS.md",
       "status": "tentative",
       "uses": 1
@@ -28,7 +28,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.818329542,
+      "score": 0.572051647,
       "source_file": "crates/fg-meta/src/io_async.rs",
       "status": "tentative",
       "uses": 1
@@ -44,13 +44,13 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.818329542,
+      "score": 0.572051647,
       "source_file": "crates/surrealdb/surrealdb/core/src/idx/ft/fulltext.rs",
       "status": "tentative",
       "uses": 1
     },
     "docs_storage_engine_hybrid_integration_plan_correctness_gate": {
-      "code_fingerprint": "5e88d0871501fc736af81b3c7de95a2d311bb59417681f5451a79e5f23cf8fd7",
+      "code_fingerprint": "03bbf5264ff5eebd3fd0877fa12b56e7830cb4aae4987d2f61b97cf0d00e966a",
       "label": "Correctness gate",
       "last": "2026-09-05T10:03:32.405089+00:00",
       "provenance": [
@@ -60,13 +60,13 @@
           "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.933397158,
+      "score": 0.652489436,
       "source_file": "docs/storage_engine_hybrid_integration_plan.md",
       "status": "tentative",
       "uses": 1
     },
-    "src_gql_execution_cursor_pathexpandcursor": {
-      "code_fingerprint": "0ef79eb53b3abbff4c971bf92a6617c469d05c064bd03426f4e1ff6b044ed626",
+    "src_gql_execution_cursor_path_pathexpandcursor": {
+      "code_fingerprint": "4733f6ec6758579c1e81b1bf789179304d11cb8ebb9dd834b4c5bf94c3e971ca",
       "label": "PathExpandCursor",
       "last": "2026-08-30T17:23:47.115005+00:00",
       "provenance": [
@@ -76,8 +76,8 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.818329542,
-      "source_file": "src/gql/execution/cursor.rs",
+      "score": 0.572051647,
+      "source_file": "src/gql/execution/cursor/path.rs",
       "status": "tentative",
       "uses": 1
     },
@@ -92,61 +92,45 @@
           "q": "What is MetaGraph?"
         }
       ],
-      "score": 0.512750438,
+      "score": 0.358437179,
       "source_file": "src/graph/metagraph.rs",
       "status": "tentative",
       "uses": 1
     },
-    "src_graph_traversal_index_traversalindex": {
-      "code_fingerprint": "5a8cc2b0e0e024b6359c20a64848768c43d5ff7fc162f7680a9ded479382324d",
-      "label": "TraversalIndex",
-      "last": "2026-08-30T17:23:47.115005+00:00",
+    "src_storage_graph_index_label_dict_decode_label_dictionary": {
+      "code_fingerprint": "3c31ea9dca0c40c8bdc6978242bfeb02a0e4549f85926bb489176119f4aa0f8d",
+      "label": "decode_label_dictionary()",
+      "last": "2026-09-12T00:23:43.957213+00:00",
       "provenance": [
         {
-          "date": "2026-08-30T17:23:47.115005+00:00",
+          "date": "2026-09-12T00:23:43.957213+00:00",
           "outcome": "useful",
-          "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
+          "q": "Добавить точный layout label entry page и typed node/edge label key в combined statistics"
         }
       ],
-      "score": 0.818329542,
-      "source_file": "src/graph/traversal/index.rs",
+      "score": 0.759929935,
+      "source_file": "src/storage/graph_index/label_dict.rs",
       "status": "tentative",
       "uses": 1
     },
-    "src_storage_store_mod_localdatabasesnapshot": {
-      "code_fingerprint": "a7f1b9ccb841d2952f7612fd75a68c4d7f25f84eecf80a42dbeda8cd5a4b0783",
-      "label": "LocalDatabaseSnapshot",
-      "last": "2026-09-08T09:34:24.172911+00:00",
+    "src_storage_graph_index_label_dict_encode_label_dictionary": {
+      "code_fingerprint": "3c31ea9dca0c40c8bdc6978242bfeb02a0e4549f85926bb489176119f4aa0f8d",
+      "label": "encode_label_dictionary()",
+      "last": "2026-09-12T00:23:43.957213+00:00",
       "provenance": [
         {
-          "date": "2026-09-08T09:34:24.172911+00:00",
+          "date": "2026-09-12T00:23:43.957213+00:00",
           "outcome": "useful",
-          "q": "Почему один файл тестов? Лучше логически разделять тесты на несколько файлов, хотя бы два файла для local и in-memory БД."
+          "q": "Добавить точный layout label entry page и typed node/edge label key в combined statistics"
         }
       ],
-      "score": 0.999922722,
-      "source_file": "src/storage/store/mod.rs",
-      "status": "tentative",
-      "uses": 1
-    },
-    "src_storage_store_mod_localsnapshotgraph": {
-      "code_fingerprint": "a7f1b9ccb841d2952f7612fd75a68c4d7f25f84eecf80a42dbeda8cd5a4b0783",
-      "label": "LocalSnapshotGraph",
-      "last": "2026-08-28T21:19:39.115264+00:00",
-      "provenance": [
-        {
-          "date": "2026-08-28T21:19:39.115264+00:00",
-          "outcome": "useful",
-          "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
-        }
-      ],
-      "score": 0.784337808,
-      "source_file": "src/storage/store/mod.rs",
+      "score": 0.759929935,
+      "source_file": "src/storage/graph_index/label_dict.rs",
       "status": "tentative",
       "uses": 1
     },
     "src_values_runtime_value_estimated_values_heap_bytes": {
-      "code_fingerprint": "826e0c2b97622478e550620738ff82ece16174bf837ba4c8f7dd81d809d8d174",
+      "code_fingerprint": "0220ce56054627712a27507c8af552e27f0d76db955f96ab5684c59af992f0d8",
       "label": "estimated_values_heap_bytes()",
       "last": "2026-08-28T21:19:39.115264+00:00",
       "provenance": [
@@ -156,7 +140,7 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.784337808,
+      "score": 0.548289792,
       "source_file": "src/values/runtime/value.rs",
       "status": "tentative",
       "uses": 1
