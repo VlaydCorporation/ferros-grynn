@@ -5,7 +5,7 @@ pub mod ecs;
 pub mod gql;
 pub mod graph;
 pub mod math;
-// mod memory;
+mod memory;
 pub mod stats;
 mod storage;
 pub mod syn;
