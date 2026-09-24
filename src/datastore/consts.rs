@@ -4,6 +4,11 @@ use std::time::Duration;
 pub(super) const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(300);
 /// Default logical transaction write-set ceiling.
 pub(super) const DEFAULT_MAX_WRITE_SET_BYTES: usize = 256 * 1024 * 1024;
+/// Default count of applied logical items retained in one private import
+/// segment.
+pub(super) const DEFAULT_IMPORT_SEGMENT_ITEMS: usize = 1_000_000;
+/// Maximum count of detailed violations retained in an import report.
+pub(super) const IMPORT_MAX_REPORTED_VIOLATIONS: usize = 1_000;
 /// Default 64-MiB pool measured in format-v1 pages.
 pub(super) const DEFAULT_BUFFER_POOL_PAGES: usize = 4_096;
 /// Default WAL-only page ratio that triggers a passive checkpoint.

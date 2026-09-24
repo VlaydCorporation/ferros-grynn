@@ -169,6 +169,17 @@ pub(crate) struct IndexStoreRoot {
 }
 
 impl IndexStoreRoot {
+	/// Removes only schema-defined indexes while preserving class and label
+	/// lookup structures required by import DML.
+	pub(crate) fn defer_explicit_indexes(&mut self, retain_unique: bool) {
+		self.base.retain(|_id, binding| retain_unique && binding.kind == ClassIndexKind::Unique);
+		for graph in self.graphs.values_mut() {
+			graph
+				.explicit
+				.retain(|_id, binding| retain_unique && binding.kind == ClassIndexKind::Unique);
+		}
+	}
+
 	pub(crate) fn register_graph(&mut self, graph: GraphId) -> FerrosGrynnResult<()> {
 		if self.graphs.insert(graph, GraphIndexRoot::default()).is_some() {
 			return Err(FerrosGrynnError::invalid_argument("graph indexes are already registered"));

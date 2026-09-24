@@ -1,5 +1,7 @@
 //! Construction, WAL publication, and snapshot reopen of graph images.
 
+use std::path::Path;
+
 use super::{GraphCheckpointAuthority, GraphFileSet};
 use crate::{
 	datastore::{DatabaseRoot, GraphRoot},
@@ -7,8 +9,14 @@ use crate::{
 	graph::{GraphId, GraphRef},
 	storage::{
 		file_registry::FileRegistry,
-		graph_index::BuiltPrimaryIndex,
-		graph_pages::{BuiltGraphImage, GraphArenaBindings, build_graph_image, open_graph_image},
+		graph_index::{BuiltPrimaryIndex, SortedIndexRecords},
+		graph_pages::{
+			BuiltGraphImage,
+			GraphArenaBindings,
+			build_graph_image,
+			build_import_graph_image,
+			open_graph_image,
+		},
 		graph_superblock::GraphSuperblock,
 		image_io::{read_pages, read_pages_cached, stage_pages},
 		metadata_cow::select_checkpoint_page,
@@ -26,6 +34,16 @@ pub(in crate::storage) fn build_durable_graph_image(
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<BuiltGraphImage> {
 	build_graph_image(database, graph_id, context, PageLsn::ZERO)
+}
+
+/// Builds graph payload with bounded membership input for atomic import.
+pub(in crate::storage) fn build_import_durable_graph_image(
+	database: &DatabaseRoot,
+	graph_id: GraphId,
+	context: &mut EncodeContext,
+	scratch_root: &Path,
+) -> FerrosGrynnResult<BuiltGraphImage<SortedIndexRecords>> {
+	build_import_graph_image(database, graph_id, context, PageLsn::ZERO, scratch_root)
 }
 
 /// Stages all graph files and publishes the logical superblock last.

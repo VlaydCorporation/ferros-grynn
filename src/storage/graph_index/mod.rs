@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// Raw-address contract shared by the global primary and graph-local indexes.
-pub(super) trait PrimaryAddress: Copy + Eq {
+pub(in crate::storage) trait PrimaryAddress: Copy + Eq {
 	fn from_raw(raw: u64) -> FerrosGrynnResult<Self>;
 	fn raw(self) -> u64;
 	fn kind(self) -> Option<AtomKind>;
@@ -80,8 +80,12 @@ mod label_dict;
 mod label_idx;
 /// Primary RecordId index.
 mod primary_idx;
+#[cfg(test)]
+mod profile;
 /// Standard and unique scalar indexes.
 mod scalar_idx;
+/// Page-at-a-time immutable index writers used by atomic import.
+mod streaming;
 
 #[allow(
 	clippy::wildcard_imports,
@@ -96,11 +100,8 @@ pub(super) use count_idx::{
 	encode_count_index,
 	stamp_count_index_lsn,
 };
-pub(super) use external_sort::{
-	ExternalIndexSorter,
-	SortedIndexRecords,
-	cleanup_external_index_sort,
-};
+pub(super) use external_sort::cleanup_external_index_sort;
+pub(crate) use external_sort::{ExternalIndexSorter, SortedIndexRecords};
 pub(super) use label_dict::{
 	LabelDictionary,
 	LabelKind,
@@ -134,6 +135,12 @@ pub(super) use scalar_idx::{
 	mutate_scalar_index_leaves,
 	range_scalar_index,
 	scan_scalar_index,
+};
+pub(super) use streaming::{
+	StreamedIndex,
+	stream_label_index,
+	stream_standard_index,
+	stream_unique_index,
 };
 
 const LEAF_NEXT_OFFSET: usize = PAGE_HEADER_SIZE;
@@ -854,6 +861,163 @@ mod tests {
 				)
 				.is_err()
 			);
+			Ok(())
+		})();
+		drop(fs::remove_dir_all(&root));
+		result
+	}
+
+	#[test]
+	fn page_at_a_time_standard_writer_streams_postings_and_internal_levels() -> FerrosGrynnResult<()>
+	{
+		let root = std::env::current_dir()
+			.map_err(|source| {
+				FerrosGrynnError::storage_io_failure("resolve streamed-index test directory")
+					.with_technical_source(source)
+			})?
+			.join(format!(
+				".ferros-grynn-streamed-index-{}-{}",
+				std::process::id(),
+				NEXT_SORT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+			));
+		fs::create_dir(&root).map_err(|source| {
+			FerrosGrynnError::storage_io_failure("create streamed-index test directory")
+				.with_technical_source(source)
+		})?;
+		let result = (|| {
+			let mut sorter = ExternalIndexSorter::with_budget(&root, 160);
+			for slot in (0..6_000_u64).rev() {
+				sorter.push(
+					format!("key-{:04}", slot % 257).into_bytes(),
+					DiskAtomRef::from_parts(AtomKind::Node, slot)?,
+				)?;
+			}
+			let records = sorter.finish()?;
+			let mut pages = Vec::new();
+			let built = stream_standard_index::<DiskAtomRef>(
+				&records,
+				&root,
+				PageLsn::ZERO,
+				|page_no, source| {
+					if page_no.get() as usize != pages.len() {
+						return Err(invalid_index("streamed pages are not sequential"));
+					}
+					let mut page = AlignedPage::zeroed();
+					page.as_bytes_mut().copy_from_slice(source.as_bytes());
+					pages.push(page);
+					Ok(())
+				},
+			)?;
+			assert_eq!(built.page_count as usize, pages.len());
+			let atoms = lookup_scalar_index::<DiskAtomRef>(
+				|page_no, output| {
+					output.as_bytes_mut().copy_from_slice(pages[page_no.get() as usize].as_bytes());
+					Ok(())
+				},
+				built.root,
+				ScalarIndexMode::Standard,
+				b"key-0001",
+			)?;
+			assert_eq!(atoms.len(), 24);
+			assert!(atoms.windows(2).all(|pair| pair[0] < pair[1]));
+			Ok(())
+		})();
+		drop(fs::remove_dir_all(&root));
+		result
+	}
+
+	#[test]
+	fn page_at_a_time_unique_and_label_writers_round_trip() -> FerrosGrynnResult<()> {
+		let root = std::env::current_dir()
+			.map_err(|source| {
+				FerrosGrynnError::storage_io_failure("resolve streamed-index test directory")
+					.with_technical_source(source)
+			})?
+			.join(format!(
+				".ferros-grynn-streamed-index-{}-{}",
+				std::process::id(),
+				NEXT_SORT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+			));
+		fs::create_dir(&root).map_err(|source| {
+			FerrosGrynnError::storage_io_failure("create streamed-index test directory")
+				.with_technical_source(source)
+		})?;
+		let result = (|| {
+			let mut unique = ExternalIndexSorter::with_budget(&root, 320);
+			for slot in (0..2_000_u64).rev() {
+				unique.push(
+					format!("key-{slot:04}").into_bytes(),
+					DiskAtomRef::from_parts(AtomKind::Node, slot)?,
+				)?;
+			}
+			let records = unique.finish()?;
+			let mut pages = Vec::new();
+			let built = stream_unique_index::<DiskAtomRef>(
+				&records,
+				&root,
+				PageLsn::ZERO,
+				|page_no, source| {
+					assert_eq!(page_no.get() as usize, pages.len());
+					let mut page = AlignedPage::zeroed();
+					page.as_bytes_mut().copy_from_slice(source.as_bytes());
+					pages.push(page);
+					Ok(())
+				},
+			)?;
+			assert_eq!(built.page_count as usize, pages.len());
+			assert_eq!(
+				lookup_scalar_index::<DiskAtomRef>(
+					|page_no, output| {
+						output
+							.as_bytes_mut()
+							.copy_from_slice(pages[page_no.get() as usize].as_bytes());
+						Ok(())
+					},
+					built.root,
+					ScalarIndexMode::Unique,
+					b"key-0042",
+				)?,
+				vec![DiskAtomRef::from_parts(AtomKind::Node, 42)?]
+			);
+
+			let mut labels = ExternalIndexSorter::with_budget(&root, 320);
+			for slot in (0..5_000_u64).rev() {
+				labels.push(
+					slot.to_be_bytes().to_vec(),
+					DiskAtomRef::from_parts(AtomKind::Node, slot)?,
+				)?;
+			}
+			let records = labels.finish()?;
+			let mut label_pages = Vec::new();
+			let built = stream_label_index::<DiskAtomRef>(
+				&records,
+				AtomKind::Node,
+				PageLsn::ZERO,
+				|page_no, source| {
+					assert_eq!(page_no.get() as usize, label_pages.len());
+					let mut page = AlignedPage::zeroed();
+					page.as_bytes_mut().copy_from_slice(source.as_bytes());
+					label_pages.push(page);
+					Ok(())
+				},
+			)?;
+			assert_eq!(built.page_count as usize, label_pages.len());
+			let mut decoded = Vec::new();
+			visit_label_index_pages::<DiskAtomRef>(
+				|page_no, output| {
+					output
+						.as_bytes_mut()
+						.copy_from_slice(label_pages[page_no.get() as usize].as_bytes());
+					Ok(())
+				},
+				AtomKind::Node,
+				|atom| {
+					decoded.push(atom);
+					Ok(())
+				},
+			)?;
+			assert_eq!(decoded.len(), 5_000);
+			assert!(decoded.windows(2).all(|pair| pair[0] < pair[1]));
 			Ok(())
 		})();
 		drop(fs::remove_dir_all(&root));

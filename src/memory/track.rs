@@ -43,7 +43,7 @@ pub static MEMORY_THRESHOLD: LazyLock<usize> = LazyLock::new(|| {
 		.unwrap_or(0)
 });
 
-/// Parse a `SURREAL_MEMORY_THRESHOLD` value into a byte count. Accepts a plain
+/// Parse a `FG_MEMORY_THRESHOLD` value into a byte count. Accepts a plain
 /// byte count or a human-readable size suffix (`b`/`kb`/`kib`/`mb`/`mib`/
 /// `gb`/`gib`, case-insensitive). Returns `None` for unparseable values;
 /// `Some(0)` for `"0"` (disables the threshold); otherwise `Some(n)` floored
@@ -167,7 +167,7 @@ impl<A: GlobalAlloc> TrackAlloc<A> {
 			}
 		});
 		// Decrement the recursion depth
-		RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+		RECURSION_DEPTH.set(RECURSION_DEPTH.get().saturating_sub(1));
 	}
 
 	fn sub(&self, size: usize) {
@@ -193,7 +193,7 @@ impl<A: GlobalAlloc> TrackAlloc<A> {
 			}
 		});
 		// Decrement the recursion depth
-		RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+		RECURSION_DEPTH.set(RECURSION_DEPTH.get().saturating_sub(1));
 	}
 }
 

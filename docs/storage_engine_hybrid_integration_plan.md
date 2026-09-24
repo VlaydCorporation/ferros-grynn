@@ -3,8 +3,9 @@
 ## Статус и нормативные границы
 
 **Статус на 2026-09-04:** H0-H13 выполнены, production cutover подтверждён и
-проведён, отчёт и компактный CSV созданы, Graphify обновлён. H14 остаётся
-отдельной зависимой работой после delta-oriented foundation этапа 4.
+проведён, отчёт и компактный CSV созданы, Graphify обновлён. Low-level delta
+foundation H14 завершён; origin-aware public flush остаётся отдельной задачей
+`Q-09` в [`full_plan.md`](full_plan.md).
 
 Этап следует после завершённой test-only кампании 3.1 и переносит в production
 только подтверждённую Pareto-комбинацию из
@@ -22,8 +23,8 @@ checkpoint/recovery, write path и публичные query-result типы не
 ### Addendum 8.1: database и graph data spaces
 
 [`rework_plan.md`](rework_plan.md) не меняет выбор R8/Direct/scatter/IoRing, бюджеты и
-router. Он меняет identity файлов и данных над этим engine. Документационные A0–A4 и
-код A5–A8 завершены; A9–A16 остаются открытыми.
+router. Он меняет identity файлов и данных над этим engine. Переход A0–A16 завершён
+и подтверждён `reports/graph_first_atom_model_report.md`.
 
 - `SourceState` и `PageKey` получают `DataSpaceId`, `DataFileId` и точную
   `PageCacheVersion`; удаляется допущение, что любой source принадлежит graph.
@@ -34,8 +35,9 @@ router. Он меняет identity файлов и данных над этим 
 - Mode 1 читает нормализованный AtomStore + occurrences из одного MVCC root;
   Mode 2 использует тот же `HybridReadEngine` для обоих data spaces; Mode 3 копирует
   effective graph и не удерживает base/overlay page references.
-- H14 зависит от A14–A16: Mutable flush пишет только graph-local
-  topology/overlay delta; неявно менять base atom запрещено.
+- Low-level delta foundation H14 завершён: Mutable flush пишет только graph-local
+  topology/overlay delta; неявно менять base atom запрещено. Origin-aware public
+  flush остаётся отдельным контрактом `Q-09`.
 
 ## Выбранная комбинация
 
@@ -183,10 +185,9 @@ source snapshot освобождается; при ошибке или cancellat
 
 Результат владеет данными, хранит origin, не удерживает page guards и сообщает
 `GraphStorageMode::Hybrid`, после чего читается как Mode 1. Frozen не получает
-flush. Mutable сохраняет source mapping и dirty state; explicit delta flush
-реализуется только после A14–A16 коррекции 8.1. Flush неявно не меняет base atom и не
-выполняется из `Drop`, работает в новой транзакции и очищает dirty state только
-после успешного commit.
+flush. Mutable сохраняет source mapping и dirty state; low-level delta flush реализован.
+Origin-aware public flush из `Q-09` неявно не меняет base atom, не выполняется из
+`Drop`, работает в новой транзакции и очищает dirty state только после успешного commit.
 
 ## Dependency-ordered реализация
 
@@ -206,7 +207,7 @@ flush. Mutable сохраняет source mapping и dirty state; explicit delta 
 | H11 | H10              | Production-API performance gate и source-level profiling пройдены                                                    |
 | H12 | H11              | `SyncPageManager` переключён на `HybridReadEngine`; старый Clock-Pro и selector удалены                              |
 | H13 | H12              | Финальная проверка, отчёт, CSV/logs и `graphify update .`                                                            |
-| H14 | H9, H12, A14–A16 | Explicit Mutable graph-local topology/overlay delta flush отдельным изменением                                       |
+| H14 | H9, H12, A14–A16 | Low-level Mutable graph-local topology/overlay delta foundation завершён; public origin-aware API остаётся `Q-09`    |
 
 ### Фактическое выполнение
 
@@ -224,7 +225,7 @@ flush. Mutable сохраняет source mapping и dirty state; explicit delta 
   `reports/storage_engine_hybrid_integration_results.csv`.
 - H12 выполнен после явного подтверждения: selector удалён, production
   `SyncPageManager` всегда владеет `HybridReadEngine`.
-- H13 выполнен; H14 намеренно не входит в этот cutover.
+- H13 и low-level foundation H14 выполнены; public origin-aware flush остаётся `Q-09`.
 
 ## Correctness gate
 

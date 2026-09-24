@@ -1,5 +1,6 @@
 mod dml;
 mod graph_dml;
+mod import;
 mod r#let;
 mod r#match;
 mod r#return;
@@ -71,6 +72,7 @@ pub enum StatementKind {
 	Remove(RemoveStatement),
 	Alter(AlterStatement),
 	Info(InfoStatement),
+	Import(ImportStatement),
 	Let(LetStatement),
 	Match(MatchStatement),
 	Relate(RelateStatement),
@@ -89,3 +91,10 @@ pub use dml::{
 	MutateStatement,
 };
 pub use graph_dml::{AttachStatement, DetachStatement, RelateStatement};
+pub use import::{
+	ImportGraphRef,
+	ImportOption,
+	ImportOptionName,
+	ImportOptionValue,
+	ImportStatement,
+};

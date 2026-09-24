@@ -1,9 +1,16 @@
 # План реализации `values`
 
+> **Статус:** завершённый исторический план. Актуальная graph-first модель A0–A16
+> реализована и проверена; текущий прогресс ведётся только в
+> [`full_plan.md`](full_plan.md), evidence — в
+> [`reports/graph_first_atom_model_report.md`](reports/graph_first_atom_model_report.md).
+> Нижеследующие промежуточные статусы сохранены как история решения и не описывают
+> состояние текущего checkout.
+
 ## Коррекция этапа 8.1
 
-Нормативная target-модель задана в [`rework_plan.md`](rework_plan.md). Документационные
-шаги A0–A4 завершены 2026-09-10; типы и код A5–A16 не изменены. Целевые границы:
+Нормативная target-модель задана в [`rework_plan.md`](rework_plan.md). Шаги A0–A16
+завершены; целевые границы:
 
 - `RecordId = class:id`; class — immutable namespace global atom, а не graph membership;
 - публичный `ClassId` типизирует schema identity; внутренний `GlobalAtomId`

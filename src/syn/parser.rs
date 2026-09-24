@@ -37,6 +37,7 @@ pub(super) fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult
 		source,
 		settings,
 		tokens: TokenBuffer::new(tokens),
+		in_import: false,
 	};
 	let mut stack = Stack::new();
 	stack.enter(|stk| parser.program(stk)).finish()
@@ -74,6 +75,7 @@ pub(in crate::syn) struct Parser<'a> {
 	pub(in crate::syn) source: &'a str,
 	pub(in crate::syn) settings: ParserSettings,
 	pub(in crate::syn) tokens: TokenBuffer<4>,
+	pub(in crate::syn) in_import: bool,
 }
 
 impl Parser<'_> {
@@ -87,7 +89,25 @@ impl Parser<'_> {
 			if self.at_eof() {
 				break;
 			}
-			statements.push(context.run(|context| self.statement(context)).await?);
+			let statement = context.run(|context| self.statement(context)).await?;
+			if matches!(statement.kind, StatementKind::Import(_)) {
+				if !statements.is_empty() {
+					return Err(self.syntax(
+						"BEGIN IMPORT must be the only top-level statement.",
+						statement.span,
+					));
+				}
+				statements.push(statement);
+				while self.consume_symbol(Symbol::Semicolon).is_some() {}
+				if !self.at_eof() {
+					return Err(self.syntax(
+						"BEGIN IMPORT must be the only top-level statement.",
+						self.current().span,
+					));
+				}
+				break;
+			}
+			statements.push(statement);
 			if !self.at_eof() && self.consume_symbol(Symbol::Semicolon).is_none() {
 				return Err(self.syntax("Expected `;` between statements.", self.current().span));
 			}
@@ -102,7 +122,12 @@ impl Parser<'_> {
 		context: &mut Stk,
 	) -> FerrosGrynnResult<Statement> {
 		let start = self.current().span;
-		let kind = if self.consume_keyword(keywords::DEFINE).is_some() {
+		let kind = if self.consume_keyword(keywords::BEGIN).is_some() {
+			if self.consume_keyword(keywords::IMPORT).is_none() {
+				return Err(self.unsupported("BEGIN transaction", start));
+			}
+			StatementKind::Import(context.run(|context| self.import_statement(context)).await?)
+		} else if self.consume_keyword(keywords::DEFINE).is_some() {
 			if self.consume_keyword(keywords::GRAPH).is_some() {
 				StatementKind::DefineGraph(self.define_graph_statement()?)
 			} else if self.consume_keyword(keywords::CLASS).is_some() {
@@ -742,6 +767,38 @@ mod tests {
 			let error = parse(source, ParserSettings::default())
 				.expect_err("statement-specific DML grammar must be enforced");
 			assert_eq!(error.status().code().to_string(), "FG-42001", "{source}");
+		}
+	}
+
+	#[test]
+	fn parses_atomic_import_as_the_only_top_level_statement() {
+		let program = parse(
+			"BEGIN IMPORT INTO GRAPH social WITH (INDEXES = DEFERRED, CONSTRAINTS = IMMEDIATE, ON \
+			 VIOLATION = SKIP, REJECT LIMIT = 2, SEGMENT SIZE = 1, EVENTS = OFF, CHANGEFEED = \
+			 OFF); ATTACH person:alice LABEL Person; UPDATE person:alice LABEL Friend; RELATE \
+			 (person:alice)-[friendship:known]->(person:bob); END IMPORT WITH VALIDATION;",
+			ParserSettings::default(),
+		)
+		.expect("stage-10 import syntax parses");
+		let StatementKind::Import(statement) = &program.statements[0].kind else {
+			panic!("expected BEGIN IMPORT");
+		};
+		assert_eq!(program.statements.len(), 1);
+		assert_eq!(statement.statements.len(), 3);
+		assert_eq!(statement.options.len(), 7);
+		assert!(statement.full_validation);
+		let StatementKind::Attach(attach) = &statement.statements[0].kind else {
+			panic!("expected ATTACH");
+		};
+		assert!(attach.graph.is_none());
+
+		for source in [
+			"RETURN 1; BEGIN IMPORT; END IMPORT;",
+			"BEGIN IMPORT; CREATE person:alice; END IMPORT; RETURN 1;",
+			"BEGIN IMPORT; DEFINE CLASS forbidden TYPE NODE; END IMPORT;",
+			"BEGIN IMPORT; BEGIN IMPORT; END IMPORT; END IMPORT;",
+		] {
+			assert!(parse(source, ParserSettings::default()).is_err(), "source: {source}");
 		}
 	}
 

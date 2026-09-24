@@ -41,7 +41,13 @@ pub(super) use hot_types::{
 	NodeHotSlot,
 	NodeSlotFlags,
 };
-pub(super) use image::{BuiltGraphImage, GraphArenaBindings, build_graph_image, open_graph_image};
+pub(super) use image::{
+	BuiltGraphImage,
+	GraphArenaBindings,
+	build_graph_image,
+	build_import_graph_image,
+	open_graph_image,
+};
 pub(super) use overlay::{GraphOverlayStore, decode_overlay, encode_overlay, read_overlay_record};
 pub(super) use statistics::{
 	EncodedStatisticsFiles,

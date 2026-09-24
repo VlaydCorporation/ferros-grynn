@@ -19,7 +19,33 @@ pub fn execute_transaction(
 	settings: ParserSettings,
 ) -> FerrosGrynnResult<Vec<QueryResult>> {
 	let program = crate::gql::parse(source, settings)?;
+	if program
+		.statements
+		.iter()
+		.any(|statement| matches!(statement.kind, crate::syn::StatementKind::Import(_)))
+	{
+		return Err(FerrosGrynnError::query_feature_not_supported(
+			"BEGIN IMPORT inside an open Transaction",
+		));
+	}
 	execute_parsed_transaction(transaction, source, &program, variables)
+}
+
+/// Analyzes a parsed mutation program without executing it and returns the
+/// captured database commit timestamp.
+pub(crate) fn validate_parsed_transaction(
+	transaction: &mut Transaction,
+	source: &str,
+	program: &Program,
+	variables: &Object,
+) -> FerrosGrynnResult<u64> {
+	let snapshot = transaction.query_snapshot()?;
+	let read = TransactionRead {
+		transaction,
+		snapshot,
+	};
+	analyze(program, source, &read, variables)?;
+	Ok(read.snapshot.commit_ts())
 }
 
 /// Analyzes and executes an already parsed program within a transaction.

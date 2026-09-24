@@ -12,8 +12,7 @@ pub mod syn;
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]
 pub use storage::prototype_api as storage_engine_prototype_api;
-// mod sys;
-// mod utils;
+mod utils;
 pub mod values;
 // mod asynchronous;
 

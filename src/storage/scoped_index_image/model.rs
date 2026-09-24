@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use crate::{
 	datastore::{ClassId, ClassIndexKind, IndexId, IndexScope, SchemaVersion},
@@ -37,6 +37,16 @@ pub(in crate::storage) struct ScopedIndexFile {
 	pub(in crate::storage) pages: Vec<AlignedPage>,
 }
 
+/// Metadata for one immutable side-file written directly by the import
+/// streaming builder.
+pub(in crate::storage) struct StreamedScopedIndexFile {
+	pub(in crate::storage) scope: IndexScope,
+	pub(in crate::storage) path: String,
+	pub(in crate::storage) kind: ScopedIndexKind,
+	pub(in crate::storage) root: PageNo,
+	pub(in crate::storage) page_count: u64,
+}
+
 /// Every index generation built from one immutable database root.
 #[derive(Default)]
 pub(in crate::storage) struct ScopedIndexImages {
@@ -44,4 +54,12 @@ pub(in crate::storage) struct ScopedIndexImages {
 	pub(in crate::storage) base: Vec<ScopedIndexFile>,
 	/// Graph-space class, label, and Effective indexes.
 	pub(in crate::storage) graphs: BTreeMap<GraphId, Vec<ScopedIndexFile>>,
+}
+
+/// Every directly written immutable index file of one import generation.
+#[derive(Default)]
+pub(in crate::storage) struct StreamedScopedIndexImages {
+	pub(in crate::storage) base: Vec<StreamedScopedIndexFile>,
+	pub(in crate::storage) graphs: BTreeMap<GraphId, Vec<StreamedScopedIndexFile>>,
+	pub(in crate::storage) index_timings: BTreeMap<IndexId, Duration>,
 }

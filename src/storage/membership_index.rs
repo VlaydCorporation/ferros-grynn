@@ -1,7 +1,15 @@
 //! B+tree images for forward and reverse graph membership resolution.
 
+use std::path::Path;
+
 use super::{
-	graph_index::{BuiltPrimaryIndex, PrimaryIndexEntry, build_primary_index},
+	graph_index::{
+		BuiltPrimaryIndex,
+		ExternalIndexSorter,
+		PrimaryIndexEntry,
+		SortedIndexRecords,
+		build_primary_index,
+	},
 	page::PageLsn,
 };
 use crate::{
@@ -29,6 +37,21 @@ pub(super) fn build_graph_membership_index(
 	build_primary_index(&entries, page_lsn)
 }
 
+/// Sorts `membership.fgidx` input within the shared import memory budget.
+pub(super) fn sort_graph_membership_index(
+	graph: &GraphRoot,
+	scratch_root: &Path,
+) -> FerrosGrynnResult<SortedIndexRecords> {
+	let mut sorter = ExternalIndexSorter::new(scratch_root);
+	for occurrence in graph.occurrences() {
+		sorter.push(
+			occurrence.global_id().raw().to_be_bytes().to_vec(),
+			disk_ref(occurrence.local_id())?,
+		)?;
+	}
+	sorter.finish()
+}
+
 /// Builds database `memberships.fgidx` in `(global, graph)` order.
 pub(super) fn build_reverse_membership_index(
 	atoms: &AtomStoreRoot,
@@ -47,6 +70,24 @@ pub(super) fn build_reverse_membership_index(
 		}
 	}
 	build_primary_index(&entries, page_lsn)
+}
+
+/// Sorts database `memberships.fgidx` input within the shared import memory
+/// budget.
+pub(super) fn sort_reverse_membership_index(
+	atoms: &AtomStoreRoot,
+	scratch_root: &Path,
+) -> FerrosGrynnResult<SortedIndexRecords> {
+	let mut sorter = ExternalIndexSorter::new(scratch_root);
+	for atom in atoms.atoms() {
+		let Some(memberships) = atoms.memberships(atom.id()) else {
+			continue;
+		};
+		for (graph, local) in memberships {
+			sorter.push(reverse_key(atom.id(), *graph), disk_ref(*local)?)?;
+		}
+	}
+	sorter.finish()
 }
 
 /// Encodes the exact reverse-membership ordering key.

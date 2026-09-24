@@ -16,6 +16,7 @@ pub(super) use checkpoint::{
 };
 pub(super) use durable::{
 	build_durable_graph_image,
+	build_import_durable_graph_image,
 	open_durable_graph_image,
 	stage_durable_graph_image,
 	stage_graph_superblock_if_changed,
@@ -23,6 +24,7 @@ pub(super) use durable::{
 pub(super) use reverse::{
 	backfill_reverse_membership_checkpoint,
 	build_reverse_membership_image,
+	build_import_reverse_membership_image,
 	open_reverse_membership_image,
 	stage_reverse_membership_image,
 	validate_reverse_memberships,

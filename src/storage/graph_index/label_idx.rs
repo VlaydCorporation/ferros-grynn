@@ -33,23 +33,41 @@ pub(in crate::storage) fn build_label_index<Address: PrimaryAddress>(
 			.ok_or_else(|| invalid_index("label-index page offset overflows usize"))?;
 		let end = start.saturating_add(ATOMS_PER_PAGE).min(atoms.len());
 		let chunk = &atoms[start..end];
-		pages.push(AlignedPage::zeroed());
-		let page = &mut pages[index];
-		page.reset(PageType::IndexLabelArray, PageFlags::empty(), page_lsn, page_no);
 		let next = (index + 1 < page_count).then(|| PageNo::new(page_no.get() + 1));
-		write_u64(page.as_bytes_mut(), NEXT_PAGE_OFFSET, next.unwrap_or(PageNo::NULL).get());
-		write_u32(
-			page.as_bytes_mut(),
-			COUNT_OFFSET,
-			u32::try_from(chunk.len())
-				.map_err(|_error| invalid_index("label-index page count exceeds u32"))?,
-		);
-		for (offset, atom) in chunk.iter().enumerate() {
-			write_u64(page.as_bytes_mut(), ATOMS_OFFSET + offset * size_of::<u64>(), atom.raw());
-		}
-		page.seal()?;
+		pages.push(AlignedPage::zeroed());
+		encode_label_page(&mut pages[index], page_no, page_lsn, next, chunk)?;
 	}
 	Ok(pages)
+}
+
+/// Encodes one bounded page of a dense label-membership stream.
+pub(super) fn encode_label_page<Address: PrimaryAddress>(
+	page: &mut AlignedPage,
+	page_no: PageNo,
+	page_lsn: PageLsn,
+	next: Option<PageNo>,
+	atoms: &[Address],
+) -> FerrosGrynnResult<()> {
+	if atoms.len() > ATOMS_PER_PAGE {
+		return Err(invalid_index("label-index page count exceeds its capacity"));
+	}
+	page.reset(PageType::IndexLabelArray, PageFlags::empty(), page_lsn, page_no);
+	write_u64(page.as_bytes_mut(), NEXT_PAGE_OFFSET, next.unwrap_or(PageNo::NULL).get());
+	write_u32(
+		page.as_bytes_mut(),
+		COUNT_OFFSET,
+		u32::try_from(atoms.len())
+			.map_err(|_error| invalid_index("label-index page count exceeds u32"))?,
+	);
+	for (offset, atom) in atoms.iter().enumerate() {
+		write_u64(page.as_bytes_mut(), ATOMS_OFFSET + offset * size_of::<u64>(), atom.raw());
+	}
+	page.seal()
+}
+
+/// Returns the number of addresses encoded in one label page.
+pub(super) const fn label_atoms_per_page() -> usize {
+	ATOMS_PER_PAGE
 }
 
 /// Visits one exact label membership in ascending slot order.

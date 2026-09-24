@@ -159,6 +159,12 @@ impl<'a> Analyzer<'a> {
 		for statement in &program.statements {
 			match &statement.kind {
 				StatementKind::Attach(statement) => {
+					let graph = statement.graph.as_ref().ok_or_else(|| {
+						self.semantic(
+							"ATTACH requires a graph scope.",
+							statement.record.class().span,
+						)
+					})?;
 					if self.catalog.class_kind(statement.record.class().value.as_ref())?
 						!= AtomKind::Node
 					{
@@ -169,7 +175,7 @@ impl<'a> Analyzer<'a> {
 					}
 					statements.push(LogicalStatement::GraphDml(LogicalGraphDmlStatement::Attach {
 						record: self.record_target(&statement.record)?,
-						graph: self.catalog.graph(&statement.graph.value)?,
+						graph: self.catalog.graph(&graph.value)?,
 						label: statement
 							.label
 							.as_ref()
@@ -229,9 +235,15 @@ impl<'a> Analyzer<'a> {
 					)?));
 				}
 				StatementKind::Detach(statement) => {
+					let graph = statement.graph.as_ref().ok_or_else(|| {
+						self.semantic(
+							"DETACH requires a graph scope.",
+							statement.record.class().span,
+						)
+					})?;
 					statements.push(LogicalStatement::GraphDml(LogicalGraphDmlStatement::Detach {
 						record: self.record_target(&statement.record)?,
-						graph: self.catalog.graph(&statement.graph.value)?,
+						graph: self.catalog.graph(&graph.value)?,
 						cascade: statement.cascade,
 					}));
 				}
@@ -257,6 +269,12 @@ impl<'a> Analyzer<'a> {
 				}
 				StatementKind::Info(statement) => {
 					statements.push(LogicalStatement::Schema(Self::info(&statement.target)));
+				}
+				StatementKind::Import(_) => {
+					return Err(self.semantic(
+						"BEGIN IMPORT must be executed through Datastore.",
+						statement.span,
+					));
 				}
 				StatementKind::Let(statement) => {
 					let value = self.expr(&statement.value, None)?;
@@ -320,6 +338,9 @@ impl<'a> Analyzer<'a> {
 		&self,
 		statement: &crate::syn::RelateStatement,
 	) -> FerrosGrynnResult<LogicalGraphDmlStatement> {
+		let graph = statement.graph.as_ref().ok_or_else(|| {
+			self.semantic("RELATE requires a graph scope.", statement.source.class().span)
+		})?;
 		for endpoint in [&statement.source, &statement.target] {
 			let kind = self.catalog.class_kind(endpoint.class().value.as_ref())?;
 			if !statement.atom_endpoints && kind != AtomKind::Node {
@@ -392,7 +413,7 @@ impl<'a> Analyzer<'a> {
 					.transpose()?,
 			},
 			target,
-			graph: self.catalog.graph(&statement.graph.value)?,
+			graph: self.catalog.graph(&graph.value)?,
 			label: statement.label.as_ref().map(|label| Text::from(label.value.as_ref())),
 			direction: statement.direction,
 			weight,

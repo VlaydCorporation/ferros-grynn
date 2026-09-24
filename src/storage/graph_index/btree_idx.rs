@@ -109,14 +109,42 @@ pub(super) fn encode_standard_leaf<Address: PrimaryAddress + Ord>(
 	entries: &[ScalarIndexEntry<Address>],
 	posting_roots: &BTreeMap<&[u8], PageNo>,
 ) -> FerrosGrynnResult<()> {
+	let entries = entries
+		.iter()
+		.map(|entry| ScalarLeafEntry {
+			key: &entry.key,
+			inline_atoms: &entry.atoms[..entry.atoms.len().min(STANDARD_INLINE_ATOMS)],
+			total_count: entry.atoms.len(),
+			posting_root: posting_roots.get(entry.key.as_slice()).copied(),
+		})
+		.collect::<Vec<_>>();
+	encode_standard_leaf_parts(page, page_no, page_lsn, next, &entries)
+}
+
+/// Borrowed bounded data required to encode one standard scalar leaf entry.
+pub(super) struct ScalarLeafEntry<'entry, Address> {
+	pub(super) key: &'entry [u8],
+	pub(super) inline_atoms: &'entry [Address],
+	pub(super) total_count: usize,
+	pub(super) posting_root: Option<PageNo>,
+}
+
+/// Encodes one standard leaf from bounded inline atoms and preassigned posting
+/// roots without retaining a complete posting group.
+pub(super) fn encode_standard_leaf_parts<Address: PrimaryAddress>(
+	page: &mut AlignedPage,
+	page_no: PageNo,
+	page_lsn: PageLsn,
+	next: Option<PageNo>,
+	entries: &[ScalarLeafEntry<'_, Address>],
+) -> FerrosGrynnResult<()> {
 	let count = u16::try_from(entries.len())
 		.map_err(|_error| invalid_index("scalar leaf entry count exceeds u16"))?;
 	let area_start = LEAF_OFFSETS_OFFSET + entries.len() * size_of::<u16>();
 	let data_bytes = entries.iter().try_fold(0_usize, |total, entry| {
-		let inline = entry.atoms.len().min(STANDARD_INLINE_ATOMS);
 		total
 			.checked_add(entry.key.len())
-			.and_then(|total| total.checked_add(inline * DISK_ATOM_REF_BYTES))
+			.and_then(|total| total.checked_add(entry.inline_atoms.len() * DISK_ATOM_REF_BYTES))
 			.and_then(|total| total.checked_add(STANDARD_ENTRY_TRAILER_BYTES))
 			.ok_or_else(|| invalid_index("scalar leaf data length overflows usize"))
 	})?;
@@ -139,7 +167,7 @@ pub(super) fn encode_standard_leaf<Address: PrimaryAddress + Ord>(
 		let start = data_start + area_offset;
 		page.as_bytes_mut()[start..start + entry.key.len()].copy_from_slice(&entry.key);
 		let mut offset = start + entry.key.len();
-		for atom in entry.atoms.iter().take(STANDARD_INLINE_ATOMS) {
+		for atom in entry.inline_atoms {
 			write_u64(page.as_bytes_mut(), offset, atom.raw());
 			offset += DISK_ATOM_REF_BYTES;
 		}
@@ -152,19 +180,19 @@ pub(super) fn encode_standard_leaf<Address: PrimaryAddress + Ord>(
 		write_u16(
 			page.as_bytes_mut(),
 			offset + size_of::<u16>(),
-			u16::try_from(entry.atoms.len().min(STANDARD_INLINE_ATOMS))
+			u16::try_from(entry.inline_atoms.len())
 				.map_err(|_error| invalid_index("scalar inline count exceeds u16"))?,
 		);
 		write_u32(
 			page.as_bytes_mut(),
 			offset + 2 * size_of::<u16>(),
-			u32::try_from(entry.atoms.len())
+			u32::try_from(entry.total_count)
 				.map_err(|_error| invalid_index("scalar atom count exceeds u32"))?,
 		);
 		write_u64(
 			page.as_bytes_mut(),
 			offset + 2 * size_of::<u16>() + size_of::<u32>(),
-			posting_roots.get(entry.key.as_slice()).copied().unwrap_or(PageNo::NULL).get(),
+			entry.posting_root.unwrap_or(PageNo::NULL).get(),
 		);
 		area_offset = offset + STANDARD_ENTRY_TRAILER_BYTES - data_start;
 	}

@@ -5,6 +5,7 @@ use super::{
 	BaseAtom,
 	ClassId,
 	ClassSchema,
+	ClassSchemaMode,
 	ConflictKey,
 	GlobalAtomId,
 	GraphOccurrence,
@@ -22,7 +23,7 @@ use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, EdgeTopology, GraphId, GraphRef},
 	stats::StatisticsStore,
-	values::{Number, PropertyDictionary, PropertyKeyId, PropertyMap, RecordId, Text, Value},
+	values::{Number, PropertyDictionary, PropertyKeyId, PropertyMap, RecordId, Text, Type, Value},
 };
 
 /// One immutable MVCC root spanning base atoms and every graph occurrence.
@@ -62,19 +63,13 @@ impl DatabaseRoot {
 	) -> FerrosGrynnResult<GlobalAtomId> {
 		let mut context = index_context(&self.schema, &self.dictionary)?;
 		let prepared = self.indexes.prepare_base_insert(class, &properties, &mut context)?;
-		let mut atoms = self.atoms.as_ref().clone();
-		let mut indexes = self.indexes.as_ref().clone();
-		let mut statistics = self.statistics.as_ref().clone();
-		statistics.insert_base(
+		Arc::make_mut(&mut self.statistics).insert_base(
 			class
 				.id()
 				.ok_or_else(|| FerrosGrynnError::invalid_argument("atom class has no ClassId"))?,
 		)?;
-		let id = atoms.insert(class, record_id, properties)?;
-		indexes.apply_base_insert(prepared, id)?;
-		self.atoms = Arc::new(atoms);
-		self.indexes = Arc::new(indexes);
-		self.statistics = Arc::new(statistics);
+		let id = Arc::make_mut(&mut self.atoms).insert(class, record_id, properties)?;
+		Arc::make_mut(&mut self.indexes).apply_base_insert(prepared, id)?;
 		Ok(id)
 	}
 
@@ -87,19 +82,13 @@ impl DatabaseRoot {
 	) -> FerrosGrynnResult<()> {
 		let mut context = index_context(&self.schema, &self.dictionary)?;
 		let prepared = self.indexes.prepare_base_insert(class, &properties, &mut context)?;
-		let mut atoms = self.atoms.as_ref().clone();
-		let mut indexes = self.indexes.as_ref().clone();
-		let mut statistics = self.statistics.as_ref().clone();
-		statistics.insert_base(
+		Arc::make_mut(&mut self.statistics).insert_base(
 			class
 				.id()
 				.ok_or_else(|| FerrosGrynnError::invalid_argument("atom class has no ClassId"))?,
 		)?;
-		atoms.insert_at(id, class, record_id, properties)?;
-		indexes.apply_base_insert(prepared, id)?;
-		self.atoms = Arc::new(atoms);
-		self.indexes = Arc::new(indexes);
-		self.statistics = Arc::new(statistics);
+		Arc::make_mut(&mut self.atoms).insert_at(id, class, record_id, properties)?;
+		Arc::make_mut(&mut self.indexes).apply_base_insert(prepared, id)?;
 		Ok(())
 	}
 
@@ -321,9 +310,96 @@ impl DatabaseRoot {
 	/// Reconstructs all derived indexes and statistics after every normalized
 	/// source participating in a durable snapshot has been installed.
 	pub(crate) fn rebuild_derived_state(&mut self) -> FerrosGrynnResult<()> {
-		self.indexes = Arc::new(rebuild_index_store(self)?);
-		self.statistics = Arc::new(crate::stats::analyze_database(self)?);
+		let scratch = std::env::temp_dir().join("ferros-grynn-statistics");
+		self.rebuild_derived_state_at(&scratch)
+	}
+
+	/// Reconstructs derived state while bounding histogram sort memory below a
+	/// caller-owned scratch root.
+	pub(crate) fn rebuild_derived_state_at(
+		&mut self,
+		scratch_root: &std::path::Path,
+	) -> FerrosGrynnResult<()> {
+		self.rebuild_indexes()?;
+		self.rebuild_statistics_at(scratch_root)?;
 		Ok(())
+	}
+
+	/// Reconstructs every schema-defined and engine-owned index.
+	pub(crate) fn rebuild_indexes(&mut self) -> FerrosGrynnResult<()> {
+		self.indexes = Arc::new(rebuild_index_store(self)?);
+		Ok(())
+	}
+
+	/// Reconstructs exact counters and bulk histograms with bounded sort
+	/// memory.
+	pub(crate) fn rebuild_statistics_at(
+		&mut self,
+		scratch_root: &std::path::Path,
+	) -> FerrosGrynnResult<()> {
+		self.statistics = Arc::new(crate::stats::analyze_database_at(self, scratch_root)?);
+		Ok(())
+	}
+
+	/// Verifies the complete normalized atom/occurrence state selected by
+	/// `END IMPORT WITH VALIDATION`.
+	pub(crate) fn validate_full_import_state(&self) -> FerrosGrynnResult<()> {
+		for atom in self.atoms.atoms() {
+			let class = self
+				.schema
+				.class_by_id(atom.class_id())
+				.ok_or_else(|| invalid("base atom references an absent class"))?;
+			if class.name().as_str() != atom.record_id().class() || class.kind() != atom.kind() {
+				return Err(invalid("base atom identity disagrees with its class"));
+			}
+			validate_properties(&class, atom.properties().iter())?;
+			for (graph_id, local) in self.atoms.memberships(atom.id()).into_iter().flatten() {
+				let occurrence =
+					self.graph(*graph_id).and_then(|graph| graph.occurrence(*local)).ok_or_else(
+						|| invalid("reverse membership references an absent occurrence"),
+					)?;
+				if occurrence.global_id() != atom.id() {
+					return Err(invalid("reverse membership references the wrong global atom"));
+				}
+			}
+		}
+		for (graph_id, graph) in &self.graphs {
+			let schema = self
+				.schema
+				.graph(*graph_id)
+				.ok_or_else(|| invalid("graph root has no schema definition"))?;
+			if schema.reference() != graph.reference() {
+				return Err(invalid("graph root identity disagrees with its schema"));
+			}
+			for occurrence in graph.occurrences() {
+				let atom = self
+					.atom(occurrence.global_id())
+					.ok_or_else(|| invalid("graph occurrence references an absent base atom"))?;
+				if self.membership(*graph_id, atom.id()) != Some(occurrence.local_id()) {
+					return Err(invalid("graph occurrence is absent from reverse memberships"));
+				}
+				let class = self
+					.schema
+					.class_by_id(atom.class_id())
+					.ok_or_else(|| invalid("graph occurrence atom has no class"))?;
+				if let Some(overlay) = occurrence.overlay() {
+					validate_properties(
+						&class,
+						overlay.iter().filter_map(|(key, value)| match value {
+							OverlayValue::Value(value) => Some((key, value)),
+							OverlayValue::Hidden => None,
+						}),
+					)?;
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// Keeps engine-owned lookup structures but defers every schema-defined
+	/// index until import finalization.
+	pub(crate) fn defer_explicit_indexes(&mut self, retain_unique: bool) {
+		Arc::make_mut(&mut self.indexes).defer_explicit_indexes(retain_unique);
 	}
 
 	pub(crate) fn attach_node(
@@ -663,6 +739,37 @@ impl DatabaseRoot {
 		}
 		Ok(())
 	}
+}
+
+fn validate_properties<'value>(
+	class: &ClassSchema,
+	properties: impl IntoIterator<Item = (PropertyKeyId, &'value Value)>,
+) -> FerrosGrynnResult<()> {
+	for (key, value) in properties {
+		let field = class.fields().find(|field| field.key == Some(key));
+		if class.schema_mode() == ClassSchemaMode::Schemafull && field.is_none() {
+			return Err(invalid("schemafull atom contains an undeclared property"));
+		}
+		if let Some(field) = field
+			&& !compatible_type(field.value_type(), &value.value_type())
+		{
+			return Err(invalid("atom property value disagrees with its schema field"));
+		}
+	}
+	Ok(())
+}
+
+fn compatible_type(expected: &Type, actual: &Type) -> bool {
+	expected == actual
+		|| matches!(expected, Type::Any)
+		|| matches!(expected, Type::Number)
+			&& matches!(actual, Type::Number | Type::Int | Type::Float | Type::Decimal)
+		|| matches!(expected, Type::Option(inner) if matches!(actual, Type::None | Type::Null) || compatible_type(inner, actual))
+		|| matches!(expected, Type::Union(types) if types.iter().any(|ty| compatible_type(ty, actual)))
+}
+
+fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
+	FerrosGrynnError::invalid_storage_file(reason)
 }
 
 #[cfg(test)]

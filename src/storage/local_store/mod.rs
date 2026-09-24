@@ -2,11 +2,15 @@
 
 mod catalog;
 mod checkpoint;
+mod cleanup;
 mod files;
 mod image;
 mod layout;
 mod open;
 mod statistics;
+
+#[cfg(test)]
+mod tests;
 
 use std::{
 	collections::BTreeMap,
@@ -20,8 +24,14 @@ use parking_lot::Mutex;
 
 use self::{
 	checkpoint::checkpoint,
-	files::{create_generation_files, stage_generation},
-	image::build_generation,
+	cleanup::cleanup_orphan_generations,
+	files::{
+		create_generation_files,
+		create_import_generation_files,
+		stage_generation,
+		stage_import_catalog,
+	},
+	image::{build_generation, build_import_generation},
 	layout::{DATABASE_CATALOG_ROOT, FILE_CATALOG_ROOT, GenerationBindings, invalid},
 	open::{OpenedLocalState, open_local_state},
 };
@@ -31,6 +41,7 @@ use super::{
 	consts::{DATABASE_SUPERBLOCK_FILE, WAL_DIRECTORY},
 	database_superblock::DatabaseSuperblock,
 	file_registry::FileRegistry,
+	graph_index::cleanup_external_index_sort,
 	graph_pages::GraphArenaBindings,
 	graph_store::GraphFileSet,
 	graph_superblock::GraphSuperblock,
@@ -41,10 +52,26 @@ use super::{
 	wal::FrameWal,
 };
 use crate::{
-	datastore::{CheckpointMode, DatabaseRoot},
+	datastore::{CheckpointMode, DatabaseRoot, IndexId},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphId,
 };
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportFailurePoint {
+	None,
+	AfterBuild,
+	AfterFileSync,
+	AfterCatalogStage,
+	BeforeWalCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+	static IMPORT_FAILURE_POINT: std::cell::Cell<ImportFailurePoint> =
+		const { std::cell::Cell::new(ImportFailurePoint::None) };
+}
 
 /// Physical bindings retained with one current catalog generation.
 pub(super) struct GraphBinding {
@@ -79,6 +106,11 @@ pub(crate) struct LocalStore {
 }
 
 impl LocalStore {
+	/// Returns the database-local root used by bounded import scratch sessions.
+	pub(crate) fn import_scratch_root(&self) -> &Path {
+		&self.root
+	}
+
 	/// Creates a new empty local database without overwriting an existing path.
 	pub(crate) fn create(
 		root: &Path,
@@ -110,6 +142,7 @@ impl LocalStore {
 		checkpoint_interval: Duration,
 	) -> FerrosGrynnResult<(Self, DatabaseRoot)> {
 		let lock = DatabaseLock::acquire(root)?;
+		cleanup_external_index_sort(root)?;
 		let io = PageIo::new(io_mode)?;
 		let engine = HybridReadEngine::new(pool_pages);
 		let database = DatabaseRoot::default();
@@ -174,6 +207,7 @@ impl LocalStore {
 		checkpoint_interval: Duration,
 	) -> FerrosGrynnResult<(Self, DatabaseRoot)> {
 		let lock = DatabaseLock::acquire(root)?;
+		cleanup_external_index_sort(root)?;
 		let io = PageIo::new(io_mode)?;
 		let engine = HybridReadEngine::new(pool_pages);
 		let (wal, opened) = open_local_state(root, &engine, io.file_open_mode())?;
@@ -187,6 +221,7 @@ impl LocalStore {
 			atom_superblock,
 			graph_superblocks,
 		} = opened;
+		cleanup_orphan_generations(root, &file_catalog)?;
 		let state = LocalState {
 			database_superblock_path: root.join(DATABASE_SUPERBLOCK_FILE),
 			database_superblock,
@@ -214,6 +249,23 @@ impl LocalStore {
 
 	/// Persists one already validated MVCC root before it becomes visible.
 	pub(crate) fn persist_root(&self, database: &DatabaseRoot) -> FerrosGrynnResult<()> {
+		self.persist_generation(database, false).map(drop)
+	}
+
+	/// Persists one import generation directly to unreachable home files and
+	/// publishes only its catalogs through one WAL transaction.
+	pub(crate) fn persist_import_root(
+		&self,
+		database: &DatabaseRoot,
+	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
+		self.persist_generation(database, true)
+	}
+
+	fn persist_generation(
+		&self,
+		database: &DatabaseRoot,
+		import: bool,
+	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
 		let mut state = self.state.lock();
 		self.checkpoint_if_due(&mut state)?;
 		let expected = self
@@ -226,16 +278,49 @@ impl LocalStore {
 		if database.commit_ts != expected {
 			return Err(invalid("MVCC and frame-WAL commit clocks diverged"));
 		}
-		let generation = build_generation(database, state.file_catalog.next_file_instance_id)?;
-		create_generation_files(&self.root, &generation, false)?;
+		let (mut generation, mut unpublished) = if import {
+			let (generation, unpublished) = build_import_generation(
+				database,
+				state.file_catalog.next_file_instance_id,
+				&self.root,
+			)?;
+			(generation, Some(unpublished))
+		} else {
+			(build_generation(database, state.file_catalog.next_file_instance_id)?, None)
+		};
+		#[cfg(test)]
+		if import {
+			inject_import_failure(ImportFailurePoint::AfterBuild)?;
+		}
+		if import {
+			create_import_generation_files(&self.root, &generation)?;
+		} else {
+			create_generation_files(&self.root, &generation, false)?;
+		}
+		#[cfg(test)]
+		if import {
+			inject_import_failure(ImportFailurePoint::AfterFileSync)?;
+		}
 		let registry = FileRegistry::open(
 			generation.file_catalog.registrations(&self.root),
 			self.io.file_open_mode(),
 			&rapidhash::RapidHashSet::default(),
 		)?;
 		let mut tx = self.wal.begin_tx()?;
-		stage_generation(&mut tx, &generation)?;
+		if import {
+			stage_import_catalog(&mut tx, &generation)?;
+		} else {
+			stage_generation(&mut tx, &generation)?;
+		}
+		#[cfg(test)]
+		if import {
+			inject_import_failure(ImportFailurePoint::AfterCatalogStage)?;
+			inject_import_failure(ImportFailurePoint::BeforeWalCommit)?;
+		}
 		let outcome = self.wal.commit_tx(tx)?;
+		if let Some(generation) = &mut unpublished {
+			generation.publish();
+		}
 		if outcome.commit_ts().get() != database.commit_ts {
 			return Err(invalid("WAL published an unexpected logical commit timestamp"));
 		}
@@ -245,7 +330,7 @@ impl LocalStore {
 		state.registry = registry;
 		state.atom_superblock = generation.atom_superblock;
 		state.graph_superblocks = generation.graph_superblocks;
-		Ok(())
+		Ok(std::mem::take(&mut generation.index_timings))
 	}
 
 	/// Runs an explicit database-wide checkpoint.
@@ -269,6 +354,17 @@ impl LocalStore {
 		}
 		Ok(())
 	}
+}
+
+#[cfg(test)]
+fn inject_import_failure(point: ImportFailurePoint) -> FerrosGrynnResult<()> {
+	IMPORT_FAILURE_POINT.with(|selected| {
+		if selected.get() == point {
+			Err(FerrosGrynnError::storage_io_failure("injected import publication failure"))
+		} else {
+			Ok(())
+		}
+	})
 }
 
 fn database_name(path: &Path) -> FerrosGrynnResult<String> {

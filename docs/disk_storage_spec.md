@@ -11,8 +11,9 @@ performance gate и Windows GA-core gate из [full_plan.md](full_plan.md) (эт
 sync/NativeAsync не блокируют эту фиксацию: после неё несовместимый Linux layout требует format
 v2 и явной миграции.
 
-**Целевая ревизия этапа 8.1:** `approved-for-implementation`. Документационные шаги
-A0–A4/S0–S6 и кодовые шаги A5–A8 завершены; A9–A16 остаются открытыми.
+**Целевая ревизия этапа 8.1:** `implemented`. Шаги A0–A16 завершены 2026-09-22;
+evidence и ограничения зафиксированы в
+[graph_first_atom_model_report.md](reports/graph_first_atom_model_report.md).
 Она заменяет graph-owned atom/table candidate на database-level AtomStore и graph-local
 occurrences. При конфликте с сохранёнными ниже legacy layout-примечаниями действуют §§2, 4, 7,
 10–11, 17–18 и 22 в редакции 8.1. Cutover принимает только `FGDC v7`/`FGFC v5`; миграции
@@ -3320,6 +3321,16 @@ LeafEntry (24 байта):
 
 Путь состоит из четырёх переиспользуемых компонентов; они одни и те же для `DEFINE INDEX` на непустом class, `REBUILD INDEX`, `COMPACT INDEX` и режима импорта (`gql_spec` §7.11).
 
+`BEGIN IMPORT` использует этот путь только внутри недостижимого COW-поколения.
+`SEGMENT SIZE` ограничивает private mutation/read/write state, но не публикует промежуточный
+commit и не создаёт recovery point. Primary identity и структуры ссылочной корректности
+поддерживаются во время staging; deferred secondary/label/count/effective indexes и statistics
+строятся перед публикацией. Готовые страницы сразу записываются в side-files, все файлы
+синхронизируются, после чего один catalog/WAL commit публикует поколение. Ошибка до этой точки
+оставляет прежний snapshot единственным достижимым; startup-GC удаляет orphan generation и
+external-sort sessions. Rollback усечением live-файлов и resume незавершённого import в format v1
+не поддерживаются.
+
 #### 20.13.1. Внешняя сортировка
 
 Логический ключ сортировки — `(encoded_key, DiskAtomRef)` (сравнение raw `DiskAtomRef` как
@@ -4127,10 +4138,9 @@ TensorCachePage инвалидируется при любом изменени�
 | `FG_INDEX_RTREE_FILL_FACTOR`          | f64   | 0.95      | Заполнение узлов R-tree при STR-упаковке                                       |
 | `FG_INDEX_PENDING_MAX`                | usize | 1000000   | Порог очереди `DEFER` → индекс `stale` + пересборка                            |
 | `FG_HNSW_BUILD_MEM`                   | usize | 2 ГиБ     | Бюджет памяти на построение HNSW (отдельно от кэша обслуживания)               |
-| `FG_IMPORT_COMMIT_ROWS`               | usize | 1000000   | Размер сегментного коммита при импорте                                         |
+| `FG_IMPORT_SEGMENT_ITEMS`             | usize | 1000000   | Applied items во внутреннем private segment импорта                            |
 | `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | usize | 1000      | Сколько нарушений описывается подробно                                         |
-| `FG_IMPORT_REJECT_LIMIT`              | usize | 0         | Допустимое число нарушений до прерывания                                       |
-| `FG_IMPORT_NO_SLOT_REUSE`             | bool  | true      | Импорт только дописывает → возможен откат усечением                            |
+| `FG_IMPORT_REJECT_LIMIT`              | usize | —         | Явный положительный предел только для `ON VIOLATION SKIP`                      |
 | `FG_BULK_WAL_MODE`                    | enum  | `minimal` | `minimal` \| `full`; `full` станет обязательным при появлении репликации/PITR  |
 
 **Статистика** (§19.5)

@@ -1,14 +1,21 @@
 //! Complete immutable AtomStore generation, WAL publication and checkpoint-COW
 //! metadata codec.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use super::{
 	atom_page::{ATOM_SLOTS_PER_PAGE, AtomHotPage, AtomHotSlot, PropertyRef, atom_location},
 	atom_store_superblock::AtomStoreSuperblock,
 	catalog::FileCatalog,
 	file_registry::FileRegistry,
-	graph_index::{BuiltPrimaryIndex, PrimaryIndexEntry, build_primary_index, scan_primary_index},
+	graph_index::{
+		BuiltPrimaryIndex,
+		ExternalIndexSorter,
+		PrimaryIndexEntry,
+		SortedIndexRecords,
+		build_primary_index,
+		scan_primary_index,
+	},
 	image_io::{backfill_pages, read_pages, read_pages_cached, stage_pages},
 	metadata_cow::{select_checkpoint_page, write_checkpoint_page},
 	page::{AlignedPage, PageLsn, PageNo},
@@ -138,11 +145,11 @@ impl AtomStoreFileSet {
 }
 
 /// Complete logical AtomStore version staged by one database WAL transaction.
-pub(super) struct DurableAtomStoreImage {
+pub(super) struct DurableAtomStoreImage<Primary = BuiltPrimaryIndex> {
 	/// Logical metadata published last in the WAL transaction.
 	pub(super) superblock: AtomStoreSuperblock,
 	/// Atom, property, and primary-index data pages.
-	pub(super) atoms: BuiltAtomStoreImage,
+	pub(super) atoms: BuiltAtomStoreImage<Primary>,
 	/// Property-key dictionary pages for the same logical version.
 	pub(super) dictionary: BuiltPropertyDictionary,
 }
@@ -165,6 +172,34 @@ pub(super) fn build_durable_atom_store_image_with_context(
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<DurableAtomStoreImage> {
 	let image = build_atom_store_image_with_context(atoms, schema, context, PageLsn::ZERO)?;
+	finish_durable_atom_store_image(atoms, image, context)
+}
+
+/// Builds bounded primary-index input for one unreachable import generation.
+pub(super) fn build_import_atom_store_image_with_context(
+	atoms: &AtomStoreRoot,
+	schema: &SchemaCatalog,
+	context: &mut EncodeContext,
+	scratch_root: &Path,
+) -> FerrosGrynnResult<DurableAtomStoreImage<SortedIndexRecords>> {
+	let mut sorter = ExternalIndexSorter::new(scratch_root);
+	let (atoms_hot, properties) =
+		build_atom_store_data_with_context(atoms, schema, context, PageLsn::ZERO, |key, atom| {
+			sorter.push(key, atom)
+		})?;
+	let image = BuiltAtomStoreImage {
+		atoms_hot,
+		properties,
+		primary: sorter.finish()?,
+	};
+	finish_durable_atom_store_image(atoms, image, context)
+}
+
+fn finish_durable_atom_store_image<Primary>(
+	atoms: &AtomStoreRoot,
+	image: BuiltAtomStoreImage<Primary>,
+	context: &EncodeContext,
+) -> FerrosGrynnResult<DurableAtomStoreImage<Primary>> {
 	let dictionary = build_property_dictionary(context.property_dictionary(), PageLsn::ZERO)?;
 	let mut node_count = 0_u64;
 	let mut edge_count = 0_u64;
@@ -348,13 +383,13 @@ pub(super) fn backfill_atom_store_checkpoint(
 }
 
 /// Immutable physical files produced for one AtomStore generation.
-pub(super) struct BuiltAtomStoreImage {
+pub(super) struct BuiltAtomStoreImage<Primary = BuiltPrimaryIndex> {
 	/// Dense global atom hot pages.
 	pub(super) atoms_hot: Vec<AlignedPage>,
 	/// Slotted and large property-record pages.
 	pub(super) properties: Vec<AlignedPage>,
 	/// Global primary-index tree.
-	pub(super) primary: BuiltPrimaryIndex,
+	pub(super) primary: Primary,
 }
 
 /// Builds the AtomStore data and primary-index files below superblock ceilings.
@@ -377,6 +412,30 @@ fn build_atom_store_image_with_context(
 	context: &mut EncodeContext,
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<BuiltAtomStoreImage> {
+	let mut primary = Vec::with_capacity(atoms.atoms().len());
+	let (atoms_hot, properties) =
+		build_atom_store_data_with_context(atoms, schema, context, page_lsn, |key, atom| {
+			primary.push(PrimaryIndexEntry {
+				key,
+				atom,
+			});
+			Ok(())
+		})?;
+	primary.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+	Ok(BuiltAtomStoreImage {
+		atoms_hot,
+		properties,
+		primary: build_primary_index(&primary, page_lsn)?,
+	})
+}
+
+fn build_atom_store_data_with_context(
+	atoms: &AtomStoreRoot,
+	schema: &SchemaCatalog,
+	context: &mut EncodeContext,
+	page_lsn: PageLsn,
+	mut primary: impl FnMut(Vec<u8>, GlobalAtomId) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<(Vec<AlignedPage>, Vec<AlignedPage>)> {
 	let page_count = atoms.slot_capacity().div_ceil(ATOM_SLOTS_PER_PAGE as usize);
 	let mut hot_pages = (0..page_count)
 		.map(|page| {
@@ -398,7 +457,6 @@ fn build_atom_store_image_with_context(
 	}
 
 	let mut properties = PropertyStoreBuilder::default();
-	let mut primary = Vec::with_capacity(atoms.atoms().len());
 	for atom in atoms.atoms() {
 		validate_atom_schema(atom, schema)?;
 		let record = encode_record_id(atom.record_id(), context)?;
@@ -413,17 +471,9 @@ fn build_atom_store_image_with_context(
 			atom.id(),
 			AtomHotSlot::live(atom.kind(), atom.class_id(), record_ref, property_ref)?,
 		)?;
-		primary.push(PrimaryIndexEntry {
-			key: record,
-			atom: atom.id(),
-		});
+		primary(record, atom.id())?;
 	}
-	primary.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-	Ok(BuiltAtomStoreImage {
-		atoms_hot: hot_pages.into_iter().map(|page| *page.finish()).collect(),
-		properties: properties.finish()?,
-		primary: build_primary_index(&primary, page_lsn)?,
-	})
+	Ok((hot_pages.into_iter().map(|page| *page.finish()).collect(), properties.finish()?))
 }
 
 /// Reopens one complete AtomStore image using the capacity published by its

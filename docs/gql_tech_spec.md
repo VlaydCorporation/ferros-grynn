@@ -52,8 +52,9 @@ bag, итог statement — `array<object>` без внутренних иден
 ## Технический профиль коррекции 8.1
 
 **Статус:** ненормативный implementation target, утверждённый нормативными разделами 8.1
-`gql_spec.md`, `gql_grammar.md` и `disk_storage_spec.md`. Документационные A0–A4 и in-memory
-A5–A7 завершены; A8 реализует durable AtomStore, а graph occurrences остаются A9.
+`gql_spec.md`, `gql_grammar.md` и `disk_storage_spec.md`. Шаги A0–A16 завершены
+2026-09-22; evidence зафиксирован в
+[graph_first_atom_model_report.md](reports/graph_first_atom_model_report.md).
 
 Целевой read pipeline:
 
@@ -143,7 +144,7 @@ ClassScan / RecordLookup
 | Компонент         | Граница                                            | При нарушении                         |
 |-------------------|----------------------------------------------------|---------------------------------------|
 | BufferPool        | `FG_PAGE_BUFFER_PAGES` — RAM-бюджет на кеш страниц | Eviction (Clock-Pro), WAL-first flush |
-| TxWriteSet        | `FG_TX_WRITE_SET_MAX_BYTES` = 256 МиБ              | Abort до публикации; import дробится  |
+| TxWriteSet        | `FG_TX_WRITE_SET_MAX_BYTES` = 256 МиБ              | Abort до публикации; import ротирует private segments |
 | Statement timeout | `statement_timeout_ms` / `TIMEOUT` clause          | Cancel query                          |
 | Snapshot age      | `max_snapshot_age`                                 | Force-close stale snapshots           |
 | Checkpoint        | `CheckpointPolicy` = 25% / 300 секунд              | Passive backfill; Restart — явно      |
@@ -1103,11 +1104,16 @@ vertical slice реализован только in-memory sort + bottom-up pack
 1. **Внешняя сортировка** по непрозрачным ключам. Компаратор — `memcmp`, поскольку кодирование ключей order-preserving; сортируется `encoded_key ‖ DiskAtomRef`, что даёт тотальный порядок и попутно упорядочивает posting-списки.
 2. **Упаковщик снизу вверх** — листья по fill factor, posting-страницы, внутренние уровни. `inline_count` известен заранее, поэтому запись пишется в финальной форме и не переписывается.
 3. **Side-file + одна WAL-запись + подмена поколения.** Тело сборки не журналируется: файл недостижим из каталога, поэтому крах в процессе безвреден. Сборка индекса на 3 ГБ даёт ~200 байт журнала.
-4. **Import epoch** — отсоединённые индексы, отложенные ограничения, сегментные коммиты.
+4. **Import epoch** — private COW root, bounded transaction segments, deferred rebuild и одна
+   atomic catalog/WAL publication. Segment не является видимым commit.
 
 Планировщик обязан задействовать bulk-путь автоматически при `DEFINE INDEX` на непустом class scope, при `REBUILD INDEX` и при `COMPACT INDEX`; `CONCURRENTLY` реализуется поверх него (снимок → сборка в side-file → добор небольшой очереди → атомарная подмена).
 
-**Отложенная проверка ограничений — условие применимости, а не оптимизация.** `VALIDATE ON_MUTATION` для `DAG` делает обход на каждое ребро, то есть `O(E·(V+E))` на загрузку; отложенная проверка — один Tarjan за `O(V+E)`. Режим импорта обязан форсировать `DEFERRED`.
+**Отложенная проверка ограничений — default bulk-path, а не единственный режим.**
+`VALIDATE ON_MUTATION` для `DAG` делает обход на каждое ребро, то есть `O(E·(V+E))` на
+загрузку; отложенная проверка — один проход `O(V+E)`. `CONSTRAINTS IMMEDIATE` сохраняется
+для небольших импортов. Любой deferred whole-graph failure отбрасывает private root до
+publication.
 
 **Производные индексы** (reachability, neighbourhood, path) построчного сопровождения не поддерживают в принципе: одна вставка ребра может инвалидировать `Θ(n)` меток. Они объявляются снимковыми артефактами, актуальными на `build_lsn`; мутация топологии переводит их в `stale`, и планировщик молча ими не пользуется — он откатывается к `ON_DEMAND`.
 

@@ -10,7 +10,7 @@ use super::*;
 #[non_exhaustive]
 pub struct AttachStatement {
 	pub record: DmlTarget,
-	pub graph: Identifier,
+	pub graph: Option<Identifier>,
 	pub label: Option<Identifier>,
 }
 
@@ -19,7 +19,7 @@ pub struct AttachStatement {
 #[non_exhaustive]
 pub struct DetachStatement {
 	pub record: DmlTarget,
-	pub graph: Identifier,
+	pub graph: Option<Identifier>,
 	pub cascade: bool,
 }
 
@@ -34,7 +34,7 @@ pub struct RelateStatement {
 	pub label: Option<Identifier>,
 	pub direction: MatchDirection,
 	pub target: DmlTarget,
-	pub graph: Identifier,
+	pub graph: Option<Identifier>,
 	pub weight: Option<Expr>,
 	pub data: Option<DmlData>,
 	pub returning: Option<DmlReturn>,
@@ -47,9 +47,16 @@ impl Parser<'_> {
 		context: &mut Stk,
 	) -> FerrosGrynnResult<AttachStatement> {
 		let record = self.exact_graph_target(context, "ATTACH").await?;
-		self.expect_keyword(keywords::TO, "Expected `TO GRAPH` after ATTACH target.")?;
-		self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `TO`.")?;
-		let graph = self.identifier()?;
+		let graph = if self.consume_keyword(keywords::TO).is_some() {
+			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `TO`.")?;
+			Some(self.identifier()?)
+		} else if self.in_import {
+			None
+		} else {
+			return Err(
+				self.syntax("Expected `TO GRAPH` after ATTACH target.", self.current().span)
+			);
+		};
 		let label = if self.consume_keyword(keywords::LABEL).is_some() {
 			Some(self.identifier()?)
 		} else {
@@ -68,9 +75,16 @@ impl Parser<'_> {
 		context: &mut Stk,
 	) -> FerrosGrynnResult<DetachStatement> {
 		let record = self.exact_graph_target(context, "DETACH").await?;
-		self.expect_keyword(keywords::FROM, "Expected `FROM GRAPH` after DETACH target.")?;
-		self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `FROM`.")?;
-		let graph = self.identifier()?;
+		let graph = if self.consume_keyword(keywords::FROM).is_some() {
+			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `FROM`.")?;
+			Some(self.identifier()?)
+		} else if self.in_import {
+			None
+		} else {
+			return Err(
+				self.syntax("Expected `FROM GRAPH` after DETACH target.", self.current().span)
+			);
+		};
 		let cascade = self.consume_keyword(keywords::CASCADE).is_some();
 		self.finish_dml("DETACH")?;
 		Ok(DetachStatement {
@@ -121,9 +135,14 @@ impl Parser<'_> {
 			_ => return Err(self.syntax("Invalid RELATE direction.", suffix_token.span)),
 		};
 		let target = self.exact_graph_target(context, "RELATE endpoint").await?;
-		self.expect_keyword(keywords::IN, "Expected `IN GRAPH` after RELATE path.")?;
-		self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `IN`.")?;
-		let graph = self.identifier()?;
+		let graph = if self.consume_keyword(keywords::IN).is_some() {
+			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `IN`.")?;
+			Some(self.identifier()?)
+		} else if self.in_import {
+			None
+		} else {
+			return Err(self.syntax("Expected `IN GRAPH` after RELATE path.", self.current().span));
+		};
 		let weight = if self.consume_keyword(keywords::WEIGHTED).is_some() {
 			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else {

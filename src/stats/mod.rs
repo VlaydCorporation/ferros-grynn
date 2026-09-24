@@ -2,11 +2,12 @@
 //! occurrences.
 
 mod analyze;
+mod bounded_histogram;
 mod delta;
 mod model;
 mod store;
 
-pub(crate) use analyze::analyze_database;
+pub(crate) use analyze::{analyze_database, analyze_database_at};
 pub use model::{
 	BaseStatistics,
 	DegreeBucket,

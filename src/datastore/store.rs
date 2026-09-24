@@ -18,11 +18,13 @@ use super::{
 	DatastoreOptions,
 	GraphSchema,
 	InMemoryOptions,
+	IsolationLevel,
 	LocalOptions,
 	SchemaCatalog,
 	StoreBackend,
 	StoreInner,
 	Transaction,
+	TransactionAccess,
 	TransactionOptions,
 	validate_local_options,
 };
@@ -30,7 +32,7 @@ use crate::{
 	gql_status::FerrosGrynnResult,
 	graph::GraphId,
 	storage::LocalStore,
-	values::PropertyDictionary,
+	values::{Object, PropertyDictionary},
 };
 
 /// Database owning one global atom registry and any number of graph views.
@@ -98,6 +100,7 @@ impl Datastore {
 				next_transaction: AtomicU64::new(1),
 				next_schema_id: AtomicU64::new(next_schema_id),
 				next_graph_id: AtomicU64::new(next_graph_id),
+				import_owner: AtomicU64::new(0),
 				current: RwLock::new(Arc::new(root)),
 				commit: Mutex::new(()),
 			}),
@@ -123,6 +126,61 @@ impl Datastore {
 			options,
 			root,
 		)
+	}
+
+	/// Parses, analyzes, and executes one GrynQL program in an automatic
+	/// transaction or atomic import session.
+	///
+	/// # Errors
+	///
+	/// Returns parser, analysis, transaction, persistence, or publication
+	/// failures. Statement execution failures remain in their query result.
+	pub fn execute(
+		&self,
+		source: &str,
+		variables: &Object,
+	) -> FerrosGrynnResult<Vec<crate::gql::QueryResult>> {
+		self.execute_with_settings(source, variables, crate::gql::ParserSettings::default())
+	}
+
+	/// Executes one GrynQL program with explicit parser settings.
+	///
+	/// # Errors
+	///
+	/// Returns parser, analysis, transaction, persistence, or publication
+	/// failures.
+	pub fn execute_with_settings(
+		&self,
+		source: &str,
+		variables: &Object,
+		settings: crate::gql::ParserSettings,
+	) -> FerrosGrynnResult<Vec<crate::gql::QueryResult>> {
+		let program = crate::gql::parse(source, settings)?;
+		if let [
+			crate::gql::Statement {
+				kind: crate::gql::StatementKind::Import(statement),
+				..
+			},
+		] = program.statements.as_slice()
+		{
+			return crate::gql::import::execute_import(self, source, statement, variables)
+				.map(|result| vec![result]);
+		}
+		let mut transaction = self.begin_with(TransactionOptions::new(
+			IsolationLevel::Serializable,
+			if crate::gql::program_mutates_state(&program) {
+				TransactionAccess::ReadWrite
+			} else {
+				TransactionAccess::ReadOnly
+			},
+		));
+		let results =
+			crate::gql::execute_parsed_transaction(&mut transaction, source, &program, variables)?;
+		if results.iter().any(|result| result.result.is_err()) {
+			return Ok(results);
+		}
+		transaction.commit()?;
+		Ok(results)
 	}
 
 	/// Returns the selected backend and resource limits.

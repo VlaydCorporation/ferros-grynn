@@ -123,3 +123,4 @@ pub mod prototype_api {
 		pub use crate::graph::GraphId;
 	}
 }
+pub(crate) use graph_index::{ExternalIndexSorter, SortedIndexRecords};

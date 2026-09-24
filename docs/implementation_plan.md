@@ -1,5 +1,11 @@
 # Ferros-Grynn — План реализации (Implementation Plan)
 
+> **Статус:** superseded исторический план. Единственным источником текущего
+> прогресса является [`full_plan.md`](full_plan.md); graph-first переход A0–A16
+> завершён и подтверждён
+> [`reports/graph_first_atom_model_report.md`](reports/graph_first_atom_model_report.md).
+> Промежуточные статусы ниже сохранены как история и не являются backlog.
+
 *Версия 0.1-draft.*
 
 Этот файл — **производный** документ. Он собирает весь материал, относящийся к реализации на
@@ -26,7 +32,7 @@ Rust и к планированию работ, который ранее был
 ### Коррекция 8.1: graph-first атомы
 
 [`rework_plan.md`](rework_plan.md) — обязательный barrier перед всеми кодовыми этапами 9–31.
-Документационные A0–A4/S0–S6 и кодовые A5–A8 завершены; A9–A16 остаются открытыми.
+Graph-first переход A0–A16 и спецификационные S0–S6 завершены.
 Целевая модель:
 
 - `CLASS`, а не TABLE, задаёт namespace `RecordId = class:id`, immutable `NODE|EDGE`

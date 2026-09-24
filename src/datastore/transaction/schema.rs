@@ -67,7 +67,7 @@ impl Transaction {
 	/// Returns a schema, identity-capacity, read-only, snapshot, or
 	/// write-budget error.
 	pub fn define_field(&mut self, class: &str, mut field: ClassField) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let mut definition = self.require_class(class)?;
 		let class_id = definition.id().ok_or_else(|| {
@@ -90,7 +90,7 @@ impl Transaction {
 	/// Returns a schema, dependency, data, read-only, snapshot, or write-budget
 	/// error.
 	pub fn overwrite_field(&mut self, class: &str, field: ClassField) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let mut definition = self.require_class(class)?;
 		let position = definition
@@ -123,7 +123,7 @@ impl Transaction {
 	///
 	/// Returns an error when data or an index still depends on the field.
 	pub fn remove_field(&mut self, class: &str, name: &str) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let mut definition = self.require_class(class)?;
 		let position = definition
@@ -153,7 +153,7 @@ impl Transaction {
 	/// Returns a schema, graph, uniqueness, identity-capacity, or resource
 	/// error.
 	pub fn define_index(&mut self, class: &str, mut index: ClassIndex) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		self.validate_index_scope(index.scope())?;
 		index.id = Some(IndexId::from_schema_id(self.store.inner.allocate_schema_id()?));
@@ -168,7 +168,7 @@ impl Transaction {
 	/// Returns a schema, graph, uniqueness, read-only, snapshot, or resource
 	/// error.
 	pub fn overwrite_index(&mut self, class: &str, mut index: ClassIndex) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		self.validate_index_scope(index.scope())?;
 		let mut definition = self.require_class(class)?;
@@ -190,7 +190,7 @@ impl Transaction {
 	///
 	/// Returns a schema, read-only, snapshot, or write-budget error.
 	pub fn prepare_index_removal(&mut self, class: &str, name: &str) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let mut definition = self.require_class(class)?;
 		let index = definition
@@ -209,7 +209,7 @@ impl Transaction {
 	///
 	/// Returns a schema, read-only, snapshot, or write-budget error.
 	pub fn remove_index(&mut self, class: &str, name: &str) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let mut definition = self.require_class(class)?;
 		let position = definition
@@ -231,7 +231,7 @@ impl Transaction {
 		class: &str,
 		mode: ClassSchemaMode,
 	) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let mut definition = self.require_class(class)?;
 		if mode == ClassSchemaMode::Schemafull && self.class_has_undeclared_properties(&definition)
@@ -251,7 +251,7 @@ impl Transaction {
 	/// Returns an error when the class is absent, owns atoms, or mutation
 	/// policy rejects the operation.
 	pub fn remove_class(&mut self, name: &str) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let class = self.require_class(name)?;
 		let id = class.id().ok_or_else(|| {
@@ -270,7 +270,7 @@ impl Transaction {
 	/// Returns an error when the graph is absent or mutation policy rejects the
 	/// operation.
 	pub fn remove_graph(&mut self, name: &str) -> FerrosGrynnResult<()> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let graph = self
 			.working
@@ -316,7 +316,8 @@ impl Transaction {
 	fn validate_index_scope(&self, scope: IndexScope) -> FerrosGrynnResult<()> {
 		if let IndexScope::Effective {
 			graph,
-		} = scope && self.working.schema.graph(graph).is_none()
+		} = scope
+			&& self.working.schema.graph(graph).is_none()
 		{
 			return Err(FerrosGrynnError::graph_does_not_exist(graph.to_string()));
 		}

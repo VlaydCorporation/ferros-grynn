@@ -393,6 +393,18 @@ define_status_codes!(
 		},
 		hint: "Retry the operation in a new transaction.",
 	},
+	ImportInProgress, "FG-25F03" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Transaction,
+		subcondition: "import in progress",
+		message: "A database-wide import is in progress; concurrent writers are not allowed.",
+		hint: "Retry the complete write after the import finishes.",
+	},
 	SerializationFailure, "FG-40001" => {
 		kind: Error {
 			classification: ErrorClassification::TransientError,
@@ -1001,6 +1013,20 @@ define_status_codes!(
 			transaction: u64 => DisplayValue,
 			actual_bytes: u64 => DisplayValue,
 			maximum_bytes: u64 => DisplayValue,
+		},
+	},
+	ImportRejectLimitExceeded, "FG-54F08" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Transaction,
+		subcondition: "import reject limit exceeded",
+		message: "Import skipped more than the configured limit of {limit} items.",
+		params: {
+			limit: u64 => DisplayValue,
 		},
 	},
 	UnexpectedExternalFailure, "FG-50F00" => {

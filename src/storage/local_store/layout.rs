@@ -28,6 +28,9 @@ pub(super) struct FileImage {
 	pub(super) entry: FileCatalogEntry,
 	pub(super) page_numbers: Vec<PageNo>,
 	pub(super) pages: Vec<AlignedPage>,
+	/// Exact page count for an import side-file already written and synced by
+	/// its bounded streaming builder.
+	pub(super) prewritten_page_count: Option<u64>,
 }
 
 /// Exact roots required to reopen one full normalized generation.
@@ -84,6 +87,41 @@ impl LayoutBuilder {
 			},
 			page_numbers,
 			pages,
+			prewritten_page_count: None,
+		});
+		Ok(file_id)
+	}
+
+	/// Registers one immutable side-file that a streaming builder already
+	/// wrote and synchronized below the unpublished generation directory.
+	pub(super) fn add_prewritten(
+		&mut self,
+		space_id: DataSpaceId,
+		kind: DataFileKind,
+		role: DataFileRole,
+		path: String,
+		page_count: u64,
+	) -> FerrosGrynnResult<DataFileId> {
+		if page_count == 0 {
+			return Err(invalid("prewritten data file is empty"));
+		}
+		let file_id = DataFileId::new(self.next_file_instance_id, kind)
+			.ok_or_else(|| invalid("physical file identity clock is exhausted"))?;
+		self.next_file_instance_id = self
+			.next_file_instance_id
+			.checked_add(1)
+			.ok_or_else(|| invalid("physical file identity clock is exhausted"))?;
+		self.files.push(FileImage {
+			entry: FileCatalogEntry {
+				space_id,
+				file_id,
+				companion_of: None,
+				role,
+				path: CatalogPath::parse(&path)?,
+			},
+			page_numbers: Vec::new(),
+			pages: Vec::new(),
+			prewritten_page_count: Some(page_count),
 		});
 		Ok(file_id)
 	}

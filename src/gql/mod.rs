@@ -4,6 +4,7 @@
 mod analysis;
 #[allow(dead_code, reason = "used by the Datastore adapter in the next vertical slice")]
 mod execution;
+pub(crate) mod import;
 #[allow(dead_code, reason = "the crate-private executor owns the logical IR")]
 mod ir;
 
@@ -36,6 +37,11 @@ pub use crate::syn::{
 	Expr,
 	ExprKind,
 	Identifier,
+	ImportGraphRef,
+	ImportOption,
+	ImportOptionName,
+	ImportOptionValue,
+	ImportStatement,
 	IndexScopeName,
 	InfoStatement,
 	InfoTarget,
@@ -87,6 +93,7 @@ pub(crate) fn program_mutates_state(program: &Program) -> bool {
 				| StatementKind::DefineIndex(_)
 				| StatementKind::Remove(_)
 				| StatementKind::Alter(_)
+				| StatementKind::Import(_)
 		)
 	})
 }
@@ -117,6 +124,7 @@ pub enum QueryStatementKind {
 	Match,
 	Return,
 	Select,
+	Import,
 }
 
 #[derive(Debug, Clone)]

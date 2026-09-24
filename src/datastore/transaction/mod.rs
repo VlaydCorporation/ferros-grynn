@@ -15,6 +15,9 @@ use super::{
 	Datastore,
 	GlobalAtomId,
 	GraphSchema,
+	ImportConstraintMode,
+	ImportIndexMode,
+	ImportViolationPolicy,
 	IndexId,
 	IsolationLevel,
 	OccurrenceState,
@@ -39,6 +42,7 @@ use crate::{
 mod commit;
 mod graph;
 mod graph_view;
+mod import;
 mod query;
 mod schema;
 mod writeback;
@@ -199,6 +203,10 @@ pub struct Transaction {
 	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
 	write_bytes: usize,
 	mutations: Vec<Mutation>,
+	import_constraints: Option<ImportConstraintMode>,
+	import_graph_scope: Option<GraphId>,
+	rollback_mutation_errors: bool,
+	atomic_mutation_depth: usize,
 }
 
 impl Transaction {
@@ -224,7 +232,33 @@ impl Transaction {
 			fanout_reservations: BTreeSet::new(),
 			write_bytes: 0,
 			mutations: Vec::new(),
+			import_constraints: None,
+			import_graph_scope: None,
+			rollback_mutation_errors: true,
+			atomic_mutation_depth: 0,
 		}
+	}
+
+	pub(crate) fn new_import(
+		store: Datastore,
+		id: u64,
+		options: TransactionOptions,
+		snapshot: Arc<DatabaseRoot>,
+		indexes: ImportIndexMode,
+		constraints: ImportConstraintMode,
+		on_violation: ImportViolationPolicy,
+		graph_scope: Option<GraphId>,
+	) -> Self {
+		let mut transaction = Self::new(store, id, options, snapshot);
+		if indexes == ImportIndexMode::Deferred {
+			transaction
+				.working
+				.defer_explicit_indexes(constraints == ImportConstraintMode::Immediate);
+		}
+		transaction.import_constraints = Some(constraints);
+		transaction.import_graph_scope = graph_scope;
+		transaction.rollback_mutation_errors = on_violation == ImportViolationPolicy::Skip;
+		transaction
 	}
 
 	/// Returns the process-local transaction identity.
@@ -280,7 +314,16 @@ impl Transaction {
 		&mut self,
 		mutate: impl FnOnce(&mut Self) -> FerrosGrynnResult<T>,
 	) -> FerrosGrynnResult<T> {
+		if self.atomic_mutation_depth != 0 {
+			return mutate(self);
+		}
 		self.prepare_mutation()?;
+		self.atomic_mutation_depth = 1;
+		if !self.rollback_mutation_errors {
+			let result = mutate(self);
+			self.atomic_mutation_depth = 0;
+			return result;
+		}
 		let working = self.working.clone();
 		let reads = self.reads.lock().clone();
 		let missing_records = self.missing_records.lock().clone();
@@ -290,7 +333,9 @@ impl Transaction {
 		let fanout_reservations = self.fanout_reservations.clone();
 		let write_bytes = self.write_bytes;
 		let mutation_len = self.mutations.len();
-		match mutate(self) {
+		let result = mutate(self);
+		self.atomic_mutation_depth = 0;
+		match result {
 			Ok(value) => Ok(value),
 			Err(error) => {
 				self.working = working;
@@ -314,7 +359,7 @@ impl Transaction {
 	/// Returns a schema, read-only, snapshot-age, identity-capacity, or
 	/// write-set-limit error.
 	pub fn define_class(&mut self, mut class: ClassSchema) -> FerrosGrynnResult<ClassId> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		if class.id.is_some() {
 			return Err(FerrosGrynnError::invalid_argument(
 				"define_class requires an unpublished class",
@@ -362,7 +407,7 @@ impl Transaction {
 		name: IntoText,
 		kind: GraphKind,
 	) -> FerrosGrynnResult<GraphRef> {
-		self.prepare_mutation()?;
+		self.prepare_schema_mutation()?;
 		let name = name.into();
 		if self.working.schema.named_graph(name.as_str()).is_some() {
 			return Err(FerrosGrynnError::graph_already_exists(name.to_string()));
@@ -422,7 +467,16 @@ impl Transaction {
 		record_id: RecordId,
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<AtomSnapshot> {
-		self.prepare_mutation()?;
+		self.atomic_mutation(move |transaction| {
+			transaction.create_atom_inner(record_id, properties)
+		})
+	}
+
+	fn create_atom_inner(
+		&mut self,
+		record_id: RecordId,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<AtomSnapshot> {
 		let class = self
 			.working
 			.schema
@@ -619,6 +673,15 @@ impl Transaction {
 			.memberships(global)
 			.map(|memberships| memberships.keys().copied().collect::<Vec<_>>())
 			.unwrap_or_else(Vec::new);
+		if cascade
+			&& let Some(scope) = self.import_graph_scope
+			&& memberships.iter().any(|graph| *graph != scope)
+		{
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				"scoped import",
+				"DELETE CASCADE would remove occurrences from another graph",
+			));
+		}
 		if !cascade && !memberships.is_empty() {
 			return Err(FerrosGrynnError::graph_constraint_violation(
 				"atom store",
@@ -644,13 +707,26 @@ impl Transaction {
 
 	fn prepare_mutation(&mut self) -> FerrosGrynnResult<()> {
 		self.ensure_live()?;
+		self.store.inner.ensure_write_allowed(self.id)?;
 		if self.options.access == TransactionAccess::ReadOnly {
 			return Err(FerrosGrynnError::read_only_transaction(self.id));
 		}
 		self.refresh_read_committed()
 	}
 
+	fn prepare_schema_mutation(&mut self) -> FerrosGrynnResult<()> {
+		if self.import_constraints.is_some() {
+			return Err(FerrosGrynnError::query_feature_not_supported(
+				"schema mutation inside BEGIN IMPORT",
+			));
+		}
+		self.prepare_mutation()
+	}
+
 	fn ensure_live(&self) -> FerrosGrynnResult<()> {
+		if self.store.inner.import_owner.load(std::sync::atomic::Ordering::Acquire) == self.id {
+			return Ok(());
+		}
 		let limits = self.store.inner.transaction_limits();
 		if self.started.elapsed() > limits.max_snapshot_age {
 			return Err(FerrosGrynnError::snapshot_expired(

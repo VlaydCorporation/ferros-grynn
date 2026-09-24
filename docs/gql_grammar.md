@@ -64,8 +64,9 @@ DDL/DML, traversal и graph-return должны завершаться диаг�
 
 ## Грамматика коррекции 8.1
 
-**Статус профиля:** `approved-for-implementation`. Документационные A0–A4/S0–S6 и кодовые
-A5–A8 завершены; parser/runtime-срезы A9–A16 ещё не завершены. Правила ниже заменяют
+**Статус профиля:** `implemented`. Шаги A0–A16 завершены 2026-09-22; evidence
+зафиксирован в [graph_first_atom_model_report.md](reports/graph_first_atom_model_report.md).
+Правила ниже заменяют
 конфликтующие правила полного draft: `TABLE`, class kind `ANY|NORMAL|RELATION` и форма
 `alias:Label` не имеют compatibility alias. Остальная полная EBNF применяется лишь там, где
 она не противоречит этому разделу.
@@ -516,12 +517,30 @@ explain_stmt ::= "EXPLAIN" [ "ANALYZE" | "FULL" ]
 
 assert_invariants_stmt ::= "ASSERT" "INVARIANTS" [ "FOR" "GRAPH" graph_ref ] [ "REPORT" integer ]
 
-(* Массовая загрузка: эпоха импорта поверх обычного DML *)
-import_stmt  ::= "BEGIN" "IMPORT" [ "INTO" "GRAPH" name ] [ with_options ]
-                 { statement ";" }
-                 "END" "IMPORT" [ "WITH" "VALIDATION" ]
+(* Atomic COW import. Точный option set задаёт §7.11 gql_spec. *)
+import_stmt      ::= "BEGIN" "IMPORT" [ "INTO" "GRAPH" graph_ref ] [ import_options ] ";"
+                     { import_body_stmt ";" }
+                     "END" "IMPORT" [ "WITH" "VALIDATION" ]
+import_body_stmt ::= create_stmt | update_stmt | upsert_stmt | delete_stmt
+                   | attach_stmt | detach_stmt | relate_stmt
+                   | for_stmt | if_stmt | try_stmt | throw_stmt
+import_options   ::= "WITH" "(" import_option { "," import_option } ")"
+import_option    ::= "INDEXES" "=" ( "DEFERRED" | "MAINTAINED" )
+                   | "CONSTRAINTS" "=" ( "DEFERRED" | "IMMEDIATE" )
+                   | "EVENTS" "=" ( "OFF" | "ON" )
+                   | "CHANGEFEED" "=" ( "OFF" | "ON" )
+                   | "ON" "VIOLATION" "=" ( "ABORT" | "SKIP" | "QUARANTINE" )
+                   | "REJECT" "LIMIT" "=" integer
+                   | "SEGMENT" "SIZE" "=" integer
+                   | "FILL_FACTOR" "=" number
+                   | "SORT_MEM" "=" integer
+                   | "PARALLELISM" "=" integer
 graph_ref    ::= name | param
 ```
+
+В исполнимом профиле этапа 10 доступны только семь DML alternatives. Control-flow
+alternatives становятся исполнимыми на этапе 12; до этого parser сохраняет точную
+unsupported-диагностику. `COMMIT EVERY` не является alias для `SEGMENT SIZE`.
 
 `CATCH`-обработчик — замыкание `|e| { ... }`, где `e : error` (§7.9 spec). `EXPLAIN` доступен и как
 префиксный оператор (здесь), и как суффиксная clause `... EXPLAIN [FULL]` (§11.11).

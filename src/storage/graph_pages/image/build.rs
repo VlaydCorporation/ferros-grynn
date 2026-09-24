@@ -1,6 +1,6 @@
 //! Construction of one immutable graph-occurrence generation.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use super::{
 	BuiltGraphImage,
@@ -16,11 +16,11 @@ use super::{
 	topology::{NodeAdjacency, encode_hot_side, encode_topology, record_node_adjacency},
 };
 use crate::{
-	datastore::{DatabaseRoot, OccurrenceState},
+	datastore::{DatabaseRoot, GraphRoot, OccurrenceState},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, GraphId},
 	storage::{
-		graph_index::{LabelDictionary, LabelKind, encode_label_dictionary},
+		graph_index::{LabelDictionary, LabelKind, SortedIndexRecords, encode_label_dictionary},
 		graph_pages::{
 			EdgeHotSlot,
 			EdgeSlotFlags,
@@ -37,7 +37,7 @@ use crate::{
 			write_node_hot_slot,
 		},
 		graph_superblock::GraphSuperblock,
-		membership_index::build_graph_membership_index,
+		membership_index::{build_graph_membership_index, sort_graph_membership_index},
 		page::AlignedPage,
 		types::{CheckpointGeneration, Lsn},
 	},
@@ -51,6 +51,31 @@ pub(in crate::storage) fn build_graph_image(
 	context: &mut EncodeContext,
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<BuiltGraphImage> {
+	build_graph_image_with_membership(database, graph_id, context, page_lsn, |graph| {
+		build_graph_membership_index(graph, page_lsn)
+	})
+}
+
+/// Builds graph payload plus bounded membership input for an import generation.
+pub(in crate::storage) fn build_import_graph_image(
+	database: &DatabaseRoot,
+	graph_id: GraphId,
+	context: &mut EncodeContext,
+	page_lsn: PageLsn,
+	scratch_root: &Path,
+) -> FerrosGrynnResult<BuiltGraphImage<SortedIndexRecords>> {
+	build_graph_image_with_membership(database, graph_id, context, page_lsn, |graph| {
+		sort_graph_membership_index(graph, scratch_root)
+	})
+}
+
+fn build_graph_image_with_membership<Membership>(
+	database: &DatabaseRoot,
+	graph_id: GraphId,
+	context: &mut EncodeContext,
+	page_lsn: PageLsn,
+	build_membership: impl FnOnce(&GraphRoot) -> FerrosGrynnResult<Membership>,
+) -> FerrosGrynnResult<BuiltGraphImage<Membership>> {
 	let graph = database
 		.graph(graph_id)
 		.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph_id.to_string()))?;
@@ -231,7 +256,7 @@ pub(in crate::storage) fn build_graph_image(
 	let overlays = overlays.finish()?;
 	let subgraph_entries = arena.entries(graph_id)?;
 	let subgraphs = subgraph_pages(&subgraph_entries, page_lsn)?;
-	let membership = build_graph_membership_index(graph, page_lsn)?;
+	let membership = build_membership(graph)?;
 	let node_count = graph
 		.occurrences()
 		.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Node))

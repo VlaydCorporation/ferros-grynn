@@ -54,9 +54,9 @@ objects, неограниченные и shortest/weighted paths, DDL/DML, Trave
 
 ## Утверждённая коррекция модели данных — этап 8.1
 
-**Статус профиля:** `approved-for-implementation`. Документационные шаги A0–A4/S0–S6 и
-кодовые A5–A8 завершены; graph storage, indexes, frontend и production cutover A9–A16 остаются
-открытыми. Исторический TABLE-layout больше не входит в собираемый crate и сохраняется только
+**Статус профиля:** `implemented`. Шаги A0–A16 завершены 2026-09-22; evidence
+зафиксирован в [graph_first_atom_model_report.md](reports/graph_first_atom_model_report.md).
+Исторический TABLE-layout больше не входит в собираемый crate и сохраняется только
 как evidence в отчётах. При конфликте этого
 раздела с последующими draft-примерами правила этапа 8.1 имеют приоритет. Ключевое слово
 `TABLE` и compatibility aliases не принимаются. Точный синтаксис профиля задаёт
@@ -1442,7 +1442,17 @@ ASSERT INVARIANTS [ FOR GRAPH @graph_name ] [ REPORT @number ];
 
 ### 7.11. BEGIN IMPORT / END IMPORT — массовая загрузка
 
-Режим массовой загрузки. Внутри эпохи импорта используются те же операторы DML (`CREATE`, `RELATE`, `UPDATE`), но движок переключается на bulk-путь: индексы отсоединяются и строятся заново в конце, проверки ограничений откладываются, события и changefeed по умолчанию отключаются.
+Режим массовой загрузки с атомарной COW-публикацией. 
+
+Внутри эпохи импорта используются те же операторы DML, но движок переключается на bulk-путь: 
+индексы отсоединяются и строятся заново в конце, проверки ограничений откладываются, события и changefeed по умолчанию отключаются.
+
+`BEGIN IMPORT` фиксирует исходный
+snapshot и создаёт private root; читатели продолжают видеть прежний snapshot. Ни один
+внутренний segment не является видимым commit. После успешного `END IMPORT` недостижимое
+UUID-поколение синхронизируется и публикуется одним catalog/WAL commit. Любая ошибка до
+publication отбрасывает staging целиком; rollback усечением опубликованных файлов не
+используется.
 
 ```
 BEGIN IMPORT [ INTO GRAPH @graph ] [ WITH ( @option = @value [, ...] ) ];
@@ -1450,26 +1460,45 @@ BEGIN IMPORT [ INTO GRAPH @graph ] [ WITH ( @option = @value [, ...] ) ];
 END IMPORT [ WITH VALIDATION ];
 ```
 
-| Опция          | По умолчанию                 | Значение                                                                                                      |
-|----------------|------------------------------|---------------------------------------------------------------------------------------------------------------|
-| `INDEXES`      | `DEFERRED`                   | `DEFERRED` — индексы отсоединяются и пересобираются в конце; `MAINTAINED` — обычное построчное сопровождение  |
-| `CONSTRAINTS`  | `DEFERRED`                   | `DEFERRED` — инварианты проверяются один раз в конце; `IMMEDIATE` — на каждой мутации                         |
-| `EVENTS`       | `OFF`                        | Выполнять ли `DEFINE EVENT`-триггеры на загружаемых записях                                                   |
-| `CHANGEFEED`   | `OFF`                        | Писать ли changefeed для загружаемых записей                                                                  |
-| `ON VIOLATION` | `ABORT`                      | `ABORT` — прервать импорт; `SKIP` — пропустить нарушающий atom; `QUARANTINE` — отвести в `@<class>__rejected` |
-| `REJECT LIMIT` | `0`                          | Сколько нарушений допустимо до принудительного `ABORT`                                                        |
-| `COMMIT EVERY` | `FG_IMPORT_COMMIT_ROWS`      | Размер сегментного коммита в строках                                                                          |
-| `FILL_FACTOR`  | `FG_INDEX_BTREE_FILL_FACTOR` | Плотность заполнения листьев при пересборке индексов                                                          |
-| `SORT_MEM`     | `FG_BULK_SORT_MEM`           | Бюджет памяти на внешнюю сортировку ключей                                                                    |
-| `PARALLELISM`  | число ядер                   | Параллелизм построения индексов                                                                               |
+| Опция          | По умолчанию                     | Контракт этапа 10                                                                                                                                                                                                       |
+|----------------|----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `INDEXES`      | `DEFERRED`                       | `DEFERRED` перестраивает secondary/Label/Count/effective indexes в конце; primary identity и correctness-critical lookup сопровождаются всегда. `MAINTAINED` использует обычное incremental сопровождение private root. |
+| `CONSTRAINTS`  | `DEFERRED`                       | `DEFERRED` проверяет graph-family и deferred Unique перед publication; `IMMEDIATE` — после каждого logical item. Schema/type/kind/reference checks не откладываются.                                                    |
+| `EVENTS`       | `OFF`                            | Этап 10 принимает только `OFF`; `ON` распознаётся и возвращает typed unsupported.                                                                                                                                       |
+| `CHANGEFEED`   | `OFF`                            | Этап 10 принимает только `OFF`; `ON` распознаётся и возвращает typed unsupported.                                                                                                                                       |
+| `ON VIOLATION` | `ABORT`                          | `ABORT` отбрасывает весь import; `SKIP` атомарно пропускает только item-level нарушение. `QUARANTINE` пока typed unsupported.                                                                                           |
+| `REJECT LIMIT` | отсутствует                      | Для `SKIP` обязателен явный положительный предел; нарушение `limit + 1` отбрасывает весь import.                                                                                                                        |
+| `SEGMENT SIZE` | `FG_IMPORT_SEGMENT_ITEMS`        | Applied items во внутреннем transaction segment; не commit и не recovery point.                                                                                                                                         |
+| `FILL_FACTOR`  | fixed writer policy              | Синтаксис зарезервирован; явное значение пока typed unsupported.                                                                                                                                                        |
+| `SORT_MEM`     | fixed 256 MiB run budget         | Синтаксис зарезервирован; явное значение пока typed unsupported.                                                                                                                                                        |
+| `PARALLELISM`  | последовательная baseline-сборка | Синтаксис зарезервирован; явное значение пока typed unsupported.                                                                                                                                                        |
 
 **Зачем отдельный режим.** Построчная вставка сопровождает каждый индекс отдельно: это случайные обращения к B+tree-страницам, кратная запись и объёмный WAL. Bulk-путь вместо этого собирает ключи, сортирует их вне памяти и строит каждый индекс снизу вверх, записывая каждую страницу ровно один раз ([§20.13 disk_storage_spec](disk_storage_spec.md)). Смежность записывается один раз с уже известной финальной степенью, поэтому overflow-цепочки сразу нужного размера и непрерывны.
 
-**Почему `CONSTRAINTS DEFERRED` обязателен.** Проверка `VALIDATE ON_MUTATION` для `DAG` выполняет обход на каждое добавляемое ребро — это `O(E · (V + E))` на всю загрузку, то есть квадратично. Отложенная проверка делает то же самое одним проходом за `O(V + E)`. То же касается `BIPARTITE`. Поэтому в режиме импорта отложенная проверка — не оптимизация, а условие применимости; `CONSTRAINTS IMMEDIATE` следует включать только на заведомо небольших объёмах.
+**Почему default — `CONSTRAINTS DEFERRED`.** Проверка `VALIDATE ON_MUTATION` для `DAG`
+выполняет обход на каждое добавляемое ребро — `O(E · (V + E))`; отложенная проверка выполняет
+один проход `O(V + E)`. `IMMEDIATE` остаётся поддерживаемым явным режимом для небольших
+импортов. Отложенная whole-graph/Unique ошибка не приписывается одному item и всегда
+отбрасывает весь staging, даже при `ON VIOLATION SKIP`.
 
-**Завершение.** `END IMPORT` перестраивает индексы, вычисляет статистику, проверяет отложенные ограничения и снимает с графа признак незавершённой загрузки. `WITH VALIDATION` дополнительно выполняет полный `ASSERT INVARIANTS`. Результат оператора — структурированный отчёт: сколько записей загружено, сколько пропущено, нарушения по классам, путь к файлу отчёта и время построения каждого индекса.
+**Завершение.** `END IMPORT` перестраивает deferred indexes/statistics и обязательно
+проверяет import delta и hard constraints. `WITH VALIDATION` дополнительно перепроверяет весь
+затронутый AtomStore, graph и rebuilt side-files, включая pre-existing data. Результат —
+структурированный `ImportReport`: processed/applied/skipped, segments, totals и bounded details
+нарушений, modes, full-validation flag и phase/index timings. Локальный путь в result/error не
+возвращается.
 
-**Откат.** Если импорт идёт в **новый** граф, неудача отбрасывает его целиком. Если импорт **дописывает** в существующий граф, откат возможен усечением файлов до отметки, зафиксированной на `BEGIN IMPORT`; но импорт, присоединяющий рёбра к **ранее существовавшим** атомам, изменяет их слоты и целиком откачен быть не может — для таких загрузок применяйте `ON VIOLATION SKIP` или `QUARANTINE`, а не `ABORT`.
+**Scope и откат.** `INTO GRAPH` требует уже существующий graph, подставляет его в
+graph-local DML без явного scope и запрещает явное обращение к другому graph до начала
+выполнения. Base DML остаётся database-global и не создаёт membership. При любой ошибке
+старый root остаётся единственным видимым состоянием; одинаковая all-or-nothing семантика
+действует для AtomStore и существующего graph.
+
+Import обязан быть единственным top-level statement и не выполняется внутри открытого
+`Transaction`. На этапе 10 body принимает `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `ATTACH`,
+`DETACH`, `RELATE`. `FOR`, `IF/ELSE`, `TRY/CATCH`, `THROW` подключаются этапом 12; до этого
+они typed unsupported. Отсутствующий DML `RETURN` означает `RETURN NONE`, а явный
+result-producing `RETURN` отвергается до staging.
 
 ```
 BEGIN IMPORT INTO GRAPH social WITH ( ON VIOLATION = SKIP, REJECT LIMIT = 10000 );
@@ -5739,9 +5768,9 @@ Live-запросы и changefeed ([§21](#21-события-и-live-запро�
 | `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | Плотность заполнения внутренних узлов B+tree                                     | 0.95                  |
 | `FG_INDEX_RTREE_FILL_FACTOR`          | Плотность заполнения узлов R-tree при STR-упаковке                               | 0.95                  |
 | `FG_INDEX_PENDING_MAX`                | Порог очереди `DEFER`, после которого индекс помечается `stale` и пересобирается | 1'000'000             |
-| `FG_IMPORT_COMMIT_ROWS`               | Размер сегментного коммита при импорте                                           | 1'000'000             |
+| `FG_IMPORT_SEGMENT_ITEMS`             | Applied items во внутреннем private segment                                      | 1'000'000             |
 | `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | Сколько нарушений описывается подробно в отчёте                                  | 1000                  |
-| `FG_IMPORT_REJECT_LIMIT`              | Допустимое число нарушений до принудительного прерывания                         | 0                     |
+| `FG_IMPORT_REJECT_LIMIT`              | Явный положительный предел для `ON VIOLATION SKIP`                               | отсутствует           |
 | `FG_HNSW_BUILD_MEM`                   | Бюджет памяти на построение HNSW (отдельно от кэша обслуживания)                 | 2 ГБ                  |
 
 ---

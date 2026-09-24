@@ -13,6 +13,7 @@ use std::{collections::BTreeSet, rc::Rc, sync::Arc, time::Instant};
 
 #[cfg(test)]
 use adapter::TransactionRead;
+pub(crate) use adapter::validate_parsed_transaction;
 pub use adapter::{execute_parsed_transaction, execute_transaction};
 use dml::{execute_dml, execute_graph_dml};
 use rust_decimal::Decimal;

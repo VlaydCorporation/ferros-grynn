@@ -178,11 +178,11 @@ impl Parser<'_> {
 		} else {
 			None
 		};
-		if label.is_some() && graph.is_none() {
+		if label.is_some() && graph.is_none() && !self.in_import {
 			return Err(self.syntax("LABEL update requires `IN GRAPH`.", self.previous_span()));
 		}
 		let data = self.dml_data(context).await?;
-		if matches!(data, Some(DmlData::Reset(_))) && graph.is_none() {
+		if matches!(data, Some(DmlData::Reset(_))) && graph.is_none() && !self.in_import {
 			return Err(self.syntax("RESET requires `IN GRAPH`.", self.previous_span()));
 		}
 		let filter = if self.consume_keyword(keywords::WHERE).is_some() {

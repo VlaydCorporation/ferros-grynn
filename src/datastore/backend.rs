@@ -1,6 +1,7 @@
 //! Backend ownership and resource-policy conversion for one MVCC store.
 
 use std::{
+	collections::BTreeMap,
 	num::NonZeroUsize,
 	sync::{
 		Arc,
@@ -31,6 +32,7 @@ pub(crate) struct StoreInner {
 	pub(crate) next_transaction: AtomicU64,
 	pub(crate) next_schema_id: AtomicU64,
 	pub(crate) next_graph_id: AtomicU64,
+	pub(crate) import_owner: AtomicU64,
 	pub(crate) current: RwLock<Arc<DatabaseRoot>>,
 	pub(crate) commit: Mutex<()>,
 }
@@ -93,6 +95,23 @@ impl StoreInner {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(()),
 			StoreBackend::Local(local) => local.persist_root(root),
+		}
+	}
+
+	pub(crate) fn persist_import_root(
+		&self,
+		root: &DatabaseRoot,
+	) -> FerrosGrynnResult<BTreeMap<super::IndexId, std::time::Duration>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(BTreeMap::new()),
+			StoreBackend::Local(local) => local.persist_import_root(root),
+		}
+	}
+
+	pub(crate) fn import_scratch_root(&self) -> std::path::PathBuf {
+		match &self.backend {
+			StoreBackend::InMemory => std::env::temp_dir().join("ferros-grynn-import"),
+			StoreBackend::Local(local) => local.import_scratch_root().to_path_buf(),
 		}
 	}
 

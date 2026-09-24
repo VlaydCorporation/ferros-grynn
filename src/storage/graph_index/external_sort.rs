@@ -14,26 +14,25 @@ use crate::{
 		direct::DirectFile,
 		page::{AlignedPage, PAGE_SIZE, PageNo},
 	},
-	values::storage::DiskAtomRef,
 };
 
 /// Default in-memory payload retained before one sorted run is spilled.
 pub(super) const INDEX_SORT_RUN_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum number of run readers participating in one merge pass.
 const INDEX_SORT_FAN_IN: usize = 64;
-/// Fixed record prefix: key length followed by the physical atom reference.
+/// Fixed record prefix: key length followed by one opaque sortable payload.
 const RUN_RECORD_PREFIX_BYTES: usize = size_of::<u32>() + size_of::<u64>();
 
-/// One total-order item consumed by primary and scalar index packers.
-pub(in crate::storage) struct IndexSortRecord {
+/// One total-order item consumed by index packers and bounded statistics.
+pub(crate) struct IndexSortRecord {
 	/// Order-preserving or primary lookup bytes.
 	pub(super) key: Vec<u8>,
-	/// Stable generation-local physical atom reference.
-	pub(super) atom: DiskAtomRef,
+	/// Opaque payload interpreted by the sorted stream consumer.
+	pub(super) address: u64,
 }
 
 /// Bounded accumulator that spills sorted runs only when its budget is full.
-pub(in crate::storage) struct ExternalIndexSorter {
+pub(crate) struct ExternalIndexSorter {
 	temporary_root: PathBuf,
 	run_budget: usize,
 	buffered_bytes: usize,
@@ -45,12 +44,12 @@ pub(in crate::storage) struct ExternalIndexSorter {
 
 impl ExternalIndexSorter {
 	/// Creates a sorter using the normative 256 MiB run budget.
-	pub(in crate::storage) fn new(database_root: &Path) -> Self {
+	pub(crate) fn new(database_root: &Path) -> Self {
 		Self::with_budget(database_root, INDEX_SORT_RUN_BYTES)
 	}
 
 	/// Creates a sorter with an explicit budget for deterministic tests.
-	pub(super) fn with_budget(database_root: &Path, run_budget: usize) -> Self {
+	pub(crate) fn with_budget(database_root: &Path, run_budget: usize) -> Self {
 		Self {
 			temporary_root: database_root.join("tmp").join("index-sort"),
 			run_budget: run_budget.max(1),
@@ -64,11 +63,17 @@ impl ExternalIndexSorter {
 
 	/// Adds one encoded key/reference pair, spilling the previous run first
 	/// when retaining this item would exceed the configured budget.
-	pub(in crate::storage) fn push(
+	pub(in crate::storage) fn push<Address: super::PrimaryAddress>(
 		&mut self,
 		key: Vec<u8>,
-		atom: DiskAtomRef,
+		address: Address,
 	) -> FerrosGrynnResult<()> {
+		self.push_raw(key, address.raw())
+	}
+
+	/// Adds one key and unchecked opaque address used by bounded internal-level
+	/// packing. The consumer validates the address domain before publication.
+	pub(crate) fn push_raw(&mut self, key: Vec<u8>, address: u64) -> FerrosGrynnResult<()> {
 		if key.is_empty() || key.len() >= PAGE_SIZE {
 			return Err(invalid_sort("external-sort key does not fit one B+tree page"));
 		}
@@ -86,7 +91,7 @@ impl ExternalIndexSorter {
 			.ok_or_else(|| invalid_sort("external-sort run size overflows usize"))?;
 		self.buffered.push(IndexSortRecord {
 			key,
-			atom,
+			address,
 		});
 		if self.buffered_bytes >= self.run_budget {
 			self.spill_buffered()?;
@@ -96,7 +101,7 @@ impl ExternalIndexSorter {
 
 	/// Finishes all required merge passes and returns a replayable sorted
 	/// input.
-	pub(in crate::storage) fn finish(mut self) -> FerrosGrynnResult<SortedIndexRecords> {
+	pub(crate) fn finish(mut self) -> FerrosGrynnResult<SortedIndexRecords> {
 		if self.runs.is_empty() {
 			sort_records(&mut self.buffered);
 			return Ok(SortedIndexRecords::Memory(self.buffered));
@@ -162,7 +167,7 @@ impl ExternalIndexSorter {
 }
 
 /// Replayable output used directly by bottom-up B+tree packers.
-pub(in crate::storage) enum SortedIndexRecords {
+pub(crate) enum SortedIndexRecords {
 	/// Inputs below one run budget need no temporary I/O.
 	Memory(Vec<IndexSortRecord>),
 	/// Larger inputs retain only the final bounded merge inputs.
@@ -175,28 +180,51 @@ pub(in crate::storage) enum SortedIndexRecords {
 }
 
 impl SortedIndexRecords {
+	/// Returns the exact number of sorted records.
+	pub(super) fn len(&self) -> FerrosGrynnResult<usize> {
+		match self {
+			Self::Memory(records) => Ok(records.len()),
+			Self::Runs {
+				runs,
+				..
+			} => runs.iter().try_fold(0_usize, |total, run| {
+				total
+					.checked_add(run.record_count)
+					.ok_or_else(|| invalid_sort("external-sort record count overflows usize"))
+			}),
+		}
+	}
+
 	/// Visits every item in `(key, atom)` order without collecting the result.
-	pub(in crate::storage) fn visit(
+	pub(in crate::storage) fn visit<Address: super::PrimaryAddress>(
 		&self,
-		mut visit: impl FnMut(&[u8], DiskAtomRef) -> FerrosGrynnResult<()>,
+		mut visit: impl FnMut(&[u8], Address) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<()> {
+		self.visit_raw(|key, address| visit(key, Address::from_raw(address)?))
+	}
+
+	/// Visits opaque addresses used by the private streaming packer.
+	pub(crate) fn visit_raw(
+		&self,
+		mut visit: impl FnMut(&[u8], u64) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<()> {
 		match self {
 			Self::Memory(records) => {
 				for record in records {
-					visit(&record.key, record.atom)?;
+					visit(&record.key, record.address)?;
 				}
 				Ok(())
 			}
 			Self::Runs {
 				runs,
 				..
-			} => merge_runs(runs, |record| visit(&record.key, record.atom)),
+			} => merge_runs(runs, |record| visit(&record.key, record.address)),
 		}
 	}
 }
 
 /// One owned temporary session removed on success, error, or unwind.
-pub(in crate::storage) struct SortSession {
+pub(crate) struct SortSession {
 	path: PathBuf,
 }
 
@@ -222,19 +250,21 @@ impl Drop for SortSession {
 }
 
 /// One immutable run and its meaningful byte length before final zero padding.
-pub(in crate::storage) struct SortRun {
+pub(crate) struct SortRun {
 	path: PathBuf,
 	logical_bytes: u64,
+	record_count: usize,
 }
 
 /// Sequential page-aligned writer for the private run format.
 struct RunWriter {
 	path: PathBuf,
 	file: DirectFile,
-	page: AlignedPage,
+	page: Box<AlignedPage>,
 	page_no: u64,
 	offset: usize,
 	logical_bytes: u64,
+	record_count: usize,
 }
 
 impl RunWriter {
@@ -244,10 +274,11 @@ impl RunWriter {
 		Ok(Self {
 			path,
 			file,
-			page: AlignedPage::zeroed(),
+			page: Box::new(AlignedPage::zeroed()),
 			page_no: 0,
 			offset: 0,
 			logical_bytes: 0,
+			record_count: 0,
 		})
 	}
 
@@ -256,8 +287,13 @@ impl RunWriter {
 		let key_len = u32::try_from(record.key.len())
 			.map_err(|_error| invalid_sort("external-sort key length exceeds u32"))?;
 		self.write_bytes(&key_len.to_le_bytes())?;
-		self.write_bytes(&record.atom.raw().to_le_bytes())?;
-		self.write_bytes(&record.key)
+		self.write_bytes(&record.address.to_le_bytes())?;
+		self.write_bytes(&record.key)?;
+		self.record_count = self
+			.record_count
+			.checked_add(1)
+			.ok_or_else(|| invalid_sort("external-sort record count overflows usize"))?;
+		Ok(())
 	}
 
 	/// Writes a byte slice across as many aligned pages as required.
@@ -300,6 +336,7 @@ impl RunWriter {
 		Ok(SortRun {
 			path: self.path,
 			logical_bytes: self.logical_bytes,
+			record_count: self.record_count,
 		})
 	}
 }
@@ -310,7 +347,7 @@ struct RunReader {
 	logical_bytes: u64,
 	position: u64,
 	loaded_page: Option<u64>,
-	page: AlignedPage,
+	page: Box<AlignedPage>,
 }
 
 impl RunReader {
@@ -321,7 +358,7 @@ impl RunReader {
 			logical_bytes: run.logical_bytes,
 			position: 0,
 			loaded_page: None,
-			page: AlignedPage::zeroed(),
+			page: Box::new(AlignedPage::zeroed()),
 		})
 	}
 
@@ -340,10 +377,9 @@ impl RunReader {
 		if key_len == 0 || key_len >= PAGE_SIZE {
 			return Err(invalid_sort("external-sort run contains an invalid key length"));
 		}
-		let atom =
-			DiskAtomRef::from_raw(u64::from_le_bytes(prefix[4..].try_into().map_err(
-				|_error| invalid_sort("external-sort atom prefix has an invalid length"),
-			)?))?;
+		let address = u64::from_le_bytes(prefix[4..].try_into().map_err(|_error| {
+			invalid_sort("external-sort address prefix has an invalid length")
+		})?);
 		let mut key = Vec::new();
 		key.try_reserve_exact(key_len)
 			.map_err(|source| invalid_sort(format!("reserve external-sort key: {source}")))?;
@@ -351,7 +387,7 @@ impl RunReader {
 		self.read_exact(&mut key)?;
 		Ok(Some(IndexSortRecord {
 			key,
-			atom,
+			address,
 		}))
 	}
 
@@ -391,16 +427,16 @@ fn merge_runs(
 	let mut heap = BinaryHeap::<Reverse<(Vec<u8>, u64, usize)>>::new();
 	for (index, reader) in readers.iter_mut().enumerate() {
 		if let Some(record) = reader.next()? {
-			heap.push(Reverse((record.key, record.atom.raw(), index)));
+			heap.push(Reverse((record.key, record.address, index)));
 		}
 	}
-	while let Some(Reverse((key, atom, index))) = heap.pop() {
+	while let Some(Reverse((key, address, index))) = heap.pop() {
 		visit(IndexSortRecord {
 			key,
-			atom: DiskAtomRef::from_raw(atom)?,
+			address,
 		})?;
 		if let Some(record) = readers[index].next()? {
-			heap.push(Reverse((record.key, record.atom.raw(), index)));
+			heap.push(Reverse((record.key, record.address, index)));
 		}
 	}
 	Ok(())
@@ -409,7 +445,7 @@ fn merge_runs(
 /// Applies the complete deterministic total order within one run.
 fn sort_records(records: &mut [IndexSortRecord]) {
 	records.sort_unstable_by(|left, right| {
-		left.key.cmp(&right.key).then_with(|| left.atom.cmp(&right.atom))
+		left.key.cmp(&right.key).then_with(|| left.address.cmp(&right.address))
 	});
 }
 
@@ -440,7 +476,7 @@ mod tests {
 	use std::sync::atomic::{AtomicU64, Ordering};
 
 	use super::*;
-	use crate::values::runtime::graph::AtomKind;
+	use crate::values::{runtime::graph::AtomKind, storage::DiskAtomRef};
 
 	/// Unique test-directory suffix within one process.
 	static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -467,7 +503,7 @@ mod tests {
 			}
 			let sorted = sorter.finish()?;
 			let mut slots = Vec::new();
-			sorted.visit(|_key, atom| {
+			sorted.visit::<DiskAtomRef>(|_key, atom| {
 				slots.push(atom.slot());
 				Ok(())
 			})?;

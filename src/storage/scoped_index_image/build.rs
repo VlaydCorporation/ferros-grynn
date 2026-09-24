@@ -191,14 +191,14 @@ fn local_addresses(atoms: &BTreeSet<AtomId>) -> FerrosGrynnResult<Vec<DiskAtomRe
 	Ok(result)
 }
 
-fn local_address(atom: AtomId) -> FerrosGrynnResult<DiskAtomRef> {
+pub(super) fn local_address(atom: AtomId) -> FerrosGrynnResult<DiskAtomRef> {
 	DiskAtomRef::from_parts(
 		atom.kind().ok_or_else(|| invalid("graph index contains a null atom"))?,
 		atom.slot(),
 	)
 }
 
-fn label_ids<'a>(
+pub(super) fn label_ids<'a>(
 	labels: impl Iterator<Item = (AtomKind, &'a Text)>,
 ) -> FerrosGrynnResult<BTreeMap<(AtomKind, Text), u32>> {
 	let mut next = BTreeMap::<AtomKind, u32>::new();
@@ -213,7 +213,7 @@ fn label_ids<'a>(
 	Ok(result)
 }
 
-fn scalar_filename(kind: ClassIndexKind, ordinal: u32) -> String {
+pub(super) fn scalar_filename(kind: ClassIndexKind, ordinal: u32) -> String {
 	let prefix = match kind {
 		ClassIndexKind::Standard => "std",
 		ClassIndexKind::Unique => "uniq",
@@ -222,7 +222,7 @@ fn scalar_filename(kind: ClassIndexKind, ordinal: u32) -> String {
 	format!("idx/{prefix}_{ordinal:04}.fgidx")
 }
 
-fn label_filename(kind: AtomKind, label_id: u32) -> String {
+pub(super) fn label_filename(kind: AtomKind, label_id: u32) -> String {
 	let kind = match kind {
 		AtomKind::Node => "node",
 		AtomKind::Edge => "edge",

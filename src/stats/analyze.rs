@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use super::{
 	BaseStatistics,
@@ -10,12 +10,12 @@ use super::{
 	HISTOGRAM_BUCKETS,
 	HistogramMethod,
 	LabelStatisticKey,
-	PropertyBucket,
 	PropertyHistogram,
 	PropertyHistogramKey,
 	StatisticField,
 	StatisticsScope,
 	StatisticsStore,
+	bounded_histogram::{HistogramInput, finish_histograms},
 };
 use crate::{
 	datastore::{
@@ -28,6 +28,7 @@ use crate::{
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, EdgeEndpoint, EdgeTopology, GraphId},
+	storage::{ExternalIndexSorter, SortedIndexRecords},
 	values::{
 		PropertyKeyId,
 		PropertyMap,
@@ -45,23 +46,37 @@ struct DegreeCounts {
 }
 
 struct PropertyAccumulator {
+	ordinal: u32,
 	property_key: PropertyKeyId,
 	value_type: Type,
 	type_tag: u8,
 	row_count: u64,
 	null_count: u64,
-	values: Vec<Vec<u8>>,
+	value_count: usize,
 	valid: bool,
 }
 
 /// Performs one exact full scan shared by RAM and durable rebuilds.
 pub(crate) fn analyze_database(database: &DatabaseRoot) -> FerrosGrynnResult<StatisticsStore> {
+	let scratch_root = std::env::temp_dir().join("ferros-grynn-statistics");
+	analyze_database_at(database, &scratch_root)
+}
+
+/// Performs the same full scan with one shared 256 MiB external-sort budget
+/// for all property histograms in each scope.
+pub(crate) fn analyze_database_at(
+	database: &DatabaseRoot,
+	scratch_root: &Path,
+) -> FerrosGrynnResult<StatisticsStore> {
 	let fields = statistic_fields(database)?;
 	let mut context = index_context(&database.schema, &database.dictionary)?;
 	let mut result = StatisticsStore::default();
-	*result.base_mut() = analyze_base(database, &fields, &mut context)?;
+	*result.base_mut() = analyze_base(database, &fields, &mut context, scratch_root)?;
 	for graph in database.graphs.keys().copied() {
-		result.replace_graph(graph, analyze_graph(database, graph, &fields, &mut context)?);
+		result.replace_graph(
+			graph,
+			analyze_graph(database, graph, &fields, &mut context, scratch_root)?,
+		);
 	}
 	Ok(result)
 }
@@ -70,6 +85,7 @@ fn analyze_base(
 	database: &DatabaseRoot,
 	fields: &[StatisticField<'_>],
 	context: &mut EncodeContext,
+	scratch_root: &Path,
 ) -> FerrosGrynnResult<BaseStatistics> {
 	let mut statistics = BaseStatistics {
 		revision: database.commit_ts,
@@ -82,6 +98,8 @@ fn analyze_base(
 			.insert(class.id().ok_or_else(|| invalid("published class has no ClassId"))?, 0);
 	}
 	let mut properties = property_accumulators(fields, StatisticsScope::Base)?;
+	let mut sorter = ExternalIndexSorter::new(scratch_root);
+	let mut sequence = 0_u64;
 	for atom in database.atoms.atoms() {
 		increment(statistics.classes.entry(atom.class_id()).or_default(), 1, "base class count")?;
 		record_properties(
@@ -89,9 +107,11 @@ fn analyze_base(
 			atom.class_id(),
 			|key| atom.properties().get(key),
 			context,
+			&mut sorter,
+			&mut sequence,
 		)?;
 	}
-	statistics.property_histograms = finish_properties(properties)?;
+	statistics.property_histograms = finish_properties(properties, sorter.finish()?)?;
 	Ok(statistics)
 }
 
@@ -100,6 +120,7 @@ fn analyze_graph(
 	graph_id: GraphId,
 	fields: &[StatisticField<'_>],
 	context: &mut EncodeContext,
+	scratch_root: &Path,
 ) -> FerrosGrynnResult<GraphStatistics> {
 	let graph = database
 		.graph(graph_id)
@@ -112,6 +133,8 @@ fn analyze_graph(
 	let mut properties = property_accumulators(fields, StatisticsScope::Effective {
 		graph: graph_id,
 	})?;
+	let mut sorter = ExternalIndexSorter::new(scratch_root);
+	let mut sequence = 0_u64;
 	let mut degrees = BTreeMap::<AtomId, DegreeCounts>::new();
 	for occurrence in graph.occurrences() {
 		let atom = database
@@ -151,6 +174,8 @@ fn analyze_graph(
 			atom.class_id(),
 			|key| occurrence.effective_value(atom.properties().get(key), key),
 			context,
+			&mut sorter,
+			&mut sequence,
 		)?;
 	}
 	for occurrence in graph.occurrences() {
@@ -163,7 +188,7 @@ fn analyze_graph(
 		}
 	}
 	finish_degrees(&mut statistics, &degrees, graph)?;
-	statistics.property_histograms = finish_properties(properties)?;
+	statistics.property_histograms = finish_properties(properties, sorter.finish()?)?;
 	Ok(statistics)
 }
 
@@ -194,9 +219,12 @@ fn property_accumulators(
 ) -> FerrosGrynnResult<BTreeMap<PropertyHistogramKey, PropertyAccumulator>> {
 	fields
 		.iter()
-		.map(|field| {
+		.enumerate()
+		.map(|(ordinal, field)| {
 			let type_tag = histogram_type_tag(field.value_type)
 				.ok_or_else(|| invalid("unsupported field entered histogram builder"))?;
+			let ordinal = u32::try_from(ordinal)
+				.map_err(|_error| invalid("property histogram ordinal exceeds u32"))?;
 			Ok((
 				PropertyHistogramKey {
 					class_id: field.class_id,
@@ -204,12 +232,13 @@ fn property_accumulators(
 					scope,
 				},
 				PropertyAccumulator {
+					ordinal,
 					property_key: field.property_key,
 					value_type: field.value_type.clone(),
 					type_tag,
 					row_count: 0,
 					null_count: 0,
-					values: Vec::new(),
+					value_count: 0,
 					valid: true,
 				},
 			))
@@ -222,6 +251,8 @@ fn record_properties<'value>(
 	class: crate::datastore::ClassId,
 	mut value: impl FnMut(PropertyKeyId) -> Option<&'value Value>,
 	context: &mut EncodeContext,
+	sorter: &mut ExternalIndexSorter,
+	sequence: &mut u64,
 ) -> FerrosGrynnResult<()> {
 	for (_key, accumulator) in properties.iter_mut().filter(|(key, _)| key.class_id == class) {
 		accumulator.row_count = accumulator
@@ -240,10 +271,21 @@ fn record_properties<'value>(
 			continue;
 		}
 		match encode_index_key(&[(value, &accumulator.value_type)], context) {
-			Ok(encoded) => accumulator.values.push(encoded),
+			Ok(encoded) => {
+				let mut key = Vec::with_capacity(4_usize.saturating_add(encoded.len()));
+				key.extend_from_slice(&accumulator.ordinal.to_be_bytes());
+				key.extend_from_slice(&encoded);
+				sorter.push_raw(key, *sequence)?;
+				*sequence = sequence
+					.checked_add(1)
+					.ok_or_else(|| invalid("property histogram sequence overflows u64"))?;
+				accumulator.value_count = accumulator
+					.value_count
+					.checked_add(1)
+					.ok_or_else(|| invalid("property histogram value count overflows usize"))?;
+			}
 			Err(_error) => {
 				accumulator.valid = false;
-				accumulator.values.clear();
 			}
 		}
 	}
@@ -252,18 +294,27 @@ fn record_properties<'value>(
 
 fn finish_properties(
 	properties: BTreeMap<PropertyHistogramKey, PropertyAccumulator>,
+	records: SortedIndexRecords,
 ) -> FerrosGrynnResult<BTreeMap<PropertyHistogramKey, PropertyHistogram>> {
+	let inputs = properties
+		.values()
+		.map(|accumulator| HistogramInput {
+			ordinal: accumulator.ordinal,
+			value_count: accumulator.value_count,
+		})
+		.collect::<Vec<_>>();
+	let mut finished = finish_histograms(&records, &inputs)?;
 	let mut result = BTreeMap::new();
-	for (key, mut accumulator) in properties {
+	for (key, accumulator) in properties {
 		let Ok(sample_count) = u32::try_from(accumulator.row_count) else {
 			continue;
 		};
 		if !accumulator.valid {
 			continue;
 		}
-		accumulator.values.sort_unstable();
-		let distinct_count = u64::try_from(distinct_sorted(&accumulator.values))
-			.map_err(|_error| invalid("histogram distinct count exceeds u64"))?;
+		let histogram = finished
+			.remove(&accumulator.ordinal)
+			.ok_or_else(|| invalid("property histogram sort result is absent"))?;
 		let null_fraction = if accumulator.row_count == 0 {
 			0.0
 		} else {
@@ -273,9 +324,9 @@ fn finish_properties(
 			type_tag: accumulator.type_tag,
 			method: HistogramMethod::Exact,
 			sample_count,
-			distinct_count,
+			distinct_count: histogram.distinct_count,
 			null_fraction,
-			buckets: property_buckets(&accumulator.values)?,
+			buckets: histogram.buckets,
 		});
 	}
 	Ok(result)
@@ -433,22 +484,6 @@ fn insert_degree(
 	Ok(())
 }
 
-fn property_buckets(values: &[Vec<u8>]) -> FerrosGrynnResult<Vec<PropertyBucket>> {
-	equi_depth_ranges(values.len())
-		.map(|range| {
-			let values = &values[range];
-			Ok(PropertyBucket {
-				lower: values[0].clone(),
-				upper: values[values.len() - 1].clone(),
-				frequency: u64::try_from(values.len())
-					.map_err(|_error| invalid("property bucket frequency exceeds u64"))?,
-				distinct_count: u64::try_from(distinct_sorted(values))
-					.map_err(|_error| invalid("property bucket distinct count exceeds u64"))?,
-			})
-		})
-		.collect()
-}
-
 fn equi_depth_ranges(length: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
 	let buckets = length.min(HISTOGRAM_BUCKETS);
 	let size = length / buckets.max(1);
@@ -458,10 +493,6 @@ fn equi_depth_ranges(length: usize) -> impl Iterator<Item = std::ops::Range<usiz
 		let end = start + size + usize::from(index < larger);
 		start..end
 	})
-}
-
-fn distinct_sorted<T: Eq>(values: &[T]) -> usize {
-	usize::from(!values.is_empty()) + values.windows(2).filter(|pair| pair[0] != pair[1]).count()
 }
 
 fn histogram_type_tag(value_type: &Type) -> Option<u8> {

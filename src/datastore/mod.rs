@@ -10,6 +10,8 @@ mod conflict;
 mod consts;
 /// Database-versus-graph physical identity.
 mod identity;
+/// Atomic bulk-import coordination and public reports.
+mod import;
 /// MVCC-owned class, label, and explicit scalar indexes.
 mod index_store;
 /// Graph-local occurrences and sparse overlays.
@@ -29,6 +31,16 @@ pub(crate) use atom_store::{AtomStoreRoot, BaseAtom, GlobalAtomId};
 pub(crate) use backend::{StoreBackend, StoreInner, validate_local_options};
 pub(crate) use conflict::ConflictKey;
 pub(crate) use identity::DataSpaceId;
+pub use import::{
+	ImportConstraintMode,
+	ImportIndexMode,
+	ImportItemOutcome,
+	ImportOptions,
+	ImportReport,
+	ImportSession,
+	ImportViolation,
+	ImportViolationPolicy,
+};
 pub(crate) use index_store::{
 	IndexBinding,
 	IndexEntries,

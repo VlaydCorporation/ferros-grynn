@@ -35,7 +35,9 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 		} => {
 			let record = record_id(record, slots, source)?;
 			transaction.attach_node(graph.id(), &record, label.clone(), None)?;
-			transaction.validate_graph_family(graph)?;
+			if transaction.validates_import_constraints_immediately() {
+				transaction.validate_graph_family(graph)?;
+			}
 			Ok(Value::None)
 		}
 		LogicalGraphDmlStatement::Detach {
@@ -45,7 +47,9 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 		} => {
 			let record = record_id(record, slots, source)?;
 			transaction.detach_occurrence(graph.id(), &record, *cascade)?;
-			transaction.validate_graph_family(graph)?;
+			if transaction.validates_import_constraints_immediately() {
+				transaction.validate_graph_family(graph)?;
+			}
 			Ok(Value::None)
 		}
 		LogicalGraphDmlStatement::Relate {
@@ -122,7 +126,9 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 				source,
 				&dictionary,
 			)?;
-			transaction.validate_graph_family(graph)?;
+			if transaction.validates_import_constraints_immediately() {
+				transaction.validate_graph_family(graph)?;
+			}
 			graph_result(&edge.returning, &edge.schema, &candidate.before, &after, slots, source)
 		}
 	}

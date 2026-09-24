@@ -1,6 +1,6 @@
 //! Database-global reverse graph-membership index publication and validation.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use super::ReverseMembershipFile;
 use crate::{
@@ -9,9 +9,9 @@ use crate::{
 	graph::GraphId,
 	storage::{
 		file_registry::FileRegistry,
-		graph_index::{BuiltPrimaryIndex, scan_primary_index},
+		graph_index::{BuiltPrimaryIndex, SortedIndexRecords, scan_primary_index},
 		image_io::{backfill_pages, read_pages, read_pages_cached, stage_pages},
-		membership_index::build_reverse_membership_index,
+		membership_index::{build_reverse_membership_index, sort_reverse_membership_index},
 		page::{AlignedPage, PageLsn, PageNo},
 		types::StorageSnapshot,
 		wal::{CheckpointTicket, FrameWal, TxHandle},
@@ -24,6 +24,14 @@ pub(in crate::storage) fn build_reverse_membership_image(
 	database: &DatabaseRoot,
 ) -> FerrosGrynnResult<BuiltPrimaryIndex> {
 	build_reverse_membership_index(&database.atoms, PageLsn::ZERO)
+}
+
+/// Builds bounded reverse-membership input for atomic import.
+pub(in crate::storage) fn build_import_reverse_membership_image(
+	database: &DatabaseRoot,
+	scratch_root: &Path,
+) -> FerrosGrynnResult<SortedIndexRecords> {
+	sort_reverse_membership_index(&database.atoms, scratch_root)
 }
 
 /// Stages the reverse membership image in the caller's database WAL

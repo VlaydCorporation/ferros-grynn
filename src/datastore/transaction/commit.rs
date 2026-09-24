@@ -19,8 +19,14 @@ impl Transaction {
 	pub fn commit(self) -> FerrosGrynnResult<CommitResult> {
 		self.ensure_live()?;
 		let store = self.store.clone();
+		if !self.mutations.is_empty() {
+			store.inner.ensure_write_allowed(self.id)?;
+		}
 		let _commit = store.inner.commit.lock();
 		self.ensure_live()?;
+		if !self.mutations.is_empty() {
+			store.inner.ensure_write_allowed(self.id)?;
+		}
 		let current = store.inner.current_root();
 		self.validate_against(&current)?;
 		self.validate_commit_fanout(&current)?;

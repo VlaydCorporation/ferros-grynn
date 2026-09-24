@@ -6742,7 +6742,9 @@ fn measure_mmap_resident_concurrency(
 			let (start, count) = partition_worker_operations(operations, threads, worker);
 			workers.push(scope.spawn(move || -> io::Result<()> {
 				#[cfg(windows)]
-				let affinity = worker_affinity_masks.map(|masks| pin_current_thread(masks[worker])).transpose();
+				let affinity = worker_affinity_masks
+					.map(|masks| pin_current_thread(masks[worker]))
+					.transpose();
 				readiness_ref.wait();
 				timed_start_ref.wait();
 				#[cfg(windows)]
@@ -6787,7 +6789,9 @@ fn measure_production_resident_concurrency(
 			let (start, count) = partition_worker_operations(operations, threads, worker);
 			workers.push(scope.spawn(move || -> FerrosGrynnResult<()> {
 				#[cfg(windows)]
-				let affinity = worker_affinity_masks.map(|masks| pin_current_thread(masks[worker])).transpose();
+				let affinity = worker_affinity_masks
+					.map(|masks| pin_current_thread(masks[worker]))
+					.transpose();
 				let prepared = (|| {
 					let scope = engine.read_scope()?;
 					let table = if hot_pages <= MAX_READ_SCOPE_OPERATIONS {

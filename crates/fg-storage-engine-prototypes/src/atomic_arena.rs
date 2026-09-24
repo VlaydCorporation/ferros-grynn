@@ -2521,7 +2521,8 @@ mod tests {
 					let evicting = pack_state(Lifecycle::Evicting, 9, 0, 0);
 					if replacement_state
 						.compare_exchange(resident, evicting, Ordering::SeqCst, Ordering::SeqCst)
-						.is_ok() && replacement_readers.load(Ordering::SeqCst) == 0
+						.is_ok()
+						&& replacement_readers.load(Ordering::SeqCst) == 0
 					{
 						replacement_state
 							.store(pack_state(Lifecycle::Loading, 10, 0, 0), Ordering::SeqCst);
