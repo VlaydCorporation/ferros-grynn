@@ -1,4 +1,4 @@
-//! Exact `FGDC v7` logical model and codec.
+//! Exact `FGDC v8` logical model and codec.
 
 mod codec;
 mod type_codec;
@@ -87,7 +87,15 @@ pub(in crate::storage) struct GraphCatalogEntry {
 	pub(in crate::storage) label_index: (IndexId, SchemaVersion),
 	pub(in crate::storage) adjacency_index: (IndexId, SchemaVersion),
 	pub(in crate::storage) membership: PhysicalIndexBinding,
+	pub(in crate::storage) properties: Vec<GraphPropertyCatalogEntry>,
 	pub(in crate::storage) arena: GraphArenaBindings,
+}
+
+/// One catalog-owned graph property encoded through the canonical value codec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::storage) struct GraphPropertyCatalogEntry {
+	pub(in crate::storage) key: PropertyKeyId,
+	pub(in crate::storage) value: Vec<u8>,
 }
 
 /// One encoded global parameter; value bytes use the canonical value codec.
@@ -100,7 +108,7 @@ pub(in crate::storage) struct ParameterCatalogEntry {
 	pub(in crate::storage) value: Vec<u8>,
 }
 
-/// Canonical `FGDC v7` payload independent of physical catalog pages.
+/// Canonical `FGDC v8` payload independent of physical catalog pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct DatabaseCatalog {
 	pub(in crate::storage) next_graph_id: u64,
@@ -118,7 +126,7 @@ impl DatabaseCatalog {
 		codec::encode(self)
 	}
 
-	/// Decodes and validates only exact `FGDC v7` bytes.
+	/// Decodes and validates only exact `FGDC v8` bytes.
 	pub(in crate::storage) fn decode(bytes: &[u8]) -> crate::gql_status::FerrosGrynnResult<Self> {
 		codec::decode(bytes)
 	}

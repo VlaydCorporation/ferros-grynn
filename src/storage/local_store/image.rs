@@ -361,6 +361,7 @@ fn build_generation_inner(
 		.map(|raw| {
 			Ok(GraphBinding {
 				graph_id: raw.graph_id,
+				generation: database.commit_ts,
 				files: GraphFileSet::from_catalog(
 					&file_catalog,
 					raw.graph_id,
@@ -766,10 +767,15 @@ fn append_catalog_pages(
 	Ok(())
 }
 
-fn prime_value_context(
+pub(super) fn prime_value_context(
 	database: &DatabaseRoot,
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<()> {
+	for graph in database.schema.graphs() {
+		for (_key, value) in graph.properties() {
+			drop(StorageValue::from_runtime(value.clone(), context)?);
+		}
+	}
 	for parameter in database.schema.parameters() {
 		drop(StorageValue::from_runtime(parameter.value().clone(), context)?);
 	}

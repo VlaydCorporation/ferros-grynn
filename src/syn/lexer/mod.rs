@@ -247,7 +247,14 @@ impl Lexer<'_> {
 			self.bump();
 			return Ok(TokenKind::FullText(self.source[start..self.cursor].into()));
 		}
-		Err(parse_error(self.source, span(start, self.cursor), "Invalid full-text operator."))
+		if self.cursor == start + 1 {
+			return Err(parse_error(
+				self.source,
+				span(start, self.cursor),
+				"Expected a graph name.",
+			));
+		}
+		Ok(TokenKind::GraphRef(self.source[start + 1..self.cursor].into()))
 	}
 
 	fn symbol(&mut self) -> FerrosGrynnResult<Symbol> {

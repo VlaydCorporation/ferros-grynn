@@ -92,6 +92,7 @@ pub fn execute_import(
 		kind: QueryStatementKind::Import,
 		elapsed: started.elapsed(),
 		result,
+		continuation: None,
 	})
 }
 

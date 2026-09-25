@@ -586,7 +586,7 @@ fn object_row(schema: &Schema, object: &Object) -> Row {
 	)
 }
 
-fn dml_diff(before: &Object, after: Option<&Object>) -> Object {
+pub(super) fn dml_diff(before: &Object, after: Option<&Object>) -> Object {
 	let empty = Object::new();
 	let after = after.unwrap_or(&empty);
 	before

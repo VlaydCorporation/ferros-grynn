@@ -1,4 +1,4 @@
-use super::stmt::Statement;
+use super::stmt::{SelectStatement, Statement};
 use crate::gql_status::TextSpan;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,8 +82,10 @@ pub enum ExprKind {
 	Call {
 		callee: Box<Expr>,
 		type_argument: Option<TypeName>,
+		distinct: bool,
 		arguments: Vec<Expr>,
 	},
+	Subquery(Box<SelectStatement>),
 	Cast {
 		target: TypeName,
 		expr: Box<Expr>,

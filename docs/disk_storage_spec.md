@@ -16,7 +16,7 @@ evidence и ограничения зафиксированы в
 [graph_first_atom_model_report.md](reports/graph_first_atom_model_report.md).
 Она заменяет graph-owned atom/table candidate на database-level AtomStore и graph-local
 occurrences. При конфликте с сохранёнными ниже legacy layout-примечаниями действуют §§2, 4, 7,
-10–11, 17–18 и 22 в редакции 8.1. Cutover принимает только `FGDC v7`/`FGFC v5`; миграции
+10–11, 17–18 и 22 в редакции 8.1. Cutover принимает только `FGDC v8`/`FGFC v5`; миграции
 промежуточных кандидатов нет.
 
 ---
@@ -450,7 +450,7 @@ enum RecordIdPart {
 
 ```
 tag(u8) = 0x10
-class_id(u32)             -- stable ClassId из FGDC v7
+class_id(u32)             -- stable ClassId из FGDC v8
 id_kind(u8):
   0x00 = Int
   0x01 = String
@@ -754,12 +754,12 @@ database-level AtomStore и catalog files. Транзакция не может 
 namespace. Backfill можно планировать по data space, но обрезка единого WAL использует общий
 watermark.
 
-### 7.2. DatabaseCatalog `FGDC v7` и FileCatalog `FGFC v5`
+### 7.2. DatabaseCatalog `FGDC v8` и FileCatalog `FGFC v5`
 
 `db.fgb` хранит root-page ссылки; канонические каталоги лежат в `schema/catalog.fgb` и
 публикуются тем же frame-WAL commit, что data pages:
 
-- `DatabaseCatalog` (`FGDC`, payload version 7): `next_graph_id`, `next_schema_id`, IANA timezone
+- `DatabaseCatalog` (`FGDC`, payload version 8): `next_graph_id`, `next_schema_id`, IANA timezone
   table, versioned CLASS/FIELD/INDEX definitions, graph catalog, AtomStore generation/bindings и
   глобальные параметры. Property-key strings в payload не дублируются;
 - `FileCatalog` (`FGFC`, payload version 5): sealed mapping
@@ -793,8 +793,23 @@ Class definition хранит стабильные `ClassId`/`SchemaVersion`, im
 `GraphRef` не кодируется как `RecordId`. Удаление graph удаляет только его catalog entry,
 occurrences, topology, overlays и effective indexes; global atoms и classes сохраняются.
 
-Decoder target layout принимает только `FGDC v7` и `FGFC v5`. Реализованные промежуточные
-`FGDC v5/v6`, `FGFC v4` и graph-owned atom layout возвращают typed incompatible-format error и не
+После fixed graph fields `FGDC v8` хранит catalog-owned properties:
+
+```text
+property_count: u32 LE
+repeat property_count in ascending PropertyKeyId:
+    property_key_id: u32 LE
+    value_len: u32 LE
+    value_bytes: canonical StorageValue (§5)
+```
+
+Ключ обязан существовать в database `PropertyDictionary`; duplicate и неканонический порядок,
+unknown key, `none`, runtime-only value, неверная длина и неканонический payload являются
+corruption. `null` является обычным хранимым значением. Properties изменяют catalog/schema
+revision при сохранении `GraphId` и physical bindings; в `GraphSuperblock` они не дублируются.
+
+Decoder target layout принимает только `FGDC v8` и `FGFC v5`. Реализованные промежуточные
+`FGDC v5/v6/v7`, `FGFC v4` и graph-owned atom layout возвращают typed incompatible-format error и не
 мигрируются, поскольку core format v1 ещё не заморожен.
 
 **Расширения файлов:**
@@ -1635,14 +1650,14 @@ Total = PAGE_SIZE байт
 Строковые пространства разделены. Database-wide `PropertyDictionary` интернирует только ключи
 свойств. `LabelDictionary` каждого графа интернирует только graph-local node/edge labels и имеет
 две независимые плотные последовательности ID. Имена classes принадлежат `ClassCatalog`, а IANA
-timezone names — `FGDC v7`.
+timezone names — `FGDC v8`.
 
 ### 16.1. Database-wide `PropertyDictionary`
 
 `atoms/<generation>/property_keys.fgb` имеет `DataFileKind::PropertyDictionary = 0x14`, является
 append-only, WAL-versioned и не имеет freelist. `PropertyKeyId` плотны, стабильны и монотонны в
 диапазоне `[0, entry_count)`; удалённый ключ не переиспользуется. `FileCatalog` — единственная
-authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v7`.
+authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v8`.
 
 ```text
 PropertyDictionaryRoot (PageType 0x003C):
@@ -1920,7 +1935,7 @@ Identity `0` и `u32::MAX` зарезервированы; допустимые 
 
 ### 18.2. Физическая публикация реализованного ядра
 
-Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 7 (§7.2). Перед первым
+Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 8 (§7.2). Перед первым
 `StorageValue` payload кодируется length-framed IANA timezone table; UTC id 0 и fixed offsets
 остаются implicit. Inline property-key strings удалены: definitions сохраняют только
 `PropertyKeyId` и разрешают их через §16.1.
@@ -1964,7 +1979,7 @@ Primary/label/adjacency имеют каталожную identity даже ког
 inline layout; пользователь не может удалить их отдельно.
 
 Подразделы 18.3–18.7 задают логические определения для последующего расширения DDL. Их
-псевдо-layout не является byte-offset layout payload `FGDC` v7; writer format v1 кодирует
+псевдо-layout не является byte-offset layout payload `FGDC` v8; writer format v1 кодирует
 только реализованные поля из таблицы выше и обязан отвергать ещё не поддержанные варианты.
 
 ### 18.3. ClassDefinition (def format)

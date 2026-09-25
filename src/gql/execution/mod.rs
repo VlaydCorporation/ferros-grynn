@@ -8,7 +8,9 @@ mod builtins;
 mod cursor;
 mod dml;
 mod eval;
+mod graph_properties;
 mod schema;
+mod select;
 
 use std::{collections::BTreeSet, rc::Rc, sync::Arc, time::Instant};
 
@@ -20,6 +22,7 @@ pub use adapter::{execute_transaction, execute_transaction_with_options};
 use dml::{execute_dml, execute_graph_dml};
 use rust_decimal::Decimal;
 use schema::execute_schema;
+use select::execute_select;
 #[allow(
 	clippy::wildcard_imports,
 	reason = "move-only executor split keeps the existing cursor and evaluator names during stage \
@@ -32,6 +35,7 @@ use super::{
 	QueryStatementKind,
 	analysis::{QueryCatalog, analyze, analyze_statement, compatible},
 	ir::{
+		Aggregate,
 		Column,
 		EndpointDomain,
 		Expand,
@@ -44,24 +48,29 @@ use super::{
 		LogicalDmlTarget,
 		LogicalExpect,
 		LogicalGraphDmlStatement,
+		LogicalGraphPropertyMutation,
+		LogicalGraphReference,
 		LogicalMatch,
 		LogicalMatchPattern,
 		LogicalMatchSelector,
-		LogicalNodeKind,
 		LogicalProgram,
 		LogicalSchemaStatement,
 		LogicalSelect,
+		LogicalSelectItem,
+		LogicalSelectSource,
+		LogicalSelectSourceKind,
+		LogicalSelectStart,
 		LogicalStatement,
+		LogicalWildcardField,
 		MatchBinding,
 		MatchOp,
-		NodeId,
 		PathExpand,
 		ScanTarget,
 		Schema,
 		TypedExpr,
 		TypedExprKind,
 	},
-	options::ExecutionControl,
+	options::{BarrierAccount, ExecutionControl},
 };
 use crate::{
 	datastore::{
@@ -179,7 +188,6 @@ fn execute_logical_statement<Read: QueryRead>(
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<QueryResult> {
 	let start = Instant::now();
-	control.check()?;
 	let kind = logical_statement_kind(statement);
 	let mut runtime = ControlRuntime::default();
 	let result =
@@ -196,10 +204,17 @@ fn execute_logical_statement<Read: QueryRead>(
 				control.check()?;
 				Ok(outcome)
 			});
+	let continuation = if result.is_ok() {
+		control.take_continuation()
+	} else {
+		control.discard_continuation();
+		None
+	};
 	Ok(QueryResult {
 		kind,
 		elapsed: start.elapsed(),
 		result,
+		continuation,
 	})
 }
 
@@ -344,7 +359,9 @@ fn execute_statement<Read: QueryRead>(
 	depth: u32,
 	persist_let: bool,
 ) -> FerrosGrynnResult<ControlFlow> {
-	control.check()?;
+	if !matches!(statement, LogicalStatement::Select(_)) {
+		control.check()?;
+	}
 	if depth > control.max_control_depth {
 		return Err(FerrosGrynnError::control_limit_exceeded(
 			"nesting depth",
@@ -352,7 +369,9 @@ fn execute_statement<Read: QueryRead>(
 		));
 	}
 	let value = match statement {
-		LogicalStatement::Schema(statement) => read.execute_schema(statement)?,
+		LogicalStatement::Schema(statement) => {
+			read.execute_schema(statement, slots, source, control)?
+		}
 		LogicalStatement::Dml(statement) => read.execute_dml(statement, slots, source, control)?,
 		LogicalStatement::GraphDml(statement) => {
 			read.execute_graph_dml(statement, slots, source, control)?
@@ -908,165 +927,6 @@ fn pattern_uses_edge_endpoint(pattern: &LogicalMatchPattern) -> bool {
 					|| expand.target.domain == EndpointDomain::Edge
 			}
 		})
-}
-
-/// Executes the existing SELECT pull pipeline.
-fn execute_select<Read: QueryRead>(
-	read: &Read,
-	snapshot: Snapshot,
-	plan: &LogicalSelect,
-	slots: &[Value],
-	source: &str,
-	control: &ExecutionControl,
-) -> FerrosGrynnResult<Value> {
-	let predicate = plan.nodes.iter().find_map(|node| match &node.kind {
-		LogicalNodeKind::Filter {
-			predicate,
-			..
-		} => Some(predicate),
-		_ => None,
-	});
-	let fields = RecordFields {
-		read,
-		snapshot,
-		graph: plan.graph.as_ref(),
-	};
-	let mut cursor = build_cursor(
-		read,
-		snapshot,
-		plan,
-		plan.root,
-		slots,
-		source,
-		predicate,
-		Some(&fields),
-		control,
-	)?;
-	let schema = &plan.node(plan.root).schema;
-	let mut result = Array::new(Vec::new());
-	while let Some(row) = cursor.next(control).map_err(execution_phase)? {
-		let value = if plan.value {
-			row.values.into_iter().next().unwrap_or(Value::None)
-		} else {
-			let object = schema
-				.columns
-				.iter()
-				.zip(row.values)
-				.map(|(column, value)| (column.name.as_ref(), value))
-				.collect::<Object>();
-			Value::Object(object)
-		};
-		result.push(value);
-		if plan.only && result.len() > 1 {
-			return Err(FerrosGrynnError::invalid_argument(
-				"SELECT ONLY returned more than one row.",
-			)
-			.with_phase(ExecutionPhase::Execution));
-		}
-	}
-	Ok(Value::Array(result))
-}
-
-/// Builds the existing SELECT cursor chain for one logical node.
-fn build_cursor<'a, Read: QueryRead>(
-	read: &'a Read,
-	snapshot: Snapshot,
-	plan: &'a LogicalSelect,
-	node_id: NodeId,
-	slots: &'a [Value],
-	source: &'a str,
-	scan_predicate: Option<&'a TypedExpr>,
-	fields: Option<&'a dyn AtomFieldRead>,
-	control: &'a ExecutionControl,
-) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
-	let node = plan.node(node_id);
-	match &node.kind {
-		LogicalNodeKind::Scan {
-			target,
-		} => {
-			let inner: Box<dyn RowCursor + 'a> = match target {
-				ScanTarget::Class(class) => {
-					read.scan(snapshot, class, plan.graph.as_ref(), scan_predicate, slots, source)?
-				}
-				ScanTarget::Record(record) => Box::new(OneRowCursor {
-					row: read.get(snapshot, record, plan.graph.as_ref())?,
-				}),
-			};
-			Ok(Box::new(ScanCursor {
-				inner,
-			}))
-		}
-		LogicalNodeKind::Filter {
-			input,
-			predicate,
-		} => Ok(Box::new(FilterCursor {
-			input: build_cursor(
-				read,
-				snapshot,
-				plan,
-				*input,
-				slots,
-				source,
-				scan_predicate,
-				fields,
-				control,
-			)?,
-			predicate,
-			slots,
-			source,
-			fields,
-		})),
-		LogicalNodeKind::Project {
-			input,
-			expressions,
-		} => Ok(Box::new(ProjectCursor {
-			input: build_cursor(
-				read,
-				snapshot,
-				plan,
-				*input,
-				slots,
-				source,
-				scan_predicate,
-				fields,
-				control,
-			)?,
-			expressions,
-			slots,
-			source,
-			fields,
-		})),
-		LogicalNodeKind::Limit {
-			input,
-			limit,
-			start,
-		} => {
-			let limit = limit
-				.as_ref()
-				.map(|value| eval_usize(value, slots, source, control))
-				.transpose()?;
-			let start = start
-				.as_ref()
-				.map(|value| eval_usize(value, slots, source, control))
-				.transpose()?
-				.unwrap_or(0);
-			Ok(Box::new(LimitCursor {
-				input: build_cursor(
-					read,
-					snapshot,
-					plan,
-					*input,
-					slots,
-					source,
-					scan_predicate,
-					fields,
-					control,
-				)?,
-				remaining: limit,
-				skip: start,
-			}))
-		}
-	}
 }
 
 #[cfg(test)]

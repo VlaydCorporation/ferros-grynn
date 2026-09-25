@@ -305,7 +305,8 @@ impl StorageValue {
 			| Value::Path(_)
 			| Value::Graph(_)
 			| Value::Closure(_)
-			| Value::Error(_) => Err(FerrosGrynnError::unsupported_storage_value(value.kind().to_string())),
+			| Value::Error(_)
+			| Value::Cursor(_) => Err(FerrosGrynnError::unsupported_storage_value(value.kind().to_string())),
 		}
 	}
 

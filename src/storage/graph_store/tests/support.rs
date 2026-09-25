@@ -99,6 +99,7 @@ impl Fixture {
 				IndexId::new(4).ok_or_else(|| invalid("test adjacency index ID is invalid"))?,
 				SystemIndexKind::Adjacency,
 			),
+			PropertyMap::new(),
 			1,
 		);
 		database.install_graph(schema, 1)?;

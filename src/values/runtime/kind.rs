@@ -32,6 +32,7 @@ pub enum ValueKind {
 	Graph,
 	Closure,
 	Error,
+	Cursor,
 }
 
 impl ValueKind {
@@ -62,6 +63,7 @@ impl ValueKind {
 			Self::Graph => 22,
 			Self::Closure => 23,
 			Self::Error => 24,
+			Self::Cursor => 25,
 		}
 	}
 
@@ -94,6 +96,7 @@ impl ValueKind {
 			Self::Graph => "graph",
 			Self::Closure => "closure",
 			Self::Error => "error",
+			Self::Cursor => "cursor",
 		}
 	}
 

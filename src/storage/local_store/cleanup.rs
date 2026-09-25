@@ -80,6 +80,17 @@ pub(super) fn cleanup_orphan_generations(
 	Ok(())
 }
 
+/// Removes transient query runs left by an interrupted process before the
+/// database accepts sessions.
+pub(super) fn cleanup_query_runs(root: &Path) -> FerrosGrynnResult<()> {
+	let path = root.join("tmp").join("query");
+	match fs::remove_dir_all(path) {
+		Ok(()) => Ok(()),
+		Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+		Err(source) => Err(io_failure("remove stale query-run scratch", source)),
+	}
+}
+
 /// Derives the exact reachable generation directories from the catalog.
 fn generation_directories(
 	root: &Path,
@@ -144,6 +155,25 @@ fn cleanup_generation_children(
 /// Wraps a filesystem failure in the project storage status.
 fn io_failure(operation: impl Into<String>, source: std::io::Error) -> FerrosGrynnError {
 	FerrosGrynnError::storage_io_failure(operation).with_technical_source(source)
+}
+
+#[cfg(test)]
+mod query_run_tests {
+	use super::*;
+
+	#[test]
+	fn startup_cleanup_removes_orphan_query_runs_idempotently() {
+		let root = std::env::temp_dir()
+			.join(format!("fg-query-cleanup-{}", crate::values::Uuid::now_v7()));
+		let session = root.join("tmp").join("query").join("orphan");
+		fs::create_dir_all(&session).unwrap();
+		fs::write(session.join("0000000000000000.run"), b"orphan").unwrap();
+
+		cleanup_query_runs(&root).unwrap();
+		assert!(!root.join("tmp").join("query").exists());
+		cleanup_query_runs(&root).unwrap();
+		drop(fs::remove_dir_all(root));
+	}
 }
 
 #[cfg(test)]

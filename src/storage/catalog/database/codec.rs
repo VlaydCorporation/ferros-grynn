@@ -1,4 +1,4 @@
-//! Canonical little-endian encoding for `FGDC v7`.
+//! Canonical little-endian encoding for `FGDC v8`.
 
 use super::{
 	AtomStoreCatalogBinding,
@@ -7,6 +7,7 @@ use super::{
 	ClassIndexCatalogEntry,
 	DatabaseCatalog,
 	GraphCatalogEntry,
+	GraphPropertyCatalogEntry,
 	ParameterCatalogEntry,
 	PhysicalIndexBinding,
 	type_codec,
@@ -30,11 +31,11 @@ use crate::{
 		page::PageNo,
 		types::{DataFileId, DataFileKind},
 	},
-	values::{PropertyKeyId, Text},
+	values::PropertyKeyId,
 };
 
 const MAGIC: [u8; 4] = *b"FGDC";
-const VERSION: u16 = 7;
+const VERSION: u16 = 8;
 const HEADER_BYTES: usize = 80;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
@@ -278,8 +279,14 @@ fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnR
 	output.extend_from_slice(&graph.adjacency_index.0.get().to_le_bytes());
 	output.extend_from_slice(&graph.adjacency_index.1.get().to_le_bytes());
 	write_binding(output, graph.membership);
+	write_u32(output, graph.properties.len(), "graph property count")?;
 	write_u32(output, graph.arena.graph_by_slot.len(), "graph arena slot count")?;
 	write_string(output, graph.name.as_str(), "graph name")?;
+	for property in &graph.properties {
+		output.extend_from_slice(&property.key.get().to_le_bytes());
+		write_u32(output, property.value.len(), "graph property value bytes")?;
+		output.extend_from_slice(&property.value);
+	}
 	for (slot, child) in &graph.arena.graph_by_slot {
 		let scope = graph
 			.arena
@@ -315,8 +322,19 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 		SchemaVersion::from_storage(decoder.read_u32()?)?,
 	);
 	let membership = read_binding(decoder)?;
+	let property_count = decoder.read_count("graph property count")?;
 	let slot_count = decoder.read_count("graph arena slot count")?;
 	let name = read_string(decoder, "graph name")?.into();
+	let mut properties = Vec::with_capacity(property_count);
+	for _ in 0..property_count {
+		let key = PropertyKeyId::new(decoder.read_u32()?);
+		let value_len = decoder.read_count("graph property value bytes")?;
+		let value = decoder.read_exact(value_len)?.to_vec();
+		properties.push(GraphPropertyCatalogEntry {
+			key,
+			value,
+		});
+	}
 	let mut graph_by_slot = std::collections::BTreeMap::new();
 	let mut scope_by_slot = std::collections::BTreeMap::new();
 	for _ in 0..slot_count {
@@ -350,6 +368,7 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 		label_index,
 		adjacency_index,
 		membership,
+		properties,
 		arena: GraphArenaBindings {
 			graph_by_slot,
 			scope_by_slot,

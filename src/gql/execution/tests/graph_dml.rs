@@ -133,6 +133,10 @@ fn query_to_memory_owns_effective_graph_after_source_transaction_is_dropped() {
 	let alice = "person:alice".parse::<RecordId>().unwrap();
 	let mut transaction = store.begin();
 	let name = transaction.intern_property("name").unwrap();
+	let owner = transaction.intern_property("owner").unwrap();
+	let mut graph_properties = crate::values::PropertyMap::new();
+	graph_properties.insert(owner, "team");
+	transaction.replace_graph_properties("social", graph_properties).unwrap();
 	transaction.set_base_property(&alice, name, Value::from("Base")).unwrap();
 	let snapshot = transaction.query_snapshot().unwrap();
 	let graph = transaction.query_named_graph(&snapshot, "social").unwrap();
@@ -145,6 +149,7 @@ fn query_to_memory_owns_effective_graph_after_source_transaction_is_dropped() {
 
 	assert_eq!(materialized.storage_mode(), GraphStorageMode::Hybrid);
 	assert_eq!(materialized.graph_ref(), Some(&graph));
+	assert_eq!(materialized.properties().get(owner), Some(&Value::from("team")));
 	let node = materialized
 		.node_ids()
 		.unwrap()

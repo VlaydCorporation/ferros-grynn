@@ -32,12 +32,13 @@ pub enum ClassSchemaModeName {
 
 /// Core `DEFINE GRAPH` syntax. Unsupported constraints remain visible to the
 /// semantic analyzer so they produce an explicit feature status.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DefineGraphStatement {
 	pub mode: DefinitionMode,
 	pub name: Identifier,
 	pub constraints: Vec<Identifier>,
+	pub content: Option<Expr>,
 }
 
 /// Core `DEFINE CLASS` syntax.
@@ -169,14 +170,16 @@ pub struct InfoStatement {
 }
 
 impl Parser<'_> {
-	pub(in crate::syn) fn define_graph_statement(
+	pub(in crate::syn) async fn define_graph_statement(
 		&mut self,
+		context: &mut Stk,
 	) -> FerrosGrynnResult<DefineGraphStatement> {
 		let mode = self.definition_mode()?;
 		let name = self.identifier()?;
 		let mut constraints = Vec::new();
 		if self.consume_keyword(keywords::TYPE).is_some() {
 			while !self.at_statement_end()
+				&& !self.at_keyword(keywords::CONTENT)
 				&& ![keywords::ROOT, keywords::ROOTS, keywords::VALIDATE, keywords::COMMENT]
 					.iter()
 					.any(|keyword| self.at_keyword(keyword))
@@ -189,6 +192,11 @@ impl Parser<'_> {
 				);
 			}
 		}
+		let content = if self.consume_keyword(keywords::CONTENT).is_some() {
+			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
+		} else {
+			None
+		};
 		if let Some(feature) =
 			[keywords::ROOT, keywords::ROOTS, keywords::VALIDATE, keywords::COMMENT]
 				.iter()
@@ -202,6 +210,7 @@ impl Parser<'_> {
 			mode,
 			name,
 			constraints,
+			content,
 		})
 	}
 

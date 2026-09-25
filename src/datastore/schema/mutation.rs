@@ -1,12 +1,38 @@
 use std::sync::Arc;
 
 use crate::{
-	datastore::{ClassId, ClassSchema, DatabaseRoot},
+	datastore::{ClassId, ClassSchema, DatabaseRoot, GraphSchema},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphId,
 };
 
 impl DatabaseRoot {
+	/// Replaces one graph definition without changing physical identity or
+	/// graph-local bindings.
+	pub(crate) fn replace_graph_schema(
+		&mut self,
+		mut replacement: GraphSchema,
+		published_at: u64,
+	) -> FerrosGrynnResult<()> {
+		let id = replacement.id();
+		let current = self
+			.schema
+			.graph(id)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(id.to_string()))?;
+		if current.reference() != replacement.reference()
+			|| current.system_indexes().ne(replacement.system_indexes())
+		{
+			return Err(FerrosGrynnError::invalid_argument(
+				"graph identity, family, storage mode, and system indexes are immutable",
+			));
+		}
+		replacement.published_at = published_at;
+		let catalog = Arc::make_mut(&mut self.schema);
+		catalog.graphs.insert(id, Arc::new(replacement));
+		catalog.graph_versions.insert(id, published_at);
+		Ok(())
+	}
+
 	/// Replaces one published class definition without changing its identity,
 	/// name, or atom kind.
 	pub(crate) fn replace_class(

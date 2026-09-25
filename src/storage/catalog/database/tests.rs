@@ -10,11 +10,11 @@ use crate::{
 };
 
 #[test]
-fn fgdc_v7_round_trips_recursive_types_and_bindings() -> FerrosGrynnResult<()> {
+fn fgdc_v8_round_trips_recursive_types_bindings_and_graph_properties() -> FerrosGrynnResult<()> {
 	let catalog = fixture()?;
 	let bytes = catalog.encode()?;
 	assert_eq!(&bytes[..4], b"FGDC");
-	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 7);
+	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 8);
 	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
 	Ok(())
 }
@@ -23,7 +23,7 @@ fn fgdc_v7_round_trips_recursive_types_and_bindings() -> FerrosGrynnResult<()> {
 fn fgdc_rejects_old_version_truncation_and_duplicate_schema_identity() -> FerrosGrynnResult<()> {
 	let catalog = fixture()?;
 	let mut old = catalog.encode()?;
-	old[4..6].copy_from_slice(&6_u16.to_le_bytes());
+	old[4..6].copy_from_slice(&7_u16.to_le_bytes());
 	assert!(DatabaseCatalog::decode(&old).is_err());
 
 	let mut truncated = catalog.encode()?;
@@ -33,6 +33,17 @@ fn fgdc_rejects_old_version_truncation_and_duplicate_schema_identity() -> Ferros
 	let mut duplicate = catalog;
 	duplicate.parameters[0].id = duplicate.classes[0].fields[0].id;
 	assert!(duplicate.encode().is_err());
+	Ok(())
+}
+
+#[test]
+fn fgdc_rejects_duplicate_or_unsorted_graph_properties() -> FerrosGrynnResult<()> {
+	let mut catalog = fixture()?;
+	catalog.graphs[0].properties.push(GraphPropertyCatalogEntry {
+		key: PropertyKeyId::new(0),
+		value: vec![1],
+	});
+	assert!(catalog.encode().is_err());
 	Ok(())
 }
 
@@ -96,6 +107,10 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 				SchemaVersion::INITIAL,
 			),
 			membership: index(4)?,
+			properties: vec![GraphPropertyCatalogEntry {
+				key: PropertyKeyId::new(0),
+				value: vec![1],
+			}],
 			arena: GraphArenaBindings {
 				graph_by_slot: BTreeMap::from([(0, graph)]),
 				scope_by_slot: BTreeMap::from([(0, Box::default())]),

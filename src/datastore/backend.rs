@@ -2,7 +2,9 @@
 
 use std::{
 	collections::BTreeMap,
+	fs,
 	num::NonZeroUsize,
+	path::PathBuf,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -35,6 +37,7 @@ pub(crate) struct StoreInner {
 	pub(crate) import_owner: AtomicU64,
 	pub(crate) current: RwLock<Arc<DatabaseRoot>>,
 	pub(crate) commit: Mutex<()>,
+	pub(crate) query_scratch_root: PathBuf,
 }
 
 pub(crate) enum StoreBackend {
@@ -91,10 +94,17 @@ impl StoreInner {
 		}
 	}
 
-	pub(crate) fn persist_root(&self, root: &DatabaseRoot) -> FerrosGrynnResult<()> {
+	pub(crate) fn persist_root(
+		&self,
+		root: &DatabaseRoot,
+		graph_catalog_only: bool,
+		dictionary_changed: bool,
+	) -> FerrosGrynnResult<()> {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(()),
-			StoreBackend::Local(local) => local.persist_root(root),
+			StoreBackend::Local(local) => {
+				local.persist_root(root, graph_catalog_only, dictionary_changed)
+			}
 		}
 	}
 
@@ -115,6 +125,10 @@ impl StoreInner {
 		}
 	}
 
+	pub(crate) fn query_scratch_root(&self) -> std::path::PathBuf {
+		self.query_scratch_root.clone()
+	}
+
 	pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<bool> {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(false),
@@ -123,10 +137,40 @@ impl StoreInner {
 	}
 }
 
+impl Drop for StoreInner {
+	fn drop(&mut self) {
+		if matches!(self.backend, StoreBackend::InMemory) {
+			drop(fs::remove_dir_all(&self.query_scratch_root));
+		}
+	}
+}
+
 pub(crate) struct ValidatedLocalOptions {
 	pub(crate) pool_pages: NonZeroUsize,
 	pub(crate) checkpoint_page_threshold: usize,
 	pub(crate) io_mode: PageIoMode,
+}
+
+#[cfg(test)]
+mod query_scratch_tests {
+	use super::*;
+
+	#[test]
+	fn in_memory_stores_own_distinct_query_scratch_roots() {
+		let first = crate::datastore::Datastore::in_memory();
+		let second = crate::datastore::Datastore::in_memory();
+		let first_root = first.inner.query_scratch_root();
+		let second_root = second.inner.query_scratch_root();
+		assert_ne!(first_root, second_root);
+		fs::create_dir_all(&first_root).unwrap();
+		fs::create_dir_all(&second_root).unwrap();
+
+		drop(first);
+		assert!(!first_root.exists());
+		assert!(second_root.exists());
+		drop(second);
+		assert!(!second_root.exists());
+	}
 }
 
 pub(crate) fn validate_local_options(

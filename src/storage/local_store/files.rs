@@ -2,12 +2,17 @@
 
 use std::{fs, path::Path};
 
-use super::{image::BuiltGeneration, layout::invalid};
+use super::{
+	image::BuiltGeneration,
+	layout::{DATABASE_CATALOG_CONTINUATION, DATABASE_CATALOG_ROOT, invalid},
+};
 use crate::{
 	datastore::DataSpaceId,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	storage::{
+		catalog::{CatalogKind, DatabaseCatalog, encode_page_chain},
 		direct::DirectFile,
+		page::PageLsn,
 		types::{DataFileKind, PageKey},
 		wal::TxHandle,
 	},
@@ -111,6 +116,26 @@ pub(super) fn stage_import_catalog(
 	page_count(image)?;
 	for (number, page) in image.page_numbers.iter().copied().zip(&image.pages) {
 		tx.stage_page(PageKey::new(image.entry.space_id, image.entry.file_id, number), page)?;
+	}
+	Ok(())
+}
+
+/// Stages only the database catalog chain while retaining every physical
+/// binding in the current file catalog.
+pub(super) fn stage_database_catalog(
+	tx: &mut TxHandle,
+	catalog: &DatabaseCatalog,
+) -> FerrosGrynnResult<()> {
+	let (numbers, pages) = encode_page_chain(
+		CatalogKind::Database,
+		DATABASE_CATALOG_ROOT,
+		DATABASE_CATALOG_CONTINUATION,
+		&catalog.encode()?,
+		PageLsn::ZERO,
+	)?;
+	let file = crate::storage::types::DataFileId::for_kind(DataFileKind::SystemCatalog);
+	for (number, page) in numbers.into_iter().zip(&pages) {
+		tx.stage_page(PageKey::new(DataSpaceId::Database, file, number), page)?;
 	}
 	Ok(())
 }

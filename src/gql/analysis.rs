@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::ir::{
+	Aggregate,
 	Builtin,
 	Column,
 	EndpointDomain,
@@ -16,17 +17,24 @@ use super::ir::{
 	LogicalDmlTarget,
 	LogicalExpect,
 	LogicalGraphDmlStatement,
+	LogicalGraphPropertyMutation,
+	LogicalGraphReference,
 	LogicalMatch,
 	LogicalMatchPattern,
 	LogicalMatchSelector,
-	LogicalNode,
-	LogicalNodeKind,
+	LogicalOrder,
 	LogicalProgram,
 	LogicalRecordTarget,
 	LogicalRelateEdge,
 	LogicalSchemaStatement,
 	LogicalSelect,
+	LogicalSelectItem,
+	LogicalSelectJoin,
+	LogicalSelectSource,
+	LogicalSelectSourceKind,
+	LogicalSelectStart,
 	LogicalStatement,
+	LogicalWildcardField,
 	MatchBinding,
 	MatchOp,
 	PathExpand,
@@ -55,6 +63,7 @@ use crate::{
 		ExpectClause,
 		Expr,
 		ExprKind,
+		GraphPropertyMutation,
 		IndexScopeName,
 		InfoTarget,
 		Literal,
@@ -66,11 +75,16 @@ use crate::{
 		Program,
 		RecordKey,
 		RemoveTarget,
+		SelectGroup,
 		SelectItem,
+		SelectSource,
+		SelectSourceKind,
+		SelectStart,
 		SelectTarget,
 		StatementKind,
 		TypeName,
 		UnaryOperator,
+		UpdateGraphStatement,
 	},
 	values::{
 		AtomKind,
@@ -253,6 +267,9 @@ impl<'a> Analyzer<'a> {
 				statement.expect.as_ref(),
 				false,
 			)?),
+			StatementKind::UpdateGraph(statement) => {
+				LogicalStatement::Schema(self.update_graph(statement)?)
+			}
 			StatementKind::Upsert(statement) => LogicalStatement::Dml(self.dml(
 				LogicalDmlKind::Upsert,
 				&statement.targets,
@@ -679,6 +696,7 @@ impl<'a> Analyzer<'a> {
 			}
 			schema.columns.push(Column {
 				name,
+				qualifier: None,
 				ty: Type::Any,
 			});
 		}
@@ -818,6 +836,67 @@ impl<'a> Analyzer<'a> {
 			mode: definition.mode,
 			name: definition.name.value.clone(),
 			kind,
+			content: definition
+				.content
+				.as_ref()
+				.map(|content| {
+					let content = self.expr(content, None)?;
+					if !compatible(&Type::Object, &content.ty) {
+						return Err(self.semantic(
+							"DEFINE GRAPH CONTENT requires an object value.",
+							content.span,
+						));
+					}
+					Ok(content)
+				})
+				.transpose()?,
+		})
+	}
+
+	fn update_graph(
+		&self,
+		statement: &UpdateGraphStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		let mutation = match &statement.mutation {
+			GraphPropertyMutation::Set(assignments) => LogicalGraphPropertyMutation::Set(
+				assignments
+					.iter()
+					.map(|assignment| {
+						Ok((
+							assignment
+								.path
+								.fields
+								.iter()
+								.map(|field| field.value.clone())
+								.collect(),
+							self.expr(&assignment.value, None)?,
+						))
+					})
+					.collect::<FerrosGrynnResult<Vec<_>>>()?,
+			),
+			GraphPropertyMutation::Unset(paths) => LogicalGraphPropertyMutation::Unset(
+				paths
+					.iter()
+					.map(|path| path.fields.iter().map(|field| field.value.clone()).collect())
+					.collect(),
+			),
+		};
+		let returning = match statement.returning.as_ref().unwrap_or(&DmlReturn::None) {
+			DmlReturn::None => LogicalDmlReturn::None,
+			DmlReturn::Before => LogicalDmlReturn::Before,
+			DmlReturn::After => LogicalDmlReturn::After,
+			DmlReturn::Diff => LogicalDmlReturn::Diff,
+			DmlReturn::Fields(_) | DmlReturn::Value(_) => {
+				return Err(self.semantic(
+					"UPDATE GRAPH supports only RETURN NONE, BEFORE, AFTER, or DIFF.",
+					statement.graph.span,
+				));
+			}
+		};
+		Ok(LogicalSchemaStatement::UpdateGraph {
+			graph: self.catalog.graph(&statement.graph.value)?,
+			mutation,
+			returning,
 		})
 	}
 
@@ -1000,6 +1079,7 @@ impl<'a> Analyzer<'a> {
 				.unwrap_or_else(|| format!("value_{index}").into_boxed_str());
 			columns.push(Column {
 				name,
+				qualifier: None,
 				ty: typed.ty.clone(),
 			});
 			projection.push(typed);
@@ -1220,6 +1300,7 @@ impl<'a> Analyzer<'a> {
 		let column = bindings.columns.len();
 		bindings.columns.push(Column {
 			name: alias.value.clone(),
+			qualifier: None,
 			ty,
 		});
 		aliases.insert(key, MatchAlias {
@@ -1234,113 +1315,360 @@ impl<'a> Analyzer<'a> {
 		statement: &crate::syn::SelectStatement,
 		span: TextSpan,
 	) -> FerrosGrynnResult<LogicalSelect> {
-		let target = self.scan_target(&statement.target)?;
-		let scan_schema = self.catalog.schema(target.class())?;
-		let mut plan = LogicalSelect {
-			nodes: Vec::new(),
-			root: super::ir::NodeId(0),
-			graph: statement
-				.graph
+		self.select_with_outer(statement, span, None)
+	}
+
+	fn select_with_outer(
+		&self,
+		statement: &crate::syn::SelectStatement,
+		span: TextSpan,
+		outer: Option<&Schema>,
+	) -> FerrosGrynnResult<LogicalSelect> {
+		let source = self.select_source(&statement.source, outer)?;
+		let mut input_schema = source.schema.clone();
+		let mut wildcard = source.wildcard.clone();
+		let mut aliases = BTreeMap::new();
+		aliases.insert(source.alias.to_ascii_lowercase(), statement.source.span);
+		let mut joins = Vec::with_capacity(statement.joins.len());
+		for join in &statement.joins {
+			let source = self.select_source(&join.source, outer)?;
+			let alias = source.alias.to_ascii_lowercase();
+			if aliases.insert(alias.clone(), join.source.span).is_some() {
+				return Err(self.semantic(
+					&format!("SELECT source alias `{}` is duplicated.", source.alias),
+					join.source.span,
+				));
+			}
+			let offset = input_schema.columns.len();
+			wildcard.extend(source.wildcard.iter().map(|field| offset_wildcard(field, offset)));
+			input_schema.columns.extend(source.schema.columns.iter().cloned());
+			let predicate = join
+				.predicate
 				.as_ref()
-				.map(|graph| self.catalog.graph(&graph.value))
-				.transpose()?,
-			value: statement.value,
-			only: statement.only,
-		};
-		let mut root = plan.push(LogicalNode {
-			kind: LogicalNodeKind::Scan {
-				target,
-			},
-			schema: scan_schema.clone(),
-			span,
-		});
-		if let Some(filter) = &statement.filter {
-			let predicate = self.expr(filter, Some(&scan_schema))?;
-			root = plan.push(LogicalNode {
-				kind: LogicalNodeKind::Filter {
-					input: root,
-					predicate,
-				},
-				schema: scan_schema.clone(),
-				span: filter.span,
+				.map(|predicate| self.select_expr(predicate, Some(&input_schema), false, 0))
+				.transpose()?;
+			joins.push(LogicalSelectJoin {
+				kind: join.kind,
+				source,
+				predicate,
 			});
 		}
-
-		let mut expressions = Vec::new();
+		let outer_columns = outer.map_or(0, |schema| schema.columns.len());
+		if let Some(outer) = outer {
+			input_schema.columns.extend(outer.columns.iter().cloned());
+		}
+		let filter = statement
+			.filter
+			.as_ref()
+			.map(|filter| self.select_expr(filter, Some(&input_schema), false, 0))
+			.transpose()?;
+		let split = statement
+			.split
+			.iter()
+			.map(|value| self.select_expr(value, Some(&input_schema), false, 0))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let group = match &statement.group {
+			None => None,
+			Some(SelectGroup::All(_)) => Some(Vec::new()),
+			Some(SelectGroup::By(values)) => Some(
+				values
+					.iter()
+					.map(|value| self.select_expr(value, Some(&input_schema), false, 0))
+					.collect::<FerrosGrynnResult<Vec<_>>>()?,
+			),
+		};
+		let mut projection = Vec::with_capacity(statement.projection.len());
 		let mut columns = Vec::new();
+		let mut contains_aggregate = false;
 		for (index, item) in statement.projection.iter().enumerate() {
 			match item {
 				SelectItem::Wildcard(item_span) => {
 					if statement.value {
 						return Err(self.semantic("SELECT VALUE does not accept `*`.", *item_span));
 					}
-					for (column_index, column) in scan_schema.columns.iter().enumerate() {
-						expressions.push(TypedExpr {
-							kind: TypedExprKind::Column(column_index),
-							ty: column.ty.clone(),
-							span: *item_span,
-						});
-						columns.push(column.clone());
+					for field in &wildcard {
+						if let LogicalWildcardField::Column {
+							name,
+							index,
+						} = field
+						{
+							columns.push(Column {
+								name: name.clone(),
+								qualifier: None,
+								ty: input_schema.columns[*index].ty.clone(),
+							});
+						}
 					}
+					projection.push(LogicalSelectItem::Wildcard(wildcard.clone()));
 				}
 				SelectItem::Expr {
 					expr,
 					alias,
 				} => {
-					let typed = self.expr(expr, Some(&scan_schema))?;
-					let name: Box<str> = alias
+					let typed = self.select_expr(expr, Some(&input_schema), true, 0)?;
+					contains_aggregate |= typed_expr_contains_aggregate(&typed);
+					let name = alias
 						.as_ref()
 						.map(|alias| alias.value.clone())
-						.or_else(|| match &expr.kind {
-							ExprKind::Name(name) => Some(name.value.clone()),
-							_ => None,
-						})
+						.or_else(|| select_expression_name(expr))
 						.unwrap_or_else(|| format!("value_{index}").into_boxed_str());
 					columns.push(Column {
-						name,
+						name: name.clone(),
+						qualifier: None,
 						ty: typed.ty.clone(),
 					});
-					expressions.push(typed);
+					projection.push(LogicalSelectItem::Expression {
+						name,
+						expression: typed,
+					});
 				}
 			}
 		}
-		let project_schema = Schema {
+		contains_aggregate |=
+			statement.order.iter().any(|order| expr_contains_aggregate(&order.expression));
+		if (group.is_some() || contains_aggregate)
+			&& statement.projection.iter().any(|item| matches!(item, SelectItem::Wildcard(_)))
+		{
+			return Err(self.semantic("Grouped SELECT does not accept `*`.", span));
+		}
+		if group.is_some() || contains_aggregate {
+			let group_expressions = group.as_deref().unwrap_or_default();
+			for (item, logical) in statement.projection.iter().zip(&projection) {
+				let (
+					SelectItem::Expr {
+						expr,
+						..
+					},
+					LogicalSelectItem::Expression {
+						expression,
+						..
+					},
+				) = (item, logical)
+				else {
+					continue;
+				};
+				if !typed_expr_contains_aggregate(expression)
+					&& expr_references_row(expr)
+					&& !group_expressions
+						.iter()
+						.any(|group| group_expr_equivalent(group, expression))
+				{
+					return Err(self.semantic(
+						"A projected non-aggregate expression must appear in GROUP BY.",
+						expr.span,
+					));
+				}
+			}
+		}
+		let group = if contains_aggregate && group.is_none() {
+			Some(Vec::new())
+		} else {
+			group
+		};
+		let result = Schema {
 			columns,
 		};
-		root = plan.push(LogicalNode {
-			kind: LogicalNodeKind::Project {
-				input: root,
-				expressions,
-			},
-			schema: project_schema.clone(),
-			span,
-		});
-		if statement.limit.is_some() || statement.start.is_some() {
-			let limit = statement.limit.as_ref().map(|expr| self.expr(expr, None)).transpose()?;
-			let start = statement.start.as_ref().map(|expr| self.expr(expr, None)).transpose()?;
-			for expression in limit.iter().chain(start.iter()) {
-				if !is_integer(&expression.ty) {
-					return Err(
-						self.semantic("LIMIT and START require an integer.", expression.span)
-					);
+		let order = statement
+			.order
+			.iter()
+			.map(|order| {
+				let expression = if let ExprKind::Name(name) = &order.expression.kind
+					&& let Some(index) = result.index_of(name.value.as_ref())
+				{
+					TypedExpr {
+						kind: TypedExprKind::Column(input_schema.columns.len() + index),
+						ty: result.columns[index].ty.clone(),
+						span: order.expression.span,
+					}
+				} else {
+					self.select_expr(&order.expression, Some(&input_schema), true, 0)?
+				};
+				Ok(LogicalOrder {
+					expression,
+					direction: order.direction,
+					nulls: order.nulls,
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		if let Some(group_expressions) = &group {
+			for (syntax, logical) in statement.order.iter().zip(&order) {
+				let projection_alias = matches!(
+					&syntax.expression.kind,
+					ExprKind::Name(name) if result.index_of(name.value.as_ref()).is_some()
+				);
+				if !projection_alias
+					&& !typed_expr_contains_aggregate(&logical.expression)
+					&& expr_references_row(&syntax.expression)
+					&& !group_expressions
+						.iter()
+						.any(|group| group_expr_equivalent(group, &logical.expression))
+				{
+					return Err(self.semantic(
+						"A non-aggregate ORDER BY expression must appear in GROUP BY.",
+						syntax.expression.span,
+					));
 				}
 			}
-			root = plan.push(LogicalNode {
-				kind: LogicalNodeKind::Limit {
-					input: root,
-					limit,
-					start,
-				},
-				schema: project_schema,
-				span,
-			});
 		}
-		plan.root = root;
-		Ok(plan)
+		let start = match &statement.start {
+			None => None,
+			Some(SelectStart::Offset(value)) => {
+				let value = self.expr(value, None)?;
+				if !is_integer(&value.ty) {
+					return Err(self.semantic("START AT requires an integer.", value.span));
+				}
+				Some(LogicalSelectStart::Offset(value))
+			}
+			Some(SelectStart::After {
+				cursor,
+				read_committed,
+			}) => Some(LogicalSelectStart::After {
+				cursor: self.expr(cursor, None)?,
+				read_committed: *read_committed,
+			}),
+		};
+		let limit = statement.limit.as_ref().map(|value| self.expr(value, None)).transpose()?;
+		if let Some(limit) = &limit
+			&& !is_integer(&limit.ty)
+		{
+			return Err(self.semantic("LIMIT requires an integer.", limit.span));
+		}
+		Ok(LogicalSelect {
+			source,
+			joins,
+			input_schema,
+			filter,
+			split,
+			group,
+			projection,
+			result,
+			omit: statement
+				.omit
+				.iter()
+				.map(|path| path.segments.iter().map(|part| part.value.clone()).collect())
+				.collect(),
+			fetch: statement
+				.fetch
+				.iter()
+				.map(|path| path.segments.iter().map(|part| part.value.clone()).collect())
+				.collect(),
+			order,
+			start,
+			limit,
+			value: statement.value,
+			only: statement.only,
+			tempfiles: statement.tempfiles,
+			outer_columns,
+		})
+	}
+
+	fn select_source(
+		&self,
+		source: &SelectSource,
+		outer: Option<&Schema>,
+	) -> FerrosGrynnResult<LogicalSelectSource> {
+		let (kind, mut schema, wildcard, default_alias) = match &source.kind {
+			SelectSourceKind::Atoms(target) => {
+				let target = self.scan_target(target)?;
+				let schema = self.catalog.schema(target.class())?;
+				let mode = self.catalog.schema_mode(target.class())?;
+				let wildcard = atom_wildcard(&schema, mode);
+				let alias: Box<str> = target.class().into();
+				(
+					LogicalSelectSourceKind::Atoms {
+						target,
+						graph: source
+							.graph
+							.as_ref()
+							.map(|graph| self.graph_reference(graph, outer))
+							.transpose()?,
+					},
+					schema,
+					wildcard,
+					alias,
+				)
+			}
+			SelectSourceKind::Graph(reference) => {
+				let reference = self.graph_reference(reference, outer)?;
+				let alias = match &reference {
+					LogicalGraphReference::Static(reference) => reference.name().as_str().into(),
+					LogicalGraphReference::Expression(_) => "graph".into(),
+				};
+				let schema = graph_source_schema();
+				(
+					LogicalSelectSourceKind::Graphs {
+						references: Some(vec![reference]),
+					},
+					schema.clone(),
+					all_columns_wildcard(&schema),
+					alias,
+				)
+			}
+			SelectSourceKind::Graphs(references) => {
+				let references = references
+					.as_ref()
+					.map(|references| {
+						references
+							.iter()
+							.map(|reference| self.graph_reference(reference, outer))
+							.collect::<FerrosGrynnResult<Vec<_>>>()
+					})
+					.transpose()?;
+				let schema = graph_source_schema();
+				(
+					LogicalSelectSourceKind::Graphs {
+						references,
+					},
+					schema.clone(),
+					all_columns_wildcard(&schema),
+					"graphs".into(),
+				)
+			}
+			SelectSourceKind::Derived(select) => {
+				let select = self.select_with_outer(select, source.span, None)?;
+				let schema = select.result.clone();
+				(
+					LogicalSelectSourceKind::Derived(Box::new(select)),
+					schema.clone(),
+					all_columns_wildcard(&schema),
+					source
+						.alias
+						.as_ref()
+						.ok_or_else(|| {
+							self.semantic("Derived source requires an alias.", source.span)
+						})?
+						.value
+						.clone(),
+				)
+			}
+		};
+		let alias = source.alias.as_ref().map_or(default_alias, |alias| alias.value.clone());
+		for column in &mut schema.columns {
+			column.qualifier = Some(alias.clone());
+		}
+		Ok(LogicalSelectSource {
+			kind,
+			schema,
+			wildcard,
+			alias,
+		})
+	}
+
+	fn graph_reference(
+		&self,
+		expression: &Expr,
+		schema: Option<&Schema>,
+	) -> FerrosGrynnResult<LogicalGraphReference> {
+		if let ExprKind::Name(name) = &expression.kind
+			&& schema.is_none_or(|schema| schema.index_of(name.value.as_ref()).is_none())
+		{
+			return self.catalog.graph(name.value.as_ref()).map(LogicalGraphReference::Static);
+		}
+		Ok(LogicalGraphReference::Expression(self.select_expr(expression, schema, false, 0)?))
 	}
 
 	fn expr(&self, expr: &Expr, schema: Option<&Schema>) -> FerrosGrynnResult<TypedExpr> {
-		self.expr_with_current(expr, schema, false)
+		self.expr_context(expr, schema, false, false, 0)
 	}
 
 	fn expr_with_current(
@@ -1348,6 +1676,27 @@ impl<'a> Analyzer<'a> {
 		expr: &Expr,
 		schema: Option<&Schema>,
 		allow_current_field: bool,
+	) -> FerrosGrynnResult<TypedExpr> {
+		self.expr_context(expr, schema, allow_current_field, false, 0)
+	}
+
+	fn select_expr(
+		&self,
+		expr: &Expr,
+		schema: Option<&Schema>,
+		allow_aggregates: bool,
+		aggregate_depth: u32,
+	) -> FerrosGrynnResult<TypedExpr> {
+		self.expr_context(expr, schema, false, allow_aggregates, aggregate_depth)
+	}
+
+	fn expr_context(
+		&self,
+		expr: &Expr,
+		schema: Option<&Schema>,
+		allow_current_field: bool,
+		allow_aggregates: bool,
+		aggregate_depth: u32,
 	) -> FerrosGrynnResult<TypedExpr> {
 		let (kind, ty) = match &expr.kind {
 			ExprKind::Literal(literal) => {
@@ -1374,7 +1723,17 @@ impl<'a> Analyzer<'a> {
 						self.semantic(&format!("Unknown field `{}`.", name.value), name.span)
 					);
 				};
-				if let Some(index) = schema.index_of(&name.value) {
+				let mut indices = schema.matching_indices(name.value.as_ref());
+				if let Some(index) = indices.next() {
+					if indices.next().is_some() {
+						return Err(self.semantic(
+							&format!(
+								"Field `{}` is ambiguous; qualify it with a source alias.",
+								name.value
+							),
+							name.span,
+						));
+					}
 					(TypedExprKind::Column(index), schema.columns[index].ty.clone())
 				} else if allow_current_field {
 					(TypedExprKind::CurrentField(name.value.clone()), Type::Any)
@@ -1387,7 +1746,15 @@ impl<'a> Analyzer<'a> {
 			ExprKind::Array(values) => {
 				let values = values
 					.iter()
-					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.map(|value| {
+						self.expr_context(
+							value,
+							schema,
+							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
+						)
+					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				let item_type =
 					values.iter().map(|value| value.ty.clone()).reduce(unify).unwrap_or(Type::Any);
@@ -1396,7 +1763,15 @@ impl<'a> Analyzer<'a> {
 			ExprKind::Set(values) => {
 				let values = values
 					.iter()
-					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.map(|value| {
+						self.expr_context(
+							value,
+							schema,
+							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
+						)
+					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				let item_type =
 					values.iter().map(|value| value.ty.clone()).reduce(unify).unwrap_or(Type::Any);
@@ -1406,8 +1781,14 @@ impl<'a> Analyzer<'a> {
 				let fields = fields
 					.iter()
 					.map(|field| {
-						self.expr_with_current(&field.value, schema, allow_current_field)
-							.map(|value| (field.name.value.clone(), value))
+						self.expr_context(
+							&field.value,
+							schema,
+							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
+						)
+						.map(|value| (field.name.value.clone(), value))
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				(TypedExprKind::Object(fields), Type::Object)
@@ -1416,7 +1797,13 @@ impl<'a> Analyzer<'a> {
 				op,
 				expr: inner,
 			} => {
-				let inner = self.expr_with_current(inner, schema, allow_current_field)?;
+				let inner = self.expr_context(
+					inner,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
 				let ty = match op {
 					UnaryOperator::Not => Type::Bool,
 					UnaryOperator::Truthy => Type::Bool,
@@ -1445,8 +1832,46 @@ impl<'a> Analyzer<'a> {
 				if matches!(op, BinaryOperator::Pipeline) {
 					return Err(self.unsupported("expression pipeline", expr.span));
 				}
-				let left = self.expr_with_current(left, schema, allow_current_field)?;
-				let right = self.expr_with_current(right, schema, allow_current_field)?;
+				let left = self.expr_context(
+					left,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				let right = if matches!(
+					op,
+					BinaryOperator::In
+						| BinaryOperator::NotIn
+						| BinaryOperator::AllIn
+						| BinaryOperator::AnyIn
+						| BinaryOperator::NoneIn
+				) && let ExprKind::Subquery(select) = &right.kind
+				{
+					if !select.value {
+						return Err(self.semantic(
+							"A collection subquery requires SELECT VALUE with one projected \
+							 column.",
+							right.span,
+						));
+					}
+					TypedExpr {
+						kind: TypedExprKind::Subquery {
+							select: Box::new(self.select_with_outer(select, right.span, schema)?),
+							collection: true,
+						},
+						ty: Type::Array(Box::new(Type::Any)),
+						span: right.span,
+					}
+				} else {
+					self.expr_context(
+						right,
+						schema,
+						allow_current_field,
+						allow_aggregates,
+						aggregate_depth,
+					)?
+				};
 				let ty = self.binary_type(*op, &left.ty, &right.ty, expr.span)?;
 				(
 					TypedExprKind::Binary {
@@ -1462,9 +1887,27 @@ impl<'a> Analyzer<'a> {
 				then_value,
 				else_value,
 			} => {
-				let condition = self.expr_with_current(condition, schema, allow_current_field)?;
-				let then_value = self.expr_with_current(then_value, schema, allow_current_field)?;
-				let else_value = self.expr_with_current(else_value, schema, allow_current_field)?;
+				let condition = self.expr_context(
+					condition,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				let then_value = self.expr_context(
+					then_value,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				let else_value = self.expr_context(
+					else_value,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
 				let ty = unify(then_value.ty.clone(), else_value.ty.clone());
 				(
 					TypedExprKind::Conditional {
@@ -1482,21 +1925,49 @@ impl<'a> Analyzer<'a> {
 			} => {
 				let operand = operand
 					.as_ref()
-					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.map(|value| {
+						self.expr_context(
+							value,
+							schema,
+							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
+						)
+					})
 					.transpose()?
 					.map(Box::new);
 				let branches = branches
 					.iter()
 					.map(|(condition, value)| {
 						Ok((
-							self.expr_with_current(condition, schema, allow_current_field)?,
-							self.expr_with_current(value, schema, allow_current_field)?,
+							self.expr_context(
+								condition,
+								schema,
+								allow_current_field,
+								allow_aggregates,
+								aggregate_depth,
+							)?,
+							self.expr_context(
+								value,
+								schema,
+								allow_current_field,
+								allow_aggregates,
+								aggregate_depth,
+							)?,
 						))
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				let else_value = else_value
 					.as_ref()
-					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.map(|value| {
+						self.expr_context(
+							value,
+							schema,
+							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
+						)
+					})
 					.transpose()?
 					.map(Box::new);
 				let ty = branches
@@ -1519,7 +1990,24 @@ impl<'a> Analyzer<'a> {
 				field,
 				null_safe,
 			} => {
-				let base = self.expr_with_current(base, schema, allow_current_field)?;
+				if let ExprKind::Name(qualifier) = &base.kind
+					&& let Some(schema) = schema
+					&& let Some(index) =
+						schema.qualified_index(qualifier.value.as_ref(), field.value.as_ref())
+				{
+					return Ok(TypedExpr {
+						kind: TypedExprKind::Column(index),
+						ty: schema.columns[index].ty.clone(),
+						span: expr.span,
+					});
+				}
+				let base = self.expr_context(
+					base,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
 				(
 					TypedExprKind::Field {
 						base: Box::new(base),
@@ -1534,7 +2022,13 @@ impl<'a> Analyzer<'a> {
 				fields,
 			} => (
 				TypedExprKind::Destructure {
-					base: Box::new(self.expr_with_current(base, schema, allow_current_field)?),
+					base: Box::new(self.expr_context(
+						base,
+						schema,
+						allow_current_field,
+						allow_aggregates,
+						aggregate_depth,
+					)?),
 					fields: fields.iter().map(|field| field.value.clone()).collect(),
 				},
 				Type::Object,
@@ -1543,7 +2037,13 @@ impl<'a> Analyzer<'a> {
 				base,
 				index,
 			} => {
-				let base = self.expr_with_current(base, schema, allow_current_field)?;
+				let base = self.expr_context(
+					base,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
 				let ty = match &base.ty {
 					Type::Array(item) => (**item).clone(),
 					_ => Type::Any,
@@ -1551,10 +2051,12 @@ impl<'a> Analyzer<'a> {
 				(
 					TypedExprKind::Index {
 						base: Box::new(base),
-						index: Box::new(self.expr_with_current(
+						index: Box::new(self.expr_context(
 							index,
 							schema,
 							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
 						)?),
 					},
 					ty,
@@ -1564,12 +2066,24 @@ impl<'a> Analyzer<'a> {
 				base,
 				predicate,
 			} => {
-				let base = self.expr_with_current(base, schema, allow_current_field)?;
+				let base = self.expr_context(
+					base,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
 				let ty = base.ty.clone();
 				(
 					TypedExprKind::Filter {
 						base: Box::new(base),
-						predicate: Box::new(self.expr_with_current(predicate, schema, true)?),
+						predicate: Box::new(self.expr_context(
+							predicate,
+							schema,
+							true,
+							allow_aggregates,
+							aggregate_depth,
+						)?),
 					},
 					ty,
 				)
@@ -1577,11 +2091,82 @@ impl<'a> Analyzer<'a> {
 			ExprKind::Call {
 				callee,
 				type_argument,
+				distinct,
 				arguments,
 			} => {
+				if let Some(function) = aggregate_name(callee) {
+					if !allow_aggregates {
+						return Err(self.semantic(
+							"Aggregate functions are valid only in a SELECT projection.",
+							expr.span,
+						));
+					}
+					if aggregate_depth > 0 {
+						return Err(
+							self.semantic("Nested aggregate functions are not allowed.", expr.span)
+						);
+					}
+					if type_argument.is_some() {
+						return Err(self.semantic(
+							"Aggregate functions do not accept a type argument.",
+							expr.span,
+						));
+					}
+					let expected = if function == Aggregate::Count {
+						0..=1
+					} else {
+						1..=1
+					};
+					if !expected.contains(&arguments.len()) {
+						return Err(self.semantic(
+							&format!("Aggregate function expects {} argument(s).", expected.end()),
+							expr.span,
+						));
+					}
+					if *distinct && arguments.is_empty() {
+						return Err(
+							self.semantic("count(DISTINCT ...) requires an expression.", expr.span)
+						);
+					}
+					let argument = arguments
+						.first()
+						.map(|argument| {
+							self.expr_context(
+								argument,
+								schema,
+								allow_current_field,
+								true,
+								aggregate_depth + 1,
+							)
+						})
+						.transpose()?
+						.map(Box::new);
+					let ty = aggregate_type(function, argument.as_deref());
+					return Ok(TypedExpr {
+						kind: TypedExprKind::Aggregate {
+							function,
+							argument,
+							distinct: *distinct,
+						},
+						ty,
+						span: expr.span,
+					});
+				}
+				if *distinct {
+					return Err(self
+						.semantic("DISTINCT is valid only inside a SELECT aggregate.", expr.span));
+				}
 				let arguments = arguments
 					.iter()
-					.map(|argument| self.expr_with_current(argument, schema, allow_current_field))
+					.map(|argument| {
+						self.expr_context(
+							argument,
+							schema,
+							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
+						)
+					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				let (function, ty) =
 					self.builtin(callee, type_argument.as_ref(), &arguments, expr.span)?;
@@ -1601,10 +2186,12 @@ impl<'a> Analyzer<'a> {
 				(
 					TypedExprKind::Cast {
 						target: target.clone(),
-						expr: Box::new(self.expr_with_current(
+						expr: Box::new(self.expr_context(
 							inner,
 							schema,
 							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
 						)?),
 					},
 					target,
@@ -1617,12 +2204,28 @@ impl<'a> Analyzer<'a> {
 			} => {
 				let start = start
 					.as_ref()
-					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.map(|value| {
+						self.expr_context(
+							value,
+							schema,
+							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
+						)
+					})
 					.transpose()?
 					.map(Box::new);
 				let end = end
 					.as_ref()
-					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.map(|value| {
+						self.expr_context(
+							value,
+							schema,
+							allow_current_field,
+							allow_aggregates,
+							aggregate_depth,
+						)
+					})
 					.transpose()?
 					.map(Box::new);
 				let item_type = match (&start, &end) {
@@ -1638,6 +2241,19 @@ impl<'a> Analyzer<'a> {
 					},
 					Type::Range(Box::new(item_type)),
 				)
+			}
+			ExprKind::Subquery(select) if allow_aggregates => (
+				TypedExprKind::Subquery {
+					select: Box::new(self.select_with_outer(select, expr.span, schema)?),
+					collection: false,
+				},
+				Type::Any,
+			),
+			ExprKind::Subquery(_) => {
+				return Err(self.semantic(
+					"A SELECT subquery is valid only inside a SELECT statement.",
+					expr.span,
+				));
 			}
 		};
 		Ok(TypedExpr {
@@ -2084,6 +2700,17 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 				collect_expr_names(argument, names);
 			}
 		}
+		ExprKind::Subquery(select) => {
+			for item in &select.projection {
+				if let crate::syn::SelectItem::Expr {
+					expr,
+					..
+				} = item
+				{
+					collect_expr_names(expr, names);
+				}
+			}
+		}
 		ExprKind::Range {
 			start,
 			end,
@@ -2120,6 +2747,492 @@ fn builtin_name(callee: &Expr) -> Option<(&str, &str)> {
 		return None;
 	};
 	Some((namespace.value.as_ref(), field.value.as_ref()))
+}
+
+fn aggregate_name(callee: &Expr) -> Option<Aggregate> {
+	if let ExprKind::Name(name) = &callee.kind {
+		return match name.value.to_ascii_lowercase().as_str() {
+			"count" => Some(Aggregate::Count),
+			"sum" => Some(Aggregate::Sum),
+			"avg" => Some(Aggregate::Average),
+			"min" => Some(Aggregate::Minimum),
+			"max" => Some(Aggregate::Maximum),
+			_ => None,
+		};
+	}
+	let (namespace, name) = builtin_name(callee)?;
+	match (namespace.to_ascii_lowercase().as_str(), name.to_ascii_lowercase().as_str()) {
+		("array", "group") => Some(Aggregate::ArrayGroup),
+		("math", "variance_pop") => Some(Aggregate::VariancePopulation),
+		("math", "stddev_pop") => Some(Aggregate::StandardDeviationPopulation),
+		("math", "variance_samp") => Some(Aggregate::VarianceSample),
+		("math", "stddev_samp") => Some(Aggregate::StandardDeviationSample),
+		_ => None,
+	}
+}
+
+fn aggregate_type(function: Aggregate, argument: Option<&TypedExpr>) -> Type {
+	match function {
+		Aggregate::Count => Type::Int,
+		Aggregate::Sum => argument.map_or(Type::Number, |value| value.ty.clone()),
+		Aggregate::Average
+		| Aggregate::VariancePopulation
+		| Aggregate::StandardDeviationPopulation
+		| Aggregate::VarianceSample
+		| Aggregate::StandardDeviationSample => Type::Float,
+		Aggregate::Minimum | Aggregate::Maximum => {
+			argument.map_or(Type::Any, |value| value.ty.clone())
+		}
+		Aggregate::ArrayGroup => Type::Array(Box::new(Type::Any)),
+	}
+}
+
+fn graph_source_schema() -> Schema {
+	Schema {
+		columns: [
+			("id", Type::Any),
+			("name", Type::String),
+			("kind", Type::String),
+			("storage_mode", Type::String),
+			("revision", Type::Int),
+			("node_count", Type::Int),
+			("edge_count", Type::Int),
+			("properties", Type::Object),
+		]
+		.into_iter()
+		.map(|(name, ty)| Column {
+			name: name.into(),
+			qualifier: None,
+			ty,
+		})
+		.collect(),
+	}
+}
+
+fn all_columns_wildcard(schema: &Schema) -> Vec<LogicalWildcardField> {
+	schema
+		.columns
+		.iter()
+		.enumerate()
+		.map(|(index, column)| LogicalWildcardField::Column {
+			name: column.name.clone(),
+			index,
+		})
+		.collect()
+}
+
+fn atom_wildcard(schema: &Schema, mode: ClassSchemaMode) -> Vec<LogicalWildcardField> {
+	let mut fields = Vec::new();
+	if let Some(index) = schema.index_of("id") {
+		fields.push(LogicalWildcardField::Column {
+			name: "id".into(),
+			index,
+		});
+	}
+	match mode {
+		ClassSchemaMode::Schemafull => {
+			fields.extend(schema.columns.iter().enumerate().filter_map(|(index, column)| {
+				(!matches!(column.name.as_ref(), "id" | "class" | "kind" | "label" | "properties"))
+					.then(|| LogicalWildcardField::Column {
+						name: column.name.clone(),
+						index,
+					})
+			}));
+		}
+		ClassSchemaMode::Schemaless => {
+			if let Some(index) = schema.index_of("properties") {
+				fields.push(LogicalWildcardField::Properties {
+					index,
+				});
+			}
+		}
+	}
+	fields
+}
+
+fn offset_wildcard(field: &LogicalWildcardField, offset: usize) -> LogicalWildcardField {
+	match field {
+		LogicalWildcardField::Column {
+			name,
+			index,
+		} => LogicalWildcardField::Column {
+			name: name.clone(),
+			index: index + offset,
+		},
+		LogicalWildcardField::Properties {
+			index,
+		} => LogicalWildcardField::Properties {
+			index: index + offset,
+		},
+	}
+}
+
+fn select_expression_name(expression: &Expr) -> Option<Box<str>> {
+	match &expression.kind {
+		ExprKind::Name(name) => Some(name.value.clone()),
+		ExprKind::Field {
+			field,
+			..
+		} => Some(field.value.clone()),
+		_ => None,
+	}
+}
+
+fn expr_contains_aggregate(expression: &Expr) -> bool {
+	match &expression.kind {
+		ExprKind::Call {
+			callee,
+			arguments,
+			..
+		} => aggregate_name(callee).is_some() || arguments.iter().any(expr_contains_aggregate),
+		ExprKind::Array(values) | ExprKind::Set(values) => {
+			values.iter().any(expr_contains_aggregate)
+		}
+		ExprKind::Object(fields) => {
+			fields.iter().any(|field| expr_contains_aggregate(&field.value))
+		}
+		ExprKind::Unary {
+			expr,
+			..
+		}
+		| ExprKind::Field {
+			base: expr,
+			..
+		}
+		| ExprKind::Destructure {
+			base: expr,
+			..
+		}
+		| ExprKind::Cast {
+			expr,
+			..
+		} => expr_contains_aggregate(expr),
+		ExprKind::Binary {
+			left,
+			right,
+			..
+		}
+		| ExprKind::Index {
+			base: left,
+			index: right,
+		}
+		| ExprKind::Filter {
+			base: left,
+			predicate: right,
+		} => expr_contains_aggregate(left) || expr_contains_aggregate(right),
+		ExprKind::Conditional {
+			condition,
+			then_value,
+			else_value,
+		} => {
+			expr_contains_aggregate(condition)
+				|| expr_contains_aggregate(then_value)
+				|| expr_contains_aggregate(else_value)
+		}
+		ExprKind::Case {
+			operand,
+			branches,
+			else_value,
+		} => {
+			operand.iter().any(|value| expr_contains_aggregate(value))
+				|| branches.iter().any(|(condition, value)| {
+					expr_contains_aggregate(condition) || expr_contains_aggregate(value)
+				})
+				|| else_value.iter().any(|value| expr_contains_aggregate(value))
+		}
+		ExprKind::Range {
+			start,
+			end,
+			..
+		} => start.iter().chain(end.iter()).any(|value| expr_contains_aggregate(value)),
+		ExprKind::Literal(_)
+		| ExprKind::Parameter(_)
+		| ExprKind::Name(_)
+		| ExprKind::Subquery(_) => false,
+	}
+}
+
+fn expr_references_row(expression: &Expr) -> bool {
+	match &expression.kind {
+		ExprKind::Name(_) => true,
+		ExprKind::Call {
+			arguments,
+			..
+		} => arguments.iter().any(expr_references_row),
+		ExprKind::Array(values) | ExprKind::Set(values) => values.iter().any(expr_references_row),
+		ExprKind::Object(fields) => fields.iter().any(|field| expr_references_row(&field.value)),
+		ExprKind::Unary {
+			expr,
+			..
+		}
+		| ExprKind::Field {
+			base: expr,
+			..
+		}
+		| ExprKind::Destructure {
+			base: expr,
+			..
+		}
+		| ExprKind::Cast {
+			expr,
+			..
+		} => expr_references_row(expr),
+		ExprKind::Binary {
+			left,
+			right,
+			..
+		}
+		| ExprKind::Index {
+			base: left,
+			index: right,
+		}
+		| ExprKind::Filter {
+			base: left,
+			predicate: right,
+		} => expr_references_row(left) || expr_references_row(right),
+		ExprKind::Conditional {
+			condition,
+			then_value,
+			else_value,
+		} => {
+			expr_references_row(condition)
+				|| expr_references_row(then_value)
+				|| expr_references_row(else_value)
+		}
+		ExprKind::Case {
+			operand,
+			branches,
+			else_value,
+		} => {
+			operand.iter().any(|value| expr_references_row(value))
+				|| branches.iter().any(|(condition, value)| {
+					expr_references_row(condition) || expr_references_row(value)
+				})
+				|| else_value.iter().any(|value| expr_references_row(value))
+		}
+		ExprKind::Range {
+			start,
+			end,
+			..
+		} => start.iter().chain(end.iter()).any(|value| expr_references_row(value)),
+		ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Subquery(_) => false,
+	}
+}
+
+fn typed_expr_contains_aggregate(expression: &TypedExpr) -> bool {
+	match &expression.kind {
+		TypedExprKind::Aggregate {
+			..
+		} => true,
+		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
+			values.iter().any(typed_expr_contains_aggregate)
+		}
+		TypedExprKind::Object(fields) => {
+			fields.iter().any(|(_, value)| typed_expr_contains_aggregate(value))
+		}
+		TypedExprKind::Range {
+			start,
+			end,
+			..
+		} => start.iter().chain(end.iter()).any(|value| typed_expr_contains_aggregate(value)),
+		TypedExprKind::Unary {
+			expr,
+			..
+		}
+		| TypedExprKind::Field {
+			base: expr,
+			..
+		}
+		| TypedExprKind::Destructure {
+			base: expr,
+			..
+		}
+		| TypedExprKind::Cast {
+			expr,
+			..
+		} => typed_expr_contains_aggregate(expr),
+		TypedExprKind::Binary {
+			left,
+			right,
+			..
+		} => typed_expr_contains_aggregate(left) || typed_expr_contains_aggregate(right),
+		TypedExprKind::Conditional {
+			condition,
+			then_value,
+			else_value,
+		} => {
+			typed_expr_contains_aggregate(condition)
+				|| typed_expr_contains_aggregate(then_value)
+				|| typed_expr_contains_aggregate(else_value)
+		}
+		TypedExprKind::Case {
+			operand,
+			branches,
+			else_value,
+		} => {
+			operand.iter().any(|value| typed_expr_contains_aggregate(value))
+				|| branches.iter().any(|(condition, value)| {
+					typed_expr_contains_aggregate(condition) || typed_expr_contains_aggregate(value)
+				})
+				|| else_value.iter().any(|value| typed_expr_contains_aggregate(value))
+		}
+		TypedExprKind::Index {
+			base,
+			index,
+		} => typed_expr_contains_aggregate(base) || typed_expr_contains_aggregate(index),
+		TypedExprKind::Filter {
+			base,
+			predicate,
+		} => typed_expr_contains_aggregate(base) || typed_expr_contains_aggregate(predicate),
+		TypedExprKind::Builtin {
+			arguments,
+			..
+		} => arguments.iter().any(typed_expr_contains_aggregate),
+		TypedExprKind::Constant(_)
+		| TypedExprKind::Slot(_)
+		| TypedExprKind::Column(_)
+		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Subquery {
+			..
+		} => false,
+	}
+}
+
+fn group_expr_equivalent(left: &TypedExpr, right: &TypedExpr) -> bool {
+	match (&left.kind, &right.kind) {
+		(TypedExprKind::Constant(left), TypedExprKind::Constant(right)) => left == right,
+		(TypedExprKind::Slot(left), TypedExprKind::Slot(right)) => left == right,
+		(TypedExprKind::Column(left), TypedExprKind::Column(right)) => left == right,
+		(TypedExprKind::Array(left), TypedExprKind::Array(right))
+		| (TypedExprKind::Set(left), TypedExprKind::Set(right)) => {
+			left.len() == right.len()
+				&& left.iter().zip(right).all(|(left, right)| group_expr_equivalent(left, right))
+		}
+		(TypedExprKind::Object(left), TypedExprKind::Object(right)) => {
+			left.len() == right.len()
+				&& left.iter().zip(right).all(|((left_name, left), (right_name, right))| {
+					left_name == right_name && group_expr_equivalent(left, right)
+				})
+		}
+		(
+			TypedExprKind::Range {
+				start: left_start,
+				end: left_end,
+				inclusive_end: left_inclusive,
+			},
+			TypedExprKind::Range {
+				start: right_start,
+				end: right_end,
+				inclusive_end: right_inclusive,
+			},
+		) => {
+			left_inclusive == right_inclusive
+				&& optional_group_expr_equivalent(left_start.as_deref(), right_start.as_deref())
+				&& optional_group_expr_equivalent(left_end.as_deref(), right_end.as_deref())
+		}
+		(
+			TypedExprKind::Unary {
+				op: left_op,
+				expr: left,
+			},
+			TypedExprKind::Unary {
+				op: right_op,
+				expr: right,
+			},
+		) => left_op == right_op && group_expr_equivalent(left, right),
+		(
+			TypedExprKind::Binary {
+				left: left_a,
+				op: left_op,
+				right: left_b,
+			},
+			TypedExprKind::Binary {
+				left: right_a,
+				op: right_op,
+				right: right_b,
+			},
+		) => {
+			left_op == right_op
+				&& group_expr_equivalent(left_a, right_a)
+				&& group_expr_equivalent(left_b, right_b)
+		}
+		(
+			TypedExprKind::Field {
+				base: left,
+				field: left_field,
+				null_safe: left_safe,
+			},
+			TypedExprKind::Field {
+				base: right,
+				field: right_field,
+				null_safe: right_safe,
+			},
+		) => {
+			left_field == right_field
+				&& left_safe == right_safe
+				&& group_expr_equivalent(left, right)
+		}
+		(TypedExprKind::CurrentField(left), TypedExprKind::CurrentField(right)) => left == right,
+		(
+			TypedExprKind::Destructure {
+				base: left,
+				fields: left_fields,
+			},
+			TypedExprKind::Destructure {
+				base: right,
+				fields: right_fields,
+			},
+		) => left_fields == right_fields && group_expr_equivalent(left, right),
+		(
+			TypedExprKind::Index {
+				base: left_base,
+				index: left_index,
+			},
+			TypedExprKind::Index {
+				base: right_base,
+				index: right_index,
+			},
+		) => {
+			group_expr_equivalent(left_base, right_base)
+				&& group_expr_equivalent(left_index, right_index)
+		}
+		(
+			TypedExprKind::Builtin {
+				function: left_function,
+				arguments: left_arguments,
+			},
+			TypedExprKind::Builtin {
+				function: right_function,
+				arguments: right_arguments,
+			},
+		) => {
+			left_function == right_function
+				&& left_arguments.len() == right_arguments.len()
+				&& left_arguments
+					.iter()
+					.zip(right_arguments)
+					.all(|(left, right)| group_expr_equivalent(left, right))
+		}
+		(
+			TypedExprKind::Cast {
+				target: left_target,
+				expr: left,
+			},
+			TypedExprKind::Cast {
+				target: right_target,
+				expr: right,
+			},
+		) => left_target == right_target && group_expr_equivalent(left, right),
+		_ => false,
+	}
+}
+
+fn optional_group_expr_equivalent(left: Option<&TypedExpr>, right: Option<&TypedExpr>) -> bool {
+	match (left, right) {
+		(Some(left), Some(right)) => group_expr_equivalent(left, right),
+		(None, None) => true,
+		(Some(_), None) | (None, Some(_)) => false,
+	}
 }
 
 const fn class_kind(kind: ClassKindName) -> AtomKind {

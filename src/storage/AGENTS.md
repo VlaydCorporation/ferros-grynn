@@ -30,7 +30,7 @@
 - `buffer_pool` — прежний Clock-Pro, доступный только тестам и prototype-control;
 - `page_manager` — staged/WAL/home resolution и production HybridReadEngine;
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
-- `catalog` — `FGFC v5` physical registry и bounded `FGDC v7` page-chain;
+- `catalog` — `FGFC v5` physical registry и bounded `FGDC v8` page-chain;
 - `atom_store_superblock` — exact database-global AtomStore ceilings/counts и checkpoint tuple;
 - `property_dictionary` — append-only database-global `PropertyKeyId ↔ UTF-8` pages и hash lookup;
 - `metadata_cow` — общий checkpoint-протокол `.tmp`/main/`.prev`, не используемый обычным commit;
@@ -67,7 +67,7 @@
   base properties. `NodeHotPage`/`EdgeHotPage` хранят membership occurrence,
   `GlobalAtomId`, label/overlay и topology. Точные offsets задают
   `docs/disk_storage_spec.md` §§10–11.
-- Собираемый target использует `FGDC v7`/`FGFC v5`, `DataSpaceId::Database` для AtomStore
+- Собираемый target использует `FGDC v8`/`FGFC v5`, `DataSpaceId::Database` для AtomStore
   и не создаёт системный graph; `GraphId` каждого graph ненулевой. AtomStore и
   graph occurrences публикуются одним WAL transaction и открываются по одной
   snapshot boundary. Missing/unopenable/checksum-corrupt secondary переводится в `Stale` и даёт scan

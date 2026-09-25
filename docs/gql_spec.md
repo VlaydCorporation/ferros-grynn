@@ -1684,6 +1684,27 @@ UPSERT @target [, @target ...]
 `UPSERT ... IN GRAPH` отсутствует: создание global atom и membership выражается отдельными
 `UPSERT`/`ATTACH` либо `RELATE`.
 
+### 8.3.1. UPDATE GRAPH
+
+Catalog-owned свойства именованного графа изменяются отдельно от atom DML:
+
+```grynql
+UPDATE GRAPH @sales
+SET properties.owner = "risk", properties.reviewed = true
+RETURN AFTER;
+
+UPDATE GRAPH @sales
+UNSET properties.region
+RETURN DIFF;
+```
+
+Разрешены только paths внутри `properties`. `SET` использует существующие idiom/update helpers;
+`null` хранится, `none` запрещён. `UNSET` удаляет path. Default return — `NONE`; доступны
+`BEFORE`, `AFTER` и `DIFF`. Оператор создаёт новую catalog/schema revision при сохранении
+`GraphId` и physical bindings, участвует в MVCC, FCW/SSI и local catalog/WAL publication, но не
+перестраивает graph generation или `GraphSuperblock`. В Atomic Import этапа 13 этот оператор
+запрещён preflight-анализом.
+
 ### 8.4. DELETE
 
 ```
@@ -2480,11 +2501,13 @@ DEFINE GRAPH [IF NOT EXISTS | OVERWRITE] @name
     [ TYPE @type ]
     [ ROOT @root_atom | ROOTS @root_atoms_array ]
     [ VALIDATE ON_MUTATION | DEFERRED ]
+    [ CONTENT @object ]
     [ COMMENT @string ]
 ;
 ```
 
-Создаёт именованный граф. При создании можно указать один из типов графов.
+Создаёт именованный граф. `CONTENT` обязан вычисляться в object и задаёт catalog-owned
+пользовательские свойства графа. При создании можно указать один из типов графов.
 В случае tree, rooted_tree и forest можно указать корневые атомы.
 Также можно определить в какой момент времени будет производиться проверка ограничений типа графа: во время мутации или во время выборки.
 
@@ -2707,12 +2730,19 @@ WHERE age >= 18 AND status = "active"
 
 ### 10.2. FROM
 
-Источник данных. Может быть:
-- именем class: `FROM person`;
-- конкретной записью: `FROM person:alice`;
-- подзапросом: `FROM (SELECT ... FROM ...)`;
-- результатом MATCH: `FROM (MATCH ...)`;
-- объединением: `FROM person, company` (union) или `FROM person & company` (cross join).
+Источник данных stage-13:
+
+- class/record: `FROM person`, `FROM person:alice`, включая `IN GRAPH @name`;
+- один именованный граф: `FROM GRAPH @sales [AS g]`;
+- явный список графов: `FROM GRAPHS @sales, @fraud` либо
+  `FROM GRAPHS [@sales, @fraud] AS g`;
+- все видимые графы: `FROM GRAPHS [AS g]`;
+- relation subquery: `FROM (SELECT ...) AS alias`.
+
+Явный список графов сохраняет заданный порядок; `GRAPHS` без списка использует `GraphId` order.
+Каждый граф образует отдельную исходную строку. Derived source всегда требует alias. Старые `,`
+как union sources и `&` как cross join удалены: нетопологический cross product выражается
+`CROSS JOIN`, а топологические отношения — `MATCH`/`TRAVERSE`.
 
 ### 10.3. WITH
 
@@ -2752,12 +2782,14 @@ WHERE age >= 18 AND status = "active"
 Группировка и агрегация.
 
 ```
-GROUP [ALL | BY @fields]
+GROUP [ALL | BY @expressions]
 ```
 
 `GROUP ALL` — сворачивает все строки в одну; применяется для глобальных агрегатов без группировки.
 
-Применим только перед `ORDER BY`.
+Aggregate без `GROUP` и `GROUP ALL` образуют одну группу. Projected non-aggregate expression
+обязан входить в group key; `null` и `none` являются разными keys. `GROUP` и `ORDER BY` могут
+использоваться вместе и всегда выполняются именно в этом порядке.
 
 ### 10.5. ORDER BY
 
@@ -2811,7 +2843,8 @@ LIMIT @number [ START [ AT ] @offset | START AFTER @cursor ]
 
 Продолжение с позиции, зафиксированной предыдущей страницей. Стоимость не зависит от глубины пагинации, и результат устойчив к конкурентным изменениям вне окна.
 
-`@cursor` — **непрозрачное** значение типа `cursor`, которое клиент не должен разбирать или конструировать. Оно возвращается вместе с результатом и кодирует:
+`@cursor` — **непрозрачное** runtime-only значение типа `cursor`, которое клиент не должен
+разбирать или конструировать. Оно возвращается как `QueryResult.continuation` и кодирует:
 - значения ключей сортировки последней выданной строки,
 - `stable_id` последней строки (для разрыва ничьих),
 - `SnapshotId` запроса,
@@ -2830,7 +2863,8 @@ SELECT id, name FROM person ORDER BY created_at DESC LIMIT 50 START AFTER $curso
 - Курсор действителен только для запроса с **тем же** `ORDER BY` и тем же набором фильтров; иначе — ошибка `InvalidCursor`. Хеш запроса в курсоре обеспечивает эту проверку.
 - Требуется детерминированный полный порядок. Если `ORDER BY` не задан или не является полным (ключи сортировки не различают строки), движок **дополняет** его каноническим `RecordId = (class, id)`. Без полного порядка позиция курсора не определена.
 - По умолчанию курсор продолжает чтение **в том же снимке** (`SnapshotId` внутри курсора): страницы одной ленты консистентны между собой. Если снимок уже собран сборщиком версий (старше `max_snapshot_age`), возвращается `SnapshotExpired`; повторить с `START AFTER @cursor READ COMMITTED` — тогда чтение продолжится в свежем снимке с тем же ключом позиции, ценой возможного появления/исчезновения строк.
-- Курсор — значение в рамках сессии; он не персистентен и не переносим между базами.
+- Usable cursor создаёт только постоянная `GqlSession`; `Datastore::execute` не сохраняет
+  межвызовное состояние. Курсор не персистентен и не переносим между session, базами и процессами.
 
 Курсор рекомендуется как основная форма пагинации для больших выборок; `START AT` оставлен для совместимости и небольших смещений.
 
@@ -2898,7 +2932,7 @@ SELECT * FROM user SPLIT emails;
 
 Исключение полей из результата.
 
-Применяется перед `FROM @class`;
+Применяется к уже построенной проекции; hidden provenance/order key не изменяется.
 
 ```
 OMIT @fields
@@ -3005,15 +3039,16 @@ EXPECT NOT EXISTS;
 SELECT 
     [ ONLY ]
     VALUE @field | @fields [ AS @alias ] [ OMIT @fields ... ]
-    FROM @targets
+    FROM @source [ @joins ]
     [ WITH [ NOINDEX | INDEX @indexes ... ]]
     [ WHERE @conditions ]
     [ SPLIT [ ON ] @field, ... ]
-    [ GROUP [ ALL | [ BY ] @field, ... ] ]
-    [ ORDER [ BY ] RAND() | @field [ COLLATE ] [ NUMERIC ] [ ASC | DESC ], ... ]
-    [ LIMIT [ BY ] @limit ]
-    [ START [ AT ] @offset | START AFTER @cursor ]
+    [ GROUP [ ALL | [ BY ] @expression, ... ] ]
+    [ OMIT @fields ... ]
     [ FETCH @fields ... ]
+    [ ORDER BY @expression [ ASC | DESC ] [ NULLS FIRST | LAST ], ... ]
+    [ START [ AT ] @offset | START AFTER @cursor [ READ COMMITTED ] ]
+    [ LIMIT [ BY ] @limit ]
     [ TIMEOUT @duration ]
     [ TEMPFILES ]
 ;
@@ -3021,10 +3056,34 @@ SELECT
 
 `SELECT ONLY` — ошибка, если запрос возвращает более одной строки (защита от случайного использования там, где ожидается единственная запись).
 
-`TEMPFILES` указывает, что запрос должен обрабатываться во временных файлах, а не в памяти, что полезно
-при обработке большого набора результатов с большим количеством записей.
-Это значительно снижает потребление памяти, но при этом производительность падает.
-Для этого необходимо указать временный каталог, используя настройку `FG_TEMPFILES_PATH`
+Stage-13 source/shape pipeline фиксирован как `source/join → WHERE → SPLIT → GROUP → projection
+→ OMIT → FETCH → ORDER → START → LIMIT → ONLY`. Обычный SELECT возвращает `array<object>`,
+`SELECT VALUE` — `array<Value>`.
+
+Atom row содержит зарезервированные `id`, `class`, `kind`, `label` (только graph scope) и
+`properties`. Объявленное `SCHEMAFULL`-поле читается знакомой формой `name`/`alias.name`, которая
+эквивалентна `properties.name`; явная форма работает для любого свойства. Не объявленное в catalog
+динамическое `SCHEMALESS`-свойство требует `properties.<name>`. Graph row содержит `id`, `name`,
+`kind`, `storage_mode`, `revision`, `node_count`, `edge_count` и единый `properties` object;
+пользовательские свойства графа не разворачиваются в корень.
+
+Поддерживаются `INNER`/`LEFT`/`CROSS JOIN`; `JOIN` означает `INNER`. Первые два требуют `ON`,
+`CROSS` запрещает `ON`. Falsey/`null`/`none` не образуют match, LEFT unmatched binding равен
+`none`, bag semantics сохраняется. Derived, scalar, correlated scalar и single-column collection
+subqueries разделяют snapshot/deadline/budget внешнего statement; scalar cardinality равна
+0 → `none`, 1 → value/object, >1 → `SubqueryCardinalityViolation`.
+
+Aggregates stage-13: `count`, `sum`, `avg`, `min`, `max`, `array::group`,
+`math::variance_pop/stddev_pop/variance_samp/stddev_samp`. Variance использует Welford/Chan;
+bare `variance/stddev` не вводятся. Barrier memory общая для join/group/order/distinct, default
+256 MiB; превышение создаёт checked transient spill, `TEMPFILES` начинает с него сразу.
+
+`DEFINE GRAPH ... CONTENT <object>` и `UPDATE GRAPH @name SET/UNSET properties.<path>` изменяют
+catalog-owned properties через MVCC и не перестраивают graph generation/`GraphSuperblock`.
+
+`TEMPFILES` начинает barrier-операторы с disk runs, не ожидая заполнения memory budget.
+Каталог задаётся `QueryExecutionOptions::temporary_directory`; при его отсутствии local backend
+использует database-owned `tmp/query`, а in-memory backend — отдельный каталог system temp.
 
 `SELECT` может использоваться:
 - как самостоятельный запрос;
@@ -3044,9 +3103,9 @@ SELECT
 -- name.last это алиас, который будет добавлен в поле name результата
 -- string::upper(address) + "!!!" это вычисляемое выражение
 SELECT
-	name.first,
+	properties.name.first,
 	"Morgan Hitchcock" AS name.last,
-	string::upper(address) + "!!!" AS angry_address
+	string::upper(properties.address) + "!!!" AS angry_address
 FROM person;
 
 -- Output
@@ -3064,24 +3123,24 @@ FROM person;
 #### Расширенные примеры запросов:
 ```
 -- Select nested objects/values
-SELECT address.city FROM person;
+SELECT properties.address.city FROM person;
 
 -- Select one item from an array
-SELECT address.coordinates[0] AS latitude FROM person;
+SELECT properties.address.coordinates[0] AS latitude FROM person;
 
 -- Select unique values from an array
-SELECT array::distinct(tags) FROM article;
+SELECT array::distinct(properties.tags) FROM article;
 
 -- Select unique values from a nested array across an entire class
-SELECT array::group(tags) AS tags FROM article GROUP ALL;
+SELECT array::group(properties.tags) AS tags FROM article GROUP ALL;
 
 -- Use mathematical calculations in a select expression
 SELECT
-	(( celsius * 1.8 ) + 32) AS fahrenheit
+	(( properties.celsius * 1.8 ) + 32) AS fahrenheit
 	FROM temperature;
 
 -- Return boolean expressions with an alias
-SELECT rating >= 4 as positive FROM review;
+SELECT properties.rating >= 4 as positive FROM review;
 
 -- Select manually generated object structure
 SELECT
@@ -3089,13 +3148,13 @@ SELECT
 FROM user;
 
 -- Select filtered nested array values
-SELECT address[WHERE active = true] FROM person;
+SELECT properties.address[WHERE active = true] FROM person;
 
 -- Use the result of a subquery as a returned field
-SELECT *, (SELECT * FROM events WHERE type = 'activity' LIMIT 5) AS history FROM user;
+SELECT *, (SELECT * FROM events WHERE properties.type = 'activity' LIMIT 5) AS history FROM user;
 
 -- Restructure objects in a select expression after `.` operator
-SELECT address.{city, country} FROM person;
+SELECT properties.address.{city, country} FROM person;
 ```
 
 #### Поддержка диапазона записей по идентификатору

@@ -184,12 +184,11 @@ relate_stmt ::= "RELATE" node_pattern graph_step node_pattern
                 [ relate_return ] [ timeout_clause ]
 
 atom_source ::= ( class_name | record_id | record_range ) [ graph_scope ]
-select_stmt ::= "SELECT" [ "ONLY" ] select_projection
-                "FROM" atom_source { "," atom_source }
+select_stmt ::= "SELECT" [ "ONLY" ] select_projection from_clause
                 [ with_clause ] [ where_clause ] [ split_clause ]
-                [ group_clause | order_clause ] [ limit_clause ]
-                [ start_clause ] [ fetch_clause ] [ timeout_clause ]
-                [ "TEMPFILES" ]
+                [ group_clause ] [ omit_clause ] [ fetch_clause ]
+                [ order_clause ] [ start_clause ] [ limit_clause ]
+                [ timeout_clause ] [ "TEMPFILES" ]
 ```
 
 Дополнительные синтаксические ограничения:
@@ -580,7 +579,9 @@ statement_param_list ::= statement_param { "," statement_param }
 ### 5.2. UPDATE / UPSERT
 
 ```ebnf
-update_stmt ::= "UPDATE" update_target_list
+update_stmt ::= update_atom_stmt | update_graph_stmt
+
+update_atom_stmt ::= "UPDATE" update_target_list
                 [ graph_scope ]
                 [ "LABEL" ( label_name | "NONE" ) ]
                 [ update_data ]
@@ -588,6 +589,13 @@ update_stmt ::= "UPDATE" update_target_list
                 [ mutate_return ]
                 [ expect_clause ]
                 [ timeout_clause ]
+
+update_graph_stmt ::= "UPDATE" "GRAPH" graph_ref
+                      ( "SET" graph_assignment_list | "UNSET" idiom_list )
+                      [ mutate_return ]
+                      [ timeout_clause ]
+graph_assignment_list ::= graph_assignment { "," graph_assignment }
+graph_assignment ::= "properties" "." idiom "=" expr
 
 upsert_stmt ::= "UPSERT" update_target_list
                 [ update_data ]
@@ -1061,6 +1069,7 @@ define_graph ::= "DEFINE" "GRAPH" [ overwrite_or_ifne ] name
                  [ "TYPE" graph_constraint ]
                  [ "ROOT" root_ref | "ROOTS" array_lit ]
                  [ "VALIDATE" ( "ON_MUTATION" | "DEFERRED" ) ]
+                 [ "CONTENT" expr ]
                  [ "COMMENT" string_lit ]
 root_ref ::= record_id | "(" record_id ")"
 
@@ -1212,14 +1221,16 @@ live_projection ::= [ "VALUE" ] select_field_list [ "AS" alias ]
 
 ```ebnf
 select_stmt ::= "SELECT" [ "ONLY" ] select_projection
-                "FROM" target_list
+                from_clause
                 [ with_clause ]
                 [ where_clause ]
                 [ split_clause ]
-                [ group_clause | order_clause ]
-                [ limit_clause ]
-                [ start_clause ]
+                [ group_clause ]
+                [ omit_clause ]
                 [ fetch_clause ]
+                [ order_clause ]
+                [ start_clause ]
+                [ limit_clause ]
                 [ timeout_clause ]
                 [ "TEMPFILES" ]
 
@@ -1235,10 +1246,18 @@ select_field      ::= "*"
 ### 11.2. Clauses
 
 ```ebnf
-from_clause  ::= "FROM" target_list
-target_list  ::= target from_join { from_join }
-from_join    ::= { "," target }                        (* union *)
-              | { "&" target }                          (* cross join *)
+from_clause  ::= "FROM" select_source { join_clause }
+select_source ::= atom_source [ source_alias ]
+                | graph_source [ source_alias ]
+                | "(" select_stmt ")" source_alias
+atom_source  ::= record_range | record_id | class_name [ graph_scope ]
+graph_source ::= "GRAPH" graph_ref
+               | "GRAPHS" [ graph_ref { "," graph_ref } ]
+               | "GRAPHS" "[" graph_ref { "," graph_ref } "]"
+source_alias ::= [ "AS" ] alias
+join_clause  ::= [ "INNER" ] "JOIN" select_source "ON" expr
+               | "LEFT" "JOIN" select_source "ON" expr
+               | "CROSS" "JOIN" select_source
 
 where_clause ::= "WHERE" expr
 
@@ -1248,17 +1267,17 @@ with_clause  ::= "WITH" ( "NOINDEX"
 
 split_clause ::= "SPLIT" [ "ON" ] idiom { "," idiom }
 
-group_clause ::= "GROUP" ( "ALL" | [ "BY" ] idiom_list )
+group_clause ::= "GROUP" ( "ALL" | [ "BY" ] expr_list )
 
 order_clause ::= "ORDER" [ "BY" ] ( order_rand | order_term_list )
 order_rand   ::= "RAND" "(" ")" [ nulls_pos ]
 order_term_list ::= order_term { "," order_term }
-order_term   ::= idiom [ "COLLATE" ] [ "NUMERIC" ] [ "ASC" | "DESC" ] [ nulls_pos ]
+order_term   ::= expr [ "COLLATE" ] [ "NUMERIC" ] [ "ASC" | "DESC" ] [ nulls_pos ]
 nulls_pos    ::= "NULLS" ( "FIRST" | "LAST" )
 
 limit_clause ::= "LIMIT" [ "BY" ] ( integer | param )
 start_clause ::= "START" [ "AT" ] ( integer | param )
-              | "START" "AFTER" ( param | expr )          (* keyset-курсор *)
+              | "START" "AFTER" ( param | expr ) [ "READ" "COMMITTED" ]
 
 fetch_clause ::= "FETCH" idiom_list
 omit_clause  ::= "OMIT" idiom_list
@@ -1271,10 +1290,12 @@ expect_clause  ::= "EXPECT" ( expr | "EXISTS" | "NOT" "EXISTS" )
 
 (* EXPLAIN — только префиксный оператор (§4.6); суффиксной формы нет *)
 
-target ::= ( record_range | record_id | class_name ) [ graph_scope ] | param
-         | "(" statement ")"          (* подзапрос / (MATCH ...) / (SELECT ...) *)
-         | idiom
+target ::= ( record_range | record_id | class_name ) [ graph_scope ] | param | idiom
 ```
+
+`ORDER RAND()`, `COLLATE` и `NUMERIC` остаются в синтаксисе полного draft, но stage-13 analyzer
+возвращает typed unsupported до открытия source. `JOIN` без модификатора означает `INNER JOIN`.
+Derived source всегда требует alias; comma/`&` больше не являются операторами объединения sources.
 
 ---
 

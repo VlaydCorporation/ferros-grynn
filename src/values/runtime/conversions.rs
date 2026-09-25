@@ -14,6 +14,7 @@ use super::{
 	Number,
 	Object,
 	Path,
+	QueryCursor,
 	Range,
 	RecordId,
 	Regex,
@@ -139,6 +140,12 @@ impl From<RecordId> for Value {
 impl From<ErrorValue> for Value {
 	fn from(value: ErrorValue) -> Self {
 		Self::Error(Box::new(value))
+	}
+}
+
+impl From<QueryCursor> for Value {
+	fn from(value: QueryCursor) -> Self {
+		Self::Cursor(value)
 	}
 }
 

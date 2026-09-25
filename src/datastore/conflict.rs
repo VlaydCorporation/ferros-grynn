@@ -6,6 +6,10 @@ use crate::graph::{AtomId, AtomKind, GraphId};
 pub(crate) enum ConflictKey {
 	/// Append-only property-name dictionary revision.
 	PropertyDictionary,
+	/// One named graph definition, including catalog-owned properties.
+	GraphDefinition(GraphId),
+	/// Set of graph definitions observed by a catalog scan.
+	GraphCatalogRange,
 	/// Database-global identity or base properties.
 	BaseAtom(GlobalAtomId),
 	/// Membership or value set observed by a database-global class scan.

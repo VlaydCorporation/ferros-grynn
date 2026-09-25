@@ -454,6 +454,21 @@ define_status_codes!(
 			transaction: u64 => DisplayValue,
 		},
 	},
+	QueryCursorExpired, "FG-25F07" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Query,
+		subcondition: "query cursor snapshot expired",
+		message: "Query cursor exceeded the snapshot age limit of {max_age_seconds} seconds.",
+		params: {
+			max_age_seconds: u64 => DisplayValue,
+		},
+		hint: "Repeat the SELECT with START AFTER ... READ COMMITTED or start a new query.",
+	},
 	QueryTimedOut, "FG-50F04" => {
 		kind: Error {
 			classification: ErrorClassification::TransientError,
@@ -552,6 +567,62 @@ define_status_codes!(
 		message: "The property batch is invalid: {reason}.",
 		params: {
 			reason: String => DisplayValue,
+		},
+	},
+	SubqueryCardinalityViolation, "FG-22F19" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "scalar subquery cardinality violation",
+		message: "Scalar subquery returned {actual_rows} rows; at most one row is allowed.",
+		params: {
+			actual_rows: u64 => DisplayValue,
+		},
+	},
+	InvalidQueryCursor, "FG-22F20" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "invalid query cursor",
+		message: "Query cursor is invalid: {reason}.",
+		params: {
+			reason: String => DisplayValue,
+		},
+	},
+	QueryValueNotSpillable, "FG-22F21" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "query value is not spillable",
+		message: "A value of type {value_type} cannot be written to a transient query run.",
+		params: {
+			value_type: String => ValueType,
+		},
+	},
+	SelectCardinalityViolation, "FG-22F22" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "SELECT ONLY cardinality violation",
+		message: "SELECT ONLY returned {actual_rows} rows; at most one row is allowed.",
+		params: {
+			actual_rows: u64 => DisplayValue,
 		},
 	},
 	AtomDoesNotExist, "FG-G1F01" => {
@@ -1129,6 +1200,20 @@ define_status_codes!(
 		message: "Control-flow {limit} exceeded the configured maximum of {maximum}.",
 		params: {
 			limit: String => Identifier,
+			maximum: u64 => DisplayValue,
+		},
+	},
+	QueryCursorLimitExceeded, "FG-54F10" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Query,
+		subcondition: "query cursor limit exceeded",
+		message: "Session already owns the maximum of {maximum} active result spools.",
+		params: {
 			maximum: u64 => DisplayValue,
 		},
 	},

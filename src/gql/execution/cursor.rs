@@ -3,6 +3,8 @@
 	reason = "move-only executor split keeps the existing imports during stage 1"
 )]
 
+use std::mem::size_of;
+
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -11,6 +13,15 @@ pub(super) struct Snapshot(pub(super) u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Row {
 	pub(super) values: Vec<Value>,
+	/// Whether atom metadata columns 1..=4 are omitted from this direct-pull
+	/// row.
+	compact_atom: bool,
+	/// Source-local ordinals used to preserve left-major relational order.
+	pub(super) sequence: Vec<usize>,
+	/// Deterministic public identities used to break ORDER ties.
+	pub(super) stable: Vec<Value>,
+	/// Graph scope used when dereferencing RecordId properties.
+	pub(super) graph: Option<GraphRef>,
 	/// Internal atom identities aligned with MATCH binding columns.
 	pub(super) atoms: Vec<Option<AtomId>>,
 	/// Connector edges already consumed by DIFFERENT EDGES semantics.
@@ -24,20 +35,86 @@ impl Row {
 		let atoms = Vec::new();
 		Self {
 			values,
+			compact_atom: false,
+			sequence: Vec::new(),
+			stable: Vec::new(),
+			graph: None,
 			atoms,
 			used_edges: Vec::new(),
 			current: None,
 		}
 	}
 
+	/// Keeps the datastore's `id + declared fields` layout for direct SELECT.
+	pub(super) const fn compact_atom(values: Vec<Value>) -> Self {
+		let mut row = Self::new(values);
+		row.compact_atom = true;
+		row
+	}
+
+	/// Resolves a logical schema column without expanding unused atom metadata.
+	pub(super) fn value(&self, column: usize) -> Option<&Value> {
+		let physical = if self.compact_atom {
+			match column {
+				0 => 0,
+				5.. => column - 4,
+				_ => return None,
+			}
+		} else {
+			column
+		};
+		self.values.get(physical)
+	}
+
 	/// Creates an empty MATCH binding row with `count` columns.
 	pub(super) fn bindings(count: usize) -> Self {
 		Self {
 			values: vec![Value::None; count],
+			compact_atom: false,
+			sequence: Vec::new(),
+			stable: Vec::new(),
+			graph: None,
 			atoms: vec![None; count],
 			used_edges: Vec::new(),
 			current: None,
 		}
+	}
+
+	pub(super) fn with_graph(mut self, graph: Option<GraphRef>) -> Self {
+		self.graph = graph;
+		self
+	}
+
+	pub(super) fn with_stable(mut self, stable: Vec<Value>) -> Self {
+		self.stable = stable;
+		self
+	}
+
+	pub(super) fn with_sequence(mut self, sequence: Vec<usize>) -> Self {
+		self.sequence = sequence;
+		self
+	}
+
+	pub(super) fn estimated_heap_bytes(&self) -> usize {
+		size_of::<Self>()
+			.saturating_add(self.values.capacity().saturating_mul(size_of::<Value>()))
+			.saturating_add(
+				self.values
+					.iter()
+					.map(Value::estimated_heap_bytes)
+					.fold(0_usize, usize::saturating_add),
+			)
+			.saturating_add(self.sequence.capacity().saturating_mul(size_of::<usize>()))
+			.saturating_add(self.stable.capacity().saturating_mul(size_of::<Value>()))
+			.saturating_add(
+				self.stable
+					.iter()
+					.map(Value::estimated_heap_bytes)
+					.fold(0_usize, usize::saturating_add),
+			)
+			.saturating_add(self.graph.as_ref().map_or(0, |graph| graph.name().len()))
+			.saturating_add(self.atoms.capacity().saturating_mul(size_of::<Option<AtomId>>()))
+			.saturating_add(self.used_edges.capacity().saturating_mul(size_of::<AtomId>()))
 	}
 }
 
@@ -64,6 +141,7 @@ pub(super) trait QueryRead {
 		predicate: Option<&TypedExpr>,
 		slots: &[Value],
 		source: &str,
+		full_row: bool,
 	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>>;
 
 	fn get(
@@ -72,6 +150,13 @@ pub(super) trait QueryRead {
 		record: &RecordId,
 		graph: Option<&GraphRef>,
 	) -> FerrosGrynnResult<Option<Row>>;
+
+	/// Produces graph-catalog rows in explicit-list or GraphId order.
+	fn graph_rows(
+		&self,
+		snapshot: Snapshot,
+		references: Option<&[GraphRef]>,
+	) -> FerrosGrynnResult<Vec<Row>>;
 
 	/// Returns graph-local seed candidates from primary, class, and label
 	/// indexes.
@@ -101,6 +186,15 @@ pub(super) trait QueryRead {
 	/// Returns the property dictionary captured by the statement snapshot.
 	fn property_dictionary(&self, snapshot: Snapshot) -> Arc<PropertyDictionary>;
 
+	/// Builds the exact dictionary/reference context for transient query runs.
+	fn spill_context(
+		&self,
+		snapshot: Snapshot,
+	) -> FerrosGrynnResult<crate::values::storage::EncodeContext>;
+
+	/// Returns the database-owned root below which query scratch is created.
+	fn query_scratch_root(&self) -> std::path::PathBuf;
+
 	fn savepoint(&self) -> Self::Savepoint;
 
 	fn restore_savepoint(&mut self, savepoint: Self::Savepoint) -> FerrosGrynnResult<()>;
@@ -112,7 +206,13 @@ pub(super) trait QueryRead {
 	) -> FerrosGrynnResult<usize>;
 
 	/// Applies one typed schema command to the transaction that owns this view.
-	fn execute_schema(&mut self, statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value>;
+	fn execute_schema(
+		&mut self,
+		statement: &LogicalSchemaStatement,
+		slots: &[Value],
+		source: &str,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<Value>;
 
 	/// Applies one typed data-mutation statement to the owning transaction.
 	fn execute_dml(

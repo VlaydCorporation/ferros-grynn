@@ -75,7 +75,17 @@ impl Transaction {
 		for key in &self.range_writes {
 			next.mark_version(*key, commit_ts);
 		}
-		store.inner.persist_root(&next)?;
+		let graph_catalog_only = self.mutations.iter().all(|mutation| {
+			matches!(mutation, Mutation::InternProperty { .. } | Mutation::ReplaceGraph(_))
+		}) && self
+			.mutations
+			.iter()
+			.any(|mutation| matches!(mutation, Mutation::ReplaceGraph(_)));
+		let dictionary_changed = self
+			.mutations
+			.iter()
+			.any(|mutation| matches!(mutation, Mutation::InternProperty { .. }));
+		store.inner.persist_root(&next, graph_catalog_only, dictionary_changed)?;
 		*store.inner.current.write() = Arc::new(next);
 		Ok(CommitResult {
 			transaction: self.id,
@@ -197,6 +207,9 @@ impl Transaction {
 				}
 				Mutation::ReplaceClass(class) => {
 					root.replace_class(class.clone(), published_at)?;
+				}
+				Mutation::ReplaceGraph(graph) => {
+					root.replace_graph_schema(graph.clone(), published_at)?;
 				}
 				Mutation::RemoveClass(class) => {
 					root.remove_class(*class)?;

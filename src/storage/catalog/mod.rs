@@ -11,6 +11,7 @@ pub(super) use database::{
 	ClassIndexCatalogEntry,
 	DatabaseCatalog,
 	GraphCatalogEntry,
+	GraphPropertyCatalogEntry,
 	ParameterCatalogEntry,
 	PhysicalIndexBinding,
 };

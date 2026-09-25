@@ -87,7 +87,7 @@ ClassScan / RecordLookup
 
 ### Утверждённые технические контракты после S0–S6
 
-- `FGDC v7` не хранит property-key strings: boot идёт FileCatalog → AtomStoreSuperblock →
+- `FGDC v8` не хранит property-key strings: boot идёт FileCatalog → AtomStoreSuperblock →
   append-only `property_keys.fgb` → schema definitions.
 - AtomStore/graph superblocks — snapshot-visible full WAL frames. Checkpoint не пишет их
   in-place, а публикует `main/.prev` COW; `.tmp` никогда не authority.
@@ -689,6 +689,24 @@ Runtime-решения: batch too large → split; skew → rebalance; выбо�
 ### 9.6. Отмена и таймауты
 
 Кооперативная отмена: операторы периодически проверяют флаг отмены и `TIMEOUT`/`statement_timeout_ms`. При превышении — `CANCEL` транзакции с откатом (§10.10, §17.5 gql_spec). Профилировочные хуки: rows processed, time per operator, cache misses → адаптивный оптимизатор и уточнение cost-model.
+
+### 9.7. Исполнимый relational profile этапа 13
+
+Stage-13 сохраняет sync pull `RowCursor`. Source binding содержит stable public provenance,
+`RecordId`/`GraphRef`, metadata и `PropertyMap`; фиксированный `Vec<Value>` не является authority
+для schemaless field resolution. Logical pipeline: source/join, filter, split, group, projection,
+omit, fetch, order, pagination и only.
+
+Hash join используется только для conjunction equality с правой build-side; arbitrary predicate
+и cross join используют block nested-loop. Один statement делит общий default budget 256 MiB
+между join/group/order/distinct. При превышении создаются transient checked runs; fan-in 64,
+cancellation/deadline проверяются при записи/чтении/merge, RAII и startup cleanup удаляют orphan
+directories. Специализированный index sorter не превращается в trait.
+
+Exact keyset continuation принадлежит `GqlSession` и читает immutable ordered spool исходного
+snapshot. Cursor проверяет session/database identity, normalized query hash и ORDER fingerprint;
+явный `READ COMMITTED` повторно выполняет запрос на свежем root после сохранённых keys.
+`Datastore::execute` не хранит межвызовный cursor state.
 
 ---
 

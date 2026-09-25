@@ -1,6 +1,7 @@
 mod control;
 mod dml;
 mod graph_dml;
+mod graph_properties;
 mod import;
 mod r#let;
 mod r#match;
@@ -50,7 +51,22 @@ pub use schema::{
 	RemoveStatement,
 	RemoveTarget,
 };
-pub use select::{RecordKey, SelectItem, SelectStatement, SelectTarget};
+pub use select::{
+	RecordKey,
+	SelectGroup,
+	SelectItem,
+	SelectJoin,
+	SelectJoinKind,
+	SelectNulls,
+	SelectOrder,
+	SelectOrderDirection,
+	SelectPath,
+	SelectSource,
+	SelectSourceKind,
+	SelectStart,
+	SelectStatement,
+	SelectTarget,
+};
 pub use transaction::{
 	BeginStatement,
 	CommitStatement,
@@ -59,7 +75,7 @@ pub use transaction::{
 };
 
 use super::{
-	ast::{Expr, Identifier, TypeName, cover},
+	ast::{Expr, ExprKind, Identifier, TypeName, cover},
 	lexer::keywords,
 	parser::Parser,
 	token::{Symbol, TokenKind},
@@ -103,6 +119,7 @@ pub enum StatementKind {
 	Attach(AttachStatement),
 	Create(CreateStatement),
 	Update(MutateStatement),
+	UpdateGraph(UpdateGraphStatement),
 	Upsert(MutateStatement),
 	Delete(DeleteStatement),
 	Detach(DetachStatement),
@@ -132,6 +149,12 @@ pub use dml::{
 	MutateStatement,
 };
 pub use graph_dml::{AttachStatement, DetachStatement, RelateStatement};
+pub use graph_properties::{
+	GraphPropertyAssignment,
+	GraphPropertyMutation,
+	GraphPropertyPath,
+	UpdateGraphStatement,
+};
 pub use import::{
 	ImportGraphRef,
 	ImportOption,

@@ -116,6 +116,7 @@ enum Mutation {
 	DefineClass(ClassSchema),
 	DefineGraph(GraphSchema),
 	ReplaceClass(ClassSchema),
+	ReplaceGraph(GraphSchema),
 	RemoveClass(ClassId),
 	RemoveGraph(GraphId),
 	CreateAtom {
@@ -507,6 +508,15 @@ impl Transaction {
 		name: IntoText,
 		kind: GraphKind,
 	) -> FerrosGrynnResult<GraphRef> {
+		self.define_graph_with_properties(name, kind, PropertyMap::new())
+	}
+
+	pub(crate) fn define_graph_with_properties<IntoText: Into<Text>>(
+		&mut self,
+		name: IntoText,
+		kind: GraphKind,
+		properties: PropertyMap,
+	) -> FerrosGrynnResult<GraphRef> {
 		self.prepare_schema_mutation()?;
 		let name = name.into();
 		if self.working.schema.named_graph(name.as_str()).is_some() {
@@ -528,10 +538,13 @@ impl Transaction {
 			reference.clone(),
 			label,
 			adjacency,
+			properties,
 			self.snapshot.commit_ts,
 		);
 		self.working.install_graph(schema.clone(), self.snapshot.commit_ts)?;
 		self.write_bytes += SCHEMA_WRITE_BYTES;
+		self.mark_range_change(ConflictKey::GraphCatalogRange);
+		self.insert_write(ConflictKey::GraphDefinition(graph), 0);
 		self.mutations.push(Mutation::DefineGraph(schema));
 		Ok(reference)
 	}

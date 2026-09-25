@@ -101,7 +101,10 @@ impl Number {
 
 	fn canonical(self) -> CanonicalNumber {
 		match self {
-			Self::Int(value) => canonical_fraction(BigInt::from(value), BigInt::from(1)),
+			Self::Int(value) => CanonicalNumber::Finite {
+				numerator: BigInt::from(value),
+				denominator: BigInt::from(1),
+			},
 			Self::Float(value) => canonical_float(value),
 			Self::Decimal(value) => {
 				let numerator = BigInt::from(value.mantissa());
@@ -211,7 +214,10 @@ impl PartialOrd for Number {
 
 impl Ord for Number {
 	fn cmp(&self, other: &Self) -> Ordering {
-		self.canonical().cmp(&other.canonical())
+		match (self, other) {
+			(Self::Int(left), Self::Int(right)) => left.cmp(right),
+			_ => self.canonical().cmp(&other.canonical()),
+		}
 	}
 }
 

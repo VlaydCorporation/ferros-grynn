@@ -23,6 +23,7 @@ use super::{
 	Object,
 	Path,
 	Position,
+	QueryCursor,
 	Range,
 	RecordId,
 	RecordIdPart,
@@ -65,6 +66,7 @@ pub enum Value {
 	Graph(Box<MaterializedGraph>),
 	Closure(Box<Closure>),
 	Error(Box<ErrorValue>),
+	Cursor(QueryCursor),
 }
 
 impl Value {
@@ -97,6 +99,7 @@ impl Value {
 			Self::Graph(_) => ValueKind::Graph,
 			Self::Closure(_) => ValueKind::Closure,
 			Self::Error(_) => ValueKind::Error,
+			Self::Cursor(_) => ValueKind::Cursor,
 		}
 	}
 
@@ -111,7 +114,8 @@ impl Value {
 			| Self::Duration(_)
 			| Self::DateTime(_)
 			| Self::Ulid(_)
-			| Self::Uuid(_) => 0,
+			| Self::Uuid(_)
+			| Self::Cursor(_) => 0,
 			Self::String(value) => value.len(),
 			Self::Array(values) => estimated_values_heap_bytes(values.iter(), values.len()),
 			Self::Set(values) => estimated_values_heap_bytes(values.iter(), values.len()),
@@ -181,7 +185,7 @@ impl Value {
 			| Self::Path(_)
 			| Self::Graph(_)
 			| Self::Closure(_) => true,
-			Self::Error(_) => true,
+			Self::Error(_) | Self::Cursor(_) => true,
 		}
 	}
 
@@ -347,6 +351,13 @@ impl Value {
 		}
 	}
 
+	pub const fn as_cursor(&self) -> Option<QueryCursor> {
+		match self {
+			Self::Cursor(value) => Some(*value),
+			_ => None,
+		}
+	}
+
 	pub fn is_storable(&self) -> bool {
 		match self {
 			Self::Array(values) => values.iter().all(Self::is_storable),
@@ -367,9 +378,12 @@ impl Value {
 				};
 				start_storable && end_storable
 			}
-			Self::Regex(_) | Self::Path(_) | Self::Graph(_) | Self::Closure(_) | Self::Error(_) => {
-				false
-			}
+			Self::Regex(_)
+			| Self::Path(_)
+			| Self::Graph(_)
+			| Self::Closure(_)
+			| Self::Error(_)
+			| Self::Cursor(_) => false,
 			_ => true,
 		}
 	}
@@ -506,6 +520,7 @@ impl Ord for Value {
 				(Self::Graph(left), Self::Graph(right)) => left.cmp(right),
 				(Self::Closure(left), Self::Closure(right)) => left.cmp(right),
 				(Self::Error(left), Self::Error(right)) => left.cmp(right),
+				(Self::Cursor(left), Self::Cursor(right)) => left.cmp(right),
 				_ => Ordering::Equal,
 			}
 		})
@@ -539,6 +554,7 @@ impl Hash for Value {
 			Self::Graph(value) => value.hash(state),
 			Self::Closure(value) => value.hash(state),
 			Self::Error(value) => value.hash(state),
+			Self::Cursor(value) => value.hash(state),
 		}
 	}
 }

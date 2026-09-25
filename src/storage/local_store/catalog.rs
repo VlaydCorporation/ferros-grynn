@@ -1,4 +1,4 @@
-//! Conversion between the MVCC schema root and exact `FGDC v7` entries.
+//! Conversion between the MVCC schema root and exact `FGDC v8` entries.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -26,6 +26,7 @@ use crate::{
 			ClassIndexCatalogEntry,
 			DatabaseCatalog,
 			GraphCatalogEntry,
+			GraphPropertyCatalogEntry,
 			ParameterCatalogEntry,
 			PhysicalIndexBinding,
 		},
@@ -121,17 +122,32 @@ pub(super) fn encode_database_catalog(
 			};
 			let label = system(SystemIndexKind::Label)?;
 			let adjacency = system(SystemIndexKind::Adjacency)?;
+			let properties = schema
+				.properties()
+				.iter()
+				.map(|(key, value)| {
+					if value.is_none() {
+						return Err(invalid("graph property cannot contain none"));
+					}
+					let value = StorageValue::from_runtime(value.clone(), context)?;
+					Ok(GraphPropertyCatalogEntry {
+						key,
+						value: CanonicalCodec::encode(value.as_ref())?,
+					})
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			Ok(GraphCatalogEntry {
 				id: binding.graph_id,
 				version: schema.version(),
 				published_at: schema.published_at,
-				generation: root.commit_ts,
+				generation: binding.generation,
 				name: schema.name().clone(),
 				kind: schema.reference().kind(),
 				storage_mode: GraphStorageMode::DiskBacked,
 				label_index: (label.id(), label.version()),
 				adjacency_index: (adjacency.id(), adjacency.version()),
 				membership: binding.membership,
+				properties,
 				arena: binding.arena.clone(),
 			})
 		})
@@ -237,6 +253,7 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 				entry.adjacency_index.1,
 				SystemIndexKind::Adjacency,
 			),
+			crate::values::PropertyMap::new(),
 			entry.published_at,
 		));
 		schema.graph_names.insert(entry.name.to_string(), entry.id);
@@ -246,7 +263,7 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 	Ok(schema)
 }
 
-pub(super) fn decode_parameters(
+pub(super) fn decode_catalog_values(
 	catalog: &DatabaseCatalog,
 	dictionary: &PropertyDictionary,
 	schema: &mut SchemaCatalog,
@@ -254,6 +271,39 @@ pub(super) fn decode_parameters(
 	let mut context = value_context(schema, dictionary.clone())?;
 	for zone in &catalog.time_zones {
 		context.register_time_zone_name(zone.clone())?;
+	}
+	for entry in &catalog.graphs {
+		let mut properties = crate::values::PropertyMap::with_capacity(entry.properties.len());
+		for property in &entry.properties {
+			if dictionary.resolve(property.key).is_none() {
+				return Err(invalid("graph property references an unknown property key"));
+			}
+			let value = CanonicalCodec::decode(&property.value, DecodeLimits::default())?
+				.into_runtime(&context.decoder())?;
+			if value.is_none() || properties.insert(property.key, value).is_some() {
+				return Err(invalid("graph property value or key is invalid"));
+			}
+		}
+		let current = schema
+			.graph(entry.id)
+			.ok_or_else(|| invalid("graph property entry has no graph definition"))?;
+		let graph = Arc::new(crate::datastore::GraphSchema::new(
+			entry.version,
+			current.reference().clone(),
+			current
+				.system_indexes()
+				.find(|index| index.kind() == SystemIndexKind::Label)
+				.copied()
+				.ok_or_else(|| invalid("graph label index is absent"))?,
+			current
+				.system_indexes()
+				.find(|index| index.kind() == SystemIndexKind::Adjacency)
+				.copied()
+				.ok_or_else(|| invalid("graph adjacency index is absent"))?,
+			properties,
+			entry.published_at,
+		));
+		schema.graphs.insert(entry.id, graph);
 	}
 	for entry in &catalog.parameters {
 		let value = CanonicalCodec::decode(&entry.value, DecodeLimits::default())?

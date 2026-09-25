@@ -30,7 +30,7 @@ const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(in crate::storage) enum CatalogKind {
-	/// `FGDC v7` database catalog.
+	/// `FGDC v8` database catalog.
 	Database = 1,
 	/// `FGFC v5` physical-file catalog.
 	Files = 2,

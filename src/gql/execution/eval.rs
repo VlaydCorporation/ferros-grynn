@@ -32,7 +32,7 @@ fn eval_current(
 		TypedExprKind::Constant(value) => Ok(value.clone()),
 		TypedExprKind::Slot(slot) => Ok(slots[*slot as usize].clone()),
 		TypedExprKind::Column(column) => {
-			row.and_then(|row| row.values.get(*column)).cloned().ok_or_else(|| {
+			row.and_then(|row| row.value(*column)).cloned().ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("Column is missing from the input row.")
 			})
 		}
@@ -230,6 +230,14 @@ fn eval_current(
 			.and_then(|arguments| {
 				crate::gql::execution::builtins::execute(function, arguments, control)
 			}),
+		TypedExprKind::Aggregate {
+			..
+		}
+		| TypedExprKind::Subquery {
+			..
+		} => Err(FerrosGrynnError::invalid_argument(
+			"SELECT aggregate or subquery reached the scalar evaluator before materialization.",
+		)),
 		TypedExprKind::Cast {
 			target,
 			expr,

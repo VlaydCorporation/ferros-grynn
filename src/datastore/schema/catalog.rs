@@ -8,7 +8,7 @@ use std::{
 use super::ClassSchema;
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::{GraphId, GraphRef, Text, Value},
+	values::runtime::{GraphId, GraphRef, PropertyMap, Text, Value},
 };
 
 /// Stable identity of one schema-catalog object.
@@ -230,21 +230,24 @@ pub struct GraphSchema {
 	version: SchemaVersion,
 	reference: GraphRef,
 	system_indexes: [SystemIndex; 2],
+	properties: PropertyMap,
 	pub(crate) published_at: u64,
 }
 
 impl GraphSchema {
-	pub(crate) const fn new(
+	pub(crate) fn new(
 		version: SchemaVersion,
 		reference: GraphRef,
 		label: SystemIndex,
 		adjacency: SystemIndex,
+		properties: PropertyMap,
 		published_at: u64,
 	) -> Self {
 		Self {
 			version,
 			reference,
 			system_indexes: [label, adjacency],
+			properties,
 			published_at,
 		}
 	}
@@ -267,6 +270,18 @@ impl GraphSchema {
 	/// Returns the graph reference owned by this datastore.
 	pub const fn reference(&self) -> &GraphRef {
 		&self.reference
+	}
+
+	/// Returns catalog-owned user properties in canonical key order.
+	pub const fn properties(&self) -> &PropertyMap {
+		&self.properties
+	}
+
+	pub(crate) fn replace_properties(&self, properties: PropertyMap) -> FerrosGrynnResult<Self> {
+		let mut replacement = self.clone();
+		replacement.version = replacement.version.next()?;
+		replacement.properties = properties;
+		Ok(replacement)
 	}
 
 	/// Returns the label and adjacency capabilities owned by the engine.

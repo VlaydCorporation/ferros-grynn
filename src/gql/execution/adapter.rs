@@ -35,6 +35,7 @@ pub fn execute_transaction_with_options(
 	variables: &Object,
 	options: crate::gql::QueryExecutionOptions,
 ) -> FerrosGrynnResult<Vec<QueryResult>> {
+	options.validate()?;
 	let program = match crate::gql::parse(source, options.parser_settings) {
 		Ok(program) => program,
 		Err(error) => {
@@ -92,6 +93,7 @@ pub fn execute_transaction_with_options(
 				result: Err(FerrosGrynnError::invalid_argument(format!(
 					"Binding `${name}` is already declared in this scope."
 				))),
+				continuation: None,
 			};
 			transaction.abort_gql();
 			results.push(result);
@@ -105,6 +107,7 @@ pub fn execute_transaction_with_options(
 					kind: crate::gql::statement_kind(&statement.kind),
 					elapsed: started.elapsed(),
 					result: Err(error),
+					continuation: None,
 				});
 				break;
 			}
@@ -125,6 +128,7 @@ pub fn execute_transaction_with_options(
 				kind: crate::gql::statement_kind(&statement.kind),
 				elapsed: started.elapsed(),
 				result: Err(error),
+				continuation: None,
 			},
 		};
 		let failed = result.result.is_err();
@@ -245,6 +249,7 @@ impl QueryRead for TransactionRead<'_> {
 		predicate: Option<&TypedExpr>,
 		slots: &[Value],
 		_source: &str,
+		full_row: bool,
 	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
 		let mut constraints = Vec::new();
 		if let Some(predicate) = predicate {
@@ -253,6 +258,8 @@ impl QueryRead for TransactionRead<'_> {
 		let rows = self.transaction.query_row_cursor(&self.snapshot, class, &constraints, graph)?;
 		Ok(Box::new(StorageCursor {
 			rows,
+			dictionary: self.transaction.query_property_dictionary(),
+			full_row,
 		}))
 	}
 
@@ -263,7 +270,59 @@ impl QueryRead for TransactionRead<'_> {
 		graph: Option<&GraphRef>,
 	) -> FerrosGrynnResult<Option<Row>> {
 		let row = self.transaction.query_point(&self.snapshot, record, graph)?;
-		Ok(row.map(|row| Row::new(row.values)))
+		Ok(row
+			.map(|row| storage_row(row, &self.transaction.query_property_dictionary(), true))
+			.transpose()?)
+	}
+
+	fn graph_rows(
+		&self,
+		_snapshot: Snapshot,
+		references: Option<&[GraphRef]>,
+	) -> FerrosGrynnResult<Vec<Row>> {
+		let schemas = self.transaction.query_schema_graphs(&self.snapshot)?;
+		let dictionary = self.transaction.query_property_dictionary();
+		let selected = if let Some(references) = references {
+			references
+				.iter()
+				.map(|reference| {
+					schemas
+						.iter()
+						.find(|schema| schema.reference() == reference)
+						.cloned()
+						.ok_or_else(|| {
+							FerrosGrynnError::graph_does_not_exist(reference.name().to_string())
+						})
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?
+		} else {
+			let mut schemas = schemas;
+			schemas.sort_by_key(crate::datastore::GraphSchema::id);
+			schemas
+		};
+		selected
+			.into_iter()
+			.map(|schema| {
+				let graph = self.transaction.query_graph(&self.snapshot, schema.reference())?;
+				let properties = super::graph_properties::property_map_to_object(
+					schema.properties(),
+					&dictionary,
+				)?;
+				Ok(Row::new(vec![
+					Value::from(schema.reference().clone()),
+					Value::from(schema.name().clone()),
+					Value::from(schema.reference().kind().name()),
+					Value::from(super::graph_properties::storage_mode_name(
+						schema.reference().storage_mode(),
+					)),
+					Value::from(graph.revision()),
+					Value::from(graph.node_count()?),
+					Value::from(graph.edge_count()?),
+					Value::Object(properties),
+				])
+				.with_stable(vec![Value::from(schema.reference().clone())]))
+			})
+			.collect()
 	}
 
 	fn match_candidates(
@@ -309,6 +368,32 @@ impl QueryRead for TransactionRead<'_> {
 		self.transaction.query_property_dictionary()
 	}
 
+	fn spill_context(
+		&self,
+		_snapshot: Snapshot,
+	) -> FerrosGrynnResult<crate::values::storage::EncodeContext> {
+		let mut context = crate::values::storage::EncodeContext::new(
+			self.transaction.query_property_dictionary().as_ref().clone(),
+		);
+		for class in self.transaction.query_schema_classes(&self.snapshot)? {
+			let id = class.id().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("published class is missing ClassId")
+			})?;
+			context.register_class_name(id.get(), class.name().clone())?;
+		}
+		for graph in self.transaction.query_schema_graphs(&self.snapshot)? {
+			context.register_graph(
+				graph.reference().clone(),
+				crate::values::storage::DiskGraphRef::new(graph.id()),
+			)?;
+		}
+		Ok(context)
+	}
+
+	fn query_scratch_root(&self) -> std::path::PathBuf {
+		self.transaction.query_scratch_root()
+	}
+
 	fn savepoint(&self) -> Self::Savepoint {
 		self.transaction.gql_savepoint()
 	}
@@ -326,8 +411,17 @@ impl QueryRead for TransactionRead<'_> {
 		self.transaction.assert_invariants(graph, detail_limit)
 	}
 
-	fn execute_schema(&mut self, statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value> {
-		let value = execute_schema(self.transaction, &self.snapshot, statement)?;
+	fn execute_schema(
+		&mut self,
+		statement: &LogicalSchemaStatement,
+		slots: &[Value],
+		source: &str,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<Value> {
+		let snapshot = self.snapshot.clone();
+		let value = self.transaction.atomic_mutation(|transaction| {
+			execute_schema(transaction, &snapshot, statement, slots, source, control)
+		})?;
 		self.refresh_snapshot()?;
 		Ok(value)
 	}
@@ -423,13 +517,37 @@ fn scalar_constraint_value(expr: &TypedExpr, slots: &[Value]) -> Option<Value> {
 }
 
 fn query_schema(schema: &ClassSchema) -> Schema {
-	let mut columns = Vec::with_capacity(schema.fields().len() + 1);
+	let mut columns = Vec::with_capacity(schema.fields().len() + 5);
 	columns.push(Column {
 		name: "id".into(),
+		qualifier: None,
 		ty: Type::Record,
 	});
+	columns.extend([
+		Column {
+			name: "class".into(),
+			qualifier: None,
+			ty: Type::String,
+		},
+		Column {
+			name: "kind".into(),
+			qualifier: None,
+			ty: Type::String,
+		},
+		Column {
+			name: "label".into(),
+			qualifier: None,
+			ty: Type::Option(Box::new(Type::String)),
+		},
+		Column {
+			name: "properties".into(),
+			qualifier: None,
+			ty: Type::Object,
+		},
+	]);
 	columns.extend(schema.fields().map(|field| Column {
 		name: field.name().as_str().into(),
+		qualifier: None,
 		ty: field.value_type().clone(),
 	}));
 	Schema {
@@ -441,6 +559,8 @@ fn query_schema(schema: &ClassSchema) -> Schema {
 /// LIMIT or cursor drop.
 struct StorageCursor<'a> {
 	rows: QueryStorageCursor<'a>,
+	dictionary: Arc<PropertyDictionary>,
+	full_row: bool,
 }
 
 impl RowCursor for StorageCursor<'_> {
@@ -449,6 +569,42 @@ impl RowCursor for StorageCursor<'_> {
 		let Some(row) = self.rows.next_row()? else {
 			return Ok(None);
 		};
-		Ok(Some(Row::new(row.values)))
+		storage_row(row, &self.dictionary, self.full_row).map(Some)
 	}
+}
+
+fn storage_row(
+	row: QueryStorageRow,
+	dictionary: &PropertyDictionary,
+	full_row: bool,
+) -> FerrosGrynnResult<Row> {
+	if !full_row {
+		return Ok(Row::compact_atom(row.values));
+	}
+	let record_id = row.record_id.clone();
+	let properties = Value::Object(
+		row.properties
+			.iter()
+			.map(|(key, value)| {
+				dictionary.resolve(key).map(|name| (name.as_str(), value.clone())).ok_or_else(
+					|| {
+						FerrosGrynnError::invalid_storage_file(
+							"query row property key is absent from the property dictionary",
+						)
+					},
+				)
+			})
+			.collect::<FerrosGrynnResult<Object>>()?,
+	);
+	let mut values = Vec::with_capacity(row.values.len() + 4);
+	let mut source_values = row.values.into_iter();
+	values.push(
+		source_values.next().unwrap_or_else(|| Value::Record(Box::new(row.record_id.clone()))),
+	);
+	values.push(Value::from(row.record_id.class()));
+	values.push(Value::from(row.kind.to_string()));
+	values.push(row.label.map_or(Value::None, Value::from));
+	values.push(properties);
+	values.extend(source_values);
+	Ok(Row::new(values).with_stable(vec![Value::Record(Box::new(record_id))]))
 }

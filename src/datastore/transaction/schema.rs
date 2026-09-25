@@ -35,7 +35,11 @@ impl Transaction {
 	/// Returns a snapshot-lifetime or read-committed refresh error.
 	pub fn named_graph(&mut self, name: &str) -> FerrosGrynnResult<Option<GraphRef>> {
 		self.prepare_read()?;
-		Ok(self.working.schema.named_graph(name).map(|schema| schema.reference().clone()))
+		let schema = self.working.schema.named_graph(name);
+		if let Some(schema) = &schema {
+			self.record_read(ConflictKey::GraphDefinition(schema.id()));
+		}
+		Ok(schema.map(|schema| schema.reference().clone()))
 	}
 
 	/// Returns all transaction-visible class definitions in stable identity
@@ -57,7 +61,29 @@ impl Transaction {
 	/// Returns a snapshot-lifetime or read-committed refresh error.
 	pub fn graphs(&mut self) -> FerrosGrynnResult<Vec<crate::datastore::GraphSchema>> {
 		self.prepare_read()?;
+		self.record_read(ConflictKey::GraphCatalogRange);
 		Ok(self.working.schema.graphs().map(|graph| graph.as_ref().clone()).collect())
+	}
+
+	pub(crate) fn replace_graph_properties(
+		&mut self,
+		name: &str,
+		properties: crate::values::PropertyMap,
+	) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let current = self
+			.working
+			.schema
+			.named_graph(name)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
+		let replacement = current.replace_properties(properties)?;
+		let id = replacement.id();
+		self.working.replace_graph_schema(replacement.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::GraphDefinition(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::GraphCatalogRange);
+		self.mutations.push(Mutation::ReplaceGraph(replacement));
+		Ok(())
 	}
 
 	/// Adds one field to an existing class.
@@ -288,6 +314,8 @@ impl Transaction {
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		self.working.remove_graph(graph)?;
+		self.insert_write(ConflictKey::GraphDefinition(graph), 0);
+		self.mark_range_change(ConflictKey::GraphCatalogRange);
 		for (class, kind) in ranges {
 			self.mark_range_change(ConflictKey::GraphClassRange(graph, class));
 			self.mark_range_change(ConflictKey::GraphKindRange(graph, kind));

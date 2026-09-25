@@ -14,6 +14,7 @@ pub(super) enum TokenKind {
 		quoted: bool,
 	},
 	Parameter(Box<str>),
+	GraphRef(Box<str>),
 	Number(Box<str>),
 	String(Box<str>),
 	Symbol(Symbol),

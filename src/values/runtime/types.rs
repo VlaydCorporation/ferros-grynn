@@ -39,6 +39,7 @@ pub enum Type {
 		result: Box<Type>,
 	},
 	Error,
+	Cursor,
 }
 
 impl Type {
@@ -70,6 +71,7 @@ impl Type {
 			Value::Graph(value) => Self::Graph(value.kind()),
 			Value::Closure(value) => value.signature(),
 			Value::Error(_) => Self::Error,
+			Value::Cursor(_) => Self::Cursor,
 		}
 	}
 }
@@ -137,6 +139,7 @@ impl Display for Type {
 				write!(f, ") -> {result}>")
 			}
 			Self::Error => f.write_str("error"),
+			Self::Cursor => f.write_str("cursor"),
 		}
 	}
 }

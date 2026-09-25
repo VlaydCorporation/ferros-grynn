@@ -64,6 +64,7 @@ impl Display for Value {
 				value.id().get(),
 			),
 			Self::Error(value) => write!(f, "error({}: {})", value.code(), value.message()),
+			Self::Cursor(value) => Display::fmt(value, f),
 		}
 	}
 }

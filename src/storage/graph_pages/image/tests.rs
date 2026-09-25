@@ -38,6 +38,7 @@ fn occurrence_image_round_trips_identity_topology_labels_and_overlay() -> Ferros
 			reference,
 			SystemIndex::new(IndexId::new(10).unwrap(), SystemIndexKind::Label),
 			SystemIndex::new(IndexId::new(11).unwrap(), SystemIndexKind::Adjacency),
+			PropertyMap::new(),
 			0,
 		),
 		0,

@@ -1,3 +1,4 @@
+use super::graph_properties::{evaluate_graph_properties, execute_graph_property_update};
 use crate::{
 	datastore::{
 		ClassField,
@@ -20,15 +21,33 @@ use crate::{
 /// Executes one analyzed schema statement against transaction-visible state.
 pub(super) fn execute_schema(
 	transaction: &mut Transaction,
-	_snapshot: &QuerySnapshot,
+	snapshot: &QuerySnapshot,
 	statement: &LogicalSchemaStatement,
+	slots: &[Value],
+	source: &str,
+	control: &crate::gql::ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	match statement {
 		LogicalSchemaStatement::DefineGraph {
 			mode,
 			name,
 			kind,
-		} => define_graph(transaction, *mode, name, *kind),
+			content,
+		} => define_graph(transaction, *mode, name, *kind, content.as_ref(), slots, source, control),
+		LogicalSchemaStatement::UpdateGraph {
+			graph,
+			mutation,
+			returning,
+		} => execute_graph_property_update(
+			transaction,
+			snapshot,
+			graph,
+			mutation,
+			returning,
+			slots,
+			source,
+			control,
+		),
 		LogicalSchemaStatement::DefineClass {
 			mode,
 			name,
@@ -98,18 +117,30 @@ fn define_graph(
 	mode: DefinitionMode,
 	name: &str,
 	kind: GraphKind,
+	content: Option<&crate::gql::ir::TypedExpr>,
+	slots: &[Value],
+	source: &str,
+	control: &crate::gql::ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	if let Some(existing) = transaction.named_graph(name)? {
 		return match mode {
 			DefinitionMode::IfNotExists => Ok(Value::None),
-			DefinitionMode::Overwrite if existing.kind() == kind => Ok(Value::None),
+			DefinitionMode::Overwrite if existing.kind() == kind => {
+				if content.is_some() {
+					let properties =
+						evaluate_graph_properties(transaction, content, slots, source, control)?;
+					transaction.replace_graph_properties(name, properties)?;
+				}
+				Ok(Value::None)
+			}
 			DefinitionMode::Overwrite => Err(FerrosGrynnError::query_feature_not_supported(
 				"changing a graph family with DEFINE GRAPH OVERWRITE",
 			)),
 			DefinitionMode::Normal => Err(FerrosGrynnError::graph_already_exists(name)),
 		};
 	}
-	transaction.define_graph(name, kind)?;
+	let properties = evaluate_graph_properties(transaction, content, slots, source, control)?;
+	transaction.define_graph_with_properties(name, kind, properties)?;
 	Ok(Value::None)
 }
 

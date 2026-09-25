@@ -232,6 +232,12 @@ pub(super) enum LogicalSchemaStatement {
 		mode: DefinitionMode,
 		name: Box<str>,
 		kind: GraphKind,
+		content: Option<TypedExpr>,
+	},
+	UpdateGraph {
+		graph: GraphRef,
+		mutation: LogicalGraphPropertyMutation,
+		returning: LogicalDmlReturn,
 	},
 	DefineClass {
 		mode: DefinitionMode,
@@ -296,6 +302,13 @@ pub(super) enum LogicalSchemaStatement {
 	},
 }
 
+/// One catalog-owned graph-property mutation.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalGraphPropertyMutation {
+	Set(Vec<(Vec<Box<str>>, TypedExpr)>),
+	Unset(Vec<Vec<Box<str>>>),
+}
+
 impl LogicalSchemaStatement {
 	pub(super) const fn statement_kind(&self) -> crate::gql::QueryStatementKind {
 		match self {
@@ -311,6 +324,9 @@ impl LogicalSchemaStatement {
 			| Self::DefineIndex {
 				..
 			} => crate::gql::QueryStatementKind::Define,
+			Self::UpdateGraph {
+				..
+			} => crate::gql::QueryStatementKind::Update,
 			Self::RemoveGraph {
 				..
 			}
@@ -456,49 +472,91 @@ pub(super) enum LogicalMatchSelector {
 
 #[derive(Debug, Clone)]
 pub(super) struct LogicalSelect {
-	pub(super) nodes: Vec<LogicalNode>,
-	pub(super) root: NodeId,
-	pub(super) graph: Option<GraphRef>,
+	pub(super) source: LogicalSelectSource,
+	pub(super) joins: Vec<LogicalSelectJoin>,
+	pub(super) input_schema: Schema,
+	pub(super) filter: Option<TypedExpr>,
+	pub(super) split: Vec<TypedExpr>,
+	pub(super) group: Option<Vec<TypedExpr>>,
+	pub(super) projection: Vec<LogicalSelectItem>,
+	pub(super) result: Schema,
+	pub(super) omit: Vec<Vec<Box<str>>>,
+	pub(super) fetch: Vec<Vec<Box<str>>>,
+	pub(super) order: Vec<LogicalOrder>,
+	pub(super) start: Option<LogicalSelectStart>,
+	pub(super) limit: Option<TypedExpr>,
 	pub(super) value: bool,
 	pub(super) only: bool,
-}
-
-impl LogicalSelect {
-	pub(super) fn push(&mut self, node: LogicalNode) -> NodeId {
-		let id = NodeId(self.nodes.len() as u32);
-		self.nodes.push(node);
-		id
-	}
-
-	pub(super) fn node(&self, id: NodeId) -> &LogicalNode {
-		&self.nodes[id.0 as usize]
-	}
+	pub(super) tempfiles: bool,
+	pub(super) outer_columns: usize,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct LogicalNode {
-	pub(super) kind: LogicalNodeKind,
+pub(super) struct LogicalSelectSource {
+	pub(super) kind: LogicalSelectSourceKind,
 	pub(super) schema: Schema,
-	pub(super) span: TextSpan,
+	pub(super) wildcard: Vec<LogicalWildcardField>,
+	pub(super) alias: Box<str>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum LogicalNodeKind {
-	Scan {
+pub(super) enum LogicalSelectSourceKind {
+	Atoms {
 		target: ScanTarget,
+		graph: Option<LogicalGraphReference>,
 	},
-	Filter {
-		input: NodeId,
-		predicate: TypedExpr,
+	Graphs {
+		references: Option<Vec<LogicalGraphReference>>,
 	},
-	Project {
-		input: NodeId,
-		expressions: Vec<TypedExpr>,
+	Derived(Box<LogicalSelect>),
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum LogicalGraphReference {
+	Static(GraphRef),
+	Expression(TypedExpr),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LogicalSelectJoin {
+	pub(super) kind: crate::syn::SelectJoinKind,
+	pub(super) source: LogicalSelectSource,
+	pub(super) predicate: Option<TypedExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum LogicalSelectItem {
+	Wildcard(Vec<LogicalWildcardField>),
+	Expression {
+		name: Box<str>,
+		expression: TypedExpr,
 	},
-	Limit {
-		input: NodeId,
-		limit: Option<TypedExpr>,
-		start: Option<TypedExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum LogicalWildcardField {
+	Column {
+		name: Box<str>,
+		index: usize,
+	},
+	Properties {
+		index: usize,
+	},
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LogicalOrder {
+	pub(super) expression: TypedExpr,
+	pub(super) direction: crate::syn::SelectOrderDirection,
+	pub(super) nulls: crate::syn::SelectNulls,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum LogicalSelectStart {
+	Offset(TypedExpr),
+	After {
+		cursor: TypedExpr,
+		read_committed: bool,
 	},
 }
 
@@ -526,11 +584,28 @@ impl Schema {
 	pub(super) fn index_of(&self, name: &str) -> Option<usize> {
 		self.columns.iter().position(|column| column.name.eq_ignore_ascii_case(name))
 	}
+
+	pub(super) fn matching_indices<'a>(
+		&'a self,
+		name: &'a str,
+	) -> impl Iterator<Item = usize> + 'a {
+		self.columns.iter().enumerate().filter_map(move |(index, column)| {
+			column.name.eq_ignore_ascii_case(name).then_some(index)
+		})
+	}
+
+	pub(super) fn qualified_index(&self, qualifier: &str, name: &str) -> Option<usize> {
+		self.columns.iter().position(|column| {
+			column.qualifier.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(qualifier))
+				&& column.name.eq_ignore_ascii_case(name)
+		})
+	}
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct Column {
 	pub(super) name: Box<str>,
+	pub(super) qualifier: Option<Box<str>>,
 	pub(super) ty: Type,
 }
 
@@ -595,14 +670,37 @@ pub(super) enum TypedExprKind {
 		function: Builtin,
 		arguments: Vec<TypedExpr>,
 	},
+	Aggregate {
+		function: Aggregate,
+		argument: Option<Box<TypedExpr>>,
+		distinct: bool,
+	},
+	Subquery {
+		select: Box<LogicalSelect>,
+		collection: bool,
+	},
 	Cast {
 		target: Type,
 		expr: Box<TypedExpr>,
 	},
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Aggregate {
+	Count,
+	Sum,
+	Average,
+	Minimum,
+	Maximum,
+	ArrayGroup,
+	VariancePopulation,
+	StandardDeviationPopulation,
+	VarianceSample,
+	StandardDeviationSample,
+}
+
 /// Statically resolved built-ins in the executable Stage 12 profile.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum Builtin {
 	MathAbs,
 	MathSqrt,

@@ -1,5 +1,4 @@
-use std::{marker::PhantomData, sync::Arc};
-
+use std::{collections::btree_set, sync::Arc};
 use super::Transaction;
 use crate::{
 	datastore::{
@@ -28,29 +27,29 @@ pub(crate) struct QueryStorageRow {
 	pub(crate) properties: PropertyMap,
 }
 
-enum QueryCursorSource {
-	Base(Vec<GlobalAtomId>),
+enum QueryCursorSource<'snapshot> {
+	Empty,
+	Base(btree_set::Iter<'snapshot, GlobalAtomId>),
 	Graph {
 		graph: GraphId,
-		ids: Vec<AtomId>,
+		ids: btree_set::Iter<'snapshot, AtomId>,
 	},
 }
 
 /// Snapshot-bound cursor over database-global atoms of one class.
 pub(crate) struct QueryStorageCursor<'snapshot> {
-	root: Arc<DatabaseRoot>,
+	root: &'snapshot DatabaseRoot,
 	class: Arc<ClassSchema>,
-	source: QueryCursorSource,
-	next: usize,
-	_marker: PhantomData<&'snapshot ()>,
+	source: QueryCursorSource<'snapshot>,
 }
 
 impl QueryStorageCursor<'_> {
 	/// Pulls one owned row without materializing the remaining class.
 	pub(crate) fn next_row(&mut self) -> FerrosGrynnResult<Option<QueryStorageRow>> {
-		let row = match &self.source {
+		let row = match &mut self.source {
+			QueryCursorSource::Empty => return Ok(None),
 			QueryCursorSource::Base(ids) => {
-				let Some(id) = ids.get(self.next).copied() else {
+				let Some(id) = ids.next().copied() else {
 					return Ok(None);
 				};
 				let atom = self.root.atom(id).ok_or_else(|| {
@@ -64,7 +63,7 @@ impl QueryStorageCursor<'_> {
 				graph,
 				ids,
 			} => {
-				let Some(local) = ids.get(self.next).copied() else {
+				let Some(local) = ids.next().copied() else {
 					return Ok(None);
 				};
 				let graph = self.root.graph(*graph).ok_or_else(|| {
@@ -80,7 +79,6 @@ impl QueryStorageCursor<'_> {
 				row_from_occurrence(&self.root, occurrence, &self.class)?
 			}
 		};
-		self.next += 1;
 		Ok(Some(row))
 	}
 }
@@ -116,6 +114,10 @@ impl QuerySnapshot {
 }
 
 impl Transaction {
+	pub(crate) fn query_scratch_root(&self) -> std::path::PathBuf {
+		self.store.inner.query_scratch_root()
+	}
+
 	pub(crate) fn query_property_dictionary(&self) -> Arc<PropertyDictionary> {
 		self.working.dictionary.clone()
 	}
@@ -155,6 +157,7 @@ impl Transaction {
 		snapshot: &QuerySnapshot,
 	) -> FerrosGrynnResult<Vec<GraphSchema>> {
 		self.ensure_live()?;
+		self.record_read(crate::datastore::ConflictKey::GraphCatalogRange);
 		Ok(snapshot.root.schema.graphs().map(|graph| graph.as_ref().clone()).collect())
 	}
 
@@ -183,20 +186,31 @@ impl Transaction {
 				reference.id(),
 				class_id,
 			));
-			QueryCursorSource::Graph {
-				graph: reference.id(),
-				ids: snapshot.root.indexes.graph_class(reference.id(), class_id),
-			}
+			snapshot
+				.root
+				.indexes
+				.graphs
+				.get(&reference.id())
+				.and_then(|indexes| indexes.classes.get(&class_id))
+				.map(|ids| QueryCursorSource::Graph {
+					graph: reference.id(),
+					ids: ids.iter(),
+				})
+				.unwrap_or(QueryCursorSource::Empty)
 		} else {
 			self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id));
-			QueryCursorSource::Base(snapshot.root.indexes.base_class(class_id))
+			snapshot
+				.root
+				.indexes
+				.classes
+				.get(&class_id)
+				.map(|ids| QueryCursorSource::Base(ids.iter()))
+				.unwrap_or(QueryCursorSource::Empty)
 		};
 		Ok(QueryStorageCursor {
-			root: snapshot.root.clone(),
+			root: &snapshot.root,
 			class,
 			source,
-			next: 0,
-			_marker: PhantomData,
 		})
 	}
 

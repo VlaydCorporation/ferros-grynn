@@ -1096,6 +1096,7 @@ mod tests {
 			reference,
 			SystemIndex::new(IndexId::new(first_index).unwrap(), SystemIndexKind::Label),
 			SystemIndex::new(IndexId::new(first_index + 1).unwrap(), SystemIndexKind::Adjacency),
+			crate::values::PropertyMap::new(),
 			0,
 		);
 		root.install_graph(schema, 0).unwrap();

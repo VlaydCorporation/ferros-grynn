@@ -1,4 +1,4 @@
-//! Cross-entry validation for one decoded `FGDC v7` payload.
+//! Cross-entry validation for one decoded `FGDC v8` payload.
 
 use std::collections::BTreeSet;
 
@@ -118,6 +118,15 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		insert_schema(&mut schema_ids, graph.label_index.0.into(), catalog.next_schema_id)?;
 		insert_schema(&mut schema_ids, graph.adjacency_index.0.into(), catalog.next_schema_id)?;
 		validate_binding(graph.membership)?;
+		let mut previous_property = None;
+		for property in &graph.properties {
+			if previous_property.is_some_and(|previous| previous >= property.key)
+				|| property.value.is_empty()
+			{
+				return Err(invalid("graph properties are not canonical"));
+			}
+			previous_property = Some(property.key);
+		}
 		if graph.arena.graph_by_slot.keys().ne(graph.arena.scope_by_slot.keys())
 			|| graph.arena.graph_by_slot.get(&0) != Some(&graph.id)
 			|| graph.arena.scope_by_slot.get(&0).is_none_or(|scope| !scope.is_empty())

@@ -6,7 +6,7 @@ use rapidhash::RapidHashSet;
 
 use super::{
 	GraphBinding,
-	catalog::{decode_parameters, decode_schema},
+	catalog::{decode_catalog_values, decode_schema},
 	layout::{DATABASE_CATALOG_ROOT, FILE_CATALOG_ROOT, GenerationBindings, invalid},
 	statistics::validate_statistics_roots,
 };
@@ -123,7 +123,7 @@ pub(super) fn open_local_state(
 		bindings.atoms,
 		&schema,
 	)?;
-	decode_parameters(&database_catalog, &dictionary, &mut schema)?;
+	decode_catalog_values(&database_catalog, &dictionary, &mut schema)?;
 
 	let mut database = DatabaseRoot::default();
 	database.commit_ts = snapshot.commit_ts().get();
@@ -244,6 +244,7 @@ fn bindings(
 		.map(|graph| {
 			Ok(GraphBinding {
 				graph_id: graph.id,
+				generation: graph.generation,
 				files: GraphFileSet::from_catalog(
 					files,
 					graph.id,
@@ -276,9 +277,9 @@ fn validate_opened_root(
 	snapshot: StorageSnapshot,
 ) -> FerrosGrynnResult<()> {
 	if root.commit_ts != snapshot.commit_ts().get()
-		|| database.atom_store.generation != root.commit_ts
+		|| database.atom_store.generation > root.commit_ts
 		|| usize::try_from(database.graphs.len()).ok() != Some(root.graphs.len())
-		|| database.graphs.iter().any(|graph| graph.generation != root.commit_ts)
+		|| database.graphs.iter().any(|graph| graph.generation > root.commit_ts)
 		|| files.next_file_instance_id < database.atom_store.primary.file_id.instance_id()
 	{
 		return Err(invalid("catalogs, WAL clocks, and normalized root disagree"));

@@ -1,14 +1,18 @@
 use std::{
+	num::NonZeroUsize,
+	path::PathBuf,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
 	time::{Duration, Instant},
 };
 
+pub(crate) const DEFAULT_BARRIER_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+
 use parking_lot::Mutex;
 
-use super::ParserSettings;
+use super::{ParserSettings, QueryCursor, cursor::CursorRuntime};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult, Outcome, Status, StatusReport},
 	syn::TimeoutValue,
@@ -47,6 +51,11 @@ pub struct QueryExecutionOptions {
 	pub max_loop_iterations: u64,
 	/// Optional cooperative cancellation token.
 	pub cancellation: Option<QueryCancellation>,
+	/// Shared memory budget for SELECT barriers. Values above the engine
+	/// default are rejected; callers may only tighten the limit.
+	pub barrier_memory_bytes: NonZeroUsize,
+	/// Optional root for transient query-run directories.
+	pub temporary_directory: Option<PathBuf>,
 }
 
 impl Default for QueryExecutionOptions {
@@ -57,7 +66,21 @@ impl Default for QueryExecutionOptions {
 			max_control_depth: 20,
 			max_loop_iterations: 1_000_000,
 			cancellation: None,
+			barrier_memory_bytes: NonZeroUsize::new(DEFAULT_BARRIER_MEMORY_BYTES)
+				.unwrap_or(NonZeroUsize::MIN),
+			temporary_directory: None,
 		}
+	}
+}
+
+impl QueryExecutionOptions {
+	pub(crate) fn validate(&self) -> FerrosGrynnResult<()> {
+		if self.barrier_memory_bytes.get() > DEFAULT_BARRIER_MEMORY_BYTES {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"barrier_memory_bytes may not exceed {DEFAULT_BARRIER_MEMORY_BYTES}."
+			)));
+		}
+		Ok(())
 	}
 }
 
@@ -70,10 +93,93 @@ pub(crate) struct ExecutionControl {
 	notifications: Arc<Mutex<Vec<Status>>>,
 	pub(crate) max_control_depth: u32,
 	pub(crate) max_loop_iterations: u64,
+	barrier_memory: Arc<BarrierMemory>,
+	pub(crate) temporary_directory: Option<PathBuf>,
+	cursors: Option<Arc<Mutex<CursorRuntime>>>,
+	continuation: Arc<Mutex<Option<QueryCursor>>>,
+}
+
+#[derive(Debug)]
+struct BarrierMemory {
+	limit: usize,
+	used: AtomicUsize,
+}
+
+/// Bytes retained by one in-memory SELECT barrier.
+#[derive(Debug)]
+pub(crate) struct BarrierAccount {
+	memory: Arc<BarrierMemory>,
+	bytes: usize,
+}
+
+impl BarrierAccount {
+	pub(crate) fn new(limit: usize) -> Self {
+		Self {
+			memory: Arc::new(BarrierMemory {
+				limit,
+				used: AtomicUsize::new(0),
+			}),
+			bytes: 0,
+		}
+	}
+
+	pub(crate) fn reserve(&mut self, bytes: usize) -> bool {
+		if bytes == 0 {
+			return true;
+		}
+		let mut used = self.memory.used.load(Ordering::Acquire);
+		loop {
+			let Some(next) = used.checked_add(bytes).filter(|next| *next <= self.memory.limit)
+			else {
+				return false;
+			};
+			match self.memory.used.compare_exchange_weak(
+				used,
+				next,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => {
+					self.bytes += bytes;
+					return true;
+				}
+				Err(current) => used = current,
+			}
+		}
+	}
+
+	pub(crate) fn release_all(&mut self) {
+		if self.bytes != 0 {
+			self.memory.used.fetch_sub(self.bytes, Ordering::AcqRel);
+			self.bytes = 0;
+		}
+	}
+
+	pub(crate) fn release(&mut self, bytes: usize) {
+		let bytes = bytes.min(self.bytes);
+		if bytes != 0 {
+			self.memory.used.fetch_sub(bytes, Ordering::AcqRel);
+			self.bytes -= bytes;
+		}
+	}
+}
+
+impl Drop for BarrierAccount {
+	fn drop(&mut self) {
+		self.release_all();
+	}
 }
 
 impl ExecutionControl {
 	pub(crate) fn new(options: &QueryExecutionOptions, timeout: Option<Duration>) -> Self {
+		Self::with_cursors(options, timeout, None)
+	}
+
+	pub(crate) fn with_cursors(
+		options: &QueryExecutionOptions,
+		timeout: Option<Duration>,
+		cursors: Option<Arc<Mutex<CursorRuntime>>>,
+	) -> Self {
 		let timeout = match (options.statement_timeout, timeout) {
 			(Some(left), Some(right)) => Some(left.min(right)),
 			(Some(value), None) | (None, Some(value)) => Some(value),
@@ -88,6 +194,13 @@ impl ExecutionControl {
 			notifications: Arc::new(Mutex::new(Vec::new())),
 			max_control_depth: options.max_control_depth,
 			max_loop_iterations: options.max_loop_iterations,
+			barrier_memory: Arc::new(BarrierMemory {
+				limit: options.barrier_memory_bytes.get(),
+				used: AtomicUsize::new(0),
+			}),
+			temporary_directory: options.temporary_directory.clone(),
+			cursors,
+			continuation: Arc::new(Mutex::new(None)),
 		}
 	}
 
@@ -126,6 +239,41 @@ impl ExecutionControl {
 			notifications: self.notifications.clone(),
 			max_control_depth: self.max_control_depth,
 			max_loop_iterations: self.max_loop_iterations,
+			barrier_memory: self.barrier_memory.clone(),
+			temporary_directory: self.temporary_directory.clone(),
+			cursors: self.cursors.clone(),
+			continuation: self.continuation.clone(),
+		}
+	}
+
+	pub(crate) fn cursors(&self) -> Option<&Arc<Mutex<CursorRuntime>>> {
+		self.cursors.as_ref()
+	}
+
+	pub(crate) fn barrier_account(&self) -> BarrierAccount {
+		BarrierAccount {
+			memory: self.barrier_memory.clone(),
+			bytes: 0,
+		}
+	}
+
+	pub(crate) fn set_continuation(&self, cursor: QueryCursor) {
+		*self.continuation.lock() = Some(cursor);
+	}
+
+	pub(crate) fn take_continuation(&self) -> Option<QueryCursor> {
+		self.continuation.lock().take()
+	}
+
+	pub(crate) fn discard_cursor(&self, cursor: QueryCursor) {
+		if let Some(runtime) = &self.cursors {
+			drop(runtime.lock().close(cursor));
+		}
+	}
+
+	pub(crate) fn discard_continuation(&self) {
+		if let Some(cursor) = self.take_continuation() {
+			self.discard_cursor(cursor);
 		}
 	}
 
@@ -218,10 +366,32 @@ fn parse_fixed_duration(value: &str) -> FerrosGrynnResult<Duration> {
 
 #[cfg(test)]
 mod tests {
-	use super::parse_fixed_duration;
+	use std::num::NonZeroUsize;
+
+	use super::{ExecutionControl, QueryExecutionOptions, parse_fixed_duration};
 
 	#[test]
 	fn duration_at_rounded_u64_boundary_is_rejected_without_panicking() {
 		assert!(parse_fixed_duration("18446744073709551615s").is_err());
+	}
+
+	#[test]
+	fn child_controls_share_one_barrier_budget() {
+		let options = QueryExecutionOptions {
+			barrier_memory_bytes: NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN),
+			..QueryExecutionOptions::default()
+		};
+		let control = ExecutionControl::new(&options, None);
+		let child = control.child(None);
+		let mut outer = control.barrier_account();
+		let mut nested = child.barrier_account();
+
+		assert!(outer.reserve(48));
+		assert!(!nested.reserve(17));
+		assert!(nested.reserve(16));
+		drop(outer);
+
+		let mut replacement = control.barrier_account();
+		assert!(replacement.reserve(48));
 	}
 }

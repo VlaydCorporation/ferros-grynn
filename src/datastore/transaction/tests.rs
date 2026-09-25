@@ -208,6 +208,22 @@ fn serializable_graph_scan_detects_a_membership_phantom() {
 }
 
 #[test]
+fn serializable_graph_catalog_scan_detects_a_property_change() {
+	let (store, identity, _) = setup(0, 1);
+	let mut reader = store.begin();
+	reader.execute("SELECT name, properties FROM GRAPHS;", &Object::new()).unwrap();
+
+	let mut writer = store.begin();
+	let result =
+		writer.execute("UPDATE GRAPH g0 SET properties.owner = 'writer';", &Object::new()).unwrap();
+	assert!(result[0].result.is_ok());
+	writer.commit().unwrap();
+	reader.set_base_property(&identity, KEY, Value::from("reader")).unwrap();
+
+	assert_eq!(reader.commit().unwrap_err().status().code().to_string(), "FG-40001");
+}
+
+#[test]
 fn fanout_limit_fails_before_private_state_changes() {
 	let (store, identity, graphs) = setup(2, 0);
 	let root = (*store.inner.current_root()).clone();

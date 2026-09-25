@@ -341,7 +341,8 @@ types при необходимости расширяется общими ти
    спецификацию; текущее устройство кода само по себе не становится контрактом.
    Допуск без владельца, срока или измеримого trigger считается открытой проблемой.
 
-   **Статус (2026-09-24):** graph-first cutover A5–A16 и Atomic Import I0–I12
+   **Статус (2026-09-26):** graph-first cutover A5–A16, Atomic Import I0–I12
+   и реляционный SELECT S0–S12
    завершены; `Q-08`, `Q-17`–`Q-18` и `Q-23`–`Q-29` закрыты текущими
    RAM/local/recovery/resource/performance gates. `Q-01`–`Q-03`,
    `Q-15`–`Q-16`, `Q-21` и `Q-07` остаются закрытыми прежними этапами.
@@ -387,6 +388,7 @@ types при необходимости расширяется общими ти
    | `Q-32`  | Schema correctness + UX                 | ALTER GRAPH, migration/validation boundary, revision race и scope-symmetric index actions не были определены.                                                                                                                                                                                                                                                                                                                                                                  | S4 утвердил atomic one-revision ALTER, bounded prevalidation, constrained migration, ALTER GRAPH и ON CLASS/ON GRAPH symmetry. A11/core admin и отдельный migration gate реализуют контракт.                                                                                                                                                                                                                  | 🟡 contract approved; implementation deferred                                   |
    | `Q-33`  | Import functionality + UX               | `QUARANTINE`, `EVENTS=ON`, `CHANGEFEED=ON`, `FILL_FACTOR`, `SORT_MEM` и `PARALLELISM` распознаются синтаксисом import, но намеренно не исполняются в GA-profile этапа 10.                                                                                                                                                                                                                                                                                                      | Анализатор возвращает typed unsupported до создания staging и writer lease. `QUARANTINE`/durable rejected-set и measured `SORT_MEM`/`PARALLELISM` принадлежат этапу 20; `FILL_FACTOR` требует отдельного performance gate; `CHANGEFEED=ON` — этапу 27; `EVENTS=ON` — этапу 29.                                                                                                                                | 🟡 contract approved; implementation deferred                                   |
    | `Q-34`  | Query performance                       | Paired `--profile profiling` probe одно-statement `Datastore::execute("RETURN 1")` дал `1620,20 ns/op` для прежнего direct path и `1702,60 ns/op` для temporary-session driver: ratio `1,0509`, то есть на 0,09 процентного пункта выше gate `+5%`. Clone AST и лишняя result allocation уже удалены.                                                                                                                                                                          | По явному решению пользователя оставить текущую реализацию и оптимизировать позднее. На этапе 19 профилировать оставшиеся structural/session/control overhead, сохраняя transaction semantics; gate не считать пройденным до ratio `≤1,05` на повторяемом paired run.                                                                                                                                         | ⬜ открыто — допустимое отклонение принято 2026-09-25                           |
+   | `Q-35`  | Functionality + durability + UX         | `TransactionGraphView::properties()` возвращал пустую map, а `FGDC v7` не сохранял пользовательские graph properties. Поэтому graph-source SELECT и Mode 3 не могли вернуть catalog-owned metadata, а обновление свойств графа было невозможно.                                                                                                                                                                                                                                | Этап 13 S1 ввёл `FGDC v8`, canonical graph-property section, `DEFINE GRAPH ... CONTENT`, `UPDATE GRAPH SET/UNSET`, MVCC/FCW/SSI и RAM/local/reopen/recovery gates без изменения `GraphSuperblock` или physical graph generation. Evidence: `reports/gql_select_stage_13_report.md`.                                                                                                                           | ✅ закрыто — этап 13 S1, 2026-09-26                                             |
 
    Уточнение к `Q-16`/`Q-27` от 2026-09-23: последующее ASan/Miri/assembly-исследование
    подтвердило порчу до Direct I/O и эффективность инициализации окончательного frame in-place,
@@ -436,8 +438,9 @@ types при необходимости расширяется общими ти
 
    **Коррекция 8.1:** закрытый статус относится к историческому TABLE-контуру.
    `Q-08` переоткрыт. A5/A11 заменяют TABLE на CLASS, убирают data membership из
-   schema catalog и переносят durable catalog на FGDC v7; property keys принадлежат отдельному
-   append-only dictionary file.
+   schema catalog и первоначально переносят durable catalog на FGDC v7; этап 13 повышает его до
+   FGDC v8 для catalog-owned graph properties. Property keys принадлежат отдельному append-only
+   dictionary file.
 
 6. **StatisticsStore** — зависит от **5**.  
    Целевой контракт после 8.1: точные class/base, graph/label/effective counts,
@@ -608,7 +611,18 @@ types при необходимости расширяется общими ти
     - [x] E7: RAM/local/import/resource gate и отчёт.
 
 13. **Полный реляционный SELECT** — зависит от **6, 7, 12**.  
-    Реализовать joins/subqueries, aggregation, `GROUP`, `ORDER BY`, `START`, `LIMIT`, `FETCH`, `SPLIT`, `OMIT` и keyset cursors. Сюда же принадлежат query subexpressions, `math::stddev/variance` и `array::group`. Сохранить sync pull `RowCursor`; barrier-операторы используют ограниченную память и явный temporary spill.
+    ✅ **Завершён 2026-09-26.** Нормативный контракт и dependency-ordered шаги S0–S12
+    зафиксированы в [`gql_select_stage_13_plan.md`](gql_select_stage_13_plan.md), evidence и
+    измерения — в [`gql_select_stage_13_report.md`](reports/gql_select_stage_13_report.md). SELECT читает
+    классы атомов и именованные графы, сохраняет graph-first границу `MATCH`/`TRAVERSE`, а
+    joins/subqueries, shape-операторы, aggregates, order/pagination и cursors исполняются через
+    sync pull `RowCursor` с одним bounded barrier budget и автоматическим spill.
+
+    - [x] S0: нормативная синхронизация и baseline;
+    - [x] S1: durable graph properties и `FGDC v8`;
+    - [x] S2–S4: row/source model, syntax, typed analysis и IR;
+    - [x] S5–S9: shared spill, shape, joins/subqueries, aggregates, order/cursors;
+    - [x] S10–S12: correctness/resource/performance gates, отчёт и Graphify.
 
 14. **Rule/CBO optimizer и EXPLAIN** — зависит от **6, 7, 13**.  
     Ввести deterministic rule passes, scan/index/join alternatives, statistics-based costs и degradation penalties. Утвердить исполнимый `DETERMINISTIC` mode поверх канонического plan/order. При отсутствии или устаревании индекса всегда доступен корректный scan. `EXPLAIN` показывает logical/physical plan, estimates, selected indexes, fallbacks и resource warnings.

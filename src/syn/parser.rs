@@ -150,7 +150,9 @@ impl Parser<'_> {
 			StatementKind::AssertInvariants(self.assert_invariants_statement()?)
 		} else if self.consume_keyword(keywords::DEFINE).is_some() {
 			if self.consume_keyword(keywords::GRAPH).is_some() {
-				StatementKind::DefineGraph(self.define_graph_statement()?)
+				StatementKind::DefineGraph(
+					context.run(|context| self.define_graph_statement(context)).await?,
+				)
 			} else if self.consume_keyword(keywords::CLASS).is_some() {
 				StatementKind::DefineClass(self.define_class_statement()?)
 			} else if self.consume_keyword(keywords::FIELD).is_some() {
@@ -166,9 +168,15 @@ impl Parser<'_> {
 		} else if self.consume_keyword(keywords::ATTACH).is_some() {
 			StatementKind::Attach(context.run(|context| self.attach_statement(context)).await?)
 		} else if self.consume_keyword(keywords::UPDATE).is_some() {
-			StatementKind::Update(
-				context.run(|context| self.mutate_statement(context, false)).await?,
-			)
+			if self.consume_keyword(keywords::GRAPH).is_some() {
+				StatementKind::UpdateGraph(
+					context.run(|context| self.update_graph_statement(context)).await?,
+				)
+			} else {
+				StatementKind::Update(
+					context.run(|context| self.mutate_statement(context, false)).await?,
+				)
+			}
 		} else if self.consume_keyword(keywords::UPSERT).is_some() {
 			StatementKind::Upsert(
 				context.run(|context| self.mutate_statement(context, true)).await?,
@@ -205,6 +213,7 @@ impl Parser<'_> {
 				kind,
 				StatementKind::Create(_)
 					| StatementKind::Update(_)
+					| StatementKind::UpdateGraph(_)
 					| StatementKind::Upsert(_)
 					| StatementKind::Delete(_)
 					| StatementKind::Attach(_)
@@ -398,6 +407,14 @@ impl Parser<'_> {
 				}),
 				span: token.span,
 			}),
+			TokenKind::GraphRef(value) => Ok(Expr {
+				kind: ExprKind::Name(Identifier {
+					value,
+					quoted: false,
+					span: token.span,
+				}),
+				span: token.span,
+			}),
 			TokenKind::Word {
 				value,
 				quoted,
@@ -509,6 +526,14 @@ impl Parser<'_> {
 				})
 			}
 			TokenKind::Symbol(Symbol::LeftParen) => {
+				if self.consume_keyword(keywords::SELECT).is_some() {
+					let select = context.run(|context| self.select_statement(context)).await?;
+					let close = self.close(Symbol::RightParen, token.span, "`)`")?;
+					return Ok(Expr {
+						kind: ExprKind::Subquery(Box::new(select)),
+						span: cover(token.span, close.span),
+					});
+				}
 				let expr = context
 					.run(|context| self.expression(context, 0, depth + 1, object_depth))
 					.await?;
@@ -662,6 +687,7 @@ impl Parser<'_> {
 				None
 			};
 			if let Some(open) = self.consume_symbol(Symbol::LeftParen) {
+				let distinct = self.consume_keyword(keywords::DISTINCT).is_some();
 				let mut arguments = Vec::new();
 				if !self.at_symbol(Symbol::RightParen) {
 					loop {
@@ -681,6 +707,7 @@ impl Parser<'_> {
 					kind: ExprKind::Call {
 						callee: Box::new(base),
 						type_argument,
+						distinct,
 						arguments,
 					},
 				}));
@@ -784,6 +811,11 @@ impl Parser<'_> {
 			} => Ok(Identifier {
 				value,
 				quoted,
+				span: token.span,
+			}),
+			TokenKind::GraphRef(value) => Ok(Identifier {
+				value,
+				quoted: false,
 				span: token.span,
 			}),
 			_ => Err(self.syntax("Expected an identifier.", token.span)),
@@ -976,7 +1008,10 @@ mod tests {
 		let StatementKind::Select(statement) = &program.statements[1].kind else {
 			panic!("expected SELECT");
 		};
-		assert!(matches!(statement.target, crate::syn::SelectTarget::Record { .. }));
+		assert!(matches!(
+			statement.source.kind,
+			crate::syn::SelectSourceKind::Atoms(crate::syn::SelectTarget::Record { .. })
+		));
 	}
 
 	#[test]
@@ -1273,5 +1308,25 @@ mod tests {
 		)
 		.expect("effective scope");
 		assert!(matches!(effective.statements[0].kind, StatementKind::DefineIndex(_)));
+	}
+
+	#[test]
+	fn parses_graph_content_and_property_updates() {
+		let program = parse(
+			"DEFINE GRAPH sales TYPE DAG CONTENT {owner: 'analytics', region: 'eu'}; UPDATE GRAPH \
+			 sales SET properties.owner = 'risk', properties.address.city = 'Berlin' RETURN \
+			 AFTER; UPDATE GRAPH sales UNSET properties.region RETURN DIFF",
+			ParserSettings::default(),
+		)
+		.expect("stage-13 graph property syntax");
+		let StatementKind::DefineGraph(definition) = &program.statements[0].kind else {
+			panic!("expected DEFINE GRAPH");
+		};
+		assert!(definition.content.is_some());
+		assert!(matches!(program.statements[1].kind, StatementKind::UpdateGraph(_)));
+		assert!(matches!(program.statements[2].kind, StatementKind::UpdateGraph(_)));
+		assert!(
+			parse("UPDATE GRAPH sales SET owner = 'risk'", ParserSettings::default(),).is_err()
+		);
 	}
 }

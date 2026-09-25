@@ -260,7 +260,11 @@ impl GraphRead for TransactionGraphView<'_> {
 	}
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
-		Ok(Cow::Owned(PropertyMap::new()))
+		self.transaction.record_read(ConflictKey::GraphDefinition(self.reference.id()));
+		let schema = self.root.schema.graphs.get(&self.reference.id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("graph view has no schema definition")
+		})?;
+		Ok(Cow::Borrowed(schema.properties()))
 	}
 
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {

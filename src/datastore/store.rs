@@ -91,6 +91,11 @@ impl Datastore {
 	fn from_parts(options: DatastoreOptions, backend: StoreBackend, root: DatabaseRoot) -> Self {
 		let next_schema_id = root.schema.next_schema_id;
 		let next_graph_id = root.schema.next_graph_id;
+		let query_scratch_root = match &backend {
+			StoreBackend::InMemory => std::env::temp_dir()
+				.join(format!("ferros-grynn-query-{}", crate::values::Uuid::now_v7())),
+			StoreBackend::Local(local) => local.import_scratch_root().to_path_buf(),
+		};
 		Self {
 			inner: Arc::new(StoreInner {
 				options,
@@ -101,6 +106,7 @@ impl Datastore {
 				import_owner: AtomicU64::new(0),
 				current: RwLock::new(Arc::new(root)),
 				commit: Mutex::new(()),
+				query_scratch_root,
 			}),
 		}
 	}
@@ -177,7 +183,8 @@ impl Datastore {
 		variables: &Object,
 		options: crate::gql::QueryExecutionOptions,
 	) -> FerrosGrynnResult<Vec<crate::gql::QueryResult>> {
-		self.session().execute_internal(source, variables, &options, true)
+		super::GqlSession::new_transient(self.clone())
+			.execute_internal(source, variables, &options, true)
 	}
 
 	/// Returns the selected backend and resource limits.

@@ -24,14 +24,15 @@ use parking_lot::Mutex;
 
 use self::{
 	checkpoint::checkpoint,
-	cleanup::cleanup_orphan_generations,
+	cleanup::{cleanup_orphan_generations, cleanup_query_runs},
 	files::{
 		create_generation_files,
 		create_import_generation_files,
+		stage_database_catalog,
 		stage_generation,
 		stage_import_catalog,
 	},
-	image::{build_generation, build_import_generation},
+	image::{build_generation, build_import_generation, prime_value_context},
 	layout::{DATABASE_CATALOG_ROOT, FILE_CATALOG_ROOT, GenerationBindings, invalid},
 	open::{OpenedLocalState, open_local_state},
 };
@@ -46,8 +47,10 @@ use super::{
 	graph_store::GraphFileSet,
 	graph_superblock::GraphSuperblock,
 	hybrid_engine::HybridReadEngine,
+	image_io::{read_pages, stage_pages},
 	local::{DatabaseLock, write_database_superblock},
 	page_io::{PageIo, PageIoMode},
+	property_dictionary::{BuiltPropertyDictionary, extend_property_dictionary},
 	types::{CheckpointGeneration, CommitTs, Lsn, TxId},
 	wal::FrameWal,
 };
@@ -76,6 +79,7 @@ thread_local! {
 /// Physical bindings retained with one current catalog generation.
 pub(super) struct GraphBinding {
 	pub(super) graph_id: GraphId,
+	pub(super) generation: u64,
 	pub(super) files: GraphFileSet,
 	pub(super) membership: PhysicalIndexBinding,
 	pub(super) arena: GraphArenaBindings,
@@ -143,6 +147,7 @@ impl LocalStore {
 	) -> FerrosGrynnResult<(Self, DatabaseRoot)> {
 		let lock = DatabaseLock::acquire(root)?;
 		cleanup_external_index_sort(root)?;
+		cleanup_query_runs(root)?;
 		let io = PageIo::new(io_mode)?;
 		let engine = HybridReadEngine::new(pool_pages);
 		let database = DatabaseRoot::default();
@@ -208,6 +213,7 @@ impl LocalStore {
 	) -> FerrosGrynnResult<(Self, DatabaseRoot)> {
 		let lock = DatabaseLock::acquire(root)?;
 		cleanup_external_index_sort(root)?;
+		cleanup_query_runs(root)?;
 		let io = PageIo::new(io_mode)?;
 		let engine = HybridReadEngine::new(pool_pages);
 		let (wal, opened) = open_local_state(root, &engine, io.file_open_mode())?;
@@ -248,8 +254,103 @@ impl LocalStore {
 	}
 
 	/// Persists one already validated MVCC root before it becomes visible.
-	pub(crate) fn persist_root(&self, database: &DatabaseRoot) -> FerrosGrynnResult<()> {
-		self.persist_generation(database, false).map(drop)
+	pub(crate) fn persist_root(
+		&self,
+		database: &DatabaseRoot,
+		graph_catalog_only: bool,
+		dictionary_changed: bool,
+	) -> FerrosGrynnResult<()> {
+		if graph_catalog_only {
+			self.persist_graph_catalog(database, dictionary_changed)
+		} else {
+			self.persist_generation(database, false).map(drop)
+		}
+	}
+
+	fn persist_graph_catalog(
+		&self,
+		database: &DatabaseRoot,
+		dictionary_changed: bool,
+	) -> FerrosGrynnResult<()> {
+		let mut state = self.state.lock();
+		self.checkpoint_if_due(&mut state)?;
+		let expected = self
+			.wal
+			.snapshot()
+			.commit_ts()
+			.get()
+			.checked_add(1)
+			.ok_or_else(|| invalid("local commit clock is exhausted"))?;
+		if database.commit_ts != expected {
+			return Err(invalid("MVCC and frame-WAL commit clocks diverged"));
+		}
+
+		let mut context = super::atom_store_image::value_context(
+			&database.schema,
+			database.dictionary.as_ref().clone(),
+		)?;
+		prime_value_context(database, &mut context)?;
+		if context.property_dictionary().len() != database.dictionary.len() {
+			return Err(invalid(
+				"graph property value contains dictionary keys absent from the MVCC root",
+			));
+		}
+		let catalog = self::catalog::encode_database_catalog(
+			database,
+			state._database_catalog.atom_store,
+			&state.bindings.graphs,
+			&state.bindings.physical_indexes,
+			&mut context,
+		)?;
+		let mut next_atom_superblock = state.atom_superblock;
+		let mut dictionary_image = None;
+		if dictionary_changed {
+			let snapshot = self.wal.snapshot();
+			let pages = read_pages(
+				&self.wal,
+				&state.registry,
+				snapshot,
+				crate::datastore::DataSpaceId::Database,
+				state.bindings.atoms.property_dictionary,
+				state.atom_superblock.property_dictionary_pages,
+			)?;
+			let image = extend_property_dictionary(
+				BuiltPropertyDictionary {
+					pages,
+				},
+				database.dictionary.as_ref(),
+				super::page::PageLsn::ZERO,
+			)?;
+			next_atom_superblock.property_dictionary_pages = u64::try_from(image.pages.len())
+				.map_err(|_error| invalid("property dictionary page count exceeds u64"))?;
+			dictionary_image = Some(image);
+		}
+
+		let mut tx = self.wal.begin_tx()?;
+		if let Some(image) = &dictionary_image {
+			stage_pages(
+				&mut tx,
+				crate::datastore::DataSpaceId::Database,
+				state.bindings.atoms.property_dictionary,
+				&image.pages,
+			)?;
+			tx.stage_page(
+				super::types::PageKey::new(
+					crate::datastore::DataSpaceId::Database,
+					state.bindings.atoms.superblock,
+					super::page::PageNo::new(0),
+				),
+				&next_atom_superblock.encode()?,
+			)?;
+		}
+		stage_database_catalog(&mut tx, &catalog)?;
+		let outcome = self.wal.commit_tx(tx)?;
+		if outcome.commit_ts().get() != database.commit_ts {
+			return Err(invalid("WAL published an unexpected logical commit timestamp"));
+		}
+		state._database_catalog = catalog;
+		state.atom_superblock = next_atom_superblock;
+		Ok(())
 	}
 
 	/// Persists one import generation directly to unreachable home files and

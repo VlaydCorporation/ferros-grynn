@@ -1,10 +1,19 @@
 //! Persistent GrynnQL session and the shared statement transaction driver.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
+
+use parking_lot::Mutex;
 
 use super::{Datastore, Transaction, TransactionAccess, TransactionOptions};
 use crate::{
-	gql::{ExecutionControl, QueryExecutionOptions, QueryResult, TransactionCommand},
+	gql::{
+		ExecutionControl,
+		QueryCursor,
+		QueryExecutionOptions,
+		QueryResult,
+		TransactionCommand,
+		cursor::CursorRuntime,
+	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult, Outcome},
 	syn::{Program, Statement, StatementKind},
 	values::{Object, Value},
@@ -15,20 +24,49 @@ pub struct GqlSession {
 	store: Datastore,
 	bindings: Object,
 	transaction: Option<Transaction>,
+	cursors: Option<Arc<Mutex<CursorRuntime>>>,
 }
 
 impl GqlSession {
 	pub(crate) fn new(store: Datastore) -> Self {
+		let max_snapshot_age = match store.options() {
+			super::DatastoreOptions::InMemory(options) => options.max_snapshot_age,
+			super::DatastoreOptions::Local(options) => options.max_snapshot_age,
+		};
 		Self {
 			store,
 			bindings: Object::new(),
 			transaction: None,
+			cursors: Some(Arc::new(Mutex::new(CursorRuntime::new(max_snapshot_age)))),
+		}
+	}
+
+	pub(crate) fn new_transient(store: Datastore) -> Self {
+		Self {
+			store,
+			bindings: Object::new(),
+			transaction: None,
+			cursors: None,
 		}
 	}
 
 	/// Returns whether this session currently owns an explicit transaction.
 	pub const fn has_active_transaction(&self) -> bool {
 		self.transaction.is_some()
+	}
+
+	/// Releases the retained result spool associated with `cursor`.
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-cursor status when the token belongs to another
+	/// session or has already been closed.
+	pub fn close_cursor(&mut self, cursor: &QueryCursor) -> FerrosGrynnResult<()> {
+		self.cursors
+			.as_ref()
+			.ok_or_else(|| FerrosGrynnError::invalid_query_cursor("session cursors are disabled"))?
+			.lock()
+			.close(*cursor)
 	}
 
 	/// Parses and executes one call while preserving session and transaction
@@ -88,6 +126,7 @@ impl GqlSession {
 		options: &QueryExecutionOptions,
 		require_closed: bool,
 	) -> FerrosGrynnResult<Vec<QueryResult>> {
+		options.validate()?;
 		let program = match crate::gql::parse(source, options.parser_settings) {
 			Ok(program) => program,
 			Err(error) => {
@@ -111,7 +150,7 @@ impl GqlSession {
 		] = program.statements.as_slice()
 		{
 			let timeout = crate::gql::resolve_timeout(statement.timeout.as_ref(), &bindings)?;
-			let control = ExecutionControl::new(options, timeout);
+			let control = ExecutionControl::with_cursors(options, timeout, self.cursors.clone());
 			return crate::gql::import::execute_import(
 				&self.store,
 				source,
@@ -139,6 +178,7 @@ impl GqlSession {
 					kind: crate::gql::statement_kind(&statement.kind),
 					elapsed: started.elapsed(),
 					result: result.map(Outcome::success),
+					continuation: None,
 				});
 				if failed {
 					break;
@@ -158,7 +198,8 @@ impl GqlSession {
 						break;
 					}
 				};
-			let control = ExecutionControl::new(options, clause_timeout);
+			let control =
+				ExecutionControl::with_cursors(options, clause_timeout, self.cursors.clone());
 			let let_name = match &statement.kind {
 				StatementKind::Let(statement) if statement.name.value.as_ref() != "_" => {
 					Some(statement.name.value.as_ref())
@@ -482,5 +523,6 @@ fn error_result(statement: &Statement, started: Instant, error: FerrosGrynnError
 		kind: crate::gql::statement_kind(&statement.kind),
 		elapsed: started.elapsed(),
 		result: Err(error),
+		continuation: None,
 	}
 }
