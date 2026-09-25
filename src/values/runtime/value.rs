@@ -12,6 +12,7 @@ use super::{
 	Closure,
 	DateTime,
 	Duration,
+	ErrorValue,
 	Frozen,
 	Geometry,
 	Graph,
@@ -63,6 +64,7 @@ pub enum Value {
 	Path(Box<Path>),
 	Graph(Box<MaterializedGraph>),
 	Closure(Box<Closure>),
+	Error(Box<ErrorValue>),
 }
 
 impl Value {
@@ -94,6 +96,7 @@ impl Value {
 			Self::Graph(value) if value.kind() == GraphKind::Subgraph => ValueKind::Subgraph,
 			Self::Graph(_) => ValueKind::Graph,
 			Self::Closure(_) => ValueKind::Closure,
+			Self::Error(_) => ValueKind::Error,
 		}
 	}
 
@@ -138,6 +141,7 @@ impl Value {
 			Self::Closure(value) => size_of_val(value.as_ref())
 				.saturating_add(value.name().map_or(0, Text::len))
 				.saturating_add(value.parameters().len().saturating_mul(size_of::<Type>())),
+			Self::Error(value) => size_of_val(value.as_ref()),
 		}
 	}
 
@@ -177,6 +181,7 @@ impl Value {
 			| Self::Path(_)
 			| Self::Graph(_)
 			| Self::Closure(_) => true,
+			Self::Error(_) => true,
 		}
 	}
 
@@ -335,6 +340,13 @@ impl Value {
 		}
 	}
 
+	pub const fn as_error(&self) -> Option<&ErrorValue> {
+		match self {
+			Self::Error(value) => Some(value),
+			_ => None,
+		}
+	}
+
 	pub fn is_storable(&self) -> bool {
 		match self {
 			Self::Array(values) => values.iter().all(Self::is_storable),
@@ -355,7 +367,9 @@ impl Value {
 				};
 				start_storable && end_storable
 			}
-			Self::Regex(_) | Self::Path(_) | Self::Graph(_) | Self::Closure(_) => false,
+			Self::Regex(_) | Self::Path(_) | Self::Graph(_) | Self::Closure(_) | Self::Error(_) => {
+				false
+			}
 			_ => true,
 		}
 	}
@@ -491,6 +505,7 @@ impl Ord for Value {
 				(Self::Path(left), Self::Path(right)) => left.cmp(right),
 				(Self::Graph(left), Self::Graph(right)) => left.cmp(right),
 				(Self::Closure(left), Self::Closure(right)) => left.cmp(right),
+				(Self::Error(left), Self::Error(right)) => left.cmp(right),
 				_ => Ordering::Equal,
 			}
 		})
@@ -523,6 +538,7 @@ impl Hash for Value {
 			Self::Path(value) => value.hash(state),
 			Self::Graph(value) => value.hash(state),
 			Self::Closure(value) => value.hash(state),
+			Self::Error(value) => value.hash(state),
 		}
 	}
 }

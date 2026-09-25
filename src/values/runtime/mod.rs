@@ -2,6 +2,7 @@ mod array;
 mod bytes;
 mod closure;
 mod conversions;
+mod error_value;
 mod formatting;
 mod geometry;
 mod id;
@@ -26,6 +27,7 @@ mod laws;
 pub use array::Array;
 pub use bytes::Bytes;
 pub use closure::{Closure, RuntimeId};
+pub use error_value::ErrorValue;
 pub use geometry::{Geometry, Position};
 pub use graph::{
 	AtomKind,

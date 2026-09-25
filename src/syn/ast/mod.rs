@@ -36,7 +36,13 @@ pub enum ExprKind {
 	Parameter(Identifier),
 	Name(Identifier),
 	Array(Vec<Expr>),
+	Set(Vec<Expr>),
 	Object(Vec<ObjectField>),
+	Range {
+		start: Option<Box<Expr>>,
+		end: Option<Box<Expr>>,
+		inclusive_end: bool,
+	},
 	Unary {
 		op: UnaryOperator,
 		expr: Box<Expr>,
@@ -51,17 +57,31 @@ pub enum ExprKind {
 		then_value: Box<Expr>,
 		else_value: Box<Expr>,
 	},
+	Case {
+		operand: Option<Box<Expr>>,
+		branches: Vec<(Expr, Expr)>,
+		else_value: Option<Box<Expr>>,
+	},
 	Field {
 		base: Box<Expr>,
 		field: Identifier,
 		null_safe: bool,
 	},
+	Destructure {
+		base: Box<Expr>,
+		fields: Vec<Identifier>,
+	},
 	Index {
 		base: Box<Expr>,
 		index: Box<Expr>,
 	},
+	Filter {
+		base: Box<Expr>,
+		predicate: Box<Expr>,
+	},
 	Call {
 		callee: Box<Expr>,
+		type_argument: Option<TypeName>,
 		arguments: Vec<Expr>,
 	},
 	Cast {
@@ -92,7 +112,7 @@ pub enum Literal {
 #[non_exhaustive]
 pub enum UnaryOperator {
 	Not,
-	Assert,
+	Truthy,
 	Negate,
 	Positive,
 }
@@ -116,6 +136,15 @@ pub enum BinaryOperator {
 	NotIs,
 	In,
 	NotIn,
+	AllIn,
+	AnyIn,
+	NoneIn,
+	AnyEqual,
+	AllEqual,
+	Contains,
+	ContainsNot,
+	ContainsAny,
+	ContainsAll,
 	And,
 	Or,
 	Coalesce,

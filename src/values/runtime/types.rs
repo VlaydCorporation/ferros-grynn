@@ -38,6 +38,7 @@ pub enum Type {
 		parameters: Vec<Type>,
 		result: Box<Type>,
 	},
+	Error,
 }
 
 impl Type {
@@ -68,6 +69,7 @@ impl Type {
 			Value::Path(_) => Self::Path,
 			Value::Graph(value) => Self::Graph(value.kind()),
 			Value::Closure(value) => value.signature(),
+			Value::Error(_) => Self::Error,
 		}
 	}
 }
@@ -134,6 +136,7 @@ impl Display for Type {
 				}
 				write!(f, ") -> {result}>")
 			}
+			Self::Error => f.write_str("error"),
 		}
 	}
 }

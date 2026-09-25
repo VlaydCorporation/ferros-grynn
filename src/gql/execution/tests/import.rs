@@ -1,5 +1,6 @@
 use crate::{
 	datastore::{ClassSchema, Datastore, ImportOptions, ImportViolationPolicy},
+	gql::{QueryCancellation, QueryExecutionOptions},
 	graph::{AtomKind, GraphKind},
 	values::{Object, PropertyMap, RecordId, Value},
 };
@@ -178,8 +179,12 @@ fn import_preflight_rejects_results_scope_mismatch_and_unsupported_options() {
 		.execute("BEGIN IMPORT; CREATE person:alice; END IMPORT;", &Object::new())
 		.unwrap_err();
 	assert_eq!(error.status().code().to_string(), "FG-50F03");
-	transaction.create_atom("person:after".parse().unwrap(), PropertyMap::new()).unwrap();
-	transaction.commit().unwrap();
+	assert!(
+		transaction.create_atom("person:blocked".parse().unwrap(), PropertyMap::new()).is_err()
+	);
+	let mut replacement = store.begin();
+	replacement.create_atom("person:after".parse().unwrap(), PropertyMap::new()).unwrap();
+	replacement.commit().unwrap();
 }
 
 #[test]
@@ -229,4 +234,90 @@ fn deferred_graph_family_failure_discards_the_complete_import() {
 		.unwrap();
 	assert!(results[0].result.is_err());
 	assert!(store.begin().atom(&"person:alice".parse::<RecordId>().unwrap()).unwrap().is_none());
+}
+
+#[test]
+fn import_for_uses_one_item_per_iteration() {
+	let store = import_store();
+	let results = store
+		.execute(
+			"BEGIN IMPORT WITH (ON VIOLATION = SKIP, REJECT LIMIT = 1, SEGMENT SIZE = 2); FOR $id \
+			 IN ['alice', 'alice', 'bob'] { CREATE person:$id; }; END IMPORT;",
+			&Object::new(),
+		)
+		.unwrap();
+	let Value::Object(report) = results[0].result.as_ref().unwrap().value() else {
+		panic!("import must return a structured report");
+	};
+	assert_eq!(report.get("processed"), Some(&Value::from(3_u64)));
+	assert_eq!(report.get("applied"), Some(&Value::from(2_u64)));
+	assert_eq!(report.get("skipped"), Some(&Value::from(1_u64)));
+	assert_eq!(report.get("segments"), Some(&Value::from(1_u64)));
+}
+
+#[test]
+fn import_try_precedes_violation_policy_and_restores_the_item() {
+	let store = import_store();
+	let results = store
+		.execute(
+			"BEGIN IMPORT WITH (ON VIOLATION = SKIP, REJECT LIMIT = 1); TRY { CREATE \
+			 person:temporary; CREATE person:temporary; } CATCH |$error| { CREATE \
+			 person:recovered; }; IF true { CREATE person:after; }; END IMPORT;",
+			&Object::new(),
+		)
+		.unwrap();
+	let Value::Object(report) = results[0].result.as_ref().unwrap().value() else {
+		panic!("import must return a structured report");
+	};
+	assert_eq!(report.get("processed"), Some(&Value::from(2_u64)));
+	assert_eq!(report.get("applied"), Some(&Value::from(2_u64)));
+	assert_eq!(report.get("skipped"), Some(&Value::from(0_u64)));
+	let mut read = store.begin();
+	assert!(read.atom(&"person:temporary".parse().unwrap()).unwrap().is_none());
+	assert!(read.atom(&"person:recovered".parse().unwrap()).unwrap().is_some());
+	assert!(read.atom(&"person:after".parse().unwrap()).unwrap().is_some());
+}
+
+#[test]
+fn import_unhandled_throw_and_cancellation_abort_every_item() {
+	let thrown = import_store();
+	let results = thrown
+		.execute(
+			"BEGIN IMPORT WITH (ON VIOLATION = SKIP, REJECT LIMIT = 1); CREATE person:alice; \
+			 THROW 'stop'; END IMPORT;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(results[0].result.is_err());
+	assert!(thrown.begin().atom(&"person:alice".parse().unwrap()).unwrap().is_none());
+
+	let cancelled = import_store();
+	let cancellation = QueryCancellation::default();
+	cancellation.cancel();
+	let options = QueryExecutionOptions {
+		cancellation: Some(cancellation),
+		..QueryExecutionOptions::default()
+	};
+	let error = cancelled
+		.execute_with_options(
+			"BEGIN IMPORT; CREATE person:alice; END IMPORT;",
+			&Object::new(),
+			options,
+		)
+		.unwrap_err();
+	assert_eq!(error.status().code().to_string(), "FG-50F05");
+	assert!(cancelled.begin().atom(&"person:alice".parse().unwrap()).unwrap().is_none());
+}
+
+#[test]
+fn import_recursive_preflight_rejects_deferred_control_surface() {
+	let store = import_store();
+	for source in [
+		"BEGIN IMPORT; IF true { LET $x = 1; }; END IMPORT;",
+		"BEGIN IMPORT; TRY { WHILE (false) { BREAK; }; }; END IMPORT;",
+		"BEGIN IMPORT; FOR $x IN [1] { ASSERT INVARIANTS; }; END IMPORT;",
+	] {
+		assert!(store.execute(source, &Object::new()).is_err(), "source: {source}");
+	}
+	assert_eq!(store.inner.current_root().commit_ts, 1);
 }

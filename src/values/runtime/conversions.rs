@@ -5,6 +5,7 @@ use super::{
 	Closure,
 	DateTime,
 	Duration,
+	ErrorValue,
 	Frozen,
 	Geometry,
 	Graph,
@@ -132,6 +133,12 @@ impl From<Closure> for Value {
 impl From<RecordId> for Value {
 	fn from(value: RecordId) -> Self {
 		Self::Record(Box::new(value))
+	}
+}
+
+impl From<ErrorValue> for Value {
+	fn from(value: ErrorValue) -> Self {
+		Self::Error(Box::new(value))
 	}
 }
 

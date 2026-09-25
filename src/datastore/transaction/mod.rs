@@ -19,6 +19,7 @@ use super::{
 	ImportIndexMode,
 	ImportViolationPolicy,
 	IndexId,
+	InvariantViolationReport,
 	IsolationLevel,
 	OccurrenceState,
 	SchemaVersion,
@@ -34,7 +35,7 @@ use super::{
 	},
 };
 use crate::{
-	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	gql_status::{FerrosGrynnError, FerrosGrynnResult, formatting::DiagnosticValue},
 	graph::{AtomId, AtomKind, EdgeTopology, GraphId, GraphKind, GraphRef, SnapshotId},
 	values::{Number, PropertyKeyId, PropertyMap, RecordId, Text, Value},
 };
@@ -207,6 +208,23 @@ pub struct Transaction {
 	import_graph_scope: Option<GraphId>,
 	rollback_mutation_errors: bool,
 	atomic_mutation_depth: usize,
+	gql_statement_depth: usize,
+	gql_aborted: bool,
+	gql_bindings: crate::values::Object,
+}
+
+pub(crate) struct TransactionSavepoint {
+	working: DatabaseRoot,
+	reads: RapidHashMap<ConflictKey, u64>,
+	missing_records: BTreeSet<RecordId>,
+	last_base_read: Option<GlobalAtomId>,
+	range_writes: BTreeSet<ConflictKey>,
+	writes: BTreeMap<ConflictKey, u64>,
+	requirements: BTreeMap<ConflictKey, u64>,
+	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
+	write_bytes: usize,
+	mutation_len: usize,
+	gql_bindings: crate::values::Object,
 }
 
 impl Transaction {
@@ -236,6 +254,9 @@ impl Transaction {
 			import_graph_scope: None,
 			rollback_mutation_errors: true,
 			atomic_mutation_depth: 0,
+			gql_statement_depth: 0,
+			gql_aborted: false,
+			gql_bindings: crate::values::Object::new(),
 		}
 	}
 
@@ -308,6 +329,101 @@ impl Transaction {
 		crate::gql::execute_transaction(self, source, variables, settings)
 	}
 
+	/// Executes GrynQL with explicit parser and bounded-runtime controls.
+	///
+	/// # Errors
+	///
+	/// Returns parse or structural failures. An uncaught GrynQL failure aborts
+	/// this transaction; statement failures are retained in `QueryResult`.
+	pub fn execute_with_options(
+		&mut self,
+		source: &str,
+		variables: &crate::values::Object,
+		options: crate::gql::QueryExecutionOptions,
+	) -> FerrosGrynnResult<Vec<crate::gql::QueryResult>> {
+		crate::gql::execute_transaction_with_options(self, source, variables, options)
+	}
+
+	pub(crate) fn run_gql_statement<T>(
+		&mut self,
+		execute: impl FnOnce(&mut Self) -> FerrosGrynnResult<T>,
+	) -> FerrosGrynnResult<T> {
+		self.ensure_live()?;
+		if self.gql_statement_depth != 0 {
+			return execute(self);
+		}
+		self.refresh_read_committed()?;
+		self.gql_statement_depth = 1;
+		let result = execute(self);
+		self.gql_statement_depth = 0;
+		result
+	}
+
+	pub(crate) fn abort_gql(&mut self) {
+		self.gql_aborted = true;
+	}
+
+	pub(crate) const fn gql_bindings(&self) -> &crate::values::Object {
+		&self.gql_bindings
+	}
+
+	pub(crate) fn replace_gql_bindings(&mut self, bindings: crate::values::Object) {
+		self.gql_bindings = bindings;
+	}
+
+	pub(crate) fn gql_savepoint(&self) -> TransactionSavepoint {
+		TransactionSavepoint {
+			working: self.working.clone(),
+			reads: self.reads.lock().clone(),
+			missing_records: self.missing_records.lock().clone(),
+			last_base_read: self.last_base_read,
+			range_writes: self.range_writes.clone(),
+			writes: self.writes.clone(),
+			requirements: self.requirements.clone(),
+			fanout_reservations: self.fanout_reservations.clone(),
+			write_bytes: self.write_bytes,
+			mutation_len: self.mutations.len(),
+			gql_bindings: self.gql_bindings.clone(),
+		}
+	}
+
+	pub(crate) fn restore_gql_savepoint(&mut self, savepoint: TransactionSavepoint) {
+		self.working = savepoint.working;
+		*self.reads.lock() = savepoint.reads;
+		*self.missing_records.lock() = savepoint.missing_records;
+		self.last_base_read = savepoint.last_base_read;
+		self.range_writes = savepoint.range_writes;
+		self.writes = savepoint.writes;
+		self.requirements = savepoint.requirements;
+		self.fanout_reservations = savepoint.fanout_reservations;
+		self.write_bytes = savepoint.write_bytes;
+		self.mutations.truncate(savepoint.mutation_len);
+		self.gql_bindings = savepoint.gql_bindings;
+	}
+
+	pub(crate) fn assert_invariants(
+		&mut self,
+		graph: Option<&GraphRef>,
+		detail_limit: usize,
+	) -> FerrosGrynnResult<usize> {
+		let graphs = if let Some(graph) = graph {
+			vec![graph.clone()]
+		} else {
+			self.working.schema.graphs().map(|graph| graph.reference().clone()).collect()
+		};
+		let mut report =
+			self.working.collect_invariant_violations(graph.map(GraphRef::id), detail_limit);
+		for graph in &graphs {
+			if let Err(error) = self.validate_graph_family(graph) {
+				report.push("graph_family", error);
+			}
+		}
+		if !report.is_empty() {
+			return Err(invariant_assertion_error(&report));
+		}
+		Ok(graphs.len())
+	}
+
 	/// Executes one statement-sized mutation with rollback to the transaction's
 	/// prior private state when validation or execution fails.
 	pub(crate) fn atomic_mutation<T>(
@@ -324,29 +440,13 @@ impl Transaction {
 			self.atomic_mutation_depth = 0;
 			return result;
 		}
-		let working = self.working.clone();
-		let reads = self.reads.lock().clone();
-		let missing_records = self.missing_records.lock().clone();
-		let range_writes = self.range_writes.clone();
-		let writes = self.writes.clone();
-		let requirements = self.requirements.clone();
-		let fanout_reservations = self.fanout_reservations.clone();
-		let write_bytes = self.write_bytes;
-		let mutation_len = self.mutations.len();
+		let savepoint = self.gql_savepoint();
 		let result = mutate(self);
 		self.atomic_mutation_depth = 0;
 		match result {
 			Ok(value) => Ok(value),
 			Err(error) => {
-				self.working = working;
-				*self.reads.lock() = reads;
-				*self.missing_records.lock() = missing_records;
-				self.range_writes = range_writes;
-				self.writes = writes;
-				self.requirements = requirements;
-				self.fanout_reservations = fanout_reservations;
-				self.write_bytes = write_bytes;
-				self.mutations.truncate(mutation_len);
+				self.restore_gql_savepoint(savepoint);
 				Err(error)
 			}
 		}
@@ -702,7 +802,10 @@ impl Transaction {
 
 	fn prepare_read(&mut self) -> FerrosGrynnResult<()> {
 		self.ensure_live()?;
-		self.refresh_read_committed()
+		if self.gql_statement_depth == 0 {
+			self.refresh_read_committed()?;
+		}
+		Ok(())
 	}
 
 	fn prepare_mutation(&mut self) -> FerrosGrynnResult<()> {
@@ -711,7 +814,10 @@ impl Transaction {
 		if self.options.access == TransactionAccess::ReadOnly {
 			return Err(FerrosGrynnError::read_only_transaction(self.id));
 		}
-		self.refresh_read_committed()
+		if self.gql_statement_depth == 0 {
+			self.refresh_read_committed()?;
+		}
+		Ok(())
 	}
 
 	fn prepare_schema_mutation(&mut self) -> FerrosGrynnResult<()> {
@@ -724,6 +830,9 @@ impl Transaction {
 	}
 
 	fn ensure_live(&self) -> FerrosGrynnResult<()> {
+		if self.gql_aborted {
+			return Err(FerrosGrynnError::transaction_aborted(self.id));
+		}
 		if self.store.inner.import_owner.load(std::sync::atomic::Ordering::Acquire) == self.id {
 			return Ok(());
 		}
@@ -844,4 +953,39 @@ impl Transaction {
 			u64::try_from(limit).unwrap_or(u64::MAX),
 		)
 	}
+}
+
+fn invariant_assertion_error(report: &InvariantViolationReport) -> FerrosGrynnError {
+	let totals = report
+		.totals()
+		.iter()
+		.map(|(category, total)| {
+			(
+				(*category).to_owned(),
+				DiagnosticValue::Unsigned(u64::try_from(*total).unwrap_or(u64::MAX)),
+			)
+		})
+		.collect();
+	let details = report
+		.details()
+		.iter()
+		.map(|(category, message)| {
+			DiagnosticValue::Map(BTreeMap::from([
+				("category".to_owned(), DiagnosticValue::String((*category).to_owned())),
+				("message".to_owned(), DiagnosticValue::String(message.clone())),
+			]))
+		})
+		.collect();
+	let mut error =
+		FerrosGrynnError::invariant_assertion_failed(format!("{} violation(s)", report.total()))
+			.with_extension(
+				"violation_total",
+				DiagnosticValue::Unsigned(u64::try_from(report.total()).unwrap_or(u64::MAX)),
+			)
+			.with_extension("violation_totals", DiagnosticValue::Map(totals))
+			.with_extension("violation_details", DiagnosticValue::List(details));
+	if let Some(cause) = report.first_error() {
+		error = error.with_cause(cause.clone());
+	}
+	error
 }

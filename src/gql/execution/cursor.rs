@@ -42,7 +42,7 @@ impl Row {
 }
 
 pub(super) trait RowCursor {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>>;
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>>;
 }
 
 pub(super) trait QueryRead {
@@ -50,6 +50,7 @@ pub(super) trait QueryRead {
 	type Graph<'a>: GraphRead + 'a
 	where
 		Self: 'a;
+	type Savepoint;
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot>;
 
@@ -100,6 +101,16 @@ pub(super) trait QueryRead {
 	/// Returns the property dictionary captured by the statement snapshot.
 	fn property_dictionary(&self, snapshot: Snapshot) -> Arc<PropertyDictionary>;
 
+	fn savepoint(&self) -> Self::Savepoint;
+
+	fn restore_savepoint(&mut self, savepoint: Self::Savepoint) -> FerrosGrynnResult<()>;
+
+	fn assert_invariants(
+		&mut self,
+		graph: Option<&GraphRef>,
+		detail_limit: usize,
+	) -> FerrosGrynnResult<usize>;
+
 	/// Applies one typed schema command to the transaction that owns this view.
 	fn execute_schema(&mut self, statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value>;
 
@@ -109,6 +120,7 @@ pub(super) trait QueryRead {
 		statement: &LogicalDmlStatement,
 		slots: &[Value],
 		source: &str,
+		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value>;
 
 	/// Applies one typed graph-membership or graph-incidence mutation.
@@ -117,6 +129,7 @@ pub(super) trait QueryRead {
 		statement: &LogicalGraphDmlStatement,
 		slots: &[Value],
 		source: &str,
+		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value>;
 }
 
@@ -172,8 +185,9 @@ impl<'a, Graph: GraphRead> EdgeExpandCursor<'a, Graph> {
 }
 
 impl<Graph: GraphRead> RowCursor for EdgeExpandCursor<'_, Graph> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
+			control.check()?;
 			if let Some(candidate) = self.candidates.get(self.next_candidate).cloned() {
 				self.next_candidate += 1;
 				if let Some(row) = expand_row(
@@ -188,7 +202,7 @@ impl<Graph: GraphRead> RowCursor for EdgeExpandCursor<'_, Graph> {
 				}
 				continue;
 			}
-			let Some(row) = self.input.next()? else {
+			let Some(row) = self.input.next(control)? else {
 				return Ok(None);
 			};
 			let source = row.current.ok_or_else(|| {
@@ -246,8 +260,9 @@ impl<'a, Graph> IndexExpandCursor<'a, Graph> {
 }
 
 impl<Graph: GraphRead> RowCursor for IndexExpandCursor<'_, Graph> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
+			control.check()?;
 			if let Some(candidate) = self.candidates.get(self.next_candidate).cloned() {
 				self.next_candidate += 1;
 				if !connector_matches(self.graph.as_ref(), candidate.edge, &self.expand.edge)? {
@@ -265,7 +280,7 @@ impl<Graph: GraphRead> RowCursor for IndexExpandCursor<'_, Graph> {
 				}
 				continue;
 			}
-			let Some(row) = self.input.next()? else {
+			let Some(row) = self.input.next(control)? else {
 				return Ok(None);
 			};
 			let source = row.current.ok_or_else(|| {

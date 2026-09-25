@@ -63,6 +63,7 @@ impl Display for Value {
 				value.name_str().unwrap_or("anonymous"),
 				value.id().get(),
 			),
+			Self::Error(value) => write!(f, "error({}: {})", value.code(), value.message()),
 		}
 	}
 }

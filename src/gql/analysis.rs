@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 
 use super::ir::{
+	Builtin,
 	Column,
 	EndpointDomain,
 	Expand,
+	LogicalBlock,
+	LogicalBlockStatement,
 	LogicalDmlData,
 	LogicalDmlKind,
 	LogicalDmlReturn,
@@ -71,6 +74,7 @@ use crate::{
 	},
 	values::{
 		AtomKind,
+		DateTime,
 		GraphKind,
 		GraphRef,
 		Number,
@@ -103,11 +107,24 @@ pub(super) fn analyze(
 	Analyzer::new(source, catalog, variables).program(program)
 }
 
+pub(super) fn analyze_statement(
+	statement: &crate::syn::Statement,
+	source: &str,
+	catalog: &dyn QueryCatalog,
+	variables: &Object,
+) -> FerrosGrynnResult<LogicalProgram> {
+	Analyzer::new(source, catalog, variables).single_statement(statement)
+}
+
 struct Analyzer<'a> {
 	source: &'a str,
 	catalog: &'a dyn QueryCatalog,
 	slots: BTreeMap<Box<str>, Slot>,
 	initial_slots: Vec<(Box<str>, u32)>,
+	next_slot: u32,
+	scopes: Vec<Vec<(Box<str>, Option<Slot>)>>,
+	variables: &'a Object,
+	statement_now: DateTime,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +152,7 @@ struct MatchAlias {
 }
 
 impl<'a> Analyzer<'a> {
-	fn new(source: &'a str, catalog: &'a dyn QueryCatalog, variables: &Object) -> Self {
+	fn new(source: &'a str, catalog: &'a dyn QueryCatalog, variables: &'a Object) -> Self {
 		let mut slots = BTreeMap::new();
 		let mut initial_slots = Vec::new();
 		for (index, (name, value)) in variables.iter().enumerate() {
@@ -151,169 +168,300 @@ impl<'a> Analyzer<'a> {
 			catalog,
 			slots,
 			initial_slots,
+			next_slot: variables.len() as u32,
+			scopes: vec![Vec::new()],
+			variables,
+			statement_now: DateTime::from(jiff::Zoned::now()),
 		}
 	}
 
 	fn program(mut self, program: &Program) -> FerrosGrynnResult<LogicalProgram> {
 		let mut statements = Vec::with_capacity(program.statements.len());
 		for statement in &program.statements {
-			match &statement.kind {
-				StatementKind::Attach(statement) => {
-					let graph = statement.graph.as_ref().ok_or_else(|| {
-						self.semantic(
-							"ATTACH requires a graph scope.",
-							statement.record.class().span,
-						)
-					})?;
-					if self.catalog.class_kind(statement.record.class().value.as_ref())?
-						!= AtomKind::Node
-					{
-						return Err(self.semantic(
-							"ATTACH requires a NODE class; edge occurrences are created by RELATE.",
-							statement.record.class().span,
-						));
-					}
-					statements.push(LogicalStatement::GraphDml(LogicalGraphDmlStatement::Attach {
-						record: self.record_target(&statement.record)?,
-						graph: self.catalog.graph(&graph.value)?,
-						label: statement
-							.label
-							.as_ref()
-							.map(|label| Text::from(label.value.as_ref())),
-					}));
-				}
-				StatementKind::Create(statement) => {
-					statements.push(LogicalStatement::Dml(self.dml(
-						LogicalDmlKind::Create,
-						&statement.targets,
-						None,
-						None,
-						statement.data.as_ref(),
-						None,
-						statement.returning.as_ref(),
-						statement.expect.as_ref(),
-						false,
-					)?));
-				}
-				StatementKind::Update(statement) => {
-					statements.push(LogicalStatement::Dml(self.dml(
-						LogicalDmlKind::Update,
-						&statement.targets,
-						statement.graph.as_ref(),
-						statement.label.as_ref(),
-						statement.data.as_ref(),
-						statement.filter.as_ref(),
-						statement.returning.as_ref(),
-						statement.expect.as_ref(),
-						false,
-					)?));
-				}
-				StatementKind::Upsert(statement) => {
-					statements.push(LogicalStatement::Dml(self.dml(
-						LogicalDmlKind::Upsert,
-						&statement.targets,
-						None,
-						None,
-						statement.data.as_ref(),
-						statement.filter.as_ref(),
-						statement.returning.as_ref(),
-						statement.expect.as_ref(),
-						false,
-					)?));
-				}
-				StatementKind::Delete(statement) => {
-					statements.push(LogicalStatement::Dml(self.dml(
-						LogicalDmlKind::Delete,
-						&statement.targets,
-						None,
-						None,
-						None,
-						statement.filter.as_ref(),
-						statement.returning.as_ref(),
-						statement.expect.as_ref(),
-						statement.cascade,
-					)?));
-				}
-				StatementKind::Detach(statement) => {
-					let graph = statement.graph.as_ref().ok_or_else(|| {
-						self.semantic(
-							"DETACH requires a graph scope.",
-							statement.record.class().span,
-						)
-					})?;
-					statements.push(LogicalStatement::GraphDml(LogicalGraphDmlStatement::Detach {
-						record: self.record_target(&statement.record)?,
-						graph: self.catalog.graph(&graph.value)?,
-						cascade: statement.cascade,
-					}));
-				}
-				StatementKind::DefineGraph(definition) => {
-					statements.push(LogicalStatement::Schema(
-						self.define_graph(definition, statement.span)?,
-					));
-				}
-				StatementKind::DefineClass(definition) => {
-					statements.push(LogicalStatement::Schema(Self::define_class(definition)));
-				}
-				StatementKind::DefineField(definition) => {
-					statements.push(LogicalStatement::Schema(self.define_field(definition)?));
-				}
-				StatementKind::DefineIndex(definition) => {
-					statements.push(LogicalStatement::Schema(self.define_index(definition)?));
-				}
-				StatementKind::Remove(statement) => {
-					statements.push(LogicalStatement::Schema(Self::remove(&statement.target)));
-				}
-				StatementKind::Alter(statement) => {
-					statements.push(LogicalStatement::Schema(self.alter(&statement.target)?));
-				}
-				StatementKind::Info(statement) => {
-					statements.push(LogicalStatement::Schema(Self::info(&statement.target)));
-				}
-				StatementKind::Import(_) => {
-					return Err(self.semantic(
-						"BEGIN IMPORT must be executed through Datastore.",
-						statement.span,
-					));
-				}
-				StatementKind::Let(statement) => {
-					let value = self.expr(&statement.value, None)?;
-					if let Some(declared) = &statement.declared_type {
-						let declared = self.type_name(declared)?;
-						if !compatible(&declared, &value.ty) {
-							return Err(self.semantic(
-								&format!("LET value has type {}, expected {declared}.", value.ty),
-								statement.value.span,
-							));
-						}
-					}
-					let slot = self.bind(&statement.name.value, value.ty.clone());
-					statements.push(LogicalStatement::Let {
-						slot,
-						value,
-					});
-				}
-				StatementKind::Return(statement) => {
-					statements.push(LogicalStatement::Return {
-						value: self.expr(&statement.value, None)?,
-					});
-				}
-				StatementKind::Relate(statement) => {
-					statements.push(LogicalStatement::GraphDml(self.relate(statement)?));
-				}
-				StatementKind::Match(statement) => {
-					statements.push(LogicalStatement::Match(self.match_statement(statement)?));
-				}
-				StatementKind::Select(select) => {
-					statements.push(LogicalStatement::Select(self.select(select, statement.span)?));
-				}
-			}
+			self.statement_now = DateTime::from(jiff::Zoned::now());
+			statements.push(self.statement(statement, 0)?);
 		}
 		Ok(LogicalProgram {
 			statements,
 			initial_slots: self.initial_slots,
-			slot_count: self.slots.len(),
+			slot_count: self.next_slot as usize,
 		})
+	}
+
+	fn single_statement(
+		mut self,
+		statement: &crate::syn::Statement,
+	) -> FerrosGrynnResult<LogicalProgram> {
+		self.statement_now = DateTime::from(jiff::Zoned::now());
+		let statement = self.statement(statement, 0)?;
+		Ok(LogicalProgram {
+			statements: vec![statement],
+			initial_slots: self.initial_slots,
+			slot_count: self.next_slot as usize,
+		})
+	}
+
+	fn statement(
+		&mut self,
+		statement: &crate::syn::Statement,
+		loop_depth: u32,
+	) -> FerrosGrynnResult<LogicalStatement> {
+		Ok(match &statement.kind {
+			StatementKind::Begin(_) | StatementKind::Commit(_) | StatementKind::Cancel => {
+				return Err(self.semantic(
+					"Transaction statements must be executed through Datastore or GqlSession.",
+					statement.span,
+				));
+			}
+			StatementKind::Attach(statement) => {
+				let graph = statement.graph.as_ref().ok_or_else(|| {
+					self.semantic("ATTACH requires a graph scope.", statement.record.class().span)
+				})?;
+				if self.catalog.class_kind(statement.record.class().value.as_ref())?
+					!= AtomKind::Node
+				{
+					return Err(self.semantic(
+						"ATTACH requires a NODE class; edge occurrences are created by RELATE.",
+						statement.record.class().span,
+					));
+				}
+				LogicalStatement::GraphDml(LogicalGraphDmlStatement::Attach {
+					record: self.record_target(&statement.record)?,
+					graph: self.catalog.graph(&graph.value)?,
+					label: statement.label.as_ref().map(|label| Text::from(label.value.as_ref())),
+				})
+			}
+			StatementKind::Create(statement) => LogicalStatement::Dml(self.dml(
+				LogicalDmlKind::Create,
+				&statement.targets,
+				None,
+				None,
+				statement.data.as_ref(),
+				None,
+				statement.returning.as_ref(),
+				statement.expect.as_ref(),
+				false,
+			)?),
+			StatementKind::Update(statement) => LogicalStatement::Dml(self.dml(
+				LogicalDmlKind::Update,
+				&statement.targets,
+				statement.graph.as_ref(),
+				statement.label.as_ref(),
+				statement.data.as_ref(),
+				statement.filter.as_ref(),
+				statement.returning.as_ref(),
+				statement.expect.as_ref(),
+				false,
+			)?),
+			StatementKind::Upsert(statement) => LogicalStatement::Dml(self.dml(
+				LogicalDmlKind::Upsert,
+				&statement.targets,
+				None,
+				None,
+				statement.data.as_ref(),
+				statement.filter.as_ref(),
+				statement.returning.as_ref(),
+				statement.expect.as_ref(),
+				false,
+			)?),
+			StatementKind::Delete(statement) => LogicalStatement::Dml(self.dml(
+				LogicalDmlKind::Delete,
+				&statement.targets,
+				None,
+				None,
+				None,
+				statement.filter.as_ref(),
+				statement.returning.as_ref(),
+				statement.expect.as_ref(),
+				statement.cascade,
+			)?),
+			StatementKind::Detach(statement) => {
+				let graph = statement.graph.as_ref().ok_or_else(|| {
+					self.semantic("DETACH requires a graph scope.", statement.record.class().span)
+				})?;
+				LogicalStatement::GraphDml(LogicalGraphDmlStatement::Detach {
+					record: self.record_target(&statement.record)?,
+					graph: self.catalog.graph(&graph.value)?,
+					cascade: statement.cascade,
+				})
+			}
+			StatementKind::DefineGraph(definition) => {
+				LogicalStatement::Schema(self.define_graph(definition, statement.span)?)
+			}
+			StatementKind::DefineClass(definition) => {
+				LogicalStatement::Schema(Self::define_class(definition))
+			}
+			StatementKind::DefineField(definition) => {
+				LogicalStatement::Schema(self.define_field(definition)?)
+			}
+			StatementKind::DefineIndex(definition) => {
+				LogicalStatement::Schema(self.define_index(definition)?)
+			}
+			StatementKind::Remove(statement) => {
+				LogicalStatement::Schema(Self::remove(&statement.target))
+			}
+			StatementKind::Alter(statement) => {
+				LogicalStatement::Schema(self.alter(&statement.target)?)
+			}
+			StatementKind::Info(statement) => {
+				LogicalStatement::Schema(Self::info(&statement.target))
+			}
+			StatementKind::Import(_) => {
+				return Err(self
+					.semantic("BEGIN IMPORT must be executed through Datastore.", statement.span));
+			}
+			StatementKind::Let(statement) => {
+				let value = self.expr(&statement.value, None)?;
+				if let Some(declared) = &statement.declared_type {
+					let declared = self.type_name(declared)?;
+					if !compatible(&declared, &value.ty) {
+						return Err(self.semantic(
+							&format!("LET value has type {}, expected {declared}.", value.ty),
+							statement.value.span,
+						));
+					}
+				}
+				let slot = self.declare(&statement.name, value.ty.clone())?;
+				LogicalStatement::Let {
+					name: statement.name.value.clone(),
+					slot,
+					value,
+				}
+			}
+			StatementKind::Return(statement) => LogicalStatement::Return {
+				value: self.expr(&statement.value, None)?,
+			},
+			StatementKind::Relate(statement) => LogicalStatement::GraphDml(self.relate(statement)?),
+			StatementKind::Match(statement) => {
+				LogicalStatement::Match(self.match_statement(statement)?)
+			}
+			StatementKind::Select(select) => {
+				LogicalStatement::Select(self.select(select, statement.span)?)
+			}
+			StatementKind::Expression(value) => LogicalStatement::Expression {
+				value: self.expr(value, None)?,
+			},
+			StatementKind::If(statement) => LogicalStatement::If {
+				branches: statement
+					.branches
+					.iter()
+					.map(|(condition, block)| {
+						Ok((self.expr(condition, None)?, self.block(block, loop_depth, None)?.0))
+					})
+					.collect::<FerrosGrynnResult<Vec<_>>>()?,
+				else_block: statement
+					.else_block
+					.as_ref()
+					.map(|block| self.block(block, loop_depth, None).map(|value| value.0))
+					.transpose()?,
+			},
+			StatementKind::For(statement) => {
+				let iterable = self.expr(&statement.iterable, None)?;
+				let item_type = match &iterable.ty {
+					Type::Array(item) | Type::Set(item) | Type::Range(item) => (**item).clone(),
+					_ => Type::Any,
+				};
+				let (body, slot) = self.block(
+					&statement.body,
+					loop_depth + 1,
+					Some((&statement.binding, item_type)),
+				)?;
+				LogicalStatement::For {
+					slot: slot.ok_or_else(|| {
+						self.semantic("FOR binding is missing.", statement.binding.span)
+					})?,
+					iterable,
+					body,
+				}
+			}
+			StatementKind::While(statement) => LogicalStatement::While {
+				condition: self.expr(&statement.condition, None)?,
+				body: self.block(&statement.body, loop_depth + 1, None)?.0,
+			},
+			StatementKind::Break if loop_depth > 0 => LogicalStatement::Break,
+			StatementKind::Continue if loop_depth > 0 => LogicalStatement::Continue,
+			StatementKind::Break | StatementKind::Continue => {
+				return Err(
+					self.semantic("BREAK and CONTINUE require an enclosing loop.", statement.span)
+				);
+			}
+			StatementKind::Try(statement) => {
+				let body = self.block(&statement.body, loop_depth, None)?.0;
+				let catch = statement
+					.catch
+					.as_ref()
+					.map(|catch| {
+						let (body, slot) = self.block(
+							&catch.body,
+							loop_depth,
+							Some((&catch.binding, Type::Error)),
+						)?;
+						Ok::<_, FerrosGrynnError>((
+							slot.ok_or_else(|| {
+								self.semantic("CATCH binding is missing.", catch.binding.span)
+							})?,
+							body,
+						))
+					})
+					.transpose()?;
+				LogicalStatement::Try {
+					body,
+					catch,
+				}
+			}
+			StatementKind::Throw(value) => {
+				let value = self.expr(value, None)?;
+				if !compatible(&Type::String, &value.ty) {
+					return Err(self.semantic("THROW requires a string value.", value.span));
+				}
+				LogicalStatement::Throw {
+					value,
+				}
+			}
+			StatementKind::AssertInvariants(assertion) => {
+				let report = assertion.report.unwrap_or(1_000) as usize;
+				if report > 1_000 {
+					return Err(self
+						.semantic("ASSERT INVARIANTS REPORT cannot exceed 1000.", statement.span));
+				}
+				LogicalStatement::AssertInvariants {
+					graph: assertion
+						.graph
+						.as_ref()
+						.map(|graph| self.catalog.graph(&graph.value))
+						.transpose()?,
+					report,
+				}
+			}
+		})
+	}
+
+	fn block(
+		&mut self,
+		block: &crate::syn::Block,
+		loop_depth: u32,
+		binding: Option<(&crate::syn::Identifier, Type)>,
+	) -> FerrosGrynnResult<(LogicalBlock, Option<u32>)> {
+		self.scopes.push(Vec::new());
+		let slot = binding.map(|(binding, ty)| self.declare(binding, ty)).transpose()?;
+		let mut statements = Vec::with_capacity(block.statements.len());
+		for statement in &block.statements {
+			let timeout = crate::gql::resolve_timeout(statement.timeout.as_ref(), self.variables)
+				.map_err(|error| {
+				self.locate(error.with_phase(ExecutionPhase::SemanticAnalysis), statement.span)
+			})?;
+			statements.push(LogicalBlockStatement {
+				statement: self.statement(statement, loop_depth)?,
+				timeout,
+			});
+		}
+		self.pop_scope();
+		Ok((
+			LogicalBlock {
+				statements,
+			},
+			slot,
+		))
 	}
 
 	fn record_target(&self, target: &DmlTarget) -> FerrosGrynnResult<LogicalRecordTarget> {
@@ -1192,6 +1340,15 @@ impl<'a> Analyzer<'a> {
 	}
 
 	fn expr(&self, expr: &Expr, schema: Option<&Schema>) -> FerrosGrynnResult<TypedExpr> {
+		self.expr_with_current(expr, schema, false)
+	}
+
+	fn expr_with_current(
+		&self,
+		expr: &Expr,
+		schema: Option<&Schema>,
+		allow_current_field: bool,
+	) -> FerrosGrynnResult<TypedExpr> {
 		let (kind, ty) = match &expr.kind {
 			ExprKind::Literal(literal) => {
 				let value = self.literal(literal, expr.span)?;
@@ -1206,29 +1363,50 @@ impl<'a> Analyzer<'a> {
 			}
 			ExprKind::Name(name) => {
 				let Some(schema) = schema else {
+					if allow_current_field {
+						return Ok(TypedExpr {
+							kind: TypedExprKind::CurrentField(name.value.clone()),
+							ty: Type::Any,
+							span: expr.span,
+						});
+					}
 					return Err(
 						self.semantic(&format!("Unknown field `{}`.", name.value), name.span)
 					);
 				};
-				let index = schema.index_of(&name.value).ok_or_else(|| {
-					self.semantic(&format!("Unknown field `{}`.", name.value), name.span)
-				})?;
-				(TypedExprKind::Column(index), schema.columns[index].ty.clone())
+				if let Some(index) = schema.index_of(&name.value) {
+					(TypedExprKind::Column(index), schema.columns[index].ty.clone())
+				} else if allow_current_field {
+					(TypedExprKind::CurrentField(name.value.clone()), Type::Any)
+				} else {
+					return Err(
+						self.semantic(&format!("Unknown field `{}`.", name.value), name.span)
+					);
+				}
 			}
 			ExprKind::Array(values) => {
 				let values = values
 					.iter()
-					.map(|value| self.expr(value, schema))
+					.map(|value| self.expr_with_current(value, schema, allow_current_field))
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				let item_type =
 					values.iter().map(|value| value.ty.clone()).reduce(unify).unwrap_or(Type::Any);
 				(TypedExprKind::Array(values), Type::Array(Box::new(item_type)))
 			}
+			ExprKind::Set(values) => {
+				let values = values
+					.iter()
+					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				let item_type =
+					values.iter().map(|value| value.ty.clone()).reduce(unify).unwrap_or(Type::Any);
+				(TypedExprKind::Set(values), Type::Set(Box::new(item_type)))
+			}
 			ExprKind::Object(fields) => {
 				let fields = fields
 					.iter()
 					.map(|field| {
-						self.expr(&field.value, schema)
+						self.expr_with_current(&field.value, schema, allow_current_field)
 							.map(|value| (field.name.value.clone(), value))
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
@@ -1238,10 +1416,10 @@ impl<'a> Analyzer<'a> {
 				op,
 				expr: inner,
 			} => {
-				let inner = self.expr(inner, schema)?;
+				let inner = self.expr_with_current(inner, schema, allow_current_field)?;
 				let ty = match op {
 					UnaryOperator::Not => Type::Bool,
-					UnaryOperator::Assert => inner.ty.clone(),
+					UnaryOperator::Truthy => Type::Bool,
 					UnaryOperator::Negate | UnaryOperator::Positive if is_number(&inner.ty) => {
 						inner.ty.clone()
 					}
@@ -1267,8 +1445,8 @@ impl<'a> Analyzer<'a> {
 				if matches!(op, BinaryOperator::Pipeline) {
 					return Err(self.unsupported("expression pipeline", expr.span));
 				}
-				let left = self.expr(left, schema)?;
-				let right = self.expr(right, schema)?;
+				let left = self.expr_with_current(left, schema, allow_current_field)?;
+				let right = self.expr_with_current(right, schema, allow_current_field)?;
 				let ty = self.binary_type(*op, &left.ty, &right.ty, expr.span)?;
 				(
 					TypedExprKind::Binary {
@@ -1284,9 +1462,9 @@ impl<'a> Analyzer<'a> {
 				then_value,
 				else_value,
 			} => {
-				let condition = self.expr(condition, schema)?;
-				let then_value = self.expr(then_value, schema)?;
-				let else_value = self.expr(else_value, schema)?;
+				let condition = self.expr_with_current(condition, schema, allow_current_field)?;
+				let then_value = self.expr_with_current(then_value, schema, allow_current_field)?;
+				let else_value = self.expr_with_current(else_value, schema, allow_current_field)?;
 				let ty = unify(then_value.ty.clone(), else_value.ty.clone());
 				(
 					TypedExprKind::Conditional {
@@ -1297,12 +1475,51 @@ impl<'a> Analyzer<'a> {
 					ty,
 				)
 			}
+			ExprKind::Case {
+				operand,
+				branches,
+				else_value,
+			} => {
+				let operand = operand
+					.as_ref()
+					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.transpose()?
+					.map(Box::new);
+				let branches = branches
+					.iter()
+					.map(|(condition, value)| {
+						Ok((
+							self.expr_with_current(condition, schema, allow_current_field)?,
+							self.expr_with_current(value, schema, allow_current_field)?,
+						))
+					})
+					.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				let else_value = else_value
+					.as_ref()
+					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.transpose()?
+					.map(Box::new);
+				let ty = branches
+					.iter()
+					.map(|(_, value)| value.ty.clone())
+					.chain(else_value.iter().map(|value| value.ty.clone()))
+					.reduce(unify)
+					.unwrap_or(Type::None);
+				(
+					TypedExprKind::Case {
+						operand,
+						branches,
+						else_value,
+					},
+					ty,
+				)
+			}
 			ExprKind::Field {
 				base,
 				field,
 				null_safe,
 			} => {
-				let base = self.expr(base, schema)?;
+				let base = self.expr_with_current(base, schema, allow_current_field)?;
 				(
 					TypedExprKind::Field {
 						base: Box::new(base),
@@ -1312,11 +1529,21 @@ impl<'a> Analyzer<'a> {
 					Type::Any,
 				)
 			}
+			ExprKind::Destructure {
+				base,
+				fields,
+			} => (
+				TypedExprKind::Destructure {
+					base: Box::new(self.expr_with_current(base, schema, allow_current_field)?),
+					fields: fields.iter().map(|field| field.value.clone()).collect(),
+				},
+				Type::Object,
+			),
 			ExprKind::Index {
 				base,
 				index,
 			} => {
-				let base = self.expr(base, schema)?;
+				let base = self.expr_with_current(base, schema, allow_current_field)?;
 				let ty = match &base.ty {
 					Type::Array(item) => (**item).clone(),
 					_ => Type::Any,
@@ -1324,14 +1551,48 @@ impl<'a> Analyzer<'a> {
 				(
 					TypedExprKind::Index {
 						base: Box::new(base),
-						index: Box::new(self.expr(index, schema)?),
+						index: Box::new(self.expr_with_current(
+							index,
+							schema,
+							allow_current_field,
+						)?),
+					},
+					ty,
+				)
+			}
+			ExprKind::Filter {
+				base,
+				predicate,
+			} => {
+				let base = self.expr_with_current(base, schema, allow_current_field)?;
+				let ty = base.ty.clone();
+				(
+					TypedExprKind::Filter {
+						base: Box::new(base),
+						predicate: Box::new(self.expr_with_current(predicate, schema, true)?),
 					},
 					ty,
 				)
 			}
 			ExprKind::Call {
-				..
-			} => return Err(self.unsupported("function calls", expr.span)),
+				callee,
+				type_argument,
+				arguments,
+			} => {
+				let arguments = arguments
+					.iter()
+					.map(|argument| self.expr_with_current(argument, schema, allow_current_field))
+					.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				let (function, ty) =
+					self.builtin(callee, type_argument.as_ref(), &arguments, expr.span)?;
+				(
+					TypedExprKind::Builtin {
+						function,
+						arguments,
+					},
+					ty,
+				)
+			}
 			ExprKind::Cast {
 				target,
 				expr: inner,
@@ -1340,9 +1601,42 @@ impl<'a> Analyzer<'a> {
 				(
 					TypedExprKind::Cast {
 						target: target.clone(),
-						expr: Box::new(self.expr(inner, schema)?),
+						expr: Box::new(self.expr_with_current(
+							inner,
+							schema,
+							allow_current_field,
+						)?),
 					},
 					target,
+				)
+			}
+			ExprKind::Range {
+				start,
+				end,
+				inclusive_end,
+			} => {
+				let start = start
+					.as_ref()
+					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.transpose()?
+					.map(Box::new);
+				let end = end
+					.as_ref()
+					.map(|value| self.expr_with_current(value, schema, allow_current_field))
+					.transpose()?
+					.map(Box::new);
+				let item_type = match (&start, &end) {
+					(Some(start), Some(end)) => unify(start.ty.clone(), end.ty.clone()),
+					(Some(value), None) | (None, Some(value)) => value.ty.clone(),
+					(None, None) => Type::Any,
+				};
+				(
+					TypedExprKind::Range {
+						start,
+						end,
+						inclusive_end: *inclusive_end,
+					},
+					Type::Range(Box::new(item_type)),
 				)
 			}
 		};
@@ -1351,6 +1645,140 @@ impl<'a> Analyzer<'a> {
 			ty,
 			span: expr.span,
 		})
+	}
+
+	fn builtin(
+		&self,
+		callee: &Expr,
+		type_argument: Option<&TypeName>,
+		arguments: &[TypedExpr],
+		span: TextSpan,
+	) -> FerrosGrynnResult<(Builtin, Type)> {
+		let Some((namespace, name)) = builtin_name(callee) else {
+			return Err(self.semantic("Built-in functions require a namespace.", callee.span));
+		};
+		let key = format!("{}::{}", namespace.to_ascii_lowercase(), name.to_ascii_lowercase());
+		let (function, arity, result) = match key.as_str() {
+			"math::abs" => {
+				(Builtin::MathAbs, 1, arguments.first().map_or(Type::Any, |v| v.ty.clone()))
+			}
+			"math::sqrt" => (Builtin::MathSqrt, 1, Type::Float),
+			"math::pow" => (Builtin::MathPow, 2, Type::Number),
+			"math::floor" => (Builtin::MathFloor, 1, Type::Float),
+			"math::ceil" => (Builtin::MathCeil, 1, Type::Float),
+			"string::upper" => (Builtin::StringUpper, 1, Type::String),
+			"string::lower" => (Builtin::StringLower, 1, Type::String),
+			"string::len" => (Builtin::StringLen, 1, Type::Int),
+			"string::contains" => (Builtin::StringContains, 2, Type::Bool),
+			"string::split" => (Builtin::StringSplit, 2, Type::Array(Box::new(Type::String))),
+			"string::concat" => (Builtin::StringConcat, arguments.len(), Type::String),
+			"time::now" => (Builtin::TimeNow(self.statement_now.clone()), 0, Type::DateTime),
+			"time::format" => (Builtin::TimeFormat, 2, Type::String),
+			"time::add" => (Builtin::TimeAdd, 2, Type::DateTime),
+			"time::diff" => (Builtin::TimeDiff, 2, Type::Duration),
+			"array::len" => (Builtin::ArrayLen, 1, Type::Int),
+			"array::concat" => (Builtin::ArrayConcat, 2, Type::Array(Box::new(Type::Any))),
+			"array::distinct" => {
+				(Builtin::ArrayDistinct, 1, arguments.first().map_or(Type::Any, |v| v.ty.clone()))
+			}
+			"array::first" => (Builtin::ArrayFirst, 1, Type::Any),
+			"array::flatten" => (Builtin::ArrayFlatten, 1, Type::Array(Box::new(Type::Any))),
+			"set::len" => (Builtin::SetLen, 1, Type::Int),
+			"set::union" => (Builtin::SetUnion, 2, Type::Set(Box::new(Type::Any))),
+			"set::intersect" => (Builtin::SetIntersect, 2, Type::Set(Box::new(Type::Any))),
+			"set::diff" => (Builtin::SetDiff, 2, Type::Set(Box::new(Type::Any))),
+			"set::has" => (Builtin::SetHas, 2, Type::Bool),
+			"meta::id" => (Builtin::MetaId, 1, Type::Any),
+			"meta::class" => (Builtin::MetaClass, 1, Type::String),
+			"meta::type" => (Builtin::MetaType, 1, Type::String),
+			"option::is_some" => (Builtin::OptionIsSome, 1, Type::Bool),
+			"option::is_none" => (Builtin::OptionIsNone, 1, Type::Bool),
+			"type::is" => {
+				let ty = type_argument
+					.ok_or_else(|| self.semantic("type::is requires a type argument.", span))?;
+				(Builtin::TypeIs(self.type_name(ty)?), 1, Type::Bool)
+			}
+			"type::to" => {
+				let ty = type_argument
+					.ok_or_else(|| self.semantic("type::to requires a type argument.", span))?;
+				let ty = self.type_name(ty)?;
+				(Builtin::TypeTo(ty.clone()), 1, ty)
+			}
+			_ => return Err(self.unsupported(&format!("function `{key}`"), span)),
+		};
+		if !matches!(key.as_str(), "type::is" | "type::to") && type_argument.is_some() {
+			return Err(self.semantic("This built-in does not accept a type argument.", span));
+		}
+		if arguments.len() != arity {
+			return Err(self.semantic(
+				&format!("Function `{key}` expects {arity} arguments, found {}.", arguments.len()),
+				span,
+			));
+		}
+		self.validate_builtin_arguments(&key, arguments, span)?;
+		if key == "math::pow"
+			&& matches!(
+				(arguments[0].ty.clone(), arguments[1].ty.clone()),
+				(Type::Float, Type::Decimal) | (Type::Decimal, Type::Float)
+			) {
+			return Err(
+				self.semantic("Float and decimal arithmetic requires an explicit cast.", span)
+			);
+		}
+		Ok((function, result))
+	}
+
+	fn validate_builtin_arguments(
+		&self,
+		key: &str,
+		arguments: &[TypedExpr],
+		span: TextSpan,
+	) -> FerrosGrynnResult<()> {
+		let expected = match key {
+			"math::abs" | "math::sqrt" | "math::floor" | "math::ceil" => {
+				vec![BuiltinArgument::Number]
+			}
+			"math::pow" => vec![BuiltinArgument::Number, BuiltinArgument::Number],
+			"string::upper" | "string::lower" | "string::len" => {
+				vec![BuiltinArgument::String]
+			}
+			"string::contains" | "string::split" => {
+				vec![BuiltinArgument::String, BuiltinArgument::String]
+			}
+			"string::concat" => vec![BuiltinArgument::String; arguments.len()],
+			"time::now" => Vec::new(),
+			"time::format" => vec![BuiltinArgument::DateTime, BuiltinArgument::String],
+			"time::add" => vec![BuiltinArgument::DateTime, BuiltinArgument::Duration],
+			"time::diff" => vec![BuiltinArgument::DateTime, BuiltinArgument::DateTime],
+			"array::len" | "array::distinct" | "array::first" | "array::flatten" => {
+				vec![BuiltinArgument::Array]
+			}
+			"array::concat" => vec![BuiltinArgument::Array, BuiltinArgument::Array],
+			"set::len" => vec![BuiltinArgument::Set],
+			"set::union" | "set::intersect" | "set::diff" => {
+				vec![BuiltinArgument::Set, BuiltinArgument::Set]
+			}
+			"set::has" => vec![BuiltinArgument::Set, BuiltinArgument::Any],
+			"meta::id" | "meta::class" => vec![BuiltinArgument::RecordOrAtom],
+			"meta::type" | "option::is_some" | "option::is_none" | "type::is" | "type::to" => {
+				vec![BuiltinArgument::Any]
+			}
+			_ => return Ok(()),
+		};
+		for (index, (argument, expected)) in arguments.iter().zip(expected).enumerate() {
+			if !expected.accepts(&argument.ty) {
+				return Err(self.semantic(
+					&format!(
+						"Function `{key}` argument {} expects {}, found {}.",
+						index + 1,
+						expected.name(),
+						argument.ty
+					),
+					span,
+				));
+			}
+		}
+		Ok(())
 	}
 
 	fn binary_type(
@@ -1367,7 +1795,13 @@ impl<'a> Analyzer<'a> {
 			| BinaryOperator::Remainder
 			| BinaryOperator::Add
 			| BinaryOperator::Subtract => {
-				if is_number(left) && is_number(right) {
+				if matches!(
+					(left, right),
+					(Type::Float, Type::Decimal) | (Type::Decimal, Type::Float)
+				) {
+					Err(self
+						.semantic("Float and decimal arithmetic requires an explicit cast.", span))
+				} else if is_number(left) && is_number(right) {
 					Ok(unify(left.clone(), right.clone()))
 				} else {
 					Err(self.semantic("Arithmetic operators require numbers.", span))
@@ -1383,6 +1817,15 @@ impl<'a> Analyzer<'a> {
 			| BinaryOperator::NotIs
 			| BinaryOperator::In
 			| BinaryOperator::NotIn
+			| BinaryOperator::AllIn
+			| BinaryOperator::AnyIn
+			| BinaryOperator::NoneIn
+			| BinaryOperator::AnyEqual
+			| BinaryOperator::AllEqual
+			| BinaryOperator::Contains
+			| BinaryOperator::ContainsNot
+			| BinaryOperator::ContainsAny
+			| BinaryOperator::ContainsAll
 			| BinaryOperator::And
 			| BinaryOperator::Or => Ok(Type::Bool),
 			BinaryOperator::Coalesce | BinaryOperator::Elvis => {
@@ -1440,24 +1883,61 @@ impl<'a> Analyzer<'a> {
 			"float" => Type::Float,
 			"decimal" => Type::Decimal,
 			"string" => Type::String,
+			"duration" => Type::Duration,
+			"datetime" => Type::DateTime,
+			"bytes" => Type::Bytes,
+			"array" => Type::Array(Box::new(Type::Any)),
+			"set" => Type::Set(Box::new(Type::Any)),
+			"range" => Type::Range(Box::new(Type::Any)),
 			"object" => Type::Object,
 			"record" => Type::Record,
+			"error" => Type::Error,
 			_ => return Err(self.semantic(&format!("Unknown type `{}`.", name.value), name.span)),
 		};
 		Ok(ty)
 	}
 
-	fn bind(&mut self, name: &str, ty: Type) -> u32 {
-		if let Some(slot) = self.slots.get_mut(name) {
-			slot.ty = ty;
-			return slot.id;
+	fn declare(&mut self, name: &crate::syn::Identifier, ty: Type) -> FerrosGrynnResult<u32> {
+		let current = self
+			.scopes
+			.last()
+			.ok_or_else(|| self.semantic("Lexical scope is unavailable.", name.span))?;
+		if name.value.as_ref() != "_" && current.iter().any(|(declared, _)| declared == &name.value)
+		{
+			return Err(self.semantic(
+				&format!("Binding `${}` is already declared in this scope.", name.value),
+				name.span,
+			));
 		}
-		let id = self.slots.len() as u32;
-		self.slots.insert(name.into(), Slot {
+		let id = self.next_slot;
+		self.next_slot = self
+			.next_slot
+			.checked_add(1)
+			.ok_or_else(|| self.semantic("The statement declares too many bindings.", name.span))?;
+		if name.value.as_ref() == "_" {
+			return Ok(id);
+		}
+		let previous = self.slots.insert(name.value.clone(), Slot {
 			id,
 			ty,
 		});
-		id
+		if let Some(scope) = self.scopes.last_mut() {
+			scope.push((name.value.clone(), previous));
+		}
+		Ok(id)
+	}
+
+	fn pop_scope(&mut self) {
+		let Some(scope) = self.scopes.pop() else {
+			return;
+		};
+		for (name, previous) in scope.into_iter().rev() {
+			if let Some(previous) = previous {
+				self.slots.insert(name, previous);
+			} else {
+				self.slots.remove(&name);
+			}
+		}
 	}
 
 	fn semantic(&self, message: &str, span: TextSpan) -> FerrosGrynnError {
@@ -1482,12 +1962,53 @@ impl<'a> Analyzer<'a> {
 	}
 }
 
+#[derive(Clone, Copy)]
+enum BuiltinArgument {
+	Any,
+	Number,
+	String,
+	DateTime,
+	Duration,
+	Array,
+	Set,
+	RecordOrAtom,
+}
+
+impl BuiltinArgument {
+	const fn accepts(self, ty: &Type) -> bool {
+		matches!(ty, Type::Any)
+			|| match self {
+				Self::Any => true,
+				Self::Number => is_number(ty),
+				Self::String => matches!(ty, Type::String),
+				Self::DateTime => matches!(ty, Type::DateTime),
+				Self::Duration => matches!(ty, Type::Duration),
+				Self::Array => matches!(ty, Type::Array(_)),
+				Self::Set => matches!(ty, Type::Set(_)),
+				Self::RecordOrAtom => matches!(ty, Type::Record | Type::Atom(_)),
+			}
+	}
+
+	const fn name(self) -> &'static str {
+		match self {
+			Self::Any => "any",
+			Self::Number => "number",
+			Self::String => "string",
+			Self::DateTime => "datetime",
+			Self::Duration => "duration",
+			Self::Array => "array",
+			Self::Set => "set",
+			Self::RecordOrAtom => "record or atom",
+		}
+	}
+}
+
 fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 	match &expr.kind {
 		ExprKind::Name(name) => {
 			names.entry(name.value.clone()).or_insert(name.span);
 		}
-		ExprKind::Array(values) => {
+		ExprKind::Array(values) | ExprKind::Set(values) => {
 			for value in values {
 				collect_expr_names(value, names);
 			}
@@ -1522,7 +2043,27 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 			collect_expr_names(then_value, names);
 			collect_expr_names(else_value, names);
 		}
+		ExprKind::Case {
+			operand,
+			branches,
+			else_value,
+		} => {
+			if let Some(operand) = operand {
+				collect_expr_names(operand, names);
+			}
+			for (condition, value) in branches {
+				collect_expr_names(condition, names);
+				collect_expr_names(value, names);
+			}
+			if let Some(else_value) = else_value {
+				collect_expr_names(else_value, names);
+			}
+		}
 		ExprKind::Field {
+			base,
+			..
+		}
+		| ExprKind::Destructure {
 			base,
 			..
 		} => collect_expr_names(base, names),
@@ -1536,14 +2077,49 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 		ExprKind::Call {
 			callee,
 			arguments,
+			..
 		} => {
 			collect_expr_names(callee, names);
 			for argument in arguments {
 				collect_expr_names(argument, names);
 			}
 		}
+		ExprKind::Range {
+			start,
+			end,
+			..
+		} => {
+			if let Some(start) = start {
+				collect_expr_names(start, names);
+			}
+			if let Some(end) = end {
+				collect_expr_names(end, names);
+			}
+		}
+		ExprKind::Filter {
+			base,
+			predicate,
+		} => {
+			collect_expr_names(base, names);
+			collect_expr_names(predicate, names);
+		}
 		ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
 	}
+}
+
+fn builtin_name(callee: &Expr) -> Option<(&str, &str)> {
+	let ExprKind::Field {
+		base,
+		field,
+		null_safe: false,
+	} = &callee.kind
+	else {
+		return None;
+	};
+	let ExprKind::Name(namespace) = &base.kind else {
+		return None;
+	};
+	Some((namespace.value.as_ref(), field.value.as_ref()))
 }
 
 const fn class_kind(kind: ClassKindName) -> AtomKind {

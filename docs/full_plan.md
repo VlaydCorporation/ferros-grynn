@@ -344,8 +344,8 @@ types при необходимости расширяется общими ти
    **Статус (2026-09-24):** graph-first cutover A5–A16 и Atomic Import I0–I12
    завершены; `Q-08`, `Q-17`–`Q-18` и `Q-23`–`Q-29` закрыты текущими
    RAM/local/recovery/resource/performance gates. `Q-01`–`Q-03`,
-   `Q-15`–`Q-16` и `Q-21` остаются закрытыми прежними этапами. `Q-04`–`Q-07`,
-   `Q-09`–`Q-14`, `Q-20`, `Q-22` и `Q-30`–`Q-33` остаются открытыми либо
+   `Q-15`–`Q-16`, `Q-21` и `Q-07` остаются закрытыми прежними этапами.
+   `Q-04`–`Q-06`, `Q-09`–`Q-14`, `Q-20`, `Q-22` и `Q-30`–`Q-34` остаются открытыми либо
    явно отложенными до назначенных зависимых этапов.
 
    **Известный реестр на текущем checkout:**
@@ -357,8 +357,8 @@ types при необходимости расширяется общими ти
    | `Q-03`  | Resource correctness + UX               | Лимит 256 МиБ нормативно остаётся консервативной логической precommit-оценкой, а не allocator quota. Единый рекурсивный accounting теперь включает mutation state, составные `RecordId`, properties, текущую и предыдущую topology, полностью выведенную adjacency затронутых узлов и nested graph payload; `FG-54F07` возвращается до commit lock, WAL, I/O и публикации.                                                                                                     | Контракт и момент отказа закреплены в `gql_spec`. Regression: `write_set_limit_counts_recursive_graph_payload_before_publication` и `local_write_set_limit_counts_derived_adjacency_before_publication`. Bounded segmented import остаётся самостоятельным этапом 10; private spill всё ещё запрещён без доказанного неделимого workload.                                                                     | ✅ закрыто — этап 4, 2026-09-05                                                 |
    | `Q-04`  | Durability + resources                  | Недостижимые COW-поколения удаляет startup-GC. Частые COW commit между reopen могут накапливать disk bytes и file registrations, тогда как активные snapshots требуют безопасно удерживать старую версию.                                                                                                                                                                                                                                                                      | До этапа 19 измерить длительный churn и реализовать snapshot-aware runtime retirement/GC либо нормативно доказать жёсткую границу; crash-orphans и ошибки удаления должны иметь отдельные тесты и наблюдаемый статус.                                                                                                                                                                                         | ⬜ открыто                                                                      |
    | `Q-05`  | Performance                             | Point-DML сначала обновляет только затронутые B+tree leaves, если сохраняются separator, page count и posting layout; иначе использует проверенный bulk fallback. Immutable external-sort generation остаётся плотным, mutable primary/Unique собираются с fill 0.90, Standard — 0.80.                                                                                                                                                                                         | Paired profiling на 50 000 entries и batch 1/32/256 показал для primary fill 0.90 отношения incremental/bulk 0.013/0.198/0.454, для Standard fill 0.80 — 0.005/0.110/0.127. Dense primary/Standard batch 256 подтвердили необходимость bulk fallback. Unique validation, one-commit WAL и reopen regression пройдены.                                                                                         | ✅ закрыто — этап 9, 2026-09-09                                                 |
-   | `Q-06`  | Correctness-preserving UX + concurrency | Serializable validation намеренно abort-ит любую исходящую rw-антизависимость; это корректно, но может давать лишние `FG-40001`. Blind-write `GraphWriteView` требует отдельного предварительного tracked read, что легко пропустить пользователю.                                                                                                                                                                                                                             | До этапов 11/19 измерить abort rate, явно документировать read-before-write либо ввести tracked guard; dangerous-structure history добавлять только при доказанном выигрыше.                                                                                                                                                                                                                                  | ⬜ открыто                                                                      |
-   | `Q-07`  | Transaction semantics                   | `ReadCommitted` пока фиксирует один root на весь переданный `Program`, а refresh между top-level statements и GrynQL transaction statements отсутствуют. Анализатор также типизирует весь `Program` по начальному schema snapshot: DDL текущей программы ещё не видна последующему DML/SELECT. При явном `Transaction::execute` ошибка отдельного statement возвращается в `QueryResult`, но контракт abort/savepoint для уже staged изменений не утверждён.                   | Этап 11 обязан синхронизировать observable statement boundary, staged-schema visibility и поведение statement error/abort в `gql_spec`, Rust API и differential tests до объявления RC/TX surface завершённым. До этого автотранзакция атомарно не публикует программу с ошибкой, а смешанный DDL→DML внутри одного `Program` не объявляется поддержанным.                                                    | ⬜ открыто                                                                      |
+   | `Q-06`  | Correctness-preserving UX + concurrency | GQL point reads участвуют в SSI/FCW, однако измерение disjoint Serializable writers выявило aborts `0/16`, `1/32`, `37/64`, `101/128` при `1/2/4/8` writers. Основной остаток — конкуренция физического slot allocator/root merge, а не отсутствие tracked GQL read. Blind-write Rust view по-прежнему требует tracked read.                                                                                                                                                   | Этап 19 должен проверить раздельные reservation ranges/merge ownership тем же probe и только затем решать, нужен ли tracked guard или dangerous-structure history. Корректность текущего abort сохранена; лишнее ослабление validation запрещено.                                                                                                                                                             | ⬜ открыто — измерено этапом 11                                                 |
+   | `Q-07`  | Transaction semantics                   | Per-statement autocommit, statement-local Read Committed refresh, DDL→DML visibility, explicit `BEGIN/COMMIT/CANCEL`, persistent session и whole-transaction abort теперь имеют единый контракт.                                                                                                                                                                                                                                                                               | Parser/structural preflight → statement analysis → typed IR → execution проверены RAM/local/reopen; `Transaction::execute` отклоняет transaction/import statements до мутации.                                                                                                                                                                                                                                | ✅ закрыто — этап 11, 2026-09-25                                                |
    | `Q-08`  | Functionality + data model              | Этап 5 реализовал generation-aware `AtomTableMemberships`, но они дублировали class namespace из `RecordId = class:id` и делали class принадлежностью, а не identity. Историческая реализация удалена полностью.                                                                                                                                                                                                                                                               | A5–A16 ввели `ClassId`/`ClassSchema`, class-aware `RecordId`, global AtomStore и graph occurrence membership. `TableSchema`, `AtomTableMemberships`, system graph и compatibility selector отсутствуют; RAM/local/recovery и DDL/DML gates пройдены.                                                                                                                                                          | ✅ закрыто — этап 8.1, 2026-09-22                                               |
    | `Q-09`  | Functionality + UX                      | Mode 3 `Mutable` уже хранит origin/dirty state и явно передаёт только dirty graph-local topology/overlay в предоставленную вызывающим кодом транзакцию. Ошибка writer сохраняет dirty state, `Drop` не пишет. Пока отсутствует самостоятельная source-level операция, которая открывает новую транзакцию, обнаруживает изменение source после materialization origin и сама выполняет commit.                                                                                  | До публикации высокоуровневого mutable write-back surface добавить origin-aware conflict check и explicit commit поверх существующего delta writer. Конфликт или ошибка commit обязаны оставлять dirty state доступным для повторного решения; неявное изменение Base и flush из `Drop` запрещены.                                                                                                            | ⬜ открыто — low-level delta writer готов, source transaction/commit UX отложен |
    | `Q-10`  | Performance                             | Frame-IoRing QD32 измеримо выигрывает на sparse frontier, но production graph/property cursors пока не предоставляют доказуемое bounded lookahead-окно, поэтому router выбирает sync Direct.                                                                                                                                                                                                                                                                                   | На этапах 16–17 добавить окно только из реального physical cursor и повторить paired gate; эвристическое угадывание и пользовательский transport knob не добавлять.                                                                                                                                                                                                                                           | ⬜ открыто                                                                      |
@@ -386,6 +386,7 @@ types при необходимости расширяется общими ти
    | `Q-31b` | Graph-index correctness + performance   | Reachability/path draft смешивал BFL с landmarks, неверно применял GRAIL, не описывал FERRARI/CHAIN_COVER/PATTERN_CACHE bindings и использовал неadmissible landmark upper bound.                                                                                                                                                                                                                                                                                              | S3–S4 утвердили SCC condensation, Yes/No/Maybe fallback, exact section codecs, five algorithms, binding-row PATTERN_CACHE и directed ALT для compatible additive costs. Этап 25 реализует differential correctness и budgets.                                                                                                                                                                                 | 🟡 contract approved; implementation deferred to 25                             |
    | `Q-32`  | Schema correctness + UX                 | ALTER GRAPH, migration/validation boundary, revision race и scope-symmetric index actions не были определены.                                                                                                                                                                                                                                                                                                                                                                  | S4 утвердил atomic one-revision ALTER, bounded prevalidation, constrained migration, ALTER GRAPH и ON CLASS/ON GRAPH symmetry. A11/core admin и отдельный migration gate реализуют контракт.                                                                                                                                                                                                                  | 🟡 contract approved; implementation deferred                                   |
    | `Q-33`  | Import functionality + UX               | `QUARANTINE`, `EVENTS=ON`, `CHANGEFEED=ON`, `FILL_FACTOR`, `SORT_MEM` и `PARALLELISM` распознаются синтаксисом import, но намеренно не исполняются в GA-profile этапа 10.                                                                                                                                                                                                                                                                                                      | Анализатор возвращает typed unsupported до создания staging и writer lease. `QUARANTINE`/durable rejected-set и measured `SORT_MEM`/`PARALLELISM` принадлежат этапу 20; `FILL_FACTOR` требует отдельного performance gate; `CHANGEFEED=ON` — этапу 27; `EVENTS=ON` — этапу 29.                                                                                                                                | 🟡 contract approved; implementation deferred                                   |
+   | `Q-34`  | Query performance                       | Paired `--profile profiling` probe одно-statement `Datastore::execute("RETURN 1")` дал `1620,20 ns/op` для прежнего direct path и `1702,60 ns/op` для temporary-session driver: ratio `1,0509`, то есть на 0,09 процентного пункта выше gate `+5%`. Clone AST и лишняя result allocation уже удалены.                                                                                                                                                                          | По явному решению пользователя оставить текущую реализацию и оптимизировать позднее. На этапе 19 профилировать оставшиеся structural/session/control overhead, сохраняя transaction semantics; gate не считать пройденным до ratio `≤1,05` на повторяемом paired run.                                                                                                                                         | ⬜ открыто — допустимое отклонение принято 2026-09-25                           |
 
    Уточнение к `Q-16`/`Q-27` от 2026-09-23: последующее ASan/Miri/assembly-исследование
    подтвердило порчу до Direct I/O и эффективность инициализации окончательного frame in-place,
@@ -509,9 +510,9 @@ types при необходимости расширяется общими ти
    - [x] RAM/local, no-default/native-async correctness matrices;
    - [x] спецификации, AGENTS, отчёт и Graphify для исторического TABLE-среза.
 
-   `ALTER GRAPH`, advanced index kinds, DML, staged DDL→DML analysis и
-   statement abort/savepoint semantics не реализованы наперёд; последние две
-   границы остаются в `Q-07` и принадлежат этапу 11.
+   `ALTER GRAPH`, advanced index kinds и DML не были реализованы наперёд.
+   Исторические staged DDL→DML и statement abort/savepoint границы закрыты
+   этапом 11 и `Q-07`.
 
 8.1. **Возврат к graph-first модели атомов** — зависит от **8**.
    Отдельный dependency-ordered план и полный контракт:
@@ -560,8 +561,8 @@ types при необходимости расширяется общими ти
    - [x] RAM/local/recovery/index/fanout gate A15 и очистка старой модели A16;
    - [x] полный stage gate и перевод этапа в завершённое состояние.
 
-   Statement refresh, staged DDL→DML analysis и savepoint/abort semantics не
-   выполняются наперёд: они остаются в `Q-07` и этапе 11.
+   Statement refresh, staged DDL→DML analysis и savepoint/abort semantics были
+   намеренно оставлены этапу 11 и теперь закрыты вместе с `Q-07`.
 
 10. **BEGIN IMPORT** — зависит от **7, 9**.  
     ✅ **Завершён 2026-09-24.** Реализован атомарный COW import по
@@ -581,22 +582,36 @@ types при необходимости расширяется общими ти
     - [x] I10–I12: correctness, resource/performance gate и отчёт.
 
 11. **Транзакционные операторы GrynnQL** — зависит от **9, 10**.
-    Добавить явные `BEGIN/COMMIT/CANCEL`, isolation/read-only options, timeout и
-    multi-statement write execution поверх восстановленного на этапе 10 обычного
-    `Datastore::execute`. Выполнение внутри уже открытого `Transaction` запрещает
-    вложенные transaction statements.
+    ✅ **Завершён 2026-09-25.** Контракт и dependency-ordered шаги T0–T7 зафиксированы
+    в [`gql_stages_11_12_plan.md`](gql_stages_11_12_plan.md). Реализованы
+    per-statement autocommit, `BEGIN/COMMIT/CANCEL`, isolation/read-only,
+    `COMMIT WITH VALIDATION`, timeout/cancellation и persistent `GqlSession`.
+    `Q-07` закрыт; измеренный Q-06 остаётся этапу 19. Performance-отклонение
+    `+5,09%` принято пользователем и вынесено в `Q-34`. Evidence:
+    [`gql_transaction_stage_11_report.md`](reports/gql_transaction_stage_11_report.md).
+
+    - [x] T0: нормативная синхронизация, statuses и baseline;
+    - [x] T1–T3: transaction syntax, statement analysis и стабильный snapshot;
+    - [x] T4–T6: общий driver, persistent session, validation и cancellation;
+    - [x] T7: correctness/concurrency gates, измерение performance и закрытие `Q-07`.
 
 12. **Выражения и управляющий язык** — зависит от **10, 11**.
-    Завершить coercions, idioms, collections, subexpressions, built-ins, `IF/ELSE`,
-    loops, `TRY-CATCH`, `THROW` и `ASSERT`; подключить эти statements к import body
-    с приоритетом языкового `TRY/CATCH` над `ON VIOLATION`. Установить
-    depth/iteration/time budgets и проверять отмену на границах операторов.
+    ✅ **Завершён 2026-09-25.** Контракт и шаги E0–E7 находятся в
+    [`gql_stages_11_12_plan.md`](gql_stages_11_12_plan.md): expressions,
+    collections/idioms, статические built-ins, blocks/loops, `TRY/CATCH`,
+    `THROW`, `ASSERT INVARIANTS` и интеграция с Atomic Import. Evidence:
+    [`gql_control_stage_12_report.md`](reports/gql_control_stage_12_report.md).
+
+    - [x] E0–E1: contract matrix и expression core;
+    - [x] E2–E3: built-ins и control flow;
+    - [x] E4–E6: savepoints/errors/assertions/import;
+    - [x] E7: RAM/local/import/resource gate и отчёт.
 
 13. **Полный реляционный SELECT** — зависит от **6, 7, 12**.  
-    Реализовать joins/subqueries, aggregation, `GROUP`, `ORDER BY`, `START`, `LIMIT`, `FETCH`, `SPLIT`, `OMIT` и keyset cursors. Сохранить sync pull `RowCursor`; barrier-операторы используют ограниченную память и явный temporary spill.
+    Реализовать joins/subqueries, aggregation, `GROUP`, `ORDER BY`, `START`, `LIMIT`, `FETCH`, `SPLIT`, `OMIT` и keyset cursors. Сюда же принадлежат query subexpressions, `math::stddev/variance` и `array::group`. Сохранить sync pull `RowCursor`; barrier-операторы используют ограниченную память и явный temporary spill.
 
 14. **Rule/CBO optimizer и EXPLAIN** — зависит от **6, 7, 13**.  
-    Ввести deterministic rule passes, scan/index/join alternatives, statistics-based costs и degradation penalties. При отсутствии или устаревании индекса всегда доступен корректный scan. `EXPLAIN` показывает logical/physical plan, estimates, selected indexes, fallbacks и resource warnings.
+    Ввести deterministic rule passes, scan/index/join alternatives, statistics-based costs и degradation penalties. Утвердить исполнимый `DETERMINISTIC` mode поверх канонического plan/order. При отсутствии или устаревании индекса всегда доступен корректный scan. `EXPLAIN` показывает logical/physical plan, estimates, selected indexes, fallbacks и resource warnings.
 
 15. **Полный StandardPath MATCH** — зависит от **13, 14**.  
     Добавить OPTIONAL, aliases/joins, match modes, cardinality, inline labels/properties, directions, bounded variable paths, TRAIL/ACYCLIC/SIMPLE, path filters/objectives и shortest/weighted paths. Path explosion ограничивается budgets и предупреждениями планировщика.
@@ -605,7 +620,7 @@ types при необходимости расширяется общими ти
     Реализовать `ATOM`, HYPER, META, WITHIN, edge-as-endpoint, cross-level incidence, qualified refs и переходы во вложенные графы. `LevelPath` не смешивать с traversal path. На этом этапе допустим корректный scan без специализированного индекса.
 
 17. **Traversal VM** — зависит от **14, 16**.  
-    Реализовать отдельный от MATCH IR и VM: traverser, map/flat-map/filter, barriers, sack, path propagation, control flow и вызов существующих graph algorithms. Сначала однопоточный pull baseline; parallel execution добавлять только после профиля.
+    Реализовать отдельный от MATCH IR и VM: traverser, map/flat-map/filter, barriers, sack, path propagation, control flow и вызов существующих graph algorithms. На этом этапе утверждается исполнимый `FAST` mode. Сначала однопоточный pull baseline; parallel execution добавлять только после профиля.
 
 18. **Path и graph results** — зависит от **16, 17**.  
     Подключить `RETURN GRAPH`, `BUILD GRAPH`, path results и graph-return matrix. Публичные результаты содержат `RecordId`, `AtomRef`, `Path`, `GraphRef` или `MaterializedGraph`, никогда `DiskAtomRef`, page addresses или `StorageValue`. Результат не удерживает завершённый storage snapshot.
@@ -619,10 +634,10 @@ types при необходимости расширяется общими ти
     Реализовать durable job state для `CONCURRENTLY`, ограниченный `DEFER`, `REBUILD INDEX`, `INFO`, `KILL` и обслуживающих операций. После crash незавершённая сборка становится `stale`, а не молча `ready`.
 
 21. **Параметры, UDF и оставшийся язык** — зависит от **12, 20**.
-    Реализовать `DEFINE PARAM/FUNCTION`, closures, overload resolution, purity/security rules, recursion `MAXDEPTH`, object constructors и оставшиеся административные выражения.
+    Реализовать `DEFINE PARAM/FUNCTION`, closures, overload resolution, purity/security rules, recursion `MAXDEPTH`, object constructors и оставшиеся административные выражения. Этап владеет отложенными `SLEEP`, stateful regex/matcher и mutable collection helpers `push/pop/clear/add`; они не должны появляться как скрытый stage-12 fallback.
 
 22. **Analyzers и Fulltext** — зависит от **7, 20, 21**.
-    Реализовать tokenizer/filter pipeline, inverted index, BM25, highlights, transactional/deferred updates и bulk build. Проверить Unicode normalization, analyzer versioning и одинаковость incremental/bulk результатов.
+    Реализовать tokenizer/filter pipeline, inverted index, BM25, highlights, search built-ins, transactional/deferred updates и bulk build. Проверить Unicode normalization, analyzer versioning и одинаковость incremental/bulk результатов.
 
 23. **Vector indexes** — зависит от **7, 20, 21**.
     Последовательно реализовать HNSW, затем DiskANN, типы векторов, distances и KNN/ANN
@@ -631,7 +646,7 @@ types при необходимости расширяется общими ти
     recall/latency/memory/build/recovery gates; custom distance использует versioned pure UDF.
 
 24. **Geometry R-tree** — зависит от **7, 20**.
-    Реализовать geometry validation, STR bulk packing, spatial predicates, planner selectivity и exact post-filter после MBR lookup.
+    Реализовать geometry validation, STR bulk packing, geo built-ins, spatial predicates, planner selectivity и exact post-filter после MBR lookup.
 
 25. **Производные графовые индексы** — зависит от **16, 17, 20**.
     Реализовать EdgeEndpoint, Path, Reachability и Neighbourhood indexes. Проверить все пять

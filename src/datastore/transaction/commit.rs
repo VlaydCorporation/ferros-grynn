@@ -10,6 +10,22 @@ use crate::{
 };
 
 impl Transaction {
+	/// Revalidates the complete private root before the normal atomic commit.
+	///
+	/// # Errors
+	///
+	/// Returns a graph-family, normalized-state, conflict, persistence, or
+	/// publication failure without publishing a partial root.
+	pub fn commit_with_validation(mut self) -> FerrosGrynnResult<CommitResult> {
+		let graphs =
+			self.working.schema.graphs().map(|graph| graph.reference().clone()).collect::<Vec<_>>();
+		for graph in &graphs {
+			self.validate_graph_family(graph)?;
+		}
+		self.working.validate_full_import_state()?;
+		self.commit()
+	}
+
 	/// Validates and atomically publishes all transaction-private mutations.
 	///
 	/// # Errors

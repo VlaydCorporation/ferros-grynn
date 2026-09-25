@@ -18,54 +18,178 @@ pub fn execute_transaction(
 	variables: &Object,
 	settings: ParserSettings,
 ) -> FerrosGrynnResult<Vec<QueryResult>> {
-	let program = crate::gql::parse(source, settings)?;
-	if program
-		.statements
-		.iter()
-		.any(|statement| matches!(statement.kind, crate::syn::StatementKind::Import(_)))
-	{
+	execute_transaction_with_options(
+		transaction,
+		source,
+		variables,
+		crate::gql::QueryExecutionOptions {
+			parser_settings: settings,
+			..crate::gql::QueryExecutionOptions::default()
+		},
+	)
+}
+
+pub fn execute_transaction_with_options(
+	transaction: &mut Transaction,
+	source: &str,
+	variables: &Object,
+	options: crate::gql::QueryExecutionOptions,
+) -> FerrosGrynnResult<Vec<QueryResult>> {
+	let program = match crate::gql::parse(source, options.parser_settings) {
+		Ok(program) => program,
+		Err(error) => {
+			transaction.abort_gql();
+			return Err(error);
+		}
+	};
+	if program.statements.iter().any(|statement| {
+		matches!(
+			statement.kind,
+			crate::syn::StatementKind::Import(_)
+				| crate::syn::StatementKind::Begin(_)
+				| crate::syn::StatementKind::Commit(_)
+				| crate::syn::StatementKind::Cancel
+		)
+	}) {
+		transaction.abort_gql();
 		return Err(FerrosGrynnError::query_feature_not_supported(
-			"BEGIN IMPORT inside an open Transaction",
+			"transaction or import statement inside an open Transaction",
 		));
 	}
-	execute_parsed_transaction(transaction, source, &program, variables)
+	for statement in &program.statements {
+		if let Err(error) = crate::datastore::validate_control_structure(statement, 0, false) {
+			transaction.abort_gql();
+			return Err(error);
+		}
+	}
+	for name in variables.keys() {
+		if transaction.gql_bindings().contains_key(name) {
+			transaction.abort_gql();
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"Execute parameter `${name}` conflicts with a transaction binding."
+			)));
+		}
+	}
+	let mut bindings = transaction.gql_bindings().clone();
+	for (name, value) in variables {
+		bindings.insert(name.clone(), value.clone());
+	}
+	let mut results = Vec::with_capacity(program.statements.len());
+	for statement in &program.statements {
+		let started = std::time::Instant::now();
+		let let_name = match &statement.kind {
+			crate::syn::StatementKind::Let(statement) if statement.name.value.as_ref() != "_" => {
+				Some(statement.name.value.as_ref())
+			}
+			_ => None,
+		};
+		if let Some(name) = let_name
+			&& (transaction.gql_bindings().contains_key(name) || variables.contains_key(name))
+		{
+			let result = QueryResult {
+				kind: crate::gql::statement_kind(&statement.kind),
+				elapsed: started.elapsed(),
+				result: Err(FerrosGrynnError::invalid_argument(format!(
+					"Binding `${name}` is already declared in this scope."
+				))),
+			};
+			transaction.abort_gql();
+			results.push(result);
+			break;
+		}
+		let timeout = match crate::gql::resolve_timeout(statement.timeout.as_ref(), &bindings) {
+			Ok(timeout) => timeout,
+			Err(error) => {
+				transaction.abort_gql();
+				results.push(QueryResult {
+					kind: crate::gql::statement_kind(&statement.kind),
+					elapsed: started.elapsed(),
+					result: Err(error),
+				});
+				break;
+			}
+		};
+		let control = crate::gql::options::ExecutionControl::new(&options, timeout);
+		let execution = transaction.run_gql_statement(|transaction| {
+			execute_parsed_statement_with_bindings(
+				transaction,
+				source,
+				statement,
+				&mut bindings,
+				&control,
+			)
+		});
+		let mut result = match execution {
+			Ok(result) => result,
+			Err(error) => QueryResult {
+				kind: crate::gql::statement_kind(&statement.kind),
+				elapsed: started.elapsed(),
+				result: Err(error),
+			},
+		};
+		let failed = result.result.is_err();
+		if !failed && let Some(name) = let_name {
+			let value = bindings.get(name).cloned().unwrap_or(Value::None);
+			let mut transaction_bindings = transaction.gql_bindings().clone();
+			transaction_bindings.insert(name, value);
+			transaction.replace_gql_bindings(transaction_bindings);
+		}
+		result.elapsed = started.elapsed();
+		results.push(result);
+		if failed {
+			transaction.abort_gql();
+			break;
+		}
+	}
+	Ok(results)
 }
 
 /// Analyzes a parsed mutation program without executing it and returns the
-/// captured database commit timestamp.
-pub(crate) fn validate_parsed_transaction(
+/// logical program with its captured database commit timestamp.
+pub(crate) fn analyze_parsed_transaction(
 	transaction: &mut Transaction,
 	source: &str,
 	program: &Program,
 	variables: &Object,
-) -> FerrosGrynnResult<u64> {
+) -> FerrosGrynnResult<(LogicalProgram, u64)> {
 	let snapshot = transaction.query_snapshot()?;
 	let read = TransactionRead {
 		transaction,
 		snapshot,
 	};
-	analyze(program, source, &read, variables)?;
-	Ok(read.snapshot.commit_ts())
+	let logical = analyze(program, source, &read, variables)?;
+	Ok((logical, read.snapshot.commit_ts()))
 }
 
-/// Analyzes and executes an already parsed program within a transaction.
-///
-/// # Errors
-///
-/// Returns semantic, storage, or execution errors produced while analyzing or
-/// executing the program.
-pub fn execute_parsed_transaction(
+#[cfg(test)]
+pub(crate) fn execute_parsed_transaction_with_bindings(
 	transaction: &mut Transaction,
 	source: &str,
 	program: &Program,
-	variables: &Object,
+	bindings: &mut Object,
+	control: &crate::gql::options::ExecutionControl,
 ) -> FerrosGrynnResult<Vec<QueryResult>> {
 	let snapshot = transaction.query_snapshot()?;
 	let mut read = TransactionRead {
 		transaction,
 		snapshot,
 	};
-	execute_program(&mut read, source, program, variables)
+	execute_program(&mut read, source, program, bindings, control)
+}
+
+pub(crate) fn execute_parsed_statement_with_bindings(
+	transaction: &mut Transaction,
+	source: &str,
+	statement: &crate::syn::Statement,
+	bindings: &mut Object,
+	control: &crate::gql::options::ExecutionControl,
+) -> FerrosGrynnResult<QueryResult> {
+	let snapshot = transaction.query_snapshot()?;
+	let mut read = TransactionRead {
+		transaction,
+		snapshot,
+	};
+	execute_parsed_statement(&mut read, source, statement, bindings, control)
 }
 
 pub(super) struct TransactionRead<'a> {
@@ -103,6 +227,7 @@ impl QueryRead for TransactionRead<'_> {
 		= TransactionGraphView<'a>
 	where
 		Self: 'a;
+	type Savepoint = crate::datastore::TransactionSavepoint;
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot> {
 		Ok(Snapshot(self.snapshot.commit_ts()))
@@ -184,6 +309,23 @@ impl QueryRead for TransactionRead<'_> {
 		self.transaction.query_property_dictionary()
 	}
 
+	fn savepoint(&self) -> Self::Savepoint {
+		self.transaction.gql_savepoint()
+	}
+
+	fn restore_savepoint(&mut self, savepoint: Self::Savepoint) -> FerrosGrynnResult<()> {
+		self.transaction.restore_gql_savepoint(savepoint);
+		self.refresh_snapshot()
+	}
+
+	fn assert_invariants(
+		&mut self,
+		graph: Option<&GraphRef>,
+		detail_limit: usize,
+	) -> FerrosGrynnResult<usize> {
+		self.transaction.assert_invariants(graph, detail_limit)
+	}
+
 	fn execute_schema(&mut self, statement: &LogicalSchemaStatement) -> FerrosGrynnResult<Value> {
 		let value = execute_schema(self.transaction, &self.snapshot, statement)?;
 		self.refresh_snapshot()?;
@@ -195,10 +337,11 @@ impl QueryRead for TransactionRead<'_> {
 		statement: &LogicalDmlStatement,
 		slots: &[Value],
 		source: &str,
+		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
 		let snapshot = self.snapshot.clone();
 		let value = self.transaction.atomic_mutation(|transaction| {
-			execute_dml(transaction, &snapshot, statement, slots, source)
+			execute_dml(transaction, &snapshot, statement, slots, source, control)
 		})?;
 		self.refresh_snapshot()?;
 		Ok(value)
@@ -209,10 +352,11 @@ impl QueryRead for TransactionRead<'_> {
 		statement: &LogicalGraphDmlStatement,
 		slots: &[Value],
 		source: &str,
+		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
 		let snapshot = self.snapshot.clone();
 		let value = self.transaction.atomic_mutation(|transaction| {
-			execute_graph_dml(transaction, &snapshot, statement, slots, source)
+			execute_graph_dml(transaction, &snapshot, statement, slots, source, control)
 		})?;
 		self.refresh_snapshot()?;
 		Ok(value)
@@ -300,7 +444,8 @@ struct StorageCursor<'a> {
 }
 
 impl RowCursor for StorageCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
+		control.check()?;
 		let Some(row) = self.rows.next_row()? else {
 			return Ok(None);
 		};

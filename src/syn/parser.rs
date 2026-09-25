@@ -15,7 +15,7 @@ use super::{
 		cover,
 	},
 	lexer::{keywords, lex},
-	stmt::{Statement, StatementKind},
+	stmt::{Statement, StatementKind, TimeoutValue},
 	token::{Symbol, Token, TokenKind},
 };
 use crate::gql_status::{
@@ -123,10 +123,31 @@ impl Parser<'_> {
 	) -> FerrosGrynnResult<Statement> {
 		let start = self.current().span;
 		let kind = if self.consume_keyword(keywords::BEGIN).is_some() {
-			if self.consume_keyword(keywords::IMPORT).is_none() {
-				return Err(self.unsupported("BEGIN transaction", start));
+			if self.consume_keyword(keywords::IMPORT).is_some() {
+				StatementKind::Import(context.run(|context| self.import_statement(context)).await?)
+			} else {
+				StatementKind::Begin(self.begin_statement()?)
 			}
-			StatementKind::Import(context.run(|context| self.import_statement(context)).await?)
+		} else if self.consume_keyword(keywords::COMMIT).is_some() {
+			StatementKind::Commit(self.commit_statement()?)
+		} else if self.consume_keyword(keywords::CANCEL).is_some() {
+			StatementKind::Cancel
+		} else if self.consume_keyword(keywords::IF).is_some() {
+			StatementKind::If(context.run(|context| self.if_statement(context)).await?)
+		} else if self.consume_keyword(keywords::FOR).is_some() {
+			StatementKind::For(context.run(|context| self.for_statement(context)).await?)
+		} else if self.consume_keyword(keywords::WHILE).is_some() {
+			StatementKind::While(context.run(|context| self.while_statement(context)).await?)
+		} else if self.consume_keyword(keywords::BREAK).is_some() {
+			StatementKind::Break
+		} else if self.consume_keyword(keywords::CONTINUE).is_some() {
+			StatementKind::Continue
+		} else if self.consume_keyword(keywords::TRY).is_some() {
+			StatementKind::Try(context.run(|context| self.try_statement(context)).await?)
+		} else if self.consume_keyword(keywords::THROW).is_some() {
+			StatementKind::Throw(context.run(|context| self.expression(context, 0, 1, 0)).await?)
+		} else if self.consume_keyword(keywords::ASSERT).is_some() {
+			StatementKind::AssertInvariants(self.assert_invariants_statement()?)
 		} else if self.consume_keyword(keywords::DEFINE).is_some() {
 			if self.consume_keyword(keywords::GRAPH).is_some() {
 				StatementKind::DefineGraph(self.define_graph_statement()?)
@@ -175,13 +196,76 @@ impl Parser<'_> {
 		} else if let Some(feature) = self.unsupported_statement() {
 			return Err(self.unsupported(feature, start));
 		} else {
-			return Err(self.syntax("Expected a supported GrynQL statement.", start));
+			StatementKind::Expression(
+				context.run(|context| self.expression(context, 0, 1, 0)).await?,
+			)
+		};
+		let timeout = if self.consume_keyword(keywords::TIMEOUT).is_some() {
+			if !matches!(
+				kind,
+				StatementKind::Create(_)
+					| StatementKind::Update(_)
+					| StatementKind::Upsert(_)
+					| StatementKind::Delete(_)
+					| StatementKind::Attach(_)
+					| StatementKind::Detach(_)
+					| StatementKind::Relate(_)
+					| StatementKind::Select(_)
+					| StatementKind::Match(_)
+			) {
+				return Err(
+					self.syntax("TIMEOUT is not valid for this statement.", self.previous_span())
+				);
+			}
+			Some(self.timeout_value()?)
+		} else {
+			None
 		};
 		let end = self.previous_span();
 		Ok(Statement {
 			kind,
 			span: cover(start, end),
+			timeout,
 		})
+	}
+
+	fn timeout_value(&mut self) -> FerrosGrynnResult<TimeoutValue> {
+		let token = self.tokens.next();
+		match token.kind {
+			TokenKind::Parameter(value) => Ok(TimeoutValue::Parameter(Identifier {
+				value,
+				quoted: false,
+				span: token.span,
+			})),
+			TokenKind::Number(number) => {
+				let unit = self.tokens.next();
+				let Token {
+					kind,
+					span: unit_span,
+					gap_before,
+				} = unit;
+				let TokenKind::Word {
+					value: unit,
+					quoted: false,
+				} = kind
+				else {
+					return Err(self.syntax("Expected a duration unit after TIMEOUT.", unit_span));
+				};
+				if gap_before {
+					return Err(
+						self.syntax("Duration literals cannot contain whitespace.", unit_span)
+					);
+				}
+				Ok(TimeoutValue::Literal {
+					value: format!("{number}{unit}").into_boxed_str(),
+					span: cover(token.span, unit_span),
+				})
+			}
+			_ => {
+				Err(self
+					.syntax("Expected a duration literal or parameter after TIMEOUT.", token.span))
+			}
+		}
 	}
 
 	pub(in crate::syn) async fn expression(
@@ -221,6 +305,29 @@ impl Parser<'_> {
 				};
 				continue;
 			}
+			if self.at_symbol(Symbol::Range) && minimum_binding_power <= 12 {
+				self.tokens.next();
+				let inclusive_end = self.consume_symbol(Symbol::Equal).is_some();
+				let end = if self.expression_terminator() {
+					None
+				} else {
+					Some(Box::new(
+						context
+							.run(|context| self.expression(context, 13, depth + 1, object_depth))
+							.await?,
+					))
+				};
+				let end_span = end.as_ref().map_or(self.previous_span(), |end| end.span);
+				left = Expr {
+					span: cover(left.span, end_span),
+					kind: ExprKind::Range {
+						start: Some(Box::new(left)),
+						end,
+						inclusive_end,
+					},
+				};
+				continue;
+			}
 			let Some((operator, left_bp, right_bp, consumed)) = self.binary_operator() else {
 				break;
 			};
@@ -254,6 +361,27 @@ impl Parser<'_> {
 	) -> FerrosGrynnResult<Expr> {
 		let token = self.tokens.next();
 		match token.kind {
+			TokenKind::Symbol(Symbol::Range) => {
+				let inclusive_end = self.consume_symbol(Symbol::Equal).is_some();
+				let end = if self.expression_terminator() {
+					None
+				} else {
+					Some(Box::new(
+						context
+							.run(|context| self.expression(context, 13, depth + 1, object_depth))
+							.await?,
+					))
+				};
+				let end_span = end.as_ref().map_or(token.span, |end| end.span);
+				Ok(Expr {
+					kind: ExprKind::Range {
+						start: None,
+						end,
+						inclusive_end,
+					},
+					span: cover(token.span, end_span),
+				})
+			}
 			TokenKind::Number(value) => Ok(Expr {
 				kind: ExprKind::Literal(Literal::Number(value)),
 				span: token.span,
@@ -301,6 +429,45 @@ impl Parser<'_> {
 			TokenKind::Word {
 				value,
 				quoted,
+			} if !quoted && value.eq_ignore_ascii_case(keywords::IF) => {
+				self.if_expression(context, token.span, depth, object_depth).await
+			}
+			TokenKind::Word {
+				value,
+				quoted,
+			} if !quoted && value.eq_ignore_ascii_case(keywords::CASE) => {
+				self.case_expression(context, token.span, depth, object_depth).await
+			}
+			TokenKind::Word {
+				value,
+				quoted,
+			} if !quoted
+				&& value.eq_ignore_ascii_case(keywords::SET)
+				&& self.at_symbol(Symbol::LeftBracket) =>
+			{
+				let open = self.tokens.next();
+				let mut values = Vec::new();
+				if !self.at_symbol(Symbol::RightBracket) {
+					loop {
+						values.push(
+							context
+								.run(|context| self.expression(context, 0, depth + 1, object_depth))
+								.await?,
+						);
+						if self.consume_symbol(Symbol::Comma).is_none() {
+							break;
+						}
+					}
+				}
+				let close = self.close(Symbol::RightBracket, open.span, "`]`")?;
+				Ok(Expr {
+					kind: ExprKind::Set(values),
+					span: cover(token.span, close.span),
+				})
+			}
+			TokenKind::Word {
+				value,
+				quoted,
 			} if !quoted && value.eq_ignore_ascii_case(keywords::NOT) => {
 				self.unary(context, token.span, UnaryOperator::Not, depth, object_depth).await
 			}
@@ -319,7 +486,7 @@ impl Parser<'_> {
 				self.unary(context, token.span, UnaryOperator::Not, depth, object_depth).await
 			}
 			TokenKind::Symbol(Symbol::DoubleBang) => {
-				self.unary(context, token.span, UnaryOperator::Assert, depth, object_depth).await
+				self.unary(context, token.span, UnaryOperator::Truthy, depth, object_depth).await
 			}
 			TokenKind::Symbol(Symbol::Minus) => {
 				self.unary(context, token.span, UnaryOperator::Negate, depth, object_depth).await
@@ -451,10 +618,25 @@ impl Parser<'_> {
 	) -> FerrosGrynnResult<Option<Expr>> {
 		let null_safe = if self.consume_symbol(Symbol::QuestionDot).is_some() {
 			true
-		} else if self.consume_symbol(Symbol::Dot).is_some() {
+		} else if self.consume_symbol(Symbol::Dot).is_some()
+			|| self.consume_symbol(Symbol::DoubleColon).is_some()
+		{
 			false
 		} else {
 			if let Some(open) = self.consume_symbol(Symbol::LeftBracket) {
+				if self.consume_keyword(keywords::WHERE).is_some() {
+					let predicate = context
+						.run(|context| self.expression(context, 0, depth + 1, object_depth))
+						.await?;
+					let close = self.close(Symbol::RightBracket, open.span, "`]`")?;
+					return Ok(Some(Expr {
+						span: cover(base.span, close.span),
+						kind: ExprKind::Filter {
+							base: Box::new(base),
+							predicate: Box::new(predicate),
+						},
+					}));
+				}
 				let index = context
 					.run(|context| self.expression(context, 0, depth + 1, object_depth))
 					.await?;
@@ -467,6 +649,18 @@ impl Parser<'_> {
 					},
 				}));
 			}
+			let type_argument = if self.at_symbol(Symbol::Less)
+				&& matches!(self.tokens.peek(1).kind, TokenKind::Word { .. })
+				&& matches!(self.tokens.peek(2).kind, TokenKind::Symbol(Symbol::Greater))
+				&& matches!(self.tokens.peek(3).kind, TokenKind::Symbol(Symbol::LeftParen))
+			{
+				self.tokens.next();
+				let argument = self.type_name()?;
+				self.tokens.next();
+				Some(argument)
+			} else {
+				None
+			};
 			if let Some(open) = self.consume_symbol(Symbol::LeftParen) {
 				let mut arguments = Vec::new();
 				if !self.at_symbol(Symbol::RightParen) {
@@ -486,12 +680,43 @@ impl Parser<'_> {
 					span: cover(base.span, close.span),
 					kind: ExprKind::Call {
 						callee: Box::new(base),
+						type_argument,
 						arguments,
 					},
 				}));
 			}
+			if type_argument.is_some() {
+				return Err(self.syntax(
+					"A generic argument must be followed by a call.",
+					self.current().span,
+				));
+			}
 			return Ok(None);
 		};
+		if self.at_symbol(Symbol::LeftBrace) {
+			if null_safe {
+				return Err(self.syntax(
+					"Null-safe destructuring is not supported; apply `?.` to each field.",
+					self.current().span,
+				));
+			}
+			let open = self.tokens.next();
+			let mut fields = Vec::new();
+			loop {
+				fields.push(self.identifier()?);
+				if self.consume_symbol(Symbol::Comma).is_none() {
+					break;
+				}
+			}
+			let close = self.close(Symbol::RightBrace, open.span, "`}`")?;
+			return Ok(Some(Expr {
+				span: cover(base.span, close.span),
+				kind: ExprKind::Destructure {
+					base: Box::new(base),
+					fields,
+				},
+			}));
+		}
 		let field = self.identifier()?;
 		Ok(Some(Expr {
 			span: cover(base.span, field.span),
@@ -514,9 +739,9 @@ impl Parser<'_> {
 			Some(Symbol::Elvis) => (BinaryOperator::Elvis, 3, 4, 1),
 			Some(Symbol::Or) => (BinaryOperator::Or, 5, 6, 1),
 			Some(Symbol::And) => (BinaryOperator::And, 7, 8, 1),
-			Some(Symbol::Equal | Symbol::QuestionEqual | Symbol::StarEqual) => {
-				(BinaryOperator::Equal, 9, 10, 1)
-			}
+			Some(Symbol::Equal) => (BinaryOperator::Equal, 9, 10, 1),
+			Some(Symbol::QuestionEqual) => (BinaryOperator::AnyEqual, 9, 10, 1),
+			Some(Symbol::StarEqual) => (BinaryOperator::AllEqual, 9, 10, 1),
 			Some(Symbol::NotEqual) => (BinaryOperator::NotEqual, 9, 10, 1),
 			Some(Symbol::Less) => (BinaryOperator::Less, 11, 12, 1),
 			Some(Symbol::LessOrEqual) => (BinaryOperator::LessOrEqual, 11, 12, 1),
@@ -532,6 +757,13 @@ impl Parser<'_> {
 			_ if self.at_keyword(keywords::AND) => (BinaryOperator::And, 7, 8, 1),
 			_ if self.at_keyword(keywords::IS) => (BinaryOperator::Is, 9, 10, 1),
 			_ if self.at_keyword(keywords::IN) => (BinaryOperator::In, 9, 10, 1),
+			_ if self.at_keyword(keywords::ALLIN) => (BinaryOperator::AllIn, 9, 10, 1),
+			_ if self.at_keyword(keywords::ANYIN) => (BinaryOperator::AnyIn, 9, 10, 1),
+			_ if self.at_keyword(keywords::NONEIN) => (BinaryOperator::NoneIn, 9, 10, 1),
+			_ if self.at_keyword(keywords::CONTAINS) => (BinaryOperator::Contains, 11, 12, 1),
+			_ if self.at_keyword(keywords::CONTAINSNOT) => (BinaryOperator::ContainsNot, 11, 12, 1),
+			_ if self.at_keyword(keywords::CONTAINSANY) => (BinaryOperator::ContainsAny, 11, 12, 1),
+			_ if self.at_keyword(keywords::CONTAINSALL) => (BinaryOperator::ContainsAll, 11, 12, 1),
 			_ if self.at_keyword(keywords::NOT) && self.peek_keyword(1, keywords::IS) => {
 				(BinaryOperator::NotIs, 9, 10, 2)
 			}
@@ -639,6 +871,25 @@ impl Parser<'_> {
 		matches!(self.current().kind, TokenKind::Eof)
 	}
 
+	fn expression_terminator(&self) -> bool {
+		self.at_eof()
+			|| matches!(
+				self.current().kind,
+				TokenKind::Symbol(
+					Symbol::Comma
+						| Symbol::Semicolon
+						| Symbol::LeftBrace
+						| Symbol::RightParen
+						| Symbol::RightBracket
+						| Symbol::RightBrace
+				)
+			)
+			|| self.at_keyword(keywords::THEN)
+			|| self.at_keyword(keywords::ELSE)
+			|| self.at_keyword(keywords::END)
+			|| self.at_keyword(keywords::WHEN)
+	}
+
 	pub(in crate::syn) fn current(&self) -> &Token {
 		self.tokens.peek(0)
 	}
@@ -690,11 +941,14 @@ mod tests {
 	use super::parse;
 	use crate::syn::{
 		BinaryOperator,
+		ExecutionModeName,
 		ExprKind,
 		MatchDirection,
 		MatchSelector,
 		ParserSettings,
 		StatementKind,
+		TimeoutValue,
+		TransactionIsolationName,
 	};
 
 	#[test]
@@ -727,9 +981,10 @@ mod tests {
 
 	#[test]
 	fn reports_unsupported_statement_and_unclosed_delimiter() {
-		let unsupported = parse("BEGIN", ParserSettings::default())
-			.expect_err("transaction statements belong to stage 11");
-		assert_eq!(unsupported.status().code().to_string(), "FG-50F03");
+		let transaction = parse("BEGIN; COMMIT;", ParserSettings::default())
+			.expect("transaction statements belong to the executable stage-11 profile");
+		assert!(matches!(transaction.statements[0].kind, StatementKind::Begin(_)));
+		assert!(matches!(transaction.statements[1].kind, StatementKind::Commit(_)));
 		let relate = parse(
 			"RELATE (person:alice)-[friendship:known LABEL Friend]->(person:bob) IN GRAPH social",
 			ParserSettings::default(),
@@ -741,6 +996,53 @@ mod tests {
 			parse("RETURN [1, 2", ParserSettings::default()).expect_err("array is not closed");
 		assert_eq!(unclosed.status().code().to_string(), "FG-42001");
 		assert_eq!(unclosed.status().diagnostic().related_locations().len(), 1);
+	}
+
+	#[test]
+	fn parses_transaction_options_and_statement_timeout() {
+		let program = parse(
+			"BEGIN ISOLATION LEVEL SNAPSHOT READ ONLY EXECUTION MODE BEST_EFFORT; SELECT * FROM \
+			 person TIMEOUT 25ms; COMMIT WITH VALIDATION;",
+			ParserSettings::default(),
+		)
+		.expect("stage-11 transaction syntax parses");
+		let StatementKind::Begin(begin) = &program.statements[0].kind else {
+			panic!("expected BEGIN");
+		};
+		assert_eq!(begin.isolation, TransactionIsolationName::Snapshot);
+		assert!(begin.read_only);
+		assert_eq!(begin.execution_mode, ExecutionModeName::BestEffort);
+		assert!(matches!(
+			program.statements[1].timeout,
+			Some(TimeoutValue::Literal {
+				ref value,
+				..
+			}) if value.as_ref() == "25ms"
+		));
+		let StatementKind::Commit(commit) = &program.statements[2].kind else {
+			panic!("expected COMMIT");
+		};
+		assert!(commit.full_validation);
+	}
+
+	#[test]
+	fn parses_control_flow_and_assertion_surface() {
+		let program = parse(
+			"IF true { 1; } ELSE { 2; }; FOR $x IN 1..=2 { $x; }; WHILE (false) { BREAK; }; TRY { \
+			 THROW 'boom'; } CATCH |$error| { $error.code; }; ASSERT INVARIANTS FOR GRAPH social \
+			 REPORT 3;",
+			ParserSettings::default(),
+		)
+		.expect("stage-12 control syntax parses");
+		assert!(matches!(program.statements[0].kind, StatementKind::If(_)));
+		assert!(matches!(program.statements[1].kind, StatementKind::For(_)));
+		assert!(matches!(program.statements[2].kind, StatementKind::While(_)));
+		assert!(matches!(program.statements[3].kind, StatementKind::Try(_)));
+		let StatementKind::AssertInvariants(assertion) = &program.statements[4].kind else {
+			panic!("expected ASSERT INVARIANTS");
+		};
+		assert_eq!(assertion.graph.as_ref().map(|graph| graph.value.as_ref()), Some("social"));
+		assert_eq!(assertion.report, Some(3));
 	}
 
 	#[test]

@@ -22,6 +22,8 @@ mod options;
 mod root;
 /// Versioned class and graph definitions.
 mod schema;
+/// Persistent GrynnQL statement driver.
+mod session;
 /// In-memory database owner and commit serialization.
 mod store;
 /// Snapshot-isolated reads, mutations, and commit validation.
@@ -66,7 +68,7 @@ pub use options::{
 	TransactionAccess,
 	TransactionOptions,
 };
-pub(crate) use root::DatabaseRoot;
+pub(crate) use root::{DatabaseRoot, InvariantViolationReport};
 pub use schema::{
 	ClassField,
 	ClassId,
@@ -85,6 +87,8 @@ pub use schema::{
 	SystemIndex,
 	SystemIndexKind,
 };
+pub use session::GqlSession;
+pub(crate) use session::validate_control_structure;
 pub use store::Datastore;
 pub use transaction::{AtomSnapshot, CommitResult, Transaction, TransactionGraphView};
 pub(crate) use transaction::{
@@ -93,4 +97,5 @@ pub(crate) use transaction::{
 	QueryStorageRow,
 	ScalarComparison,
 	ScalarIndexConstraint,
+	TransactionSavepoint,
 };

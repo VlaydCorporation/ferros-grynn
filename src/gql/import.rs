@@ -5,7 +5,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use super::{QueryResult, QueryStatementKind, execute_parsed_transaction};
+use super::{ExecutionControl, QueryResult, QueryStatementKind};
 use crate::{
 	datastore::{
 		Datastore,
@@ -53,7 +53,9 @@ pub fn execute_import(
 	source: &str,
 	statement: &ImportStatement,
 	variables: &Object,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<QueryResult> {
+	control.check()?;
 	let started = Instant::now();
 	let options = import_options(&statement.options, statement.full_validation, source)?;
 	let graph = resolve_graph(store, statement.graph.as_ref(), variables, source)?;
@@ -63,33 +65,26 @@ pub fn execute_import(
 		span: import_graph_span(statement.graph.as_ref()),
 	});
 	let program = normalize_program(statement, graph_identifier.as_ref(), source)?;
+	let timeouts = program
+		.statements
+		.iter()
+		.map(|statement| super::resolve_timeout(statement.timeout.as_ref(), variables))
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 
 	let mut preflight = store.begin_with(TransactionOptions::new(
 		IsolationLevel::Serializable,
 		TransactionAccess::ReadOnly,
 	));
-	let expected_commit_ts =
-		super::execution::validate_parsed_transaction(&mut preflight, source, &program, variables)?;
+	let (logical, expected_commit_ts) =
+		super::execution::analyze_parsed_transaction(&mut preflight, source, &program, variables)?;
 	drop(preflight);
+	control.check()?;
 
 	let result = store
 		.import_at(options, Some(expected_commit_ts), graph.as_ref().map(GraphRef::id), |session| {
-			for statement in &program.statements {
-				session.apply_item(|transaction| {
-					let item = Program {
-						statements: vec![statement.clone()],
-					};
-					let mut results =
-						execute_parsed_transaction(transaction, source, &item, variables)?;
-					let result = results.pop().ok_or_else(|| {
-						FerrosGrynnError::invalid_argument(
-							"an import item produced no execution result",
-						)
-					})?;
-					result.result.map(|_outcome| ())
-				})?;
-			}
-			Ok(())
+			super::execution::execute_import_program(
+				session, source, &logical, variables, control, &timeouts,
+			)
 		})
 		.map(report_value)
 		.map(Outcome::success);
@@ -341,7 +336,36 @@ fn normalize_statement(
 			)?;
 			normalize_return(&mut statement.returning, source, statement_span)?;
 		}
+		StatementKind::If(statement) => {
+			for (_condition, block) in &mut statement.branches {
+				normalize_block(block, default_graph, source)?;
+			}
+			if let Some(block) = &mut statement.else_block {
+				normalize_block(block, default_graph, source)?;
+			}
+		}
+		StatementKind::For(statement) => {
+			normalize_block(&mut statement.body, default_graph, source)?;
+		}
+		StatementKind::Try(statement) => {
+			normalize_block(&mut statement.body, default_graph, source)?;
+			if let Some(catch) = &mut statement.catch {
+				normalize_block(&mut catch.body, default_graph, source)?;
+			}
+		}
+		StatementKind::Throw(_) | StatementKind::Break | StatementKind::Continue => {}
 		_ => return Err(unsupported(source, statement.span, "statement inside BEGIN IMPORT")),
+	}
+	Ok(())
+}
+
+fn normalize_block(
+	block: &mut crate::syn::Block,
+	default_graph: Option<&Identifier>,
+	source: &str,
+) -> FerrosGrynnResult<()> {
+	for statement in &mut block.statements {
+		normalize_statement(statement, default_graph, source)?;
 	}
 	Ok(())
 }

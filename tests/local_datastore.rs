@@ -142,6 +142,53 @@ mod tests {
 	}
 
 	#[test]
+	fn gql_transaction_and_control_state_survive_reopen() {
+		let directory = LocalTestDirectory::new();
+		let options = local_options();
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut session = store.session();
+		assert!(session.execute("BEGIN;", &Object::new()).unwrap()[0].result.is_ok());
+		let setup = session
+			.execute(
+				"DEFINE CLASS person TYPE NODE; DEFINE FIELD version ON CLASS person TYPE int; \
+				 CREATE person:alice SET version = 1;",
+				&Object::new(),
+			)
+			.unwrap();
+		assert!(setup.iter().all(|result| result.result.is_ok()));
+		let caught = session
+			.execute(
+				"TRY { UPDATE person:alice SET version = 2; THROW 'rollback'; } CATCH |$e| { \
+				 $e.message; }; ASSERT INVARIANTS;",
+				&Object::new(),
+			)
+			.unwrap();
+		assert_eq!(caught[0].result.as_ref().unwrap().value(), &Value::from("rollback"));
+		assert!(caught[1].result.is_ok());
+		assert!(
+			session.execute("COMMIT WITH VALIDATION;", &Object::new()).unwrap()[0].result.is_ok()
+		);
+		drop(session);
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let rows =
+			reopened.execute("SELECT VALUE version FROM person:alice;", &Object::new()).unwrap();
+		let Value::Array(values) = rows[0].result.as_ref().unwrap().value() else {
+			panic!("SELECT VALUE must return an array");
+		};
+		assert_eq!(values.as_slice(), &[Value::from(1_i64)]);
+		assert_eq!(
+			reopened.execute("FOR $x IN 1..=3 { $x * 2; };", &Object::new()).unwrap()[0]
+				.result
+				.as_ref()
+				.unwrap()
+				.value(),
+			&Value::from(6_i64)
+		);
+	}
+
+	#[test]
 	fn atomic_import_streams_every_index_family_and_reopens() {
 		let directory = LocalTestDirectory::new();
 		let options = local_options();

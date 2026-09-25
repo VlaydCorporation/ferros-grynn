@@ -38,10 +38,12 @@ pub(super) fn execute_dml(
 	statement: &LogicalDmlStatement,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	let dictionary = transaction.query_property_dictionary();
 	let mut candidates = Vec::new();
 	for (target_index, target) in statement.targets.iter().enumerate() {
+		control.check()?;
 		collect_dml_candidates(
 			transaction,
 			snapshot,
@@ -53,10 +55,12 @@ pub(super) fn execute_dml(
 			source,
 			&dictionary,
 			&mut candidates,
+			control,
 		)?;
 	}
 	let mut unique_targets = BTreeSet::new();
 	for candidate in &candidates {
+		control.check()?;
 		if !unique_targets.insert(candidate.record_id.clone()) {
 			return Err(FerrosGrynnError::invalid_argument(format!(
 				"DML target '{}' resolves more than once in one statement.",
@@ -66,7 +70,7 @@ pub(super) fn execute_dml(
 	}
 	for candidate in &candidates {
 		let target = &statement.targets[candidate.target];
-		if !expect_matches(target.expect.as_ref(), candidate, slots, source)? {
+		if !expect_matches(target.expect.as_ref(), candidate, slots, source, control)? {
 			return Err(FerrosGrynnError::condition_failed(candidate.record_id.to_string()));
 		}
 	}
@@ -77,6 +81,7 @@ pub(super) fn execute_dml(
 		.is_some_and(|target| matches!(target.returning, LogicalDmlReturn::None));
 	let mut output = Array::new(Vec::new());
 	for candidate in candidates {
+		control.check()?;
 		let target = &statement.targets[candidate.target];
 		let schema = transaction.query_class(snapshot, &target.class)?;
 		let affected = candidate.exists()
@@ -90,6 +95,7 @@ pub(super) fn execute_dml(
 			slots,
 			source,
 			&dictionary,
+			control,
 		)?;
 		if affected
 			&& !returns_none
@@ -100,6 +106,7 @@ pub(super) fn execute_dml(
 				after.as_ref(),
 				slots,
 				source,
+				control,
 			)? {
 			output.push(value);
 		}
@@ -126,6 +133,7 @@ fn collect_dml_candidates(
 	source: &str,
 	dictionary: &PropertyDictionary,
 	output: &mut Vec<DmlCandidate>,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<()> {
 	match &target.selector {
 		LogicalDmlSelector::Class if kind == LogicalDmlKind::Create => {
@@ -137,6 +145,7 @@ fn collect_dml_candidates(
 		}
 		LogicalDmlSelector::Range(count) => {
 			for _ in 0..*count {
+				control.check()?;
 				output.push(missing_candidate(
 					target_index,
 					generated_record_id(&target.class)?,
@@ -145,8 +154,10 @@ fn collect_dml_candidates(
 			}
 		}
 		LogicalDmlSelector::Record(key) => {
-			let record_id =
-				RecordId::from_value(target.class.as_ref(), eval(key, None, slots, source, None)?)?;
+			let record_id = RecordId::from_value(
+				target.class.as_ref(),
+				eval(key, None, slots, source, None, Some(control))?,
+			)?;
 			let row = transaction.query_point(snapshot, &record_id, graph)?;
 			if graph.is_some()
 				&& row.is_none()
@@ -162,7 +173,7 @@ fn collect_dml_candidates(
 				None => missing_candidate(target_index, record_id, &target.schema),
 			};
 			if candidate.exists() {
-				if filter_matches(target.filter.as_ref(), &candidate.row, slots, source)? {
+				if filter_matches(target.filter.as_ref(), &candidate.row, slots, source, control)? {
 					output.push(candidate);
 				}
 			} else if target.filter.is_none() {
@@ -173,8 +184,9 @@ fn collect_dml_candidates(
 			let mut cursor = transaction.query_row_cursor(snapshot, &target.class, &[], graph)?;
 			let start_len = output.len();
 			while let Some(row) = cursor.next_row()? {
+				control.check()?;
 				let candidate = storage_candidate(target_index, row, &target.schema, dictionary)?;
-				if filter_matches(target.filter.as_ref(), &candidate.row, slots, source)? {
+				if filter_matches(target.filter.as_ref(), &candidate.row, slots, source, control)? {
 					output.push(candidate);
 				}
 			}
@@ -245,9 +257,10 @@ fn filter_matches(
 	row: &Row,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<bool> {
 	filter.map_or(Ok(true), |filter| {
-		eval(filter, Some(row), slots, source, None).map(|value| value.is_truthy())
+		eval(filter, Some(row), slots, source, None, Some(control)).map(|value| value.is_truthy())
 	})
 }
 
@@ -256,12 +269,13 @@ fn expect_matches(
 	candidate: &DmlCandidate,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<bool> {
 	match expect {
 		None => Ok(true),
 		Some(LogicalExpect::Exists(expected)) => Ok(candidate.exists() == *expected),
 		Some(LogicalExpect::Predicate(predicate)) => {
-			eval(predicate, Some(&candidate.row), slots, source, None)
+			eval(predicate, Some(&candidate.row), slots, source, None, Some(control))
 				.map(|value| value.is_truthy())
 		}
 	}
@@ -280,6 +294,7 @@ fn apply_dml_candidate(
 	slots: &[Value],
 	source: &str,
 	dictionary: &PropertyDictionary,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Option<Object>> {
 	let kind = statement.kind;
 	let exists = candidate.exists();
@@ -307,6 +322,7 @@ fn apply_dml_candidate(
 			slots,
 			source,
 			dictionary,
+			control,
 		)
 		.map(Some);
 	}
@@ -316,7 +332,7 @@ fn apply_dml_candidate(
 	} else {
 		Object::new()
 	};
-	apply_dml_data(target.data.as_ref(), &candidate.row, slots, source, &mut after)?;
+	apply_dml_data(target.data.as_ref(), &candidate.row, slots, source, &mut after, control)?;
 	after.insert("id", Value::Record(Box::new(candidate.record_id.clone())));
 	validate_dml_object(schema, &after)?;
 	if exists {
@@ -335,17 +351,18 @@ pub(super) fn apply_dml_data(
 	slots: &[Value],
 	source: &str,
 	image: &mut Object,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<()> {
 	let Some(data) = data else {
 		return Ok(());
 	};
 	match data {
 		LogicalDmlData::Content(value) => {
-			*image = eval_object(value, row, slots, source)?;
+			*image = eval_object(value, row, slots, source, control)?;
 			image.remove("id");
 		}
 		LogicalDmlData::Replace(value) => {
-			let replacement = eval_object(value, row, slots, source)?;
+			let replacement = eval_object(value, row, slots, source, control)?;
 			if replacement.contains_key("id") {
 				return Err(FerrosGrynnError::invalid_argument(
 					"REPLACE cannot change the implicit read-only `id` field.",
@@ -354,7 +371,8 @@ pub(super) fn apply_dml_data(
 			*image = replacement;
 		}
 		LogicalDmlData::Merge(value) => {
-			for (name, value) in eval_object(value, row, slots, source)? {
+			for (name, value) in eval_object(value, row, slots, source, control)? {
+				control.check()?;
 				if name.as_str().eq_ignore_ascii_case("id") {
 					return Err(FerrosGrynnError::invalid_argument(
 						"MERGE cannot change the implicit read-only `id` field.",
@@ -364,7 +382,8 @@ pub(super) fn apply_dml_data(
 			}
 		}
 		LogicalDmlData::Patch(value) => {
-			for (name, value) in eval_object(value, row, slots, source)? {
+			for (name, value) in eval_object(value, row, slots, source, control)? {
+				control.check()?;
 				if name.as_str().eq_ignore_ascii_case("id") {
 					return Err(FerrosGrynnError::invalid_argument(
 						"PATCH cannot change the implicit read-only `id` field.",
@@ -381,7 +400,8 @@ pub(super) fn apply_dml_data(
 			let values = assignments
 				.iter()
 				.map(|(name, value)| {
-					eval(value, Some(row), slots, source, None).map(|value| (name.clone(), value))
+					eval(value, Some(row), slots, source, None, Some(control))
+						.map(|value| (name.clone(), value))
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			for (name, value) in values {
@@ -390,6 +410,7 @@ pub(super) fn apply_dml_data(
 		}
 		LogicalDmlData::Unset(fields) => {
 			for field in fields {
+				control.check()?;
 				image.remove(field);
 			}
 		}
@@ -407,8 +428,9 @@ fn eval_object(
 	row: &Row,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Object> {
-	match eval(expr, Some(row), slots, source, None)? {
+	match eval(expr, Some(row), slots, source, None, Some(control))? {
 		Value::Object(value) => Ok(value),
 		value => Err(FerrosGrynnError::invalid_argument(format!(
 			"DML object mode received {}",
@@ -515,6 +537,7 @@ fn dml_return_value(
 	after: Option<&Object>,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Option<Value>> {
 	let selected = after.unwrap_or(before);
 	match returning {
@@ -524,12 +547,13 @@ fn dml_return_value(
 		LogicalDmlReturn::Diff => Ok(Some(Value::Object(dml_diff(before, after)))),
 		LogicalDmlReturn::Value(value) => {
 			let row = object_row(schema, selected);
-			eval(value, Some(&row), slots, source, None).map(Some)
+			eval(value, Some(&row), slots, source, None, Some(control)).map(Some)
 		}
 		LogicalDmlReturn::Fields(items) => {
 			let row = object_row(schema, selected);
 			let mut object = Object::new();
 			for item in items {
+				control.check()?;
 				match item {
 					LogicalDmlReturnItem::Wildcard => {
 						for (name, value) in selected {
@@ -540,7 +564,10 @@ fn dml_return_value(
 						name,
 						value,
 					} => {
-						object.insert(name.as_ref(), eval(value, Some(&row), slots, source, None)?);
+						object.insert(
+							name.as_ref(),
+							eval(value, Some(&row), slots, source, None, Some(control))?,
+						);
 					}
 				}
 			}

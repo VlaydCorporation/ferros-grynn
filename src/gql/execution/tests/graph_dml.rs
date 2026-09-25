@@ -76,9 +76,15 @@ fn detach_restrict_rolls_back_and_cascade_keeps_global_edge() {
 		)
 		.unwrap();
 	assert!(related[0].result.is_ok());
+	transaction.commit().unwrap();
+
+	let mut transaction = store.begin();
 	let restricted =
 		transaction.execute("DETACH person:alice FROM GRAPH social;", &Object::new()).unwrap();
 	assert!(restricted[0].result.is_err());
+	assert!(transaction.query_snapshot().is_err());
+
+	let mut transaction = store.begin();
 	let snapshot = transaction.query_snapshot().unwrap();
 	let graph = transaction.query_named_graph(&snapshot, "social").unwrap();
 	assert!(transaction.membership(graph.id(), &alice).unwrap().is_some());
@@ -90,6 +96,7 @@ fn detach_restrict_rolls_back_and_cascade_keeps_global_edge() {
 	assert!(transaction.membership(graph.id(), &alice).unwrap().is_none());
 	assert!(transaction.membership(graph.id(), &edge).unwrap().is_none());
 	assert!(transaction.atom(&edge).unwrap().is_some());
+	transaction.commit().unwrap();
 }
 
 #[test]
@@ -104,6 +111,9 @@ fn dag_cycle_failure_removes_the_statement_private_edge() {
 		)
 		.unwrap();
 	assert!(initial.iter().all(|result| result.result.is_ok()));
+	transaction.commit().unwrap();
+
+	let mut transaction = store.begin();
 	let cycle = transaction
 		.execute(
 			"RELATE (person:carol)-[friendship:cycle]->(person:alice) IN GRAPH flow;",
@@ -111,7 +121,10 @@ fn dag_cycle_failure_removes_the_statement_private_edge() {
 		)
 		.unwrap();
 	assert!(cycle[0].result.is_err());
-	assert!(transaction.atom(&"friendship:cycle".parse::<RecordId>().unwrap()).unwrap().is_none());
+	assert!(transaction.atom(&"friendship:cycle".parse::<RecordId>().unwrap()).is_err());
+	assert!(
+		store.begin().atom(&"friendship:cycle".parse::<RecordId>().unwrap()).unwrap().is_none()
+	);
 }
 
 #[test]

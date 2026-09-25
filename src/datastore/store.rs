@@ -18,13 +18,11 @@ use super::{
 	DatastoreOptions,
 	GraphSchema,
 	InMemoryOptions,
-	IsolationLevel,
 	LocalOptions,
 	SchemaCatalog,
 	StoreBackend,
 	StoreInner,
 	Transaction,
-	TransactionAccess,
 	TransactionOptions,
 	validate_local_options,
 };
@@ -117,6 +115,11 @@ impl Datastore {
 		self.begin_with(TransactionOptions::default())
 	}
 
+	/// Creates a persistent GrynnQL session with independent lexical bindings.
+	pub fn session(&self) -> super::GqlSession {
+		super::GqlSession::new(self.clone())
+	}
+
 	/// Opens a transaction on one immutable database-wide snapshot.
 	pub fn begin_with(&self, options: TransactionOptions) -> Transaction {
 		let root = self.inner.current_root();
@@ -155,32 +158,26 @@ impl Datastore {
 		variables: &Object,
 		settings: crate::gql::ParserSettings,
 	) -> FerrosGrynnResult<Vec<crate::gql::QueryResult>> {
-		let program = crate::gql::parse(source, settings)?;
-		if let [
-			crate::gql::Statement {
-				kind: crate::gql::StatementKind::Import(statement),
-				..
-			},
-		] = program.statements.as_slice()
-		{
-			return crate::gql::import::execute_import(self, source, statement, variables)
-				.map(|result| vec![result]);
-		}
-		let mut transaction = self.begin_with(TransactionOptions::new(
-			IsolationLevel::Serializable,
-			if crate::gql::program_mutates_state(&program) {
-				TransactionAccess::ReadWrite
-			} else {
-				TransactionAccess::ReadOnly
-			},
-		));
-		let results =
-			crate::gql::execute_parsed_transaction(&mut transaction, source, &program, variables)?;
-		if results.iter().any(|result| result.result.is_err()) {
-			return Ok(results);
-		}
-		transaction.commit()?;
-		Ok(results)
+		self.execute_with_options(source, variables, crate::gql::QueryExecutionOptions {
+			parser_settings: settings,
+			..crate::gql::QueryExecutionOptions::default()
+		})
+	}
+
+	/// Executes a bounded program with explicit parser and runtime controls.
+	///
+	/// # Errors
+	///
+	/// Returns parse, structural-validation, import, persistence, or
+	/// publication failures. A bounded call must close every explicit
+	/// transaction.
+	pub fn execute_with_options(
+		&self,
+		source: &str,
+		variables: &Object,
+		options: crate::gql::QueryExecutionOptions,
+	) -> FerrosGrynnResult<Vec<crate::gql::QueryResult>> {
+		self.session().execute_internal(source, variables, &options, true)
 	}
 
 	/// Returns the selected backend and resource limits.

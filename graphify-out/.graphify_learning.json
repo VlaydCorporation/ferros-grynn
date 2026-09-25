@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-23T23:14:04.026576+00:00",
+  "generated_at": "2026-09-24T19:07:26.727930+00:00",
   "nodes": {
     "agents_design_authority": {
       "code_fingerprint": "a348f251e7527b1e4de975c2638577066f1a9ae6e02dd57968884cb9f9325628",
@@ -12,7 +12,7 @@
           "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.651438443,
+      "score": 0.639083464,
       "source_file": "AGENTS.md",
       "status": "tentative",
       "uses": 1
@@ -28,7 +28,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.571130218,
+      "score": 0.56029834,
       "source_file": "crates/fg-meta/src/io_async.rs",
       "status": "tentative",
       "uses": 1
@@ -44,13 +44,13 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.571130218,
+      "score": 0.56029834,
       "source_file": "crates/surrealdb/surrealdb/core/src/idx/ft/fulltext.rs",
       "status": "tentative",
       "uses": 1
     },
     "docs_storage_engine_hybrid_integration_plan_correctness_gate": {
-      "code_fingerprint": "03bbf5264ff5eebd3fd0877fa12b56e7830cb4aae4987d2f61b97cf0d00e966a",
+      "code_fingerprint": "8dcfc54c0a904060f0a9c31df65554a8f7e67780b1ea79faa478455f3fb58648",
       "label": "Correctness gate",
       "last": "2026-09-05T10:03:32.405089+00:00",
       "provenance": [
@@ -60,7 +60,7 @@
           "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.651438443,
+      "score": 0.639083464,
       "source_file": "docs/storage_engine_hybrid_integration_plan.md",
       "status": "tentative",
       "uses": 1
@@ -76,7 +76,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.571130218,
+      "score": 0.56029834,
       "source_file": "src/gql/execution/cursor/path.rs",
       "status": "tentative",
       "uses": 1
@@ -92,7 +92,7 @@
           "q": "What is MetaGraph?"
         }
       ],
-      "score": 0.357859829,
+      "score": 0.351072771,
       "source_file": "src/graph/metagraph.rs",
       "status": "tentative",
       "uses": 1
@@ -108,7 +108,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.571130218,
+      "score": 0.56029834,
       "source_file": "src/graph/traversal/index.rs",
       "status": "tentative",
       "uses": 1
@@ -124,7 +124,7 @@
           "q": "Добавить точный layout label entry page и typed node/edge label key в combined statistics"
         }
       ],
-      "score": 0.758705882,
+      "score": 0.744316503,
       "source_file": "src/storage/graph_index/label_dict.rs",
       "status": "tentative",
       "uses": 1
@@ -140,7 +140,7 @@
           "q": "Добавить точный layout label entry page и typed node/edge label key в combined statistics"
         }
       ],
-      "score": 0.758705882,
+      "score": 0.744316503,
       "source_file": "src/storage/graph_index/label_dict.rs",
       "status": "tentative",
       "uses": 1
@@ -156,7 +156,7 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.547406638,
+      "score": 0.537024694,
       "source_file": "src/values/runtime/value.rs",
       "status": "tentative",
       "uses": 1

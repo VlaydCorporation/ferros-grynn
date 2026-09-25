@@ -1,3 +1,4 @@
+mod control;
 mod dml;
 mod graph_dml;
 mod import;
@@ -6,7 +7,17 @@ mod r#match;
 mod r#return;
 mod schema;
 mod select;
+mod transaction;
 
+pub use control::{
+	AssertInvariantsStatement,
+	Block,
+	CatchClause,
+	ForStatement,
+	IfStatement,
+	TryStatement,
+	WhileStatement,
+};
 pub use r#let::LetStatement;
 pub use r#match::{
 	MatchDirection,
@@ -40,6 +51,12 @@ pub use schema::{
 	RemoveTarget,
 };
 pub use select::{RecordKey, SelectItem, SelectStatement, SelectTarget};
+pub use transaction::{
+	BeginStatement,
+	CommitStatement,
+	ExecutionModeName,
+	TransactionIsolationName,
+};
 
 use super::{
 	ast::{Expr, Identifier, TypeName, cover},
@@ -54,11 +71,35 @@ use crate::gql_status::{FerrosGrynnResult, TextSpan};
 pub struct Statement {
 	pub kind: StatementKind,
 	pub span: TextSpan,
+	pub timeout: Option<TimeoutValue>,
+}
+
+/// Statement-local timeout syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TimeoutValue {
+	Literal {
+		value: Box<str>,
+		span: TextSpan,
+	},
+	Parameter(Identifier),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StatementKind {
+	Begin(BeginStatement),
+	Commit(CommitStatement),
+	Cancel,
+	Expression(Expr),
+	If(IfStatement),
+	For(ForStatement),
+	While(WhileStatement),
+	Break,
+	Continue,
+	Try(TryStatement),
+	Throw(Expr),
+	AssertInvariants(AssertInvariantsStatement),
 	Attach(AttachStatement),
 	Create(CreateStatement),
 	Update(MutateStatement),

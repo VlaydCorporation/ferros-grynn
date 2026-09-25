@@ -7,8 +7,9 @@ pub(in crate::gql::execution) struct ScanCursor<'a> {
 }
 
 impl RowCursor for ScanCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		self.inner.next()
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
+		control.check()?;
+		self.inner.next(control)
 	}
 }
 
@@ -17,7 +18,8 @@ pub(in crate::gql::execution) struct OneRowCursor {
 }
 
 impl RowCursor for OneRowCursor {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
+		control.check()?;
 		Ok(self.row.take())
 	}
 }
@@ -118,9 +120,18 @@ pub(in crate::gql::execution) struct FilterCursor<'a> {
 }
 
 impl RowCursor for FilterCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		while let Some(row) = self.input.next()? {
-			if eval(self.predicate, Some(&row), self.slots, self.source, self.fields)?.is_truthy() {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
+		while let Some(row) = self.input.next(control)? {
+			if eval(
+				self.predicate,
+				Some(&row),
+				self.slots,
+				self.source,
+				self.fields,
+				Some(control),
+			)?
+			.is_truthy()
+			{
 				return Ok(Some(row));
 			}
 		}
@@ -138,14 +149,16 @@ pub(in crate::gql::execution) struct ProjectCursor<'a> {
 }
 
 impl RowCursor for ProjectCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
-		let Some(row) = self.input.next()? else {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
+		let Some(row) = self.input.next(control)? else {
 			return Ok(None);
 		};
 		let values = self
 			.expressions
 			.iter()
-			.map(|expression| eval(expression, Some(&row), self.slots, self.source, self.fields))
+			.map(|expression| {
+				eval(expression, Some(&row), self.slots, self.source, self.fields, Some(control))
+			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		Ok(Some(Row::new(values)))
 	}
@@ -158,9 +171,9 @@ pub(in crate::gql::execution) struct LimitCursor<'a> {
 }
 
 impl RowCursor for LimitCursor<'_> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		while self.skip > 0 {
-			if self.input.next()?.is_none() {
+			if self.input.next(control)?.is_none() {
 				return Ok(None);
 			}
 			self.skip -= 1;
@@ -168,7 +181,7 @@ impl RowCursor for LimitCursor<'_> {
 		if self.remaining == Some(0) {
 			return Ok(None);
 		}
-		let row = self.input.next()?;
+		let row = self.input.next(control)?;
 		if row.is_some()
 			&& let Some(remaining) = &mut self.remaining
 		{

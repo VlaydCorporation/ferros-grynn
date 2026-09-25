@@ -1030,6 +1030,12 @@ LET $clos = |$x: int, $y: string| -> geometry {...}
 
 ### 5.9. Регулярные выражения
 
+> **Отложено до этапа 21.** Синтаксис типа остаётся зарезервированным, но cast,
+> `string::matches`, stateful matcher и mutable collection helpers не входят в
+> исполнимый профиль этапов 11–12.
+
+Следующий пример фиксирует целевой, но пока неисполнимый контракт этапа 21.
+
 Regex поддерживают стандартный синтаксис регулярных выражений, создаются путём каста строки к типу `regex` и применяются двумя способами:
 - через функцию `string::matches`, которая возвращает все совпадения,
 - через создание `matcher` объекта как, например, в Java. 
@@ -1315,7 +1321,15 @@ LET $var [: @type] = @expression;
 ```
 
 Правила:
-- Переменная живёт в области видимости текущего блока или транзакции.
+- Имена разрешаются в порядке `block → transaction → session/program → параметры execute`.
+- Вне транзакции переменная живёт до конца программы либо persistent `GqlSession`; временная
+  session `Datastore::execute` уничтожает её после возврата.
+- Внутри транзакции binding живёт до `COMMIT`, `CANCEL` или непойманной ошибки и наружу не
+  экспортируется. Binding блока, цикла и `CATCH` уничтожается при выходе из блока.
+- Вложенный scope может скрыть внешний binding; повторное объявление в одном scope ошибочно.
+  `$_` является discard-binding и не сохраняется.
+- Параметры одного `execute` неизменяемы; имя, уже занятое session/transaction binding,
+  отклоняется до исполнения.
 - Выражение может быть любым: литерал, подзапрос, pipeline, closure, IF-ELSE.
 - `LET` может кешировать промежуточные результаты и использоваться повторно.
 
@@ -1343,6 +1357,7 @@ IF @condition { @expression; .. }
 ```
 
 `IF` является выражением и может быть использован там, где ожидается значение. При отсутствии `ELSE` результатом является `none`.
+Условие использует единую truthiness-семантику §6.2.
 
 ### 7.4. Циклы
 
@@ -1360,10 +1375,25 @@ WHILE (@condition) {
 
 `BREAK` и `CONTINUE` работают только внутри `FOR` / `WHILE`.
 
+`FOR` принимает array в исходном порядке, set в каноническом порядке `Value` и конечный
+integer range: `..` исключает конец, `..=` включает. Открытый range и иной тип дают typed
+runtime error. Значением цикла является значение последней завершённой итерации либо `none`;
+результаты всех итераций не накапливаются. На один top-level statement действуют общий предел
+`1_000_000` loop iterations и control depth `20`, если API options не задают более строгие
+значения.
+
 ### 7.5. BEGIN / COMMIT / CANCEL
 
-По умолчанию каждый оператор выполняется в собственной автотранзакции.  
-`BEGIN` открывает явную транзакцию; `COMMIT` фиксирует её; `CANCEL` откатывает.
+По умолчанию каждый top-level statement выполняется в собственной автотранзакции. Программа
+полностью разбирается и структурно проверяется до первого исполнения, но семантический анализ
+происходит непосредственно перед каждым statement по текущему published/private schema root.
+Поэтому DDL виден следующему statement. Ошибка автотранзакции откатывает только текущий
+statement; уже опубликованные statements программы сохраняются.
+
+`BEGIN` открывает явную транзакцию; `COMMIT` фиксирует её; `CANCEL` откатывает. Default —
+`SERIALIZABLE READ WRITE`. Поддерживаются `READ COMMITTED`, `SNAPSHOT`, `SERIALIZABLE` и
+`READ ONLY`. В этапах 11–12 исполним только `BEST_EFFORT`; явно заданные `DETERMINISTIC` и
+`FAST` распознаются, но возвращают typed unsupported до открытия транзакции.
 
 ```
 BEGIN;
@@ -1372,10 +1402,22 @@ BEGIN;
 COMMIT;
 ```
 
-Отдельно стоит упомянуть коммит с валидацией, который проверяет ограничения на типы графов:
+Непойманная ошибка внутри явной транзакции немедленно откатывает её целиком. Вложенный `BEGIN`
+и `COMMIT/CANCEL` без активной транзакции ошибочны. `Datastore::execute` требует закрытой
+транзакции к концу вызова и откатывает незавершённый `BEGIN`; persistent `GqlSession` может
+продолжать транзакцию между вызовами, а её `Drop` всегда выполняет rollback. `READ COMMITTED`
+фиксирует новый root ровно один раз в начале каждого top-level statement; `SNAPSHOT` и
+`SERIALIZABLE` удерживают один root до завершения транзакции.
+
+Коммит с валидацией дополнительно перепроверяет весь private root — AtomStore, ссылки,
+graph-family invariants и derived bindings — общей реализацией validator:
 ```
 COMMIT WITH VALIDATION;
 ```
+
+`Transaction::execute` не принимает transaction statements и `BEGIN IMPORT`. Непойманная
+GrynnQL-ошибка отменяет эту transaction; прямые Rust mutation methods сохраняют текущую
+statement-atomic семантику.
 
 ### 7.6. EXPLAIN
 
@@ -1396,13 +1438,15 @@ EXPLAIN [ ANALYZE | FULL ] [ FORMAT TEXT | JSON ] @statement
 
 ### 7.7. THROW
 
-Немедленно прерывает транзакцию и возвращает строковое сообщение, описанное пользователем.
+Создаёт generated status `UserThrown` со строковым сообщением пользователя.
 
 ```
 THROW @message
 ```
 
-Результатом запросы будет массив с одним объектов, содержащим поле `error` с пользовательским сообщением.
+Ошибка перехватывается ближайшим `TRY/CATCH`; непойманный `THROW` прекращает программу и
+откатывает активную явную транзакцию либо весь Atomic Import. Повторный выброс безопасной
+проекции ошибки записывается как `THROW $e.message`.
 
 ### 7.8. SLEEP
 
@@ -1421,10 +1465,22 @@ SLEEP @time
 Оператор используется для отлавливания runtime ошибок при выполнении запроса.
 
 ```
-TRY { @expr } [ CATCH @handler ] 
+TRY { @statements } [ CATCH |$e| { @statements } ]
 ```
 
-Выражение `@handler` представляет собой замыкание `|e| {...}`, где переменная `e` имеет тип `error`. 
+`CATCH |$e| { … }` — специальный handler с одним block-local binding типа `error`, а не общая
+closure. До `TRY` создаётся savepoint private root, конфликтных/read sets, reservations,
+accounting, mutation log и lexical scopes. При catchable runtime error состояние полностью
+восстанавливается до запуска handler. Ошибка handler передаётся внешнему `TRY` либо прекращает
+транзакцию.
+
+Перехватываются value/type/domain errors, item-level DML/schema/constraint violations,
+отсутствующие или duplicate identity/membership, graph-family mutation errors, `THROW` и
+`ASSERT INVARIANTS`. Parse/analysis/planning errors, budgets, timeout/cancellation,
+serialization conflicts, I/O/checksum, resource exhaustion и internal invariants не
+перехватываются. Значение `error` является runtime-only безопасной проекцией diagnostic:
+`code`, `message`, `condition`, `classification`, `category`, `domain`, `causes`; storage codec
+его отклоняет.
 
 ### 7.10. ASSERT
 
@@ -1439,6 +1495,11 @@ ASSERT INVARIANTS [ FOR GRAPH @graph_name ] [ REPORT @number ];
 ```
 
 `REPORT @number` ограничивает число подробно описанных нарушений в ответе (по умолчанию `FG_IMPORT_MAX_REPORTED_VIOLATIONS`); общее количество нарушений по классам возвращается всегда.
+Допустим диапазон `0..=FG_IMPORT_MAX_REPORTED_VIOLATIONS`. `FOR GRAPH` проверяет только
+указанный graph и связанные atom references; без scope — все видимые graphs private root.
+Успех возвращает object с полями `checked_graphs`, `violation_total`,
+`violation_totals` и `violation_details`; счётчики и список нарушений равны нулю.
+Нарушение — catchable typed error с полными totals и ограниченными details.
 
 ### 7.11. BEGIN IMPORT / END IMPORT — массовая загрузка
 
@@ -1495,10 +1556,17 @@ graph-local DML без явного scope и запрещает явное об�
 действует для AtomStore и существующего graph.
 
 Import обязан быть единственным top-level statement и не выполняется внутри открытого
-`Transaction`. На этапе 10 body принимает `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `ATTACH`,
-`DETACH`, `RELATE`. `FOR`, `IF/ELSE`, `TRY/CATCH`, `THROW` подключаются этапом 12; до этого
-они typed unsupported. Отсутствующий DML `RETURN` означает `RETURN NONE`, а явный
-result-producing `RETURN` отвергается до staging.
+`Transaction`. Исполнимый профиль этапа 12 принимает `CREATE`, `UPDATE`, `UPSERT`, `DELETE`,
+`ATTACH`, `DETACH`, `RELATE`, `FOR`, `IF/ELSE`, `TRY/CATCH` и `THROW`. `WHILE`, `LET`,
+`ASSERT`, result-producing `RETURN` и transaction statements рекурсивно отвергаются до writer
+lease. Отсутствующий DML `RETURN` означает `RETURN NONE`.
+
+Простой top-level DML является одним import-item; каждая итерация top-level `FOR` — отдельным
+item; top-level `IF` или `TRY` — одним item; вложенный control-flow остаётся частью текущего
+item. Языковой `TRY` использует вложенный savepoint и имеет приоритет над `ON VIOLATION`.
+Только непойманное item-level нарушение поступает этой политике; непойманный `THROW`, timeout,
+cancellation и resource failure всегда отбрасывают import целиком. Успешный no-op учитывается
+`SEGMENT SIZE`.
 
 ```
 BEGIN IMPORT INTO GRAPH social WITH ( ON VIOLATION = SKIP, REJECT LIMIT = 10000 );
@@ -4268,7 +4336,9 @@ allocation-time heap quota. Она проверяется в начале `COMMI
 commit lock, conflict validation, кодирования страниц, durable I/O и публикации. Превышение
 завершает транзакцию `FG-54F07`; уже выделенная transaction-private память освобождается при
 отбрасывании транзакции, а видимое или durable состояние не меняется. Неограниченный private spill
-не входит в текущий контракт; bulk import обязан коммитить данные ограниченными порциями.
+не входит в текущий контракт. Atomic Import ограничивает private work
+`SEGMENT SIZE` и byte-budget, но не публикует внутренние segments: видимый commit ровно
+один и выполняется после успешного `END IMPORT`.
 
 В Rust API обычная `mutate_graph` является bounded atom-delta операцией и не материализует локальный
 граф целиком. Полная загрузка семейства доступна только через явно названную
@@ -4328,7 +4398,17 @@ persistent-режиме тот же непрозрачный snapshot также
 
 ### 17.2. Автотранзакции
 
-Каждый DML-оператор вне явной транзакции выполняется в автотранзакции.
+Каждый top-level statement вне явной транзакции выполняется в собственной автотранзакции.
+Весь текст сначала проходит parse и recursive structural validation. Затем statement
+анализируется по актуальному catalog и исполняется; его результат содержит собственные
+`kind`, `elapsed` и `FerrosGrynnResult<Outcome<Value>>`. Analysis/runtime/commit error
+останавливает программу и откатывает только текущий statement, не отменяя ранее опубликованные.
+
+`Datastore::execute` использует временную session. Для долгоживущего контекста
+`Datastore::session()` возвращает `GqlSession`, которая хранит program bindings и может
+удерживать явную транзакцию между несколькими вызовами `execute`. Parse/structural error
+возвращается внешним `FerrosGrynnResult` до первого statement; ошибка уже разобранного statement
+помещается в его `QueryResult`.
 
 ### 17.3. GraphView
 
@@ -4371,7 +4451,15 @@ BEGIN;
 COMMIT;
 ```
 
-Или на уровне отдельного оператора. При превышении — `CANCEL` текущей транзакции.
+Или на уровне отдельного оператора. Эффективный deadline — более ранний из clause и
+`QueryExecutionOptions`. `Datastore`, `GqlSession` и `Transaction` предоставляют
+`execute_with_options`; `QueryCancellation` является cloneable cooperative token.
+
+Проверка выполняется до и после statement/operator, перед каждым cursor pull, на loop backedge
+и каждые 1024 элемента collection built-in. Синхронный системный I/O прерывается после возврата
+вызова. Timeout/cancellation не перехватываются `TRY/CATCH`, прекращают дальнейшее исполнение и
+откатывают активную явную транзакцию. Defaults: timeout отсутствует, control depth `20`, общий
+loop budget одного top-level statement `1_000_000`, cancellation отсутствует.
 
 ### 17.6. ACID-гарантии
 
@@ -4427,10 +4515,14 @@ snapshot независимо от графов. Graph membership, topology, lab
 Порядок результата без `ORDER BY` не определён ([§23.5](#235-зафиксированные-инварианты), инвариант 4), а traversal, параллельное исполнение и cost-based выбор плана дополнительно вносят недетерминизм. Для сценариев, где нужна воспроизводимость — тесты, отладка, обучение моделей, сравнение прогонов — предусмотрены режимы исполнения.
 
 ```
-BEGIN [ ISOLATION LEVEL @level ] [ EXECUTION MODE DETERMINISTIC | BEST_EFFORT | FAST ];
+BEGIN [ ISOLATION LEVEL @level ] [ READ ONLY ]
+      [ EXECUTION MODE DETERMINISTIC | BEST_EFFORT | FAST ];
 ```
 
-Режим задаётся на транзакцию; значение по умолчанию для сессии — настройка `FG_EXECUTION_MODE`.
+Режим задаётся на транзакцию. В исполнимом профиле этапов 11–12 поддержан только
+`BEST_EFFORT`, и он является default. Явные `DETERMINISTIC` и `FAST` возвращают typed
+unsupported до открытия транзакции; реализация первого принадлежит этапу 14, второго — этапу
+17. Таблица ниже фиксирует целевой контракт этих режимов, а не текущую готовность.
 
 | Режим                        | Гарантии                                                                                                                                                                                                                                                                                                                 |
 |------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -4458,21 +4550,27 @@ BEGIN [ ISOLATION LEVEL @level ] [ EXECUTION MODE DETERMINISTIC | BEST_EFFORT | 
 
 ### 18.2. Встроенные пространства имён
 
-| Пространство | Примеры                                                                                                                           |
-|--------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| `math::`     | `math::abs`, `math::sqrt`, `math::pow`, `math::floor`, `math::ceil`, `math::stddev`, `math::variance`                             |
-| `string::`   | `string::upper`, `string::lower`, `string::contains`, `string::split`, `string::concat`                                           |
-| `time::`     | `time::now`, `time::format`, `time::add`, `time::diff`                                                                            |
-| `array::`    | `array::concat`, `array::distinct`, `array::first`, `array::group`, `array::flatten`, `array::push`, `array::pop`, `array::clear` |
-| `set::`      | `set::union`, `set::intersect`, `set::diff`, `set::add`, `set::has`, `set::clear`                                                 |
-| `geo::`      | `geo::distance`, `geo::within`, `geo::area`                                                                                       |
-| `search::`   | `search::score`, `search::highlight`, `search::analyze`                                                                           |
-| `graph::`    | `graph::nodes`, `graph::edges`, `graph::inner`, `graph::inner_nodes`, `graph::inner_edges`, `graph::parent`, `graph::level_path`  |
-| `type::`     | `type::is<T>`, `type::to<T>` (аналог <U>T),                                                                                       |
-| `meta::`     | `meta::id`, `meta::class`, `meta::type`                                                                                           |
-| `regex::`    | `regex::matcher`, `regex::next`                                                                                                   |
-| `option::`   | `option::is_some`, `option::is_none`                                                                                              |
-| `computed::` | `computed::compute`                                                                                                               |
+| Пространство | Исполнимо в этапе 12 | Отложено |
+|---|---|---|
+| `math::` | `abs`, `sqrt`, `pow`, `floor`, `ceil` | `stddev`, `variance` и агрегаты — этап 13 |
+| `string::` | `upper`, `lower`, `len`, `contains`, `split`, `concat` | regex/stateful helpers — этап 21 |
+| `time::` | `now`, `format`, `add`, `diff`; `now()` один на statement | оставшийся catalog — этап 21 |
+| `array::` | `len`, `concat`, `distinct`, `first`, `flatten` | `group` — этап 13; `push/pop/clear` — этап 21 |
+| `set::` | `len`, `union`, `intersect`, `diff`, `has` | `add/clear` — этап 21 |
+| `type::` | `is<T>`, `to<T>` | — |
+| `meta::` | `id`, `class`, `type` | — |
+| `option::` | `is_some`, `is_none` | — |
+| `graph::` / path / pipeline | — | этапы 16–17 |
+| UDF / closures / `regex::` | — | этап 21 |
+| `search::` | — | этап 22 |
+| `geo::` | — | этап 24 |
+| `computed::` | — | назначенный schema/query этап |
+
+Этап 12 использует закрытый статический enum/signature table и обычный `match`: runtime
+registry функций не создаётся. `array::distinct` сохраняет первое вхождение, `flatten` снимает
+один уровень, `first([])` возвращает `none`, set-операции выдают канонически упорядоченный set.
+Domain/overflow/type errors используют общую typed value-error систему. Контекстный
+`decimal → float` добавляет notification о возможной потере точности.
 
 ### 18.3. Определение пользовательских функций
 

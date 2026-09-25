@@ -466,10 +466,8 @@ impl Parser<'_> {
 	}
 
 	pub(super) fn finish_dml(&self, statement: &str) -> FerrosGrynnResult<()> {
-		if self.at_keyword("TIMEOUT") {
-			return Err(self.unsupported("DML TIMEOUT", self.current().span));
-		}
-		if self.at_eof() || self.at_symbol(Symbol::Semicolon) {
+		if self.at_keyword(keywords::TIMEOUT) || self.at_eof() || self.at_symbol(Symbol::Semicolon)
+		{
 			Ok(())
 		} else {
 			Err(self.syntax(&format!("Unexpected {statement} clause."), self.current().span))

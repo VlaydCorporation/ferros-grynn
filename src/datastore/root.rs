@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	sync::Arc,
+};
 
 use super::{
 	AtomStoreRoot,
@@ -37,6 +40,62 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) statistics: Arc<StatisticsStore>,
 	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphRoot>>,
 	pub(crate) versions: BTreeMap<ConflictKey, u64>,
+}
+
+/// Complete normalized-state violations collected for `ASSERT INVARIANTS`.
+pub(crate) struct InvariantViolationReport {
+	total: usize,
+	totals: BTreeMap<&'static str, usize>,
+	details: Vec<(&'static str, String)>,
+	detail_limit: usize,
+	first: Option<FerrosGrynnError>,
+}
+
+impl InvariantViolationReport {
+	pub(crate) fn new(detail_limit: usize) -> Self {
+		Self {
+			total: 0,
+			totals: BTreeMap::new(),
+			details: Vec::with_capacity(detail_limit.min(32)),
+			detail_limit,
+			first: None,
+		}
+	}
+
+	pub(crate) fn push(&mut self, category: &'static str, error: FerrosGrynnError) {
+		self.total = self.total.saturating_add(1);
+		*self.totals.entry(category).or_default() += 1;
+		if self.details.len() < self.detail_limit {
+			self.details.push((category, error.to_string()));
+		}
+		if self.first.is_none() {
+			self.first = Some(error);
+		}
+	}
+
+	pub(crate) const fn total(&self) -> usize {
+		self.total
+	}
+
+	pub(crate) const fn is_empty(&self) -> bool {
+		self.total == 0
+	}
+
+	pub(crate) fn totals(&self) -> &BTreeMap<&'static str, usize> {
+		&self.totals
+	}
+
+	pub(crate) fn details(&self) -> &[(&'static str, String)] {
+		&self.details
+	}
+
+	pub(crate) fn first_error(&self) -> Option<&FerrosGrynnError> {
+		self.first.as_ref()
+	}
+
+	fn into_first_error(self) -> Option<FerrosGrynnError> {
+		self.first
+	}
 }
 
 impl Default for DatabaseRoot {
@@ -344,56 +403,130 @@ impl DatabaseRoot {
 	/// Verifies the complete normalized atom/occurrence state selected by
 	/// `END IMPORT WITH VALIDATION`.
 	pub(crate) fn validate_full_import_state(&self) -> FerrosGrynnResult<()> {
+		let report = self.collect_invariant_violations(None, 1);
+		report.into_first_error().map_or(Ok(()), Err)
+	}
+
+	/// Collects every independently observable normalized-state violation.
+	pub(crate) fn collect_invariant_violations(
+		&self,
+		graph: Option<GraphId>,
+		detail_limit: usize,
+	) -> InvariantViolationReport {
+		let mut report = InvariantViolationReport::new(detail_limit);
+		if let Some(graph_id) = graph {
+			self.collect_graph_violations(graph_id, true, &mut report);
+			return report;
+		}
+
 		for atom in self.atoms.atoms() {
-			let class = self
-				.schema
-				.class_by_id(atom.class_id())
-				.ok_or_else(|| invalid("base atom references an absent class"))?;
-			if class.name().as_str() != atom.record_id().class() || class.kind() != atom.kind() {
-				return Err(invalid("base atom identity disagrees with its class"));
+			if let Err(error) = self.validate_base_atom(atom) {
+				report.push("base_atom", error);
 			}
-			validate_properties(&class, atom.properties().iter())?;
 			for (graph_id, local) in self.atoms.memberships(atom.id()).into_iter().flatten() {
-				let occurrence =
-					self.graph(*graph_id).and_then(|graph| graph.occurrence(*local)).ok_or_else(
-						|| invalid("reverse membership references an absent occurrence"),
-					)?;
-				if occurrence.global_id() != atom.id() {
-					return Err(invalid("reverse membership references the wrong global atom"));
+				match self.graph(*graph_id).and_then(|graph| graph.occurrence(*local)) {
+					Some(occurrence) if occurrence.global_id() == atom.id() => {}
+					Some(_) => report.push(
+						"reverse_membership",
+						invalid("reverse membership references the wrong global atom"),
+					),
+					None => report.push(
+						"reverse_membership",
+						invalid("reverse membership references an absent occurrence"),
+					),
 				}
 			}
 		}
-		for (graph_id, graph) in &self.graphs {
-			let schema = self
-				.schema
-				.graph(*graph_id)
-				.ok_or_else(|| invalid("graph root has no schema definition"))?;
-			if schema.reference() != graph.reference() {
-				return Err(invalid("graph root identity disagrees with its schema"));
+		let graph_ids = self
+			.graphs
+			.keys()
+			.copied()
+			.chain(self.schema.graphs().map(|graph| graph.reference().id()))
+			.collect::<BTreeSet<_>>();
+		for graph_id in graph_ids {
+			self.collect_graph_violations(graph_id, false, &mut report);
+		}
+		report
+	}
+
+	fn collect_graph_violations(
+		&self,
+		graph_id: GraphId,
+		validate_base: bool,
+		report: &mut InvariantViolationReport,
+	) {
+		let Some(graph) = self.graph(graph_id) else {
+			report.push("graph_root", invalid("graph schema references an absent graph root"));
+			return;
+		};
+		match self.schema.graph(graph_id) {
+			Some(schema) if schema.reference() == graph.reference() => {}
+			Some(_) => {
+				report.push("graph_root", invalid("graph root identity disagrees with its schema"))
 			}
-			for occurrence in graph.occurrences() {
-				let atom = self
-					.atom(occurrence.global_id())
-					.ok_or_else(|| invalid("graph occurrence references an absent base atom"))?;
-				if self.membership(*graph_id, atom.id()) != Some(occurrence.local_id()) {
-					return Err(invalid("graph occurrence is absent from reverse memberships"));
-				}
-				let class = self
-					.schema
-					.class_by_id(atom.class_id())
-					.ok_or_else(|| invalid("graph occurrence atom has no class"))?;
-				if let Some(overlay) = occurrence.overlay() {
-					validate_properties(
-						&class,
-						overlay.iter().filter_map(|(key, value)| match value {
-							OverlayValue::Value(value) => Some((key, value)),
-							OverlayValue::Hidden => None,
-						}),
-					)?;
+			None => report.push("graph_root", invalid("graph root has no schema definition")),
+		}
+		for occurrence in graph.occurrences() {
+			let Some(atom) = self.atom(occurrence.global_id()) else {
+				report
+					.push("occurrence", invalid("graph occurrence references an absent base atom"));
+				continue;
+			};
+			if validate_base && let Err(error) = self.validate_base_atom(atom) {
+				report.push("base_atom", error);
+			}
+			if self.membership(graph_id, atom.id()) != Some(occurrence.local_id()) {
+				report.push(
+					"reverse_membership",
+					invalid("graph occurrence is absent from reverse memberships"),
+				);
+			}
+			let Some(class) = self.schema.class_by_id(atom.class_id()) else {
+				report.push("overlay", invalid("graph occurrence atom has no class"));
+				continue;
+			};
+			if let Some(overlay) = occurrence.overlay()
+				&& let Err(error) = validate_properties(
+					&class,
+					overlay.iter().filter_map(|(key, value)| match value {
+						OverlayValue::Value(value) => Some((key, value)),
+						OverlayValue::Hidden => None,
+					}),
+				) {
+				report.push("overlay", error);
+			}
+		}
+		if validate_base {
+			for atom in self.atoms.atoms() {
+				let Some(local) =
+					self.atoms.memberships(atom.id()).and_then(|items| items.get(&graph_id))
+				else {
+					continue;
+				};
+				match graph.occurrence(*local) {
+					Some(occurrence) if occurrence.global_id() == atom.id() => {}
+					Some(_) => report.push(
+						"reverse_membership",
+						invalid("reverse membership references the wrong global atom"),
+					),
+					None => report.push(
+						"reverse_membership",
+						invalid("reverse membership references an absent occurrence"),
+					),
 				}
 			}
 		}
-		Ok(())
+	}
+
+	fn validate_base_atom(&self, atom: &BaseAtom) -> FerrosGrynnResult<()> {
+		let class = self
+			.schema
+			.class_by_id(atom.class_id())
+			.ok_or_else(|| invalid("base atom references an absent class"))?;
+		if class.name().as_str() != atom.record_id().class() || class.kind() != atom.kind() {
+			return Err(invalid("base atom identity disagrees with its class"));
+		}
+		validate_properties(&class, atom.properties().iter())
 	}
 
 	/// Keeps engine-owned lookup structures but defers every schema-defined
@@ -774,9 +907,11 @@ fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use super::DatabaseRoot;
 	use crate::{
-		datastore::{ClassId, ClassSchema},
+		datastore::{ClassId, ClassSchema, GraphRoot},
 		graph::{AtomKind, EdgeTopology, GraphId, GraphKind, GraphRef, GraphStorageMode},
 		values::{Number, PropertyKeyId, PropertyMap, RecordId, RecordIdPart, Value},
 	};
@@ -790,6 +925,20 @@ mod tests {
 	fn graph(id: u64, name: &str) -> GraphRef {
 		GraphRef::new(GraphId::new(id).unwrap(), name, GraphKind::Graph, GraphStorageMode::InMemory)
 			.unwrap()
+	}
+
+	#[test]
+	fn invariant_report_counts_all_violations_and_bounds_details() {
+		let mut root = DatabaseRoot::default();
+		for (id, name) in [(1, "first"), (2, "second")] {
+			let reference = graph(id, name);
+			root.graphs.insert(reference.id(), Arc::new(GraphRoot::new(reference)));
+		}
+
+		let report = root.collect_invariant_violations(None, 1);
+		assert_eq!(report.total(), 2);
+		assert_eq!(report.totals().get("graph_root"), Some(&2));
+		assert_eq!(report.details().len(), 1);
 	}
 
 	#[test]

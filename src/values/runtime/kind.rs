@@ -31,6 +31,7 @@ pub enum ValueKind {
 	Subgraph,
 	Graph,
 	Closure,
+	Error,
 }
 
 impl ValueKind {
@@ -60,6 +61,7 @@ impl ValueKind {
 			Self::Subgraph => 21,
 			Self::Graph => 22,
 			Self::Closure => 23,
+			Self::Error => 24,
 		}
 	}
 
@@ -91,6 +93,7 @@ impl ValueKind {
 			Self::Subgraph => "subgraph",
 			Self::Graph => "graph",
 			Self::Closure => "closure",
+			Self::Error => "error",
 		}
 	}
 

@@ -509,7 +509,8 @@ cancel_stmt  ::= "CANCEL"
 ```ebnf
 throw_stmt   ::= "THROW" expr
 sleep_stmt   ::= "SLEEP" ( duration_lit | expr )
-try_stmt     ::= "TRY" block [ "CATCH" closure ]
+try_stmt     ::= "TRY" block [ "CATCH" "|" catch_binding "|" block ]
+catch_binding ::= param | ident
 
 explain_stmt ::= "EXPLAIN" [ "ANALYZE" | "FULL" ]
                  [ "FORMAT" ( "TEXT" | "JSON" ) ]
@@ -538,11 +539,13 @@ import_option    ::= "INDEXES" "=" ( "DEFERRED" | "MAINTAINED" )
 graph_ref    ::= name | param
 ```
 
-В исполнимом профиле этапа 10 доступны только семь DML alternatives. Control-flow
-alternatives становятся исполнимыми на этапе 12; до этого parser сохраняет точную
-unsupported-диагностику. `COMMIT EVERY` не является alias для `SEGMENT SIZE`.
+В исполнимом профиле этапа 12 доступны семь DML alternatives, `for_stmt`, `if_stmt`,
+`try_stmt` и `throw_stmt`. Recursive preflight запрещает `WHILE`, `LET`, `ASSERT`,
+result-producing DML `RETURN` и transaction statements до writer lease. `COMMIT EVERY` не
+является alias для `SEGMENT SIZE`.
 
-`CATCH`-обработчик — замыкание `|e| { ... }`, где `e : error` (§7.9 spec). `EXPLAIN` доступен и как
+`CATCH`-обработчик имеет специальную форму `|binding| block`, где binding имеет runtime-only
+тип `error`; это не общая closure (§7.9 spec). `EXPLAIN` доступен и как
 префиксный оператор (здесь), и как суффиксная clause `... EXPLAIN [FULL]` (§11.11).
 
 ---
@@ -1288,13 +1291,14 @@ target ::= ( record_range | record_id | class_name ) [ graph_scope ] | param
 | 3       | `**`                                                                     | право           |
 | 4       | `*` `/` `%`                                                              | лево            |
 | 5       | `+` `-`                                                                  | лево            |
-| 6       | `<` `>` `<=` `>=`, KNN `<\|…\|>`, geo-ops, `CONTAINS…`, fulltext `@@`    | лево            |
-| 7       | `=` `IS` `!=` `NOT IS` `?=` `*=`, `IN`/`NOT IN`/`ALLIN`/`ANYIN`/`NONEIN` | лево            |
-| 8       | `&&` `AND`                                                               | лево            |
-| 9       | `\|\|` `OR`                                                              | лево            |
-| 10      | `??` `?:`                                                                | лево            |
-| 11      | тернарный `?:`                                                           | право           |
-| 12      | pipeline `\|>`                                                           | лево            |
+| 6       | `..` `..=`                                                               | лево            |
+| 7       | `<` `>` `<=` `>=`, KNN `<\|…\|>`, geo-ops, `CONTAINS…`, fulltext `@@`    | лево            |
+| 8       | `=` `IS` `!=` `NOT IS` `?=` `*=`, `IN`/`NOT IN`/`ALLIN`/`ANYIN`/`NONEIN` | лево            |
+| 9       | `&&` `AND`                                                               | лево            |
+| 10      | `\|\|` `OR`                                                              | лево            |
+| 11      | `??` `?:`                                                                | лево            |
+| 12      | тернарный `?:`                                                           | право           |
+| 13      | pipeline `\|>`                                                           | лево            |
 
 ### 12.2. Грамматика выражений (по уровням)
 
@@ -1306,7 +1310,9 @@ coalesce_expr  ::= or_expr { ( "??" | "?:" ) or_expr }
 or_expr        ::= and_expr { ( "OR" | "||" ) and_expr }
 and_expr       ::= equality_expr { ( "AND" | "&&" ) equality_expr }
 equality_expr  ::= comparison_expr { equality_op comparison_expr }
-comparison_expr::= additive_expr { comparison_op additive_expr }
+comparison_expr::= range_expr { comparison_op range_expr }
+range_expr     ::= additive_expr [ ( ".." | "..=" ) [ additive_expr ] ]
+                 | ( ".." | "..=" ) [ additive_expr ]
 additive_expr  ::= multiplicative_expr { ( "+" | "-" ) multiplicative_expr }
 multiplicative_expr ::= power_expr { ( "*" | "/" | "%" ) power_expr }
 power_expr     ::= unary_expr [ "**" power_expr ]
@@ -1364,6 +1370,11 @@ primary_expr ::=
 query_expr ::= select_stmt | match_stmt | traverse_stmt
 ```
 
+Открытые numeric ranges разбираются как выражения, но `FOR` исполняет только конечные integer
+ranges. Set и результат set-операций итерируются в каноническом порядке `Value`; array сохраняет
+исходный порядок. `!!`, `?:`, `IF` и `WHILE` используют одну truthiness-функцию: falsey —
+`false`, числовой ноль, пустые string/bytes/collection/object, `null` и `none`.
+
 ### 12.5. Вызовы функций
 
 ```ebnf
@@ -1373,6 +1384,13 @@ arg       ::= [ ident "=" ] expr                (* именованные арг
 ```
 
 Дженерик-форма `type::is<edge>(x)`, `type::to<int>(x)` — через `[ "<" type ">" ]`.
+
+Исполнимый статический catalog этапа 12: `math::{abs,sqrt,pow,floor,ceil}`,
+`string::{upper,lower,len,contains,split,concat}`, `time::{now,format,add,diff}`,
+`array::{len,concat,distinct,first,flatten}`, `set::{len,union,intersect,diff,has}`,
+`type::{is,to}`, `meta::{id,class,type}`, `option::{is_some,is_none}`. Aggregates/query
+subexpressions, UDF/closures, mutable collections, regex, graph/path, search и geo остаются у
+назначенных последующих этапов; parser не превращает их в динамический function registry.
 
 ### 12.6. Замыкания
 

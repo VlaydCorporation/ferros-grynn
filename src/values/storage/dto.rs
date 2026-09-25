@@ -301,9 +301,11 @@ impl StorageValue {
 			Value::Geometry(value) => Ok(Self::Geometry(value)),
 			Value::Vector(value) => Ok(Self::Vector(value)),
 			Value::Atom(value) => StorageAtomRef::from_runtime(*value, context).map(Self::AtomRef),
-			Value::Regex(_) | Value::Path(_) | Value::Graph(_) | Value::Closure(_) => {
-				Err(FerrosGrynnError::unsupported_storage_value(value.kind().to_string()))
-			}
+			Value::Regex(_)
+			| Value::Path(_)
+			| Value::Graph(_)
+			| Value::Closure(_)
+			| Value::Error(_) => Err(FerrosGrynnError::unsupported_storage_value(value.kind().to_string())),
 		}
 	}
 

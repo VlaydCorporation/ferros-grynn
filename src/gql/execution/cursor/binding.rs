@@ -38,6 +38,7 @@ pub(in crate::gql::execution) fn resolve_match_binding(
 	binding: &MatchBinding,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<ResolvedMatchBinding> {
 	let selector = match &binding.selector {
 		LogicalMatchSelector::Any => ResolvedMatchSelector::Any,
@@ -45,7 +46,7 @@ pub(in crate::gql::execution) fn resolve_match_binding(
 		LogicalMatchSelector::Record(record) => {
 			ResolvedMatchSelector::Record(RecordId::from_value(
 				record.class.as_ref(),
-				eval(&record.key, None, slots, source, None)?,
+				eval(&record.key, None, slots, source, None, Some(control))?,
 			)?)
 		}
 	};
@@ -61,10 +62,11 @@ pub(in crate::gql::execution) fn resolve_expand(
 	expand: &Expand,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<ResolvedExpand> {
 	Ok(ResolvedExpand {
-		edge: resolve_match_binding(&expand.edge, slots, source)?,
-		target: resolve_match_binding(&expand.target, slots, source)?,
+		edge: resolve_match_binding(&expand.edge, slots, source, control)?,
+		target: resolve_match_binding(&expand.target, slots, source, control)?,
 		direction: expand.direction,
 	})
 }
@@ -73,10 +75,11 @@ pub(in crate::gql::execution) fn resolve_path_expand(
 	expand: &PathExpand,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<ResolvedPathExpand> {
 	Ok(ResolvedPathExpand {
-		edge: resolve_match_binding(&expand.edge, slots, source)?,
-		target: resolve_match_binding(&expand.target, slots, source)?,
+		edge: resolve_match_binding(&expand.edge, slots, source, control)?,
+		target: resolve_match_binding(&expand.target, slots, source, control)?,
 		direction: expand.direction,
 		min: expand.min,
 		max: expand.max,
@@ -115,10 +118,11 @@ impl<'a, Graph> SeedCursor<'a, Graph> {
 }
 
 impl<Graph: GraphRead> RowCursor for SeedCursor<'_, Graph> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
+			control.check()?;
 			if self.row.is_none() {
-				let Some(row) = self.input.next()? else {
+				let Some(row) = self.input.next(control)? else {
 					return Ok(None);
 				};
 				self.bound =

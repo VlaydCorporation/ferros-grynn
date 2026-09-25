@@ -1,8 +1,10 @@
+use std::time::Duration;
+
 use crate::{
 	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope},
 	gql_status::TextSpan,
 	syn::{DefinitionMode, MatchDirection},
-	values::{GraphKind, GraphRef, RecordId, Text, Type, Value},
+	values::{DateTime, GraphKind, GraphRef, RecordId, Text, Type, Value},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,15 +23,56 @@ pub(super) enum LogicalStatement {
 	Dml(LogicalDmlStatement),
 	GraphDml(LogicalGraphDmlStatement),
 	Let {
+		name: Box<str>,
 		slot: u32,
 		value: TypedExpr,
 	},
 	Return {
 		value: TypedExpr,
 	},
+	Expression {
+		value: TypedExpr,
+	},
+	If {
+		branches: Vec<(TypedExpr, LogicalBlock)>,
+		else_block: Option<LogicalBlock>,
+	},
+	For {
+		slot: u32,
+		iterable: TypedExpr,
+		body: LogicalBlock,
+	},
+	While {
+		condition: TypedExpr,
+		body: LogicalBlock,
+	},
+	Break,
+	Continue,
+	Try {
+		body: LogicalBlock,
+		catch: Option<(u32, LogicalBlock)>,
+	},
+	Throw {
+		value: TypedExpr,
+	},
+	AssertInvariants {
+		graph: Option<GraphRef>,
+		report: usize,
+	},
 	/// Executes a read-only graph pattern match.
 	Match(LogicalMatch),
 	Select(LogicalSelect),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LogicalBlock {
+	pub(super) statements: Vec<LogicalBlockStatement>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LogicalBlockStatement {
+	pub(super) statement: LogicalStatement,
+	pub(super) timeout: Option<Duration>,
 }
 
 /// One analyzed graph-membership or graph-incidence mutation.
@@ -504,7 +547,13 @@ pub(super) enum TypedExprKind {
 	Slot(u32),
 	Column(usize),
 	Array(Vec<TypedExpr>),
+	Set(Vec<TypedExpr>),
 	Object(Vec<(Box<str>, TypedExpr)>),
+	Range {
+		start: Option<Box<TypedExpr>>,
+		end: Option<Box<TypedExpr>>,
+		inclusive_end: bool,
+	},
 	Unary {
 		op: crate::syn::UnaryOperator,
 		expr: Box<TypedExpr>,
@@ -519,17 +568,72 @@ pub(super) enum TypedExprKind {
 		then_value: Box<TypedExpr>,
 		else_value: Box<TypedExpr>,
 	},
+	Case {
+		operand: Option<Box<TypedExpr>>,
+		branches: Vec<(TypedExpr, TypedExpr)>,
+		else_value: Option<Box<TypedExpr>>,
+	},
 	Field {
 		base: Box<TypedExpr>,
 		field: Box<str>,
 		null_safe: bool,
 	},
+	CurrentField(Box<str>),
+	Destructure {
+		base: Box<TypedExpr>,
+		fields: Vec<Box<str>>,
+	},
 	Index {
 		base: Box<TypedExpr>,
 		index: Box<TypedExpr>,
+	},
+	Filter {
+		base: Box<TypedExpr>,
+		predicate: Box<TypedExpr>,
+	},
+	Builtin {
+		function: Builtin,
+		arguments: Vec<TypedExpr>,
 	},
 	Cast {
 		target: Type,
 		expr: Box<TypedExpr>,
 	},
+}
+
+/// Statically resolved built-ins in the executable Stage 12 profile.
+#[derive(Debug, Clone)]
+pub(super) enum Builtin {
+	MathAbs,
+	MathSqrt,
+	MathPow,
+	MathFloor,
+	MathCeil,
+	StringUpper,
+	StringLower,
+	StringLen,
+	StringContains,
+	StringSplit,
+	StringConcat,
+	TimeNow(DateTime),
+	TimeFormat,
+	TimeAdd,
+	TimeDiff,
+	ArrayLen,
+	ArrayConcat,
+	ArrayDistinct,
+	ArrayFirst,
+	ArrayFlatten,
+	SetLen,
+	SetUnion,
+	SetIntersect,
+	SetDiff,
+	SetHas,
+	TypeIs(Type),
+	TypeTo(Type),
+	MetaId,
+	MetaClass,
+	MetaType,
+	OptionIsSome,
+	OptionIsNone,
 }

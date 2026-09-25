@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use super::{DmlCandidate, LogicalDmlData, Object, apply_dml_data, validate_dml_object};
 use crate::{
 	datastore::{ClassSchema, Transaction},
+	gql::options::ExecutionControl,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphRef,
 	values::{PropertyDictionary, Text, Value},
@@ -24,6 +25,7 @@ pub(super) fn apply_graph_update(
 	slots: &[Value],
 	source: &str,
 	dictionary: &PropertyDictionary,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Object> {
 	candidate.local_id.ok_or_else(|| {
 		FerrosGrynnError::atom_does_not_exist("occurrence", candidate.record_id.to_string())
@@ -33,7 +35,7 @@ pub(super) fn apply_graph_update(
 		Some(LogicalDmlData::Reset(fields)) => {
 			reset_effective_fields(fields, &candidate.base_properties, dictionary, &mut after);
 		}
-		data => apply_dml_data(data, &candidate.row, slots, source, &mut after)?,
+		data => apply_dml_data(data, &candidate.row, slots, source, &mut after, control)?,
 	}
 	after.insert("id", Value::Record(Box::new(candidate.record_id.clone())));
 	validate_dml_object(schema, &after)?;

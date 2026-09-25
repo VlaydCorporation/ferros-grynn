@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
 	datastore::{AtomSnapshot, QuerySnapshot, Transaction},
-	gql::{execution::eval, ir::LogicalRecordTarget},
+	gql::{execution::eval, ir::LogicalRecordTarget, options::ExecutionControl},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, EdgeTopology},
 	values::{Array, GraphRef, Number, PropertyDictionary, RecordId, Value},
@@ -26,6 +26,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 	statement: &LogicalGraphDmlStatement,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	match statement {
 		LogicalGraphDmlStatement::Attach {
@@ -33,7 +34,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			graph,
 			label,
 		} => {
-			let record = record_id(record, slots, source)?;
+			let record = record_id(record, slots, source, control)?;
 			transaction.attach_node(graph.id(), &record, label.clone(), None)?;
 			if transaction.validates_import_constraints_immediately() {
 				transaction.validate_graph_family(graph)?;
@@ -45,7 +46,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			graph,
 			cascade,
 		} => {
-			let record = record_id(record, slots, source)?;
+			let record = record_id(record, slots, source, control)?;
 			transaction.detach_occurrence(graph.id(), &record, *cascade)?;
 			if transaction.validates_import_constraints_immediately() {
 				transaction.validate_graph_family(graph)?;
@@ -62,8 +63,8 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			direction,
 			weight,
 		} => {
-			let source_record = record_id(source_target, slots, source)?;
-			let target_record = record_id(target, slots, source)?;
+			let source_record = record_id(source_target, slots, source, control)?;
+			let target_record = record_id(target, slots, source, control)?;
 			let source_local =
 				ensure_endpoint(transaction, graph, &source_record, *atom_endpoints)?;
 			let target_local =
@@ -72,7 +73,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 				.key
 				.as_ref()
 				.map(|key| {
-					eval(key, None, slots, source, None)
+					eval(key, None, slots, source, None, Some(control))
 						.and_then(|key| RecordId::from_value(edge.class.as_ref(), key))
 				})
 				.transpose()?
@@ -83,7 +84,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 				Some(atom) => candidate_from_atom(atom, &edge.schema, &dictionary)?,
 				None => missing_candidate(0, edge_record.clone(), &edge.schema),
 			};
-			if !expect_matches(edge.expect.as_ref(), &candidate, slots, source)? {
+			if !expect_matches(edge.expect.as_ref(), &candidate, slots, source, control)? {
 				return Err(FerrosGrynnError::condition_failed(edge_record.to_string()));
 			}
 			if let Some(atom) = &before {
@@ -99,7 +100,9 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			let topology = topology(*direction, source_local, target_local);
 			let weight = weight
 				.as_ref()
-				.map(|weight| numeric_weight(eval(weight, None, slots, source, None)?))
+				.map(|weight| {
+					numeric_weight(eval(weight, None, slots, source, None, Some(control))?)
+				})
 				.transpose()?;
 			let local = transaction.attach_edge(
 				graph.id(),
@@ -125,11 +128,20 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 				slots,
 				source,
 				&dictionary,
+				control,
 			)?;
 			if transaction.validates_import_constraints_immediately() {
 				transaction.validate_graph_family(graph)?;
 			}
-			graph_result(&edge.returning, &edge.schema, &candidate.before, &after, slots, source)
+			graph_result(
+				&edge.returning,
+				&edge.schema,
+				&candidate.before,
+				&after,
+				slots,
+				source,
+				control,
+			)
 		}
 	}
 }
@@ -147,8 +159,12 @@ fn record_id(
 	target: &LogicalRecordTarget,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<RecordId> {
-	RecordId::from_value(target.class.as_ref(), eval(&target.key, None, slots, source, None)?)
+	RecordId::from_value(
+		target.class.as_ref(),
+		eval(&target.key, None, slots, source, None, Some(control))?,
+	)
 }
 
 fn ensure_endpoint(
@@ -237,10 +253,11 @@ fn graph_result(
 	after: &Object,
 	slots: &[Value],
 	source: &str,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	if matches!(returning, LogicalDmlReturn::None) {
 		return Ok(Value::None);
 	}
-	let value = dml_return_value(returning, schema, before, Some(after), slots, source)?;
+	let value = dml_return_value(returning, schema, before, Some(after), slots, source, control)?;
 	Ok(Value::Array(Array::new(value.into_iter().collect())))
 }

@@ -120,6 +120,9 @@ pub(super) fn encode(output: &mut Vec<u8>, value: &Type, depth: usize) -> Ferros
 		Type::Closure {
 			..
 		} => Tag::Closure,
+		Type::Error => {
+			return Err(invalid("runtime error values cannot appear in a durable schema"));
+		}
 	};
 	output.push(tag as u8);
 	match value {

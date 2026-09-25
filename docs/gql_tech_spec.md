@@ -141,15 +141,15 @@ ClassScan / RecordLookup
 3. Деградация планов — не сюрприз. Есть управляемые рамки: что может поменяться автоматически, а что — только явным действием.
 4. Режимы деградации описаны заранее: что происходит на пике, что отбрасывается первым, что приоритизируется.
 
-| Компонент         | Граница                                            | При нарушении                         |
-|-------------------|----------------------------------------------------|---------------------------------------|
-| BufferPool        | `FG_PAGE_BUFFER_PAGES` — RAM-бюджет на кеш страниц | Eviction (Clock-Pro), WAL-first flush |
+| Компонент         | Граница                                            | При нарушении                                         |
+|-------------------|----------------------------------------------------|-------------------------------------------------------|
+| BufferPool        | `FG_PAGE_BUFFER_PAGES` — RAM-бюджет на кеш страниц | Eviction (Clock-Pro), WAL-first flush                 |
 | TxWriteSet        | `FG_TX_WRITE_SET_MAX_BYTES` = 256 МиБ              | Abort до публикации; import ротирует private segments |
-| Statement timeout | `statement_timeout_ms` / `TIMEOUT` clause          | Cancel query                          |
-| Snapshot age      | `max_snapshot_age`                                 | Force-close stale snapshots           |
-| Checkpoint        | `CheckpointPolicy` = 25% / 300 секунд              | Passive backfill; Restart — явно      |
-| Path expansion    | `FG_PATH_MAX_DEPTH` (30), `MAXDEPTH`               | Обрыв path-finding                    |
-| Graph expansion   | `FG_GRAPH_EXPANSION_MAX_NODES/EDGES`               | Обрыв построения графа                |
+| Statement timeout | `statement_timeout_ms` / `TIMEOUT` clause          | Cancel query                                          |
+| Snapshot age      | `max_snapshot_age`                                 | Force-close stale snapshots                           |
+| Checkpoint        | `CheckpointPolicy` = 25% / 300 секунд              | Passive backfill; Restart — явно                      |
+| Path expansion    | `FG_PATH_MAX_DEPTH` (30), `MAXDEPTH`               | Обрыв path-finding                                    |
+| Graph expansion   | `FG_GRAPH_EXPANSION_MAX_NODES/EDGES`               | Обрыв построения графа                                |
 
 Fail-closed неприятнее в моменте, но честнее в эксплуатации: система сразу предлагает retry, circuit breaker, fallback или отказ.
 
@@ -196,6 +196,12 @@ NativeAsync отложен до нативной проверки. Backend не 
 После подключения datastore точкой исполнения становится
 `Datastore::execute(text, variables) -> Vec<QueryResult>`. Каждый оператор верхнего уровня
 возвращает `QueryResult { kind, elapsed, result: FerrosGrynnResult<Outcome<Value>> }`.
+
+Один concrete driver обслуживает временную session `Datastore::execute`, persistent
+`GqlSession` и `Transaction::execute`. Весь текст сначала проходит parse и recursive structural
+validation. Затем каждый top-level statement анализируется отдельно по текущему catalog,
+понижается в IR и исполняется; AST executor не вводится. Это обеспечивает DDL→DML visibility и
+Read Committed refresh без planner/session trait или фабрики.
 
 Конвейер (соответствует диаграмме §22.1 `gql_spec.md`):
 
@@ -884,9 +890,11 @@ statement и не меняет его между операторами этог
 публикуются одной заменой root. Поэтому версия с поздним commit физически отсутствует в более
 старом root независимо от порядка `BEGIN`.
 
-Текущий исполняемый срез считает один переданный в `Transaction::execute` AST `Program` одной
-statement execution unit. Когда появится драйвер нескольких top-level DML statements, он обязан
-запрашивать новый RC-root перед каждым statement, не меняя root внутри него.
+`StatementContext` фиксирует snapshot один раз перед анализом top-level statement и освобождает
+его через RAII после результата. Для Read Committed driver запрашивает новый root перед каждым
+statement; Serializable/SI удерживают исходный root транзакции. Все query adapters, cursor pulls
+и mutation reads одного statement используют этот context. Прямые Rust transaction reads
+сохраняют refresh-per-call семантику и не подменяются GrynQL context.
 
 `SnapshotId` — только identity MVCC-версии. Он не владеет данными и сам по себе не позволяет
 читать граф.
@@ -952,6 +960,29 @@ Persistent-адаптер под тем же DB commit lock сливает delta
 любая следующая операция её транзакции завершается `FG-25F01`. Удерживаемый Rust handle
 освобождает свой старый `Arc<root>` при `Drop`; фоновое принудительное уничтожение handle не
 вводится.
+
+### 11.7. Session, savepoint и cooperative execution
+
+`Datastore::execute` создаёт временную `GqlSession`; `Datastore::session` возвращает persistent
+session с program bindings и optional transaction. Общая state machine исполняет autocommit и
+`BEGIN/COMMIT/CANCEL`. Незакрытый `BEGIN` временной session, непойманная GrynQL-ошибка и `Drop`
+persistent session только откатывают private state и никогда не публикуют его.
+
+Один transaction savepoint переиспользуется `atomic_mutation`, `TRY/CATCH` и nested import item:
+private root, read/missing/range/write/requirement sets, fanout reservations, write-set
+accounting, mutation log и lexical scopes восстанавливаются вместе. `ErrorValue` — runtime-only
+проекция существующего `DiagnosticRecord`; отдельной error hierarchy и storage encoding нет.
+
+`QueryExecutionOptions` передаёт parser settings, optional deadline, control depth, общий loop
+budget и `QueryCancellation`. `ExecutionControl` проверяет deadline/token на statement/operator
+границах, cursor pull, loop backedge и каждые 1024 элемента collection built-in. Timeout,
+cancellation, resource/serialization/I/O errors не catchable. `COMMIT WITH VALIDATION`, Atomic
+Import и `ASSERT INVARIANTS` вызывают одну normalized-root validation implementation; scoped
+assert ограничивает обход указанным graph и его atom references.
+
+Expression executor использует typed IR, единый `Value::is_truthy` и статический builtin
+enum/signature table. `time::now()` захватывается один раз при анализе statement. Runtime
+function registry, общая closure-система и отдельный control VM на этапах 11–12 не вводятся.
 
 ---
 
@@ -1149,6 +1180,10 @@ Path-finding vs graph-expansion (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` прим�
 ### 15.1. Режимы исполнения
 
 `DETERMINISTIC` (строгая воспроизводимость), `BEST_EFFORT` (детерминизм без гарантии порядка; default), `FAST` (максимум производительности, без гарантий). Формула: `Determinism = Snapshot + Seed + StableExecution + CanonicalPlan`.
+
+В исполнимом профиле этапов 11–12 реализован только `BEST_EFFORT`. Parser сохраняет
+`DETERMINISTIC`/`FAST`, но transaction driver отвергает их до открытия transaction. Разделы
+15.2–15.5 задают целевой контракт этапов 14/17 и не описывают текущий runtime path.
 
 ### 15.2. Источники недетерминизма
 

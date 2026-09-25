@@ -21,11 +21,16 @@ use fg_gql_status::FerrosGrynnResult;
 pub use stmt::{
 	AlterStatement,
 	AlterTarget,
+	AssertInvariantsStatement,
 	Assignment,
 	AttachStatement,
 	BasicIndexDefinition,
+	BeginStatement,
+	Block,
+	CatchClause,
 	ClassKindName,
 	ClassSchemaModeName,
+	CommitStatement,
 	CreateStatement,
 	DefineClassStatement,
 	DefineFieldStatement,
@@ -38,7 +43,10 @@ pub use stmt::{
 	DmlReturn,
 	DmlReturnItem,
 	DmlTarget,
+	ExecutionModeName,
 	ExpectClause,
+	ForStatement,
+	IfStatement,
 	ImportGraphRef,
 	ImportOption,
 	ImportOptionName,
@@ -69,6 +77,10 @@ pub use stmt::{
 	SelectTarget,
 	Statement,
 	StatementKind,
+	TimeoutValue,
+	TransactionIsolationName,
+	TryStatement,
+	WhileStatement,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

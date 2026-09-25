@@ -74,6 +74,24 @@ impl Duration {
 		self.0
 	}
 
+	/// Returns a fixed-length nanosecond count when the span has no calendar
+	/// year or month component.
+	pub(crate) fn fixed_nanoseconds(self) -> Option<i128> {
+		if self.0.get_years() != 0 || self.0.get_months() != 0 {
+			return None;
+		}
+		Some(
+			i128::from(self.0.get_weeks()) * 7 * 86_400_000_000_000
+				+ i128::from(self.0.get_days()) * 86_400_000_000_000
+				+ i128::from(self.0.get_hours()) * 3_600_000_000_000
+				+ i128::from(self.0.get_minutes()) * 60_000_000_000
+				+ i128::from(self.0.get_seconds()) * 1_000_000_000
+				+ i128::from(self.0.get_milliseconds()) * 1_000_000
+				+ i128::from(self.0.get_microseconds()) * 1_000
+				+ i128::from(self.0.get_nanoseconds()),
+		)
+	}
+
 	fn ordering_key(self) -> (i64, i64, i128) {
 		let months = i64::from(self.0.get_years()) * 12 + i64::from(self.0.get_months());
 		let days = i64::from(self.0.get_weeks()) * 7 + i64::from(self.0.get_days());

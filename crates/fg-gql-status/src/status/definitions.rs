@@ -61,6 +61,19 @@ define_status_codes!(
 			message: String => DisplayValue,
 		},
 	},
+	LossyDecimalToFloat, "FG-01F02" => {
+		kind: Notification {
+			classification: NotificationClassification::Generic,
+			severity: Severity::Warning,
+		},
+		condition: Condition::Warning,
+		domain: Domain::Value,
+		subcondition: "lossy decimal to float coercion",
+		message: "Function {function} coerced a decimal to float with precision loss.",
+		params: {
+			function: String => Identifier,
+		},
+	},
 	InvalidArgument, "FG-22N11" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -405,6 +418,67 @@ define_status_codes!(
 		message: "A database-wide import is in progress; concurrent writers are not allowed.",
 		hint: "Retry the complete write after the import finishes.",
 	},
+	TransactionAlreadyActive, "FG-25F04" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Transaction,
+		subcondition: "transaction already active",
+		message: "A transaction is already active in this GrynQL session.",
+	},
+	TransactionNotActive, "FG-25F05" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Transaction,
+		subcondition: "no active transaction",
+		message: "COMMIT or CANCEL requires an active GrynQL transaction.",
+	},
+	TransactionAborted, "FG-25F06" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Transaction,
+		subcondition: "transaction aborted",
+		message: "Transaction {transaction} was aborted by an earlier GrynQL error.",
+		params: {
+			transaction: u64 => DisplayValue,
+		},
+	},
+	QueryTimedOut, "FG-50F04" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GeneralProcessingException,
+		domain: Domain::Query,
+		subcondition: "query timeout",
+		message: "The statement exceeded its effective timeout of {timeout_ms} milliseconds.",
+		params: {
+			timeout_ms: u64 => DisplayValue,
+		},
+	},
+	QueryCancelled, "FG-50F05" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GeneralProcessingException,
+		domain: Domain::Query,
+		subcondition: "query cancelled",
+		message: "Query execution was cancelled.",
+	},
 	SerializationFailure, "FG-40001" => {
 		kind: Error {
 			classification: ErrorClassification::TransientError,
@@ -645,6 +719,20 @@ define_status_codes!(
 		message: "The value does not satisfy the {graph_type} graph constraint: {reason}.",
 		params: {
 			graph_type: String => ValueType,
+			reason: String => DisplayValue,
+		},
+	},
+	InvariantAssertionFailed, "FG-G2F05" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GraphTypeViolation,
+		domain: Domain::Graph,
+		subcondition: "invariant assertion failed",
+		message: "ASSERT INVARIANTS failed: {reason}.",
+		params: {
 			reason: String => DisplayValue,
 		},
 	},
@@ -1027,6 +1115,35 @@ define_status_codes!(
 		message: "Import skipped more than the configured limit of {limit} items.",
 		params: {
 			limit: u64 => DisplayValue,
+		},
+	},
+	ControlLimitExceeded, "FG-54F09" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Query,
+		subcondition: "control-flow limit exceeded",
+		message: "Control-flow {limit} exceeded the configured maximum of {maximum}.",
+		params: {
+			limit: String => Identifier,
+			maximum: u64 => DisplayValue,
+		},
+	},
+	UserThrown, "FG-52F01" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProcedureException,
+		domain: Domain::Query,
+		subcondition: "user-thrown error",
+		message: "{message}",
+		params: {
+			message: String => DisplayValue,
 		},
 	},
 	UnexpectedExternalFailure, "FG-50F00" => {

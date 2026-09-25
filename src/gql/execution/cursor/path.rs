@@ -54,8 +54,8 @@ impl<'a, Graph> PathExpandCursor<'a, Graph> {
 
 impl<Graph: GraphRead> PathExpandCursor<'_, Graph> {
 	/// Initializes traversal state for the next upstream row.
-	fn start_row(&mut self) -> FerrosGrynnResult<bool> {
-		let Some(row) = self.input.next()? else {
+	fn start_row(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<bool> {
+		let Some(row) = self.input.next(control)? else {
 			return Ok(false);
 		};
 		let source = row.current.ok_or_else(|| {
@@ -91,9 +91,10 @@ impl<Graph: GraphRead> PathExpandCursor<'_, Graph> {
 }
 
 impl<Graph: GraphRead> RowCursor for PathExpandCursor<'_, Graph> {
-	fn next(&mut self) -> FerrosGrynnResult<Option<Row>> {
+	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>> {
 		loop {
-			if self.row.is_none() && !self.start_row()? {
+			control.check()?;
+			if self.row.is_none() && !self.start_row(control)? {
 				return Ok(None);
 			}
 			if self.frames.is_empty() {
@@ -150,7 +151,8 @@ impl<Graph: GraphRead> RowCursor for PathExpandCursor<'_, Graph> {
 				!= Some(match self.expand.target.domain {
 					EndpointDomain::Node => AtomKind::Node,
 					EndpointDomain::Edge => AtomKind::Edge,
-				}) || self.row.as_ref().is_some_and(|row| row.used_edges.contains(&candidate.edge))
+				})
+				|| self.row.as_ref().is_some_and(|row| row.used_edges.contains(&candidate.edge))
 				|| self.hops.iter().any(|hop| hop.edge == candidate.edge)
 				|| !connector_matches(self.graph.as_ref(), candidate.edge, &self.expand.edge)?
 			{

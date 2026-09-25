@@ -111,6 +111,10 @@ impl Parser<'_> {
 					| StatementKind::Attach(_)
 					| StatementKind::Detach(_)
 					| StatementKind::Relate(_)
+					| StatementKind::If(_)
+					| StatementKind::For(_)
+					| StatementKind::Try(_)
+					| StatementKind::Throw(_)
 			) {
 				return Err(self.unsupported("statement inside BEGIN IMPORT", statement.span));
 			}
