@@ -40,6 +40,7 @@ pub use dto::{
 	StorageValue,
 	StorageValueRef,
 };
+pub(crate) use order_key::encode_index_prefix;
 pub use order_key::{encode_index_key, validate_index_type};
 pub use tags_refs::{DiskAtomRef, DiskGraphRef, QualifiedAtomRef, TypeTag};
 

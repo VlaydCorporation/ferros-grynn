@@ -5,7 +5,13 @@ use std::{
 };
 
 use crate::{
-	gql::{options::BarrierAccount, spill::QuerySpool},
+	datastore::Transaction,
+	gql::{
+		ir::LogicalSelect,
+		optimizer::PhysicalSelectPlan,
+		options::BarrierAccount,
+		spill::QuerySpool,
+	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::{QueryCursor, Value},
 };
@@ -31,6 +37,41 @@ pub(crate) struct CursorPage {
 	pub(crate) continuation: Option<QueryCursor>,
 }
 
+/// Immutable execution state retained for an index-ordered continuation.
+pub(in crate::gql) struct IndexSeekPlan {
+	pub(in crate::gql) plan: LogicalSelect,
+	pub(in crate::gql) physical: PhysicalSelectPlan,
+	pub(in crate::gql) slots: Vec<Value>,
+	pub(in crate::gql) source: String,
+}
+
+struct IndexSeekState {
+	transaction: Option<Transaction>,
+	plan: IndexSeekPlan,
+}
+
+impl std::fmt::Debug for IndexSeekState {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("IndexSeekState")
+			.field("transaction_attached", &self.transaction.is_some())
+			.finish_non_exhaustive()
+	}
+}
+
+/// Temporarily checked-out exact snapshot while one keyset page is produced.
+pub(in crate::gql) struct IndexSeekCheckout {
+	pub(in crate::gql) transaction: Transaction,
+	pub(in crate::gql) plan: LogicalSelect,
+	pub(in crate::gql) physical: PhysicalSelectPlan,
+	pub(in crate::gql) slots: Vec<Value>,
+	pub(in crate::gql) source: String,
+	pub(in crate::gql) anchor: CursorAnchor,
+	spool: u64,
+	cursor: QueryCursor,
+	prior_next: Option<QueryCursor>,
+}
+
 #[derive(Debug)]
 struct CursorSpool {
 	rows: CursorRows,
@@ -47,12 +88,14 @@ enum CursorRows {
 		_account: BarrierAccount,
 	},
 	Disk(QuerySpool),
+	IndexSeek(IndexSeekState),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum CursorOffset {
 	Memory(usize),
 	Disk(u64),
+	IndexSeek,
 }
 
 #[derive(Debug)]
@@ -147,6 +190,165 @@ impl CursorRuntime {
 		Ok(cursor)
 	}
 
+	pub(in crate::gql) fn register_index_seek(
+		&mut self,
+		plan: IndexSeekPlan,
+		fingerprint: u64,
+		order_fingerprint: u64,
+		snapshot: u64,
+		anchor: CursorAnchor,
+	) -> FerrosGrynnResult<QueryCursor> {
+		if self.spools.len() >= MAX_CURSOR_SPOOLS {
+			return Err(FerrosGrynnError::query_cursor_limit_exceeded(MAX_CURSOR_SPOOLS as u64));
+		}
+		let spool_id = self.allocate_id()?;
+		let cursor = QueryCursor::new(self.session, self.allocate_id()?);
+		self.spools.insert(spool_id, CursorSpool {
+			rows: CursorRows::IndexSeek(IndexSeekState {
+				transaction: None,
+				plan,
+			}),
+			created: Instant::now(),
+			_snapshot: snapshot,
+			fingerprint,
+			order_fingerprint,
+		});
+		self.entries.insert(cursor.id(), CursorEntry {
+			spool: spool_id,
+			offset: CursorOffset::IndexSeek,
+			anchor,
+			next: None,
+		});
+		Ok(cursor)
+	}
+
+	pub(in crate::gql) fn attach_index_seek(
+		&mut self,
+		cursor: QueryCursor,
+		transaction: Transaction,
+	) -> FerrosGrynnResult<()> {
+		self.validate_token(cursor)?;
+		let spool = self
+			.entries
+			.get(&cursor.id())
+			.map(|entry| entry.spool)
+			.ok_or_else(|| FerrosGrynnError::invalid_query_cursor("unknown pending token"))?;
+		let Some(CursorSpool {
+			rows: CursorRows::IndexSeek(state),
+			..
+		}) = self.spools.get_mut(&spool)
+		else {
+			return Err(FerrosGrynnError::invalid_query_cursor(
+				"pending token is not an index continuation",
+			));
+		};
+		if state.transaction.is_some() {
+			return Err(FerrosGrynnError::invalid_query_cursor(
+				"index continuation already owns a snapshot",
+			));
+		}
+		state.transaction = Some(transaction);
+		Ok(())
+	}
+
+	pub(in crate::gql) fn checkout_index_seek(
+		&mut self,
+		cursor: QueryCursor,
+		fingerprint: u64,
+		order_fingerprint: u64,
+	) -> FerrosGrynnResult<Option<IndexSeekCheckout>> {
+		self.validate_token(cursor)?;
+		let (spool, anchor, prior_next) = self
+			.entries
+			.get(&cursor.id())
+			.map(|entry| (entry.spool, entry.anchor.clone(), entry.next))
+			.ok_or_else(|| FerrosGrynnError::invalid_query_cursor("unknown or closed token"))?;
+		let expired = self
+			.spools
+			.get(&spool)
+			.is_some_and(|state| state.created.elapsed() > self.max_snapshot_age);
+		if expired {
+			self.remove_spool(spool);
+			return Err(FerrosGrynnError::query_cursor_expired(self.max_snapshot_age.as_secs()));
+		}
+		let state = self
+			.spools
+			.get_mut(&spool)
+			.ok_or_else(|| FerrosGrynnError::invalid_query_cursor("result spool is unavailable"))?;
+		if !matches!(state.rows, CursorRows::IndexSeek(_)) {
+			return Ok(None);
+		}
+		if state.fingerprint != fingerprint || state.order_fingerprint != order_fingerprint {
+			return Err(FerrosGrynnError::invalid_query_cursor(
+				"query or ORDER fingerprint does not match",
+			));
+		}
+		let CursorRows::IndexSeek(seek) = &mut state.rows else {
+			unreachable!();
+		};
+		let transaction = seek.transaction.take().ok_or_else(|| {
+			FerrosGrynnError::invalid_query_cursor("index continuation is already in use")
+		})?;
+		Ok(Some(IndexSeekCheckout {
+			transaction,
+			plan: seek.plan.plan.clone(),
+			physical: seek.plan.physical.clone(),
+			slots: seek.plan.slots.clone(),
+			source: seek.plan.source.clone(),
+			anchor,
+			spool,
+			cursor,
+			prior_next,
+		}))
+	}
+
+	pub(in crate::gql) fn finish_index_seek(
+		&mut self,
+		checkout: IndexSeekCheckout,
+		next_anchor: Option<CursorAnchor>,
+	) -> FerrosGrynnResult<Option<QueryCursor>> {
+		let IndexSeekCheckout {
+			transaction,
+			spool,
+			cursor,
+			prior_next,
+			..
+		} = checkout;
+		let Some(CursorSpool {
+			rows: CursorRows::IndexSeek(state),
+			..
+		}) = self.spools.get_mut(&spool)
+		else {
+			return Err(FerrosGrynnError::invalid_query_cursor(
+				"index continuation disappeared while producing a page",
+			));
+		};
+		state.transaction = Some(transaction);
+		let Some(anchor) = next_anchor else {
+			self.remove_spool(spool);
+			return Ok(None);
+		};
+		if let Some(next) = prior_next {
+			return Ok(Some(next));
+		}
+		let next = QueryCursor::new(self.session, self.allocate_id()?);
+		self.entries.insert(next.id(), CursorEntry {
+			spool,
+			offset: CursorOffset::IndexSeek,
+			anchor,
+			next: None,
+		});
+		self.entries
+			.get_mut(&cursor.id())
+			.ok_or_else(|| FerrosGrynnError::invalid_query_cursor("cursor disappeared"))?
+			.next = Some(next);
+		Ok(Some(next))
+	}
+
+	pub(in crate::gql) fn abort_index_seek(&mut self, checkout: &IndexSeekCheckout) {
+		self.remove_spool(checkout.spool);
+	}
+
 	pub(crate) fn page(
 		&mut self,
 		cursor: QueryCursor,
@@ -187,6 +389,11 @@ impl CursorRuntime {
 				(CursorRows::Disk(rows), CursorOffset::Disk(offset)) => {
 					let page = rows.page(offset, page_size)?;
 					Ok((page.records, CursorOffset::Disk(page.next_offset), page.eof))
+				}
+				(CursorRows::IndexSeek(_), CursorOffset::IndexSeek) => {
+					Err(FerrosGrynnError::invalid_query_cursor(
+						"index continuation must use keyset execution",
+					))
 				}
 				_ => Err(FerrosGrynnError::invalid_query_cursor(
 					"cursor offset does not match its result spool",

@@ -87,6 +87,27 @@ pub fn encode_index_key(
 	Ok(output)
 }
 
+/// Encodes complete leading composite components for a prefix/range search.
+/// Every component receives the same escaping and separator it has before a
+/// following field in a complete key.
+pub(crate) fn encode_index_prefix(
+	components: &[(&Value, &Type)],
+	context: &mut EncodeContext,
+) -> FerrosGrynnResult<Vec<u8>> {
+	if components.is_empty() {
+		return Ok(Vec::new());
+	}
+	let mut output = Vec::new();
+	for (value, value_type) in components {
+		validate_index_type(value_type)?;
+		let stored = StorageValue::from_runtime((*value).clone(), context)?;
+		let raw = encode_typed(&stored, value_type, context)?;
+		append_escaped(&mut output, &raw);
+		output.extend_from_slice(&[ESCAPE, END]);
+	}
+	Ok(output)
+}
+
 fn encode_typed(
 	value: &StorageValue,
 	value_type: &Type,

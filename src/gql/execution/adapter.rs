@@ -112,7 +112,8 @@ pub fn execute_transaction_with_options(
 				break;
 			}
 		};
-		let control = crate::gql::options::ExecutionControl::new(&options, timeout);
+		let control = crate::gql::options::ExecutionControl::new(&options, timeout)
+			.with_publication_deferred(true);
 		let execution = transaction.run_gql_statement(|transaction| {
 			execute_parsed_statement_with_bindings(
 				transaction,
@@ -237,8 +238,199 @@ impl QueryRead for TransactionRead<'_> {
 		Ok(Snapshot(self.snapshot.commit_ts()))
 	}
 
+	fn mutation_count(&self) -> usize {
+		self.transaction.mutation_count()
+	}
+
 	fn catalog(&self, _snapshot: Snapshot) -> &dyn QueryCatalog {
 		self
+	}
+
+	fn planner_snapshot(
+		&self,
+		snapshot: Snapshot,
+		demand: &crate::gql::optimizer::PlannerDemand,
+	) -> FerrosGrynnResult<crate::gql::optimizer::PlannerSnapshot> {
+		use crate::{
+			gql::optimizer::{
+				PlannerClass,
+				PlannerField,
+				PlannerGraph,
+				PlannerIndex,
+				PlannerPropertyHistogram,
+				PlannerSnapshot,
+				PlannerStatisticsMeta,
+			},
+			stats::{PropertyHistogramKey, StatisticsScope},
+		};
+
+		let class_schemas = self.transaction.query_schema_classes(&self.snapshot)?;
+		let graph_schemas = if demand.all_graphs || !demand.graphs.is_empty() {
+			self.transaction.query_schema_graphs(&self.snapshot)?
+		} else {
+			Vec::new()
+		};
+		let statistics = self.transaction.query_statistics(&self.snapshot)?;
+		let base = statistics.base();
+		let graph_ids = if demand.all_graphs {
+			graph_schemas.iter().map(crate::datastore::GraphSchema::id).collect()
+		} else {
+			demand.graphs.clone()
+		};
+		let mut classes = std::collections::BTreeMap::new();
+		for class in
+			class_schemas.into_iter().filter(|class| demand.classes.contains(class.name().as_str()))
+		{
+			let class_id = class.id().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("published class is missing ClassId")
+			})?;
+			let fields = class
+				.fields()
+				.map(|field| {
+					Ok(PlannerField {
+						id: field.id().ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"published field is missing SchemaId",
+							)
+						})?,
+						name: field.name().clone(),
+						value_type: field.value_type().clone(),
+					})
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let indexes = class
+				.indexes()
+				.map(|index| {
+					let (physical_binding, exact_count) =
+						self.transaction.query_index_binding(&self.snapshot, &class, index)?;
+					Ok(PlannerIndex {
+						id: index.id().ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"published index is missing IndexId",
+							)
+						})?,
+						version: index.version(),
+						name: index.name().clone(),
+						kind: index.kind(),
+						state: index.state(),
+						scope: index.scope(),
+						fields: index.fields().cloned().collect(),
+						physical_binding,
+						exact_count,
+					})
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let graph_rows = graph_ids
+				.iter()
+				.map(|graph| {
+					(
+						*graph,
+						statistics
+							.graph(*graph)
+							.and_then(|statistics| statistics.classes.get(&class_id).copied())
+							.unwrap_or(0),
+					)
+				})
+				.collect();
+			classes.insert(class.name().clone(), PlannerClass {
+				id: class_id,
+				version: class.version(),
+				name: class.name().clone(),
+				fields,
+				indexes,
+				base_rows: base.classes.get(&class_id).copied().unwrap_or(0),
+				graph_rows,
+			});
+		}
+		let mut graphs = std::collections::BTreeMap::new();
+		for graph in graph_schemas.into_iter().filter(|graph| graph_ids.contains(&graph.id())) {
+			let graph_statistics = statistics.graph(graph.id());
+			graphs.insert(graph.id(), PlannerGraph {
+				reference: graph.reference().clone(),
+				version: graph.version(),
+				statistics: graph_statistics.map_or_else(
+					PlannerStatisticsMeta::default,
+					|statistics| PlannerStatisticsMeta {
+						revision: statistics.revision,
+						analyzed_revision: statistics.analyzed_revision,
+						dirty_rows: statistics.dirty_rows,
+					},
+				),
+				node_rows: graph_statistics.map_or(0, |statistics| statistics.node_count),
+				edge_rows: graph_statistics.map_or(0, |statistics| statistics.edge_count),
+				total_out_degree: graph_statistics
+					.map_or(0, |statistics| statistics.total_out_degree),
+				total_in_degree: graph_statistics
+					.map_or(0, |statistics| statistics.total_in_degree),
+				total_undirected_degree: graph_statistics
+					.map_or(0, |statistics| statistics.total_undirected_degree),
+				maximum_out_degree: graph_statistics
+					.map_or(0, |statistics| statistics.maximum_out_degree),
+				maximum_in_degree: graph_statistics
+					.map_or(0, |statistics| statistics.maximum_in_degree),
+				labels: graph_statistics
+					.map_or_else(std::collections::BTreeMap::new, |statistics| {
+						statistics.labels.clone()
+					}),
+			});
+		}
+		let mut property_histograms = std::collections::BTreeMap::new();
+		for requested in &demand.properties {
+			let class = classes.get(requested.class.as_ref()).ok_or_else(|| {
+				FerrosGrynnError::class_does_not_exist(requested.class.to_string())
+			})?;
+			let Some(field) =
+				class.fields.iter().find(|field| field.name.as_str() == requested.field.as_ref())
+			else {
+				// Schemaless properties have no durable field identity and
+				// therefore cannot own a persisted property
+				// histogram.
+				continue;
+			};
+			let key = PropertyHistogramKey {
+				class_id: class.id,
+				field_id: field.id,
+				scope: requested.scope,
+			};
+			let histogram = match requested.scope {
+				StatisticsScope::Base => base.property_histograms.get(&key),
+				StatisticsScope::Effective {
+					graph,
+				} => statistics
+					.graph(graph)
+					.and_then(|statistics| statistics.property_histograms.get(&key)),
+			};
+			if let Some(histogram) = histogram {
+				property_histograms.insert(key, PlannerPropertyHistogram {
+					key,
+					histogram: histogram.clone(),
+					method: histogram.method,
+				});
+			}
+		}
+		let mut degree_histograms = std::collections::BTreeMap::new();
+		for (graph, keys) in &demand.degrees {
+			let Some(graph_statistics) = statistics.graph(*graph) else {
+				continue;
+			};
+			for key in keys {
+				if let Some(histogram) = graph_statistics.degree_histograms.get(key) {
+					degree_histograms.insert((*graph, key.clone()), histogram.clone());
+				}
+			}
+		}
+		Ok(PlannerSnapshot {
+			revision: snapshot.0,
+			base_statistics: PlannerStatisticsMeta {
+				revision: base.revision,
+				analyzed_revision: base.analyzed_revision,
+				dirty_rows: base.dirty_rows,
+			},
+			classes,
+			graphs,
+			property_histograms,
+			degree_histograms,
+		})
 	}
 
 	fn scan<'a>(
@@ -247,6 +439,8 @@ impl QueryRead for TransactionRead<'_> {
 		class: &str,
 		graph: Option<&GraphRef>,
 		predicate: Option<&TypedExpr>,
+		index: Option<(crate::datastore::IndexId, bool)>,
+		window: Option<IndexScanWindow<'_>>,
 		slots: &[Value],
 		_source: &str,
 		full_row: bool,
@@ -255,7 +449,40 @@ impl QueryRead for TransactionRead<'_> {
 		if let Some(predicate) = predicate {
 			collect_scalar_constraints(predicate, slots, &mut constraints);
 		}
-		let rows = self.transaction.query_row_cursor(&self.snapshot, class, &constraints, graph)?;
+		let window = window
+			.map(|window| -> FerrosGrynnResult<_> {
+				let after = window
+					.after
+					.map(|anchor| -> FerrosGrynnResult<_> {
+						let record = anchor
+							.stable_key
+							.iter()
+							.find_map(|value| match value {
+								Value::Record(record) => Some(record.as_ref().clone()),
+								_ => None,
+							})
+							.ok_or_else(|| {
+								FerrosGrynnError::invalid_query_cursor(
+									"index continuation has no public RecordId tie key",
+								)
+							})?;
+						Ok((anchor.order_keys.clone(), record))
+					})
+					.transpose()?;
+				Ok(ScalarIndexWindow {
+					after,
+					maximum: window.maximum,
+				})
+			})
+			.transpose()?;
+		let rows = self.transaction.query_row_cursor(
+			&self.snapshot,
+			class,
+			&constraints,
+			graph,
+			index,
+			window.as_ref(),
+		)?;
 		Ok(Box::new(StorageCursor {
 			rows,
 			dictionary: self.transaction.query_property_dictionary(),
@@ -273,6 +500,38 @@ impl QueryRead for TransactionRead<'_> {
 		Ok(row
 			.map(|row| storage_row(row, &self.transaction.query_property_dictionary(), true))
 			.transpose()?)
+	}
+
+	fn count_index(
+		&self,
+		_snapshot: Snapshot,
+		index: crate::datastore::IndexId,
+		graph: Option<&GraphRef>,
+	) -> FerrosGrynnResult<u64> {
+		self.transaction.query_count_index(&self.snapshot, index, graph)
+	}
+
+	fn probe_index<'a>(
+		&'a self,
+		_snapshot: Snapshot,
+		class: &str,
+		graph: Option<&GraphRef>,
+		index: crate::datastore::IndexId,
+		values: &[Value],
+		full_row: bool,
+	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>> {
+		let rows = self.transaction.query_index_probe_cursor(
+			&self.snapshot,
+			class,
+			graph,
+			index,
+			values,
+		)?;
+		Ok(Box::new(StorageCursor {
+			rows,
+			dictionary: self.transaction.query_property_dictionary(),
+			full_row,
+		}))
 	}
 
 	fn graph_rows(
@@ -475,6 +734,22 @@ fn collect_scalar_constraints(
 		collect_scalar_constraints(right, slots, constraints);
 		return;
 	}
+	if *op == BinaryOperator::In
+		&& let TypedExprKind::Column(column) = &left.kind
+		&& let Some(value) = scalar_constraint_value(right, slots)
+	{
+		let values = match value {
+			Value::Array(values) => values.into_iter().collect(),
+			Value::Set(values) => values.into_iter().collect(),
+			_ => return,
+		};
+		constraints.push(ScalarIndexConstraint {
+			column: *column,
+			comparison: ScalarComparison::Equal,
+			values,
+		});
+		return;
+	}
 	let comparison = match op {
 		BinaryOperator::Equal | BinaryOperator::Is => ScalarComparison::Equal,
 		BinaryOperator::Less => ScalarComparison::Less,
@@ -489,7 +764,7 @@ fn collect_scalar_constraints(
 		constraints.push(ScalarIndexConstraint {
 			column: *column,
 			comparison,
-			value,
+			values: vec![value],
 		});
 	} else if let (Some(value), TypedExprKind::Column(column)) =
 		(scalar_constraint_value(left, slots), &right.kind)
@@ -503,7 +778,7 @@ fn collect_scalar_constraints(
 				ScalarComparison::Greater => ScalarComparison::Less,
 				ScalarComparison::GreaterOrEqual => ScalarComparison::LessOrEqual,
 			},
-			value,
+			values: vec![value],
 		});
 	}
 }
@@ -569,6 +844,7 @@ impl RowCursor for StorageCursor<'_> {
 		let Some(row) = self.rows.next_row()? else {
 			return Ok(None);
 		};
+		control.record_pull();
 		storage_row(row, &self.dictionary, self.full_row).map(Some)
 	}
 }

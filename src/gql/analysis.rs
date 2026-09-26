@@ -16,9 +16,11 @@ use super::ir::{
 	LogicalDmlStatement,
 	LogicalDmlTarget,
 	LogicalExpect,
+	LogicalExplain,
 	LogicalGraphDmlStatement,
 	LogicalGraphPropertyMutation,
 	LogicalGraphReference,
+	LogicalIndexHint,
 	LogicalMatch,
 	LogicalMatchPattern,
 	LogicalMatchSelector,
@@ -28,6 +30,7 @@ use super::ir::{
 	LogicalRelateEdge,
 	LogicalSchemaStatement,
 	LogicalSelect,
+	LogicalSelectAccess,
 	LogicalSelectItem,
 	LogicalSelectJoin,
 	LogicalSelectSource,
@@ -75,6 +78,7 @@ use crate::{
 		Program,
 		RecordKey,
 		RemoveTarget,
+		SelectAccessHint,
 		SelectGroup,
 		SelectItem,
 		SelectSource,
@@ -221,6 +225,11 @@ impl<'a> Analyzer<'a> {
 		loop_depth: u32,
 	) -> FerrosGrynnResult<LogicalStatement> {
 		Ok(match &statement.kind {
+			StatementKind::Explain(explain) => LogicalStatement::Explain(LogicalExplain {
+				mode: explain.mode,
+				format: explain.format,
+				statement: Box::new(self.statement(&explain.statement, loop_depth)?),
+			}),
 			StatementKind::Begin(_) | StatementKind::Commit(_) | StatementKind::Cancel => {
 				return Err(self.semantic(
 					"Transaction statements must be executed through Datastore or GqlSession.",
@@ -1353,6 +1362,19 @@ impl<'a> Analyzer<'a> {
 				predicate,
 			});
 		}
+		let access = match &statement.access {
+			None => LogicalSelectAccess::Automatic,
+			Some(SelectAccessHint::NoIndex(_)) => LogicalSelectAccess::NoIndex,
+			Some(SelectAccessHint::Indexes(indexes)) => LogicalSelectAccess::Indexes(
+				indexes
+					.iter()
+					.map(|hint| LogicalIndexHint {
+						source: hint.source.as_ref().map(|source| source.value.clone()),
+						index: hint.index.value.clone(),
+					})
+					.collect(),
+			),
+		};
 		let outer_columns = outer.map_or(0, |schema| schema.columns.len());
 		if let Some(outer) = outer {
 			input_schema.columns.extend(outer.columns.iter().cloned());
@@ -1472,7 +1494,13 @@ impl<'a> Analyzer<'a> {
 			.order
 			.iter()
 			.map(|order| {
-				let expression = if let ExprKind::Name(name) = &order.expression.kind
+				let expression = if order.random {
+					TypedExpr {
+						kind: TypedExprKind::Constant(Value::None),
+						ty: Type::Int,
+						span: order.expression.span,
+					}
+				} else if let ExprKind::Name(name) = &order.expression.kind
 					&& let Some(index) = result.index_of(name.value.as_ref())
 				{
 					TypedExpr {
@@ -1485,6 +1513,7 @@ impl<'a> Analyzer<'a> {
 				};
 				Ok(LogicalOrder {
 					expression,
+					random: order.random,
 					direction: order.direction,
 					nulls: order.nulls,
 				})
@@ -1536,6 +1565,7 @@ impl<'a> Analyzer<'a> {
 		Ok(LogicalSelect {
 			source,
 			joins,
+			access,
 			input_schema,
 			filter,
 			split,

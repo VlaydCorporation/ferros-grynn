@@ -119,9 +119,10 @@ impl OutputCollector {
 		read: &Read,
 		snapshot: Snapshot,
 		plan: &LogicalSelect,
+		requires_sort: bool,
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Self> {
-		if plan.order.is_empty() && !plan.tempfiles && plan.joins.is_empty() {
+		if !requires_sort && !plan.tempfiles && plan.joins.is_empty() && !control.deterministic() {
 			return Ok(Self::Memory(Vec::new()));
 		}
 		let root = control
@@ -147,7 +148,7 @@ impl OutputCollector {
 				control.barrier_account(),
 				plan.tempfiles,
 			)?,
-			preserve_input_order: plan.order.is_empty(),
+			preserve_input_order: plan.order.is_empty() && !control.deterministic(),
 		})
 	}
 
@@ -186,7 +187,7 @@ impl OutputCollector {
 	}
 }
 
-fn output_record(row: OutputRow) -> CursorRecord {
+pub(super) fn output_record(row: OutputRow) -> CursorRecord {
 	CursorRecord {
 		value: row.value,
 		anchor: CursorAnchor {

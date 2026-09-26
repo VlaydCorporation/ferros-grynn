@@ -3,17 +3,23 @@ use std::{
 	path::PathBuf,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 	},
 	time::{Duration, Instant},
 };
 
 pub(crate) const DEFAULT_BARRIER_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+static NEXT_STATEMENT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_statement_nonce() -> u64 {
+	NEXT_STATEMENT_NONCE.fetch_add(1, Ordering::Relaxed)
+}
 
 use parking_lot::Mutex;
 
 use super::{ParserSettings, QueryCursor, cursor::CursorRuntime};
 use crate::{
+	datastore::Transaction,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult, Outcome, Status, StatusReport},
 	syn::TimeoutValue,
 	values::{Object, Value},
@@ -56,6 +62,8 @@ pub struct QueryExecutionOptions {
 	pub barrier_memory_bytes: NonZeroUsize,
 	/// Optional root for transient query-run directories.
 	pub temporary_directory: Option<PathBuf>,
+	/// User component of strict deterministic replay seeds.
+	pub deterministic_seed: u64,
 }
 
 impl Default for QueryExecutionOptions {
@@ -69,6 +77,7 @@ impl Default for QueryExecutionOptions {
 			barrier_memory_bytes: NonZeroUsize::new(DEFAULT_BARRIER_MEMORY_BYTES)
 				.unwrap_or(NonZeroUsize::MIN),
 			temporary_directory: None,
+			deterministic_seed: 0,
 		}
 	}
 }
@@ -97,12 +106,23 @@ pub(crate) struct ExecutionControl {
 	pub(crate) temporary_directory: Option<PathBuf>,
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
 	continuation: Arc<Mutex<Option<QueryCursor>>>,
+	pending_index_seek: Arc<Mutex<Option<QueryCursor>>>,
+	deterministic: bool,
+	user_seed: u64,
+	parameter_fingerprint: u64,
+	statement_nonce: u64,
+	publication_deferred: bool,
+	instrumentation: bool,
 }
 
 #[derive(Debug)]
 struct BarrierMemory {
 	limit: usize,
 	used: AtomicUsize,
+	peak: AtomicUsize,
+	spill_bytes: AtomicU64,
+	spill_runs: AtomicU64,
+	row_pulls: AtomicU64,
 }
 
 /// Bytes retained by one in-memory SELECT barrier.
@@ -118,6 +138,10 @@ impl BarrierAccount {
 			memory: Arc::new(BarrierMemory {
 				limit,
 				used: AtomicUsize::new(0),
+				peak: AtomicUsize::new(0),
+				spill_bytes: AtomicU64::new(0),
+				spill_runs: AtomicU64::new(0),
+				row_pulls: AtomicU64::new(0),
 			}),
 			bytes: 0,
 		}
@@ -140,6 +164,7 @@ impl BarrierAccount {
 				Ordering::Acquire,
 			) {
 				Ok(_) => {
+					self.memory.peak.fetch_max(next, Ordering::AcqRel);
 					self.bytes += bytes;
 					return true;
 				}
@@ -161,6 +186,11 @@ impl BarrierAccount {
 			self.memory.used.fetch_sub(bytes, Ordering::AcqRel);
 			self.bytes -= bytes;
 		}
+	}
+
+	pub(crate) fn record_spill(&self, bytes: u64) {
+		self.memory.spill_bytes.fetch_add(bytes, Ordering::Relaxed);
+		self.memory.spill_runs.fetch_add(1, Ordering::Relaxed);
 	}
 }
 
@@ -197,11 +227,69 @@ impl ExecutionControl {
 			barrier_memory: Arc::new(BarrierMemory {
 				limit: options.barrier_memory_bytes.get(),
 				used: AtomicUsize::new(0),
+				peak: AtomicUsize::new(0),
+				spill_bytes: AtomicU64::new(0),
+				spill_runs: AtomicU64::new(0),
+				row_pulls: AtomicU64::new(0),
 			}),
 			temporary_directory: options.temporary_directory.clone(),
 			cursors,
 			continuation: Arc::new(Mutex::new(None)),
+			pending_index_seek: Arc::new(Mutex::new(None)),
+			deterministic: false,
+			user_seed: options.deterministic_seed,
+			parameter_fingerprint: 0,
+			statement_nonce: next_statement_nonce(),
+			publication_deferred: false,
+			instrumentation: false,
 		}
+	}
+
+	pub(crate) fn with_execution_mode(mut self, deterministic: bool, parameters: &Object) -> Self {
+		self.deterministic = deterministic;
+		self.parameter_fingerprint = crate::gql::optimizer::canonical_hash(
+			crate::gql::optimizer::PLAN_ENCODING_VERSION,
+			b"query-parameters",
+			parameters,
+		);
+		self
+	}
+
+	pub(crate) const fn deterministic(&self) -> bool {
+		self.deterministic
+	}
+
+	pub(crate) const fn with_publication_deferred(mut self, deferred: bool) -> Self {
+		self.publication_deferred = deferred;
+		self
+	}
+
+	pub(crate) const fn with_instrumentation(mut self) -> Self {
+		self.instrumentation = true;
+		self
+	}
+
+	pub(crate) const fn publication_deferred(&self) -> bool {
+		self.publication_deferred
+	}
+
+	pub(crate) fn statement_seed(&self, query_fingerprint: u64, snapshot: u64) -> u64 {
+		let replay = (
+			query_fingerprint,
+			self.parameter_fingerprint,
+			snapshot,
+			self.user_seed,
+			if self.deterministic {
+				0
+			} else {
+				self.statement_nonce
+			},
+		);
+		crate::gql::optimizer::canonical_hash(
+			crate::gql::optimizer::PLAN_ENCODING_VERSION,
+			b"statement-seed",
+			&replay,
+		)
 	}
 
 	pub(crate) fn check(&self) -> FerrosGrynnResult<()> {
@@ -243,6 +331,13 @@ impl ExecutionControl {
 			temporary_directory: self.temporary_directory.clone(),
 			cursors: self.cursors.clone(),
 			continuation: self.continuation.clone(),
+			pending_index_seek: self.pending_index_seek.clone(),
+			deterministic: self.deterministic,
+			user_seed: self.user_seed,
+			parameter_fingerprint: self.parameter_fingerprint,
+			statement_nonce: self.statement_nonce,
+			publication_deferred: self.publication_deferred,
+			instrumentation: self.instrumentation,
 		}
 	}
 
@@ -257,8 +352,54 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Returns the statement-wide barrier limit used by physical planning.
+	pub(crate) fn barrier_memory_limit(&self) -> usize {
+		self.barrier_memory.limit
+	}
+
+	pub(crate) fn barrier_memory_peak(&self) -> usize {
+		self.barrier_memory.peak.load(Ordering::Acquire)
+	}
+
+	pub(crate) fn spill_metrics(&self) -> (u64, u64) {
+		(
+			self.barrier_memory.spill_bytes.load(Ordering::Acquire),
+			self.barrier_memory.spill_runs.load(Ordering::Acquire),
+		)
+	}
+
+	pub(crate) fn row_pulls(&self) -> u64 {
+		self.barrier_memory.row_pulls.load(Ordering::Acquire)
+	}
+
+	pub(crate) fn record_pull(&self) {
+		if self.instrumentation {
+			self.barrier_memory.row_pulls.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
 	pub(crate) fn set_continuation(&self, cursor: QueryCursor) {
 		*self.continuation.lock() = Some(cursor);
+	}
+
+	pub(crate) fn set_pending_index_seek(&self, cursor: QueryCursor) {
+		*self.pending_index_seek.lock() = Some(cursor);
+	}
+
+	pub(crate) fn attach_pending_index_seek(
+		&self,
+		transaction: Transaction,
+	) -> FerrosGrynnResult<Option<Transaction>> {
+		let Some(cursor) = self.pending_index_seek.lock().take() else {
+			return Ok(Some(transaction));
+		};
+		let runtime = self.cursors.as_ref().ok_or_else(|| {
+			FerrosGrynnError::invalid_query_cursor(
+				"pending index continuation has no session runtime",
+			)
+		})?;
+		runtime.lock().attach_index_seek(cursor, transaction)?;
+		Ok(None)
 	}
 
 	pub(crate) fn take_continuation(&self) -> Option<QueryCursor> {
@@ -266,6 +407,11 @@ impl ExecutionControl {
 	}
 
 	pub(crate) fn discard_cursor(&self, cursor: QueryCursor) {
+		let mut pending = self.pending_index_seek.lock();
+		if pending.as_ref() == Some(&cursor) {
+			pending.take();
+		}
+		drop(pending);
 		if let Some(runtime) = &self.cursors {
 			drop(runtime.lock().close(cursor));
 		}
@@ -369,6 +515,7 @@ mod tests {
 	use std::num::NonZeroUsize;
 
 	use super::{ExecutionControl, QueryExecutionOptions, parse_fixed_duration};
+	use crate::values::{Object, Value};
 
 	#[test]
 	fn duration_at_rounded_u64_boundary_is_rejected_without_panicking() {
@@ -393,5 +540,28 @@ mod tests {
 
 		let mut replacement = control.barrier_account();
 		assert!(replacement.reserve(48));
+	}
+
+	#[test]
+	fn deterministic_statement_seed_covers_parameters_and_user_seed() {
+		let mut parameters = Object::new();
+		parameters.insert("value", Value::from(7_i64));
+		let options = QueryExecutionOptions {
+			deterministic_seed: 11,
+			..QueryExecutionOptions::default()
+		};
+		let first = ExecutionControl::new(&options, None)
+			.with_execution_mode(true, &parameters)
+			.statement_seed(13, 17);
+		let second = ExecutionControl::new(&options, None)
+			.with_execution_mode(true, &parameters)
+			.statement_seed(13, 17);
+		assert_eq!(first, second);
+
+		parameters.insert("value", Value::from(8_i64));
+		let changed = ExecutionControl::new(&options, None)
+			.with_execution_mode(true, &parameters)
+			.statement_seed(13, 17);
+		assert_ne!(first, changed);
 	}
 }

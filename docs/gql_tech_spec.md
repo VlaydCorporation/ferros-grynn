@@ -433,26 +433,27 @@ Scan(Person AS a) → Filter(a.age>18) → Expand(Out, FRIEND, b) → Filter(lab
 
 ## 6. Оптимизатор
 
-`Optimizer = RuleEngine (logical rewrite) + CostEngine (plan selection)` (§27 gql_spec). Конвейер (§27.1): Normalize → Rule-based rewrite → Stats annotation → Generate alternatives → Cost evaluation → Choose plan → (опц.) adaptive hooks.
+`Optimizer = RuleEngine (logical rewrite) + CostEngine (plan selection)` (§27 gql_spec). Этап 14
+реализует один crate-private concrete optimizer без публичного planner API, rule registry или
+trait с одной реализацией. Конвейер: typed normalize → canonical rules → stats annotation →
+bounded alternatives → fixed-point costs → canonical selection → physical sync-pull execution.
 
 ### 6.1. Rule-based правила
 
-**Семантически строгие (всегда безопасны, §22.3, §16 доказательства):**
-- Predicate pushdown: `Filter(Scan(T), p) → Scan(T, p)` (§16.1).
-- Projection pruning: удалять поля, не используемые выше (§16.3).
-- Expand + Filter fusion: `Expand → Filter(edge_pred) → Expand(edge_pred)` (§16.4 fusion).
-- Constant folding: `1+2 → 3`.
-- Dedup elimination — если ключ уже уникален.
-- Late materialization — не материализовывать объекты до явного запроса (§7.3).
-- Expand optimization: стартовать с узла минимальной степени/кардинальности; использовать adjacency index.
-
-**Условно безопасные:** join reordering (inner join без side-effects, §16.2); OPTIONAL MATCH преобразования; path pruning при известном `max_depth`.
-
-**Запрещены (§22.3, §16.6):** переставлять `IMPURE`; оптимизировать через явный `ORDER BY`; менять семантику пути (`SIMPLE`/`ACYCLIC`/`SHORTEST`); двигать операторы через side-effect барьеры.
+Rules выполняются в фиксированном порядке из `gql_spec.md` §22.3: typed pure constant folding,
+error-order-preserving conjunction split, single-source predicate pushdown, projection pruning,
+late materialization, safe LIMIT, exact count rewrite и exact sort elimination. LEFT JOIN, bag
+multiplicity, effective properties, observable error order и floating-point reduction order не
+меняются. OPTIONAL/path rewrites и новые path algorithms отложены до этапов 15–17.
 
 ### 6.2. Cost-based выбор
 
-`P* = argmin_P Cost(P)` при `∀P: [[P]] = [[Q]]` (§57 gql_spec). Модель стоимости (§22.4–§22.11 gql_spec):
+`P* = argmin_P (Cost(P), CanonicalPlanBytes(P))` при `∀P: [[P]] = [[Q]]`. Cardinality хранится
+диапазоном `{lower, expected, upper}`, а cost — versioned integer fixed-point значением. Его
+компоненты: startup, sequential rows, random lookups, expression CPU, peak memory, expected
+spill и uncertainty/resource risk. `f64` не участвует в выборе плана.
+
+Для текущего MATCH применяется только уже исполнимая seed/degree/cardinality модель:
 ```
 cost(op) ≈ rows_in × cost_per_row + overhead(cpu, io, memory)
 rows_out(Expand)   ≈ rows_in × avg_degree × selectivity(edge_label)
@@ -460,7 +461,8 @@ rows(PathExpand,d) ≈ rows_in × avg_degree^d          -- самая опасн
 ```
 Path-pruning-факторы: `effective_degree *= path_mode_factor × predicate_factor × dedup_factor` (Walk 1.0, Trail ~0.7, Simple ~0.3, Shortest ~0.05).
 
-CostEngine решает: join ordering (Selinger + graph-эвристики), стартовую точку MATCH (минимальная кардинальность), выбор алгоритма пути (BFS/DFS/Dijkstra), index vs scan.
+CostEngine решает scan/index, build side, bounded inner-join ordering и seed текущего MATCH.
+Полный path cost и выбор новых BFS/DFS/Dijkstra variants принадлежат этапам 15–17.
 
 ### 6.3. Источник статистики
 
@@ -479,24 +481,57 @@ Cost-model **обязан** иметь degree statistics — без них гр�
 deterministic reservoir 30 000 (`SAMPLE 1024..=1_000_000`). Auto threshold равен
 `max(1024, ceil(population*0.10))` и никогда не блокирует DML.
 
+Fresh histogram требует `revision == analyzed_revision && dirty_rows == 0`. До auto threshold
+он используется с расширенной uncertainty; после threshold заменяется conservative estimate и
+warning `statistics_stale`. Отсутствие даёт warning `statistics_missing`. Planner adapter
+передаёт только затребованные histograms из того же immutable statement snapshot и не раскрывает
+`DatabaseRoot`, `DataFileId`, page addresses или storage DTO.
+
 ### 6.4. Штрафы и деградация плана
 
 Штрафы (§22.11): `penalty_high_degree_nodes`, `penalty_unbounded_path`, `penalty_no_index`, `penalty_materialization`. Обязательное предупреждение планировщика при `degree > 10 AND depth > 4` (риск path explosion, §32.1). Без `max` в `[:E*]` применяется `MAXDEPTH` clause или `FG_PATH_MAX_DEPTH`.
 
 ### 6.5. `WITH`-подсказки
 
-`WITH NOINDEX` — принудительный class/membership scan; `WITH INDEX @i` — планировщик **обязан** использовать указанный индекс совместимого scope (§19.1 gql_spec), даже если optimizer предпочёл бы другой; `WITH COST fn` — пользовательская cost-функция пути (только `MATCH`/`TRAVERSE`).
+`WITH NOINDEX` запрещает user secondary indexes, но сохраняет primary/class/membership paths.
+`WITH INDEX source.i, source.j` задаёт разрешённый candidate set данного source; optimizer обязан
+выбрать один transaction-visible совместимый `Ready` index. Missing/stale/prepared/wrong-scope
+forced candidate даёт typed planning error до row pull. Без hint недоступность secondary index
+даёт scan fallback и explain warning. `WITH COST fn` остаётся будущей пользовательской
+path-cost функцией для MATCH/TRAVERSE.
 
 ### 6.6. Plan caching
 
-Ключ кеша: `normalized_query + schema_hash` (§4.7). Кешируются нормализованные логические/физические планы. Инвалидация — при изменении схемы (`schema_hash`) или значимом сдвиге статистики. Для детерминизма — canonical plan selection (§15.5).
+В этапе 14 plan cache отсутствует. Его можно добавить только после O12, если измерения докажут
+значимый planning overhead. Canonical plan selection и query/schema/statistics fingerprints не
+являются обещанием кеширования.
 
 ### 6.7. Физические альтернативы
 
-Каждый логический оператор раскрывается в несколько физических (§4.2 задела):
-`Scan → {ClassScan, GraphOccurrenceScan, IndexScan}`; `Join → {HashJoin, IndexJoin (NL),
-LeapfrogTrieJoin}`; `Expand → {ExpandAdjList, ExpandIndex}`; `PathExpand → {BFSExpand,
-DFSExpand, ShortestPathOp}`. Выбор — по cost model.
+Stage-14 alternatives ограничены:
+
+- source: `PointGet`, `ClassScan`, `GraphClassScan`, `ScalarIndexScan`, `CountLookup`,
+  `GraphCatalogScan`, `Derived`;
+- join: `HashJoin`, `PartitionedHashJoin`, `BlockNestedLoop`, `IndexNestedLoop`;
+- write: `TargetSelection`, `Mutation`, `ConstraintValidation`, `CatalogMutation`, `IndexBuild`,
+  `Publication`.
+
+WCOJ/Leapfrog, adaptive/runtime switching, parallel/vectorized execution и новые path operators
+не входят.
+
+### 6.8. Planner snapshot и EXPLAIN
+
+Transaction adapter строит из immutable statement snapshot read-only `PlannerSnapshot`: class,
+field и index metadata, `IndexId`, kind/state/scope/schema version, transaction-visible physical
+binding, exact counters и только затребованные property/degree histograms. Этот DTO не содержит
+`DatabaseRoot`, `DataFileId`, pages или storage codecs. Index path регистрирует тот же
+conservative `BaseClassRange`/`GraphClassRange`, что scan.
+
+`EXPLAIN` проецирует internal plan непосредственно в TEXT либо `Value::Object`; публичного Rust
+plan type нет. Plain/FULL прекращаются после planning и не открывают writer lease или cursor.
+`ANALYZE` оборачивает обычное исполнение одного statement, полностью потребляет SELECT и
+сохраняет autocommit/private-root/rollback semantics. Runtime counters включаются только для
+ANALYZE; обычный path не платит за detailed instrumentation.
 
 ---
 
@@ -1111,13 +1146,14 @@ range scan. Public trait с единственной реализацией не
 
 ### 13.2. Использование планировщиком
 
-Windows sync vertical slice извлекает scalar constraints только из конъюнкции `AND`: single-field
-index обслуживает equality/range, самый широкий полностью покрытый equality composite — exact
-lookup. Index возвращает candidates; затем обычный executor повторно проверяет полный predicate и
-регистрирует тот же SSI predicate, поэтому access path не меняет семантику. Неподдержанный prefix,
-отсутствующий/несовместимый specialized index или transaction-private graph write корректно
-деградирует к primary class/membership scan. Cost model и `WITH INDEX` относятся к последующему planner
-срезу. Adjacency-обход идёт через inline+overflow, а не через отдельный индекс.
+Stage-14 optimizer извлекает scalar constraints из error-order-preserving conjunction: leftmost
+equality prefix, один range следующего field либо конечный constant/parameter `IN`. Index
+возвращает candidates; executor повторно проверяет residual predicate и регистрирует тот же SSI
+class/graph range, поэтому access path не меняет семантику. Неподдержанный prefix,
+отсутствующий/несовместимый specialized index или transaction-private graph write без forced hint
+наблюдаемо деградирует к primary class/membership scan. `WITH INDEX` ограничивает candidate set,
+а `WITH NOINDEX` запрещает user secondary path. Adjacency-обход идёт через inline+overflow, а не
+через отдельный индекс.
 
 ### 13.3. Консистентность и обслуживание
 
@@ -1197,32 +1233,40 @@ Path-finding vs graph-expansion (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` прим�
 
 ### 15.1. Режимы исполнения
 
-`DETERMINISTIC` (строгая воспроизводимость), `BEST_EFFORT` (детерминизм без гарантии порядка; default), `FAST` (максимум производительности, без гарантий). Формула: `Determinism = Snapshot + Seed + StableExecution + CanonicalPlan`.
-
-В исполнимом профиле этапов 11–12 реализован только `BEST_EFFORT`. Parser сохраняет
-`DETERMINISTIC`/`FAST`, но transaction driver отвергает их до открытия transaction. Разделы
-15.2–15.5 задают целевой контракт этапов 14/17 и не описывают текущий runtime path.
+`DETERMINISTIC` (строгая воспроизводимость), `BEST_EFFORT` (default) и будущий `FAST`.
+Формула: `Determinism = Snapshot + Seed + StableExecution + CanonicalPlan`. Этап 14 исполняет
+первые два режима; `FAST` остаётся typed unsupported до этапа 17. `DETERMINISTIC` допускает
+только `SNAPSHOT` и `SERIALIZABLE`; `READ COMMITTED` отклоняется до открытия transaction.
 
 ### 15.2. Источники недетерминизма
 
-Физика (порядок чтения страниц, потоки, нестабильная итерация hash); логика (нет `ORDER BY`, `RAND()`, `time::now()`, `uuid()`, FP-округление, порядок traversal); планировщик (cost-based выбор, статистика, adaptive execution).
+Физика (порядок чтения страниц, потоки, нестабильная итерация hash); логика (нет `ORDER BY`,
+`ORDER RAND()`, недетерминированные функции, FP-округление, порядок traversal); планировщик
+(cost-based выбор и статистика). Adaptive execution в этапе 14 отсутствует.
 
 ### 15.3. Контракты DETERMINISTIC
 
-- Фиксированный снимок + фиксированный seed + стабильный порядок + канонический план.
-- Без явного `ORDER BY` — авто-`ORDER BY stable_id(record)`, `stable_id = canonical RecordId(class, id)`.
+- Фиксированный снимок + effective seed + стабильный порядок + канонический план.
+- Без явного `ORDER BY` — финальный stable order по публичной provenance identity
+  (`RecordId`/`GraphRef`/join tuple/group key/split ordinal), не по внутреннему `AtomId`.
 - Deterministic traversal: `Expand(v)` возвращает `sorted(adj[v])`; параллельный traversal — stable merge или deterministic scheduler (`task_id = hash(node_id)`).
-- `rand()` → `rand(seed, row_id)`; `time::now()` → `snapshot.timestamp`; `uuid()` → `uuid(seed, row_id)`; `seed = f(query_hash, snapshot, user_seed)`.
+- `ORDER RAND()` использует versioned RapidHash V3 от effective seed и canonical stable row key.
+  `time::now()` и прочие nondeterministic/IMPURE функции отклоняются до чтения rows; scalar
+  `rand()`/`uuid()` остаются этапу 21.
 - Deterministic aggregation: `sum = fold(sorted(values))`; FP — фиксированное дерево редукции (pairwise) или `decimal` для критичного.
 - Side-effects — детерминированный порядок либо запрет в DETERMINISTIC.
 
 ### 15.4. Протокол воспроизводимости
 
-Минимальный набор для реплея: `Query + SnapshotID + Seed + PlanHash + EngineVersion`. `QueryContext { snapshot: SnapshotId, seed: u64, deterministic: bool, plan_hash: u64 }` — передаётся в каждый оператор.
+Минимальный replay tuple: `EngineVersion + NormalizedQuery + CanonicalParameters + SnapshotId +
+UserSeed + PlanHash`. Effective seed включает versioned query/parameter fingerprints, snapshot и
+`QueryExecutionOptions::deterministic_seed`.
 
 ### 15.5. Канонический план
 
-Cost-based выбор при равенстве стоимостей разрешается tie-breaker'ом `plan_hash` → `Plan = argmin(cost, plan_hash)`; `PlanHash` сохраняется для воспроизводимости.
+При равенстве fixed-point стоимости выбираются лексикографически минимальные canonical physical
+plan bytes. `PlanHash` вычисляется RapidHash V3 по этим versioned bytes. `DefaultHasher`, Debug
+output и iteration order hash maps запрещены и для effective seed, и для `PlanHash`.
 
 ---
 

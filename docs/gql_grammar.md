@@ -513,7 +513,11 @@ catch_binding ::= param | ident
 
 explain_stmt ::= "EXPLAIN" [ "ANALYZE" | "FULL" ]
                  [ "FORMAT" ( "TEXT" | "JSON" ) ]
-                 statement
+                 explainable_stmt
+explainable_stmt ::= select_stmt | match_stmt
+                   | create_stmt | update_stmt | upsert_stmt | delete_stmt
+                   | attach_stmt | detach_stmt | relate_stmt
+                   | define_stmt | alter_stmt | remove_stmt
 
 assert_invariants_stmt ::= "ASSERT" "INVARIANTS" [ "FOR" "GRAPH" graph_ref ] [ "REPORT" integer ]
 
@@ -544,8 +548,9 @@ result-producing DML `RETURN` и transaction statements до writer lease. `COMM
 является alias для `SEGMENT SIZE`.
 
 `CATCH`-обработчик имеет специальную форму `|binding| block`, где binding имеет runtime-only
-тип `error`; это не общая closure (§7.9 spec). `EXPLAIN` доступен и как
-префиксный оператор (здесь), и как суффиксная clause `... EXPLAIN [FULL]` (§11.11).
+тип `error`; это не общая closure (§7.9 spec). `EXPLAIN` доступен только как префиксный
+оператор. Transaction statements, import, control flow и вложенный `EXPLAIN` в
+`explainable_stmt` не входят.
 
 ---
 
@@ -1262,8 +1267,9 @@ join_clause  ::= [ "INNER" ] "JOIN" select_source "ON" expr
 where_clause ::= "WHERE" expr
 
 with_clause  ::= "WITH" ( "NOINDEX"
-                        | "INDEX" name { "," name }
+                        | "INDEX" index_hint { "," index_hint }
                         | "COST" fn_name )
+index_hint   ::= [ alias "." ] name
 
 split_clause ::= "SPLIT" [ "ON" ] idiom { "," idiom }
 
@@ -1293,9 +1299,13 @@ expect_clause  ::= "EXPECT" ( expr | "EXISTS" | "NOT" "EXISTS" )
 target ::= ( record_range | record_id | class_name ) [ graph_scope ] | param | idiom
 ```
 
-`ORDER RAND()`, `COLLATE` и `NUMERIC` остаются в синтаксисе полного draft, но stage-13 analyzer
-возвращает typed unsupported до открытия source. `JOIN` без модификатора означает `INNER JOIN`.
-Derived source всегда требует alias; comma/`&` больше не являются операторами объединения sources.
+Начиная с этапа 14 `ORDER RAND()` исполним как специальный ordering operator. `COLLATE` и
+`NUMERIC` остаются в синтаксисе, но analyzer возвращает typed unsupported до чтения source; их
+владелец — этап 21. В `WITH INDEX` qualified имя связывает кандидат с source alias, а
+unqualified имя допустимо только при однозначной принадлежности. Несколько имён одного source
+задают candidate set, из которого optimizer обязан выбрать один Ready-index. `JOIN` без
+модификатора означает `INNER JOIN`. Derived source всегда требует alias; comma/`&` больше не
+являются операторами объединения sources.
 
 ---
 

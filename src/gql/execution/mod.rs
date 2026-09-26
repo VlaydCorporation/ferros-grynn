@@ -8,11 +8,12 @@ mod builtins;
 mod cursor;
 mod dml;
 mod eval;
+mod explain;
 mod graph_properties;
 mod schema;
 mod select;
 
-use std::{collections::BTreeSet, rc::Rc, sync::Arc, time::Instant};
+use std::{rc::Rc, sync::Arc, time::Instant};
 
 use adapter::TransactionRead;
 #[cfg(test)]
@@ -29,6 +30,10 @@ use select::execute_select;
 	          1"
 )]
 use {cursor::*, eval::*};
+
+pub(in crate::gql) fn evaluate_constant(expression: &TypedExpr) -> Option<Value> {
+	eval(expression, None, &[], "", None, None).ok()
+}
 
 use super::{
 	QueryResult,
@@ -56,6 +61,7 @@ use super::{
 		LogicalProgram,
 		LogicalSchemaStatement,
 		LogicalSelect,
+		LogicalSelectAccess,
 		LogicalSelectItem,
 		LogicalSelectSource,
 		LogicalSelectSourceKind,
@@ -81,6 +87,7 @@ use crate::{
 		QueryStorageRow,
 		ScalarComparison,
 		ScalarIndexConstraint,
+		ScalarIndexWindow,
 		Transaction,
 		TransactionGraphView,
 	},
@@ -187,6 +194,9 @@ fn execute_logical_statement<Read: QueryRead>(
 	bindings: &mut Object,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<QueryResult> {
+	if control.deterministic() {
+		crate::gql::optimizer::validate_deterministic_statement(statement)?;
+	}
 	let start = Instant::now();
 	let kind = logical_statement_kind(statement);
 	let mut runtime = ControlRuntime::default();
@@ -369,6 +379,11 @@ fn execute_statement<Read: QueryRead>(
 		));
 	}
 	let value = match statement {
+		LogicalStatement::Explain(explain) => {
+			return explain::execute_explain(
+				read, explain, slots, bindings, source, control, runtime, depth,
+			);
+		}
 		LogicalStatement::Schema(statement) => {
 			read.execute_schema(statement, slots, source, control)?
 		}
@@ -684,6 +699,7 @@ fn catchable(error: &FerrosGrynnError) -> bool {
 
 const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementKind {
 	match statement {
+		LogicalStatement::Explain(_) => QueryStatementKind::Explain,
 		LogicalStatement::Schema(statement) => statement.statement_kind(),
 		LogicalStatement::Dml(statement) => statement.kind.statement_kind(),
 		LogicalStatement::GraphDml(statement) => statement.statement_kind(),
@@ -740,8 +756,17 @@ fn execute_match<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
+	let demand = crate::gql::optimizer::PlannerDemand::for_match(plan);
+	let planner_snapshot = read.planner_snapshot(snapshot, &demand)?;
+	let deterministic_snapshot;
+	let planner_snapshot = if control.deterministic() {
+		deterministic_snapshot = planner_snapshot.deterministic_projection();
+		&deterministic_snapshot
+	} else {
+		&planner_snapshot
+	};
+	let physical = crate::gql::optimizer::plan_match(plan, planner_snapshot)?;
 	let graph = Rc::new(read.graph(snapshot, &plan.graph)?);
-	let ordered = optimize_match_patterns(graph.as_ref(), &plan.patterns)?;
 	let has_chain = plan.patterns.iter().any(|pattern| pattern.ops.len() > 1);
 	let has_path = plan
 		.patterns
@@ -768,7 +793,8 @@ fn execute_match<Read: QueryRead>(
 	let mut cursor: Box<dyn RowCursor + '_> = Box::new(OneRowCursor {
 		row: Some(Row::bindings(plan.bindings.columns.len())),
 	});
-	for pattern in ordered {
+	for pattern_index in physical.pattern_order {
+		let pattern = &plan.patterns[pattern_index];
 		let start = resolve_match_binding(&pattern.start, slots, source, control)?;
 		let candidates = read.match_candidates(snapshot, &plan.graph, &start)?;
 		cursor = Box::new(SeedCursor::new(cursor, graph.clone(), start, candidates));
@@ -829,89 +855,6 @@ fn execute_match<Read: QueryRead>(
 		result.push(Value::Object(object));
 	}
 	Ok(Value::Array(result))
-}
-
-/// Orders patterns by connectivity, estimated cardinality, and source order.
-fn optimize_match_patterns<'a, Graph: GraphRead>(
-	graph: &Graph,
-	patterns: &'a [LogicalMatchPattern],
-) -> FerrosGrynnResult<Vec<&'a LogicalMatchPattern>> {
-	let nodes = graph.node_count()?;
-	let edges = graph.edge_count()?;
-	let average_degree =
-		edges.saturating_mul(2).saturating_add(nodes.max(1).saturating_sub(1)) / nodes.max(1);
-	let mut remaining = patterns.iter().collect::<Vec<_>>();
-	let mut known = BTreeSet::new();
-	let mut ordered = Vec::with_capacity(patterns.len());
-	while !remaining.is_empty() {
-		let mut best = 0;
-		for index in 1..remaining.len() {
-			let candidate = remaining[index];
-			let current = remaining[best];
-			let candidate_connected =
-				pattern_columns(candidate).any(|column| known.contains(&column));
-			let current_connected = pattern_columns(current).any(|column| known.contains(&column));
-			let candidate_key = (
-				!candidate_connected,
-				pattern_estimate(candidate, nodes, edges, average_degree),
-				candidate.original_index,
-			);
-			let current_key = (
-				!current_connected,
-				pattern_estimate(current, nodes, edges, average_degree),
-				current.original_index,
-			);
-			if candidate_key < current_key {
-				best = index;
-			}
-		}
-		let pattern = remaining.remove(best);
-		known.extend(pattern_columns(pattern));
-		ordered.push(pattern);
-	}
-	Ok(ordered)
-}
-
-/// Estimates one pattern using exact graph counts and average degree.
-fn pattern_estimate(
-	pattern: &LogicalMatchPattern,
-	nodes: usize,
-	edges: usize,
-	average_degree: usize,
-) -> usize {
-	let hops = pattern.ops.iter().fold(0_usize, |total, op| {
-		total.saturating_add(match op {
-			MatchOp::Expand(_) => 1,
-			MatchOp::PathExpand(expand) => expand.max as usize,
-		})
-	});
-	if hops == 0 {
-		return match pattern.start.domain {
-			EndpointDomain::Node => nodes,
-			EndpointDomain::Edge => edges,
-		};
-	}
-	(1..hops).fold(edges, |estimate, _hop| estimate.saturating_mul(average_degree))
-}
-
-/// Iterates all binding columns mentioned by a pattern.
-fn pattern_columns(pattern: &LogicalMatchPattern) -> impl Iterator<Item = usize> + '_ {
-	pattern.start.column.into_iter().chain(pattern.ops.iter().flat_map(|op| {
-		match op {
-			MatchOp::Expand(expand) => {
-				[expand.source.column, expand.edge.column, expand.target.column]
-					.into_iter()
-					.flatten()
-					.collect::<Vec<_>>()
-			}
-			MatchOp::PathExpand(expand) => {
-				[expand.source.column, expand.target.column, expand.path_column]
-					.into_iter()
-					.flatten()
-					.collect::<Vec<_>>()
-			}
-		}
-	}))
 }
 
 /// Reports whether a pattern requires AtomWalk traversal semantics.

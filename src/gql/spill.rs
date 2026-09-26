@@ -177,7 +177,9 @@ impl QuerySorter {
 			let mut output = Vec::with_capacity(input.len().div_ceil(MERGE_FAN_IN));
 			for group in input.chunks(MERGE_FAN_IN) {
 				let path = self.new_run_path()?;
-				output.push(merge_group(group, path, &self.fields, &mut self.context)?);
+				let run = merge_group(group, path, &self.fields, &mut self.context)?;
+				self.account.record_spill(run.logical_end);
+				output.push(run);
 				for run in group {
 					fs::remove_file(&run.path)
 						.map_err(|source| run_io("remove merged query run", source))?;
@@ -211,7 +213,9 @@ impl QuerySorter {
 		for record in self.buffered.drain(..) {
 			writer.push(record, &mut self.context)?;
 		}
-		self.runs.push(writer.finish()?);
+		let run = writer.finish()?;
+		self.account.record_spill(run.logical_end);
+		self.runs.push(run);
 		self.buffered_bytes = 0;
 		self.account.release_all();
 		Ok(())
@@ -221,7 +225,9 @@ impl QuerySorter {
 		let path = self.new_run_path()?;
 		let mut writer = RunWriter::create(path)?;
 		writer.push(record, &mut self.context)?;
-		self.runs.push(writer.finish()?);
+		let run = writer.finish()?;
+		self.account.record_spill(run.logical_end);
+		self.runs.push(run);
 		Ok(())
 	}
 

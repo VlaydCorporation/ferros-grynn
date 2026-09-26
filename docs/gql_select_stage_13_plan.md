@@ -131,8 +131,8 @@ split ordinal.
 
 Keyset требует `ORDER BY`. Exact continuation читает immutable spool исходного snapshot.
 Просроченный snapshot возвращает `SnapshotExpired`; явный `READ COMMITTED` повторяет запрос на
-новом root после сохранённых sort/stable keys. `RAND()`, `COLLATE` и `NUMERIC` распознаются, но
-получают typed unsupported до чтения данных.
+новом root после сохранённых sort/stable keys. `ORDER RAND()` распознаётся, но до этапа 14
+получает typed unsupported; `COLLATE` и `NUMERIC` принадлежат этапу 21.
 
 ## 2. Public API и bounded resources
 
@@ -153,21 +153,21 @@ orphan runs.
 
 ## 3. Dependency-ordered реализация
 
-| Шаг | Зависит от | Критерий завершения |
-|---|---|---|
-| ✅ S0. Нормативная синхронизация | этап 12 | Этот план подключён к `full_plan`; spec/grammar/tech/disk согласованы, baseline снят |
-| ✅ S1. Durable graph properties | S0 | `FGDC v8`, DEFINE CONTENT, UPDATE SET/UNSET, RAM/local/reopen |
-| ✅ S2. Row/source model | S1 | Source binding хранит metadata/PropertyMap, schemaless wildcard и stable provenance |
-| ✅ S3. SELECT syntax/AST | S0 | GRAPH/GRAPHS/subquery, aliases, JOIN и все clauses разобраны без семантики в parser |
-| ✅ S4. Typed analysis и IR | S2, S3 | Scope/field resolution, aggregates, subquery cardinality, logical nodes и fingerprint |
-| ✅ S5. Budget и spill | S2, S4 | Shared accounting, run codec/merge, cleanup и TEMPFILES |
-| ✅ S6. Streaming shape slice | S4 | Sources, projection, WHERE, SPLIT, OMIT, FETCH и ONLY |
-| ✅ S7. JOIN и subqueries | S5, S6 | INNER/LEFT/CROSS и три контекста subquery |
-| ✅ S8. GROUP и aggregates | S5–S7 | Group keys, distinct и все утверждённые aggregates |
-| ✅ S9. ORDER и cursors | S5–S8 | External sort, stable keys, offset/exact/RC continuation |
-| ✅ S10. Correctness gate | S9 | RAM/local/reopen/MVCC/spill/cursor matrix |
-| ✅ S11. Resource/performance gate | S10 | RSS/temp/latency и regression gates с profiling evidence при bottleneck |
-| ✅ S12. Закрытие | S11 | Отчёт, отметка `full_plan`, deferred owners и `graphify update .` |
+| Шаг                               | Зависит от | Критерий завершения                                                                   |
+|-----------------------------------|------------|---------------------------------------------------------------------------------------|
+| ✅ S0. Нормативная синхронизация  | этап 12    | Этот план подключён к `full_plan`; spec/grammar/tech/disk согласованы, baseline снят  |
+| ✅ S1. Durable graph properties   | S0         | `FGDC v8`, DEFINE CONTENT, UPDATE SET/UNSET, RAM/local/reopen                         |
+| ✅ S2. Row/source model           | S1         | Source binding хранит metadata/PropertyMap, schemaless wildcard и stable provenance   |
+| ✅ S3. SELECT syntax/AST          | S0         | GRAPH/GRAPHS/subquery, aliases, JOIN и все clauses разобраны без семантики в parser   |
+| ✅ S4. Typed analysis и IR        | S2, S3     | Scope/field resolution, aggregates, subquery cardinality, logical nodes и fingerprint |
+| ✅ S5. Budget и spill             | S2, S4     | Shared accounting, run codec/merge, cleanup и TEMPFILES                               |
+| ✅ S6. Streaming shape slice      | S4         | Sources, projection, WHERE, SPLIT, OMIT, FETCH и ONLY                                 |
+| ✅ S7. JOIN и subqueries          | S5, S6     | INNER/LEFT/CROSS и три контекста subquery                                             |
+| ✅ S8. GROUP и aggregates         | S5–S7      | Group keys, distinct и все утверждённые aggregates                                    |
+| ✅ S9. ORDER и cursors            | S5–S8      | External sort, stable keys, offset/exact/RC continuation                              |
+| ✅ S10. Correctness gate          | S9         | RAM/local/reopen/MVCC/spill/cursor matrix                                             |
+| ✅ S11. Resource/performance gate | S10        | RSS/temp/latency и regression gates с profiling evidence при bottleneck               |
+| ✅ S12. Закрытие                  | S11        | Отчёт, отметка `full_plan`, deferred owners и `graphify update .`                     |
 
 Execution-код делится по source, shape, join, aggregate, sort/pagination и spill; единый
 многотысячестрочный `select.rs`/`pipeline.rs` не создаётся.
@@ -188,6 +188,7 @@ Performance gate требует: простой SELECT не хуже baseline б
 
 CBO, hints, join reorder и index-ordered seek принадлежат этапу 14; topology joins — этапу 15;
 traversal map/reduce — этапу 17; `RIGHT/FULL/SEMI/ANTI`, `UNION` и `LATERAL` не добавляются без
-реального запроса. `ORDER BY RAND()`/collation/numeric-string ordering принадлежат этапам 14/21.
+реального запроса. `ORDER BY RAND()` принадлежит этапу 14; collation и numeric-string ordering —
+этапу 21.
 Новые dependencies, async runtime, public streaming API, dynamic function registry и общий sorter
 trait не вводятся.

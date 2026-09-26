@@ -5,12 +5,12 @@
 
 use super::*;
 use crate::gql::{
-	cursor::{CursorAnchor, CursorPage, CursorRecord},
+	cursor::{CursorAnchor, CursorPage, CursorRecord, IndexSeekCheckout, IndexSeekPlan},
 	spill::{QuerySorter, SortField, SortedRecords, compare_record_anchor},
 };
 
 mod expression;
-mod fingerprint;
+pub(super) mod fingerprint;
 mod join;
 mod pagination;
 mod rows;
@@ -20,6 +20,24 @@ use join::*;
 use pagination::*;
 use rows::*;
 
+fn prepare_physical_plan<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	logical: &LogicalSelect,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<(LogicalSelect, crate::gql::optimizer::PhysicalSelectPlan)> {
+	let demand = crate::gql::optimizer::PlannerDemand::for_select(logical);
+	let planner_snapshot = read.planner_snapshot(snapshot, &demand)?;
+	let deterministic_snapshot;
+	let planner_snapshot = if control.deterministic() {
+		deterministic_snapshot = planner_snapshot.deterministic_projection();
+		&deterministic_snapshot
+	} else {
+		&planner_snapshot
+	};
+	crate::gql::optimizer::prepare_select(logical, planner_snapshot, control.barrier_memory_limit())
+}
+
 pub(super) fn execute_select<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -28,6 +46,8 @@ pub(super) fn execute_select<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
+	let (plan, physical) = prepare_physical_plan(read, snapshot, plan, control)?;
+	let plan = &plan;
 	let (fingerprint, order_fingerprint) = fingerprint::fingerprints(plan);
 	let values = match &plan.start {
 		Some(LogicalSelectStart::After {
@@ -66,38 +86,72 @@ pub(super) fn execute_select<Read: QueryRead>(
 					return Err(error);
 				}
 			};
-			if *read_committed {
+			if !*read_committed {
+				let checkout =
+					runtime.lock().checkout_index_seek(cursor, fingerprint, order_fingerprint)?;
+				if let Some(checkout) = checkout {
+					resume_index_seek(runtime, checkout, page_size, control)?
+				} else {
+					let page =
+						runtime.lock().page(cursor, fingerprint, order_fingerprint, page_size)?;
+					if let Err(error) = control.check() {
+						control.discard_cursor(cursor);
+						return Err(error);
+					}
+					let CursorPage {
+						values,
+						continuation,
+					} = page;
+					if let Some(cursor) = continuation {
+						control.set_continuation(cursor);
+					}
+					values
+				}
+			} else {
 				let anchor =
 					runtime.lock().read_committed_anchor(cursor, fingerprint, order_fingerprint)?;
 				runtime.lock().close(cursor)?;
-				let output =
-					execute_select_output(read, snapshot, plan, slots, source, control, None)?;
-				let output = output_after_anchor(output, &anchor, plan)?;
-				page_output(
-					output,
-					0,
-					Some(page_size),
-					plan,
-					snapshot,
-					control,
-					fingerprint,
-					order_fingerprint,
-				)?
-			} else {
-				let page =
-					runtime.lock().page(cursor, fingerprint, order_fingerprint, page_size)?;
-				if let Err(error) = control.check() {
-					control.discard_cursor(cursor);
-					return Err(error);
+				if page_size != 0
+					&& !control.publication_deferred()
+					&& let Some(records) = execute_index_seek_page(
+						read,
+						snapshot,
+						plan,
+						&physical,
+						slots,
+						source,
+						control,
+						Some(&anchor),
+						page_size.saturating_add(1),
+					)? {
+					finish_new_index_seek_page(
+						records,
+						page_size,
+						plan,
+						&physical,
+						slots,
+						source,
+						fingerprint,
+						order_fingerprint,
+						snapshot,
+						control,
+					)?
+				} else {
+					let output = execute_select_output(
+						read, snapshot, plan, &physical, slots, source, control, None,
+					)?;
+					let output = output_after_anchor(output, &anchor, plan)?;
+					page_output(
+						output,
+						0,
+						Some(page_size),
+						plan,
+						snapshot,
+						control,
+						fingerprint,
+						order_fingerprint,
+					)?
 				}
-				let CursorPage {
-					values,
-					continuation,
-				} = page;
-				if let Some(cursor) = continuation {
-					control.set_continuation(cursor);
-				}
-				values
 			}
 		}
 		_ => {
@@ -112,10 +166,37 @@ pub(super) fn execute_select<Read: QueryRead>(
 				}) => unreachable!(),
 			};
 			let limit = select_limit(plan, slots, source, control)?;
-			if let Some(values) = execute_streaming_select_values(
+			if start == 0
+				&& limit.is_some_and(|limit| limit != 0)
+				&& (control.cursors().is_none() || !control.publication_deferred())
+				&& let Some(records) = execute_index_seek_page(
+					read,
+					snapshot,
+					plan,
+					&physical,
+					slots,
+					source,
+					control,
+					None,
+					limit.unwrap_or(0).saturating_add(1),
+				)? {
+				finish_new_index_seek_page(
+					records,
+					limit.unwrap_or(0),
+					plan,
+					&physical,
+					slots,
+					source,
+					fingerprint,
+					order_fingerprint,
+					snapshot,
+					control,
+				)?
+			} else if let Some(values) = execute_streaming_select_values(
 				read,
 				snapshot,
 				plan,
+				&physical,
 				slots,
 				source,
 				control,
@@ -125,8 +206,9 @@ pub(super) fn execute_select<Read: QueryRead>(
 			)? {
 				values
 			} else {
-				let output =
-					execute_select_output(read, snapshot, plan, slots, source, control, None)?;
+				let output = execute_select_output(
+					read, snapshot, plan, &physical, slots, source, control, None,
+				)?;
 				page_output(
 					output,
 					start,
@@ -151,6 +233,162 @@ pub(super) fn execute_select<Read: QueryRead>(
 	Ok(Value::Array(values.into_iter().collect()))
 }
 
+#[allow(
+	clippy::too_many_arguments,
+	reason = "continuation registration retains the complete analyzed read state"
+)]
+fn finish_new_index_seek_page(
+	mut records: Vec<CursorRecord>,
+	page_size: usize,
+	plan: &LogicalSelect,
+	physical: &crate::gql::optimizer::PhysicalSelectPlan,
+	slots: &[Value],
+	source: &str,
+	fingerprint: u64,
+	order_fingerprint: u64,
+	snapshot: Snapshot,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Vec<Value>> {
+	let has_more = records.len() > page_size;
+	records.truncate(page_size);
+	let values = records.iter().map(|record| record.value.clone()).collect::<Vec<_>>();
+	if has_more && let Some(runtime) = control.cursors() {
+		let anchor = records
+			.last()
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_query_cursor("index continuation page is empty")
+			})?
+			.anchor
+			.clone();
+		let cursor = runtime.lock().register_index_seek(
+			IndexSeekPlan {
+				plan: plan.clone(),
+				physical: physical.clone(),
+				slots: slots.to_vec(),
+				source: source.to_owned(),
+			},
+			fingerprint,
+			order_fingerprint,
+			snapshot.0,
+			anchor,
+		)?;
+		control.set_pending_index_seek(cursor);
+		control.set_continuation(cursor);
+	}
+	Ok(values)
+}
+
+fn resume_index_seek(
+	runtime: &Arc<parking_lot::Mutex<crate::gql::cursor::CursorRuntime>>,
+	mut checkout: IndexSeekCheckout,
+	page_size: usize,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Vec<Value>> {
+	let page = (|| {
+		let snapshot = checkout.transaction.query_snapshot()?;
+		let snapshot_id = Snapshot(snapshot.commit_ts());
+		let read = TransactionRead {
+			transaction: &mut checkout.transaction,
+			snapshot,
+		};
+		execute_index_seek_page(
+			&read,
+			snapshot_id,
+			&checkout.plan,
+			&checkout.physical,
+			&checkout.slots,
+			&checkout.source,
+			control,
+			Some(&checkout.anchor),
+			page_size.saturating_add(1),
+		)
+	})();
+	let Some(mut records) = (match page {
+		Ok(records) => records,
+		Err(error) => {
+			runtime.lock().abort_index_seek(&checkout);
+			return Err(error);
+		}
+	}) else {
+		runtime.lock().abort_index_seek(&checkout);
+		return Err(FerrosGrynnError::invalid_query_cursor(
+			"captured query is no longer eligible for index continuation",
+		));
+	};
+	let has_more = records.len() > page_size;
+	records.truncate(page_size);
+	let next_anchor =
+		has_more.then(|| records.last().map(|record| record.anchor.clone())).flatten();
+	let values = records.into_iter().map(|record| record.value).collect();
+	let continuation = runtime.lock().finish_index_seek(checkout, next_anchor)?;
+	if let Some(cursor) = continuation {
+		control.set_continuation(cursor);
+	}
+	Ok(values)
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "keyset execution retains the analyzed query and exact snapshot context"
+)]
+fn execute_index_seek_page<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	physical: &crate::gql::optimizer::PhysicalSelectPlan,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	after: Option<&CursorAnchor>,
+	maximum: usize,
+) -> FerrosGrynnResult<Option<Vec<CursorRecord>>> {
+	if maximum == 0
+		|| plan.only
+		|| !plan.joins.is_empty()
+		|| plan.group.is_some()
+		|| !plan.split.is_empty()
+		|| plan.filter.is_some()
+		|| plan.tempfiles
+		|| plan.order.is_empty()
+		|| physical.requires_sort
+		|| matches!(plan.source.kind, LogicalSelectSourceKind::Derived(_))
+	{
+		return Ok(None);
+	}
+	let Some(index) = physical.sources.first().and_then(planned_scalar_index) else {
+		return Ok(None);
+	};
+	let mut records = Vec::with_capacity(maximum.min(1_024));
+	let mut ordinal = 0_usize;
+	visit_streaming_source_rows(
+		read,
+		snapshot,
+		&plan.source,
+		slots,
+		source,
+		control,
+		None,
+		true,
+		Some(index),
+		Some(IndexScanWindow {
+			after,
+			maximum,
+		}),
+		None,
+		|row| {
+			let output = build_output_row(
+				read, snapshot, plan, row, None, ordinal, None, slots, source, control,
+			)?;
+			ordinal = ordinal.checked_add(1).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("index continuation ordinal overflow")
+			})?;
+			records.push(output_record(output));
+			Ok(records.len() < maximum)
+		},
+	)?;
+	Ok(Some(records))
+}
+
 fn execute_select_values<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -161,6 +399,8 @@ fn execute_select_values<Read: QueryRead>(
 	outer: Option<&Row>,
 	maximum: Option<usize>,
 ) -> FerrosGrynnResult<Vec<Value>> {
+	let (plan, physical) = prepare_physical_plan(read, snapshot, plan, control)?;
+	let plan = &plan;
 	let start = match &plan.start {
 		None => 0,
 		Some(LogicalSelectStart::Offset(value)) => eval_usize(value, slots, source, control)?,
@@ -176,12 +416,13 @@ fn execute_select_values<Read: QueryRead>(
 		.unwrap_or(usize::MAX)
 		.min(maximum.unwrap_or(usize::MAX));
 	let values = match execute_streaming_select_values(
-		read, snapshot, plan, slots, source, control, outer, start, limit,
+		read, snapshot, plan, &physical, slots, source, control, outer, start, limit,
 	)? {
 		Some(values) => values,
 		None => {
-			let output =
-				execute_select_output(read, snapshot, plan, slots, source, control, outer)?;
+			let output = execute_select_output(
+				read, snapshot, plan, &physical, slots, source, control, outer,
+			)?;
 			record_values(output, start, limit)?
 		}
 	};
@@ -200,6 +441,7 @@ fn execute_streaming_select_values<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
 	plan: &LogicalSelect,
+	physical: &crate::gql::optimizer::PhysicalSelectPlan,
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
@@ -210,7 +452,7 @@ fn execute_streaming_select_values<Read: QueryRead>(
 	if !plan.joins.is_empty()
 		|| plan.group.is_some()
 		|| !plan.split.is_empty()
-		|| !plan.order.is_empty()
+		|| (!plan.order.is_empty() && (physical.requires_sort || control.cursors().is_some()))
 		|| plan.tempfiles
 		|| matches!(plan.source.kind, LogicalSelectSourceKind::Derived(_))
 	{
@@ -224,9 +466,59 @@ fn execute_streaming_select_values<Read: QueryRead>(
 	if limit == 0 {
 		return Ok(Some(Vec::new()));
 	}
+	if let Some(crate::gql::optimizer::SourceOperator::CountLookup {
+		index,
+		..
+	}) = physical.sources.first().map(|source| &source.operator)
+	{
+		if start != 0 {
+			return Ok(Some(Vec::new()));
+		}
+		let graph = match &plan.source.kind {
+			LogicalSelectSourceKind::Atoms {
+				graph,
+				..
+			} => graph
+				.as_ref()
+				.map(|reference| {
+					resolve_graph_reference(
+						read, snapshot, reference, outer, slots, source, control,
+					)
+				})
+				.transpose()?,
+			_ => None,
+		};
+		let count = Value::from(read.count_index(snapshot, *index, graph.as_ref())?);
+		let value = if plan.value {
+			count
+		} else {
+			let name = match plan.projection.as_slice() {
+				[
+					LogicalSelectItem::Expression {
+						name,
+						..
+					},
+				] => name,
+				_ => {
+					return Err(FerrosGrynnError::invalid_argument(
+						"CountLookup requires one aggregate projection",
+					));
+				}
+			};
+			let mut value = Object::new();
+			value.insert(name.as_ref(), count);
+			Value::Object(value)
+		};
+		return Ok(Some(vec![value]));
+	}
 	let mut values = Vec::with_capacity(limit.min(1024));
 	let mut projected = 0_usize;
 	let full_row = outer.is_some() || select_requires_expanded_atom_row(plan);
+	let index = physical.sources.first().and_then(planned_scalar_index);
+	let window = index.map(|_index| IndexScanWindow {
+		after: None,
+		maximum: start.saturating_add(limit),
+	});
 	visit_streaming_source_rows(
 		read,
 		snapshot,
@@ -236,6 +528,9 @@ fn execute_streaming_select_values<Read: QueryRead>(
 		control,
 		outer,
 		full_row,
+		index,
+		window,
+		physical.pushed_filter.then_some(plan.filter.as_ref()).flatten(),
 		|row| {
 			if let Some(predicate) = &plan.filter
 				&& !eval_select_expr(read, snapshot, predicate, &row, None, slots, source, control)?
@@ -271,6 +566,9 @@ fn visit_streaming_source_rows<Read: QueryRead>(
 	control: &ExecutionControl,
 	outer: Option<&Row>,
 	full_row: bool,
+	index: Option<(crate::datastore::IndexId, bool)>,
+	window: Option<IndexScanWindow<'_>>,
+	predicate: Option<&TypedExpr>,
 	mut visit: impl FnMut(Row) -> FerrosGrynnResult<bool>,
 ) -> FerrosGrynnResult<()> {
 	let append_outer = |mut row: Row| {
@@ -295,8 +593,17 @@ fn visit_streaming_source_rows<Read: QueryRead>(
 				.transpose()?;
 			match target {
 				ScanTarget::Class(class) => {
-					let mut cursor =
-						read.scan(snapshot, class, graph.as_ref(), None, slots, source, full_row)?;
+					let mut cursor = read.scan(
+						snapshot,
+						class,
+						graph.as_ref(),
+						predicate,
+						index,
+						window,
+						slots,
+						source,
+						full_row,
+					)?;
 					let mut ordinal = 0_usize;
 					while let Some(row) = cursor.next(control)? {
 						let row = append_outer(row.with_graph(graph.clone()));
@@ -354,18 +661,84 @@ fn execute_select_output<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
 	plan: &LogicalSelect,
+	physical: &crate::gql::optimizer::PhysicalSelectPlan,
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
 	outer: Option<&Row>,
 ) -> FerrosGrynnResult<SortedRecords> {
 	control.check()?;
-	let mut rows = source_rows(read, snapshot, &plan.source, slots, source, control, outer)?;
-	let mut left_width = plan.source.schema.columns.len();
-	for join in &plan.joins {
-		let right = source_rows(read, snapshot, &join.source, slots, source, control, None)?;
-		rows = join_rows(read, snapshot, rows, right, left_width, join, slots, source, control)?;
-		left_width += join.source.schema.columns.len();
+	let local_width = plan.input_schema.columns.len().saturating_sub(plan.outer_columns);
+	let mut rows = source_rows(
+		read,
+		snapshot,
+		logical_source(plan, physical.execution_order.first().copied().unwrap_or(0)),
+		physical.execution_order.first().and_then(|source| physical.sources.get(*source)),
+		physical.pushed_filter.then_some(plan.filter.as_ref()).flatten(),
+		slots,
+		source,
+		control,
+		outer,
+		Some(local_width),
+	)?;
+	for physical_join in &physical.joins {
+		let source_plan = logical_source(plan, physical_join.right_source);
+		let predicates = physical_join
+			.predicates
+			.iter()
+			.filter_map(|index| plan.joins.get(*index).and_then(|join| join.predicate.as_ref()))
+			.collect::<Vec<_>>();
+		let right_layout = physical
+			.sources
+			.get(physical_join.right_source)
+			.map(|source| (source.column_offset, source.column_width))
+			.unwrap_or((0, source_plan.schema.columns.len()));
+		if physical_join.operator == crate::gql::optimizer::JoinOperator::IndexNestedLoop {
+			let probe = physical_join.index_probe.as_ref().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("IndexNestedLoop has no exact probe")
+			})?;
+			rows = index_nested_join_rows(
+				read,
+				snapshot,
+				rows,
+				source_plan,
+				probe,
+				physical_join.kind,
+				&predicates,
+				right_layout,
+				slots,
+				source,
+				control,
+			)?;
+			continue;
+		}
+		let right = source_rows(
+			read,
+			snapshot,
+			source_plan,
+			physical.sources.get(physical_join.right_source),
+			None,
+			slots,
+			source,
+			control,
+			None,
+			Some(local_width),
+		)?;
+		rows = join_rows(
+			read,
+			snapshot,
+			rows,
+			right,
+			physical_join.kind,
+			&predicates,
+			&physical_join.key_columns,
+			physical_join.operator,
+			physical_join.build_side,
+			right_layout,
+			slots,
+			source,
+			control,
+		)?;
 	}
 	if let Some(outer) = outer {
 		let mut transformed = RowCollector::new(read, control, false);
@@ -391,8 +764,13 @@ fn execute_select_output<Read: QueryRead>(
 	for split in &plan.split {
 		rows = split_rows(read, snapshot, rows, split, slots, source, control)?;
 	}
+	let random_seed = plan
+		.order
+		.iter()
+		.any(|order| order.random)
+		.then(|| control.statement_seed(fingerprint::fingerprints(plan).0, snapshot.0));
 
-	let mut output = OutputCollector::new(read, snapshot, plan, control)?;
+	let mut output = OutputCollector::new(read, snapshot, plan, physical.requires_sort, control)?;
 	if plan.group.is_some() {
 		for_each_group(read, snapshot, plan, rows, slots, source, control, |ordinal, group| {
 			let row = group.first()?.unwrap_or_else(|| Row::new(Vec::new()));
@@ -403,6 +781,7 @@ fn execute_select_output<Read: QueryRead>(
 				row,
 				Some(&group),
 				ordinal,
+				random_seed,
 				slots,
 				source,
 				control,
@@ -412,8 +791,18 @@ fn execute_select_output<Read: QueryRead>(
 	} else {
 		let mut ordinal = 0;
 		rows.consume(|row| {
-			let output_row =
-				build_output_row(read, snapshot, plan, row, None, ordinal, slots, source, control)?;
+			let output_row = build_output_row(
+				read,
+				snapshot,
+				plan,
+				row,
+				None,
+				ordinal,
+				random_seed,
+				slots,
+				source,
+				control,
+			)?;
 			ordinal += 1;
 			output.push(output_row)
 		})?;
@@ -532,6 +921,7 @@ fn build_output_row<Read: QueryRead>(
 	row: Row,
 	group: Option<&RowSet>,
 	ordinal: usize,
+	random_seed: Option<u64>,
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
@@ -544,6 +934,21 @@ fn build_output_row<Read: QueryRead>(
 		.order
 		.iter()
 		.map(|order| {
+			if order.random {
+				let seed = random_seed.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("RAND ordering has no statement seed")
+				})?;
+				let stable = if row.stable.is_empty() {
+					row.sequence.iter().copied().map(Value::from).collect::<Vec<_>>()
+				} else {
+					row.stable.clone()
+				};
+				return Ok(Value::from(crate::gql::optimizer::canonical_hash(
+					crate::gql::optimizer::PLAN_ENCODING_VERSION,
+					b"order-rand-v3",
+					&(seed, stable),
+				)));
+			}
 			eval_select_expr(
 				read,
 				snapshot,
@@ -633,11 +1038,17 @@ fn source_rows<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
 	source_plan: &LogicalSelectSource,
+	physical: Option<&crate::gql::optimizer::PhysicalSource>,
+	predicate: Option<&TypedExpr>,
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
 	outer: Option<&Row>,
+	total_width: Option<usize>,
 ) -> FerrosGrynnResult<RowSet> {
+	let layout = physical
+		.zip(total_width)
+		.map(|(source, total)| (source.column_offset, source.column_width, total));
 	match &source_plan.kind {
 		LogicalSelectSourceKind::Atoms {
 			target,
@@ -653,15 +1064,27 @@ fn source_rows<Read: QueryRead>(
 				.transpose()?;
 			match target {
 				ScanTarget::Class(class) => {
-					let mut cursor =
-						read.scan(snapshot, class, graph.as_ref(), None, slots, source, true)?;
+					let mut cursor = read.scan(
+						snapshot,
+						class,
+						graph.as_ref(),
+						predicate,
+						physical.and_then(planned_scalar_index),
+						None,
+						slots,
+						source,
+						true,
+					)?;
 					let mut rows = RowCollector::new(read, control, false);
 					let mut ordinal = 0_usize;
 					while let Some(row) = cursor.next(control)? {
 						rows.push(
 							read,
 							snapshot,
-							row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+							layout_row(
+								row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+								layout,
+							),
 						)?;
 						ordinal = ordinal.checked_add(1).ok_or_else(|| {
 							FerrosGrynnError::invalid_argument("source row ordinal overflow")
@@ -674,7 +1097,7 @@ fn source_rows<Read: QueryRead>(
 					snapshot,
 					control,
 					read.get(snapshot, record, graph.as_ref())?
-						.map(|row| row.with_graph(graph))
+						.map(|row| layout_row(row.with_graph(graph), layout))
 						.into_iter()
 						.collect(),
 				),
@@ -696,11 +1119,72 @@ fn source_rows<Read: QueryRead>(
 						.collect::<FerrosGrynnResult<Vec<_>>>()
 				})
 				.transpose()?;
-			rows_to_set(read, snapshot, control, read.graph_rows(snapshot, references.as_deref())?)
+			rows_to_set(
+				read,
+				snapshot,
+				control,
+				read.graph_rows(snapshot, references.as_deref())?
+					.into_iter()
+					.map(|row| layout_row(row, layout))
+					.collect(),
+			)
 		}
 		LogicalSelectSourceKind::Derived(select) => {
-			derived_source_rows(read, snapshot, select, slots, source, control)
+			let rows = derived_source_rows(read, snapshot, select, slots, source, control)?;
+			if let Some(layout) = layout {
+				map_row_set(read, snapshot, control, rows, |row| layout_row(row, Some(layout)))
+			} else {
+				Ok(rows)
+			}
 		}
+	}
+}
+
+fn logical_source(plan: &LogicalSelect, index: usize) -> &LogicalSelectSource {
+	if index == 0 {
+		&plan.source
+	} else {
+		&plan.joins[index - 1].source
+	}
+}
+
+fn layout_row(mut row: Row, layout: Option<(usize, usize, usize)>) -> Row {
+	let Some((offset, width, total)) = layout else {
+		return row;
+	};
+	debug_assert_eq!(row.values.len(), width);
+	let mut values = vec![Value::None; total];
+	for (target, value) in
+		values[offset..offset.saturating_add(width)].iter_mut().zip(row.values.drain(..))
+	{
+		*target = value;
+	}
+	row.values = values;
+	row
+}
+
+fn map_row_set<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	control: &ExecutionControl,
+	rows: RowSet,
+	mut map: impl FnMut(Row) -> Row,
+) -> FerrosGrynnResult<RowSet> {
+	let mut output = RowCollector::new(read, control, false);
+	rows.consume(|row| output.push(read, snapshot, map(row)))?;
+	output.finish()
+}
+
+fn planned_scalar_index(
+	source: &crate::gql::optimizer::PhysicalSource,
+) -> Option<(crate::datastore::IndexId, bool)> {
+	match source.operator {
+		crate::gql::optimizer::SourceOperator::ScalarIndexScan {
+			index,
+			direction,
+			..
+		} => Some((index, direction == crate::gql::optimizer::IndexDirection::Reverse)),
+		_ => None,
 	}
 }
 
@@ -712,7 +1196,10 @@ fn derived_source_rows<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<RowSet> {
-	let output = execute_select_output(read, snapshot, select, slots, source, control, None)?;
+	let (select, physical) = prepare_physical_plan(read, snapshot, select, control)?;
+	let select = &select;
+	let output =
+		execute_select_output(read, snapshot, select, &physical, slots, source, control, None)?;
 	let start = match &select.start {
 		None => 0,
 		Some(LogicalSelectStart::Offset(value)) => eval_usize(value, slots, source, control)?,

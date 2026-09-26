@@ -13,6 +13,7 @@ pub struct SelectStatement {
 	pub projection: Vec<SelectItem>,
 	pub source: SelectSource,
 	pub joins: Vec<SelectJoin>,
+	pub access: Option<SelectAccessHint>,
 	pub filter: Option<Expr>,
 	pub split: Vec<Expr>,
 	pub group: Option<SelectGroup>,
@@ -22,6 +23,25 @@ pub struct SelectStatement {
 	pub limit: Option<Expr>,
 	pub start: Option<SelectStart>,
 	pub tempfiles: bool,
+}
+
+/// Optional user restriction over secondary-index candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SelectAccessHint {
+	/// Only the listed source/index candidates may be selected.
+	Indexes(Vec<SelectIndexHint>),
+	/// User secondary indexes are excluded for this SELECT.
+	NoIndex(TextSpan),
+}
+
+/// One optionally source-qualified index name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SelectIndexHint {
+	pub source: Option<Identifier>,
+	pub index: Identifier,
+	pub span: TextSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,7 +81,7 @@ pub struct SelectJoin {
 	pub span: TextSpan,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SelectJoinKind {
 	Inner,
@@ -80,6 +100,8 @@ pub enum SelectGroup {
 #[non_exhaustive]
 pub struct SelectOrder {
 	pub expression: Expr,
+	/// Special versioned stable-row hash ordering requested by `RAND()`.
+	pub random: bool,
 	pub direction: SelectOrderDirection,
 	pub nulls: SelectNulls,
 }
@@ -195,6 +217,34 @@ impl Parser<'_> {
 				predicate,
 			});
 		}
+		let access = if self.consume_keyword(keywords::WITH).is_some() {
+			if let Some(token) = self.consume_keyword(keywords::NOINDEX) {
+				Some(SelectAccessHint::NoIndex(token.span))
+			} else {
+				self.expect_keyword(keywords::INDEX, "Expected INDEX or NOINDEX after WITH.")?;
+				let mut indexes = Vec::new();
+				loop {
+					let first = self.identifier()?;
+					let start = first.span;
+					let (source, index) = if self.consume_symbol(Symbol::Dot).is_some() {
+						(Some(first), self.identifier()?)
+					} else {
+						(None, first)
+					};
+					indexes.push(SelectIndexHint {
+						span: cover(start, index.span),
+						source,
+						index,
+					});
+					if self.consume_symbol(Symbol::Comma).is_none() {
+						break;
+					}
+				}
+				Some(SelectAccessHint::Indexes(indexes))
+			}
+		} else {
+			None
+		};
 		let filter = if self.consume_keyword(keywords::WHERE).is_some() {
 			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else {
@@ -273,15 +323,13 @@ impl Parser<'_> {
 			break;
 		}
 		let tempfiles = self.consume_keyword(keywords::TEMPFILES).is_some();
-		if self.at_keyword(keywords::WITH) {
-			return Err(self.unsupported("SELECT WITH index hints", self.current().span));
-		}
 		Ok(SelectStatement {
 			only,
 			value,
 			projection,
 			source,
 			joins,
+			access,
 			filter,
 			split,
 			group,
@@ -390,9 +438,7 @@ impl Parser<'_> {
 		let mut order = Vec::new();
 		loop {
 			let expression = context.run(|context| self.expression(context, 0, 1, 0)).await?;
-			if select_order_is_rand(&expression) {
-				return Err(self.unsupported("ORDER BY RAND()", expression.span));
-			}
+			let random = select_order_is_rand(&expression);
 			if self.at_keyword("COLLATE") {
 				return Err(self.unsupported("ORDER BY COLLATE", self.current().span));
 			}
@@ -417,6 +463,7 @@ impl Parser<'_> {
 			};
 			order.push(SelectOrder {
 				expression,
+				random,
 				direction,
 				nulls,
 			});
@@ -494,6 +541,7 @@ impl Parser<'_> {
 				keywords::LEFT,
 				keywords::CROSS,
 				keywords::WHERE,
+				keywords::WITH,
 				keywords::SPLIT,
 				keywords::GROUP,
 				keywords::OMIT,

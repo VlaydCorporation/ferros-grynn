@@ -1,8 +1,10 @@
 mod control;
 mod dml;
+mod explain;
 mod graph_dml;
 mod import;
 mod r#match;
+mod optimizer_probe;
 mod schema;
 mod select;
 mod transaction;

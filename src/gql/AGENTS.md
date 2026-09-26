@@ -7,11 +7,14 @@
 `gql` сохраняет один pipeline:
 
 ```text
-src/syn parse -> analysis -> logical IR -> execution -> datastore adapter
+src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
+              -> execution -> datastore adapter
 ```
 
 - `analysis.rs` владеет name/type resolution и semantic errors;
 - `ir.rs` — typed logical plan, не storage plan;
+- `optimizer/` — единственный crate-private rule/CBO optimizer, physical plans,
+  fixed-point estimates/costs, deterministic plan encoding и EXPLAIN projection;
 - `execution/adapter.rs` — единственная граница к transaction snapshot;
 - `execution/cursor.rs` — pull-based relational cursors;
 - `execution/eval.rs` — вычисление typed expressions;
@@ -23,6 +26,18 @@ src/syn parse -> analysis -> logical IR -> execution -> datastore adapter
 - Не обходить analysis прямым исполнением AST.
 - IR и executor не зависят от page/WAL DTO; storage доступен только через
   transaction/query adapter.
+- Optimizer получает только read-only `PlannerSnapshot`: catalog/index metadata,
+  exact counters и востребованные histograms. `DatabaseRoot`, `DataFileId`,
+  страницы и physical addresses через эту границу не проходят.
+- Executor исполняет выбранные physical operators. Resource fallback допустим
+  только внутри заранее выбранного семейства (например, in-memory hash join в
+  partitioned hash join), но не как скрытый повторный planner.
+- Canonical rules не меняют bag semantics, LEFT/CROSS barriers, effective
+  properties, порядок наблюдаемых ошибок и floating reduction order.
+- Forced index hint является контрактом: каждый указанный source использует
+  совместимый Ready index либо получает planning error до чтения строк.
+- `DETERMINISTIC` использует canonical bytes и versioned RapidHash V3; Debug,
+  `DefaultHasher` и iteration order hash maps не являются частью PlanHash.
 - Публичный `QueryResult` содержит `Outcome<Value>` и стабильные
   `RecordId`/`AtomRef`, никогда внутренние IDs.
 - Ошибка получает правильную execution phase и source `TextSpan`; внешние

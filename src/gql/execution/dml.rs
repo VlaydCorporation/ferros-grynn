@@ -3,6 +3,8 @@
 	reason = "the DML executor shares typed IR and runtime helpers with its parent module"
 )]
 
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::{
 	datastore::{ClassSchema, ClassSchemaMode},
@@ -181,7 +183,8 @@ fn collect_dml_candidates(
 			}
 		}
 		LogicalDmlSelector::Class => {
-			let mut cursor = transaction.query_row_cursor(snapshot, &target.class, &[], graph)?;
+			let mut cursor =
+				transaction.query_row_cursor(snapshot, &target.class, &[], graph, None, None)?;
 			let start_len = output.len();
 			while let Some(row) = cursor.next_row()? {
 				control.check()?;

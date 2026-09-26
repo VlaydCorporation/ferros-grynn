@@ -1116,6 +1116,22 @@ define_status_codes!(
 			class: String => Identifier,
 		},
 	},
+	IndexHintNotUsable, "FG-42F03" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Planning,
+			severity: Severity::Error,
+		},
+		condition: Condition::SyntaxErrorOrAccessRuleViolation,
+		domain: Domain::Query,
+		subcondition: "forced index is not usable",
+		message: "Index hint {index} cannot be used for source {source}: {reason}.",
+		params: {
+			index: String => Identifier,
+			source: String => Identifier,
+			reason: String => DisplayValue,
+		},
+	},
 	QueryFeatureNotSupported, "FG-50F03" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,

@@ -19,6 +19,7 @@ pub(super) struct LogicalProgram {
 
 #[derive(Debug, Clone)]
 pub(super) enum LogicalStatement {
+	Explain(LogicalExplain),
 	Schema(LogicalSchemaStatement),
 	Dml(LogicalDmlStatement),
 	GraphDml(LogicalGraphDmlStatement),
@@ -62,6 +63,13 @@ pub(super) enum LogicalStatement {
 	/// Executes a read-only graph pattern match.
 	Match(LogicalMatch),
 	Select(LogicalSelect),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LogicalExplain {
+	pub(super) mode: crate::syn::ExplainMode,
+	pub(super) format: crate::syn::ExplainFormat,
+	pub(super) statement: Box<LogicalStatement>,
 }
 
 #[derive(Debug, Clone)]
@@ -474,6 +482,7 @@ pub(super) enum LogicalMatchSelector {
 pub(super) struct LogicalSelect {
 	pub(super) source: LogicalSelectSource,
 	pub(super) joins: Vec<LogicalSelectJoin>,
+	pub(super) access: LogicalSelectAccess,
 	pub(super) input_schema: Schema,
 	pub(super) filter: Option<TypedExpr>,
 	pub(super) split: Vec<TypedExpr>,
@@ -489,6 +498,20 @@ pub(super) struct LogicalSelect {
 	pub(super) only: bool,
 	pub(super) tempfiles: bool,
 	pub(super) outer_columns: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) enum LogicalSelectAccess {
+	#[default]
+	Automatic,
+	NoIndex,
+	Indexes(Vec<LogicalIndexHint>),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LogicalIndexHint {
+	pub(super) source: Option<Box<str>>,
+	pub(super) index: Box<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -547,6 +570,7 @@ pub(super) enum LogicalWildcardField {
 #[derive(Debug, Clone)]
 pub(super) struct LogicalOrder {
 	pub(super) expression: TypedExpr,
+	pub(super) random: bool,
 	pub(super) direction: crate::syn::SelectOrderDirection,
 	pub(super) nulls: crate::syn::SelectNulls,
 }

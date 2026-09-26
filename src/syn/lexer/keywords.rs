@@ -5,6 +5,7 @@ pub(in crate::syn) const ALL: &str = "ALL";
 pub(in crate::syn) const ATTACH: &str = "ATTACH";
 pub(in crate::syn) const AND: &str = "AND";
 pub(in crate::syn) const ALTER: &str = "ALTER";
+pub(in crate::syn) const ANALYZE: &str = "ANALYZE";
 pub(in crate::syn) const AS: &str = "AS";
 pub(in crate::syn) const ASC: &str = "ASC";
 pub(in crate::syn) const ASSERT: &str = "ASSERT";
@@ -52,6 +53,7 @@ pub(in crate::syn) const EFFECTIVE: &str = "EFFECTIVE";
 pub(in crate::syn) const END: &str = "END";
 pub(in crate::syn) const EVENTS: &str = "EVENTS";
 pub(in crate::syn) const EXECUTION: &str = "EXECUTION";
+pub(in crate::syn) const EXPLAIN: &str = "EXPLAIN";
 pub(in crate::syn) const EXISTS: &str = "EXISTS";
 pub(in crate::syn) const EXPECT: &str = "EXPECT";
 pub(in crate::syn) const FALSE: &str = "FALSE";
@@ -61,6 +63,8 @@ pub(in crate::syn) const FAST: &str = "FAST";
 pub(in crate::syn) const FIELDS: &str = "FIELDS";
 pub(in crate::syn) const FIRST: &str = "FIRST";
 pub(in crate::syn) const FOR: &str = "FOR";
+pub(in crate::syn) const FORMAT: &str = "FORMAT";
+pub(in crate::syn) const FULL: &str = "FULL";
 pub(in crate::syn) const FULLTEXT: &str = "FULLTEXT";
 pub(in crate::syn) const FROM: &str = "FROM";
 pub(in crate::syn) const GEOMETRY: &str = "GEOMETRY";
@@ -83,6 +87,7 @@ pub(in crate::syn) const INNER: &str = "INNER";
 pub(in crate::syn) const ISOLATION: &str = "ISOLATION";
 pub(in crate::syn) const IS: &str = "IS";
 pub(in crate::syn) const JOIN: &str = "JOIN";
+pub(in crate::syn) const JSON: &str = "JSON";
 pub(in crate::syn) const LET: &str = "LET";
 pub(in crate::syn) const LEVEL: &str = "LEVEL";
 pub(in crate::syn) const LABEL: &str = "LABEL";
@@ -94,6 +99,7 @@ pub(in crate::syn) const MODE: &str = "MODE";
 pub(in crate::syn) const MAINTAINED: &str = "MAINTAINED";
 pub(in crate::syn) const MERGE: &str = "MERGE";
 pub(in crate::syn) const NONE: &str = "NONE";
+pub(in crate::syn) const NOINDEX: &str = "NOINDEX";
 pub(in crate::syn) const NODE: &str = "NODE";
 pub(in crate::syn) const NOT: &str = "NOT";
 pub(in crate::syn) const NULL: &str = "NULL";
@@ -131,6 +137,7 @@ pub(in crate::syn) const SPLIT: &str = "SPLIT";
 pub(in crate::syn) const START: &str = "START";
 pub(in crate::syn) const TEMPFILES: &str = "TEMPFILES";
 pub(in crate::syn) const THEN: &str = "THEN";
+pub(in crate::syn) const TEXT: &str = "TEXT";
 pub(in crate::syn) const THROW: &str = "THROW";
 pub(in crate::syn) const TRUE: &str = "TRUE";
 pub(in crate::syn) const TRY: &str = "TRY";
@@ -153,7 +160,7 @@ pub(in crate::syn) const WHILE: &str = "WHILE";
 
 /// Statement starts recognized only to return the explicit unsupported status.
 pub(in crate::syn) const UNSUPPORTED_STATEMENTS: &[&str] =
-	&["EXPLAIN", "OPTIONAL", "TRAVERSE", "BUILD", "SHOW", "KILL", "REBUILD", "COMPACT", "LIVE"];
+	&["OPTIONAL", "TRAVERSE", "BUILD", "SHOW", "KILL", "REBUILD", "COMPACT", "LIVE"];
 
 /// MATCH modifiers recognized only to return the explicit unsupported status.
 pub(in crate::syn) const UNSUPPORTED_MATCH_MODIFIERS: &[&str] = &[

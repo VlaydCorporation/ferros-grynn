@@ -1392,8 +1392,10 @@ statement; уже опубликованные statements программы с�
 
 `BEGIN` открывает явную транзакцию; `COMMIT` фиксирует её; `CANCEL` откатывает. Default —
 `SERIALIZABLE READ WRITE`. Поддерживаются `READ COMMITTED`, `SNAPSHOT`, `SERIALIZABLE` и
-`READ ONLY`. В этапах 11–12 исполним только `BEST_EFFORT`; явно заданные `DETERMINISTIC` и
-`FAST` распознаются, но возвращают typed unsupported до открытия транзакции.
+`READ ONLY`. Начиная с этапа 14 исполнимы `BEST_EFFORT` и строгий `DETERMINISTIC`;
+`FAST` распознаётся, но возвращает typed unsupported до открытия транзакции. Сочетание
+`READ COMMITTED + DETERMINISTIC` запрещено, поскольку не фиксирует один snapshot всей
+транзакции.
 
 ```
 BEGIN;
@@ -1421,20 +1423,31 @@ statement-atomic семантику.
 
 ### 7.6. EXPLAIN
 
-Возвращает план выполнения запроса без его исполнения.
-
-При использовании `EXPLAIN` оператор возвращает пояснение, по сути раскрывающее план выполнения,
-чтобы обеспечить прозрачность и понимание производительности запроса.
-
-Использование ключевого слова `FULL` позволит отобразить количество обработанных строк в таких операциях, как `SELECT`, `UPDATE', `DELETE` и прочих.
+`EXPLAIN` является только префиксным оператором. Plain и `FULL` строят план без исполнения,
+row pull, writer lease и выделения durable identifiers. `ANALYZE` выполняет statement ровно один
+раз с обычной транзакционной семантикой, но заменяет его пользовательский result планом и
+runtime-метриками.
 
 ```
 EXPLAIN [ ANALYZE | FULL ] [ FORMAT TEXT | JSON ] @statement
 ```
 
-- `EXPLAIN` — логический план.
-- `EXPLAIN FULL` — физический план со стоимостями.
-- `EXPLAIN ANALYZE` — план с реальной статистикой выполнения (выполняет запрос).
+- `EXPLAIN` — normalized/re-written логический план.
+- `EXPLAIN FULL` — физический план, estimates, стоимости, selected indexes, fallbacks и resource
+  warnings.
+- `EXPLAIN ANALYZE` — физический план с реальной статистикой выполнения. Успешная DDL/DML в
+  autocommit публикуется; внутри explicit transaction изменяет private root до `COMMIT`; ошибка
+  использует обычные rollback/abort rules. `SELECT` полностью потребляется и continuation не
+  создаёт.
+
+Поддерживаются SELECT, текущий исполнимый MATCH, CREATE/UPDATE/UPSERT/DELETE,
+ATTACH/DETACH/RELATE/UPDATE GRAPH и DEFINE/ALTER/REMOVE. Transaction statements, Atomic Import,
+control flow, вложенный `EXPLAIN` и ещё не реализованные statements отклоняются структурно.
+`FORMAT TEXT` является default; `FORMAT JSON` возвращает structured object с versioned
+`PlanHash`, snapshot, mode/seed, stable preorder node IDs, logical/physical operators,
+cardinality ranges, cost components, ordering, index bounds, statistics freshness и warnings.
+`ANALYZE` дополнительно выводит actual rows/pulls, elapsed observations, spill, accounted memory,
+affected rows и publication state; elapsed timings не входят в deterministic replay guarantee.
 
 ### 7.7. THROW
 
@@ -2748,34 +2761,21 @@ WHERE age >= 18 AND status = "active"
 
 Явный контроль доступа к индексам, отключение индексов и использования пользовательских функций стоимости.
 
-При извлечении atoms из class планировщик запросов может заменить стандартный class scan
-одним или несколькими итераторами индексов в зависимости от структуры и требований запроса.
-Это особенно полезно при работе с большими наборами данных,
-так как позволяет значительно сократить время получения данных.
-
-Однако могут возникнуть ситуации, когда потребуется или
-будет желательно вручную управлять этими потенциальными оптимизациями.
-
-Предложение WITH используется для замены class scan по умолчанию на индексный итератор.
-В случаях, когда мощность индекса может быть высокой и даже равняться количеству atoms в class,
-сумма записей, переданных несколькими индексами, может оказаться больше, чем количество записей,
-полученных при class scan.
-
-В таких случаях, если есть несколько вариантов индексов, наиболее вероятным оптимальным выбором будет
-использование индекса с наименьшей кардинальностью.
-
-Планировщик запросов может заменить стандартный class scan одним или несколькими итераторами индексов
-в зависимости от структуры и требований запроса.
+Без hint optimizer сравнивает class/membership scan с одним совместимым secondary index path на
+source. Stage 14 не пересекает secondary indexes: несколько имён после `WITH INDEX` являются
+разрешённым candidate set, а не набором одновременно исполняемых итераторов.
 
 ```
-[ WITH [ NOINDEX                -- принудительно использовать class scan
-         | INDEX @indexes ...   -- использовать только указанные индексы
+[ WITH [ NOINDEX                         -- запретить user secondary indexes
+         | INDEX [@source.]@index, ...   -- разрешённые candidates по sources
          | COST @const_fn       -- использовать пользовательскую функцию стоимости пути
        ]
 ]
 ```
 
-`WITH COST @const_fn` применимо только для `MATCH` и `TRAVERSE` запросов. 
+Каждый явно названный source обязан получить один совместимый Ready-index из своего набора;
+неqualified имя допустимо только при однозначном source. Forced hint проверяется до row pull.
+`WITH COST @const_fn` применимо только для будущих `MATCH`/`TRAVERSE` cost-функций.
 
 ### 10.4. GROUP
 
@@ -2818,6 +2818,11 @@ Aggregate без `GROUP` и `GROUP ALL` образуют одну группу. 
 
 - `NULLS FIRST` / `NULLS LAST` — позиция null-значений (по умолчанию `NULLS LAST`) для сортируемого поля.
 - Если сортируемых полей несколько, можно указать позиции null-значений глобально.
+- В этапе 14 `ORDER RAND()` является специальным physical ordering operator. Его ключ —
+  versioned RapidHash V3 от statement seed и canonical stable row key. В `DETERMINISTIC` seed
+  входит в replay tuple; в `BEST_EFFORT` создаётся новый process-local statement seed.
+- `COLLATE` и `NUMERIC` распознаются, но остаются typed unsupported до этапа 21 и отклоняются до
+  чтения source.
 
 Применим только после `GROUP`, если он есть.
 
@@ -4578,18 +4583,25 @@ BEGIN [ ISOLATION LEVEL @level ] [ READ ONLY ]
       [ EXECUTION MODE DETERMINISTIC | BEST_EFFORT | FAST ];
 ```
 
-Режим задаётся на транзакцию. В исполнимом профиле этапов 11–12 поддержан только
-`BEST_EFFORT`, и он является default. Явные `DETERMINISTIC` и `FAST` возвращают typed
-unsupported до открытия транзакции; реализация первого принадлежит этапу 14, второго — этапу
-17. Таблица ниже фиксирует целевой контракт этих режимов, а не текущую готовность.
+Режим задаётся на транзакцию. В исполнимом профиле этапа 14 поддержаны `BEST_EFFORT`
+(default) и `DETERMINISTIC`. `FAST` возвращает typed unsupported до открытия транзакции и
+принадлежит этапу 17.
 
 | Режим                        | Гарантии                                                                                                                                                                                                                                                                                                                 |
 |------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `BEST_EFFORT` (по умолчанию) | Результат детерминирован по содержимому, но порядок без `ORDER BY` не гарантирован; план может меняться между запусками                                                                                                                                                                                                  |
-| `DETERMINISTIC`              | Полная воспроизводимость: фиксированный снимок, фиксированный seed, стабильный порядок, канонический план. Без `ORDER BY` результат доупорядочивается стабильным идентификатором; `rand()`, `uuid()`, `time::now()` выводятся из seed и снимка; агрегация с плавающей точкой выполняется в фиксированном порядке свёртки |
+| `DETERMINISTIC`              | Строгая воспроизводимость при одинаковых snapshot, canonical parameters, user seed и engine build: стабильный порядок, канонический plan и фиксированный порядок floating-point reduction. Без `ORDER BY` результат доупорядочивается stable public identity. `time::now()` и другие недетерминированные/IMPURE функции отклоняются до чтения данных; scalar `rand()`/`uuid()` остаются неисполняемыми до этапа 21 |
 | `FAST`                       | Максимум производительности, никаких гарантий порядка и стабильности плана                                                                                                                                                                                                                                               |
 
-Детерминизм не бесплатен: он требует сортировок, ограничивает параллелизм и фиксирует план, поэтому режимом по умолчанию не является. Технические детали — [gql_tech_spec.md §15](gql_tech_spec.md).
+`DETERMINISTIC` допустим только при `SNAPSHOT` и `SERIALIZABLE`; `READ COMMITTED` запрещён.
+Effective seed включает version, normalized query fingerprint, canonical parameter fingerprint,
+`SnapshotId` и user seed из `QueryExecutionOptions::deterministic_seed`. `PlanHash` вычисляется
+RapidHash V3 по versioned canonical physical-plan bytes: `DefaultHasher`, `Debug` output и порядок
+итерации hash map для него не используются.
+
+Детерминизм не бесплатен: он может требовать стабильной сортировки и ограничивает выбор
+исполнения, поэтому default остаётся `BEST_EFFORT`. Технические детали —
+[gql_tech_spec.md §15](gql_tech_spec.md).
 
 Для повторного воспроизведения прогона достаточно набора: текст запроса, `SnapshotId`, seed, `PlanHash` и версия движка.
 
@@ -4701,7 +4713,13 @@ DEFINE PURE FUNCTION fn::calc_weight(a: record<person>, b: record<person>) -> fl
 
 - Primary и secondary индексы: транзакционно-консистентны (обновляются в той же транзакции).
 - HNSW и FULLTEXT: eventually consistent опционально; транзакционная консистентность — при явном указании.
-- При `WITH INDEX @index` — планировщик обязан использовать указанный индекс, даже если optimizer предпочёл бы другой.
+- `WITH INDEX source.index [, ...]` задаёт candidate set для каждого явно названного source.
+  Планировщик обязан выбрать ровно один совместимый transaction-visible индекс в состоянии
+  `Ready` из набора этого source. Одно неqualified имя допустимо только при однозначной
+  принадлежности source.
+- Missing, `stale`, prepared, wrong-scope или несовместимый forced index даёт typed planning
+  error до row pull. Без hint та же ситуация наблюдаемо деградирует к корректному scan.
+- `WITH NOINDEX` запрещает user secondary indexes, но не primary, class и membership structures.
 
 ### 19.2. Graph-специфические индексы
 - Adjacency index — индекс смежности для ускорения `out/in/both`.
@@ -5235,49 +5253,42 @@ Optimize (rule-based + cost-based)
 
 ### 22.3. Правила оптимизации
 
-**Семантически строгие (всегда безопасны):**
-- Predicate pushdown: `Filter(Scan(T)) → Scan(T, predicate)`.
-- Projection pruning: убирать поля, не используемые выше.
-- Expand optimization:
-   - start from lowest degree node
-   - use adjacency index
-- Expand + Filter fusion: `Expand → Filter(edge_pred) → Expand(edge_pred)`.
-- Constant folding: `1 + 2 → 3`.
-- Dedup elimination: если ключ гарантирует уникальность.
-- Late materialization: не материализовывать объекты до тех пор, пока об этом не попросят явно.
+Этап 14 применяет правила в одном неизменном порядке:
 
-**Условно безопасные:**
-- Join reordering при inner join (при отсутствии side-effects).
-- OPTIONAL MATCH преобразования.
-- Path pruning при известном max_depth.
+1. Constant folding только для уже типизированных pure expressions.
+2. Разложение conjunction без перестановки expressions, способных вернуть ошибку.
+3. Predicate pushdown к единственному source.
+4. Projection pruning с учётом join/group/order/fetch/output dependencies.
+5. Late materialization.
+6. Safe LIMIT pushdown только при отсутствии join/group/split/order/correlated subquery/ONLY.
+7. Count rewrite для доказанно точной формы `count()` над одним source.
+8. Sort elimination только при полном совпадении index ordering, null placement и stable tie key.
 
-**Запрещены:**
-- Переставлять `IMPURE` функции.
-- Оптимизировать через `ORDER BY` если он задан явно.
-- Изменять семантику пути (`SIMPLE`, `ACYCLIC`, `SHORTEST`).
-- Двигать операторы через `side-effect` барьеры.
+Rule pass не может менять LEFT JOIN, bag multiplicity, graph-effective property semantics,
+порядок наблюдаемых ошибок или floating-point reduction order. Перестановка разрешена только для
+последовательной группы INNER equality joins с pure predicates. LEFT/CROSS, correlated subquery,
+explicit order и side-effect являются semantic barriers. OPTIONAL/path rewrites и новые
+path-алгоритмы принадлежат этапам 15–17.
 
 ### 22.4. Cost model
 
-Стоимость: ```cost = f(cardinality, degree, selectivity, depth)```.
-
-Cost model должен:
-- выбирать порядок матчей (join ordering);
-- выбирать стартовую точку MATCH;
-- оценивать path explosion;
-- выбирать алгоритм (BFS/DFS/Dijkstra);
-- решать index vs scan.
-
-```
-cost(op) ≈ rows_in × cost_per_row + overhead;
-overhead = cpu + io + memory.
-```
+Cardinality задаётся диапазоном `{ lower, expected, upper }`. Cost использует versioned integer
+fixed-point representation, чтобы выбор плана не зависел от platform-sensitive `f64`.
+Компоненты: startup, sequential rows, random lookups, expression CPU, peak memory, expected spill
+и uncertainty/resource risk. Веса калибруются microprobes.
 
 Ключевые факторы:
 - `node_count`, `edge_count`, `label_cardinality`, `edge_label_cardinality`.
 - `degree_stats`: `avg_out_degree`, `avg_in_degree`, degree histogram (`histogram_in`, `histogram_out`).
 - `property_selectivity` (из histogram или статистики).
-- Для PathExpand: `rows(depth=d) ≈ rows_in × (avg_degree^d)`.
+- Для текущего MATCH: degree distributions и label counters; полный path cost остаётся этапам
+  15–17.
+
+Histogram считается fresh при `revision == analyzed_revision && dirty_rows == 0`. До
+`max(1024, ceil(population × 0.10))` dirty rows он используется с расширенной uncertainty; после
+порога выбирается conservative estimate и warning `statistics_stale`. Отсутствующая статистика
+даёт conservative estimate и warning `statistics_missing`. Approximate sample только расширяет
+uncertainty и не влияет на correctness. Residual predicate выполняется после любого index access.
 
 Без degree distribution MATCH-планировщик деградирует.
 
@@ -5364,6 +5375,10 @@ effective_degree *=
 | `EXPLAIN statement`         | Логический план                       |
 | `EXPLAIN FULL statement`    | Физический план + стоимости           |
 | `EXPLAIN ANALYZE statement` | Runtime-статистика (выполняет запрос) |
+
+Plain/FULL не читают rows и не получают writer lease. ANALYZE исполняет wrapped statement ровно
+один раз и сохраняет его обычную autocommit/private-root/rollback семантику. JSON-контракт и
+перечень explainable statements определены в §7.6. Суффиксной формы `statement EXPLAIN` нет.
 
 ### 22.12. Замечания по WITHIN
 
@@ -5720,42 +5735,49 @@ Optimizer =
     CostEngine (plan selection)
 ```
 
-Основные rule-based оптимизации:
-- Predicate pushdown
-- Projection pruning
-- Expand + Filter fusion
-- Dedup elimination
-- Constant folding
-- Path pruning rules
-- Join simplification
-- Late materialization
+Этап 14 реализует один crate-private concrete optimizer без публичного planner API, registry rules
+или trait с одной реализацией. Typed logical IR остаётся источником семантики, а executor получает
+явно выбранный physical plan. Resource fallback, например in-memory hash → partitioned hash,
+разрешён только внутри заранее выбранного семейства алгоритма.
 
-Основные cost-based оптимизации:
-- Join ordering: классический Selinger + graph heuristics
-- Index selection: choose index with minimal selectivity
-- Expand ordering: expand smallest degree first
-- Path strategy: choose BFS / DFS / Dijkstra
+Физические source alternatives: `PointGet`, `ClassScan`, `GraphClassScan`,
+`ScalarIndexScan`, `CountLookup`, `GraphCatalogScan`, `Derived`. Join alternatives:
+`HashJoin`, `PartitionedHashJoin`, `BlockNestedLoop`, `IndexNestedLoop`. Write plan описывает
+`TargetSelection`, `Mutation`, `ConstraintValidation`, `CatalogMutation`, `IndexBuild` и
+`Publication`.
+
+Scalar index поддерживает leftmost equality prefix, equality prefix плюс один range следующего
+поля, конечный constant/parameter `IN` как несколько exact probes и full scan только для forced
+hint либо точного ORDER. Skip-scan, bitmap/intersection и WCOJ не входят.
+
+Для consecutive INNER equality joins с pure predicates применяется bounded Selinger DP до восьми
+sources, затем deterministic greedy. LEFT/CROSS/correlated barriers не переставляются; cross
+product рассматривается последним. INNER hash строит меньшую сторону, LEFT сохраняет left side,
+а small outer с Ready right index допускает `IndexNestedLoop`.
 
 ### 27.1. Optimizer pipeline
-1. Normalize
-2. Rule-based rewrite
-3. Stats annotation
-4. Generate alternatives
-5. Cost evaluation
-6. Choose plan
-7. Optional adaptive hooks
+1. Normalize typed logical IR.
+2. Canonical rule passes в порядке §22.3.
+3. Stats annotation из transaction-visible `PlannerSnapshot`.
+4. Generate bounded physical alternatives.
+5. Fixed-point cost evaluation.
+6. Canonical `(cost, plan_hash)` selection.
+7. Physical plan execution через sync pull operators.
+
+Plan cache, adaptive hooks/re-planning, parallel/vectorized execution и runtime algorithm
+switching не входят. Plan cache может быть возвращён только после измеренного planning bottleneck.
 
 ### 27.2. Важные инварианты
-Оптимизатор НЕ должен:
-- менять семантику path
-- менять порядок, если order гарантирован
-- двигать impure functions
+Оптимизатор НЕ должен менять path semantics, гарантированный порядок, bag multiplicity,
+effective-property view, observable error order или двигать impure functions. Scan и index path
+регистрируют одинаковый conservative SSI class/graph range, поэтому смена плана не ослабляет
+FCW/SSI.
 
 ### 27.3. Самые критичные вещи
-1. degree statistics — без них графовый planner не работает
-2. path explosion control
-3. join ordering для MATCH
-4. function purity contracts
+1. exact class/graph counters и freshness policy property/degree histograms;
+2. корректный scan fallback при missing/stale index;
+3. bounded join enumeration и canonical tie-break;
+4. function purity и strict deterministic contracts.
 
 ---
 

@@ -51,6 +51,367 @@ fn statement_error(store: &Datastore, source: &str) -> crate::gql_status::Ferros
 }
 
 #[test]
+fn forced_scalar_indexes_and_count_lookup_match_scan_results() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD age ON CLASS person TYPE int; \
+			 DEFINE INDEX by_age ON CLASS person FIELDS age SCOPE BASE; DEFINE INDEX people_count \
+			 ON CLASS person COUNT SCOPE BASE; CREATE person:a SET age = 10; CREATE person:b SET \
+			 age = 20; CREATE person:c SET age = 30;",
+			&Object::new(),
+		)
+		.unwrap();
+
+	let indexed = value(
+		&store,
+		"SELECT VALUE age FROM person WITH INDEX by_age WHERE age IN [20, 30] ORDER BY age;",
+	);
+	let scanned = value(
+		&store,
+		"SELECT VALUE age FROM person WITH NOINDEX WHERE age IN [20, 30] ORDER BY age;",
+	);
+	assert_eq!(indexed, scanned);
+	assert_eq!(
+		value(&store, "SELECT VALUE count() FROM person WITH INDEX people_count;"),
+		Value::Array(vec![Value::from(3_u64)].into()),
+	);
+}
+
+#[test]
+fn composite_index_prefix_and_range_match_scan_results() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD country ON CLASS person TYPE \
+			 string; DEFINE FIELD age ON CLASS person TYPE int; DEFINE INDEX by_country_age ON \
+			 CLASS person FIELDS country, age SCOPE BASE; CREATE person:a SET country = 'us', age \
+			 = 10; CREATE person:b SET country = 'us', age = 20; CREATE person:c SET country = \
+			 'us', age = 30; CREATE person:d SET country = 'us', age = 40; CREATE person:e SET \
+			 country = 'ca', age = 25;",
+			&Object::new(),
+		)
+		.unwrap();
+
+	let indexed = value(
+		&store,
+		"SELECT VALUE age FROM person WITH INDEX by_country_age WHERE country = 'us' AND age >= \
+		 20 AND age < 40 ORDER BY age;",
+	);
+	let scanned = value(
+		&store,
+		"SELECT VALUE age FROM person WITH NOINDEX WHERE country = 'us' AND age >= 20 AND age < \
+		 40 ORDER BY age;",
+	);
+	assert_eq!(indexed, scanned);
+	assert_eq!(indexed, Value::Array(vec![Value::from(20_i64), Value::from(30_i64)].into()));
+
+	let prefix = value(
+		&store,
+		"SELECT VALUE age FROM person WITH INDEX by_country_age WHERE country = 'ca';",
+	);
+	assert_eq!(prefix, Value::Array(vec![Value::from(25_i64)].into()));
+}
+
+#[test]
+fn statistics_freshness_changes_estimates_without_changing_results() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD score ON CLASS person TYPE \
+			 int;",
+			&Object::new(),
+		)
+		.unwrap();
+	let score = store.property_dictionary().get("score").unwrap();
+	store
+		.import(ImportOptions::default(), |session| {
+			for ordinal in 0..4 {
+				session.apply_item(|transaction| {
+					let mut properties = PropertyMap::new();
+					properties.insert(score, Value::from(ordinal));
+					transaction.create_atom(
+						format!("person:r{ordinal}").parse::<RecordId>().unwrap(),
+						properties,
+					)
+				})?;
+			}
+			Ok(())
+		})
+		.unwrap();
+	let root = (*store.inner.current_root()).clone();
+	let query = "SELECT VALUE id FROM person WHERE score = 2;";
+	let explain = "EXPLAIN FULL FORMAT JSON SELECT VALUE id FROM person WHERE score = 2;";
+	let projection = |store: &Datastore| {
+		let result = value(store, query);
+		let Value::Object(explain) = value(store, explain) else {
+			panic!("EXPLAIN JSON must return an object");
+		};
+		(result, explain)
+	};
+
+	let (expected, fresh) = projection(&store);
+	let mut approximate_root = root.clone();
+	let approximate = std::sync::Arc::make_mut(&mut approximate_root.statistics).base_mut();
+	approximate
+		.property_histograms
+		.values_mut()
+		.for_each(|histogram| histogram.method = crate::stats::HistogramMethod::Approximate);
+	let approximate_store =
+		Datastore::from_root_for_test(InMemoryOptions::default(), approximate_root);
+	let (approximate_result, approximate) = projection(&approximate_store);
+
+	let mut stale_root = root.clone();
+	let stale = std::sync::Arc::make_mut(&mut stale_root.statistics).base_mut();
+	stale.revision = stale.analyzed_revision.saturating_add(1);
+	stale.dirty_rows = 1_025;
+	let stale_store = Datastore::from_root_for_test(InMemoryOptions::default(), stale_root);
+	let (stale_result, stale) = projection(&stale_store);
+
+	let mut missing_root = root;
+	std::sync::Arc::make_mut(&mut missing_root.statistics).base_mut().property_histograms.clear();
+	let missing_store = Datastore::from_root_for_test(InMemoryOptions::default(), missing_root);
+	let (missing_result, missing) = projection(&missing_store);
+
+	assert_eq!(approximate_result, expected);
+	assert_eq!(stale_result, expected);
+	assert_eq!(missing_result, expected);
+	assert_eq!(fresh.get("plan_hash"), approximate.get("plan_hash"));
+	assert_eq!(fresh.get("plan_hash"), stale.get("plan_hash"));
+	assert_eq!(fresh.get("plan_hash"), missing.get("plan_hash"));
+	assert!(
+		matches!(stale.get("warnings"), Some(Value::Array(values)) if values.iter().any(|value| value.to_string().contains("statistics_stale")))
+	);
+	assert!(
+		matches!(missing.get("warnings"), Some(Value::Array(values)) if values.iter().any(|value| value.to_string().contains("statistics_missing")))
+	);
+	assert!(
+		matches!(approximate.get("statistics"), Some(Value::Object(statistics)) if matches!(statistics.get("property_histograms"), Some(Value::Array(values)) if values.iter().any(|value| value.to_string().contains("Approximate"))))
+	);
+}
+
+#[test]
+fn unique_index_supplies_forward_and_reverse_order_without_changing_results() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD rank ON CLASS person TYPE \
+			 int; DEFINE INDEX by_rank ON CLASS person FIELDS rank UNIQUE SCOPE BASE; CREATE \
+			 person:c SET rank = 3; CREATE person:a SET rank = 1; CREATE person:b SET rank = 2;",
+			&Object::new(),
+		)
+		.unwrap();
+
+	assert_eq!(
+		value(&store, "SELECT VALUE rank FROM person ORDER BY rank ASC NULLS FIRST LIMIT 2;",),
+		Value::Array(vec![Value::from(1_i64), Value::from(2_i64)].into())
+	);
+	assert_eq!(
+		value(&store, "SELECT VALUE rank FROM person ORDER BY rank DESC LIMIT 2;"),
+		Value::Array(vec![Value::from(3_i64), Value::from(2_i64)].into())
+	);
+}
+
+#[test]
+fn index_ordered_cursor_seeks_inside_its_exact_snapshot_without_a_spool() {
+	let store = Datastore::in_memory_with(InMemoryOptions {
+		max_snapshot_age: Duration::from_secs(60),
+		..InMemoryOptions::default()
+	});
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD rank ON CLASS person TYPE \
+			 int; DEFINE INDEX by_rank ON CLASS person FIELDS rank UNIQUE SCOPE BASE; CREATE \
+			 person:a SET rank = 1; CREATE person:c SET rank = 3; CREATE person:e SET rank = 5;",
+			&Object::new(),
+		)
+		.unwrap();
+	let scratch =
+		std::env::temp_dir().join(format!("fg-index-seek-{}", crate::values::Uuid::now_v7()));
+	let options = QueryExecutionOptions {
+		barrier_memory_bytes: NonZeroUsize::MIN,
+		temporary_directory: Some(scratch.clone()),
+		..QueryExecutionOptions::default()
+	};
+	let mut session = store.session();
+	let first = session
+		.execute_with_options(
+			"SELECT VALUE rank FROM person WITH INDEX by_rank ORDER BY rank ASC NULLS FIRST LIMIT \
+			 1;",
+			&Object::new(),
+			options.clone(),
+		)
+		.unwrap()
+		.remove(0);
+	assert_eq!(first.result.unwrap().into_parts().0, Value::Array(vec![Value::from(1_i64)].into()));
+	assert_eq!(directory_bytes(&scratch), 0, "index seek must not materialize a spool");
+	let first_cursor = first.continuation.unwrap();
+	let mut read_committed_session = store.session();
+	let read_committed_first = read_committed_session
+		.execute_with_options(
+			"SELECT VALUE rank FROM person WITH INDEX by_rank ORDER BY rank ASC NULLS FIRST LIMIT \
+			 1;",
+			&Object::new(),
+			options.clone(),
+		)
+		.unwrap()
+		.remove(0);
+	let read_committed_cursor = read_committed_first.continuation.unwrap();
+
+	store.execute("CREATE person:b SET rank = 2;", &Object::new()).unwrap();
+	let mut variables = Object::new();
+	variables.insert("cursor", Value::from(first_cursor));
+	let continuation = "SELECT VALUE rank FROM person WITH INDEX by_rank ORDER BY rank ASC NULLS \
+	                    FIRST LIMIT 1 START AFTER $cursor;";
+	let second =
+		session.execute_with_options(continuation, &variables, options.clone()).unwrap().remove(0);
+	let replay =
+		session.execute_with_options(continuation, &variables, options.clone()).unwrap().remove(0);
+	assert_eq!(
+		second.result.as_ref().unwrap().value(),
+		&Value::Array(vec![Value::from(3_i64)].into())
+	);
+	assert_eq!(second.result.as_ref().unwrap().value(), replay.result.as_ref().unwrap().value());
+	assert_eq!(second.continuation, replay.continuation);
+	assert_eq!(directory_bytes(&scratch), 0, "replayed seek must not materialize a spool");
+	let mut read_committed_variables = Object::new();
+	read_committed_variables.insert("cursor", Value::from(read_committed_cursor));
+	let read_committed = read_committed_session
+		.execute_with_options(
+			"SELECT VALUE rank FROM person WITH INDEX by_rank ORDER BY rank ASC NULLS FIRST LIMIT \
+			 1 START AFTER $cursor READ COMMITTED;",
+			&read_committed_variables,
+			options.clone(),
+		)
+		.unwrap()
+		.remove(0);
+	assert_eq!(
+		read_committed.result.unwrap().into_parts().0,
+		Value::Array(vec![Value::from(2_i64)].into())
+	);
+	if let Some(cursor) = read_committed.continuation {
+		read_committed_session.close_cursor(&cursor).unwrap();
+	}
+	assert_eq!(directory_bytes(&scratch), 0, "READ COMMITTED seek must not build a spool");
+
+	variables.insert("cursor", Value::from(second.continuation.unwrap()));
+	let last = session.execute_with_options(continuation, &variables, options).unwrap().remove(0);
+	assert_eq!(last.result.unwrap().into_parts().0, Value::Array(vec![Value::from(5_i64)].into()));
+	assert!(last.continuation.is_none());
+	assert_eq!(directory_bytes(&scratch), 0);
+	drop(fs::remove_dir_all(scratch));
+}
+
+#[test]
+fn standard_index_orders_duplicate_keys_by_public_record_id() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD rank ON CLASS person TYPE \
+			 int; DEFINE INDEX by_rank ON CLASS person FIELDS rank SCOPE BASE; CREATE person:z \
+			 SET rank = 1; CREATE person:a SET rank = 1; CREATE person:m SET rank = 2;",
+			&Object::new(),
+		)
+		.unwrap();
+
+	for direction in ["ASC NULLS FIRST", "DESC"] {
+		let indexed = value(
+			&store,
+			&format!("SELECT VALUE id FROM person WITH INDEX by_rank ORDER BY rank {direction};"),
+		);
+		let scanned = value(
+			&store,
+			&format!("SELECT VALUE id FROM person WITH NOINDEX ORDER BY rank {direction};"),
+		);
+		assert_eq!(indexed, scanned);
+	}
+}
+
+#[test]
+fn forced_index_must_be_ready_and_match_its_source() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD age ON CLASS person TYPE int; \
+			 DEFINE INDEX by_age ON CLASS person FIELDS age SCOPE BASE; ALTER INDEX by_age ON \
+			 CLASS person PREPARE REMOVE;",
+			&Object::new(),
+		)
+		.unwrap();
+	let error = statement_error(
+		&store,
+		"SELECT VALUE age FROM person WITH INDEX person.by_age WHERE age = 10;",
+	);
+	assert!(error.to_string().contains("not Ready"));
+	let fallback =
+		value(&store, "EXPLAIN FULL FORMAT JSON SELECT VALUE age FROM person WHERE age = 10;");
+	let Value::Object(fallback) = fallback else {
+		panic!("EXPLAIN fallback must be an object");
+	};
+	assert!(
+		matches!(fallback.get("warnings"), Some(Value::Array(warnings)) if !warnings.is_empty())
+	);
+}
+
+#[test]
+fn index_hints_select_one_candidate_per_qualified_source() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD code ON CLASS person TYPE \
+			 string; DEFINE FIELD age ON CLASS person TYPE int; DEFINE INDEX by_code ON CLASS \
+			 person FIELDS code SCOPE BASE; DEFINE INDEX by_age ON CLASS person FIELDS age SCOPE \
+			 BASE; DEFINE CLASS department TYPE NODE SCHEMAFULL; DEFINE FIELD code ON CLASS \
+			 department TYPE string; DEFINE INDEX by_code ON CLASS department FIELDS code SCOPE \
+			 BASE; CREATE person:a SET code = 'd', age = 30; CREATE department:d SET code = 'd';",
+			&Object::new(),
+		)
+		.unwrap();
+
+	let ambiguous = statement_error(
+		&store,
+		"SELECT p.id FROM person AS p JOIN department AS d ON p.code = d.code WITH INDEX by_code;",
+	);
+	assert!(ambiguous.to_string().contains("ambiguous"));
+	let result = value(
+		&store,
+		"SELECT VALUE p.id FROM person AS p JOIN department AS d ON p.code = d.code WITH INDEX \
+		 p.by_age, p.by_code, d.by_code WHERE p.age = 30;",
+	);
+	assert_eq!(
+		result,
+		Value::Array(vec![Value::from("person:a".parse::<RecordId>().unwrap())].into())
+	);
+}
+
+#[test]
+fn effective_index_matches_graph_scan_and_preserves_ties() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE GRAPH social; DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD score ON \
+			 CLASS person TYPE int; DEFINE INDEX by_score ON CLASS person FIELDS score SCOPE \
+			 EFFECTIVE IN GRAPH social; CREATE person:z SET score = 1; CREATE person:a SET score \
+			 = 1; CREATE person:m SET score = 2; ATTACH person:z TO GRAPH social; ATTACH person:a \
+			 TO GRAPH social; ATTACH person:m TO GRAPH social; UPDATE person:m IN GRAPH social \
+			 SET score = 0;",
+			&Object::new(),
+		)
+		.unwrap();
+
+	let indexed = value(
+		&store,
+		"SELECT VALUE id FROM person IN GRAPH @social WITH INDEX by_score ORDER BY score ASC \
+		 NULLS FIRST;",
+	);
+	let scanned = value(
+		&store,
+		"SELECT VALUE id FROM person IN GRAPH @social WITH NOINDEX ORDER BY score ASC NULLS FIRST;",
+	);
+	assert_eq!(indexed, scanned);
+}
+
+#[test]
 fn selects_graph_catalog_rows_and_durable_properties() {
 	let store = Datastore::in_memory();
 	store
@@ -78,8 +439,9 @@ fn executes_join_group_order_and_derived_source() {
 	let setup = store
 		.execute(
 			"DEFINE CLASS department TYPE NODE SCHEMAFULL; DEFINE FIELD name ON CLASS department \
-			 TYPE string; DEFINE FIELD code ON CLASS department TYPE string; DEFINE CLASS person \
-			 TYPE NODE SCHEMAFULL; DEFINE FIELD name ON CLASS person TYPE string; DEFINE FIELD \
+			 TYPE string; DEFINE FIELD code ON CLASS department TYPE string; DEFINE INDEX by_code \
+			 ON CLASS department FIELDS code SCOPE BASE; DEFINE CLASS person TYPE NODE \
+			 SCHEMAFULL; DEFINE FIELD name ON CLASS person TYPE string; DEFINE FIELD \
 			 department_id ON CLASS person TYPE string; CREATE department:eng SET name = \
 			 'Engineering', code = 'eng'; CREATE department:risk SET name = 'Risk', code = \
 			 'risk'; CREATE person:alice SET name = 'Alice', department_id = 'eng'; CREATE \
@@ -115,6 +477,36 @@ fn executes_join_group_order_and_derived_source() {
 	));
 	assert_eq!(derived.len(), 3);
 	assert_eq!(derived[0].get("people"), Some(&Value::from(1_i64)));
+}
+
+#[test]
+fn dp_and_greedy_join_orders_match_fixed_left_deep_results() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS sample TYPE NODE SCHEMAFULL; DEFINE FIELD code ON CLASS sample TYPE \
+			 int; CREATE sample:a SET code = 1; CREATE sample:b SET code = 1;",
+			&Object::new(),
+		)
+		.unwrap();
+
+	for sources in [8_usize, 10] {
+		let query = |kind: &str| {
+			let mut query = "SELECT VALUE count() FROM sample AS s0".to_owned();
+			for index in 1..sources {
+				query.push_str(&format!(
+					" {kind} JOIN sample AS s{index} ON s{}.code = s{index}.code",
+					index - 1
+				));
+			}
+			query.push_str(" GROUP ALL;");
+			query
+		};
+		let reordered = value(&store, &query("INNER"));
+		let fixed = value(&store, &query("LEFT"));
+		assert_eq!(reordered, fixed);
+		assert_eq!(reordered, Value::Array(vec![Value::from(1_u64 << sources)].into()));
+	}
 }
 
 #[test]
@@ -620,6 +1012,25 @@ fn applies_inner_limits_and_only_to_derived_sources() {
 }
 
 #[test]
+fn constant_folding_preserves_empty_source_error_semantics() {
+	let store = Datastore::in_memory();
+	store.execute("DEFINE CLASS sample TYPE NODE;", &Object::new()).unwrap();
+	assert_eq!(
+		value(&store, "SELECT VALUE 1 + 2 FROM sample;"),
+		Value::Array(Vec::<Value>::new().into())
+	);
+	assert_eq!(
+		value(&store, "SELECT VALUE 1 / 0 FROM sample;"),
+		Value::Array(Vec::<Value>::new().into())
+	);
+	store.execute("CREATE sample:one;", &Object::new()).unwrap();
+	assert_eq!(
+		value(&store, "SELECT VALUE 1 + 2 FROM sample;"),
+		Value::Array(vec![Value::from(3_i64)].into())
+	);
+}
+
+#[test]
 fn expires_exact_cursors_and_reexecutes_read_committed_after_anchor() {
 	let store = Datastore::in_memory_with(InMemoryOptions {
 		max_snapshot_age: Duration::from_millis(100),
@@ -711,11 +1122,12 @@ fn enforces_cursor_limit_and_order_offset_contract() {
 	let only = statement_error(&store, "SELECT ONLY VALUE id FROM person;");
 	assert_eq!(only.status().code().to_string(), "FG-22F22");
 	assert_eq!(value(&store, "SELECT ONLY VALUE id FROM person WHERE false;"), Value::None);
-	assert!(
-		store
-			.execute("SELECT VALUE id FROM person ORDER BY RAND() LIMIT 1;", &Object::new(),)
-			.is_err()
-	);
+	let Value::Array(random) =
+		value(&store, "SELECT VALUE id FROM person ORDER BY RAND() LIMIT 1;")
+	else {
+		panic!("RAND ordering must return a SELECT array");
+	};
+	assert_eq!(random.len(), 1);
 
 	let mut session = store.session();
 	let query = "SELECT VALUE id FROM person ORDER BY id LIMIT 1;";
@@ -892,7 +1304,7 @@ fn gql_stage_13_resource_probe() {
 	);
 }
 
-fn stage13_resource_store(row_count: usize, payload_bytes: usize) -> Datastore {
+pub(super) fn stage13_resource_store(row_count: usize, payload_bytes: usize) -> Datastore {
 	let store = Datastore::in_memory_with(InMemoryOptions {
 		max_snapshot_age: Duration::from_secs(3_600),
 		..InMemoryOptions::default()
@@ -977,7 +1389,7 @@ fn stage13_resource_query(mode: &str, limit: usize, force_tempfiles: bool) -> St
 	}
 }
 
-fn profile_usize(name: &str, default: usize) -> usize {
+pub(super) fn profile_usize(name: &str, default: usize) -> usize {
 	std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 

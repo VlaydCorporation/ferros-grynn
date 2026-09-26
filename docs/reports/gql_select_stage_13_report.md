@@ -182,7 +182,7 @@ knowledge graph содержит 51 140 nodes и 132 262 edges.
 - CBO, hints, join reordering, limit pushdown и index-ordered cursor seek — этап 14;
 - topology joins и полный `MATCH` — этап 15;
 - traversal map/reduce — этап 17;
-- `ORDER BY RAND()`, collation и numeric-string ordering — этапы 14/21;
+- `ORDER BY RAND()` — этап 14; collation и numeric-string ordering — этап 21;
 - `RIGHT/FULL/SEMI/ANTI JOIN`, `UNION` и `LATERAL` — только после реального
   пользовательского запроса.
 

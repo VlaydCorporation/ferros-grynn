@@ -1,15 +1,14 @@
-use std::{
-	collections::hash_map::DefaultHasher,
-	hash::{Hash, Hasher},
-};
+use std::hash::{Hash, Hasher};
 
 use super::super::*;
+use crate::gql::optimizer::{CanonicalHasher, PLAN_ENCODING_VERSION};
 
-pub(super) fn fingerprints(plan: &LogicalSelect) -> (u64, u64) {
-	let mut query = DefaultHasher::new();
+pub(in crate::gql::execution) fn fingerprints(plan: &LogicalSelect) -> (u64, u64) {
+	let mut query = CanonicalHasher::versioned(PLAN_ENCODING_VERSION, b"select-query");
 	hash_select(plan, &mut query);
-	let mut order = DefaultHasher::new();
+	let mut order = CanonicalHasher::versioned(PLAN_ENCODING_VERSION, b"select-order");
 	for item in &plan.order {
+		item.random.hash(&mut order);
 		hash_expr(&item.expression, &mut order);
 		std::mem::discriminant(&item.direction).hash(&mut order);
 		std::mem::discriminant(&item.nulls).hash(&mut order);
@@ -23,6 +22,17 @@ fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
 		std::mem::discriminant(&join.kind).hash(state);
 		hash_source(&join.source, state);
 		hash_optional_expr(join.predicate.as_ref(), state);
+	}
+	match &plan.access {
+		LogicalSelectAccess::Automatic => 0_u8.hash(state),
+		LogicalSelectAccess::NoIndex => 1_u8.hash(state),
+		LogicalSelectAccess::Indexes(hints) => {
+			2_u8.hash(state);
+			for hint in hints {
+				hint.source.hash(state);
+				hint.index.hash(state);
+			}
+		}
 	}
 	hash_optional_expr(plan.filter.as_ref(), state);
 	for expression in &plan.split {
@@ -73,10 +83,13 @@ fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
 	plan.omit.hash(state);
 	plan.fetch.hash(state);
 	for item in &plan.order {
+		item.random.hash(state);
 		hash_expr(&item.expression, state);
 		std::mem::discriminant(&item.direction).hash(state);
 		std::mem::discriminant(&item.nulls).hash(state);
 	}
+	// LIMIT and START are page state, not part of the normalized relation and
+	// ordering identity validated by the cursor runtime.
 	plan.value.hash(state);
 	plan.only.hash(state);
 	plan.tempfiles.hash(state);
@@ -98,7 +111,7 @@ fn hash_source(source: &LogicalSelectSource, state: &mut impl Hasher) {
 				}
 				ScanTarget::Record(record) => {
 					1_u8.hash(state);
-					format!("{record:?}").hash(state);
+					record.hash(state);
 				}
 			}
 			if let Some(graph) = graph {
@@ -126,7 +139,7 @@ fn hash_graph_reference(reference: &LogicalGraphReference, state: &mut impl Hash
 	match reference {
 		LogicalGraphReference::Static(reference) => {
 			0_u8.hash(state);
-			format!("{reference:?}").hash(state);
+			reference.hash(state);
 		}
 		LogicalGraphReference::Expression(expression) => {
 			1_u8.hash(state);
@@ -268,7 +281,7 @@ fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 			target,
 			expr,
 		} => {
-			format!("{target:?}").hash(state);
+			target.hash(state);
 			hash_expr(expr, state);
 		}
 	}

@@ -189,6 +189,66 @@ mod tests {
 	}
 
 	#[test]
+	fn optimizer_plan_and_deterministic_result_survive_reopen() {
+		fn observe(store: &Datastore) -> (Value, Value) {
+			let mut session = store.session();
+			session
+				.execute(
+					"BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;",
+					&Object::new(),
+				)
+				.unwrap();
+			let result = session
+				.execute(
+					"SELECT VALUE id FROM person WHERE rank >= 1 ORDER BY rank ASC NULLS FIRST;",
+					&Object::new(),
+				)
+				.unwrap()
+				.remove(0)
+				.result
+				.unwrap()
+				.into_parts()
+				.0;
+			let explain = session
+				.execute(
+					"EXPLAIN FULL FORMAT JSON SELECT VALUE id FROM person WHERE rank >= 1 ORDER \
+					 BY rank ASC NULLS FIRST;",
+					&Object::new(),
+				)
+				.unwrap()
+				.remove(0)
+				.result
+				.unwrap()
+				.into_parts()
+				.0;
+			let Value::Object(explain) = explain else {
+				panic!("EXPLAIN JSON must return an object");
+			};
+			let hash = explain.get("plan_hash").cloned().unwrap();
+			session.execute("CANCEL;", &Object::new()).unwrap();
+			(result, hash)
+		}
+
+		let directory = LocalTestDirectory::new();
+		let options = local_options();
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		store
+			.execute(
+				"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD rank ON CLASS person TYPE \
+				 int; DEFINE INDEX by_rank ON CLASS person FIELDS rank SCOPE BASE; CREATE \
+				 person:z SET rank = 1; CREATE person:a SET rank = 1; CREATE person:m SET rank = \
+				 2;",
+				&Object::new(),
+			)
+			.unwrap();
+		let before = observe(&store);
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		assert_eq!(observe(&reopened), before);
+	}
+
+	#[test]
 	fn atomic_import_streams_every_index_family_and_reopens() {
 		let directory = LocalTestDirectory::new();
 		let options = local_options();

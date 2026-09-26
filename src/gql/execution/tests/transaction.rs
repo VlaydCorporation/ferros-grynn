@@ -237,6 +237,27 @@ fn serializable_gql_read_participates_in_conflict_validation() {
 }
 
 #[test]
+fn serializable_index_scan_tracks_the_same_class_range_as_a_scan() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD age ON CLASS person TYPE int; \
+			 DEFINE INDEX by_age ON CLASS person FIELDS age SCOPE BASE; CREATE person:seed SET \
+			 age = 10;",
+			&Object::new(),
+		)
+		.unwrap();
+	let mut reader = store.begin();
+	reader
+		.execute("SELECT VALUE id FROM person WITH INDEX by_age WHERE age = 10;", &Object::new())
+		.unwrap();
+	store.execute("CREATE person:phantom SET age = 10;", &Object::new()).unwrap();
+	reader.execute("CREATE person:reader SET age = 99;", &Object::new()).unwrap();
+	assert_eq!(reader.commit().unwrap_err().status().code().to_string(), "FG-40001");
+	assert!(!atom_exists(&store, "person:reader"));
+}
+
+#[test]
 fn multiple_transaction_blocks_and_session_drop_preserve_only_published_work() {
 	let store = Datastore::in_memory();
 	store.execute("DEFINE CLASS person TYPE NODE;", &Object::new()).unwrap();
@@ -262,6 +283,101 @@ fn multiple_transaction_blocks_and_session_drop_preserve_only_published_work() {
 	let mut session = store.session();
 	assert!(session.execute("BEGIN EXECUTION MODE FAST;", &Object::new()).is_err());
 	assert!(!session.has_active_transaction());
+}
+
+#[test]
+fn deterministic_mode_replays_random_order_and_rejects_impure_time() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE; CREATE person:a; CREATE person:b; CREATE person:c; \
+			 CREATE person:d; CREATE person:e;",
+			&Object::new(),
+		)
+		.unwrap();
+	let options = QueryExecutionOptions {
+		deterministic_seed: 42,
+		..QueryExecutionOptions::default()
+	};
+	let mut session = store.session();
+	session
+		.execute_with_options(
+			"BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;",
+			&Object::new(),
+			options.clone(),
+		)
+		.unwrap();
+	let query = "SELECT VALUE id FROM person ORDER BY RAND();";
+	let first = session
+		.execute_with_options(query, &Object::new(), options.clone())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	let second = session
+		.execute_with_options(query, &Object::new(), options.clone())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	assert_eq!(first, second);
+	for _run in 0..18 {
+		let replay = session
+			.execute_with_options(query, &Object::new(), options.clone())
+			.unwrap()
+			.remove(0)
+			.result
+			.unwrap()
+			.into_parts()
+			.0;
+		assert_eq!(first, replay);
+	}
+	let mut expected_plan_hash = None;
+	for _run in 0..20 {
+		let explained = session
+			.execute_with_options(
+				"EXPLAIN FULL FORMAT JSON SELECT VALUE id FROM person ORDER BY RAND();",
+				&Object::new(),
+				options.clone(),
+			)
+			.unwrap()
+			.remove(0)
+			.result
+			.unwrap()
+			.into_parts()
+			.0;
+		let Value::Object(explained) = explained else {
+			panic!("deterministic EXPLAIN must return an object");
+		};
+		let hash = explained.get("plan_hash").cloned();
+		assert!(hash.is_some());
+		match &expected_plan_hash {
+			None => expected_plan_hash = hash,
+			Some(expected) => assert_eq!(Some(expected), hash.as_ref()),
+		}
+	}
+
+	let impure = session
+		.execute_with_options("RETURN time::now();", &Object::new(), options)
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap_err();
+	assert_eq!(impure.status().code().to_string(), "FG-50F03");
+	assert!(!session.has_active_transaction());
+
+	let error = store
+		.session()
+		.execute(
+			"BEGIN ISOLATION LEVEL READ COMMITTED EXECUTION MODE DETERMINISTIC;",
+			&Object::new(),
+		)
+		.unwrap_err();
+	assert_eq!(error.status().code().to_string(), "FG-22N11");
 }
 
 #[test]

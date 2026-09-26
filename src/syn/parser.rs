@@ -122,7 +122,9 @@ impl Parser<'_> {
 		context: &mut Stk,
 	) -> FerrosGrynnResult<Statement> {
 		let start = self.current().span;
-		let kind = if self.consume_keyword(keywords::BEGIN).is_some() {
+		let kind = if self.consume_keyword(keywords::EXPLAIN).is_some() {
+			StatementKind::Explain(context.run(|context| self.explain_statement(context)).await?)
+		} else if self.consume_keyword(keywords::BEGIN).is_some() {
 			if self.consume_keyword(keywords::IMPORT).is_some() {
 				StatementKind::Import(context.run(|context| self.import_statement(context)).await?)
 			} else {
@@ -1328,5 +1330,30 @@ mod tests {
 		assert!(
 			parse("UPDATE GRAPH sales SET owner = 'risk'", ParserSettings::default(),).is_err()
 		);
+	}
+
+	#[test]
+	fn parses_optimizer_hints_and_prefix_explain_only() {
+		let program = parse(
+			"EXPLAIN FULL FORMAT JSON SELECT p.id FROM person AS p JOIN department AS d ON \
+			 p.department = d.id WITH INDEX p.by_department, d.primary WHERE p.active = true; \
+			 EXPLAIN ANALYZE CREATE person:alice; SELECT id FROM person WITH NOINDEX;",
+			ParserSettings::default(),
+		)
+		.expect("stage-14 optimizer syntax parses");
+		assert!(matches!(program.statements[0].kind, StatementKind::Explain(_)));
+		assert!(matches!(program.statements[1].kind, StatementKind::Explain(_)));
+		let StatementKind::Select(select) = &program.statements[2].kind else {
+			panic!("expected SELECT");
+		};
+		assert!(matches!(select.access, Some(crate::syn::SelectAccessHint::NoIndex(_))));
+		for source in [
+			"EXPLAIN EXPLAIN SELECT id FROM person;",
+			"EXPLAIN BEGIN;",
+			"EXPLAIN FORMAT YAML SELECT id FROM person;",
+			"SELECT id FROM person EXPLAIN;",
+		] {
+			assert!(parse(source, ParserSettings::default()).is_err(), "source: {source}");
+		}
 	}
 }

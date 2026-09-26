@@ -24,6 +24,7 @@ pub struct GqlSession {
 	store: Datastore,
 	bindings: Object,
 	transaction: Option<Transaction>,
+	deterministic: bool,
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
 }
 
@@ -37,6 +38,7 @@ impl GqlSession {
 			store,
 			bindings: Object::new(),
 			transaction: None,
+			deterministic: false,
 			cursors: Some(Arc::new(Mutex::new(CursorRuntime::new(max_snapshot_age)))),
 		}
 	}
@@ -46,6 +48,7 @@ impl GqlSession {
 			store,
 			bindings: Object::new(),
 			transaction: None,
+			deterministic: false,
 			cursors: None,
 		}
 	}
@@ -150,7 +153,8 @@ impl GqlSession {
 		] = program.statements.as_slice()
 		{
 			let timeout = crate::gql::resolve_timeout(statement.timeout.as_ref(), &bindings)?;
-			let control = ExecutionControl::with_cursors(options, timeout, self.cursors.clone());
+			let control = ExecutionControl::with_cursors(options, timeout, self.cursors.clone())
+				.with_execution_mode(false, &bindings);
 			return crate::gql::import::execute_import(
 				&self.store,
 				source,
@@ -199,7 +203,9 @@ impl GqlSession {
 					}
 				};
 			let control =
-				ExecutionControl::with_cursors(options, clause_timeout, self.cursors.clone());
+				ExecutionControl::with_cursors(options, clause_timeout, self.cursors.clone())
+					.with_execution_mode(self.deterministic, &bindings)
+					.with_publication_deferred(self.transaction.is_some());
 			let let_name = match &statement.kind {
 				StatementKind::Let(statement) if statement.name.value.as_ref() != "_" => {
 					Some(statement.name.value.as_ref())
@@ -260,9 +266,13 @@ impl GqlSession {
 		command: TransactionCommand,
 	) -> FerrosGrynnResult<Value> {
 		match command {
-			TransactionCommand::Begin(options) => {
+			TransactionCommand::Begin {
+				options,
+				deterministic,
+			} => {
 				debug_assert!(self.transaction.is_none());
 				self.transaction = Some(self.store.begin_with(options));
+				self.deterministic = deterministic;
 				Ok(Value::None)
 			}
 			TransactionCommand::Commit {
@@ -275,10 +285,12 @@ impl GqlSession {
 				} else {
 					transaction.commit()?;
 				}
+				self.deterministic = false;
 				Ok(Value::None)
 			}
 			TransactionCommand::Cancel => {
 				self.transaction.take().ok_or_else(FerrosGrynnError::transaction_not_active)?;
+				self.deterministic = false;
 				Ok(Value::None)
 			}
 		}
@@ -339,10 +351,20 @@ impl GqlSession {
 			Ok(result) => result,
 			Err(error) => return error_result(statement, started, error),
 		};
-		if result.result.is_ok()
-			&& let Err(error) = transaction.commit()
-		{
-			result.result = Err(error);
+		if result.result.is_ok() {
+			match control.attach_pending_index_seek(transaction) {
+				Ok(Some(transaction)) => {
+					let commit_started = Instant::now();
+					match transaction.commit() {
+						Ok(_) => {
+							finalize_explain_publication(&mut result, commit_started.elapsed());
+						}
+						Err(error) => result.result = Err(error),
+					}
+				}
+				Ok(None) => {}
+				Err(error) => result.result = Err(error),
+			}
 		}
 		result
 	}
@@ -385,10 +407,14 @@ impl GqlSession {
 		for statement in &program.statements {
 			validate_control_structure(statement, 0, false)?;
 			match crate::gql::analyze_transaction_statement(statement)? {
-				Some(TransactionCommand::Begin(_)) if active => {
+				Some(TransactionCommand::Begin {
+					..
+				}) if active => {
 					return Err(FerrosGrynnError::transaction_already_active());
 				}
-				Some(TransactionCommand::Begin(_)) => active = true,
+				Some(TransactionCommand::Begin {
+					..
+				}) => active = true,
 				Some(
 					TransactionCommand::Commit {
 						..
@@ -461,7 +487,36 @@ impl GqlSession {
 
 	fn rollback_explicit_transaction(&mut self) {
 		self.transaction.take();
+		self.deterministic = false;
 	}
+}
+
+fn finalize_explain_publication(result: &mut QueryResult, elapsed: std::time::Duration) {
+	let Ok(outcome) = &result.result else {
+		return;
+	};
+	let (mut value, statuses) = outcome.clone().into_parts();
+	let elapsed = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+	match &mut value {
+		Value::Object(root) => {
+			let Some(Value::Object(analyze)) = root.get_mut("analyze") else {
+				return;
+			};
+			if matches!(analyze.get("publication_state"), Some(Value::String(value)) if value.as_str() == "pending")
+			{
+				analyze.insert("publication_state", "published");
+				analyze.insert("commit_elapsed_ns", elapsed);
+			}
+		}
+		Value::String(text) if text.as_str().contains("publication=pending") => {
+			value = Value::from(format!(
+				"{} commit_ns={elapsed}",
+				text.as_str().replace("publication=pending", "publication=published")
+			));
+		}
+		_ => return,
+	}
+	result.result = Ok(Outcome::new(value, statuses));
 }
 
 pub(crate) fn validate_control_structure(

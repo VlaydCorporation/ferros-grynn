@@ -1,5 +1,6 @@
 mod control;
 mod dml;
+mod explain;
 mod graph_dml;
 mod graph_properties;
 mod import;
@@ -19,6 +20,7 @@ pub use control::{
 	TryStatement,
 	WhileStatement,
 };
+pub use explain::{ExplainFormat, ExplainMode, ExplainStatement};
 pub use r#let::LetStatement;
 pub use r#match::{
 	MatchDirection,
@@ -53,7 +55,9 @@ pub use schema::{
 };
 pub use select::{
 	RecordKey,
+	SelectAccessHint,
 	SelectGroup,
+	SelectIndexHint,
 	SelectItem,
 	SelectJoin,
 	SelectJoinKind,
@@ -104,6 +108,7 @@ pub enum TimeoutValue {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum StatementKind {
+	Explain(ExplainStatement),
 	Begin(BeginStatement),
 	Commit(CommitStatement),
 	Cancel,

@@ -97,5 +97,6 @@ pub(crate) use transaction::{
 	QueryStorageRow,
 	ScalarComparison,
 	ScalarIndexConstraint,
+	ScalarIndexWindow,
 	TransactionSavepoint,
 };

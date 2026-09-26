@@ -58,6 +58,7 @@ pub(crate) use query::{
 	QueryStorageRow,
 	ScalarComparison,
 	ScalarIndexConstraint,
+	ScalarIndexWindow,
 };
 
 /// Owned database-global atom value returned by a transaction.
@@ -301,6 +302,10 @@ impl Transaction {
 	/// Returns bytes already reserved by the logical write-set preflight.
 	pub const fn write_set_bytes(&self) -> usize {
 		self.write_bytes
+	}
+
+	pub(crate) const fn mutation_count(&self) -> usize {
+		self.mutations.len()
 	}
 
 	/// Parses, analyzes, and executes a GrynQL program in this transaction.

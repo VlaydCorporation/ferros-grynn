@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	ops::Bound,
+};
 
 use super::super::{ClassId, ClassIndexKind, GlobalAtomId, IndexId, SchemaVersion};
 use crate::{
@@ -57,6 +60,67 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 			}
 			Self::Unique(entries) => entries.get(key).copied().into_iter().collect(),
 			Self::Count(_) => Vec::new(),
+		}
+	}
+
+	/// Returns scalar posting groups in canonical encoded-key order.
+	pub(crate) fn groups(
+		&self,
+		lower: Bound<Vec<u8>>,
+		upper: Bound<Vec<u8>>,
+	) -> Vec<(Vec<u8>, Vec<Address>)> {
+		match self {
+			Self::Standard(entries) => entries
+				.range((lower, upper))
+				.map(|(key, addresses)| (key.clone(), addresses.iter().copied().collect()))
+				.collect(),
+			Self::Unique(entries) => entries
+				.range((lower, upper))
+				.map(|(key, address)| (key.clone(), vec![*address]))
+				.collect(),
+			Self::Count(_) => Vec::new(),
+		}
+	}
+
+	/// Visits scalar posting groups in encoded-key order and stops when the
+	/// visitor has enough rows for its bounded window.
+	pub(crate) fn visit_groups(
+		&self,
+		lower: Bound<Vec<u8>>,
+		upper: Bound<Vec<u8>>,
+		reverse: bool,
+		mut visit: impl FnMut(&[u8], Vec<Address>) -> bool,
+	) {
+		match self {
+			Self::Standard(entries) if reverse => {
+				for (key, addresses) in entries.range((lower, upper)).rev() {
+					if !visit(key, addresses.iter().copied().collect()) {
+						break;
+					}
+				}
+			}
+			Self::Standard(entries) => {
+				for (key, addresses) in entries.range((lower, upper)) {
+					if !visit(key, addresses.iter().copied().collect()) {
+						break;
+					}
+				}
+			}
+			Self::Unique(entries) if reverse => {
+				for (key, address) in entries.range((lower, upper)).rev() {
+					if !visit(key, vec![*address]) {
+						break;
+					}
+				}
+			}
+			Self::Unique(entries) => {
+				for (key, address) in entries.range((lower, upper)) {
+					if !visit(key, vec![*address]) {
+						break;
+					}
+				}
+			}
+			Self::Count(_) => {}
 		}
 	}
 

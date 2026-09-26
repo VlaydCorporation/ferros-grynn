@@ -7,6 +7,13 @@ use std::mem::size_of;
 
 use super::*;
 
+/// Bounded window for a physically ordered scalar-index source.
+#[derive(Clone, Copy)]
+pub(super) struct IndexScanWindow<'a> {
+	pub(super) after: Option<&'a crate::gql::cursor::CursorAnchor>,
+	pub(super) maximum: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Snapshot(pub(super) u64);
 
@@ -131,7 +138,19 @@ pub(super) trait QueryRead {
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot>;
 
+	/// Returns the number of logical mutations currently staged by the
+	/// transaction.
+	fn mutation_count(&self) -> usize;
+
 	fn catalog(&self, snapshot: Snapshot) -> &dyn QueryCatalog;
+
+	/// Captures the catalog, index, exact-counter, and demanded-histogram
+	/// projection used by physical planning.
+	fn planner_snapshot(
+		&self,
+		snapshot: Snapshot,
+		demand: &crate::gql::optimizer::PlannerDemand,
+	) -> FerrosGrynnResult<crate::gql::optimizer::PlannerSnapshot>;
 
 	fn scan<'a>(
 		&'a self,
@@ -139,6 +158,8 @@ pub(super) trait QueryRead {
 		class: &str,
 		graph: Option<&GraphRef>,
 		predicate: Option<&TypedExpr>,
+		index: Option<(crate::datastore::IndexId, bool)>,
+		window: Option<IndexScanWindow<'_>>,
 		slots: &[Value],
 		source: &str,
 		full_row: bool,
@@ -150,6 +171,25 @@ pub(super) trait QueryRead {
 		record: &RecordId,
 		graph: Option<&GraphRef>,
 	) -> FerrosGrynnResult<Option<Row>>;
+
+	/// Reads one exact transaction-visible Count index.
+	fn count_index(
+		&self,
+		snapshot: Snapshot,
+		index: crate::datastore::IndexId,
+		graph: Option<&GraphRef>,
+	) -> FerrosGrynnResult<u64>;
+
+	/// Opens an exact full-key probe of one transaction-visible scalar index.
+	fn probe_index<'a>(
+		&'a self,
+		snapshot: Snapshot,
+		class: &str,
+		graph: Option<&GraphRef>,
+		index: crate::datastore::IndexId,
+		values: &[Value],
+		full_row: bool,
+	) -> FerrosGrynnResult<Box<dyn RowCursor + 'a>>;
 
 	/// Produces graph-catalog rows in explicit-list or GraphId order.
 	fn graph_rows(
@@ -632,9 +672,7 @@ pub(super) use pipeline::{
 	AtomFieldRead,
 	FilterCursor,
 	GraphFields,
-	LimitCursor,
 	OneRowCursor,
 	ProjectCursor,
 	RecordFields,
-	ScanCursor,
 };
