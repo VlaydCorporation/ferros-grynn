@@ -302,6 +302,7 @@ impl StorageValue {
 			Value::Vector(value) => Ok(Self::Vector(value)),
 			Value::Atom(value) => StorageAtomRef::from_runtime(*value, context).map(Self::AtomRef),
 			Value::Regex(_)
+			| Value::AtomOccurrence(_)
 			| Value::Path(_)
 			| Value::Graph(_)
 			| Value::Closure(_)

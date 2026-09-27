@@ -31,6 +31,8 @@ fn algorithm_failure(algorithm: &'static str, reason: impl Into<String>) -> Ferr
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use super::{
 		BinaryLiftingIndex,
 		TraversalDirection,
@@ -53,6 +55,10 @@ mod tests {
 			EdgeEndpoint,
 			EdgeTopology,
 			Graph,
+			GraphId,
+			GraphKind,
+			GraphRef,
+			GraphStorageMode,
 			Mutable,
 			RootedTree,
 			TreeOrientation,
@@ -148,7 +154,19 @@ mod tests {
 		let shortest = dijkstra(&graph, first, TraversalDirection::Forward).unwrap();
 		assert_eq!(shortest.distance_to(third), Some(5.0));
 		assert_eq!(shortest.path_to(third), Some(vec![first, second, third]));
-		assert_eq!(shortest.materialize_path(&graph, third).unwrap().unwrap().length(), 2);
+		let graph_ref = Arc::new(
+			GraphRef::new(
+				GraphId::new(1).unwrap(),
+				"shortest-test",
+				GraphKind::Graph,
+				GraphStorageMode::InMemory,
+			)
+			.unwrap(),
+		);
+		assert_eq!(
+			shortest.materialize_path(&graph, graph_ref, third).unwrap().unwrap().length(),
+			2,
+		);
 	}
 
 	#[test]

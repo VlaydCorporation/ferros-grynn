@@ -437,6 +437,10 @@ impl Transaction {
 	}
 
 	/// Selects graph-local MATCH seeds through exact, class, and label indexes.
+	///
+	/// Every returned atom satisfies the requested kind, selector, membership,
+	/// and label. Meta-position checks remain in the MATCH executor because no
+	/// transaction index represents that predicate.
 	pub(crate) fn query_match_candidates(
 		&self,
 		snapshot: &QuerySnapshot,

@@ -58,6 +58,16 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
 - MATCH сначала выбирает global exact/class кандидатов, затем пересекает их с
   graph-local label/membership indexes. Старый `(alias:label)` и `FROM graph`
   не являются compatibility grammar.
+- MATCH связывает `AtomOccurrenceRef`, а не голый `AtomRef`: каждая column
+  сама несёт свой graph occurrence context. Один `row.graph` не может быть
+  источником истины для cross-level путей, AtomWalk и `WITHIN`.
+- StandardPath, AtomWalk, hyper, nesting и shortest проходят один typed
+  MATCH pipeline и один physical-plan family. Не добавлять второй executor
+  или скрытый выбор алгоритма в cursor: mode, bounds, objective и filters
+  фиксируются physical plan.
+- Все рассмотренные topology branches считаются в `max_path_expansions`;
+  frontier/history/trace учитываются в statement barrier budget. При исчерпании
+  бюджета path execution fail-closed и не выдаёт partial path.
 - Mode 3 materialization возвращает owned effective graph; mutable write-back
   выполняется только явной delta flush operation.
 

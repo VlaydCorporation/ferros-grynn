@@ -6,6 +6,7 @@ use crate::{
 		LogicalGraphDmlStatement,
 		LogicalGraphReference,
 		LogicalMatch,
+		LogicalMatchPatternKind,
 		LogicalMatchSelector,
 		LogicalSelect,
 		LogicalSelectItem,
@@ -77,27 +78,41 @@ impl PlannerDemand {
 		let graph = statement.graph.id();
 		demand.graphs.insert(graph);
 		for pattern in &statement.patterns {
-			collect_match_binding(&pattern.start, &mut demand);
-			for operation in &pattern.ops {
-				let (source, edge, target, direction) = match operation {
-					MatchOp::Expand(expand) => {
-						(&expand.source, &expand.edge, &expand.target, expand.direction)
+			match &pattern.kind {
+				LogicalMatchPatternKind::Linear(pattern) => {
+					collect_match_binding(&pattern.start, &mut demand);
+					for operation in &pattern.ops {
+						let (source, edge, target, direction) = match operation {
+							MatchOp::Expand(expand) => {
+								(&expand.source, &expand.edge, &expand.target, expand.direction)
+							}
+							MatchOp::PathExpand(expand) => {
+								(&expand.source, &expand.edge, &expand.target, expand.direction)
+							}
+						};
+						collect_match_binding(source, &mut demand);
+						collect_match_binding(edge, &mut demand);
+						collect_match_binding(target, &mut demand);
+						for direction in degree_directions(direction) {
+							demand.degrees.entry(graph).or_default().insert(DegreeHistogramKey {
+								label: source.label.as_ref().map(|label| LabelStatisticKey {
+									kind: source.domain.atom_kind(),
+									label: label.as_ref().into(),
+								}),
+								direction,
+							});
+						}
 					}
-					MatchOp::PathExpand(expand) => {
-						(&expand.source, &expand.edge, &expand.target, expand.direction)
+				}
+				LogicalMatchPatternKind::Hyper(pattern) => {
+					collect_match_binding(&pattern.edge, &mut demand);
+					for endpoint in pattern.contains.iter().flat_map(|group| &group.endpoints) {
+						collect_match_binding(endpoint, &mut demand);
 					}
-				};
-				collect_match_binding(source, &mut demand);
-				collect_match_binding(edge, &mut demand);
-				collect_match_binding(target, &mut demand);
-				for direction in degree_directions(direction) {
-					demand.degrees.entry(graph).or_default().insert(DegreeHistogramKey {
-						label: source.label.as_ref().map(|label| LabelStatisticKey {
-							kind: source.domain.atom_kind(),
-							label: label.as_ref().into(),
-						}),
-						direction,
-					});
+				}
+				LogicalMatchPatternKind::Within(pattern) => {
+					collect_match_binding(&pattern.child, &mut demand);
+					collect_match_binding(&pattern.owner, &mut demand);
 				}
 			}
 		}

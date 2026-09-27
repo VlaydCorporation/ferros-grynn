@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
 
 use num_traits::ToPrimitive;
 use rapidhash::RapidHashMap;
@@ -12,9 +12,11 @@ use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{
 		AtomId,
+		AtomOccurrenceRef,
 		EdgeRead,
 		EndpointRole,
 		GraphRead,
+		GraphRef,
 		Path,
 		PathDirection,
 		PathStep,
@@ -64,6 +66,7 @@ impl ShortestPaths {
 	pub fn materialize_path<R: GraphRead>(
 		&self,
 		graph: &R,
+		graph_ref: Arc<GraphRef>,
 		target: AtomId,
 	) -> FerrosGrynnResult<Option<Path>> {
 		if graph.identity() != self.origin {
@@ -83,7 +86,10 @@ impl ShortestPaths {
 		};
 		let mut steps = Vec::with_capacity(path.len());
 		for (index, (atom, predecessor)) in path.into_iter().enumerate() {
-			let atom_ref = graph.atom_ref(atom)?.ok_or_else(|| atom_does_not_exist(atom))?;
+			let atom_ref = AtomOccurrenceRef::new(
+				graph.atom_ref(atom)?.ok_or_else(|| atom_does_not_exist(atom))?,
+				graph_ref.clone(),
+			);
 			if index == 0 {
 				steps.push(PathStep::new(
 					atom_ref,
@@ -96,9 +102,12 @@ impl ShortestPaths {
 			let predecessor = predecessor.ok_or_else(|| {
 				algorithm_failure("shortest path", "predecessor chain is incomplete")
 			})?;
-			let edge_ref = graph
-				.atom_ref(predecessor.step.via_edge)?
-				.ok_or_else(|| atom_does_not_exist(predecessor.step.via_edge))?;
+			let edge_ref = AtomOccurrenceRef::new(
+				graph
+					.atom_ref(predecessor.step.via_edge)?
+					.ok_or_else(|| atom_does_not_exist(predecessor.step.via_edge))?,
+				graph_ref.clone(),
+			);
 			steps.push(PathStep::new(
 				atom_ref,
 				Some(edge_ref),

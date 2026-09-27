@@ -372,6 +372,16 @@ impl LogicalSchemaStatement {
 pub(super) struct LogicalMatch {
 	/// Resolved graph reference captured during analysis.
 	pub(super) graph: GraphRef,
+	/// Whether an unmatched input row survives with new aliases set to none.
+	pub(super) optional: bool,
+	/// Whether complete binding tuples are deduplicated before projection.
+	pub(super) binding_distinct: bool,
+	/// Clause-wide atom uniqueness semantics.
+	pub(super) mode: crate::syn::MatchMode,
+	/// Whether linear endpoint positions use AtomWalk semantics.
+	pub(super) atom: bool,
+	/// Clause-wide meta requirement retained for planning and EXPLAIN.
+	pub(super) meta_scope: crate::syn::MatchMetaScope,
 	/// Analyzed patterns in their source order.
 	pub(super) patterns: Vec<LogicalMatchPattern>,
 	/// Columns bound by aliases in all patterns.
@@ -380,6 +390,12 @@ pub(super) struct LogicalMatch {
 	pub(super) filter: Option<TypedExpr>,
 	/// Expressions evaluated for each surviving row.
 	pub(super) projection: Vec<TypedExpr>,
+	/// Whether projected values are deduplicated.
+	pub(super) projection_distinct: bool,
+	/// Ordering applied after projection.
+	pub(super) order: Vec<LogicalOrder>,
+	/// Effective maximum for open path ranges.
+	pub(super) max_depth: u32,
 	/// Public result-column schema.
 	pub(super) result: Schema,
 }
@@ -387,12 +403,55 @@ pub(super) struct LogicalMatch {
 #[derive(Debug, Clone)]
 /// One linear MATCH pattern before runtime reordering.
 pub(super) struct LogicalMatchPattern {
+	/// Concrete graph relation executed for this source pattern.
+	pub(super) kind: LogicalMatchPatternKind,
+	/// Stable source-order tie breaker for the optimizer.
+	pub(super) original_index: usize,
+}
+
+#[derive(Debug, Clone)]
+/// One typed graph relation in a MATCH clause.
+pub(super) enum LogicalMatchPatternKind {
+	/// StandardPath or AtomWalk chain.
+	Linear(LogicalLinearPattern),
+	/// Hyperedge endpoint assignment.
+	Hyper(LogicalHyperPattern),
+	/// Direct or transitive graph containment join.
+	Within(LogicalWithinPattern),
+}
+
+#[derive(Debug, Clone)]
+/// One linear StandardPath or AtomWalk chain.
+pub(super) struct LogicalLinearPattern {
+	/// Optional column receiving the complete linear path.
+	pub(super) path_column: Option<usize>,
 	/// Initial endpoint binding.
 	pub(super) start: MatchBinding,
 	/// Linear expansion operations.
 	pub(super) ops: Vec<MatchOp>,
-	/// Stable source-order tie breaker for the optimizer.
-	pub(super) original_index: usize,
+}
+
+#[derive(Debug, Clone)]
+/// One hyperedge and its typed endpoint groups.
+pub(super) struct LogicalHyperPattern {
+	pub(super) edge: MatchBinding,
+	pub(super) contains: Vec<LogicalMatchContains>,
+}
+
+#[derive(Debug, Clone)]
+/// One typed HEAD, TAIL, or unqualified endpoint group.
+pub(super) struct LogicalMatchContains {
+	pub(super) side: crate::syn::MatchHyperSide,
+	pub(super) endpoints: Vec<MatchBinding>,
+}
+
+#[derive(Debug, Clone)]
+/// One direct or bounded transitive containment relation.
+pub(super) struct LogicalWithinPattern {
+	pub(super) child: MatchBinding,
+	pub(super) owner: MatchBinding,
+	pub(super) min: u32,
+	pub(super) max: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +474,8 @@ pub(super) struct Expand {
 	pub(super) target: MatchBinding,
 	/// Required traversal direction.
 	pub(super) direction: crate::syn::MatchDirection,
+	/// Candidate-edge filters inherited from the selected constraint scope.
+	pub(super) filters: Vec<crate::syn::MatchPathFilter>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +493,12 @@ pub(super) struct PathExpand {
 	pub(super) min: u32,
 	/// Inclusive maximum hop count.
 	pub(super) max: u32,
+	/// Per-path uniqueness mode after local/global override.
+	pub(super) mode: crate::syn::MatchPathMode,
+	/// Optional shortest-path objective after local/global override.
+	pub(super) objective: Option<crate::syn::MatchPathObjective>,
+	/// Candidate-edge filters after local/global override.
+	pub(super) filters: Vec<crate::syn::MatchPathFilter>,
 	/// Optional column receiving the public path value.
 	pub(super) path_column: Option<usize>,
 }
@@ -465,6 +532,12 @@ pub(super) struct MatchBinding {
 	pub(super) column: Option<usize>,
 	/// Optional graph-local label predicate.
 	pub(super) label: Option<Box<str>>,
+	/// Inline effective-property equality predicates.
+	pub(super) properties: Vec<(Box<str>, TypedExpr)>,
+	/// Inline predicate evaluated after this position is bound.
+	pub(super) predicate: Option<TypedExpr>,
+	/// Whether this position requires the corresponding meta binding.
+	pub(super) meta: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -756,6 +829,12 @@ pub(super) enum Builtin {
 	MetaId,
 	MetaClass,
 	MetaType,
+	GraphInner,
+	PathAtoms,
+	PathNodes,
+	PathEdges,
+	PathLength,
+	PathCost,
 	OptionIsSome,
 	OptionIsNone,
 }

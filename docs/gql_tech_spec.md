@@ -6,48 +6,50 @@
 
 ---
 
-## Утверждённый технический профиль P0–P2
+## Утверждённый технический профиль этапов 15–16
 
-**Статус профиля:** `approved-for-implementation`. Остальные механизмы полного языка в
-этом документе сохраняют статус `draft` и не являются зависимостями P0–P2.
+**Статус профиля:** `approved-for-implementation`. Этот раздел заменяет технический
+P0–P2-профиль MATCH; dependency order и gates задаёт
+[`gql_match_stages_15_16_plan.md`](gql_match_stages_15_16_plan.md).
 
-Вертикальный read-only срез имеет границы `text -> AST -> analysis -> LogicalMatch ->
-RowCursor -> array<object>`. Публичный AST содержит `MatchStatement`, `MatchPattern`,
-`MatchEndpoint`, `MatchEndpointKind`, `MatchStep`, `MatchEdge`, `MatchDirection`,
-`MatchLength`, `MatchReturnItem`; `StatementKind` и `QueryStatementKind` получают
-`Match`, сохраняя `#[non_exhaustive]`.
+Единый pipeline остаётся:
 
-Семантический анализ регистрозависимо разрешает обязательный `FROM graph_name` как
-`Text -> GraphRef` в `QuerySnapshot`, проверяет alias-kind, область имён и конечные
-диапазоны. В IR один `LogicalMatch` содержит линейные `MatchOp::Expand`/
-`MatchOp::PathExpand`. `Expand` несёт endpoint-domain, направление, labels и binding-
-колонки; отдельный универсальный join engine не вводится.
+```text
+parse → structural validation → typed analysis → logical IR
+      → Stage-14 optimizer → physical MATCH plan → sync pull execution
+      → projection/distinct/order → QueryResult<Value>
+```
 
-`QueryRead` статически диспетчеризуется и задаёт graph-view через GAT. Граф открывается
-только из переданного `QuerySnapshot`, поэтому всё выражение, включая Read Committed,
-использует один snapshot и регистрирует graph/set/atom reads. Граф и один построенный для
-цепочек/путей `TraversalIndex` разделяются через `Rc`; `MaterializedGraph` не является
-промежуточным представлением.
+В Stage 15 concrete executor получает `MatchSeed`, `MatchJoin`, `FixedExpand`,
+`PathEnumerate`, `BreadthFirstShortest`, `DijkstraShortest`, `OptionalFallback`, два distinct
+barrier и projection/order. Stage 16 добавляет `AtomExpand`, `HyperContains`, `HyperExpand`,
+`ResolveNestedEndpoint`, `WithinJoin` и `TransitiveWithin`; отдельного MATCH executor или
+универсального traversal trait не создаётся.
 
-Физическое исполнение — sync pull: `SeedCursor`, затем expand/path-expand, filter и
-project. Фиксированный шаг один раз получает `edge_ids` и лениво читает topology,
-labels/properties. `PathExpandCursor` выполняет инкрементальный DFS и хранит только
-активный `TRAIL`; верхняя граница 30, connector-edge не повторяется между цепочками
-одного `MATCH`, результат пути — `Value::Path`. Общие alias сравниваются при расширении,
-несвязанные паттерны образуют cursor-based декартово произведение. Семантика строк —
-bag, итог statement — `array<object>` без внутренних идентификаторов.
+Runtime binding хранит `AtomId` только как hot handle, а публичную identity — как
+`AtomOccurrenceRef { AtomRef, Arc<GraphRef> }`. Graph scope хранится на каждой MATCH column,
+не в одном `Row::graph`. Statement-local graph cache лениво открывает все графы в одном
+snapshot и регистрирует SSI predicates. Storage pages и guards не выходят в GQL.
 
-Минимальный runtime-optimizer не вводит stats-модуль: он читает точные `V = node_count`
-и `E = edge_count` из `GraphRead`, оценивает первый hop как `E`, каждый следующий как
-`ceil(2E / max(V, 1))` с saturating arithmetic. Сначала выбираются паттерны, связанные с
-известным alias, затем минимальная оценка; равенство сохраняет исходный порядок. Labels
-не меняют оценку до появления гистограмм.
+`PathTraceArena` используется лениво. Frontier/history/containment/trace входят в общий
+statement barrier budget и не spill-ятся; DISTINCT/ORDER используют существующий transient
+query spill. `max_path_expansions` считает candidate branches до property filtering.
+Cancellation/deadline проверяются на каждом frontier pop и не реже одного раза на 1024 branches.
 
-Профиль не меняет storage format/version, I/O, WAL, мутацию графов или release-gates.
-Имя графа проводится через существующее поле каталога; `create_named_graph` проверяет
-уникальность, непустоту, NUL и лимит 128 UTF-8 байт. `OPTIONAL`, явные modes,
-`RETURN DISTINCT`, `HYPER`/`META`/`WITHIN`, cross-level, inline property objects,
-неограниченные/shortest/weighted paths, DDL/DML, Traversal VM и graph-return отложены.
+Optimizer фиксирует algorithm/mode/bounds/filters в physical plan, использует Stage-14
+class/label/degree statistics и не делегирует выбор алгоритма executor. EXPLAIN содержит
+normalized constraints, seed/order, estimates и warnings; ANALYZE — actual branches,
+frontier/trace, graph opens, containment/hyper и spill metrics.
+
+Q-10 sparse frame-IoRing остаётся открытым: materialized `GraphRead` не предоставляет
+физическое page frontier. Stage 16 собирает logical frontier metrics; physical sparse cursor
+может быть подключён на этапе 17 только при наличии реального local page window.
+
+## Исторический технический профиль P0–P2
+
+**Статус профиля:** `superseded`. Удалённый vertical slice описан историческими отчётами.
+Production pipeline и принимаемый синтаксис задаются только утверждённым техническим профилем
+этапов 15–16; compatibility parser/executor для P0–P2 отсутствует.
 
 ## Технический профиль коррекции 8.1
 
@@ -298,9 +300,10 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
 ### 4.1. Фаза 1 — Binding (scope, alias)
 
 - Построение областей видимости биндингов: `Env = Map<Alias, Value>` (§14 gql_spec).
-- Правила биндингов §14.2: объявление `(a:Person)` → `Env[a] = vertex<Person>`; повторный alias — это **ограничение**, не присваивание; `MATCH` создаёт новый scope, `WITH`/`LET` — сужают/расширяют.
-- `MATCH ATOM <(a:Person)>` связывает vertex alias `a` с label-ограничением `Person`, а
-  `MATCH ATOM <[e:FRIEND]>` — edge alias `e`. В `RELATE ATOM <(person:alice)>` та же
+- Правила биндингов §14.2: объявление `(Person AS a)` → `Env[a] = vertex<Person>`; повторный alias — это **ограничение**, не присваивание; `MATCH` создаёт новый scope, `WITH`/`LET` — сужают/расширяют.
+- `MATCH ATOM <(Person AS a)> ... IN GRAPH g` связывает vertex alias `a` с class
+  `Person`, а `MATCH ATOM <[FRIEND AS e]>` — edge alias `e`. В
+  `RELATE ATOM <(person:alice)>` та же
   пунктуация окружает ссылку `record_id`; новый binding там не создаётся.
 - Проверка неопределённых алиасов, shadowing (§14.3): внутренний alias перекрывает внешний; при передаче через `WITH a, b` — проекция биндингов.
 - Разрешение `record_id` (`class:id`) в публичную ссылку; проверка существования class/graph через snapshot catalogs (§10).
@@ -405,9 +408,9 @@ Hyper- и binary-рёбра раскрываются тем же `Expand`, но 
 | `GROUP [ALL\|BY]`                                  | `Aggregate(group_by, aggs)`                                                      |
 | `ORDER BY`                                         | `Sort(keys)`                                                                     |
 | `LIMIT n START s`                                  | `Limit(n, s)`                                                                    |
-| `(a:L)-[:E]->(b:L2)`                               | `Scan(L as a) → Expand(Out, E, b) → Filter(label(b)=L2)` (§26.3, §54.5 gql_spec) |
-| `MATCH ATOM <[a:STEP]>~[r:DEPENDS_ON]~><[b:STEP]>` | `Scan(STEP as a) → Expand(Out, Atoms, DEPENDS_ON as r, STEP as b)`               |
-| `(a)-[:E*min..max mode]->(b)`                      | `PathExpand(Out, E, min, max, mode, …)`                                          |
+| `(L AS a)-[E]->(L2 AS b)`                          | `Scan(L as a) → Expand(Out, E, b) → Filter(class(b)=L2)` (§26.3, §54.5 gql_spec) |
+| `MATCH ATOM <[STEP AS a]>~[DEPENDS_ON AS r]~><[STEP AS b]>` | `Scan(STEP as a) → Expand(Out, Atoms, DEPENDS_ON as r, STEP as b)` |
+| `(* AS a)-[E*min..max mode]->(* AS b)`             | `PathExpand(Out, E, min, max, mode, …)`                                          |
 | `OPTIONAL MATCH`                                   | `Join(Left, …)` (§23.5 инвариант 6)                                              |
 | `MATCH DISTINCT` / `RETURN DISTINCT`               | `Dedup(keys)`                                                                    |
 | `RETURN GRAPH {nodes, edges}`                      | `GraphAssemble(constraint?)` (терминальная проекция в `subgraph`)                |
@@ -420,11 +423,13 @@ Hyper- и binary-рёбра раскрываются тем же `Expand`, но 
 - **Реляционная под-алгебра** (`SELECT`, соединения `MATCH`) → операторы Scan/Filter/Project/Join/Aggregate/Sort. Исполняется join/relational engine (§7).
 - **Traversal IR** (`|>`, `TRAVERSE`) → цепочка `TraversalStep`, исполняется Traversal VM (§8).
 
-Оба под-IR — узлы одного `LogicalPlan`, что позволяет смешивать стили (`FROM (MATCH …) |> tv::…`, `TRAVERSE FROM SELECT …`). Граница «MATCH → join engine, traversal → VM» фиксируется на уровне IR (§32.2 gql_spec, риск смешанной семантики).
+Оба под-IR — узлы одного `LogicalPlan`, что позволяет смешивать стили
+(`FROM (MATCH … IN GRAPH g RETURN …) |> tv::…`, `TRAVERSE FROM SELECT …`). Граница
+«MATCH → join engine, traversal → VM» фиксируется на уровне IR (§32.2 gql_spec, риск смешанной семантики).
 
 ### 5.4. Примеры IR — см. §26.3 gql_spec
 
-`MATCH (a:Person)-[:FRIEND]->(b:Person) WHERE a.age>18 RETURN b.name` →
+`MATCH (Person AS a)-[FRIEND]->(Person AS b) IN GRAPH social WHERE a.age>18 RETURN b.name` →
 ```
 Scan(Person AS a) → Filter(a.age>18) → Expand(Out, FRIEND, b) → Filter(label(b)=Person) → Project(b.name)
 ```
@@ -489,7 +494,7 @@ warning `statistics_stale`. Отсутствие даёт warning `statistics_mi
 
 ### 6.4. Штрафы и деградация плана
 
-Штрафы (§22.11): `penalty_high_degree_nodes`, `penalty_unbounded_path`, `penalty_no_index`, `penalty_materialization`. Обязательное предупреждение планировщика при `degree > 10 AND depth > 4` (риск path explosion, §32.1). Без `max` в `[:E*]` применяется `MAXDEPTH` clause или `FG_PATH_MAX_DEPTH`.
+Штрафы (§22.11): `penalty_high_degree_nodes`, `penalty_unbounded_path`, `penalty_no_index`, `penalty_materialization`. Обязательное предупреждение планировщика при `degree > 10 AND depth > 4` (риск path explosion, §32.1). Без `max` в `[E*]` применяется `MAXDEPTH` clause или `FG_PATH_MAX_DEPTH`.
 
 ### 6.5. `WITH`-подсказки
 
@@ -1140,7 +1145,7 @@ range scan. Public trait с единственной реализацией не
 | DiskANN (vector)   | Explicit Base или Effective | disk graph + exact delta      | KNN, bounded cache, optional HASHED_VECTOR     |
 | geometry (R-tree)  | Explicit Base или Effective | R-tree                        | `INSIDE`/`INTERSECTS`, `geo::*`                |
 | reachability       | Один graph                  | TREE/GRAIL/FERRARI/BFL/CHAIN  | `Yes/No/Maybe` + exact fallback                |
-| neighbourhood      | Один graph                  | EXACT/SKETCH/LANDMARK         | `[:E*1..k]`, `k_hop_neighbourhood`             |
+| neighbourhood      | Один graph                  | EXACT/SKETCH/LANDMARK         | `[E*1..k]`, `k_hop_neighbourhood`              |
 | path               | Один graph                  | LANDMARK_SSSP/PATTERN_CACHE   | shortest-path, var-length                      |
 | edge-endpoint      | Один graph                  | B+tree `ee_endpoint.fgidx`    | AtomWalk V-E/E-V/E-E (§10.4)                   |
 
@@ -1225,7 +1230,7 @@ publication.
 | `FG_TEMPFILES_PATH`                               | каталог для `SELECT … TEMPFILES`     | ""            |
 | `FG_ASYNC_EVENT_PROCESSING_INTERVAL`              | интервал async-событий               | 5000 ms       |
 
-Path-finding vs graph-expansion (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` применяется **только** к path-finding (`[:E*]` без явного `max`); `RETURN GRAPH`/`BUILD GRAPH` используют graph-expansion mode с лимитами по узлам/рёбрам, не по глубине. Деградация — fail-closed: при исчерпании бюджета операция отвергается с диагностикой, а не «зависает».
+Path-finding vs graph-expansion (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` применяется **только** к path-finding (`[E*]` без явного `max`); `RETURN GRAPH`/`BUILD GRAPH` используют graph-expansion mode с лимитами по узлам/рёбрам, не по глубине. Деградация — fail-closed: при исчерпании бюджета операция отвергается с диагностикой, а не «зависает».
 
 ---
 
@@ -1278,7 +1283,7 @@ output и iteration order hash maps запрещены и для effective seed,
 - **Join Reordering** (§54.2): `(A ⋈ B) ⋈ C ≡ A ⋈ (B ⋈ C)` при отсутствии side-effects и детерминированных предикатах. ∎
 - **Projection Pushdown** (§54.3): `π_f(σ_p(R)) ≡ σ_p(π_{f'}(R))`, `f' ⊇ attrs(p)` — если не удаляются поля, используемые предикатом. ∎
 - **Traversal Step Fusion** (§54.4): `out ∘ out = expand(depth=2)` при отсутствии side-effects и path-constraints. ∎
-- **MATCH → JOIN** (§54.5): `MATCH (a)-[:E]->(b) = {(a,b) | b ∈ Expand(a)}`. ∎
+- **MATCH → JOIN** (§54.5): `MATCH (* AS a)-[E]->(* AS b) IN GRAPH g RETURN a, b = {(a,b) | b ∈ Expand(a)}`. ∎
 - **Snapshot consistency** (§55): `∀ op: op.snapshot = S` — иначе phantom reads.
 - **Side-effects** (§56): `side_effect ∘ filter ≠ filter ∘ side_effect` — эффектные операторы фиксируют order-barrier и запрещают reordering.
 - **Cost-based корректность** (§57): если все правила rewrite корректны и все физические операторы корректны, то `Planner(Q) ≡ Q`.

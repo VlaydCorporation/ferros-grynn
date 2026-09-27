@@ -32,6 +32,7 @@ pub use error_value::ErrorValue;
 pub use geometry::{Geometry, Position};
 pub use graph::{
 	AtomKind,
+	AtomOccurrenceRef,
 	AtomRef,
 	Frozen,
 	FrozenGraph,
@@ -66,16 +67,23 @@ pub use crate::graph;
 
 #[cfg(test)]
 mod tests {
-	use std::collections::{BTreeSet, HashSet};
+	use std::{
+		collections::{BTreeSet, HashSet},
+		sync::Arc,
+	};
 
 	use rust_decimal::Decimal;
 
 	use super::{Number, Text, Type, Value, ValueKind};
 	use crate::values::runtime::graph::{
 		AtomKind,
+		AtomOccurrenceRef,
 		AtomRef,
 		Graph,
+		GraphId,
 		GraphKind,
+		GraphRef,
+		GraphStorageMode,
 		Mutable,
 		Path,
 		SnapshotId,
@@ -201,5 +209,49 @@ mod tests {
 		assert_eq!(path_value.kind(), ValueKind::Path);
 		assert_eq!(path_value.value_type(), Type::Path);
 		assert_eq!(Path::try_from(path_value).unwrap(), path);
+	}
+
+	#[test]
+	fn occurrence_identity_uses_graph_id_and_atom_identity() {
+		let atom = AtomRef::new(AtomKind::Node, "person:1".parse().unwrap());
+		let graph = Arc::new(
+			GraphRef::new(
+				GraphId::new(7).unwrap(),
+				"first",
+				GraphKind::Graph,
+				GraphStorageMode::InMemory,
+			)
+			.unwrap(),
+		);
+		let renamed = Arc::new(
+			GraphRef::new(
+				GraphId::new(7).unwrap(),
+				"renamed",
+				GraphKind::Dag,
+				GraphStorageMode::DiskBacked,
+			)
+			.unwrap(),
+		);
+		let other = Arc::new(
+			GraphRef::new(
+				GraphId::new(8).unwrap(),
+				"other",
+				GraphKind::Graph,
+				GraphStorageMode::InMemory,
+			)
+			.unwrap(),
+		);
+
+		let first = AtomOccurrenceRef::new(atom.clone(), graph);
+		let same_identity = AtomOccurrenceRef::new(atom.clone(), renamed);
+		let other_graph = AtomOccurrenceRef::new(atom, other);
+		assert_eq!(first, same_identity);
+		assert_ne!(first, other_graph);
+		assert_eq!(HashSet::from([first.clone(), same_identity]).len(), 1);
+
+		let value = Value::from(first);
+		assert_eq!(value.kind(), ValueKind::AtomOccurrence);
+		assert_eq!(value.value_type(), Type::AtomOccurrence(AtomKind::Node));
+		assert!(!value.is_storable());
 	}
 }

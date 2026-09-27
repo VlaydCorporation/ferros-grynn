@@ -9,48 +9,67 @@ storage/durability — [disk_storage_spec.md](disk_storage_spec.md), реали�
 
 ---
 
-## Утверждённый профиль P0–P2 (GrynQL MVP)
+## Утверждённый профиль этапов 15–16 — полный graph-first MATCH
 
-**Статус профиля:** `approved-for-implementation`. Полный язык, описанный остальными
-разделами этого документа, сохраняет статус `draft`; до отдельного утверждения он не
-расширяет текущий исполнимый профиль.
+**Статус профиля:** `approved-for-implementation`. Этот раздел заменяет исторический
+P0–P2-профиль для `MATCH`. Dependency-ordered реализацию и полный gate задаёт
+[`gql_match_stages_15_16_plan.md`](gql_match_stages_15_16_plan.md).
 
-Профиль P0–P2 определяет один read-only statement обязательной формы:
+Каноническая форма:
 
 ```grynql
-MATCH [ATOM] pattern [, pattern ...]
-FROM graph_name
-[WHERE expression]
-RETURN expression [AS alias] [, expression [AS alias] ...]
+[OPTIONAL] MATCH
+    [DISTINCT]
+    [ATOM]
+    [REPEATABLE ELEMENTS | DIFFERENT EDGES | DIFFERENT ATOMS]
+    [HYPER | META | METAVERTEX | METAEDGE]
+    [CONSTRAINTS <path_constraint ...>]
+    pattern [, pattern ...]
+    [CONTAINS ...]
+    IN GRAPH graph_ref
+    [WHERE expression]
+    [MAXDEPTH depth]
+    [TIMEOUT duration]
+    RETURN [DISTINCT] projection
+    [ORDER BY ...];
 ```
 
-`graph_name` является значением `Text` каталога, регистрозависимо разрешаемым в
-`GraphRef` из единого снимка запроса. `RecordId`, внутренний `AtomId` и storage-типы не
-являются именами графов и не выходят в синтаксис или публичный результат. Каталог
-поддерживает `Transaction::create_named_graph(name, id, graph)`; совместимый
-`create_graph(id, graph)` использует `id.id()` как имя. Имя уникально в базе данных,
-непусто, не содержит NUL и занимает не более 128 байт UTF-8. Оно сохраняется через уже
-существующее поле имени дискового каталога без изменения формата или его версии.
+Нормативные правила:
 
-В утверждённый профиль входят:
+1. Optionality записывается только как `OPTIONAL MATCH`; `MATCH OPTIONAL` не принимается.
+2. Источник задаётся только `IN GRAPH graph_ref`, где `graph_ref` — имя либо параметр типа
+   `GraphRef`; историческая MATCH-форма `FROM graph` не принимается.
+3. `OPTIONAL MATCH DISTINCT` сочетает независимые outer-match и binding-dedup semantics.
+   `RETURN DISTINCT` отдельно дедуплицирует projected values.
+4. `DIFFERENT EDGES` является default match mode. Mode распространяется на именованные и
+   anonymous endpoint/connector positions всех patterns clause.
+5. Selector позиции — class, exact `RecordId` либо `*`; `AS` вводит alias, `LABEL` задаёт
+   graph-local label. Повтор alias является equality join. Inline object задаёт null-safe
+   equality над effective properties; inline `WHERE` может читать только уже связанные aliases.
+6. Открытые path ranges нормализуются до конечного max: `MAXDEPTH`, иначе
+   `FG_PATH_MAX_DEPTH = 30`. Max больше 30 отклоняется до row pull. Default path mode — `TRAIL`;
+   `WALK`, `ACYCLIC` и `SIMPLE` имеют различимую семантику из §15.
+7. Global и local constraints имеют независимые оси mode, objective и AND-combined filters.
+   Локальная ось заменяет одноимённую global axis; повтор mode/objective в scope ошибочен.
+8. `SHORTEST` и `WEIGHTED SHORTEST` возвращают один канонический путь на source–target пару.
+   Используются BFS и Dijkstra; weight складывается exact numeric matrix, отсутствующий равен
+   единице, negative/non-finite даёт typed runtime error.
+9. Public atom binding является `AtomOccurrenceRef = { AtomRef, GraphRef }`. `AtomRef` остаётся
+   global durable identity; occurrence задаёт effective-property и topology scope. Durable fields
+   occurrence не принимают.
+10. `path::atoms/nodes/edges/length/cost` возвращают occurrence-aware значения. Trace создаётся
+    только при наблюдаемом path либо необходимом objective.
+11. Этап 16 активирует `ATOM`, `HYPER ... CONTAINS`, `META`/`METAVERTEX`/`METAEDGE`,
+    `WITHIN` и cross-level incidence. Meta atom остаётся opaque: обычный traversal не входит во
+    внутренний graph автоматически.
+12. `max_path_expansions` и общий statement memory budget ограничивают paths, hyper assignments
+    и containment. Timeout/cancellation не публикуют partial path.
 
-- StandardPath с node-endpoint'ами, четырьмя направлениями, сокращёнными анонимными
-  рёбрами, альтернативами label через `|`, цепочками и несколькими паттернами;
-- AtomWalk с явными `<(...)>`/`<[...]>` и четырьмя `~[...]~`-операторами, включая
-  инцидентность vertex–edge и edge–edge и пары endpoint'ов гиперребра;
-- общий alias как equi-join и несвязанные паттерны как декартово произведение;
-- `WHERE`/`RETURN` над alias, `alias.id`, `alias.label` и свойствами из
-  `PropertyDictionary`; отсутствующее свойство имеет значение `none`;
-- конечные StandardPath-диапазоны `*n`, `*min..max`, `*..max` с `min = 0`, максимумом
-  30 и режимом `TRAIL`. Alias переменного connector-edge запрещён; такой путь
-  возвращается через `path = ...` как `Value::Path`;
-- мультимножество результатов и `DIFFERENT EDGES` по умолчанию для всех цепочек одного
-  `MATCH`. Результат statement имеет публичную форму `array<object>`.
+## Исторический профиль P0–P2 (GrynQL MVP)
 
-В P0–P2 явно **не поддерживаются** `OPTIONAL`, явные match/path modes,
-`RETURN DISTINCT`, `HYPER`/`META`/`WITHIN`, cross-level matching, inline property
-objects, неограниченные и shortest/weighted paths, DDL/DML, Traversal VM и graph-return.
-Их описание ниже остаётся проектом полного языка, а не обещанием текущего runtime.
+**Статус профиля:** `superseded`. Старый vertical slice и его удалённый синтаксис сохранены
+только в исторических отчётах. Настоящая спецификация не определяет compatibility grammar:
+принимается исключительно утверждённый профиль этапов 15–16 выше.
 
 ## Утверждённая коррекция модели данных — этап 8.1
 
@@ -591,11 +610,13 @@ MetaEdge — ребро с возможностью хранения внутр�
 LevelPath не является traversal-механизмом. Это метаданные атома, позволяющие понять иерархию вложенности.
 
 ```
--- Создать кросс-уровневое ребро с явным LevelPath
-MATCH (inner_a:Function) WITHIN (mv1:Module),
-    (inner_b:Class) WITHIN (mv2:Package) WITHIN (mv1)
-RELATE (inner_a)-[e:CALLS]->(inner_b)
-KEEP LEVELPATH;
+-- Stage 17: найти endpoints и затем создать связь с явным LevelPath
+MATCH (Function AS inner_a) WITHIN*[1..7] <(Module AS mv1)>,
+      (Class AS inner_b) WITHIN*[1..7] <(Package AS mv2)>
+IN GRAPH catalog
+RETURN inner_a, inner_b, mv1, mv2;
+
+RELATE (inner_a)-[CALLS AS e]->(inner_b) KEEP LEVELPATH;
 
 -- e.levelpath = [inner_a, mv1, mv2, inner_b]
 -- inner_a.levelpath = [mv1]
@@ -1104,22 +1125,24 @@ GQL различает три типа путей с разной семанти
 Включается ключевым словом `ATOM` в `MATCH`, `TRAVERSE`, `RELATE` и других операторах,
 которые принимают графовый паттерн:
 ```
-MATCH ATOM <(a:Person)>~[e1:ANNOTATES]~><[e_mid:FRIEND]>~[e2:OWNED_BY]~><(b:Person)>
+MATCH ATOM <(Person AS a)>~[ANNOTATES AS e1]~><[FRIEND AS e_mid]>
+           ~[OWNED_BY AS e2]~><(Person AS b)>
+IN GRAPH social
+RETURN a, e1, e_mid, e2, b;
 ```
 
 Синтаксис AtomWalk:
 - `~[r]~>` / `<~[r]~` — направленный шаг через явное ребро `r`;
 - `~[r]~` — неориентированный шаг;
 - `<~[r]~>` — двунаправленный шаг;
-- `<(v:Label)>` — vertex endpoint, `<[e:Label]>` — edge endpoint; внутри обёртки сохраняется
-  семантика `alias:Label`, как и для StandardPath.
+- `<(Class AS v)>` — node endpoint, `<[Class AS e]>` — edge endpoint; внутри обёртки
+  сохраняется та же форма selector/`AS`/`LABEL`, что и для StandardPath.
 
-Kind endpoint'а определяется только внутренними delimiters, а label остаётся пользовательским
-ограничением. Например, `<(x:edge)>` означает vertex с label `edge`, а не edge-атом; edge-атом
-с тем же label записывается как `<[x:edge]>`.
+Kind endpoint'а определяется только внутренними delimiters. Class selector не является label:
+graph-local label указывается отдельно, например `<(Person AS x LABEL Employee)>`.
 
 Каждый endpoint в операции с ключевым словом `ATOM` обязан использовать одну из этих двух
-обёрток. Тильда и явное связывающее ребро `[alias]`, `[:Label]` или `[alias:Label]`
+обёрток. Тильда и явное связывающее ребро `[Class AS alias]` либо `[* AS alias]`
 обязательны, поэтому AtomWalk визуально отличается от StandardPath. Форм `~~`, `~>`,
 `~[]~>` и других анонимных связей нет.
 
@@ -1128,14 +1151,16 @@ Kind endpoint'а определяется только внутренними de
 Пример: E–E incidence-путь:
 ```
 -- flow связывает два edge-атома как source и target
-MATCH ATOM <[e1:TRANSFER]>~[flow:FLOW]~><[e2:TRANSFER]>
+MATCH ATOM <[TRANSFER AS e1]>~[FLOW AS flow]~><[TRANSFER AS e2]>
+IN GRAPH payments
 RETURN e1, e2;
 ```
 
 Пример: V–E endpoint-путь:
 ```
 -- Вершина alice соединена endpoint-ребром с ребром friendship
-MATCH ATOM <(alice:Person)>~[annotation:ANNOTATES]~><[friendship:FRIEND]>
+MATCH ATOM <(Person AS alice)>~[ANNOTATES AS annotation]~><[FRIEND AS friendship]>
+IN GRAPH social
 RETURN alice, annotation, friendship;
 ```
 
@@ -1304,7 +1329,8 @@ status = "active" ? 1 : 0
 ### 6.6. Подзапросы в выражениях
 
 Скалярный подзапрос в скобках: `(SELECT count() FROM person)`.  
-Для проверки существования: `NOT array::is_empty(MATCH (a:Person {name: $name}))`.
+Для проверки существования:
+`NOT array::is_empty(MATCH (Person AS a {name: $name}) IN GRAPH $graph RETURN a)`.
 
 Во втором примере планировщик обязан применять оптимизацию: проверять размер массива, не материализуя записи.
 
@@ -1334,7 +1360,8 @@ LET $var [: @type] = @expression;
 - `LET` может кешировать промежуточные результаты и использоваться повторно.
 
 ```
-LET $friends = MATCH (a:Person {name: "Alice"})-[:FRIEND]->(f:Person) RETURN f;
+LET $friends = MATCH (Person AS a { name: "Alice" })-[FRIEND]->(Person AS f)
+               IN GRAPH social RETURN f;
 LET $count: int = (SELECT count() FROM person WHERE age > 18);
 ```
 
@@ -2329,7 +2356,7 @@ disk-resident side-file с bounded page cache. Граф, его списки с�
 
 #### Path Index
 
-Ускоряет запросы с переменной длиной пути `[:E*min..max]->` и shortest-path запросы между произвольными парами вершин.
+Ускоряет запросы с переменной длиной пути `[E*min..max]->` и shortest-path запросы между произвольными парами вершин.
 
 ```
 DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
@@ -2446,7 +2473,7 @@ artifact.
 #### Neighborhood index
 
 Предвычисляет k-хоп окрестности вершин. 
-Ускоряет `k_hop_neighbourhood(a, k)` и MATCH-паттерны вида `[:E*1..k]->`.
+Ускоряет `k_hop_neighbourhood(a, k)` и MATCH-паттерны вида `[E*1..k]->`.
 
 ```
 DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
@@ -3197,7 +3224,7 @@ SELECT * FROM temperature:['London', '2022-08-29T08:03:39']..['London', '2022-08
 | Ось                      | Вопрос                                                                  | Где задаётся                                                                               |
 |--------------------------|-------------------------------------------------------------------------|--------------------------------------------------------------------------------------------|
 | **Match mode** (морфизм) | Могут ли **два разных алиаса** паттерна связать **один и тот же** атом? | Модификатор `MATCH` ([§12.4](#124-match-mode--морфизм-и-кардинальность)) — на весь `MATCH` |
-| **Path mode**            | Могут ли элементы повторяться **внутри одного пути**?                   | `CONSTRAINTS <...>` (глобально) или `[:E ... ]` (локально), [§12.7](#127-path-constraints) |
+| **Path mode**            | Могут ли элементы повторяться **внутри одного пути**?                   | `CONSTRAINTS <...>` (глобально) или `[E ... ]` (локально), [§12.7](#127-path-constraints)  |
 
 Match mode ограничивает отображение переменных, path mode — форму пути. Паттерн фиксированной длины не имеет path mode, но всегда имеет match mode; и наоборот, путь переменной длины имеет path mode, а его отношение к остальным алиасам — вопрос match mode.
 
@@ -3219,53 +3246,55 @@ Match mode ограничивает отображение переменных,
 ### 12.2. Синтаксис
 
 ```
-MATCH [ OPTIONAL | DISTINCT ]
-    [ REPEATABLE ELEMENTS | DIFFERENT EDGES | DIFFERENT ATOMS ]
+[OPTIONAL] MATCH
+    [ DISTINCT ]
     [ ATOM ]
+    [ REPEATABLE ELEMENTS | DIFFERENT EDGES | DIFFERENT ATOMS ]
     [ HYPER | META | METAVERTEX | METAEDGE ]
-    [ CONSTRAINTS @constaints ]
+    [ CONSTRAINTS <@constraint ...> ]
     @pattern [ , @pattern ... ]
-    [ FROM @source ]
+    [ CONTAINS ... ]
+    IN GRAPH @graph_ref
     [ WHERE @condition ]
-    [ CONTAINS @atoms ]
-    [ WITH [NOINDEX | INDEX @indexes ...] ]
-    [ ORDER BY ... ]
-    [ TIMEOUT @duration ]
     [ MAXDEPTH @depth ]
-    [ KEEP LEVELPATH [ FROM @aliases_array ] ]
-    [ RETURN @fields | @path | DISTINCT @field ]
+    [ TIMEOUT @duration ]
+    RETURN [ DISTINCT ] @projection
+    [ ORDER BY ... ]
 ;
 
 @pattern ::= [ @path_name = ] @relations_pattern
 ```
+
+`WITH INDEX` принадлежит этапу 25, `WITH COST` — этапу 21, а `KEEP LEVELPATH` — этапу 17;
+они не являются скрытыми compatibility clauses профиля этапов 15–16.
 
 ### 12.3. Синтаксис паттернов
 
 #### Вершины
 
 ```
-()                   -- безымянная вершина
-(:Label)             -- вершина с меткой
-(n)                  -- вершина с алиасом
-(n:Label)            -- вершина с алиасом и меткой
-(n:Label { key: val }) -- вершина с фильтром по свойствам
-(n:Label WHERE n.age > 18) -- вершина с WHERE-фильтром
+(*)                              -- любой node endpoint без alias
+(Person)                         -- endpoint класса Person
+(Person AS p)                    -- класс и alias
+(Person AS p LABEL Employee)     -- graph-local label
+(Person AS p { age: 18 })        -- inline equality над effective property
+(Person AS p WHERE p.age > 18)   -- inline predicate
+(person:alice AS p)              -- точный RecordId и alias
 ```
 
 #### Рёбра
 
 ```
-[:TYPE]              -- ребро с меткой
--[e:TYPE]->          -- ориентированное ребро
-<-[e:TYPE]-          -- обратное ориентированное ребро
--[e:TYPE]-           -- неориентированное
-<-[e:TYPE]->         -- двунаправленное
--[e:TYPE|OTHER]->    -- ребро с меткой TYPE или OTHER
--[e]->, -[]->, ->    -- ребро без ограничения типа
--[e:TYPE*]->         -- переменная длина (1..∞)
--[e:TYPE*1..3]->     -- длина от 1 до 3 включительно
--[e:TYPE*..5]->      -- длина от 1 до 5
--[e:TYPE*3]->        -- ровно 3 хопа
+[TYPE]               -- connector edge класса TYPE
+-[TYPE AS e]->       -- ориентированный connector с alias
+<-[TYPE AS e]-       -- обратный ориентированный connector
+-[TYPE AS e]-        -- неориентированный connector
+<-[TYPE AS e]->      -- двунаправленный connector
+-[* AS e]->, -[]->, -> -- connector без ограничения класса
+-[TYPE*]->           -- открытая длина 1..effective_max
+-[TYPE*1..3]->       -- длина 1..3 включительно
+-[TYPE*..5]->        -- длина 1..5
+-[TYPE*3]->          -- ровно три шага
 ```
 
 #### Гиперрёбра
@@ -3274,24 +3303,34 @@ MATCH [ OPTIONAL | DISTINCT ]
 
 ```
 -- HEAD и TAIL фильтруют source- и target-стороны
-MATCH HYPER [e:TYPE] CONTAINS HEAD [(a:TYPE), (b:TYPE)], TAIL [(c:TYPE)]
+MATCH HYPER [TYPE AS e]
+CONTAINS HEAD [(TYPE AS a), (TYPE AS b)], TAIL [(TYPE AS c)]
+IN GRAPH topology
+RETURN e, a, b, c;
 
 -- ATOM и HYPER ортогональны: endpoint'ом может быть edge-атом
-MATCH ATOM HYPER [e:TYPE]
-CONTAINS HEAD [<(a:TYPE)>, <[guard:GUARD]>], TAIL [<(c:TYPE)>, <[audit:AUDIT]>]
+MATCH ATOM HYPER [TYPE AS e]
+CONTAINS HEAD [<(TYPE AS a)>, <[GUARD AS guard]>],
+         TAIL [<(TYPE AS c)>, <[AUDIT AS audit]>]
+IN GRAPH topology
+RETURN e, a, guard, c, audit;
 ```
 
 Или через классическую семантику с проверкой на `HYPER`
 
 ```
-MATCH (a:TYPE)-[e:TYPE]->(b:TYPE) WHERE type::is<hyperedge>(e)
+MATCH (TYPE AS a)-[TYPE AS e]->(TYPE AS b)
+IN GRAPH topology
+WHERE type::is<hyperedge>(e)
+RETURN a, e, b;
 ```
 
 Или как фильтр по набору участников:
 
 ```
-MATCH HYPER [e:TYPE]
-WHERE array::contains(e.source, a) OR array::contains(e.target, a)
+MATCH HYPER [TYPE AS e] CONTAINS [(TYPE AS a)]
+IN GRAPH topology
+RETURN e, a;
 ```
 
 #### Мета-атомы
@@ -3300,7 +3339,8 @@ WHERE array::contains(e.source, a) OR array::contains(e.target, a)
 
 ```
 -- Найти метавершину и атом внутри неё
-MATCH METAVERTEX (m:Module) 
+MATCH METAVERTEX (Module AS m)
+IN GRAPH catalog
 RETURN m, graph::inner(m) AS subgraph;
 ```
 
@@ -3308,7 +3348,8 @@ RETURN m, graph::inner(m) AS subgraph;
 
 Мета-ребро в паттерне:
 ```
-MATCH METAEDGE (a)-[me:TYPE]->(b)
+MATCH METAEDGE (* AS a)-[TYPE AS me]->(* AS b)
+IN GRAPH catalog
 RETURN me, graph::inner(me);
 ```
 
@@ -3355,14 +3396,17 @@ edge-to-edge не делает ребро метаребром и выражае
 
 ```
 -- Две разные связи между одной парой людей
-MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(a)
+MATCH (Person AS a)-[KNOWS AS r1]->(Person AS b)-[KNOWS AS r2]->(Person AS a)
+IN GRAPH social
 RETURN r1, r2;              -- r1 ≠ r2 гарантировано по умолчанию
 
 -- Разрешить r1 = r2 (найдёт петли KNOWS)
-MATCH REPEATABLE ELEMENTS (a)-[r1:KNOWS]->(b)-[r2:KNOWS]->(a) RETURN r1, r2;
+MATCH REPEATABLE ELEMENTS (* AS a)-[KNOWS AS r1]->(* AS b)-[KNOWS AS r2]->(* AS a)
+IN GRAPH social RETURN r1, r2;
 
 -- Треугольник из трёх различных людей и трёх различных рёбер
-MATCH DIFFERENT ATOMS (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a)
+MATCH DIFFERENT ATOMS (Person AS a)-[KNOWS]->(Person AS b)-[KNOWS]->(Person AS c)-[KNOWS]->(Person AS a)
+IN GRAPH social
 RETURN a, b, c;
 ```
 
@@ -3376,25 +3420,26 @@ RETURN a, b, c;
 | `OPTIONAL MATCH`       | Сохраняет строки, у которых часть паттерна не найдена  |
 | `MATCH DISTINCT`       | Убирает дублирующиеся биндинги по всему набору алиасов |
 
-Оси независимы и комбинируются: `MATCH OPTIONAL DIFFERENT ATOMS ...`.
+Оси независимы и комбинируются: `OPTIONAL MATCH DISTINCT DIFFERENT ATOMS ...`.
 
 ### 12.5. Правила биндингов
 
-- `(a:Person)` создаёт биндинг `a: vertex<Person>`.
-- `[r:FRIEND]` создаёт биндинг `r: edge<FRIEND>`.
+- `(Person AS a)` создаёт биндинг `a: node-occurrence<Person>`.
+- `[FRIEND AS r]` создаёт биндинг `r: edge-occurrence<FRIEND>`.
 - Один алиас в одном паттерне означает один и тот же объект: `(a)-->(b), (b)-->(c)` — `b` одинаков в обоих совпадениях.
 - Биндинги живут в scope `MATCH`; `WITH` / `LET` создают новый scope.
 
 ### 12.6. Семантика пути переменной длины
 
 ```
-MATCH (a)-[:E*min..max]->(b)
+MATCH (* AS a)-[E*min..max]->(* AS b) IN GRAPH graph RETURN a, b
 ```
 
 - Возвращает **все** пути длины ∈ `[min, max]`, по умолчанию `TRAIL`-семантика.
 
 ```
-MATCH path = (a:Person)-[:FRIEND*1..3]->(b:Person)
+MATCH path = (Person AS a)-[FRIEND*1..3]->(Person AS b)
+IN GRAPH social
 WHERE a.name = "Alice"
 RETURN path;
 ```
@@ -3420,51 +3465,39 @@ RETURN path;
 Ограничения на *инъективность алиасов* — это отдельная ось, см. [§12.4](#124-match-mode--морфизм-и-кардинальность).
 
 ```
-MATCH path = (a:Person)-[:Friend]->(:Person)
+MATCH CONSTRAINTS <SIMPLE SHORTEST>
+      path = (Person AS a)-[Friend]->(Person)
+IN GRAPH social
 WHERE a.name = "Alice"
-CONSTRAINTS <SIMPLE SHORTEST>
+RETURN path
 ```
 или
 ```
-MATCH path = (a:Person)-[:Friend SIMPLE SHORTEST]->(:Person)
+MATCH path = (Person AS a)-[Friend SIMPLE SHORTEST]->(Person)
+IN GRAPH social
 WHERE a.name = "Alice"
+RETURN path
 ```
 
 ### 12.8. Расширения MATCH
 
-#### 12.8.1. FROM для MATCH — источник графа
+#### 12.8.1. `IN GRAPH` — источник MATCH
 
 В отличие от Neo4j в базе данных Ferros-Grynn нет глобального графа, вместо этого в базе данных может храниться множество графов, 
 каждый из которых имеет независимые `GraphId` и каталожное имя.
 
-Граф-источник указывается через `FROM`:
+Граф-источник указывается через `IN GRAPH`:
 ```
-FROM @graph_expr;
+IN GRAPH graph_ref
 ```
 
-где `@graph_expr` может быть:
-- Именованным графом: `FROM my_graph`
-- Внутренним подграфом мета-атомов: `FROM graph::inner(meta-atom)`
-- Результатом подзапроса: `FROM (... RETURN GRAPH ...)`
+`graph_ref` является именем графа либо параметром типа `GraphRef`. Он разрешается в одном
+statement snapshot до начала row pull. Arbitrary graph-expression и результат подзапроса не
+являются MATCH source.
 
-Примеры:
-```
--- Traversal внутри transition-подграфа MetaEdge
-SELECT
-    (MATCH META (a)-[me:SEND]->(b) FROM sender_graph RETURN me) as me,
-    (MATCH (step1:State)-[:NEXT]->(step2:State) FROM graph::inner(me) RETURN [step1, step2]) as steps 
-RETURN me, steps[0] as step1, steps[1] as step2;
-
-
--- Traversal внутри подграфа метавершины
-SELECT
-    (MATCH (mv:Module)),
-    (MATCH (fn1:Fn)-[:CALLS*1..3]->(fn2:Fn) FROM graph::inner(mv) RETURN [fn1, fn2]) as fns
-RETURN mv, fns[0] as fn1, fns[1] as fn2;
-    
--- SELECT в данных запросах не добавляет накладных расходов, а лишь выступает аггрегирующей областью видимости,
--- чтобы вручную не открывать транзакцию и не плодить LET-запросы.
-```
+Внутренний graph мета-атома доступен как `graph::inner(occurrence)`. Связь inner graph с
+владельцем сопоставляется через `WITHIN`; ordinary adjacency traversal не меняет graph scope
+неявно.
 
 #### 12.8.2. MATCH ATOM — AtomWalk-паттерн
 
@@ -3867,7 +3900,7 @@ Traversal дорогой в:
 
 | Правило          | Описание                                                                             |
 |------------------|--------------------------------------------------------------------------------------|
-| Объявление       | `(a:Person)` → `Env[a] = vertex<Person>`                                             |
+| Объявление       | `(Person AS a)` → `Env[a] = vertex<Person>`                                             |
 | Повторный alias  | `(a)-->(b), (b)-->(c)` → `Env[b]` одинаков в обоих — это constraint, не присваивание |
 | Scope            | `MATCH` создаёт новый scope; `WITH` / `LET` ограничивают или расширяют scope         |
 | MATCH result     | Возвращает `Bag<Env>` (мультимножество биндинг-сред)                                 |
@@ -3896,13 +3929,10 @@ WITH a, b   -- binding' = projection(binding, {a, b})
 
 Длина пути: n (количество рёбер).
 
-Стоимость пути: $cost(P) = \displaystyle\sum_i \text{weight}(e_i)$, где $\text{weight}(NaN) = 1$.
-
-$\text{weight}(NaN) = 1$, потому что NaN означает «вес не задан» = единичный шаг.
-При `SHORTEST` (без весов) каждое ребро стоит 1, следовательно, cost = количество рёбер.
-Если бы weight(NaN) = 0, то все невзвешенные рёбра были бы «бесплатны»
-→ кратчайший путь терял бы смысл (алгоритм не различал бы пути по длине).
-При WEIGHTED SHORTEST: ребро с weight=NaN трактуется как weight=1.
+Стоимость пути: $cost(P) = \displaystyle\sum_i \text{weight}(e_i)$. Отсутствующий weight
+равен exact numeric `1`. Явный negative либо non-finite weight на рассматриваемом connector
+edge является typed runtime error и не подменяется единицей. При `SHORTEST` каждый шаг стоит
+единицу, поэтому cost равен числу connector steps.
 
 ### 15.2. AtomWalk
 
@@ -3922,26 +3952,28 @@ $\text{weight}(NaN) = 1$, потому что NaN означает «вес не
 |-----------|----------------------------------------------------|
 | `WALK`    | Без ограничений (повторы вершин и рёбер допустимы) |
 | `TRAIL`   | Связывающие рёбра не повторяются                   |
-| `SIMPLE`  | Вершины/атомы не повторяются                       |
-| `ACYCLIC` | Нет циклов                                         |
+| `ACYCLIC` | Endpoint-атом не повторяется                        |
+| `SIMPLE`  | Endpoint не повторяется, кроме одного совпадения последнего endpoint с первым |
 
-`SIMPLE`, очевидно, включает в себя `ACYCLIC` и `TRAIL`: путь без повторов вершин не может повторить ребро.
-Поэтому отдельного режима «`TRAIL` + `SIMPLE`» не существует — это и есть `SIMPLE`.
+`ACYCLIC` запрещает возврат к началу, а `SIMPLE` допускает один замыкающий шаг. Оба режима
+контролируют endpoint history независимо от match mode. Повтор mode в одном constraint scope
+является semantic error.
 
 > Path mode ограничивает **один путь**. Инъективность между разными алиасами паттерна — это **match mode**, отдельная ось ([§12.4](#124-match-mode--морфизм-и-кардинальность)); полный изоморфизм по всем алиасам задаётся через `MATCH DIFFERENT ATOMS`, а не через path mode.
 
 #### Область действия и приоритет
 
 Path-ограничения задаются на двух уровнях:
-- **глобально на весь запрос** — `CONSTRAINTS <...>` после `MATCH` / `TRAVERSE`;
-- **локально на конкретный путь** — внутри `[:E* ... ]`.
+- **глобально на весь запрос** — `CONSTRAINTS <...>` после modifiers `MATCH` и до pattern list;
+- **локально на конкретный путь** — внутри `[E* ... ]`.
 
 **Локальные ограничения имеют приоритет над глобальными.** Если у пути задан собственный path mode, глобальный `CONSTRAINTS` для этого пути игнорируется; для всех остальных путей запроса продолжает действовать глобальный. Objective и filter разрешаются по тому же правилу, независимо друг от друга.
 
 ```
-MATCH path1 = (a)-[:E*1..5]->(b),          -- наследует глобальный SIMPLE
-      path2 = (c)-[:E*1..5 WALK]->(d)      -- локальный WALK перекрывает глобальный
-CONSTRAINTS <SIMPLE>
+MATCH CONSTRAINTS <SIMPLE>
+      path1 = (* AS a)-[E*1..5]->(* AS b), -- наследует global SIMPLE
+      path2 = (* AS c)-[E*1..5 WALK]->(* AS d)
+IN GRAPH social
 RETURN path1, path2;
 ```
 
@@ -3968,7 +4000,7 @@ RETURN path1, path2;
 
 ### 15.4. Переменная длина
 
-`[:E*min..max]` означает: `length(path.edges) ∈ [min, max]`.
+`[E*min..max]` означает: `path::length(path) ∈ [min, max]`.
 
 ### 15.5. Стоимость пути
 
@@ -3976,7 +4008,7 @@ $```cost(path) = \sum_i weight(e_i)```$
 
 Пользовательская функция стоимости: `DEFINE COST FUNCTION fn::my_cost(edge, accumulated_cost)`.
 Её можно использовать тремя способами:
-- для определённого пути `[:E ... COST fn::my_cost]`; 
+- для определённого пути `[E ... COST fn::my_cost]`;
 - как модификатор всего запроса `MATCH ... WITH COST fn::my_cost`;
 - как второй аргумент функции стоимости: `path::cost($path, $cost_fn)`
 
@@ -3984,30 +4016,31 @@ $```cost(path) = \sum_i weight(e_i)```$
 
 Найденный в запросе путь можно записать в alias:
 ```
-MATCH path = (a:Person)-[:FRIEND*1..3 SIMPLE]->(b:Person)
+MATCH path = (Person AS a)-[FRIEND*1..3 SIMPLE]->(Person AS b)
+IN GRAPH social
 RETURN path, path::length(path), path::cost(path);
 ```
 
 | Функция           | Тип результата  | Описание                               |
 |-------------------|-----------------|----------------------------------------|
-| `path::atoms(p)`  | `array<atom>`   | Полная чередующаяся последовательность |
-| `path::nodes(p)`  | `array<vertex>` | Endpoint'ы-вершины пути                |
-| `path::edges(p)`  | `array<edge>`   | Связывающие рёбра пути                 |
-| `path::length(p)` | `int`           | Количество шагов                       |
-| `path::cost(p)`   | `float`         | Сумма весов стоимостей путей           |
+| `path::atoms(p)`  | `array<atom-occurrence>`   | Полная чередующаяся последовательность |
+| `path::nodes(p)`  | `array<atom-occurrence>`   | Node endpoint occurrences              |
+| `path::edges(p)`  | `array<atom-occurrence>`   | Connector edge occurrences             |
+| `path::length(p)` | `int`                       | Количество connector steps             |
+| `path::cost(p)`   | `number`                    | Exact сумма весов либо длина            |
 
 Именованный или возвращаемый путь отслеживается с начала соответствующего обхода. Если путь
 не именован, не возвращается и не используется `tv::path()`/path-функциями, исполнитель вправе
 не создавать trace.
 
-`RETURN path` материализует самодостаточную неизменяемую структуру: identity исходного графа,
-`SnapshotId`, упорядоченные шаги со стабильными atom/edge refs, направление и накопленную
-стоимость. Внутренний `AtomId` в результат не попадает. `path::nodes`, `path::edges`,
-`path::atoms`, `path::length` и `path::cost` работают без живого snapshot.
+`RETURN path` материализует самодостаточную неизменяемую структуру: `SnapshotId`,
+упорядоченные шаги с `AtomOccurrenceRef`, направление и exact `Number` cost. Внутренний
+`AtomId` в результат не попадает. `path::nodes`, `path::edges`, `path::atoms`,
+`path::length` и `path::cost` работают без живого storage snapshot.
 
-Свойства атомов не копируются в каждый шаг автоматически. Они разрешаются через graph context,
-совпадающий по identity и `SnapshotId`; молчаливый переход к latest revision запрещён. Если
-исторический snapshot уже недоступен, разрешение свойств возвращает `SnapshotUnavailable`.
+Свойства атомов не копируются в каждый шаг автоматически. Каждый occurrence уже несёт точный
+`GraphRef`, а path — `SnapshotId`; молчаливый переход к latest revision запрещён. Если
+исторический snapshot уже недоступен, lazy property resolution возвращает `SnapshotUnavailable`.
 Чтобы сохранить автономный результат, запрос должен явно спроецировать нужные свойства либо
 выполняться над материализованным `query_to_memory`-графом.
 
@@ -4021,7 +4054,8 @@ WHERE NONE(a IN atoms(path) WHERE a.deleted = true)
 ### 15.7. Фильтрация по пути
 
 ```
-MATCH path = (a)-[:E*1..5 SIMPLE]->(b)
+MATCH path = (* AS a)-[E*1..5 SIMPLE]->(* AS b)
+IN GRAPH graph
 WHERE ALL(n IN nodes(path) WHERE n.age > 18)
   AND path::length(path) < 4
 RETURN path;
@@ -4125,7 +4159,8 @@ $|\operatorname{source}(e_i)| - 1$.
 
 ```
 -- Стандартный обход: mv1 и mv2 — атомы
-MATCH (mv1:Module)-[e:DEPENDS_ON]->(mv2:Module)
+MATCH (Module AS mv1)-[DEPENDS_ON AS e]->(Module AS mv2)
+IN GRAPH catalog
 RETURN mv1, mv2;
 ```
 
@@ -4134,7 +4169,8 @@ RETURN mv1, mv2;
 Для работы с внутренним подграфом метавершины используются функции `graph::inner_*`:
 ```
 -- Получить все внутренние вершины метавершины
-MATCH (mv:Module)
+MATCH METAVERTEX (Module AS mv)
+IN GRAPH catalog
 LET $inner = graph::inner_nodes(mv)
 RETURN mv, $inner;
 ```
@@ -4150,7 +4186,9 @@ RETURN mv, $inner;
 
 ```
 -- CROSS_LEVEL явно указывает на поиск кросс-уровневого ребра
-MATCH (mv:Module)-[e:DEPENDS_ON CROSS_LEVEL]->(v:Subsubmodule)
+MATCH CONSTRAINTS <CROSS_LEVEL>
+      (Module AS mv)-[DEPENDS_ON AS e]->(Subsubmodule AS v)
+IN GRAPH catalog
 KEEP LEVELPATH
 RETURN mv, v, e.levelpath;
 
@@ -4174,7 +4212,8 @@ Future: `DESCEND INTO @metavertex FROM @inner_atom` зарезервирован
 
 MetaEdge, как и любое другое ребро, может быть endpoint'ом другого ребра в AtomWalk:
 ```
-MATCH ATOM <[me1:TRANSITION]>~[depends:DEPENDS_ON]~><[e2:RESULT]>
+MATCH ATOM <[TRANSITION AS me1]>~[DEPENDS_ON AS depends]~><[RESULT AS e2]>
+IN GRAPH catalog
 RETURN me1, depends, e2;
 ```
 
@@ -4185,7 +4224,8 @@ RETURN me1, depends, e2;
 -- Ребро e соединяет вершину v с ребром e2
 RELATE ATOM <(person:alice)>~[:ANNOTATES { label: "key" }]~><[friendship:alice_bob]>;
 -- Traversal: от alice по ребру ANNOTATES достичь friendship
-MATCH ATOM <(v:Person)>~[:ANNOTATES]~><[target:FRIEND]>
+MATCH ATOM <(Person AS v)>~[ANNOTATES]~><[FRIEND AS target]>
+IN GRAPH social
 RETURN v, target;
 ```
 
@@ -4215,7 +4255,8 @@ AtomWalk обобщает endpoint-позиции шага на любые ат�
 Пример:
 ```
 -- ANNOTATES связывает alice с edge-атомом knows
-MATCH ATOM <(alice:Person)>~[annotation:ANNOTATES]~><[knows:KNOWS]>
+MATCH ATOM <(Person AS alice)>~[ANNOTATES AS annotation]~><[KNOWS AS knows]>
+IN GRAPH social
 RETURN knows, knows.since;
 ```
 
@@ -4228,7 +4269,8 @@ RETURN knows, knows.since;
 Пример:
 ```
 -- FROM_RELATION связывает edge-атом e с вершиной target
-MATCH ATOM <[e:RELATION]>~[link:FROM_RELATION]~><(target:Person)>
+MATCH ATOM <[RELATION AS e]>~[FROM_RELATION AS link]~><(Person AS target)>
+IN GRAPH social
 RETURN e, link, target;
 ```
 
@@ -4241,7 +4283,8 @@ RETURN e, link, target;
 
 Пример:
 ```
-MATCH ATOM <[e1:EVENT]>~[cause:CAUSES]~><[e2:EVENT]>
+MATCH ATOM <[EVENT AS e1]>~[CAUSES AS cause]~><[EVENT AS e2]>
+IN GRAPH event_graph
 RETURN e1, cause, e2;
 ```
 
@@ -4254,7 +4297,8 @@ GQL позволяет вернуть результат в виде пути и
 Одной из уникальных особенностей Ferros-Grynn является возможность вернуть результат как граф — со всеми структурными свойствами:
 ```
 -- Хочу дерево категорий, а не таблицу со ссылками
-MATCH (c:Category)-[child:CHILD*]->(sub:Category) FROM categories_tree
+MATCH (Category AS c)-[CHILD AS child*]->(Category AS sub)
+IN GRAPH categories_tree
 RETURN GRAPH <tree> { nodes: [c, sub], edges: [child] };
 ```
 
@@ -4291,12 +4335,14 @@ RETURN GRAPH [ @constraint ] {
 Примеры:
 ```
 -- Вернуть граф без проверки типа
-MATCH (root:Dept)-[:REPORTS_TO*]->(emp:Emp) FROM some_graph
-RETURN GRAPH { nodes: [root, emp], edges: [:REPORTS_TO] };
+MATCH (Dept AS root)-[REPORTS_TO AS reports_to*]->(Emp AS emp)
+IN GRAPH some_graph
+RETURN GRAPH { nodes: [root, emp], edges: [reports_to] };
 
 -- Вернуть с проверкой
-MATCH (pkg:Package)-[:DEPENDS_ON*]->(dep:Package) FROM dag_example
-RETURN GRAPH <dag> { nodes: [pkg, dep], edges: [:DEPENDS_ON] };
+MATCH (Package AS pkg)-[DEPENDS_ON AS dependency*]->(Package AS dep)
+IN GRAPH dag_example
+RETURN GRAPH <dag> { nodes: [pkg, dep], edges: [dependency] };
 ```
 
 ### 16.3. BUILD GRAPH
@@ -4353,19 +4399,22 @@ RETURN GRAPH и BUILD GRAPH используют **graph-expansion mode**: не 
 ```
 -- Построить деревья категорий как именованный граф
 BUILD GRAPH <forest> categories_tree
-FROM MATCH (root:Category {root: true})-[child:CHILD*]->(c:Category)
+FROM MATCH (Category AS root {root: true})-[CHILD AS child*]->(Category AS c)
+     IN GRAPH taxonomy RETURN root, child, c
 NODES [root, c]
 EDGES [child];
 
 -- Построить граф и проверить, что он DAG
 BUILD GRAPH <dag> build_order
-FROM MATCH (t:Task)-[b:BEFORE]->(t2:Task)
+FROM MATCH (Task AS t)-[BEFORE AS b]->(Task AS t2)
+     IN GRAPH tasks RETURN t, b, t2
 NODES [t, t2]
 EDGES [b];
 
 -- Граф в LET для последующего traversal
 LET $dep_graph = BUILD GRAPH <dag>
-FROM MATCH (p:Package)-[e:DEPENDS_ON]->(d:Package)
+FROM MATCH (Package AS p)-[DEPENDS_ON AS e]->(Package AS d)
+     IN GRAPH packages RETURN p, e, d
 NODES [p, d] EDGES [e];
 
 TRAVERSE FROM $dep_graph
@@ -4550,13 +4599,16 @@ loop budget одного top-level statement `1_000_000`, cancellation отсу�
 Это не деталь реализации, а необходимое условие: если бы счётчики версий были локальными для
 графа, они были бы попарно несравнимы, и предикат видимости `version.commit_ts ≤
 snapshot.commit_ts` для версии из другого графа не имел бы смысла. Для disk page version
-отдельно действует `frame.commit_lsn ≤ snapshot.visible_lsn`. Кросс-граф чтение (`MATCH ... FROM
-g1, g2`, `BUILD GRAPH x FROM MATCH ... FROM y`) — штатная возможность языка, поэтому оба
+отдельно действует `frame.commit_lsn ≤ snapshot.visible_lsn`. Кросс-граф чтение
+(несколько `MATCH ... IN GRAPH ...` в одном statement, `BUILD GRAPH x FROM MATCH ... IN GRAPH y`)
+— штатная возможность языка, поэтому оба
 глобальных порядка обязательны независимо от того, разрешена ли кросс-граф запись.
 
 ```
 BEGIN;
-  BUILD GRAPH <dag> build_order FROM MATCH (t:Task)-[b:BEFORE]->(t2:Task) FROM tasks
+  BUILD GRAPH <dag> build_order
+    FROM MATCH (Task AS t)-[BEFORE AS b]->(Task AS t2)
+         IN GRAPH tasks RETURN t, b, t2
     NODES [t, t2] EDGES [b];
   REMOVE GRAPH build_order_old;
 COMMIT;   -- оба графа и каталог обновляются атомарно
@@ -5386,7 +5438,7 @@ Plain/FULL не читают rows и не получают writer lease. ANALYZE
 `NodeKind::Meta { subgraph: GraphId }` даёт O(1) переход от мета-вершины к её GraphId, 
 а `MetaGraph::subgraph(gid)` — O(1) доступ к самому подграфу.
 
-Компиляция `(x:Label) WITHIN (mv)` должна разворачиваться планировщиком не в абстрактный предикат, 
+Компиляция `(Label AS x) WITHIN (Module AS mv)` должна разворачиваться планировщиком не в абстрактный предикат,
 а в Expand-подобную операцию (§26.2): "взять mv, спуститься в graph::inner(mv), отфильтровать по Label".
 Отличие от `FROM graph::inner(mv)` только в том, что это выражается предикатом внутри единого паттерна, 
 а не сменой контекста всего запроса, и даёт планировщику больше свободы: он может решить начать с более селективной стороны, 
@@ -5679,7 +5731,8 @@ Unwind {
 #### MATCH
 Query:
 ```
-MATCH (a:Person)-[:FRIEND]->(b:Person)
+MATCH (Person AS a)-[FRIEND]->(Person AS b)
+IN GRAPH social
 WHERE a.age > 18
 RETURN b.name
 ```
@@ -5696,7 +5749,9 @@ Scan(Person AS a)
 #### Path
 Query
 ```
-MATCH p = (a)-[:F*1..3]->(b)
+MATCH p = (* AS a)-[F*1..3]->(* AS b)
+IN GRAPH social
+RETURN p
 ```
 
 Logical Plan:
@@ -5805,16 +5860,18 @@ RELATE (person:alice)-[:FRIEND { since: time::now() }]->(person:bob)
 ### 28.3. MATCH — простой паттерн
 
 ```
-MATCH (a:Person { name: "Alice" })-[:FRIEND]->(f:Person)
+MATCH (Person AS a { name: "Alice" })-[FRIEND]->(Person AS f)
+IN GRAPH social
 RETURN f.name, f.age;
 ```
 
 ### 28.4. MATCH — путь переменной длины
 
 ```
-MATCH path = (a:Person { name: "Alice" })-[:FRIEND*1..3 SIMPLE]->(b:Person)
+MATCH path = (Person AS a { name: "Alice" })-[FRIEND*1..3 SIMPLE]->(Person AS b)
+IN GRAPH social
 -- WHERE a.id != b.id - не нужно, так как путь SIMPLE
-RETURN DISTINCT b.name, length(path) AS hops
+RETURN DISTINCT b.name, path::length(path) AS hops
 ORDER BY hops;
 ```
 
@@ -5831,8 +5888,8 @@ SELECT * FROM person WHERE name = "Alice"
 ### 28.6. MATCH + LET + pipeline
 
 ```
-LET $alice_articles = MATCH (:Person { name: "Alice" })-[:PUBLISH]->(a:Article)
-                      RETURN a;
+LET $alice_articles = MATCH (Person { name: "Alice" })-[PUBLISH]->(Article AS a)
+                      IN GRAPH knowledge RETURN a;
 
 RETURN $alice_articles
   |> tv::in("PUBLISH")              -- соавторы
@@ -5846,17 +5903,19 @@ RETURN $alice_articles
 
 ```
 MATCH
-  (alice:Person { name: "Alice" })-[:PUBLISH]->(art:Article),
-  (coauthor:Person)-[:PUBLISH]->(art),
-  (coauthor)-[:FRIEND]->(friend:Person)
+  (Person AS alice { name: "Alice" })-[PUBLISH]->(Article AS art),
+  (Person AS coauthor)-[PUBLISH]->(Article AS art),
+  (Person AS coauthor)-[FRIEND]->(Person AS friend)
+IN GRAPH knowledge
 WHERE coauthor != alice -- сравнение записей по умолчанию всегда по id
 RETURN array::distinct(friend.name) AS friends;
 ```
 или
 ```
-MATCH (alice:Person {name: 'Alice'})-[:PUBLISH]->(a:Article)
-              <-[:AUTHOR]-(coauthor:Person)
-              -[:FRIEND]->(friend:Person)
+MATCH (Person AS alice {name: 'Alice'})-[PUBLISH]->(Article AS a)
+              <-[AUTHOR]-(Person AS coauthor)
+              -[FRIEND]->(Person AS friend)
+IN GRAPH knowledge
 WHERE coauthor != alice
 RETURN DISTINCT friend.name as friends;
 ```
@@ -5864,7 +5923,8 @@ RETURN DISTINCT friend.name as friends;
 ### 28.8. Взвешенный кратчайший путь
 
 ```
-TRAVERSE FROM MATCH (p:Person {name: 'Alice'})
+TRAVERSE FROM MATCH (Person AS p {name: 'Alice'})
+                    IN GRAPH social RETURN p
   |> tv::weightedShortestPath(person:bob, "weight")
   |> tv::path();
 ```
@@ -5877,7 +5937,8 @@ RELATE HYPER [:COAUTHOR] TARGETS [person:alice, person:bob, person:carol]
   AS UNDIRECTED ORDER BY TARGETS SET paper = "paper:xyz";
 
 -- Найти все соавторства Алисы
-MATCH HYPER [e:COAUTHOR] CONTAINS person:alice
+MATCH HYPER [COAUTHOR AS e] CONTAINS person:alice
+IN GRAPH publications
 RETURN e, e.paper;
 ```
 
@@ -6015,7 +6076,7 @@ enum BridgeData<'a> {
 
 | Риск                           | Описание                                                                                                                | Митигация                                                                                                                                                                              |
 |--------------------------------|-------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Path explosion                 | `[:E*1..N]` при больших N и высокой степени → экспоненциальный рост                                                     | Обязательное предупреждение планировщика при `degree > 10 AND depth > 4`; ограничение по умолчанию `max_depth = 30`                                                                    |
+| Path explosion                 | `[E*1..N]` при больших N и высокой степени → экспоненциальный рост                                                     | Обязательное предупреждение планировщика при `degree > 10 AND depth > 4`; ограничение по умолчанию `max_depth = 30`                                                                    |
 | Отсутствие degree statistics   | MATCH-планировщик не работает корректно без статистики степени                                                          | Статистика по меткам и степеням — обязательна для MVP; сбор при загрузке и инкрементально                                                                                              |
 | Неопределённый критерий UPSERT | Без явного `WHERE` или ID семантика зависит от плана                                                                    | Синтаксически запрещено: `WHERE` или ID обязательны                                                                                                                                    |
 | null / none путаница           | Тонкая разница между двумя типами отсутствия                                                                            | Явное описание в §5.1 и в документации; lint-предупреждения при смешивании                                                                                                             |

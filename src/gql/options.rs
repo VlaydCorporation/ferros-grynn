@@ -55,6 +55,9 @@ pub struct QueryExecutionOptions {
 	pub max_control_depth: u32,
 	/// Combined number of loop backedges allowed in one top-level statement.
 	pub max_loop_iterations: u64,
+	/// Maximum topology branches, hyper assignments, and containment links
+	/// considered by MATCH in one statement.
+	pub max_path_expansions: u64,
 	/// Optional cooperative cancellation token.
 	pub cancellation: Option<QueryCancellation>,
 	/// Shared memory budget for SELECT barriers. Values above the engine
@@ -73,6 +76,7 @@ impl Default for QueryExecutionOptions {
 			statement_timeout: None,
 			max_control_depth: 20,
 			max_loop_iterations: 1_000_000,
+			max_path_expansions: 1_000_000,
 			cancellation: None,
 			barrier_memory_bytes: NonZeroUsize::new(DEFAULT_BARRIER_MEMORY_BYTES)
 				.unwrap_or(NonZeroUsize::MIN),
@@ -89,6 +93,11 @@ impl QueryExecutionOptions {
 				"barrier_memory_bytes may not exceed {DEFAULT_BARRIER_MEMORY_BYTES}."
 			)));
 		}
+		if self.max_path_expansions == 0 {
+			return Err(FerrosGrynnError::invalid_argument(
+				"max_path_expansions must be greater than zero.",
+			));
+		}
 		Ok(())
 	}
 }
@@ -102,6 +111,9 @@ pub(crate) struct ExecutionControl {
 	notifications: Arc<Mutex<Vec<Status>>>,
 	pub(crate) max_control_depth: u32,
 	pub(crate) max_loop_iterations: u64,
+	max_path_expansions: u64,
+	path_expansions: Arc<AtomicU64>,
+	match_metrics: Arc<MatchMetrics>,
 	barrier_memory: Arc<BarrierMemory>,
 	pub(crate) temporary_directory: Option<PathBuf>,
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
@@ -113,6 +125,46 @@ pub(crate) struct ExecutionControl {
 	statement_nonce: u64,
 	publication_deferred: bool,
 	instrumentation: bool,
+}
+
+#[derive(Debug, Default)]
+struct MatchMetrics {
+	seeds: AtomicU64,
+	frontier_peak: AtomicU64,
+	trace_nodes: AtomicU64,
+	graph_opens: AtomicU64,
+	containment_links: AtomicU64,
+	hyper_assignments: AtomicU64,
+	cancellation_checks: AtomicU64,
+}
+
+/// Snapshot of MATCH-specific counters collected by `EXPLAIN ANALYZE`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MatchMetricsSnapshot {
+	pub(crate) seeds: u64,
+	pub(crate) frontier_peak: u64,
+	pub(crate) trace_nodes: u64,
+	pub(crate) graph_opens: u64,
+	pub(crate) containment_links: u64,
+	pub(crate) hyper_assignments: u64,
+	pub(crate) cancellation_checks: u64,
+}
+
+impl MatchMetricsSnapshot {
+	/// Returns a delta between two observations of the same statement control.
+	pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
+		Self {
+			seeds: self.seeds.saturating_sub(earlier.seeds),
+			frontier_peak: self.frontier_peak,
+			trace_nodes: self.trace_nodes.saturating_sub(earlier.trace_nodes),
+			graph_opens: self.graph_opens.saturating_sub(earlier.graph_opens),
+			containment_links: self.containment_links.saturating_sub(earlier.containment_links),
+			hyper_assignments: self.hyper_assignments.saturating_sub(earlier.hyper_assignments),
+			cancellation_checks: self
+				.cancellation_checks
+				.saturating_sub(earlier.cancellation_checks),
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -224,6 +276,9 @@ impl ExecutionControl {
 			notifications: Arc::new(Mutex::new(Vec::new())),
 			max_control_depth: options.max_control_depth,
 			max_loop_iterations: options.max_loop_iterations,
+			max_path_expansions: options.max_path_expansions,
+			path_expansions: Arc::new(AtomicU64::new(0)),
+			match_metrics: Arc::new(MatchMetrics::default()),
 			barrier_memory: Arc::new(BarrierMemory {
 				limit: options.barrier_memory_bytes.get(),
 				used: AtomicUsize::new(0),
@@ -293,6 +348,9 @@ impl ExecutionControl {
 	}
 
 	pub(crate) fn check(&self) -> FerrosGrynnResult<()> {
+		if self.instrumentation {
+			self.match_metrics.cancellation_checks.fetch_add(1, Ordering::Relaxed);
+		}
 		if self.cancellation.as_ref().is_some_and(QueryCancellation::is_cancelled) {
 			return Err(FerrosGrynnError::query_cancelled());
 		}
@@ -327,6 +385,9 @@ impl ExecutionControl {
 			notifications: self.notifications.clone(),
 			max_control_depth: self.max_control_depth,
 			max_loop_iterations: self.max_loop_iterations,
+			max_path_expansions: self.max_path_expansions,
+			path_expansions: self.path_expansions.clone(),
+			match_metrics: self.match_metrics.clone(),
 			barrier_memory: self.barrier_memory.clone(),
 			temporary_directory: self.temporary_directory.clone(),
 			cursors: self.cursors.clone(),
@@ -375,6 +436,91 @@ impl ExecutionControl {
 	pub(crate) fn record_pull(&self) {
 		if self.instrumentation {
 			self.barrier_memory.row_pulls.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Charges one considered graph branch against the statement-wide MATCH
+	/// budget shared by nested execution controls.
+	pub(crate) fn record_path_expansion(&self) -> FerrosGrynnResult<()> {
+		let mut current = self.path_expansions.load(Ordering::Acquire);
+		loop {
+			if current >= self.max_path_expansions {
+				return Err(FerrosGrynnError::path_expansion_limit_exceeded(
+					self.max_path_expansions,
+				));
+			}
+			match self.path_expansions.compare_exchange_weak(
+				current,
+				current + 1,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => return Ok(()),
+				Err(actual) => current = actual,
+			}
+		}
+	}
+
+	/// Returns the number of topology branches charged by this statement.
+	pub(crate) fn path_expansions(&self) -> u64 {
+		self.path_expansions.load(Ordering::Acquire)
+	}
+
+	/// Records one accepted MATCH seed when instrumentation is active.
+	pub(crate) fn record_match_seed(&self) {
+		if self.instrumentation {
+			self.match_metrics.seeds.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Records the largest active traversal frontier observed by this
+	/// statement.
+	pub(crate) fn record_match_frontier(&self, frontier: usize) {
+		if self.instrumentation {
+			self.match_metrics
+				.frontier_peak
+				.fetch_max(u64::try_from(frontier).unwrap_or(u64::MAX), Ordering::Relaxed);
+		}
+	}
+
+	/// Records one retained named-path trace node.
+	pub(crate) fn record_match_trace_node(&self) {
+		if self.instrumentation {
+			self.match_metrics.trace_nodes.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Records one immutable graph view opened by MATCH execution.
+	pub(crate) fn record_match_graph_open(&self) {
+		if self.instrumentation {
+			self.match_metrics.graph_opens.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Records one containment link considered by WITHIN.
+	pub(crate) fn record_match_containment_link(&self) {
+		if self.instrumentation {
+			self.match_metrics.containment_links.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Records one hyperedge endpoint assignment considered by MATCH.
+	pub(crate) fn record_match_hyper_assignment(&self) {
+		if self.instrumentation {
+			self.match_metrics.hyper_assignments.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Returns MATCH counters collected so far.
+	pub(crate) fn match_metrics(&self) -> MatchMetricsSnapshot {
+		MatchMetricsSnapshot {
+			seeds: self.match_metrics.seeds.load(Ordering::Acquire),
+			frontier_peak: self.match_metrics.frontier_peak.load(Ordering::Acquire),
+			trace_nodes: self.match_metrics.trace_nodes.load(Ordering::Acquire),
+			graph_opens: self.match_metrics.graph_opens.load(Ordering::Acquire),
+			containment_links: self.match_metrics.containment_links.load(Ordering::Acquire),
+			hyper_assignments: self.match_metrics.hyper_assignments.load(Ordering::Acquire),
+			cancellation_checks: self.match_metrics.cancellation_checks.load(Ordering::Acquire),
 		}
 	}
 
@@ -563,5 +709,23 @@ mod tests {
 			.with_execution_mode(true, &parameters)
 			.statement_seed(13, 17);
 		assert_ne!(first, changed);
+	}
+
+	#[test]
+	fn path_expansion_budget_is_positive_and_shared_by_children() {
+		let invalid = QueryExecutionOptions {
+			max_path_expansions: 0,
+			..QueryExecutionOptions::default()
+		};
+		assert!(invalid.validate().is_err());
+
+		let options = QueryExecutionOptions {
+			max_path_expansions: 1,
+			..QueryExecutionOptions::default()
+		};
+		let control = ExecutionControl::new(&options, None);
+		let child = control.child(None);
+		assert!(control.record_path_expansion().is_ok());
+		assert!(child.record_path_expansion().is_err());
 	}
 }

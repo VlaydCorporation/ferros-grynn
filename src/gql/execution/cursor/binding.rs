@@ -15,6 +15,17 @@ pub(in crate::gql::execution) struct ResolvedMatchBinding {
 	pub(in crate::gql::execution) selector: ResolvedMatchSelector,
 	pub(in crate::gql::execution) column: Option<usize>,
 	pub(in crate::gql::execution) label: Option<Box<str>>,
+	pub(in crate::gql::execution) properties: Vec<(Box<str>, TypedExpr)>,
+	pub(in crate::gql::execution) predicate: Option<TypedExpr>,
+	pub(in crate::gql::execution) meta: bool,
+}
+
+/// Statement-local evaluator used by inline MATCH constraints.
+#[derive(Clone, Copy)]
+pub(in crate::gql::execution) struct MatchPredicateContext<'a> {
+	pub(in crate::gql::execution) slots: &'a [Value],
+	pub(in crate::gql::execution) source: &'a str,
+	pub(in crate::gql::execution) fields: &'a dyn AtomFieldRead,
 }
 
 #[derive(Clone)]
@@ -22,6 +33,8 @@ pub(in crate::gql::execution) struct ResolvedExpand {
 	pub(in crate::gql::execution) edge: ResolvedMatchBinding,
 	pub(in crate::gql::execution) target: ResolvedMatchBinding,
 	pub(in crate::gql::execution) direction: crate::syn::MatchDirection,
+	pub(in crate::gql::execution) mode: crate::syn::MatchMode,
+	pub(in crate::gql::execution) filters: Vec<crate::syn::MatchPathFilter>,
 }
 
 #[derive(Clone)]
@@ -32,6 +45,10 @@ pub(in crate::gql::execution) struct ResolvedPathExpand {
 	pub(in crate::gql::execution) min: u32,
 	pub(in crate::gql::execution) max: u32,
 	pub(in crate::gql::execution) path_column: Option<usize>,
+	pub(in crate::gql::execution) match_mode: crate::syn::MatchMode,
+	pub(in crate::gql::execution) path_mode: crate::syn::MatchPathMode,
+	pub(in crate::gql::execution) objective: Option<crate::syn::MatchPathObjective>,
+	pub(in crate::gql::execution) filters: Vec<crate::syn::MatchPathFilter>,
 }
 
 pub(in crate::gql::execution) fn resolve_match_binding(
@@ -55,6 +72,9 @@ pub(in crate::gql::execution) fn resolve_match_binding(
 		selector,
 		column: binding.column,
 		label: binding.label.clone(),
+		properties: binding.properties.clone(),
+		predicate: binding.predicate.clone(),
+		meta: binding.meta,
 	})
 }
 
@@ -63,11 +83,14 @@ pub(in crate::gql::execution) fn resolve_expand(
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
+	mode: crate::syn::MatchMode,
 ) -> FerrosGrynnResult<ResolvedExpand> {
 	Ok(ResolvedExpand {
 		edge: resolve_match_binding(&expand.edge, slots, source, control)?,
 		target: resolve_match_binding(&expand.target, slots, source, control)?,
 		direction: expand.direction,
+		mode,
+		filters: expand.filters.clone(),
 	})
 }
 
@@ -76,6 +99,7 @@ pub(in crate::gql::execution) fn resolve_path_expand(
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
+	match_mode: crate::syn::MatchMode,
 ) -> FerrosGrynnResult<ResolvedPathExpand> {
 	Ok(ResolvedPathExpand {
 		edge: resolve_match_binding(&expand.edge, slots, source, control)?,
@@ -84,6 +108,10 @@ pub(in crate::gql::execution) fn resolve_path_expand(
 		min: expand.min,
 		max: expand.max,
 		path_column: expand.path_column,
+		match_mode,
+		path_mode: expand.mode,
+		objective: expand.objective,
+		filters: expand.filters.clone(),
 	})
 }
 
@@ -91,10 +119,13 @@ pub(in crate::gql::execution) fn resolve_path_expand(
 pub(in crate::gql::execution) struct SeedCursor<'a, Graph> {
 	input: Box<dyn RowCursor + 'a>,
 	graph: Rc<Graph>,
+	graph_ref: Arc<GraphRef>,
 	binding: ResolvedMatchBinding,
+	mode: crate::syn::MatchMode,
+	predicate: MatchPredicateContext<'a>,
 	ids: Vec<AtomId>,
 	row: Option<Row>,
-	bound: Option<AtomId>,
+	bound: Option<BoundAtom>,
 	next_id: usize,
 }
 
@@ -102,13 +133,19 @@ impl<'a, Graph> SeedCursor<'a, Graph> {
 	pub(in crate::gql::execution) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		graph: Rc<Graph>,
+		graph_ref: Arc<GraphRef>,
 		binding: ResolvedMatchBinding,
+		mode: crate::syn::MatchMode,
+		predicate: MatchPredicateContext<'a>,
 		ids: Vec<AtomId>,
 	) -> Self {
 		Self {
 			input,
 			graph,
+			graph_ref,
 			binding,
+			mode,
+			predicate,
 			ids,
 			row: None,
 			bound: None,
@@ -132,7 +169,7 @@ impl<Graph: GraphRead> RowCursor for SeedCursor<'_, Graph> {
 			}
 			let from_bound = self.bound.is_some();
 			let candidate = if let Some(bound) = self.bound {
-				(self.next_id == 0).then_some(bound)
+				(self.next_id == 0 && bound.graph == self.graph_ref.id()).then_some(bound.atom)
 			} else {
 				self.ids.get(self.next_id).copied()
 			};
@@ -141,19 +178,101 @@ impl<Graph: GraphRead> RowCursor for SeedCursor<'_, Graph> {
 				continue;
 			};
 			self.next_id += 1;
-			if from_bound && !atom_matches(self.graph.as_ref(), candidate, &self.binding)? {
+			if (from_bound || self.binding.meta)
+				&& !atom_matches(self.graph.as_ref(), candidate, &self.binding)?
+			{
 				continue;
 			}
 			let mut row = self.row.as_ref().cloned().ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("MATCH seed lost its input row.")
 			})?;
-			if !bind_atom(&mut row, &self.binding, candidate, self.graph.as_ref())? {
+			if !bind_match_position(
+				&mut row,
+				&self.binding,
+				candidate,
+				self.graph.as_ref(),
+				&self.graph_ref,
+				self.mode,
+				self.predicate,
+				control,
+			)? {
 				continue;
 			}
-			row.current = Some(candidate);
+			control.record_match_seed();
+			row.current = Some(BoundAtom::new(self.graph_ref.id(), candidate));
 			return Ok(Some(row));
 		}
 	}
+}
+
+/// Applies clause uniqueness, binds a public occurrence, and evaluates inline
+/// property and WHERE constraints.
+pub(in crate::gql::execution) fn bind_match_position<Graph: GraphRead>(
+	row: &mut Row,
+	binding: &ResolvedMatchBinding,
+	atom: AtomId,
+	graph: &Graph,
+	graph_ref: &Arc<GraphRef>,
+	mode: crate::syn::MatchMode,
+	predicate: MatchPredicateContext<'_>,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<bool> {
+	let prebound = binding.column.and_then(|column| row.atoms.get(column).copied().flatten());
+	let occurrence = BoundAtom::new(graph_ref.id(), atom);
+	if prebound.is_none() {
+		let repeated = match mode {
+			crate::syn::MatchMode::RepeatableElements => false,
+			crate::syn::MatchMode::DifferentEdges => {
+				atom.kind() == Some(AtomKind::Edge) && row.used_edges.contains(&occurrence)
+			}
+			crate::syn::MatchMode::DifferentAtoms => row.used_atoms.contains(&occurrence),
+		};
+		if repeated {
+			return Ok(false);
+		}
+	}
+	if !bind_atom(row, binding, atom, graph, graph_ref)? {
+		return Ok(false);
+	}
+	for (field, expected) in &binding.properties {
+		let actual = predicate.fields.field(occurrence, field)?;
+		if actual == Value::None
+			|| actual
+				!= eval(
+					expected,
+					Some(row),
+					predicate.slots,
+					predicate.source,
+					Some(predicate.fields),
+					Some(control),
+				)? {
+			return Ok(false);
+		}
+	}
+	if let Some(expression) = &binding.predicate
+		&& !eval(
+			expression,
+			Some(row),
+			predicate.slots,
+			predicate.source,
+			Some(predicate.fields),
+			Some(control),
+		)?
+		.is_truthy()
+	{
+		return Ok(false);
+	}
+	if prebound.is_none() {
+		match mode {
+			crate::syn::MatchMode::RepeatableElements => {}
+			crate::syn::MatchMode::DifferentEdges if atom.kind() == Some(AtomKind::Edge) => {
+				row.used_edges.push(occurrence);
+			}
+			crate::syn::MatchMode::DifferentAtoms => row.used_atoms.push(occurrence),
+			crate::syn::MatchMode::DifferentEdges => {}
+		}
+	}
+	Ok(true)
 }
 
 pub(in crate::gql::execution) fn atom_matches<Graph: GraphRead>(
@@ -181,6 +300,15 @@ pub(in crate::gql::execution) fn atom_matches<Graph: GraphRead>(
 			return Ok(false);
 		}
 	}
+	if binding.meta {
+		let is_meta = match binding.domain {
+			EndpointDomain::Node => graph.node(atom)?.map_or(Ok(false), |node| node.is_meta())?,
+			EndpointDomain::Edge => graph.edge(atom)?.map_or(Ok(false), |edge| edge.is_meta())?,
+		};
+		if !is_meta {
+			return Ok(false);
+		}
+	}
 	let Some(expected) = binding.label.as_deref() else {
 		return Ok(true);
 	};
@@ -205,12 +333,14 @@ pub(in crate::gql::execution) fn bind_atom<Graph: GraphRead>(
 	binding: &ResolvedMatchBinding,
 	atom: AtomId,
 	graph: &Graph,
+	graph_ref: &Arc<GraphRef>,
 ) -> FerrosGrynnResult<bool> {
 	let Some(column) = binding.column else {
 		return Ok(true);
 	};
+	let occurrence = BoundAtom::new(graph_ref.id(), atom);
 	if let Some(existing) = row.atoms.get(column).copied().flatten() {
-		return Ok(existing == atom);
+		return Ok(existing == occurrence);
 	}
 	if !matches!(row.values.get(column), Some(Value::None)) {
 		return Ok(false);
@@ -223,7 +353,8 @@ pub(in crate::gql::execution) fn bind_atom<Graph: GraphRead>(
 		};
 		FerrosGrynnError::atom_does_not_exist(kind, atom.to_string())
 	})?;
-	row.values[column] = Value::Atom(Box::new(reference));
-	row.atoms[column] = Some(atom);
+	row.values[column] =
+		Value::AtomOccurrence(Box::new(AtomOccurrenceRef::new(reference, graph_ref.clone())));
+	row.atoms[column] = Some(occurrence);
 	Ok(true)
 }

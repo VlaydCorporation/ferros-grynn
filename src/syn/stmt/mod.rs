@@ -23,16 +23,28 @@ pub use control::{
 pub use explain::{ExplainFormat, ExplainMode, ExplainStatement};
 pub use r#let::LetStatement;
 pub use r#match::{
+	MatchConstraints,
+	MatchContains,
 	MatchDirection,
 	MatchEdge,
 	MatchEndpoint,
 	MatchEndpointKind,
+	MatchHyperPattern,
+	MatchHyperSide,
 	MatchLength,
+	MatchLinearPattern,
+	MatchMetaScope,
+	MatchMode,
+	MatchPathFilter,
+	MatchPathMode,
+	MatchPathObjective,
 	MatchPattern,
 	MatchReturnItem,
 	MatchSelector,
 	MatchStatement,
 	MatchStep,
+	MatchWithinDepth,
+	MatchWithinPattern,
 };
 use reblessive::Stk;
 pub use r#return::ReturnStatement;

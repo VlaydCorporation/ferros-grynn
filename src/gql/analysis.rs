@@ -20,9 +20,13 @@ use super::ir::{
 	LogicalGraphDmlStatement,
 	LogicalGraphPropertyMutation,
 	LogicalGraphReference,
+	LogicalHyperPattern,
 	LogicalIndexHint,
+	LogicalLinearPattern,
 	LogicalMatch,
+	LogicalMatchContains,
 	LogicalMatchPattern,
+	LogicalMatchPatternKind,
 	LogicalMatchSelector,
 	LogicalOrder,
 	LogicalProgram,
@@ -38,6 +42,7 @@ use super::ir::{
 	LogicalSelectStart,
 	LogicalStatement,
 	LogicalWildcardField,
+	LogicalWithinPattern,
 	MatchBinding,
 	MatchOp,
 	PathExpand,
@@ -72,9 +77,14 @@ use crate::{
 		Literal,
 		MatchEndpoint,
 		MatchEndpointKind,
+		MatchHyperPattern,
+		MatchLinearPattern,
+		MatchMetaScope,
+		MatchPathMode,
 		MatchPattern,
 		MatchSelector,
 		MatchStatement,
+		MatchWithinPattern,
 		Program,
 		RecordKey,
 		RemoveTarget,
@@ -107,6 +117,7 @@ use crate::{
 
 /// Maximum finite path depth accepted by the MVP analyzer.
 const MAX_MATCH_PATH_DEPTH: u32 = 30;
+const MAX_MATCH_WITHIN_DEPTH: u32 = 7;
 
 pub(super) trait QueryCatalog {
 	fn schema(&self, class: &str) -> FerrosGrynnResult<Schema>;
@@ -158,6 +169,22 @@ enum MatchAliasKind {
 	Endpoint(EndpointDomain),
 	/// A public path value.
 	Path,
+}
+
+const fn endpoint_domain(kind: MatchEndpointKind) -> EndpointDomain {
+	match kind {
+		MatchEndpointKind::Node => EndpointDomain::Node,
+		MatchEndpointKind::Edge => EndpointDomain::Edge,
+	}
+}
+
+const fn match_meta_required(scope: MatchMetaScope, domain: EndpointDomain) -> bool {
+	match scope {
+		MatchMetaScope::None => false,
+		MatchMetaScope::Meta => true,
+		MatchMetaScope::MetaVertex => matches!(domain, EndpointDomain::Node),
+		MatchMetaScope::MetaEdge => matches!(domain, EndpointDomain::Edge),
+	}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1053,19 +1080,40 @@ impl<'a> Analyzer<'a> {
 
 	/// Analyzes a complete MATCH statement.
 	fn match_statement(&self, statement: &MatchStatement) -> FerrosGrynnResult<LogicalMatch> {
-		let graph = self.catalog.graph(&statement.source.value).map_err(|error| {
-			self.locate(error.with_phase(ExecutionPhase::SemanticAnalysis), statement.source.span)
-		})?;
+		let graph = self.match_graph_reference(&statement.source)?;
+		let max_depth = self.match_max_depth(statement.max_depth.as_ref())?;
 		let mut aliases = BTreeMap::new();
 		let mut bindings = Schema::default();
 		let mut patterns = Vec::with_capacity(statement.patterns.len());
 		for (original_index, pattern) in statement.patterns.iter().enumerate() {
-			patterns.push(self.match_pattern(
-				pattern,
-				original_index,
-				&mut aliases,
-				&mut bindings,
-			)?);
+			patterns.push(match pattern {
+				MatchPattern::Linear(pattern) => self.match_pattern(
+					pattern,
+					original_index,
+					max_depth,
+					&statement.constraints,
+					statement.atom,
+					statement.meta_scope,
+					&mut aliases,
+					&mut bindings,
+				)?,
+				MatchPattern::Hyper(pattern) => self.match_hyper_pattern(
+					pattern,
+					original_index,
+					statement.atom,
+					statement.meta_scope,
+					&mut aliases,
+					&mut bindings,
+				)?,
+				MatchPattern::Within(pattern) => self.match_within_pattern(
+					pattern,
+					original_index,
+					statement.atom,
+					statement.meta_scope,
+					&mut aliases,
+					&mut bindings,
+				)?,
+			});
 		}
 
 		let filter = statement
@@ -1093,23 +1141,130 @@ impl<'a> Analyzer<'a> {
 			});
 			projection.push(typed);
 		}
+		let result = Schema {
+			columns,
+		};
+		let order = statement
+			.order
+			.iter()
+			.map(|order| {
+				let expression = if order.random {
+					TypedExpr {
+						kind: TypedExprKind::Constant(Value::None),
+						ty: Type::Int,
+						span: order.expression.span,
+					}
+				} else if let ExprKind::Name(name) = &order.expression.kind
+					&& let Some(index) = result.index_of(name.value.as_ref())
+				{
+					TypedExpr {
+						kind: TypedExprKind::Column(bindings.columns.len() + index),
+						ty: result.columns[index].ty.clone(),
+						span: order.expression.span,
+					}
+				} else {
+					self.expr(&order.expression, Some(&bindings))?
+				};
+				Ok(LogicalOrder {
+					expression,
+					random: order.random,
+					direction: order.direction,
+					nulls: order.nulls,
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		Ok(LogicalMatch {
 			graph,
+			optional: statement.optional,
+			binding_distinct: statement.binding_distinct,
+			mode: statement.mode,
+			atom: statement.atom,
+			meta_scope: statement.meta_scope,
 			patterns,
 			bindings,
 			filter,
 			projection,
-			result: Schema {
-				columns,
-			},
+			projection_distinct: statement.projection_distinct,
+			order,
+			max_depth,
+			result,
 		})
+	}
+
+	fn match_graph_reference(&self, expression: &Expr) -> FerrosGrynnResult<GraphRef> {
+		let graph = match &expression.kind {
+			ExprKind::Name(name) => self.catalog.graph(name.value.as_ref()),
+			ExprKind::Parameter(name) => {
+				let reference = self
+					.variables
+					.get(name.value.as_ref())
+					.and_then(Value::as_graph_ref)
+					.ok_or_else(|| {
+						self.semantic("MATCH graph parameters must contain a GraphRef.", name.span)
+					})?;
+				self.catalog.graph(reference.name()).and_then(|visible| {
+					if visible.id() == reference.id() {
+						Ok(visible)
+					} else {
+						Err(FerrosGrynnError::graph_does_not_exist(reference.name().to_owned()))
+					}
+				})
+			}
+			_ => {
+				return Err(self.semantic(
+					"MATCH IN GRAPH accepts a graph name or GraphRef parameter.",
+					expression.span,
+				));
+			}
+		};
+		graph.map_err(|error| {
+			self.locate(error.with_phase(ExecutionPhase::SemanticAnalysis), expression.span)
+		})
+	}
+
+	fn match_max_depth(&self, expression: Option<&Expr>) -> FerrosGrynnResult<u32> {
+		let Some(expression) = expression else {
+			return Ok(MAX_MATCH_PATH_DEPTH);
+		};
+		let value = match &expression.kind {
+			ExprKind::Literal(literal) => self.literal(literal, expression.span)?,
+			ExprKind::Parameter(name) => {
+				self.variables.get(name.value.as_ref()).cloned().ok_or_else(|| {
+					self.semantic(&format!("Unknown parameter `${}`.", name.value), name.span)
+				})?
+			}
+			_ => {
+				return Err(self.semantic(
+					"MATCH MAXDEPTH must be an integer literal or parameter.",
+					expression.span,
+				));
+			}
+		};
+		let depth = value
+			.as_number()
+			.and_then(|number| i64::try_from(number).ok())
+			.and_then(|number| u32::try_from(number).ok())
+			.ok_or_else(|| {
+				self.semantic("MATCH MAXDEPTH must be a non-negative integer.", expression.span)
+			})?;
+		if depth > MAX_MATCH_PATH_DEPTH {
+			return Err(self.semantic(
+				&format!("MATCH MAXDEPTH cannot exceed {MAX_MATCH_PATH_DEPTH}."),
+				expression.span,
+			));
+		}
+		Ok(depth)
 	}
 
 	/// Lowers one source pattern into linear expansion operations.
 	fn match_pattern(
 		&self,
-		pattern: &MatchPattern,
+		pattern: &MatchLinearPattern,
 		original_index: usize,
+		max_depth: u32,
+		global_constraints: &crate::syn::MatchConstraints,
+		atom: bool,
+		meta_scope: MatchMetaScope,
 		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
 		bindings: &mut Schema,
 	) -> FerrosGrynnResult<LogicalMatchPattern> {
@@ -1120,27 +1275,49 @@ impl<'a> Analyzer<'a> {
 				self.bind_match_alias(alias, MatchAliasKind::Path, Type::Path, aliases, bindings)
 			})
 			.transpose()?;
-		if path_column.is_some()
-			&& (pattern.steps.len() != 1 || pattern.steps[0].edge.length.is_none())
-		{
-			return Err(self.semantic(
-				"The MVP path alias requires exactly one variable-length step.",
-				pattern.span,
-			));
-		}
-		let start = self.match_endpoint(&pattern.start, aliases, bindings)?;
+		let start = self.match_endpoint(
+			&pattern.start,
+			atom,
+			match_meta_required(meta_scope, endpoint_domain(pattern.start.kind)),
+			aliases,
+			bindings,
+		)?;
 		let mut source = start.clone();
 		let mut ops = Vec::with_capacity(pattern.steps.len());
 		for step in &pattern.steps {
-			let target = self.match_endpoint(&step.target, aliases, bindings)?;
+			let target = self.match_endpoint(
+				&step.target,
+				atom,
+				match_meta_required(meta_scope, endpoint_domain(step.target.kind)),
+				aliases,
+				bindings,
+			)?;
 			let edge = self.match_binding(
 				&step.edge.selector,
 				step.edge.alias.as_ref(),
 				step.edge.label.as_ref(),
+				step.edge.properties.as_ref(),
+				step.edge.predicate.as_ref(),
+				match_meta_required(meta_scope, EndpointDomain::Edge),
 				EndpointDomain::Edge,
 				aliases,
 				bindings,
 			)?;
+			if let Some(custom_cost) = &step.edge.custom_cost {
+				return Err(self.unsupported("MATCH COST", custom_cost.span));
+			}
+			let mode = step
+				.edge
+				.constraints
+				.mode
+				.or(global_constraints.mode)
+				.unwrap_or(MatchPathMode::Trail);
+			let objective = step.edge.constraints.objective.or(global_constraints.objective);
+			let filters = if step.edge.constraints.filters.is_empty() {
+				global_constraints.filters.clone()
+			} else {
+				step.edge.constraints.filters.clone()
+			};
 			if let Some(length) = step.edge.length {
 				if let Some(alias) = &step.edge.alias {
 					return Err(self.semantic(
@@ -1148,16 +1325,15 @@ impl<'a> Analyzer<'a> {
 						alias.span,
 					));
 				}
-				if length.min > length.max {
+				let maximum = length.max.unwrap_or(max_depth);
+				if length.min > maximum {
 					return Err(
 						self.semantic("MATCH path minimum exceeds its maximum.", length.span)
 					);
 				}
-				if length.max > MAX_MATCH_PATH_DEPTH {
+				if maximum > MAX_MATCH_PATH_DEPTH {
 					return Err(self.semantic(
-						&format!(
-							"MATCH path depth exceeds the MVP maximum of {MAX_MATCH_PATH_DEPTH}."
-						),
+						&format!("MATCH path depth exceeds the maximum of {MAX_MATCH_PATH_DEPTH}."),
 						length.span,
 					));
 				}
@@ -1167,22 +1343,131 @@ impl<'a> Analyzer<'a> {
 					target: target.clone(),
 					direction: step.direction,
 					min: length.min,
-					max: length.max,
+					max: maximum,
+					mode,
+					objective,
+					filters,
 					path_column,
 				}));
 			} else {
+				if step.edge.constraints.mode.is_some() || step.edge.constraints.objective.is_some()
+				{
+					return Err(self.semantic(
+						"Local MATCH path mode and objective require a variable-length segment.",
+						step.edge.span,
+					));
+				}
 				ops.push(MatchOp::Expand(Expand {
 					source: source.clone(),
 					edge,
 					target: target.clone(),
 					direction: step.direction,
+					filters,
 				}));
 			}
 			source = target;
 		}
 		Ok(LogicalMatchPattern {
-			start,
-			ops,
+			kind: LogicalMatchPatternKind::Linear(LogicalLinearPattern {
+				path_column,
+				start,
+				ops,
+			}),
+			original_index,
+		})
+	}
+
+	/// Lowers one hyperedge endpoint-assignment relation.
+	fn match_hyper_pattern(
+		&self,
+		pattern: &MatchHyperPattern,
+		original_index: usize,
+		atom: bool,
+		meta_scope: MatchMetaScope,
+		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
+		bindings: &mut Schema,
+	) -> FerrosGrynnResult<LogicalMatchPattern> {
+		if pattern.edge.kind != MatchEndpointKind::Edge {
+			return Err(self.semantic("MATCH HYPER requires an edge position.", pattern.edge.span));
+		}
+		let edge = self.match_endpoint(
+			&pattern.edge,
+			true,
+			match_meta_required(meta_scope, EndpointDomain::Edge),
+			aliases,
+			bindings,
+		)?;
+		let contains = pattern
+			.contains
+			.iter()
+			.map(|contains| {
+				let endpoints = contains
+					.endpoints
+					.iter()
+					.map(|endpoint| {
+						self.match_endpoint(
+							endpoint,
+							atom,
+							match_meta_required(meta_scope, endpoint_domain(endpoint.kind)),
+							aliases,
+							bindings,
+						)
+					})
+					.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				Ok(LogicalMatchContains {
+					side: contains.side,
+					endpoints,
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		Ok(LogicalMatchPattern {
+			kind: LogicalMatchPatternKind::Hyper(LogicalHyperPattern {
+				edge,
+				contains,
+			}),
+			original_index,
+		})
+	}
+
+	/// Lowers one direct or bounded transitive containment relation.
+	fn match_within_pattern(
+		&self,
+		pattern: &MatchWithinPattern,
+		original_index: usize,
+		atom: bool,
+		meta_scope: MatchMetaScope,
+		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
+		bindings: &mut Schema,
+	) -> FerrosGrynnResult<LogicalMatchPattern> {
+		let max = pattern.depth.max.unwrap_or(MAX_MATCH_WITHIN_DEPTH);
+		if pattern.depth.min == 0 {
+			return Err(self.semantic("MATCH WITHIN depth must start at one.", pattern.depth.span));
+		}
+		if pattern.depth.min > max {
+			return Err(self
+				.semantic("MATCH WITHIN minimum depth exceeds its maximum.", pattern.depth.span));
+		}
+		if max > MAX_MATCH_WITHIN_DEPTH {
+			return Err(self.semantic(
+				&format!("MATCH WITHIN depth cannot exceed {MAX_MATCH_WITHIN_DEPTH}."),
+				pattern.depth.span,
+			));
+		}
+		let child = self.match_endpoint(
+			&pattern.child,
+			atom,
+			match_meta_required(meta_scope, endpoint_domain(pattern.child.kind)),
+			aliases,
+			bindings,
+		)?;
+		let owner = self.match_endpoint(&pattern.owner, true, true, aliases, bindings)?;
+		Ok(LogicalMatchPattern {
+			kind: LogicalMatchPatternKind::Within(LogicalWithinPattern {
+				child,
+				owner,
+				min: pattern.depth.min,
+				max,
+			}),
 			original_index,
 		})
 	}
@@ -1191,17 +1476,25 @@ impl<'a> Analyzer<'a> {
 	fn match_endpoint(
 		&self,
 		endpoint: &MatchEndpoint,
+		allow_edge: bool,
+		force_meta: bool,
 		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
 		bindings: &mut Schema,
 	) -> FerrosGrynnResult<MatchBinding> {
 		let domain = match endpoint.kind {
 			MatchEndpointKind::Node => EndpointDomain::Node,
-			MatchEndpointKind::Edge => EndpointDomain::Edge,
+			MatchEndpointKind::Edge if allow_edge => EndpointDomain::Edge,
+			MatchEndpointKind::Edge => {
+				return Err(self.semantic("An edge endpoint requires MATCH ATOM.", endpoint.span));
+			}
 		};
 		self.match_binding(
 			&endpoint.selector,
 			endpoint.alias.as_ref(),
 			endpoint.label.as_ref(),
+			endpoint.properties.as_ref(),
+			endpoint.predicate.as_ref(),
+			endpoint.meta || force_meta,
 			domain,
 			aliases,
 			bindings,
@@ -1214,13 +1507,16 @@ impl<'a> Analyzer<'a> {
 		selector: &MatchSelector,
 		alias: Option<&crate::syn::Identifier>,
 		label: Option<&crate::syn::Identifier>,
+		properties: Option<&Expr>,
+		predicate: Option<&Expr>,
+		meta: bool,
 		domain: EndpointDomain,
 		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
 		bindings: &mut Schema,
 	) -> FerrosGrynnResult<MatchBinding> {
 		let column = alias
 			.map(|alias| {
-				let ty = Type::Atom(match domain {
+				let ty = Type::AtomOccurrence(match domain {
 					EndpointDomain::Node => AtomKind::Node,
 					EndpointDomain::Edge => AtomKind::Edge,
 				});
@@ -1233,11 +1529,34 @@ impl<'a> Analyzer<'a> {
 				)
 			})
 			.transpose()?;
+		let properties = match properties {
+			None => Vec::new(),
+			Some(Expr {
+				kind: ExprKind::Object(fields),
+				..
+			}) => fields
+				.iter()
+				.map(|field| {
+					Ok((field.name.value.clone(), self.expr(&field.value, Some(bindings))?))
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?,
+			Some(value) => {
+				return Err(self.semantic(
+					"An inline MATCH property constraint must be an object.",
+					value.span,
+				));
+			}
+		};
+		let predicate =
+			predicate.map(|predicate| self.expr(predicate, Some(bindings))).transpose()?;
 		Ok(MatchBinding {
 			domain,
 			selector: self.match_selector(selector, domain)?,
 			column,
 			label: label.map(|label| label.value.clone()),
+			properties,
+			predicate,
+			meta,
 		})
 	}
 
@@ -2337,6 +2656,16 @@ impl<'a> Analyzer<'a> {
 			"meta::id" => (Builtin::MetaId, 1, Type::Any),
 			"meta::class" => (Builtin::MetaClass, 1, Type::String),
 			"meta::type" => (Builtin::MetaType, 1, Type::String),
+			"graph::inner" => (Builtin::GraphInner, 1, Type::Any),
+			"path::atoms" => (Builtin::PathAtoms, 1, Type::Array(Box::new(Type::Any))),
+			"path::nodes" => {
+				(Builtin::PathNodes, 1, Type::Array(Box::new(Type::AtomOccurrence(AtomKind::Node))))
+			}
+			"path::edges" => {
+				(Builtin::PathEdges, 1, Type::Array(Box::new(Type::AtomOccurrence(AtomKind::Edge))))
+			}
+			"path::length" => (Builtin::PathLength, 1, Type::Int),
+			"path::cost" => (Builtin::PathCost, 1, Type::Number),
 			"option::is_some" => (Builtin::OptionIsSome, 1, Type::Bool),
 			"option::is_none" => (Builtin::OptionIsNone, 1, Type::Bool),
 			"type::is" => {
@@ -2406,6 +2735,10 @@ impl<'a> Analyzer<'a> {
 			}
 			"set::has" => vec![BuiltinArgument::Set, BuiltinArgument::Any],
 			"meta::id" | "meta::class" => vec![BuiltinArgument::RecordOrAtom],
+			"graph::inner" => vec![BuiltinArgument::AtomOccurrence],
+			"path::atoms" | "path::nodes" | "path::edges" | "path::length" | "path::cost" => {
+				vec![BuiltinArgument::Path]
+			}
 			"meta::type" | "option::is_some" | "option::is_none" | "type::is" | "type::to" => {
 				vec![BuiltinArgument::Any]
 			}
@@ -2617,7 +2950,9 @@ enum BuiltinArgument {
 	Duration,
 	Array,
 	Set,
+	Path,
 	RecordOrAtom,
+	AtomOccurrence,
 }
 
 impl BuiltinArgument {
@@ -2631,7 +2966,11 @@ impl BuiltinArgument {
 				Self::Duration => matches!(ty, Type::Duration),
 				Self::Array => matches!(ty, Type::Array(_)),
 				Self::Set => matches!(ty, Type::Set(_)),
-				Self::RecordOrAtom => matches!(ty, Type::Record | Type::Atom(_)),
+				Self::Path => matches!(ty, Type::Path),
+				Self::RecordOrAtom => {
+					matches!(ty, Type::Record | Type::Atom(_) | Type::AtomOccurrence(_))
+				}
+				Self::AtomOccurrence => matches!(ty, Type::AtomOccurrence(_)),
 			}
 	}
 
@@ -2644,7 +2983,9 @@ impl BuiltinArgument {
 			Self::Duration => "duration",
 			Self::Array => "array",
 			Self::Set => "set",
+			Self::Path => "path",
 			Self::RecordOrAtom => "record or atom",
+			Self::AtomOccurrence => "atom occurrence",
 		}
 	}
 }

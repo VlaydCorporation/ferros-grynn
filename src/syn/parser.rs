@@ -122,7 +122,7 @@ impl Parser<'_> {
 		context: &mut Stk,
 	) -> FerrosGrynnResult<Statement> {
 		let start = self.current().span;
-		let kind = if self.consume_keyword(keywords::EXPLAIN).is_some() {
+		let mut kind = if self.consume_keyword(keywords::EXPLAIN).is_some() {
 			StatementKind::Explain(context.run(|context| self.explain_statement(context)).await?)
 		} else if self.consume_keyword(keywords::BEGIN).is_some() {
 			if self.consume_keyword(keywords::IMPORT).is_some() {
@@ -197,8 +197,11 @@ impl Parser<'_> {
 			StatementKind::Info(self.info_statement()?)
 		} else if self.consume_keyword(keywords::LET).is_some() {
 			StatementKind::Let(context.run(|context| self.let_statement(context)).await?)
+		} else if self.consume_keyword(keywords::OPTIONAL).is_some() {
+			self.expect_keyword(keywords::MATCH, "Expected `MATCH` after `OPTIONAL`.")?;
+			StatementKind::Match(context.run(|context| self.match_statement(context, true)).await?)
 		} else if self.consume_keyword(keywords::MATCH).is_some() {
-			StatementKind::Match(context.run(|context| self.match_statement(context)).await?)
+			StatementKind::Match(context.run(|context| self.match_statement(context, false)).await?)
 		} else if self.consume_keyword(keywords::RETURN).is_some() {
 			StatementKind::Return(context.run(|context| self.return_statement(context)).await?)
 		} else if self.consume_keyword(keywords::SELECT).is_some() {
@@ -210,7 +213,18 @@ impl Parser<'_> {
 				context.run(|context| self.expression(context, 0, 1, 0)).await?,
 			)
 		};
-		let timeout = if self.consume_keyword(keywords::TIMEOUT).is_some() {
+		let embedded_timeout = match &mut kind {
+			StatementKind::Match(statement) => statement.timeout.take(),
+			_ => None,
+		};
+		let timeout = if embedded_timeout.is_some() {
+			embedded_timeout
+		} else if self.consume_keyword(keywords::TIMEOUT).is_some() {
+			if matches!(kind, StatementKind::Match(_)) {
+				return Err(
+					self.syntax("MATCH TIMEOUT belongs before RETURN.", self.previous_span())
+				);
+			}
 			if !matches!(
 				kind,
 				StatementKind::Create(_)
@@ -240,7 +254,7 @@ impl Parser<'_> {
 		})
 	}
 
-	fn timeout_value(&mut self) -> FerrosGrynnResult<TimeoutValue> {
+	pub(in crate::syn) fn timeout_value(&mut self) -> FerrosGrynnResult<TimeoutValue> {
 		let token = self.tokens.next();
 		match token.kind {
 			TokenKind::Parameter(value) => Ok(TimeoutValue::Parameter(Identifier {
@@ -978,12 +992,21 @@ mod tests {
 		ExecutionModeName,
 		ExprKind,
 		MatchDirection,
+		MatchLinearPattern,
+		MatchPattern,
 		MatchSelector,
 		ParserSettings,
 		StatementKind,
 		TimeoutValue,
 		TransactionIsolationName,
 	};
+
+	fn linear_pattern(pattern: &MatchPattern) -> &MatchLinearPattern {
+		let MatchPattern::Linear(pattern) = pattern else {
+			panic!("expected a linear MATCH pattern");
+		};
+		pattern
+	}
 
 	#[test]
 	fn respects_precedence_and_record_adjacency() {
@@ -1171,39 +1194,34 @@ mod tests {
 		let StatementKind::Match(statement) = &standard.statements[0].kind else {
 			panic!("expected MATCH");
 		};
+		let patterns = statement.patterns.iter().map(linear_pattern).collect::<Vec<_>>();
 		assert_eq!(statement.patterns.len(), 5);
-		assert_eq!(statement.patterns[0].steps.len(), 2);
-		assert!(matches!(statement.patterns[0].start.selector, MatchSelector::Class(_)));
+		assert_eq!(patterns[0].steps.len(), 2);
+		assert!(matches!(patterns[0].start.selector, MatchSelector::Class(_)));
+		assert_eq!(patterns[0].start.alias.as_ref().map(|alias| alias.value.as_ref()), Some("a"));
 		assert_eq!(
-			statement.patterns[0].start.alias.as_ref().map(|alias| alias.value.as_ref()),
-			Some("a")
-		);
-		assert_eq!(
-			statement.patterns[0].start.label.as_ref().map(|label| label.value.as_ref()),
+			patterns[0].start.label.as_ref().map(|label| label.value.as_ref()),
 			Some("Person")
 		);
-		assert_eq!(statement.patterns[0].steps[0].direction, MatchDirection::Forward);
-		assert_eq!(statement.patterns[0].steps[1].direction, MatchDirection::Backward);
+		assert_eq!(patterns[0].steps[0].direction, MatchDirection::Forward);
+		assert_eq!(patterns[0].steps[1].direction, MatchDirection::Backward);
 		assert_eq!(
-			statement.patterns[1].steps[0].edge.length.map(|length| (length.min, length.max)),
-			Some((0, 3))
+			patterns[1].steps[0].edge.length.map(|length| (length.min, length.max)),
+			Some((0, Some(3)))
+		);
+		assert_eq!(patterns[2].steps.iter().map(|step| step.direction).collect::<Vec<_>>(), [
+			MatchDirection::Forward,
+			MatchDirection::Backward,
+			MatchDirection::Undirected,
+			MatchDirection::Bidirectional,
+		]);
+		assert_eq!(
+			patterns[3].steps[0].edge.length.map(|length| (length.min, length.max)),
+			Some((2, Some(2)))
 		);
 		assert_eq!(
-			statement.patterns[2].steps.iter().map(|step| step.direction).collect::<Vec<_>>(),
-			[
-				MatchDirection::Forward,
-				MatchDirection::Backward,
-				MatchDirection::Undirected,
-				MatchDirection::Bidirectional,
-			]
-		);
-		assert_eq!(
-			statement.patterns[3].steps[0].edge.length.map(|length| (length.min, length.max)),
-			Some((2, 2))
-		);
-		assert_eq!(
-			statement.patterns[4].steps[0].edge.length.map(|length| (length.min, length.max)),
-			Some((1, 4))
+			patterns[4].steps[0].edge.length.map(|length| (length.min, length.max)),
+			Some((1, Some(4)))
 		);
 
 		let atom = parse(
@@ -1217,39 +1235,85 @@ mod tests {
 			panic!("expected MATCH ATOM");
 		};
 		assert!(statement.atom);
+		let pattern = linear_pattern(&statement.patterns[0]);
+		assert_eq!(pattern.steps.iter().map(|step| step.direction).collect::<Vec<_>>(), [
+			MatchDirection::Forward,
+			MatchDirection::Backward,
+			MatchDirection::Undirected,
+			MatchDirection::Bidirectional,
+		]);
+	}
+
+	#[test]
+	fn parses_open_match_range_for_maxdepth_normalization() {
+		let source = "MATCH (* AS a)-[E*1..]->(* AS b) IN GRAPH social RETURN b";
+		let program =
+			parse(source, ParserSettings::default()).expect("open path range is canonical");
+		let StatementKind::Match(statement) = &program.statements[0].kind else {
+			panic!("expected MATCH");
+		};
+		let pattern = linear_pattern(&statement.patterns[0]);
 		assert_eq!(
-			statement.patterns[0].steps.iter().map(|step| step.direction).collect::<Vec<_>>(),
-			[
-				MatchDirection::Forward,
-				MatchDirection::Backward,
-				MatchDirection::Undirected,
-				MatchDirection::Bidirectional,
-			]
+			pattern.steps[0].edge.length.map(|length| (length.min, length.max)),
+			Some((1, None))
 		);
 	}
 
 	#[test]
-	fn locates_unbounded_match_range_at_missing_maximum() {
-		let source = "MATCH (* AS a)-[E*1..]->(* AS b) IN GRAPH social RETURN b";
-		let error =
-			parse(source, ParserSettings::default()).expect_err("unbounded paths are rejected");
-		let span = error.status().diagnostic().primary_location().expect("located error").span();
-		assert_eq!(span.offset as usize, source.find(']').expect("closing bracket"));
-		assert_eq!(span.len, 1);
-	}
+	fn parses_full_match_and_graph_first_surface() {
+		let standard = parse(
+			"OPTIONAL MATCH DISTINCT DIFFERENT ATOMS CONSTRAINTS <TRAIL SHORTEST WEIGHTED> \
+			 (person AS p { active: true } WHERE p.active)-[friend*1.. SIMPLE]->(person AS q) IN \
+			 GRAPH $graph WHERE q.active MAXDEPTH 8 TIMEOUT 1s RETURN DISTINCT p AS person ORDER \
+			 BY person DESC NULLS FIRST",
+			ParserSettings::default(),
+		)
+		.expect("full StandardPath surface parses");
+		let StatementKind::Match(statement) = &standard.statements[0].kind else {
+			panic!("expected MATCH");
+		};
+		assert!(statement.optional);
+		assert!(statement.binding_distinct);
+		assert!(statement.projection_distinct);
+		assert_eq!(statement.order.len(), 1);
+		assert!(matches!(statement.source.kind, ExprKind::Parameter(_)));
 
-	#[test]
-	fn classifies_deferred_match_syntax_as_unsupported() {
-		for source in [
-			"MATCH (* AS a)-[E TRAIL]->(* AS b) IN GRAPH social RETURN b",
-			"MATCH (* AS a) WITHIN (* AS b) IN GRAPH social RETURN a",
-			"MATCH (* AS a)-[E CROSS_LEVEL]->(* AS b) IN GRAPH social RETURN b",
-			"MATCH (* AS a) IN GRAPH social RETURN GRAPH",
-		] {
-			let error = parse(source, ParserSettings::default())
-				.expect_err("deferred MATCH feature must be rejected");
-			assert_eq!(error.status().code().to_string(), "FG-50F03", "source: {source}");
-		}
+		let hyper = parse(
+			"MATCH HYPER [meeting AS e] CONTAINS HEAD [(person AS a), (person AS b)], TAIL \
+			 [(document AS d)] IN GRAPH knowledge RETURN e, a, b, d",
+			ParserSettings::default(),
+		)
+		.expect("hyper endpoint assignments parse");
+		let StatementKind::Match(statement) = &hyper.statements[0].kind else {
+			panic!("expected HYPER MATCH");
+		};
+		assert!(matches!(statement.patterns[0], MatchPattern::Hyper(_)));
+
+		let within = parse(
+			"MATCH (child AS c) WITHIN*[1..4] <(module AS m)> IN GRAPH knowledge RETURN c, m",
+			ParserSettings::default(),
+		)
+		.expect("transitive containment parses");
+		let StatementKind::Match(statement) = &within.statements[0].kind else {
+			panic!("expected WITHIN MATCH");
+		};
+		assert!(matches!(statement.patterns[0], MatchPattern::Within(_)));
+
+		let error = parse("MATCH (* AS a) IN GRAPH social RETURN GRAPH", ParserSettings::default())
+			.expect_err("RETURN GRAPH belongs to stage 18");
+		assert_eq!(error.status().code().to_string(), "FG-50F03");
+
+		parse(
+			"MATCH CONSTRAINTS <TRAIL WALK> (* AS a)-[*]->(* AS b) IN GRAPH social RETURN b",
+			ParserSettings::default(),
+		)
+		.expect_err("one constraint scope cannot contain two path modes");
+		parse(
+			"MATCH CONSTRAINTS <SHORTEST WEIGHTED SHORTEST> (* AS a)-[*]->(* AS b) IN GRAPH \
+			 social RETURN b",
+			ParserSettings::default(),
+		)
+		.expect_err("one constraint scope cannot contain two objectives");
 	}
 
 	#[test]
@@ -1260,8 +1324,9 @@ mod tests {
 		let StatementKind::Match(statement) = &program.statements[0].kind else {
 			panic!("expected MATCH");
 		};
-		assert!(matches!(statement.patterns[0].start.selector, MatchSelector::Record { .. }));
-		assert!(statement.patterns[0].start.alias.is_none());
+		let pattern = linear_pattern(&statement.patterns[0]);
+		assert!(matches!(pattern.start.selector, MatchSelector::Record { .. }));
+		assert!(pattern.start.alias.is_none());
 
 		parse("MATCH (Person AS a) FROM social RETURN a", ParserSettings::default())
 			.expect_err("legacy FROM source syntax must not remain available");

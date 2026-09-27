@@ -237,29 +237,45 @@ fn graph_dml_contains_impure(statement: &LogicalGraphDmlStatement) -> bool {
 }
 
 fn match_contains_impure(statement: &LogicalMatch) -> bool {
-	statement.patterns.iter().any(|pattern| {
-		binding_contains_impure(&pattern.start)
-			|| pattern.ops.iter().any(|operation| match operation {
-				crate::gql::ir::MatchOp::Expand(expand) => {
-					binding_contains_impure(&expand.source)
-						|| binding_contains_impure(&expand.edge)
-						|| binding_contains_impure(&expand.target)
-				}
-				crate::gql::ir::MatchOp::PathExpand(expand) => {
-					binding_contains_impure(&expand.source)
-						|| binding_contains_impure(&expand.edge)
-						|| binding_contains_impure(&expand.target)
-				}
-			})
+	statement.patterns.iter().any(|pattern| match &pattern.kind {
+		crate::gql::ir::LogicalMatchPatternKind::Linear(pattern) => {
+			binding_contains_impure(&pattern.start)
+				|| pattern.ops.iter().any(|operation| match operation {
+					crate::gql::ir::MatchOp::Expand(expand) => {
+						binding_contains_impure(&expand.source)
+							|| binding_contains_impure(&expand.edge)
+							|| binding_contains_impure(&expand.target)
+					}
+					crate::gql::ir::MatchOp::PathExpand(expand) => {
+						binding_contains_impure(&expand.source)
+							|| binding_contains_impure(&expand.edge)
+							|| binding_contains_impure(&expand.target)
+					}
+				})
+		}
+		crate::gql::ir::LogicalMatchPatternKind::Hyper(pattern) => {
+			binding_contains_impure(&pattern.edge)
+				|| pattern
+					.contains
+					.iter()
+					.flat_map(|group| &group.endpoints)
+					.any(binding_contains_impure)
+		}
+		crate::gql::ir::LogicalMatchPatternKind::Within(pattern) => {
+			binding_contains_impure(&pattern.child) || binding_contains_impure(&pattern.owner)
+		}
 	}) || statement.filter.as_ref().is_some_and(expr_contains_impure)
 		|| statement.projection.iter().any(expr_contains_impure)
 }
 
 fn binding_contains_impure(binding: &crate::gql::ir::MatchBinding) -> bool {
-	match &binding.selector {
+	let selector = match &binding.selector {
 		LogicalMatchSelector::Record(record) => expr_contains_impure(&record.key),
 		LogicalMatchSelector::Any | LogicalMatchSelector::Class(_) => false,
-	}
+	};
+	selector
+		|| binding.properties.iter().any(|(_, value)| expr_contains_impure(value))
+		|| binding.predicate.as_ref().is_some_and(expr_contains_impure)
 }
 
 fn select_contains_impure(statement: &LogicalSelect) -> bool {

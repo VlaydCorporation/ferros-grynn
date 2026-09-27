@@ -1,7 +1,8 @@
 use crate::{
-	datastore::Datastore,
+	datastore::{ClassSchema, Datastore},
 	gql::QueryStatementKind,
-	values::{Object, RecordId, Value},
+	graph::{AtomKind, EdgeTopology, GraphKind},
+	values::{Number, Object, RecordId, Value},
 };
 
 fn atom_exists(store: &Datastore, record: &str) -> bool {
@@ -151,4 +152,114 @@ fn explain_analyze_respects_explicit_transaction_publication() {
 
 	assert!(store.execute("EXPLAIN EXPLAIN SELECT id FROM person;", &Object::new()).is_err());
 	assert!(store.execute("EXPLAIN IF true { RETURN 1; };", &Object::new()).is_err());
+}
+
+#[test]
+fn explain_match_projects_physical_algorithms_and_runtime_metrics() {
+	let store = Datastore::in_memory();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
+	let graph = seed.define_graph("routes", GraphKind::Graph).unwrap();
+	let source = "person:a".parse::<RecordId>().unwrap();
+	let target = "person:b".parse::<RecordId>().unwrap();
+	let edge = "link:ab".parse::<RecordId>().unwrap();
+	for record in [&source, &target, &edge] {
+		seed.create_atom(record.clone(), Default::default()).unwrap();
+	}
+	let source_id = seed.attach_node(graph.id(), &source, None, None).unwrap();
+	let target_id = seed.attach_node(graph.id(), &target, None, None).unwrap();
+	seed.attach_edge(
+		graph.id(),
+		&edge,
+		None,
+		EdgeTopology::directed([source_id], [target_id]),
+		Some(Number::Int(2)),
+		None,
+	)
+	.unwrap();
+	seed.commit().unwrap();
+
+	let node_operators = |root: &Object| {
+		let Some(Value::Array(nodes)) = root.get("nodes") else {
+			panic!("physical MATCH nodes are missing");
+		};
+		nodes
+			.iter()
+			.filter_map(Value::as_object)
+			.filter_map(|node| node.get("operator"))
+			.filter_map(Value::as_str)
+			.map(str::to_owned)
+			.collect::<Vec<_>>()
+	};
+	let full = json_result(
+		&store,
+		"EXPLAIN FULL FORMAT JSON OPTIONAL MATCH DISTINCT path = (person:a AS a)-[link*1..3 \
+		 SHORTEST]->(person:b AS b) IN GRAPH routes RETURN DISTINCT path ORDER BY \
+		 path::length(path);",
+	);
+	let operators = node_operators(&full);
+	for expected in [
+		"MatchSeed",
+		"BreadthFirstShortest",
+		"OptionalFallback",
+		"BindingDistinct",
+		"ProjectionDistinct",
+		"MatchOrder",
+	] {
+		assert!(operators.iter().any(|operator| operator == expected), "{expected}");
+	}
+
+	let weighted = json_result(
+		&store,
+		"EXPLAIN FULL FORMAT JSON MATCH path = (person:a AS a)-[link*1..3 WEIGHTED \
+		 SHORTEST]->(person:b AS b) IN GRAPH routes RETURN path;",
+	);
+	assert!(node_operators(&weighted).iter().any(|operator| operator == "DijkstraShortest"));
+
+	let analyzed = json_result(
+		&store,
+		"EXPLAIN ANALYZE FORMAT JSON MATCH path = (person:a AS a)-[link*1..3 SHORTEST]->(person:b \
+		 AS b) IN GRAPH routes RETURN path;",
+	);
+	let Some(Value::Object(metrics)) = analyzed.get("analyze") else {
+		panic!("MATCH ANALYZE metrics are missing");
+	};
+	for metric in ["path_expansions", "match_seeds", "frontier_peak", "trace_nodes", "graph_opens"]
+	{
+		assert!(
+			matches!(metrics.get(metric), Some(Value::Number(value)) if u64::try_from(*value).is_ok_and(|value| value > 0)),
+			"{metric}",
+		);
+	}
+	let without_path_value = json_result(
+		&store,
+		"EXPLAIN ANALYZE FORMAT JSON MATCH (person:a AS a)-[link*1..3]->(person:b AS b) IN GRAPH \
+		 routes RETURN b;",
+	);
+	let Some(Value::Object(metrics)) = without_path_value.get("analyze") else {
+		panic!("MATCH ANALYZE metrics are missing");
+	};
+	assert_eq!(
+		metrics.get("trace_nodes"),
+		Some(&Value::from(0_u64)),
+		"an unobserved path must not allocate PathTraceArena nodes",
+	);
+
+	let mut session = store.session();
+	session
+		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())
+		.unwrap();
+	let query = "EXPLAIN FULL FORMAT JSON MATCH (person AS p) IN GRAPH routes RETURN p;";
+	let first = session.execute(query, &Object::new()).unwrap();
+	let second = session.execute(query, &Object::new()).unwrap();
+	let hash = |results: Vec<crate::gql::QueryResult>| {
+		let value = results.into_iter().next().unwrap().result.unwrap().into_parts().0;
+		let Value::Object(root) = value else {
+			panic!("FORMAT JSON must return an object")
+		};
+		root.get("plan_hash").cloned().unwrap()
+	};
+	assert_eq!(hash(first), hash(second));
+	session.execute("CANCEL;", &Object::new()).unwrap();
 }

@@ -77,6 +77,7 @@ pub use path::{
 pub(crate) use path::{PathTraceArena, PathTraceId};
 pub use read::{
 	AtomIds,
+	AtomOccurrenceRef,
 	AtomRef,
 	DirtyTarget,
 	DiskGraphView,

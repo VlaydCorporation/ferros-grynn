@@ -158,6 +158,9 @@ fn intern_value_keys(transaction: &mut Transaction, value: &Value) -> FerrosGryn
 		}
 		Value::Record(record) => intern_record_id_keys(transaction, record.id()),
 		Value::Atom(atom) => intern_record_id_keys(transaction, atom.id().id()),
+		Value::AtomOccurrence(occurrence) => {
+			intern_record_id_keys(transaction, occurrence.atom().id().id())
+		}
 		_ => Ok(()),
 	}
 }

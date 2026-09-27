@@ -4,7 +4,7 @@ use std::{
 	sync::Arc,
 };
 
-use super::{AtomKind, AtomRef, GraphRead, SnapshotId};
+use super::{AtomKind, AtomOccurrenceRef, AtomRef, GraphRead, SnapshotId};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::runtime::{Number, Uuid},
@@ -28,16 +28,16 @@ pub enum EndpointRole {
 
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 pub struct PathStep {
-	atom: AtomRef,
-	via_edge: Option<AtomRef>,
+	atom: AtomOccurrenceRef,
+	via_edge: Option<AtomOccurrenceRef>,
 	direction: PathDirection,
 	role: EndpointRole,
 }
 
 impl PathStep {
 	pub const fn new(
-		atom: AtomRef,
-		via_edge: Option<AtomRef>,
+		atom: AtomOccurrenceRef,
+		via_edge: Option<AtomOccurrenceRef>,
 		direction: PathDirection,
 		role: EndpointRole,
 	) -> Self {
@@ -49,11 +49,11 @@ impl PathStep {
 		}
 	}
 
-	pub const fn atom(&self) -> &AtomRef {
+	pub const fn atom(&self) -> &AtomOccurrenceRef {
 		&self.atom
 	}
 
-	pub const fn via_edge(&self) -> Option<&AtomRef> {
+	pub const fn via_edge(&self) -> Option<&AtomOccurrenceRef> {
 		self.via_edge.as_ref()
 	}
 
@@ -113,15 +113,15 @@ impl Path {
 		self.cost
 	}
 
-	pub fn atoms(&self) -> impl ExactSizeIterator<Item = &AtomRef> {
-		self.steps.iter().map(PathStep::atom)
+	pub fn atoms(&self) -> impl Iterator<Item = &AtomOccurrenceRef> {
+		self.steps.iter().flat_map(|step| step.via_edge().into_iter().chain([step.atom()]))
 	}
 
-	pub fn nodes(&self) -> impl Iterator<Item = &AtomRef> {
-		self.atoms().filter(|atom| atom.kind() == AtomKind::Node)
+	pub fn nodes(&self) -> impl Iterator<Item = &AtomOccurrenceRef> {
+		self.atoms().filter(|atom| atom.atom().kind() == AtomKind::Node)
 	}
 
-	pub fn edges(&self) -> impl Iterator<Item = &AtomRef> {
+	pub fn edges(&self) -> impl Iterator<Item = &AtomOccurrenceRef> {
 		self.steps.iter().filter_map(PathStep::via_edge)
 	}
 
@@ -141,12 +141,32 @@ impl Path {
 				self.snapshot.to_string(),
 			));
 		}
+		let graph_id = self.steps.first().map(|step| step.atom().graph().id());
+		if self.steps.iter().any(|step| {
+			Some(step.atom().graph().id()) != graph_id
+				|| step.via_edge().is_some_and(|edge| Some(edge.graph().id()) != graph_id)
+		}) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"a cross-graph path cannot be resolved through one graph view",
+			));
+		}
+		if let (Some(expected), Some(actual)) =
+			(graph_id, graph.graph_ref().map(|value| value.id()))
+			&& expected != actual
+		{
+			return Err(FerrosGrynnError::graph_identity_mismatch(
+				expected.to_string(),
+				actual.to_string(),
+			));
+		}
 
 		let mut steps = Vec::with_capacity(self.steps.len());
 		for step in self.steps.iter() {
-			let atom = resolve_atom(graph, step.atom())?;
-			let via_edge =
-				step.via_edge().map(|reference| resolve_edge(graph, reference)).transpose()?;
+			let atom = resolve_atom(graph, step.atom().atom())?;
+			let via_edge = step
+				.via_edge()
+				.map(|reference| resolve_edge(graph, reference.atom()))
+				.transpose()?;
 			steps.push(ResolvedPathStep {
 				atom,
 				via_edge,
@@ -382,11 +402,34 @@ fn resolve_edge<'graph, R: GraphRead>(
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use super::{EndpointRole, PathDirection, PathStep, PathTraceArena};
 	use crate::values::{
 		PropertyMap,
-		runtime::graph::{Graph, GraphRead, Mutable},
+		runtime::graph::{
+			AtomOccurrenceRef,
+			Graph,
+			GraphId,
+			GraphKind,
+			GraphRead,
+			GraphRef,
+			GraphStorageMode,
+			Mutable,
+		},
 	};
+
+	fn graph_ref() -> Arc<GraphRef> {
+		Arc::new(
+			GraphRef::new(
+				GraphId::new(1).unwrap(),
+				"path-test",
+				GraphKind::Graph,
+				GraphStorageMode::InMemory,
+			)
+			.unwrap(),
+		)
+	}
 
 	#[test]
 	fn trace_arena_shares_prefixes_and_materializes_order() {
@@ -403,11 +446,17 @@ mod tests {
 		let first_ref = graph.atom_ref(first).unwrap().unwrap();
 		let second_ref = graph.atom_ref(second).unwrap().unwrap();
 		let edge_ref = graph.atom_ref(edge).unwrap().unwrap();
+		let graph_ref = graph_ref();
 		let mut arena = PathTraceArena::new();
 		let prefix = arena
 			.push(
 				None,
-				PathStep::new(first_ref, None, PathDirection::Forward, EndpointRole::Source),
+				PathStep::new(
+					AtomOccurrenceRef::new(first_ref, graph_ref.clone()),
+					None,
+					PathDirection::Forward,
+					EndpointRole::Source,
+				),
 				Some(1.into()),
 			)
 			.unwrap();
@@ -415,8 +464,8 @@ mod tests {
 			.push(
 				Some(prefix),
 				PathStep::new(
-					second_ref,
-					Some(edge_ref),
+					AtomOccurrenceRef::new(second_ref, graph_ref.clone()),
+					Some(AtomOccurrenceRef::new(edge_ref, graph_ref)),
 					PathDirection::Forward,
 					EndpointRole::Target,
 				),

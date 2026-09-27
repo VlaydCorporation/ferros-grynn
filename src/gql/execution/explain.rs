@@ -4,6 +4,7 @@ use super::*;
 use crate::{
 	gql::optimizer::{
 		Cardinality,
+		MatchOperator,
 		PhysicalPlan,
 		PhysicalSelectPlan,
 		PlanCost,
@@ -23,6 +24,8 @@ struct AnalyzeObservation {
 	peak_memory: u64,
 	spill_bytes: u64,
 	spill_runs: u64,
+	path_expansions: u64,
+	match_metrics: crate::gql::options::MatchMetricsSnapshot,
 	publication: &'static str,
 }
 
@@ -48,12 +51,18 @@ pub(super) fn execute_explain<Read: QueryRead>(
 	} else {
 		&planner_snapshot
 	};
-	let plan =
-		physical_plan(&explain.statement, planning_snapshot, control.barrier_memory_limit())?;
+	let plan = physical_plan(
+		&explain.statement,
+		planning_snapshot,
+		control.barrier_memory_limit(),
+		control.deterministic(),
+	)?;
 	let planning_ns = nanos(planning_started.elapsed());
 	let observation = if explain.mode == ExplainMode::Analyze {
 		let mutation_before = read.mutation_count();
 		let pulls_before = control.row_pulls();
+		let path_expansions_before = control.path_expansions();
+		let match_metrics_before = control.match_metrics();
 		let (spill_bytes_before, spill_runs_before) = control.spill_metrics();
 		let analyze_control = control.clone().with_instrumentation();
 		let started = Instant::now();
@@ -86,6 +95,10 @@ pub(super) fn execute_explain<Read: QueryRead>(
 			peak_memory: u64::try_from(analyze_control.barrier_memory_peak()).unwrap_or(u64::MAX),
 			spill_bytes: spill_bytes.saturating_sub(spill_bytes_before),
 			spill_runs: spill_runs.saturating_sub(spill_runs_before),
+			path_expansions: analyze_control
+				.path_expansions()
+				.saturating_sub(path_expansions_before),
+			match_metrics: analyze_control.match_metrics().saturating_sub(match_metrics_before),
 			publication: if logical_mutates(&explain.statement) {
 				if control.publication_deferred() {
 					"deferred"
@@ -133,6 +146,7 @@ fn physical_plan(
 	statement: &LogicalStatement,
 	snapshot: &PlannerSnapshot,
 	barrier_bytes: usize,
+	deterministic: bool,
 ) -> FerrosGrynnResult<PhysicalPlan> {
 	match statement {
 		LogicalStatement::Select(select) => {
@@ -140,7 +154,8 @@ fn physical_plan(
 				.map(|(_logical, plan)| PhysicalPlan::Select(plan))
 		}
 		LogicalStatement::Match(statement) => {
-			crate::gql::optimizer::plan_match(statement, snapshot).map(PhysicalPlan::Match)
+			crate::gql::optimizer::plan_match(statement, snapshot, deterministic)
+				.map(PhysicalPlan::Match)
 		}
 		LogicalStatement::Schema(_) | LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => {
 			Ok(PhysicalPlan::Write(crate::gql::optimizer::plan_write(statement, snapshot)))
@@ -228,7 +243,8 @@ fn explain_text(
 	if let Some(observation) = observation {
 		lines.push(format!(
 			"  actual rows={} pulls={} affected={} elapsed_ns={} spill_bytes={} spill_runs={} \
-			 peak_memory={} publication={}",
+			 peak_memory={} path_expansions={} frontier_peak={} trace_nodes={} graph_opens={} \
+			 containment_links={} hyper_assignments={} cancellation_checks={} publication={}",
 			observation.actual_rows,
 			observation.pulls,
 			observation.affected_rows,
@@ -236,6 +252,13 @@ fn explain_text(
 			observation.spill_bytes,
 			observation.spill_runs,
 			observation.peak_memory,
+			observation.path_expansions,
+			observation.match_metrics.frontier_peak,
+			observation.match_metrics.trace_nodes,
+			observation.match_metrics.graph_opens,
+			observation.match_metrics.containment_links,
+			observation.match_metrics.hyper_assignments,
+			observation.match_metrics.cancellation_checks,
 			observation.publication,
 		));
 	}
@@ -284,20 +307,26 @@ fn logical_nodes(statement: &LogicalStatement) -> Vec<Value> {
 fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value> {
 	match plan {
 		PhysicalPlan::Select(select) => select_nodes(select, snapshot),
-		PhysicalPlan::Match(plan) => {
-			let mut node = node_object(0, "Match", Some(plan.cardinality), Some(plan.cost));
-			node.insert(
-				"pattern_order",
-				Value::Array(
-					plan.pattern_order
-						.iter()
-						.map(|value| Value::from(u64::try_from(*value).unwrap_or(u64::MAX)))
-						.collect::<Vec<_>>()
-						.into(),
-				),
-			);
-			vec![Value::Object(node)]
-		}
+		PhysicalPlan::Match(plan) => plan
+			.nodes
+			.iter()
+			.map(|planned| {
+				let mut node = node_object(
+					planned.node_id,
+					match_operator_name(&planned.operator),
+					Some(planned.cardinality),
+					Some(planned.cost),
+				);
+				if let Some(pattern) = planned.pattern_index {
+					node.insert("pattern_index", u64::try_from(pattern).unwrap_or(u64::MAX));
+				}
+				if let Some(operation) = planned.operation_index {
+					node.insert("operation_index", u64::try_from(operation).unwrap_or(u64::MAX));
+				}
+				project_match_operator(&mut node, &planned.operator);
+				Value::Object(node)
+			})
+			.collect(),
 		PhysicalPlan::Write(plan) => plan
 			.operators
 			.iter()
@@ -311,6 +340,98 @@ fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value>
 				))
 			})
 			.collect(),
+	}
+}
+
+fn match_operator_name(operator: &MatchOperator) -> &'static str {
+	match operator {
+		MatchOperator::MatchSeed => "MatchSeed",
+		MatchOperator::MatchJoin => "MatchJoin",
+		MatchOperator::FixedExpand {
+			..
+		} => "FixedExpand",
+		MatchOperator::AtomExpand {
+			..
+		} => "AtomExpand",
+		MatchOperator::ResolveNestedEndpoint => "ResolveNestedEndpoint",
+		MatchOperator::PathEnumerate {
+			..
+		} => "PathEnumerate",
+		MatchOperator::BreadthFirstShortest {
+			..
+		} => "BreadthFirstShortest",
+		MatchOperator::DijkstraShortest {
+			..
+		} => "DijkstraShortest",
+		MatchOperator::HyperContains => "HyperContains",
+		MatchOperator::HyperExpand {
+			..
+		} => "HyperExpand",
+		MatchOperator::WithinJoin => "WithinJoin",
+		MatchOperator::TransitiveWithin {
+			..
+		} => "TransitiveWithin",
+		MatchOperator::OptionalFallback => "OptionalFallback",
+		MatchOperator::BindingDistinct => "BindingDistinct",
+		MatchOperator::MatchProject => "MatchProject",
+		MatchOperator::ProjectionDistinct => "ProjectionDistinct",
+		MatchOperator::MatchOrder => "MatchOrder",
+	}
+}
+
+fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
+	match operator {
+		MatchOperator::FixedExpand {
+			direction,
+		}
+		| MatchOperator::AtomExpand {
+			direction,
+		}
+		| MatchOperator::HyperExpand {
+			direction,
+		} => {
+			node.insert("direction", format!("{direction:?}"));
+		}
+		MatchOperator::PathEnumerate {
+			direction,
+			mode,
+			min,
+			max,
+		}
+		| MatchOperator::BreadthFirstShortest {
+			direction,
+			mode,
+			min,
+			max,
+		}
+		| MatchOperator::DijkstraShortest {
+			direction,
+			mode,
+			min,
+			max,
+		} => {
+			node.insert("direction", format!("{direction:?}"));
+			node.insert("path_mode", format!("{mode:?}"));
+			node.insert("minimum_depth", u64::from(*min));
+			node.insert("maximum_depth", u64::from(*max));
+		}
+		MatchOperator::TransitiveWithin {
+			min,
+			max,
+		} => {
+			node.insert("minimum_depth", u64::from(*min));
+			node.insert("maximum_depth", u64::from(*max));
+		}
+		MatchOperator::MatchSeed
+		| MatchOperator::MatchJoin
+		| MatchOperator::ResolveNestedEndpoint
+		| MatchOperator::HyperContains
+		| MatchOperator::WithinJoin
+		| MatchOperator::OptionalFallback
+		| MatchOperator::BindingDistinct
+		| MatchOperator::MatchProject
+		| MatchOperator::ProjectionDistinct
+		| MatchOperator::MatchOrder => {}
 	}
 }
 
@@ -492,6 +613,14 @@ fn observation_object(value: AnalyzeObservation) -> Object {
 	object.insert("spill_bytes", value.spill_bytes);
 	object.insert("spill_runs", value.spill_runs);
 	object.insert("peak_accounted_memory", value.peak_memory);
+	object.insert("path_expansions", value.path_expansions);
+	object.insert("match_seeds", value.match_metrics.seeds);
+	object.insert("frontier_peak", value.match_metrics.frontier_peak);
+	object.insert("trace_nodes", value.match_metrics.trace_nodes);
+	object.insert("graph_opens", value.match_metrics.graph_opens);
+	object.insert("containment_links", value.match_metrics.containment_links);
+	object.insert("hyper_assignments", value.match_metrics.hyper_assignments);
+	object.insert("cancellation_checks", value.match_metrics.cancellation_checks);
 	object.insert("publication_state", value.publication);
 	object
 }

@@ -623,6 +623,19 @@ impl QueryRead for TransactionRead<'_> {
 		self.transaction.query_graph(&self.snapshot, reference)
 	}
 
+	fn graph_reference(
+		&self,
+		_snapshot: Snapshot,
+		graph: crate::graph::GraphId,
+	) -> FerrosGrynnResult<GraphRef> {
+		self.transaction
+			.query_schema_graphs(&self.snapshot)?
+			.into_iter()
+			.find(|schema| schema.id() == graph)
+			.map(|schema| schema.reference().clone())
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))
+	}
+
 	fn property_dictionary(&self, _snapshot: Snapshot) -> Arc<PropertyDictionary> {
 		self.transaction.query_property_dictionary()
 	}

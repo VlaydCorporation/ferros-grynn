@@ -1,10 +1,11 @@
-use std::hint::black_box;
+use std::{hint::black_box, sync::Arc};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ferros_grynn::{
 	datastore::{ClassSchema, Datastore, IsolationLevel, TransactionAccess, TransactionOptions},
 	graph::{
 		AtomKind,
+		AtomOccurrenceRef,
 		AtomRef,
 		Dag,
 		DirtyTarget,
@@ -247,6 +248,15 @@ fn dag_chain(size: usize) -> (Dag<Frozen>, ferros_grynn::graph::AtomId) {
 }
 
 fn path(length: usize) -> Path {
+	let graph = Arc::new(
+		GraphRef::new(
+			GraphId::new(1).unwrap(),
+			"path-benchmark",
+			GraphKind::Graph,
+			GraphStorageMode::InMemory,
+		)
+		.unwrap(),
+	);
 	let steps = (0..=length)
 		.map(|index| {
 			let atom = AtomRef::new(
@@ -260,8 +270,8 @@ fn path(length: usize) -> Path {
 				)
 			});
 			PathStep::new(
-				atom,
-				edge,
+				AtomOccurrenceRef::new(atom, graph.clone()),
+				edge.map(|edge| AtomOccurrenceRef::new(edge, graph.clone())),
 				PathDirection::Forward,
 				ferros_grynn::graph::EndpointRole::Target,
 			)

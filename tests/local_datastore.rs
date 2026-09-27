@@ -28,7 +28,16 @@ mod tests {
 			IndexScope,
 			LocalOptions,
 		},
-		graph::{AtomId, AtomKind, GraphKind, GraphRef, GraphStorageMode},
+		graph::{
+			AtomId,
+			AtomKind,
+			EdgeEndpoint,
+			EdgeTopology,
+			GraphKind,
+			GraphRef,
+			GraphStorageMode,
+			QualifiedAtomId,
+		},
 		values::{Object, PropertyMap, RecordId, RecordIdPart, Type, Uuid, Value},
 	};
 
@@ -108,6 +117,80 @@ mod tests {
 
 		let reopened = Datastore::open_local(directory.path(), options).unwrap();
 		assert_people_graph_atom(&reopened, &remaining_graph, &alice, name);
+	}
+
+	#[test]
+	fn standard_and_nested_match_survive_reopen() {
+		let directory = LocalTestDirectory::new();
+		let options = local_options();
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut seed = store.begin();
+		for (class, kind) in [
+			("person", AtomKind::Node),
+			("document", AtomKind::Node),
+			("module", AtomKind::Node),
+			("link", AtomKind::Edge),
+			("bridge", AtomKind::Edge),
+		] {
+			seed.define_class(ClassSchema::new(class, kind, []).unwrap()).unwrap();
+		}
+		let social = seed.define_graph("local_social", GraphKind::Graph).unwrap();
+		let child = seed.define_graph("local_child", GraphKind::Graph).unwrap();
+		let meta = seed.define_graph("local_meta", GraphKind::Metagraph).unwrap();
+		let alice = "person:alice".parse::<RecordId>().unwrap();
+		let bob = "person:bob".parse::<RecordId>().unwrap();
+		let document = "document:spec".parse::<RecordId>().unwrap();
+		let module = "module:root".parse::<RecordId>().unwrap();
+		let link = "link:knows".parse::<RecordId>().unwrap();
+		let bridge = "bridge:contains".parse::<RecordId>().unwrap();
+		for record in [&alice, &bob, &document, &module, &link, &bridge] {
+			seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		}
+		let social_alice = seed.attach_node(social.id(), &alice, None, None).unwrap();
+		let social_bob = seed.attach_node(social.id(), &bob, None, None).unwrap();
+		seed.attach_edge(
+			social.id(),
+			&link,
+			None,
+			EdgeTopology::directed([social_alice], [social_bob]),
+			None,
+			None,
+		)
+		.unwrap();
+		let child_document = seed.attach_node(child.id(), &document, None, None).unwrap();
+		let owner = seed.attach_node(meta.id(), &module, None, Some(child.id())).unwrap();
+		seed.attach_edge(
+			meta.id(),
+			&bridge,
+			None,
+			EdgeTopology::directed([EdgeEndpoint::Local(owner)], [EdgeEndpoint::Nested(
+				QualifiedAtomId::new([owner], child_document).unwrap(),
+			)]),
+			None,
+			None,
+		)
+		.unwrap();
+		seed.commit().unwrap();
+
+		let standard = "MATCH (person:alice AS a)-[link:knows]->(person:bob AS b) IN GRAPH \
+		                local_social RETURN a, b";
+		let nested = "MATCH (module:root AS m)-[bridge:contains]->(document:spec AS d) IN GRAPH \
+		              local_meta RETURN m, d";
+		let observe = |store: &Datastore, query: &str| {
+			store.execute(query, &Object::new()).unwrap()[0]
+				.result
+				.as_ref()
+				.unwrap()
+				.value()
+				.clone()
+		};
+		let expected_standard = observe(&store, standard);
+		let expected_nested = observe(&store, nested);
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		assert_eq!(observe(&reopened, standard), expected_standard);
+		assert_eq!(observe(&reopened, nested), expected_nested);
 	}
 
 	#[test]

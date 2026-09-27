@@ -14,8 +14,24 @@ pub(super) struct IndexScanWindow<'a> {
 	pub(super) maximum: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Snapshot(pub(super) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Snapshot-local atom handle qualified by its graph occurrence.
+pub(super) struct BoundAtom {
+	pub(super) graph: crate::graph::GraphId,
+	pub(super) atom: AtomId,
+}
+
+impl BoundAtom {
+	pub(super) const fn new(graph: crate::graph::GraphId, atom: AtomId) -> Self {
+		Self {
+			graph,
+			atom,
+		}
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Row {
@@ -27,14 +43,22 @@ pub(super) struct Row {
 	pub(super) sequence: Vec<usize>,
 	/// Deterministic public identities used to break ORDER ties.
 	pub(super) stable: Vec<Value>,
+	/// Evaluated MATCH ORDER keys.
+	pub(super) order: Vec<Value>,
 	/// Graph scope used when dereferencing RecordId properties.
 	pub(super) graph: Option<GraphRef>,
 	/// Internal atom identities aligned with MATCH binding columns.
-	pub(super) atoms: Vec<Option<AtomId>>,
+	pub(super) atoms: Vec<Option<BoundAtom>>,
 	/// Connector edges already consumed by DIFFERENT EDGES semantics.
-	used_edges: Vec<AtomId>,
+	used_edges: Vec<BoundAtom>,
+	/// Endpoint and connector atoms consumed by DIFFERENT ATOMS semantics.
+	used_atoms: Vec<BoundAtom>,
 	/// Endpoint from which the next linear expansion starts.
-	current: Option<AtomId>,
+	current: Option<BoundAtom>,
+	/// Terminal trace node for the currently active named pattern.
+	trace: Option<PathTraceId>,
+	/// Exact cumulative cost stored in the active trace.
+	trace_cost: Number,
 }
 
 impl Row {
@@ -45,10 +69,14 @@ impl Row {
 			compact_atom: false,
 			sequence: Vec::new(),
 			stable: Vec::new(),
+			order: Vec::new(),
 			graph: None,
 			atoms,
 			used_edges: Vec::new(),
+			used_atoms: Vec::new(),
 			current: None,
+			trace: None,
+			trace_cost: Number::Int(0),
 		}
 	}
 
@@ -80,10 +108,14 @@ impl Row {
 			compact_atom: false,
 			sequence: Vec::new(),
 			stable: Vec::new(),
+			order: Vec::new(),
 			graph: None,
 			atoms: vec![None; count],
 			used_edges: Vec::new(),
+			used_atoms: Vec::new(),
 			current: None,
+			trace: None,
+			trace_cost: Number::Int(0),
 		}
 	}
 
@@ -113,15 +145,23 @@ impl Row {
 			)
 			.saturating_add(self.sequence.capacity().saturating_mul(size_of::<usize>()))
 			.saturating_add(self.stable.capacity().saturating_mul(size_of::<Value>()))
+			.saturating_add(self.order.capacity().saturating_mul(size_of::<Value>()))
 			.saturating_add(
 				self.stable
 					.iter()
 					.map(Value::estimated_heap_bytes)
 					.fold(0_usize, usize::saturating_add),
 			)
+			.saturating_add(
+				self.order
+					.iter()
+					.map(Value::estimated_heap_bytes)
+					.fold(0_usize, usize::saturating_add),
+			)
 			.saturating_add(self.graph.as_ref().map_or(0, |graph| graph.name().len()))
-			.saturating_add(self.atoms.capacity().saturating_mul(size_of::<Option<AtomId>>()))
-			.saturating_add(self.used_edges.capacity().saturating_mul(size_of::<AtomId>()))
+			.saturating_add(self.atoms.capacity().saturating_mul(size_of::<Option<BoundAtom>>()))
+			.saturating_add(self.used_edges.capacity().saturating_mul(size_of::<BoundAtom>()))
+			.saturating_add(self.used_atoms.capacity().saturating_mul(size_of::<BoundAtom>()))
 	}
 }
 
@@ -223,6 +263,13 @@ pub(super) trait QueryRead {
 		reference: &GraphRef,
 	) -> FerrosGrynnResult<Self::Graph<'a>>;
 
+	/// Resolves one graph identity in the same immutable statement snapshot.
+	fn graph_reference(
+		&self,
+		snapshot: Snapshot,
+		graph: crate::graph::GraphId,
+	) -> FerrosGrynnResult<GraphRef>;
+
 	/// Returns the property dictionary captured by the statement snapshot.
 	fn property_dictionary(&self, snapshot: Snapshot) -> Arc<PropertyDictionary>;
 
@@ -273,7 +320,7 @@ pub(super) trait QueryRead {
 	) -> FerrosGrynnResult<Value>;
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 /// One traversable connector candidate.
 pub(super) struct TraversalCandidate {
 	/// Candidate target endpoint.
@@ -292,8 +339,14 @@ pub(super) struct EdgeExpandCursor<'a, Graph> {
 	input: Box<dyn RowCursor + 'a>,
 	/// Shared snapshot graph view.
 	graph: Rc<Graph>,
+	/// Shared public graph identity for emitted occurrences.
+	graph_ref: Arc<GraphRef>,
 	/// Fixed expansion contract.
 	expand: ResolvedExpand,
+	/// Evaluator for inline property and WHERE constraints.
+	predicate: MatchPredicateContext<'a>,
+	/// Named-path trace arena, absent when the path is unobservable.
+	trace: Option<Rc<RefCell<MatchPathTrace>>>,
 	/// Connector identifiers scanned for each source row.
 	edges: Vec<AtomId>,
 	/// Current upstream row.
@@ -309,13 +362,19 @@ impl<'a, Graph: GraphRead> EdgeExpandCursor<'a, Graph> {
 	pub(super) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		graph: Rc<Graph>,
+		graph_ref: Arc<GraphRef>,
 		expand: ResolvedExpand,
+		predicate: MatchPredicateContext<'a>,
+		trace: Option<Rc<RefCell<MatchPathTrace>>>,
 	) -> FerrosGrynnResult<Self> {
 		let edges = graph.edge_ids()?.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		Ok(Self {
 			input,
 			graph,
+			graph_ref,
 			expand,
+			predicate,
+			trace,
 			edges,
 			row: None,
 			candidates: Vec::new(),
@@ -330,7 +389,8 @@ impl<Graph: GraphRead> RowCursor for EdgeExpandCursor<'_, Graph> {
 			control.check()?;
 			if let Some(candidate) = self.candidates.get(self.next_candidate).cloned() {
 				self.next_candidate += 1;
-				if let Some(row) = expand_row(
+				control.record_path_expansion()?;
+				if !fixed_candidate_allowed(
 					self.row.as_ref().ok_or_else(|| {
 						FerrosGrynnError::invalid_argument("MATCH expand lost its input row.")
 					})?,
@@ -338,6 +398,28 @@ impl<Graph: GraphRead> RowCursor for EdgeExpandCursor<'_, Graph> {
 					&candidate,
 					self.graph.as_ref(),
 				)? {
+					continue;
+				}
+				if let Some(mut row) = expand_row(
+					self.row.as_ref().ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("MATCH expand lost its input row.")
+					})?,
+					&self.expand,
+					&candidate,
+					self.graph.as_ref(),
+					&self.graph_ref,
+					self.predicate,
+					control,
+				)? {
+					append_trace_hop(
+						&mut row,
+						&candidate,
+						self.graph.as_ref(),
+						&self.graph_ref,
+						self.trace.as_ref(),
+						Number::Int(1),
+						control,
+					)?;
 					return Ok(Some(row));
 				}
 				continue;
@@ -345,9 +427,12 @@ impl<Graph: GraphRead> RowCursor for EdgeExpandCursor<'_, Graph> {
 			let Some(row) = self.input.next(control)? else {
 				return Ok(None);
 			};
-			let source = row.current.ok_or_else(|| {
-				FerrosGrynnError::invalid_argument("MATCH expand has no source endpoint.")
-			})?;
+			let source = row
+				.current
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("MATCH expand has no source endpoint.")
+				})?
+				.atom;
 			self.candidates = edge_candidates(
 				self.graph.as_ref(),
 				&self.edges,
@@ -367,10 +452,16 @@ pub(super) struct IndexExpandCursor<'a, Graph> {
 	input: Box<dyn RowCursor + 'a>,
 	/// Shared snapshot graph view.
 	graph: Rc<Graph>,
+	/// Shared public graph identity for emitted occurrences.
+	graph_ref: Arc<GraphRef>,
 	/// Shared traversal index.
 	index: Rc<TraversalIndex>,
 	/// Fixed expansion contract.
 	expand: ResolvedExpand,
+	/// Evaluator for inline property and WHERE constraints.
+	predicate: MatchPredicateContext<'a>,
+	/// Named-path trace arena, absent when the path is unobservable.
+	trace: Option<Rc<RefCell<MatchPathTrace>>>,
 	/// Current upstream row.
 	row: Option<Row>,
 	/// Candidates for the current source endpoint.
@@ -384,14 +475,20 @@ impl<'a, Graph> IndexExpandCursor<'a, Graph> {
 	pub(super) fn new(
 		input: Box<dyn RowCursor + 'a>,
 		graph: Rc<Graph>,
+		graph_ref: Arc<GraphRef>,
 		index: Rc<TraversalIndex>,
 		expand: ResolvedExpand,
+		predicate: MatchPredicateContext<'a>,
+		trace: Option<Rc<RefCell<MatchPathTrace>>>,
 	) -> Self {
 		Self {
 			input,
 			graph,
+			graph_ref,
 			index,
 			expand,
+			predicate,
+			trace,
 			row: None,
 			candidates: Vec::new(),
 			next_candidate: 0,
@@ -405,10 +502,8 @@ impl<Graph: GraphRead> RowCursor for IndexExpandCursor<'_, Graph> {
 			control.check()?;
 			if let Some(candidate) = self.candidates.get(self.next_candidate).cloned() {
 				self.next_candidate += 1;
-				if !connector_matches(self.graph.as_ref(), candidate.edge, &self.expand.edge)? {
-					continue;
-				}
-				if let Some(row) = expand_row(
+				control.record_path_expansion()?;
+				if !fixed_candidate_allowed(
 					self.row.as_ref().ok_or_else(|| {
 						FerrosGrynnError::invalid_argument("MATCH expand lost its input row.")
 					})?,
@@ -416,6 +511,28 @@ impl<Graph: GraphRead> RowCursor for IndexExpandCursor<'_, Graph> {
 					&candidate,
 					self.graph.as_ref(),
 				)? {
+					continue;
+				}
+				if let Some(mut row) = expand_row(
+					self.row.as_ref().ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("MATCH expand lost its input row.")
+					})?,
+					&self.expand,
+					&candidate,
+					self.graph.as_ref(),
+					&self.graph_ref,
+					self.predicate,
+					control,
+				)? {
+					append_trace_hop(
+						&mut row,
+						&candidate,
+						self.graph.as_ref(),
+						&self.graph_ref,
+						self.trace.as_ref(),
+						Number::Int(1),
+						control,
+					)?;
 					return Ok(Some(row));
 				}
 				continue;
@@ -423,9 +540,12 @@ impl<Graph: GraphRead> RowCursor for IndexExpandCursor<'_, Graph> {
 			let Some(row) = self.input.next(control)? else {
 				return Ok(None);
 			};
-			let source = row.current.ok_or_else(|| {
-				FerrosGrynnError::invalid_argument("MATCH expand has no source endpoint.")
-			})?;
+			let source = row
+				.current
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("MATCH expand has no source endpoint.")
+				})?
+				.atom;
 			self.candidates = index_candidates(
 				self.graph.as_ref(),
 				self.index.as_ref(),
@@ -444,28 +564,88 @@ pub(super) fn expand_row<Graph: GraphRead>(
 	expand: &ResolvedExpand,
 	candidate: &TraversalCandidate,
 	graph: &Graph,
+	graph_ref: &Arc<GraphRef>,
+	predicate: MatchPredicateContext<'_>,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Option<Row>> {
 	if !atom_matches(graph, candidate.target, &expand.target)? {
 		return Ok(None);
 	}
-	let edge_bound =
-		expand.edge.column.and_then(|column| input.atoms.get(column).copied().flatten());
-	if edge_bound.is_some_and(|edge| edge != candidate.edge)
-		|| edge_bound.is_none() && input.used_edges.contains(&candidate.edge)
-	{
-		return Ok(None);
-	}
 	let mut row = input.clone();
-	if !bind_atom(&mut row, &expand.edge, candidate.edge, graph)?
-		|| !bind_atom(&mut row, &expand.target, candidate.target, graph)?
-	{
+	if !bind_match_position(
+		&mut row,
+		&expand.edge,
+		candidate.edge,
+		graph,
+		graph_ref,
+		expand.mode,
+		predicate,
+		control,
+	)? || !bind_match_position(
+		&mut row,
+		&expand.target,
+		candidate.target,
+		graph,
+		graph_ref,
+		expand.mode,
+		predicate,
+		control,
+	)? {
 		return Ok(None);
 	}
-	if !row.used_edges.contains(&candidate.edge) {
-		row.used_edges.push(candidate.edge);
-	}
-	row.current = Some(candidate.target);
+	row.current = Some(BoundAtom::new(graph_ref.id(), candidate.target));
 	Ok(Some(row))
+}
+
+/// Applies edge-local path filters to one fixed expansion candidate.
+pub(super) fn fixed_candidate_allowed<Graph: GraphRead>(
+	row: &Row,
+	expand: &ResolvedExpand,
+	candidate: &TraversalCandidate,
+	graph: &Graph,
+) -> FerrosGrynnResult<bool> {
+	if !connector_matches(graph, candidate.edge, &expand.edge)? {
+		return Ok(false);
+	}
+	let edge = graph
+		.edge(candidate.edge)?
+		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", candidate.edge.to_string()))?;
+	let topology = edge.topology()?;
+	for filter in &expand.filters {
+		let accepted = match filter {
+			crate::syn::MatchPathFilter::Weighted => edge.weight().is_some(),
+			crate::syn::MatchPathFilter::HyperEdges => topology.is_hyper(),
+			crate::syn::MatchPathFilter::MetaEdges => edge.is_meta()?,
+			crate::syn::MatchPathFilter::Meta => {
+				edge.is_meta()?
+					&& endpoint_is_meta(graph, row.current.map(|atom| atom.atom))?
+					&& endpoint_is_meta(graph, Some(candidate.target))?
+			}
+			crate::syn::MatchPathFilter::MetaVertices => {
+				endpoint_is_meta(graph, row.current.map(|atom| atom.atom))?
+					&& endpoint_is_meta(graph, Some(candidate.target))?
+			}
+			crate::syn::MatchPathFilter::CrossLevel => false,
+		};
+		if !accepted {
+			return Ok(false);
+		}
+	}
+	Ok(true)
+}
+
+fn endpoint_is_meta<Graph: GraphRead>(
+	graph: &Graph,
+	endpoint: Option<AtomId>,
+) -> FerrosGrynnResult<bool> {
+	let Some(endpoint) = endpoint else {
+		return Ok(false);
+	};
+	match endpoint.kind() {
+		Some(AtomKind::Node) => graph.node(endpoint)?.map_or(Ok(false), |node| node.is_meta()),
+		Some(AtomKind::Edge) => graph.edge(endpoint)?.map_or(Ok(false), |edge| edge.is_meta()),
+		None => Ok(false),
+	}
 }
 
 /// Applies the connector class, exact-record, and graph-label predicates.
@@ -651,28 +831,56 @@ pub(super) const fn direction_accepts(
 	}
 }
 
+mod barrier;
 mod binding;
+mod cross_level;
+mod hyper;
+mod nesting;
 mod path;
 mod pipeline;
+mod scoped;
+mod scoped_path;
+mod shortest;
 
+pub(super) use barrier::{MatchProjectCursor, OptionalCursor, distinct_rows, sort_match_rows};
 pub(super) use binding::{
+	MatchPredicateContext,
 	ResolvedExpand,
 	ResolvedMatchBinding,
 	ResolvedMatchSelector,
 	ResolvedPathExpand,
 	SeedCursor,
 	atom_matches,
-	bind_atom,
+	bind_match_position,
 	resolve_expand,
 	resolve_match_binding,
 	resolve_path_expand,
 };
-pub(super) use path::PathExpandCursor;
+pub(super) use cross_level::{
+	CrossLevelExpandCursor,
+	append_scoped_trace_hop,
+	scoped_filters_match,
+};
+pub(super) use hyper::{HyperContainsCursor, ResolvedHyperContains};
+pub(super) use nesting::{ResolvedWithin, WithinCursor, nested_graph_reference};
+pub(super) use path::{
+	MatchPathTrace,
+	PathBindCursor,
+	PathExpandCursor,
+	PathTraceStartCursor,
+	add_path_cost,
+	append_trace_hop,
+	path_candidate_allowed,
+	path_hop_weight,
+	path_row,
+};
 pub(super) use pipeline::{
 	AtomFieldRead,
 	FilterCursor,
-	GraphFields,
+	MatchGraphFields,
 	OneRowCursor,
-	ProjectCursor,
 	RecordFields,
 };
+pub(super) use scoped::{ScopedTraversalCandidate, ScopedTraversalIndex, resolve_scoped_endpoint};
+pub(super) use scoped_path::{ScopedPathExpandCursor, ScopedShortestPathCursor};
+pub(super) use shortest::ShortestPathCursor;

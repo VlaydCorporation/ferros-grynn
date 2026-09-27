@@ -13,7 +13,7 @@ mod graph_properties;
 mod schema;
 mod select;
 
-use std::{rc::Rc, sync::Arc, time::Instant};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 
 use adapter::TransactionRead;
 #[cfg(test)]
@@ -41,6 +41,7 @@ use super::{
 	analysis::{QueryCatalog, analyze, analyze_statement, compatible},
 	ir::{
 		Aggregate,
+		Builtin,
 		Column,
 		EndpointDomain,
 		Expand,
@@ -57,7 +58,9 @@ use super::{
 		LogicalGraphReference,
 		LogicalMatch,
 		LogicalMatchPattern,
+		LogicalMatchPatternKind,
 		LogicalMatchSelector,
+		LogicalOrder,
 		LogicalProgram,
 		LogicalSchemaStatement,
 		LogicalSelect,
@@ -94,6 +97,7 @@ use crate::{
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location},
 	graph::{
 		AtomId,
+		AtomOccurrenceRef,
 		EdgeDirection,
 		EdgeEndpoint,
 		EdgeRead,
@@ -103,6 +107,8 @@ use crate::{
 		NodeRead,
 		PathDirection,
 		PathStep,
+		PathTraceArena,
+		PathTraceId,
 		TraversalDirection,
 		TraversalIndex,
 		TraversalSemantics,
@@ -765,15 +771,27 @@ fn execute_match<Read: QueryRead>(
 	} else {
 		&planner_snapshot
 	};
-	let physical = crate::gql::optimizer::plan_match(plan, planner_snapshot)?;
+	let physical =
+		crate::gql::optimizer::plan_match(plan, planner_snapshot, control.deterministic())?;
+	control.record_match_graph_open();
 	let graph = Rc::new(read.graph(snapshot, &plan.graph)?);
-	let has_chain = plan.patterns.iter().any(|pattern| pattern.ops.len() > 1);
+	let graph_ref = Arc::new(plan.graph.clone());
+	let has_chain = plan.patterns.iter().any(|pattern| {
+		matches!(
+			&pattern.kind,
+			LogicalMatchPatternKind::Linear(pattern) if pattern.ops.len() > 1
+		)
+	});
 	let has_path = plan
 		.patterns
 		.iter()
-		.flat_map(|pattern| &pattern.ops)
+		.filter_map(|pattern| match &pattern.kind {
+			LogicalMatchPatternKind::Linear(pattern) => Some(pattern.ops.as_slice()),
+			LogicalMatchPatternKind::Hyper(_) | LogicalMatchPatternKind::Within(_) => None,
+		})
+		.flatten()
 		.any(|op| matches!(op, MatchOp::PathExpand(_)));
-	let semantics = if plan.patterns.iter().any(pattern_uses_edge_endpoint) {
+	let semantics = if plan.atom || plan.patterns.iter().any(pattern_uses_edge_endpoint) {
 		TraversalSemantics::Atom
 	} else {
 		TraversalSemantics::Node
@@ -781,49 +799,263 @@ fn execute_match<Read: QueryRead>(
 	let index = (has_chain || has_path)
 		.then(|| TraversalIndex::new(graph.as_ref(), semantics).map(Rc::new))
 		.transpose()?;
-	let fields = GraphFields {
-		graph: graph.clone(),
-		dictionary: read.property_dictionary(snapshot),
-		records: RecordFields {
-			read,
-			snapshot,
-			graph: Some(&plan.graph),
-		},
+	let fields = MatchGraphFields::new(
+		read,
+		snapshot,
+		read.property_dictionary(snapshot),
+		graph_ref.clone(),
+	);
+	let scoped_index = physical
+		.uses_scoped_traversal()
+		.then(|| {
+			ScopedTraversalIndex::build(
+				read,
+				snapshot,
+				graph_ref.clone(),
+				&fields,
+				semantics,
+				control,
+			)
+			.map(Rc::new)
+		})
+		.transpose()?;
+	let match_predicate = MatchPredicateContext {
+		slots,
+		source,
+		fields: &fields,
 	};
 	let mut cursor: Box<dyn RowCursor + '_> = Box::new(OneRowCursor {
 		row: Some(Row::bindings(plan.bindings.columns.len())),
 	});
-	for pattern_index in physical.pattern_order {
-		let pattern = &plan.patterns[pattern_index];
-		let start = resolve_match_binding(&pattern.start, slots, source, control)?;
-		let candidates = read.match_candidates(snapshot, &plan.graph, &start)?;
-		cursor = Box::new(SeedCursor::new(cursor, graph.clone(), start, candidates));
-		for op in &pattern.ops {
-			cursor = match op {
-				MatchOp::Expand(expand) => {
-					let expand = resolve_expand(expand, slots, source, control)?;
-					if let Some(index) = &index {
-						Box::new(IndexExpandCursor::new(
-							cursor,
-							graph.clone(),
-							index.clone(),
-							expand,
-						))
-					} else {
-						Box::new(EdgeExpandCursor::new(cursor, graph.clone(), expand)?)
-					}
-				}
-				MatchOp::PathExpand(expand) => Box::new(PathExpandCursor::new(
+	for pattern_index in physical.pattern_order.iter().copied() {
+		let logical = &plan.patterns[pattern_index];
+		match &logical.kind {
+			LogicalMatchPatternKind::Linear(pattern) => {
+				let trace = pattern
+					.path_column
+					.map(|_column| Rc::new(RefCell::new(MatchPathTrace::new(control))));
+				let start = resolve_match_binding(&pattern.start, slots, source, control)?;
+				let candidates = read.match_candidates(snapshot, &plan.graph, &start)?;
+				cursor = Box::new(SeedCursor::new(
 					cursor,
 					graph.clone(),
-					index.clone().ok_or_else(|| {
-						FerrosGrynnError::invalid_argument(
-							"MATCH path expansion requires a traversal index.",
-						)
-					})?,
-					resolve_path_expand(expand, slots, source, control)?,
-				)),
-			};
+					graph_ref.clone(),
+					start,
+					plan.mode,
+					match_predicate,
+					candidates,
+				));
+				if let Some(arena) = &trace {
+					cursor = Box::new(PathTraceStartCursor {
+						input: cursor,
+						graph: graph.clone(),
+						graph_ref: graph_ref.clone(),
+						arena: arena.clone(),
+					});
+				}
+				for (operation_index, op) in pattern.ops.iter().enumerate() {
+					let operator =
+						physical.operation(pattern_index, operation_index).ok_or_else(|| {
+							FerrosGrynnError::invalid_argument(
+								"MATCH physical plan has no operator for a linear expansion.",
+							)
+						})?;
+					let scoped = physical.operation_is_scoped(pattern_index, operation_index);
+					cursor = match op {
+						MatchOp::Expand(expand) => {
+							let expand = resolve_expand(expand, slots, source, control, plan.mode)?;
+							if !matches!(
+								operator,
+								crate::gql::optimizer::MatchOperator::FixedExpand { .. }
+									| crate::gql::optimizer::MatchOperator::AtomExpand { .. }
+									| crate::gql::optimizer::MatchOperator::HyperExpand { .. }
+							) {
+								return Err(FerrosGrynnError::invalid_argument(
+									"MATCH physical plan selected a non-fixed operator for a \
+									 fixed expansion.",
+								));
+							}
+							if scoped {
+								let scoped_index = scoped_index.as_ref().ok_or_else(|| {
+									FerrosGrynnError::invalid_argument(
+										"MATCH physical plan requires scoped adjacency.",
+									)
+								})?;
+								Box::new(CrossLevelExpandCursor::new(
+									cursor,
+									read,
+									snapshot,
+									&fields,
+									scoped_index.clone(),
+									expand,
+									match_predicate,
+									trace.clone(),
+								))
+							} else if let Some(index) = &index {
+								Box::new(IndexExpandCursor::new(
+									cursor,
+									graph.clone(),
+									graph_ref.clone(),
+									index.clone(),
+									expand,
+									match_predicate,
+									trace.clone(),
+								))
+							} else {
+								Box::new(EdgeExpandCursor::new(
+									cursor,
+									graph.clone(),
+									graph_ref.clone(),
+									expand,
+									match_predicate,
+									trace.clone(),
+								)?)
+							}
+						}
+						MatchOp::PathExpand(expand) => {
+							let expand =
+								resolve_path_expand(expand, slots, source, control, plan.mode)?;
+							let shortest = matches!(
+								operator,
+								crate::gql::optimizer::MatchOperator::BreadthFirstShortest { .. }
+									| crate::gql::optimizer::MatchOperator::DijkstraShortest { .. }
+							);
+							if !shortest
+								&& !matches!(
+									operator,
+									crate::gql::optimizer::MatchOperator::PathEnumerate { .. }
+								) {
+								return Err(FerrosGrynnError::invalid_argument(
+									"MATCH physical plan selected a non-path operator for a path \
+									 expansion.",
+								));
+							}
+							if scoped {
+								let scoped_index = scoped_index.as_ref().ok_or_else(|| {
+									FerrosGrynnError::invalid_argument(
+										"MATCH physical plan requires scoped adjacency.",
+									)
+								})?;
+								if shortest {
+									Box::new(ScopedShortestPathCursor::new(
+										cursor,
+										read,
+										snapshot,
+										&fields,
+										scoped_index.clone(),
+										expand,
+										match_predicate,
+										trace.clone(),
+										graph.identity(),
+										graph.snapshot_id(),
+									))
+								} else {
+									Box::new(ScopedPathExpandCursor::new(
+										cursor,
+										read,
+										snapshot,
+										&fields,
+										scoped_index.clone(),
+										expand,
+										match_predicate,
+										trace.clone(),
+										graph.identity(),
+										graph.snapshot_id(),
+									))
+								}
+							} else if shortest {
+								let index = index.clone().ok_or_else(|| {
+									FerrosGrynnError::invalid_argument(
+										"MATCH path expansion requires a traversal index.",
+									)
+								})?;
+								Box::new(ShortestPathCursor::new(
+									cursor,
+									graph.clone(),
+									graph_ref.clone(),
+									index,
+									expand,
+									match_predicate,
+									trace.clone(),
+								))
+							} else {
+								let index = index.clone().ok_or_else(|| {
+									FerrosGrynnError::invalid_argument(
+										"MATCH path expansion requires a traversal index.",
+									)
+								})?;
+								Box::new(PathExpandCursor::new(
+									cursor,
+									graph.clone(),
+									graph_ref.clone(),
+									index,
+									expand,
+									match_predicate,
+									trace.clone(),
+								))
+							}
+						}
+					};
+				}
+				if let (Some(column), Some(arena)) = (pattern.path_column, trace) {
+					cursor = Box::new(PathBindCursor {
+						input: cursor,
+						arena,
+						column,
+						origin: graph.identity(),
+						snapshot: graph.snapshot_id(),
+					});
+				}
+			}
+			LogicalMatchPatternKind::Hyper(pattern) => {
+				let edge = resolve_match_binding(&pattern.edge, slots, source, control)?;
+				let contains = pattern
+					.contains
+					.iter()
+					.map(|group| {
+						Ok(ResolvedHyperContains {
+							side: group.side,
+							endpoints: group
+								.endpoints
+								.iter()
+								.map(|binding| {
+									resolve_match_binding(binding, slots, source, control)
+								})
+								.collect::<FerrosGrynnResult<Vec<_>>>()?,
+						})
+					})
+					.collect::<FerrosGrynnResult<Vec<_>>>()?;
+				cursor = Box::new(HyperContainsCursor::new(
+					cursor,
+					read,
+					snapshot,
+					&fields,
+					graph.clone(),
+					graph_ref.clone(),
+					edge,
+					contains,
+					plan.mode,
+					match_predicate,
+				)?);
+			}
+			LogicalMatchPatternKind::Within(pattern) => {
+				let relation = ResolvedWithin {
+					child: resolve_match_binding(&pattern.child, slots, source, control)?,
+					owner: resolve_match_binding(&pattern.owner, slots, source, control)?,
+					min: pattern.min,
+					max: pattern.max,
+				};
+				cursor = Box::new(WithinCursor::new(
+					cursor,
+					read,
+					snapshot,
+					graph_ref.clone(),
+					&fields,
+					relation,
+					plan.mode,
+					match_predicate,
+				));
+			}
 		}
 	}
 	if let Some(predicate) = &plan.filter {
@@ -835,13 +1067,38 @@ fn execute_match<Read: QueryRead>(
 			fields: Some(&fields),
 		});
 	}
-	cursor = Box::new(ProjectCursor {
+	if plan.optional {
+		cursor = Box::new(OptionalCursor {
+			input: cursor,
+			fallback: Some(Row::bindings(plan.bindings.columns.len())),
+			yielded: false,
+		});
+	}
+	if plan.binding_distinct {
+		cursor = distinct_rows(read, snapshot, cursor, control)?;
+	}
+	let random_seed = plan.order.iter().any(|order| order.random).then(|| {
+		control.statement_seed(
+			crate::gql::optimizer::PhysicalPlan::Match(physical.clone()).hash(),
+			snapshot.0,
+		)
+	});
+	cursor = Box::new(MatchProjectCursor {
 		input: cursor,
 		expressions: &plan.projection,
+		order: &plan.order,
 		slots,
 		source,
-		fields: Some(&fields),
+		fields: &fields,
+		random_seed,
+		ordinal: 0,
 	});
+	if plan.projection_distinct {
+		cursor = distinct_rows(read, snapshot, cursor, control)?;
+	}
+	if !plan.order.is_empty() || control.deterministic() {
+		cursor = sort_match_rows(read, snapshot, cursor, &plan.order, control)?;
+	}
 
 	let mut result = Array::new(Vec::new());
 	while let Some(row) = cursor.next(control).map_err(execution_phase)? {
@@ -859,17 +1116,45 @@ fn execute_match<Read: QueryRead>(
 
 /// Reports whether a pattern requires AtomWalk traversal semantics.
 fn pattern_uses_edge_endpoint(pattern: &LogicalMatchPattern) -> bool {
-	pattern.start.domain == EndpointDomain::Edge
-		|| pattern.ops.iter().any(|op| match op {
-			MatchOp::Expand(expand) => {
-				expand.source.domain == EndpointDomain::Edge
-					|| expand.target.domain == EndpointDomain::Edge
-			}
-			MatchOp::PathExpand(expand) => {
-				expand.source.domain == EndpointDomain::Edge
-					|| expand.target.domain == EndpointDomain::Edge
-			}
-		})
+	match &pattern.kind {
+		LogicalMatchPatternKind::Linear(pattern) => {
+			pattern.start.domain == EndpointDomain::Edge
+				|| pattern.ops.iter().any(|op| match op {
+					MatchOp::Expand(expand) => {
+						expand.source.domain == EndpointDomain::Edge
+							|| expand.target.domain == EndpointDomain::Edge
+					}
+					MatchOp::PathExpand(expand) => {
+						expand.source.domain == EndpointDomain::Edge
+							|| expand.target.domain == EndpointDomain::Edge
+					}
+				})
+		}
+		LogicalMatchPatternKind::Hyper(pattern) => pattern
+			.contains
+			.iter()
+			.flat_map(|group| &group.endpoints)
+			.any(|binding| binding.domain == EndpointDomain::Edge),
+		LogicalMatchPatternKind::Within(pattern) => {
+			pattern.child.domain == EndpointDomain::Edge
+				|| pattern.owner.domain == EndpointDomain::Edge
+		}
+	}
+}
+
+/// Reports whether a linear pattern explicitly requests cross-level branches.
+fn pattern_requires_scoped(pattern: &LogicalMatchPattern) -> bool {
+	let LogicalMatchPatternKind::Linear(pattern) = &pattern.kind else {
+		return false;
+	};
+	pattern.ops.iter().any(|operation| match operation {
+		MatchOp::Expand(expand) => {
+			expand.filters.contains(&crate::syn::MatchPathFilter::CrossLevel)
+		}
+		MatchOp::PathExpand(expand) => {
+			expand.filters.contains(&crate::syn::MatchPathFilter::CrossLevel)
+		}
+	})
 }
 
 #[cfg(test)]

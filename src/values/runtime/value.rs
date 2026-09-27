@@ -7,6 +7,7 @@ use std::{
 
 use super::{
 	Array,
+	AtomOccurrenceRef,
 	AtomRef,
 	Bytes,
 	Closure,
@@ -62,6 +63,7 @@ pub enum Value {
 	Regex(Regex),
 	Range(Range),
 	Atom(Box<AtomRef>),
+	AtomOccurrence(Box<AtomOccurrenceRef>),
 	Path(Box<Path>),
 	Graph(Box<MaterializedGraph>),
 	Closure(Box<Closure>),
@@ -94,6 +96,7 @@ impl Value {
 			Self::Regex(_) => ValueKind::Regex,
 			Self::Range(_) => ValueKind::Range,
 			Self::Atom(_) => ValueKind::Atom,
+			Self::AtomOccurrence(_) => ValueKind::AtomOccurrence,
 			Self::Path(_) => ValueKind::Path,
 			Self::Graph(value) if value.kind() == GraphKind::Subgraph => ValueKind::Subgraph,
 			Self::Graph(_) => ValueKind::Graph,
@@ -140,6 +143,8 @@ impl Value {
 			Self::Atom(value) => {
 				size_of::<AtomRef>().saturating_add(estimated_record_id_heap_bytes(value.id()))
 			}
+			Self::AtomOccurrence(value) => size_of::<AtomOccurrenceRef>()
+				.saturating_add(estimated_record_id_heap_bytes(value.atom().id())),
 			Self::Path(value) => size_of_val(value.as_ref()),
 			Self::Graph(value) => value.estimated_heap_bytes(),
 			Self::Closure(value) => size_of_val(value.as_ref())
@@ -182,6 +187,7 @@ impl Value {
 			| Self::Regex(_)
 			| Self::Range(_)
 			| Self::Atom(_)
+			| Self::AtomOccurrence(_)
 			| Self::Path(_)
 			| Self::Graph(_)
 			| Self::Closure(_) => true,
@@ -319,6 +325,13 @@ impl Value {
 		}
 	}
 
+	pub fn as_atom_occurrence(&self) -> Option<&AtomOccurrenceRef> {
+		match self {
+			Self::AtomOccurrence(value) => Some(value),
+			_ => None,
+		}
+	}
+
 	pub fn as_path(&self) -> Option<&Path> {
 		match self {
 			Self::Path(value) => Some(value),
@@ -379,6 +392,7 @@ impl Value {
 				start_storable && end_storable
 			}
 			Self::Regex(_)
+			| Self::AtomOccurrence(_)
 			| Self::Path(_)
 			| Self::Graph(_)
 			| Self::Closure(_)
@@ -516,6 +530,7 @@ impl Ord for Value {
 				(Self::Regex(left), Self::Regex(right)) => left.cmp(right),
 				(Self::Range(left), Self::Range(right)) => left.cmp(right),
 				(Self::Atom(left), Self::Atom(right)) => left.cmp(right),
+				(Self::AtomOccurrence(left), Self::AtomOccurrence(right)) => left.cmp(right),
 				(Self::Path(left), Self::Path(right)) => left.cmp(right),
 				(Self::Graph(left), Self::Graph(right)) => left.cmp(right),
 				(Self::Closure(left), Self::Closure(right)) => left.cmp(right),
@@ -550,6 +565,7 @@ impl Hash for Value {
 			Self::Regex(value) => value.hash(state),
 			Self::Range(value) => value.hash(state),
 			Self::Atom(value) => value.hash(state),
+			Self::AtomOccurrence(value) => value.hash(state),
 			Self::Path(value) => value.hash(state),
 			Self::Graph(value) => value.hash(state),
 			Self::Closure(value) => value.hash(state),

@@ -14,7 +14,12 @@ handle конкретного materialization и нужен в том числе
 - `Tree`, `RootedTree`, `Forest`, `Dag` и `Hypergraph` сохраняют отдельные
   structural invariants и layouts. Не заменять их номинальными wrapper-ами.
 - `Metagraph` использует general layout как явно зафиксированное исключение.
-- `Path` хранит стабильные `AtomRef`, а не snapshot-local `AtomId`.
+- `AtomOccurrenceRef` — snapshot-relative graph occurrence. Его equality/order/hash
+  определяются парой `{GraphId, AtomRef}`; graph name и storage mode в identity не
+  входят.
+- `PathStep` хранит occurrence endpoint и optional occurrence connector edge,
+  поэтому cross-level path может иметь endpoint в дочернем графе и
+  connector в родительском. `Path` не хранит snapshot-local `AtomId`.
 
 ## Карта владельцев
 
@@ -36,6 +41,9 @@ handle конкретного materialization и нужен в том числе
   публикации.
 - Алгоритмы принимают `GraphRead` и дают одну семантику для всех storage modes.
 - Graph equality/ordering не означает изоморфизм; не вводить скрытый deep scan.
+- `Path::resolve` с одним `GraphRead` применяется только к single-graph path.
+  Cross-graph consumers открывают graph по `PathStep::atom().graph()`; новый resolver
+  trait для этого не нужен.
 - `query_to_memory` освобождает исходный guard после копирования, а mutable
   hybrid сохраняет origin mapping и explicit dirty set.
 

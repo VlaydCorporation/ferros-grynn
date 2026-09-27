@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-25T23:11:26.234275+00:00",
+  "generated_at": "2026-09-26T17:49:27.887551+00:00",
   "nodes": {
     "agents_design_authority": {
       "code_fingerprint": "a348f251e7527b1e4de975c2638577066f1a9ae6e02dd57968884cb9f9325628",
@@ -12,7 +12,7 @@
           "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.622046775,
+      "score": 0.610987473,
       "source_file": "AGENTS.md",
       "status": "tentative",
       "uses": 1
@@ -28,7 +28,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.545361905,
+      "score": 0.535665975,
       "source_file": "crates/fg-meta/src/io_async.rs",
       "status": "tentative",
       "uses": 1
@@ -44,7 +44,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.545361905,
+      "score": 0.535665975,
       "source_file": "crates/surrealdb/surrealdb/core/src/idx/ft/fulltext.rs",
       "status": "tentative",
       "uses": 1
@@ -60,7 +60,7 @@
           "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.622046775,
+      "score": 0.610987473,
       "source_file": "docs/storage_engine_hybrid_integration_plan.md",
       "status": "tentative",
       "uses": 1
@@ -76,7 +76,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.545361905,
+      "score": 0.535665975,
       "source_file": "src/gql/execution/cursor/path.rs",
       "status": "tentative",
       "uses": 1
@@ -92,7 +92,7 @@
           "q": "What is MetaGraph?"
         }
       ],
-      "score": 0.341713872,
+      "score": 0.335638578,
       "source_file": "src/graph/metagraph.rs",
       "status": "tentative",
       "uses": 1
@@ -108,7 +108,7 @@
           "q": "Добавить точный layout label entry page и typed node/edge label key в combined statistics"
         }
       ],
-      "score": 0.724474511,
+      "score": 0.711594157,
       "source_file": "src/storage/graph_index/label_dict.rs",
       "status": "tentative",
       "uses": 1
@@ -124,7 +124,7 @@
           "q": "Добавить точный layout label entry page и typed node/edge label key в combined statistics"
         }
       ],
-      "score": 0.724474511,
+      "score": 0.711594157,
       "source_file": "src/storage/graph_index/label_dict.rs",
       "status": "tentative",
       "uses": 1
@@ -140,7 +140,7 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.522708688,
+      "score": 0.513415507,
       "source_file": "src/values/runtime/value.rs",
       "status": "tentative",
       "uses": 1

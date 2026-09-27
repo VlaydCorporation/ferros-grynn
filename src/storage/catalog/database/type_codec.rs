@@ -120,7 +120,7 @@ pub(super) fn encode(output: &mut Vec<u8>, value: &Type, depth: usize) -> Ferros
 		Type::Closure {
 			..
 		} => Tag::Closure,
-		Type::Error | Type::Cursor => {
+		Type::AtomOccurrence(_) | Type::Error | Type::Cursor => {
 			return Err(invalid("runtime-only values cannot appear in a durable schema"));
 		}
 	};
@@ -132,6 +132,9 @@ pub(super) fn encode(output: &mut Vec<u8>, value: &Type, depth: usize) -> Ferros
 		Type::Vector(kind) => output.push(vector_kind(*kind)),
 		Type::GraphRef(kind) | Type::Graph(kind) => output.push(graph_kind(*kind)),
 		Type::Atom(kind) => output.push(atom_kind(*kind)),
+		Type::AtomOccurrence(_) => {
+			return Err(invalid("runtime-only values cannot appear in a durable schema"));
+		}
 		Type::Union(values) => {
 			write_count(output, values.len())?;
 			for value in values {

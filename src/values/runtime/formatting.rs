@@ -47,6 +47,9 @@ impl Display for Value {
 			Self::Regex(value) => Display::fmt(value, f),
 			Self::Range(value) => Display::fmt(value, f),
 			Self::Atom(value) => Display::fmt(value.id(), f),
+			Self::AtomOccurrence(value) => {
+				write!(f, "{}@graph({})", value.atom().id(), value.graph().id())
+			}
 			Self::Path(value) => write!(
 				f,
 				"path({}@{}; length={})",

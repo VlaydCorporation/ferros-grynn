@@ -27,7 +27,10 @@ impl RowCursor for OneRowCursor {
 /// Resolves public fields for an atom bound in a MATCH row.
 pub(in crate::gql::execution) trait AtomFieldRead {
 	/// Reads `id`, `label`, or a dictionary-backed property.
-	fn field(&self, atom: AtomId, field: &str) -> FerrosGrynnResult<Value>;
+	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value>;
+
+	/// Returns the inner/transition graph owned by one occurrence.
+	fn inner_graph(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value>;
 
 	/// Reads a field through a stable database record reference.
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value>;
@@ -41,10 +44,15 @@ pub(in crate::gql::execution) struct RecordFields<'a, Read> {
 }
 
 impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
-	fn field(&self, atom: AtomId, _field: &str) -> FerrosGrynnResult<Value> {
+	fn field(&self, atom: BoundAtom, _field: &str) -> FerrosGrynnResult<Value> {
 		Err(FerrosGrynnError::invalid_argument(format!(
-			"SELECT row has no graph-local atom binding for {atom}."
+			"SELECT row has no graph-local atom binding for {}.",
+			atom.atom
 		)))
+	}
+
+	fn inner_graph(&self, _occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
+		Err(FerrosGrynnError::invalid_argument("graph::inner requires a MATCH atom occurrence"))
 	}
 
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
@@ -52,29 +60,77 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 	}
 }
 
-/// Atom field resolver sharing the current graph and property dictionary.
-pub(in crate::gql::execution) struct GraphFields<'a, Read, Graph> {
-	/// Snapshot graph view.
-	pub(in crate::gql::execution) graph: Rc<Graph>,
+/// Atom field resolver with a lazy cache of snapshot-visible graph references.
+pub(in crate::gql::execution) struct MatchGraphFields<'a, Read> {
+	pub(in crate::gql::execution) read: &'a Read,
+	pub(in crate::gql::execution) snapshot: Snapshot,
 	/// Snapshot property dictionary.
 	pub(in crate::gql::execution) dictionary: Arc<PropertyDictionary>,
-	/// Resolver for stable record references found in graph properties.
-	pub(in crate::gql::execution) records: RecordFields<'a, Read>,
+	references: RefCell<std::collections::BTreeMap<crate::graph::GraphId, Arc<GraphRef>>>,
 }
 
-impl<Read: QueryRead, Graph: GraphRead> AtomFieldRead for GraphFields<'_, Read, Graph> {
-	fn field(&self, atom: AtomId, field: &str) -> FerrosGrynnResult<Value> {
-		match atom.kind() {
+impl<'a, Read: QueryRead> MatchGraphFields<'a, Read> {
+	pub(in crate::gql::execution) fn new(
+		read: &'a Read,
+		snapshot: Snapshot,
+		dictionary: Arc<PropertyDictionary>,
+		root: Arc<GraphRef>,
+	) -> Self {
+		let references = std::collections::BTreeMap::from([(root.id(), root)]);
+		Self {
+			read,
+			snapshot,
+			dictionary,
+			references: RefCell::new(references),
+		}
+	}
+
+	pub(in crate::gql::execution) fn register(&self, reference: GraphRef) -> Arc<GraphRef> {
+		let graph = reference.id();
+		if let Some(reference) = self.references.borrow().get(&graph) {
+			return reference.clone();
+		}
+		let reference = Arc::new(reference);
+		self.references.borrow_mut().insert(graph, reference.clone());
+		reference
+	}
+
+	pub(in crate::gql::execution) fn reference(
+		&self,
+		graph: crate::graph::GraphId,
+	) -> FerrosGrynnResult<Arc<GraphRef>> {
+		if let Some(reference) = self.references.borrow().get(&graph) {
+			return Ok(reference.clone());
+		}
+		self.read.graph_reference(self.snapshot, graph).map(|reference| self.register(reference))
+	}
+}
+
+impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
+	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value> {
+		let reference = self.reference(atom.graph)?;
+		if field == "graph" {
+			return Ok(Value::GraphRef(Box::new(reference.as_ref().clone())));
+		}
+		let graph = self.read.graph(self.snapshot, &reference)?;
+		match atom.atom.kind() {
 			Some(AtomKind::Node) => {
-				let node = self.graph.node(atom)?.ok_or_else(|| {
-					FerrosGrynnError::atom_does_not_exist("node", atom.to_string())
+				let node = graph.node(atom.atom)?.ok_or_else(|| {
+					FerrosGrynnError::atom_does_not_exist("node", atom.atom.to_string())
 				})?;
+				let record = node.record_id()?;
 				match field {
-					"id" => Ok(Value::Record(Box::new(node.record_id()?.into_owned()))),
+					"id" => Ok(Value::Record(Box::new(record.clone().into_owned()))),
+					"class" => Ok(Value::from(record.class())),
+					"kind" => Ok(Value::from("node")),
 					"label" => Ok(node
 						.label_text()?
 						.map(|label| Value::String(label.into_owned()))
 						.unwrap_or(Value::None)),
+					"properties" => Ok(Value::Object(properties_object(
+						node.properties()?.as_ref(),
+						&self.dictionary,
+					)?)),
 					_ => {
 						let Some(key) = self.dictionary.get(field) else {
 							return Ok(Value::None);
@@ -84,15 +140,22 @@ impl<Read: QueryRead, Graph: GraphRead> AtomFieldRead for GraphFields<'_, Read, 
 				}
 			}
 			Some(AtomKind::Edge) => {
-				let edge = self.graph.edge(atom)?.ok_or_else(|| {
-					FerrosGrynnError::atom_does_not_exist("edge", atom.to_string())
+				let edge = graph.edge(atom.atom)?.ok_or_else(|| {
+					FerrosGrynnError::atom_does_not_exist("edge", atom.atom.to_string())
 				})?;
+				let record = edge.record_id()?;
 				match field {
-					"id" => Ok(Value::Record(Box::new(edge.record_id()?.into_owned()))),
+					"id" => Ok(Value::Record(Box::new(record.clone().into_owned()))),
+					"class" => Ok(Value::from(record.class())),
+					"kind" => Ok(Value::from("edge")),
 					"label" => Ok(edge
 						.label_text()?
 						.map(|label| Value::String(label.into_owned()))
 						.unwrap_or(Value::None)),
+					"properties" => Ok(Value::Object(properties_object(
+						edge.properties()?.as_ref(),
+						&self.dictionary,
+					)?)),
 					_ => {
 						let Some(key) = self.dictionary.get(field) else {
 							return Ok(Value::None);
@@ -101,13 +164,57 @@ impl<Read: QueryRead, Graph: GraphRead> AtomFieldRead for GraphFields<'_, Read, 
 					}
 				}
 			}
-			None => Err(FerrosGrynnError::atom_does_not_exist("atom", atom.to_string())),
+			None => Err(FerrosGrynnError::atom_does_not_exist("atom", atom.atom.to_string())),
 		}
 	}
 
-	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
-		self.records.record_field(record, field)
+	fn inner_graph(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
+		let owner = self.register(occurrence.graph().clone());
+		let graph = self.read.graph(self.snapshot, &owner)?;
+		let atom = graph.atom_id(occurrence.atom())?.ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist(
+				occurrence.atom().kind().to_string(),
+				occurrence.atom().id().to_string(),
+			)
+		})?;
+		let nested = match atom.kind() {
+			Some(AtomKind::Node) => graph
+				.node(atom)?
+				.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", atom.to_string()))?
+				.inner_graph_ref()?
+				.map(|value| value.into_owned()),
+			Some(AtomKind::Edge) => graph
+				.edge(atom)?
+				.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", atom.to_string()))?
+				.transition_graph_ref()?
+				.map(|value| value.into_owned()),
+			None => None,
+		};
+		Ok(nested.map_or(Value::None, |reference| {
+			let reference = self.register(reference);
+			Value::GraphRef(Box::new(reference.as_ref().clone()))
+		}))
 	}
+
+	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
+		self.read.record_field(self.snapshot, record, None, field)
+	}
+}
+
+fn properties_object(
+	properties: &crate::values::PropertyMap,
+	dictionary: &PropertyDictionary,
+) -> FerrosGrynnResult<Object> {
+	properties
+		.iter()
+		.map(|(key, value)| {
+			dictionary.resolve(key).cloned().map(|name| (name, value.clone())).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"MATCH property key is absent from the property dictionary",
+				)
+			})
+		})
+		.collect()
 }
 
 pub(in crate::gql::execution) struct FilterCursor<'a> {

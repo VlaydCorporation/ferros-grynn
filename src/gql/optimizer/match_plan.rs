@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 use super::{
 	Cardinality,
 	CostWeights,
+	MatchOperator,
+	PhysicalMatchNode,
 	PhysicalMatchPlan,
 	PlanCost,
 	PlanWarning,
@@ -18,6 +20,7 @@ use crate::{
 		EndpointDomain,
 		LogicalMatch,
 		LogicalMatchPattern,
+		LogicalMatchPatternKind,
 		LogicalMatchSelector,
 		MatchBinding,
 		MatchOp,
@@ -31,6 +34,7 @@ use crate::{
 pub(in crate::gql) fn plan_match(
 	statement: &LogicalMatch,
 	snapshot: &PlannerSnapshot,
+	deterministic: bool,
 ) -> FerrosGrynnResult<PhysicalMatchPlan> {
 	let graph = snapshot.graph(statement.graph.id()).ok_or_else(|| {
 		FerrosGrynnError::graph_does_not_exist(statement.graph.name().to_string())
@@ -41,6 +45,8 @@ pub(in crate::gql) fn plan_match(
 	let mut cardinality = Cardinality::exact(1);
 	let mut cost = PlanCost::default();
 	let mut warnings = Vec::new();
+	let mut pattern_estimates = vec![Cardinality::exact(0); statement.patterns.len()];
+	let mut pattern_costs = vec![PlanCost::default(); statement.patterns.len()];
 	while !remaining.is_empty() {
 		let mut best = None;
 		for (position, pattern_index) in remaining.iter().copied().enumerate() {
@@ -61,6 +67,8 @@ pub(in crate::gql) fn plan_match(
 		let (position, _key, estimate, candidate_cost, candidate_warnings) = best
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("MATCH planner has no candidate"))?;
 		let pattern_index = remaining.remove(position);
+		pattern_estimates[pattern_index] = estimate;
+		pattern_costs[pattern_index] = candidate_cost;
 		known.extend(pattern_columns(&statement.patterns[pattern_index]));
 		pattern_order.push(pattern_index);
 		cardinality = if pattern_order.len() == 1 {
@@ -77,12 +85,216 @@ pub(in crate::gql) fn plan_match(
 	}
 	warnings.sort_by_key(|warning| format!("{warning:?}"));
 	warnings.dedup();
+	let nodes = match_nodes(
+		statement,
+		graph,
+		&pattern_order,
+		&pattern_estimates,
+		&pattern_costs,
+		cardinality,
+		deterministic,
+	);
 	Ok(PhysicalMatchPlan {
 		pattern_order,
+		nodes,
 		cardinality,
 		cost,
 		warnings,
 	})
+}
+
+fn match_nodes(
+	statement: &LogicalMatch,
+	graph: &PlannerGraph,
+	pattern_order: &[usize],
+	pattern_estimates: &[Cardinality],
+	pattern_costs: &[PlanCost],
+	final_cardinality: Cardinality,
+	deterministic: bool,
+) -> Vec<PhysicalMatchNode> {
+	let mut nodes = Vec::new();
+	for (execution_index, pattern_index) in pattern_order.iter().copied().enumerate() {
+		let estimate = pattern_estimates[pattern_index];
+		if execution_index != 0 {
+			push_match_node(
+				&mut nodes,
+				Some(pattern_index),
+				None,
+				MatchOperator::MatchJoin,
+				estimate,
+				PlanCost::default(),
+			);
+		}
+		match &statement.patterns[pattern_index].kind {
+			LogicalMatchPatternKind::Linear(pattern) => {
+				push_match_node(
+					&mut nodes,
+					Some(pattern_index),
+					None,
+					MatchOperator::MatchSeed,
+					estimate,
+					pattern_costs[pattern_index],
+				);
+				for (operation_index, operation) in pattern.ops.iter().enumerate() {
+					let (filters, direction) = match operation {
+						MatchOp::Expand(expand) => (&expand.filters, expand.direction),
+						MatchOp::PathExpand(expand) => (&expand.filters, expand.direction),
+					};
+					let scoped = graph.reference.kind() == crate::graph::GraphKind::Metagraph
+						|| filters.contains(&crate::syn::MatchPathFilter::CrossLevel);
+					if scoped {
+						push_match_node(
+							&mut nodes,
+							Some(pattern_index),
+							Some(operation_index),
+							MatchOperator::ResolveNestedEndpoint,
+							estimate,
+							PlanCost::default(),
+						);
+					}
+					let operator = match operation {
+						MatchOp::Expand(expand)
+							if expand
+								.filters
+								.contains(&crate::syn::MatchPathFilter::HyperEdges) =>
+						{
+							MatchOperator::HyperExpand {
+								direction,
+							}
+						}
+						MatchOp::Expand(_) if statement.atom => MatchOperator::AtomExpand {
+							direction,
+						},
+						MatchOp::Expand(_) => MatchOperator::FixedExpand {
+							direction,
+						},
+						MatchOp::PathExpand(expand) => match expand.objective {
+							Some(crate::syn::MatchPathObjective::Shortest) => {
+								MatchOperator::BreadthFirstShortest {
+									direction,
+									mode: expand.mode,
+									min: expand.min,
+									max: expand.max,
+								}
+							}
+							Some(crate::syn::MatchPathObjective::WeightedShortest) => {
+								MatchOperator::DijkstraShortest {
+									direction,
+									mode: expand.mode,
+									min: expand.min,
+									max: expand.max,
+								}
+							}
+							None => MatchOperator::PathEnumerate {
+								direction,
+								mode: expand.mode,
+								min: expand.min,
+								max: expand.max,
+							},
+						},
+					};
+					push_match_node(
+						&mut nodes,
+						Some(pattern_index),
+						Some(operation_index),
+						operator,
+						estimate,
+						PlanCost::default(),
+					);
+				}
+			}
+			LogicalMatchPatternKind::Hyper(_) => push_match_node(
+				&mut nodes,
+				Some(pattern_index),
+				None,
+				MatchOperator::HyperContains,
+				estimate,
+				pattern_costs[pattern_index],
+			),
+			LogicalMatchPatternKind::Within(pattern) => push_match_node(
+				&mut nodes,
+				Some(pattern_index),
+				None,
+				if pattern.min == 1 && pattern.max == 1 {
+					MatchOperator::WithinJoin
+				} else {
+					MatchOperator::TransitiveWithin {
+						min: pattern.min,
+						max: pattern.max,
+					}
+				},
+				estimate,
+				pattern_costs[pattern_index],
+			),
+		}
+	}
+	if statement.optional {
+		push_match_node(
+			&mut nodes,
+			None,
+			None,
+			MatchOperator::OptionalFallback,
+			final_cardinality,
+			PlanCost::default(),
+		);
+	}
+	if statement.binding_distinct {
+		push_match_node(
+			&mut nodes,
+			None,
+			None,
+			MatchOperator::BindingDistinct,
+			final_cardinality,
+			PlanCost::default(),
+		);
+	}
+	push_match_node(
+		&mut nodes,
+		None,
+		None,
+		MatchOperator::MatchProject,
+		final_cardinality,
+		PlanCost::default(),
+	);
+	if statement.projection_distinct {
+		push_match_node(
+			&mut nodes,
+			None,
+			None,
+			MatchOperator::ProjectionDistinct,
+			final_cardinality,
+			PlanCost::default(),
+		);
+	}
+	if !statement.order.is_empty() || deterministic {
+		push_match_node(
+			&mut nodes,
+			None,
+			None,
+			MatchOperator::MatchOrder,
+			final_cardinality,
+			PlanCost::default(),
+		);
+	}
+	nodes
+}
+
+fn push_match_node(
+	nodes: &mut Vec<PhysicalMatchNode>,
+	pattern_index: Option<usize>,
+	operation_index: Option<usize>,
+	operator: MatchOperator,
+	cardinality: Cardinality,
+	cost: PlanCost,
+) {
+	nodes.push(PhysicalMatchNode {
+		node_id: u32::try_from(nodes.len()).unwrap_or(u32::MAX),
+		pattern_index,
+		operation_index,
+		operator,
+		cardinality,
+		cost,
+	});
 }
 
 fn estimate_pattern(
@@ -92,6 +304,40 @@ fn estimate_pattern(
 	graph_id: crate::graph::GraphId,
 ) -> (Cardinality, PlanCost, Vec<PlanWarning>) {
 	let mut warnings = Vec::new();
+	let pattern = match &pattern.kind {
+		LogicalMatchPatternKind::Linear(pattern) => pattern,
+		LogicalMatchPatternKind::Hyper(pattern) => {
+			let mut rows = binding_cardinality(&pattern.edge, graph, snapshot);
+			for endpoint in pattern.contains.iter().flat_map(|group| &group.endpoints) {
+				let endpoint_rows = binding_cardinality(endpoint, graph, snapshot);
+				rows = Cardinality::new(
+					0,
+					rows.expected.saturating_mul(endpoint_rows.expected.max(1)),
+					rows.upper.saturating_mul(endpoint_rows.upper.max(1)),
+				);
+			}
+			warnings.push(PlanWarning::ResourceRisk(
+				"hyperedge endpoint fanout uses a conservative estimate".into(),
+			));
+			return (rows, scan_cost(rows, 1, CostWeights::default()), warnings);
+		}
+		LogicalMatchPatternKind::Within(pattern) => {
+			let owner = binding_cardinality(&pattern.owner, graph, snapshot);
+			let child = binding_cardinality(&pattern.child, graph, snapshot);
+			warnings.push(PlanWarning::ResourceRisk(
+				"containment relation may require a visible-meta scan".into(),
+			));
+			let rows = Cardinality::new(
+				0,
+				owner.expected.saturating_mul(child.expected.max(1)),
+				owner
+					.upper
+					.saturating_mul(child.upper.max(1))
+					.saturating_mul(u64::from(pattern.max)),
+			);
+			return (rows, scan_cost(rows, 1, CostWeights::default()), warnings);
+		}
+	};
 	let mut rows = binding_cardinality(&pattern.start, graph, snapshot);
 	let mut cost = scan_cost(rows, 1, CostWeights::default());
 	for operation in &pattern.ops {
@@ -226,14 +472,36 @@ fn path_rows(seed: u64, degree: u64, minimum: u32, maximum: u32) -> u64 {
 }
 
 fn pattern_columns(pattern: &LogicalMatchPattern) -> impl Iterator<Item = usize> + '_ {
-	let start = pattern.start.column;
-	let operations = pattern.ops.iter().flat_map(|operation| match operation {
-		MatchOp::Expand(expand) => {
-			[expand.source.column, expand.edge.column, expand.target.column, None]
+	let mut columns = Vec::new();
+	match &pattern.kind {
+		LogicalMatchPatternKind::Linear(pattern) => {
+			columns.extend(pattern.start.column);
+			for operation in &pattern.ops {
+				match operation {
+					MatchOp::Expand(expand) => {
+						columns.extend(expand.source.column);
+						columns.extend(expand.edge.column);
+						columns.extend(expand.target.column);
+					}
+					MatchOp::PathExpand(expand) => {
+						columns.extend(expand.source.column);
+						columns.extend(expand.edge.column);
+						columns.extend(expand.target.column);
+						columns.extend(expand.path_column);
+					}
+				}
+			}
 		}
-		MatchOp::PathExpand(expand) => {
-			[expand.source.column, expand.edge.column, expand.target.column, expand.path_column]
+		LogicalMatchPatternKind::Hyper(pattern) => {
+			columns.extend(pattern.edge.column);
+			for endpoint in pattern.contains.iter().flat_map(|group| &group.endpoints) {
+				columns.extend(endpoint.column);
+			}
 		}
-	});
-	start.into_iter().chain(operations.flatten())
+		LogicalMatchPatternKind::Within(pattern) => {
+			columns.extend(pattern.child.column);
+			columns.extend(pattern.owner.column);
+		}
+	}
+	columns.into_iter()
 }

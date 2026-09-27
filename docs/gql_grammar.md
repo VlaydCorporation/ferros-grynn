@@ -9,11 +9,28 @@
 
 ---
 
-## Утверждённая грамматика P0–P2
+## Утверждённая грамматика этапов 15–16
 
-**Статус профиля:** `approved-for-implementation`. Полная EBNF ниже остаётся `draft`.
-Следующие правила имеют приоритет для текущего parser/runtime и намеренно задают
-меньшее подмножество языка:
+**Статус профиля:** `approved-for-implementation`. Этот профиль заменяет P0–P2 MATCH
+grammar. Полная EBNF находится в §6; канонический statement начинается с optional prefix,
+использует только `IN GRAPH` и завершает projection перед `ORDER BY`:
+
+```ebnf
+approved_match_stmt ::= [ "OPTIONAL" ] "MATCH" [ "DISTINCT" ] [ "ATOM" ]
+                        [ match_mode ] [ match_scope ] [ constraints_clause ]
+                        approved_pattern_list [ contains_clause ]
+                        graph_scope [ where_clause ] [ maxdepth_clause ] [ timeout_clause ]
+                        match_return [ order_clause ]
+```
+
+`OPTIONAL MATCH DISTINCT` допустим. `MATCH OPTIONAL`, MATCH-источник `FROM graph`,
+colon-alias `alias:Label` и другое положение `CONSTRAINTS` не имеют compatibility alias.
+`graph_scope ::= "IN" "GRAPH" graph_ref`, `graph_ref ::= name | param`.
+
+## Историческая грамматика P0–P2
+
+**Статус профиля:** `superseded`. Следующие правила сохраняются только как evidence исходного
+vertical slice и не задают принимаемый parser profile после M0:
 
 ```ebnf
 mvp_match_stmt ::= "MATCH" [ "ATOM" ] mvp_match_pattern_list
@@ -671,7 +688,7 @@ edge_atom     ::= "[" ( class_name | record_id ) [ "AS" alias ]
                   [ "LABEL" label_name ] [ object_lit ] "]"
 edge_dir_left  ::= "<-" | "-"
 edge_dir_right ::= "->" | "-"
-(* Комбинации: -[:E]->  (a→b) | <-[:E]-  (b→a) | -[:E]-  (undirected) | <-[:E]->  (bidirectional) *)
+(* Комбинации: -[E AS e]-> (a→b) | <-[E AS e]- (b→a) | -[E AS e]- (undirected) | <-[E AS e]-> (bidirectional) *)
 
 atom_relate_binary ::= atom_endpoint_ref atom_edge_dir_left
                        edge_atom atom_edge_dir_right atom_endpoint_ref
@@ -714,25 +731,21 @@ class либо exact `RecordId` связывающего edge. В `RELATE` со�
 ## 6. MATCH и паттерны графа
 
 ```ebnf
-match_stmt ::= "MATCH" [ match_cardinality ] [ match_mode ]
+match_stmt ::= [ "OPTIONAL" ] "MATCH" [ "DISTINCT" ]
                ( match_standard_head | match_atom_head )
+               [ contains_clause ]
                graph_scope
                [ where_clause ]
-               [ contains_clause ]
-               [ with_clause ]
-               [ order_clause ]
-               [ timeout_clause ]
                [ maxdepth_clause ]
-               [ constraints_clause ]
-               [ keep_clause ]
-               [ match_return ]
+               [ timeout_clause ]
+               match_return
+               [ order_clause ]
 
-match_cardinality ::= "OPTIONAL" | "DISTINCT"
 match_mode        ::= "REPEATABLE" "ELEMENTS" | "DIFFERENT" "EDGES" | "DIFFERENT" "ATOMS"
 match_scope       ::= "HYPER" | "META" | "METAVERTEX" | "METAEDGE"
 
-match_standard_head ::= [ match_scope ] [ constraints_clause ] match_pattern_list
-match_atom_head     ::= "ATOM" [ match_scope ] [ constraints_clause ] atom_match_pattern_list
+match_standard_head ::= [ match_mode ] [ match_scope ] [ constraints_clause ] match_pattern_list
+match_atom_head     ::= "ATOM" [ match_mode ] [ match_scope ] [ constraints_clause ] atom_match_pattern_list
 match_pattern_list ::= match_pattern { "," match_pattern }
 match_pattern      ::= [ alias "=" ] ( graph_pattern | hyper_pattern )
 atom_match_pattern_list ::= atom_match_pattern { "," atom_match_pattern }
@@ -835,6 +848,11 @@ exact `RecordId` либо `*`; `AS` вводит alias, `LABEL` ограничи
 `MATCH ATOM HYPER` каждый `contains_atom` обязан быть `atom_endpoint_pattern`.
 Kind задают delimiters и kind выбранного class; label никогда не меняет kind endpoint.
 
+Открытые `*` и `*min..` синтаксически допустимы. Анализатор нормализует их через
+`MAXDEPTH`, иначе через `FG_PATH_MAX_DEPTH = 30`; фактический max больше 30 отклоняется до
+исполнения. `WITHIN*[min..max]` имеет отдельный предел `FG_WITHIN_MAX_DEPTH = 7` и требует
+`min >= 1`.
+
 ---
 
 ## 7. Traversal Pipeline
@@ -851,7 +869,7 @@ traverse_source ::=
     | "FROM" ( record_id | param | idiom )   (* начать с конкретного атома *)
     | "FROM" match_stmt                       (* MATCH как источник *)
     | "FROM" select_stmt                      (* SELECT как источник *)
-    | "(" node_pattern ")"                    (* краткая форма: TRAVERSE (p:Person {...}) *)
+    | "(" node_pattern ")"                    (* краткая форма: TRAVERSE (Person AS p {...}) *)
 
 atom_traverse_source ::=
       "FROM" graph_expr pipeline_step

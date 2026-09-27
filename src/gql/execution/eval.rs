@@ -223,6 +223,27 @@ fn eval_current(
 		TypedExprKind::Builtin {
 			function,
 			arguments,
+		} if matches!(function, Builtin::GraphInner) => {
+			let argument = arguments.first().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("graph::inner requires one argument")
+			})?;
+			let value = eval_current(argument, row, slots, source, fields, current, control)?;
+			let Value::AtomOccurrence(occurrence) = value else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"graph::inner requires an atom occurrence",
+				));
+			};
+			fields
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument(
+						"graph::inner requires a MATCH field resolver",
+					)
+				})?
+				.inner_graph(&occurrence)
+		}
+		TypedExprKind::Builtin {
+			function,
+			arguments,
 		} => arguments
 			.iter()
 			.map(|argument| eval_current(argument, row, slots, source, fields, current, control))

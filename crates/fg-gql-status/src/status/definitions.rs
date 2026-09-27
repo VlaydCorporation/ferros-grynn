@@ -1233,6 +1233,20 @@ define_status_codes!(
 			maximum: u64 => DisplayValue,
 		},
 	},
+	PathExpansionLimitExceeded, "FG-54F11" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Query,
+		subcondition: "path expansion limit exceeded",
+		message: "MATCH considered more than the configured limit of {maximum} topology branches.",
+		params: {
+			maximum: u64 => DisplayValue,
+		},
+	},
 	UserThrown, "FG-52F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,

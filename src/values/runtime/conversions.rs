@@ -1,5 +1,6 @@
 use super::{
 	Array,
+	AtomOccurrenceRef,
 	AtomRef,
 	Bytes,
 	Closure,
@@ -330,6 +331,12 @@ impl TryFrom<Value> for RecordId {
 	}
 }
 
+impl From<AtomOccurrenceRef> for Value {
+	fn from(value: AtomOccurrenceRef) -> Self {
+		Self::AtomOccurrence(Box::new(value))
+	}
+}
+
 impl TryFrom<Value> for GraphRef {
 	type Error = FerrosGrynnError;
 
@@ -348,6 +355,17 @@ impl TryFrom<Value> for AtomRef {
 		match value {
 			Value::Atom(value) => Ok(*value),
 			value => Err(value_conversion_error(&value, "AtomRef")),
+		}
+	}
+}
+
+impl TryFrom<Value> for AtomOccurrenceRef {
+	type Error = FerrosGrynnError;
+
+	fn try_from(value: Value) -> Result<Self, Self::Error> {
+		match value {
+			Value::AtomOccurrence(value) => Ok(*value),
+			value => Err(value_conversion_error(&value, "AtomOccurrenceRef")),
 		}
 	}
 }

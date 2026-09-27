@@ -26,6 +26,7 @@ pub(in crate::syn) const COLUMNS: &str = "COLUMNS";
 pub(in crate::syn) const COMMENT: &str = "COMMENT";
 pub(in crate::syn) const COMMIT: &str = "COMMIT";
 pub(in crate::syn) const COMMITTED: &str = "COMMITTED";
+pub(in crate::syn) const CONSTRAINTS: &str = "CONSTRAINTS";
 pub(in crate::syn) const CONTENT: &str = "CONTENT";
 pub(in crate::syn) const CONTINUE: &str = "CONTINUE";
 pub(in crate::syn) const CONTAINS: &str = "CONTAINS";
@@ -44,11 +45,14 @@ pub(in crate::syn) const DELETE: &str = "DELETE";
 pub(in crate::syn) const DETACH: &str = "DETACH";
 pub(in crate::syn) const DESC: &str = "DESC";
 pub(in crate::syn) const DEFERRED: &str = "DEFERRED";
+pub(in crate::syn) const DIFFERENT: &str = "DIFFERENT";
 pub(in crate::syn) const DIFF: &str = "DIFF";
 pub(in crate::syn) const DETERMINISTIC: &str = "DETERMINISTIC";
 pub(in crate::syn) const DROP: &str = "DROP";
 pub(in crate::syn) const EDGE: &str = "EDGE";
+pub(in crate::syn) const EDGES: &str = "EDGES";
 pub(in crate::syn) const ELSE: &str = "ELSE";
+pub(in crate::syn) const ELEMENTS: &str = "ELEMENTS";
 pub(in crate::syn) const EFFECTIVE: &str = "EFFECTIVE";
 pub(in crate::syn) const END: &str = "END";
 pub(in crate::syn) const EVENTS: &str = "EVENTS";
@@ -71,7 +75,10 @@ pub(in crate::syn) const GEOMETRY: &str = "GEOMETRY";
 pub(in crate::syn) const GRAPH: &str = "GRAPH";
 pub(in crate::syn) const GRAPHS: &str = "GRAPHS";
 pub(in crate::syn) const GROUP: &str = "GROUP";
+pub(in crate::syn) const HEAD: &str = "HEAD";
 pub(in crate::syn) const HNSW: &str = "HNSW";
+pub(in crate::syn) const HYPER: &str = "HYPER";
+pub(in crate::syn) const HYPEREDGES: &str = "HYPEREDGES";
 pub(in crate::syn) const IF: &str = "IF";
 pub(in crate::syn) const IN: &str = "IN";
 pub(in crate::syn) const INVARIANTS: &str = "INVARIANTS";
@@ -95,6 +102,12 @@ pub(in crate::syn) const LAST: &str = "LAST";
 pub(in crate::syn) const LEFT: &str = "LEFT";
 pub(in crate::syn) const LIMIT: &str = "LIMIT";
 pub(in crate::syn) const MATCH: &str = "MATCH";
+pub(in crate::syn) const MAXDEPTH: &str = "MAXDEPTH";
+pub(in crate::syn) const META: &str = "META";
+pub(in crate::syn) const METAEDGE: &str = "METAEDGE";
+pub(in crate::syn) const METAEDGES: &str = "METAEDGES";
+pub(in crate::syn) const METAVERTEX: &str = "METAVERTEX";
+pub(in crate::syn) const METAVERTICES: &str = "METAVERTICES";
 pub(in crate::syn) const MODE: &str = "MODE";
 pub(in crate::syn) const MAINTAINED: &str = "MAINTAINED";
 pub(in crate::syn) const MERGE: &str = "MERGE";
@@ -106,6 +119,7 @@ pub(in crate::syn) const NULL: &str = "NULL";
 pub(in crate::syn) const NULLS: &str = "NULLS";
 pub(in crate::syn) const ON: &str = "ON";
 pub(in crate::syn) const ONLY: &str = "ONLY";
+pub(in crate::syn) const OPTIONAL: &str = "OPTIONAL";
 pub(in crate::syn) const OMIT: &str = "OMIT";
 pub(in crate::syn) const OFF: &str = "OFF";
 pub(in crate::syn) const OR: &str = "OR";
@@ -117,6 +131,7 @@ pub(in crate::syn) const READ: &str = "READ";
 pub(in crate::syn) const REPORT: &str = "REPORT";
 pub(in crate::syn) const REMOVE: &str = "REMOVE";
 pub(in crate::syn) const REJECT: &str = "REJECT";
+pub(in crate::syn) const REPEATABLE: &str = "REPEATABLE";
 pub(in crate::syn) const RELATE: &str = "RELATE";
 pub(in crate::syn) const REPLACE: &str = "REPLACE";
 pub(in crate::syn) const RESET: &str = "RESET";
@@ -131,11 +146,14 @@ pub(in crate::syn) const SERIALIZABLE: &str = "SERIALIZABLE";
 pub(in crate::syn) const SEGMENT: &str = "SEGMENT";
 pub(in crate::syn) const SET: &str = "SET";
 pub(in crate::syn) const SIZE: &str = "SIZE";
+pub(in crate::syn) const SHORTEST: &str = "SHORTEST";
+pub(in crate::syn) const SIMPLE: &str = "SIMPLE";
 pub(in crate::syn) const SNAPSHOT: &str = "SNAPSHOT";
 pub(in crate::syn) const SKIP: &str = "SKIP";
 pub(in crate::syn) const SPLIT: &str = "SPLIT";
 pub(in crate::syn) const START: &str = "START";
 pub(in crate::syn) const TEMPFILES: &str = "TEMPFILES";
+pub(in crate::syn) const TAIL: &str = "TAIL";
 pub(in crate::syn) const THEN: &str = "THEN";
 pub(in crate::syn) const TEXT: &str = "TEXT";
 pub(in crate::syn) const THROW: &str = "THROW";
@@ -155,33 +173,23 @@ pub(in crate::syn) const VIOLATION: &str = "VIOLATION";
 pub(in crate::syn) const WITH: &str = "WITH";
 pub(in crate::syn) const WHERE: &str = "WHERE";
 pub(in crate::syn) const WEIGHTED: &str = "WEIGHTED";
+pub(in crate::syn) const WITHIN: &str = "WITHIN";
+pub(in crate::syn) const WALK: &str = "WALK";
+
+pub(in crate::syn) const ACYCLIC: &str = "ACYCLIC";
+pub(in crate::syn) const ATOMS: &str = "ATOMS";
+pub(in crate::syn) const COST: &str = "COST";
+pub(in crate::syn) const CROSS_LEVEL: &str = "CROSS_LEVEL";
+pub(in crate::syn) const TRAIL: &str = "TRAIL";
 pub(in crate::syn) const WHEN: &str = "WHEN";
 pub(in crate::syn) const WHILE: &str = "WHILE";
 
 /// Statement starts recognized only to return the explicit unsupported status.
 pub(in crate::syn) const UNSUPPORTED_STATEMENTS: &[&str] =
-	&["OPTIONAL", "TRAVERSE", "BUILD", "SHOW", "KILL", "REBUILD", "COMPACT", "LIVE"];
+	&["TRAVERSE", "BUILD", "SHOW", "KILL", "REBUILD", "COMPACT", "LIVE"];
 
 /// MATCH modifiers recognized only to return the explicit unsupported status.
-pub(in crate::syn) const UNSUPPORTED_MATCH_MODIFIERS: &[&str] = &[
-	"OPTIONAL",
-	"DISTINCT",
-	"REPEATABLE",
-	"DIFFERENT",
-	"HYPER",
-	"META",
-	"METAVERTEX",
-	"METAEDGE",
-	"CONSTRAINTS",
-	"WITHIN",
-	"CROSS_LEVEL",
-	"WALK",
-	"TRAIL",
-	"SIMPLE",
-	"ACYCLIC",
-	"SHORTEST",
-	"WEIGHTED",
-];
+pub(in crate::syn) const UNSUPPORTED_MATCH_MODIFIERS: &[&str] = &["KEEP"];
 
 /// SELECT clauses recognized only to return the explicit unsupported status.
 pub(in crate::syn) const UNSUPPORTED_SELECT_CLAUSES: &[&str] =

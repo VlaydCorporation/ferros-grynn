@@ -188,17 +188,131 @@ pub(crate) struct PhysicalSelectPlan {
 	pub(crate) warnings: Vec<PlanWarning>,
 }
 
-/// Current MATCH seed ordering selected by the shared cost model.
+/// Concrete operator selected for one MATCH plan node.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum MatchOperator {
+	/// Binds the first endpoint of one pattern.
+	MatchSeed,
+	/// Joins another required pattern with the current binding row.
+	MatchJoin,
+	/// Expands one StandardPath connector.
+	FixedExpand {
+		direction: crate::syn::MatchDirection,
+	},
+	/// Expands one AtomWalk connector.
+	AtomExpand {
+		direction: crate::syn::MatchDirection,
+	},
+	/// Validates and opens a qualified endpoint in a nested graph.
+	ResolveNestedEndpoint,
+	/// Enumerates bounded paths with the selected uniqueness mode.
+	PathEnumerate {
+		direction: crate::syn::MatchDirection,
+		mode: crate::syn::MatchPathMode,
+		min: u32,
+		max: u32,
+	},
+	/// Finds one canonical unweighted shortest path per target.
+	BreadthFirstShortest {
+		direction: crate::syn::MatchDirection,
+		mode: crate::syn::MatchPathMode,
+		min: u32,
+		max: u32,
+	},
+	/// Finds one canonical weighted shortest path per target.
+	DijkstraShortest {
+		direction: crate::syn::MatchDirection,
+		mode: crate::syn::MatchPathMode,
+		min: u32,
+		max: u32,
+	},
+	/// Assigns endpoint positions of one hyperedge.
+	HyperContains,
+	/// Expands a connector constrained to hyperedge topology.
+	HyperExpand {
+		direction: crate::syn::MatchDirection,
+	},
+	/// Joins an atom with its direct containing owner.
+	WithinJoin,
+	/// Walks a bounded containment chain.
+	TransitiveWithin {
+		min: u32,
+		max: u32,
+	},
+	/// Emits the unchanged input row when the whole optional clause is empty.
+	OptionalFallback,
+	/// Deduplicates complete occurrence bindings.
+	BindingDistinct,
+	/// Projects MATCH result expressions.
+	MatchProject,
+	/// Deduplicates projected values.
+	ProjectionDistinct,
+	/// Orders projected values through the shared query sorter.
+	MatchOrder,
+}
+
+/// One stable-preorder MATCH plan node.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PhysicalMatchNode {
+	/// Stable node identifier used by EXPLAIN.
+	pub(crate) node_id: u32,
+	/// Logical pattern index, absent for clause-wide barriers.
+	pub(crate) pattern_index: Option<usize>,
+	/// Linear operation index, absent for pattern seeds and relation nodes.
+	pub(crate) operation_index: Option<usize>,
+	/// Selected physical operator.
+	pub(crate) operator: MatchOperator,
+	/// Operator output estimate.
+	pub(crate) cardinality: Cardinality,
+	/// Operator-local fixed-point cost.
+	pub(crate) cost: PlanCost,
+}
+
+/// Current MATCH operator sequence selected by the shared cost model.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PhysicalMatchPlan {
 	/// Pattern indexes in chosen execution order.
 	pub(crate) pattern_order: Vec<usize>,
+	/// Physical operators in stable execution preorder.
+	pub(crate) nodes: Vec<PhysicalMatchNode>,
 	/// Expected rows after the selected seed sequence.
 	pub(crate) cardinality: Cardinality,
 	/// Total estimated seed/expand cost.
 	pub(crate) cost: PlanCost,
 	/// Stable warnings emitted by planning.
 	pub(crate) warnings: Vec<PlanWarning>,
+}
+
+impl PhysicalMatchPlan {
+	/// Returns the selected expansion operator for one linear operation.
+	pub(crate) fn operation(
+		&self,
+		pattern_index: usize,
+		operation_index: usize,
+	) -> Option<&MatchOperator> {
+		self.nodes
+			.iter()
+			.find(|node| {
+				node.pattern_index == Some(pattern_index)
+					&& node.operation_index == Some(operation_index)
+					&& !matches!(node.operator, MatchOperator::ResolveNestedEndpoint)
+			})
+			.map(|node| &node.operator)
+	}
+
+	/// Returns whether a linear operation must resolve graph-scoped endpoints.
+	pub(crate) fn operation_is_scoped(&self, pattern_index: usize, operation_index: usize) -> bool {
+		self.nodes.iter().any(|node| {
+			node.pattern_index == Some(pattern_index)
+				&& node.operation_index == Some(operation_index)
+				&& matches!(node.operator, MatchOperator::ResolveNestedEndpoint)
+		})
+	}
+
+	/// Returns whether any selected operator can cross a graph boundary.
+	pub(crate) fn uses_scoped_traversal(&self) -> bool {
+		self.nodes.iter().any(|node| matches!(node.operator, MatchOperator::ResolveNestedEndpoint))
+	}
 }
 
 /// Write-side phase shown by EXPLAIN.
@@ -274,6 +388,10 @@ impl PhysicalPlan {
 			Self::Match(plan) => {
 				1_u8.hash(&mut writer);
 				plan.pattern_order.hash(&mut writer);
+				plan.nodes.hash(&mut writer);
+				plan.cardinality.hash(&mut writer);
+				plan.cost.hash(&mut writer);
+				plan.warnings.hash(&mut writer);
 			}
 			Self::Write(plan) => {
 				2_u8.hash(&mut writer);

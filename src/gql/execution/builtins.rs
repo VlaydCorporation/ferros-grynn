@@ -187,6 +187,29 @@ pub(super) fn execute(
 		Builtin::MetaId => meta_id(one(arguments)?),
 		Builtin::MetaClass => meta_class(one(arguments)?),
 		Builtin::MetaType => Ok(Value::from(one(arguments)?.value_type().to_string())),
+		Builtin::GraphInner => Err(FerrosGrynnError::invalid_argument(
+			"graph::inner requires the MATCH graph resolver",
+		)),
+		Builtin::PathAtoms => {
+			let path = path(one(arguments)?, "path::atoms")?;
+			Ok(Value::Array(Array::new(path.atoms().cloned().map(Value::from).collect())))
+		}
+		Builtin::PathNodes => {
+			let path = path(one(arguments)?, "path::nodes")?;
+			Ok(Value::Array(Array::new(path.nodes().cloned().map(Value::from).collect())))
+		}
+		Builtin::PathEdges => {
+			let path = path(one(arguments)?, "path::edges")?;
+			Ok(Value::Array(Array::new(path.edges().cloned().map(Value::from).collect())))
+		}
+		Builtin::PathLength => {
+			let path = path(one(arguments)?, "path::length")?;
+			length(path.length())
+		}
+		Builtin::PathCost => {
+			let path = path(one(arguments)?, "path::cost")?;
+			path.cost().map(Value::Number).map_or_else(|| length(path.length()), Ok)
+		}
 		Builtin::OptionIsSome => {
 			Ok(Value::Bool(!matches!(one(arguments)?, Value::None | Value::Null)))
 		}
@@ -221,6 +244,7 @@ fn meta_id(value: Value) -> FerrosGrynnResult<Value> {
 	match value {
 		Value::Record(record) => Ok(record.id().clone().into_value()),
 		Value::Atom(atom) => Ok(atom.id().id().clone().into_value()),
+		Value::AtomOccurrence(occurrence) => Ok(occurrence.atom().id().id().clone().into_value()),
 		_ => Err(type_error("meta::id", "record or atom")),
 	}
 }
@@ -229,6 +253,7 @@ fn meta_class(value: Value) -> FerrosGrynnResult<Value> {
 	match value {
 		Value::Record(record) => Ok(Value::from(record.class())),
 		Value::Atom(atom) => Ok(Value::from(atom.id().class())),
+		Value::AtomOccurrence(occurrence) => Ok(Value::from(occurrence.atom().id().class())),
 		_ => Err(type_error("meta::class", "record or atom")),
 	}
 }
@@ -279,6 +304,13 @@ fn set(value: Value, function: &str) -> FerrosGrynnResult<Set> {
 	match value {
 		Value::Set(value) => Ok(value),
 		_ => Err(type_error(function, "set")),
+	}
+}
+
+fn path(value: Value, function: &str) -> FerrosGrynnResult<Box<crate::graph::Path>> {
+	match value {
+		Value::Path(value) => Ok(value),
+		_ => Err(type_error(function, "path")),
 	}
 }
 

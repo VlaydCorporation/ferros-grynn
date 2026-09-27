@@ -1,31 +1,25 @@
 //! Transient, checksummed query runs shared by SELECT barriers and cursors.
 
+mod value_codec;
+
 use std::{
 	cmp::Ordering,
 	fs::{self, File},
 	io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
 	mem::size_of,
-	ops::Bound,
 	path::{Path, PathBuf},
 };
 
 use rapidhash::v3::rapidhash_v3;
 
+use self::value_codec::{decode_query_value, encode_query_value};
 use super::{
 	cursor::{CursorAnchor, CursorRecord},
 	options::BarrierAccount,
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::{
-		Array,
-		Value,
-		storage::{
-			EncodeContext,
-			StorageValue,
-			codec::{CanonicalCodec, DecodeLimits},
-		},
-	},
+	values::{Array, Value, storage::EncodeContext},
 };
 
 const MAGIC: &[u8; 8] = b"FGQRUN1\0";
@@ -520,27 +514,16 @@ fn merge_group(
 }
 
 fn encode_record(record: CursorRecord, context: &mut EncodeContext) -> FerrosGrynnResult<Vec<u8>> {
-	for value in record
-		.anchor
-		.order_keys
-		.iter()
-		.chain(&record.anchor.stable_key)
-		.chain(std::iter::once(&record.value))
-	{
-		ensure_spillable(value)?;
-	}
 	let value = Value::Array(Array::new(vec![
 		Value::Array(Array::new(record.anchor.order_keys)),
 		Value::Array(Array::new(record.anchor.stable_key)),
 		record.value,
 	]));
-	let storage = StorageValue::from_runtime(value, context)?;
-	CanonicalCodec::encode(storage.as_ref())
+	encode_query_value(value, context)
 }
 
 fn decode_record(bytes: &[u8], context: &EncodeContext) -> FerrosGrynnResult<CursorRecord> {
-	let value =
-		CanonicalCodec::decode(bytes, DecodeLimits::default())?.into_runtime(&context.decoder())?;
+	let value = decode_query_value(bytes, context)?;
 	let Value::Array(values) = value else {
 		return Err(invalid_run("query-run record is not an array"));
 	};
@@ -562,29 +545,6 @@ fn decode_record(bytes: &[u8], context: &EncodeContext) -> FerrosGrynnResult<Cur
 			stable_key: stable_key.into_iter().collect(),
 		},
 	})
-}
-
-fn ensure_spillable(value: &Value) -> FerrosGrynnResult<()> {
-	match value {
-		Value::Array(values) => values.iter().try_for_each(ensure_spillable),
-		Value::Set(values) => values.iter().try_for_each(ensure_spillable),
-		Value::Object(values) => values.values().try_for_each(ensure_spillable),
-		Value::Range(value) => {
-			for bound in [value.start(), value.end()] {
-				if let Bound::Included(value) | Bound::Excluded(value) = bound {
-					ensure_spillable(value)?;
-				}
-			}
-			Ok(())
-		}
-		Value::Regex(_)
-		| Value::Path(_)
-		| Value::Graph(_)
-		| Value::Closure(_)
-		| Value::Error(_)
-		| Value::Cursor(_) => Err(FerrosGrynnError::query_value_not_spillable(value.kind().to_string())),
-		_ => Ok(()),
-	}
 }
 
 fn estimated_record_bytes(record: &CursorRecord) -> usize {
@@ -662,10 +622,25 @@ fn run_io(operation: &str, source: std::io::Error) -> FerrosGrynnError {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use super::*;
 	use crate::{
 		gql::cursor::{CursorAnchor, CursorRecord},
-		values::{PropertyDictionary, QueryCursor},
+		graph::{EndpointRole, PathDirection, PathStep, SnapshotId},
+		values::{
+			AtomKind,
+			AtomOccurrenceRef,
+			AtomRef,
+			GraphId,
+			GraphKind,
+			GraphRef,
+			GraphStorageMode,
+			Path,
+			PropertyDictionary,
+			QueryCursor,
+			storage::DiskGraphRef,
+		},
 	};
 
 	fn scratch(name: &str) -> PathBuf {
@@ -776,6 +751,63 @@ mod tests {
 			!query_root.exists() || fs::read_dir(&query_root).unwrap().next().is_none(),
 			"failed spill must not retain a query-run session"
 		);
+		drop(fs::remove_dir_all(root));
+	}
+
+	#[test]
+	fn occurrence_and_path_round_trip_through_disk_run() {
+		let root = scratch("occurrence-path");
+		let graph = Arc::new(
+			GraphRef::new(
+				GraphId::new(9).unwrap(),
+				"knowledge",
+				GraphKind::Graph,
+				GraphStorageMode::InMemory,
+			)
+			.unwrap(),
+		);
+		let atom = AtomRef::new(AtomKind::Node, "person:1".parse().unwrap());
+		let occurrence = AtomOccurrenceRef::new(atom, graph.clone());
+		let path = Path::new(
+			crate::values::Uuid::new_v4(),
+			SnapshotId::new(3, 4),
+			vec![PathStep::new(
+				occurrence.clone(),
+				None,
+				PathDirection::Forward,
+				EndpointRole::Source,
+			)],
+			Some(0_i64.into()),
+		);
+		let expected = CursorRecord {
+			anchor: CursorAnchor {
+				order_keys: vec![Value::from(occurrence.clone())],
+				stable_key: vec![Value::from(occurrence)],
+			},
+			value: Value::from(path),
+		};
+		let mut context = EncodeContext::new(PropertyDictionary::new());
+		context.register_class_name(1, "person".into()).unwrap();
+		context.register_graph(graph.as_ref().clone(), DiskGraphRef::new(graph.id())).unwrap();
+		let mut sorter = QuerySorter::new(
+			&root,
+			context,
+			vec![SortField {
+				descending: false,
+				nulls_first: false,
+			}],
+			BarrierAccount::new(1),
+			true,
+		)
+		.unwrap();
+		sorter.push(expected.clone()).unwrap();
+		let mut stream = sorter.finish().unwrap().into_stream().unwrap();
+		let actual = stream.next().unwrap().unwrap();
+		assert_eq!(actual.anchor.order_keys, expected.anchor.order_keys);
+		assert_eq!(actual.anchor.stable_key, expected.anchor.stable_key);
+		assert_eq!(actual.value, expected.value);
+		assert!(stream.next().unwrap().is_none());
+		drop(stream);
 		drop(fs::remove_dir_all(root));
 	}
 }

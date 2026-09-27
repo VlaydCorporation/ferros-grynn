@@ -1,7 +1,10 @@
 use std::{
 	borrow::Cow,
+	cmp::Ordering,
 	collections::BTreeMap,
 	fmt::{self, Display, Formatter},
+	hash::{Hash, Hasher},
+	sync::Arc,
 };
 
 use super::{AtomId, AtomKind, EdgeTopology, Frozen, Graph, GraphId};
@@ -225,6 +228,68 @@ impl Display for SnapshotId {
 pub struct AtomRef {
 	kind: AtomKind,
 	id: RecordId,
+}
+
+/// One stable atom identity in one catalog graph occurrence.
+///
+/// [`AtomRef`] identifies the database-global atom, while this type supplies
+/// the graph scope required for graph-local labels, properties, and topology.
+#[derive(Debug, Clone)]
+pub struct AtomOccurrenceRef {
+	atom: AtomRef,
+	graph: Arc<GraphRef>,
+}
+
+impl AtomOccurrenceRef {
+	/// Creates an occurrence in the supplied catalog graph.
+	pub const fn new(atom: AtomRef, graph: Arc<GraphRef>) -> Self {
+		Self {
+			atom,
+			graph,
+		}
+	}
+
+	/// Returns the database-global atom identity.
+	pub const fn atom(&self) -> &AtomRef {
+		&self.atom
+	}
+
+	/// Returns the graph scope of this occurrence.
+	pub fn graph(&self) -> &GraphRef {
+		self.graph.as_ref()
+	}
+
+	/// Splits this occurrence into its global atom and shared graph reference.
+	pub fn into_parts(self) -> (AtomRef, Arc<GraphRef>) {
+		(self.atom, self.graph)
+	}
+}
+
+impl PartialEq for AtomOccurrenceRef {
+	fn eq(&self, other: &Self) -> bool {
+		self.cmp(other) == Ordering::Equal
+	}
+}
+
+impl Eq for AtomOccurrenceRef {}
+
+impl PartialOrd for AtomOccurrenceRef {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for AtomOccurrenceRef {
+	fn cmp(&self, other: &Self) -> Ordering {
+		(self.graph.id(), &self.atom).cmp(&(other.graph.id(), &other.atom))
+	}
+}
+
+impl Hash for AtomOccurrenceRef {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.graph.id().hash(state);
+		self.atom.hash(state);
+	}
 }
 
 impl AtomRef {

@@ -431,7 +431,7 @@ impl Parser<'_> {
 		Ok(expressions)
 	}
 
-	async fn select_order_list(
+	pub(in crate::syn) async fn select_order_list(
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<Vec<SelectOrder>> {
@@ -494,7 +494,7 @@ impl Parser<'_> {
 		Ok(paths)
 	}
 
-	fn graph_reference_expr(&mut self) -> FerrosGrynnResult<Expr> {
+	pub(in crate::syn) fn graph_reference_expr(&mut self) -> FerrosGrynnResult<Expr> {
 		let token = self.tokens.next();
 		match token.kind {
 			TokenKind::Parameter(value) => Ok(Expr {

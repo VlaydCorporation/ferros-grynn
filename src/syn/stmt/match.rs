@@ -1,120 +1,42 @@
 #![allow(
 	clippy::wildcard_imports,
-	reason = "move-only statement split keeps the existing parser imports during stage 1"
+	reason = "MATCH syntax shares the parser vocabulary while remaining isolated from analysis"
 )]
 
 use super::*;
 
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct MatchStatement {
-	pub atom: bool,
-	pub patterns: Vec<MatchPattern>,
-	pub source: Identifier,
-	pub filter: Option<Expr>,
-	pub projection: Vec<MatchReturnItem>,
-}
+mod constraints;
+mod model;
 
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct MatchPattern {
-	pub path_alias: Option<Identifier>,
-	pub start: MatchEndpoint,
-	pub steps: Vec<MatchStep>,
-	pub span: TextSpan,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct MatchEndpoint {
-	pub kind: MatchEndpointKind,
-	pub selector: MatchSelector,
-	pub alias: Option<Identifier>,
-	pub label: Option<Identifier>,
-	pub span: TextSpan,
-}
-
-/// Class, exact record, or wildcard selected by one graph-pattern position.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum MatchSelector {
-	Any(TextSpan),
-	Class(Identifier),
-	Record {
-		class: Identifier,
-		key: Expr,
-		span: TextSpan,
-	},
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MatchEndpointKind {
-	Node,
-	Edge,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct MatchStep {
-	pub direction: MatchDirection,
-	pub edge: MatchEdge,
-	pub target: MatchEndpoint,
-	pub span: TextSpan,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct MatchEdge {
-	pub selector: MatchSelector,
-	pub alias: Option<Identifier>,
-	pub label: Option<Identifier>,
-	pub length: Option<MatchLength>,
-	pub span: TextSpan,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MatchDirection {
-	Forward,
-	Backward,
-	Undirected,
-	Bidirectional,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct MatchLength {
-	pub min: u32,
-	pub max: u32,
-	pub span: TextSpan,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct MatchReturnItem {
-	pub expr: Expr,
-	pub alias: Option<Identifier>,
-	pub span: TextSpan,
-}
+pub use model::*;
 
 impl Parser<'_> {
-	/// Parses the approved read-only MATCH statement profile.
+	/// Parses the canonical StandardPath and graph-first MATCH syntax.
 	pub(in crate::syn) async fn match_statement(
 		&mut self,
 		context: &mut Stk,
+		optional: bool,
 	) -> FerrosGrynnResult<MatchStatement> {
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
+		if self.at_keyword(keywords::OPTIONAL) {
+			return Err(self.syntax(
+				"Use `OPTIONAL MATCH`; `MATCH OPTIONAL` is not valid.",
+				self.current().span,
+			));
 		}
+		let binding_distinct = self.consume_keyword(keywords::DISTINCT).is_some();
 		let atom = self.consume_keyword(keywords::ATOM).is_some();
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
+		let mode = self.match_mode()?;
+		let hyper = self.consume_keyword(keywords::HYPER).is_some();
+		let meta_scope = self.match_meta_scope();
+		let constraints = self.global_match_constraints()?;
 
 		let mut patterns = Vec::new();
 		loop {
-			patterns.push(self.match_pattern(context, atom).await?);
+			patterns.push(if hyper {
+				MatchPattern::Hyper(self.match_hyper_pattern(context, atom).await?)
+			} else {
+				self.match_linear_or_within_pattern(context, atom).await?
+			});
 			if self.consume_symbol(Symbol::Comma).is_none() {
 				break;
 			}
@@ -122,24 +44,89 @@ impl Parser<'_> {
 				return Err(self.syntax("Expected a MATCH pattern after `,`.", self.current().span));
 			}
 		}
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
-		self.expect_keyword(keywords::IN, "Expected `IN GRAPH graph_name` after MATCH patterns.")?;
+		self.expect_keyword(keywords::IN, "Expected `IN GRAPH graph_ref` after MATCH patterns.")?;
 		self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `IN` in MATCH statement.")?;
-		let source = self.identifier()?;
+		let source = self.graph_reference_expr()?;
 		let filter = if self.consume_keyword(keywords::WHERE).is_some() {
 			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else {
 			None
 		};
+		let max_depth = if self.consume_keyword(keywords::MAXDEPTH).is_some() {
+			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
+		} else {
+			None
+		};
+		let timeout = if self.consume_keyword(keywords::TIMEOUT).is_some() {
+			Some(self.timeout_value()?)
+		} else {
+			None
+		};
 		self.expect_keyword(keywords::RETURN, "Expected `RETURN` in MATCH statement.")?;
-		if let Some(token) = self.consume_keyword(keywords::DISTINCT) {
-			return Err(self.unsupported("RETURN DISTINCT", token.span));
-		}
 		if self.at_keyword(keywords::GRAPH) {
 			return Err(self.unsupported("graph-return", self.current().span));
 		}
+		let projection_distinct = self.consume_keyword(keywords::DISTINCT).is_some();
+		let projection = self.match_projection(context).await?;
+		let order = if self.consume_keyword(keywords::ORDER).is_some() {
+			self.expect_keyword(keywords::BY, "Expected `BY` after MATCH ORDER.")?;
+			self.select_order_list(context).await?
+		} else {
+			Vec::new()
+		};
+		Ok(MatchStatement {
+			optional,
+			binding_distinct,
+			atom,
+			mode,
+			hyper,
+			meta_scope,
+			constraints,
+			patterns,
+			source,
+			filter,
+			max_depth,
+			timeout,
+			projection_distinct,
+			projection,
+			order,
+		})
+	}
+
+	fn match_mode(&mut self) -> FerrosGrynnResult<MatchMode> {
+		if self.consume_keyword(keywords::REPEATABLE).is_some() {
+			self.expect_keyword(keywords::ELEMENTS, "Expected `ELEMENTS` after `REPEATABLE`.")?;
+			Ok(MatchMode::RepeatableElements)
+		} else if self.consume_keyword(keywords::DIFFERENT).is_some() {
+			if self.consume_keyword(keywords::EDGES).is_some() {
+				Ok(MatchMode::DifferentEdges)
+			} else if self.consume_keyword(keywords::ATOMS).is_some() {
+				Ok(MatchMode::DifferentAtoms)
+			} else {
+				Err(self
+					.syntax("Expected `EDGES` or `ATOMS` after `DIFFERENT`.", self.current().span))
+			}
+		} else {
+			Ok(MatchMode::DifferentEdges)
+		}
+	}
+
+	fn match_meta_scope(&mut self) -> MatchMetaScope {
+		if self.consume_keyword(keywords::META).is_some() {
+			MatchMetaScope::Meta
+		} else if self.consume_keyword(keywords::METAVERTEX).is_some() {
+			MatchMetaScope::MetaVertex
+		} else if self.consume_keyword(keywords::METAEDGE).is_some() {
+			MatchMetaScope::MetaEdge
+		} else {
+			MatchMetaScope::None
+		}
+	}
+
+	async fn match_projection(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Vec<MatchReturnItem>> {
 		let mut projection = Vec::new();
 		loop {
 			let expr = context.run(|context| self.expression(context, 0, 1, 0)).await?;
@@ -158,17 +145,10 @@ impl Parser<'_> {
 				break;
 			}
 		}
-		Ok(MatchStatement {
-			atom,
-			patterns,
-			source,
-			filter,
-			projection,
-		})
+		Ok(projection)
 	}
 
-	/// Parses one StandardPath or AtomWalk chain.
-	async fn match_pattern(
+	async fn match_linear_or_within_pattern(
 		&mut self,
 		context: &mut Stk,
 		atom: bool,
@@ -184,6 +164,19 @@ impl Parser<'_> {
 		};
 		let start = self.match_endpoint(context, atom).await?;
 		let pattern_start = path_alias.as_ref().map_or(start.span, |alias| alias.span);
+		if self.consume_keyword(keywords::WITHIN).is_some() {
+			if path_alias.is_some() {
+				return Err(self.syntax("WITHIN is not a traversal Path.", pattern_start));
+			}
+			let depth = self.match_within_depth()?;
+			let owner = self.match_endpoint(context, atom).await?;
+			return Ok(MatchPattern::Within(MatchWithinPattern {
+				span: cover(pattern_start, owner.span),
+				child: start,
+				owner,
+				depth,
+			}));
+		}
 		let mut steps = Vec::new();
 		while self.at_match_step(atom) {
 			steps.push(if atom {
@@ -193,46 +186,116 @@ impl Parser<'_> {
 			});
 		}
 		let end = steps.last().map_or(start.span, |step| step.span);
-		Ok(MatchPattern {
+		Ok(MatchPattern::Linear(MatchLinearPattern {
 			path_alias,
 			start,
 			steps,
 			span: cover(pattern_start, end),
+		}))
+	}
+
+	async fn match_hyper_pattern(
+		&mut self,
+		context: &mut Stk,
+		atom: bool,
+	) -> FerrosGrynnResult<MatchHyperPattern> {
+		let edge = self.match_bare_edge_endpoint(context).await?;
+		self.expect_keyword(keywords::CONTAINS, "Expected `CONTAINS` after a HYPER edge.")?;
+		let mut contains = Vec::new();
+		loop {
+			let start = self.current().span;
+			let side = if self.consume_keyword(keywords::HEAD).is_some() {
+				MatchHyperSide::Head
+			} else if self.consume_keyword(keywords::TAIL).is_some() {
+				MatchHyperSide::Tail
+			} else {
+				MatchHyperSide::Any
+			};
+			let open =
+				self.expect_symbol(Symbol::LeftBracket, "Expected `[` after HYPER CONTAINS.")?;
+			let mut endpoints = Vec::new();
+			loop {
+				endpoints.push(self.match_endpoint(context, atom).await?);
+				if self.consume_symbol(Symbol::Comma).is_none() {
+					break;
+				}
+			}
+			let close = self.close(Symbol::RightBracket, open.span, "`]`")?;
+			contains.push(MatchContains {
+				side,
+				endpoints,
+				span: cover(start, close.span),
+			});
+			if self.consume_symbol(Symbol::Comma).is_none()
+				|| !(self.at_keyword(keywords::HEAD)
+					|| self.at_keyword(keywords::TAIL)
+					|| self.at_symbol(Symbol::LeftBracket))
+			{
+				break;
+			}
+		}
+		let end = contains.last().map_or(edge.span, |group| group.span);
+		Ok(MatchHyperPattern {
+			span: cover(edge.span, end),
+			edge,
+			contains,
 		})
 	}
 
-	/// Parses one node or explicit AtomWalk edge endpoint.
+	fn match_within_depth(&mut self) -> FerrosGrynnResult<MatchWithinDepth> {
+		let start = self.previous_span();
+		if self.consume_symbol(Symbol::Star).is_none() {
+			return Ok(MatchWithinDepth {
+				min: 1,
+				max: Some(1),
+				span: start,
+			});
+		}
+		let open = self.expect_symbol(Symbol::LeftBracket, "Expected `[` after `WITHIN*`.")?;
+		let (min, _) = self.match_length_bound()?;
+		self.expect_symbol(Symbol::Range, "Expected `..` in a WITHIN depth range.")?;
+		let max = if matches!(&self.current().kind, TokenKind::Number(_)) {
+			Some(self.match_length_bound()?.0)
+		} else {
+			None
+		};
+		let close = self.close(Symbol::RightBracket, open.span, "`]`")?;
+		Ok(MatchWithinDepth {
+			min,
+			max,
+			span: cover(start, close.span),
+		})
+	}
+
 	async fn match_endpoint(
 		&mut self,
 		context: &mut Stk,
 		atom: bool,
 	) -> FerrosGrynnResult<MatchEndpoint> {
-		let outer = atom
-			.then(|| self.expect_symbol(Symbol::Less, "Expected `<` before AtomWalk endpoint."))
-			.transpose()?;
+		let outer = if atom {
+			Some(self.expect_symbol(Symbol::Less, "Expected `<` before AtomWalk endpoint.")?)
+		} else {
+			self.consume_symbol(Symbol::Less)
+		};
+		let meta = outer.is_some() && !atom;
 		let open = self.tokens.next();
 		let (kind, close_symbol, close_name) = match open.kind {
 			TokenKind::Symbol(Symbol::LeftParen) => {
 				(MatchEndpointKind::Node, Symbol::RightParen, "`)`")
 			}
-			TokenKind::Symbol(Symbol::LeftBracket) if atom => {
+			TokenKind::Symbol(Symbol::LeftBracket) if atom || meta => {
 				(MatchEndpointKind::Edge, Symbol::RightBracket, "`]`")
 			}
-			_ if atom => {
-				return Err(self.syntax("Expected `(` or `[` inside AtomWalk endpoint.", open.span));
+			_ if atom || meta => {
+				return Err(self.syntax("Expected `(` or `[` inside MATCH endpoint.", open.span));
 			}
 			_ => return Err(self.syntax("Expected `(` to start MATCH endpoint.", open.span)),
 		};
 		let (selector, alias, label) = self.match_binding(context).await?;
-		if self.at_symbol(Symbol::LeftBrace) {
-			return Err(self.unsupported("inline MATCH property objects", self.current().span));
-		}
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
+		let (properties, predicate) = self.match_inline_filters(context).await?;
 		let close = self.close(close_symbol, open.span, close_name)?;
-		let end = if atom {
-			self.expect_symbol(Symbol::Greater, "Expected `>` after AtomWalk endpoint.")?
+		let end = if outer.is_some() {
+			self.expect_symbol(Symbol::Greater, "Expected `>` after MATCH endpoint.")?
 		} else {
 			close
 		};
@@ -241,12 +304,51 @@ impl Parser<'_> {
 			selector,
 			alias,
 			label,
+			properties,
+			predicate,
+			meta,
 			span: cover(outer.as_ref().map_or(open.span, |token| token.span), end.span),
 		})
 	}
 
-	/// Parses a required selector followed by independent alias and label
-	/// clauses.
+	async fn match_bare_edge_endpoint(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<MatchEndpoint> {
+		let open =
+			self.expect_symbol(Symbol::LeftBracket, "Expected `[` to start a HYPER edge.")?;
+		let (selector, alias, label) = self.match_binding(context).await?;
+		let (properties, predicate) = self.match_inline_filters(context).await?;
+		let close = self.close(Symbol::RightBracket, open.span, "`]`")?;
+		Ok(MatchEndpoint {
+			kind: MatchEndpointKind::Edge,
+			selector,
+			alias,
+			label,
+			properties,
+			predicate,
+			meta: false,
+			span: cover(open.span, close.span),
+		})
+	}
+
+	async fn match_inline_filters(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<(Option<Expr>, Option<Expr>)> {
+		let properties = if self.at_symbol(Symbol::LeftBrace) {
+			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
+		} else {
+			None
+		};
+		let predicate = if self.consume_keyword(keywords::WHERE).is_some() {
+			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
+		} else {
+			None
+		};
+		Ok((properties, predicate))
+	}
+
 	async fn match_binding(
 		&mut self,
 		context: &mut Stk,
@@ -262,8 +364,6 @@ impl Parser<'_> {
 		Ok((selector, alias, label))
 	}
 
-	/// Parses the wildcard, class, or exact RecordId at a graph-pattern
-	/// position.
 	async fn match_selector(&mut self, context: &mut Stk) -> FerrosGrynnResult<MatchSelector> {
 		if let Some(star) = self.consume_symbol(Symbol::Star) {
 			return Ok(MatchSelector::Any(star.span));
@@ -286,7 +386,6 @@ impl Parser<'_> {
 		}
 	}
 
-	/// Parses one StandardPath connector and target endpoint.
 	async fn standard_match_step(&mut self, context: &mut Stk) -> FerrosGrynnResult<MatchStep> {
 		let prefix = self.tokens.next();
 		let TokenKind::Symbol(prefix_symbol) = prefix.kind else {
@@ -297,37 +396,32 @@ impl Parser<'_> {
 		let (direction, edge) = if bracketed {
 			let open = self.expect_symbol(Symbol::LeftBracket, "Expected `[` in MATCH edge.")?;
 			let (selector, alias, label, length) = self.match_edge_binding(context, true).await?;
-			if self.at_symbol(Symbol::LeftBrace) {
-				return Err(self.unsupported("inline MATCH property objects", self.current().span));
-			}
-			if let Some(feature) = self.unsupported_match_modifier() {
-				return Err(self.unsupported(feature, self.current().span));
-			}
+			let (properties, predicate) = self.match_inline_filters(context).await?;
+			let (constraints, custom_cost) = self.local_match_constraints()?;
 			self.close(Symbol::RightBracket, open.span, "`]`")?;
 			let suffix = self.tokens.next();
 			let suffix_symbol = match suffix.kind {
 				TokenKind::Symbol(Symbol::Minus) => Symbol::Minus,
 				TokenKind::Symbol(Symbol::ArrowRight) => Symbol::ArrowRight,
-				_ => {
-					return Err(self.syntax("Expected `-` or `->` after MATCH edge.", suffix.span));
-				}
+				_ => return Err(self.syntax("Expected `-` or `->` after MATCH edge.", suffix.span)),
 			};
 			let direction = match (prefix_symbol, suffix_symbol) {
 				(Symbol::Minus, Symbol::ArrowRight) => MatchDirection::Forward,
 				(Symbol::ArrowLeft, Symbol::Minus) => MatchDirection::Backward,
 				(Symbol::Minus, Symbol::Minus) => MatchDirection::Undirected,
 				(Symbol::ArrowLeft, Symbol::ArrowRight) => MatchDirection::Bidirectional,
-				_ => {
-					return Err(self.syntax("Invalid StandardPath direction.", suffix.span));
-				}
+				_ => return Err(self.syntax("Invalid StandardPath direction.", suffix.span)),
 			};
-			let span = cover(prefix.span, suffix.span);
 			(direction, MatchEdge {
 				selector,
 				alias,
 				label,
+				properties,
+				predicate,
 				length,
-				span,
+				constraints,
+				custom_cost,
+				span: cover(prefix.span, suffix.span),
 			})
 		} else {
 			let direction = match prefix_symbol {
@@ -337,13 +431,7 @@ impl Parser<'_> {
 				Symbol::ArrowBoth => MatchDirection::Bidirectional,
 				_ => return Err(self.syntax("Expected a StandardPath edge.", prefix.span)),
 			};
-			(direction, MatchEdge {
-				selector: MatchSelector::Any(prefix.span),
-				alias: None,
-				label: None,
-				length: None,
-				span: prefix.span,
-			})
+			(direction, self.anonymous_match_edge(prefix.span))
 		};
 		let target = self.match_endpoint(context, false).await?;
 		Ok(MatchStep {
@@ -354,7 +442,6 @@ impl Parser<'_> {
 		})
 	}
 
-	/// Parses one AtomWalk connector and target endpoint.
 	async fn atom_match_step(&mut self, context: &mut Stk) -> FerrosGrynnResult<MatchStep> {
 		let prefix = self.tokens.next();
 		let left = match prefix.kind {
@@ -362,13 +449,12 @@ impl Parser<'_> {
 			TokenKind::Symbol(Symbol::LeftTildeLeftBracket) => true,
 			_ => return Err(self.syntax("Expected an AtomWalk `~[...]~` edge.", prefix.span)),
 		};
-		let (selector, alias, label, _length) = self.match_edge_binding(context, false).await?;
-		if self.at_symbol(Symbol::LeftBrace) {
-			return Err(self.unsupported("inline MATCH property objects", self.current().span));
+		let (selector, alias, label, length) = self.match_edge_binding(context, false).await?;
+		if length.is_some() {
+			return Err(self.syntax("AtomWalk connectors do not accept path ranges.", prefix.span));
 		}
-		if let Some(feature) = self.unsupported_match_modifier() {
-			return Err(self.unsupported(feature, self.current().span));
-		}
+		let (properties, predicate) = self.match_inline_filters(context).await?;
+		let (constraints, custom_cost) = self.local_match_constraints()?;
 		let suffix = self.tokens.next();
 		let right = match suffix.kind {
 			TokenKind::Symbol(Symbol::RightBracketTilde) => false,
@@ -387,7 +473,11 @@ impl Parser<'_> {
 			selector,
 			alias,
 			label,
+			properties,
+			predicate,
 			length: None,
+			constraints,
+			custom_cost,
 			span: cover(prefix.span, suffix.span),
 		};
 		let target = self.match_endpoint(context, true).await?;
@@ -399,7 +489,6 @@ impl Parser<'_> {
 		})
 	}
 
-	/// Parses connector alias, labels, and an optional finite range.
 	async fn match_edge_binding(
 		&mut self,
 		context: &mut Stk,
@@ -413,7 +502,9 @@ impl Parser<'_> {
 		let (selector, alias, label) = self.match_binding(context).await?;
 		let length = if let Some(star) = self.consume_symbol(Symbol::Star) {
 			if !allow_length {
-				return Err(self.unsupported("AtomWalk variable paths", star.span));
+				return Err(
+					self.syntax("AtomWalk connectors do not accept path ranges.", star.span)
+				);
 			}
 			Some(self.match_length(star.span)?)
 		} else {
@@ -422,7 +513,6 @@ impl Parser<'_> {
 		Ok((selector, alias, label, length))
 	}
 
-	/// Parses a finite exact or bounded StandardPath length.
 	fn match_length(&mut self, star: TextSpan) -> FerrosGrynnResult<MatchLength> {
 		let first = if matches!(&self.current().kind, TokenKind::Number(_)) {
 			Some(self.match_length_bound()?)
@@ -430,30 +520,33 @@ impl Parser<'_> {
 			None
 		};
 		if self.consume_symbol(Symbol::Range).is_some() {
-			let Some((max, max_span)) = (matches!(&self.current().kind, TokenKind::Number(_)))
-				.then(|| self.match_length_bound())
-				.transpose()?
-			else {
-				return Err(self.unsupported("unbounded MATCH paths", self.current().span));
+			let maximum = if matches!(&self.current().kind, TokenKind::Number(_)) {
+				Some(self.match_length_bound()?)
+			} else {
+				None
 			};
 			let min = first.map_or(1, |(value, _span)| value);
+			let end = maximum.map_or_else(|| self.previous_span(), |(_value, span)| span);
 			return Ok(MatchLength {
 				min,
-				max,
-				span: cover(star, max_span),
+				max: maximum.map(|(value, _span)| value),
+				span: cover(star, end),
 			});
 		}
-		let Some((value, value_span)) = first else {
-			return Err(self.unsupported("unbounded MATCH paths", star));
-		};
+		if let Some((value, value_span)) = first {
+			return Ok(MatchLength {
+				min: value,
+				max: Some(value),
+				span: cover(star, value_span),
+			});
+		}
 		Ok(MatchLength {
-			min: value,
-			max: value,
-			span: cover(star, value_span),
+			min: 1,
+			max: None,
+			span: star,
 		})
 	}
 
-	/// Parses one unsigned path-length bound with its source span.
 	fn match_length_bound(&mut self) -> FerrosGrynnResult<(u32, TextSpan)> {
 		let token = self.tokens.next();
 		let TokenKind::Number(value) = token.kind else {
@@ -466,7 +559,20 @@ impl Parser<'_> {
 			.map_err(|_error| self.syntax("Path length is out of range.", token.span))
 	}
 
-	/// Reports whether the current token starts another MATCH step.
+	fn anonymous_match_edge(&self, span: TextSpan) -> MatchEdge {
+		MatchEdge {
+			selector: MatchSelector::Any(span),
+			alias: None,
+			label: None,
+			properties: None,
+			predicate: None,
+			length: None,
+			constraints: MatchConstraints::default(),
+			custom_cost: None,
+			span,
+		}
+	}
+
 	fn at_match_step(&self, atom: bool) -> bool {
 		if atom {
 			self.at_symbol(Symbol::TildeLeftBracket) || self.at_symbol(Symbol::LeftTildeLeftBracket)
@@ -476,13 +582,5 @@ impl Parser<'_> {
 				|| self.at_symbol(Symbol::ArrowRight)
 				|| self.at_symbol(Symbol::ArrowBoth)
 		}
-	}
-
-	/// Classifies deferred MATCH syntax for typed diagnostics.
-	fn unsupported_match_modifier(&self) -> Option<&'static str> {
-		keywords::UNSUPPORTED_MATCH_MODIFIERS
-			.iter()
-			.copied()
-			.find(|keyword| self.at_keyword(keyword))
 	}
 }

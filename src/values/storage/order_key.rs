@@ -49,6 +49,7 @@ pub fn validate_index_type(value_type: &Type) -> FerrosGrynnResult<()> {
 		| Type::Graph(_)
 		| Type::Union(_)
 		| Type::RecordShape(_)
+		| Type::AtomOccurrence(_)
 		| Type::Error
 		| Type::Cursor
 		| Type::Closure {
