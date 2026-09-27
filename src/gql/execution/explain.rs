@@ -7,10 +7,13 @@ use crate::{
 		MatchOperator,
 		PhysicalPlan,
 		PhysicalSelectPlan,
+		PhysicalTraversalPlan,
 		PlanCost,
 		PlannerDemand,
 		PlannerSnapshot,
 		SourceOperator,
+		TraversalOperator,
+		TraversalSourceOperator,
 	},
 	syn::{ExplainFormat, ExplainMode},
 };
@@ -56,6 +59,7 @@ pub(super) fn execute_explain<Read: QueryRead>(
 		planning_snapshot,
 		control.barrier_memory_limit(),
 		control.deterministic(),
+		control.fast(),
 	)?;
 	let planning_ns = nanos(planning_started.elapsed());
 	let observation = if explain.mode == ExplainMode::Analyze {
@@ -77,7 +81,7 @@ pub(super) fn execute_explain<Read: QueryRead>(
 			depth + 1,
 			false,
 		)? {
-			ControlFlow::Value(value) => value,
+			ControlFlow::Value(value) | ControlFlow::Return(value) => value,
 			ControlFlow::Break | ControlFlow::Continue => {
 				return Err(FerrosGrynnError::invalid_argument(
 					"EXPLAIN ANALYZE statement returned loop control.",
@@ -147,6 +151,7 @@ fn physical_plan(
 	snapshot: &PlannerSnapshot,
 	barrier_bytes: usize,
 	deterministic: bool,
+	fast: bool,
 ) -> FerrosGrynnResult<PhysicalPlan> {
 	match statement {
 		LogicalStatement::Select(select) => {
@@ -157,6 +162,14 @@ fn physical_plan(
 			crate::gql::optimizer::plan_match(statement, snapshot, deterministic)
 				.map(PhysicalPlan::Match)
 		}
+		LogicalStatement::Traverse(statement) => crate::gql::optimizer::plan_traverse(
+			statement,
+			snapshot,
+			barrier_bytes,
+			deterministic,
+			fast,
+		)
+		.map(PhysicalPlan::Traversal),
 		LogicalStatement::Schema(_) | LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => {
 			Ok(PhysicalPlan::Write(crate::gql::optimizer::plan_write(statement, snapshot)))
 		}
@@ -244,7 +257,9 @@ fn explain_text(
 		lines.push(format!(
 			"  actual rows={} pulls={} affected={} elapsed_ns={} spill_bytes={} spill_runs={} \
 			 peak_memory={} path_expansions={} frontier_peak={} trace_nodes={} graph_opens={} \
-			 containment_links={} hyper_assignments={} cancellation_checks={} publication={}",
+			 containment_links={} hyper_assignments={} cancellation_checks={} physical_windows={} \
+			 physical_resident_pages={} physical_wal_pages={} physical_sync_pages={} \
+			 physical_ioring_pages={} publication={}",
 			observation.actual_rows,
 			observation.pulls,
 			observation.affected_rows,
@@ -259,6 +274,11 @@ fn explain_text(
 			observation.match_metrics.containment_links,
 			observation.match_metrics.hyper_assignments,
 			observation.match_metrics.cancellation_checks,
+			observation.match_metrics.physical_windows,
+			observation.match_metrics.physical_resident_pages,
+			observation.match_metrics.physical_wal_pages,
+			observation.match_metrics.physical_sync_pages,
+			observation.match_metrics.physical_ioring_pages,
 			observation.publication,
 		));
 	}
@@ -294,6 +314,17 @@ fn logical_nodes(statement: &LogicalStatement) -> Vec<Value> {
 				push_node(&mut nodes, id, "Pattern", Some(Cardinality::unknown(u64::MAX)), None);
 			}
 		}
+		LogicalStatement::Traverse(statement) => {
+			push_node(&mut nodes, 0, "TraverseSource", None, None);
+			for step in &statement.steps {
+				let id = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+				push_node(&mut nodes, id, &format!("{:?}", step.kind), None, None);
+			}
+			if statement.returning.is_some() {
+				let id = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+				push_node(&mut nodes, id, "Project", None, None);
+			}
+		}
 		LogicalStatement::Schema(_) => push_node(&mut nodes, 0, "CatalogMutation", None, None),
 		LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => {
 			push_node(&mut nodes, 0, "TargetSelection", None, None);
@@ -327,6 +358,7 @@ fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value>
 				Value::Object(node)
 			})
 			.collect(),
+		PhysicalPlan::Traversal(plan) => traversal_nodes(plan),
 		PhysicalPlan::Write(plan) => plan
 			.operators
 			.iter()
@@ -340,6 +372,111 @@ fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value>
 				))
 			})
 			.collect(),
+	}
+}
+
+fn traversal_nodes(plan: &PhysicalTraversalPlan) -> Vec<Value> {
+	plan.nodes
+		.iter()
+		.map(|planned| {
+			let mut node = node_object(
+				planned.node_id,
+				traversal_operator_name(planned.operator),
+				Some(planned.cardinality),
+				Some(planned.cost),
+			);
+			if let Some(step) = planned.step_index {
+				node.insert("step_index", u64::try_from(step).unwrap_or(u64::MAX));
+			}
+			if let Some(hash) = planned.nested_plan_hash {
+				node.insert("nested_plan_hash", hash);
+			}
+			node.insert("unordered", planned.unordered);
+			if let TraversalOperator::Step(kind) = planned.operator {
+				node.insert("barrier", kind.is_barrier());
+			}
+			Value::Object(node)
+		})
+		.collect()
+}
+
+fn traversal_operator_name(operator: TraversalOperator) -> &'static str {
+	match operator {
+		TraversalOperator::Source(TraversalSourceOperator::ValueSource) => "ValueSource",
+		TraversalOperator::Source(TraversalSourceOperator::MatchSource) => "MatchSource",
+		TraversalOperator::Source(TraversalSourceOperator::SelectSource) => "SelectSource",
+		TraversalOperator::Project => "Project",
+		TraversalOperator::Step(kind) => traversal_step_name(kind),
+	}
+}
+
+fn traversal_step_name(kind: TraverseStepKind) -> &'static str {
+	match kind {
+		TraverseStepKind::Vertices => "Vertices",
+		TraverseStepKind::Edges => "Edges",
+		TraverseStepKind::Out => "Out",
+		TraverseStepKind::In => "In",
+		TraverseStepKind::Both => "Both",
+		TraverseStepKind::OutEdges => "OutEdges",
+		TraverseStepKind::InEdges => "InEdges",
+		TraverseStepKind::BothEdges => "BothEdges",
+		TraverseStepKind::InVertex => "InVertex",
+		TraverseStepKind::OutVertex => "OutVertex",
+		TraverseStepKind::Hyper => "Hyper",
+		TraverseStepKind::MetaInner => "MetaInner",
+		TraverseStepKind::HasAttribute => "HasAttribute",
+		TraverseStepKind::Has => "Has",
+		TraverseStepKind::HasLabel => "HasLabel",
+		TraverseStepKind::Where => "Where",
+		TraverseStepKind::Deduplicate => "Deduplicate",
+		TraverseStepKind::DeduplicateBy => "DeduplicateBy",
+		TraverseStepKind::SimplePath => "SimplePath",
+		TraverseStepKind::CyclicPath => "CyclicPath",
+		TraverseStepKind::Map => "Map",
+		TraverseStepKind::FlatMap => "FlatMap",
+		TraverseStepKind::Values => "Values",
+		TraverseStepKind::Select => "Select",
+		TraverseStepKind::Match => "Match",
+		TraverseStepKind::As => "As",
+		TraverseStepKind::Project => "Project",
+		TraverseStepKind::Unfold => "Unfold",
+		TraverseStepKind::InitializeSack => "InitializeSack",
+		TraverseStepKind::Sack => "Sack",
+		TraverseStepKind::GetSack => "GetSack",
+		TraverseStepKind::InitializeNamedSack => "InitializeNamedSack",
+		TraverseStepKind::NamedSack => "NamedSack",
+		TraverseStepKind::GetNamedSack => "GetNamedSack",
+		TraverseStepKind::SideEffect => "SideEffect",
+		TraverseStepKind::Path => "Path",
+		TraverseStepKind::Emit => "Emit",
+		TraverseStepKind::Limit => "Limit",
+		TraverseStepKind::Skip => "Skip",
+		TraverseStepKind::Repeat => "Repeat",
+		TraverseStepKind::Branch => "Branch",
+		TraverseStepKind::Choose => "Choose",
+		TraverseStepKind::Coalesce => "Coalesce",
+		TraverseStepKind::Order => "Order",
+		TraverseStepKind::Group => "Group",
+		TraverseStepKind::Fold => "Fold",
+		TraverseStepKind::Count => "Count",
+		TraverseStepKind::Sum => "Sum",
+		TraverseStepKind::Minimum => "Minimum",
+		TraverseStepKind::Maximum => "Maximum",
+		TraverseStepKind::Average => "Average",
+		TraverseStepKind::KHop => "KHop",
+		TraverseStepKind::Reachable => "Reachable",
+		TraverseStepKind::ShortestPath => "ShortestPath",
+		TraverseStepKind::WeightedShortestPath => "WeightedShortestPath",
+		TraverseStepKind::DistanceTo => "DistanceTo",
+		TraverseStepKind::BellmanFord => "BellmanFord",
+		TraverseStepKind::TopologicalSort => "TopologicalSort",
+		TraverseStepKind::StronglyConnectedComponents => "StronglyConnectedComponents",
+		TraverseStepKind::WeaklyConnectedComponents => "WeaklyConnectedComponents",
+		TraverseStepKind::Condensation => "Condensation",
+		TraverseStepKind::MinimumSpanningForest => "MinimumSpanningForest",
+		TraverseStepKind::Cuts => "Cuts",
+		TraverseStepKind::LowestCommonAncestor => "LowestCommonAncestor",
+		TraverseStepKind::HasCycle => "HasCycle",
 	}
 }
 
@@ -550,6 +687,21 @@ fn ordering_projection(
 	statement: &LogicalStatement,
 	plan: &PhysicalPlan,
 ) -> (Vec<Value>, &'static str) {
+	if let (LogicalStatement::Traverse(statement), PhysicalPlan::Traversal(plan)) =
+		(statement, plan)
+	{
+		let ordered = statement.steps.iter().any(|step| step.kind == TraverseStepKind::Order);
+		return (
+			ordered.then(|| Value::from("tv::order")).into_iter().collect(),
+			if ordered {
+				"traversal_barrier_order"
+			} else if plan.nodes.iter().any(|node| node.unordered) {
+				"unordered_fast"
+			} else {
+				"encounter_order"
+			},
+		);
+	}
 	let LogicalStatement::Select(select) = statement else {
 		return (Vec::new(), "not_applicable");
 	};
@@ -621,6 +773,11 @@ fn observation_object(value: AnalyzeObservation) -> Object {
 	object.insert("containment_links", value.match_metrics.containment_links);
 	object.insert("hyper_assignments", value.match_metrics.hyper_assignments);
 	object.insert("cancellation_checks", value.match_metrics.cancellation_checks);
+	object.insert("physical_windows", value.match_metrics.physical_windows);
+	object.insert("physical_resident_pages", value.match_metrics.physical_resident_pages);
+	object.insert("physical_wal_pages", value.match_metrics.physical_wal_pages);
+	object.insert("physical_sync_pages", value.match_metrics.physical_sync_pages);
+	object.insert("physical_ioring_pages", value.match_metrics.physical_ioring_pages);
 	object.insert("publication_state", value.publication);
 	object
 }
@@ -629,6 +786,7 @@ fn plan_warnings(plan: &PhysicalPlan) -> Vec<Value> {
 	let warnings = match plan {
 		PhysicalPlan::Select(plan) => &plan.warnings,
 		PhysicalPlan::Match(plan) => &plan.warnings,
+		PhysicalPlan::Traversal(plan) => &plan.warnings,
 		PhysicalPlan::Write(_) => return Vec::new(),
 	};
 	warnings
@@ -646,6 +804,9 @@ fn plan_warnings(plan: &PhysicalPlan) -> Vec<Value> {
 				}
 				crate::gql::optimizer::PlanWarning::ResourceRisk(detail) => {
 					("resource_risk", detail)
+				}
+				crate::gql::optimizer::PlanWarning::ExecutionLimited(detail) => {
+					("execution_limited", detail)
 				}
 			};
 			Value::from(format!("{code}: {detail}"))
@@ -696,6 +857,7 @@ fn statement_name(statement: &LogicalStatement) -> &'static str {
 	match statement {
 		LogicalStatement::Select(_) => "SELECT",
 		LogicalStatement::Match(_) => "MATCH",
+		LogicalStatement::Traverse(_) => "TRAVERSE",
 		LogicalStatement::Dml(statement) => match statement.kind {
 			LogicalDmlKind::Create => "CREATE",
 			LogicalDmlKind::Update => "UPDATE",

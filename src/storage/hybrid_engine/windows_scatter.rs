@@ -305,7 +305,8 @@ impl<'engine> ScatterPrefetchCursor<'engine> {
 						ordinal,
 						result,
 					})
-					.is_err() || terminal
+					.is_err()
+					|| terminal
 				{
 					break;
 				}

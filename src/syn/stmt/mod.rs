@@ -10,6 +10,7 @@ mod r#return;
 mod schema;
 mod select;
 mod transaction;
+mod traverse;
 
 pub use control::{
 	AssertInvariantsStatement,
@@ -89,6 +90,7 @@ pub use transaction::{
 	ExecutionModeName,
 	TransactionIsolationName,
 };
+pub use traverse::{TraverseSource, TraverseStatement, TraverseStep};
 
 use super::{
 	ast::{Expr, ExprKind, Identifier, TypeName, cover},
@@ -153,6 +155,7 @@ pub enum StatementKind {
 	Relate(RelateStatement),
 	Return(ReturnStatement),
 	Select(SelectStatement),
+	Traverse(TraverseStatement),
 }
 pub use dml::{
 	Assignment,
@@ -165,7 +168,7 @@ pub use dml::{
 	ExpectClause,
 	MutateStatement,
 };
-pub use graph_dml::{AttachStatement, DetachStatement, RelateStatement};
+pub use graph_dml::{AttachStatement, DetachStatement, KeepLevelPathClause, RelateStatement};
 pub use graph_properties::{
 	GraphPropertyAssignment,
 	GraphPropertyMutation,

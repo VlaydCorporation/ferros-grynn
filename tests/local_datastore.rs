@@ -176,6 +176,9 @@ mod tests {
 		                local_social RETURN a, b";
 		let nested = "MATCH (module:root AS m)-[bridge:contains]->(document:spec AS d) IN GRAPH \
 		              local_meta RETURN m, d";
+		let levelpath = "MATCH (module:root AS m)-[bridge:contains AS e]->(document:spec AS d) IN \
+		                 GRAPH local_meta RETURN e.levelpath AS stored, graph::level_path(e) AS \
+		                 computed";
 		let observe = |store: &Datastore, query: &str| {
 			store.execute(query, &Object::new()).unwrap()[0]
 				.result
@@ -184,13 +187,22 @@ mod tests {
 				.value()
 				.clone()
 		};
+		let persisted = store
+			.execute("UPDATE bridge:contains IN GRAPH local_meta KEEP LEVELPATH;", &Object::new())
+			.unwrap();
+		assert!(persisted[0].result.is_ok());
 		let expected_standard = observe(&store, standard);
 		let expected_nested = observe(&store, nested);
+		let expected_levelpath = observe(&store, levelpath);
+		let levelpath_row =
+			expected_levelpath.as_array().unwrap().get(0).unwrap().as_object().unwrap();
+		assert_eq!(levelpath_row.get("stored"), levelpath_row.get("computed"));
 		drop(store);
 
 		let reopened = Datastore::open_local(directory.path(), options).unwrap();
 		assert_eq!(observe(&reopened, standard), expected_standard);
 		assert_eq!(observe(&reopened, nested), expected_nested);
+		assert_eq!(observe(&reopened, levelpath), expected_levelpath);
 	}
 
 	#[test]

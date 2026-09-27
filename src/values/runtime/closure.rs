@@ -20,7 +20,7 @@ static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 pub struct RuntimeId(NonZeroU64);
 
 impl RuntimeId {
-	fn next() -> Self {
+	pub(crate) fn next() -> Self {
 		loop {
 			let value = NEXT_RUNTIME_ID.fetch_add(1, AtomicOrdering::Relaxed);
 			if let Some(value) = NonZeroU64::new(value) {
@@ -37,12 +37,20 @@ impl RuntimeId {
 type ClosureFunction = dyn Fn(&[Value]) -> Result<Value, FerrosGrynnError> + Send + Sync + 'static;
 
 #[derive(Clone)]
+enum ClosureImplementation {
+	Native(Arc<ClosureFunction>),
+	Session {
+		owner: RuntimeId,
+	},
+}
+
+#[derive(Clone)]
 pub struct Closure {
 	id: RuntimeId,
 	name: Option<Text>,
 	parameters: Vec<Type>,
 	result: Type,
-	function: Arc<ClosureFunction>,
+	implementation: ClosureImplementation,
 }
 
 impl Closure {
@@ -60,7 +68,19 @@ impl Closure {
 			name,
 			parameters,
 			result,
-			function: Arc::new(function),
+			implementation: ClosureImplementation::Native(Arc::new(function)),
+		}
+	}
+
+	pub(crate) fn session(owner: RuntimeId, parameters: Vec<Type>, result: Type) -> Self {
+		Self {
+			id: RuntimeId::next(),
+			name: None,
+			parameters,
+			result,
+			implementation: ClosureImplementation::Session {
+				owner,
+			},
 		}
 	}
 
@@ -91,7 +111,21 @@ impl Closure {
 				format!("{} arguments", self.parameters.len()),
 			));
 		}
-		(self.function)(arguments)
+		match &self.implementation {
+			ClosureImplementation::Native(function) => function(arguments),
+			ClosureImplementation::Session {
+				..
+			} => Err(FerrosGrynnError::closure_requires_session(self.id.get())),
+		}
+	}
+
+	pub(crate) const fn session_owner(&self) -> Option<RuntimeId> {
+		match &self.implementation {
+			ClosureImplementation::Session {
+				owner,
+			} => Some(*owner),
+			ClosureImplementation::Native(_) => None,
+		}
 	}
 
 	pub fn signature(&self) -> Type {

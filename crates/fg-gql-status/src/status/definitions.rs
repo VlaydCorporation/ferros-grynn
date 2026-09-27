@@ -625,6 +625,94 @@ define_status_codes!(
 			actual_rows: u64 => DisplayValue,
 		},
 	},
+	ClosureRequiresSession, "FG-22F23" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "language closure requires its session",
+		message: "Language closure {closure} can only be invoked through its owning GqlSession.",
+		params: {
+			closure: u64 => DisplayValue,
+		},
+	},
+	ClosureSessionMismatch, "FG-22F24" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "closure belongs to another session",
+		message: "Language closure {closure} belongs to session {owner}, not session {actual}.",
+		params: {
+			closure: u64 => DisplayValue,
+			owner: u64 => DisplayValue,
+			actual: u64 => DisplayValue,
+		},
+	},
+	ClosureExpired, "FG-22F25" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "language closure expired",
+		message: "Language closure {closure} is no longer present in its owning session.",
+		params: {
+			closure: u64 => DisplayValue,
+		},
+	},
+	ClosureEffectNotAllowed, "FG-22F26" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "closure effect is not allowed",
+		message: "Closure effect {effect} is not allowed in traversal position {position}.",
+		params: {
+			effect: String => Identifier,
+			position: String => Identifier,
+		},
+	},
+	TraversalSourceTypeMismatch, "FG-22F27" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "invalid traversal source or step input",
+		message: "Traversal expected {expected}, but received {actual}.",
+		params: {
+			expected: String => ValueType,
+			actual: String => ValueType,
+		},
+	},
+	UnsupportedLevelPathTarget, "FG-22F28" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Graph,
+		subcondition: "unsupported LevelPath target",
+		message: "KEEP LEVELPATH does not support target type {target_type}.",
+		params: {
+			target_type: String => ValueType,
+		},
+	},
 	AtomDoesNotExist, "FG-G1F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -1242,8 +1330,34 @@ define_status_codes!(
 		condition: Condition::ProgramLimitExceeded,
 		domain: Domain::Query,
 		subcondition: "path expansion limit exceeded",
-		message: "MATCH considered more than the configured limit of {maximum} topology branches.",
+		message: "Graph traversal considered more than the configured limit of {maximum} topology branches.",
 		params: {
+			maximum: u64 => DisplayValue,
+		},
+	},
+	TraversalBulkOverflow, "FG-54F12" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Query,
+		subcondition: "traverser bulk overflow",
+		message: "Merging traversers would overflow the 64-bit bulk counter.",
+	},
+	TraversalResourceLimitExceeded, "FG-54F13" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Query,
+		subcondition: "traversal resource limit exceeded",
+		message: "Traversal resource {resource} exceeded the configured maximum of {maximum}.",
+		params: {
+			resource: String => Identifier,
 			maximum: u64 => DisplayValue,
 		},
 	},

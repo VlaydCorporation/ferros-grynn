@@ -100,10 +100,16 @@ fn contains_select_special(expression: &TypedExpr) -> bool {
 			arguments,
 			..
 		} => arguments.iter().any(contains_select_special),
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => contains_select_special(callee) || arguments.iter().any(contains_select_special),
+		TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
 		| TypedExprKind::Column(_)
-		| TypedExprKind::CurrentField(_) => false,
+		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Closure(_) => false,
 	}
 }
 

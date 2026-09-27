@@ -171,7 +171,7 @@ delete_atom ::= "DELETE" atom_target [ "CASCADE" ]
                 [ delete_return ] [ timeout_clause ]
 
 attach_stmt ::= "ATTACH" record_id "TO" "GRAPH" graph_ref
-                [ "LABEL" label_name ]
+                [ "LABEL" label_name ] [ keep_levelpath_clause ]
 detach_stmt ::= "DETACH" record_id "FROM" "GRAPH" graph_ref
                 [ "CASCADE" ]
 
@@ -198,6 +198,7 @@ relate_stmt ::= "RELATE" node_pattern graph_step node_pattern
                 graph_scope
                 [ "CONTENT" expr | "SET" assignment_list ]
                 [ "WEIGHTED" expr ]
+                [ keep_levelpath_clause ]
                 [ relate_return ] [ timeout_clause ]
 
 atom_source ::= ( class_name | record_id | record_range ) [ graph_scope ]
@@ -608,6 +609,7 @@ update_atom_stmt ::= "UPDATE" update_target_list
                 [ "LABEL" ( label_name | "NONE" ) ]
                 [ update_data ]
                 [ where_clause ]
+                [ keep_levelpath_clause ]
                 [ mutate_return ]
                 [ expect_clause ]
                 [ timeout_clause ]
@@ -663,7 +665,7 @@ delete_stmt ::= "DELETE" target_list [ "CASCADE" ]
 
 ```ebnf
 attach_stmt ::= "ATTACH" record_id "TO" "GRAPH" graph_ref
-                [ "LABEL" label_name ]
+                [ "LABEL" label_name ] [ keep_levelpath_clause ]
 detach_stmt ::= "DETACH" record_id "FROM" "GRAPH" graph_ref
                 [ "CASCADE" ]
 ```
@@ -677,6 +679,7 @@ relate_stmt ::= "RELATE" ( relate_binary
                  graph_scope
                  [ "WEIGHTED" expr ]
                  [ content_or_set ]
+                 [ keep_levelpath_clause ]
                 [ mutate_return ]
                 [ expect_clause ]
                 [ timeout_clause ]
@@ -713,6 +716,8 @@ hyper_direction ::= "AS" "DIRECTED"   [ hyper_headtail ]
 hyper_headtail ::= "(" "head" ":" alias_array "," "tail" ":" alias_array ")"
 alias_array    ::= "[" alias { "," alias } "]"
 hyper_endpoint_order ::= "ORDER" "BY" ( "TAIL" | "TARGETS" )
+keep_levelpath_clause ::= "KEEP" "LEVELPATH"
+                          [ "FOR" "[" alias { "," alias } "]" ]
 ```
 
 `WEIGHTED` задаёт graph-local вес (`duration` — для темпоральных графов, иначе `number`).
@@ -858,25 +863,22 @@ Kind задают delimiters и kind выбранного class; label нико�
 ## 7. Traversal Pipeline
 
 ```ebnf
-traverse_stmt ::= "TRAVERSE" ( traverse_input | "ATOM" atom_traverse_input )
-                  [ traverse_return ]
-
-traverse_input ::= [ constraints_clause ] traverse_source pipeline_tail
-atom_traverse_input ::= [ constraints_clause ] atom_traverse_source pipeline_tail
+traverse_stmt ::= "TRAVERSE" [ "ATOM" ] [ constraints_clause ]
+                  "FROM" traverse_source [ graph_scope ]
+                  pipeline_tail [ traverse_return ] [ timeout_clause ]
 
 traverse_source ::=
-      "FROM" graph_expr pipeline_step        (* граф-источник + первый порождающий шаг *)
-    | "FROM" ( record_id | param | idiom )   (* начать с конкретного атома *)
-    | "FROM" match_stmt                       (* MATCH как источник *)
-    | "FROM" select_stmt                      (* SELECT как источник *)
-    | "(" node_pattern ")"                    (* краткая форма: TRAVERSE (Person AS p {...}) *)
-
-atom_traverse_source ::=
-      "FROM" graph_expr pipeline_step
-    | "FROM" atom_endpoint_ref                (* kind стартового атома указан обёрткой *)
-    | "FROM" match_stmt
-    | "FROM" select_stmt
-    | atom_endpoint_pattern
+      graph_expr
+    | record_id
+    | atom_endpoint_ref
+    | param
+    | idiom
+    | match_stmt
+    | select_stmt
+    | array_lit
+    | set_lit
+    | range_expr
+    | "(" expr ")"
 
 graph_expr ::= name                           (* именованный граф *)
              | param
@@ -886,14 +888,15 @@ graph_expr ::= name                           (* именованный граф
 pipeline_tail  ::= { "|>" pipeline_step }
 pipeline_step  ::= step_call { "." step_call }    (* цепочки вида repeat(...).until(...) *)
 step_call      ::= step_name "(" [ arg_list ] ")"
-step_name      ::= [ "tv" "::" ] ident            (* префикс tv:: необязателен при отсутствии конфликтов *)
+step_name      ::= "tv" "::" ident
 
 traverse_return ::= "RETURN" return_item_list
 ```
 
-В `TRAVERSE ATOM` непосредственно записанный стартовый атом использует
-`atom_endpoint_ref`: `<(...)>` для vertex или `<[...]>` для edge. Источники-запросы и
-графовые выражения не получают дополнительной обёртки.
+`GraphRef` требует первым шагом `tv::V()` либо `tv::E()`. Голые `RecordId`/`AtomRef` требуют
+`graph_scope`; `AtomOccurrenceRef` использует свой scope. В `TRAVERSE ATOM` непосредственно
+записанный endpoint может использовать `atom_endpoint_ref`: `<(...)>` для vertex или `<[...]>`
+для edge.
 
 Pipeline-оператор `|>` лево-ассоциативен (§12.10). Источником pipeline может быть любой оператор,
 возвращающий набор (`SELECT`, `MATCH`, `TRAVERSE`, массив, переменная).
@@ -905,7 +908,14 @@ Pipeline-оператор `|>` лево-ассоциативен (§12.10). Ис
 `tv::project`, `tv::init_sack`, `tv::init_named_sack`, `tv::sack`, `tv::named_sack`, `tv::get_sack`,
 `tv::get_named_sack`, `tv::side_effect`, `tv::path`, `tv::emit`, `tv::limit`, `tv::skip`, `tv::order`,
 `tv::group`, `tv::repeat`, `tv::branch`, `tv::choose`, `tv::coalesce`, `tv::count`, `tv::sum`, `tv::min`,
-`tv::max`, `tv::avg`, `tv::fold`, `tv::unfold`, `tv::shortestPath`, `tv::weightedShortestPath`, `tv::algo`, … (§13.4 spec).
+`tv::max`, `tv::avg`, `tv::fold`, `tv::unfold`, `tv::shortestPath`,
+`tv::weightedShortestPath`, `tv::distanceTo`, `tv::bellmanFord`, `tv::kHop`,
+`tv::reachable`, `tv::topologicalSort`, `tv::stronglyConnectedComponents`,
+`tv::weaklyConnectedComponents`, `tv::condensation`, `tv::minimumSpanningForest`,
+`tv::findCuts`, `tv::lca`, `tv::hasCycle` (§13.4 spec).
+
+`tv::algo` принадлежит этапу 21; PageRank, centralities, all-shortest enumeration,
+triangles/clustering, label propagation и Louvain — этапу 26.
 
 Модификаторы `repeat`: `.times(n)`, `.until(closure)`, `.emit()`.
 
@@ -1438,7 +1448,7 @@ arg       ::= [ ident "=" ] expr                (* именованные арг
 `string::{upper,lower,len,contains,split,concat}`, `time::{now,format,add,diff}`,
 `array::{len,concat,distinct,first,flatten}`, `set::{len,union,intersect,diff,has}`,
 `type::{is,to}`, `meta::{id,class,type}`, `option::{is_some,is_none}`. Aggregates/query
-subexpressions, UDF/closures, mutable collections, regex, graph/path, search и geo остаются у
+subexpressions, UDF, mutable collections, regex, graph/path, search и geo остаются у
 назначенных последующих этапов; parser не превращает их в динамический function registry.
 
 ### 12.6. Замыкания
@@ -1451,6 +1461,10 @@ closure_body   ::= block | expr
 ```
 
 Примеры: `|| { ... }`, `|$x| $x.age > 18`, `|$x, $y| { RETURN $x + $y }`, `|x: float, y: float| -> float { math::abs(x - y) }`.
+
+С этапа 17 closure является session-scoped runtime value: captures сохраняются по значению,
+а вызов требует ту же живую `GqlSession`. Transaction statements, `BEGIN IMPORT` и вложенный
+`EXPLAIN ANALYZE` внутри body запрещены. Именованные UDF и recursion остаются этапу 21.
 
 ### 12.7. Кванторы по путям
 

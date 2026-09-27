@@ -2,6 +2,7 @@
 // layer lands.
 #[allow(dead_code, reason = "used by the Datastore adapter in the next vertical slice")]
 mod analysis;
+pub(crate) mod closure;
 pub(crate) mod cursor;
 #[allow(dead_code, reason = "used by the Datastore adapter in the next vertical slice")]
 mod execution;
@@ -42,6 +43,9 @@ pub use crate::{
 		CatchClause,
 		ClassKindName,
 		ClassSchemaModeName,
+		ClosureBody,
+		ClosureExpr,
+		ClosureParameter,
 		CommitStatement,
 		CreateStatement,
 		DefineClassStatement,
@@ -116,6 +120,9 @@ pub use crate::{
 		StatementKind,
 		TimeoutValue,
 		TransactionIsolationName,
+		TraverseSource,
+		TraverseStatement,
+		TraverseStep,
 		TryStatement,
 		TypeName,
 		UnaryOperator,
@@ -158,14 +165,27 @@ pub enum QueryStatementKind {
 	Match,
 	Return,
 	Select,
+	Traverse,
 	Import,
+}
+
+/// Concrete execution semantics selected for one explicit transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExecutionMode {
+	/// Preserves the ordinary stable baseline where it is already defined.
+	#[default]
+	BestEffort,
+	/// Requires replay-stable planning and result ordering.
+	Deterministic,
+	/// Permits unordered pure execution while retaining exact semantics.
+	Fast,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TransactionCommand {
 	Begin {
 		options: crate::datastore::TransactionOptions,
-		deterministic: bool,
+		execution_mode: ExecutionMode,
 	},
 	Commit {
 		full_validation: bool,
@@ -178,11 +198,6 @@ pub(crate) fn analyze_transaction_statement(
 ) -> FerrosGrynnResult<Option<TransactionCommand>> {
 	let command = match &statement.kind {
 		StatementKind::Begin(begin) => {
-			if begin.execution_mode == ExecutionModeName::Fast {
-				return Err(crate::gql_status::FerrosGrynnError::query_feature_not_supported(
-					"EXECUTION MODE FAST",
-				));
-			}
 			let isolation = match begin.isolation {
 				TransactionIsolationName::ReadCommitted => {
 					crate::datastore::IsolationLevel::ReadCommitted
@@ -197,15 +212,21 @@ pub(crate) fn analyze_transaction_statement(
 			} else {
 				crate::datastore::TransactionAccess::ReadWrite
 			};
-			let deterministic = begin.execution_mode == ExecutionModeName::Deterministic;
-			if deterministic && isolation == crate::datastore::IsolationLevel::ReadCommitted {
+			let execution_mode = match begin.execution_mode {
+				ExecutionModeName::BestEffort => ExecutionMode::BestEffort,
+				ExecutionModeName::Deterministic => ExecutionMode::Deterministic,
+				ExecutionModeName::Fast => ExecutionMode::Fast,
+			};
+			if execution_mode == ExecutionMode::Deterministic
+				&& isolation == crate::datastore::IsolationLevel::ReadCommitted
+			{
 				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
 					"EXECUTION MODE DETERMINISTIC requires SNAPSHOT or SERIALIZABLE isolation.",
 				));
 			}
 			TransactionCommand::Begin {
 				options: crate::datastore::TransactionOptions::new(isolation, access),
-				deterministic,
+				execution_mode,
 			}
 		}
 		StatementKind::Commit(commit) => TransactionCommand::Commit {
@@ -252,6 +273,7 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		StatementKind::Relate(_) => QueryStatementKind::Relate,
 		StatementKind::Return(_) => QueryStatementKind::Return,
 		StatementKind::Select(_) => QueryStatementKind::Select,
+		StatementKind::Traverse(_) => QueryStatementKind::Traverse,
 	}
 }
 

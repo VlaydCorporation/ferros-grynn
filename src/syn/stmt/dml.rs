@@ -25,6 +25,7 @@ pub struct MutateStatement {
 	pub label: Option<Option<Identifier>>,
 	pub data: Option<DmlData>,
 	pub filter: Option<Expr>,
+	pub keep_levelpath: Option<KeepLevelPathClause>,
 	pub returning: Option<DmlReturn>,
 	pub expect: Option<ExpectClause>,
 }
@@ -196,6 +197,12 @@ impl Parser<'_> {
 				targets[0].class().span,
 			));
 		}
+		let keep_levelpath = self.keep_levelpath_clause()?;
+		if upsert && keep_levelpath.is_some() {
+			return Err(
+				self.syntax("UPSERT does not support `KEEP LEVELPATH`.", self.previous_span())
+			);
+		}
 		let returning = self.dml_return(context, false).await?;
 		let expect = self.expect_clause(context).await?;
 		self.finish_dml(if upsert {
@@ -209,6 +216,7 @@ impl Parser<'_> {
 			label,
 			data,
 			filter,
+			keep_levelpath,
 			returning,
 			expect,
 		})

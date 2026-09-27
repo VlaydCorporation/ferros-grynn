@@ -23,8 +23,8 @@ pub(super) use durable::{
 };
 pub(super) use reverse::{
 	backfill_reverse_membership_checkpoint,
-	build_reverse_membership_image,
 	build_import_reverse_membership_image,
+	build_reverse_membership_image,
 	open_reverse_membership_image,
 	stage_reverse_membership_image,
 	validate_reverse_memberships,

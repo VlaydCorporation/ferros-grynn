@@ -12,6 +12,7 @@ mod explain;
 mod graph_properties;
 mod schema;
 mod select;
+mod traversal;
 
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 
@@ -42,9 +43,11 @@ use super::{
 	ir::{
 		Aggregate,
 		Builtin,
+		ClosureEffect,
 		Column,
 		EndpointDomain,
 		Expand,
+		LogicalClosureBody,
 		LogicalDmlData,
 		LogicalDmlKind,
 		LogicalDmlReturn,
@@ -70,12 +73,15 @@ use super::{
 		LogicalSelectSourceKind,
 		LogicalSelectStart,
 		LogicalStatement,
+		LogicalTraverse,
+		LogicalTraverseSource,
 		LogicalWildcardField,
 		MatchBinding,
 		MatchOp,
 		PathExpand,
 		ScanTarget,
 		Schema,
+		TraverseStepKind,
 		TypedExpr,
 		TypedExprKind,
 	},
@@ -118,6 +124,7 @@ use crate::{
 	values::{
 		Array,
 		AtomKind,
+		Closure,
 		GraphRef,
 		Number,
 		Object,
@@ -209,7 +216,7 @@ fn execute_logical_statement<Read: QueryRead>(
 	let result =
 		execute_statement(read, statement, slots, bindings, source, control, &mut runtime, 0, true)
 			.and_then(|flow| match flow {
-				ControlFlow::Value(value) => control.outcome(value),
+				ControlFlow::Value(value) | ControlFlow::Return(value) => control.outcome(value),
 				ControlFlow::Break | ControlFlow::Continue => {
 					Err(FerrosGrynnError::invalid_argument(
 						"BREAK or CONTINUE escaped its enclosing loop.",
@@ -283,7 +290,9 @@ pub(crate) fn execute_import_program(
 				}
 				match flow {
 					Some(ControlFlow::Break) => break,
-					Some(ControlFlow::Value(_) | ControlFlow::Continue) => {}
+					Some(
+						ControlFlow::Value(_) | ControlFlow::Return(_) | ControlFlow::Continue,
+					) => {}
 					None => {
 						return Err(FerrosGrynnError::invalid_argument(
 							"Applied import iteration produced no control-flow result.",
@@ -327,7 +336,7 @@ fn execute_import_statement(
 	match execute_statement(
 		&mut read, statement, slots, bindings, source, control, runtime, 0, false,
 	)? {
-		ControlFlow::Value(_) => Ok(()),
+		ControlFlow::Value(_) | ControlFlow::Return(_) => Ok(()),
 		ControlFlow::Break | ControlFlow::Continue => Err(FerrosGrynnError::invalid_argument(
 			"BREAK or CONTINUE escaped its enclosing import loop.",
 		)),
@@ -353,14 +362,22 @@ fn execute_import_block(
 }
 
 #[derive(Default)]
-struct ControlRuntime {
+pub(in crate::gql::execution) struct ControlRuntime {
 	iterations: u64,
 }
 
 enum ControlFlow {
 	Value(Value),
+	Return(Value),
 	Break,
 	Continue,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::gql::execution) enum ClosureInvocationMode {
+	ReadOnlyTraversal,
+	TraversalSideEffect,
+	Standalone,
 }
 
 #[allow(clippy::too_many_arguments, reason = "the interpreter keeps one concrete execution path")]
@@ -402,7 +419,7 @@ fn execute_statement<Read: QueryRead>(
 			slot,
 			value,
 		} => {
-			let value = eval(value, None, slots, source, None, Some(control))?;
+			let value = eval_query_expression(read, value, slots, source, control, runtime)?;
 			slots[*slot as usize] = value.clone();
 			if persist_let && name.as_ref() != "_" {
 				bindings.insert(name.as_ref(), value);
@@ -411,17 +428,22 @@ fn execute_statement<Read: QueryRead>(
 		}
 		LogicalStatement::Return {
 			value,
+		} => {
+			return eval_query_expression(read, value, slots, source, control, runtime)
+				.map(ControlFlow::Return);
 		}
-		| LogicalStatement::Expression {
+		LogicalStatement::Expression {
 			value,
-		} => eval(value, None, slots, source, None, Some(control))?,
+		} => eval_query_expression(read, value, slots, source, control, runtime)?,
 		LogicalStatement::If {
 			branches,
 			else_block,
 		} => {
 			let mut selected = None;
 			for (condition, block) in branches {
-				if eval(condition, None, slots, source, None, Some(control))?.is_truthy() {
+				if eval_query_expression(read, condition, slots, source, control, runtime)?
+					.is_truthy()
+				{
 					selected = Some(block);
 					break;
 				}
@@ -445,8 +467,9 @@ fn execute_statement<Read: QueryRead>(
 			iterable,
 			body,
 		} => {
-			let values =
-				iterable_values(eval(iterable, None, slots, source, None, Some(control))?)?;
+			let values = iterable_values(eval_query_expression(
+				read, iterable, slots, source, control, runtime,
+			)?)?;
 			let mut last = Value::None;
 			for value in values {
 				control.check()?;
@@ -465,6 +488,7 @@ fn execute_statement<Read: QueryRead>(
 					ControlFlow::Value(value) => last = value,
 					ControlFlow::Break => break,
 					ControlFlow::Continue => continue,
+					flow @ ControlFlow::Return(_) => return Ok(flow),
 				}
 			}
 			last
@@ -474,7 +498,9 @@ fn execute_statement<Read: QueryRead>(
 			body,
 		} => {
 			let mut last = Value::None;
-			while eval(condition, None, slots, source, None, Some(control))?.is_truthy() {
+			while eval_query_expression(read, condition, slots, source, control, runtime)?
+				.is_truthy()
+			{
 				control.check()?;
 				record_iteration(runtime, control)?;
 				match execute_block(
@@ -490,6 +516,7 @@ fn execute_statement<Read: QueryRead>(
 					ControlFlow::Value(value) => last = value,
 					ControlFlow::Break => break,
 					ControlFlow::Continue => continue,
+					flow @ ControlFlow::Return(_) => return Ok(flow),
 				}
 			}
 			last
@@ -531,7 +558,7 @@ fn execute_statement<Read: QueryRead>(
 		LogicalStatement::Throw {
 			value,
 		} => {
-			let value = eval(value, None, slots, source, None, Some(control))?;
+			let value = eval_query_expression(read, value, slots, source, control, runtime)?;
 			let Value::String(message) = value else {
 				return Err(FerrosGrynnError::invalid_argument("THROW requires a string value."));
 			};
@@ -555,9 +582,65 @@ fn execute_statement<Read: QueryRead>(
 		LogicalStatement::Select(select) => {
 			execute_select(read, read.snapshot()?, select, slots, source, control)?
 		}
+		LogicalStatement::Traverse(traverse) => traversal::execute_traverse(
+			read,
+			read.snapshot()?,
+			traverse,
+			slots,
+			source,
+			control,
+			runtime,
+		)?,
 	};
 	control.check()?;
 	Ok(ControlFlow::Value(value))
+}
+
+fn eval_query_expression<Read: QueryRead>(
+	read: &mut Read,
+	expression: &TypedExpr,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	runtime: &mut ControlRuntime,
+) -> FerrosGrynnResult<Value> {
+	match &expression.kind {
+		TypedExprKind::Traversal(plan) => traversal::execute_traverse(
+			read,
+			read.snapshot()?,
+			plan,
+			slots,
+			source,
+			control,
+			runtime,
+		),
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => {
+			let callee = eval_query_expression(read, callee, slots, source, control, runtime)?;
+			let Value::Closure(closure) = callee else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"Only a closure value can be invoked.",
+				));
+			};
+			let mut values = Vec::with_capacity(arguments.len());
+			for argument in arguments {
+				values
+					.push(eval_query_expression(read, argument, slots, source, control, runtime)?);
+			}
+			invoke_closure(
+				read,
+				&closure,
+				&values,
+				source,
+				control,
+				runtime,
+				ClosureInvocationMode::Standalone,
+			)
+		}
+		_ => eval(expression, None, slots, source, None, Some(control)),
+	}
 }
 
 #[allow(clippy::too_many_arguments, reason = "the interpreter keeps one concrete execution path")]
@@ -586,10 +669,115 @@ fn execute_block<Read: QueryRead>(
 			false,
 		)? {
 			ControlFlow::Value(value) => last = value,
-			flow @ (ControlFlow::Break | ControlFlow::Continue) => return Ok(flow),
+			flow @ (ControlFlow::Return(_) | ControlFlow::Break | ControlFlow::Continue) => {
+				return Ok(flow);
+			}
 		}
 	}
 	Ok(ControlFlow::Value(last))
+}
+
+/// Invokes a native or session-owned closure through the transaction-aware
+/// evaluator used by traversal steps.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "closure invocation preserves the active query and transaction contexts"
+)]
+pub(in crate::gql::execution) fn invoke_closure<Read: QueryRead>(
+	read: &mut Read,
+	closure: &Closure,
+	arguments: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	runtime: &mut ControlRuntime,
+	mode: ClosureInvocationMode,
+) -> FerrosGrynnResult<Value> {
+	if closure.session_owner().is_none() {
+		return closure.call(arguments);
+	}
+	let entry = control.resolve_closure(closure)?;
+	let effect_allowed = match (entry.plan.effect, mode) {
+		(ClosureEffect::Pure | ClosureEffect::StableRead, _) => true,
+		(ClosureEffect::DataMutation, ClosureInvocationMode::TraversalSideEffect)
+		| (
+			ClosureEffect::DataMutation | ClosureEffect::SchemaMutation,
+			ClosureInvocationMode::Standalone,
+		) => true,
+		(
+			ClosureEffect::DataMutation | ClosureEffect::SchemaMutation,
+			ClosureInvocationMode::ReadOnlyTraversal | ClosureInvocationMode::TraversalSideEffect,
+		) => false,
+	};
+	if !effect_allowed {
+		let position = match mode {
+			ClosureInvocationMode::ReadOnlyTraversal => "read-only traversal step",
+			ClosureInvocationMode::TraversalSideEffect => "tv::side_effect",
+			ClosureInvocationMode::Standalone => "standalone closure",
+		};
+		return Err(FerrosGrynnError::closure_effect_not_allowed(
+			format!("{:?}", entry.plan.effect),
+			position.to_owned(),
+		));
+	}
+	if entry.plan.parameters.len() != arguments.len() {
+		return Err(FerrosGrynnError::conversion_error(
+			format!("{} closure arguments", arguments.len()),
+			format!("{} arguments", entry.plan.parameters.len()),
+		));
+	}
+	let mut slots = vec![Value::None; entry.plan.slot_count];
+	for (slot, value) in entry.captures {
+		let target = slots.get_mut(slot as usize).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("Closure capture slot is outside its typed frame.")
+		})?;
+		*target = value;
+	}
+	for ((slot, _), value) in entry.plan.parameters.iter().zip(arguments) {
+		let target = slots.get_mut(*slot as usize).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("Closure parameter slot is outside its typed frame.")
+		})?;
+		*target = value.clone();
+	}
+	let savepoint = read.savepoint();
+	let result = match &entry.plan.body {
+		LogicalClosureBody::Expression(expression) => {
+			if matches!(mode, ClosureInvocationMode::Standalone) {
+				eval_query_expression(read, expression, &slots, source, control, runtime)
+			} else {
+				let occurrence = arguments.iter().find_map(Value::as_atom_occurrence);
+				if let Some(occurrence) = occurrence {
+					let snapshot = read.snapshot()?;
+					let fields = MatchGraphFields::new(
+						&*read,
+						snapshot,
+						read.property_dictionary(snapshot),
+						Arc::new(occurrence.graph().clone()),
+					);
+					eval(expression, None, &slots, source, Some(&fields), Some(control))
+				} else {
+					eval(expression, None, &slots, source, None, Some(control))
+				}
+			}
+		}
+		LogicalClosureBody::Block(block) => {
+			let mut bindings = Object::new();
+			match execute_block(read, block, &mut slots, &mut bindings, source, control, runtime, 1)
+			{
+				Ok(ControlFlow::Value(value) | ControlFlow::Return(value)) => Ok(value),
+				Ok(ControlFlow::Break | ControlFlow::Continue) => {
+					Err(FerrosGrynnError::invalid_argument(
+						"BREAK or CONTINUE cannot cross a closure boundary.",
+					))
+				}
+				Err(error) => Err(error),
+			}
+		}
+	};
+	if let Err(error) = result {
+		read.restore_savepoint(savepoint)?;
+		return Err(error);
+	}
+	result
 }
 
 fn record_iteration(
@@ -740,6 +928,7 @@ const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementK
 		} => QueryStatementKind::Assert,
 		LogicalStatement::Match(_) => QueryStatementKind::Match,
 		LogicalStatement::Select(_) => QueryStatementKind::Select,
+		LogicalStatement::Traverse(_) => QueryStatementKind::Traverse,
 	}
 }
 
@@ -761,6 +950,18 @@ fn execute_match<Read: QueryRead>(
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	execute_match_with_environment(read, snapshot, plan, slots, source, control, &Object::new())
+}
+
+fn execute_match_with_environment<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalMatch,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	environment: &Object,
 ) -> FerrosGrynnResult<Value> {
 	let demand = crate::gql::optimizer::PlannerDemand::for_match(plan);
 	let planner_snapshot = read.planner_snapshot(snapshot, &demand)?;
@@ -824,8 +1025,32 @@ fn execute_match<Read: QueryRead>(
 		source,
 		fields: &fields,
 	};
+	let mut seed = Row::bindings(plan.bindings.columns.len());
+	let mut seed_is_valid = true;
+	for (column, binding) in plan.bindings.columns.iter().enumerate() {
+		if let Some(value) = environment.get(&binding.name) {
+			let Value::AtomOccurrence(occurrence) = value else {
+				seed.values[column] = value.clone();
+				continue;
+			};
+			if occurrence.graph().id() != graph_ref.id() {
+				seed.values[column] = value.clone();
+				continue;
+			}
+			let Some(atom) = graph.atom_id(occurrence.atom())? else {
+				seed.values[column] = value.clone();
+				continue;
+			};
+			seed_is_valid &= seed.seed_binding(
+				column,
+				value.clone(),
+				BoundAtom::new(graph_ref.id(), atom),
+				plan.mode,
+			);
+		}
+	}
 	let mut cursor: Box<dyn RowCursor + '_> = Box::new(OneRowCursor {
-		row: Some(Row::bindings(plan.bindings.columns.len())),
+		row: seed_is_valid.then_some(seed),
 	});
 	for pattern_index in physical.pattern_order.iter().copied() {
 		let logical = &plan.patterns[pattern_index];

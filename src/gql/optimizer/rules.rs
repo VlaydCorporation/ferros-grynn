@@ -176,6 +176,15 @@ fn fold_expr(expression: &mut TypedExpr) -> bool {
 			arguments,
 			..
 		} => arguments.iter_mut().fold(false, |changed, argument| changed | fold_expr(argument)),
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => {
+			fold_expr(callee)
+				| arguments
+					.iter_mut()
+					.fold(false, |changed, argument| changed | fold_expr(argument))
+		}
 		TypedExprKind::Aggregate {
 			argument,
 			..
@@ -184,10 +193,12 @@ fn fold_expr(expression: &mut TypedExpr) -> bool {
 			select,
 			..
 		} => fold_select(select),
+		TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
 		| TypedExprKind::Column(_)
-		| TypedExprKind::CurrentField(_) => false,
+		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Closure(_) => false,
 	};
 	if !matches!(expression.kind, TypedExprKind::Constant(_))
 		&& constant_expression(expression)
@@ -269,6 +280,11 @@ fn constant_expression(expression: &TypedExpr) -> bool {
 			function,
 			arguments,
 		} => !matches!(function, Builtin::TimeNow(_)) && arguments.iter().all(constant_expression),
+		TypedExprKind::Closure(_)
+		| TypedExprKind::Invoke {
+			..
+		}
+		| TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Slot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_)

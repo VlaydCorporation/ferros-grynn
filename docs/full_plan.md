@@ -362,7 +362,7 @@ types при необходимости расширяется общими ти
    | `Q-07`  | Transaction semantics                   | Per-statement autocommit, statement-local Read Committed refresh, DDL→DML visibility, explicit `BEGIN/COMMIT/CANCEL`, persistent session и whole-transaction abort теперь имеют единый контракт.                                                                                                                                                                                                                                                                                                        | Parser/structural preflight → statement analysis → typed IR → execution проверены RAM/local/reopen; `Transaction::execute` отклоняет transaction/import statements до мутации.                                                                                                                                                                                                                                   | ✅ закрыто — этап 11, 2026-09-25                                                |
    | `Q-08`  | Functionality + data model              | Этап 5 реализовал generation-aware `AtomTableMemberships`, но они дублировали class namespace из `RecordId = class:id` и делали class принадлежностью, а не identity. Историческая реализация удалена полностью.                                                                                                                                                                                                                                                                                        | A5–A16 ввели `ClassId`/`ClassSchema`, class-aware `RecordId`, global AtomStore и graph occurrence membership. `TableSchema`, `AtomTableMemberships`, system graph и compatibility selector отсутствуют; RAM/local/recovery и DDL/DML gates пройдены.                                                                                                                                                             | ✅ закрыто — этап 8.1, 2026-09-22                                               |
    | `Q-09`  | Functionality + UX                      | Mode 3 `Mutable` уже хранит origin/dirty state и явно передаёт только dirty graph-local topology/overlay в предоставленную вызывающим кодом транзакцию. Ошибка writer сохраняет dirty state, `Drop` не пишет. Пока отсутствует самостоятельная source-level операция, которая открывает новую транзакцию, обнаруживает изменение source после materialization origin и сама выполняет commit.                                                                                                           | До публикации высокоуровневого mutable write-back surface добавить origin-aware conflict check и explicit commit поверх существующего delta writer. Конфликт или ошибка commit обязаны оставлять dirty state доступным для повторного решения; неявное изменение Base и flush из `Drop` запрещены.                                                                                                               | ⬜ открыто — low-level delta writer готов, source transaction/commit UX отложен |
-   | `Q-10`  | Performance                             | Frame-IoRing QD32 измеримо выигрывает на sparse frontier, но Stage 16 подтвердил только logical frontier над materialized `GraphRead`; доказуемого bounded physical page window всё ещё нет, поэтому router выбирает sync Direct.                                                                                                                                                                                                                                                                       | На этапе 17 добавить окно только из реального local physical cursor и повторить paired gate; эвристическое угадывание и пользовательский transport knob не добавлять.                                                                                                                                                                                                                                            | ⬜ открыто                                                                      |
+   | `Q-10`  | Performance                             | Snapshot-exact local `PhysicalTraversalCursor` формирует доказуемое окно до 256 logical operations и 32 cold home pages после exact resident/WAL resolution. Paired 7-run gate на 64 cold-start запросах дал frame-IoRing median `868 610 ns` против sync Direct `1 343 950 ns` (`0,646×`), p99 `1 290 679 ns` против `2 450 029 ns`, CPU total `732 421 ns` против `1 708 982 ns`; RSS остался bounded.                                                                                                | Production router выбирает frame-IoRing QD32 только для подходящего `NativeAsync` sparse window; `Sync`, singleton miss, неподходящее окно и недоступная capability остаются на sync Direct. Пользовательского transport knob нет. Evidence: `reports/gql_traversal_stage_17_q10_report.md` и `target/gql-stage17/q10-traversal-frontier-01a0e463-da2a-73c2-8b73-5b48102e0f5e.csv`.                              | ✅ закрыто — этап 17, 2026-09-27                                                |
    | `Q-11`  | Performance + operability               | Остались измеренные границы: generic R8 hit около 74,9 нс против stretch 70 нс, один global read-epoch counter, единичный fixed-hot outlier до 65,87% raw и ручной общий `buffer_pool_pages=4096` без auto-sizing/per-file fairness.                                                                                                                                                                                                                                                                    | До этапа 19 выполнить long-run/multi-file/concurrency sweep, вывести effective resident/transient/metadata budget и cache pressure. Directory/epoch/sharding/auto-sizing менять только по профилю representative workload.                                                                                                                                                                                       | ⬜ открыто                                                                      |
    | `Q-12`  | Scalability                             | Известны пока не доминирующие потолки: `File::open` на WAL-frame miss, один mutex IoRing, `O(graphs + classes)` clone каталога, линейный changed-graph lookup и `O(V+E)` copy при `LiveGraph` update/conversion.                                                                                                                                                                                                                                                                                        | Каждый владелец-потребитель обязан измерить свой потолок на соответствующем этапе; оптимизация выполняется только при заметной доле профиля, а не по одному наличию комментария в коде.                                                                                                                                                                                                                          | ⬜ открыто                                                                      |
    | `Q-13`  | UX + configuration                      | Источники конфигурации расходятся: спецификация называет `FG_PAGE_BUFFER_PAGES`, production API использует `LocalOptions::buffer_pool_pages`, allocation tracking читает process-wide `SURREAL_MEMORY_THRESHOLD`; эффективные budget/fallback пользователю не видны.                                                                                                                                                                                                                                    | До этапов 19–20 определить одну embeddable configuration authority, единицы и precedence, убрать чужой prefix, добавить validation и read-only introspection эффективных значений/pressure без глобальной env-зависимости.                                                                                                                                                                                       | ⬜ открыто                                                                      |
@@ -664,8 +664,9 @@ types при необходимости расширяется общими ти
     Продолжение того же плана расширяет единый MATCH executor до edge endpoints,
     V–E/E–V/E–E, `HYPER ... CONTAINS`, all-position meta scopes, `WITHIN` и
     `EdgeEndpoint::Nested`. `LevelPath` не смешивается с traversal `Path`; корректный scan
-    допускается без преждевременного специализированного индекса. Q-10 остаётся открытым до
-    появления настоящего local physical page frontier.
+    допускается без преждевременного специализированного индекса. На момент закрытия этапа 16
+    Q-10 оставался открытым; настоящий local physical page frontier и положительное transport
+    решение добавлены этапом 17.
 
     **Статус (2026-09-27): ✅ завершён.** AtomWalk, hyper/meta, direct/transitive
     containment, cross-level incidence, same-snapshot graph cache, planner metrics и
@@ -676,11 +677,36 @@ types при необходимости расширяется общими ти
     - [x] N4: planner/EXPLAIN integration;
     - [x] N5–N6: correctness/performance gates, отчёт и закрытие.
 
-17. **Traversal VM** — зависит от **14, 16**.  
-    Реализовать отдельный от MATCH IR и VM: traverser, map/flat-map/filter, barriers, sack, path propagation, control flow и вызов существующих graph algorithms. На этом этапе утверждается исполнимый `FAST` mode. Сначала однопоточный pull baseline; parallel execution добавлять только после профиля.
+17. **Traversal VM, closures, `FAST` и physical sparse frontier** — зависит от **14, 16**.
+
+    Dependency-ordered контракт и gates вынесены в
+    [`gql_traversal_stage_17_plan.md`](gql_traversal_stage_17_plan.md). Этап вводит отдельный
+    потоковый traversal executor поверх общего typed pipeline, session-scoped closures,
+    mutation-only `KEEP LEVELPATH`, exact `FAST` и snapshot-exact local physical cursor.
+    Однопоточный pull остаётся baseline; parallel execution допускается только после measured
+    hotspot/gain gate. `Q-10` закрывается положительным либо отрицательным paired transport
+    решением.
+
+    **Статус (2026-09-28): ✅ завершён.** V0–V15, language closures, traversal VM,
+    mutation-only LevelPath, exact `FAST`, optimizer/EXPLAIN и snapshot-exact physical cursor
+    реализованы. Correctness прошёл 474/476 library tests без/с `native-async-io`; paired
+    profiling подтвердил выигрыш `FAST` 17,8% и отсутствие one-hop regression. `Q-10` закрыт
+    положительным IoRing-решением. Evidence:
+    [`reports/gql_traversal_stage_17_report.md`](reports/gql_traversal_stage_17_report.md).
+
+    - [x] V0: нормативная синхронизация и отдельный stage-plan;
+    - [x] V11 + `Q-10`: snapshot-exact physical cursor и положительный paired IoRing gate;
+    - [x] V1–V3: closures, traversal syntax/IR и VM skeleton;
+    - [x] V4–V8: streaming steps, state/control/barriers и existing algorithms;
+    - [x] V9–V10, V12: LevelPath, `FAST` и EXPLAIN;
+    - [x] V13–V15: correctness/performance gates, отчёт и закрытие этапа.
 
 18. **Path и graph results** — зависит от **16, 17**.  
-    Подключить `RETURN GRAPH`, `BUILD GRAPH`, path results и graph-return matrix. Публичные результаты содержат `RecordId`, `AtomRef`, `Path`, `GraphRef` или `MaterializedGraph`, никогда `DiskAtomRef`, page addresses или `StorageValue`. Результат не удерживает завершённый storage snapshot.
+    Подключить `RETURN GRAPH`, `BUILD GRAPH`, graph/path assembly и graph-return matrix.
+    Базовый runtime `Path` и `PathTraceArena` уже принадлежат этапам 15–17; этап 18 владеет их
+    result/assembly surface. Публичные результаты содержат `RecordId`, `AtomRef`, `Path`,
+    `GraphRef` или `MaterializedGraph`, никогда `DiskAtomRef`, page addresses или
+    `StorageValue`. Результат не удерживает завершённый storage snapshot.
 
 19. **Windows GA-core gate** — зависит от **3–18** и закрытия блокеров реестра **4.1**.
     Прогнать crash/recovery matrix, codec/parser fuzzing, RAM/local и Sync/NativeAsync differential tests, long-running SSI/checkpoint tests и storage/query benchmarks. После успеха заморозить core format v1, публичный API и поддерживаемый GrynQL-profile; advanced side-files остаются отдельно версионируемыми.
@@ -691,7 +717,13 @@ types при необходимости расширяется общими ти
     Реализовать durable job state для `CONCURRENTLY`, ограниченный `DEFER`, `REBUILD INDEX`, `INFO`, `KILL` и обслуживающих операций. После crash незавершённая сборка становится `stale`, а не молча `ready`.
 
 21. **Параметры, UDF и оставшийся язык** — зависит от **12, 20**.
-    Реализовать `DEFINE PARAM/FUNCTION`, closures, overload resolution, purity/security rules, recursion `MAXDEPTH`, object constructors и оставшиеся административные выражения. Этап владеет отложенными `SLEEP`, stateful regex/matcher и mutable collection helpers `push/pop/clear/add`; они не должны появляться как скрытый stage-12 fallback.
+    Реализовать `DEFINE PARAM/FUNCTION`, UDF catalog, overload resolution, security rules,
+    именованную recursion `MAXDEPTH`, object constructors и оставшиеся административные
+    выражения. Session-scoped language closures и их effect classification принадлежат этапу 17;
+    этап 21 добавляет именованные UDF, catalog/overloads/security/recursion и `tv::algo`
+    registry. Этап также владеет отложенными `SLEEP`, stateful regex/matcher и mutable
+    collection helpers `push/pop/clear/add`; они не должны появляться как скрытый stage-12
+    fallback.
 
 22. **Analyzers и Fulltext** — зависит от **7, 20, 21**.
     Реализовать tokenizer/filter pipeline, inverted index, BM25, highlights, search built-ins, transactional/deferred updates и bulk build. Проверить Unicode normalization, analyzer versioning и одинаковость incremental/bulk результатов.
@@ -712,7 +744,10 @@ types при необходимости расширяется общими ти
     с `build_lsn`; dependency mutation переводит их в `stale`.
 
 26. **EndpointTensor и аналитические представления** — зависит от **16, 17**.  
-    Добавить нормативные tensor/matrix views поверх полной incidence-модели без изменения runtime/storage границ. Кеширование допускается только как revision-bound derived data.
+    Добавить нормативные tensor/matrix views поверх полной incidence-модели без изменения
+    runtime/storage границ. Здесь же реализовать не существующие на этапе 17 PageRank,
+    centralities, all-shortest enumeration, triangle counting, clustering coefficient, label
+    propagation и Louvain. Кеширование допускается только как revision-bound derived data.
 
 27. **Durable Changefeed** — зависит от **9, 19, 20**.
     Добавить глобальный versionstamp, before/after entries, retention, rotation, resume cursor и WAL-coordinated publication. Доставка — at-least-once; потеря истории выражается явным GAP.

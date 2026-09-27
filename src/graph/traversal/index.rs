@@ -8,6 +8,7 @@ use crate::{
 	graph::{
 		AtomId,
 		AtomKind,
+		EdgeDirection,
 		EdgeEndpoint,
 		EdgeRead,
 		EdgeTopology,
@@ -39,6 +40,7 @@ pub enum TraversalSemantics {
 pub struct TraversalStep {
 	pub(super) target: EdgeEndpoint,
 	pub(super) via_edge: AtomId,
+	pub(super) topology: EdgeDirection,
 	pub(super) direction: PathDirection,
 	pub(super) role: EndpointRole,
 }
@@ -50,6 +52,10 @@ impl TraversalStep {
 
 	pub const fn via_edge(&self) -> AtomId {
 		self.via_edge
+	}
+
+	pub const fn topology(&self) -> EdgeDirection {
+		self.topology
 	}
 
 	pub const fn direction(&self) -> PathDirection {
@@ -71,30 +77,67 @@ pub struct TraversalIndex {
 	identity: Uuid,
 	revision: u64,
 	semantics: TraversalSemantics,
+	has_nested_endpoints: bool,
 	forward: RapidHashMap<EdgeEndpoint, Vec<TraversalStep>>,
 	backward: RapidHashMap<EdgeEndpoint, Vec<TraversalStep>>,
 }
 
 impl TraversalIndex {
 	pub fn new<R: GraphRead>(graph: &R, semantics: TraversalSemantics) -> FerrosGrynnResult<Self> {
+		Self::build(graph, semantics, true, &mut || Ok(()))
+	}
+
+	pub(crate) fn new_for_expansion<R: GraphRead>(
+		graph: &R,
+		semantics: TraversalSemantics,
+	) -> FerrosGrynnResult<Self> {
+		Self::build(graph, semantics, false, &mut || Ok(()))
+	}
+
+	pub(super) fn new_with_check<R: GraphRead, Check>(
+		graph: &R,
+		semantics: TraversalSemantics,
+		check: &mut Check,
+	) -> FerrosGrynnResult<Self>
+	where
+		Check: FnMut() -> FerrosGrynnResult<()>,
+	{
+		Self::build(graph, semantics, true, check)
+	}
+
+	fn build<R: GraphRead, Check>(
+		graph: &R,
+		semantics: TraversalSemantics,
+		register_isolated: bool,
+		check: &mut Check,
+	) -> FerrosGrynnResult<Self>
+	where
+		Check: FnMut() -> FerrosGrynnResult<()>,
+	{
 		let mut index = Self {
 			identity: graph.identity(),
 			revision: graph.revision(),
 			semantics,
+			has_nested_endpoints: false,
 			forward: RapidHashMap::default(),
 			backward: RapidHashMap::default(),
 		};
 
-		for id in graph.node_ids()? {
-			index.register_endpoint(EdgeEndpoint::Local(id?));
-		}
-		if semantics == TraversalSemantics::Atom {
-			for id in graph.edge_ids()? {
+		if register_isolated {
+			for id in graph.node_ids()? {
+				check()?;
 				index.register_endpoint(EdgeEndpoint::Local(id?));
+			}
+			if semantics == TraversalSemantics::Atom {
+				for id in graph.edge_ids()? {
+					check()?;
+					index.register_endpoint(EdgeEndpoint::Local(id?));
+				}
 			}
 		}
 
 		for id in graph.edge_ids()? {
+			check()?;
 			let id = id?;
 			let edge = graph.edge(id)?.ok_or_else(|| {
 				algorithm_failure(
@@ -118,6 +161,10 @@ impl TraversalIndex {
 
 	pub const fn semantics(&self) -> TraversalSemantics {
 		self.semantics
+	}
+
+	pub(crate) const fn has_nested_endpoints(&self) -> bool {
+		self.has_nested_endpoints
 	}
 
 	pub fn contains(&self, endpoint: &EdgeEndpoint) -> bool {
@@ -199,11 +246,11 @@ impl TraversalIndex {
 			EdgeTopology::Directed {
 				source,
 				target,
-			} => self.connect_sets(edge, source, target, false),
+			} => self.connect_sets(edge, source, target, EdgeDirection::Directed),
 			EdgeTopology::Bidirectional {
 				source,
 				target,
-			} => self.connect_sets(edge, source, target, true),
+			} => self.connect_sets(edge, source, target, EdgeDirection::Bidirectional),
 			EdgeTopology::Undirected {
 				endpoints,
 			} => {
@@ -213,6 +260,7 @@ impl TraversalIndex {
 							edge,
 							left,
 							right,
+							EdgeDirection::Undirected,
 							PathDirection::Undirected,
 							EndpointRole::Undirected,
 							PathDirection::Undirected,
@@ -222,6 +270,7 @@ impl TraversalIndex {
 							edge,
 							right,
 							left,
+							EdgeDirection::Undirected,
 							PathDirection::Undirected,
 							EndpointRole::Undirected,
 							PathDirection::Undirected,
@@ -238,7 +287,7 @@ impl TraversalIndex {
 		edge: AtomId,
 		source: &[EdgeEndpoint],
 		target: &[EdgeEndpoint],
-		bidirectional: bool,
+		topology: EdgeDirection,
 	) {
 		for left in source {
 			for right in target {
@@ -246,16 +295,18 @@ impl TraversalIndex {
 					edge,
 					left,
 					right,
+					topology,
 					PathDirection::Forward,
 					EndpointRole::Target,
 					PathDirection::Reverse,
 					EndpointRole::Source,
 				);
-				if bidirectional {
+				if topology == EdgeDirection::Bidirectional {
 					self.connect(
 						edge,
 						right,
 						left,
+						topology,
 						PathDirection::Reverse,
 						EndpointRole::Source,
 						PathDirection::Forward,
@@ -275,6 +326,7 @@ impl TraversalIndex {
 		edge: AtomId,
 		from: &EdgeEndpoint,
 		to: &EdgeEndpoint,
+		topology: EdgeDirection,
 		forward_direction: PathDirection,
 		forward_role: EndpointRole,
 		backward_direction: PathDirection,
@@ -288,12 +340,14 @@ impl TraversalIndex {
 		self.forward.entry(from.clone()).or_default().push(TraversalStep {
 			target: to.clone(),
 			via_edge: edge,
+			topology,
 			direction: forward_direction,
 			role: forward_role,
 		});
 		self.backward.entry(to.clone()).or_default().push(TraversalStep {
 			target: from.clone(),
 			via_edge: edge,
+			topology,
 			direction: backward_direction,
 			role: backward_role,
 		});
@@ -305,6 +359,7 @@ impl TraversalIndex {
 	}
 
 	fn register_endpoint(&mut self, endpoint: EdgeEndpoint) {
+		self.has_nested_endpoints |= matches!(endpoint, EdgeEndpoint::Nested(_));
 		self.forward.entry(endpoint.clone()).or_default();
 		self.backward.entry(endpoint).or_default();
 	}

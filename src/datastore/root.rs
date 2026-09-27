@@ -489,7 +489,14 @@ impl DatabaseRoot {
 				&& let Err(error) = validate_properties(
 					&class,
 					overlay.iter().filter_map(|(key, value)| match value {
-						OverlayValue::Value(value) => Some((key, value)),
+						OverlayValue::Value(value)
+							if self.dictionary.resolve(key).is_none_or(|name| {
+								name.as_str() != crate::datastore::LEVEL_PATH_PROPERTY
+							}) =>
+						{
+							Some((key, value))
+						}
+						OverlayValue::Value(_) => None,
 						OverlayValue::Hidden => None,
 					}),
 				) {

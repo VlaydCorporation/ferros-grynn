@@ -14,6 +14,8 @@ mod identity;
 mod import;
 /// MVCC-owned class, label, and explicit scalar indexes.
 mod index_store;
+/// Canonical graph-local LevelPath projection.
+mod level_path;
 /// Graph-local occurrences and sparse overlays.
 mod occurrence;
 /// Backend and transaction configuration.
@@ -50,6 +52,7 @@ pub(crate) use index_store::{
 	index_context,
 	rebuild_index_store,
 };
+pub(crate) use level_path::LEVEL_PATH_PROPERTY;
 pub(crate) use occurrence::{
 	GraphOccurrence,
 	GraphRoot,

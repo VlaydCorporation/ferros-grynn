@@ -65,6 +65,18 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
   MATCH pipeline и один physical-plan family. Не добавлять второй executor
   или скрытый выбор алгоритма в cursor: mode, bounds, objective и filters
   фиксируются physical plan.
+- `TRAVERSE` проходит тот же typed pipeline и переиспользует MATCH, graph cache,
+  `PathTraceArena`, optimizer и query spill. Traversal VM остаётся concrete
+  sync pull executor; второй matcher, универсальный traversal trait и отдельная
+  async runtime запрещены.
+- Language closure принадлежит создавшей её `GqlSession`, учитывается вместе с
+  retained typed plan и captures в общем лимите 256 МиБ и не сериализуется.
+  Mutation допустима только в явном `tv::side_effect`; schema mutation во время
+  traversal запрещена.
+- Bulk является только внутренней оптимизацией: equality включает current,
+  trace, sacks и env, а observable path либо impure side effect отключает
+  небезопасное слияние. Resource exhaustion fail-closed и не выдаёт partial
+  traversal result.
 - Все рассмотренные topology branches считаются в `max_path_expansions`;
   frontier/history/trace учитываются в statement barrier budget. При исчерпании
   бюджета path execution fail-closed и не выдаёт partial path.

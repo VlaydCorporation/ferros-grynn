@@ -7,7 +7,9 @@
 пройдены. Evidence:
 [`gql_standard_match_stage_15_report.md`](reports/gql_standard_match_stage_15_report.md) и
 [`gql_nested_match_stage_16_report.md`](reports/gql_nested_match_stage_16_report.md).
-`Q-10` остаётся открытым до появления настоящего physical page frontier.
+На момент закрытия этапа 16 `Q-10` оставался открытым. Этап 17 закрыл его положительным paired
+IoRing gate на настоящем physical page frontier; evidence:
+[`gql_traversal_stage_17_q10_report.md`](reports/gql_traversal_stage_17_q10_report.md).
 
 Документ задаёт dependency-ordered реализацию этапов 15–16 из
 [`full_plan.md`](full_plan.md). Нормативную семантику определяет
@@ -303,9 +305,10 @@ Frontier, histories, containment map и trace учитываются общим 
 spill-ятся. DISTINCT/ORDER могут spill. Deadline/cancellation проверяются перед pull, на каждом
 frontier pop и не реже 1024 candidate branches. Partial path после ошибки не публикуется.
 
-Q-10 по frame-IoRing остаётся открытым: materialized `GraphRead` не предоставляет физического
-page frontier. Stage 16 фиксирует logical frontier metrics; sparse physical cursor принадлежит
-этапу 17 после появления реального local page window.
+Stage 16 не закрывал Q-10: materialized `GraphRead` не предоставлял физического page frontier.
+Stage 17 добавил snapshot-exact local page window и закрыл Q-10 положительным paired
+frame-IoRing gate. Исторические Stage-16 logical frontier metrics не переинтерпретируются как
+physical evidence.
 
 ## 6. Dependency-ordered реализация
 

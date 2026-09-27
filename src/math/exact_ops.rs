@@ -1,6 +1,10 @@
 use num_traits::{CheckedAdd, CheckedMul, CheckedSub, PrimInt, Signed};
+use rust_decimal::Decimal;
 
-use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
+use crate::{
+	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	values::Number,
+};
 
 pub trait ExactArithmetic: AddExact + SubtractExact + CheckedMul {}
 
@@ -136,4 +140,58 @@ where
 	}
 
 	Ok(a / b)
+}
+
+/// Adds two runtime numbers with the same coercion and overflow rules used by
+/// GrynnQL arithmetic.
+///
+/// # Errors
+///
+/// Returns an overflow error for an unrepresentable result and rejects the
+/// intentionally unsupported decimal/float implicit conversion.
+pub fn add_numbers(left: Number, right: Number) -> FerrosGrynnResult<Number> {
+	match (left, right) {
+		(Number::Int(left), Number::Int(right)) => left
+			.checked_add(right)
+			.map(Number::Int)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("+")),
+		(Number::Float(left), Number::Float(right)) => finite_sum(left, right),
+		(Number::Float(left), Number::Int(right)) => finite_sum(left, right as f64),
+		(Number::Int(left), Number::Float(right)) => finite_sum(left as f64, right),
+		(Number::Decimal(left), Number::Decimal(right)) => decimal_sum(left, right),
+		(Number::Decimal(left), Number::Int(right)) => decimal_sum(left, Decimal::from(right)),
+		(Number::Int(left), Number::Decimal(right)) => decimal_sum(Decimal::from(left), right),
+		(Number::Float(_), Number::Decimal(_)) | (Number::Decimal(_), Number::Float(_)) => {
+			Err(FerrosGrynnError::invalid_argument(
+				"Float and decimal arithmetic requires an explicit cast.",
+			))
+		}
+	}
+}
+
+fn finite_sum(left: f64, right: f64) -> FerrosGrynnResult<Number> {
+	let value = left + right;
+	if value.is_nan() {
+		return Err(FerrosGrynnError::invalid_argument(
+			"Numeric addition received non-finite operands.",
+		));
+	}
+	if value.is_infinite() {
+		return Err(FerrosGrynnError::operation_overflow("+"));
+	}
+	Ok(Number::Float(value))
+}
+
+fn decimal_sum(left: Decimal, right: Decimal) -> FerrosGrynnResult<Number> {
+	left.checked_add(right)
+		.map(Number::Decimal)
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("+"))
+}
+
+/// Returns whether a runtime number is finite.
+pub const fn number_is_finite(value: Number) -> bool {
+	match value {
+		Number::Float(value) => value.is_finite(),
+		Number::Int(_) | Number::Decimal(_) => true,
+	}
 }

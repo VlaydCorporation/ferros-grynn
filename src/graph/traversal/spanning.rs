@@ -1,15 +1,21 @@
 use rapidhash::RapidHashMap;
 
-use super::{algorithm_failure, connectivity::collect_node_ids, shortest_paths::collect_weights};
+use super::{
+	algorithm_failure,
+	connectivity::collect_node_ids_with_check,
+	shortest_paths::collect_weights_with_check,
+};
 use crate::{
 	gql_status::FerrosGrynnResult,
 	graph::{AtomId, AtomKind, EdgeRead, GraphRead, general::atom_does_not_exist},
+	math::add_numbers,
+	values::Number,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpanningForest {
 	edges: Box<[AtomId]>,
-	total_weight: f64,
+	total_weight: Number,
 	components: usize,
 }
 
@@ -18,7 +24,7 @@ impl SpanningForest {
 		&self.edges
 	}
 
-	pub const fn total_weight(&self) -> f64 {
+	pub const fn total_weight(&self) -> Number {
 		self.total_weight
 	}
 
@@ -28,11 +34,21 @@ impl SpanningForest {
 }
 
 pub fn minimum_spanning_forest<R: GraphRead>(graph: &R) -> FerrosGrynnResult<SpanningForest> {
-	let nodes = collect_node_ids(graph)?;
+	minimum_spanning_forest_with_check(graph, &mut || Ok(()))
+}
+
+pub(crate) fn minimum_spanning_forest_with_check<R: GraphRead, Check>(
+	graph: &R,
+	check: &mut Check,
+) -> FerrosGrynnResult<SpanningForest>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	let nodes = collect_node_ids_with_check(graph, check)?;
 	let positions =
 		nodes.iter().enumerate().map(|(index, id)| (*id, index)).collect::<RapidHashMap<_, _>>();
-	let weights = collect_weights(graph, true, "minimum spanning forest")?;
-	let mut candidates = binary_edges(graph)?
+	let weights = collect_weights_with_check(graph, true, "minimum spanning forest", check)?;
+	let mut candidates = binary_edges_with_check(graph, check)?
 		.into_iter()
 		.map(|edge| {
 			let weight = weights.get(&edge.edge).copied().ok_or_else(|| {
@@ -45,14 +61,15 @@ pub fn minimum_spanning_forest<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Spa
 		})
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	candidates.sort_by(|(left_weight, left), (right_weight, right)| {
-		left_weight.total_cmp(right_weight).then_with(|| left.edge.cmp(&right.edge))
+		left_weight.cmp(right_weight).then_with(|| left.edge.cmp(&right.edge))
 	});
 
 	let mut sets = DisjointSets::new(nodes.len());
 	let mut selected = Vec::with_capacity(nodes.len().saturating_sub(1));
-	let mut total_weight = 0.0;
+	let mut total_weight = Number::Int(0);
 	let mut components = nodes.len();
-	for (weight, edge) in candidates {
+	for (candidate, (weight, edge)) in candidates.into_iter().enumerate() {
+		check_candidate(check, candidate)?;
 		let Some(left) = positions.get(&edge.left).copied() else {
 			return Err(atom_does_not_exist(edge.left));
 		};
@@ -61,13 +78,7 @@ pub fn minimum_spanning_forest<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Spa
 		};
 		if sets.union(left, right) {
 			selected.push(edge.edge);
-			total_weight += weight;
-			if !total_weight.is_finite() {
-				return Err(algorithm_failure(
-					"minimum spanning forest",
-					"total weight overflowed f64",
-				));
-			}
+			total_weight = add_numbers(total_weight, weight)?;
 			components = components.saturating_sub(1);
 		}
 	}
@@ -140,9 +151,16 @@ impl DisjointSets {
 	}
 }
 
-pub(super) fn binary_edges<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Vec<BinaryEdge>> {
+pub(super) fn binary_edges_with_check<R: GraphRead, Check>(
+	graph: &R,
+	check: &mut Check,
+) -> FerrosGrynnResult<Vec<BinaryEdge>>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
 	let mut edges = Vec::with_capacity(graph.edge_count()?);
-	for id in graph.edge_ids()? {
+	for (candidate, id) in graph.edge_ids()?.enumerate() {
+		check_candidate(check, candidate)?;
 		let id = id?;
 		let edge = graph.edge(id)?.ok_or_else(|| {
 			algorithm_failure("binary graph algorithm", format!("missing edge {id}"))
@@ -168,4 +186,14 @@ pub(super) fn binary_edges<R: GraphRead>(graph: &R) -> FerrosGrynnResult<Vec<Bin
 		});
 	}
 	Ok(edges)
+}
+
+fn check_candidate<Check>(check: &mut Check, candidate: usize) -> FerrosGrynnResult<()>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	if candidate & 1023 == 0 {
+		check()?;
+	}
+	Ok(())
 }

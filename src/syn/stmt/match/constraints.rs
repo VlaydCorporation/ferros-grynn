@@ -4,7 +4,9 @@ use super::*;
 
 impl Parser<'_> {
 	/// Parses an optional angle-delimited global constraint block.
-	pub(super) fn global_match_constraints(&mut self) -> FerrosGrynnResult<MatchConstraints> {
+	pub(in crate::syn) fn global_match_constraints(
+		&mut self,
+	) -> FerrosGrynnResult<MatchConstraints> {
 		if self.consume_keyword(keywords::CONSTRAINTS).is_none() {
 			return Ok(MatchConstraints::default());
 		}

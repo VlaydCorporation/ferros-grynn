@@ -15,10 +15,13 @@ use crate::{
 		GraphRoot,
 		GraphSchema,
 		IndexId,
+		OccurrenceState,
 		OverlayValue,
+		index_context,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::{AtomId, GraphId, GraphRef},
+	graph::{AtomId, AtomOccurrenceRef, GraphId, GraphRef},
+	storage::LocalQuerySnapshot,
 	values::{AtomKind, PropertyDictionary, PropertyMap, RecordId, Text, Value},
 };
 
@@ -154,6 +157,45 @@ pub(crate) struct ScalarIndexWindow {
 #[derive(Clone)]
 pub(crate) struct QuerySnapshot {
 	pub(super) root: Arc<DatabaseRoot>,
+	pub(super) physical: Option<LocalQuerySnapshot>,
+}
+
+/// One graph-local incidence returned by the datastore physical cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryPhysicalTraversalCandidate {
+	pub(crate) target: AtomId,
+	pub(crate) edge: AtomId,
+	pub(crate) direction: crate::graph::PathDirection,
+	pub(crate) role: crate::graph::EndpointRole,
+	pub(crate) topology: crate::graph::EdgeDirection,
+}
+
+/// Transport accounting retained without exposing pages or file identities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct QueryPhysicalTraversalStats {
+	pub(crate) resident_pages: u64,
+	pub(crate) wal_pages: u64,
+	pub(crate) sync_home_pages: u64,
+	pub(crate) ioring_home_pages: u64,
+}
+
+/// Complete owned result of one bounded physical frontier expansion.
+pub(crate) struct QueryPhysicalTraversalRead {
+	pub(crate) candidates: Vec<QueryPhysicalTraversalCandidate>,
+	pub(crate) stats: QueryPhysicalTraversalStats,
+}
+
+/// One exact physical nested-graph lookup with transport accounting.
+pub(crate) struct QueryPhysicalInnerGraphRead {
+	pub(crate) graph: Option<GraphId>,
+	pub(crate) stats: QueryPhysicalTraversalStats,
+}
+
+/// Snapshot-exact public atom fields decoded from local physical pages.
+pub(crate) struct QueryPhysicalFieldsRead {
+	pub(crate) record_id: RecordId,
+	pub(crate) properties: PropertyMap,
+	pub(crate) stats: QueryPhysicalTraversalStats,
 }
 
 impl QuerySnapshot {
@@ -173,8 +215,14 @@ impl Transaction {
 
 	pub(crate) fn query_snapshot(&mut self) -> FerrosGrynnResult<QuerySnapshot> {
 		self.prepare_read()?;
+		let physical = if self.mutations.is_empty() {
+			self.store.inner.capture_physical_query_snapshot(self.working.commit_ts)?
+		} else {
+			None
+		};
 		Ok(QuerySnapshot {
 			root: Arc::new(self.working.clone()),
+			physical,
 		})
 	}
 
@@ -216,6 +264,43 @@ impl Transaction {
 	) -> FerrosGrynnResult<Vec<ClassSchema>> {
 		self.ensure_live()?;
 		Ok(snapshot.root.schema.classes().map(|class| class.as_ref().clone()).collect())
+	}
+
+	/// Computes a LevelPath object from one immutable statement snapshot.
+	pub(crate) fn query_level_path(
+		&self,
+		snapshot: &QuerySnapshot,
+		occurrence: &AtomOccurrenceRef,
+	) -> FerrosGrynnResult<Value> {
+		self.ensure_live()?;
+		let global = snapshot.root.resolve_atom(occurrence.atom().id()).ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist(
+				occurrence.atom().kind().to_string(),
+				occurrence.atom().id().to_string(),
+			)
+		})?;
+		if global.kind() != Some(occurrence.atom().kind()) {
+			return Err(FerrosGrynnError::atom_kind_mismatch(
+				occurrence.atom().id().to_string(),
+				global.kind().map_or_else(|| "null".to_owned(), |kind| kind.to_string()),
+				occurrence.atom().kind().to_string(),
+			));
+		}
+		let graph = occurrence.graph().id();
+		self.record_read(crate::datastore::ConflictKey::GraphCatalogRange);
+		self.record_read(crate::datastore::ConflictKey::BaseAtom(global));
+		self.record_read(crate::datastore::ConflictKey::GraphMembership(graph, global));
+		for schema in snapshot.root.schema.graphs() {
+			self.record_read(crate::datastore::ConflictKey::GraphKindRange(
+				schema.id(),
+				AtomKind::Node,
+			));
+			self.record_read(crate::datastore::ConflictKey::GraphKindRange(
+				schema.id(),
+				AtomKind::Edge,
+			));
+		}
+		snapshot.root.level_path_value(graph, global)
 	}
 
 	/// Returns planner statistics from the same immutable statement snapshot.
@@ -511,6 +596,205 @@ impl Transaction {
 				.map(GraphOccurrence::local_id)
 				.collect(),
 		})
+	}
+
+	/// Attempts one snapshot-exact local hot-page expansion. `None` selects the
+	/// ordinary materialized graph path without changing query semantics.
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "the physical frontier keeps all requested direction axes explicit"
+	)]
+	pub(crate) fn query_physical_traversal(
+		&self,
+		snapshot: &QuerySnapshot,
+		reference: &GraphRef,
+		source: AtomId,
+		forward: bool,
+		backward: bool,
+		undirected: bool,
+	) -> FerrosGrynnResult<Option<QueryPhysicalTraversalRead>> {
+		self.ensure_live()?;
+		let graph = query_graph_root(&snapshot.root, reference)?;
+		if graph.occurrence(source).is_none() {
+			return Err(FerrosGrynnError::atom_does_not_exist("atom", source.to_string()));
+		}
+		let Some(physical) = &snapshot.physical else {
+			return Ok(None);
+		};
+		let Some(read) = self.store.inner.physical_traversal_expand(
+			physical,
+			reference.id(),
+			source,
+			forward,
+			backward,
+			undirected,
+		)?
+		else {
+			return Ok(None);
+		};
+		self.record_reads([
+			crate::datastore::ConflictKey::GraphKindRange(reference.id(), AtomKind::Node),
+			crate::datastore::ConflictKey::GraphKindRange(reference.id(), AtomKind::Edge),
+			crate::datastore::ConflictKey::GraphIncidence(reference.id(), source),
+		]);
+		let candidates = read
+			.incidences
+			.into_iter()
+			.map(|candidate| {
+				if graph.occurrence(candidate.edge).is_none()
+					|| graph.occurrence(candidate.target).is_none()
+				{
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"physical traversal hot pages disagree with the captured MVCC root",
+					));
+				}
+				self.record_reads([
+					crate::datastore::ConflictKey::GraphIncidence(reference.id(), candidate.edge),
+					crate::datastore::ConflictKey::GraphIncidence(reference.id(), candidate.target),
+				]);
+				Ok(QueryPhysicalTraversalCandidate {
+					target: candidate.target,
+					edge: candidate.edge,
+					direction: candidate.direction,
+					role: candidate.role,
+					topology: candidate.topology,
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		Ok(Some(QueryPhysicalTraversalRead {
+			candidates,
+			stats: QueryPhysicalTraversalStats {
+				resident_pages: read.stats.resident_pages,
+				wal_pages: read.stats.wal_pages,
+				sync_home_pages: read.stats.sync_home_pages,
+				ioring_home_pages: read.stats.ioring_home_pages,
+			},
+		}))
+	}
+
+	/// Attempts one snapshot-exact node inner-graph or edge transition-graph
+	/// lookup. The physical value is checked against the immutable MVCC root
+	/// before it crosses the datastore boundary.
+	pub(crate) fn query_physical_inner_graph(
+		&self,
+		snapshot: &QuerySnapshot,
+		reference: &GraphRef,
+		owner: AtomId,
+	) -> FerrosGrynnResult<Option<QueryPhysicalInnerGraphRead>> {
+		self.ensure_live()?;
+		let graph = query_graph_root(&snapshot.root, reference)?;
+		let occurrence = graph
+			.occurrence(owner)
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("atom", owner.to_string()))?;
+		let expected = match occurrence.state() {
+			OccurrenceState::Node {
+				nested_graph,
+			} => *nested_graph,
+			OccurrenceState::Edge {
+				transition_graph,
+				..
+			} => *transition_graph,
+		};
+		let Some(physical) = &snapshot.physical else {
+			return Ok(None);
+		};
+		let Some(read) =
+			self.store.inner.physical_traversal_inner_graph(physical, reference.id(), owner)?
+		else {
+			return Ok(None);
+		};
+		if read.graph != expected {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"physical nested-graph binding disagrees with the captured MVCC root",
+			));
+		}
+		self.record_reads([
+			crate::datastore::ConflictKey::BaseAtom(occurrence.global_id()),
+			crate::datastore::ConflictKey::GraphMembership(reference.id(), occurrence.global_id()),
+			crate::datastore::ConflictKey::GraphOverlay(reference.id(), occurrence.global_id()),
+			crate::datastore::ConflictKey::GraphIncidence(reference.id(), owner),
+		]);
+		Ok(Some(QueryPhysicalInnerGraphRead {
+			graph: read.graph,
+			stats: QueryPhysicalTraversalStats {
+				resident_pages: read.stats.resident_pages,
+				wal_pages: read.stats.wal_pages,
+				sync_home_pages: read.stats.sync_home_pages,
+				ioring_home_pages: read.stats.ioring_home_pages,
+			},
+		}))
+	}
+
+	/// Attempts one snapshot-exact base/effective property read. Physical
+	/// identities are checked against the immutable MVCC root before owned
+	/// values cross the datastore boundary.
+	pub(crate) fn query_physical_fields(
+		&self,
+		snapshot: &QuerySnapshot,
+		reference: &GraphRef,
+		owner: AtomId,
+	) -> FerrosGrynnResult<Option<QueryPhysicalFieldsRead>> {
+		self.ensure_live()?;
+		let graph = query_graph_root(&snapshot.root, reference)?;
+		let occurrence = graph
+			.occurrence(owner)
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("atom", owner.to_string()))?;
+		let base = snapshot.root.atom(occurrence.global_id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"graph occurrence references an absent base atom",
+			)
+		})?;
+		let Some(physical) = &snapshot.physical else {
+			return Ok(None);
+		};
+		let context = index_context(&snapshot.root.schema, &snapshot.root.dictionary)?;
+		let Some(read) = self.store.inner.physical_traversal_fields(
+			physical,
+			reference.id(),
+			owner,
+			&context.decoder(),
+		)?
+		else {
+			return Ok(None);
+		};
+		if read.global != occurrence.global_id()
+			|| read.class_id != base.class_id()
+			|| &read.record_id != base.record_id()
+			|| &read.base_properties != base.properties()
+			|| read.overlay.as_ref() != occurrence.overlay()
+		{
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"physical occurrence fields disagree with the captured MVCC root",
+			));
+		}
+		let mut properties = read.base_properties;
+		if let Some(overlay) = &read.overlay {
+			for (key, value) in overlay.iter() {
+				match value {
+					OverlayValue::Value(value) => {
+						properties.insert(key, value.clone());
+					}
+					OverlayValue::Hidden => {
+						properties.remove(key);
+					}
+				}
+			}
+		}
+		self.record_reads([
+			crate::datastore::ConflictKey::BaseAtom(occurrence.global_id()),
+			crate::datastore::ConflictKey::GraphMembership(reference.id(), occurrence.global_id()),
+			crate::datastore::ConflictKey::GraphOverlay(reference.id(), occurrence.global_id()),
+		]);
+		Ok(Some(QueryPhysicalFieldsRead {
+			record_id: read.record_id,
+			properties,
+			stats: QueryPhysicalTraversalStats {
+				resident_pages: read.stats.resident_pages,
+				wal_pages: read.stats.wal_pages,
+				sync_home_pages: read.stats.sync_home_pages,
+				ioring_home_pages: read.stats.ioring_home_pages,
+			},
+		}))
 	}
 
 	pub(crate) fn query_point(

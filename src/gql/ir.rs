@@ -63,6 +63,8 @@ pub(super) enum LogicalStatement {
 	/// Executes a read-only graph pattern match.
 	Match(LogicalMatch),
 	Select(LogicalSelect),
+	/// Executes a streaming traversal pipeline.
+	Traverse(LogicalTraverse),
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,7 @@ pub(super) enum LogicalGraphDmlStatement {
 		record: LogicalRecordTarget,
 		graph: GraphRef,
 		label: Option<Text>,
+		keep_levelpath: bool,
 	},
 	Detach {
 		record: LogicalRecordTarget,
@@ -105,6 +108,7 @@ pub(super) enum LogicalGraphDmlStatement {
 		label: Option<Text>,
 		direction: MatchDirection,
 		weight: Option<TypedExpr>,
+		keep_levelpath: bool,
 	},
 }
 
@@ -149,6 +153,7 @@ pub(super) struct LogicalDmlStatement {
 	pub(super) graph: Option<GraphRef>,
 	pub(super) label: Option<Option<crate::values::Text>>,
 	pub(super) cascade: bool,
+	pub(super) keep_levelpath: bool,
 	pub(super) targets: Vec<LogicalDmlTarget>,
 }
 
@@ -573,6 +578,151 @@ pub(super) struct LogicalSelect {
 	pub(super) outer_columns: usize,
 }
 
+/// Typed source consumed by a traversal pipeline.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalTraverseSource {
+	/// A collection, atom, occurrence, graph, or range expression.
+	Expression(TypedExpr),
+	/// Existing MATCH execution used as a correlated traversal source.
+	Match(Box<LogicalMatch>),
+	/// Existing SELECT execution used as a traversal source.
+	Select(Box<LogicalSelect>),
+}
+
+/// One statically known `tv::` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TraverseStepKind {
+	Vertices,
+	Edges,
+	Out,
+	In,
+	Both,
+	OutEdges,
+	InEdges,
+	BothEdges,
+	InVertex,
+	OutVertex,
+	Hyper,
+	MetaInner,
+	HasAttribute,
+	Has,
+	HasLabel,
+	Where,
+	Deduplicate,
+	DeduplicateBy,
+	SimplePath,
+	CyclicPath,
+	Map,
+	FlatMap,
+	Values,
+	Select,
+	Match,
+	As,
+	Project,
+	Unfold,
+	InitializeSack,
+	Sack,
+	GetSack,
+	InitializeNamedSack,
+	NamedSack,
+	GetNamedSack,
+	SideEffect,
+	Path,
+	Emit,
+	Limit,
+	Skip,
+	Repeat,
+	Branch,
+	Choose,
+	Coalesce,
+	Order,
+	Group,
+	Fold,
+	Count,
+	Sum,
+	Minimum,
+	Maximum,
+	Average,
+	KHop,
+	Reachable,
+	ShortestPath,
+	WeightedShortestPath,
+	DistanceTo,
+	BellmanFord,
+	TopologicalSort,
+	StronglyConnectedComponents,
+	WeaklyConnectedComponents,
+	Condensation,
+	MinimumSpanningForest,
+	Cuts,
+	LowestCommonAncestor,
+	HasCycle,
+}
+
+impl TraverseStepKind {
+	pub(super) const fn is_barrier(self) -> bool {
+		matches!(
+			self,
+			Self::Deduplicate
+				| Self::DeduplicateBy
+				| Self::Order
+				| Self::Group
+				| Self::Fold
+				| Self::Count
+				| Self::Sum
+				| Self::Minimum
+				| Self::Maximum
+				| Self::Average
+				| Self::KHop
+				| Self::Reachable
+				| Self::ShortestPath
+				| Self::WeightedShortestPath
+				| Self::DistanceTo
+				| Self::BellmanFord
+				| Self::TopologicalSort
+				| Self::StronglyConnectedComponents
+				| Self::WeaklyConnectedComponents
+				| Self::Condensation
+				| Self::MinimumSpanningForest
+				| Self::Cuts
+				| Self::LowestCommonAncestor
+				| Self::HasCycle
+		)
+	}
+}
+
+/// One analyzed traversal step in source order.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalTraverseStep {
+	pub(super) kind: TraverseStepKind,
+	pub(super) arguments: Vec<TypedExpr>,
+	pub(super) match_plan: Option<Box<LogicalMatch>>,
+	pub(super) repeat: Option<LogicalRepeat>,
+	pub(super) span: TextSpan,
+}
+
+/// Normalized modifiers of `tv::repeat(body)`.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalRepeat {
+	pub(super) body: TypedExpr,
+	pub(super) times: Option<TypedExpr>,
+	pub(super) until: Option<TypedExpr>,
+	pub(super) emit: bool,
+}
+
+/// One complete streaming traversal statement.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalTraverse {
+	pub(super) atom: bool,
+	pub(super) constraints: crate::syn::MatchConstraints,
+	pub(super) source: LogicalTraverseSource,
+	pub(super) graph: Option<LogicalGraphReference>,
+	pub(super) steps: Vec<LogicalTraverseStep>,
+	/// Columns available to the final RETURN expression in runtime row order.
+	pub(super) result: Schema,
+	pub(super) returning: Option<TypedExpr>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) enum LogicalSelectAccess {
 	#[default]
@@ -713,6 +863,35 @@ pub(super) struct TypedExpr {
 	pub(super) span: TextSpan,
 }
 
+/// Statically classified side effects of one language closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ClosureEffect {
+	Pure,
+	StableRead,
+	DataMutation,
+	SchemaMutation,
+}
+
+/// Typed closure body executed by the session-owned closure registry.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalClosureBody {
+	Expression(Box<TypedExpr>),
+	Block(LogicalBlock),
+}
+
+/// Session-scoped closure with explicit capture and invocation slots.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalClosure {
+	pub(super) parameters: Vec<(u32, Type)>,
+	pub(super) captures: Vec<u32>,
+	pub(super) result: Type,
+	pub(super) body: LogicalClosureBody,
+	pub(super) effect: ClosureEffect,
+	pub(super) slot_count: usize,
+	/// Conservative retained size of the typed closure plan.
+	pub(super) retained_plan_bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum TypedExprKind {
 	Constant(Value),
@@ -767,6 +946,13 @@ pub(super) enum TypedExprKind {
 		function: Builtin,
 		arguments: Vec<TypedExpr>,
 	},
+	Closure(Box<LogicalClosure>),
+	Invoke {
+		callee: Box<TypedExpr>,
+		arguments: Vec<TypedExpr>,
+	},
+	/// A generic expression pipeline lowered to the traversal VM.
+	Traversal(Box<LogicalTraverse>),
 	Aggregate {
 		function: Aggregate,
 		argument: Option<Box<TypedExpr>>,
@@ -830,6 +1016,7 @@ pub(super) enum Builtin {
 	MetaClass,
 	MetaType,
 	GraphInner,
+	GraphLevelPath,
 	PathAtoms,
 	PathNodes,
 	PathEdges,

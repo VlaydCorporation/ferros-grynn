@@ -3,11 +3,14 @@ use std::collections::BTreeMap;
 use super::ir::{
 	Aggregate,
 	Builtin,
+	ClosureEffect,
 	Column,
 	EndpointDomain,
 	Expand,
 	LogicalBlock,
 	LogicalBlockStatement,
+	LogicalClosure,
+	LogicalClosureBody,
 	LogicalDmlData,
 	LogicalDmlKind,
 	LogicalDmlReturn,
@@ -32,6 +35,7 @@ use super::ir::{
 	LogicalProgram,
 	LogicalRecordTarget,
 	LogicalRelateEdge,
+	LogicalRepeat,
 	LogicalSchemaStatement,
 	LogicalSelect,
 	LogicalSelectAccess,
@@ -41,6 +45,9 @@ use super::ir::{
 	LogicalSelectSourceKind,
 	LogicalSelectStart,
 	LogicalStatement,
+	LogicalTraverse,
+	LogicalTraverseSource,
+	LogicalTraverseStep,
 	LogicalWildcardField,
 	LogicalWithinPattern,
 	MatchBinding,
@@ -48,11 +55,12 @@ use super::ir::{
 	PathExpand,
 	ScanTarget,
 	Schema,
+	TraverseStepKind,
 	TypedExpr,
 	TypedExprKind,
 };
 use crate::{
-	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope},
+	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope, LEVEL_PATH_PROPERTY},
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, TextSpan},
 	syn::{
 		AlterTarget,
@@ -96,6 +104,8 @@ use crate::{
 		SelectStart,
 		SelectTarget,
 		StatementKind,
+		TraverseSource,
+		TraverseStatement,
 		TypeName,
 		UnaryOperator,
 		UpdateGraphStatement,
@@ -279,6 +289,11 @@ impl<'a> Analyzer<'a> {
 					record: self.record_target(&statement.record)?,
 					graph: self.catalog.graph(&graph.value)?,
 					label: statement.label.as_ref().map(|label| Text::from(label.value.as_ref())),
+					keep_levelpath: keep_levelpath_enabled(
+						statement.keep_levelpath.as_ref(),
+						None,
+						|message, span| self.semantic(message, span),
+					)?,
 				})
 			}
 			StatementKind::Create(statement) => LogicalStatement::Dml(self.dml(
@@ -287,6 +302,7 @@ impl<'a> Analyzer<'a> {
 				None,
 				None,
 				statement.data.as_ref(),
+				None,
 				None,
 				statement.returning.as_ref(),
 				statement.expect.as_ref(),
@@ -299,6 +315,7 @@ impl<'a> Analyzer<'a> {
 				statement.label.as_ref(),
 				statement.data.as_ref(),
 				statement.filter.as_ref(),
+				statement.keep_levelpath.as_ref(),
 				statement.returning.as_ref(),
 				statement.expect.as_ref(),
 				false,
@@ -313,6 +330,7 @@ impl<'a> Analyzer<'a> {
 				None,
 				statement.data.as_ref(),
 				statement.filter.as_ref(),
+				None,
 				statement.returning.as_ref(),
 				statement.expect.as_ref(),
 				false,
@@ -324,6 +342,7 @@ impl<'a> Analyzer<'a> {
 				None,
 				None,
 				statement.filter.as_ref(),
+				None,
 				statement.returning.as_ref(),
 				statement.expect.as_ref(),
 				statement.cascade,
@@ -390,6 +409,9 @@ impl<'a> Analyzer<'a> {
 			}
 			StatementKind::Select(select) => {
 				LogicalStatement::Select(self.select(select, statement.span)?)
+			}
+			StatementKind::Traverse(traverse) => {
+				LogicalStatement::Traverse(self.traverse(traverse, statement.span)?)
 			}
 			StatementKind::Expression(value) => LogicalStatement::Expression {
 				value: self.expr(value, None)?,
@@ -559,6 +581,9 @@ impl<'a> Analyzer<'a> {
 		let source = self.record_target(&statement.source)?;
 		let target = self.record_target(&statement.target)?;
 		let class = statement.edge.class().value.clone();
+		validate_reserved_levelpath_data(statement.data.as_ref(), |message, span| {
+			self.semantic(message, span)
+		})?;
 		let mut schema = self.catalog.schema(&class)?;
 		let mode = self.catalog.schema_mode(&class)?;
 		self.extend_dml_schema(
@@ -590,6 +615,11 @@ impl<'a> Analyzer<'a> {
 		{
 			return Err(self.semantic("RELATE WEIGHTED requires a number.", weight.span));
 		}
+		let keep_levelpath = keep_levelpath_enabled(
+			statement.keep_levelpath.as_ref(),
+			statement.alias.as_ref(),
+			|message, span| self.semantic(message, span),
+		)?;
 		Ok(LogicalGraphDmlStatement::Relate {
 			atom_endpoints: statement.atom_endpoints,
 			source,
@@ -618,6 +648,7 @@ impl<'a> Analyzer<'a> {
 			label: statement.label.as_ref().map(|label| Text::from(label.value.as_ref())),
 			direction: statement.direction,
 			weight,
+			keep_levelpath,
 		})
 	}
 
@@ -629,10 +660,21 @@ impl<'a> Analyzer<'a> {
 		label: Option<&Option<crate::syn::Identifier>>,
 		data: Option<&DmlData>,
 		filter: Option<&Expr>,
+		keep_levelpath: Option<&crate::syn::KeepLevelPathClause>,
 		returning: Option<&DmlReturn>,
 		expect: Option<&ExpectClause>,
 		cascade: bool,
 	) -> FerrosGrynnResult<LogicalDmlStatement> {
+		if keep_levelpath.is_some() && graph.is_none() {
+			return Err(self.semantic(
+				"KEEP LEVELPATH requires graph-scoped UPDATE.",
+				targets[0].class().span,
+			));
+		}
+		let keep_levelpath = keep_levelpath_enabled(keep_levelpath, None, |message, span| {
+			self.semantic(message, span)
+		})?;
+		validate_reserved_levelpath_data(data, |message, span| self.semantic(message, span))?;
 		let mut plans = Vec::with_capacity(targets.len());
 		for target in targets {
 			let class = target.class().value.clone();
@@ -669,6 +711,7 @@ impl<'a> Analyzer<'a> {
 			graph: graph.map(|graph| self.catalog.graph(&graph.value)).transpose()?,
 			label: label.map(|label| label.as_ref().map(|label| Text::from(label.value.as_ref()))),
 			cascade,
+			keep_levelpath,
 			targets: plans,
 		})
 	}
@@ -1076,6 +1119,289 @@ impl<'a> Analyzer<'a> {
 				name: name.value.clone(),
 			},
 		}
+	}
+
+	fn traverse(
+		&self,
+		statement: &TraverseStatement,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalTraverse> {
+		let source = match &statement.source {
+			TraverseSource::Expression(expression) => {
+				LogicalTraverseSource::Expression(self.expr(expression, None)?)
+			}
+			TraverseSource::Match(statement) => {
+				let mut source = self.match_statement(statement)?;
+				source.projection = source
+					.bindings
+					.columns
+					.iter()
+					.enumerate()
+					.map(|(column, binding)| TypedExpr {
+						kind: TypedExprKind::Column(column),
+						ty: binding.ty.clone(),
+						span,
+					})
+					.collect();
+				source.result = source.bindings.clone();
+				LogicalTraverseSource::Match(Box::new(source))
+			}
+			TraverseSource::Select(statement) => {
+				LogicalTraverseSource::Select(Box::new(self.select(statement, span)?))
+			}
+		};
+		let graph =
+			statement.graph.as_ref().map(|graph| self.graph_reference(graph, None)).transpose()?;
+		let steps = statement
+			.steps
+			.iter()
+			.map(|step| self.traverse_step(&step.expression, step.span))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut result = Schema {
+			columns: vec![Column {
+				name: "current".into(),
+				qualifier: None,
+				ty: Type::Any,
+			}],
+		};
+		let source_schema = match &source {
+			LogicalTraverseSource::Expression(_) => None,
+			LogicalTraverseSource::Match(source) => Some(&source.result),
+			LogicalTraverseSource::Select(source) => Some(&source.result),
+		};
+		if let Some(source_schema) = source_schema {
+			for column in &source_schema.columns {
+				push_traverse_result_column(&mut result, column.name.clone(), column.ty.clone());
+			}
+		}
+		for step in &steps {
+			if matches!(step.kind, TraverseStepKind::As | TraverseStepKind::SideEffect)
+				&& let Some(name) =
+					step.arguments.first().and_then(|argument| match &argument.kind {
+						TypedExprKind::Constant(value) => value.as_str(),
+						_ => None,
+					}) {
+				push_traverse_result_column(&mut result, name.into(), Type::Any);
+			}
+		}
+		let returning = statement
+			.returning
+			.as_ref()
+			.map(|returning| self.select_expr(&returning.value, Some(&result), false, 0))
+			.transpose()?;
+		Ok(LogicalTraverse {
+			atom: statement.atom,
+			constraints: statement.constraints.clone(),
+			source,
+			graph,
+			steps,
+			result,
+			returning,
+		})
+	}
+
+	fn pipeline_expression(
+		&self,
+		expression: &Expr,
+		schema: Option<&Schema>,
+		allow_current_field: bool,
+		allow_aggregates: bool,
+		aggregate_depth: u32,
+	) -> FerrosGrynnResult<TypedExpr> {
+		if schema.is_some() {
+			return Err(
+				self.unsupported("traversal pipeline inside row expression", expression.span)
+			);
+		}
+		let mut step_expressions = Vec::new();
+		let source = pipeline_parts(expression, &mut step_expressions);
+		let source = self.expr_context(
+			source,
+			schema,
+			allow_current_field,
+			allow_aggregates,
+			aggregate_depth,
+		)?;
+		let steps = step_expressions
+			.into_iter()
+			.map(|step| self.traverse_step(step, step.span))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		Ok(TypedExpr {
+			kind: TypedExprKind::Traversal(Box::new(LogicalTraverse {
+				atom: false,
+				constraints: crate::syn::MatchConstraints::default(),
+				source: LogicalTraverseSource::Expression(source),
+				graph: None,
+				steps,
+				result: Schema {
+					columns: vec![Column {
+						name: "current".into(),
+						qualifier: None,
+						ty: Type::Any,
+					}],
+				},
+				returning: None,
+			})),
+			ty: Type::Array(Box::new(Type::Any)),
+			span: expression.span,
+		})
+	}
+
+	fn traverse_step(
+		&self,
+		expression: &Expr,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalTraverseStep> {
+		if let Some(repeat) = parse_repeat_syntax(expression) {
+			return self.traverse_repeat(repeat, span);
+		}
+		let ExprKind::Call {
+			callee,
+			type_argument,
+			distinct,
+			arguments,
+		} = &expression.kind
+		else {
+			return Err(self.semantic("A traversal step must be a `tv::` call.", expression.span));
+		};
+		if type_argument.is_some() || *distinct {
+			return Err(self.semantic(
+				"Traversal steps do not accept type arguments or DISTINCT.",
+				expression.span,
+			));
+		}
+		let Some((namespace, name)) = builtin_name(callee) else {
+			return Err(
+				self.semantic("A traversal step must use the `tv::` namespace.", callee.span)
+			);
+		};
+		if !namespace.eq_ignore_ascii_case("tv") {
+			return Err(
+				self.semantic("A traversal step must use the `tv::` namespace.", callee.span)
+			);
+		}
+		let kind = traverse_step_kind(name).ok_or_else(|| {
+			self.semantic(&format!("Unknown traversal step `tv::{name}`."), callee.span)
+		})?;
+		let expected = traverse_step_arity(kind);
+		if !expected.contains(&arguments.len()) {
+			return Err(self.semantic(
+				&format!(
+					"Traversal step `tv::{name}` expects {}..={} argument(s), found {}.",
+					expected.start(),
+					expected.end(),
+					arguments.len()
+				),
+				expression.span,
+			));
+		}
+		if kind == TraverseStepKind::Match {
+			let ExprKind::MatchSubquery(statement) = &arguments[0].kind else {
+				return Err(self.semantic(
+					"tv::match expects `MATCH ... IN GRAPH ... RETURN ...`.",
+					arguments[0].span,
+				));
+			};
+			return Ok(LogicalTraverseStep {
+				kind,
+				arguments: Vec::new(),
+				match_plan: Some(Box::new(self.match_statement(statement)?)),
+				repeat: None,
+				span,
+			});
+		}
+		let arguments = arguments
+			.iter()
+			.map(|argument| self.expr(argument, None))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		self.validate_traverse_step_effect(kind, &arguments)?;
+		Ok(LogicalTraverseStep {
+			kind,
+			arguments,
+			match_plan: None,
+			repeat: None,
+			span,
+		})
+	}
+
+	fn traverse_repeat(
+		&self,
+		repeat: ParsedRepeat,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalTraverseStep> {
+		if repeat.arguments.len() != 1 {
+			return Err(self.semantic("tv::repeat expects one closure.", span));
+		}
+		let body = self.expr(&repeat.arguments[0], None)?;
+		ensure_traversal_closure(self, &body, false)?;
+		let mut times = None;
+		let mut until = None;
+		let mut emit = false;
+		for modifier in repeat.modifiers {
+			match modifier.name.to_ascii_lowercase().as_str() {
+				"times" if times.is_none() && modifier.arguments.len() == 1 => {
+					times = Some(self.expr(&modifier.arguments[0], None)?);
+				}
+				"until" if until.is_none() && modifier.arguments.len() == 1 => {
+					let predicate = self.expr(&modifier.arguments[0], None)?;
+					ensure_traversal_closure(self, &predicate, false)?;
+					until = Some(predicate);
+				}
+				"emit" if !emit && modifier.arguments.is_empty() => emit = true,
+				_ => {
+					return Err(self.semantic(
+						"repeat accepts each of `.times(n)`, `.until(closure)`, and `.emit()` at \
+						 most once.",
+						modifier.span,
+					));
+				}
+			}
+		}
+		if times.is_none() && until.is_none() {
+			return Err(
+				self.semantic("tv::repeat requires `.times(n)` or `.until(closure)`.", span)
+			);
+		}
+		Ok(LogicalTraverseStep {
+			kind: TraverseStepKind::Repeat,
+			arguments: Vec::new(),
+			match_plan: None,
+			repeat: Some(LogicalRepeat {
+				body,
+				times,
+				until,
+				emit,
+			}),
+			span,
+		})
+	}
+
+	fn validate_traverse_step_effect(
+		&self,
+		kind: TraverseStepKind,
+		arguments: &[TypedExpr],
+	) -> FerrosGrynnResult<()> {
+		let positions = match kind {
+			TraverseStepKind::Where
+			| TraverseStepKind::DeduplicateBy
+			| TraverseStepKind::Map
+			| TraverseStepKind::FlatMap
+			| TraverseStepKind::Sack => vec![0],
+			TraverseStepKind::NamedSack => vec![1],
+			TraverseStepKind::Order => (!arguments.is_empty()).then_some(0).into_iter().collect(),
+			TraverseStepKind::Choose => (0..arguments.len()).collect(),
+			TraverseStepKind::Branch | TraverseStepKind::Coalesce => (0..arguments.len()).collect(),
+			TraverseStepKind::SideEffect => arguments.len().checked_sub(1).into_iter().collect(),
+			_ => Vec::new(),
+		};
+		for position in positions {
+			ensure_traversal_closure(
+				self,
+				&arguments[position],
+				kind == TraverseStepKind::SideEffect,
+			)?;
+		}
+		Ok(())
 	}
 
 	/// Analyzes a complete MATCH statement.
@@ -2179,7 +2505,13 @@ impl<'a> Analyzer<'a> {
 				right,
 			} => {
 				if matches!(op, BinaryOperator::Pipeline) {
-					return Err(self.unsupported("expression pipeline", expr.span));
+					return self.pipeline_expression(
+						expr,
+						schema,
+						allow_current_field,
+						allow_aggregates,
+						aggregate_depth,
+					);
 				}
 				let left = self.expr_context(
 					left,
@@ -2517,15 +2849,74 @@ impl<'a> Analyzer<'a> {
 						)
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
-				let (function, ty) =
-					self.builtin(callee, type_argument.as_ref(), &arguments, expr.span)?;
-				(
-					TypedExprKind::Builtin {
-						function,
-						arguments,
-					},
-					ty,
-				)
+				if builtin_name(callee).is_some() {
+					let (function, ty) =
+						self.builtin(callee, type_argument.as_ref(), &arguments, expr.span)?;
+					(
+						TypedExprKind::Builtin {
+							function,
+							arguments,
+						},
+						ty,
+					)
+				} else {
+					if type_argument.is_some() {
+						return Err(self.semantic(
+							"Language closures do not accept call-site type arguments.",
+							expr.span,
+						));
+					}
+					let callee = self.expr_context(
+						callee,
+						schema,
+						allow_current_field,
+						allow_aggregates,
+						aggregate_depth,
+					)?;
+					let result = match &callee.ty {
+						Type::Closure {
+							parameters,
+							result,
+						} => {
+							if parameters.len() != arguments.len() {
+								return Err(self.semantic(
+									&format!(
+										"Closure expects {} argument(s), found {}.",
+										parameters.len(),
+										arguments.len()
+									),
+									expr.span,
+								));
+							}
+							for (parameter, argument) in parameters.iter().zip(&arguments) {
+								if !compatible(parameter, &argument.ty) {
+									return Err(self.semantic(
+										&format!(
+											"Closure argument has type {}, expected {parameter}.",
+											argument.ty
+										),
+										argument.span,
+									));
+								}
+							}
+							(**result).clone()
+						}
+						Type::Any => Type::Any,
+						other => {
+							return Err(self.semantic(
+								&format!("Cannot call a value of type {other}."),
+								callee.span,
+							));
+						}
+					};
+					(
+						TypedExprKind::Invoke {
+							callee: Box::new(callee),
+							arguments,
+						},
+						result,
+					)
+				}
 			}
 			ExprKind::Cast {
 				target,
@@ -2604,11 +2995,91 @@ impl<'a> Analyzer<'a> {
 					expr.span,
 				));
 			}
+			ExprKind::MatchSubquery(_) => {
+				return Err(self.semantic(
+					"A MATCH query expression is valid only inside tv::match(...).",
+					expr.span,
+				));
+			}
+			ExprKind::Closure(closure) => {
+				let closure = self.closure(closure, expr.span)?;
+				let ty = Type::Closure {
+					parameters: closure.parameters.iter().map(|(_, ty)| ty.clone()).collect(),
+					result: Box::new(closure.result.clone()),
+				};
+				(TypedExprKind::Closure(Box::new(closure)), ty)
+			}
 		};
 		Ok(TypedExpr {
 			kind,
 			ty,
 			span: expr.span,
+		})
+	}
+
+	fn closure(
+		&self,
+		closure: &crate::syn::ClosureExpr,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalClosure> {
+		let mut captures = self.slots.values().map(|slot| slot.id).collect::<Vec<_>>();
+		captures.sort_unstable();
+		captures.dedup();
+		let mut analyzer = Self {
+			source: self.source,
+			catalog: self.catalog,
+			slots: self.slots.clone(),
+			initial_slots: Vec::new(),
+			next_slot: self.next_slot,
+			scopes: vec![Vec::new()],
+			variables: self.variables,
+			statement_now: self.statement_now.clone(),
+		};
+		let mut parameters = Vec::with_capacity(closure.parameters.len());
+		for parameter in &closure.parameters {
+			let ty = parameter
+				.declared_type
+				.as_ref()
+				.map(|ty| analyzer.type_name(ty))
+				.transpose()?
+				.unwrap_or(Type::Any);
+			let slot = analyzer.declare(&parameter.name, ty.clone())?;
+			parameters.push((slot, ty));
+		}
+		let (body, inferred, effect) = match &closure.body {
+			crate::syn::ClosureBody::Expression(expression) => {
+				let expression = analyzer.expr(expression, None)?;
+				let effect = typed_expression_effect(&expression);
+				let inferred = expression.ty.clone();
+				(LogicalClosureBody::Expression(Box::new(expression)), inferred, effect)
+			}
+			crate::syn::ClosureBody::Block(block) => {
+				let block = analyzer.block(block, 0, None)?.0;
+				let inferred = logical_block_result_type(&block);
+				let effect = logical_block_effect(&block);
+				(LogicalClosureBody::Block(block), inferred, effect)
+			}
+		};
+		let result = closure
+			.result_type
+			.as_ref()
+			.map(|ty| analyzer.type_name(ty))
+			.transpose()?
+			.unwrap_or_else(|| inferred.clone());
+		if closure.result_type.is_some() && !compatible(&result, &inferred) {
+			return Err(self
+				.semantic(&format!("Closure body has type {inferred}, expected {result}."), span));
+		}
+		Ok(LogicalClosure {
+			parameters,
+			captures,
+			result,
+			body,
+			effect,
+			slot_count: analyzer.next_slot as usize,
+			retained_plan_bytes: std::mem::size_of::<LogicalClosure>().saturating_add(
+				(span.len as usize).saturating_mul(std::mem::size_of::<TypedExpr>()),
+			),
 		})
 	}
 
@@ -2657,6 +3128,7 @@ impl<'a> Analyzer<'a> {
 			"meta::class" => (Builtin::MetaClass, 1, Type::String),
 			"meta::type" => (Builtin::MetaType, 1, Type::String),
 			"graph::inner" => (Builtin::GraphInner, 1, Type::Any),
+			"graph::level_path" => (Builtin::GraphLevelPath, 1, Type::Object),
 			"path::atoms" => (Builtin::PathAtoms, 1, Type::Array(Box::new(Type::Any))),
 			"path::nodes" => {
 				(Builtin::PathNodes, 1, Type::Array(Box::new(Type::AtomOccurrence(AtomKind::Node))))
@@ -2735,7 +3207,7 @@ impl<'a> Analyzer<'a> {
 			}
 			"set::has" => vec![BuiltinArgument::Set, BuiltinArgument::Any],
 			"meta::id" | "meta::class" => vec![BuiltinArgument::RecordOrAtom],
-			"graph::inner" => vec![BuiltinArgument::AtomOccurrence],
+			"graph::inner" | "graph::level_path" => vec![BuiltinArgument::AtomOccurrence],
 			"path::atoms" | "path::nodes" | "path::edges" | "path::length" | "path::cost" => {
 				vec![BuiltinArgument::Path]
 			}
@@ -2941,6 +3413,286 @@ impl<'a> Analyzer<'a> {
 	}
 }
 
+fn logical_block_result_type(block: &LogicalBlock) -> Type {
+	block
+		.statements
+		.last()
+		.map_or(Type::None, |statement| logical_statement_result_type(&statement.statement))
+}
+
+fn logical_statement_result_type(statement: &LogicalStatement) -> Type {
+	match statement {
+		LogicalStatement::Return {
+			value,
+		}
+		| LogicalStatement::Expression {
+			value,
+		} => value.ty.clone(),
+		LogicalStatement::If {
+			branches,
+			else_block,
+		} => branches
+			.iter()
+			.map(|(_, block)| logical_block_result_type(block))
+			.chain(else_block.iter().map(logical_block_result_type))
+			.reduce(unify)
+			.unwrap_or(Type::None),
+		LogicalStatement::Try {
+			body,
+			catch,
+		} => catch.as_ref().map_or_else(
+			|| logical_block_result_type(body),
+			|(_, catch)| unify(logical_block_result_type(body), logical_block_result_type(catch)),
+		),
+		_ => Type::Any,
+	}
+}
+
+fn logical_block_effect(block: &LogicalBlock) -> ClosureEffect {
+	block.statements.iter().fold(ClosureEffect::Pure, |effect, statement| {
+		effect.max(logical_statement_effect(&statement.statement))
+	})
+}
+
+fn logical_statement_effect(statement: &LogicalStatement) -> ClosureEffect {
+	match statement {
+		LogicalStatement::Explain(explain) => {
+			if explain.mode == crate::syn::ExplainMode::Analyze {
+				ClosureEffect::SchemaMutation
+			} else {
+				ClosureEffect::StableRead
+			}
+		}
+		LogicalStatement::Schema(statement) => match statement {
+			LogicalSchemaStatement::InfoDatabase
+			| LogicalSchemaStatement::InfoClass {
+				..
+			}
+			| LogicalSchemaStatement::InfoIndex {
+				..
+			} => ClosureEffect::StableRead,
+			_ => ClosureEffect::SchemaMutation,
+		},
+		LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => ClosureEffect::DataMutation,
+		LogicalStatement::Let {
+			value,
+			..
+		}
+		| LogicalStatement::Return {
+			value,
+		}
+		| LogicalStatement::Expression {
+			value,
+		}
+		| LogicalStatement::Throw {
+			value,
+		} => typed_expression_effect(value),
+		LogicalStatement::If {
+			branches,
+			else_block,
+		} => branches
+			.iter()
+			.fold(ClosureEffect::Pure, |effect, (condition, block)| {
+				effect.max(typed_expression_effect(condition)).max(logical_block_effect(block))
+			})
+			.max(else_block.as_ref().map_or(ClosureEffect::Pure, logical_block_effect)),
+		LogicalStatement::For {
+			iterable,
+			body,
+			..
+		} => typed_expression_effect(iterable).max(logical_block_effect(body)),
+		LogicalStatement::While {
+			condition,
+			body,
+		} => typed_expression_effect(condition).max(logical_block_effect(body)),
+		LogicalStatement::Try {
+			body,
+			catch,
+		} => logical_block_effect(body).max(
+			catch.as_ref().map_or(ClosureEffect::Pure, |(_, block)| logical_block_effect(block)),
+		),
+		LogicalStatement::AssertInvariants {
+			..
+		}
+		| LogicalStatement::Match(_)
+		| LogicalStatement::Select(_) => ClosureEffect::StableRead,
+		LogicalStatement::Traverse(traverse) => {
+			let source = match &traverse.source {
+				LogicalTraverseSource::Expression(expression) => {
+					typed_expression_effect(expression)
+				}
+				LogicalTraverseSource::Match(_) | LogicalTraverseSource::Select(_) => {
+					ClosureEffect::StableRead
+				}
+			};
+			traverse.steps.iter().fold(source, |effect, step| {
+				let child = if step.match_plan.is_some() {
+					ClosureEffect::StableRead
+				} else {
+					ClosureEffect::Pure
+				};
+				let arguments = step.arguments.iter().fold(ClosureEffect::Pure, |effect, value| {
+					effect.max(typed_expression_effect(value))
+				});
+				let repeat = step.repeat.as_ref().map_or(ClosureEffect::Pure, |repeat| {
+					typed_expression_effect(&repeat.body)
+						.max(
+							repeat
+								.times
+								.as_ref()
+								.map_or(ClosureEffect::Pure, typed_expression_effect),
+						)
+						.max(
+							repeat
+								.until
+								.as_ref()
+								.map_or(ClosureEffect::Pure, typed_expression_effect),
+						)
+				});
+				effect.max(child).max(arguments).max(repeat)
+			})
+		}
+		LogicalStatement::Break | LogicalStatement::Continue => ClosureEffect::Pure,
+	}
+}
+
+fn typed_expression_effect(expression: &TypedExpr) -> ClosureEffect {
+	match &expression.kind {
+		TypedExprKind::Traversal(traverse) => {
+			let source = match &traverse.source {
+				LogicalTraverseSource::Expression(expression) => {
+					typed_expression_effect(expression)
+				}
+				LogicalTraverseSource::Match(_) | LogicalTraverseSource::Select(_) => {
+					ClosureEffect::StableRead
+				}
+			};
+			traverse.steps.iter().fold(source, |effect, step| {
+				let child = if step.match_plan.is_some() {
+					ClosureEffect::StableRead
+				} else {
+					ClosureEffect::Pure
+				};
+				let arguments = step.arguments.iter().fold(ClosureEffect::Pure, |effect, value| {
+					effect.max(typed_expression_effect(value))
+				});
+				let repeat = step.repeat.as_ref().map_or(ClosureEffect::Pure, |repeat| {
+					typed_expression_effect(&repeat.body)
+						.max(
+							repeat
+								.times
+								.as_ref()
+								.map_or(ClosureEffect::Pure, typed_expression_effect),
+						)
+						.max(
+							repeat
+								.until
+								.as_ref()
+								.map_or(ClosureEffect::Pure, typed_expression_effect),
+						)
+				});
+				effect.max(child).max(arguments).max(repeat)
+			})
+		}
+		TypedExprKind::Subquery {
+			..
+		} => ClosureEffect::StableRead,
+		TypedExprKind::Builtin {
+			function: Builtin::GraphInner,
+			..
+		} => ClosureEffect::StableRead,
+		TypedExprKind::Array(values) | TypedExprKind::Set(values) => values
+			.iter()
+			.fold(ClosureEffect::Pure, |effect, value| effect.max(typed_expression_effect(value))),
+		TypedExprKind::Object(fields) => {
+			fields.iter().fold(ClosureEffect::Pure, |effect, (_, value)| {
+				effect.max(typed_expression_effect(value))
+			})
+		}
+		TypedExprKind::Range {
+			start,
+			end,
+			..
+		} => start
+			.iter()
+			.chain(end.iter())
+			.fold(ClosureEffect::Pure, |effect, value| effect.max(typed_expression_effect(value))),
+		TypedExprKind::Unary {
+			expr,
+			..
+		}
+		| TypedExprKind::Field {
+			base: expr,
+			..
+		}
+		| TypedExprKind::Destructure {
+			base: expr,
+			..
+		}
+		| TypedExprKind::Cast {
+			expr,
+			..
+		} => typed_expression_effect(expr),
+		TypedExprKind::Binary {
+			left,
+			right,
+			..
+		}
+		| TypedExprKind::Index {
+			base: left,
+			index: right,
+		}
+		| TypedExprKind::Filter {
+			base: left,
+			predicate: right,
+		} => typed_expression_effect(left).max(typed_expression_effect(right)),
+		TypedExprKind::Conditional {
+			condition,
+			then_value,
+			else_value,
+		} => typed_expression_effect(condition)
+			.max(typed_expression_effect(then_value))
+			.max(typed_expression_effect(else_value)),
+		TypedExprKind::Case {
+			operand,
+			branches,
+			else_value,
+		} => operand
+			.iter()
+			.chain(else_value.iter())
+			.fold(ClosureEffect::Pure, |effect, value| effect.max(typed_expression_effect(value)))
+			.max(branches.iter().fold(ClosureEffect::Pure, |effect, (condition, value)| {
+				effect.max(typed_expression_effect(condition)).max(typed_expression_effect(value))
+			})),
+		TypedExprKind::Builtin {
+			arguments,
+			..
+		}
+		| TypedExprKind::Invoke {
+			arguments,
+			..
+		} => arguments
+			.iter()
+			.fold(ClosureEffect::Pure, |effect, value| effect.max(typed_expression_effect(value)))
+			.max(if matches!(expression.kind, TypedExprKind::Invoke { .. }) {
+				ClosureEffect::StableRead
+			} else {
+				ClosureEffect::Pure
+			}),
+		TypedExprKind::Aggregate {
+			argument,
+			..
+		} => argument
+			.as_ref()
+			.map_or(ClosureEffect::Pure, |argument| typed_expression_effect(argument)),
+		TypedExprKind::Constant(_)
+		| TypedExprKind::Slot(_)
+		| TypedExprKind::Column(_)
+		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Closure(_) => ClosureEffect::Pure,
+	}
+}
+
 #[derive(Clone, Copy)]
 enum BuiltinArgument {
 	Any,
@@ -2988,6 +3740,45 @@ impl BuiltinArgument {
 			Self::AtomOccurrence => "atom occurrence",
 		}
 	}
+}
+
+fn keep_levelpath_enabled(
+	clause: Option<&crate::syn::KeepLevelPathClause>,
+	allowed_alias: Option<&crate::syn::Identifier>,
+	error: impl Fn(&str, TextSpan) -> FerrosGrynnError,
+) -> FerrosGrynnResult<bool> {
+	let Some(clause) = clause else {
+		return Ok(false);
+	};
+	for alias in &clause.aliases {
+		if allowed_alias.is_none_or(|allowed| allowed.value != alias.value) {
+			return Err(error(
+				"KEEP LEVELPATH FOR may name only an occurrence mutated by this statement.",
+				alias.span,
+			));
+		}
+	}
+	Ok(true)
+}
+
+fn validate_reserved_levelpath_data(
+	data: Option<&DmlData>,
+	error: impl Fn(&str, TextSpan) -> FerrosGrynnError,
+) -> FerrosGrynnResult<()> {
+	let fields: Box<dyn Iterator<Item = &crate::syn::Identifier> + '_> = match data {
+		Some(DmlData::Set(assignments)) => Box::new(assignments.iter().map(|value| &value.field)),
+		Some(DmlData::Unset(fields) | DmlData::Reset(fields)) => Box::new(fields.iter()),
+		_ => Box::new(std::iter::empty()),
+	};
+	for field in fields {
+		if field.value.eq_ignore_ascii_case(LEVEL_PATH_PROPERTY) {
+			return Err(error(
+				"`levelpath` is a system-managed graph-local property; use KEEP LEVELPATH.",
+				field.span,
+			));
+		}
+	}
+	Ok(())
 }
 
 fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
@@ -3101,7 +3892,10 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 			collect_expr_names(base, names);
 			collect_expr_names(predicate, names);
 		}
-		ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
+		ExprKind::MatchSubquery(_)
+		| ExprKind::Closure(_)
+		| ExprKind::Literal(_)
+		| ExprKind::Parameter(_) => {}
 	}
 }
 
@@ -3118,6 +3912,255 @@ fn builtin_name(callee: &Expr) -> Option<(&str, &str)> {
 		return None;
 	};
 	Some((namespace.value.as_ref(), field.value.as_ref()))
+}
+
+fn pipeline_parts<'expression>(
+	expression: &'expression Expr,
+	steps: &mut Vec<&'expression Expr>,
+) -> &'expression Expr {
+	let ExprKind::Binary {
+		left,
+		op: BinaryOperator::Pipeline,
+		right,
+	} = &expression.kind
+	else {
+		return expression;
+	};
+	let source = pipeline_parts(left, steps);
+	steps.push(right);
+	source
+}
+
+struct ParsedRepeat {
+	arguments: Vec<Expr>,
+	modifiers: Vec<ParsedRepeatModifier>,
+}
+
+struct ParsedRepeatModifier {
+	name: Box<str>,
+	arguments: Vec<Expr>,
+	span: TextSpan,
+}
+
+fn parse_repeat_syntax(expression: &Expr) -> Option<ParsedRepeat> {
+	let ExprKind::Call {
+		callee,
+		type_argument: None,
+		distinct: false,
+		arguments,
+	} = &expression.kind
+	else {
+		return None;
+	};
+	if let Some((namespace, name)) = builtin_name(callee)
+		&& namespace.eq_ignore_ascii_case("tv")
+		&& name.eq_ignore_ascii_case("repeat")
+	{
+		return Some(ParsedRepeat {
+			arguments: arguments.clone(),
+			modifiers: Vec::new(),
+		});
+	}
+	let ExprKind::Field {
+		base,
+		field,
+		null_safe: false,
+	} = &callee.kind
+	else {
+		return None;
+	};
+	let mut repeat = parse_repeat_syntax(base)?;
+	repeat.modifiers.push(ParsedRepeatModifier {
+		name: field.value.clone(),
+		arguments: arguments.clone(),
+		span: expression.span,
+	});
+	Some(repeat)
+}
+
+fn ensure_traversal_closure(
+	analyzer: &Analyzer<'_>,
+	expression: &TypedExpr,
+	allow_mutation: bool,
+) -> FerrosGrynnResult<()> {
+	if !matches!(expression.ty, Type::Closure { .. } | Type::Any) {
+		return Err(analyzer.semantic(
+			&format!("Traversal closure position received {}.", expression.ty),
+			expression.span,
+		));
+	}
+	let TypedExprKind::Closure(closure) = &expression.kind else {
+		return Ok(());
+	};
+	let allowed = match closure.effect {
+		ClosureEffect::Pure | ClosureEffect::StableRead => true,
+		ClosureEffect::DataMutation => allow_mutation,
+		ClosureEffect::SchemaMutation => false,
+	};
+	if allowed {
+		return Ok(());
+	}
+	Err(FerrosGrynnError::closure_effect_not_allowed(
+		format!("{:?}", closure.effect),
+		if allow_mutation {
+			"tv::side_effect".to_owned()
+		} else {
+			"read-only traversal step".to_owned()
+		},
+	))
+}
+
+fn push_traverse_result_column(schema: &mut Schema, name: Box<str>, ty: Type) {
+	if let Some(column) = schema.columns.iter_mut().find(|column| column.name == name) {
+		column.ty = unify(column.ty.clone(), ty);
+	} else {
+		schema.columns.push(Column {
+			name,
+			qualifier: None,
+			ty,
+		});
+	}
+}
+
+fn traverse_step_kind(name: &str) -> Option<TraverseStepKind> {
+	Some(match name.to_ascii_lowercase().as_str() {
+		"v" => TraverseStepKind::Vertices,
+		"e" => TraverseStepKind::Edges,
+		"out" => TraverseStepKind::Out,
+		"in" => TraverseStepKind::In,
+		"both" => TraverseStepKind::Both,
+		"oute" => TraverseStepKind::OutEdges,
+		"ine" => TraverseStepKind::InEdges,
+		"bothe" => TraverseStepKind::BothEdges,
+		"inv" => TraverseStepKind::InVertex,
+		"outv" => TraverseStepKind::OutVertex,
+		"hyper" => TraverseStepKind::Hyper,
+		"meta_inner" => TraverseStepKind::MetaInner,
+		"hasattr" => TraverseStepKind::HasAttribute,
+		"has" => TraverseStepKind::Has,
+		"haslabel" => TraverseStepKind::HasLabel,
+		"where" => TraverseStepKind::Where,
+		"dedup" => TraverseStepKind::Deduplicate,
+		"dedup_by" => TraverseStepKind::DeduplicateBy,
+		"simplepath" => TraverseStepKind::SimplePath,
+		"cyclicpath" => TraverseStepKind::CyclicPath,
+		"map" => TraverseStepKind::Map,
+		"flatmap" => TraverseStepKind::FlatMap,
+		"values" => TraverseStepKind::Values,
+		"select" => TraverseStepKind::Select,
+		"match" => TraverseStepKind::Match,
+		"as" => TraverseStepKind::As,
+		"project" => TraverseStepKind::Project,
+		"unfold" => TraverseStepKind::Unfold,
+		"init_sack" => TraverseStepKind::InitializeSack,
+		"sack" => TraverseStepKind::Sack,
+		"get_sack" => TraverseStepKind::GetSack,
+		"init_named_sack" => TraverseStepKind::InitializeNamedSack,
+		"named_sack" => TraverseStepKind::NamedSack,
+		"get_named_sack" => TraverseStepKind::GetNamedSack,
+		"side_effect" => TraverseStepKind::SideEffect,
+		"path" => TraverseStepKind::Path,
+		"emit" => TraverseStepKind::Emit,
+		"limit" => TraverseStepKind::Limit,
+		"skip" => TraverseStepKind::Skip,
+		"repeat" => TraverseStepKind::Repeat,
+		"branch" => TraverseStepKind::Branch,
+		"choose" => TraverseStepKind::Choose,
+		"coalesce" => TraverseStepKind::Coalesce,
+		"order" => TraverseStepKind::Order,
+		"group" => TraverseStepKind::Group,
+		"fold" => TraverseStepKind::Fold,
+		"count" => TraverseStepKind::Count,
+		"sum" => TraverseStepKind::Sum,
+		"min" => TraverseStepKind::Minimum,
+		"max" => TraverseStepKind::Maximum,
+		"avg" => TraverseStepKind::Average,
+		"khop" => TraverseStepKind::KHop,
+		"reachable" => TraverseStepKind::Reachable,
+		"shortestpath" => TraverseStepKind::ShortestPath,
+		"weightedshortestpath" => TraverseStepKind::WeightedShortestPath,
+		"distanceto" => TraverseStepKind::DistanceTo,
+		"bellmanford" => TraverseStepKind::BellmanFord,
+		"topologicalsort" => TraverseStepKind::TopologicalSort,
+		"stronglyconnectedcomponents" => TraverseStepKind::StronglyConnectedComponents,
+		"weaklyconnectedcomponents" => TraverseStepKind::WeaklyConnectedComponents,
+		"condensation" => TraverseStepKind::Condensation,
+		"minimumspanningforest" => TraverseStepKind::MinimumSpanningForest,
+		"findcuts" => TraverseStepKind::Cuts,
+		"lca" => TraverseStepKind::LowestCommonAncestor,
+		"hascycle" => TraverseStepKind::HasCycle,
+		_ => return None,
+	})
+}
+
+const fn traverse_step_arity(kind: TraverseStepKind) -> std::ops::RangeInclusive<usize> {
+	match kind {
+		TraverseStepKind::Vertices
+		| TraverseStepKind::Edges
+		| TraverseStepKind::InVertex
+		| TraverseStepKind::OutVertex
+		| TraverseStepKind::Hyper
+		| TraverseStepKind::MetaInner
+		| TraverseStepKind::Deduplicate
+		| TraverseStepKind::SimplePath
+		| TraverseStepKind::CyclicPath
+		| TraverseStepKind::Unfold
+		| TraverseStepKind::GetSack
+		| TraverseStepKind::Path
+		| TraverseStepKind::Emit
+		| TraverseStepKind::Fold
+		| TraverseStepKind::Count
+		| TraverseStepKind::Sum
+		| TraverseStepKind::Minimum
+		| TraverseStepKind::Maximum
+		| TraverseStepKind::Average
+		| TraverseStepKind::TopologicalSort
+		| TraverseStepKind::StronglyConnectedComponents
+		| TraverseStepKind::WeaklyConnectedComponents
+		| TraverseStepKind::Condensation
+		| TraverseStepKind::MinimumSpanningForest
+		| TraverseStepKind::Cuts
+		| TraverseStepKind::HasCycle => 0..=0,
+		TraverseStepKind::Out
+		| TraverseStepKind::In
+		| TraverseStepKind::Both
+		| TraverseStepKind::OutEdges
+		| TraverseStepKind::InEdges
+		| TraverseStepKind::BothEdges
+		| TraverseStepKind::Order => 0..=1,
+		TraverseStepKind::Group => 0..=usize::MAX,
+		TraverseStepKind::HasAttribute
+		| TraverseStepKind::Where
+		| TraverseStepKind::DeduplicateBy
+		| TraverseStepKind::Map
+		| TraverseStepKind::FlatMap
+		| TraverseStepKind::As
+		| TraverseStepKind::InitializeSack
+		| TraverseStepKind::Sack
+		| TraverseStepKind::GetNamedSack
+		| TraverseStepKind::Limit
+		| TraverseStepKind::Skip
+		| TraverseStepKind::KHop
+		| TraverseStepKind::Reachable
+		| TraverseStepKind::ShortestPath
+		| TraverseStepKind::WeightedShortestPath
+		| TraverseStepKind::DistanceTo
+		| TraverseStepKind::BellmanFord
+		| TraverseStepKind::LowestCommonAncestor => 1..=1,
+		TraverseStepKind::Has
+		| TraverseStepKind::InitializeNamedSack
+		| TraverseStepKind::NamedSack
+		| TraverseStepKind::SideEffect => 2..=2,
+		TraverseStepKind::Choose => 2..=3,
+		TraverseStepKind::HasLabel
+		| TraverseStepKind::Values
+		| TraverseStepKind::Select
+		| TraverseStepKind::Match
+		| TraverseStepKind::Project
+		| TraverseStepKind::Branch
+		| TraverseStepKind::Coalesce => 1..=usize::MAX,
+		TraverseStepKind::Repeat => 1..=1,
+	}
 }
 
 fn aggregate_name(callee: &Expr) -> Option<Aggregate> {
@@ -3319,7 +4362,9 @@ fn expr_contains_aggregate(expression: &Expr) -> bool {
 		ExprKind::Literal(_)
 		| ExprKind::Parameter(_)
 		| ExprKind::Name(_)
-		| ExprKind::Subquery(_) => false,
+		| ExprKind::Subquery(_)
+		| ExprKind::MatchSubquery(_)
+		| ExprKind::Closure(_) => false,
 	}
 }
 
@@ -3386,7 +4431,11 @@ fn expr_references_row(expression: &Expr) -> bool {
 			end,
 			..
 		} => start.iter().chain(end.iter()).any(|value| expr_references_row(value)),
-		ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Subquery(_) => false,
+		ExprKind::Literal(_)
+		| ExprKind::Parameter(_)
+		| ExprKind::Subquery(_)
+		| ExprKind::MatchSubquery(_)
+		| ExprKind::Closure(_) => false,
 	}
 }
 
@@ -3459,10 +4508,19 @@ fn typed_expr_contains_aggregate(expression: &TypedExpr) -> bool {
 			arguments,
 			..
 		} => arguments.iter().any(typed_expr_contains_aggregate),
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => {
+			typed_expr_contains_aggregate(callee)
+				|| arguments.iter().any(typed_expr_contains_aggregate)
+		}
+		TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Closure(_)
 		| TypedExprKind::Subquery {
 			..
 		} => false,

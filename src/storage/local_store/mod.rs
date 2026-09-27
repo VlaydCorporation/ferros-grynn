@@ -7,6 +7,7 @@ mod files;
 mod image;
 mod layout;
 mod open;
+mod physical_traversal;
 mod statistics;
 
 #[cfg(test)]
@@ -21,6 +22,12 @@ use std::{
 };
 
 use parking_lot::Mutex;
+pub(crate) use physical_traversal::{
+	LocalQuerySnapshot,
+	PhysicalTraversalFieldsRead,
+	PhysicalTraversalInnerRead,
+	PhysicalTraversalRead,
+};
 
 use self::{
 	checkpoint::checkpoint,
@@ -110,6 +117,12 @@ pub(crate) struct LocalStore {
 }
 
 impl LocalStore {
+	/// Clears the shared resident arena for an isolated prototype measurement.
+	#[cfg(feature = "storage-engine-prototype-api")]
+	pub(crate) fn clear_resident_for_prototype(&self) -> FerrosGrynnResult<usize> {
+		self.engine.clear_resident_for_prototype()
+	}
+
 	/// Returns the database-local root used by bounded import scratch sessions.
 	pub(crate) fn import_scratch_root(&self) -> &Path {
 		&self.root

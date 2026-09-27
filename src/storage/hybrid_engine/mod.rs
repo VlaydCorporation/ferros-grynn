@@ -270,6 +270,17 @@ impl HybridReadEngine {
 		self.arena.capacity()
 	}
 
+	/// Clears resident frames for a process-isolated storage prototype.
+	///
+	/// # Errors
+	///
+	/// Returns an arena lifecycle error if a captured mapping changes while it
+	/// is being removed.
+	#[cfg(feature = "storage-engine-prototype-api")]
+	pub(crate) fn clear_resident_for_prototype(&self) -> FerrosGrynnResult<usize> {
+		self.arena.clear_resident()
+	}
+
 	/// Returns the resident capacity through the page-manager cache contract.
 	pub(super) const fn capacity(&self) -> usize {
 		self.resident_capacity()

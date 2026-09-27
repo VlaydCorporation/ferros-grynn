@@ -604,28 +604,27 @@ MetaEdge — ребро с возможностью хранения внутр�
 Ребро помечается флагом `CROSS_LEVEL`, если хотя бы один его endpoint находится в подграфе, отличном от графа, содержащего ребро.
 Семантика ребра не изменяется: оно соединяет конкретные атомы из `source` и `target`.
 
-**LevelPath** — опциональная структура, записываемая в свойства атомов через `KEEP LEVELPATH`. 
-Содержит упорядоченную цепочку мета-вершин от самой верхней мета-вершины, содержащей endpoint, до самого endpoint:
-`[mv_top, mv_middle, ..., leaf_atom]`. Путь идёт от сверху вниз: от endpoint на высшем уровне до endpoint на нижнем уровне.    
-LevelPath не является traversal-механизмом. Это метаданные атома, позволяющие понять иерархию вложенности.
+**LevelPath** — system-managed graph-local overlay, вычисляемый для конкретного occurrence.
+Он хранит все containment chains от внешнего owner до непосредственного owner; target atom в
+chain не входит. LevelPath не является traversal-механизмом и не создаётся чтением.
 
 ```
--- Stage 17: найти endpoints и затем создать связь с явным LevelPath
+-- Сначала read-only поиск, затем отдельная graph-local mutation.
 MATCH (Function AS inner_a) WITHIN*[1..7] <(Module AS mv1)>,
       (Class AS inner_b) WITHIN*[1..7] <(Package AS mv2)>
 IN GRAPH catalog
 RETURN inner_a, inner_b, mv1, mv2;
 
-RELATE (inner_a)-[CALLS AS e]->(inner_b) KEEP LEVELPATH;
-
--- e.levelpath = [inner_a, mv1, mv2, inner_b]
--- inner_a.levelpath = [mv1]
--- inner_b.levelpath = [mv1, mv2]
+RELATE (inner_a)-[CALLS AS e]->(inner_b)
+IN GRAPH catalog
+KEEP LEVELPATH;
 ```
 
-`KEEP LEVELPATH` **поддерживается только для бинарных кросс-уровневых связей**
-(`source_count = 1`, `target_count = 1`).
-Для кросс-уровневых гиперрёбер используйте функцию `graph::level_path(edge)` вручную для каждого endpoint.
+`KEEP LEVELPATH` допустим только в graph-local `ATTACH`, `RELATE` и graph-scoped `UPDATE`.
+`MATCH` и `TRAVERSE` read-only и не принимают эту clause. Для binary edge сохраняются source и
+target objects; для node occurrence — atom object. Top-level occurrence имеет `chains: [[]]`.
+Hyperedge с явным `KEEP LEVELPATH` возвращает typed unsupported. Функция
+`graph::level_path(occurrence)` вычисляет тот же object read-only для текущего snapshot.
 
 #### 3.8.4. Матричное представление инцидентности
 
@@ -1049,6 +1048,18 @@ LET $clos = |$x: int, $y: string| -> geometry {...}
 
 Замыкания не требуют определения через `DEFINE FUNCTION` и не имеют пространств имён.
 
+Начиная с этапа 17 language closure принадлежит создавшей её `GqlSession`, захватывает lexical
+values по значению и может храниться в `LET`, передаваться как аргумент либо возвращаться
+persistent session. Она не переносится в другую session, не переживает `GqlSession::drop`, не
+сериализуется и не spill-ится. Closure из временной session `Datastore::execute` не может
+покинуть вызов.
+
+Analyzer классифицирует body как `PURE`, `STABLE_READ`, `DATA_MUTATION` либо
+`SCHEMA_MUTATION`. Predicate/map/control positions принимают только первые два класса.
+`DATA_MUTATION` допустима только в явном `tv::side_effect`; schema mutation внутри активного
+traversal запрещена. Каждый вызов block closure использует transaction savepoint и полностью
+восстанавливает private state при ошибке.
+
 ### 5.9. Регулярные выражения
 
 > **Отложено до этапа 21.** Синтаксис типа остаётся зарезервированным, но cast,
@@ -1166,14 +1177,24 @@ RETURN alice, annotation, friendship;
 
 #### 5.11.3. LevelPath
 
-Не traversal-механизм. Цепочка мета-вершин, описывающая иерархию вложенности от внешнего уровня до конкретного атома:
-$`\text{LevelPath} = [mv_1, mv_2, ..., mv_n, leaf_atom]``$, где $mv_1 \supset mv_2 \supset \dots \supset mvₙ \supset leaf_atom$ (вложенность).
+Не traversal-механизм. Это reserved canonical object в graph-local overlay; новый durable value
+type не вводится:
 
-Опционально записывается в свойства ребра через `KEEP LEVELPATH` при создании или выборке кросс-уровневого ребра (см. §3.8.3).
-Тип поля — `array<atom>`.
+```grynql
+{ kind: "atom", chains: [[{ graph: GraphRef, owner: AtomRef }, ...], ...] }
 
-`LevelPath` не участвует в traversal, к нему нельзя применять path-функции `path::nodes()`, `path::edges()`, `path::length()`. 
-Только прямой доступ как к свойству: `e.levelpath[0]`, `array::len(e.levelpath)`.
+{
+    kind: "binary_edge",
+    source: { atom: AtomRef, chains: [...] },
+    target: { atom: AtomRef, chains: [...] }
+}
+```
+
+Chain перечисляет owners от внешнего к непосредственному, target atom не включается. Все chains
+сохраняются, дедуплицируются и канонически сортируются по `{GraphId, AtomRef}`. `GraphRef`
+фиксирует revision вычисления. Cycle или повреждённый containment отклоняет mutation.
+`levelpath` видим, но system-managed: прямой пользовательский `SET/UNSET properties.levelpath`
+запрещён. `DETACH` удаляет occurrence вместе с overlay. Path-functions к LevelPath неприменимы.
 
 ---
 
@@ -1419,8 +1440,8 @@ statement; уже опубликованные statements программы с�
 
 `BEGIN` открывает явную транзакцию; `COMMIT` фиксирует её; `CANCEL` откатывает. Default —
 `SERIALIZABLE READ WRITE`. Поддерживаются `READ COMMITTED`, `SNAPSHOT`, `SERIALIZABLE` и
-`READ ONLY`. Начиная с этапа 14 исполнимы `BEST_EFFORT` и строгий `DETERMINISTIC`;
-`FAST` распознаётся, но возвращает typed unsupported до открытия транзакции. Сочетание
+`READ ONLY`. Начиная с этапа 17 исполнимы `BEST_EFFORT`, строгий `DETERMINISTIC` и exact
+`FAST`. Сочетание
 `READ COMMITTED + DETERMINISTIC` запрещено, поскольку не фиксирует один snapshot всей
 транзакции.
 
@@ -3009,22 +3030,20 @@ $object CONTAINS $key;
 KEEP LEVELPATH [ FOR @aliases_array ]
 ```
 
-Записывает LevelPath в свойства создаваемого атома. Уровневый путь могут иметь не только рёбра, но и вершины.
-Применимо как при создании атомов, так и при выборке атомов или путей в `MATCH` / `TRAVERSE`.
+Клауза сохраняет вычисленный LevelPath только для occurrence, который мутирует
+graph-local statement: `ATTACH`, `RELATE` или graph-scoped `UPDATE`. `MATCH` и `TRAVERSE`
+остаются read-only и не принимают `KEEP LEVELPATH`; read-side использует
+`graph::level_path(occurrence)`.
 
-При `KEEP LEVELPATH`:
-- если атом — вершина (мета-вершина) `v`, то в `v.levelpath` записывается цепочка от самого верхнего уровня вложенности графов
-до текущего атома-вершины по вложенным подграфам;
-- если атом — кросс-уровневое ребро `e`, то в `e.levelpath` записывается цепочка мета-вершин от endpoint на самом верхнем уровне вложенности
-до endpoint на самом нижнем уровне вложенности, то есть набор мета-вершин, сквозь которые ребро `e` соединяет один endpoint с другим;
-- если атом — кросс-уровневое гипер-ребро `he`, то оператор игнорируется и свойство `levelpath` не будет создано.
-- если атом — НЕ кросс-уровневое ребро, то оператор игнорируется и свойство `levelpath` не будет создано. 
-- если атом — НЕ кросс-уровневое ребро и НЕ атом-вершина, то оператор игнорируется и свойство `levelpath` не будет создано. 
+Для node occurrence хранится object `{ kind: "atom", chains: [...] }`; для binary edge
+occurrence — `{ kind: "binary_edge", source: {...}, target: {...} }`. Top-level occurrence
+имеет `chains: [[]]`; сохраняются все канонически отсортированные containment chains.
+Для hyperedge явный `KEEP LEVELPATH` возвращает typed unsupported; обычное binary edge
+также получает top-level chains. `levelpath` является system-managed graph-local
+property; прямой `SET`/`UNSET` запрещён.
 
-Если атом (вершина или endpoint ребра) находится на верхнем уровне (не вложен), соответствующий LevelPath — пустой массив `[]`.
-
-При использовании `KEEP LEVELPATH [ FOR @aliases_array ]` можно указать массив алиасов, для которых сохранять уровневый путь.
-В противном случае уровневые пути будут сохранены для всех допустимых сущностей, участвующих в запросе.
+`FOR [aliases]` может содержать только alias occurrence, мутируемого текущим
+statement; любой другой alias отклоняется до мутации.
 
 ### 10.14. EXPECT — условная запись
 
@@ -3533,10 +3552,11 @@ Traversal — потоковая обработка набора Traverser'ов.
 ```
 Traverser = {
     current: atom | value,   -- текущий элемент
-    path: Path?,             -- накопленный путь (включается по запросу)
-    sack: Value?,            -- локальное состояние (для накопления)
-    env: Bindings            -- биндинги из MATCH / LET
-    bulk: u64                -- количество одинаковых traverser'ов (компрессия)
+    trace: PathTraceId?,      -- ленивый накопленный путь
+    sack: Value,              -- локальное состояние
+    named_sacks: Map,         -- именованные локальные состояния
+    env: Bindings,            -- биндинги из MATCH / LET
+    bulk: NonZeroU64          -- количество одинаковых traverser'ов
 }
 ```
 
@@ -3548,16 +3568,19 @@ Traverser = {
 
 ```
 mergeable(t1, t2) ⟺ t1.current == t2.current
-                  ∧ t1.path    == t2.path
+                  ∧ t1.trace   == t2.trace
                   ∧ t1.sack    == t2.sack
+                  ∧ t1.named_sacks == t2.named_sacks
                   ∧ t1.env     == t2.env
 ```
 
 Из этого следуют три практических правила:
 
 1. **Трекинг пути отключает bulking.** У двух traverser'ов, пришедших в одну вершину разными путями, `path` различается, поэтому они не сливаются. Как только в pipeline появляется `tv::path()` или именованный путь, компрессия по `bulk` для этой ветви исчезает, и кардинальность растёт как без неё. Поэтому путь трекается **лениво**: пока он не запрошен, он не материализуется и не мешает слиянию.
-2. **Именованный sack отключает bulking** ровно в той же мере: traverser'ы с разным накопленным состоянием — разные. Глобальный `sack`, одинаковый у всех, слиянию не мешает.
-3. **Агрегаты и side-effect умножаются на `bulk`.** `tv::count()` прибавляет `bulk`, а не единицу; `tv::sum(f)` прибавляет `f × bulk`; `tv::side_effect(...)` применяется с учётом кратности. Шаг, который «считает traverser'ы», обязан считать именно `bulk`, иначе компрессия изменит результат — это главный источник ошибок при реализации шагов.
+2. **Любой sack входит в identity.** Разные global или named sacks запрещают слияние.
+3. **Агрегаты и side-effect учитывают `bulk`.** `tv::count()` прибавляет `bulk`, а не
+   единицу; IMPURE side effect разворачивает bulk и исполняется один раз на каждый logical
+   traverser. `limit`/`skip` могут разделить bulk, `dedup` оставляет `bulk = 1`.
 
 **Инвариант корректности.** Для любого шага `s` результат обязан совпадать с результатом на развёрнутом потоке:
 
@@ -3588,40 +3611,38 @@ Pipeline начинается с исходного набора и послед
   |> @step3(...)
 ```
 
-Источник — любой statement, возвращающий набор атомов или записей: `SELECT`, `MATCH`, `TRAVERSE`, литеральный массив.
+Источник — любой expression или statement, возвращающий допустимый source: graph/occurrence,
+`SELECT`, `MATCH`, `TRAVERSE`, array, set либо конечный range.
 
 ### 13.3. TRAVERSE
 
 `TRAVERSE` — явный старт traversal pipeline.
 
 ```
-TRAVERSE [ CONSTRAINTS <@path_constraints> ] @source
+TRAVERSE [ CONSTRAINTS <@path_constraints> ]
+    FROM @source
+    [ IN GRAPH @graph_ref ]
     |> step(...)
     |> step(...)
+[ RETURN @projection ]
+[ TIMEOUT @duration ]
 ;
 
-TRAVERSE ATOM [ CONSTRAINTS <@path_constraints> ] @atom_source
+TRAVERSE ATOM [ CONSTRAINTS <@path_constraints> ]
+    FROM @source
+    [ IN GRAPH @graph_ref ]
     |> step(...)
     |> step(...)
+[ RETURN @projection ]
+[ TIMEOUT @duration ]
 ;
-
-@source ::=
-    FROM @graph |> @source_step    -- Граф-источник, за которым обязательно следует шаг, генерирующий исходный набор (см. "Навигация" в §13.4)
-    | FROM @record_id           -- Начать с конкретного атома
-    | FROM MATCH @pattern       -- Использовать MATCH как источник (смешанный стиль)
-    | FROM SELECT ...           -- Использовать SELECT как источник (смешанный стиль)
-
-@atom_source ::=
-    FROM <(@endpoint_ref)>      -- Начать с vertex-атома
-    | FROM <[@endpoint_ref]>    -- Начать с edge-атома
-    | FROM MATCH @atom_pattern
-    | FROM SELECT ...
 ```
 
-В `TRAVERSE ATOM` прямой стартовый атом всегда указывает свой kind: `FROM <(@endpoint_ref)>`
-для vertex или `FROM <[@endpoint_ref]>` для edge. Например,
-`TRAVERSE ATOM FROM <[relation:depends]> |> tv::out('CAUSES')`. Запросы и графовые выражения
-в роли источника дополнительной обёртки не требуют.
+`GraphRef` требует первым генерирующим шагом `tv::V()` или `tv::E()`. `RecordId`/`AtomRef`
+требуют `IN GRAPH`, поскольку не содержат occurrence scope. `AtomOccurrenceRef` использует
+собственный graph. MATCH создаёт traverser на binding row, SELECT — на value/object row.
+Array сохраняет порядок, set использует canonical order, range обязан быть конечным. Bare atom
+без graph scope отклоняется до row pull.
 
 Глобальные `CONSTRAINTS` применяются ко всем шагам, которые порождают путь. Для шага без
 собственного path mode действует `TRAIL`; локальный mode/objective/filter шага переопределяет
@@ -3641,15 +3662,6 @@ TRAVERSE нужен когда:
 - Нужны повторения обходов с нетривиальным условием остановки
 - Применяется `side_effect()` или алгоритмы
 - Требуется ветвление потока
-
-Пример: PageRank внутри подграфа
-```
-TRAVERSE FROM graph::inner(mv)
-    |> tv::V()
-    |> tv::pagerank(damping=0.85, iterations=20)
-    |> tv::order("rank", "desc")
-    |> tv::limit(10);
-```
 
 Пример: накопление весов пути через sack
 ```
@@ -3760,7 +3772,6 @@ RETURN weights_sum;
 | `tv::shortestPath(target)`                        | Кратчайший путь до target по числу рёбер (BFS)                                      |
 | `tv::weightedShortestPath(target, weight_field?)` | Взвешенный кратчайший путь (Dijkstra); требует неотрицательных весов                |
 | `tv::bellmanFord(target, weight_field?)`          | Взвешенный кратчайший путь с отрицательными весами; сообщает об отрицательном цикле |
-| `tv::allShortestPaths(target)`                    | Все кратчайшие пути до target                                                       |
 | `tv::distanceTo(target, weight_field?)`           | Только длина/стоимость, без материализации пути                                     |
 | `tv::kHop(k)`                                     | Множество вершин ровно на расстоянии k                                              |
 
@@ -3772,27 +3783,16 @@ RETURN weights_sum;
 | `tv::stronglyConnectedComponents()`      | Компоненты сильной связности (SCC)                                 |
 | `tv::weaklyConnectedComponents()`        | Компоненты слабой связности (WCC)                                  |
 | `tv::condensation()`                     | Конденсация по SCC — DAG из компонент                              |
-| `tv::minimumSpanningTree(weight_field?)` | Минимальное остовное дерево / лес                                  |
+| `tv::minimumSpanningForest(weight_field?)` | Минимальный остовный лес                                           |
 | `tv::findCuts()`                         | Точки сочленения и мосты                                           |
 | `tv::lca(a, b)`                          | Наименьший общий предок (binary lifting; требует корневого дерева) |
 | `tv::hasCycle()`                         | Наличие цикла                                                      |
 | `tv::reachable(target)`                  | Достижимость; использует reachability-индекс, если он `ready`      |
 
-**Аналитика и центральности**
-
-| Шаг                                             | Описание                                           |
-|-------------------------------------------------|----------------------------------------------------|
-| `tv::pagerank(damping: float, iterations: int)` | PageRank                                           |
-| `tv::degreeCentrality(direction?)`              | Центральность по степени                           |
-| `tv::betweennessCentrality(sampling?)`          | Центральность по посредничеству (Brandes)          |
-| `tv::closenessCentrality()`                     | Центральность по близости                          |
-| `tv::triangleCount()`                           | Число треугольников на вершину                     |
-| `tv::clusteringCoefficient()`                   | Коэффициент кластеризации                          |
-| `tv::labelPropagation(iterations: int)`         | Выделение сообществ распространением меток         |
-| `tv::louvain(resolution?)`                      | Выделение сообществ (модулярность, Louvain)        |
-| `tv::algo(name, config)`                        | Запуск произвольного зарегистрированного алгоритма |
-
-Алгоритмы, требующие полного обзора графа (`SCC`, `WCC`, `pagerank`, `louvain`, центральности), являются **барьерными** ([§13.8](#138-классы-шагов)): они материализуют поток целиком и не могут быть слиты с соседними шагами.
+Graph-wide algorithms работают над induced graph node occurrences одного `GraphId` и являются
+barrier-операторами. PageRank, centralities, all-shortest enumeration, triangles, clustering,
+label propagation и Louvain принадлежат этапу 26. Пользовательский `tv::algo` registry
+принадлежит этапу 21.
 
 ### 13.5. Sack
 
@@ -3819,7 +3819,7 @@ Traversal возвращает `Stream<Traverser>`, который преобр�
 - `tv::count()` → число;
 - `tv::fold()` → один массив.
 
-Без явного терминирующего шага traversal возвращает `array<atom>`.
+Без `RETURN` traversal возвращает `array<Value>` текущих значений.
 
 ### 13.7. Материализация
 
@@ -3866,14 +3866,13 @@ Materialization происходит только на:
 
 Оптимизация: хранить path как ```Path = persistent structure (rope / arena index)``` -> O(1) append.
 
-### 13.10. Parallel execution
+### 13.10. Execution mode и parallelism
 
-Traversal VM должна поддерживать:
-1. Data parallelism ```partition traversers across threads```;
-2. Step parallelism (ограниченно).
-   Только для:
-   - stateless steps;
-   - pure functions.
+Baseline — однопоточный sync pull. `FAST` снимает требования стабильного неоговорённого
+порядка и pure merge order, но сохраняет result multiset, ACID, constraints, errors и budgets.
+Parallel execution добавляется только после CPU hotspot не менее 20% и paired gain не менее
+15% на 4/8 cores при приемлемых p99/RSS. IMPURE closures и DML side effects всегда исполняются
+последовательно в source order.
 
 ### 13.11. Cost hotspots
 
@@ -3882,10 +3881,9 @@ Traversal дорогой в:
 - repeat();
 - path tracking.
 
-Обязательные оптимизации:
-- adjacency index;
-- degree-aware planning;
-- path pruning.
+Planner использует доступные adjacency/index/statistics, degree-aware estimates и path pruning.
+Отсутствующий специализированный индекс не меняет correctness и не является основанием для
+speculative implementation.
 
 ---
 
@@ -4180,25 +4178,27 @@ RETURN mv, $inner;
 Кросс-уровневое ребро соединяет атомы на разных уровнях вложенности. Если endpoint является
 ребром, его обход требует `ATOM`, как и для любой V–E/E–V/E–E связи.
 
-Свойства ребра могут содержать объект, содержащий пути по мета-вершинам от самого верхнего уровня до концов ребра.
-Для этого используется предложение `KEEP LEVELPATH`, добавляющее в свойства ребра **уровневый путь** — набор ссылок на мета-вершины, 
-начиная с мета-вершины одного конца кросс-уровневого ребра, заканчивая вершиной / мета-вершиной уровнями ниже другого конца этого ребра.
+Уровневые пути к концам кросс-уровневого ребра можно вычислить без изменения
+данных через `graph::level_path(occurrence)`. Если путь нужно сохранить как system-managed
+graph-local property, `KEEP LEVELPATH` указывается в создающем или изменяющем occurrence
+`ATTACH`, `RELATE` или graph-scoped `UPDATE`, а не в `MATCH`/`TRAVERSE`.
 
 ```
 -- CROSS_LEVEL явно указывает на поиск кросс-уровневого ребра
 MATCH CONSTRAINTS <CROSS_LEVEL>
       (Module AS mv)-[DEPENDS_ON AS e]->(Subsubmodule AS v)
 IN GRAPH catalog
-KEEP LEVELPATH
-RETURN mv, v, e.levelpath;
+RETURN mv, v, graph::level_path(e) AS levelpath;
 
 -- Output
 {
     "mv": 01KRMDFC2Q4ABBQ0WCE95T0W8W,
     "v": 01KRMDG8VQ278PE3BHYXHNHYR4,
-    "levelpath": [01KRMDFC2Q4ABBQ0WCE95T0W8W, 01KRMDGVM5MTRG9KTW5YFQR9FJ, 01KRMDG8VQ278PE3BHYXHNHYR4]
-                                                        ^^^
-                   Некоторая мета-вершина типа Submodule в цепочке вложенности: Module -> Submodule -> Subsubmodule
+    "levelpath": {
+        "kind": "binary_edge",
+        "source": { "atom": mv, "chains": [...] },
+        "target": { "atom": v, "chains": [...] }
+    }
 }
 ```
 
@@ -4235,8 +4235,11 @@ RETURN v, target;
 
 ### 15.11. LevelPath — не путь traversal
 
-LevelPath (§5.11.3) хранится в свойствах ребра. Нет traversal по LevelPath.
-Подъём по иерархии вложенности — только через свойства.
+LevelPath (§5.11.3) — system-managed graph-local overlay node occurrence либо binary edge
+occurrence. `MATCH`/`TRAVERSE` не мутируют данные. Сохранение выполняет только явный
+`ATTACH`/`RELATE`/graph-scoped `UPDATE ... KEEP LEVELPATH`; dynamic
+`graph::level_path(occurrence)` вычисляет тот же object без записи. LevelPath не становится
+частью traversal `Path` и не принимается path-functions.
 
 ### 15.12. Семантика переходов в AtomWalk
 
@@ -4635,15 +4638,14 @@ BEGIN [ ISOLATION LEVEL @level ] [ READ ONLY ]
       [ EXECUTION MODE DETERMINISTIC | BEST_EFFORT | FAST ];
 ```
 
-Режим задаётся на транзакцию. В исполнимом профиле этапа 14 поддержаны `BEST_EFFORT`
-(default) и `DETERMINISTIC`. `FAST` возвращает typed unsupported до открытия транзакции и
-принадлежит этапу 17.
+Режим задаётся на транзакцию. В исполнимом профиле этапа 17 поддержаны `BEST_EFFORT`
+(default), `DETERMINISTIC` и `FAST`.
 
 | Режим                        | Гарантии                                                                                                                                                                                                                                                                                                                 |
 |------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `BEST_EFFORT` (по умолчанию) | Результат детерминирован по содержимому, но порядок без `ORDER BY` не гарантирован; план может меняться между запусками                                                                                                                                                                                                  |
 | `DETERMINISTIC`              | Строгая воспроизводимость при одинаковых snapshot, canonical parameters, user seed и engine build: стабильный порядок, канонический plan и фиксированный порядок floating-point reduction. Без `ORDER BY` результат доупорядочивается stable public identity. `time::now()` и другие недетерминированные/IMPURE функции отклоняются до чтения данных; scalar `rand()`/`uuid()` остаются неисполняемыми до этапа 21 |
-| `FAST`                       | Максимум производительности, никаких гарантий порядка и стабильности плана                                                                                                                                                                                                                                               |
+| `FAST`                       | Та же ACID/FCW/SSI/constraint/error semantics и тот же result multiset. Без явного `ORDER BY` не гарантирует порядок, plan/replay stability, pure branch/hash merge order и schedule float reductions; int/decimal остаются exact. Approximation, sampling, early cutoff и пропуск validation запрещены. |
 
 `DETERMINISTIC` допустим только при `SNAPSHOT` и `SERIALIZABLE`; `READ COMMITTED` запрещён.
 Effective seed включает version, normalized query fingerprint, canonical parameter fingerprint,
@@ -4683,8 +4685,9 @@ RapidHash V3 по versioned canonical physical-plan bytes: `DefaultHasher`, `Deb
 | `type::` | `is<T>`, `to<T>` | — |
 | `meta::` | `id`, `class`, `type` | — |
 | `option::` | `is_some`, `is_none` | — |
-| `graph::` / path / pipeline | — | этапы 16–17 |
-| UDF / closures / `regex::` | — | этап 21 |
+| `graph::` / path / pipeline | graph occurrence/path functions этапов 16–17 | `tv::algo` registry — этап 21 |
+| closures | session-scoped language closures — этап 17 | UDF/catalog/overloads/recursion — этап 21 |
+| `regex::` | — | этап 21 |
 | `search::` | — | этап 22 |
 | `geo::` | — | этап 24 |
 | `computed::` | — | назначенный schema/query этап |
@@ -4714,6 +4717,12 @@ DEFINE PURE FUNCTION fn::calc_weight(a: record<person>, b: record<person>) -> fl
 ```
 
 Тип: $`closure<(T_1, T_2, \dots) → U>`$.
+
+Session-scoped closures исполнимы с этапа 17. Их runtime identity принадлежит `GqlSession`,
+captures сохраняются по значению, а вызов через другую/закрытую session является typed error.
+`PURE`/`STABLE_READ` closures допустимы в predicate/map/control positions;
+`DATA_MUTATION` — только в явном `tv::side_effect`; `SCHEMA_MUTATION` запрещена во время
+активного traversal. Именованные UDF, overload catalog, recursion и `tv::algo` остаются этапу 21.
 
 ### 18.5. Purity
 

@@ -281,7 +281,10 @@ fn multiple_transaction_blocks_and_session_drop_preserve_only_published_work() {
 	assert!(!atom_exists(&store, "person:dropped"));
 
 	let mut session = store.session();
-	assert!(session.execute("BEGIN EXECUTION MODE FAST;", &Object::new()).is_err());
+	let fast = session.execute("BEGIN EXECUTION MODE FAST;", &Object::new()).unwrap();
+	assert!(fast[0].result.is_ok());
+	assert!(session.has_active_transaction());
+	session.execute("CANCEL;", &Object::new()).unwrap();
 	assert!(!session.has_active_transaction());
 }
 

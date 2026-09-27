@@ -352,9 +352,11 @@ impl CombinedLayout {
 		catalog.files.sort_unstable_by_key(|item| (item.space_id, item.file_id));
 		catalog.encode()?;
 
-		// Keep these test-only metadata pages at stable addresses across the I/O loop. This is a
-		// conservative Q-27 mitigation; the investigation did not prove that every populated
-		// over-aligned stack value is unsafe. Production bulk builders initialize final frames in place.
+		// Keep these test-only metadata pages at stable addresses across the
+		// I/O loop. This is a conservative Q-27 mitigation; the
+		// investigation did not prove that every populated over-aligned
+		// stack value is unsafe. Production bulk builders initialize final
+		// frames in place.
 		let atom_superblock_page = Box::new(empty_atom.superblock.encode()?);
 		let graph_superblock_page = Box::new(empty_graph.superblock.encode()?);
 		for item in &catalog.files {

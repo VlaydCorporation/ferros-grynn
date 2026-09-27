@@ -38,6 +38,13 @@ pub(super) fn apply_graph_update(
 		data => apply_dml_data(data, &candidate.row, slots, source, &mut after, control)?,
 	}
 	after.insert("id", Value::Record(Box::new(candidate.record_id.clone())));
+	if candidate.before.get(crate::datastore::LEVEL_PATH_PROPERTY)
+		!= after.get(crate::datastore::LEVEL_PATH_PROPERTY)
+	{
+		return Err(FerrosGrynnError::invalid_argument(
+			"`levelpath` is a system-managed graph-local property; use KEEP LEVELPATH.",
+		));
+	}
 	validate_dml_object(schema, &after)?;
 	apply_minimal_overlay(transaction, graph, candidate, data, dictionary, &after)?;
 	if let Some(label) = label {

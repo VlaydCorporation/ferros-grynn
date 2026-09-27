@@ -3,7 +3,7 @@
 use std::hash::{Hash, Hasher};
 
 use super::{Cardinality, PLAN_ENCODING_VERSION, PlanCost};
-use crate::{datastore::IndexId, syn::SelectJoinKind, values::RecordId};
+use crate::{datastore::IndexId, gql::ir::TraverseStepKind, syn::SelectJoinKind, values::RecordId};
 
 /// One observable fallback or planning-risk reason.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -16,6 +16,8 @@ pub(crate) enum PlanWarning {
 	IndexUnavailable(Box<str>),
 	/// Expected memory exceeds the in-memory barrier budget.
 	ResourceRisk(Box<str>),
+	/// The requested execution mode is intentionally serialized by effects.
+	ExecutionLimited(Box<str>),
 }
 
 /// Physical source selected for one logical relation.
@@ -283,6 +285,60 @@ pub(crate) struct PhysicalMatchPlan {
 	pub(crate) warnings: Vec<PlanWarning>,
 }
 
+/// Concrete input adapter selected for a traversal statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TraversalSourceOperator {
+	/// A scalar or collection expression evaluated once.
+	ValueSource,
+	/// Rows produced by the existing MATCH executor.
+	MatchSource,
+	/// Rows produced by the existing SELECT executor.
+	SelectSource,
+}
+
+/// Concrete traversal operator fixed before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TraversalOperator {
+	/// Initial source adapter.
+	Source(TraversalSourceOperator),
+	/// One analyzed `tv::` step.
+	Step(TraverseStepKind),
+	/// Final traversal RETURN projection.
+	Project,
+}
+
+/// One stable-preorder traversal plan node.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PhysicalTraversalNode {
+	/// Stable node identifier used by EXPLAIN.
+	pub(crate) node_id: u32,
+	/// Source-order step index, absent for source and projection nodes.
+	pub(crate) step_index: Option<usize>,
+	/// Selected concrete operation.
+	pub(crate) operator: TraversalOperator,
+	/// Whether FAST may merge this operator's output without stable ordering.
+	pub(crate) unordered: bool,
+	/// Operator output estimate.
+	pub(crate) cardinality: Cardinality,
+	/// Operator-local fixed-point cost.
+	pub(crate) cost: PlanCost,
+	/// Canonical hash of a nested MATCH or SELECT plan, when present.
+	pub(crate) nested_plan_hash: Option<u64>,
+}
+
+/// Complete physical plan for the streaming traversal VM.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PhysicalTraversalPlan {
+	/// Physical operators in stable execution order.
+	pub(crate) nodes: Vec<PhysicalTraversalNode>,
+	/// Estimated final traverser count.
+	pub(crate) cardinality: Cardinality,
+	/// Total fixed-point plan cost.
+	pub(crate) cost: PlanCost,
+	/// Stable planning warnings.
+	pub(crate) warnings: Vec<PlanWarning>,
+}
+
 impl PhysicalMatchPlan {
 	/// Returns the selected expansion operator for one linear operation.
 	pub(crate) fn operation(
@@ -350,6 +406,8 @@ pub(crate) enum PhysicalPlan {
 	Select(PhysicalSelectPlan),
 	/// Current executable MATCH profile.
 	Match(PhysicalMatchPlan),
+	/// Streaming traversal VM.
+	Traversal(PhysicalTraversalPlan),
 	/// DDL or DML phase sequence.
 	Write(PhysicalWritePlan),
 }
@@ -393,8 +451,18 @@ impl PhysicalPlan {
 				plan.cost.hash(&mut writer);
 				plan.warnings.hash(&mut writer);
 			}
-			Self::Write(plan) => {
+			Self::Traversal(plan) => {
 				2_u8.hash(&mut writer);
+				for node in &plan.nodes {
+					node.node_id.hash(&mut writer);
+					node.step_index.hash(&mut writer);
+					node.operator.hash(&mut writer);
+					node.unordered.hash(&mut writer);
+					node.nested_plan_hash.hash(&mut writer);
+				}
+			}
+			Self::Write(plan) => {
+				3_u8.hash(&mut writer);
 				plan.operators.hash(&mut writer);
 			}
 		}

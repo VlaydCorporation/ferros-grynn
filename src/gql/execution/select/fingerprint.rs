@@ -261,6 +261,37 @@ fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 				hash_expr(argument, state);
 			}
 		}
+		TypedExprKind::Closure(closure) => {
+			closure.parameters.hash(state);
+			closure.captures.hash(state);
+			closure.result.hash(state);
+			std::mem::discriminant(&closure.effect).hash(state);
+			closure.slot_count.hash(state);
+			if let crate::gql::ir::LogicalClosureBody::Expression(body) = &closure.body {
+				hash_expr(body, state);
+			}
+		}
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => {
+			hash_expr(callee, state);
+			for argument in arguments {
+				hash_expr(argument, state);
+			}
+		}
+		TypedExprKind::Traversal(traverse) => {
+			std::mem::discriminant(&traverse.source).hash(state);
+			if let LogicalTraverseSource::Expression(source) = &traverse.source {
+				hash_expr(source, state);
+			}
+			for step in &traverse.steps {
+				step.kind.hash(state);
+				for argument in &step.arguments {
+					hash_expr(argument, state);
+				}
+			}
+		}
 		TypedExprKind::Aggregate {
 			function,
 			argument,

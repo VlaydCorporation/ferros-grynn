@@ -29,8 +29,18 @@ pub(in crate::gql::execution) trait AtomFieldRead {
 	/// Reads `id`, `label`, or a dictionary-backed property.
 	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value>;
 
+	/// Reads one public field through a graph-scoped occurrence identity.
+	fn occurrence_field(
+		&self,
+		occurrence: &AtomOccurrenceRef,
+		field: &str,
+	) -> FerrosGrynnResult<Value>;
+
 	/// Returns the inner/transition graph owned by one occurrence.
 	fn inner_graph(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value>;
+
+	/// Computes the canonical read-only LevelPath for one occurrence.
+	fn level_path(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value>;
 
 	/// Reads a field through a stable database record reference.
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value>;
@@ -51,8 +61,24 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 		)))
 	}
 
+	fn occurrence_field(
+		&self,
+		_occurrence: &AtomOccurrenceRef,
+		_field: &str,
+	) -> FerrosGrynnResult<Value> {
+		Err(FerrosGrynnError::invalid_argument(
+			"SELECT row has no graph-local occurrence resolver.",
+		))
+	}
+
 	fn inner_graph(&self, _occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		Err(FerrosGrynnError::invalid_argument("graph::inner requires a MATCH atom occurrence"))
+	}
+
+	fn level_path(&self, _occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
+		Err(FerrosGrynnError::invalid_argument(
+			"graph::level_path requires a MATCH atom occurrence",
+		))
 	}
 
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
@@ -168,6 +194,22 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 		}
 	}
 
+	fn occurrence_field(
+		&self,
+		occurrence: &AtomOccurrenceRef,
+		field: &str,
+	) -> FerrosGrynnResult<Value> {
+		let graph = self.read.graph(self.snapshot, occurrence.graph())?;
+		let atom = graph.atom_id(occurrence.atom())?.ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist(
+				occurrence.atom().kind().to_string(),
+				occurrence.atom().id().to_string(),
+			)
+		})?;
+		drop(graph);
+		self.field(BoundAtom::new(occurrence.graph().id(), atom), field)
+	}
+
 	fn inner_graph(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		let owner = self.register(occurrence.graph().clone());
 		let graph = self.read.graph(self.snapshot, &owner)?;
@@ -196,12 +238,16 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 		}))
 	}
 
+	fn level_path(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
+		self.read.level_path(self.snapshot, occurrence)
+	}
+
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
 		self.read.record_field(self.snapshot, record, None, field)
 	}
 }
 
-fn properties_object(
+pub(in crate::gql::execution) fn properties_object(
 	properties: &crate::values::PropertyMap,
 	dictionary: &PropertyDictionary,
 ) -> FerrosGrynnResult<Object> {

@@ -41,9 +41,11 @@ class/label/degree statistics и не делегирует выбор алгор
 normalized constraints, seed/order, estimates и warnings; ANALYZE — actual branches,
 frontier/trace, graph opens, containment/hyper и spill metrics.
 
-Q-10 sparse frame-IoRing остаётся открытым: materialized `GraphRead` не предоставляет
-физическое page frontier. Stage 16 собирает logical frontier metrics; physical sparse cursor
-может быть подключён на этапе 17 только при наличии реального local page window.
+`Q-10` закрыт 2026-09-27 на реальном snapshot-exact local physical frontier. Для подходящего
+`NativeAsync` sparse window production router выбирает frame-IoRing QD32; `Sync`, singleton
+miss и неподходящее окно используют sync Direct. Paired evidence и точная profiling-пара
+зафиксированы в
+[`gql_traversal_stage_17_q10_report.md`](reports/gql_traversal_stage_17_q10_report.md).
 
 ## Исторический технический профиль P0–P2
 
@@ -618,25 +620,34 @@ Scan(Person AS a) → Filter(a.age>18) → Expand(Out,FRIEND,b) → Filter(label
 
 ## 8. Traversal VM — исполнение pipeline
 
-Реализация — `src/gql/traversal` (`TraversalMachine`, `TraversalContext`, `TraversalStep`, `Traverser`). Семантика — §13 gql_spec.
+Реализация — bounded submodules `src/gql/traversal/{machine,source,navigation,state,control,
+barrier,algorithm}.rs`; один многотысячестрочный файл и универсальный traversal trait не
+создаются. Семантика — §13 `gql_spec`.
 
 ### 8.1. Модель
 
 Traversal — потоковая обработка `Stream<Traverser>`. Каждый шаг: `Stream<Traverser> → Stream<Traverser>`.
 ```
 Traverser = {
-    current: atom | value,   -- текущий элемент
-    path:    Path?,          -- накопленный путь (по запросу)
-    sack:    Value?,         -- локальное состояние (накопление)
-    env:     Bindings,       -- биндинги из MATCH/LET
-    bulk:    u64             -- счётчик одинаковых traverser'ов (компрессия)
+    current:     Value,
+    trace:       PathTraceId?,
+    sack:        Value,
+    named_sacks: NamedSacks,
+    env:         BindingSlots,
+    bulk:        NonZeroU64
 }
 ```
-`TraversalMachine::execute(graph, initial_ids) -> Iterator<Traverser>` строит начальный поток из `initial_ids` и последовательно применяет `steps`. `TraversalContext` держит `side_effects: RefCell<Map<String, AnyValue>>` — глобальное состояние запроса (агрегаты, счётчики).
+`TraversalMachine` является concrete sync pull executor physical plan. `TraversalContext`
+держит statement-local side effects, graph cache, path arena, budgets и execution control.
 
 ### 8.2. Ключевая оптимизация — bulk
 
-`bulk` (как в Gremlin) агрегирует одинаковые traverser-состояния без физического дублирования: N идентичных путешественников представляются одним с `bulk = N`. Шаги, не различающие traverser'ы, работают над `bulk` арифметически; ветвление/различающие шаги разворачивают bulk.
+`bulk` агрегирует состояния только при полном равенстве `current`, `trace`, `sack`,
+`named_sacks` и `env`. Tracking path отключает merge ветви. `limit`/`skip` могут делить bulk,
+`dedup` оставляет `bulk=1`, overflow является typed error. IMPURE side effect разворачивает
+bulk и вызывается один раз на каждый logical traverser. Merge выполняется adjacent и bounded
+hash способом только на естественных frontier/barrier boundaries; при memory pressure поток
+продолжается несжатым.
 
 ### 8.3. Классы шагов (§13.8 gql_spec)
 
@@ -657,7 +668,7 @@ Traverser = {
 
 ### 8.5. Path propagation
 
-На каждом шаге trace расширяется новым `PathTraceNode` (§13.9). Planner включает tracking с
+На каждом navigation step trace расширяется новым `PathTraceNode` (§13.9). Planner включает tracking с
 начала обхода, если path именован, возвращается, используется `tv::path()` либо path-функцией.
 Если path статически не используется, trace не создаётся. Barrier сам по себе не обязан
 материализовывать path; это делают `RETURN`, `collect` и операторы, которым нужна полная
@@ -665,7 +676,10 @@ Traverser = {
 
 ### 8.6. Control flow
 
-`repeat(pipeline)` — fixpoint-итерация с условиями остановки `.times(n)` / `.until(closure)` / `.emit()`. Обязателен конечный критерий (§18.6 gql_spec) — защита от бесконечных циклов. `branch`/`choose`/`coalesce` формируют нелинейный execution graph.
+`repeat(pipeline)` использует `.times(n)`, `.until(closure)` и optional `.emit()`.
+`times(0)` возвращает input. Каждый backedge учитывается общим loop budget. `branch` сохраняет
+объявленный порядок, `choose` выбирает одну ветвь, `coalesce` откатывает savepoint пустой
+альтернативы и сохраняет первую непустую; ошибка не маскируется.
 
 ### 8.7. Материализация и барьеры
 
@@ -676,17 +690,48 @@ Traverser = {
 `GraphRead`, совпадающий по origin и snapshot; при отсутствии исторической версии возвращается
 `SnapshotUnavailable`, а не latest value.
 
-### 8.8. Параллелизм
+### 8.8. `FAST` и параллелизм
 
-VM поддерживает (§13.10): **data parallelism** (партиционирование traverser'ов по потокам) и **step parallelism** (ограниченно — только для stateless-шагов и pure-функций). Cost hotspots (§13.11): fan-out на high-degree узлах, `repeat`, path-tracking. Обязательные оптимизации: adjacency index, degree-aware planning, path pruning.
+Baseline — однопоточный sync pull. `FAST` сохраняет exact result multiset, ACID, constraints,
+errors и budgets, но снимает требования неоговорённого stable order/plan/hash merge и float
+reduction schedule. Int/decimal остаются exact. IMPURE closures и DML side effects всегда
+source-ordered. Parallel path добавляется только после CPU hotspot ≥20% и paired gain ≥15% на
+4/8 cores при допустимых p99/RSS.
 
 ### 8.9. Терминирование
 
-Без явного терминирующего шага traversal возвращает `array<atom>`. Иначе: `values → array<scalar>`, `path → array<path>`, `project → array<object>`, `count → int`, `fold → array` (§13.6).
+Без `RETURN` traversal возвращает `array<Value>` current values. Иначе: `values →
+array<scalar>`, `path → array<path>`, `project → array<object>`, `count → int`, `fold → array`
+(§13.6).
 
 ### 8.10. Взаимодействие с декларативной ветвью
 
-Источник pipeline — любой оператор, возвращающий набор (`SELECT`, `MATCH`, `TRAVERSE`, массив, переменная). Понижение `src |> tv::step` → `TraversalStep` над IR-узлом источника (§5.3). Внутри одного запроса MATCH исполняется join-движком, traversal — VM; данные передаются через материализованный набор атомов на границе.
+Источник pipeline — допустимый expression/operator (`SELECT`, `MATCH`, `TRAVERSE`, array, set,
+range, parameter или idiom). Понижение `src |> tv::step` создаёт typed traversal source и steps.
+MATCH остаётся единым pull executor и подаёт binding rows напрямую; обязательной полной
+materialization на MATCH→TRAVERSE boundary нет. `tv::match` открывает существующий MATCH как
+correlated pull source.
+
+### 8.11. Language closures
+
+`GqlSession` владеет concrete registry `RuntimeId → typed body/captures/signature/effect/owner`
+с лимитом 256 МиБ. Native `Closure::call` сохраняется, language closure разрешается evaluator
+через текущую session. Вызов использует transaction savepoint. Effect analysis различает
+`PURE`, `STABLE_READ`, `DATA_MUTATION`, `SCHEMA_MUTATION`; traversal принимает mutation только
+в `tv::side_effect`, а schema mutation во время traversal запрещена. Downstream step читает
+новую private-root epoch, upstream cursor не перезапускается.
+
+### 8.12. Physical traversal cursor
+
+Local adapter предоставляет GQL только owned logical `expand`, `resolve_fields` и
+`resolve_inner_graph`. `PhysicalTraversalCursor` внутри datastore фиксирует exact storage
+snapshot/generation/bindings и строит окна до 256 logical operations/32 cold home pages.
+Source resolution выполняется R8 → visible WAL/staged → home; весь batch checksum-validates до
+decode/publication. Private mutation затронутого graph навсегда переводит остаток statement на
+materialized root. Paired `Q-10` gate пройден: frame-IoRing является production route только
+для bounded sparse window при `NativeAsync` и доступной platform capability. `Sync`, singleton
+miss, превышение окна и недоступная capability выбирают sync Direct до submission;
+пользовательский transport knob отсутствует.
 
 ---
 
@@ -1039,8 +1084,9 @@ Import и `ASSERT INVARIANTS` вызывают одну normalized-root validati
 assert ограничивает обход указанным graph и его atom references.
 
 Expression executor использует typed IR, единый `Value::is_truthy` и статический builtin
-enum/signature table. `time::now()` захватывается один раз при анализе statement. Runtime
-function registry, общая closure-система и отдельный control VM на этапах 11–12 не вводятся.
+enum/signature table. `time::now()` захватывается один раз при анализе statement. На этапах
+11–12 runtime function registry и общая closure-система не вводятся; session-scoped language
+closures принадлежат этапу 17, UDF/catalog registry — этапу 21.
 
 ---
 
@@ -1238,9 +1284,9 @@ Path-finding vs graph-expansion (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` прим�
 
 ### 15.1. Режимы исполнения
 
-`DETERMINISTIC` (строгая воспроизводимость), `BEST_EFFORT` (default) и будущий `FAST`.
-Формула: `Determinism = Snapshot + Seed + StableExecution + CanonicalPlan`. Этап 14 исполняет
-первые два режима; `FAST` остаётся typed unsupported до этапа 17. `DETERMINISTIC` допускает
+`DETERMINISTIC` (строгая воспроизводимость), `BEST_EFFORT` (default) и exact `FAST`.
+Формула: `Determinism = Snapshot + Seed + StableExecution + CanonicalPlan`. Этап 17 исполняет
+все три режима. `DETERMINISTIC` допускает
 только `SNAPSHOT` и `SERIALIZABLE`; `READ COMMITTED` отклоняется до открытия transaction.
 
 ### 15.2. Источники недетерминизма

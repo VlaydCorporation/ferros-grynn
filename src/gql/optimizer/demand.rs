@@ -13,6 +13,8 @@ use crate::{
 		LogicalSelectSource,
 		LogicalSelectSourceKind,
 		LogicalStatement,
+		LogicalTraverse,
+		LogicalTraverseSource,
 		MatchBinding,
 		MatchOp,
 		TypedExpr,
@@ -119,12 +121,52 @@ impl PlannerDemand {
 		demand
 	}
 
+	/// Discovers nested source, graph, and expression metadata used by one
+	/// traversal pipeline.
+	pub(in crate::gql) fn for_traverse(statement: &LogicalTraverse) -> Self {
+		let mut demand = match &statement.source {
+			LogicalTraverseSource::Expression(expression) => {
+				let mut demand = Self::default();
+				collect_expr(Some(expression), &[], &mut demand);
+				demand
+			}
+			LogicalTraverseSource::Match(statement) => Self::for_match(statement),
+			LogicalTraverseSource::Select(statement) => Self::for_select(statement),
+		};
+		if let Some(graph) = &statement.graph {
+			match graph {
+				LogicalGraphReference::Static(graph) => {
+					demand.graphs.insert(graph.id());
+				}
+				LogicalGraphReference::Expression(expression) => {
+					collect_expr(Some(expression), &[], &mut demand);
+				}
+			}
+		}
+		for step in &statement.steps {
+			if let Some(child) = &step.match_plan {
+				demand.merge(Self::for_match(child));
+			}
+			for argument in &step.arguments {
+				collect_expr(Some(argument), &[], &mut demand);
+			}
+			if let Some(repeat) = &step.repeat {
+				collect_expr(Some(&repeat.body), &[], &mut demand);
+				collect_expr(repeat.times.as_ref(), &[], &mut demand);
+				collect_expr(repeat.until.as_ref(), &[], &mut demand);
+			}
+		}
+		collect_expr(statement.returning.as_ref(), &[], &mut demand);
+		demand
+	}
+
 	/// Discovers metadata needed to explain one supported statement.
 	pub(in crate::gql) fn for_statement(statement: &LogicalStatement) -> Self {
 		match statement {
 			LogicalStatement::Explain(explain) => Self::for_statement(&explain.statement),
 			LogicalStatement::Select(select) => Self::for_select(select),
 			LogicalStatement::Match(statement) => Self::for_match(statement),
+			LogicalStatement::Traverse(statement) => Self::for_traverse(statement),
 			LogicalStatement::Dml(statement) => {
 				let mut demand = Self::default();
 				if let Some(graph) = &statement.graph {
@@ -409,6 +451,15 @@ fn collect_expr(
 				collect_expr(Some(argument), owners, demand);
 			}
 		}
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => {
+			collect_expr(Some(callee), owners, demand);
+			for argument in arguments {
+				collect_expr(Some(argument), owners, demand);
+			}
+		}
 		TypedExprKind::Aggregate {
 			argument,
 			..
@@ -417,7 +468,13 @@ fn collect_expr(
 			select,
 			..
 		} => demand.merge(PlannerDemand::for_select(select)),
-		TypedExprKind::Constant(_) | TypedExprKind::Slot(_) | TypedExprKind::CurrentField(_) => {}
+		TypedExprKind::Traversal(traversal) => {
+			demand.merge(PlannerDemand::for_traverse(traversal));
+		}
+		TypedExprKind::Constant(_)
+		| TypedExprKind::Slot(_)
+		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Closure(_) => {}
 	}
 }
 

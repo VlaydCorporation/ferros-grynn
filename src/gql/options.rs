@@ -17,12 +17,19 @@ fn next_statement_nonce() -> u64 {
 
 use parking_lot::Mutex;
 
-use super::{ParserSettings, QueryCursor, cursor::CursorRuntime};
+use super::{
+	ExecutionMode,
+	ParserSettings,
+	QueryCursor,
+	closure::{LanguageClosureEntry, LanguageClosureRegistry},
+	cursor::CursorRuntime,
+	ir::LogicalClosure,
+};
 use crate::{
 	datastore::Transaction,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult, Outcome, Status, StatusReport},
 	syn::TimeoutValue,
-	values::{Object, Value},
+	values::{Closure, Object, Value},
 };
 
 /// Cooperative cancellation handle shared with one or more query executions.
@@ -119,7 +126,8 @@ pub(crate) struct ExecutionControl {
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
 	continuation: Arc<Mutex<Option<QueryCursor>>>,
 	pending_index_seek: Arc<Mutex<Option<QueryCursor>>>,
-	deterministic: bool,
+	closure_registry: Arc<Mutex<LanguageClosureRegistry>>,
+	execution_mode: ExecutionMode,
 	user_seed: u64,
 	parameter_fingerprint: u64,
 	statement_nonce: u64,
@@ -136,6 +144,11 @@ struct MatchMetrics {
 	containment_links: AtomicU64,
 	hyper_assignments: AtomicU64,
 	cancellation_checks: AtomicU64,
+	physical_windows: AtomicU64,
+	physical_resident_pages: AtomicU64,
+	physical_wal_pages: AtomicU64,
+	physical_sync_pages: AtomicU64,
+	physical_ioring_pages: AtomicU64,
 }
 
 /// Snapshot of MATCH-specific counters collected by `EXPLAIN ANALYZE`.
@@ -148,6 +161,11 @@ pub(crate) struct MatchMetricsSnapshot {
 	pub(crate) containment_links: u64,
 	pub(crate) hyper_assignments: u64,
 	pub(crate) cancellation_checks: u64,
+	pub(crate) physical_windows: u64,
+	pub(crate) physical_resident_pages: u64,
+	pub(crate) physical_wal_pages: u64,
+	pub(crate) physical_sync_pages: u64,
+	pub(crate) physical_ioring_pages: u64,
 }
 
 impl MatchMetricsSnapshot {
@@ -163,6 +181,17 @@ impl MatchMetricsSnapshot {
 			cancellation_checks: self
 				.cancellation_checks
 				.saturating_sub(earlier.cancellation_checks),
+			physical_windows: self.physical_windows.saturating_sub(earlier.physical_windows),
+			physical_resident_pages: self
+				.physical_resident_pages
+				.saturating_sub(earlier.physical_resident_pages),
+			physical_wal_pages: self.physical_wal_pages.saturating_sub(earlier.physical_wal_pages),
+			physical_sync_pages: self
+				.physical_sync_pages
+				.saturating_sub(earlier.physical_sync_pages),
+			physical_ioring_pages: self
+				.physical_ioring_pages
+				.saturating_sub(earlier.physical_ioring_pages),
 		}
 	}
 }
@@ -291,7 +320,8 @@ impl ExecutionControl {
 			cursors,
 			continuation: Arc::new(Mutex::new(None)),
 			pending_index_seek: Arc::new(Mutex::new(None)),
-			deterministic: false,
+			closure_registry: Arc::new(Mutex::new(LanguageClosureRegistry::default())),
+			execution_mode: ExecutionMode::BestEffort,
 			user_seed: options.deterministic_seed,
 			parameter_fingerprint: 0,
 			statement_nonce: next_statement_nonce(),
@@ -300,8 +330,12 @@ impl ExecutionControl {
 		}
 	}
 
-	pub(crate) fn with_execution_mode(mut self, deterministic: bool, parameters: &Object) -> Self {
-		self.deterministic = deterministic;
+	pub(crate) fn with_execution_mode(
+		mut self,
+		execution_mode: ExecutionMode,
+		parameters: &Object,
+	) -> Self {
+		self.execution_mode = execution_mode;
 		self.parameter_fingerprint = crate::gql::optimizer::canonical_hash(
 			crate::gql::optimizer::PLAN_ENCODING_VERSION,
 			b"query-parameters",
@@ -310,8 +344,39 @@ impl ExecutionControl {
 		self
 	}
 
+	pub(crate) fn with_closure_registry(
+		mut self,
+		registry: Arc<Mutex<LanguageClosureRegistry>>,
+	) -> Self {
+		self.closure_registry = registry;
+		self
+	}
+
+	pub(in crate::gql) fn create_closure(
+		&self,
+		plan: &LogicalClosure,
+		slots: &[Value],
+	) -> FerrosGrynnResult<Closure> {
+		self.closure_registry.lock().register(plan, slots, self.statement_nonce)
+	}
+
+	pub(crate) const fn statement_nonce(&self) -> u64 {
+		self.statement_nonce
+	}
+
+	pub(in crate::gql) fn resolve_closure(
+		&self,
+		closure: &Closure,
+	) -> FerrosGrynnResult<LanguageClosureEntry> {
+		self.closure_registry.lock().resolve(closure)
+	}
+
 	pub(crate) const fn deterministic(&self) -> bool {
-		self.deterministic
+		matches!(self.execution_mode, ExecutionMode::Deterministic)
+	}
+
+	pub(crate) const fn fast(&self) -> bool {
+		matches!(self.execution_mode, ExecutionMode::Fast)
 	}
 
 	pub(crate) const fn with_publication_deferred(mut self, deferred: bool) -> Self {
@@ -334,7 +399,7 @@ impl ExecutionControl {
 			self.parameter_fingerprint,
 			snapshot,
 			self.user_seed,
-			if self.deterministic {
+			if self.deterministic() {
 				0
 			} else {
 				self.statement_nonce
@@ -393,7 +458,8 @@ impl ExecutionControl {
 			cursors: self.cursors.clone(),
 			continuation: self.continuation.clone(),
 			pending_index_seek: self.pending_index_seek.clone(),
-			deterministic: self.deterministic,
+			closure_registry: self.closure_registry.clone(),
+			execution_mode: self.execution_mode,
 			user_seed: self.user_seed,
 			parameter_fingerprint: self.parameter_fingerprint,
 			statement_nonce: self.statement_nonce,
@@ -511,6 +577,24 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Records one fully decoded local physical-frontier window.
+	pub(crate) fn record_physical_traversal(
+		&self,
+		resident_pages: u64,
+		wal_pages: u64,
+		sync_pages: u64,
+		ioring_pages: u64,
+	) {
+		if !self.instrumentation {
+			return;
+		}
+		self.match_metrics.physical_windows.fetch_add(1, Ordering::Relaxed);
+		self.match_metrics.physical_resident_pages.fetch_add(resident_pages, Ordering::Relaxed);
+		self.match_metrics.physical_wal_pages.fetch_add(wal_pages, Ordering::Relaxed);
+		self.match_metrics.physical_sync_pages.fetch_add(sync_pages, Ordering::Relaxed);
+		self.match_metrics.physical_ioring_pages.fetch_add(ioring_pages, Ordering::Relaxed);
+	}
+
 	/// Returns MATCH counters collected so far.
 	pub(crate) fn match_metrics(&self) -> MatchMetricsSnapshot {
 		MatchMetricsSnapshot {
@@ -521,6 +605,14 @@ impl ExecutionControl {
 			containment_links: self.match_metrics.containment_links.load(Ordering::Acquire),
 			hyper_assignments: self.match_metrics.hyper_assignments.load(Ordering::Acquire),
 			cancellation_checks: self.match_metrics.cancellation_checks.load(Ordering::Acquire),
+			physical_windows: self.match_metrics.physical_windows.load(Ordering::Acquire),
+			physical_resident_pages: self
+				.match_metrics
+				.physical_resident_pages
+				.load(Ordering::Acquire),
+			physical_wal_pages: self.match_metrics.physical_wal_pages.load(Ordering::Acquire),
+			physical_sync_pages: self.match_metrics.physical_sync_pages.load(Ordering::Acquire),
+			physical_ioring_pages: self.match_metrics.physical_ioring_pages.load(Ordering::Acquire),
 		}
 	}
 
@@ -661,7 +753,10 @@ mod tests {
 	use std::num::NonZeroUsize;
 
 	use super::{ExecutionControl, QueryExecutionOptions, parse_fixed_duration};
-	use crate::values::{Object, Value};
+	use crate::{
+		gql::ExecutionMode,
+		values::{Object, Value},
+	};
 
 	#[test]
 	fn duration_at_rounded_u64_boundary_is_rejected_without_panicking() {
@@ -697,16 +792,16 @@ mod tests {
 			..QueryExecutionOptions::default()
 		};
 		let first = ExecutionControl::new(&options, None)
-			.with_execution_mode(true, &parameters)
+			.with_execution_mode(ExecutionMode::Deterministic, &parameters)
 			.statement_seed(13, 17);
 		let second = ExecutionControl::new(&options, None)
-			.with_execution_mode(true, &parameters)
+			.with_execution_mode(ExecutionMode::Deterministic, &parameters)
 			.statement_seed(13, 17);
 		assert_eq!(first, second);
 
 		parameters.insert("value", Value::from(8_i64));
 		let changed = ExecutionControl::new(&options, None)
-			.with_execution_mode(true, &parameters)
+			.with_execution_mode(ExecutionMode::Deterministic, &parameters)
 			.statement_seed(13, 17);
 		assert_ne!(first, changed);
 	}

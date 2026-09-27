@@ -315,7 +315,7 @@ fn apply_dml_candidate(
 		return Ok(None);
 	}
 	if let Some(graph) = &statement.graph {
-		return scoped::apply_graph_update(
+		let mut after = scoped::apply_graph_update(
 			transaction,
 			graph,
 			statement.label.as_ref(),
@@ -326,8 +326,14 @@ fn apply_dml_candidate(
 			source,
 			dictionary,
 			control,
-		)
-		.map(Some);
+		)?;
+		if statement.keep_levelpath {
+			after.insert(
+				crate::datastore::LEVEL_PATH_PROPERTY,
+				transaction.store_level_path(graph.id(), &candidate.record_id)?,
+			);
+		}
+		return Ok(Some(after));
 	}
 
 	let mut after = if exists {

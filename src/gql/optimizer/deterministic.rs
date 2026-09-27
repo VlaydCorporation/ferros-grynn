@@ -22,6 +22,7 @@ use crate::{
 		LogicalSelectSourceKind,
 		LogicalSelectStart,
 		LogicalStatement,
+		LogicalTraverseSource,
 		TypedExpr,
 		TypedExprKind,
 	},
@@ -85,6 +86,24 @@ fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 		}
 		LogicalStatement::Match(statement) => match_contains_impure(statement),
 		LogicalStatement::Select(statement) => select_contains_impure(statement),
+		LogicalStatement::Traverse(statement) => {
+			let source = match &statement.source {
+				LogicalTraverseSource::Expression(expression) => expr_contains_impure(expression),
+				LogicalTraverseSource::Match(statement) => match_contains_impure(statement),
+				LogicalTraverseSource::Select(statement) => select_contains_impure(statement),
+			};
+			source
+				|| statement.steps.iter().any(|step| {
+					step.match_plan.as_deref().is_some_and(match_contains_impure)
+						|| step.arguments.iter().any(expr_contains_impure)
+						|| step.repeat.as_ref().is_some_and(|repeat| {
+							expr_contains_impure(&repeat.body)
+								|| repeat.times.as_ref().is_some_and(expr_contains_impure)
+								|| repeat.until.as_ref().is_some_and(expr_contains_impure)
+						})
+				})
+				|| statement.returning.as_ref().is_some_and(expr_contains_impure)
+		}
 		LogicalStatement::Break
 		| LogicalStatement::Continue
 		| LogicalStatement::AssertInvariants {
@@ -399,6 +418,29 @@ fn expr_contains_impure(expression: &TypedExpr) -> bool {
 			arguments,
 			..
 		} => arguments.iter().any(expr_contains_impure),
+		TypedExprKind::Closure(closure) => {
+			closure.effect > crate::gql::ir::ClosureEffect::StableRead
+		}
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => expr_contains_impure(callee) || arguments.iter().any(expr_contains_impure),
+		TypedExprKind::Traversal(traverse) => {
+			let source = match &traverse.source {
+				LogicalTraverseSource::Expression(expression) => expr_contains_impure(expression),
+				LogicalTraverseSource::Match(_) | LogicalTraverseSource::Select(_) => false,
+			};
+			source
+				|| traverse.steps.iter().any(|step| {
+					step.match_plan.as_deref().is_some_and(match_contains_impure)
+						|| step.arguments.iter().any(expr_contains_impure)
+						|| step.repeat.as_ref().is_some_and(|repeat| {
+							expr_contains_impure(&repeat.body)
+								|| repeat.times.as_ref().is_some_and(expr_contains_impure)
+								|| repeat.until.as_ref().is_some_and(expr_contains_impure)
+						})
+				})
+		}
 		TypedExprKind::Aggregate {
 			argument,
 			..

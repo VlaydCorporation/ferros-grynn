@@ -62,7 +62,7 @@ impl Parser<'_> {
 		let statement = context.run(|context| self.statement(context)).await?;
 		if !explainable(&statement.kind) {
 			return Err(self.syntax(
-				"EXPLAIN supports DDL, DML, SELECT, and MATCH statements.",
+				"EXPLAIN supports DDL, DML, SELECT, MATCH, and TRAVERSE statements.",
 				statement.span,
 			));
 		}
@@ -93,5 +93,6 @@ fn explainable(statement: &StatementKind) -> bool {
 			| StatementKind::Match(_)
 			| StatementKind::Relate(_)
 			| StatementKind::Select(_)
+			| StatementKind::Traverse(_)
 	)
 }

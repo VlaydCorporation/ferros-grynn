@@ -157,6 +157,13 @@ fn eval_current(
 			match base {
 				Value::Object(object) => Ok(object.get(field).cloned().unwrap_or(Value::None)),
 				Value::Error(error) => Ok(error_field(&error, field)),
+				Value::AtomOccurrence(occurrence) if fields.is_some() => fields
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_argument(
+							"Atom occurrence resolver is unavailable.",
+						)
+					})?
+					.occurrence_field(&occurrence, field),
 				Value::Record(record) if fields.is_some() => fields
 					.ok_or_else(|| {
 						FerrosGrynnError::invalid_argument("Record resolver is unavailable.")
@@ -223,7 +230,7 @@ fn eval_current(
 		TypedExprKind::Builtin {
 			function,
 			arguments,
-		} if matches!(function, Builtin::GraphInner) => {
+		} if matches!(function, Builtin::GraphInner | Builtin::GraphLevelPath) => {
 			let argument = arguments.first().ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("graph::inner requires one argument")
 			})?;
@@ -233,13 +240,18 @@ fn eval_current(
 					"graph::inner requires an atom occurrence",
 				));
 			};
-			fields
-				.ok_or_else(|| {
-					FerrosGrynnError::invalid_argument(
-						"graph::inner requires a MATCH field resolver",
-					)
-				})?
-				.inner_graph(&occurrence)
+			let fields = fields.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"graph occurrence functions require a MATCH field resolver",
+				)
+			})?;
+			match function {
+				Builtin::GraphInner => fields.inner_graph(&occurrence),
+				Builtin::GraphLevelPath => fields.level_path(&occurrence),
+				_ => Err(FerrosGrynnError::invalid_argument(
+					"invalid graph occurrence function dispatch",
+				)),
+			}
 		}
 		TypedExprKind::Builtin {
 			function,
@@ -251,6 +263,46 @@ fn eval_current(
 			.and_then(|arguments| {
 				crate::gql::execution::builtins::execute(function, arguments, control)
 			}),
+		TypedExprKind::Closure(closure) => control
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"Language closure creation requires an execution session.",
+				)
+			})?
+			.create_closure(closure, slots)
+			.map(|closure| Value::Closure(Box::new(closure))),
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => {
+			let callee = eval_current(callee, row, slots, source, fields, current, control)?;
+			let Value::Closure(closure) = callee else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"Only a closure value can be invoked.",
+				));
+			};
+			let arguments = arguments
+				.iter()
+				.map(|argument| {
+					eval_current(argument, row, slots, source, fields, current, control)
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			if closure.session_owner().is_none() {
+				closure.call(&arguments)
+			} else {
+				invoke_expression_closure(
+					control.ok_or_else(|| {
+						FerrosGrynnError::closure_requires_session(closure.id().get())
+					})?,
+					&closure,
+					&arguments,
+					source,
+				)
+			}
+		}
+		TypedExprKind::Traversal(_) => Err(FerrosGrynnError::invalid_argument(
+			"Traversal expression requires the transaction-aware evaluator.",
+		)),
 		TypedExprKind::Aggregate {
 			..
 		}
@@ -265,6 +317,44 @@ fn eval_current(
 		} => cast(eval_current(expr, row, slots, source, fields, current, control)?, target),
 	};
 	result.map_err(|error| locate_execution(error, expr, source))
+}
+
+fn invoke_expression_closure(
+	control: &ExecutionControl,
+	closure: &crate::values::Closure,
+	arguments: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<Value> {
+	let entry = control.resolve_closure(closure)?;
+	if entry.plan.parameters.len() != arguments.len() {
+		return Err(FerrosGrynnError::conversion_error(
+			format!("{} closure arguments", arguments.len()),
+			format!("{} arguments", entry.plan.parameters.len()),
+		));
+	}
+	let mut slots = vec![Value::None; entry.plan.slot_count];
+	for (slot, value) in entry.captures {
+		let target = slots.get_mut(slot as usize).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("Closure capture slot is outside its typed frame.")
+		})?;
+		*target = value;
+	}
+	for ((slot, _), value) in entry.plan.parameters.iter().zip(arguments) {
+		let target = slots.get_mut(*slot as usize).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("Closure parameter slot is outside its typed frame.")
+		})?;
+		*target = value.clone();
+	}
+	match &entry.plan.body {
+		crate::gql::ir::LogicalClosureBody::Expression(expression) => {
+			eval(expression, None, &slots, source, None, Some(control))
+		}
+		crate::gql::ir::LogicalClosureBody::Block(_) => {
+			Err(FerrosGrynnError::query_feature_not_supported(
+				"block closure invocation outside traversal execution",
+			))
+		}
+	}
 }
 
 fn unary(operator: UnaryOperator, value: Value) -> FerrosGrynnResult<Value> {

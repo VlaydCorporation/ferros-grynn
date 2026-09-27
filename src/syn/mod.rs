@@ -7,6 +7,9 @@ mod token;
 
 pub use ast::{
 	BinaryOperator,
+	ClosureBody,
+	ClosureExpr,
+	ClosureParameter,
 	Expr,
 	ExprKind,
 	Identifier,
@@ -61,6 +64,7 @@ pub use stmt::{
 	IndexScopeName,
 	InfoStatement,
 	InfoTarget,
+	KeepLevelPathClause,
 	LetStatement,
 	MatchConstraints,
 	MatchContains,
@@ -109,6 +113,9 @@ pub use stmt::{
 	StatementKind,
 	TimeoutValue,
 	TransactionIsolationName,
+	TraverseSource,
+	TraverseStatement,
+	TraverseStep,
 	TryStatement,
 	UpdateGraphStatement,
 	WhileStatement,

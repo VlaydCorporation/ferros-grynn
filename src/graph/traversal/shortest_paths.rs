@@ -1,6 +1,5 @@
 use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
 
-use num_traits::ToPrimitive;
 use rapidhash::RapidHashMap;
 
 use super::{
@@ -23,6 +22,7 @@ use crate::{
 		SnapshotId,
 		general::atom_does_not_exist,
 	},
+	math::{add_numbers, number_is_finite},
 	values::{Number, Uuid},
 };
 
@@ -37,7 +37,7 @@ pub struct ShortestPaths {
 	origin: Uuid,
 	snapshot: SnapshotId,
 	source: AtomId,
-	distances: RapidHashMap<AtomId, f64>,
+	distances: RapidHashMap<AtomId, Number>,
 	predecessors: RapidHashMap<AtomId, Predecessor>,
 }
 
@@ -46,7 +46,7 @@ impl ShortestPaths {
 		self.source
 	}
 
-	pub fn distance_to(&self, target: AtomId) -> Option<f64> {
+	pub fn distance_to(&self, target: AtomId) -> Option<Number> {
 		self.distances.get(&target).copied()
 	}
 
@@ -115,12 +115,7 @@ impl ShortestPaths {
 				predecessor.step.role,
 			));
 		}
-		Ok(Some(Path::new(
-			self.origin,
-			self.snapshot,
-			steps,
-			self.distance_to(target).map(Number::Float),
-		)))
+		Ok(Some(Path::new(self.origin, self.snapshot, steps, self.distance_to(target))))
 	}
 
 	fn reconstruct(&self, target: AtomId) -> Option<Vec<(AtomId, Option<Predecessor>)>> {
@@ -143,13 +138,13 @@ impl ShortestPaths {
 
 #[derive(Debug, Clone, Copy)]
 struct QueueEntry {
-	distance: f64,
+	distance: Number,
 	node: AtomId,
 }
 
 impl PartialEq for QueueEntry {
 	fn eq(&self, other: &Self) -> bool {
-		self.distance.total_cmp(&other.distance) == Ordering::Equal && self.node == other.node
+		self.distance.cmp(&other.distance) == Ordering::Equal && self.node == other.node
 	}
 }
 
@@ -163,7 +158,7 @@ impl PartialOrd for QueueEntry {
 
 impl Ord for QueueEntry {
 	fn cmp(&self, other: &Self) -> Ordering {
-		other.distance.total_cmp(&self.distance).then_with(|| other.node.cmp(&self.node))
+		other.distance.cmp(&self.distance).then_with(|| other.node.cmp(&self.node))
 	}
 }
 
@@ -172,26 +167,41 @@ pub fn dijkstra<R: GraphRead>(
 	source: AtomId,
 	direction: TraversalDirection,
 ) -> FerrosGrynnResult<ShortestPaths> {
+	dijkstra_with_check(graph, source, direction, &mut || Ok(()))
+}
+
+pub(crate) fn dijkstra_with_check<R: GraphRead, Check>(
+	graph: &R,
+	source: AtomId,
+	direction: TraversalDirection,
+	check: &mut Check,
+) -> FerrosGrynnResult<ShortestPaths>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	check()?;
 	ensure_node(graph, source)?;
-	let index = TraversalIndex::new(graph, TraversalSemantics::Node)?;
-	let weights = collect_weights(graph, false, "Dijkstra")?;
+	let index = TraversalIndex::new_with_check(graph, TraversalSemantics::Node, check)?;
+	let weights = collect_weights_with_check(graph, false, "Dijkstra", check)?;
 	let mut distances = RapidHashMap::default();
 	let mut predecessors = RapidHashMap::default();
 	let mut queue = BinaryHeap::from([QueueEntry {
-		distance: 0.0,
+		distance: Number::Int(0),
 		node: source,
 	}]);
-	distances.insert(source, 0.0);
+	distances.insert(source, Number::Int(0));
 
 	while let Some(QueueEntry {
 		distance,
 		node,
 	}) = queue.pop()
 	{
+		check()?;
 		if distances.get(&node).is_some_and(|known| distance > *known) {
 			continue;
 		}
-		for step in local_steps(&index, node, direction) {
+		for (candidate_index, step) in local_steps(&index, node, direction).enumerate() {
+			check_candidate(check, candidate_index)?;
 			let Some(target) = step.target.local_id().filter(|id| id.is_node()) else {
 				continue;
 			};
@@ -201,10 +211,7 @@ pub fn dijkstra<R: GraphRead>(
 					format!("missing weight for edge {}", step.via_edge),
 				));
 			};
-			let candidate = distance + weight;
-			if !candidate.is_finite() {
-				return Err(algorithm_failure("Dijkstra", "distance overflowed f64"));
-			}
+			let candidate = add_numbers(distance, weight)?;
 			if distances.get(&target).is_none_or(|known| candidate < *known) {
 				distances.insert(target, candidate);
 				predecessors.insert(target, Predecessor {
@@ -226,24 +233,36 @@ pub fn bellman_ford<R: GraphRead>(
 	source: AtomId,
 	direction: TraversalDirection,
 ) -> FerrosGrynnResult<ShortestPaths> {
+	bellman_ford_with_check(graph, source, direction, &mut || Ok(()))
+}
+
+pub(crate) fn bellman_ford_with_check<R: GraphRead, Check>(
+	graph: &R,
+	source: AtomId,
+	direction: TraversalDirection,
+	check: &mut Check,
+) -> FerrosGrynnResult<ShortestPaths>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	check()?;
 	ensure_node(graph, source)?;
-	let index = TraversalIndex::new(graph, TraversalSemantics::Node)?;
-	let weights = collect_weights(graph, true, "Bellman-Ford")?;
-	let arcs = local_arcs(graph, &index, &weights, direction)?;
+	let index = TraversalIndex::new_with_check(graph, TraversalSemantics::Node, check)?;
+	let weights = collect_weights_with_check(graph, true, "Bellman-Ford", check)?;
+	let arcs = local_arcs(graph, &index, &weights, direction, check)?;
 	let mut distances = RapidHashMap::default();
 	let mut predecessors = RapidHashMap::default();
-	distances.insert(source, 0.0);
+	distances.insert(source, Number::Int(0));
 
 	for _ in 0..graph.node_count()?.saturating_sub(1) {
+		check()?;
 		let mut changed = false;
-		for arc in &arcs {
+		for (candidate, arc) in arcs.iter().enumerate() {
+			check_candidate(check, candidate)?;
 			let Some(distance) = distances.get(&arc.from).copied() else {
 				continue;
 			};
-			let candidate = distance + arc.weight;
-			if !candidate.is_finite() {
-				return Err(algorithm_failure("Bellman-Ford", "distance overflowed f64"));
-			}
+			let candidate = add_numbers(distance, arc.weight)?;
 			if distances.get(&arc.to).is_none_or(|known| candidate < *known) {
 				distances.insert(arc.to, candidate);
 				predecessors.insert(arc.to, Predecessor {
@@ -258,11 +277,13 @@ pub fn bellman_ford<R: GraphRead>(
 		}
 	}
 
-	for arc in &arcs {
+	for (candidate, arc) in arcs.iter().enumerate() {
+		check_candidate(check, candidate)?;
 		let Some(distance) = distances.get(&arc.from).copied() else {
 			continue;
 		};
-		if distances.get(&arc.to).is_none_or(|known| distance + arc.weight < *known) {
+		let candidate = add_numbers(distance, arc.weight)?;
+		if distances.get(&arc.to).is_none_or(|known| candidate < *known) {
 			return Err(algorithm_failure(
 				"Bellman-Ford",
 				"a negative-weight cycle is reachable from the source",
@@ -276,33 +297,31 @@ pub fn bellman_ford<R: GraphRead>(
 struct WeightedArc {
 	from: AtomId,
 	to: AtomId,
-	weight: f64,
+	weight: Number,
 	step: TraversalStep,
 }
 
-pub(super) fn collect_weights<R: GraphRead>(
+pub(super) fn collect_weights_with_check<R: GraphRead, Check>(
 	graph: &R,
 	allow_negative: bool,
 	algorithm: &'static str,
-) -> FerrosGrynnResult<RapidHashMap<AtomId, f64>> {
+	check: &mut Check,
+) -> FerrosGrynnResult<RapidHashMap<AtomId, Number>>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
 	let mut weights = RapidHashMap::default();
-	for id in graph.edge_ids()? {
+	for (candidate, id) in graph.edge_ids()?.enumerate() {
+		check_candidate(check, candidate)?;
 		let id = id?;
 		let edge = graph.edge(id)?.ok_or_else(|| {
 			algorithm_failure(algorithm, format!("edge iterator yielded missing edge {id}"))
 		})?;
-		let weight = match edge.weight() {
-			None => 1.0,
-			Some(Number::Int(value)) => value as f64,
-			Some(Number::Float(value)) => value,
-			Some(Number::Decimal(value)) => value.to_f64().ok_or_else(|| {
-				algorithm_failure(algorithm, format!("edge {id} weight is outside f64 range"))
-			})?,
-		};
-		if !weight.is_finite() {
+		let weight = edge.weight().unwrap_or(Number::Int(1));
+		if !number_is_finite(weight) {
 			return Err(algorithm_failure(algorithm, format!("edge {id} has a non-finite weight")));
 		}
-		if !allow_negative && weight < 0.0 {
+		if !allow_negative && weight < Number::Int(0) {
 			return Err(algorithm_failure(
 				algorithm,
 				format!("edge {id} has negative weight {weight}"),
@@ -316,13 +335,16 @@ pub(super) fn collect_weights<R: GraphRead>(
 fn local_arcs<R: GraphRead>(
 	graph: &R,
 	index: &TraversalIndex,
-	weights: &RapidHashMap<AtomId, f64>,
+	weights: &RapidHashMap<AtomId, Number>,
 	direction: TraversalDirection,
+	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Vec<WeightedArc>> {
 	let mut arcs = Vec::new();
-	for from in graph.node_ids()? {
+	for (node_index, from) in graph.node_ids()?.enumerate() {
+		check_candidate(check, node_index)?;
 		let from = from?;
-		for step in local_steps(index, from, direction) {
+		for (candidate, step) in local_steps(index, from, direction).enumerate() {
+			check_candidate(check, candidate)?;
 			let Some(to) = step.target.local_id().filter(|id| id.is_node()) else {
 				continue;
 			};
@@ -343,10 +365,20 @@ fn local_arcs<R: GraphRead>(
 	Ok(arcs)
 }
 
+fn check_candidate<Check>(check: &mut Check, candidate: usize) -> FerrosGrynnResult<()>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	if candidate & 1023 == 0 {
+		check()?;
+	}
+	Ok(())
+}
+
 fn shortest_paths<R: GraphRead>(
 	graph: &R,
 	source: AtomId,
-	distances: RapidHashMap<AtomId, f64>,
+	distances: RapidHashMap<AtomId, Number>,
 	predecessors: RapidHashMap<AtomId, Predecessor>,
 ) -> ShortestPaths {
 	ShortestPaths {

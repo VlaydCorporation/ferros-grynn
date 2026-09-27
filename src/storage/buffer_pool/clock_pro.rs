@@ -279,7 +279,8 @@ impl ClockPro {
 				temperature,
 				referenced,
 				..
-			} = frame && *temperature == Temperature::Hot
+			} = frame
+				&& *temperature == Temperature::Hot
 				&& !*referenced
 			{
 				*temperature = Temperature::Cold;

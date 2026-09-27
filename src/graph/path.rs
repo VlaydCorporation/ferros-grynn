@@ -311,6 +311,15 @@ impl PathTraceArena {
 		Self::default()
 	}
 
+	/// Estimates the bytes retained by one additional trace node.
+	pub(crate) fn estimated_node_heap_bytes(step: &PathStep) -> usize {
+		std::mem::size_of::<PathTraceNode>()
+			.saturating_add(step.atom().atom().id().estimated_heap_bytes())
+			.saturating_add(
+				step.via_edge().map_or(0, |edge| edge.atom().id().estimated_heap_bytes()),
+			)
+	}
+
 	pub(crate) fn push(
 		&mut self,
 		previous: Option<PathTraceId>,

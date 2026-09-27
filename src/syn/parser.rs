@@ -4,6 +4,9 @@ use super::{
 	ParserSettings,
 	ast::{
 		BinaryOperator,
+		ClosureBody,
+		ClosureExpr,
+		ClosureParameter,
 		Expr,
 		ExprKind,
 		Identifier,
@@ -206,6 +209,8 @@ impl Parser<'_> {
 			StatementKind::Return(context.run(|context| self.return_statement(context)).await?)
 		} else if self.consume_keyword(keywords::SELECT).is_some() {
 			StatementKind::Select(context.run(|context| self.select_statement(context)).await?)
+		} else if self.consume_keyword(keywords::TRAVERSE).is_some() {
+			StatementKind::Traverse(context.run(|context| self.traverse_statement(context)).await?)
 		} else if let Some(feature) = self.unsupported_statement() {
 			return Err(self.unsupported(feature, start));
 		} else {
@@ -237,6 +242,7 @@ impl Parser<'_> {
 					| StatementKind::Relate(_)
 					| StatementKind::Select(_)
 					| StatementKind::Match(_)
+					| StatementKind::Traverse(_)
 			) {
 				return Err(
 					self.syntax("TIMEOUT is not valid for this statement.", self.previous_span())
@@ -462,6 +468,17 @@ impl Parser<'_> {
 			TokenKind::Word {
 				value,
 				quoted,
+			} if !quoted && value.eq_ignore_ascii_case(keywords::MATCH) => {
+				let statement = context.run(|context| self.match_statement(context, false)).await?;
+				let end = self.previous_span();
+				Ok(Expr {
+					kind: ExprKind::MatchSubquery(Box::new(statement)),
+					span: cover(token.span, end),
+				})
+			}
+			TokenKind::Word {
+				value,
+				quoted,
 			} if !quoted && value.eq_ignore_ascii_case(keywords::IF) => {
 				self.if_expression(context, token.span, depth, object_depth).await
 			}
@@ -565,8 +582,68 @@ impl Parser<'_> {
 			TokenKind::Symbol(Symbol::LeftBrace) => {
 				self.object(context, token.span, depth, object_depth + 1).await
 			}
+			TokenKind::Symbol(Symbol::Pipe) => {
+				self.closure(context, token.span, depth, object_depth).await
+			}
 			_ => Err(self.syntax("Expected an expression.", token.span)),
 		}
+	}
+
+	async fn closure(
+		&mut self,
+		context: &mut Stk,
+		start: TextSpan,
+		depth: u32,
+		object_depth: u32,
+	) -> FerrosGrynnResult<Expr> {
+		let mut parameters = Vec::new();
+		if !self.at_symbol(Symbol::Pipe) {
+			loop {
+				let name = match self.current().kind {
+					TokenKind::Parameter(_) => self.parameter()?,
+					_ => self.identifier()?,
+				};
+				let declared_type = if self.consume_symbol(Symbol::Colon).is_some() {
+					Some(self.type_name()?)
+				} else {
+					None
+				};
+				parameters.push(ClosureParameter {
+					name,
+					declared_type,
+				});
+				if self.consume_symbol(Symbol::Comma).is_none() {
+					break;
+				}
+			}
+		}
+		self.expect_symbol(Symbol::Pipe, "Expected `|` after closure parameters.")?;
+		let result_type = if self.consume_symbol(Symbol::ArrowRight).is_some() {
+			Some(self.type_name()?)
+		} else {
+			None
+		};
+		let body = if self.at_symbol(Symbol::LeftBrace) {
+			ClosureBody::Block(context.run(|context| self.block(context)).await?)
+		} else {
+			// Pipeline has lower binding power and therefore remains outside
+			// the closure body.
+			ClosureBody::Expression(Box::new(
+				context.run(|context| self.expression(context, 2, depth + 1, object_depth)).await?,
+			))
+		};
+		let end = match &body {
+			ClosureBody::Expression(body) => body.span,
+			ClosureBody::Block(body) => body.span,
+		};
+		Ok(Expr {
+			kind: ExprKind::Closure(ClosureExpr {
+				parameters,
+				result_type,
+				body,
+			}),
+			span: cover(start, end),
+		})
 	}
 
 	pub(in crate::syn) async fn unary(
@@ -987,18 +1064,21 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
 	use super::parse;
-	use crate::syn::{
-		BinaryOperator,
-		ExecutionModeName,
-		ExprKind,
-		MatchDirection,
-		MatchLinearPattern,
-		MatchPattern,
-		MatchSelector,
-		ParserSettings,
-		StatementKind,
-		TimeoutValue,
-		TransactionIsolationName,
+	use crate::{
+		gql_status::{FerrosGrynnError, FerrosGrynnResult},
+		syn::{
+			BinaryOperator,
+			ExecutionModeName,
+			ExprKind,
+			MatchDirection,
+			MatchLinearPattern,
+			MatchPattern,
+			MatchSelector,
+			ParserSettings,
+			StatementKind,
+			TimeoutValue,
+			TransactionIsolationName,
+		},
 	};
 
 	fn linear_pattern(pattern: &MatchPattern) -> &MatchLinearPattern {
@@ -1130,6 +1210,47 @@ mod tests {
 				.expect_err("statement-specific DML grammar must be enforced");
 			assert_eq!(error.status().code().to_string(), "FG-42001", "{source}");
 		}
+	}
+
+	#[test]
+	fn parses_keep_levelpath_only_on_graph_local_mutations() -> FerrosGrynnResult<()> {
+		let program = parse(
+			"ATTACH person:alice TO GRAPH social KEEP LEVELPATH; UPDATE person:alice IN GRAPH \
+			 social KEEP LEVELPATH; RELATE (person:alice)-[friendship:known AS \
+			 edge]->(person:bob) IN GRAPH social KEEP LEVELPATH FOR [edge]",
+			ParserSettings::default(),
+		)?;
+		let StatementKind::Attach(attach) = &program.statements[0].kind else {
+			return Err(FerrosGrynnError::invalid_argument("expected ATTACH"));
+		};
+		assert!(attach.keep_levelpath.is_some());
+		let StatementKind::Update(update) = &program.statements[1].kind else {
+			return Err(FerrosGrynnError::invalid_argument("expected UPDATE"));
+		};
+		assert!(update.keep_levelpath.is_some());
+		let StatementKind::Relate(relate) = &program.statements[2].kind else {
+			return Err(FerrosGrynnError::invalid_argument("expected RELATE"));
+		};
+		assert_eq!(
+			relate
+				.keep_levelpath
+				.as_ref()
+				.and_then(|keep| keep.aliases.first())
+				.map(|alias| alias.value.as_ref()),
+			Some("edge"),
+		);
+		assert!(
+			parse(
+				"MATCH (* AS a) IN GRAPH social KEEP LEVELPATH RETURN a",
+				ParserSettings::default()
+			)
+			.is_err()
+		);
+		assert!(
+			parse("TRAVERSE FROM $values |> tv::fold() KEEP LEVELPATH", ParserSettings::default())
+				.is_err()
+		);
+		Ok(())
 	}
 
 	#[test]

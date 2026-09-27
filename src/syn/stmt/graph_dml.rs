@@ -12,6 +12,7 @@ pub struct AttachStatement {
 	pub record: DmlTarget,
 	pub graph: Option<Identifier>,
 	pub label: Option<Identifier>,
+	pub keep_levelpath: Option<KeepLevelPathClause>,
 }
 
 /// Removes one occurrence from a named graph.
@@ -37,8 +38,16 @@ pub struct RelateStatement {
 	pub graph: Option<Identifier>,
 	pub weight: Option<Expr>,
 	pub data: Option<DmlData>,
+	pub keep_levelpath: Option<KeepLevelPathClause>,
 	pub returning: Option<DmlReturn>,
 	pub expect: Option<ExpectClause>,
+}
+
+/// Explicit request to persist the canonical graph-local LevelPath overlay.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct KeepLevelPathClause {
+	pub aliases: Vec<Identifier>,
 }
 
 impl Parser<'_> {
@@ -62,11 +71,13 @@ impl Parser<'_> {
 		} else {
 			None
 		};
+		let keep_levelpath = self.keep_levelpath_clause()?;
 		self.finish_dml("ATTACH")?;
 		Ok(AttachStatement {
 			record,
 			graph,
 			label,
+			keep_levelpath,
 		})
 	}
 
@@ -162,6 +173,7 @@ impl Parser<'_> {
 		) {
 			return Err(self.syntax("RELATE supports only CONTENT or SET.", data_span));
 		}
+		let keep_levelpath = self.keep_levelpath_clause()?;
 		let returning = self.dml_return(context, true).await?;
 		let expect = self.expect_clause(context).await?;
 		self.finish_dml("RELATE")?;
@@ -176,9 +188,32 @@ impl Parser<'_> {
 			graph,
 			weight,
 			data,
+			keep_levelpath,
 			returning,
 			expect,
 		})
+	}
+
+	pub(super) fn keep_levelpath_clause(
+		&mut self,
+	) -> FerrosGrynnResult<Option<KeepLevelPathClause>> {
+		if self.consume_keyword(keywords::KEEP).is_none() {
+			return Ok(None);
+		}
+		self.expect_keyword(keywords::LEVELPATH, "Expected `LEVELPATH` after `KEEP`.")?;
+		let mut aliases = Vec::new();
+		if self.consume_keyword(keywords::FOR).is_some() {
+			let open = self
+				.expect_symbol(Symbol::LeftBracket, "Expected `[` after `KEEP LEVELPATH FOR`.")?;
+			aliases.push(self.identifier()?);
+			while self.consume_symbol(Symbol::Comma).is_some() {
+				aliases.push(self.identifier()?);
+			}
+			self.close(Symbol::RightBracket, open.span, "`]`")?;
+		}
+		Ok(Some(KeepLevelPathClause {
+			aliases,
+		}))
 	}
 
 	async fn exact_graph_target(

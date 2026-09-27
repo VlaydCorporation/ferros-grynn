@@ -155,6 +155,7 @@ impl GraphRefReader for Transaction {
 		self.ensure_live()?;
 		let snapshot = QuerySnapshot {
 			root: Arc::new(self.working.clone()),
+			physical: None,
 		};
 		self.query_graph(&snapshot, reference)
 	}

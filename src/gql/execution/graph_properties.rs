@@ -4,11 +4,7 @@
 )]
 
 use super::*;
-use crate::{
-	datastore::GraphSchema,
-	graph::GraphStorageMode,
-	values::{PropertyMap, RecordIdPart},
-};
+use crate::{datastore::GraphSchema, graph::GraphStorageMode, values::PropertyMap};
 
 pub(super) fn evaluate_graph_properties(
 	transaction: &mut Transaction,
@@ -128,57 +124,9 @@ fn object_to_property_map(
 fn intern_object_keys(transaction: &mut Transaction, object: &Object) -> FerrosGrynnResult<()> {
 	for (name, value) in object {
 		transaction.intern_property(name.as_str())?;
-		intern_value_keys(transaction, value)?;
+		transaction.intern_value_keys(value)?;
 	}
 	Ok(())
-}
-
-fn intern_value_keys(transaction: &mut Transaction, value: &Value) -> FerrosGrynnResult<()> {
-	match value {
-		Value::Object(object) => intern_object_keys(transaction, object),
-		Value::Array(values) => {
-			for value in values {
-				intern_value_keys(transaction, value)?;
-			}
-			Ok(())
-		}
-		Value::Set(values) => {
-			for value in values {
-				intern_value_keys(transaction, value)?;
-			}
-			Ok(())
-		}
-		Value::Range(range) => {
-			for bound in [range.start(), range.end()] {
-				if let std::ops::Bound::Included(value) | std::ops::Bound::Excluded(value) = bound {
-					intern_value_keys(transaction, value)?;
-				}
-			}
-			Ok(())
-		}
-		Value::Record(record) => intern_record_id_keys(transaction, record.id()),
-		Value::Atom(atom) => intern_record_id_keys(transaction, atom.id().id()),
-		Value::AtomOccurrence(occurrence) => {
-			intern_record_id_keys(transaction, occurrence.atom().id().id())
-		}
-		_ => Ok(()),
-	}
-}
-
-fn intern_record_id_keys(
-	transaction: &mut Transaction,
-	id: &RecordIdPart,
-) -> FerrosGrynnResult<()> {
-	match id {
-		RecordIdPart::Array(values) => {
-			for value in values {
-				intern_value_keys(transaction, value)?;
-			}
-			Ok(())
-		}
-		RecordIdPart::Object(object) => intern_object_keys(transaction, object),
-		_ => Ok(()),
-	}
 }
 
 fn set_object_path(object: &mut Object, path: &[Box<str>], value: Value) -> FerrosGrynnResult<()> {

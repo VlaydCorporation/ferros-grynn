@@ -37,7 +37,7 @@ use super::{
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult, formatting::DiagnosticValue},
 	graph::{AtomId, AtomKind, EdgeTopology, GraphId, GraphKind, GraphRef, SnapshotId},
-	values::{Number, PropertyKeyId, PropertyMap, RecordId, Text, Value},
+	values::{Number, PropertyKeyId, PropertyMap, RecordId, RecordIdPart, Text, Value},
 };
 
 mod commit;
@@ -574,6 +574,66 @@ impl Transaction {
 		Ok(key)
 	}
 
+	/// Interns every object key reachable from one durable runtime value.
+	pub(crate) fn intern_value_keys(&mut self, value: &Value) -> FerrosGrynnResult<()> {
+		match value {
+			Value::Object(object) => {
+				for (name, value) in object {
+					self.intern_property(name.as_str())?;
+					self.intern_value_keys(value)?;
+				}
+				Ok(())
+			}
+			Value::Array(values) => {
+				for value in values {
+					self.intern_value_keys(value)?;
+				}
+				Ok(())
+			}
+			Value::Set(values) => {
+				for value in values {
+					self.intern_value_keys(value)?;
+				}
+				Ok(())
+			}
+			Value::Range(range) => {
+				for bound in [range.start(), range.end()] {
+					if let std::ops::Bound::Included(value) | std::ops::Bound::Excluded(value) =
+						bound
+					{
+						self.intern_value_keys(value)?;
+					}
+				}
+				Ok(())
+			}
+			Value::Record(record) => self.intern_record_id_keys(record.id()),
+			Value::Atom(atom) => self.intern_record_id_keys(atom.id().id()),
+			Value::AtomOccurrence(occurrence) => {
+				self.intern_record_id_keys(occurrence.atom().id().id())
+			}
+			_ => Ok(()),
+		}
+	}
+
+	fn intern_record_id_keys(&mut self, id: &RecordIdPart) -> FerrosGrynnResult<()> {
+		match id {
+			RecordIdPart::Array(values) => {
+				for value in values {
+					self.intern_value_keys(value)?;
+				}
+				Ok(())
+			}
+			RecordIdPart::Object(object) => {
+				for (name, value) in object {
+					self.intern_property(name.as_str())?;
+					self.intern_value_keys(value)?;
+				}
+				Ok(())
+			}
+			_ => Ok(()),
+		}
+	}
+
 	/// Creates one database-global atom in the class named by its `RecordId`.
 	///
 	/// # Errors
@@ -603,6 +663,9 @@ impl Transaction {
 		let class_id = class.id().ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("published class is missing ClassId")
 		})?;
+		for (_key, value) in &properties {
+			self.intern_value_keys(value)?;
+		}
 		self.ensure_capacity(BASE_ATOM_WRITE_BYTES)?;
 		let global = self.working.insert_atom(&class, record_id.clone(), properties.clone())?;
 		let key = ConflictKey::BaseAtom(global);
@@ -650,6 +713,7 @@ impl Transaction {
 	) -> FerrosGrynnResult<Option<Value>> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
+		self.intern_value_keys(&value)?;
 		let (class_id, _kind) = self.atom_domain(global)?;
 		let write = ConflictKey::BaseAtom(global);
 		let fanout = self.inherited_memberships(global, key);

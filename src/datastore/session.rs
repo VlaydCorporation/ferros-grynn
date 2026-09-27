@@ -8,10 +8,12 @@ use super::{Datastore, Transaction, TransactionAccess, TransactionOptions};
 use crate::{
 	gql::{
 		ExecutionControl,
+		ExecutionMode,
 		QueryCursor,
 		QueryExecutionOptions,
 		QueryResult,
 		TransactionCommand,
+		closure::LanguageClosureRegistry,
 		cursor::CursorRuntime,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult, Outcome},
@@ -24,8 +26,9 @@ pub struct GqlSession {
 	store: Datastore,
 	bindings: Object,
 	transaction: Option<Transaction>,
-	deterministic: bool,
+	execution_mode: ExecutionMode,
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
+	closures: Arc<Mutex<LanguageClosureRegistry>>,
 }
 
 impl GqlSession {
@@ -38,8 +41,9 @@ impl GqlSession {
 			store,
 			bindings: Object::new(),
 			transaction: None,
-			deterministic: false,
+			execution_mode: ExecutionMode::BestEffort,
 			cursors: Some(Arc::new(Mutex::new(CursorRuntime::new(max_snapshot_age)))),
+			closures: Arc::new(Mutex::new(LanguageClosureRegistry::default())),
 		}
 	}
 
@@ -48,14 +52,21 @@ impl GqlSession {
 			store,
 			bindings: Object::new(),
 			transaction: None,
-			deterministic: false,
+			execution_mode: ExecutionMode::BestEffort,
 			cursors: None,
+			closures: Arc::new(Mutex::new(LanguageClosureRegistry::default())),
 		}
 	}
 
 	/// Returns whether this session currently owns an explicit transaction.
 	pub const fn has_active_transaction(&self) -> bool {
 		self.transaction.is_some()
+	}
+
+	/// Returns closure-registry memory retained by persistent session values.
+	#[cfg(test)]
+	pub(crate) fn retained_closure_bytes(&self) -> usize {
+		self.closures.lock().retained_bytes()
 	}
 
 	/// Releases the retained result spool associated with `cursor`.
@@ -154,7 +165,8 @@ impl GqlSession {
 		{
 			let timeout = crate::gql::resolve_timeout(statement.timeout.as_ref(), &bindings)?;
 			let control = ExecutionControl::with_cursors(options, timeout, self.cursors.clone())
-				.with_execution_mode(false, &bindings);
+				.with_execution_mode(ExecutionMode::BestEffort, &bindings)
+				.with_closure_registry(self.closures.clone());
 			return crate::gql::import::execute_import(
 				&self.store,
 				source,
@@ -204,7 +216,8 @@ impl GqlSession {
 				};
 			let control =
 				ExecutionControl::with_cursors(options, clause_timeout, self.cursors.clone())
-					.with_execution_mode(self.deterministic, &bindings)
+					.with_execution_mode(self.execution_mode, &bindings)
+					.with_closure_registry(self.closures.clone())
 					.with_publication_deferred(self.transaction.is_some());
 			let let_name = match &statement.kind {
 				StatementKind::Let(statement) if statement.name.value.as_ref() != "_" => {
@@ -234,6 +247,16 @@ impl GqlSession {
 			} else {
 				self.execute_autocommit(statement, source, &mut bindings, &control, started)
 			};
+			if require_closed
+				&& let Some(closure) = result
+					.result
+					.as_ref()
+					.ok()
+					.and_then(|outcome| outcome.value().session_closure_id())
+			{
+				result.result = Err(FerrosGrynnError::closure_requires_session(closure.get()));
+				result.continuation = None;
+			}
 			let failed = result.result.is_err();
 			if !failed {
 				if let Some(name) = let_name {
@@ -249,6 +272,16 @@ impl GqlSession {
 			} else {
 				self.rollback_explicit_transaction();
 			}
+			let statement_nonce = control.statement_nonce();
+			let result_value = result.result.as_ref().ok().map(Outcome::value);
+			let transaction_bindings = self.transaction.as_ref().map(Transaction::gql_bindings);
+			self.closures.lock().finish_statement(
+				statement_nonce,
+				self.bindings
+					.values()
+					.chain(transaction_bindings.into_iter().flat_map(Object::values))
+					.chain(result_value),
+			);
 			result.elapsed = started.elapsed();
 			results.push(result);
 			if failed {
@@ -268,11 +301,11 @@ impl GqlSession {
 		match command {
 			TransactionCommand::Begin {
 				options,
-				deterministic,
+				execution_mode,
 			} => {
 				debug_assert!(self.transaction.is_none());
 				self.transaction = Some(self.store.begin_with(options));
-				self.deterministic = deterministic;
+				self.execution_mode = execution_mode;
 				Ok(Value::None)
 			}
 			TransactionCommand::Commit {
@@ -285,12 +318,12 @@ impl GqlSession {
 				} else {
 					transaction.commit()?;
 				}
-				self.deterministic = false;
+				self.execution_mode = ExecutionMode::BestEffort;
 				Ok(Value::None)
 			}
 			TransactionCommand::Cancel => {
 				self.transaction.take().ok_or_else(FerrosGrynnError::transaction_not_active)?;
-				self.deterministic = false;
+				self.execution_mode = ExecutionMode::BestEffort;
 				Ok(Value::None)
 			}
 		}
@@ -487,7 +520,7 @@ impl GqlSession {
 
 	fn rollback_explicit_transaction(&mut self) {
 		self.transaction.take();
-		self.deterministic = false;
+		self.execution_mode = ExecutionMode::BestEffort;
 	}
 }
 

@@ -128,7 +128,8 @@ fn read_candidate<T>(
 	if file
 		.metadata()
 		.map_err(|source| io_failure("inspect metadata checkpoint candidate", source))?
-		.len() != PAGE_SIZE as u64
+		.len()
+		!= PAGE_SIZE as u64
 	{
 		return Ok(Candidate::Invalid);
 	}

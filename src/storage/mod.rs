@@ -32,7 +32,13 @@ mod types;
 mod wal;
 
 use direct_io as direct;
-pub(crate) use local_store::LocalStore;
+pub(crate) use local_store::{
+	LocalQuerySnapshot,
+	LocalStore,
+	PhysicalTraversalFieldsRead,
+	PhysicalTraversalInnerRead,
+	PhysicalTraversalRead,
+};
 pub use page_io::PageIoMode;
 
 #[cfg(feature = "storage-engine-prototype-api")]

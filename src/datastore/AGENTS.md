@@ -58,6 +58,13 @@ indexes и schema одним storage snapshot.
   только graph-local occurrence, если операция явно не задаёт Base scope.
 - `query_to_memory` владеет copied effective graph. Mutable materialization
   сохраняет origin mapping и flush-ит только явным вызовом; `Drop` не пишет.
+- Local `PhysicalTraversalCursor` фиксирует exact storage snapshot, graph
+  generation и bindings. Он разрешает staged/WAL/home версии до transport,
+  возвращает GQL только owned logical values и после первой private mutation
+  данного graph до конца statement использует materialized private root.
+- Physical и materialized traversal routes регистрируют одинаковые SSI
+  predicates; page guards, `DataFileId` и storage DTO не проходят transaction
+  query adapter.
 
 ## Проверка
 

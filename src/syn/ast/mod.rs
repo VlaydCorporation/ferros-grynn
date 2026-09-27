@@ -1,4 +1,4 @@
-use super::stmt::{SelectStatement, Statement};
+use super::stmt::{Block, MatchStatement, SelectStatement, Statement};
 use crate::gql_status::TextSpan;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,10 +86,46 @@ pub enum ExprKind {
 		arguments: Vec<Expr>,
 	},
 	Subquery(Box<SelectStatement>),
+	/// MATCH query accepted only as the child of `tv::match(...)`.
+	MatchSubquery(Box<MatchStatement>),
 	Cast {
 		target: TypeName,
 		expr: Box<Expr>,
 	},
+	/// Session-scoped language closure.
+	Closure(ClosureExpr),
+}
+
+/// One declared closure parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClosureParameter {
+	/// Parameter binding local to the closure invocation.
+	pub name: Identifier,
+	/// Optional explicit parameter type; omitted parameters use `any`.
+	pub declared_type: Option<TypeName>,
+}
+
+/// Closure body executed through the ordinary typed expression/block evaluator.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ClosureBody {
+	/// Single-expression closure body.
+	Expression(Box<Expr>),
+	/// Statement block with lexical scope and explicit `RETURN` support.
+	Block(Block),
+}
+
+/// Parsed language closure before capture and effect analysis.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ClosureExpr {
+	/// Ordered invocation parameters.
+	pub parameters: Vec<ClosureParameter>,
+	/// Optional declared return type.
+	pub result_type: Option<TypeName>,
+	/// Executable body.
+	pub body: ClosureBody,
 }
 
 #[derive(Debug, Clone, PartialEq)]

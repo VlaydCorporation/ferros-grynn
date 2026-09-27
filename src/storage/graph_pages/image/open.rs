@@ -365,13 +365,14 @@ fn validate_subgraphs(
 						.occurrences()
 						.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Node))
 						.count(),
-				)? || entry.edge_count
-			!= usize_u32(
-				child
-					.occurrences()
-					.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Edge))
-					.count(),
-			)? {
+				)?
+			|| entry.edge_count
+				!= usize_u32(
+					child
+						.occurrences()
+						.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Edge))
+						.count(),
+				)? {
 			return Err(invalid("subgraph directory child capacity or count disagrees"));
 		}
 		let container = graph

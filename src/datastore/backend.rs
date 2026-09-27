@@ -25,7 +25,15 @@ use super::{
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{GraphId, GraphStorageMode},
-	storage::{LocalStore, PageIoMode},
+	storage::{
+		LocalQuerySnapshot,
+		LocalStore,
+		PageIoMode,
+		PhysicalTraversalFieldsRead,
+		PhysicalTraversalInnerRead,
+		PhysicalTraversalRead,
+	},
+	values::storage::DecodeContext,
 };
 
 pub(crate) struct StoreInner {
@@ -129,10 +137,77 @@ impl StoreInner {
 		self.query_scratch_root.clone()
 	}
 
+	pub(crate) fn capture_physical_query_snapshot(
+		&self,
+		commit_ts: u64,
+	) -> FerrosGrynnResult<Option<LocalQuerySnapshot>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => local.capture_query_snapshot(commit_ts),
+		}
+	}
+
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "the local frontier contract keeps graph, source, and direction axes explicit"
+	)]
+	pub(crate) fn physical_traversal_expand(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		graph: GraphId,
+		source: crate::graph::AtomId,
+		forward: bool,
+		backward: bool,
+		undirected: bool,
+	) -> FerrosGrynnResult<Option<PhysicalTraversalRead>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => local
+				.physical_traversal_expand(snapshot, graph, source, forward, backward, undirected),
+		}
+	}
+
+	pub(crate) fn physical_traversal_inner_graph(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		graph: GraphId,
+		owner: crate::graph::AtomId,
+	) -> FerrosGrynnResult<Option<PhysicalTraversalInnerRead>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => {
+				local.physical_traversal_inner_graph(snapshot, graph, owner)
+			}
+		}
+	}
+
+	pub(crate) fn physical_traversal_fields(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		graph: GraphId,
+		owner: crate::graph::AtomId,
+		context: &DecodeContext<'_>,
+	) -> FerrosGrynnResult<Option<PhysicalTraversalFieldsRead>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => {
+				local.physical_traversal_fields(snapshot, graph, owner, context)
+			}
+		}
+	}
+
 	pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> FerrosGrynnResult<bool> {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(false),
 			StoreBackend::Local(local) => local.checkpoint(mode),
+		}
+	}
+
+	#[cfg(feature = "storage-engine-prototype-api")]
+	pub(crate) fn clear_resident_for_prototype(&self) -> FerrosGrynnResult<usize> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(0),
+			StoreBackend::Local(local) => local.clear_resident_for_prototype(),
 		}
 	}
 }

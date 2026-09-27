@@ -76,6 +76,9 @@ pub fn execute_transaction_with_options(
 		bindings.insert(name.clone(), value.clone());
 	}
 	let mut results = Vec::with_capacity(program.statements.len());
+	let closures = std::sync::Arc::new(parking_lot::Mutex::new(
+		crate::gql::closure::LanguageClosureRegistry::default(),
+	));
 	for statement in &program.statements {
 		let started = std::time::Instant::now();
 		let let_name = match &statement.kind {
@@ -113,6 +116,7 @@ pub fn execute_transaction_with_options(
 			}
 		};
 		let control = crate::gql::options::ExecutionControl::new(&options, timeout)
+			.with_closure_registry(closures.clone())
 			.with_publication_deferred(true);
 		let execution = transaction.run_gql_statement(|transaction| {
 			execute_parsed_statement_with_bindings(
@@ -235,6 +239,11 @@ impl QueryRead for TransactionRead<'_> {
 	type Savepoint = crate::datastore::TransactionSavepoint;
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot> {
+		Ok(Snapshot(self.snapshot.commit_ts()))
+	}
+
+	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<Snapshot> {
+		self.snapshot = self.transaction.query_snapshot()?;
 		Ok(Snapshot(self.snapshot.commit_ts()))
 	}
 
@@ -605,6 +614,75 @@ impl QueryRead for TransactionRead<'_> {
 		)
 	}
 
+	fn physical_traversal_candidates(
+		&self,
+		_snapshot: Snapshot,
+		graph: &GraphRef,
+		source: AtomId,
+		directions: &[crate::syn::MatchDirection],
+	) -> FerrosGrynnResult<Option<PhysicalTraversalBatch>> {
+		let forward = directions.contains(&crate::syn::MatchDirection::Forward);
+		let backward = directions.contains(&crate::syn::MatchDirection::Backward);
+		let undirected = directions.contains(&crate::syn::MatchDirection::Undirected);
+		self.transaction
+			.query_physical_traversal(&self.snapshot, graph, source, forward, backward, undirected)
+			.map(|read| {
+				read.map(|read| PhysicalTraversalBatch {
+					candidates: read
+						.candidates
+						.into_iter()
+						.map(|candidate| ScopedTraversalCandidate {
+							target: BoundAtom::new(graph.id(), candidate.target),
+							edge: BoundAtom::new(graph.id(), candidate.edge),
+							direction: candidate.direction,
+							role: candidate.role,
+							topology: candidate.topology,
+							cross_level: false,
+						})
+						.collect(),
+					resident_pages: read.stats.resident_pages,
+					wal_pages: read.stats.wal_pages,
+					sync_home_pages: read.stats.sync_home_pages,
+					ioring_home_pages: read.stats.ioring_home_pages,
+				})
+			})
+	}
+
+	fn physical_inner_graph(
+		&self,
+		_snapshot: Snapshot,
+		graph: &GraphRef,
+		owner: AtomId,
+	) -> FerrosGrynnResult<Option<PhysicalInnerGraphBatch>> {
+		self.transaction.query_physical_inner_graph(&self.snapshot, graph, owner).map(|read| {
+			read.map(|read| PhysicalInnerGraphBatch {
+				graph: read.graph,
+				resident_pages: read.stats.resident_pages,
+				wal_pages: read.stats.wal_pages,
+				sync_home_pages: read.stats.sync_home_pages,
+				ioring_home_pages: read.stats.ioring_home_pages,
+			})
+		})
+	}
+
+	fn physical_occurrence_fields(
+		&self,
+		_snapshot: Snapshot,
+		graph: &GraphRef,
+		owner: AtomId,
+	) -> FerrosGrynnResult<Option<PhysicalOccurrenceFieldsBatch>> {
+		self.transaction.query_physical_fields(&self.snapshot, graph, owner).map(|read| {
+			read.map(|read| PhysicalOccurrenceFieldsBatch {
+				record_id: read.record_id,
+				properties: read.properties,
+				resident_pages: read.stats.resident_pages,
+				wal_pages: read.stats.wal_pages,
+				sync_home_pages: read.stats.sync_home_pages,
+				ioring_home_pages: read.stats.ioring_home_pages,
+			})
+		})
+	}
+
 	fn record_field(
 		&self,
 		_snapshot: Snapshot,
@@ -634,6 +712,14 @@ impl QueryRead for TransactionRead<'_> {
 			.find(|schema| schema.id() == graph)
 			.map(|schema| schema.reference().clone())
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))
+	}
+
+	fn level_path(
+		&self,
+		_snapshot: Snapshot,
+		occurrence: &crate::graph::AtomOccurrenceRef,
+	) -> FerrosGrynnResult<Value> {
+		self.transaction.query_level_path(&self.snapshot, occurrence)
 	}
 
 	fn property_dictionary(&self, _snapshot: Snapshot) -> Arc<PropertyDictionary> {

@@ -16,7 +16,7 @@ pub(in crate::gql::execution) struct ScopedTraversalCandidate {
 	pub(in crate::gql::execution) edge: BoundAtom,
 	pub(in crate::gql::execution) direction: PathDirection,
 	pub(in crate::gql::execution) role: EndpointRole,
-	topology: EdgeDirection,
+	pub(in crate::gql::execution) topology: EdgeDirection,
 	pub(in crate::gql::execution) cross_level: bool,
 }
 

@@ -2,7 +2,11 @@ use std::collections::hash_map;
 
 use rapidhash::{RapidHashMap, RapidHashSet};
 
-use super::{algorithm_failure, connectivity::collect_node_ids, spanning::binary_edges};
+use super::{
+	algorithm_failure,
+	connectivity::collect_node_ids_with_check,
+	spanning::binary_edges_with_check,
+};
 use crate::{
 	gql_status::FerrosGrynnResult,
 	graph::{AtomId, GraphRead},
@@ -25,13 +29,24 @@ impl CutSet {
 }
 
 pub fn find_cuts<R: GraphRead>(graph: &R) -> FerrosGrynnResult<CutSet> {
-	let nodes = collect_node_ids(graph)?;
+	find_cuts_with_check(graph, &mut || Ok(()))
+}
+
+pub(crate) fn find_cuts_with_check<R: GraphRead, Check>(
+	graph: &R,
+	check: &mut Check,
+) -> FerrosGrynnResult<CutSet>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	let nodes = collect_node_ids_with_check(graph, check)?;
 	let mut adjacency = nodes
 		.iter()
 		.copied()
 		.map(|id| (id, Vec::<(AtomId, AtomId)>::new()))
 		.collect::<RapidHashMap<_, _>>();
-	for edge in binary_edges(graph)? {
+	for (candidate, edge) in binary_edges_with_check(graph, check)?.into_iter().enumerate() {
+		check_candidate(check, candidate)?;
 		adjacency.entry(edge.left).or_default().push((edge.right, edge.edge));
 		adjacency.entry(edge.right).or_default().push((edge.left, edge.edge));
 	}
@@ -46,6 +61,7 @@ pub fn find_cuts<R: GraphRead>(graph: &R) -> FerrosGrynnResult<CutSet> {
 	let mut time = 0_usize;
 
 	for root in nodes {
+		check()?;
 		if discovered.contains_key(&root) {
 			continue;
 		}
@@ -58,6 +74,7 @@ pub fn find_cuts<R: GraphRead>(graph: &R) -> FerrosGrynnResult<CutSet> {
 		}];
 
 		while !stack.is_empty() {
+			check()?;
 			let last = stack.len() - 1;
 			let node = stack[last].node;
 			let neighbors = adjacency.get(&node).map_or(&[][..], Vec::as_slice);
@@ -127,6 +144,16 @@ pub fn find_cuts<R: GraphRead>(graph: &R) -> FerrosGrynnResult<CutSet> {
 		articulation_points: articulation.into_boxed_slice(),
 		bridges: bridges.into_boxed_slice(),
 	})
+}
+
+fn check_candidate<Check>(check: &mut Check, candidate: usize) -> FerrosGrynnResult<()>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	if candidate & 1023 == 0 {
+		check()?;
+	}
+	Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

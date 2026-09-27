@@ -13,3 +13,4 @@ mod optimizer_probe;
 mod schema;
 mod select;
 mod transaction;
+mod traversal;

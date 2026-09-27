@@ -589,6 +589,22 @@ impl AtomicArenaBufferPool {
 		}
 	}
 
+	/// Removes every currently resident mapping for an isolated prototype run.
+	///
+	/// # Errors
+	///
+	/// Returns the first lifecycle error produced while removing a captured
+	/// exact key. Normal production routing never calls this operation.
+	#[cfg(feature = "storage-engine-prototype-api")]
+	pub fn clear_resident(&self) -> FerrosGrynnResult<usize> {
+		let keys = self.replacement.lock().keys.iter().flatten().copied().collect::<Vec<_>>();
+		let mut removed = 0_usize;
+		for key in keys {
+			removed = removed.saturating_add(usize::from(self.remove_resident(key)?));
+		}
+		Ok(removed)
+	}
+
 	/// Looks up a directory entry and releases its shard lock immediately.
 	fn lookup(&self, key: PageCacheKey) -> DirectoryLookup {
 		let shard = &self.directory[directory_shard(key)];

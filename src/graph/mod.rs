@@ -126,5 +126,18 @@ pub use traversal::{
 	topological_sort,
 	weakly_connected_components,
 };
+pub(crate) use traversal::{
+	bellman_ford_with_check,
+	bfs_with_check,
+	condensation_with_check,
+	dijkstra_with_check,
+	find_cuts_with_check,
+	has_cycle_directed_with_check,
+	has_cycle_undirected_with_check,
+	minimum_spanning_forest_with_check,
+	strongly_connected_components_with_check,
+	topological_sort_with_check,
+	weakly_connected_components_with_check,
+};
 pub use view::{DagView, ForestView, GraphView, TreeView};
 pub use workspace::{GraphWorkspace, IntoGraphWorkspace};

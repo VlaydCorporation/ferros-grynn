@@ -1,5 +1,6 @@
 use std::{
 	cmp::Ordering,
+	collections::BTreeSet,
 	hash::{Hash, Hasher},
 	mem::{size_of, size_of_val},
 	ops::Bound,
@@ -72,6 +73,58 @@ pub enum Value {
 }
 
 impl Value {
+	/// Collects every session-owned closure reachable through this runtime
+	/// value.
+	pub(crate) fn collect_session_closure_ids(&self, ids: &mut BTreeSet<super::RuntimeId>) {
+		match self {
+			Self::Closure(closure) if closure.session_owner().is_some() => {
+				ids.insert(closure.id());
+			}
+			Self::Array(values) => {
+				for value in values {
+					value.collect_session_closure_ids(ids);
+				}
+			}
+			Self::Set(values) => {
+				for value in values {
+					value.collect_session_closure_ids(ids);
+				}
+			}
+			Self::Object(values) => {
+				for value in values.values() {
+					value.collect_session_closure_ids(ids);
+				}
+			}
+			Self::Range(range) => {
+				if let Some(value) = bound_value(range.start()) {
+					value.collect_session_closure_ids(ids);
+				}
+				if let Some(value) = bound_value(range.end()) {
+					value.collect_session_closure_ids(ids);
+				}
+			}
+			_ => {}
+		}
+	}
+
+	/// Returns the first session-owned closure retained by this runtime value.
+	///
+	/// Temporary GrynnQL sessions use this recursive check at their public
+	/// result boundary because such a closure becomes unusable as soon as the
+	/// session registry is dropped.
+	pub(crate) fn session_closure_id(&self) -> Option<super::RuntimeId> {
+		match self {
+			Self::Closure(closure) => closure.session_owner().map(|_| closure.id()),
+			Self::Array(values) => values.iter().find_map(Self::session_closure_id),
+			Self::Set(values) => values.iter().find_map(Self::session_closure_id),
+			Self::Object(values) => values.values().find_map(Self::session_closure_id),
+			Self::Range(range) => bound_value(range.start())
+				.and_then(Self::session_closure_id)
+				.or_else(|| bound_value(range.end()).and_then(Self::session_closure_id)),
+			_ => None,
+		}
+	}
+
 	pub fn kind(&self) -> ValueKind {
 		match self {
 			Self::None => ValueKind::None,
@@ -406,6 +459,13 @@ impl Value {
 		self.is_storable()
 			.then_some(())
 			.ok_or_else(|| FerrosGrynnError::conversion_error(self.kind().name(), "StorageValue"))
+	}
+}
+
+fn bound_value(bound: Bound<&Value>) -> Option<&Value> {
+	match bound {
+		Bound::Included(value) | Bound::Excluded(value) => Some(value),
+		Bound::Unbounded => None,
 	}
 }
 

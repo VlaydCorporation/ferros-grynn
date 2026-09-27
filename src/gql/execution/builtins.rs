@@ -187,8 +187,8 @@ pub(super) fn execute(
 		Builtin::MetaId => meta_id(one(arguments)?),
 		Builtin::MetaClass => meta_class(one(arguments)?),
 		Builtin::MetaType => Ok(Value::from(one(arguments)?.value_type().to_string())),
-		Builtin::GraphInner => Err(FerrosGrynnError::invalid_argument(
-			"graph::inner requires the MATCH graph resolver",
+		Builtin::GraphInner | Builtin::GraphLevelPath => Err(FerrosGrynnError::invalid_argument(
+			"graph occurrence functions require the MATCH graph resolver",
 		)),
 		Builtin::PathAtoms => {
 			let path = path(one(arguments)?, "path::atoms")?;

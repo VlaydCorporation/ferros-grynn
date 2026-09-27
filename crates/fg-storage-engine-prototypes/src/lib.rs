@@ -13,6 +13,8 @@ mod policy;
 #[cfg(test)]
 mod prefetch;
 #[cfg(all(test, windows, feature = "native-async-io"))]
+mod traversal_frontier;
+#[cfg(all(test, windows, feature = "native-async-io"))]
 mod windows_transport;
 #[cfg(all(test, windows))]
 mod windows_vm;

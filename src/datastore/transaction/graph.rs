@@ -277,6 +277,20 @@ impl Transaction {
 		self.change_overlay(graph, record_id, key, Some(value))
 	}
 
+	/// Computes and stores the canonical system-managed LevelPath overlay.
+	pub(crate) fn store_level_path(
+		&mut self,
+		graph: GraphId,
+		record_id: &RecordId,
+	) -> FerrosGrynnResult<Value> {
+		self.prepare_mutation()?;
+		let global = self.require_atom(record_id)?;
+		let value = self.working.level_path_value(graph, global)?;
+		let key = self.intern_property(crate::datastore::LEVEL_PATH_PROPERTY)?;
+		self.set_overlay(graph, record_id, key, value.clone())?;
+		Ok(value)
+	}
+
 	/// Hides an inherited base property in one graph.
 	///
 	/// # Errors
@@ -452,6 +466,9 @@ impl Transaction {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
 		let local = self.require_membership(graph, global)?;
+		if let Some(value) = &value {
+			self.intern_value_keys(value)?;
+		}
 		self.reserve_overlay_write(graph, global)?;
 		match value {
 			Some(value) => {

@@ -33,9 +33,13 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			record,
 			graph,
 			label,
+			keep_levelpath,
 		} => {
 			let record = record_id(record, slots, source, control)?;
 			transaction.attach_node(graph.id(), &record, label.clone(), None)?;
+			if *keep_levelpath {
+				transaction.store_level_path(graph.id(), &record)?;
+			}
 			if transaction.validates_import_constraints_immediately() {
 				transaction.validate_graph_family(graph)?;
 			}
@@ -62,6 +66,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			label,
 			direction,
 			weight,
+			keep_levelpath,
 		} => {
 			let source_record = record_id(source_target, slots, source, control)?;
 			let target_record = record_id(target, slots, source, control)?;
@@ -118,7 +123,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			let mut attached = candidate_from_atom(&atom, &edge.schema, &dictionary)?;
 			attached.local_id = Some(local);
 			let class = transaction_class(transaction, snapshot, &edge.class)?;
-			let after = scoped::apply_graph_update(
+			let mut after = scoped::apply_graph_update(
 				transaction,
 				graph,
 				None,
@@ -130,6 +135,12 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 				&dictionary,
 				control,
 			)?;
+			if *keep_levelpath {
+				after.insert(
+					crate::datastore::LEVEL_PATH_PROPERTY,
+					transaction.store_level_path(graph.id(), &edge_record)?,
+				);
+			}
 			if transaction.validates_import_constraints_immediately() {
 				transaction.validate_graph_family(graph)?;
 			}

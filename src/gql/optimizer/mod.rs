@@ -10,6 +10,7 @@ mod plan;
 mod rules;
 mod select_plan;
 mod snapshot;
+mod traverse_plan;
 mod write_plan;
 
 pub(crate) use cost::{Cardinality, PlanCost};
@@ -32,9 +33,13 @@ pub(crate) use plan::{
 	PhysicalPlan,
 	PhysicalSelectPlan,
 	PhysicalSource,
+	PhysicalTraversalNode,
+	PhysicalTraversalPlan,
 	PhysicalWritePlan,
 	PlanWarning,
 	SourceOperator,
+	TraversalOperator,
+	TraversalSourceOperator,
 	WriteOperator,
 };
 pub(in crate::gql) use rules::prepare_select;
@@ -50,10 +55,11 @@ pub(crate) use snapshot::{
 	PlannerSnapshot,
 	PlannerStatisticsMeta,
 };
+pub(in crate::gql) use traverse_plan::plan_traverse;
 pub(in crate::gql) use write_plan::plan_write;
 
 /// Version mixed into canonical query and physical-plan fingerprints.
-pub(crate) const PLAN_ENCODING_VERSION: u16 = 1;
+pub(crate) const PLAN_ENCODING_VERSION: u16 = 2;
 
 #[cfg(test)]
 mod tests;

@@ -17,10 +17,22 @@ pub use connectivity::{
 	topological_sort,
 	weakly_connected_components,
 };
+pub(crate) use connectivity::{
+	bfs_with_check,
+	condensation_with_check,
+	has_cycle_directed_with_check,
+	has_cycle_undirected_with_check,
+	strongly_connected_components_with_check,
+	topological_sort_with_check,
+	weakly_connected_components_with_check,
+};
+pub(crate) use cuts::find_cuts_with_check;
 pub use cuts::{CutSet, find_cuts};
 pub use index::{TraversalDirection, TraversalIndex, TraversalSemantics, TraversalStep};
 pub use lca::BinaryLiftingIndex;
 pub use shortest_paths::{ShortestPaths, bellman_ford, dijkstra};
+pub(crate) use shortest_paths::{bellman_ford_with_check, dijkstra_with_check};
+pub(crate) use spanning::minimum_spanning_forest_with_check;
 pub use spanning::{SpanningForest, minimum_spanning_forest, minimum_spanning_tree};
 
 use crate::gql_status::FerrosGrynnError;
@@ -40,6 +52,7 @@ mod tests {
 		TraversalSemantics,
 		bellman_ford,
 		bfs,
+		bfs_with_check,
 		condensation,
 		dijkstra,
 		find_cuts,
@@ -47,21 +60,24 @@ mod tests {
 		strongly_connected_components,
 		topological_sort,
 	};
-	use crate::values::runtime::{
-		Number,
-		PropertyMap,
-		graph::{
-			AtomKind,
-			EdgeEndpoint,
-			EdgeTopology,
-			Graph,
-			GraphId,
-			GraphKind,
-			GraphRef,
-			GraphStorageMode,
-			Mutable,
-			RootedTree,
-			TreeOrientation,
+	use crate::{
+		gql_status::FerrosGrynnError,
+		values::runtime::{
+			Number,
+			PropertyMap,
+			graph::{
+				AtomKind,
+				EdgeEndpoint,
+				EdgeTopology,
+				Graph,
+				GraphId,
+				GraphKind,
+				GraphRef,
+				GraphStorageMode,
+				Mutable,
+				RootedTree,
+				TreeOrientation,
+			},
 		},
 	};
 
@@ -105,6 +121,30 @@ mod tests {
 		],);
 		assert_eq!(topological_sort(&graph).unwrap(), vec![first, second, third],);
 		assert_eq!(strongly_connected_components(&graph).unwrap().len(), 3);
+	}
+
+	#[test]
+	fn controlled_bfs_propagates_a_frontier_check_failure() {
+		let mut graph = Graph::<Mutable>::new();
+		let first = graph.add_node(None, PropertyMap::new()).unwrap();
+		let second = graph.add_node(None, PropertyMap::new()).unwrap();
+		graph
+			.add_edge(EdgeTopology::directed([first], [second]), None, PropertyMap::new())
+			.unwrap();
+		let mut checks = 0;
+
+		let error = bfs_with_check(&graph, first, TraversalDirection::Forward, None, &mut || {
+			checks += 1;
+			if checks == 5 {
+				Err(FerrosGrynnError::query_cancelled())
+			} else {
+				Ok(())
+			}
+		})
+		.unwrap_err();
+
+		assert_eq!(checks, 5);
+		assert_eq!(error.status().code().to_string(), "FG-50F05");
 	}
 
 	#[test]
@@ -152,7 +192,7 @@ mod tests {
 
 		let graph = graph.freeze();
 		let shortest = dijkstra(&graph, first, TraversalDirection::Forward).unwrap();
-		assert_eq!(shortest.distance_to(third), Some(5.0));
+		assert_eq!(shortest.distance_to(third), Some(Number::Float(5.0)));
 		assert_eq!(shortest.path_to(third), Some(vec![first, second, third]));
 		let graph_ref = Arc::new(
 			GraphRef::new(

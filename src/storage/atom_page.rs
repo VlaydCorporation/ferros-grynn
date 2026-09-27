@@ -191,13 +191,7 @@ impl AtomHotPage {
 
 	/// Opens and validates one complete atom page without copying it.
 	pub(super) fn from_page(page: Box<AlignedPage>, page_no: PageNo) -> FerrosGrynnResult<Self> {
-		let header = page.validate(page_no)?;
-		if header.page_type() != PageType::AtomHot || !header.flags().is_empty() {
-			return Err(invalid_atom_page(page_no, "expected an unflagged AtomHot page"));
-		}
-		if page.as_bytes()[ATOM_PADDING_OFFSET..].iter().any(|byte| *byte != 0) {
-			return Err(invalid_atom_page(page_no, "atom hot-page padding is non-zero"));
-		}
+		validate_atom_hot_page(&page, page_no)?;
 		let result = Self {
 			page,
 		};
@@ -220,7 +214,8 @@ impl AtomHotPage {
 		if let AtomHotSlot::Live {
 			kind,
 			..
-		} = slot && id.kind() != Some(kind)
+		} = slot
+			&& id.kind() != Some(kind)
 		{
 			return Err(invalid_atom_page(page_no, "global identity and slot kind disagree"));
 		}
@@ -297,57 +292,90 @@ impl AtomHotPage {
 
 	/// Decodes and validates one fixed slot.
 	fn decode_slot(&self, slot: u64) -> FerrosGrynnResult<(u32, AtomHotSlot)> {
-		let offset = slot_offset(slot)?;
-		let bytes = self.page.as_bytes();
-		let generation = read_u32(bytes, offset);
-		let class_id = read_u32(bytes, offset + 4);
-		let flags = bytes[offset + 8];
-		if flags & !ALLOWED_FLAGS != 0
-			|| bytes[offset + 9..offset + 16].iter().any(|byte| *byte != 0)
-		{
-			return Err(invalid_atom_page(
-				self.page_no(),
-				"atom slot contains unknown flags or non-zero reserved bytes",
-			));
-		}
-		let record = read_ref(bytes, offset + 16, "RecordId")?;
-		let properties = read_ref(bytes, offset + 32, "properties")?;
-		if flags == TOMBSTONE {
-			if class_id != NULL_CLASS
-				|| record != PropertyRef::None
-				|| properties != PropertyRef::None
-			{
-				return Err(invalid_atom_page(
-					self.page_no(),
-					"atom tombstone contains live fields",
-				));
-			}
-			return Ok((generation, AtomHotSlot::Tombstone));
-		}
-		if flags & TOMBSTONE != 0 || record == PropertyRef::None {
-			return Err(invalid_atom_page(
-				self.page_no(),
-				"live atom slot has invalid flags or no RecordId",
-			));
-		}
-		let class_id = ClassId::from_storage(class_id)?;
-		let kind = if flags & EDGE == 0 {
-			AtomKind::Node
-		} else {
-			AtomKind::Edge
-		};
-		Ok((generation, AtomHotSlot::Live {
-			kind,
-			class_id,
-			record_id: record,
-			properties,
-		}))
+		decode_atom_slot(&self.page, self.page_no(), slot)
 	}
 
 	/// Returns the already validated page number stored in the header.
 	fn page_no(&self) -> PageNo {
 		PageNo::new(read_u64(self.page.as_bytes(), 24))
 	}
+}
+
+/// Reads one global atom slot after validating its containing page.
+pub(super) fn read_atom_hot_slot(
+	page: &AlignedPage,
+	page_no: PageNo,
+	slot_within_page: u64,
+) -> FerrosGrynnResult<(GlobalAtomId, AtomHotSlot)> {
+	validate_atom_hot_page(page, page_no)?;
+	let (generation, slot) = decode_atom_slot(page, page_no, slot_within_page)?;
+	let global_slot = page_no
+		.get()
+		.checked_mul(ATOM_SLOTS_PER_PAGE)
+		.and_then(|base| base.checked_add(slot_within_page))
+		.ok_or_else(|| invalid_atom_page(page_no, "global atom slot overflows u64"))?;
+	let kind = match slot {
+		AtomHotSlot::Live {
+			kind,
+			..
+		} => kind,
+		AtomHotSlot::Tombstone => AtomKind::Node,
+	};
+	let atom = AtomId::from_parts(kind, global_slot, generation)?;
+	Ok((GlobalAtomId::from_raw(atom.raw()), slot))
+}
+
+fn validate_atom_hot_page(page: &AlignedPage, page_no: PageNo) -> FerrosGrynnResult<()> {
+	let header = page.validate(page_no)?;
+	if header.page_type() != PageType::AtomHot || !header.flags().is_empty() {
+		return Err(invalid_atom_page(page_no, "expected an unflagged AtomHot page"));
+	}
+	if page.as_bytes()[ATOM_PADDING_OFFSET..].iter().any(|byte| *byte != 0) {
+		return Err(invalid_atom_page(page_no, "atom hot-page padding is non-zero"));
+	}
+	Ok(())
+}
+
+fn decode_atom_slot(
+	page: &AlignedPage,
+	page_no: PageNo,
+	slot: u64,
+) -> FerrosGrynnResult<(u32, AtomHotSlot)> {
+	let offset = slot_offset(slot)?;
+	let bytes = page.as_bytes();
+	let generation = read_u32(bytes, offset);
+	let class_id = read_u32(bytes, offset + 4);
+	let flags = bytes[offset + 8];
+	if flags & !ALLOWED_FLAGS != 0 || bytes[offset + 9..offset + 16].iter().any(|byte| *byte != 0) {
+		return Err(invalid_atom_page(
+			page_no,
+			"atom slot contains unknown flags or non-zero reserved bytes",
+		));
+	}
+	let record = read_ref(bytes, offset + 16, "RecordId")?;
+	let properties = read_ref(bytes, offset + 32, "properties")?;
+	if flags == TOMBSTONE {
+		if class_id != NULL_CLASS || record != PropertyRef::None || properties != PropertyRef::None
+		{
+			return Err(invalid_atom_page(page_no, "atom tombstone contains live fields"));
+		}
+		return Ok((generation, AtomHotSlot::Tombstone));
+	}
+	if flags & TOMBSTONE != 0 || record == PropertyRef::None {
+		return Err(invalid_atom_page(page_no, "live atom slot has invalid flags or no RecordId"));
+	}
+	let class_id = ClassId::from_storage(class_id)?;
+	let kind = if flags & EDGE == 0 {
+		AtomKind::Node
+	} else {
+		AtomKind::Edge
+	};
+	Ok((generation, AtomHotSlot::Live {
+		kind,
+		class_id,
+		record_id: record,
+		properties,
+	}))
 }
 
 /// Computes the owning page and within-page slot for one global slot index.

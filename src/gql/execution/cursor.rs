@@ -119,6 +119,43 @@ impl Row {
 		}
 	}
 
+	/// Seeds one MATCH binding from an outer correlated environment.
+	///
+	/// Returns `false` when the seeded occurrence violates the clause match
+	/// mode.
+	pub(super) fn seed_binding(
+		&mut self,
+		column: usize,
+		value: Value,
+		occurrence: BoundAtom,
+		mode: crate::syn::MatchMode,
+	) -> bool {
+		let repeated = match mode {
+			crate::syn::MatchMode::RepeatableElements => false,
+			crate::syn::MatchMode::DifferentEdges => {
+				occurrence.atom.kind() == Some(AtomKind::Edge)
+					&& self.used_edges.contains(&occurrence)
+			}
+			crate::syn::MatchMode::DifferentAtoms => self.used_atoms.contains(&occurrence),
+		};
+		if repeated {
+			return false;
+		}
+		self.values[column] = value;
+		self.atoms[column] = Some(occurrence);
+		match mode {
+			crate::syn::MatchMode::RepeatableElements => {}
+			crate::syn::MatchMode::DifferentEdges
+				if occurrence.atom.kind() == Some(AtomKind::Edge) =>
+			{
+				self.used_edges.push(occurrence);
+			}
+			crate::syn::MatchMode::DifferentAtoms => self.used_atoms.push(occurrence),
+			crate::syn::MatchMode::DifferentEdges => {}
+		}
+		true
+	}
+
 	pub(super) fn with_graph(mut self, graph: Option<GraphRef>) -> Self {
 		self.graph = graph;
 		self
@@ -169,6 +206,34 @@ pub(super) trait RowCursor {
 	fn next(&mut self, control: &ExecutionControl) -> FerrosGrynnResult<Option<Row>>;
 }
 
+/// Datastore-owned logical output of one snapshot-exact physical frontier.
+pub(super) struct PhysicalTraversalBatch {
+	pub(super) candidates: Vec<ScopedTraversalCandidate>,
+	pub(super) resident_pages: u64,
+	pub(super) wal_pages: u64,
+	pub(super) sync_home_pages: u64,
+	pub(super) ioring_home_pages: u64,
+}
+
+/// Datastore-owned result of one physical nested-graph lookup.
+pub(super) struct PhysicalInnerGraphBatch {
+	pub(super) graph: Option<crate::graph::GraphId>,
+	pub(super) resident_pages: u64,
+	pub(super) wal_pages: u64,
+	pub(super) sync_home_pages: u64,
+	pub(super) ioring_home_pages: u64,
+}
+
+/// Owned public fields decoded through the local physical traversal cursor.
+pub(super) struct PhysicalOccurrenceFieldsBatch {
+	pub(super) record_id: RecordId,
+	pub(super) properties: crate::values::PropertyMap,
+	pub(super) resident_pages: u64,
+	pub(super) wal_pages: u64,
+	pub(super) sync_home_pages: u64,
+	pub(super) ioring_home_pages: u64,
+}
+
 pub(super) trait QueryRead {
 	/// Graph view tied to the requested query snapshot.
 	type Graph<'a>: GraphRead + 'a
@@ -177,6 +242,10 @@ pub(super) trait QueryRead {
 	type Savepoint;
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot>;
+
+	/// Recaptures the transaction-private root after an explicit traversal
+	/// side effect and returns its logical snapshot identity.
+	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<Snapshot>;
 
 	/// Returns the number of logical mutations currently staged by the
 	/// transaction.
@@ -247,6 +316,34 @@ pub(super) trait QueryRead {
 		binding: &ResolvedMatchBinding,
 	) -> FerrosGrynnResult<Vec<AtomId>>;
 
+	/// Attempts a bounded local hot-page expansion. `None` requests the
+	/// occurrence-aware materialized fallback.
+	fn physical_traversal_candidates(
+		&self,
+		snapshot: Snapshot,
+		graph: &GraphRef,
+		source: AtomId,
+		directions: &[crate::syn::MatchDirection],
+	) -> FerrosGrynnResult<Option<PhysicalTraversalBatch>>;
+
+	/// Attempts a snapshot-exact local nested-graph lookup. `None` requests
+	/// the materialized occurrence fallback.
+	fn physical_inner_graph(
+		&self,
+		snapshot: Snapshot,
+		graph: &GraphRef,
+		owner: AtomId,
+	) -> FerrosGrynnResult<Option<PhysicalInnerGraphBatch>>;
+
+	/// Attempts a snapshot-exact local base/effective property read. `None`
+	/// requests the ordinary materialized occurrence fallback.
+	fn physical_occurrence_fields(
+		&self,
+		snapshot: Snapshot,
+		graph: &GraphRef,
+		owner: AtomId,
+	) -> FerrosGrynnResult<Option<PhysicalOccurrenceFieldsBatch>>;
+
 	/// Dereferences one record field in the statement's optional graph scope.
 	fn record_field(
 		&self,
@@ -269,6 +366,13 @@ pub(super) trait QueryRead {
 		snapshot: Snapshot,
 		graph: crate::graph::GraphId,
 	) -> FerrosGrynnResult<GraphRef>;
+
+	/// Computes the canonical read-only LevelPath for one occurrence.
+	fn level_path(
+		&self,
+		snapshot: Snapshot,
+		occurrence: &AtomOccurrenceRef,
+	) -> FerrosGrynnResult<Value>;
 
 	/// Returns the property dictionary captured by the statement snapshot.
 	fn property_dictionary(&self, snapshot: Snapshot) -> Arc<PropertyDictionary>;
@@ -880,6 +984,7 @@ pub(super) use pipeline::{
 	MatchGraphFields,
 	OneRowCursor,
 	RecordFields,
+	properties_object,
 };
 pub(super) use scoped::{ScopedTraversalCandidate, ScopedTraversalIndex, resolve_scoped_endpoint};
 pub(super) use scoped_path::{ScopedPathExpandCursor, ScopedShortestPathCursor};

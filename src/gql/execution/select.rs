@@ -900,6 +900,13 @@ fn expression_uses_column(expression: &TypedExpr, column: usize) -> bool {
 			arguments,
 			..
 		} => arguments.iter().any(|value| expression_uses_column(value, column)),
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => {
+			expression_uses_column(callee, column)
+				|| arguments.iter().any(|value| expression_uses_column(value, column))
+		}
 		TypedExprKind::Aggregate {
 			argument,
 			..
@@ -907,9 +914,11 @@ fn expression_uses_column(expression: &TypedExpr, column: usize) -> bool {
 		TypedExprKind::Subquery {
 			..
 		} => true,
-		TypedExprKind::Constant(_) | TypedExprKind::Slot(_) | TypedExprKind::CurrentField(_) => {
-			false
-		}
+		TypedExprKind::Traversal(_) => false,
+		TypedExprKind::Constant(_)
+		| TypedExprKind::Slot(_)
+		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Closure(_) => false,
 	}
 }
 
@@ -1268,7 +1277,7 @@ fn rows_to_set<Read: QueryRead>(
 	collector.finish()
 }
 
-fn resolve_graph_reference<Read: QueryRead>(
+pub(in crate::gql::execution) fn resolve_graph_reference<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
 	reference: &LogicalGraphReference,

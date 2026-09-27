@@ -423,15 +423,15 @@ impl Measurement {
 
 /// Wall/process-CPU deltas captured around one measured aggregate scope.
 #[derive(Debug, Clone, Copy)]
-struct MeasurementTiming {
+pub(super) struct MeasurementTiming {
 	/// Complete measured wall time.
-	elapsed: Duration,
+	pub(super) elapsed: Duration,
 	/// Process kernel plus user CPU time consumed during the same scope.
-	cpu_time: Duration,
+	pub(super) cpu_time: Duration,
 }
 
 /// Paired wall/process-CPU timer for aggregate measurements.
-struct MeasurementTimer {
+pub(super) struct MeasurementTimer {
 	/// Wall-clock start instant.
 	wall_started: Instant,
 	/// Process CPU time observed immediately before the wall start.
@@ -441,16 +441,16 @@ struct MeasurementTimer {
 /// Cumulative Windows process-memory counters around one measured scan.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy)]
-struct ProcessMemorySnapshot {
+pub(super) struct ProcessMemorySnapshot {
 	/// Total process page faults since process start.
-	page_fault_count: u32,
+	pub(super) page_fault_count: u32,
 	/// Current resident working-set bytes.
-	working_set_bytes: u64,
+	pub(super) working_set_bytes: u64,
 }
 
 impl MeasurementTimer {
 	/// Captures the process-CPU snapshot immediately before the wall start.
-	fn start() -> io::Result<Self> {
+	pub(super) fn start() -> io::Result<Self> {
 		let cpu_started = process_cpu_time()?;
 		Ok(Self {
 			wall_started: Instant::now(),
@@ -459,7 +459,7 @@ impl MeasurementTimer {
 	}
 
 	/// Captures wall and process-CPU deltas at the end of the measured scope.
-	fn finish(self) -> io::Result<MeasurementTiming> {
+	pub(super) fn finish(self) -> io::Result<MeasurementTiming> {
 		let elapsed = self.wall_started.elapsed();
 		let cpu_finished = process_cpu_time()?;
 		Ok(MeasurementTiming {
@@ -7077,7 +7077,7 @@ fn filetime_ticks(value: FILETIME) -> u64 {
 
 /// Reads cumulative process page faults and current working-set bytes.
 #[cfg(windows)]
-fn process_memory_snapshot() -> io::Result<ProcessMemorySnapshot> {
+pub(super) fn process_memory_snapshot() -> io::Result<ProcessMemorySnapshot> {
 	let mut counters = PROCESS_MEMORY_COUNTERS::default();
 	counters.cb = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>())
 		.map_err(|_error| io::Error::other("process memory counter size exceeds u32"))?;

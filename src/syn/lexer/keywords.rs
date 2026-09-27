@@ -95,8 +95,10 @@ pub(in crate::syn) const ISOLATION: &str = "ISOLATION";
 pub(in crate::syn) const IS: &str = "IS";
 pub(in crate::syn) const JOIN: &str = "JOIN";
 pub(in crate::syn) const JSON: &str = "JSON";
+pub(in crate::syn) const KEEP: &str = "KEEP";
 pub(in crate::syn) const LET: &str = "LET";
 pub(in crate::syn) const LEVEL: &str = "LEVEL";
+pub(in crate::syn) const LEVELPATH: &str = "LEVELPATH";
 pub(in crate::syn) const LABEL: &str = "LABEL";
 pub(in crate::syn) const LAST: &str = "LAST";
 pub(in crate::syn) const LEFT: &str = "LEFT";
@@ -181,15 +183,16 @@ pub(in crate::syn) const ATOMS: &str = "ATOMS";
 pub(in crate::syn) const COST: &str = "COST";
 pub(in crate::syn) const CROSS_LEVEL: &str = "CROSS_LEVEL";
 pub(in crate::syn) const TRAIL: &str = "TRAIL";
+pub(in crate::syn) const TRAVERSE: &str = "TRAVERSE";
 pub(in crate::syn) const WHEN: &str = "WHEN";
 pub(in crate::syn) const WHILE: &str = "WHILE";
 
 /// Statement starts recognized only to return the explicit unsupported status.
 pub(in crate::syn) const UNSUPPORTED_STATEMENTS: &[&str] =
-	&["TRAVERSE", "BUILD", "SHOW", "KILL", "REBUILD", "COMPACT", "LIVE"];
+	&["BUILD", "SHOW", "KILL", "REBUILD", "COMPACT", "LIVE"];
 
 /// MATCH modifiers recognized only to return the explicit unsupported status.
-pub(in crate::syn) const UNSUPPORTED_MATCH_MODIFIERS: &[&str] = &["KEEP"];
+pub(in crate::syn) const UNSUPPORTED_MATCH_MODIFIERS: &[&str] = &[KEEP];
 
 /// SELECT clauses recognized only to return the explicit unsupported status.
 pub(in crate::syn) const UNSUPPORTED_SELECT_CLAUSES: &[&str] =

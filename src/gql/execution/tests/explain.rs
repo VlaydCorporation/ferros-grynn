@@ -263,3 +263,59 @@ fn explain_match_projects_physical_algorithms_and_runtime_metrics() {
 	assert_eq!(hash(first), hash(second));
 	session.execute("CANCEL;", &Object::new()).unwrap();
 }
+
+#[test]
+fn explain_traverse_projects_vm_steps_and_fast_effect_limit() {
+	let store = Datastore::in_memory();
+	let full = json_result(
+		&store,
+		"EXPLAIN FULL FORMAT JSON TRAVERSE FROM [1, 2, 2] |> tv::map(|$value| $value + 1) |> \
+		 tv::dedup() |> tv::count();",
+	);
+	assert_eq!(full.get("statement_kind"), Some(&Value::from("TRAVERSE")));
+	let Some(Value::Array(nodes)) = full.get("nodes") else {
+		panic!("physical traversal nodes are missing");
+	};
+	let operators = nodes
+		.iter()
+		.filter_map(Value::as_object)
+		.filter_map(|node| node.get("operator"))
+		.filter_map(Value::as_str)
+		.collect::<Vec<_>>();
+	assert_eq!(operators, ["ValueSource", "Map", "Deduplicate", "Count"]);
+	assert!(matches!(full.get("plan_hash"), Some(Value::Number(_))));
+
+	let analyzed = json_result(
+		&store,
+		"EXPLAIN ANALYZE FORMAT JSON TRAVERSE FROM [1, 2, 2] |> tv::dedup() |> tv::count();",
+	);
+	let Some(Value::Object(metrics)) = analyzed.get("analyze") else {
+		panic!("TRAVERSE ANALYZE metrics are missing");
+	};
+	assert_eq!(metrics.get("actual_rows"), Some(&Value::from(1_u64)));
+
+	let mut session = store.session();
+	session.execute("BEGIN EXECUTION MODE FAST;", &Object::new()).unwrap();
+	let explained = session
+		.execute(
+			"EXPLAIN FULL FORMAT JSON TRAVERSE FROM [1] |> tv::side_effect('seen', |$value, \
+			 $previous| $value);",
+			&Object::new(),
+		)
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	let Value::Object(explained) = explained else {
+		panic!("FORMAT JSON must return an object");
+	};
+	let Some(Value::Array(warnings)) = explained.get("warnings") else {
+		panic!("FAST traversal warnings are missing");
+	};
+	assert!(warnings.iter().any(|warning| {
+		warning.as_str().is_some_and(|warning| warning.starts_with("execution_limited:"))
+	}));
+	session.execute("CANCEL;", &Object::new()).unwrap();
+}
