@@ -16,6 +16,7 @@ use super::{
 	GraphKind,
 	GraphMut,
 	GraphRead,
+	GraphTopologyConstraints,
 	GraphWriteBack,
 	Mutable,
 	NodeRead,
@@ -185,6 +186,10 @@ impl<State> Metagraph<State> {
 		self.graph.revision()
 	}
 
+	pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.graph.topology_constraints()
+	}
+
 	pub const fn node_count(&self) -> usize {
 		self.graph.node_count()
 	}
@@ -249,6 +254,10 @@ impl<State> GraphRead for Metagraph<State> {
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		GraphRead::properties(&self.graph)
+	}
+
+	fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.graph.topology_constraints()
 	}
 
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
@@ -365,7 +374,7 @@ impl<State> Hash for Metagraph<State> {
 	}
 }
 
-fn validate_nested_references<R: GraphRead>(graph: &R) -> FerrosGrynnResult<()> {
+pub(crate) fn validate_nested_references<R: GraphRead>(graph: &R) -> FerrosGrynnResult<()> {
 	for id in graph.edge_ids()? {
 		let id = id?;
 		let edge = graph.edge(id)?.ok_or_else(|| {

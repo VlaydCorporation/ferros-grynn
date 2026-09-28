@@ -3777,17 +3777,17 @@ RETURN weights_sum;
 
 **Структура графа**
 
-| Шаг                                      | Описание                                                           |
-|------------------------------------------|--------------------------------------------------------------------|
-| `tv::topologicalSort()`                  | Топологическая сортировка (только для ациклического подграфа)      |
-| `tv::stronglyConnectedComponents()`      | Компоненты сильной связности (SCC)                                 |
-| `tv::weaklyConnectedComponents()`        | Компоненты слабой связности (WCC)                                  |
-| `tv::condensation()`                     | Конденсация по SCC — DAG из компонент                              |
+| Шаг                                        | Описание                                                           |
+|--------------------------------------------|--------------------------------------------------------------------|
+| `tv::topologicalSort()`                    | Топологическая сортировка (только для ациклического подграфа)      |
+| `tv::stronglyConnectedComponents()`        | Компоненты сильной связности (SCC)                                 |
+| `tv::weaklyConnectedComponents()`          | Компоненты слабой связности (WCC)                                  |
+| `tv::condensation()`                       | Конденсация по SCC — DAG из компонент                              |
 | `tv::minimumSpanningForest(weight_field?)` | Минимальный остовный лес                                           |
-| `tv::findCuts()`                         | Точки сочленения и мосты                                           |
-| `tv::lca(a, b)`                          | Наименьший общий предок (binary lifting; требует корневого дерева) |
-| `tv::hasCycle()`                         | Наличие цикла                                                      |
-| `tv::reachable(target)`                  | Достижимость; использует reachability-индекс, если он `ready`      |
+| `tv::findCuts()`                           | Точки сочленения и мосты                                           |
+| `tv::lca(a, b)`                            | Наименьший общий предок (binary lifting; требует корневого дерева) |
+| `tv::hasCycle()`                           | Наличие цикла                                                      |
+| `tv::reachable(target)`                    | Достижимость; использует reachability-индекс, если он `ready`      |
 
 Graph-wide algorithms работают над induced graph node occurrences одного `GraphId` и являются
 barrier-операторами. PageRank, centralities, all-shortest enumeration, triangles, clustering,
@@ -3898,7 +3898,7 @@ speculative implementation.
 
 | Правило          | Описание                                                                             |
 |------------------|--------------------------------------------------------------------------------------|
-| Объявление       | `(Person AS a)` → `Env[a] = vertex<Person>`                                             |
+| Объявление       | `(Person AS a)` → `Env[a] = vertex<Person>`                                          |
 | Повторный alias  | `(a)-->(b), (b)-->(c)` → `Env[b]` одинаков в обоих — это constraint, не присваивание |
 | Scope            | `MATCH` создаёт новый scope; `WITH` / `LET` ограничивают или расширяют scope         |
 | MATCH result     | Возвращает `Bag<Env>` (мультимножество биндинг-сред)                                 |
@@ -3946,11 +3946,11 @@ edge является typed runtime error и не подменяется еди�
 ### 15.3. Модификаторы путей
 
 #### Path mode
-| Режим     | Условие                                            |
-|-----------|----------------------------------------------------|
-| `WALK`    | Без ограничений (повторы вершин и рёбер допустимы) |
-| `TRAIL`   | Связывающие рёбра не повторяются                   |
-| `ACYCLIC` | Endpoint-атом не повторяется                        |
+| Режим     | Условие                                                                       |
+|-----------|-------------------------------------------------------------------------------|
+| `WALK`    | Без ограничений (повторы вершин и рёбер допустимы)                            |
+| `TRAIL`   | Связывающие рёбра не повторяются                                              |
+| `ACYCLIC` | Endpoint-атом не повторяется                                                  |
 | `SIMPLE`  | Endpoint не повторяется, кроме одного совпадения последнего endpoint с первым |
 
 `ACYCLIC` запрещает возврат к началу, а `SIMPLE` допускает один замыкающий шаг. Оба режима
@@ -4019,13 +4019,13 @@ IN GRAPH social
 RETURN path, path::length(path), path::cost(path);
 ```
 
-| Функция           | Тип результата  | Описание                               |
-|-------------------|-----------------|----------------------------------------|
-| `path::atoms(p)`  | `array<atom-occurrence>`   | Полная чередующаяся последовательность |
-| `path::nodes(p)`  | `array<atom-occurrence>`   | Node endpoint occurrences              |
-| `path::edges(p)`  | `array<atom-occurrence>`   | Connector edge occurrences             |
-| `path::length(p)` | `int`                       | Количество connector steps             |
-| `path::cost(p)`   | `number`                    | Exact сумма весов либо длина            |
+| Функция           | Тип результата           | Описание                               |
+|-------------------|--------------------------|----------------------------------------|
+| `path::atoms(p)`  | `array<atom-occurrence>` | Полная чередующаяся последовательность |
+| `path::nodes(p)`  | `array<atom-occurrence>` | Node endpoint occurrences              |
+| `path::edges(p)`  | `array<atom-occurrence>` | Connector edge occurrences             |
+| `path::length(p)` | `int`                    | Количество connector steps             |
+| `path::cost(p)`   | `number`                 | Exact сумма весов либо длина           |
 
 Именованный или возвращаемый путь отслеживается с начала соответствующего обхода. Если путь
 не именован, не возвращается и не используется `tv::path()`/path-функциями, исполнитель вправе
@@ -4313,24 +4313,26 @@ RETURN GRAPH <tree> { nodes: [c, sub], edges: [child] };
 
 ### 16.2. RETURN GRAPH
 
-Возвращает граф как результат запроса. Необязательный модификатор типа `@constraint` проверяет структуру результирующего графа.
+Возвращает самодостаточный graph-result как терминальный результат `MATCH`/`TRAVERSE` либо из
+session/block bindings:
 
-```
-RETURN GRAPH [ @constraint ] {
-    nodes: [ @node_exprs ],
-    edges: [ @edge_exprs ]
+```grynql
+RETURN GRAPH [ <family validators...> ] [ ROOT expr ] {
+    nodes: expr,
+    edges: expr
 };
 ```
 
-Возвращаемый тип:
-- `subgraph` (`Subgraph<Frozen>` в Rust SDK), если `@constraint` не указан;
-- точный frozen-тип, указанный `@constraint` (`Tree<Frozen>`, `Dag<Frozen>` и т. п.);
-- если граф нарушает указанный тип → `ConstraintViolation` на уровне запроса.
+Family — одна из `GRAPH`, `TREE`, `ROOTED_TREE`, `FOREST`, `DAG`, `HYPER`, `META`.
+`SIMPLE`, `BIPARTITE` и `COMPLETE` являются независимыми validators. Без family результат имеет
+тип `Subgraph<Frozen>` даже при validators; иначе возвращается точный frozen family type.
+Несоответствие даёт `ConstraintViolation`.
 
 `RETURN GRAPH` — терминальная проекция результата текущего запроса. Она полностью материализует
 выбранную топологию и значения до возврата, после чего исходный transaction/disk snapshot
-освобождается. Результат самодостаточен, неизменяем и не меняется вместе с базой. Ничего не
-сохраняется в базе; значение существует, пока его держит клиент или сессия.
+освобождается. Результат самодостаточен, неизменяем, не меняется вместе с базой и не удерживает
+transaction, page guard или storage snapshot. Ничего не сохраняется в базе; owned value живёт,
+пока его держит клиент или сессия.
 
 Транспортный sum-type не меняет контракт: вид варианта однозначно определяется синтаксисом
 оператора. Пользователь не должен угадывать backend или ветку `GraphHandle`.
@@ -4348,31 +4350,60 @@ IN GRAPH dag_example
 RETURN GRAPH <dag> { nodes: [pkg, dep], edges: [dependency] };
 ```
 
+Selectors рекурсивно принимают graph-domain values, arrays и sets. Выбранное edge автоматически
+добавляет свои endpoints, включая edge-as-endpoint topology и необходимые containment owners,
+но не обходит постороннюю adjacency выбранных nodes. Один atom в разных graph scopes остаётся
+разными occurrences. Несвязанные containment roots не сплющиваются и дают
+`GraphAssemblyScopeAmbiguous`.
+
+`ROOT` допустим только для `ROOTED_TREE`. Explicit root authoritative и обязан быть одной
+root-level node occurrence; для directed arborescence он совпадает со structural root. Без
+`ROOT` допустимы singleton либо единственный directed structural root; undirected multi-node
+tree требует explicit root.
+
 ### 16.3. BUILD GRAPH
 
-Явно строит именованный граф из результата запроса.
+Явно строит owned graph из query/direct graph value и, при наличии имени, атомарно публикует его
+в catalog.
 
 ```
 BUILD GRAPH 
     [ OVERWRITE | IF NOT EXISTS ]
-    [ @constraint ] 
-    [ @name ]
-    FROM @source_query
-    [ NODES @node_selector ]
-    [ EDGES @edge_selector ]
-    [ LIMIT NODES @n ]
-    [ LIMIT EDGES @m ]
+    [ <family validators...> ]
+    [ name ]
+    FROM source
+    [ ROOT expr ]
+    [ NODES node_selector ]
+    [ EDGES edge_selector ]
+    [ LIMIT NODES n ]
+    [ LIMIT EDGES m ]
+    [ TIMEOUT duration ]
 ;
 ```
-Модификатор типа `<@constraint>` — проверка после построения. Если граф не удовлетворяет типу, возвращается `ConstraintViolation`.
+`LIMIT` — hard ceiling, а не truncation. Без family анонимный результат —
+`Subgraph<Frozen>`, новый именованный graph — `GraphKind::Graph`.
 
 `BUILD GRAPH` — DDL/DML-гибрид: материализует и именует новый граф верхнего уровня.
 После выполнения граф с именем `@name` появляется в каталоге графов наравне с графами, созданными через DEFINE GRAPH, 
 и переживает транзакцию/сессию — он персистентен, пока не удалён явно (`REMOVE GRAPH @name`).
-Если `@name` не указано — возвращается session-owned точный frozen-тип, заданный constraint
-(без constraint — `Subgraph<Frozen>`). Он живёт как значение переменной в рамках сессии и не
-попадает в постоянный каталог. Именованный `BUILD GRAPH` после успешного `COMMIT` возвращает
+Если имя не указано — возвращается owned точный frozen-тип, заданный contract
+(без family — `Subgraph<Frozen>`), который не попадает в каталог. Именованный `BUILD GRAPH`
+после успешного `COMMIT` возвращает
 каталожную ссылку `GraphRef`; до коммита она не видна другим транзакциям.
+
+`IF NOT EXISTS` при существующем graph возвращает его `GraphRef` без вычисления source.
+`OVERWRITE` сохраняет root `GraphId`, graph properties, family и system-index identities,
+заменяя occurrences/topology/overlays одной transaction mutation. Explicit family обязана
+совпасть; validators без annotation сохраняются, с annotation заменяются exact set.
+
+Именованный build использует только существующие database-global atoms. Target overlay
+воспроизводит effective source view; отсутствующие base atoms не создаются неявно. Nested subset
+получает internal child graphs, скрытые из обычного name lookup/`GRAPHS`. Один source child
+копируется физически один раз, даже если несколько owners ссылаются на него. Root replacement
+каскадно удаляет прежних owned children.
+
+`BUILD GRAPH` допустим как statement и как полный RHS `LET`, но не как произвольный nested
+scalar expression и не внутри Atomic Import.
 
 #### Контракт результатов графовых операторов
 
@@ -4385,18 +4416,19 @@ BUILD GRAPH
 | `RETURN GRAPH { ... }`               | самодостаточный `subgraph`                             |
 | `RETURN GRAPH <type> { ... }`        | точный frozen graph type                               |
 | именованный `BUILD GRAPH <type>`     | `GraphRef` после commit                                |
-| анонимный `BUILD GRAPH <type>`       | session-owned frozen graph type                        |
-| `graph::inner(meta)` внутри запроса  | snapshot-bound view                                    |
-| возврат `graph::inner(meta)` клиенту | материализованный `subgraph`                           |
+| анонимный `BUILD GRAPH <type>`       | owned frozen graph type                                |
+| `graph::inner(meta)`                 | `GraphRef` внутреннего graph                           |
 
 ### 16.4. Ограничение глубины и граф-результаты
 
 `FG_PATH_MAX_DEPTH` применяется **только к path-finding** (MATCH с `*` без явного max). 
-RETURN GRAPH и BUILD GRAPH используют **graph-expansion mode**: не отслеживают пути, а собирают достижимые атомы.
+RETURN GRAPH и BUILD GRAPH используют **graph-assembly mode**: потребляют явно выбранные
+значения, выполняют только endpoint/containment closure и не обходят произвольную adjacency.
 
-Лимит в graph-expansion mode разделены по числу узлов и рёбер. 
-Без явного указания лимитов используются настройки `FG_GRAPH_EXPANSION_MAX_NODES` и `FG_GRAPH_EXPANSION_MAX_EDGES`.
-Это позволяет строить большие графы без ограничений, связанных с глубиной.
+Лимиты разделены по unique target nodes и edges. Без query limits используются
+`QueryExecutionOptions.max_graph_nodes = 1_000_000` и `max_graph_edges = 5_000_000`; effective
+ceiling — minimum options/query limits. Assembly учитывается в общем barrier-memory budget и не
+spill-ится, потому что owned graph обязан быть самодостаточным.
 
 Примеры:
 ```
@@ -4641,11 +4673,11 @@ BEGIN [ ISOLATION LEVEL @level ] [ READ ONLY ]
 Режим задаётся на транзакцию. В исполнимом профиле этапа 17 поддержаны `BEST_EFFORT`
 (default), `DETERMINISTIC` и `FAST`.
 
-| Режим                        | Гарантии                                                                                                                                                                                                                                                                                                                 |
-|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `BEST_EFFORT` (по умолчанию) | Результат детерминирован по содержимому, но порядок без `ORDER BY` не гарантирован; план может меняться между запусками                                                                                                                                                                                                  |
+| Режим                        | Гарантии                                                                                                                                                                                                                                                                                                                                                                                                           |
+|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `BEST_EFFORT` (по умолчанию) | Результат детерминирован по содержимому, но порядок без `ORDER BY` не гарантирован; план может меняться между запусками                                                                                                                                                                                                                                                                                            |
 | `DETERMINISTIC`              | Строгая воспроизводимость при одинаковых snapshot, canonical parameters, user seed и engine build: стабильный порядок, канонический plan и фиксированный порядок floating-point reduction. Без `ORDER BY` результат доупорядочивается stable public identity. `time::now()` и другие недетерминированные/IMPURE функции отклоняются до чтения данных; scalar `rand()`/`uuid()` остаются неисполняемыми до этапа 21 |
-| `FAST`                       | Та же ACID/FCW/SSI/constraint/error semantics и тот же result multiset. Без явного `ORDER BY` не гарантирует порядок, plan/replay stability, pure branch/hash merge order и schedule float reductions; int/decimal остаются exact. Approximation, sampling, early cutoff и пропуск validation запрещены. |
+| `FAST`                       | Та же ACID/FCW/SSI/constraint/error semantics и тот же result multiset. Без явного `ORDER BY` не гарантирует порядок, plan/replay stability, pure branch/hash merge order и schedule float reductions; int/decimal остаются exact. Approximation, sampling, early cutoff и пропуск validation запрещены.                                                                                                           |
 
 `DETERMINISTIC` допустим только при `SNAPSHOT` и `SERIALIZABLE`; `READ COMMITTED` запрещён.
 Effective seed включает version, normalized query fingerprint, canonical parameter fingerprint,
@@ -4675,22 +4707,22 @@ RapidHash V3 по versioned canonical physical-plan bytes: `DefaultHasher`, `Deb
 
 ### 18.2. Встроенные пространства имён
 
-| Пространство | Исполнимо в этапе 12 | Отложено |
-|---|---|---|
-| `math::` | `abs`, `sqrt`, `pow`, `floor`, `ceil` | `stddev`, `variance` и агрегаты — этап 13 |
-| `string::` | `upper`, `lower`, `len`, `contains`, `split`, `concat` | regex/stateful helpers — этап 21 |
-| `time::` | `now`, `format`, `add`, `diff`; `now()` один на statement | оставшийся catalog — этап 21 |
-| `array::` | `len`, `concat`, `distinct`, `first`, `flatten` | `group` — этап 13; `push/pop/clear` — этап 21 |
-| `set::` | `len`, `union`, `intersect`, `diff`, `has` | `add/clear` — этап 21 |
-| `type::` | `is<T>`, `to<T>` | — |
-| `meta::` | `id`, `class`, `type` | — |
-| `option::` | `is_some`, `is_none` | — |
-| `graph::` / path / pipeline | graph occurrence/path functions этапов 16–17 | `tv::algo` registry — этап 21 |
-| closures | session-scoped language closures — этап 17 | UDF/catalog/overloads/recursion — этап 21 |
-| `regex::` | — | этап 21 |
-| `search::` | — | этап 22 |
-| `geo::` | — | этап 24 |
-| `computed::` | — | назначенный schema/query этап |
+| Пространство                | Исполнимо в этапе 12                                      | Отложено                                      |
+|-----------------------------|-----------------------------------------------------------|-----------------------------------------------|
+| `math::`                    | `abs`, `sqrt`, `pow`, `floor`, `ceil`                     | `stddev`, `variance` и агрегаты — этап 13     |
+| `string::`                  | `upper`, `lower`, `len`, `contains`, `split`, `concat`    | regex/stateful helpers — этап 21              |
+| `time::`                    | `now`, `format`, `add`, `diff`; `now()` один на statement | оставшийся catalog — этап 21                  |
+| `array::`                   | `len`, `concat`, `distinct`, `first`, `flatten`           | `group` — этап 13; `push/pop/clear` — этап 21 |
+| `set::`                     | `len`, `union`, `intersect`, `diff`, `has`                | `add/clear` — этап 21                         |
+| `type::`                    | `is<T>`, `to<T>`                                          | —                                             |
+| `meta::`                    | `id`, `class`, `type`                                     | —                                             |
+| `option::`                  | `is_some`, `is_none`                                      | —                                             |
+| `graph::` / path / pipeline | graph occurrence/path functions этапов 16–17              | `tv::algo` registry — этап 21                 |
+| closures                    | session-scoped language closures — этап 17                | UDF/catalog/overloads/recursion — этап 21     |
+| `regex::`                   | —                                                         | этап 21                                       |
+| `search::`                  | —                                                         | этап 22                                       |
+| `geo::`                     | —                                                         | этап 24                                       |
+| `computed::`                | —                                                         | назначенный schema/query этап                 |
 
 Этап 12 использует закрытый статический enum/signature table и обычный `match`: runtime
 registry функций не создаётся. `array::distinct` сохраняет первое вхождение, `flatten` снимает
@@ -5991,8 +6023,8 @@ SELECT fn::friend_score(person:alice, person:bob) AS score;
 | `FG_WITHIN_MAX_DEPTH`                | Глобальная максимальная длина поиска вложенностей в мета-атомах                        | 7                     |
 | `FG_TRAVERSAL_READ_YOUR_WRITES`      | Включает traversal pipeline'у видимость его собственных изменений                      | false                 |
 | `FG_TEMPFILES_PATH`                  | Каталог временных файлов: спиллинг сортировок в `SELECT` **и** при построении индексов | ""                    |
-| `FG_GRAPH_EXPANSION_MAX_NODES`       | Глобальное максимальное количество узлов при построении графа                          | 1'000'000             |
-| `FG_GRAPH_EXPANSION_MAX_EDGES`       | Глобальное максимальное количество рёбер при построении графа                          | 5'000'000             |
+| `QueryExecutionOptions.max_graph_nodes` | Максимум unique target nodes одного graph result                                   | 1'000'000             |
+| `QueryExecutionOptions.max_graph_edges` | Максимум unique target edges одного graph result                                   | 5'000'000             |
 | `FG_DISKANN_CACHE_SIZE`              | Размер кэша индекса DiskANN                                                            | 268435456 (256 МБ)    |
 | `FG_EXECUTION_MODE`                  | Режим исполнения по умолчанию ([§17.8](#178-режимы-исполнения-и-детерминизм))          | `BEST_EFFORT`         |
 | `FG_MAX_SNAPSHOT_AGE_SEC`            | Возраст снимка, после которого он принудительно закрывается                            | 300                   |

@@ -100,27 +100,40 @@ impl DatabaseRoot {
 	}
 
 	/// Removes one graph and every graph-local occurrence while preserving all
-	/// database-global atoms.
+	/// database-global atoms. Owned internal descendants are removed with their
+	/// public root.
 	pub(crate) fn remove_graph(&mut self, graph: GraphId) -> FerrosGrynnResult<()> {
-		let schema = self
-			.schema
+		self.schema
 			.graph(graph)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?;
 		let mut next = self.clone();
-		let globals = next
-			.graph(graph)
-			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?
-			.occurrences()
-			.map(|occurrence| occurrence.global_id())
+		let mut remove = next
+			.schema
+			.all_graphs()
+			.filter(|schema| schema.owner_root() == Some(graph))
+			.map(|schema| schema.id())
 			.collect::<Vec<_>>();
-		for global in globals {
-			next.detach(graph, global)?;
+		remove.push(graph);
+		for graph in remove {
+			let schema = next
+				.schema
+				.graph(graph)
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?;
+			let globals = next
+				.graph(graph)
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?
+				.occurrences()
+				.map(|occurrence| occurrence.global_id())
+				.collect::<Vec<_>>();
+			for global in globals {
+				next.detach(graph, global)?;
+			}
+			next.graphs.remove(&graph);
+			let catalog = Arc::make_mut(&mut next.schema);
+			catalog.graphs.remove(&graph);
+			catalog.graph_names.remove(schema.name().as_str());
+			catalog.graph_versions.remove(&graph);
 		}
-		next.graphs.remove(&graph);
-		let catalog = Arc::make_mut(&mut next.schema);
-		catalog.graphs.remove(&graph);
-		catalog.graph_names.remove(schema.name().as_str());
-		catalog.graph_versions.remove(&graph);
 		next.rebuild_derived_state()?;
 		*self = next;
 		Ok(())

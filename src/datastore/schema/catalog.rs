@@ -8,7 +8,8 @@ use std::{
 use super::ClassSchema;
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::{GraphId, GraphRef, PropertyMap, Text, Value},
+	graph::GraphTopologyConstraints,
+	values::runtime::{GraphId, GraphRef, PropertyMap, RecordId, Text, Value},
 };
 
 /// Stable identity of one schema-catalog object.
@@ -231,6 +232,9 @@ pub struct GraphSchema {
 	reference: GraphRef,
 	system_indexes: [SystemIndex; 2],
 	properties: PropertyMap,
+	topology_constraints: GraphTopologyConstraints,
+	root: Option<RecordId>,
+	owner_root: Option<GraphId>,
 	pub(crate) published_at: u64,
 }
 
@@ -241,6 +245,9 @@ impl GraphSchema {
 		label: SystemIndex,
 		adjacency: SystemIndex,
 		properties: PropertyMap,
+		topology_constraints: GraphTopologyConstraints,
+		root: Option<RecordId>,
+		owner_root: Option<GraphId>,
 		published_at: u64,
 	) -> Self {
 		Self {
@@ -248,6 +255,9 @@ impl GraphSchema {
 			reference,
 			system_indexes: [label, adjacency],
 			properties,
+			topology_constraints,
+			root,
+			owner_root,
 			published_at,
 		}
 	}
@@ -277,10 +287,44 @@ impl GraphSchema {
 		&self.properties
 	}
 
+	/// Returns the durable topology validators attached to this graph.
+	pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.topology_constraints
+	}
+
+	/// Returns the authoritative root of a rooted-tree graph.
+	pub const fn root(&self) -> Option<&RecordId> {
+		self.root.as_ref()
+	}
+
+	pub(crate) const fn owner_root(&self) -> Option<GraphId> {
+		self.owner_root
+	}
+
+	pub(crate) const fn is_internal(&self) -> bool {
+		self.owner_root.is_some()
+	}
+
 	pub(crate) fn replace_properties(&self, properties: PropertyMap) -> FerrosGrynnResult<Self> {
 		let mut replacement = self.clone();
 		replacement.version = replacement.version.next()?;
 		replacement.properties = properties;
+		Ok(replacement)
+	}
+
+	pub(crate) fn replace_definition(
+		&self,
+		properties: Option<PropertyMap>,
+		topology_constraints: GraphTopologyConstraints,
+		root: Option<RecordId>,
+	) -> FerrosGrynnResult<Self> {
+		let mut replacement = self.clone();
+		replacement.version = replacement.version.next()?;
+		if let Some(properties) = properties {
+			replacement.properties = properties;
+		}
+		replacement.topology_constraints = topology_constraints;
+		replacement.root = root;
 		Ok(replacement)
 	}
 
@@ -402,8 +446,12 @@ impl SchemaCatalog {
 		self.parameters.get(name).cloned()
 	}
 
-	/// Iterates graph definitions in stable identity order.
-	pub fn graphs(&self) -> impl ExactSizeIterator<Item = &Arc<GraphSchema>> {
+	/// Iterates public graph definitions in stable identity order.
+	pub fn graphs(&self) -> impl Iterator<Item = &Arc<GraphSchema>> {
+		self.graphs.values().filter(|graph| !graph.is_internal())
+	}
+
+	pub(crate) fn all_graphs(&self) -> impl ExactSizeIterator<Item = &Arc<GraphSchema>> {
 		self.graphs.values()
 	}
 

@@ -1,4 +1,4 @@
-//! Canonical little-endian encoding for `FGDC v8`.
+//! Canonical little-endian encoding for `FGDC v9`.
 
 use super::{
 	AtomStoreCatalogBinding,
@@ -25,7 +25,7 @@ use crate::{
 		SchemaVersion,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::{AtomId, AtomKind, GraphId, GraphStorageMode},
+	graph::{AtomId, AtomKind, GraphId, GraphStorageMode, GraphTopologyConstraints},
 	storage::{
 		graph_pages::GraphArenaBindings,
 		page::PageNo,
@@ -35,7 +35,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"FGDC";
-const VERSION: u16 = 8;
+const VERSION: u16 = 9;
 const HEADER_BYTES: usize = 80;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
@@ -273,15 +273,20 @@ fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnR
 	output.extend_from_slice(&graph.generation.to_le_bytes());
 	output.push(type_codec::graph_kind(graph.kind));
 	output.push(storage_mode(graph.storage_mode));
-	output.extend_from_slice(&0_u16.to_le_bytes());
+	output.extend_from_slice(&graph.topology_constraints.bits().to_le_bytes());
 	output.extend_from_slice(&graph.label_index.0.get().to_le_bytes());
 	output.extend_from_slice(&graph.label_index.1.get().to_le_bytes());
 	output.extend_from_slice(&graph.adjacency_index.0.get().to_le_bytes());
 	output.extend_from_slice(&graph.adjacency_index.1.get().to_le_bytes());
 	write_binding(output, graph.membership);
+	output.extend_from_slice(&graph.owner_root.map_or(0, GraphId::get).to_le_bytes());
+	write_u32(output, graph.root.as_ref().map_or(0, Vec::len), "graph root value bytes")?;
 	write_u32(output, graph.properties.len(), "graph property count")?;
 	write_u32(output, graph.arena.graph_by_slot.len(), "graph arena slot count")?;
 	write_string(output, graph.name.as_str(), "graph name")?;
+	if let Some(root) = &graph.root {
+		output.extend_from_slice(root);
+	}
 	for property in &graph.properties {
 		output.extend_from_slice(&property.key.get().to_le_bytes());
 		write_u32(output, property.value.len(), "graph property value bytes")?;
@@ -312,7 +317,8 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 	let generation = decoder.read_u64()?;
 	let kind = type_codec::decode_graph_kind(decoder.read_u8()?)?;
 	let storage_mode = decode_storage_mode(decoder.read_u8()?)?;
-	decoder.expect_zero(2, "graph entry reserved bytes")?;
+	let topology_constraints = GraphTopologyConstraints::from_bits(decoder.read_u16()?)
+		.ok_or_else(|| invalid("graph entry contains unknown topology constraint bits"))?;
 	let label_index = (
 		IndexId::from_storage(decoder.read_u32()?)?,
 		SchemaVersion::from_storage(decoder.read_u32()?)?,
@@ -322,9 +328,20 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 		SchemaVersion::from_storage(decoder.read_u32()?)?,
 	);
 	let membership = read_binding(decoder)?;
+	let owner_root = match decoder.read_u64()? {
+		0 => None,
+		value => Some(
+			GraphId::new(value).ok_or_else(|| invalid("graph owner root uses identity zero"))?,
+		),
+	};
+	let root_len = decoder.read_count("graph root value bytes")?;
 	let property_count = decoder.read_count("graph property count")?;
 	let slot_count = decoder.read_count("graph arena slot count")?;
 	let name = read_string(decoder, "graph name")?.into();
+	let root = match root_len {
+		0 => None,
+		length => Some(decoder.read_exact(length)?.to_vec()),
+	};
 	let mut properties = Vec::with_capacity(property_count);
 	for _ in 0..property_count {
 		let key = PropertyKeyId::new(decoder.read_u32()?);
@@ -365,9 +382,12 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 		name,
 		kind,
 		storage_mode,
+		topology_constraints,
 		label_index,
 		adjacency_index,
 		membership,
+		owner_root,
+		root,
 		properties,
 		arena: GraphArenaBindings {
 			graph_by_slot,

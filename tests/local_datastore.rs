@@ -34,8 +34,10 @@ mod tests {
 			EdgeEndpoint,
 			EdgeTopology,
 			GraphKind,
+			GraphRead,
 			GraphRef,
 			GraphStorageMode,
+			NodeRead,
 			QualifiedAtomId,
 		},
 		values::{Object, PropertyMap, RecordId, RecordIdPart, Type, Uuid, Value},
@@ -564,6 +566,139 @@ mod tests {
 		let primary = find_file(directory.path(), "primary.fgidx").unwrap();
 		corrupt_byte(&primary, 128);
 		assert!(Datastore::open_local(directory.path(), options).is_err());
+	}
+
+	#[test]
+	fn named_build_graph_survives_reopen() {
+		let directory = LocalTestDirectory::new();
+		let options = local_options();
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut seed = store.begin();
+		seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+		seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
+		let source = seed.define_graph("source", GraphKind::Graph).unwrap();
+		let left = "person:left".parse::<RecordId>().unwrap();
+		let right = "person:right".parse::<RecordId>().unwrap();
+		let edge = "link:edge".parse::<RecordId>().unwrap();
+		for record in [&left, &right, &edge] {
+			seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		}
+		let left_id = seed.attach_node(source.id(), &left, None, None).unwrap();
+		let right_id = seed.attach_node(source.id(), &right, None, None).unwrap();
+		seed.attach_edge(
+			source.id(),
+			&edge,
+			None,
+			EdgeTopology::directed([left_id], [right_id]),
+			None,
+			None,
+		)
+		.unwrap();
+		seed.commit().unwrap();
+		store
+			.execute(
+				"BUILD GRAPH copied FROM (MATCH (person:left AS a)-[link:edge AS \
+				 e]->(person:right AS b) IN GRAPH source RETURN a, e, b) NODES [a, b] EDGES e",
+				&Object::new(),
+			)
+			.unwrap();
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let rows = reopened
+			.execute(
+				"MATCH (person:left AS a)-[link:edge]->(person:right AS b) IN GRAPH copied RETURN \
+				 b",
+				&Object::new(),
+			)
+			.unwrap();
+		assert!(matches!(
+			rows[0].result.as_ref().unwrap().value(),
+			Value::Array(values) if values.len() == 1
+		));
+	}
+
+	#[test]
+	fn named_build_shared_child_reopens_and_is_replaced_and_removed_atomically() {
+		let directory = LocalTestDirectory::new();
+		let options = local_options();
+		let store = Datastore::create_local(directory.path(), options).unwrap();
+		let mut seed = store.begin();
+		seed.define_class(ClassSchema::new("module", AtomKind::Node, []).unwrap()).unwrap();
+		seed.define_class(ClassSchema::new("document", AtomKind::Node, []).unwrap()).unwrap();
+		let child = seed.define_graph("child", GraphKind::Graph).unwrap();
+		let root = seed.define_graph("root", GraphKind::Metagraph).unwrap();
+		let document = "document:spec".parse::<RecordId>().unwrap();
+		let first = "module:first".parse::<RecordId>().unwrap();
+		let second = "module:second".parse::<RecordId>().unwrap();
+		for record in [&document, &first, &second] {
+			seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		}
+		seed.attach_node(child.id(), &document, None, None).unwrap();
+		seed.attach_node(root.id(), &first, None, Some(child.id())).unwrap();
+		seed.attach_node(root.id(), &second, None, Some(child.id())).unwrap();
+		seed.commit().unwrap();
+		let source =
+			"MATCH (document AS d) WITHIN <(module AS owner)> IN GRAPH root RETURN d, owner";
+		let build = format!("BUILD GRAPH <META> copied FROM ({source}) NODES [d, owner]");
+		store.execute(&build, &Object::new()).unwrap();
+		drop(store);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let mut read = reopened.begin();
+		let copied = read.named_graph("copied").unwrap().unwrap();
+		let copied_id = copied.id();
+		let view = copied.read(&read).unwrap();
+		let children = view
+			.node_ids()
+			.unwrap()
+			.filter_map(Result::ok)
+			.filter_map(|id| view.node(id).ok().flatten())
+			.filter_map(|node| {
+				node.inner_graph_ref().unwrap().map(|reference| reference.into_owned())
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(children.len(), 2);
+		assert_eq!(children[0].id(), children[1].id());
+		let old_child = children[0].clone();
+		drop(read);
+
+		reopened
+			.execute(
+				&format!("BUILD GRAPH OVERWRITE <META> copied FROM ({source}) NODES [d, owner]"),
+				&Object::new(),
+			)
+			.unwrap();
+		let mut after_overwrite = reopened.begin();
+		let replacement = after_overwrite.named_graph("copied").unwrap().unwrap();
+		assert_eq!(replacement.id(), copied_id);
+		assert!(old_child.read(&after_overwrite).is_err());
+		let replacement_view = replacement.read(&after_overwrite).unwrap();
+		let replacement_child = replacement_view
+			.node_ids()
+			.unwrap()
+			.filter_map(Result::ok)
+			.filter_map(|id| replacement_view.node(id).ok().flatten())
+			.find_map(|node| {
+				node.inner_graph_ref().unwrap().map(|reference| reference.into_owned())
+			})
+			.unwrap();
+		assert_ne!(replacement_child.id(), old_child.id());
+		drop(after_overwrite);
+
+		let mut remove = reopened.begin();
+		remove.remove_graph("copied").unwrap();
+		remove.commit().unwrap();
+		let verify = reopened.begin();
+		assert!(replacement.read(&verify).is_err());
+		assert!(replacement_child.read(&verify).is_err());
+		drop(verify);
+		drop(reopened);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let mut verify = reopened.begin();
+		assert!(verify.named_graph("copied").unwrap().is_none());
+		assert!(replacement_child.read(&verify).is_err());
 	}
 
 	#[cfg(feature = "native-async-io")]

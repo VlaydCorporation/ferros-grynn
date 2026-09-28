@@ -248,18 +248,33 @@ pub(super) fn record_values(
 	start: usize,
 	limit: usize,
 ) -> FerrosGrynnResult<Vec<Value>> {
+	let mut values = Vec::with_capacity(limit.min(1024));
+	visit_record_values(output, start, limit, |value| {
+		values.push(value);
+		Ok(())
+	})?;
+	Ok(values)
+}
+
+pub(super) fn visit_record_values(
+	output: SortedRecords,
+	start: usize,
+	limit: usize,
+	mut visit: impl FnMut(Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<usize> {
 	let mut stream = output.into_stream()?;
 	for _index in 0..start {
 		if stream.next()?.is_none() {
-			return Ok(Vec::new());
+			return Ok(0);
 		}
 	}
-	let mut values = Vec::with_capacity(limit.min(1024));
-	while values.len() < limit {
+	let mut visited = 0;
+	while visited < limit {
 		let Some(record) = stream.next()? else {
 			break;
 		};
-		values.push(record.value);
+		visit(record.value)?;
+		visited += 1;
 	}
-	Ok(values)
+	Ok(visited)
 }

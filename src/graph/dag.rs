@@ -24,6 +24,7 @@ use super::{
 	GraphKind,
 	GraphMut,
 	GraphRead,
+	GraphTopologyConstraints,
 	GraphWriteBack,
 	Mutable,
 	NodeRead,
@@ -544,6 +545,10 @@ impl<State> Dag<State> {
 		self.metadata.properties()
 	}
 
+	pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.metadata.topology_constraints()
+	}
+
 	pub const fn node_count(&self) -> usize {
 		self.storage.nodes.len()
 	}
@@ -653,6 +658,10 @@ impl<State> GraphRead for Dag<State> {
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		Ok(Cow::Borrowed(self.properties()))
+	}
+
+	fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.topology_constraints()
 	}
 
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {

@@ -268,6 +268,16 @@ impl GraphRead for TransactionGraphView<'_> {
 		Ok(Cow::Borrowed(schema.properties()))
 	}
 
+	fn topology_constraints(&self) -> crate::graph::GraphTopologyConstraints {
+		self.root
+			.schema
+			.graphs
+			.get(&self.reference.id())
+			.map_or(crate::graph::GraphTopologyConstraints::empty(), |schema| {
+				schema.topology_constraints()
+			})
+	}
+
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		self.transaction
 			.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Node));

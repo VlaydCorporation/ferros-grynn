@@ -27,7 +27,7 @@ impl UnpublishedGeneration {
 	/// Arms cleanup before the first streamed side-file is created.
 	pub(super) fn for_database(root: &Path, database: &DatabaseRoot, generation: &str) -> Self {
 		let mut directories = vec![root.join("atoms").join(generation)];
-		directories.extend(database.schema.graphs().map(|graph| {
+		directories.extend(database.schema.all_graphs().map(|graph| {
 			root.join("graphs").join(format!("{:016x}", graph.id().get())).join(generation)
 		}));
 		Self {

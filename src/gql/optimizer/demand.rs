@@ -118,6 +118,11 @@ impl PlannerDemand {
 				}
 			}
 		}
+		if let Some(result) = &statement.return_graph {
+			collect_expr(result.root.as_ref(), &[], &mut demand);
+			collect_expr(Some(&result.nodes), &[], &mut demand);
+			collect_expr(Some(&result.edges), &[], &mut demand);
+		}
 		demand
 	}
 
@@ -157,6 +162,11 @@ impl PlannerDemand {
 			}
 		}
 		collect_expr(statement.returning.as_ref(), &[], &mut demand);
+		if let Some(result) = &statement.return_graph {
+			collect_expr(result.root.as_ref(), &[], &mut demand);
+			collect_expr(Some(&result.nodes), &[], &mut demand);
+			collect_expr(Some(&result.edges), &[], &mut demand);
+		}
 		demand
 	}
 
@@ -167,6 +177,35 @@ impl PlannerDemand {
 			LogicalStatement::Select(select) => Self::for_select(select),
 			LogicalStatement::Match(statement) => Self::for_match(statement),
 			LogicalStatement::Traverse(statement) => Self::for_traverse(statement),
+			LogicalStatement::ReturnGraph(result) => {
+				let mut demand = Self::default();
+				collect_expr(result.root.as_ref(), &[], &mut demand);
+				collect_expr(Some(&result.nodes), &[], &mut demand);
+				collect_expr(Some(&result.edges), &[], &mut demand);
+				demand
+			}
+			LogicalStatement::BuildGraph(build) => {
+				let mut demand = match &build.source {
+					crate::gql::ir::LogicalBuildGraphSource::Match(statement) => {
+						Self::for_match(statement)
+					}
+					crate::gql::ir::LogicalBuildGraphSource::Select(statement) => {
+						Self::for_select(statement)
+					}
+					crate::gql::ir::LogicalBuildGraphSource::Traverse(statement) => {
+						Self::for_traverse(statement)
+					}
+					crate::gql::ir::LogicalBuildGraphSource::Expression(expression) => {
+						let mut demand = Self::default();
+						collect_expr(Some(expression), &[], &mut demand);
+						demand
+					}
+				};
+				collect_expr(build.root.as_ref(), &[], &mut demand);
+				collect_expr(build.nodes.as_ref(), &[], &mut demand);
+				collect_expr(build.edges.as_ref(), &[], &mut demand);
+				demand
+			}
 			LogicalStatement::Dml(statement) => {
 				let mut demand = Self::default();
 				if let Some(graph) = &statement.graph {

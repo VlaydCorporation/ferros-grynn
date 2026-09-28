@@ -347,7 +347,8 @@ types при необходимости расширяется общими ти
    RAM/local/recovery/resource/performance gates. `Q-01`–`Q-03`,
    `Q-15`–`Q-16`, `Q-21`, `Q-07` и `Q-35` остаются закрытыми прежними этапами.
    `Q-04`–`Q-06`, `Q-09`–`Q-14`, `Q-20`, `Q-22` и `Q-30`–`Q-34` остаются открытыми либо
-   явно отложенными до назначенных зависимых этапов; `Q-36` зарегистрирован этапом 14.
+   явно отложенными до назначенных зависимых этапов; `Q-36` зарегистрирован этапом 14,
+   `Q-37` закрыт этапом 18.
 
    **Известный реестр на текущем checkout:**
 
@@ -390,6 +391,7 @@ types при необходимости расширяется общими ти
    | `Q-34`  | Query performance                       | Paired `--profile profiling` probe одно-statement `Datastore::execute("RETURN 1")` дал `1620,20 ns/op` для прежнего direct path и `1702,60 ns/op` для temporary-session driver: ratio `1,0509`, то есть на 0,09 процентного пункта выше gate `+5%`. Clone AST и лишняя result allocation уже удалены.                                                                                                                                                                                                   | По явному решению пользователя оставить текущую реализацию и оптимизировать позднее. На этапе 19 профилировать оставшиеся structural/session/control overhead, сохраняя transaction semantics; gate не считать пройденным до ratio `≤1,05` на повторяемом paired run.                                                                                                                                            | ⬜ открыто — допустимое отклонение принято 2026-09-25                           |
    | `Q-35`  | Functionality + durability + UX         | `TransactionGraphView::properties()` возвращал пустую map, а `FGDC v7` не сохранял пользовательские graph properties. Поэтому graph-source SELECT и Mode 3 не могли вернуть catalog-owned metadata, а обновление свойств графа было невозможно.                                                                                                                                                                                                                                                         | Этап 13 S1 ввёл `FGDC v8`, canonical graph-property section, `DEFINE GRAPH ... CONTENT`, `UPDATE GRAPH SET/UNSET`, MVCC/FCW/SSI и RAM/local/reopen/recovery gates без изменения `GraphSuperblock` или physical graph generation. Evidence: `reports/gql_select_stage_13_report.md`.                                                                                                                              | ✅ закрыто — этап 13 S1, 2026-09-26                                             |
    | `Q-36`  | Startup performance + architecture      | Local open вызывает eager `DatabaseRoot::rebuild_derived_state`: indexes и statistics заново строятся из atom/graph state, хотя durable side-files уже прошли recovery и доступны для чтения. Correctness сохраняется, но startup остаётся `O(data + indexes)`, lazy statistics lifecycle не становится runtime authority, а reopen benchmark оптимизатора не измеряет реальную стоимость открытия крупной БД.                                                                                          | На этапе 19 измерить reopen для 1K/100K/1M atoms и количества индексов 0/1/8; затем либо загружать validated durable index/stat roots лениво по demand, либо оставить rebuild только как typed corruption fallback. Нельзя удалять rebuild до differential recovery/reopen gate и проверки revision/binding identities. Evidence обнаружения и Stage-14 граница: `reports/gql_optimizer_stage_14_report.md` §10. | ⬜ открыто — владелец этап 19                                                   |
+   | `Q-37`  | Correctness + durability                | Durable family/root/validator contract должен одинаково применяться к GrynnQL и прямому Rust mutation path. Проверка только в `BUILD GRAPH` позволила бы прямой транзакционной мутации опубликовать invalid `TREE`/`DAG`/validator topology.                                                                                                                                                                                                                                                            | Этап 18 выделил один shared validator и запускает его для каждого затронутого graph после replay под commit lock, до публикации. Прямые Rust mutation regressions, RAM/local/reopen и combined `SIMPLE`/`BIPARTITE`/`COMPLETE` gates пройдены. Evidence: `reports/gql_graph_results_stage_18_report.md`.                                                                                                         | ✅ закрыто — этап 18 G7, 2026-09-28                                             |
 
    Уточнение к `Q-16`/`Q-27` от 2026-09-23: последующее ASan/Miri/assembly-исследование
    подтвердило порчу до Direct I/O и эффективность инициализации окончательного frame in-place,
@@ -702,11 +704,25 @@ types при необходимости расширяется общими ти
     - [x] V13–V15: correctness/performance gates, отчёт и закрытие этапа.
 
 18. **Path и graph results** — зависит от **16, 17**.  
-    Подключить `RETURN GRAPH`, `BUILD GRAPH`, graph/path assembly и graph-return matrix.
-    Базовый runtime `Path` и `PathTraceArena` уже принадлежат этапам 15–17; этап 18 владеет их
-    result/assembly surface. Публичные результаты содержат `RecordId`, `AtomRef`, `Path`,
-    `GraphRef` или `MaterializedGraph`, никогда `DiskAtomRef`, page addresses или
-    `StorageValue`. Результат не удерживает завершённый storage snapshot.
+    Dependency-ordered контракт и gates вынесены в
+    [`gql_graph_results_stage_18_plan.md`](gql_graph_results_stage_18_plan.md). Этап подключает
+    terminal `RETURN GRAPH`, анонимный owned и именованный atomic `BUILD GRAPH`, сохраняет
+    nested/shared-child hierarchy, вводит durable orthogonal validators и `FGDC v9` без
+    изменения page/WAL layout. Базовый runtime `Path` и `PathTraceArena` уже принадлежат
+    этапам 15–17; этап 18 владеет только result/assembly surface. Публичный результат не
+    содержит storage DTO и не удерживает завершённый snapshot.
+
+    **Статус (2026-09-28): ✅ завершён.** G0–G14, self-contained graph assembly,
+    `FGDC v9`, arena DAG, commit-time durable validation и atomic named build реализованы.
+    Library gates прошли 499/501 tests без/с `native-async-io`; local gates — 15/16.
+    Paired profiling дал `BUILD GRAPH/query_to_memory = 1,023×`, внутри лимита 5%.
+    `Q-37` закрыт. Evidence:
+    [`reports/gql_graph_results_stage_18_report.md`](reports/gql_graph_results_stage_18_report.md).
+
+    - [x] G0–G3: normative contract, runtime metadata, `FGDC v9`, syntax/IR;
+    - [x] G4–G8: pull assembly, hierarchy, validators и anonymous results;
+    - [x] G9–G11: atomic named build, local durability и EXPLAIN/resources;
+    - [x] G12–G14: correctness/performance gates, report, AGENTS и Graphify attempt.
 
 19. **Windows GA-core gate** — зависит от **3–18** и закрытия блокеров реестра **4.1**.
     Прогнать crash/recovery matrix, codec/parser fuzzing, RAM/local и Sync/NativeAsync differential tests, long-running SSI/checkpoint tests и storage/query benchmarks. После успеха заморозить core format v1, публичный API и поддерживаемый GrynQL-profile; advanced side-files остаются отдельно версионируемыми.

@@ -18,6 +18,7 @@ pub struct MatchStatement {
 	pub filter: Option<Expr>,
 	pub max_depth: Option<Expr>,
 	pub timeout: Option<TimeoutValue>,
+	pub return_graph: Option<ReturnGraph>,
 	pub projection_distinct: bool,
 	pub projection: Vec<MatchReturnItem>,
 	pub order: Vec<SelectOrder>,

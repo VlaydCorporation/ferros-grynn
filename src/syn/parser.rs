@@ -18,7 +18,7 @@ use super::{
 		cover,
 	},
 	lexer::{keywords, lex},
-	stmt::{Statement, StatementKind, TimeoutValue},
+	stmt::{RecordKey, Statement, StatementKind, TimeoutValue},
 	token::{Symbol, Token, TokenKind},
 };
 use crate::gql_status::{
@@ -153,6 +153,11 @@ impl Parser<'_> {
 			StatementKind::Throw(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else if self.consume_keyword(keywords::ASSERT).is_some() {
 			StatementKind::AssertInvariants(self.assert_invariants_statement()?)
+		} else if self.consume_keyword(keywords::BUILD).is_some() {
+			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `BUILD`.")?;
+			StatementKind::BuildGraph(
+				context.run(|context| self.build_graph_statement(context)).await?,
+			)
 		} else if self.consume_keyword(keywords::DEFINE).is_some() {
 			if self.consume_keyword(keywords::GRAPH).is_some() {
 				StatementKind::DefineGraph(
@@ -206,7 +211,11 @@ impl Parser<'_> {
 		} else if self.consume_keyword(keywords::MATCH).is_some() {
 			StatementKind::Match(context.run(|context| self.match_statement(context, false)).await?)
 		} else if self.consume_keyword(keywords::RETURN).is_some() {
-			StatementKind::Return(context.run(|context| self.return_statement(context)).await?)
+			if self.consume_keyword(keywords::GRAPH).is_some() {
+				StatementKind::ReturnGraph(context.run(|context| self.return_graph(context)).await?)
+			} else {
+				StatementKind::Return(context.run(|context| self.return_statement(context)).await?)
+			}
 		} else if self.consume_keyword(keywords::SELECT).is_some() {
 			StatementKind::Select(context.run(|context| self.select_statement(context)).await?)
 		} else if self.consume_keyword(keywords::TRAVERSE).is_some() {
@@ -220,6 +229,11 @@ impl Parser<'_> {
 		};
 		let embedded_timeout = match &mut kind {
 			StatementKind::Match(statement) => statement.timeout.take(),
+			StatementKind::BuildGraph(statement) => statement.timeout.take(),
+			StatementKind::Let(crate::syn::LetStatement {
+				value: crate::syn::LetValue::BuildGraph(statement),
+				..
+			}) => statement.timeout.take(),
 			_ => None,
 		};
 		let timeout = if embedded_timeout.is_some() {
@@ -524,14 +538,42 @@ impl Parser<'_> {
 			TokenKind::Word {
 				value,
 				quoted,
-			} => Ok(Expr {
-				kind: ExprKind::Name(Identifier {
-					value,
-					quoted,
-					span: token.span,
-				}),
-				span: token.span,
-			}),
+			} => {
+				if self.at_symbol(Symbol::Colon)
+					&& !self.current().gap_before
+					&& !self.tokens.peek(1).gap_before
+				{
+					self.tokens.next();
+					let key = self.tokens.next();
+					let record_key = match key.kind {
+						TokenKind::Number(value) => RecordKey::Integer(value, key.span),
+						TokenKind::String(value)
+						| TokenKind::Word {
+							value,
+							..
+						} => RecordKey::String(value, key.span),
+						_ => {
+							return Err(self.syntax("Expected a record ID after `:`.", key.span));
+						}
+					};
+					Ok(Expr {
+						kind: ExprKind::Literal(Literal::Record {
+							class: value,
+							key: record_key,
+						}),
+						span: cover(token.span, key.span),
+					})
+				} else {
+					Ok(Expr {
+						kind: ExprKind::Name(Identifier {
+							value,
+							quoted,
+							span: token.span,
+						}),
+						span: token.span,
+					})
+				}
+			}
 			TokenKind::Symbol(Symbol::Bang) => {
 				self.unary(context, token.span, UnaryOperator::Not, depth, object_depth).await
 			}
@@ -1420,9 +1462,27 @@ mod tests {
 		};
 		assert!(matches!(statement.patterns[0], MatchPattern::Within(_)));
 
-		let error = parse("MATCH (* AS a) IN GRAPH social RETURN GRAPH", ParserSettings::default())
-			.expect_err("RETURN GRAPH belongs to stage 18");
-		assert_eq!(error.status().code().to_string(), "FG-50F03");
+		let returned = parse(
+			"MATCH (* AS a) IN GRAPH social RETURN GRAPH <DAG SIMPLE> { nodes: a, edges: [] }",
+			ParserSettings::default(),
+		)
+		.expect("terminal RETURN GRAPH parses");
+		let StatementKind::Match(statement) = &returned.statements[0].kind else {
+			panic!("expected MATCH");
+		};
+		assert!(statement.return_graph.is_some());
+
+		let built = parse(
+			"BUILD GRAPH OVERWRITE <ROOTED_TREE BIPARTITE> social FROM (SELECT VALUE id FROM \
+			 person) ROOT person:root LIMIT NODES 10 LIMIT EDGES 9",
+			ParserSettings::default(),
+		)
+		.expect("named BUILD GRAPH parses");
+		assert!(matches!(built.statements[0].kind, StatementKind::BuildGraph(_)));
+		parse("BUILD GRAPH <GRAPH DAG> FROM []", ParserSettings::default())
+			.expect_err("one graph contract cannot contain two families");
+		parse("BUILD GRAPH <SIMPLE SIMPLE> FROM []", ParserSettings::default())
+			.expect_err("one graph contract cannot repeat a validator");
 
 		parse(
 			"MATCH CONSTRAINTS <TRAIL WALK> (* AS a)-[*]->(* AS b) IN GRAPH social RETURN b",

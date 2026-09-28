@@ -141,7 +141,19 @@ pub(super) fn open_local_state(
 		database_superblock.checkpoint_record_lsn,
 	);
 	let mut graph_superblocks = BTreeMap::new();
-	for binding in &bindings.graphs {
+	let mut pending = bindings.graphs.iter().collect::<Vec<_>>();
+	while !pending.is_empty() {
+		let index = pending
+			.iter()
+			.position(|binding| {
+				binding
+					.arena
+					.graph_by_slot
+					.iter()
+					.all(|(slot, child)| *slot == 0 || database.graph(*child).is_some())
+			})
+			.ok_or_else(|| invalid("graph arenas contain a cycle or an absent child graph"))?;
+		let binding = pending.remove(index);
 		let reference = database
 			.schema
 			.graph(binding.graph_id)

@@ -399,6 +399,45 @@ pub(crate) struct PhysicalWritePlan {
 	pub(crate) cost: PlanCost,
 }
 
+/// Concrete graph-result operation projected by `EXPLAIN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GraphResultOperator {
+	/// Produces one owned anonymous graph value.
+	GraphAssemble,
+	/// Installs one named graph tree through the transaction adapter.
+	BuildGraph,
+}
+
+/// Publication behavior of one graph-result operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GraphResultMode {
+	Anonymous,
+	Create,
+	IfNotExists,
+	Overwrite,
+}
+
+/// Fixed graph assembly plan; Stage 18 has no competing assembly algorithms.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PhysicalGraphResultPlan {
+	pub(crate) operator: GraphResultOperator,
+	pub(crate) mode: GraphResultMode,
+	pub(crate) source: Option<Box<PhysicalPlan>>,
+	pub(crate) name: Option<Box<str>>,
+	pub(crate) family: Option<crate::graph::GraphKind>,
+	pub(crate) validator_bits: u16,
+	pub(crate) has_root: bool,
+	pub(crate) has_node_selector: bool,
+	pub(crate) has_edge_selector: bool,
+	pub(crate) node_limit: u64,
+	pub(crate) edge_limit: u64,
+	pub(crate) expected_nodes: Cardinality,
+	pub(crate) expected_edges: Cardinality,
+	pub(crate) expected_scopes: Cardinality,
+	pub(crate) cost: PlanCost,
+	pub(crate) warnings: Vec<PlanWarning>,
+}
+
 /// Complete internal physical plan used by EXPLAIN and replay hashing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PhysicalPlan {
@@ -410,6 +449,8 @@ pub(crate) enum PhysicalPlan {
 	Traversal(PhysicalTraversalPlan),
 	/// DDL or DML phase sequence.
 	Write(PhysicalWritePlan),
+	/// Owned graph assembly and optional named publication.
+	GraphResult(PhysicalGraphResultPlan),
 }
 
 impl PhysicalPlan {
@@ -464,6 +505,23 @@ impl PhysicalPlan {
 			Self::Write(plan) => {
 				3_u8.hash(&mut writer);
 				plan.operators.hash(&mut writer);
+			}
+			Self::GraphResult(plan) => {
+				4_u8.hash(&mut writer);
+				plan.operator.hash(&mut writer);
+				plan.mode.hash(&mut writer);
+				plan.source.as_deref().map(Self::hash).hash(&mut writer);
+				plan.name.hash(&mut writer);
+				plan.family.hash(&mut writer);
+				plan.validator_bits.hash(&mut writer);
+				plan.has_root.hash(&mut writer);
+				plan.has_node_selector.hash(&mut writer);
+				plan.has_edge_selector.hash(&mut writer);
+				plan.node_limit.hash(&mut writer);
+				plan.edge_limit.hash(&mut writer);
+				plan.expected_nodes.hash(&mut writer);
+				plan.expected_edges.hash(&mut writer);
+				plan.expected_scopes.hash(&mut writer);
 			}
 		}
 		writer.finish()

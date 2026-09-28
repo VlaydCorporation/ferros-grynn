@@ -14,6 +14,13 @@ handle конкретного materialization и нужен в том числе
 - `Tree`, `RootedTree`, `Forest`, `Dag` и `Hypergraph` сохраняют отдельные
   structural invariants и layouts. Не заменять их номинальными wrapper-ами.
 - `Metagraph` использует general layout как явно зафиксированное исключение.
+- `GraphTopologyConstraints` хранит ортогональные `SIMPLE`, `BIPARTITE` и
+  `COMPLETE`; это metadata, а не дополнительные graph families. Rooted tree
+  хранит durable `RecordId` root и разрешает его в materialization-local
+  `AtomId` только после проверки graph scope.
+- `MaterializedGraph` является полностью owned result. Вложенный child graph
+  физически представлен один раз, даже если несколько container slots
+  ссылаются на него; разные occurrence paths при этом не схлопываются.
 - `AtomOccurrenceRef` — snapshot-relative graph occurrence. Его equality/order/hash
   определяются парой `{GraphId, AtomRef}`; graph name и storage mode в identity не
   входят.
@@ -46,6 +53,9 @@ handle конкретного materialization и нужен в том числе
   trait для этого не нужен.
 - `query_to_memory` освобождает исходный guard после копирования, а mutable
   hybrid сохраняет origin mapping и explicit dirty set.
+- Graph-result assembly копирует только выбранные atoms и closure-required
+  endpoints/containers; adjacency не обходится неявно. Несвязанные root scopes
+  дают typed error вместо flattening.
 
 ## Проверка
 

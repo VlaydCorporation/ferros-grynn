@@ -40,6 +40,8 @@ pub use crate::{
 		BeginStatement,
 		BinaryOperator,
 		Block,
+		BuildGraphSource,
+		BuildGraphStatement,
 		CatchClause,
 		ClassKindName,
 		ClassSchemaModeName,
@@ -67,9 +69,12 @@ pub use crate::{
 		Expr,
 		ExprKind,
 		ForStatement,
+		GraphContract,
+		GraphFamilyName,
 		GraphPropertyAssignment,
 		GraphPropertyMutation,
 		GraphPropertyPath,
+		GraphValidatorName,
 		Identifier,
 		IfStatement,
 		ImportGraphRef,
@@ -81,6 +86,7 @@ pub use crate::{
 		InfoStatement,
 		InfoTarget,
 		LetStatement,
+		LetValue,
 		Literal,
 		MatchDirection,
 		MatchEdge,
@@ -100,6 +106,7 @@ pub use crate::{
 		RelateStatement,
 		RemoveStatement,
 		RemoveTarget,
+		ReturnGraph,
 		ReturnStatement,
 		SelectAccessHint,
 		SelectGroup,
@@ -150,6 +157,7 @@ pub enum QueryStatementKind {
 	Try,
 	Throw,
 	Assert,
+	BuildGraph,
 	Create,
 	Update,
 	Upsert,
@@ -164,6 +172,7 @@ pub enum QueryStatementKind {
 	Let,
 	Match,
 	Return,
+	ReturnGraph,
 	Select,
 	Traverse,
 	Import,
@@ -253,6 +262,7 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		StatementKind::Try(_) => QueryStatementKind::Try,
 		StatementKind::Throw(_) => QueryStatementKind::Throw,
 		StatementKind::AssertInvariants(_) => QueryStatementKind::Assert,
+		StatementKind::BuildGraph(_) => QueryStatementKind::BuildGraph,
 		StatementKind::Attach(_) => QueryStatementKind::Attach,
 		StatementKind::Create(_) => QueryStatementKind::Create,
 		StatementKind::Update(_) => QueryStatementKind::Update,
@@ -272,6 +282,7 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		StatementKind::Match(_) => QueryStatementKind::Match,
 		StatementKind::Relate(_) => QueryStatementKind::Relate,
 		StatementKind::Return(_) => QueryStatementKind::Return,
+		StatementKind::ReturnGraph(_) => QueryStatementKind::ReturnGraph,
 		StatementKind::Select(_) => QueryStatementKind::Select,
 		StatementKind::Traverse(_) => QueryStatementKind::Traverse,
 	}
@@ -299,6 +310,10 @@ pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
 			| StatementKind::Remove(_)
 			| StatementKind::Alter(_)
 			| StatementKind::Import(_)
+			| StatementKind::BuildGraph(crate::syn::BuildGraphStatement {
+				name: Some(_),
+				..
+			})
 	) {
 		return true;
 	}

@@ -924,27 +924,34 @@ triangles/clustering, label propagation и Louvain — этапу 26.
 ## 8. Граф как результат
 
 ```ebnf
-return_graph_stmt ::= "RETURN" "GRAPH" [ graph_constraint_ann ] graph_return_body
-graph_return_body ::= "{" "nodes" ":" array_lit "," "edges" ":" array_lit "}"
-graph_constraint_ann ::= "<" graph_constraint ">"
+return_graph_stmt ::= "RETURN" "GRAPH" [ graph_contract ] [ "ROOT" expr ] graph_return_body
+graph_return_body ::= "{" "nodes" ":" expr "," "edges" ":" expr "}"
+
+graph_contract  ::= "<" [ graph_family ] { graph_validator } ">"
+graph_family    ::= "GRAPH" | "TREE" | "ROOTED_TREE" | "FOREST" | "DAG"
+                  | "HYPER" | "META"
+graph_validator ::= "SIMPLE" | "BIPARTITE" | "COMPLETE"
 
 build_graph_stmt ::= "BUILD" "GRAPH"
                      [ "OVERWRITE" | "IF" "NOT" "EXISTS" ]
-                     [ graph_constraint_ann ]
+                     [ graph_contract ]
                      [ name ]
                      "FROM" build_source
+                     [ "ROOT" expr ]
                      [ "NODES" expr ]
                      [ "EDGES" expr ]
-                     [ "LIMIT" "NODES" integer ]
-                     [ "LIMIT" "EDGES" integer ]
+                     [ "LIMIT" "NODES" unsigned_integer ]
+                     [ "LIMIT" "EDGES" unsigned_integer ]
+                     [ "TIMEOUT" duration_lit ]
 build_source     ::= match_stmt | select_stmt | traverse_stmt | "(" statement ")" | graph_expr
 ```
 
-`graph_constraint` — тот же набор типов графов, что и в `DEFINE GRAPH` (§9.8, §14.4). Проверка типа выполняется
-**после** построения результата; несоответствие → `ConstraintViolation`.
-Без annotation `RETURN GRAPH` имеет тип `subgraph`; с annotation — точный указанный graph type.
-Оба результата полностью материализуются до выхода из запроса. Эти правила семантические и не
-добавляют альтернатив в EBNF.
+Contract содержит не более одной family и одного экземпляра каждого validator. Analyzer
+канонизирует validators как `SIMPLE`, `BIPARTITE`, `COMPLETE`. Без family `RETURN GRAPH` и
+анонимный `BUILD GRAPH` имеют тип `subgraph`; новый именованный graph получает family `GRAPH`.
+`ROOT` допустим только для rooted tree. `BUILD GRAPH` является statement либо полным RHS `LET`,
+но не nested scalar expression. Обе формы materialize owned result; ordinary `graph::inner`
+возвращает `GraphRef`.
 
 ---
 
@@ -1099,16 +1106,14 @@ filter         ::= "ascii" | "lowercase" | "uppercase" | "nfc" | "nfkc"
 
 ```ebnf
 define_graph ::= "DEFINE" "GRAPH" [ overwrite_or_ifne ] name
-                 [ "TYPE" graph_constraint ]
+                 [ "TYPE" graph_contract_body ]
                  [ "ROOT" root_ref | "ROOTS" array_lit ]
                  [ "VALIDATE" ( "ON_MUTATION" | "DEFERRED" ) ]
                  [ "CONTENT" expr ]
                  [ "COMMENT" string_lit ]
 root_ref ::= record_id | "(" record_id ")"
 
-graph_constraint ::= graph_type { graph_type }        (* совместимые ограничения комбинируются *)
-graph_type       ::= "SIMPLE" | "TREE" | "ROOTED_TREE" | "FOREST" | "DAG"
-                   | "BIPARTITE" | "COMPLETE" | "HYPER" | "META"
+graph_contract_body ::= [ graph_family ] { graph_validator }
 ```
 
 ### 9.9. REMOVE
@@ -1182,7 +1187,7 @@ alter_class_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
 
 alter_graph ::= "ALTER" "GRAPH" [ if_exists ] name
                 alter_graph_action { alter_graph_action }
-alter_graph_action ::= "TYPE" graph_constraint
+alter_graph_action ::= "TYPE" graph_contract_body
                      | "ROOT" root_ref | "ROOTS" array_lit | "DROP" "ROOTS"
                      | "VALIDATE" ( "ON_MUTATION" | "DEFERRED" )
                      | "COMMENT" string_lit | "DROP" "COMMENT"
@@ -1564,8 +1569,8 @@ domain_type ::=
 
 ### 14.4. Ограничения графа
 
-`graph_constraint` (используется в `DEFINE GRAPH TYPE`, `RETURN GRAPH <...>`, `BUILD GRAPH <...>`) —
-см. §9.8.
+`graph_contract_body` используется после `DEFINE/ALTER GRAPH TYPE`, а bracketed
+`graph_contract` — в `RETURN GRAPH`/`BUILD GRAPH`; family и validators определены в §8.
 
 ---
 

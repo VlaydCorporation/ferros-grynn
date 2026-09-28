@@ -8,6 +8,7 @@ use super::{
 	Forest,
 	GraphKind,
 	GraphRead,
+	GraphTopologyConstraints,
 	RootedTree,
 	Tree,
 	TreeOrientation,
@@ -67,6 +68,10 @@ macro_rules! define_family_view {
 
 			fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 				self.source.properties()
+			}
+
+			fn topology_constraints(&self) -> GraphTopologyConstraints {
+				self.source.topology_constraints()
 			}
 
 			fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {

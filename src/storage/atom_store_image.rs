@@ -678,7 +678,7 @@ pub(super) fn value_context(
 		let id = class.id().ok_or_else(|| invalid("catalog contains an unpublished class"))?;
 		context.register_class_name(id.get(), class.name().clone())?;
 	}
-	for graph in schema.graphs() {
+	for graph in schema.all_graphs() {
 		let reference = graph.reference().clone();
 		context.register_graph(reference.clone(), DiskGraphRef::new(reference.id()))?;
 	}

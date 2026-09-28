@@ -63,12 +63,19 @@ impl Parser<'_> {
 			None
 		};
 		self.expect_keyword(keywords::RETURN, "Expected `RETURN` in MATCH statement.")?;
-		if self.at_keyword(keywords::GRAPH) {
-			return Err(self.unsupported("graph-return", self.current().span));
-		}
-		let projection_distinct = self.consume_keyword(keywords::DISTINCT).is_some();
-		let projection = self.match_projection(context).await?;
-		let order = if self.consume_keyword(keywords::ORDER).is_some() {
+		let return_graph = if self.consume_keyword(keywords::GRAPH).is_some() {
+			Some(context.run(|context| self.return_graph(context)).await?)
+		} else {
+			None
+		};
+		let projection_distinct =
+			return_graph.is_none() && self.consume_keyword(keywords::DISTINCT).is_some();
+		let projection = if return_graph.is_some() {
+			Vec::new()
+		} else {
+			self.match_projection(context).await?
+		};
+		let order = if return_graph.is_none() && self.consume_keyword(keywords::ORDER).is_some() {
 			self.expect_keyword(keywords::BY, "Expected `BY` after MATCH ORDER.")?;
 			self.select_order_list(context).await?
 		} else {
@@ -87,6 +94,7 @@ impl Parser<'_> {
 			filter,
 			max_depth,
 			timeout,
+			return_graph,
 			projection_distinct,
 			projection,
 			order,

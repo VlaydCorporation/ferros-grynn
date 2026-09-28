@@ -165,7 +165,7 @@ fn build_graph_image_with_membership<Membership>(
 				let subgraph_slot = nested_graph
 					.map(|child| {
 						arena
-							.direct_slot(graph_id, child)
+							.direct_slot(0, local, child)
 							.ok_or_else(|| invalid("nested graph has no direct arena binding"))
 					})
 					.transpose()?;
@@ -216,7 +216,7 @@ fn build_graph_image_with_membership<Membership>(
 				let transition_subgraph_slot = transition_graph
 					.map(|child| {
 						arena
-							.direct_slot(graph_id, child)
+							.direct_slot(0, occurrence.local_id(), child)
 							.ok_or_else(|| invalid("transition graph has no direct arena binding"))
 					})
 					.transpose()?;

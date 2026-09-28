@@ -70,14 +70,30 @@ base view.
 hyperedge, meta-атома, edge-to-edge endpoint или cross-level incidence делает
 прямое сужение в эти family недопустимым.
 
-`SIMPLE`, `BIPARTITE` и `COMPLETE` — проверяемые ограничения topology, а не самостоятельные
-runtime family. Они могут применяться к совместимой family без обещания отдельного физического
-layout.
+`SIMPLE`, `BIPARTITE` и `COMPLETE` — ортогональные durable validators, а не самостоятельные
+runtime family. Они хранятся в graph schema, могут применяться совместно к совместимой family и
+проверяются после каждой затрагивающей topology transaction replay до commit publication:
+
+- `SIMPLE` требует binary connectors с двумя различными endpoint occurrences, запрещает
+  self-loop и повторную unordered pair независимо от direction;
+- `BIPARTITE` принимает только binary node-to-node topology и окрашивает underlying undirected
+  projection; disconnected components допустимы;
+- `COMPLETE` принимает только binary node-to-node topology и требует каждую unordered pair
+  distinct nodes; direction/multiplicity не учитываются, empty/singleton graph допустимы.
+
+Комбинация означает conjunction. Несовместимый hyper/meta/edge-endpoint input является
+constraint error, а не проигнорированным validator. Отдельного физического layout у validators
+нет.
 
 `Subgraph` — не ещё одна storage family, а самодостаточный materialized effective result
-выбранных occurrences и incidence. Constraint `RETURN GRAPH <T>` валидирует `Subgraph` и строит
-точный `T`; materialization копирует необходимые base/overlay properties и не удерживает
-membership или snapshot исходной базы.
+выбранных occurrences и incidence. Contract `RETURN GRAPH <family validators...>` валидирует
+`Subgraph` и при наличии family строит точный тип; materialization копирует необходимые
+base/overlay properties и не удерживает membership или snapshot исходной базы.
+
+Nested graph-result сохраняет containment DAG. Один source child `GraphId`, доступный через
+несколько owners, отображается в один target child, а разные arena slots сохраняют exact owner
+paths. Повтор child в другой branch допустим; повтор того же graph в текущей ancestry является
+cycle. Несвязанные source roots не сплющиваются в один result root.
 
 ## 3. Ориентация деревьев
 

@@ -69,6 +69,14 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
   `PathTraceArena`, optimizer и query spill. Traversal VM остаётся concrete
   sync pull executor; второй matcher, универсальный traversal trait и отдельная
   async runtime запрещены.
+- `RETURN GRAPH` и `BUILD GRAPH` проходят один concrete
+  `GraphAssemblyAccumulator`: source читается pull-потоком без промежуточного
+  `Vec<Value>`, edge/containment closure добавляет только необходимые atoms, а
+  публичный `MaterializedGraph` не удерживает transaction, snapshot или page
+  guard. Обычный `graph::inner` возвращает `GraphRef`; копирование всегда явно.
+- Именованный `BUILD GRAPH` передаёт уже проверенный owned graph одной bulk
+  mutation через datastore adapter. Executor не создаёт base atoms, storage
+  generations или отдельную публикацию на каждый atom.
 - Language closure принадлежит создавшей её `GqlSession`, учитывается вместе с
   retained typed plan и captures в общем лимите 256 МиБ и не сериализуется.
   Mutation допустима только в явном `tv::side_effect`; schema mutation во время

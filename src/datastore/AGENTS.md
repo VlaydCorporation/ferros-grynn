@@ -58,6 +58,14 @@ indexes и schema одним storage snapshot.
   только graph-local occurrence, если операция явно не задаёт Base scope.
 - `query_to_memory` владеет copied effective graph. Mutable materialization
   сохраняет origin mapping и flush-ит только явным вызовом; `Drop` не пишет.
+- Named `BUILD GRAPH` использует одну `InstallBuiltGraphTree` mutation: она
+  отображает только существующие global atoms, сохраняет effective overlays и
+  устанавливает root с owned internal children атомарно. Internal graphs имеют
+  одного public owner root, скрыты из обычного catalog scan и удаляются вместе
+  с заменяемым/удаляемым root.
+- Family, rooted-tree root и orthogonal topology validators проверяются одним
+  shared validator после transaction replay под commit lock. Прямой Rust path
+  не может обойти тот же durable contract, который проверяет GrynnQL.
 - Local `PhysicalTraversalCursor` фиксирует exact storage snapshot, graph
   generation и bindings. Он разрешает staged/WAL/home версии до transport,
   возвращает GQL только owned logical values и после первой private mutation

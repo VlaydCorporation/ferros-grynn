@@ -5,6 +5,7 @@ use std::{
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
 	marker::PhantomData,
+	mem::size_of,
 	sync::Arc,
 };
 
@@ -28,6 +29,7 @@ use super::{
 	GraphRead,
 	GraphReadView,
 	GraphStorageMode,
+	GraphTopologyConstraints,
 	GraphWriteBack,
 	MaterializationOrigin,
 	Mutable,
@@ -36,6 +38,12 @@ use super::{
 	QualifiedAtomId,
 	QueryMaterialize,
 	SnapshotId,
+	materialized::{
+		MaterializedGraph,
+		estimated_edge_fields_heap_bytes,
+		estimated_graph_fixed_heap_bytes,
+		estimated_node_fields_heap_bytes,
+	},
 	storage::{EdgeColumns, GraphMetadata, NodeColumns, ensure_unique_record, generated_record_id},
 };
 use crate::{
@@ -524,8 +532,18 @@ impl Graph<Mutable> {
 		self.clone_preserving_state().freeze()
 	}
 
+	pub(crate) fn set_topology_constraints(&mut self, constraints: GraphTopologyConstraints) {
+		self.metadata.set_topology_constraints(constraints);
+	}
+
 	pub(crate) fn from_read_preserving<R: GraphRead>(source: &R) -> FerrosGrynnResult<Self> {
 		copy_from_read(source, true)
+	}
+
+	pub(crate) fn query_flat_with_heap_estimate<R: GraphRead>(
+		source: &R,
+	) -> FerrosGrynnResult<Option<(Self, usize)>> {
+		copy_from_read_inner(source, false, true)
 	}
 
 	/// Starts an owned query result without recording construction as mutation.
@@ -801,6 +819,10 @@ impl<State> Graph<State> {
 		self.metadata.properties()
 	}
 
+	pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.metadata.topology_constraints()
+	}
+
 	pub const fn node_count(&self) -> usize {
 		self.storage.nodes.len()
 	}
@@ -924,6 +946,10 @@ impl<State> GraphRead for Graph<State> {
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		Ok(Cow::Borrowed(self.properties()))
+	}
+
+	fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.topology_constraints()
 	}
 
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
@@ -1072,6 +1098,19 @@ fn copy_from_read<R: GraphRead>(
 	source: &R,
 	preserve_ids: bool,
 ) -> FerrosGrynnResult<Graph<Mutable>> {
+	match copy_from_read_inner(source, preserve_ids, false)? {
+		Some((graph, _estimated_bytes)) => Ok(graph),
+		None => Err(FerrosGrynnError::invalid_argument(
+			"nested graph detection escaped the flat-copy path",
+		)),
+	}
+}
+
+fn copy_from_read_inner<R: GraphRead>(
+	source: &R,
+	preserve_ids: bool,
+	reject_nested: bool,
+) -> FerrosGrynnResult<Option<(Graph<Mutable>, usize)>> {
 	let properties = source.properties()?.into_owned();
 	let metadata = if preserve_ids {
 		GraphMetadata::with_identity(source.identity(), source.revision(), properties)
@@ -1085,14 +1124,30 @@ fn copy_from_read<R: GraphRead>(
 	};
 	let mut ids = BTreeMap::new();
 	let mut source_atoms = BTreeMap::new();
+	let mut variable_bytes = 0_usize;
 
 	for source_id in source.node_ids()? {
 		let source_id = source_id?;
 		let node = source.node(source_id)?.ok_or_else(|| atom_does_not_exist(source_id))?;
-		let inner_graph = node.inner_graph()?.map(Cow::into_owned);
+		let inner_graph = if reject_nested {
+			if node.inner_graph_ref()?.is_some() {
+				return Ok(None);
+			}
+			None
+		} else {
+			node.inner_graph()?.map(Cow::into_owned)
+		};
 		let record_id = node.record_id()?.into_owned();
 		let label = node.label_text()?.map(Cow::into_owned);
 		let properties = node.properties()?.into_owned();
+		if reject_nested {
+			variable_bytes = variable_bytes.saturating_add(estimated_node_fields_heap_bytes(
+				&record_id,
+				label.as_ref(),
+				&properties,
+				None,
+			)?);
+		}
 		let local_id = if preserve_ids {
 			result.storage.insert_node_at(source_id, record_id, label, properties, inner_graph)?;
 			source_id
@@ -1106,12 +1161,28 @@ fn copy_from_read<R: GraphRead>(
 	for source_id in source.edge_ids()? {
 		let source_id = source_id?;
 		let edge = source.edge(source_id)?.ok_or_else(|| atom_does_not_exist(source_id))?;
-		let transition_graph = edge.transition_graph()?.map(Cow::into_owned);
+		let transition_graph = if reject_nested {
+			if edge.transition_graph_ref()?.is_some() {
+				return Ok(None);
+			}
+			None
+		} else {
+			edge.transition_graph()?.map(Cow::into_owned)
+		};
 		let topology = remap_topology(edge.topology()?.as_ref(), &ids)?;
 		result.storage.validate_topology(&topology)?;
 		let record_id = edge.record_id()?.into_owned();
 		let label = edge.label_text()?.map(Cow::into_owned);
 		let properties = edge.properties()?.into_owned();
+		if reject_nested {
+			variable_bytes = variable_bytes.saturating_add(estimated_edge_fields_heap_bytes(
+				&record_id,
+				label.as_ref(),
+				&properties,
+				&topology,
+				None,
+			)?);
+		}
 		let local_id = if preserve_ids {
 			result.storage.insert_edge_at(
 				source_id,
@@ -1140,7 +1211,18 @@ fn copy_from_read<R: GraphRead>(
 	if !preserve_ids {
 		result.metadata.set_origin(MaterializationOrigin::new(source, source_atoms));
 	}
-	Ok(result)
+	let estimated_bytes = if reject_nested {
+		estimated_graph_fixed_heap_bytes(
+			size_of::<MaterializedGraph>(),
+			result.slot_capacity(AtomKind::Node),
+			result.slot_capacity(AtomKind::Edge),
+			result.properties(),
+		)
+		.saturating_add(variable_bytes)
+	} else {
+		0
+	};
+	Ok(Some((result, estimated_bytes)))
 }
 
 pub(crate) fn remap_topology(

@@ -1,12 +1,12 @@
-//! Cross-entry validation for one decoded `FGDC v8` payload.
+//! Cross-entry validation for one decoded `FGDC v9` payload.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{DatabaseCatalog, PhysicalIndexBinding, codec::invalid};
 use crate::{
 	datastore::{ClassIndexKind, ClassIndexState, IndexScope, SchemaId},
 	gql_status::FerrosGrynnResult,
-	graph::GraphStorageMode,
+	graph::{GraphKind, GraphStorageMode},
 	storage::{page::PageNo, types::DataFileKind},
 };
 
@@ -30,7 +30,9 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		}
 	}
 
-	let graph_ids = catalog.graphs.iter().map(|graph| graph.id).collect::<BTreeSet<_>>();
+	let graph_by_id =
+		catalog.graphs.iter().map(|graph| (graph.id, graph)).collect::<BTreeMap<_, _>>();
+	let graph_ids = graph_by_id.keys().copied().collect::<BTreeSet<_>>();
 	let mut schema_ids = BTreeSet::new();
 	let mut class_ids = BTreeSet::new();
 	let mut class_names = BTreeSet::new();
@@ -112,8 +114,32 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			|| graph.name.as_str().contains('\0')
 			|| !graph_names.insert(graph.name.as_str())
 			|| graph.storage_mode != GraphStorageMode::DiskBacked
+			|| graph.kind == GraphKind::Subgraph
 		{
 			return Err(invalid("graph catalog ordering, identity, or storage mode is invalid"));
+		}
+		match graph.owner_root {
+			None if graph.name.as_str().starts_with("$fg$") => {
+				return Err(invalid("public graph uses the reserved internal-name prefix"));
+			}
+			Some(owner) => {
+				let owner_entry = graph_by_id
+					.get(&owner)
+					.ok_or_else(|| invalid("internal graph owner root is absent"))?;
+				if owner == graph.id
+					|| owner_entry.owner_root.is_some()
+					|| graph.kind != GraphKind::Graph
+					|| graph.name.as_str() != internal_graph_name(owner, graph.id)
+				{
+					return Err(invalid("internal graph ownership or name is not canonical"));
+				}
+			}
+			None => {}
+		}
+		if graph.root.as_ref().is_some_and(Vec::is_empty)
+			|| (graph.root.is_some() && graph.kind != GraphKind::RootedTree)
+		{
+			return Err(invalid("graph root value is empty or belongs to a non-rooted family"));
 		}
 		insert_schema(&mut schema_ids, graph.label_index.0.into(), catalog.next_schema_id)?;
 		insert_schema(&mut schema_ids, graph.adjacency_index.0.into(), catalog.next_schema_id)?;
@@ -133,14 +159,62 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		{
 			return Err(invalid("graph arena root or slot maps are inconsistent"));
 		}
+		let mut scope_slots = BTreeMap::new();
+		let mut scoped_children = BTreeSet::new();
 		for (expected, (slot, child)) in graph.arena.graph_by_slot.iter().enumerate() {
 			if usize::try_from(*slot).ok() != Some(expected) || !graph_ids.contains(child) {
 				return Err(invalid(
 					"graph arena slots are not dense or reference an absent graph",
 				));
 			}
+			let scope = graph
+				.arena
+				.scope_by_slot
+				.get(slot)
+				.ok_or_else(|| invalid("graph arena slot has no scope"))?;
+			if (*slot != 0 && scope.is_empty())
+				|| scope_slots.insert(scope.as_ref(), *slot).is_some()
+				|| !scoped_children.insert((scope.as_ref(), *child))
+			{
+				return Err(invalid("graph arena contains a duplicate or empty scope"));
+			}
+			if let Some(owner) = graph_by_id.get(child).and_then(|entry| entry.owner_root) {
+				let expected_owner = graph.owner_root.unwrap_or(graph.id);
+				if owner != expected_owner {
+					return Err(invalid("internal graph is reachable from a foreign root arena"));
+				}
+			}
+		}
+		for (slot, scope) in &graph.arena.scope_by_slot {
+			if *slot == 0 {
+				continue;
+			}
+			let parent_scope = &scope[..scope.len() - 1];
+			if !scope_slots.contains_key(parent_scope) {
+				return Err(invalid("graph arena scope has no parent scope"));
+			}
+			let child = graph.arena.graph_by_slot[slot];
+			for depth in 0..scope.len() {
+				let ancestor_slot = scope_slots
+					.get(&scope[..depth])
+					.ok_or_else(|| invalid("graph arena ancestry is incomplete"))?;
+				if graph.arena.graph_by_slot[ancestor_slot] == child {
+					return Err(invalid("graph arena contains a containment cycle"));
+				}
+			}
 		}
 		previous_graph = Some(graph.id);
+	}
+	for graph in &catalog.graphs {
+		let Some(owner) = graph.owner_root else {
+			continue;
+		};
+		let owner_entry = graph_by_id
+			.get(&owner)
+			.ok_or_else(|| invalid("internal graph owner root is absent"))?;
+		if !owner_entry.arena.graph_by_slot.values().any(|child| *child == graph.id) {
+			return Err(invalid("internal graph is not reachable from its owner root arena"));
+		}
 	}
 
 	let mut previous_parameter = None;
@@ -157,6 +231,10 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		previous_parameter = Some(parameter.name.as_str());
 	}
 	Ok(())
+}
+
+fn internal_graph_name(owner: crate::graph::GraphId, child: crate::graph::GraphId) -> String {
+	format!("$fg$build_{:016x}_{:016x}", owner.get(), child.get())
 }
 
 fn validate_binding(binding: PhysicalIndexBinding) -> FerrosGrynnResult<()> {

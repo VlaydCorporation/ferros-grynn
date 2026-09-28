@@ -281,6 +281,13 @@ pub(super) trait QueryRead {
 		graph: Option<&GraphRef>,
 	) -> FerrosGrynnResult<Option<Row>>;
 
+	/// Resolves one database-global atom without inventing graph topology.
+	fn base_atom(
+		&self,
+		snapshot: Snapshot,
+		record: &RecordId,
+	) -> FerrosGrynnResult<Option<(AtomKind, PropertyMap)>>;
+
 	/// Reads one exact transaction-visible Count index.
 	fn count_index(
 		&self,
@@ -367,6 +374,16 @@ pub(super) trait QueryRead {
 		graph: crate::graph::GraphId,
 	) -> FerrosGrynnResult<GraphRef>;
 
+	/// Lists public and internal graph references in stable GraphId order.
+	fn graph_references(&self, snapshot: Snapshot) -> FerrosGrynnResult<Vec<GraphRef>>;
+
+	/// Resolves one public graph definition without opening graph data.
+	fn named_graph_contract(
+		&self,
+		snapshot: Snapshot,
+		name: &str,
+	) -> FerrosGrynnResult<Option<(GraphRef, crate::graph::GraphTopologyConstraints)>>;
+
 	/// Computes the canonical read-only LevelPath for one occurrence.
 	fn level_path(
 		&self,
@@ -422,6 +439,16 @@ pub(super) trait QueryRead {
 		source: &str,
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value>;
+
+	/// Atomically installs one already validated owned graph into the
+	/// transaction.
+	fn install_built_graph(
+		&mut self,
+		name: &str,
+		mode: crate::syn::DefinitionMode,
+		contract_explicit: bool,
+		graph: crate::graph::MaterializedGraph,
+	) -> FerrosGrynnResult<GraphRef>;
 }
 
 #[derive(Debug, Clone)]

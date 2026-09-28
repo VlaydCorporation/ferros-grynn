@@ -11,7 +11,7 @@ use crate::{
 /// also the recovery fallback for derived index state.
 pub(crate) fn rebuild_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<IndexStoreRoot> {
 	let mut indexes = IndexStoreRoot::default();
-	for graph in database.schema.graphs() {
+	for graph in database.schema.all_graphs() {
 		indexes.register_graph(graph.id())?;
 	}
 	for class in database.schema.classes() {

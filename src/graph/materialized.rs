@@ -18,6 +18,7 @@ use super::{
 	Graph,
 	GraphKind,
 	GraphRead,
+	GraphTopologyConstraints,
 	Hypergraph,
 	Metagraph,
 	NodeRead,
@@ -83,6 +84,10 @@ impl GraphRead for MaterializedGraph {
 		Ok(Cow::Borrowed(Self::properties(self)))
 	}
 
+	fn topology_constraints(&self) -> GraphTopologyConstraints {
+		Self::topology_constraints(self)
+	}
+
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		match self {
 			Self::Graph(value) => Ok(Box::new(GraphRead::node_ids(value)?)),
@@ -127,11 +132,12 @@ pub(crate) fn estimated_nested_graph_heap_bytes(graph: &Graph<Frozen>) -> Ferros
 	)
 }
 
-fn estimated_graph_heap_bytes<Reader: GraphRead>(
-	graph: &Reader,
+pub(crate) fn estimated_graph_fixed_heap_bytes(
+	container_bytes: usize,
 	node_capacity: usize,
 	edge_capacity: usize,
-) -> FerrosGrynnResult<usize> {
+	properties: &PropertyMap,
+) -> usize {
 	let node_slot_bytes = size_of::<Option<RecordId>>()
 		.saturating_add(size_of::<Option<Text>>())
 		.saturating_add(size_of::<PropertyMap>())
@@ -140,10 +146,58 @@ fn estimated_graph_heap_bytes<Reader: GraphRead>(
 	let edge_slot_bytes = node_slot_bytes
 		.saturating_add(size_of::<Option<EdgeTopology>>())
 		.saturating_add(size_of::<Option<usize>>());
-	let mut bytes = size_of_val(graph)
+	container_bytes
 		.saturating_add(node_capacity.saturating_mul(node_slot_bytes))
 		.saturating_add(edge_capacity.saturating_mul(edge_slot_bytes))
-		.saturating_add(graph.properties()?.estimated_heap_bytes());
+		.saturating_add(properties.estimated_heap_bytes())
+}
+
+pub(crate) fn estimated_node_fields_heap_bytes(
+	record_id: &RecordId,
+	label: Option<&Text>,
+	properties: &PropertyMap,
+	inner: Option<&Graph<Frozen>>,
+) -> FerrosGrynnResult<usize> {
+	let mut bytes = record_id
+		.estimated_heap_bytes()
+		.saturating_add(label.map_or(0, Text::len))
+		.saturating_add(properties.estimated_heap_bytes());
+	if let Some(inner) = inner {
+		bytes = bytes.saturating_add(estimated_nested_graph_heap_bytes(inner)?);
+	}
+	Ok(bytes)
+}
+
+pub(crate) fn estimated_edge_fields_heap_bytes(
+	record_id: &RecordId,
+	label: Option<&Text>,
+	properties: &PropertyMap,
+	topology: &EdgeTopology,
+	transition: Option<&Graph<Frozen>>,
+) -> FerrosGrynnResult<usize> {
+	let mut bytes = record_id
+		.estimated_heap_bytes()
+		.saturating_add(label.map_or(0, Text::len))
+		.saturating_add(properties.estimated_heap_bytes())
+		.saturating_add(estimated_topology_heap_bytes(topology));
+	if let Some(transition) = transition {
+		bytes = bytes.saturating_add(estimated_nested_graph_heap_bytes(transition)?);
+	}
+	Ok(bytes)
+}
+
+fn estimated_graph_heap_bytes<Reader: GraphRead>(
+	graph: &Reader,
+	node_capacity: usize,
+	edge_capacity: usize,
+) -> FerrosGrynnResult<usize> {
+	let properties = graph.properties()?;
+	let mut bytes = estimated_graph_fixed_heap_bytes(
+		size_of_val(graph),
+		node_capacity,
+		edge_capacity,
+		properties.as_ref(),
+	);
 	for id in graph.node_ids()? {
 		let id = id?;
 		let node = graph.node(id)?.ok_or_else(|| {
@@ -152,14 +206,15 @@ fn estimated_graph_heap_bytes<Reader: GraphRead>(
 			)
 		})?;
 		let record_id = node.record_id()?;
-		bytes = bytes.saturating_add(record_id.estimated_heap_bytes());
-		if let Some(label) = node.label_text()? {
-			bytes = bytes.saturating_add(label.len());
-		}
-		bytes = bytes.saturating_add(node.properties()?.estimated_heap_bytes());
-		if let Some(inner) = node.inner_graph()? {
-			bytes = bytes.saturating_add(estimated_nested_graph_heap_bytes(inner.as_ref())?);
-		}
+		let label = node.label_text()?;
+		let properties = node.properties()?;
+		let inner = node.inner_graph()?;
+		bytes = bytes.saturating_add(estimated_node_fields_heap_bytes(
+			record_id.as_ref(),
+			label.as_deref(),
+			properties.as_ref(),
+			inner.as_deref(),
+		)?);
 	}
 	for id in graph.edge_ids()? {
 		let id = id?;
@@ -169,15 +224,17 @@ fn estimated_graph_heap_bytes<Reader: GraphRead>(
 			)
 		})?;
 		let record_id = edge.record_id()?;
-		bytes = bytes.saturating_add(record_id.estimated_heap_bytes());
-		if let Some(label) = edge.label_text()? {
-			bytes = bytes.saturating_add(label.len());
-		}
-		bytes = bytes.saturating_add(edge.properties()?.estimated_heap_bytes());
-		bytes = bytes.saturating_add(estimated_topology_heap_bytes(edge.topology()?.as_ref()));
-		if let Some(transition) = edge.transition_graph()? {
-			bytes = bytes.saturating_add(estimated_nested_graph_heap_bytes(transition.as_ref())?);
-		}
+		let label = edge.label_text()?;
+		let properties = edge.properties()?;
+		let topology = edge.topology()?;
+		let transition = edge.transition_graph()?;
+		bytes = bytes.saturating_add(estimated_edge_fields_heap_bytes(
+			record_id.as_ref(),
+			label.as_deref(),
+			properties.as_ref(),
+			topology.as_ref(),
+			transition.as_deref(),
+		)?);
 	}
 	Ok(bytes)
 }
@@ -299,6 +356,19 @@ impl MaterializedGraph {
 			Self::Hypergraph(value) => value.properties(),
 			Self::Metagraph(value) => value.as_graph().properties(),
 			Self::Subgraph(value) => value.as_graph().properties(),
+		}
+	}
+
+	pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
+		match self {
+			Self::Graph(value) => value.topology_constraints(),
+			Self::Tree(value) => value.topology_constraints(),
+			Self::RootedTree(value) => value.topology_constraints(),
+			Self::Forest(value) => value.topology_constraints(),
+			Self::Dag(value) => value.topology_constraints(),
+			Self::Hypergraph(value) => value.topology_constraints(),
+			Self::Metagraph(value) => value.topology_constraints(),
+			Self::Subgraph(value) => value.topology_constraints(),
 		}
 	}
 

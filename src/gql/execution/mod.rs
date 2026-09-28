@@ -10,6 +10,7 @@ mod dml;
 mod eval;
 mod explain;
 mod graph_properties;
+mod graph_result;
 mod schema;
 mod select;
 mod traversal;
@@ -59,6 +60,7 @@ use super::{
 		LogicalGraphDmlStatement,
 		LogicalGraphPropertyMutation,
 		LogicalGraphReference,
+		LogicalLetValue,
 		LogicalMatch,
 		LogicalMatchPattern,
 		LogicalMatchPatternKind,
@@ -130,6 +132,7 @@ use crate::{
 		Object,
 		Path,
 		PropertyDictionary,
+		PropertyMap,
 		RecordId,
 		Type,
 		Value,
@@ -419,7 +422,20 @@ fn execute_statement<Read: QueryRead>(
 			slot,
 			value,
 		} => {
-			let value = eval_query_expression(read, value, slots, source, control, runtime)?;
+			let value = match value {
+				LogicalLetValue::Expression(value) => {
+					eval_query_expression(read, value, slots, source, control, runtime)?
+				}
+				LogicalLetValue::BuildGraph(build) => graph_result::execute_build_graph(
+					read,
+					read.snapshot()?,
+					build,
+					slots,
+					source,
+					control,
+					runtime,
+				)?,
+			};
 			slots[*slot as usize] = value.clone();
 			if persist_let && name.as_ref() != "_" {
 				bindings.insert(name.as_ref(), value);
@@ -432,6 +448,23 @@ fn execute_statement<Read: QueryRead>(
 			return eval_query_expression(read, value, slots, source, control, runtime)
 				.map(ControlFlow::Return);
 		}
+		LogicalStatement::ReturnGraph(plan) => graph_result::execute_return_graph(
+			read,
+			read.snapshot()?,
+			plan,
+			slots,
+			source,
+			control,
+		)?,
+		LogicalStatement::BuildGraph(plan) => graph_result::execute_build_graph(
+			read,
+			read.snapshot()?,
+			plan,
+			slots,
+			source,
+			control,
+			runtime,
+		)?,
 		LogicalStatement::Expression {
 			value,
 		} => eval_query_expression(read, value, slots, source, control, runtime)?,
@@ -903,6 +936,8 @@ const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementK
 		LogicalStatement::Return {
 			..
 		} => QueryStatementKind::Return,
+		LogicalStatement::ReturnGraph(_) => QueryStatementKind::ReturnGraph,
+		LogicalStatement::BuildGraph(_) => QueryStatementKind::BuildGraph,
 		LogicalStatement::Expression {
 			..
 		}
@@ -963,6 +998,39 @@ fn execute_match_with_environment<Read: QueryRead>(
 	control: &ExecutionControl,
 	environment: &Object,
 ) -> FerrosGrynnResult<Value> {
+	let mut result = Array::new(Vec::new());
+	if let Some(value) = visit_match_with_environment(
+		read,
+		snapshot,
+		plan,
+		slots,
+		source,
+		control,
+		environment,
+		&mut |value| {
+			result.push(value);
+			Ok(())
+		},
+	)? {
+		return Ok(value);
+	}
+	Ok(Value::Array(result))
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "MATCH pull execution retains the analyzed statement and lexical environment"
+)]
+fn visit_match_with_environment<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalMatch,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	environment: &Object,
+	visit: &mut impl FnMut(Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<Option<Value>> {
 	let demand = crate::gql::optimizer::PlannerDemand::for_match(plan);
 	let planner_snapshot = read.planner_snapshot(snapshot, &demand)?;
 	let deterministic_snapshot;
@@ -1302,6 +1370,46 @@ fn execute_match_with_environment<Read: QueryRead>(
 	if plan.binding_distinct {
 		cursor = distinct_rows(read, snapshot, cursor, control)?;
 	}
+	if let Some(graph_plan) = &plan.return_graph {
+		let mut assembly = graph_result::GraphAssemblyAccumulator::new(
+			Some(plan.graph.clone()),
+			None,
+			None,
+			control,
+		);
+		while let Some(row) = cursor.next(control).map_err(execution_phase)? {
+			assembly.record_source_row();
+			assembly.add_nodes(eval(
+				&graph_plan.nodes,
+				Some(&row),
+				slots,
+				source,
+				Some(&fields),
+				Some(control),
+			)?)?;
+			assembly.add_edges(eval(
+				&graph_plan.edges,
+				Some(&row),
+				slots,
+				source,
+				Some(&fields),
+				Some(control),
+			)?)?;
+			if let Some(root) = &graph_plan.root {
+				assembly.add_root(eval(
+					root,
+					Some(&row),
+					slots,
+					source,
+					Some(&fields),
+					Some(control),
+				)?)?;
+			}
+		}
+		return assembly
+			.finish(read, snapshot, graph_plan.contract)
+			.map(|graph| Some(Value::Graph(Box::new(graph))));
+	}
 	let random_seed = plan.order.iter().any(|order| order.random).then(|| {
 		control.statement_seed(
 			crate::gql::optimizer::PhysicalPlan::Match(physical.clone()).hash(),
@@ -1325,7 +1433,6 @@ fn execute_match_with_environment<Read: QueryRead>(
 		cursor = sort_match_rows(read, snapshot, cursor, &plan.order, control)?;
 	}
 
-	let mut result = Array::new(Vec::new());
 	while let Some(row) = cursor.next(control).map_err(execution_phase)? {
 		let object = plan
 			.result
@@ -1334,9 +1441,9 @@ fn execute_match_with_environment<Read: QueryRead>(
 			.zip(row.values)
 			.map(|(column, value)| (column.name.as_ref(), value))
 			.collect::<Object>();
-		result.push(Value::Object(object));
+		visit(Value::Object(object))?;
 	}
-	Ok(Value::Array(result))
+	Ok(None)
 }
 
 /// Reports whether a pattern requires AtomWalk traversal semantics.

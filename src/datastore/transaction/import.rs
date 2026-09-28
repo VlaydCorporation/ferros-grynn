@@ -98,8 +98,12 @@ impl Transaction {
 		full_validation: bool,
 	) -> FerrosGrynnResult<(DatabaseRoot, u64, Vec<IndexId>)> {
 		self.ensure_live()?;
-		let graphs =
-			self.working.schema.graphs().map(|graph| graph.reference().clone()).collect::<Vec<_>>();
+		let graphs = self
+			.working
+			.schema
+			.all_graphs()
+			.map(|graph| graph.reference().clone())
+			.collect::<Vec<_>>();
 		for graph in &graphs {
 			self.validate_graph_family(graph)?;
 		}

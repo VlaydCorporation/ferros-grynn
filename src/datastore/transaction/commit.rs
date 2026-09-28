@@ -7,6 +7,7 @@ use super::{CommitResult, Mutation, Transaction};
 use crate::{
 	datastore::{ConflictKey, DatabaseRoot, IsolationLevel, consts::EFFECTIVE_FANOUT_WRITE_BYTES},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
+	graph::GraphId,
 };
 
 impl Transaction {
@@ -17,8 +18,12 @@ impl Transaction {
 	/// Returns a graph-family, normalized-state, conflict, persistence, or
 	/// publication failure without publishing a partial root.
 	pub fn commit_with_validation(mut self) -> FerrosGrynnResult<CommitResult> {
-		let graphs =
-			self.working.schema.graphs().map(|graph| graph.reference().clone()).collect::<Vec<_>>();
+		let graphs = self
+			.working
+			.schema
+			.all_graphs()
+			.map(|graph| graph.reference().clone())
+			.collect::<Vec<_>>();
 		for graph in &graphs {
 			self.validate_graph_family(graph)?;
 		}
@@ -57,6 +62,7 @@ impl Transaction {
 			FerrosGrynnError::serialization_failure(self.id, "the commit clock is exhausted")
 		})?;
 		let mut next = (*current).clone();
+		let affected_graphs = self.affected_graphs(&current);
 		Self::apply_mutations(&mut next, &self.mutations, commit_ts).map_err(|error| {
 			FerrosGrynnError::serialization_failure(
 				self.id,
@@ -68,6 +74,13 @@ impl Transaction {
 			store.inner.next_schema_id.load(Ordering::Relaxed),
 			store.inner.next_graph_id.load(Ordering::Relaxed),
 		);
+		let validation_root = Arc::new(next.clone());
+		for graph in affected_graphs {
+			let Some(schema) = validation_root.schema.graph(graph) else {
+				continue;
+			};
+			self.validate_graph_family_in_root(validation_root.clone(), schema.reference())?;
+		}
 		next.commit_ts = commit_ts;
 		for key in self.writes.keys() {
 			next.mark_version(*key, commit_ts);
@@ -91,6 +104,51 @@ impl Transaction {
 			transaction: self.id,
 			commit_ts,
 		})
+	}
+
+	fn affected_graphs(&self, current: &DatabaseRoot) -> BTreeSet<GraphId> {
+		let mut graphs = BTreeSet::new();
+		for mutation in &self.mutations {
+			match mutation {
+				Mutation::DefineGraph(schema) | Mutation::ReplaceGraph(schema) => {
+					graphs.insert(schema.id());
+				}
+				Mutation::InstallBuiltGraphTree(build) => {
+					graphs.extend(build.graph_ids());
+					graphs.extend(current.schema.all_graphs().map(|schema| schema.id()));
+					graphs.extend(self.working.schema.all_graphs().map(|schema| schema.id()));
+				}
+				Mutation::AttachNode {
+					graph,
+					..
+				}
+				| Mutation::AttachEdge {
+					graph,
+					..
+				}
+				| Mutation::Detach {
+					graph,
+					..
+				}
+				| Mutation::ReplaceOccurrenceState {
+					graph,
+					..
+				} => {
+					graphs.insert(*graph);
+				}
+				Mutation::DeleteAtom {
+					global,
+				} => {
+					for root in [current, &self.working] {
+						if let Some(memberships) = root.memberships(*global) {
+							graphs.extend(memberships.keys().copied());
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+		graphs
 	}
 
 	fn validate_against(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
@@ -210,6 +268,9 @@ impl Transaction {
 				}
 				Mutation::ReplaceGraph(graph) => {
 					root.replace_graph_schema(graph.clone(), published_at)?;
+				}
+				Mutation::InstallBuiltGraphTree(build) => {
+					build.apply(root, published_at)?;
 				}
 				Mutation::RemoveClass(class) => {
 					root.remove_class(*class)?;

@@ -1,4 +1,7 @@
-use super::graph_properties::{evaluate_graph_properties, execute_graph_property_update};
+use super::{
+	eval::eval,
+	graph_properties::{evaluate_graph_properties, execute_graph_property_update},
+};
 use crate::{
 	datastore::{
 		ClassField,
@@ -32,8 +35,21 @@ pub(super) fn execute_schema(
 			mode,
 			name,
 			kind,
+			constraints,
+			root,
 			content,
-		} => define_graph(transaction, *mode, name, *kind, content.as_ref(), slots, source, control),
+		} => define_graph(
+			transaction,
+			*mode,
+			name,
+			*kind,
+			*constraints,
+			root.as_ref(),
+			content.as_ref(),
+			slots,
+			source,
+			control,
+		),
 		LogicalSchemaStatement::UpdateGraph {
 			graph,
 			mutation,
@@ -117,20 +133,40 @@ fn define_graph(
 	mode: DefinitionMode,
 	name: &str,
 	kind: GraphKind,
+	constraints: crate::graph::GraphTopologyConstraints,
+	root: Option<&crate::gql::ir::TypedExpr>,
 	content: Option<&crate::gql::ir::TypedExpr>,
 	slots: &[Value],
 	source: &str,
 	control: &crate::gql::ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
+	let root = root
+		.map(|root| {
+			let value = eval(root, None, slots, source, None, Some(control))?;
+			let Value::Record(root) = value else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"DEFINE GRAPH ROOT requires one RecordId.",
+				));
+			};
+			Ok(*root)
+		})
+		.transpose()?;
 	if let Some(existing) = transaction.named_graph(name)? {
 		return match mode {
 			DefinitionMode::IfNotExists => Ok(Value::None),
 			DefinitionMode::Overwrite if existing.kind() == kind => {
-				if content.is_some() {
-					let properties =
-						evaluate_graph_properties(transaction, content, slots, source, control)?;
-					transaction.replace_graph_properties(name, properties)?;
-				}
+				let properties = content
+					.map(|content| {
+						evaluate_graph_properties(
+							transaction,
+							Some(content),
+							slots,
+							source,
+							control,
+						)
+					})
+					.transpose()?;
+				transaction.replace_graph_definition(name, properties, constraints, root)?;
 				Ok(Value::None)
 			}
 			DefinitionMode::Overwrite => Err(FerrosGrynnError::query_feature_not_supported(
@@ -140,7 +176,7 @@ fn define_graph(
 		};
 	}
 	let properties = evaluate_graph_properties(transaction, content, slots, source, control)?;
-	transaction.define_graph_with_properties(name, kind, properties)?;
+	transaction.define_graph_with_contract(name, kind, properties, constraints, root, None)?;
 	Ok(Value::None)
 }
 

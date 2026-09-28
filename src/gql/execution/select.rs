@@ -399,6 +399,29 @@ fn execute_select_values<Read: QueryRead>(
 	outer: Option<&Row>,
 	maximum: Option<usize>,
 ) -> FerrosGrynnResult<Vec<Value>> {
+	let mut values = Vec::new();
+	visit_select_values(read, snapshot, plan, slots, source, control, outer, maximum, |value| {
+		values.push(value);
+		Ok(())
+	})?;
+	Ok(values)
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "SELECT pull execution retains the complete analyzed statement context"
+)]
+pub(super) fn visit_select_values<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+	maximum: Option<usize>,
+	mut visit: impl FnMut(Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<usize> {
 	let (plan, physical) = prepare_physical_plan(read, snapshot, plan, control)?;
 	let plan = &plan;
 	let start = match &plan.start {
@@ -415,22 +438,22 @@ fn execute_select_values<Read: QueryRead>(
 	let limit = select_limit(plan, slots, source, control)?
 		.unwrap_or(usize::MAX)
 		.min(maximum.unwrap_or(usize::MAX));
-	let values = match execute_streaming_select_values(
-		read, snapshot, plan, &physical, slots, source, control, outer, start, limit,
+	let count = match visit_streaming_select_values(
+		read, snapshot, plan, &physical, slots, source, control, outer, start, limit, &mut visit,
 	)? {
-		Some(values) => values,
+		Some(count) => count,
 		None => {
 			let output = execute_select_output(
 				read, snapshot, plan, &physical, slots, source, control, outer,
 			)?;
-			record_values(output, start, limit)?
+			visit_record_values(output, start, limit, &mut visit)?
 		}
 	};
-	if plan.only && values.len() > 1 {
-		return Err(FerrosGrynnError::select_cardinality_violation(values.len() as u64)
+	if plan.only && count > 1 {
+		return Err(FerrosGrynnError::select_cardinality_violation(count as u64)
 			.with_phase(ExecutionPhase::Execution));
 	}
-	Ok(values)
+	Ok(count)
 }
 
 #[allow(
@@ -449,6 +472,43 @@ fn execute_streaming_select_values<Read: QueryRead>(
 	start: usize,
 	limit: usize,
 ) -> FerrosGrynnResult<Option<Vec<Value>>> {
+	let mut values = Vec::with_capacity(limit.min(1024));
+	let result = visit_streaming_select_values(
+		read,
+		snapshot,
+		plan,
+		physical,
+		slots,
+		source,
+		control,
+		outer,
+		start,
+		limit,
+		&mut |value| {
+			values.push(value);
+			Ok(())
+		},
+	)?;
+	Ok(result.map(|_count| values))
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "the direct pull path retains the complete analyzed SELECT context"
+)]
+fn visit_streaming_select_values<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	physical: &crate::gql::optimizer::PhysicalSelectPlan,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+	start: usize,
+	limit: usize,
+	visit: &mut impl FnMut(Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<Option<usize>> {
 	if !plan.joins.is_empty()
 		|| plan.group.is_some()
 		|| !plan.split.is_empty()
@@ -464,7 +524,7 @@ fn execute_streaming_select_values<Read: QueryRead>(
 		limit
 	};
 	if limit == 0 {
-		return Ok(Some(Vec::new()));
+		return Ok(Some(0));
 	}
 	if let Some(crate::gql::optimizer::SourceOperator::CountLookup {
 		index,
@@ -472,7 +532,7 @@ fn execute_streaming_select_values<Read: QueryRead>(
 	}) = physical.sources.first().map(|source| &source.operator)
 	{
 		if start != 0 {
-			return Ok(Some(Vec::new()));
+			return Ok(Some(0));
 		}
 		let graph = match &plan.source.kind {
 			LogicalSelectSourceKind::Atoms {
@@ -509,9 +569,10 @@ fn execute_streaming_select_values<Read: QueryRead>(
 			value.insert(name.as_ref(), count);
 			Value::Object(value)
 		};
-		return Ok(Some(vec![value]));
+		visit(value)?;
+		return Ok(Some(1));
 	}
-	let mut values = Vec::with_capacity(limit.min(1024));
+	let mut visited = 0_usize;
 	let mut projected = 0_usize;
 	let full_row = outer.is_some() || select_requires_expanded_atom_row(plan);
 	let index = physical.sources.first().and_then(planned_scalar_index);
@@ -546,11 +607,14 @@ fn execute_streaming_select_values<Read: QueryRead>(
 			if projected <= start {
 				return Ok(true);
 			}
-			values.push(output);
-			Ok(values.len() < limit)
+			visit(output)?;
+			visited = visited.checked_add(1).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("projected row count overflow")
+			})?;
+			Ok(visited < limit)
 		},
 	)?;
-	Ok(Some(values))
+	Ok(Some(visited))
 }
 
 #[allow(

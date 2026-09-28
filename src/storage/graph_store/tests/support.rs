@@ -100,6 +100,9 @@ impl Fixture {
 				SystemIndexKind::Adjacency,
 			),
 			PropertyMap::new(),
+			crate::graph::GraphTopologyConstraints::empty(),
+			None,
+			None,
 			1,
 		);
 		database.install_graph(schema, 1)?;

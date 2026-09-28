@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::{
 	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope},
 	gql_status::TextSpan,
+	graph::GraphTopologyConstraints,
 	syn::{DefinitionMode, MatchDirection},
 	values::{DateTime, GraphKind, GraphRef, RecordId, Text, Type, Value},
 };
@@ -26,11 +27,12 @@ pub(super) enum LogicalStatement {
 	Let {
 		name: Box<str>,
 		slot: u32,
-		value: TypedExpr,
+		value: LogicalLetValue,
 	},
 	Return {
 		value: TypedExpr,
 	},
+	ReturnGraph(LogicalReturnGraph),
 	Expression {
 		value: TypedExpr,
 	},
@@ -60,11 +62,18 @@ pub(super) enum LogicalStatement {
 		graph: Option<GraphRef>,
 		report: usize,
 	},
+	BuildGraph(LogicalBuildGraph),
 	/// Executes a read-only graph pattern match.
 	Match(LogicalMatch),
 	Select(LogicalSelect),
 	/// Executes a streaming traversal pipeline.
 	Traverse(LogicalTraverse),
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum LogicalLetValue {
+	Expression(TypedExpr),
+	BuildGraph(LogicalBuildGraph),
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +254,8 @@ pub(super) enum LogicalSchemaStatement {
 		mode: DefinitionMode,
 		name: Box<str>,
 		kind: GraphKind,
+		constraints: GraphTopologyConstraints,
+		root: Option<TypedExpr>,
 		content: Option<TypedExpr>,
 	},
 	UpdateGraph {
@@ -372,6 +383,46 @@ impl LogicalSchemaStatement {
 	}
 }
 
+/// Normalized graph family and orthogonal topology validators.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LogicalGraphContract {
+	pub(super) family: Option<GraphKind>,
+	pub(super) validators: GraphTopologyConstraints,
+}
+
+/// Typed selectors used by an owned graph result.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalReturnGraph {
+	pub(super) contract: LogicalGraphContract,
+	pub(super) root: Option<TypedExpr>,
+	pub(super) nodes: TypedExpr,
+	pub(super) edges: TypedExpr,
+}
+
+/// Typed source consumed by `BUILD GRAPH`.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalBuildGraphSource {
+	Match(Box<LogicalMatch>),
+	Select(Box<LogicalSelect>),
+	Traverse(Box<LogicalTraverse>),
+	Expression(TypedExpr),
+}
+
+/// One anonymous materialization or named atomic graph installation.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalBuildGraph {
+	pub(super) mode: DefinitionMode,
+	pub(super) contract: LogicalGraphContract,
+	pub(super) contract_explicit: bool,
+	pub(super) name: Option<Box<str>>,
+	pub(super) source: LogicalBuildGraphSource,
+	pub(super) root: Option<TypedExpr>,
+	pub(super) nodes: Option<TypedExpr>,
+	pub(super) edges: Option<TypedExpr>,
+	pub(super) limit_nodes: Option<u64>,
+	pub(super) limit_edges: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 /// An analyzed MATCH statement tied to one catalog graph.
 pub(super) struct LogicalMatch {
@@ -395,6 +446,8 @@ pub(super) struct LogicalMatch {
 	pub(super) filter: Option<TypedExpr>,
 	/// Expressions evaluated for each surviving row.
 	pub(super) projection: Vec<TypedExpr>,
+	/// Terminal graph assembly, mutually exclusive with ordinary projection.
+	pub(super) return_graph: Option<LogicalReturnGraph>,
 	/// Whether projected values are deduplicated.
 	pub(super) projection_distinct: bool,
 	/// Ordering applied after projection.
@@ -721,6 +774,7 @@ pub(super) struct LogicalTraverse {
 	/// Columns available to the final RETURN expression in runtime row order.
 	pub(super) result: Schema,
 	pub(super) returning: Option<TypedExpr>,
+	pub(super) return_graph: Option<LogicalReturnGraph>,
 }
 
 #[derive(Debug, Clone, Default)]

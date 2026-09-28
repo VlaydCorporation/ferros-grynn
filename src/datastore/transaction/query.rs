@@ -249,6 +249,19 @@ impl Transaction {
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))
 	}
 
+	pub(crate) fn query_named_graph_schema(
+		&self,
+		snapshot: &QuerySnapshot,
+		name: &str,
+	) -> FerrosGrynnResult<Option<GraphSchema>> {
+		self.ensure_live()?;
+		let schema = snapshot.root.schema.named_graph(name);
+		if let Some(schema) = &schema {
+			self.record_read(crate::datastore::ConflictKey::GraphDefinition(schema.id()));
+		}
+		Ok(schema.map(|schema| schema.as_ref().clone()))
+	}
+
 	pub(crate) fn query_schema_graphs(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -256,6 +269,15 @@ impl Transaction {
 		self.ensure_live()?;
 		self.record_read(crate::datastore::ConflictKey::GraphCatalogRange);
 		Ok(snapshot.root.schema.graphs().map(|graph| graph.as_ref().clone()).collect())
+	}
+
+	pub(crate) fn query_schema_all_graphs(
+		&self,
+		snapshot: &QuerySnapshot,
+	) -> FerrosGrynnResult<Vec<GraphSchema>> {
+		self.ensure_live()?;
+		self.record_read(crate::datastore::ConflictKey::GraphCatalogRange);
+		Ok(snapshot.root.schema.all_graphs().map(|graph| graph.as_ref().clone()).collect())
 	}
 
 	pub(crate) fn query_schema_classes(

@@ -9,6 +9,7 @@ use super::{
 	EdgeTopology,
 	GraphRef,
 	GraphStorageMode,
+	GraphTopologyConstraints,
 	MaterializationOrigin,
 	id::SlotAllocator,
 };
@@ -23,6 +24,7 @@ pub(super) struct GraphMetadata {
 	identity: Uuid,
 	revision: u64,
 	properties: PropertyMap,
+	topology_constraints: GraphTopologyConstraints,
 	origin: Option<MaterializationOrigin>,
 	dirty: BTreeSet<DirtyTarget>,
 }
@@ -33,6 +35,7 @@ impl GraphMetadata {
 			identity: Uuid::now_v7(),
 			revision: 0,
 			properties: PropertyMap::new(),
+			topology_constraints: GraphTopologyConstraints::empty(),
 			origin: None,
 			dirty: BTreeSet::new(),
 		}
@@ -47,6 +50,7 @@ impl GraphMetadata {
 			identity,
 			revision,
 			properties,
+			topology_constraints: GraphTopologyConstraints::empty(),
 			origin: None,
 			dirty: BTreeSet::new(),
 		}
@@ -62,6 +66,14 @@ impl GraphMetadata {
 
 	pub(crate) const fn properties(&self) -> &PropertyMap {
 		&self.properties
+	}
+
+	pub(crate) const fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.topology_constraints
+	}
+
+	pub(crate) const fn set_topology_constraints(&mut self, constraints: GraphTopologyConstraints) {
+		self.topology_constraints = constraints;
 	}
 
 	pub(crate) fn properties_mut(&mut self) -> FerrosGrynnResult<&mut PropertyMap> {

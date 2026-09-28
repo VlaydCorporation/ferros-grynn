@@ -1,4 +1,4 @@
-use super::{Mutation, Transaction};
+use super::{Mutation, QuerySnapshot, Transaction};
 use crate::{
 	datastore::{
 		ConflictKey,
@@ -13,20 +13,23 @@ use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{
 		AtomId,
+		AtomRef,
 		EdgeTopology,
 		FrozenDag,
 		FrozenForest,
 		FrozenGraph,
 		FrozenHypergraph,
-		FrozenMetagraph,
 		FrozenRootedTree,
 		FrozenTree,
 		GraphId,
 		GraphKind,
+		GraphRead,
 		GraphRef,
 		query_to_memory,
+		validate_nested_references,
+		validate_topology_constraints,
 	},
-	values::{Number, PropertyKeyId, RecordId, Text, Value},
+	values::{AtomKind, Number, PropertyKeyId, RecordId, Text, Value},
 };
 
 impl Transaction {
@@ -224,22 +227,62 @@ impl Transaction {
 	/// graph family.
 	pub(crate) fn validate_graph_family(&mut self, graph: &GraphRef) -> FerrosGrynnResult<()> {
 		let snapshot = self.query_snapshot()?;
+		self.validate_graph_family_snapshot(&snapshot, graph)
+	}
+
+	pub(super) fn validate_graph_family_in_root(
+		&self,
+		root: std::sync::Arc<crate::datastore::DatabaseRoot>,
+		graph: &GraphRef,
+	) -> FerrosGrynnResult<()> {
+		self.validate_graph_family_snapshot(
+			&QuerySnapshot {
+				root,
+				physical: None,
+			},
+			graph,
+		)
+	}
+
+	fn validate_graph_family_snapshot(
+		&self,
+		snapshot: &QuerySnapshot,
+		graph: &GraphRef,
+	) -> FerrosGrynnResult<()> {
+		let schema = snapshot
+			.root
+			.schema
+			.graph(graph.id())
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.name().to_string()))?;
 		let view = self.query_graph(&snapshot, graph)?;
 		match graph.kind() {
-			GraphKind::Graph => query_to_memory::<FrozenGraph, _>(&view).map(|_graph| ()),
+			GraphKind::Graph => Ok(()),
 			GraphKind::Dag => query_to_memory::<FrozenDag, _>(&view).map(|_graph| ()),
 			GraphKind::Forest => query_to_memory::<FrozenForest, _>(&view).map(|_graph| ()),
 			GraphKind::Tree => query_to_memory::<FrozenTree, _>(&view).map(|_graph| ()),
 			GraphKind::RootedTree => {
-				let graph = query_to_memory::<FrozenGraph, _>(&view)?;
-				FrozenRootedTree::try_from(graph).map(|_graph| ())
+				let materialized = query_to_memory::<FrozenGraph, _>(&view)?;
+				if let Some(root) = schema.root() {
+					let root = view
+						.atom_id(&AtomRef::new(AtomKind::Node, root.clone()))?
+						.ok_or_else(|| {
+							FerrosGrynnError::graph_constraint_violation(
+								graph.to_string(),
+								"the declared rooted-tree root is not a root-graph node",
+							)
+						})?;
+					FrozenRootedTree::try_from_graph_with_root(materialized, root).map(|_graph| ())
+				} else {
+					FrozenRootedTree::try_from(materialized).map(|_graph| ())
+				}
 			}
 			GraphKind::Hypergraph => query_to_memory::<FrozenHypergraph, _>(&view).map(|_graph| ()),
-			GraphKind::Metagraph => query_to_memory::<FrozenMetagraph, _>(&view).map(|_graph| ()),
+			GraphKind::Metagraph => validate_nested_references(&view),
 			GraphKind::Subgraph => Err(FerrosGrynnError::invalid_argument(
 				"a catalog graph cannot use the derived SUBGRAPH family",
 			)),
-		}
+		}?;
+		validate_topology_constraints(&view, schema.topology_constraints())
 	}
 
 	/// Resolves one graph-local occurrence of a global atom.

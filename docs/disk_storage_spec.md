@@ -16,7 +16,7 @@ evidence и ограничения зафиксированы в
 [graph_first_atom_model_report.md](reports/graph_first_atom_model_report.md).
 Она заменяет graph-owned atom/table candidate на database-level AtomStore и graph-local
 occurrences. При конфликте с сохранёнными ниже legacy layout-примечаниями действуют §§2, 4, 7,
-10–11, 17–18 и 22 в редакции 8.1. Cutover принимает только `FGDC v8`/`FGFC v5`; миграции
+10–11, 17–18 и 22 в редакции 9.0. Cutover принимает только `FGDC v9`/`FGFC v5`; миграции
 промежуточных кандидатов нет.
 
 ---
@@ -450,7 +450,7 @@ enum RecordIdPart {
 
 ```
 tag(u8) = 0x10
-class_id(u32)             -- stable ClassId из FGDC v8
+class_id(u32)             -- stable ClassId из FGDC v9
 id_kind(u8):
   0x00 = Int
   0x01 = String
@@ -754,12 +754,12 @@ database-level AtomStore и catalog files. Транзакция не может 
 namespace. Backfill можно планировать по data space, но обрезка единого WAL использует общий
 watermark.
 
-### 7.2. DatabaseCatalog `FGDC v8` и FileCatalog `FGFC v5`
+### 7.2. DatabaseCatalog `FGDC v9` и FileCatalog `FGFC v5`
 
 `db.fgb` хранит root-page ссылки; канонические каталоги лежат в `schema/catalog.fgb` и
 публикуются тем же frame-WAL commit, что data pages:
 
-- `DatabaseCatalog` (`FGDC`, payload version 8): `next_graph_id`, `next_schema_id`, IANA timezone
+- `DatabaseCatalog` (`FGDC`, payload version 9): `next_graph_id`, `next_schema_id`, IANA timezone
   table, versioned CLASS/FIELD/INDEX definitions, graph catalog, AtomStore generation/bindings и
   глобальные параметры. Property-key strings в payload не дублируются;
 - `FileCatalog` (`FGFC`, payload version 5): sealed mapping
@@ -793,7 +793,37 @@ Class definition хранит стабильные `ClassId`/`SchemaVersion`, im
 `GraphRef` не кодируется как `RecordId`. Удаление graph удаляет только его catalog entry,
 occurrences, topology, overlays и effective indexes; global atoms и classes сохраняются.
 
-После fixed graph fields `FGDC v8` хранит catalog-owned properties:
+Graph entry `FGDC v9` имеет canonical fixed header:
+
+```text
+0   8   graph_id
+8   4   schema_version
+12  8   published_at
+20  8   generation
+28  1   graph_kind
+29  1   storage_mode
+30  2   topology_constraint_bits
+32  8   label IndexId + SchemaVersion
+40  8   adjacency IndexId + SchemaVersion
+48 16   membership physical binding
+64  8   owner_root_graph_id; 0 = public graph
+72  4   root_value_len; 0 = absent
+76  4   property_count
+80  4   arena_slot_count
+84 ... canonical graph name
+...     canonical StorageValue::Record root bytes
+...     sorted graph properties
+...     arena slot records
+```
+
+`topology_constraint_bits` допускает только `SIMPLE`, `BIPARTITE`, `COMPLETE`. Root присутствует
+только у `ROOTED_TREE`, кодируется canonical `StorageValue::Record` и ссылается на node root
+graph. Internal graph имеет ненулевой `owner_root_graph_id`, указывающий на public owning root;
+его reserved canonical name начинается с `$fg$build_`. Public name map содержит только public
+graphs. Internal graph не может принадлежать другому internal graph или быть доступен из arena
+чужого owner root.
+
+После fixed graph fields `FGDC v9` хранит catalog-owned properties:
 
 ```text
 property_count: u32 LE
@@ -808,8 +838,8 @@ unknown key, `none`, runtime-only value, неверная длина и нека
 corruption. `null` является обычным хранимым значением. Properties изменяют catalog/schema
 revision при сохранении `GraphId` и physical bindings; в `GraphSuperblock` они не дублируются.
 
-Decoder target layout принимает только `FGDC v8` и `FGFC v5`. Реализованные промежуточные
-`FGDC v5/v6/v7`, `FGFC v4` и graph-owned atom layout возвращают typed incompatible-format error и не
+Decoder target layout принимает только `FGDC v9` и `FGFC v5`. Реализованные промежуточные
+`FGDC v5/v6/v7/v8`, `FGFC v4` и graph-owned atom layout возвращают typed incompatible-format error и не
 мигрируются, поскольку core format v1 ещё не заморожен.
 
 **Расширения файлов:**
@@ -1600,11 +1630,15 @@ Total = PAGE_SIZE байт
 ```
 
 `SubgraphDirEntry` не является authority для filesystem path. Durable binding хранится в
-`DatabaseCatalog`: дочерняя запись содержит собственный `GraphId` и обязательные
-`parent_graph_id`, `subgraph_slot`, `parent_atom`. При открытии обе стороны сверяются, включая
-kind/generation container-атома. Несовпадение, duplicate slot или ссылка на отсутствующий child
-считаются corruption. Вложенный и transition graph имеют полный обычный набор Direct-I/O файлов,
-собственный primary index и graph superblock, но скрыты от публичного named-graph каталога.
+`DatabaseCatalog`: arena slot содержит child `GraphId`, exact parent slot/scope и container atom.
+Разные slots могут ссылаться на один child `GraphId`; пара `(scope, child)` уникальна, slots dense.
+Один child через несколько owners образует containment DAG, а не несколько физических копий.
+При открытии queue несёт `(graph_id, arena_slot, ancestry)`: повтор graph в другой branch допустим,
+повтор в текущей ancestry является corruption cycle. Обе стороны binding сверяются, включая
+kind/generation container-атома. Missing child, duplicate `(scope, child)`, non-dense slot либо
+доступ internal child из чужого `owner_root` считаются corruption. Вложенный и transition graph
+имеют обычный набор Direct-I/O файлов, собственный primary index и graph superblock, но скрыты от
+публичного named-graph каталога.
 
 ---
 
@@ -1650,14 +1684,14 @@ Total = PAGE_SIZE байт
 Строковые пространства разделены. Database-wide `PropertyDictionary` интернирует только ключи
 свойств. `LabelDictionary` каждого графа интернирует только graph-local node/edge labels и имеет
 две независимые плотные последовательности ID. Имена classes принадлежат `ClassCatalog`, а IANA
-timezone names — `FGDC v8`.
+timezone names — `FGDC v9`.
 
 ### 16.1. Database-wide `PropertyDictionary`
 
 `atoms/<generation>/property_keys.fgb` имеет `DataFileKind::PropertyDictionary = 0x14`, является
 append-only, WAL-versioned и не имеет freelist. `PropertyKeyId` плотны, стабильны и монотонны в
 диапазоне `[0, entry_count)`; удалённый ключ не переиспользуется. `FileCatalog` — единственная
-authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v8`.
+authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v9`.
 
 ```text
 PropertyDictionaryRoot (PageType 0x003C):
@@ -1935,7 +1969,7 @@ Identity `0` и `u32::MAX` зарезервированы; допустимые 
 
 ### 18.2. Физическая публикация реализованного ядра
 
-Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 8 (§7.2). Перед первым
+Schema definitions входят в `DatabaseCatalog` payload `FGDC` version 9 (§7.2). Перед первым
 `StorageValue` payload кодируется length-framed IANA timezone table; UTC id 0 и fixed offsets
 остаются implicit. Inline property-key strings удалены: definitions сохраняют только
 `PropertyKeyId` и разрешают их через §16.1.

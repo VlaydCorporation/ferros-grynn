@@ -9,6 +9,8 @@ use super::ir::{
 	Expand,
 	LogicalBlock,
 	LogicalBlockStatement,
+	LogicalBuildGraph,
+	LogicalBuildGraphSource,
 	LogicalClosure,
 	LogicalClosureBody,
 	LogicalDmlData,
@@ -20,11 +22,13 @@ use super::ir::{
 	LogicalDmlTarget,
 	LogicalExpect,
 	LogicalExplain,
+	LogicalGraphContract,
 	LogicalGraphDmlStatement,
 	LogicalGraphPropertyMutation,
 	LogicalGraphReference,
 	LogicalHyperPattern,
 	LogicalIndexHint,
+	LogicalLetValue,
 	LogicalLinearPattern,
 	LogicalMatch,
 	LogicalMatchContains,
@@ -36,6 +40,7 @@ use super::ir::{
 	LogicalRecordTarget,
 	LogicalRelateEdge,
 	LogicalRepeat,
+	LogicalReturnGraph,
 	LogicalSchemaStatement,
 	LogicalSelect,
 	LogicalSelectAccess,
@@ -62,10 +67,13 @@ use super::ir::{
 use crate::{
 	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope, LEVEL_PATH_PROPERTY},
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, TextSpan},
+	graph::{GraphTopologyConstraint, GraphTopologyConstraints},
 	syn::{
 		AlterTarget,
 		BasicIndexDefinition,
 		BinaryOperator,
+		BuildGraphSource,
+		BuildGraphStatement,
 		ClassKindName,
 		ClassSchemaModeName,
 		DefineClassStatement,
@@ -79,9 +87,13 @@ use crate::{
 		ExpectClause,
 		Expr,
 		ExprKind,
+		GraphContract,
+		GraphFamilyName,
 		GraphPropertyMutation,
+		GraphValidatorName,
 		IndexScopeName,
 		InfoTarget,
+		LetValue,
 		Literal,
 		MatchEndpoint,
 		MatchEndpointKind,
@@ -96,6 +108,7 @@ use crate::{
 		Program,
 		RecordKey,
 		RemoveTarget,
+		ReturnGraph,
 		SelectAccessHint,
 		SelectGroup,
 		SelectItem,
@@ -135,6 +148,8 @@ pub(super) trait QueryCatalog {
 	fn class_kind(&self, class: &str) -> FerrosGrynnResult<AtomKind>;
 	/// Resolves a case-sensitive named graph.
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef>;
+	/// Resolves an optional named graph without turning absence into an error.
+	fn graph_if_exists(&self, name: &str) -> FerrosGrynnResult<Option<GraphRef>>;
 }
 
 pub(super) fn analyze(
@@ -382,20 +397,43 @@ impl<'a> Analyzer<'a> {
 				return Err(self
 					.semantic("BEGIN IMPORT must be executed through Datastore.", statement.span));
 			}
-			StatementKind::Let(statement) => {
-				let value = self.expr(&statement.value, None)?;
-				if let Some(declared) = &statement.declared_type {
+			StatementKind::BuildGraph(build) => {
+				LogicalStatement::BuildGraph(self.build_graph(build, statement.span)?)
+			}
+			StatementKind::Let(binding) => {
+				let (value, value_type) = match &binding.value {
+					LetValue::Expression(expression) => {
+						let expression = self.expr(expression, None)?;
+						let value_type = expression.ty.clone();
+						(LogicalLetValue::Expression(expression), value_type)
+					}
+					LetValue::BuildGraph(build) => {
+						let build = self.build_graph(build, statement.span)?;
+						let family = build.contract.family.unwrap_or(if build.name.is_some() {
+							GraphKind::Graph
+						} else {
+							GraphKind::Subgraph
+						});
+						let value_type = if build.name.is_some() {
+							Type::GraphRef(family)
+						} else {
+							Type::Graph(family)
+						};
+						(LogicalLetValue::BuildGraph(build), value_type)
+					}
+				};
+				if let Some(declared) = &binding.declared_type {
 					let declared = self.type_name(declared)?;
-					if !compatible(&declared, &value.ty) {
+					if !compatible(&declared, &value_type) {
 						return Err(self.semantic(
-							&format!("LET value has type {}, expected {declared}.", value.ty),
-							statement.value.span,
+							&format!("LET value has type {value_type}, expected {declared}."),
+							statement.span,
 						));
 					}
 				}
-				let slot = self.declare(&statement.name, value.ty.clone())?;
+				let slot = self.declare(&binding.name, value_type)?;
 				LogicalStatement::Let {
-					name: statement.name.value.clone(),
+					name: binding.name.value.clone(),
 					slot,
 					value,
 				}
@@ -403,6 +441,9 @@ impl<'a> Analyzer<'a> {
 			StatementKind::Return(statement) => LogicalStatement::Return {
 				value: self.expr(&statement.value, None)?,
 			},
+			StatementKind::ReturnGraph(graph) => {
+				LogicalStatement::ReturnGraph(self.return_graph(graph, None, statement.span)?)
+			}
 			StatementKind::Relate(statement) => LogicalStatement::GraphDml(self.relate(statement)?),
 			StatementKind::Match(statement) => {
 				LogicalStatement::Match(self.match_statement(statement)?)
@@ -896,25 +937,17 @@ impl<'a> Analyzer<'a> {
 		definition: &DefineGraphStatement,
 		span: TextSpan,
 	) -> FerrosGrynnResult<LogicalSchemaStatement> {
-		let kind = match definition.constraints.as_slice() {
-			[] => GraphKind::Graph,
-			[constraint] if constraint.value.eq_ignore_ascii_case("DAG") => GraphKind::Dag,
-			[constraint] if constraint.value.eq_ignore_ascii_case("HYPER") => GraphKind::Hypergraph,
-			[constraint] if constraint.value.eq_ignore_ascii_case("META") => GraphKind::Metagraph,
-			_ => {
-				let constraints = definition
-					.constraints
-					.iter()
-					.map(|constraint| constraint.value.as_ref())
-					.collect::<Vec<_>>()
-					.join(" ");
-				return Err(self.unsupported(&format!("DEFINE GRAPH TYPE {constraints}"), span));
-			}
-		};
+		let contract = self.graph_contract(&definition.contract);
+		let kind = contract.family.unwrap_or(GraphKind::Graph);
+		if definition.root.is_some() && kind != GraphKind::RootedTree {
+			return Err(self.semantic("ROOT is valid only for ROOTED_TREE.", span));
+		}
 		Ok(LogicalSchemaStatement::DefineGraph {
 			mode: definition.mode,
 			name: definition.name.value.clone(),
 			kind,
+			constraints: contract.validators,
+			root: definition.root.as_ref().map(|root| self.expr(root, None)).transpose()?,
 			content: definition
 				.content
 				.as_ref()
@@ -929,6 +962,127 @@ impl<'a> Analyzer<'a> {
 					Ok(content)
 				})
 				.transpose()?,
+		})
+	}
+
+	fn graph_contract(&self, contract: &GraphContract) -> LogicalGraphContract {
+		let family = contract.family.map(|family| match family {
+			GraphFamilyName::Graph => GraphKind::Graph,
+			GraphFamilyName::Tree => GraphKind::Tree,
+			GraphFamilyName::RootedTree => GraphKind::RootedTree,
+			GraphFamilyName::Forest => GraphKind::Forest,
+			GraphFamilyName::Dag => GraphKind::Dag,
+			GraphFamilyName::Hyper => GraphKind::Hypergraph,
+			GraphFamilyName::Meta => GraphKind::Metagraph,
+		});
+		let mut validators = GraphTopologyConstraints::empty();
+		for validator in &contract.validators {
+			validators.insert(match validator {
+				GraphValidatorName::Simple => GraphTopologyConstraint::Simple,
+				GraphValidatorName::Bipartite => GraphTopologyConstraint::Bipartite,
+				GraphValidatorName::Complete => GraphTopologyConstraint::Complete,
+			});
+		}
+		LogicalGraphContract {
+			family,
+			validators,
+		}
+	}
+
+	fn return_graph(
+		&self,
+		graph: &ReturnGraph,
+		schema: Option<&Schema>,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalReturnGraph> {
+		let contract = graph.contract.as_ref().map_or(
+			LogicalGraphContract {
+				family: None,
+				validators: GraphTopologyConstraints::empty(),
+			},
+			|contract| self.graph_contract(contract),
+		);
+		if graph.root.is_some() && contract.family != Some(GraphKind::RootedTree) {
+			return Err(self.semantic("RETURN GRAPH ROOT requires ROOTED_TREE.", span));
+		}
+		Ok(LogicalReturnGraph {
+			contract,
+			root: graph.root.as_ref().map(|root| self.expr(root, schema)).transpose()?,
+			nodes: self.expr(&graph.nodes, schema)?,
+			edges: self.expr(&graph.edges, schema)?,
+		})
+	}
+
+	fn build_graph(
+		&self,
+		build: &BuildGraphStatement,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalBuildGraph> {
+		let contract = build.contract.as_ref().map_or(
+			LogicalGraphContract {
+				family: None,
+				validators: GraphTopologyConstraints::empty(),
+			},
+			|contract| self.graph_contract(contract),
+		);
+		if build.name.is_none() && build.mode != crate::syn::DefinitionMode::Normal {
+			return Err(self.semantic(
+				"Anonymous BUILD GRAPH does not accept OVERWRITE or IF NOT EXISTS.",
+				span,
+			));
+		}
+		let existing = build
+			.name
+			.as_ref()
+			.map(|name| self.catalog.graph_if_exists(&name.value))
+			.transpose()?
+			.flatten();
+		let overwrite_rooted_tree = build.mode == crate::syn::DefinitionMode::Overwrite
+			&& contract.family.is_none()
+			&& existing.as_ref().is_some_and(|graph| graph.kind() == GraphKind::RootedTree);
+		if build.root.is_some()
+			&& contract.family != Some(GraphKind::RootedTree)
+			&& !overwrite_rooted_tree
+		{
+			return Err(self.semantic("BUILD GRAPH ROOT requires ROOTED_TREE.", span));
+		}
+		let (source, schema, direct) = match &build.source {
+			BuildGraphSource::Match(statement) => {
+				let statement = self.match_statement(statement)?;
+				let schema = statement.result.clone();
+				(LogicalBuildGraphSource::Match(Box::new(statement)), Some(schema), false)
+			}
+			BuildGraphSource::Select(statement) => {
+				let statement = self.select(statement, span)?;
+				let schema = statement.result.clone();
+				(LogicalBuildGraphSource::Select(Box::new(statement)), Some(schema), false)
+			}
+			BuildGraphSource::Traverse(statement) => {
+				let statement = self.traverse(statement, span)?;
+				let schema = statement.result.clone();
+				(LogicalBuildGraphSource::Traverse(Box::new(statement)), Some(schema), false)
+			}
+			BuildGraphSource::Expression(expression) => {
+				(LogicalBuildGraphSource::Expression(self.expr(expression, None)?), None, true)
+			}
+		};
+		if direct && (build.nodes.is_some() || build.edges.is_some()) {
+			return Err(
+				self.semantic("Direct graph values do not accept NODES or EDGES selectors.", span)
+			);
+		}
+		let schema = schema.as_ref();
+		Ok(LogicalBuildGraph {
+			mode: build.mode,
+			contract,
+			contract_explicit: build.contract.is_some(),
+			name: build.name.as_ref().map(|name| name.value.clone()),
+			source,
+			root: build.root.as_ref().map(|root| self.expr(root, schema)).transpose()?,
+			nodes: build.nodes.as_ref().map(|nodes| self.expr(nodes, schema)).transpose()?,
+			edges: build.edges.as_ref().map(|edges| self.expr(edges, schema)).transpose()?,
+			limit_nodes: build.limit_nodes,
+			limit_edges: build.limit_edges,
 		})
 	}
 
@@ -1189,6 +1343,11 @@ impl<'a> Analyzer<'a> {
 			.as_ref()
 			.map(|returning| self.select_expr(&returning.value, Some(&result), false, 0))
 			.transpose()?;
+		let return_graph = statement
+			.return_graph
+			.as_ref()
+			.map(|graph| self.return_graph(graph, Some(&result), graph.span))
+			.transpose()?;
 		Ok(LogicalTraverse {
 			atom: statement.atom,
 			constraints: statement.constraints.clone(),
@@ -1197,6 +1356,7 @@ impl<'a> Analyzer<'a> {
 			steps,
 			result,
 			returning,
+			return_graph,
 		})
 	}
 
@@ -1241,6 +1401,7 @@ impl<'a> Analyzer<'a> {
 					}],
 				},
 				returning: None,
+				return_graph: None,
 			})),
 			ty: Type::Array(Box::new(Type::Any)),
 			span: expression.span,
@@ -1447,25 +1608,38 @@ impl<'a> Analyzer<'a> {
 			.as_ref()
 			.map(|filter| self.expr(filter, Some(&bindings)))
 			.transpose()?;
+		let return_graph = statement
+			.return_graph
+			.as_ref()
+			.map(|graph| self.return_graph(graph, Some(&bindings), graph.span))
+			.transpose()?;
 		let mut projection = Vec::with_capacity(statement.projection.len());
-		let mut columns = Vec::with_capacity(statement.projection.len());
-		for (index, item) in statement.projection.iter().enumerate() {
-			let typed = self.expr(&item.expr, Some(&bindings))?;
-			let name = item
-				.alias
-				.as_ref()
-				.map(|alias| alias.value.clone())
-				.or_else(|| match &item.expr.kind {
-					ExprKind::Name(name) => Some(name.value.clone()),
-					_ => None,
-				})
-				.unwrap_or_else(|| format!("value_{index}").into_boxed_str());
+		let mut columns = Vec::with_capacity(statement.projection.len().max(1));
+		if let Some(graph) = &return_graph {
 			columns.push(Column {
-				name,
+				name: "graph".into(),
 				qualifier: None,
-				ty: typed.ty.clone(),
+				ty: Type::Graph(graph.contract.family.unwrap_or(GraphKind::Subgraph)),
 			});
-			projection.push(typed);
+		} else {
+			for (index, item) in statement.projection.iter().enumerate() {
+				let typed = self.expr(&item.expr, Some(&bindings))?;
+				let name = item
+					.alias
+					.as_ref()
+					.map(|alias| alias.value.clone())
+					.or_else(|| match &item.expr.kind {
+						ExprKind::Name(name) => Some(name.value.clone()),
+						_ => None,
+					})
+					.unwrap_or_else(|| format!("value_{index}").into_boxed_str());
+				columns.push(Column {
+					name,
+					qualifier: None,
+					ty: typed.ty.clone(),
+				});
+				projection.push(typed);
+			}
 		}
 		let result = Schema {
 			columns,
@@ -1510,6 +1684,7 @@ impl<'a> Analyzer<'a> {
 			bindings,
 			filter,
 			projection,
+			return_graph,
 			projection_distinct: statement.projection_distinct,
 			order,
 			max_depth,
@@ -3292,6 +3467,24 @@ impl<'a> Analyzer<'a> {
 			Literal::Null => Ok(Value::Null),
 			Literal::Bool(value) => Ok(Value::Bool(*value)),
 			Literal::String(value) => Ok(Value::from(value.as_ref())),
+			Literal::Record {
+				class,
+				key,
+			} => {
+				let key = match key {
+					RecordKey::Integer(value, _) => {
+						value.parse::<i64>().map(RecordIdPart::Int).map_err(|_error| {
+							self.semantic("Record integer ID is out of range.", span)
+						})?
+					}
+					RecordKey::String(value, _) => RecordIdPart::String(value.as_ref().into()),
+				};
+				RecordId::new(class.as_ref(), key)
+					.map(|record| Value::Record(Box::new(record)))
+					.map_err(|error| {
+						self.locate(error.with_phase(ExecutionPhase::SemanticAnalysis), span)
+					})
+			}
 			Literal::Number(value) => {
 				value.replace('_', "").parse::<Number>().map(Value::Number).map_err(|error| {
 					self.locate(error.with_phase(ExecutionPhase::SemanticAnalysis), span)
@@ -3474,11 +3667,28 @@ fn logical_statement_effect(statement: &LogicalStatement) -> ClosureEffect {
 			_ => ClosureEffect::SchemaMutation,
 		},
 		LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => ClosureEffect::DataMutation,
+		LogicalStatement::BuildGraph(build) => {
+			if build.name.is_some() {
+				ClosureEffect::DataMutation
+			} else {
+				ClosureEffect::StableRead
+			}
+		}
+		LogicalStatement::ReturnGraph(_) => ClosureEffect::StableRead,
 		LogicalStatement::Let {
 			value,
 			..
-		}
-		| LogicalStatement::Return {
+		} => match value {
+			LogicalLetValue::Expression(value) => typed_expression_effect(value),
+			LogicalLetValue::BuildGraph(build) => {
+				if build.name.is_some() {
+					ClosureEffect::DataMutation
+				} else {
+					ClosureEffect::StableRead
+				}
+			}
+		},
+		LogicalStatement::Return {
 			value,
 		}
 		| LogicalStatement::Expression {

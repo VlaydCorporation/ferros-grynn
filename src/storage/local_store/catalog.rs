@@ -1,4 +1,4 @@
-//! Conversion between the MVCC schema root and exact `FGDC v8` entries.
+//! Conversion between the MVCC schema root and exact `FGDC v9` entries.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -33,6 +33,7 @@ use crate::{
 	},
 	values::{
 		PropertyDictionary,
+		Value,
 		storage::{
 			EncodeContext,
 			StorageValue,
@@ -136,6 +137,13 @@ pub(super) fn encode_database_catalog(
 					})
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let root = schema
+				.root()
+				.map(|root| {
+					let value = StorageValue::from_runtime(Value::from(root.clone()), context)?;
+					CanonicalCodec::encode(value.as_ref())
+				})
+				.transpose()?;
 			Ok(GraphCatalogEntry {
 				id: binding.graph_id,
 				version: schema.version(),
@@ -144,9 +152,12 @@ pub(super) fn encode_database_catalog(
 				name: schema.name().clone(),
 				kind: schema.reference().kind(),
 				storage_mode: GraphStorageMode::DiskBacked,
+				topology_constraints: schema.topology_constraints(),
 				label_index: (label.id(), label.version()),
 				adjacency_index: (adjacency.id(), adjacency.version()),
 				membership: binding.membership,
+				owner_root: schema.owner_root(),
+				root,
 				properties,
 				arena: binding.arena.clone(),
 			})
@@ -254,9 +265,14 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 				SystemIndexKind::Adjacency,
 			),
 			crate::values::PropertyMap::new(),
+			entry.topology_constraints,
+			None,
+			entry.owner_root,
 			entry.published_at,
 		));
-		schema.graph_names.insert(entry.name.to_string(), entry.id);
+		if entry.owner_root.is_none() {
+			schema.graph_names.insert(entry.name.to_string(), entry.id);
+		}
 		schema.graphs.insert(entry.id, graph);
 		schema.graph_versions.insert(entry.id, entry.published_at);
 	}
@@ -287,6 +303,18 @@ pub(super) fn decode_catalog_values(
 		let current = schema
 			.graph(entry.id)
 			.ok_or_else(|| invalid("graph property entry has no graph definition"))?;
+		let root = entry
+			.root
+			.as_ref()
+			.map(|bytes| {
+				let value = CanonicalCodec::decode(bytes, DecodeLimits::default())?
+					.into_runtime(&context.decoder())?;
+				match value {
+					Value::Record(record) => Ok(*record),
+					_ => Err(invalid("graph root is not a canonical RecordId")),
+				}
+			})
+			.transpose()?;
 		let graph = Arc::new(crate::datastore::GraphSchema::new(
 			entry.version,
 			current.reference().clone(),
@@ -301,6 +329,9 @@ pub(super) fn decode_catalog_values(
 				.copied()
 				.ok_or_else(|| invalid("graph adjacency index is absent"))?,
 			properties,
+			entry.topology_constraints,
+			root,
+			entry.owner_root,
 			entry.published_at,
 		));
 		schema.graphs.insert(entry.id, graph);

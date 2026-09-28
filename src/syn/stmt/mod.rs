@@ -3,6 +3,7 @@ mod dml;
 mod explain;
 mod graph_dml;
 mod graph_properties;
+mod graph_result;
 mod import;
 mod r#let;
 mod r#match;
@@ -22,7 +23,15 @@ pub use control::{
 	WhileStatement,
 };
 pub use explain::{ExplainFormat, ExplainMode, ExplainStatement};
-pub use r#let::LetStatement;
+pub use graph_result::{
+	BuildGraphSource,
+	BuildGraphStatement,
+	GraphContract,
+	GraphFamilyName,
+	GraphValidatorName,
+	ReturnGraph,
+};
+pub use r#let::{LetStatement, LetValue};
 pub use r#match::{
 	MatchConstraints,
 	MatchContains,
@@ -135,6 +144,7 @@ pub enum StatementKind {
 	Try(TryStatement),
 	Throw(Expr),
 	AssertInvariants(AssertInvariantsStatement),
+	BuildGraph(BuildGraphStatement),
 	Attach(AttachStatement),
 	Create(CreateStatement),
 	Update(MutateStatement),
@@ -154,6 +164,7 @@ pub enum StatementKind {
 	Match(MatchStatement),
 	Relate(RelateStatement),
 	Return(ReturnStatement),
+	ReturnGraph(ReturnGraph),
 	Select(SelectStatement),
 	Traverse(TraverseStatement),
 }

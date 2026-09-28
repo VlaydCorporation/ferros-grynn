@@ -5,6 +5,7 @@ mod demand;
 mod deterministic;
 mod encode;
 mod estimate;
+mod graph_result_plan;
 mod match_plan;
 mod plan;
 mod rules;
@@ -18,15 +19,24 @@ pub(in crate::gql) use deterministic::validate_deterministic_statement;
 pub(crate) use encode::{CanonicalHasher, canonical_hash};
 pub(in crate::gql) use estimate::estimate_predicate;
 pub(crate) use estimate::{CostWeights, join_cost, lookup_cost, range_lookup_cost, scan_cost};
+pub(in crate::gql) use graph_result_plan::{
+	plan_build_graph,
+	plan_match_graph_result,
+	plan_return_graph,
+	plan_traverse_graph_result,
+};
 pub(in crate::gql) use match_plan::plan_match;
 pub(crate) use plan::{
 	AppliedRule,
+	GraphResultMode,
+	GraphResultOperator,
 	IndexAccessKind,
 	IndexDirection,
 	IndexJoinProbe,
 	JoinBuildSide,
 	JoinOperator,
 	MatchOperator,
+	PhysicalGraphResultPlan,
 	PhysicalJoin,
 	PhysicalMatchNode,
 	PhysicalMatchPlan,

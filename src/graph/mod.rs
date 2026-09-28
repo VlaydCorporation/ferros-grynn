@@ -28,6 +28,7 @@ mod storage;
 mod subgraph;
 mod topology;
 mod traversal;
+mod validate;
 mod view;
 mod workspace;
 
@@ -59,7 +60,8 @@ pub(crate) use id::SlotAllocator;
 pub use id::{AtomId, AtomKind, GraphId};
 pub use live::{LiveEvent, LiveGraph, LiveReadGuard, LiveUpdate};
 pub use materialized::MaterializedGraph;
-pub(crate) use materialized::{estimated_nested_graph_heap_bytes, estimated_topology_heap_bytes};
+pub(crate) use materialized::estimated_topology_heap_bytes;
+pub(crate) use metagraph::validate_nested_references;
 pub use metagraph::{FrozenMetagraph, Metagraph, MutableMetagraph};
 pub use path::{
 	EndpointRole,
@@ -91,6 +93,8 @@ pub use read::{
 	GraphRef,
 	GraphRefReader,
 	GraphStorageMode,
+	GraphTopologyConstraint,
+	GraphTopologyConstraints,
 	GraphWriteBack,
 	MaterializationOrigin,
 	NodeRead,
@@ -139,5 +143,6 @@ pub(crate) use traversal::{
 	topological_sort_with_check,
 	weakly_connected_components_with_check,
 };
+pub(crate) use validate::validate_topology_constraints;
 pub use view::{DagView, ForestView, GraphView, TreeView};
 pub use workspace::{GraphWorkspace, IntoGraphWorkspace};

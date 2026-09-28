@@ -61,6 +61,39 @@ pub(super) fn execute_traverse<Read: QueryRead>(
 	control: &ExecutionControl,
 	runtime: &mut ControlRuntime,
 ) -> FerrosGrynnResult<Value> {
+	let mut result = Array::new(Vec::new());
+	if let Some(value) = visit_traverse_values(
+		read,
+		snapshot,
+		plan,
+		slots,
+		source,
+		control,
+		runtime,
+		&mut |value| {
+			result.push(value);
+			Ok(())
+		},
+	)? {
+		return Ok(value);
+	}
+	Ok(Value::Array(result))
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "traversal pull execution retains the VM and statement runtime context"
+)]
+pub(super) fn visit_traverse_values<Read: QueryRead>(
+	read: &mut Read,
+	snapshot: Snapshot,
+	plan: &LogicalTraverse,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	runtime: &mut ControlRuntime,
+	visit: &mut impl FnMut(Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<Option<Value>> {
 	let graph = plan
 		.graph
 		.as_ref()
@@ -126,7 +159,36 @@ pub(super) fn execute_traverse<Read: QueryRead>(
 		path_tracking,
 		plan.atom,
 	);
-	let mut result = Array::new(Vec::new());
+	if let Some(graph_plan) = &plan.return_graph {
+		let mut assembly = graph_result::GraphAssemblyAccumulator::new(graph, None, None, control);
+		while let Some(traverser) = machine.next()? {
+			control.check()?;
+			assembly.record_source_row();
+			let row = machine.return_row(&traverser, &plan.result);
+			assembly.add_nodes(eval(
+				&graph_plan.nodes,
+				Some(&row),
+				slots,
+				source,
+				None,
+				Some(control),
+			)?)?;
+			assembly.add_edges(eval(
+				&graph_plan.edges,
+				Some(&row),
+				slots,
+				source,
+				None,
+				Some(control),
+			)?)?;
+			if let Some(root) = &graph_plan.root {
+				assembly.add_root(eval(root, Some(&row), slots, source, None, Some(control))?)?;
+			}
+		}
+		return assembly
+			.finish(machine.read, snapshot, graph_plan.contract)
+			.map(|graph| Some(Value::Graph(Box::new(graph))));
+	}
 	while let Some(traverser) = machine.next()? {
 		control.check()?;
 		let value = if let Some(projection) = &plan.returning {
@@ -136,10 +198,10 @@ pub(super) fn execute_traverse<Read: QueryRead>(
 			traverser.current
 		};
 		for _ in 0..traverser.bulk.get() {
-			result.push(value.clone());
+			visit(value.clone())?;
 		}
 	}
-	Ok(Value::Array(result))
+	Ok(None)
 }
 
 fn traversal_source<Read: QueryRead>(

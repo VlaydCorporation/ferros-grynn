@@ -2,6 +2,7 @@ mod control;
 mod dml;
 mod explain;
 mod graph_dml;
+mod graph_result;
 mod import;
 mod r#match;
 mod match_atomwalk;

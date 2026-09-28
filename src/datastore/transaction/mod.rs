@@ -40,6 +40,7 @@ use crate::{
 	values::{Number, PropertyKeyId, PropertyMap, RecordId, RecordIdPart, Text, Value},
 };
 
+mod build_graph;
 mod commit;
 mod graph;
 mod graph_view;
@@ -118,6 +119,7 @@ enum Mutation {
 	DefineGraph(GraphSchema),
 	ReplaceClass(ClassSchema),
 	ReplaceGraph(GraphSchema),
+	InstallBuiltGraphTree(build_graph::InstallBuiltGraphTree),
 	RemoveClass(ClassId),
 	RemoveGraph(GraphId),
 	CreateAtom {
@@ -415,7 +417,7 @@ impl Transaction {
 		let graphs = if let Some(graph) = graph {
 			vec![graph.clone()]
 		} else {
-			self.working.schema.graphs().map(|graph| graph.reference().clone()).collect()
+			self.working.schema.all_graphs().map(|graph| graph.reference().clone()).collect()
 		};
 		let mut report =
 			self.working.collect_invariant_violations(graph.map(GraphRef::id), detail_limit);
@@ -522,12 +524,68 @@ impl Transaction {
 		kind: GraphKind,
 		properties: PropertyMap,
 	) -> FerrosGrynnResult<GraphRef> {
+		self.define_graph_with_contract(
+			name,
+			kind,
+			properties,
+			crate::graph::GraphTopologyConstraints::empty(),
+			None,
+			None,
+		)
+	}
+
+	pub(crate) fn define_graph_with_contract<IntoText: Into<Text>>(
+		&mut self,
+		name: IntoText,
+		kind: GraphKind,
+		properties: PropertyMap,
+		topology_constraints: crate::graph::GraphTopologyConstraints,
+		root: Option<RecordId>,
+		owner_root: Option<GraphId>,
+	) -> FerrosGrynnResult<GraphRef> {
 		self.prepare_schema_mutation()?;
 		let name = name.into();
+		if owner_root.is_none() && name.as_str().starts_with("$fg$") {
+			return Err(FerrosGrynnError::invalid_argument(
+				"graph names beginning with `$fg$` are reserved by the engine",
+			));
+		}
+		if kind != GraphKind::RootedTree && root.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"only ROOTED_TREE may define a durable root",
+			));
+		}
 		if self.working.schema.named_graph(name.as_str()).is_some() {
 			return Err(FerrosGrynnError::graph_already_exists(name.to_string()));
 		}
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let schema = self.allocate_graph_schema(
+			name,
+			kind,
+			properties,
+			topology_constraints,
+			root,
+			owner_root,
+		)?;
+		let graph = schema.id();
+		let reference = schema.reference().clone();
+		self.working.install_graph(schema.clone(), self.snapshot.commit_ts)?;
+		self.write_bytes += SCHEMA_WRITE_BYTES;
+		self.mark_range_change(ConflictKey::GraphCatalogRange);
+		self.insert_write(ConflictKey::GraphDefinition(graph), 0);
+		self.mutations.push(Mutation::DefineGraph(schema));
+		Ok(reference)
+	}
+
+	fn allocate_graph_schema(
+		&self,
+		name: Text,
+		kind: GraphKind,
+		properties: PropertyMap,
+		topology_constraints: crate::graph::GraphTopologyConstraints,
+		root: Option<RecordId>,
+		owner_root: Option<GraphId>,
+	) -> FerrosGrynnResult<GraphSchema> {
 		let graph = self.store.inner.allocate_graph_id()?;
 		let reference = GraphRef::new(graph, name, kind, self.store.inner.graph_storage_mode())?;
 		let label = SystemIndex::new(
@@ -538,20 +596,17 @@ impl Transaction {
 			IndexId::from_schema_id(self.store.inner.allocate_schema_id()?),
 			SystemIndexKind::Adjacency,
 		);
-		let schema = GraphSchema::new(
+		Ok(GraphSchema::new(
 			SchemaVersion::INITIAL,
-			reference.clone(),
+			reference,
 			label,
 			adjacency,
 			properties,
+			topology_constraints,
+			root,
+			owner_root,
 			self.snapshot.commit_ts,
-		);
-		self.working.install_graph(schema.clone(), self.snapshot.commit_ts)?;
-		self.write_bytes += SCHEMA_WRITE_BYTES;
-		self.mark_range_change(ConflictKey::GraphCatalogRange);
-		self.insert_write(ConflictKey::GraphDefinition(graph), 0);
-		self.mutations.push(Mutation::DefineGraph(schema));
-		Ok(reference)
+		))
 	}
 
 	/// Resolves or appends one database-global property name.

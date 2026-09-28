@@ -331,7 +331,9 @@ impl DatabaseRoot {
 				return Err(FerrosGrynnError::graph_already_exists(reference.name().to_string()));
 			}
 			schema.published_at = published_at;
-			catalog.graph_names.insert(reference.name().to_string(), reference.id());
+			if !schema.is_internal() {
+				catalog.graph_names.insert(reference.name().to_string(), reference.id());
+			}
 			catalog.graphs.insert(reference.id(), Arc::new(schema));
 			catalog.graph_versions.insert(reference.id(), published_at);
 		}
@@ -441,7 +443,7 @@ impl DatabaseRoot {
 			.graphs
 			.keys()
 			.copied()
-			.chain(self.schema.graphs().map(|graph| graph.reference().id()))
+			.chain(self.schema.all_graphs().map(|graph| graph.reference().id()))
 			.collect::<BTreeSet<_>>();
 		for graph_id in graph_ids {
 			self.collect_graph_violations(graph_id, false, &mut report);
@@ -663,6 +665,51 @@ impl DatabaseRoot {
 		Arc::make_mut(&mut self.indexes).apply_occurrence_insert(graph, &occurrence, prepared)?;
 		self.statistics = Arc::new(statistics);
 		Ok(())
+	}
+
+	/// Restores one edge occurrence before the complete edge-endpoint set is
+	/// available. The caller must validate the graph after every edge is
+	/// installed.
+	pub(crate) fn restore_edge_at(
+		&mut self,
+		graph: GraphId,
+		local: AtomId,
+		global: GlobalAtomId,
+		label: Option<Text>,
+		topology: EdgeTopology,
+		weight: Option<Number>,
+		transition_graph: Option<GraphId>,
+	) -> FerrosGrynnResult<()> {
+		self.require_kind(global, AtomKind::Edge)?;
+		let atom = self
+			.atom(global)
+			.cloned()
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
+		let mut context = index_context(&self.schema, &self.dictionary)?;
+		let prepared = self.indexes.prepare_occurrence_insert(graph, &atom, &mut context)?;
+		let mut statistics = self.statistics.as_ref().clone();
+		statistics.insert_fresh_occurrence(graph, &atom, label.as_ref(), Some(&topology))?;
+		self.graph_mut(graph)?.restore_edge_at(
+			local,
+			global,
+			label,
+			topology,
+			weight,
+			transition_graph,
+		)?;
+		Arc::make_mut(&mut self.atoms).add_membership(global, graph, local);
+		let occurrence = self.occurrence(graph, local).cloned().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("restored occurrence disappeared")
+		})?;
+		Arc::make_mut(&mut self.indexes).apply_occurrence_insert(graph, &occurrence, prepared)?;
+		self.statistics = Arc::new(statistics);
+		Ok(())
+	}
+
+	pub(crate) fn validate_graph_endpoints(&self, graph: GraphId) -> FerrosGrynnResult<()> {
+		self.graph(graph)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?
+			.validate_restored_endpoints()
 	}
 
 	pub(crate) fn detach(
@@ -1104,6 +1151,9 @@ mod tests {
 			SystemIndex::new(IndexId::new(first_index).unwrap(), SystemIndexKind::Label),
 			SystemIndex::new(IndexId::new(first_index + 1).unwrap(), SystemIndexKind::Adjacency),
 			crate::values::PropertyMap::new(),
+			crate::graph::GraphTopologyConstraints::empty(),
+			None,
+			None,
 			0,
 		);
 		root.install_graph(schema, 0).unwrap();

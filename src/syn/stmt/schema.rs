@@ -30,14 +30,14 @@ pub enum ClassSchemaModeName {
 	Schemafull,
 }
 
-/// Core `DEFINE GRAPH` syntax. Unsupported constraints remain visible to the
-/// semantic analyzer so they produce an explicit feature status.
+/// Core `DEFINE GRAPH` syntax.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DefineGraphStatement {
 	pub mode: DefinitionMode,
 	pub name: Identifier,
-	pub constraints: Vec<Identifier>,
+	pub contract: GraphContract,
+	pub root: Option<Expr>,
 	pub content: Option<Expr>,
 }
 
@@ -176,32 +176,48 @@ impl Parser<'_> {
 	) -> FerrosGrynnResult<DefineGraphStatement> {
 		let mode = self.definition_mode()?;
 		let name = self.identifier()?;
-		let mut constraints = Vec::new();
-		if self.consume_keyword(keywords::TYPE).is_some() {
-			while !self.at_statement_end()
-				&& !self.at_keyword(keywords::CONTENT)
-				&& ![keywords::ROOT, keywords::ROOTS, keywords::VALIDATE, keywords::COMMENT]
-					.iter()
-					.any(|keyword| self.at_keyword(keyword))
-			{
-				constraints.push(self.identifier()?);
+		let contract = if self.consume_keyword(keywords::TYPE).is_some() {
+			let start = self.current().span;
+			let contract = self.graph_contract_until(None, start)?;
+			if contract.family.is_none() && contract.validators.is_empty() {
+				return Err(self.syntax(
+					"Expected a graph family or validator after `TYPE`.",
+					self.current().span,
+				));
 			}
-			if constraints.is_empty() {
-				return Err(
-					self.syntax("Expected a graph constraint after `TYPE`.", self.current().span)
-				);
+			contract
+		} else {
+			GraphContract {
+				family: None,
+				validators: Vec::new(),
+				span: name.span,
+			}
+		};
+		let mut root = None;
+		let mut content = None;
+		loop {
+			if self.consume_keyword(keywords::ROOT).is_some() {
+				if root.is_some() {
+					return Err(self
+						.syntax("DEFINE GRAPH ROOT may appear only once.", self.previous_span()));
+				}
+				root = Some(context.run(|context| self.expression(context, 0, 1, 0)).await?);
+			} else if self.consume_keyword(keywords::CONTENT).is_some() {
+				if content.is_some() {
+					return Err(self.syntax(
+						"DEFINE GRAPH CONTENT may appear only once.",
+						self.previous_span(),
+					));
+				}
+				content = Some(context.run(|context| self.expression(context, 0, 1, 0)).await?);
+			} else {
+				break;
 			}
 		}
-		let content = if self.consume_keyword(keywords::CONTENT).is_some() {
-			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
-		} else {
-			None
-		};
-		if let Some(feature) =
-			[keywords::ROOT, keywords::ROOTS, keywords::VALIDATE, keywords::COMMENT]
-				.iter()
-				.copied()
-				.find(|keyword| self.at_keyword(keyword))
+		if let Some(feature) = [keywords::ROOTS, keywords::VALIDATE, keywords::COMMENT]
+			.iter()
+			.copied()
+			.find(|keyword| self.at_keyword(keyword))
 		{
 			return Err(self.unsupported(feature, self.current().span));
 		}
@@ -209,7 +225,8 @@ impl Parser<'_> {
 		Ok(DefineGraphStatement {
 			mode,
 			name,
-			constraints,
+			contract,
+			root,
 			content,
 		})
 	}
@@ -468,7 +485,7 @@ impl Parser<'_> {
 		})
 	}
 
-	fn definition_mode(&mut self) -> FerrosGrynnResult<DefinitionMode> {
+	pub(in crate::syn) fn definition_mode(&mut self) -> FerrosGrynnResult<DefinitionMode> {
 		if self.consume_keyword(keywords::OVERWRITE).is_some() {
 			return Ok(DefinitionMode::Overwrite);
 		}
@@ -494,7 +511,7 @@ impl Parser<'_> {
 		self.identifier()
 	}
 
-	fn at_statement_end(&self) -> bool {
+	pub(in crate::syn) fn at_statement_end(&self) -> bool {
 		self.at_eof() || self.at_symbol(Symbol::Semicolon)
 	}
 

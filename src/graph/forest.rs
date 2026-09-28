@@ -1,7 +1,7 @@
 use std::{
 	borrow::Cow,
 	cmp::Ordering,
-	collections::{BTreeMap, BTreeSet},
+	collections::{BTreeMap, BTreeSet, VecDeque},
 	fmt::{self, Debug, Formatter},
 	hash::{Hash, Hasher},
 	marker::PhantomData,
@@ -23,6 +23,7 @@ use super::{
 	GraphKind,
 	GraphMut,
 	GraphRead,
+	GraphTopologyConstraints,
 	GraphWriteBack,
 	Mutable,
 	NodeRead,
@@ -68,6 +69,51 @@ impl ForestStorage {
 			children: CowVec::new(),
 			roots: Arc::new(BTreeSet::new()),
 		}
+	}
+
+	fn reroot_undirected(&mut self, root: AtomId) -> FerrosGrynnResult<()> {
+		if self.orientation != TreeOrientation::Undirected {
+			return Err(constraint("only an undirected tree can be re-rooted"));
+		}
+		if !self.nodes.contains(root) {
+			return Err(atom_does_not_exist(root));
+		}
+		let mut adjacency = BTreeMap::<AtomId, Vec<(AtomId, AtomId)>>::new();
+		for edge in self.edges.ids().iter().copied() {
+			let topology = self.edges.topology(edge).ok_or_else(|| atom_does_not_exist(edge))?;
+			let (left, right, direction) = topology
+				.local_binary()
+				.ok_or_else(|| constraint("a rooted tree requires local binary edges"))?;
+			if direction != EdgeDirection::Undirected {
+				return Err(constraint("an undirected tree contains a directed edge"));
+			}
+			adjacency.entry(left).or_default().push((right, edge));
+			adjacency.entry(right).or_default().push((left, edge));
+		}
+		for node in self.nodes.ids().iter().copied() {
+			let slot = node.slot() as usize;
+			self.parent[slot] = None;
+			self.parent_edge[slot] = None;
+			self.children[slot].clear();
+		}
+		let mut seen = BTreeSet::from([root]);
+		let mut queue = VecDeque::from([root]);
+		while let Some(parent) = queue.pop_front() {
+			for (child, edge) in adjacency.get(&parent).into_iter().flatten().copied() {
+				if !seen.insert(child) {
+					continue;
+				}
+				self.parent[child.slot() as usize] = Some(parent);
+				self.parent_edge[child.slot() as usize] = Some(edge);
+				self.children[parent.slot() as usize].push(child);
+				queue.push_back(child);
+			}
+		}
+		if seen.len() != self.nodes.len() {
+			return Err(constraint("a rooted tree must contain one connected component"));
+		}
+		self.roots = Arc::new(BTreeSet::from([root]));
+		Ok(())
 	}
 
 	fn insert_root_new(
@@ -658,6 +704,10 @@ macro_rules! impl_forest_read {
 				Ok(Cow::Borrowed(self.metadata.properties()))
 			}
 
+			fn topology_constraints(&self) -> GraphTopologyConstraints {
+				self.metadata.topology_constraints()
+			}
+
 			fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 				Ok(FallibleAtomIds::new(AtomIds::new(self.storage.nodes.ids().iter())))
 			}
@@ -726,6 +776,10 @@ macro_rules! impl_forest_common {
 
 			pub const fn properties(&self) -> &PropertyMap {
 				self.metadata.properties()
+			}
+
+			pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
+				self.metadata.topology_constraints()
 			}
 
 			pub const fn orientation(&self) -> TreeOrientation {
@@ -826,6 +880,33 @@ impl_forest_common!(RootedTree);
 impl<State> RootedTree<State> {
 	pub const fn root(&self) -> AtomId {
 		self.root
+	}
+
+	/// Builds a rooted tree with an explicit authoritative root.
+	///
+	/// # Errors
+	///
+	/// Returns a graph constraint error when the source is not a tree, the root
+	/// is absent, or a directed source has a different structural root.
+	pub fn try_from_graph_with_root(value: Graph<State>, root: AtomId) -> FerrosGrynnResult<Self> {
+		Self::try_from_tree_with_root(Tree::try_from(value)?, root)
+	}
+
+	fn try_from_tree_with_root(mut tree: Tree<State>, root: AtomId) -> FerrosGrynnResult<Self> {
+		if !tree.storage.nodes.contains(root) {
+			return Err(atom_does_not_exist(root));
+		}
+		if tree.storage.orientation == TreeOrientation::Undirected {
+			tree.storage.reroot_undirected(root)?;
+		} else if tree.storage.roots.first().copied() != Some(root) {
+			return Err(constraint("the explicit root differs from the directed structural root"));
+		}
+		Ok(Self {
+			metadata: tree.metadata,
+			storage: tree.storage,
+			root,
+			state: PhantomData,
+		})
 	}
 }
 
@@ -1048,18 +1129,16 @@ impl<State> TryFrom<Graph<State>> for RootedTree<State> {
 
 	fn try_from(value: Graph<State>) -> Result<Self, Self::Error> {
 		let tree = Tree::try_from(value)?;
+		if tree.storage.orientation == TreeOrientation::Undirected && tree.storage.nodes.len() > 1 {
+			return Err(constraint("an undirected rooted tree requires an explicit root"));
+		}
 		let root = tree
 			.storage
 			.roots
 			.first()
 			.copied()
 			.ok_or_else(|| constraint("a rooted tree must contain one root"))?;
-		Ok(Self {
-			metadata: tree.metadata,
-			storage: tree.storage,
-			root,
-			state: PhantomData,
-		})
+		Self::try_from_tree_with_root(tree, root)
 	}
 }
 
@@ -1324,6 +1403,20 @@ mod tests {
 		let tree = Tree::try_from(graph).unwrap();
 		assert_eq!(tree.orientation(), TreeOrientation::OutArborescence);
 		assert_eq!(tree.node_count(), 2);
+	}
+
+	#[test]
+	fn undirected_rooted_tree_requires_and_applies_explicit_root() {
+		let mut graph = Graph::<Mutable>::new();
+		let left = graph.add_node(None, PropertyMap::new()).unwrap();
+		let right = graph.add_node(None, PropertyMap::new()).unwrap();
+		graph
+			.add_edge(super::EdgeTopology::undirected([left, right]), None, PropertyMap::new())
+			.unwrap();
+		let rooted = RootedTree::try_from_graph_with_root(graph, right).unwrap();
+
+		assert_eq!(rooted.root(), right);
+		assert_eq!(rooted.parent(left), Some(right));
 	}
 
 	#[test]

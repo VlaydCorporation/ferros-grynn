@@ -108,6 +108,77 @@ impl Display for GraphKind {
 	}
 }
 
+/// Orthogonal topology validator attached to a graph contract.
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[non_exhaustive]
+pub enum GraphTopologyConstraint {
+	/// Rejects self-loops and repeated unordered endpoint pairs.
+	Simple,
+	/// Requires a two-colorable binary node projection.
+	Bipartite,
+	/// Requires an edge for every unordered pair of distinct nodes.
+	Complete,
+}
+
+impl GraphTopologyConstraint {
+	const fn bit(self) -> u16 {
+		match self {
+			Self::Simple => 1 << 0,
+			Self::Bipartite => 1 << 1,
+			Self::Complete => 1 << 2,
+		}
+	}
+}
+
+/// Compact durable set of graph topology validators.
+#[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[repr(transparent)]
+pub struct GraphTopologyConstraints(u16);
+
+impl GraphTopologyConstraints {
+	pub(crate) const KNOWN_BITS: u16 = (1 << 3) - 1;
+
+	/// Returns a graph contract without additional topology validators.
+	pub const fn empty() -> Self {
+		Self(0)
+	}
+
+	/// Returns whether this contract contains the requested validator.
+	pub const fn contains(self, constraint: GraphTopologyConstraint) -> bool {
+		self.0 & constraint.bit() != 0
+	}
+
+	/// Iterates validators in their canonical order.
+	pub fn iter(self) -> impl Iterator<Item = GraphTopologyConstraint> {
+		[
+			GraphTopologyConstraint::Simple,
+			GraphTopologyConstraint::Bipartite,
+			GraphTopologyConstraint::Complete,
+		]
+		.into_iter()
+		.filter(move |constraint| self.contains(*constraint))
+	}
+
+	pub(crate) const fn insert(&mut self, constraint: GraphTopologyConstraint) -> bool {
+		let bit = constraint.bit();
+		let inserted = self.0 & bit == 0;
+		self.0 |= bit;
+		inserted
+	}
+
+	pub(crate) const fn bits(self) -> u16 {
+		self.0
+	}
+
+	pub(crate) const fn from_bits(bits: u16) -> Option<Self> {
+		if bits & !Self::KNOWN_BITS == 0 {
+			Some(Self(bits))
+		} else {
+			None
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub enum GraphStorageMode {
@@ -588,6 +659,11 @@ pub trait GraphRead {
 	fn revision(&self) -> u64;
 	fn kind(&self) -> GraphKind;
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>>;
+
+	/// Returns durable topology validators attached to this graph.
+	fn topology_constraints(&self) -> GraphTopologyConstraints {
+		GraphTopologyConstraints::empty()
+	}
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>>;
 	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>>;
 	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>>;
@@ -786,6 +862,10 @@ impl<R: GraphRead + ?Sized> GraphRead for GraphReadView<'_, R> {
 		self.source.properties()
 	}
 
+	fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.source.topology_constraints()
+	}
+
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		self.source.node_ids()
 	}
@@ -875,6 +955,10 @@ impl<R: GraphRead + ?Sized> GraphRead for DiskGraphView<'_, R> {
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		self.view.properties()
+	}
+
+	fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.view.topology_constraints()
 	}
 
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {

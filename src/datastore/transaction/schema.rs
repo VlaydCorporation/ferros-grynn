@@ -86,6 +86,29 @@ impl Transaction {
 		Ok(())
 	}
 
+	pub(crate) fn replace_graph_definition(
+		&mut self,
+		name: &str,
+		properties: Option<crate::values::PropertyMap>,
+		constraints: crate::graph::GraphTopologyConstraints,
+		root: Option<crate::values::RecordId>,
+	) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let current = self
+			.working
+			.schema
+			.named_graph(name)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name))?;
+		let replacement = current.replace_definition(properties, constraints, root)?;
+		let id = replacement.id();
+		self.working.replace_graph_schema(replacement.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::GraphDefinition(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::GraphCatalogRange);
+		self.mutations.push(Mutation::ReplaceGraph(replacement));
+		Ok(())
+	}
+
 	/// Adds one field to an existing class.
 	///
 	/// # Errors

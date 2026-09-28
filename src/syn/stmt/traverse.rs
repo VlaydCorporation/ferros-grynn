@@ -34,6 +34,7 @@ pub struct TraverseStatement {
 	pub graph: Option<Expr>,
 	pub steps: Vec<TraverseStep>,
 	pub returning: Option<ReturnStatement>,
+	pub return_graph: Option<ReturnGraph>,
 }
 
 impl Parser<'_> {
@@ -79,10 +80,14 @@ impl Parser<'_> {
 				self.current().span,
 			));
 		}
-		let returning = if self.consume_keyword(keywords::RETURN).is_some() {
-			Some(context.run(|context| self.return_statement(context)).await?)
+		let (returning, return_graph) = if self.consume_keyword(keywords::RETURN).is_some() {
+			if self.consume_keyword(keywords::GRAPH).is_some() {
+				(None, Some(context.run(|context| self.return_graph(context)).await?))
+			} else {
+				(Some(context.run(|context| self.return_statement(context)).await?), None)
+			}
 		} else {
-			None
+			(None, None)
 		};
 		Ok(TraverseStatement {
 			atom,
@@ -91,6 +96,7 @@ impl Parser<'_> {
 			graph,
 			steps,
 			returning,
+			return_graph,
 		})
 	}
 }

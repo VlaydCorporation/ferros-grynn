@@ -17,12 +17,17 @@ struct ChildBinding {
 	container: AtomId,
 }
 
+struct PendingGraph {
+	graph: GraphId,
+	slot: u32,
+	ancestry: Vec<GraphId>,
+}
+
 /// Stable root-arena slots and direct parent bindings for one graph tree.
 pub(super) struct GraphArena<'database> {
 	database: &'database DatabaseRoot,
 	root: GraphId,
-	slot_by_graph: BTreeMap<GraphId, u32>,
-	children: BTreeMap<GraphId, Vec<ChildBinding>>,
+	children: BTreeMap<u32, Vec<ChildBinding>>,
 	bindings: GraphArenaBindings,
 }
 
@@ -34,15 +39,18 @@ impl<'database> GraphArena<'database> {
 		if database.graph(root).is_none() {
 			return Err(invalid("root arena graph is absent"));
 		}
-		let mut slot_by_graph = BTreeMap::from([(root, 0)]);
 		let mut graph_by_slot = BTreeMap::from([(0, root)]);
 		let mut scope_by_slot = BTreeMap::from([(0, Box::<[AtomId]>::default())]);
 		let mut children = BTreeMap::new();
-		let mut queue = VecDeque::from([root]);
+		let mut queue = VecDeque::from([PendingGraph {
+			graph: root,
+			slot: 0,
+			ancestry: vec![root],
+		}]);
 		let mut next_slot = 1_u32;
 		while let Some(parent) = queue.pop_front() {
 			let graph = database
-				.graph(parent)
+				.graph(parent.graph)
 				.ok_or_else(|| invalid("root arena references an absent graph"))?;
 			let mut direct = graph
 				.occurrences()
@@ -50,24 +58,19 @@ impl<'database> GraphArena<'database> {
 					child_graph(occurrence.state()).map(|child| (child, occurrence.local_id()))
 				})
 				.collect::<Vec<_>>();
-			direct.sort_unstable_by_key(|(child, container)| (child.get(), container.raw()));
+			direct.sort_unstable_by_key(|(child, container)| (container.raw(), child.get()));
 			let mut seen = BTreeSet::new();
-			let parent_slot = *slot_by_graph
-				.get(&parent)
-				.ok_or_else(|| invalid("root arena parent has no slot"))?;
 			let parent_scope = scope_by_slot
-				.get(&parent_slot)
+				.get(&parent.slot)
 				.ok_or_else(|| invalid("root arena parent has no scope"))?
 				.to_vec();
 			let mut planned = Vec::with_capacity(direct.len());
 			for (child, container) in direct {
-				if !seen.insert(child) {
-					return Err(invalid("one child graph has multiple containers in its parent"));
+				if !seen.insert(container) {
+					return Err(invalid("one container occurrence has multiple child graphs"));
 				}
-				if slot_by_graph.contains_key(&child) {
-					return Err(invalid(
-						"root arena contains a cycle or a child with multiple parents",
-					));
+				if parent.ancestry.contains(&child) {
+					return Err(invalid("root arena contains a containment cycle"));
 				}
 				if database.graph(child).is_none() {
 					return Err(invalid("container references an absent child graph"));
@@ -76,7 +79,6 @@ impl<'database> GraphArena<'database> {
 				next_slot = next_slot
 					.checked_add(1)
 					.ok_or_else(|| invalid("root arena slot clock is exhausted"))?;
-				slot_by_graph.insert(child, slot);
 				graph_by_slot.insert(slot, child);
 				let mut scope = parent_scope.clone();
 				scope.push(container);
@@ -86,14 +88,19 @@ impl<'database> GraphArena<'database> {
 					slot,
 					container,
 				});
-				queue.push_back(child);
+				let mut ancestry = parent.ancestry.clone();
+				ancestry.push(child);
+				queue.push_back(PendingGraph {
+					graph: child,
+					slot,
+					ancestry,
+				});
 			}
-			children.insert(parent, planned);
+			children.insert(parent.slot, planned);
 		}
 		Ok(Self {
 			database,
 			root,
-			slot_by_graph,
 			children,
 			bindings: GraphArenaBindings {
 				graph_by_slot,
@@ -106,17 +113,25 @@ impl<'database> GraphArena<'database> {
 		self.bindings.clone()
 	}
 
-	pub(super) fn direct_slot(&self, parent: GraphId, child: GraphId) -> Option<u32> {
+	pub(super) fn direct_slot(
+		&self,
+		parent_slot: u32,
+		container: AtomId,
+		child: GraphId,
+	) -> Option<u32> {
 		self.children
-			.get(&parent)?
+			.get(&parent_slot)?
 			.iter()
-			.find(|binding| binding.graph == child)
+			.find(|binding| binding.graph == child && binding.container == container)
 			.map(|binding| binding.slot)
 	}
 
 	pub(super) fn entries(&self, parent: GraphId) -> FerrosGrynnResult<Vec<SubgraphEntry>> {
+		if parent != self.root {
+			return Err(invalid("subgraph directory can only be built for the arena root"));
+		}
 		self.children
-			.get(&parent)
+			.get(&0)
 			.into_iter()
 			.flatten()
 			.map(|binding| {
@@ -149,15 +164,17 @@ impl<'database> GraphArena<'database> {
 		qualified: &QualifiedAtomId,
 	) -> FerrosGrynnResult<(u32, DiskAtomRef)> {
 		let mut current = self.root;
+		let mut current_slot = 0;
 		for container in qualified.scope() {
 			let binding = self
 				.children
-				.get(&current)
+				.get(&current_slot)
 				.into_iter()
 				.flatten()
 				.find(|binding| binding.container == *container)
 				.ok_or_else(|| invalid("qualified endpoint scope has no child binding"))?;
 			current = binding.graph;
+			current_slot = binding.slot;
 		}
 		let graph = self
 			.database
@@ -167,11 +184,7 @@ impl<'database> GraphArena<'database> {
 		if graph.occurrence(atom).is_none() {
 			return Err(invalid("qualified endpoint atom is absent from its graph"));
 		}
-		let slot = *self
-			.slot_by_graph
-			.get(&current)
-			.ok_or_else(|| invalid("qualified endpoint graph has no root-arena slot"))?;
-		Ok((slot, disk_ref(atom)?))
+		Ok((current_slot, disk_ref(atom)?))
 	}
 }
 

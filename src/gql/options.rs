@@ -65,6 +65,10 @@ pub struct QueryExecutionOptions {
 	/// Maximum topology branches, hyper assignments, and containment links
 	/// considered by MATCH in one statement.
 	pub max_path_expansions: u64,
+	/// Maximum unique node atoms retained by one graph-result assembly.
+	pub max_graph_nodes: u64,
+	/// Maximum unique edge atoms retained by one graph-result assembly.
+	pub max_graph_edges: u64,
 	/// Optional cooperative cancellation token.
 	pub cancellation: Option<QueryCancellation>,
 	/// Shared memory budget for SELECT barriers. Values above the engine
@@ -84,6 +88,8 @@ impl Default for QueryExecutionOptions {
 			max_control_depth: 20,
 			max_loop_iterations: 1_000_000,
 			max_path_expansions: 1_000_000,
+			max_graph_nodes: 1_000_000,
+			max_graph_edges: 5_000_000,
 			cancellation: None,
 			barrier_memory_bytes: NonZeroUsize::new(DEFAULT_BARRIER_MEMORY_BYTES)
 				.unwrap_or(NonZeroUsize::MIN),
@@ -105,6 +111,11 @@ impl QueryExecutionOptions {
 				"max_path_expansions must be greater than zero.",
 			));
 		}
+		if self.max_graph_nodes == 0 || self.max_graph_edges == 0 {
+			return Err(FerrosGrynnError::invalid_argument(
+				"max_graph_nodes and max_graph_edges must be greater than zero.",
+			));
+		}
 		Ok(())
 	}
 }
@@ -119,8 +130,11 @@ pub(crate) struct ExecutionControl {
 	pub(crate) max_control_depth: u32,
 	pub(crate) max_loop_iterations: u64,
 	max_path_expansions: u64,
+	max_graph_nodes: u64,
+	max_graph_edges: u64,
 	path_expansions: Arc<AtomicU64>,
 	match_metrics: Arc<MatchMetrics>,
+	graph_assembly_metrics: Arc<GraphAssemblyMetrics>,
 	barrier_memory: Arc<BarrierMemory>,
 	pub(crate) temporary_directory: Option<PathBuf>,
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
@@ -149,6 +163,21 @@ struct MatchMetrics {
 	physical_wal_pages: AtomicU64,
 	physical_sync_pages: AtomicU64,
 	physical_ioring_pages: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct GraphAssemblyMetrics {
+	source_rows: AtomicU64,
+	selected_nodes: AtomicU64,
+	selected_edges: AtomicU64,
+	closure_nodes: AtomicU64,
+	closure_edges: AtomicU64,
+	deduplicated_values: AtomicU64,
+	final_nodes: AtomicU64,
+	final_edges: AtomicU64,
+	child_graphs: AtomicU64,
+	scope_slots: AtomicU64,
+	validation_ns: AtomicU64,
 }
 
 /// Snapshot of MATCH-specific counters collected by `EXPLAIN ANALYZE`.
@@ -192,6 +221,43 @@ impl MatchMetricsSnapshot {
 			physical_ioring_pages: self
 				.physical_ioring_pages
 				.saturating_sub(earlier.physical_ioring_pages),
+		}
+	}
+}
+
+/// Snapshot of owned graph assembly counters collected by `EXPLAIN ANALYZE`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GraphAssemblyMetricsSnapshot {
+	pub(crate) source_rows: u64,
+	pub(crate) selected_nodes: u64,
+	pub(crate) selected_edges: u64,
+	pub(crate) closure_nodes: u64,
+	pub(crate) closure_edges: u64,
+	pub(crate) deduplicated_values: u64,
+	pub(crate) final_nodes: u64,
+	pub(crate) final_edges: u64,
+	pub(crate) child_graphs: u64,
+	pub(crate) scope_slots: u64,
+	pub(crate) validation_ns: u64,
+}
+
+impl GraphAssemblyMetricsSnapshot {
+	/// Returns a delta between two observations of the same statement control.
+	pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
+		Self {
+			source_rows: self.source_rows.saturating_sub(earlier.source_rows),
+			selected_nodes: self.selected_nodes.saturating_sub(earlier.selected_nodes),
+			selected_edges: self.selected_edges.saturating_sub(earlier.selected_edges),
+			closure_nodes: self.closure_nodes.saturating_sub(earlier.closure_nodes),
+			closure_edges: self.closure_edges.saturating_sub(earlier.closure_edges),
+			deduplicated_values: self
+				.deduplicated_values
+				.saturating_sub(earlier.deduplicated_values),
+			final_nodes: self.final_nodes.saturating_sub(earlier.final_nodes),
+			final_edges: self.final_edges.saturating_sub(earlier.final_edges),
+			child_graphs: self.child_graphs.saturating_sub(earlier.child_graphs),
+			scope_slots: self.scope_slots.saturating_sub(earlier.scope_slots),
+			validation_ns: self.validation_ns.saturating_sub(earlier.validation_ns),
 		}
 	}
 }
@@ -306,8 +372,11 @@ impl ExecutionControl {
 			max_control_depth: options.max_control_depth,
 			max_loop_iterations: options.max_loop_iterations,
 			max_path_expansions: options.max_path_expansions,
+			max_graph_nodes: options.max_graph_nodes,
+			max_graph_edges: options.max_graph_edges,
 			path_expansions: Arc::new(AtomicU64::new(0)),
 			match_metrics: Arc::new(MatchMetrics::default()),
+			graph_assembly_metrics: Arc::new(GraphAssemblyMetrics::default()),
 			barrier_memory: Arc::new(BarrierMemory {
 				limit: options.barrier_memory_bytes.get(),
 				used: AtomicUsize::new(0),
@@ -451,8 +520,11 @@ impl ExecutionControl {
 			max_control_depth: self.max_control_depth,
 			max_loop_iterations: self.max_loop_iterations,
 			max_path_expansions: self.max_path_expansions,
+			max_graph_nodes: self.max_graph_nodes,
+			max_graph_edges: self.max_graph_edges,
 			path_expansions: self.path_expansions.clone(),
 			match_metrics: self.match_metrics.clone(),
+			graph_assembly_metrics: self.graph_assembly_metrics.clone(),
 			barrier_memory: self.barrier_memory.clone(),
 			temporary_directory: self.temporary_directory.clone(),
 			cursors: self.cursors.clone(),
@@ -482,6 +554,16 @@ impl ExecutionControl {
 	/// Returns the statement-wide barrier limit used by physical planning.
 	pub(crate) fn barrier_memory_limit(&self) -> usize {
 		self.barrier_memory.limit
+	}
+
+	/// Returns the statement-wide unique-node ceiling for owned graph results.
+	pub(crate) const fn max_graph_nodes(&self) -> u64 {
+		self.max_graph_nodes
+	}
+
+	/// Returns the statement-wide unique-edge ceiling for owned graph results.
+	pub(crate) const fn max_graph_edges(&self) -> u64 {
+		self.max_graph_edges
 	}
 
 	pub(crate) fn barrier_memory_peak(&self) -> usize {
@@ -613,6 +695,114 @@ impl ExecutionControl {
 			physical_wal_pages: self.match_metrics.physical_wal_pages.load(Ordering::Acquire),
 			physical_sync_pages: self.match_metrics.physical_sync_pages.load(Ordering::Acquire),
 			physical_ioring_pages: self.match_metrics.physical_ioring_pages.load(Ordering::Acquire),
+		}
+	}
+
+	pub(crate) fn record_graph_source_row(&self) {
+		if self.instrumentation {
+			self.graph_assembly_metrics.source_rows.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	pub(crate) fn record_graph_selected_atom(&self, kind: crate::graph::AtomKind) {
+		if !self.instrumentation {
+			return;
+		}
+		match kind {
+			crate::graph::AtomKind::Node => {
+				self.graph_assembly_metrics.selected_nodes.fetch_add(1, Ordering::Relaxed);
+			}
+			crate::graph::AtomKind::Edge => {
+				self.graph_assembly_metrics.selected_edges.fetch_add(1, Ordering::Relaxed);
+			}
+		}
+	}
+
+	pub(crate) fn record_graph_selected_counts(&self, nodes: usize, edges: usize) {
+		if !self.instrumentation {
+			return;
+		}
+		self.graph_assembly_metrics
+			.selected_nodes
+			.fetch_add(u64::try_from(nodes).unwrap_or(u64::MAX), Ordering::Relaxed);
+		self.graph_assembly_metrics
+			.selected_edges
+			.fetch_add(u64::try_from(edges).unwrap_or(u64::MAX), Ordering::Relaxed);
+	}
+
+	pub(crate) fn record_graph_closure_atom(&self, kind: crate::graph::AtomKind) {
+		if !self.instrumentation {
+			return;
+		}
+		match kind {
+			crate::graph::AtomKind::Node => {
+				self.graph_assembly_metrics.closure_nodes.fetch_add(1, Ordering::Relaxed);
+			}
+			crate::graph::AtomKind::Edge => {
+				self.graph_assembly_metrics.closure_edges.fetch_add(1, Ordering::Relaxed);
+			}
+		}
+	}
+
+	pub(crate) fn record_graph_deduplicated_value(&self) {
+		if self.instrumentation {
+			self.graph_assembly_metrics.deduplicated_values.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	pub(crate) fn record_graph_scope_slots(&self, slots: usize) {
+		if self.instrumentation {
+			self.graph_assembly_metrics
+				.scope_slots
+				.fetch_add(u64::try_from(slots).unwrap_or(u64::MAX), Ordering::Relaxed);
+		}
+	}
+
+	pub(crate) fn record_graph_assembly_result(
+		&self,
+		nodes: usize,
+		edges: usize,
+		child_graphs: usize,
+	) {
+		if !self.instrumentation {
+			return;
+		}
+		self.graph_assembly_metrics
+			.final_nodes
+			.fetch_add(u64::try_from(nodes).unwrap_or(u64::MAX), Ordering::Relaxed);
+		self.graph_assembly_metrics
+			.final_edges
+			.fetch_add(u64::try_from(edges).unwrap_or(u64::MAX), Ordering::Relaxed);
+		self.graph_assembly_metrics
+			.child_graphs
+			.fetch_add(u64::try_from(child_graphs).unwrap_or(u64::MAX), Ordering::Relaxed);
+	}
+
+	pub(crate) fn record_graph_validation(&self, validation: Duration) {
+		if !self.instrumentation {
+			return;
+		}
+		self.graph_assembly_metrics
+			.validation_ns
+			.fetch_add(u64::try_from(validation.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+	}
+
+	pub(crate) fn graph_assembly_metrics(&self) -> GraphAssemblyMetricsSnapshot {
+		GraphAssemblyMetricsSnapshot {
+			source_rows: self.graph_assembly_metrics.source_rows.load(Ordering::Acquire),
+			selected_nodes: self.graph_assembly_metrics.selected_nodes.load(Ordering::Acquire),
+			selected_edges: self.graph_assembly_metrics.selected_edges.load(Ordering::Acquire),
+			closure_nodes: self.graph_assembly_metrics.closure_nodes.load(Ordering::Acquire),
+			closure_edges: self.graph_assembly_metrics.closure_edges.load(Ordering::Acquire),
+			deduplicated_values: self
+				.graph_assembly_metrics
+				.deduplicated_values
+				.load(Ordering::Acquire),
+			final_nodes: self.graph_assembly_metrics.final_nodes.load(Ordering::Acquire),
+			final_edges: self.graph_assembly_metrics.final_edges.load(Ordering::Acquire),
+			child_graphs: self.graph_assembly_metrics.child_graphs.load(Ordering::Acquire),
+			scope_slots: self.graph_assembly_metrics.scope_slots.load(Ordering::Acquire),
+			validation_ns: self.graph_assembly_metrics.validation_ns.load(Ordering::Acquire),
 		}
 	}
 

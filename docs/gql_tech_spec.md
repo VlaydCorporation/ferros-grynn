@@ -91,7 +91,7 @@ ClassScan / RecordLookup
 
 ### Утверждённые технические контракты после S0–S6
 
-- `FGDC v8` не хранит property-key strings: boot идёт FileCatalog → AtomStoreSuperblock →
+- `FGDC v9` не хранит property-key strings: boot идёт FileCatalog → AtomStoreSuperblock →
   append-only `property_keys.fgb` → schema definitions.
 - AtomStore/graph superblocks — snapshot-visible full WAL frames. Checkpoint не пишет их
   in-place, а публикует `main/.prev` COW; `.tmp` никогда не authority.
@@ -153,7 +153,7 @@ ClassScan / RecordLookup
 | Snapshot age      | `max_snapshot_age`                                 | Force-close stale snapshots                           |
 | Checkpoint        | `CheckpointPolicy` = 25% / 300 секунд              | Passive backfill; Restart — явно                      |
 | Path expansion    | `FG_PATH_MAX_DEPTH` (30), `MAXDEPTH`               | Обрыв path-finding                                    |
-| Graph expansion   | `FG_GRAPH_EXPANSION_MAX_NODES/EDGES`               | Обрыв построения графа                                |
+| Graph assembly    | `QueryExecutionOptions.max_graph_nodes/edges`      | Обрыв без partial result/publication                  |
 
 Fail-closed неприятнее в моменте, но честнее в эксплуатации: система сразу предлагает retry, circuit breaker, fallback или отказ.
 
@@ -332,7 +332,9 @@ Graph-специфичные проверки:
 - Traversal-шаг: `out('FRIEND') : vertex<record<Person>> -> vertex<record<Person>>`.
 - `StandardPath` чередует vertex/edge, `AtomWalk` — atom/edge; функции
   `path::nodes/edges/atoms/length/cost` типизируются по фактическому виду пути (§15.6 gql_spec).
-- `RETURN GRAPH <constraint> {…}`: тип результата — `subgraph` или заявленный тип графа; **система типов не делает неявных преобразований** (запрос `rooted_tree` при фактическом `forest` → ошибка; проверка **после** построения результата, §16.1 gql_spec).
+- `RETURN GRAPH <family validators...> {…}`: тип результата — `subgraph` либо заявленная
+  family; validators не создают отдельный type. **Система типов не делает неявных
+  преобразований**: проверка и exact rebuild происходят после assembly (§16 gql_spec).
 
 `option<T>` существует только в Typed AST: `Some(v)` понижается в `v`, `None` — в
 `Value::None`. Отдельного runtime-варианта и `TypeTag` нет. Операторы над `none`/`null` всегда
@@ -340,15 +342,15 @@ Graph-специфичные проверки:
 
 Контракт graph/query результатов фиксируется уже при типизации:
 
-| Оператор                      | Typed result                 |
-|-------------------------------|------------------------------|
-| `RETURN atom`                 | stable atom/record ref       |
-| `RETURN path`                 | materialized `Path`          |
-| `RETURN GRAPH {…}`            | `Subgraph<Frozen>`           |
-| `RETURN GRAPH <T> {…}`        | точный `T<Frozen>`           |
-| именованный `BUILD GRAPH <T>` | `GraphRef<T>` после commit   |
-| анонимный `BUILD GRAPH <T>`   | session-owned `T<Frozen>`    |
-| `graph::inner` внутри плана   | borrowed graph/subgraph view |
+| Оператор                      | Typed result               |
+|-------------------------------|----------------------------|
+| `RETURN atom`                 | stable atom/record ref     |
+| `RETURN path`                 | materialized `Path`        |
+| `RETURN GRAPH {…}`            | `Subgraph<Frozen>`         |
+| `RETURN GRAPH <T> {…}`        | точный `T<Frozen>`         |
+| именованный `BUILD GRAPH <T>` | `GraphRef<T>` после commit |
+| анонимный `BUILD GRAPH <T>`   | owned `T<Frozen>`          |
+| `graph::inner`                | `GraphRef`                 |
 
 Backend-dispatch не меняет Typed result и остаётся внутренним.
 
@@ -401,24 +403,24 @@ Hyper- и binary-рёбра раскрываются тем же `Expand`, но 
 
 Понижение связывает конструкции грамматики с операторами IR:
 
-| Конструкция GrynQL                                 | Понижение в IR                                                                   |
-|----------------------------------------------------|----------------------------------------------------------------------------------|
-| `SELECT f FROM t WHERE p`                          | `Scan(t) → Filter(p) → Project(f)`                                               |
-| `FROM a, b` (union)                                | `Union(Scan a, Scan b)`                                                          |
-| `FROM a & b` (cross)                               | `Join(Inner, true)`                                                              |
-| `SPLIT field`                                      | `Unwind(field)`                                                                  |
-| `GROUP [ALL\|BY]`                                  | `Aggregate(group_by, aggs)`                                                      |
-| `ORDER BY`                                         | `Sort(keys)`                                                                     |
-| `LIMIT n START s`                                  | `Limit(n, s)`                                                                    |
-| `(L AS a)-[E]->(L2 AS b)`                          | `Scan(L as a) → Expand(Out, E, b) → Filter(class(b)=L2)` (§26.3, §54.5 gql_spec) |
-| `MATCH ATOM <[STEP AS a]>~[DEPENDS_ON AS r]~><[STEP AS b]>` | `Scan(STEP as a) → Expand(Out, Atoms, DEPENDS_ON as r, STEP as b)` |
-| `(* AS a)-[E*min..max mode]->(* AS b)`             | `PathExpand(Out, E, min, max, mode, …)`                                          |
-| `OPTIONAL MATCH`                                   | `Join(Left, …)` (§23.5 инвариант 6)                                              |
-| `MATCH DISTINCT` / `RETURN DISTINCT`               | `Dedup(keys)`                                                                    |
-| `RETURN GRAPH {nodes, edges}`                      | `GraphAssemble(constraint?)` (терминальная проекция в `subgraph`)                |
-| `BUILD GRAPH … FROM …`                             | `GraphAssemble` + материализация в каталог                                       |
-| `src \|> tv::step(...)`                            | `TraversalStep(step)` поверх источника                                           |
-| `TRAVERSE FROM g \|> …`                            | цепочка `TraversalStep` над graph-источником                                     |
+| Конструкция GrynQL                                          | Понижение в IR                                                                   |
+|-------------------------------------------------------------|----------------------------------------------------------------------------------|
+| `SELECT f FROM t WHERE p`                                   | `Scan(t) → Filter(p) → Project(f)`                                               |
+| `FROM a, b` (union)                                         | `Union(Scan a, Scan b)`                                                          |
+| `FROM a & b` (cross)                                        | `Join(Inner, true)`                                                              |
+| `SPLIT field`                                               | `Unwind(field)`                                                                  |
+| `GROUP [ALL\|BY]`                                           | `Aggregate(group_by, aggs)`                                                      |
+| `ORDER BY`                                                  | `Sort(keys)`                                                                     |
+| `LIMIT n START s`                                           | `Limit(n, s)`                                                                    |
+| `(L AS a)-[E]->(L2 AS b)`                                   | `Scan(L as a) → Expand(Out, E, b) → Filter(class(b)=L2)` (§26.3, §54.5 gql_spec) |
+| `MATCH ATOM <[STEP AS a]>~[DEPENDS_ON AS r]~><[STEP AS b]>` | `Scan(STEP as a) → Expand(Out, Atoms, DEPENDS_ON as r, STEP as b)`               |
+| `(* AS a)-[E*min..max mode]->(* AS b)`                      | `PathExpand(Out, E, min, max, mode, …)`                                          |
+| `OPTIONAL MATCH`                                            | `Join(Left, …)` (§23.5 инвариант 6)                                              |
+| `MATCH DISTINCT` / `RETURN DISTINCT`                        | `Dedup(keys)`                                                                    |
+| `RETURN GRAPH {nodes, edges}`                               | `GraphAssemble(contract?, root?, limits)`                                        |
+| `BUILD GRAPH … FROM …`                                      | `BuildGraph(GraphAssemble(...), create_mode)`                                    |
+| `src \|> tv::step(...)`                                     | `TraversalStep(step)` поверх источника                                           |
+| `TRAVERSE FROM g \|> …`                                     | цепочка `TraversalStep` над graph-источником                                     |
 
 ### 5.3. Две под-алгебры под одной крышей
 
@@ -1271,12 +1273,15 @@ publication.
 | `FG_HNSW_CACHE_SIZE`                              | кеш HNSW                             | 256 MiB       |
 | `FG_STATS_AUTO_ANALYZE_DIRTY`                     | авто-`ANALYZE`                       | 0.10          |
 | `FG_PATH_MAX_DEPTH`                               | макс. глубина path-finding           | 30            |
-| `FG_GRAPH_EXPANSION_MAX_NODES/EDGES`              | лимиты graph-expansion               | 1e6 / 5e6     |
+| `QueryExecutionOptions.max_graph_nodes/edges`     | лимиты graph assembly                | 1e6 / 5e6     |
 | `FG_TRAVERSAL_READ_YOUR_WRITES`                   | видимость своих мутаций traversal'ом | false         |
 | `FG_TEMPFILES_PATH`                               | каталог для `SELECT … TEMPFILES`     | ""            |
 | `FG_ASYNC_EVENT_PROCESSING_INTERVAL`              | интервал async-событий               | 5000 ms       |
 
-Path-finding vs graph-expansion (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` применяется **только** к path-finding (`[E*]` без явного `max`); `RETURN GRAPH`/`BUILD GRAPH` используют graph-expansion mode с лимитами по узлам/рёбрам, не по глубине. Деградация — fail-closed: при исчерпании бюджета операция отвергается с диагностикой, а не «зависает».
+Path-finding vs graph assembly (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` применяется **только** к
+path-finding (`[E*]` без явного max). `RETURN GRAPH`/`BUILD GRAPH` потребляют выбранные значения
+и выполняют endpoint/containment closure; они ограничены nodes/edges и общим barrier-memory
+budget, а не depth. Деградация fail-closed: partial graph не возвращается и не публикуется.
 
 ---
 

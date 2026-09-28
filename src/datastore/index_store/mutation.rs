@@ -500,7 +500,7 @@ pub(crate) fn index_context(
 			class.name().clone(),
 		)?;
 	}
-	for graph in schema.graphs() {
+	for graph in schema.all_graphs() {
 		context.register_graph(
 			graph.reference().clone(),
 			crate::values::storage::DiskGraphRef::new(graph.id()),

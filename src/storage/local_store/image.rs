@@ -224,7 +224,7 @@ fn build_generation_inner(
 		None => GenerationIndex::Buffered(build_reverse_membership_image(database)?),
 	};
 	let mut graph_images = BTreeMap::new();
-	for graph in database.schema.graphs() {
+	for graph in database.schema.all_graphs() {
 		let graph_id = graph.id();
 		let image = match stream_root {
 			Some(root) => {
@@ -771,7 +771,7 @@ pub(super) fn prime_value_context(
 	database: &DatabaseRoot,
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<()> {
-	for graph in database.schema.graphs() {
+	for graph in database.schema.all_graphs() {
 		for (_key, value) in graph.properties() {
 			drop(StorageValue::from_runtime(value.clone(), context)?);
 		}

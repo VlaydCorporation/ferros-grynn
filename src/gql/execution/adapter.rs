@@ -229,6 +229,12 @@ impl QueryCatalog for TransactionRead<'_> {
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef> {
 		self.transaction.query_named_graph(&self.snapshot, name)
 	}
+
+	fn graph_if_exists(&self, name: &str) -> FerrosGrynnResult<Option<GraphRef>> {
+		self.transaction
+			.query_named_graph_schema(&self.snapshot, name)
+			.map(|schema| schema.map(|schema| schema.reference().clone()))
+	}
 }
 
 impl QueryRead for TransactionRead<'_> {
@@ -511,6 +517,17 @@ impl QueryRead for TransactionRead<'_> {
 			.transpose()?)
 	}
 
+	fn base_atom(
+		&self,
+		_snapshot: Snapshot,
+		record: &RecordId,
+	) -> FerrosGrynnResult<Option<(AtomKind, PropertyMap)>> {
+		Ok(self
+			.transaction
+			.query_point(&self.snapshot, record, None)?
+			.map(|row| (row.kind, row.base_properties)))
+	}
+
 	fn count_index(
 		&self,
 		_snapshot: Snapshot,
@@ -707,11 +724,27 @@ impl QueryRead for TransactionRead<'_> {
 		graph: crate::graph::GraphId,
 	) -> FerrosGrynnResult<GraphRef> {
 		self.transaction
-			.query_schema_graphs(&self.snapshot)?
+			.query_schema_all_graphs(&self.snapshot)?
 			.into_iter()
 			.find(|schema| schema.id() == graph)
 			.map(|schema| schema.reference().clone())
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))
+	}
+
+	fn graph_references(&self, _snapshot: Snapshot) -> FerrosGrynnResult<Vec<GraphRef>> {
+		self.transaction
+			.query_schema_all_graphs(&self.snapshot)
+			.map(|graphs| graphs.into_iter().map(|graph| graph.reference().clone()).collect())
+	}
+
+	fn named_graph_contract(
+		&self,
+		_snapshot: Snapshot,
+		name: &str,
+	) -> FerrosGrynnResult<Option<(GraphRef, crate::graph::GraphTopologyConstraints)>> {
+		self.transaction.query_named_graph_schema(&self.snapshot, name).map(|schema| {
+			schema.map(|schema| (schema.reference().clone(), schema.topology_constraints()))
+		})
 	}
 
 	fn level_path(
@@ -812,6 +845,20 @@ impl QueryRead for TransactionRead<'_> {
 		})?;
 		self.refresh_snapshot()?;
 		Ok(value)
+	}
+
+	fn install_built_graph(
+		&mut self,
+		name: &str,
+		mode: crate::syn::DefinitionMode,
+		contract_explicit: bool,
+		graph: crate::graph::MaterializedGraph,
+	) -> FerrosGrynnResult<GraphRef> {
+		let reference = self.transaction.atomic_mutation(|transaction| {
+			transaction.install_built_graph(name, mode, contract_explicit, &graph)
+		})?;
+		self.refresh_snapshot()?;
+		Ok(reference)
 	}
 }
 

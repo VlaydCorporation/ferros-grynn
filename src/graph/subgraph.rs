@@ -13,6 +13,7 @@ use super::{
 	GraphKind,
 	GraphMut,
 	GraphRead,
+	GraphTopologyConstraints,
 	GraphWriteBack,
 	Mutable,
 	QueryMaterialize,
@@ -115,6 +116,10 @@ impl<State> Subgraph<State> {
 	pub const fn revision(&self) -> u64 {
 		self.graph.revision()
 	}
+
+	pub const fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.graph.topology_constraints()
+	}
 }
 
 impl<State> GraphRead for Subgraph<State> {
@@ -149,6 +154,10 @@ impl<State> GraphRead for Subgraph<State> {
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
 		GraphRead::properties(&self.graph)
+	}
+
+	fn topology_constraints(&self) -> GraphTopologyConstraints {
+		self.graph.topology_constraints()
 	}
 
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {

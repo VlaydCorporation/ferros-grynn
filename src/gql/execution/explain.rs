@@ -4,7 +4,9 @@ use super::*;
 use crate::{
 	gql::optimizer::{
 		Cardinality,
+		GraphResultOperator,
 		MatchOperator,
+		PhysicalGraphResultPlan,
 		PhysicalPlan,
 		PhysicalSelectPlan,
 		PhysicalTraversalPlan,
@@ -29,6 +31,7 @@ struct AnalyzeObservation {
 	spill_runs: u64,
 	path_expansions: u64,
 	match_metrics: crate::gql::options::MatchMetricsSnapshot,
+	graph_assembly: crate::gql::options::GraphAssemblyMetricsSnapshot,
 	publication: &'static str,
 }
 
@@ -60,6 +63,8 @@ pub(super) fn execute_explain<Read: QueryRead>(
 		control.barrier_memory_limit(),
 		control.deterministic(),
 		control.fast(),
+		control.max_graph_nodes(),
+		control.max_graph_edges(),
 	)?;
 	let planning_ns = nanos(planning_started.elapsed());
 	let observation = if explain.mode == ExplainMode::Analyze {
@@ -67,6 +72,7 @@ pub(super) fn execute_explain<Read: QueryRead>(
 		let pulls_before = control.row_pulls();
 		let path_expansions_before = control.path_expansions();
 		let match_metrics_before = control.match_metrics();
+		let graph_assembly_before = control.graph_assembly_metrics();
 		let (spill_bytes_before, spill_runs_before) = control.spill_metrics();
 		let analyze_control = control.clone().with_instrumentation();
 		let started = Instant::now();
@@ -103,6 +109,9 @@ pub(super) fn execute_explain<Read: QueryRead>(
 				.path_expansions()
 				.saturating_sub(path_expansions_before),
 			match_metrics: analyze_control.match_metrics().saturating_sub(match_metrics_before),
+			graph_assembly: analyze_control
+				.graph_assembly_metrics()
+				.saturating_sub(graph_assembly_before),
 			publication: if logical_mutates(&explain.statement) {
 				if control.publication_deferred() {
 					"deferred"
@@ -152,24 +161,46 @@ fn physical_plan(
 	barrier_bytes: usize,
 	deterministic: bool,
 	fast: bool,
+	max_graph_nodes: u64,
+	max_graph_edges: u64,
 ) -> FerrosGrynnResult<PhysicalPlan> {
 	match statement {
 		LogicalStatement::Select(select) => {
 			crate::gql::optimizer::prepare_select(select, snapshot, barrier_bytes)
 				.map(|(_logical, plan)| PhysicalPlan::Select(plan))
 		}
-		LogicalStatement::Match(statement) => {
-			crate::gql::optimizer::plan_match(statement, snapshot, deterministic)
-				.map(PhysicalPlan::Match)
-		}
-		LogicalStatement::Traverse(statement) => crate::gql::optimizer::plan_traverse(
+		LogicalStatement::Match(statement) => crate::gql::optimizer::plan_match_graph_result(
+			statement,
+			snapshot,
+			deterministic,
+			max_graph_nodes,
+			max_graph_edges,
+			barrier_bytes,
+		),
+		LogicalStatement::Traverse(statement) => crate::gql::optimizer::plan_traverse_graph_result(
 			statement,
 			snapshot,
 			barrier_bytes,
 			deterministic,
 			fast,
-		)
-		.map(PhysicalPlan::Traversal),
+			max_graph_nodes,
+			max_graph_edges,
+		),
+		LogicalStatement::ReturnGraph(result) => Ok(crate::gql::optimizer::plan_return_graph(
+			result,
+			max_graph_nodes,
+			max_graph_edges,
+			barrier_bytes,
+		)),
+		LogicalStatement::BuildGraph(build) => crate::gql::optimizer::plan_build_graph(
+			build,
+			snapshot,
+			barrier_bytes,
+			deterministic,
+			fast,
+			max_graph_nodes,
+			max_graph_edges,
+		),
 		LogicalStatement::Schema(_) | LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => {
 			Ok(PhysicalPlan::Write(crate::gql::optimizer::plan_write(statement, snapshot)))
 		}
@@ -259,7 +290,10 @@ fn explain_text(
 			 peak_memory={} path_expansions={} frontier_peak={} trace_nodes={} graph_opens={} \
 			 containment_links={} hyper_assignments={} cancellation_checks={} physical_windows={} \
 			 physical_resident_pages={} physical_wal_pages={} physical_sync_pages={} \
-			 physical_ioring_pages={} publication={}",
+			 physical_ioring_pages={} graph_source_rows={} graph_selected_nodes={} \
+			 graph_selected_edges={} graph_closure_nodes={} graph_closure_edges={} \
+			 graph_deduplicated_values={} graph_final_nodes={} graph_final_edges={} \
+			 graph_child_graphs={} graph_scope_slots={} graph_validation_ns={} publication={}",
 			observation.actual_rows,
 			observation.pulls,
 			observation.affected_rows,
@@ -279,6 +313,17 @@ fn explain_text(
 			observation.match_metrics.physical_wal_pages,
 			observation.match_metrics.physical_sync_pages,
 			observation.match_metrics.physical_ioring_pages,
+			observation.graph_assembly.source_rows,
+			observation.graph_assembly.selected_nodes,
+			observation.graph_assembly.selected_edges,
+			observation.graph_assembly.closure_nodes,
+			observation.graph_assembly.closure_edges,
+			observation.graph_assembly.deduplicated_values,
+			observation.graph_assembly.final_nodes,
+			observation.graph_assembly.final_edges,
+			observation.graph_assembly.child_graphs,
+			observation.graph_assembly.scope_slots,
+			observation.graph_assembly.validation_ns,
 			observation.publication,
 		));
 	}
@@ -313,6 +358,10 @@ fn logical_nodes(statement: &LogicalStatement) -> Vec<Value> {
 				let id = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
 				push_node(&mut nodes, id, "Pattern", Some(Cardinality::unknown(u64::MAX)), None);
 			}
+			if statement.return_graph.is_some() {
+				let id = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+				push_node(&mut nodes, id, "GraphAssemble", None, None);
+			}
 		}
 		LogicalStatement::Traverse(statement) => {
 			push_node(&mut nodes, 0, "TraverseSource", None, None);
@@ -324,6 +373,27 @@ fn logical_nodes(statement: &LogicalStatement) -> Vec<Value> {
 				let id = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
 				push_node(&mut nodes, id, "Project", None, None);
 			}
+			if statement.return_graph.is_some() {
+				let id = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+				push_node(&mut nodes, id, "GraphAssemble", None, None);
+			}
+		}
+		LogicalStatement::ReturnGraph(_) => {
+			push_node(&mut nodes, 0, "GraphAssemble", None, None);
+		}
+		LogicalStatement::BuildGraph(build) => {
+			push_node(
+				&mut nodes,
+				0,
+				if build.name.is_some() {
+					"BuildGraph"
+				} else {
+					"GraphAssemble"
+				},
+				None,
+				None,
+			);
+			push_node(&mut nodes, 1, "Source", None, None);
 		}
 		LogicalStatement::Schema(_) => push_node(&mut nodes, 0, "CatalogMutation", None, None),
 		LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => {
@@ -372,7 +442,46 @@ fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value>
 				))
 			})
 			.collect(),
+		PhysicalPlan::GraphResult(plan) => graph_result_nodes(plan, snapshot),
 	}
+}
+
+fn graph_result_nodes(plan: &PhysicalGraphResultPlan, snapshot: &PlannerSnapshot) -> Vec<Value> {
+	let mut root = node_object(
+		0,
+		match plan.operator {
+			GraphResultOperator::GraphAssemble => "GraphAssemble",
+			GraphResultOperator::BuildGraph => "BuildGraph",
+		},
+		Some(Cardinality::exact(1)),
+		Some(plan.cost),
+	);
+	root.insert("output_mode", format!("{:?}", plan.mode));
+	root.insert("graph_name", plan.name.as_deref().map_or(Value::None, Value::from));
+	root.insert("family", plan.family.map_or(Value::None, |family| Value::from(family.name())));
+	root.insert("validator_bits", u64::from(plan.validator_bits));
+	root.insert("root_selector", plan.has_root);
+	root.insert("node_selector", plan.has_node_selector);
+	root.insert("edge_selector", plan.has_edge_selector);
+	root.insert("node_limit", plan.node_limit);
+	root.insert("edge_limit", plan.edge_limit);
+	root.insert("expected_nodes", Value::Object(cardinality_object(plan.expected_nodes)));
+	root.insert("expected_edges", Value::Object(cardinality_object(plan.expected_edges)));
+	root.insert("expected_scopes", Value::Object(cardinality_object(plan.expected_scopes)));
+	let mut nodes = vec![Value::Object(root)];
+	if let Some(source) = &plan.source {
+		let mut source_nodes = physical_nodes(source, snapshot);
+		for node in &mut source_nodes {
+			if let Value::Object(node) = node
+				&& let Some(Value::Number(id)) = node.get("node_id").cloned()
+				&& let Ok(id) = u64::try_from(id)
+			{
+				node.insert("node_id", id.saturating_add(1));
+			}
+		}
+		nodes.extend(source_nodes);
+	}
+	nodes
 }
 
 fn traversal_nodes(plan: &PhysicalTraversalPlan) -> Vec<Value> {
@@ -778,6 +887,17 @@ fn observation_object(value: AnalyzeObservation) -> Object {
 	object.insert("physical_wal_pages", value.match_metrics.physical_wal_pages);
 	object.insert("physical_sync_pages", value.match_metrics.physical_sync_pages);
 	object.insert("physical_ioring_pages", value.match_metrics.physical_ioring_pages);
+	object.insert("graph_source_rows", value.graph_assembly.source_rows);
+	object.insert("graph_selected_nodes", value.graph_assembly.selected_nodes);
+	object.insert("graph_selected_edges", value.graph_assembly.selected_edges);
+	object.insert("graph_closure_nodes", value.graph_assembly.closure_nodes);
+	object.insert("graph_closure_edges", value.graph_assembly.closure_edges);
+	object.insert("graph_deduplicated_values", value.graph_assembly.deduplicated_values);
+	object.insert("graph_final_nodes", value.graph_assembly.final_nodes);
+	object.insert("graph_final_edges", value.graph_assembly.final_edges);
+	object.insert("graph_child_graphs", value.graph_assembly.child_graphs);
+	object.insert("graph_scope_slots", value.graph_assembly.scope_slots);
+	object.insert("graph_validation_ns", value.graph_assembly.validation_ns);
 	object.insert("publication_state", value.publication);
 	object
 }
@@ -788,6 +908,7 @@ fn plan_warnings(plan: &PhysicalPlan) -> Vec<Value> {
 		PhysicalPlan::Match(plan) => &plan.warnings,
 		PhysicalPlan::Traversal(plan) => &plan.warnings,
 		PhysicalPlan::Write(_) => return Vec::new(),
+		PhysicalPlan::GraphResult(plan) => &plan.warnings,
 	};
 	warnings
 		.iter()
@@ -858,6 +979,8 @@ fn statement_name(statement: &LogicalStatement) -> &'static str {
 		LogicalStatement::Select(_) => "SELECT",
 		LogicalStatement::Match(_) => "MATCH",
 		LogicalStatement::Traverse(_) => "TRAVERSE",
+		LogicalStatement::ReturnGraph(_) => "RETURN GRAPH",
+		LogicalStatement::BuildGraph(_) => "BUILD GRAPH",
 		LogicalStatement::Dml(statement) => match statement.kind {
 			LogicalDmlKind::Create => "CREATE",
 			LogicalDmlKind::Update => "UPDATE",
@@ -897,7 +1020,13 @@ fn mode_name(mode: ExplainMode) -> &'static str {
 fn logical_mutates(statement: &LogicalStatement) -> bool {
 	matches!(
 		statement,
-		LogicalStatement::Schema(_) | LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_)
+		LogicalStatement::Schema(_)
+			| LogicalStatement::Dml(_)
+			| LogicalStatement::GraphDml(_)
+			| LogicalStatement::BuildGraph(crate::gql::ir::LogicalBuildGraph {
+				name: Some(_),
+				..
+			})
 	)
 }
 

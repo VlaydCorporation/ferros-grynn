@@ -1,4 +1,4 @@
-use super::stmt::{Block, MatchStatement, SelectStatement, Statement};
+use super::stmt::{Block, MatchStatement, RecordKey, SelectStatement, Statement};
 use crate::gql_status::TextSpan;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +144,10 @@ pub enum Literal {
 	Bool(bool),
 	Number(Box<str>),
 	String(Box<str>),
+	Record {
+		class: Box<str>,
+		key: RecordKey,
+	},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

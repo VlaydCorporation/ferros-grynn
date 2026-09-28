@@ -13,6 +13,7 @@ use crate::{
 		LogicalGraphDmlStatement,
 		LogicalGraphPropertyMutation,
 		LogicalGraphReference,
+		LogicalLetValue,
 		LogicalMatch,
 		LogicalMatchSelector,
 		LogicalSchemaStatement,
@@ -47,11 +48,16 @@ fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 		LogicalStatement::Schema(statement) => schema_contains_impure(statement),
 		LogicalStatement::Dml(statement) => dml_contains_impure(statement),
 		LogicalStatement::GraphDml(statement) => graph_dml_contains_impure(statement),
+		LogicalStatement::ReturnGraph(graph) => return_graph_contains_impure(graph),
+		LogicalStatement::BuildGraph(build) => build_graph_contains_impure(build),
 		LogicalStatement::Let {
 			value,
 			..
-		}
-		| LogicalStatement::Return {
+		} => match value {
+			LogicalLetValue::Expression(value) => expr_contains_impure(value),
+			LogicalLetValue::BuildGraph(build) => build_graph_contains_impure(build),
+		},
+		LogicalStatement::Return {
 			value,
 		}
 		| LogicalStatement::Expression {
@@ -103,6 +109,7 @@ fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 						})
 				})
 				|| statement.returning.as_ref().is_some_and(expr_contains_impure)
+				|| statement.return_graph.as_ref().is_some_and(return_graph_contains_impure)
 		}
 		LogicalStatement::Break
 		| LogicalStatement::Continue
@@ -112,6 +119,38 @@ fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 	}
 }
 
+fn build_graph_contains_impure(build: &crate::gql::ir::LogicalBuildGraph) -> bool {
+	let source = match &build.source {
+		crate::gql::ir::LogicalBuildGraphSource::Match(statement) => {
+			match_contains_impure(statement)
+		}
+		crate::gql::ir::LogicalBuildGraphSource::Select(statement) => {
+			select_contains_impure(statement)
+		}
+		crate::gql::ir::LogicalBuildGraphSource::Traverse(statement) => {
+			statement.returning.as_ref().is_some_and(expr_contains_impure)
+				|| statement.return_graph.as_ref().is_some_and(return_graph_contains_impure)
+				|| statement
+					.steps
+					.iter()
+					.any(|step| step.arguments.iter().any(expr_contains_impure))
+		}
+		crate::gql::ir::LogicalBuildGraphSource::Expression(expression) => {
+			expr_contains_impure(expression)
+		}
+	};
+	source
+		|| build.root.as_ref().is_some_and(expr_contains_impure)
+		|| build.nodes.as_ref().is_some_and(expr_contains_impure)
+		|| build.edges.as_ref().is_some_and(expr_contains_impure)
+}
+
+fn return_graph_contains_impure(graph: &crate::gql::ir::LogicalReturnGraph) -> bool {
+	graph.root.as_ref().is_some_and(expr_contains_impure)
+		|| expr_contains_impure(&graph.nodes)
+		|| expr_contains_impure(&graph.edges)
+}
+
 fn block_contains_impure(block: &LogicalBlock) -> bool {
 	block.statements.iter().any(|statement| statement_contains_impure(&statement.statement))
 }
@@ -119,9 +158,13 @@ fn block_contains_impure(block: &LogicalBlock) -> bool {
 fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 	match statement {
 		LogicalSchemaStatement::DefineGraph {
+			root,
 			content,
 			..
-		} => content.as_ref().is_some_and(expr_contains_impure),
+		} => {
+			root.as_ref().is_some_and(expr_contains_impure)
+				|| content.as_ref().is_some_and(expr_contains_impure)
+		}
 		LogicalSchemaStatement::UpdateGraph {
 			mutation,
 			returning,

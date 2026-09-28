@@ -7,7 +7,7 @@ use crate::{
 		TransactionAccess,
 		consts::{GRAPH_INCIDENCE_WRITE_BYTES, GRAPH_MEMBERSHIP_WRITE_BYTES},
 	},
-	graph::{AtomKind, GraphRead},
+	graph::{AtomKind, EdgeTopology, GraphRead, GraphTopologyConstraint, GraphTopologyConstraints},
 	values::{Object, RecordIdPart},
 };
 
@@ -35,6 +35,109 @@ fn setup(memberships: usize, empty_graphs: usize) -> (Datastore, RecordId, Vec<G
 	}
 	transaction.commit().unwrap();
 	(store, identity, graphs)
+}
+
+#[test]
+fn commit_rejects_a_direct_rust_mutation_that_breaks_simple() {
+	let store = Datastore::in_memory();
+	let mut transaction = store.begin();
+	transaction.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	transaction.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
+	let node = record("loop");
+	let edge = RecordId::new("relation", RecordIdPart::String("self".into())).unwrap();
+	transaction.create_atom(node.clone(), PropertyMap::new()).unwrap();
+	transaction.create_atom(edge.clone(), PropertyMap::new()).unwrap();
+	let mut constraints = GraphTopologyConstraints::empty();
+	constraints.insert(GraphTopologyConstraint::Simple);
+	let graph = transaction
+		.define_graph_with_contract(
+			"simple",
+			GraphKind::Graph,
+			PropertyMap::new(),
+			constraints,
+			None,
+			None,
+		)
+		.unwrap();
+	let local = transaction.attach_node(graph.id(), &node, None, None).unwrap();
+	transaction
+		.attach_edge(graph.id(), &edge, None, EdgeTopology::directed([local], [local]), None, None)
+		.unwrap();
+
+	assert!(transaction.commit().is_err());
+}
+
+#[test]
+fn commit_rejects_direct_rust_family_and_root_violations() {
+	let store = Datastore::in_memory();
+	let mut transaction = store.begin();
+	transaction.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	transaction.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
+	let left = record("left");
+	let right = record("right");
+	let forward = RecordId::new("relation", RecordIdPart::String("forward".into())).unwrap();
+	let reverse = RecordId::new("relation", RecordIdPart::String("reverse".into())).unwrap();
+	for atom in [&left, &right, &forward, &reverse] {
+		transaction.create_atom(atom.clone(), PropertyMap::new()).unwrap();
+	}
+	let dag = transaction.define_graph("dag", GraphKind::Dag).unwrap();
+	let local_left = transaction.attach_node(dag.id(), &left, None, None).unwrap();
+	let local_right = transaction.attach_node(dag.id(), &right, None, None).unwrap();
+	transaction
+		.attach_edge(
+			dag.id(),
+			&forward,
+			None,
+			EdgeTopology::directed([local_left], [local_right]),
+			None,
+			None,
+		)
+		.unwrap();
+	transaction
+		.attach_edge(
+			dag.id(),
+			&reverse,
+			None,
+			EdgeTopology::directed([local_right], [local_left]),
+			None,
+			None,
+		)
+		.unwrap();
+	assert!(transaction.commit().is_err());
+
+	let store = Datastore::in_memory();
+	let mut transaction = store.begin();
+	transaction.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	transaction.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
+	let left = record("left");
+	let right = record("right");
+	let edge = RecordId::new("relation", RecordIdPart::String("edge".into())).unwrap();
+	for atom in [&left, &right, &edge] {
+		transaction.create_atom(atom.clone(), PropertyMap::new()).unwrap();
+	}
+	let rooted = transaction
+		.define_graph_with_contract(
+			"rooted",
+			GraphKind::RootedTree,
+			PropertyMap::new(),
+			GraphTopologyConstraints::empty(),
+			Some(right.clone()),
+			None,
+		)
+		.unwrap();
+	let local_left = transaction.attach_node(rooted.id(), &left, None, None).unwrap();
+	let local_right = transaction.attach_node(rooted.id(), &right, None, None).unwrap();
+	transaction
+		.attach_edge(
+			rooted.id(),
+			&edge,
+			None,
+			EdgeTopology::directed([local_left], [local_right]),
+			None,
+			None,
+		)
+		.unwrap();
+	assert!(transaction.commit().is_err());
 }
 
 #[test]

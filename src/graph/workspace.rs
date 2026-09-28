@@ -224,6 +224,10 @@ impl<G: GraphRead> GraphRead for GraphWorkspace<G> {
 		self.graph.properties()
 	}
 
+	fn topology_constraints(&self) -> super::GraphTopologyConstraints {
+		self.graph.topology_constraints()
+	}
+
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
 		self.graph.node_ids()
 	}

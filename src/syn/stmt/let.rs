@@ -5,12 +5,20 @@
 
 use super::*;
 
+/// Value-producing form accepted by one lexical binding.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum LetValue {
+	Expression(Expr),
+	BuildGraph(BuildGraphStatement),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct LetStatement {
 	pub name: Identifier,
 	pub declared_type: Option<TypeName>,
-	pub value: Expr,
+	pub value: LetValue,
 }
 
 impl Parser<'_> {
@@ -25,7 +33,12 @@ impl Parser<'_> {
 			None
 		};
 		self.expect_symbol(Symbol::Equal, "Expected `=` in LET statement.")?;
-		let value = context.run(|context| self.expression(context, 0, 1, 0)).await?;
+		let value = if self.consume_keyword(keywords::BUILD).is_some() {
+			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `BUILD`.")?;
+			LetValue::BuildGraph(context.run(|context| self.build_graph_statement(context)).await?)
+		} else {
+			LetValue::Expression(context.run(|context| self.expression(context, 0, 1, 0)).await?)
+		};
 		Ok(LetStatement {
 			name,
 			declared_type,
