@@ -160,6 +160,7 @@ pub(super) struct LogicalRelateEdge {
 pub(super) struct LogicalDmlStatement {
 	pub(super) kind: LogicalDmlKind,
 	pub(super) graph: Option<GraphRef>,
+	/// Label mutation: no change, explicit removal, or replacement.
 	pub(super) label: Option<Option<crate::values::Text>>,
 	pub(super) cascade: bool,
 	pub(super) keep_levelpath: bool,

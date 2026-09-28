@@ -4,15 +4,78 @@ use std::{
 	collections::BTreeSet,
 	fs,
 	path::{Path, PathBuf},
+	sync::Weak,
 };
 
 use super::layout::invalid;
 use crate::{
 	datastore::DatabaseRoot,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	storage::{catalog::FileCatalog, types::DataFileKind},
+	storage::{
+		catalog::FileCatalog,
+		file_registry::{FileRegistry, RegisteredDataFile},
+		types::DataFileKind,
+	},
 	values::Uuid,
 };
+
+/// One catalog generation that is no longer current but may still be pinned
+/// by an exact physical query snapshot.
+pub(super) struct RetiredGeneration {
+	/// UUID directories reachable only from the replaced catalog.
+	directories: Vec<PathBuf>,
+	/// Non-owning markers for handles from the replaced registry.
+	markers: Vec<Weak<RegisteredDataFile>>,
+}
+
+impl RetiredGeneration {
+	/// Captures the directories retired by one durable catalog replacement.
+	pub(super) fn between(
+		root: &Path,
+		previous: &FileCatalog,
+		current: &FileCatalog,
+		registry: &FileRegistry,
+	) -> FerrosGrynnResult<Option<Self>> {
+		let previous = generation_directories(root, previous)?;
+		let current = generation_directories(root, current)?;
+		let directories = previous.difference(&current).cloned().collect::<Vec<_>>();
+		if directories.is_empty() {
+			return Ok(None);
+		}
+		Ok(Some(Self {
+			directories,
+			markers: registry.retirement_markers(),
+		}))
+	}
+
+	/// Returns the number of directories awaiting removal.
+	pub(super) const fn directory_count(&self) -> usize {
+		self.directories.len()
+	}
+
+	/// Removes every unpinned directory and returns the number of failed
+	/// removals. A failure remains pending for the next maintenance sweep.
+	pub(super) fn sweep(&mut self) -> u64 {
+		if self.markers.iter().any(|marker| marker.strong_count() != 0) {
+			return 0;
+		}
+		self.markers.clear();
+		let mut failures = 0_u64;
+		self.directories.retain(|directory| match remove_generation_directory(directory) {
+			Ok(()) => false,
+			Err(_error) => {
+				failures = failures.saturating_add(1);
+				true
+			}
+		});
+		failures
+	}
+
+	/// Reports whether every retired directory has been removed.
+	pub(super) fn is_empty(&self) -> bool {
+		self.directories.is_empty()
+	}
+}
 
 /// Deletes an import generation on unwind or error until its catalog commit is
 /// known to be durable.
@@ -145,11 +208,53 @@ fn cleanup_generation_children(
 		}
 		let path = entry.path();
 		if !reachable.contains(&path) {
-			fs::remove_dir_all(&path)
-				.map_err(|source| io_failure("remove orphan generation", source))?;
+			remove_generation_directory(&path)?;
 		}
 	}
 	Ok(())
+}
+
+/// Removes one generation directory. Absence is success so a partially
+/// completed Windows removal can be retried safely.
+fn remove_generation_directory(path: &Path) -> FerrosGrynnResult<()> {
+	#[cfg(test)]
+	if take_injected_cleanup_failure() {
+		return Err(io_failure(
+			"remove retired generation",
+			std::io::Error::other("injected retired-generation cleanup failure"),
+		));
+	}
+	match fs::remove_dir_all(path) {
+		Ok(()) => Ok(()),
+		Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+		Err(source) => Err(io_failure("remove retired generation", source)),
+	}
+}
+
+#[cfg(test)]
+thread_local! {
+	static INJECTED_CLEANUP_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Injects deterministic post-publication cleanup failures for local-store
+/// lifecycle tests.
+#[cfg(test)]
+pub(super) fn inject_cleanup_failures(count: u64) {
+	INJECTED_CLEANUP_FAILURES.set(count);
+}
+
+/// Consumes one deterministic cleanup failure.
+#[cfg(test)]
+fn take_injected_cleanup_failure() -> bool {
+	INJECTED_CLEANUP_FAILURES.with(|remaining| {
+		let count = remaining.get();
+		if count == 0 {
+			false
+		} else {
+			remaining.set(count - 1);
+			true
+		}
+	})
 }
 
 /// Wraps a filesystem failure in the project storage status.

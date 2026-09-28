@@ -19,6 +19,7 @@ use super::{
 	GraphSchema,
 	InMemoryOptions,
 	LocalOptions,
+	LocalStorageStatus,
 	SchemaCatalog,
 	StoreBackend,
 	StoreInner,
@@ -40,18 +41,10 @@ pub struct Datastore {
 }
 
 impl Datastore {
-	/// Clears local resident frames for an isolated storage-engine prototype.
-	///
-	/// This non-default feature hook is not a runtime cache-management API.
-	///
-	/// # Errors
-	///
-	/// Returns an arena lifecycle error if a resident mapping cannot be removed
-	/// consistently.
-	#[cfg(feature = "storage-engine-prototype-api")]
-	#[doc(hidden)]
-	pub fn prototype_clear_resident_pages(&self) -> FerrosGrynnResult<usize> {
-		self.inner.clear_resident_for_prototype()
+	/// Returns effective local storage budgets and pressure counters, or `None`
+	/// for an in-memory datastore.
+	pub fn local_storage_status(&self) -> Option<LocalStorageStatus> {
+		self.inner.local_storage_status()
 	}
 
 	/// Creates a volatile datastore with default transaction limits.

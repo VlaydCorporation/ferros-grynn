@@ -15,10 +15,12 @@
 - Native async I/O ограничен frame-oriented IoRing для заранее известного
   sparse-окна; синхронный Direct I/O остаётся fallback для singleton miss.
 - Test-only storage-engine прототипы принадлежат
-  `crates/fg-storage-engine-prototypes`, а не `src/storage`. Временный скрытый
-  `prototype_api` открывает этому крейту только измерительные production-типы и
-  методы под feature `storage-engine-prototype-api`; feature не выбирает
-  production-поведение и не должен становиться runtime selector.
+  `crates/fg-storage-engine-prototypes`, а не `src/storage`. Скрытый non-default
+  `prototype_api` открывает этому workspace-крейту только измерительные
+  production-типы и функции под feature `storage-engine-prototype-api`; feature
+  не входит в GA public API, не выбирает production-поведение и не должен
+  становиться runtime selector. Измерительные операции не добавлять как методы
+  публичного `Datastore`.
 
 ## Карта владельцев
 
@@ -50,6 +52,11 @@
   repair не должен маскировать полную corruption.
 - Checkpoint публикуется атомарно и не удаляет данные, удерживаемые активным
   snapshot.
+- После COW publication прежняя UUID-generation удаляется в runtime только
+  после освобождения exact physical snapshots, удерживающих старый registry.
+  Cleanup failure не отменяет уже опубликованный commit: generation остаётся
+  pending, счётчик ошибки наблюдаем, checkpoint/следующий commit повторяет
+  удаление.
 - Direct I/O сохраняет alignment, полный page transfer и платформенную
   семантику ошибок.
 - On-disk числа, magic, tags и checksums меняются только вместе со

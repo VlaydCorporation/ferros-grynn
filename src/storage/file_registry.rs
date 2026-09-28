@@ -1,11 +1,17 @@
 //! Sealed mapping from persisted file identities to owned Direct-I/O handles.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+	fs,
+	path::PathBuf,
+	sync::{Arc, OnceLock, Weak},
+};
 
+use parking_lot::Mutex;
 use rapidhash::{HashMapExt, HashSetExt, RapidHashMap, RapidHashSet};
 
 use super::{
 	direct::{DirectFile, DirectFileOpenMode},
+	direct_io::validate_file_length,
 	types::{DataFileId, DataFileKind, PageKey},
 };
 use crate::{
@@ -45,7 +51,13 @@ pub(super) struct RegisteredDataFile {
 	///
 	/// Checkpoint-owned superblocks keep no handle because Windows replacement
 	/// requires the old file object to be closed.
-	file: Option<Arc<DirectFile>>,
+	file: OnceLock<Arc<DirectFile>>,
+	/// Serializes only the first native open attempt.
+	open_lock: Mutex<()>,
+	/// Native handle behavior used when the data file is first demanded.
+	open_mode: DirectFileOpenMode,
+	/// Validated home-file length in pages.
+	page_count: u64,
 }
 
 impl RegisteredDataFile {
@@ -60,12 +72,38 @@ impl RegisteredDataFile {
 	}
 
 	/// Returns the shared Direct-I/O handle.
-	pub(super) fn file(&self) -> FerrosGrynnResult<&Arc<DirectFile>> {
-		self.file.as_ref().ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file(
+	pub(super) fn file(&self) -> FerrosGrynnResult<Arc<DirectFile>> {
+		if self.role == DataFileRole::Superblock {
+			return Err(FerrosGrynnError::invalid_storage_file(
 				"checkpoint-owned metadata has no positional data handle",
-			)
-		})
+			));
+		}
+		if let Some(file) = self.file.get() {
+			return Ok(file.clone());
+		}
+		let _open = self.open_lock.lock();
+		if let Some(file) = self.file.get() {
+			return Ok(file.clone());
+		}
+		let opened = Arc::new(DirectFile::open_read_write_with_mode(&self.path, self.open_mode)?);
+		match self.file.set(opened.clone()) {
+			Ok(()) => Ok(opened),
+			Err(_opened) => self.file.get().cloned().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"lazy data-file handle publication lost its initialized value",
+				)
+			}),
+		}
+	}
+
+	/// Returns whether this registration currently owns a native data handle.
+	pub(super) fn is_open(&self) -> bool {
+		self.file.get().is_some()
+	}
+
+	/// Returns the validated number of addressable home pages.
+	pub(super) const fn page_count(&self) -> u64 {
+		self.page_count
 	}
 }
 
@@ -182,30 +220,49 @@ impl FileRegistry {
 	pub(super) fn snapshot(&self) -> Vec<((DataSpaceId, DataFileId), Arc<RegisteredDataFile>)> {
 		self.files.iter().map(|(key, file)| (*key, file.clone())).collect()
 	}
+
+	/// Returns non-owning markers for every file in the current physical
+	/// generation. A retired generation remains pinned while any exact physical
+	/// snapshot can still upgrade one of these markers.
+	pub(super) fn retirement_markers(&self) -> Vec<Weak<RegisteredDataFile>> {
+		self.files.values().map(Arc::downgrade).collect()
+	}
+
+	/// Returns `(registrations, open positional handles)`.
+	pub(super) fn handle_counts(&self) -> (usize, usize) {
+		(self.files.len(), self.files.values().filter(|file| file.is_open()).count())
+	}
 }
 
-/// Opens one trusted registration without publishing a partial registry.
+/// Validates one trusted registration without opening a persistent handle.
 fn open_registration(
 	registration: DataFileRegistration,
 	io_mode: DirectFileOpenMode,
 ) -> FerrosGrynnResult<RegisteredDataFile> {
 	validate_registration(registration.space_id, registration.file_id, registration.role)?;
-	let opened = DirectFile::open_read_write_with_mode(&registration.path, io_mode)?;
-	let file = if registration.role == DataFileRole::Superblock {
-		if opened.page_count() != 1 {
+	let length = fs::metadata(&registration.path)
+		.map_err(|source| {
+			FerrosGrynnError::storage_io_failure("read registered data-file metadata")
+				.with_technical_source(source)
+		})?
+		.len();
+	validate_file_length(length)?;
+	if registration.role == DataFileRole::Superblock {
+		if length != crate::storage::page::PAGE_SIZE as u64 {
 			return Err(FerrosGrynnError::invalid_storage_file(
 				"registered checkpoint-owned superblock must contain exactly one page",
 			));
 		}
-		drop(opened);
-		None
-	} else {
-		Some(Arc::new(opened))
-	};
+	}
+	let file = OnceLock::new();
+	let page_count = length / crate::storage::page::PAGE_SIZE as u64;
 	Ok(RegisteredDataFile {
 		role: registration.role,
 		path: registration.path,
 		file,
+		open_lock: Mutex::new(()),
+		open_mode: io_mode,
+		page_count,
 	})
 }
 
@@ -260,5 +317,31 @@ mod tests {
 			validate_registration(DataSpaceId::Database, graph, DataFileRole::Superblock).is_err()
 		);
 		assert!(validate_registration(graph_space, atoms, DataFileRole::Superblock).is_err());
+	}
+
+	#[test]
+	fn ordinary_handle_opens_only_on_first_use() -> FerrosGrynnResult<()> {
+		let path =
+			std::env::temp_dir().join(format!("fg-registry-{}.fgb", crate::values::Uuid::now_v7()));
+		let created = DirectFile::create_new(&path)?;
+		created.resize_pages(1)?;
+		drop(created);
+		let file_id = DataFileId::for_kind(DataFileKind::NodesHot);
+		let registry = FileRegistry::open(
+			vec![DataFileRegistration {
+				space_id: DataSpaceId::Database,
+				file_id,
+				role: DataFileRole::WalBackfilled,
+				path: path.clone(),
+			}],
+			DirectFileOpenMode::Synchronous,
+			&RapidHashSet::default(),
+		)?;
+		assert_eq!(registry.handle_counts(), (1, 0));
+		drop(registry.resolve_file(DataSpaceId::Database, file_id)?.file()?);
+		assert_eq!(registry.handle_counts(), (1, 1));
+		drop(registry);
+		drop(std::fs::remove_file(path));
+		Ok(())
 	}
 }

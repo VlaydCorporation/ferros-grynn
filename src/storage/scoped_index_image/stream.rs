@@ -178,6 +178,9 @@ where
 	let mut standard = 0_u32;
 	let mut unique = 0_u32;
 	for binding in bindings.values() {
+		if binding.deferred {
+			return Err(invalid("deferred physical index reached the generation builder"));
+		}
 		let started = Instant::now();
 		let (relative_path, built) = match &binding.entries {
 			IndexEntries::Standard(entries) => {

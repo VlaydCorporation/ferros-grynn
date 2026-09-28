@@ -14,7 +14,12 @@ use std::{
 
 use rapidhash::RapidHashMap;
 
-use super::{GraphBinding, LocalStore};
+use super::{
+	GraphBinding,
+	LocalStore,
+	physical_index::PhysicalIndexFile,
+	statistics::PhysicalStatisticsFiles,
+};
 #[cfg(all(windows, feature = "native-async-io"))]
 use crate::storage::hybrid_engine::{ReadIntent, ReadWindow, TransportCapabilities};
 use crate::{
@@ -134,18 +139,20 @@ struct PhysicalGraphSnapshot {
 }
 
 /// Cloneable token keeping the exact WAL visibility boundary alive.
-struct LocalQuerySnapshotInner {
-	_pin: TxHandle,
-	snapshot: StorageSnapshot,
-	home_generation: crate::storage::types::CheckpointGeneration,
-	home_ceiling: crate::storage::types::Lsn,
+pub(super) struct LocalQuerySnapshotInner {
+	pub(super) _pin: TxHandle,
+	pub(super) snapshot: StorageSnapshot,
+	pub(super) home_generation: crate::storage::types::CheckpointGeneration,
+	pub(super) home_ceiling: crate::storage::types::Lsn,
 	atoms: PhysicalAtomSnapshot,
 	graphs: BTreeMap<GraphId, PhysicalGraphSnapshot>,
+	pub(super) indexes: BTreeMap<crate::datastore::IndexId, Arc<PhysicalIndexFile>>,
+	pub(super) statistics: Option<Arc<PhysicalStatisticsFiles>>,
 }
 
 /// Local physical state captured for one immutable query snapshot.
 #[derive(Clone)]
-pub(crate) struct LocalQuerySnapshot(Arc<LocalQuerySnapshotInner>);
+pub(crate) struct LocalQuerySnapshot(pub(super) Arc<LocalQuerySnapshotInner>);
 
 /// One bounded physical traversal reader. It never exposes pages or file ids
 /// above the datastore boundary.
@@ -192,6 +199,8 @@ impl LocalStore {
 			home_ceiling,
 			atoms,
 			graphs,
+			indexes: state.physical_indexes.clone(),
+			statistics: state.physical_statistics.clone(),
 		}))))
 	}
 
@@ -706,104 +715,123 @@ impl PhysicalTraversalCursor<'_> {
 		page_ceiling: u64,
 		page_numbers: &[PageNo],
 	) -> FerrosGrynnResult<LoadedPages> {
-		if page_numbers.len() > MAX_READ_SCOPE_OPERATIONS
-			|| page_numbers.iter().any(|page| page.get() >= page_ceiling)
-		{
-			return Err(invalid("physical traversal page window exceeds its bounded source"));
-		}
-		let keys =
-			page_numbers.iter().map(|page| PageKey::new(space, file_id, *page)).collect::<Vec<_>>();
-		let visible = self.store.wal.visible_frames(&keys, self.snapshot.snapshot);
-		let mut pages = (0..keys.len()).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
-		let mut cold_home = Vec::new();
-		let mut stats = PhysicalTraversalReadStats::default();
-		for (index, (key, frame)) in keys.iter().zip(visible.frames()).enumerate() {
-			let version = frame.map_or(
-				PageCacheVersion::Home {
-					generation: self.snapshot.home_generation,
-					ceiling: self.snapshot.home_ceiling,
-				},
-				|frame| {
-					PageCacheVersion::Wal(crate::storage::page::PageLsn::new(
-						frame.frame_lsn().get(),
-					))
-				},
-			);
-			let cache_key = PageCacheKey::new(*key, version);
-			if let Some(resident) = self.store.engine.get_if_resident(cache_key)? {
-				pages[index].as_bytes_mut().copy_from_slice(resident.as_bytes());
-				stats.resident_pages = stats.resident_pages.saturating_add(1);
-				continue;
-			}
-			if let Some(frame) = frame {
-				let loaded = self
-					.store
-					.engine
-					.get_or_load(cache_key, |output| visible.read_frame(*frame, output))?;
-				pages[index].as_bytes_mut().copy_from_slice(loaded.as_bytes());
-				stats.wal_pages = stats.wal_pages.saturating_add(1);
-			} else {
-				cold_home.push(index);
-			}
-		}
-		if !cold_home.is_empty() {
-			self.read_cold_home(file, page_numbers, &cold_home, &mut pages, &mut stats)?;
-		}
-		Ok(LoadedPages {
-			pages,
-			stats,
-		})
-	}
-
-	fn read_cold_home(
-		&self,
-		file: &Arc<RegisteredDataFile>,
-		page_numbers: &[PageNo],
-		cold: &[usize],
-		pages: &mut [AlignedPage],
-		stats: &mut PhysicalTraversalReadStats,
-	) -> FerrosGrynnResult<()> {
-		let direct = file.file()?;
-		let cold_count = u64::try_from(cold.len()).map_err(|error| {
-			invalid(format!("physical traversal cold-page count does not fit u64: {error}"))
-		})?;
-		#[cfg(all(windows, feature = "native-async-io"))]
-		let route = self.store.engine.route(
-			false,
-			ReadIntent::IndexTraversal,
-			ReadWindow::Sparse {
-				operations: page_numbers.len(),
-				cold_pages: cold.len(),
-			},
-			self.store.io.mode(),
-			TransportCapabilities::current(),
-		);
-		#[cfg(all(windows, feature = "native-async-io"))]
-		if matches!(route, crate::storage::hybrid_engine::ReadRoute::IoRingSparse { .. })
-			&& cold.len() <= self.store.engine.sparse_window_capacity()
-		{
-			let reads = cold
-				.iter()
-				.map(|index| (Arc::clone(direct), page_numbers[*index]))
-				.collect::<Vec<_>>();
-			let loaded = self.store.engine.read_sparse_ioring(&reads)?;
-			for (position, index) in cold.iter().copied().enumerate() {
-				pages[index].as_bytes_mut().copy_from_slice(loaded.pages()[position].as_bytes());
-			}
-			stats.ioring_home_pages = stats.ioring_home_pages.saturating_add(cold_count);
-			return Ok(());
-		}
-		for index in cold {
-			direct.read_page(page_numbers[*index], &mut pages[*index])?;
-		}
-		stats.sync_home_pages = stats.sync_home_pages.saturating_add(cold_count);
-		Ok(())
+		read_snapshot_pages(
+			self.store,
+			self.snapshot,
+			space,
+			file_id,
+			file,
+			page_ceiling,
+			page_numbers,
+		)
 	}
 }
 
-struct LoadedPages {
-	pages: Vec<AlignedPage>,
-	stats: PhysicalTraversalReadStats,
+/// Reads one bounded exact-version page window shared by traversal and lazy
+/// immutable index decoding.
+pub(super) fn read_snapshot_pages(
+	store: &LocalStore,
+	snapshot: &LocalQuerySnapshotInner,
+	space: DataSpaceId,
+	file_id: DataFileId,
+	file: &Arc<RegisteredDataFile>,
+	page_ceiling: u64,
+	page_numbers: &[PageNo],
+) -> FerrosGrynnResult<LoadedPages> {
+	if page_numbers.len() > MAX_READ_SCOPE_OPERATIONS
+		|| page_numbers.iter().any(|page| page.get() >= page_ceiling)
+	{
+		return Err(invalid("physical query page window exceeds its bounded source"));
+	}
+	let keys =
+		page_numbers.iter().map(|page| PageKey::new(space, file_id, *page)).collect::<Vec<_>>();
+	let visible = store.wal.visible_frames(&keys, snapshot.snapshot);
+	let mut pages = (0..keys.len()).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
+	let mut cold_home = Vec::new();
+	let mut stats = PhysicalTraversalReadStats::default();
+	for (index, (key, frame)) in keys.iter().zip(visible.frames()).enumerate() {
+		let version = frame.map_or(
+			PageCacheVersion::Home {
+				generation: snapshot.home_generation,
+				ceiling: snapshot.home_ceiling,
+			},
+			|frame| {
+				PageCacheVersion::Wal(crate::storage::page::PageLsn::new(frame.frame_lsn().get()))
+			},
+		);
+		let cache_key = PageCacheKey::new(*key, version);
+		if let Some(resident) = store.engine.get_if_resident(cache_key)? {
+			pages[index].as_bytes_mut().copy_from_slice(resident.as_bytes());
+			stats.resident_pages = stats.resident_pages.saturating_add(1);
+			continue;
+		}
+		if let Some(frame) = frame {
+			let loaded =
+				store.engine.get_or_load(cache_key, |output| visible.read_frame(*frame, output))?;
+			pages[index].as_bytes_mut().copy_from_slice(loaded.as_bytes());
+			stats.wal_pages = stats.wal_pages.saturating_add(1);
+		} else {
+			cold_home.push(index);
+		}
+	}
+	if !cold_home.is_empty() {
+		read_cold_home(store, file, page_numbers, &cold_home, &mut pages, &mut stats)?;
+	}
+	Ok(LoadedPages {
+		pages,
+		stats,
+	})
+}
+
+fn read_cold_home(
+	store: &LocalStore,
+	file: &Arc<RegisteredDataFile>,
+	page_numbers: &[PageNo],
+	cold: &[usize],
+	pages: &mut [AlignedPage],
+	stats: &mut PhysicalTraversalReadStats,
+) -> FerrosGrynnResult<()> {
+	#[cfg(not(all(windows, feature = "native-async-io")))]
+	let _ = store;
+	let direct = file.file()?;
+	let cold_count = u64::try_from(cold.len())
+		.map_err(|error| invalid(format!("physical cold-page count does not fit u64: {error}")))?;
+	#[cfg(all(windows, feature = "native-async-io"))]
+	let route = store.engine.route(
+		false,
+		ReadIntent::IndexTraversal,
+		ReadWindow::Sparse {
+			operations: page_numbers.len(),
+			cold_pages: cold.len(),
+		},
+		store.io.mode(),
+		TransportCapabilities::current(),
+	);
+	#[cfg(all(windows, feature = "native-async-io"))]
+	if matches!(route, crate::storage::hybrid_engine::ReadRoute::IoRingSparse { .. })
+		&& cold.len() <= store.engine.sparse_window_capacity()
+	{
+		let reads = cold
+			.iter()
+			.map(|index| (Arc::clone(&direct), page_numbers[*index]))
+			.collect::<Vec<_>>();
+		let loaded = store.engine.read_sparse_ioring(&reads)?;
+		for (position, index) in cold.iter().copied().enumerate() {
+			pages[index].as_bytes_mut().copy_from_slice(loaded.pages()[position].as_bytes());
+		}
+		stats.ioring_home_pages = stats.ioring_home_pages.saturating_add(cold_count);
+		return Ok(());
+	}
+	for index in cold {
+		direct.read_page(page_numbers[*index], &mut pages[*index])?;
+	}
+	stats.sync_home_pages = stats.sync_home_pages.saturating_add(cold_count);
+	Ok(())
+}
+
+pub(super) struct LoadedPages {
+	pub(super) pages: Vec<AlignedPage>,
+	pub(super) stats: PhysicalTraversalReadStats,
 }
 
 #[derive(Clone, Copy)]

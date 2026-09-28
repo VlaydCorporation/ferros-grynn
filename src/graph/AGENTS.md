@@ -27,6 +27,9 @@ handle конкретного materialization и нужен в том числе
 - `PathStep` хранит occurrence endpoint и optional occurrence connector edge,
   поэтому cross-level path может иметь endpoint в дочернем графе и
   connector в родительском. `Path` не хранит snapshot-local `AtomId`.
+- Внутренние SoA-accessors `label`/`weight` намеренно возвращают две оси
+  optionality: внешний `None` означает stale/foreign `AtomId`, внутренний
+  `None` — живой atom без label/weight. Не схлопывать эти состояния.
 
 ## Карта владельцев
 

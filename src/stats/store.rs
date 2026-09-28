@@ -4,12 +4,25 @@ use super::{BaseStatistics, GraphStatistics};
 use crate::{datastore::ClassId, graph::GraphId};
 
 /// Statistics owned by one immutable database MVCC root.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StatisticsStore {
 	base: BaseStatistics,
 	graphs: BTreeMap<GraphId, GraphStatistics>,
 	pub(super) base_touched: bool,
 	pub(super) graphs_touched: BTreeSet<GraphId>,
+	auxiliary_deferred: bool,
+}
+
+impl Default for StatisticsStore {
+	fn default() -> Self {
+		Self {
+			base: BaseStatistics::default(),
+			graphs: BTreeMap::new(),
+			base_touched: false,
+			graphs_touched: BTreeSet::new(),
+			auxiliary_deferred: false,
+		}
+	}
 }
 
 impl StatisticsStore {
@@ -51,6 +64,22 @@ impl StatisticsStore {
 
 	pub(crate) fn replace_graph(&mut self, graph: GraphId, statistics: GraphStatistics) {
 		self.graphs.insert(graph, statistics);
+	}
+
+	/// Marks independently stored statistics parts as absent from this runtime
+	/// projection until an exact physical snapshot supplies them.
+	pub(crate) fn mark_auxiliary_deferred(&mut self) {
+		self.auxiliary_deferred = true;
+	}
+
+	/// Returns whether this runtime projection contains only eager roots.
+	pub(crate) const fn auxiliary_deferred(&self) -> bool {
+		self.auxiliary_deferred
+	}
+
+	/// Marks all independently stored statistics parts as present.
+	pub(crate) fn mark_auxiliary_complete(&mut self) {
+		self.auxiliary_deferred = false;
 	}
 
 	pub(crate) fn publish_revision(&mut self, revision: u64) {

@@ -401,7 +401,7 @@ fn persistent_session_rolls_back_after_outer_preflight_failure() {
 }
 
 #[test]
-fn measures_disjoint_serializable_gql_writer_aborts() {
+fn disjoint_serializable_gql_writers_commit_without_allocator_conflicts() {
 	for workers in [1_usize, 2, 4, 8] {
 		let store = Datastore::in_memory();
 		store.execute("DEFINE CLASS person TYPE NODE;", &Object::new()).unwrap();
@@ -438,7 +438,7 @@ fn measures_disjoint_serializable_gql_writer_aborts() {
 			 elapsed={elapsed:?}",
 			workers * 16
 		);
-		assert!(aborts < workers * 16);
+		assert_eq!(aborts, 0);
 	}
 }
 

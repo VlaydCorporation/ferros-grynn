@@ -3,14 +3,10 @@
 use std::{
 	alloc::{GlobalAlloc, Layout, System},
 	cell::Cell,
-	sync::{
-		LazyLock,
-		atomic::{AtomicI64, Ordering},
-	},
+	sync::atomic::{AtomicI64, Ordering},
 };
 
 use super::registry;
-use crate::utils::ParseBytes;
 
 static GLOBAL_TOTAL_BYTES: AtomicI64 = AtomicI64::new(0);
 
@@ -24,35 +20,6 @@ thread_local! {
 
 	/// Recursion depth counter to prevent infinite recursion with nested allocations
 	static RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
-}
-
-// FIXME: These configuration values should be removed.
-// We advertise that we are embeddable, but configuring solely through
-// environment variables is not acceptable for an embeddable database.
-// Currently these cannot be removed without a major restructure.
-
-// Used in the memory allocator global, so hard to remove.
-
-/// The memory usage threshold before tasks are forced to exit (default: 0
-/// bytes). The default 0 bytes means that there is no memory threshold.
-/// Any other user-set memory threshold will default to at least 1 MiB.
-pub static MEMORY_THRESHOLD: LazyLock<usize> = LazyLock::new(|| {
-	std::env::var("SURREAL_MEMORY_THRESHOLD")
-		.ok()
-		.and_then(|x| parse_memory_threshold(&x))
-		.unwrap_or(0)
-});
-
-/// Parse a `FG_MEMORY_THRESHOLD` value into a byte count. Accepts a plain
-/// byte count or a human-readable size suffix (`b`/`kb`/`kib`/`mb`/`mib`/
-/// `gb`/`gib`, case-insensitive). Returns `None` for unparseable values;
-/// `Some(0)` for `"0"` (disables the threshold); otherwise `Some(n)` floored
-/// to 1 MiB.
-fn parse_memory_threshold(value: &str) -> Option<usize> {
-	value.parse_bytes::<usize>().ok().map(|x| match x {
-		0 => 0,
-		x => x.max(1024 * 1024),
-	})
 }
 
 struct ThreadState {
@@ -134,14 +101,6 @@ impl<A: GlobalAlloc> TrackAlloc<A> {
 		THREAD_STATE.with(|state| {
 			state.flush_to_global();
 		});
-	}
-
-	/// Checks if the current usage exceeds a configured threshold.
-	pub fn is_beyond_threshold(&self) -> bool {
-		match *MEMORY_THRESHOLD {
-			0 => false,
-			v => self.memory_allocated() > v,
-		}
 	}
 
 	fn add(&self, size: usize) {

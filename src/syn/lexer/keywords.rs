@@ -198,10 +198,3 @@ pub(in crate::syn) const WHILE: &str = "WHILE";
 /// Statement starts recognized only to return the explicit unsupported status.
 pub(in crate::syn) const UNSUPPORTED_STATEMENTS: &[&str] =
 	&["SHOW", "KILL", "REBUILD", "COMPACT", "LIVE"];
-
-/// MATCH modifiers recognized only to return the explicit unsupported status.
-pub(in crate::syn) const UNSUPPORTED_MATCH_MODIFIERS: &[&str] = &[KEEP];
-
-/// SELECT clauses recognized only to return the explicit unsupported status.
-pub(in crate::syn) const UNSUPPORTED_SELECT_CLAUSES: &[&str] =
-	&["WITH", "SPLIT", "GROUP", "ORDER", "FETCH", "OMIT", "TEMPFILES"];

@@ -26,6 +26,9 @@ pub(crate) struct IndexBinding<Address> {
 	pub(crate) name: Text,
 	pub(crate) kind: ClassIndexKind,
 	pub(crate) fields: Vec<IndexField>,
+	/// Whether immutable durable entries remain the read authority until the
+	/// first transaction-private mutation rebuilds mutable index state.
+	pub(crate) deferred: bool,
 	pub(crate) entries: IndexEntries<Address>,
 }
 
@@ -59,25 +62,6 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 				entries.get(key).into_iter().flat_map(BTreeSet::iter).copied().collect()
 			}
 			Self::Unique(entries) => entries.get(key).copied().into_iter().collect(),
-			Self::Count(_) => Vec::new(),
-		}
-	}
-
-	/// Returns scalar posting groups in canonical encoded-key order.
-	pub(crate) fn groups(
-		&self,
-		lower: Bound<Vec<u8>>,
-		upper: Bound<Vec<u8>>,
-	) -> Vec<(Vec<u8>, Vec<Address>)> {
-		match self {
-			Self::Standard(entries) => entries
-				.range((lower, upper))
-				.map(|(key, addresses)| (key.clone(), addresses.iter().copied().collect()))
-				.collect(),
-			Self::Unique(entries) => entries
-				.range((lower, upper))
-				.map(|(key, address)| (key.clone(), vec![*address]))
-				.collect(),
 			Self::Count(_) => Vec::new(),
 		}
 	}
@@ -233,6 +217,17 @@ pub(crate) struct IndexStoreRoot {
 }
 
 impl IndexStoreRoot {
+	/// Returns whether any explicit index still uses its immutable durable
+	/// side-file instead of transaction-private mutable entries.
+	pub(crate) fn has_deferred_indexes(&self) -> bool {
+		self.base.values().any(|binding| binding.deferred)
+			|| self
+				.graphs
+				.values()
+				.flat_map(|graph| graph.explicit.values())
+				.any(|binding| binding.deferred)
+	}
+
 	/// Removes only schema-defined indexes while preserving class and label
 	/// lookup structures required by import DML.
 	pub(crate) fn defer_explicit_indexes(&mut self, retain_unique: bool) {

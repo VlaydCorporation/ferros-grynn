@@ -12,6 +12,7 @@ use std::{
 use ferros_grynn::{
 	datastore::{CheckpointMode, ClassSchema, Datastore, IoMode, LocalOptions},
 	graph::{AtomKind, EdgeTopology, GraphKind, GraphRef},
+	storage_engine_prototype_api::clear_resident_pages,
 	values::{Object, PropertyMap, RecordId, Uuid, Value},
 };
 
@@ -264,7 +265,7 @@ fn measure(
 	let mut wall_time = Duration::ZERO;
 	let mut cpu_time = Duration::ZERO;
 	for _ in 0..queries_per_sample {
-		let _cleared = store.prototype_clear_resident_pages()?;
+		let _cleared = clear_resident_pages(&store)?;
 		let timer = MeasurementTimer::start()?;
 		let value = store.execute(QUERY, &variables)?.remove(0).result?.into_parts().0;
 		let timing = timer.finish()?;
@@ -343,7 +344,7 @@ fn transport_metrics(
 	candidate: Candidate,
 ) -> Result<TransportMetrics, Box<dyn Error>> {
 	let store = Datastore::open_local(&fixture.directory.0, local_options(candidate.mode()))?;
-	let _cleared = store.prototype_clear_resident_pages()?;
+	let _cleared = clear_resident_pages(&store)?;
 	let value = store.execute(EXPLAIN, &variables(fixture))?.remove(0).result?.into_parts().0;
 	let Value::Object(root) = value else {
 		return Err("EXPLAIN FORMAT JSON did not return an object".into());

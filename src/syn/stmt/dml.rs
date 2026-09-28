@@ -22,6 +22,7 @@ pub struct CreateStatement {
 pub struct MutateStatement {
 	pub targets: Vec<DmlTarget>,
 	pub graph: Option<Identifier>,
+	/// Label mutation: omitted clause, explicit `LABEL NONE`, or a new label.
 	pub label: Option<Option<Identifier>>,
 	pub data: Option<DmlData>,
 	pub filter: Option<Expr>,

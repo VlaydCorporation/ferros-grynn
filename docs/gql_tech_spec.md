@@ -145,15 +145,15 @@ ClassScan / RecordLookup
 3. Деградация планов — не сюрприз. Есть управляемые рамки: что может поменяться автоматически, а что — только явным действием.
 4. Режимы деградации описаны заранее: что происходит на пике, что отбрасывается первым, что приоритизируется.
 
-| Компонент         | Граница                                            | При нарушении                                         |
-|-------------------|----------------------------------------------------|-------------------------------------------------------|
-| BufferPool        | `FG_PAGE_BUFFER_PAGES` — RAM-бюджет на кеш страниц | Eviction (Clock-Pro), WAL-first flush                 |
-| TxWriteSet        | `FG_TX_WRITE_SET_MAX_BYTES` = 256 МиБ              | Abort до публикации; import ротирует private segments |
-| Statement timeout | `statement_timeout_ms` / `TIMEOUT` clause          | Cancel query                                          |
-| Snapshot age      | `max_snapshot_age`                                 | Force-close stale snapshots                           |
-| Checkpoint        | `CheckpointPolicy` = 25% / 300 секунд              | Passive backfill; Restart — явно                      |
-| Path expansion    | `FG_PATH_MAX_DEPTH` (30), `MAXDEPTH`               | Обрыв path-finding                                    |
-| Graph assembly    | `QueryExecutionOptions.max_graph_nodes/edges`      | Обрыв без partial result/publication                  |
+| Компонент         | Граница                                                  | При нарушении                                            |
+|-------------------|----------------------------------------------------------|----------------------------------------------------------|
+| HybridReadEngine  | `LocalOptions.buffer_pool_pages` — общий resident budget | R8 eviction; transport bypass не загрязняет resident set |
+| TxWriteSet        | `LocalOptions.max_write_set_bytes` = 256 МиБ             | Abort до публикации; import ротирует private segments    |
+| Statement timeout | `QueryExecutionOptions` / `TIMEOUT` clause               | Cancel query                                             |
+| Snapshot age      | `max_snapshot_age`                                       | Force-close stale snapshots                              |
+| Checkpoint        | `CheckpointPolicy` = 25% / 300 секунд                    | Passive backfill; Restart — явно                         |
+| Path expansion    | `FG_PATH_MAX_DEPTH` (30), `MAXDEPTH`                     | Обрыв path-finding                                       |
+| Graph assembly    | `QueryExecutionOptions.max_graph_nodes/edges`            | Обрыв без partial result/publication                     |
 
 Fail-closed неприятнее в моменте, но честнее в эксплуатации: система сразу предлагает retry, circuit breaker, fallback или отказ.
 
@@ -1263,13 +1263,12 @@ publication.
 
 | Настройка                                         | Назначение                           | Default       |
 |---------------------------------------------------|--------------------------------------|---------------|
-| `FG_PAGE_BUFFER_PAGES`                            | размер buffer pool (страниц)         | 4096 (64 MiB) |
+| `LocalOptions.buffer_pool_pages`                  | общий resident budget (16-КиБ pages) | 4096 (64 MiB) |
 | `FG_WAL_SEGMENT_SIZE`                             | размер WAL-сегмента                  | 64 MiB        |
 | `LocalOptions.checkpoint`                         | доля WAL-only страниц / интервал     | 25% / 300 sec |
-| `FG_TX_WRITE_SET_MAX_BYTES`                       | atom-delta budget транзакции         | 256 MiB       |
-| `FG_MAX_SNAPSHOT_AGE_SEC`                         | максимальный возраст snapshot        | 300           |
+| `LocalOptions.max_write_set_bytes`                | atom-delta budget транзакции         | 256 MiB       |
+| `LocalOptions.max_snapshot_age`                   | максимальный возраст snapshot        | 300 sec       |
 | `FG_LABEL_DICT_CACHE_MB`                          | LRU-кеш словаря меток                | 32            |
-| `FG_PROPS_COMPRESS_THRESHOLD`                     | порог LZ4-сжатия props               | 512           |
 | `FG_HNSW_CACHE_SIZE`                              | кеш HNSW                             | 256 MiB       |
 | `FG_STATS_AUTO_ANALYZE_DIRTY`                     | авто-`ANALYZE`                       | 0.10          |
 | `FG_PATH_MAX_DEPTH`                               | макс. глубина path-finding           | 30            |

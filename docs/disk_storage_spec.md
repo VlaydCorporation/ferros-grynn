@@ -727,8 +727,13 @@ Base secondary indexes размещаются в AtomStore; explicit effective i
 
 Путь поколения и каждый `DataFileId` публикуются только через каталоги; пользовательские имена
 в filesystem path не попадают. `ordinal`, `class_id` и `label_id` — проверенные числовые
-компоненты. Старые поколения удаляются startup-GC после захвата `db.lock` и только если они
-недостижимы из durable catalog.
+компоненты. После durable catalog/WAL publication заменённое поколение переходит в runtime
+retirement. Exact physical snapshots удерживают `Arc` зарегистрированных файлов; cleanup хранит
+только `Weak` markers и удаляет UUID-каталоги после освобождения последнего snapshot. Ошибка
+удаления после publication не отменяет commit: каталог остаётся pending, счётчик ошибки виден в
+`Datastore::local_storage_status()`, а следующая COW publication или explicit checkpoint повторяет
+операцию. Startup-GC после захвата `db.lock` независимо удаляет crash-orphans, недостижимые из
+durable catalog. Без живых snapshots и OS errors число поколений не растёт от COW churn.
 
 Primary, standard/unique scalar, class membership, Label и Count layouts входят в target core
 format v1. Specialized index layouts остаются отдельными draft side-files. Их добавление после
@@ -1052,7 +1057,8 @@ derived-index codecs §20.8. Точные `AtomHotSlot`, `NodeHotSlot` и `EdgeH
 
 ```
 0x0001  FLAG_DIRTY        -- в памяти изменена, не сброшена на диск (runtime)
-0x0002  FLAG_COMPRESSED   -- payload сжат LZ4 (для PropHeap при sparse props)
+0x0002  FLAG_COMPRESSED   -- зарезервировано для versioned compressed layout;
+                           -- GA-core v1 отклоняет этот flag во всех codecs
 0x0004  FLAG_OVERFLOW     -- продолжение overflow-цепочки
 0x0008  FLAG_LEAF         -- leaf в B+tree
 0x0010  FLAG_SCHEMA       -- страница схемы (не данные)
@@ -1497,11 +1503,14 @@ runtime `PropertyMap` семантически незначим.
 
 ### 13.3. Сжатие
 
-Если `FLAG_COMPRESSED = 1` в PageHeader, bytes `[free_end..PAGE_SIZE]` сжаты LZ4 frame.
-Байты `[32..40]` сжимать нельзя, так как это метаданные, и их сжатие не позволит прочитать их быстро без декомпрессии всей страницы.
-Применяется при `serialized_size > FG_PROPS_COMPRESS_THRESHOLD` (default 512 байт).
-Сжатие опциональное; решение принимается при записи страницы. 
-Сжатие также применимо к PropLargeChunkPage.
+GA-core format v1 хранит property records без сжатия. `PropHeapPage` принимает только empty
+flags, а `PropLargeChunkPage` — только `FLAG_OVERFLOW`; `FLAG_COMPRESSED` в обоих случаях является
+corruption. Прежний draft-контракт LZ4 не имел production codec, discriminator с длиной
+распакованного payload и malformed/recovery gate, поэтому удалён до freeze, а не оставлен второй
+интерпретацией тех же bytes.
+
+Сжатие может появиться только в format v2 либо в отдельной versioned side-file family после
+paired size/CPU/p99/RSS gate. Core-v1 decoder не пытается угадать или распаковать такой payload.
 
 ### 13.4. Мультистраничные записи (Large Objects)
 
@@ -2744,40 +2753,23 @@ O(k) где k — длина ключа. Не предназначен для д
 
 #### 20.2.9. Сжатие страниц индекса
 
-Stage-7 core layout хранит полные encoded keys и требует только `FLAG_LEAF` для листьев;
-`FLAG_COMPRESSED` у B+tree pages пока недопустим. Описанные ниже два механизма являются
-кандидатами оптимизации до format-v1 freeze, а не альтернативной интерпретацией уже записанной
-страницы. Их включение требует явного page-layout discriminator, golden vectors и сравнения
-размера/CPU на representative string/composite indexes.
+Замороженный core-v1 B+tree хранит полные encoded keys. Internal pages имеют empty flags,
+Standard/Unique/primary leaves — только `FLAG_LEAF`; `FLAG_COMPRESSED` является corruption.
+Immutable builder заполняет доступную page capacity, mutable writer сохраняет измеренную policy
+`90%` для primary/Unique и `80%` для Standard.
 
-Два рассматриваемых механизма — структурное сжатие ключей и блочное сжатие страницы. Они
-складываются и решают разные задачи.
+Перед freeze ignored profiling probe сравнил current full-key layout с точным page-prefix
+prototype на 100 000 production-encoded string/composite keys. Prefix layout уменьшал page count,
+но добавлял отдельный codec, существенно более дорогой packing pass и не имел end-to-end
+доказательства point/range read, mutation, recovery и p99. Whole-page compression дополнительно
+требует полной распаковки, нового dependency/config/discriminator и не сохраняет direct lookup в
+page bytes. Поэтому оба draft-кандидата удалены, а единственным format-v1 codec остаётся
+проверенный full-key layout.
 
-**Префиксное сжатие ключей (предпочтительный кандидат).** Ключи в листе отсортированы, поэтому соседние обычно имеют длинный общий префикс — особенно строковые и составные (§20.2.6). В листе хранится общий префикс всех ключей страницы один раз, а каждая запись содержит только суффикс:
-
-```
-[..]        page_prefix_len (u16)
-[..]        page_prefix (page_prefix_len байт)
-[записи]    для каждого ключа: suffix_len (u16) + suffix_bytes
-```
-
-Это **не** LZ4 и вообще не универсальный компрессор: сжатие структурное и order-preserving, поэтому по сжатой странице по-прежнему работает бинарный поиск **без распаковки** — сравнивается только суффикс. Стоимость на чтении нулевая, выигрыш для строковых ключей часто двукратный.
-
-Существенно: префиксное сжатие дёшево при bulk-сборке (§20.13), где лист формируется целиком и общий префикс известен сразу, и дорого при построчной вставке — вставка в середину сжатого листа может изменить общий префикс и потребовать перекодирования всей страницы. Если кандидат будет принят, естественная точка его применения — сборка и перестроение; stage-7 packer его не записывает.
-
-**Блочное сжатие (вторичный кандидат).** Сжатие всей полезной нагрузки страницы целиком по аналогии с контрактом `PropHeapPage` (§13.3) через `FLAG_COMPRESSED`. Оно требует распаковки страницы перед любым обращением и не включено в текущий B+tree codec.
-
-Если этот вариант будет принят, выбор алгоритма должен принадлежать конкретному class/index, а не быть глобальным: у разных данных разный профиль. Поле `block_compressor` в target `ClassDefinition` пока отсутствует.
-
-| Значение             | Когда уместно                                                                             |
-|----------------------|-------------------------------------------------------------------------------------------|
-| `none`               | Данные уже плотные; приоритет — латентность                                               |
-| `lz4`                | Универсальный компромисс; тот же кодек, что и в `PropHeapPage`                            |
-| `zstd`               | Холодные данные и архивные графы; заметно плотнее LZ4, дороже по CPU                      |
-| `snappy`             | Совместимость с внешними экосистемами                                                     |
-| `fsst`               | Специализированно для коротких строк — сохраняет возможность работы без полной распаковки |
-
-Кодеки, требующие полной распаковки страницы (`lz4`, `zstd`, `snappy`), не сочетаются с чтением произвольной записи «на месте», поэтому для горячих индексов рекомендуется ограничиваться префиксным сжатием.
+Будущий prefix/block codec не может переиспользовать current bytes по эвристике. Он требует
+format v2 либо отдельной versioned side-file family, golden/malformed vectors и paired gate для
+point/range reads, bulk build, mutation/rebuild, recovery, page count, CPU, p99 и RSS. Решение и
+evidence перечислены в `storage_core_v1_freeze_manifest.md`.
 
 ### 20.3. Count Index
 
@@ -4140,25 +4132,28 @@ TensorCachePage инвалидируется при любом изменени�
 | `FG_ADJ_INLINE_UNDIR`      | usize | 2       | Inline undir-adj per node (NodeHotSlot.adj_undir[])     |
 | `FG_EDGE_INLINE_ENDPOINTS` | usize | 2       | Inline endpoints per edge side (EdgeHotSlot.*_inline[]) |
 
-### 27.2. Runtime-параметры
+### 27.2. Runtime-параметры GA-core
 
-| Параметр                             | Тип    | Default   | Описание                                                                     |
-|--------------------------------------|--------|-----------|------------------------------------------------------------------------------|
-| `FG_PAGE_BUFFER_PAGES`               | usize  | 4096      | Ёмкость BufferPool (4096 × 16 КиБ = 64 МиБ)                                  |
-| `FG_WAL_SEGMENT_SIZE`                | u64    | 67108864  | Размер WAL сегмента до ротации (64 МиБ)                                      |
-| `FG_CHECKPOINT_DIRTY_THRESHOLD`      | f64    | 0.25      | Checkpoint при ≥ N% dirty pages в pool                                       |
-| `FG_CHECKPOINT_INTERVAL_SEC`         | u64    | 300       | Максимальный интервал checkpoint                                             |
-| `FG_LABEL_DICT_CACHE_MB`             | usize  | 32        | In-memory LRU кэш label dictionary                                           |
-| `FG_PROPS_COMPRESS_THRESHOLD`        | usize  | 512       | Сжимать props если serialized_size > N байт                                  |
-| `FG_HNSW_CACHE_SIZE`                 | usize  | 268435456 | HNSW кэш (256 МиБ); §9.6 gql_spec                                            |
-| `FG_COMPACTION_TOMBSTONE_RATIO`      | f64    | 0.20      | Инкрементальный реклейминг страницы при tombstone ratio > N                  |
-| `FG_COMPACT_HOT_TOMBSTONE_RATIO`     | f64    | 0.30      | Полный defrag при tombstone ratio > N                                        |
-| `FG_STATS_AUTO_ANALYZE_DIRTY`        | f64    | 0.10      | Авто-ANALYZE при dirty_fraction > N                                          |
-| `FG_ASYNC_EVENT_PROCESSING_INTERVAL` | u64    | 5000      | Интервал обработки async событий (мс)                                        |
-| `FG_CHANGEFEED_PURGE_INTERVAL_SEC`   | u64    | 3600      | Интервал очистки старых changefeed файлов                                    |
-| `FG_PATH_MAX_DEPTH`                  | usize  | 30        | Максимальная глубина путей                                                   |
-| `FG_TRAVERSAL_READ_YOUR_WRITES`      | bool   | false     | Traversal видит собственные мутации                                          |
-| `FG_TEMPFILES_PATH`                  | String | ""        | Каталог временных файлов: спиллинг сортировок запросов **и** сборки индексов |
+Ferros-Grynn является embedded library: единственная authority — явно переданные Rust options.
+Environment variables не переопределяют их. `Datastore::options()` возвращает выбранные значения,
+`Datastore::local_storage_status()` — effective storage budgets и pressure counters.
+
+| Rust API                                      | Тип/Default       | Описание |
+|-----------------------------------------------|-------------------|----------|
+| `LocalOptions::buffer_pool_pages`             | `usize` / 4096    | Общий resident budget в 16-КиБ frames для всех файлов и версий |
+| `LocalOptions::checkpoint.unbackfilled_page_percent` | `u8` / 25 | Passive checkpoint threshold как доля resident frames |
+| `LocalOptions::checkpoint.interval`           | 300 sec           | Максимальный интервал между checkpoint attempts при наличии WAL-only pages |
+| `LocalOptions::max_snapshot_age`              | 300 sec           | Максимальный возраст MVCC snapshot |
+| `LocalOptions::max_write_set_bytes`           | 256 MiB           | Логический precommit write-set ceiling |
+| `QueryExecutionOptions::barrier_memory_bytes` | 256 MiB           | Общий statement budget join/group/order/distinct spill |
+| `QueryExecutionOptions::temporary_directory`  | `None`            | Явный query scratch root; иначе database-owned/system temp |
+
+Transient transport budget вычисляется как `min(288, floor(buffer_pool_pages / 10))`; scatter,
+prefetch, QD и cache policy не являются пользовательскими knobs. Process-wide allocation tracking
+служит диагностикой и не имеет скрытого environment-configured admission threshold.
+
+Имена `FG_*` в следующих разделах обозначают compile-time constants либо будущие admin settings
+этапов 20+, а не читаемые production environment variables GA-core.
 
 **Журнал и checkpoint** (§22–§23)
 

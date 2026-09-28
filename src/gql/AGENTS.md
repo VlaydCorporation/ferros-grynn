@@ -55,6 +55,9 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
 - `ATTACH`, `DETACH`, class-aware `RELATE ... IN GRAPH`, graph-local `LABEL` и
   `RESET` проходят typed IR. Alias, class и label — независимые понятия;
   выводить class из label запрещено.
+- `MutateStatement.label` и соответствующее поле IR намеренно имеют форму
+  `Option<Option<_>>`: внешний `None` означает отсутствие clause и сохранение
+  прежнего label, `Some(None)` — явный `LABEL NONE`, `Some(Some(_))` — замену.
 - MATCH сначала выбирает global exact/class кандидатов, затем пересекает их с
   graph-local label/membership indexes. Старый `(alias:label)` и `FROM graph`
   не являются compatibility grammar.

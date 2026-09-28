@@ -155,6 +155,22 @@ fn first_committer_wins_for_the_same_base_atom() {
 }
 
 #[test]
+fn concurrent_create_of_the_same_record_still_conflicts() {
+	let store = Datastore::in_memory();
+	let mut schema = store.begin();
+	schema.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	schema.commit().unwrap();
+	let identity = record("same");
+	let mut first = store.begin();
+	let mut second = store.begin();
+	first.create_atom(identity.clone(), PropertyMap::new()).unwrap();
+	second.create_atom(identity, PropertyMap::new()).unwrap();
+
+	first.commit().unwrap();
+	assert_eq!(second.commit().unwrap_err().status().code().to_string(), "FG-40001");
+}
+
+#[test]
 fn atom_snapshot_keeps_its_immutable_payload_after_a_private_update() {
 	let (store, identity, _) = setup(0, 0);
 	let mut transaction = store.begin();
@@ -385,7 +401,7 @@ fn commit_rechecks_memberships_added_after_base_preflight() {
 }
 
 #[test]
-fn graph_incidence_prevents_reusing_a_concurrently_claimed_local_slot() {
+fn disjoint_graph_memberships_rebase_snapshot_local_slots() {
 	let (store, first_record, graphs) = setup(0, 1);
 	let second_record = record("second");
 	let mut create = store.begin();
@@ -399,7 +415,77 @@ fn graph_incidence_prevents_reusing_a_concurrently_claimed_local_slot() {
 	assert_eq!(first_local, second_local);
 
 	first.commit().unwrap();
-	assert_eq!(second.commit().unwrap_err().status().code().to_string(), "FG-40001");
+	second.commit().unwrap();
+	let mut read = store.begin();
+	let first_published = read.membership(graphs[0].id(), &first_record).unwrap().unwrap();
+	let second_published = read.membership(graphs[0].id(), &second_record).unwrap().unwrap();
+	assert_ne!(first_published, second_published);
+}
+
+#[test]
+fn rebased_edge_topology_uses_published_endpoint_slots() {
+	let store = Datastore::in_memory();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
+	let graph = seed.define_graph("social", GraphKind::Graph).unwrap();
+	let nodes = [record("a1"), record("a2"), record("b1"), record("b2")];
+	let edges = [
+		RecordId::new("relation", RecordIdPart::String("a".into())).unwrap(),
+		RecordId::new("relation", RecordIdPart::String("b".into())).unwrap(),
+	];
+	for identity in nodes.iter().chain(edges.iter()) {
+		seed.create_atom(identity.clone(), PropertyMap::new()).unwrap();
+	}
+	seed.commit().unwrap();
+
+	let mut first = store.begin();
+	let first_source = first.attach_node(graph.id(), &nodes[0], None, None).unwrap();
+	let first_target = first.attach_node(graph.id(), &nodes[1], None, None).unwrap();
+	first
+		.attach_edge(
+			graph.id(),
+			&edges[0],
+			None,
+			EdgeTopology::directed([first_source], [first_target]),
+			None,
+			None,
+		)
+		.unwrap();
+	let mut second = store.begin();
+	let private_source = second.attach_node(graph.id(), &nodes[2], None, None).unwrap();
+	let private_target = second.attach_node(graph.id(), &nodes[3], None, None).unwrap();
+	second
+		.attach_edge(
+			graph.id(),
+			&edges[1],
+			None,
+			EdgeTopology::directed([private_source], [private_target]),
+			None,
+			None,
+		)
+		.unwrap();
+
+	first.commit().unwrap();
+	second.commit().unwrap();
+	let root = store.inner.current_root();
+	let source_global = root.resolve_atom(&nodes[2]).unwrap();
+	let target_global = root.resolve_atom(&nodes[3]).unwrap();
+	let edge_global = root.resolve_atom(&edges[1]).unwrap();
+	let source = root.membership(graph.id(), source_global).unwrap();
+	let target = root.membership(graph.id(), target_global).unwrap();
+	let edge = root.membership(graph.id(), edge_global).unwrap();
+	let OccurrenceState::Edge {
+		topology,
+		..
+	} = root.occurrence(graph.id(), edge).unwrap().state()
+	else {
+		panic!("relation occurrence must remain an edge");
+	};
+	assert_eq!(
+		topology.local_binary().map(|(left, right, _direction)| (left, right)),
+		Some((source, target))
+	);
 }
 
 #[test]

@@ -303,6 +303,48 @@ fn index_ordered_cursor_seeks_inside_its_exact_snapshot_without_a_spool() {
 }
 
 #[test]
+fn index_cursor_filters_duplicate_anchor_after_reading_its_whole_posting_group() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD rank ON CLASS person TYPE \
+			 int; DEFINE INDEX by_rank ON CLASS person FIELDS rank SCOPE BASE; CREATE person:a \
+			 SET rank = 1; CREATE person:b SET rank = 1; CREATE person:c SET rank = 2;",
+			&Object::new(),
+		)
+		.unwrap();
+
+	for (predicate, expected) in
+		[("rank = 1", &["a", "b"][..]), ("rank >= 1", &["a", "b", "c"][..])]
+	{
+		let mut session = store.session();
+		let mut cursor = None;
+		for (position, key) in expected.iter().enumerate() {
+			let mut variables = Object::new();
+			let continuation = if let Some(cursor) = cursor.take() {
+				variables.insert("cursor", Value::from(cursor));
+				" START AFTER $cursor"
+			} else {
+				""
+			};
+			let source = format!(
+				"SELECT VALUE id FROM person WITH INDEX by_rank WHERE {predicate} ORDER BY rank \
+				 ASC NULLS FIRST LIMIT 1{continuation};"
+			);
+			let result = session.execute(&source, &variables).unwrap().remove(0);
+			assert_eq!(
+				result.result.unwrap().into_parts().0,
+				Value::Array(
+					vec![Value::from(format!("person:{key}").parse::<RecordId>().unwrap())].into()
+				)
+			);
+			cursor = result.continuation;
+			assert_eq!(cursor.is_some(), position + 1 < expected.len());
+		}
+	}
+}
+
+#[test]
 fn standard_index_orders_duplicate_keys_by_public_record_id() {
 	let store = Datastore::in_memory();
 	store

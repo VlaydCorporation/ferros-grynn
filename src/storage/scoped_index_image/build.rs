@@ -98,6 +98,9 @@ where
 	let mut standard = 0_u32;
 	let mut unique = 0_u32;
 	for binding in bindings.values() {
+		if binding.deferred {
+			return Err(invalid("deferred physical index reached the generation builder"));
+		}
 		let (relative_path, root, pages) = match &binding.entries {
 			IndexEntries::Standard(entries) => {
 				let entries = scalar_entries(entries, address)?;

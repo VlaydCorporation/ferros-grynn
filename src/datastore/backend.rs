@@ -20,15 +20,19 @@ use super::{
 	InMemoryOptions,
 	IoMode,
 	LocalOptions,
+	LocalStorageStatus,
+	QueryStatisticsDemand,
 	SchemaId,
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{GraphId, GraphStorageMode},
+	stats::StatisticsStore,
 	storage::{
 		LocalQuerySnapshot,
 		LocalStore,
 		PageIoMode,
+		PhysicalIndexRead,
 		PhysicalTraversalFieldsRead,
 		PhysicalTraversalInnerRead,
 		PhysicalTraversalRead,
@@ -147,6 +151,52 @@ impl StoreInner {
 		}
 	}
 
+	pub(crate) fn has_physical_index(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		index: super::IndexId,
+	) -> bool {
+		match &self.backend {
+			StoreBackend::InMemory => false,
+			StoreBackend::Local(local) => local.has_physical_index(snapshot, index),
+		}
+	}
+
+	pub(crate) fn physical_index(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		index: super::IndexId,
+	) -> FerrosGrynnResult<Option<Arc<PhysicalIndexRead>>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => local.physical_index(snapshot, index),
+		}
+	}
+
+	pub(crate) fn load_planner_statistics(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		database: &DatabaseRoot,
+		demand: &QueryStatisticsDemand,
+		statistics: &mut StatisticsStore,
+	) {
+		if let StoreBackend::Local(local) = &self.backend {
+			local.load_planner_statistics(snapshot, database, demand, statistics);
+		}
+	}
+
+	pub(crate) fn hydrate_statistics(&self, database: &mut DatabaseRoot) -> FerrosGrynnResult<()> {
+		if !database.statistics.auxiliary_deferred() {
+			return Ok(());
+		}
+		match &self.backend {
+			StoreBackend::InMemory => Err(FerrosGrynnError::invalid_storage_file(
+				"in-memory root unexpectedly contains deferred statistics",
+			)),
+			StoreBackend::Local(local) => local.hydrate_statistics(database),
+		}
+	}
+
 	#[allow(
 		clippy::too_many_arguments,
 		reason = "the local frontier contract keeps graph, source, and direction axes explicit"
@@ -203,6 +253,15 @@ impl StoreInner {
 		}
 	}
 
+	pub(crate) fn local_storage_status(&self) -> Option<LocalStorageStatus> {
+		match (&self.backend, self.options) {
+			(StoreBackend::Local(local), DatastoreOptions::Local(options)) => {
+				Some(local.runtime_status(options))
+			}
+			_ => None,
+		}
+	}
+
 	#[cfg(feature = "storage-engine-prototype-api")]
 	pub(crate) fn clear_resident_for_prototype(&self) -> FerrosGrynnResult<usize> {
 		match &self.backend {
@@ -245,6 +304,11 @@ mod query_scratch_tests {
 		assert!(second_root.exists());
 		drop(second);
 		assert!(!second_root.exists());
+	}
+
+	#[test]
+	fn in_memory_has_no_local_storage_status() {
+		assert!(crate::datastore::Datastore::in_memory().local_storage_status().is_none());
 	}
 }
 

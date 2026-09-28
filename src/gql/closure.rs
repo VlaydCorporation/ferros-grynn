@@ -9,8 +9,13 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	mem::size_of,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 };
+
+use parking_lot::Mutex;
 
 use super::ir::LogicalClosure;
 use crate::{
@@ -19,6 +24,55 @@ use crate::{
 };
 
 const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Session-owned closure registry with a lock-free empty fast path.
+#[derive(Debug, Default)]
+pub(crate) struct LanguageClosureState {
+	registry: Mutex<LanguageClosureRegistry>,
+	populated: AtomicBool,
+}
+
+impl LanguageClosureState {
+	pub(crate) fn has_entries(&self) -> bool {
+		self.populated.load(Ordering::Acquire)
+	}
+
+	pub(in crate::gql) fn register(
+		&self,
+		plan: &LogicalClosure,
+		slots: &[Value],
+		statement_nonce: u64,
+	) -> FerrosGrynnResult<Closure> {
+		let closure = self.registry.lock().register(plan, slots, statement_nonce)?;
+		self.populated.store(true, Ordering::Release);
+		Ok(closure)
+	}
+
+	pub(crate) fn finish_statement<'a>(
+		&self,
+		statement_nonce: u64,
+		roots: impl IntoIterator<Item = &'a Value>,
+	) {
+		if !self.has_entries() {
+			return;
+		}
+		let mut registry = self.registry.lock();
+		registry.finish_statement(statement_nonce, roots);
+		self.populated.store(!registry.entries.is_empty(), Ordering::Release);
+	}
+
+	pub(in crate::gql) fn resolve(
+		&self,
+		closure: &Closure,
+	) -> FerrosGrynnResult<LanguageClosureEntry> {
+		self.registry.lock().resolve(closure)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn retained_bytes(&self) -> usize {
+		self.registry.lock().retained_bytes()
+	}
+}
 
 /// One immutable language closure and the lexical values captured at creation.
 #[derive(Debug, Clone)]
@@ -161,7 +215,7 @@ impl LanguageClosureRegistry {
 	}
 
 	#[cfg(test)]
-	pub(crate) fn retained_bytes(&self) -> usize {
+	fn retained_bytes(&self) -> usize {
 		self.retained_bytes
 	}
 }

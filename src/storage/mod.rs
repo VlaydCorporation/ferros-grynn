@@ -35,6 +35,10 @@ use direct_io as direct;
 pub(crate) use local_store::{
 	LocalQuerySnapshot,
 	LocalStore,
+	PhysicalIndexAtom,
+	PhysicalIndexEntries,
+	PhysicalIndexRead,
+	PhysicalScalarGroup,
 	PhysicalTraversalFieldsRead,
 	PhysicalTraversalInnerRead,
 	PhysicalTraversalRead,
@@ -44,6 +48,20 @@ pub use page_io::PageIoMode;
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]
 pub mod prototype_api {
+	/// Clears resident frames before an isolated prototype measurement.
+	///
+	/// This non-default measurement boundary is not a supported datastore API.
+	///
+	/// # Errors
+	///
+	/// Returns an arena lifecycle error if a resident mapping changes while it
+	/// is being removed.
+	pub fn clear_resident_pages(
+		store: &crate::datastore::Datastore,
+	) -> crate::gql_status::FerrosGrynnResult<usize> {
+		store.inner.clear_resident_for_prototype()
+	}
+
 	/// Builds a prototype storage error while retaining its native source.
 	pub fn storage_io_failure_with_source<E>(
 		operation: impl Into<String>,

@@ -15,7 +15,12 @@ mod schema;
 mod select;
 mod traversal;
 
-use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
+use std::{
+	cell::RefCell,
+	rc::Rc,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use adapter::TransactionRead;
 #[cfg(test)]
@@ -178,7 +183,7 @@ fn execute_parsed_statement<Read: QueryRead>(
 	let statement = logical.statements.first().ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("Analyzed statement produced no executable IR.")
 	})?;
-	execute_logical_statement(read, source, statement, &mut slots, bindings, control)
+	execute_logical_statement(read, source, statement, &mut slots, bindings, control, false)
 }
 
 fn execute_logical_program<Read: QueryRead>(
@@ -191,8 +196,9 @@ fn execute_logical_program<Read: QueryRead>(
 	let mut slots = initialize_slots(logical, bindings);
 	let mut results = Vec::with_capacity(logical.statements.len());
 	for statement in &logical.statements {
-		let result =
-			execute_logical_statement(read, source, statement, &mut slots, bindings, control)?;
+		let result = execute_logical_statement(
+			read, source, statement, &mut slots, bindings, control, true,
+		)?;
 		let failed = result.result.is_err();
 		results.push(result);
 		if failed {
@@ -209,11 +215,12 @@ fn execute_logical_statement<Read: QueryRead>(
 	slots: &mut [Value],
 	bindings: &mut Object,
 	control: &ExecutionControl,
+	measure_elapsed: bool,
 ) -> FerrosGrynnResult<QueryResult> {
 	if control.deterministic() {
 		crate::gql::optimizer::validate_deterministic_statement(statement)?;
 	}
-	let start = Instant::now();
+	let start = measure_elapsed.then(Instant::now);
 	let kind = logical_statement_kind(statement);
 	let mut runtime = ControlRuntime::default();
 	let result =
@@ -238,7 +245,7 @@ fn execute_logical_statement<Read: QueryRead>(
 	};
 	Ok(QueryResult {
 		kind,
-		elapsed: start.elapsed(),
+		elapsed: start.map_or(Duration::ZERO, |start| start.elapsed()),
 		result,
 		continuation,
 	})

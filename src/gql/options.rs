@@ -21,7 +21,7 @@ use super::{
 	ExecutionMode,
 	ParserSettings,
 	QueryCursor,
-	closure::{LanguageClosureEntry, LanguageClosureRegistry},
+	closure::{LanguageClosureEntry, LanguageClosureState},
 	cursor::CursorRuntime,
 	ir::LogicalClosure,
 };
@@ -140,7 +140,7 @@ pub(crate) struct ExecutionControl {
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
 	continuation: Arc<Mutex<Option<QueryCursor>>>,
 	pending_index_seek: Arc<Mutex<Option<QueryCursor>>>,
-	closure_registry: Arc<Mutex<LanguageClosureRegistry>>,
+	closure_registry: Arc<LanguageClosureState>,
 	execution_mode: ExecutionMode,
 	user_seed: u64,
 	parameter_fingerprint: u64,
@@ -357,6 +357,15 @@ impl ExecutionControl {
 		timeout: Option<Duration>,
 		cursors: Option<Arc<Mutex<CursorRuntime>>>,
 	) -> Self {
+		Self::with_runtime(options, timeout, cursors, Arc::new(LanguageClosureState::default()))
+	}
+
+	pub(crate) fn with_runtime(
+		options: &QueryExecutionOptions,
+		timeout: Option<Duration>,
+		cursors: Option<Arc<Mutex<CursorRuntime>>>,
+		closure_registry: Arc<LanguageClosureState>,
+	) -> Self {
 		let timeout = match (options.statement_timeout, timeout) {
 			(Some(left), Some(right)) => Some(left.min(right)),
 			(Some(value), None) | (None, Some(value)) => Some(value),
@@ -389,7 +398,7 @@ impl ExecutionControl {
 			cursors,
 			continuation: Arc::new(Mutex::new(None)),
 			pending_index_seek: Arc::new(Mutex::new(None)),
-			closure_registry: Arc::new(Mutex::new(LanguageClosureRegistry::default())),
+			closure_registry,
 			execution_mode: ExecutionMode::BestEffort,
 			user_seed: options.deterministic_seed,
 			parameter_fingerprint: 0,
@@ -405,19 +414,13 @@ impl ExecutionControl {
 		parameters: &Object,
 	) -> Self {
 		self.execution_mode = execution_mode;
-		self.parameter_fingerprint = crate::gql::optimizer::canonical_hash(
-			crate::gql::optimizer::PLAN_ENCODING_VERSION,
-			b"query-parameters",
-			parameters,
-		);
-		self
-	}
-
-	pub(crate) fn with_closure_registry(
-		mut self,
-		registry: Arc<Mutex<LanguageClosureRegistry>>,
-	) -> Self {
-		self.closure_registry = registry;
+		if self.deterministic() {
+			self.parameter_fingerprint = crate::gql::optimizer::canonical_hash(
+				crate::gql::optimizer::PLAN_ENCODING_VERSION,
+				b"query-parameters",
+				parameters,
+			);
+		}
 		self
 	}
 
@@ -426,7 +429,7 @@ impl ExecutionControl {
 		plan: &LogicalClosure,
 		slots: &[Value],
 	) -> FerrosGrynnResult<Closure> {
-		self.closure_registry.lock().register(plan, slots, self.statement_nonce)
+		self.closure_registry.register(plan, slots, self.statement_nonce)
 	}
 
 	pub(crate) const fn statement_nonce(&self) -> u64 {
@@ -437,7 +440,7 @@ impl ExecutionControl {
 		&self,
 		closure: &Closure,
 	) -> FerrosGrynnResult<LanguageClosureEntry> {
-		self.closure_registry.lock().resolve(closure)
+		self.closure_registry.resolve(closure)
 	}
 
 	pub(crate) const fn deterministic(&self) -> bool {
@@ -818,6 +821,9 @@ impl ExecutionControl {
 		&self,
 		transaction: Transaction,
 	) -> FerrosGrynnResult<Option<Transaction>> {
+		if self.cursors.is_none() {
+			return Ok(Some(transaction));
+		}
 		let Some(cursor) = self.pending_index_seek.lock().take() else {
 			return Ok(Some(transaction));
 		};
@@ -831,6 +837,7 @@ impl ExecutionControl {
 	}
 
 	pub(crate) fn take_continuation(&self) -> Option<QueryCursor> {
+		self.cursors.as_ref()?;
 		self.continuation.lock().take()
 	}
 

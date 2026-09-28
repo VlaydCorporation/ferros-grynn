@@ -463,6 +463,17 @@ impl HybridReadEngine {
 		self.arena.resident_count()
 	}
 
+	/// Returns frames awaiting bounded read-epoch reclamation.
+	pub fn retired_resident_count(&self) -> usize {
+		self.arena.retired_count()
+	}
+
+	/// Returns fixed arena metadata bytes, excluding dynamic map and allocator
+	/// overhead.
+	pub fn fixed_metadata_bytes(&self) -> usize {
+		self.arena.fixed_metadata_bytes()
+	}
+
 	/// Returns miss, coalescing, eviction, and capacity-wait counts.
 	pub fn slow_path_counts(&self) -> (u64, u64, u64, u64) {
 		self.arena.slow_path_counts()

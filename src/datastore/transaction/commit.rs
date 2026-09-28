@@ -1,5 +1,5 @@
 use std::{
-	collections::BTreeSet,
+	collections::{BTreeMap, BTreeSet},
 	sync::{Arc, atomic::Ordering},
 };
 
@@ -7,8 +7,77 @@ use super::{CommitResult, Mutation, Transaction};
 use crate::{
 	datastore::{ConflictKey, DatabaseRoot, IsolationLevel, consts::EFFECTIVE_FANOUT_WRITE_BYTES},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::GraphId,
+	graph::{AtomId, EdgeEndpoint, EdgeTopology, GraphId, remap_topology},
 };
+
+/// Commit-local address translation for allocations made from an older
+/// immutable root. Logical conflict checks run before this map is created.
+#[derive(Default)]
+pub(super) struct ReplayRemap {
+	globals: BTreeMap<super::GlobalAtomId, super::GlobalAtomId>,
+	locals: BTreeMap<(GraphId, AtomId), AtomId>,
+}
+
+impl ReplayRemap {
+	fn global(&self, id: super::GlobalAtomId) -> super::GlobalAtomId {
+		self.globals.get(&id).copied().unwrap_or(id)
+	}
+
+	fn local(&self, graph: GraphId, id: AtomId) -> AtomId {
+		self.locals.get(&(graph, id)).copied().unwrap_or(id)
+	}
+
+	fn conflict(&self, key: ConflictKey) -> ConflictKey {
+		match key {
+			ConflictKey::BaseAtom(global) => ConflictKey::BaseAtom(self.global(global)),
+			ConflictKey::GraphMembership(graph, global) => {
+				ConflictKey::GraphMembership(graph, self.global(global))
+			}
+			ConflictKey::GraphOverlay(graph, global) => {
+				ConflictKey::GraphOverlay(graph, self.global(global))
+			}
+			ConflictKey::GraphIncidence(graph, local) => {
+				ConflictKey::GraphIncidence(graph, self.local(graph, local))
+			}
+			other => other,
+		}
+	}
+
+	fn topology(&self, graph: GraphId, topology: &EdgeTopology) -> FerrosGrynnResult<EdgeTopology> {
+		let ids = topology
+			.endpoints()
+			.filter_map(|endpoint| match endpoint {
+				EdgeEndpoint::Local(local) => Some(*local),
+				EdgeEndpoint::Nested(qualified) => qualified.scope().first().copied(),
+			})
+			.map(|local| (local, self.local(graph, local)))
+			.collect();
+		remap_topology(topology, &ids)
+	}
+
+	fn occurrence_state(
+		&self,
+		graph: GraphId,
+		state: &super::OccurrenceState,
+	) -> FerrosGrynnResult<super::OccurrenceState> {
+		Ok(match state {
+			super::OccurrenceState::Node {
+				nested_graph,
+			} => super::OccurrenceState::Node {
+				nested_graph: *nested_graph,
+			},
+			super::OccurrenceState::Edge {
+				topology,
+				weight,
+				transition_graph,
+			} => super::OccurrenceState::Edge {
+				topology: self.topology(graph, topology)?,
+				weight: *weight,
+				transition_graph: *transition_graph,
+			},
+		})
+	}
+}
 
 impl Transaction {
 	/// Revalidates the complete private root before the normal atomic commit.
@@ -62,14 +131,17 @@ impl Transaction {
 			FerrosGrynnError::serialization_failure(self.id, "the commit clock is exhausted")
 		})?;
 		let mut next = (*current).clone();
+		store.inner.hydrate_statistics(&mut next)?;
 		let affected_graphs = self.affected_graphs(&current);
-		Self::apply_mutations(&mut next, &self.mutations, commit_ts).map_err(|error| {
-			FerrosGrynnError::serialization_failure(
-				self.id,
-				"a transaction prerequisite changed before commit",
-			)
-			.with_cause(error)
-		})?;
+		let remap = Self::apply_mutations(&mut next, &self.mutations, commit_ts, true).map_err(
+			|error| {
+				FerrosGrynnError::serialization_failure(
+					self.id,
+					"a transaction prerequisite changed before commit",
+				)
+				.with_cause(error)
+			},
+		)?;
 		next.advance_identity_clocks(
 			store.inner.next_schema_id.load(Ordering::Relaxed),
 			store.inner.next_graph_id.load(Ordering::Relaxed),
@@ -83,7 +155,7 @@ impl Transaction {
 		}
 		next.commit_ts = commit_ts;
 		for key in self.writes.keys() {
-			next.mark_version(*key, commit_ts);
+			next.mark_version(remap.conflict(*key), commit_ts);
 		}
 		for key in &self.range_writes {
 			next.mark_version(*key, commit_ts);
@@ -155,7 +227,9 @@ impl Transaction {
 		self.validate_write_requirements(current)?;
 		if self.options.isolation == IsolationLevel::Serializable && !self.mutations.is_empty() {
 			for (key, observed) in self.reads.lock().iter() {
-				if current.version(*key) != *observed {
+				if current.version(*key) != *observed
+					&& !self.is_private_allocation_collision(current, *key)
+				{
 					return Err(FerrosGrynnError::serialization_failure(
 						self.id,
 						"a logical value read from the snapshot was concurrently changed",
@@ -179,7 +253,9 @@ impl Transaction {
 		current: &DatabaseRoot,
 	) -> FerrosGrynnResult<()> {
 		for (key, observed) in self.writes.iter().chain(&self.requirements) {
-			if current.version(*key) != *observed {
+			if current.version(*key) != *observed
+				&& !self.is_private_allocation_collision(current, *key)
+			{
 				return Err(FerrosGrynnError::serialization_failure(
 					self.id,
 					"a logical write target or structural prerequisite changed",
@@ -187,6 +263,53 @@ impl Transaction {
 			}
 		}
 		Ok(())
+	}
+
+	/// Distinguishes a stale physical address chosen by a private root from a
+	/// real logical conflict. The latter remains a serialization failure.
+	fn is_private_allocation_collision(&self, current: &DatabaseRoot, key: ConflictKey) -> bool {
+		let created_record = |global| {
+			self.mutations.iter().find_map(|mutation| match mutation {
+				Mutation::CreateAtom {
+					id,
+					record_id,
+					..
+				} if *id == global => Some(record_id),
+				_ => None,
+			})
+		};
+		match key {
+			ConflictKey::BaseAtom(global)
+			| ConflictKey::GraphMembership(_, global)
+			| ConflictKey::GraphOverlay(_, global) => {
+				created_record(global).is_some_and(|record| current.resolve_atom(record).is_none())
+			}
+			ConflictKey::GraphIncidence(graph, local) => self
+				.mutations
+				.iter()
+				.find_map(|mutation| match mutation {
+					Mutation::AttachNode {
+						graph: candidate_graph,
+						local: candidate_local,
+						global,
+						..
+					}
+					| Mutation::AttachEdge {
+						graph: candidate_graph,
+						local: candidate_local,
+						global,
+						..
+					} if *candidate_graph == graph && *candidate_local == local => Some(*global),
+					_ => None,
+				})
+				.is_some_and(|global| {
+					created_record(global).map_or_else(
+						|| current.membership(graph, global).is_none(),
+						|record| current.resolve_atom(record).is_none(),
+					)
+				}),
+			_ => false,
+		}
 	}
 
 	fn validate_commit_fanout(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
@@ -207,8 +330,12 @@ impl Transaction {
 				} => (global, key),
 				_ => continue,
 			};
-			let graphs = current
-				.memberships(*global)
+			let current_memberships = (!self.mutations.iter().any(
+				|mutation| matches!(mutation, Mutation::CreateAtom { id, .. } if id == global),
+			))
+			.then(|| current.memberships(*global))
+			.flatten();
+			let graphs = current_memberships
 				.into_iter()
 				.flat_map(|memberships| memberships.keys().copied())
 				.chain(
@@ -248,7 +375,12 @@ impl Transaction {
 		root: &mut DatabaseRoot,
 		mutations: &[Mutation],
 		published_at: u64,
-	) -> FerrosGrynnResult<()> {
+		rebase_allocations: bool,
+	) -> FerrosGrynnResult<ReplayRemap> {
+		if !mutations.is_empty() && root.indexes.has_deferred_indexes() {
+			root.rebuild_indexes()?;
+		}
+		let mut remap = ReplayRemap::default();
 		for mutation in mutations {
 			match mutation {
 				Mutation::InternProperty {
@@ -288,25 +420,31 @@ impl Transaction {
 						.schema
 						.class_by_id(*class_id)
 						.ok_or_else(|| FerrosGrynnError::class_does_not_exist(record_id.class()))?;
-					root.insert_atom_at(*id, &class, record_id.clone(), properties.clone())?;
+					if rebase_allocations {
+						let actual =
+							root.insert_atom(&class, record_id.clone(), properties.clone())?;
+						remap.globals.insert(*id, actual);
+					} else {
+						root.insert_atom_at(*id, &class, record_id.clone(), properties.clone())?;
+					}
 				}
 				Mutation::SetBaseProperty {
 					global,
 					key,
 					value,
 				} => {
-					root.set_base_property(*global, *key, value.clone())?;
+					root.set_base_property(remap.global(*global), *key, value.clone())?;
 				}
 				Mutation::RemoveBaseProperty {
 					global,
 					key,
 				} => {
-					root.remove_base_property(*global, *key)?;
+					root.remove_base_property(remap.global(*global), *key)?;
 				}
 				Mutation::DeleteAtom {
 					global,
 				} => {
-					root.remove_atom(*global)?;
+					root.remove_atom(remap.global(*global))?;
 				}
 				Mutation::AttachNode {
 					graph,
@@ -315,7 +453,23 @@ impl Transaction {
 					label,
 					nested_graph,
 				} => {
-					root.attach_node_at(*graph, *local, *global, label.clone(), *nested_graph)?;
+					if rebase_allocations {
+						let actual = root.attach_node(
+							*graph,
+							remap.global(*global),
+							label.clone(),
+							*nested_graph,
+						)?;
+						remap.locals.insert((*graph, *local), actual);
+					} else {
+						root.attach_node_at(
+							*graph,
+							*local,
+							remap.global(*global),
+							label.clone(),
+							*nested_graph,
+						)?;
+					}
 				}
 				Mutation::AttachEdge {
 					graph,
@@ -326,21 +480,35 @@ impl Transaction {
 					weight,
 					transition_graph,
 				} => {
-					root.attach_edge_at(
-						*graph,
-						*local,
-						*global,
-						label.clone(),
-						topology.clone(),
-						*weight,
-						*transition_graph,
-					)?;
+					let topology = remap.topology(*graph, topology)?;
+					if rebase_allocations {
+						let actual = root.attach_edge(
+							*graph,
+							remap.global(*global),
+							label.clone(),
+							topology,
+							*weight,
+							*transition_graph,
+						)?;
+						remap.locals.insert((*graph, *local), actual);
+					} else {
+						root.attach_edge_at(
+							*graph,
+							*local,
+							remap.global(*global),
+							label.clone(),
+							topology,
+							*weight,
+							*transition_graph,
+						)?;
+					}
 				}
 				Mutation::Detach {
 					graph,
 					global,
 				} => {
-					root.detach(*graph, *global)?.ok_or_else(|| {
+					let global = remap.global(*global);
+					root.detach(*graph, global)?.ok_or_else(|| {
 						FerrosGrynnError::atom_does_not_exist("occurrence", global.to_string())
 					})?;
 				}
@@ -350,39 +518,43 @@ impl Transaction {
 					key,
 					value,
 				} => {
-					root.set_overlay(*graph, *local, *key, value.clone())?;
+					root.set_overlay(*graph, remap.local(*graph, *local), *key, value.clone())?;
 				}
 				Mutation::HideProperty {
 					graph,
 					local,
 					key,
 				} => {
-					root.hide_property(*graph, *local, *key)?;
+					root.hide_property(*graph, remap.local(*graph, *local), *key)?;
 				}
 				Mutation::ResetProperty {
 					graph,
 					local,
 					key,
 				} => {
-					root.reset_property(*graph, *local, *key)?;
+					root.reset_property(*graph, remap.local(*graph, *local), *key)?;
 				}
 				Mutation::SetOccurrenceLabel {
 					graph,
 					local,
 					label,
 				} => {
-					root.set_occurrence_label(*graph, *local, label.clone())?;
+					root.set_occurrence_label(*graph, remap.local(*graph, *local), label.clone())?;
 				}
 				Mutation::ReplaceOccurrenceState {
 					graph,
 					local,
 					state,
 				} => {
-					root.replace_occurrence_state(*graph, *local, state.clone())?;
+					root.replace_occurrence_state(
+						*graph,
+						remap.local(*graph, *local),
+						remap.occurrence_state(*graph, state)?,
+					)?;
 				}
 			}
 		}
 		root.publish_statistics_revision(published_at);
-		Ok(())
+		Ok(remap)
 	}
 }

@@ -435,6 +435,16 @@ impl AtomicArenaBufferPool {
 			.count()
 	}
 
+	/// Returns fixed arena metadata bytes. Dynamic hash-table bucket and
+	/// allocator overhead remains visible through entry counts and process RSS.
+	pub fn fixed_metadata_bytes(&self) -> usize {
+		let replacement = self.replacement.lock();
+		std::mem::size_of::<Self>()
+			.saturating_add(std::mem::size_of_val(self.metadata.as_ref()))
+			.saturating_add(std::mem::size_of_val(self.directory.as_ref()))
+			.saturating_add(std::mem::size_of_val(replacement.keys.as_ref()))
+	}
+
 	/// Returns live source-locator entries across every source epoch.
 	pub fn locator_entry_count(&self) -> usize {
 		self.locator_entries.load(Ordering::Acquire)

@@ -13,7 +13,7 @@ use crate::{
 		QueryExecutionOptions,
 		QueryResult,
 		TransactionCommand,
-		closure::LanguageClosureRegistry,
+		closure::LanguageClosureState,
 		cursor::CursorRuntime,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult, Outcome},
@@ -28,7 +28,7 @@ pub struct GqlSession {
 	transaction: Option<Transaction>,
 	execution_mode: ExecutionMode,
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
-	closures: Arc<Mutex<LanguageClosureRegistry>>,
+	closures: Arc<LanguageClosureState>,
 }
 
 impl GqlSession {
@@ -43,7 +43,7 @@ impl GqlSession {
 			transaction: None,
 			execution_mode: ExecutionMode::BestEffort,
 			cursors: Some(Arc::new(Mutex::new(CursorRuntime::new(max_snapshot_age)))),
-			closures: Arc::new(Mutex::new(LanguageClosureRegistry::default())),
+			closures: Arc::new(LanguageClosureState::default()),
 		}
 	}
 
@@ -54,7 +54,7 @@ impl GqlSession {
 			transaction: None,
 			execution_mode: ExecutionMode::BestEffort,
 			cursors: None,
-			closures: Arc::new(Mutex::new(LanguageClosureRegistry::default())),
+			closures: Arc::new(LanguageClosureState::default()),
 		}
 	}
 
@@ -66,7 +66,7 @@ impl GqlSession {
 	/// Returns closure-registry memory retained by persistent session values.
 	#[cfg(test)]
 	pub(crate) fn retained_closure_bytes(&self) -> usize {
-		self.closures.lock().retained_bytes()
+		self.closures.retained_bytes()
 	}
 
 	/// Releases the retained result spool associated with `cursor`.
@@ -141,6 +141,7 @@ impl GqlSession {
 		require_closed: bool,
 	) -> FerrosGrynnResult<Vec<QueryResult>> {
 		options.validate()?;
+		let transient = self.cursors.is_none();
 		let program = match crate::gql::parse(source, options.parser_settings) {
 			Ok(program) => program,
 			Err(error) => {
@@ -148,14 +149,21 @@ impl GqlSession {
 				return Err(error);
 			}
 		};
-		if let Err(error) = self
-			.ensure_parameter_names_available(variables)
-			.and_then(|()| self.validate_structure(&program, require_closed))
-		{
+		let validation = if transient {
+			self.validate_structure(&program, require_closed)
+		} else {
+			self.ensure_parameter_names_available(variables)
+				.and_then(|()| self.validate_structure(&program, require_closed))
+		};
+		if let Err(error) = validation {
 			self.rollback_explicit_transaction();
 			return Err(error);
 		}
-		let mut bindings = self.merged_bindings(variables);
+		let mut bindings = if transient {
+			variables.clone()
+		} else {
+			self.merged_bindings(variables)
+		};
 		if let [
 			statement @ Statement {
 				kind: StatementKind::Import(import),
@@ -164,9 +172,13 @@ impl GqlSession {
 		] = program.statements.as_slice()
 		{
 			let timeout = crate::gql::resolve_timeout(statement.timeout.as_ref(), &bindings)?;
-			let control = ExecutionControl::with_cursors(options, timeout, self.cursors.clone())
-				.with_execution_mode(ExecutionMode::BestEffort, &bindings)
-				.with_closure_registry(self.closures.clone());
+			let control = ExecutionControl::with_runtime(
+				options,
+				timeout,
+				self.cursors.clone(),
+				self.closures.clone(),
+			)
+			.with_execution_mode(ExecutionMode::BestEffort, &bindings);
 			return crate::gql::import::execute_import(
 				&self.store,
 				source,
@@ -214,11 +226,19 @@ impl GqlSession {
 						break;
 					}
 				};
-			let control =
-				ExecutionControl::with_cursors(options, clause_timeout, self.cursors.clone())
+			let control = ExecutionControl::with_runtime(
+				options,
+				clause_timeout,
+				self.cursors.clone(),
+				self.closures.clone(),
+			);
+			let control = if transient {
+				control
+			} else {
+				control
 					.with_execution_mode(self.execution_mode, &bindings)
-					.with_closure_registry(self.closures.clone())
-					.with_publication_deferred(self.transaction.is_some());
+					.with_publication_deferred(self.transaction.is_some())
+			};
 			let let_name = match &statement.kind {
 				StatementKind::Let(statement) if statement.name.value.as_ref() != "_" => {
 					Some(statement.name.value.as_ref())
@@ -248,6 +268,7 @@ impl GqlSession {
 				self.execute_autocommit(statement, source, &mut bindings, &control, started)
 			};
 			if require_closed
+				&& (self.closures.has_entries() || !variables.is_empty())
 				&& let Some(closure) = result
 					.result
 					.as_ref()
@@ -275,13 +296,15 @@ impl GqlSession {
 			let statement_nonce = control.statement_nonce();
 			let result_value = result.result.as_ref().ok().map(Outcome::value);
 			let transaction_bindings = self.transaction.as_ref().map(Transaction::gql_bindings);
-			self.closures.lock().finish_statement(
-				statement_nonce,
-				self.bindings
-					.values()
-					.chain(transaction_bindings.into_iter().flat_map(Object::values))
-					.chain(result_value),
-			);
+			if !transient || index + 1 < program.statements.len() {
+				self.closures.finish_statement(
+					statement_nonce,
+					self.bindings
+						.values()
+						.chain(transaction_bindings.into_iter().flat_map(Object::values))
+						.chain(result_value),
+				);
+			}
 			result.elapsed = started.elapsed();
 			results.push(result);
 			if failed {
@@ -387,10 +410,17 @@ impl GqlSession {
 		if result.result.is_ok() {
 			match control.attach_pending_index_seek(transaction) {
 				Ok(Some(transaction)) => {
-					let commit_started = Instant::now();
+					let commit_started = matches!(
+						statement.kind,
+						StatementKind::Explain(ref explain)
+							if explain.mode == crate::syn::ExplainMode::Analyze
+					)
+					.then(Instant::now);
 					match transaction.commit() {
 						Ok(_) => {
-							finalize_explain_publication(&mut result, commit_started.elapsed());
+							if let Some(started) = commit_started {
+								finalize_explain_publication(&mut result, started.elapsed());
+							}
 						}
 						Err(error) => result.result = Err(error),
 					}

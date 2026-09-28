@@ -437,6 +437,9 @@ mod tests {
 		drop(store);
 
 		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		let query_value = |store: &Datastore, query: &str| {
+			store.execute(query, &Object::new()).unwrap().remove(0).result.unwrap().into_parts().0
+		};
 		assert_eq!(find_files(directory.path(), "std_0000.fgidx").len(), 2);
 		assert_eq!(find_files(directory.path(), "uniq_0000.fgidx").len(), 2);
 		assert_eq!(find_files_starting_with(directory.path(), "cnt_").len(), 2);
@@ -444,6 +447,49 @@ mod tests {
 		assert_eq!(find_files(directory.path(), "primary.fgidx").len(), 1);
 		assert_eq!(find_files(directory.path(), "memberships.fgidx").len(), 1);
 		assert_eq!(find_files(directory.path(), "membership.fgidx").len(), 1);
+		let handles_before_index_read =
+			reopened.local_storage_status().unwrap().open_file_handles();
+		assert_eq!(
+			query_value(
+				&reopened,
+				"SELECT VALUE age FROM person WITH INDEX by_age WHERE age = 42 ORDER BY age;",
+			),
+			query_value(
+				&reopened,
+				"SELECT VALUE age FROM person WITH NOINDEX WHERE age = 42 ORDER BY age;",
+			),
+		);
+		assert_eq!(
+			query_value(
+				&reopened,
+				"SELECT VALUE email FROM person WITH INDEX unique_email WHERE email = \
+				 'alice@example.test';",
+			),
+			Value::Array(vec![Value::from("alice@example.test")].into()),
+		);
+		assert_eq!(
+			query_value(&reopened, "SELECT VALUE count() FROM person WITH INDEX base_count;"),
+			Value::Array(vec![Value::from(2_u64)].into()),
+		);
+		assert_eq!(
+			query_value(
+				&reopened,
+				"SELECT VALUE age FROM person IN GRAPH @social WITH INDEX effective_age WHERE age \
+				 = 42 ORDER BY age;",
+			),
+			Value::Array(vec![Value::from(42_i64), Value::from(42_i64)].into()),
+		);
+		assert_eq!(
+			query_value(
+				&reopened,
+				"SELECT VALUE count() FROM person IN GRAPH @social WITH INDEX effective_count;",
+			),
+			Value::Array(vec![Value::from(2_u64)].into()),
+		);
+		assert!(
+			reopened.local_storage_status().unwrap().open_file_handles()
+				> handles_before_index_read
+		);
 
 		let alice = "person:alice".parse::<RecordId>().unwrap();
 		let mut read = reopened.begin();
@@ -451,6 +497,32 @@ mod tests {
 		assert_eq!(atom.properties().get(age), Some(&Value::from(42_i64)));
 		assert_eq!(atom.properties().get(email), Some(&Value::from("alice@example.test")),);
 		assert!(read.membership(graph.id(), &alice).unwrap().is_some());
+		drop(read);
+		let update = reopened
+			.execute(
+				"UPDATE person:alice SET age = 43, email = 'alice+updated@example.test';",
+				&Object::new(),
+			)
+			.unwrap();
+		assert!(update[0].result.is_ok(), "{:?}", update[0].result);
+		assert_eq!(
+			query_value(
+				&reopened,
+				"SELECT VALUE age FROM person WITH INDEX by_age WHERE age = 43;",
+			),
+			Value::Array(vec![Value::from(43_i64)].into()),
+		);
+		drop(reopened);
+
+		let reopened = Datastore::open_local(directory.path(), options).unwrap();
+		assert_eq!(
+			query_value(
+				&reopened,
+				"SELECT VALUE email FROM person WITH INDEX unique_email WHERE email = \
+				 'alice+updated@example.test';",
+			),
+			Value::Array(vec![Value::from("alice+updated@example.test")].into()),
+		);
 	}
 
 	#[test]
@@ -528,6 +600,16 @@ mod tests {
 
 		let reopened = Datastore::open_local(directory.path(), options).unwrap();
 		assert!(reopened.class("person").is_some());
+		let rows = reopened
+			.execute("MATCH (person AS p LABEL Person) IN GRAPH people RETURN p", &Object::new())
+			.unwrap();
+		assert!(rows[0].result.is_ok());
+
+		let carol = "person:carol".parse::<RecordId>().unwrap();
+		let mut write = reopened.begin();
+		assert!(write.create_atom(carol.clone(), PropertyMap::new()).is_err());
+		drop(write);
+		assert!(reopened.begin().atom(&carol).unwrap().is_none());
 	}
 
 	#[test]

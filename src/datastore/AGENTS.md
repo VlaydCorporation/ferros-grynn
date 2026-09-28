@@ -48,6 +48,10 @@ indexes и schema одним storage snapshot.
   write transaction консервативно abort-ится при изменении прочитанного key.
 - Commit под одним mutex сначала проверяет FCW, structural requirements, SSI и
   fanout, затем строит полный новый root и публикует его одной заменой `Arc`.
+- Новые global/local slots, выбранные private snapshot, являются временными
+  физическими адресами. Commit replay повторно выделяет их из актуального root
+  и переводит topology/conflict keys; логическая коллизия `RecordId` или
+  membership по-прежнему завершается serialization failure.
 - Публичные read results владеют `RecordId`, `ClassId`, `AtomKind` и
   `PropertyMap`; crate-private `GlobalAtomId` наружу не выходит.
 - Predicate/range phantoms, scope-aware indexes, durable publication и graph
@@ -73,6 +77,9 @@ indexes и schema одним storage snapshot.
 - Physical и materialized traversal routes регистрируют одинаковые SSI
   predicates; page guards, `DataFileId` и storage DTO не проходят transaction
   query adapter.
+- `LocalOptions` является единственной construction authority локального
+  backend. `local_storage_status()` только наблюдает effective budgets и
+  pressure; environment variables не переопределяют параметры экземпляра.
 
 ## Проверка
 

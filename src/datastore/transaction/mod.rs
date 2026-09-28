@@ -55,6 +55,7 @@ mod tests;
 pub use graph_view::TransactionGraphView;
 pub(crate) use query::{
 	QuerySnapshot,
+	QueryStatisticsDemand,
 	QueryStorageCursor,
 	QueryStorageRow,
 	ScalarComparison,
@@ -954,6 +955,10 @@ impl Transaction {
 		if self.gql_statement_depth == 0 {
 			self.refresh_read_committed()?;
 		}
+		self.store.inner.hydrate_statistics(&mut self.working)?;
+		if self.working.indexes.has_deferred_indexes() {
+			self.working.rebuild_indexes()?;
+		}
 		Ok(())
 	}
 
@@ -993,7 +998,7 @@ impl Transaction {
 		}
 		self.validate_write_requirements(&current)?;
 		let mut working = (*current).clone();
-		Self::apply_mutations(&mut working, &self.mutations, current.commit_ts).map_err(
+		Self::apply_mutations(&mut working, &self.mutations, current.commit_ts, false).map_err(
 			|error| {
 				FerrosGrynnError::serialization_failure(
 					self.id,

@@ -22,6 +22,8 @@ mod occurrence;
 mod options;
 /// Immutable MVCC root joining global and graph-local state.
 mod root;
+/// Read-only effective resource budgets and pressure counters.
+mod runtime_status;
 /// Versioned class and graph definitions.
 mod schema;
 /// Persistent GrynnQL statement driver.
@@ -51,6 +53,7 @@ pub(crate) use index_store::{
 	IndexStoreRoot,
 	index_context,
 	rebuild_index_store,
+	rebuild_lookup_index_store,
 };
 pub(crate) use level_path::LEVEL_PATH_PROPERTY;
 pub(crate) use occurrence::{
@@ -72,6 +75,7 @@ pub use options::{
 	TransactionOptions,
 };
 pub(crate) use root::{DatabaseRoot, InvariantViolationReport};
+pub use runtime_status::LocalStorageStatus;
 pub use schema::{
 	ClassField,
 	ClassId,
@@ -96,6 +100,7 @@ pub use store::Datastore;
 pub use transaction::{AtomSnapshot, CommitResult, Transaction, TransactionGraphView};
 pub(crate) use transaction::{
 	QuerySnapshot,
+	QueryStatisticsDemand,
 	QueryStorageCursor,
 	QueryStorageRow,
 	ScalarComparison,

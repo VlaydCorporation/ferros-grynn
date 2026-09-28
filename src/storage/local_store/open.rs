@@ -1,5 +1,10 @@
 //! Catalog-first recovery and normalized MVCC-root reconstruction.
 
+#[cfg(test)]
+use std::{
+	cell::Cell,
+	time::{Duration, Instant},
+};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use rapidhash::RapidHashSet;
@@ -8,7 +13,7 @@ use super::{
 	GraphBinding,
 	catalog::{decode_catalog_values, decode_schema},
 	layout::{DATABASE_CATALOG_ROOT, FILE_CATALOG_ROOT, GenerationBindings, invalid},
-	statistics::validate_statistics_roots,
+	statistics::{PhysicalStatisticsFiles, load_statistics_roots},
 };
 use crate::{
 	datastore::{DataSpaceId, DatabaseRoot},
@@ -53,6 +58,39 @@ pub(super) struct OpenedLocalState {
 	pub(super) registry: FileRegistry,
 	pub(super) atom_superblock: crate::storage::atom_store_superblock::AtomStoreSuperblock,
 	pub(super) graph_superblocks: BTreeMap<crate::graph::GraphId, GraphSuperblock>,
+	pub(super) physical_statistics: Arc<PhysicalStatisticsFiles>,
+}
+
+/// Test-only phase timings for one complete local reopen.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct StartupTimings {
+	pub(super) catalog: Duration,
+	pub(super) registry: Duration,
+	pub(super) materialization: Duration,
+	pub(super) derived: Duration,
+	pub(super) indexes: Duration,
+	pub(super) statistics: Duration,
+	pub(super) validation: Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+	static LAST_STARTUP_TIMINGS: Cell<StartupTimings> = Cell::new(StartupTimings {
+		catalog: Duration::ZERO,
+		registry: Duration::ZERO,
+		materialization: Duration::ZERO,
+		derived: Duration::ZERO,
+		indexes: Duration::ZERO,
+		statistics: Duration::ZERO,
+		validation: Duration::ZERO,
+	});
+}
+
+/// Returns the latest reopen timings recorded on this test thread.
+#[cfg(test)]
+pub(super) fn last_startup_timings() -> StartupTimings {
+	LAST_STARTUP_TIMINGS.get()
 }
 
 /// Opens the database authority, recovers WAL metadata, and materializes the
@@ -62,6 +100,8 @@ pub(super) fn open_local_state(
 	engine: &HybridReadEngine,
 	open_mode: DirectFileOpenMode,
 ) -> FerrosGrynnResult<(FrameWal, OpenedLocalState)> {
+	#[cfg(test)]
+	let catalog_started = Instant::now();
 	let database_superblock =
 		select_database_superblock(&root_path.join(super::DATABASE_SUPERBLOCK_FILE))?;
 	let seed = RecoverySeed::new(
@@ -102,11 +142,19 @@ pub(super) fn open_local_state(
 		CatalogKind::Database,
 	)
 	.and_then(|bytes| DatabaseCatalog::decode(&bytes))?;
+	#[cfg(test)]
+	let catalog = catalog_started.elapsed();
+	#[cfg(test)]
+	let registry_started = Instant::now();
 	let registry = FileRegistry::open(
 		file_catalog.registrations(root_path),
 		open_mode,
 		&RapidHashSet::default(),
 	)?;
+	#[cfg(test)]
+	let registry_duration = registry_started.elapsed();
+	#[cfg(test)]
+	let materialization_started = Instant::now();
 	let bindings = bindings(&file_catalog, &database_catalog)?;
 	let mut schema = decode_schema(&database_catalog)?;
 	let authority = AtomStoreCheckpointAuthority::new(
@@ -185,7 +233,11 @@ pub(super) fn open_local_state(
 		bindings.reverse,
 	)?;
 	validate_reverse_memberships(&reverse, &database)?;
-	validate_statistics_roots(
+	#[cfg(test)]
+	let materialization = materialization_started.elapsed();
+	#[cfg(test)]
+	let statistics_started = Instant::now();
+	let (statistics_store, physical_statistics) = load_statistics_roots(
 		&wal,
 		&registry,
 		engine,
@@ -193,8 +245,31 @@ pub(super) fn open_local_state(
 		&database_superblock,
 		&file_catalog,
 	)?;
-	database.rebuild_derived_state()?;
+	database.statistics = Arc::new(statistics_store);
+	#[cfg(test)]
+	let statistics = statistics_started.elapsed();
+	#[cfg(test)]
+	let derived_started = Instant::now();
+	#[cfg(test)]
+	let indexes_started = Instant::now();
+	database.rebuild_lookup_indexes()?;
+	#[cfg(test)]
+	let indexes = indexes_started.elapsed();
+	#[cfg(test)]
+	let derived = derived_started.elapsed();
+	#[cfg(test)]
+	let validation_started = Instant::now();
 	validate_opened_root(&database, &database_catalog, &file_catalog, snapshot)?;
+	#[cfg(test)]
+	LAST_STARTUP_TIMINGS.set(StartupTimings {
+		catalog,
+		registry: registry_duration,
+		materialization,
+		derived,
+		indexes,
+		statistics,
+		validation: validation_started.elapsed(),
+	});
 
 	Ok((wal, OpenedLocalState {
 		root: database,
@@ -205,6 +280,7 @@ pub(super) fn open_local_state(
 		registry,
 		atom_superblock,
 		graph_superblocks,
+		physical_statistics,
 	}))
 }
 

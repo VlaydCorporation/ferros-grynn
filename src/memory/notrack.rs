@@ -29,11 +29,6 @@ impl<A: GlobalAlloc> NotrackAlloc<A> {
 	pub fn flush_local_allocations(&self) {
 		// Does nothing
 	}
-
-	/// Checks if the current usage exceeds a configured threshold.
-	pub fn is_beyond_threshold(&self) -> bool {
-		false
-	}
 }
 
 unsafe impl<A: GlobalAlloc> GlobalAlloc for NotrackAlloc<A> {

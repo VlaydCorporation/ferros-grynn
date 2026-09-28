@@ -7,6 +7,7 @@ mod files;
 mod image;
 mod layout;
 mod open;
+mod physical_index;
 mod physical_traversal;
 mod statistics;
 
@@ -22,6 +23,12 @@ use std::{
 };
 
 use parking_lot::Mutex;
+pub(crate) use physical_index::{
+	PhysicalIndexAtom,
+	PhysicalIndexEntries,
+	PhysicalIndexRead,
+	PhysicalScalarGroup,
+};
 pub(crate) use physical_traversal::{
 	LocalQuerySnapshot,
 	PhysicalTraversalFieldsRead,
@@ -31,7 +38,7 @@ pub(crate) use physical_traversal::{
 
 use self::{
 	checkpoint::checkpoint,
-	cleanup::{cleanup_orphan_generations, cleanup_query_runs},
+	cleanup::{RetiredGeneration, cleanup_orphan_generations, cleanup_query_runs},
 	files::{
 		create_generation_files,
 		create_import_generation_files,
@@ -42,6 +49,8 @@ use self::{
 	image::{build_generation, build_import_generation, prime_value_context},
 	layout::{DATABASE_CATALOG_ROOT, FILE_CATALOG_ROOT, GenerationBindings, invalid},
 	open::{OpenedLocalState, open_local_state},
+	physical_index::{PhysicalIndexFile, bind_physical_indexes},
+	statistics::PhysicalStatisticsFiles,
 };
 use super::{
 	atom_store_superblock::AtomStoreSuperblock,
@@ -62,7 +71,7 @@ use super::{
 	wal::FrameWal,
 };
 use crate::{
-	datastore::{CheckpointMode, DatabaseRoot, IndexId},
+	datastore::{CheckpointMode, DatabaseRoot, IndexId, LocalOptions, LocalStorageStatus},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphId,
 };
@@ -101,6 +110,10 @@ struct LocalState {
 	registry: FileRegistry,
 	atom_superblock: AtomStoreSuperblock,
 	graph_superblocks: BTreeMap<GraphId, GraphSuperblock>,
+	physical_indexes: BTreeMap<IndexId, std::sync::Arc<PhysicalIndexFile>>,
+	physical_statistics: Option<std::sync::Arc<PhysicalStatisticsFiles>>,
+	retired_generations: Vec<RetiredGeneration>,
+	generation_cleanup_failures: u64,
 	last_checkpoint: Instant,
 }
 
@@ -117,6 +130,40 @@ pub(crate) struct LocalStore {
 }
 
 impl LocalStore {
+	/// Captures effective budgets and cumulative pressure without exposing
+	/// physical file identities.
+	pub(crate) fn runtime_status(&self, options: LocalOptions) -> LocalStorageStatus {
+		let state = self.state.lock();
+		let (cache_misses, coalesced_misses, evictions, capacity_waits) =
+			self.engine.slow_path_counts();
+		let (registered_files, open_file_handles) = state.registry.handle_counts();
+		LocalStorageStatus {
+			options,
+			resident_capacity_pages: self.engine.resident_capacity(),
+			resident_pages: self.engine.resident_count(),
+			retired_resident_pages: self.engine.retired_resident_count(),
+			transient_capacity_pages: self.engine.transient_capacity(),
+			scatter_extent_pages: self.engine.scatter_extent_capacity(),
+			sparse_window_pages: self.engine.sparse_window_capacity(),
+			fixed_metadata_bytes: self.engine.fixed_metadata_bytes(),
+			home_source_versions: self.engine.source_count(),
+			locator_entries: self.engine.locator_entry_count(),
+			registered_files,
+			open_file_handles,
+			cache_misses,
+			coalesced_misses,
+			evictions,
+			capacity_waits,
+			wal_unbackfilled_pages: self.wal.unbackfilled_page_count(),
+			pending_retired_generation_directories: state
+				.retired_generations
+				.iter()
+				.map(RetiredGeneration::directory_count)
+				.sum(),
+			generation_cleanup_failures: state.generation_cleanup_failures,
+		}
+	}
+
 	/// Clears the shared resident arena for an isolated prototype measurement.
 	#[cfg(feature = "storage-engine-prototype-api")]
 	pub(crate) fn clear_resident_for_prototype(&self) -> FerrosGrynnResult<usize> {
@@ -190,6 +237,7 @@ impl LocalStore {
 			io.file_open_mode(),
 			&rapidhash::RapidHashSet::default(),
 		)?;
+		let physical_indexes = bind_physical_indexes(&generation.database_catalog, &registry)?;
 		let state = LocalState {
 			database_superblock_path: superblock_path,
 			database_superblock: superblock,
@@ -199,6 +247,10 @@ impl LocalStore {
 			registry,
 			atom_superblock: generation.atom_superblock,
 			graph_superblocks: generation.graph_superblocks,
+			physical_indexes,
+			physical_statistics: None,
+			retired_generations: Vec::new(),
+			generation_cleanup_failures: 0,
 			last_checkpoint: Instant::now(),
 		};
 		Ok((
@@ -239,8 +291,10 @@ impl LocalStore {
 			registry,
 			atom_superblock,
 			graph_superblocks,
+			physical_statistics,
 		} = opened;
 		cleanup_orphan_generations(root, &file_catalog)?;
+		let physical_indexes = bind_physical_indexes(&database_catalog, &registry)?;
 		let state = LocalState {
 			database_superblock_path: root.join(DATABASE_SUPERBLOCK_FILE),
 			database_superblock,
@@ -250,6 +304,10 @@ impl LocalStore {
 			registry,
 			atom_superblock,
 			graph_superblocks,
+			physical_indexes,
+			physical_statistics: Some(physical_statistics),
+			retired_generations: Vec::new(),
+			generation_cleanup_failures: 0,
 			last_checkpoint: Instant::now(),
 		};
 		let store = Self {
@@ -363,6 +421,7 @@ impl LocalStore {
 		}
 		state._database_catalog = catalog;
 		state.atom_superblock = next_atom_superblock;
+		state.physical_statistics = None;
 		Ok(())
 	}
 
@@ -420,6 +479,13 @@ impl LocalStore {
 			self.io.file_open_mode(),
 			&rapidhash::RapidHashSet::default(),
 		)?;
+		let physical_indexes = bind_physical_indexes(&generation.database_catalog, &registry)?;
+		let retired = RetiredGeneration::between(
+			&self.root,
+			&state.file_catalog,
+			&generation.file_catalog,
+			&state.registry,
+		)?;
 		let mut tx = self.wal.begin_tx()?;
 		if import {
 			stage_import_catalog(&mut tx, &generation)?;
@@ -444,6 +510,12 @@ impl LocalStore {
 		state.registry = registry;
 		state.atom_superblock = generation.atom_superblock;
 		state.graph_superblocks = generation.graph_superblocks;
+		state.physical_indexes = physical_indexes;
+		state.physical_statistics = None;
+		if let Some(retired) = retired {
+			state.retired_generations.push(retired);
+		}
+		sweep_retired_generations(&mut state);
 		Ok(std::mem::take(&mut generation.index_timings))
 	}
 
@@ -454,6 +526,7 @@ impl LocalStore {
 		if advanced {
 			state.last_checkpoint = Instant::now();
 		}
+		sweep_retired_generations(&mut state);
 		Ok(advanced)
 	}
 
@@ -468,6 +541,18 @@ impl LocalStore {
 		}
 		Ok(())
 	}
+}
+
+/// Retries post-publication generation cleanup without changing commit
+/// success. Failures remain observable and pending for the next maintenance
+/// point.
+fn sweep_retired_generations(state: &mut LocalState) {
+	let mut failures = 0_u64;
+	state.retired_generations.retain_mut(|generation| {
+		failures = failures.saturating_add(generation.sweep());
+		!generation.is_empty()
+	});
+	state.generation_cleanup_failures = state.generation_cleanup_failures.saturating_add(failures);
 }
 
 #[cfg(test)]

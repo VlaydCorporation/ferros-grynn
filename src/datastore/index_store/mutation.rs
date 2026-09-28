@@ -60,6 +60,20 @@ pub(crate) struct PreparedReplace {
 
 impl IndexStoreRoot {
 	pub(crate) fn register_class(&mut self, class: &ClassSchema) -> FerrosGrynnResult<()> {
+		self.register_class_with_mode(class, false)
+	}
+
+	/// Registers explicit metadata without reconstructing immutable side-file
+	/// entries during local reopen.
+	pub(crate) fn register_class_deferred(&mut self, class: &ClassSchema) -> FerrosGrynnResult<()> {
+		self.register_class_with_mode(class, true)
+	}
+
+	fn register_class_with_mode(
+		&mut self,
+		class: &ClassSchema,
+		deferred: bool,
+	) -> FerrosGrynnResult<()> {
 		let class_id = class.id().ok_or_else(|| invalid("index owner has no ClassId"))?;
 		if self.classes.insert(class_id, Default::default()).is_some() {
 			return Err(invalid("class indexes are already registered"));
@@ -67,7 +81,8 @@ impl IndexStoreRoot {
 		for index in class.indexes() {
 			match index.scope() {
 				IndexScope::Base => {
-					let binding = binding::<GlobalAtomId>(class, index)?;
+					let mut binding = binding::<GlobalAtomId>(class, index)?;
+					binding.deferred = deferred;
 					if self.base.insert(binding.id, binding).is_some() {
 						return Err(invalid("duplicate base IndexId"));
 					}
@@ -75,7 +90,8 @@ impl IndexStoreRoot {
 				IndexScope::Effective {
 					graph,
 				} => {
-					let binding = binding::<AtomId>(class, index)?;
+					let mut binding = binding::<AtomId>(class, index)?;
+					binding.deferred = deferred;
 					let graph = self
 						.graphs
 						.get_mut(&graph)
@@ -398,6 +414,7 @@ fn binding<Address: Copy + Ord>(
 		name: index.name().clone(),
 		kind: index.kind(),
 		fields,
+		deferred: false,
 		entries: IndexEntries::empty(index.kind()),
 	})
 }

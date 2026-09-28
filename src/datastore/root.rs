@@ -21,6 +21,7 @@ use super::{
 	SchemaCatalog,
 	index_context,
 	rebuild_index_store,
+	rebuild_lookup_index_store,
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -389,6 +390,13 @@ impl DatabaseRoot {
 	/// Reconstructs every schema-defined and engine-owned index.
 	pub(crate) fn rebuild_indexes(&mut self) -> FerrosGrynnResult<()> {
 		self.indexes = Arc::new(rebuild_index_store(self)?);
+		Ok(())
+	}
+
+	/// Reconstructs engine-owned lookups while leaving immutable explicit
+	/// indexes backed by their validated durable files.
+	pub(crate) fn rebuild_lookup_indexes(&mut self) -> FerrosGrynnResult<()> {
+		self.indexes = Arc::new(rebuild_lookup_index_store(self)?);
 		Ok(())
 	}
 

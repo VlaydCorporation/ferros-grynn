@@ -76,9 +76,7 @@ pub fn execute_transaction_with_options(
 		bindings.insert(name.clone(), value.clone());
 	}
 	let mut results = Vec::with_capacity(program.statements.len());
-	let closures = std::sync::Arc::new(parking_lot::Mutex::new(
-		crate::gql::closure::LanguageClosureRegistry::default(),
-	));
+	let closures = std::sync::Arc::new(crate::gql::closure::LanguageClosureState::default());
 	for statement in &program.statements {
 		let started = std::time::Instant::now();
 		let let_name = match &statement.kind {
@@ -115,9 +113,13 @@ pub fn execute_transaction_with_options(
 				break;
 			}
 		};
-		let control = crate::gql::options::ExecutionControl::new(&options, timeout)
-			.with_closure_registry(closures.clone())
-			.with_publication_deferred(true);
+		let control = crate::gql::options::ExecutionControl::with_runtime(
+			&options,
+			timeout,
+			None,
+			closures.clone(),
+		)
+		.with_publication_deferred(true);
 		let execution = transaction.run_gql_statement(|transaction| {
 			execute_parsed_statement_with_bindings(
 				transaction,
@@ -285,13 +287,37 @@ impl QueryRead for TransactionRead<'_> {
 		} else {
 			Vec::new()
 		};
-		let statistics = self.transaction.query_statistics(&self.snapshot)?;
-		let base = statistics.base();
 		let graph_ids = if demand.all_graphs {
 			graph_schemas.iter().map(crate::datastore::GraphSchema::id).collect()
 		} else {
 			demand.graphs.clone()
 		};
+		let statistics_demand = crate::datastore::QueryStatisticsDemand {
+			base_classes: !demand.classes.is_empty(),
+			base_properties: demand
+				.properties
+				.iter()
+				.any(|property| property.scope == StatisticsScope::Base),
+			graph_classes: if demand.classes.is_empty() {
+				std::collections::BTreeSet::new()
+			} else {
+				graph_ids.clone()
+			},
+			graph_labels: graph_ids.clone(),
+			graph_degrees: demand.degrees.keys().copied().collect(),
+			graph_properties: demand
+				.properties
+				.iter()
+				.filter_map(|property| match property.scope {
+					StatisticsScope::Base => None,
+					StatisticsScope::Effective {
+						graph,
+					} => Some(graph),
+				})
+				.collect(),
+		};
+		let statistics = self.transaction.query_statistics(&self.snapshot, &statistics_demand)?;
+		let base = statistics.base();
 		let mut classes = std::collections::BTreeMap::new();
 		for class in
 			class_schemas.into_iter().filter(|class| demand.classes.contains(class.name().as_str()))

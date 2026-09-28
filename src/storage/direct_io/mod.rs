@@ -648,7 +648,7 @@ fn checked_file_length(page_count: u64) -> FerrosGrynnResult<u64> {
 }
 
 /// Ensures an existing data file consists only of complete pages.
-fn validate_file_length(length: u64) -> FerrosGrynnResult<()> {
+pub(super) fn validate_file_length(length: u64) -> FerrosGrynnResult<()> {
 	if !length.is_multiple_of(PAGE_SIZE as u64) {
 		return Err(FerrosGrynnError::invalid_storage_file(format!(
 			"length {length} is not a multiple of {PAGE_SIZE}"

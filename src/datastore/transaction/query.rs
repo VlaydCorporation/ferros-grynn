@@ -21,7 +21,13 @@ use crate::{
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomOccurrenceRef, GraphId, GraphRef},
-	storage::LocalQuerySnapshot,
+	storage::{
+		LocalQuerySnapshot,
+		PhysicalIndexAtom,
+		PhysicalIndexEntries,
+		PhysicalIndexRead,
+		PhysicalScalarGroup,
+	},
 	values::{AtomKind, PropertyDictionary, PropertyMap, RecordId, Text, Value},
 };
 
@@ -158,6 +164,17 @@ pub(crate) struct ScalarIndexWindow {
 pub(crate) struct QuerySnapshot {
 	pub(super) root: Arc<DatabaseRoot>,
 	pub(super) physical: Option<LocalQuerySnapshot>,
+}
+
+/// Independently stored statistics parts required by one planner snapshot.
+#[derive(Debug, Default)]
+pub(crate) struct QueryStatisticsDemand {
+	pub(crate) base_classes: bool,
+	pub(crate) base_properties: bool,
+	pub(crate) graph_classes: BTreeSet<GraphId>,
+	pub(crate) graph_labels: BTreeSet<GraphId>,
+	pub(crate) graph_degrees: BTreeSet<GraphId>,
+	pub(crate) graph_properties: BTreeSet<GraphId>,
 }
 
 /// One graph-local incidence returned by the datastore physical cursor.
@@ -325,13 +342,27 @@ impl Transaction {
 		snapshot.root.level_path_value(graph, global)
 	}
 
-	/// Returns planner statistics from the same immutable statement snapshot.
-	pub(crate) fn query_statistics<'snapshot>(
+	/// Returns planner statistics projected from the same immutable statement
+	/// snapshot. Corrupt optional parts remain absent so planning can use its
+	/// conservative fallback without weakening data reads.
+	pub(crate) fn query_statistics(
 		&self,
-		snapshot: &'snapshot QuerySnapshot,
-	) -> FerrosGrynnResult<&'snapshot crate::stats::StatisticsStore> {
+		snapshot: &QuerySnapshot,
+		demand: &QueryStatisticsDemand,
+	) -> FerrosGrynnResult<crate::stats::StatisticsStore> {
 		self.ensure_live()?;
-		Ok(snapshot.root.statistics.as_ref())
+		let mut statistics = snapshot.root.statistics.as_ref().clone();
+		if statistics.auxiliary_deferred()
+			&& let Some(physical) = snapshot.physical.as_ref()
+		{
+			self.store.inner.load_planner_statistics(
+				physical,
+				&snapshot.root,
+				demand,
+				&mut statistics,
+			);
+		}
+		Ok(statistics)
 	}
 
 	/// Resolves one transaction-visible physical binding without exposing its
@@ -349,7 +380,7 @@ impl Transaction {
 		let index_id = index.id().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("published index is missing IndexId")
 		})?;
-		match index.scope() {
+		let binding = match index.scope() {
 			crate::datastore::IndexScope::Base => planner_binding_summary(
 				snapshot.root.indexes.base_index(index_id),
 				class_id,
@@ -364,6 +395,42 @@ impl Transaction {
 				index_id,
 				index,
 			),
+		}?;
+		let deferred = match index.scope() {
+			crate::datastore::IndexScope::Base => {
+				snapshot.root.indexes.base_index(index_id).is_some_and(|binding| binding.deferred)
+			}
+			crate::datastore::IndexScope::Effective {
+				graph,
+			} => snapshot
+				.root
+				.indexes
+				.graph_index(graph, index_id)
+				.is_some_and(|binding| binding.deferred),
+		};
+		if !deferred {
+			return Ok(binding);
+		}
+		let Some(physical) = snapshot.physical.as_ref() else {
+			return Ok((false, None));
+		};
+		if !self.store.inner.has_physical_index(physical, index_id) {
+			return Ok((false, None));
+		}
+		if index.kind() != crate::datastore::ClassIndexKind::Count {
+			return Ok((true, None));
+		}
+		let physical = self
+			.store
+			.inner
+			.physical_index(physical, index_id)?
+			.ok_or_else(|| deferred_index_missing(index_id))?;
+		validate_physical_index(&physical, class_id, index)?;
+		match &physical.entries {
+			PhysicalIndexEntries::Count(count) => Ok((true, Some(*count))),
+			PhysicalIndexEntries::Scalar(_) => {
+				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as scalar"))
+			}
 		}
 	}
 
@@ -393,15 +460,55 @@ impl Transaction {
 							"planned effective index has no transaction-visible binding",
 						)
 					})?;
-				let ids = query_index_addresses(
-					&snapshot.root,
-					&class,
-					binding,
-					constraints,
-					reverse,
-					window,
-					|local| graph_record_id(&snapshot.root, graph_root, local),
-				)?;
+				let ids = if binding.deferred {
+					let physical = self.query_physical_index(
+						snapshot,
+						index,
+						class_id,
+						binding.kind,
+						crate::datastore::IndexScope::Effective {
+							graph: reference.id(),
+						},
+					)?;
+					query_index_addresses(
+						&snapshot.root,
+						&class,
+						binding,
+						constraints,
+						reverse,
+						window,
+						|lower, upper, reverse, maximum| {
+							read_physical_index_groups(
+								&physical,
+								lower,
+								upper,
+								reverse,
+								maximum,
+								|atom| physical_local_id(graph_root, atom),
+							)
+						},
+						|local| graph_record_id(&snapshot.root, graph_root, local),
+					)?
+				} else {
+					query_index_addresses(
+						&snapshot.root,
+						&class,
+						binding,
+						constraints,
+						reverse,
+						window,
+						|lower, upper, reverse, maximum| {
+							Ok(read_memory_index_groups(
+								&binding.entries,
+								lower,
+								upper,
+								reverse,
+								maximum,
+							))
+						},
+						|local| graph_record_id(&snapshot.root, graph_root, local),
+					)?
+				};
 				QueryCursorSource::GraphOwned {
 					graph: reference.id(),
 					ids: ids.into_iter(),
@@ -427,15 +534,53 @@ impl Transaction {
 						"planned base index has no transaction-visible binding",
 					)
 				})?;
-				let ids = query_index_addresses(
-					&snapshot.root,
-					&class,
-					binding,
-					constraints,
-					reverse,
-					window,
-					|global| base_record_id(&snapshot.root, global),
-				)?;
+				let ids = if binding.deferred {
+					let physical = self.query_physical_index(
+						snapshot,
+						index,
+						class_id,
+						binding.kind,
+						crate::datastore::IndexScope::Base,
+					)?;
+					query_index_addresses(
+						&snapshot.root,
+						&class,
+						binding,
+						constraints,
+						reverse,
+						window,
+						|lower, upper, reverse, maximum| {
+							read_physical_index_groups(
+								&physical,
+								lower,
+								upper,
+								reverse,
+								maximum,
+								|atom| physical_global_id(&snapshot.root, atom),
+							)
+						},
+						|global| base_record_id(&snapshot.root, global),
+					)?
+				} else {
+					query_index_addresses(
+						&snapshot.root,
+						&class,
+						binding,
+						constraints,
+						reverse,
+						window,
+						|lower, upper, reverse, maximum| {
+							Ok(read_memory_index_groups(
+								&binding.entries,
+								lower,
+								upper,
+								reverse,
+								maximum,
+							))
+						},
+						|global| base_record_id(&snapshot.root, global),
+					)?
+				};
 				QueryCursorSource::BaseOwned(ids.into_iter())
 			} else {
 				snapshot
@@ -483,9 +628,36 @@ impl Transaction {
 					)
 				})?;
 			let key = exact_index_probe_key(binding, values, &mut context)?;
+			let ids = if binding.deferred {
+				let physical = self.query_physical_index(
+					snapshot,
+					index,
+					class_id,
+					binding.kind,
+					crate::datastore::IndexScope::Effective {
+						graph: reference.id(),
+					},
+				)?;
+				read_physical_index_groups(
+					&physical,
+					Bound::Included(key.clone()),
+					Bound::Included(key.clone()),
+					false,
+					None,
+					|atom| {
+						let graph = query_graph_root(&snapshot.root, reference)?;
+						physical_local_id(graph, atom)
+					},
+				)?
+				.into_iter()
+				.flat_map(|(_key, ids)| ids)
+				.collect()
+			} else {
+				binding.entries.lookup(&key)
+			};
 			QueryCursorSource::GraphOwned {
 				graph: reference.id(),
-				ids: binding.entries.lookup(&key).into_iter(),
+				ids: ids.into_iter(),
 			}
 		} else {
 			self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id));
@@ -495,7 +667,29 @@ impl Transaction {
 				)
 			})?;
 			let key = exact_index_probe_key(binding, values, &mut context)?;
-			QueryCursorSource::BaseOwned(binding.entries.lookup(&key).into_iter())
+			let ids = if binding.deferred {
+				let physical = self.query_physical_index(
+					snapshot,
+					index,
+					class_id,
+					binding.kind,
+					crate::datastore::IndexScope::Base,
+				)?;
+				read_physical_index_groups(
+					&physical,
+					Bound::Included(key.clone()),
+					Bound::Included(key.clone()),
+					false,
+					None,
+					|atom| physical_global_id(&snapshot.root, atom),
+				)?
+				.into_iter()
+				.flat_map(|(_key, ids)| ids)
+				.collect()
+			} else {
+				binding.entries.lookup(&key)
+			};
+			QueryCursorSource::BaseOwned(ids.into_iter())
 		};
 		Ok(QueryStorageCursor {
 			root: &snapshot.root,
@@ -523,6 +717,18 @@ impl Transaction {
 				graph.id(),
 				binding.class_id,
 			));
+			if binding.deferred {
+				let physical = self.query_physical_index(
+					snapshot,
+					index,
+					binding.class_id,
+					binding.kind,
+					crate::datastore::IndexScope::Effective {
+						graph: graph.id(),
+					},
+				)?;
+				return physical_count(&physical);
+			}
 			return binding.entries.count().ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file(
 					"planned Count lookup selected a scalar index",
@@ -535,12 +741,45 @@ impl Transaction {
 				)
 			})?;
 			self.record_read(crate::datastore::ConflictKey::BaseClassRange(binding.class_id));
+			if binding.deferred {
+				let physical = self.query_physical_index(
+					snapshot,
+					index,
+					binding.class_id,
+					binding.kind,
+					crate::datastore::IndexScope::Base,
+				)?;
+				return physical_count(&physical);
+			}
 			binding.entries.count().ok_or_else(|| {
 				FerrosGrynnError::invalid_storage_file(
 					"planned Count lookup selected a scalar index",
 				)
 			})
 		}
+	}
+
+	fn query_physical_index(
+		&self,
+		snapshot: &QuerySnapshot,
+		index: IndexId,
+		class_id: crate::datastore::ClassId,
+		kind: crate::datastore::ClassIndexKind,
+		scope: crate::datastore::IndexScope,
+	) -> FerrosGrynnResult<Arc<PhysicalIndexRead>> {
+		let physical_snapshot =
+			snapshot.physical.as_ref().ok_or_else(|| deferred_index_missing(index))?;
+		let physical = self
+			.store
+			.inner
+			.physical_index(physical_snapshot, index)?
+			.ok_or_else(|| deferred_index_missing(index))?;
+		if physical.class_id != class_id || physical.kind != kind || physical.scope != scope {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"durable index metadata disagrees with its transaction binding",
+			));
+		}
+		Ok(physical)
 	}
 
 	/// Selects graph-local MATCH seeds through exact, class, and label indexes.
@@ -932,6 +1171,12 @@ fn query_index_addresses<Address: Copy + Ord>(
 	constraints: &[ScalarIndexConstraint],
 	reverse: bool,
 	window: Option<&ScalarIndexWindow>,
+	mut read_groups: impl FnMut(
+		Bound<Vec<u8>>,
+		Bound<Vec<u8>>,
+		bool,
+		Option<usize>,
+	) -> FerrosGrynnResult<Vec<(Vec<u8>, Vec<Address>)>>,
 	mut record_id: impl FnMut(Address) -> FerrosGrynnResult<RecordId>,
 ) -> FerrosGrynnResult<Vec<Address>> {
 	if binding.kind == crate::datastore::ClassIndexKind::Count {
@@ -989,7 +1234,23 @@ fn query_index_addresses<Address: Copy + Ord>(
 				.map(|(value, field)| (value, &field.value_type))
 				.collect::<Vec<_>>();
 			let key = crate::values::storage::encode_index_key(&components, &mut context)?;
-			groups.entry(key.clone()).or_default().extend(binding.entries.lookup(&key));
+			let after_key = after.as_ref().map(|(key, _record)| key.as_slice());
+			if !key_is_after(&key, reverse, after_key) {
+				continue;
+			}
+			let group_maximum = if after_key == Some(key.as_slice()) {
+				None
+			} else {
+				maximum
+			};
+			for (key, addresses) in read_groups(
+				Bound::Included(key.clone()),
+				Bound::Included(key),
+				reverse,
+				group_maximum,
+			)? {
+				groups.entry(key).or_default().extend(addresses);
+			}
 		}
 		return ordered_index_addresses(
 			groups,
@@ -1008,8 +1269,30 @@ fn query_index_addresses<Address: Copy + Ord>(
 		})
 		.collect::<Vec<_>>();
 	if equality_fields == 0 && ranges.is_empty() {
-		return visit_ordered_index_addresses(
-			&binding.entries,
+		let after_key = after.as_ref().map(|(key, _record)| key);
+		if let Some(after_key) = after_key {
+			for (key, addresses) in read_groups(
+				Bound::Included(after_key.clone()),
+				Bound::Included(after_key.clone()),
+				reverse,
+				None,
+			)? {
+				groups.entry(key).or_default().extend(addresses);
+			}
+		}
+		let lower = match (reverse, after_key) {
+			(false, Some(key)) => Bound::Excluded(key.clone()),
+			_ => Bound::Unbounded,
+		};
+		let upper = match (reverse, after_key) {
+			(true, Some(key)) => Bound::Excluded(key.clone()),
+			_ => Bound::Unbounded,
+		};
+		for (key, addresses) in read_groups(lower, upper, reverse, maximum)? {
+			groups.entry(key).or_default().extend(addresses);
+		}
+		return ordered_index_addresses(
+			groups,
 			reverse,
 			after.as_ref().map(|(key, record)| (key.as_slice(), *record)),
 			maximum,
@@ -1069,7 +1352,24 @@ fn query_index_addresses<Address: Copy + Ord>(
 				}
 			}
 		}
-		for (key, addresses) in binding.entries.groups(lower, upper) {
+		if let Some((after_key, _record)) = after.as_ref() {
+			if key_in_bounds(after_key, &lower, &upper) {
+				for (key, addresses) in read_groups(
+					Bound::Included(after_key.clone()),
+					Bound::Included(after_key.clone()),
+					reverse,
+					None,
+				)? {
+					groups.entry(key).or_default().extend(addresses);
+				}
+			}
+			if reverse {
+				upper = tighter_upper(upper, Bound::Excluded(after_key.clone()));
+			} else {
+				lower = tighter_lower(lower, Bound::Excluded(after_key.clone()));
+			}
+		}
+		for (key, addresses) in read_groups(lower, upper, reverse, maximum)? {
 			groups.entry(key).or_default().extend(addresses);
 		}
 	}
@@ -1121,55 +1421,142 @@ fn ordered_index_addresses<Address: Copy + Ord>(
 	Ok(output)
 }
 
-fn visit_ordered_index_addresses<Address: Copy + Ord>(
+fn read_memory_index_groups<Address: Copy + Ord>(
 	entries: &crate::datastore::IndexEntries<Address>,
+	lower: Bound<Vec<u8>>,
+	upper: Bound<Vec<u8>>,
 	reverse: bool,
-	after: Option<(&[u8], &RecordId)>,
 	maximum: Option<usize>,
-	record_id: &mut impl FnMut(Address) -> FerrosGrynnResult<RecordId>,
-) -> FerrosGrynnResult<Vec<Address>> {
-	let lower = if reverse {
-		Bound::Unbounded
-	} else {
-		after.map_or(Bound::Unbounded, |(key, _record)| Bound::Included(key.to_vec()))
+) -> Vec<(Vec<u8>, Vec<Address>)> {
+	let mut output = Vec::new();
+	let mut address_count = 0_usize;
+	entries.visit_groups(lower, upper, reverse, |key, posting| {
+		address_count = address_count.saturating_add(posting.len());
+		output.push((key.to_vec(), posting));
+		maximum.is_none_or(|maximum| address_count < maximum)
+	});
+	output
+}
+
+fn read_physical_index_groups<Address: Copy + Ord>(
+	index: &PhysicalIndexRead,
+	lower: Bound<Vec<u8>>,
+	upper: Bound<Vec<u8>>,
+	reverse: bool,
+	maximum: Option<usize>,
+	mut address: impl FnMut(PhysicalIndexAtom) -> FerrosGrynnResult<Address>,
+) -> FerrosGrynnResult<Vec<(Vec<u8>, Vec<Address>)>> {
+	let PhysicalIndexEntries::Scalar(groups) = &index.entries else {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"Count index reached a scalar row cursor",
+		));
 	};
-	let upper = if reverse {
-		after.map_or(Bound::Unbounded, |(key, _record)| Bound::Included(key.to_vec()))
-	} else {
-		Bound::Unbounded
+	let mut output = Vec::new();
+	let mut address_count = 0_usize;
+	let mut append = |group: &PhysicalScalarGroup| -> FerrosGrynnResult<bool> {
+		if !key_in_bounds(&group.key, &lower, &upper) {
+			return Ok(true);
+		}
+		let posting =
+			group.atoms.iter().copied().map(&mut address).collect::<FerrosGrynnResult<Vec<_>>>()?;
+		address_count = address_count.saturating_add(posting.len());
+		output.push((group.key.clone(), posting));
+		Ok(maximum.is_none_or(|maximum| address_count < maximum))
 	};
-	let mut output = Vec::with_capacity(maximum.unwrap_or(0).min(1_024));
-	let mut failure = None;
-	entries.visit_groups(lower, upper, reverse, |key, addresses| {
-		let posting = addresses
-			.into_iter()
-			.map(|address| Ok((record_id(address)?, address)))
-			.collect::<FerrosGrynnResult<Vec<_>>>();
-		let mut posting = match posting {
-			Ok(posting) => posting,
-			Err(error) => {
-				failure = Some(error);
-				return false;
-			}
-		};
-		posting.sort_unstable();
-		for (record, address) in posting {
-			if after.is_some_and(|(after_key, after_record)| {
-				key == after_key && record <= *after_record
-			}) {
-				continue;
-			}
-			output.push(address);
-			if maximum.is_some_and(|maximum| output.len() >= maximum) {
-				return false;
+	if reverse {
+		for group in groups.iter().rev() {
+			if !append(group)? {
+				break;
 			}
 		}
-		true
-	});
-	match failure {
-		Some(error) => Err(error),
-		None => Ok(output),
+	} else {
+		for group in groups {
+			if !append(group)? {
+				break;
+			}
+		}
 	}
+	Ok(output)
+}
+
+fn key_in_bounds(key: &[u8], lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>) -> bool {
+	let above_lower = match lower {
+		Bound::Included(lower) => key >= lower.as_slice(),
+		Bound::Excluded(lower) => key > lower.as_slice(),
+		Bound::Unbounded => true,
+	};
+	let below_upper = match upper {
+		Bound::Included(upper) => key <= upper.as_slice(),
+		Bound::Excluded(upper) => key < upper.as_slice(),
+		Bound::Unbounded => true,
+	};
+	above_lower && below_upper
+}
+
+fn physical_global_id(
+	root: &DatabaseRoot,
+	atom: PhysicalIndexAtom,
+) -> FerrosGrynnResult<GlobalAtomId> {
+	let slot = usize::try_from(atom.slot)
+		.map_err(|_error| FerrosGrynnError::invalid_storage_file("index slot exceeds usize"))?;
+	let generation = root
+		.atoms
+		.slot_generation(slot)
+		.ok_or_else(|| FerrosGrynnError::invalid_storage_file("index slot is outside AtomStore"))?;
+	let id = GlobalAtomId::from_raw(AtomId::new(atom.kind, atom.slot, generation).raw());
+	root.atom(id).filter(|stored| stored.id().kind() == Some(atom.kind)).map(|_atom| id).ok_or_else(
+		|| {
+			FerrosGrynnError::invalid_storage_file(
+				"durable scalar index references an absent global atom",
+			)
+		},
+	)
+}
+
+fn physical_local_id(graph: &GraphRoot, atom: PhysicalIndexAtom) -> FerrosGrynnResult<AtomId> {
+	let slot = usize::try_from(atom.slot)
+		.map_err(|_error| FerrosGrynnError::invalid_storage_file("index slot exceeds usize"))?;
+	let generation = graph.slot_generation(atom.kind, slot).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("index slot is outside graph occurrence storage")
+	})?;
+	let id = AtomId::new(atom.kind, atom.slot, generation);
+	graph.occurrence(id).map(|_occurrence| id).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file(
+			"durable scalar index references an absent graph occurrence",
+		)
+	})
+}
+
+fn physical_count(index: &PhysicalIndexRead) -> FerrosGrynnResult<u64> {
+	match &index.entries {
+		PhysicalIndexEntries::Count(count) => Ok(*count),
+		PhysicalIndexEntries::Scalar(_) => {
+			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as scalar"))
+		}
+	}
+}
+
+fn validate_physical_index(
+	physical: &PhysicalIndexRead,
+	class_id: crate::datastore::ClassId,
+	index: &ClassIndex,
+) -> FerrosGrynnResult<()> {
+	if physical.class_id != class_id
+		|| physical.kind != index.kind()
+		|| physical.scope != index.scope()
+	{
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"durable index metadata disagrees with the schema catalog",
+		));
+	}
+	Ok(())
+}
+
+fn deferred_index_missing(index: IndexId) -> FerrosGrynnError {
+	FerrosGrynnError::invalid_storage_file(format!(
+		"deferred index {} has no exact durable binding",
+		index.get()
+	))
 }
 
 fn key_is_after(key: &[u8], reverse: bool, after: Option<&[u8]>) -> bool {
@@ -1267,7 +1654,7 @@ fn planner_binding_summary<Address: Copy + Ord>(
 			index.name()
 		)));
 	}
-	Ok((true, binding.entries.count()))
+	Ok((true, (!binding.deferred).then(|| binding.entries.count()).flatten()))
 }
 
 fn row_from_atom(atom: &crate::datastore::BaseAtom, class: &ClassSchema) -> QueryStorageRow {

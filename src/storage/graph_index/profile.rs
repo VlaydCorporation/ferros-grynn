@@ -1,18 +1,26 @@
 //! Ignored stage-10 profile comparing retained-page and streamed index output.
 
 use std::{
+	cmp,
 	error::Error,
 	fs::{self, OpenOptions},
+	hint::black_box,
 	io::{self, Write},
+	ops::Range,
 	path::{Path, PathBuf},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use super::{
+	ChildPage,
 	ExternalIndexSorter,
+	LEAF_OFFSETS_OFFSET,
+	PrimaryIndexEntry,
 	ScalarIndexMode,
 	SortedIndexRecords,
 	build_scalar_index_sorted,
+	partition_internal_children,
+	partition_leaf_entries,
 	scan_scalar_index,
 	stream_standard_index,
 };
@@ -22,7 +30,10 @@ use crate::{
 		direct::DirectFile,
 		page::{AlignedPage, PAGE_SIZE, PageLsn, PageNo},
 	},
-	values::storage::DiskAtomRef,
+	values::{
+		runtime::{PropertyDictionary, Type, Value},
+		storage::{DiskAtomRef, EncodeContext, encode_index_key},
+	},
 };
 
 /// Number of atoms sharing one scalar key in the representative posting
@@ -30,6 +41,300 @@ use crate::{
 const POSTING_GROUP_SIZE: usize = 16;
 /// Paired samples required by the stage-10 performance gate.
 const PROFILE_RUNS: usize = 7;
+/// Paired samples for the format-freeze key-layout diagnostic.
+const KEY_LAYOUT_RUNS: usize = 15;
+
+/// Measures the only compression candidate that can preserve point lookup
+/// without a new dependency or whole-page decompression.
+#[test]
+#[ignore = "stage-19 Q-20 key-layout format-freeze diagnostic"]
+fn stage19_index_key_layout_profile() -> Result<(), Box<dyn Error>> {
+	let items = environment_usize("FG_Q20_KEYS", 100_000)?;
+	for workload in KeyWorkload::ALL {
+		let entries = workload.entries(items)?;
+		let full = full_key_layout(&entries)?;
+		let prefix = prefix_key_layout(&entries)?;
+		let mut full_samples = Vec::with_capacity(KEY_LAYOUT_RUNS);
+		let mut prefix_samples = Vec::with_capacity(KEY_LAYOUT_RUNS);
+		for run in 0..KEY_LAYOUT_RUNS {
+			let (full_elapsed, prefix_elapsed) = if run % 2 == 0 {
+				(
+					measure(|| full_key_layout(black_box(&entries))),
+					measure(|| prefix_key_layout(black_box(&entries))),
+				)
+			} else {
+				let prefix = measure(|| prefix_key_layout(black_box(&entries)));
+				let full = measure(|| full_key_layout(black_box(&entries)));
+				(full, prefix)
+			};
+			full_samples.push(full_elapsed?);
+			prefix_samples.push(prefix_elapsed?);
+		}
+		let full_ns = median_nanos(&mut full_samples);
+		let prefix_ns = median_nanos(&mut prefix_samples);
+		let row = format!(
+			"{},{},{items},{},{},{},{},{full_ns},{prefix_ns}",
+			SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+			workload.name(),
+			full.pages,
+			prefix.pages,
+			full.used_bytes,
+			prefix.used_bytes,
+		);
+		write_q20_csv(&row)?;
+		println!("FG_Q20_KEY_LAYOUT,{row}");
+	}
+	Ok(())
+}
+
+/// Returns one timed, fallible layout-planning result.
+fn measure(
+	operation: impl FnOnce() -> crate::gql_status::FerrosGrynnResult<LayoutSample>,
+) -> Result<Duration, Box<dyn Error>> {
+	let started = Instant::now();
+	black_box(operation()?);
+	Ok(started.elapsed())
+}
+
+/// Computes the exact page count and occupied bytes of the frozen full-key
+/// leaf layout.
+fn full_key_layout(
+	entries: &[PrimaryIndexEntry],
+) -> crate::gql_status::FerrosGrynnResult<LayoutSample> {
+	let groups = partition_leaf_entries(entries)?;
+	let used_bytes = groups.iter().try_fold(0_usize, |total, group| {
+		let keys = group.iter().try_fold(0_usize, |bytes, entry| {
+			bytes
+				.checked_add(entry.key.len() + size_of::<u64>())
+				.ok_or_else(|| super::invalid_index("full-key diagnostic bytes overflow"))
+		})?;
+		total
+			.checked_add(LEAF_OFFSETS_OFFSET + group.len() * size_of::<u16>() + keys)
+			.ok_or_else(|| super::invalid_index("full-key diagnostic total overflows"))
+	})?;
+	let minimum_keys = groups
+		.iter()
+		.map(|group| group.first().map_or_else(Vec::new, |entry| entry.key.clone()))
+		.collect();
+	Ok(LayoutSample {
+		pages: tree_page_count(minimum_keys)?,
+		used_bytes,
+	})
+}
+
+/// Computes the exact size of a candidate layout that stores one common
+/// prefix per leaf and suffixes in the existing offset directory.
+fn prefix_key_layout(
+	entries: &[PrimaryIndexEntry],
+) -> crate::gql_status::FerrosGrynnResult<LayoutSample> {
+	let groups = partition_prefix_leaves(entries)?;
+	let mut used_bytes = 0_usize;
+	let mut minimum_keys = Vec::with_capacity(groups.len());
+	for group in &groups {
+		let entries = &entries[group.entries.clone()];
+		let suffix_bytes = entries.iter().try_fold(0_usize, |total, entry| {
+			total
+				.checked_add(entry.key.len() - group.prefix_len + size_of::<u64>())
+				.ok_or_else(|| super::invalid_index("prefix diagnostic bytes overflow"))
+		})?;
+		used_bytes = used_bytes
+			.checked_add(
+				LEAF_OFFSETS_OFFSET
+					+ entries.len() * size_of::<u16>()
+					+ group.prefix_len
+					+ suffix_bytes,
+			)
+			.ok_or_else(|| super::invalid_index("prefix diagnostic total overflows"))?;
+		minimum_keys.push(entries.first().map_or_else(Vec::new, |entry| entry.key.clone()));
+	}
+	Ok(LayoutSample {
+		pages: tree_page_count(minimum_keys)?,
+		used_bytes,
+	})
+}
+
+/// Greedily packs sorted unique entries using the candidate prefix layout.
+fn partition_prefix_leaves(
+	entries: &[PrimaryIndexEntry],
+) -> crate::gql_status::FerrosGrynnResult<Vec<PrefixLeafGroup>> {
+	if entries.is_empty() {
+		return Ok(vec![PrefixLeafGroup {
+			entries: 0..0,
+			prefix_len: 0,
+		}]);
+	}
+	let mut groups = Vec::new();
+	let mut start = 0;
+	while start < entries.len() {
+		let mut end = start;
+		let mut key_bytes = 0_usize;
+		let mut prefix_len = entries[start].key.len();
+		while end < entries.len() {
+			prefix_len = common_prefix_len(&entries[start].key[..prefix_len], &entries[end].key);
+			key_bytes = key_bytes
+				.checked_add(entries[end].key.len())
+				.ok_or_else(|| super::invalid_index("prefix diagnostic key bytes overflow"))?;
+			let count = end - start + 1;
+			let suffix_bytes = key_bytes
+				.checked_sub(count * prefix_len)
+				.ok_or_else(|| super::invalid_index("prefix diagnostic suffix underflow"))?;
+			let used = LEAF_OFFSETS_OFFSET
+				.checked_add(count * size_of::<u16>())
+				.and_then(|bytes| bytes.checked_add(prefix_len))
+				.and_then(|bytes| bytes.checked_add(suffix_bytes))
+				.and_then(|bytes| bytes.checked_add(count * size_of::<u64>()))
+				.ok_or_else(|| super::invalid_index("prefix diagnostic leaf bytes overflow"))?;
+			if used > PAGE_SIZE {
+				if end == start {
+					return Err(super::invalid_index("one prefixed key exceeds leaf capacity"));
+				}
+				break;
+			}
+			end += 1;
+		}
+		let last = end - 1;
+		groups.push(PrefixLeafGroup {
+			entries: start..end,
+			prefix_len: common_prefix_len(&entries[start].key, &entries[last].key),
+		});
+		start = end;
+	}
+	Ok(groups)
+}
+
+/// Counts unchanged full-key internal levels above candidate leaf groups.
+fn tree_page_count(mut minimum_keys: Vec<Vec<u8>>) -> crate::gql_status::FerrosGrynnResult<usize> {
+	let mut pages = minimum_keys.len();
+	let mut next_page = u64::try_from(pages)
+		.map_err(|_error| super::invalid_index("diagnostic page count exceeds u64"))?;
+	while minimum_keys.len() > 1 {
+		let level = minimum_keys
+			.into_iter()
+			.map(|min_key| {
+				let page_no = PageNo::new(next_page);
+				next_page += 1;
+				ChildPage {
+					page_no,
+					min_key,
+				}
+			})
+			.collect::<Vec<_>>();
+		let groups = partition_internal_children(&level)?;
+		if groups.len() == level.len() {
+			return Err(super::invalid_index("diagnostic internal key exceeds page capacity"));
+		}
+		minimum_keys = groups.iter().map(|group| group[0].min_key.clone()).collect();
+		pages += groups.iter().filter(|group| group.len() > 1).count();
+	}
+	Ok(pages)
+}
+
+/// Returns the byte prefix shared by two keys.
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+	left.iter().zip(right).take_while(|(left, right)| left == right).count()
+}
+
+/// Appends one Q-20 measurement row under the stage-19 artifact directory.
+fn write_q20_csv(row: &str) -> Result<(), Box<dyn Error>> {
+	let path = std::env::var_os("FG_Q20_OUTPUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/windows-ga-core-stage19/q20_key_layout.csv"));
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent)?;
+	}
+	let missing = !path.exists();
+	let mut output = OpenOptions::new().create(true).append(true).open(path)?;
+	if missing {
+		writeln!(
+			output,
+			"timestamp_ms,workload,items,full_pages,prefix_pages,full_used_bytes,\
+			 prefix_used_bytes,full_pack_ns,prefix_pack_ns"
+		)?;
+	}
+	writeln!(output, "{row}")?;
+	Ok(())
+}
+
+/// One page-count and occupied-byte result.
+#[derive(Debug)]
+struct LayoutSample {
+	/// Leaf and unchanged internal pages.
+	pages: usize,
+	/// Bytes occupied inside all leaf pages.
+	used_bytes: usize,
+}
+
+/// One candidate prefix-compressed leaf.
+struct PrefixLeafGroup {
+	/// Half-open range of sorted source entries.
+	entries: Range<usize>,
+	/// Prefix shared by every key in the page.
+	prefix_len: usize,
+}
+
+/// Representative canonical key distributions used by Q-20.
+#[derive(Clone, Copy)]
+enum KeyWorkload {
+	/// One long common string prefix.
+	CommonString,
+	/// Two fixed string components followed by a varying integer.
+	Composite,
+	/// Many shorter page-local prefixes.
+	MixedString,
+}
+
+impl KeyWorkload {
+	/// Stable diagnostic order.
+	const ALL: [Self; 3] = [Self::CommonString, Self::Composite, Self::MixedString];
+
+	/// Returns the CSV name.
+	const fn name(self) -> &'static str {
+		match self {
+			Self::CommonString => "common_string",
+			Self::Composite => "composite",
+			Self::MixedString => "mixed_string",
+		}
+	}
+
+	/// Builds sorted unique entries through the production order-key codec.
+	fn entries(self, count: usize) -> Result<Vec<PrimaryIndexEntry>, Box<dyn Error>> {
+		let mut context = EncodeContext::new(PropertyDictionary::new());
+		let mut entries = Vec::with_capacity(count);
+		for ordinal in 0..count {
+			let atom = DiskAtomRef::from_parts(AtomKind::Node, u64::try_from(ordinal)?)?;
+			let key = match self {
+				Self::CommonString => {
+					let value = Value::from(format!("tenant/europe/customer/{ordinal:012}"));
+					encode_index_key(&[(&value, &Type::String)], &mut context)?
+				}
+				Self::Composite => {
+					let tenant = Value::from("tenant/europe");
+					let region = Value::from("eu-west-1");
+					let ordinal = Value::from(i64::try_from(ordinal)?);
+					encode_index_key(
+						&[
+							(&tenant, &Type::String),
+							(&region, &Type::String),
+							(&ordinal, &Type::Int),
+						],
+						&mut context,
+					)?
+				}
+				Self::MixedString => {
+					let tenant = ordinal % cmp::max(count / 24, 1);
+					let value = Value::from(format!("tenant/{tenant:06}/customer/{ordinal:012}"));
+					encode_index_key(&[(&value, &Type::String)], &mut context)?
+				}
+			};
+			entries.push(PrimaryIndexEntry {
+				key,
+				atom,
+			});
+		}
+		entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+		Ok(entries)
+	}
+}
 
 /// Compares the former retained `Vec<AlignedPage>` builder with the production
 /// page-at-a-time writer under identical sorted input and Direct-I/O

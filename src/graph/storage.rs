@@ -257,6 +257,8 @@ impl NodeColumns {
 		self.contains(id).then(|| self.record_ids.get(id.slot() as usize)?.as_ref())?
 	}
 
+	/// Returns `None` for a stale ID and `Some(None)` for a live unlabeled
+	/// node.
 	pub(crate) fn label(&self, id: AtomId) -> Option<Option<&Text>> {
 		self.contains(id).then(|| self.labels.get(id.slot() as usize).map(Option::as_ref))?
 	}
@@ -438,7 +440,8 @@ impl EdgeColumns {
 		self.contains(id).then(|| self.topologies.get_mut(id.slot() as usize))?
 	}
 
-	// TODO: does we need Option<Option<_>>?
+	/// Returns `None` for a stale ID and `Some(None)` for a live unlabeled
+	/// edge.
 	pub(crate) fn label(&self, id: AtomId) -> Option<Option<&Text>> {
 		self.contains(id).then(|| self.labels.get(id.slot() as usize).map(Option::as_ref))?
 	}
@@ -451,17 +454,17 @@ impl EdgeColumns {
 		self.contains(id).then(|| self.properties.get_mut(id.slot() as usize))?
 	}
 
-	// TODO: does we need Option<Option<_>>?
+	/// Returns the optional label slot only while `id` identifies a live edge.
 	pub(crate) fn label_mut(&mut self, id: AtomId) -> Option<&mut Option<Text>> {
 		self.contains(id).then(|| self.labels.get_mut(id.slot() as usize))?
 	}
 
-	// TODO: does we need Option<Option<_>>?
+	/// Returns `None` for a stale ID and `Some(None)` for an unweighted edge.
 	pub(crate) fn weight(&self, id: AtomId) -> Option<Option<Number>> {
 		self.contains(id).then(|| self.weights.get(id.slot() as usize).copied())?
 	}
 
-	// TODO: does we need Option<Option<_>>?
+	/// Returns the optional weight slot only while `id` identifies a live edge.
 	pub(crate) fn weight_mut(&mut self, id: AtomId) -> Option<&mut Option<Number>> {
 		self.contains(id).then(|| self.weights.get_mut(id.slot() as usize))?
 	}

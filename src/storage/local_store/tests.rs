@@ -2,15 +2,34 @@ use std::{
 	fs,
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
-	sync::atomic::{AtomicU64, Ordering},
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::{Duration, Instant},
 };
 
-use super::{IMPORT_FAILURE_POINT, ImportFailurePoint};
+use super::{
+	IMPORT_FAILURE_POINT,
+	ImportFailurePoint,
+	cleanup::inject_cleanup_failures,
+	open::{StartupTimings, last_startup_timings},
+};
 use crate::{
-	datastore::{CheckpointMode, ClassSchema, Datastore, ImportOptions, LocalOptions},
+	datastore::{
+		CheckpointMode,
+		ClassField,
+		ClassIndex,
+		ClassIndexKind,
+		ClassSchema,
+		Datastore,
+		ImportOptions,
+		IndexScope,
+		LocalOptions,
+	},
 	gql::QueryExecutionOptions,
 	graph::{AtomKind, EdgeTopology, GraphKind},
-	values::{Object, PropertyMap, RecordId, Value},
+	values::{Object, PropertyMap, RecordId, RecordIdPart, Type, Value},
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +49,180 @@ impl Drop for TestDirectory {
 	fn drop(&mut self) {
 		drop(fs::remove_dir_all(&self.0));
 	}
+}
+
+/// Measures total and phase-level reopen scaling for the format-v1 registry.
+#[test]
+#[ignore = "diagnostic creates up to 1,800 graph-generation files"]
+fn local_file_layout_reopen_diagnostic() {
+	for graph_count in [1_usize, 100] {
+		let directory = TestDirectory::new();
+		let options = LocalOptions {
+			buffer_pool_pages: 256,
+			..LocalOptions::default()
+		};
+		let store = Datastore::create_local(&directory.0, options).unwrap();
+		let mut transaction = store.begin();
+		for ordinal in 0..graph_count {
+			transaction.define_graph(&format!("reopen-{ordinal}"), GraphKind::Graph).unwrap();
+		}
+		transaction.commit().unwrap();
+		drop(store);
+
+		let mut totals = Vec::with_capacity(5);
+		let mut phases = Vec::with_capacity(5);
+		let mut handle_counts = (0, 0);
+		for _ in 0..5 {
+			let started = Instant::now();
+			let reopened = Datastore::open_local(&directory.0, options).unwrap();
+			totals.push(started.elapsed());
+			phases.push(last_startup_timings());
+			assert_eq!(reopened.schema_catalog().graphs().count(), graph_count);
+			let status = reopened.local_storage_status().unwrap();
+			handle_counts = (status.registered_files(), status.open_file_handles());
+			assert!(handle_counts.1 < handle_counts.0);
+			drop(reopened);
+		}
+		println!(
+			"layout_reopen graphs={graph_count} total_ms={:.3} catalog_ms={:.3} registry_ms={:.3} \
+			 materialization_ms={:.3} derived_ms={:.3} index_ms={:.3} statistics_ms={:.3} \
+			 validation_ms={:.3} registered_files={} open_handles={}",
+			median_duration(&mut totals).as_secs_f64() * 1_000.0,
+			median_phase(&mut phases, |phase| phase.catalog),
+			median_phase(&mut phases, |phase| phase.registry),
+			median_phase(&mut phases, |phase| phase.materialization),
+			median_phase(&mut phases, |phase| phase.derived),
+			median_phase(&mut phases, |phase| phase.indexes),
+			median_phase(&mut phases, |phase| phase.statistics),
+			median_phase(&mut phases, |phase| phase.validation),
+			handle_counts.0,
+			handle_counts.1,
+		);
+	}
+}
+
+/// Measures local reopen scaling for one atom/index fixture selected through
+/// `FG_REOPEN_ATOMS`, `FG_REOPEN_INDEXES`, and `FG_REOPEN_RUNS`.
+#[test]
+#[ignore = "diagnostic may build one million atoms and eight indexes"]
+fn local_atom_index_reopen_diagnostic() -> crate::gql_status::FerrosGrynnResult<()> {
+	let atom_count = diagnostic_usize("FG_REOPEN_ATOMS", 1_000)?;
+	let index_count = diagnostic_usize("FG_REOPEN_INDEXES", 0)?;
+	let runs = diagnostic_usize("FG_REOPEN_RUNS", 3)?;
+	if atom_count == 0 || runs == 0 {
+		return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+			"reopen diagnostic atom and run counts must be positive",
+		));
+	}
+
+	let directory = TestDirectory::new();
+	let options = LocalOptions {
+		buffer_pool_pages: 512,
+		..LocalOptions::default()
+	};
+	let store = Datastore::create_local(&directory.0, options)?;
+	let mut class =
+		ClassSchema::new("probe", AtomKind::Node, [ClassField::new("value", Type::Int)])?;
+	for ordinal in 0..index_count {
+		class = class.with_index(ClassIndex::new(
+			format!("by_value_{ordinal:02}"),
+			ClassIndexKind::Standard,
+			IndexScope::Base,
+			["value"],
+		)?)?;
+	}
+	let mut schema = store.begin();
+	schema.define_class(class)?;
+	schema.commit()?;
+	let class = store
+		.class("probe")
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::class_does_not_exist("probe"))?;
+	let value_key = class
+		.fields()
+		.next()
+		.and_then(|field| field.key)
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::unknown_field("value"))?;
+	let mut root = (*store.inner.current_root()).clone();
+	for ordinal in 0..atom_count {
+		let mut properties = PropertyMap::new();
+		properties.insert(
+			value_key,
+			i64::try_from(ordinal % 4_096).map_err(|_error| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(
+					"reopen diagnostic ordinal exceeds i64",
+				)
+			})?,
+		);
+		Arc::make_mut(&mut root.atoms).insert(
+			&class,
+			RecordId::new(
+				"probe",
+				RecordIdPart::Int(i64::try_from(ordinal).map_err(|_error| {
+					crate::gql_status::FerrosGrynnError::invalid_argument(
+						"reopen diagnostic atom count exceeds i64",
+					)
+				})?),
+			)?,
+			properties,
+		)?;
+	}
+	root.rebuild_derived_state_at(&directory.0.join("fixture-scratch"))?;
+	root.commit_ts = root.commit_ts.checked_add(1).ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::invalid_argument("commit clock exhausted")
+	})?;
+	drop(store.inner.persist_import_root(&root)?);
+	drop(store);
+
+	let mut totals = Vec::with_capacity(runs);
+	let mut phases = Vec::with_capacity(runs);
+	for _ in 0..runs {
+		let started = Instant::now();
+		let reopened = Datastore::open_local(&directory.0, options)?;
+		totals.push(started.elapsed());
+		phases.push(last_startup_timings());
+		assert_eq!(reopened.inner.current_root().atoms.atoms().len(), atom_count);
+		drop(reopened);
+	}
+	println!(
+		"atom_reopen atoms={atom_count} indexes={index_count} total_ms={:.3} catalog_ms={:.3} \
+		 registry_ms={:.3} materialization_ms={:.3} derived_ms={:.3} index_ms={:.3} \
+		 statistics_ms={:.3} validation_ms={:.3}",
+		median_duration(&mut totals).as_secs_f64() * 1_000.0,
+		median_phase(&mut phases, |phase| phase.catalog),
+		median_phase(&mut phases, |phase| phase.registry),
+		median_phase(&mut phases, |phase| phase.materialization),
+		median_phase(&mut phases, |phase| phase.derived),
+		median_phase(&mut phases, |phase| phase.indexes),
+		median_phase(&mut phases, |phase| phase.statistics),
+		median_phase(&mut phases, |phase| phase.validation),
+	);
+	Ok(())
+}
+
+fn diagnostic_usize(name: &str, default: usize) -> crate::gql_status::FerrosGrynnResult<usize> {
+	match std::env::var(name) {
+		Ok(value) => value.parse().map_err(|_error| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+				"{name} must contain an unsigned integer"
+			))
+		}),
+		Err(std::env::VarError::NotPresent) => Ok(default),
+		Err(std::env::VarError::NotUnicode(_)) => {
+			Err(crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+				"{name} must contain Unicode digits"
+			)))
+		}
+	}
+}
+
+fn median_duration(values: &mut [Duration]) -> Duration {
+	values.sort_unstable();
+	values[values.len() / 2]
+}
+
+fn median_phase(values: &mut [StartupTimings], select: impl Fn(StartupTimings) -> Duration) -> f64 {
+	let mut durations = values.iter().copied().map(select).collect::<Vec<_>>();
+	median_duration(&mut durations).as_secs_f64() * 1_000.0
 }
 
 #[test]
@@ -100,6 +293,106 @@ fn graph_property_catalog_update_reuses_graph_generation_and_reopens() {
 		.execute("SELECT ONLY VALUE properties.owner FROM GRAPH @sales;", &Object::new())
 		.unwrap();
 	assert_eq!(selected[0].result.as_ref().unwrap().value(), &Value::from("risk"));
+}
+
+#[test]
+fn repeated_cow_commits_retire_unpinned_generations_at_runtime() {
+	let directory = TestDirectory::new();
+	let store = Datastore::create_local(&directory.0, LocalOptions::default()).unwrap();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.create_atom("person:seed".parse().unwrap(), PropertyMap::new()).unwrap();
+	seed.commit().unwrap();
+	let expected = generation_directories(&directory.0);
+
+	for index in 0..8 {
+		let mut transaction = store.begin();
+		transaction
+			.create_atom(format!("person:{index}").parse().unwrap(), PropertyMap::new())
+			.unwrap();
+		transaction.commit().unwrap();
+		assert_eq!(generation_directories(&directory.0), expected);
+	}
+}
+
+#[test]
+fn atom_and_graph_cow_churn_keeps_only_live_generations() {
+	let directory = TestDirectory::new();
+	let store = Datastore::create_local(&directory.0, LocalOptions::default()).unwrap();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	let graph = seed.define_graph("social", GraphKind::Graph).unwrap();
+	let identity = "person:seed".parse::<RecordId>().unwrap();
+	seed.create_atom(identity.clone(), PropertyMap::new()).unwrap();
+	seed.attach_node(graph.id(), &identity, None, None).unwrap();
+	seed.commit().unwrap();
+	let expected = generation_directories(&directory.0);
+
+	for index in 0..32 {
+		let identity = format!("person:churn-{index}").parse::<RecordId>().unwrap();
+		let mut transaction = store.begin();
+		transaction.create_atom(identity.clone(), PropertyMap::new()).unwrap();
+		transaction.attach_node(graph.id(), &identity, None, None).unwrap();
+		transaction.commit().unwrap();
+		assert_eq!(generation_directories(&directory.0), expected);
+	}
+	let status = store.local_storage_status().unwrap();
+	assert_eq!(status.pending_retired_generation_directories(), 0);
+	assert_eq!(status.generation_cleanup_failures(), 0);
+}
+
+#[test]
+fn physical_snapshot_pins_replaced_generation_until_maintenance() {
+	let directory = TestDirectory::new();
+	let store = Datastore::create_local(&directory.0, LocalOptions::default()).unwrap();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.create_atom("person:seed".parse().unwrap(), PropertyMap::new()).unwrap();
+	seed.commit().unwrap();
+	let expected = generation_directories(&directory.0);
+	let snapshot = store
+		.inner
+		.capture_physical_query_snapshot(store.inner.current_root().commit_ts)
+		.unwrap()
+		.unwrap();
+
+	let mut transaction = store.begin();
+	transaction.create_atom("person:next".parse().unwrap(), PropertyMap::new()).unwrap();
+	transaction.commit().unwrap();
+	assert_eq!(generation_directories(&directory.0), expected + 1);
+
+	drop(snapshot);
+	store.checkpoint(CheckpointMode::Passive).unwrap();
+	assert_eq!(generation_directories(&directory.0), expected);
+}
+
+#[test]
+fn cleanup_failure_does_not_undo_commit_and_is_retried() {
+	let directory = TestDirectory::new();
+	let store = Datastore::create_local(&directory.0, LocalOptions::default()).unwrap();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.create_atom("person:seed".parse().unwrap(), PropertyMap::new()).unwrap();
+	seed.commit().unwrap();
+	let expected = generation_directories(&directory.0);
+	inject_cleanup_failures(1);
+
+	let next = "person:next".parse::<RecordId>().unwrap();
+	let mut transaction = store.begin();
+	transaction.create_atom(next.clone(), PropertyMap::new()).unwrap();
+	transaction.commit().unwrap();
+	assert!(store.begin().atom(&next).unwrap().is_some());
+	assert_eq!(generation_directories(&directory.0), expected + 1);
+	let status = store.local_storage_status().unwrap();
+	assert_eq!(status.generation_cleanup_failures(), 1);
+	assert_eq!(status.pending_retired_generation_directories(), 1);
+	assert_eq!(status.options(), LocalOptions::default());
+	assert_eq!(status.resident_capacity_pages(), LocalOptions::default().buffer_pool_pages);
+	assert!(status.fixed_metadata_bytes() > 0);
+
+	store.checkpoint(CheckpointMode::Passive).unwrap();
+	assert_eq!(generation_directories(&directory.0), expected);
+	assert_eq!(store.local_storage_status().unwrap().pending_retired_generation_directories(), 0);
 }
 
 #[test]
