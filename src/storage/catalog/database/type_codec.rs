@@ -43,6 +43,7 @@ enum Tag {
 	RecordShape = 0x1b,
 	Closure = 0x1c,
 	GraphRef = 0x1d,
+	Matcher = 0x1e,
 }
 
 impl Tag {
@@ -78,6 +79,7 @@ impl Tag {
 			0x1b => Self::RecordShape,
 			0x1c => Self::Closure,
 			0x1d => Self::GraphRef,
+			0x1e => Self::Matcher,
 			_ => return Err(invalid("database catalog contains an unknown schema type")),
 		})
 	}
@@ -110,6 +112,7 @@ pub(super) fn encode(output: &mut Vec<u8>, value: &Type, depth: usize) -> Ferros
 		Type::GraphRef(_) => Tag::GraphRef,
 		Type::Record => Tag::Record,
 		Type::Regex => Tag::Regex,
+		Type::Matcher => Tag::Matcher,
 		Type::Range(_) => Tag::Range,
 		Type::Atom(_) => Tag::Atom,
 		Type::Path => Tag::Path,
@@ -190,6 +193,7 @@ pub(super) fn decode(decoder: &mut Decoder<'_>, depth: usize) -> FerrosGrynnResu
 		Tag::GraphRef => Type::GraphRef(decode_graph_kind(decoder.read_u8()?)?),
 		Tag::Record => Type::Record,
 		Tag::Regex => Type::Regex,
+		Tag::Matcher => Type::Matcher,
 		Tag::Range => Type::Range(Box::new(decode(decoder, depth + 1)?)),
 		Tag::Atom => Type::Atom(decode_atom_kind(decoder.read_u8()?)?),
 		Tag::Path => Type::Path,

@@ -116,7 +116,7 @@ pub(super) struct AtomStoreFileSet {
 }
 
 impl AtomStoreFileSet {
-	/// Resolves singleton AtomStore files from `FGFC v5` and an explicit
+	/// Resolves singleton AtomStore files from `FGFC v6` and an explicit
 	/// physical binding for the global primary index.
 	pub(super) fn from_catalog(
 		catalog: &FileCatalog,

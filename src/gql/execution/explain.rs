@@ -543,6 +543,7 @@ fn traversal_step_name(kind: TraverseStepKind) -> &'static str {
 		TraverseStepKind::CyclicPath => "CyclicPath",
 		TraverseStepKind::Map => "Map",
 		TraverseStepKind::FlatMap => "FlatMap",
+		TraverseStepKind::Algorithm => "Algorithm",
 		TraverseStepKind::Values => "Values",
 		TraverseStepKind::Select => "Select",
 		TraverseStepKind::Match => "Match",
@@ -821,7 +822,21 @@ fn ordering_projection(
 			Value::from(if order.random {
 				"RAND".to_owned()
 			} else {
-				format!("{:?} {:?}", order.direction, order.nulls)
+				format!(
+					"{:?} {:?}{}{}",
+					order.direction,
+					order.nulls,
+					if order.collate {
+						" COLLATE"
+					} else {
+						""
+					},
+					if order.numeric {
+						" NUMERIC"
+					} else {
+						""
+					}
+				)
 			})
 		})
 		.collect();

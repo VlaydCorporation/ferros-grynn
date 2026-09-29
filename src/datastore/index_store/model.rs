@@ -217,6 +217,15 @@ pub(crate) struct IndexStoreRoot {
 }
 
 impl IndexStoreRoot {
+	/// Removes one schema-defined binding after its definition becomes stale.
+	/// Engine-owned class and label lookups are unaffected.
+	pub(crate) fn remove_explicit_index(&mut self, id: IndexId) {
+		self.base.remove(&id);
+		for graph in self.graphs.values_mut() {
+			graph.explicit.remove(&id);
+		}
+	}
+
 	/// Returns whether any explicit index still uses its immutable durable
 	/// side-file instead of transaction-private mutable entries.
 	pub(crate) fn has_deferred_indexes(&self) -> bool {

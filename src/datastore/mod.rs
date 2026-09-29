@@ -16,6 +16,8 @@ mod import;
 mod index_store;
 /// Canonical graph-local LevelPath projection.
 mod level_path;
+/// Durable maintenance jobs and their public projections.
+mod maintenance;
 /// Graph-local occurrences and sparse overlays.
 mod occurrence;
 /// Backend and transaction configuration.
@@ -46,6 +48,9 @@ pub use import::{
 	ImportSession,
 	ImportViolation,
 	ImportViolationPolicy,
+	QuarantineId,
+	QuarantineReader,
+	QuarantinedItem,
 };
 pub(crate) use index_store::{
 	IndexBinding,
@@ -56,6 +61,13 @@ pub(crate) use index_store::{
 	rebuild_lookup_index_store,
 };
 pub(crate) use level_path::LEVEL_PATH_PROPERTY;
+pub use maintenance::{JobId, MaintenanceJobInfo, MaintenanceJobKind, MaintenanceJobState};
+pub(crate) use maintenance::{
+	MaintenanceAnalyzeMode,
+	MaintenanceCoordinator,
+	MaintenanceRunOutcome,
+	MaintenanceTarget,
+};
 pub(crate) use occurrence::{
 	GraphOccurrence,
 	GraphRoot,
@@ -71,6 +83,7 @@ pub use options::{
 	IoMode,
 	IsolationLevel,
 	LocalOptions,
+	MaintenanceOptions,
 	TransactionAccess,
 	TransactionOptions,
 };
@@ -84,10 +97,15 @@ pub use schema::{
 	ClassIndexState,
 	ClassSchema,
 	ClassSchemaMode,
+	FunctionEffect,
+	FunctionId,
 	GraphSchema,
 	IndexId,
+	IndexMaintenanceMode,
 	IndexScope,
 	SchemaCatalog,
+	SchemaFunction,
+	SchemaFunctionParameter,
 	SchemaId,
 	SchemaParameter,
 	SchemaVersion,

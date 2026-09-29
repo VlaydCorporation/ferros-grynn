@@ -32,7 +32,9 @@
 - `buffer_pool` — прежний Clock-Pro, доступный только тестам и prototype-control;
 - `page_manager` — staged/WAL/home resolution и production HybridReadEngine;
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
-- `catalog` — `FGFC v5` physical registry и bounded `FGDC v9` page-chain;
+- `catalog` — `FGFC v6` physical registry и bounded `FGDC v10` page-chain;
+- `job_catalog` — checksummed metadata-COW `FGJB v1` с `main/.prev` recovery;
+- `quarantine` — immutable streaming `FGQR v1`; файл не является positional page source;
 - `atom_store_superblock` — exact database-global AtomStore ceilings/counts и checkpoint tuple;
 - `property_dictionary` — append-only database-global `PropertyKeyId ↔ UTF-8` pages и hash lookup;
 - `metadata_cow` — общий checkpoint-протокол `.tmp`/main/`.prev`, не используемый обычным commit;
@@ -67,23 +69,25 @@
   filename. Binding индекса разрешается по `IndexId`, не по имени.
 - `GraphSuperblock` хранится только в `superblock.fgb`. В текущем codec ровно
   шесть изменяемых graph data-файлов имеют отдельные `freelist_*.fgb`, а binding
-  хранится в `FGFC v5.companion_of` вместе с `DataSpaceId`. Standard и Unique называются
+  хранится в `FGFC v6.companion_of` вместе с `DataSpaceId`. Standard и Unique называются
   соответственно `std_<ordinal:04>.fgidx` и `uniq_<ordinal:04>.fgidx`; `scalar`
   допустим только как внутреннее имя общей реализации.
 - `AtomHotPage` хранит только database-global class, RecordId и
   base properties. `NodeHotPage`/`EdgeHotPage` хранят membership occurrence,
   `GlobalAtomId`, label/overlay и topology. Точные offsets задают
   `docs/disk_storage_spec.md` §§10–11.
-- Собираемый target использует `FGDC v9`/`FGFC v5`, `DataSpaceId::Database` для AtomStore
+- Собираемый target использует только `FGDC v10`/`FGFC v6`, `DataSpaceId::Database` для AtomStore
   и не создаёт системный graph; `GraphId` каждого graph ненулевой. AtomStore и
   graph occurrences публикуются одним WAL transaction и открываются по одной
   snapshot boundary. Missing/unopenable/checksum-corrupt secondary переводится в `Stale` и даёт scan
   fallback, а primary/base corruption остаётся фатальной.
-- `FGDC v9` хранит topology constraint bits, optional rooted-tree `RecordId`,
+- `FGDC v10` хранит topology constraint bits, optional rooted-tree `RecordId`,
   public owner root и dense arena slots. Несколько slots могут указывать на один
   child `GraphId`, но `(scope, child)` уникален, containment cycle запрещён, а
-  name map содержит только public graphs. `FGDC v8` не принимается и не
-  мигрируется.
+  name map содержит только public graphs. Он также хранит durable parameter/function
+  sections и `IndexMaintenanceMode`; `FGDC v9` и `FGFC v5` не принимаются и не мигрируются.
+- `JobCatalog` регистрируется ровно как `admin/jobs.fgb`; quarantine — только как
+  `admin/quarantine/<uuid>.fgq`. Оба auxiliary kind не открываются через `PageManager`.
 - Bulk builders на Windows MSVC должны сначала выделять окончательные
   `Vec`-slots/arena и только затем заполнять 16 KiB `AlignedPage` через `&mut`.
   В ASan-инструментированном большом builder-path наблюдалась codegen-sensitive

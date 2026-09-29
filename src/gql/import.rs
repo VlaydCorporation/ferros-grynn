@@ -2,6 +2,7 @@
 
 use std::{
 	collections::BTreeSet,
+	num::NonZeroUsize,
 	time::{Duration, Instant},
 };
 
@@ -65,6 +66,11 @@ pub fn execute_import(
 		span: import_graph_span(statement.graph.as_ref()),
 	});
 	let program = normalize_program(statement, graph_identifier.as_ref(), source)?;
+	let payloads = program
+		.statements
+		.iter()
+		.map(|statement| ImportItemPayload::from_statement(statement, source))
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let timeouts = program
 		.statements
 		.iter()
@@ -83,7 +89,7 @@ pub fn execute_import(
 	let result = store
 		.import_at(options, Some(expected_commit_ts), graph.as_ref().map(GraphRef::id), |session| {
 			super::execution::execute_import_program(
-				session, source, &logical, variables, control, &timeouts,
+				session, source, &logical, variables, control, &timeouts, &payloads,
 			)
 		})
 		.map(report_value)
@@ -94,6 +100,56 @@ pub fn execute_import(
 		result,
 		continuation: None,
 	})
+}
+
+/// Storable source projection retained when one GrynQL import item is
+/// quarantined.
+pub(super) struct ImportItemPayload {
+	statement: Box<str>,
+	kind: Box<str>,
+	binding: Option<Box<str>>,
+}
+
+impl ImportItemPayload {
+	fn from_statement(statement: &Statement, source: &str) -> FerrosGrynnResult<Self> {
+		let start = usize::try_from(statement.span.offset).map_err(|_error| {
+			FerrosGrynnError::invalid_argument("import statement offset exceeds usize")
+		})?;
+		let end =
+			statement.span.end().and_then(|end| usize::try_from(end).ok()).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("import statement span exceeds source bounds")
+			})?;
+		let statement_source = source.get(start..end).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("import statement span is not a source boundary")
+		})?;
+		Ok(Self {
+			statement: statement_source.into(),
+			kind: format!("{:?}", super::statement_kind(&statement.kind))
+				.to_ascii_uppercase()
+				.into(),
+			binding: match &statement.kind {
+				StatementKind::For(statement) => Some(statement.binding.value.clone()),
+				_ => None,
+			},
+		})
+	}
+
+	pub(super) fn binding_name(&self) -> Option<&str> {
+		self.binding.as_deref()
+	}
+
+	pub(super) fn value(&self, item: u64, binding: Option<(&str, &Value)>) -> Value {
+		let mut bindings = Object::new();
+		if let Some((name, value)) = binding {
+			bindings.insert(name, value.clone());
+		}
+		let mut payload = Object::new();
+		payload.insert("source", self.statement.as_ref());
+		payload.insert("statement_kind", self.kind.as_ref());
+		payload.insert("item", item);
+		payload.insert("bindings", Value::Object(bindings));
+		Value::Object(payload)
+	}
 }
 
 /// Converts syntactic options into the validated datastore contract.
@@ -148,7 +204,7 @@ fn import_options(
 				} else if value.eq_ignore_ascii_case("SKIP") {
 					ImportViolationPolicy::Skip
 				} else if value.eq_ignore_ascii_case("QUARANTINE") {
-					return Err(unsupported(source, option.span, "IMPORT QUARANTINE"));
+					ImportViolationPolicy::Quarantine
 				} else {
 					return Err(invalid_option_value(source, option));
 				};
@@ -181,10 +237,16 @@ fn import_options(
 				return Err(unsupported(source, option.span, "IMPORT FILL_FACTOR"));
 			}
 			ImportOptionName::SortMem => {
-				return Err(unsupported(source, option.span, "IMPORT SORT_MEM"));
+				result.sort_memory_bytes = NonZeroUsize::new(option_usize(option, source)?);
+				if result.sort_memory_bytes.is_none() {
+					return Err(invalid_option_value(source, option));
+				}
 			}
 			ImportOptionName::Parallelism => {
-				return Err(unsupported(source, option.span, "IMPORT PARALLELISM"));
+				result.parallelism = NonZeroUsize::new(option_usize(option, source)?);
+				if result.parallelism.is_none() {
+					return Err(invalid_option_value(source, option));
+				}
 			}
 		}
 	}
@@ -452,6 +514,7 @@ fn report_value(report: ImportReport) -> Value {
 		.iter()
 		.map(|(index, duration)| (index.get().to_string(), duration_value(*duration)))
 		.collect::<Object>();
+	let quarantine = report.quarantine().map_or(Value::None, |id| Value::Uuid(id.as_uuid()));
 	Value::from(Object::from_iter([
 		("processed", Value::from(report.processed_items())),
 		("applied", Value::from(report.applied_items())),
@@ -462,6 +525,7 @@ fn report_value(report: ImportReport) -> Value {
 		("built_indexes", Value::from(built_indexes)),
 		("phase_timings_ns", Value::from(phase_timings)),
 		("index_timings_ns", Value::from(index_timings)),
+		("quarantine", quarantine),
 		(
 			"indexes",
 			Value::from(match report.index_mode() {

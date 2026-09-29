@@ -50,6 +50,10 @@ impl Array {
 		self.0.pop()
 	}
 
+	pub fn clear(&mut self) {
+		self.0.clear();
+	}
+
 	pub fn into_vec(self) -> Vec<Value> {
 		self.0
 	}

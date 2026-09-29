@@ -18,6 +18,7 @@ mod graph_store;
 mod graph_superblock;
 mod hybrid_engine;
 mod image_io;
+mod job_catalog;
 mod local;
 mod local_store;
 mod membership_index;
@@ -27,6 +28,7 @@ mod page_cache;
 mod page_io;
 mod property_dictionary;
 mod property_page;
+mod quarantine;
 mod scoped_index_image;
 mod types;
 mod wal;
@@ -44,6 +46,7 @@ pub(crate) use local_store::{
 	PhysicalTraversalRead,
 };
 pub use page_io::PageIoMode;
+pub(crate) use quarantine::{QuarantineArchiveReader, QuarantineArtifact, QuarantineWriter};
 
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]
@@ -147,4 +150,23 @@ pub mod prototype_api {
 		pub use crate::graph::GraphId;
 	}
 }
-pub(crate) use graph_index::{ExternalIndexSorter, SortedIndexRecords};
+pub(crate) use graph_index::{
+	ExternalIndexSorter,
+	SortedIndexRecords,
+	check_external_sort_cancelled,
+	external_sort_metrics,
+	with_external_sort_control,
+	with_external_sort_options,
+};
+
+/// Returns the canonical number of global atom hot pages for one slot ceiling.
+pub(crate) const fn atom_hot_page_count(slot_capacity: usize) -> usize {
+	slot_capacity.div_ceil(atom_page::ATOM_SLOTS_PER_PAGE as usize)
+}
+
+/// Returns the canonical number of graph-local node and edge hot pages.
+pub(crate) const fn graph_hot_page_count(node_capacity: usize, edge_capacity: usize) -> usize {
+	node_capacity
+		.div_ceil(graph_pages::HOT_SLOTS_PER_PAGE)
+		.saturating_add(edge_capacity.div_ceil(graph_pages::HOT_SLOTS_PER_PAGE))
+}

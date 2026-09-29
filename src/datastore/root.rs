@@ -7,6 +7,7 @@ use super::{
 	AtomStoreRoot,
 	BaseAtom,
 	ClassId,
+	ClassIndexState,
 	ClassSchema,
 	ClassSchemaMode,
 	ConflictKey,
@@ -15,6 +16,7 @@ use super::{
 	GraphRoot,
 	GraphSchema,
 	IndexId,
+	IndexMaintenanceMode,
 	IndexStoreRoot,
 	OccurrenceState,
 	OverlayValue,
@@ -115,6 +117,45 @@ impl Default for DatabaseRoot {
 }
 
 impl DatabaseRoot {
+	/// Excludes every ready deferred user index from planning after a data
+	/// mutation and returns every affected deferred definition.
+	///
+	/// Ready bindings are removed exactly once. Definitions which are already
+	/// stale are still returned so that a concurrent catch-up observes later
+	/// commits through the bounded pending-index queue.
+	pub(crate) fn mark_deferred_indexes_stale(
+		&mut self,
+	) -> FerrosGrynnResult<Vec<(ClassId, IndexId, super::SchemaVersion)>> {
+		let mut affected = Vec::new();
+		let mut newly_stale = Vec::new();
+		{
+			let schema = Arc::make_mut(&mut self.schema);
+			for (class_id, class) in &mut schema.classes {
+				let class = Arc::make_mut(class);
+				for index in &mut class.indexes {
+					if index.maintenance_mode() != IndexMaintenanceMode::Deferred {
+						continue;
+					}
+					let id = index.id().ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"published deferred index is missing IndexId",
+						)
+					})?;
+					affected.push((*class_id, id, index.version()));
+					if index.state() == ClassIndexState::Ready {
+						index.state = ClassIndexState::Stale;
+						newly_stale.push(id);
+					}
+				}
+			}
+		}
+		let indexes = Arc::make_mut(&mut self.indexes);
+		for id in newly_stale {
+			indexes.remove_explicit_index(id);
+		}
+		Ok(affected)
+	}
+
 	pub(crate) fn insert_atom(
 		&mut self,
 		class: &ClassSchema,
@@ -298,6 +339,11 @@ impl DatabaseRoot {
 			field.class_id = Some(id);
 			field.key = Some(dictionary.intern(field.name.clone())?);
 		}
+		for index in &mut class.indexes {
+			if index.state() == ClassIndexState::Ready && index.build_revision == 0 {
+				index.build_revision = published_at;
+			}
+		}
 		class.published_at = published_at;
 		let mut indexes = self.indexes.as_ref().clone();
 		indexes.register_class(&class)?;
@@ -407,6 +453,68 @@ impl DatabaseRoot {
 		scratch_root: &std::path::Path,
 	) -> FerrosGrynnResult<()> {
 		self.statistics = Arc::new(crate::stats::analyze_database_at(self, scratch_root)?);
+		Ok(())
+	}
+
+	/// Reconstructs planner statistics using the maintenance-selected exact or
+	/// sampled distribution policy.
+	pub(crate) fn rebuild_statistics_with_mode_at(
+		&mut self,
+		scratch_root: &std::path::Path,
+		mode: super::MaintenanceAnalyzeMode,
+		target: super::MaintenanceTarget,
+	) -> FerrosGrynnResult<()> {
+		let method = match mode {
+			super::MaintenanceAnalyzeMode::Full => crate::stats::AnalyzeMethod::Full,
+			super::MaintenanceAnalyzeMode::Approximate {
+				sample_count,
+			} => crate::stats::AnalyzeMethod::Approximate {
+				sample_count: std::num::NonZeroU32::new(sample_count).ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("ANALYZE SAMPLE must be greater than zero")
+				})?,
+			},
+			super::MaintenanceAnalyzeMode::Automatic => {
+				return Err(FerrosGrynnError::invalid_argument(
+					"automatic ANALYZE mode must be resolved before building statistics",
+				));
+			}
+		};
+		let statistics = match target {
+			super::MaintenanceTarget::Database => {
+				crate::stats::analyze_database_with_method_at(self, scratch_root, method)?
+			}
+			super::MaintenanceTarget::BaseClass(class) => {
+				if self.schema.class_by_id(class).is_none() {
+					return Err(FerrosGrynnError::class_does_not_exist(class.to_string()));
+				}
+				let mut statistics = (*self.statistics).clone();
+				*statistics.base_mut() =
+					crate::stats::analyze_base_with_method_at(self, scratch_root, method)?;
+				statistics.mark_auxiliary_complete();
+				statistics
+			}
+			super::MaintenanceTarget::Graph(graph)
+			| super::MaintenanceTarget::EffectiveClass {
+				graph,
+				..
+			} => {
+				let mut statistics = (*self.statistics).clone();
+				statistics.replace_graph(
+					graph,
+					crate::stats::analyze_graph_with_method_at(self, graph, scratch_root, method)?,
+				);
+				statistics.mark_auxiliary_complete();
+				statistics
+			}
+			super::MaintenanceTarget::Index {
+				..
+			} => {
+				return Err(FerrosGrynnError::invalid_argument(
+					"ANALYZE does not accept an index maintenance target",
+				));
+			}
+		};
+		self.statistics = Arc::new(statistics);
 		Ok(())
 	}
 

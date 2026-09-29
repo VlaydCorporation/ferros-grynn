@@ -26,6 +26,10 @@ pub(super) enum DataFileRole {
 	WalBackfilled,
 	/// Data-space metadata replaced atomically by checkpoint.
 	Superblock,
+	/// Metadata replaced through the checksummed metadata-COW protocol.
+	MetadataCow,
+	/// Immutable auxiliary file outside positional page addressing.
+	AuxiliaryImmutable,
 }
 
 /// Bootstrap description supplied by the local database opener.
@@ -73,9 +77,9 @@ impl RegisteredDataFile {
 
 	/// Returns the shared Direct-I/O handle.
 	pub(super) fn file(&self) -> FerrosGrynnResult<Arc<DirectFile>> {
-		if self.role == DataFileRole::Superblock {
+		if self.role != DataFileRole::WalBackfilled {
 			return Err(FerrosGrynnError::invalid_storage_file(
-				"checkpoint-owned metadata has no positional data handle",
+				"metadata and auxiliary files have no positional data handle",
 			));
 		}
 		if let Some(file) = self.file.get() {
@@ -285,11 +289,20 @@ fn validate_registration(
 
 /// Validates that checkpoint ownership agrees with the persisted file kind.
 fn validate_role(file_id: DataFileId, role: DataFileRole) -> FerrosGrynnResult<()> {
-	let metadata = matches!(
-		file_id.kind(),
-		Some(DataFileKind::GraphSuperblock | DataFileKind::AtomStoreSuperblock)
-	);
-	if metadata != (role == DataFileRole::Superblock) {
+	let expected = match file_id.kind() {
+		Some(DataFileKind::GraphSuperblock | DataFileKind::AtomStoreSuperblock) => {
+			DataFileRole::Superblock
+		}
+		Some(DataFileKind::JobCatalog) => DataFileRole::MetadataCow,
+		Some(DataFileKind::ImportQuarantine) => DataFileRole::AuxiliaryImmutable,
+		Some(_) => DataFileRole::WalBackfilled,
+		None => {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"data-file identity has an unknown format-v1 kind",
+			));
+		}
+	};
+	if expected != role {
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"data-file role does not match its format-v1 kind",
 		));

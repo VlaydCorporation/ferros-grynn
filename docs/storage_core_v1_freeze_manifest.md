@@ -1,7 +1,9 @@
 # Freeze-manifest storage core v1
 
-**Статус: утверждён этапом 19 W4, 2026-09-28.** Этот документ перечисляет
-байтовые контракты Windows GA-core. Нормативные layout остаются в
+**Статус: повторно утверждён после этапа 21, 2026-09-29.** Первичная freeze
+выполнена этапом 19 W4; этапы 20–21 сознательно разморозили только catalog
+payloads и завершили несовместимый cutover v9/v5 → v10/v6. Этот документ
+перечисляет байтовые контракты Windows GA-core. Нормативные layout остаются в
 [`disk_storage_spec.md`](disk_storage_spec.md); manifest фиксирует их набор,
 версии и границу совместимости.
 
@@ -10,18 +12,21 @@
 | Контракт                             |          Замороженная версия | Authority                     |
 |--------------------------------------|-----------------------------:|-------------------------------|
 | common page header и page types      | `STORAGE_FORMAT_VERSION = 1` | `disk_storage_spec.md` §§6, 8 |
-| database catalog payload             |                    `FGDC v9` | §7.2                          |
-| physical-file catalog payload        |                    `FGFC v5` | §7.2                          |
+| database catalog payload             |                   `FGDC v10` | §7.2                          |
+| physical-file catalog payload        |                    `FGFC v6` | §7.2                          |
 | catalog page chain                   |                    `FGC1 v1` | §§7.2, 18.2                   |
+| maintenance job catalog              |                    `FGJB v1` | §7.2                          |
+| import quarantine archive            |                    `FGQR v1` | §7.2                          |
 | canonical value envelope             |                    `FGAR v1` | §5                            |
 | frame WAL                            |                       `FGW1` | §22                           |
 | statistics root layouts              |           layout version `1` | §19                           |
 | AtomStore/graph/database superblocks |   format/compatibility `1/1` | §17                           |
 
-Decoder принимает только перечисленные версии. Автоматической миграции,
-reinterpretation старых `FGDC`/`FGFC` и test-only compatibility path нет.
-Любое изменение замороженных bytes требует `STORAGE_FORMAT_VERSION = 2` либо
-новой однозначно versioned side-file family.
+Decoder принимает только перечисленные версии. `FGDC v9`/`FGFC v5`, как и
+более ранние payloads, несовместимы; автоматической миграции, reinterpretation
+и test-only compatibility path нет. Следующее изменение повторно замороженных
+bytes требует `STORAGE_FORMAT_VERSION = 2` либо новой однозначно versioned
+side-file family.
 
 ## 2. Общие инварианты
 
@@ -47,7 +52,7 @@ reinterpretation старых `FGDC`/`FGFC` и test-only compatibility path не
 
 1. `DatabaseSuperblock`, `AtomStoreSuperblock` и `GraphSuperblock`, публикуемые
    metadata COW;
-2. `FGDC v9`, `FGFC v5` и bounded checksummed `FGC1` chains;
+2. `FGDC v10`, `FGFC v6` и bounded checksummed `FGC1` chains;
 3. `AtomHotPage`, graph-local node/edge hot pages, graph overlays, adjacency и
    cross-level overflow, property heap/large-property chains, subgraph directory
    и per-target freelists;
@@ -58,6 +63,8 @@ reinterpretation старых `FGDC`/`FGFC` и test-only compatibility path не
    COW;
 8. canonical `StorageValue`, order-preserving scalar/composite index key и
    `RecordId` codecs.
+9. checksummed metadata-COW `FGJB v1` и immutable streaming `FGQR v1` как
+   database auxiliary files вне positional page addressing.
 
 Названия файлов и UUID-generation layout заморожены §7. Primary/membership и
 engine-owned lookup indexes являются частью core; specialized fulltext, vector,
@@ -96,10 +103,12 @@ CPU/p99/RSS и golden/malformed vectors. Core-v1 bytes при этом не ме
 
 - `storage::page` — exact header, all assigned types, checksum, wrong
   page/type/version/flags;
-- `storage::catalog::database` — `FGDC v9` round-trip, truncation, old version,
+- `storage::catalog::database` — `FGDC v10` round-trip, truncation, отказ v9,
   duplicate identity/property/scope, invalid root/ownership/constraint bits;
-- `storage::catalog::file` — exact `FGFC v5`, отказ v4, companion/path/role и
+- `storage::catalog::file` — exact `FGFC v6`, отказ v5, companion/path/role и
   reserved bytes;
+- `storage::job_catalog`/`storage::quarantine` — exact `FGJB v1`/`FGQR v1`,
+  checksum, bounds, truncation и main/prev либо streaming lifecycle;
 - `storage::catalog::page_chain` — exact `FGC1`, multi-page chain, bounds и
   trailing bytes;
 - `values::storage::codec` — все v1 tags, `FGAR`, canonical collections,
@@ -109,6 +118,8 @@ CPU/p99/RSS и golden/malformed vectors. Core-v1 bytes при этом не ме
 - WAL record/checksum/torn-tail/corruption/checkpoint/reopen tests;
 - RAM/local/reopen differential gate и обе I/O feature-конфигурации.
 
-Команды и фактические результаты этапа сохраняются в
-[`reports/windows_ga_core_stage_19_report.md`](reports/windows_ga_core_stage_19_report.md),
-а profiler/CSV artifacts — в `target/windows-ga-core-stage19/`.
+Первичная freeze evidence хранится в
+[`reports/windows_ga_core_stage_19_report.md`](reports/windows_ga_core_stage_19_report.md).
+Evidence cutover/refreeze хранится в
+[`reports/gql_admin_stage_20_report.md`](reports/gql_admin_stage_20_report.md) и
+[`reports/gql_udf_stage_21_report.md`](reports/gql_udf_stage_21_report.md).

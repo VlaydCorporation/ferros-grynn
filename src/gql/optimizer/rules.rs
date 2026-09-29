@@ -70,7 +70,7 @@ fn fold_select(select: &mut LogicalSelect) -> bool {
 		}
 	}
 	for order in &mut select.order {
-		if !order.random {
+		if !order.random && !order.collate && !order.numeric {
 			changed |= fold_expr(&mut order.expression);
 		}
 	}
@@ -185,6 +185,10 @@ fn fold_expr(expression: &mut TypedExpr) -> bool {
 					.iter_mut()
 					.fold(false, |changed, argument| changed | fold_expr(argument))
 		}
+		TypedExprKind::NamedInvoke {
+			arguments,
+			..
+		} => arguments.iter_mut().fold(false, |changed, argument| changed | fold_expr(argument)),
 		TypedExprKind::Aggregate {
 			argument,
 			..
@@ -279,9 +283,27 @@ fn constant_expression(expression: &TypedExpr) -> bool {
 		TypedExprKind::Builtin {
 			function,
 			arguments,
-		} => !matches!(function, Builtin::TimeNow(_)) && arguments.iter().all(constant_expression),
+		} => {
+			!matches!(
+				function,
+				Builtin::TimeNow(_)
+					| Builtin::Uuid
+					| Builtin::Ulid
+					| Builtin::RandId
+					| Builtin::RegexMatcher
+					| Builtin::RegexNext
+					| Builtin::ArrayPush(_)
+					| Builtin::ArrayPop(_)
+					| Builtin::ArrayClear(_)
+					| Builtin::SetAdd(_)
+					| Builtin::SetClear(_)
+			) && arguments.iter().all(constant_expression)
+		}
 		TypedExprKind::Closure(_)
 		| TypedExprKind::Invoke {
+			..
+		}
+		| TypedExprKind::NamedInvoke {
 			..
 		}
 		| TypedExprKind::Traversal(_) => false,

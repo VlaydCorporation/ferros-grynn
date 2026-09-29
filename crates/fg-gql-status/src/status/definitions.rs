@@ -418,6 +418,36 @@ define_status_codes!(
 		message: "A database-wide import is in progress; concurrent writers are not allowed.",
 		hint: "Retry the complete write after the import finishes.",
 	},
+	MaintenanceTargetBusy, "FG-25F08" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::InvalidTransactionState,
+		domain: Domain::Transaction,
+		subcondition: "maintenance target busy",
+		message: "Maintenance target {target} already has an active job.",
+		params: {
+			target: String => Identifier,
+		},
+		hint: "Wait for or cancel the active job before retrying.",
+	},
+	MaintenanceRevisionRace, "FG-40F02" => {
+		kind: Error {
+			classification: ErrorClassification::TransientError,
+			category: ErrorCategory::Transaction,
+			severity: Severity::Error,
+		},
+		condition: Condition::TransactionRollback,
+		domain: Domain::Transaction,
+		subcondition: "maintenance source changed",
+		message: "Maintenance target {target} changed while the foreground build was running.",
+		params: {
+			target: String => Identifier,
+		},
+		hint: "Retry the maintenance statement against a fresh snapshot.",
+	},
 	TransactionAlreadyActive, "FG-25F04" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,
@@ -452,6 +482,20 @@ define_status_codes!(
 		message: "Transaction {transaction} was aborted by an earlier GrynQL error.",
 		params: {
 			transaction: u64 => DisplayValue,
+		},
+	},
+	MaintenanceJobNotFound, "FG-22F30" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Query,
+		subcondition: "maintenance job not found",
+		message: "Maintenance job {job} does not exist.",
+		params: {
+			job: String => StringLiteral,
 		},
 	},
 	QueryCursorExpired, "FG-25F07" => {

@@ -1,12 +1,20 @@
 //! Bounded-memory Direct-I/O runs for immutable index generation builds.
 
 use std::{
+	cell::Cell,
 	cmp::Reverse,
 	collections::BinaryHeap,
 	fs,
 	mem::size_of,
+	num::NonZeroUsize,
 	path::{Path, PathBuf},
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 };
+
+use rayon::{ThreadPoolBuilder, slice::ParallelSliceMut};
 
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -22,6 +30,136 @@ pub(super) const INDEX_SORT_RUN_BYTES: usize = 256 * 1024 * 1024;
 const INDEX_SORT_FAN_IN: usize = 64;
 /// Fixed record prefix: key length followed by one opaque sortable payload.
 const RUN_RECORD_PREFIX_BYTES: usize = size_of::<u32>() + size_of::<u64>();
+
+#[derive(Clone, Copy)]
+struct SortOptions {
+	run_budget: usize,
+	parallelism: usize,
+}
+
+/// Aggregate counters for the external sorters used by one builder call.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExternalSortMetrics {
+	pub(crate) processed_items: u64,
+	pub(crate) written_bytes: u64,
+	pub(crate) runs: u64,
+}
+
+thread_local! {
+	static SORT_OPTIONS: Cell<SortOptions> = const { Cell::new(SortOptions {
+		run_budget: INDEX_SORT_RUN_BYTES,
+		parallelism: 1,
+	}) };
+	static SORT_CANCELLATION: std::cell::RefCell<Option<Arc<AtomicBool>>> = const {
+		std::cell::RefCell::new(None)
+	};
+	static SORT_METRICS: Cell<ExternalSortMetrics> = const {
+		Cell::new(ExternalSortMetrics {
+			processed_items: 0,
+			written_bytes: 0,
+			runs: 0,
+		})
+	};
+}
+
+struct SortOptionsGuard(SortOptions);
+
+impl Drop for SortOptionsGuard {
+	fn drop(&mut self) {
+		SORT_OPTIONS.set(self.0);
+	}
+}
+
+struct SortCancellationGuard(Option<Arc<AtomicBool>>);
+
+impl Drop for SortCancellationGuard {
+	fn drop(&mut self) {
+		SORT_CANCELLATION.with(|slot| {
+			slot.replace(self.0.take());
+		});
+	}
+}
+
+/// Applies one caller-owned aggregate sort budget and worker limit to every
+/// external sorter created by the closure on this thread.
+pub(crate) fn with_external_sort_options<T>(
+	max_memory_bytes: NonZeroUsize,
+	max_parallelism: NonZeroUsize,
+	run: impl FnOnce() -> FerrosGrynnResult<T>,
+) -> FerrosGrynnResult<T> {
+	let previous = SORT_OPTIONS.replace(SortOptions {
+		run_budget: max_memory_bytes.get(),
+		parallelism: max_parallelism.get(),
+	});
+	let _guard = SortOptionsGuard(previous);
+	run()
+}
+
+/// Applies builder limits and one cooperative cancellation token while
+/// resetting aggregate sorter counters for the call.
+pub(crate) fn with_external_sort_control<T>(
+	max_memory_bytes: NonZeroUsize,
+	max_parallelism: NonZeroUsize,
+	cancellation: Arc<AtomicBool>,
+	run: impl FnOnce() -> FerrosGrynnResult<T>,
+) -> FerrosGrynnResult<T> {
+	let previous = SORT_CANCELLATION.with(|slot| slot.replace(Some(cancellation)));
+	let _guard = SortCancellationGuard(previous);
+	SORT_METRICS.set(ExternalSortMetrics::default());
+	with_external_sort_options(max_memory_bytes, max_parallelism, run)
+}
+
+/// Returns aggregate counters recorded by the current builder call.
+pub(crate) fn external_sort_metrics() -> ExternalSortMetrics {
+	SORT_METRICS.get()
+}
+
+/// Checks the current maintenance cancellation token, when one is installed.
+pub(crate) fn check_external_sort_cancelled() -> FerrosGrynnResult<()> {
+	let cancelled = SORT_CANCELLATION
+		.with(|slot| slot.borrow().as_ref().is_some_and(|token| token.load(Ordering::Acquire)));
+	if cancelled {
+		Err(FerrosGrynnError::query_cancelled())
+	} else {
+		Ok(())
+	}
+}
+
+fn record_sort_item() -> FerrosGrynnResult<()> {
+	SORT_METRICS.with(|metrics| {
+		let mut current = metrics.get();
+		current.processed_items = current
+			.processed_items
+			.checked_add(1)
+			.ok_or_else(|| invalid_sort("external-sort processed-item counter overflows u64"))?;
+		metrics.set(current);
+		Ok(())
+	})
+}
+
+fn record_sort_bytes(bytes: usize) -> FerrosGrynnResult<()> {
+	SORT_METRICS.with(|metrics| {
+		let mut current = metrics.get();
+		current.written_bytes = current
+			.written_bytes
+			.checked_add(bytes as u64)
+			.ok_or_else(|| invalid_sort("external-sort byte counter overflows u64"))?;
+		metrics.set(current);
+		Ok(())
+	})
+}
+
+fn record_sort_run() -> FerrosGrynnResult<()> {
+	SORT_METRICS.with(|metrics| {
+		let mut current = metrics.get();
+		current.runs = current
+			.runs
+			.checked_add(1)
+			.ok_or_else(|| invalid_sort("external-sort run counter overflows u64"))?;
+		metrics.set(current);
+		Ok(())
+	})
+}
 
 /// One total-order item consumed by index packers and bounded statistics.
 pub(crate) struct IndexSortRecord {
@@ -40,16 +178,26 @@ pub(crate) struct ExternalIndexSorter {
 	session: Option<SortSession>,
 	runs: Vec<SortRun>,
 	next_run: u64,
+	parallelism: usize,
 }
 
 impl ExternalIndexSorter {
 	/// Creates a sorter using the normative 256 MiB run budget.
 	pub(crate) fn new(database_root: &Path) -> Self {
-		Self::with_budget(database_root, INDEX_SORT_RUN_BYTES)
+		let options = SORT_OPTIONS.get();
+		Self::with_budget_and_parallelism(database_root, options.run_budget, options.parallelism)
 	}
 
 	/// Creates a sorter with an explicit budget for deterministic tests.
 	pub(crate) fn with_budget(database_root: &Path, run_budget: usize) -> Self {
+		Self::with_budget_and_parallelism(database_root, run_budget, SORT_OPTIONS.get().parallelism)
+	}
+
+	fn with_budget_and_parallelism(
+		database_root: &Path,
+		run_budget: usize,
+		parallelism: usize,
+	) -> Self {
 		Self {
 			temporary_root: database_root.join("tmp").join("index-sort"),
 			run_budget: run_budget.max(1),
@@ -58,6 +206,7 @@ impl ExternalIndexSorter {
 			session: None,
 			runs: Vec::new(),
 			next_run: 0,
+			parallelism: parallelism.max(1),
 		}
 	}
 
@@ -74,6 +223,7 @@ impl ExternalIndexSorter {
 	/// Adds one key and unchecked opaque address used by bounded internal-level
 	/// packing. The consumer validates the address domain before publication.
 	pub(crate) fn push_raw(&mut self, key: Vec<u8>, address: u64) -> FerrosGrynnResult<()> {
+		check_external_sort_cancelled()?;
 		if key.is_empty() || key.len() >= PAGE_SIZE {
 			return Err(invalid_sort("external-sort key does not fit one B+tree page"));
 		}
@@ -93,6 +243,7 @@ impl ExternalIndexSorter {
 			key,
 			address,
 		});
+		record_sort_item()?;
 		if self.buffered_bytes >= self.run_budget {
 			self.spill_buffered()?;
 		}
@@ -103,7 +254,7 @@ impl ExternalIndexSorter {
 	/// input.
 	pub(crate) fn finish(mut self) -> FerrosGrynnResult<SortedIndexRecords> {
 		if self.runs.is_empty() {
-			sort_records(&mut self.buffered);
+			sort_records(&mut self.buffered, self.parallelism)?;
 			return Ok(SortedIndexRecords::Memory(self.buffered));
 		}
 		self.spill_buffered()?;
@@ -114,6 +265,7 @@ impl ExternalIndexSorter {
 				let mut writer = RunWriter::create(output)?;
 				merge_runs(group, |record| writer.push(&record))?;
 				self.runs.push(writer.finish()?);
+				record_sort_run()?;
 				for run in group {
 					fs::remove_file(&run.path)
 						.map_err(|source| sort_io("remove merged index-sort run", source))?;
@@ -135,13 +287,18 @@ impl ExternalIndexSorter {
 		if self.buffered.is_empty() {
 			return Ok(());
 		}
-		sort_records(&mut self.buffered);
+		sort_records(&mut self.buffered, self.parallelism)?;
+		check_external_sort_cancelled()?;
 		let path = self.new_run_path()?;
 		let mut writer = RunWriter::create(path)?;
-		for record in &self.buffered {
+		for (index, record) in self.buffered.iter().enumerate() {
+			if index % 1024 == 0 {
+				check_external_sort_cancelled()?;
+			}
 			writer.push(record)?;
 		}
 		self.runs.push(writer.finish()?);
+		record_sort_run()?;
 		self.buffered.clear();
 		self.buffered_bytes = 0;
 		Ok(())
@@ -298,6 +455,7 @@ impl RunWriter {
 
 	/// Writes a byte slice across as many aligned pages as required.
 	fn write_bytes(&mut self, mut bytes: &[u8]) -> FerrosGrynnResult<()> {
+		record_sort_bytes(bytes.len())?;
 		while !bytes.is_empty() {
 			let count = bytes.len().min(PAGE_SIZE - self.offset);
 			self.page.as_bytes_mut()[self.offset..self.offset + count]
@@ -430,7 +588,12 @@ fn merge_runs(
 			heap.push(Reverse((record.key, record.address, index)));
 		}
 	}
+	let mut processed = 0_usize;
 	while let Some(Reverse((key, address, index))) = heap.pop() {
+		if processed % 1024 == 0 {
+			check_external_sort_cancelled()?;
+		}
+		processed = processed.saturating_add(1);
 		visit(IndexSortRecord {
 			key,
 			address,
@@ -443,10 +606,21 @@ fn merge_runs(
 }
 
 /// Applies the complete deterministic total order within one run.
-fn sort_records(records: &mut [IndexSortRecord]) {
-	records.sort_unstable_by(|left, right| {
-		left.key.cmp(&right.key).then_with(|| left.address.cmp(&right.address))
-	});
+fn sort_records(records: &mut [IndexSortRecord], parallelism: usize) -> FerrosGrynnResult<()> {
+	if parallelism <= 1 || records.len() < 2 {
+		records.sort_unstable_by(compare_records);
+		return Ok(());
+	}
+	let pool = ThreadPoolBuilder::new()
+		.num_threads(parallelism.min(records.len()))
+		.build()
+		.map_err(|source| invalid_sort(format!("create external-sort worker pool: {source}")))?;
+	pool.install(|| records.par_sort_unstable_by(compare_records));
+	Ok(())
+}
+
+fn compare_records(left: &IndexSortRecord, right: &IndexSortRecord) -> std::cmp::Ordering {
+	left.key.cmp(&right.key).then_with(|| left.address.cmp(&right.address))
 }
 
 /// Removes scratch left by a process that exited before RAII cleanup.
@@ -513,6 +687,78 @@ mod tests {
 			Ok(())
 		})();
 		drop(fs::remove_dir_all(&root));
+		result
+	}
+
+	#[test]
+	fn scoped_budget_and_parallelism_preserve_canonical_order() -> FerrosGrynnResult<()> {
+		let root = std::env::current_dir()
+			.map_err(|source| sort_io("resolve parallel sorter test root", source))?
+			.join(format!(
+				".ferros-grynn-sort-options-{}-{}",
+				std::process::id(),
+				NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+			));
+		fs::create_dir(&root)
+			.map_err(|source| sort_io("create parallel sorter test root", source))?;
+		let result = with_external_sort_options(
+			NonZeroUsize::new(40).unwrap_or(NonZeroUsize::MIN),
+			NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
+			|| {
+				let mut sorter = ExternalIndexSorter::new(&root);
+				for slot in (0..200_u64).rev() {
+					sorter.push(
+						format!("key-{slot:04}").into_bytes(),
+						DiskAtomRef::from_parts(AtomKind::Node, slot)?,
+					)?;
+				}
+				let sorted = sorter.finish()?;
+				let mut slots = Vec::new();
+				sorted.visit::<DiskAtomRef>(|_key, atom| {
+					slots.push(atom.slot());
+					Ok(())
+				})?;
+				assert_eq!(slots, (0..200).collect::<Vec<_>>());
+				Ok(())
+			},
+		);
+		drop(fs::remove_dir_all(root));
+		result
+	}
+
+	#[test]
+	fn maintenance_control_reports_runs_and_stops_before_more_input() -> FerrosGrynnResult<()> {
+		let root = std::env::current_dir()
+			.map_err(|source| sort_io("resolve controlled sorter test root", source))?
+			.join(format!(
+				".ferros-grynn-sort-control-{}-{}",
+				std::process::id(),
+				NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+			));
+		fs::create_dir(&root)
+			.map_err(|source| sort_io("create controlled sorter test root", source))?;
+		let cancellation = Arc::new(AtomicBool::new(false));
+		let result = with_external_sort_control(
+			NonZeroUsize::MIN,
+			NonZeroUsize::MIN,
+			cancellation.clone(),
+			|| {
+				let mut sorter = ExternalIndexSorter::new(&root);
+				sorter.push(b"first".to_vec(), DiskAtomRef::from_parts(AtomKind::Node, 1)?)?;
+				let metrics = external_sort_metrics();
+				assert_eq!(metrics.processed_items, 1);
+				assert!(metrics.runs >= 1);
+				assert!(metrics.written_bytes > 0);
+				cancellation.store(true, Ordering::Release);
+				assert!(
+					sorter
+						.push(b"second".to_vec(), DiskAtomRef::from_parts(AtomKind::Node, 2)?)
+						.is_err()
+				);
+				Ok(())
+			},
+		);
+		drop(fs::remove_dir_all(root));
 		result
 	}
 }

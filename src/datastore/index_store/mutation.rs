@@ -79,6 +79,9 @@ impl IndexStoreRoot {
 			return Err(invalid("class indexes are already registered"));
 		}
 		for index in class.indexes() {
+			if index.state() != crate::datastore::ClassIndexState::Ready {
+				continue;
+			}
 			match index.scope() {
 				IndexScope::Base => {
 					let mut binding = binding::<GlobalAtomId>(class, index)?;

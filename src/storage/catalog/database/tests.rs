@@ -2,7 +2,14 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::{
-	datastore::{ClassIndexKind, ClassIndexState, ClassSchemaMode, IndexScope},
+	datastore::{
+		ClassIndexKind,
+		ClassIndexState,
+		ClassSchemaMode,
+		FunctionEffect,
+		FunctionId,
+		IndexScope,
+	},
 	gql_status::FerrosGrynnResult,
 	graph::{AtomId, AtomKind, GraphKind, GraphTopologyConstraints},
 	storage::types::{DataFileId, DataFileKind},
@@ -10,11 +17,11 @@ use crate::{
 };
 
 #[test]
-fn fgdc_v9_round_trips_recursive_types_bindings_and_graph_properties() -> FerrosGrynnResult<()> {
+fn fgdc_v10_round_trips_recursive_types_bindings_and_graph_properties() -> FerrosGrynnResult<()> {
 	let catalog = fixture()?;
 	let bytes = catalog.encode()?;
 	assert_eq!(&bytes[..4], b"FGDC");
-	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 9);
+	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 10);
 	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
 	Ok(())
 }
@@ -23,7 +30,7 @@ fn fgdc_v9_round_trips_recursive_types_bindings_and_graph_properties() -> Ferros
 fn fgdc_rejects_old_version_truncation_and_duplicate_schema_identity() -> FerrosGrynnResult<()> {
 	let catalog = fixture()?;
 	let mut old = catalog.encode()?;
-	old[4..6].copy_from_slice(&8_u16.to_le_bytes());
+	old[4..6].copy_from_slice(&9_u16.to_le_bytes());
 	assert!(DatabaseCatalog::decode(&old).is_err());
 
 	let mut truncated = catalog.encode()?;
@@ -48,7 +55,7 @@ fn fgdc_rejects_duplicate_or_unsorted_graph_properties() -> FerrosGrynnResult<()
 }
 
 #[test]
-fn fgdc_v9_allows_one_internal_child_through_multiple_owner_scopes() -> FerrosGrynnResult<()> {
+fn fgdc_v10_allows_one_internal_child_through_multiple_owner_scopes() -> FerrosGrynnResult<()> {
 	let catalog = fixture_with_shared_child()?;
 	let decoded = DatabaseCatalog::decode(&catalog.encode()?)?;
 	let root = &decoded.graphs[0];
@@ -59,7 +66,7 @@ fn fgdc_v9_allows_one_internal_child_through_multiple_owner_scopes() -> FerrosGr
 }
 
 #[test]
-fn fgdc_v9_rejects_duplicate_scope_and_noncanonical_internal_name() -> FerrosGrynnResult<()> {
+fn fgdc_v10_rejects_duplicate_scope_and_noncanonical_internal_name() -> FerrosGrynnResult<()> {
 	let mut duplicate_scope = fixture_with_shared_child()?;
 	let first_scope = duplicate_scope.graphs[0].arena.scope_by_slot[&1].clone();
 	duplicate_scope.graphs[0].arena.scope_by_slot.insert(2, first_scope);
@@ -72,7 +79,7 @@ fn fgdc_v9_rejects_duplicate_scope_and_noncanonical_internal_name() -> FerrosGry
 }
 
 #[test]
-fn fgdc_v9_rejects_unknown_constraint_bits_and_invalid_roots() -> FerrosGrynnResult<()> {
+fn fgdc_v10_rejects_unknown_constraint_bits_and_invalid_roots() -> FerrosGrynnResult<()> {
 	let catalog = fixture()?;
 	let mut unknown_bits = catalog.encode()?;
 	let graph_header = first_graph_header(&unknown_bits, &catalog.graphs[0])?;
@@ -90,7 +97,7 @@ fn fgdc_v9_rejects_unknown_constraint_bits_and_invalid_roots() -> FerrosGrynnRes
 }
 
 #[test]
-fn fgdc_v9_rejects_invalid_internal_ownership_and_scope_ancestry() -> FerrosGrynnResult<()> {
+fn fgdc_v10_rejects_invalid_internal_ownership_and_scope_ancestry() -> FerrosGrynnResult<()> {
 	let mut missing_owner = fixture_with_shared_child()?;
 	missing_owner.graphs[1].owner_root = GraphId::new(99);
 	assert!(missing_owner.encode().is_err());
@@ -139,7 +146,7 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 	};
 	Ok(DatabaseCatalog {
 		next_graph_id: 8,
-		next_schema_id: 7,
+		next_schema_id: 8,
 		time_zones: vec!["Europe/London".into()],
 		atom_store: AtomStoreCatalogBinding {
 			generation: 11,
@@ -166,6 +173,8 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 				name: "by_home".into(),
 				kind: ClassIndexKind::Unique,
 				state: ClassIndexState::Ready,
+				maintenance: crate::datastore::IndexMaintenanceMode::Immediate,
+				build_revision: 1,
 				scope: IndexScope::Base,
 				fields: vec![PropertyKeyId::new(0)],
 				physical: Some(index(3)?),
@@ -206,6 +215,24 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 			published_at: 1,
 			name: "answer".into(),
 			value: vec![0],
+			comment: Some("durable parameter".into()),
+		}],
+		functions: vec![FunctionCatalogEntry {
+			id: FunctionId::new(7).ok_or_else(|| codec::invalid("invalid fixture function"))?,
+			version: SchemaVersion::INITIAL,
+			published_at: 1,
+			namespace: "fn".into(),
+			name: "increment".into(),
+			parameters: vec![FunctionParameterCatalogEntry {
+				name: "value".into(),
+				value_type: Type::Int,
+			}],
+			result: Type::Int,
+			effect: FunctionEffect::Pure,
+			cost: false,
+			max_depth: None,
+			body: "{ RETURN $value + 1; }".into(),
+			comment: Some("fixture function".into()),
 		}],
 	})
 }
@@ -217,7 +244,7 @@ fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 	let owner_a = AtomId::from_parts(AtomKind::Node, 0, 0)?;
 	let owner_b = AtomId::from_parts(AtomKind::Node, 1, 0)?;
 	catalog.next_graph_id = 9;
-	catalog.next_schema_id = 9;
+	catalog.next_schema_id = 10;
 	catalog.graphs[0].arena.graph_by_slot.extend([(1, child), (2, child)]);
 	catalog.graphs[0]
 		.arena
@@ -233,11 +260,11 @@ fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 		storage_mode: GraphStorageMode::DiskBacked,
 		topology_constraints: GraphTopologyConstraints::empty(),
 		label_index: (
-			IndexId::new(7).ok_or_else(|| codec::invalid("invalid label index"))?,
+			IndexId::new(8).ok_or_else(|| codec::invalid("invalid label index"))?,
 			SchemaVersion::INITIAL,
 		),
 		adjacency_index: (
-			IndexId::new(8).ok_or_else(|| codec::invalid("invalid adjacency index"))?,
+			IndexId::new(9).ok_or_else(|| codec::invalid("invalid adjacency index"))?,
 			SchemaVersion::INITIAL,
 		),
 		membership: PhysicalIndexBinding {

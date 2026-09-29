@@ -128,6 +128,47 @@ impl Display for IndexId {
 	}
 }
 
+/// Stable identity of one named function overload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct FunctionId(SchemaId);
+
+impl FunctionId {
+	/// Creates a function identity from its durable representation.
+	pub const fn new(value: u32) -> Option<Self> {
+		match SchemaId::new(value) {
+			Some(value) => Some(Self(value)),
+			None => None,
+		}
+	}
+
+	/// Returns the durable integer representation.
+	pub const fn get(self) -> u32 {
+		self.0.get()
+	}
+
+	pub(crate) const fn from_schema_id(value: SchemaId) -> Self {
+		Self(value)
+	}
+
+	pub(crate) fn from_storage(value: u32) -> FerrosGrynnResult<Self> {
+		Self::new(value)
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("function identity is reserved"))
+	}
+}
+
+impl From<FunctionId> for SchemaId {
+	fn from(value: FunctionId) -> Self {
+		value.0
+	}
+}
+
+impl Display for FunctionId {
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+		Display::fmt(&self.get(), formatter)
+	}
+}
+
 /// Monotonic semantic version of one schema-catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -341,7 +382,205 @@ pub struct SchemaParameter {
 	pub(crate) version: SchemaVersion,
 	pub(crate) name: Text,
 	pub(crate) value: Value,
+	pub(crate) comment: Option<Text>,
 	pub(crate) published_at: u64,
+}
+
+/// Declared side-effect class of one named function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum FunctionEffect {
+	/// The function depends only on its arguments.
+	Pure,
+	/// The function may read the statement snapshot.
+	Stable,
+	/// The function may perform data mutations through a transaction savepoint.
+	Impure,
+}
+
+/// One named parameter in a durable function signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaFunctionParameter {
+	pub(crate) name: Text,
+	pub(crate) value_type: crate::values::Type,
+}
+
+impl SchemaFunctionParameter {
+	/// Creates one parameter after validating its catalog name.
+	pub fn new<IntoText: Into<Text>>(
+		name: IntoText,
+		value_type: crate::values::Type,
+	) -> FerrosGrynnResult<Self> {
+		let name = name.into();
+		validate_catalog_name(name.as_str(), "function parameter")?;
+		Ok(Self {
+			name,
+			value_type,
+		})
+	}
+
+	/// Returns the source-level parameter name without a `$` prefix.
+	pub const fn name(&self) -> &Text {
+		&self.name
+	}
+
+	/// Returns the resolved parameter type.
+	pub const fn value_type(&self) -> &crate::values::Type {
+		&self.value_type
+	}
+}
+
+/// Immutable durable definition of one named function overload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaFunction {
+	pub(crate) id: Option<FunctionId>,
+	pub(crate) version: SchemaVersion,
+	pub(crate) namespace: Text,
+	pub(crate) name: Text,
+	pub(crate) parameters: Vec<SchemaFunctionParameter>,
+	pub(crate) result: crate::values::Type,
+	pub(crate) effect: FunctionEffect,
+	pub(crate) cost: bool,
+	pub(crate) max_depth: Option<u8>,
+	pub(crate) body: Text,
+	pub(crate) comment: Option<Text>,
+	pub(crate) published_at: u64,
+}
+
+impl SchemaFunction {
+	/// Creates an unpublished named function definition.
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-argument error for an invalid name, duplicate
+	/// parameter, empty body, invalid recursion bound, or non-pure cost
+	/// function.
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "a durable function definition owns these fixed catalog fields"
+	)]
+	pub fn new<IntoNamespace: Into<Text>, IntoName: Into<Text>, IntoBody: Into<Text>>(
+		namespace: IntoNamespace,
+		name: IntoName,
+		parameters: Vec<SchemaFunctionParameter>,
+		result: crate::values::Type,
+		effect: FunctionEffect,
+		cost: bool,
+		max_depth: Option<u8>,
+		body: IntoBody,
+	) -> FerrosGrynnResult<Self> {
+		let namespace = namespace.into();
+		let name = name.into();
+		let body = body.into();
+		validate_catalog_name(namespace.as_str(), "function namespace")?;
+		validate_catalog_name(name.as_str(), "function name")?;
+		if namespace.as_str() != "fn" {
+			return Err(FerrosGrynnError::invalid_argument(
+				"user-defined functions must use the 'fn' namespace",
+			));
+		}
+		let mut names = std::collections::BTreeSet::new();
+		if parameters.iter().any(|parameter| !names.insert(parameter.name.as_str())) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"function parameter names must be unique",
+			));
+		}
+		if body.is_empty() || body.as_str().contains('\0') {
+			return Err(FerrosGrynnError::invalid_argument(
+				"function body must be non-empty UTF-8 without NUL",
+			));
+		}
+		if max_depth.is_some_and(|depth| !(1..=64).contains(&depth)) {
+			return Err(FerrosGrynnError::invalid_argument("function MAXDEPTH must be in 1..=64"));
+		}
+		if cost && effect != FunctionEffect::Pure {
+			return Err(FerrosGrynnError::invalid_argument("COST functions must be PURE"));
+		}
+		Ok(Self {
+			id: None,
+			version: SchemaVersion::INITIAL,
+			namespace,
+			name,
+			parameters,
+			result,
+			effect,
+			cost,
+			max_depth,
+			body,
+			comment: None,
+			published_at: 0,
+		})
+	}
+
+	/// Attaches an optional durable catalog comment.
+	#[must_use]
+	pub fn with_comment<IntoText: Into<Text>>(mut self, comment: IntoText) -> Self {
+		self.comment = Some(comment.into());
+		self
+	}
+
+	/// Returns the stable identity after publication.
+	pub const fn id(&self) -> Option<FunctionId> {
+		self.id
+	}
+
+	/// Returns the semantic definition version.
+	pub const fn version(&self) -> SchemaVersion {
+		self.version
+	}
+
+	/// Returns the namespace. User definitions always use `fn`.
+	pub const fn namespace(&self) -> &Text {
+		&self.namespace
+	}
+
+	/// Returns the unqualified function name.
+	pub const fn name(&self) -> &Text {
+		&self.name
+	}
+
+	/// Returns the ordered exact overload signature.
+	pub fn parameters(&self) -> impl ExactSizeIterator<Item = &SchemaFunctionParameter> {
+		self.parameters.iter()
+	}
+
+	/// Returns the resolved return type.
+	pub const fn result(&self) -> &crate::values::Type {
+		&self.result
+	}
+
+	/// Returns the declared and validated effect class.
+	pub const fn effect(&self) -> FunctionEffect {
+		self.effect
+	}
+
+	/// Returns whether the function is eligible as a custom cost function.
+	pub const fn is_cost(&self) -> bool {
+		self.cost
+	}
+
+	/// Returns the explicit recursion bound, if any.
+	pub const fn max_depth(&self) -> Option<u8> {
+		self.max_depth
+	}
+
+	/// Returns the persisted UTF-8 source body.
+	pub const fn body(&self) -> &Text {
+		&self.body
+	}
+
+	/// Returns the optional durable comment.
+	pub const fn comment(&self) -> Option<&Text> {
+		self.comment.as_ref()
+	}
+
+	pub(crate) fn signature(&self) -> (String, String, Vec<crate::values::Type>) {
+		(
+			self.namespace.to_string(),
+			self.name.to_string(),
+			self.parameters.iter().map(|parameter| parameter.value_type.clone()).collect(),
+		)
+	}
 }
 
 impl SchemaParameter {
@@ -363,8 +602,16 @@ impl SchemaParameter {
 			version: SchemaVersion::INITIAL,
 			name,
 			value,
+			comment: None,
 			published_at: 0,
 		})
+	}
+
+	/// Attaches an optional durable catalog comment.
+	#[must_use]
+	pub fn with_comment<IntoText: Into<Text>>(mut self, comment: IntoText) -> Self {
+		self.comment = Some(comment.into());
+		self
 	}
 
 	/// Returns the stable identity after the definition has been published.
@@ -386,6 +633,11 @@ impl SchemaParameter {
 	pub const fn value(&self) -> &Value {
 		&self.value
 	}
+
+	/// Returns the optional durable catalog comment.
+	pub const fn comment(&self) -> Option<&Text> {
+		self.comment.as_ref()
+	}
 }
 
 /// Immutable MVCC snapshot of currently visible schema definitions.
@@ -401,6 +653,10 @@ pub struct SchemaCatalog {
 	pub(crate) class_versions: BTreeMap<ClassId, u64>,
 	pub(crate) parameters: BTreeMap<String, Arc<SchemaParameter>>,
 	pub(crate) parameter_versions: BTreeMap<String, u64>,
+	pub(crate) functions: BTreeMap<FunctionId, Arc<SchemaFunction>>,
+	pub(crate) function_signatures:
+		BTreeMap<(String, String, Vec<crate::values::Type>), FunctionId>,
+	pub(crate) function_versions: BTreeMap<FunctionId, u64>,
 }
 
 impl Default for SchemaCatalog {
@@ -416,6 +672,9 @@ impl Default for SchemaCatalog {
 			class_versions: BTreeMap::new(),
 			parameters: BTreeMap::new(),
 			parameter_versions: BTreeMap::new(),
+			functions: BTreeMap::new(),
+			function_signatures: BTreeMap::new(),
+			function_versions: BTreeMap::new(),
 		}
 	}
 }
@@ -464,6 +723,33 @@ impl SchemaCatalog {
 	pub fn parameters(&self) -> impl ExactSizeIterator<Item = &Arc<SchemaParameter>> {
 		self.parameters.values()
 	}
+
+	/// Resolves one exact named function overload.
+	pub fn function(
+		&self,
+		namespace: &str,
+		name: &str,
+		parameters: &[crate::values::Type],
+	) -> Option<Arc<SchemaFunction>> {
+		self.function_signatures
+			.get(&(namespace.to_owned(), name.to_owned(), parameters.to_vec()))
+			.and_then(|id| self.functions.get(id))
+			.cloned()
+	}
+
+	/// Iterates named function definitions in stable identity order.
+	pub fn functions(&self) -> impl ExactSizeIterator<Item = &Arc<SchemaFunction>> {
+		self.functions.values()
+	}
+}
+
+fn validate_catalog_name(name: &str, subject: &str) -> FerrosGrynnResult<()> {
+	if name.is_empty() || name.contains('\0') {
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"{subject} must be non-empty and must not contain NUL"
+		)));
+	}
+	Ok(())
 }
 
 #[cfg(test)]

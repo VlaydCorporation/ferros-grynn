@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use super::consts::{
 	DEFAULT_BUFFER_POOL_PAGES,
@@ -7,6 +7,25 @@ use super::consts::{
 	DEFAULT_MAX_SNAPSHOT_AGE,
 	DEFAULT_MAX_WRITE_SET_BYTES,
 };
+
+/// Resource limits shared by foreground and background maintenance builders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MaintenanceOptions {
+	/// Maximum aggregate memory used by all sort runs and worker lanes.
+	pub max_memory_bytes: NonZeroUsize,
+	/// Maximum number of scoped worker threads used by one build.
+	pub max_parallelism: NonZeroUsize,
+}
+
+impl Default for MaintenanceOptions {
+	fn default() -> Self {
+		Self {
+			max_memory_bytes: NonZeroUsize::new(256 * 1024 * 1024).unwrap_or(NonZeroUsize::MIN),
+			max_parallelism: std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+		}
+	}
+}
 
 /// Physical I/O strategy selected for one local datastore.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +83,8 @@ pub struct LocalOptions {
 	pub max_snapshot_age: Duration,
 	/// Maximum estimated bytes in one transaction-private write set.
 	pub max_write_set_bytes: usize,
+	/// Resource limits for maintenance and import builders.
+	pub maintenance: MaintenanceOptions,
 }
 
 impl Default for LocalOptions {
@@ -74,6 +95,7 @@ impl Default for LocalOptions {
 			checkpoint: CheckpointPolicy::default(),
 			max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
 			max_write_set_bytes: DEFAULT_MAX_WRITE_SET_BYTES,
+			maintenance: MaintenanceOptions::default(),
 		}
 	}
 }
@@ -83,6 +105,8 @@ impl Default for LocalOptions {
 pub struct InMemoryOptions {
 	pub max_snapshot_age: Duration,
 	pub max_write_set_bytes: usize,
+	/// Resource limits for maintenance and import builders.
+	pub maintenance: MaintenanceOptions,
 }
 
 impl Default for InMemoryOptions {
@@ -90,6 +114,7 @@ impl Default for InMemoryOptions {
 		Self {
 			max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
 			max_write_set_bytes: DEFAULT_MAX_WRITE_SET_BYTES,
+			maintenance: MaintenanceOptions::default(),
 		}
 	}
 }

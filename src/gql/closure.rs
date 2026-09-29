@@ -17,7 +17,7 @@ use std::{
 
 use parking_lot::Mutex;
 
-use super::ir::LogicalClosure;
+use super::ir::{LogicalClosure, NamedFunctionKey};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::{Closure, RuntimeId, Value},
@@ -68,6 +68,26 @@ impl LanguageClosureState {
 		self.registry.lock().resolve(closure)
 	}
 
+	pub(in crate::gql) fn resolve_named(
+		&self,
+		function: NamedFunctionKey,
+	) -> FerrosGrynnResult<Arc<LogicalClosure>> {
+		self.registry.lock().resolve_named(function)
+	}
+
+	pub(in crate::gql) fn cached_named(
+		&self,
+		function: NamedFunctionKey,
+	) -> Option<Arc<LogicalClosure>> {
+		self.registry.lock().named_entries.get(&function).cloned()
+	}
+
+	pub(in crate::gql) fn cache_named_plan(&self, plan: &LogicalClosure) -> FerrosGrynnResult<()> {
+		self.registry.lock().cache_named(plan)?;
+		self.populated.store(true, Ordering::Release);
+		Ok(())
+	}
+
 	#[cfg(test)]
 	pub(crate) fn retained_bytes(&self) -> usize {
 		self.registry.lock().retained_bytes()
@@ -89,6 +109,9 @@ pub(crate) struct LanguageClosureRegistry {
 	owner: RuntimeId,
 	entries: BTreeMap<RuntimeId, LanguageClosureEntry>,
 	retained_bytes: usize,
+	named_epoch: Option<u64>,
+	named_entries: BTreeMap<NamedFunctionKey, Arc<LogicalClosure>>,
+	named_bytes: usize,
 }
 
 impl Default for LanguageClosureRegistry {
@@ -97,6 +120,9 @@ impl Default for LanguageClosureRegistry {
 			owner: RuntimeId::next(),
 			entries: BTreeMap::new(),
 			retained_bytes: 0,
+			named_epoch: None,
+			named_entries: BTreeMap::new(),
+			named_bytes: 0,
 		}
 	}
 }
@@ -108,6 +134,7 @@ impl LanguageClosureRegistry {
 		slots: &[Value],
 		statement_nonce: u64,
 	) -> FerrosGrynnResult<Closure> {
+		self.cache_named(plan)?;
 		let captures = plan
 			.captures
 			.iter()
@@ -127,7 +154,7 @@ impl LanguageClosureRegistry {
 					.saturating_add(value.estimated_heap_bytes())
 			},
 		));
-		let retained = self.retained_bytes.saturating_add(bytes);
+		let retained = self.retained_bytes.saturating_add(self.named_bytes).saturating_add(bytes);
 		if retained > MAX_RETAINED_BYTES {
 			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
 				"closure registry".to_owned(),
@@ -145,8 +172,35 @@ impl LanguageClosureRegistry {
 			statement_nonce,
 			retained_bytes: bytes,
 		});
-		self.retained_bytes = retained;
+		self.retained_bytes = self.retained_bytes.saturating_add(bytes);
 		Ok(closure)
+	}
+
+	fn cache_named(&mut self, plan: &LogicalClosure) -> FerrosGrynnResult<()> {
+		let Some(function) = plan.named_function else {
+			return Ok(());
+		};
+		if self.named_epoch != Some(function.schema_epoch) {
+			self.named_entries.clear();
+			self.named_bytes = 0;
+			self.named_epoch = Some(function.schema_epoch);
+		}
+		if self.named_entries.contains_key(&function) {
+			return Ok(());
+		}
+		let retained = self
+			.retained_bytes
+			.saturating_add(self.named_bytes)
+			.saturating_add(plan.retained_plan_bytes);
+		if retained > MAX_RETAINED_BYTES {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"named function cache".to_owned(),
+				MAX_RETAINED_BYTES as u64,
+			));
+		}
+		self.named_bytes = self.named_bytes.saturating_add(plan.retained_plan_bytes);
+		self.named_entries.insert(function, Arc::new(plan.clone()));
+		Ok(())
 	}
 
 	/// Releases closures created by one statement unless its result or a
@@ -214,8 +268,16 @@ impl LanguageClosureRegistry {
 			.ok_or_else(|| FerrosGrynnError::closure_expired(closure.id().get()))
 	}
 
+	fn resolve_named(&self, function: NamedFunctionKey) -> FerrosGrynnResult<Arc<LogicalClosure>> {
+		self.named_entries.get(&function).cloned().ok_or_else(|| {
+			FerrosGrynnError::invalid_argument(
+				"Compiled named function is unavailable for the current schema epoch.",
+			)
+		})
+	}
+
 	#[cfg(test)]
 	fn retained_bytes(&self) -> usize {
-		self.retained_bytes
+		self.retained_bytes.saturating_add(self.named_bytes)
 	}
 }

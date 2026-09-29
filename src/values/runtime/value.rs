@@ -20,6 +20,7 @@ use super::{
 	Graph,
 	GraphKind,
 	GraphRef,
+	Matcher,
 	MaterializedGraph,
 	Number,
 	Object,
@@ -62,6 +63,7 @@ pub enum Value {
 	GraphRef(Box<GraphRef>),
 	Record(Box<RecordId>),
 	Regex(Regex),
+	Matcher(Matcher),
 	Range(Range),
 	Atom(Box<AtomRef>),
 	AtomOccurrence(Box<AtomOccurrenceRef>),
@@ -147,6 +149,7 @@ impl Value {
 			Self::GraphRef(_) => ValueKind::GraphRef,
 			Self::Record(_) => ValueKind::Record,
 			Self::Regex(_) => ValueKind::Regex,
+			Self::Matcher(_) => ValueKind::Matcher,
 			Self::Range(_) => ValueKind::Range,
 			Self::Atom(_) => ValueKind::Atom,
 			Self::AtomOccurrence(_) => ValueKind::AtomOccurrence,
@@ -191,6 +194,7 @@ impl Value {
 				size_of::<RecordId>().saturating_add(estimated_record_id_heap_bytes(value))
 			}
 			Self::Regex(value) => value.as_str().len(),
+			Self::Matcher(value) => value.estimated_heap_bytes(),
 			Self::Range(value) => estimated_bound_heap_bytes(value.start())
 				.saturating_add(estimated_bound_heap_bytes(value.end())),
 			Self::Atom(value) => {
@@ -238,6 +242,7 @@ impl Value {
 			| Self::GraphRef(_)
 			| Self::Record(_)
 			| Self::Regex(_)
+			| Self::Matcher(_)
 			| Self::Range(_)
 			| Self::Atom(_)
 			| Self::AtomOccurrence(_)
@@ -364,6 +369,13 @@ impl Value {
 		}
 	}
 
+	pub const fn as_matcher(&self) -> Option<&Matcher> {
+		match self {
+			Self::Matcher(value) => Some(value),
+			_ => None,
+		}
+	}
+
 	pub const fn as_range(&self) -> Option<&Range> {
 		match self {
 			Self::Range(value) => Some(value),
@@ -445,6 +457,7 @@ impl Value {
 				start_storable && end_storable
 			}
 			Self::Regex(_)
+			| Self::Matcher(_)
 			| Self::AtomOccurrence(_)
 			| Self::Path(_)
 			| Self::Graph(_)
@@ -588,6 +601,7 @@ impl Ord for Value {
 				(Self::GraphRef(left), Self::GraphRef(right)) => left.cmp(right),
 				(Self::Record(left), Self::Record(right)) => left.cmp(right),
 				(Self::Regex(left), Self::Regex(right)) => left.cmp(right),
+				(Self::Matcher(left), Self::Matcher(right)) => left.cmp(right),
 				(Self::Range(left), Self::Range(right)) => left.cmp(right),
 				(Self::Atom(left), Self::Atom(right)) => left.cmp(right),
 				(Self::AtomOccurrence(left), Self::AtomOccurrence(right)) => left.cmp(right),
@@ -623,6 +637,7 @@ impl Hash for Value {
 			Self::GraphRef(value) => value.hash(state),
 			Self::Record(value) => value.hash(state),
 			Self::Regex(value) => value.hash(state),
+			Self::Matcher(value) => value.hash(state),
 			Self::Range(value) => value.hash(state),
 			Self::Atom(value) => value.hash(state),
 			Self::AtomOccurrence(value) => value.hash(state),

@@ -83,6 +83,7 @@ pub enum ExprKind {
 		callee: Box<Expr>,
 		type_argument: Option<TypeName>,
 		distinct: bool,
+		argument_names: Vec<Option<Identifier>>,
 		arguments: Vec<Expr>,
 	},
 	Subquery(Box<SelectStatement>),

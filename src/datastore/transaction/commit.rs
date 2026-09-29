@@ -5,7 +5,13 @@ use std::{
 
 use super::{CommitResult, Mutation, Transaction};
 use crate::{
-	datastore::{ConflictKey, DatabaseRoot, IsolationLevel, consts::EFFECTIVE_FANOUT_WRITE_BYTES},
+	datastore::{
+		ConflictKey,
+		DatabaseRoot,
+		IsolationLevel,
+		MaintenanceTarget,
+		consts::EFFECTIVE_FANOUT_WRITE_BYTES,
+	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, EdgeEndpoint, EdgeTopology, GraphId, remap_topology},
 };
@@ -142,6 +148,11 @@ impl Transaction {
 				.with_cause(error)
 			},
 		)?;
+		let stale_indexes = if self.mutations.iter().any(mutation_affects_explicit_indexes) {
+			next.mark_deferred_indexes_stale()?
+		} else {
+			Vec::new()
+		};
 		next.advance_identity_clocks(
 			store.inner.next_schema_id.load(Ordering::Relaxed),
 			store.inner.next_graph_id.load(Ordering::Relaxed),
@@ -161,17 +172,48 @@ impl Transaction {
 			next.mark_version(*key, commit_ts);
 		}
 		let graph_catalog_only = self.mutations.iter().all(|mutation| {
-			matches!(mutation, Mutation::InternProperty { .. } | Mutation::ReplaceGraph(_))
-		}) && self
-			.mutations
-			.iter()
-			.any(|mutation| matches!(mutation, Mutation::ReplaceGraph(_)));
+			matches!(
+				mutation,
+				Mutation::InternProperty { .. }
+					| Mutation::ReplaceGraph(_)
+					| Mutation::DefineParameter(_)
+					| Mutation::ReplaceParameter(_)
+					| Mutation::RemoveParameter(_)
+					| Mutation::DefineFunction(_)
+					| Mutation::ReplaceFunction(_)
+					| Mutation::RemoveFunction(_)
+			)
+		}) && self.mutations.iter().any(|mutation| {
+			matches!(
+				mutation,
+				Mutation::ReplaceGraph(_)
+					| Mutation::DefineParameter(_)
+					| Mutation::ReplaceParameter(_)
+					| Mutation::RemoveParameter(_)
+					| Mutation::DefineFunction(_)
+					| Mutation::ReplaceFunction(_)
+					| Mutation::RemoveFunction(_)
+			)
+		});
 		let dictionary_changed = self
 			.mutations
 			.iter()
 			.any(|mutation| matches!(mutation, Mutation::InternProperty { .. }));
 		store.inner.persist_root(&next, graph_catalog_only, dictionary_changed)?;
 		*store.inner.current.write() = Arc::new(next);
+		for (class, index, version) in stale_indexes {
+			// Availability may lag when the durable job ledger itself is
+			// unavailable, but the published Stale state keeps query results
+			// exact.
+			let _job = store.record_deferred_index_change(
+				MaintenanceTarget::Index {
+					class,
+					index,
+					version,
+				},
+				commit_ts,
+			);
+		}
 		Ok(CommitResult {
 			transaction: self.id,
 			commit_ts,
@@ -392,11 +434,23 @@ impl Transaction {
 				Mutation::DefineClass(class) => {
 					root.install_class(class.clone(), published_at)?;
 				}
+				Mutation::DefineParameter(parameter) => {
+					root.install_parameter(parameter.clone(), published_at)?;
+				}
+				Mutation::DefineFunction(function) => {
+					root.install_function(function.clone(), published_at)?;
+				}
 				Mutation::DefineGraph(graph) => {
 					root.install_graph(graph.clone(), published_at)?;
 				}
 				Mutation::ReplaceClass(class) => {
 					root.replace_class(class.clone(), published_at)?;
+				}
+				Mutation::ReplaceParameter(parameter) => {
+					root.replace_parameter(parameter.clone(), published_at)?;
+				}
+				Mutation::ReplaceFunction(function) => {
+					root.replace_function(function.clone(), published_at)?;
 				}
 				Mutation::ReplaceGraph(graph) => {
 					root.replace_graph_schema(graph.clone(), published_at)?;
@@ -406,6 +460,12 @@ impl Transaction {
 				}
 				Mutation::RemoveClass(class) => {
 					root.remove_class(*class)?;
+				}
+				Mutation::RemoveParameter(parameter) => {
+					root.remove_parameter(*parameter)?;
+				}
+				Mutation::RemoveFunction(function) => {
+					root.remove_function(*function)?;
 				}
 				Mutation::RemoveGraph(graph) => {
 					root.remove_graph(*graph)?;
@@ -557,4 +617,23 @@ impl Transaction {
 		root.publish_statistics_revision(published_at);
 		Ok(remap)
 	}
+}
+
+fn mutation_affects_explicit_indexes(mutation: &Mutation) -> bool {
+	matches!(
+		mutation,
+		Mutation::InstallBuiltGraphTree(_)
+			| Mutation::CreateAtom { .. }
+			| Mutation::SetBaseProperty { .. }
+			| Mutation::RemoveBaseProperty { .. }
+			| Mutation::DeleteAtom { .. }
+			| Mutation::AttachNode { .. }
+			| Mutation::AttachEdge { .. }
+			| Mutation::Detach { .. }
+			| Mutation::SetOverlay { .. }
+			| Mutation::HideProperty { .. }
+			| Mutation::ResetProperty { .. }
+			| Mutation::SetOccurrenceLabel { .. }
+			| Mutation::ReplaceOccurrenceState { .. }
+	)
 }

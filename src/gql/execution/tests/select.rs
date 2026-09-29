@@ -213,6 +213,52 @@ fn unique_index_supplies_forward_and_reverse_order_without_changing_results() {
 }
 
 #[test]
+fn unicode_collation_and_numeric_ordering_use_canonical_ties() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS item TYPE NODE SCHEMAFULL; DEFINE FIELD text ON CLASS item TYPE string; \
+			 CREATE item:a SET text = 'item10'; CREATE item:b SET text = 'item2'; CREATE item:c \
+			 SET text = 'item1'; CREATE item:d SET text = 'é'; CREATE item:e SET text = 'é'; \
+			 CREATE item:f SET text = 'E';",
+			&Object::new(),
+		)
+		.unwrap();
+
+	assert_eq!(
+		value(
+			&store,
+			"SELECT VALUE text FROM item WHERE text IN ['item10', 'item2', 'item1'] ORDER BY text \
+			 NUMERIC;",
+		),
+		Value::Array(
+			vec![Value::from("item1"), Value::from("item2"), Value::from("item10")].into()
+		)
+	);
+	let collated = value(
+		&store,
+		"SELECT VALUE text FROM item WHERE text IN ['é', 'é', 'E'] ORDER BY text COLLATE;",
+	);
+	assert_eq!(
+		collated,
+		Value::Array(vec![Value::from("E"), Value::from("é"), Value::from("é")].into())
+	);
+	assert_eq!(
+		value(
+			&store,
+			"SELECT VALUE text FROM item WHERE text IN ['é', 'é', 'E'] ORDER BY text COLLATE \
+			 TEMPFILES;",
+		),
+		collated
+	);
+	assert!(
+		statement_error(&store, "SELECT VALUE text FROM item ORDER BY id COLLATE;")
+			.to_string()
+			.contains("expects a string")
+	);
+}
+
+#[test]
 fn index_ordered_cursor_seeks_inside_its_exact_snapshot_without_a_spool() {
 	let store = Datastore::in_memory_with(InMemoryOptions {
 		max_snapshot_age: Duration::from_secs(60),

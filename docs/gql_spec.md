@@ -1062,14 +1062,12 @@ traversal запрещена. Каждый вызов block closure исполь
 
 ### 5.9. Регулярные выражения
 
-> **Отложено до этапа 21.** Синтаксис типа остаётся зарезервированным, но cast,
-> `string::matches`, stateful matcher и mutable collection helpers не входят в
-> исполнимый профиль этапов 11–12.
-
-Следующий пример фиксирует целевой, но пока неисполнимый контракт этапа 21.
+Контракт исполним с этапа 21. Regex использует существующий Rust `regex`, а `Matcher` является
+runtime-only shared-state value: clones разделяют позицию под
+`Arc<parking_lot::Mutex<_>>`, identity задаёт `Eq/Ord/Hash`, storage/spill codecs его отклоняют.
 
 Regex поддерживают стандартный синтаксис регулярных выражений, создаются путём каста строки к типу `regex` и применяются двумя способами:
-- через функцию `string::matches`, которая возвращает все совпадения,
+- через функцию `string::matches`, которая возвращает bool,
 - через создание `matcher` объекта как, например, в Java. 
 ```
 LET $reg = <regex> "colou{3}r";
@@ -1083,8 +1081,9 @@ WHILE (regex::next($matcher)) {
 }
 -- $matches = ["Алла", "Алекса"];
 ```
-Объект типа `matcher` имеет два публичных целочисленных поля: `start` и `end`, - указывающие на начало и конец совпадения в исходной строке.
-Применение `regex::next` обновляет `start` и `end` на основе внутреннего состояния `matcher`-объекта.
+Объект типа `matcher` имеет два публичных целочисленных поля `start` и `end` в Unicode scalar
+offsets. `regex::next` обновляет их; zero-length match обязательно продвигает byte cursor хотя бы
+через один scalar, а после exhaustion сохраняется последняя успешная пара offsets.
 
 ### 5.10. Вычисляемые выражения
 
@@ -1521,6 +1520,10 @@ SLEEP @time
 - при ожидании фоновой операции, запущенной с `CONCURRENTLY` (см. [§9.6](#96-define-index));
 - для регулирования количества выполняемых операций.
 
+Duration должна быть неотрицательной. Ожидание разбивается на короткие cooperative intervals с
+проверкой timeout/cancellation; эти ошибки не перехватываются `TRY/CATCH`. `SLEEP` запрещён в
+Atomic Import и `DETERMINISTIC`; явная транзакция сохраняет snapshot и max-snapshot-age contract.
+
 ### 7.9. TRY-CATCH
 
 Оператор используется для отлавливания runtime ошибок при выполнении запроса.
@@ -1582,18 +1585,18 @@ BEGIN IMPORT [ INTO GRAPH @graph ] [ WITH ( @option = @value [, ...] ) ];
 END IMPORT [ WITH VALIDATION ];
 ```
 
-| Опция          | По умолчанию                     | Контракт этапа 10                                                                                                                                                                                                       |
-|----------------|----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `INDEXES`      | `DEFERRED`                       | `DEFERRED` перестраивает secondary/Label/Count/effective indexes в конце; primary identity и correctness-critical lookup сопровождаются всегда. `MAINTAINED` использует обычное incremental сопровождение private root. |
-| `CONSTRAINTS`  | `DEFERRED`                       | `DEFERRED` проверяет graph-family и deferred Unique перед publication; `IMMEDIATE` — после каждого logical item. Schema/type/kind/reference checks не откладываются.                                                    |
-| `EVENTS`       | `OFF`                            | Этап 10 принимает только `OFF`; `ON` распознаётся и возвращает typed unsupported.                                                                                                                                       |
-| `CHANGEFEED`   | `OFF`                            | Этап 10 принимает только `OFF`; `ON` распознаётся и возвращает typed unsupported.                                                                                                                                       |
-| `ON VIOLATION` | `ABORT`                          | `ABORT` отбрасывает весь import; `SKIP` атомарно пропускает только item-level нарушение. `QUARANTINE` пока typed unsupported.                                                                                           |
-| `REJECT LIMIT` | отсутствует                      | Для `SKIP` обязателен явный положительный предел; нарушение `limit + 1` отбрасывает весь import.                                                                                                                        |
-| `SEGMENT SIZE` | `FG_IMPORT_SEGMENT_ITEMS`        | Applied items во внутреннем transaction segment; не commit и не recovery point.                                                                                                                                         |
-| `FILL_FACTOR`  | fixed writer policy              | Синтаксис зарезервирован; явное значение пока typed unsupported.                                                                                                                                                        |
-| `SORT_MEM`     | fixed 256 MiB run budget         | Синтаксис зарезервирован; явное значение пока typed unsupported.                                                                                                                                                        |
-| `PARALLELISM`  | последовательная baseline-сборка | Синтаксис зарезервирован; явное значение пока typed unsupported.                                                                                                                                                        |
+| Опция          | По умолчанию              | Контракт этапа 10                                                                                                                                                                                                       |
+|----------------|---------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `INDEXES`      | `DEFERRED`                | `DEFERRED` перестраивает secondary/Label/Count/effective indexes в конце; primary identity и correctness-critical lookup сопровождаются всегда. `MAINTAINED` использует обычное incremental сопровождение private root. |
+| `CONSTRAINTS`  | `DEFERRED`                | `DEFERRED` проверяет graph-family и deferred Unique перед publication; `IMMEDIATE` — после каждого logical item. Schema/type/kind/reference checks не откладываются.                                                    |
+| `EVENTS`       | `OFF`                     | Этап 10 принимает только `OFF`; `ON` распознаётся и возвращает typed unsupported.                                                                                                                                       |
+| `CHANGEFEED`   | `OFF`                     | Этап 10 принимает только `OFF`; `ON` распознаётся и возвращает typed unsupported.                                                                                                                                       |
+| `ON VIOLATION` | `ABORT`                   | `ABORT` отбрасывает весь import; `SKIP` атомарно пропускает item-level нарушение; `QUARANTINE` дополнительно сохраняет canonical payload/status в durable `FGQR v1`.                                                    |
+| `REJECT LIMIT` | отсутствует               | Для `SKIP` и `QUARANTINE` обязателен явный положительный предел; нарушение `limit + 1` отбрасывает весь import.                                                                                                         |
+| `SEGMENT SIZE` | `FG_IMPORT_SEGMENT_ITEMS` | Applied items во внутреннем transaction segment; не commit и не recovery point.                                                                                                                                         |
+| `FILL_FACTOR`  | fixed writer policy       | Синтаксис зарезервирован; явное значение typed unsupported. Stage-20 diagnostic превысил допустимый `5%` page-set budget; иной bounded/adaptive вариант отслеживается в `Q-39`.                                         |
+| `SORT_MEM`     | configured 256 MiB limit  | Положительный общий budget всех index/statistics runs и lanes; не умножается на число потоков и не может превышать datastore maintenance limit.                                                                         |
+| `PARALLELISM`  | `1`                       | Положительная верхняя граница scoped run sorting, ограниченная `MaintenanceOptions` и `available_parallelism`; canonical output bytes не зависят от значения.                                                           |
 
 **Зачем отдельный режим.** Построчная вставка сопровождает каждый индекс отдельно: это случайные обращения к B+tree-страницам, кратная запись и объёмный WAL. Bulk-путь вместо этого собирает ключи, сортирует их вне памяти и строит каждый индекс снизу вверх, записывая каждую страницу ровно один раз ([§20.13 disk_storage_spec](disk_storage_spec.md)). Смежность записывается один раз с уже известной финальной степенью, поэтому overflow-цепочки сразу нужного размера и непрерывны.
 
@@ -1609,6 +1612,13 @@ END IMPORT [ WITH VALIDATION ];
 структурированный `ImportReport`: processed/applied/skipped, segments, totals и bounded details
 нарушений, modes, full-validation flag и phase/index timings. Локальный путь в result/error не
 возвращается.
+
+В режиме `QUARANTINE` Rust callback обязан использовать `apply_item_with_payload`; вариант без
+payload отклоняется до mutation. Payload обязан быть canonical storable `Value`. GrynnQL
+формирует payload из exact source slice, statement kind, ordinal и storable bindings внешней
+итерации `FOR`. Пустой rejected-set не создаёт archive. Непустой `FGQR v1` публикуется тем же
+успешным import commit и доступен только через opaque `QuarantineId`/streaming reader; abort,
+panic, validation либо I/O failure удаляет temp artifact.
 
 **Scope и откат.** `INTO GRAPH` требует уже существующий graph, подставляет его в
 graph-local DML без явного scope и запрещает явное обращение к другому graph до начала
@@ -2034,7 +2044,9 @@ SHOW CHANGES FOR CLASS @class_name
 KILL @id;
 ```
 
-Прерывает выполнение live-запроса по идентификатору.
+Для UUIDv7 maintenance `JobId` cooperative cancellation выполняет тот же оператор. До
+publication boundary job становится `cancelled`; если exact fingerprint уже опубликован под
+commit lock, результатом является `completed`. Live-query cancellation остаётся этапам 27–29.
 
 ```
 KILL $query_id;
@@ -2046,10 +2058,17 @@ KILL $query_id;
 Применяется при деградации качества, в частности для HNSW-индексов после большого числа обновлений.
 
 ```
-REBUILD [
-	INDEX [ IF EXISTS ] @name ON CLASS @class
-]
+REBUILD INDEX [ IF EXISTS ] @name
+ON ( CLASS @class | GRAPH @graph )
+[ CONCURRENTLY ]
+[ WITH ( SORT_MEM = @bytes [, PARALLELISM = @n] ) ]
 ```
+
+Rebuild сохраняет `IndexId`, definition version и прежний Ready binding до atomic swap.
+Foreground использует тот же builder в caller thread; `CONCURRENTLY` durable-enqueue-ит job и
+возвращает UUIDv7. Аналогичные forms: `COMPACT INDEX ...`, `COMPACT GRAPH ...` и
+`ALTER DATABASE COMPACT`. `INFO FOR JOB $id`, `INFO FOR JOBS` и расширенный `INFO FOR INDEX`
+показывают state, progress, maintenance mode, build revision и exact fallback reason.
 
 ---
 
@@ -2125,21 +2144,33 @@ DEFINE PARAM [ OVERWRITE | IF NOT EXISTS ] $@name VALUE @value
 ;
 ```
 
+Value вычисляется один раз в DDL transaction и обязан быть canonical storable. `IF NOT EXISTS`
+при существующем имени expression не вычисляет; `OVERWRITE` сохраняет `SchemaId` и увеличивает
+`SchemaVersion`. Resolution: block → transaction → session/program → execute parameters →
+durable parameter. Lexical binding может скрывать durable value, но execute parameter immutable.
+
 ### 9.4. DEFINE FUNCTION
 
 ```
 DEFINE [ PURE | STABLE | IMPURE ] [ COST ] FUNCTION 
     [ OVERWRITE | IF NOT EXISTS ] 
     fn::@name ( [ ( @argument:@type ... ) ] )  [-> @return_type]
+    [ MAXDEPTH @n ]
     { [@query] [ RETURN @returned ] }
     [ COMMENT @string ]
 ;
 ```
 
-- `PURE` — функция детерминирована, не имеет побочных эффектов; планировщик может переставлять и кешировать вызовы.
-- `STABLE` (подкласс PURE) — функция детерминирована в рамках одного запроса, но не между запросами (например, `time::now()` закреплено на время запроса).
-- `IMPURE` — функция имеет побочные эффекты; планировщик фиксирует порядок.
+- `PURE` — без datastore reads, времени, randomness и mutation; допустима в `DETERMINISTIC`.
+- `STABLE` — snapshot reads и statement-fixed `time::now()`; не является PURE между replay.
+- `IMPURE` — допускает DML в transaction savepoint; ошибка полностью восстанавливает call state.
 - По умолчанию, если не указано: `IMPURE`.
+
+Built-in namespaces не перекрываются; пользовательские functions существуют только в `fn::`.
+Schema/admin, transaction/import и nested `EXPLAIN ANALYZE` внутри body запрещены. `COST`
+требует PURE и non-negative finite numeric result. Recursion требует `MAXDEPTH 1..=64`; mutual
+cycle additionally требует explicit return type и bound у каждого overload. Source body хранится
+в catalog, а typed cache ключуется `(FunctionId, SchemaVersion, schema_epoch)`.
 
 ### 9.5. DEFINE EVENT
 
@@ -2235,15 +2266,10 @@ Standard/Unique/Count index обязан явно выбрать scope. `BASE` �
 
 `CONCURRENTLY` — общий модификатор длительных обслуживающих операций, а не только построения индекса. Он применим к `DEFINE INDEX`, `REBUILD INDEX` и операциям уплотнения (`COMPACT`). Семантика везде одинакова: оператор ставит фоновое задание и возвращает управление немедленно; ход выполнения виден через `INFO`, задание прерывается через `KILL` по его идентификатору. Обычные запросы (`SELECT`, `MATCH`, `TRAVERSE`) не выполняются с `CONCURRENTLY` — для них есть `TIMEOUT` и отмена на уровне сессии.
 
-Процесс индексирования состоит из двух этапов: первичного и обновления.
-
-1. Начальный этап: На этом этапе Ferros-Grynn индексирует все существующие записи. Количество проиндексированных записей отображается в свойстве `initial`. Пока выполняется этот этап, все новые вставки, обновления и удаления отслеживаются как `pending`.
-2. Этап обновления: после завершения начального этапа Ferros-Grynn приступает к индексированию ожидающих обработки записей, накопленных на начальном этапе. На этом этапе:
-   - Количество `initial` остается стабильным.
-   - По мере обработки этих записей значение `pending` должно постепенно уменьшаться, однако оно может временно увеличиться, если во время индексации будут внесены новые изменения.
-   - Свойство `updated` указывает на количество ожидающих индексации записей на данном этапе.
-
-После завершения обоих этапов статус индекса меняется на `ready`, что означает, что индекс автоматически обновляется в рамках той же транзакции, которая выполняет вставку, обновление или удаление записей.
+Worker фиксирует source revision, строит candidate в недостижимом UUID-generation и перед
+publication повторно проверяет target/schema/revision. Concurrent relevant DML вызывает новую
+snapshot/build iteration; candidate никогда не становится Ready только по состоянию job ledger.
+`INFO FOR JOB` показывает `processed_items`, bytes, runs и restart count.
 
 `DEFER` — откладывает обновление индекса.
 
@@ -2252,13 +2278,14 @@ Standard/Unique/Count index обязан явно выбрать scope. `BASE` �
 Однако это может стать узким местом при параллельном приеме больших объемов данных, приводя к увеличению задержки и конфликтам при записи, 
 особенно при использовании полнотекстовых или векторных индексов.
 
-В этом случае можно использовать предложение `DEFER`, если приемлема согласованность в конечном счёте, 
-то есть ситуация, при которой при чтении в течение короткого периода могут возвращаться устаревшие данные, 
-но в конечном счёте данные будут соответствовать последней записи. 
-Индекс с этим предложением будет помещён в постоянную фоновую очередь, что позволит разделить приём данных и индексацию.
+В этом случае можно использовать `DEFER`. Eventual относится только к доступности индекса:
+затрагивающий commit публикует exact data вместе с persisted `Stale`, planner исключает binding
+и выполняет точный scan, а forced hint получает typed error. In-memory bounded queue только
+коалесцирует invalidations; после crash persistent Stale запускает full rebuild. Устаревшие index
+rows никогда не возвращаются пользователю.
 
-Поскольку уникальные индексы гарантируют, что записи, противоречащие индексу, существовать не будут, 
-предложение `UNIQUE` нельзя использовать вместе с `DEFER`.
+`DEFER` допустим только для Standard и Count. Unique и engine-owned correctness indexes всегда
+сопровождаются синхронно.
 
 Типы индексов:
 #### Standard (non-unique) index
@@ -2869,8 +2896,12 @@ Aggregate без `GROUP` и `GROUP ALL` образуют одну группу. 
 - В этапе 14 `ORDER RAND()` является специальным physical ordering operator. Его ключ —
   versioned RapidHash V3 от statement seed и canonical stable row key. В `DETERMINISTIC` seed
   входит в replay tuple; в `BEST_EFFORT` создаётся новый process-local statement seed.
-- `COLLATE` и `NUMERIC` распознаются, но остаются typed unsupported до этапа 21 и отклоняются до
-  чтения source.
+- `COLLATE` использует pinned ICU4X root collation с primary strength. `NUMERIC` включает
+  numeric comparison digit sequences; без `COLLATE` сохраняется tertiary text sensitivity.
+  Equal sort keys разрешаются canonical UTF-8 и stable-row key. ICU version/config входят в
+  ORDER fingerprint и cursor validation; keys учитываются общим barrier/spill budget.
+- Пока physical index не хранит тот же versioned ICU key, он не удовлетворяет такой ORDER и
+  optimizer сохраняет bounded external sort.
 
 Применим только после `GROUP`, если он есть.
 
@@ -3284,7 +3315,7 @@ Match mode ограничивает отображение переменных,
 @pattern ::= [ @path_name = ] @relations_pattern
 ```
 
-`WITH INDEX` принадлежит этапу 25, `WITH COST` — этапу 21, а `KEEP LEVELPATH` — этапу 17;
+`WITH INDEX` и custom path `WITH COST` принадлежат этапу 25, а `KEEP LEVELPATH` — этапу 17;
 они не являются скрытыми compatibility clauses профиля этапов 15–16.
 
 ### 12.3. Синтаксис паттернов
@@ -3791,8 +3822,9 @@ RETURN weights_sum;
 
 Graph-wide algorithms работают над induced graph node occurrences одного `GraphId` и являются
 barrier-операторами. PageRank, centralities, all-shortest enumeration, triangles, clustering,
-label propagation и Louvain принадлежат этапу 26. Пользовательский `tv::algo` registry
-принадлежит этапу 21.
+label propagation и Louvain принадлежат этапу 26. С этапа 21 `tv::algo(fn::name, ...)`
+вызывает versioned named PURE/STABLE UDF через общий function catalog; отдельного algorithm
+registry нет.
 
 ### 13.5. Sack
 
@@ -4676,7 +4708,7 @@ BEGIN [ ISOLATION LEVEL @level ] [ READ ONLY ]
 | Режим                        | Гарантии                                                                                                                                                                                                                                                                                                                                                                                                           |
 |------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `BEST_EFFORT` (по умолчанию) | Результат детерминирован по содержимому, но порядок без `ORDER BY` не гарантирован; план может меняться между запусками                                                                                                                                                                                                                                                                                            |
-| `DETERMINISTIC`              | Строгая воспроизводимость при одинаковых snapshot, canonical parameters, user seed и engine build: стабильный порядок, канонический plan и фиксированный порядок floating-point reduction. Без `ORDER BY` результат доупорядочивается stable public identity. `time::now()` и другие недетерминированные/IMPURE функции отклоняются до чтения данных; scalar `rand()`/`uuid()` остаются неисполняемыми до этапа 21 |
+| `DETERMINISTIC`              | Строгая воспроизводимость при одинаковых snapshot, canonical parameters, user seed и engine build: стабильный порядок, канонический plan и фиксированный порядок floating-point reduction. Без `ORDER BY` результат доупорядочивается stable public identity. `time::now()`, `uuid()`, `ulid()`, `rand::id()` и другие недетерминированные/IMPURE функции отклоняются до чтения данных. |
 | `FAST`                       | Та же ACID/FCW/SSI/constraint/error semantics и тот же result multiset. Без явного `ORDER BY` не гарантирует порядок, plan/replay stability, pure branch/hash merge order и schedule float reductions; int/decimal остаются exact. Approximation, sampling, early cutoff и пропуск validation запрещены.                                                                                                           |
 
 `DETERMINISTIC` допустим только при `SNAPSHOT` и `SERIALIZABLE`; `READ COMMITTED` запрещён.
@@ -4707,22 +4739,23 @@ RapidHash V3 по versioned canonical physical-plan bytes: `DefaultHasher`, `Deb
 
 ### 18.2. Встроенные пространства имён
 
-| Пространство                | Исполнимо в этапе 12                                      | Отложено                                      |
-|-----------------------------|-----------------------------------------------------------|-----------------------------------------------|
-| `math::`                    | `abs`, `sqrt`, `pow`, `floor`, `ceil`                     | `stddev`, `variance` и агрегаты — этап 13     |
-| `string::`                  | `upper`, `lower`, `len`, `contains`, `split`, `concat`    | regex/stateful helpers — этап 21              |
-| `time::`                    | `now`, `format`, `add`, `diff`; `now()` один на statement | оставшийся catalog — этап 21                  |
-| `array::`                   | `len`, `concat`, `distinct`, `first`, `flatten`           | `group` — этап 13; `push/pop/clear` — этап 21 |
-| `set::`                     | `len`, `union`, `intersect`, `diff`, `has`                | `add/clear` — этап 21                         |
-| `type::`                    | `is<T>`, `to<T>`                                          | —                                             |
-| `meta::`                    | `id`, `class`, `type`                                     | —                                             |
-| `option::`                  | `is_some`, `is_none`                                      | —                                             |
-| `graph::` / path / pipeline | graph occurrence/path functions этапов 16–17              | `tv::algo` registry — этап 21                 |
-| closures                    | session-scoped language closures — этап 17                | UDF/catalog/overloads/recursion — этап 21     |
-| `regex::`                   | —                                                         | этап 21                                       |
-| `search::`                  | —                                                         | этап 22                                       |
-| `geo::`                     | —                                                         | этап 24                                       |
-| `computed::`                | —                                                         | назначенный schema/query этап                 |
+| Пространство                | Исполнимо                                                   | Отложено                              |
+|-----------------------------|--------------------------------------------------------------|---------------------------------------|
+| `math::`                    | scalar этапа 12 и aggregates этапа 13                        | specialized catalog — по потребности |
+| `string::`                  | scalar helpers, `matches`, Unicode-scalar `slice`             | —                                     |
+| `time::`                    | `now`, `format`, `add`, `diff`; `now()` один на statement     | —                                     |
+| `array::`                   | pure helpers, `group`, lexical `push/pop/clear`                | —                                     |
+| `set::`                     | pure helpers и lexical `add/clear`                             | —                                     |
+| `type::`                    | `is<T>`, `to<T>`, включая object construction                  | —                                     |
+| `meta::`                    | `id`, `class`, `type`                                         | —                                     |
+| `option::`                  | `is_some`, `is_none`                                          | —                                     |
+| `graph::` / path / pipeline | occurrence/path helpers и named-UDF `tv::algo`                 | graph assembly — этап 18              |
+| closures                    | session closures и durable named UDF/catalog/overloads         | native/WASM/plugin UDF не планируются |
+| `regex::`                   | stateful runtime-only matcher                                  | —                                     |
+| `uuid`/`ulid`/`rand::`      | UUIDv7, ULID, `rand::id([length])`                              | —                                     |
+| `search::`                  | —                                                            | этап 22                               |
+| `geo::`                     | —                                                            | этап 24                               |
+| `computed::`                | —                                                            | назначенный schema/query этап         |
 
 Этап 12 использует закрытый статический enum/signature table и обычный `match`: runtime
 registry функций не создаётся. `array::distinct` сохраняет первое вхождение, `flatten` снимает
@@ -4740,6 +4773,16 @@ DEFINE PURE FUNCTION fn::calc_weight(a: record<person>, b: record<person>) -> fl
 };
 ```
 
+`SchemaCatalog` хранит overloads по `(name, parameter types)` и общий schema clock выдаёт
+`FunctionId`. Definition до publication проходит parse, typed analysis, effect/result validation
+и dependency-cycle check. После reopen source body компилируется лениво; изменение schema epoch
+консервативно инвалидирует typed cache. Persisted IR/bytecode нет.
+
+Вызов поддерживает positional arguments, затем named arguments `name = expr`; повтор name,
+unknown name и positional argument после named являются analysis error. `tv::algo(fn::name,
+args...)` передаёт current первым implicit argument; array/set/range разворачивается как flatMap,
+scalar даёт один traverser, `none` — пустой поток. Допустимы только PURE/STABLE UDF.
+
 ### 18.4. Замыкания
 
 ```
@@ -4754,23 +4797,33 @@ Session-scoped closures исполнимы с этапа 17. Их runtime identi
 captures сохраняются по значению, а вызов через другую/закрытую session является typed error.
 `PURE`/`STABLE_READ` closures допустимы в predicate/map/control positions;
 `DATA_MUTATION` — только в явном `tv::side_effect`; `SCHEMA_MUTATION` запрещена во время
-активного traversal. Именованные UDF, overload catalog, recursion и `tv::algo` остаются этапу 21.
+активного traversal. Именованные UDF используют тот же evaluator, но durable catalog и
+versioned typed cache; отдельного runtime function/algorithm registry нет.
 
 ### 18.5. Purity
 
 - `PURE` функции: детерминированы, без побочных эффектов — планировщик может инлайнить, кешировать, переставлять.
 - `IMPURE` функции: имеют побочные эффекты — планировщик фиксирует порядок.
-- `STABLE` (подкласс PURE): детерминированы в рамках одного запроса, но не между запросами (например, `time::now()` закреплено на время запроса).
+- `STABLE`: детерминированы в рамках одного snapshot/statement, но могут читать datastore и
+  `time::now()`; они не являются PURE между replay.
 
 ### 18.6. Безопасность
 
-- Рекурсия требует явного ограничения: `MAXDEPTH n`.
+- Рекурсия требует явного `MAXDEPTH 1..=64`; effective bound является минимумом UDF bound и
+  оставшегося control-depth budget. Mutual recursion требует bound и return type у каждого
+  участника цикла.
 - Бесконечные циклы запрещены: `FOR` и `tv::repeat` требуют `times(n)` или `until(condition)` с конечным критерием.
+- IMPURE UDF запрещена в predicates, ordering/grouping, planner cost и traversal map/filter;
+  DML допускается только как обычный statement call либо `tv::side_effect` и наследует права,
+  transaction mode, timeout/cancellation и resource budgets вызывающей стороны.
 
 ### 18.7. Перегрузка
 
-Разрешена только для числового типа `number` — без необходимости дублировать реализацию для `int`, `float`, `decimal`. 
-Разрешение типа `number` происходит на этапе анализа запроса. Иные перегрузки не разрешены.
+Кандидаты фильтруются по имени, arity и named arguments. Для каждого аргумента rank равен:
+`0` exact, `1` lossless numeric coercion, `2` compatibility с `number`, `3` precision-losing
+numeric coercion с notification. Побеждает minimum `(max_rank, sum_rank)`; равный лучший rank
+даёт typed ambiguity без скрытого tie-break по `FunctionId`. Overload только по return type,
+varargs/defaults/generics и пользовательские implicit conversions не поддерживаются.
 
 ### 18.8. Конструкторы объектов
 
@@ -4795,6 +4848,16 @@ captures сохраняются по значению, а вызов через 
 | `regex`     | `string`                                              |
 | `geometry`  | `object`                                              |
 | `formatter` | `string`                                              |
+
+`type::to<object>`/`<object>` принимает array/set объектов, объединяет их в encounter/canonical
+order и отклоняет duplicate key либо неподходящий element. Mutable helpers
+`array::push/pop/clear` и `set::add/clear` принимают только прямой mutable lexical `LET` binding
+текущего scope; execute/durable parameters, fields, arbitrary expressions и captured values не
+мутируются. Аргумент UDF меняется только как локальная копия вызова.
+
+`uuid()` возвращает UUIDv7, `ulid()` — ULID, `rand::id([length])` — строку из `a-z0-9` длиной
+`1..=1024` (default 20). Новая randomness dependency не вводится; все три функции запрещены в
+`DETERMINISTIC`.
 
 ---
 

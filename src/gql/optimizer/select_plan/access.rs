@@ -372,7 +372,7 @@ fn index_ordering(
 			crate::syn::SelectOrderDirection::Descending => IndexDirection::Reverse,
 		};
 		for (order, field) in logical.order.iter().zip(&index.fields) {
-			if order.random {
+			if order.random || order.collate || order.numeric {
 				return None;
 			}
 			let Some(column) = order_source_column(logical, &order.expression) else {

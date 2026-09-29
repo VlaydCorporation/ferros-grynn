@@ -3,12 +3,19 @@ use std::hash::{Hash, Hasher};
 use super::super::*;
 use crate::gql::optimizer::{CanonicalHasher, PLAN_ENCODING_VERSION};
 
+const COLLATION_FINGERPRINT: &[u8] = b"icu4x-2.2.1-root-primary-tertiary-numeric-v1";
+
 pub(in crate::gql::execution) fn fingerprints(plan: &LogicalSelect) -> (u64, u64) {
 	let mut query = CanonicalHasher::versioned(PLAN_ENCODING_VERSION, b"select-query");
 	hash_select(plan, &mut query);
 	let mut order = CanonicalHasher::versioned(PLAN_ENCODING_VERSION, b"select-order");
 	for item in &plan.order {
 		item.random.hash(&mut order);
+		item.collate.hash(&mut order);
+		item.numeric.hash(&mut order);
+		if item.collate || item.numeric {
+			COLLATION_FINGERPRINT.hash(&mut order);
+		}
 		hash_expr(&item.expression, &mut order);
 		std::mem::discriminant(&item.direction).hash(&mut order);
 		std::mem::discriminant(&item.nulls).hash(&mut order);
@@ -84,6 +91,11 @@ fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
 	plan.fetch.hash(state);
 	for item in &plan.order {
 		item.random.hash(state);
+		item.collate.hash(state);
+		item.numeric.hash(state);
+		if item.collate || item.numeric {
+			COLLATION_FINGERPRINT.hash(state);
+		}
 		hash_expr(&item.expression, state);
 		std::mem::discriminant(&item.direction).hash(state);
 		std::mem::discriminant(&item.nulls).hash(state);
@@ -267,6 +279,7 @@ fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 			closure.result.hash(state);
 			std::mem::discriminant(&closure.effect).hash(state);
 			closure.slot_count.hash(state);
+			closure.named_function.hash(state);
 			if let crate::gql::ir::LogicalClosureBody::Expression(body) = &closure.body {
 				hash_expr(body, state);
 			}
@@ -280,6 +293,15 @@ fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 				hash_expr(argument, state);
 			}
 		}
+		TypedExprKind::NamedInvoke {
+			function,
+			arguments,
+		} => {
+			function.hash(state);
+			for argument in arguments {
+				hash_expr(argument, state);
+			}
+		}
 		TypedExprKind::Traversal(traverse) => {
 			std::mem::discriminant(&traverse.source).hash(state);
 			if let LogicalTraverseSource::Expression(source) = &traverse.source {
@@ -287,6 +309,9 @@ fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 			}
 			for step in &traverse.steps {
 				step.kind.hash(state);
+				step.named_function.hash(state);
+				step.algorithm_input.hash(state);
+				step.output_type.hash(state);
 				for argument in &step.arguments {
 					hash_expr(argument, state);
 				}

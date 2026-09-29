@@ -305,6 +305,35 @@ impl Transaction {
 		Ok(snapshot.root.schema.classes().map(|class| class.as_ref().clone()).collect())
 	}
 
+	pub(crate) fn query_schema_functions(
+		&self,
+		snapshot: &QuerySnapshot,
+		namespace: &str,
+		name: &str,
+	) -> FerrosGrynnResult<Vec<Arc<crate::datastore::SchemaFunction>>> {
+		self.ensure_live()?;
+		self.record_read(crate::datastore::ConflictKey::FunctionCatalogRange);
+		Ok(snapshot
+			.root
+			.schema
+			.functions()
+			.filter(|function| {
+				function.namespace().as_str() == namespace && function.name().as_str() == name
+			})
+			.cloned()
+			.collect())
+	}
+
+	pub(crate) fn query_schema_function(
+		&self,
+		snapshot: &QuerySnapshot,
+		id: crate::datastore::FunctionId,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaFunction>>> {
+		self.ensure_live()?;
+		self.record_read(crate::datastore::ConflictKey::SchemaFunction(id));
+		Ok(snapshot.root.schema.functions.get(&id).cloned())
+	}
+
 	/// Computes a LevelPath object from one immutable statement snapshot.
 	pub(crate) fn query_level_path(
 		&self,

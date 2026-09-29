@@ -16,7 +16,8 @@ evidence и ограничения зафиксированы в
 [graph_first_atom_model_report.md](reports/graph_first_atom_model_report.md).
 Она заменяет graph-owned atom/table candidate на database-level AtomStore и graph-local
 occurrences. При конфликте с сохранёнными ниже legacy layout-примечаниями действуют §§2, 4, 7,
-10–11, 17–18 и 22 в редакции 9.0. Cutover принимает только `FGDC v9`/`FGFC v5`; миграции
+10–11, 17–18 и 22 в редакции 9.0. После этапов 20–21 cutover принимает только
+`FGDC v10`/`FGFC v6`; миграции
 промежуточных кандидатов нет.
 
 ---
@@ -450,7 +451,7 @@ enum RecordIdPart {
 
 ```
 tag(u8) = 0x10
-class_id(u32)             -- stable ClassId из FGDC v9
+class_id(u32)             -- stable ClassId из FGDC v10
 id_kind(u8):
   0x00 = Int
   0x01 = String
@@ -759,18 +760,47 @@ database-level AtomStore и catalog files. Транзакция не может 
 namespace. Backfill можно планировать по data space, но обрезка единого WAL использует общий
 watermark.
 
-### 7.2. DatabaseCatalog `FGDC v9` и FileCatalog `FGFC v5`
+### 7.2. DatabaseCatalog `FGDC v10` и FileCatalog `FGFC v6`
 
 `db.fgb` хранит root-page ссылки; канонические каталоги лежат в `schema/catalog.fgb` и
 публикуются тем же frame-WAL commit, что data pages:
 
-- `DatabaseCatalog` (`FGDC`, payload version 9): `next_graph_id`, `next_schema_id`, IANA timezone
-  table, versioned CLASS/FIELD/INDEX definitions, graph catalog, AtomStore generation/bindings и
-  глобальные параметры. Property-key strings в payload не дублируются;
-- `FileCatalog` (`FGFC`, payload version 5): sealed mapping
+- `DatabaseCatalog` (`FGDC`, payload version 10): identity clocks, IANA timezone table,
+  versioned CLASS/FIELD/INDEX definitions, graph catalog, AtomStore generation/bindings,
+  durable parameters и named functions. Property-key strings в payload не дублируются;
+- `FileCatalog` (`FGFC`, payload version 6): sealed mapping
   `(DataSpaceId, DataFileId) → (companion_of, role, validated relative path)`.
 
-Каждая запись `FGFC v5` сохраняет 32-байтовый fixed header:
+`FGDC v10` начинается с exact 88-byte header:
+
+```text
+0   4   magic = FGDC
+4   2   version = 10
+6   2   reserved = 0
+8   8   next_graph_id
+16  8   next_schema_id
+24  4   timezone_count
+28  4   class_count
+32  4   graph_count
+36  4   parameter_count
+40  4   function_count
+44  4   reserved = 0
+48  8   atom_store_generation
+56 16   primary physical binding
+72 16   reverse-membership physical binding
+```
+
+Sections следуют строго в порядке timezone → class → graph → parameter → function и обязаны
+полностью потребить payload. Index entry использует maintenance byte `0=Immediate`,
+`1=Deferred`; unknown value является corruption. Parameter entry хранит identity/version,
+`published_at`, canonical value bytes, name и optional comment. Function entry хранит
+`FunctionId`, `SchemaVersion`, `published_at`, namespace/name, ordered parameters и resolved
+types, effect `PURE|STABLE|IMPURE`, `COST`, optional `MAXDEPTH 1..=64`, source UTF-8 body и
+optional comment. Уникальны identity и `(namespace, name, parameter types)`; typed IR и
+platform bytecode не сохраняются.
+
+`FGFC v6` имеет 24-byte header (`FGFC`, version 6, reserved, count, reserved,
+`next_file_instance_id`). Каждая запись сохраняет 32-байтовый fixed header:
 
 ```text
 0   8   space_id; 0 = Database, >0 = GraphId
@@ -788,6 +818,25 @@ statistics либо immutable side-file и имеет ровно один compan
 для `AtomsHot` и `Properties`; в graph space — для `NodesHot`, `EdgesHot`,
 `AdjacencyOverflow`, `CrossLevelAdjacencyOverflow`, `Overlays` и `Subgraphs`.
 
+Допустимые роли: `0=WalBackfilled`, `1=Superblock`, `2=MetadataCow`,
+`3=AuxiliaryImmutable`. Database space содержит ровно один
+`JobCatalog=0x15` по path `admin/jobs.fgb` и role `MetadataCow`.
+`ImportQuarantine=0x16` использует canonical
+`admin/quarantine/<lowercase-uuid>.fgq` и `AuxiliaryImmutable`. Metadata/auxiliary entries не
+регистрируются как positional page files и не получают Direct page handle.
+
+`FGJB v1` — bounded checksummed metadata-COW catalog `main/.prev`: header хранит generation,
+record count, payload length и checksum; record хранит UUIDv7 job identity, kind/state,
+logical target IDs/versions, source revision, resource/progress counters, restart count,
+candidate fingerprint и bounded terminal diagnostic. Absolute path, page pointer и process
+handle в нём отсутствуют.
+
+`FGQR v1` — immutable streaming archive rejected import-items: checksummed header задаёт UUID,
+record/context counts и lengths; records имеют возрастающий ordinal, canonical storable payload,
+status code и diagnostic до 4096 bytes; checksummed footer подтверждает exact consumption.
+Незавершённый temp-file недостижим и удаляется RAII. Оба auxiliary formats не вводят новый
+`PageType` и не меняют common page header.
+
 Оба catalog payload разбиты на bounded chain страниц `SystemCatalog`. Каждая страница содержит
 `FGC1`, catalog kind, page-codec version, `next_page`, длину chunk/полного payload и нулевые
 reserved/trailing bytes; суммарный payload ограничен 16 МиБ до allocation.
@@ -798,7 +847,7 @@ Class definition хранит стабильные `ClassId`/`SchemaVersion`, im
 `GraphRef` не кодируется как `RecordId`. Удаление graph удаляет только его catalog entry,
 occurrences, topology, overlays и effective indexes; global atoms и classes сохраняются.
 
-Graph entry `FGDC v9` имеет canonical fixed header:
+Graph entry `FGDC v10` сохраняет canonical fixed header этапа 18:
 
 ```text
 0   8   graph_id
@@ -828,7 +877,7 @@ graph. Internal graph имеет ненулевой `owner_root_graph_id`, ук�
 graphs. Internal graph не может принадлежать другому internal graph или быть доступен из arena
 чужого owner root.
 
-После fixed graph fields `FGDC v9` хранит catalog-owned properties:
+После fixed graph fields `FGDC v10` хранит catalog-owned properties:
 
 ```text
 property_count: u32 LE
@@ -843,9 +892,10 @@ unknown key, `none`, runtime-only value, неверная длина и нека
 corruption. `null` является обычным хранимым значением. Properties изменяют catalog/schema
 revision при сохранении `GraphId` и physical bindings; в `GraphSuperblock` они не дублируются.
 
-Decoder target layout принимает только `FGDC v9` и `FGFC v5`. Реализованные промежуточные
-`FGDC v5/v6/v7/v8`, `FGFC v4` и graph-owned atom layout возвращают typed incompatible-format error и не
-мигрируются, поскольку core format v1 ещё не заморожен.
+Decoder принимает только `FGDC v10` и `FGFC v6`. `FGDC v5..=v9`, `FGFC v4/v5` и
+graph-owned atom layout возвращают typed incompatible-format error. Migration и test-only
+compatibility отсутствуют. `STORAGE_FORMAT_VERSION` остаётся `1`; catalog payloads повторно
+заморожены после этапа 21 согласно `storage_core_v1_freeze_manifest.md`.
 
 **Расширения файлов:**
 
@@ -855,6 +905,7 @@ Decoder target layout принимает только `FGDC v9` и `FGFC v5`. Р
 - `.snap` — Snapshot;
 - `.fcf` — Ferros-Grynn Changefeed;
 - `.chk` — Checkpoint header.
+- `.fgq` — immutable import quarantine archive.
 
 ### 7.3. Идентичность physical data-файла (format v1)
 
@@ -892,8 +943,10 @@ fields и `SchemaVersion`. `DataFileId` может измениться при C
 | `0x12`   | `Overlays`                    |
 | `0x13`   | `ClassStatistics`             |
 | `0x14`   | `PropertyDictionary`          |
+| `0x15`   | `JobCatalog`                  |
+| `0x16`   | `ImportQuarantine`            |
 
-`0x00` и `0x15..=0xff` зарезервированы. До написания codecs новые discriminants и соответствующие
+`0x00` и `0x17..=0xff` зарезервированы. До написания codecs новые discriminants и соответствующие
 page types обязаны получить golden vectors. Неизвестное значение при open/recovery является
 повреждением либо incompatible format, но не молча пропускаемым расширением.
 
@@ -903,7 +956,7 @@ PageKey    = (DataSpaceId, DataFileId, PageNo)
 ```
 
 `instance_id` занимает 56 бит и не переиспользуется. Registry строится только из проверенного
-`FGFC v5`: `(DataSpaceId, DataFileId) → (role, trusted path, DirectFile)`. Superblock files не
+`FGFC v6`: `(DataSpaceId, DataFileId) → (role, trusted path, DirectFile)`. Superblock files не
 удерживают долгоживущий Windows handle, чтобы atomic replace не оставлял ссылку на старый file
 object. Отсутствующий id является fatal corruption.
 
@@ -1659,7 +1712,7 @@ Format-v1 создаёт отдельный `FreelistPage` для двух из�
 `subgraphs.fgb`. Их companions называются соответственно `freelist_atoms.fgb`,
 `freelist_props.fgb`, `freelist_nodes.fgb`, `freelist_edges.fgb`, `freelist_adj.fgb`,
 `freelist_adj_cl.fgb`, `freelist_overlays.fgb` и `freelist_subgraphs.fgb`; связь хранится явно
-в `FGFC v5.companion_of`.
+в `FGFC v6.companion_of`.
 Superblock, labels, statistics и immutable index side-files freelist не имеют. Пока
 incremental page allocation не реализован, каждый из восьми freelist-файлов содержит одну
 валидную пустую страницу и не читается обычным index/page hot path.
@@ -1693,14 +1746,14 @@ Total = PAGE_SIZE байт
 Строковые пространства разделены. Database-wide `PropertyDictionary` интернирует только ключи
 свойств. `LabelDictionary` каждого графа интернирует только graph-local node/edge labels и имеет
 две независимые плотные последовательности ID. Имена classes принадлежат `ClassCatalog`, а IANA
-timezone names — `FGDC v9`.
+timezone names — `FGDC v10`.
 
 ### 16.1. Database-wide `PropertyDictionary`
 
 `atoms/<generation>/property_keys.fgb` имеет `DataFileKind::PropertyDictionary = 0x14`, является
 append-only, WAL-versioned и не имеет freelist. `PropertyKeyId` плотны, стабильны и монотонны в
 диапазоне `[0, entry_count)`; удалённый ключ не переиспользуется. `FileCatalog` — единственная
-authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v9`.
+authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v10`.
 
 ```text
 PropertyDictionaryRoot (PageType 0x003C):
@@ -3303,17 +3356,23 @@ base-property изменение и schema/function dependency mutation атом
 
 ### 20.11. Совместное использование индексов
 
-При `DEFINE INDEX ... DEFER` — индекс работает в eventually-consistent режиме:
+При `DEFINE INDEX ... DEFER` eventual относится только к **доступности** индекса, но не к
+корректности query result:
 
-- Pending changes накапливаются в `IndexPendingQueue` в памяти.
-- Background worker применяет их с интервалом.
-- `status` = `building_update` пока очередь непуста.
+- затрагивающий commit атомарно публикует data и `ClassIndexState::Stale`;
+- stale binding немедленно исключается из planner candidates, exact query использует scan;
+- forced `WITH INDEX` для stale definition возвращает typed planning error;
+- relevant commits записываются в bounded in-memory `IndexPendingQueue`;
+- один background worker строит full snapshot candidate; новая queued revision до publication
+  заставляет повторить build, после exact drain definition становится `Ready`;
+- overflow коалесцирует target в один full rebuild; после crash недолговечная очередь теряется,
+  но persistent `Stale` гарантирует тот же full rebuild при reopen.
 
 При `CONCURRENTLY` — начальная индексация без блокировки class source:
 
 - Snapshot существующих записей → bulk insert.
-- Параллельные changes → в PendingQueue.
-- После завершения bulk → flush PendingQueue.
+- Параллельные changes сохраняют source exact и заставляют новую snapshot/build iteration.
+- Ready binding публикуется только одним commit после revision/fingerprint recheck.
 
 ### 20.12. EdgeEndpointIndex
 
@@ -3520,13 +3579,19 @@ primary/base file является фатальной corruption.
 
 #### 20.13.6. Отношение к `DEFER` и `CONCURRENTLY`
 
-`DEFER` (§20.11) **не является** заменой bulk-сборке: он переносит ту же построчную работу в фон, то есть превращает проблему латентности в проблему очереди. На загрузке в сотни миллионов строк это даёт очередь того же порядка.
+`DEFER` (§20.11) **не является** заменой import bulk-сборке: DML быстро публикует base data и
+недоступность secondary index, а worker выполняет bounded full rebuild. На загрузке в сотни
+миллионов строк следует использовать Atomic Import и одну финальную bulk-сборку.
 
 Разрешение противоречия «очередь в памяти или персистентная» (§20.11 против `gql_spec` §9.6): очередь остаётся **в памяти и ограниченной** `FG_INDEX_PENDING_MAX`. При достижении порога происходит **эскалация**: очередь сбрасывается, индекс помечается `stale`, планируется полная bulk-пересборка. Это crash-safe по построению — ничего долговечного не теряется, поскольку устаревший индекс всё равно строится заново из базовых данных. Персистентная очередь потребовала бы собственного формата, вида WAL-записи и семантики восстановления — то есть незаметно превратилась бы в L0 LSM-дерева, от которого проект отказался сознательно.
 
-Роли получаются раздельными и определёнными: `DEFER` — оптимизация **малой** дельты при редких точечных записях; bulk-сборка — путь **большой** дельты; между ними один явный переход.
+Роли получаются раздельными и определёнными: `DEFER` — latency policy для точечных writes с
+exact scan fallback; import bulk-сборка — путь большой дельты. Stale rows пользователю не
+возвращаются ни в одном режиме.
 
-`CONCURRENTLY` реализуется **поверх** bulk-сборки: снимок на `build_lsn` → внешняя сортировка и сборка в side-file → добор накопившейся (к этому моменту небольшой) очереди обычными вставками → атомарная подмена поколения.
+`CONCURRENTLY` реализуется **поверх** bulk-сборки: снимок на `build_lsn` → внешняя сортировка и
+сборка в side-file → revision recheck/retry → атомарная подмена поколения. Incremental delta
+replay не является скрытым вторым writer path.
 
 ---
 
@@ -4152,8 +4217,9 @@ Transient transport budget вычисляется как `min(288, floor(buffer_
 prefetch, QD и cache policy не являются пользовательскими knobs. Process-wide allocation tracking
 служит диагностикой и не имеет скрытого environment-configured admission threshold.
 
-Имена `FG_*` в следующих разделах обозначают compile-time constants либо будущие admin settings
-этапов 20+, а не читаемые production environment variables GA-core.
+Имена `FG_*` в следующих разделах обозначают compile-time constants или исторические имена
+policy, а не читаемые production environment variables. Runtime-граница этапа 20 —
+`MaintenanceOptions` и bounded overrides `ImportOptions`.
 
 **Журнал и checkpoint** (§22–§23)
 
@@ -4167,10 +4233,11 @@ prefetch, QD и cache policy не являются пользовательск�
 
 **Сборка индексов и массовая загрузка** (§20.13)
 
-Таблица ниже задаёт целевой runtime-configuration contract. В stage-7 baseline
-`FG_BULK_SORT_MEM` и `FG_BULK_SORT_MERGE_FANIN` ещё не читаются из окружения:
-действуют фиксированные значения 256 МиБ и 64 из §20.13.1;
-`FG_BULK_SORT_PARALLELISM` и fill-factor tuning ещё не подключены.
+Таблица ниже задаёт effective runtime policy. Этап 20 подключает общий memory budget и
+parallelism через `MaintenanceOptions` и import overrides; merge fan-in остаётся фиксированным
+64. Значение `FILL_FACTOR` в GrynQL остаётся typed unsupported: Stage-20 diagnostic дал
+`11–26%` роста page-set при допустимом лимите `5%`. Возможная иная bounded/adaptive policy
+отслеживается в `Q-39`; текущий immutable generation packer не разрежается.
 
 | Параметр                              | Тип   | Default   | Описание                                                                       |
 |---------------------------------------|-------|-----------|--------------------------------------------------------------------------------|
@@ -4180,11 +4247,11 @@ prefetch, QD и cache policy не являются пользовательск�
 | `FG_INDEX_BTREE_FILL_FACTOR`          | f64   | **0.90**  | Заполнение листьев B+tree (было 0.80); 1.00 автоматически при монотонном ключе |
 | `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | f64   | 0.95      | Заполнение внутренних узлов B+tree                                             |
 | `FG_INDEX_RTREE_FILL_FACTOR`          | f64   | 0.95      | Заполнение узлов R-tree при STR-упаковке                                       |
-| `FG_INDEX_PENDING_MAX`                | usize | 1000000   | Порог очереди `DEFER` → индекс `stale` + пересборка                            |
+| `FG_INDEX_PENDING_MAX`                | usize | 65536     | Fixed global bound очереди `DEFER`; overflow коалесцируется в full rebuild     |
 | `FG_HNSW_BUILD_MEM`                   | usize | 2 ГиБ     | Бюджет памяти на построение HNSW (отдельно от кэша обслуживания)               |
 | `FG_IMPORT_SEGMENT_ITEMS`             | usize | 1000000   | Applied items во внутреннем private segment импорта                            |
 | `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | usize | 1000      | Сколько нарушений описывается подробно                                         |
-| `FG_IMPORT_REJECT_LIMIT`              | usize | —         | Явный положительный предел только для `ON VIOLATION SKIP`                      |
+| `FG_IMPORT_REJECT_LIMIT`              | usize | —         | Явный положительный предел для `ON VIOLATION SKIP|QUARANTINE`                  |
 | `FG_BULK_WAL_MODE`                    | enum  | `minimal` | `minimal` \| `full`; `full` станет обязательным при появлении репликации/PITR  |
 
 **Статистика** (§19.5)

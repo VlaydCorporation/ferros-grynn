@@ -10,6 +10,8 @@ pub(super) use database::{
 	ClassFieldCatalogEntry,
 	ClassIndexCatalogEntry,
 	DatabaseCatalog,
+	FunctionCatalogEntry,
+	FunctionParameterCatalogEntry,
 	GraphCatalogEntry,
 	GraphPropertyCatalogEntry,
 	ParameterCatalogEntry,

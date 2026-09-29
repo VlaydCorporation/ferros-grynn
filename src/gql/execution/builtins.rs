@@ -7,7 +7,7 @@ use crate::{
 	gql::{ir::Builtin, options::ExecutionControl},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	syn::BinaryOperator,
-	values::{Array, Duration, Number, Set, Type, Value},
+	values::{Array, Duration, Matcher, Number, Regex, Set, Type, Ulid, Uuid, Value},
 };
 
 pub(super) fn execute(
@@ -43,6 +43,46 @@ pub(super) fn execute(
 				string(haystack, "string::contains")?
 					.contains(string(needle, "string::contains")?.as_str()),
 			))
+		}
+		Builtin::StringMatches => {
+			let (value, pattern) = two(arguments)?;
+			let value = string(value, "string::matches")?;
+			let pattern = match pattern {
+				Value::Regex(pattern) => pattern,
+				Value::String(pattern) => Regex::new(pattern).map_err(|error| {
+					FerrosGrynnError::invalid_argument(format!(
+						"invalid regular expression: {error}"
+					))
+				})?,
+				_ => return Err(type_error("string::matches", "regex or string")),
+			};
+			Ok(Value::Bool(pattern.is_match(&value)))
+		}
+		Builtin::StringSlice => {
+			let mut values = arguments.into_iter();
+			let value = string(values.next().ok_or_else(missing_argument)?, "string::slice")?;
+			let start =
+				non_negative_usize(values.next().ok_or_else(missing_argument)?, "string::slice")?;
+			let end =
+				non_negative_usize(values.next().ok_or_else(missing_argument)?, "string::slice")?;
+			if start > end {
+				return Err(domain("string::slice"));
+			}
+			let start = scalar_byte_offset(&value, start)?;
+			let end = scalar_byte_offset(&value, end)?;
+			Ok(Value::from(&value[start..end]))
+		}
+		Builtin::RegexMatcher => {
+			let (value, pattern) = two(arguments)?;
+			let value = string(value, "regex::matcher")?;
+			let pattern = regex(pattern, "regex::matcher")?;
+			Ok(Value::Matcher(Matcher::new(value.into(), pattern)))
+		}
+		Builtin::RegexNext => {
+			let Value::Matcher(matcher) = one(arguments)? else {
+				return Err(type_error("regex::next", "matcher"));
+			};
+			Ok(Value::Bool(matcher.advance()))
 		}
 		Builtin::StringSplit => {
 			let (value, separator) = two(arguments)?;
@@ -146,6 +186,13 @@ pub(super) fn execute(
 			}
 			Ok(Value::Array(result))
 		}
+		Builtin::ArrayPush(_)
+		| Builtin::ArrayPop(_)
+		| Builtin::ArrayClear(_)
+		| Builtin::SetAdd(_)
+		| Builtin::SetClear(_) => Err(FerrosGrynnError::invalid_argument(
+			"Mutable collection helper reached the read-only built-in evaluator.",
+		)),
 		Builtin::SetLen => set(one(arguments)?, "set::len").and_then(|value| length(value.len())),
 		Builtin::SetUnion => {
 			let (left, right) = two_sets(arguments, "set::union")?;
@@ -216,7 +263,57 @@ pub(super) fn execute(
 		Builtin::OptionIsNone => {
 			Ok(Value::Bool(matches!(one(arguments)?, Value::None | Value::Null)))
 		}
+		Builtin::Uuid => Ok(Value::Uuid(Uuid::now_v7())),
+		Builtin::Ulid => Ok(Value::Ulid(Ulid::new())),
+		Builtin::RandId => random_id(arguments),
 	}
+}
+
+fn random_id(arguments: Vec<Value>) -> FerrosGrynnResult<Value> {
+	let length = match arguments.into_iter().next() {
+		Some(value) => non_negative_usize(value, "rand::id")?,
+		None => 20,
+	};
+	if !(1..=1024).contains(&length) {
+		return Err(domain("rand::id"));
+	}
+	const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+	let mut output = String::with_capacity(length);
+	while output.len() < length {
+		for byte in Uuid::new_v4().as_inner().as_bytes() {
+			if *byte >= 252 {
+				continue;
+			}
+			output.push(char::from(ALPHABET[usize::from(*byte % 36)]));
+			if output.len() == length {
+				break;
+			}
+		}
+	}
+	Ok(Value::from(output))
+}
+
+fn non_negative_usize(value: Value, function: &str) -> FerrosGrynnResult<usize> {
+	let Value::Number(Number::Int(value)) = value else {
+		return Err(type_error(function, "non-negative integer"));
+	};
+	usize::try_from(value).map_err(|_| domain(function))
+}
+
+fn scalar_byte_offset(value: &str, offset: usize) -> FerrosGrynnResult<usize> {
+	if offset == 0 {
+		return Ok(0);
+	}
+	value
+		.char_indices()
+		.nth(offset)
+		.map(|(index, _)| index)
+		.or_else(|| (value.chars().count() == offset).then_some(value.len()))
+		.ok_or_else(|| domain("string::slice"))
+}
+
+fn missing_argument() -> FerrosGrynnError {
+	FerrosGrynnError::invalid_argument("Built-in argument is missing.")
 }
 
 fn check(control: Option<&ExecutionControl>, index: usize) -> FerrosGrynnResult<()> {
@@ -290,6 +387,16 @@ fn string(value: Value, function: &str) -> FerrosGrynnResult<String> {
 	match value {
 		Value::String(value) => Ok(value.to_string()),
 		_ => Err(type_error(function, "string")),
+	}
+}
+
+fn regex(value: Value, function: &str) -> FerrosGrynnResult<Regex> {
+	match value {
+		Value::Regex(value) => Ok(value),
+		Value::String(value) => Regex::new(value).map_err(|error| {
+			FerrosGrynnError::invalid_argument(format!("invalid regular expression: {error}"))
+		}),
+		_ => Err(type_error(function, "regex or string")),
 	}
 }
 

@@ -16,7 +16,7 @@ use crate::{
 /// File-catalog format magic.
 const MAGIC: [u8; 4] = *b"FGFC";
 /// Only accepted file-catalog version.
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 /// Fixed byte width of the catalog header.
 const HEADER_BYTES: usize = 24;
 /// Fixed byte width of one entry before its path bytes.
@@ -80,7 +80,7 @@ pub(in crate::storage) struct FileCatalogEntry {
 	pub(in crate::storage) path: CatalogPath,
 }
 
-/// Canonical `FGFC v5` payload.
+/// Canonical `FGFC v6` payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct FileCatalog {
 	/// Next unused physical file-instance identity.
@@ -94,17 +94,26 @@ impl FileCatalog {
 	pub(in crate::storage) fn bootstrap() -> FerrosGrynnResult<Self> {
 		Ok(Self {
 			next_file_instance_id: 1,
-			files: vec![FileCatalogEntry {
-				space_id: DataSpaceId::Database,
-				file_id: DataFileId::for_kind(DataFileKind::SystemCatalog),
-				companion_of: None,
-				role: DataFileRole::WalBackfilled,
-				path: CatalogPath::parse(SYSTEM_CATALOG_PATH)?,
-			}],
+			files: vec![
+				FileCatalogEntry {
+					space_id: DataSpaceId::Database,
+					file_id: DataFileId::for_kind(DataFileKind::SystemCatalog),
+					companion_of: None,
+					role: DataFileRole::WalBackfilled,
+					path: CatalogPath::parse(SYSTEM_CATALOG_PATH)?,
+				},
+				FileCatalogEntry {
+					space_id: DataSpaceId::Database,
+					file_id: DataFileId::for_kind(DataFileKind::JobCatalog),
+					companion_of: None,
+					role: DataFileRole::MetadataCow,
+					path: CatalogPath::parse("admin/jobs.fgb")?,
+				},
+			],
 		})
 	}
 
-	/// Encodes exact `FGFC v5` bytes.
+	/// Encodes exact `FGFC v6` bytes.
 	pub(in crate::storage) fn encode(&self) -> FerrosGrynnResult<Vec<u8>> {
 		validate(self)?;
 		let count = u32::try_from(self.files.len())
@@ -137,7 +146,7 @@ impl FileCatalog {
 		Ok(output)
 	}
 
-	/// Decodes only exact `FGFC v5` bytes and validates the complete registry.
+	/// Decodes only exact `FGFC v6` bytes and validates the complete registry.
 	pub(in crate::storage) fn decode(bytes: &[u8]) -> FerrosGrynnResult<Self> {
 		if bytes.len() > MAX_CATALOG_BYTES {
 			return Err(FerrosGrynnError::storage_decode_limit_exceeded(
@@ -212,6 +221,9 @@ impl FileCatalog {
 	pub(in crate::storage) fn registrations(&self, root: &Path) -> Vec<DataFileRegistration> {
 		self.files
 			.iter()
+			.filter(|file| {
+				matches!(file.role, DataFileRole::WalBackfilled | DataFileRole::Superblock)
+			})
 			.map(|file| DataFileRegistration {
 				space_id: file.space_id,
 				file_id: file.file_id,
@@ -230,6 +242,7 @@ fn validate(catalog: &FileCatalog) -> FerrosGrynnResult<()> {
 		return Err(invalid("file catalog next-file clock is outside its format domain"));
 	}
 	let mut previous = None;
+	let mut job_catalogs = 0_u8;
 	let mut entries = BTreeMap::new();
 	for file in &catalog.files {
 		let key = (file.space_id, file.file_id);
@@ -241,12 +254,30 @@ fn validate(catalog: &FileCatalog) -> FerrosGrynnResult<()> {
 			return Err(invalid("file catalog contains an identity beyond its next-file clock"));
 		}
 		validate_space_kind(file.space_id, file.file_id.kind())?;
-		let superblock = matches!(
-			file.file_id.kind(),
-			Some(DataFileKind::AtomStoreSuperblock | DataFileKind::GraphSuperblock)
-		);
-		if superblock != (file.role == DataFileRole::Superblock) {
+		let expected_role = match file.file_id.kind() {
+			Some(DataFileKind::AtomStoreSuperblock | DataFileKind::GraphSuperblock) => {
+				DataFileRole::Superblock
+			}
+			Some(DataFileKind::JobCatalog) => DataFileRole::MetadataCow,
+			Some(DataFileKind::ImportQuarantine) => DataFileRole::AuxiliaryImmutable,
+			Some(_) => DataFileRole::WalBackfilled,
+			None => return Err(invalid("file catalog contains an unknown file kind")),
+		};
+		if file.role != expected_role {
 			return Err(invalid("file catalog role does not match its file kind"));
+		}
+		match file.file_id.kind() {
+			Some(DataFileKind::JobCatalog) => {
+				job_catalogs = job_catalogs.saturating_add(1);
+				if file.space_id != DataSpaceId::Database || file.path.as_str() != "admin/jobs.fgb"
+				{
+					return Err(invalid("job catalog path or data space is not canonical"));
+				}
+			}
+			Some(DataFileKind::ImportQuarantine) => {
+				validate_quarantine_path(file.space_id, file.path.as_str())?;
+			}
+			_ => {}
 		}
 		if file.file_id.kind() == Some(DataFileKind::Freelist) {
 			if file.companion_of.is_none() {
@@ -258,6 +289,9 @@ fn validate(catalog: &FileCatalog) -> FerrosGrynnResult<()> {
 		if entries.insert(key, file).is_some() {
 			return Err(invalid("file catalog contains duplicate identities"));
 		}
+	}
+	if job_catalogs != 1 {
+		return Err(invalid("file catalog must contain exactly one job catalog"));
 	}
 
 	let mut companions = BTreeSet::new();
@@ -303,6 +337,8 @@ fn validate_space_kind(space: DataSpaceId, kind: Option<DataFileKind>) -> Ferros
 				| DataFileKind::ClassStatistics
 				| DataFileKind::PropertyStatistics
 				| DataFileKind::PropertyDictionary
+				| DataFileKind::JobCatalog
+				| DataFileKind::ImportQuarantine
 		),
 		(DataSpaceId::Graph(_), Some(kind)) => matches!(
 			kind,
@@ -324,6 +360,19 @@ fn validate_space_kind(space: DataSpaceId, kind: Option<DataFileKind>) -> Ferros
 	};
 	if !valid {
 		return Err(invalid("data-file kind does not belong to its data space"));
+	}
+	Ok(())
+}
+
+fn validate_quarantine_path(space: DataSpaceId, path: &str) -> FerrosGrynnResult<()> {
+	let id = path
+		.strip_prefix("admin/quarantine/")
+		.and_then(|value| value.strip_suffix(".fgq"))
+		.ok_or_else(|| invalid("quarantine path is not canonical"))?;
+	let parsed = uuid::Uuid::parse_str(id)
+		.map_err(|_error| invalid("quarantine path does not contain a UUID"))?;
+	if space != DataSpaceId::Database || parsed.to_string() != id {
+		return Err(invalid("quarantine path or data space is not canonical"));
 	}
 	Ok(())
 }
@@ -367,16 +416,20 @@ fn invalid_component(component: &str) -> bool {
 /// Encodes a checkpoint role into its canonical byte.
 const fn role_byte(role: DataFileRole) -> u8 {
 	match role {
-		DataFileRole::WalBackfilled => 1,
-		DataFileRole::Superblock => 2,
+		DataFileRole::WalBackfilled => 0,
+		DataFileRole::Superblock => 1,
+		DataFileRole::MetadataCow => 2,
+		DataFileRole::AuxiliaryImmutable => 3,
 	}
 }
 
 /// Decodes one canonical checkpoint-role byte.
 fn role_from_byte(value: u8) -> FerrosGrynnResult<DataFileRole> {
 	match value {
-		1 => Ok(DataFileRole::WalBackfilled),
-		2 => Ok(DataFileRole::Superblock),
+		0 => Ok(DataFileRole::WalBackfilled),
+		1 => Ok(DataFileRole::Superblock),
+		2 => Ok(DataFileRole::MetadataCow),
+		3 => Ok(DataFileRole::AuxiliaryImmutable),
 		_ => Err(invalid("file catalog contains an unknown checkpoint role")),
 	}
 }
@@ -472,11 +525,11 @@ mod tests {
 	use crate::graph::GraphId;
 
 	#[test]
-	fn fgfc_v5_has_exact_space_header_and_rejects_v4() -> FerrosGrynnResult<()> {
+	fn fgfc_v6_has_exact_auxiliary_roles_and_rejects_v5() -> FerrosGrynnResult<()> {
 		let catalog = FileCatalog::bootstrap()?;
 		let bytes = catalog.encode()?;
 		let mut expected = vec![
-			b'F', b'G', b'F', b'C', 5, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+			b'F', b'G', b'F', b'C', 6, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
 		];
 		expected.extend_from_slice(&0_u64.to_le_bytes());
 		expected.extend_from_slice(
@@ -484,14 +537,23 @@ mod tests {
 		);
 		expected.extend_from_slice(&0_u64.to_le_bytes());
 		expected.extend_from_slice(&18_u16.to_le_bytes());
-		expected.push(1);
+		expected.push(0);
 		expected.extend_from_slice(&[0; 5]);
 		expected.extend_from_slice(SYSTEM_CATALOG_PATH.as_bytes());
+		expected.extend_from_slice(&0_u64.to_le_bytes());
+		expected
+			.extend_from_slice(&DataFileId::for_kind(DataFileKind::JobCatalog).get().to_le_bytes());
+		expected.extend_from_slice(&0_u64.to_le_bytes());
+		expected.extend_from_slice(&14_u16.to_le_bytes());
+		expected.push(2);
+		expected.extend_from_slice(&[0; 5]);
+		expected.extend_from_slice(b"admin/jobs.fgb");
 		assert_eq!(bytes, expected);
 		assert_eq!(FileCatalog::decode(&bytes)?, catalog);
+		assert_eq!(catalog.registrations(Path::new("db")).len(), 1);
 
 		let mut old = bytes;
-		old[4..6].copy_from_slice(&4_u16.to_le_bytes());
+		old[4..6].copy_from_slice(&5_u16.to_le_bytes());
 		assert_eq!(
 			FileCatalog::decode(&old).err().map(|error| error.status().code().to_string()),
 			Some("FG-51S01".to_owned())
@@ -534,12 +596,12 @@ mod tests {
 			Some(nodes.file_id),
 		)?;
 		let node_free_id = node_free.file_id;
+		let mut catalog = FileCatalog::bootstrap()?;
 		let mut files = vec![atoms, atom_free, props, prop_free, nodes, node_free];
+		files.append(&mut catalog.files);
 		files.sort_unstable_by_key(|file| (file.space_id, file.file_id));
-		let catalog = FileCatalog {
-			next_file_instance_id: 7,
-			files,
-		};
+		catalog.next_file_instance_id = 7;
+		catalog.files = files;
 		assert_eq!(FileCatalog::decode(&catalog.encode()?)?, catalog);
 
 		let mut wrong_space = catalog;

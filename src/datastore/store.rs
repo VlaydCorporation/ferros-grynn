@@ -4,7 +4,7 @@ use std::{
 	path::Path,
 	sync::{
 		Arc,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicU64, AtomicUsize, Ordering},
 	},
 };
 
@@ -20,6 +20,12 @@ use super::{
 	InMemoryOptions,
 	LocalOptions,
 	LocalStorageStatus,
+	MaintenanceAnalyzeMode,
+	MaintenanceCoordinator,
+	MaintenanceJobInfo,
+	MaintenanceJobKind,
+	MaintenanceOptions,
+	MaintenanceTarget,
 	SchemaCatalog,
 	StoreBackend,
 	StoreInner,
@@ -35,12 +41,56 @@ use crate::{
 };
 
 /// Database owning one global atom registry and any number of graph views.
-#[derive(Clone)]
 pub struct Datastore {
 	pub(crate) inner: Arc<StoreInner>,
 }
 
+impl Clone for Datastore {
+	fn clone(&self) -> Self {
+		if self
+			.inner
+			.datastore_handles
+			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handles| handles.checked_add(1))
+			.is_err()
+		{
+			std::process::abort();
+		}
+		Self {
+			inner: self.inner.clone(),
+		}
+	}
+}
+
+impl Drop for Datastore {
+	fn drop(&mut self) {
+		if self.inner.datastore_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+			self.inner.maintenance.shutdown();
+		}
+	}
+}
+
 impl Datastore {
+	/// Opens one immutable rejected-item set by its durable identity.
+	///
+	/// # Errors
+	///
+	/// Returns an unknown-identity, corruption, decode, or I/O error.
+	pub fn open_quarantine(
+		&self,
+		id: super::QuarantineId,
+	) -> FerrosGrynnResult<super::QuarantineReader> {
+		self.inner.open_quarantine(id.as_uuid()).map(super::QuarantineReader::new)
+	}
+
+	/// Removes one rejected-item set from the durable catalog.
+	///
+	/// # Errors
+	///
+	/// Returns an unknown-identity, persistence, or I/O error.
+	pub fn remove_quarantine(&self, id: super::QuarantineId) -> FerrosGrynnResult<()> {
+		self.inner.remove_quarantine(id.as_uuid())
+	}
+
 	/// Returns effective local storage budgets and pressure counters, or `None`
 	/// for an in-memory datastore.
 	pub fn local_storage_status(&self) -> Option<LocalStorageStatus> {
@@ -71,11 +121,13 @@ impl Datastore {
 			validated.checkpoint_page_threshold,
 			options.checkpoint.interval,
 		)?;
-		Ok(Self::from_parts(
+		let store = Self::from_parts(
 			DatastoreOptions::Local(options),
 			StoreBackend::Local(Box::new(local)),
 			root,
-		))
+		);
+		store.inner.maintenance.start(&store.inner)?;
+		Ok(store)
 	}
 
 	/// Opens, recovers, and exclusively owns an existing local database.
@@ -88,11 +140,13 @@ impl Datastore {
 			validated.checkpoint_page_threshold,
 			options.checkpoint.interval,
 		)?;
-		Ok(Self::from_parts(
+		let store = Self::from_parts(
 			DatastoreOptions::Local(options),
 			StoreBackend::Local(Box::new(local)),
 			root,
-		))
+		);
+		store.inner.maintenance.start(&store.inner)?;
+		Ok(store)
 	}
 
 	fn from_parts(options: DatastoreOptions, backend: StoreBackend, root: DatabaseRoot) -> Self {
@@ -103,6 +157,10 @@ impl Datastore {
 				.join(format!("ferros-grynn-query-{}", crate::values::Uuid::now_v7())),
 			StoreBackend::Local(local) => local.import_scratch_root().to_path_buf(),
 		};
+		let recovered_jobs = match &backend {
+			StoreBackend::InMemory => Vec::new(),
+			StoreBackend::Local(local) => local.maintenance_jobs(),
+		};
 		Self {
 			inner: Arc::new(StoreInner {
 				options,
@@ -111,11 +169,117 @@ impl Datastore {
 				next_schema_id: AtomicU64::new(next_schema_id),
 				next_graph_id: AtomicU64::new(next_graph_id),
 				import_owner: AtomicU64::new(0),
+				datastore_handles: AtomicUsize::new(1),
 				current: RwLock::new(Arc::new(root)),
 				commit: Mutex::new(()),
 				query_scratch_root,
+				quarantines: Mutex::new(std::collections::BTreeMap::new()),
+				maintenance: MaintenanceCoordinator::new(recovered_jobs),
 			}),
 		}
+	}
+
+	/// Returns one durable maintenance job, if it exists.
+	pub fn job(&self, id: super::JobId) -> FerrosGrynnResult<Option<MaintenanceJobInfo>> {
+		Ok(self.inner.maintenance.job(id))
+	}
+
+	/// Returns all retained active and terminal maintenance jobs.
+	pub fn jobs(&self) -> FerrosGrynnResult<Vec<MaintenanceJobInfo>> {
+		Ok(self.inner.maintenance.jobs())
+	}
+
+	/// Cooperatively cancels one queued or running maintenance job.
+	pub fn kill_job(&self, id: super::JobId) -> FerrosGrynnResult<MaintenanceJobInfo> {
+		self.inner.maintenance.kill(self.inner.as_ref(), id)
+	}
+
+	pub(crate) fn enqueue_maintenance(
+		&self,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		options: Option<MaintenanceOptions>,
+	) -> FerrosGrynnResult<super::JobId> {
+		self.enqueue_maintenance_with_analysis(kind, target, options, None)
+	}
+
+	pub(crate) fn enqueue_maintenance_with_analysis(
+		&self,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		options: Option<MaintenanceOptions>,
+		analyze_mode: Option<MaintenanceAnalyzeMode>,
+	) -> FerrosGrynnResult<super::JobId> {
+		let analyze_mode = if kind == MaintenanceJobKind::Analyze {
+			Some(self.inner.resolve_analyze_mode(
+				target,
+				analyze_mode.unwrap_or(MaintenanceAnalyzeMode::Automatic),
+			)?)
+		} else {
+			if analyze_mode.is_some() {
+				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+					"only ANALYZE maintenance accepts a statistics build mode",
+				));
+			}
+			None
+		};
+		let configured = match self.inner.options {
+			DatastoreOptions::InMemory(options) => options.maintenance,
+			DatastoreOptions::Local(options) => options.maintenance,
+		};
+		let selected = options.unwrap_or(MaintenanceOptions {
+			max_memory_bytes: configured.max_memory_bytes,
+			max_parallelism: std::num::NonZeroUsize::MIN,
+		});
+		self.inner.maintenance.enqueue(&self.inner, kind, target, selected, analyze_mode)
+	}
+
+	pub(crate) fn record_deferred_index_change(
+		&self,
+		target: MaintenanceTarget,
+		revision: u64,
+	) -> FerrosGrynnResult<super::JobId> {
+		let configured = match self.inner.options {
+			DatastoreOptions::InMemory(options) => options.maintenance,
+			DatastoreOptions::Local(options) => options.maintenance,
+		};
+		let selected = MaintenanceOptions {
+			max_memory_bytes: configured.max_memory_bytes,
+			max_parallelism: std::num::NonZeroUsize::MIN,
+		};
+		self.inner.maintenance.record_deferred_index_change(&self.inner, target, revision, selected)
+	}
+
+	pub(crate) fn run_foreground_maintenance(
+		&self,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		options: MaintenanceOptions,
+	) -> FerrosGrynnResult<()> {
+		self.run_foreground_maintenance_with_analysis(kind, target, options, None)
+	}
+
+	pub(crate) fn run_foreground_maintenance_with_analysis(
+		&self,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		options: MaintenanceOptions,
+		analyze_mode: Option<MaintenanceAnalyzeMode>,
+	) -> FerrosGrynnResult<()> {
+		let analyze_mode = if kind == MaintenanceJobKind::Analyze {
+			Some(self.inner.resolve_analyze_mode(
+				target,
+				analyze_mode.unwrap_or(MaintenanceAnalyzeMode::Automatic),
+			)?)
+		} else {
+			if analyze_mode.is_some() {
+				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+					"only ANALYZE maintenance accepts a statistics build mode",
+				));
+			}
+			None
+		};
+		self.inner.run_foreground_maintenance(kind, target, options, analyze_mode)
 	}
 
 	#[cfg(test)]

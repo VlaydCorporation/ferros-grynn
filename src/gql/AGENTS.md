@@ -47,8 +47,8 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
   -> IR -> execution -> backend tests. Пустые variants «на будущее» запрещены.
 - Core DDL проходит этой же цепочкой и изменяет транзакционный catalog через
   datastore adapter. `CLASS` задаёт namespace и immutable atom kind;
-  `INFO FOR DB|CLASS|INDEX` читает transaction-visible definitions и состояние
-  индекса.
+  `INFO FOR DB|CLASS|INDEX|PARAM|FUNCTION|JOB(S)` читает transaction-visible
+  definitions либо immutable maintenance projection.
 - Core DML выполняет общий preflight целей и `EXPECT` по pre-image до первой
   мутации. Direct DML адресует global atom по `RecordId = class:id`, а
   graph-scoped DML читает effective properties.
@@ -84,6 +84,15 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
   retained typed plan и captures в общем лимите 256 МиБ и не сериализуется.
   Mutation допустима только в явном `tv::side_effect`; schema mutation во время
   traversal запрещена.
+- Named `fn::` UDF всегда разрешается анализатором в точный `(FunctionId,
+  SchemaVersion)` overload. Effect проверяется транзитивно; IMPURE call использует общий
+  transaction savepoint, recursion — общий control budget и declared `MAXDEPTH`.
+  Typed IR на диск не записывается, а builtin/UDF/algorithm registry не объединяются.
+- Maintenance statements понижаются в typed IR до обращения к coordinator. Unsupported
+  option обязан завершиться до durable enqueue. Stale index не может стать approximate read
+  path: planner выбирает exact scan, а forced hint возвращает planning error.
+- Unicode `COLLATE`/`NUMERIC` формирует ICU4X sort key внутри общего barrier budget; version и
+  configuration входят в ORDER fingerprint. Runtime-only matcher/closure не spill-ятся.
 - Bulk является только внутренней оптимизацией: equality включает current,
   trace, sacks и env, а observable path либо impure side effect отключает
   небезопасное слияние. Resource exhaustion fail-closed и не выдаёт partial

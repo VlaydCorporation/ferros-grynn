@@ -45,6 +45,7 @@ pub fn validate_index_type(value_type: &Type) -> FerrosGrynnResult<()> {
 		| Type::Geometry
 		| Type::Vector(_)
 		| Type::Regex
+		| Type::Matcher
 		| Type::Path
 		| Type::Graph(_)
 		| Type::Union(_)

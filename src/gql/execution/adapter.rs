@@ -3,6 +3,8 @@
 	reason = "move-only executor split keeps the existing imports during stage 1"
 )]
 
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::datastore::{ClassSchema, ClassSchemaMode};
 
@@ -120,12 +122,18 @@ pub fn execute_transaction_with_options(
 			closures.clone(),
 		)
 		.with_publication_deferred(true);
+		let mutable_bindings = transaction
+			.gql_bindings()
+			.keys()
+			.map(|name| Box::<str>::from(name.as_str()))
+			.collect::<BTreeSet<_>>();
 		let execution = transaction.run_gql_statement(|transaction| {
 			execute_parsed_statement_with_bindings(
 				transaction,
 				source,
 				statement,
 				&mut bindings,
+				&mutable_bindings,
 				&control,
 			)
 		});
@@ -139,10 +147,17 @@ pub fn execute_transaction_with_options(
 			},
 		};
 		let failed = result.result.is_err();
-		if !failed && let Some(name) = let_name {
-			let value = bindings.get(name).cloned().unwrap_or(Value::None);
+		if !failed {
 			let mut transaction_bindings = transaction.gql_bindings().clone();
-			transaction_bindings.insert(name, value);
+			for name in &mutable_bindings {
+				if let Some(value) = bindings.get(name).cloned() {
+					transaction_bindings.insert(name.as_ref(), value);
+				}
+			}
+			if let Some(name) = let_name {
+				transaction_bindings
+					.insert(name, bindings.get(name).cloned().unwrap_or(Value::None));
+			}
 			transaction.replace_gql_bindings(transaction_bindings);
 		}
 		result.elapsed = started.elapsed();
@@ -193,6 +208,7 @@ pub(crate) fn execute_parsed_statement_with_bindings(
 	source: &str,
 	statement: &crate::syn::Statement,
 	bindings: &mut Object,
+	mutable_bindings: &BTreeSet<Box<str>>,
 	control: &crate::gql::options::ExecutionControl,
 ) -> FerrosGrynnResult<QueryResult> {
 	let snapshot = transaction.query_snapshot()?;
@@ -200,7 +216,7 @@ pub(crate) fn execute_parsed_statement_with_bindings(
 		transaction,
 		snapshot,
 	};
-	execute_parsed_statement(&mut read, source, statement, bindings, control)
+	execute_parsed_statement(&mut read, source, statement, bindings, mutable_bindings, control)
 }
 
 pub(super) struct TransactionRead<'a> {
@@ -216,6 +232,10 @@ impl TransactionRead<'_> {
 }
 
 impl QueryCatalog for TransactionRead<'_> {
+	fn schema_epoch(&self) -> u64 {
+		self.snapshot.commit_ts()
+	}
+
 	fn schema(&self, class: &str) -> FerrosGrynnResult<Schema> {
 		self.transaction.query_class(&self.snapshot, class).map(|schema| query_schema(&schema))
 	}
@@ -236,6 +256,21 @@ impl QueryCatalog for TransactionRead<'_> {
 		self.transaction
 			.query_named_graph_schema(&self.snapshot, name)
 			.map(|schema| schema.map(|schema| schema.reference().clone()))
+	}
+
+	fn functions(
+		&self,
+		namespace: &str,
+		name: &str,
+	) -> FerrosGrynnResult<Vec<Arc<crate::datastore::SchemaFunction>>> {
+		self.transaction.query_schema_functions(&self.snapshot, namespace, name)
+	}
+
+	fn function(
+		&self,
+		id: crate::datastore::FunctionId,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaFunction>>> {
+		self.transaction.query_schema_function(&self.snapshot, id)
 	}
 }
 
@@ -836,9 +871,20 @@ impl QueryRead for TransactionRead<'_> {
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
 		let snapshot = self.snapshot.clone();
-		let value = self.transaction.atomic_mutation(|transaction| {
-			execute_schema(transaction, &snapshot, statement, slots, source, control)
-		})?;
+		let value = if matches!(
+			statement,
+			LogicalSchemaStatement::InfoDatabase
+				| LogicalSchemaStatement::InfoClass { .. }
+				| LogicalSchemaStatement::InfoIndex { .. }
+				| LogicalSchemaStatement::InfoParameter { .. }
+				| LogicalSchemaStatement::InfoFunction { .. }
+		) {
+			execute_schema(self.transaction, &snapshot, statement, slots, source, control)?
+		} else {
+			self.transaction.atomic_mutation(|transaction| {
+				execute_schema(transaction, &snapshot, statement, slots, source, control)
+			})?
+		};
 		self.refresh_snapshot()?;
 		Ok(value)
 	}

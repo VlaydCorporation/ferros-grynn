@@ -1,11 +1,25 @@
 # GrynQL — Грамматика языка запросов Ferros-Grynn
 
 **Версия:** 0.3-draft
-**Статус:** проектирование
+**Статус:** исполнимый профиль синхронизирован по этап 21
 **Основано на:** [gql_spec.md](gql_spec.md) v0.3-draft
 **Нормативная область:** точный синтаксис каждого утверждённого профиля. Семантику конструкций
 задаёт [gql_spec.md](gql_spec.md), storage-контракт —
 [disk_storage_spec.md](disk_storage_spec.md), реализацию — [gql_tech_spec.md](gql_tech_spec.md).
+
+---
+
+## Исполнимый профиль этапов 20–21
+
+**Статус профиля:** `implemented` (2026-09-29). Административные statements,
+durable `PARAM`, именованные `fn::` UDF, оставшийся runtime-язык и
+`COLLATE`/`NUMERIC` принимаются в формах, закреплённых ниже. Durable wire profile:
+`FGDC v10`, `FGFC v6`, `FGJB v1`, `FGQR v1`; старые `FGDC v9`/`FGFC v5` не
+являются compatibility grammar/runtime profile.
+
+`FILL_FACTOR` (`Q-39`), `EVENTS=ON` и `CHANGEFEED=ON` остаются распознаваемой,
+но не исполняемой поверхностью. `QUARANTINE`, `SORT_MEM`, `PARALLELISM`, `tv::algo`,
+именованные аргументы UDF и Unicode ordering исполнимы.
 
 ---
 
@@ -914,8 +928,10 @@ Pipeline-оператор `|>` лево-ассоциативен (§12.10). Ис
 `tv::weaklyConnectedComponents`, `tv::condensation`, `tv::minimumSpanningForest`,
 `tv::findCuts`, `tv::lca`, `tv::hasCycle` (§13.4 spec).
 
-`tv::algo` принадлежит этапу 21; PageRank, centralities, all-shortest enumeration,
-triangles/clustering, label propagation и Louvain — этапу 26.
+`tv::algo(fn::name, ...)` исполним с этапа 21 и принимает только named
+`PURE`/`STABLE` UDF; текущий traverser передаётся первым неявным аргументом. PageRank,
+centralities, all-shortest enumeration, triangles/clustering, label propagation и Louvain —
+этапу 26.
 
 Модификаторы `repeat`: `.times(n)`, `.until(closure)`, `.emit()`.
 
@@ -1000,6 +1016,7 @@ define_param ::= "DEFINE" "PARAM" [ overwrite_or_ifne ] param "VALUE" expr
 ```ebnf
 define_function ::= "DEFINE" [ fn_purity ] [ "COST" ] "FUNCTION" [ overwrite_or_ifne ]
                     user_fn "(" [ fn_param_list ] ")" [ "->" type ]
+                    [ "MAXDEPTH" integer ]
                     block
                     [ "COMMENT" string_lit ]
 fn_purity     ::= "PURE" | "STABLE" | "IMPURE"
@@ -1128,8 +1145,11 @@ remove_target ::=
     | "FIELD"    [ if_exists ] name "ON" "CLASS" class_name
     | "INDEX"    [ if_exists ] name "ON" ( "CLASS" class_name | "GRAPH" name )
     | "ANALYZER" [ if_exists ] name
-    | "FUNCTION" [ if_exists ] user_fn
+    | "FUNCTION" [ if_exists ] function_signature
     | "PARAM"    [ if_exists ] param
+
+function_signature ::= user_fn [ "(" [ type_list ] ")" ]
+type_list          ::= type { "," type }
 ```
 
 ### 9.10. ALTER
@@ -1165,11 +1185,13 @@ alter_field_action ::= "DROP" ( "TYPE" | "FLEXIBLE" | "READONLY" | "VALUE"
                      | "TYPE" type | "VALUE" expr | "ASSERT" expr
                      | "DEFAULT" [ "ALWAYS" ] expr | "COMMENT" string_lit
 
-alter_function ::= "ALTER" "FUNCTION" [ if_exists ] user_fn
+alter_function ::= "ALTER" "FUNCTION" [ if_exists ] function_signature
                    alter_function_action { alter_function_action }
 alter_function_action ::= "(" [ fn_param_list ] ")"
                         | "->" type | "DROP" "RETURNS"
-                        | block | "COMMENT" string_lit | "DROP" "COMMENT"
+                         | fn_purity | "COST" | "DROP" "COST"
+                         | "MAXDEPTH" integer | "DROP" "MAXDEPTH"
+                         | block | "COMMENT" string_lit | "DROP" "COMMENT"
 
 alter_index ::= "ALTER" "INDEX" name "ON" ( "CLASS" class_name | "GRAPH" name )
                 ( "COMMENT" string_lit | "PREPARE" "REMOVE" | "DROP" "COMMENT" )
@@ -1208,29 +1230,39 @@ info_stmt ::= "INFO" "FOR" (
                 | "CLASS" class_name
                 | "GRAPH" graph_ref
                 | "INDEX" name "ON" ( "CLASS" class_name | "GRAPH" name )
+                | "PARAM" param
+                | "FUNCTION" function_signature
+                | "JOB" param
+                | "JOBS"
               )
 
 analyze_stmt ::= "ANALYZE"
                  ( "CLASS" class_name
-                   ( "BASE" | "EFFECTIVE" "IN" "GRAPH" name )
-                 | "GRAPH" name )
+                   ( "BASE" | "EFFECTIVE" "IN" "GRAPH" graph_ref )
+                 | "GRAPH" graph_ref )
                  [ "FULL" | "APPROXIMATE" [ "SAMPLE" integer ] ]
-                 [ "CONCURRENTLY" ]
+                 [ "CONCURRENTLY" ] [ maintenance_options ]
 
 show_changes_stmt ::= "SHOW" "CHANGES" "FOR"
                       ( "CLASS" class_name | "GRAPH" graph_ref )
                       "SINCE" ( datetime_lit | integer | expr )
                       [ "LIMIT" integer ]
 
-kill_stmt ::= "KILL" ( param | expr )
+kill_stmt ::= "KILL" param
 
 rebuild_stmt ::= "REBUILD" "INDEX" [ if_exists ] name
-                 "ON" "CLASS" class_name
-                 [ "CONCURRENTLY" ] [ with_options ]
+                 "ON" ( "CLASS" class_name | "GRAPH" name )
+                 [ "CONCURRENTLY" ] [ maintenance_options ]
 
-compact_stmt ::= "COMPACT" ( "INDEX" name | "GRAPH" name ) [ "CONCURRENTLY" ]
+compact_stmt ::= "COMPACT"
+                 ( "DATABASE" | "DB" | "GRAPH" name
+                 | "INDEX" name "ON" ( "CLASS" class_name | "GRAPH" name ) )
+                 [ "CONCURRENTLY" ] [ maintenance_options ]
 
-(* Общий блок опций сборки: FILL_FACTOR, SORT_MEM, PARALLELISM, ... *)
+maintenance_options ::= "WITH" "(" maintenance_option { "," maintenance_option } ")"
+maintenance_option  ::= ( "SORT_MEM" | "PARALLELISM" ) "=" integer
+
+(* Общий блок прочих опций; поддерживаемый набор задаёт statement contract. *)
 with_options ::= "WITH" "(" option_assign { "," option_assign } ")"
 option_assign ::= ident "=" expr
 
@@ -1332,9 +1364,10 @@ expect_clause  ::= "EXPECT" ( expr | "EXISTS" | "NOT" "EXISTS" )
 target ::= ( record_range | record_id | class_name ) [ graph_scope ] | param | idiom
 ```
 
-Начиная с этапа 14 `ORDER RAND()` исполним как специальный ordering operator. `COLLATE` и
-`NUMERIC` остаются в синтаксисе, но analyzer возвращает typed unsupported до чтения source; их
-владелец — этап 21. В `WITH INDEX` qualified имя связывает кандидат с source alias, а
+Начиная с этапа 14 `ORDER RAND()` исполним как специальный ordering operator. С этапа 21
+`COLLATE` и `NUMERIC` исполнимы через versioned ICU4X sort key: `COLLATE` использует root
+primary collation, а standalone `NUMERIC` — tertiary text sensitivity с numeric segments.
+В `WITH INDEX` qualified имя связывает кандидат с source alias, а
 unqualified имя допустимо только при однозначной принадлежности. Несколько имён одного source
 задают candidate set, из которого optimizer обязан выбрать один Ready-index. `JOIN` без
 модификатора означает `INNER JOIN`. Derived source всегда требует alias; comma/`&` больше не
@@ -1449,12 +1482,13 @@ arg       ::= [ ident "=" ] expr                (* именованные арг
 
 Дженерик-форма `type::is<edge>(x)`, `type::to<int>(x)` — через `[ "<" type ">" ]`.
 
-Исполнимый статический catalog этапа 12: `math::{abs,sqrt,pow,floor,ceil}`,
+Базовый статический catalog: `math::{abs,sqrt,pow,floor,ceil}`,
 `string::{upper,lower,len,contains,split,concat}`, `time::{now,format,add,diff}`,
 `array::{len,concat,distinct,first,flatten}`, `set::{len,union,intersect,diff,has}`,
-`type::{is,to}`, `meta::{id,class,type}`, `option::{is_some,is_none}`. Aggregates/query
-subexpressions, UDF, mutable collections, regex, graph/path, search и geo остаются у
-назначенных последующих этапов; parser не превращает их в динамический function registry.
+`type::{is,to}`, `meta::{id,class,type}`, `option::{is_some,is_none}`. Этап 21 добавляет
+`string::{matches,slice}`, `regex::{matcher,next}`, lvalue-only
+`array::{push,pop,clear}`/`set::{add,clear}`, `uuid()`, `ulid()`, `rand::id()` и named `fn::`
+UDF. Parser по-прежнему не создаёт динамический builtin registry.
 
 ### 12.6. Замыкания
 
@@ -1469,7 +1503,8 @@ closure_body   ::= block | expr
 
 С этапа 17 closure является session-scoped runtime value: captures сохраняются по значению,
 а вызов требует ту же живую `GqlSession`. Transaction statements, `BEGIN IMPORT` и вложенный
-`EXPLAIN ANALYZE` внутри body запрещены. Именованные UDF и recursion остаются этапу 21.
+`EXPLAIN ANALYZE` внутри body запрещены. С этапа 21 durable named UDF имеют отдельный
+catalog contract, exact overload resolution и bounded recursion через `MAXDEPTH 1..=64`.
 
 ### 12.7. Кванторы по путям
 

@@ -1,8 +1,45 @@
 # Ferros-Grynn GrynQL Tech Spec — Спецификация реализации механизмов языка запросов
 
 **Версия:** 0.3-draft
-**Статус:** проектирование
+**Статус:** исполнимый профиль синхронизирован по этап 21
 **Определяется файлами:** [gql_spec.md](gql_spec.md) (семантика), [gql_grammar.md](gql_grammar.md) (синтаксис), [disk_storage_spec.md](disk_storage_spec.md) (хранилище)
+
+---
+
+## Утверждённый технический профиль этапов 20–21
+
+**Статус профиля:** `implemented` (2026-09-29). Dependency order и gates задают
+[`gql_admin_stage_20_plan.md`](gql_admin_stage_20_plan.md) и
+[`gql_udf_stage_21_plan.md`](gql_udf_stage_21_plan.md); evidence находится в одноимённых
+отчётах каталога `reports/`.
+
+Stage 20 добавляет один concrete `MaintenanceCoordinator` на datastore: FIFO worker на
+`std::thread + Mutex + Condvar`, durable `FGJB v1`, cooperative cancellation и publication
+через существующий catalog/WAL commit. Job record не хранит paths или page pointers.
+`CONCURRENTLY` сначала durable-enqueue-ит работу; `KILL` может победить только до publication
+под commit lock. Startup reconciliation сверяет `Publishing` fingerprint, перезапускает
+прерванный build и никогда не выводит `Ready` только из состояния ledger.
+
+Deferred Standard/Count index публикуется как `Stale` в том же commit, что primary mutation.
+Planner не рассматривает stale binding, forced hint возвращает typed error, поэтому exact scan
+остаётся correctness path. In-memory pending queue bounded и недолговечна; переполнение или
+restart коалесцируются в full rebuild. Catch-up публикует новый binding только после проверки
+source revision и отсутствия более новой queued delta. Quarantine пишет transient `FGQR v1` и
+публикует immutable auxiliary file лишь вместе с успешным import.
+
+Stage 21 расширяет тот же schema catalog durable параметрами и named `fn::` overloads.
+Function body хранится как UTF-8 source, проходит parse/type/effect/cycle validation до
+publication и компилируется лениво в concrete cache `(FunctionId, SchemaVersion,
+schema_epoch)`. Overload выбирается по `(max_rank, sum_rank)`; равенство остаётся ambiguity.
+Вызов наследует transaction/deadline/budgets, IMPURE body работает через существующий
+savepoint, recursion ограничена `MAXDEPTH` и control-depth. Отдельного function/algorithm
+registry, persisted typed IR и второго executor нет.
+
+`tv::algo` понижает named PURE/STABLE UDF в обычный traversal call. Matcher остаётся
+runtime-only identity value; mutable collection helpers меняют только прямой lexical lvalue.
+ICU4X sort keys учитываются в общем barrier budget и transient spill, а ICU version/config —
+в ORDER fingerprint. Durable wire cutover — только `FGDC v10`/`FGFC v6`; `FGJB v1` и
+`FGQR v1` являются отдельными metadata/auxiliary formats, а v9/v5 не мигрируются.
 
 ---
 
@@ -91,7 +128,7 @@ ClassScan / RecordLookup
 
 ### Утверждённые технические контракты после S0–S6
 
-- `FGDC v9` не хранит property-key strings: boot идёт FileCatalog → AtomStoreSuperblock →
+- `FGDC v10` не хранит property-key strings: boot идёт FileCatalog → AtomStoreSuperblock →
   append-only `property_keys.fgb` → schema definitions.
 - AtomStore/graph superblocks — snapshot-visible full WAL frames. Checkpoint не пишет их
   in-place, а публикует `main/.prev` COW; `.tmp` никогда не authority.
@@ -1086,9 +1123,9 @@ Import и `ASSERT INVARIANTS` вызывают одну normalized-root validati
 assert ограничивает обход указанным graph и его atom references.
 
 Expression executor использует typed IR, единый `Value::is_truthy` и статический builtin
-enum/signature table. `time::now()` захватывается один раз при анализе statement. На этапах
-11–12 runtime function registry и общая closure-система не вводятся; session-scoped language
-closures принадлежат этапу 17, UDF/catalog registry — этапу 21.
+enum/signature table. `time::now()` захватывается один раз при анализе statement. Session-scoped
+closures принадлежат этапу 17; этап 21 добавляет concrete durable UDF catalog/cache, но не
+динамический builtin registry.
 
 ---
 
@@ -1273,6 +1310,8 @@ publication.
 | `FG_STATS_AUTO_ANALYZE_DIRTY`                     | авто-`ANALYZE`                       | 0.10          |
 | `FG_PATH_MAX_DEPTH`                               | макс. глубина path-finding           | 30            |
 | `QueryExecutionOptions.max_graph_nodes/edges`     | лимиты graph assembly                | 1e6 / 5e6     |
+| `MaintenanceOptions.max_memory_bytes`             | общий budget одного maintenance build | 256 MiB       |
+| `MaintenanceOptions.max_parallelism`              | верхняя граница scoped run workers    | ядра          |
 | `FG_TRAVERSAL_READ_YOUR_WRITES`                   | видимость своих мутаций traversal'ом | false         |
 | `FG_TEMPFILES_PATH`                               | каталог для `SELECT … TEMPFILES`     | ""            |
 | `FG_ASYNC_EVENT_PROCESSING_INTERVAL`              | интервал async-событий               | 5000 ms       |
@@ -1306,8 +1345,8 @@ budget, а не depth. Деградация fail-closed: partial graph не во
   (`RecordId`/`GraphRef`/join tuple/group key/split ordinal), не по внутреннему `AtomId`.
 - Deterministic traversal: `Expand(v)` возвращает `sorted(adj[v])`; параллельный traversal — stable merge или deterministic scheduler (`task_id = hash(node_id)`).
 - `ORDER RAND()` использует versioned RapidHash V3 от effective seed и canonical stable row key.
-  `time::now()` и прочие nondeterministic/IMPURE функции отклоняются до чтения rows; scalar
-  `rand()`/`uuid()` остаются этапу 21.
+  `time::now()`, `uuid()`, `ulid()`, `rand::id()` и прочие nondeterministic/IMPURE функции
+  отклоняются до чтения rows.
 - Deterministic aggregation: `sum = fold(sorted(values))`; FP — фиксированное дерево редукции (pairwise) или `decimal` для критичного.
 - Side-effects — детерминированный порядок либо запрет в DETERMINISTIC.
 

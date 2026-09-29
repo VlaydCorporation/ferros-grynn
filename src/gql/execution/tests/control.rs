@@ -60,6 +60,211 @@ fn evaluates_collections_ranges_idioms_and_builtins() {
 }
 
 #[test]
+fn stage21_string_and_random_builtins_follow_runtime_contract()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	assert_eq!(value(&store, "RETURN string::matches('graph', '^gr(a|y)ph$');"), Value::Bool(true));
+	assert_eq!(value(&store, "RETURN string::slice('aЖ🙂z', 1, 3);"), Value::from("Ж🙂"));
+	assert_eq!(value(&store, "RETURN meta::type(uuid());"), Value::from("uuid"));
+	assert_eq!(value(&store, "RETURN meta::type(ulid());"), Value::from("ulid"));
+	let random = value(&store, "RETURN rand::id(64);");
+	let Value::String(random) = random else {
+		return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+			"rand::id must return a string",
+		));
+	};
+	assert_eq!(random.len(), 64);
+	assert!(random.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()));
+	for source in ["RETURN rand::id(0);", "RETURN string::slice('x', 0, 2);"] {
+		let result = store.execute(source, &Object::new())?;
+		assert!(result[0].result.is_err(), "{source}");
+	}
+
+	let mut session = store.session();
+	let begun = session
+		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())?;
+	assert!(begun[0].result.is_ok());
+	assert!(session.execute("RETURN uuid();", &Object::new())?[0].result.is_err());
+	Ok(())
+}
+
+#[test]
+fn matcher_shares_state_and_reports_unicode_scalar_offsets()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let results = store.execute(
+		"LET $matcher = regex::matcher('Жа Алла Анна', 'А.+?а'); RETURN [$matcher.start, \
+		 $matcher.end]; RETURN regex::next($matcher); RETURN [$matcher.start, $matcher.end]; \
+		 RETURN regex::next($matcher); RETURN [$matcher.start, $matcher.end]; RETURN \
+		 regex::next($matcher); RETURN [$matcher.start, $matcher.end];",
+		&Object::new(),
+	)?;
+	let values = results
+		.iter()
+		.skip(1)
+		.map(|result| {
+			result.result.as_ref().map(|outcome| outcome.value().clone()).map_err(Clone::clone)
+		})
+		.collect::<crate::gql_status::FerrosGrynnResult<Vec<_>>>()?;
+	assert_eq!(values, vec![
+		Value::Array(vec![Value::None, Value::None].into()),
+		Value::Bool(true),
+		Value::Array(vec![3_i64, 7].into()),
+		Value::Bool(true),
+		Value::Array(vec![8_i64, 12].into()),
+		Value::Bool(false),
+		Value::Array(vec![8_i64, 12].into()),
+	],);
+	let mut session = store.session();
+	session
+		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())?;
+	assert!(
+		session.execute("RETURN regex::matcher('x', 'x');", &Object::new())?[0].result.is_err()
+	);
+	Ok(())
+}
+
+#[test]
+fn mutable_collection_helpers_require_and_update_lexical_bindings()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let mut session = store.session();
+	let declared_array = session.execute("LET $a = [1];", &Object::new()).map_err(|error| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+			"array binding declaration failed: {error}"
+		))
+	})?;
+	let declared_set = session.execute("LET $s = SET[1];", &Object::new()).map_err(|error| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+			"set binding declaration failed: {error}"
+		))
+	})?;
+	assert!(declared_array.iter().all(|result| result.result.is_ok()));
+	assert!(declared_set.iter().all(|result| result.result.is_ok()));
+
+	let results = session
+		.execute(
+			"RETURN array::push($a, 2); RETURN array::pop($a); RETURN array::push($a, 3); RETURN \
+			 $a; RETURN set::add($s, 2); RETURN set::add($s, 2); RETURN $s; RETURN \
+			 array::clear($a); RETURN $a; RETURN set::clear($s); RETURN $s;",
+			&Object::new(),
+		)
+		.map_err(|error| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+				"collection mutation program failed: {error}"
+			))
+		})?;
+	let values = results
+		.iter()
+		.map(|result| {
+			result.result.as_ref().map(|outcome| outcome.value().clone()).map_err(Clone::clone)
+		})
+		.collect::<crate::gql_status::FerrosGrynnResult<Vec<_>>>()?;
+	assert_eq!(values, vec![
+		Value::from(2_i64),
+		Value::from(2_i64),
+		Value::from(2_i64),
+		Value::Array(vec![1_i64, 3].into()),
+		Value::Bool(true),
+		Value::Bool(false),
+		Value::Set(vec![1_i64, 2].into()),
+		Value::None,
+		Value::Array(Vec::<Value>::new().into()),
+		Value::None,
+		Value::Set(Vec::<Value>::new().into()),
+	],);
+
+	let mut parameters = Object::new();
+	parameters.insert("a", Value::Array(vec![1_i64].into()));
+	let immutable_parameter = store.execute("RETURN array::push($a, 2);", &parameters);
+	assert!(immutable_parameter.is_err() || immutable_parameter.unwrap()[0].result.is_err());
+	let expression_target = store.execute("RETURN array::push([1], 2);", &Object::new());
+	assert!(expression_target.is_err() || expression_target.unwrap()[0].result.is_err());
+	let durable = store
+		.execute(
+			"DEFINE PARAM $durable VALUE [1]; RETURN array::push($durable, 2);",
+			&Object::new(),
+		)
+		.map_err(|error| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+				"durable mutable-binding probe did not parse: {error}"
+			))
+		})?;
+	assert!(durable[0].result.is_ok());
+	assert!(durable[1].result.is_err());
+
+	let function = store
+		.execute(
+			"DEFINE IMPURE FUNCTION fn::append_local(values: array) -> array { LET $_ = \
+			 array::push($values, 2); RETURN $values; }; RETURN fn::append_local([1]);",
+			&Object::new(),
+		)
+		.map_err(|error| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+				"mutable UDF probe did not parse: {error}"
+			))
+		})?;
+	assert!(function[0].result.is_ok());
+	assert_eq!(
+		function[1].result.as_ref().map_err(Clone::clone)?.value(),
+		&Value::Array(vec![1_i64, 2].into())
+	);
+	Ok(())
+}
+
+#[test]
+fn object_conversion_merges_collections_without_silent_overwrite()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	assert_eq!(
+		value(&store, "RETURN type::to<object>([{b: 2}, {a: 1}]);"),
+		Value::Object([("a", 1_i64), ("b", 2_i64)].into_iter().collect())
+	);
+	assert_eq!(value(&store, "RETURN <object>[];"), Value::Object(Object::new()));
+	assert_eq!(
+		value(&store, "RETURN <object>SET[{b: 2}, {a: 1}];"),
+		Value::Object([("a", 1_i64), ("b", 2_i64)].into_iter().collect())
+	);
+	for source in
+		["RETURN type::to<object>([{a: 1}, {a: 2}]);", "RETURN type::to<object>([{a: 1}, 2]);"]
+	{
+		let result = store.execute(source, &Object::new())?;
+		assert!(result[0].result.is_err(), "{source}");
+	}
+	Ok(())
+}
+
+#[test]
+fn sleep_is_cooperative_and_rejected_in_deterministic_mode()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let zero = store.execute("SLEEP 0ms;", &Object::new())?;
+	assert_eq!(zero[0].kind, crate::gql::QueryStatementKind::Sleep);
+	assert_eq!(zero[0].result.as_ref().map_err(Clone::clone)?.value(), &Value::None);
+
+	let mut bindings = Object::new();
+	let delay = "1ms".parse::<crate::values::Duration>().map_err(|error| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+	})?;
+	bindings.insert("delay", Value::from(delay));
+	let parameter = store.execute("SLEEP $delay;", &bindings)?;
+	assert!(parameter[0].result.is_ok());
+
+	let mut options = QueryExecutionOptions::default();
+	options.statement_timeout = Some(std::time::Duration::from_millis(5));
+	let timed_out = store.execute_with_options("SLEEP 100ms;", &Object::new(), options)?;
+	assert!(timed_out[0].result.is_err());
+
+	let mut session = store.session();
+	let begun = session
+		.execute("BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;", &Object::new())?;
+	assert!(begun[0].result.is_ok());
+	let deterministic = session.execute("SLEEP 0ms;", &Object::new())?;
+	assert!(deterministic[0].result.is_err());
+	Ok(())
+}
+
+#[test]
 fn enforces_numeric_coercion_and_power_contract() {
 	let store = Datastore::in_memory();
 	assert_eq!(value(&store, "RETURN 2 + 3.5;"), Value::from(5.5_f64));

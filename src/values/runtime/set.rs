@@ -39,6 +39,10 @@ impl Set {
 		self.0.remove(value)
 	}
 
+	pub fn clear(&mut self) {
+		self.0.clear();
+	}
+
 	pub fn into_inner(self) -> BTreeSet<Value> {
 		self.0
 	}

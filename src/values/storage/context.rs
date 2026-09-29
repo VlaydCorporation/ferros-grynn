@@ -129,6 +129,13 @@ impl EncodeContext {
 		self.classes.entries()
 	}
 
+	/// Iterates registered graph references in durable identity order.
+	pub(crate) fn graph_references(
+		&self,
+	) -> impl ExactSizeIterator<Item = (DiskGraphRef, &GraphRef)> {
+		self.graphs_from_disk.iter().map(|(disk, runtime)| (*disk, runtime))
+	}
+
 	/// Resolves one class identifier while constructing an order key.
 	pub(crate) fn class_name(&self, id: u32) -> Option<&Text> {
 		self.classes.resolve(id)

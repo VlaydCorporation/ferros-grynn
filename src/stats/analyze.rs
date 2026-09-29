@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, num::NonZeroU32, path::Path};
+
+use rapidhash::v3::rapidhash_v3;
 
 use super::{
 	BaseStatistics,
@@ -54,6 +56,58 @@ struct PropertyAccumulator {
 	null_count: u64,
 	value_count: usize,
 	valid: bool,
+	sampled_rows: u32,
+	sampled_nulls: u32,
+	hll: Option<HyperLogLog>,
+}
+
+/// Histogram construction policy selected by public `ANALYZE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnalyzeMethod {
+	Full,
+	Approximate {
+		sample_count: NonZeroU32,
+	},
+}
+
+const HLL_PRECISION: u32 = 12;
+const HLL_REGISTER_COUNT: usize = 1 << HLL_PRECISION;
+
+struct HyperLogLog {
+	registers: Box<[u8]>,
+}
+
+impl HyperLogLog {
+	fn new() -> Self {
+		Self {
+			registers: vec![0; HLL_REGISTER_COUNT].into_boxed_slice(),
+		}
+	}
+
+	fn insert(&mut self, value: &[u8]) {
+		let hash = rapidhash_v3(value);
+		let index = usize::try_from(hash >> (64 - HLL_PRECISION)).unwrap_or(0);
+		let rank =
+			(hash << HLL_PRECISION).leading_zeros().saturating_add(1).min(65 - HLL_PRECISION);
+		if let Some(register) = self.registers.get_mut(index) {
+			*register = (*register).max(u8::try_from(rank).unwrap_or(u8::MAX));
+		}
+	}
+
+	fn estimate(&self) -> u64 {
+		let count = self.registers.len() as f64;
+		let reciprocal_sum =
+			self.registers.iter().map(|rank| 2.0_f64.powi(-i32::from(*rank))).sum::<f64>();
+		let alpha = 0.7213 / (1.0 + 1.079 / count);
+		let raw = alpha * count * count / reciprocal_sum;
+		let empty = self.registers.iter().filter(|rank| **rank == 0).count();
+		let corrected = if raw <= 2.5 * count && empty != 0 {
+			count * (count / empty as f64).ln()
+		} else {
+			raw
+		};
+		corrected.round().clamp(0.0, u64::MAX as f64) as u64
+	}
 }
 
 /// Performs one exact full scan shared by RAM and durable rebuilds.
@@ -68,17 +122,51 @@ pub(crate) fn analyze_database_at(
 	database: &DatabaseRoot,
 	scratch_root: &Path,
 ) -> FerrosGrynnResult<StatisticsStore> {
+	analyze_database_with_method_at(database, scratch_root, AnalyzeMethod::Full)
+}
+
+/// Performs a full statistics scan while selecting exact or sampled property
+/// distributions.
+pub(crate) fn analyze_database_with_method_at(
+	database: &DatabaseRoot,
+	scratch_root: &Path,
+	method: AnalyzeMethod,
+) -> FerrosGrynnResult<StatisticsStore> {
 	let fields = statistic_fields(database)?;
 	let mut context = index_context(&database.schema, &database.dictionary)?;
 	let mut result = StatisticsStore::default();
-	*result.base_mut() = analyze_base(database, &fields, &mut context, scratch_root)?;
+	*result.base_mut() = analyze_base(database, &fields, &mut context, scratch_root, method)?;
 	for graph in database.graphs.keys().copied() {
 		result.replace_graph(
 			graph,
-			analyze_graph(database, graph, &fields, &mut context, scratch_root)?,
+			analyze_graph(database, graph, &fields, &mut context, scratch_root, method)?,
 		);
 	}
 	Ok(result)
+}
+
+/// Rebuilds the complete Base statistics scope while preserving graph-local
+/// scopes in the caller-owned store.
+pub(crate) fn analyze_base_with_method_at(
+	database: &DatabaseRoot,
+	scratch_root: &Path,
+	method: AnalyzeMethod,
+) -> FerrosGrynnResult<BaseStatistics> {
+	let fields = statistic_fields(database)?;
+	let mut context = index_context(&database.schema, &database.dictionary)?;
+	analyze_base(database, &fields, &mut context, scratch_root, method)
+}
+
+/// Rebuilds one complete graph-effective statistics scope.
+pub(crate) fn analyze_graph_with_method_at(
+	database: &DatabaseRoot,
+	graph: GraphId,
+	scratch_root: &Path,
+	method: AnalyzeMethod,
+) -> FerrosGrynnResult<GraphStatistics> {
+	let fields = statistic_fields(database)?;
+	let mut context = index_context(&database.schema, &database.dictionary)?;
+	analyze_graph(database, graph, &fields, &mut context, scratch_root, method)
 }
 
 fn analyze_base(
@@ -86,6 +174,7 @@ fn analyze_base(
 	fields: &[StatisticField<'_>],
 	context: &mut EncodeContext,
 	scratch_root: &Path,
+	method: AnalyzeMethod,
 ) -> FerrosGrynnResult<BaseStatistics> {
 	let mut statistics = BaseStatistics {
 		revision: database.commit_ts,
@@ -97,7 +186,7 @@ fn analyze_base(
 			.classes
 			.insert(class.id().ok_or_else(|| invalid("published class has no ClassId"))?, 0);
 	}
-	let mut properties = property_accumulators(fields, StatisticsScope::Base)?;
+	let mut properties = property_accumulators(fields, StatisticsScope::Base, method)?;
 	let mut sorter = ExternalIndexSorter::new(scratch_root);
 	let mut sequence = 0_u64;
 	for atom in database.atoms.atoms() {
@@ -109,9 +198,11 @@ fn analyze_base(
 			context,
 			&mut sorter,
 			&mut sequence,
+			method,
 		)?;
 	}
-	statistics.property_histograms = finish_properties(properties, sorter.finish()?)?;
+	statistics.property_histograms =
+		finish_properties(properties, sorter.finish()?, scratch_root, method)?;
 	Ok(statistics)
 }
 
@@ -121,6 +212,7 @@ fn analyze_graph(
 	fields: &[StatisticField<'_>],
 	context: &mut EncodeContext,
 	scratch_root: &Path,
+	method: AnalyzeMethod,
 ) -> FerrosGrynnResult<GraphStatistics> {
 	let graph = database
 		.graph(graph_id)
@@ -130,9 +222,13 @@ fn analyze_graph(
 		analyzed_revision: database.commit_ts,
 		..GraphStatistics::default()
 	};
-	let mut properties = property_accumulators(fields, StatisticsScope::Effective {
-		graph: graph_id,
-	})?;
+	let mut properties = property_accumulators(
+		fields,
+		StatisticsScope::Effective {
+			graph: graph_id,
+		},
+		method,
+	)?;
 	let mut sorter = ExternalIndexSorter::new(scratch_root);
 	let mut sequence = 0_u64;
 	let mut degrees = BTreeMap::<AtomId, DegreeCounts>::new();
@@ -176,6 +272,7 @@ fn analyze_graph(
 			context,
 			&mut sorter,
 			&mut sequence,
+			method,
 		)?;
 	}
 	for occurrence in graph.occurrences() {
@@ -188,7 +285,8 @@ fn analyze_graph(
 		}
 	}
 	finish_degrees(&mut statistics, &degrees, graph)?;
-	statistics.property_histograms = finish_properties(properties, sorter.finish()?)?;
+	statistics.property_histograms =
+		finish_properties(properties, sorter.finish()?, scratch_root, method)?;
 	Ok(statistics)
 }
 
@@ -216,6 +314,7 @@ fn statistic_fields(database: &DatabaseRoot) -> FerrosGrynnResult<Vec<StatisticF
 fn property_accumulators(
 	fields: &[StatisticField<'_>],
 	scope: StatisticsScope,
+	method: AnalyzeMethod,
 ) -> FerrosGrynnResult<BTreeMap<PropertyHistogramKey, PropertyAccumulator>> {
 	fields
 		.iter()
@@ -240,6 +339,9 @@ fn property_accumulators(
 					null_count: 0,
 					value_count: 0,
 					valid: true,
+					sampled_rows: 0,
+					sampled_nulls: 0,
+					hll: matches!(method, AnalyzeMethod::Approximate { .. }).then(HyperLogLog::new),
 				},
 			))
 		})
@@ -253,6 +355,7 @@ fn record_properties<'value>(
 	context: &mut EncodeContext,
 	sorter: &mut ExternalIndexSorter,
 	sequence: &mut u64,
+	method: AnalyzeMethod,
 ) -> FerrosGrynnResult<()> {
 	for (_key, accumulator) in properties.iter_mut().filter(|(key, _)| key.class_id == class) {
 		accumulator.row_count = accumulator
@@ -262,40 +365,77 @@ fn record_properties<'value>(
 		if !accumulator.valid {
 			continue;
 		}
-		let Some(value) = value(accumulator.property_key) else {
-			increment(&mut accumulator.null_count, 1, "histogram null count")?;
-			continue;
+		let encoded = match value(accumulator.property_key) {
+			None | Some(Value::None | Value::Null) => {
+				increment(&mut accumulator.null_count, 1, "histogram null count")?;
+				None
+			}
+			Some(value) => match encode_index_key(&[(value, &accumulator.value_type)], context) {
+				Ok(encoded) => Some(encoded),
+				Err(_error) => {
+					accumulator.valid = false;
+					continue;
+				}
+			},
 		};
-		if matches!(value, Value::None | Value::Null) {
-			increment(&mut accumulator.null_count, 1, "histogram null count")?;
-			continue;
-		}
-		match encode_index_key(&[(value, &accumulator.value_type)], context) {
-			Ok(encoded) => {
-				let mut key = Vec::with_capacity(4_usize.saturating_add(encoded.len()));
+		match method {
+			AnalyzeMethod::Full => {
+				if let Some(encoded) = encoded {
+					let mut key = Vec::with_capacity(4_usize.saturating_add(encoded.len()));
+					key.extend_from_slice(&accumulator.ordinal.to_be_bytes());
+					key.extend_from_slice(&encoded);
+					sorter.push_raw(key, *sequence)?;
+					accumulator.value_count = accumulator
+						.value_count
+						.checked_add(1)
+						.ok_or_else(|| invalid("property histogram value count overflows usize"))?;
+				}
+			}
+			AnalyzeMethod::Approximate {
+				..
+			} => {
+				if let (Some(hll), Some(encoded)) = (accumulator.hll.as_mut(), encoded.as_deref()) {
+					hll.insert(encoded);
+				}
+				let mut priority_input = Vec::with_capacity(
+					13_usize.saturating_add(encoded.as_ref().map_or(0, Vec::len)),
+				);
+				priority_input.extend_from_slice(&accumulator.ordinal.to_be_bytes());
+				priority_input.extend_from_slice(&sequence.to_be_bytes());
+				priority_input.push(u8::from(encoded.is_some()));
+				if let Some(encoded) = &encoded {
+					priority_input.extend_from_slice(encoded);
+				}
+				let priority = rapidhash_v3(&priority_input);
+				let mut key = Vec::with_capacity(priority_input.len());
 				key.extend_from_slice(&accumulator.ordinal.to_be_bytes());
-				key.extend_from_slice(&encoded);
+				key.extend_from_slice(&priority.to_be_bytes());
+				key.push(u8::from(encoded.is_some()));
+				if let Some(encoded) = encoded {
+					key.extend_from_slice(&encoded);
+				}
 				sorter.push_raw(key, *sequence)?;
-				*sequence = sequence
-					.checked_add(1)
-					.ok_or_else(|| invalid("property histogram sequence overflows u64"))?;
-				accumulator.value_count = accumulator
-					.value_count
-					.checked_add(1)
-					.ok_or_else(|| invalid("property histogram value count overflows usize"))?;
-			}
-			Err(_error) => {
-				accumulator.valid = false;
 			}
 		}
+		*sequence = sequence
+			.checked_add(1)
+			.ok_or_else(|| invalid("property histogram sequence overflows u64"))?;
 	}
 	Ok(())
 }
 
 fn finish_properties(
-	properties: BTreeMap<PropertyHistogramKey, PropertyAccumulator>,
+	mut properties: BTreeMap<PropertyHistogramKey, PropertyAccumulator>,
 	records: SortedIndexRecords,
+	scratch_root: &Path,
+	method: AnalyzeMethod,
 ) -> FerrosGrynnResult<BTreeMap<PropertyHistogramKey, PropertyHistogram>> {
+	let records = match method {
+		AnalyzeMethod::Full => records,
+		AnalyzeMethod::Approximate {
+			sample_count,
+		} => select_property_sample(&mut properties, &records, scratch_root, sample_count)?,
+	};
 	let inputs = properties
 		.values()
 		.map(|accumulator| HistogramInput {
@@ -306,30 +446,108 @@ fn finish_properties(
 	let mut finished = finish_histograms(&records, &inputs)?;
 	let mut result = BTreeMap::new();
 	for (key, accumulator) in properties {
-		let Ok(sample_count) = u32::try_from(accumulator.row_count) else {
-			continue;
-		};
 		if !accumulator.valid {
 			continue;
 		}
 		let histogram = finished
 			.remove(&accumulator.ordinal)
 			.ok_or_else(|| invalid("property histogram sort result is absent"))?;
-		let null_fraction = if accumulator.row_count == 0 {
-			0.0
-		} else {
-			accumulator.null_count as f32 / accumulator.row_count as f32
+		let (method, sample_count, distinct_count, null_fraction) = match method {
+			AnalyzeMethod::Full => {
+				let Ok(sample_count) = u32::try_from(accumulator.row_count) else {
+					continue;
+				};
+				let null_fraction = fraction(accumulator.null_count, accumulator.row_count);
+				(HistogramMethod::Exact, sample_count, histogram.distinct_count, null_fraction)
+			}
+			AnalyzeMethod::Approximate {
+				..
+			} => {
+				let distinct_count = accumulator.hll.as_ref().map_or(0, HyperLogLog::estimate);
+				let null_fraction = fraction(
+					u64::from(accumulator.sampled_nulls),
+					u64::from(accumulator.sampled_rows),
+				);
+				(
+					HistogramMethod::Approximate,
+					accumulator.sampled_rows,
+					distinct_count,
+					null_fraction,
+				)
+			}
 		};
 		result.insert(key, PropertyHistogram {
 			type_tag: accumulator.type_tag,
-			method: HistogramMethod::Exact,
+			method,
 			sample_count,
-			distinct_count: histogram.distinct_count,
+			distinct_count,
 			null_fraction,
 			buckets: histogram.buckets,
 		});
 	}
 	Ok(result)
+}
+
+fn select_property_sample(
+	properties: &mut BTreeMap<PropertyHistogramKey, PropertyAccumulator>,
+	records: &SortedIndexRecords,
+	scratch_root: &Path,
+	sample_count: NonZeroU32,
+) -> FerrosGrynnResult<SortedIndexRecords> {
+	let mut by_ordinal = properties
+		.values_mut()
+		.map(|accumulator| (accumulator.ordinal, accumulator))
+		.collect::<BTreeMap<_, _>>();
+	let mut sampled = ExternalIndexSorter::new(scratch_root);
+	records.visit_raw(|key, sequence| {
+		if key.len() < 13 {
+			return Err(invalid("sample selection key is truncated"));
+		}
+		let ordinal = u32::from_be_bytes(
+			key[..4]
+				.try_into()
+				.map_err(|_error| invalid("sample ordinal has an invalid length"))?,
+		);
+		let accumulator = by_ordinal
+			.get_mut(&ordinal)
+			.ok_or_else(|| invalid("sample refers to an unknown histogram ordinal"))?;
+		if accumulator.sampled_rows >= sample_count.get() {
+			return Ok(());
+		}
+		accumulator.sampled_rows = accumulator
+			.sampled_rows
+			.checked_add(1)
+			.ok_or_else(|| invalid("sample row count overflows u32"))?;
+		match key[12] {
+			0 if key.len() == 13 => {
+				accumulator.sampled_nulls = accumulator
+					.sampled_nulls
+					.checked_add(1)
+					.ok_or_else(|| invalid("sample null count overflows u32"))?;
+			}
+			1 if key.len() > 13 => {
+				let mut histogram_key = Vec::with_capacity(key.len() - 9);
+				histogram_key.extend_from_slice(&ordinal.to_be_bytes());
+				histogram_key.extend_from_slice(&key[13..]);
+				sampled.push_raw(histogram_key, sequence)?;
+				accumulator.value_count = accumulator
+					.value_count
+					.checked_add(1)
+					.ok_or_else(|| invalid("sample value count overflows usize"))?;
+			}
+			_ => return Err(invalid("sample selection marker is not canonical")),
+		}
+		Ok(())
+	})?;
+	sampled.finish()
+}
+
+fn fraction(numerator: u64, denominator: u64) -> f32 {
+	if denominator == 0 {
+		0.0
+	} else {
+		numerator as f32 / denominator as f32
+	}
 }
 
 fn effective_property_count(

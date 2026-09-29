@@ -52,8 +52,10 @@ pub use crate::{
 		CreateStatement,
 		DefineClassStatement,
 		DefineFieldStatement,
+		DefineFunctionStatement,
 		DefineGraphStatement,
 		DefineIndexStatement,
+		DefineParameterStatement,
 		DefinitionMode,
 		DeleteStatement,
 		DetachStatement,
@@ -100,6 +102,7 @@ pub use crate::{
 		MatchStep,
 		MutateStatement,
 		ObjectField,
+		ParameterCommentChange,
 		ParserSettings,
 		Program,
 		RecordKey,
@@ -156,6 +159,7 @@ pub enum QueryStatementKind {
 	While,
 	Try,
 	Throw,
+	Sleep,
 	Assert,
 	BuildGraph,
 	Create,
@@ -169,6 +173,8 @@ pub enum QueryStatementKind {
 	Remove,
 	Alter,
 	Info,
+	Maintenance,
+	Kill,
 	Let,
 	Match,
 	Return,
@@ -261,6 +267,7 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		StatementKind::While(_) => QueryStatementKind::While,
 		StatementKind::Try(_) => QueryStatementKind::Try,
 		StatementKind::Throw(_) => QueryStatementKind::Throw,
+		StatementKind::Sleep(_) => QueryStatementKind::Sleep,
 		StatementKind::AssertInvariants(_) => QueryStatementKind::Assert,
 		StatementKind::BuildGraph(_) => QueryStatementKind::BuildGraph,
 		StatementKind::Attach(_) => QueryStatementKind::Attach,
@@ -273,10 +280,14 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		StatementKind::DefineGraph(_)
 		| StatementKind::DefineClass(_)
 		| StatementKind::DefineField(_)
-		| StatementKind::DefineIndex(_) => QueryStatementKind::Define,
+		| StatementKind::DefineIndex(_)
+		| StatementKind::DefineFunction(_)
+		| StatementKind::DefineParameter(_) => QueryStatementKind::Define,
 		StatementKind::Remove(_) => QueryStatementKind::Remove,
 		StatementKind::Alter(_) => QueryStatementKind::Alter,
 		StatementKind::Info(_) => QueryStatementKind::Info,
+		StatementKind::Maintenance(_) => QueryStatementKind::Maintenance,
+		StatementKind::Kill(_) => QueryStatementKind::Kill,
 		StatementKind::Import(_) => QueryStatementKind::Import,
 		StatementKind::Let(_) => QueryStatementKind::Let,
 		StatementKind::Match(_) => QueryStatementKind::Match,
@@ -307,8 +318,12 @@ pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
 			| StatementKind::DefineClass(_)
 			| StatementKind::DefineField(_)
 			| StatementKind::DefineIndex(_)
+			| StatementKind::DefineFunction(_)
+			| StatementKind::DefineParameter(_)
 			| StatementKind::Remove(_)
 			| StatementKind::Alter(_)
+			| StatementKind::Maintenance(_)
+			| StatementKind::Kill(_)
 			| StatementKind::Import(_)
 			| StatementKind::BuildGraph(crate::syn::BuildGraphStatement {
 				name: Some(_),

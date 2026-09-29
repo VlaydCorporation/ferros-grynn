@@ -2,6 +2,9 @@
 
 use std::{
 	collections::BTreeMap,
+	fmt::{self, Display, Formatter},
+	num::{NonZeroU8, NonZeroUsize},
+	path::PathBuf,
 	sync::{Arc, atomic::Ordering},
 	time::{Duration, Instant},
 };
@@ -25,6 +28,13 @@ use crate::{
 		StatusCode,
 	},
 	graph::GraphId,
+	storage::{
+		QuarantineArchiveReader,
+		QuarantineArtifact,
+		QuarantineWriter,
+		with_external_sort_options,
+	},
+	values::{Uuid, Value},
 };
 
 /// Index-maintenance policy used by one atomic import.
@@ -58,6 +68,112 @@ pub enum ImportViolationPolicy {
 	Abort,
 	/// Roll back only the failing item and continue within an explicit limit.
 	Skip,
+	/// Roll back the item and durably retain its caller-supplied payload.
+	Quarantine,
+}
+
+/// Stable public identity of one immutable rejected-item set.
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[repr(transparent)]
+pub struct QuarantineId(Uuid);
+
+impl QuarantineId {
+	pub(crate) const fn from_uuid(value: Uuid) -> Self {
+		Self(value)
+	}
+
+	/// Returns the UUIDv7 identity used by the public value surface.
+	pub const fn as_uuid(self) -> Uuid {
+		self.0
+	}
+}
+
+impl Display for QuarantineId {
+	fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+		Display::fmt(&self.0, formatter)
+	}
+}
+
+/// One streamed rejected import item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedItem {
+	item: u64,
+	payload: Value,
+	code: StatusCode,
+	diagnostic: String,
+}
+
+impl QuarantinedItem {
+	/// Returns the one-based import item ordinal.
+	pub const fn item(&self) -> u64 {
+		self.item
+	}
+
+	/// Returns the exact caller-supplied storable payload.
+	pub const fn payload(&self) -> &Value {
+		&self.payload
+	}
+
+	/// Returns the classified violation status.
+	pub const fn code(&self) -> StatusCode {
+		self.code
+	}
+
+	/// Returns the bounded safe diagnostic retained with the payload.
+	pub fn diagnostic(&self) -> &str {
+		&self.diagnostic
+	}
+}
+
+/// Streaming reader over one validated immutable quarantine file.
+pub struct QuarantineReader {
+	inner: QuarantineArchiveReader,
+	finished: bool,
+}
+
+impl QuarantineReader {
+	pub(crate) const fn new(inner: QuarantineArchiveReader) -> Self {
+		Self {
+			inner,
+			finished: false,
+		}
+	}
+
+	/// Reads the next rejected item without retaining earlier payloads.
+	///
+	/// # Errors
+	///
+	/// Returns corruption, decode, or I/O errors and permanently exhausts this
+	/// reader after the first failure.
+	pub fn read_next(&mut self) -> FerrosGrynnResult<Option<QuarantinedItem>> {
+		if self.finished {
+			return Ok(None);
+		}
+		match self.inner.next_record() {
+			Ok(Some(record)) => Ok(Some(QuarantinedItem {
+				item: record.ordinal,
+				payload: record.payload,
+				code: record.code,
+				diagnostic: record.diagnostic,
+			})),
+			Ok(None) => {
+				self.finished = true;
+				Ok(None)
+			}
+			Err(error) => {
+				self.finished = true;
+				Err(error)
+			}
+		}
+	}
+}
+
+impl Iterator for QuarantineReader {
+	type Item = FerrosGrynnResult<QuarantinedItem>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		self.read_next().transpose()
+	}
 }
 
 /// Validated public settings for one atomic import.
@@ -70,13 +186,19 @@ pub struct ImportOptions {
 	pub constraints: ImportConstraintMode,
 	/// Item-level violation policy.
 	pub on_violation: ImportViolationPolicy,
-	/// Required positive limit when [`ImportViolationPolicy::Skip`] is
-	/// selected.
+	/// Required positive limit when [`ImportViolationPolicy::Skip`] or
+	/// [`ImportViolationPolicy::Quarantine`] is selected.
 	pub reject_limit: Option<usize>,
 	/// Positive count of applied items retained in one private segment.
 	pub segment_size: usize,
 	/// Whether final validation must include all affected pre-existing data.
 	pub full_validation: bool,
+	/// Optional aggregate memory budget for all import sort runs.
+	pub sort_memory_bytes: Option<NonZeroUsize>,
+	/// Optional upper bound for scoped import build workers.
+	pub parallelism: Option<NonZeroUsize>,
+	/// Optional B+tree fill factor, enabled only after its performance gate.
+	pub fill_factor: Option<NonZeroU8>,
 }
 
 impl Default for ImportOptions {
@@ -88,6 +210,9 @@ impl Default for ImportOptions {
 			reject_limit: None,
 			segment_size: DEFAULT_IMPORT_SEGMENT_ITEMS,
 			full_validation: false,
+			sort_memory_bytes: None,
+			parallelism: None,
+			fill_factor: None,
 		}
 	}
 }
@@ -106,19 +231,39 @@ impl ImportOptions {
 				"import segment_size must be greater than zero",
 			));
 		}
+		if self.fill_factor.is_some() {
+			return Err(FerrosGrynnError::query_feature_not_supported(
+				"IMPORT FILL_FACTOR pending its measured gate",
+			));
+		}
 		match (self.on_violation, self.reject_limit) {
-			(ImportViolationPolicy::Abort, None) | (ImportViolationPolicy::Skip, Some(1..)) => {
-				Ok(self)
-			}
+			(ImportViolationPolicy::Abort, None)
+			| (ImportViolationPolicy::Skip | ImportViolationPolicy::Quarantine, Some(1..)) => Ok(self),
 			(ImportViolationPolicy::Abort, Some(_)) => Err(FerrosGrynnError::invalid_argument(
-				"import reject_limit is valid only with the Skip violation policy",
+				"import reject_limit is valid only with Skip or Quarantine",
 			)),
-			(ImportViolationPolicy::Skip, None | Some(0)) => {
+			(ImportViolationPolicy::Skip | ImportViolationPolicy::Quarantine, None | Some(0)) => {
 				Err(FerrosGrynnError::invalid_argument(
-					"the Skip violation policy requires a positive reject_limit",
+					"Skip and Quarantine require a positive reject_limit",
 				))
 			}
 		}
+	}
+
+	fn validate_resources(self, configured: super::MaintenanceOptions) -> FerrosGrynnResult<Self> {
+		if self.sort_memory_bytes.is_some_and(|value| value > configured.max_memory_bytes) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"import sort_memory_bytes exceeds the datastore maintenance limit",
+			));
+		}
+		let available = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+		let maximum = configured.max_parallelism.min(available);
+		if self.parallelism.is_some_and(|value| value > maximum) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"import parallelism exceeds the configured or available limit",
+			));
+		}
+		Ok(self)
 	}
 }
 
@@ -187,6 +332,8 @@ pub struct ImportReport {
 	constraints: ImportConstraintMode,
 	/// Whether finalization rechecked all affected existing data.
 	full_validation: bool,
+	/// Published rejected-set identity, when at least one item was quarantined.
+	quarantine: Option<QuarantineId>,
 }
 
 impl ImportReport {
@@ -249,6 +396,11 @@ impl ImportReport {
 	pub const fn full_validation(&self) -> bool {
 		self.full_validation
 	}
+
+	/// Returns the immutable rejected-set identity, if one was published.
+	pub const fn quarantine(&self) -> Option<QuarantineId> {
+		self.quarantine
+	}
 }
 
 /// Transaction-backed callback surface for one atomic import.
@@ -277,11 +429,20 @@ pub struct ImportSession {
 	changed: bool,
 	/// First fatal failure, retained so callers cannot swallow it and publish.
 	failure: Option<FerrosGrynnError>,
+	/// Backend-local scratch root for a lazily created quarantine writer.
+	quarantine_root: PathBuf,
+	/// Streaming rejected-set writer, created only after the first violation.
+	quarantine: Option<QuarantineWriter>,
 }
 
 impl ImportSession {
 	/// Creates the callback surface around one private transaction.
-	fn new(transaction: Transaction, options: ImportOptions, commit_ts: u64) -> Self {
+	fn new(
+		transaction: Transaction,
+		options: ImportOptions,
+		commit_ts: u64,
+		quarantine_root: PathBuf,
+	) -> Self {
 		Self {
 			transaction: Some(transaction),
 			options,
@@ -295,6 +456,8 @@ impl ImportSession {
 			details: Vec::new(),
 			changed: false,
 			failure: None,
+			quarantine_root,
+			quarantine: None,
 		}
 	}
 
@@ -309,14 +472,74 @@ impl ImportSession {
 	where
 		Apply: FnOnce(&mut Transaction) -> FerrosGrynnResult<T>,
 	{
+		if self.options.on_violation == ImportViolationPolicy::Quarantine {
+			return Err(FerrosGrynnError::invalid_argument(
+				"Quarantine requires apply_item_with_payload before mutation",
+			));
+		}
+		self.apply_item_inner(None, apply)
+	}
+
+	/// Applies one logical item while retaining its storable source payload if
+	/// the item is quarantined.
+	///
+	/// # Errors
+	///
+	/// Returns a value-conversion error before mutation, or the same item and
+	/// fatal failures as [`Self::apply_item`].
+	pub fn apply_item_with_payload<T, Apply>(
+		&mut self,
+		payload: Value,
+		apply: Apply,
+	) -> FerrosGrynnResult<ImportItemOutcome>
+	where
+		Apply: FnOnce(&mut Transaction) -> FerrosGrynnResult<T>,
+	{
+		if self.options.on_violation == ImportViolationPolicy::Quarantine {
+			payload.ensure_storable()?;
+			self.apply_item_inner(Some(payload), apply)
+		} else {
+			self.apply_item_inner(None, apply)
+		}
+	}
+
+	pub(crate) fn apply_gql_item<T, Apply>(
+		&mut self,
+		payload: Value,
+		apply: Apply,
+	) -> FerrosGrynnResult<ImportItemOutcome>
+	where
+		Apply: FnOnce(&mut Transaction) -> FerrosGrynnResult<T>,
+	{
+		self.apply_item_inner(Some(payload), apply)
+	}
+
+	pub(crate) fn next_item_ordinal(&self) -> FerrosGrynnResult<u64> {
+		self.processed
+			.checked_add(1)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("import item ordinal"))
+	}
+
+	fn apply_item_inner<T, Apply>(
+		&mut self,
+		payload: Option<Value>,
+		apply: Apply,
+	) -> FerrosGrynnResult<ImportItemOutcome>
+	where
+		Apply: FnOnce(&mut Transaction) -> FerrosGrynnResult<T>,
+	{
 		if let Some(error) = &self.failure {
 			return Err(error.clone());
 		}
 		increment(&mut self.processed, "import processed item count")?;
-		let transaction = self.transaction.as_mut().ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("the import session is already finished")
-		})?;
-		match transaction.atomic_import_item(apply) {
+		let outcome = self
+			.transaction
+			.as_mut()
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("the import session is already finished")
+			})?
+			.atomic_import_item(apply);
+		match outcome {
 			Ok(changed) => {
 				increment(&mut self.applied, "import applied item count")?;
 				self.applied_in_segment =
@@ -325,15 +548,24 @@ impl ImportSession {
 					})?;
 				self.changed |= changed;
 				if self.applied_in_segment == self.options.segment_size {
-					transaction.seal_import_segment(self.commit_ts);
+					self.transaction
+						.as_mut()
+						.ok_or_else(|| {
+							FerrosGrynnError::invalid_argument(
+								"the import session is already finished",
+							)
+						})?
+						.seal_import_segment(self.commit_ts);
 					increment(&mut self.segments, "import segment count")?;
 					self.applied_in_segment = 0;
 				}
 				Ok(ImportItemOutcome::Applied)
 			}
 			Err(error)
-				if self.options.on_violation == ImportViolationPolicy::Skip
-					&& is_item_violation(&error) =>
+				if matches!(
+					self.options.on_violation,
+					ImportViolationPolicy::Skip | ImportViolationPolicy::Quarantine
+				) && is_item_violation(&error) =>
 			{
 				increment(&mut self.skipped, "import skipped item count")?;
 				let violation = ImportViolation {
@@ -341,13 +573,6 @@ impl ImportSession {
 					code: error.status().code(),
 					description: error.status().description(),
 				};
-				increment(
-					self.violations.entry(violation.code).or_insert(0),
-					"import violation count",
-				)?;
-				if self.details.len() < IMPORT_MAX_REPORTED_VIOLATIONS {
-					self.details.push(violation.clone());
-				}
 				let limit = self.options.reject_limit.unwrap_or(0);
 				if usize::try_from(self.skipped).unwrap_or(usize::MAX) > limit {
 					let error = FerrosGrynnError::import_reject_limit_exceeded(
@@ -355,6 +580,47 @@ impl ImportSession {
 					);
 					self.failure = Some(error.clone());
 					return Err(error);
+				}
+				if self.options.on_violation == ImportViolationPolicy::Quarantine {
+					let payload = payload.ok_or_else(|| {
+						FerrosGrynnError::invalid_argument(
+							"Quarantine requires a payload for every import item",
+						)
+					})?;
+					if self.quarantine.is_none() {
+						self.quarantine =
+							Some(QuarantineWriter::create(&self.quarantine_root, Uuid::now_v7())?);
+					}
+					let schema = self
+						.transaction
+						.as_ref()
+						.ok_or_else(|| {
+							FerrosGrynnError::invalid_argument(
+								"the import session is already finished",
+							)
+						})?
+						.import_schema();
+					self.quarantine
+						.as_mut()
+						.ok_or_else(|| {
+							FerrosGrynnError::invalid_argument(
+								"the quarantine writer is unavailable",
+							)
+						})?
+						.write_record(
+							self.processed,
+							payload,
+							violation.code,
+							&bounded_diagnostic(&violation.description),
+							schema,
+						)?;
+				}
+				increment(
+					self.violations.entry(violation.code).or_insert(0),
+					"import violation count",
+				)?;
+				if self.details.len() < IMPORT_MAX_REPORTED_VIOLATIONS {
+					self.details.push(violation.clone());
 				}
 				Ok(ImportItemOutcome::Skipped(violation))
 			}
@@ -372,7 +638,9 @@ impl ImportSession {
 	///
 	/// Returns the retained fatal item failure, an already-finished error, or a
 	/// counter-overflow status.
-	fn finish(mut self) -> FerrosGrynnResult<(Transaction, ImportReport, bool)> {
+	fn finish(
+		mut self,
+	) -> FerrosGrynnResult<(Transaction, ImportReport, bool, Option<QuarantineArtifact>)> {
 		if let Some(error) = self.failure.take() {
 			return Err(error);
 		}
@@ -383,6 +651,9 @@ impl ImportSession {
 			transaction.seal_import_segment(self.commit_ts);
 			increment(&mut self.segments, "import segment count")?;
 		}
+		let quarantine = self.quarantine.take().map(QuarantineWriter::finish).transpose()?;
+		let quarantine_id =
+			quarantine.as_ref().map(|artifact| QuarantineId::from_uuid(artifact.id()));
 		let report = ImportReport {
 			processed_items: self.processed,
 			applied_items: self.applied,
@@ -396,8 +667,9 @@ impl ImportSession {
 			indexes: self.options.indexes,
 			constraints: self.options.constraints,
 			full_validation: self.options.full_validation,
+			quarantine: quarantine_id,
 		};
-		Ok((transaction, report, self.changed))
+		Ok((transaction, report, self.changed, quarantine))
 	}
 }
 
@@ -431,7 +703,16 @@ impl Datastore {
 	where
 		Run: FnOnce(&mut ImportSession) -> FerrosGrynnResult<()>,
 	{
-		let options = options.validate()?;
+		let configured = match self.inner.options {
+			super::DatastoreOptions::InMemory(options) => options.maintenance,
+			super::DatastoreOptions::Local(options) => options.maintenance,
+		};
+		let options = options.validate()?.validate_resources(configured)?;
+		let sort_memory = options.sort_memory_bytes.unwrap_or(configured.max_memory_bytes);
+		// The configured value is an upper bound. Parallel run generation
+		// remains opt-in until the Stage-20 paired performance gate
+		// proves its default.
+		let parallelism = options.parallelism.unwrap_or(NonZeroUsize::MIN);
 		let started = Instant::now();
 		let owner = self.inner.next_transaction.fetch_add(1, Ordering::Relaxed);
 		let (lease, transaction, commit_ts) = {
@@ -464,19 +745,22 @@ impl Datastore {
 		};
 
 		let callback_started = Instant::now();
-		let mut session = ImportSession::new(transaction, options, commit_ts);
+		let mut session =
+			ImportSession::new(transaction, options, commit_ts, self.inner.import_scratch_root());
 		run(&mut session)?;
 		let callback_elapsed = callback_started.elapsed();
-		let (transaction, mut report, changed) = session.finish()?;
+		let (transaction, mut report, changed, mut quarantine) = session.finish()?;
 
 		let validation_started = Instant::now();
 		let (mut root, base_commit_ts, built_indexes) =
-			transaction.finish_import(commit_ts, options.indexes, options.full_validation)?;
+			with_external_sort_options(sort_memory, parallelism, || {
+				transaction.finish_import(commit_ts, options.indexes, options.full_validation)
+			})?;
 		report.phase_timings.insert("validation".to_owned(), validation_started.elapsed());
 		report.built_indexes = built_indexes;
 
 		let publication_started = Instant::now();
-		if changed {
+		if changed || quarantine.is_some() {
 			let _commit = self.inner.commit.lock();
 			self.inner.ensure_import_owner(owner)?;
 			let current = self.inner.current_root();
@@ -487,7 +771,9 @@ impl Datastore {
 				));
 			}
 			root.commit_ts = commit_ts;
-			report.index_timings = self.inner.persist_import_root(&root)?;
+			report.index_timings = with_external_sort_options(sort_memory, parallelism, || {
+				self.inner.persist_import_root(&root, quarantine.as_mut())
+			})?;
 			*self.inner.current.write() = Arc::new(root);
 		}
 		report.phase_timings.insert("callback".to_owned(), callback_elapsed);
@@ -581,6 +867,19 @@ fn is_item_violation(error: &FerrosGrynnError) -> bool {
 			Condition::DependentObjectError | Condition::GraphTypeViolation
 		)
 		|| matches!(status.code().body(), "40F01" | "42F01")
+}
+
+/// Truncates one diagnostic at a UTF-8 boundary for the fixed FGQR limit.
+fn bounded_diagnostic(value: &str) -> String {
+	const LIMIT: usize = 4096;
+	if value.len() <= LIMIT {
+		return value.to_owned();
+	}
+	let mut end = LIMIT;
+	while !value.is_char_boundary(end) {
+		end -= 1;
+	}
+	value[..end].to_owned()
 }
 
 /// Increments one report counter with a typed overflow error.
@@ -1022,5 +1321,69 @@ mod tests {
 		assert!(result.is_err());
 		assert!(store.begin().atom(&record("candidate")).unwrap().is_none());
 		assert!(store.begin().atom(&record("invalid")).unwrap().is_some());
+	}
+
+	#[test]
+	fn quarantine_publishes_only_rejected_payloads_and_streams_them_back() -> FerrosGrynnResult<()>
+	{
+		let store = store_with_class();
+		let options = ImportOptions {
+			on_violation: ImportViolationPolicy::Quarantine,
+			reject_limit: Some(1),
+			..ImportOptions::default()
+		};
+		let report = store.import(options, |session| {
+			session.apply_item_with_payload("accepted".into(), |transaction| {
+				transaction.create_atom(record("alice"), PropertyMap::new())
+			})?;
+			let outcome = session.apply_item_with_payload("duplicate".into(), |transaction| {
+				transaction.create_atom(record("alice"), PropertyMap::new())
+			})?;
+			assert!(matches!(outcome, ImportItemOutcome::Skipped(_)));
+			Ok(())
+		})?;
+
+		let id = report.quarantine().ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("missing quarantine report identity")
+		})?;
+		let mut reader = store.open_quarantine(id)?;
+		let item = reader
+			.read_next()?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("missing quarantined item"))?;
+		assert_eq!(item.item(), 2);
+		assert_eq!(item.payload(), &Value::from("duplicate"));
+		assert_eq!(item.code().to_string(), "FG-G2F04");
+		assert!(reader.read_next()?.is_none());
+		assert!(store.begin().atom(&record("alice"))?.is_some());
+		drop(reader);
+		store.remove_quarantine(id)?;
+		assert!(store.open_quarantine(id).is_err());
+		Ok(())
+	}
+
+	#[test]
+	fn quarantine_requires_payload_before_running_the_item() -> FerrosGrynnResult<()> {
+		let store = store_with_class();
+		let options = ImportOptions {
+			on_violation: ImportViolationPolicy::Quarantine,
+			reject_limit: Some(1),
+			..ImportOptions::default()
+		};
+		let mut called = false;
+		let error = store
+			.import(options, |session| {
+				session.apply_item(|_transaction| {
+					called = true;
+					Ok(())
+				})?;
+				Ok(())
+			})
+			.err()
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("payload-less quarantine succeeded")
+			})?;
+		assert_eq!(error.status().code().to_string(), "FG-22N11");
+		assert!(!called);
+		Ok(())
 	}
 }

@@ -37,8 +37,10 @@ use crate::{
 		catalog::{
 			AtomStoreCatalogBinding,
 			CatalogKind,
+			CatalogPath,
 			DatabaseCatalog,
 			FileCatalog,
+			FileCatalogEntry,
 			PhysicalIndexBinding,
 			encode_page_chain,
 		},
@@ -95,6 +97,53 @@ pub(super) struct BuiltGeneration {
 	pub(super) atom_superblock: AtomStoreSuperblock,
 	pub(super) graph_superblocks: BTreeMap<crate::graph::GraphId, GraphSuperblock>,
 	pub(super) index_timings: BTreeMap<IndexId, Duration>,
+}
+
+impl BuiltGeneration {
+	/// Carries immutable quarantine registrations across a full-generation
+	/// rewrite and optionally appends the file published by this import.
+	pub(super) fn update_quarantines(
+		&mut self,
+		previous: &FileCatalog,
+		addition: Option<Uuid>,
+		removal: Option<Uuid>,
+	) -> FerrosGrynnResult<()> {
+		self.file_catalog.files.extend(
+			previous
+				.files
+				.iter()
+				.filter(|entry| {
+					entry.file_id.kind() == Some(DataFileKind::ImportQuarantine)
+						&& removal.is_none_or(|id| {
+							entry.path.as_str() != format!("admin/quarantine/{id}.fgq")
+						})
+				})
+				.cloned(),
+		);
+		if let Some(id) = addition {
+			let file_id = DataFileId::new(
+				self.file_catalog.next_file_instance_id,
+				DataFileKind::ImportQuarantine,
+			)
+			.ok_or_else(|| invalid("quarantine file identity clock is exhausted"))?;
+			self.file_catalog.next_file_instance_id = self
+				.file_catalog
+				.next_file_instance_id
+				.checked_add(1)
+				.ok_or_else(|| invalid("quarantine file identity clock is exhausted"))?;
+			self.file_catalog.files.push(FileCatalogEntry {
+				space_id: DataSpaceId::Database,
+				file_id,
+				companion_of: None,
+				role: DataFileRole::AuxiliaryImmutable,
+				path: CatalogPath::parse(&format!("admin/quarantine/{id}.fgq"))?,
+			});
+		}
+		self.file_catalog.files.sort_unstable_by_key(|entry| (entry.space_id, entry.file_id));
+		self.file_catalog.encode()?;
+		self.files.retain(|image| image.entry.file_id.kind() != Some(DataFileKind::SystemCatalog));
+		append_catalog_pages(&mut self.files, &self.file_catalog, &self.database_catalog)
+	}
 }
 
 fn map_atom_primary<Primary>(

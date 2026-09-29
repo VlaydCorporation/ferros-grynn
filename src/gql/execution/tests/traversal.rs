@@ -31,6 +31,47 @@ fn traverses_collection_with_language_closures() {
 }
 
 #[test]
+fn named_algorithm_receives_current_and_flat_maps_collections() {
+	let store = Datastore::in_memory();
+	let defined = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::offset(value: int, amount: int) -> int { RETURN $value + \
+			 $amount; }; DEFINE PURE FUNCTION fn::spread(value: int) -> array { RETURN [$value, \
+			 $value + 10]; }; DEFINE IMPURE FUNCTION fn::impure_identity(value: int) -> int { \
+			 RETURN $value; };",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(
+		defined.iter().all(|result| result.result.is_ok()),
+		"function definition failed: {defined:?}"
+	);
+
+	assert_eq!(
+		store
+			.execute("TRAVERSE FROM [1, 2, 3] |> tv::algo(fn::offset, 2);", &Object::new(),)
+			.unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap()
+			.value(),
+		&Value::Array(vec![3_i64, 4, 5].into())
+	);
+	assert_eq!(
+		store.execute("TRAVERSE FROM [1, 2] |> tv::algo(fn::spread);", &Object::new(),).unwrap()[0]
+			.result
+			.as_ref()
+			.unwrap()
+			.value(),
+		&Value::Array(vec![1_i64, 11, 2, 12].into())
+	);
+	let impure = store
+		.execute("TRAVERSE FROM [1] |> tv::algo(fn::impure_identity);", &Object::new())
+		.unwrap();
+	assert!(impure[0].result.is_err());
+}
+
+#[test]
 fn collection_steps_cover_the_public_traversal_adapters() {
 	assert_eq!(
 		traverse(

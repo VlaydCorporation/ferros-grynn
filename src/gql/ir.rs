@@ -1,7 +1,14 @@
 use std::time::Duration;
 
 use crate::{
-	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope},
+	datastore::{
+		ClassIndexKind,
+		ClassSchemaMode,
+		FunctionEffect,
+		FunctionId,
+		IndexScope,
+		SchemaVersion,
+	},
 	gql_status::TextSpan,
 	graph::GraphTopologyConstraints,
 	syn::{DefinitionMode, MatchDirection},
@@ -14,7 +21,7 @@ pub(super) struct NodeId(pub(super) u32);
 #[derive(Debug, Clone)]
 pub(super) struct LogicalProgram {
 	pub(super) statements: Vec<LogicalStatement>,
-	pub(super) initial_slots: Vec<(Box<str>, u32)>,
+	pub(super) initial_slots: Vec<(Box<str>, u32, bool)>,
 	pub(super) slot_count: usize,
 }
 
@@ -58,6 +65,7 @@ pub(super) enum LogicalStatement {
 	Throw {
 		value: TypedExpr,
 	},
+	Sleep(Duration),
 	AssertInvariants {
 		graph: Option<GraphRef>,
 		report: usize,
@@ -283,6 +291,26 @@ pub(super) enum LogicalSchemaStatement {
 		kind: ClassIndexKind,
 		fields: Vec<Box<str>>,
 		scope: IndexScope,
+		maintenance: crate::datastore::IndexMaintenanceMode,
+		concurrently: bool,
+	},
+	DefineParameter {
+		mode: DefinitionMode,
+		name: Box<str>,
+		value: TypedExpr,
+		comment: Option<Text>,
+	},
+	DefineFunction {
+		mode: DefinitionMode,
+		namespace: Box<str>,
+		name: Box<str>,
+		parameters: Vec<(Box<str>, Type)>,
+		result: Type,
+		effect: FunctionEffect,
+		cost: bool,
+		max_depth: Option<u8>,
+		body: Text,
+		comment: Option<Text>,
 	},
 	RemoveGraph {
 		if_exists: bool,
@@ -302,6 +330,16 @@ pub(super) enum LogicalSchemaStatement {
 		class: Box<str>,
 		name: Box<str>,
 	},
+	RemoveParameter {
+		if_exists: bool,
+		name: Box<str>,
+	},
+	RemoveFunction {
+		if_exists: bool,
+		namespace: Box<str>,
+		name: Box<str>,
+		signature: Option<Vec<Type>>,
+	},
 	AlterClassMode {
 		if_exists: bool,
 		name: Box<str>,
@@ -317,6 +355,23 @@ pub(super) enum LogicalSchemaStatement {
 		class: Box<str>,
 		name: Box<str>,
 	},
+	AlterParameter {
+		if_exists: bool,
+		name: Box<str>,
+		value: Option<TypedExpr>,
+		comment: Option<Option<Text>>,
+	},
+	AlterFunction {
+		if_exists: bool,
+		namespace: Box<str>,
+		name: Box<str>,
+		signature: Option<Vec<Type>>,
+		effect: Option<FunctionEffect>,
+		cost: Option<bool>,
+		max_depth: Option<Option<u8>>,
+		body: Option<Text>,
+		comment: Option<Option<Text>>,
+	},
 	InfoDatabase,
 	InfoClass {
 		name: Box<str>,
@@ -324,6 +379,14 @@ pub(super) enum LogicalSchemaStatement {
 	InfoIndex {
 		class: Box<str>,
 		name: Box<str>,
+	},
+	InfoParameter {
+		name: Box<str>,
+	},
+	InfoFunction {
+		namespace: Box<str>,
+		name: Box<str>,
+		signature: Option<Vec<Type>>,
 	},
 }
 
@@ -348,6 +411,12 @@ impl LogicalSchemaStatement {
 			}
 			| Self::DefineIndex {
 				..
+			}
+			| Self::DefineParameter {
+				..
+			}
+			| Self::DefineFunction {
+				..
 			} => crate::gql::QueryStatementKind::Define,
 			Self::UpdateGraph {
 				..
@@ -363,6 +432,12 @@ impl LogicalSchemaStatement {
 			}
 			| Self::RemoveIndex {
 				..
+			}
+			| Self::RemoveParameter {
+				..
+			}
+			| Self::RemoveFunction {
+				..
 			} => crate::gql::QueryStatementKind::Remove,
 			Self::AlterClassMode {
 				..
@@ -372,12 +447,24 @@ impl LogicalSchemaStatement {
 			}
 			| Self::PrepareIndexRemoval {
 				..
+			}
+			| Self::AlterParameter {
+				..
+			}
+			| Self::AlterFunction {
+				..
 			} => crate::gql::QueryStatementKind::Alter,
 			Self::InfoDatabase
 			| Self::InfoClass {
 				..
 			}
 			| Self::InfoIndex {
+				..
+			}
+			| Self::InfoParameter {
+				..
+			}
+			| Self::InfoFunction {
 				..
 			} => crate::gql::QueryStatementKind::Info,
 		}
@@ -668,6 +755,7 @@ pub(crate) enum TraverseStepKind {
 	CyclicPath,
 	Map,
 	FlatMap,
+	Algorithm,
 	Values,
 	Select,
 	Match,
@@ -750,6 +838,12 @@ impl TraverseStepKind {
 pub(super) struct LogicalTraverseStep {
 	pub(super) kind: TraverseStepKind,
 	pub(super) arguments: Vec<TypedExpr>,
+	/// Recursive `tv::algo` target resolved through the named-function cache.
+	pub(super) named_function: Option<NamedFunctionKey>,
+	/// Target type of the implicit first `tv::algo` argument.
+	pub(super) algorithm_input: Option<Type>,
+	/// Statically resolved type produced by `tv::algo`.
+	pub(super) output_type: Option<Type>,
 	pub(super) match_plan: Option<Box<LogicalMatch>>,
 	pub(super) repeat: Option<LogicalRepeat>,
 	pub(super) span: TextSpan,
@@ -849,6 +943,8 @@ pub(super) enum LogicalWildcardField {
 pub(super) struct LogicalOrder {
 	pub(super) expression: TypedExpr,
 	pub(super) random: bool,
+	pub(super) collate: bool,
+	pub(super) numeric: bool,
 	pub(super) direction: crate::syn::SelectOrderDirection,
 	pub(super) nulls: crate::syn::SelectNulls,
 }
@@ -945,6 +1041,17 @@ pub(super) struct LogicalClosure {
 	pub(super) slot_count: usize,
 	/// Conservative retained size of the typed closure plan.
 	pub(super) retained_plan_bytes: usize,
+	pub(super) named_function: Option<NamedFunctionKey>,
+}
+
+/// Session-cache identity and recursion contract of one compiled named UDF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct NamedFunctionKey {
+	pub(super) id: FunctionId,
+	pub(super) version: SchemaVersion,
+	pub(super) schema_epoch: u64,
+	pub(super) max_depth: Option<u8>,
+	pub(super) effect: FunctionEffect,
 }
 
 #[derive(Debug, Clone)]
@@ -1006,6 +1113,10 @@ pub(super) enum TypedExprKind {
 		callee: Box<TypedExpr>,
 		arguments: Vec<TypedExpr>,
 	},
+	NamedInvoke {
+		function: NamedFunctionKey,
+		arguments: Vec<TypedExpr>,
+	},
 	/// A generic expression pipeline lowered to the traversal VM.
 	Traversal(Box<LogicalTraverse>),
 	Aggregate {
@@ -1049,6 +1160,10 @@ pub(super) enum Builtin {
 	StringLower,
 	StringLen,
 	StringContains,
+	StringMatches,
+	StringSlice,
+	RegexMatcher,
+	RegexNext,
 	StringSplit,
 	StringConcat,
 	TimeNow(DateTime),
@@ -1060,11 +1175,16 @@ pub(super) enum Builtin {
 	ArrayDistinct,
 	ArrayFirst,
 	ArrayFlatten,
+	ArrayPush(u32),
+	ArrayPop(u32),
+	ArrayClear(u32),
 	SetLen,
 	SetUnion,
 	SetIntersect,
 	SetDiff,
 	SetHas,
+	SetAdd(u32),
+	SetClear(u32),
 	TypeIs(Type),
 	TypeTo(Type),
 	MetaId,
@@ -1079,4 +1199,7 @@ pub(super) enum Builtin {
 	PathCost,
 	OptionIsSome,
 	OptionIsNone,
+	Uuid,
+	Ulid,
+	RandId,
 }

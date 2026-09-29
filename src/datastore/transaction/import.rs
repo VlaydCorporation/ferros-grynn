@@ -31,6 +31,11 @@ impl Mutation {
 }
 
 impl Transaction {
+	/// Borrows the transaction-visible schema used to encode rejected payloads.
+	pub(crate) fn import_schema(&self) -> &crate::datastore::SchemaCatalog {
+		self.working.schema.as_ref()
+	}
+
 	/// Applies and validates one logical import item as an atomic mutation.
 	///
 	/// # Errors

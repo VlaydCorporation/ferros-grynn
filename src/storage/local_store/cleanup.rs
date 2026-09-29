@@ -143,6 +143,48 @@ pub(super) fn cleanup_orphan_generations(
 	Ok(())
 }
 
+/// Removes immutable quarantine files that are not reachable from the
+/// recovered file catalog.
+pub(super) fn cleanup_orphan_quarantines(
+	root: &Path,
+	catalog: &FileCatalog,
+) -> FerrosGrynnResult<()> {
+	let directory = root.join("admin").join("quarantine");
+	if !directory.exists() {
+		return Ok(());
+	}
+	let reachable = catalog
+		.files
+		.iter()
+		.filter(|entry| entry.file_id.kind() == Some(DataFileKind::ImportQuarantine))
+		.map(|entry| entry.path.resolve(root))
+		.collect::<BTreeSet<_>>();
+	for entry in fs::read_dir(&directory)
+		.map_err(|source| io_failure("read quarantine directory", source))?
+	{
+		let entry = entry.map_err(|source| io_failure("read quarantine entry", source))?;
+		let file_type =
+			entry.file_type().map_err(|source| io_failure("inspect quarantine entry", source))?;
+		if !file_type.is_file() || file_type.is_symlink() {
+			continue;
+		}
+		let path = entry.path();
+		let canonical_name = path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.and_then(|name| name.strip_suffix(".fgq"))
+			.is_some_and(|id| id.parse::<Uuid>().is_ok());
+		if canonical_name && !reachable.contains(&path) {
+			match fs::remove_file(&path) {
+				Ok(()) => {}
+				Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+				Err(source) => return Err(io_failure("remove orphan quarantine", source)),
+			}
+		}
+	}
+	Ok(())
+}
+
 /// Removes transient query runs left by an interrupted process before the
 /// database accepts sessions.
 pub(super) fn cleanup_query_runs(root: &Path) -> FerrosGrynnResult<()> {
@@ -161,7 +203,11 @@ fn generation_directories(
 ) -> FerrosGrynnResult<BTreeSet<PathBuf>> {
 	let mut directories = BTreeSet::new();
 	for file in &catalog.files {
-		if file.file_id.kind() == Some(DataFileKind::SystemCatalog) {
+		if file.file_id.kind() == Some(DataFileKind::SystemCatalog)
+			|| matches!(
+				file.file_id.kind(),
+				Some(DataFileKind::JobCatalog | DataFileKind::ImportQuarantine)
+			) {
 			continue;
 		}
 		let components = file.path.as_str().split('/').collect::<Vec<_>>();
@@ -320,6 +366,39 @@ mod tests {
 		assert!(reachable_path.is_dir());
 		assert!(!orphan_path.exists());
 		assert!(unrelated.is_dir());
+		drop(fs::remove_dir_all(root));
+		Ok(())
+	}
+
+	#[test]
+	fn startup_cleanup_removes_only_unreachable_quarantines() -> FerrosGrynnResult<()> {
+		let root = std::env::temp_dir().join(format!("fg-quarantine-cleanup-{}", Uuid::now_v7()));
+		let directory = root.join("admin").join("quarantine");
+		fs::create_dir_all(&directory)
+			.map_err(|source| io_failure("create quarantine fixture directory", source))?;
+		let reachable = Uuid::now_v7();
+		let orphan = Uuid::now_v7();
+		let reachable_path = directory.join(format!("{reachable}.fgq"));
+		let orphan_path = directory.join(format!("{orphan}.fgq"));
+		let unrelated = directory.join("keep-me");
+		for path in [&reachable_path, &orphan_path, &unrelated] {
+			fs::write(path, b"fixture")
+				.map_err(|source| io_failure("write quarantine fixture", source))?;
+		}
+		let mut catalog = FileCatalog::bootstrap()?;
+		catalog.files.push(FileCatalogEntry {
+			space_id: DataSpaceId::Database,
+			file_id: DataFileId::new(1, DataFileKind::ImportQuarantine)
+				.ok_or_else(|| invalid("test quarantine identity is invalid"))?,
+			companion_of: None,
+			role: DataFileRole::AuxiliaryImmutable,
+			path: CatalogPath::parse(&format!("admin/quarantine/{reachable}.fgq"))?,
+		});
+
+		cleanup_orphan_quarantines(&root, &catalog)?;
+		assert!(reachable_path.is_file());
+		assert!(!orphan_path.exists());
+		assert!(unrelated.is_file());
 		drop(fs::remove_dir_all(root));
 		Ok(())
 	}

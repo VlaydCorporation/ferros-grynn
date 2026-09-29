@@ -1,4 +1,4 @@
-//! Canonical little-endian encoding for `FGDC v9`.
+//! Canonical little-endian encoding for `FGDC v10`.
 
 use super::{
 	AtomStoreCatalogBinding,
@@ -6,6 +6,8 @@ use super::{
 	ClassFieldCatalogEntry,
 	ClassIndexCatalogEntry,
 	DatabaseCatalog,
+	FunctionCatalogEntry,
+	FunctionParameterCatalogEntry,
 	GraphCatalogEntry,
 	GraphPropertyCatalogEntry,
 	ParameterCatalogEntry,
@@ -19,7 +21,10 @@ use crate::{
 		ClassIndexKind,
 		ClassIndexState,
 		ClassSchemaMode,
+		FunctionEffect,
+		FunctionId,
 		IndexId,
+		IndexMaintenanceMode,
 		IndexScope,
 		SchemaId,
 		SchemaVersion,
@@ -35,8 +40,8 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"FGDC";
-const VERSION: u16 = 9;
-const HEADER_BYTES: usize = 80;
+const VERSION: u16 = 10;
+const HEADER_BYTES: usize = 88;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
 
@@ -52,6 +57,8 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	write_u32(&mut output, catalog.classes.len(), "class count")?;
 	write_u32(&mut output, catalog.graphs.len(), "graph count")?;
 	write_u32(&mut output, catalog.parameters.len(), "parameter count")?;
+	write_u32(&mut output, catalog.functions.len(), "function count")?;
+	output.extend_from_slice(&0_u32.to_le_bytes());
 	output.extend_from_slice(&catalog.atom_store.generation.to_le_bytes());
 	write_binding(&mut output, catalog.atom_store.primary);
 	write_binding(&mut output, catalog.atom_store.reverse_membership);
@@ -67,6 +74,9 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	}
 	for parameter in &catalog.parameters {
 		encode_parameter(&mut output, parameter)?;
+	}
+	for function in &catalog.functions {
+		encode_function(&mut output, function)?;
 	}
 	if output.len() > MAX_BYTES {
 		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
@@ -104,6 +114,8 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	let class_count = decoder.read_count("class count")?;
 	let graph_count = decoder.read_count("graph count")?;
 	let parameter_count = decoder.read_count("parameter count")?;
+	let function_count = decoder.read_count("function count")?;
+	decoder.expect_zero(4, "database catalog header reserved bytes")?;
 	let generation = decoder.read_u64()?;
 	let primary = read_binding(&mut decoder)?;
 	let reverse_membership = read_binding(&mut decoder)?;
@@ -124,6 +136,10 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	for _ in 0..parameter_count {
 		parameters.push(decode_parameter(&mut decoder)?);
 	}
+	let mut functions = Vec::with_capacity(function_count);
+	for _ in 0..function_count {
+		functions.push(decode_function(&mut decoder)?);
+	}
 	decoder.finish()?;
 	let catalog = DatabaseCatalog {
 		next_graph_id,
@@ -137,6 +153,7 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 		classes,
 		graphs,
 		parameters,
+		functions,
 	};
 	validate(&catalog)?;
 	Ok(catalog)
@@ -209,19 +226,20 @@ fn encode_index(output: &mut Vec<u8>, index: &ClassIndexCatalogEntry) -> FerrosG
 	match index.scope {
 		IndexScope::Base => {
 			output.push(0);
-			output.push(0);
+			output.push(index_maintenance(index.maintenance));
 			output.extend_from_slice(&0_u64.to_le_bytes());
 		}
 		IndexScope::Effective {
 			graph,
 		} => {
 			output.push(1);
-			output.push(0);
+			output.push(index_maintenance(index.maintenance));
 			output.extend_from_slice(&graph.get().to_le_bytes());
 		}
 	}
 	write_u16(output, index.fields.len(), "index field count")?;
 	output.extend_from_slice(&0_u16.to_le_bytes());
+	output.extend_from_slice(&index.build_revision.to_le_bytes());
 	write_optional_binding(output, index.physical);
 	write_string(output, index.name.as_str(), "index name")?;
 	for field in &index.fields {
@@ -236,7 +254,7 @@ fn decode_index(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassIndexCatalo
 	let kind = decode_index_kind(decoder.read_u8()?)?;
 	let state = decode_index_state(decoder.read_u8()?)?;
 	let scope_kind = decoder.read_u8()?;
-	decoder.expect_zero(1, "index scope reserved byte")?;
+	let maintenance = decode_index_maintenance(decoder.read_u8()?)?;
 	let scope_graph = decoder.read_u64()?;
 	let scope = match (scope_kind, scope_graph) {
 		(0, 0) => IndexScope::Base,
@@ -248,6 +266,7 @@ fn decode_index(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassIndexCatalo
 	};
 	let field_count = usize::from(decoder.read_u16()?);
 	decoder.expect_zero(2, "index entry reserved bytes")?;
+	let build_revision = decoder.read_u64()?;
 	let physical = read_optional_binding(decoder)?;
 	let name = read_string(decoder, "index name")?.into();
 	let mut fields = Vec::with_capacity(field_count);
@@ -260,6 +279,8 @@ fn decode_index(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassIndexCatalo
 		name,
 		kind,
 		state,
+		maintenance,
+		build_revision,
 		scope,
 		fields,
 		physical,
@@ -404,6 +425,11 @@ fn encode_parameter(
 	output.extend_from_slice(&parameter.version.get().to_le_bytes());
 	output.extend_from_slice(&parameter.published_at.to_le_bytes());
 	write_u32(output, parameter.value.len(), "parameter value length")?;
+	write_optional_string(
+		output,
+		parameter.comment.as_ref().map(|value| value.as_str()),
+		"parameter comment",
+	)?;
 	write_string(output, parameter.name.as_str(), "parameter name")?;
 	output.extend_from_slice(&parameter.value);
 	Ok(())
@@ -414,6 +440,7 @@ fn decode_parameter(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ParameterCat
 	let version = SchemaVersion::from_storage(decoder.read_u32()?)?;
 	let published_at = decoder.read_u64()?;
 	let value_len = decoder.read_count("parameter value length")?;
+	let comment = read_optional_string(decoder, "parameter comment")?.map(Into::into);
 	let name = read_string(decoder, "parameter name")?.into();
 	let value = decoder.read_exact(value_len)?.to_vec();
 	Ok(ParameterCatalogEntry {
@@ -422,7 +449,130 @@ fn decode_parameter(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ParameterCat
 		published_at,
 		name,
 		value,
+		comment,
 	})
+}
+
+fn encode_function(output: &mut Vec<u8>, function: &FunctionCatalogEntry) -> FerrosGrynnResult<()> {
+	output.extend_from_slice(&function.id.get().to_le_bytes());
+	output.extend_from_slice(&function.version.get().to_le_bytes());
+	output.extend_from_slice(&function.published_at.to_le_bytes());
+	output.push(function_effect(function.effect));
+	output.push(u8::from(function.cost));
+	output.push(function.max_depth.unwrap_or(0));
+	output.push(0);
+	write_u16(output, function.parameters.len(), "function parameter count")?;
+	output.extend_from_slice(&0_u16.to_le_bytes());
+	write_u32(output, function.body.len(), "function body length")?;
+	write_string(output, function.namespace.as_str(), "function namespace")?;
+	write_string(output, function.name.as_str(), "function name")?;
+	type_codec::encode(output, &function.result, 0)?;
+	for parameter in &function.parameters {
+		write_string(output, parameter.name.as_str(), "function parameter name")?;
+		type_codec::encode(output, &parameter.value_type, 0)?;
+	}
+	write_optional_string(
+		output,
+		function.comment.as_ref().map(|comment| comment.as_str()),
+		"function comment",
+	)?;
+	output.extend_from_slice(function.body.as_bytes());
+	Ok(())
+}
+
+fn decode_function(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<FunctionCatalogEntry> {
+	let id = FunctionId::from_storage(decoder.read_u32()?)?;
+	let version = SchemaVersion::from_storage(decoder.read_u32()?)?;
+	let published_at = decoder.read_u64()?;
+	let effect = decode_function_effect(decoder.read_u8()?)?;
+	let cost = match decoder.read_u8()? {
+		0 => false,
+		1 => true,
+		_ => return Err(invalid("function cost flag is invalid")),
+	};
+	let max_depth = match decoder.read_u8()? {
+		0 => None,
+		value @ 1..=64 => Some(value),
+		_ => return Err(invalid("function recursion bound is invalid")),
+	};
+	decoder.expect_zero(1, "function reserved byte")?;
+	let parameter_count = usize::from(decoder.read_u16()?);
+	decoder.expect_zero(2, "function reserved bytes")?;
+	let body_len = decoder.read_count("function body length")?;
+	let namespace = read_string(decoder, "function namespace")?.into();
+	let name = read_string(decoder, "function name")?.into();
+	let result = type_codec::decode(decoder, 0)?;
+	let mut parameters = Vec::with_capacity(parameter_count);
+	for _ in 0..parameter_count {
+		parameters.push(FunctionParameterCatalogEntry {
+			name: read_string(decoder, "function parameter name")?.into(),
+			value_type: type_codec::decode(decoder, 0)?,
+		});
+	}
+	let comment = read_optional_string(decoder, "function comment")?.map(Into::into);
+	let body = std::str::from_utf8(decoder.read_exact(body_len)?)
+		.map_err(|_error| invalid("function body is not UTF-8"))?
+		.into();
+	Ok(FunctionCatalogEntry {
+		id,
+		version,
+		published_at,
+		namespace,
+		name,
+		parameters,
+		result,
+		effect,
+		cost,
+		max_depth,
+		body,
+		comment,
+	})
+}
+
+const fn function_effect(effect: FunctionEffect) -> u8 {
+	match effect {
+		FunctionEffect::Pure => 0,
+		FunctionEffect::Stable => 1,
+		FunctionEffect::Impure => 2,
+	}
+}
+
+fn decode_function_effect(value: u8) -> FerrosGrynnResult<FunctionEffect> {
+	match value {
+		0 => Ok(FunctionEffect::Pure),
+		1 => Ok(FunctionEffect::Stable),
+		2 => Ok(FunctionEffect::Impure),
+		_ => Err(invalid("function effect is invalid")),
+	}
+}
+
+fn write_optional_string(
+	output: &mut Vec<u8>,
+	value: Option<&str>,
+	field: &str,
+) -> FerrosGrynnResult<()> {
+	match value {
+		None => output.extend_from_slice(&u16::MAX.to_le_bytes()),
+		Some(value) => write_string(output, value, field)?,
+	}
+	Ok(())
+}
+
+fn read_optional_string<'a>(
+	decoder: &mut Decoder<'a>,
+	field: &str,
+) -> FerrosGrynnResult<Option<&'a str>> {
+	let length = decoder.read_u16()?;
+	if length == u16::MAX {
+		return Ok(None);
+	}
+	let bytes = decoder.read_exact(usize::from(length))?;
+	let value =
+		std::str::from_utf8(bytes).map_err(|_error| invalid(format!("{field} is not UTF-8")))?;
+	if value.len() > MAX_STRING_BYTES {
+		return Err(invalid(format!("{field} exceeds its format limit")));
+	}
+	Ok(Some(value))
 }
 
 fn write_binding(output: &mut Vec<u8>, binding: PhysicalIndexBinding) {
@@ -579,6 +729,21 @@ fn decode_index_state(value: u8) -> FerrosGrynnResult<ClassIndexState> {
 		1 => Ok(ClassIndexState::Stale),
 		2 => Ok(ClassIndexState::PreparedForRemoval),
 		_ => Err(invalid("index contains an unknown state")),
+	}
+}
+
+const fn index_maintenance(value: IndexMaintenanceMode) -> u8 {
+	match value {
+		IndexMaintenanceMode::Immediate => 0,
+		IndexMaintenanceMode::Deferred => 1,
+	}
+}
+
+fn decode_index_maintenance(value: u8) -> FerrosGrynnResult<IndexMaintenanceMode> {
+	match value {
+		0 => Ok(IndexMaintenanceMode::Immediate),
+		1 => Ok(IndexMaintenanceMode::Deferred),
+		_ => Err(invalid("class index has an unknown maintenance mode")),
 	}
 }
 

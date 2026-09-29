@@ -2,7 +2,7 @@
 
 use std::{
 	fs::{self, File},
-	io::{self, Read},
+	io::{self, Read, Write},
 	path::{Path, PathBuf},
 };
 
@@ -32,6 +32,16 @@ enum Candidate<T> {
 	},
 }
 
+/// Decode and authority state of one variable-length metadata candidate.
+enum BytesCandidate<T> {
+	Missing,
+	Invalid,
+	Valid {
+		value: T,
+		bytes: Vec<u8>,
+	},
+}
+
 /// Writes a checkpoint metadata page through the canonical tmp/main/prev
 /// sequence.
 ///
@@ -51,6 +61,85 @@ pub(super) fn write_checkpoint_page(target: &Path, page: &AlignedPage) -> Ferros
 		rename_durable(target, &previous)?;
 	}
 	rename_durable(&temporary, target)
+}
+
+/// Writes an arbitrary checksummed metadata payload through the same
+/// tmp/main/prev authority protocol as checkpoint metadata pages.
+pub(super) fn write_metadata_bytes(target: &Path, bytes: &[u8]) -> FerrosGrynnResult<()> {
+	let temporary = derived_path(target, TEMP_SUFFIX);
+	let previous = derived_path(target, PREVIOUS_SUFFIX);
+	remove_if_present(&temporary, "remove stale metadata temporary file")?;
+	let mut file = File::create_new(&temporary)
+		.map_err(|source| io_failure("create metadata temporary file", source))?;
+	file.write_all(bytes).map_err(|source| io_failure("write metadata temporary file", source))?;
+	file.sync_all().map_err(|source| io_failure("synchronize metadata temporary file", source))?;
+	drop(file);
+
+	if target.exists() {
+		remove_if_present(&previous, "remove obsolete metadata previous file")?;
+		rename_durable(target, &previous)?;
+	}
+	rename_durable(&temporary, target)
+}
+
+/// Selects the newest valid variable-length metadata candidate from main and
+/// previous files. A neighboring temporary file is never authoritative.
+pub(super) fn select_metadata_bytes<T, Key>(
+	target: &Path,
+	max_bytes: usize,
+	decode: impl Fn(&[u8]) -> FerrosGrynnResult<T> + Copy,
+	key_of: impl Fn(&T) -> Key + Copy,
+	kind: &str,
+) -> FerrosGrynnResult<T>
+where
+	T: Clone,
+	Key: Copy + Ord,
+{
+	let main = read_bytes_candidate(target, max_bytes, decode)?;
+	let previous = read_bytes_candidate(&derived_path(target, PREVIOUS_SUFFIX), max_bytes, decode)?;
+	match (main, previous) {
+		(
+			BytesCandidate::Valid {
+				value,
+				..
+			},
+			BytesCandidate::Missing | BytesCandidate::Invalid,
+		)
+		| (
+			BytesCandidate::Missing | BytesCandidate::Invalid,
+			BytesCandidate::Valid {
+				value,
+				..
+			},
+		) => Ok(value),
+		(
+			BytesCandidate::Valid {
+				value: main_value,
+				bytes: main_bytes,
+			},
+			BytesCandidate::Valid {
+				value: previous_value,
+				bytes: previous_bytes,
+			},
+		) => {
+			let main_key = key_of(&main_value);
+			let previous_key = key_of(&previous_value);
+			if main_key == previous_key && main_bytes != previous_bytes {
+				return Err(invalid(format!(
+					"{kind} main and previous files have equal clocks but different bytes"
+				)));
+			}
+			if main_key >= previous_key {
+				Ok(main_value)
+			} else {
+				Ok(previous_value)
+			}
+		}
+		(
+			BytesCandidate::Missing | BytesCandidate::Invalid,
+			BytesCandidate::Missing | BytesCandidate::Invalid,
+		) => Err(invalid(format!("no valid {kind} main/previous file exists"))),
+	}
 }
 
 /// Selects the newest checksummed main/prev page accepted by database
@@ -147,6 +236,42 @@ fn read_candidate<T>(
 			page,
 		}),
 		Ok(_) | Err(_) => Ok(Candidate::Invalid),
+	}
+}
+
+/// Reads one bounded variable-length metadata candidate.
+fn read_bytes_candidate<T>(
+	path: &Path,
+	max_bytes: usize,
+	decode: impl Fn(&[u8]) -> FerrosGrynnResult<T>,
+) -> FerrosGrynnResult<BytesCandidate<T>> {
+	let mut file = match File::open(path) {
+		Ok(file) => file,
+		Err(source) if source.kind() == io::ErrorKind::NotFound => {
+			return Ok(BytesCandidate::Missing);
+		}
+		Err(source) => return Err(io_failure("open metadata candidate", source)),
+	};
+	let length =
+		file.metadata().map_err(|source| io_failure("inspect metadata candidate", source))?.len();
+	let length = match usize::try_from(length) {
+		Ok(length) if length <= max_bytes => length,
+		Ok(_) | Err(_) => return Ok(BytesCandidate::Invalid),
+	};
+	let mut bytes = vec![0; length];
+	match file.read_exact(&mut bytes) {
+		Ok(()) => {}
+		Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
+			return Ok(BytesCandidate::Invalid);
+		}
+		Err(source) => return Err(io_failure("read metadata candidate", source)),
+	}
+	match decode(&bytes) {
+		Ok(value) => Ok(BytesCandidate::Valid {
+			value,
+			bytes,
+		}),
+		Err(_) => Ok(BytesCandidate::Invalid),
 	}
 }
 

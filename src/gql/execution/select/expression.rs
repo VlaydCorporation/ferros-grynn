@@ -104,6 +104,10 @@ fn contains_select_special(expression: &TypedExpr) -> bool {
 			callee,
 			arguments,
 		} => contains_select_special(callee) || arguments.iter().any(contains_select_special),
+		TypedExprKind::NamedInvoke {
+			arguments,
+			..
+		} => arguments.iter().any(contains_select_special),
 		TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)

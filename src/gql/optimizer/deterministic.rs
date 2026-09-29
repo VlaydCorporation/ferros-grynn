@@ -66,6 +66,7 @@ fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 		| LogicalStatement::Throw {
 			value,
 		} => expr_contains_impure(value),
+		LogicalStatement::Sleep(_) => true,
 		LogicalStatement::If {
 			branches,
 			else_block,
@@ -101,6 +102,9 @@ fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 			source
 				|| statement.steps.iter().any(|step| {
 					step.match_plan.as_deref().is_some_and(match_contains_impure)
+						|| step.named_function.is_some_and(|function| {
+							matches!(function.effect, crate::datastore::FunctionEffect::Impure)
+						})
 						|| step.arguments.iter().any(expr_contains_impure)
 						|| step.repeat.as_ref().is_some_and(|repeat| {
 							expr_contains_impure(&repeat.body)
@@ -170,7 +174,21 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 			returning,
 			..
 		} => graph_property_mutation_contains_impure(mutation) || return_contains_impure(returning),
-		LogicalSchemaStatement::DefineClass {
+		LogicalSchemaStatement::DefineParameter {
+			value,
+			..
+		} => expr_contains_impure(value),
+		LogicalSchemaStatement::AlterParameter {
+			value,
+			..
+		} => value.as_ref().is_some_and(expr_contains_impure),
+		LogicalSchemaStatement::DefineFunction {
+			..
+		}
+		| LogicalSchemaStatement::AlterFunction {
+			..
+		}
+		| LogicalSchemaStatement::DefineClass {
 			..
 		}
 		| LogicalSchemaStatement::DefineField {
@@ -191,6 +209,12 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 		| LogicalSchemaStatement::RemoveIndex {
 			..
 		}
+		| LogicalSchemaStatement::RemoveParameter {
+			..
+		}
+		| LogicalSchemaStatement::RemoveFunction {
+			..
+		}
 		| LogicalSchemaStatement::AlterClassMode {
 			..
 		}
@@ -205,6 +229,12 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 			..
 		}
 		| LogicalSchemaStatement::InfoIndex {
+			..
+		}
+		| LogicalSchemaStatement::InfoParameter {
+			..
+		}
+		| LogicalSchemaStatement::InfoFunction {
 			..
 		} => false,
 	}
@@ -391,7 +421,18 @@ fn source_contains_impure(source: &LogicalSelectSource) -> bool {
 fn expr_contains_impure(expression: &TypedExpr) -> bool {
 	match &expression.kind {
 		TypedExprKind::Builtin {
-			function: Builtin::TimeNow(_),
+			function:
+				Builtin::TimeNow(_)
+				| Builtin::Uuid
+				| Builtin::Ulid
+				| Builtin::RandId
+				| Builtin::RegexMatcher
+				| Builtin::RegexNext
+				| Builtin::ArrayPush(_)
+				| Builtin::ArrayPop(_)
+				| Builtin::ArrayClear(_)
+				| Builtin::SetAdd(_)
+				| Builtin::SetClear(_),
 			..
 		} => true,
 		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
@@ -461,13 +502,18 @@ fn expr_contains_impure(expression: &TypedExpr) -> bool {
 			arguments,
 			..
 		} => arguments.iter().any(expr_contains_impure),
-		TypedExprKind::Closure(closure) => {
-			closure.effect > crate::gql::ir::ClosureEffect::StableRead
-		}
+		TypedExprKind::Closure(closure) => closure.effect != crate::gql::ir::ClosureEffect::Pure,
 		TypedExprKind::Invoke {
 			callee,
 			arguments,
 		} => expr_contains_impure(callee) || arguments.iter().any(expr_contains_impure),
+		TypedExprKind::NamedInvoke {
+			function,
+			arguments,
+		} => {
+			function.effect != crate::datastore::FunctionEffect::Pure
+				|| arguments.iter().any(expr_contains_impure)
+		}
 		TypedExprKind::Traversal(traverse) => {
 			let source = match &traverse.source {
 				LogicalTraverseSource::Expression(expression) => expr_contains_impure(expression),
@@ -476,6 +522,9 @@ fn expr_contains_impure(expression: &TypedExpr) -> bool {
 			source
 				|| traverse.steps.iter().any(|step| {
 					step.match_plan.as_deref().is_some_and(match_contains_impure)
+						|| step.named_function.is_some_and(|function| {
+							matches!(function.effect, crate::datastore::FunctionEffect::Impure)
+						})
 						|| step.arguments.iter().any(expr_contains_impure)
 						|| step.repeat.as_ref().is_some_and(|repeat| {
 							expr_contains_impure(&repeat.body)

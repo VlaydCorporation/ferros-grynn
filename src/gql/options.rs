@@ -1,4 +1,5 @@
 use std::{
+	collections::BTreeMap,
 	num::NonZeroUsize,
 	path::PathBuf,
 	sync::{
@@ -23,10 +24,10 @@ use super::{
 	QueryCursor,
 	closure::{LanguageClosureEntry, LanguageClosureState},
 	cursor::CursorRuntime,
-	ir::LogicalClosure,
+	ir::{LogicalClosure, NamedFunctionKey},
 };
 use crate::{
-	datastore::Transaction,
+	datastore::{FunctionId, Transaction},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult, Outcome, Status, StatusReport},
 	syn::TimeoutValue,
 	values::{Closure, Object, Value},
@@ -141,6 +142,7 @@ pub(crate) struct ExecutionControl {
 	continuation: Arc<Mutex<Option<QueryCursor>>>,
 	pending_index_seek: Arc<Mutex<Option<QueryCursor>>>,
 	closure_registry: Arc<LanguageClosureState>,
+	function_depths: Arc<Mutex<BTreeMap<FunctionId, u8>>>,
 	execution_mode: ExecutionMode,
 	user_seed: u64,
 	parameter_fingerprint: u64,
@@ -399,6 +401,7 @@ impl ExecutionControl {
 			continuation: Arc::new(Mutex::new(None)),
 			pending_index_seek: Arc::new(Mutex::new(None)),
 			closure_registry,
+			function_depths: Arc::new(Mutex::new(BTreeMap::new())),
 			execution_mode: ExecutionMode::BestEffort,
 			user_seed: options.deterministic_seed,
 			parameter_fingerprint: 0,
@@ -432,6 +435,10 @@ impl ExecutionControl {
 		self.closure_registry.register(plan, slots, self.statement_nonce)
 	}
 
+	pub(in crate::gql) fn function_cache(&self) -> &LanguageClosureState {
+		&self.closure_registry
+	}
+
 	pub(crate) const fn statement_nonce(&self) -> u64 {
 		self.statement_nonce
 	}
@@ -441,6 +448,41 @@ impl ExecutionControl {
 		closure: &Closure,
 	) -> FerrosGrynnResult<LanguageClosureEntry> {
 		self.closure_registry.resolve(closure)
+	}
+
+	pub(in crate::gql) fn resolve_named_function(
+		&self,
+		function: NamedFunctionKey,
+	) -> FerrosGrynnResult<Arc<LogicalClosure>> {
+		self.closure_registry.resolve_named(function)
+	}
+
+	pub(in crate::gql) fn enter_named_function(
+		&self,
+		function: NamedFunctionKey,
+	) -> FerrosGrynnResult<NamedFunctionFrame> {
+		// Catalog validation rejects recursive cycles without MAXDEPTH, so a
+		// non-recursive call does not need the shared depth map.
+		let Some(maximum) = function.max_depth.map(u32::from) else {
+			return Ok(NamedFunctionFrame {
+				depths: None,
+				function: function.id,
+			});
+		};
+		let maximum = maximum.min(self.max_control_depth);
+		let mut depths = self.function_depths.lock();
+		let depth = depths.entry(function.id).or_default();
+		if u32::from(*depth) >= maximum {
+			return Err(FerrosGrynnError::control_limit_exceeded(
+				"function recursion".to_owned(),
+				u64::from(maximum),
+			));
+		}
+		*depth = depth.saturating_add(1);
+		Ok(NamedFunctionFrame {
+			depths: Some(self.function_depths.clone()),
+			function: function.id,
+		})
 	}
 
 	pub(crate) const fn deterministic(&self) -> bool {
@@ -534,6 +576,7 @@ impl ExecutionControl {
 			continuation: self.continuation.clone(),
 			pending_index_seek: self.pending_index_seek.clone(),
 			closure_registry: self.closure_registry.clone(),
+			function_depths: self.function_depths.clone(),
 			execution_mode: self.execution_mode,
 			user_seed: self.user_seed,
 			parameter_fingerprint: self.parameter_fingerprint,
@@ -875,6 +918,26 @@ impl ExecutionControl {
 	}
 }
 
+pub(in crate::gql) struct NamedFunctionFrame {
+	depths: Option<Arc<Mutex<BTreeMap<FunctionId, u8>>>>,
+	function: FunctionId,
+}
+
+impl Drop for NamedFunctionFrame {
+	fn drop(&mut self) {
+		let Some(depths) = &self.depths else {
+			return;
+		};
+		let mut depths = depths.lock();
+		if let Some(depth) = depths.get_mut(&self.function) {
+			*depth = depth.saturating_sub(1);
+			if *depth == 0 {
+				depths.remove(&self.function);
+			}
+		}
+	}
+}
+
 pub(crate) fn resolve_timeout(
 	value: Option<&TimeoutValue>,
 	bindings: &Object,
@@ -882,48 +945,62 @@ pub(crate) fn resolve_timeout(
 	let Some(value) = value else {
 		return Ok(None);
 	};
+	resolve_duration(value, bindings, "TIMEOUT").map(Some)
+}
+
+pub(crate) fn resolve_duration(
+	value: &TimeoutValue,
+	bindings: &Object,
+	subject: &str,
+) -> FerrosGrynnResult<Duration> {
 	match value {
 		TimeoutValue::Literal {
 			value,
 			..
-		} => parse_fixed_duration(value).map(Some),
+		} => parse_fixed_duration(value, subject),
 		TimeoutValue::Parameter(parameter) => {
 			let Some(value) = bindings.get(&parameter.value) else {
 				return Err(FerrosGrynnError::invalid_argument(format!(
-					"TIMEOUT parameter `${}` is not defined.",
+					"{subject} parameter `${}` is not defined.",
 					parameter.value
 				)));
 			};
 			let Value::Duration(value) = value else {
 				return Err(FerrosGrynnError::invalid_argument(format!(
-					"TIMEOUT parameter has type {}, expected duration.",
+					"{subject} parameter has type {}, expected duration.",
 					value.value_type()
 				)));
 			};
 			let nanoseconds = value.fixed_nanoseconds().ok_or_else(|| {
-				FerrosGrynnError::invalid_argument(
-					"TIMEOUT cannot use a calendar duration containing years or months.",
-				)
+				FerrosGrynnError::invalid_argument(format!(
+					"{subject} cannot use a calendar duration containing years or months."
+				))
 			})?;
 			if nanoseconds < 0 {
-				return Err(FerrosGrynnError::invalid_argument("TIMEOUT cannot be negative."));
+				return Err(FerrosGrynnError::invalid_argument(format!(
+					"{subject} cannot be negative."
+				)));
 			}
 			let nanoseconds = u64::try_from(nanoseconds).map_err(|_| {
-				FerrosGrynnError::invalid_argument("TIMEOUT is too large for this platform.")
+				FerrosGrynnError::invalid_argument(format!(
+					"{subject} is too large for this platform."
+				))
 			})?;
-			Ok(Some(Duration::from_nanos(nanoseconds)))
+			Ok(Duration::from_nanos(nanoseconds))
 		}
 	}
 }
 
-fn parse_fixed_duration(value: &str) -> FerrosGrynnResult<Duration> {
+fn parse_fixed_duration(value: &str, subject: &str) -> FerrosGrynnResult<Duration> {
 	let split = value
 		.char_indices()
 		.find_map(|(index, character)| character.is_alphabetic().then_some(index))
-		.ok_or_else(|| FerrosGrynnError::invalid_argument("TIMEOUT requires a duration unit."))?;
+		.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument(format!("{subject} requires a duration unit."))
+		})?;
 	let (number, unit) = value.split_at(split);
 	let number = number.replace('_', "").parse::<f64>().map_err(|_parse_error| {
-		FerrosGrynnError::invalid_argument(format!("Invalid TIMEOUT duration `{value}`."))
+		FerrosGrynnError::invalid_argument(format!("Invalid {subject} duration `{value}`."))
 	})?;
 	let scale = match unit.to_ascii_lowercase().as_str() {
 		"ns" => 1.0e-9,
@@ -935,13 +1012,13 @@ fn parse_fixed_duration(value: &str) -> FerrosGrynnResult<Duration> {
 		"d" => 86_400.0,
 		_ => {
 			return Err(FerrosGrynnError::invalid_argument(format!(
-				"Unsupported TIMEOUT duration unit `{unit}`."
+				"Unsupported {subject} duration unit `{unit}`."
 			)));
 		}
 	};
 	let seconds = number * scale;
 	Duration::try_from_secs_f64(seconds).map_err(|_range_error| {
-		FerrosGrynnError::invalid_argument(format!("Invalid TIMEOUT duration `{value}`."))
+		FerrosGrynnError::invalid_argument(format!("Invalid {subject} duration `{value}`."))
 	})
 }
 
@@ -957,7 +1034,7 @@ mod tests {
 
 	#[test]
 	fn duration_at_rounded_u64_boundary_is_rejected_without_panicking() {
-		assert!(parse_fixed_duration("18446744073709551615s").is_err());
+		assert!(parse_fixed_duration("18446744073709551615s", "TIMEOUT").is_err());
 	}
 
 	#[test]

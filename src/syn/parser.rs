@@ -127,6 +127,14 @@ impl Parser<'_> {
 		let start = self.current().span;
 		let mut kind = if self.consume_keyword(keywords::EXPLAIN).is_some() {
 			StatementKind::Explain(context.run(|context| self.explain_statement(context)).await?)
+		} else if self.consume_keyword(keywords::RETURN).is_some() {
+			if self.consume_keyword(keywords::GRAPH).is_some() {
+				StatementKind::ReturnGraph(context.run(|context| self.return_graph(context)).await?)
+			} else {
+				StatementKind::Return(context.run(|context| self.return_statement(context)).await?)
+			}
+		} else if self.consume_keyword(keywords::SELECT).is_some() {
+			StatementKind::Select(context.run(|context| self.select_statement(context)).await?)
 		} else if self.consume_keyword(keywords::BEGIN).is_some() {
 			if self.consume_keyword(keywords::IMPORT).is_some() {
 				StatementKind::Import(context.run(|context| self.import_statement(context)).await?)
@@ -151,15 +159,33 @@ impl Parser<'_> {
 			StatementKind::Try(context.run(|context| self.try_statement(context)).await?)
 		} else if self.consume_keyword(keywords::THROW).is_some() {
 			StatementKind::Throw(context.run(|context| self.expression(context, 0, 1, 0)).await?)
+		} else if self.consume_keyword(keywords::SLEEP).is_some() {
+			StatementKind::Sleep(self.timeout_value()?)
 		} else if self.consume_keyword(keywords::ASSERT).is_some() {
 			StatementKind::AssertInvariants(self.assert_invariants_statement()?)
+		} else if self.consume_keyword(keywords::ANALYZE).is_some() {
+			StatementKind::Maintenance(self.analyze_statement()?)
+		} else if self.consume_keyword(keywords::REBUILD).is_some() {
+			StatementKind::Maintenance(self.rebuild_index_statement()?)
+		} else if self.consume_keyword(keywords::COMPACT).is_some() {
+			StatementKind::Maintenance(self.compact_statement()?)
+		} else if self.consume_keyword(keywords::KILL).is_some() {
+			StatementKind::Kill(self.kill_statement()?)
 		} else if self.consume_keyword(keywords::BUILD).is_some() {
 			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `BUILD`.")?;
 			StatementKind::BuildGraph(
 				context.run(|context| self.build_graph_statement(context)).await?,
 			)
 		} else if self.consume_keyword(keywords::DEFINE).is_some() {
-			if self.consume_keyword(keywords::GRAPH).is_some() {
+			if self.at_function_definition() {
+				StatementKind::DefineFunction(
+					context.run(|context| self.define_function_statement(context)).await?,
+				)
+			} else if self.consume_keyword(keywords::PARAM).is_some() {
+				StatementKind::DefineParameter(
+					context.run(|context| self.define_parameter_statement(context)).await?,
+				)
+			} else if self.consume_keyword(keywords::GRAPH).is_some() {
 				StatementKind::DefineGraph(
 					context.run(|context| self.define_graph_statement(context)).await?,
 				)
@@ -200,7 +226,13 @@ impl Parser<'_> {
 		} else if self.consume_keyword(keywords::REMOVE).is_some() {
 			StatementKind::Remove(self.remove_statement()?)
 		} else if self.consume_keyword(keywords::ALTER).is_some() {
-			StatementKind::Alter(self.alter_statement()?)
+			if self.consume_keyword(keywords::DATABASE).is_some()
+				|| self.consume_keyword(keywords::DB).is_some()
+			{
+				StatementKind::Maintenance(self.alter_database_compact_statement()?)
+			} else {
+				StatementKind::Alter(context.run(|context| self.alter_statement(context)).await?)
+			}
 		} else if self.consume_keyword(keywords::INFO).is_some() {
 			StatementKind::Info(self.info_statement()?)
 		} else if self.consume_keyword(keywords::LET).is_some() {
@@ -210,14 +242,6 @@ impl Parser<'_> {
 			StatementKind::Match(context.run(|context| self.match_statement(context, true)).await?)
 		} else if self.consume_keyword(keywords::MATCH).is_some() {
 			StatementKind::Match(context.run(|context| self.match_statement(context, false)).await?)
-		} else if self.consume_keyword(keywords::RETURN).is_some() {
-			if self.consume_keyword(keywords::GRAPH).is_some() {
-				StatementKind::ReturnGraph(context.run(|context| self.return_graph(context)).await?)
-			} else {
-				StatementKind::Return(context.run(|context| self.return_statement(context)).await?)
-			}
-		} else if self.consume_keyword(keywords::SELECT).is_some() {
-			StatementKind::Select(context.run(|context| self.select_statement(context)).await?)
 		} else if self.consume_keyword(keywords::TRAVERSE).is_some() {
 			StatementKind::Traverse(context.run(|context| self.traverse_statement(context)).await?)
 		} else if let Some(feature) = self.unsupported_statement() {
@@ -823,9 +847,33 @@ impl Parser<'_> {
 			};
 			if let Some(open) = self.consume_symbol(Symbol::LeftParen) {
 				let distinct = self.consume_keyword(keywords::DISTINCT).is_some();
+				let mut argument_names = Vec::new();
 				let mut arguments = Vec::new();
+				let mut saw_named_argument = false;
 				if !self.at_symbol(Symbol::RightParen) {
 					loop {
+						let argument_name = if matches!(self.current().kind, TokenKind::Word { .. })
+							&& matches!(self.tokens.peek(1).kind, TokenKind::Symbol(Symbol::Equal))
+						{
+							let name = self.identifier()?;
+							self.tokens.next();
+							if argument_names.iter().flatten().any(|existing: &Identifier| {
+								existing.value.eq_ignore_ascii_case(name.value.as_ref())
+							}) {
+								return Err(self.syntax("Duplicate named argument.", name.span));
+							}
+							saw_named_argument = true;
+							Some(name)
+						} else {
+							if saw_named_argument {
+								return Err(self.syntax(
+									"Positional arguments must precede named arguments.",
+									self.current().span,
+								));
+							}
+							None
+						};
+						argument_names.push(argument_name);
 						arguments.push(
 							context
 								.run(|context| self.expression(context, 0, depth + 1, object_depth))
@@ -843,6 +891,7 @@ impl Parser<'_> {
 						callee: Box::new(base),
 						type_argument,
 						distinct,
+						argument_names,
 						arguments,
 					},
 				}));

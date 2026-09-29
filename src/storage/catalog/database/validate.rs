@@ -1,10 +1,10 @@
-//! Cross-entry validation for one decoded `FGDC v9` payload.
+//! Cross-entry validation for one decoded `FGDC v10` payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{DatabaseCatalog, PhysicalIndexBinding, codec::invalid};
 use crate::{
-	datastore::{ClassIndexKind, ClassIndexState, IndexScope, SchemaId},
+	datastore::{ClassIndexKind, ClassIndexState, IndexMaintenanceMode, IndexScope, SchemaId},
 	gql_status::FerrosGrynnResult,
 	graph::{GraphKind, GraphStorageMode},
 	storage::{page::PageNo, types::DataFileKind},
@@ -83,6 +83,11 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 				}
 				_ => {}
 			}
+			if index.maintenance == IndexMaintenanceMode::Deferred
+				&& index.kind == ClassIndexKind::Unique
+			{
+				return Err(invalid("Unique index cannot use deferred maintenance"));
+			}
 			let mut keys = BTreeSet::new();
 			if index.fields.iter().any(|key| !field_keys.contains(key) || !keys.insert(*key)) {
 				return Err(invalid("class index references an absent or duplicate field"));
@@ -96,6 +101,9 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			}
 			if index.state == ClassIndexState::Ready && index.physical.is_none() {
 				return Err(invalid("ready class index has no physical binding"));
+			}
+			if index.state == ClassIndexState::Ready && index.build_revision == 0 {
+				return Err(invalid("ready class index has no published build revision"));
 			}
 			if let Some(binding) = index.physical {
 				validate_binding(binding)?;
@@ -225,10 +233,47 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			|| parameter.name.is_empty()
 			|| parameter.name.as_str().contains('\0')
 			|| parameter.value.is_empty()
+			|| parameter.comment.as_ref().is_some_and(|comment| comment.as_str().contains('\0'))
 		{
 			return Err(invalid("parameter catalog ordering or value is invalid"));
 		}
 		previous_parameter = Some(parameter.name.as_str());
+	}
+
+	let mut previous_function = None;
+	let mut function_signatures = BTreeSet::new();
+	for function in &catalog.functions {
+		insert_schema(&mut schema_ids, function.id.into(), catalog.next_schema_id)?;
+		if previous_function.is_some_and(|previous| previous >= function.id)
+			|| function.published_at == 0
+			|| function.namespace.as_str() != "fn"
+			|| function.name.is_empty()
+			|| function.name.as_str().contains('\0')
+			|| function.body.is_empty()
+			|| function.body.as_str().contains('\0')
+			|| function.max_depth.is_some_and(|depth| !(1..=64).contains(&depth))
+			|| function.cost && function.effect != crate::datastore::FunctionEffect::Pure
+			|| function.comment.as_ref().is_some_and(|comment| comment.as_str().contains('\0'))
+		{
+			return Err(invalid("function catalog identity or metadata is invalid"));
+		}
+		let mut parameter_names = BTreeSet::new();
+		if function.parameters.iter().any(|parameter| {
+			parameter.name.is_empty()
+				|| parameter.name.as_str().contains('\0')
+				|| !parameter_names.insert(parameter.name.as_str())
+		}) {
+			return Err(invalid("function parameters are invalid or duplicated"));
+		}
+		let signature = (
+			function.namespace.as_str(),
+			function.name.as_str(),
+			function.parameters.iter().map(|parameter| &parameter.value_type).collect::<Vec<_>>(),
+		);
+		if !function_signatures.insert(signature) {
+			return Err(invalid("function overload signature is duplicated"));
+		}
+		previous_function = Some(function.id);
 	}
 	Ok(())
 }

@@ -102,6 +102,10 @@ pub struct SelectOrder {
 	pub expression: Expr,
 	/// Special versioned stable-row hash ordering requested by `RAND()`.
 	pub random: bool,
+	/// Root Unicode collation with primary strength.
+	pub collate: bool,
+	/// Numeric comparison of digit sequences in strings.
+	pub numeric: bool,
 	pub direction: SelectOrderDirection,
 	pub nulls: SelectNulls,
 }
@@ -439,11 +443,27 @@ impl Parser<'_> {
 		loop {
 			let expression = context.run(|context| self.expression(context, 0, 1, 0)).await?;
 			let random = select_order_is_rand(&expression);
-			if self.at_keyword("COLLATE") {
-				return Err(self.unsupported("ORDER BY COLLATE", self.current().span));
+			let mut collate = false;
+			let mut numeric = false;
+			while self.at_keyword("COLLATE") || self.at_keyword("NUMERIC") {
+				if let Some(token) = self.consume_keyword("COLLATE") {
+					if std::mem::replace(&mut collate, true) {
+						return Err(
+							self.syntax("COLLATE may appear only once per ORDER item.", token.span)
+						);
+					}
+				} else if let Some(token) = self.consume_keyword("NUMERIC")
+					&& std::mem::replace(&mut numeric, true)
+				{
+					return Err(
+						self.syntax("NUMERIC may appear only once per ORDER item.", token.span)
+					);
+				}
 			}
-			if self.at_keyword("NUMERIC") {
-				return Err(self.unsupported("ORDER BY NUMERIC", self.current().span));
+			if random && (collate || numeric) {
+				return Err(
+					self.syntax("RAND() ordering cannot use COLLATE or NUMERIC.", expression.span)
+				);
 			}
 			let direction = if self.consume_keyword(keywords::DESC).is_some() {
 				SelectOrderDirection::Descending
@@ -464,6 +484,8 @@ impl Parser<'_> {
 			order.push(SelectOrder {
 				expression,
 				random,
+				collate,
+				numeric,
 				direction,
 				nulls,
 			});

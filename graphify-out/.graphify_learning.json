@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-28T12:46:05.279775+00:00",
+  "generated_at": "2026-09-28T22:29:59.085085+00:00",
   "nodes": {
     "agents_design_authority": {
       "code_fingerprint": "a348f251e7527b1e4de975c2638577066f1a9ae6e02dd57968884cb9f9325628",
@@ -12,24 +12,8 @@
           "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.586242981,
+      "score": 0.580776314,
       "source_file": "AGENTS.md",
-      "status": "tentative",
-      "uses": 1
-    },
-    "crates_fg_meta_src_io_async_asyncio": {
-      "code_fingerprint": "d68e39c803958c597740f9444dcc5d7b65010eb6c978fcb3a6502cb951e9f5d1",
-      "label": "AsyncIo",
-      "last": "2026-08-30T17:23:47.115005+00:00",
-      "provenance": [
-        {
-          "date": "2026-08-30T17:23:47.115005+00:00",
-          "outcome": "useful",
-          "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
-        }
-      ],
-      "score": 0.513971942,
-      "source_file": "crates/fg-meta/src/io_async.rs",
       "status": "tentative",
       "uses": 1
     },
@@ -44,7 +28,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.513971942,
+      "score": 0.509179197,
       "source_file": "crates/surrealdb/surrealdb/core/src/idx/ft/fulltext.rs",
       "status": "tentative",
       "uses": 1
@@ -60,7 +44,7 @@
           "q": "Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
         }
       ],
-      "score": 0.586242981,
+      "score": 0.580776314,
       "source_file": "docs/storage_engine_hybrid_integration_plan.md",
       "status": "tentative",
       "uses": 1
@@ -76,7 +60,7 @@
           "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
         }
       ],
-      "score": 0.513971942,
+      "score": 0.509179197,
       "source_file": "src/gql/execution/cursor/path.rs",
       "status": "tentative",
       "uses": 1
@@ -92,8 +76,24 @@
           "q": "What is MetaGraph?"
         }
       ],
-      "score": 0.322045491,
+      "score": 0.319042443,
       "source_file": "src/graph/metagraph.rs",
+      "status": "tentative",
+      "uses": 1
+    },
+    "src_graph_traversal_index_traversalindex": {
+      "code_fingerprint": "a0d89b9a47673634f6586f4bd47aba3df83434d3e8d8ea3e502f01e7e34a3c31",
+      "label": "TraversalIndex",
+      "last": "2026-08-30T17:23:47.115005+00:00",
+      "provenance": [
+        {
+          "date": "2026-08-30T17:23:47.115005+00:00",
+          "outcome": "useful",
+          "q": "Переделать анализ крейтов и кода как прогноз будущей применимости на основе всех спецификаций, сохранив старый отчёт и создав новый в docs/reports."
+        }
+      ],
+      "score": 0.509179197,
+      "source_file": "src/graph/traversal/index.rs",
       "status": "tentative",
       "uses": 1
     },
@@ -108,7 +108,7 @@
           "q": "Добавить точный layout label entry page и typed node/edge label key в combined statistics"
         }
       ],
-      "score": 0.682775177,
+      "score": 0.676408355,
       "source_file": "src/storage/graph_index/label_dict.rs",
       "status": "tentative",
       "uses": 1
@@ -124,7 +124,7 @@
           "q": "Добавить точный layout label entry page и typed node/edge label key в combined statistics"
         }
       ],
-      "score": 0.682775177,
+      "score": 0.676408355,
       "source_file": "src/storage/graph_index/label_dict.rs",
       "status": "tentative",
       "uses": 1
@@ -140,7 +140,7 @@
           "q": "Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
         }
       ],
-      "score": 0.4926226,
+      "score": 0.488028935,
       "source_file": "src/values/runtime/value.rs",
       "status": "tentative",
       "uses": 1

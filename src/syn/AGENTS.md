@@ -31,7 +31,8 @@ state. Он не выполняет запросы и не разрешает sc
 - Syntax errors создаются через `gql_status`; semantic validation принадлежит
   `gql::analysis`.
 - `stmt/schema.rs` владеет core `DEFINE`/`REMOVE`/`ALTER` для
-  `GRAPH|CLASS|FIELD|INDEX` и `INFO FOR DB|CLASS|INDEX`.
+  `GRAPH|CLASS|FIELD|INDEX|PARAM|FUNCTION` и schema `INFO`; `stmt/maintenance.rs`
+  владеет `ANALYZE`/`REBUILD`/`COMPACT`/`KILL` и их bounded options.
 - `stmt/dml.rs`, `stmt/graph_dml.rs` и `stmt/match.rs` разделяют direct atom
   DML, graph occurrence DML и pattern grammar. `RecordId` selector, alias,
   optional label и `IN GRAPH` не должны сливаться в один syntax field.
@@ -39,6 +40,9 @@ state. Он не выполняет запросы и не разрешает sc
   parser не поддерживается.
 - Неподдерживаемые DDL/DML clauses завершаются явной диагностикой, а не создают
   speculative AST variants.
+- Именованные аргументы допускаются только после positional; duplicate name и positional после
+  named отклоняются до analysis. Signature qualifier UDF содержит только declared argument
+  types и не использует return type как overload discriminator.
 
 ## Проверка
 

@@ -101,7 +101,14 @@ pub(super) use count_idx::{
 	stamp_count_index_lsn,
 };
 pub(super) use external_sort::cleanup_external_index_sort;
-pub(crate) use external_sort::{ExternalIndexSorter, SortedIndexRecords};
+pub(crate) use external_sort::{
+	ExternalIndexSorter,
+	SortedIndexRecords,
+	check_external_sort_cancelled,
+	external_sort_metrics,
+	with_external_sort_control,
+	with_external_sort_options,
+};
 pub(super) use label_dict::{
 	LabelDictionary,
 	LabelKind,

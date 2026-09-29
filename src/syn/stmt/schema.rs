@@ -89,12 +89,83 @@ pub struct DefineIndexStatement {
 	pub class: Identifier,
 	pub definition: BasicIndexDefinition,
 	pub scope: IndexScopeName,
+	pub concurrently: bool,
+	pub deferred: bool,
+}
+
+/// Durable database-parameter definition.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct DefineParameterStatement {
+	pub mode: DefinitionMode,
+	pub name: Identifier,
+	pub value: Expr,
+	pub comment: Option<Box<str>>,
+}
+
+/// Parsed effect annotation of a named function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FunctionEffectName {
+	Pure,
+	Stable,
+	Impure,
+}
+
+/// One named argument in a function definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FunctionParameterDefinition {
+	pub name: Identifier,
+	pub value_type: TypeName,
+}
+
+/// Qualified function name with an optional exact overload signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FunctionSignatureName {
+	pub namespace: Identifier,
+	pub name: Identifier,
+	pub parameters: Option<Vec<TypeName>>,
+}
+
+/// Durable named-function definition.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct DefineFunctionStatement {
+	pub mode: DefinitionMode,
+	pub effect: FunctionEffectName,
+	pub cost: bool,
+	pub namespace: Identifier,
+	pub name: Identifier,
+	pub parameters: Vec<FunctionParameterDefinition>,
+	pub result_type: Option<TypeName>,
+	pub max_depth: Option<u8>,
+	pub body: Block,
+	pub comment: Option<Box<str>>,
+}
+
+/// Optional durable comment update for `ALTER PARAM`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParameterCommentChange {
+	Keep,
+	Set(Box<str>),
+	Drop,
 }
 
 /// Core schema object accepted by `REMOVE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RemoveTarget {
+	Function {
+		if_exists: bool,
+		signature: FunctionSignatureName,
+	},
+	Parameter {
+		if_exists: bool,
+		name: Identifier,
+	},
 	Graph {
 		if_exists: bool,
 		name: Identifier,
@@ -123,9 +194,24 @@ pub struct RemoveStatement {
 }
 
 /// Supported `ALTER` operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AlterTarget {
+	Function {
+		if_exists: bool,
+		signature: FunctionSignatureName,
+		effect: Option<FunctionEffectName>,
+		cost: Option<bool>,
+		max_depth: Option<Option<u8>>,
+		body: Option<Block>,
+		comment: ParameterCommentChange,
+	},
+	Parameter {
+		if_exists: bool,
+		name: Identifier,
+		value: Option<Expr>,
+		comment: ParameterCommentChange,
+	},
 	Class {
 		if_exists: bool,
 		name: Identifier,
@@ -144,7 +230,7 @@ pub enum AlterTarget {
 }
 
 /// Core `ALTER` statement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AlterStatement {
 	pub target: AlterTarget,
@@ -155,6 +241,10 @@ pub struct AlterStatement {
 #[non_exhaustive]
 pub enum InfoTarget {
 	Database,
+	Function(FunctionSignatureName),
+	Parameter(Identifier),
+	Job(Identifier),
+	Jobs,
 	Class(Identifier),
 	Index {
 		name: Identifier,
@@ -170,6 +260,87 @@ pub struct InfoStatement {
 }
 
 impl Parser<'_> {
+	pub(in crate::syn) async fn define_function_statement(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<DefineFunctionStatement> {
+		let effect = self.function_effect().unwrap_or(FunctionEffectName::Impure);
+		let cost = self.consume_keyword(keywords::COST).is_some();
+		self.expect_keyword(keywords::FUNCTION, "Expected `FUNCTION` after function modifiers.")?;
+		let mode = self.definition_mode()?;
+		let (namespace, name) = self.qualified_function_name()?;
+		let open = self.expect_symbol(Symbol::LeftParen, "Expected `(` after function name.")?;
+		let mut parameters = Vec::new();
+		if !self.at_symbol(Symbol::RightParen) {
+			loop {
+				let name = match self.current().kind {
+					TokenKind::Parameter(_) => self.parameter()?,
+					_ => self.identifier()?,
+				};
+				self.expect_symbol(Symbol::Colon, "Expected `:` after function parameter.")?;
+				parameters.push(FunctionParameterDefinition {
+					name,
+					value_type: self.type_name()?,
+				});
+				if self.consume_symbol(Symbol::Comma).is_none() {
+					break;
+				}
+			}
+		}
+		self.close(Symbol::RightParen, open.span, "`)`")?;
+		let result_type = if self.consume_symbol(Symbol::ArrowRight).is_some() {
+			Some(self.type_name()?)
+		} else {
+			None
+		};
+		let max_depth = if self.consume_keyword(keywords::MAXDEPTH).is_some() {
+			Some(self.function_max_depth()?)
+		} else {
+			None
+		};
+		let body = context.run(|context| self.block(context)).await?;
+		let comment = if self.consume_keyword(keywords::COMMENT).is_some() {
+			Some(self.string_value("Expected a string after `COMMENT`.")?)
+		} else {
+			None
+		};
+		self.expect_statement_end("DEFINE FUNCTION")?;
+		Ok(DefineFunctionStatement {
+			mode,
+			effect,
+			cost,
+			namespace,
+			name,
+			parameters,
+			result_type,
+			max_depth,
+			body,
+			comment,
+		})
+	}
+
+	pub(in crate::syn) async fn define_parameter_statement(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<DefineParameterStatement> {
+		let mode = self.definition_mode()?;
+		let name = self.parameter()?;
+		self.expect_keyword(keywords::VALUE, "Expected `VALUE` after parameter name.")?;
+		let value = context.run(|context| self.expression(context, 0, 1, 0)).await?;
+		let comment = if self.consume_keyword(keywords::COMMENT).is_some() {
+			Some(self.string_value("Expected a string after `COMMENT`.")?)
+		} else {
+			None
+		};
+		self.expect_statement_end("DEFINE PARAM")?;
+		Ok(DefineParameterStatement {
+			mode,
+			name,
+			value,
+			comment,
+		})
+	}
+
 	pub(in crate::syn) async fn define_graph_statement(
 		&mut self,
 		context: &mut Stk,
@@ -351,9 +522,25 @@ impl Parser<'_> {
 				self.syntax("Expected `BASE` or `EFFECTIVE` after `SCOPE`.", self.current().span)
 			);
 		};
-		if !self.at_statement_end() {
-			let feature = self.current_word().unwrap_or("DEFINE INDEX clause");
-			return Err(self.unsupported(feature, self.current().span));
+		let mut concurrently = false;
+		let mut deferred = false;
+		while !self.at_statement_end() {
+			if self.consume_keyword(keywords::CONCURRENTLY).is_some() {
+				if concurrently {
+					return Err(
+						self.syntax("CONCURRENTLY may appear only once.", self.previous_span())
+					);
+				}
+				concurrently = true;
+			} else if self.consume_keyword(keywords::DEFER).is_some() {
+				if deferred {
+					return Err(self.syntax("DEFER may appear only once.", self.previous_span()));
+				}
+				deferred = true;
+			} else {
+				let feature = self.current_word().unwrap_or("DEFINE INDEX clause");
+				return Err(self.unsupported(feature, self.current().span));
+			}
 		}
 		Ok(DefineIndexStatement {
 			mode,
@@ -361,11 +548,25 @@ impl Parser<'_> {
 			class,
 			definition,
 			scope,
+			concurrently,
+			deferred,
 		})
 	}
 
 	pub(in crate::syn) fn remove_statement(&mut self) -> FerrosGrynnResult<RemoveStatement> {
-		let target = if self.consume_keyword(keywords::GRAPH).is_some() {
+		let target = if self.consume_keyword(keywords::FUNCTION).is_some() {
+			let if_exists = self.if_exists()?;
+			RemoveTarget::Function {
+				if_exists,
+				signature: self.function_signature_name()?,
+			}
+		} else if self.consume_keyword(keywords::PARAM).is_some() {
+			let if_exists = self.if_exists()?;
+			RemoveTarget::Parameter {
+				if_exists,
+				name: self.parameter()?,
+			}
+		} else if self.consume_keyword(keywords::GRAPH).is_some() {
 			let if_exists = self.if_exists()?;
 			RemoveTarget::Graph {
 				if_exists,
@@ -405,8 +606,118 @@ impl Parser<'_> {
 		})
 	}
 
-	pub(in crate::syn) fn alter_statement(&mut self) -> FerrosGrynnResult<AlterStatement> {
-		let target = if self.consume_keyword(keywords::CLASS).is_some() {
+	pub(in crate::syn) async fn alter_statement(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<AlterStatement> {
+		let target = if self.consume_keyword(keywords::FUNCTION).is_some() {
+			let if_exists = self.if_exists()?;
+			let signature = self.function_signature_name()?;
+			let effect = self.function_effect();
+			let cost = if self.consume_keyword(keywords::COST).is_some() {
+				Some(true)
+			} else if self.at_keyword(keywords::DROP) && self.peek_keyword(1, keywords::COST) {
+				self.tokens.next();
+				self.expect_keyword(keywords::COST, "Expected `COST` after `DROP`.")?;
+				Some(false)
+			} else {
+				None
+			};
+			let max_depth = if self.consume_keyword(keywords::MAXDEPTH).is_some() {
+				Some(Some(self.function_max_depth()?))
+			} else if self.at_keyword(keywords::DROP) && self.peek_keyword(1, keywords::MAXDEPTH) {
+				self.tokens.next();
+				self.expect_keyword(keywords::MAXDEPTH, "Expected `MAXDEPTH` after `DROP`.")?;
+				Some(None)
+			} else {
+				None
+			};
+			let body = if self.at_symbol(Symbol::LeftBrace) {
+				Some(context.run(|context| self.block(context)).await?)
+			} else {
+				None
+			};
+			let comment = if self.consume_keyword(keywords::COMMENT).is_some() {
+				ParameterCommentChange::Set(
+					self.string_value("Expected a string after `COMMENT`.")?,
+				)
+			} else if self.at_keyword(keywords::DROP) && self.peek_keyword(1, keywords::COMMENT) {
+				self.tokens.next();
+				self.expect_keyword(keywords::COMMENT, "Expected `COMMENT` after `DROP`.")?;
+				ParameterCommentChange::Drop
+			} else {
+				ParameterCommentChange::Keep
+			};
+			if effect.is_none()
+				&& cost.is_none()
+				&& max_depth.is_none()
+				&& body.is_none()
+				&& comment == ParameterCommentChange::Keep
+			{
+				return Err(self.syntax(
+					"ALTER FUNCTION requires an effect, COST, MAXDEPTH, body, or COMMENT change.",
+					self.current().span,
+				));
+			}
+			AlterTarget::Function {
+				if_exists,
+				signature,
+				effect,
+				cost,
+				max_depth,
+				body,
+				comment,
+			}
+		} else if self.consume_keyword(keywords::PARAM).is_some() {
+			let if_exists = self.if_exists()?;
+			let name = self.parameter()?;
+			let mut value = None;
+			let mut comment = ParameterCommentChange::Keep;
+			while !self.at_statement_end() {
+				if self.consume_keyword(keywords::VALUE).is_some() {
+					if value.is_some() {
+						return Err(self.syntax(
+							"ALTER PARAM VALUE may appear only once.",
+							self.previous_span(),
+						));
+					}
+					value = Some(context.run(|context| self.expression(context, 0, 1, 0)).await?);
+				} else if self.consume_keyword(keywords::COMMENT).is_some() {
+					if comment != ParameterCommentChange::Keep {
+						return Err(self.syntax(
+							"ALTER PARAM COMMENT may appear only once.",
+							self.previous_span(),
+						));
+					}
+					comment = ParameterCommentChange::Set(
+						self.string_value("Expected a string after `COMMENT`.")?,
+					);
+				} else if self.consume_keyword(keywords::DROP).is_some() {
+					self.expect_keyword(keywords::COMMENT, "Expected `COMMENT` after `DROP`.")?;
+					if comment != ParameterCommentChange::Keep {
+						return Err(self.syntax(
+							"ALTER PARAM COMMENT may appear only once.",
+							self.previous_span(),
+						));
+					}
+					comment = ParameterCommentChange::Drop;
+				} else {
+					return Err(self.syntax("Unexpected ALTER PARAM clause.", self.current().span));
+				}
+			}
+			if value.is_none() && comment == ParameterCommentChange::Keep {
+				return Err(self.syntax(
+					"ALTER PARAM requires VALUE, COMMENT, or DROP COMMENT.",
+					self.current().span,
+				));
+			}
+			AlterTarget::Parameter {
+				if_exists,
+				name,
+				value,
+				comment,
+			}
+		} else if self.consume_keyword(keywords::CLASS).is_some() {
 			let if_exists = self.if_exists()?;
 			let name = self.identifier()?;
 			let schema_mode = if self.consume_keyword(keywords::SCHEMAFULL).is_some() {
@@ -466,6 +777,14 @@ impl Parser<'_> {
 		self.expect_keyword(keywords::FOR, "Expected `FOR` after `INFO`.")?;
 		let target = if self.consume_keyword(keywords::DB).is_some() {
 			InfoTarget::Database
+		} else if self.consume_keyword(keywords::FUNCTION).is_some() {
+			InfoTarget::Function(self.function_signature_name()?)
+		} else if self.consume_keyword(keywords::PARAM).is_some() {
+			InfoTarget::Parameter(self.parameter()?)
+		} else if self.consume_keyword(keywords::JOB).is_some() {
+			InfoTarget::Job(self.parameter()?)
+		} else if self.consume_keyword(keywords::JOBS).is_some() {
+			InfoTarget::Jobs
 		} else if self.consume_keyword(keywords::CLASS).is_some() {
 			InfoTarget::Class(self.identifier()?)
 		} else if self.consume_keyword(keywords::INDEX).is_some() {
@@ -497,7 +816,7 @@ impl Parser<'_> {
 		Ok(DefinitionMode::Normal)
 	}
 
-	fn if_exists(&mut self) -> FerrosGrynnResult<bool> {
+	pub(in crate::syn) fn if_exists(&mut self) -> FerrosGrynnResult<bool> {
 		if self.consume_keyword(keywords::IF).is_none() {
 			return Ok(false);
 		}
@@ -505,7 +824,7 @@ impl Parser<'_> {
 		Ok(true)
 	}
 
-	fn on_class(&mut self) -> FerrosGrynnResult<Identifier> {
+	pub(in crate::syn) fn on_class(&mut self) -> FerrosGrynnResult<Identifier> {
 		self.expect_keyword(keywords::ON, "Expected `ON CLASS` before class name.")?;
 		self.expect_keyword(keywords::CLASS, "Expected `CLASS` after `ON`.")?;
 		self.identifier()
@@ -515,7 +834,7 @@ impl Parser<'_> {
 		self.at_eof() || self.at_symbol(Symbol::Semicolon)
 	}
 
-	fn expect_statement_end(&self, statement: &str) -> FerrosGrynnResult<()> {
+	pub(in crate::syn) fn expect_statement_end(&self, statement: &str) -> FerrosGrynnResult<()> {
 		if self.at_statement_end() {
 			Ok(())
 		} else {
@@ -531,5 +850,77 @@ impl Parser<'_> {
 			} => Some(value),
 			_ => None,
 		}
+	}
+
+	fn string_value(&mut self, message: &str) -> FerrosGrynnResult<Box<str>> {
+		let token = self.tokens.next();
+		match token.kind {
+			TokenKind::String(value) => Ok(value),
+			_ => Err(self.syntax(message, token.span)),
+		}
+	}
+
+	pub(in crate::syn) fn at_function_definition(&self) -> bool {
+		[keywords::PURE, keywords::STABLE, keywords::IMPURE, keywords::COST, keywords::FUNCTION]
+			.iter()
+			.any(|keyword| self.at_keyword(keyword))
+	}
+
+	fn function_effect(&mut self) -> Option<FunctionEffectName> {
+		if self.consume_keyword(keywords::PURE).is_some() {
+			Some(FunctionEffectName::Pure)
+		} else if self.consume_keyword(keywords::STABLE).is_some() {
+			Some(FunctionEffectName::Stable)
+		} else if self.consume_keyword(keywords::IMPURE).is_some() {
+			Some(FunctionEffectName::Impure)
+		} else {
+			None
+		}
+	}
+
+	fn qualified_function_name(&mut self) -> FerrosGrynnResult<(Identifier, Identifier)> {
+		let namespace = self.identifier()?;
+		self.expect_symbol(Symbol::DoubleColon, "Expected `::` in a function name.")?;
+		let name = self.identifier()?;
+		Ok((namespace, name))
+	}
+
+	fn function_signature_name(&mut self) -> FerrosGrynnResult<FunctionSignatureName> {
+		let (namespace, name) = self.qualified_function_name()?;
+		let parameters = if let Some(open) = self.consume_symbol(Symbol::LeftParen) {
+			let mut parameters = Vec::new();
+			if !self.at_symbol(Symbol::RightParen) {
+				loop {
+					parameters.push(self.type_name()?);
+					if self.consume_symbol(Symbol::Comma).is_none() {
+						break;
+					}
+				}
+			}
+			self.close(Symbol::RightParen, open.span, "`)`")?;
+			Some(parameters)
+		} else {
+			None
+		};
+		Ok(FunctionSignatureName {
+			namespace,
+			name,
+			parameters,
+		})
+	}
+
+	fn function_max_depth(&mut self) -> FerrosGrynnResult<u8> {
+		let token = self.tokens.next();
+		let TokenKind::Number(value) = token.kind else {
+			return Err(self.syntax("Expected MAXDEPTH in 1..=64.", token.span));
+		};
+		let depth = value
+			.replace('_', "")
+			.parse::<u8>()
+			.map_err(|_error| self.syntax("Expected MAXDEPTH in 1..=64.", token.span))?;
+		if !(1..=64).contains(&depth) {
+			return Err(self.syntax("Expected MAXDEPTH in 1..=64.", token.span));
+		}
+		Ok(depth)
 	}
 }

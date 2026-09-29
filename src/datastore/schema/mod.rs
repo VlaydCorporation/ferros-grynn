@@ -13,9 +13,13 @@ mod mutation;
 
 pub use catalog::{
 	ClassId,
+	FunctionEffect,
+	FunctionId,
 	GraphSchema,
 	IndexId,
 	SchemaCatalog,
+	SchemaFunction,
+	SchemaFunctionParameter,
 	SchemaId,
 	SchemaParameter,
 	SchemaVersion,
@@ -24,4 +28,4 @@ pub use catalog::{
 };
 pub use class::{ClassSchema, ClassSchemaMode};
 pub use field::ClassField;
-pub use index::{ClassIndex, ClassIndexKind, ClassIndexState, IndexScope};
+pub use index::{ClassIndex, ClassIndexKind, ClassIndexState, IndexMaintenanceMode, IndexScope};

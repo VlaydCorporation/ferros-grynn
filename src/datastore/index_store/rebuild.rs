@@ -12,14 +12,19 @@ use crate::{
 pub(crate) fn rebuild_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<IndexStoreRoot> {
 	let mut indexes = IndexStoreRoot::default();
 	for graph in database.schema.all_graphs() {
+		crate::storage::check_external_sort_cancelled()?;
 		indexes.register_graph(graph.id())?;
 	}
 	for class in database.schema.classes() {
+		crate::storage::check_external_sort_cancelled()?;
 		indexes.register_class(class)?;
 	}
 
 	let mut context = index_context(&database.schema, &database.dictionary)?;
-	for atom in database.atoms.atoms() {
+	for (ordinal, atom) in database.atoms.atoms().enumerate() {
+		if ordinal % 1024 == 0 {
+			crate::storage::check_external_sort_cancelled()?;
+		}
 		let class = database
 			.schema
 			.class_by_id(atom.class_id())
@@ -28,7 +33,11 @@ pub(crate) fn rebuild_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<
 		indexes.apply_base_insert(prepared, atom.id())?;
 	}
 	for (graph_id, graph) in &database.graphs {
-		for occurrence in graph.occurrences() {
+		crate::storage::check_external_sort_cancelled()?;
+		for (ordinal, occurrence) in graph.occurrences().enumerate() {
+			if ordinal % 1024 == 0 {
+				crate::storage::check_external_sort_cancelled()?;
+			}
 			let atom = database
 				.atom(occurrence.global_id())
 				.ok_or_else(|| invalid("graph occurrence references an absent base atom"))?;

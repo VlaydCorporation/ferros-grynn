@@ -164,6 +164,10 @@ pub enum DataFileKind {
 	ClassStatistics = 0x13,
 	/// Database-global append-only property-key dictionary.
 	PropertyDictionary = 0x14,
+	/// Durable database-level maintenance-job catalog.
+	JobCatalog = 0x15,
+	/// Immutable rejected-item set produced by one successful import.
+	ImportQuarantine = 0x16,
 }
 
 impl DataFileKind {
@@ -214,6 +218,10 @@ impl DataFileKind {
 			Some(Self::ClassStatistics)
 		} else if value == Self::PropertyDictionary.get() {
 			Some(Self::PropertyDictionary)
+		} else if value == Self::JobCatalog.get() {
+			Some(Self::JobCatalog)
+		} else if value == Self::ImportQuarantine.get() {
+			Some(Self::ImportQuarantine)
 		} else {
 			None
 		}
@@ -379,7 +387,15 @@ mod tests {
 			DataFileId::from_raw(0x14).and_then(DataFileId::kind),
 			Some(DataFileKind::PropertyDictionary)
 		);
-		assert!(DataFileId::from_raw(0x15).is_none());
+		assert_eq!(
+			DataFileId::from_raw(0x15).and_then(DataFileId::kind),
+			Some(DataFileKind::JobCatalog)
+		);
+		assert_eq!(
+			DataFileId::from_raw(0x16).and_then(DataFileId::kind),
+			Some(DataFileKind::ImportQuarantine)
+		);
+		assert!(DataFileId::from_raw(0x17).is_none());
 	}
 
 	/// Page keys keep database storage distinct from every graph address space.

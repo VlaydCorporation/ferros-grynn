@@ -499,6 +499,14 @@ fn collect_expr(
 				collect_expr(Some(argument), owners, demand);
 			}
 		}
+		TypedExprKind::NamedInvoke {
+			arguments,
+			..
+		} => {
+			for argument in arguments {
+				collect_expr(Some(argument), owners, demand);
+			}
+		}
 		TypedExprKind::Aggregate {
 			argument,
 			..

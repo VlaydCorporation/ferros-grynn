@@ -24,6 +24,14 @@ harness = false
 name = "atom_model"
 harness = false
 
+[[bench]]
+name = "gql_stage_common"
+harness = false
+
+[[bench]]
+name = "gql_stage20_21"
+harness = false
+
 [dependencies]
 ferros-grynn = { workspace = true, default-features = false }
 

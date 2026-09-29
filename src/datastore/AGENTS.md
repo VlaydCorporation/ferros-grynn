@@ -26,7 +26,14 @@ indexes и schema одним storage snapshot.
 - `transaction` — private root, FCW/SSI validation, bounded fanout preflight и
   replay непересекающихся writes поверх актуального root;
 - `store` — datastore owner, ID clocks и один commit mutex;
-- `options`/`consts` — transaction и будущие local-storage resource limits.
+- `options`/`consts` — transaction, import и maintenance resource limits;
+- `maintenance` — один durable FIFO coordinator, job reconciliation, cancellation и
+  bounded недолговечная очередь deferred-index invalidations.
+
+Final maintenance counters сначала обновляются в coordinator state и
+персистируются вместе с обязательным переходом `Publishing`; отдельный
+metadata-COW только ради progress запрещён, поскольку crash до publication
+всё равно требует rebuild candidate.
 
 ## Инварианты
 
@@ -80,6 +87,15 @@ indexes и schema одним storage snapshot.
 - `LocalOptions` является единственной construction authority локального
   backend. `local_storage_status()` только наблюдает effective budgets и
   pressure; environment variables не переопределяют параметры экземпляра.
+- Deferred Standard/Count index становится `Stale` атомарно с primary mutation.
+  Stale binding не является query candidate; forced hint ошибочен, обычный planner
+  использует exact scan. Потеря недолговечной pending queue после crash означает full rebuild,
+  а не повторное использование stale rows.
+- Maintenance publication сверяет target/version/source revision под commit lock.
+  Durable job ledger не является доказательством готовности binding; `Ready` публикуется только
+  вместе с exact physical binding. Один datastore исполняет не более одного тяжёлого job.
+- Durable PARAM и FUNCTION используют общий schema clock. Function overload identity включает
+  declared parameter types; compiled cache ключуется `FunctionId`, version и schema epoch.
 
 ## Проверка
 

@@ -1,4 +1,4 @@
-//! Exact `FGDC v9` logical model and codec.
+//! Exact `FGDC v10` logical model and codec.
 
 mod codec;
 mod type_codec;
@@ -13,7 +13,10 @@ use crate::{
 		ClassIndexKind,
 		ClassIndexState,
 		ClassSchemaMode,
+		FunctionEffect,
+		FunctionId,
 		IndexId,
+		IndexMaintenanceMode,
 		IndexScope,
 		SchemaId,
 		SchemaVersion,
@@ -56,6 +59,8 @@ pub(in crate::storage) struct ClassIndexCatalogEntry {
 	pub(in crate::storage) name: Text,
 	pub(in crate::storage) kind: ClassIndexKind,
 	pub(in crate::storage) state: ClassIndexState,
+	pub(in crate::storage) maintenance: IndexMaintenanceMode,
+	pub(in crate::storage) build_revision: u64,
 	pub(in crate::storage) scope: IndexScope,
 	pub(in crate::storage) fields: Vec<PropertyKeyId>,
 	pub(in crate::storage) physical: Option<PhysicalIndexBinding>,
@@ -109,9 +114,34 @@ pub(in crate::storage) struct ParameterCatalogEntry {
 	pub(in crate::storage) published_at: u64,
 	pub(in crate::storage) name: Text,
 	pub(in crate::storage) value: Vec<u8>,
+	pub(in crate::storage) comment: Option<Text>,
 }
 
-/// Canonical `FGDC v9` payload independent of physical catalog pages.
+/// One parameter in a durable named-function signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::storage) struct FunctionParameterCatalogEntry {
+	pub(in crate::storage) name: Text,
+	pub(in crate::storage) value_type: Type,
+}
+
+/// One durable named-function overload. The body is persisted as UTF-8 source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::storage) struct FunctionCatalogEntry {
+	pub(in crate::storage) id: FunctionId,
+	pub(in crate::storage) version: SchemaVersion,
+	pub(in crate::storage) published_at: u64,
+	pub(in crate::storage) namespace: Text,
+	pub(in crate::storage) name: Text,
+	pub(in crate::storage) parameters: Vec<FunctionParameterCatalogEntry>,
+	pub(in crate::storage) result: Type,
+	pub(in crate::storage) effect: FunctionEffect,
+	pub(in crate::storage) cost: bool,
+	pub(in crate::storage) max_depth: Option<u8>,
+	pub(in crate::storage) body: Text,
+	pub(in crate::storage) comment: Option<Text>,
+}
+
+/// Canonical `FGDC v10` payload independent of physical catalog pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct DatabaseCatalog {
 	pub(in crate::storage) next_graph_id: u64,
@@ -121,6 +151,7 @@ pub(in crate::storage) struct DatabaseCatalog {
 	pub(in crate::storage) classes: Vec<ClassCatalogEntry>,
 	pub(in crate::storage) graphs: Vec<GraphCatalogEntry>,
 	pub(in crate::storage) parameters: Vec<ParameterCatalogEntry>,
+	pub(in crate::storage) functions: Vec<FunctionCatalogEntry>,
 }
 
 impl DatabaseCatalog {
@@ -129,7 +160,7 @@ impl DatabaseCatalog {
 		codec::encode(self)
 	}
 
-	/// Decodes and validates only exact `FGDC v9` bytes.
+	/// Decodes and validates only exact `FGDC v10` bytes.
 	pub(in crate::storage) fn decode(bytes: &[u8]) -> crate::gql_status::FerrosGrynnResult<Self> {
 		codec::decode(bytes)
 	}

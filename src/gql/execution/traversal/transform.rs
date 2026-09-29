@@ -58,6 +58,39 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 					})
 					.collect())
 			}
+			TraverseStepKind::Algorithm => {
+				let target = step.algorithm_input.as_ref().ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("tv::algo input type is missing.")
+				})?;
+				let current = cast(traverser.current.clone(), target)?;
+				let offset = usize::from(step.named_function.is_none());
+				let mut arguments = Vec::with_capacity(step.arguments.len() + 1 - offset);
+				arguments.push(current);
+				arguments.extend(step.arguments[offset..].iter().cloned());
+				let value = if let Some(function) = step.named_function {
+					let plan = self.control.resolve_named_function(function)?;
+					invoke_logical_closure_with_read(
+						self.read,
+						&plan,
+						&[],
+						&arguments,
+						self.source,
+						self.control,
+						self.runtime,
+						ClosureInvocationMode::ReadOnlyTraversal,
+					)?
+				} else {
+					self.invoke(closure_argument(step, 0)?, &arguments, false)?
+				};
+				Ok(expand_algorithm_value(value)?
+					.into_iter()
+					.map(|value| {
+						let mut output = traverser.clone();
+						output.current = value;
+						output
+					})
+					.collect())
+			}
 			TraverseStepKind::Unfold => {
 				let values = expand_value(traverser.current.clone())?;
 				Ok(values
@@ -547,6 +580,16 @@ fn value_closure(value: &Value) -> FerrosGrynnResult<&Closure> {
 		));
 	};
 	Ok(closure)
+}
+
+fn expand_algorithm_value(value: Value) -> FerrosGrynnResult<Vec<Value>> {
+	match value {
+		Value::Array(values) => Ok(values.into_iter().collect()),
+		Value::Set(values) => Ok(values.into_iter().collect()),
+		Value::Range(range) => Ok(super::integer_range(range)?.collect()),
+		Value::None => Ok(Vec::new()),
+		value => Ok(vec![value]),
+	}
 }
 
 fn collection_or_one(value: Value) -> FerrosGrynnResult<Vec<Value>> {

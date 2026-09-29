@@ -34,6 +34,10 @@ impl Regex {
 	pub fn is_match(&self, value: &str) -> bool {
 		self.compiled.is_match(value)
 	}
+
+	pub(crate) fn find_at(&self, value: &str, start: usize) -> Option<(usize, usize)> {
+		self.compiled.find_at(value, start).map(|value| (value.start(), value.end()))
+	}
 }
 
 impl FromStr for Regex {

@@ -1,4 +1,4 @@
-//! Conversion between the MVCC schema root and exact `FGDC v9` entries.
+//! Conversion between the MVCC schema root and exact `FGDC v10` entries.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -11,6 +11,8 @@ use crate::{
 		DatabaseRoot,
 		IndexId,
 		SchemaCatalog,
+		SchemaFunction,
+		SchemaFunctionParameter,
 		SchemaParameter,
 		SystemIndex,
 		SystemIndexKind,
@@ -25,6 +27,8 @@ use crate::{
 			ClassFieldCatalogEntry,
 			ClassIndexCatalogEntry,
 			DatabaseCatalog,
+			FunctionCatalogEntry,
+			FunctionParameterCatalogEntry,
 			GraphCatalogEntry,
 			GraphPropertyCatalogEntry,
 			ParameterCatalogEntry,
@@ -88,6 +92,8 @@ pub(super) fn encode_database_catalog(
 						name: index.name().clone(),
 						kind: index.kind(),
 						state: index.state(),
+						maintenance: index.maintenance_mode(),
+						build_revision: index.build_revision(),
 						scope: index.scope(),
 						fields: keys,
 						physical: physical_indexes.get(&id).copied(),
@@ -175,6 +181,33 @@ pub(super) fn encode_database_catalog(
 				published_at: parameter.published_at,
 				name: parameter.name().clone(),
 				value: CanonicalCodec::encode(storage.as_ref())?,
+				comment: parameter.comment().cloned(),
+			})
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let functions = root
+		.schema
+		.functions()
+		.map(|function| {
+			Ok(FunctionCatalogEntry {
+				id: function.id().ok_or_else(|| invalid("published function has no FunctionId"))?,
+				version: function.version(),
+				published_at: function.published_at,
+				namespace: function.namespace().clone(),
+				name: function.name().clone(),
+				parameters: function
+					.parameters()
+					.map(|parameter| FunctionParameterCatalogEntry {
+						name: parameter.name().clone(),
+						value_type: parameter.value_type().clone(),
+					})
+					.collect(),
+				result: function.result().clone(),
+				effect: function.effect(),
+				cost: function.is_cost(),
+				max_depth: function.max_depth(),
+				body: function.body().clone(),
+				comment: function.comment().cloned(),
 			})
 		})
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
@@ -187,6 +220,7 @@ pub(super) fn encode_database_catalog(
 		classes,
 		graphs,
 		parameters,
+		functions,
 	})
 }
 
@@ -229,6 +263,8 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 					name: index.name.clone(),
 					kind: index.kind,
 					state: index.state,
+					maintenance: index.maintenance,
+					build_revision: index.build_revision,
 					scope: index.scope,
 					fields: names,
 				})
@@ -275,6 +311,33 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 		}
 		schema.graphs.insert(entry.id, graph);
 		schema.graph_versions.insert(entry.id, entry.published_at);
+	}
+	for entry in &catalog.functions {
+		let parameters = entry
+			.parameters
+			.iter()
+			.map(|parameter| {
+				SchemaFunctionParameter::new(parameter.name.clone(), parameter.value_type.clone())
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut function = SchemaFunction::new(
+			entry.namespace.clone(),
+			entry.name.clone(),
+			parameters,
+			entry.result.clone(),
+			entry.effect,
+			entry.cost,
+			entry.max_depth,
+			entry.body.clone(),
+		)?;
+		function.id = Some(entry.id);
+		function.version = entry.version;
+		function.comment = entry.comment.clone();
+		function.published_at = entry.published_at;
+		let signature = function.signature();
+		schema.function_signatures.insert(signature, entry.id);
+		schema.functions.insert(entry.id, Arc::new(function));
+		schema.function_versions.insert(entry.id, entry.published_at);
 	}
 	Ok(schema)
 }
@@ -344,6 +407,7 @@ pub(super) fn decode_catalog_values(
 			version: entry.version,
 			name: entry.name.clone(),
 			value,
+			comment: entry.comment.clone(),
 			published_at: entry.published_at,
 		});
 		schema.parameters.insert(entry.name.to_string(), parameter);

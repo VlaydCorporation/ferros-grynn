@@ -19,6 +19,7 @@ use model::Traverser;
 use rapidhash::RapidHashMap;
 
 use super::*;
+use crate::gql::ir::NamedFunctionKey;
 
 #[derive(Clone)]
 struct PreparedRepeat {
@@ -32,6 +33,8 @@ struct PreparedRepeat {
 struct PreparedStep {
 	kind: TraverseStepKind,
 	arguments: Vec<Value>,
+	named_function: Option<NamedFunctionKey>,
+	algorithm_input: Option<Type>,
 	match_plan: Option<Box<LogicalMatch>>,
 	repeat: Option<PreparedRepeat>,
 }
@@ -351,6 +354,8 @@ fn prepare_steps(
 			Ok(PreparedStep {
 				kind: step.kind,
 				arguments,
+				named_function: step.named_function,
+				algorithm_input: step.algorithm_input.clone(),
 				match_plan: step.match_plan.clone(),
 				repeat,
 			})

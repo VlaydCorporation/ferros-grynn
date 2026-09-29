@@ -5,6 +5,7 @@
 
 mod adapter;
 mod builtins;
+mod collation;
 mod cursor;
 mod dml;
 mod eval;
@@ -45,7 +46,7 @@ pub(in crate::gql) fn evaluate_constant(expression: &TypedExpr) -> Option<Value>
 use super::{
 	QueryResult,
 	QueryStatementKind,
-	analysis::{QueryCatalog, analyze, analyze_statement, compatible},
+	analysis::{QueryCatalog, analyze, analyze_statement_with_runtime, compatible},
 	ir::{
 		Aggregate,
 		Builtin,
@@ -53,6 +54,7 @@ use super::{
 		Column,
 		EndpointDomain,
 		Expand,
+		LogicalClosure,
 		LogicalClosureBody,
 		LogicalDmlData,
 		LogicalDmlKind,
@@ -175,15 +177,28 @@ fn execute_parsed_statement<Read: QueryRead>(
 	source: &str,
 	statement: &crate::syn::Statement,
 	bindings: &mut Object,
+	mutable_bindings: &std::collections::BTreeSet<Box<str>>,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<QueryResult> {
 	let snapshot = read.snapshot()?;
-	let logical = analyze_statement(statement, source, read.catalog(snapshot), bindings)?;
+	let logical = analyze_statement_with_runtime(
+		statement,
+		source,
+		read.catalog(snapshot),
+		bindings,
+		mutable_bindings,
+		control.function_cache(),
+	)?;
 	let mut slots = initialize_slots(&logical, bindings);
 	let statement = logical.statements.first().ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("Analyzed statement produced no executable IR.")
 	})?;
-	execute_logical_statement(read, source, statement, &mut slots, bindings, control, false)
+	let result =
+		execute_logical_statement(read, source, statement, &mut slots, bindings, control, false)?;
+	if result.result.is_ok() {
+		persist_mutable_initial_slots(&logical, &slots, bindings)?;
+	}
+	Ok(result)
 }
 
 fn execute_logical_program<Read: QueryRead>(
@@ -258,15 +273,16 @@ pub(crate) fn execute_import_program(
 	variables: &Object,
 	parent_control: &ExecutionControl,
 	timeouts: &[Option<std::time::Duration>],
+	payloads: &[super::import::ImportItemPayload],
 ) -> FerrosGrynnResult<()> {
-	if logical.statements.len() != timeouts.len() {
+	if logical.statements.len() != timeouts.len() || logical.statements.len() != payloads.len() {
 		return Err(FerrosGrynnError::invalid_argument(
 			"Import execution metadata does not match the analyzed program.",
 		));
 	}
 	let mut slots = initialize_slots(logical, variables);
 	let mut bindings = variables.clone();
-	for (statement, timeout) in logical.statements.iter().zip(timeouts) {
+	for ((statement, timeout), payload) in logical.statements.iter().zip(timeouts).zip(payloads) {
 		let control = parent_control.child(*timeout);
 		control.check()?;
 		let mut runtime = ControlRuntime::default();
@@ -282,8 +298,17 @@ pub(crate) fn execute_import_program(
 				control.check()?;
 				record_iteration(&mut runtime, &control)?;
 				slots[*slot as usize] = value;
+				let binding_name = payload.binding_name().ok_or_else(|| {
+					FerrosGrynnError::invalid_argument(
+						"Import loop binding is absent from its source metadata.",
+					)
+				})?;
+				let payload = payload.value(
+					session.next_item_ordinal()?,
+					Some((binding_name, &slots[*slot as usize])),
+				);
 				let mut flow = None;
-				let outcome = session.apply_item(|transaction| {
+				let outcome = session.apply_gql_item(payload, |transaction| {
 					flow = Some(execute_import_block(
 						transaction,
 						body,
@@ -313,7 +338,8 @@ pub(crate) fn execute_import_program(
 			continue;
 		}
 
-		session.apply_item(|transaction| {
+		let payload = payload.value(session.next_item_ordinal()?, None);
+		session.apply_gql_item(payload, |transaction| {
 			execute_import_statement(
 				transaction,
 				statement,
@@ -604,6 +630,10 @@ fn execute_statement<Read: QueryRead>(
 			};
 			return Err(FerrosGrynnError::user_thrown(message.to_string()));
 		}
+		LogicalStatement::Sleep(duration) => {
+			cooperative_sleep(*duration, control)?;
+			Value::None
+		}
 		LogicalStatement::AssertInvariants {
 			graph,
 			report,
@@ -636,14 +666,43 @@ fn execute_statement<Read: QueryRead>(
 	Ok(ControlFlow::Value(value))
 }
 
+fn cooperative_sleep(duration: Duration, control: &ExecutionControl) -> FerrosGrynnResult<()> {
+	let deadline = Instant::now().checked_add(duration).ok_or_else(|| {
+		FerrosGrynnError::invalid_argument("SLEEP duration is too large for this platform.")
+	})?;
+	loop {
+		control.check()?;
+		let now = Instant::now();
+		if now >= deadline {
+			return Ok(());
+		}
+		std::thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
+	}
+}
+
 fn eval_query_expression<Read: QueryRead>(
 	read: &mut Read,
 	expression: &TypedExpr,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 	runtime: &mut ControlRuntime,
 ) -> FerrosGrynnResult<Value> {
+	eval_query_expression_current(read, expression, slots, source, control, runtime, None)
+}
+
+fn eval_query_expression_current<Read: QueryRead>(
+	read: &mut Read,
+	expression: &TypedExpr,
+	slots: &mut [Value],
+	source: &str,
+	control: &ExecutionControl,
+	runtime: &mut ControlRuntime,
+	current: Option<&Value>,
+) -> FerrosGrynnResult<Value> {
+	if !query_expression_requires_read(expression) {
+		return eval_mut_current(expression, None, slots, source, None, current, Some(control));
+	}
 	match &expression.kind {
 		TypedExprKind::Traversal(plan) => traversal::execute_traverse(
 			read,
@@ -658,7 +717,9 @@ fn eval_query_expression<Read: QueryRead>(
 			callee,
 			arguments,
 		} => {
-			let callee = eval_query_expression(read, callee, slots, source, control, runtime)?;
+			let callee = eval_query_expression_current(
+				read, callee, slots, source, control, runtime, current,
+			)?;
 			let Value::Closure(closure) = callee else {
 				return Err(FerrosGrynnError::invalid_argument(
 					"Only a closure value can be invoked.",
@@ -666,8 +727,9 @@ fn eval_query_expression<Read: QueryRead>(
 			};
 			let mut values = Vec::with_capacity(arguments.len());
 			for argument in arguments {
-				values
-					.push(eval_query_expression(read, argument, slots, source, control, runtime)?);
+				values.push(eval_query_expression_current(
+					read, argument, slots, source, control, runtime, current,
+				)?);
 			}
 			invoke_closure(
 				read,
@@ -679,7 +741,427 @@ fn eval_query_expression<Read: QueryRead>(
 				ClosureInvocationMode::Standalone,
 			)
 		}
-		_ => eval(expression, None, slots, source, None, Some(control)),
+		TypedExprKind::NamedInvoke {
+			function,
+			arguments,
+		} => {
+			let mut values = Vec::with_capacity(arguments.len());
+			for argument in arguments {
+				values.push(eval_query_expression_current(
+					read, argument, slots, source, control, runtime, current,
+				)?);
+			}
+			let plan = control.resolve_named_function(*function)?;
+			invoke_logical_closure_with_read(
+				read,
+				&plan,
+				&[],
+				&values,
+				source,
+				control,
+				runtime,
+				ClosureInvocationMode::Standalone,
+			)
+		}
+		TypedExprKind::Array(values) => values
+			.iter()
+			.map(|value| {
+				eval_query_expression_current(read, value, slots, source, control, runtime, current)
+			})
+			.collect::<FerrosGrynnResult<Array>>()
+			.map(Value::Array),
+		TypedExprKind::Set(values) => values
+			.iter()
+			.map(|value| {
+				eval_query_expression_current(read, value, slots, source, control, runtime, current)
+			})
+			.collect::<FerrosGrynnResult<crate::values::Set>>()
+			.map(Value::Set),
+		TypedExprKind::Object(fields) => fields
+			.iter()
+			.map(|(name, value)| {
+				eval_query_expression_current(read, value, slots, source, control, runtime, current)
+					.map(|value| (name.as_ref(), value))
+			})
+			.collect::<FerrosGrynnResult<Object>>()
+			.map(Value::Object),
+		TypedExprKind::Binary {
+			left,
+			op,
+			right,
+		} => {
+			let left_value = eval_query_expression_current(
+				read, left, slots, source, control, runtime, current,
+			)?;
+			match op {
+				BinaryOperator::And if !left_value.is_truthy() => Ok(Value::Bool(false)),
+				BinaryOperator::Or if left_value.is_truthy() => Ok(Value::Bool(true)),
+				BinaryOperator::Coalesce if !matches!(left_value, Value::None | Value::Null) => {
+					Ok(left_value)
+				}
+				BinaryOperator::Elvis if left_value.is_truthy() => Ok(left_value),
+				_ => {
+					let right_value = eval_query_expression_current(
+						read, right, slots, source, control, runtime, current,
+					)?;
+					let materialized = TypedExpr {
+						kind: TypedExprKind::Binary {
+							left: Box::new(query_constant(left, left_value)),
+							op: *op,
+							right: Box::new(query_constant(right, right_value)),
+						},
+						ty: expression.ty.clone(),
+						span: expression.span,
+					};
+					eval_mut_current(
+						&materialized,
+						None,
+						slots,
+						source,
+						None,
+						current,
+						Some(control),
+					)
+				}
+			}
+		}
+		TypedExprKind::Conditional {
+			condition,
+			then_value,
+			else_value,
+		} => {
+			if eval_query_expression_current(
+				read, condition, slots, source, control, runtime, current,
+			)?
+			.is_truthy()
+			{
+				eval_query_expression_current(
+					read, then_value, slots, source, control, runtime, current,
+				)
+			} else {
+				eval_query_expression_current(
+					read, else_value, slots, source, control, runtime, current,
+				)
+			}
+		}
+		TypedExprKind::Case {
+			operand,
+			branches,
+			else_value,
+		} => {
+			let operand = operand
+				.as_deref()
+				.map(|value| {
+					eval_query_expression_current(
+						read, value, slots, source, control, runtime, current,
+					)
+				})
+				.transpose()?;
+			for (condition, value) in branches {
+				let condition = eval_query_expression_current(
+					read, condition, slots, source, control, runtime, current,
+				)?;
+				if operand
+					.as_ref()
+					.map_or_else(|| condition.is_truthy(), |operand| operand == &condition)
+				{
+					return eval_query_expression_current(
+						read, value, slots, source, control, runtime, current,
+					);
+				}
+			}
+			else_value.as_deref().map_or(Ok(Value::None), |value| {
+				eval_query_expression_current(read, value, slots, source, control, runtime, current)
+			})
+		}
+		TypedExprKind::Filter {
+			base,
+			predicate,
+		} => {
+			let Value::Array(values) = eval_query_expression_current(
+				read, base, slots, source, control, runtime, current,
+			)?
+			else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"Collection filter requires an array.",
+				));
+			};
+			let mut filtered = Array::new(Vec::new());
+			for value in values {
+				if eval_query_expression_current(
+					read,
+					predicate,
+					slots,
+					source,
+					control,
+					runtime,
+					Some(&value),
+				)?
+				.is_truthy()
+				{
+					filtered.push(value);
+				}
+			}
+			Ok(Value::Array(filtered))
+		}
+		TypedExprKind::Builtin {
+			function,
+			arguments,
+		} => {
+			let mutable_first = matches!(
+				function,
+				Builtin::ArrayPush(_)
+					| Builtin::ArrayPop(_)
+					| Builtin::ArrayClear(_)
+					| Builtin::SetAdd(_)
+					| Builtin::SetClear(_)
+			);
+			let mut materialized = Vec::with_capacity(arguments.len());
+			for (index, argument) in arguments.iter().enumerate() {
+				if mutable_first && index == 0 {
+					materialized.push(argument.clone());
+				} else {
+					let value = eval_query_expression_current(
+						read, argument, slots, source, control, runtime, current,
+					)?;
+					materialized.push(query_constant(argument, value));
+				}
+			}
+			let expression = TypedExpr {
+				kind: TypedExprKind::Builtin {
+					function: function.clone(),
+					arguments: materialized,
+				},
+				ty: expression.ty.clone(),
+				span: expression.span,
+			};
+			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+		}
+		TypedExprKind::Range {
+			start,
+			end,
+			inclusive_end,
+		} => {
+			let start = start
+				.as_deref()
+				.map(|value| {
+					eval_query_expression_current(
+						read, value, slots, source, control, runtime, current,
+					)
+					.map(|result| Box::new(query_constant(value, result)))
+				})
+				.transpose()?;
+			let end = end
+				.as_deref()
+				.map(|value| {
+					eval_query_expression_current(
+						read, value, slots, source, control, runtime, current,
+					)
+					.map(|result| Box::new(query_constant(value, result)))
+				})
+				.transpose()?;
+			let expression = TypedExpr {
+				kind: TypedExprKind::Range {
+					start,
+					end,
+					inclusive_end: *inclusive_end,
+				},
+				ty: expression.ty.clone(),
+				span: expression.span,
+			};
+			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+		}
+		TypedExprKind::Unary {
+			op,
+			expr,
+		} => {
+			let value = eval_query_expression_current(
+				read, expr, slots, source, control, runtime, current,
+			)?;
+			let expression = TypedExpr {
+				kind: TypedExprKind::Unary {
+					op: *op,
+					expr: Box::new(query_constant(expr, value)),
+				},
+				ty: expression.ty.clone(),
+				span: expression.span,
+			};
+			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+		}
+		TypedExprKind::Field {
+			base,
+			field,
+			null_safe,
+		} => {
+			let value = eval_query_expression_current(
+				read, base, slots, source, control, runtime, current,
+			)?;
+			let expression = TypedExpr {
+				kind: TypedExprKind::Field {
+					base: Box::new(query_constant(base, value)),
+					field: field.clone(),
+					null_safe: *null_safe,
+				},
+				ty: expression.ty.clone(),
+				span: expression.span,
+			};
+			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+		}
+		TypedExprKind::Destructure {
+			base,
+			fields,
+		} => {
+			let value = eval_query_expression_current(
+				read, base, slots, source, control, runtime, current,
+			)?;
+			let expression = TypedExpr {
+				kind: TypedExprKind::Destructure {
+					base: Box::new(query_constant(base, value)),
+					fields: fields.clone(),
+				},
+				ty: expression.ty.clone(),
+				span: expression.span,
+			};
+			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+		}
+		TypedExprKind::Index {
+			base,
+			index,
+		} => {
+			let base_value = eval_query_expression_current(
+				read, base, slots, source, control, runtime, current,
+			)?;
+			let index_value = eval_query_expression_current(
+				read, index, slots, source, control, runtime, current,
+			)?;
+			let expression = TypedExpr {
+				kind: TypedExprKind::Index {
+					base: Box::new(query_constant(base, base_value)),
+					index: Box::new(query_constant(index, index_value)),
+				},
+				ty: expression.ty.clone(),
+				span: expression.span,
+			};
+			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+		}
+		TypedExprKind::Cast {
+			target,
+			expr,
+		} => {
+			let value = eval_query_expression_current(
+				read, expr, slots, source, control, runtime, current,
+			)?;
+			let expression = TypedExpr {
+				kind: TypedExprKind::Cast {
+					target: target.clone(),
+					expr: Box::new(query_constant(expr, value)),
+				},
+				ty: expression.ty.clone(),
+				span: expression.span,
+			};
+			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+		}
+		_ => eval_mut_current(expression, None, slots, source, None, current, Some(control)),
+	}
+}
+
+fn query_constant(expression: &TypedExpr, value: Value) -> TypedExpr {
+	TypedExpr {
+		kind: TypedExprKind::Constant(value),
+		ty: expression.ty.clone(),
+		span: expression.span,
+	}
+}
+
+fn query_expression_requires_read(expression: &TypedExpr) -> bool {
+	match &expression.kind {
+		TypedExprKind::Invoke {
+			..
+		}
+		| TypedExprKind::NamedInvoke {
+			..
+		}
+		| TypedExprKind::Traversal(_) => true,
+		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
+			values.iter().any(query_expression_requires_read)
+		}
+		TypedExprKind::Object(fields) => {
+			fields.iter().any(|(_, value)| query_expression_requires_read(value))
+		}
+		TypedExprKind::Range {
+			start,
+			end,
+			..
+		} => {
+			start.as_deref().is_some_and(query_expression_requires_read)
+				|| end.as_deref().is_some_and(query_expression_requires_read)
+		}
+		TypedExprKind::Unary {
+			expr,
+			..
+		}
+		| TypedExprKind::Field {
+			base: expr,
+			..
+		}
+		| TypedExprKind::Destructure {
+			base: expr,
+			..
+		}
+		| TypedExprKind::Cast {
+			expr,
+			..
+		} => query_expression_requires_read(expr),
+		TypedExprKind::Binary {
+			left,
+			right,
+			..
+		}
+		| TypedExprKind::Index {
+			base: left,
+			index: right,
+		}
+		| TypedExprKind::Filter {
+			base: left,
+			predicate: right,
+		} => query_expression_requires_read(left) || query_expression_requires_read(right),
+		TypedExprKind::Conditional {
+			condition,
+			then_value,
+			else_value,
+		} => {
+			query_expression_requires_read(condition)
+				|| query_expression_requires_read(then_value)
+				|| query_expression_requires_read(else_value)
+		}
+		TypedExprKind::Case {
+			operand,
+			branches,
+			else_value,
+		} => {
+			operand.as_deref().is_some_and(query_expression_requires_read)
+				|| branches.iter().any(|(condition, value)| {
+					query_expression_requires_read(condition)
+						|| query_expression_requires_read(value)
+				})
+				|| else_value.as_deref().is_some_and(query_expression_requires_read)
+		}
+		TypedExprKind::Builtin {
+			arguments,
+			..
+		} => arguments.iter().any(query_expression_requires_read),
+		TypedExprKind::Aggregate {
+			argument,
+			..
+		} => argument.as_deref().is_some_and(query_expression_requires_read),
+		TypedExprKind::Constant(_)
+		| TypedExprKind::Slot(_)
+		| TypedExprKind::Column(_)
+		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Closure(_)
+		| TypedExprKind::Subquery {
+			..
+		} => false,
 	}
 }
 
@@ -736,7 +1218,33 @@ pub(in crate::gql::execution) fn invoke_closure<Read: QueryRead>(
 		return closure.call(arguments);
 	}
 	let entry = control.resolve_closure(closure)?;
-	let effect_allowed = match (entry.plan.effect, mode) {
+	invoke_logical_closure_with_read(
+		read,
+		&entry.plan,
+		&entry.captures,
+		arguments,
+		source,
+		control,
+		runtime,
+		mode,
+	)
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "named and closure calls share one transaction-aware evaluator"
+)]
+fn invoke_logical_closure_with_read<Read: QueryRead>(
+	read: &mut Read,
+	plan: &LogicalClosure,
+	captures: &[(u32, Value)],
+	arguments: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	runtime: &mut ControlRuntime,
+	mode: ClosureInvocationMode,
+) -> FerrosGrynnResult<Value> {
+	let effect_allowed = match (plan.effect, mode) {
 		(ClosureEffect::Pure | ClosureEffect::StableRead, _) => true,
 		(ClosureEffect::DataMutation, ClosureInvocationMode::TraversalSideEffect)
 		| (
@@ -755,34 +1263,36 @@ pub(in crate::gql::execution) fn invoke_closure<Read: QueryRead>(
 			ClosureInvocationMode::Standalone => "standalone closure",
 		};
 		return Err(FerrosGrynnError::closure_effect_not_allowed(
-			format!("{:?}", entry.plan.effect),
+			format!("{:?}", plan.effect),
 			position.to_owned(),
 		));
 	}
-	if entry.plan.parameters.len() != arguments.len() {
+	if plan.parameters.len() != arguments.len() {
 		return Err(FerrosGrynnError::conversion_error(
 			format!("{} closure arguments", arguments.len()),
-			format!("{} arguments", entry.plan.parameters.len()),
+			format!("{} arguments", plan.parameters.len()),
 		));
 	}
-	let mut slots = vec![Value::None; entry.plan.slot_count];
-	for (slot, value) in entry.captures {
-		let target = slots.get_mut(slot as usize).ok_or_else(|| {
+	let _frame =
+		plan.named_function.map(|function| control.enter_named_function(function)).transpose()?;
+	let mut slots = vec![Value::None; plan.slot_count];
+	for (slot, value) in captures {
+		let target = slots.get_mut(*slot as usize).ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("Closure capture slot is outside its typed frame.")
 		})?;
-		*target = value;
+		*target = value.clone();
 	}
-	for ((slot, _), value) in entry.plan.parameters.iter().zip(arguments) {
+	for ((slot, _), value) in plan.parameters.iter().zip(arguments) {
 		let target = slots.get_mut(*slot as usize).ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("Closure parameter slot is outside its typed frame.")
 		})?;
 		*target = value.clone();
 	}
 	let savepoint = read.savepoint();
-	let result = match &entry.plan.body {
+	let result = match &plan.body {
 		LogicalClosureBody::Expression(expression) => {
 			if matches!(mode, ClosureInvocationMode::Standalone) {
-				eval_query_expression(read, expression, &slots, source, control, runtime)
+				eval_query_expression(read, expression, &mut slots, source, control, runtime)
 			} else {
 				let occurrence = arguments.iter().find_map(Value::as_atom_occurrence);
 				if let Some(occurrence) = occurrence {
@@ -965,6 +1475,7 @@ const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementK
 		LogicalStatement::Throw {
 			..
 		} => QueryStatementKind::Throw,
+		LogicalStatement::Sleep(_) => QueryStatementKind::Sleep,
 		LogicalStatement::AssertInvariants {
 			..
 		} => QueryStatementKind::Assert,
@@ -976,12 +1487,29 @@ const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementK
 
 fn initialize_slots(program: &LogicalProgram, variables: &Object) -> Vec<Value> {
 	let mut slots = vec![Value::None; program.slot_count];
-	for (name, slot) in &program.initial_slots {
+	for (name, slot, _) in &program.initial_slots {
 		if let Some(value) = variables.get(name) {
 			slots[*slot as usize] = value.clone();
 		}
 	}
 	slots
+}
+
+fn persist_mutable_initial_slots(
+	program: &LogicalProgram,
+	slots: &[Value],
+	bindings: &mut Object,
+) -> FerrosGrynnResult<()> {
+	for (name, slot, mutable) in &program.initial_slots {
+		if !mutable {
+			continue;
+		}
+		let value = slots.get(*slot as usize).cloned().ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("Mutable binding slot is outside its typed frame.")
+		})?;
+		bindings.insert(name.as_ref(), value);
+	}
+	Ok(())
 }
 
 /// Executes a logical MATCH as a synchronous pull pipeline.

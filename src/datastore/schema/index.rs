@@ -43,6 +43,16 @@ pub enum ClassIndexState {
 	PreparedForRemoval,
 }
 
+/// Write-side maintenance policy of one user-declared class index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IndexMaintenanceMode {
+	/// Every committed mutation updates the index before publication.
+	Immediate,
+	/// Mutations mark the index stale until maintenance catches up.
+	Deferred,
+}
+
 /// Declarative scalar B+tree attached to one class schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassIndex {
@@ -56,6 +66,10 @@ pub struct ClassIndex {
 	pub(crate) kind: ClassIndexKind,
 	/// Observable planner-availability contract.
 	pub(crate) state: ClassIndexState,
+	/// Write-side maintenance policy.
+	pub(crate) maintenance: IndexMaintenanceMode,
+	/// Commit revision that published the currently query-visible build.
+	pub(crate) build_revision: u64,
 	/// Explicit base or graph-effective scope.
 	pub(crate) scope: IndexScope,
 	/// Indexed fields in composite-key order.
@@ -108,9 +122,37 @@ impl ClassIndex {
 			name,
 			kind,
 			state: ClassIndexState::Ready,
+			maintenance: IndexMaintenanceMode::Immediate,
+			build_revision: 0,
 			scope,
 			fields,
 		})
+	}
+
+	/// Selects the write-side maintenance policy.
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-argument error when deferred maintenance is requested
+	/// for a Unique index, whose constraint must remain immediately visible.
+	pub fn with_maintenance_mode(
+		mut self,
+		maintenance: IndexMaintenanceMode,
+	) -> FerrosGrynnResult<Self> {
+		if maintenance == IndexMaintenanceMode::Deferred && self.kind == ClassIndexKind::Unique {
+			return Err(FerrosGrynnError::invalid_argument(
+				"deferred maintenance is supported only for Standard and Count indexes",
+			));
+		}
+		self.maintenance = maintenance;
+		Ok(self)
+	}
+
+	/// Selects the query-visible state used while a concurrent builder owns the
+	/// first physical generation.
+	pub(crate) fn with_state(mut self, state: ClassIndexState) -> Self {
+		self.state = state;
+		self
 	}
 
 	/// Returns the stable identity after the containing class is published.
@@ -136,6 +178,17 @@ impl ClassIndex {
 	/// Returns whether the index is usable, stale, or prepared for removal.
 	pub const fn state(&self) -> ClassIndexState {
 		self.state
+	}
+
+	/// Returns the write-side maintenance policy.
+	pub const fn maintenance_mode(&self) -> IndexMaintenanceMode {
+		self.maintenance
+	}
+
+	/// Returns the commit revision of the last successfully published build.
+	/// Zero means that a concurrent initial build has not published yet.
+	pub const fn build_revision(&self) -> u64 {
+		self.build_revision
 	}
 
 	/// Returns the explicit base or graph-effective scope.

@@ -9,8 +9,11 @@ use crate::{
 		ClassSchema,
 		ClassSchemaMode,
 		ConflictKey,
+		FunctionId,
 		IndexId,
 		IndexScope,
+		SchemaFunction,
+		SchemaParameter,
 		consts::SCHEMA_WRITE_BYTES,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -18,6 +21,203 @@ use crate::{
 };
 
 impl Transaction {
+	/// Returns every transaction-visible overload for one qualified name.
+	pub(crate) fn functions_named(
+		&mut self,
+		namespace: &str,
+		name: &str,
+	) -> FerrosGrynnResult<Vec<Arc<SchemaFunction>>> {
+		self.prepare_read()?;
+		self.record_read(ConflictKey::FunctionCatalogRange);
+		Ok(self
+			.working
+			.schema
+			.functions()
+			.filter(|function| {
+				function.namespace().as_str() == namespace && function.name().as_str() == name
+			})
+			.cloned()
+			.collect())
+	}
+
+	/// Resolves one transaction-visible function by stable identity.
+	pub(crate) fn function_by_id(
+		&mut self,
+		id: FunctionId,
+	) -> FerrosGrynnResult<Option<Arc<SchemaFunction>>> {
+		self.prepare_read()?;
+		self.record_read(ConflictKey::SchemaFunction(id));
+		Ok(self.working.schema.functions.get(&id).cloned())
+	}
+
+	/// Returns all transaction-visible named-function definitions.
+	pub(crate) fn functions(&mut self) -> FerrosGrynnResult<Vec<Arc<SchemaFunction>>> {
+		self.prepare_read()?;
+		self.record_read(ConflictKey::FunctionCatalogRange);
+		Ok(self.working.schema.functions().cloned().collect())
+	}
+
+	/// Defines one durable named-function overload.
+	pub(crate) fn define_function(
+		&mut self,
+		mut function: SchemaFunction,
+	) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		if function.id.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"define_function requires an unpublished function",
+			));
+		}
+		if self.working.schema.function_signatures.contains_key(&function.signature()) {
+			return Err(FerrosGrynnError::invalid_argument("function overload already exists"));
+		}
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let id = FunctionId::from_schema_id(self.store.inner.allocate_schema_id()?);
+		function.id = Some(id);
+		self.working.install_function(function.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::SchemaFunction(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::FunctionCatalogRange);
+		self.mutations.push(Mutation::DefineFunction(function));
+		Ok(())
+	}
+
+	/// Replaces one function body and metadata while preserving its signature.
+	pub(crate) fn replace_function(
+		&mut self,
+		mut replacement: SchemaFunction,
+	) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let id = replacement
+			.id
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("replacement function has no id"))?;
+		replacement.version = replacement.version.next()?;
+		self.working.replace_function(replacement.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::SchemaFunction(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::FunctionCatalogRange);
+		self.mutations.push(Mutation::ReplaceFunction(replacement));
+		Ok(())
+	}
+
+	/// Removes one named-function overload.
+	pub(crate) fn remove_function(&mut self, id: FunctionId) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.working.remove_function(id)?;
+		self.insert_write(ConflictKey::SchemaFunction(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::FunctionCatalogRange);
+		self.mutations.push(Mutation::RemoveFunction(id));
+		Ok(())
+	}
+
+	/// Resolves one transaction-visible durable database parameter.
+	pub(crate) fn parameter(
+		&mut self,
+		name: &str,
+	) -> FerrosGrynnResult<Option<Arc<SchemaParameter>>> {
+		self.prepare_read()?;
+		let parameter = self.working.schema.parameter(name);
+		match parameter.as_ref().and_then(|parameter| parameter.id()) {
+			Some(id) => self.record_read(ConflictKey::SchemaParameter(id)),
+			None => self.record_read(ConflictKey::ParameterCatalogRange),
+		}
+		Ok(parameter)
+	}
+
+	/// Returns all transaction-visible durable parameter values by name.
+	pub(crate) fn parameter_bindings(&mut self) -> FerrosGrynnResult<crate::values::Object> {
+		Ok(self
+			.parameters()?
+			.into_iter()
+			.map(|parameter| (parameter.name().clone(), parameter.value().clone()))
+			.collect())
+	}
+
+	/// Returns all transaction-visible durable parameter definitions.
+	pub(crate) fn parameters(&mut self) -> FerrosGrynnResult<Vec<Arc<SchemaParameter>>> {
+		self.prepare_read()?;
+		self.record_read(ConflictKey::ParameterCatalogRange);
+		Ok(self.working.schema.parameters().cloned().collect())
+	}
+
+	/// Defines one durable database parameter.
+	pub(crate) fn define_parameter(
+		&mut self,
+		mut parameter: SchemaParameter,
+	) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		if parameter.id.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"define_parameter requires an unpublished parameter",
+			));
+		}
+		if self.working.schema.parameter(parameter.name.as_str()).is_some() {
+			return Err(parameter_exists(parameter.name.as_str()));
+		}
+		parameter.value.ensure_storable()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.intern_value_keys(&parameter.value)?;
+		let id = self.store.inner.allocate_schema_id()?;
+		parameter.id = Some(id);
+		self.working.install_parameter(parameter.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::SchemaParameter(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::ParameterCatalogRange);
+		self.mutations.push(Mutation::DefineParameter(parameter));
+		Ok(())
+	}
+
+	/// Replaces a durable parameter value and/or comment while preserving
+	/// identity.
+	pub(crate) fn replace_parameter(
+		&mut self,
+		name: &str,
+		value: Option<crate::values::Value>,
+		comment: Option<Option<crate::values::Text>>,
+	) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let mut replacement = self
+			.working
+			.schema
+			.parameter(name)
+			.map(|parameter| parameter.as_ref().clone())
+			.ok_or_else(|| parameter_missing(name))?;
+		let id = replacement
+			.id
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("parameter has no SchemaId"))?;
+		if let Some(value) = value {
+			value.ensure_storable()?;
+			self.intern_value_keys(&value)?;
+			replacement.value = value;
+		}
+		if let Some(comment) = comment {
+			replacement.comment = comment;
+		}
+		replacement.version = replacement.version.next()?;
+		self.working.replace_parameter(replacement.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::SchemaParameter(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::ParameterCatalogRange);
+		self.mutations.push(Mutation::ReplaceParameter(replacement));
+		Ok(())
+	}
+
+	/// Removes one durable database parameter.
+	pub(crate) fn remove_parameter(&mut self, name: &str) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let id = self
+			.working
+			.schema
+			.parameter(name)
+			.and_then(|parameter| parameter.id())
+			.ok_or_else(|| parameter_missing(name))?;
+		self.working.remove_parameter(id)?;
+		self.insert_write(ConflictKey::SchemaParameter(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::ParameterCatalogRange);
+		self.mutations.push(Mutation::RemoveParameter(id));
+		Ok(())
+	}
+
 	/// Resolves a class from the transaction-visible schema root.
 	///
 	/// # Errors
@@ -424,6 +624,14 @@ impl Transaction {
 	fn index_missing(&self, class: &str, name: &str) -> FerrosGrynnError {
 		FerrosGrynnError::invalid_argument(format!("index '{class}.{name}' does not exist"))
 	}
+}
+
+fn parameter_exists(name: &str) -> FerrosGrynnError {
+	FerrosGrynnError::invalid_argument(format!("parameter '${name}' already exists"))
+}
+
+fn parameter_missing(name: &str) -> FerrosGrynnError {
+	FerrosGrynnError::invalid_argument(format!("parameter '${name}' does not exist"))
 }
 
 #[cfg(test)]

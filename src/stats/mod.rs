@@ -7,7 +7,14 @@ mod delta;
 mod model;
 mod store;
 
-pub(crate) use analyze::{analyze_database, analyze_database_at};
+pub(crate) use analyze::{
+	AnalyzeMethod,
+	analyze_base_with_method_at,
+	analyze_database,
+	analyze_database_at,
+	analyze_database_with_method_at,
+	analyze_graph_with_method_at,
+};
 pub use model::{
 	BaseStatistics,
 	DegreeBucket,

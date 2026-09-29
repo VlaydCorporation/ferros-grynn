@@ -24,6 +24,7 @@ use crate::{
 		ClassSchema,
 		Datastore,
 		ImportOptions,
+		ImportViolationPolicy,
 		IndexScope,
 		LocalOptions,
 	},
@@ -49,6 +50,51 @@ impl Drop for TestDirectory {
 	fn drop(&mut self) {
 		drop(fs::remove_dir_all(&self.0));
 	}
+}
+
+#[test]
+fn durable_parameter_survives_local_reopen() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let defined = store
+		.execute("DEFINE PARAM $region VALUE 'eu' COMMENT 'routing';", &Object::new())
+		.unwrap();
+	assert!(defined[0].result.is_ok());
+	let identity = store.schema_catalog().parameter("region").unwrap().id();
+	drop(store);
+
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	let parameter = reopened.schema_catalog().parameter("region").unwrap();
+	assert_eq!(parameter.id(), identity);
+	assert_eq!(parameter.comment().map(|comment| comment.as_str()), Some("routing"));
+	let result = reopened.execute("RETURN $region;", &Object::new()).unwrap();
+	assert_eq!(result[0].result.as_ref().unwrap().value(), &Value::from("eu"));
+}
+
+#[test]
+fn durable_function_survives_local_reopen() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let defined = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::double(value: int) -> int { RETURN $value * 2; } COMMENT \
+			 'reopen';",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(defined[0].result.is_ok());
+	let identity = store.schema_catalog().functions().next().unwrap().id();
+	drop(store);
+
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	let catalog = reopened.schema_catalog();
+	let function = catalog.functions().next().unwrap();
+	assert_eq!(function.id(), identity);
+	assert_eq!(function.comment().map(|comment| comment.as_str()), Some("reopen"));
+	let result = reopened.execute("RETURN fn::double(21);", &Object::new()).unwrap();
+	assert_eq!(result[0].result.as_ref().unwrap().value(), &Value::from(42_i64));
 }
 
 /// Measures total and phase-level reopen scaling for the format-v1 registry.
@@ -170,7 +216,7 @@ fn local_atom_index_reopen_diagnostic() -> crate::gql_status::FerrosGrynnResult<
 	root.commit_ts = root.commit_ts.checked_add(1).ok_or_else(|| {
 		crate::gql_status::FerrosGrynnError::invalid_argument("commit clock exhausted")
 	})?;
-	drop(store.inner.persist_import_root(&root)?);
+	drop(store.inner.persist_import_root(&root, None)?);
 	drop(store);
 
 	let mut totals = Vec::with_capacity(runs);
@@ -255,6 +301,54 @@ fn every_prepublication_failure_discards_root_and_unreachable_generation() {
 		);
 		assert_eq!(generation_directories(&directory.0), generation_count);
 	}
+}
+
+#[test]
+fn quarantine_reopens_survives_cow_and_is_removed_by_catalog_publication()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options)?;
+	let mut schema = store.begin();
+	schema.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
+	schema.commit()?;
+	let import = ImportOptions {
+		on_violation: ImportViolationPolicy::Quarantine,
+		reject_limit: Some(1),
+		..ImportOptions::default()
+	};
+	let report = store.import(import, |session| {
+		session.apply_item_with_payload(Value::from("accepted"), |transaction| {
+			transaction.create_atom("person:alice".parse()?, PropertyMap::new())
+		})?;
+		drop(session.apply_item_with_payload(Value::from("duplicate"), |transaction| {
+			transaction.create_atom("person:alice".parse()?, PropertyMap::new())
+		})?);
+		Ok(())
+	})?;
+	let id = report.quarantine().ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::invalid_argument("missing quarantine identity")
+	})?;
+	drop(store);
+
+	let store = Datastore::open_local(&directory.0, options)?;
+	let mut reader = store.open_quarantine(id)?;
+	let item = reader.read_next()?.ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::invalid_argument("missing quarantined item")
+	})?;
+	assert_eq!(item.payload(), &Value::from("duplicate"));
+	drop(reader);
+	let mut mutation = store.begin();
+	mutation.create_atom("person:bob".parse()?, PropertyMap::new())?;
+	mutation.commit()?;
+	assert!(store.open_quarantine(id)?.read_next()?.is_some());
+	store.remove_quarantine(id)?;
+	assert!(store.open_quarantine(id).is_err());
+	drop(store);
+
+	let reopened = Datastore::open_local(&directory.0, options)?;
+	assert!(reopened.open_quarantine(id).is_err());
+	Ok(())
 }
 
 #[test]

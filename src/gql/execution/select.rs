@@ -971,6 +971,10 @@ fn expression_uses_column(expression: &TypedExpr, column: usize) -> bool {
 			expression_uses_column(callee, column)
 				|| arguments.iter().any(|value| expression_uses_column(value, column))
 		}
+		TypedExprKind::NamedInvoke {
+			arguments,
+			..
+		} => arguments.iter().any(|value| expression_uses_column(value, column)),
 		TypedExprKind::Aggregate {
 			argument,
 			..
@@ -1022,7 +1026,7 @@ fn build_output_row<Read: QueryRead>(
 					&(seed, stable),
 				)));
 			}
-			eval_select_expr(
+			let value = eval_select_expr(
 				read,
 				snapshot,
 				&order.expression,
@@ -1031,7 +1035,8 @@ fn build_output_row<Read: QueryRead>(
 				slots,
 				source,
 				control,
-			)
+			)?;
+			super::collation::order_key(value, order)
 		})
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let mut stable = if let Some(group_keys) = &plan.group {

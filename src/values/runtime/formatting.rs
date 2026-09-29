@@ -45,6 +45,7 @@ impl Display for Value {
 			Self::Record(value) => Display::fmt(value, f),
 			Self::GraphRef(value) => write!(f, "graph_ref({}#{})", value.name(), value.id()),
 			Self::Regex(value) => Display::fmt(value, f),
+			Self::Matcher(value) => write!(f, "<matcher:#{}>", value.id().get()),
 			Self::Range(value) => Display::fmt(value, f),
 			Self::Atom(value) => Display::fmt(value.id(), f),
 			Self::AtomOccurrence(value) => {

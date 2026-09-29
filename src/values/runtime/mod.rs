@@ -7,6 +7,7 @@ mod formatting;
 mod geometry;
 mod id;
 mod kind;
+mod matcher;
 mod number;
 mod object;
 mod property_dictionary;
@@ -48,6 +49,7 @@ pub use graph::{
 };
 pub use id::{Ulid, Uuid};
 pub use kind::ValueKind;
+pub use matcher::Matcher;
 pub use number::Number;
 pub use object::Object;
 pub use property_dictionary::PropertyDictionary;

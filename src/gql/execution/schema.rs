@@ -10,8 +10,15 @@ use crate::{
 		ClassIndexState,
 		ClassSchema,
 		ClassSchemaMode,
+		FunctionEffect,
 		GraphSchema,
+		IndexMaintenanceMode,
 		IndexScope,
+		MaintenanceJobInfo,
+		MaintenanceTarget,
+		SchemaFunction,
+		SchemaFunctionParameter,
+		SchemaParameter,
 		Transaction,
 	},
 	gql::{execution::QuerySnapshot, ir::LogicalSchemaStatement},
@@ -83,7 +90,58 @@ pub(super) fn execute_schema(
 			kind,
 			fields,
 			scope,
-		} => define_index(transaction, *mode, class, name, *kind, fields, *scope),
+			maintenance,
+			concurrently,
+		} => define_index(
+			transaction,
+			*mode,
+			class,
+			name,
+			*kind,
+			fields,
+			*scope,
+			*maintenance,
+			*concurrently,
+		),
+		LogicalSchemaStatement::DefineParameter {
+			mode,
+			name,
+			value,
+			comment,
+		} => define_parameter(
+			transaction,
+			*mode,
+			name,
+			value,
+			comment.as_ref(),
+			slots,
+			source,
+			control,
+		),
+		LogicalSchemaStatement::DefineFunction {
+			mode,
+			namespace,
+			name,
+			parameters,
+			result,
+			effect,
+			cost,
+			max_depth,
+			body,
+			comment,
+		} => define_function(
+			transaction,
+			*mode,
+			namespace,
+			name,
+			parameters,
+			result.clone(),
+			*effect,
+			*cost,
+			*max_depth,
+			body,
+			comment.as_ref(),
+		),
 		LogicalSchemaStatement::RemoveGraph {
 			if_exists,
 			name,
@@ -102,6 +160,16 @@ pub(super) fn execute_schema(
 			class,
 			name,
 		} => remove_index(transaction, *if_exists, class, name),
+		LogicalSchemaStatement::RemoveParameter {
+			if_exists,
+			name,
+		} => remove_parameter(transaction, *if_exists, name),
+		LogicalSchemaStatement::RemoveFunction {
+			if_exists,
+			namespace,
+			name,
+			signature,
+		} => remove_function(transaction, *if_exists, namespace, name, signature.as_deref()),
 		LogicalSchemaStatement::AlterClassMode {
 			if_exists,
 			name,
@@ -117,6 +185,43 @@ pub(super) fn execute_schema(
 			class,
 			name,
 		} => transaction.prepare_index_removal(class, name).map(|()| Value::None),
+		LogicalSchemaStatement::AlterParameter {
+			if_exists,
+			name,
+			value,
+			comment,
+		} => alter_parameter(
+			transaction,
+			*if_exists,
+			name,
+			value.as_ref(),
+			comment.clone(),
+			slots,
+			source,
+			control,
+		),
+		LogicalSchemaStatement::AlterFunction {
+			if_exists,
+			namespace,
+			name,
+			signature,
+			effect,
+			cost,
+			max_depth,
+			body,
+			comment,
+		} => alter_function(
+			transaction,
+			*if_exists,
+			namespace,
+			name,
+			signature.as_deref(),
+			*effect,
+			*cost,
+			*max_depth,
+			body.as_ref(),
+			comment.clone(),
+		),
 		LogicalSchemaStatement::InfoDatabase => info_database(transaction),
 		LogicalSchemaStatement::InfoClass {
 			name,
@@ -125,7 +230,153 @@ pub(super) fn execute_schema(
 			class,
 			name,
 		} => info_index(transaction, class, name),
+		LogicalSchemaStatement::InfoParameter {
+			name,
+		} => info_parameter(transaction, name),
+		LogicalSchemaStatement::InfoFunction {
+			namespace,
+			name,
+			signature,
+		} => info_function(transaction, namespace, name, signature.as_deref()),
 	}
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "function DDL forwards the fixed catalog definition fields"
+)]
+fn define_function(
+	transaction: &mut Transaction,
+	mode: DefinitionMode,
+	namespace: &str,
+	name: &str,
+	parameters: &[(Box<str>, Type)],
+	result: Type,
+	effect: FunctionEffect,
+	cost: bool,
+	max_depth: Option<u8>,
+	body: &crate::values::Text,
+	comment: Option<&crate::values::Text>,
+) -> FerrosGrynnResult<Value> {
+	let signature = parameters.iter().map(|(_, value_type)| value_type.clone()).collect::<Vec<_>>();
+	let existing = resolve_function(transaction, namespace, name, Some(&signature))?;
+	if let Some(existing) = existing {
+		return match mode {
+			DefinitionMode::IfNotExists => Ok(Value::None),
+			DefinitionMode::Normal => Err(FerrosGrynnError::invalid_argument(format!(
+				"function overload '{namespace}::{name}' already exists"
+			))),
+			DefinitionMode::Overwrite => {
+				let mut replacement = new_function(
+					namespace, name, parameters, result, effect, cost, max_depth, body, comment,
+				)?;
+				replacement.id = existing.id();
+				replacement.version = existing.version();
+				transaction.replace_function(replacement)?;
+				Ok(Value::None)
+			}
+		};
+	}
+	let function =
+		new_function(namespace, name, parameters, result, effect, cost, max_depth, body, comment)?;
+	transaction.define_function(function)?;
+	Ok(Value::None)
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "function replacement forwards the fixed catalog definition fields"
+)]
+fn new_function(
+	namespace: &str,
+	name: &str,
+	parameters: &[(Box<str>, Type)],
+	result: Type,
+	effect: FunctionEffect,
+	cost: bool,
+	max_depth: Option<u8>,
+	body: &crate::values::Text,
+	comment: Option<&crate::values::Text>,
+) -> FerrosGrynnResult<SchemaFunction> {
+	let parameters = parameters
+		.iter()
+		.map(|(name, value_type)| SchemaFunctionParameter::new(name.as_ref(), value_type.clone()))
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let mut function = SchemaFunction::new(
+		namespace,
+		name,
+		parameters,
+		result,
+		effect,
+		cost,
+		max_depth,
+		body.clone(),
+	)?;
+	if let Some(comment) = comment {
+		function = function.with_comment(comment.clone());
+	}
+	Ok(function)
+}
+
+fn define_parameter(
+	transaction: &mut Transaction,
+	mode: DefinitionMode,
+	name: &str,
+	value: &crate::gql::ir::TypedExpr,
+	comment: Option<&crate::values::Text>,
+	slots: &[Value],
+	source: &str,
+	control: &crate::gql::ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	if transaction.parameter(name)?.is_some() {
+		return match mode {
+			DefinitionMode::IfNotExists => Ok(Value::None),
+			DefinitionMode::Normal => Err(FerrosGrynnError::invalid_argument(format!(
+				"parameter '${name}' already exists"
+			))),
+			DefinitionMode::Overwrite => {
+				let value = eval(value, None, slots, source, None, Some(control))?;
+				value.ensure_storable()?;
+				transaction.replace_parameter(name, Some(value), Some(comment.cloned()))?;
+				Ok(Value::None)
+			}
+		};
+	}
+	let value = eval(value, None, slots, source, None, Some(control))?;
+	value.ensure_storable()?;
+	let mut parameter = SchemaParameter::new(name, value)?;
+	if let Some(comment) = comment {
+		parameter = parameter.with_comment(comment.clone());
+	}
+	transaction.define_parameter(parameter)?;
+	Ok(Value::None)
+}
+
+fn alter_parameter(
+	transaction: &mut Transaction,
+	if_exists: bool,
+	name: &str,
+	value: Option<&crate::gql::ir::TypedExpr>,
+	comment: Option<Option<crate::values::Text>>,
+	slots: &[Value],
+	source: &str,
+	control: &crate::gql::ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	if transaction.parameter(name)?.is_none() {
+		if if_exists {
+			return Ok(Value::None);
+		}
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"parameter '${name}' does not exist"
+		)));
+	}
+	let value =
+		value.map(|value| eval(value, None, slots, source, None, Some(control))).transpose()?;
+	if let Some(value) = &value {
+		value.ensure_storable()?;
+	}
+	transaction.replace_parameter(name, value, comment)?;
+	Ok(Value::None)
 }
 
 fn define_graph(
@@ -233,13 +484,19 @@ fn define_index(
 	kind: ClassIndexKind,
 	fields: &[Box<str>],
 	scope: IndexScope,
+	maintenance: IndexMaintenanceMode,
+	concurrently: bool,
 ) -> FerrosGrynnResult<Value> {
 	let schema = require_class(transaction, class)?;
 	let exists = schema.indexes().any(|index| index.name().as_str() == name);
 	if mode == DefinitionMode::IfNotExists && exists {
 		return Ok(Value::None);
 	}
-	let index = ClassIndex::new(name, kind, scope, fields.iter().map(Box::as_ref))?;
+	let mut index = ClassIndex::new(name, kind, scope, fields.iter().map(Box::as_ref))?
+		.with_maintenance_mode(maintenance)?;
+	if concurrently {
+		index = index.with_state(ClassIndexState::Stale);
+	}
 	if mode == DefinitionMode::Overwrite && exists {
 		transaction.overwrite_index(class, index)?;
 	} else {
@@ -310,6 +567,108 @@ fn remove_index(
 	Ok(Value::None)
 }
 
+fn remove_parameter(
+	transaction: &mut Transaction,
+	if_exists: bool,
+	name: &str,
+) -> FerrosGrynnResult<Value> {
+	if transaction.parameter(name)?.is_none() && if_exists {
+		return Ok(Value::None);
+	}
+	transaction.remove_parameter(name)?;
+	Ok(Value::None)
+}
+
+fn remove_function(
+	transaction: &mut Transaction,
+	if_exists: bool,
+	namespace: &str,
+	name: &str,
+	signature: Option<&[Type]>,
+) -> FerrosGrynnResult<Value> {
+	let Some(function) = resolve_function(transaction, namespace, name, signature)? else {
+		if if_exists {
+			return Ok(Value::None);
+		}
+		return Err(function_missing(namespace, name));
+	};
+	let id = function.id().ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("published function is missing FunctionId")
+	})?;
+	transaction.remove_function(id)?;
+	Ok(Value::None)
+}
+
+#[allow(
+	clippy::too_many_arguments,
+	reason = "named-function execution shares one explicit statement context"
+)]
+fn alter_function(
+	transaction: &mut Transaction,
+	if_exists: bool,
+	namespace: &str,
+	name: &str,
+	signature: Option<&[Type]>,
+	effect: Option<FunctionEffect>,
+	cost: Option<bool>,
+	max_depth: Option<Option<u8>>,
+	body: Option<&crate::values::Text>,
+	comment: Option<Option<crate::values::Text>>,
+) -> FerrosGrynnResult<Value> {
+	let Some(existing) = resolve_function(transaction, namespace, name, signature)? else {
+		if if_exists {
+			return Ok(Value::None);
+		}
+		return Err(function_missing(namespace, name));
+	};
+	let parameters = existing
+		.parameters()
+		.map(|parameter| {
+			SchemaFunctionParameter::new(parameter.name().clone(), parameter.value_type().clone())
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let mut replacement = SchemaFunction::new(
+		existing.namespace().clone(),
+		existing.name().clone(),
+		parameters,
+		existing.result().clone(),
+		effect.unwrap_or(existing.effect()),
+		cost.unwrap_or(existing.is_cost()),
+		max_depth.unwrap_or(existing.max_depth()),
+		body.cloned().unwrap_or_else(|| existing.body().clone()),
+	)?;
+	replacement.id = existing.id();
+	replacement.version = existing.version();
+	replacement.comment = comment.unwrap_or_else(|| existing.comment().cloned());
+	transaction.replace_function(replacement)?;
+	Ok(Value::None)
+}
+
+fn resolve_function(
+	transaction: &mut Transaction,
+	namespace: &str,
+	name: &str,
+	signature: Option<&[Type]>,
+) -> FerrosGrynnResult<Option<std::sync::Arc<SchemaFunction>>> {
+	let mut candidates = transaction.functions_named(namespace, name)?;
+	if let Some(signature) = signature {
+		candidates.retain(|function| {
+			function.parameters().map(SchemaFunctionParameter::value_type).eq(signature.iter())
+		});
+	}
+	match candidates.len() {
+		0 => Ok(None),
+		1 => Ok(candidates.pop()),
+		_ => Err(FerrosGrynnError::invalid_argument(format!(
+			"function '{namespace}::{name}' is ambiguous; specify its parameter types"
+		))),
+	}
+}
+
+fn function_missing(namespace: &str, name: &str) -> FerrosGrynnError {
+	FerrosGrynnError::invalid_argument(format!("function '{namespace}::{name}' does not exist"))
+}
+
 fn alter_class(
 	transaction: &mut Transaction,
 	if_exists: bool,
@@ -361,15 +720,98 @@ fn info_database(transaction: &mut Transaction) -> FerrosGrynnResult<Value> {
 		.into_iter()
 		.map(|schema| (schema.name().clone(), class_definition(&schema)))
 		.collect::<Object>();
+	let parameters = transaction
+		.parameters()?
+		.into_iter()
+		.map(|parameter| (parameter.name().clone(), parameter_info(&parameter)))
+		.collect::<Object>();
+	let functions = transaction
+		.functions()?
+		.into_iter()
+		.map(|function| (function_info_key(&function), function_info(&function)))
+		.collect::<Object>();
 	Ok(Value::from(Object::from_iter([
 		("analyzers", Value::from(Object::new())),
 		("classes", Value::from(classes)),
 		("configs", Value::from(Object::new())),
-		("functions", Value::from(Object::new())),
+		("functions", Value::from(functions)),
 		("graphs", Value::from(graphs)),
 		("models", Value::from(Object::new())),
-		("params", Value::from(Object::new())),
+		("params", Value::from(parameters)),
 	])))
+}
+
+fn info_function(
+	transaction: &mut Transaction,
+	namespace: &str,
+	name: &str,
+	signature: Option<&[Type]>,
+) -> FerrosGrynnResult<Value> {
+	resolve_function(transaction, namespace, name, signature)?
+		.map(|function| function_info(&function))
+		.ok_or_else(|| function_missing(namespace, name))
+}
+
+fn function_info(function: &SchemaFunction) -> Value {
+	let effect = match function.effect() {
+		FunctionEffect::Pure => "pure",
+		FunctionEffect::Stable => "stable",
+		FunctionEffect::Impure => "impure",
+	};
+	let parameters = function
+		.parameters()
+		.map(|parameter| {
+			Value::from(Object::from_iter([
+				("name", Value::from(parameter.name().clone())),
+				("type", Value::from(parameter.value_type().to_string())),
+			]))
+		})
+		.collect::<Vec<_>>();
+	Value::from(Object::from_iter([
+		("body", Value::from(function.body().clone())),
+		("comment", function.comment().cloned().map_or(Value::None, Value::from)),
+		("cost", Value::Bool(function.is_cost())),
+		("effect", Value::from(effect)),
+		("id", function.id().map_or(Value::None, |id| Value::from(u64::from(id.get())))),
+		(
+			"max_depth",
+			function.max_depth().map_or(Value::None, |depth| Value::from(u64::from(depth))),
+		),
+		("name", Value::from(function.name().clone())),
+		("namespace", Value::from(function.namespace().clone())),
+		("parameters", Value::from(parameters)),
+		("result", Value::from(function.result().to_string())),
+		("version", Value::from(u64::from(function.version().get()))),
+	]))
+}
+
+fn function_info_key(function: &SchemaFunction) -> crate::values::Text {
+	let parameters = function
+		.parameters()
+		.map(|parameter| parameter.value_type().to_string())
+		.collect::<Vec<_>>()
+		.join(",");
+	crate::values::Text::from(format!(
+		"{}::{}({parameters})",
+		function.namespace(),
+		function.name()
+	))
+}
+
+fn info_parameter(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Value> {
+	transaction.parameter(name)?.map(|parameter| parameter_info(&parameter)).ok_or_else(|| {
+		FerrosGrynnError::invalid_argument(format!("parameter '${name}' does not exist"))
+	})
+}
+
+fn parameter_info(parameter: &SchemaParameter) -> Value {
+	Value::from(Object::from_iter([
+		("comment", parameter.comment().cloned().map_or(Value::None, Value::from)),
+		("id", parameter.id().map_or(Value::None, |id| Value::from(u64::from(id.get())))),
+		("name", Value::from(parameter.name().clone())),
+		("value", parameter.value().clone()),
+		("version", Value::from(u64::from(parameter.version().get()))),
+	]))
 }
 
 fn info_class(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Value> {
@@ -381,7 +823,7 @@ fn info_class(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Va
 		.collect::<Object>();
 	let mut indexes = schema
 		.indexes()
-		.map(|index| (index.name().clone(), index_info(name, index, &graphs)))
+		.map(|index| (index.name().clone(), index_info(name, index, &graphs, None)))
 		.collect::<Object>();
 	indexes.insert("class", system_index_info(name, "class"));
 	indexes.insert("primary", system_index_info(name, "primary"));
@@ -401,13 +843,18 @@ fn info_index(transaction: &mut Transaction, class: &str, name: &str) -> FerrosG
 		return Ok(system_index_info(class, name));
 	}
 	let graphs = transaction.graphs()?;
-	schema
-		.indexes()
-		.find(|index| index.name().as_str() == name)
-		.map(|index| index_info(class, index, &graphs))
-		.ok_or_else(|| {
-			FerrosGrynnError::invalid_argument(format!("index '{class}.{name}' does not exist"))
-		})
+	let index = schema.indexes().find(|index| index.name().as_str() == name).ok_or_else(|| {
+		FerrosGrynnError::invalid_argument(format!("index '{class}.{name}' does not exist"))
+	})?;
+	let active_job = match (schema.id(), index.id()) {
+		(Some(class), Some(id)) => transaction.active_maintenance_job(MaintenanceTarget::Index {
+			class,
+			index: id,
+			version: index.version(),
+		}),
+		_ => None,
+	};
+	Ok(index_info(class, index, &graphs, active_job.as_ref()))
 }
 
 fn graph_definition(reference: &GraphRef) -> Value {
@@ -439,11 +886,40 @@ fn field_definition(class: &str, field: &ClassField) -> Value {
 	))
 }
 
-fn index_info(class: &str, index: &ClassIndex, graphs: &[GraphSchema]) -> Value {
+fn index_info(
+	class: &str,
+	index: &ClassIndex,
+	graphs: &[GraphSchema],
+	active_job: Option<&MaintenanceJobInfo>,
+) -> Value {
 	let state = index_state_name(index.state());
+	let maintenance = match index.maintenance_mode() {
+		IndexMaintenanceMode::Immediate => "immediate",
+		IndexMaintenanceMode::Deferred => "deferred",
+	};
+	let fallback = match index.state() {
+		ClassIndexState::Ready => Value::None,
+		ClassIndexState::Stale => Value::from("scan:index_stale"),
+		ClassIndexState::PreparedForRemoval => Value::from("scan:index_prepared_for_removal"),
+	};
+	let building = active_job.map_or_else(
+		|| Value::from(Object::from_iter([("status", Value::from(state))])),
+		|job| {
+			Value::from(Object::from_iter([
+				("status", Value::from(state)),
+				("job", job.value()),
+				("source_revision", Value::from(job.source_revision())),
+			]))
+		},
+	);
 	Value::from(Object::from_iter([
-		("building", Value::from(Object::from_iter([("status", Value::from(state))]))),
+		("active_job", active_job.map_or(Value::None, MaintenanceJobInfo::value)),
+		("build_revision", Value::from(index.build_revision())),
+		("building", building),
 		("definition", index_definition(class, index, graphs)),
+		("fallback_reason", fallback),
+		("maintenance", Value::from(maintenance)),
+		("query_visible", Value::Bool(index.state() == ClassIndexState::Ready)),
 		("state", Value::from(state)),
 		("system", Value::Bool(false)),
 	]))

@@ -1,4 +1,4 @@
-use super::{ClassId, GlobalAtomId};
+use super::{ClassId, FunctionId, GlobalAtomId, SchemaId};
 use crate::graph::{AtomId, AtomKind, GraphId};
 
 /// Independently versioned logical targets used by FCW and SSI validation.
@@ -10,6 +10,14 @@ pub(crate) enum ConflictKey {
 	GraphDefinition(GraphId),
 	/// Set of graph definitions observed by a catalog scan.
 	GraphCatalogRange,
+	/// One durable database parameter definition.
+	SchemaParameter(SchemaId),
+	/// Set of durable database parameters observed by a catalog scan.
+	ParameterCatalogRange,
+	/// One durable named-function overload.
+	SchemaFunction(FunctionId),
+	/// Set of durable named-function overloads observed by a catalog scan.
+	FunctionCatalogRange,
 	/// Database-global identity or base properties.
 	BaseAtom(GlobalAtomId),
 	/// Membership or value set observed by a database-global class scan.

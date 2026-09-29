@@ -38,7 +38,12 @@ pub(crate) use physical_traversal::{
 
 use self::{
 	checkpoint::checkpoint,
-	cleanup::{RetiredGeneration, cleanup_orphan_generations, cleanup_query_runs},
+	cleanup::{
+		RetiredGeneration,
+		cleanup_orphan_generations,
+		cleanup_orphan_quarantines,
+		cleanup_query_runs,
+	},
 	files::{
 		create_generation_files,
 		create_import_generation_files,
@@ -64,17 +69,30 @@ use super::{
 	graph_superblock::GraphSuperblock,
 	hybrid_engine::HybridReadEngine,
 	image_io::{read_pages, stage_pages},
+	job_catalog::{JobCatalog, MAX_JOB_CATALOG_BYTES},
 	local::{DatabaseLock, write_database_superblock},
+	metadata_cow::{select_metadata_bytes, write_metadata_bytes},
 	page_io::{PageIo, PageIoMode},
 	property_dictionary::{BuiltPropertyDictionary, extend_property_dictionary},
+	quarantine::{QuarantineArchiveReader, QuarantineArtifact, quarantine_path},
 	types::{CheckpointGeneration, CommitTs, Lsn, TxId},
 	wal::FrameWal,
 };
 use crate::{
-	datastore::{CheckpointMode, DatabaseRoot, IndexId, LocalOptions, LocalStorageStatus},
+	datastore::{
+		CheckpointMode,
+		DatabaseRoot,
+		IndexId,
+		LocalOptions,
+		LocalStorageStatus,
+		MaintenanceJobInfo,
+	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphId,
+	values::Uuid,
 };
+
+const JOB_CATALOG_PATH: &str = "admin/jobs.fgb";
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,6 +130,7 @@ struct LocalState {
 	graph_superblocks: BTreeMap<GraphId, GraphSuperblock>,
 	physical_indexes: BTreeMap<IndexId, std::sync::Arc<PhysicalIndexFile>>,
 	physical_statistics: Option<std::sync::Arc<PhysicalStatisticsFiles>>,
+	job_catalog: JobCatalog,
 	retired_generations: Vec<RetiredGeneration>,
 	generation_cleanup_failures: u64,
 	last_checkpoint: Instant,
@@ -213,6 +232,13 @@ impl LocalStore {
 		let database = DatabaseRoot::default();
 		let generation = build_generation(&database, 1)?;
 		create_generation_files(root, &generation, true)?;
+		let job_catalog = JobCatalog::default();
+		let job_path = root.join(JOB_CATALOG_PATH);
+		let job_parent =
+			job_path.parent().ok_or_else(|| invalid("job catalog path has no parent directory"))?;
+		fs::create_dir_all(job_parent)
+			.map_err(|source| io_failure("create job catalog directory", source))?;
+		write_metadata_bytes(&job_path, &job_catalog.encode()?)?;
 		let name = database_name(root)?;
 		let superblock = DatabaseSuperblock {
 			name,
@@ -249,6 +275,7 @@ impl LocalStore {
 			graph_superblocks: generation.graph_superblocks,
 			physical_indexes,
 			physical_statistics: None,
+			job_catalog,
 			retired_generations: Vec::new(),
 			generation_cleanup_failures: 0,
 			last_checkpoint: Instant::now(),
@@ -282,6 +309,13 @@ impl LocalStore {
 		let io = PageIo::new(io_mode)?;
 		let engine = HybridReadEngine::new(pool_pages);
 		let (wal, opened) = open_local_state(root, &engine, io.file_open_mode())?;
+		let job_catalog = select_metadata_bytes(
+			&root.join(JOB_CATALOG_PATH),
+			MAX_JOB_CATALOG_BYTES,
+			JobCatalog::decode,
+			|catalog| catalog.generation,
+			"maintenance job catalog",
+		)?;
 		let OpenedLocalState {
 			root: database,
 			database_superblock,
@@ -294,6 +328,7 @@ impl LocalStore {
 			physical_statistics,
 		} = opened;
 		cleanup_orphan_generations(root, &file_catalog)?;
+		cleanup_orphan_quarantines(root, &file_catalog)?;
 		let physical_indexes = bind_physical_indexes(&database_catalog, &registry)?;
 		let state = LocalState {
 			database_superblock_path: root.join(DATABASE_SUPERBLOCK_FILE),
@@ -306,6 +341,7 @@ impl LocalStore {
 			graph_superblocks,
 			physical_indexes,
 			physical_statistics: Some(physical_statistics),
+			job_catalog,
 			retired_generations: Vec::new(),
 			generation_cleanup_failures: 0,
 			last_checkpoint: Instant::now(),
@@ -324,6 +360,68 @@ impl LocalStore {
 		Ok((store, database))
 	}
 
+	/// Returns the recovered immutable maintenance ledger projection.
+	pub(crate) fn maintenance_jobs(&self) -> Vec<MaintenanceJobInfo> {
+		self.state.lock().job_catalog.jobs.clone()
+	}
+
+	/// Opens one catalog-reachable immutable rejected-item file.
+	pub(crate) fn open_quarantine(&self, id: Uuid) -> FerrosGrynnResult<QuarantineArchiveReader> {
+		let expected = format!("admin/quarantine/{id}.fgq");
+		let registered = self.state.lock().file_catalog.files.iter().any(|entry| {
+			entry.file_id.kind() == Some(crate::storage::types::DataFileKind::ImportQuarantine)
+				&& entry.path.as_str() == expected
+		});
+		if !registered {
+			return Err(FerrosGrynnError::invalid_argument("quarantine identity does not exist"));
+		}
+		let reader = QuarantineArchiveReader::open(&quarantine_path(&self.root, id))?;
+		if reader.id() != id {
+			return Err(invalid("quarantine path and file identity disagree"));
+		}
+		Ok(reader)
+	}
+
+	/// Removes one immutable rejected-item set through a catalog publication.
+	pub(crate) fn remove_quarantine(
+		&self,
+		database: &DatabaseRoot,
+		id: Uuid,
+	) -> FerrosGrynnResult<()> {
+		let expected = format!("admin/quarantine/{id}.fgq");
+		if !self.state.lock().file_catalog.files.iter().any(|entry| {
+			entry.file_id.kind() == Some(crate::storage::types::DataFileKind::ImportQuarantine)
+				&& entry.path.as_str() == expected
+		}) {
+			return Err(FerrosGrynnError::invalid_argument("quarantine identity does not exist"));
+		}
+		self.persist_generation(database, false, None, Some(id)).map(drop)?;
+		// The catalog publication is authoritative. A reader may still pin the
+		// file on Windows; startup orphan cleanup retries physical removal.
+		drop(fs::remove_file(quarantine_path(&self.root, id)));
+		Ok(())
+	}
+
+	/// Replaces the durable job ledger through `FGJB` metadata COW.
+	pub(crate) fn persist_maintenance_jobs(
+		&self,
+		jobs: &[MaintenanceJobInfo],
+	) -> FerrosGrynnResult<()> {
+		let mut state = self.state.lock();
+		let generation = state
+			.job_catalog
+			.generation
+			.checked_add(1)
+			.ok_or_else(|| invalid("job catalog generation is exhausted"))?;
+		let catalog = JobCatalog {
+			generation,
+			jobs: jobs.to_vec(),
+		};
+		write_metadata_bytes(&self.root.join(JOB_CATALOG_PATH), &catalog.encode()?)?;
+		state.job_catalog = catalog;
+		Ok(())
+	}
+
 	/// Persists one already validated MVCC root before it becomes visible.
 	pub(crate) fn persist_root(
 		&self,
@@ -334,7 +432,7 @@ impl LocalStore {
 		if graph_catalog_only {
 			self.persist_graph_catalog(database, dictionary_changed)
 		} else {
-			self.persist_generation(database, false).map(drop)
+			self.persist_generation(database, false, None, None).map(drop)
 		}
 	}
 
@@ -430,14 +528,17 @@ impl LocalStore {
 	pub(crate) fn persist_import_root(
 		&self,
 		database: &DatabaseRoot,
+		quarantine: Option<&mut QuarantineArtifact>,
 	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
-		self.persist_generation(database, true)
+		self.persist_generation(database, true, quarantine, None)
 	}
 
 	fn persist_generation(
 		&self,
 		database: &DatabaseRoot,
 		import: bool,
+		mut quarantine: Option<&mut QuarantineArtifact>,
+		removed_quarantine: Option<Uuid>,
 	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
 		let mut state = self.state.lock();
 		self.checkpoint_if_due(&mut state)?;
@@ -461,6 +562,11 @@ impl LocalStore {
 		} else {
 			(build_generation(database, state.file_catalog.next_file_instance_id)?, None)
 		};
+		generation.update_quarantines(
+			&state.file_catalog,
+			quarantine.as_ref().map(|artifact| artifact.id()),
+			removed_quarantine,
+		)?;
 		#[cfg(test)]
 		if import {
 			inject_import_failure(ImportFailurePoint::AfterBuild)?;
@@ -469,6 +575,9 @@ impl LocalStore {
 			create_import_generation_files(&self.root, &generation)?;
 		} else {
 			create_generation_files(&self.root, &generation, false)?;
+		}
+		if let Some(artifact) = quarantine.as_deref_mut() {
+			artifact.install(&self.root)?;
 		}
 		#[cfg(test)]
 		if import {
@@ -500,6 +609,9 @@ impl LocalStore {
 		let outcome = self.wal.commit_tx(tx)?;
 		if let Some(generation) = &mut unpublished {
 			generation.publish();
+		}
+		if let Some(artifact) = quarantine {
+			artifact.publish();
 		}
 		if outcome.commit_ts().get() != database.commit_ts {
 			return Err(invalid("WAL published an unexpected logical commit timestamp"));

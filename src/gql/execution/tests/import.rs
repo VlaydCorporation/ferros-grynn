@@ -94,6 +94,61 @@ fn gql_import_abort_and_skip_match_callback_atomicity() {
 }
 
 #[test]
+fn gql_quarantine_retains_source_kind_and_for_binding() -> crate::gql_status::FerrosGrynnResult<()>
+{
+	let store = import_store();
+	let results = store.execute(
+		"BEGIN IMPORT WITH (ON VIOLATION = QUARANTINE, REJECT LIMIT = 1, SORT_MEM = 4096, \
+		 PARALLELISM = 1); FOR $id IN ['alice', 'alice'] { CREATE person:$id; }; END IMPORT;",
+		&Object::new(),
+	)?;
+	let result = results.into_iter().next().ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(
+			"GrynQL quarantine did not return a report",
+		)
+	})?;
+	let outcome = result.result?;
+	let Value::Object(report) = outcome.value() else {
+		return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+			"GrynQL quarantine report is not an object",
+		));
+	};
+	let Value::Uuid(id) = report.get("quarantine").ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(
+			"GrynQL quarantine report has no identity",
+		)
+	})?
+	else {
+		return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+			"GrynQL quarantine identity is not a UUID",
+		));
+	};
+	let mut reader = store.open_quarantine(crate::datastore::QuarantineId::from_uuid(*id))?;
+	let item = reader.read_next()?.ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(
+			"GrynQL quarantine has no rejected item",
+		)
+	})?;
+	let Value::Object(payload) = item.payload() else {
+		return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+			"GrynQL quarantine payload is not an object",
+		));
+	};
+	assert_eq!(payload.get("statement_kind"), Some(&Value::from("FOR")));
+	assert_eq!(payload.get("item"), Some(&Value::from(2_u64)));
+	assert!(payload.get("source").is_some_and(|value| {
+		matches!(value, Value::String(source) if source.starts_with("FOR $id"))
+	}));
+	let Some(Value::Object(bindings)) = payload.get("bindings") else {
+		return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+			"GrynQL quarantine bindings are not an object",
+		));
+	};
+	assert_eq!(bindings.get("id"), Some(&Value::from("alice")));
+	Ok(())
+}
+
+#[test]
 fn gql_and_callback_import_publish_the_same_logical_root_and_report() {
 	let gql = import_store();
 	let callback = import_store();

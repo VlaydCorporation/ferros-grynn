@@ -178,9 +178,10 @@ fn estimate_expression(
 	let expected = constant
 		.and_then(|value| {
 			let mut context = EncodeContext::default();
-			encode_index_key(&[(value, &field.value_type)], &mut context)
-				.ok()
-				.map(|key| histogram_cardinality(distribution, &key, comparison))
+			encode_index_key(&[(value, &field.value_type)], &mut context).ok().map(|key| {
+				let sampled = histogram_cardinality(distribution, &key, comparison);
+				scale_histogram_cardinality(distribution, sampled, input.expected)
+			})
 		})
 		.unwrap_or_else(|| match comparison {
 			ScalarEstimate::Equal => input.expected.div_ceil(distribution.distinct_count.max(1)),
@@ -204,6 +205,18 @@ fn estimate_expression(
 		expected.min(input.upper),
 		expected.saturating_mul(uncertainty).min(input.upper),
 	)
+}
+
+fn scale_histogram_cardinality(
+	histogram: &crate::stats::PropertyHistogram,
+	sampled: u64,
+	population: u64,
+) -> u64 {
+	if histogram.method == HistogramMethod::Approximate {
+		sampled.saturating_mul(population).div_ceil(u64::from(histogram.sample_count).max(1))
+	} else {
+		sampled
+	}
 }
 
 fn statistics_meta(snapshot: &PlannerSnapshot, scope: StatisticsScope) -> PlannerStatisticsMeta {
@@ -362,6 +375,12 @@ mod tests {
 		assert_eq!(histogram_cardinality(&histogram, &[10], ScalarEstimate::Greater), 9);
 		assert_eq!(histogram_cardinality(&histogram, &[10], ScalarEstimate::GreaterOrEqual), 10);
 		assert_eq!(histogram_cardinality(&histogram, &[10], ScalarEstimate::Equal), 1);
+		let approximate = PropertyHistogram {
+			method: HistogramMethod::Approximate,
+			sample_count: 20,
+			..histogram.clone()
+		};
+		assert_eq!(scale_histogram_cardinality(&approximate, 5, 100), 25);
 
 		let weights = CostWeights::default();
 		let rows = Cardinality::exact(100);

@@ -1,4 +1,13 @@
-use super::{PropertyHistogramKey, StatisticsScope, analyze_database};
+use std::num::NonZeroU32;
+
+use super::{
+	AnalyzeMethod,
+	HistogramMethod,
+	PropertyHistogramKey,
+	StatisticsScope,
+	analyze_database,
+	analyze_database_with_method_at,
+};
 use crate::{
 	datastore::{ClassField, ClassSchema, Datastore},
 	gql_status::FerrosGrynnResult,
@@ -70,5 +79,29 @@ fn full_scan_separates_base_and_effective_populations() -> FerrosGrynnResult<()>
 			crate::gql_status::FerrosGrynnError::invalid_storage_file("effective histogram absent")
 		})?;
 	assert_ne!(base.buckets[0].lower, effective.buckets[0].lower);
+
+	let scratch = std::env::temp_dir().join(format!("fg-stats-{}", crate::values::Uuid::now_v7()));
+	let sampled = analyze_database_with_method_at(&root, &scratch, AnalyzeMethod::Approximate {
+		sample_count: NonZeroU32::new(1_024).ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("test sample is zero")
+		})?,
+	})?;
+	let sampled_base = sampled
+		.base()
+		.property_histograms
+		.get(&PropertyHistogramKey {
+			class_id,
+			field_id,
+			scope: StatisticsScope::Base,
+		})
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_storage_file(
+				"sampled base histogram absent",
+			)
+		})?;
+	assert_eq!(sampled_base.method, HistogramMethod::Approximate);
+	assert_eq!(sampled_base.sample_count, 1);
+	assert_eq!(sampled_base.distinct_count, 1);
+	drop(std::fs::remove_dir_all(scratch));
 	Ok(())
 }

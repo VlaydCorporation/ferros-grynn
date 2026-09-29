@@ -1,71 +1,88 @@
-use std::collections::BTreeMap;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	sync::Arc,
+};
 
-use super::ir::{
-	Aggregate,
-	Builtin,
-	ClosureEffect,
-	Column,
-	EndpointDomain,
-	Expand,
-	LogicalBlock,
-	LogicalBlockStatement,
-	LogicalBuildGraph,
-	LogicalBuildGraphSource,
-	LogicalClosure,
-	LogicalClosureBody,
-	LogicalDmlData,
-	LogicalDmlKind,
-	LogicalDmlReturn,
-	LogicalDmlReturnItem,
-	LogicalDmlSelector,
-	LogicalDmlStatement,
-	LogicalDmlTarget,
-	LogicalExpect,
-	LogicalExplain,
-	LogicalGraphContract,
-	LogicalGraphDmlStatement,
-	LogicalGraphPropertyMutation,
-	LogicalGraphReference,
-	LogicalHyperPattern,
-	LogicalIndexHint,
-	LogicalLetValue,
-	LogicalLinearPattern,
-	LogicalMatch,
-	LogicalMatchContains,
-	LogicalMatchPattern,
-	LogicalMatchPatternKind,
-	LogicalMatchSelector,
-	LogicalOrder,
-	LogicalProgram,
-	LogicalRecordTarget,
-	LogicalRelateEdge,
-	LogicalRepeat,
-	LogicalReturnGraph,
-	LogicalSchemaStatement,
-	LogicalSelect,
-	LogicalSelectAccess,
-	LogicalSelectItem,
-	LogicalSelectJoin,
-	LogicalSelectSource,
-	LogicalSelectSourceKind,
-	LogicalSelectStart,
-	LogicalStatement,
-	LogicalTraverse,
-	LogicalTraverseSource,
-	LogicalTraverseStep,
-	LogicalWildcardField,
-	LogicalWithinPattern,
-	MatchBinding,
-	MatchOp,
-	PathExpand,
-	ScanTarget,
-	Schema,
-	TraverseStepKind,
-	TypedExpr,
-	TypedExprKind,
+use super::{
+	closure::LanguageClosureState,
+	ir::{
+		Aggregate,
+		Builtin,
+		ClosureEffect,
+		Column,
+		EndpointDomain,
+		Expand,
+		LogicalBlock,
+		LogicalBlockStatement,
+		LogicalBuildGraph,
+		LogicalBuildGraphSource,
+		LogicalClosure,
+		LogicalClosureBody,
+		LogicalDmlData,
+		LogicalDmlKind,
+		LogicalDmlReturn,
+		LogicalDmlReturnItem,
+		LogicalDmlSelector,
+		LogicalDmlStatement,
+		LogicalDmlTarget,
+		LogicalExpect,
+		LogicalExplain,
+		LogicalGraphContract,
+		LogicalGraphDmlStatement,
+		LogicalGraphPropertyMutation,
+		LogicalGraphReference,
+		LogicalHyperPattern,
+		LogicalIndexHint,
+		LogicalLetValue,
+		LogicalLinearPattern,
+		LogicalMatch,
+		LogicalMatchContains,
+		LogicalMatchPattern,
+		LogicalMatchPatternKind,
+		LogicalMatchSelector,
+		LogicalOrder,
+		LogicalProgram,
+		LogicalRecordTarget,
+		LogicalRelateEdge,
+		LogicalRepeat,
+		LogicalReturnGraph,
+		LogicalSchemaStatement,
+		LogicalSelect,
+		LogicalSelectAccess,
+		LogicalSelectItem,
+		LogicalSelectJoin,
+		LogicalSelectSource,
+		LogicalSelectSourceKind,
+		LogicalSelectStart,
+		LogicalStatement,
+		LogicalTraverse,
+		LogicalTraverseSource,
+		LogicalTraverseStep,
+		LogicalWildcardField,
+		LogicalWithinPattern,
+		MatchBinding,
+		MatchOp,
+		NamedFunctionKey,
+		PathExpand,
+		ScanTarget,
+		Schema,
+		TraverseStepKind,
+		TypedExpr,
+		TypedExprKind,
+	},
 };
 use crate::{
-	datastore::{ClassIndexKind, ClassSchemaMode, IndexScope, LEVEL_PATH_PROPERTY},
+	datastore::{
+		ClassIndexKind,
+		ClassSchemaMode,
+		FunctionEffect,
+		FunctionId,
+		IndexMaintenanceMode,
+		IndexScope,
+		LEVEL_PATH_PROPERTY,
+		SchemaFunction,
+		SchemaFunctionParameter,
+	},
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, TextSpan},
 	graph::{GraphTopologyConstraint, GraphTopologyConstraints},
 	syn::{
@@ -78,8 +95,10 @@ use crate::{
 		ClassSchemaModeName,
 		DefineClassStatement,
 		DefineFieldStatement,
+		DefineFunctionStatement,
 		DefineGraphStatement,
 		DefineIndexStatement,
+		DefineParameterStatement,
 		DmlData,
 		DmlReturn,
 		DmlReturnItem,
@@ -87,10 +106,13 @@ use crate::{
 		ExpectClause,
 		Expr,
 		ExprKind,
+		FunctionEffectName,
+		FunctionSignatureName,
 		GraphContract,
 		GraphFamilyName,
 		GraphPropertyMutation,
 		GraphValidatorName,
+		Identifier,
 		IndexScopeName,
 		InfoTarget,
 		LetValue,
@@ -105,6 +127,7 @@ use crate::{
 		MatchSelector,
 		MatchStatement,
 		MatchWithinPattern,
+		ParameterCommentChange,
 		Program,
 		RecordKey,
 		RemoveTarget,
@@ -143,6 +166,7 @@ const MAX_MATCH_PATH_DEPTH: u32 = 30;
 const MAX_MATCH_WITHIN_DEPTH: u32 = 7;
 
 pub(super) trait QueryCatalog {
+	fn schema_epoch(&self) -> u64;
 	fn schema(&self, class: &str) -> FerrosGrynnResult<Schema>;
 	fn schema_mode(&self, class: &str) -> FerrosGrynnResult<ClassSchemaMode>;
 	fn class_kind(&self, class: &str) -> FerrosGrynnResult<AtomKind>;
@@ -150,6 +174,15 @@ pub(super) trait QueryCatalog {
 	fn graph(&self, name: &str) -> FerrosGrynnResult<GraphRef>;
 	/// Resolves an optional named graph without turning absence into an error.
 	fn graph_if_exists(&self, name: &str) -> FerrosGrynnResult<Option<GraphRef>>;
+	fn functions(
+		&self,
+		namespace: &str,
+		name: &str,
+	) -> FerrosGrynnResult<Vec<Arc<crate::datastore::SchemaFunction>>>;
+	fn function(
+		&self,
+		id: FunctionId,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaFunction>>>;
 }
 
 pub(super) fn analyze(
@@ -158,7 +191,7 @@ pub(super) fn analyze(
 	catalog: &dyn QueryCatalog,
 	variables: &Object,
 ) -> FerrosGrynnResult<LogicalProgram> {
-	Analyzer::new(source, catalog, variables).program(program)
+	Analyzer::new(source, catalog, variables, &BTreeSet::new()).program(program)
 }
 
 pub(super) fn analyze_statement(
@@ -167,24 +200,53 @@ pub(super) fn analyze_statement(
 	catalog: &dyn QueryCatalog,
 	variables: &Object,
 ) -> FerrosGrynnResult<LogicalProgram> {
-	Analyzer::new(source, catalog, variables).single_statement(statement)
+	Analyzer::new(source, catalog, variables, &BTreeSet::new()).single_statement(statement)
+}
+
+pub(super) fn analyze_statement_with_mutable(
+	statement: &crate::syn::Statement,
+	source: &str,
+	catalog: &dyn QueryCatalog,
+	variables: &Object,
+	mutable_variables: &BTreeSet<Box<str>>,
+) -> FerrosGrynnResult<LogicalProgram> {
+	Analyzer::new(source, catalog, variables, mutable_variables).single_statement(statement)
+}
+
+pub(super) fn analyze_statement_with_runtime(
+	statement: &crate::syn::Statement,
+	source: &str,
+	catalog: &dyn QueryCatalog,
+	variables: &Object,
+	mutable_variables: &BTreeSet<Box<str>>,
+	function_cache: &LanguageClosureState,
+) -> FerrosGrynnResult<LogicalProgram> {
+	Analyzer::new(source, catalog, variables, mutable_variables)
+		.with_function_cache(function_cache)
+		.single_statement(statement)
 }
 
 struct Analyzer<'a> {
 	source: &'a str,
 	catalog: &'a dyn QueryCatalog,
 	slots: BTreeMap<Box<str>, Slot>,
-	initial_slots: Vec<(Box<str>, u32)>,
+	initial_slots: Vec<(Box<str>, u32, bool)>,
 	next_slot: u32,
 	scopes: Vec<Vec<(Box<str>, Option<Slot>)>>,
 	variables: &'a Object,
 	statement_now: DateTime,
+	function_stack: Vec<FunctionId>,
+	function_overrides: BTreeMap<FunctionId, Arc<SchemaFunction>>,
+	function_cache: Option<&'a LanguageClosureState>,
+	current_function: Option<Arc<SchemaFunction>>,
+	current_function_has_explicit_result: bool,
 }
 
 #[derive(Debug, Clone)]
 struct Slot {
 	id: u32,
 	ty: Type,
+	mutable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +284,12 @@ struct MatchAlias {
 }
 
 impl<'a> Analyzer<'a> {
-	fn new(source: &'a str, catalog: &'a dyn QueryCatalog, variables: &'a Object) -> Self {
+	fn new(
+		source: &'a str,
+		catalog: &'a dyn QueryCatalog,
+		variables: &'a Object,
+		mutable_variables: &BTreeSet<Box<str>>,
+	) -> Self {
 		let mut slots = BTreeMap::new();
 		let mut initial_slots = Vec::new();
 		for (index, (name, value)) in variables.iter().enumerate() {
@@ -230,8 +297,13 @@ impl<'a> Analyzer<'a> {
 			slots.insert(name.as_str().into(), Slot {
 				id,
 				ty: value.value_type(),
+				mutable: mutable_variables.contains(name.as_str()),
 			});
-			initial_slots.push((name.as_str().into(), id));
+			initial_slots.push((
+				name.as_str().into(),
+				id,
+				mutable_variables.contains(name.as_str()),
+			));
 		}
 		Self {
 			source,
@@ -242,7 +314,17 @@ impl<'a> Analyzer<'a> {
 			scopes: vec![Vec::new()],
 			variables,
 			statement_now: DateTime::from(jiff::Zoned::now()),
+			function_stack: Vec::new(),
+			function_overrides: BTreeMap::new(),
+			function_cache: None,
+			current_function: None,
+			current_function_has_explicit_result: true,
 		}
+	}
+
+	fn with_function_cache(mut self, function_cache: &'a LanguageClosureState) -> Self {
+		self.function_cache = Some(function_cache);
+		self
 	}
 
 	fn program(mut self, program: &Program) -> FerrosGrynnResult<LogicalProgram> {
@@ -384,14 +466,26 @@ impl<'a> Analyzer<'a> {
 			StatementKind::DefineIndex(definition) => {
 				LogicalStatement::Schema(self.define_index(definition)?)
 			}
+			StatementKind::DefineParameter(definition) => {
+				LogicalStatement::Schema(self.define_parameter(definition)?)
+			}
+			StatementKind::DefineFunction(definition) => {
+				LogicalStatement::Schema(self.define_function(definition)?)
+			}
 			StatementKind::Remove(statement) => {
-				LogicalStatement::Schema(Self::remove(&statement.target))
+				LogicalStatement::Schema(self.remove(&statement.target)?)
 			}
 			StatementKind::Alter(statement) => {
 				LogicalStatement::Schema(self.alter(&statement.target)?)
 			}
 			StatementKind::Info(statement) => {
-				LogicalStatement::Schema(Self::info(&statement.target))
+				LogicalStatement::Schema(self.info(&statement.target)?)
+			}
+			StatementKind::Maintenance(_) | StatementKind::Kill(_) => {
+				return Err(self.semantic(
+					"Maintenance statements must be executed through Datastore or GqlSession.",
+					statement.span,
+				));
 			}
 			StatementKind::Import(_) => {
 				return Err(self
@@ -431,7 +525,7 @@ impl<'a> Analyzer<'a> {
 						));
 					}
 				}
-				let slot = self.declare(&binding.name, value_type)?;
+				let slot = self.declare_mutable(&binding.name, value_type)?;
 				LogicalStatement::Let {
 					name: binding.name.value.clone(),
 					slot,
@@ -534,6 +628,9 @@ impl<'a> Analyzer<'a> {
 					value,
 				}
 			}
+			StatementKind::Sleep(duration) => LogicalStatement::Sleep(
+				crate::gql::options::resolve_duration(duration, self.variables, "SLEEP")?,
+			),
 			StatementKind::AssertInvariants(assertion) => {
 				let report = assertion.report.unwrap_or(1_000) as usize;
 				if report > 1_000 {
@@ -1178,6 +1275,12 @@ impl<'a> Analyzer<'a> {
 				graph: self.catalog.graph(&graph.value)?.id(),
 			},
 		};
+		if definition.deferred && kind == ClassIndexKind::Unique {
+			return Err(self.semantic(
+				"DEFER is supported only for Standard and Count indexes.",
+				definition.name.span,
+			));
+		}
 		Ok(LogicalSchemaStatement::DefineIndex {
 			mode: definition.mode,
 			class: definition.class.value.clone(),
@@ -1185,48 +1288,235 @@ impl<'a> Analyzer<'a> {
 			kind,
 			fields,
 			scope,
+			maintenance: if definition.deferred {
+				IndexMaintenanceMode::Deferred
+			} else {
+				IndexMaintenanceMode::Immediate
+			},
+			concurrently: definition.concurrently,
 		})
 	}
 
-	fn remove(target: &RemoveTarget) -> LogicalSchemaStatement {
+	fn define_parameter(
+		&self,
+		definition: &DefineParameterStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		Ok(LogicalSchemaStatement::DefineParameter {
+			mode: definition.mode,
+			name: definition.name.value.clone(),
+			value: self.expr(&definition.value, None)?,
+			comment: definition.comment.as_deref().map(Text::from),
+		})
+	}
+
+	fn define_function(
+		&self,
+		definition: &DefineFunctionStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		let parameters = definition
+			.parameters
+			.iter()
+			.map(|parameter| {
+				Ok((parameter.name.value.clone(), self.type_name(&parameter.value_type)?))
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let declared_result =
+			definition.result_type.as_ref().map(|result| self.type_name(result)).transpose()?;
+		let body = Text::from(self.source_slice(definition.body.span)?);
+		let pending = SchemaFunction::new(
+			definition.namespace.value.as_ref(),
+			definition.name.value.as_ref(),
+			parameters
+				.iter()
+				.map(|(name, value_type)| {
+					SchemaFunctionParameter::new(name.as_ref(), value_type.clone())
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?,
+			declared_result.clone().unwrap_or(Type::Any),
+			function_effect(definition.effect),
+			definition.cost,
+			definition.max_depth,
+			body.clone(),
+		)?;
+		let closure = crate::syn::ClosureExpr {
+			parameters: definition
+				.parameters
+				.iter()
+				.map(|parameter| crate::syn::ClosureParameter {
+					name: parameter.name.clone(),
+					declared_type: Some(parameter.value_type.clone()),
+				})
+				.collect(),
+			result_type: definition.result_type.clone(),
+			body: crate::syn::ClosureBody::Block(definition.body.clone()),
+		};
+		let analyzer = Self {
+			source: self.source,
+			catalog: self.catalog,
+			slots: BTreeMap::new(),
+			initial_slots: Vec::new(),
+			next_slot: 0,
+			scopes: vec![Vec::new()],
+			variables: self.variables,
+			statement_now: self.statement_now.clone(),
+			function_stack: Vec::new(),
+			function_overrides: BTreeMap::new(),
+			function_cache: self.function_cache,
+			current_function: Some(Arc::new(pending)),
+			current_function_has_explicit_result: declared_result.is_some(),
+		};
+		let analyzed = analyzer.closure(&closure, definition.body.span)?;
+		let effect = function_effect(definition.effect);
+		let allowed = match effect {
+			FunctionEffect::Pure => ClosureEffect::Pure,
+			FunctionEffect::Stable => ClosureEffect::StableRead,
+			FunctionEffect::Impure => ClosureEffect::DataMutation,
+		};
+		if analyzed.effect > allowed {
+			return Err(self.semantic(
+				"Function body exceeds its declared effect or performs a schema mutation.",
+				definition.body.span,
+			));
+		}
+		if definition.cost
+			&& (!matches!(analyzed.result, Type::Int | Type::Float | Type::Decimal | Type::Number)
+				|| effect != FunctionEffect::Pure)
+		{
+			return Err(self.semantic(
+				"COST functions must be PURE and return a number.",
+				definition.body.span,
+			));
+		}
+		Ok(LogicalSchemaStatement::DefineFunction {
+			mode: definition.mode,
+			namespace: definition.namespace.value.clone(),
+			name: definition.name.value.clone(),
+			parameters,
+			result: analyzed.result,
+			effect,
+			cost: definition.cost,
+			max_depth: definition.max_depth,
+			body,
+			comment: definition.comment.as_deref().map(Text::from),
+		})
+	}
+
+	fn remove(&self, target: &RemoveTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
+			RemoveTarget::Function {
+				if_exists,
+				signature,
+			} => Ok(LogicalSchemaStatement::RemoveFunction {
+				if_exists: *if_exists,
+				namespace: signature.namespace.value.clone(),
+				name: signature.name.value.clone(),
+				signature: self.function_signature(signature)?,
+			}),
+			RemoveTarget::Parameter {
+				if_exists,
+				name,
+			} => Ok(LogicalSchemaStatement::RemoveParameter {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+			}),
 			RemoveTarget::Graph {
 				if_exists,
 				name,
-			} => LogicalSchemaStatement::RemoveGraph {
+			} => Ok(LogicalSchemaStatement::RemoveGraph {
 				if_exists: *if_exists,
 				name: name.value.clone(),
-			},
+			}),
 			RemoveTarget::Class {
 				if_exists,
 				name,
-			} => LogicalSchemaStatement::RemoveClass {
+			} => Ok(LogicalSchemaStatement::RemoveClass {
 				if_exists: *if_exists,
 				name: name.value.clone(),
-			},
+			}),
 			RemoveTarget::Field {
 				if_exists,
 				name,
 				class,
-			} => LogicalSchemaStatement::RemoveField {
+			} => Ok(LogicalSchemaStatement::RemoveField {
 				if_exists: *if_exists,
 				class: class.value.clone(),
 				name: name.value.clone(),
-			},
+			}),
 			RemoveTarget::Index {
 				if_exists,
 				name,
 				class,
-			} => LogicalSchemaStatement::RemoveIndex {
+			} => Ok(LogicalSchemaStatement::RemoveIndex {
 				if_exists: *if_exists,
 				class: class.value.clone(),
 				name: name.value.clone(),
-			},
+			}),
 		}
 	}
 
 	fn alter(&self, target: &AlterTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
+			AlterTarget::Function {
+				if_exists,
+				signature,
+				effect,
+				cost,
+				max_depth,
+				body,
+				comment,
+			} => {
+				let parameter_types = self.function_signature(signature)?;
+				let body = body
+					.as_ref()
+					.map(|body| self.source_slice(body.span).map(Text::from))
+					.transpose()?;
+				if effect.is_some() || cost.is_some() || max_depth.is_some() || body.is_some() {
+					self.validate_altered_function(
+						signature.namespace.value.as_ref(),
+						signature.name.value.as_ref(),
+						parameter_types.as_deref(),
+						effect.map(function_effect),
+						*cost,
+						*max_depth,
+						body.as_ref(),
+						signature.name.span,
+					)?;
+				}
+				Ok(LogicalSchemaStatement::AlterFunction {
+					if_exists: *if_exists,
+					namespace: signature.namespace.value.clone(),
+					name: signature.name.value.clone(),
+					signature: parameter_types,
+					effect: effect.map(function_effect),
+					cost: *cost,
+					max_depth: *max_depth,
+					body,
+					comment: match comment {
+						ParameterCommentChange::Keep => None,
+						ParameterCommentChange::Set(comment) => {
+							Some(Some(Text::from(comment.as_ref())))
+						}
+						ParameterCommentChange::Drop => Some(None),
+					},
+				})
+			}
+			AlterTarget::Parameter {
+				if_exists,
+				name,
+				value,
+				comment,
+			} => Ok(LogicalSchemaStatement::AlterParameter {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+				value: value.as_ref().map(|value| self.expr(value, None)).transpose()?,
+				comment: match comment {
+					ParameterCommentChange::Keep => None,
+					ParameterCommentChange::Set(comment) => {
+						Some(Some(Text::from(comment.as_ref())))
+					}
+					ParameterCommentChange::Drop => Some(None),
+				},
+			}),
 			AlterTarget::Class {
 				if_exists,
 				name,
@@ -1259,9 +1549,94 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
-	fn info(target: &InfoTarget) -> LogicalSchemaStatement {
-		match target {
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "function-call analysis needs the complete typed call context"
+	)]
+	fn validate_altered_function(
+		&self,
+		namespace: &str,
+		name: &str,
+		signature: Option<&[Type]>,
+		effect: Option<FunctionEffect>,
+		cost: Option<bool>,
+		max_depth: Option<Option<u8>>,
+		body: Option<&Text>,
+		span: TextSpan,
+	) -> FerrosGrynnResult<()> {
+		let mut candidates = self.catalog.functions(namespace, name)?;
+		if let Some(signature) = signature {
+			candidates.retain(|function| {
+				function.parameters().map(SchemaFunctionParameter::value_type).eq(signature.iter())
+			});
+		}
+		if candidates.len() != 1 {
+			return Ok(());
+		}
+		let Some(existing) = candidates.pop() else {
+			return Ok(());
+		};
+		let parameters = existing
+			.parameters()
+			.map(|parameter| {
+				SchemaFunctionParameter::new(
+					parameter.name().clone(),
+					parameter.value_type().clone(),
+				)
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut replacement = SchemaFunction::new(
+			existing.namespace().clone(),
+			existing.name().clone(),
+			parameters,
+			existing.result().clone(),
+			effect.unwrap_or(existing.effect()),
+			cost.unwrap_or(existing.is_cost()),
+			max_depth.unwrap_or(existing.max_depth()),
+			body.cloned().unwrap_or_else(|| existing.body().clone()),
+		)?;
+		replacement.id = existing.id();
+		replacement.version = existing.version();
+		if replacement.is_cost()
+			&& !matches!(
+				replacement.result(),
+				Type::Int | Type::Float | Type::Decimal | Type::Number
+			) {
+			return Err(self.semantic("COST functions must return a number.", span));
+		}
+		compile_named_function(
+			self.catalog,
+			&replacement,
+			&self.function_stack,
+			&self.function_overrides,
+			self.function_cache,
+		)
+		.map(|_| ())
+		.map_err(|error| self.semantic(&format!("Altered function body is invalid: {error}"), span))
+	}
+
+	fn info(&self, target: &InfoTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		Ok(match target {
 			InfoTarget::Database => LogicalSchemaStatement::InfoDatabase,
+			InfoTarget::Function(signature) => LogicalSchemaStatement::InfoFunction {
+				namespace: signature.namespace.value.clone(),
+				name: signature.name.value.clone(),
+				signature: self.function_signature(signature)?,
+			},
+			InfoTarget::Parameter(name) => LogicalSchemaStatement::InfoParameter {
+				name: name.value.clone(),
+			},
+			InfoTarget::Job(job) => {
+				return Err(self.semantic(
+					"INFO FOR JOB must be executed through Datastore or GqlSession.",
+					job.span,
+				));
+			}
+			InfoTarget::Jobs => {
+				return Err(FerrosGrynnError::invalid_argument(
+					"INFO FOR JOBS must be executed through Datastore or GqlSession.",
+				));
+			}
 			InfoTarget::Class(name) => LogicalSchemaStatement::InfoClass {
 				name: name.value.clone(),
 			},
@@ -1272,7 +1647,31 @@ impl<'a> Analyzer<'a> {
 				class: class.value.clone(),
 				name: name.value.clone(),
 			},
-		}
+		})
+	}
+
+	fn function_signature(
+		&self,
+		signature: &FunctionSignatureName,
+	) -> FerrosGrynnResult<Option<Vec<Type>>> {
+		signature
+			.parameters
+			.as_ref()
+			.map(|parameters| {
+				parameters.iter().map(|parameter| self.type_name(parameter)).collect()
+			})
+			.transpose()
+	}
+
+	fn source_slice(&self, span: TextSpan) -> FerrosGrynnResult<&str> {
+		let start = span.offset as usize;
+		let end = span
+			.end()
+			.map(|end| end as usize)
+			.ok_or_else(|| self.semantic("Function body source range overflows.", span))?;
+		self.source
+			.get(start..end)
+			.ok_or_else(|| self.semantic("Function body source range is invalid.", span))
 	}
 
 	fn traverse(
@@ -1306,11 +1705,13 @@ impl<'a> Analyzer<'a> {
 		};
 		let graph =
 			statement.graph.as_ref().map(|graph| self.graph_reference(graph, None)).transpose()?;
-		let steps = statement
-			.steps
-			.iter()
-			.map(|step| self.traverse_step(&step.expression, step.span))
-			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut current_type = traverse_source_item_type(&source);
+		let mut steps = Vec::with_capacity(statement.steps.len());
+		for step in &statement.steps {
+			let analyzed = self.traverse_step(&step.expression, step.span, &current_type)?;
+			current_type = traverse_step_output_type(&analyzed, current_type);
+			steps.push(analyzed);
+		}
 		let mut result = Schema {
 			columns: vec![Column {
 				name: "current".into(),
@@ -1382,10 +1783,13 @@ impl<'a> Analyzer<'a> {
 			allow_aggregates,
 			aggregate_depth,
 		)?;
-		let steps = step_expressions
-			.into_iter()
-			.map(|step| self.traverse_step(step, step.span))
-			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut current_type = collection_item_type(&source.ty);
+		let mut steps = Vec::with_capacity(step_expressions.len());
+		for step in step_expressions {
+			let analyzed = self.traverse_step(step, step.span, &current_type)?;
+			current_type = traverse_step_output_type(&analyzed, current_type);
+			steps.push(analyzed);
+		}
 		Ok(TypedExpr {
 			kind: TypedExprKind::Traversal(Box::new(LogicalTraverse {
 				atom: false,
@@ -1412,6 +1816,7 @@ impl<'a> Analyzer<'a> {
 		&self,
 		expression: &Expr,
 		span: TextSpan,
+		current_type: &Type,
 	) -> FerrosGrynnResult<LogicalTraverseStep> {
 		if let Some(repeat) = parse_repeat_syntax(expression) {
 			return self.traverse_repeat(repeat, span);
@@ -1420,14 +1825,15 @@ impl<'a> Analyzer<'a> {
 			callee,
 			type_argument,
 			distinct,
+			argument_names,
 			arguments,
 		} = &expression.kind
 		else {
 			return Err(self.semantic("A traversal step must be a `tv::` call.", expression.span));
 		};
-		if type_argument.is_some() || *distinct {
+		if type_argument.is_some() || *distinct || argument_names.iter().any(Option::is_some) {
 			return Err(self.semantic(
-				"Traversal steps do not accept type arguments or DISTINCT.",
+				"Traversal steps do not accept type arguments, named arguments, or DISTINCT.",
 				expression.span,
 			));
 		}
@@ -1466,10 +1872,16 @@ impl<'a> Analyzer<'a> {
 			return Ok(LogicalTraverseStep {
 				kind,
 				arguments: Vec::new(),
+				named_function: None,
+				algorithm_input: None,
+				output_type: None,
 				match_plan: Some(Box::new(self.match_statement(statement)?)),
 				repeat: None,
 				span,
 			});
+		}
+		if kind == TraverseStepKind::Algorithm {
+			return self.traverse_algorithm(arguments, current_type, span);
 		}
 		let arguments = arguments
 			.iter()
@@ -1479,6 +1891,9 @@ impl<'a> Analyzer<'a> {
 		Ok(LogicalTraverseStep {
 			kind,
 			arguments,
+			named_function: None,
+			algorithm_input: None,
+			output_type: None,
 			match_plan: None,
 			repeat: None,
 			span,
@@ -1526,6 +1941,9 @@ impl<'a> Analyzer<'a> {
 		Ok(LogicalTraverseStep {
 			kind: TraverseStepKind::Repeat,
 			arguments: Vec::new(),
+			named_function: None,
+			algorithm_input: None,
+			output_type: None,
 			match_plan: None,
 			repeat: Some(LogicalRepeat {
 				body,
@@ -1533,6 +1951,96 @@ impl<'a> Analyzer<'a> {
 				until,
 				emit,
 			}),
+			span,
+		})
+	}
+
+	fn traverse_algorithm(
+		&self,
+		arguments: &[Expr],
+		current_type: &Type,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalTraverseStep> {
+		let Some((namespace, name)) = arguments.first().and_then(builtin_name) else {
+			return Err(
+				self.semantic("tv::algo expects a named `fn::name` as its first argument.", span)
+			);
+		};
+		if !namespace.eq_ignore_ascii_case("fn") {
+			return Err(self.semantic(
+				"tv::algo accepts only a named function from the `fn::` namespace.",
+				arguments[0].span,
+			));
+		}
+		let mut call_arguments = Vec::with_capacity(arguments.len());
+		call_arguments.push(TypedExpr {
+			kind: TypedExprKind::Constant(Value::None),
+			ty: current_type.clone(),
+			span,
+		});
+		call_arguments.extend(
+			arguments[1..]
+				.iter()
+				.map(|argument| self.expr(argument, None))
+				.collect::<FerrosGrynnResult<Vec<_>>>()?,
+		);
+		let argument_names = vec![None; call_arguments.len()];
+		let (invocation, output_type) =
+			self.named_function(name, &argument_names, call_arguments, span)?;
+		let (callee, named_function, mut resolved_arguments) = match invocation {
+			TypedExprKind::Invoke {
+				callee,
+				arguments,
+			} => (Some(*callee), None, arguments),
+			TypedExprKind::NamedInvoke {
+				function,
+				arguments,
+			} => (None, Some(function), arguments),
+			_ => {
+				return Err(self.semantic("tv::algo failed to resolve its named function.", span));
+			}
+		};
+		let implicit = resolved_arguments.remove(0);
+		let effect = callee
+			.as_ref()
+			.and_then(|callee| match &callee.kind {
+				TypedExprKind::Closure(closure) => {
+					Some(closure.named_function.map_or(closure.effect, |function| {
+						match function.effect {
+							FunctionEffect::Pure => ClosureEffect::Pure,
+							FunctionEffect::Stable => ClosureEffect::StableRead,
+							FunctionEffect::Impure => ClosureEffect::DataMutation,
+						}
+					}))
+				}
+				_ => None,
+			})
+			.or_else(|| {
+				named_function.map(|function| match function.effect {
+					FunctionEffect::Pure => ClosureEffect::Pure,
+					FunctionEffect::Stable => ClosureEffect::StableRead,
+					FunctionEffect::Impure => ClosureEffect::DataMutation,
+				})
+			});
+		if !matches!(effect, Some(ClosureEffect::Pure | ClosureEffect::StableRead)) {
+			return Err(FerrosGrynnError::closure_effect_not_allowed(
+				format!("{effect:?}"),
+				"tv::algo".to_owned(),
+			));
+		}
+		let mut step_arguments = Vec::with_capacity(resolved_arguments.len() + 1);
+		if let Some(callee) = callee {
+			step_arguments.push(callee);
+		}
+		step_arguments.extend(resolved_arguments);
+		Ok(LogicalTraverseStep {
+			kind: TraverseStepKind::Algorithm,
+			arguments: step_arguments,
+			named_function,
+			algorithm_input: Some(implicit.ty),
+			output_type: Some(output_type),
+			match_plan: None,
+			repeat: None,
 			span,
 		})
 	}
@@ -1668,6 +2176,8 @@ impl<'a> Analyzer<'a> {
 				Ok(LogicalOrder {
 					expression,
 					random: order.random,
+					collate: order.collate,
+					numeric: order.numeric,
 					direction: order.direction,
 					nulls: order.nulls,
 				})
@@ -2334,6 +2844,8 @@ impl<'a> Analyzer<'a> {
 				Ok(LogicalOrder {
 					expression,
 					random: order.random,
+					collate: order.collate,
+					numeric: order.numeric,
 					direction: order.direction,
 					nulls: order.nulls,
 				})
@@ -2864,13 +3376,24 @@ impl<'a> Analyzer<'a> {
 					allow_aggregates,
 					aggregate_depth,
 				)?;
+				let ty = if matches!(base.ty, Type::Matcher) {
+					if !matches!(field.value.to_ascii_lowercase().as_str(), "start" | "end") {
+						return Err(self.semantic(
+							"Matcher exposes only `start` and `end` fields.",
+							field.span,
+						));
+					}
+					Type::Option(Box::new(Type::Int))
+				} else {
+					Type::Any
+				};
 				(
 					TypedExprKind::Field {
 						base: Box::new(base),
 						field: field.value.clone(),
 						null_safe: *null_safe,
 					},
-					Type::Any,
+					ty,
 				)
 			}
 			ExprKind::Destructure {
@@ -2948,6 +3471,7 @@ impl<'a> Analyzer<'a> {
 				callee,
 				type_argument,
 				distinct,
+				argument_names,
 				arguments,
 			} => {
 				if let Some(function) = aggregate_name(callee) {
@@ -2965,6 +3489,12 @@ impl<'a> Analyzer<'a> {
 					if type_argument.is_some() {
 						return Err(self.semantic(
 							"Aggregate functions do not accept a type argument.",
+							expr.span,
+						));
+					}
+					if argument_names.iter().any(Option::is_some) {
+						return Err(self.semantic(
+							"Aggregate functions do not accept named arguments.",
 							expr.span,
 						));
 					}
@@ -3008,6 +3538,126 @@ impl<'a> Analyzer<'a> {
 						span: expr.span,
 					});
 				}
+				if let Some((namespace, name)) = builtin_name(callee) {
+					let key = format!(
+						"{}::{}",
+						namespace.to_ascii_lowercase(),
+						name.to_ascii_lowercase()
+					);
+					if matches!(
+						key.as_str(),
+						"array::push" | "array::pop" | "array::clear" | "set::add" | "set::clear"
+					) {
+						if *distinct
+							|| type_argument.is_some()
+							|| argument_names.iter().any(Option::is_some)
+						{
+							return Err(self.semantic(
+								"Mutable collection helpers do not accept DISTINCT, type \
+								 arguments, or named arguments.",
+								expr.span,
+							));
+						}
+						if schema.is_some() {
+							return Err(self.semantic(
+								"Mutable collection helpers are not allowed in row-producing \
+								 query expressions.",
+								expr.span,
+							));
+						}
+						let expected = if matches!(key.as_str(), "array::push" | "set::add") {
+							2
+						} else {
+							1
+						};
+						if arguments.len() != expected {
+							return Err(self.semantic(
+								&format!("Function `{key}` expects {expected} arguments."),
+								expr.span,
+							));
+						}
+						let Some(Expr {
+							kind: ExprKind::Parameter(binding),
+							..
+						}) = arguments.first()
+						else {
+							return Err(self.semantic(
+								"The first mutable collection argument must be a direct \
+								 `$binding`.",
+								expr.span,
+							));
+						};
+						let slot =
+							self.slots.get(binding.value.as_ref()).cloned().ok_or_else(|| {
+								self.semantic(
+									&format!("Unknown parameter `${}`.", binding.value),
+									binding.span,
+								)
+							})?;
+						if !slot.mutable {
+							return Err(self.semantic(
+								"Execute parameters, durable parameters, loop bindings, and \
+								 closure captures are immutable.",
+								binding.span,
+							));
+						}
+						let array_target =
+							matches!(key.as_str(), "array::push" | "array::pop" | "array::clear");
+						if array_target && !matches!(slot.ty, Type::Array(_) | Type::Any) {
+							return Err(self.semantic(
+								"Mutable array helper requires an array binding.",
+								binding.span,
+							));
+						}
+						if !array_target && !matches!(slot.ty, Type::Set(_) | Type::Any) {
+							return Err(self.semantic(
+								"Mutable set helper requires a set binding.",
+								binding.span,
+							));
+						}
+						let values = arguments[1..]
+							.iter()
+							.map(|argument| {
+								self.expr_context(
+									argument,
+									schema,
+									allow_current_field,
+									allow_aggregates,
+									aggregate_depth,
+								)
+							})
+							.collect::<FerrosGrynnResult<Vec<_>>>()?;
+						if let (Some(value), Type::Array(item) | Type::Set(item)) =
+							(values.first(), &slot.ty)
+							&& !compatible(item, &value.ty)
+						{
+							return Err(self.semantic(
+								&format!("Inserted value has type {}, expected {item}.", value.ty),
+								value.span,
+							));
+						}
+						let (function, ty) = match key.as_str() {
+							"array::push" => (Builtin::ArrayPush(slot.id), Type::Int),
+							"array::pop" => (Builtin::ArrayPop(slot.id), Type::Any),
+							"array::clear" => (Builtin::ArrayClear(slot.id), Type::None),
+							"set::add" => (Builtin::SetAdd(slot.id), Type::Bool),
+							"set::clear" => (Builtin::SetClear(slot.id), Type::None),
+							_ => {
+								return Err(
+									self.semantic("Unknown mutable collection helper.", expr.span)
+								);
+							}
+						};
+						return Ok(TypedExpr {
+							kind: TypedExprKind::Builtin {
+								function,
+								arguments: values,
+							},
+							ty,
+							span: expr.span,
+						});
+					}
+				}
 				if *distinct {
 					return Err(self
 						.semantic("DISTINCT is valid only inside a SELECT aggregate.", expr.span));
@@ -3024,17 +3674,39 @@ impl<'a> Analyzer<'a> {
 						)
 					})
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
-				if builtin_name(callee).is_some() {
-					let (function, ty) =
-						self.builtin(callee, type_argument.as_ref(), &arguments, expr.span)?;
-					(
-						TypedExprKind::Builtin {
-							function,
-							arguments,
-						},
-						ty,
-					)
+				if let Some((namespace, name)) = builtin_name(callee) {
+					if namespace.eq_ignore_ascii_case("fn") {
+						if type_argument.is_some() {
+							return Err(self.semantic(
+								"Named functions do not accept call-site type arguments.",
+								expr.span,
+							));
+						}
+						self.named_function(name, argument_names, arguments, expr.span)?
+					} else {
+						if argument_names.iter().any(Option::is_some) {
+							return Err(self.semantic(
+								"Built-in functions do not accept named arguments.",
+								expr.span,
+							));
+						}
+						let (function, ty) =
+							self.builtin(callee, type_argument.as_ref(), &arguments, expr.span)?;
+						(
+							TypedExprKind::Builtin {
+								function,
+								arguments,
+							},
+							ty,
+						)
+					}
 				} else {
+					if argument_names.iter().any(Option::is_some) {
+						return Err(self.semantic(
+							"Language closures do not accept named arguments.",
+							expr.span,
+						));
+					}
 					if type_argument.is_some() {
 						return Err(self.semantic(
 							"Language closures do not accept call-site type arguments.",
@@ -3200,15 +3872,24 @@ impl<'a> Analyzer<'a> {
 		let mut captures = self.slots.values().map(|slot| slot.id).collect::<Vec<_>>();
 		captures.sort_unstable();
 		captures.dedup();
+		let mut slots = self.slots.clone();
+		for slot in slots.values_mut() {
+			slot.mutable = false;
+		}
 		let mut analyzer = Self {
 			source: self.source,
 			catalog: self.catalog,
-			slots: self.slots.clone(),
+			slots,
 			initial_slots: Vec::new(),
 			next_slot: self.next_slot,
 			scopes: vec![Vec::new()],
 			variables: self.variables,
 			statement_now: self.statement_now.clone(),
+			function_stack: self.function_stack.clone(),
+			function_overrides: self.function_overrides.clone(),
+			function_cache: self.function_cache,
+			current_function: self.current_function.clone(),
+			current_function_has_explicit_result: self.current_function_has_explicit_result,
 		};
 		let mut parameters = Vec::with_capacity(closure.parameters.len());
 		for parameter in &closure.parameters {
@@ -3218,7 +3899,7 @@ impl<'a> Analyzer<'a> {
 				.map(|ty| analyzer.type_name(ty))
 				.transpose()?
 				.unwrap_or(Type::Any);
-			let slot = analyzer.declare(&parameter.name, ty.clone())?;
+			let slot = analyzer.declare_mutable(&parameter.name, ty.clone())?;
 			parameters.push((slot, ty));
 		}
 		let (body, inferred, effect) = match &closure.body {
@@ -3230,9 +3911,25 @@ impl<'a> Analyzer<'a> {
 			}
 			crate::syn::ClosureBody::Block(block) => {
 				let block = analyzer.block(block, 0, None)?.0;
-				let inferred = logical_block_result_type(&block);
-				let effect = logical_block_effect(&block);
-				(LogicalClosureBody::Block(block), inferred, effect)
+				if let [
+					LogicalBlockStatement {
+						statement: LogicalStatement::Return {
+							value,
+						},
+						..
+					},
+				] = block.statements.as_slice()
+				{
+					(
+						LogicalClosureBody::Expression(Box::new(value.clone())),
+						value.ty.clone(),
+						typed_expression_effect(value),
+					)
+				} else {
+					let inferred = logical_block_result_type(&block);
+					let effect = logical_block_effect(&block);
+					(LogicalClosureBody::Block(block), inferred, effect)
+				}
 			}
 		};
 		let result = closure
@@ -3255,7 +3952,223 @@ impl<'a> Analyzer<'a> {
 			retained_plan_bytes: std::mem::size_of::<LogicalClosure>().saturating_add(
 				(span.len as usize).saturating_mul(std::mem::size_of::<TypedExpr>()),
 			),
+			named_function: None,
 		})
+	}
+
+	fn named_function(
+		&self,
+		name: &str,
+		argument_names: &[Option<Identifier>],
+		arguments: Vec<TypedExpr>,
+		span: TextSpan,
+	) -> FerrosGrynnResult<(TypedExprKind, Type)> {
+		let mut candidates = self.catalog.functions("fn", name)?;
+		for override_function in
+			self.function_overrides.values().filter(|function| function.name().as_str() == name)
+		{
+			let signature = override_function
+				.parameters()
+				.map(SchemaFunctionParameter::value_type)
+				.collect::<Vec<_>>();
+			candidates.retain(|candidate| {
+				!candidate
+					.parameters()
+					.map(SchemaFunctionParameter::value_type)
+					.eq(signature.iter().copied())
+			});
+			candidates.push(Arc::clone(override_function));
+		}
+		if let Some(current) = self.current_function.as_ref().filter(|function| {
+			function.name().as_str() == name && function.parameters().len() == arguments.len()
+		}) {
+			let current_signature =
+				current.parameters().map(SchemaFunctionParameter::value_type).collect::<Vec<_>>();
+			candidates.retain(|candidate| {
+				!candidate
+					.parameters()
+					.map(SchemaFunctionParameter::value_type)
+					.eq(current_signature.iter().copied())
+			});
+			candidates.push(Arc::clone(current));
+		}
+		let mut ranked = candidates
+			.into_iter()
+			.filter(|function| function.parameters().len() == arguments.len())
+			.filter_map(|function| {
+				let order = named_argument_order(&function, argument_names)?;
+				let ranks = function
+					.parameters()
+					.zip(&order)
+					.map(|(parameter, argument_index)| {
+						function_argument_rank(
+							parameter.value_type(),
+							&arguments[*argument_index].ty,
+						)
+					})
+					.collect::<Option<Vec<_>>>()?;
+				let maximum = ranks.iter().copied().max().unwrap_or(0);
+				let total = ranks.iter().map(|rank| u32::from(*rank)).sum::<u32>();
+				Some(((maximum, total), function, order, ranks))
+			})
+			.collect::<Vec<_>>();
+		ranked.sort_by_key(|(rank, function, _, _)| (*rank, function.id()));
+		let Some((best_rank, function, order, ranks)) = ranked.first().cloned() else {
+			return Err(self.semantic(
+				&format!("No overload of `fn::{name}` accepts these argument types."),
+				span,
+			));
+		};
+		if ranked.get(1).is_some_and(|(rank, _, _, _)| *rank == best_rank) {
+			return Err(self.semantic(&format!("Call to `fn::{name}` is ambiguous."), span));
+		}
+		let mut supplied = arguments.into_iter().map(Some).collect::<Vec<_>>();
+		let mut arguments = Vec::with_capacity(supplied.len());
+		for argument_index in order {
+			let Some(argument) = supplied.get_mut(argument_index).and_then(Option::take) else {
+				return Err(self.semantic("Invalid named function argument mapping.", span));
+			};
+			arguments.push(argument);
+		}
+		let arguments = arguments
+			.into_iter()
+			.zip(function.parameters())
+			.zip(ranks)
+			.map(|((argument, parameter), rank)| {
+				if matches!(rank, 1 | 3) {
+					TypedExpr {
+						kind: TypedExprKind::Cast {
+							target: parameter.value_type().clone(),
+							expr: Box::new(argument),
+						},
+						ty: parameter.value_type().clone(),
+						span,
+					}
+				} else {
+					argument
+				}
+			})
+			.collect::<Vec<_>>();
+		let result = function.result().clone();
+		let Some(id) = function.id() else {
+			if function.max_depth().is_none() {
+				return Err(
+					self.semantic("Recursive functions require an explicit MAXDEPTH.", span)
+				);
+			}
+			if !self.current_function_has_explicit_result {
+				return Err(
+					self.semantic("Recursive functions require an explicit return type.", span)
+				);
+			}
+			let effect = match function.effect() {
+				FunctionEffect::Pure => ClosureEffect::Pure,
+				FunctionEffect::Stable => ClosureEffect::StableRead,
+				FunctionEffect::Impure => ClosureEffect::DataMutation,
+			};
+			let placeholder = LogicalClosure {
+				parameters: function
+					.parameters()
+					.enumerate()
+					.map(|(slot, parameter)| (slot as u32, parameter.value_type().clone()))
+					.collect(),
+				captures: Vec::new(),
+				result: result.clone(),
+				body: LogicalClosureBody::Expression(Box::new(TypedExpr {
+					kind: TypedExprKind::Constant(Value::None),
+					ty: result.clone(),
+					span,
+				})),
+				effect,
+				slot_count: arguments.len(),
+				retained_plan_bytes: 0,
+				named_function: None,
+			};
+			return Ok((
+				TypedExprKind::Invoke {
+					callee: Box::new(TypedExpr {
+						kind: TypedExprKind::Closure(Box::new(placeholder)),
+						ty: Type::Closure {
+							parameters: function
+								.parameters()
+								.map(|parameter| parameter.value_type().clone())
+								.collect(),
+							result: Box::new(result.clone()),
+						},
+						span,
+					}),
+					arguments,
+				},
+				result,
+			));
+		};
+		let key = NamedFunctionKey {
+			id,
+			version: function.version(),
+			schema_epoch: self.catalog.schema_epoch(),
+			max_depth: function.max_depth(),
+			effect: function.effect(),
+		};
+		if self.function_stack.contains(&id) {
+			Self::validate_recursive_cycle(
+				self.catalog,
+				&self.function_stack,
+				&function,
+				span,
+				self,
+			)?;
+			return Ok((
+				TypedExprKind::NamedInvoke {
+					function: key,
+					arguments,
+				},
+				result,
+			));
+		}
+		let closure = if let Some(cache) = self.function_cache {
+			if cache.cached_named(key).is_none() {
+				let closure = compile_named_function(
+					self.catalog,
+					&function,
+					&self.function_stack,
+					&self.function_overrides,
+					self.function_cache,
+				)?;
+				cache.cache_named_plan(&closure)?;
+			}
+			return Ok((
+				TypedExprKind::NamedInvoke {
+					function: key,
+					arguments,
+				},
+				result,
+			));
+		} else {
+			compile_named_function(
+				self.catalog,
+				&function,
+				&self.function_stack,
+				&self.function_overrides,
+				self.function_cache,
+			)?
+		};
+		Ok((
+			TypedExprKind::Invoke {
+				callee: Box::new(TypedExpr {
+					kind: TypedExprKind::Closure(Box::new(closure)),
+					ty: Type::Closure {
+						parameters: function
+							.parameters()
+							.map(|parameter| parameter.value_type().clone())
+							.collect(),
+						result: Box::new(result.clone()),
+					},
+					span,
+				}),
+				arguments,
+			},
+			result,
+		))
 	}
 
 	fn builtin(
@@ -3281,6 +4194,10 @@ impl<'a> Analyzer<'a> {
 			"string::lower" => (Builtin::StringLower, 1, Type::String),
 			"string::len" => (Builtin::StringLen, 1, Type::Int),
 			"string::contains" => (Builtin::StringContains, 2, Type::Bool),
+			"string::matches" => (Builtin::StringMatches, 2, Type::Bool),
+			"string::slice" => (Builtin::StringSlice, 3, Type::String),
+			"regex::matcher" => (Builtin::RegexMatcher, 2, Type::Matcher),
+			"regex::next" => (Builtin::RegexNext, 1, Type::Bool),
 			"string::split" => (Builtin::StringSplit, 2, Type::Array(Box::new(Type::String))),
 			"string::concat" => (Builtin::StringConcat, arguments.len(), Type::String),
 			"time::now" => (Builtin::TimeNow(self.statement_now.clone()), 0, Type::DateTime),
@@ -3315,6 +4232,16 @@ impl<'a> Analyzer<'a> {
 			"path::cost" => (Builtin::PathCost, 1, Type::Number),
 			"option::is_some" => (Builtin::OptionIsSome, 1, Type::Bool),
 			"option::is_none" => (Builtin::OptionIsNone, 1, Type::Bool),
+			"::uuid" => (Builtin::Uuid, 0, Type::Uuid),
+			"::ulid" => (Builtin::Ulid, 0, Type::Ulid),
+			"rand::id" => {
+				if arguments.len() > 1 {
+					return Err(
+						self.semantic("Function `rand::id` expects zero or one argument.", span)
+					);
+				}
+				(Builtin::RandId, arguments.len(), Type::String)
+			}
 			"type::is" => {
 				let ty = type_argument
 					.ok_or_else(|| self.semantic("type::is requires a type argument.", span))?;
@@ -3367,6 +4294,12 @@ impl<'a> Analyzer<'a> {
 			"string::contains" | "string::split" => {
 				vec![BuiltinArgument::String, BuiltinArgument::String]
 			}
+			"string::matches" => vec![BuiltinArgument::String, BuiltinArgument::RegexOrString],
+			"string::slice" => {
+				vec![BuiltinArgument::String, BuiltinArgument::Integer, BuiltinArgument::Integer]
+			}
+			"regex::matcher" => vec![BuiltinArgument::String, BuiltinArgument::RegexOrString],
+			"regex::next" => vec![BuiltinArgument::Matcher],
 			"string::concat" => vec![BuiltinArgument::String; arguments.len()],
 			"time::now" => Vec::new(),
 			"time::format" => vec![BuiltinArgument::DateTime, BuiltinArgument::String],
@@ -3381,6 +4314,10 @@ impl<'a> Analyzer<'a> {
 				vec![BuiltinArgument::Set, BuiltinArgument::Set]
 			}
 			"set::has" => vec![BuiltinArgument::Set, BuiltinArgument::Any],
+			"::uuid" | "::ulid" => Vec::new(),
+			"rand::id" => {
+				arguments.first().map_or_else(Vec::new, |_| vec![BuiltinArgument::Integer])
+			}
 			"meta::id" | "meta::class" => vec![BuiltinArgument::RecordOrAtom],
 			"graph::inner" | "graph::level_path" => vec![BuiltinArgument::AtomOccurrence],
 			"path::atoms" | "path::nodes" | "path::edges" | "path::length" | "path::cost" => {
@@ -3536,12 +4473,30 @@ impl<'a> Analyzer<'a> {
 			"object" => Type::Object,
 			"record" => Type::Record,
 			"error" => Type::Error,
+			"matcher" => Type::Matcher,
 			_ => return Err(self.semantic(&format!("Unknown type `{}`.", name.value), name.span)),
 		};
 		Ok(ty)
 	}
 
 	fn declare(&mut self, name: &crate::syn::Identifier, ty: Type) -> FerrosGrynnResult<u32> {
+		self.declare_with_mutability(name, ty, false)
+	}
+
+	fn declare_mutable(
+		&mut self,
+		name: &crate::syn::Identifier,
+		ty: Type,
+	) -> FerrosGrynnResult<u32> {
+		self.declare_with_mutability(name, ty, true)
+	}
+
+	fn declare_with_mutability(
+		&mut self,
+		name: &crate::syn::Identifier,
+		ty: Type,
+		mutable: bool,
+	) -> FerrosGrynnResult<u32> {
 		let current = self
 			.scopes
 			.last()
@@ -3564,6 +4519,7 @@ impl<'a> Analyzer<'a> {
 		let previous = self.slots.insert(name.value.clone(), Slot {
 			id,
 			ty,
+			mutable,
 		});
 		if let Some(scope) = self.scopes.last_mut() {
 			scope.push((name.value.clone(), previous));
@@ -3590,6 +4546,40 @@ impl<'a> Analyzer<'a> {
 				.with_phase(ExecutionPhase::SemanticAnalysis),
 			span,
 		)
+	}
+
+	fn validate_recursive_cycle(
+		catalog: &dyn QueryCatalog,
+		stack: &[FunctionId],
+		function: &SchemaFunction,
+		span: TextSpan,
+		analyzer: &Analyzer<'_>,
+	) -> FerrosGrynnResult<()> {
+		let id = function
+			.id()
+			.ok_or_else(|| analyzer.semantic("Published function is missing FunctionId.", span))?;
+		let start = stack.iter().position(|candidate| *candidate == id).unwrap_or(0);
+		for candidate in &stack[start..] {
+			let candidate = if let Some(overridden) = analyzer.function_overrides.get(candidate) {
+				Arc::clone(overridden)
+			} else if *candidate == id {
+				Arc::new(function.clone())
+			} else {
+				catalog.function(*candidate)?.ok_or_else(|| {
+					analyzer.semantic(
+						"Recursive function dependency disappeared from the catalog.",
+						span,
+					)
+				})?
+			};
+			if candidate.max_depth().is_none() {
+				return Err(analyzer.semantic(
+					"Every function in a recursive cycle requires an explicit MAXDEPTH.",
+					span,
+				));
+			}
+		}
+		Ok(())
 	}
 
 	fn unsupported(&self, feature: &str, span: TextSpan) -> FerrosGrynnError {
@@ -3663,6 +4653,12 @@ fn logical_statement_effect(statement: &LogicalStatement) -> ClosureEffect {
 			}
 			| LogicalSchemaStatement::InfoIndex {
 				..
+			}
+			| LogicalSchemaStatement::InfoParameter {
+				..
+			}
+			| LogicalSchemaStatement::InfoFunction {
+				..
 			} => ClosureEffect::StableRead,
 			_ => ClosureEffect::SchemaMutation,
 		},
@@ -3697,6 +4693,7 @@ fn logical_statement_effect(statement: &LogicalStatement) -> ClosureEffect {
 		| LogicalStatement::Throw {
 			value,
 		} => typed_expression_effect(value),
+		LogicalStatement::Sleep(_) => ClosureEffect::DataMutation,
 		LogicalStatement::If {
 			branches,
 			else_block,
@@ -3808,9 +4805,23 @@ fn typed_expression_effect(expression: &TypedExpr) -> ClosureEffect {
 			..
 		} => ClosureEffect::StableRead,
 		TypedExprKind::Builtin {
-			function: Builtin::GraphInner,
+			function: Builtin::GraphInner | Builtin::GraphLevelPath | Builtin::TimeNow(_),
 			..
 		} => ClosureEffect::StableRead,
+		TypedExprKind::Builtin {
+			function:
+				Builtin::Uuid
+				| Builtin::Ulid
+				| Builtin::RandId
+				| Builtin::RegexMatcher
+				| Builtin::RegexNext
+				| Builtin::ArrayPush(_)
+				| Builtin::ArrayPop(_)
+				| Builtin::ArrayClear(_)
+				| Builtin::SetAdd(_)
+				| Builtin::SetClear(_),
+			..
+		} => ClosureEffect::DataMutation,
 		TypedExprKind::Array(values) | TypedExprKind::Set(values) => values
 			.iter()
 			.fold(ClosureEffect::Pure, |effect, value| effect.max(typed_expression_effect(value))),
@@ -3877,17 +4888,29 @@ fn typed_expression_effect(expression: &TypedExpr) -> ClosureEffect {
 		TypedExprKind::Builtin {
 			arguments,
 			..
-		}
-		| TypedExprKind::Invoke {
+		} => arguments
+			.iter()
+			.fold(ClosureEffect::Pure, |effect, value| effect.max(typed_expression_effect(value))),
+		TypedExprKind::Invoke {
+			callee,
 			arguments,
-			..
 		} => arguments
 			.iter()
 			.fold(ClosureEffect::Pure, |effect, value| effect.max(typed_expression_effect(value)))
-			.max(if matches!(expression.kind, TypedExprKind::Invoke { .. }) {
-				ClosureEffect::StableRead
-			} else {
-				ClosureEffect::Pure
+			.max(match &callee.kind {
+				TypedExprKind::Closure(closure) => closure.effect,
+				_ => ClosureEffect::StableRead,
+			}),
+		TypedExprKind::NamedInvoke {
+			function,
+			arguments,
+		} => arguments
+			.iter()
+			.fold(ClosureEffect::Pure, |effect, value| effect.max(typed_expression_effect(value)))
+			.max(match function.effect {
+				FunctionEffect::Pure => ClosureEffect::Pure,
+				FunctionEffect::Stable => ClosureEffect::StableRead,
+				FunctionEffect::Impure => ClosureEffect::DataMutation,
 			}),
 		TypedExprKind::Aggregate {
 			argument,
@@ -3907,7 +4930,10 @@ fn typed_expression_effect(expression: &TypedExpr) -> ClosureEffect {
 enum BuiltinArgument {
 	Any,
 	Number,
+	Integer,
 	String,
+	RegexOrString,
+	Matcher,
 	DateTime,
 	Duration,
 	Array,
@@ -3923,7 +4949,10 @@ impl BuiltinArgument {
 			|| match self {
 				Self::Any => true,
 				Self::Number => is_number(ty),
+				Self::Integer => is_integer(ty),
 				Self::String => matches!(ty, Type::String),
+				Self::RegexOrString => matches!(ty, Type::Regex | Type::String),
+				Self::Matcher => matches!(ty, Type::Matcher),
 				Self::DateTime => matches!(ty, Type::DateTime),
 				Self::Duration => matches!(ty, Type::Duration),
 				Self::Array => matches!(ty, Type::Array(_)),
@@ -3940,7 +4969,10 @@ impl BuiltinArgument {
 		match self {
 			Self::Any => "any",
 			Self::Number => "number",
+			Self::Integer => "integer",
 			Self::String => "string",
+			Self::RegexOrString => "regex or string",
+			Self::Matcher => "matcher",
 			Self::DateTime => "datetime",
 			Self::Duration => "duration",
 			Self::Array => "array",
@@ -4110,6 +5142,9 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 }
 
 fn builtin_name(callee: &Expr) -> Option<(&str, &str)> {
+	if let ExprKind::Name(name) = &callee.kind {
+		return Some(("", name.value.as_ref()));
+	}
 	let ExprKind::Field {
 		base,
 		field,
@@ -4122,6 +5157,155 @@ fn builtin_name(callee: &Expr) -> Option<(&str, &str)> {
 		return None;
 	};
 	Some((namespace.value.as_ref(), field.value.as_ref()))
+}
+
+fn compile_named_function(
+	catalog: &dyn QueryCatalog,
+	function: &crate::datastore::SchemaFunction,
+	stack: &[FunctionId],
+	overrides: &BTreeMap<FunctionId, Arc<SchemaFunction>>,
+	function_cache: Option<&LanguageClosureState>,
+) -> FerrosGrynnResult<LogicalClosure> {
+	let parameters = function
+		.parameters()
+		.map(|parameter| {
+			Ok(format!(
+				"$`{}`: {}",
+				parameter.name().as_str().replace('`', "``"),
+				function_source_type(parameter.value_type())?
+			))
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?
+		.join(", ");
+	let source = format!(
+		"|{parameters}| -> {} {}",
+		function_source_type(function.result())?,
+		function.body()
+	);
+	let program = crate::syn::parse(&source, crate::syn::ParserSettings::default())?;
+	let Some(crate::syn::Statement {
+		kind: StatementKind::Expression(Expr {
+			kind: ExprKind::Closure(closure),
+			span,
+		}),
+		..
+	}) = program.statements.first()
+	else {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"stored function body did not parse as a closure",
+		));
+	};
+	let variables = Object::new();
+	let mut analyzer = Analyzer::new(&source, catalog, &variables, &BTreeSet::new());
+	analyzer.function_cache = function_cache;
+	analyzer.function_overrides.clone_from(overrides);
+	analyzer.function_stack.extend_from_slice(stack);
+	let id = function.id().ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("published function is missing FunctionId")
+	})?;
+	analyzer.function_overrides.insert(id, Arc::new(function.clone()));
+	analyzer.function_stack.push(id);
+	let mut closure = analyzer.closure(closure, *span)?;
+	let allowed = match function.effect() {
+		FunctionEffect::Pure => ClosureEffect::Pure,
+		FunctionEffect::Stable => ClosureEffect::StableRead,
+		FunctionEffect::Impure => ClosureEffect::DataMutation,
+	};
+	if closure.effect > allowed {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"stored function body exceeds its declared effect",
+		));
+	}
+	closure.named_function = Some(NamedFunctionKey {
+		id,
+		version: function.version(),
+		schema_epoch: catalog.schema_epoch(),
+		max_depth: function.max_depth(),
+		effect: function.effect(),
+	});
+	Ok(closure)
+}
+
+fn function_source_type(value: &Type) -> FerrosGrynnResult<&'static str> {
+	let name = match value {
+		Type::Any => "any",
+		Type::None => "none",
+		Type::Null => "null",
+		Type::Bool => "bool",
+		Type::Number => "number",
+		Type::Int => "int",
+		Type::Float => "float",
+		Type::Decimal => "decimal",
+		Type::String => "string",
+		Type::Duration => "duration",
+		Type::DateTime => "datetime",
+		Type::Bytes => "bytes",
+		Type::Array(_) => "array",
+		Type::Set(_) => "set",
+		Type::Range(_) => "range",
+		Type::Object => "object",
+		Type::Record => "record",
+		Type::Error => "error",
+		Type::Matcher => "matcher",
+		_ => {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"stored function signature contains a type unsupported by the source parser",
+			));
+		}
+	};
+	Ok(name)
+}
+
+fn function_argument_rank(expected: &Type, actual: &Type) -> Option<u8> {
+	if expected == actual {
+		return Some(0);
+	}
+	match (expected, actual) {
+		(Type::Decimal, Type::Int) => Some(1),
+		(Type::Number, Type::Int | Type::Float | Type::Decimal) => Some(2),
+		(Type::Any, _) => Some(2),
+		(Type::Array(expected), Type::Array(actual))
+		| (Type::Set(expected), Type::Set(actual))
+		| (Type::Range(expected), Type::Range(actual)) => function_argument_rank(expected, actual),
+		(Type::Float, Type::Int | Type::Decimal) => Some(3),
+		(Type::Option(_), Type::None | Type::Null) => Some(0),
+		(Type::Option(inner), actual) => function_argument_rank(inner, actual),
+		_ => None,
+	}
+}
+
+fn named_argument_order(
+	function: &SchemaFunction,
+	argument_names: &[Option<Identifier>],
+) -> Option<Vec<usize>> {
+	let parameters = function.parameters().collect::<Vec<_>>();
+	if parameters.len() != argument_names.len() {
+		return None;
+	}
+	let mut order = vec![usize::MAX; parameters.len()];
+	let mut next_positional = 0_usize;
+	for (argument_index, argument_name) in argument_names.iter().enumerate() {
+		let parameter_index = if let Some(argument_name) = argument_name {
+			parameters.iter().position(|parameter| {
+				parameter.name().as_str().eq_ignore_ascii_case(argument_name.value.as_ref())
+			})?
+		} else {
+			while next_positional < order.len() && order[next_positional] != usize::MAX {
+				next_positional += 1;
+			}
+			if next_positional == order.len() {
+				return None;
+			}
+			let parameter_index = next_positional;
+			next_positional += 1;
+			parameter_index
+		};
+		if order[parameter_index] != usize::MAX {
+			return None;
+		}
+		order[parameter_index] = argument_index;
+	}
+	order.iter().all(|index| *index != usize::MAX).then_some(order)
 }
 
 fn pipeline_parts<'expression>(
@@ -4157,11 +5341,15 @@ fn parse_repeat_syntax(expression: &Expr) -> Option<ParsedRepeat> {
 		callee,
 		type_argument: None,
 		distinct: false,
+		argument_names,
 		arguments,
 	} = &expression.kind
 	else {
 		return None;
 	};
+	if argument_names.iter().any(Option::is_some) {
+		return None;
+	}
 	if let Some((namespace, name)) = builtin_name(callee)
 		&& namespace.eq_ignore_ascii_case("tv")
 		&& name.eq_ignore_ascii_case("repeat")
@@ -4232,6 +5420,78 @@ fn push_traverse_result_column(schema: &mut Schema, name: Box<str>, ty: Type) {
 	}
 }
 
+fn traverse_source_item_type(source: &LogicalTraverseSource) -> Type {
+	match source {
+		LogicalTraverseSource::Expression(expression) => collection_item_type(&expression.ty),
+		LogicalTraverseSource::Match(source) => {
+			source.result.columns.last().map_or(Type::Any, |column| column.ty.clone())
+		}
+		LogicalTraverseSource::Select(source) => {
+			if source.value && source.result.columns.len() == 1 {
+				source.result.columns[0].ty.clone()
+			} else {
+				Type::Object
+			}
+		}
+	}
+}
+
+fn collection_item_type(ty: &Type) -> Type {
+	match ty {
+		Type::Array(item) | Type::Set(item) | Type::Range(item) => (**item).clone(),
+		_ => ty.clone(),
+	}
+}
+
+fn traverse_step_output_type(step: &LogicalTraverseStep, current: Type) -> Type {
+	if let Some(output) = &step.output_type {
+		return collection_item_type(output);
+	}
+	match step.kind {
+		TraverseStepKind::Vertices
+		| TraverseStepKind::Out
+		| TraverseStepKind::In
+		| TraverseStepKind::Both
+		| TraverseStepKind::InVertex
+		| TraverseStepKind::OutVertex => Type::AtomOccurrence(AtomKind::Node),
+		TraverseStepKind::Edges
+		| TraverseStepKind::OutEdges
+		| TraverseStepKind::InEdges
+		| TraverseStepKind::BothEdges
+		| TraverseStepKind::Hyper => Type::AtomOccurrence(AtomKind::Edge),
+		TraverseStepKind::MetaInner => Type::GraphRef(GraphKind::Graph),
+		TraverseStepKind::Map | TraverseStepKind::FlatMap => step
+			.arguments
+			.first()
+			.and_then(|argument| match &argument.ty {
+				Type::Closure {
+					result,
+					..
+				} => Some(if step.kind == TraverseStepKind::FlatMap {
+					collection_item_type(result)
+				} else {
+					(**result).clone()
+				}),
+				_ => None,
+			})
+			.unwrap_or(Type::Any),
+		TraverseStepKind::Unfold => collection_item_type(&current),
+		TraverseStepKind::Select | TraverseStepKind::Project | TraverseStepKind::Group => {
+			Type::Object
+		}
+		TraverseStepKind::Path
+		| TraverseStepKind::ShortestPath
+		| TraverseStepKind::WeightedShortestPath => Type::Path,
+		TraverseStepKind::Count => Type::Int,
+		TraverseStepKind::Sum
+		| TraverseStepKind::Minimum
+		| TraverseStepKind::Maximum
+		| TraverseStepKind::Average
+		| TraverseStepKind::DistanceTo => Type::Number,
+		_ => current,
+	}
+}
+
 fn traverse_step_kind(name: &str) -> Option<TraverseStepKind> {
 	Some(match name.to_ascii_lowercase().as_str() {
 		"v" => TraverseStepKind::Vertices,
@@ -4256,6 +5516,7 @@ fn traverse_step_kind(name: &str) -> Option<TraverseStepKind> {
 		"cyclicpath" => TraverseStepKind::CyclicPath,
 		"map" => TraverseStepKind::Map,
 		"flatmap" => TraverseStepKind::FlatMap,
+		"algo" => TraverseStepKind::Algorithm,
 		"values" => TraverseStepKind::Values,
 		"select" => TraverseStepKind::Select,
 		"match" => TraverseStepKind::Match,
@@ -4369,6 +5630,7 @@ const fn traverse_step_arity(kind: TraverseStepKind) -> std::ops::RangeInclusive
 		| TraverseStepKind::Project
 		| TraverseStepKind::Branch
 		| TraverseStepKind::Coalesce => 1..=usize::MAX,
+		TraverseStepKind::Algorithm => 1..=usize::MAX,
 		TraverseStepKind::Repeat => 1..=1,
 	}
 }
@@ -4725,6 +5987,10 @@ fn typed_expr_contains_aggregate(expression: &TypedExpr) -> bool {
 			typed_expr_contains_aggregate(callee)
 				|| arguments.iter().any(typed_expr_contains_aggregate)
 		}
+		TypedExprKind::NamedInvoke {
+			arguments,
+			..
+		} => arguments.iter().any(typed_expr_contains_aggregate),
 		TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
@@ -4888,6 +6154,14 @@ const fn class_schema_mode(mode: ClassSchemaModeName) -> ClassSchemaMode {
 	}
 }
 
+const fn function_effect(effect: FunctionEffectName) -> FunctionEffect {
+	match effect {
+		FunctionEffectName::Pure => FunctionEffect::Pure,
+		FunctionEffectName::Stable => FunctionEffect::Stable,
+		FunctionEffectName::Impure => FunctionEffect::Impure,
+	}
+}
+
 const fn is_number(ty: &Type) -> bool {
 	matches!(ty, Type::Any | Type::Number | Type::Int | Type::Float | Type::Decimal)
 }
@@ -4900,6 +6174,11 @@ pub(super) fn compatible(expected: &Type, actual: &Type) -> bool {
 	expected == actual
 		|| matches!(expected, Type::Any)
 		|| matches!(expected, Type::Number) && is_number(actual)
+		|| matches!((expected, actual),
+			(Type::Array(expected), Type::Array(actual))
+			| (Type::Set(expected), Type::Set(actual))
+			| (Type::Range(expected), Type::Range(actual))
+			if compatible(expected, actual))
 		|| matches!(expected, Type::Option(inner) if matches!(actual, Type::None | Type::Null) || compatible(inner, actual))
 		|| matches!(expected, Type::Union(types) if types.iter().any(|ty| compatible(ty, actual)))
 }

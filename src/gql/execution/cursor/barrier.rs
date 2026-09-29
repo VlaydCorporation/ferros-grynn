@@ -80,14 +80,15 @@ impl RowCursor for MatchProjectCursor<'_> {
 						&(seed, &binding_key),
 					)));
 				}
-				eval(
+				let value = eval(
 					&order.expression,
 					Some(&order_row),
 					self.slots,
 					self.source,
 					Some(self.fields),
 					Some(control),
-				)
+				)?;
+				super::super::collation::order_key(value, order)
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		let mut output = Row::new(projected);

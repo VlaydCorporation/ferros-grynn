@@ -481,7 +481,7 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 	read: &mut Read,
 	snapshot: Snapshot,
 	plan: &LogicalBuildGraph,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 	runtime: &mut ControlRuntime,

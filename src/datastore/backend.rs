@@ -7,7 +7,7 @@ use std::{
 	path::PathBuf,
 	sync::{
 		Arc,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicU64, AtomicUsize, Ordering},
 	},
 };
 
@@ -21,12 +21,17 @@ use super::{
 	IoMode,
 	LocalOptions,
 	LocalStorageStatus,
+	MaintenanceCoordinator,
+	MaintenanceJobInfo,
+	MaintenanceJobKind,
+	MaintenanceRunOutcome,
+	MaintenanceTarget,
 	QueryStatisticsDemand,
 	SchemaId,
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::{GraphId, GraphStorageMode},
+	graph::{AtomKind, GraphId, GraphStorageMode},
 	stats::StatisticsStore,
 	storage::{
 		LocalQuerySnapshot,
@@ -36,8 +41,10 @@ use crate::{
 		PhysicalTraversalFieldsRead,
 		PhysicalTraversalInnerRead,
 		PhysicalTraversalRead,
+		QuarantineArchiveReader,
+		QuarantineArtifact,
 	},
-	values::storage::DecodeContext,
+	values::{Uuid, storage::DecodeContext},
 };
 
 pub(crate) struct StoreInner {
@@ -47,9 +54,12 @@ pub(crate) struct StoreInner {
 	pub(crate) next_schema_id: AtomicU64,
 	pub(crate) next_graph_id: AtomicU64,
 	pub(crate) import_owner: AtomicU64,
+	pub(crate) datastore_handles: AtomicUsize,
 	pub(crate) current: RwLock<Arc<DatabaseRoot>>,
 	pub(crate) commit: Mutex<()>,
 	pub(crate) query_scratch_root: PathBuf,
+	pub(crate) quarantines: Mutex<BTreeMap<Uuid, PathBuf>>,
+	pub(crate) maintenance: MaintenanceCoordinator,
 }
 
 pub(crate) enum StoreBackend {
@@ -95,6 +105,7 @@ impl StoreInner {
 			DatastoreOptions::Local(options) => InMemoryOptions {
 				max_snapshot_age: options.max_snapshot_age,
 				max_write_set_bytes: options.max_write_set_bytes,
+				maintenance: options.maintenance,
 			},
 		}
 	}
@@ -123,10 +134,62 @@ impl StoreInner {
 	pub(crate) fn persist_import_root(
 		&self,
 		root: &DatabaseRoot,
+		quarantine: Option<&mut QuarantineArtifact>,
 	) -> FerrosGrynnResult<BTreeMap<super::IndexId, std::time::Duration>> {
 		match &self.backend {
-			StoreBackend::InMemory => Ok(BTreeMap::new()),
-			StoreBackend::Local(local) => local.persist_import_root(root),
+			StoreBackend::InMemory => {
+				if let Some(artifact) = quarantine {
+					let id = artifact.id();
+					let path = artifact.install(&self.query_scratch_root)?;
+					artifact.publish();
+					self.quarantines.lock().insert(id, path);
+				}
+				Ok(BTreeMap::new())
+			}
+			StoreBackend::Local(local) => local.persist_import_root(root, quarantine),
+		}
+	}
+
+	pub(crate) fn open_quarantine(&self, id: Uuid) -> FerrosGrynnResult<QuarantineArchiveReader> {
+		match &self.backend {
+			StoreBackend::InMemory => {
+				let path = self.quarantines.lock().get(&id).cloned().ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("quarantine identity does not exist")
+				})?;
+				QuarantineArchiveReader::open(&path)
+			}
+			StoreBackend::Local(local) => local.open_quarantine(id),
+		}
+	}
+
+	pub(crate) fn remove_quarantine(&self, id: Uuid) -> FerrosGrynnResult<()> {
+		match &self.backend {
+			StoreBackend::InMemory => {
+				let path = self.quarantines.lock().remove(&id).ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("quarantine identity does not exist")
+				})?;
+				match fs::remove_file(path) {
+					Ok(()) => Ok(()),
+					Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+					Err(source) => {
+						Err(FerrosGrynnError::storage_io_failure("remove import quarantine")
+							.with_technical_source(source))
+					}
+				}
+			}
+			StoreBackend::Local(local) => {
+				let _commit = self.commit.lock();
+				let snapshot = self.current_root();
+				let mut next = (*snapshot).clone();
+				next.commit_ts = snapshot.commit_ts.checked_add(1).ok_or_else(|| {
+					FerrosGrynnError::invalid_argument(
+						"quarantine removal commit clock is exhausted",
+					)
+				})?;
+				local.remove_quarantine(&next, id)?;
+				*self.current.write() = Arc::new(next);
+				Ok(())
+			}
 		}
 	}
 
@@ -135,6 +198,265 @@ impl StoreInner {
 			StoreBackend::InMemory => std::env::temp_dir().join("ferros-grynn-import"),
 			StoreBackend::Local(local) => local.import_scratch_root().to_path_buf(),
 		}
+	}
+
+	pub(crate) fn persist_maintenance_jobs(
+		&self,
+		jobs: &[MaintenanceJobInfo],
+	) -> FerrosGrynnResult<()> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(()),
+			StoreBackend::Local(local) => local.persist_maintenance_jobs(jobs),
+		}
+	}
+
+	pub(crate) fn maintenance_publication_matches(&self, job: &MaintenanceJobInfo) -> bool {
+		let Some(fingerprint) = job.candidate_fingerprint else {
+			return false;
+		};
+		let root = self.current_root();
+		match job.target {
+			MaintenanceTarget::Index {
+				class,
+				index,
+				version,
+			} => root.schema.class_by_id(class).is_some_and(|definition| {
+				definition.indexes().any(|candidate| {
+					candidate.id() == Some(index)
+						&& candidate.version() == version
+						&& candidate.state() == super::ClassIndexState::Ready
+						&& candidate.build_revision() == fingerprint
+				})
+			}),
+			MaintenanceTarget::Graph(graph) => {
+				root.commit_ts == fingerprint && root.graph(graph).is_some()
+			}
+			MaintenanceTarget::BaseClass(class) => {
+				root.commit_ts == fingerprint && root.schema.class_by_id(class).is_some()
+			}
+			MaintenanceTarget::EffectiveClass {
+				class,
+				graph,
+			} => {
+				root.commit_ts == fingerprint
+					&& root.schema.class_by_id(class).is_some()
+					&& root.graph(graph).is_some()
+			}
+			MaintenanceTarget::Database => root.commit_ts == fingerprint,
+		}
+	}
+
+	pub(crate) fn maintenance_target_exists(&self, target: MaintenanceTarget) -> bool {
+		let root = self.current_root();
+		match target {
+			MaintenanceTarget::Database => true,
+			MaintenanceTarget::Graph(graph) => root.graph(graph).is_some(),
+			MaintenanceTarget::BaseClass(class) => root.schema.class_by_id(class).is_some(),
+			MaintenanceTarget::EffectiveClass {
+				class,
+				graph,
+			} => root.schema.class_by_id(class).is_some() && root.graph(graph).is_some(),
+			MaintenanceTarget::Index {
+				class,
+				index,
+				version,
+			} => root.schema.class_by_id(class).is_some_and(|definition| {
+				definition.indexes().any(|candidate| {
+					candidate.id() == Some(index) && candidate.version() == version
+				})
+			}),
+		}
+	}
+
+	pub(crate) fn resolve_analyze_mode(
+		&self,
+		target: MaintenanceTarget,
+		mode: super::MaintenanceAnalyzeMode,
+	) -> FerrosGrynnResult<super::MaintenanceAnalyzeMode> {
+		if mode != super::MaintenanceAnalyzeMode::Automatic {
+			return Ok(mode);
+		}
+		let root = self.current_root();
+		let visible_hot_pages = match target {
+			MaintenanceTarget::Database => root.graphs.values().fold(
+				crate::storage::atom_hot_page_count(root.atoms.slot_capacity()),
+				|pages, graph| {
+					pages.saturating_add(crate::storage::graph_hot_page_count(
+						graph.slot_capacity(AtomKind::Node),
+						graph.slot_capacity(AtomKind::Edge),
+					))
+				},
+			),
+			MaintenanceTarget::BaseClass(class) => {
+				if root.schema.class_by_id(class).is_none() {
+					return Err(FerrosGrynnError::class_does_not_exist(class.to_string()));
+				}
+				crate::storage::atom_hot_page_count(root.atoms.slot_capacity())
+			}
+			MaintenanceTarget::Graph(graph)
+			| MaintenanceTarget::EffectiveClass {
+				graph,
+				..
+			} => {
+				let graph = root
+					.graph(graph)
+					.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?;
+				crate::storage::graph_hot_page_count(
+					graph.slot_capacity(AtomKind::Node),
+					graph.slot_capacity(AtomKind::Edge),
+				)
+			}
+			MaintenanceTarget::Index {
+				..
+			} => {
+				return Err(FerrosGrynnError::invalid_argument(
+					"ANALYZE does not accept an index maintenance target",
+				));
+			}
+		};
+		Ok(if visible_hot_pages <= 32 {
+			super::MaintenanceAnalyzeMode::Full
+		} else {
+			super::MaintenanceAnalyzeMode::Approximate {
+				sample_count: 30_000,
+			}
+		})
+	}
+
+	pub(crate) fn run_maintenance_job(
+		&self,
+		id: super::JobId,
+	) -> FerrosGrynnResult<MaintenanceRunOutcome> {
+		if self.maintenance.is_cancelled(id) {
+			return Ok(MaintenanceRunOutcome::Cancelled);
+		}
+		let job = self
+			.maintenance
+			.job(id)
+			.ok_or_else(|| FerrosGrynnError::maintenance_job_not_found(id.to_string()))?;
+		let cancellation = self.maintenance.cancellation_token(id);
+		let result = crate::storage::with_external_sort_control(
+			job.max_memory_bytes,
+			job.max_parallelism,
+			cancellation.clone(),
+			|| {
+				let snapshot = self.current_root();
+				let publication = snapshot.commit_ts.checked_add(1).ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("maintenance commit clock is exhausted")
+				})?;
+				let mut next = self.build_maintenance_candidate(
+					&snapshot,
+					job.kind,
+					job.target,
+					publication,
+					job.analyze_mode,
+				)?;
+				let metrics = crate::storage::external_sort_metrics();
+				self.maintenance.stage_progress(
+					id,
+					maintenance_source_items(&next, job.target).max(metrics.processed_items),
+					metrics.written_bytes,
+					metrics.runs,
+				)?;
+				if self.maintenance.is_cancelled(id) {
+					return Ok(MaintenanceRunOutcome::Cancelled);
+				}
+				if self.maintenance.has_pending_index_change_after(job.target, snapshot.commit_ts) {
+					return Ok(MaintenanceRunOutcome::Retry);
+				}
+				if !self.maintenance.mark_publishing(self, id, publication)? {
+					return Ok(MaintenanceRunOutcome::Cancelled);
+				}
+				let _commit = self.commit.lock();
+				if self.current_root().commit_ts != snapshot.commit_ts {
+					return Ok(MaintenanceRunOutcome::Retry);
+				}
+				if self.maintenance.is_cancelled(id) {
+					return Ok(MaintenanceRunOutcome::Cancelled);
+				}
+				next.commit_ts = publication;
+				self.persist_root(&next, false, false)?;
+				*self.current.write() = Arc::new(next);
+				self.maintenance.acknowledge_index_changes(job.target, snapshot.commit_ts);
+				Ok(MaintenanceRunOutcome::Completed)
+			},
+		);
+		if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+			Ok(MaintenanceRunOutcome::Cancelled)
+		} else {
+			result
+		}
+	}
+
+	/// Runs the same concrete builder in the caller thread without creating a
+	/// durable background job.
+	pub(crate) fn run_foreground_maintenance(
+		&self,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		options: super::MaintenanceOptions,
+		analyze_mode: Option<super::MaintenanceAnalyzeMode>,
+	) -> FerrosGrynnResult<()> {
+		crate::storage::with_external_sort_options(
+			options.max_memory_bytes,
+			options.max_parallelism,
+			|| {
+				let snapshot = self.current_root();
+				let publication = snapshot.commit_ts.checked_add(1).ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("maintenance commit clock is exhausted")
+				})?;
+				let mut next = self.build_maintenance_candidate(
+					&snapshot,
+					kind,
+					target,
+					publication,
+					analyze_mode,
+				)?;
+				let _commit = self.commit.lock();
+				if self.current_root().commit_ts != snapshot.commit_ts {
+					return Err(FerrosGrynnError::maintenance_revision_race(target.display_name()));
+				}
+				next.commit_ts = publication;
+				self.persist_root(&next, false, false)?;
+				*self.current.write() = Arc::new(next);
+				Ok(())
+			},
+		)
+	}
+
+	fn build_maintenance_candidate(
+		&self,
+		snapshot: &DatabaseRoot,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		build_revision: u64,
+		analyze_mode: Option<super::MaintenanceAnalyzeMode>,
+	) -> FerrosGrynnResult<DatabaseRoot> {
+		let mut next = snapshot.clone();
+		match kind {
+			MaintenanceJobKind::BuildIndex
+			| MaintenanceJobKind::RebuildIndex
+			| MaintenanceJobKind::DeferredIndexCatchUp
+			| MaintenanceJobKind::CompactIndex => {
+				prepare_index_maintenance(&mut next, target, build_revision)?;
+				next.rebuild_indexes()?;
+			}
+			MaintenanceJobKind::Analyze => {
+				self.hydrate_statistics(&mut next)?;
+				next.rebuild_statistics_with_mode_at(
+					&self.import_scratch_root().join("maintenance"),
+					analyze_mode.ok_or_else(|| {
+						FerrosGrynnError::invalid_argument(
+							"ANALYZE maintenance is missing its resolved build mode",
+						)
+					})?,
+					target,
+				)?;
+			}
+			MaintenanceJobKind::CompactGraph | MaintenanceJobKind::CompactDatabase => {}
+		}
+		next.validate_full_import_state()?;
+		Ok(next)
 	}
 
 	pub(crate) fn query_scratch_root(&self) -> std::path::PathBuf {
@@ -273,8 +595,92 @@ impl StoreInner {
 
 impl Drop for StoreInner {
 	fn drop(&mut self) {
+		self.maintenance.shutdown();
 		if matches!(self.backend, StoreBackend::InMemory) {
 			drop(fs::remove_dir_all(&self.query_scratch_root));
+		}
+	}
+}
+
+fn prepare_index_maintenance(
+	database: &mut DatabaseRoot,
+	target: MaintenanceTarget,
+	build_revision: u64,
+) -> FerrosGrynnResult<()> {
+	let MaintenanceTarget::Index {
+		class,
+		index,
+		version,
+	} = target
+	else {
+		return Err(FerrosGrynnError::invalid_argument(
+			"index maintenance job has a non-index target",
+		));
+	};
+	let catalog = Arc::make_mut(&mut database.schema);
+	let definition = catalog
+		.classes
+		.get_mut(&class)
+		.ok_or_else(|| FerrosGrynnError::class_does_not_exist(class.to_string()))?;
+	let definition = Arc::make_mut(definition);
+	let candidate =
+		definition.indexes.iter_mut().find(|candidate| candidate.id() == Some(index)).ok_or_else(
+			|| FerrosGrynnError::invalid_argument("maintenance index target no longer exists"),
+		)?;
+	if candidate.version() != version {
+		return Err(FerrosGrynnError::invalid_argument(
+			"maintenance index definition changed before build",
+		));
+	}
+	candidate.state = super::ClassIndexState::Ready;
+	candidate.build_revision = build_revision;
+	Ok(())
+}
+
+fn maintenance_source_items(database: &DatabaseRoot, target: MaintenanceTarget) -> u64 {
+	match target {
+		MaintenanceTarget::Index {
+			class,
+			..
+		} => database
+			.atoms
+			.atoms()
+			.filter(|atom| atom.class_id() == class)
+			.count()
+			.try_into()
+			.unwrap_or(u64::MAX),
+		MaintenanceTarget::Graph(graph) => database
+			.graphs
+			.get(&graph)
+			.map_or(0, |graph| graph.occurrences().count().try_into().unwrap_or(u64::MAX)),
+		MaintenanceTarget::BaseClass(class) => database
+			.atoms
+			.atoms()
+			.filter(|atom| atom.class_id() == class)
+			.count()
+			.try_into()
+			.unwrap_or(u64::MAX),
+		MaintenanceTarget::EffectiveClass {
+			class,
+			graph,
+		} => database.graphs.get(&graph).map_or(0, |graph| {
+			graph
+				.occurrences()
+				.filter(|occurrence| {
+					database
+						.atom(occurrence.global_id())
+						.is_some_and(|atom| atom.class_id() == class)
+				})
+				.count()
+				.try_into()
+				.unwrap_or(u64::MAX)
+		}),
+		MaintenanceTarget::Database => {
+			let atoms = database.atoms.atoms().count().try_into().unwrap_or(u64::MAX);
+			let occurrences = database.graphs.values().fold(0_u64, |total, graph| {
+				total.saturating_add(graph.occurrences().count().try_into().unwrap_or(u64::MAX))
+			});
+			atoms.saturating_add(occurrences)
 		}
 	}
 }

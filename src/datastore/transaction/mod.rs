@@ -13,6 +13,7 @@ use super::{
 	ConflictKey,
 	DatabaseRoot,
 	Datastore,
+	FunctionId,
 	GlobalAtomId,
 	GraphSchema,
 	ImportConstraintMode,
@@ -21,7 +22,12 @@ use super::{
 	IndexId,
 	InvariantViolationReport,
 	IsolationLevel,
+	MaintenanceJobInfo,
+	MaintenanceTarget,
 	OccurrenceState,
+	SchemaFunction,
+	SchemaId,
+	SchemaParameter,
 	SchemaVersion,
 	SystemIndex,
 	SystemIndexKind,
@@ -117,11 +123,17 @@ enum Mutation {
 		name: Text,
 	},
 	DefineClass(ClassSchema),
+	DefineParameter(SchemaParameter),
+	DefineFunction(SchemaFunction),
 	DefineGraph(GraphSchema),
 	ReplaceClass(ClassSchema),
+	ReplaceParameter(SchemaParameter),
+	ReplaceFunction(SchemaFunction),
 	ReplaceGraph(GraphSchema),
 	InstallBuiltGraphTree(build_graph::InstallBuiltGraphTree),
 	RemoveClass(ClassId),
+	RemoveParameter(SchemaId),
+	RemoveFunction(FunctionId),
 	RemoveGraph(GraphId),
 	CreateAtom {
 		id: GlobalAtomId,
@@ -283,7 +295,8 @@ impl Transaction {
 		}
 		transaction.import_constraints = Some(constraints);
 		transaction.import_graph_scope = graph_scope;
-		transaction.rollback_mutation_errors = on_violation == ImportViolationPolicy::Skip;
+		transaction.rollback_mutation_errors =
+			matches!(on_violation, ImportViolationPolicy::Skip | ImportViolationPolicy::Quarantine);
 		transaction
 	}
 
@@ -305,6 +318,13 @@ impl Transaction {
 	/// Returns bytes already reserved by the logical write-set preflight.
 	pub const fn write_set_bytes(&self) -> usize {
 		self.write_bytes
+	}
+
+	pub(crate) fn active_maintenance_job(
+		&self,
+		target: MaintenanceTarget,
+	) -> Option<MaintenanceJobInfo> {
+		self.store.inner.maintenance.active_job_for(target)
 	}
 
 	pub(crate) const fn mutation_count(&self) -> usize {
@@ -947,6 +967,10 @@ impl Transaction {
 	}
 
 	fn prepare_mutation(&mut self) -> FerrosGrynnResult<()> {
+		self.prepare_write(true)
+	}
+
+	fn prepare_write(&mut self, defer_indexes: bool) -> FerrosGrynnResult<()> {
 		self.ensure_live()?;
 		self.store.inner.ensure_write_allowed(self.id)?;
 		if self.options.access == TransactionAccess::ReadOnly {
@@ -959,6 +983,9 @@ impl Transaction {
 		if self.working.indexes.has_deferred_indexes() {
 			self.working.rebuild_indexes()?;
 		}
+		if defer_indexes {
+			self.working.mark_deferred_indexes_stale()?;
+		}
 		Ok(())
 	}
 
@@ -968,7 +995,7 @@ impl Transaction {
 				"schema mutation inside BEGIN IMPORT",
 			));
 		}
-		self.prepare_mutation()
+		self.prepare_write(false)
 	}
 
 	fn ensure_live(&self) -> FerrosGrynnResult<()> {

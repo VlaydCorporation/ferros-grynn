@@ -6,6 +6,7 @@ mod graph_properties;
 mod graph_result;
 mod import;
 mod r#let;
+mod maintenance;
 mod r#match;
 mod r#return;
 mod schema;
@@ -32,6 +33,14 @@ pub use graph_result::{
 	ReturnGraph,
 };
 pub use r#let::{LetStatement, LetValue};
+pub use maintenance::{
+	AnalyzeModeName,
+	KillStatement,
+	MaintenanceIndexOwner,
+	MaintenanceOperationName,
+	MaintenanceStatement,
+	MaintenanceTargetName,
+};
 pub use r#match::{
 	MatchConstraints,
 	MatchContains,
@@ -66,12 +75,18 @@ pub use schema::{
 	ClassSchemaModeName,
 	DefineClassStatement,
 	DefineFieldStatement,
+	DefineFunctionStatement,
 	DefineGraphStatement,
 	DefineIndexStatement,
+	DefineParameterStatement,
 	DefinitionMode,
+	FunctionEffectName,
+	FunctionParameterDefinition,
+	FunctionSignatureName,
 	IndexScopeName,
 	InfoStatement,
 	InfoTarget,
+	ParameterCommentChange,
 	RemoveStatement,
 	RemoveTarget,
 };
@@ -143,6 +158,7 @@ pub enum StatementKind {
 	Continue,
 	Try(TryStatement),
 	Throw(Expr),
+	Sleep(TimeoutValue),
 	AssertInvariants(AssertInvariantsStatement),
 	BuildGraph(BuildGraphStatement),
 	Attach(AttachStatement),
@@ -155,10 +171,14 @@ pub enum StatementKind {
 	DefineGraph(DefineGraphStatement),
 	DefineClass(DefineClassStatement),
 	DefineField(DefineFieldStatement),
+	DefineFunction(DefineFunctionStatement),
 	DefineIndex(DefineIndexStatement),
+	DefineParameter(DefineParameterStatement),
 	Remove(RemoveStatement),
 	Alter(AlterStatement),
 	Info(InfoStatement),
+	Maintenance(MaintenanceStatement),
+	Kill(KillStatement),
 	Import(ImportStatement),
 	Let(LetStatement),
 	Match(MatchStatement),

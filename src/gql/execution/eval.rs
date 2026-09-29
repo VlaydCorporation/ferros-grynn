@@ -13,13 +13,64 @@ pub(super) fn eval(
 	fields: Option<&dyn AtomFieldRead>,
 	control: Option<&ExecutionControl>,
 ) -> FerrosGrynnResult<Value> {
-	eval_current(expr, row, slots, source, fields, None, control)
+	let mut slots = SlotFrame::Read(slots);
+	eval_current(expr, row, &mut slots, source, fields, None, control)
+}
+
+pub(super) fn eval_mut(
+	expr: &TypedExpr,
+	row: Option<&Row>,
+	slots: &mut [Value],
+	source: &str,
+	fields: Option<&dyn AtomFieldRead>,
+	control: Option<&ExecutionControl>,
+) -> FerrosGrynnResult<Value> {
+	let mut slots = SlotFrame::Write(slots);
+	eval_current(expr, row, &mut slots, source, fields, None, control)
+}
+
+pub(super) fn eval_mut_current(
+	expr: &TypedExpr,
+	row: Option<&Row>,
+	slots: &mut [Value],
+	source: &str,
+	fields: Option<&dyn AtomFieldRead>,
+	current: Option<&Value>,
+	control: Option<&ExecutionControl>,
+) -> FerrosGrynnResult<Value> {
+	let mut slots = SlotFrame::Write(slots);
+	eval_current(expr, row, &mut slots, source, fields, current, control)
+}
+
+enum SlotFrame<'a> {
+	Read(&'a [Value]),
+	Write(&'a mut [Value]),
+}
+
+impl SlotFrame<'_> {
+	fn values(&self) -> &[Value] {
+		match self {
+			Self::Read(values) => values,
+			Self::Write(values) => values,
+		}
+	}
+
+	fn get_mut(&mut self, slot: u32) -> FerrosGrynnResult<&mut Value> {
+		match self {
+			Self::Read(_) => Err(FerrosGrynnError::invalid_argument(
+				"Mutable collection helpers require a writable lexical scope.",
+			)),
+			Self::Write(values) => values.get_mut(slot as usize).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("Mutable collection binding slot is invalid.")
+			}),
+		}
+	}
 }
 
 fn eval_current(
 	expr: &TypedExpr,
 	row: Option<&Row>,
-	slots: &[Value],
+	slots: &mut SlotFrame<'_>,
 	source: &str,
 	fields: Option<&dyn AtomFieldRead>,
 	current: Option<&Value>,
@@ -30,7 +81,11 @@ fn eval_current(
 	}
 	let result = match &expr.kind {
 		TypedExprKind::Constant(value) => Ok(value.clone()),
-		TypedExprKind::Slot(slot) => Ok(slots[*slot as usize].clone()),
+		TypedExprKind::Slot(slot) => slots
+			.values()
+			.get(*slot as usize)
+			.cloned()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("Expression slot is invalid.")),
 		TypedExprKind::Column(column) => {
 			row.and_then(|row| row.value(*column)).cloned().ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("Column is missing from the input row.")
@@ -157,6 +212,7 @@ fn eval_current(
 			match base {
 				Value::Object(object) => Ok(object.get(field).cloned().unwrap_or(Value::None)),
 				Value::Error(error) => Ok(error_field(&error, field)),
+				Value::Matcher(matcher) => matcher_field(&matcher, field),
 				Value::AtomOccurrence(occurrence) if fields.is_some() => fields
 					.ok_or_else(|| {
 						FerrosGrynnError::invalid_argument(
@@ -230,6 +286,26 @@ fn eval_current(
 		TypedExprKind::Builtin {
 			function,
 			arguments,
+		} if matches!(
+			function,
+			Builtin::ArrayPush(_)
+				| Builtin::ArrayPop(_)
+				| Builtin::ArrayClear(_)
+				| Builtin::SetAdd(_)
+				| Builtin::SetClear(_)
+		) =>
+		{
+			let arguments = arguments
+				.iter()
+				.map(|argument| {
+					eval_current(argument, row, slots, source, fields, current, control)
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			mutate_collection(function, arguments, slots)
+		}
+		TypedExprKind::Builtin {
+			function,
+			arguments,
 		} if matches!(function, Builtin::GraphInner | Builtin::GraphLevelPath) => {
 			let argument = arguments.first().ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("graph::inner requires one argument")
@@ -269,7 +345,7 @@ fn eval_current(
 					"Language closure creation requires an execution session.",
 				)
 			})?
-			.create_closure(closure, slots)
+			.create_closure(closure, slots.values())
 			.map(|closure| Value::Closure(Box::new(closure))),
 		TypedExprKind::Invoke {
 			callee,
@@ -300,6 +376,25 @@ fn eval_current(
 				)
 			}
 		}
+		TypedExprKind::NamedInvoke {
+			function,
+			arguments,
+		} => {
+			let control = control.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"Named function invocation requires an execution session.",
+				)
+			})?;
+			let arguments = arguments
+				.iter()
+				.map(|argument| {
+					eval_current(argument, row, slots, source, fields, current, Some(control))
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let plan = control.resolve_named_function(*function)?;
+			let _frame = control.enter_named_function(*function)?;
+			invoke_logical_closure(control, &plan, &[], &arguments, source)
+		}
 		TypedExprKind::Traversal(_) => Err(FerrosGrynnError::invalid_argument(
 			"Traversal expression requires the transaction-aware evaluator.",
 		)),
@@ -326,34 +421,121 @@ fn invoke_expression_closure(
 	source: &str,
 ) -> FerrosGrynnResult<Value> {
 	let entry = control.resolve_closure(closure)?;
-	if entry.plan.parameters.len() != arguments.len() {
+	let _frame = entry
+		.plan
+		.named_function
+		.map(|function| control.enter_named_function(function))
+		.transpose()?;
+	invoke_logical_closure(control, &entry.plan, &entry.captures, arguments, source)
+}
+
+fn invoke_logical_closure(
+	control: &ExecutionControl,
+	plan: &LogicalClosure,
+	captures: &[(u32, Value)],
+	arguments: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<Value> {
+	if plan.parameters.len() != arguments.len() {
 		return Err(FerrosGrynnError::conversion_error(
 			format!("{} closure arguments", arguments.len()),
-			format!("{} arguments", entry.plan.parameters.len()),
+			format!("{} arguments", plan.parameters.len()),
 		));
 	}
-	let mut slots = vec![Value::None; entry.plan.slot_count];
-	for (slot, value) in entry.captures {
-		let target = slots.get_mut(slot as usize).ok_or_else(|| {
+	let mut slots = vec![Value::None; plan.slot_count];
+	for (slot, value) in captures {
+		let target = slots.get_mut(*slot as usize).ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("Closure capture slot is outside its typed frame.")
 		})?;
-		*target = value;
+		*target = value.clone();
 	}
-	for ((slot, _), value) in entry.plan.parameters.iter().zip(arguments) {
+	for ((slot, _), value) in plan.parameters.iter().zip(arguments) {
 		let target = slots.get_mut(*slot as usize).ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("Closure parameter slot is outside its typed frame.")
 		})?;
 		*target = value.clone();
 	}
-	match &entry.plan.body {
+	match &plan.body {
 		crate::gql::ir::LogicalClosureBody::Expression(expression) => {
-			eval(expression, None, &slots, source, None, Some(control))
+			eval_mut(expression, None, &mut slots, source, None, Some(control))
 		}
 		crate::gql::ir::LogicalClosureBody::Block(_) => {
 			Err(FerrosGrynnError::query_feature_not_supported(
 				"block closure invocation outside traversal execution",
 			))
 		}
+	}
+}
+
+fn mutate_collection(
+	function: &Builtin,
+	mut arguments: Vec<Value>,
+	slots: &mut SlotFrame<'_>,
+) -> FerrosGrynnResult<Value> {
+	let slot = match function {
+		Builtin::ArrayPush(slot)
+		| Builtin::ArrayPop(slot)
+		| Builtin::ArrayClear(slot)
+		| Builtin::SetAdd(slot)
+		| Builtin::SetClear(slot) => *slot,
+		_ => {
+			return Err(FerrosGrynnError::invalid_argument(
+				"Invalid mutable collection helper dispatch.",
+			));
+		}
+	};
+	let target = slots.get_mut(slot)?;
+	match function {
+		Builtin::ArrayPush(_) => {
+			let value = arguments.pop().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("array::push requires a value.")
+			})?;
+			let Value::Array(values) = target else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"array::push requires an array binding.",
+				));
+			};
+			values.push(value);
+			i64::try_from(values.len())
+				.map(Value::from)
+				.map_err(|_| FerrosGrynnError::operation_overflow("array length"))
+		}
+		Builtin::ArrayPop(_) => {
+			let Value::Array(values) = target else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"array::pop requires an array binding.",
+				));
+			};
+			Ok(values.pop().unwrap_or(Value::None))
+		}
+		Builtin::ArrayClear(_) => {
+			let Value::Array(values) = target else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"array::clear requires an array binding.",
+				));
+			};
+			values.clear();
+			Ok(Value::None)
+		}
+		Builtin::SetAdd(_) => {
+			let value = arguments
+				.pop()
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("set::add requires a value."))?;
+			let Value::Set(values) = target else {
+				return Err(FerrosGrynnError::invalid_argument("set::add requires a set binding."));
+			};
+			Ok(Value::Bool(values.insert(value)))
+		}
+		Builtin::SetClear(_) => {
+			let Value::Set(values) = target else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"set::clear requires a set binding.",
+				));
+			};
+			values.clear();
+			Ok(Value::None)
+		}
+		_ => Err(FerrosGrynnError::invalid_argument("Invalid mutable collection helper dispatch.")),
 	}
 }
 
@@ -521,6 +703,23 @@ fn error_field(error: &crate::values::ErrorValue, field: &str) -> Value {
 		),
 		_ => Value::None,
 	}
+}
+
+fn matcher_field(matcher: &crate::values::Matcher, field: &str) -> FerrosGrynnResult<Value> {
+	let offset = match field.to_ascii_lowercase().as_str() {
+		"start" => matcher.start(),
+		"end" => matcher.end(),
+		_ => {
+			return Err(FerrosGrynnError::invalid_argument(
+				"Matcher exposes only `start` and `end` fields.",
+			));
+		}
+	};
+	offset.map_or(Ok(Value::None), |offset| {
+		i64::try_from(offset)
+			.map(Value::from)
+			.map_err(|_| FerrosGrynnError::operation_overflow("matcher Unicode scalar offset"))
+	})
 }
 
 fn arithmetic(operator: BinaryOperator, left: Value, right: Value) -> FerrosGrynnResult<Value> {
@@ -711,10 +910,35 @@ pub(super) fn cast(value: Value, target: &Type) -> FerrosGrynnResult<Value> {
 			}
 			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "decimal")),
 		},
+		Type::Object => match value {
+			Value::Object(_) => Ok(value),
+			Value::Array(values) => merge_objects(values),
+			Value::Set(values) => merge_objects(values),
+			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "object")),
+		},
 		Type::None if matches!(value, Value::None) => Ok(value),
 		Type::Null if matches!(value, Value::Null) => Ok(value),
 		_ => Err(FerrosGrynnError::conversion_error(value.to_string(), target.to_string())),
 	}
+}
+
+fn merge_objects(values: impl IntoIterator<Item = Value>) -> FerrosGrynnResult<Value> {
+	let mut merged = Object::new();
+	for value in values {
+		let Value::Object(value) = value else {
+			return Err(FerrosGrynnError::invalid_argument(
+				"Object conversion requires a collection containing only objects.",
+			));
+		};
+		for (key, value) in value {
+			if merged.insert(key.clone(), value).is_some() {
+				return Err(FerrosGrynnError::invalid_argument(format!(
+					"Object conversion contains duplicate key `{key}`."
+				)));
+			}
+		}
+	}
+	Ok(Value::Object(merged))
 }
 
 pub(super) fn eval_usize(

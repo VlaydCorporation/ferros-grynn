@@ -220,6 +220,7 @@ fn estimate_step(
 		| TraverseStepKind::BothEdges
 		| TraverseStepKind::Hyper => expand_cardinality(kind, input, graph),
 		TraverseStepKind::FlatMap
+		| TraverseStepKind::Algorithm
 		| TraverseStepKind::Unfold
 		| TraverseStepKind::Branch
 		| TraverseStepKind::Repeat => multiply(input, 4, 32),
