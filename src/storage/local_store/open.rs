@@ -350,11 +350,18 @@ fn bindings(
 		.flat_map(|class| class.indexes.iter())
 		.filter_map(|index| index.physical.map(|physical| (index.id, physical)))
 		.collect();
+	let physical_deltas = database
+		.classes
+		.iter()
+		.flat_map(|class| class.indexes.iter())
+		.filter_map(|index| index.delta.map(|delta| (index.id, delta)))
+		.collect();
 	Ok(GenerationBindings {
 		atoms,
 		reverse,
 		graphs,
 		physical_indexes,
+		physical_deltas,
 	})
 }
 

@@ -17,6 +17,7 @@ use super::{
 	CheckpointMode,
 	DatabaseRoot,
 	DatastoreOptions,
+	FunctionId,
 	InMemoryOptions,
 	IoMode,
 	LocalOptions,
@@ -27,9 +28,12 @@ use super::{
 	MaintenanceRunOutcome,
 	MaintenanceTarget,
 	QueryStatisticsDemand,
+	SchemaAnalyzer,
 	SchemaId,
+	SchemaVersion,
 };
 use crate::{
+	gql::PureFunctionEvaluator,
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomKind, GraphId, GraphStorageMode},
 	stats::StatisticsStore,
@@ -44,7 +48,7 @@ use crate::{
 		QuarantineArchiveReader,
 		QuarantineArtifact,
 	},
-	values::{Uuid, storage::DecodeContext},
+	values::{RecordId, Uuid, Vector, storage::DecodeContext},
 };
 
 pub(crate) struct StoreInner {
@@ -120,13 +124,32 @@ impl StoreInner {
 	pub(crate) fn persist_root(
 		&self,
 		root: &DatabaseRoot,
+		previous: Option<&DatabaseRoot>,
+		changed_records: Option<&std::collections::BTreeSet<RecordId>>,
 		graph_catalog_only: bool,
 		dictionary_changed: bool,
 	) -> FerrosGrynnResult<()> {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(()),
 			StoreBackend::Local(local) => {
-				local.persist_root(root, graph_catalog_only, dictionary_changed)
+				let evaluator = PureFunctionEvaluator::new(root);
+				let mut analyze =
+					|analyzer: &SchemaAnalyzer, input: &str| evaluator.analyze(analyzer, input);
+				let mut distance = |function: FunctionId,
+				                    version: SchemaVersion,
+				                    left: &Vector,
+				                    right: &Vector| {
+					evaluator.distance(function, version, left, right)
+				};
+				local.persist_root(
+					root,
+					previous,
+					changed_records,
+					graph_catalog_only,
+					dictionary_changed,
+					&mut analyze,
+					&mut distance,
+				)
 			}
 		}
 	}
@@ -146,7 +169,18 @@ impl StoreInner {
 				}
 				Ok(BTreeMap::new())
 			}
-			StoreBackend::Local(local) => local.persist_import_root(root, quarantine),
+			StoreBackend::Local(local) => {
+				let evaluator = PureFunctionEvaluator::new(root);
+				let mut analyze =
+					|analyzer: &SchemaAnalyzer, input: &str| evaluator.analyze(analyzer, input);
+				let mut distance = |function: FunctionId,
+				                    version: SchemaVersion,
+				                    left: &Vector,
+				                    right: &Vector| {
+					evaluator.distance(function, version, left, right)
+				};
+				local.persist_import_root(root, quarantine, &mut analyze, &mut distance)
+			}
 		}
 	}
 
@@ -186,7 +220,16 @@ impl StoreInner {
 						"quarantine removal commit clock is exhausted",
 					)
 				})?;
-				local.remove_quarantine(&next, id)?;
+				let evaluator = PureFunctionEvaluator::new(&next);
+				let mut analyze =
+					|analyzer: &SchemaAnalyzer, input: &str| evaluator.analyze(analyzer, input);
+				let mut distance = |function: FunctionId,
+				                    version: SchemaVersion,
+				                    left: &Vector,
+				                    right: &Vector| {
+					evaluator.distance(function, version, left, right)
+				};
+				local.remove_quarantine(&next, id, &mut analyze, &mut distance)?;
 				*self.current.write() = Arc::new(next);
 				Ok(())
 			}
@@ -327,6 +370,23 @@ impl StoreInner {
 		&self,
 		id: super::JobId,
 	) -> FerrosGrynnResult<MaintenanceRunOutcome> {
+		self.run_maintenance_job_inner(id, || Ok(()))
+	}
+
+	#[cfg(test)]
+	pub(crate) fn run_maintenance_job_interleaved(
+		&self,
+		id: super::JobId,
+		interleave: impl FnOnce() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<MaintenanceRunOutcome> {
+		self.run_maintenance_job_inner(id, interleave)
+	}
+
+	fn run_maintenance_job_inner(
+		&self,
+		id: super::JobId,
+		interleave: impl FnOnce() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<MaintenanceRunOutcome> {
 		if self.maintenance.is_cancelled(id) {
 			return Ok(MaintenanceRunOutcome::Cancelled);
 		}
@@ -361,6 +421,7 @@ impl StoreInner {
 				if self.maintenance.is_cancelled(id) {
 					return Ok(MaintenanceRunOutcome::Cancelled);
 				}
+				interleave()?;
 				if self.maintenance.has_pending_index_change_after(job.target, snapshot.commit_ts) {
 					return Ok(MaintenanceRunOutcome::Retry);
 				}
@@ -375,7 +436,7 @@ impl StoreInner {
 					return Ok(MaintenanceRunOutcome::Cancelled);
 				}
 				next.commit_ts = publication;
-				self.persist_root(&next, false, false)?;
+				self.persist_root(&next, None, None, false, false)?;
 				*self.current.write() = Arc::new(next);
 				self.maintenance.acknowledge_index_changes(job.target, snapshot.commit_ts);
 				Ok(MaintenanceRunOutcome::Completed)
@@ -417,7 +478,7 @@ impl StoreInner {
 					return Err(FerrosGrynnError::maintenance_revision_race(target.display_name()));
 				}
 				next.commit_ts = publication;
-				self.persist_root(&next, false, false)?;
+				self.persist_root(&next, None, None, false, false)?;
 				*self.current.write() = Arc::new(next);
 				Ok(())
 			},
@@ -492,6 +553,22 @@ impl StoreInner {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(None),
 			StoreBackend::Local(local) => local.physical_index(snapshot, index),
+		}
+	}
+
+	pub(crate) fn search_diskann_index(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		index: super::IndexId,
+		query: &crate::values::Vector,
+		k: usize,
+		breadth: usize,
+	) -> FerrosGrynnResult<Option<Vec<crate::storage::VectorSearchHit>>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => {
+				local.search_diskann_index(snapshot, index, query, k, breadth)
+			}
 		}
 	}
 

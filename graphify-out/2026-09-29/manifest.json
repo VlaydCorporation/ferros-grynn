@@ -320,18 +320,18 @@
     "semantic_hash": "0539f2fbc582bee265d91bb6a0fa0cfc"
   },
   "docs/disk_storage_spec.md": {
-    "mtime": 1790692327.9783938,
-    "ast_hash": "52e44df8c81cec9cea7e610e4c64c3d8",
+    "mtime": 1790701784.155831,
+    "ast_hash": "31452497e5c2407057128f3849204327",
     "semantic_hash": ""
   },
   "docs/gql_grammar.md": {
-    "mtime": 1790693920.8457716,
-    "ast_hash": "7c2edbdbaac7ff70d088a88c9dd5ab5c",
+    "mtime": 1790701783.6032598,
+    "ast_hash": "587b906c1fcb9d5b8abcd973d88a4540",
     "semantic_hash": ""
   },
   "docs/gql_spec.md": {
-    "mtime": 1790692243.5197835,
-    "ast_hash": "3ccdc47fadcae0cf7b4588774c6aeadf",
+    "mtime": 1790701783.0986009,
+    "ast_hash": "7b854e64c8c3bc671b5880863128e8d7",
     "semantic_hash": ""
   },
   "docs/gql_tech_spec.md": {
@@ -10180,8 +10180,8 @@
     "semantic_hash": ""
   },
   "docs/full_plan.md": {
-    "mtime": 1790700247.3602931,
-    "ast_hash": "2981b96ff91860e827befc237ccd5001",
+    "mtime": 1790701756.8175895,
+    "ast_hash": "710105b37125c043d6d295f3dc6622ab",
     "semantic_hash": ""
   },
   "crates/ferntree/img/black/logo.svg": {
@@ -10700,8 +10700,8 @@
     "semantic_hash": ""
   },
   "src/datastore/AGENTS.md": {
-    "mtime": 1790692292.1742163,
-    "ast_hash": "c3a35b7b1cdbc8523b8852e1f52fd00d",
+    "mtime": 1790701799.9410539,
+    "ast_hash": "f98dcf479c283ba8ef3ce4e37339553e",
     "semantic_hash": ""
   },
   "src/gql/AGENTS.md": {
@@ -11360,8 +11360,8 @@
     "semantic_hash": ""
   },
   "src/datastore/backend.rs": {
-    "mtime": 1790694529.7325375,
-    "ast_hash": "58b8ea2e6b7ad66208e0e3475d2253cc",
+    "mtime": 1790701337.80654,
+    "ast_hash": "efc640a308d03c56cefea82fabd9b62b",
     "semantic_hash": ""
   },
   "src/datastore/index_store/rebuild.rs": {
@@ -12150,8 +12150,8 @@
     "semantic_hash": ""
   },
   "ferros-grynn-bench/benches/gql_stage20_21.rs": {
-    "mtime": 1790699525.632052,
-    "ast_hash": "ccdd5bdf43e51376d26813afb9b16386",
+    "mtime": 1790701831.1106844,
+    "ast_hash": "b9d61dac95b39f770a51a9af3642bf17",
     "semantic_hash": ""
   },
   "ferros-grynn-bench/benches/gql_stage_common.rs": {
@@ -12160,8 +12160,8 @@
     "semantic_hash": ""
   },
   "src/datastore/maintenance.rs": {
-    "mtime": 1790694882.922348,
-    "ast_hash": "2631799ae732a96c3893e99d51b88f13",
+    "mtime": 1790701831.5301232,
+    "ast_hash": "07ff9b9f1e6c6fdfb96b2efbd5190039",
     "semantic_hash": ""
   },
   "src/gql/execution/collation.rs": {
@@ -12190,23 +12190,23 @@
     "semantic_hash": ""
   },
   "docs/gql_admin_stage_20_plan.md": {
-    "mtime": 1790695040.6900733,
-    "ast_hash": "42497870867aca1c62161ccec8958850",
+    "mtime": 1790700827.0088623,
+    "ast_hash": "8e0d9a7ccd8923bfc65e3e3435a062ec",
     "semantic_hash": ""
   },
   "docs/gql_udf_stage_21_plan.md": {
-    "mtime": 1790695041.198858,
-    "ast_hash": "a00b4095b16d3c757c12d95c5bf21976",
+    "mtime": 1790700827.4656916,
+    "ast_hash": "74ed790f526a1cd5dcb3985c7da5efb3",
     "semantic_hash": ""
   },
   "docs/reports/gql_admin_stage_20_report.md": {
-    "mtime": 1790695047.3845632,
-    "ast_hash": "802cce73c9358ab67483631d9fdb8fe9",
+    "mtime": 1790701703.892415,
+    "ast_hash": "78ab63322edd5f3629ac4c13ae795a88",
     "semantic_hash": ""
   },
   "docs/reports/gql_udf_stage_21_report.md": {
-    "mtime": 1790695047.3856237,
-    "ast_hash": "bd8736d8fbd4af57b9a42db42ac7750e",
+    "mtime": 1790701742.2064095,
+    "ast_hash": "6724f8352aaf52012a3771f0df14badf",
     "semantic_hash": ""
   }
 }

@@ -1,15 +1,16 @@
 # Freeze-manifest storage core v1
 
-**Статус: повторно утверждён после этапа 21, 2026-09-29.** Первичная freeze
-выполнена этапом 19 W4; этапы 20–21 сознательно разморозили только catalog
-payloads и завершили несовместимый cutover v9/v5 → v10/v6. Этот документ
-перечисляет байтовые контракты Windows GA-core. Нормативные layout остаются в
-[`disk_storage_spec.md`](disk_storage_spec.md); manifest фиксирует их набор,
-версии и границу совместимости.
+**Статус: временно неактивен с этапа 22.** Первичная freeze была выполнена
+этапом 19 W4, а этапы 20–21 сделали несовместимый cutover v9/v5 → v10/v6.
+Оставшиеся этапы расширяют catalog и specialized side-files, поэтому согласно
+`Q-40` identifiers `STORAGE_FORMAT_VERSION=1`, `FGDC v10` и `FGFC v6` пока
+изменяются на месте. Прежние bytes не декодируются, migration и test-only
+compatibility отсутствуют. После закрытия всего [`full_plan.md`](full_plan.md)
+выполняются единая перенумерация, полный golden/recovery gate и новая freeze.
 
 ## 1. Версии и совместимость
 
-| Контракт                             |          Замороженная версия | Authority                     |
+| Контракт                             | Текущий development identifier | Authority                     |
 |--------------------------------------|-----------------------------:|-------------------------------|
 | common page header и page types      | `STORAGE_FORMAT_VERSION = 1` | `disk_storage_spec.md` §§6, 8 |
 | database catalog payload             |                   `FGDC v10` | §7.2                          |
@@ -22,11 +23,11 @@ payloads и завершили несовместимый cutover v9/v5 → v10/
 | statistics root layouts              |           layout version `1` | §19                           |
 | AtomStore/graph/database superblocks |   format/compatibility `1/1` | §17                           |
 
-Decoder принимает только перечисленные версии. `FGDC v9`/`FGFC v5`, как и
-более ранние payloads, несовместимы; автоматической миграции, reinterpretation
-и test-only compatibility path нет. Следующее изменение повторно замороженных
-bytes требует `STORAGE_FORMAT_VERSION = 2` либо новой однозначно versioned
-side-file family.
+Decoder принимает только текущие bytes перечисленных identifiers. `FGDC v9`/
+`FGFC v5`, как и любые более ранние payloads текущих v10/v6, несовместимы;
+автоматической миграции, reinterpretation и test-only compatibility path нет.
+Требование нового `STORAGE_FORMAT_VERSION` применяется при финальном закрытии
+`Q-40`, а не к промежуточным development-layout этапов 22–29.
 
 ## 2. Общие инварианты
 

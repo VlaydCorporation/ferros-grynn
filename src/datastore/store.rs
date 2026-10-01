@@ -203,6 +203,19 @@ impl Datastore {
 		self.enqueue_maintenance_with_analysis(kind, target, options, None)
 	}
 
+	pub(crate) fn enqueue_maintenance_coalesced(
+		&self,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		options: Option<MaintenanceOptions>,
+	) -> FerrosGrynnResult<super::JobId> {
+		let options = options.unwrap_or_else(|| match self.options() {
+			DatastoreOptions::InMemory(options) => options.maintenance,
+			DatastoreOptions::Local(options) => options.maintenance,
+		});
+		self.inner.maintenance.enqueue_coalesced(&self.inner, kind, target, options, None)
+	}
+
 	pub(crate) fn enqueue_maintenance_with_analysis(
 		&self,
 		kind: MaintenanceJobKind,

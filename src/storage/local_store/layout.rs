@@ -28,8 +28,8 @@ pub(super) struct FileImage {
 	pub(super) entry: FileCatalogEntry,
 	pub(super) page_numbers: Vec<PageNo>,
 	pub(super) pages: Vec<AlignedPage>,
-	/// Exact page count for an import side-file already written and synced by
-	/// its bounded streaming builder.
+	/// Exact page count for an immutable side-file already written and synced
+	/// by its bounded streaming builder.
 	pub(super) prewritten_page_count: Option<u64>,
 }
 
@@ -39,12 +39,14 @@ pub(super) struct GenerationBindings {
 	pub(super) reverse: ReverseMembershipFile,
 	pub(super) graphs: Vec<GraphBinding>,
 	pub(super) physical_indexes: BTreeMap<IndexId, PhysicalIndexBinding>,
+	pub(super) physical_deltas: BTreeMap<IndexId, PhysicalIndexBinding>,
 }
 
 /// Allocation helper shared by the AtomStore, graph, and index packers.
 pub(super) struct LayoutBuilder {
 	next_file_instance_id: u64,
 	files: Vec<FileImage>,
+	retained: Vec<FileCatalogEntry>,
 }
 
 impl LayoutBuilder {
@@ -52,7 +54,19 @@ impl LayoutBuilder {
 		Self {
 			next_file_instance_id,
 			files: Vec::new(),
+			retained: Vec::new(),
 		}
+	}
+
+	/// Keeps one immutable file reachable without copying it into the new
+	/// generation. The retained identity must have been allocated by an older
+	/// catalog generation.
+	pub(super) fn retain(&mut self, entry: FileCatalogEntry) -> FerrosGrynnResult<()> {
+		if entry.file_id.instance_id() >= self.next_file_instance_id {
+			return Err(invalid("retained file identity is beyond the allocation clock"));
+		}
+		self.retained.push(entry);
+		Ok(())
 	}
 
 	pub(super) fn add(
@@ -146,6 +160,7 @@ impl LayoutBuilder {
 	pub(super) fn finish(mut self) -> FerrosGrynnResult<(FileCatalog, Vec<FileImage>)> {
 		let mut catalog = FileCatalog::bootstrap()?;
 		catalog.next_file_instance_id = self.next_file_instance_id;
+		catalog.files.append(&mut self.retained);
 		catalog.files.extend(self.files.iter().map(|file| file.entry.clone()));
 		catalog.files.sort_unstable_by_key(|file| (file.space_id, file.file_id));
 		self.files.sort_unstable_by_key(|file| (file.entry.space_id, file.entry.file_id));

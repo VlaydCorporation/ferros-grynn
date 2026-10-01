@@ -6,6 +6,7 @@
 use super::*;
 use crate::gql::{
 	cursor::{CursorAnchor, CursorPage, CursorRecord, IndexSeekCheckout, IndexSeekPlan},
+	ir::LogicalKnnDistance,
 	spill::{QuerySorter, SortField, SortedRecords, compare_record_anchor},
 };
 
@@ -14,11 +15,13 @@ pub(super) mod fingerprint;
 mod join;
 mod pagination;
 mod rows;
+mod search;
 
 use expression::*;
 use join::*;
 use pagination::*;
 use rows::*;
+use search::*;
 
 fn prepare_physical_plan<Read: QueryRead>(
 	read: &Read,
@@ -514,6 +517,7 @@ fn visit_streaming_select_values<Read: QueryRead>(
 		|| !plan.split.is_empty()
 		|| (!plan.order.is_empty() && (physical.requires_sort || control.cursors().is_some()))
 		|| plan.tempfiles
+		|| plan.filter.as_ref().is_some_and(contains_search)
 		|| matches!(plan.source.kind, LogicalSelectSourceKind::Derived(_))
 	{
 		return Ok(None);
@@ -732,17 +736,36 @@ fn execute_select_output<Read: QueryRead>(
 	outer: Option<&Row>,
 ) -> FerrosGrynnResult<SortedRecords> {
 	control.check()?;
+	let mut prepared_search = plan
+		.filter
+		.as_ref()
+		.filter(|filter| contains_search(filter))
+		.map(|filter| prepare_search_inputs(filter, &plan.access, slots, source, control))
+		.transpose()?;
 	let local_width = plan.input_schema.columns.len().saturating_sub(plan.outer_columns);
+	let physical_search = if plan.joins.is_empty() {
+		match (plan.filter.as_ref(), prepared_search.as_mut()) {
+			(Some(filter), Some(prepared)) => Some((filter, &plan.access, prepared)),
+			_ => None,
+		}
+	} else {
+		None
+	};
 	let mut rows = source_rows(
 		read,
 		snapshot,
 		logical_source(plan, physical.execution_order.first().copied().unwrap_or(0)),
 		physical.execution_order.first().and_then(|source| physical.sources.get(*source)),
-		physical.pushed_filter.then_some(plan.filter.as_ref()).flatten(),
+		physical
+			.pushed_filter
+			.then_some(plan.filter.as_ref())
+			.flatten()
+			.filter(|filter| !contains_search(filter)),
 		slots,
 		source,
 		control,
 		outer,
+		physical_search,
 		Some(local_width),
 	)?;
 	for physical_join in &physical.joins {
@@ -786,6 +809,7 @@ fn execute_select_output<Read: QueryRead>(
 			source,
 			control,
 			None,
+			None,
 			Some(local_width),
 		)?;
 		rows = join_rows(
@@ -814,6 +838,16 @@ fn execute_select_output<Read: QueryRead>(
 		rows = transformed.finish()?;
 	}
 	if let Some(predicate) = &plan.filter {
+		if contains_search(predicate) {
+			let prepared = prepared_search.as_ref().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"search inputs were not prepared before source row pull",
+				)
+			})?;
+			rows = prepare_search_rows(
+				read, snapshot, rows, predicate, prepared, slots, source, control,
+			)?;
+		}
 		let mut filtered = RowCollector::new(read, control, false);
 		rows.consume(|row| {
 			if eval_select_expr(read, snapshot, predicate, &row, None, slots, source, control)?
@@ -939,6 +973,30 @@ fn expression_uses_column(expression: &TypedExpr, column: usize) -> bool {
 			base: left,
 			predicate: right,
 		} => expression_uses_column(left, column) || expression_uses_column(right, column),
+		TypedExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => expression_uses_column(left, column) || expression_uses_column(right, column),
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			..
+		} => {
+			expression_uses_column(left, column)
+				|| expression_uses_column(k, column)
+				|| ef.as_deref().is_some_and(|value| expression_uses_column(value, column))
+				|| match distance {
+					LogicalKnnDistance::Minkowski(value) | LogicalKnnDistance::Callable(value) => {
+						expression_uses_column(value, column)
+					}
+					LogicalKnnDistance::Builtin(_) | LogicalKnnDistance::Named(_) => false,
+				}
+				|| expression_uses_column(right, column)
+		}
 		TypedExprKind::Conditional {
 			condition,
 			then_value,
@@ -1122,6 +1180,7 @@ fn source_rows<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 	outer: Option<&Row>,
+	physical_search: Option<(&TypedExpr, &LogicalSelectAccess, &mut PreparedSearch)>,
 	total_width: Option<usize>,
 ) -> FerrosGrynnResult<RowSet> {
 	let layout = physical
@@ -1142,6 +1201,72 @@ fn source_rows<Read: QueryRead>(
 				.transpose()?;
 			match target {
 				ScanTarget::Class(class) => {
+					if let Some((filter, access, prepared)) = physical_search {
+						let planned_index = physical.and_then(planned_search_index);
+						if let Some(candidates) = try_physical_fulltext(
+							read,
+							snapshot,
+							filter,
+							access,
+							planned_index,
+							class,
+							graph.as_ref(),
+							prepared,
+							control,
+						)? {
+							let mut rows = RowCollector::new(read, control, false);
+							for (ordinal, (record, matched)) in candidates.into_iter().enumerate() {
+								let mut row = read
+									.get(snapshot, &record, graph.as_ref())?
+									.ok_or_else(|| {
+										FerrosGrynnError::invalid_storage_file(
+											"Fulltext candidate is absent from its snapshot source",
+										)
+									})?;
+								row.fulltext.push(matched);
+								rows.push(
+									read,
+									snapshot,
+									layout_row(
+										row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+										layout,
+									),
+								)?;
+							}
+							return rows.finish();
+						}
+						if let Some(candidates) = try_physical_knn(
+							read,
+							snapshot,
+							filter,
+							access,
+							planned_index,
+							class,
+							graph.as_ref(),
+							prepared,
+						)? {
+							let mut rows = RowCollector::new(read, control, false);
+							for (ordinal, (record, matched)) in candidates.into_iter().enumerate() {
+								let mut row = read
+									.get(snapshot, &record, graph.as_ref())?
+									.ok_or_else(|| {
+										FerrosGrynnError::invalid_storage_file(
+											"ANN candidate is absent from its snapshot source",
+										)
+									})?;
+								row.knn.push(matched);
+								rows.push(
+									read,
+									snapshot,
+									layout_row(
+										row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+										layout,
+									),
+								)?;
+							}
+							return rows.finish();
+						}
+					}
 					let mut cursor = read.scan(
 						snapshot,
 						class,
@@ -1262,6 +1387,26 @@ fn planned_scalar_index(
 			direction,
 			..
 		} => Some((index, direction == crate::gql::optimizer::IndexDirection::Reverse)),
+		_ => None,
+	}
+}
+
+fn planned_search_index(
+	source: &crate::gql::optimizer::PhysicalSource,
+) -> Option<crate::datastore::IndexId> {
+	match source.operator {
+		crate::gql::optimizer::SourceOperator::FulltextIndexScan {
+			index,
+			..
+		}
+		| crate::gql::optimizer::SourceOperator::HnswSearch {
+			index,
+			..
+		}
+		| crate::gql::optimizer::SourceOperator::DiskAnnSearch {
+			index,
+			..
+		} => Some(index),
 		_ => None,
 	}
 }

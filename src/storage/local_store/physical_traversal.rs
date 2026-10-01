@@ -20,8 +20,6 @@ use super::{
 	physical_index::PhysicalIndexFile,
 	statistics::PhysicalStatisticsFiles,
 };
-#[cfg(all(windows, feature = "native-async-io"))]
-use crate::storage::hybrid_engine::{ReadIntent, ReadWindow, TransportCapabilities};
 use crate::{
 	datastore::{ClassId, DataSpaceId, GlobalAtomId, PropertyOverlay},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -45,7 +43,13 @@ use crate::{
 		},
 		graph_store::GraphFileSet,
 		graph_superblock::GraphSuperblock,
-		hybrid_engine::MAX_READ_SCOPE_OPERATIONS,
+		hybrid_engine::{
+			MAX_READ_SCOPE_OPERATIONS,
+			ReadIntent,
+			ReadRoute,
+			ReadWindow,
+			TransportCapabilities,
+		},
 		page::{AlignedPage, PageNo},
 		page_cache::{PageCacheKey, PageCacheVersion},
 		property_page::{
@@ -748,6 +752,7 @@ pub(super) fn read_snapshot_pages(
 	let visible = store.wal.visible_frames(&keys, snapshot.snapshot);
 	let mut pages = (0..keys.len()).map(|_| AlignedPage::zeroed()).collect::<Vec<_>>();
 	let mut cold_home = Vec::new();
+	let mut cache_keys = Vec::with_capacity(keys.len());
 	let mut stats = PhysicalTraversalReadStats::default();
 	for (index, (key, frame)) in keys.iter().zip(visible.frames()).enumerate() {
 		let version = frame.map_or(
@@ -760,6 +765,7 @@ pub(super) fn read_snapshot_pages(
 			},
 		);
 		let cache_key = PageCacheKey::new(*key, version);
+		cache_keys.push(cache_key);
 		if let Some(resident) = store.engine.get_if_resident(cache_key)? {
 			pages[index].as_bytes_mut().copy_from_slice(resident.as_bytes());
 			stats.resident_pages = stats.resident_pages.saturating_add(1);
@@ -775,7 +781,7 @@ pub(super) fn read_snapshot_pages(
 		}
 	}
 	if !cold_home.is_empty() {
-		read_cold_home(store, file, page_numbers, &cold_home, &mut pages, &mut stats)?;
+		read_cold_home(store, file, page_numbers, &cache_keys, &cold_home, &mut pages, &mut stats)?;
 	}
 	Ok(LoadedPages {
 		pages,
@@ -787,16 +793,14 @@ fn read_cold_home(
 	store: &LocalStore,
 	file: &Arc<RegisteredDataFile>,
 	page_numbers: &[PageNo],
+	cache_keys: &[PageCacheKey],
 	cold: &[usize],
 	pages: &mut [AlignedPage],
 	stats: &mut PhysicalTraversalReadStats,
 ) -> FerrosGrynnResult<()> {
-	#[cfg(not(all(windows, feature = "native-async-io")))]
-	let _ = store;
 	let direct = file.file()?;
 	let cold_count = u64::try_from(cold.len())
 		.map_err(|error| invalid(format!("physical cold-page count does not fit u64: {error}")))?;
-	#[cfg(all(windows, feature = "native-async-io"))]
 	let route = store.engine.route(
 		false,
 		ReadIntent::IndexTraversal,
@@ -820,6 +824,18 @@ fn read_cold_home(
 			pages[index].as_bytes_mut().copy_from_slice(loaded.pages()[position].as_bytes());
 		}
 		stats.ioring_home_pages = stats.ioring_home_pages.saturating_add(cold_count);
+		return Ok(());
+	}
+	if matches!(route, ReadRoute::SyncDirect {
+		admit: true
+	}) {
+		for index in cold {
+			let resident = store.engine.get_or_load(cache_keys[*index], |output| {
+				direct.read_page(page_numbers[*index], output)
+			})?;
+			pages[*index].as_bytes_mut().copy_from_slice(resident.as_bytes());
+		}
+		stats.sync_home_pages = stats.sync_home_pages.saturating_add(cold_count);
 		return Ok(());
 	}
 	for index in cold {

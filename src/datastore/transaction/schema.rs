@@ -3,15 +3,19 @@ use std::sync::Arc;
 use super::{Mutation, Transaction};
 use crate::{
 	datastore::{
+		AnalyzerFilter,
+		AnalyzerId,
 		ClassField,
 		ClassIndex,
 		ClassIndexState,
 		ClassSchema,
 		ClassSchemaMode,
 		ConflictKey,
+		FunctionEffect,
 		FunctionId,
 		IndexId,
 		IndexScope,
+		SchemaAnalyzer,
 		SchemaFunction,
 		SchemaParameter,
 		consts::SCHEMA_WRITE_BYTES,
@@ -21,6 +25,132 @@ use crate::{
 };
 
 impl Transaction {
+	/// Resolves one transaction-visible durable analyzer by name.
+	pub(crate) fn analyzer(
+		&mut self,
+		name: &str,
+	) -> FerrosGrynnResult<Option<Arc<SchemaAnalyzer>>> {
+		self.prepare_read()?;
+		let analyzer = self.working.schema.analyzer(name);
+		match analyzer.as_ref().and_then(|analyzer| analyzer.id()) {
+			Some(id) => self.record_read(ConflictKey::SchemaAnalyzer(id)),
+			None => self.record_read(ConflictKey::AnalyzerCatalogRange),
+		}
+		Ok(analyzer)
+	}
+
+	/// Returns every transaction-visible durable analyzer.
+	pub(crate) fn analyzers(&mut self) -> FerrosGrynnResult<Vec<Arc<SchemaAnalyzer>>> {
+		self.prepare_read()?;
+		self.record_read(ConflictKey::AnalyzerCatalogRange);
+		Ok(self.working.schema.analyzers().cloned().collect())
+	}
+
+	/// Defines one durable text analyzer.
+	pub(crate) fn define_analyzer(
+		&mut self,
+		mut analyzer: SchemaAnalyzer,
+	) -> FerrosGrynnResult<AnalyzerId> {
+		self.prepare_schema_mutation()?;
+		if analyzer.id.is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"define_analyzer requires an unpublished analyzer",
+			));
+		}
+		if self.working.schema.analyzer(analyzer.name.as_str()).is_some() {
+			return Err(analyzer_exists(analyzer.name.as_str()));
+		}
+		self.validate_analyzer_function(&analyzer)?;
+		self.intern_analyzer_mapper_keys(&analyzer)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let id = AnalyzerId::from_schema_id(self.store.inner.allocate_schema_id()?);
+		analyzer.id = Some(id);
+		self.working.install_analyzer(analyzer.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::SchemaAnalyzer(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::AnalyzerCatalogRange);
+		self.mutations.push(Mutation::DefineAnalyzer(analyzer));
+		Ok(id)
+	}
+
+	/// Replaces one analyzer definition while preserving identity and name.
+	pub(crate) fn replace_analyzer(
+		&mut self,
+		name: &str,
+		mut replacement: SchemaAnalyzer,
+	) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		let current = self.working.schema.analyzer(name).ok_or_else(|| analyzer_missing(name))?;
+		if replacement.name() != current.name() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"analyzer identity and name are immutable",
+			));
+		}
+		let id = current.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("published analyzer has no AnalyzerId")
+		})?;
+		replacement.id = Some(id);
+		replacement.version = current.version().next()?;
+		self.validate_analyzer_function(&replacement)?;
+		self.intern_analyzer_mapper_keys(&replacement)?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		self.working.replace_analyzer(replacement.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::SchemaAnalyzer(id), SCHEMA_WRITE_BYTES);
+		self.mutations.push(Mutation::ReplaceAnalyzer(replacement));
+		Ok(())
+	}
+
+	/// Removes one unreferenced durable analyzer.
+	pub(crate) fn remove_analyzer(&mut self, name: &str) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let id = self
+			.working
+			.schema
+			.analyzer(name)
+			.and_then(|analyzer| analyzer.id())
+			.ok_or_else(|| analyzer_missing(name))?;
+		self.working.remove_analyzer(id)?;
+		self.insert_write(ConflictKey::SchemaAnalyzer(id), SCHEMA_WRITE_BYTES);
+		self.mark_range_change(ConflictKey::AnalyzerCatalogRange);
+		self.mutations.push(Mutation::RemoveAnalyzer(id));
+		Ok(())
+	}
+
+	fn validate_analyzer_function(&mut self, analyzer: &SchemaAnalyzer) -> FerrosGrynnResult<()> {
+		let Some((id, version)) = analyzer.function() else {
+			return Ok(());
+		};
+		let function = self.function_by_id(id)?.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument(format!("function {id} does not exist"))
+		})?;
+		if function.version() != version
+			|| function.effect() != FunctionEffect::Pure
+			|| function.parameters().len() != 1
+			|| function
+				.parameters()
+				.next()
+				.is_none_or(|parameter| parameter.value_type() != &crate::values::Type::String)
+			|| function.result()
+				!= &crate::values::Type::Array(Box::new(crate::values::Type::Object))
+		{
+			return Err(FerrosGrynnError::invalid_argument(
+				"analyzer FUNCTION must be PURE fn(string) -> array<object>",
+			));
+		}
+		Ok(())
+	}
+
+	fn intern_analyzer_mapper_keys(&mut self, analyzer: &SchemaAnalyzer) -> FerrosGrynnResult<()> {
+		for filter in analyzer.filters() {
+			if let AnalyzerFilter::Mapper(entries) = filter {
+				for source in entries.keys() {
+					self.intern_property(source.as_str())?;
+				}
+			}
+		}
+		Ok(())
+	}
+
 	/// Returns every transaction-visible overload for one qualified name.
 	pub(crate) fn functions_named(
 		&mut self,
@@ -632,6 +762,14 @@ fn parameter_exists(name: &str) -> FerrosGrynnError {
 
 fn parameter_missing(name: &str) -> FerrosGrynnError {
 	FerrosGrynnError::invalid_argument(format!("parameter '${name}' does not exist"))
+}
+
+fn analyzer_exists(name: &str) -> FerrosGrynnError {
+	FerrosGrynnError::invalid_argument(format!("analyzer '{name}' already exists"))
+}
+
+fn analyzer_missing(name: &str) -> FerrosGrynnError {
+	FerrosGrynnError::invalid_argument(format!("analyzer '{name}' does not exist"))
 }
 
 #[cfg(test)]

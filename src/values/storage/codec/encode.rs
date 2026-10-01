@@ -381,11 +381,30 @@ fn encode_vector(output: &mut Vec<u8>, value: &Vector) -> FerrosGrynnResult<()> 
 				output.extend_from_slice(&canonical_f32(*value).to_le_bytes());
 			}
 		}
+		Vector::F16(values) => {
+			output.push(TypeTag::VectorF16.byte());
+			output.extend_from_slice(&dimension.to_le_bytes());
+			for value in values {
+				output.extend_from_slice(&canonical_f16(*value).to_le_bytes());
+			}
+		}
 		Vector::I64(values) => encode_fixed_vector(output, TypeTag::VectorI64, dimension, values),
 		Vector::I32(values) => encode_fixed_vector(output, TypeTag::VectorI32, dimension, values),
 		Vector::I16(values) => encode_fixed_vector(output, TypeTag::VectorI16, dimension, values),
+		Vector::I8(values) => encode_fixed_vector(output, TypeTag::VectorI8, dimension, values),
+		Vector::U8(values) => encode_fixed_vector(output, TypeTag::VectorU8, dimension, values),
 	}
 	Ok(())
+}
+
+fn canonical_f16(value: half::f16) -> u16 {
+	if value.is_nan() {
+		half::f16::NAN.to_bits()
+	} else if value == half::f16::ZERO {
+		half::f16::ZERO.to_bits()
+	} else {
+		value.to_bits()
+	}
 }
 
 trait LittleEndianElement {
@@ -404,7 +423,7 @@ macro_rules! impl_little_endian_element {
 	};
 }
 
-impl_little_endian_element!(i16, i32, i64);
+impl_little_endian_element!(i8, i16, i32, i64, u8);
 
 fn encode_fixed_vector<T: LittleEndianElement>(
 	output: &mut Vec<u8>,

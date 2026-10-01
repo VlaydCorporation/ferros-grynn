@@ -224,6 +224,15 @@ pub(super) fn plan_source(
 			}
 			continue;
 		}
+		if let Some(search) = search_access_operator(logical.filter.as_ref(), index) {
+			let estimate =
+				estimate_predicate(logical, snapshot, baseline, logical.filter.as_ref()).0;
+			candidates.push((lookup_cost(1, estimate, weights), index.id, search, estimate, false));
+			continue;
+		}
+		if !matches!(index.kind, ClassIndexKind::Standard | ClassIndexKind::Unique) {
+			continue;
+		}
 		let access = scalar_access_kind(source, offset, logical.filter.as_ref(), index);
 		let ordering = index_ordering(logical, source, offset, index, class);
 		let (access, direction) = match (access, ordering, forced.is_some()) {
@@ -286,6 +295,47 @@ pub(super) fn plan_source(
 		cardinality = candidate_cardinality;
 	}
 	Ok((operator, cardinality, cost, warnings))
+}
+
+fn search_access_operator(
+	filter: Option<&TypedExpr>,
+	index: &PlannerIndex,
+) -> Option<SourceOperator> {
+	let expression = filter?;
+	match &expression.kind {
+		TypedExprKind::Fulltext {
+			definitions,
+			..
+		} if index.kind == ClassIndexKind::Fulltext
+			&& definitions.iter().any(|definition| definition.index == index.id) =>
+		{
+			Some(SourceOperator::FulltextIndexScan {
+				index: index.id,
+				name: index.name.as_str().into(),
+			})
+		}
+		TypedExprKind::Knn {
+			definitions,
+			..
+		} if definitions.iter().any(|definition| definition.index == index.id) => match index.kind {
+			ClassIndexKind::Hnsw => Some(SourceOperator::HnswSearch {
+				index: index.id,
+				name: index.name.as_str().into(),
+			}),
+			ClassIndexKind::DiskAnn => Some(SourceOperator::DiskAnnSearch {
+				index: index.id,
+				name: index.name.as_str().into(),
+			}),
+			_ => None,
+		},
+		TypedExprKind::Binary {
+			left,
+			op: BinaryOperator::And,
+			right,
+		} => search_access_operator(Some(left), index)
+			.or_else(|| search_access_operator(Some(right), index)),
+		_ => None,
+	}
 }
 
 fn validate_forced_index(

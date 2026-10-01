@@ -1,7 +1,10 @@
 use std::hash::{Hash, Hasher};
 
 use super::super::*;
-use crate::gql::optimizer::{CanonicalHasher, PLAN_ENCODING_VERSION};
+use crate::gql::{
+	ir::LogicalKnnDistance,
+	optimizer::{CanonicalHasher, PLAN_ENCODING_VERSION},
+};
 
 const COLLATION_FINGERPRINT: &[u8] = b"icu4x-2.2.1-root-primary-tertiary-numeric-v1";
 
@@ -211,6 +214,81 @@ fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 			hash_expr(left, state);
 			std::mem::discriminant(op).hash(state);
 			hash_expr(right, state);
+		}
+		TypedExprKind::Fulltext {
+			left,
+			op,
+			right,
+			definitions,
+		} => {
+			hash_expr(left, state);
+			std::mem::discriminant(op).hash(state);
+			if let crate::syn::FulltextOperator::Slot(slot) = op {
+				slot.hash(state);
+			}
+			hash_expr(right, state);
+			for definition in definitions {
+				definition.index.hash(state);
+				definition.scope.hash(state);
+				definition.analyzer.id().hash(state);
+				definition.analyzer.version().hash(state);
+				definition.analyzer_function.hash(state);
+				definition.k1.to_bits().hash(state);
+				definition.b.to_bits().hash(state);
+				definition.highlights.hash(state);
+			}
+		}
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			definitions,
+			..
+		} => {
+			hash_expr(left, state);
+			hash_expr(k, state);
+			hash_optional_expr(ef.as_deref(), state);
+			match distance {
+				LogicalKnnDistance::Builtin(distance) => {
+					0_u8.hash(state);
+					distance.hash(state);
+				}
+				LogicalKnnDistance::Minkowski(exponent) => {
+					1_u8.hash(state);
+					hash_expr(exponent, state);
+				}
+				LogicalKnnDistance::Named(function) => {
+					2_u8.hash(state);
+					function.hash(state);
+				}
+				LogicalKnnDistance::Callable(callable) => {
+					3_u8.hash(state);
+					hash_expr(callable, state);
+				}
+			}
+			hash_expr(right, state);
+			for definition in definitions {
+				definition.index.hash(state);
+				definition.scope.hash(state);
+				std::mem::discriminant(&definition.kind).hash(state);
+				match definition.options {
+					crate::datastore::ClassIndexOptions::Scalar => 0_u8.hash(state),
+					crate::datastore::ClassIndexOptions::Fulltext(options) => {
+						1_u8.hash(state);
+						options.hash(state);
+					}
+					crate::datastore::ClassIndexOptions::Hnsw(options) => {
+						2_u8.hash(state);
+						options.hash(state);
+					}
+					crate::datastore::ClassIndexOptions::DiskAnn(options) => {
+						3_u8.hash(state);
+						options.hash(state);
+					}
+				}
+			}
 		}
 		TypedExprKind::Conditional {
 			condition,

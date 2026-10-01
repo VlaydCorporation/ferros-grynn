@@ -709,6 +709,26 @@ fn select_nodes(plan: &PhysicalSelectPlan, snapshot: &PlannerSnapshot) -> Vec<Va
 			node.insert("bounds", format!("{access:?}"));
 			node.insert("direction", format!("{direction:?}"));
 			node.insert("residual_predicate", plan.pushed_filter);
+		} else if let SourceOperator::FulltextIndexScan {
+			index,
+			name,
+		}
+		| SourceOperator::HnswSearch {
+			index,
+			name,
+		}
+		| SourceOperator::DiskAnnSearch {
+			index,
+			name,
+		} = &source.operator
+		{
+			node.insert("index_id", u64::from(index.get()));
+			node.insert("index_name", name.as_ref());
+			if let Some(index) = planner_index(snapshot, *index) {
+				node.insert("index_state", format!("{:?}", index.state));
+				node.insert("index_scope", format!("{:?}", index.scope));
+				node.insert("index_schema_version", u64::from(index.version.get()));
+			}
 		}
 		nodes.push(Value::Object(node));
 	}
@@ -969,6 +989,15 @@ fn source_operator_name(operator: &SourceOperator) -> &'static str {
 		SourceOperator::ScalarIndexScan {
 			..
 		} => "ScalarIndexScan",
+		SourceOperator::FulltextIndexScan {
+			..
+		} => "FulltextIndexScan",
+		SourceOperator::HnswSearch {
+			..
+		} => "HnswSearch",
+		SourceOperator::DiskAnnSearch {
+			..
+		} => "DiskAnnSearch",
 		SourceOperator::CountLookup {
 			..
 		} => "CountLookup",

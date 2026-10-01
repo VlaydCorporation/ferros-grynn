@@ -5,6 +5,8 @@ mod file;
 mod page_chain;
 
 pub(super) use database::{
+	AnalyzerCatalogEntry,
+	AnalyzerFilterCatalogEntry,
 	AtomStoreCatalogBinding,
 	ClassCatalogEntry,
 	ClassFieldCatalogEntry,

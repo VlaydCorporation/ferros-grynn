@@ -5,11 +5,13 @@ use std::{collections::BTreeMap, sync::Arc};
 use super::GraphBinding;
 use crate::{
 	datastore::{
+		AnalyzerFilter,
 		ClassField,
 		ClassIndex,
 		ClassSchema,
 		DatabaseRoot,
 		IndexId,
+		SchemaAnalyzer,
 		SchemaCatalog,
 		SchemaFunction,
 		SchemaFunctionParameter,
@@ -22,6 +24,8 @@ use crate::{
 	storage::{
 		atom_store_image::value_context,
 		catalog::{
+			AnalyzerCatalogEntry,
+			AnalyzerFilterCatalogEntry,
 			AtomStoreCatalogBinding,
 			ClassCatalogEntry,
 			ClassFieldCatalogEntry,
@@ -36,6 +40,7 @@ use crate::{
 		},
 	},
 	values::{
+		Object,
 		PropertyDictionary,
 		Value,
 		storage::{
@@ -51,6 +56,7 @@ pub(super) fn encode_database_catalog(
 	atom_store: AtomStoreCatalogBinding,
 	graphs: &[GraphBinding],
 	physical_indexes: &BTreeMap<IndexId, PhysicalIndexBinding>,
+	physical_deltas: &BTreeMap<IndexId, PhysicalIndexBinding>,
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<DatabaseCatalog> {
 	let classes = root
@@ -96,7 +102,9 @@ pub(super) fn encode_database_catalog(
 						build_revision: index.build_revision(),
 						scope: index.scope(),
 						fields: keys,
+						options: index.options,
 						physical: physical_indexes.get(&id).copied(),
+						delta: physical_deltas.get(&id).copied(),
 					})
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
@@ -211,6 +219,25 @@ pub(super) fn encode_database_catalog(
 			})
 		})
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let analyzers = root
+		.schema
+		.analyzers()
+		.map(|analyzer| {
+			Ok(AnalyzerCatalogEntry {
+				id: analyzer.id().ok_or_else(|| invalid("published analyzer has no AnalyzerId"))?,
+				version: analyzer.version(),
+				published_at: analyzer.published_at,
+				name: analyzer.name().clone(),
+				tokenizers: analyzer.tokenizers().collect(),
+				filters: analyzer
+					.filters()
+					.map(|filter| encode_analyzer_filter(filter, context))
+					.collect::<FerrosGrynnResult<Vec<_>>>()?,
+				function: analyzer.function(),
+				comment: analyzer.comment().cloned(),
+			})
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 
 	Ok(DatabaseCatalog {
 		next_graph_id: root.schema.next_graph_id,
@@ -221,6 +248,42 @@ pub(super) fn encode_database_catalog(
 		graphs,
 		parameters,
 		functions,
+		analyzers,
+	})
+}
+
+fn encode_analyzer_filter(
+	filter: &AnalyzerFilter,
+	context: &mut EncodeContext,
+) -> FerrosGrynnResult<AnalyzerFilterCatalogEntry> {
+	Ok(match filter {
+		AnalyzerFilter::Nfc => AnalyzerFilterCatalogEntry::Nfc,
+		AnalyzerFilter::Nfkc => AnalyzerFilterCatalogEntry::Nfkc,
+		AnalyzerFilter::Ascii => AnalyzerFilterCatalogEntry::Ascii,
+		AnalyzerFilter::Lowercase => AnalyzerFilterCatalogEntry::Lowercase,
+		AnalyzerFilter::Uppercase => AnalyzerFilterCatalogEntry::Uppercase,
+		AnalyzerFilter::EdgeNgram {
+			min,
+			max,
+		} => AnalyzerFilterCatalogEntry::EdgeNgram {
+			min: *min,
+			max: *max,
+		},
+		AnalyzerFilter::Ngram {
+			min,
+			max,
+		} => AnalyzerFilterCatalogEntry::Ngram {
+			min: *min,
+			max: *max,
+		},
+		AnalyzerFilter::Snowball(language) => AnalyzerFilterCatalogEntry::Snowball(*language),
+		AnalyzerFilter::Mapper(entries) => {
+			let mapper = Object::from_iter(entries.iter().map(|(source, target)| {
+				(source.clone(), target.clone().map_or(Value::Null, Value::String))
+			}));
+			let value = StorageValue::from_runtime(Value::Object(mapper), context)?;
+			AnalyzerFilterCatalogEntry::Mapper(CanonicalCodec::encode(value.as_ref())?)
+		}
 	})
 }
 
@@ -267,6 +330,7 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 					build_revision: index.build_revision,
 					scope: index.scope,
 					fields: names,
+					options: index.options,
 				})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
@@ -413,7 +477,71 @@ pub(super) fn decode_catalog_values(
 		schema.parameters.insert(entry.name.to_string(), parameter);
 		schema.parameter_versions.insert(entry.name.to_string(), entry.published_at);
 	}
+	for entry in &catalog.analyzers {
+		let filters = entry
+			.filters
+			.iter()
+			.map(|filter| decode_analyzer_filter(filter, &context.decoder()))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut analyzer =
+			SchemaAnalyzer::new(entry.name.clone(), entry.tokenizers.iter().copied(), filters)?;
+		if let Some((id, version)) = entry.function {
+			analyzer = analyzer.with_function(id, version)?;
+		}
+		analyzer.id = Some(entry.id);
+		analyzer.version = entry.version;
+		analyzer.published_at = entry.published_at;
+		analyzer.comment = entry.comment.clone();
+		schema.analyzer_names.insert(entry.name.to_string(), entry.id);
+		schema.analyzers.insert(entry.id, Arc::new(analyzer));
+		schema.analyzer_versions.insert(entry.id, entry.published_at);
+	}
 	Ok(())
+}
+
+fn decode_analyzer_filter(
+	filter: &AnalyzerFilterCatalogEntry,
+	context: &crate::values::storage::DecodeContext<'_>,
+) -> FerrosGrynnResult<AnalyzerFilter> {
+	Ok(match filter {
+		AnalyzerFilterCatalogEntry::Nfc => AnalyzerFilter::Nfc,
+		AnalyzerFilterCatalogEntry::Nfkc => AnalyzerFilter::Nfkc,
+		AnalyzerFilterCatalogEntry::Ascii => AnalyzerFilter::Ascii,
+		AnalyzerFilterCatalogEntry::Lowercase => AnalyzerFilter::Lowercase,
+		AnalyzerFilterCatalogEntry::Uppercase => AnalyzerFilter::Uppercase,
+		AnalyzerFilterCatalogEntry::EdgeNgram {
+			min,
+			max,
+		} => AnalyzerFilter::EdgeNgram {
+			min: *min,
+			max: *max,
+		},
+		AnalyzerFilterCatalogEntry::Ngram {
+			min,
+			max,
+		} => AnalyzerFilter::Ngram {
+			min: *min,
+			max: *max,
+		},
+		AnalyzerFilterCatalogEntry::Snowball(language) => AnalyzerFilter::Snowball(*language),
+		AnalyzerFilterCatalogEntry::Mapper(bytes) => {
+			let value =
+				CanonicalCodec::decode(bytes, DecodeLimits::default())?.into_runtime(context)?;
+			let Value::Object(entries) = value else {
+				return Err(invalid("analyzer mapper is not an object"));
+			};
+			let mut mapper = BTreeMap::new();
+			for (source, target) in entries {
+				let target = match target {
+					Value::String(value) => Some(value),
+					Value::Null => None,
+					_ => return Err(invalid("analyzer mapper value is neither string nor null")),
+				};
+				mapper.insert(source, target);
+			}
+			AnalyzerFilter::Mapper(mapper)
+		}
+	})
 }
 
 fn invalid(reason: impl Into<String>) -> FerrosGrynnError {

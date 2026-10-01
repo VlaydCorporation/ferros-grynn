@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeSet, btree_set},
+	collections::{BTreeMap, BTreeSet, btree_set},
 	ops::Bound,
 	sync::Arc,
 };
@@ -24,11 +24,12 @@ use crate::{
 	storage::{
 		LocalQuerySnapshot,
 		PhysicalIndexAtom,
+		PhysicalIndexDelta,
 		PhysicalIndexEntries,
 		PhysicalIndexRead,
 		PhysicalScalarGroup,
 	},
-	values::{AtomKind, PropertyDictionary, PropertyMap, RecordId, Text, Value},
+	values::{AtomKind, PropertyDictionary, PropertyMap, RecordId, Text, Value, Vector},
 };
 
 /// One owned atom row passed from datastore cursors to query execution.
@@ -41,6 +42,38 @@ pub(crate) struct QueryStorageRow {
 	pub(crate) values: Vec<Value>,
 	pub(crate) base_properties: PropertyMap,
 	pub(crate) properties: PropertyMap,
+}
+
+/// One query term retained from a validated immutable Fulltext side-file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryFulltextTermRead {
+	pub(crate) document_frequency: u64,
+	pub(crate) term_frequency: u32,
+	pub(crate) spans: Vec<(u32, u32)>,
+}
+
+/// One matching document projected out of storage-owned index addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryFulltextDocumentRead {
+	pub(crate) record_id: RecordId,
+	pub(crate) document_length: u32,
+	pub(crate) terms: BTreeMap<Box<str>, QueryFulltextTermRead>,
+}
+
+/// Snapshot-exact Fulltext statistics and matching public identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryFulltextIndexRead {
+	pub(crate) document_count: u64,
+	pub(crate) total_document_length: u64,
+	pub(crate) documents: Vec<QueryFulltextDocumentRead>,
+}
+
+/// One public row identity returned by a physical ANN generation after exact
+/// reranking of its full canonical vector.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QueryVectorIndexRead {
+	pub(crate) record_id: RecordId,
+	pub(crate) distance: f64,
 }
 
 enum QueryCursorSource<'snapshot> {
@@ -334,6 +367,30 @@ impl Transaction {
 		Ok(snapshot.root.schema.functions.get(&id).cloned())
 	}
 
+	pub(crate) fn query_schema_analyzer(
+		&self,
+		snapshot: &QuerySnapshot,
+		name: &str,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaAnalyzer>>> {
+		self.ensure_live()?;
+		let analyzer = snapshot.root.schema.analyzer(name);
+		match analyzer.as_ref().and_then(|analyzer| analyzer.id()) {
+			Some(id) => self.record_read(crate::datastore::ConflictKey::SchemaAnalyzer(id)),
+			None => self.record_read(crate::datastore::ConflictKey::AnalyzerCatalogRange),
+		}
+		Ok(analyzer)
+	}
+
+	pub(crate) fn query_schema_analyzer_by_id(
+		&self,
+		snapshot: &QuerySnapshot,
+		id: crate::datastore::AnalyzerId,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaAnalyzer>>> {
+		self.ensure_live()?;
+		self.record_read(crate::datastore::ConflictKey::SchemaAnalyzer(id));
+		Ok(snapshot.root.schema.analyzer_by_id(id))
+	}
+
 	/// Computes a LevelPath object from one immutable statement snapshot.
 	pub(crate) fn query_level_path(
 		&self,
@@ -409,6 +466,21 @@ impl Transaction {
 		let index_id = index.id().ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("published index is missing IndexId")
 		})?;
+		if matches!(
+			index.kind(),
+			crate::datastore::ClassIndexKind::Fulltext
+				| crate::datastore::ClassIndexKind::Hnsw
+				| crate::datastore::ClassIndexKind::DiskAnn
+		) {
+			if index.state() != crate::datastore::ClassIndexState::Ready {
+				return Ok((false, None));
+			}
+			let available = snapshot
+				.physical
+				.as_ref()
+				.is_some_and(|physical| self.store.inner.has_physical_index(physical, index_id));
+			return Ok((available, None));
+		}
 		let binding = match index.scope() {
 			crate::datastore::IndexScope::Base => planner_binding_summary(
 				snapshot.root.indexes.base_index(index_id),
@@ -460,7 +532,361 @@ impl Transaction {
 			PhysicalIndexEntries::Scalar(_) => {
 				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as scalar"))
 			}
+			PhysicalIndexEntries::Fulltext(_) => {
+				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as Fulltext"))
+			}
+			PhysicalIndexEntries::Vector(_) => {
+				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as vector"))
+			}
 		}
+	}
+
+	/// Reads one immutable Fulltext binding into public record identities.
+	///
+	/// `None` means the captured snapshot has no compatible physical binding
+	/// and the query executor must use its exact analyzer scan.
+	pub(crate) fn query_fulltext_index(
+		&self,
+		snapshot: &QuerySnapshot,
+		index: IndexId,
+		class_id: crate::datastore::ClassId,
+		scope: crate::datastore::IndexScope,
+		terms: &BTreeSet<Box<str>>,
+	) -> FerrosGrynnResult<Option<QueryFulltextIndexRead>> {
+		self.ensure_live()?;
+		let Some(physical_snapshot) = snapshot.physical.as_ref() else {
+			return Ok(None);
+		};
+		if !self.store.inner.has_physical_index(physical_snapshot, index) {
+			return Ok(None);
+		}
+		match scope {
+			crate::datastore::IndexScope::Base => {
+				self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id));
+			}
+			crate::datastore::IndexScope::Effective {
+				graph,
+			} => {
+				self.record_read(crate::datastore::ConflictKey::GraphClassRange(graph, class_id));
+			}
+		}
+		let physical = self.query_physical_index(
+			snapshot,
+			index,
+			class_id,
+			crate::datastore::ClassIndexKind::Fulltext,
+			scope,
+		)?;
+		let PhysicalIndexEntries::Fulltext(fulltext) = &physical.entries else {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"Fulltext index decoded as another index kind",
+			));
+		};
+		let mut documents = fulltext
+			.documents
+			.iter()
+			.map(|document| (document.atom, (document.document_length, BTreeMap::new())))
+			.collect::<BTreeMap<_, _>>();
+		for term in terms {
+			let Some(entry) = fulltext
+				.terms
+				.binary_search_by(|candidate| candidate.term.as_slice().cmp(term.as_bytes()))
+				.ok()
+				.map(|position| &fulltext.terms[position])
+			else {
+				continue;
+			};
+			for posting in &entry.postings {
+				let document = documents
+					.entry(posting.atom)
+					.or_insert_with(|| (posting.document_length, BTreeMap::new()));
+				if document.0 != posting.document_length {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"Fulltext postings disagree on document length",
+					));
+				}
+				document.1.insert(term.clone(), QueryFulltextTermRead {
+					document_frequency: 0,
+					term_frequency: posting.term_frequency,
+					spans: posting.spans.clone(),
+				});
+			}
+		}
+		match physical.delta.as_ref() {
+			None => {}
+			Some(PhysicalIndexDelta::Fulltext(delta)) => {
+				for record in &delta.records {
+					match record {
+						crate::storage::FulltextDeltaRecord::Delete {
+							atom,
+						} => {
+							documents.remove(atom);
+						}
+						crate::storage::FulltextDeltaRecord::Upsert {
+							atom,
+							tokens,
+						} => {
+							let document_length =
+								u32::try_from(tokens.len()).map_err(|_error| {
+									FerrosGrynnError::invalid_storage_file(
+										"Fulltext delta document length exceeds u32",
+									)
+								})?;
+							let mut matches = BTreeMap::<Box<str>, QueryFulltextTermRead>::new();
+							for token in
+								tokens.iter().filter(|token| terms.contains(token.term.as_str()))
+							{
+								let matched = matches
+									.entry(token.term.as_str().into())
+									.or_insert_with(|| QueryFulltextTermRead {
+										document_frequency: 0,
+										term_frequency: 0,
+										spans: Vec::new(),
+									});
+								matched.term_frequency =
+									matched.term_frequency.checked_add(1).ok_or_else(|| {
+										FerrosGrynnError::invalid_storage_file(
+											"Fulltext delta term frequency exceeds u32",
+										)
+									})?;
+								if fulltext.spec.options.highlights() {
+									matched.spans.push((token.start, token.end));
+								}
+							}
+							documents.insert(*atom, (document_length, matches));
+						}
+					}
+				}
+			}
+			Some(PhysicalIndexDelta::Vector(_)) => {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"Fulltext index has a vector delta",
+				));
+			}
+		}
+		let document_count = u64::try_from(documents.len()).map_err(|_error| {
+			FerrosGrynnError::invalid_storage_file("Fulltext document count exceeds u64")
+		})?;
+		let total_document_length = documents.values().try_fold(0_u64, |total, document| {
+			total.checked_add(u64::from(document.0)).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("Fulltext total document length exceeds u64")
+			})
+		})?;
+		let frequencies = terms
+			.iter()
+			.map(|term| {
+				(
+					term.clone(),
+					u64::try_from(
+						documents.values().filter(|document| document.1.contains_key(term)).count(),
+					)
+					.unwrap_or(u64::MAX),
+				)
+			})
+			.collect::<BTreeMap<_, _>>();
+		for document in documents.values_mut() {
+			for (term, matched) in &mut document.1 {
+				matched.document_frequency = frequencies.get(term).copied().unwrap_or(0);
+			}
+		}
+		let graph = match scope {
+			crate::datastore::IndexScope::Base => None,
+			crate::datastore::IndexScope::Effective {
+				graph,
+			} => Some(
+				snapshot
+					.root
+					.graph(graph)
+					.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?,
+			),
+		};
+		let mut output = Vec::with_capacity(documents.len());
+		for (address, (document_length, terms)) in
+			documents.into_iter().filter(|(_address, (_length, terms))| !terms.is_empty())
+		{
+			let address = PhysicalIndexAtom {
+				kind: address.kind(),
+				slot: address.slot(),
+			};
+			let global = if let Some(graph) = graph {
+				let local = physical_local_id(graph, address)?;
+				graph
+					.occurrence(local)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"Fulltext posting references an absent occurrence",
+						)
+					})?
+					.global_id()
+			} else {
+				physical_global_id(&snapshot.root, address)?
+			};
+			let atom = snapshot.root.atom(global).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"Fulltext posting references an absent base atom",
+				)
+			})?;
+			if atom.class_id() != class_id {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"Fulltext posting references an atom of another class",
+				));
+			}
+			let record_id = atom.record_id().clone();
+			output.push(QueryFulltextDocumentRead {
+				record_id,
+				document_length,
+				terms,
+			});
+		}
+		output.sort_unstable_by(|left, right| left.record_id.cmp(&right.record_id));
+		Ok(Some(QueryFulltextIndexRead {
+			document_count,
+			total_document_length,
+			documents: output,
+		}))
+	}
+
+	/// Searches one compatible immutable HNSW/DiskANN generation and maps its
+	/// storage-local addresses to public record identities.
+	pub(crate) fn query_vector_index(
+		&self,
+		snapshot: &QuerySnapshot,
+		index: IndexId,
+		class_id: crate::datastore::ClassId,
+		scope: crate::datastore::IndexScope,
+		query: &Vector,
+		k: usize,
+		breadth: usize,
+	) -> FerrosGrynnResult<Option<Vec<QueryVectorIndexRead>>> {
+		self.ensure_live()?;
+		let Some(physical_snapshot) = snapshot.physical.as_ref() else {
+			return Ok(None);
+		};
+		if !self.store.inner.has_physical_index(physical_snapshot, index) {
+			return Ok(None);
+		}
+		match scope {
+			crate::datastore::IndexScope::Base => {
+				self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id));
+			}
+			crate::datastore::IndexScope::Effective {
+				graph,
+			} => {
+				self.record_read(crate::datastore::ConflictKey::GraphClassRange(graph, class_id));
+			}
+		}
+		let class = snapshot.root.schema.class_by_id(class_id).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file(
+				"vector physical binding references an absent class",
+			)
+		})?;
+		let definition =
+			class.indexes().find(|candidate| candidate.id() == Some(index)).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"vector physical binding has no schema definition",
+				)
+			})?;
+		if !matches!(
+			definition.kind(),
+			crate::datastore::ClassIndexKind::Hnsw | crate::datastore::ClassIndexKind::DiskAnn
+		) {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"vector physical binding points to a non-vector definition",
+			));
+		}
+		let graph = match scope {
+			crate::datastore::IndexScope::Base => None,
+			crate::datastore::IndexScope::Effective {
+				graph,
+			} => Some(
+				snapshot
+					.root
+					.graph(graph)
+					.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?,
+			),
+		};
+		let hits = if definition.kind() == crate::datastore::ClassIndexKind::DiskAnn {
+			self.store
+				.inner
+				.search_diskann_index(physical_snapshot, index, query, k, breadth)?
+				.ok_or_else(|| deferred_index_missing(index))?
+		} else {
+			let physical =
+				self.query_physical_index(snapshot, index, class_id, definition.kind(), scope)?;
+			let PhysicalIndexEntries::Vector(vector) = &physical.entries else {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"vector index decoded as another index kind",
+				));
+			};
+			let evaluator = crate::gql::PureFunctionEvaluator::new(&snapshot.root);
+			let mut distance = |function, version, left: &Vector, right: &Vector| {
+				evaluator.distance(function, version, left, right)
+			};
+			match physical.delta.as_ref() {
+				None => crate::storage::search_vector_index_with_distance(
+					vector,
+					query,
+					k,
+					breadth,
+					&mut distance,
+				)?,
+				Some(PhysicalIndexDelta::Vector(delta)) => {
+					crate::storage::search_vector_index_with_delta_and_distance(
+						vector,
+						delta,
+						query,
+						k,
+						breadth,
+						&mut distance,
+					)?
+				}
+				Some(PhysicalIndexDelta::Fulltext(_)) => {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"vector index has a Fulltext delta",
+					));
+				}
+			}
+		};
+		let mut output = Vec::new();
+		for hit in hits {
+			let address = PhysicalIndexAtom {
+				kind: hit.atom.kind(),
+				slot: hit.atom.slot(),
+			};
+			let global = if let Some(graph) = graph {
+				let local = physical_local_id(graph, address)?;
+				graph
+					.occurrence(local)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"vector posting references an absent occurrence",
+						)
+					})?
+					.global_id()
+			} else {
+				physical_global_id(&snapshot.root, address)?
+			};
+			let atom = snapshot.root.atom(global).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"vector posting references an absent base atom",
+				)
+			})?;
+			if atom.class_id() != class_id {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"vector posting references an atom of another class",
+				));
+			}
+			output.push(QueryVectorIndexRead {
+				record_id: atom.record_id().clone(),
+				distance: hit.distance,
+			});
+		}
+		output.sort_unstable_by(|left, right| {
+			left.distance
+				.total_cmp(&right.distance)
+				.then_with(|| left.record_id.cmp(&right.record_id))
+		});
+		Ok(Some(output))
 	}
 
 	pub(crate) fn query_row_cursor<'snapshot>(
@@ -1561,6 +1987,12 @@ fn physical_count(index: &PhysicalIndexRead) -> FerrosGrynnResult<u64> {
 		PhysicalIndexEntries::Count(count) => Ok(*count),
 		PhysicalIndexEntries::Scalar(_) => {
 			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as scalar"))
+		}
+		PhysicalIndexEntries::Fulltext(_) => {
+			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as Fulltext"))
+		}
+		PhysicalIndexEntries::Vector(_) => {
+			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as vector"))
 		}
 	}
 }

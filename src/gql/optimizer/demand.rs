@@ -5,6 +5,7 @@ use crate::{
 	gql::ir::{
 		LogicalGraphDmlStatement,
 		LogicalGraphReference,
+		LogicalKnnDistance,
 		LogicalMatch,
 		LogicalMatchPatternKind,
 		LogicalMatchSelector,
@@ -441,6 +442,33 @@ fn collect_expr(
 			..
 		} => {
 			collect_expr(Some(left), owners, demand);
+			collect_expr(Some(right), owners, demand);
+		}
+		TypedExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => {
+			collect_expr(Some(left), owners, demand);
+			collect_expr(Some(right), owners, demand);
+		}
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			..
+		} => {
+			collect_expr(Some(left), owners, demand);
+			collect_expr(Some(k), owners, demand);
+			collect_expr(ef.as_deref(), owners, demand);
+			match distance {
+				LogicalKnnDistance::Minkowski(value) | LogicalKnnDistance::Callable(value) => {
+					collect_expr(Some(value), owners, demand);
+				}
+				LogicalKnnDistance::Builtin(_) | LogicalKnnDistance::Named(_) => {}
+			}
 			collect_expr(Some(right), owners, demand);
 		}
 		TypedExprKind::Conditional {

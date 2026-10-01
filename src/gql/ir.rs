@@ -1,13 +1,18 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use crate::{
 	datastore::{
 		ClassIndexKind,
+		ClassIndexOptions,
+		ClassIndexState,
 		ClassSchemaMode,
 		FunctionEffect,
 		FunctionId,
+		IndexId,
 		IndexScope,
+		SchemaAnalyzer,
 		SchemaVersion,
+		VectorDistance,
 	},
 	gql_status::TextSpan,
 	graph::GraphTopologyConstraints,
@@ -290,9 +295,14 @@ pub(super) enum LogicalSchemaStatement {
 		name: Box<str>,
 		kind: ClassIndexKind,
 		fields: Vec<Box<str>>,
+		options: ClassIndexOptions,
 		scope: IndexScope,
 		maintenance: crate::datastore::IndexMaintenanceMode,
 		concurrently: bool,
+	},
+	DefineAnalyzer {
+		mode: DefinitionMode,
+		analyzer: crate::datastore::SchemaAnalyzer,
 	},
 	DefineParameter {
 		mode: DefinitionMode,
@@ -340,6 +350,10 @@ pub(super) enum LogicalSchemaStatement {
 		name: Box<str>,
 		signature: Option<Vec<Type>>,
 	},
+	RemoveAnalyzer {
+		if_exists: bool,
+		name: Box<str>,
+	},
 	AlterClassMode {
 		if_exists: bool,
 		name: Box<str>,
@@ -372,7 +386,18 @@ pub(super) enum LogicalSchemaStatement {
 		body: Option<Text>,
 		comment: Option<Option<Text>>,
 	},
+	AlterAnalyzer {
+		if_exists: bool,
+		name: Box<str>,
+		function: Option<Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion)>>,
+		tokenizers: Option<Vec<crate::datastore::AnalyzerTokenizer>>,
+		filters: Option<Vec<crate::datastore::AnalyzerFilter>>,
+		comment: Option<Option<Text>>,
+	},
 	InfoDatabase,
+	InfoAnalyzer {
+		name: Box<str>,
+	},
 	InfoClass {
 		name: Box<str>,
 	},
@@ -412,6 +437,9 @@ impl LogicalSchemaStatement {
 			| Self::DefineIndex {
 				..
 			}
+			| Self::DefineAnalyzer {
+				..
+			}
 			| Self::DefineParameter {
 				..
 			}
@@ -438,6 +466,9 @@ impl LogicalSchemaStatement {
 			}
 			| Self::RemoveFunction {
 				..
+			}
+			| Self::RemoveAnalyzer {
+				..
 			} => crate::gql::QueryStatementKind::Remove,
 			Self::AlterClassMode {
 				..
@@ -453,8 +484,14 @@ impl LogicalSchemaStatement {
 			}
 			| Self::AlterFunction {
 				..
+			}
+			| Self::AlterAnalyzer {
+				..
 			} => crate::gql::QueryStatementKind::Alter,
 			Self::InfoDatabase
+			| Self::InfoAnalyzer {
+				..
+			}
 			| Self::InfoClass {
 				..
 			}
@@ -976,6 +1013,7 @@ impl ScanTarget {
 #[derive(Debug, Clone, Default)]
 pub(super) struct Schema {
 	pub(super) columns: Vec<Column>,
+	pub(super) origins: BTreeMap<usize, ColumnOrigin>,
 }
 
 impl Schema {
@@ -998,6 +1036,18 @@ impl Schema {
 				&& column.name.eq_ignore_ascii_case(name)
 		})
 	}
+}
+
+/// Durable field identity retained while relational aliases and joins reshape
+/// the visible row schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ColumnOrigin {
+	pub(super) source: Box<str>,
+	pub(super) class: Box<str>,
+	pub(super) field: Box<str>,
+	/// `None` denotes a dynamic graph scope whose identity is resolved at
+	/// statement execution.
+	pub(super) scope: Option<IndexScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -1076,6 +1126,21 @@ pub(super) enum TypedExprKind {
 		op: crate::syn::BinaryOperator,
 		right: Box<TypedExpr>,
 	},
+	Fulltext {
+		left: Box<TypedExpr>,
+		op: crate::syn::FulltextOperator,
+		right: Box<TypedExpr>,
+		definitions: Vec<LogicalFulltextDefinition>,
+	},
+	Knn {
+		left: Box<TypedExpr>,
+		origin: ColumnOrigin,
+		k: Box<TypedExpr>,
+		ef: Option<Box<TypedExpr>>,
+		distance: LogicalKnnDistance,
+		right: Box<TypedExpr>,
+		definitions: Vec<LogicalVectorDefinition>,
+	},
 	Conditional {
 		condition: Box<TypedExpr>,
 		then_value: Box<TypedExpr>,
@@ -1132,6 +1197,46 @@ pub(super) enum TypedExprKind {
 		target: Type,
 		expr: Box<TypedExpr>,
 	},
+}
+
+/// Snapshot-exact Fulltext definition selected during semantic analysis.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalFulltextDefinition {
+	pub(super) class: Box<str>,
+	pub(super) field: Box<str>,
+	pub(super) source: Box<str>,
+	pub(super) scope: Option<IndexScope>,
+	pub(super) index: IndexId,
+	pub(super) name: Text,
+	pub(super) state: ClassIndexState,
+	pub(super) analyzer: Arc<SchemaAnalyzer>,
+	pub(super) analyzer_function: Option<NamedFunctionKey>,
+	pub(super) k1: f64,
+	pub(super) b: f64,
+	pub(super) highlights: bool,
+}
+
+/// Exact KNN distance or a typed callable evaluated by the query runtime.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalKnnDistance {
+	Builtin(VectorDistance),
+	Minkowski(Box<TypedExpr>),
+	Named(NamedFunctionKey),
+	Callable(Box<TypedExpr>),
+}
+
+/// One compatible durable ANN definition visible to planning.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalVectorDefinition {
+	pub(super) class: Box<str>,
+	pub(super) field: Box<str>,
+	pub(super) source: Box<str>,
+	pub(super) scope: Option<IndexScope>,
+	pub(super) index: IndexId,
+	pub(super) name: Text,
+	pub(super) kind: ClassIndexKind,
+	pub(super) state: ClassIndexState,
+	pub(super) options: ClassIndexOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1202,4 +1307,10 @@ pub(super) enum Builtin {
 	Uuid,
 	Ulid,
 	RandId,
+	SearchAnalyze {
+		analyzer: Arc<SchemaAnalyzer>,
+		function: Option<NamedFunctionKey>,
+	},
+	SearchScore(u16),
+	SearchHighlight(u16),
 }

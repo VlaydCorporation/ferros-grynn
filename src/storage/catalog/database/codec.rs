@@ -1,6 +1,8 @@
 //! Canonical little-endian encoding for `FGDC v10`.
 
 use super::{
+	AnalyzerCatalogEntry,
+	AnalyzerFilterCatalogEntry,
 	AtomStoreCatalogBinding,
 	ClassCatalogEntry,
 	ClassFieldCatalogEntry,
@@ -17,17 +19,25 @@ use super::{
 };
 use crate::{
 	datastore::{
+		AnalyzerId,
+		AnalyzerLanguage,
+		AnalyzerTokenizer,
 		ClassId,
 		ClassIndexKind,
+		ClassIndexOptions,
 		ClassIndexState,
 		ClassSchemaMode,
+		DiskAnnIndexOptions,
+		FulltextIndexOptions,
 		FunctionEffect,
 		FunctionId,
+		HnswIndexOptions,
 		IndexId,
 		IndexMaintenanceMode,
 		IndexScope,
 		SchemaId,
 		SchemaVersion,
+		VectorDistance,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, GraphId, GraphStorageMode, GraphTopologyConstraints},
@@ -36,7 +46,7 @@ use crate::{
 		page::PageNo,
 		types::{DataFileId, DataFileKind},
 	},
-	values::PropertyKeyId,
+	values::{PropertyKeyId, VectorKind},
 };
 
 const MAGIC: [u8; 4] = *b"FGDC";
@@ -58,7 +68,7 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	write_u32(&mut output, catalog.graphs.len(), "graph count")?;
 	write_u32(&mut output, catalog.parameters.len(), "parameter count")?;
 	write_u32(&mut output, catalog.functions.len(), "function count")?;
-	output.extend_from_slice(&0_u32.to_le_bytes());
+	write_u32(&mut output, catalog.analyzers.len(), "analyzer count")?;
 	output.extend_from_slice(&catalog.atom_store.generation.to_le_bytes());
 	write_binding(&mut output, catalog.atom_store.primary);
 	write_binding(&mut output, catalog.atom_store.reverse_membership);
@@ -77,6 +87,9 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	}
 	for function in &catalog.functions {
 		encode_function(&mut output, function)?;
+	}
+	for analyzer in &catalog.analyzers {
+		encode_analyzer(&mut output, analyzer)?;
 	}
 	if output.len() > MAX_BYTES {
 		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
@@ -115,7 +128,7 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	let graph_count = decoder.read_count("graph count")?;
 	let parameter_count = decoder.read_count("parameter count")?;
 	let function_count = decoder.read_count("function count")?;
-	decoder.expect_zero(4, "database catalog header reserved bytes")?;
+	let analyzer_count = decoder.read_count("analyzer count")?;
 	let generation = decoder.read_u64()?;
 	let primary = read_binding(&mut decoder)?;
 	let reverse_membership = read_binding(&mut decoder)?;
@@ -140,6 +153,10 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	for _ in 0..function_count {
 		functions.push(decode_function(&mut decoder)?);
 	}
+	let mut analyzers = Vec::with_capacity(analyzer_count);
+	for _ in 0..analyzer_count {
+		analyzers.push(decode_analyzer(&mut decoder)?);
+	}
 	decoder.finish()?;
 	let catalog = DatabaseCatalog {
 		next_graph_id,
@@ -154,6 +171,7 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 		graphs,
 		parameters,
 		functions,
+		analyzers,
 	};
 	validate(&catalog)?;
 	Ok(catalog)
@@ -238,13 +256,16 @@ fn encode_index(output: &mut Vec<u8>, index: &ClassIndexCatalogEntry) -> FerrosG
 		}
 	}
 	write_u16(output, index.fields.len(), "index field count")?;
-	output.extend_from_slice(&0_u16.to_le_bytes());
+	let options = encode_index_options(index.options)?;
+	write_u16(output, options.len(), "index options length")?;
 	output.extend_from_slice(&index.build_revision.to_le_bytes());
 	write_optional_binding(output, index.physical);
+	write_optional_binding(output, index.delta);
 	write_string(output, index.name.as_str(), "index name")?;
 	for field in &index.fields {
 		output.extend_from_slice(&field.get().to_le_bytes());
 	}
+	output.extend_from_slice(&options);
 	Ok(())
 }
 
@@ -265,14 +286,18 @@ fn decode_index(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassIndexCatalo
 		_ => return Err(invalid("index scope encoding is not canonical")),
 	};
 	let field_count = usize::from(decoder.read_u16()?);
-	decoder.expect_zero(2, "index entry reserved bytes")?;
+	let options_len = usize::from(decoder.read_u16()?);
 	let build_revision = decoder.read_u64()?;
 	let physical = read_optional_binding(decoder)?;
+	let delta = read_optional_binding(decoder)?;
 	let name = read_string(decoder, "index name")?.into();
 	let mut fields = Vec::with_capacity(field_count);
 	for _ in 0..field_count {
 		fields.push(PropertyKeyId::new(decoder.read_u32()?));
 	}
+	let mut options_decoder = Decoder::new(decoder.read_exact(options_len)?);
+	let options = decode_index_options(kind, &mut options_decoder)?;
+	options_decoder.finish()?;
 	Ok(ClassIndexCatalogEntry {
 		id,
 		version,
@@ -283,8 +308,164 @@ fn decode_index(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ClassIndexCatalo
 		build_revision,
 		scope,
 		fields,
+		options,
 		physical,
+		delta,
 	})
+}
+
+fn encode_index_options(options: ClassIndexOptions) -> FerrosGrynnResult<Vec<u8>> {
+	let mut output = Vec::new();
+	match options {
+		ClassIndexOptions::Scalar => {}
+		ClassIndexOptions::Fulltext(options) => {
+			output.extend_from_slice(&options.analyzer.get().to_le_bytes());
+			output.extend_from_slice(&options.analyzer_version.get().to_le_bytes());
+			output.extend_from_slice(&options.k1_bits.to_le_bytes());
+			output.extend_from_slice(&options.b_bits.to_le_bytes());
+			output.push(u8::from(options.highlights));
+			output.extend_from_slice(&[0; 7]);
+		}
+		ClassIndexOptions::Hnsw(options) => {
+			output.push(vector_kind(options.element));
+			output.extend_from_slice(&[0; 3]);
+			output.extend_from_slice(&options.dimension.get().to_le_bytes());
+			output.extend_from_slice(&options.m.get().to_le_bytes());
+			output.extend_from_slice(&options.ef_construction.get().to_le_bytes());
+			output.extend_from_slice(&options.m0.get().to_le_bytes());
+			encode_vector_distance(&mut output, options.distance);
+		}
+		ClassIndexOptions::DiskAnn(options) => {
+			output.push(vector_kind(options.element));
+			output.push(u8::from(options.hashed_vector));
+			output.extend_from_slice(&options.dimension.get().to_le_bytes());
+			output.extend_from_slice(&options.degree.get().to_le_bytes());
+			output.extend_from_slice(&options.build_list_size.get().to_le_bytes());
+			output.extend_from_slice(&options.alpha_bits.to_le_bytes());
+			encode_vector_distance(&mut output, options.distance);
+		}
+	}
+	Ok(output)
+}
+
+fn decode_index_options(
+	kind: ClassIndexKind,
+	decoder: &mut Decoder<'_>,
+) -> FerrosGrynnResult<ClassIndexOptions> {
+	match kind {
+		ClassIndexKind::Standard | ClassIndexKind::Unique | ClassIndexKind::Count => {
+			Ok(ClassIndexOptions::Scalar)
+		}
+		ClassIndexKind::Fulltext => {
+			let analyzer = AnalyzerId::from_storage(decoder.read_u32()?)?;
+			let analyzer_version = SchemaVersion::from_storage(decoder.read_u32()?)?;
+			let k1 = f64::from_bits(decoder.read_u64()?);
+			let b = f64::from_bits(decoder.read_u64()?);
+			let highlights = match decoder.read_u8()? {
+				0 => false,
+				1 => true,
+				_ => return Err(invalid("Fulltext highlight flag is invalid")),
+			};
+			decoder.expect_zero(7, "Fulltext options reserved bytes")?;
+			Ok(ClassIndexOptions::Fulltext(FulltextIndexOptions::new(
+				analyzer,
+				analyzer_version,
+				k1,
+				b,
+				highlights,
+			)?))
+		}
+		ClassIndexKind::Hnsw => {
+			let element = decode_vector_kind(decoder.read_u8()?)?;
+			decoder.expect_zero(3, "HNSW options reserved bytes")?;
+			let dimension = nonzero_u16(decoder.read_u16()?, "HNSW dimension")?;
+			let m = nonzero_u16(decoder.read_u16()?, "HNSW M")?;
+			let ef_construction = nonzero_u16(decoder.read_u16()?, "HNSW EFC")?;
+			let m0 = nonzero_u16(decoder.read_u16()?, "HNSW M0")?;
+			let distance = decode_vector_distance(decoder)?;
+			distance.validate()?;
+			Ok(ClassIndexOptions::Hnsw(HnswIndexOptions {
+				element,
+				dimension,
+				distance,
+				m,
+				ef_construction,
+				m0,
+			}))
+		}
+		ClassIndexKind::DiskAnn => {
+			let element = decode_vector_kind(decoder.read_u8()?)?;
+			let hashed_vector = match decoder.read_u8()? {
+				0 => false,
+				1 => true,
+				_ => return Err(invalid("DiskANN HASHED_VECTOR flag is invalid")),
+			};
+			let dimension = nonzero_u16(decoder.read_u16()?, "DiskANN dimension")?;
+			let degree = nonzero_u16(decoder.read_u16()?, "DiskANN degree")?;
+			let build_list_size = nonzero_u16(decoder.read_u16()?, "DiskANN build list")?;
+			let alpha_bits = decoder.read_u32()?;
+			let alpha = f32::from_bits(alpha_bits);
+			if !alpha.is_finite() || alpha <= 0.0 {
+				return Err(invalid("DiskANN alpha must be finite and positive"));
+			}
+			let distance = decode_vector_distance(decoder)?;
+			distance.validate()?;
+			Ok(ClassIndexOptions::DiskAnn(DiskAnnIndexOptions {
+				element,
+				dimension,
+				distance,
+				degree,
+				build_list_size,
+				alpha_bits,
+				hashed_vector,
+			}))
+		}
+	}
+}
+
+fn encode_vector_distance(output: &mut Vec<u8>, distance: VectorDistance) {
+	let (tag, function, version, parameter) = match distance {
+		VectorDistance::Euclidean => (0, 0, 0, 0),
+		VectorDistance::Cosine => (1, 0, 0, 0),
+		VectorDistance::Manhattan => (2, 0, 0, 0),
+		VectorDistance::Minkowski(exponent) => (3, 0, 0, exponent.to_bits()),
+		VectorDistance::InnerProduct => (4, 0, 0, 0),
+		VectorDistance::CosineNormalized => (5, 0, 0, 0),
+		VectorDistance::Custom {
+			function,
+			version,
+		} => (6, function.get(), version.get(), 0),
+	};
+	output.push(tag);
+	output.extend_from_slice(&[0; 3]);
+	output.extend_from_slice(&function.to_le_bytes());
+	output.extend_from_slice(&version.to_le_bytes());
+	output.extend_from_slice(&parameter.to_le_bytes());
+}
+
+fn decode_vector_distance(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<VectorDistance> {
+	let tag = decoder.read_u8()?;
+	decoder.expect_zero(3, "vector distance reserved bytes")?;
+	let function = decoder.read_u32()?;
+	let version = decoder.read_u32()?;
+	let parameter = decoder.read_u64()?;
+	match (tag, function, version, parameter) {
+		(0, 0, 0, 0) => Ok(VectorDistance::Euclidean),
+		(1, 0, 0, 0) => Ok(VectorDistance::Cosine),
+		(2, 0, 0, 0) => Ok(VectorDistance::Manhattan),
+		(3, 0, 0, bits) => Ok(VectorDistance::Minkowski(f64::from_bits(bits))),
+		(4, 0, 0, 0) => Ok(VectorDistance::InnerProduct),
+		(5, 0, 0, 0) => Ok(VectorDistance::CosineNormalized),
+		(6, function, version, 0) => Ok(VectorDistance::Custom {
+			function: FunctionId::from_storage(function)?,
+			version: SchemaVersion::from_storage(version)?,
+		}),
+		_ => Err(invalid("vector distance encoding is not canonical")),
+	}
+}
+
+fn nonzero_u16(value: u16, field: &str) -> FerrosGrynnResult<std::num::NonZeroU16> {
+	std::num::NonZeroU16::new(value).ok_or_else(|| invalid(format!("{field} is zero")))
 }
 
 fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnResult<()> {
@@ -546,6 +727,213 @@ fn decode_function_effect(value: u8) -> FerrosGrynnResult<FunctionEffect> {
 	}
 }
 
+fn encode_analyzer(output: &mut Vec<u8>, analyzer: &AnalyzerCatalogEntry) -> FerrosGrynnResult<()> {
+	output.extend_from_slice(&analyzer.id.get().to_le_bytes());
+	output.extend_from_slice(&analyzer.version.get().to_le_bytes());
+	output.extend_from_slice(&analyzer.published_at.to_le_bytes());
+	output.push(tokenizer_bits(&analyzer.tokenizers));
+	output.push(u8::from(analyzer.function.is_some()));
+	write_u16(output, analyzer.filters.len(), "analyzer filter count")?;
+	match analyzer.function {
+		Some((id, version)) => {
+			output.extend_from_slice(&id.get().to_le_bytes());
+			output.extend_from_slice(&version.get().to_le_bytes());
+		}
+		None => output.extend_from_slice(&0_u64.to_le_bytes()),
+	}
+	write_string(output, analyzer.name.as_str(), "analyzer name")?;
+	write_optional_string(
+		output,
+		analyzer.comment.as_ref().map(|comment| comment.as_str()),
+		"analyzer comment",
+	)?;
+	for filter in &analyzer.filters {
+		encode_analyzer_filter(output, filter)?;
+	}
+	Ok(())
+}
+
+fn decode_analyzer(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<AnalyzerCatalogEntry> {
+	let id = AnalyzerId::from_storage(decoder.read_u32()?)?;
+	let version = SchemaVersion::from_storage(decoder.read_u32()?)?;
+	let published_at = decoder.read_u64()?;
+	let tokenizers = decode_tokenizer_bits(decoder.read_u8()?)?;
+	let has_function = match decoder.read_u8()? {
+		0 => false,
+		1 => true,
+		_ => return Err(invalid("analyzer function flag is invalid")),
+	};
+	let filter_count = usize::from(decoder.read_u16()?);
+	let function_id = decoder.read_u32()?;
+	let function_version = decoder.read_u32()?;
+	let function = match (has_function, function_id, function_version) {
+		(false, 0, 0) => None,
+		(true, id, version) => {
+			Some((FunctionId::from_storage(id)?, SchemaVersion::from_storage(version)?))
+		}
+		_ => return Err(invalid("analyzer function reference is not canonical")),
+	};
+	let name = read_string(decoder, "analyzer name")?.into();
+	let comment = read_optional_string(decoder, "analyzer comment")?.map(Into::into);
+	let mut filters = Vec::with_capacity(filter_count);
+	for _ in 0..filter_count {
+		filters.push(decode_analyzer_filter(decoder)?);
+	}
+	Ok(AnalyzerCatalogEntry {
+		id,
+		version,
+		published_at,
+		name,
+		tokenizers,
+		filters,
+		function,
+		comment,
+	})
+}
+
+fn encode_analyzer_filter(
+	output: &mut Vec<u8>,
+	filter: &AnalyzerFilterCatalogEntry,
+) -> FerrosGrynnResult<()> {
+	match filter {
+		AnalyzerFilterCatalogEntry::Nfc => output.push(0),
+		AnalyzerFilterCatalogEntry::Nfkc => output.push(1),
+		AnalyzerFilterCatalogEntry::Ascii => output.push(2),
+		AnalyzerFilterCatalogEntry::Lowercase => output.push(3),
+		AnalyzerFilterCatalogEntry::Uppercase => output.push(4),
+		AnalyzerFilterCatalogEntry::EdgeNgram {
+			min,
+			max,
+		} => {
+			output.push(5);
+			output.extend_from_slice(&min.to_le_bytes());
+			output.extend_from_slice(&max.to_le_bytes());
+		}
+		AnalyzerFilterCatalogEntry::Ngram {
+			min,
+			max,
+		} => {
+			output.push(6);
+			output.extend_from_slice(&min.to_le_bytes());
+			output.extend_from_slice(&max.to_le_bytes());
+		}
+		AnalyzerFilterCatalogEntry::Snowball(language) => {
+			output.push(7);
+			output.push(analyzer_language(*language));
+		}
+		AnalyzerFilterCatalogEntry::Mapper(value) => {
+			output.push(8);
+			write_u32(output, value.len(), "analyzer mapper bytes")?;
+			output.extend_from_slice(value);
+		}
+	}
+	Ok(())
+}
+
+fn decode_analyzer_filter(
+	decoder: &mut Decoder<'_>,
+) -> FerrosGrynnResult<AnalyzerFilterCatalogEntry> {
+	match decoder.read_u8()? {
+		0 => Ok(AnalyzerFilterCatalogEntry::Nfc),
+		1 => Ok(AnalyzerFilterCatalogEntry::Nfkc),
+		2 => Ok(AnalyzerFilterCatalogEntry::Ascii),
+		3 => Ok(AnalyzerFilterCatalogEntry::Lowercase),
+		4 => Ok(AnalyzerFilterCatalogEntry::Uppercase),
+		5 => Ok(AnalyzerFilterCatalogEntry::EdgeNgram {
+			min: decoder.read_u16()?,
+			max: decoder.read_u16()?,
+		}),
+		6 => Ok(AnalyzerFilterCatalogEntry::Ngram {
+			min: decoder.read_u16()?,
+			max: decoder.read_u16()?,
+		}),
+		7 => decode_analyzer_language(decoder.read_u8()?).map(AnalyzerFilterCatalogEntry::Snowball),
+		8 => {
+			let count = decoder.read_count("analyzer mapper bytes")?;
+			Ok(AnalyzerFilterCatalogEntry::Mapper(decoder.read_exact(count)?.to_vec()))
+		}
+		_ => Err(invalid("analyzer filter tag is invalid")),
+	}
+}
+
+fn tokenizer_bits(tokenizers: &std::collections::BTreeSet<AnalyzerTokenizer>) -> u8 {
+	tokenizers.iter().fold(0, |bits, tokenizer| {
+		bits | match tokenizer {
+			AnalyzerTokenizer::Blank => 1,
+			AnalyzerTokenizer::Camel => 2,
+			AnalyzerTokenizer::Class => 4,
+			AnalyzerTokenizer::Punct => 8,
+		}
+	})
+}
+
+fn decode_tokenizer_bits(
+	bits: u8,
+) -> FerrosGrynnResult<std::collections::BTreeSet<AnalyzerTokenizer>> {
+	if bits & !0x0f != 0 {
+		return Err(invalid("analyzer tokenizer bits are invalid"));
+	}
+	let mut result = std::collections::BTreeSet::new();
+	for (bit, tokenizer) in [
+		(1, AnalyzerTokenizer::Blank),
+		(2, AnalyzerTokenizer::Camel),
+		(4, AnalyzerTokenizer::Class),
+		(8, AnalyzerTokenizer::Punct),
+	] {
+		if bits & bit != 0 {
+			result.insert(tokenizer);
+		}
+	}
+	Ok(result)
+}
+
+const fn analyzer_language(language: AnalyzerLanguage) -> u8 {
+	match language {
+		AnalyzerLanguage::Arabic => 0,
+		AnalyzerLanguage::Danish => 1,
+		AnalyzerLanguage::Dutch => 2,
+		AnalyzerLanguage::English => 3,
+		AnalyzerLanguage::Finnish => 4,
+		AnalyzerLanguage::French => 5,
+		AnalyzerLanguage::German => 6,
+		AnalyzerLanguage::Greek => 7,
+		AnalyzerLanguage::Hungarian => 8,
+		AnalyzerLanguage::Italian => 9,
+		AnalyzerLanguage::Norwegian => 10,
+		AnalyzerLanguage::Portuguese => 11,
+		AnalyzerLanguage::Romanian => 12,
+		AnalyzerLanguage::Russian => 13,
+		AnalyzerLanguage::Spanish => 14,
+		AnalyzerLanguage::Swedish => 15,
+		AnalyzerLanguage::Tamil => 16,
+		AnalyzerLanguage::Turkish => 17,
+	}
+}
+
+fn decode_analyzer_language(value: u8) -> FerrosGrynnResult<AnalyzerLanguage> {
+	match value {
+		0 => Ok(AnalyzerLanguage::Arabic),
+		1 => Ok(AnalyzerLanguage::Danish),
+		2 => Ok(AnalyzerLanguage::Dutch),
+		3 => Ok(AnalyzerLanguage::English),
+		4 => Ok(AnalyzerLanguage::Finnish),
+		5 => Ok(AnalyzerLanguage::French),
+		6 => Ok(AnalyzerLanguage::German),
+		7 => Ok(AnalyzerLanguage::Greek),
+		8 => Ok(AnalyzerLanguage::Hungarian),
+		9 => Ok(AnalyzerLanguage::Italian),
+		10 => Ok(AnalyzerLanguage::Norwegian),
+		11 => Ok(AnalyzerLanguage::Portuguese),
+		12 => Ok(AnalyzerLanguage::Romanian),
+		13 => Ok(AnalyzerLanguage::Russian),
+		14 => Ok(AnalyzerLanguage::Spanish),
+		15 => Ok(AnalyzerLanguage::Swedish),
+		16 => Ok(AnalyzerLanguage::Tamil),
+		17 => Ok(AnalyzerLanguage::Turkish),
+		_ => Err(invalid("analyzer Snowball language is invalid")),
+	}
+}
+
 fn write_optional_string(
 	output: &mut Vec<u8>,
 	value: Option<&str>,
@@ -703,6 +1091,9 @@ const fn index_kind(value: ClassIndexKind) -> u8 {
 		ClassIndexKind::Standard => 0,
 		ClassIndexKind::Unique => 1,
 		ClassIndexKind::Count => 2,
+		ClassIndexKind::Fulltext => 3,
+		ClassIndexKind::Hnsw => 4,
+		ClassIndexKind::DiskAnn => 5,
 	}
 }
 
@@ -711,7 +1102,37 @@ fn decode_index_kind(value: u8) -> FerrosGrynnResult<ClassIndexKind> {
 		0 => Ok(ClassIndexKind::Standard),
 		1 => Ok(ClassIndexKind::Unique),
 		2 => Ok(ClassIndexKind::Count),
+		3 => Ok(ClassIndexKind::Fulltext),
+		4 => Ok(ClassIndexKind::Hnsw),
+		5 => Ok(ClassIndexKind::DiskAnn),
 		_ => Err(invalid("index contains an unknown kind")),
+	}
+}
+
+const fn vector_kind(value: VectorKind) -> u8 {
+	match value {
+		VectorKind::F64 => 0,
+		VectorKind::F32 => 1,
+		VectorKind::F16 => 2,
+		VectorKind::I64 => 3,
+		VectorKind::I32 => 4,
+		VectorKind::I16 => 5,
+		VectorKind::I8 => 6,
+		VectorKind::U8 => 7,
+	}
+}
+
+fn decode_vector_kind(value: u8) -> FerrosGrynnResult<VectorKind> {
+	match value {
+		0 => Ok(VectorKind::F64),
+		1 => Ok(VectorKind::F32),
+		2 => Ok(VectorKind::F16),
+		3 => Ok(VectorKind::I64),
+		4 => Ok(VectorKind::I32),
+		5 => Ok(VectorKind::I16),
+		6 => Ok(VectorKind::I8),
+		7 => Ok(VectorKind::U8),
+		_ => Err(invalid("index contains an unknown vector element kind")),
 	}
 }
 

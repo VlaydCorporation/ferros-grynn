@@ -1,5 +1,6 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	num::NonZeroU16,
 	sync::Arc,
 };
 
@@ -10,6 +11,7 @@ use super::{
 		Builtin,
 		ClosureEffect,
 		Column,
+		ColumnOrigin,
 		EndpointDomain,
 		Expand,
 		LogicalBlock,
@@ -27,12 +29,14 @@ use super::{
 		LogicalDmlTarget,
 		LogicalExpect,
 		LogicalExplain,
+		LogicalFulltextDefinition,
 		LogicalGraphContract,
 		LogicalGraphDmlStatement,
 		LogicalGraphPropertyMutation,
 		LogicalGraphReference,
 		LogicalHyperPattern,
 		LogicalIndexHint,
+		LogicalKnnDistance,
 		LogicalLetValue,
 		LogicalLinearPattern,
 		LogicalMatch,
@@ -58,6 +62,7 @@ use super::{
 		LogicalTraverse,
 		LogicalTraverseSource,
 		LogicalTraverseStep,
+		LogicalVectorDefinition,
 		LogicalWildcardField,
 		LogicalWithinPattern,
 		MatchBinding,
@@ -73,26 +78,39 @@ use super::{
 };
 use crate::{
 	datastore::{
+		AnalyzerFilter,
+		AnalyzerLanguage,
+		AnalyzerTokenizer,
 		ClassIndexKind,
+		ClassIndexOptions,
+		ClassIndexState,
 		ClassSchemaMode,
+		DiskAnnIndexOptions,
+		FulltextIndexOptions,
 		FunctionEffect,
 		FunctionId,
+		HnswIndexOptions,
 		IndexMaintenanceMode,
 		IndexScope,
 		LEVEL_PATH_PROPERTY,
+		SchemaAnalyzer,
 		SchemaFunction,
 		SchemaFunctionParameter,
+		VectorDistance,
 	},
 	gql_status::{ExecutionPhase, FerrosGrynnError, FerrosGrynnResult, Location, TextSpan},
 	graph::{GraphTopologyConstraint, GraphTopologyConstraints},
 	syn::{
 		AlterTarget,
+		AnalyzerFilterName,
+		AnalyzerTokenizerName,
 		BasicIndexDefinition,
 		BinaryOperator,
 		BuildGraphSource,
 		BuildGraphStatement,
 		ClassKindName,
 		ClassSchemaModeName,
+		DefineAnalyzerStatement,
 		DefineClassStatement,
 		DefineFieldStatement,
 		DefineFunctionStatement,
@@ -106,6 +124,7 @@ use crate::{
 		ExpectClause,
 		Expr,
 		ExprKind,
+		FulltextOperator,
 		FunctionEffectName,
 		FunctionSignatureName,
 		GraphContract,
@@ -115,6 +134,8 @@ use crate::{
 		Identifier,
 		IndexScopeName,
 		InfoTarget,
+		KnnDistance,
+		KnnSearchArgument,
 		LetValue,
 		Literal,
 		MatchEndpoint,
@@ -145,6 +166,8 @@ use crate::{
 		TypeName,
 		UnaryOperator,
 		UpdateGraphStatement,
+		VectorDistanceName,
+		VectorElementName,
 	},
 	values::{
 		AtomKind,
@@ -158,6 +181,7 @@ use crate::{
 		Text,
 		Type,
 		Value,
+		VectorKind,
 	},
 };
 
@@ -168,6 +192,10 @@ const MAX_MATCH_WITHIN_DEPTH: u32 = 7;
 pub(super) trait QueryCatalog {
 	fn schema_epoch(&self) -> u64;
 	fn schema(&self, class: &str) -> FerrosGrynnResult<Schema>;
+	fn class_definition(
+		&self,
+		class: &str,
+	) -> FerrosGrynnResult<Arc<crate::datastore::ClassSchema>>;
 	fn schema_mode(&self, class: &str) -> FerrosGrynnResult<ClassSchemaMode>;
 	fn class_kind(&self, class: &str) -> FerrosGrynnResult<AtomKind>;
 	/// Resolves a case-sensitive named graph.
@@ -183,6 +211,14 @@ pub(super) trait QueryCatalog {
 		&self,
 		id: FunctionId,
 	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaFunction>>>;
+	fn analyzer(
+		&self,
+		name: &str,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaAnalyzer>>>;
+	fn analyzer_by_id(
+		&self,
+		id: crate::datastore::AnalyzerId,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaAnalyzer>>>;
 }
 
 pub(super) fn analyze(
@@ -465,6 +501,9 @@ impl<'a> Analyzer<'a> {
 			}
 			StatementKind::DefineIndex(definition) => {
 				LogicalStatement::Schema(self.define_index(definition)?)
+			}
+			StatementKind::DefineAnalyzer(definition) => {
+				LogicalStatement::Schema(self.define_analyzer(definition)?)
 			}
 			StatementKind::DefineParameter(definition) => {
 				LogicalStatement::Schema(self.define_parameter(definition)?)
@@ -1258,14 +1297,96 @@ impl<'a> Analyzer<'a> {
 		&self,
 		definition: &DefineIndexStatement,
 	) -> FerrosGrynnResult<LogicalSchemaStatement> {
-		let (kind, fields) = match &definition.definition {
-			BasicIndexDefinition::Standard(fields) => {
-				(ClassIndexKind::Standard, fields.iter().map(|field| field.value.clone()).collect())
+		let (kind, fields, options) = match &definition.definition {
+			BasicIndexDefinition::Standard(fields) => (
+				ClassIndexKind::Standard,
+				fields.iter().map(|field| field.value.clone()).collect(),
+				ClassIndexOptions::Scalar,
+			),
+			BasicIndexDefinition::Unique(fields) => (
+				ClassIndexKind::Unique,
+				fields.iter().map(|field| field.value.clone()).collect(),
+				ClassIndexOptions::Scalar,
+			),
+			BasicIndexDefinition::Count => {
+				(ClassIndexKind::Count, Vec::new(), ClassIndexOptions::Scalar)
 			}
-			BasicIndexDefinition::Unique(fields) => {
-				(ClassIndexKind::Unique, fields.iter().map(|field| field.value.clone()).collect())
+			BasicIndexDefinition::Fulltext {
+				field,
+				analyzer,
+				k1_bits,
+				b_bits,
+				highlights,
+			} => {
+				let analyzer_definition =
+					self.catalog.analyzer(analyzer.value.as_ref())?.ok_or_else(|| {
+						self.semantic(
+							&format!("Analyzer '{}' does not exist.", analyzer.value),
+							analyzer.span,
+						)
+					})?;
+				let analyzer_id = analyzer_definition
+					.id()
+					.ok_or_else(|| self.semantic("Analyzer is not published.", analyzer.span))?;
+				let options = FulltextIndexOptions::new(
+					analyzer_id,
+					analyzer_definition.version(),
+					f64::from_bits(*k1_bits),
+					f64::from_bits(*b_bits),
+					*highlights,
+				)?;
+				(
+					ClassIndexKind::Fulltext,
+					vec![field.value.clone()],
+					ClassIndexOptions::Fulltext(options),
+				)
 			}
-			BasicIndexDefinition::Count => (ClassIndexKind::Count, Vec::new()),
+			BasicIndexDefinition::Hnsw {
+				field,
+				dimension,
+				element,
+				distance,
+				ef_construction,
+				m,
+			} => {
+				let element = vector_element(*element);
+				let distance = self.vector_distance(distance, element)?;
+				let options = HnswIndexOptions::new(
+					element,
+					self.nonzero_index_value(*dimension, "HNSW dimension", field.span)?,
+					distance,
+					self.nonzero_index_value(*m, "HNSW M", field.span)?,
+					self.nonzero_index_value(*ef_construction, "HNSW EFC", field.span)?,
+				)?;
+				(ClassIndexKind::Hnsw, vec![field.value.clone()], ClassIndexOptions::Hnsw(options))
+			}
+			BasicIndexDefinition::DiskAnn {
+				field,
+				dimension,
+				element,
+				distance,
+				degree,
+				build_list_size,
+				alpha_bits,
+				hashed_vector,
+			} => {
+				let element = vector_element(*element);
+				let distance = self.vector_distance(distance, element)?;
+				let options = DiskAnnIndexOptions::new(
+					element,
+					self.nonzero_index_value(*dimension, "DiskANN dimension", field.span)?,
+					distance,
+					self.nonzero_index_value(*degree, "DiskANN degree", field.span)?,
+					self.nonzero_index_value(*build_list_size, "DiskANN L_BUILD", field.span)?,
+					f32::from_bits(*alpha_bits),
+					*hashed_vector,
+				)?;
+				(
+					ClassIndexKind::DiskAnn,
+					vec![field.value.clone()],
+					ClassIndexOptions::DiskAnn(options),
+				)
+			}
 		};
 		let scope = match &definition.scope {
 			IndexScopeName::Base => IndexScope::Base,
@@ -1276,10 +1397,9 @@ impl<'a> Analyzer<'a> {
 			},
 		};
 		if definition.deferred && kind == ClassIndexKind::Unique {
-			return Err(self.semantic(
-				"DEFER is supported only for Standard and Count indexes.",
-				definition.name.span,
-			));
+			return Err(
+				self.semantic("DEFER is not supported for Unique indexes.", definition.name.span)
+			);
 		}
 		Ok(LogicalSchemaStatement::DefineIndex {
 			mode: definition.mode,
@@ -1287,6 +1407,7 @@ impl<'a> Analyzer<'a> {
 			name: definition.name.value.clone(),
 			kind,
 			fields,
+			options,
 			scope,
 			maintenance: if definition.deferred {
 				IndexMaintenanceMode::Deferred
@@ -1294,6 +1415,71 @@ impl<'a> Analyzer<'a> {
 				IndexMaintenanceMode::Immediate
 			},
 			concurrently: definition.concurrently,
+		})
+	}
+
+	fn nonzero_index_value(
+		&self,
+		value: u16,
+		label: &str,
+		span: TextSpan,
+	) -> FerrosGrynnResult<NonZeroU16> {
+		NonZeroU16::new(value)
+			.ok_or_else(|| self.semantic(&format!("{label} must be positive."), span))
+	}
+
+	fn vector_distance(
+		&self,
+		distance: &VectorDistanceName,
+		element: VectorKind,
+	) -> FerrosGrynnResult<VectorDistance> {
+		Ok(match distance {
+			VectorDistanceName::Euclidean => VectorDistance::Euclidean,
+			VectorDistanceName::Cosine => VectorDistance::Cosine,
+			VectorDistanceName::Manhattan => VectorDistance::Manhattan,
+			VectorDistanceName::Minkowski {
+				exponent_bits,
+			} => VectorDistance::Minkowski(f64::from_bits(*exponent_bits)),
+			VectorDistanceName::InnerProduct => VectorDistance::InnerProduct,
+			VectorDistanceName::CosineNormalized => VectorDistance::CosineNormalized,
+			VectorDistanceName::Function(function) => {
+				if function.namespace.value.as_ref() != "fn" || function.parameters.is_some() {
+					return Err(self.semantic(
+						"Custom distance must name fn::name without an overload signature.",
+						function.name.span,
+					));
+				}
+				let vector = Type::Vector(element);
+				let mut candidates = self.catalog.functions("fn", function.name.value.as_ref())?;
+				candidates.retain(|candidate| {
+					candidate.effect() == FunctionEffect::Pure
+						&& candidate.is_cost()
+						&& candidate.result() == &Type::Float
+						&& candidate
+							.parameters()
+							.map(SchemaFunctionParameter::value_type)
+							.eq([&vector, &vector])
+				});
+				if candidates.len() != 1 {
+					return Err(self.semantic(
+						"Custom distance must resolve uniquely to PURE COST fn(vector<T>, \
+						 vector<T>) -> float.",
+						function.name.span,
+					));
+				}
+				let candidate = candidates.pop().ok_or_else(|| {
+					self.semantic("Custom distance function does not exist.", function.name.span)
+				})?;
+				VectorDistance::Custom {
+					function: candidate.id().ok_or_else(|| {
+						self.semantic(
+							"Custom distance function is not published.",
+							function.name.span,
+						)
+					})?,
+					version: candidate.version(),
+				}
+			}
 		})
 	}
 
@@ -1307,6 +1493,123 @@ impl<'a> Analyzer<'a> {
 			value: self.expr(&definition.value, None)?,
 			comment: definition.comment.as_deref().map(Text::from),
 		})
+	}
+
+	fn define_analyzer(
+		&self,
+		definition: &DefineAnalyzerStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		let tokenizers =
+			definition.tokenizers.iter().copied().map(analyzer_tokenizer).collect::<Vec<_>>();
+		let filters = definition
+			.filters
+			.iter()
+			.map(|filter| self.analyzer_filter(filter))
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut analyzer =
+			SchemaAnalyzer::new(definition.name.value.as_ref(), tokenizers, filters)?;
+		if let Some(function) = &definition.function {
+			let (id, version) = self.resolve_analyzer_function(function)?;
+			analyzer = analyzer.with_function(id, version)?;
+		}
+		if let Some(comment) = definition.comment.as_deref() {
+			analyzer = analyzer.with_comment(comment);
+		}
+		Ok(LogicalSchemaStatement::DefineAnalyzer {
+			mode: definition.mode,
+			analyzer,
+		})
+	}
+
+	fn analyzer_filter(&self, filter: &AnalyzerFilterName) -> FerrosGrynnResult<AnalyzerFilter> {
+		Ok(match filter {
+			AnalyzerFilterName::Nfc => AnalyzerFilter::Nfc,
+			AnalyzerFilterName::Nfkc => AnalyzerFilter::Nfkc,
+			AnalyzerFilterName::Ascii => AnalyzerFilter::Ascii,
+			AnalyzerFilterName::Lowercase => AnalyzerFilter::Lowercase,
+			AnalyzerFilterName::Uppercase => AnalyzerFilter::Uppercase,
+			AnalyzerFilterName::EdgeNgram {
+				min,
+				max,
+			} => AnalyzerFilter::EdgeNgram {
+				min: *min,
+				max: *max,
+			},
+			AnalyzerFilterName::Ngram {
+				min,
+				max,
+			} => AnalyzerFilter::Ngram {
+				min: *min,
+				max: *max,
+			},
+			AnalyzerFilterName::Snowball(language) => {
+				AnalyzerFilter::Snowball(analyzer_language(language)?)
+			}
+			AnalyzerFilterName::Mapper(value) => {
+				let ExprKind::Object(fields) = &value.kind else {
+					return Err(
+						self.semantic("Analyzer mapper must be an inline object.", value.span)
+					);
+				};
+				let mut entries = BTreeMap::new();
+				for field in fields {
+					let replacement = match &field.value.kind {
+						ExprKind::Literal(Literal::String(value)) => {
+							Some(Text::from(value.as_ref()))
+						}
+						ExprKind::Literal(Literal::Null) => None,
+						_ => {
+							return Err(self.semantic(
+								"Analyzer mapper values must be strings or null.",
+								field.value.span,
+							));
+						}
+					};
+					if entries.insert(Text::from(field.name.value.as_ref()), replacement).is_some()
+					{
+						return Err(
+							self.semantic("Analyzer mapper keys must be unique.", field.name.span)
+						);
+					}
+				}
+				AnalyzerFilter::Mapper(entries)
+			}
+		})
+	}
+
+	fn resolve_analyzer_function(
+		&self,
+		function: &FunctionSignatureName,
+	) -> FerrosGrynnResult<(FunctionId, crate::datastore::SchemaVersion)> {
+		if function.namespace.value.as_ref() != "fn" || function.parameters.is_some() {
+			return Err(self.semantic(
+				"Analyzer FUNCTION must name fn::name without an overload signature.",
+				function.name.span,
+			));
+		}
+		let mut candidates = self.catalog.functions("fn", function.name.value.as_ref())?;
+		candidates.retain(|candidate| {
+			candidate.effect() == FunctionEffect::Pure
+				&& candidate.parameters().len() == 1
+				&& candidate
+					.parameters()
+					.next()
+					.is_some_and(|parameter| parameter.value_type() == &Type::String)
+				&& candidate.result() == &Type::Array(Box::new(Type::Object))
+		});
+		if candidates.len() != 1 {
+			return Err(self.semantic(
+				"Analyzer FUNCTION must resolve uniquely to PURE fn(string) -> array<object>.",
+				function.name.span,
+			));
+		}
+		let candidate = candidates.pop().ok_or_else(|| {
+			self.semantic("Analyzer FUNCTION does not exist.", function.name.span)
+		})?;
+		let id = candidate.id().ok_or_else(|| {
+			self.semantic("Analyzer FUNCTION is not published.", function.name.span)
+		})?;
+		Ok((id, candidate.version()))
 	}
 
 	fn define_function(
@@ -1403,6 +1706,13 @@ impl<'a> Analyzer<'a> {
 
 	fn remove(&self, target: &RemoveTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
+			RemoveTarget::Analyzer {
+				if_exists,
+				name,
+			} => Ok(LogicalSchemaStatement::RemoveAnalyzer {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+			}),
 			RemoveTarget::Function {
 				if_exists,
 				signature,
@@ -1456,6 +1766,45 @@ impl<'a> Analyzer<'a> {
 
 	fn alter(&self, target: &AlterTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
+			AlterTarget::Analyzer {
+				if_exists,
+				name,
+				function,
+				tokenizers,
+				filters,
+				comment,
+			} => Ok(LogicalSchemaStatement::AlterAnalyzer {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+				function: function
+					.as_ref()
+					.map(|function| {
+						function
+							.as_ref()
+							.map(|function| self.resolve_analyzer_function(function))
+							.transpose()
+					})
+					.transpose()?,
+				tokenizers: tokenizers
+					.as_ref()
+					.map(|tokenizers| tokenizers.iter().copied().map(analyzer_tokenizer).collect()),
+				filters: filters
+					.as_ref()
+					.map(|filters| {
+						filters
+							.iter()
+							.map(|filter| self.analyzer_filter(filter))
+							.collect::<FerrosGrynnResult<Vec<_>>>()
+					})
+					.transpose()?,
+				comment: match comment {
+					ParameterCommentChange::Keep => None,
+					ParameterCommentChange::Set(comment) => {
+						Some(Some(Text::from(comment.as_ref())))
+					}
+					ParameterCommentChange::Drop => Some(None),
+				},
+			}),
 			AlterTarget::Function {
 				if_exists,
 				signature,
@@ -1618,6 +1967,9 @@ impl<'a> Analyzer<'a> {
 	fn info(&self, target: &InfoTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		Ok(match target {
 			InfoTarget::Database => LogicalSchemaStatement::InfoDatabase,
+			InfoTarget::Analyzer(name) => LogicalSchemaStatement::InfoAnalyzer {
+				name: name.value.clone(),
+			},
 			InfoTarget::Function(signature) => LogicalSchemaStatement::InfoFunction {
 				namespace: signature.namespace.value.clone(),
 				name: signature.name.value.clone(),
@@ -1718,6 +2070,7 @@ impl<'a> Analyzer<'a> {
 				qualifier: None,
 				ty: Type::Any,
 			}],
+			origins: BTreeMap::new(),
 		};
 		let source_schema = match &source {
 			LogicalTraverseSource::Expression(_) => None,
@@ -1803,6 +2156,7 @@ impl<'a> Analyzer<'a> {
 						qualifier: None,
 						ty: Type::Any,
 					}],
+					origins: BTreeMap::new(),
 				},
 				returning: None,
 				return_graph: None,
@@ -2151,6 +2505,7 @@ impl<'a> Analyzer<'a> {
 		}
 		let result = Schema {
 			columns,
+			origins: BTreeMap::new(),
 		};
 		let order = statement
 			.order
@@ -2681,6 +3036,13 @@ impl<'a> Analyzer<'a> {
 			let offset = input_schema.columns.len();
 			wildcard.extend(source.wildcard.iter().map(|field| offset_wildcard(field, offset)));
 			input_schema.columns.extend(source.schema.columns.iter().cloned());
+			input_schema.origins.extend(
+				source
+					.schema
+					.origins
+					.iter()
+					.map(|(column, origin)| (column + offset, origin.clone())),
+			);
 			let predicate = join
 				.predicate
 				.as_ref()
@@ -2707,7 +3069,11 @@ impl<'a> Analyzer<'a> {
 		};
 		let outer_columns = outer.map_or(0, |schema| schema.columns.len());
 		if let Some(outer) = outer {
+			let offset = input_schema.columns.len();
 			input_schema.columns.extend(outer.columns.iter().cloned());
+			input_schema.origins.extend(
+				outer.origins.iter().map(|(column, origin)| (column + offset, origin.clone())),
+			);
 		}
 		let filter = statement
 			.filter
@@ -2731,6 +3097,7 @@ impl<'a> Analyzer<'a> {
 		};
 		let mut projection = Vec::with_capacity(statement.projection.len());
 		let mut columns = Vec::new();
+		let mut result_origins = BTreeMap::new();
 		let mut contains_aggregate = false;
 		for (index, item) in statement.projection.iter().enumerate() {
 			match item {
@@ -2744,11 +3111,15 @@ impl<'a> Analyzer<'a> {
 							index,
 						} = field
 						{
+							let output = columns.len();
 							columns.push(Column {
 								name: name.clone(),
 								qualifier: None,
 								ty: input_schema.columns[*index].ty.clone(),
 							});
+							if let Some(origin) = input_schema.origins.get(index) {
+								result_origins.insert(output, origin.clone());
+							}
 						}
 					}
 					projection.push(LogicalSelectItem::Wildcard(wildcard.clone()));
@@ -2764,6 +3135,12 @@ impl<'a> Analyzer<'a> {
 						.map(|alias| alias.value.clone())
 						.or_else(|| select_expression_name(expr))
 						.unwrap_or_else(|| format!("value_{index}").into_boxed_str());
+					let output = columns.len();
+					if let TypedExprKind::Column(column) = &typed.kind
+						&& let Some(origin) = input_schema.origins.get(column)
+					{
+						result_origins.insert(output, origin.clone());
+					}
 					columns.push(Column {
 						name: name.clone(),
 						qualifier: None,
@@ -2819,6 +3196,7 @@ impl<'a> Analyzer<'a> {
 		};
 		let result = Schema {
 			columns,
+			origins: result_origins,
 		};
 		let order = statement
 			.order
@@ -2871,6 +3249,16 @@ impl<'a> Analyzer<'a> {
 				}
 			}
 		}
+		self.validate_select_search(
+			filter.as_ref(),
+			&access,
+			&joins,
+			&split,
+			group.as_deref(),
+			&projection,
+			&order,
+			span,
+		)?;
 		let start = match &statement.start {
 			None => None,
 			Some(SelectStart::Offset(value)) => {
@@ -2921,6 +3309,379 @@ impl<'a> Analyzer<'a> {
 			only: statement.only,
 			tempfiles: statement.tempfiles,
 			outer_columns,
+		})
+	}
+
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "search validation must see every SELECT expression context"
+	)]
+	fn validate_select_search(
+		&self,
+		filter: Option<&TypedExpr>,
+		access: &LogicalSelectAccess,
+		joins: &[LogicalSelectJoin],
+		split: &[TypedExpr],
+		group: Option<&[TypedExpr]>,
+		projection: &[LogicalSelectItem],
+		order: &[LogicalOrder],
+		span: TextSpan,
+	) -> FerrosGrynnResult<()> {
+		let mut slots = BTreeMap::<u16, bool>::new();
+		if let Some(filter) = filter {
+			let mut knn_count = 0_usize;
+			self.validate_knn_shape(filter, true, &mut knn_count)?;
+			visit_typed_expression(filter, &mut |expression| match &expression.kind {
+				TypedExprKind::Fulltext {
+					op,
+					right,
+					definitions,
+					..
+				} => {
+					if !typed_expression_is_statement_fixed(right)
+						|| typed_expression_effect(right) > ClosureEffect::StableRead
+					{
+						return Err(self.semantic(
+							"Fulltext query must be independent of source rows and may not mutate \
+							 data.",
+							right.span,
+						));
+					}
+					let definition =
+						self.selected_fulltext_definition(definitions, access, expression.span)?;
+					if let FulltextOperator::Slot(slot) = op
+						&& slots.insert(*slot, definition.highlights).is_some()
+					{
+						return Err(self.semantic(
+							&format!("Fulltext match slot {slot} is duplicated in one statement."),
+							expression.span,
+						));
+					}
+					Ok(())
+				}
+				TypedExprKind::Knn {
+					origin,
+					k,
+					ef,
+					distance,
+					right,
+					definitions,
+					..
+				} => {
+					for (name, value) in [("KNN K", k.as_ref()), ("KNN query", right.as_ref())] {
+						if !typed_expression_is_statement_fixed(value)
+							|| typed_expression_effect(value) > ClosureEffect::StableRead
+						{
+							return Err(self.semantic(
+								&format!(
+									"{name} must be independent of source rows and may not mutate \
+									 data."
+								),
+								value.span,
+							));
+						}
+					}
+					if let Some(ef) = ef
+						&& (!typed_expression_is_statement_fixed(ef)
+							|| typed_expression_effect(ef) > ClosureEffect::StableRead)
+					{
+						return Err(self.semantic(
+							"KNN EF must be independent of source rows and may not mutate data.",
+							ef.span,
+						));
+					}
+					if let LogicalKnnDistance::Minkowski(value)
+					| LogicalKnnDistance::Callable(value) = distance
+						&& (!typed_expression_is_statement_fixed(value)
+							|| typed_expression_effect(value) > ClosureEffect::Pure)
+					{
+						return Err(self.semantic(
+							"KNN distance must be a row-independent PURE expression.",
+							value.span,
+						));
+					}
+					self.validate_vector_definitions(
+						origin,
+						definitions,
+						access,
+						ef.is_some(),
+						!matches!(filter.kind, TypedExprKind::Knn { .. }),
+						expression.span,
+					)
+				}
+				TypedExprKind::Builtin {
+					function: Builtin::SearchScore(_) | Builtin::SearchHighlight(_),
+					..
+				} => {
+					return Err(self.semantic(
+						"search::score and search::highlight are valid only in SELECT projection \
+						 or ORDER BY.",
+						expression.span,
+					));
+				}
+				_ => Ok(()),
+			})?;
+		}
+
+		for join in joins {
+			if let Some(predicate) = &join.predicate {
+				self.reject_search_context(predicate, "JOIN ON")?;
+			}
+		}
+		for expression in split {
+			self.reject_search_context(expression, "SPLIT")?;
+		}
+		if let Some(group) = group {
+			for expression in group {
+				self.reject_search_context(expression, "GROUP BY")?;
+			}
+		}
+		for item in projection {
+			if let LogicalSelectItem::Expression {
+				expression,
+				..
+			} = item
+			{
+				self.validate_search_result_expression(expression, &slots)?;
+			}
+		}
+		for item in order {
+			self.validate_search_result_expression(&item.expression, &slots)?;
+		}
+		if filter.is_none() && !slots.is_empty() {
+			return Err(self.semantic("Fulltext slots require SELECT WHERE.", span));
+		}
+		Ok(())
+	}
+
+	fn validate_knn_shape(
+		&self,
+		expression: &TypedExpr,
+		positive_conjunction: bool,
+		count: &mut usize,
+	) -> FerrosGrynnResult<()> {
+		match &expression.kind {
+			TypedExprKind::Knn {
+				..
+			} => {
+				if !positive_conjunction {
+					return Err(self.semantic(
+						"KNN must be a positive top-level conjunction in SELECT WHERE.",
+						expression.span,
+					));
+				}
+				*count += 1;
+				if *count > 1 {
+					return Err(self.semantic(
+						"One SELECT source may contain only one KNN predicate.",
+						expression.span,
+					));
+				}
+			}
+			TypedExprKind::Binary {
+				left,
+				op: BinaryOperator::And,
+				right,
+			} if positive_conjunction => {
+				self.validate_knn_shape(left, true, count)?;
+				self.validate_knn_shape(right, true, count)?;
+			}
+			_ if typed_expression_contains_knn(expression) => {
+				return Err(self.semantic(
+					"KNN must be a positive top-level conjunction in SELECT WHERE.",
+					expression.span,
+				));
+			}
+			_ => {}
+		}
+		Ok(())
+	}
+
+	fn selected_fulltext_definition<'definition>(
+		&self,
+		definitions: &'definition [LogicalFulltextDefinition],
+		access: &LogicalSelectAccess,
+		span: TextSpan,
+	) -> FerrosGrynnResult<&'definition LogicalFulltextDefinition> {
+		let forced = match access {
+			LogicalSelectAccess::Indexes(hints) => definitions
+				.iter()
+				.filter(|definition| {
+					hints.iter().any(|hint| {
+						hint.index.as_ref() == definition.name.as_str()
+							&& hint.source.as_deref().is_none_or(|source| {
+								source.eq_ignore_ascii_case(definition.source.as_ref())
+							})
+					})
+				})
+				.collect::<Vec<_>>(),
+			LogicalSelectAccess::Automatic | LogicalSelectAccess::NoIndex => Vec::new(),
+		};
+		let definition = match forced.as_slice() {
+			[definition] => {
+				if definition.state != ClassIndexState::Ready {
+					return Err(self.semantic(
+						&format!("Forced Fulltext index `{}` is not Ready.", definition.name),
+						span,
+					));
+				}
+				*definition
+			}
+			[] => match definitions {
+				[definition] => definition,
+				_ => {
+					return Err(self.semantic(
+						"Multiple compatible Fulltext definitions require WITH INDEX selecting \
+						 exactly one definition.",
+						span,
+					));
+				}
+			},
+			_ => {
+				return Err(self.semantic(
+					"WITH INDEX selects more than one compatible Fulltext definition.",
+					span,
+				));
+			}
+		};
+		Ok(definition)
+	}
+
+	fn validate_vector_definitions(
+		&self,
+		origin: &ColumnOrigin,
+		definitions: &[LogicalVectorDefinition],
+		access: &LogicalSelectAccess,
+		requires_ann: bool,
+		has_residual: bool,
+		span: TextSpan,
+	) -> FerrosGrynnResult<()> {
+		let (forced, explicit_source) = match access {
+			LogicalSelectAccess::Indexes(hints) => (
+				definitions
+					.iter()
+					.filter(|definition| {
+						hints.iter().any(|hint| {
+							hint.index.as_ref() == definition.name.as_str()
+								&& hint.source.as_deref().is_none_or(|source| {
+									source.eq_ignore_ascii_case(origin.source.as_ref())
+								})
+						})
+					})
+					.collect::<Vec<_>>(),
+				hints.iter().any(|hint| {
+					hint.source
+						.as_deref()
+						.is_some_and(|source| source.eq_ignore_ascii_case(origin.source.as_ref()))
+				}),
+			),
+			LogicalSelectAccess::Automatic | LogicalSelectAccess::NoIndex => (Vec::new(), false),
+		};
+		if forced.len() > 1 {
+			return Err(
+				self.semantic("WITH INDEX selects more than one compatible ANN definition.", span)
+			);
+		}
+		if explicit_source && forced.is_empty() {
+			return Err(self.semantic(
+				"WITH INDEX does not contain a compatible ANN definition for the KNN source.",
+				span,
+			));
+		}
+		if let Some(definition) = forced.first() {
+			if definition.state != ClassIndexState::Ready {
+				return Err(self.semantic(
+					&format!("Forced ANN index `{}` is not Ready.", definition.name),
+					span,
+				));
+			}
+			if has_residual {
+				return Err(self.semantic(
+					"Forced ANN does not support an additional row predicate in stage 23.",
+					span,
+				));
+			}
+		}
+		if requires_ann {
+			if matches!(access, LogicalSelectAccess::NoIndex) {
+				return Err(self.semantic("KNN EF is incompatible with WITH NOINDEX.", span));
+			}
+			let ready = definitions
+				.iter()
+				.filter(|definition| definition.state == ClassIndexState::Ready)
+				.count();
+			if ready != 1 {
+				return Err(
+					self.semantic("KNN EF requires exactly one compatible Ready ANN index.", span)
+				);
+			}
+		}
+		Ok(())
+	}
+
+	fn reject_search_context(
+		&self,
+		expression: &TypedExpr,
+		context: &str,
+	) -> FerrosGrynnResult<()> {
+		let mut found = None;
+		visit_typed_expression(expression, &mut |expression| {
+			if found.is_none() && typed_expression_is_search_related(expression) {
+				found = Some(expression.span);
+			}
+			Ok::<(), FerrosGrynnError>(())
+		})?;
+		if let Some(span) = found {
+			return Err(self.semantic(
+				&format!(
+					"Fulltext, KNN, score, and highlight expressions are not valid in {context}."
+				),
+				span,
+			));
+		}
+		Ok(())
+	}
+
+	fn validate_search_result_expression(
+		&self,
+		expression: &TypedExpr,
+		slots: &BTreeMap<u16, bool>,
+	) -> FerrosGrynnResult<()> {
+		visit_typed_expression(expression, &mut |expression| match &expression.kind {
+			TypedExprKind::Fulltext {
+				..
+			}
+			| TypedExprKind::Knn {
+				..
+			} => Err(self.semantic(
+				"Fulltext and KNN predicates are valid only in SELECT WHERE.",
+				expression.span,
+			)),
+			TypedExprKind::Builtin {
+				function: Builtin::SearchScore(slot),
+				..
+			} if !slots.contains_key(slot) => Err(self.semantic(
+				&format!("search::score references unknown Fulltext slot {slot}."),
+				expression.span,
+			)),
+			TypedExprKind::Builtin {
+				function: Builtin::SearchHighlight(slot),
+				..
+			} => match slots.get(slot) {
+				None => Err(self.semantic(
+					&format!("search::highlight references unknown Fulltext slot {slot}."),
+					expression.span,
+				)),
+				Some(false) => Err(self.semantic(
+					&format!(
+						"search::highlight requires a HIGHLIGHTS Fulltext definition for slot \
+						 {slot}."
+					),
+					expression.span,
+				)),
+				Some(true) => Ok(()),
+			},
+			_ => Ok(()),
 		})
 	}
 
@@ -3007,6 +3768,32 @@ impl<'a> Analyzer<'a> {
 		let alias = source.alias.as_ref().map_or(default_alias, |alias| alias.value.clone());
 		for column in &mut schema.columns {
 			column.qualifier = Some(alias.clone());
+		}
+		let scope = match &kind {
+			LogicalSelectSourceKind::Atoms {
+				graph: None,
+				..
+			} => Some(Some(IndexScope::Base)),
+			LogicalSelectSourceKind::Atoms {
+				graph: Some(LogicalGraphReference::Static(graph)),
+				..
+			} => Some(Some(IndexScope::Effective {
+				graph: graph.id(),
+			})),
+			LogicalSelectSourceKind::Atoms {
+				graph: Some(LogicalGraphReference::Expression(_)),
+				..
+			} => Some(None),
+			LogicalSelectSourceKind::Graphs {
+				..
+			} => Some(None),
+			LogicalSelectSourceKind::Derived(_) => None,
+		};
+		for origin in schema.origins.values_mut() {
+			origin.source = alias.clone();
+			if let Some(scope) = scope {
+				origin.scope = scope;
+			}
 		}
 		Ok(LogicalSelectSource {
 			kind,
@@ -3250,6 +4037,132 @@ impl<'a> Analyzer<'a> {
 					ty,
 				)
 			}
+			ExprKind::Fulltext {
+				left,
+				op,
+				right,
+			} => {
+				let left = self.expr_context(
+					left,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				if left.ty != Type::String {
+					return Err(self.semantic(
+						"A Fulltext predicate requires a declared string field on the left.",
+						expr.span,
+					));
+				}
+				let origin = column_origin(schema, &left).ok_or_else(|| {
+					self.semantic(
+						"A Fulltext predicate must reference one declared source field.",
+						expr.span,
+					)
+				})?;
+				let right = self.expr_context(
+					right,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				let valid_query = match op {
+					FulltextOperator::Any | FulltextOperator::Slot(_) => right.ty == Type::String,
+					FulltextOperator::All | FulltextOperator::AnyOf => {
+						matches!(&right.ty, Type::Array(item) if **item == Type::String)
+					}
+				};
+				if !valid_query {
+					return Err(self.semantic(
+						"@@ and @n@ require a string query; @AND@ and @OR@ require array<string>.",
+						right.span,
+					));
+				}
+				let definitions = self.fulltext_definitions(origin, expr.span)?;
+				(
+					TypedExprKind::Fulltext {
+						left: Box::new(left),
+						op: *op,
+						right: Box::new(right),
+						definitions,
+					},
+					Type::Bool,
+				)
+			}
+			ExprKind::Knn {
+				left,
+				k,
+				search,
+				right,
+			} => {
+				let left = self.expr_context(
+					left,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				let Type::Vector(element) = &left.ty else {
+					return Err(self.semantic(
+						"A KNN predicate requires a declared vector field on the left.",
+						expr.span,
+					));
+				};
+				let origin = column_origin(schema, &left).ok_or_else(|| {
+					self.semantic(
+						"A KNN predicate must reference one declared source field.",
+						expr.span,
+					)
+				})?;
+				let k = self.expr_context(
+					k,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				if !is_integer(&k.ty) {
+					return Err(self.semantic("KNN K must be an integer.", k.span));
+				}
+				let right = self.expr_context(
+					right,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				let element = *element;
+				if right.ty != Type::Vector(element) {
+					return Err(self.semantic(
+						"KNN field and query vector element types must match.",
+						right.span,
+					));
+				}
+				let (distance, ef) = self.knn_distance(
+					search.as_ref(),
+					element,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+					expr.span,
+				)?;
+				let definitions = self.vector_definitions(origin, element, &distance, expr.span)?;
+				(
+					TypedExprKind::Knn {
+						left: Box::new(left),
+						origin: origin.clone(),
+						k: Box::new(k),
+						ef,
+						distance,
+						right: Box::new(right),
+						definitions,
+					},
+					Type::Bool,
+				)
+			}
 			ExprKind::Conditional {
 				condition,
 				then_value,
@@ -3425,6 +4338,16 @@ impl<'a> Analyzer<'a> {
 				)?;
 				let ty = match &base.ty {
 					Type::Array(item) => (**item).clone(),
+					Type::Vector(kind) => match kind {
+						crate::values::VectorKind::F64
+						| crate::values::VectorKind::F32
+						| crate::values::VectorKind::F16 => Type::Float,
+						crate::values::VectorKind::I64
+						| crate::values::VectorKind::I32
+						| crate::values::VectorKind::I16
+						| crate::values::VectorKind::I8
+						| crate::values::VectorKind::U8 => Type::Int,
+					},
 					_ => Type::Any,
 				};
 				(
@@ -3864,6 +4787,289 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	fn fulltext_definitions(
+		&self,
+		origin: &ColumnOrigin,
+		span: TextSpan,
+	) -> FerrosGrynnResult<Vec<LogicalFulltextDefinition>> {
+		let class = self.catalog.class_definition(origin.class.as_ref())?;
+		let mut definitions = Vec::new();
+		for index in class.indexes() {
+			let Some(options) = index.fulltext_options() else {
+				continue;
+			};
+			if index.fields().next().is_none_or(|field| field.as_str() != origin.field.as_ref())
+				|| !index_scope_matches(index.scope(), origin.scope)
+			{
+				continue;
+			}
+			let analyzer = self
+				.catalog
+				.analyzer_by_id(options.analyzer())?
+				.ok_or_else(|| self.semantic("Fulltext analyzer does not exist.", span))?;
+			if analyzer.version() != options.analyzer_version() {
+				return Err(
+					self.semantic("Fulltext index captures a different analyzer version.", span)
+				);
+			}
+			let analyzer_function = analyzer
+				.function()
+				.map(|(id, version)| {
+					let function = self.catalog.function(id)?.ok_or_else(|| {
+						self.semantic("Fulltext analyzer function does not exist.", span)
+					})?;
+					if function.version() != version || function.effect() != FunctionEffect::Pure {
+						return Err(self.semantic(
+							"Fulltext analyzer requires its exact PURE function version.",
+							span,
+						));
+					}
+					let key = NamedFunctionKey {
+						id,
+						version,
+						schema_epoch: self.catalog.schema_epoch(),
+						max_depth: function.max_depth(),
+						effect: function.effect(),
+					};
+					if let Some(cache) = self.function_cache
+						&& cache.cached_named(key).is_none()
+					{
+						let closure = compile_named_function(
+							self.catalog,
+							&function,
+							&self.function_stack,
+							&self.function_overrides,
+							self.function_cache,
+						)?;
+						cache.cache_named_plan(&closure)?;
+					}
+					Ok(key)
+				})
+				.transpose()?;
+			definitions.push(LogicalFulltextDefinition {
+				class: origin.class.clone(),
+				field: origin.field.clone(),
+				source: origin.source.clone(),
+				scope: origin.scope,
+				index: index.id().ok_or_else(|| {
+					self.semantic("Published Fulltext index has no IndexId.", span)
+				})?,
+				name: index.name().clone(),
+				state: index.state(),
+				analyzer,
+				analyzer_function,
+				k1: options.k1(),
+				b: options.b(),
+				highlights: options.highlights(),
+			});
+		}
+		if definitions.is_empty() {
+			return Err(self.semantic(
+				"A Fulltext predicate requires a compatible Fulltext index definition.",
+				span,
+			));
+		}
+		Ok(definitions)
+	}
+
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "KNN distance analysis shares the surrounding expression context"
+	)]
+	fn knn_distance(
+		&self,
+		search: Option<&KnnSearchArgument>,
+		element: VectorKind,
+		schema: Option<&Schema>,
+		allow_current_field: bool,
+		allow_aggregates: bool,
+		aggregate_depth: u32,
+		span: TextSpan,
+	) -> FerrosGrynnResult<(LogicalKnnDistance, Option<Box<TypedExpr>>)> {
+		let Some(search) = search else {
+			return Ok((LogicalKnnDistance::Builtin(VectorDistance::Euclidean), None));
+		};
+		if let KnnSearchArgument::Ef(value) = search {
+			let value = self.expr_context(
+				value,
+				schema,
+				allow_current_field,
+				allow_aggregates,
+				aggregate_depth,
+			)?;
+			if !is_integer(&value.ty) {
+				return Err(self.semantic("KNN EF must be an integer.", value.span));
+			}
+			return Ok((
+				LogicalKnnDistance::Builtin(VectorDistance::Euclidean),
+				Some(Box::new(value)),
+			));
+		}
+		let KnnSearchArgument::Distance(distance) = search else {
+			unreachable!("KNN search argument was exhausted above")
+		};
+		let distance = match distance {
+			KnnDistance::Euclidean => LogicalKnnDistance::Builtin(VectorDistance::Euclidean),
+			KnnDistance::Cosine => LogicalKnnDistance::Builtin(VectorDistance::Cosine),
+			KnnDistance::Manhattan => LogicalKnnDistance::Builtin(VectorDistance::Manhattan),
+			KnnDistance::InnerProduct => LogicalKnnDistance::Builtin(VectorDistance::InnerProduct),
+			KnnDistance::CosineNormalized => {
+				LogicalKnnDistance::Builtin(VectorDistance::CosineNormalized)
+			}
+			KnnDistance::Minkowski(exponent) => {
+				let exponent = self.expr_context(
+					exponent,
+					schema,
+					allow_current_field,
+					allow_aggregates,
+					aggregate_depth,
+				)?;
+				if !is_number(&exponent.ty) {
+					return Err(self.semantic("MINKOWSKI exponent must be numeric.", exponent.span));
+				}
+				LogicalKnnDistance::Minkowski(Box::new(exponent))
+			}
+			KnnDistance::Custom(expression) => {
+				if let Some((namespace, name)) = builtin_name(expression) {
+					if !namespace.eq_ignore_ascii_case("fn") {
+						return Err(self.semantic(
+							"Custom KNN distance must be a fn:: function or closure.",
+							expression.span,
+						));
+					}
+					self.knn_named_distance(name, element, expression.span)?
+				} else {
+					let callable = self.expr_context(
+						expression,
+						schema,
+						allow_current_field,
+						allow_aggregates,
+						aggregate_depth,
+					)?;
+					let expected = Type::Closure {
+						parameters: vec![Type::Vector(element), Type::Vector(element)],
+						result: Box::new(Type::Float),
+					};
+					if !compatible(&expected, &callable.ty) {
+						return Err(self.semantic(
+							"Custom KNN closure must accept two equal vector types and return \
+							 float.",
+							callable.span,
+						));
+					}
+					LogicalKnnDistance::Callable(Box::new(callable))
+				}
+			}
+		};
+		if let LogicalKnnDistance::Callable(callable) = &distance
+			&& let TypedExprKind::Closure(closure) = &callable.kind
+			&& closure.effect != ClosureEffect::Pure
+		{
+			return Err(self.semantic("Custom KNN distance closure must be PURE.", span));
+		}
+		Ok((distance, None))
+	}
+
+	fn knn_named_distance(
+		&self,
+		name: &str,
+		element: VectorKind,
+		span: TextSpan,
+	) -> FerrosGrynnResult<LogicalKnnDistance> {
+		let expected = Type::Vector(element);
+		let mut candidates = self
+			.catalog
+			.functions("fn", name)?
+			.into_iter()
+			.filter(|function| {
+				function.effect() == FunctionEffect::Pure
+					&& function.is_cost()
+					&& function.result() == &Type::Float
+					&& function.parameters().len() == 2
+					&& function.parameters().all(|parameter| parameter.value_type() == &expected)
+			})
+			.collect::<Vec<_>>();
+		if candidates.len() != 1 {
+			return Err(self.semantic(
+				"Custom KNN distance must resolve uniquely to PURE COST fn(vector<T>, vector<T>) \
+				 -> float.",
+				span,
+			));
+		}
+		let function = candidates
+			.pop()
+			.ok_or_else(|| self.semantic("Custom KNN distance function does not exist.", span))?;
+		let id = function
+			.id()
+			.ok_or_else(|| self.semantic("Custom KNN distance function is not published.", span))?;
+		let key = NamedFunctionKey {
+			id,
+			version: function.version(),
+			schema_epoch: self.catalog.schema_epoch(),
+			max_depth: function.max_depth(),
+			effect: function.effect(),
+		};
+		if let Some(cache) = self.function_cache
+			&& cache.cached_named(key).is_none()
+		{
+			let closure = compile_named_function(
+				self.catalog,
+				&function,
+				&self.function_stack,
+				&self.function_overrides,
+				self.function_cache,
+			)?;
+			cache.cache_named_plan(&closure)?;
+		}
+		Ok(LogicalKnnDistance::Named(key))
+	}
+
+	fn vector_definitions(
+		&self,
+		origin: &ColumnOrigin,
+		element: VectorKind,
+		distance: &LogicalKnnDistance,
+		span: TextSpan,
+	) -> FerrosGrynnResult<Vec<LogicalVectorDefinition>> {
+		let class = self.catalog.class_definition(origin.class.as_ref())?;
+		class
+			.indexes()
+			.filter_map(|index| {
+				let options = match index.kind() {
+					ClassIndexKind::Hnsw => index.hnsw_options().map(ClassIndexOptions::Hnsw),
+					ClassIndexKind::DiskAnn => {
+						index.disk_ann_options().map(ClassIndexOptions::DiskAnn)
+					}
+					_ => None,
+				}?;
+				let option_element = match options {
+					ClassIndexOptions::Hnsw(options) => options.element(),
+					ClassIndexOptions::DiskAnn(options) => options.element(),
+					ClassIndexOptions::Scalar | ClassIndexOptions::Fulltext(_) => return None,
+				};
+				(index.fields().next().is_some_and(|field| field.as_str() == origin.field.as_ref())
+					&& index_scope_matches(index.scope(), origin.scope)
+					&& option_element == element
+					&& vector_distance_matches(options, distance))
+				.then(|| {
+					Ok(LogicalVectorDefinition {
+						class: origin.class.clone(),
+						field: origin.field.clone(),
+						source: origin.source.clone(),
+						scope: origin.scope,
+						index: index.id().ok_or_else(|| {
+							self.semantic("Published vector index has no IndexId.", span)
+						})?,
+						name: index.name().clone(),
+						kind: index.kind(),
+						state: index.state(),
+						options,
+					})
+				})
+			})
+			.collect()
+	}
+
 	fn closure(
 		&self,
 		closure: &crate::syn::ClosureExpr,
@@ -4242,6 +5448,75 @@ impl<'a> Analyzer<'a> {
 				}
 				(Builtin::RandId, arguments.len(), Type::String)
 			}
+			"search::analyze" => {
+				let Some(TypedExpr {
+					kind: TypedExprKind::Constant(Value::String(name)),
+					..
+				}) = arguments.first()
+				else {
+					return Err(self.semantic(
+						"search::analyze requires a constant analyzer name as its first argument.",
+						span,
+					));
+				};
+				let analyzer = self.catalog.analyzer(name.as_str())?.ok_or_else(|| {
+					self.semantic(&format!("Analyzer `{name}` does not exist."), span)
+				})?;
+				let function = analyzer
+					.function()
+					.map(|(id, version)| {
+						let function = self.catalog.function(id)?.ok_or_else(|| {
+							self.semantic("Analyzer function does not exist.", span)
+						})?;
+						if function.version() != version {
+							return Err(self.semantic(
+								"Analyzer function version does not match its durable definition.",
+								span,
+							));
+						}
+						let key = NamedFunctionKey {
+							id,
+							version,
+							schema_epoch: self.catalog.schema_epoch(),
+							max_depth: function.max_depth(),
+							effect: function.effect(),
+						};
+						if let Some(cache) = self.function_cache
+							&& cache.cached_named(key).is_none()
+						{
+							let closure = compile_named_function(
+								self.catalog,
+								&function,
+								&self.function_stack,
+								&self.function_overrides,
+								self.function_cache,
+							)?;
+							cache.cache_named_plan(&closure)?;
+						}
+						Ok(key)
+					})
+					.transpose()?;
+				(
+					Builtin::SearchAnalyze {
+						analyzer,
+						function,
+					},
+					2,
+					Type::Array(Box::new(Type::String)),
+				)
+			}
+			"search::score" => {
+				let slot = search_slot_argument(arguments.first(), span, |message, span| {
+					self.semantic(message, span)
+				})?;
+				(Builtin::SearchScore(slot), 1, Type::Float)
+			}
+			"search::highlight" => {
+				let slot = search_slot_argument(arguments.get(2), span, |message, span| {
+					self.semantic(message, span)
+				})?;
+				(Builtin::SearchHighlight(slot), 3, Type::String)
+			}
 			"type::is" => {
 				let ty = type_argument
 					.ok_or_else(|| self.semantic("type::is requires a type argument.", span))?;
@@ -4291,8 +5566,12 @@ impl<'a> Analyzer<'a> {
 			"string::upper" | "string::lower" | "string::len" => {
 				vec![BuiltinArgument::String]
 			}
-			"string::contains" | "string::split" => {
+			"string::contains" | "string::split" | "search::analyze" => {
 				vec![BuiltinArgument::String, BuiltinArgument::String]
+			}
+			"search::score" => vec![BuiltinArgument::Integer],
+			"search::highlight" => {
+				vec![BuiltinArgument::String, BuiltinArgument::String, BuiltinArgument::Integer]
 			}
 			"string::matches" => vec![BuiltinArgument::String, BuiltinArgument::RegexOrString],
 			"string::slice" => {
@@ -4454,7 +5733,12 @@ impl<'a> Analyzer<'a> {
 	}
 
 	fn type_name(&self, name: &TypeName) -> FerrosGrynnResult<Type> {
-		let ty = match name.value.to_ascii_lowercase().as_str() {
+		self.type_name_value(name.value.as_ref(), name.span)
+	}
+
+	fn type_name_value(&self, value: &str, span: TextSpan) -> FerrosGrynnResult<Type> {
+		let lower = value.to_ascii_lowercase();
+		let ty = match lower.as_str() {
 			"any" => Type::Any,
 			"none" => Type::None,
 			"null" => Type::Null,
@@ -4474,7 +5758,37 @@ impl<'a> Analyzer<'a> {
 			"record" => Type::Record,
 			"error" => Type::Error,
 			"matcher" => Type::Matcher,
-			_ => return Err(self.semantic(&format!("Unknown type `{}`.", name.value), name.span)),
+			_ => {
+				let Some((outer, inner)) = lower.split_once('<') else {
+					return Err(self.semantic(&format!("Unknown type `{value}`."), span));
+				};
+				let Some(inner) = inner.strip_suffix('>') else {
+					return Err(self.semantic(&format!("Unknown type `{value}`."), span));
+				};
+				match outer {
+					"array" => Type::Array(Box::new(self.type_name_value(inner, span)?)),
+					"set" => Type::Set(Box::new(self.type_name_value(inner, span)?)),
+					"range" => Type::Range(Box::new(self.type_name_value(inner, span)?)),
+					"option" => Type::Option(Box::new(self.type_name_value(inner, span)?)),
+					"vector" => Type::Vector(match inner {
+						"f64" => crate::values::VectorKind::F64,
+						"f32" => crate::values::VectorKind::F32,
+						"f16" => crate::values::VectorKind::F16,
+						"i64" => crate::values::VectorKind::I64,
+						"i32" => crate::values::VectorKind::I32,
+						"i16" => crate::values::VectorKind::I16,
+						"i8" => crate::values::VectorKind::I8,
+						"u8" => crate::values::VectorKind::U8,
+						_ => {
+							return Err(self.semantic(
+								&format!("Unknown vector element type `{inner}`."),
+								span,
+							));
+						}
+					}),
+					_ => return Err(self.semantic(&format!("Unknown type `{value}`."), span)),
+				}
+			}
 		};
 		Ok(ty)
 	}
@@ -4867,6 +6181,36 @@ fn typed_expression_effect(expression: &TypedExpr) -> ClosureEffect {
 			base: left,
 			predicate: right,
 		} => typed_expression_effect(left).max(typed_expression_effect(right)),
+		TypedExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => ClosureEffect::StableRead
+			.max(typed_expression_effect(left))
+			.max(typed_expression_effect(right)),
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			..
+		} => {
+			let distance = match distance {
+				LogicalKnnDistance::Minkowski(value) | LogicalKnnDistance::Callable(value) => {
+					typed_expression_effect(value)
+				}
+				LogicalKnnDistance::Builtin(_) | LogicalKnnDistance::Named(_) => {
+					ClosureEffect::Pure
+				}
+			};
+			ClosureEffect::StableRead
+				.max(typed_expression_effect(left))
+				.max(typed_expression_effect(k))
+				.max(ef.as_deref().map_or(ClosureEffect::Pure, typed_expression_effect))
+				.max(distance)
+				.max(typed_expression_effect(right))
+		}
 		TypedExprKind::Conditional {
 			condition,
 			then_value,
@@ -4924,6 +6268,26 @@ fn typed_expression_effect(expression: &TypedExpr) -> ClosureEffect {
 		| TypedExprKind::CurrentField(_)
 		| TypedExprKind::Closure(_) => ClosureEffect::Pure,
 	}
+}
+
+fn search_slot_argument(
+	argument: Option<&TypedExpr>,
+	span: TextSpan,
+	error: impl Fn(&str, TextSpan) -> FerrosGrynnError,
+) -> FerrosGrynnResult<u16> {
+	let Some(TypedExpr {
+		kind: TypedExprKind::Constant(Value::Number(number)),
+		..
+	}) = argument
+	else {
+		return Err(error("Search match slot must be a constant integer.", span));
+	};
+	let slot = u16::try_from(number.clone())
+		.map_err(|_| error("Search match slot must be in 1..=65535.", span))?;
+	if slot == 0 {
+		return Err(error("Search match slot must be in 1..=65535.", span));
+	}
+	Ok(slot)
 }
 
 #[derive(Clone, Copy)]
@@ -5054,6 +6418,33 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 			collect_expr_names(left, names);
 			collect_expr_names(right, names);
 		}
+		ExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => {
+			collect_expr_names(left, names);
+			collect_expr_names(right, names);
+		}
+		ExprKind::Knn {
+			left,
+			k,
+			search,
+			right,
+		} => {
+			collect_expr_names(left, names);
+			collect_expr_names(k, names);
+			if let Some(search) = search {
+				match search {
+					KnnSearchArgument::Ef(value) => collect_expr_names(value, names),
+					KnnSearchArgument::Distance(
+						KnnDistance::Minkowski(value) | KnnDistance::Custom(value),
+					) => collect_expr_names(value, names),
+					KnnSearchArgument::Distance(_) => {}
+				}
+			}
+			collect_expr_names(right, names);
+		}
 		ExprKind::Conditional {
 			condition,
 			then_value,
@@ -5159,7 +6550,7 @@ fn builtin_name(callee: &Expr) -> Option<(&str, &str)> {
 	Some((namespace.value.as_ref(), field.value.as_ref()))
 }
 
-fn compile_named_function(
+pub(in crate::gql) fn compile_named_function(
 	catalog: &dyn QueryCatalog,
 	function: &crate::datastore::SchemaFunction,
 	stack: &[FunctionId],
@@ -5226,27 +6617,38 @@ fn compile_named_function(
 	Ok(closure)
 }
 
-fn function_source_type(value: &Type) -> FerrosGrynnResult<&'static str> {
+fn function_source_type(value: &Type) -> FerrosGrynnResult<String> {
 	let name = match value {
-		Type::Any => "any",
-		Type::None => "none",
-		Type::Null => "null",
-		Type::Bool => "bool",
-		Type::Number => "number",
-		Type::Int => "int",
-		Type::Float => "float",
-		Type::Decimal => "decimal",
-		Type::String => "string",
-		Type::Duration => "duration",
-		Type::DateTime => "datetime",
-		Type::Bytes => "bytes",
-		Type::Array(_) => "array",
-		Type::Set(_) => "set",
-		Type::Range(_) => "range",
-		Type::Object => "object",
-		Type::Record => "record",
-		Type::Error => "error",
-		Type::Matcher => "matcher",
+		Type::Any => "any".to_owned(),
+		Type::None => "none".to_owned(),
+		Type::Null => "null".to_owned(),
+		Type::Bool => "bool".to_owned(),
+		Type::Number => "number".to_owned(),
+		Type::Int => "int".to_owned(),
+		Type::Float => "float".to_owned(),
+		Type::Decimal => "decimal".to_owned(),
+		Type::String => "string".to_owned(),
+		Type::Duration => "duration".to_owned(),
+		Type::DateTime => "datetime".to_owned(),
+		Type::Bytes => "bytes".to_owned(),
+		Type::Array(item) => format!("array<{}>", function_source_type(item)?),
+		Type::Set(item) => format!("set<{}>", function_source_type(item)?),
+		Type::Range(item) => format!("range<{}>", function_source_type(item)?),
+		Type::Option(item) => format!("option<{}>", function_source_type(item)?),
+		Type::Vector(kind) => format!("vector<{}>", match kind {
+			crate::values::VectorKind::F64 => "f64",
+			crate::values::VectorKind::F32 => "f32",
+			crate::values::VectorKind::F16 => "f16",
+			crate::values::VectorKind::I64 => "i64",
+			crate::values::VectorKind::I32 => "i32",
+			crate::values::VectorKind::I16 => "i16",
+			crate::values::VectorKind::I8 => "i8",
+			crate::values::VectorKind::U8 => "u8",
+		}),
+		Type::Object => "object".to_owned(),
+		Type::Record => "record".to_owned(),
+		Type::Error => "error".to_owned(),
+		Type::Matcher => "matcher".to_owned(),
 		_ => {
 			return Err(FerrosGrynnError::invalid_storage_file(
 				"stored function signature contains a type unsupported by the source parser",
@@ -5657,6 +7059,243 @@ fn aggregate_name(callee: &Expr) -> Option<Aggregate> {
 	}
 }
 
+fn column_origin<'a>(
+	schema: Option<&'a Schema>,
+	expression: &TypedExpr,
+) -> Option<&'a ColumnOrigin> {
+	let TypedExprKind::Column(column) = expression.kind else {
+		return None;
+	};
+	schema?.origins.get(&column)
+}
+
+fn index_scope_matches(index: IndexScope, source: Option<IndexScope>) -> bool {
+	match source {
+		Some(source) => index == source,
+		None => matches!(index, IndexScope::Effective { .. }),
+	}
+}
+
+fn visit_typed_expression<'expression, Error>(
+	expression: &'expression TypedExpr,
+	visit: &mut impl FnMut(&'expression TypedExpr) -> Result<(), Error>,
+) -> Result<(), Error> {
+	visit(expression)?;
+	match &expression.kind {
+		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
+			for value in values {
+				visit_typed_expression(value, visit)?;
+			}
+		}
+		TypedExprKind::Object(fields) => {
+			for (_, value) in fields {
+				visit_typed_expression(value, visit)?;
+			}
+		}
+		TypedExprKind::Range {
+			start,
+			end,
+			..
+		} => {
+			if let Some(value) = start {
+				visit_typed_expression(value, visit)?;
+			}
+			if let Some(value) = end {
+				visit_typed_expression(value, visit)?;
+			}
+		}
+		TypedExprKind::Unary {
+			expr,
+			..
+		}
+		| TypedExprKind::Field {
+			base: expr,
+			..
+		}
+		| TypedExprKind::Destructure {
+			base: expr,
+			..
+		}
+		| TypedExprKind::Cast {
+			expr,
+			..
+		} => visit_typed_expression(expr, visit)?,
+		TypedExprKind::Binary {
+			left,
+			right,
+			..
+		}
+		| TypedExprKind::Index {
+			base: left,
+			index: right,
+		}
+		| TypedExprKind::Filter {
+			base: left,
+			predicate: right,
+		}
+		| TypedExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => {
+			visit_typed_expression(left, visit)?;
+			visit_typed_expression(right, visit)?;
+		}
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			..
+		} => {
+			visit_typed_expression(left, visit)?;
+			visit_typed_expression(k, visit)?;
+			if let Some(ef) = ef {
+				visit_typed_expression(ef, visit)?;
+			}
+			if let LogicalKnnDistance::Minkowski(value) | LogicalKnnDistance::Callable(value) =
+				distance
+			{
+				visit_typed_expression(value, visit)?;
+			}
+			visit_typed_expression(right, visit)?;
+		}
+		TypedExprKind::Conditional {
+			condition,
+			then_value,
+			else_value,
+		} => {
+			visit_typed_expression(condition, visit)?;
+			visit_typed_expression(then_value, visit)?;
+			visit_typed_expression(else_value, visit)?;
+		}
+		TypedExprKind::Case {
+			operand,
+			branches,
+			else_value,
+		} => {
+			if let Some(operand) = operand {
+				visit_typed_expression(operand, visit)?;
+			}
+			for (condition, value) in branches {
+				visit_typed_expression(condition, visit)?;
+				visit_typed_expression(value, visit)?;
+			}
+			if let Some(value) = else_value {
+				visit_typed_expression(value, visit)?;
+			}
+		}
+		TypedExprKind::Builtin {
+			arguments,
+			..
+		}
+		| TypedExprKind::NamedInvoke {
+			arguments,
+			..
+		} => {
+			for argument in arguments {
+				visit_typed_expression(argument, visit)?;
+			}
+		}
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => {
+			visit_typed_expression(callee, visit)?;
+			for argument in arguments {
+				visit_typed_expression(argument, visit)?;
+			}
+		}
+		TypedExprKind::Aggregate {
+			argument,
+			..
+		} => {
+			if let Some(argument) = argument {
+				visit_typed_expression(argument, visit)?;
+			}
+		}
+		TypedExprKind::Constant(_)
+		| TypedExprKind::Slot(_)
+		| TypedExprKind::Column(_)
+		| TypedExprKind::CurrentField(_)
+		| TypedExprKind::Closure(_)
+		| TypedExprKind::Traversal(_)
+		| TypedExprKind::Subquery {
+			..
+		} => {}
+	}
+	Ok(())
+}
+
+fn typed_expression_contains_knn(expression: &TypedExpr) -> bool {
+	let mut found = false;
+	let result = visit_typed_expression(expression, &mut |expression| {
+		found |= matches!(expression.kind, TypedExprKind::Knn { .. });
+		Ok::<_, std::convert::Infallible>(())
+	});
+	match result {
+		Ok(()) => found,
+		Err(never) => match never {},
+	}
+}
+
+fn typed_expression_is_statement_fixed(expression: &TypedExpr) -> bool {
+	let mut fixed = true;
+	let result = visit_typed_expression(expression, &mut |expression| {
+		if matches!(
+			expression.kind,
+			TypedExprKind::Column(_)
+				| TypedExprKind::CurrentField(_)
+				| TypedExprKind::Aggregate { .. }
+				| TypedExprKind::Traversal(_)
+				| TypedExprKind::Subquery { .. }
+		) {
+			fixed = false;
+		}
+		Ok::<_, std::convert::Infallible>(())
+	});
+	match result {
+		Ok(()) => fixed,
+		Err(never) => match never {},
+	}
+}
+
+fn typed_expression_is_search_related(expression: &TypedExpr) -> bool {
+	matches!(
+		expression.kind,
+		TypedExprKind::Fulltext { .. }
+			| TypedExprKind::Knn { .. }
+			| TypedExprKind::Builtin {
+				function: Builtin::SearchScore(_) | Builtin::SearchHighlight(_),
+				..
+			}
+	)
+}
+
+fn vector_distance_matches(options: ClassIndexOptions, distance: &LogicalKnnDistance) -> bool {
+	let expected = match distance {
+		LogicalKnnDistance::Builtin(distance) => Some(*distance),
+		LogicalKnnDistance::Minkowski(exponent) => match &exponent.kind {
+			TypedExprKind::Constant(Value::Number(number)) => {
+				number.as_f64().map(VectorDistance::Minkowski)
+			}
+			_ => None,
+		},
+		LogicalKnnDistance::Named(function) => Some(VectorDistance::Custom {
+			function: function.id,
+			version: function.version,
+		}),
+		LogicalKnnDistance::Callable(_) => None,
+	};
+	let actual = match options {
+		ClassIndexOptions::Hnsw(options) => options.distance(),
+		ClassIndexOptions::DiskAnn(options) => options.distance(),
+		ClassIndexOptions::Scalar | ClassIndexOptions::Fulltext(_) => return false,
+	};
+	expected.is_some_and(|expected| expected == actual)
+}
+
 fn aggregate_type(function: Aggregate, argument: Option<&TypedExpr>) -> Type {
 	match function {
 		Aggregate::Count => Type::Int,
@@ -5692,6 +7331,7 @@ fn graph_source_schema() -> Schema {
 			ty,
 		})
 		.collect(),
+		origins: BTreeMap::new(),
 	}
 }
 
@@ -5806,6 +7446,28 @@ fn expr_contains_aggregate(expression: &Expr) -> bool {
 			base: left,
 			predicate: right,
 		} => expr_contains_aggregate(left) || expr_contains_aggregate(right),
+		ExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => expr_contains_aggregate(left) || expr_contains_aggregate(right),
+		ExprKind::Knn {
+			left,
+			k,
+			search,
+			right,
+		} => {
+			expr_contains_aggregate(left)
+				|| expr_contains_aggregate(k)
+				|| search.as_ref().is_some_and(|search| match search {
+					KnnSearchArgument::Ef(value) => expr_contains_aggregate(value),
+					KnnSearchArgument::Distance(
+						KnnDistance::Minkowski(value) | KnnDistance::Custom(value),
+					) => expr_contains_aggregate(value),
+					KnnSearchArgument::Distance(_) => false,
+				})
+				|| expr_contains_aggregate(right)
+		}
 		ExprKind::Conditional {
 			condition,
 			then_value,
@@ -5878,6 +7540,28 @@ fn expr_references_row(expression: &Expr) -> bool {
 			base: left,
 			predicate: right,
 		} => expr_references_row(left) || expr_references_row(right),
+		ExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => expr_references_row(left) || expr_references_row(right),
+		ExprKind::Knn {
+			left,
+			k,
+			search,
+			right,
+		} => {
+			expr_references_row(left)
+				|| expr_references_row(k)
+				|| search.as_ref().is_some_and(|search| match search {
+					KnnSearchArgument::Ef(value) => expr_references_row(value),
+					KnnSearchArgument::Distance(
+						KnnDistance::Minkowski(value) | KnnDistance::Custom(value),
+					) => expr_references_row(value),
+					KnnSearchArgument::Distance(_) => false,
+				})
+				|| expr_references_row(right)
+		}
 		ExprKind::Conditional {
 			condition,
 			then_value,
@@ -5948,6 +7632,30 @@ fn typed_expr_contains_aggregate(expression: &TypedExpr) -> bool {
 			right,
 			..
 		} => typed_expr_contains_aggregate(left) || typed_expr_contains_aggregate(right),
+		TypedExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => typed_expr_contains_aggregate(left) || typed_expr_contains_aggregate(right),
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			..
+		} => {
+			typed_expr_contains_aggregate(left)
+				|| typed_expr_contains_aggregate(k)
+				|| ef.as_deref().is_some_and(typed_expr_contains_aggregate)
+				|| match distance {
+					LogicalKnnDistance::Minkowski(value) | LogicalKnnDistance::Callable(value) => {
+						typed_expr_contains_aggregate(value)
+					}
+					LogicalKnnDistance::Builtin(_) | LogicalKnnDistance::Named(_) => false,
+				}
+				|| typed_expr_contains_aggregate(right)
+		}
 		TypedExprKind::Conditional {
 			condition,
 			then_value,
@@ -6159,6 +7867,55 @@ const fn function_effect(effect: FunctionEffectName) -> FunctionEffect {
 		FunctionEffectName::Pure => FunctionEffect::Pure,
 		FunctionEffectName::Stable => FunctionEffect::Stable,
 		FunctionEffectName::Impure => FunctionEffect::Impure,
+	}
+}
+
+const fn vector_element(element: VectorElementName) -> VectorKind {
+	match element {
+		VectorElementName::F64 => VectorKind::F64,
+		VectorElementName::F32 => VectorKind::F32,
+		VectorElementName::F16 => VectorKind::F16,
+		VectorElementName::I64 => VectorKind::I64,
+		VectorElementName::I32 => VectorKind::I32,
+		VectorElementName::I16 => VectorKind::I16,
+		VectorElementName::I8 => VectorKind::I8,
+		VectorElementName::U8 => VectorKind::U8,
+	}
+}
+
+const fn analyzer_tokenizer(tokenizer: AnalyzerTokenizerName) -> AnalyzerTokenizer {
+	match tokenizer {
+		AnalyzerTokenizerName::Blank => AnalyzerTokenizer::Blank,
+		AnalyzerTokenizerName::Camel => AnalyzerTokenizer::Camel,
+		AnalyzerTokenizerName::Class => AnalyzerTokenizer::Class,
+		AnalyzerTokenizerName::Punct => AnalyzerTokenizer::Punct,
+	}
+}
+
+fn analyzer_language(language: &Identifier) -> FerrosGrynnResult<AnalyzerLanguage> {
+	match language.value.to_ascii_lowercase().as_str() {
+		"arabic" => Ok(AnalyzerLanguage::Arabic),
+		"danish" => Ok(AnalyzerLanguage::Danish),
+		"dutch" => Ok(AnalyzerLanguage::Dutch),
+		"english" => Ok(AnalyzerLanguage::English),
+		"finnish" => Ok(AnalyzerLanguage::Finnish),
+		"french" => Ok(AnalyzerLanguage::French),
+		"german" => Ok(AnalyzerLanguage::German),
+		"greek" => Ok(AnalyzerLanguage::Greek),
+		"hungarian" => Ok(AnalyzerLanguage::Hungarian),
+		"italian" => Ok(AnalyzerLanguage::Italian),
+		"norwegian" => Ok(AnalyzerLanguage::Norwegian),
+		"portuguese" => Ok(AnalyzerLanguage::Portuguese),
+		"romanian" => Ok(AnalyzerLanguage::Romanian),
+		"russian" => Ok(AnalyzerLanguage::Russian),
+		"spanish" => Ok(AnalyzerLanguage::Spanish),
+		"swedish" => Ok(AnalyzerLanguage::Swedish),
+		"tamil" => Ok(AnalyzerLanguage::Tamil),
+		"turkish" => Ok(AnalyzerLanguage::Turkish),
+		_ => Err(FerrosGrynnError::invalid_argument(format!(
+			"unsupported Snowball language '{}'",
+			language.value
+		))),
 	}
 }
 

@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use rapidhash::RapidHashMap;
 
 use super::{
+	AnalyzerId,
 	ClassId,
 	ClassSchema,
 	ConflictKey,
@@ -25,6 +26,7 @@ use super::{
 	MaintenanceJobInfo,
 	MaintenanceTarget,
 	OccurrenceState,
+	SchemaAnalyzer,
 	SchemaFunction,
 	SchemaId,
 	SchemaParameter,
@@ -125,15 +127,18 @@ enum Mutation {
 	DefineClass(ClassSchema),
 	DefineParameter(SchemaParameter),
 	DefineFunction(SchemaFunction),
+	DefineAnalyzer(SchemaAnalyzer),
 	DefineGraph(GraphSchema),
 	ReplaceClass(ClassSchema),
 	ReplaceParameter(SchemaParameter),
 	ReplaceFunction(SchemaFunction),
+	ReplaceAnalyzer(SchemaAnalyzer),
 	ReplaceGraph(GraphSchema),
 	InstallBuiltGraphTree(build_graph::InstallBuiltGraphTree),
 	RemoveClass(ClassId),
 	RemoveParameter(SchemaId),
 	RemoveFunction(FunctionId),
+	RemoveAnalyzer(AnalyzerId),
 	RemoveGraph(GraphId),
 	CreateAtom {
 		id: GlobalAtomId,

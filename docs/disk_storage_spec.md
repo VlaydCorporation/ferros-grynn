@@ -4248,10 +4248,9 @@ parallelism через `MaintenanceOptions` и import overrides; merge fan-in о
 | `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | f64   | 0.95      | Заполнение внутренних узлов B+tree                                             |
 | `FG_INDEX_RTREE_FILL_FACTOR`          | f64   | 0.95      | Заполнение узлов R-tree при STR-упаковке                                       |
 | `FG_INDEX_PENDING_MAX`                | usize | 65536     | Fixed global bound очереди `DEFER`; overflow коалесцируется в full rebuild     |
-| `FG_HNSW_BUILD_MEM`                   | usize | 2 ГиБ     | Бюджет памяти на построение HNSW (отдельно от кэша обслуживания)               |
 | `FG_IMPORT_SEGMENT_ITEMS`             | usize | 1000000   | Applied items во внутреннем private segment импорта                            |
 | `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | usize | 1000      | Сколько нарушений описывается подробно                                         |
-| `FG_IMPORT_REJECT_LIMIT`              | usize | —         | Явный положительный предел для `ON VIOLATION SKIP|QUARANTINE`                  |
+| `FG_IMPORT_REJECT_LIMIT`              | usize | —         | Явный положительный предел для `ON VIOLATION SKIP                              |QUARANTINE`                  |
 | `FG_BULK_WAL_MODE`                    | enum  | `minimal` | `minimal` \| `full`; `full` станет обязательным при появлении репликации/PITR  |
 
 **Статистика** (§19.5)

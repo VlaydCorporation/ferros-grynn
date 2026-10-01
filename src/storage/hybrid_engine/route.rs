@@ -147,7 +147,7 @@ pub const fn route_read(
 			};
 		}
 		return ReadRoute::SyncDirect {
-			admit: false,
+			admit: matches!(intent, ReadIntent::IndexTraversal),
 		};
 	}
 
@@ -172,6 +172,32 @@ pub const fn route_read(
 
 	ReadRoute::SyncDirect {
 		admit: matches!(window, ReadWindow::Single),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn sparse_sync_index_traversal_admits_validated_pages() {
+		let route = route_read(
+			false,
+			ReadIntent::IndexTraversal,
+			ReadWindow::Sparse {
+				operations: 8,
+				cold_pages: 8,
+			},
+			PageIoMode::Sync,
+			TransportCapabilities {
+				scatter: false,
+				io_ring: false,
+			},
+			288,
+		);
+		assert_eq!(route, ReadRoute::SyncDirect {
+			admit: true
+		});
 	}
 }
 

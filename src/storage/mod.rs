@@ -12,12 +12,15 @@ mod consts;
 mod database_superblock;
 mod direct_io;
 mod file_registry;
+mod fulltext_index;
+mod fulltext_index_delta;
 mod graph_index;
 mod graph_pages;
 mod graph_store;
 mod graph_superblock;
 mod hybrid_engine;
 mod image_io;
+mod immutable_stream;
 mod job_catalog;
 mod local;
 mod local_store;
@@ -31,13 +34,16 @@ mod property_page;
 mod quarantine;
 mod scoped_index_image;
 mod types;
+mod vector_index;
 mod wal;
 
 use direct_io as direct;
+pub(crate) use fulltext_index_delta::FulltextDeltaRecord;
 pub(crate) use local_store::{
 	LocalQuerySnapshot,
 	LocalStore,
 	PhysicalIndexAtom,
+	PhysicalIndexDelta,
 	PhysicalIndexEntries,
 	PhysicalIndexRead,
 	PhysicalScalarGroup,
@@ -47,6 +53,11 @@ pub(crate) use local_store::{
 };
 pub use page_io::PageIoMode;
 pub(crate) use quarantine::{QuarantineArchiveReader, QuarantineArtifact, QuarantineWriter};
+pub(crate) use vector_index::{
+	VectorSearchHit,
+	search_vector_index_with_delta_and_distance,
+	search_vector_index_with_distance,
+};
 
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]
@@ -155,6 +166,7 @@ pub(crate) use graph_index::{
 	SortedIndexRecords,
 	check_external_sort_cancelled,
 	external_sort_metrics,
+	external_sort_run_budget,
 	with_external_sort_control,
 	with_external_sort_options,
 };

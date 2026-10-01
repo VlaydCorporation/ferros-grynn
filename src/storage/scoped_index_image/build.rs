@@ -194,7 +194,7 @@ fn local_addresses(atoms: &BTreeSet<AtomId>) -> FerrosGrynnResult<Vec<DiskAtomRe
 	Ok(result)
 }
 
-pub(super) fn local_address(atom: AtomId) -> FerrosGrynnResult<DiskAtomRef> {
+pub(in crate::storage) fn local_address(atom: AtomId) -> FerrosGrynnResult<DiskAtomRef> {
 	DiskAtomRef::from_parts(
 		atom.kind().ok_or_else(|| invalid("graph index contains a null atom"))?,
 		atom.slot(),
@@ -221,6 +221,9 @@ pub(super) fn scalar_filename(kind: ClassIndexKind, ordinal: u32) -> String {
 		ClassIndexKind::Standard => "std",
 		ClassIndexKind::Unique => "uniq",
 		ClassIndexKind::Count => "cnt",
+		ClassIndexKind::Fulltext => "ft",
+		ClassIndexKind::Hnsw => "hnsw",
+		ClassIndexKind::DiskAnn => "diskann",
 	};
 	format!("idx/{prefix}_{ordinal:04}.fgidx")
 }

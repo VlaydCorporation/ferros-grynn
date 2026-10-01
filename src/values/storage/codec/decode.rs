@@ -95,7 +95,7 @@ impl<'a> Decoder<'a> {
 			0x13 => self.decode_object(depth + 1).map(StorageValue::Object),
 			0x15 => self.decode_range(depth + 1, offset).map(StorageValue::Range),
 			0x21..=0x27 => self.decode_geometry(tag, depth + 1).map(StorageValue::Geometry),
-			0x31..=0x35 => self.decode_vector(tag).map(StorageValue::Vector),
+			0x31..=0x35 | 0x39..=0x3B => self.decode_vector(tag).map(StorageValue::Vector),
 			0x36 => {
 				let kind = match self.read_u8()? {
 					0 => crate::values::AtomKind::Node,
@@ -427,6 +427,39 @@ impl<'a> Decoder<'a> {
 			0x33 => self.decode_i64_vector(dimension).map(Vector::I64),
 			0x34 => self.decode_i32_vector(dimension).map(Vector::I32),
 			0x35 => self.decode_i16_vector(dimension).map(Vector::I16),
+			0x39 => {
+				let mut values = self.allocate_vec(dimension)?;
+				for _ in 0..dimension {
+					let offset = self.position;
+					let value = half::f16::from_bits(self.read_u16()?);
+					let canonical = if value.is_nan() {
+						half::f16::NAN.to_bits()
+					} else if value == half::f16::ZERO {
+						half::f16::ZERO.to_bits()
+					} else {
+						value.to_bits()
+					};
+					if value.to_bits() != canonical {
+						return Err(invalid(offset, "f16 vector component is not canonical"));
+					}
+					values.push(value);
+				}
+				Ok(Vector::F16(values))
+			}
+			0x3A => {
+				let mut values = self.allocate_vec(dimension)?;
+				for _ in 0..dimension {
+					values.push(i8::from_le_bytes([self.read_u8()?]));
+				}
+				Ok(Vector::I8(values))
+			}
+			0x3B => {
+				let mut values = self.allocate_vec(dimension)?;
+				for _ in 0..dimension {
+					values.push(self.read_u8()?);
+				}
+				Ok(Vector::U8(values))
+			}
 			_ => Err(invalid(self.position, "unknown vector tag")),
 		}
 	}

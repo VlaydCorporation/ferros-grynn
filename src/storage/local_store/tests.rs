@@ -1,5 +1,6 @@
 use std::{
 	fs,
+	io::{Read, Seek, SeekFrom, Write},
 	num::NonZeroUsize,
 	path::{Path, PathBuf},
 	sync::{
@@ -10,8 +11,8 @@ use std::{
 };
 
 use super::{
-	IMPORT_FAILURE_POINT,
-	ImportFailurePoint,
+	GENERATION_FAILURE_POINT,
+	GenerationFailurePoint,
 	cleanup::inject_cleanup_failures,
 	open::{StartupTimings, last_startup_timings},
 };
@@ -21,17 +22,23 @@ use crate::{
 		ClassField,
 		ClassIndex,
 		ClassIndexKind,
+		ClassIndexState,
 		ClassSchema,
 		Datastore,
 		ImportOptions,
 		ImportViolationPolicy,
 		IndexScope,
 		LocalOptions,
+		MaintenanceJobKind,
+		MaintenanceJobState,
+		StoreBackend,
 	},
 	gql::QueryExecutionOptions,
 	graph::{AtomKind, EdgeTopology, GraphKind},
-	values::{Object, PropertyMap, RecordId, RecordIdPart, Type, Value},
+	values::{Object, PropertyMap, RecordId, RecordIdPart, Type, Value, Vector},
 };
+
+mod search_scope_tests;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -49,6 +56,21 @@ impl TestDirectory {
 impl Drop for TestDirectory {
 	fn drop(&mut self) {
 		drop(fs::remove_dir_all(&self.0));
+	}
+}
+
+struct GenerationFailureGuard;
+
+impl GenerationFailureGuard {
+	fn set(point: GenerationFailurePoint) -> Self {
+		GENERATION_FAILURE_POINT.set(point);
+		Self
+	}
+}
+
+impl Drop for GenerationFailureGuard {
+	fn drop(&mut self) {
+		GENERATION_FAILURE_POINT.set(GenerationFailurePoint::None);
 	}
 }
 
@@ -281,19 +303,19 @@ fn every_prepublication_failure_discards_root_and_unreachable_generation() {
 	let generation_count = generation_directories(&directory.0);
 
 	for point in [
-		ImportFailurePoint::AfterBuild,
-		ImportFailurePoint::AfterFileSync,
-		ImportFailurePoint::AfterCatalogStage,
-		ImportFailurePoint::BeforeWalCommit,
+		GenerationFailurePoint::AfterBuild,
+		GenerationFailurePoint::AfterFileSync,
+		GenerationFailurePoint::AfterCatalogStage,
+		GenerationFailurePoint::BeforeWalCommit,
 	] {
-		IMPORT_FAILURE_POINT.set(point);
+		let failure = GenerationFailureGuard::set(point);
 		let result = store.import(ImportOptions::default(), |session| {
 			session.apply_item(|transaction| {
 				transaction.create_atom("person:alice".parse()?, PropertyMap::new())
 			})?;
 			Ok(())
 		});
-		IMPORT_FAILURE_POINT.set(ImportFailurePoint::None);
+		drop(failure);
 
 		assert!(result.is_err());
 		assert!(
@@ -301,6 +323,66 @@ fn every_prepublication_failure_discards_root_and_unreachable_generation() {
 		);
 		assert_eq!(generation_directories(&directory.0), generation_count);
 	}
+}
+
+#[test]
+fn streamed_search_index_failures_discard_unreachable_generation() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let setup = store
+		.execute(
+			"DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document TYPE \
+			 NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD \
+			 embedding ON CLASS document TYPE vector<f32>; CREATE document:a SET title = 'Rust \
+			 graph', embedding = $embedding;",
+			&Object::from_iter([("embedding", Value::Vector(Vector::F32(vec![1.0, 0.0])))]),
+		)
+		.unwrap();
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+	let generation_count = generation_directories(&directory.0);
+
+	let definitions = [
+		(
+			"title_search",
+			"DEFINE INDEX title_search ON CLASS document FIELDS title FULLTEXT ANALYZER words \
+			 BM25(1.2, 0.75) HIGHLIGHTS SCOPE BASE;",
+		),
+		(
+			"embedding_hnsw",
+			"DEFINE INDEX embedding_hnsw ON CLASS document FIELDS embedding HNSW DIMENSION 2 TYPE \
+			 F32 DIST EUCLIDEAN EFC 16 M 4 SCOPE BASE;",
+		),
+		(
+			"embedding_disk",
+			"DEFINE INDEX embedding_disk ON CLASS document FIELDS embedding DISKANN DIMENSION 2 \
+			 TYPE F32 DIST EUCLIDEAN DEGREE 4 L_BUILD 8 ALPHA 1.2 SCOPE BASE;",
+		),
+	];
+	for point in [
+		GenerationFailurePoint::AfterBuild,
+		GenerationFailurePoint::AfterFileSync,
+		GenerationFailurePoint::AfterCatalogStage,
+		GenerationFailurePoint::BeforeWalCommit,
+	] {
+		for (name, definition) in definitions {
+			let failure = GenerationFailureGuard::set(point);
+			let define = store.execute(definition, &Object::new()).unwrap();
+			drop(failure);
+
+			assert!(define[0].result.is_err());
+			assert!(store.class("document").unwrap().indexes().all(|index| index.name() != name));
+			assert_eq!(generation_directories(&directory.0), generation_count);
+			assert!(
+				store.begin().atom(&"document:a".parse::<RecordId>().unwrap()).unwrap().is_some()
+			);
+		}
+	}
+	drop(store);
+
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	assert!(reopened.class("document").unwrap().indexes().next().is_none());
+	assert!(reopened.begin().atom(&"document:a".parse::<RecordId>().unwrap()).unwrap().is_some());
 }
 
 #[test]
@@ -761,6 +843,587 @@ fn local_physical_traversal_resolves_effective_properties() {
 }
 
 #[test]
+fn fulltext_physical_results_match_scan_after_local_reopen() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let setup = store
+		.execute(
+			"DEFINE ANALYZER words TOKENIZERS blank FILTERS nfkc, lowercase, ngram(2, 3); DEFINE \
+			 CLASS document TYPE NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE \
+			 string; DEFINE INDEX title_search ON CLASS document FIELDS title FULLTEXT ANALYZER \
+			 words BM25(1.2, 0.75) HIGHLIGHTS SCOPE BASE; CREATE document:a SET title = 'Rust \
+			 graph'; CREATE document:b SET title = 'Rust storage ﬃeld notes'; CREATE document:c \
+			 SET title = 'Graph only';",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+	let automatic = "SELECT id, search::score(7) AS score, search::highlight('[', ']', 7) AS \
+	                 snippet FROM document WHERE title @7@ 'rust' ORDER BY id;";
+	let scan = "SELECT id, search::score(7) AS score, search::highlight('[', ']', 7) AS snippet \
+	            FROM document WITH NOINDEX WHERE title @7@ 'rust' ORDER BY id;";
+	let expected =
+		store.execute(scan, &Object::new()).unwrap().remove(0).result.unwrap().into_parts().0;
+	let actual =
+		store.execute(automatic, &Object::new()).unwrap().remove(0).result.unwrap().into_parts().0;
+	assert_eq!(actual, expected);
+	let unicode_automatic = "SELECT search::highlight('[', ']', 8) AS snippet FROM document WHERE \
+	                         title @8@ 'ffi' ORDER BY id;";
+	let unicode_scan = "SELECT search::highlight('[', ']', 8) AS snippet FROM document WITH \
+	                    NOINDEX WHERE title @8@ 'ffi' ORDER BY id;";
+	let unicode_expected = store
+		.execute(unicode_scan, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	assert_eq!(
+		unicode_expected,
+		Value::Array(
+			vec![Value::Object(Object::from_iter([(
+				"snippet",
+				Value::from("Rust storage [ﬃeld] notes"),
+			)]))]
+			.into(),
+		),
+	);
+	let unicode_actual = store
+		.execute(unicode_automatic, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	assert_eq!(unicode_actual, unicode_expected);
+	let (base_before, delta_before, _) = physical_index_files(&store, "title_search");
+	assert!(delta_before.is_some());
+	let updated =
+		store.execute("UPDATE document:c SET title = 'Rust graph only';", &Object::new()).unwrap();
+	assert!(updated[0].result.is_ok());
+	let (base_after, delta_after, delta_path) = physical_index_files(&store, "title_search");
+	assert_eq!(base_after, base_before);
+	assert_ne!(delta_after, delta_before);
+	assert!(delta_path.as_deref().is_some_and(|path| path.contains("/idx/ft_delta_")));
+	let expected =
+		store.execute(scan, &Object::new()).unwrap().remove(0).result.unwrap().into_parts().0;
+	let actual =
+		store.execute(automatic, &Object::new()).unwrap().remove(0).result.unwrap().into_parts().0;
+	assert_eq!(actual, expected);
+	assert!(store.checkpoint(CheckpointMode::Restart).unwrap());
+	drop(store);
+
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	let after = reopened
+		.execute(automatic, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	assert_eq!(after, expected);
+	let unicode_after = reopened
+		.execute(unicode_automatic, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	assert_eq!(unicode_after, unicode_expected);
+}
+
+#[test]
+fn vector_physical_results_match_scan_after_local_reopen() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let setup = store
+		.execute(
+			"DEFINE CLASS document TYPE NODE SCHEMAFULL; DEFINE FIELD embedding ON CLASS document \
+			 TYPE vector<f32>; DEFINE INDEX embedding_hnsw ON CLASS document FIELDS embedding \
+			 HNSW DIMENSION 2 TYPE F32 DIST COSINE EFC 16 M 4 SCOPE BASE; DEFINE INDEX \
+			 embedding_disk ON CLASS document FIELDS embedding DISKANN DIMENSION 2 TYPE F32 DIST \
+			 EUCLIDEAN DEGREE 4 L_BUILD 8 ALPHA 1.2 HASHED_VECTOR SCOPE BASE;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+	for (name, vector) in [
+		("a", vec![1.0_f32, 0.0]),
+		("b", vec![0.0_f32, 1.0]),
+		("c", vec![-1.0_f32, 0.0]),
+		("d", vec![0.0_f32, 1.0]),
+	] {
+		let mut parameters = Object::new();
+		parameters.insert("vector", Value::Vector(Vector::F32(vector)));
+		let results = store
+			.execute(&format!("CREATE document:{name} SET embedding = $vector;"), &parameters)
+			.unwrap();
+		assert!(results[0].result.is_ok());
+	}
+	let mut parameters = Object::new();
+	parameters.insert("query", Value::Vector(Vector::F32(vec![1.0, 0.0])));
+	let cases = [
+		(
+			"embedding_hnsw",
+			"COSINE",
+			"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 2, COSINE |> $query;",
+		),
+		(
+			"embedding_disk",
+			"EUCLIDEAN",
+			"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 2, EUCLIDEAN |> $query;",
+		),
+	];
+	let expected = cases
+		.iter()
+		.map(|(_, _, scan)| {
+			store.execute(scan, &parameters).unwrap().remove(0).result.unwrap().into_parts().0
+		})
+		.collect::<Vec<_>>();
+	for ((index, distance, _), expected) in cases.iter().zip(&expected) {
+		let query = format!(
+			"SELECT VALUE id FROM document WITH INDEX {index} WHERE embedding <| 2, {distance} |> \
+			 $query;"
+		);
+		let actual =
+			store.execute(&query, &parameters).unwrap().remove(0).result.unwrap().into_parts().0;
+		assert_eq!(&actual, expected);
+	}
+	let hnsw_before = physical_index_files(&store, "embedding_hnsw");
+	let disk_before = physical_index_files(&store, "embedding_disk");
+	let mut update = Object::new();
+	update.insert("vector", Value::Vector(Vector::F32(vec![0.5, 0.5])));
+	let updated = store.execute("UPDATE document:a SET embedding = $vector;", &update).unwrap();
+	assert!(updated[0].result.is_ok());
+	let hnsw_after = physical_index_files(&store, "embedding_hnsw");
+	let disk_after = physical_index_files(&store, "embedding_disk");
+	for (before, after, marker) in [
+		(hnsw_before, hnsw_after, "/idx/hnsw_delta_"),
+		(disk_before, disk_after, "/idx/diskann_delta_"),
+	] {
+		assert_eq!(after.0, before.0);
+		assert!(after.1.is_some());
+		assert!(after.2.as_deref().is_some_and(|path| path.contains(marker)));
+	}
+	let expected = cases
+		.iter()
+		.map(|(_, _, scan)| {
+			store.execute(scan, &parameters).unwrap().remove(0).result.unwrap().into_parts().0
+		})
+		.collect::<Vec<_>>();
+	for ((index, distance, _), expected) in cases.iter().zip(&expected) {
+		let query = format!(
+			"SELECT VALUE id FROM document WITH INDEX {index} WHERE embedding <| 2, {distance} |> \
+			 $query;"
+		);
+		let actual =
+			store.execute(&query, &parameters).unwrap().remove(0).result.unwrap().into_parts().0;
+		assert_eq!(&actual, expected);
+	}
+	assert!(store.checkpoint(CheckpointMode::Restart).unwrap());
+	drop(store);
+
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	let execution_options = QueryExecutionOptions {
+		deterministic_seed: 23,
+		..QueryExecutionOptions::default()
+	};
+	let mut session = reopened.session();
+	let begun = session
+		.execute_with_options(
+			"BEGIN ISOLATION LEVEL SNAPSHOT EXECUTION MODE DETERMINISTIC;",
+			&Object::new(),
+			execution_options.clone(),
+		)
+		.unwrap();
+	assert!(begun[0].result.is_ok());
+	for ((index, distance, _), expected) in cases.iter().zip(&expected) {
+		let query = format!(
+			"SELECT VALUE id FROM document WITH INDEX {index} WHERE embedding <| 2, {distance} |> \
+			 $query;"
+		);
+		let explain = format!("EXPLAIN FULL FORMAT JSON {query}");
+		let mut expected_plan_hash = None;
+		for _run in 0..20 {
+			let actual = session
+				.execute_with_options(&query, &parameters, execution_options.clone())
+				.unwrap()
+				.remove(0)
+				.result
+				.unwrap()
+				.into_parts()
+				.0;
+			assert_eq!(&actual, expected);
+			let explained = session
+				.execute_with_options(&explain, &parameters, execution_options.clone())
+				.unwrap()
+				.remove(0)
+				.result
+				.unwrap()
+				.into_parts()
+				.0;
+			let Value::Object(explained) = explained else {
+				panic!("vector EXPLAIN must return an object");
+			};
+			let plan_hash = explained.get("plan_hash").cloned();
+			assert!(plan_hash.is_some());
+			match &expected_plan_hash {
+				None => expected_plan_hash = plan_hash,
+				Some(expected) => assert_eq!(Some(expected), plan_hash.as_ref()),
+			}
+		}
+	}
+	let cancelled = session.execute("CANCEL;", &Object::new()).unwrap();
+	assert!(cancelled[0].result.is_ok());
+}
+
+#[test]
+fn defining_sibling_vector_indexes_reuses_existing_bases() {
+	let directory = TestDirectory::new();
+	let store = Datastore::create_local(&directory.0, LocalOptions::default()).unwrap();
+	let setup = store
+		.execute(
+			"DEFINE CLASS document TYPE NODE SCHEMAFULL; DEFINE FIELD embedding ON CLASS document \
+			 TYPE vector<f32>; CREATE document:a SET embedding = $a; CREATE document:b SET \
+			 embedding = $b; CREATE document:c SET embedding = $c; DEFINE INDEX embedding_hnsw ON \
+			 CLASS document FIELDS embedding HNSW DIMENSION 2 TYPE F32 DIST EUCLIDEAN EFC 16 M 4 \
+			 SCOPE BASE;",
+			&Object::from_iter([
+				("a", Value::Vector(Vector::F32(vec![0.0, 0.0]))),
+				("b", Value::Vector(Vector::F32(vec![1.0, 0.0]))),
+				("c", Value::Vector(Vector::F32(vec![2.0, 0.0]))),
+			]),
+		)
+		.unwrap();
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+	let hnsw = physical_index_files(&store, "embedding_hnsw");
+
+	let diskann = store
+		.execute(
+			"DEFINE INDEX embedding_disk ON CLASS document FIELDS embedding DISKANN DIMENSION 2 \
+			 TYPE F32 DIST EUCLIDEAN DEGREE 4 L_BUILD 8 ALPHA 1.2 SCOPE BASE;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(diskann[0].result.is_ok());
+	assert_eq!(physical_index_files(&store, "embedding_hnsw"), hnsw);
+	let diskann = physical_index_files(&store, "embedding_disk");
+
+	let hashed = store
+		.execute(
+			"DEFINE INDEX embedding_disk_hashed ON CLASS document FIELDS embedding DISKANN \
+			 DIMENSION 2 TYPE F32 DIST EUCLIDEAN DEGREE 4 L_BUILD 8 ALPHA 1.2 HASHED_VECTOR SCOPE \
+			 BASE;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(hashed[0].result.is_ok());
+	assert_eq!(physical_index_files(&store, "embedding_hnsw"), hnsw);
+	assert_eq!(physical_index_files(&store, "embedding_disk"), diskann);
+}
+
+#[test]
+fn deferred_search_indexes_rebuild_before_becoming_query_visible() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let setup = store
+		.execute(
+			"DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document TYPE \
+			 NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD \
+			 embedding ON CLASS document TYPE vector<f32>; CREATE document:a SET title = 'old', \
+			 embedding = $a; CREATE document:b SET title = 'other', embedding = $b; DEFINE INDEX \
+			 title_search ON CLASS document FIELDS title FULLTEXT ANALYZER words HIGHLIGHTS SCOPE \
+			 BASE DEFER; DEFINE INDEX embedding_hnsw ON CLASS document FIELDS embedding HNSW \
+			 DIMENSION 2 TYPE F32 DIST COSINE EFC 16 M 4 SCOPE BASE DEFER; DEFINE INDEX \
+			 embedding_disk ON CLASS document FIELDS embedding DISKANN DIMENSION 2 TYPE F32 DIST \
+			 COSINE DEGREE 4 L_BUILD 8 ALPHA 1.2 SCOPE BASE DEFER;",
+			&Object::from_iter([
+				("a", Value::Vector(Vector::F32(vec![1.0, 0.0]))),
+				("b", Value::Vector(Vector::F32(vec![0.0, 1.0]))),
+			]),
+		)
+		.unwrap();
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+
+	let parameters = Object::from_iter([
+		("query", Value::Vector(Vector::F32(vec![0.5, 0.5]))),
+		("updated", Value::Vector(Vector::F32(vec![0.5, 0.5]))),
+	]);
+	let mut transaction = store.begin();
+	let update = transaction
+		.execute("UPDATE document:a SET title = 'Rust updated', embedding = $updated;", &parameters)
+		.unwrap();
+	assert!(update[0].result.is_ok());
+	for (automatic, scan) in [
+		(
+			"SELECT VALUE id FROM document WHERE title @@ 'rust' ORDER BY id;",
+			"SELECT VALUE id FROM document WITH NOINDEX WHERE title @@ 'rust' ORDER BY id;",
+		),
+		(
+			"SELECT VALUE id FROM document WHERE embedding <| 1, COSINE |> $query;",
+			"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 1, COSINE |> $query;",
+		),
+	] {
+		let automatic = transaction
+			.execute(automatic, &parameters)
+			.unwrap()
+			.remove(0)
+			.result
+			.unwrap()
+			.into_parts()
+			.0;
+		let scan = transaction
+			.execute(scan, &parameters)
+			.unwrap()
+			.remove(0)
+			.result
+			.unwrap()
+			.into_parts()
+			.0;
+		assert_eq!(automatic, scan);
+	}
+	transaction.commit().unwrap();
+
+	let deadline = Instant::now() + Duration::from_secs(10);
+	loop {
+		let jobs = store
+			.jobs()
+			.unwrap()
+			.into_iter()
+			.filter(|job| job.kind() == MaintenanceJobKind::DeferredIndexCatchUp)
+			.collect::<Vec<_>>();
+		assert!(!jobs.iter().any(|job| job.state() == MaintenanceJobState::Failed));
+		if jobs.len() == 3 && jobs.iter().all(|job| job.state() == MaintenanceJobState::Completed) {
+			break;
+		}
+		assert!(Instant::now() < deadline, "deferred search-index rebuild timed out: {jobs:?}");
+		std::thread::sleep(Duration::from_millis(1));
+	}
+	let class = store.schema_catalog().class("document").unwrap();
+	assert!(class.indexes().all(|index| index.state() == ClassIndexState::Ready));
+
+	let queries = [
+		(
+			"SELECT VALUE id FROM document WITH INDEX title_search WHERE title @@ 'rust' ORDER BY \
+			 id;",
+			"SELECT VALUE id FROM document WITH NOINDEX WHERE title @@ 'rust' ORDER BY id;",
+		),
+		(
+			"SELECT VALUE id FROM document WITH INDEX embedding_hnsw WHERE embedding <| 1, COSINE \
+			 |> $query;",
+			"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 1, COSINE |> $query;",
+		),
+		(
+			"SELECT VALUE id FROM document WITH INDEX embedding_disk WHERE embedding <| 1, COSINE \
+			 |> $query;",
+			"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 1, COSINE |> $query;",
+		),
+	];
+	let expected = queries
+		.iter()
+		.map(|(_, scan)| {
+			store.execute(scan, &parameters).unwrap().remove(0).result.unwrap().into_parts().0
+		})
+		.collect::<Vec<_>>();
+	for ((forced, _), expected) in queries.iter().zip(&expected) {
+		let actual =
+			store.execute(forced, &parameters).unwrap().remove(0).result.unwrap().into_parts().0;
+		assert_eq!(&actual, expected);
+	}
+	drop(store);
+
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	for ((forced, _), expected) in queries.iter().zip(&expected) {
+		let actual =
+			reopened.execute(forced, &parameters).unwrap().remove(0).result.unwrap().into_parts().0;
+		assert_eq!(&actual, expected);
+	}
+}
+
+#[test]
+fn corrupt_search_indexes_fall_back_automatically_but_fail_when_forced() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let setup = store
+		.execute(
+			"DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document TYPE \
+			 NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD \
+			 embedding ON CLASS document TYPE vector<f32>; CREATE document:a SET title = 'Rust \
+			 graph', embedding = $a; CREATE document:b SET title = 'Other', embedding = $b; \
+			 CREATE document:c SET title = 'Rust storage', embedding = $c; DEFINE INDEX \
+			 title_search ON CLASS document FIELDS title FULLTEXT ANALYZER words HIGHLIGHTS SCOPE \
+			 BASE; DEFINE INDEX embedding_hnsw ON CLASS document FIELDS embedding HNSW DIMENSION \
+			 2 TYPE F32 DIST COSINE EFC 16 M 4 SCOPE BASE;",
+			&Object::from_iter([
+				("a", Value::Vector(Vector::F32(vec![1.0, 0.0]))),
+				("b", Value::Vector(Vector::F32(vec![0.0, 1.0]))),
+				("c", Value::Vector(Vector::F32(vec![-1.0, 0.0]))),
+			]),
+		)
+		.unwrap();
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+	let fulltext_scan =
+		"SELECT VALUE id FROM document WITH NOINDEX WHERE title @@ 'rust' ORDER BY id;";
+	let fulltext_auto = "SELECT VALUE id FROM document WHERE title @@ 'rust' ORDER BY id;";
+	let fulltext_forced =
+		"SELECT VALUE id FROM document WITH INDEX title_search WHERE title @@ 'rust' ORDER BY id;";
+	let vector_scan =
+		"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 2, COSINE |> $query;";
+	let vector_auto = "SELECT VALUE id FROM document WHERE embedding <| 2, COSINE |> $query;";
+	let vector_forced = "SELECT VALUE id FROM document WITH INDEX embedding_hnsw WHERE embedding \
+	                     <| 2, COSINE |> $query;";
+	let parameters = Object::from_iter([("query", Value::Vector(Vector::F32(vec![1.0, 0.0])))]);
+	let expected_fulltext = store
+		.execute(fulltext_scan, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	let expected_vector =
+		store.execute(vector_scan, &parameters).unwrap().remove(0).result.unwrap().into_parts().0;
+	let fulltext_path = physical_index_base_path(&store, &directory.0, "title_search");
+	let vector_path = physical_index_base_path(&store, &directory.0, "embedding_hnsw");
+	drop(store);
+	corrupt_page_checksum(&fulltext_path);
+	corrupt_page_checksum(&vector_path);
+
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	let automatic_fulltext = reopened
+		.execute(fulltext_auto, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	let automatic_vector = reopened
+		.execute(vector_auto, &parameters)
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	assert_eq!(automatic_fulltext, expected_fulltext);
+	assert_eq!(automatic_vector, expected_vector);
+	assert!(reopened.execute(fulltext_forced, &Object::new()).unwrap().remove(0).result.is_err());
+	assert!(reopened.execute(vector_forced, &parameters).unwrap().remove(0).result.is_err());
+}
+
+#[test]
+fn udf_backed_physical_indexes_survive_local_reopen() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let setup = store
+		.execute(
+			"DEFINE PURE FUNCTION fn::whole(value: string) -> array<object> { RETURN [{term: \
+			 string::upper($value), start: 0, end: string::len($value)}]; }; DEFINE PURE COST \
+			 FUNCTION fn::l1(left: vector<f32>, right: vector<f32>) -> float { RETURN \
+			 math::abs($left[0] - $right[0]) + math::abs($left[1] - $right[1]); }; DEFINE \
+			 ANALYZER whole FUNCTION fn::whole; DEFINE CLASS document TYPE NODE SCHEMAFULL; \
+			 DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD embedding ON CLASS \
+			 document TYPE vector<f32>; DEFINE INDEX title_search ON CLASS document FIELDS title \
+			 FULLTEXT ANALYZER whole BM25(1.2, 0.75) HIGHLIGHTS SCOPE BASE; DEFINE INDEX \
+			 custom_hnsw ON CLASS document FIELDS embedding HNSW DIMENSION 2 TYPE F32 DIST fn::l1 \
+			 EFC 16 M 4 SCOPE BASE; CREATE document:a SET title = 'rust graph', embedding = $a; \
+			 CREATE document:b SET title = 'other', embedding = $b; CREATE document:c SET title = \
+			 'rust graph', embedding = $c;",
+			&Object::from_iter([
+				("a", Value::Vector(Vector::F32(vec![0.0, 0.0]))),
+				("b", Value::Vector(Vector::F32(vec![2.0, 0.0]))),
+				("c", Value::Vector(Vector::F32(vec![1.0, 0.0]))),
+			]),
+		)
+		.unwrap();
+	assert!(
+		setup.iter().all(|result| result.result.is_ok()),
+		"UDF-backed index setup failed: {:?}",
+		setup.iter().filter_map(|result| result.result.as_ref().err()).collect::<Vec<_>>()
+	);
+	let fulltext_base = physical_index_files(&store, "title_search").0;
+	let vector_base = physical_index_files(&store, "custom_hnsw").0;
+	store
+		.execute(
+			"UPDATE document:c SET title = 'rust updated', embedding = $updated;",
+			&Object::from_iter([("updated", Value::Vector(Vector::F32(vec![0.25, 0.0])))]),
+		)
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap();
+	let fulltext_files = physical_index_files(&store, "title_search");
+	let vector_files = physical_index_files(&store, "custom_hnsw");
+	assert_eq!(fulltext_files.0, fulltext_base);
+	assert_eq!(vector_files.0, vector_base);
+	assert!(fulltext_files.1.is_some());
+	assert!(vector_files.1.is_some());
+
+	let fulltext_scan = "SELECT VALUE search::highlight('[', ']', 9) FROM document WITH NOINDEX \
+	                     WHERE title @9@ 'rust graph' ORDER BY id;";
+	let fulltext_index = "SELECT VALUE search::highlight('[', ']', 9) FROM document WITH INDEX \
+	                      title_search WHERE title @9@ 'rust graph' ORDER BY id;";
+	let expected_fulltext = store
+		.execute(fulltext_scan, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	let actual_fulltext = store
+		.execute(fulltext_index, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	assert_eq!(actual_fulltext, expected_fulltext);
+	assert_eq!(expected_fulltext, Value::Array(vec![Value::from("[rust graph]")].into()));
+
+	let mut parameters = Object::new();
+	parameters.insert("query", Value::Vector(Vector::F32(vec![0.0, 0.0])));
+	let knn_scan =
+		"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 2, fn::l1 |> $query;";
+	let knn_index = "SELECT VALUE id FROM document WITH INDEX custom_hnsw WHERE embedding <| 2, \
+	                 fn::l1 |> $query;";
+	let expected_knn =
+		store.execute(knn_scan, &parameters).unwrap().remove(0).result.unwrap().into_parts().0;
+	let actual_knn =
+		store.execute(knn_index, &parameters).unwrap().remove(0).result.unwrap().into_parts().0;
+	assert_eq!(actual_knn, expected_knn);
+	assert_ne!(physical_index_files(&store, "title_search").0, 0);
+	assert_ne!(physical_index_files(&store, "custom_hnsw").0, 0);
+
+	assert!(store.checkpoint(CheckpointMode::Restart).unwrap());
+	drop(store);
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	let reopened_fulltext = reopened
+		.execute(fulltext_index, &Object::new())
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap()
+		.into_parts()
+		.0;
+	let reopened_knn =
+		reopened.execute(knn_index, &parameters).unwrap().remove(0).result.unwrap().into_parts().0;
+	assert_eq!(reopened_fulltext, expected_fulltext);
+	assert_eq!(reopened_knn, expected_knn);
+}
+
+#[test]
 fn relational_select_spill_matches_after_local_reopen() {
 	let directory = TestDirectory::new();
 	let options = LocalOptions::default();
@@ -828,4 +1491,64 @@ fn generation_directories(root: &Path) -> usize {
 		}
 	}
 	count
+}
+
+fn physical_index_files(store: &Datastore, name: &str) -> (u64, Option<u64>, Option<String>) {
+	let StoreBackend::Local(local) = &store.inner.backend else {
+		panic!("test requires a local datastore");
+	};
+	let state = local.state.lock();
+	let index = state
+		._database_catalog
+		.classes
+		.iter()
+		.flat_map(|class| &class.indexes)
+		.find(|index| index.name.as_str() == name)
+		.unwrap_or_else(|| panic!("index {name} is absent"));
+	let base = index.physical.expect("physical base is absent").file_id.get();
+	let delta = index.delta.map(|binding| binding.file_id.get());
+	let path = index.delta.and_then(|binding| {
+		state
+			.file_catalog
+			.files
+			.iter()
+			.find(|entry| entry.file_id == binding.file_id)
+			.map(|entry| entry.path.as_str().to_owned())
+	});
+	(base, delta, path)
+}
+
+fn physical_index_base_path(store: &Datastore, database: &Path, name: &str) -> PathBuf {
+	let StoreBackend::Local(local) = &store.inner.backend else {
+		panic!("test requires a local datastore");
+	};
+	let state = local.state.lock();
+	let binding = state
+		._database_catalog
+		.classes
+		.iter()
+		.flat_map(|class| &class.indexes)
+		.find(|index| index.name.as_str() == name)
+		.and_then(|index| index.physical)
+		.unwrap_or_else(|| panic!("physical index {name} is absent"));
+	let path = state
+		.file_catalog
+		.files
+		.iter()
+		.find(|entry| entry.file_id == binding.file_id)
+		.unwrap_or_else(|| panic!("physical file for index {name} is absent"))
+		.path
+		.as_str();
+	database.join(path)
+}
+
+fn corrupt_page_checksum(path: &Path) {
+	let mut file = fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+	file.seek(SeekFrom::Start(47)).unwrap();
+	let mut byte = [0_u8; 1];
+	file.read_exact(&mut byte).unwrap();
+	byte[0] ^= 1;
+	file.seek(SeekFrom::Start(47)).unwrap();
+	file.write_all(&byte).unwrap();
+	file.sync_all().unwrap();
 }

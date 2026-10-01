@@ -1327,7 +1327,9 @@ SELECT id FROM pts WHERE point <|10, EF 40|> [2,3,4,5];
 совпадении index `DIST`, element type, dimensions, scope и field; иначе выполняется exact scan с
 тем же distance. `<|K, EF n|>` явно требует ready ANN index: `WITH INDEX` выбирает его, без hint
 допустим ровно один compatible candidate; отсутствие и неоднозначность дают typed planning
-errors. Выбранный approximate path и индекс отображаются в `EXPLAIN`.
+errors. Без явного `EF` HNSW использует `max(K, 1024, DIMENSION)`, DiskANN —
+`max(K, 64)`; explicit `EF` не корректируется. Выбранный approximate path и индекс
+отображаются в `EXPLAIN`.
 
 ### 6.5. Условные выражения
 
@@ -2351,8 +2353,9 @@ HNSW (иерархически управляемый малый мир) — м�
 Вы можете указать только `TYPE`, `M` и `EFC`. Ferros-Grynn автоматически вычисляет `M0` и `LM`, 
 используя наиболее подходящее значение. Если значения не указаны, `M` и `EFC` устанавливаются на 12 и 150 соответственно.
 
-Векторный поиск `HNSW` по умолчанию использует ограниченный кэш памяти, что снижает скачки потребления памяти и повышает стабильность работы под нагрузкой. 
-Размер кэша по умолчанию составляет 256 МБ, его можно изменить с помощью настройки `FG_HNSW_CACHE_SIZE`.
+HNSW использует общий `BufferPool`/query memory accounting. Отдельный глобальный
+HNSW-кэш и `FG_HNSW_CACHE_SIZE` не вводятся, чтобы не дублировать eviction и
+memory budget.
 
 #### DiskANN
 
@@ -6078,20 +6081,19 @@ SELECT fn::friend_score(person:alice, person:bob) AS score;
 
 Общие настройки
 
-| Имя                                  | Описание                                                                               | Значение по умолчанию |
-|--------------------------------------|----------------------------------------------------------------------------------------|-----------------------|
-| `FG_ASYNC_EVENT_PROCESSING_INTERVAL` | Интервал обработки асинхронных событий                                                 | 5 сек                 |
-| `FG_HNSW_CACHE_SIZE`                 | Размер HNSW кеша                                                                       | 256 МБ                |
-| `FG_PATH_MAX_DEPTH`                  | Глобальная максимальная длина путей графов                                             | 30                    |
-| `FG_WITHIN_MAX_DEPTH`                | Глобальная максимальная длина поиска вложенностей в мета-атомах                        | 7                     |
-| `FG_TRAVERSAL_READ_YOUR_WRITES`      | Включает traversal pipeline'у видимость его собственных изменений                      | false                 |
-| `FG_TEMPFILES_PATH`                  | Каталог временных файлов: спиллинг сортировок в `SELECT` **и** при построении индексов | ""                    |
-| `QueryExecutionOptions.max_graph_nodes` | Максимум unique target nodes одного graph result                                   | 1'000'000             |
-| `QueryExecutionOptions.max_graph_edges` | Максимум unique target edges одного graph result                                   | 5'000'000             |
-| `FG_DISKANN_CACHE_SIZE`              | Размер кэша индекса DiskANN                                                            | 268435456 (256 МБ)    |
-| `FG_EXECUTION_MODE`                  | Режим исполнения по умолчанию ([§17.8](#178-режимы-исполнения-и-детерминизм))          | `BEST_EFFORT`         |
-| `FG_MAX_SNAPSHOT_AGE_SEC`            | Возраст снимка, после которого он принудительно закрывается                            | 300                   |
-| `FG_TX_WRITE_SET_MAX_BYTES`          | Максимальный atom-delta write-set одной sync-транзакции                                | 268435456 (256 МиБ)   |
+| Имя                                     | Описание                                                                               | Значение по умолчанию |
+|-----------------------------------------|----------------------------------------------------------------------------------------|-----------------------|
+| `FG_ASYNC_EVENT_PROCESSING_INTERVAL`    | Интервал обработки асинхронных событий                                                 | 5 сек                 |
+| `FG_PATH_MAX_DEPTH`                     | Глобальная максимальная длина путей графов                                             | 30                    |
+| `FG_WITHIN_MAX_DEPTH`                   | Глобальная максимальная длина поиска вложенностей в мета-атомах                        | 7                     |
+| `FG_TRAVERSAL_READ_YOUR_WRITES`         | Включает traversal pipeline'у видимость его собственных изменений                      | false                 |
+| `FG_TEMPFILES_PATH`                     | Каталог временных файлов: спиллинг сортировок в `SELECT` **и** при построении индексов | ""                    |
+| `QueryExecutionOptions.max_graph_nodes` | Максимум unique target nodes одного graph result                                       | 1'000'000             |
+| `QueryExecutionOptions.max_graph_edges` | Максимум unique target edges одного graph result                                       | 5'000'000             |
+| `FG_DISKANN_CACHE_SIZE`                 | Размер кэша индекса DiskANN                                                            | 268435456 (256 МБ)    |
+| `FG_EXECUTION_MODE`                     | Режим исполнения по умолчанию ([§17.8](#178-режимы-исполнения-и-детерминизм))          | `BEST_EFFORT`         |
+| `FG_MAX_SNAPSHOT_AGE_SEC`               | Возраст снимка, после которого он принудительно закрывается                            | 300                   |
+| `FG_TX_WRITE_SET_MAX_BYTES`             | Максимальный atom-delta write-set одной sync-транзакции                                | 268435456 (256 МиБ)   |
 
 Live-запросы и changefeed ([§21](#21-события-и-live-запросы))
 
@@ -6115,7 +6117,6 @@ Live-запросы и changefeed ([§21](#21-события-и-live-запро�
 | `FG_IMPORT_SEGMENT_ITEMS`             | Applied items во внутреннем private segment                                      | 1'000'000             |
 | `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | Сколько нарушений описывается подробно в отчёте                                  | 1000                  |
 | `FG_IMPORT_REJECT_LIMIT`              | Явный положительный предел для `ON VIOLATION SKIP`                               | отсутствует           |
-| `FG_HNSW_BUILD_MEM`                   | Бюджет памяти на построение HNSW (отдельно от кэша обслуживания)                 | 2 ГБ                  |
 
 ---
 

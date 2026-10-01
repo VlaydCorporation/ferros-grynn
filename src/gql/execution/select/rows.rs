@@ -198,6 +198,53 @@ pub(super) fn row_record(row: Row, ordinal: usize) -> CursorRecord {
 				graph,
 				Value::Array(row.stable.into()),
 				Value::Array(row.sequence.into_iter().map(Value::from).collect::<Vec<_>>().into()),
+				Value::Array(
+					row.fulltext
+						.into_iter()
+						.map(|entry| {
+							Value::Array(
+								vec![
+									Value::from(entry.predicate),
+									entry.slot.map_or(Value::None, Value::from),
+									Value::Bool(entry.matched),
+									Value::Bool(entry.highlights),
+									Value::from(entry.score_bits),
+									Value::from(entry.text.as_ref()),
+									Value::Array(
+										entry
+											.spans
+											.into_iter()
+											.map(|(start, end)| {
+												Value::Array(
+													vec![Value::from(start), Value::from(end)]
+														.into(),
+												)
+											})
+											.collect::<Vec<_>>()
+											.into(),
+									),
+								]
+								.into(),
+							)
+						})
+						.collect::<Vec<_>>()
+						.into(),
+				),
+				Value::Array(
+					row.knn
+						.into_iter()
+						.map(|entry| {
+							Value::Array(
+								vec![
+									Value::from(entry.predicate),
+									Value::from(entry.distance_bits),
+								]
+								.into(),
+							)
+						})
+						.collect::<Vec<_>>()
+						.into(),
+				),
 			]
 			.into(),
 		),
@@ -246,13 +293,133 @@ pub(super) fn row_from_record(record: CursorRecord) -> FerrosGrynnResult<Row> {
 			}
 		})
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let fulltext = take_array_value(values.next(), "fulltext results")?
+		.into_iter()
+		.map(decode_fulltext_match)
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	let knn = take_array_value(values.next(), "KNN results")?
+		.into_iter()
+		.map(decode_knn_match)
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	if values.next().is_some() {
 		return Err(FerrosGrynnError::invalid_storage_file(
 			"query row run contains trailing fields",
 		));
 	}
-	Ok(Row::new(columns.into_iter().collect())
+	let mut row = Row::new(columns.into_iter().collect())
 		.with_graph(graph)
 		.with_stable(stable.into_iter().collect())
-		.with_sequence(sequence))
+		.with_sequence(sequence);
+	row.fulltext = fulltext;
+	row.knn = knn;
+	Ok(row)
+}
+
+fn take_array_value(value: Option<Value>, name: &str) -> FerrosGrynnResult<Array> {
+	match value {
+		Some(Value::Array(values)) => Ok(values),
+		_ => {
+			Err(FerrosGrynnError::invalid_storage_file(format!("query row run has invalid {name}")))
+		}
+	}
+}
+
+fn decode_fulltext_match(value: Value) -> FerrosGrynnResult<FulltextMatch> {
+	let Value::Array(fields) = value else {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"query row fulltext result is not an array",
+		));
+	};
+	let mut fields = fields.into_iter();
+	let predicate = decode_u64(fields.next(), "fulltext predicate").and_then(|value| {
+		u32::try_from(value).map_err(|_| invalid_row_number("fulltext predicate"))
+	})?;
+	let slot = match fields.next() {
+		Some(Value::None) => None,
+		value => Some(
+			u16::try_from(decode_u64(value, "fulltext slot")?)
+				.map_err(|_| invalid_row_number("fulltext slot"))?,
+		),
+	};
+	let Some(Value::Bool(matched)) = fields.next() else {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"query row fulltext result has invalid match flag",
+		));
+	};
+	let Some(Value::Bool(highlights)) = fields.next() else {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"query row fulltext result has invalid highlight flag",
+		));
+	};
+	let score_bits = decode_u64(fields.next(), "fulltext score")?;
+	let Some(Value::String(text)) = fields.next() else {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"query row fulltext result has invalid text",
+		));
+	};
+	let spans = take_array_value(fields.next(), "fulltext spans")?
+		.into_iter()
+		.map(|value| {
+			let Value::Array(span) = value else {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"query row fulltext span is not an array",
+				));
+			};
+			let mut span = span.into_iter();
+			let start = u32::try_from(decode_u64(span.next(), "fulltext span start")?)
+				.map_err(|_| invalid_row_number("fulltext span start"))?;
+			let end = u32::try_from(decode_u64(span.next(), "fulltext span end")?)
+				.map_err(|_| invalid_row_number("fulltext span end"))?;
+			if span.next().is_some() {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"query row fulltext span has trailing fields",
+				));
+			}
+			Ok((start, end))
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	if fields.next().is_some() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"query row fulltext result has trailing fields",
+		));
+	}
+	Ok(FulltextMatch {
+		predicate,
+		slot,
+		matched,
+		highlights,
+		score_bits,
+		text: text.as_str().into(),
+		spans,
+	})
+}
+
+fn decode_knn_match(value: Value) -> FerrosGrynnResult<KnnMatch> {
+	let Value::Array(fields) = value else {
+		return Err(FerrosGrynnError::invalid_storage_file("query row KNN result is not an array"));
+	};
+	let mut fields = fields.into_iter();
+	let predicate = u32::try_from(decode_u64(fields.next(), "KNN predicate")?)
+		.map_err(|_| invalid_row_number("KNN predicate"))?;
+	let distance_bits = decode_u64(fields.next(), "KNN distance")?;
+	if fields.next().is_some() {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"query row KNN result has trailing fields",
+		));
+	}
+	Ok(KnnMatch {
+		predicate,
+		distance_bits,
+	})
+}
+
+fn decode_u64(value: Option<Value>, name: &str) -> FerrosGrynnResult<u64> {
+	let Some(Value::Number(number)) = value else {
+		return Err(invalid_row_number(name));
+	};
+	u64::try_from(number).map_err(|_| invalid_row_number(name))
+}
+
+fn invalid_row_number(name: &str) -> FerrosGrynnError {
+	FerrosGrynnError::invalid_storage_file(format!("query row run has invalid {name}"))
 }

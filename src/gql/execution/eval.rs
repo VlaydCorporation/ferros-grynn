@@ -4,6 +4,7 @@
 )]
 
 use super::*;
+use crate::values::Vector;
 
 pub(super) fn eval(
 	expr: &TypedExpr,
@@ -306,6 +307,113 @@ fn eval_current(
 		TypedExprKind::Builtin {
 			function,
 			arguments,
+		} if matches!(function, Builtin::SearchScore(_) | Builtin::SearchHighlight(_)) => {
+			let row = row.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"search score and highlight require a SELECT match row",
+				)
+			})?;
+			match function {
+				Builtin::SearchScore(slot) => {
+					let score = row
+						.fulltext_slot(*slot)
+						.map_or(0.0, |entry| f64::from_bits(entry.score_bits));
+					Ok(Value::from(score))
+				}
+				Builtin::SearchHighlight(slot) => {
+					let open = eval_current(
+						arguments.first().ok_or_else(|| {
+							FerrosGrynnError::invalid_argument("search::highlight has no open tag")
+						})?,
+						Some(row),
+						slots,
+						source,
+						fields,
+						current,
+						control,
+					)?;
+					let close = eval_current(
+						arguments.get(1).ok_or_else(|| {
+							FerrosGrynnError::invalid_argument("search::highlight has no close tag")
+						})?,
+						Some(row),
+						slots,
+						source,
+						fields,
+						current,
+						control,
+					)?;
+					let (Value::String(open), Value::String(close)) = (open, close) else {
+						return Err(FerrosGrynnError::invalid_argument(
+							"search::highlight tags must be strings",
+						));
+					};
+					let entry = row.fulltext_slot(*slot).ok_or_else(|| {
+						FerrosGrynnError::invalid_argument(
+							"search::highlight slot has no Fulltext match in this row",
+						)
+					})?;
+					if !entry.highlights {
+						return Err(FerrosGrynnError::invalid_argument(
+							"search::highlight requires a Fulltext definition with HIGHLIGHTS",
+						));
+					}
+					Ok(Value::from(render_highlight(
+						&entry.text,
+						&entry.spans,
+						open.as_str(),
+						close.as_str(),
+					)?))
+				}
+				_ => unreachable!("search result dispatch was guarded above"),
+			}
+		}
+		TypedExprKind::Builtin {
+			function,
+			arguments,
+		} if matches!(function, Builtin::SearchAnalyze { .. }) => {
+			let control = control.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("search::analyze requires an execution session.")
+			})?;
+			let arguments = arguments
+				.iter()
+				.map(|argument| {
+					eval_current(argument, row, slots, source, fields, current, Some(control))
+				})
+				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let [_, Value::String(input)] = arguments.as_slice() else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"search::analyze requires an analyzer name and string input.",
+				));
+			};
+			let Builtin::SearchAnalyze {
+				analyzer,
+				function,
+			} = function
+			else {
+				unreachable!("search analyzer dispatch was guarded above")
+			};
+			let tokens = if let Some(function) = function {
+				let plan = control.resolve_named_function(*function)?;
+				let _frame = control.enter_named_function(*function)?;
+				let result = invoke_logical_closure(
+					control,
+					&plan,
+					&[],
+					&[Value::String(input.clone())],
+					source,
+				)?;
+				crate::datastore::analyze_function_result(analyzer, input.as_str(), &result)?
+			} else {
+				crate::datastore::analyze_builtin(analyzer, input.as_str())?
+			};
+			Ok(Value::Array(crate::values::Array::from_iter(
+				tokens.into_iter().map(|token| Value::String(token.term)),
+			)))
+		}
+		TypedExprKind::Builtin {
+			function,
+			arguments,
 		} if matches!(function, Builtin::GraphInner | Builtin::GraphLevelPath) => {
 			let argument = arguments.first().ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("graph::inner requires one argument")
@@ -398,6 +506,25 @@ fn eval_current(
 		TypedExprKind::Traversal(_) => Err(FerrosGrynnError::invalid_argument(
 			"Traversal expression requires the transaction-aware evaluator.",
 		)),
+		TypedExprKind::Fulltext {
+			..
+		} => row
+			.and_then(|row| row.fulltext_match(expr.span.offset))
+			.map(|entry| Value::Bool(entry.matched))
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"Fulltext predicate reached evaluation before SELECT search preparation",
+				)
+			}),
+		TypedExprKind::Knn {
+			..
+		} => {
+			row.map(|row| Value::Bool(row.knn_match(expr.span.offset).is_some())).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"KNN predicate reached evaluation before SELECT search preparation",
+				)
+			})
+		}
 		TypedExprKind::Aggregate {
 			..
 		}
@@ -414,7 +541,50 @@ fn eval_current(
 	result.map_err(|error| locate_execution(error, expr, source))
 }
 
-fn invoke_expression_closure(
+fn render_highlight(
+	text: &str,
+	spans: &[(u32, u32)],
+	open: &str,
+	close: &str,
+) -> FerrosGrynnResult<String> {
+	if spans.is_empty() {
+		return Ok(text.to_owned());
+	}
+	let mut scalar_offsets = text.char_indices().map(|(offset, _)| offset).collect::<Vec<_>>();
+	scalar_offsets.push(text.len());
+	let mut output = String::with_capacity(
+		text.len().saturating_add(spans.len().saturating_mul(open.len() + close.len())),
+	);
+	let mut copied = 0_usize;
+	for &(start, end) in spans {
+		let start = usize::try_from(start).map_err(|_| {
+			FerrosGrynnError::invalid_argument("highlight span start does not fit usize")
+		})?;
+		let end = usize::try_from(end).map_err(|_| {
+			FerrosGrynnError::invalid_argument("highlight span end does not fit usize")
+		})?;
+		let (Some(&start), Some(&end)) = (scalar_offsets.get(start), scalar_offsets.get(end))
+		else {
+			return Err(FerrosGrynnError::invalid_argument(
+				"highlight span is outside the source text",
+			));
+		};
+		if start < copied || start > end {
+			return Err(FerrosGrynnError::invalid_argument(
+				"highlight spans are not sorted and disjoint",
+			));
+		}
+		output.push_str(&text[copied..start]);
+		output.push_str(open);
+		output.push_str(&text[start..end]);
+		output.push_str(close);
+		copied = end;
+	}
+	output.push_str(&text[copied..]);
+	Ok(output)
+}
+
+pub(super) fn invoke_expression_closure(
 	control: &ExecutionControl,
 	closure: &crate::values::Closure,
 	arguments: &[Value],
@@ -429,7 +599,7 @@ fn invoke_expression_closure(
 	invoke_logical_closure(control, &entry.plan, &entry.captures, arguments, source)
 }
 
-fn invoke_logical_closure(
+pub(in crate::gql) fn invoke_logical_closure(
 	control: &ExecutionControl,
 	plan: &LogicalClosure,
 	captures: &[(u32, Value)],
@@ -459,12 +629,181 @@ fn invoke_logical_closure(
 		crate::gql::ir::LogicalClosureBody::Expression(expression) => {
 			eval_mut(expression, None, &mut slots, source, None, Some(control))
 		}
-		crate::gql::ir::LogicalClosureBody::Block(_) => {
-			Err(FerrosGrynnError::query_feature_not_supported(
-				"block closure invocation outside traversal execution",
-			))
+		crate::gql::ir::LogicalClosureBody::Block(block) => {
+			let mut runtime = super::ControlRuntime::default();
+			match execute_pure_block(block, &mut slots, source, control, &mut runtime, 1)? {
+				PureControlFlow::Value(value) | PureControlFlow::Return(value) => Ok(value),
+				PureControlFlow::Break | PureControlFlow::Continue => {
+					Err(FerrosGrynnError::invalid_argument(
+						"BREAK or CONTINUE cannot cross a closure boundary.",
+					))
+				}
+			}
 		}
 	}
+}
+
+enum PureControlFlow {
+	Value(Value),
+	Return(Value),
+	Break,
+	Continue,
+}
+
+fn execute_pure_block(
+	block: &crate::gql::ir::LogicalBlock,
+	slots: &mut [Value],
+	source: &str,
+	control: &ExecutionControl,
+	runtime: &mut super::ControlRuntime,
+	depth: u32,
+) -> FerrosGrynnResult<PureControlFlow> {
+	let mut last = Value::None;
+	for statement in &block.statements {
+		let child = control.child(statement.timeout);
+		match execute_pure_statement(&statement.statement, slots, source, &child, runtime, depth)? {
+			PureControlFlow::Value(value) => last = value,
+			flow @ (PureControlFlow::Return(_)
+			| PureControlFlow::Break
+			| PureControlFlow::Continue) => return Ok(flow),
+		}
+	}
+	Ok(PureControlFlow::Value(last))
+}
+
+fn execute_pure_statement(
+	statement: &crate::gql::ir::LogicalStatement,
+	slots: &mut [Value],
+	source: &str,
+	control: &ExecutionControl,
+	runtime: &mut super::ControlRuntime,
+	depth: u32,
+) -> FerrosGrynnResult<PureControlFlow> {
+	use crate::gql::ir::{LogicalLetValue, LogicalStatement};
+
+	control.check()?;
+	if depth > control.max_control_depth {
+		return Err(FerrosGrynnError::control_limit_exceeded(
+			"nesting depth",
+			u64::from(control.max_control_depth),
+		));
+	}
+	let value = match statement {
+		LogicalStatement::Let {
+			slot,
+			value: LogicalLetValue::Expression(value),
+			..
+		} => {
+			slots[*slot as usize] = eval_mut(value, None, slots, source, None, Some(control))?;
+			Value::None
+		}
+		LogicalStatement::Return {
+			value,
+		} => {
+			return eval_mut(value, None, slots, source, None, Some(control))
+				.map(PureControlFlow::Return);
+		}
+		LogicalStatement::Expression {
+			value,
+		} => eval_mut(value, None, slots, source, None, Some(control))?,
+		LogicalStatement::If {
+			branches,
+			else_block,
+		} => {
+			let mut selected = None;
+			for (condition, block) in branches {
+				if eval_mut(condition, None, slots, source, None, Some(control))?.is_truthy() {
+					selected = Some(block);
+					break;
+				}
+			}
+			if let Some(block) = selected.or(else_block.as_ref()) {
+				return execute_pure_block(block, slots, source, control, runtime, depth + 1);
+			}
+			Value::None
+		}
+		LogicalStatement::For {
+			slot,
+			iterable,
+			body,
+		} => {
+			let values = super::iterable_values(eval_mut(
+				iterable,
+				None,
+				slots,
+				source,
+				None,
+				Some(control),
+			)?)?;
+			let mut last = Value::None;
+			for value in values {
+				control.check()?;
+				super::record_iteration(runtime, control)?;
+				slots[*slot as usize] = value;
+				match execute_pure_block(body, slots, source, control, runtime, depth + 1)? {
+					PureControlFlow::Value(value) => last = value,
+					PureControlFlow::Break => break,
+					PureControlFlow::Continue => continue,
+					flow @ PureControlFlow::Return(_) => return Ok(flow),
+				}
+			}
+			last
+		}
+		LogicalStatement::While {
+			condition,
+			body,
+		} => {
+			let mut last = Value::None;
+			while eval_mut(condition, None, slots, source, None, Some(control))?.is_truthy() {
+				control.check()?;
+				super::record_iteration(runtime, control)?;
+				match execute_pure_block(body, slots, source, control, runtime, depth + 1)? {
+					PureControlFlow::Value(value) => last = value,
+					PureControlFlow::Break => break,
+					PureControlFlow::Continue => continue,
+					flow @ PureControlFlow::Return(_) => return Ok(flow),
+				}
+			}
+			last
+		}
+		LogicalStatement::Break => return Ok(PureControlFlow::Break),
+		LogicalStatement::Continue => return Ok(PureControlFlow::Continue),
+		LogicalStatement::Try {
+			body,
+			catch,
+		} => {
+			let saved_slots = slots.to_vec();
+			match execute_pure_block(body, slots, source, control, runtime, depth + 1) {
+				Ok(flow) => return Ok(flow),
+				Err(error) if catch.as_ref().is_some_and(|_| super::catchable(&error)) => {
+					slots.clone_from_slice(&saved_slots);
+					let (slot, handler) = catch.as_ref().ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("CATCH handler is missing.")
+					})?;
+					slots[*slot as usize] =
+						Value::Error(Box::new(crate::values::ErrorValue::from_error(&error)));
+					return execute_pure_block(handler, slots, source, control, runtime, depth + 1);
+				}
+				Err(error) => return Err(error),
+			}
+		}
+		LogicalStatement::Throw {
+			value,
+		} => {
+			let Value::String(message) = eval_mut(value, None, slots, source, None, Some(control))?
+			else {
+				return Err(FerrosGrynnError::invalid_argument("THROW requires a string value."));
+			};
+			return Err(FerrosGrynnError::user_thrown(message.to_string()));
+		}
+		_ => {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"PURE function body contains a non-pure statement",
+			));
+		}
+	};
+	control.check()?;
+	Ok(PureControlFlow::Value(value))
 }
 
 fn mutate_collection(
@@ -865,6 +1204,36 @@ fn index_value(base: Value, index: Value) -> FerrosGrynnResult<Value> {
 			.ok()
 			.and_then(|index| values.get(index).cloned())
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("Array index is out of bounds.")),
+		(Value::Vector(vector), Value::Number(number)) => {
+			let index = usize::try_from(number).map_err(|_| {
+				FerrosGrynnError::invalid_argument("Vector index must be non-negative.")
+			})?;
+			let value = match vector {
+				Vector::F64(values) => values.get(index).copied().map(Number::Float),
+				Vector::F32(values) => {
+					values.get(index).copied().map(|value| Number::Float(f64::from(value)))
+				}
+				Vector::F16(values) => {
+					values.get(index).copied().map(|value| Number::Float(f64::from(value.to_f32())))
+				}
+				Vector::I64(values) => values.get(index).copied().map(Number::Int),
+				Vector::I32(values) => {
+					values.get(index).copied().map(|value| Number::Int(i64::from(value)))
+				}
+				Vector::I16(values) => {
+					values.get(index).copied().map(|value| Number::Int(i64::from(value)))
+				}
+				Vector::I8(values) => {
+					values.get(index).copied().map(|value| Number::Int(i64::from(value)))
+				}
+				Vector::U8(values) => {
+					values.get(index).copied().map(|value| Number::Int(i64::from(value)))
+				}
+			};
+			value
+				.map(Value::Number)
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("Vector index is out of bounds."))
+		}
 		(Value::Object(values), Value::String(key)) => {
 			Ok(values.get(key.as_str()).cloned().unwrap_or(Value::None))
 		}

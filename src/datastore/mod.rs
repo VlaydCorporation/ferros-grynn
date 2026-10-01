@@ -32,9 +32,12 @@ mod schema;
 mod session;
 /// In-memory database owner and commit serialization.
 mod store;
+/// Shared durable-analyzer execution used by scans and index builders.
+mod text_analyzer;
 /// Snapshot-isolated reads, mutations, and commit validation.
 mod transaction;
-
+/// Exact vector-distance oracle used by scans and ANN reranking.
+mod vector_distance;
 pub(crate) use atom_store::{AtomStoreRoot, BaseAtom, GlobalAtomId};
 pub(crate) use backend::{StoreBackend, StoreInner, validate_local_options};
 pub(crate) use conflict::ConflictKey;
@@ -89,7 +92,12 @@ pub use options::{
 };
 pub(crate) use root::{DatabaseRoot, InvariantViolationReport};
 pub use runtime_status::LocalStorageStatus;
+pub(crate) use schema::ClassIndexOptions;
 pub use schema::{
+	AnalyzerFilter,
+	AnalyzerId,
+	AnalyzerLanguage,
+	AnalyzerTokenizer,
 	ClassField,
 	ClassId,
 	ClassIndex,
@@ -97,12 +105,16 @@ pub use schema::{
 	ClassIndexState,
 	ClassSchema,
 	ClassSchemaMode,
+	DiskAnnIndexOptions,
+	FulltextIndexOptions,
 	FunctionEffect,
 	FunctionId,
 	GraphSchema,
+	HnswIndexOptions,
 	IndexId,
 	IndexMaintenanceMode,
 	IndexScope,
+	SchemaAnalyzer,
 	SchemaCatalog,
 	SchemaFunction,
 	SchemaFunctionParameter,
@@ -111,10 +123,12 @@ pub use schema::{
 	SchemaVersion,
 	SystemIndex,
 	SystemIndexKind,
+	VectorDistance,
 };
 pub use session::GqlSession;
 pub(crate) use session::validate_control_structure;
 pub use store::Datastore;
+pub(crate) use text_analyzer::{AnalyzedToken, analyze_builtin, analyze_function_result};
 pub use transaction::{AtomSnapshot, CommitResult, Transaction, TransactionGraphView};
 pub(crate) use transaction::{
 	QuerySnapshot,
@@ -126,3 +140,4 @@ pub(crate) use transaction::{
 	ScalarIndexWindow,
 	TransactionSavepoint,
 };
+pub(crate) use vector_distance::{exact_vector_distance, validate_ann_vector};

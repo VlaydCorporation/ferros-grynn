@@ -241,6 +241,178 @@ fn durable_parameters_support_ddl_precedence_and_transaction_rollback() -> Ferro
 }
 
 #[test]
+fn durable_analyzers_support_inline_mapper_alter_info_and_rollback() -> FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let defined = store.execute(
+		"DEFINE ANALYZER english TOKENIZERS blank, punct FILTERS lowercase, mapper({driven: \
+		 'drive', stop_word: null}) COMMENT 'base';",
+		&Object::new(),
+	)?;
+	if let Some(error) = defined.iter().find_map(|result| result.result.as_ref().err()) {
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"analyzer definition failed: {error}"
+		)));
+	}
+	let info_result = store.execute("INFO FOR ANALYZER english;", &Object::new())?;
+	let info =
+		info_result[0].result.as_ref().map_err(Clone::clone)?.value().as_object().ok_or_else(
+			|| FerrosGrynnError::invalid_argument("INFO FOR ANALYZER returned no object"),
+		)?;
+	if info.get("comment") != Some(&Value::from("base")) {
+		return Err(FerrosGrynnError::invalid_argument("analyzer comment was not retained"));
+	}
+	let before = store
+		.schema_catalog()
+		.analyzer("english")
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("analyzer was not published"))?;
+	let altered = store.execute(
+		"ALTER ANALYZER english DROP TOKENIZERS FILTERS nfkc COMMENT 'changed';",
+		&Object::new(),
+	)?;
+	if altered[0].result.is_err() {
+		return Err(FerrosGrynnError::invalid_argument("ALTER ANALYZER failed"));
+	}
+	let after = store
+		.schema_catalog()
+		.analyzer("english")
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("altered analyzer disappeared"))?;
+	if before.id() != after.id()
+		|| before.version() >= after.version()
+		|| after.tokenizers().len() != 0
+		|| after.comment().is_none_or(|comment| comment.as_str() != "changed")
+	{
+		return Err(FerrosGrynnError::invalid_argument(
+			"ALTER ANALYZER did not preserve identity and replace the definition",
+		));
+	}
+
+	let mut transaction = store.begin();
+	let changed =
+		transaction.execute("ALTER ANALYZER english COMMENT 'rolled-back';", &Object::new())?;
+	if changed[0].result.is_err() {
+		return Err(FerrosGrynnError::invalid_argument("transactional ALTER ANALYZER failed"));
+	}
+	drop(transaction);
+	let visible = store
+		.schema_catalog()
+		.analyzer("english")
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("analyzer disappeared after rollback"))?;
+	if visible.comment().is_none_or(|comment| comment.as_str() != "changed") {
+		return Err(FerrosGrynnError::invalid_argument(
+			"rolled-back analyzer change became visible",
+		));
+	}
+
+	let invalid =
+		store.execute("DEFINE ANALYZER bad FILTERS mapper('dictionary.txt');", &Object::new())?;
+	assert!(invalid[0].result.is_err());
+	let removed = store.execute("REMOVE ANALYZER english;", &Object::new())?;
+	assert!(removed[0].result.is_ok());
+	assert!(store.schema_catalog().analyzer("english").is_none());
+	Ok(())
+}
+
+#[test]
+fn search_analyze_executes_builtin_and_span_aware_function_pipelines() -> FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let defined = store.execute(
+		"DEFINE ANALYZER words TOKENIZERS blank, punct FILTERS lowercase;",
+		&Object::new(),
+	)?;
+	assert!(defined[0].result.is_ok());
+	let results =
+		store.execute("RETURN search::analyze('words', 'Hello World!');", &Object::new())?;
+	assert_eq!(
+		results[0].result.as_ref().map_err(Clone::clone)?.value(),
+		&Value::Array(crate::values::Array::from_iter([
+			Value::from("hello"),
+			Value::from("world"),
+			Value::from("!"),
+		])),
+	);
+
+	let function_results = store.execute(
+		"DEFINE PURE FUNCTION fn::whole(value: string) -> array<object> { RETURN [{term: $value, \
+		 start: 0, end: string::len($value)}]; }; DEFINE ANALYZER whole FUNCTION fn::whole \
+		 FILTERS uppercase; RETURN search::analyze('whole', 'граф');",
+		&Object::new(),
+	)?;
+	if function_results.iter().any(|result| result.result.is_err()) {
+		return Err(FerrosGrynnError::invalid_argument(
+			"function-backed search::analyze pipeline failed",
+		));
+	}
+	assert_eq!(
+		function_results[2].result.as_ref().map_err(Clone::clone)?.value(),
+		&Value::Array(crate::values::Array::from_iter([Value::from("ГРАФ")])),
+	);
+	for invalid in [
+		"DEFINE STABLE FUNCTION fn::stable_tokens(value: string) -> array<object> { RETURN \
+		 [{term: $value, start: 0, end: string::len($value)}]; }; DEFINE ANALYZER invalid_effect \
+		 FUNCTION fn::stable_tokens;",
+		"DEFINE PURE FUNCTION fn::wrong_tokens(value: string) -> string { RETURN $value; }; \
+		 DEFINE ANALYZER invalid_signature FUNCTION fn::wrong_tokens;",
+	] {
+		let results = store.execute(invalid, &Object::new())?;
+		assert!(results[0].result.is_ok());
+		assert!(results[1].result.is_err());
+	}
+	Ok(())
+}
+
+#[test]
+fn specialized_index_definitions_publish_checked_options() -> FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let results = store.execute(
+		"DEFINE ANALYZER english TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document TYPE \
+		 NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD \
+		 embedding ON CLASS document TYPE vector<f32>; DEFINE FIELD compact ON CLASS document \
+		 TYPE vector<f16>; DEFINE INDEX title_search ON CLASS document FIELDS title FULLTEXT \
+		 ANALYZER english BM25(1.4, 0.6) HIGHLIGHTS SCOPE BASE DEFER; DEFINE INDEX embedding_hnsw \
+		 ON CLASS document FIELDS embedding HNSW DIMENSION 128 TYPE F32 DIST COSINE EFC 180 M 16 \
+		 SCOPE BASE; DEFINE INDEX compact_disk ON CLASS document FIELDS compact DISKANN DIMENSION \
+		 768 TYPE F16 DIST COSINE_NORMALIZED DEGREE 48 L_BUILD 120 ALPHA 1.3 HASHED_VECTOR SCOPE \
+		 BASE CONCURRENTLY;",
+		&Object::new(),
+	)?;
+	if let Some(error) = results.iter().find_map(|result| result.result.as_ref().err()) {
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"specialized index definition failed: {error}"
+		)));
+	}
+	let class = store
+		.schema_catalog()
+		.class("document")
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("document class is absent"))?;
+	let fulltext = class
+		.indexes()
+		.find(|index| index.name().as_str() == "title_search")
+		.and_then(crate::datastore::ClassIndex::fulltext_options)
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("Fulltext options are absent"))?;
+	assert_eq!(fulltext.k1(), 1.4);
+	assert_eq!(fulltext.b(), 0.6);
+	assert!(fulltext.highlights());
+	let hnsw = class
+		.indexes()
+		.find(|index| index.name().as_str() == "embedding_hnsw")
+		.and_then(crate::datastore::ClassIndex::hnsw_options)
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("HNSW options are absent"))?;
+	assert_eq!(hnsw.dimension().get(), 128);
+	assert_eq!(hnsw.m().get(), 16);
+	assert_eq!(hnsw.m0().get(), 32);
+	let disk_ann = class
+		.indexes()
+		.find(|index| index.name().as_str() == "compact_disk")
+		.and_then(crate::datastore::ClassIndex::disk_ann_options)
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("DiskANN options are absent"))?;
+	assert_eq!(disk_ann.dimension().get(), 768);
+	assert_eq!(disk_ann.degree().get(), 48);
+	assert_eq!(disk_ann.build_list_size().get(), 120);
+	assert!(disk_ann.hashed_vector());
+	Ok(())
+}
+
+#[test]
 fn durable_parameter_overwrite_preserves_identity_and_rejects_runtime_values() {
 	let store = Datastore::in_memory();
 	let first = store.execute("DEFINE PARAM $value VALUE 1;", &Object::new()).unwrap();

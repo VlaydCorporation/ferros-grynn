@@ -26,9 +26,11 @@ use std::{
 use adapter::TransactionRead;
 #[cfg(test)]
 pub(crate) use adapter::execute_parsed_transaction_with_bindings;
+pub(in crate::gql) use adapter::query_schema;
 pub(crate) use adapter::{analyze_parsed_transaction, execute_parsed_statement_with_bindings};
 pub use adapter::{execute_transaction, execute_transaction_with_options};
 use dml::{execute_dml, execute_graph_dml};
+pub(in crate::gql) use eval::invoke_logical_closure;
 use rust_decimal::Decimal;
 use schema::execute_schema;
 use select::execute_select;
@@ -1081,7 +1083,13 @@ fn query_expression_requires_read(expression: &TypedExpr) -> bool {
 		| TypedExprKind::NamedInvoke {
 			..
 		}
-		| TypedExprKind::Traversal(_) => true,
+		| TypedExprKind::Traversal(_)
+		| TypedExprKind::Fulltext {
+			..
+		}
+		| TypedExprKind::Knn {
+			..
+		} => true,
 		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
 			values.iter().any(query_expression_requires_read)
 		}

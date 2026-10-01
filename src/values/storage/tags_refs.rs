@@ -43,6 +43,9 @@ pub enum TypeTag {
 	AtomRef = 0x36,
 	GraphRef = 0x37,
 	QualifiedAtomRef = 0x38,
+	VectorF16 = 0x39,
+	VectorI8 = 0x3A,
+	VectorU8 = 0x3B,
 }
 
 impl TypeTag {

@@ -182,6 +182,9 @@ impl Transaction {
 					| Mutation::DefineFunction(_)
 					| Mutation::ReplaceFunction(_)
 					| Mutation::RemoveFunction(_)
+					| Mutation::DefineAnalyzer(_)
+					| Mutation::ReplaceAnalyzer(_)
+					| Mutation::RemoveAnalyzer(_)
 			)
 		}) && self.mutations.iter().any(|mutation| {
 			matches!(
@@ -193,14 +196,34 @@ impl Transaction {
 					| Mutation::DefineFunction(_)
 					| Mutation::ReplaceFunction(_)
 					| Mutation::RemoveFunction(_)
+					| Mutation::DefineAnalyzer(_)
+					| Mutation::ReplaceAnalyzer(_)
+					| Mutation::RemoveAnalyzer(_)
 			)
 		});
 		let dictionary_changed = self
 			.mutations
 			.iter()
 			.any(|mutation| matches!(mutation, Mutation::InternProperty { .. }));
-		store.inner.persist_root(&next, graph_catalog_only, dictionary_changed)?;
+		let dependency_indexes_changed = self.mutations.iter().any(|mutation| {
+			matches!(mutation, Mutation::ReplaceAnalyzer(_) | Mutation::ReplaceFunction(_))
+		});
+		let changed_records = self.index_delta_records(&current, &next, &remap);
+		let delta_eligible = self.mutations.iter().all(mutation_allows_physical_index_delta);
+		store.inner.persist_root(
+			&next,
+			Some(&current),
+			delta_eligible.then_some(&changed_records),
+			graph_catalog_only,
+			dictionary_changed,
+		)?;
 		*store.inner.current.write() = Arc::new(next);
+		if dependency_indexes_changed {
+			// The Stale catalog state is the correctness boundary. A ledger I/O
+			// failure may delay availability, but cannot expose an incompatible
+			// physical binding to query planning.
+			let _job = store.inner.maintenance.recover_stale_indexes(&store.inner);
+		}
 		for (class, index, version) in stale_indexes {
 			// Availability may lag when the durable job ledger itself is
 			// unavailable, but the published Stale state keeps query results
@@ -263,6 +286,26 @@ impl Transaction {
 			}
 		}
 		graphs
+	}
+
+	fn index_delta_records(
+		&self,
+		current: &DatabaseRoot,
+		next: &DatabaseRoot,
+		remap: &ReplayRemap,
+	) -> BTreeSet<crate::values::RecordId> {
+		self.writes
+			.keys()
+			.filter_map(|key| match remap.conflict(*key) {
+				ConflictKey::BaseAtom(global)
+				| ConflictKey::GraphMembership(_, global)
+				| ConflictKey::GraphOverlay(_, global) => current
+					.atom(global)
+					.or_else(|| next.atom(global))
+					.map(|atom| atom.record_id().clone()),
+				_ => None,
+			})
+			.collect()
 	}
 
 	fn validate_against(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
@@ -440,6 +483,9 @@ impl Transaction {
 				Mutation::DefineFunction(function) => {
 					root.install_function(function.clone(), published_at)?;
 				}
+				Mutation::DefineAnalyzer(analyzer) => {
+					root.install_analyzer(analyzer.clone(), published_at)?;
+				}
 				Mutation::DefineGraph(graph) => {
 					root.install_graph(graph.clone(), published_at)?;
 				}
@@ -451,6 +497,9 @@ impl Transaction {
 				}
 				Mutation::ReplaceFunction(function) => {
 					root.replace_function(function.clone(), published_at)?;
+				}
+				Mutation::ReplaceAnalyzer(analyzer) => {
+					root.replace_analyzer(analyzer.clone(), published_at)?;
 				}
 				Mutation::ReplaceGraph(graph) => {
 					root.replace_graph_schema(graph.clone(), published_at)?;
@@ -466,6 +515,9 @@ impl Transaction {
 				}
 				Mutation::RemoveFunction(function) => {
 					root.remove_function(*function)?;
+				}
+				Mutation::RemoveAnalyzer(analyzer) => {
+					root.remove_analyzer(*analyzer)?;
 				}
 				Mutation::RemoveGraph(graph) => {
 					root.remove_graph(*graph)?;
@@ -623,6 +675,26 @@ fn mutation_affects_explicit_indexes(mutation: &Mutation) -> bool {
 	matches!(
 		mutation,
 		Mutation::InstallBuiltGraphTree(_)
+			| Mutation::CreateAtom { .. }
+			| Mutation::SetBaseProperty { .. }
+			| Mutation::RemoveBaseProperty { .. }
+			| Mutation::DeleteAtom { .. }
+			| Mutation::AttachNode { .. }
+			| Mutation::AttachEdge { .. }
+			| Mutation::Detach { .. }
+			| Mutation::SetOverlay { .. }
+			| Mutation::HideProperty { .. }
+			| Mutation::ResetProperty { .. }
+			| Mutation::SetOccurrenceLabel { .. }
+			| Mutation::ReplaceOccurrenceState { .. }
+	)
+}
+
+fn mutation_allows_physical_index_delta(mutation: &Mutation) -> bool {
+	matches!(
+		mutation,
+		Mutation::InternProperty { .. }
+			| Mutation::ReplaceClass(_)
 			| Mutation::CreateAtom { .. }
 			| Mutation::SetBaseProperty { .. }
 			| Mutation::RemoveBaseProperty { .. }

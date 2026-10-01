@@ -5,6 +5,7 @@ mod checkpoint;
 mod cleanup;
 mod files;
 mod image;
+mod index_delta;
 mod layout;
 mod open;
 mod physical_index;
@@ -25,6 +26,7 @@ use std::{
 use parking_lot::Mutex;
 pub(crate) use physical_index::{
 	PhysicalIndexAtom,
+	PhysicalIndexDelta,
 	PhysicalIndexEntries,
 	PhysicalIndexRead,
 	PhysicalScalarGroup,
@@ -51,7 +53,13 @@ use self::{
 		stage_generation,
 		stage_import_catalog,
 	},
-	image::{build_generation, build_import_generation, prime_value_context},
+	image::{
+		build_generation,
+		build_import_generation,
+		build_streamed_generation_with_reuse,
+		prime_value_context,
+	},
+	index_delta::IndexReusePlan,
 	layout::{DATABASE_CATALOG_ROOT, FILE_CATALOG_ROOT, GenerationBindings, invalid},
 	open::{OpenedLocalState, open_local_state},
 	physical_index::{PhysicalIndexFile, bind_physical_indexes},
@@ -80,23 +88,27 @@ use super::{
 };
 use crate::{
 	datastore::{
+		AnalyzedToken,
 		CheckpointMode,
 		DatabaseRoot,
+		FunctionId,
 		IndexId,
 		LocalOptions,
 		LocalStorageStatus,
 		MaintenanceJobInfo,
+		SchemaAnalyzer,
+		SchemaVersion,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphId,
-	values::Uuid,
+	values::{RecordId, Uuid, Vector},
 };
 
 const JOB_CATALOG_PATH: &str = "admin/jobs.fgb";
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ImportFailurePoint {
+enum GenerationFailurePoint {
 	None,
 	AfterBuild,
 	AfterFileSync,
@@ -106,8 +118,8 @@ enum ImportFailurePoint {
 
 #[cfg(test)]
 thread_local! {
-	static IMPORT_FAILURE_POINT: std::cell::Cell<ImportFailurePoint> =
-		const { std::cell::Cell::new(ImportFailurePoint::None) };
+	static GENERATION_FAILURE_POINT: std::cell::Cell<GenerationFailurePoint> =
+		const { std::cell::Cell::new(GenerationFailurePoint::None) };
 }
 
 /// Physical bindings retained with one current catalog generation.
@@ -387,6 +399,16 @@ impl LocalStore {
 		&self,
 		database: &DatabaseRoot,
 		id: Uuid,
+		analyze_function: &mut dyn FnMut(
+			&SchemaAnalyzer,
+			&str,
+		) -> FerrosGrynnResult<Vec<AnalyzedToken>>,
+		distance_function: &mut dyn FnMut(
+			FunctionId,
+			SchemaVersion,
+			&Vector,
+			&Vector,
+		) -> FerrosGrynnResult<f64>,
 	) -> FerrosGrynnResult<()> {
 		let expected = format!("admin/quarantine/{id}.fgq");
 		if !self.state.lock().file_catalog.files.iter().any(|entry| {
@@ -395,7 +417,17 @@ impl LocalStore {
 		}) {
 			return Err(FerrosGrynnError::invalid_argument("quarantine identity does not exist"));
 		}
-		self.persist_generation(database, false, None, Some(id)).map(drop)?;
+		self.persist_generation(
+			database,
+			None,
+			None,
+			false,
+			None,
+			Some(id),
+			analyze_function,
+			distance_function,
+		)
+		.map(drop)?;
 		// The catalog publication is authoritative. A reader may still pin the
 		// file on Windows; startup orphan cleanup retries physical removal.
 		drop(fs::remove_file(quarantine_path(&self.root, id)));
@@ -426,13 +458,35 @@ impl LocalStore {
 	pub(crate) fn persist_root(
 		&self,
 		database: &DatabaseRoot,
+		previous: Option<&DatabaseRoot>,
+		changed_records: Option<&std::collections::BTreeSet<RecordId>>,
 		graph_catalog_only: bool,
 		dictionary_changed: bool,
+		analyze_function: &mut dyn FnMut(
+			&SchemaAnalyzer,
+			&str,
+		) -> FerrosGrynnResult<Vec<AnalyzedToken>>,
+		distance_function: &mut dyn FnMut(
+			FunctionId,
+			SchemaVersion,
+			&Vector,
+			&Vector,
+		) -> FerrosGrynnResult<f64>,
 	) -> FerrosGrynnResult<()> {
 		if graph_catalog_only {
 			self.persist_graph_catalog(database, dictionary_changed)
 		} else {
-			self.persist_generation(database, false, None, None).map(drop)
+			self.persist_generation(
+				database,
+				previous,
+				changed_records,
+				false,
+				None,
+				None,
+				analyze_function,
+				distance_function,
+			)
+			.map(drop)
 		}
 	}
 
@@ -469,6 +523,7 @@ impl LocalStore {
 			state._database_catalog.atom_store,
 			&state.bindings.graphs,
 			&state.bindings.physical_indexes,
+			&state.bindings.physical_deltas,
 			&mut context,
 		)?;
 		let mut next_atom_superblock = state.atom_superblock;
@@ -529,17 +584,54 @@ impl LocalStore {
 		&self,
 		database: &DatabaseRoot,
 		quarantine: Option<&mut QuarantineArtifact>,
+		analyze_function: &mut dyn FnMut(
+			&SchemaAnalyzer,
+			&str,
+		) -> FerrosGrynnResult<Vec<AnalyzedToken>>,
+		distance_function: &mut dyn FnMut(
+			FunctionId,
+			SchemaVersion,
+			&Vector,
+			&Vector,
+		) -> FerrosGrynnResult<f64>,
 	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
-		self.persist_generation(database, true, quarantine, None)
+		self.persist_generation(
+			database,
+			None,
+			None,
+			true,
+			quarantine,
+			None,
+			analyze_function,
+			distance_function,
+		)
 	}
 
 	fn persist_generation(
 		&self,
 		database: &DatabaseRoot,
+		previous: Option<&DatabaseRoot>,
+		changed_records: Option<&std::collections::BTreeSet<RecordId>>,
 		import: bool,
 		mut quarantine: Option<&mut QuarantineArtifact>,
 		removed_quarantine: Option<Uuid>,
+		analyze_function: &mut dyn FnMut(
+			&SchemaAnalyzer,
+			&str,
+		) -> FerrosGrynnResult<Vec<AnalyzedToken>>,
+		distance_function: &mut dyn FnMut(
+			FunctionId,
+			SchemaVersion,
+			&Vector,
+			&Vector,
+		) -> FerrosGrynnResult<f64>,
 	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
+		let reuse = match (previous, changed_records, import) {
+			(Some(previous), Some(changed), false) => {
+				self.prepare_index_reuse(previous, database, changed, analyze_function)?
+			}
+			_ => IndexReusePlan::default(),
+		};
 		let mut state = self.state.lock();
 		self.checkpoint_if_due(&mut state)?;
 		let expected = self
@@ -557,10 +649,20 @@ impl LocalStore {
 				database,
 				state.file_catalog.next_file_instance_id,
 				&self.root,
+				analyze_function,
+				distance_function,
 			)?;
 			(generation, Some(unpublished))
 		} else {
-			(build_generation(database, state.file_catalog.next_file_instance_id)?, None)
+			let (generation, unpublished) = build_streamed_generation_with_reuse(
+				database,
+				state.file_catalog.next_file_instance_id,
+				&self.root,
+				reuse,
+				analyze_function,
+				distance_function,
+			)?;
+			(generation, Some(unpublished))
 		};
 		generation.update_quarantines(
 			&state.file_catalog,
@@ -568,9 +670,7 @@ impl LocalStore {
 			removed_quarantine,
 		)?;
 		#[cfg(test)]
-		if import {
-			inject_import_failure(ImportFailurePoint::AfterBuild)?;
-		}
+		inject_generation_failure(GenerationFailurePoint::AfterBuild)?;
 		if import {
 			create_import_generation_files(&self.root, &generation)?;
 		} else {
@@ -580,9 +680,7 @@ impl LocalStore {
 			artifact.install(&self.root)?;
 		}
 		#[cfg(test)]
-		if import {
-			inject_import_failure(ImportFailurePoint::AfterFileSync)?;
-		}
+		inject_generation_failure(GenerationFailurePoint::AfterFileSync)?;
 		let registry = FileRegistry::open(
 			generation.file_catalog.registrations(&self.root),
 			self.io.file_open_mode(),
@@ -602,9 +700,9 @@ impl LocalStore {
 			stage_generation(&mut tx, &generation)?;
 		}
 		#[cfg(test)]
-		if import {
-			inject_import_failure(ImportFailurePoint::AfterCatalogStage)?;
-			inject_import_failure(ImportFailurePoint::BeforeWalCommit)?;
+		{
+			inject_generation_failure(GenerationFailurePoint::AfterCatalogStage)?;
+			inject_generation_failure(GenerationFailurePoint::BeforeWalCommit)?;
 		}
 		let outcome = self.wal.commit_tx(tx)?;
 		if let Some(generation) = &mut unpublished {
@@ -668,10 +766,10 @@ fn sweep_retired_generations(state: &mut LocalState) {
 }
 
 #[cfg(test)]
-fn inject_import_failure(point: ImportFailurePoint) -> FerrosGrynnResult<()> {
-	IMPORT_FAILURE_POINT.with(|selected| {
+fn inject_generation_failure(point: GenerationFailurePoint) -> FerrosGrynnResult<()> {
+	GENERATION_FAILURE_POINT.with(|selected| {
 		if selected.get() == point {
-			Err(FerrosGrynnError::storage_io_failure("injected import publication failure"))
+			Err(FerrosGrynnError::storage_io_failure("injected generation publication failure"))
 		} else {
 			Ok(())
 		}

@@ -70,9 +70,12 @@ pub use r#return::ReturnStatement;
 pub use schema::{
 	AlterStatement,
 	AlterTarget,
+	AnalyzerFilterName,
+	AnalyzerTokenizerName,
 	BasicIndexDefinition,
 	ClassKindName,
 	ClassSchemaModeName,
+	DefineAnalyzerStatement,
 	DefineClassStatement,
 	DefineFieldStatement,
 	DefineFunctionStatement,
@@ -89,6 +92,8 @@ pub use schema::{
 	ParameterCommentChange,
 	RemoveStatement,
 	RemoveTarget,
+	VectorDistanceName,
+	VectorElementName,
 };
 pub use select::{
 	RecordKey,
@@ -171,6 +176,7 @@ pub enum StatementKind {
 	DefineGraph(DefineGraphStatement),
 	DefineClass(DefineClassStatement),
 	DefineField(DefineFieldStatement),
+	DefineAnalyzer(DefineAnalyzerStatement),
 	DefineFunction(DefineFunctionStatement),
 	DefineIndex(DefineIndexStatement),
 	DefineParameter(DefineParameterStatement),

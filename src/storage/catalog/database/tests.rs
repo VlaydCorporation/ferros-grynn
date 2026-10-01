@@ -1,19 +1,34 @@
-use std::collections::BTreeMap;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	num::NonZeroU16,
+};
 
 use super::*;
 use crate::{
 	datastore::{
+		AnalyzerId,
+		AnalyzerTokenizer,
 		ClassIndexKind,
+		ClassIndexOptions,
 		ClassIndexState,
 		ClassSchemaMode,
+		DiskAnnIndexOptions,
+		FulltextIndexOptions,
 		FunctionEffect,
 		FunctionId,
+		HnswIndexOptions,
 		IndexScope,
+		VectorDistance,
 	},
 	gql_status::FerrosGrynnResult,
 	graph::{AtomId, AtomKind, GraphKind, GraphTopologyConstraints},
 	storage::types::{DataFileId, DataFileKind},
-	values::{PropertyKeyId, Type},
+	values::{
+		PropertyKeyId,
+		Type,
+		VectorKind,
+		storage::{StorageValue, codec::CanonicalCodec},
+	},
 };
 
 #[test]
@@ -23,6 +38,110 @@ fn fgdc_v10_round_trips_recursive_types_bindings_and_graph_properties() -> Ferro
 	assert_eq!(&bytes[..4], b"FGDC");
 	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 10);
 	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	Ok(())
+}
+
+#[test]
+fn fgdc_v10_round_trips_fulltext_hnsw_and_disk_ann_payloads() -> FerrosGrynnResult<()> {
+	let mut catalog = fixture()?;
+	let class = &mut catalog.classes[0];
+	class.fields.extend([
+		ClassFieldCatalogEntry {
+			id: SchemaId::new(9).ok_or_else(|| codec::invalid("invalid title field"))?,
+			version: SchemaVersion::INITIAL,
+			name: "title".into(),
+			value_type: Type::String,
+			property_key: PropertyKeyId::new(1),
+		},
+		ClassFieldCatalogEntry {
+			id: SchemaId::new(10).ok_or_else(|| codec::invalid("invalid vector field"))?,
+			version: SchemaVersion::INITIAL,
+			name: "embedding".into(),
+			value_type: Type::Vector(VectorKind::F32),
+			property_key: PropertyKeyId::new(2),
+		},
+		ClassFieldCatalogEntry {
+			id: SchemaId::new(11).ok_or_else(|| codec::invalid("invalid compact field"))?,
+			version: SchemaVersion::INITIAL,
+			name: "compact".into(),
+			value_type: Type::Vector(VectorKind::F16),
+			property_key: PropertyKeyId::new(3),
+		},
+	]);
+	let binding = |instance| -> FerrosGrynnResult<PhysicalIndexBinding> {
+		Ok(PhysicalIndexBinding {
+			file_id: DataFileId::new(instance, DataFileKind::Index)
+				.ok_or_else(|| codec::invalid("invalid specialized fixture file"))?,
+			root: crate::storage::page::PageNo::new(0),
+		})
+	};
+	class.indexes.extend([
+		ClassIndexCatalogEntry {
+			id: IndexId::new(12).ok_or_else(|| codec::invalid("invalid Fulltext index"))?,
+			version: SchemaVersion::INITIAL,
+			name: "title_search".into(),
+			kind: ClassIndexKind::Fulltext,
+			state: ClassIndexState::Ready,
+			maintenance: crate::datastore::IndexMaintenanceMode::Immediate,
+			build_revision: 3,
+			scope: IndexScope::Base,
+			fields: vec![PropertyKeyId::new(1)],
+			options: ClassIndexOptions::Fulltext(FulltextIndexOptions::new(
+				AnalyzerId::new(8).ok_or_else(|| codec::invalid("invalid analyzer"))?,
+				SchemaVersion::INITIAL,
+				1.4,
+				0.6,
+				true,
+			)?),
+			physical: Some(binding(6)?),
+			delta: Some(binding(7)?),
+		},
+		ClassIndexCatalogEntry {
+			id: IndexId::new(13).ok_or_else(|| codec::invalid("invalid HNSW index"))?,
+			version: SchemaVersion::INITIAL,
+			name: "embedding_hnsw".into(),
+			kind: ClassIndexKind::Hnsw,
+			state: ClassIndexState::Ready,
+			maintenance: crate::datastore::IndexMaintenanceMode::Immediate,
+			build_revision: 3,
+			scope: IndexScope::Base,
+			fields: vec![PropertyKeyId::new(2)],
+			options: ClassIndexOptions::Hnsw(HnswIndexOptions::new(
+				VectorKind::F32,
+				NonZeroU16::new(128).ok_or_else(|| codec::invalid("invalid dimension"))?,
+				VectorDistance::Cosine,
+				NonZeroU16::new(16).ok_or_else(|| codec::invalid("invalid M"))?,
+				NonZeroU16::new(180).ok_or_else(|| codec::invalid("invalid EFC"))?,
+			)?),
+			physical: Some(binding(8)?),
+			delta: Some(binding(9)?),
+		},
+		ClassIndexCatalogEntry {
+			id: IndexId::new(14).ok_or_else(|| codec::invalid("invalid DiskANN index"))?,
+			version: SchemaVersion::INITIAL,
+			name: "compact_disk".into(),
+			kind: ClassIndexKind::DiskAnn,
+			state: ClassIndexState::Ready,
+			maintenance: crate::datastore::IndexMaintenanceMode::Deferred,
+			build_revision: 3,
+			scope: IndexScope::Base,
+			fields: vec![PropertyKeyId::new(3)],
+			options: ClassIndexOptions::DiskAnn(DiskAnnIndexOptions::new(
+				VectorKind::F16,
+				NonZeroU16::new(768).ok_or_else(|| codec::invalid("invalid dimension"))?,
+				VectorDistance::CosineNormalized,
+				NonZeroU16::new(48).ok_or_else(|| codec::invalid("invalid degree"))?,
+				NonZeroU16::new(120).ok_or_else(|| codec::invalid("invalid build list"))?,
+				1.3,
+				true,
+			)?),
+			physical: Some(binding(10)?),
+			delta: Some(binding(11)?),
+		},
+	]);
+	catalog.next_schema_id = 15;
+	let decoded = DatabaseCatalog::decode(&catalog.encode()?)?;
+	assert_eq!(decoded, catalog);
 	Ok(())
 }
 
@@ -146,7 +265,7 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 	};
 	Ok(DatabaseCatalog {
 		next_graph_id: 8,
-		next_schema_id: 8,
+		next_schema_id: 9,
 		time_zones: vec!["Europe/London".into()],
 		atom_store: AtomStoreCatalogBinding {
 			generation: 11,
@@ -177,7 +296,9 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 				build_revision: 1,
 				scope: IndexScope::Base,
 				fields: vec![PropertyKeyId::new(0)],
+				options: crate::datastore::ClassIndexOptions::Scalar,
 				physical: Some(index(3)?),
+				delta: None,
 			}],
 		}],
 		graphs: vec![GraphCatalogEntry {
@@ -234,6 +355,25 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 			body: "{ RETURN $value + 1; }".into(),
 			comment: Some("fixture function".into()),
 		}],
+		analyzers: vec![AnalyzerCatalogEntry {
+			id: AnalyzerId::new(8).ok_or_else(|| codec::invalid("invalid fixture analyzer"))?,
+			version: SchemaVersion::INITIAL,
+			published_at: 1,
+			name: "english".into(),
+			tokenizers: BTreeSet::from([AnalyzerTokenizer::Blank, AnalyzerTokenizer::Punct]),
+			filters: vec![
+				AnalyzerFilterCatalogEntry::Lowercase,
+				AnalyzerFilterCatalogEntry::Mapper(CanonicalCodec::encode(
+					StorageValue::Object(vec![(
+						PropertyKeyId::new(0),
+						StorageValue::String("drive".into()),
+					)])
+					.as_ref(),
+				)?),
+			],
+			function: None,
+			comment: Some("fixture analyzer".into()),
+		}],
 	})
 }
 
@@ -244,7 +384,7 @@ fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 	let owner_a = AtomId::from_parts(AtomKind::Node, 0, 0)?;
 	let owner_b = AtomId::from_parts(AtomKind::Node, 1, 0)?;
 	catalog.next_graph_id = 9;
-	catalog.next_schema_id = 10;
+	catalog.next_schema_id = 11;
 	catalog.graphs[0].arena.graph_by_slot.extend([(1, child), (2, child)]);
 	catalog.graphs[0]
 		.arena
@@ -260,11 +400,11 @@ fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 		storage_mode: GraphStorageMode::DiskBacked,
 		topology_constraints: GraphTopologyConstraints::empty(),
 		label_index: (
-			IndexId::new(8).ok_or_else(|| codec::invalid("invalid label index"))?,
+			IndexId::new(9).ok_or_else(|| codec::invalid("invalid label index"))?,
 			SchemaVersion::INITIAL,
 		),
 		adjacency_index: (
-			IndexId::new(9).ok_or_else(|| codec::invalid("invalid adjacency index"))?,
+			IndexId::new(10).ok_or_else(|| codec::invalid("invalid adjacency index"))?,
 			SchemaVersion::INITIAL,
 		),
 		membership: PhysicalIndexBinding {

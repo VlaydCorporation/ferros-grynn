@@ -2,12 +2,28 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{DatabaseCatalog, PhysicalIndexBinding, codec::invalid};
+use super::{AnalyzerFilterCatalogEntry, DatabaseCatalog, PhysicalIndexBinding, codec::invalid};
 use crate::{
-	datastore::{ClassIndexKind, ClassIndexState, IndexMaintenanceMode, IndexScope, SchemaId},
+	datastore::{
+		ClassIndexKind,
+		ClassIndexOptions,
+		ClassIndexState,
+		FunctionEffect,
+		IndexMaintenanceMode,
+		IndexScope,
+		SchemaId,
+		VectorDistance,
+	},
 	gql_status::FerrosGrynnResult,
 	graph::{GraphKind, GraphStorageMode},
 	storage::{page::PageNo, types::DataFileKind},
+	values::{
+		Type,
+		storage::{
+			StorageValue,
+			codec::{CanonicalCodec, DecodeLimits},
+		},
+	},
 };
 
 pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
@@ -33,6 +49,16 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 	let graph_by_id =
 		catalog.graphs.iter().map(|graph| (graph.id, graph)).collect::<BTreeMap<_, _>>();
 	let graph_ids = graph_by_id.keys().copied().collect::<BTreeSet<_>>();
+	let analyzer_by_id = catalog
+		.analyzers
+		.iter()
+		.map(|analyzer| (analyzer.id, analyzer))
+		.collect::<BTreeMap<_, _>>();
+	let function_by_id = catalog
+		.functions
+		.iter()
+		.map(|function| (function.id, function))
+		.collect::<BTreeMap<_, _>>();
 	let mut schema_ids = BTreeSet::new();
 	let mut class_ids = BTreeSet::new();
 	let mut class_names = BTreeSet::new();
@@ -81,7 +107,35 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 				ClassIndexKind::Standard | ClassIndexKind::Unique if index.fields.is_empty() => {
 					return Err(invalid("scalar index contains no fields"));
 				}
+				ClassIndexKind::Fulltext | ClassIndexKind::Hnsw | ClassIndexKind::DiskAnn
+					if index.fields.len() != 1 =>
+				{
+					return Err(invalid("specialized index must contain exactly one field"));
+				}
 				_ => {}
+			}
+			match (index.kind, index.options) {
+				(
+					ClassIndexKind::Standard | ClassIndexKind::Unique | ClassIndexKind::Count,
+					ClassIndexOptions::Scalar,
+				) => {}
+				(ClassIndexKind::Fulltext, ClassIndexOptions::Fulltext(options)) => {
+					let analyzer = analyzer_by_id
+						.get(&options.analyzer())
+						.ok_or_else(|| invalid("Fulltext index references an absent analyzer"))?;
+					if analyzer.version != options.analyzer_version() {
+						return Err(invalid("Fulltext analyzer version is stale"));
+					}
+				}
+				(ClassIndexKind::Hnsw, ClassIndexOptions::Hnsw(options)) => {
+					validate_custom_distance(options.distance(), &function_by_id)?;
+				}
+				(ClassIndexKind::DiskAnn, ClassIndexOptions::DiskAnn(options)) => {
+					if matches!(options.distance(), VectorDistance::Custom { .. }) {
+						return Err(invalid("DiskANN cannot use a custom distance"));
+					}
+				}
+				_ => return Err(invalid("index kind-specific options do not match its kind")),
 			}
 			if index.maintenance == IndexMaintenanceMode::Deferred
 				&& index.kind == ClassIndexKind::Unique
@@ -106,6 +160,9 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 				return Err(invalid("ready class index has no published build revision"));
 			}
 			if let Some(binding) = index.physical {
+				validate_binding(binding)?;
+			}
+			if let Some(binding) = index.delta {
 				validate_binding(binding)?;
 			}
 		}
@@ -242,6 +299,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 
 	let mut previous_function = None;
 	let mut function_signatures = BTreeSet::new();
+	let mut functions_by_id = BTreeMap::new();
 	for function in &catalog.functions {
 		insert_schema(&mut schema_ids, function.id.into(), catalog.next_schema_id)?;
 		if previous_function.is_some_and(|previous| previous >= function.id)
@@ -273,7 +331,90 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		if !function_signatures.insert(signature) {
 			return Err(invalid("function overload signature is duplicated"));
 		}
+		functions_by_id.insert(function.id, function);
 		previous_function = Some(function.id);
+	}
+
+	let mut previous_analyzer = None;
+	let mut analyzer_names = BTreeSet::new();
+	for analyzer in &catalog.analyzers {
+		insert_schema(&mut schema_ids, analyzer.id.into(), catalog.next_schema_id)?;
+		if previous_analyzer.is_some_and(|previous| previous >= analyzer.id)
+			|| analyzer.published_at == 0
+			|| analyzer.name.is_empty()
+			|| analyzer.name.as_str().contains('\0')
+			|| !analyzer_names.insert(analyzer.name.as_str())
+			|| analyzer.comment.as_ref().is_some_and(|comment| comment.as_str().contains('\0'))
+			|| (analyzer.function.is_some() && !analyzer.tokenizers.is_empty())
+		{
+			return Err(invalid("analyzer catalog identity or metadata is invalid"));
+		}
+		if let Some((id, version)) = analyzer.function {
+			let function = functions_by_id
+				.get(&id)
+				.ok_or_else(|| invalid("analyzer references an absent function"))?;
+			if function.version != version
+				|| function.effect != FunctionEffect::Pure
+				|| function.parameters.len() != 1
+				|| function.parameters[0].value_type != Type::String
+				|| function.result != Type::Array(Box::new(Type::Object))
+			{
+				return Err(invalid("analyzer function signature or version is invalid"));
+			}
+		}
+		for filter in &analyzer.filters {
+			match filter {
+				AnalyzerFilterCatalogEntry::EdgeNgram {
+					min,
+					max,
+				}
+				| AnalyzerFilterCatalogEntry::Ngram {
+					min,
+					max,
+				} if *min == 0 || min > max => {
+					return Err(invalid("analyzer n-gram bounds are invalid"));
+				}
+				AnalyzerFilterCatalogEntry::Mapper(bytes) => {
+					let value = CanonicalCodec::decode(bytes, DecodeLimits::default())?;
+					let StorageValue::Object(entries) = &*value.as_ref() else {
+						return Err(invalid("analyzer mapper is not a canonical object"));
+					};
+					if entries.iter().any(|(_key, value)| {
+						!matches!(value, StorageValue::String(term) if !term.is_empty() && !term.as_str().contains('\0'))
+							&& !matches!(value, StorageValue::Null)
+					}) {
+						return Err(invalid("analyzer mapper contains a non-string replacement"));
+					}
+				}
+				_ => {}
+			}
+		}
+		previous_analyzer = Some(analyzer.id);
+	}
+	Ok(())
+}
+
+fn validate_custom_distance(
+	distance: VectorDistance,
+	functions: &BTreeMap<crate::datastore::FunctionId, &super::FunctionCatalogEntry>,
+) -> FerrosGrynnResult<()> {
+	let VectorDistance::Custom {
+		function,
+		version,
+	} = distance
+	else {
+		return Ok(());
+	};
+	let definition = functions
+		.get(&function)
+		.ok_or_else(|| invalid("custom vector distance references an absent function"))?;
+	if definition.version != version
+		|| definition.effect != FunctionEffect::Pure
+		|| !definition.cost
+	{
+		return Err(invalid(
+			"custom vector distance requires its exact PURE COST function version",
+		));
 	}
 	Ok(())
 }

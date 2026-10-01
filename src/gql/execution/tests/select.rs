@@ -15,8 +15,82 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use crate::{
 	datastore::{Datastore, ImportOptions, InMemoryOptions},
 	gql::{QueryCancellation, QueryExecutionOptions},
-	values::{Object, PropertyMap, RecordId, Value},
+	values::{Object, PropertyMap, RecordId, Value, Vector},
 };
+
+#[test]
+fn fulltext_exact_scan_scores_and_highlights_snapshot_rows() {
+	let store = Datastore::in_memory();
+	let setup = store
+		.execute(
+			"DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document TYPE \
+			 NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE INDEX \
+			 title_search ON CLASS document FIELDS title FULLTEXT ANALYZER words BM25(1.2, 0.75) \
+			 HIGHLIGHTS SCOPE BASE; CREATE document:a SET title = 'Rust graph'; CREATE document:b \
+			 SET title = 'Rust storage'; CREATE document:c SET title = 'Graph only';",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+
+	let result = rows(value(
+		&store,
+		"SELECT id, search::score(7) AS score, search::highlight('[', ']', 7) AS snippet FROM \
+		 document WITH NOINDEX WHERE title @7@ 'rust' ORDER BY score DESC, id;",
+	));
+	assert_eq!(result.len(), 2);
+	assert_eq!(result[0].get("id"), Some(&Value::from("document:a".parse::<RecordId>().unwrap())));
+	assert_eq!(result[0].get("snippet"), Some(&Value::from("[Rust] graph")));
+	assert_eq!(result[1].get("id"), Some(&Value::from("document:b".parse::<RecordId>().unwrap())));
+	assert_eq!(result[1].get("snippet"), Some(&Value::from("[Rust] storage")));
+	assert!(matches!(result[0].get("score"), Some(Value::Number(_))));
+
+	let unknown_slot =
+		statement_error(&store, "SELECT search::score(8) FROM document WHERE title @7@ 'rust';");
+	assert!(unknown_slot.to_string().contains("unknown Fulltext slot 8"));
+}
+
+#[test]
+fn exact_knn_uses_bounded_top_k_and_stable_ties() {
+	let store = Datastore::in_memory();
+	store
+		.execute(
+			"DEFINE CLASS document TYPE NODE SCHEMAFULL; DEFINE FIELD embedding ON CLASS document \
+			 TYPE vector<f32>;",
+			&Object::new(),
+		)
+		.unwrap();
+	for (name, vector) in
+		[("a", vec![1.0_f32, 0.0]), ("b", vec![0.0_f32, 1.0]), ("c", vec![-1.0_f32, 0.0])]
+	{
+		let mut parameters = Object::new();
+		parameters.insert("vector", Value::Vector(Vector::F32(vector)));
+		let results = store
+			.execute(&format!("CREATE document:{name} SET embedding = $vector;"), &parameters)
+			.unwrap();
+		assert!(results[0].result.is_ok());
+	}
+	let mut parameters = Object::new();
+	parameters.insert("query", Value::Vector(Vector::F32(vec![1.0, 0.0])));
+	let results = store
+		.execute(
+			"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 2, COSINE |> $query;",
+			&parameters,
+		)
+		.unwrap();
+	let actual = results[0].result.as_ref().unwrap().value().clone();
+	assert_eq!(
+		actual,
+		Value::Array(
+			[
+				Value::from("document:a".parse::<RecordId>().unwrap()),
+				Value::from("document:b".parse::<RecordId>().unwrap()),
+			]
+			.into_iter()
+			.collect(),
+		),
+	);
+}
 
 fn value(store: &Datastore, source: &str) -> Value {
 	store.execute(source, &Object::new()).unwrap()[0].result.as_ref().unwrap().value().clone()

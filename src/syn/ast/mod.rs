@@ -52,6 +52,19 @@ pub enum ExprKind {
 		op: BinaryOperator,
 		right: Box<Expr>,
 	},
+	/// Fulltext predicate with an optional statement-local match slot.
+	Fulltext {
+		left: Box<Expr>,
+		op: FulltextOperator,
+		right: Box<Expr>,
+	},
+	/// Infix top-K vector predicate.
+	Knn {
+		left: Box<Expr>,
+		k: Box<Expr>,
+		search: Option<KnnSearchArgument>,
+		right: Box<Expr>,
+	},
 	Conditional {
 		condition: Box<Expr>,
 		then_value: Box<Expr>,
@@ -95,6 +108,43 @@ pub enum ExprKind {
 	},
 	/// Session-scoped language closure.
 	Closure(ClosureExpr),
+}
+
+/// Query-term combination encoded by one Fulltext operator token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FulltextOperator {
+	/// OR over analyzed terms without an observable match slot.
+	Any,
+	/// OR over analyzed terms with one explicit statement-local slot.
+	Slot(u16),
+	/// All distinct analyzed terms must occur.
+	All,
+	/// At least one analyzed term must occur.
+	AnyOf,
+}
+
+/// Optional search-control argument inside `<| ... |>`.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum KnnSearchArgument {
+	/// Exact or approximate distance contract.
+	Distance(KnnDistance),
+	/// Dynamic ANN candidate-list size.
+	Ef(Box<Expr>),
+}
+
+/// Parsed KNN distance before type and durable-index resolution.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum KnnDistance {
+	Euclidean,
+	Cosine,
+	Manhattan,
+	Minkowski(Box<Expr>),
+	InnerProduct,
+	CosineNormalized,
+	Custom(Box<Expr>),
 }
 
 /// One declared closure parameter.

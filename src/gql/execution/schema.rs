@@ -4,9 +4,13 @@ use super::{
 };
 use crate::{
 	datastore::{
+		AnalyzerFilter,
+		AnalyzerLanguage,
+		AnalyzerTokenizer,
 		ClassField,
 		ClassIndex,
 		ClassIndexKind,
+		ClassIndexOptions,
 		ClassIndexState,
 		ClassSchema,
 		ClassSchemaMode,
@@ -16,6 +20,7 @@ use crate::{
 		IndexScope,
 		MaintenanceJobInfo,
 		MaintenanceTarget,
+		SchemaAnalyzer,
 		SchemaFunction,
 		SchemaFunctionParameter,
 		SchemaParameter,
@@ -89,6 +94,7 @@ pub(super) fn execute_schema(
 			name,
 			kind,
 			fields,
+			options,
 			scope,
 			maintenance,
 			concurrently,
@@ -99,10 +105,15 @@ pub(super) fn execute_schema(
 			name,
 			*kind,
 			fields,
+			*options,
 			*scope,
 			*maintenance,
 			*concurrently,
 		),
+		LogicalSchemaStatement::DefineAnalyzer {
+			mode,
+			analyzer,
+		} => define_analyzer(transaction, *mode, analyzer),
 		LogicalSchemaStatement::DefineParameter {
 			mode,
 			name,
@@ -170,6 +181,10 @@ pub(super) fn execute_schema(
 			name,
 			signature,
 		} => remove_function(transaction, *if_exists, namespace, name, signature.as_deref()),
+		LogicalSchemaStatement::RemoveAnalyzer {
+			if_exists,
+			name,
+		} => remove_analyzer(transaction, *if_exists, name),
 		LogicalSchemaStatement::AlterClassMode {
 			if_exists,
 			name,
@@ -222,7 +237,26 @@ pub(super) fn execute_schema(
 			body.as_ref(),
 			comment.clone(),
 		),
+		LogicalSchemaStatement::AlterAnalyzer {
+			if_exists,
+			name,
+			function,
+			tokenizers,
+			filters,
+			comment,
+		} => alter_analyzer(
+			transaction,
+			*if_exists,
+			name,
+			*function,
+			tokenizers.as_deref(),
+			filters.as_deref(),
+			comment.clone(),
+		),
 		LogicalSchemaStatement::InfoDatabase => info_database(transaction),
+		LogicalSchemaStatement::InfoAnalyzer {
+			name,
+		} => info_analyzer(transaction, name),
 		LogicalSchemaStatement::InfoClass {
 			name,
 		} => info_class(transaction, name),
@@ -239,6 +273,75 @@ pub(super) fn execute_schema(
 			signature,
 		} => info_function(transaction, namespace, name, signature.as_deref()),
 	}
+}
+
+fn define_analyzer(
+	transaction: &mut Transaction,
+	mode: DefinitionMode,
+	analyzer: &SchemaAnalyzer,
+) -> FerrosGrynnResult<Value> {
+	if transaction.analyzer(analyzer.name().as_str())?.is_some() {
+		return match mode {
+			DefinitionMode::IfNotExists => Ok(Value::None),
+			DefinitionMode::Normal => Err(FerrosGrynnError::invalid_argument(format!(
+				"analyzer '{}' already exists",
+				analyzer.name()
+			))),
+			DefinitionMode::Overwrite => {
+				transaction.replace_analyzer(analyzer.name().as_str(), analyzer.clone())?;
+				Ok(Value::None)
+			}
+		};
+	}
+	transaction.define_analyzer(analyzer.clone())?;
+	Ok(Value::None)
+}
+
+fn remove_analyzer(
+	transaction: &mut Transaction,
+	if_exists: bool,
+	name: &str,
+) -> FerrosGrynnResult<Value> {
+	if transaction.analyzer(name)?.is_none() && if_exists {
+		return Ok(Value::None);
+	}
+	transaction.remove_analyzer(name)?;
+	Ok(Value::None)
+}
+
+fn alter_analyzer(
+	transaction: &mut Transaction,
+	if_exists: bool,
+	name: &str,
+	function: Option<Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion)>>,
+	tokenizers: Option<&[AnalyzerTokenizer]>,
+	filters: Option<&[AnalyzerFilter]>,
+	comment: Option<Option<crate::values::Text>>,
+) -> FerrosGrynnResult<Value> {
+	let Some(existing) = transaction.analyzer(name)? else {
+		if if_exists {
+			return Ok(Value::None);
+		}
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"analyzer '{name}' does not exist"
+		)));
+	};
+	let selected_tokenizers = tokenizers
+		.map(<[AnalyzerTokenizer]>::to_vec)
+		.unwrap_or_else(|| existing.tokenizers().collect());
+	let selected_filters = filters
+		.map(<[AnalyzerFilter]>::to_vec)
+		.unwrap_or_else(|| existing.filters().cloned().collect());
+	let selected_function = function.unwrap_or(existing.function());
+	let mut replacement = SchemaAnalyzer::new(name, selected_tokenizers, selected_filters)?;
+	if let Some((id, version)) = selected_function {
+		replacement = replacement.with_function(id, version)?;
+	}
+	if let Some(comment) = comment.unwrap_or_else(|| existing.comment().cloned()) {
+		replacement = replacement.with_comment(comment);
+	}
+	transaction.replace_analyzer(name, replacement)?;
+	Ok(Value::None)
 }
 
 #[allow(
@@ -483,6 +586,7 @@ fn define_index(
 	name: &str,
 	kind: ClassIndexKind,
 	fields: &[Box<str>],
+	options: ClassIndexOptions,
 	scope: IndexScope,
 	maintenance: IndexMaintenanceMode,
 	concurrently: bool,
@@ -492,8 +596,21 @@ fn define_index(
 	if mode == DefinitionMode::IfNotExists && exists {
 		return Ok(Value::None);
 	}
-	let mut index = ClassIndex::new(name, kind, scope, fields.iter().map(Box::as_ref))?
-		.with_maintenance_mode(maintenance)?;
+	let mut index = match options {
+		ClassIndexOptions::Scalar => {
+			ClassIndex::new(name, kind, scope, fields.iter().map(Box::as_ref))?
+		}
+		ClassIndexOptions::Fulltext(options) => {
+			ClassIndex::new_fulltext(name, scope, only_index_field(fields)?, options)?
+		}
+		ClassIndexOptions::Hnsw(options) => {
+			ClassIndex::new_hnsw(name, scope, only_index_field(fields)?, options)?
+		}
+		ClassIndexOptions::DiskAnn(options) => {
+			ClassIndex::new_disk_ann(name, scope, only_index_field(fields)?, options)?
+		}
+	}
+	.with_maintenance_mode(maintenance)?;
 	if concurrently {
 		index = index.with_state(ClassIndexState::Stale);
 	}
@@ -503,6 +620,15 @@ fn define_index(
 		transaction.define_index(class, index)?;
 	}
 	Ok(Value::None)
+}
+
+fn only_index_field(fields: &[Box<str>]) -> FerrosGrynnResult<&str> {
+	match fields {
+		[field] => Ok(field.as_ref()),
+		_ => Err(FerrosGrynnError::invalid_argument(
+			"a specialized index requires exactly one field",
+		)),
+	}
 }
 
 fn remove_graph(
@@ -710,6 +836,11 @@ fn require_class(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult
 }
 
 fn info_database(transaction: &mut Transaction) -> FerrosGrynnResult<Value> {
+	let analyzers = transaction
+		.analyzers()?
+		.into_iter()
+		.map(|analyzer| (analyzer.name().clone(), analyzer_info(&analyzer)))
+		.collect::<Object>();
 	let graphs = transaction
 		.graphs()?
 		.into_iter()
@@ -731,7 +862,7 @@ fn info_database(transaction: &mut Transaction) -> FerrosGrynnResult<Value> {
 		.map(|function| (function_info_key(&function), function_info(&function)))
 		.collect::<Object>();
 	Ok(Value::from(Object::from_iter([
-		("analyzers", Value::from(Object::new())),
+		("analyzers", Value::from(analyzers)),
 		("classes", Value::from(classes)),
 		("configs", Value::from(Object::new())),
 		("functions", Value::from(functions)),
@@ -739,6 +870,109 @@ fn info_database(transaction: &mut Transaction) -> FerrosGrynnResult<Value> {
 		("models", Value::from(Object::new())),
 		("params", Value::from(parameters)),
 	])))
+}
+
+fn info_analyzer(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Value> {
+	transaction.analyzer(name)?.map(|analyzer| analyzer_info(&analyzer)).ok_or_else(|| {
+		FerrosGrynnError::invalid_argument(format!("analyzer '{name}' does not exist"))
+	})
+}
+
+fn analyzer_info(analyzer: &SchemaAnalyzer) -> Value {
+	let tokenizers = analyzer
+		.tokenizers()
+		.map(|tokenizer| Value::from(analyzer_tokenizer_name(tokenizer)))
+		.collect::<Vec<_>>();
+	let filters = analyzer.filters().map(analyzer_filter_info).collect::<Vec<_>>();
+	let function = analyzer.function().map_or(Value::None, |(id, version)| {
+		Value::from(Object::from_iter([
+			("id", Value::from(u64::from(id.get()))),
+			("version", Value::from(u64::from(version.get()))),
+		]))
+	});
+	Value::from(Object::from_iter([
+		("comment", analyzer.comment().cloned().map_or(Value::None, Value::from)),
+		("filters", Value::from(filters)),
+		("function", function),
+		("id", analyzer.id().map_or(Value::None, |id| Value::from(u64::from(id.get())))),
+		("name", Value::from(analyzer.name().clone())),
+		("tokenizers", Value::from(tokenizers)),
+		("version", Value::from(u64::from(analyzer.version().get()))),
+	]))
+}
+
+const fn analyzer_tokenizer_name(tokenizer: AnalyzerTokenizer) -> &'static str {
+	match tokenizer {
+		AnalyzerTokenizer::Blank => "blank",
+		AnalyzerTokenizer::Camel => "camel",
+		AnalyzerTokenizer::Class => "class",
+		AnalyzerTokenizer::Punct => "punct",
+	}
+}
+
+fn analyzer_filter_info(filter: &AnalyzerFilter) -> Value {
+	match filter {
+		AnalyzerFilter::Nfc => Value::from("nfc"),
+		AnalyzerFilter::Nfkc => Value::from("nfkc"),
+		AnalyzerFilter::Ascii => Value::from("ascii"),
+		AnalyzerFilter::Lowercase => Value::from("lowercase"),
+		AnalyzerFilter::Uppercase => Value::from("uppercase"),
+		AnalyzerFilter::EdgeNgram {
+			min,
+			max,
+		} => Value::from(Object::from_iter([
+			("filter", Value::from("edgengram")),
+			("max", Value::from(u64::from(*max))),
+			("min", Value::from(u64::from(*min))),
+		])),
+		AnalyzerFilter::Ngram {
+			min,
+			max,
+		} => Value::from(Object::from_iter([
+			("filter", Value::from("ngram")),
+			("max", Value::from(u64::from(*max))),
+			("min", Value::from(u64::from(*min))),
+		])),
+		AnalyzerFilter::Snowball(language) => Value::from(Object::from_iter([
+			("filter", Value::from("snowball")),
+			("language", Value::from(analyzer_language_name(*language))),
+		])),
+		AnalyzerFilter::Mapper(entries) => {
+			let mapper = entries
+				.iter()
+				.map(|(source, target)| {
+					(source.clone(), target.clone().map_or(Value::Null, Value::from))
+				})
+				.collect::<Object>();
+			Value::from(Object::from_iter([
+				("filter", Value::from("mapper")),
+				("value", Value::from(mapper)),
+			]))
+		}
+	}
+}
+
+const fn analyzer_language_name(language: AnalyzerLanguage) -> &'static str {
+	match language {
+		AnalyzerLanguage::Arabic => "arabic",
+		AnalyzerLanguage::Danish => "danish",
+		AnalyzerLanguage::Dutch => "dutch",
+		AnalyzerLanguage::English => "english",
+		AnalyzerLanguage::Finnish => "finnish",
+		AnalyzerLanguage::French => "french",
+		AnalyzerLanguage::German => "german",
+		AnalyzerLanguage::Greek => "greek",
+		AnalyzerLanguage::Hungarian => "hungarian",
+		AnalyzerLanguage::Italian => "italian",
+		AnalyzerLanguage::Norwegian => "norwegian",
+		AnalyzerLanguage::Portuguese => "portuguese",
+		AnalyzerLanguage::Romanian => "romanian",
+		AnalyzerLanguage::Russian => "russian",
+		AnalyzerLanguage::Spanish => "spanish",
+		AnalyzerLanguage::Swedish => "swedish",
+		AnalyzerLanguage::Tamil => "tamil",
+		AnalyzerLanguage::Turkish => "turkish",
+	}
 }
 
 fn info_function(
@@ -946,6 +1180,25 @@ fn index_definition(class: &str, index: &ClassIndex, graphs: &[GraphSchema]) -> 
 			};
 			format!("FIELDS {}{unique}", fields.join(", "))
 		}
+		ClassIndexKind::Fulltext => {
+			let field = index
+				.fields()
+				.next()
+				.map_or("<missing>".to_owned(), |field| quote_name(field.as_str()));
+			let options = index.fulltext_options();
+			let analyzer = options.map_or(0, |options| options.analyzer().get());
+			let highlights = options.is_some_and(|options| options.highlights());
+			format!(
+				"FIELDS {field} FULLTEXT ANALYZER #{analyzer}{}",
+				if highlights {
+					" HIGHLIGHTS"
+				} else {
+					""
+				}
+			)
+		}
+		ClassIndexKind::Hnsw => "FIELDS <vector> HNSW".to_owned(),
+		ClassIndexKind::DiskAnn => "FIELDS <vector> DISKANN".to_owned(),
 	};
 	let scope = match index.scope() {
 		IndexScope::Base => "SCOPE BASE".to_owned(),

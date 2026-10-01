@@ -276,7 +276,7 @@ where
 }
 
 /// Creates, fills, syncs, and rereads one immutable side-file.
-fn write_streamed_file(
+pub(super) fn write_streamed_file(
 	database_root: &Path,
 	relative_path: &str,
 	build: impl FnOnce(&DirectFile) -> FerrosGrynnResult<StreamedIndex>,

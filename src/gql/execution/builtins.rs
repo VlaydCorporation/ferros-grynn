@@ -237,6 +237,13 @@ pub(super) fn execute(
 		Builtin::GraphInner | Builtin::GraphLevelPath => Err(FerrosGrynnError::invalid_argument(
 			"graph occurrence functions require the MATCH graph resolver",
 		)),
+		Builtin::SearchAnalyze {
+			..
+		}
+		| Builtin::SearchScore(_)
+		| Builtin::SearchHighlight(_) => Err(FerrosGrynnError::invalid_argument(
+			"search::analyze requires query execution context",
+		)),
 		Builtin::PathAtoms => {
 			let path = path(one(arguments)?, "path::atoms")?;
 			Ok(Value::Array(Array::new(path.atoms().cloned().map(Value::from).collect())))

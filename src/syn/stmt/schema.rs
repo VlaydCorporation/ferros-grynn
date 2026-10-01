@@ -61,13 +61,67 @@ pub struct DefineFieldStatement {
 	pub value_type: Option<TypeName>,
 }
 
-/// Basic class-index kind accepted by stage 8.1.
+/// Vector element type written in an ANN index definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VectorElementName {
+	F64,
+	F32,
+	F16,
+	I64,
+	I32,
+	I16,
+	I8,
+	U8,
+}
+
+/// Distance written in a durable ANN index definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VectorDistanceName {
+	Euclidean,
+	Cosine,
+	Manhattan,
+	Minkowski {
+		exponent_bits: u64,
+	},
+	InnerProduct,
+	CosineNormalized,
+	Function(FunctionSignatureName),
+}
+
+/// Class-index kind and kind-specific syntax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BasicIndexDefinition {
 	Standard(Vec<Identifier>),
 	Unique(Vec<Identifier>),
 	Count,
+	Fulltext {
+		field: Identifier,
+		analyzer: Identifier,
+		k1_bits: u64,
+		b_bits: u64,
+		highlights: bool,
+	},
+	Hnsw {
+		field: Identifier,
+		dimension: u16,
+		element: VectorElementName,
+		distance: VectorDistanceName,
+		ef_construction: u16,
+		m: u16,
+	},
+	DiskAnn {
+		field: Identifier,
+		dimension: u16,
+		element: VectorElementName,
+		distance: VectorDistanceName,
+		degree: u16,
+		build_list_size: u16,
+		alpha_bits: u32,
+		hashed_vector: bool,
+	},
 }
 
 /// Explicit logical scope of a class index.
@@ -100,6 +154,49 @@ pub struct DefineParameterStatement {
 	pub mode: DefinitionMode,
 	pub name: Identifier,
 	pub value: Expr,
+	pub comment: Option<Box<str>>,
+}
+
+/// Built-in tokenizer name in a durable analyzer definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AnalyzerTokenizerName {
+	Blank,
+	Camel,
+	Class,
+	Punct,
+}
+
+/// Ordered filter in a durable analyzer definition.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AnalyzerFilterName {
+	Nfc,
+	Nfkc,
+	Ascii,
+	Lowercase,
+	Uppercase,
+	EdgeNgram {
+		min: u16,
+		max: u16,
+	},
+	Ngram {
+		min: u16,
+		max: u16,
+	},
+	Snowball(Identifier),
+	Mapper(Expr),
+}
+
+/// Durable text-analyzer definition.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct DefineAnalyzerStatement {
+	pub mode: DefinitionMode,
+	pub name: Identifier,
+	pub function: Option<FunctionSignatureName>,
+	pub tokenizers: Vec<AnalyzerTokenizerName>,
+	pub filters: Vec<AnalyzerFilterName>,
 	pub comment: Option<Box<str>>,
 }
 
@@ -158,6 +255,10 @@ pub enum ParameterCommentChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RemoveTarget {
+	Analyzer {
+		if_exists: bool,
+		name: Identifier,
+	},
 	Function {
 		if_exists: bool,
 		signature: FunctionSignatureName,
@@ -197,6 +298,14 @@ pub struct RemoveStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AlterTarget {
+	Analyzer {
+		if_exists: bool,
+		name: Identifier,
+		function: Option<Option<FunctionSignatureName>>,
+		tokenizers: Option<Vec<AnalyzerTokenizerName>>,
+		filters: Option<Vec<AnalyzerFilterName>>,
+		comment: ParameterCommentChange,
+	},
 	Function {
 		if_exists: bool,
 		signature: FunctionSignatureName,
@@ -241,6 +350,7 @@ pub struct AlterStatement {
 #[non_exhaustive]
 pub enum InfoTarget {
 	Database,
+	Analyzer(Identifier),
 	Function(FunctionSignatureName),
 	Parameter(Identifier),
 	Job(Identifier),
@@ -338,6 +448,171 @@ impl Parser<'_> {
 			name,
 			value,
 			comment,
+		})
+	}
+
+	pub(in crate::syn) async fn define_analyzer_statement(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<DefineAnalyzerStatement> {
+		let mode = self.definition_mode()?;
+		let name = self.identifier()?;
+		let mut function = None;
+		let mut tokenizers = None;
+		let mut filters = None;
+		let mut comment = None;
+		while !self.at_statement_end() {
+			if self.consume_keyword(keywords::FUNCTION).is_some() {
+				if function.is_some() {
+					return Err(self.syntax(
+						"DEFINE ANALYZER FUNCTION may appear only once.",
+						self.previous_span(),
+					));
+				}
+				function = Some(self.analyzer_function_name()?);
+			} else if self.consume_keyword(keywords::TOKENIZERS).is_some() {
+				if tokenizers.is_some() {
+					return Err(self.syntax(
+						"DEFINE ANALYZER TOKENIZERS may appear only once.",
+						self.previous_span(),
+					));
+				}
+				tokenizers = Some(self.analyzer_tokenizers()?);
+			} else if self.consume_keyword(keywords::FILTERS).is_some() {
+				if filters.is_some() {
+					return Err(self.syntax(
+						"DEFINE ANALYZER FILTERS may appear only once.",
+						self.previous_span(),
+					));
+				}
+				filters = Some(context.run(|context| self.analyzer_filters(context)).await?);
+			} else if self.consume_keyword(keywords::COMMENT).is_some() {
+				if comment.is_some() {
+					return Err(self.syntax(
+						"DEFINE ANALYZER COMMENT may appear only once.",
+						self.previous_span(),
+					));
+				}
+				comment = Some(self.string_value("Expected a string after `COMMENT`.")?);
+			} else {
+				return Err(self.syntax("Unexpected DEFINE ANALYZER clause.", self.current().span));
+			}
+		}
+		if function.is_some() && tokenizers.as_ref().is_some_and(|values| !values.is_empty()) {
+			return Err(
+				self.syntax("ANALYZER FUNCTION and TOKENIZERS are mutually exclusive.", name.span)
+			);
+		}
+		Ok(DefineAnalyzerStatement {
+			mode,
+			name,
+			function,
+			tokenizers: tokenizers.unwrap_or_else(Vec::new),
+			filters: filters.unwrap_or_else(Vec::new),
+			comment,
+		})
+	}
+
+	fn analyzer_function_name(&mut self) -> FerrosGrynnResult<FunctionSignatureName> {
+		let (namespace, name) = self.qualified_function_name()?;
+		Ok(FunctionSignatureName {
+			namespace,
+			name,
+			parameters: None,
+		})
+	}
+
+	fn analyzer_tokenizers(&mut self) -> FerrosGrynnResult<Vec<AnalyzerTokenizerName>> {
+		let mut tokenizers = Vec::new();
+		loop {
+			let token = self.identifier()?;
+			let tokenizer = match token.value.to_ascii_lowercase().as_str() {
+				"blank" => AnalyzerTokenizerName::Blank,
+				"camel" => AnalyzerTokenizerName::Camel,
+				"class" => AnalyzerTokenizerName::Class,
+				"punct" => AnalyzerTokenizerName::Punct,
+				_ => return Err(self.syntax("Unknown analyzer tokenizer.", token.span)),
+			};
+			if tokenizers.contains(&tokenizer) {
+				return Err(self.syntax("Analyzer tokenizer is repeated.", token.span));
+			}
+			tokenizers.push(tokenizer);
+			if self.consume_symbol(Symbol::Comma).is_none() {
+				break;
+			}
+		}
+		Ok(tokenizers)
+	}
+
+	async fn analyzer_filters(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<Vec<AnalyzerFilterName>> {
+		let mut filters = Vec::new();
+		loop {
+			let name = self.identifier()?;
+			let lower = name.value.to_ascii_lowercase();
+			let filter = match lower.as_str() {
+				"nfc" => AnalyzerFilterName::Nfc,
+				"nfkc" => AnalyzerFilterName::Nfkc,
+				"ascii" => AnalyzerFilterName::Ascii,
+				"lowercase" => AnalyzerFilterName::Lowercase,
+				"uppercase" => AnalyzerFilterName::Uppercase,
+				"edgengram" | "ngram" => {
+					let open = self.expect_symbol(
+						Symbol::LeftParen,
+						"Expected `(` after analyzer n-gram filter.",
+					)?;
+					let min = self.analyzer_u16("n-gram minimum")?;
+					self.expect_symbol(Symbol::Comma, "Expected `,` between n-gram bounds.")?;
+					let max = self.analyzer_u16("n-gram maximum")?;
+					self.close(Symbol::RightParen, open.span, "`)`")?;
+					if lower == "edgengram" {
+						AnalyzerFilterName::EdgeNgram {
+							min,
+							max,
+						}
+					} else {
+						AnalyzerFilterName::Ngram {
+							min,
+							max,
+						}
+					}
+				}
+				"snowball" => {
+					let open =
+						self.expect_symbol(Symbol::LeftParen, "Expected `(` after `snowball`.")?;
+					let language = self.identifier()?;
+					self.close(Symbol::RightParen, open.span, "`)`")?;
+					AnalyzerFilterName::Snowball(language)
+				}
+				"mapper" => {
+					let open =
+						self.expect_symbol(Symbol::LeftParen, "Expected `(` after `mapper`.")?;
+					let value = context.run(|context| self.expression(context, 0, 1, 0)).await?;
+					self.close(Symbol::RightParen, open.span, "`)`")?;
+					AnalyzerFilterName::Mapper(value)
+				}
+				_ => return Err(self.syntax("Unknown analyzer filter.", name.span)),
+			};
+			filters.push(filter);
+			if self.consume_symbol(Symbol::Comma).is_none() {
+				break;
+			}
+		}
+		Ok(filters)
+	}
+
+	fn analyzer_u16(&mut self, field: &str) -> FerrosGrynnResult<u16> {
+		let token = self.tokens.next();
+		let TokenKind::Number(value) = token.kind else {
+			return Err(self.syntax(&format!("Expected an unsigned {field}."), token.span));
+		};
+		if value.contains(['.', 'e', 'E', '+', '-']) {
+			return Err(self.syntax(&format!("Expected an unsigned {field}."), token.span));
+		}
+		value.replace('_', "").parse::<u16>().map_err(|_error| {
+			self.syntax(&format!("Analyzer {field} is out of range."), token.span)
 		})
 	}
 
@@ -490,13 +765,103 @@ impl Parser<'_> {
 			}
 			if self.consume_keyword(keywords::UNIQUE).is_some() {
 				BasicIndexDefinition::Unique(fields)
-			} else if let Some(feature) =
-				[keywords::FULLTEXT, keywords::HNSW, keywords::DISKANN, keywords::GEOMETRY]
-					.iter()
-					.copied()
-					.find(|keyword| self.at_keyword(keyword))
-			{
-				return Err(self.unsupported(feature, self.current().span));
+			} else if self.consume_keyword(keywords::FULLTEXT).is_some() {
+				let field = self.single_specialized_index_field(fields)?;
+				self.expect_keyword(keywords::ANALYZER, "Expected `ANALYZER` after `FULLTEXT`.")?;
+				let analyzer = self.identifier()?;
+				let (k1, b) = if self.consume_keyword(keywords::BM25).is_some() {
+					if let Some(open) = self.consume_symbol(Symbol::LeftParen) {
+						let k1 = self.index_f64("BM25 k1")?;
+						self.expect_symbol(Symbol::Comma, "Expected `,` between BM25 parameters.")?;
+						let b = self.index_f64("BM25 b")?;
+						self.close(Symbol::RightParen, open.span, "`)`")?;
+						(k1, b)
+					} else {
+						(1.2, 0.75)
+					}
+				} else {
+					(1.2, 0.75)
+				};
+				BasicIndexDefinition::Fulltext {
+					field,
+					analyzer,
+					k1_bits: k1.to_bits(),
+					b_bits: b.to_bits(),
+					highlights: self.consume_keyword(keywords::HIGHLIGHTS).is_some(),
+				}
+			} else if self.consume_keyword(keywords::HNSW).is_some() {
+				let field = self.single_specialized_index_field(fields)?;
+				self.expect_keyword(keywords::DIMENSION, "Expected `DIMENSION` after `HNSW`.")?;
+				let dimension = self.index_positive_u16("HNSW dimension")?;
+				let element = if self.consume_keyword(keywords::TYPE).is_some() {
+					self.vector_element_name()?
+				} else {
+					VectorElementName::F64
+				};
+				let distance = if self.consume_keyword(keywords::DIST).is_some() {
+					self.vector_distance_name()?
+				} else {
+					VectorDistanceName::Euclidean
+				};
+				let ef_construction = if self.consume_keyword(keywords::EFC).is_some() {
+					self.index_positive_u16("HNSW EFC")?
+				} else {
+					150
+				};
+				let m = if self.consume_keyword(keywords::M).is_some() {
+					self.index_positive_u16("HNSW M")?
+				} else {
+					12
+				};
+				BasicIndexDefinition::Hnsw {
+					field,
+					dimension,
+					element,
+					distance,
+					ef_construction,
+					m,
+				}
+			} else if self.consume_keyword(keywords::DISKANN).is_some() {
+				let field = self.single_specialized_index_field(fields)?;
+				self.expect_keyword(keywords::DIMENSION, "Expected `DIMENSION` after `DISKANN`.")?;
+				let dimension = self.index_positive_u16("DiskANN dimension")?;
+				let element = if self.consume_keyword(keywords::TYPE).is_some() {
+					self.vector_element_name()?
+				} else {
+					VectorElementName::F32
+				};
+				let distance = if self.consume_keyword(keywords::DIST).is_some() {
+					self.vector_distance_name()?
+				} else {
+					VectorDistanceName::Euclidean
+				};
+				let degree = if self.consume_keyword(keywords::DEGREE).is_some() {
+					self.index_positive_u16("DiskANN degree")?
+				} else {
+					64
+				};
+				let build_list_size = if self.consume_keyword(keywords::L_BUILD).is_some() {
+					self.index_positive_u16("DiskANN L_BUILD")?
+				} else {
+					100
+				};
+				let alpha = if self.consume_keyword(keywords::ALPHA).is_some() {
+					self.index_f32("DiskANN alpha")?
+				} else {
+					1.2
+				};
+				BasicIndexDefinition::DiskAnn {
+					field,
+					dimension,
+					element,
+					distance,
+					degree,
+					build_list_size,
+					alpha_bits: alpha.to_bits(),
+					hashed_vector: self.consume_keyword(keywords::HASHED_VECTOR).is_some(),
+				}
+			} else if self.at_keyword(keywords::GEOMETRY) {
+				return Err(self.unsupported(keywords::GEOMETRY, self.current().span));
 			} else {
 				BasicIndexDefinition::Standard(fields)
 			}
@@ -553,8 +918,125 @@ impl Parser<'_> {
 		})
 	}
 
+	fn single_specialized_index_field(
+		&self,
+		mut fields: Vec<Identifier>,
+	) -> FerrosGrynnResult<Identifier> {
+		if fields.len() != 1 {
+			return Err(self.syntax(
+				"Fulltext, HNSW, and DiskANN indexes require exactly one field.",
+				self.previous_span(),
+			));
+		}
+		fields.pop().ok_or_else(|| {
+			self.syntax("A specialized index field is missing.", self.previous_span())
+		})
+	}
+
+	fn index_positive_u16(&mut self, label: &str) -> FerrosGrynnResult<u16> {
+		let token = self.tokens.next();
+		let TokenKind::Number(value) = token.kind else {
+			return Err(self.syntax(&format!("Expected positive {label}."), token.span));
+		};
+		let value = value.replace('_', "").parse::<u16>().map_err(|_error| {
+			self.syntax(&format!("Expected positive {label} in u16 range."), token.span)
+		})?;
+		if value == 0 {
+			return Err(self.syntax(&format!("Expected positive {label}."), token.span));
+		}
+		Ok(value)
+	}
+
+	fn index_f64(&mut self, label: &str) -> FerrosGrynnResult<f64> {
+		let token = self.tokens.next();
+		let TokenKind::Number(value) = token.kind else {
+			return Err(self.syntax(&format!("Expected numeric {label}."), token.span));
+		};
+		value
+			.replace('_', "")
+			.parse::<f64>()
+			.map_err(|_error| self.syntax(&format!("Expected finite numeric {label}."), token.span))
+	}
+
+	fn index_f32(&mut self, label: &str) -> FerrosGrynnResult<f32> {
+		let token = self.tokens.next();
+		let TokenKind::Number(value) = token.kind else {
+			return Err(self.syntax(&format!("Expected numeric {label}."), token.span));
+		};
+		value
+			.replace('_', "")
+			.parse::<f32>()
+			.map_err(|_error| self.syntax(&format!("Expected finite numeric {label}."), token.span))
+	}
+
+	fn vector_element_name(&mut self) -> FerrosGrynnResult<VectorElementName> {
+		let token = self.tokens.next();
+		let TokenKind::Word {
+			value,
+			quoted: false,
+		} = token.kind
+		else {
+			return Err(self.syntax("Expected a vector element type.", token.span));
+		};
+		if value.eq_ignore_ascii_case(keywords::F64) {
+			Ok(VectorElementName::F64)
+		} else if value.eq_ignore_ascii_case(keywords::F32) {
+			Ok(VectorElementName::F32)
+		} else if value.eq_ignore_ascii_case(keywords::F16) {
+			Ok(VectorElementName::F16)
+		} else if value.eq_ignore_ascii_case(keywords::I64) {
+			Ok(VectorElementName::I64)
+		} else if value.eq_ignore_ascii_case(keywords::I32) {
+			Ok(VectorElementName::I32)
+		} else if value.eq_ignore_ascii_case(keywords::I16) {
+			Ok(VectorElementName::I16)
+		} else if value.eq_ignore_ascii_case(keywords::I8) {
+			Ok(VectorElementName::I8)
+		} else if value.eq_ignore_ascii_case(keywords::U8) {
+			Ok(VectorElementName::U8)
+		} else {
+			Err(self.syntax("Unknown vector element type.", token.span))
+		}
+	}
+
+	fn vector_distance_name(&mut self) -> FerrosGrynnResult<VectorDistanceName> {
+		if self.consume_keyword(keywords::EUCLIDEAN).is_some() {
+			Ok(VectorDistanceName::Euclidean)
+		} else if self.consume_keyword(keywords::COSINE).is_some() {
+			Ok(VectorDistanceName::Cosine)
+		} else if self.consume_keyword(keywords::MANHATTAN).is_some() {
+			Ok(VectorDistanceName::Manhattan)
+		} else if self.consume_keyword(keywords::MINKOWSKI).is_some() {
+			let open = self.expect_symbol(Symbol::LeftParen, "Expected `(` after `MINKOWSKI`.")?;
+			let exponent = self.index_f64("Minkowski exponent")?;
+			self.close(Symbol::RightParen, open.span, "`)`")?;
+			Ok(VectorDistanceName::Minkowski {
+				exponent_bits: exponent.to_bits(),
+			})
+		} else if self.consume_keyword(keywords::INNER_PRODUCT).is_some() {
+			Ok(VectorDistanceName::InnerProduct)
+		} else if self.consume_keyword(keywords::COSINE_NORMALIZED).is_some() {
+			Ok(VectorDistanceName::CosineNormalized)
+		} else {
+			let function = self.function_signature_name()?;
+			if function.parameters.is_some() {
+				return Err(self.syntax(
+					"A custom distance names fn::name without an overload signature.",
+					function.name.span,
+				));
+			}
+			Ok(VectorDistanceName::Function(function))
+		}
+	}
+
 	pub(in crate::syn) fn remove_statement(&mut self) -> FerrosGrynnResult<RemoveStatement> {
-		let target = if self.consume_keyword(keywords::FUNCTION).is_some() {
+		let target = if self.consume_keyword(keywords::ANALYZER).is_some() {
+			let if_exists = self.if_exists()?;
+			RemoveTarget::Analyzer {
+				if_exists,
+				name: self.identifier()?,
+			}
+		} else if self.consume_keyword(keywords::FUNCTION).is_some() {
 			let if_exists = self.if_exists()?;
 			RemoveTarget::Function {
 				if_exists,
@@ -610,7 +1092,118 @@ impl Parser<'_> {
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<AlterStatement> {
-		let target = if self.consume_keyword(keywords::FUNCTION).is_some() {
+		let target = if self.consume_keyword(keywords::ANALYZER).is_some() {
+			let if_exists = self.if_exists()?;
+			let name = self.identifier()?;
+			let mut function = None;
+			let mut tokenizers = None;
+			let mut filters = None;
+			let mut comment = ParameterCommentChange::Keep;
+			while !self.at_statement_end() {
+				if self.consume_keyword(keywords::FUNCTION).is_some() {
+					if function.is_some() {
+						return Err(self.syntax(
+							"ALTER ANALYZER FUNCTION may appear only once.",
+							self.previous_span(),
+						));
+					}
+					function = Some(Some(self.analyzer_function_name()?));
+				} else if self.consume_keyword(keywords::TOKENIZERS).is_some() {
+					if tokenizers.is_some() {
+						return Err(self.syntax(
+							"ALTER ANALYZER TOKENIZERS may appear only once.",
+							self.previous_span(),
+						));
+					}
+					tokenizers = Some(self.analyzer_tokenizers()?);
+				} else if self.consume_keyword(keywords::FILTERS).is_some() {
+					if filters.is_some() {
+						return Err(self.syntax(
+							"ALTER ANALYZER FILTERS may appear only once.",
+							self.previous_span(),
+						));
+					}
+					filters = Some(context.run(|context| self.analyzer_filters(context)).await?);
+				} else if self.consume_keyword(keywords::COMMENT).is_some() {
+					if comment != ParameterCommentChange::Keep {
+						return Err(self.syntax(
+							"ALTER ANALYZER COMMENT may appear only once.",
+							self.previous_span(),
+						));
+					}
+					comment = ParameterCommentChange::Set(
+						self.string_value("Expected a string after `COMMENT`.")?,
+					);
+				} else if self.consume_keyword(keywords::DROP).is_some() {
+					if self.consume_keyword(keywords::FUNCTION).is_some() {
+						if function.is_some() {
+							return Err(self.syntax(
+								"ALTER ANALYZER FUNCTION may appear only once.",
+								self.previous_span(),
+							));
+						}
+						function = Some(None);
+					} else if self.consume_keyword(keywords::TOKENIZERS).is_some() {
+						if tokenizers.is_some() {
+							return Err(self.syntax(
+								"ALTER ANALYZER TOKENIZERS may appear only once.",
+								self.previous_span(),
+							));
+						}
+						tokenizers = Some(Vec::new());
+					} else if self.consume_keyword(keywords::FILTERS).is_some() {
+						if filters.is_some() {
+							return Err(self.syntax(
+								"ALTER ANALYZER FILTERS may appear only once.",
+								self.previous_span(),
+							));
+						}
+						filters = Some(Vec::new());
+					} else if self.consume_keyword(keywords::COMMENT).is_some() {
+						if comment != ParameterCommentChange::Keep {
+							return Err(self.syntax(
+								"ALTER ANALYZER COMMENT may appear only once.",
+								self.previous_span(),
+							));
+						}
+						comment = ParameterCommentChange::Drop;
+					} else {
+						return Err(self.syntax(
+							"Expected FUNCTION, TOKENIZERS, FILTERS, or COMMENT after DROP.",
+							self.current().span,
+						));
+					}
+				} else {
+					return Err(
+						self.syntax("Unexpected ALTER ANALYZER clause.", self.current().span)
+					);
+				}
+			}
+			if function.is_none()
+				&& tokenizers.is_none()
+				&& filters.is_none()
+				&& comment == ParameterCommentChange::Keep
+			{
+				return Err(self
+					.syntax("ALTER ANALYZER requires at least one change.", self.current().span));
+			}
+			if function.as_ref().is_some_and(Option::is_some)
+				&& tokenizers.as_ref().is_some_and(|values| !values.is_empty())
+			{
+				return Err(self.syntax(
+					"ANALYZER FUNCTION and TOKENIZERS are mutually exclusive.",
+					name.span,
+				));
+			}
+			AlterTarget::Analyzer {
+				if_exists,
+				name,
+				function,
+				tokenizers,
+				filters,
+				comment,
+			}
+		} else if self.consume_keyword(keywords::FUNCTION).is_some() {
 			let if_exists = self.if_exists()?;
 			let signature = self.function_signature_name()?;
 			let effect = self.function_effect();
@@ -777,6 +1370,8 @@ impl Parser<'_> {
 		self.expect_keyword(keywords::FOR, "Expected `FOR` after `INFO`.")?;
 		let target = if self.consume_keyword(keywords::DB).is_some() {
 			InfoTarget::Database
+		} else if self.consume_keyword(keywords::ANALYZER).is_some() {
+			InfoTarget::Analyzer(self.identifier()?)
 		} else if self.consume_keyword(keywords::FUNCTION).is_some() {
 			InfoTarget::Function(self.function_signature_name()?)
 		} else if self.consume_keyword(keywords::PARAM).is_some() {

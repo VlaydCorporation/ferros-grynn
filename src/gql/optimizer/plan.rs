@@ -48,6 +48,21 @@ pub(crate) enum SourceOperator {
 		/// Direction of the ordered index walk.
 		direction: IndexDirection,
 	},
+	/// BM25 posting access through one Ready Fulltext generation.
+	FulltextIndexScan {
+		index: IndexId,
+		name: Box<str>,
+	},
+	/// Approximate HNSW access followed by exact full-vector reranking.
+	HnswSearch {
+		index: IndexId,
+		name: Box<str>,
+	},
+	/// Page-backed DiskANN access followed by exact full-vector reranking.
+	DiskAnnSearch {
+		index: IndexId,
+		name: Box<str>,
+	},
 	/// Exact count index lookup.
 	CountLookup {
 		/// Stable logical index identity.

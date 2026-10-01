@@ -560,9 +560,12 @@ fn estimated_vector_heap_bytes(vector: &Vector) -> usize {
 	match vector {
 		Vector::F32(values) => values.len().saturating_mul(size_of::<f32>()),
 		Vector::F64(values) => values.len().saturating_mul(size_of::<f64>()),
+		Vector::F16(values) => values.len().saturating_mul(size_of::<half::f16>()),
 		Vector::I16(values) => values.len().saturating_mul(size_of::<i16>()),
 		Vector::I32(values) => values.len().saturating_mul(size_of::<i32>()),
 		Vector::I64(values) => values.len().saturating_mul(size_of::<i64>()),
+		Vector::I8(values) => values.len().saturating_mul(size_of::<i8>()),
+		Vector::U8(values) => values.len().saturating_mul(size_of::<u8>()),
 	}
 }
 

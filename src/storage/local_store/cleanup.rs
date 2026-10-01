@@ -77,10 +77,10 @@ impl RetiredGeneration {
 	}
 }
 
-/// Deletes an import generation on unwind or error until its catalog commit is
-/// known to be durable.
+/// Deletes a generation on unwind or error until its catalog commit is known
+/// to be durable.
 pub(super) struct UnpublishedGeneration {
-	/// AtomStore and graph-generation directories owned by the import.
+	/// AtomStore and graph-generation directories owned by the pending commit.
 	directories: Vec<PathBuf>,
 	/// Whether `Drop` must remove the directories.
 	armed: bool,

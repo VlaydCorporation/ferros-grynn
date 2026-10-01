@@ -82,6 +82,12 @@ impl IndexStoreRoot {
 			if index.state() != crate::datastore::ClassIndexState::Ready {
 				continue;
 			}
+			if !matches!(
+				index.kind(),
+				ClassIndexKind::Standard | ClassIndexKind::Unique | ClassIndexKind::Count
+			) {
+				continue;
+			}
 			match index.scope() {
 				IndexScope::Base => {
 					let mut binding = binding::<GlobalAtomId>(class, index)?;

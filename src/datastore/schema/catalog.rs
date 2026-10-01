@@ -5,7 +5,7 @@ use std::{
 	sync::Arc,
 };
 
-use super::ClassSchema;
+use super::{AnalyzerId, ClassSchema, SchemaAnalyzer};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphTopologyConstraints,
@@ -657,6 +657,9 @@ pub struct SchemaCatalog {
 	pub(crate) function_signatures:
 		BTreeMap<(String, String, Vec<crate::values::Type>), FunctionId>,
 	pub(crate) function_versions: BTreeMap<FunctionId, u64>,
+	pub(crate) analyzers: BTreeMap<AnalyzerId, Arc<SchemaAnalyzer>>,
+	pub(crate) analyzer_names: BTreeMap<String, AnalyzerId>,
+	pub(crate) analyzer_versions: BTreeMap<AnalyzerId, u64>,
 }
 
 impl Default for SchemaCatalog {
@@ -675,6 +678,9 @@ impl Default for SchemaCatalog {
 			functions: BTreeMap::new(),
 			function_signatures: BTreeMap::new(),
 			function_versions: BTreeMap::new(),
+			analyzers: BTreeMap::new(),
+			analyzer_names: BTreeMap::new(),
+			analyzer_versions: BTreeMap::new(),
 		}
 	}
 }
@@ -740,6 +746,21 @@ impl SchemaCatalog {
 	/// Iterates named function definitions in stable identity order.
 	pub fn functions(&self) -> impl ExactSizeIterator<Item = &Arc<SchemaFunction>> {
 		self.functions.values()
+	}
+
+	/// Resolves one durable analyzer by its case-sensitive catalog name.
+	pub fn analyzer(&self, name: &str) -> Option<Arc<SchemaAnalyzer>> {
+		self.analyzer_names.get(name).and_then(|id| self.analyzers.get(id)).cloned()
+	}
+
+	/// Resolves one durable analyzer by stable identity.
+	pub fn analyzer_by_id(&self, id: AnalyzerId) -> Option<Arc<SchemaAnalyzer>> {
+		self.analyzers.get(&id).cloned()
+	}
+
+	/// Iterates analyzer definitions in stable identity order.
+	pub fn analyzers(&self) -> impl ExactSizeIterator<Item = &Arc<SchemaAnalyzer>> {
+		self.analyzers.values()
 	}
 }
 

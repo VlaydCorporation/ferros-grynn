@@ -5,6 +5,7 @@ use crate::{
 	gql::ir::{
 		Builtin,
 		LogicalGraphReference,
+		LogicalKnnDistance,
 		LogicalSelect,
 		LogicalSelectItem,
 		LogicalSelectSource,
@@ -156,6 +157,31 @@ fn fold_expr(expression: &mut TypedExpr) -> bool {
 			base: left,
 			predicate: right,
 		} => fold_expr(left) | fold_expr(right),
+		TypedExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => fold_expr(left) | fold_expr(right),
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			..
+		} => {
+			let distance_changed = match distance {
+				LogicalKnnDistance::Minkowski(value) | LogicalKnnDistance::Callable(value) => {
+					fold_expr(value)
+				}
+				LogicalKnnDistance::Builtin(_) | LogicalKnnDistance::Named(_) => false,
+			};
+			fold_expr(left)
+				| fold_expr(k)
+				| ef.as_deref_mut().is_some_and(fold_expr)
+				| distance_changed
+				| fold_expr(right)
+		}
 		TypedExprKind::Conditional {
 			condition,
 			then_value,
@@ -306,7 +332,13 @@ fn constant_expression(expression: &TypedExpr) -> bool {
 		| TypedExprKind::NamedInvoke {
 			..
 		}
-		| TypedExprKind::Traversal(_) => false,
+		| TypedExprKind::Traversal(_)
+		| TypedExprKind::Fulltext {
+			..
+		}
+		| TypedExprKind::Knn {
+			..
+		} => false,
 		TypedExprKind::Slot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_)

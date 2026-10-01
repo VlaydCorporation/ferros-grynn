@@ -240,6 +240,10 @@ impl QueryCatalog for TransactionRead<'_> {
 		self.transaction.query_class(&self.snapshot, class).map(|schema| query_schema(&schema))
 	}
 
+	fn class_definition(&self, class: &str) -> FerrosGrynnResult<Arc<ClassSchema>> {
+		self.transaction.query_class(&self.snapshot, class)
+	}
+
 	fn schema_mode(&self, class: &str) -> FerrosGrynnResult<ClassSchemaMode> {
 		self.transaction.query_class(&self.snapshot, class).map(|schema| schema.schema_mode())
 	}
@@ -271,6 +275,20 @@ impl QueryCatalog for TransactionRead<'_> {
 		id: crate::datastore::FunctionId,
 	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaFunction>>> {
 		self.transaction.query_schema_function(&self.snapshot, id)
+	}
+
+	fn analyzer(
+		&self,
+		name: &str,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaAnalyzer>>> {
+		self.transaction.query_schema_analyzer(&self.snapshot, name)
+	}
+
+	fn analyzer_by_id(
+		&self,
+		id: crate::datastore::AnalyzerId,
+	) -> FerrosGrynnResult<Option<Arc<crate::datastore::SchemaAnalyzer>>> {
+		self.transaction.query_schema_analyzer_by_id(&self.snapshot, id)
 	}
 }
 
@@ -598,6 +616,85 @@ impl QueryRead for TransactionRead<'_> {
 		self.transaction.query_count_index(&self.snapshot, index, graph)
 	}
 
+	fn fulltext_index(
+		&self,
+		_snapshot: Snapshot,
+		class: &str,
+		graph: Option<&GraphRef>,
+		index: crate::datastore::IndexId,
+		terms: &std::collections::BTreeSet<Box<str>>,
+	) -> FerrosGrynnResult<Option<PhysicalFulltextBatch>> {
+		let class = self.transaction.query_class(&self.snapshot, class)?;
+		let class_id = class.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("published class is missing ClassId")
+		})?;
+		let scope = graph.map_or(crate::datastore::IndexScope::Base, |graph| {
+			crate::datastore::IndexScope::Effective {
+				graph: graph.id(),
+			}
+		});
+		self.transaction.query_fulltext_index(&self.snapshot, index, class_id, scope, terms).map(
+			|batch| {
+				batch.map(|batch| PhysicalFulltextBatch {
+					document_count: batch.document_count,
+					total_document_length: batch.total_document_length,
+					documents: batch
+						.documents
+						.into_iter()
+						.map(|document| PhysicalFulltextDocument {
+							record_id: document.record_id,
+							document_length: document.document_length,
+							terms: document
+								.terms
+								.into_iter()
+								.map(|(term, value)| {
+									(term, PhysicalFulltextTerm {
+										document_frequency: value.document_frequency,
+										term_frequency: value.term_frequency,
+										spans: value.spans,
+									})
+								})
+								.collect(),
+						})
+						.collect(),
+				})
+			},
+		)
+	}
+
+	fn vector_index(
+		&self,
+		_snapshot: Snapshot,
+		class: &str,
+		graph: Option<&GraphRef>,
+		index: crate::datastore::IndexId,
+		query: &crate::values::Vector,
+		k: usize,
+		breadth: usize,
+	) -> FerrosGrynnResult<Option<Vec<PhysicalVectorHit>>> {
+		let class = self.transaction.query_class(&self.snapshot, class)?;
+		let class_id = class.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("published class is missing ClassId")
+		})?;
+		let scope = graph.map_or(crate::datastore::IndexScope::Base, |graph| {
+			crate::datastore::IndexScope::Effective {
+				graph: graph.id(),
+			}
+		});
+		self.transaction
+			.query_vector_index(&self.snapshot, index, class_id, scope, query, k, breadth)
+			.map(|hits| {
+				hits.map(|hits| {
+					hits.into_iter()
+						.map(|hit| PhysicalVectorHit {
+							record_id: hit.record_id,
+							distance_bits: hit.distance.to_bits(),
+						})
+						.collect()
+				})
+			})
+	}
+
 	fn probe_index<'a>(
 		&'a self,
 		_snapshot: Snapshot,
@@ -874,6 +971,7 @@ impl QueryRead for TransactionRead<'_> {
 		let value = if matches!(
 			statement,
 			LogicalSchemaStatement::InfoDatabase
+				| LogicalSchemaStatement::InfoAnalyzer { .. }
 				| LogicalSchemaStatement::InfoClass { .. }
 				| LogicalSchemaStatement::InfoIndex { .. }
 				| LogicalSchemaStatement::InfoParameter { .. }
@@ -1009,7 +1107,7 @@ fn scalar_constraint_value(expr: &TypedExpr, slots: &[Value]) -> Option<Value> {
 	}
 }
 
-fn query_schema(schema: &ClassSchema) -> Schema {
+pub(in crate::gql) fn query_schema(schema: &ClassSchema) -> Schema {
 	let mut columns = Vec::with_capacity(schema.fields().len() + 5);
 	columns.push(Column {
 		name: "id".into(),
@@ -1043,8 +1141,21 @@ fn query_schema(schema: &ClassSchema) -> Schema {
 		qualifier: None,
 		ty: field.value_type().clone(),
 	}));
+	let origins = schema
+		.fields()
+		.enumerate()
+		.map(|(offset, field)| {
+			(offset + 5, crate::gql::ir::ColumnOrigin {
+				source: schema.name().as_str().into(),
+				class: schema.name().as_str().into(),
+				field: field.name().as_str().into(),
+				scope: Some(crate::datastore::IndexScope::Base),
+			})
+		})
+		.collect();
 	Schema {
 		columns,
+		origins,
 	}
 }
 

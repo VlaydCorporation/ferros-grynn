@@ -31,9 +31,12 @@ impl Display for Value {
 			Self::Vector(value) => match value {
 				Vector::F32(values) => write_debug_sequence(f, "vector<f32>", values),
 				Vector::F64(values) => write_debug_sequence(f, "vector<f64>", values),
+				Vector::F16(values) => write_debug_sequence(f, "vector<f16>", values),
 				Vector::I16(values) => write_debug_sequence(f, "vector<i16>", values),
 				Vector::I32(values) => write_debug_sequence(f, "vector<i32>", values),
 				Vector::I64(values) => write_debug_sequence(f, "vector<i64>", values),
+				Vector::I8(values) => write_debug_sequence(f, "vector<i8>", values),
+				Vector::U8(values) => write_debug_sequence(f, "vector<u8>", values),
 			},
 			Self::Bytes(value) => {
 				f.write_str("b\"")?;

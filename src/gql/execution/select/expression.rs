@@ -76,6 +76,30 @@ fn contains_select_special(expression: &TypedExpr) -> bool {
 			base: left,
 			predicate: right,
 		} => contains_select_special(left) || contains_select_special(right),
+		TypedExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => contains_select_special(left) || contains_select_special(right),
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			..
+		} => {
+			contains_select_special(left)
+				|| contains_select_special(k)
+				|| ef.as_deref().is_some_and(contains_select_special)
+				|| match distance {
+					LogicalKnnDistance::Minkowski(value) | LogicalKnnDistance::Callable(value) => {
+						contains_select_special(value)
+					}
+					LogicalKnnDistance::Builtin(_) | LogicalKnnDistance::Named(_) => false,
+				}
+				|| contains_select_special(right)
+		}
 		TypedExprKind::Conditional {
 			condition,
 			then_value,

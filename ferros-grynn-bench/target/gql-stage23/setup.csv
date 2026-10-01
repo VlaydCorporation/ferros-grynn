@@ -1,0 +1,8 @@
+metric,value
+rows,128
+dimension,8
+hnsw_build_ms,30.1631
+diskann_build_ms,158.9682
+hashed_diskann_build_ms,319.62980000000005
+hnsw_recall_at_10,1
+diskann_recall_at_10,1

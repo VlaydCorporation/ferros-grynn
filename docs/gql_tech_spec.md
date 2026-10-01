@@ -1298,23 +1298,22 @@ publication.
 
 Бюджеты — §1.1. Настройки (`gql_spec.md` §29 + `disk_storage_spec.md` §27):
 
-| Настройка                                         | Назначение                           | Default       |
-|---------------------------------------------------|--------------------------------------|---------------|
-| `LocalOptions.buffer_pool_pages`                  | общий resident budget (16-КиБ pages) | 4096 (64 MiB) |
-| `FG_WAL_SEGMENT_SIZE`                             | размер WAL-сегмента                  | 64 MiB        |
-| `LocalOptions.checkpoint`                         | доля WAL-only страниц / интервал     | 25% / 300 sec |
-| `LocalOptions.max_write_set_bytes`                | atom-delta budget транзакции         | 256 MiB       |
-| `LocalOptions.max_snapshot_age`                   | максимальный возраст snapshot        | 300 sec       |
-| `FG_LABEL_DICT_CACHE_MB`                          | LRU-кеш словаря меток                | 32            |
-| `FG_HNSW_CACHE_SIZE`                              | кеш HNSW                             | 256 MiB       |
-| `FG_STATS_AUTO_ANALYZE_DIRTY`                     | авто-`ANALYZE`                       | 0.10          |
-| `FG_PATH_MAX_DEPTH`                               | макс. глубина path-finding           | 30            |
-| `QueryExecutionOptions.max_graph_nodes/edges`     | лимиты graph assembly                | 1e6 / 5e6     |
-| `MaintenanceOptions.max_memory_bytes`             | общий budget одного maintenance build | 256 MiB       |
-| `MaintenanceOptions.max_parallelism`              | верхняя граница scoped run workers    | ядра          |
-| `FG_TRAVERSAL_READ_YOUR_WRITES`                   | видимость своих мутаций traversal'ом | false         |
-| `FG_TEMPFILES_PATH`                               | каталог для `SELECT … TEMPFILES`     | ""            |
-| `FG_ASYNC_EVENT_PROCESSING_INTERVAL`              | интервал async-событий               | 5000 ms       |
+| Настройка                                     | Назначение                            | Default       |
+|-----------------------------------------------|---------------------------------------|---------------|
+| `LocalOptions.buffer_pool_pages`              | общий resident budget (16-КиБ pages)  | 4096 (64 MiB) |
+| `FG_WAL_SEGMENT_SIZE`                         | размер WAL-сегмента                   | 64 MiB        |
+| `LocalOptions.checkpoint`                     | доля WAL-only страниц / интервал      | 25% / 300 sec |
+| `LocalOptions.max_write_set_bytes`            | atom-delta budget транзакции          | 256 MiB       |
+| `LocalOptions.max_snapshot_age`               | максимальный возраст snapshot         | 300 sec       |
+| `FG_LABEL_DICT_CACHE_MB`                      | LRU-кеш словаря меток                 | 32            |
+| `FG_STATS_AUTO_ANALYZE_DIRTY`                 | авто-`ANALYZE`                        | 0.10          |
+| `FG_PATH_MAX_DEPTH`                           | макс. глубина path-finding            | 30            |
+| `QueryExecutionOptions.max_graph_nodes/edges` | лимиты graph assembly                 | 1e6 / 5e6     |
+| `MaintenanceOptions.max_memory_bytes`         | общий budget одного maintenance build | 256 MiB       |
+| `MaintenanceOptions.max_parallelism`          | верхняя граница scoped run workers    | ядра          |
+| `FG_TRAVERSAL_READ_YOUR_WRITES`               | видимость своих мутаций traversal'ом  | false         |
+| `FG_TEMPFILES_PATH`                           | каталог для `SELECT … TEMPFILES`      | ""            |
+| `FG_ASYNC_EVENT_PROCESSING_INTERVAL`          | интервал async-событий                | 5000 ms       |
 
 Path-finding vs graph assembly (§16.4 gql_spec): `FG_PATH_MAX_DEPTH` применяется **только** к
 path-finding (`[E*]` без явного max). `RETURN GRAPH`/`BUILD GRAPH` потребляют выбранные значения

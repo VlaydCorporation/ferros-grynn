@@ -9,7 +9,10 @@ use super::{
 		ClosureParameter,
 		Expr,
 		ExprKind,
+		FulltextOperator,
 		Identifier,
+		KnnDistance,
+		KnnSearchArgument,
 		Literal,
 		ObjectField,
 		Program,
@@ -180,6 +183,10 @@ impl Parser<'_> {
 			if self.at_function_definition() {
 				StatementKind::DefineFunction(
 					context.run(|context| self.define_function_statement(context)).await?,
+				)
+			} else if self.consume_keyword(keywords::ANALYZER).is_some() {
+				StatementKind::DefineAnalyzer(
+					context.run(|context| self.define_analyzer_statement(context)).await?,
 				)
 			} else if self.consume_keyword(keywords::PARAM).is_some() {
 				StatementKind::DefineParameter(
@@ -397,6 +404,29 @@ impl Parser<'_> {
 				};
 				continue;
 			}
+			if minimum_binding_power <= 9
+				&& let TokenKind::FullText(operator) = &self.current().kind
+			{
+				let operator = self.fulltext_operator(operator, self.current().span)?;
+				self.tokens.next();
+				let right = context
+					.run(|context| self.expression(context, 10, depth + 1, object_depth))
+					.await?;
+				let span = cover(left.span, right.span);
+				left = Expr {
+					kind: ExprKind::Fulltext {
+						left: Box::new(left),
+						op: operator,
+						right: Box::new(right),
+					},
+					span,
+				};
+				continue;
+			}
+			if minimum_binding_power <= 9 && self.at_symbol(Symbol::ReversePipeline) {
+				left = self.knn_expression(context, left, depth, object_depth).await?;
+				continue;
+			}
 			let Some((operator, left_bp, right_bp, consumed)) = self.binary_operator() else {
 				break;
 			};
@@ -420,6 +450,76 @@ impl Parser<'_> {
 			};
 		}
 		Ok(left)
+	}
+
+	async fn knn_expression(
+		&mut self,
+		context: &mut Stk,
+		left: Expr,
+		depth: u32,
+		object_depth: u32,
+	) -> FerrosGrynnResult<Expr> {
+		self.tokens.next();
+		let k = context.run(|context| self.expression(context, 2, depth + 1, object_depth)).await?;
+		let search = if self.consume_symbol(Symbol::Comma).is_some() {
+			if self.consume_keyword(keywords::EF).is_some() {
+				Some(KnnSearchArgument::Ef(Box::new(
+					context
+						.run(|context| self.expression(context, 2, depth + 1, object_depth))
+						.await?,
+				)))
+			} else {
+				Some(KnnSearchArgument::Distance(
+					self.knn_distance(context, depth, object_depth).await?,
+				))
+			}
+		} else {
+			None
+		};
+		self.expect_symbol(Symbol::Pipeline, "Expected `|>` after KNN search options.")?;
+		let right =
+			context.run(|context| self.expression(context, 10, depth + 1, object_depth)).await?;
+		Ok(Expr {
+			span: cover(left.span, right.span),
+			kind: ExprKind::Knn {
+				left: Box::new(left),
+				k: Box::new(k),
+				search,
+				right: Box::new(right),
+			},
+		})
+	}
+
+	async fn knn_distance(
+		&mut self,
+		context: &mut Stk,
+		depth: u32,
+		object_depth: u32,
+	) -> FerrosGrynnResult<KnnDistance> {
+		for (keyword, distance) in [
+			(keywords::EUCLIDEAN, KnnDistance::Euclidean),
+			(keywords::COSINE, KnnDistance::Cosine),
+			(keywords::MANHATTAN, KnnDistance::Manhattan),
+			(keywords::INNER_PRODUCT, KnnDistance::InnerProduct),
+			(keywords::COSINE_NORMALIZED, KnnDistance::CosineNormalized),
+		] {
+			if self.consume_keyword(keyword).is_some() {
+				return Ok(distance);
+			}
+		}
+		if let Some(start) = self.consume_keyword(keywords::MINKOWSKI) {
+			let open = self.expect_symbol(Symbol::LeftParen, "Expected `(` after MINKOWSKI.")?;
+			let exponent =
+				context.run(|context| self.expression(context, 0, depth + 1, object_depth)).await?;
+			self.close(Symbol::RightParen, open.span, "`)`")?;
+			if exponent.span.offset < start.span.offset {
+				return Err(self.syntax("Invalid MINKOWSKI exponent.", exponent.span));
+			}
+			return Ok(KnnDistance::Minkowski(Box::new(exponent)));
+		}
+		let distance =
+			context.run(|context| self.expression(context, 2, depth + 1, object_depth)).await?;
+		Ok(KnnDistance::Custom(Box::new(distance)))
 	}
 
 	pub(in crate::syn) async fn prefix(
@@ -986,6 +1086,31 @@ impl Parser<'_> {
 		Some(operator)
 	}
 
+	fn fulltext_operator(
+		&self,
+		operator: &str,
+		span: TextSpan,
+	) -> FerrosGrynnResult<FulltextOperator> {
+		if operator == "@@" {
+			return Ok(FulltextOperator::Any);
+		}
+		if operator.eq_ignore_ascii_case("@AND@") {
+			return Ok(FulltextOperator::All);
+		}
+		if operator.eq_ignore_ascii_case("@OR@") {
+			return Ok(FulltextOperator::AnyOf);
+		}
+		let slot = operator
+			.strip_prefix('@')
+			.and_then(|value| value.strip_suffix('@'))
+			.and_then(|value| value.parse::<u16>().ok())
+			.filter(|value| *value != 0)
+			.ok_or_else(|| {
+				self.syntax("Fulltext match slots must be integers in 1..=65535.", span)
+			})?;
+		Ok(FulltextOperator::Slot(slot))
+	}
+
 	pub(in crate::syn) fn identifier(&mut self) -> FerrosGrynnResult<Identifier> {
 		let token = self.tokens.next();
 		match token.kind {
@@ -1020,9 +1145,17 @@ impl Parser<'_> {
 
 	pub(in crate::syn) fn type_name(&mut self) -> FerrosGrynnResult<TypeName> {
 		let identifier = self.identifier()?;
+		let mut value = identifier.value;
+		let mut span = identifier.span;
+		if let Some(open) = self.consume_symbol(Symbol::Less) {
+			let item = self.type_name()?;
+			let close = self.close(Symbol::Greater, open.span, "`>`")?;
+			value = format!("{value}<{}>", item.value).into_boxed_str();
+			span = cover(span, close.span);
+		}
 		Ok(TypeName {
-			value: identifier.value,
-			span: identifier.span,
+			value,
+			span,
 		})
 	}
 
@@ -1158,9 +1291,13 @@ mod tests {
 	use crate::{
 		gql_status::{FerrosGrynnError, FerrosGrynnResult},
 		syn::{
+			BasicIndexDefinition,
 			BinaryOperator,
 			ExecutionModeName,
 			ExprKind,
+			FulltextOperator,
+			KnnDistance,
+			KnnSearchArgument,
 			MatchDirection,
 			MatchLinearPattern,
 			MatchPattern,
@@ -1581,12 +1718,33 @@ mod tests {
 		assert!(matches!(program.statements[9].kind, StatementKind::Info(_)));
 		assert!(matches!(program.statements[13].kind, StatementKind::Remove(_)));
 
-		let advanced = parse(
+		let specialized = parse(
+			"DEFINE INDEX title_search ON CLASS user FIELDS title FULLTEXT ANALYZER english \
+			 BM25(1.4, 0.6) HIGHLIGHTS SCOPE BASE DEFER; DEFINE INDEX embedding ON CLASS user \
+			 FIELDS vector HNSW DIMENSION 128 TYPE F32 DIST MINKOWSKI(3) EFC 180 M 16 SCOPE BASE; \
+			 DEFINE INDEX disk_embedding ON CLASS user FIELDS compact DISKANN DIMENSION 768 TYPE \
+			 F16 DIST COSINE_NORMALIZED DEGREE 48 L_BUILD 120 ALPHA 1.3 HASHED_VECTOR SCOPE BASE \
+			 CONCURRENTLY",
+			ParserSettings::default(),
+		)
+		.expect("specialized index definitions");
+		let StatementKind::DefineIndex(fulltext) = &specialized.statements[0].kind else {
+			panic!("expected Fulltext definition");
+		};
+		assert!(matches!(fulltext.definition, BasicIndexDefinition::Fulltext { .. }));
+		let StatementKind::DefineIndex(hnsw) = &specialized.statements[1].kind else {
+			panic!("expected HNSW definition");
+		};
+		assert!(matches!(hnsw.definition, BasicIndexDefinition::Hnsw { .. }));
+		let StatementKind::DefineIndex(disk_ann) = &specialized.statements[2].kind else {
+			panic!("expected DiskANN definition");
+		};
+		assert!(matches!(disk_ann.definition, BasicIndexDefinition::DiskAnn { .. }));
+		parse(
 			"DEFINE INDEX embedding ON CLASS user FIELDS vector HNSW SCOPE BASE",
 			ParserSettings::default(),
 		)
-		.expect_err("advanced index is explicit");
-		assert_eq!(advanced.status().code().to_string(), "FG-50F03");
+		.expect_err("HNSW requires a dimension");
 		let alter_graph = parse("ALTER GRAPH social", ParserSettings::default())
 			.expect_err("ALTER GRAPH has no approved semantics");
 		assert_eq!(alter_graph.status().code().to_string(), "FG-50F03");
@@ -1605,6 +1763,77 @@ mod tests {
 		)
 		.expect("effective scope");
 		assert!(matches!(effective.statements[0].kind, StatementKind::DefineIndex(_)));
+	}
+
+	#[test]
+	fn parses_analyzer_schema_statements_and_inline_mapper() {
+		let program = parse(
+			"DEFINE ANALYZER english TOKENIZERS blank, punct FILTERS lowercase, \
+			 snowball(english), mapper({driven: 'drive', stop_word: null}) COMMENT 'search'; \
+			 ALTER ANALYZER english DROP TOKENIZERS FUNCTION fn::tokens FILTERS nfkc; INFO FOR \
+			 ANALYZER english; REMOVE ANALYZER IF EXISTS english;",
+			ParserSettings::default(),
+		)
+		.expect("analyzer DDL parses");
+		assert!(matches!(program.statements[0].kind, StatementKind::DefineAnalyzer(_)));
+		assert!(matches!(program.statements[1].kind, StatementKind::Alter(_)));
+		assert!(matches!(program.statements[2].kind, StatementKind::Info(_)));
+		assert!(matches!(program.statements[3].kind, StatementKind::Remove(_)));
+
+		parse(
+			"DEFINE ANALYZER invalid FUNCTION fn::tokens TOKENIZERS blank;",
+			ParserSettings::default(),
+		)
+		.expect_err("FUNCTION and TOKENIZERS are mutually exclusive");
+		parse(
+			"DEFINE ANALYZER invalid FILTERS mapper('dictionary.txt');",
+			ParserSettings::default(),
+		)
+		.expect("mapper type is rejected during semantic analysis");
+	}
+
+	#[test]
+	fn parses_fulltext_and_knn_expression_operators() {
+		let program = parse(
+			"SELECT title FROM document WHERE title @7@ 'rust graph' AND embedding <| 10, \
+			 MINKOWSKI(3) |> $query; SELECT title FROM document WHERE title @@ 'rust'; SELECT \
+			 title FROM document WHERE title @AND@ ['rust', 'graph']; SELECT title FROM document \
+			 WHERE title @OR@ ['rust', 'graph']; SELECT id FROM document WHERE embedding <| 5, EF \
+			 32 |> $query;",
+			ParserSettings::default(),
+		)
+		.expect("stage-22/23 search operators parse");
+		let StatementKind::Select(select) = &program.statements[0].kind else {
+			panic!("expected SELECT");
+		};
+		let ExprKind::Binary {
+			left,
+			op: BinaryOperator::And,
+			right,
+		} = &select.filter.as_ref().expect("WHERE expression").kind
+		else {
+			panic!("expected conjunction");
+		};
+		assert!(matches!(left.kind, ExprKind::Fulltext {
+			op: FulltextOperator::Slot(7),
+			..
+		}));
+		assert!(matches!(right.kind, ExprKind::Knn {
+			search: Some(KnnSearchArgument::Distance(KnnDistance::Minkowski(_))),
+			..
+		}));
+		let StatementKind::Select(ef) = &program.statements[4].kind else {
+			panic!("expected EF SELECT");
+		};
+		assert!(matches!(
+			ef.filter.as_ref().map(|filter| &filter.kind),
+			Some(ExprKind::Knn {
+				search: Some(KnnSearchArgument::Ef(_)),
+				..
+			})
+		));
+		parse("SELECT title FROM document WHERE title @0@ 'rust';", ParserSettings::default())
+			.expect_err("Fulltext slot zero is reserved");
 	}
 
 	#[test]

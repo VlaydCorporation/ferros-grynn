@@ -4,7 +4,7 @@ use super::{ClassField, ClassId, ClassIndex, ClassIndexKind, SchemaVersion};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	values::{
-		runtime::{AtomKind, Text},
+		runtime::{AtomKind, Text, Type},
 		storage::validate_index_type,
 	},
 };
@@ -150,7 +150,39 @@ impl ClassSchema {
 					index.name, name
 				))
 			})?;
-			validate_index_type(&field.value_type)?;
+			match index.kind {
+				ClassIndexKind::Standard | ClassIndexKind::Unique => {
+					validate_index_type(&field.value_type)?;
+				}
+				ClassIndexKind::Fulltext if field.value_type != Type::String => {
+					return Err(FerrosGrynnError::invalid_argument(
+						"Fulltext indexes require one declared string field",
+					));
+				}
+				ClassIndexKind::Hnsw => {
+					let Some(options) = index.hnsw_options() else {
+						return Err(FerrosGrynnError::invalid_argument("HNSW options are absent"));
+					};
+					if field.value_type != Type::Vector(options.element()) {
+						return Err(FerrosGrynnError::invalid_argument(
+							"HNSW field type does not match its element type",
+						));
+					}
+				}
+				ClassIndexKind::DiskAnn => {
+					let Some(options) = index.disk_ann_options() else {
+						return Err(FerrosGrynnError::invalid_argument(
+							"DiskANN options are absent",
+						));
+					};
+					if field.value_type != Type::Vector(options.element()) {
+						return Err(FerrosGrynnError::invalid_argument(
+							"DiskANN field type does not match its element type",
+						));
+					}
+				}
+				ClassIndexKind::Count | ClassIndexKind::Fulltext => {}
+			}
 		}
 		if index.kind == ClassIndexKind::Count
 			&& self.indexes.iter().any(|existing| {

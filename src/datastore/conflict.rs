@@ -1,4 +1,4 @@
-use super::{ClassId, FunctionId, GlobalAtomId, SchemaId};
+use super::{AnalyzerId, ClassId, FunctionId, GlobalAtomId, SchemaId};
 use crate::graph::{AtomId, AtomKind, GraphId};
 
 /// Independently versioned logical targets used by FCW and SSI validation.
@@ -18,6 +18,10 @@ pub(crate) enum ConflictKey {
 	SchemaFunction(FunctionId),
 	/// Set of durable named-function overloads observed by a catalog scan.
 	FunctionCatalogRange,
+	/// One durable text-analyzer definition.
+	SchemaAnalyzer(AnalyzerId),
+	/// Set of durable text analyzers observed by a catalog scan.
+	AnalyzerCatalogRange,
 	/// Database-global identity or base properties.
 	BaseAtom(GlobalAtomId),
 	/// Membership or value set observed by a database-global class scan.

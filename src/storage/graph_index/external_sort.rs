@@ -114,6 +114,11 @@ pub(crate) fn external_sort_metrics() -> ExternalSortMetrics {
 	SORT_METRICS.get()
 }
 
+/// Returns the aggregate run-memory budget installed for the current builder.
+pub(crate) fn external_sort_run_budget() -> usize {
+	SORT_OPTIONS.get().run_budget
+}
+
 /// Checks the current maintenance cancellation token, when one is installed.
 pub(crate) fn check_external_sort_cancelled() -> FerrosGrynnResult<()> {
 	let cancelled = SORT_CANCELLATION

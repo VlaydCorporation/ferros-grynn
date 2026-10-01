@@ -13,6 +13,7 @@ use crate::{
 		LogicalGraphDmlStatement,
 		LogicalGraphPropertyMutation,
 		LogicalGraphReference,
+		LogicalKnnDistance,
 		LogicalLetValue,
 		LogicalMatch,
 		LogicalMatchSelector,
@@ -197,6 +198,9 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 		| LogicalSchemaStatement::DefineIndex {
 			..
 		}
+		| LogicalSchemaStatement::DefineAnalyzer {
+			..
+		}
 		| LogicalSchemaStatement::RemoveGraph {
 			..
 		}
@@ -215,6 +219,9 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 		| LogicalSchemaStatement::RemoveFunction {
 			..
 		}
+		| LogicalSchemaStatement::RemoveAnalyzer {
+			..
+		}
 		| LogicalSchemaStatement::AlterClassMode {
 			..
 		}
@@ -224,7 +231,13 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 		| LogicalSchemaStatement::PrepareIndexRemoval {
 			..
 		}
+		| LogicalSchemaStatement::AlterAnalyzer {
+			..
+		}
 		| LogicalSchemaStatement::InfoDatabase
+		| LogicalSchemaStatement::InfoAnalyzer {
+			..
+		}
 		| LogicalSchemaStatement::InfoClass {
 			..
 		}
@@ -478,6 +491,30 @@ fn expr_contains_impure(expression: &TypedExpr) -> bool {
 			base: left,
 			predicate: right,
 		} => expr_contains_impure(left) || expr_contains_impure(right),
+		TypedExprKind::Fulltext {
+			left,
+			right,
+			..
+		} => expr_contains_impure(left) || expr_contains_impure(right),
+		TypedExprKind::Knn {
+			left,
+			k,
+			ef,
+			distance,
+			right,
+			..
+		} => {
+			expr_contains_impure(left)
+				|| expr_contains_impure(k)
+				|| ef.as_deref().is_some_and(expr_contains_impure)
+				|| match distance {
+					LogicalKnnDistance::Minkowski(value) | LogicalKnnDistance::Callable(value) => {
+						expr_contains_impure(value)
+					}
+					LogicalKnnDistance::Builtin(_) | LogicalKnnDistance::Named(_) => false,
+				}
+				|| expr_contains_impure(right)
+		}
 		TypedExprKind::Conditional {
 			condition,
 			then_value,

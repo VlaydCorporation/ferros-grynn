@@ -692,7 +692,9 @@ impl GqlSession {
 			return Ok(None);
 		}
 		let target = self.resolve_index_target(class_name, index_name)?;
-		self.store.enqueue_maintenance(MaintenanceJobKind::BuildIndex, target, None).map(Some)
+		self.store
+			.enqueue_maintenance_coalesced(MaintenanceJobKind::BuildIndex, target, None)
+			.map(Some)
 	}
 
 	fn execute_transaction_command(

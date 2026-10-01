@@ -9,8 +9,11 @@ mod tests;
 
 use crate::{
 	datastore::{
+		AnalyzerId,
+		AnalyzerTokenizer,
 		ClassId,
 		ClassIndexKind,
+		ClassIndexOptions,
 		ClassIndexState,
 		ClassSchemaMode,
 		FunctionEffect,
@@ -25,6 +28,40 @@ use crate::{
 	storage::{graph_pages::GraphArenaBindings, page::PageNo, types::DataFileId},
 	values::{PropertyKeyId, Text, Type},
 };
+
+/// One ordered analyzer filter in the durable catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::storage) enum AnalyzerFilterCatalogEntry {
+	Nfc,
+	Nfkc,
+	Ascii,
+	Lowercase,
+	Uppercase,
+	EdgeNgram {
+		min: u16,
+		max: u16,
+	},
+	Ngram {
+		min: u16,
+		max: u16,
+	},
+	Snowball(crate::datastore::AnalyzerLanguage),
+	/// Canonical `StorageValue::Object` bytes.
+	Mapper(Vec<u8>),
+}
+
+/// One durable text-analyzer definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::storage) struct AnalyzerCatalogEntry {
+	pub(in crate::storage) id: AnalyzerId,
+	pub(in crate::storage) version: SchemaVersion,
+	pub(in crate::storage) published_at: u64,
+	pub(in crate::storage) name: Text,
+	pub(in crate::storage) tokenizers: std::collections::BTreeSet<AnalyzerTokenizer>,
+	pub(in crate::storage) filters: Vec<AnalyzerFilterCatalogEntry>,
+	pub(in crate::storage) function: Option<(FunctionId, SchemaVersion)>,
+	pub(in crate::storage) comment: Option<Text>,
+}
 
 /// Exact physical root of one immutable index generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +100,9 @@ pub(in crate::storage) struct ClassIndexCatalogEntry {
 	pub(in crate::storage) build_revision: u64,
 	pub(in crate::storage) scope: IndexScope,
 	pub(in crate::storage) fields: Vec<PropertyKeyId>,
+	pub(in crate::storage) options: ClassIndexOptions,
 	pub(in crate::storage) physical: Option<PhysicalIndexBinding>,
+	pub(in crate::storage) delta: Option<PhysicalIndexBinding>,
 }
 
 /// One durable `RecordId` namespace definition.
@@ -152,6 +191,7 @@ pub(in crate::storage) struct DatabaseCatalog {
 	pub(in crate::storage) graphs: Vec<GraphCatalogEntry>,
 	pub(in crate::storage) parameters: Vec<ParameterCatalogEntry>,
 	pub(in crate::storage) functions: Vec<FunctionCatalogEntry>,
+	pub(in crate::storage) analyzers: Vec<AnalyzerCatalogEntry>,
 }
 
 impl DatabaseCatalog {

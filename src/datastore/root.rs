@@ -42,7 +42,7 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) indexes: Arc<IndexStoreRoot>,
 	pub(crate) statistics: Arc<StatisticsStore>,
 	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphRoot>>,
-	pub(crate) versions: BTreeMap<ConflictKey, u64>,
+	pub(crate) versions: Arc<BTreeMap<ConflictKey, u64>>,
 }
 
 /// Complete normalized-state violations collected for `ASSERT INVARIANTS`.
@@ -111,7 +111,7 @@ impl Default for DatabaseRoot {
 			indexes: Arc::new(IndexStoreRoot::default()),
 			statistics: Arc::new(StatisticsStore::default()),
 			graphs: BTreeMap::new(),
-			versions: BTreeMap::new(),
+			versions: Arc::new(BTreeMap::new()),
 		}
 	}
 }
@@ -999,7 +999,7 @@ impl DatabaseRoot {
 	}
 
 	pub(crate) fn mark_version(&mut self, key: ConflictKey, commit_ts: u64) {
-		self.versions.insert(key, commit_ts);
+		Arc::make_mut(&mut self.versions).insert(key, commit_ts);
 	}
 
 	pub(crate) fn advance_identity_clocks(&mut self, next_schema_id: u64, next_graph_id: u64) {

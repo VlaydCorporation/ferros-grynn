@@ -314,6 +314,8 @@ fn match_row(record: CursorRecord) -> FerrosGrynnResult<Row> {
 		current,
 		trace: None,
 		trace_cost: Number::Int(0),
+		fulltext: Vec::new(),
+		knn: Vec::new(),
 	})
 }
 

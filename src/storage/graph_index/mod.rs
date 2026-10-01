@@ -106,6 +106,7 @@ pub(crate) use external_sort::{
 	SortedIndexRecords,
 	check_external_sort_cancelled,
 	external_sort_metrics,
+	external_sort_run_budget,
 	with_external_sort_control,
 	with_external_sort_options,
 };

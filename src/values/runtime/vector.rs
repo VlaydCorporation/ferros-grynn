@@ -8,9 +8,12 @@ use std::{
 pub enum VectorKind {
 	F64,
 	F32,
+	F16,
 	I64,
 	I32,
 	I16,
+	I8,
+	U8,
 }
 
 #[derive(Debug, Clone)]
@@ -18,9 +21,12 @@ pub enum VectorKind {
 pub enum Vector {
 	F32(Vec<f32>),
 	F64(Vec<f64>),
+	F16(Vec<half::f16>),
 	I16(Vec<i16>),
 	I32(Vec<i32>),
 	I64(Vec<i64>),
+	I8(Vec<i8>),
+	U8(Vec<u8>),
 }
 
 impl Vector {
@@ -28,9 +34,12 @@ impl Vector {
 		match self {
 			Self::F32(_) => VectorKind::F32,
 			Self::F64(_) => VectorKind::F64,
+			Self::F16(_) => VectorKind::F16,
 			Self::I16(_) => VectorKind::I16,
 			Self::I32(_) => VectorKind::I32,
 			Self::I64(_) => VectorKind::I64,
+			Self::I8(_) => VectorKind::I8,
+			Self::U8(_) => VectorKind::U8,
 		}
 	}
 
@@ -38,9 +47,12 @@ impl Vector {
 		match self {
 			Self::F32(values) => values.len(),
 			Self::F64(values) => values.len(),
+			Self::F16(values) => values.len(),
 			Self::I16(values) => values.len(),
 			Self::I32(values) => values.len(),
 			Self::I64(values) => values.len(),
+			Self::I8(values) => values.len(),
+			Self::U8(values) => values.len(),
 		}
 	}
 
@@ -58,6 +70,13 @@ impl Vector {
 	pub fn as_f64(&self) -> Option<&[f64]> {
 		match self {
 			Self::F64(values) => Some(values),
+			_ => None,
+		}
+	}
+
+	pub fn as_f16(&self) -> Option<&[half::f16]> {
+		match self {
+			Self::F16(values) => Some(values),
 			_ => None,
 		}
 	}
@@ -82,6 +101,20 @@ impl Vector {
 			_ => None,
 		}
 	}
+
+	pub fn as_i8(&self) -> Option<&[i8]> {
+		match self {
+			Self::I8(values) => Some(values),
+			_ => None,
+		}
+	}
+
+	pub fn as_u8(&self) -> Option<&[u8]> {
+		match self {
+			Self::U8(values) => Some(values),
+			_ => None,
+		}
+	}
 }
 
 impl PartialEq for Vector {
@@ -103,9 +136,12 @@ impl Ord for Vector {
 		self.kind().cmp(&other.kind()).then_with(|| match (self, other) {
 			(Self::F32(left), Self::F32(right)) => compare_f32(left, right),
 			(Self::F64(left), Self::F64(right)) => compare_f64(left, right),
+			(Self::F16(left), Self::F16(right)) => compare_f16(left, right),
 			(Self::I16(left), Self::I16(right)) => left.cmp(right),
 			(Self::I32(left), Self::I32(right)) => left.cmp(right),
 			(Self::I64(left), Self::I64(right)) => left.cmp(right),
+			(Self::I8(left), Self::I8(right)) => left.cmp(right),
+			(Self::U8(left), Self::U8(right)) => left.cmp(right),
 			_ => Ordering::Equal,
 		})
 	}
@@ -117,10 +153,23 @@ impl Hash for Vector {
 		match self {
 			Self::F32(values) => hash_f32(values, state),
 			Self::F64(values) => hash_f64(values, state),
+			Self::F16(values) => hash_f16(values, state),
 			Self::I16(values) => values.hash(state),
 			Self::I32(values) => values.hash(state),
 			Self::I64(values) => values.hash(state),
+			Self::I8(values) => values.hash(state),
+			Self::U8(values) => values.hash(state),
 		}
+	}
+}
+
+fn canonical_f16(value: half::f16) -> u16 {
+	if value.is_nan() {
+		half::f16::NAN.to_bits()
+	} else if value == half::f16::ZERO {
+		half::f16::ZERO.to_bits()
+	} else {
+		value.to_bits()
 	}
 }
 
@@ -154,6 +203,16 @@ fn compare_f32(left: &[f32], right: &[f32]) -> Ordering {
 		.unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
+fn compare_f16(left: &[half::f16], right: &[half::f16]) -> Ordering {
+	left.iter()
+		.zip(right)
+		.find_map(|(left, right)| {
+			let ordering = compare_f16_value(*left, *right);
+			(ordering != Ordering::Equal).then_some(ordering)
+		})
+		.unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
 fn compare_f64(left: &[f64], right: &[f64]) -> Ordering {
 	left.iter()
 		.zip(right)
@@ -174,6 +233,16 @@ fn compare_f32_value(left: f32, right: f32) -> Ordering {
 	}
 }
 
+fn compare_f16_value(left: half::f16, right: half::f16) -> Ordering {
+	match (left.is_nan(), right.is_nan()) {
+		(true, true) => Ordering::Equal,
+		(true, false) => Ordering::Greater,
+		(false, true) => Ordering::Less,
+		(false, false) if left == half::f16::ZERO && right == half::f16::ZERO => Ordering::Equal,
+		(false, false) => left.total_cmp(&right),
+	}
+}
+
 fn compare_f64_value(left: f64, right: f64) -> Ordering {
 	match (left.is_nan(), right.is_nan()) {
 		(true, true) => Ordering::Equal,
@@ -188,6 +257,13 @@ fn hash_f32<H: Hasher>(values: &[f32], state: &mut H) {
 	values.len().hash(state);
 	for value in values {
 		canonical_f32(*value).hash(state);
+	}
+}
+
+fn hash_f16<H: Hasher>(values: &[half::f16], state: &mut H) {
+	values.len().hash(state);
+	for value in values {
+		canonical_f16(*value).hash(state);
 	}
 }
 
@@ -210,9 +286,12 @@ macro_rules! impl_from_vector {
 
 impl_from_vector!(f32, F32);
 impl_from_vector!(f64, F64);
+impl_from_vector!(half::f16, F16);
 impl_from_vector!(i16, I16);
 impl_from_vector!(i32, I32);
 impl_from_vector!(i64, I64);
+impl_from_vector!(i8, I8);
+impl_from_vector!(u8, U8);
 
 #[cfg(test)]
 mod tests {
@@ -234,5 +313,14 @@ mod tests {
 		let right = Vector::from(vec![0.0_f64, f64::from_bits(0x7ff8_0000_0000_0001)]);
 		assert_eq!(left, right);
 		assert_eq!(HashSet::from([left, right]).len(), 1);
+	}
+
+	#[test]
+	fn supports_f16_and_byte_vectors_with_canonical_float_identity() {
+		let left = Vector::from(vec![half::f16::from_f32(-0.0), half::f16::NAN]);
+		let right = Vector::from(vec![half::f16::ZERO, half::f16::from_bits(0x7e01)]);
+		assert_eq!(left, right);
+		assert_eq!(Vector::from(vec![-1_i8, 2]).as_i8(), Some([-1, 2].as_slice()));
+		assert_eq!(Vector::from(vec![1_u8, 255]).as_u8(), Some([1, 255].as_slice()));
 	}
 }

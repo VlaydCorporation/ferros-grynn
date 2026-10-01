@@ -46,9 +46,6 @@ fn create_generation_files_with_mode(
 	for image in &generation.files {
 		let path = image.entry.path.resolve(root);
 		if let Some(expected) = image.prewritten_page_count {
-			if !write_unreachable_home {
-				return Err(invalid("prewritten file reached a non-import generation"));
-			}
 			let file = DirectFile::open_read_write(&path)?;
 			if file.page_count() != expected {
 				return Err(invalid("prewritten file length disagrees with its catalog image"));
@@ -89,7 +86,7 @@ pub(super) fn stage_generation(
 ) -> FerrosGrynnResult<()> {
 	for image in &generation.files {
 		if image.prewritten_page_count.is_some() {
-			return Err(invalid("prewritten file cannot be staged through the page WAL"));
+			continue;
 		}
 		page_count(image)?;
 		for (number, page) in image.page_numbers.iter().copied().zip(&image.pages) {

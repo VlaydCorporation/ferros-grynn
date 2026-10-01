@@ -301,6 +301,9 @@ const fn vector_kind(kind: VectorKind) -> u8 {
 		VectorKind::I64 => 2,
 		VectorKind::I32 => 3,
 		VectorKind::I16 => 4,
+		VectorKind::F16 => 5,
+		VectorKind::I8 => 6,
+		VectorKind::U8 => 7,
 	}
 }
 
@@ -311,6 +314,9 @@ fn decode_vector_kind(value: u8) -> FerrosGrynnResult<VectorKind> {
 		2 => Ok(VectorKind::I64),
 		3 => Ok(VectorKind::I32),
 		4 => Ok(VectorKind::I16),
+		5 => Ok(VectorKind::F16),
+		6 => Ok(VectorKind::I8),
+		7 => Ok(VectorKind::U8),
 		_ => Err(invalid("schema type contains an unknown VectorKind")),
 	}
 }

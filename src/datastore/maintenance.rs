@@ -438,7 +438,7 @@ impl MaintenanceCoordinator {
 		Ok(())
 	}
 
-	fn recover_stale_indexes(&self, store: &StoreInner) -> FerrosGrynnResult<()> {
+	pub(crate) fn recover_stale_indexes(&self, store: &StoreInner) -> FerrosGrynnResult<()> {
 		let root = store.current_root();
 		let options = match store.options {
 			DatastoreOptions::InMemory(options) => options.maintenance,
@@ -460,6 +460,37 @@ impl MaintenanceCoordinator {
 					index: index_id,
 					version: index.version(),
 				};
+				let superseded = state
+					.jobs
+					.values()
+					.filter(|job| {
+						!terminal(job.state)
+							&& matches!(
+								job.target,
+								MaintenanceTarget::Index {
+									class,
+									index,
+									..
+								} if class == class_id && index == index_id
+							)
+							&& job.target != target
+					})
+					.map(|job| job.id)
+					.collect::<Vec<_>>();
+				for id in superseded {
+					if let Some(token) = state.cancellation_tokens.get(&id) {
+						token.store(true, Ordering::Release);
+					}
+					state.queue.retain(|queued| *queued != id);
+					if let Some(job) = state.jobs.get_mut(&id) {
+						job.state = MaintenanceJobState::Cancelled;
+						job.candidate_fingerprint = None;
+						job.diagnostic =
+							Some("superseded by a newer index definition version".to_owned());
+						job.updated_at = SystemTime::now();
+						changed = true;
+					}
+				}
 				if state.jobs.values().any(|job| job.target == target && !terminal(job.state)) {
 					continue;
 				}
@@ -478,6 +509,9 @@ impl MaintenanceCoordinator {
 		if changed && let Err(error) = persist_state(store, &state) {
 			*state = previous;
 			return Err(error);
+		}
+		if changed {
+			self.shared.wake.notify_one();
 		}
 		Ok(())
 	}
@@ -542,9 +576,37 @@ impl MaintenanceCoordinator {
 		options: MaintenanceOptions,
 		analyze_mode: Option<MaintenanceAnalyzeMode>,
 	) -> FerrosGrynnResult<JobId> {
+		self.enqueue_with_existing(store, kind, target, options, analyze_mode, false)
+	}
+
+	pub(crate) fn enqueue_coalesced(
+		&self,
+		store: &Arc<StoreInner>,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		options: MaintenanceOptions,
+		analyze_mode: Option<MaintenanceAnalyzeMode>,
+	) -> FerrosGrynnResult<JobId> {
+		self.enqueue_with_existing(store, kind, target, options, analyze_mode, true)
+	}
+
+	fn enqueue_with_existing(
+		&self,
+		store: &Arc<StoreInner>,
+		kind: MaintenanceJobKind,
+		target: MaintenanceTarget,
+		options: MaintenanceOptions,
+		analyze_mode: Option<MaintenanceAnalyzeMode>,
+		coalesce: bool,
+	) -> FerrosGrynnResult<JobId> {
 		self.start(store)?;
 		let mut state = self.shared.state.lock();
-		if state.jobs.values().any(|job| job.target == target && !terminal(job.state)) {
+		if let Some(existing) =
+			state.jobs.values().find(|job| job.target == target && !terminal(job.state))
+		{
+			if coalesce {
+				return Ok(existing.id);
+			}
 			return Err(FerrosGrynnError::maintenance_target_busy(target.display_name()));
 		}
 		let previous = state.clone();
@@ -913,9 +975,30 @@ pub(crate) enum MaintenanceRunOutcome {
 mod tests {
 	use super::*;
 	use crate::{
-		datastore::Datastore,
+		datastore::{Datastore, LocalOptions},
 		stats::{HistogramMethod, PropertyHistogramKey, StatisticsScope},
+		values::Vector,
 	};
+
+	static NEXT_LOCAL_DIRECTORY: std::sync::atomic::AtomicU64 =
+		std::sync::atomic::AtomicU64::new(0);
+
+	struct TestDirectory(std::path::PathBuf);
+
+	impl TestDirectory {
+		fn new() -> Self {
+			Self(std::env::temp_dir().join(format!(
+				"fgdb-{:016x}",
+				NEXT_LOCAL_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+			)))
+		}
+	}
+
+	impl Drop for TestDirectory {
+		fn drop(&mut self) {
+			drop(std::fs::remove_dir_all(&self.0));
+		}
+	}
 
 	#[test]
 	fn pending_index_queue_is_bounded_and_coalesces_to_full_rebuild() -> FerrosGrynnResult<()> {
@@ -943,6 +1026,148 @@ mod tests {
 		assert!(state.has_index_change_after(target, INDEX_PENDING_QUEUE_CAPACITY as u64));
 		state.acknowledge_index_changes(target, INDEX_PENDING_QUEUE_CAPACITY as u64 + 1);
 		assert!(!state.has_index_change_after(target, 0));
+		Ok(())
+	}
+
+	#[test]
+	fn maintenance_retries_when_dml_changes_the_built_snapshot() -> FerrosGrynnResult<()> {
+		let store = Datastore::in_memory();
+		let setup = store.execute(
+			"DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document TYPE \
+			 NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD \
+			 embedding ON CLASS document TYPE vector<f32>; CREATE document:a SET title = 'old', \
+			 embedding = $old; CREATE document:b SET title = 'other', embedding = $other; DEFINE \
+			 INDEX title_search ON CLASS document FIELDS title FULLTEXT ANALYZER words HIGHLIGHTS \
+			 SCOPE BASE; DEFINE INDEX embedding_disk ON CLASS document FIELDS embedding DISKANN \
+			 DIMENSION 2 TYPE F32 DIST EUCLIDEAN DEGREE 4 L_BUILD 8 ALPHA 1.2 SCOPE BASE;",
+			&Object::from_iter([
+				("old", Value::Vector(Vector::F32(vec![10.0, 0.0]))),
+				("other", Value::Vector(Vector::F32(vec![20.0, 0.0]))),
+			]),
+		)?;
+		if setup.iter().any(|result| result.result.is_err()) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"maintenance revision-race fixture setup failed",
+			));
+		}
+		let class = store
+			.class("document")
+			.ok_or_else(|| FerrosGrynnError::class_does_not_exist("document"))?;
+		let class_id = class.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("fixture class has no identity")
+		})?;
+		let targets = [
+			("title_search", "UPDATE document:a SET title = 'revision winner';", Object::new()),
+			(
+				"embedding_disk",
+				"UPDATE document:b SET embedding = $updated;",
+				Object::from_iter([("updated", Value::Vector(Vector::F32(vec![0.0, 0.0])))]),
+			),
+		];
+		for (name, mutation, parameters) in targets {
+			let index = class
+				.indexes()
+				.find(|index| index.name().as_str() == name)
+				.ok_or_else(|| FerrosGrynnError::invalid_storage_file("fixture index is absent"))?;
+			let target = MaintenanceTarget::Index {
+				class: class_id,
+				index: index.id().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("fixture index has no identity")
+				})?,
+				version: index.version(),
+			};
+			let job = MaintenanceJobInfo::new(
+				MaintenanceJobKind::RebuildIndex,
+				target,
+				store.inner.current_root().commit_ts,
+				MaintenanceOptions::default(),
+				None,
+			);
+			let id = job.id;
+			{
+				let mut state = store.inner.maintenance.shared.state.lock();
+				state.cancellation_tokens.insert(id, Arc::new(AtomicBool::new(false)));
+				state.jobs.insert(id, job);
+			}
+			begin_job(store.inner.maintenance.shared.as_ref(), store.inner.as_ref(), id)?;
+			let outcome = store.inner.run_maintenance_job_interleaved(id, || {
+				let results = store.execute(mutation, &parameters)?;
+				if results.iter().any(|result| result.result.is_err()) {
+					return Err(FerrosGrynnError::invalid_argument(
+						"interleaved DML failed during maintenance revision-race test",
+					));
+				}
+				Ok(())
+			})?;
+			if !matches!(outcome, MaintenanceRunOutcome::Retry) {
+				return Err(FerrosGrynnError::invalid_argument(
+					"maintenance published a candidate built from a stale snapshot",
+				));
+			}
+			finish_job(
+				store.inner.maintenance.shared.as_ref(),
+				store.inner.as_ref(),
+				id,
+				Ok(MaintenanceRunOutcome::Retry),
+			);
+			{
+				let mut state = store.inner.maintenance.shared.state.lock();
+				state.queue.retain(|queued| *queued != id);
+				let job = state
+					.jobs
+					.get(&id)
+					.ok_or_else(|| FerrosGrynnError::maintenance_job_not_found(id.to_string()))?;
+				assert_eq!(job.state(), MaintenanceJobState::Queued);
+				assert_eq!(job.restart_count(), 1);
+			}
+			begin_job(store.inner.maintenance.shared.as_ref(), store.inner.as_ref(), id)?;
+			let outcome = store.inner.run_maintenance_job(id)?;
+			if !matches!(outcome, MaintenanceRunOutcome::Completed) {
+				return Err(FerrosGrynnError::invalid_argument(
+					"maintenance retry did not publish the current snapshot",
+				));
+			}
+			finish_job(
+				store.inner.maintenance.shared.as_ref(),
+				store.inner.as_ref(),
+				id,
+				Ok(MaintenanceRunOutcome::Completed),
+			);
+			assert_eq!(
+				store
+					.job(id)?
+					.ok_or_else(|| FerrosGrynnError::maintenance_job_not_found(id.to_string()))?
+					.state(),
+				MaintenanceJobState::Completed,
+			);
+			let root = store.inner.current_root();
+			let built_class = root
+				.schema
+				.class_by_id(class_id)
+				.ok_or_else(|| FerrosGrynnError::invalid_storage_file("fixture class is absent"))?;
+			let built = built_class
+				.indexes()
+				.find(|index| index.name().as_str() == name)
+				.ok_or_else(|| FerrosGrynnError::invalid_storage_file("rebuilt index is absent"))?;
+			assert_eq!(built.build_revision(), root.commit_ts);
+		}
+
+		let query = Object::from_iter([("query", Value::Vector(Vector::F32(vec![0.0, 0.0])))]);
+		for (forced, scan) in [
+			(
+				"SELECT VALUE id FROM document WHERE title @@ 'winner' ORDER BY id;",
+				"SELECT VALUE id FROM document WITH NOINDEX WHERE title @@ 'winner' ORDER BY id;",
+			),
+			(
+				"SELECT VALUE id FROM document WHERE embedding <| 1, EUCLIDEAN |> $query;",
+				"SELECT VALUE id FROM document WITH NOINDEX WHERE embedding <| 1, EUCLIDEAN |> \
+				 $query;",
+			),
+		] {
+			let forced = store.execute(forced, &query)?.remove(0).result?.into_parts().0;
+			let scan = store.execute(scan, &query)?.remove(0).result?.into_parts().0;
+			assert_eq!(forced, scan);
+		}
 		Ok(())
 	}
 
@@ -1158,6 +1383,120 @@ mod tests {
 			coordinator.job(orphan_id).map(|job| job.state()),
 			Some(MaintenanceJobState::Cancelled)
 		);
+		Ok(())
+	}
+
+	#[test]
+	fn local_reopen_reconciles_published_interrupted_and_orphan_jobs() -> FerrosGrynnResult<()> {
+		let directory = TestDirectory::new();
+		let options = LocalOptions::default();
+		let store = Datastore::create_local(&directory.0, options)?;
+		let setup = store.execute(
+			"DEFINE CLASS document TYPE NODE SCHEMAFULL; DEFINE FIELD embedding ON CLASS document \
+			 TYPE vector<f32>; CREATE document:a SET embedding = $a; CREATE document:b SET \
+			 embedding = $b; DEFINE INDEX embedding_hnsw ON CLASS document FIELDS embedding HNSW \
+			 DIMENSION 2 TYPE F32 DIST EUCLIDEAN EFC 16 M 4 SCOPE BASE; DEFINE INDEX \
+			 embedding_disk ON CLASS document FIELDS embedding DISKANN DIMENSION 2 TYPE F32 DIST \
+			 EUCLIDEAN DEGREE 4 L_BUILD 8 ALPHA 1.2 SCOPE BASE;",
+			&Object::from_iter([
+				("a", Value::Vector(Vector::F32(vec![0.0, 0.0]))),
+				("b", Value::Vector(Vector::F32(vec![1.0, 0.0]))),
+			]),
+		)?;
+		if setup.iter().any(|result| result.result.is_err()) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"local maintenance recovery fixture setup failed",
+			));
+		}
+		let class = store
+			.class("document")
+			.ok_or_else(|| FerrosGrynnError::class_does_not_exist("document"))?;
+		let class_id = class.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("fixture class has no identity")
+		})?;
+		let hnsw =
+			class.indexes().find(|index| index.name().as_str() == "embedding_hnsw").ok_or_else(
+				|| FerrosGrynnError::invalid_storage_file("fixture HNSW index is absent"),
+			)?;
+		let disk_ann =
+			class.indexes().find(|index| index.name().as_str() == "embedding_disk").ok_or_else(
+				|| FerrosGrynnError::invalid_storage_file("fixture DiskANN index is absent"),
+			)?;
+		let hnsw_target = MaintenanceTarget::Index {
+			class: class_id,
+			index: hnsw.id().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("fixture HNSW index has no identity")
+			})?,
+			version: hnsw.version(),
+		};
+		let disk_ann_target = MaintenanceTarget::Index {
+			class: class_id,
+			index: disk_ann.id().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("fixture DiskANN index has no identity")
+			})?,
+			version: disk_ann.version(),
+		};
+		let source_revision = store.inner.current_root().commit_ts;
+		let mut published = MaintenanceJobInfo::new(
+			MaintenanceJobKind::RebuildIndex,
+			hnsw_target,
+			source_revision,
+			MaintenanceOptions::default(),
+			None,
+		);
+		published.state = MaintenanceJobState::Publishing;
+		published.candidate_fingerprint = Some(hnsw.build_revision());
+		let published_id = published.id();
+		let mut interrupted = MaintenanceJobInfo::new(
+			MaintenanceJobKind::RebuildIndex,
+			disk_ann_target,
+			source_revision,
+			MaintenanceOptions::default(),
+			None,
+		);
+		interrupted.state = MaintenanceJobState::Publishing;
+		interrupted.candidate_fingerprint = Some(disk_ann.build_revision().saturating_add(1));
+		let interrupted_id = interrupted.id();
+		let missing_graph = GraphId::new(u64::MAX)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("invalid fixture graph identity"))?;
+		let orphan = MaintenanceJobInfo::new(
+			MaintenanceJobKind::CompactGraph,
+			MaintenanceTarget::Graph(missing_graph),
+			source_revision,
+			MaintenanceOptions::default(),
+			None,
+		);
+		let orphan_id = orphan.id();
+		store.inner.persist_maintenance_jobs(&[published, interrupted, orphan])?;
+		drop(store);
+
+		let reopened = Datastore::open_local(&directory.0, options)?;
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		loop {
+			let published = reopened.job(published_id)?.ok_or_else(|| {
+				FerrosGrynnError::maintenance_job_not_found(published_id.to_string())
+			})?;
+			let interrupted = reopened.job(interrupted_id)?.ok_or_else(|| {
+				FerrosGrynnError::maintenance_job_not_found(interrupted_id.to_string())
+			})?;
+			let orphan = reopened.job(orphan_id)?.ok_or_else(|| {
+				FerrosGrynnError::maintenance_job_not_found(orphan_id.to_string())
+			})?;
+			if published.state() == MaintenanceJobState::Completed
+				&& interrupted.state() == MaintenanceJobState::Completed
+				&& orphan.state() == MaintenanceJobState::Cancelled
+			{
+				assert_eq!(interrupted.restart_count(), 1);
+				break;
+			}
+			if std::time::Instant::now() >= deadline {
+				return Err(FerrosGrynnError::invalid_argument(format!(
+					"local maintenance reconciliation timed out: {published:?}, {interrupted:?}, \
+					 {orphan:?}",
+				)));
+			}
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
 		Ok(())
 	}
 }

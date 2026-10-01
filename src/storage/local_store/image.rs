@@ -7,6 +7,7 @@ use super::{
 	GraphBinding,
 	catalog::encode_database_catalog,
 	cleanup::UnpublishedGeneration,
+	index_delta::{IndexReusePlan, RetainedDelta},
 	layout::{
 		DATABASE_CATALOG_CONTINUATION,
 		DATABASE_CATALOG_ROOT,
@@ -21,7 +22,16 @@ use super::{
 	},
 };
 use crate::{
-	datastore::{DataSpaceId, DatabaseRoot, GlobalAtomId, IndexId},
+	datastore::{
+		AnalyzedToken,
+		DataSpaceId,
+		DatabaseRoot,
+		FunctionId,
+		GlobalAtomId,
+		IndexId,
+		SchemaAnalyzer,
+		SchemaVersion,
+	},
 	gql_status::FerrosGrynnResult,
 	storage::{
 		atom_store_image::{
@@ -61,15 +71,21 @@ use crate::{
 			ScopedIndexFile,
 			ScopedIndexKind,
 			StreamedScopedIndexFile,
+			StreamedScopedIndexImages,
+			build_fulltext_index_images,
 			build_scoped_index_images,
+			build_vector_index_images,
 			validate_scoped_index_images,
+			write_streamed_fulltext_index_images,
 			write_streamed_scoped_indexes,
 			write_streamed_unique_file,
+			write_streamed_vector_index_images,
 		},
 		types::{DataFileId, DataFileKind},
 	},
 	values::{
 		Uuid,
+		Vector,
 		storage::{DiskAtomRef, EncodeContext, StorageValue},
 	},
 };
@@ -208,8 +224,85 @@ pub(super) fn build_generation(
 	database: &DatabaseRoot,
 	next_file_instance_id: u64,
 ) -> FerrosGrynnResult<BuiltGeneration> {
+	let mut analyze_function = |_analyzer: &SchemaAnalyzer, _input: &str| {
+		Err(invalid("function analyzer requires the datastore evaluator"))
+	};
+	let mut distance_function =
+		|function: FunctionId, _version: SchemaVersion, _left: &Vector, _right: &Vector| {
+			Err(invalid(format!(
+				"custom vector distance function {function} requires the datastore evaluator"
+			)))
+		};
+	build_generation_with_reuse(
+		database,
+		next_file_instance_id,
+		IndexReusePlan::default(),
+		&mut analyze_function,
+		&mut distance_function,
+	)
+}
+
+/// Builds one ordinary generation while retaining compatible immutable index
+/// bases and publishing only their exact row deltas.
+pub(super) fn build_generation_with_reuse(
+	database: &DatabaseRoot,
+	next_file_instance_id: u64,
+	reuse: IndexReusePlan,
+	analyze_function: &mut dyn FnMut(
+		&SchemaAnalyzer,
+		&str,
+	) -> FerrosGrynnResult<Vec<AnalyzedToken>>,
+	distance_function: &mut dyn FnMut(
+		FunctionId,
+		SchemaVersion,
+		&Vector,
+		&Vector,
+	) -> FerrosGrynnResult<f64>,
+) -> FerrosGrynnResult<BuiltGeneration> {
 	let generation = Uuid::now_v7().to_string();
-	build_generation_inner(database, next_file_instance_id, &generation, None)
+	build_generation_inner(
+		database,
+		next_file_instance_id,
+		&generation,
+		None,
+		false,
+		reuse,
+		analyze_function,
+		distance_function,
+	)
+}
+
+/// Builds an ordinary WAL-backed generation while streaming immutable
+/// specialized index bases directly into its unreachable directory.
+pub(super) fn build_streamed_generation_with_reuse(
+	database: &DatabaseRoot,
+	next_file_instance_id: u64,
+	root: &Path,
+	reuse: IndexReusePlan,
+	analyze_function: &mut dyn FnMut(
+		&SchemaAnalyzer,
+		&str,
+	) -> FerrosGrynnResult<Vec<AnalyzedToken>>,
+	distance_function: &mut dyn FnMut(
+		FunctionId,
+		SchemaVersion,
+		&Vector,
+		&Vector,
+	) -> FerrosGrynnResult<f64>,
+) -> FerrosGrynnResult<(BuiltGeneration, UnpublishedGeneration)> {
+	let generation = Uuid::now_v7().to_string();
+	let unpublished = UnpublishedGeneration::for_database(root, database, &generation);
+	let built = build_generation_inner(
+		database,
+		next_file_instance_id,
+		&generation,
+		Some(root),
+		false,
+		reuse,
+		analyze_function,
+		distance_function,
+	)?;
+	Ok((built, unpublished))
 }
 
 /// Builds one import generation while cleanup is armed before any streamed
@@ -218,10 +311,29 @@ pub(super) fn build_import_generation(
 	database: &DatabaseRoot,
 	next_file_instance_id: u64,
 	root: &Path,
+	analyze_function: &mut dyn FnMut(
+		&SchemaAnalyzer,
+		&str,
+	) -> FerrosGrynnResult<Vec<AnalyzedToken>>,
+	distance_function: &mut dyn FnMut(
+		FunctionId,
+		SchemaVersion,
+		&Vector,
+		&Vector,
+	) -> FerrosGrynnResult<f64>,
 ) -> FerrosGrynnResult<(BuiltGeneration, UnpublishedGeneration)> {
 	let generation = Uuid::now_v7().to_string();
 	let unpublished = UnpublishedGeneration::for_database(root, database, &generation);
-	let built = build_generation_inner(database, next_file_instance_id, &generation, Some(root))?;
+	let built = build_generation_inner(
+		database,
+		next_file_instance_id,
+		&generation,
+		Some(root),
+		true,
+		IndexReusePlan::default(),
+		analyze_function,
+		distance_function,
+	)?;
 	Ok((built, unpublished))
 }
 
@@ -230,12 +342,32 @@ fn build_generation_inner(
 	next_file_instance_id: u64,
 	generation: &str,
 	stream_root: Option<&Path>,
+	import: bool,
+	reuse: IndexReusePlan,
+	analyze_function: &mut dyn FnMut(
+		&SchemaAnalyzer,
+		&str,
+	) -> FerrosGrynnResult<Vec<AnalyzedToken>>,
+	distance_function: &mut dyn FnMut(
+		FunctionId,
+		SchemaVersion,
+		&Vector,
+		&Vector,
+	) -> FerrosGrynnResult<f64>,
 ) -> FerrosGrynnResult<BuiltGeneration> {
+	if import && stream_root.is_none() {
+		return Err(invalid("import generation has no streaming root"));
+	}
+	let import_root = if import {
+		stream_root
+	} else {
+		None
+	};
 	let mut context = value_context(&database.schema, database.dictionary.as_ref().clone())?;
 	prime_value_context(database, &mut context)?;
 
 	let atom_prefix = atom_prefix(generation);
-	let atom = match stream_root {
+	let atom = match import_root {
 		Some(root) => {
 			let image = build_import_atom_store_image_with_context(
 				&database.atoms,
@@ -261,7 +393,7 @@ fn build_generation_inner(
 			|index| Ok(GenerationIndex::Buffered(index)),
 		)?,
 	};
-	let reverse = match stream_root {
+	let reverse = match import_root {
 		Some(root) => {
 			let records = build_import_reverse_membership_image(database, root)?;
 			GenerationIndex::Prewritten(write_streamed_unique_file::<DiskAtomRef>(
@@ -275,7 +407,7 @@ fn build_generation_inner(
 	let mut graph_images = BTreeMap::new();
 	for graph in database.schema.all_graphs() {
 		let graph_id = graph.id();
-		let image = match stream_root {
+		let image = match import_root {
 			Some(root) => {
 				let image =
 					build_import_durable_graph_image(database, graph_id, &mut context, root)?;
@@ -296,16 +428,53 @@ fn build_generation_inner(
 		};
 		graph_images.insert(graph_id, image);
 	}
-	let mut scoped = if stream_root.is_none() {
+	let mut scoped = if import_root.is_none() {
 		let images = build_scoped_index_images(database)?;
 		validate_scoped_index_images(&images, database)?;
 		Some(images)
 	} else {
 		None
 	};
-	let mut streamed = stream_root
-		.map(|root| write_streamed_scoped_indexes(database, root, generation))
-		.transpose()?;
+	let mut streamed = match import_root {
+		Some(root) => Some(write_streamed_scoped_indexes(database, root, generation)?),
+		None if stream_root.is_some() => Some(StreamedScopedIndexImages::default()),
+		None => None,
+	};
+	let skipped = reuse.skipped_builds();
+	let mut fulltext = match stream_root {
+		Some(root) => {
+			let images = write_streamed_fulltext_index_images(
+				database,
+				&skipped,
+				root,
+				generation,
+				analyze_function,
+			)?;
+			merge_streamed_images(
+				streamed.as_mut().ok_or_else(|| invalid("streamed index accumulator is absent"))?,
+				images,
+			)?;
+			None
+		}
+		None => Some(build_fulltext_index_images(database, &skipped, analyze_function)?),
+	};
+	let mut vectors = match stream_root {
+		Some(root) => {
+			let images = write_streamed_vector_index_images(
+				database,
+				&skipped,
+				root,
+				generation,
+				distance_function,
+			)?;
+			merge_streamed_images(
+				streamed.as_mut().ok_or_else(|| invalid("streamed index accumulator is absent"))?,
+				images,
+			)?;
+			None
+		}
+		None => Some(build_vector_index_images(database, &skipped, distance_function)?),
+	};
 
 	let mut layout = LayoutBuilder::new(next_file_instance_id);
 	let atom_superblock = atom.superblock;
@@ -363,6 +532,14 @@ fn build_generation_inner(
 	add_base_statistics(&mut layout, &atom_prefix, database)?;
 
 	let mut physical_indexes = BTreeMap::new();
+	let mut physical_deltas = BTreeMap::new();
+	add_reused_indexes(
+		&mut layout,
+		generation,
+		reuse,
+		&mut physical_indexes,
+		&mut physical_deltas,
+	)?;
 	if let Some(images) = &mut scoped {
 		add_scoped_indexes(
 			&mut layout,
@@ -375,6 +552,24 @@ fn build_generation_inner(
 	if let Some(images) = &mut streamed {
 		add_streamed_scoped_indexes(
 			&mut layout,
+			std::mem::take(&mut images.base),
+			&mut physical_indexes,
+		)?;
+	}
+	if let Some(images) = &mut fulltext {
+		add_scoped_indexes(
+			&mut layout,
+			DataSpaceId::Database,
+			&atom_prefix,
+			std::mem::take(&mut images.base),
+			&mut physical_indexes,
+		)?;
+	}
+	if let Some(images) = &mut vectors {
+		add_scoped_indexes(
+			&mut layout,
+			DataSpaceId::Database,
+			&atom_prefix,
 			std::mem::take(&mut images.base),
 			&mut physical_indexes,
 		)?;
@@ -398,6 +593,25 @@ fn build_generation_inner(
 		if let Some(indexes) = streamed.as_mut().and_then(|images| images.graphs.remove(&graph_id))
 		{
 			add_streamed_scoped_indexes(&mut layout, indexes, &mut physical_indexes)?;
+		}
+		if let Some(indexes) = fulltext.as_mut().and_then(|images| images.graphs.remove(&graph_id))
+		{
+			add_scoped_indexes(
+				&mut layout,
+				DataSpaceId::Graph(graph_id),
+				&prefix,
+				indexes,
+				&mut physical_indexes,
+			)?;
+		}
+		if let Some(indexes) = vectors.as_mut().and_then(|images| images.graphs.remove(&graph_id)) {
+			add_scoped_indexes(
+				&mut layout,
+				DataSpaceId::Graph(graph_id),
+				&prefix,
+				indexes,
+				&mut physical_indexes,
+			)?;
 		}
 		raw_graphs.push(raw);
 	}
@@ -427,6 +641,7 @@ fn build_generation_inner(
 		reverse,
 		graphs,
 		physical_indexes,
+		physical_deltas,
 	};
 	let atom_binding = AtomStoreCatalogBinding {
 		generation: database.commit_ts,
@@ -444,6 +659,7 @@ fn build_generation_inner(
 		atom_binding,
 		&bindings.graphs,
 		&bindings.physical_indexes,
+		&bindings.physical_deltas,
 		&mut context,
 	)?;
 	append_catalog_pages(&mut files, &file_catalog, &database_catalog)?;
@@ -742,6 +958,69 @@ fn add_scoped_indexes(
 	Ok(())
 }
 
+fn add_reused_indexes(
+	layout: &mut LayoutBuilder,
+	generation: &str,
+	reuse: IndexReusePlan,
+	physical: &mut BTreeMap<IndexId, PhysicalIndexBinding>,
+	deltas: &mut BTreeMap<IndexId, PhysicalIndexBinding>,
+) -> FerrosGrynnResult<()> {
+	let mut ordinals = BTreeMap::<(crate::datastore::IndexScope, u8), u32>::new();
+	for (index, retained) in reuse.indexes {
+		layout.retain(retained.base_entry)?;
+		if physical.insert(index, retained.base).is_some() {
+			return Err(invalid("retained index has multiple immutable bases"));
+		}
+		let binding = match retained.delta {
+			RetainedDelta::None => continue,
+			RetainedDelta::Existing {
+				binding,
+				entry,
+			} => {
+				layout.retain(entry)?;
+				binding
+			}
+			RetainedDelta::Replacement(pages) => {
+				let kind = match retained.kind {
+					crate::datastore::ClassIndexKind::Fulltext => (0, "ft_delta"),
+					crate::datastore::ClassIndexKind::Hnsw => (1, "hnsw_delta"),
+					crate::datastore::ClassIndexKind::DiskAnn => (2, "diskann_delta"),
+					_ => return Err(invalid("non-specialized index reached delta publication")),
+				};
+				let ordinal = ordinals.entry((retained.scope, kind.0)).or_default();
+				let current = *ordinal;
+				*ordinal = ordinal
+					.checked_add(1)
+					.ok_or_else(|| invalid("index delta ordinal exceeds u32"))?;
+				let (space, prefix) = match retained.scope {
+					crate::datastore::IndexScope::Base => {
+						(DataSpaceId::Database, atom_prefix(generation))
+					}
+					crate::datastore::IndexScope::Effective {
+						graph,
+					} => (DataSpaceId::Graph(graph), graph_prefix(graph, generation)),
+				};
+				let file_id = layout.add(
+					space,
+					DataFileKind::Index,
+					DataFileRole::WalBackfilled,
+					format!("{prefix}/idx/{}_{current:04}.fgidx", kind.1),
+					None,
+					pages,
+				)?;
+				PhysicalIndexBinding {
+					file_id,
+					root: PageNo::new(0),
+				}
+			}
+		};
+		if deltas.insert(index, binding).is_some() {
+			return Err(invalid("retained index has multiple exact deltas"));
+		}
+	}
+	Ok(())
+}
+
 fn add_streamed_scoped_indexes(
 	layout: &mut LayoutBuilder,
 	indexes: Vec<StreamedScopedIndexFile>,
@@ -775,6 +1054,22 @@ fn add_streamed_scoped_indexes(
 				.is_some()
 		{
 			return Err(invalid("explicit index has multiple physical generations"));
+		}
+	}
+	Ok(())
+}
+
+fn merge_streamed_images(
+	target: &mut StreamedScopedIndexImages,
+	mut source: StreamedScopedIndexImages,
+) -> FerrosGrynnResult<()> {
+	target.base.append(&mut source.base);
+	for (graph, mut files) in source.graphs {
+		target.graphs.entry(graph).or_default().append(&mut files);
+	}
+	for (index, elapsed) in source.index_timings {
+		if target.index_timings.insert(index, elapsed).is_some() {
+			return Err(invalid("streamed index timing contains a duplicate IndexId"));
 		}
 	}
 	Ok(())
@@ -827,6 +1122,20 @@ pub(super) fn prime_value_context(
 	}
 	for parameter in database.schema.parameters() {
 		drop(StorageValue::from_runtime(parameter.value().clone(), context)?);
+	}
+	for analyzer in database.schema.analyzers() {
+		for filter in analyzer.filters() {
+			let crate::datastore::AnalyzerFilter::Mapper(entries) = filter else {
+				continue;
+			};
+			let value = crate::values::Object::from_iter(entries.iter().map(|(source, target)| {
+				(
+					source.clone(),
+					target.clone().map_or(crate::values::Value::Null, crate::values::Value::String),
+				)
+			}));
+			drop(StorageValue::from_runtime(crate::values::Value::Object(value), context)?);
+		}
 	}
 	Ok(())
 }

@@ -11,6 +11,7 @@ pub(crate) mod import;
 mod ir;
 pub(crate) mod optimizer;
 mod options;
+mod pure_function;
 pub(crate) mod spill;
 
 use std::time::Duration;
@@ -24,6 +25,7 @@ pub(crate) use execution::{
 };
 pub(crate) use options::{ExecutionControl, resolve_timeout};
 pub use options::{QueryCancellation, QueryExecutionOptions};
+pub(crate) use pure_function::PureFunctionEvaluator;
 
 use crate::{
 	gql_status::{FerrosGrynnResult, Outcome},
@@ -71,6 +73,7 @@ pub use crate::{
 		Expr,
 		ExprKind,
 		ForStatement,
+		FulltextOperator,
 		GraphContract,
 		GraphFamilyName,
 		GraphPropertyAssignment,
@@ -87,6 +90,8 @@ pub use crate::{
 		IndexScopeName,
 		InfoStatement,
 		InfoTarget,
+		KnnDistance,
+		KnnSearchArgument,
 		LetStatement,
 		LetValue,
 		Literal,
@@ -137,6 +142,8 @@ pub use crate::{
 		TypeName,
 		UnaryOperator,
 		UpdateGraphStatement,
+		VectorDistanceName,
+		VectorElementName,
 		WhileStatement,
 	},
 	values::QueryCursor,
@@ -281,6 +288,7 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		| StatementKind::DefineClass(_)
 		| StatementKind::DefineField(_)
 		| StatementKind::DefineIndex(_)
+		| StatementKind::DefineAnalyzer(_)
 		| StatementKind::DefineFunction(_)
 		| StatementKind::DefineParameter(_) => QueryStatementKind::Define,
 		StatementKind::Remove(_) => QueryStatementKind::Remove,
@@ -318,6 +326,7 @@ pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
 			| StatementKind::DefineClass(_)
 			| StatementKind::DefineField(_)
 			| StatementKind::DefineIndex(_)
+			| StatementKind::DefineAnalyzer(_)
 			| StatementKind::DefineFunction(_)
 			| StatementKind::DefineParameter(_)
 			| StatementKind::Remove(_)

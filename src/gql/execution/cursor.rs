@@ -24,6 +24,23 @@ pub(super) struct BoundAtom {
 	pub(super) atom: AtomId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FulltextMatch {
+	pub(super) predicate: u32,
+	pub(super) slot: Option<u16>,
+	pub(super) matched: bool,
+	pub(super) highlights: bool,
+	pub(super) score_bits: u64,
+	pub(super) text: Box<str>,
+	pub(super) spans: Vec<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KnnMatch {
+	pub(super) predicate: u32,
+	pub(super) distance_bits: u64,
+}
+
 impl BoundAtom {
 	pub(super) const fn new(graph: crate::graph::GraphId, atom: AtomId) -> Self {
 		Self {
@@ -59,6 +76,10 @@ pub(super) struct Row {
 	trace: Option<PathTraceId>,
 	/// Exact cumulative cost stored in the active trace.
 	trace_cost: Number,
+	/// Fulltext outcomes materialized before relational filtering.
+	pub(super) fulltext: Vec<FulltextMatch>,
+	/// Exact or ANN KNN membership materialized before filtering.
+	pub(super) knn: Vec<KnnMatch>,
 }
 
 impl Row {
@@ -77,6 +98,8 @@ impl Row {
 			current: None,
 			trace: None,
 			trace_cost: Number::Int(0),
+			fulltext: Vec::new(),
+			knn: Vec::new(),
 		}
 	}
 
@@ -116,6 +139,8 @@ impl Row {
 			current: None,
 			trace: None,
 			trace_cost: Number::Int(0),
+			fulltext: Vec::new(),
+			knn: Vec::new(),
 		}
 	}
 
@@ -171,6 +196,18 @@ impl Row {
 		self
 	}
 
+	pub(super) fn fulltext_match(&self, predicate: u32) -> Option<&FulltextMatch> {
+		self.fulltext.iter().find(|entry| entry.predicate == predicate)
+	}
+
+	pub(super) fn fulltext_slot(&self, slot: u16) -> Option<&FulltextMatch> {
+		self.fulltext.iter().find(|entry| entry.slot == Some(slot))
+	}
+
+	pub(super) fn knn_match(&self, predicate: u32) -> Option<KnnMatch> {
+		self.knn.iter().copied().find(|entry| entry.predicate == predicate)
+	}
+
 	pub(super) fn estimated_heap_bytes(&self) -> usize {
 		size_of::<Self>()
 			.saturating_add(self.values.capacity().saturating_mul(size_of::<Value>()))
@@ -199,6 +236,13 @@ impl Row {
 			.saturating_add(self.atoms.capacity().saturating_mul(size_of::<Option<BoundAtom>>()))
 			.saturating_add(self.used_edges.capacity().saturating_mul(size_of::<BoundAtom>()))
 			.saturating_add(self.used_atoms.capacity().saturating_mul(size_of::<BoundAtom>()))
+			.saturating_add(self.fulltext.iter().fold(0_usize, |bytes, entry| {
+				bytes
+					.saturating_add(size_of::<FulltextMatch>())
+					.saturating_add(entry.text.len())
+					.saturating_add(entry.spans.capacity().saturating_mul(size_of::<(u32, u32)>()))
+			}))
+			.saturating_add(self.knn.capacity().saturating_mul(size_of::<KnnMatch>()))
 	}
 }
 
@@ -232,6 +276,37 @@ pub(super) struct PhysicalOccurrenceFieldsBatch {
 	pub(super) wal_pages: u64,
 	pub(super) sync_home_pages: u64,
 	pub(super) ioring_home_pages: u64,
+}
+
+/// One query-term contribution read from an immutable Fulltext binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PhysicalFulltextTerm {
+	pub(super) document_frequency: u64,
+	pub(super) term_frequency: u32,
+	pub(super) spans: Vec<(u32, u32)>,
+}
+
+/// One matching document addressed only by its public record identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PhysicalFulltextDocument {
+	pub(super) record_id: RecordId,
+	pub(super) document_length: u32,
+	pub(super) terms: std::collections::BTreeMap<Box<str>, PhysicalFulltextTerm>,
+}
+
+/// Exact statistics and matching documents from one snapshot-bound index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PhysicalFulltextBatch {
+	pub(super) document_count: u64,
+	pub(super) total_document_length: u64,
+	pub(super) documents: Vec<PhysicalFulltextDocument>,
+}
+
+/// One ANN candidate addressed only by its public record identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PhysicalVectorHit {
+	pub(super) record_id: RecordId,
+	pub(super) distance_bits: u64,
 }
 
 pub(super) trait QueryRead {
@@ -295,6 +370,30 @@ pub(super) trait QueryRead {
 		index: crate::datastore::IndexId,
 		graph: Option<&GraphRef>,
 	) -> FerrosGrynnResult<u64>;
+
+	/// Reads one immutable Fulltext binding without exposing storage addresses.
+	/// `None` requests the exact analyzer scan fallback.
+	fn fulltext_index(
+		&self,
+		snapshot: Snapshot,
+		class: &str,
+		graph: Option<&GraphRef>,
+		index: crate::datastore::IndexId,
+		terms: &std::collections::BTreeSet<Box<str>>,
+	) -> FerrosGrynnResult<Option<PhysicalFulltextBatch>>;
+
+	/// Searches one immutable ANN binding without exposing storage addresses.
+	/// `None` requests the bounded exact-scan fallback.
+	fn vector_index(
+		&self,
+		snapshot: Snapshot,
+		class: &str,
+		graph: Option<&GraphRef>,
+		index: crate::datastore::IndexId,
+		query: &crate::values::Vector,
+		k: usize,
+		breadth: usize,
+	) -> FerrosGrynnResult<Option<Vec<PhysicalVectorHit>>>;
 
 	/// Opens an exact full-key probe of one transaction-visible scalar index.
 	fn probe_index<'a>(
