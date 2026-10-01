@@ -25,12 +25,7 @@ use crate::{
 		fulltext_index_delta::{FulltextDeltaRecord, FulltextDeltaSpec, build_fulltext_delta},
 		page::AlignedPage,
 		scoped_index_image::local_address,
-		vector_index::{
-			DecodedVectorIndex,
-			VectorDeltaRecord,
-			VectorDeltaSpec,
-			build_vector_delta,
-		},
+		vector_index::{VectorDeltaRecord, VectorDeltaSpec, build_vector_delta},
 	},
 	values::{PropertyKeyId, RecordId, Value, storage::DiskAtomRef},
 };
@@ -150,8 +145,28 @@ impl LocalStore {
 						delta,
 						analyze_function,
 					)?,
+					(PhysicalIndexEntries::Hnsw(base), delta) => prepare_vector_delta(
+						previous,
+						next,
+						changed_records,
+						base.spec,
+						base.posting_count,
+						delta,
+					)?,
 					(PhysicalIndexEntries::Vector(base), delta) => {
-						prepare_vector_delta(previous, next, changed_records, base, delta)?
+						let population = base.nodes.iter().try_fold(0_usize, |count, node| {
+							count
+								.checked_add(node.postings.len())
+								.ok_or_else(|| invalid("vector posting count exceeds usize"))
+						})?;
+						prepare_vector_delta(
+							previous,
+							next,
+							changed_records,
+							base.spec,
+							population,
+							delta,
+						)?
 					}
 					_ => None,
 				};
@@ -276,7 +291,8 @@ fn prepare_vector_delta(
 	previous: &DatabaseRoot,
 	next: &DatabaseRoot,
 	changed: &BTreeSet<RecordId>,
-	base: &DecodedVectorIndex,
+	spec: crate::storage::vector_index::VectorBuildSpec,
+	population: usize,
 	delta: &Option<PhysicalIndexDelta>,
 ) -> FerrosGrynnResult<Option<PreparedDelta>> {
 	let mut records = match delta {
@@ -291,8 +307,8 @@ fn prepare_vector_delta(
 	};
 	let mut touched = false;
 	for record in changed {
-		let old = vector_row(previous, record, base.spec.class, base.spec.scope, base.spec.field)?;
-		let new = vector_row(next, record, base.spec.class, base.spec.scope, base.spec.field)?;
+		let old = vector_row(previous, record, spec.class, spec.scope, spec.field)?;
+		let new = vector_row(next, record, spec.class, spec.scope, spec.field)?;
 		if old == new {
 			continue;
 		}
@@ -313,17 +329,12 @@ fn prepare_vector_delta(
 	if !touched {
 		return Ok(Some(PreparedDelta::Unchanged));
 	}
-	let population = base.nodes.iter().try_fold(0_usize, |count, node| {
-		count
-			.checked_add(node.postings.len())
-			.ok_or_else(|| invalid("vector posting count exceeds usize"))
-	})?;
 	if records.len() > rebuild_threshold(population) {
 		return Ok(None);
 	}
 	let pages = build_vector_delta(
 		VectorDeltaSpec {
-			base: base.spec,
+			base: spec,
 			revision: next.commit_ts,
 		},
 		records.into_values().collect(),

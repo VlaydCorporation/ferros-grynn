@@ -1311,6 +1311,8 @@ publication.
 | `QueryExecutionOptions.max_graph_nodes/edges` | лимиты graph assembly                 | 1e6 / 5e6     |
 | `MaintenanceOptions.max_memory_bytes`         | общий budget одного maintenance build | 256 MiB       |
 | `MaintenanceOptions.max_parallelism`          | верхняя граница scoped run workers    | ядра          |
+| `FG_HNSW_CACHE_SIZE`                          | общий cache vector payload HNSW       | 256 MiB       |
+| `FG_HNSW_BUILD_MEM`                           | admission budget построения HNSW      | 2 GiB         |
 | `FG_TRAVERSAL_READ_YOUR_WRITES`               | видимость своих мутаций traversal'ом  | false         |
 | `FG_TEMPFILES_PATH`                           | каталог для `SELECT … TEMPFILES`      | ""            |
 | `FG_ASYNC_EVENT_PROCESSING_INTERVAL`          | интервал async-событий                | 5000 ms       |

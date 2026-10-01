@@ -4199,27 +4199,31 @@ TensorCachePage инвалидируется при любом изменени�
 
 ### 27.2. Runtime-параметры GA-core
 
-Ferros-Grynn является embedded library: единственная authority — явно переданные Rust options.
-Environment variables не переопределяют их. `Datastore::options()` возвращает выбранные значения,
+Ferros-Grynn является embedded library: обычная authority — явно переданные Rust options.
+Environment variables не переопределяют их. Исключение составляют два process-wide ресурса HNSW,
+которые нельзя корректно раздать по отдельным datastore: `FG_HNSW_CACHE_SIZE` и
+`FG_HNSW_BUILD_MEM`. Они читаются один раз при первом использовании HNSW.
+`Datastore::options()` возвращает выбранные per-store значения,
 `Datastore::local_storage_status()` — effective storage budgets и pressure counters.
 
-| Rust API                                      | Тип/Default       | Описание |
-|-----------------------------------------------|-------------------|----------|
-| `LocalOptions::buffer_pool_pages`             | `usize` / 4096    | Общий resident budget в 16-КиБ frames для всех файлов и версий |
-| `LocalOptions::checkpoint.unbackfilled_page_percent` | `u8` / 25 | Passive checkpoint threshold как доля resident frames |
-| `LocalOptions::checkpoint.interval`           | 300 sec           | Максимальный интервал между checkpoint attempts при наличии WAL-only pages |
-| `LocalOptions::max_snapshot_age`              | 300 sec           | Максимальный возраст MVCC snapshot |
-| `LocalOptions::max_write_set_bytes`           | 256 MiB           | Логический precommit write-set ceiling |
-| `QueryExecutionOptions::barrier_memory_bytes` | 256 MiB           | Общий statement budget join/group/order/distinct spill |
-| `QueryExecutionOptions::temporary_directory`  | `None`            | Явный query scratch root; иначе database-owned/system temp |
+| Rust API                                             | Тип/Default       | Описание                                                                                        |
+|------------------------------------------------------|-------------------|-------------------------------------------------------------------------------------------------|
+| `LocalOptions::buffer_pool_pages`                    | `usize` / 4096    | Общий resident budget в 16-КиБ frames для всех файлов и версий                                  |
+| `LocalOptions::checkpoint.unbackfilled_page_percent` | `u8` / 25         | Passive checkpoint threshold как доля resident frames                                           |
+| `LocalOptions::checkpoint.interval`                  | 300 sec           | Максимальный интервал между checkpoint attempts при наличии WAL-only pages                      |
+| `LocalOptions::max_snapshot_age`                     | 300 sec           | Максимальный возраст MVCC snapshot                                                              |
+| `LocalOptions::max_write_set_bytes`                  | 256 MiB           | Логический precommit write-set ceiling                                                          |
+| `QueryExecutionOptions::barrier_memory_bytes`        | 256 MiB           | Общий statement budget join/group/order/distinct spill                                          |
+| `QueryExecutionOptions::temporary_directory`         | `None`            | Явный query scratch root; иначе database-owned/system temp                                      |
+| `FG_HNSW_CACHE_SIZE`                                 | `usize` / 256 MiB | Общий process-wide budget только для vector payload всех HNSW-индексов; `0` отключает retention |
 
 Transient transport budget вычисляется как `min(288, floor(buffer_pool_pages / 10))`; scatter,
 prefetch, QD и cache policy не являются пользовательскими knobs. Process-wide allocation tracking
 служит диагностикой и не имеет скрытого environment-configured admission threshold.
 
-Имена `FG_*` в следующих разделах обозначают compile-time constants или исторические имена
-policy, а не читаемые production environment variables. Runtime-граница этапа 20 —
-`MaintenanceOptions` и bounded overrides `ImportOptions`.
+Кроме двух HNSW-исключений выше, имена `FG_*` в следующих разделах обозначают compile-time
+constants или исторические имена policy, а не читаемые production environment variables.
+Runtime-граница этапа 20 — `MaintenanceOptions` и bounded overrides `ImportOptions`.
 
 **Журнал и checkpoint** (§22–§23)
 
@@ -4239,19 +4243,20 @@ parallelism через `MaintenanceOptions` и import overrides; merge fan-in о
 `11–26%` роста page-set при допустимом лимите `5%`. Возможная иная bounded/adaptive policy
 отслеживается в `Q-39`; текущий immutable generation packer не разрежается.
 
-| Параметр                              | Тип   | Default   | Описание                                                                       |
-|---------------------------------------|-------|-----------|--------------------------------------------------------------------------------|
-| `FG_BULK_SORT_MEM`                    | usize | 268435456 | Память на прогон внешней сортировки (256 МиБ)                                  |
-| `FG_BULK_SORT_MERGE_FANIN`            | usize | 64        | Степень k-путёвого слияния                                                     |
-| `FG_BULK_SORT_PARALLELISM`            | usize | ядра      | Потоки генерации прогонов                                                      |
-| `FG_INDEX_BTREE_FILL_FACTOR`          | f64   | **0.90**  | Заполнение листьев B+tree (было 0.80); 1.00 автоматически при монотонном ключе |
-| `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | f64   | 0.95      | Заполнение внутренних узлов B+tree                                             |
-| `FG_INDEX_RTREE_FILL_FACTOR`          | f64   | 0.95      | Заполнение узлов R-tree при STR-упаковке                                       |
-| `FG_INDEX_PENDING_MAX`                | usize | 65536     | Fixed global bound очереди `DEFER`; overflow коалесцируется в full rebuild     |
-| `FG_IMPORT_SEGMENT_ITEMS`             | usize | 1000000   | Applied items во внутреннем private segment импорта                            |
-| `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | usize | 1000      | Сколько нарушений описывается подробно                                         |
-| `FG_IMPORT_REJECT_LIMIT`              | usize | —         | Явный положительный предел для `ON VIOLATION SKIP                              |QUARANTINE`                  |
-| `FG_BULK_WAL_MODE`                    | enum  | `minimal` | `minimal` \| `full`; `full` станет обязательным при появлении репликации/PITR  |
+| Параметр                              | Тип   | Default    | Описание                                                                                          |
+|---------------------------------------|-------|------------|---------------------------------------------------------------------------------------------------|
+| `FG_BULK_SORT_MEM`                    | usize | 268435456  | Память на прогон внешней сортировки (256 МиБ)                                                     |
+| `FG_BULK_SORT_MERGE_FANIN`            | usize | 64         | Степень k-путёвого слияния                                                                        |
+| `FG_BULK_SORT_PARALLELISM`            | usize | ядра       | Потоки генерации прогонов                                                                         |
+| `FG_HNSW_BUILD_MEM`                   | usize | 2147483648 | Положительный admission budget оценки памяти одного HNSW build (2 ГиБ), отдельно от serving cache |
+| `FG_INDEX_BTREE_FILL_FACTOR`          | f64   | **0.90**   | Заполнение листьев B+tree (было 0.80); 1.00 автоматически при монотонном ключе                    |
+| `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | f64   | 0.95       | Заполнение внутренних узлов B+tree                                                                |
+| `FG_INDEX_RTREE_FILL_FACTOR`          | f64   | 0.95       | Заполнение узлов R-tree при STR-упаковке                                                          |
+| `FG_INDEX_PENDING_MAX`                | usize | 65536      | Fixed global bound очереди `DEFER`; overflow коалесцируется в full rebuild                        |
+| `FG_IMPORT_SEGMENT_ITEMS`             | usize | 1000000    | Applied items во внутреннем private segment импорта                                               |
+| `FG_IMPORT_MAX_REPORTED_VIOLATIONS`   | usize | 1000       | Сколько нарушений описывается подробно                                                            |
+| `FG_IMPORT_REJECT_LIMIT`              | usize | —          | Явный положительный предел для `ON VIOLATION SKIP                                                 |QUARANTINE`                  |
+| `FG_BULK_WAL_MODE`                    | enum  | `minimal`  | `minimal` \| `full`; `full` станет обязательным при появлении репликации/PITR                     |
 
 **Статистика** (§19.5)
 

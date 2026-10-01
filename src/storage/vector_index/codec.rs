@@ -169,6 +169,24 @@ pub(crate) struct DecodedVectorIndex {
 	pub(crate) provider_fingerprint: u64,
 }
 
+/// Resident HNSW topology. Full-precision vectors stay in the shared bounded
+/// vector cache and are loaded from the immutable side-file on demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedHnswIndex {
+	pub(crate) spec: VectorBuildSpec,
+	pub(crate) entrypoint: Option<u32>,
+	pub(crate) nodes: Vec<HnswGraphNode>,
+	pub(crate) posting_count: usize,
+}
+
+/// One resident HNSW ordinal without its potentially large vector payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HnswGraphNode {
+	pub(crate) postings: Vec<DiskAtomRef>,
+	pub(crate) vector_hash: u64,
+	pub(crate) neighbors: Vec<Vec<u32>>,
+}
+
 /// Encoded immutable vector file before catalog publication.
 pub(in crate::storage) struct BuiltVectorIndex {
 	pub(in crate::storage) root: PageNo,
@@ -343,6 +361,64 @@ pub(crate) struct PagedVectorHeader {
 	pub(crate) provider_fingerprint: u64,
 	pub(crate) rebuild_threshold: u64,
 	pub(crate) posting_count: usize,
+}
+
+/// Validates topology projected from bounded page-loaded HNSW records.
+pub(crate) fn assemble_hnsw_index(
+	header: &PagedVectorHeader,
+	nodes: Vec<HnswGraphNode>,
+) -> FerrosGrynnResult<DecodedHnswIndex> {
+	if header.spec.algorithm()? != VectorAlgorithm::Hnsw {
+		return Err(invalid("resident HNSW graph received another vector algorithm"));
+	}
+	if usize::try_from(header.node_count).ok() != Some(nodes.len())
+		|| nodes.is_empty() != header.entrypoint.is_none()
+	{
+		return Err(invalid("resident HNSW graph count or entrypoint is inconsistent"));
+	}
+	let mut postings = BTreeSet::new();
+	let mut posting_count = 0_usize;
+	for (ordinal, node) in nodes.iter().enumerate() {
+		if node.postings.is_empty()
+			|| node.postings.windows(2).any(|pair| pair[0] >= pair[1])
+			|| node.postings.iter().any(|atom| !postings.insert(*atom))
+		{
+			return Err(invalid("resident HNSW postings are inconsistent"));
+		}
+		posting_count = posting_count
+			.checked_add(node.postings.len())
+			.ok_or_else(|| invalid("resident HNSW posting count exceeds usize"))?;
+		let expected_levels = deterministic_level(header.spec, node.postings[0])? + 1;
+		if node.neighbors.len() != expected_levels {
+			return Err(invalid("resident HNSW node level count is not deterministic"));
+		}
+		for (level, neighbors) in node.neighbors.iter().enumerate() {
+			if neighbors.len() > maximum_degree(header.spec, level)? {
+				return Err(invalid("resident HNSW adjacency exceeds its configured degree"));
+			}
+			let mut unique = BTreeSet::new();
+			for neighbor in neighbors {
+				let neighbor = usize::try_from(*neighbor)
+					.map_err(|_error| invalid("resident HNSW neighbor exceeds usize"))?;
+				if neighbor >= nodes.len()
+					|| neighbor == ordinal
+					|| !unique.insert(neighbor)
+					|| level >= nodes[neighbor].neighbors.len()
+				{
+					return Err(invalid("resident HNSW adjacency contains an invalid ordinal"));
+				}
+			}
+		}
+	}
+	if posting_count != header.posting_count {
+		return Err(invalid("resident HNSW posting count disagrees with its header"));
+	}
+	Ok(DecodedHnswIndex {
+		spec: header.spec,
+		entrypoint: header.entrypoint,
+		nodes,
+		posting_count,
+	})
 }
 
 pub(super) fn encode_header(

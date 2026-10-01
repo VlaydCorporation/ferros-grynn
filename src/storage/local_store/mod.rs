@@ -275,7 +275,8 @@ impl LocalStore {
 			io.file_open_mode(),
 			&rapidhash::RapidHashSet::default(),
 		)?;
-		let physical_indexes = bind_physical_indexes(&generation.database_catalog, &registry)?;
+		let physical_indexes =
+			bind_physical_indexes(&generation.database_catalog, &registry, None)?;
 		let state = LocalState {
 			database_superblock_path: superblock_path,
 			database_superblock: superblock,
@@ -341,7 +342,7 @@ impl LocalStore {
 		} = opened;
 		cleanup_orphan_generations(root, &file_catalog)?;
 		cleanup_orphan_quarantines(root, &file_catalog)?;
-		let physical_indexes = bind_physical_indexes(&database_catalog, &registry)?;
+		let physical_indexes = bind_physical_indexes(&database_catalog, &registry, None)?;
 		let state = LocalState {
 			database_superblock_path: root.join(DATABASE_SUPERBLOCK_FILE),
 			database_superblock,
@@ -686,7 +687,11 @@ impl LocalStore {
 			self.io.file_open_mode(),
 			&rapidhash::RapidHashSet::default(),
 		)?;
-		let physical_indexes = bind_physical_indexes(&generation.database_catalog, &registry)?;
+		let physical_indexes = bind_physical_indexes(
+			&generation.database_catalog,
+			&registry,
+			Some(&state.physical_indexes),
+		)?;
 		let retired = RetiredGeneration::between(
 			&self.root,
 			&state.file_catalog,

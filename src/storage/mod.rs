@@ -53,11 +53,7 @@ pub(crate) use local_store::{
 };
 pub use page_io::PageIoMode;
 pub(crate) use quarantine::{QuarantineArchiveReader, QuarantineArtifact, QuarantineWriter};
-pub(crate) use vector_index::{
-	VectorSearchHit,
-	search_vector_index_with_delta_and_distance,
-	search_vector_index_with_distance,
-};
+pub(crate) use vector_index::VectorSearchHit;
 
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]

@@ -5,14 +5,10 @@ use std::{
 	collections::{BTreeSet, BinaryHeap},
 };
 
+#[cfg(test)]
+use super::codec::DecodedVectorIndex;
 use super::{
-	codec::{
-		DecodedVectorIndex,
-		PagedVectorHeader,
-		PagedVectorNode,
-		VectorAlgorithm,
-		validate_vector,
-	},
+	codec::{PagedVectorHeader, PagedVectorNode, VectorAlgorithm, validate_vector},
 	delta::{DecodedVectorDelta, VectorDeltaRecord},
 };
 use crate::{
@@ -111,8 +107,8 @@ impl Ord for Candidate {
 	}
 }
 
-/// Searches one immutable graph with the concrete versioned custom-distance
-/// evaluator owned by the datastore composition boundary.
+/// Searches a fully decoded graph for builder recall tests.
+#[cfg(test)]
 pub(crate) fn search_vector_index_with_distance(
 	index: &DecodedVectorIndex,
 	query: &Vector,
@@ -140,77 +136,7 @@ pub(crate) fn search_vector_index_with_distance(
 	let candidate_nodes = bounded_level_zero(index, query, entrypoint, breadth, distance_function)?;
 	let mut hits = rerank(index, query, candidate_nodes.iter().copied(), distance_function)?;
 	if hits.len() < k && candidate_nodes.len() < index.nodes.len() {
-		// A disconnected/corrupt-by-construction candidate frontier must never
-		// produce a false partial top-K. The exact fallback is deliberate.
 		hits = rerank(index, query, 0..index.nodes.len(), distance_function)?;
-	}
-	hits.sort_unstable_by(|left, right| {
-		left.distance.total_cmp(&right.distance).then_with(|| left.atom.cmp(&right.atom))
-	});
-	hits.dedup_by_key(|hit| hit.atom);
-	hits.truncate(k);
-	Ok(hits)
-}
-
-/// Merges an exact delta while using the same custom-distance evaluator as
-/// the immutable base graph.
-pub(crate) fn search_vector_index_with_delta_and_distance(
-	index: &DecodedVectorIndex,
-	delta: &DecodedVectorDelta,
-	query: &Vector,
-	k: usize,
-	breadth: usize,
-	distance_function: &mut dyn FnMut(
-		crate::datastore::FunctionId,
-		crate::datastore::SchemaVersion,
-		&Vector,
-		&Vector,
-	) -> FerrosGrynnResult<f64>,
-) -> FerrosGrynnResult<Vec<VectorSearchHit>> {
-	if delta.spec.base != index.spec {
-		return Err(invalid("vector delta definition disagrees with its base"));
-	}
-	let shadowed = delta.records.iter().map(VectorDeltaRecord::atom).collect::<BTreeSet<_>>();
-	let requested = k.saturating_add(shadowed.len()).max(k);
-	let mut hits = search_vector_index_with_distance(
-		index,
-		query,
-		requested,
-		breadth.max(requested),
-		distance_function,
-	)?
-	.into_iter()
-	.filter(|hit| !shadowed.contains(&hit.atom))
-	.collect::<Vec<_>>();
-	for record in &delta.records {
-		if let VectorDeltaRecord::Upsert {
-			atom,
-			vector,
-		} = record
-		{
-			hits.push(VectorSearchHit {
-				atom: *atom,
-				distance: search_distance(index, query, vector, distance_function)?,
-			});
-		}
-	}
-	if hits.len() < k {
-		hits = rerank(index, query, 0..index.nodes.len(), distance_function)?
-			.into_iter()
-			.filter(|hit| !shadowed.contains(&hit.atom))
-			.collect();
-		for record in &delta.records {
-			if let VectorDeltaRecord::Upsert {
-				atom,
-				vector,
-			} = record
-			{
-				hits.push(VectorSearchHit {
-					atom: *atom,
-					distance: search_distance(index, query, vector, distance_function)?,
-				});
-			}
-		}
 	}
 	hits.sort_unstable_by(|left, right| {
 		left.distance.total_cmp(&right.distance).then_with(|| left.atom.cmp(&right.atom))
@@ -461,6 +387,7 @@ fn validate_paged_node(
 	Ok(())
 }
 
+#[cfg(test)]
 fn greedy_upper_levels(
 	index: &DecodedVectorIndex,
 	query: &Vector,
@@ -514,6 +441,7 @@ fn greedy_upper_levels(
 	Ok(current)
 }
 
+#[cfg(test)]
 fn bounded_level_zero(
 	index: &DecodedVectorIndex,
 	query: &Vector,
@@ -566,15 +494,16 @@ fn bounded_level_zero(
 			}
 		}
 	}
-	Ok(nearest
+	nearest
 		.into_iter()
 		.map(|candidate| {
 			usize::try_from(candidate.ordinal)
 				.map_err(|_error| invalid("vector candidate ordinal exceeds usize"))
 		})
-		.collect::<FerrosGrynnResult<_>>()?)
+		.collect()
 }
 
+#[cfg(test)]
 fn rerank(
 	index: &DecodedVectorIndex,
 	query: &Vector,
@@ -603,6 +532,7 @@ fn rerank(
 	Ok(hits)
 }
 
+#[cfg(test)]
 fn search_distance(
 	index: &DecodedVectorIndex,
 	left: &Vector,
@@ -629,15 +559,14 @@ fn invalid(reason: impl Into<String>) -> FerrosGrynnError {
 
 #[cfg(test)]
 mod tests {
-	use std::{cell::Cell, collections::BTreeSet, num::NonZeroU16};
+	use std::{cell::Cell, num::NonZeroU16};
 
-	use super::{bounded_level_zero, search_paged_diskann};
+	use super::search_paged_diskann;
 	use crate::{
 		datastore::{
 			ClassId,
 			ClassIndexOptions,
 			DiskAnnIndexOptions,
-			HnswIndexOptions,
 			IndexId,
 			IndexScope,
 			SchemaVersion,
@@ -653,62 +582,6 @@ mod tests {
 		},
 		values::{PropertyKeyId, Vector, VectorKind, storage::DiskAtomRef},
 	};
-
-	#[test]
-	fn hnsw_query_keeps_nearest_candidate_discovered_at_breadth_boundary() {
-		let options = HnswIndexOptions::defaults(
-			VectorKind::F32,
-			NonZeroU16::new(1).unwrap(),
-			VectorDistance::Euclidean,
-		)
-		.unwrap();
-		let index = crate::storage::vector_index::DecodedVectorIndex {
-			spec: VectorBuildSpec {
-				index: IndexId::new(7).unwrap(),
-				index_version: SchemaVersion::INITIAL,
-				scope: IndexScope::Base,
-				class: ClassId::new(3).unwrap(),
-				field: PropertyKeyId::new(2),
-				options: ClassIndexOptions::Hnsw(options),
-				build_revision: 11,
-				build_seed: 19,
-			},
-			entrypoint: Some(0),
-			nodes: vec![
-				VectorNode {
-					postings: vec![DiskAtomRef::from_parts(AtomKind::Node, 1).unwrap()],
-					vector: Vector::from(vec![10.0_f32]),
-					vector_hash: 0,
-					neighbors: vec![vec![1]],
-				},
-				VectorNode {
-					postings: vec![DiskAtomRef::from_parts(AtomKind::Node, 2).unwrap()],
-					vector: Vector::from(vec![5.0_f32]),
-					vector_hash: 0,
-					neighbors: vec![vec![2]],
-				},
-				VectorNode {
-					postings: vec![DiskAtomRef::from_parts(AtomKind::Node, 3).unwrap()],
-					vector: Vector::from(vec![0.0_f32]),
-					vector_hash: 0,
-					neighbors: vec![Vec::new()],
-				},
-			],
-			fingerprint: 0,
-			provider_fingerprint: 0,
-		};
-		let mut unavailable = |_function, _version, _left: &Vector, _right: &Vector| {
-			Err(crate::gql_status::FerrosGrynnError::invalid_argument(
-				"built-in distance unexpectedly invoked a UDF",
-			))
-		};
-
-		let actual =
-			bounded_level_zero(&index, &Vector::from(vec![0.0_f32]), 0, 2, &mut unavailable)
-				.unwrap();
-
-		assert_eq!(actual, BTreeSet::from([1, 2]));
-	}
 
 	#[test]
 	fn hashed_diskann_requests_only_the_top_k_posting_prefix() {

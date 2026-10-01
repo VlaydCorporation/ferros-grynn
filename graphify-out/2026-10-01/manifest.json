@@ -320,8 +320,8 @@
     "semantic_hash": "0539f2fbc582bee265d91bb6a0fa0cfc"
   },
   "docs/disk_storage_spec.md": {
-    "mtime": 1790829225.531598,
-    "ast_hash": "d2179ea7362d9eeccdec5b52f38040af",
+    "mtime": 1790845299.245,
+    "ast_hash": "0f9b9b0232029f7476cfadd2475a0e9a",
     "semantic_hash": ""
   },
   "docs/gql_grammar.md": {
@@ -330,13 +330,13 @@
     "semantic_hash": ""
   },
   "docs/gql_spec.md": {
-    "mtime": 1790829225.9919198,
-    "ast_hash": "a4548f271733802958f224f92502afcb",
+    "mtime": 1790845389.019,
+    "ast_hash": "961c6d7bbd22ee47b04bade62bf7c546",
     "semantic_hash": ""
   },
   "docs/gql_tech_spec.md": {
-    "mtime": 1790829151.001716,
-    "ast_hash": "67adbbda1fe0d5ac00c8c877ec4c5e5d",
+    "mtime": 1790845453.061,
+    "ast_hash": "afb458669ef5818d50fff9dcfc13f726",
     "semantic_hash": ""
   },
   "docs/graphs.md": {
@@ -671,7 +671,7 @@
   },
   "crates/surrealdb/context7.json": {
     "mtime": 1784933295.4041705,
-    "ast_hash": "",
+    "ast_hash": "67acd68a0832e1dd3b2293bc711ba6d6",
     "semantic_hash": ""
   },
   "crates/surrealdb/fuzz/fuzz_targets/fuzz_executor.rs": {
@@ -8896,7 +8896,7 @@
   },
   "crates/surrealdb/surrealism/demo/fs/data/config.json": {
     "mtime": 1784933296.1412716,
-    "ast_hash": "",
+    "ast_hash": "d2f8f66a9197c873c9d19c49dc4a40bf",
     "semantic_hash": ""
   },
   "crates/surrealdb/surrealism/demo/src/lib.rs": {
@@ -10180,8 +10180,8 @@
     "semantic_hash": ""
   },
   "docs/full_plan.md": {
-    "mtime": 1790830153.1938317,
-    "ast_hash": "8365ef548ddedd49ea078da44d0ee538",
+    "mtime": 1790845388.968,
+    "ast_hash": "b0712570df218823050a9d76ff64d2cd",
     "semantic_hash": ""
   },
   "crates/ferntree/img/black/logo.svg": {
@@ -10255,8 +10255,8 @@
     "semantic_hash": ""
   },
   "src/datastore/schema/index.rs": {
-    "mtime": 1790827288.4968543,
-    "ast_hash": "e2bbf05f752f18e78e0aeb61ef963b5c",
+    "mtime": 1790832279.465928,
+    "ast_hash": "5a28c9af30636805cd4819bb62226198",
     "semantic_hash": ""
   },
   "src/datastore/schema/mod.rs": {
@@ -12275,8 +12275,8 @@
     "semantic_hash": ""
   },
   "src/storage/vector_index/build.rs": {
-    "mtime": 1790829435.4207625,
-    "ast_hash": "4cdbb6af82fc0fde9e478e701fc61899",
+    "mtime": 1790835788.3429112,
+    "ast_hash": "d3ae0d55fe242a6171cd605d9d4578fa",
     "semantic_hash": ""
   },
   "src/storage/vector_index/codec.rs": {
@@ -12305,23 +12305,23 @@
     "semantic_hash": ""
   },
   "docs/gql_fulltext_stage_22_plan.md": {
-    "mtime": 1790709313.345067,
-    "ast_hash": "1b0ce027d7dea5cce3de4df511641a02",
+    "mtime": 1790845388.998,
+    "ast_hash": "0df7f7e9100a6566afd409015806c948",
     "semantic_hash": ""
   },
   "docs/gql_vector_stage_23_plan.md": {
-    "mtime": 1790829149.863922,
-    "ast_hash": "bbb0c353ac15656555f47e3771daf381",
+    "mtime": 1790835142.2690823,
+    "ast_hash": "cd80f27f682eee1b8ec589cbde7d376e",
     "semantic_hash": ""
   },
   "docs/reports/gql_fulltext_stage_22_report.md": {
-    "mtime": 1790825326.7173328,
-    "ast_hash": "edef0471b300851197abb9d8b0c44e93",
+    "mtime": 1790845299.224,
+    "ast_hash": "7d6ed432cac34920b179967f5f615d47",
     "semantic_hash": ""
   },
   "docs/reports/gql_vector_stage_23_report.md": {
-    "mtime": 1790830152.7721477,
-    "ast_hash": "9fa349a8e814d723d95fd2782a083d94",
+    "mtime": 1790845299.183,
+    "ast_hash": "233c890bb9975dbce6f0971706d0ce80",
     "semantic_hash": ""
   },
   "src/storage/local_store/tests/search_scope_tests.rs": {

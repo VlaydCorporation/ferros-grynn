@@ -4,6 +4,7 @@ use std::{
 	borrow::Borrow,
 	cmp::{Ordering, Reverse},
 	collections::{BTreeMap, BTreeSet, BinaryHeap},
+	mem::size_of,
 };
 
 use diskann::{
@@ -16,16 +17,19 @@ use diskann_vector::{
 };
 use rapidhash::v3::rapidhash_v3;
 
-use super::codec::{
-	BuiltVectorIndex,
-	VectorAlgorithm,
-	VectorBuildSpec,
-	VectorDocument,
-	VectorNode,
-	deterministic_level,
-	encode_vector_index,
-	maximum_degree,
-	validate_vector,
+use super::{
+	codec::{
+		BuiltVectorIndex,
+		VectorAlgorithm,
+		VectorBuildSpec,
+		VectorDocument,
+		VectorNode,
+		deterministic_level,
+		encode_vector_index,
+		maximum_degree,
+		validate_vector,
+	},
+	hnsw_memory::hnsw_build_memory_bytes,
 };
 use crate::{
 	datastore::{VectorDistance, exact_vector_distance},
@@ -147,6 +151,9 @@ fn build_graph_with_hasher_and_distance<V: Borrow<Vector>>(
 		&Vector,
 	) -> FerrosGrynnResult<f64>,
 ) -> FerrosGrynnResult<(Option<u32>, Vec<VectorNode<V>>)> {
+	if spec.algorithm()? == VectorAlgorithm::Hnsw {
+		enforce_hnsw_build_budget(spec, &documents, hnsw_build_memory_bytes()?)?;
+	}
 	documents.sort_unstable_by_key(|document| document.atom);
 	if documents.windows(2).any(|pair| pair[0].atom == pair[1].atom) {
 		return Err(invalid("vector input contains a duplicate document address"));
@@ -169,6 +176,115 @@ fn build_graph_with_hasher_and_distance<V: Borrow<Vector>>(
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let entrypoint = build_adjacency(spec, &mut nodes, distance_function)?;
 	Ok((entrypoint, nodes))
+}
+
+fn enforce_hnsw_build_budget<V>(
+	spec: VectorBuildSpec,
+	documents: &[VectorDocument<V>],
+	budget: usize,
+) -> FerrosGrynnResult<()> {
+	let estimated = estimated_hnsw_build_bytes(spec, documents)?;
+	if estimated > budget {
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"HNSW build needs an estimated {estimated} bytes, exceeding FG_HNSW_BUILD_MEM={budget}",
+		)));
+	}
+	Ok(())
+}
+
+fn estimated_hnsw_build_bytes<V>(
+	spec: VectorBuildSpec,
+	documents: &[VectorDocument<V>],
+) -> FerrosGrynnResult<usize> {
+	let crate::datastore::ClassIndexOptions::Hnsw(options) = spec.options else {
+		return Err(invalid("HNSW build budget received another index kind"));
+	};
+	let count = documents.len();
+	let element_width = match spec.element()? {
+		crate::values::VectorKind::F64 | crate::values::VectorKind::I64 => 8,
+		crate::values::VectorKind::F32 | crate::values::VectorKind::I32 => 4,
+		crate::values::VectorKind::F16 | crate::values::VectorKind::I16 => 2,
+		crate::values::VectorKind::I8 | crate::values::VectorKind::U8 => 1,
+	};
+	let vector_bytes = usize::from(spec.dimension()?.get())
+		.checked_mul(element_width)
+		.ok_or_else(|| invalid("HNSW vector payload estimate exceeds usize"))?;
+	let mut adjacency_slots = 0_usize;
+	let mut level_count = 0_usize;
+	for document in documents {
+		let levels = deterministic_level(spec, document.atom)?
+			.checked_add(1)
+			.ok_or_else(|| invalid("HNSW level estimate exceeds usize"))?;
+		level_count = checked_add(level_count, levels, "HNSW level estimate")?;
+		let upper = levels.saturating_sub(1);
+		adjacency_slots = checked_add(
+			adjacency_slots,
+			usize::from(options.m0().get()),
+			"HNSW adjacency estimate",
+		)?;
+		adjacency_slots = checked_add(
+			adjacency_slots,
+			checked_mul(upper, usize::from(options.m().get()), "HNSW upper adjacency estimate")?,
+			"HNSW adjacency estimate",
+		)?;
+	}
+	let fixed = checked_mul(
+		count,
+		size_of::<VectorDocument<V>>()
+			.saturating_add(size_of::<Group<V>>())
+			.saturating_add(size_of::<VectorNode<V>>())
+			.saturating_add(size_of::<crate::values::storage::DiskAtomRef>()),
+		"HNSW fixed build estimate",
+	)?;
+	let canonical_grouping = checked_mul(
+		count,
+		vector_bytes
+			.saturating_add(3)
+			.saturating_add(size_of::<(Vec<u8>, usize)>())
+			.saturating_add(64),
+		"HNSW grouping estimate",
+	)?;
+	let topology = checked_add(
+		checked_mul(level_count, size_of::<Vec<u32>>(), "HNSW level headers")?,
+		checked_mul(adjacency_slots, size_of::<u32>(), "HNSW adjacency bytes")?,
+		"HNSW topology estimate",
+	)?;
+	let encoded = checked_add(
+		checked_mul(count, vector_bytes.saturating_add(35), "HNSW encoded records")?,
+		checked_add(
+			checked_mul(count, 8, "HNSW encoded postings")?,
+			checked_mul(level_count.saturating_add(adjacency_slots), 4, "HNSW encoded topology")?,
+			"HNSW encoded topology",
+		)?,
+		"HNSW encoded estimate",
+	)?;
+	let work = checked_add(
+		checked_mul(count, 64, "HNSW visited-set estimate")?,
+		checked_mul(
+			usize::from(options.ef_construction().get()),
+			size_of::<BuildCandidate>().saturating_mul(2).saturating_add(64),
+			"HNSW candidate estimate",
+		)?,
+		"HNSW working-set estimate",
+	)?;
+	[
+		fixed,
+		canonical_grouping,
+		topology,
+		checked_mul(count, vector_bytes, "HNSW retained vector estimate")?,
+		checked_mul(encoded, 2, "HNSW encoder peak estimate")?,
+		work,
+	]
+	.into_iter()
+	.try_fold(0_usize, |total, bytes| checked_add(total, bytes, "HNSW build estimate"))
+}
+
+fn checked_add(left: usize, right: usize, context: &str) -> FerrosGrynnResult<usize> {
+	left.checked_add(right).ok_or_else(|| invalid(format!("{context} exceeds usize")))
+}
+
+fn checked_mul(left: usize, right: usize, context: &str) -> FerrosGrynnResult<usize> {
+	left.checked_mul(right).ok_or_else(|| invalid(format!("{context} exceeds usize")))
 }
 
 fn group_documents<V: Borrow<Vector>>(
@@ -1025,6 +1141,8 @@ mod tests {
 		build_vector_graph_with_distance,
 		build_vector_index,
 		build_with_hasher,
+		enforce_hnsw_build_budget,
+		estimated_hnsw_build_bytes,
 		invalid,
 		normalized_f32_distance,
 		rank_hnsw_candidates,
@@ -1054,6 +1172,31 @@ mod tests {
 		},
 		values::{PropertyKeyId, Vector, VectorKind, storage::DiskAtomRef},
 	};
+
+	#[test]
+	fn hnsw_build_budget_rejects_the_same_input_below_its_estimate() {
+		let options = HnswIndexOptions::defaults(
+			VectorKind::F32,
+			NonZeroU16::new(2).unwrap(),
+			VectorDistance::Euclidean,
+		)
+		.unwrap();
+		let spec = spec(ClassIndexOptions::Hnsw(options));
+		let documents = vec![
+			VectorDocument {
+				atom: atom(1),
+				vector: Vector::from(vec![0.0_f32, 1.0]),
+			},
+			VectorDocument {
+				atom: atom(2),
+				vector: Vector::from(vec![1.0_f32, 0.0]),
+			},
+		];
+		let estimate = estimated_hnsw_build_bytes(spec, &documents).unwrap();
+
+		assert!(enforce_hnsw_build_budget(spec, &documents, estimate).is_ok());
+		assert!(enforce_hnsw_build_budget(spec, &documents, estimate - 1).is_err());
+	}
 
 	#[test]
 	fn hnsw_build_keeps_nearest_candidates_from_multiple_entrypoints() {

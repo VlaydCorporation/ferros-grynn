@@ -572,6 +572,28 @@ impl StoreInner {
 		}
 	}
 
+	pub(crate) fn search_hnsw_index(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		index: super::IndexId,
+		query: &crate::values::Vector,
+		k: usize,
+		breadth: usize,
+		distance_function: &mut dyn FnMut(
+			super::FunctionId,
+			super::SchemaVersion,
+			&crate::values::Vector,
+			&crate::values::Vector,
+		) -> FerrosGrynnResult<f64>,
+	) -> FerrosGrynnResult<Option<Vec<crate::storage::VectorSearchHit>>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => {
+				local.search_hnsw_index(snapshot, index, query, k, breadth, distance_function)
+			}
+		}
+	}
+
 	pub(crate) fn load_planner_statistics(
 		&self,
 		snapshot: &LocalQuerySnapshot,

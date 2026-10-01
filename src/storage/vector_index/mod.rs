@@ -3,6 +3,8 @@
 mod build;
 mod codec;
 mod delta;
+mod hnsw_memory;
+mod hnsw_search;
 mod search;
 mod stream;
 
@@ -12,7 +14,9 @@ pub(in crate::storage) use build::{
 };
 pub(in crate::storage) use codec::{BuiltVectorIndex, VectorDocument};
 pub(crate) use codec::{
+	DecodedHnswIndex,
 	DecodedVectorIndex,
+	HnswGraphNode,
 	PagedVectorHeader,
 	PagedVectorNode,
 	STREAM_PAYLOAD_BYTES,
@@ -23,6 +27,7 @@ pub(crate) use codec::{
 	VectorNode,
 	VectorNodeLocation,
 	VectorNodeRecordLayout,
+	assemble_hnsw_index,
 	decode_validated_vector_stream_page,
 	decode_vector_directory_entry,
 	decode_vector_header,
@@ -40,10 +45,13 @@ pub(crate) use delta::{
 	build_vector_delta,
 	decode_vector_delta,
 };
-pub(crate) use search::{
-	VectorSearchHit,
-	search_paged_diskann,
-	search_vector_index_with_delta_and_distance,
-	search_vector_index_with_distance,
+pub(crate) use hnsw_memory::{
+	hnsw_vector_cache_get,
+	hnsw_vector_cache_insert,
+	purge_hnsw_vector_cache,
 };
+pub(crate) use hnsw_search::search_cached_hnsw_with_distance;
+#[cfg(test)]
+pub(crate) use search::search_vector_index_with_distance;
+pub(crate) use search::{VectorSearchHit, search_paged_diskann};
 pub(in crate::storage) use stream::write_vector_index_stream;

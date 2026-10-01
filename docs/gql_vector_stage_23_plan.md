@@ -79,8 +79,13 @@ multiplier derived from M. Seed детерминирован по IndexId/versio
 revision/stable row identity.
 
 Base хранит full vectors, stable row addresses, levels и adjacency каждого
-level. Reader может лениво использовать текущий PageManager/BufferPool; второй
-глобальный cache и `FG_HNSW_CACHE_SIZE` не вводятся.
+level. При первом использовании topology целиком загружается в память. Векторы
+узлов читаются лениво через текущий PageManager/BufferPool и удерживаются в одном
+process-wide bounded LRU, общем для всех HNSW-индексов. Его vector-payload budget
+задаёт `FG_HNSW_CACHE_SIZE` (default 256 МиБ); topology, cache metadata и активные
+ссылки читателей в него не входят. Для графа, который не помещается в RAM,
+используется DiskANN. Независимый `FG_HNSW_BUILD_MEM` (default 2 ГиБ) ограничивает
+консервативную оценку пика построителя до тяжёлых allocation.
 
 ## 5. DiskANN
 

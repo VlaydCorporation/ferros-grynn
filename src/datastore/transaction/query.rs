@@ -535,6 +535,9 @@ impl Transaction {
 			PhysicalIndexEntries::Fulltext(_) => {
 				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as Fulltext"))
 			}
+			PhysicalIndexEntries::Hnsw(_) => {
+				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as HNSW"))
+			}
 			PhysicalIndexEntries::Vector(_) => {
 				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as vector"))
 			}
@@ -811,41 +814,14 @@ impl Transaction {
 				.search_diskann_index(physical_snapshot, index, query, k, breadth)?
 				.ok_or_else(|| deferred_index_missing(index))?
 		} else {
-			let physical =
-				self.query_physical_index(snapshot, index, class_id, definition.kind(), scope)?;
-			let PhysicalIndexEntries::Vector(vector) = &physical.entries else {
-				return Err(FerrosGrynnError::invalid_storage_file(
-					"vector index decoded as another index kind",
-				));
-			};
 			let evaluator = crate::gql::PureFunctionEvaluator::new(&snapshot.root);
 			let mut distance = |function, version, left: &Vector, right: &Vector| {
 				evaluator.distance(function, version, left, right)
 			};
-			match physical.delta.as_ref() {
-				None => crate::storage::search_vector_index_with_distance(
-					vector,
-					query,
-					k,
-					breadth,
-					&mut distance,
-				)?,
-				Some(PhysicalIndexDelta::Vector(delta)) => {
-					crate::storage::search_vector_index_with_delta_and_distance(
-						vector,
-						delta,
-						query,
-						k,
-						breadth,
-						&mut distance,
-					)?
-				}
-				Some(PhysicalIndexDelta::Fulltext(_)) => {
-					return Err(FerrosGrynnError::invalid_storage_file(
-						"vector index has a Fulltext delta",
-					));
-				}
-			}
+			self.store
+				.inner
+				.search_hnsw_index(physical_snapshot, index, query, k, breadth, &mut distance)?
+				.ok_or_else(|| deferred_index_missing(index))?
 		};
 		let mut output = Vec::new();
 		for hit in hits {
@@ -1990,6 +1966,9 @@ fn physical_count(index: &PhysicalIndexRead) -> FerrosGrynnResult<u64> {
 		}
 		PhysicalIndexEntries::Fulltext(_) => {
 			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as Fulltext"))
+		}
+		PhysicalIndexEntries::Hnsw(_) => {
+			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as HNSW"))
 		}
 		PhysicalIndexEntries::Vector(_) => {
 			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as vector"))

@@ -2353,9 +2353,17 @@ HNSW (иерархически управляемый малый мир) — м�
 Вы можете указать только `TYPE`, `M` и `EFC`. Ferros-Grynn автоматически вычисляет `M0` и `LM`, 
 используя наиболее подходящее значение. Если значения не указаны, `M` и `EFC` устанавливаются на 12 и 150 соответственно.
 
-HNSW использует общий `BufferPool`/query memory accounting. Отдельный глобальный
-HNSW-кэш и `FG_HNSW_CACHE_SIZE` не вводятся, чтобы не дублировать eviction и
-memory budget.
+Граф HNSW при первом использовании целиком загружается в память и остаётся
+resident на время жизни физического поколения индекса. Полные векторы узлов
+загружаются лениво и удерживаются в одном ограниченном process-wide LRU-кэше,
+общем для всех HNSW-индексов. `FG_HNSW_CACHE_SIZE` задаёт общий бюджет payload
+векторов в байтах; default — 256 МиБ, `0` отключает retention. Метаданные кэша,
+активные `Arc` читателей и сам граф HNSW в этот бюджет не входят. Если resident
+граф не помещается в оперативную память, следует использовать DiskANN.
+
+`FG_HNSW_BUILD_MEM` независимо ограничивает консервативную оценку пика памяти
+построителя HNSW; default — 2 ГиБ. Значение должно быть положительным. Оба
+process-wide параметра читаются один раз при первом соответствующем обращении.
 
 #### DiskANN
 
@@ -4708,11 +4716,11 @@ BEGIN [ ISOLATION LEVEL @level ] [ READ ONLY ]
 Режим задаётся на транзакцию. В исполнимом профиле этапа 17 поддержаны `BEST_EFFORT`
 (default), `DETERMINISTIC` и `FAST`.
 
-| Режим                        | Гарантии                                                                                                                                                                                                                                                                                                                                                                                                           |
-|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `BEST_EFFORT` (по умолчанию) | Результат детерминирован по содержимому, но порядок без `ORDER BY` не гарантирован; план может меняться между запусками                                                                                                                                                                                                                                                                                            |
+| Режим                        | Гарантии                                                                                                                                                                                                                                                                                                                                                                                |
+|------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `BEST_EFFORT` (по умолчанию) | Результат детерминирован по содержимому, но порядок без `ORDER BY` не гарантирован; план может меняться между запусками                                                                                                                                                                                                                                                                 |
 | `DETERMINISTIC`              | Строгая воспроизводимость при одинаковых snapshot, canonical parameters, user seed и engine build: стабильный порядок, канонический plan и фиксированный порядок floating-point reduction. Без `ORDER BY` результат доупорядочивается stable public identity. `time::now()`, `uuid()`, `ulid()`, `rand::id()` и другие недетерминированные/IMPURE функции отклоняются до чтения данных. |
-| `FAST`                       | Та же ACID/FCW/SSI/constraint/error semantics и тот же result multiset. Без явного `ORDER BY` не гарантирует порядок, plan/replay stability, pure branch/hash merge order и schedule float reductions; int/decimal остаются exact. Approximation, sampling, early cutoff и пропуск validation запрещены.                                                                                                           |
+| `FAST`                       | Та же ACID/FCW/SSI/constraint/error semantics и тот же result multiset. Без явного `ORDER BY` не гарантирует порядок, plan/replay stability, pure branch/hash merge order и schedule float reductions; int/decimal остаются exact. Approximation, sampling, early cutoff и пропуск validation запрещены.                                                                                |
 
 `DETERMINISTIC` допустим только при `SNAPSHOT` и `SERIALIZABLE`; `READ COMMITTED` запрещён.
 Effective seed включает version, normalized query fingerprint, canonical parameter fingerprint,
@@ -4742,23 +4750,23 @@ RapidHash V3 по versioned canonical physical-plan bytes: `DefaultHasher`, `Deb
 
 ### 18.2. Встроенные пространства имён
 
-| Пространство                | Исполнимо                                                   | Отложено                              |
-|-----------------------------|--------------------------------------------------------------|---------------------------------------|
-| `math::`                    | scalar этапа 12 и aggregates этапа 13                        | specialized catalog — по потребности |
-| `string::`                  | scalar helpers, `matches`, Unicode-scalar `slice`             | —                                     |
-| `time::`                    | `now`, `format`, `add`, `diff`; `now()` один на statement     | —                                     |
-| `array::`                   | pure helpers, `group`, lexical `push/pop/clear`                | —                                     |
-| `set::`                     | pure helpers и lexical `add/clear`                             | —                                     |
-| `type::`                    | `is<T>`, `to<T>`, включая object construction                  | —                                     |
-| `meta::`                    | `id`, `class`, `type`                                         | —                                     |
-| `option::`                  | `is_some`, `is_none`                                          | —                                     |
-| `graph::` / path / pipeline | occurrence/path helpers и named-UDF `tv::algo`                 | graph assembly — этап 18              |
-| closures                    | session closures и durable named UDF/catalog/overloads         | native/WASM/plugin UDF не планируются |
-| `regex::`                   | stateful runtime-only matcher                                  | —                                     |
-| `uuid`/`ulid`/`rand::`      | UUIDv7, ULID, `rand::id([length])`                              | —                                     |
-| `search::`                  | —                                                            | этап 22                               |
-| `geo::`                     | —                                                            | этап 24                               |
-| `computed::`                | —                                                            | назначенный schema/query этап         |
+| Пространство                | Исполнимо                                                 | Отложено                              |
+|-----------------------------|-----------------------------------------------------------|---------------------------------------|
+| `math::`                    | scalar этапа 12 и aggregates этапа 13                     | specialized catalog — по потребности  |
+| `string::`                  | scalar helpers, `matches`, Unicode-scalar `slice`         | —                                     |
+| `time::`                    | `now`, `format`, `add`, `diff`; `now()` один на statement | —                                     |
+| `array::`                   | pure helpers, `group`, lexical `push/pop/clear`           | —                                     |
+| `set::`                     | pure helpers и lexical `add/clear`                        | —                                     |
+| `type::`                    | `is<T>`, `to<T>`, включая object construction             | —                                     |
+| `meta::`                    | `id`, `class`, `type`                                     | —                                     |
+| `option::`                  | `is_some`, `is_none`                                      | —                                     |
+| `graph::` / path / pipeline | occurrence/path helpers и named-UDF `tv::algo`            | graph assembly — этап 18              |
+| closures                    | session closures и durable named UDF/catalog/overloads    | native/WASM/plugin UDF не планируются |
+| `regex::`                   | stateful runtime-only matcher                             | —                                     |
+| `uuid`/`ulid`/`rand::`      | UUIDv7, ULID, `rand::id([length])`                        | —                                     |
+| `search::`                  | —                                                         | этап 22                               |
+| `geo::`                     | —                                                         | этап 24                               |
+| `computed::`                | —                                                         | назначенный schema/query этап         |
 
 Этап 12 использует закрытый статический enum/signature table и обычный `match`: runtime
 registry функций не создаётся. `array::distinct` сохраняет первое вхождение, `flatten` снимает
@@ -6091,6 +6099,7 @@ SELECT fn::friend_score(person:alice, person:bob) AS score;
 | `QueryExecutionOptions.max_graph_nodes` | Максимум unique target nodes одного graph result                                       | 1'000'000             |
 | `QueryExecutionOptions.max_graph_edges` | Максимум unique target edges одного graph result                                       | 5'000'000             |
 | `FG_DISKANN_CACHE_SIZE`                 | Размер кэша индекса DiskANN                                                            | 268435456 (256 МБ)    |
+| `FG_HNSW_CACHE_SIZE`                    | Общий process-wide бюджет кэшированных vector payload всех HNSW-индексов               | 268435456 (256 МиБ)   |
 | `FG_EXECUTION_MODE`                     | Режим исполнения по умолчанию ([§17.8](#178-режимы-исполнения-и-детерминизм))          | `BEST_EFFORT`         |
 | `FG_MAX_SNAPSHOT_AGE_SEC`               | Возраст снимка, после которого он принудительно закрывается                            | 300                   |
 | `FG_TX_WRITE_SET_MAX_BYTES`             | Максимальный atom-delta write-set одной sync-транзакции                                | 268435456 (256 МиБ)   |
@@ -6110,6 +6119,7 @@ Live-запросы и changefeed ([§21](#21-события-и-live-запро�
 | `FG_BULK_SORT_MEM`                    | Бюджет памяти на прогон внешней сортировки ключей                                | 256 МБ                |
 | `FG_BULK_SORT_MERGE_FANIN`            | Степень слияния при k-way merge                                                  | 64                    |
 | `FG_BULK_SORT_PARALLELISM`            | Число потоков генерации прогонов                                                 | число ядер            |
+| `FG_HNSW_BUILD_MEM`                   | Независимый process-wide предел оценки памяти одного построения HNSW             | 2147483648 (2 ГиБ)    |
 | `FG_INDEX_BTREE_FILL_FACTOR`          | Плотность заполнения листьев B+tree при bulk-сборке                              | 0.90                  |
 | `FG_INDEX_BTREE_INTERNAL_FILL_FACTOR` | Плотность заполнения внутренних узлов B+tree                                     | 0.95                  |
 | `FG_INDEX_RTREE_FILL_FACTOR`          | Плотность заполнения узлов R-tree при STR-упаковке                               | 0.95                  |
@@ -6181,7 +6191,7 @@ enum BridgeData<'a> {
 
 | Риск                           | Описание                                                                                                                | Митигация                                                                                                                                                                              |
 |--------------------------------|-------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Path explosion                 | `[E*1..N]` при больших N и высокой степени → экспоненциальный рост                                                     | Обязательное предупреждение планировщика при `degree > 10 AND depth > 4`; ограничение по умолчанию `max_depth = 30`                                                                    |
+| Path explosion                 | `[E*1..N]` при больших N и высокой степени → экспоненциальный рост                                                      | Обязательное предупреждение планировщика при `degree > 10 AND depth > 4`; ограничение по умолчанию `max_depth = 30`                                                                    |
 | Отсутствие degree statistics   | MATCH-планировщик не работает корректно без статистики степени                                                          | Статистика по меткам и степеням — обязательна для MVP; сбор при загрузке и инкрементально                                                                                              |
 | Неопределённый критерий UPSERT | Без явного `WHERE` или ID семантика зависит от плана                                                                    | Синтаксически запрещено: `WHERE` или ID обязательны                                                                                                                                    |
 | null / none путаница           | Тонкая разница между двумя типами отсутствия                                                                            | Явное описание в §5.1 и в документации; lint-предупреждения при смешивании                                                                                                             |

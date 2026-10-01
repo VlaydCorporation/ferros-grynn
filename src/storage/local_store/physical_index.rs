@@ -2,7 +2,10 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet, VecDeque},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
 };
 
 use parking_lot::Mutex;
@@ -24,7 +27,7 @@ use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::AtomKind,
 	storage::{
-		catalog::{DatabaseCatalog, PhysicalIndexBinding},
+		catalog::{ClassIndexCatalogEntry, DatabaseCatalog, PhysicalIndexBinding},
 		file_registry::{FileRegistry, RegisteredDataFile},
 		fulltext_index::{DecodedFulltextIndex, decode_fulltext_index},
 		fulltext_index_delta::{DecodedFulltextDelta, decode_fulltext_delta},
@@ -32,14 +35,17 @@ use crate::{
 		hybrid_engine::MAX_READ_SCOPE_OPERATIONS,
 		page::{AlignedPage, PageHeader, PageNo},
 		vector_index::{
+			DecodedHnswIndex,
 			DecodedVectorDelta,
 			DecodedVectorIndex,
+			HnswGraphNode,
 			PagedVectorNode,
 			STREAM_PAYLOAD_BYTES,
 			VECTOR_NODE_HEADER_BYTES,
 			VectorNodeLocation,
 			VectorNodeRecordLayout,
 			VectorSearchHit,
+			assemble_hnsw_index,
 			decode_validated_vector_stream_page,
 			decode_vector_delta,
 			decode_vector_directory_entry,
@@ -47,6 +53,10 @@ use crate::{
 			decode_vector_index,
 			decode_vector_node_parts,
 			decode_vector_node_record_layout,
+			hnsw_vector_cache_get,
+			hnsw_vector_cache_insert,
+			purge_hnsw_vector_cache,
+			search_cached_hnsw_with_distance,
 			search_paged_diskann,
 			validate_vector_file_pages,
 			vector_directory_address,
@@ -57,6 +67,7 @@ use crate::{
 
 const DISKANN_PAGE_WINDOW: usize = 32;
 const DISKANN_PAGE_CACHE_PAGES: usize = MAX_READ_SCOPE_OPERATIONS;
+static NEXT_HNSW_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 /// Generation-free address returned by one immutable physical index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -78,6 +89,7 @@ pub(crate) enum PhysicalIndexEntries {
 	Scalar(Vec<PhysicalScalarGroup>),
 	Count(u64),
 	Fulltext(DecodedFulltextIndex),
+	Hnsw(DecodedHnswIndex),
 	Vector(DecodedVectorIndex),
 }
 
@@ -110,6 +122,7 @@ pub(super) struct PhysicalIndexFile {
 	file: Arc<RegisteredDataFile>,
 	delta_binding: Option<PhysicalIndexBinding>,
 	delta_file: Option<Arc<RegisteredDataFile>>,
+	hnsw_cache_namespace: u64,
 	decoded: Mutex<Option<Arc<PhysicalIndexRead>>>,
 }
 
@@ -150,9 +163,122 @@ impl LocalStore {
 		}
 		file.search_diskann(self, snapshot, query, k, breadth).map(Some)
 	}
+
+	/// Searches HNSW with resident topology and vectors retained by the single
+	/// process-wide bounded vector cache.
+	pub(crate) fn search_hnsw_index(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		index: IndexId,
+		query: &Vector,
+		k: usize,
+		breadth: usize,
+		distance_function: &mut dyn FnMut(
+			crate::datastore::FunctionId,
+			crate::datastore::SchemaVersion,
+			&Vector,
+			&Vector,
+		) -> FerrosGrynnResult<f64>,
+	) -> FerrosGrynnResult<Option<Vec<VectorSearchHit>>> {
+		let Some(file) = snapshot.0.indexes.get(&index) else {
+			return Ok(None);
+		};
+		if file.kind != ClassIndexKind::Hnsw {
+			return Ok(None);
+		}
+		file.search_hnsw(self, snapshot, query, k, breadth, distance_function).map(Some)
+	}
 }
 
 impl PhysicalIndexFile {
+	fn matches_catalog(
+		&self,
+		class: ClassId,
+		index: &ClassIndexCatalogEntry,
+		binding: PhysicalIndexBinding,
+	) -> bool {
+		self.index_id == index.id
+			&& self.version == index.version
+			&& self.class_id == class
+			&& self.kind == index.kind
+			&& self.scope == index.scope
+			&& self.options == index.options
+			&& self.binding == binding
+			&& self.delta_binding == index.delta
+	}
+
+	fn search_hnsw(
+		&self,
+		store: &LocalStore,
+		snapshot: &LocalQuerySnapshot,
+		query: &Vector,
+		k: usize,
+		breadth: usize,
+		distance_function: &mut dyn FnMut(
+			crate::datastore::FunctionId,
+			crate::datastore::SchemaVersion,
+			&Vector,
+			&Vector,
+		) -> FerrosGrynnResult<f64>,
+	) -> FerrosGrynnResult<Vec<VectorSearchHit>> {
+		let decoded = self.read(store, snapshot)?;
+		let PhysicalIndexEntries::Hnsw(graph) = &decoded.entries else {
+			return Err(invalid("HNSW side-file decoded as another index kind"));
+		};
+		let delta = match decoded.delta.as_ref() {
+			None => None,
+			Some(PhysicalIndexDelta::Vector(delta)) => Some(delta),
+			Some(PhysicalIndexDelta::Fulltext(_)) => {
+				return Err(invalid("HNSW side-file has a Fulltext delta"));
+			}
+		};
+		let space = match self.scope {
+			IndexScope::Base => DataSpaceId::Database,
+			IndexScope::Effective {
+				graph,
+			} => DataSpaceId::Graph(graph),
+		};
+		let mut provider = FerrosDiskAnnProvider {
+			store,
+			snapshot: &snapshot.0,
+			space,
+			binding: self.binding,
+			file: &self.file,
+			pages: VecDeque::with_capacity(DISKANN_PAGE_CACHE_PAGES),
+		};
+		let header_page = provider.read_page(PageNo::new(0))?;
+		let header = decode_vector_header(&header_page.page)?;
+		validate_vector_file_pages(&header, self.file.page_count())?;
+		let namespace = self.hnsw_cache_namespace;
+		search_cached_hnsw_with_distance(
+			graph,
+			delta,
+			query,
+			k,
+			breadth,
+			&mut |ordinal| {
+				if let Some(vector) = hnsw_vector_cache_get(namespace, ordinal)? {
+					return Ok(vector);
+				}
+				let loaded = provider.read_node(&header, ordinal, 1)?;
+				let expected = graph
+					.nodes
+					.get(
+						usize::try_from(ordinal)
+							.map_err(|_error| invalid("HNSW vector ordinal exceeds usize"))?,
+					)
+					.ok_or_else(|| invalid("HNSW vector ordinal lies outside its graph"))?;
+				if loaded.node.vector_hash != expected.vector_hash {
+					return Err(invalid(
+						"HNSW cached vector hash disagrees with resident topology",
+					));
+				}
+				hnsw_vector_cache_insert(namespace, ordinal, Arc::new(loaded.node.vector))
+			},
+			distance_function,
+		)
+	}
+
 	fn search_diskann(
 		&self,
 		store: &LocalStore,
@@ -294,7 +420,53 @@ impl PhysicalIndexFile {
 				}
 				PhysicalIndexEntries::Fulltext(decoded)
 			}
-			ClassIndexKind::Hnsw | ClassIndexKind::DiskAnn => {
+			ClassIndexKind::Hnsw => {
+				let mut provider = FerrosDiskAnnProvider {
+					store,
+					snapshot: &snapshot.0,
+					space,
+					binding: self.binding,
+					file: &self.file,
+					pages: VecDeque::with_capacity(DISKANN_PAGE_CACHE_PAGES),
+				};
+				let header_page = provider.read_page(PageNo::new(0))?;
+				let header = decode_vector_header(&header_page.page)?;
+				validate_vector_file_pages(&header, self.file.page_count())?;
+				if header.spec.index != self.index_id
+					|| header.spec.index_version != self.version
+					|| header.spec.class != self.class_id
+					|| header.spec.scope != self.scope
+					|| header.spec.options != self.options
+					|| header.spec.algorithm()?.kind() != self.kind
+				{
+					return Err(invalid("HNSW side-file metadata disagrees with the catalog"));
+				}
+				let mut nodes = Vec::with_capacity(
+					usize::try_from(header.node_count)
+						.map_err(|_error| invalid("HNSW node count exceeds usize"))?,
+				);
+				for start in (0..header.node_count).step_by(DISKANN_PAGE_WINDOW) {
+					let end =
+						start.saturating_add(DISKANN_PAGE_WINDOW as u32).min(header.node_count);
+					let ordinals = (start..end).collect::<Vec<_>>();
+					let loaded =
+						provider.read_nodes(&header, &ordinals, header.posting_count.max(1))?;
+					for (ordinal, node) in ordinals.into_iter().zip(loaded) {
+						let _ = hnsw_vector_cache_insert(
+							self.hnsw_cache_namespace,
+							ordinal,
+							Arc::new(node.node.vector),
+						)?;
+						nodes.push(HnswGraphNode {
+							postings: node.node.postings,
+							vector_hash: node.node.vector_hash,
+							neighbors: node.node.neighbors,
+						});
+					}
+				}
+				PhysicalIndexEntries::Hnsw(assemble_hnsw_index(&header, nodes)?)
+			}
+			ClassIndexKind::DiskAnn => {
 				let pages = read_all_pages(store, snapshot, space, self.binding, &self.file)?;
 				let decoded = decode_vector_index(&pages)?;
 				if decoded.spec.index != self.index_id
@@ -319,6 +491,10 @@ impl PhysicalIndexFile {
 				let pages = read_all_pages(store, snapshot, space, binding, file)?;
 				Some(PhysicalIndexDelta::Vector(decode_vector_delta(&pages, base.spec)?))
 			}
+			(Some(binding), Some(file), PhysicalIndexEntries::Hnsw(base)) => {
+				let pages = read_all_pages(store, snapshot, space, binding, file)?;
+				Some(PhysicalIndexDelta::Vector(decode_vector_delta(&pages, base.spec)?))
+			}
 			(Some(_), Some(_), _) => {
 				return Err(invalid("scalar or Count index has an unexpected delta binding"));
 			}
@@ -333,6 +509,12 @@ impl PhysicalIndexFile {
 		});
 		*decoded = Some(Arc::clone(&value));
 		Ok(value)
+	}
+}
+
+impl Drop for PhysicalIndexFile {
+	fn drop(&mut self) {
+		purge_hnsw_vector_cache(self.hnsw_cache_namespace);
 	}
 }
 
@@ -508,11 +690,13 @@ impl FerrosDiskAnnProvider<'_> {
 		layout: VectorNodeRecordLayout,
 		posting_limit: usize,
 	) -> FerrosGrynnResult<(u64, usize, u64, usize)> {
-		let prefix_count = layout.posting_count.min(
+		let prefix_count = if posting_limit >= layout.posting_count {
+			layout.posting_count
+		} else {
 			posting_limit
 				.checked_add(1)
-				.ok_or_else(|| invalid("DiskANN posting prefix overflows usize"))?,
-		);
+				.ok_or_else(|| invalid("DiskANN posting prefix overflows usize"))?
+		};
 		let prefix_bytes = prefix_count
 			.checked_mul(8)
 			.ok_or_else(|| invalid("DiskANN posting prefix bytes overflow usize"))?;
@@ -563,11 +747,13 @@ impl FerrosDiskAnnProvider<'_> {
 		let fixed =
 			self.read_stream_range(header.stream, location.offset, VECTOR_NODE_HEADER_BYTES)?;
 		let layout = decode_vector_node_record_layout(&fixed, location.length)?;
-		let prefix_count = layout.posting_count.min(
+		let prefix_count = if posting_limit >= layout.posting_count {
+			layout.posting_count
+		} else {
 			posting_limit
 				.checked_add(1)
-				.ok_or_else(|| invalid("DiskANN posting prefix overflows usize"))?,
-		);
+				.ok_or_else(|| invalid("DiskANN posting prefix overflows usize"))?
+		};
 		let prefix_bytes = prefix_count
 			.checked_mul(8)
 			.ok_or_else(|| invalid("DiskANN posting prefix bytes overflow usize"))?;
@@ -892,10 +1078,12 @@ fn read_all_pages(
 }
 
 /// Binds catalog identities to lazy registered handles without opening the
-/// underlying native files.
+/// underlying native files. An unchanged binding reuses its prior handle so
+/// resident decoded state survives unrelated catalog publications.
 pub(super) fn bind_physical_indexes(
 	catalog: &DatabaseCatalog,
 	registry: &FileRegistry,
+	previous: Option<&BTreeMap<IndexId, Arc<PhysicalIndexFile>>>,
 ) -> FerrosGrynnResult<BTreeMap<IndexId, Arc<PhysicalIndexFile>>> {
 	let mut files = BTreeMap::new();
 	for class in &catalog.classes {
@@ -909,6 +1097,15 @@ pub(super) fn bind_physical_indexes(
 					graph,
 				} => crate::datastore::DataSpaceId::Graph(graph),
 			};
+			if let Some(existing) = previous
+				.and_then(|previous| previous.get(&index.id))
+				.filter(|existing| existing.matches_catalog(class.id, index, binding))
+			{
+				if files.insert(index.id, Arc::clone(existing)).is_some() {
+					return Err(invalid("duplicate physical IndexId in database catalog"));
+				}
+				continue;
+			}
 			let file = Arc::new(PhysicalIndexFile {
 				index_id: index.id,
 				version: index.version,
@@ -923,6 +1120,11 @@ pub(super) fn bind_physical_indexes(
 					.delta
 					.map(|delta| registry.resolve_file(space, delta.file_id))
 					.transpose()?,
+				hnsw_cache_namespace: NEXT_HNSW_CACHE_NAMESPACE
+					.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+						current.checked_add(1)
+					})
+					.map_err(|_current| invalid("HNSW cache namespace clock is exhausted"))?,
 				decoded: Mutex::new(None),
 			});
 			if files.insert(index.id, file).is_some() {
