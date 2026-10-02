@@ -59,6 +59,8 @@
   проверяются рекурсивно с лимитом глубины.
 - Runtime-only значения сравниваются по `RuntimeId`, а storage-конвертер обязан отклонять их
   структурированной ошибкой.
+- `Value::Path` heap estimate включает steps/public identifiers через владельца `graph::Path`.
+  Размер boxed структуры недостаточен для query memory admission; Eq/Ord/Hash и codecs не меняются.
 - `Matcher` — runtime-only identity value: mutable cursor скрыт под синхронизацией, но
   `Eq`/`Ord`/`Hash` не зависят от позиции. Matcher, Closure, Cursor и ErrorValue не получают
   durable или query-spill encoding.

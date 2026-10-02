@@ -47,6 +47,12 @@ impl Parser<'_> {
 		self.expect_keyword(keywords::IN, "Expected `IN GRAPH graph_ref` after MATCH patterns.")?;
 		self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `IN` in MATCH statement.")?;
 		let source = self.graph_reference_expr()?;
+		let custom_cost = if self.consume_keyword(keywords::WITH).is_some() {
+			self.expect_keyword(keywords::COST, "Expected `COST` after MATCH WITH.")?;
+			Some(self.function_signature_name()?)
+		} else {
+			None
+		};
 		let filter = if self.consume_keyword(keywords::WHERE).is_some() {
 			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else {
@@ -91,6 +97,7 @@ impl Parser<'_> {
 			constraints,
 			patterns,
 			source,
+			custom_cost,
 			filter,
 			max_depth,
 			timeout,
@@ -403,7 +410,7 @@ impl Parser<'_> {
 			&& self.at_symbol(Symbol::LeftBracket);
 		let (direction, edge) = if bracketed {
 			let open = self.expect_symbol(Symbol::LeftBracket, "Expected `[` in MATCH edge.")?;
-			let (selector, alias, label, length) = self.match_edge_binding(context, true).await?;
+			let (selector, alias, label, length) = self.match_edge_binding(context).await?;
 			let (properties, predicate) = self.match_inline_filters(context).await?;
 			let (constraints, custom_cost) = self.local_match_constraints()?;
 			self.close(Symbol::RightBracket, open.span, "`]`")?;
@@ -457,10 +464,7 @@ impl Parser<'_> {
 			TokenKind::Symbol(Symbol::LeftTildeLeftBracket) => true,
 			_ => return Err(self.syntax("Expected an AtomWalk `~[...]~` edge.", prefix.span)),
 		};
-		let (selector, alias, label, length) = self.match_edge_binding(context, false).await?;
-		if length.is_some() {
-			return Err(self.syntax("AtomWalk connectors do not accept path ranges.", prefix.span));
-		}
+		let (selector, alias, label, length) = self.match_edge_binding(context).await?;
 		let (properties, predicate) = self.match_inline_filters(context).await?;
 		let (constraints, custom_cost) = self.local_match_constraints()?;
 		let suffix = self.tokens.next();
@@ -483,7 +487,7 @@ impl Parser<'_> {
 			label,
 			properties,
 			predicate,
-			length: None,
+			length,
 			constraints,
 			custom_cost,
 			span: cover(prefix.span, suffix.span),
@@ -500,7 +504,6 @@ impl Parser<'_> {
 	async fn match_edge_binding(
 		&mut self,
 		context: &mut Stk,
-		allow_length: bool,
 	) -> FerrosGrynnResult<(
 		MatchSelector,
 		Option<Identifier>,
@@ -509,11 +512,6 @@ impl Parser<'_> {
 	)> {
 		let (selector, alias, label) = self.match_binding(context).await?;
 		let length = if let Some(star) = self.consume_symbol(Symbol::Star) {
-			if !allow_length {
-				return Err(
-					self.syntax("AtomWalk connectors do not accept path ranges.", star.span)
-				);
-			}
 			Some(self.match_length(star.span)?)
 		} else {
 			None

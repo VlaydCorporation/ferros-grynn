@@ -35,6 +35,8 @@ struct PreparedStep {
 	arguments: Vec<Value>,
 	named_function: Option<NamedFunctionKey>,
 	algorithm_input: Option<Type>,
+	neighbourhood_index: Option<crate::datastore::IndexId>,
+	landmark_path: Option<crate::datastore::QueryLandmarkPath>,
 	match_plan: Option<Box<LogicalMatch>>,
 	repeat: Option<PreparedRepeat>,
 }
@@ -97,6 +99,32 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 	runtime: &mut ControlRuntime,
 	visit: &mut impl FnMut(Value) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Option<Value>> {
+	let physical = if plan.steps.iter().any(|step| {
+		matches!(
+			step.kind,
+			TraverseStepKind::KHopEstimate
+				| TraverseStepKind::ShortestPath
+				| TraverseStepKind::WeightedShortestPath
+				| TraverseStepKind::DistanceTo
+		)
+	}) {
+		let demand = crate::gql::optimizer::PlannerDemand::for_traverse(plan);
+		let snapshot = read.planner_snapshot(snapshot, &demand)?;
+		let snapshot = if control.deterministic() {
+			snapshot.deterministic_projection()
+		} else {
+			snapshot
+		};
+		Some(crate::gql::optimizer::plan_traverse(
+			plan,
+			&snapshot,
+			control.barrier_memory_limit(),
+			control.deterministic(),
+			control.fast(),
+		)?)
+	} else {
+		None
+	};
 	let graph = plan
 		.graph
 		.as_ref()
@@ -106,7 +134,12 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 		.transpose()?;
 	let (source_value, source_binding, retain_environment) = match &plan.source {
 		LogicalTraverseSource::Expression(expression) => {
-			(eval(expression, None, slots, source, None, Some(control))?, None, false)
+			let fields = RecordFields {
+				read: &*read,
+				snapshot,
+				graph: graph.as_ref(),
+			};
+			(eval(expression, None, slots, source, Some(&fields), Some(control))?, None, false)
 		}
 		LogicalTraverseSource::Match(statement) => {
 			let current = statement
@@ -130,7 +163,14 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 		source_binding.as_deref(),
 		retain_environment,
 	)?;
-	let prepared = prepare_steps(plan, slots, source, control)?;
+	let prepared = {
+		let fields = RecordFields {
+			read: &*read,
+			snapshot,
+			graph: graph.as_ref(),
+		};
+		prepare_steps(plan, physical.as_ref(), slots, source, control, &fields)?
+	};
 	if source_queue.iter().any(|traverser| matches!(traverser.current, Value::GraphRef(_)))
 		&& prepared.first().is_none_or(|step| {
 			!matches!(step.kind, TraverseStepKind::Vertices | TraverseStepKind::Edges)
@@ -161,6 +201,8 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 		runtime,
 		path_tracking,
 		plan.atom,
+		plan.custom_cost,
+		&plan.constraints,
 	);
 	if let Some(graph_plan) = &plan.return_graph {
 		let mut assembly = graph_result::GraphAssemblyAccumulator::new(graph, None, None, control);
@@ -168,12 +210,17 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 			control.check()?;
 			assembly.record_source_row();
 			let row = machine.return_row(&traverser, &plan.result);
+			let fields = RecordFields {
+				read: &*machine.read,
+				snapshot,
+				graph: None,
+			};
 			assembly.add_nodes(eval(
 				&graph_plan.nodes,
 				Some(&row),
 				slots,
 				source,
-				None,
+				Some(&fields),
 				Some(control),
 			)?)?;
 			assembly.add_edges(eval(
@@ -181,11 +228,18 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 				Some(&row),
 				slots,
 				source,
-				None,
+				Some(&fields),
 				Some(control),
 			)?)?;
 			if let Some(root) = &graph_plan.root {
-				assembly.add_root(eval(root, Some(&row), slots, source, None, Some(control))?)?;
+				assembly.add_root(eval(
+					root,
+					Some(&row),
+					slots,
+					source,
+					Some(&fields),
+					Some(control),
+				)?)?;
 			}
 		}
 		return assembly
@@ -196,7 +250,12 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 		control.check()?;
 		let value = if let Some(projection) = &plan.returning {
 			let row = machine.return_row(&traverser, &plan.result);
-			eval(projection, Some(&row), slots, source, None, Some(control))?
+			let fields = RecordFields {
+				read: &*machine.read,
+				snapshot,
+				graph: None,
+			};
+			eval(projection, Some(&row), slots, source, Some(&fields), Some(control))?
 		} else {
 			traverser.current
 		};
@@ -240,19 +299,7 @@ fn traversal_source<Read: QueryRead>(
 					)
 				})?;
 				let graph_view = read.graph(snapshot, graph)?;
-				let node = crate::graph::AtomRef::new(AtomKind::Node, (*record).clone());
-				let atom = if graph_view.atom_id(&node)?.is_some() {
-					node
-				} else {
-					let edge = crate::graph::AtomRef::new(AtomKind::Edge, (*record).clone());
-					if graph_view.atom_id(&edge)?.is_none() {
-						return Err(FerrosGrynnError::atom_does_not_exist(
-							"atom",
-							record.to_string(),
-						));
-					}
-					edge
-				};
+				let atom = resolve_record_atom(&graph_view, &record)?;
 				Value::AtomOccurrence(Box::new(AtomOccurrenceRef::new(
 					atom,
 					Arc::new(graph.clone()),
@@ -305,17 +352,20 @@ fn traversal_source<Read: QueryRead>(
 
 fn prepare_steps(
 	plan: &LogicalTraverse,
+	physical: Option<&crate::gql::optimizer::PhysicalTraversalPlan>,
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
+	fields: &dyn AtomFieldRead,
 ) -> FerrosGrynnResult<Vec<PreparedStep>> {
 	plan.steps
 		.iter()
-		.map(|step| {
+		.enumerate()
+		.map(|(ordinal, step)| {
 			let arguments = step
 				.arguments
 				.iter()
-				.map(|argument| eval(argument, None, slots, source, None, Some(control)))
+				.map(|argument| eval(argument, None, slots, source, Some(fields), Some(control)))
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			let repeat = step
 				.repeat
@@ -326,21 +376,35 @@ fn prepare_steps(
 						None,
 						slots,
 						source,
-						None,
+						Some(fields),
 						Some(control),
 					)?)?;
 					let times = repeat
 						.times
 						.as_ref()
 						.map(|times| {
-							eval_usize_value(eval(times, None, slots, source, None, Some(control))?)
+							eval_usize_value(eval(
+								times,
+								None,
+								slots,
+								source,
+								Some(fields),
+								Some(control),
+							)?)
 						})
 						.transpose()?;
 					let until = repeat
 						.until
 						.as_ref()
 						.map(|until| {
-							closure_value(eval(until, None, slots, source, None, Some(control))?)
+							closure_value(eval(
+								until,
+								None,
+								slots,
+								source,
+								Some(fields),
+								Some(control),
+							)?)
 						})
 						.transpose()?;
 					Ok::<_, FerrosGrynnError>(PreparedRepeat {
@@ -356,11 +420,53 @@ fn prepare_steps(
 				arguments,
 				named_function: step.named_function,
 				algorithm_input: step.algorithm_input.clone(),
+				neighbourhood_index: physical.and_then(|plan| {
+					plan.nodes.iter().find_map(|node| {
+						if node.step_index != Some(ordinal) {
+							return None;
+						}
+						match &node.operator {
+							crate::gql::optimizer::TraversalOperator::NeighbourhoodSketch(
+								index,
+							) => Some(index.index),
+							_ => None,
+						}
+					})
+				}),
+				landmark_path: physical.and_then(|plan| {
+					plan.nodes.iter().find_map(|node| {
+						if node.step_index == Some(ordinal)
+							&& let crate::gql::optimizer::TraversalOperator::LandmarkShortest(index)
+							| crate::gql::optimizer::TraversalOperator::LandmarkWeighted {
+								index,
+								..
+							} = &node.operator
+						{
+							Some(index.clone())
+						} else {
+							None
+						}
+					})
+				}),
 				match_plan: step.match_plan.clone(),
 				repeat,
 			})
 		})
 		.collect()
+}
+
+/// Resolves a public RecordId within exactly one graph membership scope.
+fn resolve_record_atom<Graph: GraphRead>(
+	graph: &Graph,
+	record: &crate::values::RecordId,
+) -> FerrosGrynnResult<crate::graph::AtomRef> {
+	for kind in [AtomKind::Node, AtomKind::Edge] {
+		let atom = crate::graph::AtomRef::new(kind, record.clone());
+		if graph.atom_id(&atom)?.is_some() {
+			return Ok(atom);
+		}
+	}
+	Err(FerrosGrynnError::atom_does_not_exist("atom", record.to_string()))
 }
 
 fn closure_value(value: Value) -> FerrosGrynnResult<Closure> {
@@ -401,6 +507,8 @@ struct TraversalMachine<'a, Read: QueryRead> {
 	trace_memory: BarrierAccount,
 	path_tracking: bool,
 	atom_semantics: bool,
+	custom_cost: Option<crate::gql::ir::LogicalPathCost>,
+	constraints: crate::syn::MatchConstraints,
 	side_effects: Object,
 	occurrences: std::collections::BTreeMap<BoundAtom, AtomOccurrenceRef>,
 	local_indexes: std::collections::BTreeMap<crate::graph::GraphId, Option<Rc<TraversalIndex>>>,
@@ -441,6 +549,8 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 		runtime: &'a mut ControlRuntime,
 		path_tracking: bool,
 		atom_semantics: bool,
+		custom_cost: Option<crate::gql::ir::LogicalPathCost>,
+		constraints: &crate::syn::MatchConstraints,
 	) -> Self {
 		let mut queues = (0..=steps.len()).map(|_| VecDeque::new()).collect::<Vec<_>>();
 		queues[0] = source_queue;
@@ -460,6 +570,8 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 			trace_memory: control.barrier_account(),
 			path_tracking,
 			atom_semantics,
+			custom_cost,
+			constraints: constraints.clone(),
 			side_effects: Object::new(),
 			occurrences: std::collections::BTreeMap::new(),
 			local_indexes: std::collections::BTreeMap::new(),

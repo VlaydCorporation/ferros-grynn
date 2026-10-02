@@ -103,6 +103,57 @@ pub(in crate::gql) fn plan_match(
 	})
 }
 
+/// Selects a compatible additive bound; query connector restrictions only
+/// narrow the indexed relation.
+fn select_landmark_path(
+	graph: &PlannerGraph,
+	atom: bool,
+	expand: &crate::gql::ir::PathExpand,
+) -> Option<crate::datastore::QueryLandmarkPath> {
+	let mode = if atom {
+		crate::graph::TraversalSemantics::Atom
+	} else {
+		crate::graph::TraversalSemantics::Node
+	};
+	let direction = match expand.direction {
+		crate::syn::MatchDirection::Forward => crate::graph::TraversalDirection::Forward,
+		crate::syn::MatchDirection::Backward => crate::graph::TraversalDirection::Backward,
+		crate::syn::MatchDirection::Undirected | crate::syn::MatchDirection::Bidirectional => {
+			crate::graph::TraversalDirection::Both
+		}
+	};
+	let cost = match expand.objective? {
+		crate::syn::MatchPathObjective::Shortest => crate::datastore::GraphIndexCost::Hop,
+		crate::syn::MatchPathObjective::WeightedShortest => {
+			if let Some(cost) = expand.custom_cost {
+				if cost.stateful {
+					return None;
+				}
+				crate::datastore::GraphIndexCost::Function {
+					function: cost.function.id,
+					version: cost.function.version,
+				}
+			} else {
+				crate::datastore::GraphIndexCost::Weighted
+			}
+		}
+	};
+	graph
+		.landmark_paths
+		.iter()
+		.filter(|binding| {
+			binding.mode == mode
+				&& binding.direction == direction
+				&& binding.cost == cost
+				&& (binding.edge_labels.is_empty()
+					|| expand.edge.label.as_ref().is_some_and(|label| {
+						binding.edge_labels.iter().any(|indexed| indexed == label)
+					}))
+		})
+		.min_by_key(|binding| (std::cmp::Reverse(binding.landmarks), binding.bytes, binding.index))
+		.cloned()
+}
+
 fn match_nodes(
 	statement: &LogicalMatch,
 	graph: &PlannerGraph,
@@ -136,10 +187,22 @@ fn match_nodes(
 					pattern_costs[pattern_index],
 				);
 				for (operation_index, operation) in pattern.ops.iter().enumerate() {
-					let (filters, direction) = match operation {
-						MatchOp::Expand(expand) => (&expand.filters, expand.direction),
-						MatchOp::PathExpand(expand) => (&expand.filters, expand.direction),
+					let (filters, direction, custom_cost) = match operation {
+						MatchOp::Expand(expand) => {
+							(&expand.filters, expand.direction, expand.custom_cost)
+						}
+						MatchOp::PathExpand(expand) => {
+							(&expand.filters, expand.direction, expand.custom_cost)
+						}
 					};
+					let cost = custom_cost.map(|cost| {
+						(
+							cost.function.id,
+							cost.function.version,
+							cost.function.schema_epoch,
+							cost.stateful,
+						)
+					});
 					let scoped = graph.reference.kind() == crate::graph::GraphKind::Metagraph
 						|| filters.contains(&crate::syn::MatchPathFilter::CrossLevel);
 					if scoped {
@@ -152,46 +215,69 @@ fn match_nodes(
 							PlanCost::default(),
 						);
 					}
-					let operator = match operation {
-						MatchOp::Expand(expand)
-							if expand
-								.filters
-								.contains(&crate::syn::MatchPathFilter::HyperEdges) =>
-						{
-							MatchOperator::HyperExpand {
-								direction,
-							}
+					let landmark = match operation {
+						MatchOp::PathExpand(expand) if !scoped && expand.objective.is_some() => {
+							select_landmark_path(graph, statement.atom, expand)
 						}
-						MatchOp::Expand(_) if statement.atom => MatchOperator::AtomExpand {
+						_ => None,
+					};
+					let operator = if let (MatchOp::PathExpand(expand), Some(binding)) =
+						(operation, landmark)
+					{
+						MatchOperator::LandmarkShortest {
 							direction,
-						},
-						MatchOp::Expand(_) => MatchOperator::FixedExpand {
-							direction,
-						},
-						MatchOp::PathExpand(expand) => match expand.objective {
-							Some(crate::syn::MatchPathObjective::Shortest) => {
-								MatchOperator::BreadthFirstShortest {
+							mode: expand.mode,
+							min: expand.min,
+							max: expand.max,
+							binding,
+						}
+					} else {
+						match operation {
+							MatchOp::Expand(expand)
+								if expand
+									.filters
+									.contains(&crate::syn::MatchPathFilter::HyperEdges) =>
+							{
+								MatchOperator::HyperExpand {
 									direction,
-									mode: expand.mode,
-									min: expand.min,
-									max: expand.max,
+									cost,
 								}
 							}
-							Some(crate::syn::MatchPathObjective::WeightedShortest) => {
-								MatchOperator::DijkstraShortest {
-									direction,
-									mode: expand.mode,
-									min: expand.min,
-									max: expand.max,
-								}
-							}
-							None => MatchOperator::PathEnumerate {
+							MatchOp::Expand(_) if statement.atom => MatchOperator::AtomExpand {
 								direction,
-								mode: expand.mode,
-								min: expand.min,
-								max: expand.max,
+								cost,
 							},
-						},
+							MatchOp::Expand(_) => MatchOperator::FixedExpand {
+								direction,
+								cost,
+							},
+							MatchOp::PathExpand(expand) => match expand.objective {
+								Some(crate::syn::MatchPathObjective::Shortest) => {
+									MatchOperator::BreadthFirstShortest {
+										direction,
+										mode: expand.mode,
+										min: expand.min,
+										max: expand.max,
+									}
+								}
+								Some(crate::syn::MatchPathObjective::WeightedShortest) => {
+									MatchOperator::DijkstraShortest {
+										direction,
+										mode: expand.mode,
+										min: expand.min,
+										max: expand.max,
+										cost,
+									}
+								}
+								None => MatchOperator::PathEnumerate {
+									direction,
+									mode: expand.mode,
+									min: expand.min,
+									max: expand.max,
+									cost,
+								},
+							},
+						}
 					};
 					push_match_node(
 						&mut nodes,

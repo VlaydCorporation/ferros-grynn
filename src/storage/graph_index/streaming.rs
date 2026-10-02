@@ -19,10 +19,26 @@ pub(in crate::storage) fn stream_unique_index<Address: PrimaryAddress>(
 	records: &SortedIndexRecords,
 	scratch_root: &Path,
 	page_lsn: PageLsn,
+	write: impl FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<StreamedIndex> {
+	stream_unique_index_with_layout::<Address>(records, scratch_root, page_lsn, PageType::IndexUniqueBtreeLeaf, PageNo::new(0), external_sort_run_budget(), write)
+}
+
+/// Streams the shared unique tree at a checked base page with a concrete leaf type.
+pub(in crate::storage) fn stream_unique_index_with_layout<Address: PrimaryAddress>(
+	records: &SortedIndexRecords,
+	scratch_root: &Path,
+	page_lsn: PageLsn,
+	leaf_type: PageType,
+	first_page: PageNo,
+	sort_budget: usize,
 	mut write: impl FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<StreamedIndex> {
+	if first_page == PageNo::NULL || !matches!(leaf_type, PageType::IndexUniqueBtreeLeaf | PageType::IndexEdgeEndpointEntry) {
+		return Err(invalid_index("unique tree page layout is invalid"));
+	}
 	let leaf_count = count_unique_leaves::<Address>(records)?;
-	let mut children = ExternalIndexSorter::new(scratch_root);
+	let mut children = ExternalIndexSorter::with_budget(scratch_root, sort_budget);
 	let mut leaf = Vec::<PrimaryIndexEntry<Address>>::new();
 	let mut leaf_data_bytes = 0_usize;
 	let mut leaf_index = 0_usize;
@@ -42,7 +58,7 @@ pub(in crate::storage) fn stream_unique_index<Address: PrimaryAddress>(
 				entry_bytes,
 				MUTABLE_PRIMARY_LEAF_BYTES,
 			)? {
-			flush_unique_leaf(&mut write, &mut children, leaf_index, leaf_count, &leaf, page_lsn)?;
+			flush_unique_leaf(&mut write, &mut children, leaf_index, leaf_count, &leaf, page_lsn, leaf_type, first_page)?;
 			leaf_index += 1;
 			leaf.clear();
 			leaf_data_bytes = 0;
@@ -60,23 +76,25 @@ pub(in crate::storage) fn stream_unique_index<Address: PrimaryAddress>(
 		previous_key = Some(key.to_vec());
 		Ok(())
 	})?;
-	flush_unique_leaf(&mut write, &mut children, leaf_index, leaf_count, &leaf, page_lsn)?;
+	flush_unique_leaf(&mut write, &mut children, leaf_index, leaf_count, &leaf, page_lsn, leaf_type, first_page)?;
 	if leaf_index + 1 != leaf_count {
 		return Err(invalid_index("unique leaf sizing pass disagrees with packing pass"));
 	}
 	if leaf_count == 1 {
 		return Ok(StreamedIndex {
-			root: PageNo::new(0),
-			page_count: 1,
+			root: first_page,
+			page_count: first_page.get().checked_add(1).ok_or_else(|| invalid_index("unique page count overflows"))?,
 		});
 	}
 	let children = children.finish()?;
 	let (root, page_count) = stream_internal_levels(
 		children,
 		u64::try_from(leaf_count)
-			.map_err(|_error| invalid_index("unique leaf count exceeds u64"))?,
+			.map_err(|_error| invalid_index("unique leaf count exceeds u64"))?
+			.checked_add(first_page.get()).ok_or_else(|| invalid_index("unique page count overflows"))?,
 		scratch_root,
 		page_lsn,
+		sort_budget,
 		&mut write,
 	)?;
 	Ok(StreamedIndex {
@@ -169,7 +187,7 @@ pub(in crate::storage) fn stream_standard_index<Address: PrimaryAddress + Ord>(
 	}
 	let children = children.finish()?;
 	let (root, page_count) =
-		stream_internal_levels(children, leaf_and_posting, scratch_root, page_lsn, &mut write)?;
+		stream_internal_levels(children, leaf_and_posting, scratch_root, page_lsn, external_sort_run_budget(), &mut write)?;
 	Ok(StreamedIndex {
 		root,
 		page_count,
@@ -465,11 +483,13 @@ fn flush_unique_leaf<Address: PrimaryAddress>(
 	leaf_count: usize,
 	leaf: &[PrimaryIndexEntry<Address>],
 	page_lsn: PageLsn,
+	leaf_type: PageType,
+	first_page: PageNo,
 ) -> FerrosGrynnResult<()> {
-	let page_no = usize_page_no(leaf_index, "unique leaf page index")?;
+	let page_no = PageNo::new(usize_page_no(leaf_index, "unique leaf page index")?.get().checked_add(first_page.get()).ok_or_else(|| invalid_index("unique leaf page number overflows"))?);
 	let next = (leaf_index + 1 < leaf_count).then(|| PageNo::new(page_no.get() + 1));
 	let mut page = Box::new(AlignedPage::zeroed());
-	encode_unique_leaf(&mut page, page_no, page_lsn, next, leaf)?;
+	encode_unique_leaf_with_type(&mut page, page_no, page_lsn, next, leaf, leaf_type)?;
 	write(page_no, &page)?;
 	if let Some(first) = leaf.first() {
 		children.push_raw(first.key.clone(), page_no.get())?;
@@ -566,11 +586,12 @@ fn stream_internal_levels(
 	mut next_page: u64,
 	scratch_root: &Path,
 	page_lsn: PageLsn,
+	sort_budget: usize,
 	write: &mut impl FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<(PageNo, u64)> {
 	while current.len()? > 1 {
 		let current_count = current.len()?;
-		let mut next = ExternalIndexSorter::new(scratch_root);
+		let mut next = ExternalIndexSorter::with_budget(scratch_root, sort_budget);
 		let mut group = Vec::<ChildPage>::new();
 		let mut previous_key = None::<Vec<u8>>;
 		current.visit_raw(|key, address| {

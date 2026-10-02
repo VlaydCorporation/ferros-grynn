@@ -30,6 +30,7 @@ use crate::{
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomKind, EdgeEndpoint, EdgeTopology, GraphId},
+	math::HyperLogLog,
 	storage::{ExternalIndexSorter, SortedIndexRecords},
 	values::{
 		PropertyKeyId,
@@ -59,6 +60,8 @@ struct PropertyAccumulator {
 	sampled_rows: u32,
 	sampled_nulls: u32,
 	hll: Option<HyperLogLog>,
+	geometry_sample: BTreeMap<(u64, u64), [f64; 4]>,
+	geometry_population: u64,
 }
 
 /// Histogram construction policy selected by public `ANALYZE`.
@@ -68,46 +71,6 @@ pub(crate) enum AnalyzeMethod {
 	Approximate {
 		sample_count: NonZeroU32,
 	},
-}
-
-const HLL_PRECISION: u32 = 12;
-const HLL_REGISTER_COUNT: usize = 1 << HLL_PRECISION;
-
-struct HyperLogLog {
-	registers: Box<[u8]>,
-}
-
-impl HyperLogLog {
-	fn new() -> Self {
-		Self {
-			registers: vec![0; HLL_REGISTER_COUNT].into_boxed_slice(),
-		}
-	}
-
-	fn insert(&mut self, value: &[u8]) {
-		let hash = rapidhash_v3(value);
-		let index = usize::try_from(hash >> (64 - HLL_PRECISION)).unwrap_or(0);
-		let rank =
-			(hash << HLL_PRECISION).leading_zeros().saturating_add(1).min(65 - HLL_PRECISION);
-		if let Some(register) = self.registers.get_mut(index) {
-			*register = (*register).max(u8::try_from(rank).unwrap_or(u8::MAX));
-		}
-	}
-
-	fn estimate(&self) -> u64 {
-		let count = self.registers.len() as f64;
-		let reciprocal_sum =
-			self.registers.iter().map(|rank| 2.0_f64.powi(-i32::from(*rank))).sum::<f64>();
-		let alpha = 0.7213 / (1.0 + 1.079 / count);
-		let raw = alpha * count * count / reciprocal_sum;
-		let empty = self.registers.iter().filter(|rank| **rank == 0).count();
-		let corrected = if raw <= 2.5 * count && empty != 0 {
-			count * (count / empty as f64).ln()
-		} else {
-			raw
-		};
-		corrected.round().clamp(0.0, u64::MAX as f64) as u64
-	}
 }
 
 /// Performs one exact full scan shared by RAM and durable rebuilds.
@@ -341,7 +304,14 @@ fn property_accumulators(
 					valid: true,
 					sampled_rows: 0,
 					sampled_nulls: 0,
-					hll: matches!(method, AnalyzeMethod::Approximate { .. }).then(HyperLogLog::new),
+					hll: match method {
+						AnalyzeMethod::Full => None,
+						AnalyzeMethod::Approximate {
+							..
+						} => Some(HyperLogLog::new(12)?),
+					},
+					geometry_sample: BTreeMap::new(),
+					geometry_population: 0,
 				},
 			))
 		})
@@ -363,6 +333,34 @@ fn record_properties<'value>(
 			.checked_add(1)
 			.ok_or_else(|| invalid("histogram row count overflows u64"))?;
 		if !accumulator.valid {
+			continue;
+		}
+		if accumulator.type_tag == 0x27 {
+			match value(accumulator.property_key) {
+				None | Some(Value::None | Value::Null) => {
+					increment(&mut accumulator.null_count, 1, "geometry null count")?
+				}
+				Some(Value::Geometry(geometry)) => {
+					if let Some(mbr) = geometry.mbr()? {
+						increment(&mut accumulator.geometry_population, 1, "geometry population")?;
+						let mut identity = [0_u8; 12];
+						identity[..4].copy_from_slice(&accumulator.ordinal.to_le_bytes());
+						identity[4..].copy_from_slice(&sequence.to_le_bytes());
+						accumulator
+							.geometry_sample
+							.insert((rapidhash_v3(&identity), *sequence), mbr);
+						if accumulator.geometry_sample.len() > 1024 {
+							accumulator.geometry_sample.pop_last();
+						}
+					}
+				}
+				Some(_) => {
+					accumulator.valid = false;
+				}
+			}
+			*sequence = sequence
+				.checked_add(1)
+				.ok_or_else(|| invalid("geometry sample sequence overflows"))?;
 			continue;
 		}
 		let encoded = match value(accumulator.property_key) {
@@ -452,6 +450,20 @@ fn finish_properties(
 		let histogram = finished
 			.remove(&accumulator.ordinal)
 			.ok_or_else(|| invalid("property histogram sort result is absent"))?;
+		if accumulator.type_tag == 0x27 {
+			result.insert(key, PropertyHistogram {
+				type_tag: 0x27,
+				method: HistogramMethod::Exact,
+				sample_count: u32::try_from(accumulator.row_count)
+					.map_err(|_| invalid("geometry histogram population exceeds u32"))?,
+				distinct_count: 0,
+				null_fraction: fraction(accumulator.null_count, accumulator.row_count),
+				buckets: Vec::new(),
+				mbr_sample: accumulator.geometry_sample.into_values().collect(),
+				mbr_population: accumulator.geometry_population,
+			});
+			continue;
+		}
 		let (method, sample_count, distinct_count, null_fraction) = match method {
 			AnalyzeMethod::Full => {
 				let Ok(sample_count) = u32::try_from(accumulator.row_count) else {
@@ -483,6 +495,8 @@ fn finish_properties(
 			distinct_count,
 			null_fraction,
 			buckets: histogram.buckets,
+			mbr_sample: accumulator.geometry_sample.into_values().collect(),
+			mbr_population: 0,
 		});
 	}
 	Ok(result)
@@ -742,6 +756,7 @@ fn histogram_type_tag(value_type: &Type) -> Option<u8> {
 		}
 		Type::Atom(_) => TypeTag::AtomRef,
 		Type::Option(inner) => return histogram_type_tag(inner),
+		Type::Geometry => return Some(0x27),
 		_ => return None,
 	};
 	Some(tag.byte())

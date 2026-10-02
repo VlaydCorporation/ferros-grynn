@@ -312,7 +312,13 @@ impl Datastore {
 
 	/// Opens a transaction on one immutable database-wide snapshot.
 	pub fn begin_with(&self, options: TransactionOptions) -> Transaction {
-		let root = self.inner.current_root();
+		let mut root = self.inner.current_root();
+		let _commit = (matches!(&self.inner.backend, StoreBackend::Local(_))
+			&& root.schema.has_snapshot_indexes())
+		.then(|| self.inner.commit.lock());
+		if _commit.is_some() {
+			root = self.inner.current_root();
+		}
 		Transaction::new(
 			self.clone(),
 			self.inner.next_transaction.fetch_add(1, Ordering::Relaxed),

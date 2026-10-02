@@ -243,6 +243,13 @@ pub enum BinaryOperator {
 	Coalesce,
 	Elvis,
 	Pipeline,
+	Inside,
+	NotInside,
+	AllInside,
+	AnyInside,
+	NoneInside,
+	Outside,
+	Intersects,
 }
 
 pub(super) const fn cover(start: TextSpan, end: TextSpan) -> TextSpan {

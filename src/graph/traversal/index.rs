@@ -94,6 +94,134 @@ impl TraversalIndex {
 		Self::build(graph, semantics, false, &mut || Ok(()))
 	}
 
+	/// Admits adjacency growth before constructing an owned index. The estimate
+	/// includes both directions, hash table growth, endpoint clones and vector
+	/// reallocation peaks, including qualified scopes.
+	///
+	/// # Errors
+	/// Returns graph read, cancellation, checked-size or caller budget errors.
+	pub(crate) fn new_with_admission<R: GraphRead>(
+		graph: &R,
+		semantics: TraversalSemantics,
+		admit: &mut impl FnMut(usize) -> FerrosGrynnResult<()>,
+		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Self> {
+		let overflow = || FerrosGrynnError::operation_overflow("traversal adjacency bytes");
+		admit(graph.node_count()?.checked_mul(512).ok_or_else(overflow)?)?;
+		if semantics == TraversalSemantics::Atom {
+			admit(graph.edge_count()?.checked_mul(512).ok_or_else(overflow)?)?;
+		}
+		for id in graph.edge_ids()? {
+			check()?;
+			let id = id?;
+			let edge = graph.edge(id)?.ok_or_else(|| {
+				algorithm_failure("traversal index", format!("missing edge {id}"))
+			})?;
+			let topology = edge.topology()?;
+			let accepts = |endpoint: &&EdgeEndpoint| {
+				semantics == TraversalSemantics::Atom
+					|| endpoint_kind(endpoint) == Some(AtomKind::Node)
+			};
+			let sources = topology.source().iter().filter(accepts).count();
+			let targets = topology.target().iter().filter(accepts).count();
+			let nested = topology.endpoints().filter(|endpoint| endpoint.is_cross_level()).count();
+			let mut scope_bytes = 0;
+			for endpoint in topology.endpoints() {
+				if let EdgeEndpoint::Nested(qualified) = endpoint {
+					scope_bytes = scope_bytes.max(
+						qualified
+							.scope()
+							.len()
+							.checked_mul(size_of::<AtomId>())
+							.ok_or_else(overflow)?,
+					);
+				}
+			}
+			let pairs = match topology.as_ref() {
+				EdgeTopology::Undirected {
+					..
+				} => sources.checked_mul(sources.saturating_sub(1)),
+				EdgeTopology::Directed {
+					..
+				} => sources.checked_mul(targets),
+				EdgeTopology::Bidirectional {
+					..
+				} => sources.checked_mul(targets).and_then(|pairs| pairs.checked_mul(2)),
+			}
+			.ok_or_else(overflow)?;
+			let endpoint_bytes = scope_bytes
+				.checked_mul(4)
+				.and_then(|bytes| bytes.checked_add(512))
+				.ok_or_else(overflow)?;
+			let step_bytes = scope_bytes
+				.checked_add(size_of::<TraversalStep>())
+				.and_then(|bytes| bytes.checked_mul(8))
+				.ok_or_else(overflow)?;
+			admit(
+				nested
+					.checked_mul(endpoint_bytes)
+					.and_then(|bytes| {
+						pairs.checked_mul(step_bytes).and_then(|steps| bytes.checked_add(steps))
+					})
+					.ok_or_else(overflow)?,
+			)?;
+		}
+		Self::build(graph, semantics, true, check)
+	}
+
+	/// Builds only one indexed edge frontier, retaining the shared incidence
+	/// semantics.
+	pub(crate) fn for_edge_endpoint<R: GraphRead>(
+		graph: &R,
+		endpoint: &EdgeEndpoint,
+	) -> FerrosGrynnResult<Option<Self>> {
+		let Some(connectors) = graph.edge_endpoint_connectors(endpoint)? else {
+			return Ok(None);
+		};
+		let mut index = Self {
+			identity: graph.identity(),
+			revision: graph.revision(),
+			semantics: TraversalSemantics::Atom,
+			has_nested_endpoints: false,
+			forward: RapidHashMap::default(),
+			backward: RapidHashMap::default(),
+		};
+		let mut count = 0_usize;
+		for connector in connectors {
+			let edge = graph
+				.edge(connector)?
+				.ok_or_else(|| algorithm_failure("edge endpoint", "connector is absent"))?;
+			let topology = edge.topology()?;
+			for direction in [TraversalDirection::Forward, TraversalDirection::Backward] {
+				visit_endpoint_steps(
+					connector,
+					topology.as_ref(),
+					endpoint,
+					TraversalSemantics::Atom,
+					direction,
+					|step| {
+						if count == 262_144 {
+							return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+								"edge endpoint candidates",
+								262_144,
+							));
+						}
+						count += 1;
+						index.has_nested_endpoints |= step.target.is_cross_level();
+						let target = if direction == TraversalDirection::Forward {
+							&mut index.forward
+						} else {
+							&mut index.backward
+						};
+						target.entry(endpoint.clone()).or_default().push(step);
+						Ok(())
+					},
+				)?;
+			}
+		}
+		Ok(Some(index))
+	}
+
 	pub(super) fn new_with_check<R: GraphRead, Check>(
 		graph: &R,
 		semantics: TraversalSemantics,
@@ -193,18 +321,56 @@ impl TraversalIndex {
 		direction: TraversalDirection,
 		max_depth: Option<usize>,
 	) -> FerrosGrynnResult<Vec<EdgeEndpoint>> {
+		self.breadth_first_with_control(
+			root,
+			direction,
+			max_depth,
+			&mut |_| Ok(()),
+			&mut || Ok(()),
+			&mut || Ok(()),
+		)
+	}
+
+	/// Reuses the projection BFS with admission and per-branch execution
+	/// control.
+	///
+	/// # Errors
+	/// Propagates missing endpoints, capacity, memory and cancellation
+	/// failures.
+	pub(crate) fn breadth_first_with_control(
+		&self,
+		root: EdgeEndpoint,
+		direction: TraversalDirection,
+		max_depth: Option<usize>,
+		admit: &mut impl FnMut(usize) -> FerrosGrynnResult<()>,
+		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+		visit: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Vec<EdgeEndpoint>> {
+		check()?;
 		self.ensure_endpoint(&root)?;
+		let bytes = self
+			.forward
+			.len()
+			.checked_add(self.backward.len())
+			.and_then(|count| count.checked_mul(3 * std::mem::size_of::<EdgeEndpoint>() + 96))
+			.ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::operation_overflow("projection BFS bytes")
+			})?;
+		admit(bytes)?;
 		let mut visited = RapidHashSet::default();
 		let mut queue = VecDeque::from([(root.clone(), 0_usize)]);
 		let mut order = Vec::new();
 		visited.insert(root);
 
 		while let Some((endpoint, depth)) = queue.pop_front() {
+			check()?;
 			order.push(endpoint.clone());
 			if max_depth.is_some_and(|limit| depth >= limit) {
 				continue;
 			}
 			for step in self.steps(&endpoint, direction) {
+				check()?;
+				visit()?;
 				if visited.insert(step.target.clone()) {
 					queue.push_back((step.target.clone(), depth + 1));
 				}
@@ -375,6 +541,73 @@ impl TraversalIndex {
 	}
 }
 
+/// Visits one endpoint's exact incidence without constructing the other
+/// endpoint pairs.
+pub fn visit_endpoint_steps(
+	edge: AtomId,
+	topology: &EdgeTopology,
+	endpoint: &EdgeEndpoint,
+	semantics: TraversalSemantics,
+	direction: TraversalDirection,
+	mut visit: impl FnMut(TraversalStep) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()> {
+	if semantics == TraversalSemantics::Node && endpoint_kind(endpoint) != Some(AtomKind::Node) {
+		return Ok(());
+	}
+	let mut emit = |target: &EdgeEndpoint, direction, role| {
+		if semantics == TraversalSemantics::Node && endpoint_kind(target) != Some(AtomKind::Node) {
+			return Ok(());
+		}
+		visit(TraversalStep {
+			target: target.clone(),
+			via_edge: edge,
+			topology: topology.direction(),
+			direction,
+			role,
+		})
+	};
+	if let EdgeTopology::Undirected {
+		endpoints,
+	} = topology
+	{
+		let occurrences = endpoints.iter().filter(|source| *source == endpoint).count();
+		for target in endpoints {
+			for _ in 0..occurrences.saturating_sub(usize::from(target == endpoint)) {
+				emit(target, PathDirection::Undirected, EndpointRole::Undirected)?;
+			}
+		}
+		return Ok(());
+	}
+	for forward in [true, false] {
+		if !forward
+			&& direction == TraversalDirection::Both
+			&& topology.direction() == EdgeDirection::Bidirectional
+		{
+			continue;
+		}
+		if (forward && direction == TraversalDirection::Backward)
+			|| (!forward && direction == TraversalDirection::Forward)
+		{
+			continue;
+		}
+		if (forward || topology.direction() == EdgeDirection::Bidirectional)
+			&& topology.source().contains(endpoint)
+		{
+			for target in topology.target() {
+				emit(target, PathDirection::Forward, EndpointRole::Target)?;
+			}
+		}
+		if (!forward || topology.direction() == EdgeDirection::Bidirectional)
+			&& topology.target().contains(endpoint)
+		{
+			for target in topology.source() {
+				emit(target, PathDirection::Reverse, EndpointRole::Source)?;
+			}
+		}
+	}
+	Ok(())
+}
+
 const fn endpoint_kind(endpoint: &EdgeEndpoint) -> Option<AtomKind> {
 	match endpoint {
 		EdgeEndpoint::Local(id) => id.kind(),
@@ -404,4 +637,64 @@ fn deduplicated_steps<'index>(
 	second: &'index [TraversalStep],
 ) -> impl DoubleEndedIterator<Item = &'index TraversalStep> + 'index {
 	first.iter().chain(second.iter().filter(move |step| !first.contains(step)))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn endpoint_kernel_matches_full_incidence_for_every_direction_and_mode() {
+		let node = AtomId::from_parts(AtomKind::Node, 1, 1).unwrap();
+		let edge = AtomId::from_parts(AtomKind::Edge, 1, 1).unwrap();
+		let other = AtomId::from_parts(AtomKind::Edge, 2, 1).unwrap();
+		let nested = crate::graph::QualifiedAtomId::new(vec![node], edge).unwrap();
+		let sources = [EdgeEndpoint::Local(node), EdgeEndpoint::Local(edge)];
+		let targets = [EdgeEndpoint::Local(other), EdgeEndpoint::Nested(nested)];
+		for topology in [
+			EdgeTopology::directed(sources.clone(), targets.clone()),
+			EdgeTopology::bidirectional(sources.clone(), targets.clone()),
+			EdgeTopology::undirected(sources.into_iter().chain(targets)),
+			EdgeTopology::directed([edge], [edge]),
+		] {
+			for semantics in [TraversalSemantics::Node, TraversalSemantics::Atom] {
+				let mut index = TraversalIndex {
+					identity: Uuid::default(),
+					revision: 0,
+					semantics,
+					has_nested_endpoints: false,
+					forward: RapidHashMap::default(),
+					backward: RapidHashMap::default(),
+				};
+				index.register_topology(other, &topology);
+				for endpoint in topology.endpoints() {
+					for direction in [
+						TraversalDirection::Forward,
+						TraversalDirection::Backward,
+						TraversalDirection::Both,
+					] {
+						let expected =
+							index.steps(endpoint, direction).cloned().collect::<Vec<_>>();
+						let mut actual = Vec::new();
+						visit_endpoint_steps(
+							other,
+							&topology,
+							endpoint,
+							semantics,
+							direction,
+							|step| {
+								actual.push(step);
+								Ok(())
+							},
+						)
+						.unwrap();
+						assert_eq!(
+							actual, expected,
+							"{topology:?} {endpoint:?} {semantics:?} {direction:?}"
+						);
+					}
+				}
+			}
+		}
+	}
 }

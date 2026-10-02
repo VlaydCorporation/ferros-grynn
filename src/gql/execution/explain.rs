@@ -32,6 +32,10 @@ struct AnalyzeObservation {
 	path_expansions: u64,
 	match_metrics: crate::gql::options::MatchMetricsSnapshot,
 	graph_assembly: crate::gql::options::GraphAssemblyMetricsSnapshot,
+	/// Actual candidates, refinements, fallbacks, tree pages and delta records.
+	spatial: [u64; 5],
+	/// Sketch hits, exact fallbacks, charged work and consulted artifact bytes.
+	neighbourhood: [u64; 4],
 	publication: &'static str,
 }
 
@@ -73,6 +77,8 @@ pub(super) fn execute_explain<Read: QueryRead>(
 		let path_expansions_before = control.path_expansions();
 		let match_metrics_before = control.match_metrics();
 		let graph_assembly_before = control.graph_assembly_metrics();
+		let spatial_before = control.spatial_metrics();
+		let neighbourhood_before = control.neighbourhood_metrics();
 		let (spill_bytes_before, spill_runs_before) = control.spill_metrics();
 		let analyze_control = control.clone().with_instrumentation();
 		let started = Instant::now();
@@ -112,6 +118,13 @@ pub(super) fn execute_explain<Read: QueryRead>(
 			graph_assembly: analyze_control
 				.graph_assembly_metrics()
 				.saturating_sub(graph_assembly_before),
+			spatial: std::array::from_fn(|index| {
+				analyze_control.spatial_metrics()[index].saturating_sub(spatial_before[index])
+			}),
+			neighbourhood: std::array::from_fn(|index| {
+				analyze_control.neighbourhood_metrics()[index]
+					.saturating_sub(neighbourhood_before[index])
+			}),
 			publication: if logical_mutates(&explain.statement) {
 				if control.publication_deferred() {
 					"deferred"
@@ -139,7 +152,7 @@ pub(super) fn execute_explain<Read: QueryRead>(
 			snapshot,
 			seed,
 			planning_ns,
-			observation,
+			observation.as_ref(),
 		),
 		ExplainFormat::Text => explain_text(
 			explain.mode,
@@ -149,7 +162,7 @@ pub(super) fn execute_explain<Read: QueryRead>(
 			snapshot,
 			seed,
 			planning_ns,
-			observation,
+			observation.as_ref(),
 		),
 	};
 	Ok(ControlFlow::Value(value))
@@ -217,7 +230,7 @@ fn explain_json(
 	query_snapshot: Snapshot,
 	seed: u64,
 	planning_ns: u64,
-	observation: Option<AnalyzeObservation>,
+	observation: Option<&AnalyzeObservation>,
 ) -> Value {
 	let mut root = Object::new();
 	root.insert("plan_version", u64::from(crate::gql::optimizer::PLAN_ENCODING_VERSION));
@@ -257,7 +270,7 @@ fn explain_text(
 	query_snapshot: Snapshot,
 	seed: u64,
 	planning_ns: u64,
-	observation: Option<AnalyzeObservation>,
+	observation: Option<&AnalyzeObservation>,
 ) -> Value {
 	let mut lines = vec![format!(
 		"EXPLAIN {} {} plan=v{} hash={:016x} snapshot={} seed={} stats_revision={} planning_ns={}",
@@ -325,6 +338,28 @@ fn explain_text(
 			observation.graph_assembly.scope_slots,
 			observation.graph_assembly.validation_ns,
 			observation.publication,
+		));
+		lines.push(format!(
+			"  landmark_lookups={} landmark_fallbacks={} landmark_artifact_bytes={}",
+			observation.match_metrics.landmark_lookups,
+			observation.match_metrics.landmark_fallbacks,
+			observation.match_metrics.landmark_artifact_bytes,
+		));
+		lines.push(format!(
+			"  spatial_candidates={} spatial_refinements={} spatial_fallbacks={}",
+			observation.spatial[0], observation.spatial[1], observation.spatial[2]
+		));
+		lines.push(format!(
+			"  spatial_tree_pages={} spatial_delta_records={}",
+			observation.spatial[3], observation.spatial[4]
+		));
+		lines.push(format!(
+			"  neighbourhood_sketch_reads={} neighbourhood_fallbacks={} \
+			 neighbourhood_exact_work={} graph_artifact_bytes={}",
+			observation.neighbourhood[0],
+			observation.neighbourhood[1],
+			observation.neighbourhood[2],
+			observation.neighbourhood[3]
 		));
 	}
 	Value::from(lines.join("\n"))
@@ -490,7 +525,7 @@ fn traversal_nodes(plan: &PhysicalTraversalPlan) -> Vec<Value> {
 		.map(|planned| {
 			let mut node = node_object(
 				planned.node_id,
-				traversal_operator_name(planned.operator),
+				traversal_operator_name(&planned.operator),
 				Some(planned.cardinality),
 				Some(planned.cost),
 			);
@@ -501,21 +536,116 @@ fn traversal_nodes(plan: &PhysicalTraversalPlan) -> Vec<Value> {
 				node.insert("nested_plan_hash", hash);
 			}
 			node.insert("unordered", planned.unordered);
-			if let TraversalOperator::Step(kind) = planned.operator {
+			if let Some((function, version, epoch, stateful)) = plan.custom_cost {
+				node.insert("cost_function_id", function.get());
+				node.insert("cost_function_version", version.get());
+				node.insert("cost_schema_epoch", epoch);
+				node.insert("cost_stateful", stateful);
+				if let Some((mode, filters)) = &plan.custom_constraints {
+					node.insert("custom_path_mode", format!("{mode:?}"));
+					node.insert("custom_path_filters", format!("{filters:?}"));
+				}
+			}
+			if let TraversalOperator::Step(kind) = &planned.operator {
 				node.insert("barrier", kind.is_barrier());
+				if *kind == TraverseStepKind::KHopEstimate {
+					node.insert("approximate_count", true);
+					node.insert("fallback", "exact_traversal");
+				}
+				if plan.custom_cost.is_some()
+					&& matches!(
+						kind,
+						TraverseStepKind::WeightedShortestPath | TraverseStepKind::DistanceTo
+					) {
+					node.insert("refinement", "canonical full-state path");
+					node.insert("fallback", "exact_traversal");
+				}
+			} else if let TraversalOperator::NeighbourhoodSketch(index) = &planned.operator {
+				node.insert("barrier", true);
+				node.insert("graph_id", index.graph.get());
+				node.insert("index_id", index.index.get());
+				node.insert("index_version", index.version.get());
+				node.insert("build_revision", index.revision);
+				node.insert(
+					"mode",
+					if index.mode == crate::graph::TraversalSemantics::Atom {
+						"ATOM"
+					} else {
+						"NODE"
+					},
+				);
+				node.insert("direction", "OUT");
+				node.insert("precision", u64::from(index.precision));
+				node.insert("artifact_bytes", index.bytes);
+				node.insert("approximate_count", true);
+				node.insert("fallback", "exact_traversal");
+			} else if let TraversalOperator::LandmarkShortest(index)
+			| TraversalOperator::LandmarkWeighted {
+				index,
+				..
+			} = &planned.operator
+			{
+				node.insert("barrier", true);
+				node.insert("graph_id", index.graph.get());
+				node.insert("index_id", index.index.get());
+				node.insert("index_version", index.version.get());
+				node.insert("build_revision", index.revision);
+				node.insert("mode", "NODE");
+				node.insert("direction", "OUT");
+				let weighted =
+					matches!(planned.operator, TraversalOperator::LandmarkWeighted { .. });
+				node.insert(
+					"cost",
+					if weighted {
+						if plan.custom_cost.is_some() {
+							"COST"
+						} else {
+							"WEIGHT"
+						}
+					} else {
+						"HOP"
+					},
+				);
+				if let TraversalOperator::LandmarkWeighted {
+					kind,
+					..
+				} = &planned.operator
+				{
+					node.insert("step", traversal_step_name(*kind));
+				}
+				node.insert("landmarks", u64::from(index.landmarks));
+				node.insert("artifact_bytes", index.bytes);
+				node.insert(
+					"refinement",
+					if weighted {
+						if plan.custom_cost.is_some() {
+							"ALT bound, canonical full-state path"
+						} else {
+							"ALT bound, canonical Dijkstra path"
+						}
+					} else {
+						"A* length, canonical BFS path"
+					},
+				);
+				node.insert("fallback", "exact_traversal");
 			}
 			Value::Object(node)
 		})
 		.collect()
 }
 
-fn traversal_operator_name(operator: TraversalOperator) -> &'static str {
+fn traversal_operator_name(operator: &TraversalOperator) -> &'static str {
 	match operator {
 		TraversalOperator::Source(TraversalSourceOperator::ValueSource) => "ValueSource",
 		TraversalOperator::Source(TraversalSourceOperator::MatchSource) => "MatchSource",
 		TraversalOperator::Source(TraversalSourceOperator::SelectSource) => "SelectSource",
 		TraversalOperator::Project => "Project",
-		TraversalOperator::Step(kind) => traversal_step_name(kind),
+		TraversalOperator::Step(kind) => traversal_step_name(*kind),
+		TraversalOperator::NeighbourhoodSketch(_) => "NeighbourhoodSketch",
+		TraversalOperator::LandmarkShortest(_) => "LandmarkShortest",
+		TraversalOperator::LandmarkWeighted {
+			..
+		} => "LandmarkWeighted",
 	}
 }
 
@@ -574,6 +704,7 @@ fn traversal_step_name(kind: TraverseStepKind) -> &'static str {
 		TraverseStepKind::Maximum => "Maximum",
 		TraverseStepKind::Average => "Average",
 		TraverseStepKind::KHop => "KHop",
+		TraverseStepKind::KHopEstimate => "KHopEstimate",
 		TraverseStepKind::Reachable => "Reachable",
 		TraverseStepKind::ShortestPath => "ShortestPath",
 		TraverseStepKind::WeightedShortestPath => "WeightedShortestPath",
@@ -610,6 +741,9 @@ fn match_operator_name(operator: &MatchOperator) -> &'static str {
 		MatchOperator::DijkstraShortest {
 			..
 		} => "DijkstraShortest",
+		MatchOperator::LandmarkShortest {
+			..
+		} => "LandmarkShortest",
 		MatchOperator::HyperContains => "HyperContains",
 		MatchOperator::HyperExpand {
 			..
@@ -630,12 +764,15 @@ fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 	match operator {
 		MatchOperator::FixedExpand {
 			direction,
+			..
 		}
 		| MatchOperator::AtomExpand {
 			direction,
+			..
 		}
 		| MatchOperator::HyperExpand {
 			direction,
+			..
 		} => {
 			node.insert("direction", format!("{direction:?}"));
 		}
@@ -644,6 +781,7 @@ fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 			mode,
 			min,
 			max,
+			..
 		}
 		| MatchOperator::BreadthFirstShortest {
 			direction,
@@ -656,6 +794,7 @@ fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 			mode,
 			min,
 			max,
+			..
 		} => {
 			node.insert("direction", format!("{direction:?}"));
 			node.insert("path_mode", format!("{mode:?}"));
@@ -669,6 +808,27 @@ fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 			node.insert("minimum_depth", u64::from(*min));
 			node.insert("maximum_depth", u64::from(*max));
 		}
+		MatchOperator::LandmarkShortest {
+			direction,
+			mode,
+			min,
+			max,
+			binding,
+		} => {
+			node.insert("direction", format!("{direction:?}"));
+			node.insert("path_mode", format!("{mode:?}"));
+			node.insert("minimum_depth", u64::from(*min));
+			node.insert("maximum_depth", u64::from(*max));
+			node.insert("index_id", u64::from(binding.index.get()));
+			node.insert("index_version", u64::from(binding.version.get()));
+			node.insert("build_revision", binding.revision);
+			node.insert("projection", format!("{:?}", binding.mode));
+			node.insert("cost", format!("{:?}", binding.cost));
+			node.insert("landmarks", u64::from(binding.landmarks));
+			node.insert("artifact_bytes", binding.bytes);
+			node.insert("post_filter", "exact bounded path search");
+			node.insert("fallback", "unbound target or unavailable generation");
+		}
 		MatchOperator::MatchSeed
 		| MatchOperator::MatchJoin
 		| MatchOperator::ResolveNestedEndpoint
@@ -679,6 +839,33 @@ fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 		| MatchOperator::MatchProject
 		| MatchOperator::ProjectionDistinct
 		| MatchOperator::MatchOrder => {}
+	}
+	if let MatchOperator::FixedExpand {
+		cost: Some((function, version, epoch, stateful)),
+		..
+	}
+	| MatchOperator::AtomExpand {
+		cost: Some((function, version, epoch, stateful)),
+		..
+	}
+	| MatchOperator::HyperExpand {
+		cost: Some((function, version, epoch, stateful)),
+		..
+	}
+	| MatchOperator::PathEnumerate {
+		cost: Some((function, version, epoch, stateful)),
+		..
+	}
+	| MatchOperator::DijkstraShortest {
+		cost: Some((function, version, epoch, stateful)),
+		..
+	} = operator
+	{
+		node.insert("cost_function_id", u64::from(function.get()));
+		node.insert("cost_function_version", u64::from(version.get()));
+		node.insert("cost_schema_epoch", *epoch);
+		node.insert("cost_stateful", *stateful);
+		node.insert("cost_execution", "ON_DEMAND");
 	}
 }
 
@@ -720,6 +907,11 @@ fn select_nodes(plan: &PhysicalSelectPlan, snapshot: &PlannerSnapshot) -> Vec<Va
 		| SourceOperator::DiskAnnSearch {
 			index,
 			name,
+		}
+		| SourceOperator::GeometryIndexScan {
+			index,
+			name,
+			..
 		} = &source.operator
 		{
 			node.insert("index_id", u64::from(index.get()));
@@ -728,6 +920,15 @@ fn select_nodes(plan: &PhysicalSelectPlan, snapshot: &PlannerSnapshot) -> Vec<Va
 				node.insert("index_state", format!("{:?}", index.state));
 				node.insert("index_scope", format!("{:?}", index.scope));
 				node.insert("index_schema_version", u64::from(index.version.get()));
+			}
+			if matches!(source.operator, SourceOperator::GeometryIndexScan { .. }) {
+				node.insert("post_filter", "exact spatial predicate");
+				node.insert("candidates", source.cardinality.expected);
+				node.insert("delta", "replacement MBR / tombstone");
+				node.insert(
+					"fallback",
+					"exact scan when automatic binding is unavailable or corrupt",
+				);
 			}
 		}
 		nodes.push(Value::Object(node));
@@ -900,7 +1101,7 @@ fn cost_object(value: PlanCost) -> Object {
 	object
 }
 
-fn observation_object(value: AnalyzeObservation) -> Object {
+fn observation_object(value: &AnalyzeObservation) -> Object {
 	let mut object = Object::new();
 	object.insert("actual_rows", value.actual_rows);
 	object.insert("pulls", value.pulls);
@@ -910,6 +1111,9 @@ fn observation_object(value: AnalyzeObservation) -> Object {
 	object.insert("spill_runs", value.spill_runs);
 	object.insert("peak_accounted_memory", value.peak_memory);
 	object.insert("path_expansions", value.path_expansions);
+	object.insert("landmark_lookups", value.match_metrics.landmark_lookups);
+	object.insert("landmark_fallbacks", value.match_metrics.landmark_fallbacks);
+	object.insert("landmark_artifact_bytes", value.match_metrics.landmark_artifact_bytes);
 	object.insert("match_seeds", value.match_metrics.seeds);
 	object.insert("frontier_peak", value.match_metrics.frontier_peak);
 	object.insert("trace_nodes", value.match_metrics.trace_nodes);
@@ -933,6 +1137,15 @@ fn observation_object(value: AnalyzeObservation) -> Object {
 	object.insert("graph_child_graphs", value.graph_assembly.child_graphs);
 	object.insert("graph_scope_slots", value.graph_assembly.scope_slots);
 	object.insert("graph_validation_ns", value.graph_assembly.validation_ns);
+	object.insert("spatial_candidates", value.spatial[0]);
+	object.insert("spatial_refinements", value.spatial[1]);
+	object.insert("spatial_fallbacks", value.spatial[2]);
+	object.insert("spatial_tree_pages", value.spatial[3]);
+	object.insert("spatial_delta_records", value.spatial[4]);
+	object.insert("neighbourhood_sketch_reads", value.neighbourhood[0]);
+	object.insert("neighbourhood_fallbacks", value.neighbourhood[1]);
+	object.insert("neighbourhood_exact_work", value.neighbourhood[2]);
+	object.insert("graph_artifact_bytes", value.neighbourhood[3]);
 	object.insert("publication_state", value.publication);
 	object
 }
@@ -1001,6 +1214,9 @@ fn source_operator_name(operator: &SourceOperator) -> &'static str {
 		SourceOperator::CountLookup {
 			..
 		} => "CountLookup",
+		SourceOperator::GeometryIndexScan {
+			..
+		} => "GeometryIndexScan",
 		SourceOperator::GraphCatalogScan => "GraphCatalogScan",
 		SourceOperator::Derived => "Derived",
 	}

@@ -233,7 +233,10 @@ impl Parser<'_> {
 		self.maintenance_positive_integer("maintenance option")
 	}
 
-	fn maintenance_positive_integer(&mut self, field: &str) -> FerrosGrynnResult<u64> {
+	pub(in crate::syn) fn maintenance_positive_integer(
+		&mut self,
+		field: &str,
+	) -> FerrosGrynnResult<u64> {
 		let token = self.tokens.next();
 		let TokenKind::Number(value) = token.kind else {
 			let message = format!("Expected a positive integer {field}.");
@@ -254,7 +257,9 @@ impl Parser<'_> {
 		Ok(value)
 	}
 
-	fn maintenance_index_owner(&mut self) -> FerrosGrynnResult<MaintenanceIndexOwner> {
+	pub(in crate::syn) fn maintenance_index_owner(
+		&mut self,
+	) -> FerrosGrynnResult<MaintenanceIndexOwner> {
 		self.expect_keyword(keywords::ON, "Expected `ON CLASS` or `ON GRAPH` after index name.")?;
 		if self.consume_keyword(keywords::CLASS).is_some() {
 			return self.identifier().map(MaintenanceIndexOwner::Class);

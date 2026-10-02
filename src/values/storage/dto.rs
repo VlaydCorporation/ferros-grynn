@@ -298,7 +298,10 @@ impl StorageValue {
 				Ok(Self::Object(result))
 			}
 			Value::Range(value) => StorageRange::from_runtime(value, context).map(Self::Range),
-			Value::Geometry(value) => Ok(Self::Geometry(value)),
+			Value::Geometry(value) => {
+				value.validate()?;
+				Ok(Self::Geometry(value))
+			}
 			Value::Vector(value) => Ok(Self::Vector(value)),
 			Value::Atom(value) => StorageAtomRef::from_runtime(*value, context).map(Self::AtomRef),
 			Value::Regex(_)
@@ -362,7 +365,10 @@ impl StorageValue {
 				Ok(Value::Object(result))
 			}
 			Self::Range(value) => value.into_runtime(context).map(Value::Range),
-			Self::Geometry(value) => Ok(Value::Geometry(value)),
+			Self::Geometry(value) => {
+				value.validate()?;
+				Ok(Value::Geometry(value))
+			}
 			Self::Vector(value) => Ok(Value::Vector(value)),
 			Self::AtomRef(value) => value.into_runtime(context).map(Value::from),
 			Self::GraphRef(value) => context.graph_from_disk(value).cloned().map(Value::from),

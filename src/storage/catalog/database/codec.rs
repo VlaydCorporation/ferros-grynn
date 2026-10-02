@@ -1,5 +1,7 @@
 //! Canonical little-endian encoding for `FGDC v10`.
 
+use std::collections::BTreeMap;
+
 use super::{
 	AnalyzerCatalogEntry,
 	AnalyzerFilterCatalogEntry,
@@ -318,6 +320,18 @@ fn encode_index_options(options: ClassIndexOptions) -> FerrosGrynnResult<Vec<u8>
 	let mut output = Vec::new();
 	match options {
 		ClassIndexOptions::Scalar => {}
+		ClassIndexOptions::Geometry(options) => {
+			output.push(options.geometry_type().map_or(0, |kind| match kind {
+				crate::values::GeometryKind::Point => 1,
+				crate::values::GeometryKind::MultiPoint => 2,
+				crate::values::GeometryKind::LineString => 3,
+				crate::values::GeometryKind::MultiLineString => 4,
+				crate::values::GeometryKind::Polygon => 5,
+				crate::values::GeometryKind::MultiPolygon => 6,
+				crate::values::GeometryKind::Collection => 7,
+			}));
+			output.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0]);
+		}
 		ClassIndexOptions::Fulltext(options) => {
 			output.extend_from_slice(&options.analyzer.get().to_le_bytes());
 			output.extend_from_slice(&options.analyzer_version.get().to_le_bytes());
@@ -353,6 +367,24 @@ fn decode_index_options(
 	decoder: &mut Decoder<'_>,
 ) -> FerrosGrynnResult<ClassIndexOptions> {
 	match kind {
+		ClassIndexKind::Geometry => {
+			let kind = match decoder.read_u8()? {
+				0 => None,
+				1 => Some(crate::values::GeometryKind::Point),
+				2 => Some(crate::values::GeometryKind::MultiPoint),
+				3 => Some(crate::values::GeometryKind::LineString),
+				4 => Some(crate::values::GeometryKind::MultiLineString),
+				5 => Some(crate::values::GeometryKind::Polygon),
+				6 => Some(crate::values::GeometryKind::MultiPolygon),
+				7 => Some(crate::values::GeometryKind::Collection),
+				_ => return Err(invalid("unknown geometry TYPE")),
+			};
+			if decoder.read_u8()? != 1 {
+				return Err(invalid("unknown geometry model"));
+			}
+			decoder.expect_zero(6, "geometry options reserved bytes")?;
+			Ok(ClassIndexOptions::Geometry(crate::datastore::GeometryIndexOptions::new(kind)))
+		}
 		ClassIndexKind::Standard | ClassIndexKind::Unique | ClassIndexKind::Count => {
 			Ok(ClassIndexOptions::Scalar)
 		}
@@ -485,6 +517,12 @@ fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnR
 	write_u32(output, graph.root.as_ref().map_or(0, Vec::len), "graph root value bytes")?;
 	write_u32(output, graph.properties.len(), "graph property count")?;
 	write_u32(output, graph.arena.graph_by_slot.len(), "graph arena slot count")?;
+	write_u32(output, graph.indexes.len(), "graph user index count")?;
+	let (endpoint_id, endpoint_version) =
+		graph.edge_endpoint_index.map_or((0, 0), |(id, version)| (id.get(), version.get()));
+	output.extend_from_slice(&endpoint_id.to_le_bytes());
+	output.extend_from_slice(&endpoint_version.to_le_bytes());
+	write_optional_binding(output, graph.edge_endpoint);
 	write_string(output, graph.name.as_str(), "graph name")?;
 	if let Some(root) = &graph.root {
 		output.extend_from_slice(root);
@@ -507,6 +545,13 @@ fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnR
 		for atom in scope.iter() {
 			output.extend_from_slice(&atom.raw().to_le_bytes());
 		}
+	}
+	for index in &graph.indexes {
+		super::graph_index::encode(output, index)?;
+		write_optional_binding(
+			output,
+			index.id().and_then(|id| graph.index_bindings.get(&id).copied()),
+		);
 	}
 	Ok(())
 }
@@ -539,6 +584,15 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 	let root_len = decoder.read_count("graph root value bytes")?;
 	let property_count = decoder.read_count("graph property count")?;
 	let slot_count = decoder.read_count("graph arena slot count")?;
+	let index_count = decoder.read_count("graph user index count")?;
+	if index_count > 4096 {
+		return Err(invalid("graph user index count exceeds its bound"));
+	}
+	let edge_endpoint_index = match (decoder.read_u32()?, decoder.read_u32()?) {
+		(0, 0) => None,
+		(id, version) => Some((IndexId::from_storage(id)?, SchemaVersion::from_storage(version)?)),
+	};
+	let edge_endpoint = read_optional_binding(decoder)?;
 	let name = read_string(decoder, "graph name")?.into();
 	let root = match root_len {
 		0 => None,
@@ -576,6 +630,20 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 			return Err(invalid("graph arena contains duplicate slots"));
 		}
 	}
+	let mut indexes = Vec::new();
+	let mut index_bindings = BTreeMap::new();
+	for _ in 0..index_count {
+		let index = super::graph_index::decode(decoder)?;
+		if let Some(binding) = read_optional_binding(decoder)? {
+			let id = index
+				.id()
+				.ok_or_else(|| invalid("graph artifact binding has no definition identity"))?;
+			if index_bindings.insert(id, binding).is_some() {
+				return Err(invalid("graph artifact bindings are duplicated"));
+			}
+		}
+		indexes.push(index);
+	}
 	Ok(GraphCatalogEntry {
 		id,
 		version,
@@ -587,6 +655,10 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 		topology_constraints,
 		label_index,
 		adjacency_index,
+		edge_endpoint_index,
+		edge_endpoint,
+		indexes,
+		index_bindings,
 		membership,
 		owner_root,
 		root,
@@ -934,7 +1006,7 @@ fn decode_analyzer_language(value: u8) -> FerrosGrynnResult<AnalyzerLanguage> {
 	}
 }
 
-fn write_optional_string(
+pub(super) fn write_optional_string(
 	output: &mut Vec<u8>,
 	value: Option<&str>,
 	field: &str,
@@ -946,7 +1018,7 @@ fn write_optional_string(
 	Ok(())
 }
 
-fn read_optional_string<'a>(
+pub(super) fn read_optional_string<'a>(
 	decoder: &mut Decoder<'a>,
 	field: &str,
 ) -> FerrosGrynnResult<Option<&'a str>> {
@@ -1094,6 +1166,7 @@ const fn index_kind(value: ClassIndexKind) -> u8 {
 		ClassIndexKind::Fulltext => 3,
 		ClassIndexKind::Hnsw => 4,
 		ClassIndexKind::DiskAnn => 5,
+		ClassIndexKind::Geometry => 6,
 	}
 }
 
@@ -1105,6 +1178,7 @@ fn decode_index_kind(value: u8) -> FerrosGrynnResult<ClassIndexKind> {
 		3 => Ok(ClassIndexKind::Fulltext),
 		4 => Ok(ClassIndexKind::Hnsw),
 		5 => Ok(ClassIndexKind::DiskAnn),
+		6 => Ok(ClassIndexKind::Geometry),
 		_ => Err(invalid("index contains an unknown kind")),
 	}
 }
@@ -1191,7 +1265,7 @@ pub(super) struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
-	fn new(bytes: &'a [u8]) -> Self {
+	pub(super) fn new(bytes: &'a [u8]) -> Self {
 		Self {
 			bytes,
 			position: 0,
@@ -1239,19 +1313,19 @@ impl<'a> Decoder<'a> {
 		))
 	}
 
-	fn read_count(&mut self, field: &str) -> FerrosGrynnResult<usize> {
+	pub(super) fn read_count(&mut self, field: &str) -> FerrosGrynnResult<usize> {
 		usize::try_from(self.read_u32()?)
 			.map_err(|_error| invalid(format!("{field} does not fit usize")))
 	}
 
-	fn expect_zero(&mut self, count: usize, field: &str) -> FerrosGrynnResult<()> {
+	pub(super) fn expect_zero(&mut self, count: usize, field: &str) -> FerrosGrynnResult<()> {
 		if self.read_exact(count)?.iter().any(|byte| *byte != 0) {
 			return Err(invalid(format!("{field} are non-zero")));
 		}
 		Ok(())
 	}
 
-	fn finish(self) -> FerrosGrynnResult<()> {
+	pub(super) fn finish(self) -> FerrosGrynnResult<()> {
 		if self.position != self.bytes.len() {
 			return Err(invalid("database catalog contains trailing bytes"));
 		}

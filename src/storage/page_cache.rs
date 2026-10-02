@@ -15,7 +15,7 @@ pub enum PageCacheVersion {
 	Home {
 		/// Generation that invalidates every older home-cache entry.
 		generation: CheckpointGeneration,
-		/// Highest page LSN permitted by the database checkpoint.
+		/// Highest page LSN permitted by the checkpoint or pinned snapshot.
 		ceiling: Lsn,
 	},
 }
@@ -80,7 +80,7 @@ pub fn validate_loaded_header(key: PageCacheKey, header: PageHeader) -> FerrosGr
 			return Err(FerrosGrynnError::invalid_storage_page(
 				key.page_no().get(),
 				format!(
-					"home page LSN {} exceeds checkpoint ceiling {}",
+					"home page LSN {} exceeds read ceiling {}",
 					header.page_lsn().get(),
 					ceiling.get()
 				),

@@ -8,6 +8,7 @@ use crate::{
 			GRAPH_INCIDENCE_WRITE_BYTES,
 			GRAPH_MEMBERSHIP_WRITE_BYTES,
 			GRAPH_OVERLAY_WRITE_BYTES,
+			SCHEMA_WRITE_BYTES,
 		},
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -113,8 +114,20 @@ impl Transaction {
 					})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let endpoint_capability = self.prepare_edge_endpoint_capability(graph, &topology)?;
+		let posting_bytes = endpoint_posting_write_bytes(&topology)?;
+		let incidence_bytes = GRAPH_INCIDENCE_WRITE_BYTES
+			.checked_add(posting_bytes)
+			.ok_or_else(|| self.limit_error(usize::MAX))?;
 		let additional = GRAPH_MEMBERSHIP_WRITE_BYTES
-			.checked_add(GRAPH_INCIDENCE_WRITE_BYTES)
+			.checked_add(incidence_bytes)
+			.and_then(|bytes| {
+				bytes.checked_add(if endpoint_capability.is_some() {
+					SCHEMA_WRITE_BYTES
+				} else {
+					0
+				})
+			})
 			.ok_or_else(|| self.limit_error(usize::MAX))?;
 		self.ensure_capacity(additional)?;
 		let local = self.working.attach_edge(
@@ -125,6 +138,9 @@ impl Transaction {
 			weight,
 			transition_graph,
 		)?;
+		if let Some(capability) = endpoint_capability {
+			self.publish_graph_replacement(capability, SCHEMA_WRITE_BYTES)?;
+		}
 		for (endpoint, endpoint_global) in endpoints {
 			self.record_requirement(ConflictKey::GraphMembership(graph, endpoint_global));
 			self.record_read(ConflictKey::GraphIncidence(graph, endpoint));
@@ -133,7 +149,7 @@ impl Transaction {
 			ConflictKey::GraphMembership(graph, global),
 			GRAPH_MEMBERSHIP_WRITE_BYTES,
 		);
-		self.insert_write(ConflictKey::GraphIncidence(graph, local), GRAPH_INCIDENCE_WRITE_BYTES);
+		self.insert_write(ConflictKey::GraphIncidence(graph, local), incidence_bytes);
 		self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
 		self.mark_range_change(ConflictKey::GraphKindRange(graph, kind));
 		self.mutations.push(Mutation::AttachEdge {
@@ -174,10 +190,22 @@ impl Transaction {
 			let local = self.working.membership(graph, global).ok_or_else(|| {
 				FerrosGrynnError::atom_does_not_exist("occurrence", global.to_string())
 			})?;
-			let has_overlay = self
-				.working
-				.occurrence(graph, local)
-				.is_some_and(crate::datastore::GraphOccurrence::has_overlay);
+			let occurrence = self.working.occurrence(graph, local).ok_or_else(|| {
+				FerrosGrynnError::atom_does_not_exist("occurrence", local.to_string())
+			})?;
+			let has_overlay = occurrence.has_overlay();
+			let posting_bytes = match occurrence.state() {
+				OccurrenceState::Edge {
+					topology,
+					..
+				} => endpoint_posting_write_bytes(topology)?,
+				OccurrenceState::Node {
+					..
+				} => 0,
+			};
+			additional = additional
+				.checked_add(posting_bytes)
+				.ok_or_else(|| self.limit_error(usize::MAX))?;
 			for (key, cost) in [
 				(ConflictKey::GraphMembership(graph, global), GRAPH_MEMBERSHIP_WRITE_BYTES),
 				(ConflictKey::GraphIncidence(graph, local), GRAPH_INCIDENCE_WRITE_BYTES),
@@ -192,10 +220,10 @@ impl Transaction {
 					.checked_add(GRAPH_OVERLAY_WRITE_BYTES)
 					.ok_or_else(|| self.limit_error(usize::MAX))?;
 			}
-			removals.push((global, local, has_overlay, class_id, kind));
+			removals.push((global, local, has_overlay, class_id, kind, posting_bytes));
 		}
 		self.ensure_capacity(additional)?;
-		for (global, local, has_overlay, class_id, kind) in removals {
+		for (global, local, has_overlay, class_id, kind, posting_bytes) in removals {
 			self.working.detach(graph, global)?.ok_or_else(|| {
 				FerrosGrynnError::atom_does_not_exist("occurrence", global.to_string())
 			})?;
@@ -207,6 +235,7 @@ impl Transaction {
 				ConflictKey::GraphIncidence(graph, local),
 				GRAPH_INCIDENCE_WRITE_BYTES,
 			);
+			self.write_bytes += posting_bytes;
 			if has_overlay {
 				self.insert_write(
 					ConflictKey::GraphOverlay(graph, global),
@@ -430,6 +459,27 @@ impl Transaction {
 		{
 			return Ok(());
 		}
+		let endpoint_capability = if let OccurrenceState::Edge {
+			topology,
+			..
+		} = &state
+		{
+			self.prepare_edge_endpoint_capability(graph, topology)?
+		} else {
+			None
+		};
+		let posting_bytes = if let OccurrenceState::Edge {
+			topology,
+			..
+		} = &state
+		{
+			endpoint_posting_write_bytes(topology)?
+		} else {
+			0
+		};
+		let incidence_bytes = GRAPH_INCIDENCE_WRITE_BYTES
+			.checked_add(posting_bytes)
+			.ok_or_else(|| self.limit_error(usize::MAX))?;
 		let nested = match &state {
 			OccurrenceState::Node {
 				nested_graph,
@@ -445,7 +495,19 @@ impl Transaction {
 			}
 		}
 		if !self.writes.contains_key(&ConflictKey::GraphIncidence(graph, local)) {
-			self.ensure_capacity(GRAPH_INCIDENCE_WRITE_BYTES)?;
+			self.ensure_capacity(incidence_bytes.saturating_add(
+				if endpoint_capability.is_some() {
+					SCHEMA_WRITE_BYTES
+				} else {
+					0
+				},
+			))?;
+		} else {
+			self.ensure_capacity(posting_bytes.saturating_add(if endpoint_capability.is_some() {
+				SCHEMA_WRITE_BYTES
+			} else {
+				0
+			}))?;
 		}
 		if let OccurrenceState::Edge {
 			topology,
@@ -465,7 +527,13 @@ impl Transaction {
 			}
 		}
 		self.working.replace_occurrence_state(graph, local, state.clone())?;
-		self.insert_write(ConflictKey::GraphIncidence(graph, local), GRAPH_INCIDENCE_WRITE_BYTES);
+		if let Some(capability) = endpoint_capability {
+			self.publish_graph_replacement(capability, SCHEMA_WRITE_BYTES)?;
+		}
+		if self.writes.contains_key(&ConflictKey::GraphIncidence(graph, local)) {
+			self.write_bytes += posting_bytes;
+		}
+		self.insert_write(ConflictKey::GraphIncidence(graph, local), incidence_bytes);
 		let (class_id, kind) = self.atom_domain(global)?;
 		self.mark_range_change(ConflictKey::GraphClassRange(graph, class_id));
 		self.mark_range_change(ConflictKey::GraphKindRange(graph, kind));
@@ -560,4 +628,51 @@ impl Transaction {
 			.membership(graph, global)
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("occurrence", global.to_string()))
 	}
+
+	/// Reserves the shared identity before topology publication without
+	/// exposing an artifact.
+	fn prepare_edge_endpoint_capability(
+		&self,
+		graph: GraphId,
+		topology: &EdgeTopology,
+	) -> FerrosGrynnResult<Option<crate::datastore::GraphSchema>> {
+		let schema = self
+			.working
+			.schema
+			.graph(graph)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?;
+		if topology.edge_endpoint_sides().next().is_none() || schema.edge_endpoint_index().is_some()
+		{
+			return Ok(None);
+		}
+		let index = crate::datastore::SystemIndex::new(
+			crate::datastore::IndexId::from_schema_id(self.store.inner.allocate_schema_id()?),
+			crate::datastore::SystemIndexKind::EdgeEndpoint,
+		);
+		schema
+			.replace_indexes(schema.indexes().cloned().collect())?
+			.with_edge_endpoint_index(index)
+			.map(Some)
+	}
+}
+
+/// Admits exact posting keys, connector identities, and B-tree node overhead
+/// before mutation.
+pub(super) fn endpoint_posting_write_bytes(topology: &EdgeTopology) -> FerrosGrynnResult<usize> {
+	let mut bytes = 0_usize;
+	for (endpoint, _) in topology.edge_endpoint_sides() {
+		let depth = match endpoint {
+			crate::graph::EdgeEndpoint::Local(_) => 0,
+			crate::graph::EdgeEndpoint::Nested(qualified) => qualified.scope().len(),
+		};
+		if depth > 64 {
+			return Err(FerrosGrynnError::invalid_argument(
+				"edge endpoint scope exceeds 64 levels",
+			));
+		}
+		bytes = bytes.checked_add(128 + depth * size_of::<AtomId>()).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("edge endpoint posting bytes overflow")
+		})?;
+	}
+	Ok(bytes)
 }

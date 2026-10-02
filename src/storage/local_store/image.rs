@@ -73,10 +73,12 @@ use crate::{
 			StreamedScopedIndexFile,
 			StreamedScopedIndexImages,
 			build_fulltext_index_images,
+			build_geometry_index_images,
 			build_scoped_index_images,
 			build_vector_index_images,
 			validate_scoped_index_images,
 			write_streamed_fulltext_index_images,
+			write_streamed_geometry_index_images,
 			write_streamed_scoped_indexes,
 			write_streamed_unique_file,
 			write_streamed_vector_index_images,
@@ -475,6 +477,18 @@ fn build_generation_inner(
 		}
 		None => Some(build_vector_index_images(database, &skipped, distance_function)?),
 	};
+	let mut geometry = match stream_root {
+		Some(root) => {
+			let images =
+				write_streamed_geometry_index_images(database, &skipped, root, generation)?;
+			merge_streamed_images(
+				streamed.as_mut().ok_or_else(|| invalid("streamed index accumulator is absent"))?,
+				images,
+			)?;
+			None
+		}
+		None => Some(build_geometry_index_images(database, &skipped)?),
+	};
 
 	let mut layout = LayoutBuilder::new(next_file_instance_id);
 	let atom_superblock = atom.superblock;
@@ -574,12 +588,31 @@ fn build_generation_inner(
 			&mut physical_indexes,
 		)?;
 	}
+	if let Some(images) = &mut geometry {
+		add_scoped_indexes(
+			&mut layout,
+			DataSpaceId::Database,
+			&atom_prefix,
+			std::mem::take(&mut images.base),
+			&mut physical_indexes,
+		)?;
+	}
 
 	let mut raw_graphs = Vec::new();
 	let mut graph_superblocks = BTreeMap::new();
 	for (graph_id, image) in graph_images {
 		let prefix = graph_prefix(graph_id, generation);
-		let raw = add_graph(&mut layout, &prefix, image, database)?;
+		let mut raw = add_graph(&mut layout, &prefix, image, database)?;
+		raw.edge_endpoint =
+			add_edge_endpoint(&mut layout, &prefix, database, graph_id, &raw.arena, stream_root)?;
+		add_graph_artifacts(
+			&mut layout,
+			&prefix,
+			database,
+			graph_id,
+			stream_root,
+			&mut physical_indexes,
+		)?;
 		graph_superblocks.insert(graph_id, raw.superblock);
 		if let Some(indexes) = scoped.as_mut().and_then(|images| images.graphs.remove(&graph_id)) {
 			add_scoped_indexes(
@@ -613,6 +646,16 @@ fn build_generation_inner(
 				&mut physical_indexes,
 			)?;
 		}
+		if let Some(indexes) = geometry.as_mut().and_then(|images| images.graphs.remove(&graph_id))
+		{
+			add_scoped_indexes(
+				&mut layout,
+				DataSpaceId::Graph(graph_id),
+				&prefix,
+				indexes,
+				&mut physical_indexes,
+			)?;
+		}
 		raw_graphs.push(raw);
 	}
 
@@ -632,6 +675,7 @@ fn build_generation_inner(
 					raw.membership.root,
 				)?,
 				membership: raw.membership,
+				edge_endpoint: raw.edge_endpoint,
 				arena: raw.arena,
 			})
 		})
@@ -679,6 +723,7 @@ fn build_generation_inner(
 struct RawGraphBinding {
 	graph_id: crate::graph::GraphId,
 	membership: PhysicalIndexBinding,
+	edge_endpoint: Option<PhysicalIndexBinding>,
 	arena: crate::storage::graph_pages::GraphArenaBindings,
 	superblock: GraphSuperblock,
 }
@@ -766,9 +811,202 @@ fn add_graph(
 			file_id: membership_file,
 			root: membership_root,
 		},
+		edge_endpoint: None,
 		arena: image.arena,
 		superblock,
 	})
+}
+
+/// Publishes synchronous endpoint postings in the same generation as topology.
+fn add_edge_endpoint(
+	layout: &mut LayoutBuilder,
+	prefix: &str,
+	database: &DatabaseRoot,
+	graph: crate::graph::GraphId,
+	arena: &crate::storage::graph_pages::GraphArenaBindings,
+	stream_root: Option<&Path>,
+) -> FerrosGrynnResult<Option<PhysicalIndexBinding>> {
+	let Some(capability) =
+		database.schema.graph(graph).and_then(|schema| schema.edge_endpoint_index())
+	else {
+		return Ok(None);
+	};
+	let temporary = std::env::temp_dir();
+	let scratch = stream_root.unwrap_or(&temporary);
+	let (records, posting_count) =
+		crate::storage::edge_endpoint_index::prepare(database, graph, arena, scratch)?;
+	let header = crate::storage::edge_endpoint_index::EndpointHeader {
+		graph,
+		capability,
+		revision: database.commit_ts,
+		root: PageNo::NULL,
+		page_count: 0,
+		posting_count,
+	};
+	let path = format!("{prefix}/idx/ee_endpoint.fgidx");
+	let space = DataSpaceId::Graph(graph);
+	let file_id = if let Some(root) = stream_root {
+		let built = crate::storage::scoped_index_image::write_streamed_file(root, &path, |file| {
+			crate::storage::edge_endpoint_index::stream(
+				&records,
+				header,
+				scratch,
+				|number, page| file.write_page(number, page),
+			)
+		})?;
+		layout.add_prewritten(
+			space,
+			DataFileKind::Index,
+			DataFileRole::WalBackfilled,
+			path,
+			built.page_count,
+		)?
+	} else {
+		let pages = crate::storage::edge_endpoint_index::buffered(&records, header, scratch)?;
+		layout.add(space, DataFileKind::Index, DataFileRole::WalBackfilled, path, None, pages)?
+	};
+	Ok(Some(PhysicalIndexBinding {
+		file_id,
+		root: PageNo::new(0),
+	}))
+}
+
+/// Publishes complete graph artifacts through the existing generation writer.
+fn add_graph_artifacts(
+	layout: &mut LayoutBuilder,
+	prefix: &str,
+	database: &DatabaseRoot,
+	graph: crate::graph::GraphId,
+	stream_root: Option<&Path>,
+	physical: &mut BTreeMap<IndexId, PhysicalIndexBinding>,
+) -> FerrosGrynnResult<()> {
+	let schema =
+		database.schema.graph(graph).ok_or_else(|| invalid("artifact graph schema is absent"))?;
+	for (ordinal, index) in schema.indexes().enumerate() {
+		if index.state() != crate::datastore::ClassIndexState::Ready {
+			continue;
+		}
+		let id = index.id().ok_or_else(|| invalid("graph artifact definition has no identity"))?;
+		let reachability = database.reachability_artifacts.get(&id);
+		let neighbourhood = database.neighbourhood_artifacts.get(&id);
+		let path_artifact = database.path_artifacts.get(&id);
+		let (identity, page_count, descriptor, family) =
+			match (reachability, neighbourhood, path_artifact) {
+				(Some(artifact), None, None) => (
+					artifact.layout.header.identity,
+					artifact.layout.page_count,
+					&artifact.descriptor,
+					"reach",
+				),
+				(None, Some(artifact), None) => (
+					artifact.layout.header.identity,
+					artifact.layout.page_count,
+					&artifact.descriptor,
+					"neighbour",
+				),
+				(None, None, Some(artifact)) => (
+					artifact.layout.header.identity,
+					artifact.layout.page_count,
+					&artifact.descriptor,
+					"path",
+				),
+				(None, None, None) => continue,
+				_ => {
+					return Err(invalid("graph definition has multiple artifact families"));
+				}
+			};
+		if identity.version != index.version().get()
+			|| identity.revision != index.build_revision()
+			|| *descriptor != index.descriptor()?
+		{
+			return Err(invalid("graph publication has an incompatible artifact"));
+		}
+		if physical.contains_key(&id) {
+			continue;
+		}
+		let path = format!("{prefix}/idx/{family}_{ordinal:04}.fgidx");
+		let space = DataSpaceId::Graph(graph);
+		let stream = |write: &mut dyn FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>| {
+			if let Some(artifact) = reachability {
+				artifact.layout.stream(
+					|kind, ordinal, output| artifact.encode_element(kind, ordinal, output),
+					write,
+					&mut crate::storage::check_external_sort_cancelled,
+				)
+			} else if let Some(artifact) = neighbourhood {
+				artifact.layout.stream(
+					|kind, ordinal, output| artifact.encode_element(kind, ordinal, output),
+					write,
+					&mut crate::storage::check_external_sort_cancelled,
+				)
+			} else if let Some(artifact) = path_artifact {
+				artifact.layout.stream(
+					|kind, ordinal, output| artifact.encode_element(kind, ordinal, output),
+					write,
+					&mut crate::storage::check_external_sort_cancelled,
+				)
+			} else {
+				Err(invalid("graph artifact disappeared before page streaming"))
+			}
+		};
+		let file_id = if let Some(root) = stream_root {
+			let built =
+				crate::storage::scoped_index_image::write_streamed_file(root, &path, |file| {
+					stream(&mut |at, page| file.write_page(at, page))?;
+					Ok(StreamedIndex {
+						root: PageNo::new(0),
+						page_count,
+					})
+				})?;
+			layout.add_prewritten(
+				space,
+				DataFileKind::Index,
+				DataFileRole::WalBackfilled,
+				path,
+				built.page_count,
+			)?
+		} else {
+			if let Some(artifact) = reachability {
+				artifact.layout.admit_decode(crate::storage::external_sort_run_budget())?;
+			} else if let Some(artifact) = neighbourhood {
+				artifact.layout.admit_decode(crate::storage::external_sort_run_budget())?;
+			} else if let Some(artifact) = path_artifact {
+				artifact.layout.admit_decode(crate::storage::external_sort_run_budget())?;
+			}
+			let count = usize::try_from(page_count).map_err(|cause| {
+				invalid("graph artifact image page extent exceeds platform")
+					.with_technical_source(cause)
+			})?;
+			if count
+				.checked_mul(crate::storage::page::PAGE_SIZE)
+				.is_none_or(|bytes| bytes > crate::storage::external_sort_run_budget())
+			{
+				return Err(invalid("graph artifact buffered pages exceed scratch cap"));
+			}
+			let mut pages = Vec::new();
+			pages.try_reserve_exact(count).map_err(|cause| {
+				invalid("graph artifact page allocation failed").with_technical_source(cause)
+			})?;
+			pages.resize_with(count, AlignedPage::zeroed);
+			stream(&mut |at, page| {
+				pages[at.get() as usize].as_bytes_mut().copy_from_slice(page.as_bytes());
+				Ok(())
+			})?;
+			layout.add(
+				space,
+				DataFileKind::Index,
+				DataFileRole::WalBackfilled,
+				path,
+				None,
+				pages,
+			)?
+		};
+		physical.insert(id, PhysicalIndexBinding {
+			file_id,
+			root: PageNo::new(0),
+		});
+	}
+	Ok(())
 }
 
 fn add_generation_index(
@@ -985,6 +1223,7 @@ fn add_reused_indexes(
 					crate::datastore::ClassIndexKind::Fulltext => (0, "ft_delta"),
 					crate::datastore::ClassIndexKind::Hnsw => (1, "hnsw_delta"),
 					crate::datastore::ClassIndexKind::DiskAnn => (2, "diskann_delta"),
+					crate::datastore::ClassIndexKind::Geometry => (3, "geo_delta"),
 					_ => return Err(invalid("non-specialized index reached delta publication")),
 				};
 				let ordinal = ordinals.entry((retained.scope, kind.0)).or_default();
@@ -1016,6 +1255,12 @@ fn add_reused_indexes(
 		};
 		if deltas.insert(index, binding).is_some() {
 			return Err(invalid("retained index has multiple exact deltas"));
+		}
+	}
+	for (index, (binding, entry)) in reuse.graph_artifacts {
+		layout.retain(entry)?;
+		if physical.insert(index, binding).is_some() {
+			return Err(invalid("graph artifact has duplicate retained bindings"));
 		}
 	}
 	Ok(())

@@ -34,6 +34,8 @@ pub(in crate::gql::execution) struct ResolvedExpand {
 	pub(in crate::gql::execution) target: ResolvedMatchBinding,
 	pub(in crate::gql::execution) direction: crate::syn::MatchDirection,
 	pub(in crate::gql::execution) mode: crate::syn::MatchMode,
+	/// Versioned contribution shared by local and scoped fixed expansion.
+	pub(in crate::gql::execution) custom_cost: Option<crate::gql::ir::LogicalPathCost>,
 	pub(in crate::gql::execution) filters: Vec<crate::syn::MatchPathFilter>,
 }
 
@@ -48,6 +50,8 @@ pub(in crate::gql::execution) struct ResolvedPathExpand {
 	pub(in crate::gql::execution) match_mode: crate::syn::MatchMode,
 	pub(in crate::gql::execution) path_mode: crate::syn::MatchPathMode,
 	pub(in crate::gql::execution) objective: Option<crate::syn::MatchPathObjective>,
+	/// Captured cost plan used by every exact path consumer.
+	pub(in crate::gql::execution) custom_cost: Option<crate::gql::ir::LogicalPathCost>,
 	pub(in crate::gql::execution) filters: Vec<crate::syn::MatchPathFilter>,
 }
 
@@ -90,6 +94,7 @@ pub(in crate::gql::execution) fn resolve_expand(
 		target: resolve_match_binding(&expand.target, slots, source, control)?,
 		direction: expand.direction,
 		mode,
+		custom_cost: expand.custom_cost,
 		filters: expand.filters.clone(),
 	})
 }
@@ -111,6 +116,7 @@ pub(in crate::gql::execution) fn resolve_path_expand(
 		match_mode,
 		path_mode: expand.mode,
 		objective: expand.objective,
+		custom_cost: expand.custom_cost,
 		filters: expand.filters.clone(),
 	})
 }

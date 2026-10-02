@@ -206,26 +206,23 @@ impl<Read: QueryRead> RowCursor for ScopedPathExpandCursor<'_, Read> {
 			let source = self.frames.last().map(|frame| frame.endpoint).ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("scoped MATCH DFS stack is empty")
 			})?;
-			if candidate.target.atom.kind() != Some(self.expand.target.domain.atom_kind())
-				|| !scoped_path_candidate_allowed(
-					self.row.as_ref().ok_or_else(|| {
-						FerrosGrynnError::invalid_argument("scoped MATCH path lost its input row")
-					})?,
-					self.frames.first().map(|frame| frame.endpoint).ok_or_else(|| {
-						FerrosGrynnError::invalid_argument(
-							"scoped MATCH path has no source endpoint",
-						)
-					})?,
-					source,
-					&self.hops,
-					&self.expand,
-					&candidate,
-					self.read,
-					self.snapshot,
-					self.fields,
-					self.predicate,
-					control,
-				)? {
+			if !scoped_path_candidate_allowed(
+				self.row.as_ref().ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("scoped MATCH path lost its input row")
+				})?,
+				self.frames.first().map(|frame| frame.endpoint).ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("scoped MATCH path has no source endpoint")
+				})?,
+				source,
+				&self.hops,
+				&self.expand,
+				&candidate,
+				self.read,
+				self.snapshot,
+				self.fields,
+				self.predicate,
+				control,
+			)? {
 				continue;
 			}
 			let closes_simple = self.expand.path_mode == crate::syn::MatchPathMode::Simple
@@ -260,6 +257,8 @@ struct ScopedSearchState {
 	hops: Vec<ScopedTraversalCandidate>,
 	canonical: Vec<CanonicalScopedHop>,
 	cost: Number,
+	/// Conservative bound on every remaining runtime numeric reduction.
+	priority: Number,
 	serial: u64,
 	accounted_bytes: usize,
 }
@@ -267,9 +266,7 @@ struct ScopedSearchState {
 impl ScopedSearchState {
 	fn estimated_heap_bytes(&self) -> usize {
 		let identities = self.canonical.iter().fold(0_usize, |bytes, hop| {
-			bytes
-				.saturating_add(Value::from(hop.edge.clone()).estimated_heap_bytes())
-				.saturating_add(Value::from(hop.target.clone()).estimated_heap_bytes())
+			bytes.saturating_add(canonical_atom_bytes(&hop.edge, &hop.target))
 		});
 		size_of::<Self>()
 			.saturating_add(
@@ -284,7 +281,8 @@ impl ScopedSearchState {
 
 impl PartialEq for ScopedSearchState {
 	fn eq(&self, other: &Self) -> bool {
-		(self.cost, &self.canonical, self.serial) == (other.cost, &other.canonical, other.serial)
+		(self.priority, self.cost, &self.canonical, self.serial)
+			== (other.priority, other.cost, &other.canonical, other.serial)
 	}
 }
 
@@ -299,8 +297,9 @@ impl PartialOrd for ScopedSearchState {
 impl Ord for ScopedSearchState {
 	fn cmp(&self, other: &Self) -> Ordering {
 		other
-			.cost
-			.cmp(&self.cost)
+			.priority
+			.cmp(&self.priority)
+			.then_with(|| other.cost.cmp(&self.cost))
 			.then_with(|| other.canonical.cmp(&self.canonical))
 			.then_with(|| other.serial.cmp(&self.serial))
 	}
@@ -346,6 +345,14 @@ impl ScopedSearchFrontier {
 			Self::Weighted(frontier) => frontier.len(),
 		}
 	}
+
+	/// The smallest pending bound; equality still requires canonical tie work.
+	fn minimum_priority(&self) -> Option<Number> {
+		match self {
+			Self::Breadth(frontier) => frontier.front().map(|state| state.priority),
+			Self::Weighted(frontier) => frontier.peek().map(|state| state.priority),
+		}
+	}
 }
 
 /// Canonical BFS/Dijkstra over scoped adjacency.
@@ -364,6 +371,9 @@ pub(in crate::gql::execution) struct ScopedShortestPathCursor<'a, Read: QueryRea
 	source: Option<BoundAtom>,
 	bound_target: bool,
 	frontier: ScopedSearchFrontier,
+	/// Qualified terminal rows awaiting proof against pending completion
+	/// bounds.
+	completed: BinaryHeap<CompletedPath<ScopedSearchState>>,
 	seen_targets: BTreeSet<BoundAtom>,
 	account: Option<BarrierAccount>,
 	next_serial: u64,
@@ -402,6 +412,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 			source: None,
 			bound_target: false,
 			frontier: ScopedSearchFrontier::new(objective),
+			completed: BinaryHeap::new(),
 			seen_targets: BTreeSet::new(),
 			account: None,
 			next_serial: 0,
@@ -413,13 +424,15 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		mut state: ScopedSearchState,
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<()> {
-		state.accounted_bytes = state.estimated_heap_bytes();
-		let account = self.account.get_or_insert_with(|| control.barrier_account());
-		if !account.reserve(state.accounted_bytes) {
-			return Err(FerrosGrynnError::control_limit_exceeded(
-				"MATCH frontier memory",
-				u64::try_from(control.barrier_memory_limit()).unwrap_or(u64::MAX),
-			));
+		if state.accounted_bytes == 0 {
+			state.accounted_bytes = state.estimated_heap_bytes();
+			let account = self.account.get_or_insert_with(|| control.barrier_account());
+			if !account.reserve(state.accounted_bytes) {
+				return Err(FerrosGrynnError::control_limit_exceeded(
+					"MATCH frontier memory",
+					u64::try_from(control.barrier_memory_limit()).unwrap_or(u64::MAX),
+				));
+			}
 		}
 		self.frontier.push(state);
 		control.record_match_frontier(self.frontier.len());
@@ -433,6 +446,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		let source = row.current.ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("scoped MATCH shortest path has no source endpoint")
 		})?;
+		control.record_landmark_fallback();
 		self.bound_target = self
 			.expand
 			.target
@@ -449,6 +463,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 				hops: Vec::new(),
 				canonical: Vec::new(),
 				cost: Number::Int(0),
+				priority: Number::Int(0),
 				serial: 0,
 				accounted_bytes: 0,
 			},
@@ -459,6 +474,7 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 
 	fn clear_row(&mut self) {
 		self.frontier.clear();
+		self.completed.clear();
 		if let Some(account) = &mut self.account {
 			account.release_all();
 		}
@@ -524,32 +540,72 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 		}
 		for (canonical, candidate) in self.ordered_candidates(state.endpoint)? {
 			control.record_path_expansion()?;
-			if candidate.target.atom.kind() != Some(self.expand.target.domain.atom_kind())
-				|| !scoped_path_candidate_allowed(
-					self.row.as_ref().ok_or_else(|| {
-						FerrosGrynnError::invalid_argument("scoped MATCH shortest lost its row")
-					})?,
-					source,
-					state.endpoint,
-					&state.hops,
-					&self.expand,
-					&candidate,
-					self.read,
-					self.snapshot,
-					self.fields,
-					self.predicate,
-					control,
-				)? {
+			if !scoped_path_candidate_allowed(
+				self.row.as_ref().ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("scoped MATCH shortest lost its row")
+				})?,
+				source,
+				state.endpoint,
+				&state.hops,
+				&self.expand,
+				&candidate,
+				self.read,
+				self.snapshot,
+				self.fields,
+				self.predicate,
+				control,
+			)? {
 				continue;
 			}
 			let cost = add_path_cost(
 				state.cost,
-				scoped_hop_weight(self.read, self.snapshot, self.fields, &self.expand, &candidate)?,
+				scoped_hop_cost(
+					self.read,
+					self.snapshot,
+					self.fields,
+					&self.expand,
+					&candidate,
+					state.cost,
+					self.predicate,
+					control,
+				)?,
 			)?;
-			let mut hops = state.hops.clone();
-			hops.push(candidate.clone());
-			let mut sequence = state.canonical.clone();
-			sequence.push(canonical);
+			let identities = state
+				.canonical
+				.iter()
+				.chain(std::iter::once(&canonical))
+				.fold(size_of::<ScopedSearchState>(), |bytes, hop| {
+					bytes.saturating_add(canonical_atom_bytes(&hop.edge, &hop.target))
+				});
+			let account = self.account.get_or_insert_with(|| control.barrier_account());
+			let (hops, sequence, accounted_bytes) = extend_path_buffers(
+				&state.hops,
+				candidate.clone(),
+				&state.canonical,
+				canonical,
+				identities,
+				&mut |bytes| {
+					if account.reserve(bytes) {
+						Ok(())
+					} else {
+						Err(FerrosGrynnError::control_limit_exceeded(
+							"MATCH frontier memory",
+							control.barrier_memory_limit() as u64,
+						))
+					}
+				},
+			)?;
+			let priority = if self.expand.objective
+				== Some(crate::syn::MatchPathObjective::WeightedShortest)
+			{
+				completion_bound(
+					cost,
+					Number::Int(0),
+					self.expand.max.saturating_sub(hops.len() as u32),
+				)?
+			} else {
+				cost
+			};
 			let serial = self.next_serial;
 			self.next_serial = self.next_serial.checked_add(1).ok_or_else(|| {
 				FerrosGrynnError::operation_overflow("scoped MATCH shortest frontier serial")
@@ -560,8 +616,9 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 					hops,
 					canonical: sequence,
 					cost,
+					priority,
 					serial,
-					accounted_bytes: 0,
+					accounted_bytes,
 				},
 				control,
 			)?;
@@ -607,7 +664,9 @@ impl<'a, Read: QueryRead> ScopedShortestPathCursor<'a, Read> {
 			self.origin,
 			self.snapshot_id,
 		)?;
-		if row.is_some() {
+		if row.is_some()
+			&& self.expand.objective != Some(crate::syn::MatchPathObjective::WeightedShortest)
+		{
 			self.seen_targets.insert(state.endpoint);
 		}
 		Ok(row)
@@ -621,11 +680,67 @@ impl<Read: QueryRead> RowCursor for ScopedShortestPathCursor<'_, Read> {
 			if self.row.is_none() && !self.start_row(control)? {
 				return Ok(None);
 			}
-			let Some(state) = self.frontier.pop() else {
+			if self.completed.peek().is_some_and(|best| {
+				self.frontier.minimum_priority().is_none_or(|pending| pending > best.state.cost)
+			}) {
+				let best = self.completed.pop().ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("scoped MATCH shortest lost its best result")
+				})?;
+				if let Some(account) = &mut self.account {
+					account.release(best.state.accounted_bytes.saturating_add(best.row_bytes));
+				}
+				if !self.seen_targets.insert(best.state.endpoint) {
+					continue;
+				}
+				if self.bound_target {
+					self.clear_row();
+				}
+				return Ok(Some(best.row));
+			}
+			let Some(mut state) = self.frontier.pop() else {
 				self.clear_row();
 				continue;
 			};
+			let weighted =
+				self.expand.objective == Some(crate::syn::MatchPathObjective::WeightedShortest);
+			if weighted
+				&& self.bound_target
+				&& monotone_path_prefix(state.cost)
+				&& self.completed.peek().is_some_and(|best| {
+					(state.cost, &state.canonical) >= (best.state.cost, &best.state.canonical)
+				}) {
+				if let Some(account) = &mut self.account {
+					account.release(state.accounted_bytes);
+				}
+				continue;
+			}
 			let output = self.output_row(&state, control)?;
+			if weighted {
+				self.expand_state(&state, control)?;
+				if let Some(row) = output {
+					let bytes = row
+						.estimated_heap_bytes()
+						.saturating_add(size_of::<CompletedPath<ScopedSearchState>>());
+					let account = self.account.get_or_insert_with(|| control.barrier_account());
+					if !account.reserve(bytes) {
+						return Err(FerrosGrynnError::control_limit_exceeded(
+							"scoped MATCH best path memory",
+							control.barrier_memory_limit() as u64,
+						));
+					}
+					state.priority = state.cost;
+					self.completed.push(CompletedPath {
+						state,
+						row,
+						row_bytes: bytes,
+					});
+					continue;
+				}
+				if let Some(account) = &mut self.account {
+					account.release(state.accounted_bytes);
+				}
+				continue;
+			}
 			if output.is_some() && self.bound_target {
 				self.clear_row();
 				return Ok(output);
@@ -784,11 +899,15 @@ fn scoped_path_row<Read: QueryRead>(
 	)? {
 		return Ok(None);
 	}
+	let mut cost = Number::Int(0);
 	for hop in hops {
 		let edge_ref = fields.reference(hop.edge.graph)?;
 		let edge_graph = read.graph(snapshot, &edge_ref)?;
 		let endpoint_ref = fields.reference(hop.target.graph)?;
 		let endpoint_graph = read.graph(snapshot, &endpoint_ref)?;
+		let contribution =
+			scoped_hop_cost(read, snapshot, fields, expand, hop, cost, predicate, control)?;
+		cost = add_path_cost(cost, contribution)?;
 		append_scoped_trace_hop(
 			&mut row,
 			hop,
@@ -797,7 +916,7 @@ fn scoped_path_row<Read: QueryRead>(
 			&endpoint_graph,
 			&endpoint_ref,
 			trace,
-			scoped_hop_weight(read, snapshot, fields, expand, hop)?,
+			contribution,
 			control,
 		)?;
 	}
@@ -820,7 +939,6 @@ fn scoped_path_row<Read: QueryRead>(
 		PathDirection::Forward,
 		EndpointRole::Source,
 	));
-	let mut cost = Number::Int(0);
 	for hop in hops {
 		let edge_ref = fields.reference(hop.edge.graph)?;
 		let edge_graph = read.graph(snapshot, &edge_ref)?;
@@ -832,7 +950,6 @@ fn scoped_path_row<Read: QueryRead>(
 		let atom = target_graph.atom_ref(hop.target.atom)?.ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("scoped MATCH endpoint disappeared")
 		})?;
-		cost = add_path_cost(cost, scoped_hop_weight(read, snapshot, fields, expand, hop)?)?;
 		steps.push(PathStep::new(
 			AtomOccurrenceRef::new(atom, target_ref),
 			Some(AtomOccurrenceRef::new(edge, edge_ref)),
@@ -849,33 +966,40 @@ fn scoped_path_row<Read: QueryRead>(
 	Ok(Some(row))
 }
 
-fn scoped_hop_weight<Read: QueryRead>(
+/// Resolves the connector's qualified occurrence before invoking shared cost
+/// semantics; graph-local weights and UDF fields use the same snapshot.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "scoped costs preserve the read root, occurrence and evaluator context explicitly"
+)]
+fn scoped_hop_cost<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
 	fields: &MatchGraphFields<'_, Read>,
 	expand: &ResolvedPathExpand,
 	candidate: &ScopedTraversalCandidate,
+	prefix: Number,
+	predicate: MatchPredicateContext<'_>,
+	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Number> {
-	if expand.objective != Some(crate::syn::MatchPathObjective::WeightedShortest) {
+	if expand.custom_cost.is_none()
+		&& expand.objective != Some(crate::syn::MatchPathObjective::WeightedShortest)
+	{
 		return Ok(Number::Int(1));
 	}
 	let reference = fields.reference(candidate.edge.graph)?;
 	let graph = read.graph(snapshot, &reference)?;
-	let weight = graph
-		.edge(candidate.edge.atom)?
-		.ok_or_else(|| {
+	if let Some(cost) = expand.custom_cost {
+		let edge = graph.atom_ref(candidate.edge.atom)?.ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("scoped MATCH connector disappeared")
-		})?
-		.weight()
-		.unwrap_or(Number::Int(1));
-	let invalid = match weight {
-		Number::Float(value) => !value.is_finite() || value < 0.0,
-		_ => weight < Number::Int(0),
-	};
-	if invalid {
-		return Err(FerrosGrynnError::invalid_argument(
-			"WEIGHTED SHORTEST requires finite, non-negative edge weights.",
-		));
+		})?;
+		return custom_path_contribution(
+			cost,
+			AtomOccurrenceRef::new(edge, reference),
+			prefix,
+			predicate,
+			control,
+		);
 	}
-	Ok(weight)
+	path_edge_weight(&graph, expand, candidate.edge.atom)
 }

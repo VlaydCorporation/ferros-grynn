@@ -250,6 +250,15 @@ pub(super) fn open_local_state(
 	let statistics = statistics_started.elapsed();
 	#[cfg(test)]
 	let derived_started = Instant::now();
+	load_graph_artifacts(
+		&mut database,
+		&database_catalog,
+		&wal,
+		&registry,
+		engine,
+		snapshot,
+		&database_superblock,
+	)?;
 	#[cfg(test)]
 	let indexes_started = Instant::now();
 	database.rebuild_lookup_indexes()?;
@@ -282,6 +291,161 @@ pub(super) fn open_local_state(
 		graph_superblocks,
 		physical_statistics,
 	}))
+}
+
+/// Restores bounded optional graph artifacts through the normal snapshot
+/// reader.
+fn load_graph_artifacts(
+	database: &mut DatabaseRoot,
+	catalog: &DatabaseCatalog,
+	wal: &FrameWal,
+	registry: &FileRegistry,
+	engine: &HybridReadEngine,
+	snapshot: StorageSnapshot,
+	authority: &DatabaseSuperblock,
+) -> FerrosGrynnResult<()> {
+	for graph in &catalog.graphs {
+		for index in graph.indexes.iter().filter(|index| {
+			index.state() == crate::datastore::ClassIndexState::Ready
+				&& matches!(
+					index.definition(),
+					crate::datastore::GraphIndexDefinition::Reachability { .. }
+						| crate::datastore::GraphIndexDefinition::Neighbourhood { .. }
+						| crate::datastore::GraphIndexDefinition::Path {
+							algorithm: crate::datastore::PathIndexAlgorithm::LandmarkSssp(_),
+							..
+						}
+				)
+				&& !index.is_on_demand()
+		}) {
+			let id =
+				index.id().ok_or_else(|| invalid("graph artifact definition has no identity"))?;
+			let Some(binding) = graph.index_bindings.get(&id).copied() else {
+				continue;
+			};
+			let restored = (|| {
+				let registered =
+					registry.resolve_file(DataSpaceId::Graph(graph.id), binding.file_id)?;
+				let mut read = |at, page: &mut AlignedPage| {
+					read_page_cached(
+						wal,
+						registry,
+						engine,
+						snapshot,
+						authority.generation,
+						snapshot.visible_lsn(),
+						PageKey::new(DataSpaceId::Graph(graph.id), binding.file_id, at),
+						page,
+					)
+					.map(|_| ())
+				};
+				let mut page = Box::new(AlignedPage::zeroed());
+				read(PageNo::new(0), &mut page)?;
+				let budget = crate::storage::external_sort_run_budget();
+				let descriptor = index.descriptor_with_limit(budget)?;
+				let identity = crate::storage::GraphArtifactIdentity {
+					index: id.get(),
+					version: index.version().get(),
+					graph: graph.id.get(),
+					revision: index.build_revision(),
+					fingerprint: rapidhash::v3::rapidhash_v3(&descriptor),
+				};
+				drop(descriptor);
+				let logical = database
+					.graph(graph.id)
+					.ok_or_else(|| invalid("artifact graph is absent after recovery"))?;
+				match index.definition() {
+					crate::datastore::GraphIndexDefinition::Reachability {
+						..
+					} => {
+						let layout = crate::storage::ReachabilityLayout::decode_header(
+							&page,
+							identity,
+							registered.page_count(),
+						)?;
+						let data = layout.load_sections(
+							budget,
+							&mut read,
+							&mut crate::storage::check_external_sort_cancelled,
+						)?;
+						let artifact = crate::datastore::ReachabilityArtifact::restore(
+							logical,
+							index,
+							layout,
+							data,
+							budget,
+							&mut crate::storage::check_external_sort_cancelled,
+						)?;
+						Arc::make_mut(&mut database.reachability_artifacts)
+							.insert(id, Arc::new(artifact));
+					}
+					crate::datastore::GraphIndexDefinition::Neighbourhood {
+						..
+					} => {
+						let layout = crate::storage::NeighbourhoodLayout::decode_header(
+							&page,
+							identity,
+							registered.page_count(),
+						)?;
+						let data = layout.load_sections(
+							budget,
+							&mut read,
+							&mut crate::storage::check_external_sort_cancelled,
+						)?;
+						let artifact = crate::datastore::NeighbourhoodArtifact::restore(
+							logical,
+							index,
+							layout,
+							data,
+							budget,
+							&mut crate::storage::check_external_sort_cancelled,
+						)?;
+						Arc::make_mut(&mut database.neighbourhood_artifacts)
+							.insert(id, Arc::new(artifact));
+					}
+					crate::datastore::GraphIndexDefinition::Path {
+						algorithm: crate::datastore::PathIndexAlgorithm::LandmarkSssp(_),
+						..
+					} => {
+						let layout = crate::storage::LandmarkPathLayout::decode_header(
+							&page,
+							identity,
+							registered.page_count(),
+						)?;
+						let data = layout.load_sections(
+							budget,
+							&mut read,
+							&mut crate::storage::check_external_sort_cancelled,
+						)?;
+						let artifact = crate::datastore::LandmarkPathArtifact::restore(
+							logical,
+							index,
+							layout,
+							data,
+							budget,
+							&mut crate::storage::check_external_sort_cancelled,
+						)?;
+						Arc::make_mut(&mut database.path_artifacts).insert(id, Arc::new(artifact));
+					}
+					_ => return Err(invalid("unknown graph artifact family")),
+				}
+				Ok(())
+			})();
+			if let Err(_unavailable_secondary) = restored {
+				let schema = Arc::make_mut(&mut database.schema)
+					.graphs
+					.get_mut(&graph.id)
+					.ok_or_else(|| invalid("artifact graph schema is absent"))?;
+				let definition = Arc::make_mut(schema)
+					.indexes
+					.iter_mut()
+					.find(|index| index.id() == Some(id))
+					.ok_or_else(|| invalid("graph artifact definition is absent after recovery"))?;
+				definition.state = crate::datastore::ClassIndexState::Stale;
+			}
+		}
+	}
+	Ok(())
 }
 
 fn read_catalog(
@@ -340,6 +504,7 @@ fn bindings(
 					graph.membership.root,
 				)?,
 				membership: graph.membership,
+				edge_endpoint: graph.edge_endpoint,
 				arena: graph.arena.clone(),
 			})
 		})

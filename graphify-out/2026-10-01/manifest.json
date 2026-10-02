@@ -320,8 +320,8 @@
     "semantic_hash": "0539f2fbc582bee265d91bb6a0fa0cfc"
   },
   "docs/disk_storage_spec.md": {
-    "mtime": 1790845299.245,
-    "ast_hash": "0f9b9b0232029f7476cfadd2475a0e9a",
+    "mtime": 1790850142.3641462,
+    "ast_hash": "c323a9962a1052cf1e7cf576991f0b56",
     "semantic_hash": ""
   },
   "docs/gql_grammar.md": {
@@ -330,13 +330,13 @@
     "semantic_hash": ""
   },
   "docs/gql_spec.md": {
-    "mtime": 1790845389.019,
-    "ast_hash": "961c6d7bbd22ee47b04bade62bf7c546",
+    "mtime": 1790850141.3072743,
+    "ast_hash": "ed274387f3471fc06516f135af0600f5",
     "semantic_hash": ""
   },
   "docs/gql_tech_spec.md": {
-    "mtime": 1790845453.061,
-    "ast_hash": "afb458669ef5818d50fff9dcfc13f726",
+    "mtime": 1790850141.8393927,
+    "ast_hash": "6bae8cab1e160eb67904158d612b4937",
     "semantic_hash": ""
   },
   "docs/graphs.md": {
@@ -380,8 +380,8 @@
     "semantic_hash": ""
   },
   "src/storage/mod.rs": {
-    "mtime": 1790758785.8082473,
-    "ast_hash": "a05d4312620afd30e37ea74b36bdf99e",
+    "mtime": 1790850050.2650619,
+    "ast_hash": "d0110429316f4fb1dfc493f05a6d3535",
     "semantic_hash": ""
   },
   "src/storage/page.rs": {
@@ -671,7 +671,7 @@
   },
   "crates/surrealdb/context7.json": {
     "mtime": 1784933295.4041705,
-    "ast_hash": "67acd68a0832e1dd3b2293bc711ba6d6",
+    "ast_hash": "",
     "semantic_hash": ""
   },
   "crates/surrealdb/fuzz/fuzz_targets/fuzz_executor.rs": {
@@ -8896,7 +8896,7 @@
   },
   "crates/surrealdb/surrealism/demo/fs/data/config.json": {
     "mtime": 1784933296.1412716,
-    "ast_hash": "d2f8f66a9197c873c9d19c49dc4a40bf",
+    "ast_hash": "",
     "semantic_hash": ""
   },
   "crates/surrealdb/surrealism/demo/src/lib.rs": {
@@ -11360,8 +11360,8 @@
     "semantic_hash": ""
   },
   "src/datastore/backend.rs": {
-    "mtime": 1790825142.8420303,
-    "ast_hash": "c7448b56b21b735c087b31de80dee296",
+    "mtime": 1790850161.1142921,
+    "ast_hash": "ee517ff945944d18749f2d8f647ff1d2",
     "semantic_hash": ""
   },
   "src/datastore/index_store/rebuild.rs": {
@@ -11390,8 +11390,8 @@
     "semantic_hash": ""
   },
   "src/datastore/transaction/query.rs": {
-    "mtime": 1790758772.4551258,
-    "ast_hash": "d3b28efb03ae8c67f341d1867bc72392",
+    "mtime": 1790850161.2308445,
+    "ast_hash": "c2e8afe122d2ebb1be6b0b676404126b",
     "semantic_hash": ""
   },
   "src/datastore/transaction/schema.rs": {
@@ -11565,8 +11565,8 @@
     "semantic_hash": ""
   },
   "src/storage/local_store/mod.rs": {
-    "mtime": 1790758782.5915968,
-    "ast_hash": "1903ed4c7c53008b1ef2c671927a70cd",
+    "mtime": 1790851094.671695,
+    "ast_hash": "e6c4f943b3e6a0b05926366c4dfc780f",
     "semantic_hash": ""
   },
   "src/storage/local_store/open.rs": {
@@ -12130,8 +12130,8 @@
     "semantic_hash": ""
   },
   "src/storage/local_store/physical_index.rs": {
-    "mtime": 1790821256.183374,
-    "ast_hash": "f0b1dc7e97ce531ab75e9ca1dc93365a",
+    "mtime": 1790851134.5904813,
+    "ast_hash": "98f9d97b6117e2112c3cf9dec2c99263",
     "semantic_hash": ""
   },
   "docs/reports/windows_ga_core_stage_19_report.md": {
@@ -12260,8 +12260,8 @@
     "semantic_hash": ""
   },
   "src/storage/local_store/index_delta.rs": {
-    "mtime": 1790769591.1748474,
-    "ast_hash": "78886d66a324df3f8adb06de7840ae2f",
+    "mtime": 1790850157.8177412,
+    "ast_hash": "d8c767734249af5bd5ed3ef3da364ff2",
     "semantic_hash": ""
   },
   "src/storage/scoped_index_image/fulltext.rs": {
@@ -12275,13 +12275,13 @@
     "semantic_hash": ""
   },
   "src/storage/vector_index/build.rs": {
-    "mtime": 1790835788.3429112,
-    "ast_hash": "d3ae0d55fe242a6171cd605d9d4578fa",
+    "mtime": 1790850157.1072915,
+    "ast_hash": "bb25ee4ca749056441040bd5ddd2196f",
     "semantic_hash": ""
   },
   "src/storage/vector_index/codec.rs": {
-    "mtime": 1790813503.4068034,
-    "ast_hash": "faa9328922052020d1f687562a4d0dd5",
+    "mtime": 1790850749.0665245,
+    "ast_hash": "d7336fb36d131cc9e2e555218565b2c2",
     "semantic_hash": ""
   },
   "src/storage/vector_index/delta.rs": {
@@ -12290,13 +12290,13 @@
     "semantic_hash": ""
   },
   "src/storage/vector_index/mod.rs": {
-    "mtime": 1790813527.8082955,
-    "ast_hash": "6658f8712ad39424ff614b6ee5ba077d",
+    "mtime": 1790851029.9466622,
+    "ast_hash": "56fc1eefae72974b33d65d6ff022f023",
     "semantic_hash": ""
   },
   "src/storage/vector_index/search.rs": {
-    "mtime": 1790811264.5762508,
-    "ast_hash": "e3fa7fa735202ce9d9f01b2d0aa60ca8",
+    "mtime": 1790851029.4374921,
+    "ast_hash": "d1c983b112b1e4caab54521f897df15f",
     "semantic_hash": ""
   },
   "src/storage/vector_index/stream.rs": {
@@ -12310,8 +12310,8 @@
     "semantic_hash": ""
   },
   "docs/gql_vector_stage_23_plan.md": {
-    "mtime": 1790835142.2690823,
-    "ast_hash": "cd80f27f682eee1b8ec589cbde7d376e",
+    "mtime": 1790850142.8548868,
+    "ast_hash": "05dc6ad1439eb14aec71ad86eff88167",
     "semantic_hash": ""
   },
   "docs/reports/gql_fulltext_stage_22_report.md": {
@@ -12327,6 +12327,16 @@
   "src/storage/local_store/tests/search_scope_tests.rs": {
     "mtime": 1790824659.7029543,
     "ast_hash": "5064288178650b2a915952a4d1d3aaf2",
+    "semantic_hash": ""
+  },
+  "src/storage/vector_index/hnsw_memory.rs": {
+    "mtime": 1790850915.3554492,
+    "ast_hash": "a07538fc91b9962fbb75e44d416226be",
+    "semantic_hash": ""
+  },
+  "src/storage/vector_index/hnsw_search.rs": {
+    "mtime": 1790850156.959715,
+    "ast_hash": "4798a7037dc912277c980fed72c0e5ce",
     "semantic_hash": ""
   }
 }

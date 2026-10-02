@@ -276,7 +276,7 @@ where
 }
 
 /// Creates, fills, syncs, and rereads one immutable side-file.
-pub(super) fn write_streamed_file(
+pub(in crate::storage) fn write_streamed_file(
 	database_root: &Path,
 	relative_path: &str,
 	build: impl FnOnce(&DirectFile) -> FerrosGrynnResult<StreamedIndex>,

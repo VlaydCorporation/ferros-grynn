@@ -202,7 +202,9 @@ impl Value {
 			}
 			Self::AtomOccurrence(value) => size_of::<AtomOccurrenceRef>()
 				.saturating_add(estimated_record_id_heap_bytes(value.atom().id())),
-			Self::Path(value) => size_of_val(value.as_ref()),
+			Self::Path(value) => {
+				size_of_val(value.as_ref()).saturating_add(value.estimated_heap_bytes())
+			}
 			Self::Graph(value) => value.estimated_heap_bytes(),
 			Self::Closure(value) => size_of_val(value.as_ref())
 				.saturating_add(value.name().map_or(0, Text::len))
@@ -491,7 +493,7 @@ fn estimated_values_heap_bytes<'a>(
 	)
 }
 
-pub(super) fn estimated_record_id_heap_bytes(record: &RecordId) -> usize {
+pub(crate) fn estimated_record_id_heap_bytes(record: &RecordId) -> usize {
 	record.class().len().saturating_add(estimated_record_part_heap_bytes(record.id()))
 }
 
@@ -530,7 +532,7 @@ fn estimated_positions_heap_bytes(positions: &[Position]) -> usize {
 	)
 }
 
-fn estimated_geometry_heap_bytes(geometry: &Geometry) -> usize {
+pub(super) fn estimated_geometry_heap_bytes(geometry: &Geometry) -> usize {
 	match geometry {
 		Geometry::Point(position) => estimated_position_heap_bytes(position),
 		Geometry::MultiPoint(positions) | Geometry::LineString(positions) => {

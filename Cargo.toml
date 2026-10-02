@@ -83,7 +83,7 @@ arrow = { version = "58.4.0", default-features = false }
 datafusion = { version = "54.1.0", default-features = false }
 bytes = "1.12.1"
 compact_str = { version = "0.10.0", features = ["rkyv"] }
-geo = "0.33.1"
+geo = { version = "=0.33.1", default-features = false }
 geojson = "1.0.0"
 jiff = "0.2.34"
 humantime = "2.3.0"
@@ -262,6 +262,7 @@ arrow = { workspace = true, optional = true }
 datafusion = { workspace = true, optional = true }
 compact_str = { workspace = true }
 geojson = { workspace = true }
+geo = { workspace = true }
 jiff = { workspace = true }
 rust_decimal = { workspace = true }
 uuid = { workspace = true }

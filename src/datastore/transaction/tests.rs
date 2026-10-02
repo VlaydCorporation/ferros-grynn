@@ -13,6 +13,79 @@ use crate::{
 
 const KEY: PropertyKeyId = PropertyKeyId::new(7);
 
+#[test]
+fn edge_endpoint_postings_publish_abort_replace_and_retire_with_topology() {
+	use crate::graph::{EdgeEndpoint, TraversalIndex, TraversalSemantics};
+	let store = Datastore::in_memory();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
+	let graph = seed.define_graph("endpoints", GraphKind::Graph).unwrap();
+	let records = ["person:a", "person:b", "relation:base", "relation:connector"].map(|value| value.parse::<RecordId>().unwrap());
+	for record in &records { seed.create_atom(record.clone(), PropertyMap::new()).unwrap(); }
+	let a = seed.attach_node(graph.id(), &records[0], None, None).unwrap();
+	let b = seed.attach_node(graph.id(), &records[1], None, None).unwrap();
+	let endpoint = seed.attach_edge(graph.id(), &records[2], None, EdgeTopology::directed([a], [b]), None, None).unwrap();
+	seed.commit().unwrap();
+	let old_without = store.begin();
+	assert!(old_without.snapshot.schema.graph(graph.id()).unwrap().edge_endpoint_index().is_none());
+	let mut writer = store.begin();
+	let connector = writer.attach_edge(graph.id(), &records[3], None, EdgeTopology::directed([endpoint, a], [endpoint, b]), None, None).unwrap();
+	let key = EdgeEndpoint::Local(endpoint);
+	assert_eq!(writer.working.graph(graph.id()).unwrap().edge_endpoint_postings(&key).copied().collect::<Vec<_>>(), vec![(connector, false), (connector, true)]);
+	writer.commit().unwrap();
+	assert!(old_without.snapshot.schema.graph(graph.id()).unwrap().edge_endpoint_index().is_none());
+	let mut old = store.begin();
+	let capability = old.snapshot.schema.graph(graph.id()).unwrap().edge_endpoint_index().unwrap();
+	let view = graph.read(&old).unwrap();
+	assert_eq!(view.edge_endpoint_connectors(&key).unwrap(), Some(vec![connector]));
+	let exact = TraversalIndex::new(&view, TraversalSemantics::Atom).unwrap();
+	let indexed = TraversalIndex::for_edge_endpoint(&view, &key).unwrap().unwrap();
+	for direction in [crate::graph::TraversalDirection::Forward, crate::graph::TraversalDirection::Backward, crate::graph::TraversalDirection::Both] {
+		assert_eq!(indexed.steps(&key, direction).collect::<Vec<_>>(), exact.steps(&key, direction).collect::<Vec<_>>());
+	}
+	drop(view);
+	let mut private = store.begin();
+	private.replace_occurrence_state(graph.id(), &records[3], OccurrenceState::Edge { topology: EdgeTopology::directed([a], [a, b]), weight: None, transition_graph: None }).unwrap();
+	assert_eq!(private.working.graph(graph.id()).unwrap().edge_endpoint_postings(&key).count(), 0);
+	let rebuilt = crate::stats::analyze_database(&private.working).unwrap();
+	assert_eq!(private.working.statistics.graph(graph.id()).unwrap().total_in_degree, rebuilt.graph(graph.id()).unwrap().total_in_degree);
+	drop(private);
+	assert_eq!(old.snapshot.graph(graph.id()).unwrap().edge_endpoint_postings(&key).count(), 2);
+	let mut remove = store.begin();
+	remove.detach_occurrence(graph.id(), &records[3], false).unwrap();
+	remove.commit().unwrap();
+	assert_eq!(store.begin().snapshot.graph(graph.id()).unwrap().edge_endpoint_postings(&key).count(), 0);
+	assert_eq!(store.begin().snapshot.schema.graph(graph.id()).unwrap().edge_endpoint_index(), Some(capability));
+	assert_eq!(old.graphs().unwrap()[0].edge_endpoint_index(), Some(capability));
+}
+
+#[test]
+fn edge_endpoint_postings_preserve_two_paths_to_the_same_child_graph() {
+	use crate::graph::{EdgeEndpoint, QualifiedAtomId};
+	let store = Datastore::in_memory();
+	let mut tx = store.begin();
+	for (class, kind) in [("person", AtomKind::Node), ("relation", AtomKind::Edge)] { tx.define_class(ClassSchema::new(class, kind, []).unwrap()).unwrap(); }
+	let parent = tx.define_graph("parent", GraphKind::Metagraph).unwrap();
+	let child = tx.define_graph("child", GraphKind::Graph).unwrap();
+	let records = ["person:a", "person:b", "person:c1", "person:c2", "relation:base", "relation:x", "relation:y"].map(|value| value.parse::<RecordId>().unwrap());
+	for record in &records { tx.create_atom(record.clone(), PropertyMap::new()).unwrap(); }
+	let a = tx.attach_node(child.id(), &records[0], None, None).unwrap();
+	let b = tx.attach_node(child.id(), &records[1], None, None).unwrap();
+	let endpoint = tx.attach_edge(child.id(), &records[4], None, EdgeTopology::directed([a], [b]), None, None).unwrap();
+	let first = tx.attach_node(parent.id(), &records[2], None, Some(child.id())).unwrap();
+	let second = tx.attach_node(parent.id(), &records[3], None, Some(child.id())).unwrap();
+	let q1 = EdgeEndpoint::Nested(QualifiedAtomId::new(vec![first], endpoint).unwrap());
+	let q2 = EdgeEndpoint::Nested(QualifiedAtomId::new(vec![second], endpoint).unwrap());
+	let x = tx.attach_edge(parent.id(), &records[5], None, EdgeTopology::directed([q1.clone()], [EdgeEndpoint::Local(second)]), None, None).unwrap();
+	let y = tx.attach_edge(parent.id(), &records[6], None, EdgeTopology::directed([q2.clone()], [EdgeEndpoint::Local(first)]), None, None).unwrap();
+	tx.commit().unwrap();
+	let read = store.begin();
+	let view = parent.read(&read).unwrap();
+	assert_eq!(view.edge_endpoint_connectors(&q1).unwrap(), Some(vec![x]));
+	assert_eq!(view.edge_endpoint_connectors(&q2).unwrap(), Some(vec![y]));
+}
+
 fn record(name: &str) -> RecordId {
 	RecordId::new("person", RecordIdPart::String(name.into())).unwrap()
 }

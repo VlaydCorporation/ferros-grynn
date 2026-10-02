@@ -16,6 +16,30 @@ pub(super) fn execute(
 	control: Option<&ExecutionControl>,
 ) -> FerrosGrynnResult<Value> {
 	match function {
+		Builtin::GeoWithin | Builtin::GeoIntersects => {
+			let (left, right) = two(arguments)?;
+			binary(
+				if matches!(function, Builtin::GeoWithin) {
+					BinaryOperator::Inside
+				} else {
+					BinaryOperator::Intersects
+				},
+				left,
+				right,
+			)
+		}
+		Builtin::GeoDistance => {
+			let (left, right) = two(arguments)?;
+			if matches!(left, Value::None | Value::Null)
+				|| matches!(right, Value::None | Value::Null)
+			{
+				return Ok(Value::None);
+			}
+			let (Value::Geometry(left), Value::Geometry(right)) = (left, right) else {
+				return Err(type_error("geo::distance", "point geometry, point geometry"));
+			};
+			left.distance(&right).map(Value::from)
+		}
 		Builtin::MathAbs => math_abs(one(arguments)?),
 		Builtin::MathSqrt => number_f64(one(arguments)?, "math::sqrt", control).and_then(|value| {
 			(value >= 0.0).then_some(Value::from(value.sqrt())).ok_or_else(|| domain("math::sqrt"))
@@ -243,6 +267,9 @@ pub(super) fn execute(
 		| Builtin::SearchScore(_)
 		| Builtin::SearchHighlight(_) => Err(FerrosGrynnError::invalid_argument(
 			"search::analyze requires query execution context",
+		)),
+		Builtin::PathCostWith(_) => Err(FerrosGrynnError::invalid_argument(
+			"custom path cost requires query execution context",
 		)),
 		Builtin::PathAtoms => {
 			let path = path(one(arguments)?, "path::atoms")?;

@@ -69,6 +69,21 @@ impl ShortestPaths {
 		graph_ref: Arc<GraphRef>,
 		target: AtomId,
 	) -> FerrosGrynnResult<Option<Path>> {
+		self.materialize_path_with_admission(graph, graph_ref, target, &mut |_bytes| Ok(()))
+	}
+
+	/// Admits reconstruction buffers and public identifiers before retaining
+	/// them.
+	///
+	/// # Errors
+	/// Propagates admission, identity, snapshot and atom resolution errors.
+	pub(crate) fn materialize_path_with_admission<R: GraphRead>(
+		&self,
+		graph: &R,
+		graph_ref: Arc<GraphRef>,
+		target: AtomId,
+		admit: &mut impl FnMut(usize) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Option<Path>> {
 		if graph.identity() != self.origin {
 			return Err(FerrosGrynnError::graph_identity_mismatch(
 				self.origin.to_string(),
@@ -81,15 +96,28 @@ impl ShortestPaths {
 				self.snapshot.to_string(),
 			));
 		}
+		if !self.distances.contains_key(&target) {
+			return Ok(None);
+		}
+		admit(
+			self.predecessors
+				.len()
+				.checked_add(1)
+				.and_then(|count| {
+					count.checked_mul(
+						3 * (size_of::<(AtomId, Option<Predecessor>)>() + size_of::<PathStep>()),
+					)
+				})
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("path reconstruction bytes"))?,
+		)?;
 		let Some(path) = self.reconstruct(target) else {
 			return Ok(None);
 		};
 		let mut steps = Vec::with_capacity(path.len());
 		for (index, (atom, predecessor)) in path.into_iter().enumerate() {
-			let atom_ref = AtomOccurrenceRef::new(
-				graph.atom_ref(atom)?.ok_or_else(|| atom_does_not_exist(atom))?,
-				graph_ref.clone(),
-			);
+			let atom = graph.atom_ref(atom)?.ok_or_else(|| atom_does_not_exist(atom))?;
+			admit(atom.id().estimated_heap_bytes())?;
+			let atom_ref = AtomOccurrenceRef::new(atom, graph_ref.clone());
 			if index == 0 {
 				steps.push(PathStep::new(
 					atom_ref,
@@ -102,12 +130,11 @@ impl ShortestPaths {
 			let predecessor = predecessor.ok_or_else(|| {
 				algorithm_failure("shortest path", "predecessor chain is incomplete")
 			})?;
-			let edge_ref = AtomOccurrenceRef::new(
-				graph
-					.atom_ref(predecessor.step.via_edge)?
-					.ok_or_else(|| atom_does_not_exist(predecessor.step.via_edge))?,
-				graph_ref.clone(),
-			);
+			let edge = graph
+				.atom_ref(predecessor.step.via_edge)?
+				.ok_or_else(|| atom_does_not_exist(predecessor.step.via_edge))?;
+			admit(edge.id().estimated_heap_bytes())?;
+			let edge_ref = AtomOccurrenceRef::new(edge, graph_ref.clone());
 			steps.push(PathStep::new(
 				atom_ref,
 				Some(edge_ref),
@@ -170,7 +197,7 @@ pub fn dijkstra<R: GraphRead>(
 	dijkstra_with_check(graph, source, direction, &mut || Ok(()))
 }
 
-pub(crate) fn dijkstra_with_check<R: GraphRead, Check>(
+fn dijkstra_with_check<R: GraphRead, Check>(
 	graph: &R,
 	source: AtomId,
 	direction: TraversalDirection,
@@ -183,6 +210,146 @@ where
 	ensure_node(graph, source)?;
 	let index = TraversalIndex::new_with_check(graph, TraversalSemantics::Node, check)?;
 	let weights = collect_weights_with_check(graph, false, "Dijkstra", check)?;
+	dijkstra_search(
+		graph,
+		source,
+		direction,
+		&index,
+		&weights,
+		None,
+		(&mut |_bytes| Ok(()), &mut |_node, _prefix, _upper| Ok(true), check, &mut || Ok(())),
+	)
+}
+
+/// Runs the shared forward NODE search with bounded buffers and optional ALT
+/// refinement. Queue order and strict predecessor improvement stay unchanged.
+/// The returned flag proves that pruning cannot hide arithmetic failures.
+///
+/// # Errors
+/// Validates all weights before refinement; propagates admission, cancellation,
+/// branch budget, read and arithmetic errors.
+pub fn dijkstra_to_with_control<R: GraphRead, Admit, Refine, Check, Visit>(
+	graph: &R,
+	source: AtomId,
+	target: AtomId,
+	admit: &mut Admit,
+	refine: &mut Refine,
+	check: &mut Check,
+	visit: &mut Visit,
+) -> FerrosGrynnResult<(ShortestPaths, bool)>
+where
+	Admit: FnMut(usize) -> FerrosGrynnResult<()>,
+	Refine: FnMut(AtomId, Number, Option<Number>) -> FerrosGrynnResult<bool>,
+	Check: FnMut() -> FerrosGrynnResult<()>,
+	Visit: FnMut() -> FerrosGrynnResult<()>,
+{
+	check()?;
+	ensure_node(graph, source)?;
+	let index = TraversalIndex::new_with_admission(graph, TraversalSemantics::Node, admit, check)?;
+	admit(
+		graph
+			.edge_count()?
+			.checked_mul(4 * size_of::<(AtomId, Number)>())
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("Dijkstra weights bytes"))?,
+	)?;
+	let weights = collect_weights_with_check(graph, false, "Dijkstra", check)?;
+	let pruning_safe = pruning_preserves_arithmetic(&weights, graph.node_count()?, check)?;
+	let paths = dijkstra_search(
+		graph,
+		source,
+		TraversalDirection::Forward,
+		&index,
+		&weights,
+		Some(target),
+		(
+			admit,
+			&mut |node, prefix, upper| {
+				if pruning_safe {
+					refine(node, prefix, upper)
+				} else {
+					Ok(true)
+				}
+			},
+			check,
+			visit,
+		),
+	)?;
+	Ok((paths, pruning_safe))
+}
+
+/// Keeps full traversal when a mixed cast can decrease a prefix or when any
+/// reachable addition could fail. Otherwise every simple prefix plus one arc
+/// is monotone and representable, so a strict completion bound is safe.
+fn pruning_preserves_arithmetic<Check>(
+	weights: &RapidHashMap<AtomId, Number>,
+	vertices: usize,
+	check: &mut Check,
+) -> FerrosGrynnResult<bool>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	let mut maximum = Number::Int(0);
+	let mut maximum_integer = 0_i64;
+	let mut floating = false;
+	let mut decimal = false;
+	for (ordinal, &weight) in weights.values().enumerate() {
+		check_candidate(check, ordinal)?;
+		maximum = maximum.max(weight);
+		match weight {
+			Number::Int(weight) => maximum_integer = maximum_integer.max(weight),
+			Number::Float(_) => floating = true,
+			Number::Decimal(_) => decimal = true,
+		}
+	}
+	let Ok(vertices_i64) = i64::try_from(vertices.max(1)) else {
+		return Ok(false);
+	};
+	if !floating {
+		// Decimal sums below the i64 ceiling are far inside their 96-bit
+		// range. Pure integer prefixes also cannot overflow.
+		return Ok(maximum <= Number::Int(i64::MAX / vertices_i64));
+	}
+	if decimal || maximum_integer > (1_i64 << 53) / vertices_i64 {
+		return Ok(false);
+	}
+	// Integer-only prefixes cast exactly before the first float. Outward
+	// interval addition bounds every possible floating reduction, including
+	// subnormals, before allowing arithmetic work to be skipped.
+	let maximum = super::landmark::DistanceInterval::from_number(maximum)?;
+	let mut total = super::landmark::DistanceInterval::ZERO;
+	for ordinal in 0..vertices {
+		check_candidate(check, ordinal)?;
+		total = total.add(maximum);
+		if !total.upper.is_finite() {
+			return Ok(false);
+		}
+	}
+	Ok(true)
+}
+
+/// One loop for public all-target Dijkstra and query point refinement.
+fn dijkstra_search<R: GraphRead, Admit, Refine, Check, Visit>(
+	graph: &R,
+	source: AtomId,
+	direction: TraversalDirection,
+	index: &TraversalIndex,
+	weights: &RapidHashMap<AtomId, Number>,
+	target: Option<AtomId>,
+	callbacks: (&mut Admit, &mut Refine, &mut Check, &mut Visit),
+) -> FerrosGrynnResult<ShortestPaths>
+where
+	Admit: FnMut(usize) -> FerrosGrynnResult<()>,
+	Refine: FnMut(AtomId, Number, Option<Number>) -> FerrosGrynnResult<bool>,
+	Check: FnMut() -> FerrosGrynnResult<()>,
+	Visit: FnMut() -> FerrosGrynnResult<()>,
+{
+	let (admit, refine, check, visit) = callbacks;
+	let state_bytes = 4
+		* (size_of::<(AtomId, Predecessor)>()
+			+ size_of::<(AtomId, Number)>()
+			+ size_of::<QueueEntry>())
+		+ 128;
+	admit(state_bytes)?;
 	let mut distances = RapidHashMap::default();
 	let mut predecessors = RapidHashMap::default();
 	let mut queue = BinaryHeap::from([QueueEntry {
@@ -200,8 +367,12 @@ where
 		if distances.get(&node).is_some_and(|known| distance > *known) {
 			continue;
 		}
-		for (candidate_index, step) in local_steps(&index, node, direction).enumerate() {
+		if !refine(node, distance, target.and_then(|target| distances.get(&target).copied()))? {
+			continue;
+		}
+		for (candidate_index, step) in local_steps(index, node, direction).enumerate() {
 			check_candidate(check, candidate_index)?;
+			visit()?;
 			let Some(target) = step.target.local_id().filter(|id| id.is_node()) else {
 				continue;
 			};
@@ -213,6 +384,7 @@ where
 			};
 			let candidate = add_numbers(distance, weight)?;
 			if distances.get(&target).is_none_or(|known| candidate < *known) {
+				admit(state_bytes)?;
 				distances.insert(target, candidate);
 				predecessors.insert(target, Predecessor {
 					from: node,

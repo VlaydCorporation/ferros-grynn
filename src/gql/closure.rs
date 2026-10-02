@@ -30,9 +30,60 @@ const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) struct LanguageClosureState {
 	registry: Mutex<LanguageClosureRegistry>,
 	populated: AtomicBool,
+	compiler_bounded: bool,
 }
 
 impl LanguageClosureState {
+	/// Shares one admission cap between retained plans and live compiler
+	/// frames.
+	pub(in crate::gql) fn bounded(limit: usize) -> Self {
+		Self {
+			registry: Mutex::new(LanguageClosureRegistry {
+				scratch_limit: Some(limit),
+				..LanguageClosureRegistry::default()
+			}),
+			populated: AtomicBool::new(false),
+			compiler_bounded: true,
+		}
+	}
+
+	/// Admits compilation before source, tokens, syntax or typed IR are
+	/// allocated.
+	pub(in crate::gql) fn admit_compile(
+		&self,
+		source_bytes: usize,
+	) -> FerrosGrynnResult<CompileReservation<'_>> {
+		if !self.compiler_bounded {
+			return Ok(CompileReservation {
+				state: self,
+				bytes: 0,
+			});
+		}
+		let mut registry = self.registry.lock();
+		let bytes = if let Some(limit) = registry.scratch_limit {
+			let bytes = source_bytes
+				.checked_mul(1024)
+				.and_then(|bytes| bytes.checked_add(16_384))
+				.ok_or_else(|| compiler_resource(limit))?;
+			let next = registry
+				.compiling_bytes
+				.checked_add(bytes)
+				.and_then(|bytes| bytes.checked_add(registry.retained_bytes()))
+				.ok_or_else(|| compiler_resource(limit))?;
+			if next > limit {
+				return Err(compiler_resource(limit));
+			}
+			registry.compiling_bytes += bytes;
+			bytes
+		} else {
+			0
+		};
+		Ok(CompileReservation {
+			state: self,
+			bytes,
+		})
+	}
+
 	pub(crate) fn has_entries(&self) -> bool {
 		self.populated.load(Ordering::Acquire)
 	}
@@ -92,6 +143,52 @@ impl LanguageClosureState {
 	pub(crate) fn retained_bytes(&self) -> usize {
 		self.registry.lock().retained_bytes()
 	}
+
+	/// Captured identities for already compiled transitive named calls.
+	pub(in crate::gql) fn named_dependencies(
+		&self,
+	) -> BTreeSet<(crate::datastore::FunctionId, crate::datastore::SchemaVersion)> {
+		self.registry.lock().named_entries.keys().map(|key| (key.id, key.version)).collect()
+	}
+}
+
+/// Releases a live compiler admission on success, error and cancellation.
+pub(in crate::gql) struct CompileReservation<'a> {
+	state: &'a LanguageClosureState,
+	bytes: usize,
+}
+
+impl Drop for CompileReservation<'_> {
+	fn drop(&mut self) {
+		if self.bytes != 0 {
+			let mut registry = self.state.registry.lock();
+			registry.compiling_bytes -= self.bytes;
+		}
+	}
+}
+
+fn compiler_resource(limit: usize) -> FerrosGrynnError {
+	FerrosGrynnError::traversal_resource_limit_exceeded("PURE compiler scratch", limit as u64)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn compiler_frames_share_the_cap_and_release_on_error() -> FerrosGrynnResult<()> {
+		let state = LanguageClosureState::bounded(65_536);
+		let parent = state.admit_compile(16)?;
+		assert!(state.admit_compile(17).is_err());
+		let child = state.admit_compile(16)?;
+		assert!(state.admit_compile(0).is_err());
+		drop(child);
+		drop(parent);
+		assert_eq!(state.registry.lock().compiling_bytes, 0);
+		let _replacement = state.admit_compile(48)?;
+		assert!(state.admit_compile(usize::MAX).is_err());
+		Ok(())
+	}
 }
 
 /// One immutable language closure and the lexical values captured at creation.
@@ -112,6 +209,8 @@ pub(crate) struct LanguageClosureRegistry {
 	named_epoch: Option<u64>,
 	named_entries: BTreeMap<NamedFunctionKey, Arc<LogicalClosure>>,
 	named_bytes: usize,
+	scratch_limit: Option<usize>,
+	compiling_bytes: usize,
 }
 
 impl Default for LanguageClosureRegistry {
@@ -123,6 +222,8 @@ impl Default for LanguageClosureRegistry {
 			named_epoch: None,
 			named_entries: BTreeMap::new(),
 			named_bytes: 0,
+			scratch_limit: None,
+			compiling_bytes: 0,
 		}
 	}
 }
@@ -135,6 +236,25 @@ impl LanguageClosureRegistry {
 		statement_nonce: u64,
 	) -> FerrosGrynnResult<Closure> {
 		self.cache_named(plan)?;
+		let bytes = plan.captures.iter().try_fold(plan.retained_plan_bytes, |bytes, slot| {
+			let value = slots.get(*slot as usize).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"Closure capture references an unavailable lexical slot.",
+				)
+			})?;
+			bytes
+				.checked_add(size_of::<(u32, Value)>())
+				.and_then(|bytes| bytes.checked_add(value.estimated_heap_bytes()))
+				.ok_or_else(|| compiler_resource(self.scratch_limit.unwrap_or(MAX_RETAINED_BYTES)))
+		})?;
+		let retained = self.retained_bytes.saturating_add(self.named_bytes).saturating_add(bytes);
+		let limit = self.scratch_limit.unwrap_or(MAX_RETAINED_BYTES);
+		if retained.saturating_add(self.compiling_bytes) > limit {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"closure registry".to_owned(),
+				limit as u64,
+			));
+		}
 		let captures = plan
 			.captures
 			.iter()
@@ -146,21 +266,6 @@ impl LanguageClosureRegistry {
 				})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
-		let bytes = plan.retained_plan_bytes.saturating_add(captures.iter().fold(
-			0_usize,
-			|bytes, (_, value)| {
-				bytes
-					.saturating_add(size_of::<(u32, Value)>())
-					.saturating_add(value.estimated_heap_bytes())
-			},
-		));
-		let retained = self.retained_bytes.saturating_add(self.named_bytes).saturating_add(bytes);
-		if retained > MAX_RETAINED_BYTES {
-			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
-				"closure registry".to_owned(),
-				MAX_RETAINED_BYTES as u64,
-			));
-		}
 		let closure = Closure::session(
 			self.owner,
 			plan.parameters.iter().map(|(_, ty)| ty.clone()).collect(),
@@ -192,10 +297,11 @@ impl LanguageClosureRegistry {
 			.retained_bytes
 			.saturating_add(self.named_bytes)
 			.saturating_add(plan.retained_plan_bytes);
-		if retained > MAX_RETAINED_BYTES {
+		let limit = self.scratch_limit.unwrap_or(MAX_RETAINED_BYTES);
+		if retained.saturating_add(self.compiling_bytes) > limit {
 			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
 				"named function cache".to_owned(),
-				MAX_RETAINED_BYTES as u64,
+				limit as u64,
 			));
 		}
 		self.named_bytes = self.named_bytes.saturating_add(plan.retained_plan_bytes);
@@ -276,7 +382,6 @@ impl LanguageClosureRegistry {
 		})
 	}
 
-	#[cfg(test)]
 	fn retained_bytes(&self) -> usize {
 		self.retained_bytes.saturating_add(self.named_bytes)
 	}

@@ -45,6 +45,15 @@
 - `graph_index` — order-preserving primary и общий внутренний B+tree codec для
   раздельных Standard/Unique контрактов, bounded Direct-I/O
   external sort, bottom-up packing, immutable Label arrays и single-page Count;
+- `geometry_index` — общий STR page builder/walker и exact replacement delta;
+  resident RAM pages и local WAL/COW files используют один checked layout.
+- `reachability_index`/`neighbourhood_index`/`path_index` — immutable graph-owned header/array sections, full definition
+  descriptor, canonical contiguous roots и aggregate decode admission; status остаётся в catalog.
+- `derived_index` — borrowed array/record sections, checked ordinal chains,
+  reference bounds и reserved bytes для snapshot graph artifacts.
+- `edge_endpoint_index` — engine-owned qualified postings, shared Unique B+tree
+  с concrete leaf/header и snapshot identity. Header page 0 и topology публикуются
+  одной WAL/COW generation; lookup возвращает только connector/side, не query values.
 - `store` — open/load, transaction views, commit и startup GC;
 - `local` — адаптер локального datastore.
 
@@ -54,6 +63,9 @@
   repair не должен маскировать полную corruption.
 - Checkpoint публикуется атомарно и не удаляет данные, удерживаемые активным
   snapshot.
+- Pinned physical snapshot допускает home page LSN до своего `visible_lsn`:
+  passive checkpoint может backfill/prune после capture. Direct/IoRing bypass
+  проверяет тот же page identity/checksum/ceiling, что resident admission.
 - После COW publication прежняя UUID-generation удаляется в runtime только
   после освобождения exact physical snapshots, удерживающих старый registry.
   Cleanup failure не отменяет уже опубликованный commit: generation остаётся
@@ -102,6 +114,12 @@
   primary/Unique и `0.80` для Standard. Это writer policy, не новый disk tag.
 - Любая входная длина/счётчик проверяется до allocation; ошибки проходят через
   `gql_status` без раскрытия локальных путей и сырых страниц.
+- Graph-owned definitions хранятся в FGDC v10 отдельно от availability/build revision,
+  checked canonical descriptor и полные bytes обязательны наряду с fingerprint. GraphIndex
+  durable job имеет target tag 5; graph-wide target и class index target не смешиваются.
+- Ready Reachability/Neighbourhood/LANDMARK_SSSP binding удерживает один immutable файл своей проекции. Независимый
+  commit сохраняет DataFileId; reopen проверяет maps/CSR/labels против того же snapshot.
+  Ошибка secondary decode исключает artifact и делает logical definition Stale.
 
 ## Проверка
 

@@ -32,6 +32,8 @@ mod validate;
 mod view;
 mod workspace;
 
+pub(crate) use traversal::visit_endpoint_steps;
+
 #[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]
 pub struct Mutable;
@@ -131,10 +133,17 @@ pub use traversal::{
 	weakly_connected_components,
 };
 pub(crate) use traversal::{
+	DirectedLandmarks,
+	DistanceInterval,
+	LandmarkBuildLimits,
+	LandmarkDistanceRows,
+	ProjectedCondensation,
+	ProjectedRelation,
+	RelationCsr,
 	bellman_ford_with_check,
 	bfs_with_check,
 	condensation_with_check,
-	dijkstra_with_check,
+	dijkstra_to_with_control,
 	find_cuts_with_check,
 	has_cycle_directed_with_check,
 	has_cycle_undirected_with_check,

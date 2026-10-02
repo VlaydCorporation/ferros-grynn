@@ -502,6 +502,9 @@ impl<'a> Analyzer<'a> {
 			StatementKind::DefineIndex(definition) => {
 				LogicalStatement::Schema(self.define_index(definition)?)
 			}
+			StatementKind::DefineGraphIndex(definition) => {
+				LogicalStatement::Schema(self.define_graph_index(definition)?)
+			}
 			StatementKind::DefineAnalyzer(definition) => {
 				LogicalStatement::Schema(self.define_analyzer(definition)?)
 			}
@@ -1293,11 +1296,245 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Resolves graph options without importing storage bindings into typed IR.
+	fn define_graph_index(
+		&self,
+		definition: &crate::syn::DefineGraphIndexStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		use crate::{
+			datastore::{
+				GraphIndex,
+				GraphIndexCost,
+				GraphIndexDefinition,
+				NeighbourhoodAlgorithm,
+				PathIndexAlgorithm,
+				ReachabilityAlgorithm,
+			},
+			graph::{TraversalDirection, TraversalSemantics},
+			syn::GraphIndexFamilyName,
+		};
+		let graph = self.catalog.graph(&definition.graph.value)?;
+		let algorithm =
+			definition.algorithm.as_ref().map(|(name, _)| name.value.to_ascii_uppercase());
+		let parameter = definition.algorithm.as_ref().and_then(|(_, parameter)| *parameter);
+		let narrow = |value: u32| {
+			u16::try_from(value).map_err(|_error| {
+				self.semantic("Graph algorithm parameter exceeds u16.", definition.name.span)
+			})
+		};
+		let narrow_byte = |value: u32| {
+			u8::try_from(value).map_err(|_error| {
+				self.semantic("Graph algorithm parameter exceeds u8.", definition.name.span)
+			})
+		};
+		if parameter.is_some()
+			&& !matches!(
+				algorithm.as_deref(),
+				Some("GRAIL" | "FERRARI" | "BFL" | "SKETCH" | "LANDMARK" | "LANDMARK_SSSP")
+			) {
+			return Err(
+				self.semantic("This algorithm does not accept a parameter.", definition.name.span)
+			);
+		}
+		if definition.weighted && definition.cost.is_some() {
+			return Err(
+				self.semantic("WEIGHTED and COST cannot be combined.", definition.name.span)
+			);
+		}
+		if !matches!(definition.family, GraphIndexFamilyName::Path)
+			&& (definition.weighted || definition.cost.is_some() || !definition.patterns.is_empty())
+		{
+			return Err(
+				self.semantic("Costs and PATTERNS require a PATH index.", definition.name.span)
+			);
+		}
+		let options = match definition.family {
+			GraphIndexFamilyName::Reachability => GraphIndexDefinition::Reachability {
+				algorithm: match algorithm.as_deref().unwrap_or("AUTO") {
+					"AUTO" => ReachabilityAlgorithm::Auto,
+					"TREE_COVER" => ReachabilityAlgorithm::TreeCover,
+					"GRAIL" => ReachabilityAlgorithm::Grail(narrow_byte(parameter.unwrap_or(2))?),
+					"FERRARI" => {
+						ReachabilityAlgorithm::Ferrari(narrow_byte(parameter.unwrap_or(4))?)
+					}
+					"BFL" => ReachabilityAlgorithm::Bfl(narrow(parameter.unwrap_or(160))?),
+					"CHAIN_COVER" => ReachabilityAlgorithm::ChainCover,
+					"ON_DEMAND" => ReachabilityAlgorithm::OnDemand,
+					_ => {
+						return Err(
+							self.semantic("Unknown reachability algorithm.", definition.name.span)
+						);
+					}
+				},
+			},
+			GraphIndexFamilyName::Neighbourhood(radius) => GraphIndexDefinition::Neighbourhood {
+				radius,
+				algorithm: match algorithm.as_deref().unwrap_or("AUTO") {
+					"AUTO" => NeighbourhoodAlgorithm::Auto,
+					"EXACT" => NeighbourhoodAlgorithm::Exact,
+					"SKETCH" => {
+						NeighbourhoodAlgorithm::Sketch(narrow_byte(parameter.unwrap_or(12))?)
+					}
+					"LANDMARK" => {
+						NeighbourhoodAlgorithm::Landmark(narrow(parameter.ok_or_else(|| {
+							self.semantic("LANDMARK requires a count.", definition.name.span)
+						})?)?)
+					}
+					"ON_DEMAND" => NeighbourhoodAlgorithm::OnDemand,
+					_ => {
+						return Err(
+							self.semantic("Unknown neighbourhood algorithm.", definition.name.span)
+						);
+					}
+				},
+			},
+			GraphIndexFamilyName::Path => {
+				let algorithm = match algorithm.as_deref().unwrap_or("ON_DEMAND") {
+					"LANDMARK_SSSP" => {
+						PathIndexAlgorithm::LandmarkSssp(narrow(parameter.ok_or_else(|| {
+							self.semantic("LANDMARK_SSSP requires a count.", definition.name.span)
+						})?)?)
+					}
+					"PATTERN_CACHE" => PathIndexAlgorithm::PatternCache,
+					"ON_DEMAND" => PathIndexAlgorithm::OnDemand,
+					_ => {
+						return Err(
+							self.semantic("Unknown path index algorithm.", definition.name.span)
+						);
+					}
+				};
+				let cost = if let Some(function) = &definition.cost {
+					if function.namespace.value.as_ref() != "fn" || function.parameters.is_some() {
+						return Err(self.semantic(
+							"Graph COST requires fn::name without a signature qualifier.",
+							function.name.span,
+						));
+					}
+					let mut candidates = self.catalog.functions("fn", &function.name.value)?;
+					candidates.retain(|function| {
+						(function.parameters().len() == 1
+							|| matches!(algorithm, PathIndexAlgorithm::OnDemand)
+								&& function.parameters().len() == 2
+								&& function.parameters().nth(1).is_some_and(|parameter| {
+									parameter.value_type() == &Type::Number
+								}))
+							&& function.parameters().next().is_some_and(|parameter| {
+								matches!(
+									parameter.value_type(),
+									Type::Any | Type::AtomOccurrence(AtomKind::Edge)
+								)
+							})
+							&& matches!(
+								function.result(),
+								Type::Int | Type::Float | Type::Decimal | Type::Number
+							)
+							&& (matches!(algorithm, PathIndexAlgorithm::OnDemand)
+								|| function.effect() == FunctionEffect::Pure && function.is_cost())
+					});
+					if candidates.len() != 1 {
+						return Err(self.semantic(
+							"Graph COST must resolve uniquely to a numeric edge function; \
+							 materialization requires PURE COST.",
+							function.name.span,
+						));
+					}
+					let candidate = candidates.pop().ok_or_else(|| {
+						self.semantic("Graph COST function is absent.", function.name.span)
+					})?;
+					GraphIndexCost::Function {
+						function: candidate.id().ok_or_else(|| {
+							self.semantic("Graph COST function is unpublished.", function.name.span)
+						})?,
+						version: candidate.version(),
+					}
+				} else if definition.weighted {
+					GraphIndexCost::Weighted
+				} else {
+					GraphIndexCost::Hop
+				};
+				GraphIndexDefinition::Path {
+					algorithm,
+					cost,
+					patterns: definition
+						.patterns
+						.iter()
+						.map(|source| source.as_ref().into())
+						.collect(),
+				}
+			}
+		};
+		let mode = match definition
+			.projection
+			.as_ref()
+			.map(|name| name.value.to_ascii_uppercase())
+			.as_deref()
+			.unwrap_or("NODE")
+		{
+			"NODE" => TraversalSemantics::Node,
+			"ATOM" => TraversalSemantics::Atom,
+			_ => {
+				return Err(
+					self.semantic("Graph index MODE must be NODE or ATOM.", definition.name.span)
+				);
+			}
+		};
+		let direction = match definition
+			.direction
+			.as_ref()
+			.map(|name| name.value.to_ascii_uppercase())
+			.as_deref()
+			.unwrap_or("OUT")
+		{
+			"OUT" => TraversalDirection::Forward,
+			"IN" => TraversalDirection::Backward,
+			"BOTH" => TraversalDirection::Both,
+			_ => {
+				return Err(self.semantic(
+					"Graph index DIRECTION must be OUT, IN, or BOTH.",
+					definition.name.span,
+				));
+			}
+		};
+		let mut index =
+			GraphIndex::new(definition.name.value.as_ref(), options, definition.max_bytes)?
+				.with_mode(mode)
+				.with_direction(direction)
+				.with_edge_labels(definition.edge_labels.iter().map(|label| label.value.as_ref()))?
+				.with_maintenance_mode(if definition.deferred {
+					IndexMaintenanceMode::Deferred
+				} else {
+					IndexMaintenanceMode::Immediate
+				});
+		index.validate_family(graph.kind())?;
+		index.comment = definition.comment.as_ref().map(|comment| comment.as_ref().into());
+		index.validate()?;
+		Ok(LogicalSchemaStatement::DefineGraphIndex {
+			mode: definition.mode,
+			graph: definition.graph.value.clone(),
+			index,
+			concurrently: definition.concurrently,
+		})
+	}
+
 	fn define_index(
 		&self,
 		definition: &DefineIndexStatement,
 	) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		let (kind, fields, options) = match &definition.definition {
+			BasicIndexDefinition::Geometry {
+				field,
+				geometry_type,
+			} => {
+				let kind = geometry_type
+					.as_ref()
+					.map(|kind| kind.value.parse::<crate::values::GeometryKind>())
+					.transpose()?;
+				(
+					ClassIndexKind::Geometry,
+					vec![field.value.clone()],
+					ClassIndexOptions::Geometry(crate::datastore::GeometryIndexOptions::new(kind)),
+				)
+			}
 			BasicIndexDefinition::Standard(fields) => (
 				ClassIndexKind::Standard,
 				fields.iter().map(|field| field.value.clone()).collect(),
@@ -1761,6 +1998,15 @@ impl<'a> Analyzer<'a> {
 				class: class.value.clone(),
 				name: name.value.clone(),
 			}),
+			RemoveTarget::GraphIndex {
+				if_exists,
+				name,
+				graph,
+			} => Ok(LogicalSchemaStatement::RemoveGraphIndex {
+				if_exists: *if_exists,
+				graph: graph.value.clone(),
+				name: name.value.clone(),
+			}),
 		}
 	}
 
@@ -1999,6 +2245,13 @@ impl<'a> Analyzer<'a> {
 				class: class.value.clone(),
 				name: name.value.clone(),
 			},
+			InfoTarget::GraphIndex {
+				name,
+				graph,
+			} => LogicalSchemaStatement::InfoGraphIndex {
+				graph: graph.value.clone(),
+				name: name.value.clone(),
+			},
 		})
 	}
 
@@ -2057,12 +2310,42 @@ impl<'a> Analyzer<'a> {
 		};
 		let graph =
 			statement.graph.as_ref().map(|graph| self.graph_reference(graph, None)).transpose()?;
+		let custom_cost =
+			statement.custom_cost.as_ref().map(|name| self.path_cost_function(name)).transpose()?;
 		let mut current_type = traverse_source_item_type(&source);
 		let mut steps = Vec::with_capacity(statement.steps.len());
 		for step in &statement.steps {
 			let analyzed = self.traverse_step(&step.expression, step.span, &current_type)?;
 			current_type = traverse_step_output_type(&analyzed, current_type);
 			steps.push(analyzed);
+		}
+		if custom_cost.is_some() {
+			if statement.constraints.objective == Some(crate::syn::MatchPathObjective::Shortest)
+				|| steps.iter().any(|step| {
+					matches!(
+						step.kind,
+						TraverseStepKind::ShortestPath | TraverseStepKind::BellmanFord
+					)
+				}) {
+				return Err(self.semantic(
+					"TRAVERSE WITH COST requires weightedShortestPath/distanceTo or navigation.",
+					span,
+				));
+			}
+			if !steps.iter().any(|step| {
+				matches!(
+					step.kind,
+					TraverseStepKind::WeightedShortestPath
+						| TraverseStepKind::DistanceTo
+						| TraverseStepKind::Out
+						| TraverseStepKind::In
+						| TraverseStepKind::Both
+						| TraverseStepKind::InVertex
+						| TraverseStepKind::OutVertex
+				)
+			}) {
+				return Err(self.semantic("TRAVERSE WITH COST has no connector consumer.", span));
+			}
 		}
 		let mut result = Schema {
 			columns: vec![Column {
@@ -2107,6 +2390,7 @@ impl<'a> Analyzer<'a> {
 			constraints: statement.constraints.clone(),
 			source,
 			graph,
+			custom_cost,
 			steps,
 			result,
 			returning,
@@ -2149,6 +2433,7 @@ impl<'a> Analyzer<'a> {
 				constraints: crate::syn::MatchConstraints::default(),
 				source: LogicalTraverseSource::Expression(source),
 				graph: None,
+				custom_cost: None,
 				steps,
 				result: Schema {
 					columns: vec![Column {
@@ -2431,6 +2716,19 @@ impl<'a> Analyzer<'a> {
 	fn match_statement(&self, statement: &MatchStatement) -> FerrosGrynnResult<LogicalMatch> {
 		let graph = self.match_graph_reference(&statement.source)?;
 		let max_depth = self.match_max_depth(statement.max_depth.as_ref())?;
+		let global_cost = statement
+			.custom_cost
+			.as_ref()
+			.map(|function| self.path_cost_function(function))
+			.transpose()?;
+		if let Some(function) = &statement.custom_cost
+			&& !statement.patterns.iter().any(
+				|pattern| matches!(pattern, MatchPattern::Linear(pattern) if !pattern.steps.is_empty()),
+			) {
+			return Err(
+				self.semantic("WITH COST requires a linear connector path.", function.name.span)
+			);
+		}
 		let mut aliases = BTreeMap::new();
 		let mut bindings = Schema::default();
 		let mut patterns = Vec::with_capacity(statement.patterns.len());
@@ -2440,7 +2738,7 @@ impl<'a> Analyzer<'a> {
 					pattern,
 					original_index,
 					max_depth,
-					&statement.constraints,
+					(&statement.constraints, global_cost),
 					statement.atom,
 					statement.meta_scope,
 					&mut aliases,
@@ -2628,12 +2926,13 @@ impl<'a> Analyzer<'a> {
 		pattern: &MatchLinearPattern,
 		original_index: usize,
 		max_depth: u32,
-		global_constraints: &crate::syn::MatchConstraints,
+		global: (&crate::syn::MatchConstraints, Option<crate::gql::ir::LogicalPathCost>),
 		atom: bool,
 		meta_scope: MatchMetaScope,
 		aliases: &mut BTreeMap<Box<str>, MatchAlias>,
 		bindings: &mut Schema,
 	) -> FerrosGrynnResult<LogicalMatchPattern> {
+		let (global_constraints, global_cost) = global;
 		let path_column = pattern
 			.path_alias
 			.as_ref()
@@ -2669,9 +2968,13 @@ impl<'a> Analyzer<'a> {
 				aliases,
 				bindings,
 			)?;
-			if let Some(custom_cost) = &step.edge.custom_cost {
-				return Err(self.unsupported("MATCH COST", custom_cost.span));
-			}
+			let custom_cost = step
+				.edge
+				.custom_cost
+				.as_ref()
+				.map(|function| self.path_cost_function(function))
+				.transpose()?
+				.or(global_cost);
 			let mode = step
 				.edge
 				.constraints
@@ -2679,6 +2982,13 @@ impl<'a> Analyzer<'a> {
 				.or(global_constraints.mode)
 				.unwrap_or(MatchPathMode::Trail);
 			let objective = step.edge.constraints.objective.or(global_constraints.objective);
+			if custom_cost.is_some() && objective == Some(crate::syn::MatchPathObjective::Shortest)
+			{
+				return Err(self.semantic(
+					"COST requires WEIGHTED SHORTEST or path enumeration.",
+					step.edge.span,
+				));
+			}
 			let filters = if step.edge.constraints.filters.is_empty() {
 				global_constraints.filters.clone()
 			} else {
@@ -2712,6 +3022,7 @@ impl<'a> Analyzer<'a> {
 					max: maximum,
 					mode,
 					objective,
+					custom_cost,
 					filters,
 					path_column,
 				}));
@@ -2728,6 +3039,7 @@ impl<'a> Analyzer<'a> {
 					edge,
 					target: target.clone(),
 					direction: step.direction,
+					custom_cost,
 					filters,
 				}));
 			}
@@ -2740,6 +3052,74 @@ impl<'a> Analyzer<'a> {
 				ops,
 			}),
 			original_index,
+		})
+	}
+
+	/// Captures the ordinary named PURE COST plan; two-argument functions are
+	/// valid exact consumers but cannot bind an additive landmark artifact.
+	fn path_cost_function(
+		&self,
+		name: &FunctionSignatureName,
+	) -> FerrosGrynnResult<crate::gql::ir::LogicalPathCost> {
+		let span = name.name.span;
+		if name.namespace.value.as_ref() != "fn" || name.parameters.is_some() {
+			return Err(self.semantic("COST requires fn::name without a signature.", span));
+		}
+		let mut candidates = self.named_function_candidates(&name.name.value)?;
+		candidates.retain(|function| {
+			let mut parameters = function.parameters();
+			function.effect() == FunctionEffect::Pure
+				&& function.is_cost()
+				&& matches!(
+					function.result(),
+					Type::Int | Type::Float | Type::Decimal | Type::Number
+				)
+				&& matches!(parameters.len(), 1 | 2)
+				&& parameters.next().is_some_and(|parameter| {
+					matches!(
+						parameter.value_type(),
+						Type::Any | Type::AtomOccurrence(AtomKind::Edge)
+					)
+				})
+				&& parameters.next().is_none_or(|parameter| parameter.value_type() == &Type::Number)
+		});
+		if candidates.len() != 1 {
+			return Err(self.semantic(
+				"COST must resolve uniquely to PURE COST fn(edge [, number]) -> number.",
+				span,
+			));
+		}
+		let function = candidates.pop().ok_or_else(|| self.semantic("COST is absent.", span))?;
+		let key = NamedFunctionKey {
+			id: function.id().ok_or_else(|| self.semantic("COST is unpublished.", span))?,
+			version: function.version(),
+			schema_epoch: self.catalog.schema_epoch(),
+			max_depth: function.max_depth(),
+			effect: function.effect(),
+		};
+		if self.function_stack.contains(&key.id) {
+			Self::validate_recursive_cycle(
+				self.catalog,
+				&self.function_stack,
+				&function,
+				span,
+				self,
+			)?;
+		} else if let Some(cache) = self.function_cache
+			&& cache.cached_named(key).is_none()
+		{
+			let plan = compile_named_function(
+				self.catalog,
+				&function,
+				&self.function_stack,
+				&self.function_overrides,
+				self.function_cache,
+			)?;
+			cache.cache_named_plan(&plan)?;
+		}
+		Ok(crate::gql::ir::LogicalPathCost {
+			function: key,
+			stateful: function.parameters().len() == 2,
 		})
 	}
 
@@ -4397,6 +4777,59 @@ impl<'a> Analyzer<'a> {
 				argument_names,
 				arguments,
 			} => {
+				if builtin_name(callee).is_some_and(|(namespace, name)| {
+					namespace.eq_ignore_ascii_case("path") && name.eq_ignore_ascii_case("cost")
+				}) && arguments.len() == 2
+				{
+					if *distinct
+						|| type_argument.is_some()
+						|| argument_names.iter().any(Option::is_some)
+					{
+						return Err(
+							self.semantic("path::cost does not accept call modifiers.", expr.span)
+						);
+					}
+					let cost_expr = &arguments[1];
+					let Some(("fn", name)) = builtin_name(cost_expr) else {
+						return Err(self.semantic(
+							"path::cost requires a named PURE COST fn::name.",
+							cost_expr.span,
+						));
+					};
+					let cost = self.path_cost_function(&FunctionSignatureName {
+						namespace: Identifier {
+							value: "fn".into(),
+							span: cost_expr.span,
+							quoted: false,
+						},
+						name: Identifier {
+							value: name.into(),
+							span: cost_expr.span,
+							quoted: false,
+						},
+						parameters: None,
+					})?;
+					let path = self.expr_context(
+						&arguments[0],
+						schema,
+						allow_current_field,
+						allow_aggregates,
+						aggregate_depth,
+					)?;
+					self.validate_builtin_arguments(
+						"path::cost",
+						std::slice::from_ref(&path),
+						expr.span,
+					)?;
+					return Ok(TypedExpr {
+						kind: TypedExprKind::Builtin {
+							function: Builtin::PathCostWith(cost),
+							arguments: vec![path],
+						},
+						ty: Type::Number,
+						span: expr.span,
+					});
+				}
 				if let Some(function) = aggregate_name(callee) {
 					if !allow_aggregates {
 						return Err(self.semantic(
@@ -5045,7 +5478,9 @@ impl<'a> Analyzer<'a> {
 				let option_element = match options {
 					ClassIndexOptions::Hnsw(options) => options.element(),
 					ClassIndexOptions::DiskAnn(options) => options.element(),
-					ClassIndexOptions::Scalar | ClassIndexOptions::Fulltext(_) => return None,
+					ClassIndexOptions::Scalar
+					| ClassIndexOptions::Fulltext(_)
+					| ClassIndexOptions::Geometry(_) => return None,
 				};
 				(index.fields().next().is_some_and(|field| field.as_str() == origin.field.as_ref())
 					&& index_scope_matches(index.scope(), origin.scope)
@@ -5162,13 +5597,8 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
-	fn named_function(
-		&self,
-		name: &str,
-		argument_names: &[Option<Identifier>],
-		arguments: Vec<TypedExpr>,
-		span: TextSpan,
-	) -> FerrosGrynnResult<(TypedExprKind, Type)> {
+	/// Merges catalog definitions with the current function compilation scope.
+	fn named_function_candidates(&self, name: &str) -> FerrosGrynnResult<Vec<Arc<SchemaFunction>>> {
 		let mut candidates = self.catalog.functions("fn", name)?;
 		for override_function in
 			self.function_overrides.values().filter(|function| function.name().as_str() == name)
@@ -5185,9 +5615,9 @@ impl<'a> Analyzer<'a> {
 			});
 			candidates.push(Arc::clone(override_function));
 		}
-		if let Some(current) = self.current_function.as_ref().filter(|function| {
-			function.name().as_str() == name && function.parameters().len() == arguments.len()
-		}) {
+		if let Some(current) =
+			self.current_function.as_ref().filter(|function| function.name().as_str() == name)
+		{
 			let current_signature =
 				current.parameters().map(SchemaFunctionParameter::value_type).collect::<Vec<_>>();
 			candidates.retain(|candidate| {
@@ -5198,6 +5628,17 @@ impl<'a> Analyzer<'a> {
 			});
 			candidates.push(Arc::clone(current));
 		}
+		Ok(candidates)
+	}
+
+	fn named_function(
+		&self,
+		name: &str,
+		argument_names: &[Option<Identifier>],
+		arguments: Vec<TypedExpr>,
+		span: TextSpan,
+	) -> FerrosGrynnResult<(TypedExprKind, Type)> {
+		let candidates = self.named_function_candidates(name)?;
 		let mut ranked = candidates
 			.into_iter()
 			.filter(|function| function.parameters().len() == arguments.len())
@@ -5394,6 +5835,9 @@ impl<'a> Analyzer<'a> {
 			}
 			"math::sqrt" => (Builtin::MathSqrt, 1, Type::Float),
 			"math::pow" => (Builtin::MathPow, 2, Type::Number),
+			"geo::within" => (Builtin::GeoWithin, 2, Type::Bool),
+			"geo::intersects" => (Builtin::GeoIntersects, 2, Type::Bool),
+			"geo::distance" => (Builtin::GeoDistance, 2, Type::Float),
 			"math::floor" => (Builtin::MathFloor, 1, Type::Float),
 			"math::ceil" => (Builtin::MathCeil, 1, Type::Float),
 			"string::upper" => (Builtin::StringUpper, 1, Type::String),
@@ -5563,6 +6007,9 @@ impl<'a> Analyzer<'a> {
 				vec![BuiltinArgument::Number]
 			}
 			"math::pow" => vec![BuiltinArgument::Number, BuiltinArgument::Number],
+			"geo::within" | "geo::intersects" | "geo::distance" => {
+				vec![BuiltinArgument::Geometry, BuiltinArgument::Geometry]
+			}
 			"string::upper" | "string::lower" | "string::len" => {
 				vec![BuiltinArgument::String]
 			}
@@ -5631,6 +6078,42 @@ impl<'a> Analyzer<'a> {
 		span: TextSpan,
 	) -> FerrosGrynnResult<Type> {
 		match op {
+			BinaryOperator::Inside
+			| BinaryOperator::NotInside
+			| BinaryOperator::Outside
+			| BinaryOperator::Intersects => {
+				if [left, right].into_iter().all(|ty| {
+					matches!(ty, Type::Geometry | Type::Any | Type::None | Type::Null)
+						|| matches!(ty, Type::Option(inner) if matches!(inner.as_ref(), Type::Geometry | Type::Any))
+				}) {
+					Ok(Type::Bool)
+				} else {
+					Err(self.semantic("Spatial operators require geometry operands.", span))
+				}
+			}
+			BinaryOperator::AllInside | BinaryOperator::AnyInside | BinaryOperator::NoneInside => {
+				let element = match left {
+					Type::Array(element) | Type::Set(element) => element.as_ref(),
+					Type::Any | Type::None | Type::Null => left,
+					_ => {
+						return Err(
+							self.semantic("Spatial quantifiers require an array or set.", span)
+						);
+					}
+				};
+				if [element, right]
+					.into_iter()
+					.all(|ty| matches!(ty, Type::Geometry | Type::Any | Type::None | Type::Null))
+				{
+					Ok(Type::Bool)
+				} else {
+					Err(self.semantic(
+						"Spatial quantifiers require geometry elements and a geometry right \
+						 operand.",
+						span,
+					))
+				}
+			}
 			BinaryOperator::Power
 			| BinaryOperator::Multiply
 			| BinaryOperator::Divide
@@ -5749,6 +6232,7 @@ impl<'a> Analyzer<'a> {
 			"decimal" => Type::Decimal,
 			"string" => Type::String,
 			"duration" => Type::Duration,
+			"geometry" => Type::Geometry,
 			"datetime" => Type::DateTime,
 			"bytes" => Type::Bytes,
 			"array" => Type::Array(Box::new(Type::Any)),
@@ -5960,22 +6444,13 @@ fn logical_statement_effect(statement: &LogicalStatement) -> ClosureEffect {
 				ClosureEffect::StableRead
 			}
 		}
-		LogicalStatement::Schema(statement) => match statement {
-			LogicalSchemaStatement::InfoDatabase
-			| LogicalSchemaStatement::InfoClass {
-				..
+		LogicalStatement::Schema(statement) => {
+			if statement.statement_kind() == crate::gql::QueryStatementKind::Info {
+				ClosureEffect::StableRead
+			} else {
+				ClosureEffect::SchemaMutation
 			}
-			| LogicalSchemaStatement::InfoIndex {
-				..
-			}
-			| LogicalSchemaStatement::InfoParameter {
-				..
-			}
-			| LogicalSchemaStatement::InfoFunction {
-				..
-			} => ClosureEffect::StableRead,
-			_ => ClosureEffect::SchemaMutation,
-		},
+		}
 		LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => ClosureEffect::DataMutation,
 		LogicalStatement::BuildGraph(build) => {
 			if build.name.is_some() {
@@ -6293,6 +6768,7 @@ fn search_slot_argument(
 #[derive(Clone, Copy)]
 enum BuiltinArgument {
 	Any,
+	Geometry,
 	Number,
 	Integer,
 	String,
@@ -6308,10 +6784,14 @@ enum BuiltinArgument {
 }
 
 impl BuiltinArgument {
-	const fn accepts(self, ty: &Type) -> bool {
+	fn accepts(self, ty: &Type) -> bool {
 		matches!(ty, Type::Any)
 			|| match self {
 				Self::Any => true,
+				Self::Geometry => {
+					matches!(ty, Type::Geometry | Type::None | Type::Null)
+						|| matches!(ty, Type::Option(inner) if matches!(inner.as_ref(), Type::Geometry | Type::Any))
+				}
 				Self::Number => is_number(ty),
 				Self::Integer => is_integer(ty),
 				Self::String => matches!(ty, Type::String),
@@ -6332,6 +6812,7 @@ impl BuiltinArgument {
 	const fn name(self) -> &'static str {
 		match self {
 			Self::Any => "any",
+			Self::Geometry => "geometry",
 			Self::Number => "number",
 			Self::Integer => "integer",
 			Self::String => "string",
@@ -6557,6 +7038,9 @@ pub(in crate::gql) fn compile_named_function(
 	overrides: &BTreeMap<FunctionId, Arc<SchemaFunction>>,
 	function_cache: Option<&LanguageClosureState>,
 ) -> FerrosGrynnResult<LogicalClosure> {
+	let _admission = function_cache
+		.map(|cache| cache.admit_compile(function_compile_source_bytes(function)?))
+		.transpose()?;
 	let parameters = function
 		.parameters()
 		.map(|parameter| {
@@ -6615,6 +7099,35 @@ pub(in crate::gql) fn compile_named_function(
 		effect: function.effect(),
 	});
 	Ok(closure)
+}
+
+/// Counts a conservative source extent without constructing the signature.
+fn function_compile_source_bytes(function: &SchemaFunction) -> FerrosGrynnResult<usize> {
+	let mut bytes = function.body().len().checked_add(32);
+	for parameter in function.parameters() {
+		bytes = bytes
+			.and_then(|bytes| parameter.name().len().checked_mul(2)?.checked_add(bytes))
+			.and_then(|bytes| bytes.checked_add(16))
+			.and_then(|bytes| {
+				bytes.checked_add(function_type_source_bytes(parameter.value_type()))
+			});
+	}
+	bytes
+		.and_then(|bytes| bytes.checked_add(function_type_source_bytes(function.result())))
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("function source extent"))
+}
+
+/// Parser-supported nested types contain one child and require no traversal
+/// heap.
+fn function_type_source_bytes(mut value: &Type) -> usize {
+	let mut bytes = 32_usize;
+	while let Type::Array(inner) | Type::Set(inner) | Type::Range(inner) | Type::Option(inner) =
+		value
+	{
+		bytes = bytes.saturating_add(8);
+		value = inner;
+	}
+	bytes
 }
 
 fn function_source_type(value: &Type) -> FerrosGrynnResult<String> {
@@ -6884,7 +7397,7 @@ fn traverse_step_output_type(step: &LogicalTraverseStep, current: Type) -> Type 
 		TraverseStepKind::Path
 		| TraverseStepKind::ShortestPath
 		| TraverseStepKind::WeightedShortestPath => Type::Path,
-		TraverseStepKind::Count => Type::Int,
+		TraverseStepKind::Count | TraverseStepKind::KHopEstimate => Type::Int,
 		TraverseStepKind::Sum
 		| TraverseStepKind::Minimum
 		| TraverseStepKind::Maximum
@@ -6949,6 +7462,7 @@ fn traverse_step_kind(name: &str) -> Option<TraverseStepKind> {
 		"max" => TraverseStepKind::Maximum,
 		"avg" => TraverseStepKind::Average,
 		"khop" => TraverseStepKind::KHop,
+		"khopestimate" => TraverseStepKind::KHopEstimate,
 		"reachable" => TraverseStepKind::Reachable,
 		"shortestpath" => TraverseStepKind::ShortestPath,
 		"weightedshortestpath" => TraverseStepKind::WeightedShortestPath,
@@ -7014,6 +7528,7 @@ const fn traverse_step_arity(kind: TraverseStepKind) -> std::ops::RangeInclusive
 		| TraverseStepKind::Limit
 		| TraverseStepKind::Skip
 		| TraverseStepKind::KHop
+		| TraverseStepKind::KHopEstimate
 		| TraverseStepKind::Reachable
 		| TraverseStepKind::ShortestPath
 		| TraverseStepKind::WeightedShortestPath
@@ -7291,7 +7806,9 @@ fn vector_distance_matches(options: ClassIndexOptions, distance: &LogicalKnnDist
 	let actual = match options {
 		ClassIndexOptions::Hnsw(options) => options.distance(),
 		ClassIndexOptions::DiskAnn(options) => options.distance(),
-		ClassIndexOptions::Scalar | ClassIndexOptions::Fulltext(_) => return false,
+		ClassIndexOptions::Scalar
+		| ClassIndexOptions::Fulltext(_)
+		| ClassIndexOptions::Geometry(_) => return false,
 	};
 	expected.is_some_and(|expected| expected == actual)
 }

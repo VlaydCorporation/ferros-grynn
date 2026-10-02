@@ -50,6 +50,14 @@ pub enum EdgeEndpoint {
 }
 
 impl EdgeEndpoint {
+	/// Returns the kind of the endpoint while preserving its qualified scope.
+	pub(crate) const fn kind(&self) -> Option<crate::graph::AtomKind> {
+		match self {
+			Self::Local(atom) => atom.kind(),
+			Self::Nested(qualified) => qualified.atom().kind(),
+		}
+	}
+
 	pub const fn local_id(&self) -> Option<AtomId> {
 		match self {
 			Self::Local(id) => Some(*id),
@@ -194,6 +202,15 @@ impl EdgeTopology {
 
 	pub fn endpoints(&self) -> impl Iterator<Item = &EdgeEndpoint> {
 		self.source().iter().chain(self.target())
+	}
+
+	/// Enumerates distinct-side edge endpoint keys for synchronous postings.
+	pub(crate) fn edge_endpoint_sides(&self) -> impl Iterator<Item = (&EdgeEndpoint, bool)> {
+		self.source()
+			.iter()
+			.map(|endpoint| (endpoint, false))
+			.chain(self.target().iter().map(|endpoint| (endpoint, true)))
+			.filter(|(endpoint, _)| endpoint.kind() == Some(crate::graph::AtomKind::Edge))
 	}
 
 	pub fn endpoint_count(&self) -> usize {

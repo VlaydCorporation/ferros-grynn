@@ -1,7 +1,9 @@
 mod connectivity;
 mod cuts;
 mod index;
+mod landmark;
 mod lca;
+mod relation;
 mod shortest_paths;
 mod spanning;
 
@@ -28,10 +30,18 @@ pub(crate) use connectivity::{
 };
 pub(crate) use cuts::find_cuts_with_check;
 pub use cuts::{CutSet, find_cuts};
+pub(crate) use index::visit_endpoint_steps;
 pub use index::{TraversalDirection, TraversalIndex, TraversalSemantics, TraversalStep};
+pub use landmark::{
+	DirectedLandmarks,
+	DistanceInterval,
+	LandmarkBuildLimits,
+	LandmarkDistanceRows,
+};
 pub use lca::BinaryLiftingIndex;
-pub use shortest_paths::{ShortestPaths, bellman_ford, dijkstra};
-pub(crate) use shortest_paths::{bellman_ford_with_check, dijkstra_with_check};
+pub(crate) use relation::{ProjectedCondensation, ProjectedRelation, RelationCsr};
+pub(crate) use shortest_paths::bellman_ford_with_check;
+pub use shortest_paths::{ShortestPaths, bellman_ford, dijkstra, dijkstra_to_with_control};
 pub(crate) use spanning::minimum_spanning_forest_with_check;
 pub use spanning::{SpanningForest, minimum_spanning_forest, minimum_spanning_tree};
 
@@ -145,6 +155,22 @@ mod tests {
 
 		assert_eq!(checks, 5);
 		assert_eq!(error.status().code().to_string(), "FG-50F05");
+	}
+
+	#[test]
+	fn scc_keeps_one_way_siblings_separate() {
+		let mut graph = Graph::<Mutable>::new();
+		let first = graph.add_node(None, PropertyMap::new()).unwrap();
+		let second = graph.add_node(None, PropertyMap::new()).unwrap();
+		let third = graph.add_node(None, PropertyMap::new()).unwrap();
+		for (source, target) in [(first, second), (first, third), (second, third)] {
+			graph
+				.add_edge(EdgeTopology::directed([source], [target]), None, PropertyMap::new())
+				.unwrap();
+		}
+		let components = strongly_connected_components(&graph).unwrap();
+		assert_eq!(components.len(), 3);
+		assert!(components.iter().all(|component| component.len() == 1));
 	}
 
 	#[test]

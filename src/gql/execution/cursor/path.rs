@@ -63,6 +63,18 @@ impl MatchPathTrace {
 	) -> FerrosGrynnResult<Path> {
 		self.arena.materialize(end, origin, snapshot)
 	}
+
+	/// Admits the public result before cloning its immutable trace steps.
+	pub(in crate::gql::execution) fn materialize_with_admission(
+		&self,
+		end: PathTraceId,
+		origin: crate::values::Uuid,
+		snapshot: crate::graph::SnapshotId,
+		admit: &mut impl FnMut(usize) -> FerrosGrynnResult<()>,
+		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Path> {
+		self.arena.materialize_with_admission(end, origin, snapshot, admit, check)
+	}
 }
 
 /// Starts one named path after its seed endpoint has been bound.
@@ -406,13 +418,7 @@ impl<Graph: GraphRead> RowCursor for PathExpandCursor<'_, Graph> {
 				continue;
 			};
 			control.record_path_expansion()?;
-			if candidate.target.kind()
-				!= Some(match self.expand.target.domain {
-					EndpointDomain::Node => AtomKind::Node,
-					EndpointDomain::Edge => AtomKind::Edge,
-				})
-				|| !self.accepts_candidate(&candidate, control)?
-			{
+			if !self.accepts_candidate(&candidate, control)? {
 				continue;
 			}
 			let closes_simple = self.expand.path_mode == crate::syn::MatchPathMode::Simple
@@ -480,21 +486,17 @@ pub(in crate::gql::execution) fn path_row<Graph: GraphRead>(
 	)? {
 		return Ok(None);
 	}
+	let mut cost = Number::Int(0);
 	for hop in hops {
-		append_trace_hop(
-			&mut row,
-			hop,
-			graph,
-			graph_ref,
-			trace,
-			path_hop_weight(graph, expand, hop)?,
-			control,
-		)?;
+		let contribution = path_hop_cost(graph, graph_ref, expand, hop, cost, predicate, control)?;
+		cost = add_path_cost(cost, contribution)?;
+		append_trace_hop(&mut row, hop, graph, graph_ref, trace, contribution, control)?;
 	}
 	row.current = Some(BoundAtom::new(graph_ref.id(), target));
 	if trace.is_some() {
 		return Ok(Some(row));
 	}
+	row.trace_cost = cost;
 	let Some(column) = expand.path_column else {
 		return Ok(Some(row));
 	};
@@ -522,12 +524,8 @@ pub(in crate::gql::execution) fn path_row<Graph: GraphRead>(
 			hop.role,
 		));
 	}
-	let path = Value::Path(Box::new(Path::new(
-		graph.identity(),
-		graph.snapshot_id(),
-		steps,
-		Some(path_cost(graph, expand, hops)?),
-	)));
+	let path =
+		Value::Path(Box::new(Path::new(graph.identity(), graph.snapshot_id(), steps, Some(cost))));
 	match row.values.get(column) {
 		Some(Value::None) => row.values[column] = path,
 		Some(existing) if existing == &path => {}
@@ -603,17 +601,119 @@ pub(in crate::gql::execution) fn path_candidate_allowed<Graph: GraphRead>(
 }
 
 /// Returns the exact contribution of one hop to the active path objective.
-pub(in crate::gql::execution) fn path_hop_weight<Graph: GraphRead>(
+pub(in crate::gql::execution) fn path_hop_cost<Graph: GraphRead>(
 	graph: &Graph,
+	graph_ref: &Arc<GraphRef>,
 	expand: &ResolvedPathExpand,
 	candidate: &TraversalCandidate,
+	prefix: Number,
+	predicate: MatchPredicateContext<'_>,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Number> {
+	if let Some(cost) = expand.custom_cost {
+		let edge = graph.atom_ref(candidate.edge)?.ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist("edge", candidate.edge.to_string())
+		})?;
+		return custom_path_contribution(
+			cost,
+			AtomOccurrenceRef::new(edge, graph_ref.clone()),
+			prefix,
+			predicate,
+			control,
+		);
+	}
+	path_edge_weight(graph, expand, candidate.edge)
+}
+
+/// Evaluates the unit or custom contribution of a fixed one-hop segment.
+pub(in crate::gql::execution) fn fixed_hop_cost<Graph: GraphRead>(
+	graph: &Graph,
+	graph_ref: &Arc<GraphRef>,
+	expand: &ResolvedExpand,
+	edge: AtomId,
+	predicate: MatchPredicateContext<'_>,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Number> {
+	let Some(cost) = expand.custom_cost else {
+		return Ok(Number::Int(1));
+	};
+	let edge = graph
+		.atom_ref(edge)?
+		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", edge.to_string()))?;
+	custom_path_contribution(
+		cost,
+		AtomOccurrenceRef::new(edge, graph_ref.clone()),
+		Number::Int(0),
+		predicate,
+		control,
+	)
+}
+
+/// Recomputes a path in connector order without retaining intermediate rows.
+pub(in crate::gql::execution) fn custom_path_cost(
+	path: &crate::graph::Path,
+	cost: crate::gql::ir::LogicalPathCost,
+	predicate: MatchPredicateContext<'_>,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Number> {
+	predicate.fields.validate_path(path, control)?;
+	let mut prefix = Number::Int(0);
+	for connector in path.edges() {
+		control.check()?;
+		let contribution =
+			custom_path_contribution(cost, connector.clone(), prefix, predicate, control)?;
+		prefix = add_path_cost(prefix, contribution)?;
+	}
+	Ok(prefix)
+}
+
+/// Invokes the same cached, typed PURE plan as an ordinary named UDF call.
+pub(in crate::gql::execution) fn custom_path_contribution(
+	cost: crate::gql::ir::LogicalPathCost,
+	edge: AtomOccurrenceRef,
+	prefix: Number,
+	predicate: MatchPredicateContext<'_>,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Number> {
+	let plan = control.resolve_named_function(cost.function)?;
+	let _frame = control.enter_named_function(cost.function)?;
+	let arguments = [Value::from(edge), Value::Number(prefix)];
+	let arguments = &arguments[..if cost.stateful {
+		2
+	} else {
+		1
+	}];
+	let Value::Number(contribution) = invoke_logical_closure_with_fields(
+		control,
+		&plan,
+		&[],
+		arguments,
+		predicate.source,
+		Some(predicate.fields),
+	)?
+	else {
+		return Err(FerrosGrynnError::invalid_argument("MATCH COST must return a number"));
+	};
+	if !crate::math::number_is_finite(contribution) || contribution < Number::Int(0) {
+		return Err(FerrosGrynnError::invalid_argument(
+			"MATCH COST requires finite, non-negative contributions",
+		));
+	}
+	Ok(contribution)
+}
+
+/// Returns the exact stored weight or unit hop contribution.
+pub(in crate::gql::execution) fn path_edge_weight<Graph: GraphRead>(
+	graph: &Graph,
+	expand: &ResolvedPathExpand,
+	edge: AtomId,
 ) -> FerrosGrynnResult<Number> {
 	if expand.objective != Some(crate::syn::MatchPathObjective::WeightedShortest) {
 		return Ok(Number::Int(1));
 	}
 	let weight = graph
-		.edge(candidate.edge)?
-		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", candidate.edge.to_string()))?
+		.edge(edge)?
+		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", edge.to_string()))?
 		.weight()
 		.unwrap_or(Number::Int(1));
 	let invalid = match weight {
@@ -641,14 +741,4 @@ pub(in crate::gql::execution) fn add_path_cost(
 		));
 	};
 	Ok(result)
-}
-
-fn path_cost<Graph: GraphRead>(
-	graph: &Graph,
-	expand: &ResolvedPathExpand,
-	hops: &[TraversalCandidate],
-) -> FerrosGrynnResult<Number> {
-	hops.iter().try_fold(Number::Int(0), |cost, hop| {
-		add_path_cost(cost, path_hop_weight(graph, expand, hop)?)
-	})
 }

@@ -20,6 +20,8 @@ fn base_statistics_round_trip_keeps_split_ranges() -> FerrosGrynnResult<()> {
 		scope: StatisticsScope::Base,
 	};
 	statistics.property_histograms.insert(histogram_key, PropertyHistogram {
+		mbr_sample: Vec::new(),
+		mbr_population: 0,
 		type_tag: crate::values::storage::TypeTag::Int.byte(),
 		method: HistogramMethod::Exact,
 		sample_count: 3,

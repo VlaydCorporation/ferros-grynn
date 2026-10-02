@@ -543,8 +543,27 @@ warning `statistics_stale`. Отсутствие даёт warning `statistics_mi
 `WITH INDEX source.i, source.j` задаёт разрешённый candidate set данного source; optimizer обязан
 выбрать один transaction-visible совместимый `Ready` index. Missing/stale/prepared/wrong-scope
 forced candidate даёт typed planning error до row pull. Без hint недоступность secondary index
-даёт scan fallback и explain warning. `WITH COST fn` остаётся будущей пользовательской
-path-cost функцией для MATCH/TRAVERSE.
+даёт scan fallback и explain warning. MATCH `IN GRAPH ... WITH COST fn::name` нормализуется
+в тот же versioned PURE LogicalPathCost, что и local COST: local override, fixed/variable
+segments, scoped occurrences и stateful ON_DEMAND сохраняются. Fixed physical operators
+включают cost identity/version/schema epoch/stateful flag в PlanHash encoding version 5.
+TRAVERSE `FROM ... [IN GRAPH ...] WITH COST fn::name` захватывает тот же contract.
+Navigation суммирует connector contributions с prefix traverser; seed-local custom weighted
+path/distance начинает отдельный NODE segment с prefix 0, в том числе в TRAVERSE ATOM.
+Unary COST выбирает compatible Ready NODE/OUT/function-version artifact без labels;
+stateful COST использует exact full-state cursor. OUT включает undirected incidence.
+Custom search применяет mode/filters и canonical full-path ties; TRAIL ограничен числом
+connectors, ACYCLIC — nodes−1, SIMPLE — nodes, WALK — checked u32 и общими budgets.
+Для структурно unreachable WALK bounded BFS завершает поиск до COST reduction;
+cycles/filters могут исчерпать бюджет, что даёт typed error без partial answer.
+HOP shortestPath/SHORTEST и BellmanFord с глобальным COST отклоняются при analysis.
+Physical hash включает COST key и constraints; EXPLAIN показывает capture/refinement/fallback.
+
+`path::cost(path, fn::name)` захватывает тот же LogicalPathCost при analysis. Общий
+occurrence-field resolver проверяет origin/snapshot/membership перед потоковым reduction;
+connector expansion budget и PURE call/depth/cancellation control сохраняются. Stateful prefix
+относится ко всему supplied Path. Expression не constant-fold-ится и получает query reader
+также в standalone RETURN, SELECT и traversal closure. Stored одноаргументный cost не читает storage.
 
 ### 6.6. Plan caching
 

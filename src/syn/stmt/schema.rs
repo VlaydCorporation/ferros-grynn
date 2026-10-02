@@ -97,6 +97,10 @@ pub enum BasicIndexDefinition {
 	Standard(Vec<Identifier>),
 	Unique(Vec<Identifier>),
 	Count,
+	Geometry {
+		field: Identifier,
+		geometry_type: Option<Identifier>,
+	},
 	Fulltext {
 		field: Identifier,
 		analyzer: Identifier,
@@ -144,6 +148,52 @@ pub struct DefineIndexStatement {
 	pub definition: BasicIndexDefinition,
 	pub scope: IndexScopeName,
 	pub concurrently: bool,
+	pub deferred: bool,
+}
+
+/// Parsed graph-owned index family and optional radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphIndexFamilyName {
+	/// Shortest-path or bounded pattern acceleration.
+	Path,
+	/// Unbounded reachability of the selected projection.
+	Reachability,
+	/// Maximum neighbourhood radius.
+	Neighbourhood(u32),
+}
+
+/// Graph-owned `DEFINE INDEX` syntax before catalog resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefineGraphIndexStatement {
+	/// Conflict behavior.
+	pub mode: DefinitionMode,
+	/// Graph-local index name.
+	pub name: Identifier,
+	/// Named graph owner.
+	pub graph: Identifier,
+	/// Kind and optional maximum radius.
+	pub family: GraphIndexFamilyName,
+	/// Optional algorithm and numeric parameter.
+	pub algorithm: Option<(Identifier, Option<u32>)>,
+	/// Optional NODE/ATOM projection; NODE is the default.
+	pub projection: Option<Identifier>,
+	/// Optional OUT/IN/BOTH direction; OUT is the default.
+	pub direction: Option<Identifier>,
+	/// Exact connector label filter.
+	pub edge_labels: Vec<Identifier>,
+	/// Built-in weighted path cost.
+	pub weighted: bool,
+	/// Versioned custom path cost name.
+	pub cost: Option<FunctionSignatureName>,
+	/// Parameter-free pattern source strings.
+	pub patterns: Vec<Box<str>>,
+	/// Pages and metadata budget.
+	pub max_bytes: Option<u64>,
+	/// Optional durable comment.
+	pub comment: Option<Box<str>>,
+	/// Background initial build.
+	pub concurrently: bool,
+	/// Deferred maintenance scheduling.
 	pub deferred: bool,
 }
 
@@ -255,6 +305,12 @@ pub enum ParameterCommentChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RemoveTarget {
+	/// Removes a graph-owned user definition.
+	GraphIndex {
+		if_exists: bool,
+		name: Identifier,
+		graph: Identifier,
+	},
 	Analyzer {
 		if_exists: bool,
 		name: Identifier,
@@ -349,6 +405,11 @@ pub struct AlterStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InfoTarget {
+	/// Reads a graph-owned user or engine index definition.
+	GraphIndex {
+		name: Identifier,
+		graph: Identifier,
+	},
 	Database,
 	Analyzer(Identifier),
 	Function(FunctionSignatureName),
@@ -743,14 +804,15 @@ impl Parser<'_> {
 		})
 	}
 
-	pub(in crate::syn) fn define_index_statement(
-		&mut self,
-	) -> FerrosGrynnResult<DefineIndexStatement> {
+	pub(in crate::syn) fn define_index_statement(&mut self) -> FerrosGrynnResult<StatementKind> {
 		let mode = self.definition_mode()?;
 		let name = self.identifier()?;
 		self.expect_keyword(keywords::ON, "Expected `ON` after index name.")?;
-		if self.consume_keyword(keywords::GRAPH).is_some() {
-			return Err(self.unsupported("graph index", self.previous_span()));
+		if !self.at_keyword(keywords::CLASS) {
+			self.consume_keyword(keywords::GRAPH);
+			return self
+				.define_graph_index_statement(mode, name)
+				.map(StatementKind::DefineGraphIndex);
 		}
 		self.expect_keyword(keywords::CLASS, "Expected `CLASS` after `ON`.")?;
 		let class = self.identifier()?;
@@ -860,8 +922,15 @@ impl Parser<'_> {
 					alpha_bits: alpha.to_bits(),
 					hashed_vector: self.consume_keyword(keywords::HASHED_VECTOR).is_some(),
 				}
-			} else if self.at_keyword(keywords::GEOMETRY) {
-				return Err(self.unsupported(keywords::GEOMETRY, self.current().span));
+			} else if self.consume_keyword(keywords::GEOMETRY).is_some() {
+				BasicIndexDefinition::Geometry {
+					field: self.single_specialized_index_field(fields)?,
+					geometry_type: if self.consume_keyword(keywords::TYPE).is_some() {
+						Some(self.identifier()?)
+					} else {
+						None
+					},
+				}
 			} else {
 				BasicIndexDefinition::Standard(fields)
 			}
@@ -907,7 +976,7 @@ impl Parser<'_> {
 				return Err(self.unsupported(feature, self.current().span));
 			}
 		}
-		Ok(DefineIndexStatement {
+		Ok(StatementKind::DefineIndex(DefineIndexStatement {
 			mode,
 			name,
 			class,
@@ -915,6 +984,159 @@ impl Parser<'_> {
 			scope,
 			concurrently,
 			deferred,
+		}))
+	}
+
+	/// Parses graph clauses without resolving schema or algorithm semantics.
+	fn define_graph_index_statement(
+		&mut self,
+		mode: DefinitionMode,
+		name: Identifier,
+	) -> FerrosGrynnResult<DefineGraphIndexStatement> {
+		let graph = self.identifier()?;
+		let family = if self.consume_keyword("PATH").is_some() {
+			GraphIndexFamilyName::Path
+		} else if self.consume_keyword("REACHABILITY").is_some() {
+			GraphIndexFamilyName::Reachability
+		} else if self.consume_keyword("NEIGHBOURHOOD").is_some() {
+			let open = self.expect_symbol(
+				Symbol::LeftParen,
+				"Expected neighbourhood radius in parentheses.",
+			)?;
+			let radius = self.graph_index_u32("neighbourhood radius")?;
+			self.close(Symbol::RightParen, open.span, "`)`")?;
+			GraphIndexFamilyName::Neighbourhood(radius)
+		} else {
+			return Err(
+				self.syntax("Expected PATH, REACHABILITY, or NEIGHBOURHOOD.", self.current().span)
+			);
+		};
+		let mut definition = DefineGraphIndexStatement {
+			mode,
+			name,
+			graph,
+			family,
+			algorithm: None,
+			projection: None,
+			direction: None,
+			edge_labels: Vec::new(),
+			weighted: false,
+			cost: None,
+			patterns: Vec::new(),
+			max_bytes: None,
+			comment: None,
+			concurrently: false,
+			deferred: false,
+		};
+		let mut clauses = std::collections::BTreeSet::new();
+		while !self.at_statement_end() {
+			let clause = self
+				.current_word()
+				.ok_or_else(|| self.syntax("Expected a graph index clause.", self.current().span))?
+				.to_ascii_uppercase();
+			if !clauses.insert(clause.clone()) {
+				return Err(self.syntax("Duplicate graph index clause.", self.current().span));
+			}
+			match clause.as_str() {
+				"ALGORITHM" => {
+					self.tokens.next();
+					let algorithm = self.identifier()?;
+					let parameter = if let Some(open) = self.consume_symbol(Symbol::LeftParen) {
+						let value = self.graph_index_u32("algorithm parameter")?;
+						self.close(Symbol::RightParen, open.span, "`)`")?;
+						Some(value)
+					} else {
+						None
+					};
+					definition.algorithm = Some((algorithm, parameter));
+				}
+				"MODE" => {
+					self.tokens.next();
+					definition.projection = Some(self.identifier()?);
+				}
+				"DIRECTION" => {
+					self.tokens.next();
+					definition.direction = Some(self.identifier()?);
+				}
+				"EDGES" => {
+					self.tokens.next();
+					definition.edge_labels.push(self.identifier()?);
+					while self.consume_symbol(Symbol::Comma).is_some() {
+						if definition.edge_labels.len() == 1024 {
+							return Err(
+								self.syntax("Too many graph index labels.", self.current().span)
+							);
+						}
+						definition.edge_labels.push(self.identifier()?);
+					}
+				}
+				"WEIGHTED" => {
+					self.tokens.next();
+					definition.weighted = true;
+				}
+				"COST" => {
+					self.tokens.next();
+					definition.cost = Some(self.function_signature_name()?);
+				}
+				"PATTERNS" => {
+					self.tokens.next();
+					let open = self.expect_symbol(
+						Symbol::LeftBracket,
+						"Expected a list of pattern source strings.",
+					)?;
+					let mut bytes = 0_usize;
+					if !self.at_symbol(Symbol::RightBracket) {
+						loop {
+							let pattern = self.string_value("Expected a pattern source string.")?;
+							bytes = bytes.checked_add(pattern.len()).ok_or_else(|| {
+								self.syntax("Pattern source size overflows.", self.previous_span())
+							})?;
+							if definition.patterns.len() == 64 || bytes > 1024 * 1024 {
+								return Err(self.syntax(
+									"Pattern list exceeds its bound.",
+									self.previous_span(),
+								));
+							}
+							definition.patterns.push(pattern);
+							if self.consume_symbol(Symbol::Comma).is_none() {
+								break;
+							}
+						}
+					}
+					self.close(Symbol::RightBracket, open.span, "`]`")?;
+				}
+				"COMMENT" => {
+					self.tokens.next();
+					definition.comment = Some(self.string_value("Expected a comment string.")?);
+				}
+				"CONCURRENTLY" => {
+					self.tokens.next();
+					definition.concurrently = true;
+				}
+				"DEFER" => {
+					self.tokens.next();
+					definition.deferred = true;
+				}
+				"WITH" => {
+					self.tokens.next();
+					let open = self
+						.expect_symbol(Symbol::LeftParen, "Expected WITH (MAX_BYTES = bytes).")?;
+					self.expect_keyword("MAX_BYTES", "Expected MAX_BYTES.")?;
+					self.expect_symbol(Symbol::Equal, "Expected `=` after MAX_BYTES.")?;
+					definition.max_bytes = Some(self.maintenance_positive_integer("MAX_BYTES")?);
+					self.close(Symbol::RightParen, open.span, "`)`")?;
+				}
+				_ => return Err(self.syntax("Unexpected graph index clause.", self.current().span)),
+			}
+		}
+		Ok(definition)
+	}
+
+	/// Reuses checked maintenance integers and narrows graph parameters
+	/// explicitly.
+	fn graph_index_u32(&mut self, field: &str) -> FerrosGrynnResult<u32> {
+		u32::try_from(self.maintenance_positive_integer(field)?).map_err(|_error| {
+			self.syntax("Graph index parameter exceeds u32.", self.previous_span())
 		})
 	}
 
@@ -1072,11 +1294,17 @@ impl Parser<'_> {
 		} else if self.consume_keyword(keywords::INDEX).is_some() {
 			let if_exists = self.if_exists()?;
 			let name = self.identifier()?;
-			let class = self.on_class()?;
-			RemoveTarget::Index {
-				if_exists,
-				name,
-				class,
+			match self.maintenance_index_owner()? {
+				MaintenanceIndexOwner::Class(class) => RemoveTarget::Index {
+					if_exists,
+					name,
+					class,
+				},
+				MaintenanceIndexOwner::Graph(graph) => RemoveTarget::GraphIndex {
+					if_exists,
+					name,
+					graph,
+				},
 			}
 		} else {
 			let feature = self.current_word().unwrap_or("REMOVE target");
@@ -1384,10 +1612,15 @@ impl Parser<'_> {
 			InfoTarget::Class(self.identifier()?)
 		} else if self.consume_keyword(keywords::INDEX).is_some() {
 			let name = self.identifier()?;
-			let class = self.on_class()?;
-			InfoTarget::Index {
-				name,
-				class,
+			match self.maintenance_index_owner()? {
+				MaintenanceIndexOwner::Class(class) => InfoTarget::Index {
+					name,
+					class,
+				},
+				MaintenanceIndexOwner::Graph(graph) => InfoTarget::GraphIndex {
+					name,
+					graph,
+				},
 			}
 		} else {
 			let feature = self.current_word().unwrap_or("INFO target");
@@ -1480,7 +1713,9 @@ impl Parser<'_> {
 		Ok((namespace, name))
 	}
 
-	fn function_signature_name(&mut self) -> FerrosGrynnResult<FunctionSignatureName> {
+	pub(in crate::syn) fn function_signature_name(
+		&mut self,
+	) -> FerrosGrynnResult<FunctionSignatureName> {
 		let (namespace, name) = self.qualified_function_name()?;
 		let parameters = if let Some(open) = self.consume_symbol(Symbol::LeftParen) {
 			let mut parameters = Vec::new();

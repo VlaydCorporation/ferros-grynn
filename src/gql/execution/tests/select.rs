@@ -19,6 +19,56 @@ use crate::{
 };
 
 #[test]
+fn geometry_index_refines_mbr_false_positives_and_preserves_error_order() {
+	let store = Datastore::in_memory();
+	let setup = store
+		.execute(
+			"DEFINE CLASS place TYPE NODE SCHEMAFULL; DEFINE FIELD shape ON CLASS place TYPE \
+			 geometry;
+		 DEFINE FIELD zero ON CLASS place TYPE int;
+		 CREATE place:inside SET shape = <geometry>{type:'Point', coordinates:[1,1]}, zero=0;
+		 CREATE place:hole SET shape = <geometry>{type:'Point', coordinates:[3,3]}, zero=0;
+		 CREATE place:boundary SET shape = <geometry>{type:'Point', coordinates:[0,1]}, zero=0;
+		 CREATE place:outside SET shape = <geometry>{type:'Point', coordinates:[8,8]}, zero=0;
+		 DEFINE INDEX by_shape ON CLASS place FIELDS shape GEOMETRY SCOPE BASE;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(setup.iter().all(|result| result.result.is_ok()), "{setup:?}");
+	let polygon = "<geometry>{type:'Polygon', \
+	               coordinates:[[[0,0],[6,0],[6,6],[0,6],[0,0]],[[2,2],[4,2],[4,4],[2,4],[2,2]]]}";
+	let indexed = format!(
+		"SELECT VALUE id FROM place WITH INDEX by_shape WHERE shape INSIDE {polygon} ORDER BY id;"
+	);
+	let scan = indexed.replace("WITH INDEX by_shape", "WITH NOINDEX");
+	assert_eq!(value(&store, &indexed), value(&store, &scan));
+	assert_eq!(
+		value(&store, &indexed),
+		Value::Array(vec![Value::from("place:inside".parse::<RecordId>().unwrap())].into())
+	);
+	let outside =
+		"<geometry>{type:'Polygon', coordinates:[[[20,20],[21,20],[21,21],[20,21],[20,20]]]}";
+	let automatic = format!("SELECT id FROM place WHERE 1 / zero = 1 AND shape INSIDE {outside};");
+	let scan = automatic.replace("FROM place WHERE", "FROM place WITH NOINDEX WHERE");
+	assert_eq!(
+		statement_error(&store, &automatic).status().status(),
+		statement_error(&store, &scan).status().status()
+	);
+	let explain = value(&store, &format!("EXPLAIN FULL FORMAT JSON {indexed}"));
+	assert!(format!("{explain:?}").contains("GeometryIndexScan"), "{explain:?}");
+	let analyzed = value(&store, &format!("EXPLAIN ANALYZE FORMAT JSON {indexed}"));
+	let Value::Object(explain) = analyzed else {
+		panic!("EXPLAIN did not return an object");
+	};
+	let Some(Value::Object(actual)) = explain.get("analyze") else {
+		panic!("EXPLAIN actual metrics absent: {explain:?}");
+	};
+	assert_eq!(actual.get("spatial_candidates"), Some(&Value::from(3_i64)));
+	assert_eq!(actual.get("spatial_refinements"), Some(&Value::from(3_i64)));
+	assert_eq!(actual.get("spatial_tree_pages"), Some(&Value::from(1_i64)));
+}
+
+#[test]
 fn fulltext_exact_scan_scores_and_highlights_snapshot_rows() {
 	let store = Datastore::in_memory();
 	let setup = store

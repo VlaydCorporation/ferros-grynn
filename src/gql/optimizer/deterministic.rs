@@ -198,6 +198,9 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 		| LogicalSchemaStatement::DefineIndex {
 			..
 		}
+		| LogicalSchemaStatement::DefineGraphIndex {
+			..
+		}
 		| LogicalSchemaStatement::DefineAnalyzer {
 			..
 		}
@@ -211,6 +214,9 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 			..
 		}
 		| LogicalSchemaStatement::RemoveIndex {
+			..
+		}
+		| LogicalSchemaStatement::RemoveGraphIndex {
 			..
 		}
 		| LogicalSchemaStatement::RemoveParameter {
@@ -242,6 +248,9 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 			..
 		}
 		| LogicalSchemaStatement::InfoIndex {
+			..
+		}
+		| LogicalSchemaStatement::InfoGraphIndex {
 			..
 		}
 		| LogicalSchemaStatement::InfoParameter {

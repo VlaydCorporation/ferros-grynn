@@ -772,7 +772,7 @@ impl Datastore {
 			}
 			root.commit_ts = commit_ts;
 			report.index_timings = with_external_sort_options(sort_memory, parallelism, || {
-				self.inner.persist_import_root(&root, quarantine.as_mut())
+				self.inner.persist_import_root(&mut root, quarantine.as_mut())
 			})?;
 			*self.inner.current.write() = Arc::new(root);
 		}

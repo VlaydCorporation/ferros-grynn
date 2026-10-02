@@ -12,6 +12,7 @@ use crate::{
 		ClassId,
 		ClassIndexKind,
 		ClassIndexState,
+		DataSpaceId,
 		DatabaseRoot,
 		IndexId,
 		IndexMaintenanceMode,
@@ -34,9 +35,63 @@ use crate::{
 #[derive(Default)]
 pub(super) struct IndexReusePlan {
 	pub(super) indexes: BTreeMap<IndexId, RetainedIndex>,
+	/// Graph snapshot files are retained whole and never receive row deltas.
+	pub(super) graph_artifacts: BTreeMap<IndexId, (PhysicalIndexBinding, FileCatalogEntry)>,
 }
 
 impl IndexReusePlan {
+	/// Retains unchanged artifacts even during unrelated foreground
+	/// maintenance.
+	///
+	/// # Errors
+	/// Propagates checked complete descriptor encoding failures.
+	pub(super) fn retain_graph_artifacts(
+		&mut self,
+		next: &DatabaseRoot,
+		previous: &crate::storage::catalog::DatabaseCatalog,
+		files: &FileCatalog,
+	) -> FerrosGrynnResult<()> {
+		for graph in next.schema.all_graphs() {
+			let Some(old) = previous.graphs.iter().find(|old| old.id == graph.id()) else {
+				continue;
+			};
+			for index in graph.indexes().filter(|index| index.state() == ClassIndexState::Ready) {
+				let Some(id) = index.id().filter(|id| {
+					next.reachability_artifacts.contains_key(id)
+						|| next.neighbourhood_artifacts.contains_key(id)
+						|| next.path_artifacts.contains_key(id)
+				}) else {
+					continue;
+				};
+				let Some(binding) = old.index_bindings.get(&id).copied() else {
+					continue;
+				};
+				let Some(definition) = old.indexes.iter().find(|old| old.id() == Some(id)) else {
+					continue;
+				};
+				if definition.state() != ClassIndexState::Ready
+					|| definition.build_revision() != index.build_revision()
+					|| definition.descriptor()? != index.descriptor()?
+				{
+					continue;
+				}
+				let Some(entry) = files
+					.files
+					.iter()
+					.find(|entry| {
+						entry.space_id == DataSpaceId::Graph(graph.id())
+							&& entry.file_id == binding.file_id
+					})
+					.cloned()
+				else {
+					continue;
+				};
+				self.graph_artifacts.insert(id, (binding, entry));
+			}
+		}
+		Ok(())
+	}
+
 	pub(super) fn skipped_builds(&self) -> BTreeSet<IndexId> {
 		self.indexes.keys().copied().collect()
 	}
@@ -113,7 +168,10 @@ impl LocalStore {
 					.collect::<FerrosGrynnResult<Vec<_>>>()?;
 				if !matches!(
 					index.kind(),
-					ClassIndexKind::Fulltext | ClassIndexKind::Hnsw | ClassIndexKind::DiskAnn
+					ClassIndexKind::Fulltext
+						| ClassIndexKind::Hnsw
+						| ClassIndexKind::DiskAnn
+						| ClassIndexKind::Geometry
 				) || index.state() != ClassIndexState::Ready
 					|| index.maintenance_mode() != IndexMaintenanceMode::Immediate
 					|| old.version != index.version()
@@ -137,6 +195,9 @@ impl LocalStore {
 					continue;
 				};
 				let delta = match (&decoded.entries, &decoded.delta) {
+					(PhysicalIndexEntries::Geometry(base), delta) => {
+						prepare_geometry_delta(previous, next, changed_records, *base, delta)?
+					}
 					(PhysicalIndexEntries::Fulltext(base), delta) => prepare_fulltext_delta(
 						previous,
 						next,
@@ -206,6 +267,30 @@ enum PreparedDelta {
 	Replacement(Vec<AlignedPage>),
 }
 
+/// Retains the base while the bounded delta replaces every changed identity.
+fn prepare_geometry_delta(
+	previous: &DatabaseRoot,
+	next: &DatabaseRoot,
+	changed: &BTreeSet<RecordId>,
+	base: crate::storage::geometry_index::GeometryHeader,
+	delta: &Option<PhysicalIndexDelta>,
+) -> FerrosGrynnResult<Option<PreparedDelta>> {
+	use crate::storage::geometry_index::{build_geometry_delta, geometry_delta_records};
+	let prior = match delta {
+		Some(PhysicalIndexDelta::Geometry(delta)) => delta.records.as_slice(),
+		None => &[],
+		Some(_) => return Ok(None),
+	};
+	let Some(records) =
+		geometry_delta_records(previous, next, changed, base, prior.iter().copied())?
+	else {
+		return Ok(None);
+	};
+	if records.values().copied().eq(prior.iter().copied()) {
+		return Ok(Some(PreparedDelta::Unchanged));
+	}
+	Ok(Some(PreparedDelta::Replacement(build_geometry_delta(base.spec, next.commit_ts, records)?)))
+}
 fn prepare_fulltext_delta(
 	previous: &DatabaseRoot,
 	next: &DatabaseRoot,

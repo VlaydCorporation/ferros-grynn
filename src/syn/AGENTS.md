@@ -43,6 +43,10 @@ state. Он не выполняет запросы и не разрешает sc
 - Именованные аргументы допускаются только после positional; duplicate name и positional после
   named отклоняются до analysis. Signature qualifier UDF содержит только declared argument
   types и не использует return type как overload discriminator.
+- MATCH global `WITH COST fn::name` стоит после IN GRAPH перед WHERE; AST хранит owned
+  function name и byte span. Scope/default/override и проверка функции принадлежат analysis.
+- TRAVERSE `WITH COST fn::name` стоит после optional outer IN GRAPH перед первым `|>`;
+  embedded MATCH сохраняет собственный COST scope. Signature/version/effect проверяет analysis.
 
 ## Проверка
 

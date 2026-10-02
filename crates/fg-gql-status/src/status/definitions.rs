@@ -303,6 +303,20 @@ define_status_codes!(
 			actual: String => ValueType,
 		},
 	},
+	InvalidGeometryStructure, "FG-22F31" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Type,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::Value,
+		subcondition: "invalid geometry structure",
+		message: "The geometry is invalid: {reason}.",
+		params: {
+			reason: String => DisplayValue,
+		},
+	},
 	InvalidRecordIdSyntax, "FG-22F11" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,

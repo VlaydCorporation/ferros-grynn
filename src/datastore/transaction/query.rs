@@ -76,6 +76,78 @@ pub(crate) struct QueryVectorIndexRead {
 	pub(crate) distance: f64,
 }
 
+/// Spatial candidates expressed only through public identities and work
+/// counters.
+#[derive(Default)]
+pub(crate) struct QueryGeometryIndexRead {
+	/// Snapshot-stable row identities requiring exact refinement.
+	pub(crate) records: Vec<RecordId>,
+	/// Tree node pages visited by the lookup.
+	pub(crate) page_reads: u64,
+	/// Exact replacement records consulted.
+	pub(crate) delta_records: u64,
+}
+
+/// Logical availability metadata for one Ready unfiltered graph sketch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QueryNeighbourhoodSketch {
+	/// Owning logical graph scope.
+	pub(crate) graph: GraphId,
+	/// Stable catalog identity.
+	pub(crate) index: IndexId,
+	/// Captured semantic definition version.
+	pub(crate) version: crate::datastore::SchemaVersion,
+	/// Snapshot revision used by the immutable artifact.
+	pub(crate) revision: u64,
+	/// Stored NODE/ATOM incidence projection.
+	pub(crate) mode: crate::graph::TraversalSemantics,
+	/// Stored relation direction.
+	pub(crate) direction: crate::graph::TraversalDirection,
+	/// Maximum materialized radius.
+	pub(crate) radius: u32,
+	/// Register precision, never an exact-count guarantee.
+	pub(crate) precision: u8,
+	/// Complete artifact pages and metadata bytes.
+	pub(crate) bytes: u64,
+}
+
+/// Logical binding for one snapshot-exact directed landmark generation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QueryLandmarkPath {
+	/// Graph scope and immutable catalog identity.
+	pub(crate) graph: GraphId,
+	/// Catalog index identity.
+	pub(crate) index: IndexId,
+	/// Definition version and captured build revision.
+	pub(crate) version: crate::datastore::SchemaVersion,
+	/// Commit revision captured by the builder.
+	pub(crate) revision: u64,
+	/// Incidence projection, direction and additive cost.
+	pub(crate) mode: crate::graph::TraversalSemantics,
+	/// Direction of the projected relation.
+	pub(crate) direction: crate::graph::TraversalDirection,
+	/// Additive cost captured by this generation.
+	pub(crate) cost: crate::datastore::GraphIndexCost,
+	/// Canonical connector label filter.
+	pub(crate) edge_labels: Vec<Box<str>>,
+	/// Actual landmark count and complete artifact footprint.
+	pub(crate) landmarks: u32,
+	/// Complete artifact pages and metadata bytes.
+	pub(crate) bytes: u64,
+}
+
+/// Explicit approximate count or bounded exact fallback, with logical work.
+pub struct QueryNeighbourhoodEstimate {
+	/// Distinct count including the source occurrence.
+	pub(crate) count: u64,
+	/// True only when a compatible Ready sketch supplied the estimate.
+	pub(crate) approximate: bool,
+	/// Admitted artifact bytes used by this lookup, zero for traversal.
+	pub(crate) artifact_bytes: u64,
+	/// Exact-fallback cooperative work, including relation construction.
+	pub(crate) work: u64,
+}
+
 enum QueryCursorSource<'snapshot> {
 	Empty,
 	Base(btree_set::Iter<'snapshot, GlobalAtomId>),
@@ -255,6 +327,388 @@ impl QuerySnapshot {
 }
 
 impl Transaction {
+	/// Projects admitted Ready path bindings without physical addresses.
+	///
+	/// # Errors
+	/// Rejects foreign graphs, expired transactions or allocation failures.
+	pub(crate) fn query_landmark_paths(
+		&self,
+		snapshot: &QuerySnapshot,
+		reference: &GraphRef,
+	) -> FerrosGrynnResult<Vec<QueryLandmarkPath>> {
+		self.ensure_live()?;
+		query_graph_root(&snapshot.root, reference)?;
+		self.record_read(crate::datastore::ConflictKey::GraphDefinition(reference.id()));
+		let schema =
+			snapshot.root.schema.graph(reference.id()).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(reference.name().to_string())
+			})?;
+		let mut result = Vec::new();
+		result.try_reserve_exact(schema.indexes().len()).map_err(|cause| {
+			FerrosGrynnError::invalid_argument("path binding allocation failed")
+				.with_technical_source(cause)
+		})?;
+		for definition in schema
+			.indexes()
+			.filter(|index| index.state() == crate::datastore::ClassIndexState::Ready)
+		{
+			let crate::datastore::GraphIndexDefinition::Path {
+				algorithm: crate::datastore::PathIndexAlgorithm::LandmarkSssp(_),
+				cost,
+				..
+			} = definition.definition()
+			else {
+				continue;
+			};
+			let Some(id) = definition.id() else {
+				continue;
+			};
+			let Some(artifact) = snapshot.root.path_artifacts.get(&id) else {
+				continue;
+			};
+			let header = artifact.layout.header;
+			if header.has_cross_level
+				|| header.identity.version != definition.version().get()
+				|| header.identity.revision != definition.build_revision()
+			{
+				continue;
+			}
+			result.push(QueryLandmarkPath {
+				graph: reference.id(),
+				index: id,
+				version: definition.version(),
+				revision: definition.build_revision(),
+				mode: definition.mode(),
+				direction: definition.direction(),
+				cost: *cost,
+				edge_labels: definition.edge_labels().map(|label| label.as_str().into()).collect(),
+				landmarks: artifact.distances.landmarks.len() as u32,
+				bytes: artifact.layout.page_count * 16_384,
+			});
+		}
+		Ok(result)
+	}
+
+	/// Reads a directed admissible bound from the exact selected generation.
+	///
+	/// # Errors
+	/// Rejects graph identity or corrupt ordinal/distance metadata.
+	pub(crate) fn query_path_lower_bound(
+		&self,
+		snapshot: &QuerySnapshot,
+		binding: &QueryLandmarkPath,
+		source: AtomId,
+		target: AtomId,
+	) -> FerrosGrynnResult<Option<crate::values::Number>> {
+		self.ensure_live()?;
+		let Some(schema) = snapshot.root.schema.graph(binding.graph) else {
+			return Ok(None);
+		};
+		let Some(definition) = schema.indexes().find(|index| index.id() == Some(binding.index))
+		else {
+			return Ok(None);
+		};
+		if definition.state() != crate::datastore::ClassIndexState::Ready
+			|| definition.version() != binding.version
+			|| definition.build_revision() != binding.revision
+			|| definition.mode() != binding.mode
+			|| definition.direction() != binding.direction
+			|| !matches!(definition.definition(), crate::datastore::GraphIndexDefinition::Path { cost, .. } if *cost == binding.cost)
+			|| !definition
+				.edge_labels()
+				.map(|label| label.as_str())
+				.eq(binding.edge_labels.iter().map(Box::as_ref))
+		{
+			return Ok(None);
+		}
+		let Some(artifact) = snapshot.root.path_artifacts.get(&binding.index) else {
+			return Ok(None);
+		};
+		if artifact.layout.header.has_cross_level
+			|| artifact.layout.header.identity.version != binding.version.get()
+			|| artifact.layout.header.identity.revision != binding.revision
+		{
+			return Ok(None);
+		}
+		self.record_reads([
+			crate::datastore::ConflictKey::GraphDefinition(binding.graph),
+			crate::datastore::ConflictKey::GraphKindRange(binding.graph, AtomKind::Node),
+			crate::datastore::ConflictKey::GraphKindRange(binding.graph, AtomKind::Edge),
+		]);
+		if matches!(binding.cost, crate::datastore::GraphIndexCost::Function { .. }) {
+			// A bound can prune unvisited connectors. SSI must therefore
+			// observe every effective-property range captured by
+			// this PURE artifact.
+			for class in snapshot.root.schema.classes() {
+				let id = class.id().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("published class has no identity")
+				})?;
+				self.record_reads([
+					crate::datastore::ConflictKey::BaseClassRange(id),
+					crate::datastore::ConflictKey::GraphClassRange(binding.graph, id),
+				]);
+			}
+			self.record_read(crate::datastore::ConflictKey::FunctionCatalogRange);
+			for &(function, _) in definition.dependencies() {
+				self.record_read(crate::datastore::ConflictKey::SchemaFunction(function));
+			}
+		}
+		let (Some(source), Some(target)) =
+			(artifact.ordinal_by_atom.get(&source), artifact.ordinal_by_atom.get(&target))
+		else {
+			return Ok(None);
+		};
+		artifact.distances.lower_bound(*source, *target).map(Some)
+	}
+
+	/// Projects only logical sketch metadata from the captured snapshot.
+	///
+	/// # Errors
+	/// Rejects a stale transaction, foreign graph or metadata allocation
+	/// failure.
+	pub(crate) fn query_neighbourhood_sketches(
+		&self,
+		snapshot: &QuerySnapshot,
+		reference: &GraphRef,
+	) -> FerrosGrynnResult<Vec<QueryNeighbourhoodSketch>> {
+		self.ensure_live()?;
+		query_graph_root(&snapshot.root, reference)?;
+		self.record_read(crate::datastore::ConflictKey::GraphDefinition(reference.id()));
+		let schema =
+			snapshot.root.schema.graph(reference.id()).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(reference.name().to_string())
+			})?;
+		let mut result = Vec::new();
+		result.try_reserve_exact(schema.indexes().len()).map_err(|cause| {
+			FerrosGrynnError::invalid_argument("neighbourhood metadata allocation failed")
+				.with_technical_source(cause)
+		})?;
+		for definition in schema.indexes().filter(|index| {
+			index.state() == crate::datastore::ClassIndexState::Ready
+				&& index.edge_labels().len() == 0
+		}) {
+			let crate::datastore::GraphIndexDefinition::Neighbourhood {
+				radius,
+				algorithm: crate::datastore::NeighbourhoodAlgorithm::Sketch(precision),
+			} = *definition.definition()
+			else {
+				continue;
+			};
+			let Some(id) = definition.id() else {
+				continue;
+			};
+			let Some(artifact) = snapshot.root.neighbourhood_artifacts.get(&id) else {
+				continue;
+			};
+			let header = artifact.layout.header;
+			if header.has_cross_level
+				|| header.identity.version != definition.version().get()
+				|| header.identity.revision != definition.build_revision()
+			{
+				continue;
+			}
+			result.push(QueryNeighbourhoodSketch {
+				graph: reference.id(),
+				index: id,
+				version: definition.version(),
+				revision: definition.build_revision(),
+				mode: definition.mode(),
+				direction: definition.direction(),
+				radius,
+				precision,
+				bytes: artifact.layout.page_count * 16_384,
+			});
+		}
+		Ok(result)
+	}
+
+	/// Reads the planner-selected sketch or completes exact bounded local
+	/// traversal.
+	///
+	/// # Errors
+	/// Rejects source/graph/type mismatches, scratch/work overflow or
+	/// cancellation.
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "snapshot, projection, selected binding and independent resource guards are \
+		          explicit"
+	)]
+	pub(crate) fn query_k_hop_estimate(
+		&self,
+		snapshot: &QuerySnapshot,
+		occurrence: &AtomOccurrenceRef,
+		mode: crate::graph::TraversalSemantics,
+		radius: u32,
+		index: Option<IndexId>,
+		scratch_bytes: usize,
+		max_work: u64,
+		admit: &mut dyn FnMut(usize) -> FerrosGrynnResult<()>,
+		check: &mut dyn FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<QueryNeighbourhoodEstimate> {
+		use crate::{
+			datastore::graph_neighbourhood::{
+				NeighbourhoodBuildLimits,
+				NeighbourhoodLabels,
+				neighbourhood_members,
+			},
+			graph::{ProjectedRelation, TraversalDirection, TraversalSemantics},
+		};
+		self.ensure_live()?;
+		check()?;
+		let graph = query_graph_root(&snapshot.root, occurrence.graph())?;
+		let global = snapshot.root.resolve_atom(occurrence.atom().id()).ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist("atom", occurrence.atom().id().to_string())
+		})?;
+		let source = graph.local_id(global).ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist("occurrence", occurrence.atom().id().to_string())
+		})?;
+		if source.kind() != Some(occurrence.atom().kind())
+			|| mode == TraversalSemantics::Node && !source.is_node()
+		{
+			return Err(FerrosGrynnError::invalid_argument(
+				"kHopEstimate source is incompatible with its projection",
+			));
+		}
+		self.record_reads([
+			crate::datastore::ConflictKey::GraphDefinition(graph.reference().id()),
+			crate::datastore::ConflictKey::GraphKindRange(graph.reference().id(), AtomKind::Node),
+			crate::datastore::ConflictKey::GraphKindRange(graph.reference().id(), AtomKind::Edge),
+		]);
+		if radius == 0 {
+			return Ok(QueryNeighbourhoodEstimate {
+				count: 1,
+				approximate: false,
+				artifact_bytes: 0,
+				work: 0,
+			});
+		}
+		if let Some(id) = index {
+			let schema = snapshot.root.schema.graph(graph.reference().id()).ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(graph.reference().name().to_string())
+			})?;
+			let compatible = schema.indexes().find(|definition| definition.id() == Some(id)).is_some_and(|definition| definition.state() == crate::datastore::ClassIndexState::Ready && definition.mode() == mode && definition.direction() == TraversalDirection::Forward && definition.edge_labels().len() == 0 && matches!(definition.definition(), crate::datastore::GraphIndexDefinition::Neighbourhood { radius: maximum, algorithm: crate::datastore::NeighbourhoodAlgorithm::Sketch(_) } if radius <= *maximum));
+			if compatible
+				&& let Some(artifact) = snapshot.root.neighbourhood_artifacts.get(&id)
+				&& !artifact.relation.has_cross_level
+				&& let NeighbourhoodLabels::Sketch(sketches) = &artifact.labels
+			{
+				let ordinal = *artifact.relation.ordinal_by_atom.get(&source).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("neighbourhood sketch source is absent")
+				})?;
+				let row = (radius as usize - 1)
+					.checked_mul(artifact.relation.vertices.len())
+					.and_then(|row| row.checked_add(ordinal))
+					.ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("neighbourhood sketch row")
+					})?;
+				let sketch = sketches.get(row).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file(
+						"neighbourhood sketch radius row is absent",
+					)
+				})?;
+				return Ok(QueryNeighbourhoodEstimate {
+					count: sketch.estimate(),
+					approximate: true,
+					artifact_bytes: artifact.layout.page_count * 16_384,
+					work: 0,
+				});
+			}
+		}
+		admit(scratch_bytes)?;
+		let resource = || {
+			FerrosGrynnError::traversal_resource_limit_exceeded(
+				"neighbourhood exact scratch bytes",
+				scratch_bytes as u64,
+			)
+		};
+		let vertices = graph
+			.occurrences()
+			.filter(|occurrence| {
+				mode == TraversalSemantics::Atom || occurrence.local_id().is_node()
+			})
+			.count();
+		let workspace = vertices
+			.checked_mul(32)
+			.and_then(|bytes| bytes.checked_add(1024))
+			.ok_or_else(resource)?;
+		let relation_budget = scratch_bytes.checked_sub(workspace).ok_or_else(resource)?;
+		let mut work = 0_u64;
+		let mut bounded = || {
+			check()?;
+			if work >= max_work {
+				return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"neighbourhood exact work",
+					max_work,
+				));
+			}
+			work += 1;
+			Ok(())
+		};
+		let relation = ProjectedRelation::build(
+			graph.occurrences().map(GraphOccurrence::local_id),
+			graph.occurrences().filter_map(|occurrence| match occurrence.state() {
+				OccurrenceState::Edge {
+					topology,
+					..
+				} => Some((occurrence.local_id(), topology)),
+				OccurrenceState::Node {
+					..
+				} => None,
+			}),
+			mode,
+			TraversalDirection::Forward,
+			relation_budget,
+			|atom| {
+				graph.occurrence(atom).map(|occurrence| occurrence.global_id().raw()).ok_or_else(
+					|| {
+						FerrosGrynnError::invalid_storage_file(
+							"neighbourhood exact vertex is absent",
+						)
+					},
+				)
+			},
+			&mut bounded,
+		)?;
+		let ordinal = *relation.ordinal_by_atom.get(&source).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("neighbourhood exact source is absent")
+		})?;
+		let live = relation
+			.vertices
+			.len()
+			.checked_mul(512)
+			.and_then(|bytes| {
+				relation
+					.forward
+					.targets
+					.len()
+					.checked_mul(128)
+					.and_then(|arcs| bytes.checked_add(arcs))
+			})
+			.and_then(|bytes| bytes.checked_add(1024))
+			.ok_or_else(resource)?;
+		let members = neighbourhood_members(
+			&relation,
+			None,
+			ordinal,
+			radius,
+			0,
+			max_work,
+			NeighbourhoodBuildLimits {
+				max_bytes: u64::MAX,
+				common_pages: 0,
+				scratch_bytes,
+				live_scratch_bytes: live,
+			},
+			&mut bounded,
+		)?;
+		Ok(QueryNeighbourhoodEstimate {
+			count: members.len() as u64,
+			approximate: false,
+			artifact_bytes: 0,
+			work,
+		})
+	}
+
 	pub(crate) fn query_scratch_root(&self) -> std::path::PathBuf {
 		self.store.inner.query_scratch_root()
 	}
@@ -266,7 +720,24 @@ impl Transaction {
 	pub(crate) fn query_snapshot(&mut self) -> FerrosGrynnResult<QuerySnapshot> {
 		self.prepare_read()?;
 		let physical = if self.mutations.is_empty() {
-			self.store.inner.capture_physical_query_snapshot(self.working.commit_ts)?
+			if self
+				.physical_query_snapshot
+				.as_ref()
+				.is_some_and(|(revision, _)| *revision != self.working.commit_ts)
+			{
+				self.physical_query_snapshot = None;
+			}
+			if self.physical_query_snapshot.is_none() {
+				self.physical_query_snapshot = Some((
+					self.working.commit_ts,
+					self.store.inner.capture_physical_query_snapshot(self.working.commit_ts),
+				));
+			}
+			self.physical_query_snapshot
+				.as_ref()
+				.map(|(_, snapshot)| snapshot.clone())
+				.transpose()?
+				.flatten()
 		} else {
 			None
 		};
@@ -431,13 +902,13 @@ impl Transaction {
 	/// Returns planner statistics projected from the same immutable statement
 	/// snapshot. Corrupt optional parts remain absent so planning can use its
 	/// conservative fallback without weakening data reads.
-	pub(crate) fn query_statistics(
+	pub(crate) fn query_statistics<'snapshot>(
 		&self,
-		snapshot: &QuerySnapshot,
+		snapshot: &'snapshot QuerySnapshot,
 		demand: &QueryStatisticsDemand,
-	) -> FerrosGrynnResult<crate::stats::StatisticsStore> {
+	) -> FerrosGrynnResult<std::borrow::Cow<'snapshot, crate::stats::StatisticsStore>> {
 		self.ensure_live()?;
-		let mut statistics = snapshot.root.statistics.as_ref().clone();
+		let mut statistics = std::borrow::Cow::Borrowed(snapshot.root.statistics.as_ref());
 		if statistics.auxiliary_deferred()
 			&& let Some(physical) = snapshot.physical.as_ref()
 		{
@@ -445,7 +916,7 @@ impl Transaction {
 				physical,
 				&snapshot.root,
 				demand,
-				&mut statistics,
+				statistics.to_mut(),
 			);
 		}
 		Ok(statistics)
@@ -471,9 +942,20 @@ impl Transaction {
 			crate::datastore::ClassIndexKind::Fulltext
 				| crate::datastore::ClassIndexKind::Hnsw
 				| crate::datastore::ClassIndexKind::DiskAnn
+				| crate::datastore::ClassIndexKind::Geometry
 		) {
 			if index.state() != crate::datastore::ClassIndexState::Ready {
 				return Ok((false, None));
+			}
+			if index.kind() == crate::datastore::ClassIndexKind::Geometry
+				&& self.mutations.is_empty()
+				&& snapshot.root.resident_geometry.get(&index_id).is_some_and(|generation| {
+					generation.header.spec.class == class_id
+						&& generation.header.spec.index_version == index.version()
+						&& generation.header.spec.scope == index.scope()
+						&& generation.header.spec.build_revision == index.build_revision()
+				}) {
+				return Ok((true, None));
 			}
 			let available = snapshot
 				.physical
@@ -540,6 +1022,9 @@ impl Transaction {
 			}
 			PhysicalIndexEntries::Vector(_) => {
 				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as vector"))
+			}
+			PhysicalIndexEntries::Geometry(_) => {
+				Err(FerrosGrynnError::invalid_storage_file("Count index decoded as geometry"))
 			}
 		}
 	}
@@ -661,7 +1146,7 @@ impl Transaction {
 					}
 				}
 			}
-			Some(PhysicalIndexDelta::Vector(_)) => {
+			Some(_) => {
 				return Err(FerrosGrynnError::invalid_storage_file(
 					"Fulltext index has a vector delta",
 				));
@@ -749,8 +1234,115 @@ impl Transaction {
 		}))
 	}
 
-	/// Searches one compatible immutable HNSW/DiskANN generation and maps its
-	/// storage-local addresses to public record identities.
+	/// Searches a snapshot-bound geometry generation and maps candidates to
+	/// public identities.
+	pub(crate) fn query_geometry_index(
+		&self,
+		snapshot: &QuerySnapshot,
+		index: IndexId,
+		class_id: crate::datastore::ClassId,
+		scope: crate::datastore::IndexScope,
+		geometry: &crate::values::Geometry,
+		admit: &mut dyn FnMut(usize) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Option<QueryGeometryIndexRead>> {
+		self.ensure_live()?;
+		if !self.mutations.is_empty() {
+			return Ok(None);
+		}
+		match scope {
+			crate::datastore::IndexScope::Base => {
+				self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id))
+			}
+			crate::datastore::IndexScope::Effective {
+				graph,
+			} => self.record_read(crate::datastore::ConflictKey::GraphClassRange(graph, class_id)),
+		}
+		let Some(mbr) = geometry.mbr()? else {
+			return Ok(Some(QueryGeometryIndexRead::default()));
+		};
+		let candidates = if let Some(generation) = snapshot.root.resident_geometry.get(&index) {
+			if generation.header.spec.class != class_id || generation.header.spec.scope != scope {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"resident geometry binding is incompatible",
+				));
+			}
+			generation.search(mbr, admit)?
+		} else {
+			let Some(physical_snapshot) = &snapshot.physical else {
+				return Ok(None);
+			};
+			if !self.store.inner.has_physical_index(physical_snapshot, index) {
+				return Ok(None);
+			}
+			// Admit the bounded cold header and delta decode before physical
+			// metadata reads.
+			admit(512 * 1024)?;
+			self.query_physical_index(
+				snapshot,
+				index,
+				class_id,
+				crate::datastore::ClassIndexKind::Geometry,
+				scope,
+			)?;
+			let Some(candidates) =
+				self.store.inner.search_geometry_index(physical_snapshot, index, mbr, admit)?
+			else {
+				return Ok(None);
+			};
+			candidates
+		};
+		let graph = match scope {
+			crate::datastore::IndexScope::Base => None,
+			crate::datastore::IndexScope::Effective {
+				graph,
+			} => Some(
+				snapshot
+					.root
+					.graph(graph)
+					.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?,
+			),
+		};
+		admit(candidates.atoms.len().checked_mul(std::mem::size_of::<RecordId>()).ok_or_else(
+			|| FerrosGrynnError::invalid_storage_file("geometry candidate allocation overflows"),
+		)?)?;
+		let mut output = Vec::with_capacity(candidates.atoms.len());
+		for address in candidates.atoms {
+			let address = PhysicalIndexAtom {
+				kind: address.kind(),
+				slot: address.slot(),
+			};
+			let global = if let Some(graph) = graph {
+				graph
+					.occurrence(physical_local_id(graph, address)?)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"geometry candidate references an absent occurrence",
+						)
+					})?
+					.global_id()
+			} else {
+				physical_global_id(&snapshot.root, address)?
+			};
+			let atom =
+				snapshot.root.atom(global).filter(|atom| atom.class_id() == class_id).ok_or_else(
+					|| {
+						FerrosGrynnError::invalid_storage_file(
+							"geometry candidate references an absent or incompatible atom",
+						)
+					},
+				)?;
+			admit(crate::values::runtime::estimated_record_id_heap_bytes(atom.record_id()))?;
+			output.push(atom.record_id().clone());
+		}
+		output.sort_unstable();
+		Ok(Some(QueryGeometryIndexRead {
+			records: output,
+			page_reads: candidates.page_reads,
+			delta_records: candidates.delta_records,
+		}))
+	}
+
+	/// Searches one compatible immutable vector generation.
 	pub(crate) fn query_vector_index(
 		&self,
 		snapshot: &QuerySnapshot,
@@ -1972,6 +2564,9 @@ fn physical_count(index: &PhysicalIndexRead) -> FerrosGrynnResult<u64> {
 		}
 		PhysicalIndexEntries::Vector(_) => {
 			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as vector"))
+		}
+		PhysicalIndexEntries::Geometry(_) => {
+			Err(FerrosGrynnError::invalid_storage_file("Count index decoded as geometry"))
 		}
 	}
 }

@@ -148,6 +148,10 @@ pub struct PropertyHistogram {
 	pub null_fraction: f32,
 	/// Ordered equi-depth buckets.
 	pub buckets: Vec<PropertyBucket>,
+	/// Deterministic bulk sample of at most 1024 nonempty geometry rectangles.
+	pub mbr_sample: Vec<[f64; 4]>,
+	/// Number of nonempty geometry observations represented by the MBR sample.
+	pub mbr_population: u64,
 }
 
 /// Resolved schema field eligible for histogram collection.

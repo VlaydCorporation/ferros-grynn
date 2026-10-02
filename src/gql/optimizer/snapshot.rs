@@ -46,6 +46,10 @@ pub(crate) struct PlannerDemand {
 	pub(crate) graphs: BTreeSet<GraphId>,
 	/// Whether an unbounded graph-catalog source requires every visible graph.
 	pub(crate) all_graphs: bool,
+	/// Whether an explicit approximate step needs Ready sketch bindings.
+	pub(crate) neighbourhood_sketches: bool,
+	/// Whether a shortest-path objective needs directed landmark bindings.
+	pub(crate) landmark_paths: bool,
 	/// Property distributions used by predicates, grouping, or ordering.
 	pub(crate) properties: BTreeSet<PlannerPropertyDemand>,
 	/// Degree distributions used by current MATCH estimates.
@@ -141,6 +145,11 @@ pub(crate) struct PlannerGraph {
 	pub(crate) maximum_in_degree: u64,
 	/// Exact graph-local label counters.
 	pub(crate) labels: BTreeMap<LabelStatisticKey, LabelStatistic>,
+	/// Logical Ready sketch metadata, without artifact payloads or page
+	/// bindings.
+	pub(crate) neighbourhood_sketches: Vec<crate::datastore::QueryNeighbourhoodSketch>,
+	/// Logical Ready path bindings, independent of physical storage pages.
+	pub(crate) landmark_paths: Vec<crate::datastore::QueryLandmarkPath>,
 }
 
 /// One demanded histogram together with its build method.

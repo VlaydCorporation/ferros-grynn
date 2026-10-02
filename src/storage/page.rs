@@ -59,6 +59,8 @@ impl PageMagic {
 	pub(super) const INDEX_BTREE: Self = Self(0x01_42_49_46);
 	/// Count-index marker (`b"FIC\x01"`).
 	pub(super) const INDEX_COUNT: Self = Self(0x01_43_49_46);
+	/// Shared graph-index section marker (`b"FID\x01"`).
+	pub(super) const INDEX_DERIVED: Self = Self(0x01_44_49_46);
 	/// Edge-endpoint-index marker (`b"FIE\x01"`).
 	pub(super) const INDEX_EDGE_ENDPOINT: Self = Self(0x01_45_49_46);
 	/// Full-text-index marker (`b"FIT\x01"`).
@@ -235,8 +237,8 @@ define_page_types! {
 	IndexReachabilityFerrari = 0x0029 => INDEX_REACHABILITY;
 	/// BFL reachability page.
 	IndexReachabilityBfl = 0x002a => INDEX_REACHABILITY;
-	/// Reachability landmark-list page.
-	IndexReachabilityLandmarkList = 0x002b => INDEX_REACHABILITY;
+	/// Exact chain-cover coordinates and reachability cells.
+	IndexReachabilityChainCover = 0x002b => INDEX_REACHABILITY;
 	/// Neighbourhood-index header page.
 	IndexNeighbourhoodHeader = 0x002c => INDEX_NEIGHBOURHOOD;
 	/// Exact-neighbourhood page.
@@ -273,6 +275,10 @@ define_page_types! {
 	PropertyDictionaryRoot = 0x003c => ATOM_STORE;
 	/// Database-global property-key dictionary entry page.
 	PropertyDictionaryEntry = 0x003d => ATOM_STORE;
+	/// Shared fixed-width graph-index section.
+	IndexDerivedArray = 0x003e => INDEX_DERIVED;
+	/// Shared variable-record graph-index section.
+	IndexDerivedRecords = 0x003f => INDEX_DERIVED;
 }
 
 bitflags! {
@@ -749,7 +755,10 @@ mod tests {
 		assert_eq!(PageType::from_raw(0x0038), Some(PageType::AtomStoreSuperblock));
 		assert_eq!(PageType::from_raw(0x003c), Some(PageType::PropertyDictionaryRoot));
 		assert_eq!(PageType::from_raw(0x003d), Some(PageType::PropertyDictionaryEntry));
-		assert_eq!(PageType::from_raw(0x003e), None);
+		assert_eq!(PageType::from_raw(0x002b), Some(PageType::IndexReachabilityChainCover));
+		assert_eq!(PageType::from_raw(0x003e), Some(PageType::IndexDerivedArray));
+		assert_eq!(PageType::from_raw(0x003f), Some(PageType::IndexDerivedRecords));
+		assert_eq!(PageType::from_raw(0x0040), None);
 	}
 
 	#[test]

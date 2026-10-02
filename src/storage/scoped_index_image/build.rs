@@ -224,6 +224,7 @@ pub(super) fn scalar_filename(kind: ClassIndexKind, ordinal: u32) -> String {
 		ClassIndexKind::Fulltext => "ft",
 		ClassIndexKind::Hnsw => "hnsw",
 		ClassIndexKind::DiskAnn => "diskann",
+		ClassIndexKind::Geometry => "geo",
 	};
 	format!("idx/{prefix}_{ordinal:04}.fgidx")
 }

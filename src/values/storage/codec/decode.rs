@@ -94,7 +94,7 @@ impl<'a> Decoder<'a> {
 			0x12 => self.decode_set(depth + 1).map(StorageValue::Set),
 			0x13 => self.decode_object(depth + 1).map(StorageValue::Object),
 			0x15 => self.decode_range(depth + 1, offset).map(StorageValue::Range),
-			0x21..=0x27 => self.decode_geometry(tag, depth + 1).map(StorageValue::Geometry),
+			0x21..=0x27 => self.decode_geometry(tag, depth).map(StorageValue::Geometry),
 			0x31..=0x35 | 0x39..=0x3B => self.decode_vector(tag).map(StorageValue::Vector),
 			0x36 => {
 				let kind = match self.read_u8()? {
@@ -331,30 +331,69 @@ impl<'a> Decoder<'a> {
 	}
 
 	fn decode_geometry(&mut self, tag: u8, depth: usize) -> FerrosGrynnResult<Geometry> {
+		let mut elements = 0;
+		let geometry = self.decode_geometry_inner(tag, depth, &mut elements)?;
+		let scratch = geometry.validation_scratch_bytes()?;
+		let retained = self.allocated;
+		self.charge(scratch)?;
+		geometry.validate().map_err(|cause| {
+			invalid(self.position, "invalid geometry structure").with_cause(cause)
+		})?;
+		self.allocated = retained;
+		Ok(geometry)
+	}
+
+	/// Charges aggregate geometry members before allocating each nested
+	/// container.
+	fn geometry_len(&mut self, elements: &mut usize) -> FerrosGrynnResult<usize> {
+		let count = self.read_fixed_collection_len()?;
+		*elements = elements
+			.checked_add(count)
+			.filter(|count| *count <= Geometry::MAX_ELEMENTS)
+			.ok_or_else(|| limit_error("geometry elements", Geometry::MAX_ELEMENTS, usize::MAX))?;
+		Ok(count)
+	}
+
+	/// Decodes one bounded geometry without allocating a validation copy per
+	/// child.
+	fn decode_geometry_inner(
+		&mut self,
+		tag: u8,
+		depth: usize,
+		elements: &mut usize,
+	) -> FerrosGrynnResult<Geometry> {
 		self.check_depth(depth)?;
 		match tag {
-			0x21 => self.decode_position().map(Geometry::Point),
-			0x22 => self.decode_positions().map(Geometry::LineString),
-			0x23 => self.decode_polygon(depth).map(Geometry::Polygon),
-			0x24 => self.decode_positions().map(Geometry::MultiPoint),
+			0x21 => {
+				*elements = elements
+					.checked_add(1)
+					.filter(|count| *count <= Geometry::MAX_ELEMENTS)
+					.ok_or_else(|| {
+						limit_error("geometry elements", Geometry::MAX_ELEMENTS, usize::MAX)
+					})?;
+				self.decode_position().map(Geometry::Point)
+			}
+			0x22 => self.decode_positions(elements).map(Geometry::LineString),
+			0x23 => self.decode_polygon(depth, elements).map(Geometry::Polygon),
+			0x24 => self.decode_positions(elements).map(Geometry::MultiPoint),
 			0x25 => {
-				let count = self.read_fixed_collection_len()?;
+				let count = self.geometry_len(elements)?;
 				let mut lines = self.allocate_vec(count)?;
 				for _ in 0..count {
-					lines.push(self.decode_positions()?);
+					lines.push(self.decode_positions(elements)?);
 				}
 				Ok(Geometry::MultiLineString(lines))
 			}
 			0x26 => {
-				let count = self.read_fixed_collection_len()?;
+				let count = self.geometry_len(elements)?;
 				let mut polygons = self.allocate_vec(count)?;
 				for _ in 0..count {
-					polygons.push(self.decode_polygon(depth + 1)?);
+					polygons.push(self.decode_polygon(depth, elements)?);
 				}
 				Ok(Geometry::MultiPolygon(polygons))
 			}
 			0x27 => {
-				let count = self.read_fixed_collection_len()?;
+				let count = self.geometry_len(elements)?;
 				let mut geometries = self.allocate_vec(count)?;
 				for _ in 0..count {
 					let offset = self.position;
@@ -365,7 +404,7 @@ impl<'a> Decoder<'a> {
 							"geometry collection contains a non-geometry tag",
 						));
 					}
-					geometries.push(self.decode_geometry(child_tag, depth + 1)?);
+					geometries.push(self.decode_geometry_inner(child_tag, depth + 1, elements)?);
 				}
 				Ok(Geometry::Collection(geometries))
 			}
@@ -373,18 +412,22 @@ impl<'a> Decoder<'a> {
 		}
 	}
 
-	fn decode_polygon(&mut self, depth: usize) -> FerrosGrynnResult<Vec<Vec<Position>>> {
+	fn decode_polygon(
+		&mut self,
+		depth: usize,
+		elements: &mut usize,
+	) -> FerrosGrynnResult<Vec<Vec<Position>>> {
 		self.check_depth(depth)?;
-		let count = self.read_fixed_collection_len()?;
+		let count = self.geometry_len(elements)?;
 		let mut rings = self.allocate_vec(count)?;
 		for _ in 0..count {
-			rings.push(self.decode_positions()?);
+			rings.push(self.decode_positions(elements)?);
 		}
 		Ok(rings)
 	}
 
-	fn decode_positions(&mut self) -> FerrosGrynnResult<Vec<Position>> {
-		let count = self.read_fixed_collection_len()?;
+	fn decode_positions(&mut self, elements: &mut usize) -> FerrosGrynnResult<Vec<Position>> {
+		let count = self.geometry_len(elements)?;
 		let mut positions = self.allocate_vec(count)?;
 		for _ in 0..count {
 			positions.push(self.decode_position()?);

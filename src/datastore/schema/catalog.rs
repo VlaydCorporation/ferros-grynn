@@ -5,7 +5,7 @@ use std::{
 	sync::Arc,
 };
 
-use super::{AnalyzerId, ClassSchema, SchemaAnalyzer};
+use super::{AnalyzerId, ClassSchema, GraphIndex, SchemaAnalyzer};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphTopologyConstraints,
@@ -219,6 +219,8 @@ pub enum SystemIndexKind {
 	Label,
 	/// Role-separated graph adjacency.
 	Adjacency,
+	/// Exact qualified edge-endpoint connector postings.
+	EdgeEndpoint,
 }
 
 /// One engine-owned index definition.
@@ -271,7 +273,9 @@ impl SystemIndex {
 pub struct GraphSchema {
 	version: SchemaVersion,
 	reference: GraphRef,
-	system_indexes: [SystemIndex; 2],
+	system_indexes: Vec<SystemIndex>,
+	/// User definitions in stable identity order.
+	pub(crate) indexes: Vec<GraphIndex>,
 	properties: PropertyMap,
 	topology_constraints: GraphTopologyConstraints,
 	root: Option<RecordId>,
@@ -294,7 +298,8 @@ impl GraphSchema {
 		Self {
 			version,
 			reference,
-			system_indexes: [label, adjacency],
+			system_indexes: vec![label, adjacency],
+			indexes: Vec::new(),
 			properties,
 			topology_constraints,
 			root,
@@ -369,9 +374,45 @@ impl GraphSchema {
 		Ok(replacement)
 	}
 
-	/// Returns the label and adjacency capabilities owned by the engine.
+	/// Returns the label, adjacency, and optional endpoint engine capabilities.
 	pub fn system_indexes(&self) -> impl ExactSizeIterator<Item = &SystemIndex> {
 		self.system_indexes.iter()
+	}
+
+	/// Returns the synchronous endpoint capability after its first creation.
+	pub fn edge_endpoint_index(&self) -> Option<SystemIndex> {
+		self.system_indexes
+			.iter()
+			.copied()
+			.find(|index| index.kind() == SystemIndexKind::EdgeEndpoint)
+	}
+
+	/// Installs a previously absent endpoint capability without changing core
+	/// identities.
+	pub(crate) fn with_edge_endpoint_index(
+		mut self,
+		index: SystemIndex,
+	) -> FerrosGrynnResult<Self> {
+		if index.kind() != SystemIndexKind::EdgeEndpoint || self.edge_endpoint_index().is_some() {
+			return Err(FerrosGrynnError::invalid_argument(
+				"edge endpoint capability is invalid or already present",
+			));
+		}
+		self.system_indexes.push(index);
+		Ok(self)
+	}
+
+	/// Returns graph-owned user index definitions in stable identity order.
+	pub fn indexes(&self) -> impl ExactSizeIterator<Item = &GraphIndex> {
+		self.indexes.iter()
+	}
+
+	/// Replaces graph-owned definitions without changing engine capabilities.
+	pub(crate) fn replace_indexes(&self, indexes: Vec<GraphIndex>) -> FerrosGrynnResult<Self> {
+		let mut replacement = self.clone();
+		replacement.version = replacement.version.next()?;
+		replacement.indexes = indexes;
+		Ok(replacement)
 	}
 }
 
@@ -720,6 +761,14 @@ impl SchemaCatalog {
 		self.graphs.values()
 	}
 
+	/// Reports indexes whose immutable physical generations must be pinned at
+	/// begin.
+	pub(crate) fn has_snapshot_indexes(&self) -> bool {
+		self.classes().any(|class| {
+			class.indexes().any(|index| index.kind() == super::ClassIndexKind::Geometry)
+		}) || self.all_graphs().any(|graph| graph.edge_endpoint_index().is_some())
+	}
+
 	/// Iterates class definitions in stable identity order.
 	pub fn classes(&self) -> impl ExactSizeIterator<Item = &Arc<ClassSchema>> {
 		self.classes.values()
@@ -764,7 +813,7 @@ impl SchemaCatalog {
 	}
 }
 
-fn validate_catalog_name(name: &str, subject: &str) -> FerrosGrynnResult<()> {
+pub(super) fn validate_catalog_name(name: &str, subject: &str) -> FerrosGrynnResult<()> {
 	if name.is_empty() || name.contains('\0') {
 		return Err(FerrosGrynnError::invalid_argument(format!(
 			"{subject} must be non-empty and must not contain NUL"

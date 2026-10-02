@@ -46,7 +46,10 @@ impl<Address: Copy + Ord> IndexEntries<Address> {
 			ClassIndexKind::Standard => Self::Standard(BTreeMap::new()),
 			ClassIndexKind::Unique => Self::Unique(BTreeMap::new()),
 			ClassIndexKind::Count => Self::Count(0),
-			ClassIndexKind::Fulltext | ClassIndexKind::Hnsw | ClassIndexKind::DiskAnn => {
+			ClassIndexKind::Fulltext
+			| ClassIndexKind::Hnsw
+			| ClassIndexKind::DiskAnn
+			| ClassIndexKind::Geometry => {
 				unreachable!("specialized indexes do not use the scalar index store")
 			}
 		}

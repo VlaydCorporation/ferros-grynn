@@ -92,6 +92,14 @@ impl<'a, Read: QueryRead> CrossLevelExpandCursor<'a, Read> {
 		)? {
 			return Ok(None);
 		}
+		let contribution = fixed_hop_cost(
+			&edge_graph,
+			&edge_ref,
+			&self.expand,
+			candidate.edge.atom,
+			self.predicate,
+			control,
+		)?;
 		append_scoped_trace_hop(
 			&mut row,
 			candidate,
@@ -100,7 +108,7 @@ impl<'a, Read: QueryRead> CrossLevelExpandCursor<'a, Read> {
 			&target_graph,
 			&target_ref,
 			self.trace.as_ref(),
-			Number::Int(1),
+			contribution,
 			control,
 		)?;
 		row.current = Some(candidate.target);

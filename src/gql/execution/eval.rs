@@ -438,6 +438,35 @@ fn eval_current(
 			}
 		}
 		TypedExprKind::Builtin {
+			function: Builtin::PathCostWith(cost),
+			arguments,
+		} => {
+			let argument = arguments.first().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("custom path cost has no path")
+			})?;
+			let value = eval_current(argument, row, slots, source, fields, current, control)?;
+			let Value::Path(path) = value else {
+				return Err(FerrosGrynnError::invalid_argument("path::cost requires a path"));
+			};
+			let fields = fields.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("custom path cost requires a field resolver")
+			})?;
+			let control = control.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("custom path cost requires an execution session")
+			})?;
+			custom_path_cost(
+				&path,
+				*cost,
+				MatchPredicateContext {
+					slots: slots.values(),
+					source,
+					fields,
+				},
+				control,
+			)
+			.map(Value::Number)
+		}
+		TypedExprKind::Builtin {
 			function,
 			arguments,
 		} => arguments
@@ -474,13 +503,14 @@ fn eval_current(
 			if closure.session_owner().is_none() {
 				closure.call(&arguments)
 			} else {
-				invoke_expression_closure(
+				invoke_expression_closure_with_fields(
 					control.ok_or_else(|| {
 						FerrosGrynnError::closure_requires_session(closure.id().get())
 					})?,
 					&closure,
 					&arguments,
 					source,
+					fields,
 				)
 			}
 		}
@@ -501,7 +531,7 @@ fn eval_current(
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			let plan = control.resolve_named_function(*function)?;
 			let _frame = control.enter_named_function(*function)?;
-			invoke_logical_closure(control, &plan, &[], &arguments, source)
+			invoke_logical_closure_with_fields(control, &plan, &[], &arguments, source, fields)
 		}
 		TypedExprKind::Traversal(_) => Err(FerrosGrynnError::invalid_argument(
 			"Traversal expression requires the transaction-aware evaluator.",
@@ -590,13 +620,31 @@ pub(super) fn invoke_expression_closure(
 	arguments: &[Value],
 	source: &str,
 ) -> FerrosGrynnResult<Value> {
+	invoke_expression_closure_with_fields(control, closure, arguments, source, None)
+}
+
+/// Preserves the captured snapshot resolver through nested language closures.
+fn invoke_expression_closure_with_fields(
+	control: &ExecutionControl,
+	closure: &crate::values::Closure,
+	arguments: &[Value],
+	source: &str,
+	fields: Option<&dyn AtomFieldRead>,
+) -> FerrosGrynnResult<Value> {
 	let entry = control.resolve_closure(closure)?;
 	let _frame = entry
 		.plan
 		.named_function
 		.map(|function| control.enter_named_function(function))
 		.transpose()?;
-	invoke_logical_closure(control, &entry.plan, &entry.captures, arguments, source)
+	invoke_logical_closure_with_fields(
+		control,
+		&entry.plan,
+		&entry.captures,
+		arguments,
+		source,
+		fields,
+	)
 }
 
 pub(in crate::gql) fn invoke_logical_closure(
@@ -606,13 +654,71 @@ pub(in crate::gql) fn invoke_logical_closure(
 	arguments: &[Value],
 	source: &str,
 ) -> FerrosGrynnResult<Value> {
+	invoke_logical_closure_with_fields(control, plan, captures, arguments, source, None)
+}
+
+/// Evaluates one PURE function with the immutable builder's field resolver.
+///
+/// # Errors
+/// Propagates typed evaluation, field resolution and bounded execution errors.
+pub(in crate::gql) fn invoke_root_logical_closure(
+	root: &crate::datastore::DatabaseRoot,
+	control: &ExecutionControl,
+	plan: &LogicalClosure,
+	arguments: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<Value> {
+	invoke_logical_closure_with_fields(
+		control,
+		plan,
+		&[],
+		arguments,
+		source,
+		Some(&RootFields(root)),
+	)
+}
+
+/// Evaluates the existing typed IR while retaining resolver scope in every
+/// call.
+pub(in crate::gql::execution) fn invoke_logical_closure_with_fields(
+	control: &ExecutionControl,
+	plan: &LogicalClosure,
+	captures: &[(u32, Value)],
+	arguments: &[Value],
+	source: &str,
+	fields: Option<&dyn AtomFieldRead>,
+) -> FerrosGrynnResult<Value> {
 	if plan.parameters.len() != arguments.len() {
 		return Err(FerrosGrynnError::conversion_error(
 			format!("{} closure arguments", arguments.len()),
 			format!("{} arguments", plan.parameters.len()),
 		));
 	}
-	let mut slots = vec![Value::None; plan.slot_count];
+	control.check()?;
+	let frame_bytes = captures
+		.iter()
+		.map(|(_, value)| value)
+		.chain(arguments)
+		.fold(plan.slot_count.checked_mul(std::mem::size_of::<Value>()), |bytes, value| {
+			bytes?.checked_add(value.estimated_heap_bytes())
+		})
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("PURE frame scratch"))?;
+	let mut frame = control.barrier_account();
+	if !frame.reserve(frame_bytes) {
+		return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+			"PURE frame scratch",
+			control.barrier_memory_limit() as u64,
+		));
+	}
+	let mut slots = Vec::new();
+	slots.try_reserve_exact(plan.slot_count).map_err(|cause| {
+		FerrosGrynnError::traversal_resource_limit_exceeded(
+			"PURE frame allocation",
+			control.barrier_memory_limit() as u64,
+		)
+		.with_technical_source(cause)
+	})?;
+	slots.resize(plan.slot_count, Value::None);
 	for (slot, value) in captures {
 		let target = slots.get_mut(*slot as usize).ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("Closure capture slot is outside its typed frame.")
@@ -627,11 +733,11 @@ pub(in crate::gql) fn invoke_logical_closure(
 	}
 	match &plan.body {
 		crate::gql::ir::LogicalClosureBody::Expression(expression) => {
-			eval_mut(expression, None, &mut slots, source, None, Some(control))
+			eval_mut(expression, None, &mut slots, source, fields, Some(control))
 		}
 		crate::gql::ir::LogicalClosureBody::Block(block) => {
 			let mut runtime = super::ControlRuntime::default();
-			match execute_pure_block(block, &mut slots, source, control, &mut runtime, 1)? {
+			match execute_pure_block(block, &mut slots, source, control, &mut runtime, 1, fields)? {
 				PureControlFlow::Value(value) | PureControlFlow::Return(value) => Ok(value),
 				PureControlFlow::Break | PureControlFlow::Continue => {
 					Err(FerrosGrynnError::invalid_argument(
@@ -657,11 +763,20 @@ fn execute_pure_block(
 	control: &ExecutionControl,
 	runtime: &mut super::ControlRuntime,
 	depth: u32,
+	fields: Option<&dyn AtomFieldRead>,
 ) -> FerrosGrynnResult<PureControlFlow> {
 	let mut last = Value::None;
 	for statement in &block.statements {
 		let child = control.child(statement.timeout);
-		match execute_pure_statement(&statement.statement, slots, source, &child, runtime, depth)? {
+		match execute_pure_statement(
+			&statement.statement,
+			slots,
+			source,
+			&child,
+			runtime,
+			depth,
+			fields,
+		)? {
 			PureControlFlow::Value(value) => last = value,
 			flow @ (PureControlFlow::Return(_)
 			| PureControlFlow::Break
@@ -678,6 +793,7 @@ fn execute_pure_statement(
 	control: &ExecutionControl,
 	runtime: &mut super::ControlRuntime,
 	depth: u32,
+	fields: Option<&dyn AtomFieldRead>,
 ) -> FerrosGrynnResult<PureControlFlow> {
 	use crate::gql::ir::{LogicalLetValue, LogicalStatement};
 
@@ -694,31 +810,39 @@ fn execute_pure_statement(
 			value: LogicalLetValue::Expression(value),
 			..
 		} => {
-			slots[*slot as usize] = eval_mut(value, None, slots, source, None, Some(control))?;
+			slots[*slot as usize] = eval_mut(value, None, slots, source, fields, Some(control))?;
 			Value::None
 		}
 		LogicalStatement::Return {
 			value,
 		} => {
-			return eval_mut(value, None, slots, source, None, Some(control))
+			return eval_mut(value, None, slots, source, fields, Some(control))
 				.map(PureControlFlow::Return);
 		}
 		LogicalStatement::Expression {
 			value,
-		} => eval_mut(value, None, slots, source, None, Some(control))?,
+		} => eval_mut(value, None, slots, source, fields, Some(control))?,
 		LogicalStatement::If {
 			branches,
 			else_block,
 		} => {
 			let mut selected = None;
 			for (condition, block) in branches {
-				if eval_mut(condition, None, slots, source, None, Some(control))?.is_truthy() {
+				if eval_mut(condition, None, slots, source, fields, Some(control))?.is_truthy() {
 					selected = Some(block);
 					break;
 				}
 			}
 			if let Some(block) = selected.or(else_block.as_ref()) {
-				return execute_pure_block(block, slots, source, control, runtime, depth + 1);
+				return execute_pure_block(
+					block,
+					slots,
+					source,
+					control,
+					runtime,
+					depth + 1,
+					fields,
+				);
 			}
 			Value::None
 		}
@@ -732,7 +856,7 @@ fn execute_pure_statement(
 				None,
 				slots,
 				source,
-				None,
+				fields,
 				Some(control),
 			)?)?;
 			let mut last = Value::None;
@@ -740,7 +864,8 @@ fn execute_pure_statement(
 				control.check()?;
 				super::record_iteration(runtime, control)?;
 				slots[*slot as usize] = value;
-				match execute_pure_block(body, slots, source, control, runtime, depth + 1)? {
+				match execute_pure_block(body, slots, source, control, runtime, depth + 1, fields)?
+				{
 					PureControlFlow::Value(value) => last = value,
 					PureControlFlow::Break => break,
 					PureControlFlow::Continue => continue,
@@ -754,10 +879,11 @@ fn execute_pure_statement(
 			body,
 		} => {
 			let mut last = Value::None;
-			while eval_mut(condition, None, slots, source, None, Some(control))?.is_truthy() {
+			while eval_mut(condition, None, slots, source, fields, Some(control))?.is_truthy() {
 				control.check()?;
 				super::record_iteration(runtime, control)?;
-				match execute_pure_block(body, slots, source, control, runtime, depth + 1)? {
+				match execute_pure_block(body, slots, source, control, runtime, depth + 1, fields)?
+				{
 					PureControlFlow::Value(value) => last = value,
 					PureControlFlow::Break => break,
 					PureControlFlow::Continue => continue,
@@ -773,7 +899,7 @@ fn execute_pure_statement(
 			catch,
 		} => {
 			let saved_slots = slots.to_vec();
-			match execute_pure_block(body, slots, source, control, runtime, depth + 1) {
+			match execute_pure_block(body, slots, source, control, runtime, depth + 1, fields) {
 				Ok(flow) => return Ok(flow),
 				Err(error) if catch.as_ref().is_some_and(|_| super::catchable(&error)) => {
 					slots.clone_from_slice(&saved_slots);
@@ -782,7 +908,15 @@ fn execute_pure_statement(
 					})?;
 					slots[*slot as usize] =
 						Value::Error(Box::new(crate::values::ErrorValue::from_error(&error)));
-					return execute_pure_block(handler, slots, source, control, runtime, depth + 1);
+					return execute_pure_block(
+						handler,
+						slots,
+						source,
+						control,
+						runtime,
+						depth + 1,
+						fields,
+					);
 				}
 				Err(error) => return Err(error),
 			}
@@ -790,7 +924,8 @@ fn execute_pure_statement(
 		LogicalStatement::Throw {
 			value,
 		} => {
-			let Value::String(message) = eval_mut(value, None, slots, source, None, Some(control))?
+			let Value::String(message) =
+				eval_mut(value, None, slots, source, fields, Some(control))?
 			else {
 				return Err(FerrosGrynnError::invalid_argument("THROW requires a string value."));
 			};
@@ -907,6 +1042,35 @@ pub(super) fn binary(
 	right: Value,
 ) -> FerrosGrynnResult<Value> {
 	match operator {
+		BinaryOperator::Inside
+		| BinaryOperator::NotInside
+		| BinaryOperator::Outside
+		| BinaryOperator::Intersects => spatial(operator, &left, &right).map(Value::Bool),
+		BinaryOperator::AllInside | BinaryOperator::AnyInside | BinaryOperator::NoneInside => {
+			if matches!(left, Value::None | Value::Null)
+				|| matches!(right, Value::None | Value::Null)
+			{
+				return Ok(Value::Bool(false));
+			}
+			let Value::Geometry(geometry) = &right else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"Spatial quantifiers require a geometry right operand.",
+				));
+			};
+			geometry.validate()?;
+			let mut any = false;
+			let mut all = true;
+			for value in collection_values(&left)? {
+				let matched = spatial(BinaryOperator::Inside, value, &right)?;
+				any |= matched;
+				all &= matched;
+			}
+			Ok(Value::Bool(match operator {
+				BinaryOperator::AllInside => all,
+				BinaryOperator::AnyInside => any,
+				_ => !any,
+			}))
+		}
 		BinaryOperator::Power
 		| BinaryOperator::Multiply
 		| BinaryOperator::Divide
@@ -983,6 +1147,25 @@ pub(super) fn binary(
 		BinaryOperator::Pipeline => {
 			Err(FerrosGrynnError::query_feature_not_supported("expression pipeline"))
 		}
+	}
+}
+
+/// Shared exact spatial predicate; sentinel checks precede every negation.
+fn spatial(operator: BinaryOperator, left: &Value, right: &Value) -> FerrosGrynnResult<bool> {
+	if matches!(left, Value::None | Value::Null) || matches!(right, Value::None | Value::Null) {
+		return Ok(false);
+	}
+	let (Value::Geometry(left), Value::Geometry(right)) = (left, right) else {
+		return Err(FerrosGrynnError::invalid_argument(
+			"Spatial operators require geometry operands.",
+		));
+	};
+	match operator {
+		BinaryOperator::Intersects => left.intersects(right),
+		BinaryOperator::NotInside | BinaryOperator::Outside => {
+			left.within(right).map(|matched| !matched)
+		}
+		_ => left.within(right),
 	}
 }
 
@@ -1245,6 +1428,17 @@ fn index_value(base: Value, index: Value) -> FerrosGrynnResult<Value> {
 
 pub(super) fn cast(value: Value, target: &Type) -> FerrosGrynnResult<Value> {
 	match target {
+		Type::Geometry => match value {
+			Value::Geometry(geometry) => {
+				geometry.validate()?;
+				Ok(Value::Geometry(geometry))
+			}
+			Value::String(value) => value.parse::<crate::values::Geometry>().map(Value::Geometry),
+			Value::Object(object) => {
+				crate::values::Geometry::from_object(&object).map(Value::Geometry)
+			}
+			_ => Err(FerrosGrynnError::conversion_error(value.kind().to_string(), "geometry")),
+		},
 		Type::Any => Ok(value),
 		Type::Bool => Ok(Value::Bool(value.is_truthy())),
 		Type::String => Ok(Value::from(value.to_string())),

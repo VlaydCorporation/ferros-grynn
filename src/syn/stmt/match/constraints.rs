@@ -19,10 +19,10 @@ impl Parser<'_> {
 	/// Parses local connector constraints until no recognized term remains.
 	pub(super) fn local_match_constraints(
 		&mut self,
-	) -> FerrosGrynnResult<(MatchConstraints, Option<Identifier>)> {
+	) -> FerrosGrynnResult<(MatchConstraints, Option<FunctionSignatureName>)> {
 		let constraints = self.match_constraints_until(None)?;
 		let custom_cost = if self.consume_keyword(keywords::COST).is_some() {
-			Some(self.identifier()?)
+			Some(self.function_signature_name()?)
 		} else {
 			None
 		};

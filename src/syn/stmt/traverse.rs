@@ -32,6 +32,8 @@ pub struct TraverseStatement {
 	pub constraints: MatchConstraints,
 	pub source: TraverseSource,
 	pub graph: Option<Expr>,
+	/// Versioned PURE contribution for path-generating traversal operations.
+	pub custom_cost: Option<FunctionSignatureName>,
 	pub steps: Vec<TraverseStep>,
 	pub returning: Option<ReturnStatement>,
 	pub return_graph: Option<ReturnGraph>,
@@ -66,6 +68,12 @@ impl Parser<'_> {
 		} else {
 			None
 		};
+		let custom_cost = if self.consume_keyword(keywords::WITH).is_some() {
+			self.expect_keyword(keywords::COST, "Expected `COST` after `WITH` in TRAVERSE.")?;
+			Some(self.function_signature_name()?)
+		} else {
+			None
+		};
 		let mut steps = Vec::new();
 		while let Some(pipeline) = self.consume_symbol(Symbol::Pipeline) {
 			let expression = context.run(|context| self.expression(context, 2, 1, 0)).await?;
@@ -94,6 +102,7 @@ impl Parser<'_> {
 			constraints,
 			source,
 			graph,
+			custom_cost,
 			steps,
 			returning,
 			return_graph,

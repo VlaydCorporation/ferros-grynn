@@ -88,6 +88,7 @@ fn explainable(statement: &StatementKind) -> bool {
 			| StatementKind::DefineClass(_)
 			| StatementKind::DefineField(_)
 			| StatementKind::DefineIndex(_)
+			| StatementKind::DefineGraphIndex(_)
 			| StatementKind::Remove(_)
 			| StatementKind::Alter(_)
 			| StatementKind::Match(_)

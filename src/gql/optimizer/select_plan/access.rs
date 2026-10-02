@@ -224,6 +224,35 @@ pub(super) fn plan_source(
 			}
 			continue;
 		}
+		if index.kind == ClassIndexKind::Geometry {
+			if let Some(column) = index
+				.fields
+				.first()
+				.and_then(|field| source.schema.index_of(field.as_str()))
+				.map(|local| offset + local)
+				&& logical
+					.filter
+					.as_ref()
+					.and_then(|filter| spatial_query(filter, column))
+					.is_some()
+			{
+				let estimate =
+					estimate_predicate(logical, snapshot, baseline, logical.filter.as_ref()).0;
+				candidates.push((
+					lookup_cost(1, estimate, weights),
+					index.id,
+					SourceOperator::GeometryIndexScan {
+						index: index.id,
+						name: index.name.as_str().into(),
+						column,
+						forced: forced.is_some(),
+					},
+					estimate,
+					false,
+				));
+			}
+			continue;
+		}
 		if let Some(search) = search_access_operator(logical.filter.as_ref(), index) {
 			let estimate =
 				estimate_predicate(logical, snapshot, baseline, logical.filter.as_ref()).0;
@@ -336,6 +365,66 @@ fn search_access_operator(
 			.or_else(|| search_access_operator(Some(right), index)),
 		_ => None,
 	}
+}
+
+/// Returns the row-independent query geometry of one positive field predicate.
+pub(in crate::gql) fn spatial_query(expression: &TypedExpr, column: usize) -> Option<&TypedExpr> {
+	let (left, right, symmetric) = match &expression.kind {
+		TypedExprKind::Binary {
+			left,
+			op: BinaryOperator::And,
+			..
+		} => return spatial_query(left, column),
+		TypedExprKind::Binary {
+			left,
+			op: BinaryOperator::Inside,
+			right,
+		} => (left.as_ref(), right.as_ref(), false),
+		TypedExprKind::Binary {
+			left,
+			op: BinaryOperator::Intersects,
+			right,
+		} => (left.as_ref(), right.as_ref(), true),
+		TypedExprKind::Builtin {
+			function:
+				function @ (crate::gql::ir::Builtin::GeoWithin | crate::gql::ir::Builtin::GeoIntersects),
+			arguments,
+		} => {
+			let [left, right] = arguments.as_slice() else {
+				return None;
+			};
+			(left, right, *function == crate::gql::ir::Builtin::GeoIntersects)
+		}
+		_ => return None,
+	};
+	if matches!(left.kind, TypedExprKind::Column(found) if found == column)
+		&& spatial_constant(right)
+	{
+		Some(right)
+	} else if symmetric
+		&& matches!(right.kind, TypedExprKind::Column(found) if found == column)
+		&& spatial_constant(left)
+	{
+		Some(left)
+	} else {
+		None
+	}
+}
+
+/// Keeps effectful or row-dependent expressions on the ordinary exact path.
+fn spatial_constant(expression: &TypedExpr) -> bool {
+	matches!(
+		&expression.kind,
+		TypedExprKind::Constant(
+			crate::values::Value::Geometry(_)
+				| crate::values::Value::None
+				| crate::values::Value::Null
+		)
+	) || matches!(&expression.kind, TypedExprKind::Slot(_))
+		&& matches!(
+			&expression.ty,
+			crate::values::Type::Geometry | crate::values::Type::None | crate::values::Type::Null
+		)
 }
 
 fn validate_forced_index(

@@ -466,6 +466,17 @@ impl QueryRead for TransactionRead<'_> {
 					.map_or_else(std::collections::BTreeMap::new, |statistics| {
 						statistics.labels.clone()
 					}),
+				neighbourhood_sketches: if demand.neighbourhood_sketches {
+					self.transaction
+						.query_neighbourhood_sketches(&self.snapshot, graph.reference())?
+				} else {
+					Vec::new()
+				},
+				landmark_paths: if demand.landmark_paths {
+					self.transaction.query_landmark_paths(&self.snapshot, graph.reference())?
+				} else {
+					Vec::new()
+				},
 			});
 		}
 		let mut property_histograms = std::collections::BTreeMap::new();
@@ -659,6 +670,62 @@ impl QueryRead for TransactionRead<'_> {
 						.collect(),
 				})
 			},
+		)
+	}
+
+	fn geometry_index(
+		&self,
+		_snapshot: Snapshot,
+		class: &str,
+		graph: Option<&GraphRef>,
+		index: crate::datastore::IndexId,
+		query: &crate::values::Geometry,
+		admit: &mut dyn FnMut(usize) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Option<crate::datastore::QueryGeometryIndexRead>> {
+		let class = self.transaction.query_class(&self.snapshot, class)?;
+		let class_id = class.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("published class has no identity")
+		})?;
+		let scope = graph.map_or(crate::datastore::IndexScope::Base, |graph| {
+			crate::datastore::IndexScope::Effective {
+				graph: graph.id(),
+			}
+		});
+		self.transaction.query_geometry_index(&self.snapshot, index, class_id, scope, query, admit)
+	}
+
+	fn path_lower_bound(
+		&self,
+		_snapshot: Snapshot,
+		binding: &crate::datastore::QueryLandmarkPath,
+		source: AtomId,
+		target: AtomId,
+	) -> FerrosGrynnResult<Option<Number>> {
+		self.transaction.query_path_lower_bound(&self.snapshot, binding, source, target)
+	}
+
+	fn k_hop_estimate(
+		&self,
+		_snapshot: Snapshot,
+		occurrence: &AtomOccurrenceRef,
+		mode: crate::graph::TraversalSemantics,
+		radius: u32,
+		index: Option<crate::datastore::IndexId>,
+		scratch_bytes: usize,
+		max_work: u64,
+		admit: &mut dyn FnMut(usize) -> FerrosGrynnResult<()>,
+		check: &mut dyn FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<crate::datastore::QueryNeighbourhoodEstimate> {
+		self.transaction.query_k_hop_estimate(
+			&self.snapshot,
+			occurrence,
+			mode,
+			radius,
+			index,
+			scratch_bytes,
+			max_work,
+			admit,
+			check,
 		)
 	}
 
@@ -968,15 +1035,7 @@ impl QueryRead for TransactionRead<'_> {
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
 		let snapshot = self.snapshot.clone();
-		let value = if matches!(
-			statement,
-			LogicalSchemaStatement::InfoDatabase
-				| LogicalSchemaStatement::InfoAnalyzer { .. }
-				| LogicalSchemaStatement::InfoClass { .. }
-				| LogicalSchemaStatement::InfoIndex { .. }
-				| LogicalSchemaStatement::InfoParameter { .. }
-				| LogicalSchemaStatement::InfoFunction { .. }
-		) {
+		let value = if statement.statement_kind() == crate::gql::QueryStatementKind::Info {
 			execute_schema(self.transaction, &snapshot, statement, slots, source, control)?
 		} else {
 			self.transaction.atomic_mutation(|transaction| {

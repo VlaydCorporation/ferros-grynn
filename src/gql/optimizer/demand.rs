@@ -90,6 +90,7 @@ impl PlannerDemand {
 								(&expand.source, &expand.edge, &expand.target, expand.direction)
 							}
 							MatchOp::PathExpand(expand) => {
+								demand.landmark_paths |= expand.objective.is_some();
 								(&expand.source, &expand.edge, &expand.target, expand.direction)
 							}
 						};
@@ -150,6 +151,14 @@ impl PlannerDemand {
 			}
 		}
 		for step in &statement.steps {
+			demand.neighbourhood_sketches |=
+				step.kind == crate::gql::ir::TraverseStepKind::KHopEstimate;
+			demand.landmark_paths |= matches!(
+				step.kind,
+				crate::gql::ir::TraverseStepKind::ShortestPath
+					| crate::gql::ir::TraverseStepKind::WeightedShortestPath
+					| crate::gql::ir::TraverseStepKind::DistanceTo
+			);
 			if let Some(child) = &step.match_plan {
 				demand.merge(Self::for_match(child));
 			}
@@ -303,6 +312,8 @@ impl PlannerDemand {
 		self.classes.extend(other.classes);
 		self.graphs.extend(other.graphs);
 		self.all_graphs |= other.all_graphs;
+		self.neighbourhood_sketches |= other.neighbourhood_sketches;
+		self.landmark_paths |= other.landmark_paths;
 		self.properties.extend(other.properties);
 		for (graph, keys) in other.degrees {
 			self.degrees.entry(graph).or_default().extend(keys);

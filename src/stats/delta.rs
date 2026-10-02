@@ -184,6 +184,8 @@ impl StatisticsStore {
 					undirected,
 					"total undirected degree",
 				)?;
+				statistics.maximum_out_degree = statistics.maximum_out_degree.min(statistics.total_out_degree);
+				statistics.maximum_in_degree = statistics.maximum_in_degree.min(statistics.total_in_degree);
 			}
 		}
 		if let Some(label) = occurrence.label() {
@@ -209,6 +211,21 @@ impl StatisticsStore {
 	) -> FerrosGrynnResult<()> {
 		let before_count = effective_property_count(atom.properties(), before)?;
 		let after_count = effective_property_count(atom.properties(), after)?;
+		if let (OccurrenceState::Edge { topology: before, .. }, OccurrenceState::Edge { topology: after, .. }) = (before.state(), after.state())
+			&& before != after {
+			let before = topology_counts(before)?;
+			let after = topology_counts(after)?;
+			let statistics = self.graph_mut(graph).ok_or_else(|| invalid("statistics graph is absent"))?;
+			for (total, old, new) in [
+				(&mut statistics.total_out_degree, before[0], after[0]),
+				(&mut statistics.total_in_degree, before[1], after[1]),
+				(&mut statistics.total_undirected_degree, before[2], after[2]),
+			] {
+				*total = total.checked_sub(old).and_then(|value| value.checked_add(new)).ok_or_else(|| invalid("topology degree delta exceeds its counter domain"))?;
+			}
+			statistics.maximum_out_degree = statistics.total_out_degree;
+			statistics.maximum_in_degree = statistics.total_in_degree;
+		}
 		if before.label() != after.label() {
 			self.remove_label(graph, atom, before, before_count)?;
 			self.add_label(graph, atom, after, after_count)?;

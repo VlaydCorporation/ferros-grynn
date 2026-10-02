@@ -30,7 +30,7 @@ pub(in crate::gql) use adapter::query_schema;
 pub(crate) use adapter::{analyze_parsed_transaction, execute_parsed_statement_with_bindings};
 pub use adapter::{execute_transaction, execute_transaction_with_options};
 use dml::{execute_dml, execute_graph_dml};
-pub(in crate::gql) use eval::invoke_logical_closure;
+pub(in crate::gql) use eval::{invoke_logical_closure, invoke_root_logical_closure};
 use rust_decimal::Decimal;
 use schema::execute_schema;
 use select::execute_select;
@@ -937,6 +937,22 @@ fn eval_query_expression_current<Read: QueryRead>(
 				ty: expression.ty.clone(),
 				span: expression.span,
 			};
+			if matches!(function, Builtin::PathCostWith(_)) {
+				let fields = RecordFields {
+					read,
+					snapshot: read.snapshot()?,
+					graph: None,
+				};
+				return eval_mut_current(
+					&expression,
+					None,
+					slots,
+					source,
+					Some(&fields),
+					current,
+					Some(control),
+				);
+			}
 			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
 		}
 		TypedExprKind::Range {
@@ -1155,9 +1171,13 @@ fn query_expression_requires_read(expression: &TypedExpr) -> bool {
 				|| else_value.as_deref().is_some_and(query_expression_requires_read)
 		}
 		TypedExprKind::Builtin {
+			function,
 			arguments,
 			..
-		} => arguments.iter().any(query_expression_requires_read),
+		} => {
+			matches!(function, Builtin::PathCostWith(_))
+				|| arguments.iter().any(query_expression_requires_read)
+		}
 		TypedExprKind::Aggregate {
 			argument,
 			..
@@ -1312,6 +1332,8 @@ fn invoke_logical_closure_with_read<Read: QueryRead>(
 						Arc::new(occurrence.graph().clone()),
 					);
 					eval(expression, None, &slots, source, Some(&fields), Some(control))
+				} else if query_expression_requires_read(expression) {
+					eval_query_expression(read, expression, &mut slots, source, control, runtime)
 				} else {
 					eval(expression, None, &slots, source, None, Some(control))
 				}
@@ -1755,6 +1777,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 								operator,
 								crate::gql::optimizer::MatchOperator::BreadthFirstShortest { .. }
 									| crate::gql::optimizer::MatchOperator::DijkstraShortest { .. }
+									| crate::gql::optimizer::MatchOperator::LandmarkShortest { .. }
 							);
 							if !shortest
 								&& !matches!(
@@ -1813,6 +1836,9 @@ fn visit_match_with_environment<Read: QueryRead>(
 									expand,
 									match_predicate,
 									trace.clone(),
+									read,
+									snapshot,
+									match operator { crate::gql::optimizer::MatchOperator::LandmarkShortest { binding, .. } => Some(binding.clone()), _ => None },
 								))
 							} else {
 								let index = index.clone().ok_or_else(|| {

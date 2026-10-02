@@ -488,6 +488,21 @@ pub(super) fn encode_unique_leaf<Address: PrimaryAddress>(
 	next: Option<PageNo>,
 	entries: &[PrimaryIndexEntry<Address>],
 ) -> FerrosGrynnResult<()> {
+	encode_unique_leaf_with_type(page, page_no, page_lsn, next, entries, PageType::IndexUniqueBtreeLeaf)
+}
+
+/// Reuses the unique leaf codec for the engine-owned endpoint access path.
+pub(super) fn encode_unique_leaf_with_type<Address: PrimaryAddress>(
+	page: &mut AlignedPage,
+	page_no: PageNo,
+	page_lsn: PageLsn,
+	next: Option<PageNo>,
+	entries: &[PrimaryIndexEntry<Address>],
+	leaf_type: PageType,
+) -> FerrosGrynnResult<()> {
+	if !matches!(leaf_type, PageType::IndexUniqueBtreeLeaf | PageType::IndexEdgeEndpointEntry) {
+		return Err(invalid_index("unique leaf page type is incompatible"));
+	}
 	let count = u16::try_from(entries.len())
 		.map_err(|_error| invalid_index("primary leaf entry count exceeds u16"))?;
 	let area_start = LEAF_OFFSETS_OFFSET + entries.len() * size_of::<u16>();
@@ -500,7 +515,7 @@ pub(super) fn encode_unique_leaf<Address: PrimaryAddress>(
 		.checked_sub(data_bytes)
 		.filter(|start| *start >= area_start)
 		.ok_or_else(|| invalid_index("primary leaf data overlaps its directory"))?;
-	page.reset(PageType::IndexUniqueBtreeLeaf, PageFlags::LEAF, page_lsn, page_no);
+	page.reset(leaf_type, PageFlags::LEAF, page_lsn, page_no);
 	write_u64(page.as_bytes_mut(), LEAF_NEXT_OFFSET, next.unwrap_or(PageNo::NULL).get());
 	write_u16(page.as_bytes_mut(), LEAF_COUNT_OFFSET, count);
 	let mut area_offset = 0_usize;

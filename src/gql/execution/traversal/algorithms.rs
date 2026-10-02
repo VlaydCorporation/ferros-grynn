@@ -2,7 +2,8 @@
 
 use std::{
 	borrow::Cow,
-	collections::{BTreeMap, BTreeSet, VecDeque},
+	cmp::Reverse,
+	collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
 	sync::Arc,
 };
 
@@ -20,7 +21,7 @@ use crate::{
 		bellman_ford_with_check,
 		bfs_with_check,
 		condensation_with_check,
-		dijkstra_with_check,
+		dijkstra_to_with_control,
 		find_cuts_with_check,
 		has_cycle_directed_with_check,
 		has_cycle_undirected_with_check,
@@ -41,6 +42,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 	) -> FerrosGrynnResult<Vec<Traverser>> {
 		match kind {
 			TraverseStepKind::KHop
+			| TraverseStepKind::KHopEstimate
 			| TraverseStepKind::Reachable
 			| TraverseStepKind::ShortestPath
 			| TraverseStepKind::WeightedShortestPath
@@ -66,10 +68,70 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		step: &PreparedStep,
 		input: Vec<Traverser>,
 	) -> FerrosGrynnResult<Vec<Traverser>> {
+		let mut memory = self.control.barrier_account();
+		let limit = || {
+			FerrosGrynnError::traversal_resource_limit_exceeded(
+				"algorithm result bytes",
+				self.control.barrier_memory_limit() as u64,
+			)
+		};
+		if !memory.reserve(input.len().checked_mul(3 * size_of::<Traverser>()).ok_or_else(limit)?) {
+			return Err(limit());
+		}
 		let mut output = Vec::with_capacity(input.len());
+		let mut retain = |output: &mut Vec<Traverser>, traverser: Traverser| {
+			if !memory.reserve(traverser.estimated_heap_bytes()) {
+				return Err(limit());
+			}
+			output.push(traverser);
+			Ok(())
+		};
 		for mut traverser in input {
 			self.control.check()?;
 			let occurrence = occurrence(&traverser.current)?.clone();
+			if kind == TraverseStepKind::KHopEstimate {
+				let radius = u32::try_from(non_negative_usize(step.arguments.first())?).map_err(
+					|_cause| FerrosGrynnError::invalid_argument("kHopEstimate radius exceeds u32"),
+				)?;
+				let mut memory = self.control.barrier_account();
+				let scratch = self.control.barrier_memory_available();
+				let estimate = self.read.k_hop_estimate(
+					self.snapshot,
+					&occurrence,
+					if self.atom_semantics {
+						crate::graph::TraversalSemantics::Atom
+					} else {
+						crate::graph::TraversalSemantics::Node
+					},
+					radius,
+					step.neighbourhood_index,
+					scratch,
+					self.control.remaining_neighbourhood_work(),
+					&mut |bytes| {
+						if memory.reserve(bytes) {
+							Ok(())
+						} else {
+							Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+								"neighbourhood scratch bytes",
+								scratch as u64,
+							))
+						}
+					},
+					&mut || self.control.check(),
+				)?;
+				self.control.record_neighbourhood_estimate(
+					estimate.approximate,
+					estimate.work,
+					estimate.artifact_bytes,
+				)?;
+				// The projection scratch may reserve all available bytes. Its
+				// count result owns no projection buffers; release them before
+				// admitting the retained output batch.
+				drop(memory);
+				traverser.current = Value::from(estimate.count);
+				retain(&mut output, traverser)?;
+				continue;
+			}
 			if occurrence.atom().kind() != AtomKind::Node {
 				return Err(domain_error("seed-local graph algorithms require node occurrences"));
 			}
@@ -107,20 +169,35 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 				}
 				TraverseStepKind::ShortestPath => {
 					let target = target_id(&graph, occurrence.graph(), step.arguments.first())?;
-					unweighted_path(&graph, graph_ref, source, target, &mut check)?
-						.map_or(Value::None, |path| Value::Path(Box::new(path)))
+					self.unweighted_path(
+						&graph,
+						graph_ref,
+						source,
+						target,
+						step.landmark_path.as_ref(),
+					)?
+					.map_or(Value::None, |path| Value::Path(Box::new(path)))
 				}
-				TraverseStepKind::WeightedShortestPath => {
+				TraverseStepKind::WeightedShortestPath | TraverseStepKind::DistanceTo => {
 					let target = target_id(&graph, occurrence.graph(), step.arguments.first())?;
-					dijkstra_with_check(&graph, source, TraversalDirection::Forward, &mut check)?
-						.materialize_path(&graph, graph_ref, target)?
-						.map_or(Value::None, |path| Value::Path(Box::new(path)))
-				}
-				TraverseStepKind::DistanceTo => {
-					let target = target_id(&graph, occurrence.graph(), step.arguments.first())?;
-					dijkstra_with_check(&graph, source, TraversalDirection::Forward, &mut check)?
-						.distance_to(target)
-						.map_or(Value::None, Value::Number)
+					if self.custom_cost.is_some() {
+						self.custom_weighted_result(
+							Rc::new(graph),
+							graph_ref,
+							source,
+							target,
+							step,
+						)?
+					} else {
+						self.weighted_result(
+							&graph,
+							graph_ref,
+							source,
+							target,
+							step.landmark_path.as_ref(),
+							kind == TraverseStepKind::WeightedShortestPath,
+						)?
+					}
 				}
 				TraverseStepKind::BellmanFord => {
 					let target = target_id(&graph, occurrence.graph(), step.arguments.first())?;
@@ -142,10 +219,183 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 				}
 				_ => unreachable!("seed algorithm kind was matched above"),
 			};
-			traverser.bulk = std::num::NonZeroU64::MIN;
-			output.push(traverser);
+			retain(&mut output, traverser)?;
 		}
 		Ok(output)
+	}
+
+	/// Shares the bounded, full-state MATCH kernel for prefix-dependent COST.
+	fn custom_weighted_result<Graph: GraphRead>(
+		&self,
+		graph: Rc<Graph>,
+		reference: Arc<GraphRef>,
+		source: AtomId,
+		target: AtomId,
+		step: &PreparedStep,
+	) -> FerrosGrynnResult<Value> {
+		let origin = graph.identity();
+		let path_snapshot = graph.snapshot_id();
+		let cost = self.custom_cost.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("custom shortest path has no COST")
+		})?;
+		let mut memory = self.control.barrier_account();
+		let mut admit = |bytes| {
+			if memory.reserve(bytes) {
+				Ok(())
+			} else {
+				Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"custom shortest path scratch bytes",
+					self.control.barrier_memory_limit() as u64,
+				))
+			}
+		};
+		let index = Rc::new(TraversalIndex::new_with_admission(
+			graph.as_ref(),
+			TraversalSemantics::Node,
+			&mut admit,
+			&mut || self.control.check(),
+		)?);
+		let binding = |domain, atom: AtomId, column| -> FerrosGrynnResult<_> {
+			Ok(ResolvedMatchBinding {
+				domain,
+				selector: ResolvedMatchSelector::Record(
+					graph
+						.atom_ref(atom)?
+						.ok_or_else(|| {
+							FerrosGrynnError::atom_does_not_exist("atom", atom.to_string())
+						})?
+						.id()
+						.clone(),
+				),
+				column: Some(column),
+				label: None,
+				properties: Vec::new(),
+				predicate: None,
+				meta: false,
+			})
+		};
+		let path_mode = self.constraints.mode.unwrap_or(crate::syn::MatchPathMode::Trail);
+		if path_mode == crate::syn::MatchPathMode::Walk && source != target {
+			let reachable = index.breadth_first_with_control(
+				EdgeEndpoint::Local(source),
+				TraversalDirection::Forward,
+				None,
+				&mut admit,
+				&mut || self.control.check(),
+				&mut || self.control.record_path_expansion(),
+			)?;
+			if !reachable.contains(&EdgeEndpoint::Local(target)) {
+				return Ok(Value::None);
+			}
+		}
+		let max = match path_mode {
+			crate::syn::MatchPathMode::Walk => u32::MAX,
+			crate::syn::MatchPathMode::Trail => {
+				u32::try_from(graph.edge_count()?).map_err(|cause| {
+					FerrosGrynnError::operation_overflow("custom path edge bound")
+						.with_technical_source(cause)
+				})?
+			}
+			crate::syn::MatchPathMode::Acyclic => {
+				u32::try_from(graph.node_count()?.saturating_sub(1)).map_err(|cause| {
+					FerrosGrynnError::operation_overflow("custom path node bound")
+						.with_technical_source(cause)
+				})?
+			}
+			crate::syn::MatchPathMode::Simple => {
+				u32::try_from(graph.node_count()?).map_err(|cause| {
+					FerrosGrynnError::operation_overflow("custom path node bound")
+						.with_technical_source(cause)
+				})?
+			}
+		};
+		let fields = MatchGraphFields::new(
+			&*self.read,
+			self.snapshot,
+			self.read.property_dictionary(self.snapshot),
+			reference.clone(),
+		);
+		let predicate = MatchPredicateContext {
+			slots: self.slots,
+			source: self.source,
+			fields: &fields,
+		};
+		let seed = SeedCursor::new(
+			Box::new(OneRowCursor {
+				row: Some(Row::bindings(2)),
+			}),
+			graph.clone(),
+			reference.clone(),
+			binding(EndpointDomain::Node, source, 0)?,
+			crate::syn::MatchMode::RepeatableElements,
+			predicate,
+			vec![source],
+		);
+		let expand = ResolvedPathExpand {
+			edge: ResolvedMatchBinding {
+				domain: EndpointDomain::Edge,
+				selector: ResolvedMatchSelector::Any,
+				column: None,
+				label: None,
+				properties: Vec::new(),
+				predicate: None,
+				meta: false,
+			},
+			target: binding(EndpointDomain::Node, target, 1)?,
+			direction: crate::syn::MatchDirection::Forward,
+			min: 0,
+			max,
+			path_column: None,
+			match_mode: crate::syn::MatchMode::RepeatableElements,
+			path_mode,
+			objective: Some(crate::syn::MatchPathObjective::WeightedShortest),
+			custom_cost: Some(cost),
+			filters: self.constraints.filters.clone(),
+		};
+		let trace = (step.kind == TraverseStepKind::WeightedShortestPath)
+			.then(|| Rc::new(RefCell::new(MatchPathTrace::new(self.control))));
+		let input: Box<dyn RowCursor> = if let Some(trace) = &trace {
+			Box::new(PathTraceStartCursor {
+				input: Box::new(seed),
+				graph: graph.clone(),
+				graph_ref: reference.clone(),
+				arena: trace.clone(),
+			})
+		} else {
+			Box::new(seed)
+		};
+		let mut cursor = ShortestPathCursor::new(
+			input,
+			graph,
+			reference,
+			index,
+			expand,
+			predicate,
+			trace.clone(),
+			&*self.read,
+			self.snapshot,
+			step.landmark_path.clone(),
+		)
+		.with_relation_direction(TraversalDirection::Forward);
+		let Some(row) = cursor.next(self.control)? else {
+			return Ok(Value::None);
+		};
+		if step.kind == TraverseStepKind::DistanceTo {
+			return Ok(Value::Number(row.trace_cost));
+		}
+		let path = row.trace.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("custom shortest path has no trace")
+		})?;
+		let trace = trace.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("custom shortest path has no trace arena")
+		})?;
+		Ok(Value::Path(Box::new(trace.borrow().materialize_with_admission(
+			path,
+			origin,
+			path_snapshot,
+			&mut admit,
+			&mut || self.control.check(),
+		)?)))
 	}
 
 	fn execute_induced_algorithm(
@@ -218,6 +468,272 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		};
 		Ok(vec![Traverser::new(value)])
 	}
+
+	/// Refines the existing Dijkstra queue using strictly greater completion
+	/// bounds. Keeping its distance/node order preserves the first equal path.
+	fn weighted_result<Graph: GraphRead>(
+		&self,
+		graph: &Graph,
+		reference: Arc<GraphRef>,
+		source: AtomId,
+		target: AtomId,
+		binding: Option<&crate::datastore::QueryLandmarkPath>,
+		materialize: bool,
+	) -> FerrosGrynnResult<Value> {
+		let control = self.control;
+		let mut memory = control.barrier_account();
+		let mut admit = |bytes| {
+			if memory.reserve(bytes) {
+				Ok(())
+			} else {
+				Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"weighted path scratch bytes",
+					control.barrier_memory_limit() as u64,
+				))
+			}
+		};
+		let vertices = graph.node_count()?;
+		admit(
+			vertices.checked_mul(256).ok_or_else(|| {
+				FerrosGrynnError::operation_overflow("weighted bound cache bytes")
+			})?,
+		)?;
+		let remaining = u32::try_from(vertices).map_err(|cause| {
+			FerrosGrynnError::operation_overflow("weighted completion steps")
+				.with_technical_source(cause)
+		})?;
+		let binding = binding.filter(|binding| {
+			binding.graph == reference.id()
+				&& binding.mode == TraversalSemantics::Node
+				&& binding.direction == TraversalDirection::Forward
+				&& binding.cost == crate::datastore::GraphIndexCost::Weighted
+				&& binding.edge_labels.is_empty()
+		});
+		let mut bounds = BTreeMap::new();
+		let mut used = false;
+		let mut missing = false;
+		let mut refine = |node, prefix, upper| {
+			let bound = if let Some(bound) = bounds.get(&node) {
+				*bound
+			} else {
+				let bound = binding
+					.map(|binding| self.read.path_lower_bound(self.snapshot, binding, node, target))
+					.transpose()?
+					.flatten();
+				if let Some(bound) = bound {
+					if !crate::math::number_is_finite(bound) || bound < Number::Int(0) {
+						return Err(FerrosGrynnError::invalid_storage_file(
+							"WEIGHT lower bound is not finite and nonnegative",
+						));
+					}
+					control.record_landmark_lookup(if used {
+						0
+					} else {
+						binding.map_or(0, |index| index.bytes)
+					});
+					used = true;
+				} else {
+					missing = true;
+				}
+				bounds.insert(node, bound);
+				bound
+			};
+			if let (Some(bound), Some(upper)) = (bound, upper) {
+				Ok(super::super::cursor::completion_bound(prefix, bound, remaining)? <= upper)
+			} else {
+				Ok(true)
+			}
+		};
+		let (paths, pruning_safe) = dijkstra_to_with_control(
+			graph,
+			source,
+			target,
+			&mut admit,
+			&mut refine,
+			&mut || control.check(),
+			&mut || control.record_path_expansion(),
+		)?;
+		if !pruning_safe || !used || missing {
+			control.record_landmark_fallback();
+		}
+		if materialize {
+			paths
+				.materialize_path_with_admission(graph, reference, target, &mut admit)
+				.map(|path| path.map_or(Value::None, |path| Value::Path(Box::new(path))))
+		} else {
+			Ok(paths.distance_to(target).map_or(Value::None, Value::Number))
+		}
+	}
+
+	/// A* determines only the exact length. The second pass keeps the existing
+	/// FIFO/connector order, pruning strictly greater completion bounds so
+	/// equal shortest routes retain their original predecessor.
+	fn unweighted_path<Graph: GraphRead>(
+		&self,
+		graph: &Graph,
+		reference: Arc<GraphRef>,
+		source: AtomId,
+		target: AtomId,
+		binding: Option<&crate::datastore::QueryLandmarkPath>,
+	) -> FerrosGrynnResult<Option<Path>> {
+		let control = self.control;
+		let mut check = || control.check();
+		let mut memory = control.barrier_account();
+		let mut admit = |bytes| {
+			if memory.reserve(bytes) {
+				Ok(())
+			} else {
+				Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"shortest path scratch bytes",
+					control.barrier_memory_limit() as u64,
+				))
+			}
+		};
+		let index = TraversalIndex::new_with_admission(
+			graph,
+			TraversalSemantics::Node,
+			&mut admit,
+			&mut check,
+		)?;
+		// BTree nodes, FIFO entries, predecessor steps and bound cache are all
+		// linear in the live NODE projection; reserve before their first
+		// insert.
+		let state_bytes =
+			3 * (size_of::<PathStep>() + size_of::<(AtomId, crate::graph::TraversalStep)>()) + 512;
+		admit(
+			graph.node_count()?.checked_mul(state_bytes).ok_or_else(|| {
+				FerrosGrynnError::operation_overflow("shortest path scratch bytes")
+			})?,
+		)?;
+		let binding = binding.filter(|binding| binding.graph == reference.id());
+		let initial_bound = binding
+			.map(|binding| self.read.path_lower_bound(self.snapshot, binding, source, target))
+			.transpose()?
+			.flatten();
+		let mut bounds = BTreeMap::new();
+		let mut lower = |node| {
+			if let Some(bound) = bounds.get(&node) {
+				return Ok(*bound);
+			}
+			let bound = if node == source {
+				initial_bound
+			} else {
+				binding
+					.map(|binding| self.read.path_lower_bound(self.snapshot, binding, node, target))
+					.transpose()?
+					.flatten()
+			};
+			let bound = match bound {
+				Some(Number::Int(bound)) if bound >= 0 => {
+					control.record_landmark_lookup(if node == source {
+						binding.map_or(0, |binding| binding.bytes)
+					} else {
+						0
+					});
+					usize::try_from(bound).map_err(|cause| {
+						FerrosGrynnError::invalid_storage_file("HOP lower bound exceeds usize")
+							.with_technical_source(cause)
+					})?
+				}
+				Some(_) => {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"HOP lower bound is not a non-negative integer",
+					));
+				}
+				None => 0,
+			};
+			bounds.insert(node, bound);
+			Ok(bound)
+		};
+		let maximum = if initial_bound.is_some() {
+			let distance = shortest_hop_distance(&index, source, target, control, &mut lower)?;
+			if distance.is_none() {
+				return Ok(None);
+			}
+			distance
+		} else {
+			control.record_landmark_fallback();
+			None
+		};
+		let mut queue = VecDeque::from([(source, 0_usize)]);
+		let mut predecessor = BTreeMap::<AtomId, (AtomId, crate::graph::TraversalStep)>::new();
+		let mut seen = BTreeSet::from([source]);
+		while let Some((current, depth)) = queue.pop_front() {
+			check()?;
+			if current == target {
+				break;
+			}
+			for (candidate, step) in
+				index.steps(&EdgeEndpoint::Local(current), TraversalDirection::Forward).enumerate()
+			{
+				control.record_path_expansion()?;
+				if candidate & 1023 == 0 {
+					check()?;
+				}
+				let Some(next) = step.target().local_id().filter(|id| id.is_node()) else {
+					continue;
+				};
+				let depth = depth
+					.checked_add(1)
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("path length"))?;
+				if let Some(maximum) = maximum
+					&& depth.checked_add(lower(next)?).is_none_or(|bound| bound > maximum)
+				{
+					continue;
+				}
+				if seen.insert(next) {
+					predecessor.insert(next, (current, step.clone()));
+					queue.push_back((next, depth));
+				}
+			}
+		}
+		if !seen.contains(&target) {
+			return Ok(None);
+		}
+		let mut chain = Vec::new();
+		let mut current = target;
+		while current != source {
+			let (parent, step) = predecessor.get(&current).cloned().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("Shortest-path predecessor chain is incomplete.")
+			})?;
+			chain.push((current, step));
+			current = parent;
+		}
+		chain.reverse();
+		let source_atom = graph
+			.atom_ref(source)?
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", source.to_string()))?;
+		admit(source_atom.id().estimated_heap_bytes())?;
+		let mut steps = vec![PathStep::new(
+			AtomOccurrenceRef::new(source_atom, reference.clone()),
+			None,
+			PathDirection::Forward,
+			EndpointRole::Source,
+		)];
+		for (node, link) in chain {
+			let atom = graph
+				.atom_ref(node)?
+				.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", node.to_string()))?;
+			let edge = graph.atom_ref(link.via_edge())?.ok_or_else(|| {
+				FerrosGrynnError::atom_does_not_exist("edge", link.via_edge().to_string())
+			})?;
+			admit(
+				atom.id().estimated_heap_bytes().saturating_add(edge.id().estimated_heap_bytes()),
+			)?;
+			steps.push(PathStep::new(
+				AtomOccurrenceRef::new(atom, reference.clone()),
+				Some(AtomOccurrenceRef::new(edge, reference.clone())),
+				link.direction(),
+				link.role(),
+			));
+		}
+		Ok(Some(Path::new(
+			graph.identity(),
+			graph.snapshot_id(),
+			steps,
+			Some(Number::from(predecessor_distance(&predecessor, source, target)?)),
+		)))
+	}
 }
 
 fn occurrence(value: &Value) -> FerrosGrynnResult<&AtomOccurrenceRef> {
@@ -254,18 +770,19 @@ fn target_id<Graph: GraphRead>(
 			if target.graph().id() != scope.id() {
 				return Err(domain_error("algorithm source and target belong to different graphs"));
 			}
-			target.atom()
+			Cow::Borrowed(target.atom())
 		}
-		Value::Atom(atom) => atom,
+		Value::Atom(atom) => Cow::Borrowed(atom.as_ref()),
+		Value::Record(record) => Cow::Owned(resolve_record_atom(graph, record)?),
 		_ => {
 			return Err(FerrosGrynnError::traversal_source_type_mismatch(
-				"atom or atom occurrence".to_owned(),
+				"record, atom or atom occurrence".to_owned(),
 				value.kind().to_string(),
 			));
 		}
 	};
 	graph
-		.atom_id(atom)?
+		.atom_id(atom.as_ref())?
 		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", atom.id().to_string()))
 }
 
@@ -453,79 +970,59 @@ fn graph_is_directed<Graph: GraphRead>(
 	Ok(false)
 }
 
-fn unweighted_path<Graph: GraphRead>(
-	graph: &Graph,
-	reference: Arc<GraphRef>,
+/// Finds an exact HOP distance with reopening, using only admissible bounds.
+/// Parent selection belongs to the subsequent canonical BFS pass.
+fn shortest_hop_distance(
+	index: &TraversalIndex,
 	source: AtomId,
 	target: AtomId,
-	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
-) -> FerrosGrynnResult<Option<Path>> {
-	let index = TraversalIndex::new(graph, TraversalSemantics::Node)?;
-	let mut queue = VecDeque::from([source]);
-	let mut predecessor = BTreeMap::<AtomId, (AtomId, crate::graph::TraversalStep)>::new();
-	let mut seen = BTreeSet::from([source]);
-	while let Some(current) = queue.pop_front() {
-		check()?;
-		if current == target {
-			break;
+	control: &ExecutionControl,
+	lower: &mut impl FnMut(AtomId) -> FerrosGrynnResult<usize>,
+) -> FerrosGrynnResult<Option<usize>> {
+	let mut memory = control.barrier_account();
+	let mut reserve = |bytes| {
+		if memory.reserve(bytes) {
+			Ok(())
+		} else {
+			Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"A* frontier bytes",
+				control.barrier_memory_limit() as u64,
+			))
 		}
-		for (candidate, step) in
-			index.steps(&EdgeEndpoint::Local(current), TraversalDirection::Forward).enumerate()
-		{
-			if candidate & 1023 == 0 {
-				check()?;
-			}
+	};
+	reserve(256)?;
+	let mut queue = BinaryHeap::from([Reverse((lower(source)?, 0_usize, source))]);
+	let mut distances = BTreeMap::from([(source, 0_usize)]);
+	while let Some(Reverse((_priority, distance, node))) = queue.pop() {
+		control.check()?;
+		if distances.get(&node).is_some_and(|known| distance > *known) {
+			continue;
+		}
+		if node == target {
+			return Ok(Some(distance));
+		}
+		for step in index.steps(&EdgeEndpoint::Local(node), TraversalDirection::Forward) {
+			control.record_path_expansion()?;
 			let Some(next) = step.target().local_id().filter(|id| id.is_node()) else {
 				continue;
 			};
-			if seen.insert(next) {
-				predecessor.insert(next, (current, step.clone()));
-				queue.push_back(next);
+			let distance = distance
+				.checked_add(1)
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("path length"))?;
+			if distances.get(&next).is_none_or(|known| distance < *known) {
+				let priority = distance
+					.checked_add(lower(next)?)
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("HOP completion bound"))?;
+				// Three simultaneous heap buffers at growth plus one BTree
+				// entry. Keeping the charge until this pass ends is
+				// conservative.
+				reserve(256)?;
+				distances.insert(next, distance);
+				queue.push(Reverse((priority, distance, next)));
 			}
 		}
 	}
-	if !seen.contains(&target) {
-		return Ok(None);
-	}
-	let mut chain = Vec::new();
-	let mut current = target;
-	while current != source {
-		let (parent, step) = predecessor.get(&current).cloned().ok_or_else(|| {
-			FerrosGrynnError::invalid_argument("Shortest-path predecessor chain is incomplete.")
-		})?;
-		chain.push((current, step));
-		current = parent;
-	}
-	chain.reverse();
-	let source_atom = graph
-		.atom_ref(source)?
-		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", source.to_string()))?;
-	let mut steps = vec![PathStep::new(
-		AtomOccurrenceRef::new(source_atom, reference.clone()),
-		None,
-		PathDirection::Forward,
-		EndpointRole::Source,
-	)];
-	for (node, link) in chain {
-		let atom = graph
-			.atom_ref(node)?
-			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", node.to_string()))?;
-		let edge = graph.atom_ref(link.via_edge())?.ok_or_else(|| {
-			FerrosGrynnError::atom_does_not_exist("edge", link.via_edge().to_string())
-		})?;
-		steps.push(PathStep::new(
-			AtomOccurrenceRef::new(atom, reference.clone()),
-			Some(AtomOccurrenceRef::new(edge, reference.clone())),
-			link.direction(),
-			link.role(),
-		));
-	}
-	Ok(Some(Path::new(
-		graph.identity(),
-		graph.snapshot_id(),
-		steps,
-		Some(Number::from(predecessor_distance(&predecessor, source, target)?)),
-	)))
+	Ok(None)
 }
 
 fn predecessor_distance(
@@ -613,6 +1110,44 @@ struct InducedGraph<'a, Graph: GraphRead> {
 	inner: &'a Graph,
 	nodes: BTreeSet<AtomId>,
 	edges: BTreeSet<AtomId>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn hop_astar_reopens_improved_vertices_for_inconsistent_admissible_bounds() {
+		let mut graph = crate::graph::Graph::<crate::graph::Mutable>::new();
+		let nodes =
+			(0..9).map(|_| graph.add_node(None, PropertyMap::new()).unwrap()).collect::<Vec<_>>();
+		// The long prefix reaches v before c; h(c)=5 is admissible but
+		// inconsistent with h(v)=0. Reopening v improves the answer to 6.
+		for (source, target) in
+			[(0, 1), (1, 2), (2, 3), (0, 4), (4, 3), (3, 5), (5, 6), (6, 7), (7, 8)]
+		{
+			graph
+				.add_edge(
+					EdgeTopology::directed([nodes[source]], [nodes[target]]),
+					None,
+					PropertyMap::new(),
+				)
+				.unwrap();
+		}
+		let index = TraversalIndex::new(&graph, TraversalSemantics::Node).unwrap();
+		let control = ExecutionControl::new(&crate::gql::QueryExecutionOptions::default(), None);
+		assert_eq!(
+			shortest_hop_distance(&index, nodes[0], nodes[8], &control, &mut |node| Ok(
+				if node == nodes[4] {
+					5
+				} else {
+					0
+				}
+			))
+			.unwrap(),
+			Some(6)
+		);
+	}
 }
 
 impl<Graph: GraphRead> GraphRead for InducedGraph<'_, Graph> {

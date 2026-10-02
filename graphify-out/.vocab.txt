@@ -25,6 +25,7 @@ account
 accounted
 accumulate
 accumulates
+accumulation
 accumulator
 accumulators
 acknowledge
@@ -131,6 +132,7 @@ amendment
 analyse
 analysis
 analyze
+analyzed
 analyzer
 analyzers
 ancestor
@@ -214,6 +216,7 @@ asin
 ask
 asked
 assemble
+assembler
 assembly
 assert
 assertion
@@ -316,6 +319,7 @@ bearer
 bearing
 beats
 becomes
+becoming
 before
 beg
 begin
@@ -396,6 +400,7 @@ branch
 branches
 branching
 breadth
+breadths
 break
 breaking
 breaks
@@ -465,6 +470,7 @@ cannot
 canonical
 canonicalize
 canonicalizes
+canonically
 cant
 cap
 capabilities
@@ -623,6 +629,7 @@ collector
 collects
 collides
 collision
+collisions
 colon
 color
 column
@@ -745,6 +752,7 @@ const
 constant
 constraint
 constraints
+construction
 constructor
 consts
 consume
@@ -932,6 +940,7 @@ deferred
 defers
 define
 defined
+defining
 definition
 definitions
 definitive
@@ -1046,6 +1055,7 @@ digraph
 dijkstra
 dim
 dimension
+dimensional
 dimensions
 dims
 dir
@@ -1070,6 +1080,7 @@ discarded
 discards
 disconnect
 discover
+discovered
 discovery
 discriminant
 discriminants
@@ -1098,6 +1109,7 @@ div
 dive
 diverge
 divergent
+diverse
 diverted
 diverts
 divide
@@ -1242,6 +1254,8 @@ entirely
 entities
 entries
 entry
+entrypoint
+entrypoints
 enum
 enumerate
 enumeration
@@ -1388,6 +1402,7 @@ failure
 failures
 fairness
 fake
+fall
 fallback
 fallbacks
 fallible
@@ -1887,6 +1902,7 @@ interning
 interop
 interpreting
 interquartile
+interrupted
 intersect
 intersection
 intersects
@@ -1987,6 +2003,7 @@ language
 large
 last
 latch
+latency
 later
 latest
 latitude
@@ -2186,6 +2203,7 @@ materialization
 materialize
 materialized
 materializes
+materializing
 math
 matrix
 max
@@ -2381,7 +2399,9 @@ newline
 newtype
 next
 nextval
+nfc
 ngram
+ngrams
 nightly
 nil
 nix
@@ -2399,6 +2419,7 @@ none
 nonempty
 nonexistent
 nonexisting
+nonzero
 noop
 norm
 normal
@@ -2689,6 +2710,7 @@ pinning
 pins
 pipe
 pipeline
+pipelines
 pitfalls
 pivot
 pkey
@@ -2928,6 +2950,7 @@ random
 range
 ranges
 rank
+ranked
 rapid
 ras
 raspberry
@@ -2976,6 +2999,7 @@ recommit
 recommits
 recomputes
 reconcile
+reconciles
 reconnect
 reconstruct
 record
@@ -3016,6 +3040,7 @@ referencing
 referential
 referrer
 refilled
+refine
 reflects
 refprefix
 refresh
@@ -3062,6 +3087,7 @@ remain
 remaining
 remains
 remap
+remember
 remote
 removal
 remove
@@ -3086,6 +3112,7 @@ repetitions
 replace
 replaced
 replacement
+replacements
 replaces
 replay
 replayable
@@ -3113,10 +3140,12 @@ requirement
 requirements
 requires
 reqwest
+rerank
 rereads
 reroot
 res
 resamples
+resealed
 reseed
 reservation
 reservations
@@ -3207,6 +3236,7 @@ risks
 rnd
 rng
 roaring
+robust
 rocks
 rocksdb
 role
@@ -3306,6 +3336,7 @@ scopes
 score
 scored
 scorer
+scores
 scoring
 scrapable
 scratch
@@ -3476,6 +3507,7 @@ snake
 snapshot
 snapshots
 snippet
+snowball
 soak
 socket
 sockets
@@ -3502,6 +3534,7 @@ spawned
 spearman
 spec
 special
+specialized
 specials
 specific
 specification
@@ -4047,6 +4080,7 @@ upload
 upper
 uppercase
 upsert
+upserts
 upstream
 upwards
 uri
@@ -4367,6 +4401,7 @@ zoned
 задела
 закрепить
 закрытие
+закрытия
 закрытые
 заменены
 замороженные
@@ -4539,6 +4574,7 @@ zoned
 остальной
 остаточные
 остаточный
+остаётся
 отдельный
 отключённом
 открытая

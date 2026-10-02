@@ -637,6 +637,7 @@ MAGIC_IDX_FT          = 0x01_54_49_46   -- b"FIT\x01"
 MAGIC_IDX_VEC         = 0x01_56_49_46   -- b"FIV\x01"
 MAGIC_IDX_RTREE       = 0x01_52_49_46   -- b"FIR\x01"  (geometry R-tree)
 MAGIC_IDX_COUNT       = 0x01_43_49_46   -- b"FIC\x01"
+MAGIC_IDX_DERIVED     = 0x01_44_49_46   -- b"FID\x01"  (общие graph-index sections)
 MAGIC_IDX_REACH       = 0x01_41_49_46   -- b"FIA\x01"  (reachability)
 MAGIC_IDX_NBH         = 0x01_4E_49_46   -- b"FIN\x01"  (neighbourhood)
 MAGIC_IDX_PATH        = 0x01_50_49_46   -- b"FIP\x01"  (path)
@@ -847,7 +848,7 @@ Class definition хранит стабильные `ClassId`/`SchemaVersion`, im
 `GraphRef` не кодируется как `RecordId`. Удаление graph удаляет только его catalog entry,
 occurrences, topology, overlays и effective indexes; global atoms и classes сохраняются.
 
-Graph entry `FGDC v10` сохраняет canonical fixed header этапа 18:
+Graph entry `FGDC v10` расширяет development fixed header этапа 18 на месте (Q-40):
 
 ```text
 0   8   graph_id
@@ -864,11 +865,65 @@ Graph entry `FGDC v10` сохраняет canonical fixed header этапа 18:
 72  4   root_value_len; 0 = absent
 76  4   property_count
 80  4   arena_slot_count
-84 ... canonical graph name
+84  4   user_index_count; 0..4096
+88  4   edge_endpoint IndexId; 0 = capability absent
+92  4   edge_endpoint SchemaVersion; 0 iff IndexId = 0
+96 16   optional edge_endpoint physical binding; file_id=0, root=NULL_PAGE = absent
+112 ... canonical graph name
 ...     canonical StorageValue::Record root bytes
 ...     sorted graph properties
 ...     arena slot records
+...     graph user index entries в ascending IndexId
 ```
+
+Graph user index entry отделяет availability от semantic descriptor:
+
+```text
+0   1   state: 0=Ready, 1=Stale, 2=PreparedForRemoval
+1   7   reserved = 0
+8   8   build_revision
+16  4   descriptor_length; не более 8 МиБ
+20  ... descriptor bytes
+... 8   RapidHash V3 seed 0(descriptor bytes)
+...     optional comment: u16 byte length, 0xFFFF=absent; UTF-8 до 4096 bytes
+... 16  optional physical binding: file_id:u64 + root_page:u64; absent=(0,NULL_PAGE)
+```
+
+Canonical semantic descriptor использует LE и следующий exact layout:
+
+```text
+0   4   index_id
+4   4   schema_version
+8   8   graph_id
+16  1   mode: 0=NODE, 1=ATOM
+17  1   direction: 0=OUT, 1=IN, 2=BOTH
+18  1   maintenance: 0=Immediate, 1=Deferred
+19  1   kind: 0=Reachability, 1=Neighbourhood, 2=Path
+20  1   algorithm (kind-specific tags below)
+21  3   reserved = 0
+24  4   algorithm_parameter
+28  4   radius; 0 для Reachability/Path
+32  8   max_bytes; 0=absent
+40  1   cost: 0=Hop, 1=Weighted, 2=Function
+41  3   reserved = 0
+44  4   cost_function_id; 0 без Function
+48  4   cost_function_version; 0 без Function
+52  ... name: u32 length + UTF-8 до 4096 bytes
+...     labels: u32 count <=1024, sorted unique length-prefixed UTF-8 labels
+...     dependencies: u32 count <=1024, sorted unique FunctionId:u32 + SchemaVersion:u32
+...     patterns: u32 count <=64, ordered length-prefixed UTF-8 sources, суммарно <=1 МиБ
+```
+
+Reachability tags: `0=AUTO,1=TREE_COVER,2=GRAIL,3=FERRARI,4=BFL,5=CHAIN_COVER,6=ON_DEMAND`.
+Neighbourhood: `0=AUTO,1=EXACT,2=SKETCH,3=LANDMARK,4=ON_DEMAND`.
+Path: `0=LANDMARK_SSSP,1=PATTERN_CACHE,2=ON_DEMAND`. Неиспользуемые parameters равны нулю;
+Reachability/Neighbourhood cost равен Hop, patterns пусты. Один FunctionId имеет одну captured
+version. Decoder проверяет descriptor целиком повторным canonical encoding, включая полные bytes;
+одного совпадения hash недостаточно. Engine-owned label/adjacency/edge_endpoint не входят в этот
+список user definitions. Source text не является сериализованным executable IR.
+
+`FGJB v1` добавляет target tag `5=GraphIndex`: class=0, index/version ненулевые, graph ненулевой.
+Layout job record и metadata-COW protocol сохранены; graph-wide target tag 1 остаётся отдельным.
 
 `topology_constraint_bits` допускает только `SIMPLE`, `BIPARTITE`, `COMPLETE`. Root присутствует
 только у `ROOTED_TREE`, кодируется canonical `StorageValue::Record` и ссылается на node root
@@ -894,8 +949,8 @@ revision при сохранении `GraphId` и physical bindings; в `GraphSu
 
 Decoder принимает только `FGDC v10` и `FGFC v6`. `FGDC v5..=v9`, `FGFC v4/v5` и
 graph-owned atom layout возвращают typed incompatible-format error. Migration и test-only
-compatibility отсутствуют. `STORAGE_FORMAT_VERSION` остаётся `1`; catalog payloads повторно
-заморожены после этапа 21 согласно `storage_core_v1_freeze_manifest.md`.
+compatibility отсутствуют. `STORAGE_FORMAT_VERSION` остаётся `1`; development catalog layout
+изменяется на месте по Q-40, без промежуточной заморозки и compatibility decoders.
 
 **Расширения файлов:**
 
@@ -2367,6 +2422,16 @@ HLL registers служат только рабочей памятью builder и
 отсутствию только этой необязательной гистограммы. Пользовательская транзакция из-за этого не
 отклоняется.
 
+Geometry distribution использует отдельную форму `PropertyHistogram`: `value_type=0x27` обозначает
+агрегированный geometry sample, `method=0`, `hll_precision=0`. Offsets 32..55 сохраняют class/field,
+scope, число всех наблюдений и scope_graph. Offset 56 хранит total sample length≤1024; offset 64 —
+null fraction, 68 — число MBR в текущем chunk≤509, 70 — zero-based chunk ordinal; offset 72 —
+`mbr_population(u64)`, число непустых геометрий, а offset 80 — `[minX,minY,maxX,maxY](f64×4)` records.
+Хвост нулевой. Число chunks равно `max(1,ceil(sample_length/509))`; лишние/неполные chunks и
+несогласованные metadata запрещены. Sample непустой тогда и только тогда, когда population>0.
+ANALYZE выбирает до 1024 MBR детерминированным priority reservoir; empty geometry не имеет MBR.
+Оценка candidates учитывает долю непустых наблюдений; sample влияет только на planning.
+
 ### 19.4. DegreeHistogramPage
 
 ```
@@ -3050,7 +3115,9 @@ ANN index либо `WITH INDEX`; ambiguity/unavailability являются typed
 
 Файл: `idx/geo_<ordinal:04>.fgidx`.
 
-Spatial index для `geo::` операторов: `INSIDE`, `INTERSECTS`, `OUTSIDE`, `geo::within`, `geo::distance`.
+Spatial candidates для положительных `INSIDE`/`INTERSECTS` и соответствующих `geo::` predicates.
+Каждый кандидат проходит exact refinement на geometry того же snapshot. `OUTSIDE`, отрицания и
+distance используют exact scan. Ready/Stale и maintenance policy принадлежат catalog.
 
 **Структура**: R-tree (2D bounding rectangles).
 
@@ -3058,11 +3125,27 @@ Spatial index для `geo::` операторов: `INSIDE`, `INTERSECTS`, `OUTS
 
 ```
 PageHeader(32) (magic=MAGIC_IDX_RTREE, type=IndexGeometryRtreeHeader)
-index_name_id: u32
-class_id:      u32
-field_id:      u32
-root_page:     u64   -- корень R-tree
-node_count:    u64
+32    index_id:        u32
+36    schema_version:  u32
+40    class_id:        u32
+44    property_key_id: u32
+48    build_revision:  u64
+56    scope_graph:     u64   -- 0=Base
+64    scope_kind:      u8    -- 0=Base, 1=Effective
+65    geometry_type:   u8    -- 0=all; 1..7=Point, MultiPoint, LineString,
+                              MultiLineString, Polygon, MultiPolygon, Collection
+66    layout:          u16   -- 1=STR base; 2=exact delta
+68    fill_per_mille:  u16   -- 950
+70    reserved:        [u8;2] = 0
+72    kernel_model:    u64   -- 0x5747533834535452, WGS-84 planar STR v1
+80    root_page:       u64   -- NULL для пустого base
+88    row_count:       u64
+96    page_count:      u64   -- включает header
+104   height:          u16
+106   reserved:        [u8;6] = 0
+112   definition_hash: u64   -- RapidHash v3 над bytes[32..48] + bytes[56..80]
+120   delta_revision:  u64   -- только layout=2; 0 для base
+128   zero padding до PAGE_SIZE
 ```
 
 #### 20.7.2. RtreeInternalPage
@@ -3070,7 +3153,8 @@ node_count:    u64
 ```
 PageHeader(32) (magic=MAGIC_IDX_RTREE, type=IndexGeometryRtreeInternal)
 num_entries: u16
-_pad: 14
+level: u16             -- leaf=0; internal>0
+_pad: 12 = 0
 entries: [mbr_lo_lon(f64) + mbr_lo_lat(f64) + mbr_hi_lon(f64) + mbr_hi_lat(f64)
           + child_page(u64)] × num_entries
 → MBR(32 байта) + child(8 байт) = 40 байт/entry
@@ -3082,13 +3166,39 @@ entries: [mbr_lo_lon(f64) + mbr_lo_lat(f64) + mbr_hi_lon(f64) + mbr_hi_lat(f64)
 ```
 PageHeader(32) (magic=MAGIC_IDX_RTREE, type=IndexGeometryRtreeLeaf, FLAG_LEAF set)
 num_entries: u16
-_pad: 6
+level: u16 = 0
+_pad: 4 = 0
 entries: [mbr_lo_lon + mbr_lo_lat + mbr_hi_lon + mbr_hi_lat (f64×4)
           + DiskAtomRef(u64)] × num_entries
-→ (PAGE_SIZE - 40) / 36 = 454 entries per page
+→ MBR(32 байта) + DiskAtomRef(8 байт) = 40 байт/entry
+→ (PAGE_SIZE - 40) / 40 = 408 entries per page
 ```
 
+STR заполняет до 387 записей (`floor(408×0.95)`), сортирует центры по X, затем по Y внутри
+полос; tie-break — row identity. Internal child расположен раньше parent; height≤64.
+Все MBR конечны, упорядочены и лежат в диапазоне WGS-84. Reserved и свободный хвост нулевые.
+PageManager, CRC и snapshot registry проверяются до использования страницы.
+
+#### 20.7.4. Exact replacement delta
+
+Base остаётся immutable. Companion `geo_<ordinal:04>_delta.fgidx` публикуется через тот же WAL/COW
+registry; header layout=2, revision≥base build revision, root=1 и height=1 для непустой delta.
+Пустая delta имеет NULL root, height=0 и только header. Максимум 4096 records, 14 pages.
+Records отсортированы по `DiskAtomRef`, без дублей. Leaf payload начинается с offset 40:
+`MBR(f64×4) + DiskAtomRef(u64) + action(u8) + reserved[7]` = 48 байт, capacity=340.
+Action 1 заменяет MBR; action 0 — tombstone с нулевым MBR. Changed identities исключаются из base,
+после чего добавляются перекрывающиеся актуальные replacements. При превышении порога
+`clamp(base_row_count/1000, 1, 4096)` строится новый base. RAM snapshots удерживают те же STR pages
+и точную replacement map; старый snapshot сохраняет прежнюю generation.
+
+Fingerprint включает IndexId/version, class/field, scope, TYPE, layout, kernel/model и fill.
+Build revision проверяется отдельно; status не дублируется в physical header.
+
 ### 20.8. Reachability Index
+
+**Файл:** `idx/reach_<ordinal:04>.fgidx`; один файл на definition/projection. IndexId/version
+сохраняются в catalog и header; ordinal является только filename. Immutable binding сохраняется
+при unrelated commits/maintenance, relation mutation переводит definition в Stale без row delta.
 
 `TREE_COVER`, `GRAIL`, `FERRARI`, `BFL` и `CHAIN_COVER` — отдельные derived accelerators.
 Для ориентированного graph сначала вычисляются SCC, детерминированно нумеруются по минимальному
@@ -3097,6 +3207,13 @@ entries: [mbr_lo_lon + mbr_lo_lat + mbr_hi_lon + mbr_hi_lat (f64×4)
 Для `BOTH` индекс строится над симметризованным отношением. Mutation dependency делает side-file
 stale; stale artifact никогда не влияет на корректность.
 
+NODE/ATOM relation берётся из общей incidence-модели после exact connector label filter и
+выбранного direction. Включаются isolated atoms проекции; parallel connectors не дублируют
+CSR arcs. Qualified endpoints остаются за пределами local relation, cross-level запрос использует
+exact scoped traversal. Общий iterative SCC kernel обслуживает public NODE-only алгоритм и
+derived projection; condensation numbering использует минимум GlobalAtomId, CSR rows сортированы
+и не содержат дубликатов, topological ties разрешаются по component ordinal.
+
 #### 20.8.1. ReachabilityHeaderPage
 
 ```text
@@ -3104,7 +3221,7 @@ stale; stale artifact никогда не влияет на корректнос
 32      4     index_id
 36      4     schema_version
 40      8     graph_id
-48      8     build_lsn
+48      8     build_revision; logical commit timestamp
 56      8     node_capacity
 64      8     edge_capacity
 72      8     component_count
@@ -3118,21 +3235,40 @@ stale; stale artifact никогда не влияет на корректнос
 136     8     algorithm_aux_root
 144     8     algorithm_aux_count
 152     8     max_bytes
-160     4     edge_label_id; NULL_LABEL=all, 0 is valid
-164     4     algorithm_parameter
-168     1     algorithm: 0=TREE_COVER, 1=GRAIL, 2=FERRARI, 3=BFL, 4=CHAIN_COVER
-169     1     direction: 0=OUT, 1=IN, 2=BOTH
-170     2     flags = 0
-172     ...   reserved = 0
+160     8     definition_fingerprint; RapidHash V3 of complete canonical bytes
+168     8     definition_descriptor_root
+176     8     definition_descriptor_bytes
+184     8     page_count; including this header
+192     4     algorithm_parameter
+196     1     algorithm: 0=TREE_COVER, 1=GRAIL, 2=FERRARI, 3=BFL, 4=CHAIN_COVER
+197     1     direction: 0=OUT, 1=IN, 2=BOTH
+198     1     mode: 0=NODE, 1=ATOM
+199     1     flags: bit 0=reversed TREE_COVER, bit 1=qualified endpoints present
+200     ...   reserved = 0
 ```
 
 `ON_DEMAND` — только planner strategy и physical header не создаёт. Status
 `building/ready/stale/error` хранится только в catalog. `algorithm_parameter`: 0 для TREE_COVER и
 CHAIN_COVER, `k` для GRAIL, `max_ranges` для FERRARI, `bits` для BFL.
 
+Canonical descriptor содержит полный label set, MODE/direction, budgets и captured function
+versions. Binding сверяет полные bytes, а не только fingerprint. TREE_COVER auxiliary section
+отсутствует; GRAIL auxiliary отсутствует; FERRARI auxiliary использует PostorderRanks (width 8,
+component_count entries); BFL auxiliary отсутствует; CHAIN_COVER auxiliary хранит cells,
+`algorithm_aux_count` означает число chains. Для остальных algorithms aux_count равен 0.
+Основная секция GRAIL/FERRARI имеет соответственно component_count×parameter entries, BFL
+хранит component_count rows. Sections упакованы последовательно в порядке header roots,
+descriptor последним; все страницы кроме последней страницы секции заполнены до capacity.
+Полный extent и metadata входят в MAX_BYTES; пустые maps/labels имеют NULL root, CSR offsets
+всегда содержит component_count+1 entries. NODE edge map содержит только NULL component refs.
+
 #### 20.8.2. Общие derived codecs
 
 `PageType::IndexDerivedArray=0x003E`:
+
+Общие `0x003E/0x003F` используют `MAGIC_IDX_DERIVED`; specialized reachability pages сохраняют
+`MAGIC_IDX_REACH`. Flags пустые, page 0 принадлежит artifact header. Все секции append-only:
+`next_page` равен NULL или строго больше текущего page_no и меньше полного page_count.
 
 ```text
 32 next_page:u64; 40 section_kind:u16; 42 element_width:u16;
@@ -3148,6 +3284,11 @@ CHAIN_COVER, `k` для GRAIL, `max_ranges` для FERRARI, `bits` для BFL.
 56 offsets:u16[record_count+1], затем records
 ```
 
+`used_bytes` records включает offsets и payload после byte 56; offsets относительны началу
+record payload, первый равен 0, последний — payload length, промежуточные не убывают.
+Пустой record допустим, пустая секция не создаёт страницу. Array `used_bytes` равен
+`element_count * element_width`. Count ненулевой; checked exclusive ordinal end не переполняется.
+
 Единое пространство `section_kind`:
 
 |      Код | Секция                 |      Код | Секция                 |
@@ -3161,18 +3302,28 @@ CHAIN_COVER, `k` для GRAIL, `max_ranges` для FERRARI, `bits` для BFL.
 | `0x0007` | LandmarkRefs           | `0x0101` | GrailIntervals         |
 | `0x0008` | LandmarkDistanceFrom   | `0x0102` | FerrariIntervals       |
 | `0x0009` | LandmarkDistanceTo     | `0x0103` | BflBitsets             |
+| `0x000A` | DefinitionDescriptor   | `0x0106` | PostorderRanks         |
 |          |                        | `0x0104` | ChainCoordinates       |
 |          |                        | `0x0105` | ChainReachabilityCells |
+| `0x0200` | NeighbourhoodCenters   | `0x0201` | NeighbourhoodOffsets   |
+| `0x0202` | NeighbourhoodMembers   | `0x0203` | NeighbourhoodRegisters |
+| `0x0204` | NeighbourhoodLandmarkMembers | `0x0205` | NeighbourhoodVertexMap |
 
-`0x003E` принимает только `0x0001..=0x0009`, `0x003F` — `0x0010..=0x0014`; specialized page types
+`0x003E` принимает `0x0001..=0x000A`, `0x0106`, `0x0200/0x0201/0x0205`; `0x003F` — `0x0010..=0x0014`; specialized page types
 `0x0027..=0x002A` принимают соответственно только `0x0100..=0x0103`, а renamed
 `IndexReachabilityChainCover=0x002B` — `0x0104/0x0105`. Ноль, unknown и несовместимая пара
 PageType/section_kind являются corruption.
+Neighbourhood types `0x002D/0x002E/0x002F` принимают соответственно только
+`0x0202/0x0203/0x0204`; registers имеют width 1, прочие Neighbourhood sections — width 8.
 
 Fixed arrays проверяют exact element width/count, checked `u64` total, непрерывность
 `first_ordinal` и нулевой tail. Component/representative/CSR/path/landmark refs имеют width 8;
+DefinitionDescriptor имеет width 1; PostorderRanks — width 8.
 TREE/GRAIL intervals и chain coordinates — 16; BFL — `2*ceil(bits/8)`;
-chain cells — 8. GRAIL хранит все `k` dimensions; FERRARI — bounded exact/approx interval set;
+chain cells — 8. Distance sections используют width 8 для hops или 16 для outward-rounded
+intervals. FERRARI interval занимает 24 bytes: lower:u64, upper:u64, kind:u8
+(0=Exact, 1=Approximate, 2=unused), reserved[7]=0. GRAIL хранит все `k` dimensions;
+FERRARI — bounded exact/approx interval set;
 BFL — hashed reachability filters без landmarks и без false negatives; Chain-Cover хранит
 отдельно coordinates и плоскую component×chain matrix. Пустая секция имеет `NULL_PAGE`.
 
@@ -3180,6 +3331,8 @@ BFL — hashed reachability filters без landmarks и без false negatives; 
 
 - `TREE_COVER` разрешён только для TREE/ROOTED_TREE/FOREST. OUT/IN хранит точные ancestor
   intervals; BOTH сравнивает connected-component ordinals симметризованного отношения.
+  DFS начинает обход с источников выбранного DAG, чтобы subtree занимал непрерывный диапазон;
+  произвольный старт с descendants нарушает точность forest intervals.
 - `GRAIL(k)`, `k=1..=32`, default 2, проверяет все dimensions: нарушение containment хотя бы в
   одной даёт `No`; прохождение всех даёт `Maybe`, не `Yes`.
 - `FERRARI(max_ranges)`, default 4, range `1..=255`, объединяет exact postorder intervals и
@@ -3200,72 +3353,85 @@ MAX_BYTES является hard cap.
 
 ### 20.9. Neighbourhood Index
 
-**Файл:** `idx/nbh_<ordinal:04>.fgidx`
+**Файл:** `idx/nbh_<ordinal:04>.fgidx`; один immutable файл на graph-owned definition
+и выбранную NODE/ATOM projection. Availability хранится в catalog. k=1, ON_DEMAND и
+AUTO fallback файла не создают; materialized max_k только 2..4. MAX_BYTES включает header,
+section headers/padding, descriptor и relation; maintenance scratch ограничивается отдельно.
 
-Создаётся один файл на один именованный граф.
-Заголовок хранит ссылки на корни B+tree для каждого из видов индекса.
+#### 20.9.1. NeighbourhoodHeaderPage
 
-#### NeighbourhoodHeaderPage (страница 0)
-
-```
-Offset  Size  Тип    Поле               Описание
-0       32    —      PageHeader (magic=MAGIC_IDX_NBH, type=IndexNeighbourhoodHeader)
-32      1     u8     algorithm          0=exact, 1=sketch, 2=landmark, 3=on_demand
-33      1     u8     max_k              предвычисленный радиус (1..4)
-34      1     u8     direction          0=out, 1=in, 2=both
-35      1     u8     status             0=building, 1=ready, 2=stale
-36      4     u32    params             LANDMARK: n_landmarks
-                                        SKETCH: hll_precision (4..18, default=12)
-                                        остальные: 0
-40      8     u64    node_count
-48      8     u64    build_lsn
-56      32    u64[4] exact_roots        EXACT: B+tree корни для k=1..4
-88      8     u64    sketch_root        SKETCH: B+tree корень
-96      8     u64    landmark_refs_page LANDMARK: список landmark DiskAtomRef;
-                                        остальные: NULL_PAGE
-104     8     u64    landmark_nbh_root  LANDMARK: B+tree окрестностей landmark-вершин
-112     16272 —      _reserved
-Total = PAGE_SIZE байт
-```
-
-#### EXACT — Neighbourhood Posting Pages
-
-  B+tree (exact_roots[k-1]): ключ = DiskAtomRef(u64) центра, значение = page_no первой NeighbourhoodListPage.
-
-```
-NeighbourhoodListPage:
-    Offset  Size    Содержимое
-    0       32      PageHeader (MAGIC_IDX_NBH, type=IndexNeighbourhoodExact)
-    32      8       center_ref: DiskAtomRef(u64)
-    40      1       k (u8)
-    41      7       _pad
-    48      8       next_page (u64)
-    56      4       count (u32)
-    60      4       _pad
-    64      16320   neighbors: DiskAtomRef(u64) × count
-    -- per page: 16320 / 8 = 2040 соседей
+```text
+0       32    PageHeader(IndexNeighbourhoodHeader), magic=FIN v1
+32      4     index_id
+36      4     schema_version
+40      8     graph_id
+48      8     build_revision (logical CommitTs)
+56      8     node_slot_capacity
+64      8     edge_slot_capacity
+72      8     vertex_count
+80      8     selected_relation_arc_count
+88      8     center_count; SKETCH=0
+96      8     member_count; SKETCH=0
+104     8     register_bytes; EXACT/LANDMARK=0
+112     8     max_bytes
+120     8     definition_fingerprint
+128     8     definition_descriptor_bytes
+136     8     page_count
+144     8     vertex_map_root
+152     8     csr_offsets_root
+160     8     csr_targets_root
+168     8     centers_root
+176     8     neighbourhood_offsets_root
+184     8     members_root
+192     8     registers_root
+200     8     definition_descriptor_root
+208     4     parameter: EXACT=0, SKETCH=p, LANDMARK=requested_count
+212     1     max_k (2..4)
+213     1     algorithm: 0=EXACT, 1=SKETCH, 2=LANDMARK
+214     1     direction: 0=OUT, 1=IN, 2=BOTH
+215     1     mode: 0=NODE, 1=ATOM
+216     1     flags: bit0=has_cross_level; другие bits=0
+217     ...   reserved=0
 ```
 
-#### SKETCH — HyperLogLog Pages
+Полные canonical descriptor bytes сравниваются наряду с fingerprint. Sections используют
+§20.8.2 checked array codec и упакованы подряд в порядке roots; все non-final pages заполнены
+до capacity. Пустые sections имеют NULL root; CSR offsets всегда содержит vertex_count+1 words.
 
-B+tree (sketch_root): составной ключ = k(u8) + _pad(7) + DiskAtomRef(u64) = 16 байт, значение = hll_sketch(u8[64]).
+VertexMap (`0x0205`, width 8) хранит DiskAtomRef выбранных live vertices в порядке GlobalAtomId;
+graph namespace задаёт header. CSR offsets/targets используют `0x0004/0x0005` и vertex ordinals.
+Это выбранная incidence relation, включая допустимые cycles/self arcs; она не является
+SCC condensation. Restore сверяет live membership, canonical ordering и все ordinal bounds.
+Cross-level запрос сохраняет exact scoped traversal; qualified endpoints не flatten-ятся.
 
-```
-PageHeader (MAGIC_IDX_NBH, type=IndexNeighbourhoodSketch)
-```
+#### 20.9.2. EXACT и LANDMARK
 
-#### LANDMARK
+Centers (`0x0200`, width 8) — sorted distinct vertex ordinals. EXACT содержит все vertices;
+LANDMARK — min(parameter, vertex_count) deterministic centers, выбранные по descending сумме
+in/out degree и меньшему GlobalAtomId при ties. После выбора centers сортируются по ordinal.
 
-LANDMARK хранит точные окрестности только для landmark-вершин.
-Формат данных идентичен EXACT, но в B+tree (landmark_nbh_root) присутствуют только записи для landmark-вершин, не для всех.
+Offsets (`0x0201`, width 8) содержит center_count×max_k+1 слов, первое 0, последнее member_count.
+Rows расположены center-major, затем radius 1..max_k. Members имеют width 8:
+EXACT `0x0202`/IndexNeighbourhoodExact, LANDMARK `0x0204`/IndexNeighbourhoodLandmarkList.
+Каждая row содержит sorted distinct vertex ordinals с minimum hop distance ≤ radius,
+включая seed; rows одного center монотонны по включению. Публичный порядок BFS/path bindings
+сохраняется consumer; сортировка artifact members не меняет его.
 
-```
-PageHeader (MAGIC_IDX_NBH, type=IndexNeighbourhoodLandmarkList)
-```
+LANDMARK дополняет обход cached members для оставшегося радиуса. Cached membership и ordinary
+visited/depth учитываются отдельно: cached member не должен подавить позднее ordinary посещение
+по более короткому пути. Refinement ограничивает scratch/work и проверяет cancellation.
 
-landmark_refs_page: LandmarkListPage в том же формате, что §20.8 LandmarkListPage.
+#### 20.9.3. SKETCH
 
-Для нелэндмарк-вершин данных нет: запрос выполняется BFS с ранним отсечением при достижении landmark.
+Registers (`0x0203`, IndexNeighbourhoodSketch, width 1) содержит
+vertex_count×max_k×2^p байт, radius-major, затем vertex-major. p=4..18, default=12:
+4096 registers, а не 64 байта. Один sketch может пересекать границы pages.
+Seed identity — canonical vertex ordinal как u64 LE в общем RapidHash-v3 domain данного artifact;
+все merged sketches используют одну projection/ordinal mapping. Ranks находятся в 0..=65-p.
+
+Round r объединяет предыдущий sketch центра и предыдущие sketches его выбранных neighbours
+через registerwise max. Sketch используется только approximate estimate/planner; ordinary
+enumeration/count остаются exact. Нет совместимого Ready sketch — exact traversal fallback.
 
 ### 20.10. Path Index
 
@@ -3281,14 +3447,14 @@ landmark_refs_page: LandmarkListPage в том же формате, что §20.
 48      8     build_lsn
 56      8     vertex_count
 64      4     landmark_count
-68      4     edge_label_id; NULL_LABEL=all, 0 is valid
+68      4     requested_landmark_count; 1..=256 for LANDMARK_SSSP
 72      8     vertex_map_root
 80      8     landmark_refs_root
 88      8     distance_from_root
 96      8     distance_to_root
 104     8     pattern_catalog_root
 112     8     pattern_rows_root
-120     8     dependency_root
+120     8     definition_descriptor_root
 128     8     max_bytes
 136     4     cost_function_id
 140     4     cost_function_version
@@ -3296,12 +3462,21 @@ landmark_refs_page: LandmarkListPage в том же формате, что §20.
 145     1     direction: 0=OUT, 1=IN, 2=BOTH
 146     1     cost_kind: 0=NONE, 1=HOP, 2=WEIGHT, 3=FUNCTION
 147     1     distance_encoding: 0=NONE, 1=U64, 2=F64_INTERVAL
-148     4     flags = 0
-152     ...   reserved = 0
+148     4     flags: bit0=has_cross_level; other bits=0
+152     8     definition_fingerprint
+160     8     definition_descriptor_bytes
+168     8     total_page_count
+176     1     mode: 0=NODE, 1=ATOM
+177     ...   reserved = 0
 ```
 
 Readiness/staleness хранится в catalog; `ON_DEMAND` physical header не создаёт. LANDMARK_SSSP
 использует roots `PathVertexMap`, `LandmarkRefs`, `LandmarkDistanceFrom/To` и NULL pattern roots.
+Полные semantic descriptor bytes содержат все labels и versioned dependencies; fingerprint
+сравнивается вместе с полными bytes. `LandmarkRefs` содержит vertex ordinals в selection order,
+distance arrays — landmark-major. `landmark_count=min(vertex_count,requested_landmark_count)`;
+для пустой проекции vertex/landmark/distance roots равны NULL_PAGE. Полный `MAX_BYTES` учитывает
+page zero и округлённые до страниц sections; scratch admission выполняется отдельно до чтения.
 PATTERN_CACHE использует `PatternDescriptor`, `PatternBindingRows`, `PatternDependencies` и
 locators на canonical IR/schema; vertex/landmark/distance roots равны NULL_PAGE.
 
@@ -3322,7 +3497,9 @@ h(v,t) = max(0,
 
 Участвуют только конечные terms. Это admissible ALT lower bound; A* повторно открывает
 улучшенные states. Landmark count `1..=256`, selection deterministic farthest-point с tie по
-меньшему `GlobalAtomId`. Hop distance — `u64` (`u64::MAX` infinity); weighted/custom — directed
+меньшему `GlobalAtomId`: первый landmark имеет минимальный identity, следующие максимизируют
+минимум `min(d(l,v),d(v,l))` по выбранным landmarks; unreachable имеет приоритет, weighted
+selection использует lower bounds. Hop distance — `u64` (`u64::MAX` infinity); weighted/custom — directed
 rounded interval `{lower:f64,upper:f64}`, вычитание использует lower minus upper и `next_down`.
 Weight/property/function dependency mutation делает индекс stale.
 
@@ -3348,8 +3525,11 @@ CachedBindingRow:
   multiplicity:u64 (>0); binding_count:u16; reserved:u16=0; canonical bindings...
 ```
 
-Atom/edge bindings содержат `GlobalAtomId`; named path — start atom и ordered
-`(edge GlobalAtomId, endpoint GlobalAtomId)[]`. Equal rows схлопываются с multiplicity и
+Каждый atom/connector/endpoint binding сохраняет qualified `{GraphId:u64, GlobalAtomId:u64}`.
+Named path содержит qualified start и ordered pairs qualified connector/endpoint, direction,
+endpoint role и exact Number cost. Один base atom в разных graphs не объединяется.
+Canonical descriptor описывает analyzed pattern и literals, но executable typed IR не
+сериализуется и не исполняется из physical pages. Equal rows схлопываются с multiplicity и
 сортируются lexicographically. `WHERE`, `RETURN` и `RETURN GRAPH` работают поверх восстановленных
 rows; materialized graph строится обычным путём. Membership/topology/label/overlay либо видимое
 base-property изменение и schema/function dependency mutation атомарно делают definition stale.
@@ -3384,28 +3564,55 @@ base-property изменение и schema/function dependency mutation атом
 **Файл:** `idx/ee_endpoint.fgidx`
 
 **Структура:** B+tree.
-- Ключ: `DiskAtomRef` edge-endpoint (`QualifiedDiskAtomRef` при `CROSS_LEVEL`)
-- Значение: список записей `(edge_ref, side)`
+- Prefix lookup по `(arena_scope_slot, endpoint_ref)` сохраняет qualified occurrence.
+  Scope 0 означает текущий граф; ненулевой slot разрешается через exact graph arena.
+- Unique key включает connector и actual side, поэтому source/target posting одного
+  connector не схлопываются. Key numbers — big-endian для byte ordering; physical metadata — LE.
+- Используются общий Unique B+tree codec и internal pages §20.2. Concrete leaf PageType —
+  `IndexEdgeEndpointEntry`; packed offset directory и key length сохраняются.
 
 ```
 Header:
   PageHeader (magic=MAGIC_IDX_EE, type=IndexEdgeEndpointHeader)
+  32  4  IndexId
+  36  4  SchemaVersion
+  40  8  GraphId
+  48  8  snapshot revision
+  56  8  tree root; 1..page_count-1
+  64  8  exact file page_count, включая header page 0
+  72  8  exact posting_count
+  80 ... reserved = 0
 ```
 
-Листовые страницы используют стандартный формат B+tree-листа (§20.2.3); собственного `PageHeader` у отдельной записи, разумеется, нет — заголовок принадлежит странице. Запись:
+Status находится только в catalog. Header записывается первым в недостижимом файле;
+после bottom-up packing root/extent обновляются, затем файл sync/validate и WAL/COW publication.
+Пустая capability сохраняет header и один пустой leaf; tree root не равен NULL.
+Packed leaf record состоит из 24-byte key и 8-byte value плюс key length/offset overhead:
 
 ```
-LeafEntry (24 байта):
-  endpoint_ref:  u64  -- DiskAtomRef ребра, выступающего endpoint'ом (ключ)
-  edge_ref:      u64  -- DiskAtomRef ребра, у которого оно endpoint
-  side:          u8   -- 0=source, 1=target
-  _pad:          u8[7]
+Key (24 bytes):
+  scope_slot:    u32 BE
+  endpoint_ref:  u64 BE -- DiskAtomRef edge-endpoint
+  connector_ref: u64 BE -- DiskAtomRef connector
+  side:          u8    -- 0=source/undirected, 1=target
+  reserved:      u8[3] = 0
+Value (8 bytes):
+  connector_ref: u64 LE -- обязан совпадать с key, общий Unique codec
 ```
 
 **Создаётся автоматически** при наличии хотя бы одного ребра с is_edge(endpoint) = true.
 Для каждого edge-endpoint записывается одна строка на фактическую сторону. Insert/delete
 выполняется в той же транзакции, что и изменение `EdgeHotSlot`; vertex-endpoint'ы в индекс
 не попадают.
+Identity capability выделяется из общего schema clock при первом edge-endpoint и сохраняется
+при удалении последнего posting. BUILD GRAPH использует тот же capability contract. Insert,
+topology replacement, cascade/delete и recovery сопровождают runtime postings; local snapshot
+публикует полный canonical posting tree в generation topology. Старые physical generations
+закрепляются при begin/Read Committed refresh; private mutation использует private exact postings.
+Buffered control ограничен 128 MiB; streaming output не удерживает все pages. Scratch использует
+maintenance external sort с разделением бюджета между input/child/next-level buffers. Lookup
+ограничивает 262144 postings/candidates и 4096 page reads до retention; ошибки дают typed resource
+error. Decoder проверяет exact identity/version/revision/extent, reserved bytes и connector side.
 
 **Использование при traversal:**
 1. Текущий атом = ребро $e_1$ (AtomWalk-режим)
@@ -3949,6 +4156,12 @@ read_page(PageKey, snapshot):
     если найден → вернуть его образ
     иначе       → прочитать страницу из .fgb
 ```
+
+Обычный physical snapshot удерживает exact file bindings и reader pin. Его home-cache key
+сохраняет захваченную generation, а допустимый page LSN ограничен `snapshot.visible_lsn`:
+passive checkpoint может после capture перенести видимые frames в home и удалить их из WAL.
+Ceiling последнего checkpoint на момент capture для такого чтения недостаточен. Все transport
+routes, включая transient Direct/IoRing bypass, проверяют page identity, checksum и этот ceiling.
 
 Отсюда следуют свойства, которых у модели дельт не было:
 - **Снимок консистентен по всей базе**, а не по одному графу: `commit_ts` упорядочивает MVCC,

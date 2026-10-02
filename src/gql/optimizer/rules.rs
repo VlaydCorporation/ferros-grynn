@@ -313,6 +313,7 @@ fn constant_expression(expression: &TypedExpr) -> bool {
 			!matches!(
 				function,
 				Builtin::TimeNow(_)
+					| Builtin::PathCostWith(_)
 					| Builtin::Uuid
 					| Builtin::Ulid
 					| Builtin::RandId

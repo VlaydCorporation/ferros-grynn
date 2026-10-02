@@ -128,6 +128,11 @@ fn encode_job(output: &mut Vec<u8>, job: &MaintenanceJobInfo) -> FerrosGrynnResu
 	output.push(kind_byte(job.kind));
 	output.push(state_byte(job.state));
 	let (target_kind, class, index, version, graph) = match job.target {
+		MaintenanceTarget::GraphIndex {
+			graph,
+			index,
+			version,
+		} => (5, 0, index.get(), version.get(), graph.get()),
 		MaintenanceTarget::Database => (0, 0, 0, 0, 0),
 		MaintenanceTarget::Graph(graph) => (1, 0, 0, 0, graph.get()),
 		MaintenanceTarget::Index {
@@ -202,6 +207,13 @@ fn decode_job(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<MaintenanceJobInfo
 	let restart_count = decoder.read_u32()?;
 	let graph = decoder.read_u64()?;
 	let target = match (target_kind, class, index, version, graph) {
+		(5, 0, index, version, graph) => MaintenanceTarget::GraphIndex {
+			graph: GraphId::new(graph).ok_or_else(|| invalid("job graph index owner is zero"))?,
+			index: IndexId::new(index)
+				.ok_or_else(|| invalid("job graph index identity is reserved"))?,
+			version: SchemaVersion::new(version)
+				.ok_or_else(|| invalid("job graph index version is zero"))?,
+		},
 		(0, 0, 0, 0, 0) => MaintenanceTarget::Database,
 		(1, 0, 0, 0, graph) => MaintenanceTarget::Graph(
 			GraphId::new(graph).ok_or_else(|| invalid("job graph target uses identity zero"))?,
@@ -313,7 +325,7 @@ fn validate_job_target(
 				| MaintenanceJobKind::RebuildIndex
 				| MaintenanceJobKind::DeferredIndexCatchUp
 				| MaintenanceJobKind::CompactIndex,
-			MaintenanceTarget::Index { .. }
+			MaintenanceTarget::Index { .. } | MaintenanceTarget::GraphIndex { .. }
 		) | (
 			MaintenanceJobKind::Analyze,
 			MaintenanceTarget::BaseClass(_)
@@ -638,6 +650,29 @@ mod tests {
 			.encode()
 			.is_err()
 		);
+		Ok(())
+	}
+
+	#[test]
+	fn graph_index_job_target_round_trips_and_rejects_reserved_owner() -> FerrosGrynnResult<()> {
+		let mut job = sample()?;
+		job.target = MaintenanceTarget::GraphIndex {
+			graph: GraphId::new(7).ok_or_else(|| invalid("test graph identity"))?,
+			index: IndexId::new(9).ok_or_else(|| invalid("test index identity"))?,
+			version: SchemaVersion::INITIAL,
+		};
+		let catalog = JobCatalog {
+			generation: 1,
+			jobs: vec![job.clone()],
+		};
+		let bytes = catalog.encode()?;
+		assert_eq!(JobCatalog::decode(&bytes)?, catalog);
+		let mut record = Vec::new();
+		encode_job(&mut record, &job)?;
+		assert_eq!(record[18], 5);
+		assert_eq!(&record[25..37], &[0, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0]);
+		record[41..49].fill(0);
+		assert!(decode_job(&mut Decoder::new(&record)).is_err());
 		Ok(())
 	}
 }

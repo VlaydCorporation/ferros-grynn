@@ -11,6 +11,50 @@ fn value(store: &Datastore, source: &str) -> Value {
 }
 
 #[test]
+fn geometry_predicates_conversions_and_quantifiers_use_the_exact_oracle() {
+	let store = Datastore::in_memory();
+	let point = "type::to<geometry>({type: 'Point', coordinates: [1, 1]})";
+	let boundary = "type::to<geometry>({type: 'Point', coordinates: [0, 1]})";
+	let polygon =
+		"type::to<geometry>({type: 'Polygon', coordinates: [[[0,0], [2,0], [2,2], [0,2], [0,0]]]})";
+	for (expression, expected) in [
+		(format!("{point} INSIDE {polygon}"), true),
+		(format!("{boundary} INSIDE {polygon}"), false),
+		(format!("{boundary} INTERSECTS {polygon}"), true),
+		(format!("geo::within({point}, {polygon})"), true),
+		(format!("geo::intersects({boundary}, {polygon})"), true),
+		(format!("none OUTSIDE {polygon}"), false),
+		(format!("null NOTINSIDE {polygon}"), false),
+		(format!("[] ALLINSIDE {polygon}"), true),
+		(format!("[] ANYINSIDE {polygon}"), false),
+		(format!("SET[] NONEINSIDE {polygon}"), true),
+		(format!("[{point}, {boundary}] ALLINSIDE {polygon}"), false),
+		(format!("[{point}, {boundary}] ANYINSIDE {polygon}"), true),
+	] {
+		assert_eq!(
+			value(&store, &format!("RETURN {expression};")),
+			Value::Bool(expected),
+			"{expression}"
+		);
+	}
+	assert_eq!(
+		value(&store, &format!("RETURN geo::distance({point}, {point});")),
+		Value::from(0.0)
+	);
+	for expression in [
+		format!("1 INSIDE {polygon}"),
+		format!("[none, 1] NONEINSIDE {polygon}"),
+		format!("geo::within(1, {polygon})"),
+	] {
+		assert!(
+			store
+				.execute(&format!("RETURN {expression};"), &Object::new())
+				.map_or(true, |outcomes| outcomes[0].result.is_err())
+		);
+	}
+}
+
+#[test]
 fn evaluates_collections_ranges_idioms_and_builtins() {
 	let store = Datastore::in_memory();
 	assert_eq!(value(&store, "RETURN [1, 2, 3] CONTAINS 2;"), Value::Bool(true));

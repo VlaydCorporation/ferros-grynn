@@ -300,6 +300,13 @@ pub(super) enum LogicalSchemaStatement {
 		maintenance: crate::datastore::IndexMaintenanceMode,
 		concurrently: bool,
 	},
+	/// Graph-owned definition resolved to public catalog types.
+	DefineGraphIndex {
+		mode: DefinitionMode,
+		graph: Box<str>,
+		index: crate::datastore::GraphIndex,
+		concurrently: bool,
+	},
 	DefineAnalyzer {
 		mode: DefinitionMode,
 		analyzer: crate::datastore::SchemaAnalyzer,
@@ -338,6 +345,12 @@ pub(super) enum LogicalSchemaStatement {
 	RemoveIndex {
 		if_exists: bool,
 		class: Box<str>,
+		name: Box<str>,
+	},
+	/// Removes a graph-owned user definition.
+	RemoveGraphIndex {
+		if_exists: bool,
+		graph: Box<str>,
 		name: Box<str>,
 	},
 	RemoveParameter {
@@ -405,6 +418,11 @@ pub(super) enum LogicalSchemaStatement {
 		class: Box<str>,
 		name: Box<str>,
 	},
+	/// Observes a graph-owned definition.
+	InfoGraphIndex {
+		graph: Box<str>,
+		name: Box<str>,
+	},
 	InfoParameter {
 		name: Box<str>,
 	},
@@ -437,6 +455,9 @@ impl LogicalSchemaStatement {
 			| Self::DefineIndex {
 				..
 			}
+			| Self::DefineGraphIndex {
+				..
+			}
 			| Self::DefineAnalyzer {
 				..
 			}
@@ -459,6 +480,9 @@ impl LogicalSchemaStatement {
 				..
 			}
 			| Self::RemoveIndex {
+				..
+			}
+			| Self::RemoveGraphIndex {
 				..
 			}
 			| Self::RemoveParameter {
@@ -496,6 +520,9 @@ impl LogicalSchemaStatement {
 				..
 			}
 			| Self::InfoIndex {
+				..
+			}
+			| Self::InfoGraphIndex {
 				..
 			}
 			| Self::InfoParameter {
@@ -657,6 +684,8 @@ pub(super) struct Expand {
 	pub(super) target: MatchBinding,
 	/// Required traversal direction.
 	pub(super) direction: crate::syn::MatchDirection,
+	/// Captured PURE contribution; this one-hop segment starts at zero.
+	pub(super) custom_cost: Option<LogicalPathCost>,
 	/// Candidate-edge filters inherited from the selected constraint scope.
 	pub(super) filters: Vec<crate::syn::MatchPathFilter>,
 }
@@ -680,10 +709,22 @@ pub(super) struct PathExpand {
 	pub(super) mode: crate::syn::MatchPathMode,
 	/// Optional shortest-path objective after local/global override.
 	pub(super) objective: Option<crate::syn::MatchPathObjective>,
+	/// Captured PURE COST identity and additive/stateful invocation contract.
+	pub(super) custom_cost: Option<LogicalPathCost>,
 	/// Candidate-edge filters after local/global override.
 	pub(super) filters: Vec<crate::syn::MatchPathFilter>,
 	/// Optional column receiving the public path value.
 	pub(super) path_column: Option<usize>,
+}
+
+/// One versioned path contribution; stateful functions receive the current
+/// segment prefix and remain exact traversal consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct LogicalPathCost {
+	/// Published identity shared with the ordinary named-function cache.
+	pub(super) function: NamedFunctionKey,
+	/// Whether a second numeric prefix argument is required.
+	pub(super) stateful: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -836,6 +877,8 @@ pub(crate) enum TraverseStepKind {
 	Cuts,
 	LowestCommonAncestor,
 	HasCycle,
+	/// Explicit approximate distinct count within the given hop radius.
+	KHopEstimate,
 }
 
 impl TraverseStepKind {
@@ -853,6 +896,7 @@ impl TraverseStepKind {
 				| Self::Maximum
 				| Self::Average
 				| Self::KHop
+				| Self::KHopEstimate
 				| Self::Reachable
 				| Self::ShortestPath
 				| Self::WeightedShortestPath
@@ -902,6 +946,8 @@ pub(super) struct LogicalTraverse {
 	pub(super) constraints: crate::syn::MatchConstraints,
 	pub(super) source: LogicalTraverseSource,
 	pub(super) graph: Option<LogicalGraphReference>,
+	/// Shared static contribution used by navigation and weighted path steps.
+	pub(super) custom_cost: Option<LogicalPathCost>,
 	pub(super) steps: Vec<LogicalTraverseStep>,
 	/// Columns available to the final RETURN expression in runtime row order.
 	pub(super) result: Schema,
@@ -1313,4 +1359,9 @@ pub(super) enum Builtin {
 	},
 	SearchScore(u16),
 	SearchHighlight(u16),
+	GeoWithin,
+	GeoIntersects,
+	GeoDistance,
+	/// Streaming recomputation through a captured versioned PURE COST.
+	PathCostWith(LogicalPathCost),
 }

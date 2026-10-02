@@ -21,6 +21,9 @@
 - `mod.rs` — фасад и реэкспорт общих математических операций;
 - `exact_ops.rs` — traits и функции checked add/subtract/multiply и exact
   unsigned/signed division с ошибками `gql_status`.
+- `hyper_log_log.rs` — общий checked mergeable cardinality kernel для ANALYZE и
+  Neighbourhood; p=12 сохраняет прежние hash/rounding semantics. Registers и precision
+  проверяются на decode; approximation не подменяет ordinary exact counts.
 
 Новые предметные группы выделять в отдельные подмодули (`statistics`,
 `distance`, `tensor` и т. п.) только после появления общей ответственности и

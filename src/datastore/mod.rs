@@ -8,6 +8,17 @@ mod backend;
 mod conflict;
 /// Shared datastore constants.
 mod consts;
+/// Snapshot-root adapter for derived incidence projections.
+mod graph_index_relation;
+/// Directed landmark snapshot artifacts and their checked physical adapters.
+mod graph_path;
+pub(crate) use graph_path::LandmarkPathArtifact;
+/// Bounded neighbourhood sets, cardinality sketches and landmark refinement.
+mod graph_neighbourhood;
+pub(crate) use graph_neighbourhood::NeighbourhoodArtifact;
+/// Sound reachability labels and bounded exact refinement.
+mod graph_reachability;
+pub(crate) use graph_reachability::ReachabilityArtifact;
 /// Database-versus-graph physical identity.
 mod identity;
 /// Atomic bulk-import coordination and public reports.
@@ -109,11 +120,18 @@ pub use schema::{
 	FulltextIndexOptions,
 	FunctionEffect,
 	FunctionId,
+	GeometryIndexOptions,
+	GraphIndex,
+	GraphIndexCost,
+	GraphIndexDefinition,
 	GraphSchema,
 	HnswIndexOptions,
 	IndexId,
 	IndexMaintenanceMode,
 	IndexScope,
+	NeighbourhoodAlgorithm,
+	PathIndexAlgorithm,
+	ReachabilityAlgorithm,
 	SchemaAnalyzer,
 	SchemaCatalog,
 	SchemaFunction,
@@ -131,6 +149,10 @@ pub use store::Datastore;
 pub(crate) use text_analyzer::{AnalyzedToken, analyze_builtin, analyze_function_result};
 pub use transaction::{AtomSnapshot, CommitResult, Transaction, TransactionGraphView};
 pub(crate) use transaction::{
+	QueryGeometryIndexRead,
+	QueryLandmarkPath,
+	QueryNeighbourhoodEstimate,
+	QueryNeighbourhoodSketch,
 	QuerySnapshot,
 	QueryStatisticsDemand,
 	QueryStorageCursor,

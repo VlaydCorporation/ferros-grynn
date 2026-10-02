@@ -44,6 +44,14 @@ impl Traverser {
 		self.trace.is_none()
 			&& other.trace.is_none()
 			&& self.current == other.current
+			&& match (self.trace_cost, other.trace_cost) {
+				(Number::Int(left), Number::Int(right)) => left == right,
+				(Number::Float(left), Number::Float(right)) => left.to_bits() == right.to_bits(),
+				(Number::Decimal(left), Number::Decimal(right)) => {
+					left.serialize() == right.serialize()
+				}
+				_ => false,
+			}
 			&& self.sack == other.sack
 			&& self.named_sacks == other.named_sacks
 			&& self.env == other.env
@@ -63,6 +71,10 @@ impl Traverser {
 	pub(super) fn merge_fingerprint(&self) -> u64 {
 		let mut hasher = rapidhash::fast::RapidHasher::default();
 		self.current.hash(&mut hasher);
+		if !matches!(self.trace_cost, Number::Int(0)) {
+			std::mem::discriminant(&self.trace_cost).hash(&mut hasher);
+			self.trace_cost.hash(&mut hasher);
+		}
 		self.sack.hash(&mut hasher);
 		self.named_sacks.hash(&mut hasher);
 		self.env.hash(&mut hasher);
@@ -85,5 +97,24 @@ impl Traverser {
 					.map(|(name, value)| name.len().saturating_add(value.estimated_heap_bytes()))
 					.fold(0_usize, usize::saturating_add),
 			)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn bulking_preserves_exact_cost_prefix_representation() {
+		let seed = Traverser::new(Value::None);
+		assert!(seed.can_merge(&seed.clone()));
+		for prefix in
+			[Number::Int(1), Number::Float(0.0), Number::Decimal(rust_decimal::Decimal::ZERO)]
+		{
+			let mut other = seed.clone();
+			other.trace_cost = prefix;
+			assert!(!seed.can_merge(&other));
+			assert!(other.can_merge(&other.clone()));
+		}
 	}
 }

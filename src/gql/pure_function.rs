@@ -1,12 +1,12 @@
 //! Evaluation boundary for durable PURE functions used by physical builders.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 use super::{
 	QueryExecutionOptions,
 	analysis::{QueryCatalog, compile_named_function},
 	closure::LanguageClosureState,
-	execution::{invoke_logical_closure, query_schema},
+	execution::{invoke_root_logical_closure, query_schema},
 	ir::NamedFunctionKey,
 	options::ExecutionControl,
 };
@@ -53,6 +53,34 @@ impl<'a> PureFunctionEvaluator<'a> {
 		}
 	}
 
+	/// Captures caller-owned scratch and cancellation for an immutable build.
+	pub(crate) fn for_builder(
+		root: &'a DatabaseRoot,
+		scratch_bytes: usize,
+		check: fn() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Self> {
+		check()?;
+		let compiler_bytes = scratch_bytes / 2;
+		let runtime_bytes = NonZeroUsize::new(scratch_bytes - compiler_bytes).ok_or_else(|| {
+			FerrosGrynnError::traversal_resource_limit_exceeded(
+				"PURE runtime scratch",
+				scratch_bytes as u64,
+			)
+		})?;
+		let cache = Arc::new(LanguageClosureState::bounded(compiler_bytes));
+		let options = QueryExecutionOptions {
+			barrier_memory_bytes: runtime_bytes,
+			..QueryExecutionOptions::default()
+		};
+		let control = ExecutionControl::with_runtime(&options, None, None, Arc::clone(&cache))
+			.with_cooperative_check(check);
+		Ok(Self {
+			catalog: RootCatalog(root),
+			cache,
+			control,
+		})
+	}
+
 	/// Runs one analyzer function and validates its public token contract.
 	pub(crate) fn analyze(
 		&self,
@@ -91,12 +119,106 @@ impl<'a> PureFunctionEvaluator<'a> {
 		Ok(distance)
 	}
 
+	/// Evaluates the captured versioned additive edge COST through normal typed
+	/// IR.
+	///
+	/// # Errors
+	/// Rejects missing/non-edge occurrences, invalid signatures or numeric
+	/// costs.
+	pub(crate) fn path_cost(
+		&self,
+		function: FunctionId,
+		version: SchemaVersion,
+		graph: &GraphRef,
+		local: crate::graph::AtomId,
+	) -> FerrosGrynnResult<Number> {
+		let occurrence = self
+			.catalog
+			.0
+			.occurrence(graph.id(), local)
+			.filter(|occurrence| occurrence.local_id().is_edge())
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("path COST requires an edge occurrence")
+			})?;
+		let atom =
+			self.catalog.0.atom(occurrence.global_id()).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("COST edge base is absent")
+			})?;
+		let definition = self
+			.catalog
+			.function(function)?
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("COST function is absent"))?;
+		if !definition.is_cost() || definition.parameters().len() != 1 {
+			return Err(FerrosGrynnError::invalid_argument(
+				"path COST requires a unary PURE COST function",
+			));
+		}
+		let argument = Value::from(crate::graph::AtomOccurrenceRef::new(
+			crate::graph::AtomRef::new(atom.kind(), atom.record_id().clone()),
+			Arc::new(graph.clone()),
+		));
+		let Value::Number(number) = self.invoke(function, version, &[argument])? else {
+			return Err(FerrosGrynnError::invalid_argument("path COST did not return a number"));
+		};
+		crate::graph::DistanceInterval::from_number(number)?;
+		Ok(number)
+	}
+
+	/// Resolves transitive versions through the same analyzer used for
+	/// execution.
+	///
+	/// # Errors
+	/// Rejects absent/non-PURE definitions, malformed bodies or cache budgets.
+	pub(crate) fn path_dependencies(
+		root: &'a DatabaseRoot,
+		function: FunctionId,
+		version: SchemaVersion,
+	) -> FerrosGrynnResult<std::collections::BTreeSet<(FunctionId, SchemaVersion)>> {
+		let evaluator = Self::new(root);
+		evaluator.dependencies(function, version)
+	}
+
+	/// Resolves versions under this evaluator's compiler and cancellation caps.
+	pub(crate) fn dependencies(
+		&self,
+		function: FunctionId,
+		version: SchemaVersion,
+	) -> FerrosGrynnResult<std::collections::BTreeSet<(FunctionId, SchemaVersion)>> {
+		self.control.check()?;
+		let definition = self
+			.catalog
+			.function(function)?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("path COST function is absent"))?;
+		if definition.version() != version || definition.effect() != FunctionEffect::Pure {
+			return Err(FerrosGrynnError::invalid_argument(
+				"path COST requires the captured PURE version",
+			));
+		}
+		let plan = compile_named_function(
+			&self.catalog,
+			&definition,
+			&[],
+			&BTreeMap::new(),
+			Some(&self.cache),
+		)?;
+		self.control.check()?;
+		self.cache.cache_named_plan(&plan)?;
+		let dependencies = self.cache.named_dependencies();
+		if dependencies.len() > 1024 {
+			return Err(FerrosGrynnError::invalid_argument(
+				"path COST exceeds 1024 transitive function dependencies",
+			));
+		}
+		Ok(dependencies)
+	}
+
 	fn invoke(
 		&self,
 		id: FunctionId,
 		version: SchemaVersion,
 		arguments: &[Value],
 	) -> FerrosGrynnResult<Value> {
+		self.control.check()?;
 		let function = self
 			.catalog
 			.function(id)?
@@ -128,9 +250,16 @@ impl<'a> PureFunctionEvaluator<'a> {
 			)?;
 			self.cache.cache_named_plan(&plan)?;
 		}
+		self.control.check()?;
 		let plan = self.control.resolve_named_function(key)?;
 		let _frame = self.control.enter_named_function(key)?;
-		invoke_logical_closure(&self.control, &plan, &[], arguments, function.body().as_str())
+		invoke_root_logical_closure(
+			self.catalog.0,
+			&self.control,
+			&plan,
+			arguments,
+			function.body().as_str(),
+		)
 	}
 }
 
@@ -200,6 +329,8 @@ impl QueryCatalog for RootCatalog<'_> {
 
 #[cfg(test)]
 mod tests {
+	use std::cell::Cell;
+
 	use super::*;
 	use crate::{
 		datastore::SchemaFunctionParameter,
@@ -227,6 +358,65 @@ mod tests {
 			evaluator.invoke(id, SchemaVersion::INITIAL, &[Value::from(21_i64)])?,
 			Value::from(42_i64)
 		);
+		Ok(())
+	}
+
+	thread_local! {
+		/// Deterministic cancellation inside a function, independent of timing.
+		static BUILDER_CHECKS: Cell<usize> = const { Cell::new(0) };
+	}
+
+	/// Cancels after typed execution has entered the loop and its child blocks.
+	fn cancel_during_function() -> FerrosGrynnResult<()> {
+		BUILDER_CHECKS.with(|checks| {
+			let next = checks.get() + 1;
+			checks.set(next);
+			if next > 128 {
+				Err(FerrosGrynnError::query_cancelled())
+			} else {
+				Ok(())
+			}
+		})
+	}
+
+	#[test]
+	fn pure_builder_admits_compilers_frames_and_cancels_inside_calls() -> FerrosGrynnResult<()> {
+		let mut root = DatabaseRoot::default();
+		let id = FunctionId::new(1).ok_or_else(|| FerrosGrynnError::invalid_argument("test id"))?;
+		let mut function = SchemaFunction::new(
+			"fn",
+			"iterate",
+			vec![SchemaFunctionParameter::new("value", Type::Any)?],
+			Type::Int,
+			FunctionEffect::Pure,
+			true,
+			None,
+			"{ FOR $i IN 0..1000000 { LET $copy = $i; }; RETURN 1; }",
+		)?;
+		function.id = Some(id);
+		Arc::make_mut(&mut root.schema).functions.insert(id, Arc::new(function));
+		let version = SchemaVersion::INITIAL;
+		let evaluator = PureFunctionEvaluator::for_builder(&root, 64, || Ok(()))?;
+		assert!(evaluator.dependencies(id, version).is_err());
+		BUILDER_CHECKS.set(0);
+		let evaluator = PureFunctionEvaluator::for_builder(&root, 2 << 20, cancel_during_function)?;
+		let error = evaluator
+			.invoke(id, version, &[Value::None])
+			.err()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("loop did not cancel"))?;
+		assert_eq!(error.status().code(), FerrosGrynnError::query_cancelled().status().code());
+		assert_eq!(BUILDER_CHECKS.get(), 129);
+		assert_eq!(evaluator.control.barrier_memory_available(), 1 << 20);
+		BUILDER_CHECKS.set(0);
+		evaluator.dependencies(id, version)?;
+		let evaluator = PureFunctionEvaluator::for_builder(&root, 2 << 20, || Ok(()))?;
+		let oversized = Value::from("x".repeat(2 << 20));
+		let error = evaluator
+			.invoke(id, version, &[oversized])
+			.err()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("frame was not rejected"))?;
+		assert_eq!(error.status().condition(), crate::gql_status::Condition::ProgramLimitExceeded);
+		assert_eq!(evaluator.control.barrier_memory_available(), 1 << 20);
 		Ok(())
 	}
 }

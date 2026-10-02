@@ -40,6 +40,216 @@ use crate::{
 
 mod search_scope_tests;
 
+#[test]
+fn edge_endpoint_physical_hyperwalk_pins_old_generation_and_reopens() {
+	use crate::graph::{EdgeEndpoint, TraversalDirection, TraversalIndex, TraversalSemantics};
+	let directory = TestDirectory::new();
+	let mut options = LocalOptions::default();
+	options.buffer_pool_pages = 16;
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.define_class(ClassSchema::new("relation", AtomKind::Edge, []).unwrap()).unwrap();
+	let graph = seed.define_graph("endpoints", GraphKind::Graph).unwrap();
+	let mut nodes = Vec::new();
+	for index in 0..8 {
+		let record = format!("person:n{index}").parse::<RecordId>().unwrap();
+		seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		nodes.push(seed.attach_node(graph.id(), &record, None, None).unwrap());
+	}
+	let records = ["relation:base", "relation:hyper", "relation:both", "relation:undirected"]
+		.map(|value| value.parse::<RecordId>().unwrap());
+	for record in &records {
+		seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+	}
+	let endpoint = seed
+		.attach_edge(
+			graph.id(),
+			&records[0],
+			None,
+			EdgeTopology::directed([nodes[0]], [nodes[1]]),
+			None,
+			None,
+		)
+		.unwrap();
+	seed.attach_edge(
+		graph.id(),
+		&records[1],
+		None,
+		EdgeTopology::directed([endpoint, nodes[2]], nodes[3..].iter().copied().chain([endpoint])),
+		None,
+		None,
+	)
+	.unwrap();
+	seed.attach_edge(
+		graph.id(),
+		&records[2],
+		None,
+		EdgeTopology::bidirectional([endpoint], [nodes[2]]),
+		None,
+		None,
+	)
+	.unwrap();
+	seed.attach_edge(
+		graph.id(),
+		&records[3],
+		None,
+		EdgeTopology::undirected([endpoint, nodes[0], nodes[1]]),
+		None,
+		None,
+	)
+	.unwrap();
+	seed.commit().unwrap();
+	let mut old = store.begin();
+	let capability = old.graphs().unwrap()[0].edge_endpoint_index().unwrap();
+	assert!(store.checkpoint(CheckpointMode::Passive).unwrap());
+	let snapshot = old.query_snapshot().unwrap();
+	let exact =
+		TraversalIndex::new(&old.query_graph(&snapshot, &graph).unwrap(), TraversalSemantics::Atom)
+			.unwrap();
+	for (forward, backward, direction) in [
+		(true, false, TraversalDirection::Forward),
+		(false, true, TraversalDirection::Backward),
+		(true, true, TraversalDirection::Both),
+	] {
+		let physical = old
+			.query_physical_traversal(&snapshot, &graph, endpoint, forward, backward, true)
+			.unwrap()
+			.unwrap();
+		let mut expected = exact
+			.steps(&EdgeEndpoint::Local(endpoint), direction)
+			.map(|step| {
+				(
+					step.target().local_id().unwrap(),
+					step.via_edge(),
+					step.direction(),
+					step.role(),
+					step.topology(),
+				)
+			})
+			.collect::<Vec<_>>();
+		let mut actual = physical
+			.candidates
+			.iter()
+			.map(|step| (step.target, step.edge, step.direction, step.role, step.topology))
+			.collect::<Vec<_>>();
+		expected.sort();
+		expected.dedup();
+		actual.sort();
+		assert_eq!(actual, expected);
+	}
+	let variables = Object::from_iter([
+		("graph", Value::GraphRef(Box::new(graph.clone()))),
+		("source", Value::Record(Box::new(records[0].clone()))),
+	]);
+	let query = "TRAVERSE ATOM FROM $source IN GRAPH $graph |> tv::out() |> tv::values('id');";
+	let before = store.execute(query, &variables).unwrap().remove(0).result.unwrap().into_parts().0;
+	assert_eq!(before.as_array().unwrap().len(), 9);
+	let mut remove = store.begin();
+	remove.detach_occurrence(graph.id(), &records[1], false).unwrap();
+	remove.commit().unwrap();
+	assert_eq!(
+		old.execute(query, &variables).unwrap().remove(0).result.unwrap().into_parts().0,
+		before
+	);
+	let current =
+		store.execute(query, &variables).unwrap().remove(0).result.unwrap().into_parts().0;
+	assert_eq!(current.as_array().unwrap().len(), 3);
+	for result in store
+		.execute(
+			"INFO FOR INDEX edge_endpoint ON GRAPH endpoints; REBUILD INDEX edge_endpoint ON \
+			 GRAPH endpoints;",
+			&Object::new(),
+		)
+		.unwrap()
+	{
+		assert!(result.result.is_ok(), "{:?}", result.result);
+	}
+	drop(snapshot);
+	drop(old);
+	drop(store);
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	assert_eq!(reopened.begin().graphs().unwrap()[0].edge_endpoint_index(), Some(capability));
+	assert_eq!(
+		reopened.execute(query, &variables).unwrap().remove(0).result.unwrap().into_parts().0,
+		current
+	);
+}
+
+#[test]
+fn geometry_physical_delta_matches_scan_and_survives_reopen() {
+	let directory = TestDirectory::new();
+	let options = LocalOptions::default();
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let setup = store
+		.execute(
+			"DEFINE CLASS place TYPE NODE SCHEMAFULL; DEFINE FIELD shape ON CLASS place TYPE \
+			 geometry; CREATE place:a SET shape = <geometry>{type: 'Point', coordinates: [1, 1]}; \
+			 CREATE place:b SET shape = <geometry>{type: 'Point', coordinates: [8, 8]}; CREATE \
+			 place:c SET shape = <geometry>{type: 'Point', coordinates: [2, 2]}; DEFINE INDEX \
+			 by_shape ON CLASS place FIELDS shape GEOMETRY SCOPE BASE;",
+			&Object::new(),
+		)
+		.unwrap();
+	for result in setup {
+		assert!(result.result.is_ok(), "{:?}", result.result);
+	}
+	let query = Object::from_iter([(
+		"area",
+		Value::Geometry(
+			"{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[5,0],[5,5],[0,5],[0,0]]]}"
+				.parse::<crate::values::Geometry>()
+				.unwrap(),
+		),
+	)]);
+	let indexed =
+		"SELECT VALUE id FROM place WITH INDEX by_shape WHERE shape INSIDE $area ORDER BY id;";
+	let scan = "SELECT VALUE id FROM place WITH NOINDEX WHERE shape INSIDE $area ORDER BY id;";
+	let value = |store: &Datastore, text: &str| {
+		store.execute(text, &query).unwrap().remove(0).result.unwrap().into_parts().0
+	};
+	assert_eq!(value(&store, indexed), value(&store, scan));
+	let base = physical_index_files(&store, "by_shape").0;
+	let mut old = store.begin();
+	let before = value(&store, scan);
+	store
+		.execute(
+			"UPDATE place:b SET shape = <geometry>{type: 'Point', coordinates: [3, 3]};",
+			&Object::new(),
+		)
+		.unwrap()
+		.remove(0)
+		.result
+		.unwrap();
+	assert_eq!(physical_index_files(&store, "by_shape").0, base);
+	assert!(physical_index_files(&store, "by_shape").1.is_some());
+	assert_eq!(value(&store, indexed), value(&store, scan));
+	assert_eq!(
+		old.execute(indexed, &query).unwrap().remove(0).result.unwrap().into_parts().0,
+		before
+	);
+	drop(old);
+	store.execute("DELETE place:a;", &Object::new()).unwrap().remove(0).result.unwrap();
+	assert_eq!(value(&store, indexed), value(&store, scan));
+	let compacted = physical_index_files(&store, "by_shape").0;
+	store.execute("DELETE place:b;", &Object::new()).unwrap().remove(0).result.unwrap();
+	assert_eq!(physical_index_files(&store, "by_shape").0, compacted);
+	assert!(physical_index_files(&store, "by_shape").1.is_some());
+	assert_eq!(value(&store, indexed), value(&store, scan));
+	let rejected = store
+		.execute(
+			"SELECT VALUE id FROM place WITH INDEX by_shape WHERE shape OUTSIDE $area;",
+			&query,
+		)
+		.unwrap();
+	assert!(rejected[0].result.is_err());
+	let expected = value(&store, scan);
+	assert!(store.checkpoint(CheckpointMode::Restart).unwrap());
+	drop(store);
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	assert_eq!(value(&reopened, indexed), expected);
+}
+
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
@@ -238,7 +448,7 @@ fn local_atom_index_reopen_diagnostic() -> crate::gql_status::FerrosGrynnResult<
 	root.commit_ts = root.commit_ts.checked_add(1).ok_or_else(|| {
 		crate::gql_status::FerrosGrynnError::invalid_argument("commit clock exhausted")
 	})?;
-	drop(store.inner.persist_import_root(&root, None)?);
+	drop(store.inner.persist_import_root(&mut root, None)?);
 	drop(store);
 
 	let mut totals = Vec::with_capacity(runs);
@@ -334,8 +544,9 @@ fn streamed_search_index_failures_discard_unreachable_generation() {
 		.execute(
 			"DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase; DEFINE CLASS document TYPE \
 			 NODE SCHEMAFULL; DEFINE FIELD title ON CLASS document TYPE string; DEFINE FIELD \
-			 embedding ON CLASS document TYPE vector<f32>; CREATE document:a SET title = 'Rust \
-			 graph', embedding = $embedding;",
+			 embedding ON CLASS document TYPE vector<f32>; DEFINE FIELD shape ON CLASS document \
+			 TYPE geometry; CREATE document:a SET title = 'Rust graph', embedding = $embedding, \
+			 shape = <geometry>{type:'Point', coordinates:[1,1]};",
 			&Object::from_iter([("embedding", Value::Vector(Vector::F32(vec![1.0, 0.0])))]),
 		)
 		.unwrap();
@@ -343,6 +554,10 @@ fn streamed_search_index_failures_discard_unreachable_generation() {
 	let generation_count = generation_directories(&directory.0);
 
 	let definitions = [
+		(
+			"shape_geometry",
+			"DEFINE INDEX shape_geometry ON CLASS document FIELDS shape GEOMETRY SCOPE BASE;",
+		),
 		(
 			"title_search",
 			"DEFINE INDEX title_search ON CLASS document FIELDS title FULLTEXT ANALYZER words \
@@ -383,6 +598,154 @@ fn streamed_search_index_failures_discard_unreachable_generation() {
 	let reopened = Datastore::open_local(&directory.0, options).unwrap();
 	assert!(reopened.class("document").unwrap().indexes().next().is_none());
 	assert!(reopened.begin().atom(&"document:a".parse::<RecordId>().unwrap()).unwrap().is_some());
+}
+
+#[test]
+fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
+	use crate::datastore::{
+		GraphIndex,
+		GraphIndexCost,
+		GraphIndexDefinition,
+		NeighbourhoodAlgorithm,
+		PathIndexAlgorithm,
+		ReachabilityAlgorithm,
+	};
+	for definition in [
+		GraphIndexDefinition::Path {
+			algorithm: PathIndexAlgorithm::LandmarkSssp(2),
+			cost: GraphIndexCost::Hop,
+			patterns: Vec::new(),
+		},
+		GraphIndexDefinition::Path {
+			algorithm: PathIndexAlgorithm::LandmarkSssp(2),
+			cost: GraphIndexCost::Weighted,
+			patterns: Vec::new(),
+		},
+		GraphIndexDefinition::Reachability {
+			algorithm: ReachabilityAlgorithm::Grail(2),
+		},
+		GraphIndexDefinition::Neighbourhood {
+			radius: 4,
+			algorithm: NeighbourhoodAlgorithm::Exact,
+		},
+		GraphIndexDefinition::Neighbourhood {
+			radius: 4,
+			algorithm: NeighbourhoodAlgorithm::Sketch(12),
+		},
+		GraphIndexDefinition::Neighbourhood {
+			radius: 4,
+			algorithm: NeighbourhoodAlgorithm::Landmark(2),
+		},
+	] {
+		let directory = TestDirectory::new();
+		let options = LocalOptions::default();
+		let store = Datastore::create_local(&directory.0, options).unwrap();
+		let mut seed = store.begin();
+		seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+		seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
+		let graph = seed.define_graph("network", GraphKind::Graph).unwrap();
+		let records =
+			["person:a", "person:b", "link:ab"].map(|record| record.parse::<RecordId>().unwrap());
+		for record in &records {
+			seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+		}
+		let a = seed.attach_node(graph.id(), &records[0], None, None).unwrap();
+		let b = seed.attach_node(graph.id(), &records[1], None, None).unwrap();
+		seed.attach_edge(
+			graph.id(),
+			&records[2],
+			None,
+			EdgeTopology::directed([a], [b]),
+			None,
+			None,
+		)
+		.unwrap();
+		let index = seed
+			.define_graph_index(
+				"network",
+				GraphIndex::new("reach", definition, Some(1 << 20)).unwrap(),
+			)
+			.unwrap();
+		seed.commit().unwrap();
+		let id = index;
+		let rebuild = "REBUILD INDEX reach ON GRAPH network;";
+		let generation_count = generation_directories(&directory.0);
+		for point in [
+			GenerationFailurePoint::AfterBuild,
+			GenerationFailurePoint::AfterFileSync,
+			GenerationFailurePoint::AfterCatalogStage,
+			GenerationFailurePoint::BeforeWalCommit,
+		] {
+			let failure = GenerationFailureGuard::set(point);
+			let result = store.execute(rebuild, &Object::new()).unwrap();
+			drop(failure);
+			assert!(result[0].result.is_err());
+			assert_eq!(
+				store.begin().graphs().unwrap()[0].indexes().next().unwrap().state(),
+				ClassIndexState::Stale
+			);
+			assert!(!store.inner.current_root().reachability_artifacts.contains_key(&id));
+			assert!(!store.inner.current_root().neighbourhood_artifacts.contains_key(&id));
+			assert!(!store.inner.current_root().path_artifacts.contains_key(&id));
+			assert_eq!(generation_directories(&directory.0), generation_count);
+		}
+		assert!(store.execute(rebuild, &Object::new()).unwrap()[0].result.is_ok());
+		let physical = |store: &Datastore| {
+			let StoreBackend::Local(local) = &store.inner.backend else {
+				panic!("local backend required")
+			};
+			let state = local.state.lock();
+			let binding = state
+				._database_catalog
+				.graphs
+				.iter()
+				.find(|entry| entry.id == graph.id())
+				.unwrap()
+				.index_bindings[&id];
+			let path = state
+				.file_catalog
+				.files
+				.iter()
+				.find(|entry| entry.file_id == binding.file_id)
+				.unwrap()
+				.path
+				.as_str()
+				.to_owned();
+			(binding, path)
+		};
+		let before = physical(&store);
+		let mut unrelated = store.begin();
+		unrelated.create_atom("person:unrelated".parse().unwrap(), PropertyMap::new()).unwrap();
+		unrelated.commit().unwrap();
+		assert_eq!(physical(&store), before);
+		let failure = GenerationFailureGuard::set(GenerationFailurePoint::BeforeWalCommit);
+		assert!(store.execute(rebuild, &Object::new()).unwrap()[0].result.is_err());
+		drop(failure);
+		assert_eq!(physical(&store), before);
+		assert_eq!(
+			store.begin().graphs().unwrap()[0].indexes().next().unwrap().state(),
+			ClassIndexState::Ready
+		);
+		drop(store);
+		let reopened = Datastore::open_local(&directory.0, options).unwrap();
+		assert_eq!(physical(&reopened), before);
+		assert!(
+			reopened.inner.current_root().reachability_artifacts.contains_key(&id)
+				|| reopened.inner.current_root().neighbourhood_artifacts.contains_key(&id)
+				|| reopened.inner.current_root().path_artifacts.contains_key(&id)
+		);
+		drop(reopened);
+		corrupt_page_checksum(&directory.0.join(&before.1));
+		let reopened = Datastore::open_local(&directory.0, options).unwrap();
+		assert_eq!(
+			reopened.begin().graphs().unwrap()[0].indexes().next().unwrap().state(),
+			ClassIndexState::Stale
+		);
+		assert!(!reopened.inner.current_root().reachability_artifacts.contains_key(&id));
+		assert!(!reopened.inner.current_root().neighbourhood_artifacts.contains_key(&id));
+		assert!(!reopened.inner.current_root().path_artifacts.contains_key(&id));
+		assert!(reopened.begin().atom(&records[0]).unwrap().is_some());
+	}
 }
 
 #[test]

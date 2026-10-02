@@ -107,7 +107,10 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 				ClassIndexKind::Standard | ClassIndexKind::Unique if index.fields.is_empty() => {
 					return Err(invalid("scalar index contains no fields"));
 				}
-				ClassIndexKind::Fulltext | ClassIndexKind::Hnsw | ClassIndexKind::DiskAnn
+				ClassIndexKind::Fulltext
+				| ClassIndexKind::Hnsw
+				| ClassIndexKind::DiskAnn
+				| ClassIndexKind::Geometry
 					if index.fields.len() != 1 =>
 				{
 					return Err(invalid("specialized index must contain exactly one field"));
@@ -115,6 +118,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 				_ => {}
 			}
 			match (index.kind, index.options) {
+				(ClassIndexKind::Geometry, ClassIndexOptions::Geometry(_)) => {}
 				(
 					ClassIndexKind::Standard | ClassIndexKind::Unique | ClassIndexKind::Count,
 					ClassIndexOptions::Scalar,
@@ -208,6 +212,78 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		}
 		insert_schema(&mut schema_ids, graph.label_index.0.into(), catalog.next_schema_id)?;
 		insert_schema(&mut schema_ids, graph.adjacency_index.0.into(), catalog.next_schema_id)?;
+		if let Some((id, _version)) = graph.edge_endpoint_index {
+			insert_schema(&mut schema_ids, id.into(), catalog.next_schema_id)?;
+		}
+		if graph.edge_endpoint_index.is_none() && graph.edge_endpoint.is_some() {
+			return Err(invalid("endpoint physical binding has no engine capability"));
+		}
+		if let Some(binding) = graph.edge_endpoint {
+			validate_binding(binding)?;
+		}
+		let mut previous_index = None;
+		let mut index_names = BTreeSet::new();
+		if graph.indexes.len() > 4096 {
+			return Err(invalid("graph user index count exceeds its bound"));
+		}
+		for index in &graph.indexes {
+			let id = index.id().ok_or_else(|| invalid("graph index has no identity"))?;
+			if let Some(binding) = graph.index_bindings.get(&id) {
+				validate_binding(*binding)?;
+				if index.state() != ClassIndexState::Ready
+					|| index.is_on_demand()
+					|| binding.root != PageNo::new(0)
+				{
+					return Err(invalid(
+						"graph artifact binding has incompatible availability or root",
+					));
+				}
+			} else if index.state() == ClassIndexState::Ready
+				&& !index.is_on_demand()
+				&& !matches!(
+					index.definition(),
+					crate::datastore::GraphIndexDefinition::Reachability {
+						algorithm: crate::datastore::ReachabilityAlgorithm::Auto
+					} | crate::datastore::GraphIndexDefinition::Neighbourhood {
+						algorithm: crate::datastore::NeighbourhoodAlgorithm::Auto,
+						..
+					}
+				) {
+				return Err(invalid("Ready materialized graph index has no artifact binding"));
+			}
+			insert_schema(&mut schema_ids, id.into(), catalog.next_schema_id)?;
+			index
+				.validate()
+				.map_err(|cause| invalid("graph index definition is invalid").with_cause(cause))?;
+			index
+				.validate_family(graph.kind)
+				.map_err(|cause| invalid("graph index family is invalid").with_cause(cause))?;
+			if index.graph() != Some(graph.id)
+				|| previous_index.is_some_and(|previous| previous >= id)
+				|| !index_names.insert(index.name().as_str())
+			{
+				return Err(invalid("graph index ownership, ordering, or name is invalid"));
+			}
+			for &(function, version) in index.dependencies() {
+				if index.state() == ClassIndexState::Ready
+					&& function_by_id.get(&function).is_none_or(|entry| {
+						entry.version != version
+							|| !index.is_on_demand() && entry.effect != FunctionEffect::Pure
+					}) {
+					return Err(invalid(
+						"Ready graph index has an incompatible function dependency",
+					));
+				}
+			}
+			previous_index = Some(id);
+		}
+		if graph
+			.index_bindings
+			.keys()
+			.any(|id| graph.indexes.iter().all(|index| index.id() != Some(*id)))
+		{
+			return Err(invalid("graph artifact binding references an absent definition"));
+		}
 		validate_binding(graph.membership)?;
 		let mut previous_property = None;
 		for property in &graph.properties {

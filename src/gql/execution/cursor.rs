@@ -73,9 +73,9 @@ pub(super) struct Row {
 	/// Endpoint from which the next linear expansion starts.
 	current: Option<BoundAtom>,
 	/// Terminal trace node for the currently active named pattern.
-	trace: Option<PathTraceId>,
+	pub(super) trace: Option<PathTraceId>,
 	/// Exact cumulative cost stored in the active trace.
-	trace_cost: Number,
+	pub(super) trace_cost: Number,
 	/// Fulltext outcomes materialized before relational filtering.
 	pub(super) fulltext: Vec<FulltextMatch>,
 	/// Exact or ANN KNN membership materialized before filtering.
@@ -382,6 +382,45 @@ pub(super) trait QueryRead {
 		terms: &std::collections::BTreeSet<Box<str>>,
 	) -> FerrosGrynnResult<Option<PhysicalFulltextBatch>>;
 
+	/// Searches one immutable spatial binding without exposing storage
+	/// addresses.
+	fn geometry_index(
+		&self,
+		snapshot: Snapshot,
+		class: &str,
+		graph: Option<&GraphRef>,
+		index: crate::datastore::IndexId,
+		query: &crate::values::Geometry,
+		admit: &mut dyn FnMut(usize) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Option<crate::datastore::QueryGeometryIndexRead>>;
+
+	/// Reads a logical bound from the selected immutable generation.
+	fn path_lower_bound(
+		&self,
+		snapshot: Snapshot,
+		binding: &crate::datastore::QueryLandmarkPath,
+		source: AtomId,
+		target: AtomId,
+	) -> FerrosGrynnResult<Option<Number>>;
+
+	/// Executes only the selected sketch binding or bounded exact fallback.
+	#[allow(
+		clippy::too_many_arguments,
+		reason = "the logical estimate keeps projection, binding and resource guards explicit"
+	)]
+	fn k_hop_estimate(
+		&self,
+		snapshot: Snapshot,
+		occurrence: &AtomOccurrenceRef,
+		mode: crate::graph::TraversalSemantics,
+		radius: u32,
+		index: Option<crate::datastore::IndexId>,
+		scratch_bytes: usize,
+		max_work: u64,
+		admit: &mut dyn FnMut(usize) -> FerrosGrynnResult<()>,
+		check: &mut dyn FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<crate::datastore::QueryNeighbourhoodEstimate>;
+
 	/// Searches one immutable ANN binding without exposing storage addresses.
 	/// `None` requests the bounded exact-scan fallback.
 	fn vector_index(
@@ -641,13 +680,21 @@ impl<Graph: GraphRead> RowCursor for EdgeExpandCursor<'_, Graph> {
 					self.predicate,
 					control,
 				)? {
+					let contribution = fixed_hop_cost(
+						self.graph.as_ref(),
+						&self.graph_ref,
+						&self.expand,
+						candidate.edge,
+						self.predicate,
+						control,
+					)?;
 					append_trace_hop(
 						&mut row,
 						&candidate,
 						self.graph.as_ref(),
 						&self.graph_ref,
 						self.trace.as_ref(),
-						Number::Int(1),
+						contribution,
 						control,
 					)?;
 					return Ok(Some(row));
@@ -754,13 +801,21 @@ impl<Graph: GraphRead> RowCursor for IndexExpandCursor<'_, Graph> {
 					self.predicate,
 					control,
 				)? {
+					let contribution = fixed_hop_cost(
+						self.graph.as_ref(),
+						&self.graph_ref,
+						&self.expand,
+						candidate.edge,
+						self.predicate,
+						control,
+					)?;
 					append_trace_hop(
 						&mut row,
 						&candidate,
 						self.graph.as_ref(),
 						&self.graph_ref,
 						self.trace.as_ref(),
-						Number::Int(1),
+						contribution,
 						control,
 					)?;
 					return Ok(Some(row));
@@ -1025,6 +1080,12 @@ pub(super) fn index_candidates<Graph: GraphRead>(
 	};
 	let endpoint = EdgeEndpoint::Local(source);
 	let mut candidates = Vec::new();
+	let endpoint_index = if index.semantics() == TraversalSemantics::Atom {
+		TraversalIndex::for_edge_endpoint(graph, &endpoint)?
+	} else {
+		None
+	};
+	let index = endpoint_index.as_ref().unwrap_or(index);
 	for step in index.steps(&endpoint, traversal) {
 		let Some(target) = step.target().local_id() else {
 			continue;
@@ -1100,8 +1161,12 @@ pub(super) use path::{
 	PathTraceStartCursor,
 	add_path_cost,
 	append_trace_hop,
+	custom_path_contribution,
+	custom_path_cost,
+	fixed_hop_cost,
 	path_candidate_allowed,
-	path_hop_weight,
+	path_edge_weight,
+	path_hop_cost,
 	path_row,
 };
 pub(super) use pipeline::{
@@ -1110,8 +1175,16 @@ pub(super) use pipeline::{
 	MatchGraphFields,
 	OneRowCursor,
 	RecordFields,
+	RootFields,
 	properties_object,
 };
 pub(super) use scoped::{ScopedTraversalCandidate, ScopedTraversalIndex, resolve_scoped_endpoint};
 pub(super) use scoped_path::{ScopedPathExpandCursor, ScopedShortestPathCursor};
-pub(super) use shortest::ShortestPathCursor;
+pub(super) use shortest::{
+	CompletedPath,
+	ShortestPathCursor,
+	canonical_atom_bytes,
+	completion_bound,
+	extend_path_buffers,
+	monotone_path_prefix,
+};

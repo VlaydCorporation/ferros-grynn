@@ -28,6 +28,9 @@ use crate::{
 pub(super) const INDEX_SORT_RUN_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum number of run readers participating in one merge pass.
 const INDEX_SORT_FAN_IN: usize = 64;
+/// Bounds retained run paths and vector capacity slack independently of input
+/// length.
+const INDEX_SORT_METADATA_BYTES: usize = 256 * 1024;
 /// Fixed record prefix: key length followed by one opaque sortable payload.
 const RUN_RECORD_PREFIX_BYTES: usize = size_of::<u32>() + size_of::<u64>();
 
@@ -302,11 +305,59 @@ impl ExternalIndexSorter {
 			}
 			writer.push(record)?;
 		}
-		self.runs.push(writer.finish()?);
+		let run = writer.finish()?;
+		let metadata =
+			self.runs.iter().chain(std::iter::once(&run)).try_fold(0_usize, |bytes, run| {
+				bytes
+					.checked_add(run.path.capacity())
+					.and_then(|bytes| bytes.checked_add(size_of::<SortRun>() * 2))
+			});
+		if metadata.is_none_or(|bytes| bytes > INDEX_SORT_METADATA_BYTES) {
+			return Err(FerrosGrynnError::control_limit_exceeded(
+				"external-sort run metadata",
+				INDEX_SORT_METADATA_BYTES as u64,
+			));
+		}
+		self.runs.push(run);
 		record_sort_run()?;
 		self.buffered.clear();
 		self.buffered_bytes = 0;
+		self.compact_equal_levels()?;
 		Ok(())
+	}
+
+	/// Merges equal-sized spill generations online so paths cannot grow
+	/// linearly with input.
+	fn compact_equal_levels(&mut self) -> FerrosGrynnResult<()> {
+		loop {
+			let level = self.runs.iter().map(|run| run.level).find(|level| {
+				self.runs.iter().filter(|run| run.level == *level).count() >= INDEX_SORT_FAN_IN
+			});
+			let Some(level) = level else {
+				return Ok(());
+			};
+			let mut group = Vec::with_capacity(INDEX_SORT_FAN_IN);
+			let mut ordinal = 0;
+			while ordinal < self.runs.len() && group.len() < INDEX_SORT_FAN_IN {
+				if self.runs[ordinal].level == level {
+					group.push(self.runs.swap_remove(ordinal));
+				} else {
+					ordinal += 1;
+				}
+			}
+			let mut writer = RunWriter::create(self.new_run_path()?)?;
+			merge_runs(&group, |record| writer.push(&record))?;
+			let mut output = writer.finish()?;
+			output.level = level
+				.checked_add(1)
+				.ok_or_else(|| invalid_sort("external-sort level overflows"))?;
+			for run in group {
+				fs::remove_file(run.path)
+					.map_err(|source| sort_io("remove merged index-sort run", source))?;
+			}
+			self.runs.push(output);
+			record_sort_run()?;
+		}
 	}
 
 	/// Allocates one collision-free filename below the owned session directory.
@@ -416,6 +467,8 @@ pub(crate) struct SortRun {
 	path: PathBuf,
 	logical_bytes: u64,
 	record_count: usize,
+	/// Number of online equal-fan-in merge generations.
+	level: u8,
 }
 
 /// Sequential page-aligned writer for the private run format.
@@ -500,6 +553,7 @@ impl RunWriter {
 			path: self.path,
 			logical_bytes: self.logical_bytes,
 			record_count: self.record_count,
+			level: 0,
 		})
 	}
 }

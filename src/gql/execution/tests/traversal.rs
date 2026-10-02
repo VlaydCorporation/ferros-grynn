@@ -15,6 +15,299 @@ fn traverse(source: &str) -> Value {
 	statement.result.as_ref().unwrap().value().clone()
 }
 
+/// Creates a directed chain used by both estimate bindings and exact traversal.
+fn estimate_store() -> Datastore {
+	let store = Datastore::in_memory();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.define_class(ClassSchema::new("road", AtomKind::Edge, []).unwrap()).unwrap();
+	let graph = seed.define_graph("routes", GraphKind::Graph).unwrap();
+	let records = ["person:a", "person:b", "person:c", "road:ab", "road:bc"]
+		.map(|value| value.parse::<RecordId>().unwrap());
+	for record in &records {
+		seed.create_atom(record.clone(), Default::default()).unwrap();
+	}
+	let nodes = records[..3]
+		.iter()
+		.map(|record| seed.attach_node(graph.id(), record, None, None).unwrap())
+		.collect::<Vec<_>>();
+	for (ordinal, pair) in nodes.windows(2).enumerate() {
+		seed.attach_edge(
+			graph.id(),
+			&records[3 + ordinal],
+			Some("road".into()),
+			EdgeTopology::directed([pair[0]], [pair[1]]),
+			None,
+			None,
+		)
+		.unwrap();
+	}
+	seed.commit().unwrap();
+	store
+}
+
+/// Returns the public query value, failing on parser or statement errors.
+fn estimate_value(store: &Datastore, query: &str) -> Value {
+	store
+		.execute(query, &Object::new())
+		.unwrap()
+		.last()
+		.unwrap()
+		.result
+		.as_ref()
+		.unwrap()
+		.value()
+		.clone()
+}
+
+#[test]
+fn k_hop_estimate_selects_only_compatible_sketches_and_keeps_exact_enumeration() {
+	let store = estimate_store();
+	let query = "TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHopEstimate(2);";
+	let explain =
+		|query: &str| estimate_value(&store, &format!("EXPLAIN ANALYZE FORMAT JSON {query}"));
+	let before = explain(query);
+	assert_eq!(
+		before
+			.as_object()
+			.unwrap()
+			.get("analyze")
+			.unwrap()
+			.as_object()
+			.unwrap()
+			.get("neighbourhood_fallbacks"),
+		Some(&Value::from(1_u64))
+	);
+	assert_eq!(estimate_value(&store, query), Value::Array(vec![3_u64].into()));
+	for (name, suffix) in [
+		("wrong_direction", "DIRECTION IN"),
+		("wrong_mode", "MODE ATOM"),
+		("wrong_labels", "EDGES road"),
+	] {
+		estimate_value(
+			&store,
+			&format!(
+				"DEFINE INDEX {name} ON GRAPH routes NEIGHBOURHOOD(4) ALGORITHM SKETCH(12) \
+				 {suffix} WITH (MAX_BYTES=1048576); REBUILD INDEX {name} ON GRAPH routes;"
+			),
+		);
+	}
+	let incompatible = explain(query);
+	assert_eq!(
+		incompatible.as_object().unwrap().get("plan_hash"),
+		before.as_object().unwrap().get("plan_hash")
+	);
+	assert_eq!(
+		incompatible
+			.as_object()
+			.unwrap()
+			.get("analyze")
+			.unwrap()
+			.as_object()
+			.unwrap()
+			.get("neighbourhood_sketch_reads"),
+		Some(&Value::from(0_u64))
+	);
+	for (name, precision) in [("coarse", 4), ("near", 12)] {
+		estimate_value(
+			&store,
+			&format!(
+				"DEFINE INDEX {name} ON GRAPH routes NEIGHBOURHOOD(4) ALGORITHM \
+				 SKETCH({precision}) WITH (MAX_BYTES=1048576); REBUILD INDEX {name} ON GRAPH \
+				 routes;"
+			),
+		);
+	}
+	let ready = explain(query);
+	let ready = ready.as_object().unwrap();
+	assert_ne!(ready.get("plan_hash"), before.as_object().unwrap().get("plan_hash"));
+	let node = ready
+		.get("nodes")
+		.unwrap()
+		.as_array()
+		.unwrap()
+		.iter()
+		.filter_map(Value::as_object)
+		.find(|node| node.get("operator") == Some(&Value::from("NeighbourhoodSketch")))
+		.unwrap();
+	assert_eq!(node.get("precision"), Some(&Value::from(12_u64)));
+	let metrics = ready.get("analyze").unwrap().as_object().unwrap();
+	assert_eq!(metrics.get("neighbourhood_sketch_reads"), Some(&Value::from(1_u64)));
+	assert_eq!(metrics.get("neighbourhood_fallbacks"), Some(&Value::from(0_u64)));
+	assert_eq!(metrics.get("neighbourhood_exact_work"), Some(&Value::from(0_u64)));
+	assert_ne!(metrics.get("graph_artifact_bytes"), Some(&Value::from(0_u64)));
+	let exact = "TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHop(2);";
+	let rows = estimate_value(&store, exact);
+	let members = rows.as_array().unwrap().iter().next().unwrap().as_array().unwrap();
+	assert_eq!(
+		members
+			.iter()
+			.map(|value| value.as_atom_occurrence().unwrap().atom().id().to_string())
+			.collect::<Vec<_>>(),
+		["person:a", "person:b", "person:c"]
+	);
+	assert_eq!(
+		explain(exact)
+			.as_object()
+			.unwrap()
+			.get("analyze")
+			.unwrap()
+			.as_object()
+			.unwrap()
+			.get("neighbourhood_sketch_reads"),
+		Some(&Value::from(0_u64))
+	);
+	for (radius, count) in [(0, 1_u64), (1, 2), (2, 3), (4, 3), (5, 3)] {
+		assert_eq!(
+			estimate_value(
+				&store,
+				&format!("TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHopEstimate({radius});")
+			),
+			Value::Array(vec![count].into())
+		);
+	}
+	for (source, radius, count) in
+		[("person:a", 1, 2_u64), ("person:a", 2, 3), ("road:ab", 2, 1), ("person:a", 5, 3)]
+	{
+		assert_eq!(
+			estimate_value(
+				&store,
+				&format!(
+					"TRAVERSE ATOM FROM {source} IN GRAPH @routes |> tv::kHopEstimate({radius});"
+				)
+			),
+			Value::Array(vec![count].into())
+		);
+	}
+	assert_eq!(
+		estimate_value(
+			&store,
+			"TRAVERSE FROM [person:a, person:a] IN GRAPH @routes |> tv::kHopEstimate(2);"
+		),
+		Value::Array(vec![3_u64, 3].into())
+	);
+}
+
+#[test]
+fn k_hop_estimate_rejects_invalid_radii_and_enforces_exact_resource_budgets() {
+	let store = estimate_store();
+	for radius in ["-1", "1.5", "'two'", "4294967296"] {
+		let query =
+			format!("TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHopEstimate({radius});");
+		match store.execute(&query, &Object::new()) {
+			Ok(results) => assert!(results[0].result.is_err(), "{radius}"),
+			Err(_) => {}
+		}
+	}
+	let query = "TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHopEstimate(2);";
+	let limited = QueryExecutionOptions {
+		max_path_expansions: 1,
+		..Default::default()
+	};
+	assert!(store.execute_with_options(query, &Object::new(), limited).unwrap()[0].result.is_err());
+	let tiny = QueryExecutionOptions {
+		barrier_memory_bytes: NonZeroUsize::new(2048).unwrap(),
+		..Default::default()
+	};
+	assert!(store.execute_with_options(query, &Object::new(), tiny).unwrap()[0].result.is_err());
+	let cancel = crate::gql::QueryCancellation::default();
+	cancel.cancel();
+	let cancelled = QueryExecutionOptions {
+		cancellation: Some(cancel),
+		..Default::default()
+	};
+	assert!(
+		store.execute_with_options(query, &Object::new(), cancelled).unwrap()[0].result.is_err()
+	);
+	let full = estimate_value(&store, &format!("EXPLAIN ANALYZE FORMAT JSON {query}"));
+	let work = full
+		.as_object()
+		.unwrap()
+		.get("analyze")
+		.unwrap()
+		.as_object()
+		.unwrap()
+		.get("neighbourhood_exact_work")
+		.unwrap()
+		.as_number()
+		.and_then(|value| u64::try_from(value).ok())
+		.unwrap();
+	assert!(work > 1);
+	let shared = QueryExecutionOptions {
+		max_path_expansions: work,
+		..Default::default()
+	};
+	assert!(
+		store
+			.execute_with_options(
+				"TRAVERSE FROM [person:a, person:b] IN GRAPH @routes |> tv::kHopEstimate(2);",
+				&Object::new(),
+				shared
+			)
+			.unwrap()[0]
+			.result
+			.is_err()
+	);
+}
+
+#[test]
+fn k_hop_estimate_private_invalidation_old_snapshot_and_ssi() {
+	let store = estimate_store();
+	estimate_value(
+		&store,
+		"DEFINE INDEX near ON GRAPH routes NEIGHBOURHOOD(4) ALGORITHM SKETCH WITH \
+		 (MAX_BYTES=1048576); REBUILD INDEX near ON GRAPH routes;",
+	);
+	let query = "EXPLAIN ANALYZE FORMAT JSON TRAVERSE FROM person:a IN GRAPH @routes |> \
+	             tv::kHopEstimate(2);";
+	let hits = |value: &Value| {
+		value
+			.as_object()
+			.unwrap()
+			.get("analyze")
+			.unwrap()
+			.as_object()
+			.unwrap()
+			.get("neighbourhood_sketch_reads")
+			.cloned()
+	};
+	let graph = store.schema_catalog().named_graph("routes").unwrap().id();
+	let edge = "road:ab".parse::<RecordId>().unwrap();
+	let mut old = store.begin();
+	let mut reader = store.begin();
+	assert_eq!(
+		hits(reader.execute(query, &Object::new()).unwrap()[0].result.as_ref().unwrap().value()),
+		Some(Value::from(1_u64))
+	);
+	let mut private = store.begin();
+	private.set_occurrence_label(graph, &edge, Some("private".into())).unwrap();
+	assert_eq!(
+		hits(private.execute(query, &Object::new()).unwrap()[0].result.as_ref().unwrap().value()),
+		Some(Value::from(0_u64))
+	);
+	drop(private);
+	assert_eq!(hits(&estimate_value(&store, query)), Some(Value::from(1_u64)));
+	let mut property = store.begin();
+	let key = property.intern_property("info").unwrap();
+	property.set_base_property(&edge, key, Value::from(7_i64)).unwrap();
+	property.commit().unwrap();
+	assert_eq!(hits(&estimate_value(&store, query)), Some(Value::from(1_u64)));
+	let mut writer = store.begin();
+	writer.detach_occurrence(graph, &edge, false).unwrap();
+	writer.commit().unwrap();
+	assert_eq!(hits(&estimate_value(&store, query)), Some(Value::from(0_u64)));
+	assert_eq!(
+		estimate_value(&store, "TRAVERSE FROM person:a IN GRAPH @routes |> tv::kHopEstimate(2);"),
+		Value::Array(vec![1_u64].into())
+	);
+	assert_eq!(
+		hits(old.execute(query, &Object::new()).unwrap()[0].result.as_ref().unwrap().value()),
+		Some(Value::from(1_u64))
+	);
+	reader.create_atom("person:reader".parse().unwrap(), Default::default()).unwrap();
+	assert_eq!(reader.commit().unwrap_err().status().code().to_string(), "FG-40001");
+}
+
 #[test]
 fn traverses_collection_with_language_closures() {
 	assert_eq!(

@@ -27,6 +27,11 @@ handle конкретного materialization и нужен в том числе
 - `PathStep` хранит occurrence endpoint и optional occurrence connector edge,
   поэтому cross-level path может иметь endpoint в дочернем графе и
   connector в родительском. `Path` не хранит snapshot-local `AtomId`.
+- Crate-private Path heap estimate включает immutable steps, RecordId и graph references;
+  оценка не меняет equality, snapshot или canonical encoding. Shared references учитываются
+  консервативно без дополнительных allocations.
+- Trace materialization с admission сначала проверяет chain и оценивает owned steps,
+  затем допускает allocation/clones; cancellation проверяется в обеих фазах.
 - Внутренние SoA-accessors `label`/`weight` намеренно возвращают две оси
   optionality: внешний `None` означает stale/foreign `AtomId`, внутренний
   `None` — живой atom без label/weight. Не схлопывать эти состояния.
@@ -40,6 +45,9 @@ handle конкретного materialization и нужен в том числе
   views;
 - `path` — public path и внутренний trace arena;
 - `traversal` — connectivity, shortest paths, spanning, cuts и LCA;
+- `traversal/relation` — bounded NODE/ATOM incidence projection и deterministic
+  condensation CSR; общий SCC kernel в connectivity сохраняет public NODE API.
+  General CSR restore допускает cycles/self arcs; condensation restore требует DAG.
 - `live` — отдельный live-update contract;
 - `workspace` — ECS-sidecar derived state, не часть durability/equality.
 
@@ -50,6 +58,14 @@ handle конкретного materialization и нужен в том числе
 - Mutation проверяет generation, graph identity и structural constraints до
   публикации.
 - Алгоритмы принимают `GraphRead` и дают одну семантику для всех storage modes.
+- Public all-target Dijkstra и query point refinement используют один loop с тем же distance/node
+  queue и strict predecessor improvement. Query callbacks остаются crate-private через re-export;
+  storage/GQL types в graph kernel не входят. Refinement предварительно валидирует все weights
+  и доказывает отсутствие новых arithmetic errors. Reconstruction поддерживает fallible admission.
+- Optional `GraphRead::edge_endpoint_connectors` возвращает snapshot-local logical
+  connector IDs по полному qualified endpoint; readers без capability возвращают
+  None для exact traversal fallback. `visit_endpoint_steps` сохраняет общие
+  NODE/ATOM, direction и endpoint roles без сборки всех hyperedge endpoint pairs.
 - Graph equality/ordering не означает изоморфизм; не вводить скрытый deep scan.
 - `Path::resolve` с одним `GraphRead` применяется только к single-graph path.
   Cross-graph consumers открывают graph по `PathStep::atom().graph()`; новый resolver

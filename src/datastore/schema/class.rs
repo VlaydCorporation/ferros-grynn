@@ -33,6 +33,43 @@ pub struct ClassSchema {
 }
 
 impl ClassSchema {
+	/// Checks geometry definitions in one scope before publishing source
+	/// mutations.
+	pub(crate) fn validate_geometry_values<'value>(
+		&self,
+		scope: super::IndexScope,
+		mut value: impl FnMut(crate::values::PropertyKeyId) -> Option<&'value crate::values::Value>,
+	) -> FerrosGrynnResult<()> {
+		for index in self
+			.indexes()
+			.filter(|index| index.kind() == ClassIndexKind::Geometry && index.scope() == scope)
+		{
+			let field = index
+				.fields()
+				.next()
+				.and_then(|name| self.fields().find(|field| field.name() == name))
+				.and_then(|field| field.key)
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("geometry index field is unpublished")
+				})?;
+			match value(field) {
+				None | Some(crate::values::Value::None | crate::values::Value::Null) => {}
+				Some(crate::values::Value::Geometry(geometry)) => index
+					.geometry_options()
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("geometry index options are absent")
+					})?
+					.validate(geometry)?,
+				Some(_) => {
+					return Err(FerrosGrynnError::invalid_argument(
+						"geometry index field requires a geometry value",
+					));
+				}
+			}
+		}
+		Ok(())
+	}
+
 	/// Creates an unpublished class definition.
 	///
 	/// # Errors
@@ -166,6 +203,15 @@ impl ClassSchema {
 					if field.value_type != Type::Vector(options.element()) {
 						return Err(FerrosGrynnError::invalid_argument(
 							"HNSW field type does not match its element type",
+						));
+					}
+				}
+				ClassIndexKind::Geometry => {
+					if !matches!(&field.value_type, Type::Geometry | Type::Option(_))
+						|| matches!(&field.value_type, Type::Option(inner) if !matches!(inner.as_ref(), Type::Geometry))
+					{
+						return Err(FerrosGrynnError::invalid_argument(
+							"Geometry indexes require one declared geometry field",
 						));
 					}
 				}

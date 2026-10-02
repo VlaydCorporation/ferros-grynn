@@ -117,7 +117,81 @@ pub(in crate::gql) fn plan_traverse(
 		nodes.push(PhysicalTraversalNode {
 			node_id: u32::try_from(step_index + 1).unwrap_or(u32::MAX),
 			step_index: Some(step_index),
-			operator: TraversalOperator::Step(step.kind),
+			operator: if step.kind == TraverseStepKind::KHopEstimate {
+				graph
+					.and_then(|graph| {
+						constant_u64(step.arguments.first()).and_then(|radius| {
+							graph
+								.neighbourhood_sketches
+								.iter()
+								.filter(|index| {
+									index.mode
+										== if statement.atom {
+											crate::graph::TraversalSemantics::Atom
+										} else {
+											crate::graph::TraversalSemantics::Node
+										}
+										&& index.direction
+											== crate::graph::TraversalDirection::Forward
+										&& radius != 0
+										&& radius <= u64::from(index.radius)
+								})
+								.min_by_key(|index| {
+									(std::cmp::Reverse(index.precision), index.bytes, index.index)
+								})
+								.copied()
+						})
+					})
+					.map_or(
+						TraversalOperator::Step(step.kind),
+						TraversalOperator::NeighbourhoodSketch,
+					)
+			} else if matches!(
+				step.kind,
+				TraverseStepKind::ShortestPath
+					| TraverseStepKind::WeightedShortestPath
+					| TraverseStepKind::DistanceTo
+			) {
+				graph
+					.and_then(|graph| {
+						graph
+							.landmark_paths
+							.iter()
+							.filter(|index| {
+								index.mode == crate::graph::TraversalSemantics::Node
+									&& index.direction == crate::graph::TraversalDirection::Forward
+									&& statement.custom_cost.is_none_or(|cost| !cost.stateful)
+									&& index.cost
+										== if step.kind == TraverseStepKind::ShortestPath {
+											crate::datastore::GraphIndexCost::Hop
+										} else if let Some(cost) = statement.custom_cost {
+											crate::datastore::GraphIndexCost::Function {
+												function: cost.function.id,
+												version: cost.function.version,
+											}
+										} else {
+											crate::datastore::GraphIndexCost::Weighted
+										}
+									&& index.edge_labels.is_empty()
+							})
+							.min_by_key(|index| {
+								(std::cmp::Reverse(index.landmarks), index.bytes, index.index)
+							})
+							.cloned()
+					})
+					.map_or(TraversalOperator::Step(step.kind), |index| {
+						if step.kind == TraverseStepKind::ShortestPath {
+							TraversalOperator::LandmarkShortest(index)
+						} else {
+							TraversalOperator::LandmarkWeighted {
+								kind: step.kind,
+								index,
+							}
+						}
+					})
+			} else {
+				TraversalOperator::Step(step.kind)
+			},
 			unordered: fast && !ordered_from_here && step.kind != TraverseStepKind::Order,
 			cardinality,
 			cost: step_cost,
@@ -142,6 +216,15 @@ pub(in crate::gql) fn plan_traverse(
 		cardinality,
 		cost,
 		warnings,
+		custom_cost: statement.custom_cost.map(|cost| {
+			(cost.function.id, cost.function.version, cost.function.schema_epoch, cost.stateful)
+		}),
+		custom_constraints: statement.custom_cost.map(|_| {
+			(
+				statement.constraints.mode.unwrap_or(crate::syn::MatchPathMode::Trail),
+				statement.constraints.filters.clone(),
+			)
+		}),
 	})
 }
 
@@ -260,6 +343,7 @@ fn estimate_step(
 		| TraverseStepKind::Cuts
 		| TraverseStepKind::LowestCommonAncestor
 		| TraverseStepKind::HasCycle => Cardinality::exact(1),
+		TraverseStepKind::KHopEstimate => input,
 		TraverseStepKind::InVertex
 		| TraverseStepKind::OutVertex
 		| TraverseStepKind::MetaInner

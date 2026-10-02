@@ -43,4 +43,63 @@ mod tests {
 		let store = Datastore::in_memory();
 		exercise_normalized_atom_model(&store);
 	}
+
+	#[test]
+	fn geometry_index_is_snapshot_exact_and_enforces_type_on_ram_writes() {
+		use ferros_grynn::values::{Geometry, Object, Value};
+		let store = Datastore::in_memory();
+		let setup = store
+			.execute(
+				"DEFINE CLASS place TYPE NODE SCHEMAFULL; DEFINE FIELD shape ON CLASS place TYPE \
+				 geometry; CREATE place:a SET shape = <geometry>{type: 'Point', coordinates: [1, \
+				 1]}; CREATE place:b SET shape = <geometry>{type: 'Point', coordinates: [8, 8]}; \
+				 DEFINE INDEX by_shape ON CLASS place FIELDS shape GEOMETRY TYPE Point SCOPE BASE;",
+				&Object::new(),
+			)
+			.unwrap();
+		for result in setup {
+			assert!(result.result.is_ok(), "{:?}", result.result);
+		}
+		let parameters =
+			Object::from_iter([(
+				"area",
+				Value::Geometry(
+					r#"{"type":"Polygon","coordinates":[[[0,0],[5,0],[5,5],[0,5],[0,0]]]}"#
+						.parse::<Geometry>()
+						.unwrap(),
+				),
+			)]);
+		let indexed =
+			"SELECT VALUE id FROM place WITH INDEX by_shape WHERE shape INSIDE $area ORDER BY id;";
+		let scan = "SELECT VALUE id FROM place WITH NOINDEX WHERE shape INSIDE $area ORDER BY id;";
+		let value = |text| {
+			store.execute(text, &parameters).unwrap().remove(0).result.unwrap().into_parts().0
+		};
+		let expected = value(scan);
+		assert_eq!(value(indexed), expected);
+		let mut old = store.begin();
+		store
+			.execute(
+				"UPDATE place:b SET shape = <geometry>{type: 'Point', coordinates: [2, 2]};",
+				&Object::new(),
+			)
+			.unwrap()
+			.remove(0)
+			.result
+			.unwrap();
+		assert_eq!(
+			old.execute(indexed, &parameters).unwrap().remove(0).result.unwrap().into_parts().0,
+			expected
+		);
+		assert_eq!(value(indexed), value(scan));
+		let rejected = store
+			.execute(
+				"UPDATE place:b SET shape = <geometry>{type: 'LineString', coordinates: [[1, 1], \
+				 [2, 2]]};",
+				&Object::new(),
+			)
+			.unwrap();
+		assert!(rejected[0].result.is_err());
+		assert_eq!(value(indexed), value(scan));
+	}
 }

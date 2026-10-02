@@ -302,6 +302,42 @@ impl GraphRead for TransactionGraphView<'_> {
 			.into_iter())
 	}
 
+	fn edge_endpoint_connectors(
+		&self,
+		endpoint: &crate::graph::EdgeEndpoint,
+	) -> FerrosGrynnResult<Option<Vec<AtomId>>> {
+		if endpoint.kind() != Some(AtomKind::Edge)
+			|| self
+				.root
+				.schema
+				.graph(self.reference.id())
+				.and_then(|schema| schema.edge_endpoint_index())
+				.is_none()
+		{
+			return Ok(None);
+		}
+		self.transaction
+			.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Edge));
+		if let Some(local) = endpoint.local_id() {
+			self.record_incidence(local);
+		}
+		let mut connectors = Vec::new();
+		for &(connector, _side) in self.graph.edge_endpoint_postings(endpoint) {
+			if connectors.last() == Some(&connector) {
+				continue;
+			}
+			if connectors.len() == 262_144 {
+				return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"edge endpoint connectors",
+					262_144,
+				));
+			}
+			self.record_incidence(connector);
+			connectors.push(connector);
+		}
+		Ok(Some(connectors))
+	}
+
 	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>> {
 		let Some(occurrence) = self.occurrence(id)? else {
 			self.record_incidence(id);

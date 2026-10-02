@@ -201,7 +201,7 @@ impl Parser<'_> {
 			} else if self.consume_keyword(keywords::FIELD).is_some() {
 				StatementKind::DefineField(self.define_field_statement()?)
 			} else if self.consume_keyword(keywords::INDEX).is_some() {
-				StatementKind::DefineIndex(self.define_index_statement()?)
+				self.define_index_statement()?
 			} else {
 				let feature = self.current_word().unwrap_or("DEFINE target");
 				return Err(self.unsupported(feature, self.current().span));
@@ -1075,6 +1075,13 @@ impl Parser<'_> {
 			_ if self.at_keyword(keywords::CONTAINSNOT) => (BinaryOperator::ContainsNot, 11, 12, 1),
 			_ if self.at_keyword(keywords::CONTAINSANY) => (BinaryOperator::ContainsAny, 11, 12, 1),
 			_ if self.at_keyword(keywords::CONTAINSALL) => (BinaryOperator::ContainsAll, 11, 12, 1),
+			_ if self.at_keyword(keywords::INSIDE) => (BinaryOperator::Inside, 11, 12, 1),
+			_ if self.at_keyword(keywords::NOTINSIDE) => (BinaryOperator::NotInside, 11, 12, 1),
+			_ if self.at_keyword(keywords::ALLINSIDE) => (BinaryOperator::AllInside, 11, 12, 1),
+			_ if self.at_keyword(keywords::ANYINSIDE) => (BinaryOperator::AnyInside, 11, 12, 1),
+			_ if self.at_keyword(keywords::NONEINSIDE) => (BinaryOperator::NoneInside, 11, 12, 1),
+			_ if self.at_keyword(keywords::OUTSIDE) => (BinaryOperator::Outside, 11, 12, 1),
+			_ if self.at_keyword(keywords::INTERSECTS) => (BinaryOperator::Intersects, 11, 12, 1),
 			_ if self.at_keyword(keywords::NOT) && self.peek_keyword(1, keywords::IS) => {
 				(BinaryOperator::NotIs, 9, 10, 2)
 			}
@@ -1609,6 +1616,64 @@ mod tests {
 	}
 
 	#[test]
+	fn parses_global_match_cost_before_predicates_and_preserves_unicode_span() {
+		let source = "MATCH path = (person AS a)-[link*1..3 WEIGHTED SHORTEST]->(person AS b) IN \
+		              GRAPH routes WITH COST fn::`тариф` WHERE b.active RETURN path;";
+		let program = parse(source, ParserSettings::default()).unwrap();
+		let StatementKind::Match(statement) = &program.statements[0].kind else {
+			panic!("expected MATCH");
+		};
+		let function = statement.custom_cost.as_ref().unwrap();
+		assert_eq!(function.name.value.as_ref(), "тариф");
+		assert!(source.is_char_boundary(function.name.span.offset as usize));
+		assert!(
+			source.is_char_boundary((function.name.span.offset + function.name.span.len) as usize)
+		);
+		assert_eq!(
+			&source[function.name.span.offset as usize
+				..(function.name.span.offset + function.name.span.len) as usize],
+			"`тариф`"
+		);
+		assert!(statement.filter.is_some());
+		assert!(linear_pattern(&statement.patterns[0]).steps[0].edge.custom_cost.is_none());
+		for invalid in [
+			"MATCH (person)-[link]->(person) IN GRAPH routes WITH COST RETURN 1;",
+			"MATCH (person)-[link]->(person) IN GRAPH routes WITH COST fn::fee WITH COST \
+			 fn::other RETURN 1;",
+			"MATCH (person)-[link]->(person) IN GRAPH routes WITH fn::fee RETURN 1;",
+			"MATCH (person)-[link]->(person) IN GRAPH routes WHERE true WITH COST fn::fee RETURN \
+			 1;",
+		] {
+			assert!(parse(invalid, ParserSettings::default()).is_err(), "{invalid}");
+		}
+	}
+
+	#[test]
+	fn parses_global_traverse_cost_and_unicode_span() {
+		let source = "TRAVERSE ATOM FROM [person:a] IN GRAPH routes WITH COST fn::`тариф` |> \
+		              tv::weightedShortestPath(person:b);";
+		let program = parse(source, ParserSettings::default()).unwrap();
+		let StatementKind::Traverse(statement) = &program.statements[0].kind else {
+			panic!("expected TRAVERSE");
+		};
+		let function = statement.custom_cost.as_ref().unwrap();
+		assert_eq!(function.name.value.as_ref(), "тариф");
+		assert_eq!(
+			&source[function.name.span.offset as usize
+				..(function.name.span.offset + function.name.span.len) as usize],
+			"`тариф`"
+		);
+		for invalid in [
+			"TRAVERSE FROM [] WITH COST |> tv::limit(1);",
+			"TRAVERSE FROM [] WITH fn::cost |> tv::limit(1);",
+			"TRAVERSE FROM [] WITH COST fn::a WITH COST fn::b |> tv::limit(1);",
+			"TRAVERSE FROM [] |> tv::limit(1) WITH COST fn::a;",
+		] {
+			assert!(parse(invalid, ParserSettings::default()).is_err(), "{invalid}");
+		}
+	}
+
+	#[test]
 	fn parses_full_match_and_graph_first_surface() {
 		let standard = parse(
 			"OPTIONAL MATCH DISTINCT DIFFERENT ATOMS CONSTRAINTS <TRAIL SHORTEST WEIGHTED> \
@@ -1681,6 +1746,28 @@ mod tests {
 			ParserSettings::default(),
 		)
 		.expect_err("one constraint scope cannot contain two objectives");
+	}
+
+	#[test]
+	fn atomwalk_path_bounds_share_grammar_and_preserve_unicode_spans() {
+		const SOURCE: &str = "MATCH ATOM путь = <(person AS а)>~[link*0..3 TRAIL \
+		                      SHORTEST]~><[link AS е]> IN GRAPH routes RETURN путь;";
+		let bounded = parse(SOURCE, ParserSettings::default())
+			.expect("bounded AtomWalk uses the shared path grammar");
+		let StatementKind::Match(statement) = &bounded.statements[0].kind else {
+			panic!("expected MATCH");
+		};
+		let step = &linear_pattern(&statement.patterns[0]).steps[0];
+		assert_eq!(step.edge.length.unwrap().min, 0);
+		assert_eq!(step.edge.length.unwrap().max, Some(3));
+		assert!(SOURCE.is_char_boundary(step.edge.span.offset as usize));
+		assert!(SOURCE.is_char_boundary((step.edge.span.offset + step.edge.span.len) as usize));
+		for query in [
+			"MATCH ATOM <(person)>~[link*1..4294967296]~><(person)> IN GRAPH routes RETURN 1;",
+			"MATCH ATOM <(person)>~[link*-1]~><(person)> IN GRAPH routes RETURN 1;",
+		] {
+			assert!(parse(query, ParserSettings::default()).is_err());
+		}
 	}
 
 	#[test]

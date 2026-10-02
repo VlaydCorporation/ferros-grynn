@@ -8,6 +8,8 @@ mod catalog;
 mod class;
 /// Class field definitions.
 mod field;
+/// Graph-owned snapshot index definitions.
+mod graph_index;
 /// Class index definitions.
 mod index;
 /// Atomic replacement and removal of published schema definitions.
@@ -37,6 +39,14 @@ pub use catalog::{
 };
 pub use class::{ClassSchema, ClassSchemaMode};
 pub use field::ClassField;
+pub use graph_index::{
+	GraphIndex,
+	GraphIndexCost,
+	GraphIndexDefinition,
+	NeighbourhoodAlgorithm,
+	PathIndexAlgorithm,
+	ReachabilityAlgorithm,
+};
 pub(crate) use index::ClassIndexOptions;
 pub use index::{
 	ClassIndex,
@@ -44,6 +54,7 @@ pub use index::{
 	ClassIndexState,
 	DiskAnnIndexOptions,
 	FulltextIndexOptions,
+	GeometryIndexOptions,
 	HnswIndexOptions,
 	IndexMaintenanceMode,
 	IndexScope,

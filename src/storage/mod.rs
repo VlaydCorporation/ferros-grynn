@@ -10,10 +10,19 @@ mod buffer_pool;
 mod catalog;
 mod consts;
 mod database_superblock;
+mod derived_index;
+pub(crate) use derived_index::{GraphArtifactIdentity, SectionKind as DerivedSectionKind};
 mod direct_io;
+mod edge_endpoint_index;
 mod file_registry;
 mod fulltext_index;
 mod fulltext_index_delta;
+mod geometry_index;
+pub(crate) use geometry_index::{
+	GeometryCandidates,
+	ResidentGeometryIndex,
+	build_resident_geometry_indexes,
+};
 mod graph_index;
 mod graph_pages;
 mod graph_store;
@@ -22,6 +31,8 @@ mod hybrid_engine;
 mod image_io;
 mod immutable_stream;
 mod job_catalog;
+mod neighbourhood_index;
+pub(crate) use neighbourhood_index::{NeighbourhoodHeader, NeighbourhoodLayout, NeighbourhoodTag};
 mod local;
 mod local_store;
 mod membership_index;
@@ -29,9 +40,13 @@ mod metadata_cow;
 mod page;
 mod page_cache;
 mod page_io;
+mod path_index;
+pub use path_index::{LandmarkPathHeader, LandmarkPathLayout};
 mod property_dictionary;
 mod property_page;
 mod quarantine;
+mod reachability_index;
+pub(crate) use reachability_index::{ReachabilityHeader, ReachabilityLayout, ReachabilityTag};
 mod scoped_index_image;
 mod types;
 mod vector_index;

@@ -124,6 +124,44 @@ fn limit_error(name: &str, maximum: usize, actual: usize) -> FerrosGrynnError {
 mod tests {
 	use proptest::prelude::*;
 
+	#[test]
+	fn geometry_writer_and_default_decoder_agree_at_large_point_and_depth_boundaries() {
+		let point = crate::values::Position::new([1.0, 2.0]).unwrap();
+		let large = crate::values::storage::StorageValue::Geometry(
+			crate::values::Geometry::MultiPoint(vec![point.clone(); 250_000]),
+		);
+		let bytes = super::CanonicalCodec::encode(large.as_ref()).unwrap();
+		assert_eq!(
+			super::CanonicalCodec::decode(&bytes, super::DecodeLimits::default()).unwrap(),
+			large
+		);
+		assert!(
+			super::CanonicalCodec::decode(
+				&bytes,
+				super::DecodeLimits::new(64, 1_000_000, 1024, 1024, 1024)
+			)
+			.is_err()
+		);
+		let mut geometry = crate::values::Geometry::Point(point);
+		for _ in 0..64 {
+			geometry = crate::values::Geometry::Collection(vec![geometry]);
+		}
+		let value = crate::values::storage::StorageValue::Geometry(geometry);
+		let bytes = super::CanonicalCodec::encode(value.as_ref()).unwrap();
+		assert_eq!(
+			super::CanonicalCodec::decode(&bytes, super::DecodeLimits::default()).unwrap(),
+			value
+		);
+		let mut malformed = vec![0x23];
+		malformed.extend_from_slice(&1_u32.to_le_bytes());
+		malformed.extend_from_slice(&4_u32.to_le_bytes());
+		for (x, y) in [(0.0_f64, 0.0_f64), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+			malformed.extend_from_slice(&x.to_le_bytes());
+			malformed.extend_from_slice(&y.to_le_bytes());
+		}
+		assert!(super::CanonicalCodec::decode(&malformed, super::DecodeLimits::default()).is_err());
+	}
+
 	use super::{ArchiveEnvelope, CanonicalCodec, DecodeLimits, crc32};
 	use crate::{
 		gql_status::FerrosGrynnError,
@@ -158,6 +196,12 @@ mod tests {
 	fn all_format_v1_tags_round_trip() {
 		let point = Position::new([10.0, 20.0]).unwrap();
 		let second = Position::new([-10.0, -20.0]).unwrap();
+		let ring = vec![
+			point.clone(),
+			second.clone(),
+			Position::new([10.0, -20.0]).unwrap(),
+			point.clone(),
+		];
 		let local_atom = DiskAtomRef::from_parts(crate::values::AtomKind::Edge, 17).unwrap();
 		let atom = StorageAtomRef {
 			kind: crate::values::AtomKind::Edge,
@@ -212,13 +256,13 @@ mod tests {
 			}),
 			StorageValue::Geometry(Geometry::Point(point.clone())),
 			StorageValue::Geometry(Geometry::LineString(vec![point.clone(), second.clone()])),
-			StorageValue::Geometry(Geometry::Polygon(vec![vec![point.clone(), second.clone()]])),
+			StorageValue::Geometry(Geometry::Polygon(vec![ring.clone()])),
 			StorageValue::Geometry(Geometry::MultiPoint(vec![point.clone(), second.clone()])),
 			StorageValue::Geometry(Geometry::MultiLineString(vec![vec![
 				point.clone(),
 				second.clone(),
 			]])),
-			StorageValue::Geometry(Geometry::MultiPolygon(vec![vec![vec![point.clone(), second]]])),
+			StorageValue::Geometry(Geometry::MultiPolygon(vec![vec![ring]])),
 			StorageValue::Geometry(Geometry::Collection(vec![Geometry::Point(point)])),
 			StorageValue::Vector(Vector::F64(vec![1.0, 2.0])),
 			StorageValue::Vector(Vector::F32(vec![1.0, 2.0])),

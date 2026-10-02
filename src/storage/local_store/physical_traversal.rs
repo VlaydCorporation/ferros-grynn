@@ -140,6 +140,14 @@ struct PhysicalGraphSnapshot {
 	edges: Arc<RegisteredDataFile>,
 	adjacency: Arc<RegisteredDataFile>,
 	overlays: Arc<RegisteredDataFile>,
+	endpoint: Option<PhysicalEndpointSnapshot>,
+}
+
+/// Engine identity and immutable qualified postings pinned with graph topology.
+struct PhysicalEndpointSnapshot {
+	binding: crate::storage::catalog::PhysicalIndexBinding,
+	capability: crate::datastore::SystemIndex,
+	file: Arc<RegisteredDataFile>,
 }
 
 /// Cloneable token keeping the exact WAL visibility boundary alive.
@@ -181,7 +189,10 @@ impl LocalStore {
 			return Ok(None);
 		}
 		let home_generation = state.database_superblock.generation;
-		let home_ceiling = state.database_superblock.checkpoint_lsn;
+		// A passive checkpoint may backfill and prune WAL versions after
+		// capture. The reader pin keeps every such home image within
+		// this snapshot's LSN.
+		let home_ceiling = snapshot.visible_lsn();
 		let atoms =
 			physical_atom_snapshot(&state.registry, state.bindings.atoms, state.atom_superblock)?;
 		let mut graphs = BTreeMap::new();
@@ -193,7 +204,24 @@ impl LocalStore {
 				.ok_or_else(|| invalid("physical graph binding has no GraphSuperblock"))?;
 			graphs.insert(
 				binding.graph_id,
-				physical_graph_snapshot(&state.registry, binding, superblock)?,
+				physical_graph_snapshot(
+					&state.registry,
+					binding,
+					superblock,
+					state
+						._database_catalog
+						.graphs
+						.iter()
+						.find(|graph| graph.id == binding.graph_id)
+						.and_then(|graph| graph.edge_endpoint_index)
+						.map(|(id, version)| {
+							crate::datastore::SystemIndex::from_storage(
+								id,
+								version,
+								crate::datastore::SystemIndexKind::EdgeEndpoint,
+							)
+						}),
+				)?,
 			);
 		}
 		Ok(Some(LocalQuerySnapshot(Arc::new(LocalQuerySnapshotInner {
@@ -509,6 +537,9 @@ impl PhysicalTraversalCursor<'_> {
 		backward: bool,
 		undirected: bool,
 	) -> FerrosGrynnResult<Option<PhysicalTraversalRead>> {
+		if source.kind() == Some(AtomKind::Edge) {
+			return self.expand_edge_endpoint(source, forward, backward, undirected);
+		}
 		if source.kind() != Some(AtomKind::Node) {
 			return Ok(None);
 		}
@@ -635,6 +666,270 @@ impl PhysicalTraversalCursor<'_> {
 		}
 		Ok(Some(PhysicalTraversalRead {
 			incidences: unique,
+			stats,
+		}))
+	}
+
+	/// Resolves a local atom using its hot-slot generation in the captured
+	/// snapshot.
+	fn endpoint_atom(
+		&self,
+		atom: DiskAtomRef,
+		stats: &mut PhysicalTraversalReadStats,
+	) -> FerrosGrynnResult<AtomId> {
+		let (number, within) = hot_slot_address(atom.slot())?;
+		let (file_id, file, ceiling) = match atom.kind() {
+			AtomKind::Node => {
+				(self.graph.files.nodes, &self.graph.nodes, self.graph.superblock.node_hot_pages)
+			}
+			AtomKind::Edge => {
+				(self.graph.files.edges, &self.graph.edges, self.graph.superblock.edge_hot_pages)
+			}
+		};
+		let loaded =
+			self.read_pages(self.graph.files.space(), file_id, file, ceiling, &[number])?;
+		stats.add(loaded.stats);
+		let generation = match atom.kind() {
+			AtomKind::Node => {
+				let slot = read_node_hot_slot(&loaded.pages[0], number, within)?;
+				if slot.flags.contains(NodeSlotFlags::TOMBSTONE) || slot.global_atom.is_none() {
+					return Err(invalid("endpoint references an absent node"));
+				}
+				slot.generation
+			}
+			AtomKind::Edge => {
+				let slot = read_edge_hot_slot(&loaded.pages[0], number, within)?;
+				if slot.flags.contains(EdgeSlotFlags::TOMBSTONE) || slot.global_atom.is_none() {
+					return Err(invalid("endpoint references an absent edge"));
+				}
+				slot.generation
+			}
+		};
+		AtomId::from_parts(atom.kind(), atom.slot(), generation)
+	}
+
+	/// Reads one bounded local hyperedge side through the existing adjacency
+	/// codec.
+	fn endpoint_side(
+		&self,
+		inline: &[Option<DiskAtomRef>; 2],
+		count: u32,
+		overflow: Option<PageNo>,
+		stats: &mut PhysicalTraversalReadStats,
+	) -> FerrosGrynnResult<Option<Vec<crate::graph::EdgeEndpoint>>> {
+		if count > 262_144 {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"physical endpoint side",
+				262_144,
+			));
+		}
+		let mut entries = Vec::new();
+		if !self.append_node_side(
+			&mut entries,
+			inline,
+			count,
+			overflow,
+			RequestedDirection::Forward,
+			stats,
+		)? {
+			return Ok(None);
+		}
+		entries
+			.into_iter()
+			.map(|(atom, _)| self.endpoint_atom(atom, stats).map(crate::graph::EdgeEndpoint::Local))
+			.collect::<FerrosGrynnResult<Vec<_>>>()
+			.map(Some)
+	}
+
+	/// Expands exact indexed edge incidences, preserving hyperedge sides and
+	/// roles.
+	fn expand_edge_endpoint(
+		&self,
+		source: AtomId,
+		forward: bool,
+		backward: bool,
+		undirected: bool,
+	) -> FerrosGrynnResult<Option<PhysicalTraversalRead>> {
+		let Some(endpoint) = &self.graph.endpoint else {
+			return Ok(None);
+		};
+		let mut stats = PhysicalTraversalReadStats::default();
+		let encoded_source = DiskAtomRef::from_parts(AtomKind::Edge, source.slot())?;
+		if self.endpoint_atom(encoded_source, &mut stats)? != source {
+			return Err(invalid("physical edge endpoint generation is stale"));
+		}
+		let loaded = self.read_pages(
+			self.graph.files.space(),
+			endpoint.binding.file_id,
+			&endpoint.file,
+			endpoint.file.page_count(),
+			&[endpoint.binding.root],
+		)?;
+		stats.add(loaded.stats);
+		let graph = match self.graph.files.space() {
+			DataSpaceId::Graph(graph) => graph,
+			DataSpaceId::Database => return Err(invalid("endpoint file has database scope")),
+		};
+		let header = crate::storage::edge_endpoint_index::decode_header(
+			&loaded.pages[0],
+			graph,
+			endpoint.capability,
+			self.snapshot.snapshot.commit_ts().get(),
+			endpoint.file.page_count(),
+		)?;
+		let postings = crate::storage::edge_endpoint_index::lookup(
+			|number, output| {
+				let loaded = self.read_pages(
+					self.graph.files.space(),
+					endpoint.binding.file_id,
+					&endpoint.file,
+					header.page_count,
+					&[number],
+				)?;
+				stats.add(loaded.stats);
+				output.as_bytes_mut().copy_from_slice(loaded.pages[0].as_bytes());
+				Ok(())
+			},
+			header,
+			0,
+			encoded_source,
+		)?;
+		let mut topologies = Vec::new();
+		let mut endpoint_count = 0_usize;
+		for group in postings.chunk_by(|left, right| left.0 == right.0) {
+			let connector_ref = group[0].0;
+			let (number, within) = hot_slot_address(connector_ref.slot())?;
+			let loaded = self.read_pages(
+				self.graph.files.space(),
+				self.graph.files.edges,
+				&self.graph.edges,
+				self.graph.superblock.edge_hot_pages,
+				&[number],
+			)?;
+			stats.add(loaded.stats);
+			let slot = read_edge_hot_slot(&loaded.pages[0], number, within)?;
+			if slot.flags.contains(EdgeSlotFlags::CROSS_LEVEL) {
+				return Ok(None);
+			}
+			let connector =
+				AtomId::from_parts(AtomKind::Edge, connector_ref.slot(), slot.generation)?;
+			validate_edge_identity(&slot, connector)?;
+			endpoint_count = endpoint_count
+				.checked_add(slot.source_count as usize)
+				.and_then(|count| count.checked_add(slot.target_count as usize))
+				.ok_or_else(|| invalid("endpoint count overflows"))?;
+			if endpoint_count > 262_144 {
+				return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"physical endpoint frontier",
+					262_144,
+				));
+			}
+			let Some(sources) = self.endpoint_side(
+				&slot.source_inline,
+				slot.source_count,
+				slot.source_overflow,
+				&mut stats,
+			)?
+			else {
+				return Ok(None);
+			};
+			let Some(targets) = self.endpoint_side(
+				&slot.target_inline,
+				slot.target_count,
+				slot.target_overflow,
+				&mut stats,
+			)?
+			else {
+				return Ok(None);
+			};
+			let topology = match slot.topology {
+				EdgeTopologyCode::Directed
+				| EdgeTopologyCode::HyperDirected
+				| EdgeTopologyCode::Loop => crate::graph::EdgeTopology::directed(sources, targets),
+				EdgeTopologyCode::Bidirectional => {
+					crate::graph::EdgeTopology::bidirectional(sources, targets)
+				}
+				EdgeTopologyCode::Undirected | EdgeTopologyCode::HyperUndirected => {
+					crate::graph::EdgeTopology::undirected(sources)
+				}
+			};
+			for &(_, side) in group {
+				if !if side {
+					topology.target()
+				} else {
+					topology.source()
+				}
+				.contains(&crate::graph::EdgeEndpoint::Local(source))
+				{
+					return Err(invalid("endpoint posting disagrees with its connector side"));
+				}
+			}
+			topologies.push((connector, topology));
+		}
+		let mut incidences = BTreeSet::new();
+		let mut ordered = Vec::new();
+		for requested in [
+			RequestedDirection::Forward,
+			RequestedDirection::Backward,
+			RequestedDirection::Undirected,
+		] {
+			if !match requested {
+				RequestedDirection::Forward => forward,
+				RequestedDirection::Backward => backward,
+				RequestedDirection::Undirected => undirected,
+			} {
+				continue;
+			}
+			for (connector, topology) in &topologies {
+				if (topology.direction() == EdgeDirection::Undirected)
+					!= matches!(requested, RequestedDirection::Undirected)
+				{
+					continue;
+				}
+				let direction = if matches!(requested, RequestedDirection::Backward) {
+					crate::graph::TraversalDirection::Backward
+				} else {
+					crate::graph::TraversalDirection::Forward
+				};
+				crate::graph::visit_endpoint_steps(
+					*connector,
+					topology,
+					&crate::graph::EdgeEndpoint::Local(source),
+					crate::graph::TraversalSemantics::Atom,
+					direction,
+					|step| {
+						let Some(target) = step.target().local_id() else {
+							return Err(invalid("local physical endpoint became qualified"));
+						};
+						let incidence = PhysicalTraversalIncidence {
+							target,
+							edge: *connector,
+							direction: step.direction(),
+							role: step.role(),
+							topology: step.topology(),
+						};
+						if incidences.insert((
+							target,
+							*connector,
+							step.direction(),
+							step.role(),
+							step.topology(),
+						)) {
+							if ordered.len() == 262_144 {
+								return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+									"physical endpoint candidates",
+									262_144,
+								));
+							}
+							ordered.push(incidence);
+						}
+						Ok(())
+					},
+				)?;
+			}
+		}
+		Ok(Some(PhysicalTraversalRead {
+			incidences: ordered,
 			stats,
 		}))
 	}
@@ -821,6 +1116,8 @@ fn read_cold_home(
 			.collect::<Vec<_>>();
 		let loaded = store.engine.read_sparse_ioring(&reads)?;
 		for (position, index) in cold.iter().copied().enumerate() {
+			let header = loaded.pages()[position].validate(page_numbers[index])?;
+			crate::storage::page_cache::validate_loaded_header(cache_keys[index], header)?;
 			pages[index].as_bytes_mut().copy_from_slice(loaded.pages()[position].as_bytes());
 		}
 		stats.ioring_home_pages = stats.ioring_home_pages.saturating_add(cold_count);
@@ -840,6 +1137,8 @@ fn read_cold_home(
 	}
 	for index in cold {
 		direct.read_page(page_numbers[*index], &mut pages[*index])?;
+		let header = pages[*index].validate(page_numbers[*index])?;
+		crate::storage::page_cache::validate_loaded_header(cache_keys[*index], header)?;
 	}
 	stats.sync_home_pages = stats.sync_home_pages.saturating_add(cold_count);
 	Ok(())
@@ -869,6 +1168,7 @@ fn physical_graph_snapshot(
 	registry: &crate::storage::file_registry::FileRegistry,
 	binding: &GraphBinding,
 	superblock: GraphSuperblock,
+	capability: Option<crate::datastore::SystemIndex>,
 ) -> FerrosGrynnResult<PhysicalGraphSnapshot> {
 	Ok(PhysicalGraphSnapshot {
 		files: binding.files,
@@ -878,6 +1178,17 @@ fn physical_graph_snapshot(
 		edges: registry.resolve_file(binding.files.space(), binding.files.edges)?,
 		adjacency: registry.resolve_file(binding.files.space(), binding.files.adjacency)?,
 		overlays: registry.resolve_file(binding.files.space(), binding.files.overlays)?,
+		endpoint: match (binding.edge_endpoint, capability) {
+			(Some(endpoint), Some(capability)) => Some(PhysicalEndpointSnapshot {
+				binding: endpoint,
+				capability,
+				file: registry.resolve_file(binding.files.space(), endpoint.file_id)?,
+			}),
+			(None, _) => None,
+			(Some(_), None) => {
+				return Err(invalid("physical endpoint binding has no engine identity"));
+			}
+		},
 	})
 }
 

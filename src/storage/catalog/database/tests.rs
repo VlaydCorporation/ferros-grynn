@@ -318,7 +318,11 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 				IndexId::new(5).ok_or_else(|| codec::invalid("invalid adjacency index"))?,
 				SchemaVersion::INITIAL,
 			),
+			edge_endpoint_index: None,
+			edge_endpoint: None,
 			membership: index(4)?,
+			indexes: Vec::new(),
+			index_bindings: BTreeMap::new(),
 			owner_root: None,
 			root: None,
 			properties: vec![GraphPropertyCatalogEntry {
@@ -407,12 +411,16 @@ fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 			IndexId::new(10).ok_or_else(|| codec::invalid("invalid adjacency index"))?,
 			SchemaVersion::INITIAL,
 		),
+		edge_endpoint_index: None,
+		edge_endpoint: None,
 		membership: PhysicalIndexBinding {
 			file_id: DataFileId::new(5, DataFileKind::Index)
 				.ok_or_else(|| codec::invalid("invalid child membership"))?,
 			root: crate::storage::page::PageNo::new(0),
 		},
 		owner_root: Some(root),
+		indexes: Vec::new(),
+		index_bindings: BTreeMap::new(),
 		root: None,
 		properties: Vec::new(),
 		arena: GraphArenaBindings {

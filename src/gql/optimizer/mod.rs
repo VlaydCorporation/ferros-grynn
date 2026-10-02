@@ -53,7 +53,7 @@ pub(crate) use plan::{
 	WriteOperator,
 };
 pub(in crate::gql) use rules::prepare_select;
-pub(in crate::gql) use select_plan::plan_select;
+pub(in crate::gql) use select_plan::{plan_select, spatial_query};
 pub(crate) use snapshot::{
 	PlannerClass,
 	PlannerDemand,
@@ -69,7 +69,7 @@ pub(in crate::gql) use traverse_plan::plan_traverse;
 pub(in crate::gql) use write_plan::plan_write;
 
 /// Version mixed into canonical query and physical-plan fingerprints.
-pub(crate) const PLAN_ENCODING_VERSION: u16 = 2;
+pub(crate) const PLAN_ENCODING_VERSION: u16 = 5;
 
 #[cfg(test)]
 mod tests;

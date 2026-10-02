@@ -44,6 +44,199 @@ pub(in crate::gql::execution) trait AtomFieldRead {
 
 	/// Reads a field through a stable database record reference.
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value>;
+
+	/// Validates a runtime path before reading snapshot-bound contributions.
+	fn validate_path(
+		&self,
+		_path: &crate::graph::Path,
+		_control: &ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		Err(FerrosGrynnError::invalid_argument("custom path cost requires a query snapshot"))
+	}
+}
+
+/// Immutable builder resolver; values and typed execution retain public
+/// identities.
+pub(in crate::gql::execution) struct RootFields<'a>(
+	pub(in crate::gql::execution) &'a crate::datastore::DatabaseRoot,
+);
+
+impl RootFields<'_> {
+	/// Resolves a qualified durable occurrence against this exact root.
+	fn bound(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<BoundAtom> {
+		let global = self
+			.0
+			.resolve_atom(occurrence.atom().id())
+			.filter(|global| global.kind() == Some(occurrence.atom().kind()))
+			.ok_or_else(|| {
+				FerrosGrynnError::atom_does_not_exist("atom", occurrence.atom().id().to_string())
+			})?;
+		let local = self.0.membership(occurrence.graph().id(), global).ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist("occurrence", occurrence.atom().id().to_string())
+		})?;
+		Ok(BoundAtom::new(occurrence.graph().id(), local))
+	}
+}
+
+impl AtomFieldRead for RootFields<'_> {
+	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value> {
+		let bound = atom;
+		let occurrence = self.0.occurrence(bound.graph, bound.atom).ok_or_else(|| {
+			FerrosGrynnError::atom_does_not_exist("occurrence", bound.atom.to_string())
+		})?;
+		let base = self
+			.0
+			.atom(occurrence.global_id())
+			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("PURE occurrence has no base"))?;
+		match field {
+			"id" => Ok(Value::Record(Box::new(base.record_id().clone()))),
+			"class" => Ok(Value::from(base.record_id().class())),
+			"kind" => Ok(Value::from(if bound.atom.is_edge() {
+				"edge"
+			} else {
+				"node"
+			})),
+			"label" => Ok(occurrence.label().cloned().map_or(Value::None, Value::String)),
+			"graph" => self
+				.0
+				.graph(bound.graph)
+				.map(|graph| Value::GraphRef(Box::new(graph.reference().clone())))
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(bound.graph.to_string())),
+			"properties" => {
+				let mut object = properties_object(base.properties(), &self.0.dictionary)?;
+				if let Some(overlay) = occurrence.overlay() {
+					for (key, value) in overlay.iter() {
+						let name = self.0.dictionary.resolve(key).ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"PURE overlay property name is absent",
+							)
+						})?;
+						match value {
+							crate::datastore::OverlayValue::Value(value) => {
+								object.insert(name.clone(), value.clone());
+							}
+							crate::datastore::OverlayValue::Hidden => {
+								object.remove(name);
+							}
+						}
+					}
+				}
+				Ok(Value::Object(object))
+			}
+			_ => Ok(self
+				.0
+				.dictionary
+				.get(field)
+				.and_then(|key| occurrence.effective_value(base.properties().get(key), key))
+				.cloned()
+				.unwrap_or(Value::None)),
+		}
+	}
+
+	fn occurrence_field(
+		&self,
+		occurrence: &AtomOccurrenceRef,
+		field: &str,
+	) -> FerrosGrynnResult<Value> {
+		self.field(self.bound(occurrence)?, field)
+	}
+
+	fn inner_graph(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
+		let bound = self.bound(occurrence)?;
+		let current = self.0.occurrence(bound.graph, bound.atom).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("PURE owner occurrence is absent")
+		})?;
+		let nested = match current.state() {
+			crate::datastore::OccurrenceState::Node {
+				nested_graph,
+			} => *nested_graph,
+			crate::datastore::OccurrenceState::Edge {
+				transition_graph,
+				..
+			} => *transition_graph,
+		};
+		match nested {
+			None => Ok(Value::None),
+			Some(id) => self
+				.0
+				.graph(id)
+				.map(|graph| Value::GraphRef(Box::new(graph.reference().clone())))
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(id.to_string())),
+		}
+	}
+
+	fn level_path(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
+		let bound = self.bound(occurrence)?;
+		let current = self.0.occurrence(bound.graph, bound.atom).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("PURE LevelPath occurrence is absent")
+		})?;
+		self.0.level_path_value(bound.graph, current.global_id())
+	}
+
+	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
+		let base =
+			self.0.resolve_atom(record).and_then(|global| self.0.atom(global)).ok_or_else(
+				|| FerrosGrynnError::atom_does_not_exist("record", record.to_string()),
+			)?;
+		match field {
+			"id" => Ok(Value::Record(Box::new(record.clone()))),
+			"label" => Ok(Value::None),
+			_ => Ok(self
+				.0
+				.dictionary
+				.get(field)
+				.and_then(|key| base.properties().get(key))
+				.cloned()
+				.unwrap_or(Value::None)),
+		}
+	}
+}
+
+/// Checks the origin graph, snapshot and every qualified path occurrence.
+fn validate_query_path<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	path: &crate::graph::Path,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<()> {
+	let Some(first) = path.steps().first() else {
+		return Ok(());
+	};
+	let graph = read.graph(snapshot, first.atom().graph())?;
+	if graph.identity() != path.origin() {
+		return Err(FerrosGrynnError::graph_identity_mismatch(
+			path.origin().to_string(),
+			graph.identity().to_string(),
+		));
+	}
+	if graph.snapshot_id() != path.snapshot() {
+		return Err(FerrosGrynnError::snapshot_unavailable(
+			path.origin().to_string(),
+			path.snapshot().to_string(),
+		));
+	}
+	drop(graph);
+	for step in path.steps() {
+		control.check()?;
+		if step.via_edge().is_some() {
+			control.record_path_expansion()?;
+		}
+		if step.via_edge().is_some_and(|connector| connector.atom().kind() != AtomKind::Edge) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"path connector must be an edge occurrence",
+			));
+		}
+		for occurrence in step.via_edge().into_iter().chain([step.atom()]) {
+			let graph = read.graph(snapshot, occurrence.graph())?;
+			if graph.atom_id(occurrence.atom())?.is_none() {
+				return Err(FerrosGrynnError::atom_does_not_exist(
+					"occurrence",
+					occurrence.atom().id().to_string(),
+				));
+			}
+		}
+	}
+	Ok(())
 }
 
 /// Record-reference resolver bound to one statement snapshot and graph scope.
@@ -63,12 +256,16 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 
 	fn occurrence_field(
 		&self,
-		_occurrence: &AtomOccurrenceRef,
-		_field: &str,
+		occurrence: &AtomOccurrenceRef,
+		field: &str,
 	) -> FerrosGrynnResult<Value> {
-		Err(FerrosGrynnError::invalid_argument(
-			"SELECT row has no graph-local occurrence resolver.",
-		))
+		let fields = MatchGraphFields::new(
+			self.read,
+			self.snapshot,
+			self.read.property_dictionary(self.snapshot),
+			Arc::new(occurrence.graph().clone()),
+		);
+		fields.occurrence_field(occurrence, field)
 	}
 
 	fn inner_graph(&self, _occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
@@ -83,6 +280,14 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
 		self.read.record_field(self.snapshot, record, self.graph, field)
+	}
+
+	fn validate_path(
+		&self,
+		path: &crate::graph::Path,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		validate_query_path(self.read, self.snapshot, path, control)
 	}
 }
 
@@ -244,6 +449,14 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
 		self.read.record_field(self.snapshot, record, None, field)
+	}
+
+	fn validate_path(
+		&self,
+		path: &crate::graph::Path,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		validate_query_path(self.read, self.snapshot, path, control)
 	}
 }
 

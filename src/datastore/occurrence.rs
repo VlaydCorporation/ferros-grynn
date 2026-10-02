@@ -168,6 +168,9 @@ pub(crate) struct GraphRoot {
 	edges: SlotAllocator,
 	by_global: BTreeMap<GlobalAtomId, AtomId>,
 	occurrences: BTreeMap<AtomId, GraphOccurrence>,
+	/// Created at the first edge endpoint; keys retain the complete nested
+	/// scope.
+	edge_endpoints: Option<BTreeMap<crate::graph::EdgeEndpoint, BTreeSet<(AtomId, bool)>>>,
 }
 
 impl GraphRoot {
@@ -178,6 +181,7 @@ impl GraphRoot {
 			edges: SlotAllocator::new(AtomKind::Edge),
 			by_global: BTreeMap::new(),
 			occurrences: BTreeMap::new(),
+			edge_endpoints: None,
 		}
 	}
 
@@ -195,6 +199,93 @@ impl GraphRoot {
 
 	pub(crate) fn occurrence_mut(&mut self, local: AtomId) -> Option<&mut GraphOccurrence> {
 		self.occurrences.get_mut(&local).filter(|occurrence| occurrence.local_id == local)
+	}
+
+	/// Returns canonical connector/source-target postings for one qualified
+	/// endpoint.
+	pub(crate) fn edge_endpoint_postings(
+		&self,
+		endpoint: &crate::graph::EdgeEndpoint,
+	) -> impl Iterator<Item = &(AtomId, bool)> {
+		self.edge_endpoints
+			.as_ref()
+			.and_then(|postings| postings.get(endpoint))
+			.into_iter()
+			.flatten()
+	}
+
+	/// Streams all synchronous endpoint postings for durable generation
+	/// construction.
+	pub(crate) fn edge_endpoint_entries(
+		&self,
+	) -> impl Iterator<Item = (&crate::graph::EdgeEndpoint, AtomId, bool)> {
+		self.edge_endpoints.iter().flat_map(|postings| postings.iter()).flat_map(
+			|(endpoint, connectors)| {
+				connectors.iter().map(move |&(connector, side)| (endpoint, connector, side))
+			},
+		)
+	}
+
+	/// Replaces one occurrence and its endpoint postings together after
+	/// validation.
+	pub(crate) fn replace_occurrence(&mut self, after: GraphOccurrence) {
+		let local = after.local_id();
+		if let Some(before) = self.occurrences.get(&local) {
+			let before_topology = match before.state() {
+				OccurrenceState::Edge {
+					topology,
+					..
+				} => Some(topology),
+				OccurrenceState::Node {
+					..
+				} => None,
+			};
+			let after_topology = match after.state() {
+				OccurrenceState::Edge {
+					topology,
+					..
+				} => Some(topology),
+				OccurrenceState::Node {
+					..
+				} => None,
+			};
+			if before_topology == after_topology {
+				self.occurrences.insert(local, after);
+				return;
+			}
+			if let Some(topology) = before_topology.cloned() {
+				self.update_edge_endpoint_postings(local, &topology, false);
+			}
+			if let Some(topology) = after_topology {
+				self.update_edge_endpoint_postings(local, topology, true);
+			}
+		}
+		self.occurrences.insert(local, after);
+	}
+
+	/// Maintains one exact posting per connector and actual endpoint side.
+	fn update_edge_endpoint_postings(
+		&mut self,
+		connector: AtomId,
+		topology: &EdgeTopology,
+		insert: bool,
+	) {
+		for (endpoint, side) in topology.edge_endpoint_sides() {
+			if insert {
+				self.edge_endpoints
+					.get_or_insert_with(BTreeMap::new)
+					.entry(endpoint.clone())
+					.or_default()
+					.insert((connector, side));
+			} else if let Some(postings) = &mut self.edge_endpoints {
+				if let Some(connectors) = postings.get_mut(endpoint) {
+					connectors.remove(&(connector, side));
+				}
+				if postings.get(endpoint).is_some_and(BTreeSet::is_empty) {
+					postings.remove(endpoint);
+				}
+			}
+		}
 	}
 
 	pub(crate) fn attach_node(
@@ -339,8 +430,16 @@ impl GraphRoot {
 			}
 		};
 		let local = allocator.alloc()?;
+		let occurrence = build(local);
+		if let OccurrenceState::Edge {
+			topology,
+			..
+		} = occurrence.state()
+		{
+			self.update_edge_endpoint_postings(local, topology, true);
+		}
 		self.by_global.insert(global, local);
-		self.occurrences.insert(local, build(local));
+		self.occurrences.insert(local, occurrence);
 		Ok(local)
 	}
 
@@ -369,8 +468,16 @@ impl GraphRoot {
 			}
 		};
 		allocator.restore(local)?;
+		let occurrence = build(local);
+		if let OccurrenceState::Edge {
+			topology,
+			..
+		} = occurrence.state()
+		{
+			self.update_edge_endpoint_postings(local, topology, true);
+		}
 		self.by_global.insert(global, local);
-		self.occurrences.insert(local, build(local));
+		self.occurrences.insert(local, occurrence);
 		Ok(())
 	}
 
@@ -422,6 +529,14 @@ impl GraphRoot {
 
 	pub(crate) fn detach(&mut self, global: GlobalAtomId) -> Option<GraphOccurrence> {
 		let local = self.by_global.remove(&global)?;
+		let occurrence = self.occurrences.remove(&local)?;
+		if let OccurrenceState::Edge {
+			topology,
+			..
+		} = occurrence.state()
+		{
+			self.update_edge_endpoint_postings(local, topology, false);
+		}
 		match local.kind() {
 			Some(AtomKind::Node) => {
 				self.nodes.free(local);
@@ -431,7 +546,7 @@ impl GraphRoot {
 			}
 			None => {}
 		}
-		self.occurrences.remove(&local)
+		Some(occurrence)
 	}
 
 	/// Builds a dependency-ordered occurrence removal plan.
@@ -476,6 +591,16 @@ impl GraphRoot {
 	}
 
 	fn incident_edges(&self, endpoint: AtomId) -> Vec<GlobalAtomId> {
+		if endpoint.kind() == Some(AtomKind::Edge) {
+			return self
+				.edge_endpoint_postings(&crate::graph::EdgeEndpoint::Local(endpoint))
+				.filter_map(|&(connector, _)| {
+					self.occurrence(connector).map(GraphOccurrence::global_id)
+				})
+				.collect::<BTreeSet<_>>()
+				.into_iter()
+				.collect();
+		}
 		self.occurrences
 			.values()
 			.filter_map(|occurrence| match occurrence.state() {
@@ -493,7 +618,7 @@ impl GraphRoot {
 			.collect()
 	}
 
-	pub(crate) fn occurrences(&self) -> impl ExactSizeIterator<Item = &GraphOccurrence> {
+	pub(crate) fn occurrences(&self) -> impl ExactSizeIterator<Item = &GraphOccurrence> + Clone {
 		self.occurrences.values()
 	}
 

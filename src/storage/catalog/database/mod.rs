@@ -1,6 +1,8 @@
 //! Exact `FGDC v10` logical model and codec.
 
 mod codec;
+/// Checked graph-owned definition descriptors.
+mod graph_index;
 mod type_codec;
 mod validate;
 
@@ -18,6 +20,7 @@ use crate::{
 		ClassSchemaMode,
 		FunctionEffect,
 		FunctionId,
+		GraphIndex,
 		IndexId,
 		IndexMaintenanceMode,
 		IndexScope,
@@ -131,6 +134,15 @@ pub(in crate::storage) struct GraphCatalogEntry {
 	pub(in crate::storage) topology_constraints: GraphTopologyConstraints,
 	pub(in crate::storage) label_index: (IndexId, SchemaVersion),
 	pub(in crate::storage) adjacency_index: (IndexId, SchemaVersion),
+	/// Optional engine capability and its snapshot-exact synchronous side-file.
+	pub(in crate::storage) edge_endpoint_index: Option<(IndexId, SchemaVersion)>,
+	pub(in crate::storage) edge_endpoint: Option<PhysicalIndexBinding>,
+	/// User snapshot definitions in stable identity order.
+	pub(in crate::storage) indexes: Vec<GraphIndex>,
+	/// Exact immutable user artifact bindings, separate from public
+	/// definitions.
+	pub(in crate::storage) index_bindings:
+		std::collections::BTreeMap<IndexId, PhysicalIndexBinding>,
 	pub(in crate::storage) membership: PhysicalIndexBinding,
 	pub(in crate::storage) owner_root: Option<GraphId>,
 	pub(in crate::storage) root: Option<Vec<u8>>,

@@ -71,7 +71,11 @@ pub(in crate::gql) fn plan_write(
 		),
 		LogicalStatement::Schema(schema) => {
 			let mut operators = vec![WriteOperator::CatalogMutation];
-			if matches!(schema, LogicalSchemaStatement::DefineIndex { .. }) {
+			if matches!(
+				schema,
+				LogicalSchemaStatement::DefineIndex { .. }
+					| LogicalSchemaStatement::DefineGraphIndex { .. }
+			) {
 				operators.push(WriteOperator::IndexBuild);
 			}
 			operators.push(WriteOperator::ConstraintValidation);

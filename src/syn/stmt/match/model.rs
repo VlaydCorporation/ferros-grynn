@@ -15,6 +15,8 @@ pub struct MatchStatement {
 	pub constraints: MatchConstraints,
 	pub patterns: Vec<MatchPattern>,
 	pub source: Expr,
+	/// Statement-wide default for connector path cost; local COST overrides it.
+	pub custom_cost: Option<FunctionSignatureName>,
 	pub filter: Option<Expr>,
 	pub max_depth: Option<Expr>,
 	pub timeout: Option<TimeoutValue>,
@@ -177,7 +179,7 @@ pub struct MatchEdge {
 	pub predicate: Option<Expr>,
 	pub length: Option<MatchLength>,
 	pub constraints: MatchConstraints,
-	pub custom_cost: Option<Identifier>,
+	pub custom_cost: Option<FunctionSignatureName>,
 	pub span: TextSpan,
 }
 

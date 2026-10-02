@@ -406,14 +406,30 @@ fn range_unique_index<Address: PrimaryAddress>(
 	lower: &Bound<&[u8]>,
 	upper: &Bound<&[u8]>,
 ) -> FerrosGrynnResult<Vec<Address>> {
+	let mut result = Vec::new();
+	visit_unique_range(read_page, root, PageType::IndexUniqueBtreeLeaf, lower, upper, &mut |_key, address| { result.push(address); Ok(()) })?;
+	Ok(result)
+}
+
+/// Visits complete unique leaf records without allocating the result set.
+pub(in crate::storage) fn visit_unique_range<Address: PrimaryAddress>(
+	read_page: &mut impl FnMut(PageNo, &mut AlignedPage) -> FerrosGrynnResult<()>,
+	root: PageNo,
+	leaf_type: PageType,
+	lower: &Bound<&[u8]>,
+	upper: &Bound<&[u8]>,
+	visit: &mut impl FnMut(&[u8], Address) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()> {
+	if !matches!(leaf_type, PageType::IndexUniqueBtreeLeaf | PageType::IndexEdgeEndpointEntry) {
+		return Err(invalid_index("unique range leaf type is incompatible"));
+	}
 	let target = match lower {
 		Bound::Included(key) | Bound::Excluded(key) => *key,
 		Bound::Unbounded => &[],
 	};
-	let mut page_no = descend_to_leaf(read_page, root, target, PageType::IndexUniqueBtreeLeaf)?;
+	let mut page_no = descend_to_leaf(read_page, root, target, leaf_type)?;
 	let mut visited = BTreeSet::new();
 	let mut previous_key = None::<Vec<u8>>;
-	let mut result = Vec::new();
 	while page_no != PageNo::NULL {
 		if !visited.insert(page_no) {
 			return Err(invalid_index("unique scalar B+tree leaf chain contains a cycle"));
@@ -421,7 +437,7 @@ fn range_unique_index<Address: PrimaryAddress>(
 		let mut page = AlignedPage::zeroed();
 		read_page(page_no, &mut page)?;
 		let header = page.validate(page_no)?;
-		if header.page_type() != PageType::IndexUniqueBtreeLeaf {
+		if header.page_type() != leaf_type {
 			return Err(invalid_index("unique scalar B+tree leaf link targets an invalid page"));
 		}
 		let bytes = page.as_bytes();
@@ -434,14 +450,14 @@ fn range_unique_index<Address: PrimaryAddress>(
 				));
 			}
 			if upper_exceeded(key, upper) {
-				return Ok(result);
+				return Ok(());
 			}
 			if key_in_bounds(key, lower, upper) {
-				result.push(Address::from_raw(atom)?);
+				visit(key, Address::from_raw(atom)?)?;
 			}
 			previous_key = Some(key.to_vec());
 		}
 		page_no = PageNo::new(read_u64(bytes, LEAF_NEXT_OFFSET));
 	}
-	Ok(result)
+	Ok(())
 }

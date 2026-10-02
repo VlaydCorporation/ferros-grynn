@@ -91,6 +91,7 @@ pub(crate) enum PhysicalIndexEntries {
 	Fulltext(DecodedFulltextIndex),
 	Hnsw(DecodedHnswIndex),
 	Vector(DecodedVectorIndex),
+	Geometry(crate::storage::geometry_index::GeometryHeader),
 }
 
 /// Exact replacement/tombstone generation attached to an immutable base.
@@ -98,6 +99,7 @@ pub(crate) enum PhysicalIndexEntries {
 pub(crate) enum PhysicalIndexDelta {
 	Fulltext(DecodedFulltextDelta),
 	Vector(DecodedVectorDelta),
+	Geometry(crate::storage::geometry_index::DecodedGeometryDelta),
 }
 
 /// Exact logical metadata and lazily decoded payload of one durable index.
@@ -118,6 +120,8 @@ pub(super) struct PhysicalIndexFile {
 	kind: ClassIndexKind,
 	scope: IndexScope,
 	options: ClassIndexOptions,
+	fields: Vec<crate::values::PropertyKeyId>,
+	build_revision: u64,
 	binding: PhysicalIndexBinding,
 	file: Arc<RegisteredDataFile>,
 	delta_binding: Option<PhysicalIndexBinding>,
@@ -127,6 +131,61 @@ pub(super) struct PhysicalIndexFile {
 }
 
 impl LocalStore {
+	/// Returns exact delta-adjusted MBR candidates from snapshot-bound pages.
+	pub(crate) fn search_geometry_index(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		index: IndexId,
+		query: [f64; 4],
+		admit: &mut dyn FnMut(usize) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Option<crate::storage::GeometryCandidates>> {
+		let Some(file) = snapshot.0.indexes.get(&index) else {
+			return Ok(None);
+		};
+		if file.kind != ClassIndexKind::Geometry {
+			return Ok(None);
+		}
+		let decoded = file.read(self, snapshot)?;
+		let PhysicalIndexEntries::Geometry(header) = decoded.entries else {
+			return Err(invalid("geometry binding decoded as another kind"));
+		};
+		let delta = match &decoded.delta {
+			None => None,
+			Some(PhysicalIndexDelta::Geometry(delta)) => Some(delta),
+			Some(_) => return Err(invalid("geometry binding has an incompatible delta")),
+		};
+		let space = match file.scope {
+			IndexScope::Base => DataSpaceId::Database,
+			IndexScope::Effective {
+				graph,
+			} => DataSpaceId::Graph(graph),
+		};
+		let candidates = crate::storage::geometry_index::search_geometry_generation(
+			header,
+			delta.map_or(&[], |delta| &delta.records),
+			query,
+			admit,
+			|page_no, output| {
+				let mut loaded = read_snapshot_pages(
+					self,
+					&snapshot.0,
+					space,
+					file.binding.file_id,
+					&file.file,
+					file.file.page_count(),
+					&[page_no],
+				)?;
+				let page = loaded
+					.pages
+					.pop()
+					.ok_or_else(|| invalid("geometry page read returned no page"))?;
+				output.as_bytes_mut().copy_from_slice(page.as_bytes());
+				Ok(())
+			},
+		)?;
+		Ok(Some(candidates))
+	}
+
 	/// Returns whether an exact immutable side-file belongs to this snapshot.
 	pub(crate) fn has_physical_index(&self, snapshot: &LocalQuerySnapshot, index: IndexId) -> bool {
 		snapshot.0.indexes.contains_key(&index)
@@ -203,6 +262,8 @@ impl PhysicalIndexFile {
 			&& self.kind == index.kind
 			&& self.scope == index.scope
 			&& self.options == index.options
+			&& self.fields == index.fields
+			&& self.build_revision == index.build_revision
 			&& self.binding == binding
 			&& self.delta_binding == index.delta
 	}
@@ -228,7 +289,7 @@ impl PhysicalIndexFile {
 		let delta = match decoded.delta.as_ref() {
 			None => None,
 			Some(PhysicalIndexDelta::Vector(delta)) => Some(delta),
-			Some(PhysicalIndexDelta::Fulltext(_)) => {
+			Some(_) => {
 				return Err(invalid("HNSW side-file has a Fulltext delta"));
 			}
 		};
@@ -366,6 +427,25 @@ impl PhysicalIndexFile {
 			Ok(())
 		};
 		let entries = match self.kind {
+			ClassIndexKind::Geometry => {
+				let mut page = Box::new(AlignedPage::zeroed());
+				read_page(PageNo::new(0), &mut page)?;
+				let header = crate::storage::geometry_index::decode_geometry_header(
+					&page,
+					self.file.page_count(),
+				)?;
+				if header.spec.index != self.index_id
+					|| header.spec.index_version != self.version
+					|| header.spec.class != self.class_id
+					|| header.spec.scope != self.scope
+					|| ClassIndexOptions::Geometry(header.spec.options) != self.options
+					|| self.fields.as_slice() != [header.spec.field]
+					|| self.build_revision != header.spec.build_revision
+				{
+					return Err(invalid("geometry side-file metadata disagrees with catalog"));
+				}
+				PhysicalIndexEntries::Geometry(header)
+			}
 			ClassIndexKind::Standard | ClassIndexKind::Unique => {
 				let mode = if self.kind == ClassIndexKind::Standard {
 					ScalarIndexMode::Standard
@@ -483,6 +563,15 @@ impl PhysicalIndexFile {
 		};
 		let delta = match (self.delta_binding, self.delta_file.as_ref(), &entries) {
 			(None, None, _) => None,
+			(Some(binding), Some(file), PhysicalIndexEntries::Geometry(base)) => {
+				if file.page_count() > 14 {
+					return Err(invalid("geometry delta exceeds its bounded page count"));
+				}
+				let pages = read_all_pages(store, snapshot, space, binding, file)?;
+				Some(PhysicalIndexDelta::Geometry(
+					crate::storage::geometry_index::decode_geometry_delta(&pages, base.spec)?,
+				))
+			}
 			(Some(binding), Some(file), PhysicalIndexEntries::Fulltext(base)) => {
 				let pages = read_all_pages(store, snapshot, space, binding, file)?;
 				Some(PhysicalIndexDelta::Fulltext(decode_fulltext_delta(&pages, base.spec)?))
@@ -1113,6 +1202,8 @@ pub(super) fn bind_physical_indexes(
 				kind: index.kind,
 				scope: index.scope,
 				options: index.options,
+				fields: index.fields.clone(),
+				build_revision: index.build_revision,
 				binding,
 				file: registry.resolve_file(space, binding.file_id)?,
 				delta_binding: index.delta,

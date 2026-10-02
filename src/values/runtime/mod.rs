@@ -30,7 +30,7 @@ pub use array::Array;
 pub use bytes::Bytes;
 pub use closure::{Closure, RuntimeId};
 pub use error_value::ErrorValue;
-pub use geometry::{Geometry, Position};
+pub use geometry::{Geometry, GeometryKind, Position};
 pub use graph::{
 	AtomKind,
 	AtomOccurrenceRef,
@@ -63,6 +63,7 @@ pub use temporal::{DateTime, Duration};
 pub use text::Text;
 pub use types::Type;
 pub use value::Value;
+pub(crate) use value::estimated_record_id_heap_bytes;
 pub use vector::{Vector, VectorKind};
 
 pub use crate::graph;

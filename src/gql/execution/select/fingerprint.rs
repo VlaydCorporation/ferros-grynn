@@ -275,6 +275,10 @@ fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 				std::mem::discriminant(&definition.kind).hash(state);
 				match definition.options {
 					crate::datastore::ClassIndexOptions::Scalar => 0_u8.hash(state),
+					crate::datastore::ClassIndexOptions::Geometry(options) => {
+						4_u8.hash(state);
+						options.hash(state);
+					}
 					crate::datastore::ClassIndexOptions::Fulltext(options) => {
 						1_u8.hash(state);
 						options.hash(state);

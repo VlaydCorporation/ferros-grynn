@@ -105,3 +105,67 @@ fn full_scan_separates_base_and_effective_populations() -> FerrosGrynnResult<()>
 	drop(std::fs::remove_dir_all(scratch));
 	Ok(())
 }
+
+#[test]
+fn geometry_analyze_samples_nonempty_mbrs_and_keeps_population() -> FerrosGrynnResult<()> {
+	use crate::values::{Geometry, Position, Value};
+	let store = Datastore::in_memory();
+	let mut transaction = store.begin();
+	let graph = transaction.define_graph("places", GraphKind::Graph)?;
+	transaction.define_class(ClassSchema::new("place", AtomKind::Node, [ClassField::new(
+		"shape",
+		Type::Option(Box::new(Type::Geometry)),
+	)])?)?;
+	transaction.commit()?;
+	let class = store.class("place").unwrap();
+	let field = class.fields().next().unwrap();
+	let key = field.key.unwrap();
+	let mut transaction = store.begin();
+	for ordinal in 0..1032_i64 {
+		let record = RecordId::new("place", RecordIdPart::Int(ordinal))?;
+		let value = match ordinal {
+			1030 => Value::Geometry(Geometry::Collection(vec![])),
+			1031 => Value::Null,
+			_ => Value::Geometry(Geometry::Point(Position::new([1.0, 2.0])?)),
+		};
+		transaction.create_atom(record.clone(), PropertyMap::from_iter([(key, value)]))?;
+		if ordinal == 0 {
+			transaction.attach_node(graph.id(), &record, None, None)?;
+			transaction.set_overlay(
+				graph.id(),
+				&record,
+				key,
+				Value::Geometry(Geometry::Point(Position::new([8.0, 9.0])?)),
+			)?;
+		}
+	}
+	transaction.commit()?;
+	let root = store.inner.current_root();
+	let scratch = std::env::temp_dir().join(format!("fg-stats-{}", crate::values::Uuid::now_v7()));
+	for method in [AnalyzeMethod::Full, AnalyzeMethod::Approximate {
+		sample_count: NonZeroU32::new(1024).unwrap(),
+	}] {
+		let stats = analyze_database_with_method_at(&root, &scratch, method)?;
+		let base = &stats.base().property_histograms[&PropertyHistogramKey {
+			class_id: class.id().unwrap(),
+			field_id: field.id().unwrap(),
+			scope: StatisticsScope::Base,
+		}];
+		assert_eq!(base.method, HistogramMethod::Exact);
+		assert_eq!(base.sample_count, 1032);
+		assert_eq!(base.mbr_population, 1030);
+		assert_eq!(base.mbr_sample, vec![[1.0, 2.0, 1.0, 2.0]; 1024]);
+		assert!((base.null_fraction - 1.0 / 1032.0).abs() < f32::EPSILON);
+		let effective = &stats.graph(graph.id()).unwrap().property_histograms
+			[&PropertyHistogramKey {
+				class_id: class.id().unwrap(),
+				field_id: field.id().unwrap(),
+				scope: StatisticsScope::Effective {
+					graph: graph.id(),
+				},
+			}];
+		assert_eq!(effective.mbr_sample, vec![[8.0, 9.0, 8.0, 9.0]]);
+	}
+	drop(std::fs::remove_dir_all(scratch));
+	Ok(())
+}

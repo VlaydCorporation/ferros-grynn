@@ -31,6 +31,8 @@ const NULL_FRACTION: usize = 64;
 const BUCKET_COUNT: usize = 68;
 const RESERVED: usize = 70;
 const OFFSETS: usize = 72;
+const GEOMETRY_POPULATION: usize = 72;
+const GEOMETRY_OFFSETS: usize = 80;
 const EXACT_PRECISION: u8 = 0;
 const APPROXIMATE_PRECISION: u8 = 12;
 
@@ -38,8 +40,22 @@ pub(in crate::storage) fn encode_property_statistics(
 	histograms: &BTreeMap<PropertyHistogramKey, PropertyHistogram>,
 	page_lsn: PageLsn,
 ) -> FerrosGrynnResult<Vec<AlignedPage>> {
-	let mut pages = Vec::new();
+	let capacity = histograms.values().try_fold(0_usize, |total, histogram| {
+		validate_histogram(histogram)?;
+		total
+			.checked_add(if histogram.type_tag == 0x27 {
+				histogram.mbr_sample.len().div_ceil(509).max(1)
+			} else {
+				1
+			})
+			.ok_or_else(|| invalid("property statistics page count overflows"))
+	})?;
+	let mut pages = Vec::with_capacity(capacity);
 	for (key, histogram) in histograms {
+		if histogram.type_tag == 0x27 {
+			encode_geometry_sample(&mut pages, page_lsn, *key, histogram)?;
+			continue;
+		}
 		let page_no = checked_page_no(pages.len(), 0, "property statistics")?;
 		if let Some(page) = encode_page(page_no, page_lsn, *key, histogram)? {
 			pages.push(page);
@@ -67,17 +83,109 @@ where
 {
 	let count = usize::try_from(page_count)
 		.map_err(|_error| invalid("property statistics page count exceeds usize"))?;
-	let mut result = BTreeMap::new();
+	let mut result = BTreeMap::<PropertyHistogramKey, PropertyHistogram>::new();
+	let mut geometry_counts = BTreeMap::new();
 	let mut page = AlignedPage::zeroed();
 	for index in 0..count {
 		let page_no = checked_page_no(index, 0, "property statistics")?;
 		read_page(page_no, &mut page)?;
 		let (key, histogram) = decode_page(&page, page_no)?;
+		if histogram.type_tag == 0x27 {
+			let ordinal = usize::from(read_u16(page.as_bytes(), RESERVED));
+			let expected = usize::try_from(read_u64(page.as_bytes(), DISTINCT_COUNT))
+				.map_err(|_| invalid("geometry sample count exceeds usize"))?;
+			if expected > 1024
+				|| ordinal >= expected.div_ceil(509).max(1)
+				|| histogram.mbr_sample.len() != expected.saturating_sub(ordinal * 509).min(509)
+			{
+				return Err(invalid(
+					"geometry sample exceeds its bound or has an incomplete chunk",
+				));
+			}
+			if let Some(previous) = result.get_mut(&key) {
+				if ordinal == 0
+					|| previous.type_tag != 0x27
+					|| ordinal * 509 != previous.mbr_sample.len()
+					|| previous.sample_count != histogram.sample_count
+					|| previous.mbr_population != histogram.mbr_population
+					|| previous.null_fraction != histogram.null_fraction
+					|| geometry_counts.get(&key) != Some(&expected)
+					|| previous
+						.mbr_sample
+						.len()
+						.checked_add(histogram.mbr_sample.len())
+						.is_none_or(|length| length > expected)
+				{
+					return Err(invalid("inconsistent geometry sample continuation"));
+				}
+				previous.mbr_sample.extend(histogram.mbr_sample);
+			} else {
+				if ordinal != 0 || histogram.mbr_sample.len() > expected {
+					return Err(invalid("invalid geometry sample root"));
+				}
+				geometry_counts.insert(key, expected);
+				result.insert(key, histogram);
+			}
+			continue;
+		}
 		if result.insert(key, histogram).is_some() {
 			return Err(invalid_page(page_no, "duplicate property histogram"));
 		}
 	}
+	for (key, expected) in geometry_counts {
+		if result.get(&key).is_none_or(|histogram| histogram.mbr_sample.len() != expected) {
+			return Err(invalid("truncated geometry sample"));
+		}
+	}
 	Ok(result)
+}
+
+/// Stores the bounded sample in final aligned slots, with checked continuation
+/// ordinals.
+fn encode_geometry_sample(
+	pages: &mut Vec<AlignedPage>,
+	page_lsn: PageLsn,
+	key: PropertyHistogramKey,
+	histogram: &PropertyHistogram,
+) -> FerrosGrynnResult<()> {
+	validate_histogram(histogram)?;
+	let start = pages.len();
+	let count = histogram.mbr_sample.len().div_ceil(509).max(1);
+	pages.try_reserve_exact(count).map_err(|cause| {
+		invalid("geometry statistics allocation failed").with_technical_source(cause)
+	})?;
+	pages.resize_with(start + count, AlignedPage::zeroed);
+	for ordinal in 0..count {
+		let page_no = checked_page_no(start + ordinal, 0, "geometry statistics")?;
+		let page = &mut pages[start + ordinal];
+		page.reset(PageType::PropertyHistogram, PageFlags::empty(), page_lsn, page_no);
+		let bytes = page.as_bytes_mut();
+		write_u32(bytes, CLASS_ID, key.class_id.get());
+		write_u32(bytes, FIELD_ID, key.field_id.get());
+		if let StatisticsScope::Effective {
+			graph,
+		} = key.scope
+		{
+			bytes[SCOPE_KIND] = 1;
+			write_u64(bytes, SCOPE_GRAPH, graph.get());
+		}
+		bytes[VALUE_TYPE] = 0x27;
+		write_u32(bytes, SAMPLE_COUNT, histogram.sample_count);
+		write_u64(bytes, DISTINCT_COUNT, histogram.mbr_sample.len() as u64);
+		write_u64(bytes, GEOMETRY_POPULATION, histogram.mbr_population);
+		write_u32(bytes, NULL_FRACTION, histogram.null_fraction.to_bits());
+		let chunk = &histogram.mbr_sample[(ordinal * 509).min(histogram.mbr_sample.len())
+			..((ordinal + 1) * 509).min(histogram.mbr_sample.len())];
+		write_u16(bytes, BUCKET_COUNT, chunk.len() as u16);
+		write_u16(bytes, RESERVED, ordinal as u16);
+		for (slot, mbr) in chunk.iter().enumerate() {
+			for (axis, value) in mbr.iter().enumerate() {
+				write_u64(bytes, GEOMETRY_OFFSETS + slot * 32 + axis * 8, value.to_bits());
+			}
+		}
+		page.seal()?;
+	}
+	Ok(())
 }
 
 fn encode_page(
@@ -184,6 +292,44 @@ fn decode_page(
 	if bytes[HLL_PRECISION] != expected_precision {
 		return Err(invalid_page(page_no, "property histogram HLL precision is invalid"));
 	}
+	if bytes[VALUE_TYPE] == 0x27 {
+		let count = usize::from(read_u16(bytes, BUCKET_COUNT));
+		if count > 509 || method != HistogramMethod::Exact {
+			return Err(invalid("invalid geometry sample page"));
+		}
+		let mut mbr_sample = Vec::with_capacity(count);
+		for slot in 0..count {
+			let mbr = std::array::from_fn(|axis| {
+				f64::from_bits(read_u64(bytes, GEOMETRY_OFFSETS + slot * 32 + axis * 8))
+			});
+			crate::storage::geometry_index::validate_mbr(mbr)?;
+			mbr_sample.push(mbr);
+		}
+		validate_zero(
+			&bytes[GEOMETRY_OFFSETS + count * 32..],
+			page_no,
+			"geometry sample trailing bytes",
+		)?;
+		let histogram = PropertyHistogram {
+			type_tag: 0x27,
+			method,
+			sample_count: read_u32(bytes, SAMPLE_COUNT),
+			distinct_count: 0,
+			null_fraction: f32::from_bits(read_u32(bytes, NULL_FRACTION)),
+			buckets: Vec::new(),
+			mbr_sample,
+			mbr_population: read_u64(bytes, GEOMETRY_POPULATION),
+		};
+		validate_histogram(&histogram)?;
+		return Ok((
+			PropertyHistogramKey {
+				class_id,
+				field_id,
+				scope,
+			},
+			histogram,
+		));
+	}
 	validate_zero(&bytes[RESERVED..OFFSETS], page_no, "property histogram reserved bytes")?;
 	let count = usize::from(read_u16(bytes, BUCKET_COUNT));
 	if count > HISTOGRAM_BUCKETS {
@@ -247,6 +393,8 @@ fn decode_page(
 		distinct_count: read_u64(bytes, DISTINCT_COUNT),
 		null_fraction: f32::from_bits(read_u32(bytes, NULL_FRACTION)),
 		buckets,
+		mbr_sample: Vec::new(),
+		mbr_population: 0,
 	};
 	validate_histogram(&histogram)?;
 	Ok((
@@ -260,6 +408,22 @@ fn decode_page(
 }
 
 fn validate_histogram(histogram: &PropertyHistogram) -> FerrosGrynnResult<()> {
+	if histogram.mbr_sample.len() > 1024
+		|| (histogram.type_tag != 0x27
+			&& (!histogram.mbr_sample.is_empty() || histogram.mbr_population != 0))
+		|| (histogram.type_tag == 0x27
+			&& (!histogram.buckets.is_empty()
+				|| histogram.distinct_count != 0
+				|| histogram.method != HistogramMethod::Exact
+				|| histogram.mbr_population > u64::from(histogram.sample_count)
+				|| histogram.mbr_sample.len() as u64 > histogram.mbr_population
+				|| (histogram.mbr_population == 0) != histogram.mbr_sample.is_empty()))
+	{
+		return Err(invalid("geometry sample metadata is invalid"));
+	}
+	for mbr in &histogram.mbr_sample {
+		crate::storage::geometry_index::validate_mbr(*mbr)?;
+	}
 	let bucket_ndv = histogram.buckets.iter().try_fold(0_u64, |sum, bucket| {
 		if bucket.lower > bucket.upper
 			|| bucket.frequency == 0

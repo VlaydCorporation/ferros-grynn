@@ -13,4 +13,11 @@ degree, label и property части читаются независимо и л
 - Degree/property histograms заменяются только полным bulk scan и могут быть
   устаревшими; это влияет лишь на качество будущего плана.
 - Границы property buckets используют order-preserving codec из `values`.
+- Geometry distribution хранит до 1024 MBR и отдельную nonempty population;
+  bulk ANALYZE учитывает BASE/EFFECTIVE overlays. Sample не меняет query correctness.
+- ANALYZE использует общий `math::HyperLogLog`, как Neighbourhood SKETCH. Hash domain
+  задаёт consumer; merge допускается только при одинаковой precision/domain.
 - Любые счётчики и размеры проверяются до allocation или арифметики адресов.
+- Topology replacement меняет exact node-incidence totals в общей delta. После
+  delete conservative degree maximum ограничен новым exact total; ANALYZE
+  восстанавливает exact maximum и distributions.

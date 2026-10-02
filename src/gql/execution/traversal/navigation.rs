@@ -147,7 +147,9 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 			],
 			_ => &[],
 		};
-		let candidates = if let Some(physical) = self.read.physical_traversal_candidates(
+		let candidates = if source.atom.kind() == Some(AtomKind::Edge) && !self.atom_semantics {
+			Vec::new()
+		} else if let Some(physical) = self.read.physical_traversal_candidates(
 			self.snapshot,
 			occurrence.graph(),
 			source.atom,
@@ -235,7 +237,17 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		source: BoundAtom,
 		directions: &[crate::syn::MatchDirection],
 	) -> FerrosGrynnResult<Option<Vec<ScopedTraversalCandidate>>> {
-		let index = if let Some(index) = self.local_indexes.get(&source.graph) {
+		let endpoint_index = if source.atom.kind() == Some(AtomKind::Edge) && self.atom_semantics {
+			let reference = self.read.graph_reference(self.snapshot, source.graph)?;
+			let graph = self.read.graph(self.snapshot, &reference)?;
+			TraversalIndex::for_edge_endpoint(&graph, &EdgeEndpoint::Local(source.atom))?
+				.map(Rc::new)
+		} else {
+			None
+		};
+		let index = if let Some(index) = endpoint_index {
+			Some(index)
+		} else if let Some(index) = self.local_indexes.get(&source.graph) {
 			index.clone()
 		} else {
 			let reference = self.read.graph_reference(self.snapshot, source.graph)?;
@@ -556,10 +568,10 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		direction: PathDirection,
 		role: EndpointRole,
 	) -> FerrosGrynnResult<()> {
-		if !self.path_tracking {
+		if !self.path_tracking && self.custom_cost.is_none() {
 			return Ok(());
 		}
-		if traverser.trace.is_none() {
+		if self.path_tracking && traverser.trace.is_none() {
 			let (origin, snapshot) = {
 				let graph = self.read.graph(self.snapshot, source.graph())?;
 				(graph.identity(), graph.snapshot_id())
@@ -572,7 +584,27 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 			traverser.trace_origin = Some(origin);
 			traverser.trace_snapshot = Some(snapshot);
 		}
-		let weight = self.edge_weight(&edge)?;
+		let weight = if let Some(cost) = self.custom_cost {
+			let fields = MatchGraphFields::new(
+				&*self.read,
+				self.snapshot,
+				self.read.property_dictionary(self.snapshot),
+				Arc::new(edge.graph().clone()),
+			);
+			custom_path_contribution(
+				cost,
+				edge.clone(),
+				traverser.trace_cost,
+				MatchPredicateContext {
+					slots: self.slots,
+					source: self.source,
+					fields: &fields,
+				},
+				self.control,
+			)?
+		} else {
+			self.edge_weight(&edge)?
+		};
 		traverser.trace_cost = match binary(
 			BinaryOperator::Add,
 			Value::Number(traverser.trace_cost),
@@ -585,6 +617,9 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 				));
 			}
 		};
+		if !self.path_tracking {
+			return Ok(());
+		}
 		traverser.trace = Some(self.push_trace_node(
 			traverser.trace,
 			PathStep::new(target, Some(edge), direction, role),

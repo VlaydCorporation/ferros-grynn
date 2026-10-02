@@ -666,6 +666,17 @@ pub trait GraphRead {
 	}
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>>;
 	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>>;
+	/// Returns exact connector identities for a qualified edge endpoint when
+	/// indexed.
+	///
+	/// # Errors
+	/// Returns snapshot, incidence, or resource errors from the graph reader.
+	fn edge_endpoint_connectors(
+		&self,
+		_endpoint: &crate::graph::EdgeEndpoint,
+	) -> FerrosGrynnResult<Option<Vec<AtomId>>> {
+		Ok(None)
+	}
 	fn node(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Node<'_>>>;
 	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>>;
 

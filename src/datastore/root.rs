@@ -41,6 +41,14 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) atoms: Arc<AtomStoreRoot>,
 	pub(crate) indexes: Arc<IndexStoreRoot>,
 	pub(crate) statistics: Arc<StatisticsStore>,
+	/// Immutable geometry page generations retained by RAM snapshots.
+	pub(crate) resident_geometry: Arc<BTreeMap<IndexId, crate::storage::ResidentGeometryIndex>>,
+	/// Immutable graph artifacts retained by the exact logical snapshot.
+	pub(crate) reachability_artifacts: Arc<BTreeMap<IndexId, Arc<super::ReachabilityArtifact>>>,
+	/// Immutable neighbourhood projections retained by the logical snapshot.
+	pub(crate) neighbourhood_artifacts: Arc<BTreeMap<IndexId, Arc<super::NeighbourhoodArtifact>>>,
+	/// Immutable directed landmark tables retained by the logical snapshot.
+	pub(crate) path_artifacts: Arc<BTreeMap<IndexId, Arc<super::LandmarkPathArtifact>>>,
 	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphRoot>>,
 	pub(crate) versions: Arc<BTreeMap<ConflictKey, u64>>,
 }
@@ -110,6 +118,10 @@ impl Default for DatabaseRoot {
 			atoms: Arc::new(AtomStoreRoot::default()),
 			indexes: Arc::new(IndexStoreRoot::default()),
 			statistics: Arc::new(StatisticsStore::default()),
+			resident_geometry: Arc::new(BTreeMap::new()),
+			reachability_artifacts: Arc::new(BTreeMap::new()),
+			neighbourhood_artifacts: Arc::new(BTreeMap::new()),
+			path_artifacts: Arc::new(BTreeMap::new()),
 			graphs: BTreeMap::new(),
 			versions: Arc::new(BTreeMap::new()),
 		}
@@ -117,6 +129,19 @@ impl Default for DatabaseRoot {
 }
 
 impl DatabaseRoot {
+	/// Checks geometry constraints owned by a published class in one scope.
+	fn validate_geometry_values<'value>(
+		&self,
+		class: ClassId,
+		scope: super::IndexScope,
+		value: impl FnMut(PropertyKeyId) -> Option<&'value Value>,
+	) -> FerrosGrynnResult<()> {
+		if let Some(class) = self.schema.class_by_id(class) {
+			class.validate_geometry_values(scope, value)?;
+		}
+		Ok(())
+	}
+
 	/// Excludes every ready deferred user index from planning after a data
 	/// mutation and returns every affected deferred definition.
 	///
@@ -256,6 +281,21 @@ impl DatabaseRoot {
 					})
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let class = self.schema.class_by_id(after.class_id());
+		if let Some(class) = &class {
+			class.validate_geometry_values(super::IndexScope::Base, |key| {
+				after.properties().get(key)
+			})?;
+		}
+		for (graph, occurrence) in &memberships {
+			self.validate_geometry_values(
+				after.class_id(),
+				super::IndexScope::Effective {
+					graph: *graph,
+				},
+				|key| occurrence.effective_value(after.properties().get(key), key),
+			)?;
+		}
 		let mut context = index_context(&self.schema, &self.dictionary)?;
 		let prepared =
 			self.indexes.prepare_base_replace(&before, &after, &memberships, &mut context)?;
@@ -278,6 +318,9 @@ impl DatabaseRoot {
 		self.indexes = Arc::new(indexes);
 		self.atoms = Arc::new(atoms);
 		self.statistics = Arc::new(statistics);
+		if before != after {
+			self.invalidate_path_cost_artifacts(None, false);
+		}
 		Ok(previous)
 	}
 
@@ -508,6 +551,9 @@ impl DatabaseRoot {
 			}
 			super::MaintenanceTarget::Index {
 				..
+			}
+			| super::MaintenanceTarget::GraphIndex {
+				..
 			} => {
 				return Err(FerrosGrynnError::invalid_argument(
 					"ANALYZE does not accept an index maintenance target",
@@ -673,6 +719,13 @@ impl DatabaseRoot {
 			.cloned()
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
 		let mut context = index_context(&self.schema, &self.dictionary)?;
+		self.validate_geometry_values(
+			atom.class_id(),
+			super::IndexScope::Effective {
+				graph,
+			},
+			|key| atom.properties().get(key),
+		)?;
 		let prepared = self.indexes.prepare_occurrence_insert(graph, &atom, &mut context)?;
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.insert_fresh_occurrence(graph, &atom, label.as_ref(), None)?;
@@ -683,6 +736,7 @@ impl DatabaseRoot {
 		})?;
 		Arc::make_mut(&mut self.indexes).apply_occurrence_insert(graph, &occurrence, prepared)?;
 		self.statistics = Arc::new(statistics);
+		self.invalidate_relation_artifacts(graph);
 		Ok(local)
 	}
 
@@ -700,6 +754,13 @@ impl DatabaseRoot {
 			.cloned()
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
 		let mut context = index_context(&self.schema, &self.dictionary)?;
+		self.validate_geometry_values(
+			atom.class_id(),
+			super::IndexScope::Effective {
+				graph,
+			},
+			|key| atom.properties().get(key),
+		)?;
 		let prepared = self.indexes.prepare_occurrence_insert(graph, &atom, &mut context)?;
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.insert_fresh_occurrence(graph, &atom, label.as_ref(), None)?;
@@ -710,6 +771,7 @@ impl DatabaseRoot {
 		})?;
 		Arc::make_mut(&mut self.indexes).apply_occurrence_insert(graph, &occurrence, prepared)?;
 		self.statistics = Arc::new(statistics);
+		self.invalidate_relation_artifacts(graph);
 		Ok(())
 	}
 
@@ -728,6 +790,13 @@ impl DatabaseRoot {
 			.cloned()
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
 		let mut context = index_context(&self.schema, &self.dictionary)?;
+		self.validate_geometry_values(
+			atom.class_id(),
+			super::IndexScope::Effective {
+				graph,
+			},
+			|key| atom.properties().get(key),
+		)?;
 		let prepared = self.indexes.prepare_occurrence_insert(graph, &atom, &mut context)?;
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.insert_fresh_occurrence(graph, &atom, label.as_ref(), Some(&topology))?;
@@ -744,6 +813,7 @@ impl DatabaseRoot {
 		})?;
 		Arc::make_mut(&mut self.indexes).apply_occurrence_insert(graph, &occurrence, prepared)?;
 		self.statistics = Arc::new(statistics);
+		self.invalidate_relation_artifacts(graph);
 		Ok(local)
 	}
 
@@ -763,6 +833,13 @@ impl DatabaseRoot {
 			.cloned()
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
 		let mut context = index_context(&self.schema, &self.dictionary)?;
+		self.validate_geometry_values(
+			atom.class_id(),
+			super::IndexScope::Effective {
+				graph,
+			},
+			|key| atom.properties().get(key),
+		)?;
 		let prepared = self.indexes.prepare_occurrence_insert(graph, &atom, &mut context)?;
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.insert_fresh_occurrence(graph, &atom, label.as_ref(), Some(&topology))?;
@@ -780,6 +857,7 @@ impl DatabaseRoot {
 		})?;
 		Arc::make_mut(&mut self.indexes).apply_occurrence_insert(graph, &occurrence, prepared)?;
 		self.statistics = Arc::new(statistics);
+		self.invalidate_relation_artifacts(graph);
 		Ok(())
 	}
 
@@ -802,6 +880,13 @@ impl DatabaseRoot {
 			.cloned()
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
 		let mut context = index_context(&self.schema, &self.dictionary)?;
+		self.validate_geometry_values(
+			atom.class_id(),
+			super::IndexScope::Effective {
+				graph,
+			},
+			|key| atom.properties().get(key),
+		)?;
 		let prepared = self.indexes.prepare_occurrence_insert(graph, &atom, &mut context)?;
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.insert_fresh_occurrence(graph, &atom, label.as_ref(), Some(&topology))?;
@@ -819,6 +904,7 @@ impl DatabaseRoot {
 		})?;
 		Arc::make_mut(&mut self.indexes).apply_occurrence_insert(graph, &occurrence, prepared)?;
 		self.statistics = Arc::new(statistics);
+		self.invalidate_relation_artifacts(graph);
 		Ok(())
 	}
 
@@ -859,6 +945,7 @@ impl DatabaseRoot {
 		if removed.is_some() {
 			Arc::make_mut(&mut self.atoms).remove_membership(global, graph);
 			self.statistics = Arc::new(statistics);
+			self.invalidate_relation_artifacts(graph);
 		}
 		Ok(removed)
 	}
@@ -983,14 +1070,58 @@ impl DatabaseRoot {
 		})?;
 		let mut after = before.clone();
 		change(&mut after);
+		let cost_changed = before != after;
+		let weight_changed = matches!((before.state(), after.state()), (OccurrenceState::Edge { weight: before, .. }, OccurrenceState::Edge { weight: after, .. }) if before != after);
+		let class = self.schema.class_by_id(atom.class_id());
+		let relation_changed = before.label() != after.label() && local.is_edge()
+			|| match (before.state(), after.state()) {
+				(
+					OccurrenceState::Edge {
+						topology: before,
+						transition_graph: before_graph,
+						..
+					},
+					OccurrenceState::Edge {
+						topology: after,
+						transition_graph: after_graph,
+						..
+					},
+				) => before != after || before_graph != after_graph,
+				(
+					OccurrenceState::Node {
+						nested_graph: before,
+					},
+					OccurrenceState::Node {
+						nested_graph: after,
+					},
+				) => before != after,
+				_ => true,
+			};
+		if let Some(class) = &class {
+			class.validate_geometry_values(
+				super::IndexScope::Effective {
+					graph,
+				},
+				|key| after.effective_value(atom.properties().get(key), key),
+			)?;
+		}
 		let mut context = index_context(&self.schema, &self.dictionary)?;
 		let prepared =
 			self.indexes.prepare_occurrence_replace(graph, &atom, &before, &after, &mut context)?;
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.replace_occurrence(graph, &atom, &before, &after)?;
 		Arc::make_mut(&mut self.indexes).apply_replace(prepared)?;
-		*self.occurrence_mut(graph, local)? = after;
+		self.graph_mut(graph)?.replace_occurrence(after);
 		self.statistics = Arc::new(statistics);
+		if relation_changed {
+			self.invalidate_relation_artifacts(graph);
+		}
+		if cost_changed {
+			self.invalidate_path_cost_artifacts(None, false);
+		}
+		if weight_changed {
+			self.invalidate_path_cost_artifacts(Some(graph), true);
+		}
 		Ok(())
 	}
 
@@ -1017,6 +1148,75 @@ impl DatabaseRoot {
 			.get_mut(&graph)
 			.map(Arc::make_mut)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))
+	}
+
+	/// Excludes graph relation artifacts after a successful relation
+	/// mutation.
+	fn invalidate_relation_artifacts(&mut self, graph: GraphId) {
+		let Some(schema) = self.schema.graph(graph) else {
+			return;
+		};
+		if !schema.indexes().any(|index| {
+			index.state() == ClassIndexState::Ready
+				&& !index.is_on_demand()
+				&& matches!(
+					index.definition(),
+					super::GraphIndexDefinition::Reachability { .. }
+						| super::GraphIndexDefinition::Neighbourhood { .. }
+						| super::GraphIndexDefinition::Path { .. }
+				)
+		}) {
+			return;
+		}
+		if let Some(schema) = Arc::make_mut(&mut self.schema).graphs.get_mut(&graph) {
+			for index in &mut Arc::make_mut(schema).indexes {
+				if !index.is_on_demand()
+					&& matches!(
+						index.definition(),
+						super::GraphIndexDefinition::Reachability { .. }
+							| super::GraphIndexDefinition::Neighbourhood { .. }
+							| super::GraphIndexDefinition::Path { .. }
+					) {
+					index.state = ClassIndexState::Stale;
+					if let Some(id) = index.id() {
+						Arc::make_mut(&mut self.reachability_artifacts).remove(&id);
+						Arc::make_mut(&mut self.neighbourhood_artifacts).remove(&id);
+						Arc::make_mut(&mut self.path_artifacts).remove(&id);
+					}
+				}
+			}
+		}
+	}
+
+	/// Excludes cost-dependent artifacts in the same private root. PURE
+	/// functions may reference other records, so property changes
+	/// conservatively cover all graphs.
+	fn invalidate_path_cost_artifacts(&mut self, graph: Option<GraphId>, weighted: bool) {
+		if self.path_artifacts.is_empty() {
+			return;
+		}
+		let catalog = Arc::make_mut(&mut self.schema);
+		for (id, definition) in &mut catalog.graphs {
+			if graph.is_some_and(|selected| selected != *id) {
+				continue;
+			}
+			let relevant = |index: &super::GraphIndex| {
+				index.state() == ClassIndexState::Ready
+					&& !index.is_on_demand()
+					&& matches!(index.definition(), super::GraphIndexDefinition::Path { cost, .. } if if weighted { *cost == super::GraphIndexCost::Weighted } else { matches!(cost, super::GraphIndexCost::Function { .. }) })
+			};
+			if !definition.indexes().any(relevant) {
+				continue;
+			}
+			for index in &mut Arc::make_mut(definition).indexes {
+				if relevant(index) {
+					index.state = ClassIndexState::Stale;
+					if let Some(id) = index.id() {
+						Arc::make_mut(&mut self.path_artifacts).remove(&id);
+					}
+				}
+			}
+		}
 	}
 
 	fn occurrence_mut(

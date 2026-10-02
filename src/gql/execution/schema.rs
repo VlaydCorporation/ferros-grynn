@@ -110,6 +110,28 @@ pub(super) fn execute_schema(
 			*maintenance,
 			*concurrently,
 		),
+		LogicalSchemaStatement::DefineGraphIndex {
+			mode,
+			graph,
+			index,
+			..
+		} => {
+			let schemas = transaction.graphs()?;
+			let schema = schemas
+				.iter()
+				.find(|schema| schema.name().as_str() == graph.as_ref())
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.as_ref()))?;
+			let exists = schema.indexes().any(|old| old.name() == index.name());
+			if *mode == DefinitionMode::IfNotExists && exists {
+				return Ok(Value::None);
+			}
+			if *mode == DefinitionMode::Overwrite && exists {
+				transaction.overwrite_graph_index(graph, index.clone())?;
+			} else {
+				transaction.define_graph_index(graph, index.clone())?;
+			}
+			Ok(Value::None)
+		}
 		LogicalSchemaStatement::DefineAnalyzer {
 			mode,
 			analyzer,
@@ -171,6 +193,21 @@ pub(super) fn execute_schema(
 			class,
 			name,
 		} => remove_index(transaction, *if_exists, class, name),
+		LogicalSchemaStatement::RemoveGraphIndex {
+			if_exists,
+			graph,
+			name,
+		} => {
+			let exists = transaction.graphs()?.iter().any(|schema| {
+				schema.name().as_str() == graph.as_ref()
+					&& schema.indexes().any(|index| index.name().as_str() == name.as_ref())
+			});
+			if !exists && *if_exists {
+				return Ok(Value::None);
+			}
+			transaction.remove_graph_index(graph, name)?;
+			Ok(Value::None)
+		}
 		LogicalSchemaStatement::RemoveParameter {
 			if_exists,
 			name,
@@ -264,6 +301,34 @@ pub(super) fn execute_schema(
 			class,
 			name,
 		} => info_index(transaction, class, name),
+		LogicalSchemaStatement::InfoGraphIndex {
+			graph,
+			name,
+		} => {
+			let schemas = transaction.graphs()?;
+			let schema = schemas
+				.iter()
+				.find(|schema| schema.name().as_str() == graph.as_ref())
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.as_ref()))?;
+			if name.as_ref() == "edge_endpoint"
+				&& let Some(index) = schema.edge_endpoint_index()
+			{
+				let mut info = Object::default();
+				info.insert("id", Value::from(u64::from(index.id().get())));
+				info.insert("version", Value::from(u64::from(index.version().get())));
+				info.insert("graph", Value::from(schema.id().get()));
+				info.insert("kind", Value::from("EDGE_ENDPOINT"));
+				info.insert("system", Value::Bool(true));
+				info.insert("state", Value::from("READY"));
+				info.insert("maintenance", Value::from("IMMEDIATE"));
+				return Ok(Value::Object(info));
+			}
+			let index = schema
+				.indexes()
+				.find(|index| index.name().as_str() == name.as_ref())
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("graph index is absent"))?;
+			graph_index_info(index)
+		}
 		LogicalSchemaStatement::InfoParameter {
 			name,
 		} => info_parameter(transaction, name),
@@ -600,6 +665,17 @@ fn define_index(
 		ClassIndexOptions::Scalar => {
 			ClassIndex::new(name, kind, scope, fields.iter().map(Box::as_ref))?
 		}
+		ClassIndexOptions::Geometry(options) => ClassIndex::new_geometry(
+			name,
+			scope,
+			fields
+				.first()
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("Geometry index field is absent")
+				})?
+				.as_ref(),
+			options,
+		)?,
 		ClassIndexOptions::Fulltext(options) => {
 			ClassIndex::new_fulltext(name, scope, only_index_field(fields)?, options)?
 		}
@@ -1071,6 +1147,126 @@ fn info_class(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Va
 	])))
 }
 
+/// Projects logical graph definitions without exposing physical binding
+/// addresses.
+fn graph_index_info(index: &crate::datastore::GraphIndex) -> FerrosGrynnResult<Value> {
+	use crate::datastore::{
+		GraphIndexCost,
+		GraphIndexDefinition,
+		NeighbourhoodAlgorithm,
+		PathIndexAlgorithm,
+		ReachabilityAlgorithm,
+	};
+	let (kind, algorithm, parameter, radius, cost, patterns) = match index.definition() {
+		GraphIndexDefinition::Reachability {
+			algorithm,
+		} => {
+			let (name, parameter) = match algorithm {
+				ReachabilityAlgorithm::Auto => ("AUTO", 0),
+				ReachabilityAlgorithm::TreeCover => ("TREE_COVER", 0),
+				ReachabilityAlgorithm::Grail(value) => ("GRAIL", u64::from(*value)),
+				ReachabilityAlgorithm::Ferrari(value) => ("FERRARI", u64::from(*value)),
+				ReachabilityAlgorithm::Bfl(value) => ("BFL", u64::from(*value)),
+				ReachabilityAlgorithm::ChainCover => ("CHAIN_COVER", 0),
+				ReachabilityAlgorithm::OnDemand => ("ON_DEMAND", 0),
+			};
+			("REACHABILITY", name, parameter, 0, GraphIndexCost::Hop, &[][..])
+		}
+		GraphIndexDefinition::Neighbourhood {
+			radius,
+			algorithm,
+		} => {
+			let (name, parameter) = match algorithm {
+				NeighbourhoodAlgorithm::Auto => ("AUTO", 0),
+				NeighbourhoodAlgorithm::Exact => ("EXACT", 0),
+				NeighbourhoodAlgorithm::Sketch(value) => ("SKETCH", u64::from(*value)),
+				NeighbourhoodAlgorithm::Landmark(value) => ("LANDMARK", u64::from(*value)),
+				NeighbourhoodAlgorithm::OnDemand => ("ON_DEMAND", 0),
+			};
+			("NEIGHBOURHOOD", name, parameter, u64::from(*radius), GraphIndexCost::Hop, &[][..])
+		}
+		GraphIndexDefinition::Path {
+			algorithm,
+			cost,
+			patterns,
+		} => {
+			let (name, parameter) = match algorithm {
+				PathIndexAlgorithm::LandmarkSssp(value) => ("LANDMARK_SSSP", u64::from(*value)),
+				PathIndexAlgorithm::PatternCache => ("PATTERN_CACHE", 0),
+				PathIndexAlgorithm::OnDemand => ("ON_DEMAND", 0),
+			};
+			("PATH", name, parameter, 0, *cost, patterns.as_slice())
+		}
+	};
+	let cost = match cost {
+		GraphIndexCost::Hop => Value::from("HOP"),
+		GraphIndexCost::Weighted => Value::from("WEIGHTED"),
+		GraphIndexCost::Function {
+			function,
+			version,
+		} => Value::from(Object::from_iter([
+			("function_id", Value::from(u64::from(function.get()))),
+			("version", Value::from(u64::from(version.get()))),
+		])),
+	};
+	Ok(Value::from(Object::from_iter([
+		("name", Value::from(index.name().clone())),
+		("id", index.id().map_or(Value::None, |id| Value::from(u64::from(id.get())))),
+		("version", Value::from(u64::from(index.version().get()))),
+		("graph_id", index.graph().map_or(Value::None, |id| Value::from(id.get()))),
+		("kind", Value::from(kind)),
+		("algorithm", Value::from(algorithm)),
+		("parameter", Value::from(parameter)),
+		("radius", Value::from(radius)),
+		(
+			"mode",
+			Value::from(match index.mode() {
+				crate::graph::TraversalSemantics::Node => "NODE",
+				crate::graph::TraversalSemantics::Atom => "ATOM",
+			}),
+		),
+		(
+			"direction",
+			Value::from(match index.direction() {
+				crate::graph::TraversalDirection::Forward => "OUT",
+				crate::graph::TraversalDirection::Backward => "IN",
+				crate::graph::TraversalDirection::Both => "BOTH",
+			}),
+		),
+		("edges", Value::from(index.edge_labels().cloned().map(Value::from).collect::<Vec<_>>())),
+		("cost", cost),
+		("patterns", Value::from(patterns.iter().cloned().map(Value::from).collect::<Vec<_>>())),
+		(
+			"dependencies",
+			Value::from(
+				index
+					.dependencies()
+					.map(|(function, version)| {
+						Value::from(Object::from_iter([
+							("function_id", Value::from(u64::from(function.get()))),
+							("version", Value::from(u64::from(version.get()))),
+						]))
+					})
+					.collect::<Vec<_>>(),
+			),
+		),
+		("comment", index.comment().cloned().map_or(Value::None, Value::from)),
+		("max_bytes", index.max_bytes().map_or(Value::None, Value::from)),
+		("fingerprint", Value::from(index.fingerprint()?)),
+		("state", Value::from(index_state_name(index.state()))),
+		("system", Value::Bool(false)),
+		("query_visible", Value::Bool(index.state() == ClassIndexState::Ready)),
+		("build_revision", Value::from(index.build_revision())),
+		(
+			"maintenance",
+			Value::from(match index.maintenance_mode() {
+				IndexMaintenanceMode::Immediate => "immediate",
+				IndexMaintenanceMode::Deferred => "deferred",
+			}),
+		),
+	])))
+}
+
 fn info_index(transaction: &mut Transaction, class: &str, name: &str) -> FerrosGrynnResult<Value> {
 	let schema = require_class(transaction, class)?;
 	if matches!(name, "class" | "primary") {
@@ -1171,6 +1367,17 @@ fn system_index_info(class: &str, name: &str) -> Value {
 fn index_definition(class: &str, index: &ClassIndex, graphs: &[GraphSchema]) -> Value {
 	let body = match index.kind() {
 		ClassIndexKind::Count => "COUNT".to_owned(),
+		ClassIndexKind::Geometry => {
+			let field = index
+				.fields()
+				.next()
+				.map_or("<missing>".to_owned(), |field| quote_name(field.as_str()));
+			let kind = index
+				.geometry_options()
+				.and_then(|options| options.geometry_type())
+				.map_or(String::new(), |kind| format!(" TYPE {}", kind.as_str()));
+			format!("FIELDS {field} GEOMETRY{kind}")
+		}
 		ClassIndexKind::Standard | ClassIndexKind::Unique => {
 			let fields = index.fields().map(|field| quote_name(field.as_str())).collect::<Vec<_>>();
 			let unique = if index.kind() == ClassIndexKind::Unique {

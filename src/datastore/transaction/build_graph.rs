@@ -231,7 +231,7 @@ impl Transaction {
 			},
 		);
 		let create_root = existing.is_none();
-		let root_schema = if let Some(existing) = &existing {
+		let mut root_schema = if let Some(existing) = &existing {
 			existing.replace_definition(None, constraints, root_record)?
 		} else {
 			self.allocate_graph_schema(
@@ -293,6 +293,29 @@ impl Transaction {
 		graphs.push(self.prepare_built_graph(root_id, &source, &graph_ids)?);
 		for (identity, child) in &nested {
 			graphs.push(self.prepare_built_graph(graph_ids[identity], child, &graph_ids)?);
+		}
+		for built in &graphs {
+			if !built.edges.iter().any(|edge| edge.topology.edge_endpoint_sides().next().is_some())
+			{
+				continue;
+			}
+			let schema = if built.graph == root_id {
+				&mut root_schema
+			} else {
+				child_schemas
+					.iter_mut()
+					.find(|schema| schema.id() == built.graph)
+					.ok_or_else(|| invalid("built graph has no prepared schema"))?
+			};
+			if schema.edge_endpoint_index().is_none() {
+				let capability = crate::datastore::SystemIndex::new(
+					crate::datastore::IndexId::from_schema_id(
+						self.store.inner.allocate_schema_id()?,
+					),
+					crate::datastore::SystemIndexKind::EdgeEndpoint,
+				);
+				*schema = schema.clone().with_edge_endpoint_index(capability)?;
+			}
 		}
 		let mutation = InstallBuiltGraphTree {
 			root_schema,
@@ -436,7 +459,15 @@ impl Transaction {
 			.iter()
 			.filter(|(key, _cost)| !self.writes.contains_key(key))
 			.fold(0_usize, |bytes, (_key, cost)| bytes.saturating_add(*cost));
-		let payload_bytes = mutation.estimated_bytes();
+		let posting_bytes = mutation.graphs.iter().flat_map(|graph| &graph.edges).try_fold(
+			0_usize,
+			|bytes, edge| {
+				bytes
+					.checked_add(super::graph::endpoint_posting_write_bytes(&edge.topology)?)
+					.ok_or_else(|| self.limit_error(usize::MAX))
+			},
+		)?;
+		let payload_bytes = mutation.estimated_bytes().saturating_add(posting_bytes);
 		self.ensure_capacity(conflict_bytes.saturating_add(payload_bytes))?;
 		self.write_bytes = self.write_bytes.saturating_add(payload_bytes);
 		for (key, cost) in keys {

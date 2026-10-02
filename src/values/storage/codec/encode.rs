@@ -138,7 +138,10 @@ pub(super) fn encode_value(output: &mut Vec<u8>, value: &StorageValue) -> Ferros
 			}
 		}
 		StorageValue::Range(value) => encode_range(output, value)?,
-		StorageValue::Geometry(value) => encode_geometry(output, value)?,
+		StorageValue::Geometry(value) => {
+			value.validate()?;
+			encode_geometry(output, value)?;
+		}
 		StorageValue::Vector(value) => encode_vector(output, value)?,
 		StorageValue::AtomRef(value) => {
 			output.push(TypeTag::AtomRef.byte());

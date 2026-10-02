@@ -32,6 +32,57 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
 - Executor исполняет выбранные physical operators. Resource fallback допустим
   только внутри заранее выбранного семейства (например, in-memory hash join в
   partitioned hash join), но не как скрытый повторный planner.
+- `tv::kHopEstimate` выбирает только compatible Ready Neighbourhood SKETCH в physical planner.
+  Adapter проверяет captured binding и выполняет bounded exact NODE/ATOM fallback; обычный
+  `tv::kHop` не читает sketch. Metadata/PlanHash содержат logical identity/version/projection,
+  не physical pages. Bulk и seed inclusion сохраняются; private invalidation исключает artifact.
+- HOP/WEIGHT `LandmarkShortest` получает только logical generation metadata и Number bounds через
+  adapter. Exact bounded cursor сохраняет полные path states и canonical ties; улучшенный
+  prefix не блокируется visited-set. Unbound target и scoped paths используют exact fallback.
+  Ready metadata собирается только по PlannerDemand; binding/version/revision/projection
+  входят в PlanHash. WEIGHT completion bound округляется вниз и включает потери runtime
+  reduction на оставшихся шагах; terminal rows ждут proof против pending bounds, включая
+  zero-weight/canonical ties. Scoped weighted fallback использует тот же completion-bound
+  proof и сохраняет qualified target identity. MATCH `COST fn::name` использует
+  обычный versioned PURE evaluator: unary additive COST допускает compatible artifact,
+  `(edge, prefix:number)` возвращает вклад hop и остаётся ON_DEMAND. Prefix относится к
+  текущему segment. Global `IN GRAPH ... WITH COST` задаёт default linear connector segments;
+  local COST переопределяет его. Fixed Expand сохраняет edge aliases/uniqueness и вызывает
+  общий PURE contribution helper с нулевым segment prefix, включая scoped/hyper/AtomWalk.
+  Cost вычисляется и без path projection. Identity/version/stateful flag входят в PlanHash version 5.
+- `path::cost(path, fn::name)` использует общий versioned PURE COST resolver и contribution helper.
+  Перед property reads проверяются origin первого graph, snapshot и все qualified occurrences.
+  Stateful prefix начинается с нуля для всего Path; reduction потоковый и расходует один
+  expansion на connector. Standalone/SELECT/traversal closure получают тот же query reader/SSI.
+  Recursive static COST использует общую MAXDEPTH cycle validation и current/override resolution.
+  Одноаргументный stored cost сохраняет работу без живого snapshot.
+- `tv::shortestPath` сохраняет текущий NODE seed-local domain, в том числе внутри TRAVERSE ATOM.
+  Compatible Ready NODE/OUT/HOP artifact без labels ускоряет точную длину через reopening A*;
+  второй BFS сохраняет прежний FIFO/connector порядок равных путей. Runtime сверяет graph
+  scope binding; Stale/private/cross-level metadata ведёт к exact fallback. RecordId source/target
+  разрешаются одним membership resolver. Seed bulk сохраняется. Adjacency/frontier/batch
+  admission выполняется до роста соответствующих buffers; Path estimator включает steps и
+  public identifiers, shared references учитываются консервативно.
+- `tv::weightedShortestPath`/`distanceTo` используют Ready NODE/OUT/WEIGHT logical binding.
+  Shared Dijkstra сохраняет distance/node queue и первый равный predecessor. Strict ALT completion
+  refinement допускается только после all-edge validation и numeric proof, исключающего
+  немонотонные casts и masked arithmetic errors; иначе тот же loop работает полностью.
+  Adjacency, weights, bound cache, frontier и path reconstruction получают admission.
+- TRAVERSE `WITH COST` захватывает тот же versioned PURE key. Navigation сохраняет exact
+  traverser prefix без обязательного trace; custom weighted seed search начинает NODE segment
+  с prefix 0 и переиспользует full-state MATCH cursor с OUT incidence, включая undirected edges.
+  Mode/filters и canonical path ties сохраняются. Unary additive COST допускает compatible
+  NODE/OUT/function artifact; stateful всегда exact. Physical hash включает COST/constraints.
+  Bulk сравнивает numeric prefix representation, поскольку UDF может наблюдать тип/scale.
+- Canonical shortest cursors допускают hop/canonical extension перед allocation/cloning.
+  Общий helper использует fallible exact reserve; уже admitted state не начисляется повторно.
+  Identity heap estimator заимствует RecordId, не создавая временные boxed Values.
+- PURE physical builders читают occurrence/base fields из captured immutable root через
+  обычный typed evaluator; nested named calls сохраняют тот же field resolver.
+  Maintenance cancellation check наследуется child blocks/calls. Compiler/cache и initial
+  runtime frames получают admission до allocation/clone; growing collections/temporaries
+  остаются отдельным открытым resource gate.
+
 - Canonical rules не меняют bag semantics, LEFT/CROSS barriers, effective
   properties, порядок наблюдаемых ошибок и floating reduction order.
 - Forced index hint является контрактом: каждый указанный source использует

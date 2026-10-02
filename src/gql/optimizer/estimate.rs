@@ -141,6 +141,65 @@ fn estimate_expression(
 		let left = estimate_expression(select, snapshot, input, left, warnings);
 		return estimate_expression(select, snapshot, left, right, warnings);
 	}
+	if let Some(column) = spatial_column(expression)
+		&& let Some(query) = super::spatial_query(expression, column)
+		&& let Some(demand) = property_demand(select, column, None)
+		&& let Some(class) = snapshot.class(&demand.class)
+		&& let Some(field) =
+			class.fields.iter().find(|field| field.name.as_str() == demand.field.as_ref())
+	{
+		let key = PropertyHistogramKey {
+			class_id: class.id,
+			field_id: field.id,
+			scope: demand.scope,
+		};
+		let Some(histogram) = snapshot.property_histograms.get(&key) else {
+			warnings.push(PlanWarning::StatisticsMissing(
+				format!("{}.{} MBR sample", demand.class, demand.field).into(),
+			));
+			return conservative_fraction(input, 1, 3);
+		};
+		let meta = statistics_meta(snapshot, demand.scope);
+		if meta.revision != meta.analyzed_revision
+			&& meta.dirty_rows > input.upper.div_ceil(10).max(1024)
+		{
+			warnings.push(PlanWarning::StatisticsStale(
+				format!("{}.{} MBR sample", demand.class, demand.field).into(),
+			));
+			return conservative_fraction(input, 1, 3);
+		}
+		if let TypedExprKind::Constant(Value::Geometry(geometry)) = &query.kind
+			&& let Ok(Some(mbr)) = geometry.mbr()
+			&& !histogram.histogram.mbr_sample.is_empty()
+		{
+			let sample = &histogram.histogram.mbr_sample;
+			let hits = sample
+				.iter()
+				.filter(|candidate| {
+					candidate[0] <= mbr[2]
+						&& mbr[0] <= candidate[2]
+						&& candidate[1] <= mbr[3]
+						&& mbr[1] <= candidate[3]
+				})
+				.count() as u64;
+			let population = histogram.histogram.mbr_population;
+			let observations = u64::from(histogram.histogram.sample_count).max(1);
+			let expected = input
+				.expected
+				.saturating_mul(population)
+				.saturating_mul(hits)
+				.div_ceil(observations.saturating_mul(sample.len() as u64));
+			return Cardinality::new(
+				0,
+				expected,
+				expected
+					.saturating_mul(4)
+					.max(input.upper.div_ceil(sample.len() as u64))
+					.min(input.upper),
+			);
+		}
+		return conservative_fraction(input, 1, 3);
+	}
 	let Some((column, comparison, constant)) = scalar_column_comparison(expression) else {
 		return conservative_fraction(input, 1, 3);
 	};
@@ -205,6 +264,30 @@ fn estimate_expression(
 		expected.min(input.upper),
 		expected.saturating_mul(uncertainty).min(input.upper),
 	)
+}
+
+/// Locates candidate geometry columns; the shared proof checks polarity and
+/// independence.
+fn spatial_column(expression: &TypedExpr) -> Option<usize> {
+	let operands: &[&TypedExpr] = match &expression.kind {
+		TypedExprKind::Binary {
+			left,
+			right,
+			..
+		} => &[left, right],
+		TypedExprKind::Builtin {
+			arguments,
+			..
+		} if arguments.len() == 2 => &[&arguments[0], &arguments[1]],
+		_ => return None,
+	};
+	operands.iter().find_map(|operand| {
+		if let TypedExprKind::Column(column) = operand.kind {
+			Some(column)
+		} else {
+			None
+		}
+	})
 }
 
 fn scale_histogram_cardinality(
@@ -350,6 +433,8 @@ mod tests {
 	#[test]
 	fn equi_depth_boundaries_estimate_ranges_without_random_lookup_per_row() {
 		let histogram = PropertyHistogram {
+			mbr_sample: Vec::new(),
+			mbr_population: 0,
 			type_tag: 0,
 			method: HistogramMethod::Exact,
 			sample_count: 20,

@@ -5,6 +5,7 @@ use std::{num::NonZeroUsize, sync::Arc, time::Instant};
 use parking_lot::Mutex;
 
 use super::{
+	ClassIndexState,
 	Datastore,
 	JobId,
 	MaintenanceAnalyzeMode,
@@ -319,6 +320,40 @@ impl GqlSession {
 					Err(error) => result.result = Err(error),
 				}
 			}
+			if result.result.is_ok()
+				&& let StatementKind::DefineGraphIndex(definition) = &statement.kind
+				&& definition.concurrently
+			{
+				let ready =
+					self.store.schema_catalog().named_graph(&definition.graph.value).is_some_and(
+						|graph| {
+							graph.indexes().any(|index| {
+								index.name().as_str() == definition.name.value.as_ref()
+									&& index.state() == ClassIndexState::Ready
+							})
+						},
+					);
+				if !ready {
+					let owner = MaintenanceIndexOwner::Graph(definition.graph.clone());
+					match self.resolve_index_owner(&owner, &definition.name.value).and_then(
+						|target| {
+							self.store.enqueue_maintenance_coalesced(
+								MaintenanceJobKind::BuildIndex,
+								target,
+								None,
+							)
+						},
+					) {
+						Ok(id) => {
+							result.result = result
+								.result
+								.clone()
+								.map(|outcome| outcome.map(|_value| Value::from(id.as_uuid())));
+						}
+						Err(error) => result.result = Err(error),
+					}
+				}
+			}
 			if require_closed
 				&& (self.closures.has_entries() || !variables.is_empty())
 				&& let Some(closure) = result
@@ -390,6 +425,13 @@ impl GqlSession {
 	) -> Option<QueryResult> {
 		let result = match &statement.kind {
 			StatementKind::DefineIndex(definition)
+				if definition.concurrently && self.transaction.is_some() =>
+			{
+				Err(FerrosGrynnError::query_feature_not_supported(
+					"DEFINE INDEX CONCURRENTLY inside an explicit transaction",
+				))
+			}
+			StatementKind::DefineGraphIndex(definition)
 				if definition.concurrently && self.transaction.is_some() =>
 			{
 				Err(FerrosGrynnError::query_feature_not_supported(
@@ -472,6 +514,9 @@ impl GqlSession {
 					MaintenanceTarget::Database => MaintenanceJobKind::CompactDatabase,
 					MaintenanceTarget::Graph(_) => MaintenanceJobKind::CompactGraph,
 					MaintenanceTarget::Index {
+						..
+					}
+					| MaintenanceTarget::GraphIndex {
 						..
 					} => MaintenanceJobKind::CompactIndex,
 					MaintenanceTarget::BaseClass(_)
@@ -606,6 +651,28 @@ impl GqlSession {
 				let graph = catalog
 					.named_graph(&graph.value)
 					.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.value.as_ref()))?;
+				if index_name == "edge_endpoint"
+					&& let Some(index) = graph.edge_endpoint_index()
+				{
+					return Ok(MaintenanceTarget::GraphIndex {
+						graph: graph.id(),
+						index: index.id(),
+						version: index.version(),
+					});
+				}
+				if let Some(index) =
+					graph.indexes().find(|index| index.name().as_str() == index_name)
+				{
+					return Ok(MaintenanceTarget::GraphIndex {
+						graph: graph.id(),
+						index: index.id().ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"published graph index has no identity",
+							)
+						})?,
+						version: index.version(),
+					});
+				}
 				let mut matches = catalog.classes().filter_map(|class| {
 					class
 						.indexes()

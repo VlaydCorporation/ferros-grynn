@@ -1,71 +1,71 @@
-# Graph Report - ferros-grynn  (2026-10-01)
+# Graph Report - ferros-grynn  (2026-10-02)
 
 ## Corpus Check
-- 2442 files · ~2,866,038 words
+- 2487 files · ~2,955,275 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 53569 nodes · 142017 edges · 1821 communities (1711 shown, 110 thin omitted)
-- Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 3217 edges (avg confidence: 0.8)
+- 54992 nodes · 145094 edges · 2131 communities (1707 shown, 424 thin omitted)
+- Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 3343 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `e8bd22e4`
+- Built from commit: `19a67617`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
 - cover
-- Traverser
+- collect_dml_candidates
 - trees/knn.rs
 - Category
-- Row
-- DatabaseId
+- EvalContext
+- NamespaceId
 - debug.rs
-- MaintenanceJobInfo
+- JobId
 - quarantine.rs
 - FerrosGrynnResult
-- compat/fixtures.rs
-- NamespaceId
+- TableDefinition
+- DatabaseId
 - Transaction
 - WindowsIoRing
 - SchemaAnalyzer
-- SnapshotId
-- IndexDefinition
-- eval
+- Path
+- Result
+- AtomOccurrenceRef
 - Number
-- harness.rs
+- RowCursor
 - ferntree/src/iter.rs
 - ExecOperator
 - TreeNode<S>
-- bind_match_position
+- TransactionGraphView
 - status_codes.rs
-- write_explicit
+- f
 - .persist_generation
 - GraphKind
 - DirectedGraph
-- Position
+- Err
 - hash_join.rs
-- BaseAtom
-- Result
+- Lsn
+- IndexDefinition
 - lower/test.rs
 - Text
-- PageCacheKey
-- QueryPlanner
+- AtomicArenaBufferPool
+- exec.rs
 - metadata_cow.rs
 - SparseSet<T>
 - Duration
 - Id
 - PropertyColumn<T>
 - HybridReadEngine
-- imports.rs
-- Closure
+- VersionScope
+- Type
 - vector_index/codec.rs
-- ContextLevel
-- Result
+- AccessMode
+- Datastore
 - PageNo
 - arrow.rs
-- atom_store_image.rs
+- AtomId
 - SchemaVersion
 - Vector
 - tests/function.rs
@@ -75,27 +75,27 @@
 - diskann/index.rs
 - Sequences
 - hnsw_memory.rs
+- gql/execution/mod.rs
 - FerrosGrynnResult
-- Type
 - Regex
 - Set
 - fulltext_index.rs
-- analyze.rs
+- LocalQuerySnapshot
 - pre_decode_filter/mod.rs
 - Object
 - get_metadata_inner
 - parse_err
 - BarrierAccount
-- ObjectStore
-- Lsn
+- FerrosGrynnResult
+- rocksdb/cnf.rs
 - CowVec<T, CHUNK_LEN>
-- label_dict.rs
-- Severity
+- S
+- AnalyzerDefinition
 - Self
-- RowCursor
-- ResolvedTableContext
-- open_graph_image
-- ObjectKey
+- AtomId
+- ScanDirection
+- DocumentContext
+- .check_permission
 - ferntree/src/lib.rs
 - hnsw/mod.rs
 - FieldState
@@ -104,46 +104,46 @@
 - Bytes
 - write_fulltext_index_stream
 - unsafed/os.rs
-- TableScan
-- K
+- topk_pushdown.rs
+- V
 - Graphify
-- match/model.rs
-- atomic_arena.rs
+- analyze.rs
+- PageCacheKey
 - Dag<State>
-- TableInfoPlan
+- BinaryOperator
 - Number
-- PageLsn
+- demo/src/lib.rs
 - Strand
 - Context
 - DirectedAcyclicGraph
-- ClassId
+- SchemaFunction
 - PhysicalExpr
 - search_cached_hnsw_with_distance
 - Physical Query Execution
 - Ferros-Grynn Disk Storage Format
 - vector_index/search.rs
 - atoms
-- open_reverse_membership_image
+- I
 - VectorCache
 - EdgeColumns
 - FullTextIndex
 - index/analysis.rs
-- Dc
-- slowlog.rs
-- Result
+- QueryPlanner
+- SqlFormat
+- HnswIndex
 - Error
 - Value
-- select/search.rs
-- PropertyMap
+- B
+- PropertyKeyId
 - ferros-grynn-macros/src/lib.rs
-- ImportSession
+- ImportReport
 - DiskAnnProvider
-- AtomKind
+- GraphId
 - P3 Query Execution
-- gql/execution/mod.rs
+- RpcState
 - &'a Bytes
-- DocumentContext
-- Collectable
+- document.rs
+- src/host.rs
 - src/formatting.rs
 - windows_vm.rs
 - physical_traversal.rs
@@ -151,7 +151,7 @@
 - FerrosGrynnResult
 - spill.rs
 - ExecutionContext
-- IndexStores
+- IndexOperation<'a>
 - AtomId
 - DirtyTarget
 - surrealism_integration.rs
@@ -159,9 +159,9 @@
 - Options
 - Uuid
 - Controller
-- RecordIdPart
+- Ulid
 - SortedIndexRecords
-- topk_pushdown.rs
+- topk.rs
 - Backend
 - Distribution
 - Iter<'_, T>
@@ -173,18 +173,18 @@
 - benches/property_map.rs
 - Handle<'_, T>
 - Отчёт этапа 2: Sync Direct I/O и BufferPool
-- EdgeTopology
+- Hypergraph<State>
 - policy.rs
 - tables.rs
 - ClockPro
 - AppState
 - DecodeError
-- AlignedPage
-- KnnContext
-- rocksdb/cnf.rs
-- PropertyKeyId
-- ScatterPrefetchCursor
 - aggregates/math.rs
+- KnnContext
+- Patch
+- GraphRoot
+- parse_if_exists
+- AtomId
 - ferros-grynn-bench/benches/collections.rs
 - fnc/math.rs
 - Array
@@ -194,50 +194,50 @@
 - GraphWorkspace<G>
 - Q: Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?
 - compile.rs
-- .drop
+- tests/graph_dml.rs
 - MaintenanceStatement
 - Vector
 - IgnoreError
-- Frozen
+- EdgeTopology
 - C
 - events.rs
-- invalid_index
+- AlignedPage
 - parse_unordered_clause
-- Result
+- harness.rs
 - src/tx.rs
 - CursorDoc
-- LogicalSelect
+- ExecutionControl
 - Capabilities
-- execution/schema.rs
-- SurrealValue
+- Value
+- Value
 - catalog/schema/index.rs
 - FieldPath
 - Value
 - Metagraph<State>
 - latch.rs
-- run_resident_concurrency
-- InfoStructure
-- V
+- .build
+- GraphIndex
+- Error
 - EncodeError
 - StatusObject
 - array_ops.rs
-- AnalyzePlan
+- RecursionOp
 - GraphEdgeScan
 - .install_built_graph_inner
-- FunctionsConfig
+- IndexId
 - InlineVec<T, N>
-- Run
+- method/run.rs
 - QueryExecutor
 - graphql_integration.rs
-- dbs/executor.rs
+- Executor
 - FunctionRegistry
-- .check_permission
+- FerrosGrynnResult
 - wire_cmp.rs
-- Cardinality
+- PlannerSnapshot
 - write_streamed_vector_index_images
 - Websocket
 - Option
-- SearchState
+- AsyncEventRecord
 - fnc/array.rs
 - fnc/string.rs
 - Transaction
@@ -248,10 +248,10 @@
 - GqlSession
 - Capabilities
 - build_generation_inner
-- ready.rs
+- Result
 - Statement
 - expression_registry.rs
-- surrealdb/src/lib.rs
+- Strategy
 - Transaction
 - SurrealismConfig
 - Subgraph<State>
@@ -260,8 +260,8 @@
 - src/db.rs
 - Blob<'a>
 - Runtime
-- ops.rs
-- FanOutObserver
+- ContextLevel
+- CapturingObserver
 - gql/import.rs
 - builtin/search.rs
 - iam/signin.rs
@@ -273,7 +273,7 @@
 - Ident
 - Accumulator
 - expr/statements/remove/mod.rs
-- SerializedVector
+- TableId
 - Transaction
 - revision_impl.rs
 - BoxTimeStamp
@@ -283,28 +283,28 @@
 - Error
 - VecSet<T>
 - Builder
-- ScalarFunction
+- Result
 - tests/schema/mod.rs
-- FerrosGrynnResult
+- Datetime
 - Decoder<'a>
 - Error
-- ApiRequest
+- build_graph_image_with_membership
 - Parser
 - Value
 - Surreal
 - bench/run.rs
 - Building
-- RowSet
-- TableId
-- Results
+- Range
+- SerializedVector
+- ObjectKey
 - T
 - DatabaseRoot
 - EdgeEndpoint
-- Mem
+- analyzer/filter.rs
 - PathSegment
 - ParseSync
 - dbs/store.rs
-- QualifiedAtomId
+- AtomId
 - Parser<'_>
 - computed_deps.rs
 - Registry
@@ -312,54 +312,54 @@
 - TableName
 - SharedVector
 - kvs/config.rs
-- Resource
+- SkipContent
 - ws_integration.rs
-- CommonConfig
+- core/src/syn/mod.rs
 - aggregates/array.rs
-- generate_schema
-- ScanDirection
+- Dc
+- Resource
 - McpService
 - CreateDb
-- Tt
+- dbs/capabilities.rs
 - TestCase
 - conditions.rs
 - Kind
 - surreal_value/derive/mod.rs
 - StorageValue
-- FullTextScan
+- Tt
 - WorldComponents
 - FieldDefinition
 - Result
 - Self
 - PeekableLexer<'source, SIZE>
-- Builder
+- Results
 - remote/http/mod.rs
-- MemoryStore
+- invalid_run
 - generator.rs
-- invalid
+- FileCatalog
 - Vec<Number>
 - Parser<'_>
-- HnswIndex
+- DefineAnalyzerStatement
 - wal/mod.rs
 - QueryResult
 - wire_literal.rs
-- Content
+- InfoStructure
 - syn/parser/test/stmt.rs
 - Duration
-- Value
+- Array
 - aggregates/time.rs
-- AnalyzerDefinition
+- Bp
 - SurrealProcess
 - src/error/mod.rs
 - store/file.rs
 - fulltext_index_delta.rs
 - operators/aggregate.rs
 - physical_expr/mod.rs
-- ExecutionObserver
+- http_tower.rs
 - Closure
 - block_on
 - operators/distinct.rs
-- AlterAnalyzerStatement
+- CursorRecord
 - local/mod.rs
 - tests/transaction.rs
 - NormaliserType
@@ -376,10 +376,10 @@
 - Geometry
 - Object
 - enum_tagged_skip_content.rs
-- ViewDefinition
+- ModuleDefinition
 - NodeId
-- analyzer/mod.rs
-- Splits
+- Tokens
+- AtomId
 - graphql/mutations.rs
 - Expr
 - From
@@ -388,12 +388,12 @@
 - Persistence
 - node/tests.rs
 - LeaseHandler
-- EvalContext
+- Result
 - evaluate_recurse_iterative
 - gql/lexer/test.rs
 - lower/expr.rs
-- Tokens
-- ParseResult
+- analyzer/tokenizer.rs
+- TokenValue
 - Result
 - Parser<'source, 'ast>
 - L
@@ -409,8 +409,8 @@
 - source/mod.rs
 - Result
 - String
-- ConfigMap
-- .sample
+- CommonConfig
+- dbs/executor.rs
 - TempFileIterator
 - Expr
 - Regex
@@ -418,11 +418,11 @@
 - BTreeMapStore
 - operations.rs
 - Cursor
-- Parser<'_>
+- GqlExpr
 - dynamicset.rs
 - Delete
-- body
-- header
+- IndexId
+- Enum
 - vector_index/delta.rs
 - expr/statements/alter/mod.rs
 - Sender
@@ -430,11 +430,11 @@
 - .parse_alter_stmt
 - Receiver
 - src/capabilities.rs
-- provisioner.rs
+- AggregateFunction
 - tests/remove.rs
 - PropertyRef
-- DecodeContext
-- Parser<'_>
+- EncodeContext
+- Identifier
 - expr/access_type.rs
 - expr/module.rs
 - expr/statements/access.rs
@@ -443,29 +443,30 @@
 - CreateDs
 - TopLevelExpr
 - ObservabilityRuntime
-- AsyncEventRecord
+- OrderedStream
 - Performance Benchmark Workflow
 - report/mod.rs
 - RawError
-- Result
+- DbsCapabilities
 - ClassSchema
-- EncodeContext
+- label_dict.rs
 - endpoint.rs
 - hybrid_candidate.rs
-- datastore/import.rs
+- Result
 - row_scope.rs
 - Response<'js>
-- Range
+- SlowLog
 - TokenKind
-- Router
+- action.rs
 - parse/expr.rs
 - Socket
 - Inner
 - Http
-- run_router
-- TableRoot
+- S
+- index/state.rs
 - ObjectMeta
 - DynamicScan
+- Traverser
 - ResourceKind
 - Args
 - Literal
@@ -477,7 +478,7 @@
 - pre_decode_filter/streaming.rs
 - TempDir
 - collections/benches/collections.rs
-- Task
+- EngineOptions
 - Result
 - Lookup
 - Parser<'_>
@@ -485,88 +486,88 @@
 - McpConfig
 - ParseResult
 - client_ip.rs
-- ResponseError
+- DataFileId
 - RecordIdKeyRange
-- Host
-- parse/record_id.rs
+- Cast
+- parse_lookup_range
 - atomic_slot.rs
-- Snapshot
+- AtomId
 - catalog/schema/mod.rs
 - Block
 - Param
 - cli/mod.rs
 - Sample
 - `[env]`
-- Result
+- cmd/run/mod.rs
 - catalog/record.rs
 - .poll_next_before
 - Lookup
-- SurrealismCache
-- PageHeader
+- TextSpan
+- .new
 - .arbitrary
-- TempDir
+- SurrealismPackage
 - traversal_frontier.rs
 - serde_integration.rs
 - Release Process Documentation
-- Patch
-- fill_vals_batch
-- tests/audit.rs
+- LandmarkPathLayout
+- build_reachability_labels
+- geometry_index/mod.rs
 - .execute_with_session
 - fnc/set.rs
-- DbsCapabilities
+- text_analyzer.rs
 - SourceBoundLocator
 - Part
 - tests/define.rs
-- ReferenceScan
-- Args
+- MessageBroker
+- AuthArguments
 - cli_integration.rs
 - DiagnosticRecord
 - arena/support.rs
 - TypedExpr
-- Datetime
+- TableRoot
 - KnnTopK
 - Fields
 - Literal
 - AlterStatement
 - sync.rs
-- index/builder.rs
+- Mem
 - Array
 - rename.rs
-- .poll_next_before
+- ops.rs
 - .new
-- FileCatalog
+- cleanup.rs
 - wasi_context.rs
 - tests/fixtures.rs
 - Result
-- Ulid
+- AggregateExtractor
 - Child
-- index/state.rs
+- convert.rs
 - ComputedData
 - RemoteStore
-- delta_debugging_bitmap.rs
+- Explanation
 - MatchesOp
-- DiskAnnRecordPending
+- LanguageClosureState
 - .consume
 - fnc/crypto.rs
 - fnc/vector.rs
 - verify.rs
 - decode_base_statistics_root
 - Bytes
-- DbResponse
-- idx/mod.rs
+- DbResult
+- PropertyMap
 - tests/http.rs
 - OperatorMetrics
 - observe/handler.rs
-- PatchOps
-- ShortestPathExpand
-- FerrosGrynnResult
+- SurrealValue
+- Entry
+- DemoHost
 - Geometry
-- open_local_state
+- TimeZone
 - Header
-- IndexCompactionKey
+- MemoryStore
 - unsafe_coverage.rs
 - build_generics_types
-- test_queries
+- RandomShuffle
 - aggregation.rs
 - DefineStatement
 - parser/function.rs
@@ -574,29 +575,29 @@
 - Uuid
 - .compare
 - order_key.rs
-- Filter
+- ViewDefinition
 - hashmap.rs
-- syn/stmt/select.rs
-- analyzer/filter.rs
+- match/model.rs
+- Filter
 - SurrealError
 - comparison.rs
 - RoughlyEqConfig
 - ast/src/lib.rs
 - MutationStage
 - lives.rs
-- NamespaceInfoPlan
+- resolve_condition_params
 - Bytesize
 - Auth
 - KnnBruteForceResult
 - UndirectedGraph<S>
-- DefineTableStatement
-- CratePath
-- Select
+- graph_neighbourhood/mod.rs
+- ScatterPrefetchCursor
+- ProjectedRelation
 - Lexer<'a>
 - Parser<'a>
 - Offset
-- Result
-- dbs/capabilities.rs
+- DefineTableStatement
+- CardinalityHint
 - Parser<'_>
 - EscapedSlice
 - functional_coverage.rs
@@ -605,22 +606,22 @@
 - codec/encode.rs
 - Variables
 - object_extract/tests.rs
-- QuerySnapshot
+- GraphRef
 - prefix_extractor.rs
-- fnc/rand.rs
+- SurrealDatabase
 - codec/mod.rs
 - SleepPlan
 - Object
-- ExprPlan
+- AnalyzePlan
 - Variables
-- cursor/barrier.rs
+- surrealdb/src/lib.rs
 - decode_page_chain
 - .run
 - Отчёт этапа 3.1: прототипы storage engine и BufferPool V2
 - StrictlyUpperTriangularLogicalMatrix
 - expr/statements/define/mod.rs
-- invalid
-- ForeachPlan
+- DataFileKind
+- .restore
 - DmlTarget
 - Fields
 - handle_function
@@ -628,30 +629,30 @@
 - LetPlan
 - validator/mod.rs
 - Config
-- extract_args
+- derived_index/mod.rs
 - SurrealError
 - CountScan
-- compute_idiom_recursion
-- ToSql
+- datastore/import.rs
+- rocksdb/tests.rs
 - kvs/mod.rs
 - stdio.rs
 - tree_oracle_iter.rs
 - T
-- .run_triggers
-- demo/src/lib.rs
-- Param
+- AlterAccessStatement
+- DatabaseInfoPlan
+- ApiRequest
 - evaluate_streaming
-- .output_write
+- write_explicit
 - arc.rs
-- DestructurePart
+- Select
 - expr/statements/kill.rs
 - Headers
-- Enum
+- CratePath
 - ModuleExecutable
 - value/patch.rs
 - ErrorData
 - Self
-- ApiResponse
+- binaries.rs
 - Bytes
 - .create
 - PropertyDictionary
@@ -659,16 +660,16 @@
 - api_integration/mod.rs
 - Catalog Backwards Compatibility Tests
 - McpSession
-- MessageBroker
+- get.rs
 - RecordIdKeyLit
 - expr/statements/live.rs
 - Body
-- new
+- Router
 - OrderList
-- ReturnPlan
+- AlterApiClause
 - BytesReader<'a>
 - Range
-- FieldEditContext
+- every.rs
 - src/auth.rs
 - usize
 - RecordIdKey
@@ -676,31 +677,31 @@
 - surrealmx/README.md
 - bench_internals.rs
 - MergeIterator
-- invalid
+- StatisticsStore
 - waitgroup.rs
-- FieldDependencyExtractor
+- Compute
 - StatusReport
-- convert.rs
-- Result
-- AlterTableStatement
-- ClosureFieldCallPart
+- DatabaseRoot
+- SchemaId
+- Set
+- api_scope.rs
 - Function
 - RemoveStatement
 - decimal.rs
 - .compute
-- atom_store_superblock.rs
+- GraphqlError
 - Blob
 - .from_arguments
-- ix.rs
+- fill_vals_batch
 - LiveEventBuffer
 - RenderedError
-- route.rs
-- tests/index.rs
+- FieldEditContext
+- Operation
 - mcp/tests/common/mod.rs
 - parse_bare_type
 - StatusCode
 - Building SurrealDB
-- KnnScan
+- NamedFields
 - run_with_timeout
 - gql_stage22_23.rs
 - Fetchs
@@ -713,234 +714,234 @@
 - lower/pattern.rs
 - IntoBytes
 - queue.rs
-- execute
-- cmd/run/mod.rs
+- Value
+- BuildGraphStatement
 - Notify
 - connectivity.rs
-- AccessMode
+- Parts
 - gql_stage20_21.rs
 - fulltext_row
 - Исследование порчи первого байта `AlignedPage` на Windows MSVC
-- GraphId
-- coerce.rs
-- parse_surrealism_attrs
+- FerrosGrynnResult
+- PrefixedStore<T>
+- gql_integration.rs
 - lower/mod.rs
-- classes.rs
+- wait_for_index_ready
 - ToFloat
 - Parser<'_>
-- Result
+- rc.rs
 - observer.rs
 - tests/insert.rs
-- strand.rs
-- ShortestPaths
+- ExportsManifest
+- AtomId
 - Result
 - KeyBindings
 - Schedular
 - cycle_guard.rs
-- Relation
+- atom_store_image.rs
 - TrackAlloc<A>
 - seqdocids.rs
 - wire_skip.rs
 - case/config.rs
 - TransactionInner
-- Result
-- expr/statements/alter/api.rs
+- iu.rs
+- AnalyzedToken
 - .path
 - run_router
-- AlterEventStatement
+- Rest
 - AlterUserStatement
 - RelateThrough
-- trees/store/mod.rs
+- request
 - parser/expression.rs
-- Set
+- ParserSettings
 - tests/delete.rs
 - net/mod.rs
 - IndexKeyBase
 - RecordIdKeyLit
 - SelectStatement
 - v2.rs
-- checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates
-- Option
+- Invalidate
+- HttpClient
 - remote/mod.rs
 - api_integration/live.rs
 - token_surreal_value.rs
-- trait.rs
+- Point
 - Engine
 - find_entry
-- cli/sql.rs
-- query/mod.rs
+- ObjectStore
+- query
 - RecordExists
-- StreamExt
-- Br
-- CaseImports
-- AlterAccessStatement
+- Split
+- middleware/res.rs
+- upgrade/mod.rs
+- expr/statements/alter/bucket.rs
 - DefineAnalyzerStatement
 - DefineUserStatement
 - IdiomExpr
 - UpsertStatement
 - fnc/parse.rs
-- minimum_spanning_forest_with_check
+- KVKey
 - .parse_insert_filler
-- table/lq.rs
-- Split
+- mock
+- ScalarFunction
 - replay.rs
 - InlineGuard
-- surrealkv/cnf.rs
+- CommitCoordinator
 - TrackAlloc<A>
 - .from_object
-- TokenValue
+- Parser
 - AlterFieldStatement
 - DefineFieldStatement
 - CanonicalHasher
 - ToFlatbuffers
-- PrefixedStore<T>
-- Self
+- AlterTableStatement
+- Cell
 - surreal_value.rs
 - Community 793
 - wrap.rs
 - reproduce_issue_7318.rs
-- ControlFlow
-- graphql/cache.rs
-- StringValue
-- BodyParser<'a>
+- BinaryOperator
+- Actor
+- tests/index.rs
+- MaintenanceJobInfo
 - rocksdb/mod.rs
 - hash_btree.rs
 - AuthLimit
-- Strategy
-- JwtAccess
+- FieldDependencyExtractor
+- UserInfoPlan
 - live_events.rs
 - Format
-- iu.rs
-- Rest
+- QuarantineId
+- delta_debugging_bitmap.rs
 - Idiom
 - direct_io/tests.rs
 - expr/model.rs
-- Role
-- StatementKind
+- try_join_all_buffered.rs
+- Block
 - StoreInner
-- ContentType
+- ControlFlow
 - builtin/type.rs
-- .load
-- Bind
+- AtomicLen
+- .add
 - Fetchs
-- cli/start.rs
+- js.rs
 - Parser<'_>
 - crates/surrealdb/README.md
 - tests/info.rs
-- RpcState
-- CommitCoordinator
-- .from_string
+- compute_idiom_recursion
+- Result
+- StringValue
 - .from_string
 - ProxyObject
-- is_allowed
-- ApiMethod
+- ResolvedNetAllow
+- minimum_spanning_forest_with_check
 - execution/tests/select.rs
-- T
+- headers.rs
 - ClosureExpr
-- DatabaseRoot
+- T
 - traversal.rs
 - SelectStatement
 - UpdateStatement
 - UpsertStatement
-- expected.rs
-- UserInfoPlan
-- resources/schema.rs
+- .try_parse_orders
+- strand.rs
+- Bind
 - expr/statements/define/config/mod.rs
 - tests/schema.rs
 - UpdateStatement
 - profile.rs
-- Http
-- js.rs
-- Algorithm
-- CreateStatement
-- ReclaimKey
-- src/audit.rs
-- Actor
-- binaries.rs
-- Ib
+- ClosureFieldCallPart
+- DefineApiStatement
+- Bg
+- module/build.rs
+- ready.rs
+- NeighbourhoodLayout
+- PropertyBatch
+- provisioner.rs
+- TableInfoPlan
 - transaction/tests.rs
 - full_plan.md
 - report/update.rs
 - .from_fb
 - crates/surrealdb/build.rs
-- graph/traversal/mod.rs
+- signals.rs
 - .parse_ref
-- ErrorValue
-- fnc/http.rs
-- expr/statements/alter/sequence.rs
+- Fs
+- ControlFlowExpr
+- Position
 - server/src/graphql/mod.rs
 - Scoring
 - stage10_atomic_import_profile
 - DefineTableStatement
 - DeleteStatement
 - LiveStatement
-- Permissions
+- Relation
 - expr/kind.rs
 - prompts/mod.rs
 - init_cmd.rs
 - DeleteStatement
-- .compute
+- Dp
 - SurrealDB Types
 - Этап 8.1. Возврат к graph-first модели атомов
 - waker.rs
 - SurrealNamespace
-- ResolvedNetAllow
+- Result
 - Phase 2-5 implementation guide
-- Operation
+- .import_at
 - exact_vector_distance
 - exec/ — Streaming Query Execution Engine
-- Data
+- Permissions
 - Этапы 15–16. Полный StandardPath MATCH и graph-first AtomWalk/nested MATCH
-- builtin/http.rs
+- tests/audit.rs
 - DefineFunctionStatement
 - .compute
 - run_eval
 - gql/token/mod.rs
-- rocksdb/tests.rs
+- T
 - comparator.rs
 - GarbageCollector
 - Group
-- FieldPart
-- RecursionOp
+- FerrosGrynnResult
+- CustomFilter
 - BinaryLiftingIndex
 - .parse_builtin
-- Bytes
+- unsafed/memory.rs
 - each.rs
 - run_queries
-- invoke
-- DefineParamStatement
+- SurrealAuthNamespace
+- builtin/http.rs
 - Endpoint
 - BoxedSlot<T>
-- CardinalityHint
+- IndexId
 - expr/statements/define/database.rs
 - GraphSuperblock
 - fnc/session.rs
-- VersionScope
+- IndexCountScan
 - .from_string
 - utils.py
 - DatabaseOptions
-- race_stress.rs
-- .poll_next_before
-- Этап 21. Durable PARAM, именованные UDF и оставшийся язык
+- resources/schema.rs
+- ImmutableStreamWriter<'a>
+- FieldPart
 - obs/mod.rs
-- Id
-- View
+- BackgroundFlusher
+- Position
 - VectorId
 - DiskAnnRecordPendingShard
-- Di
-- LiveQueryRouter
-- finish_histograms
-- AsynkStrim
+- add_auth_mutations
+- DiagnosticValue
+- ReachabilityLayout
+- .parse_inner_kind
 - SetStatement
 - fnc/encoding.rs
-- providers.rs
+- cmd/graphql.rs
 - Sprintable
 - AlterAnalyzerStatement
 - BackgroundFlusher
 - Algorithm
-- MajorVersion
+- idiom/mod.rs
 - gql_graph_result_stage_18_probe
-- Bg
+- ResponseError
 - ConfigInner
 - ShowStatement
 - Relation
@@ -948,14 +949,14 @@
 - render.rs
 - Lexer<'_>
 - Lexer<'_>
-- ReadableStream
+- Bytes
 - .put
 - src/resources/mod.rs
 - CredentialsBuilder
-- serde_wrapper_roundtrip.rs
-- .parse_ref
-- Giver
-- DynamicConfiguration
+- SurrealId
+- tracing.rs
+- DiskAnnRecordPending
+- .compute
 - Merge
 - flatbuffers/mod.rs
 - struct_flatten.rs
@@ -966,85 +967,85 @@
 - ml_integration.rs
 - CompressedWriter
 - prefix_keys.rs
-- walk.rs
+- Role
 - Отчёт по этапу 20: durable maintenance и admin surface
 - match_performance_probe.rs
 - GQL v2 design contract — MatchPlan, binding-table execution
-- mock
-- .compute
+- rpc/protocol.rs
+- Kind
 - AtomicPageGuard
 - Timestamp
 - graphql/naming.rs
-- cmd/graphql.rs
-- ApiInvoke
+- IterKey
+- cli/sql.rs
 - Аналитический отчёт по этапу 1.6
-- execute_graph_property_update
-- collect_dml_candidates
+- ArraySection
+- DestructurePart
 - IfelseStatement
-- tb.rs
-- SetStatement
-- module/build.rs
+- lookup
+- ScalarSubquery
+- RelateStatement
 - AlterAccessStatement
 - Отчёт этапа 3: закрытие Windows sync performance gate
-- Stats
+- tests/landmark.rs
 - Param
-- ap.rs
+- local/native.rs
 - AlterBucketStatement
 - DefineAccessStatement
 - DefineBucketStatement
 - DefineDatabaseStatement
 - DefineModelStatement
-- ImmutableStreamWriter<'a>
+- CreateStatement
 - str/bytes.rs
 - Lexer<'_>
 - Environment
 - diff.rs
-- az.rs
+- GroupCollector
 - Authenticate
 - TryYielder<Ok, Error>
 - AlterTableStatement
 - Table
 - File
-- load_reserved_extents
+- validate_loaded_header
 - MemStore
 - Result
 - Environment
 - Этап 3.2. Внедрение гибридного storage engine
-- ParserSettings
+- VectorDistanceKnn
 - Отчёт по этапу 7: базовый индексный контур
 - ferntree/tests/scan_out_of_range.rs
 - .to_fb
 - .register_datafusion_table
 - CreateStatement
-- DefineAnalyzerStatement
-- span.rs
-- upgrade/mod.rs
-- Entry
-- Parser<'_>
+- IndexCompactionKey
+- Br
+- .deserialize_revisioned
+- DefineUserStatement
+- .increment
 - completions.rs
-- collect_expr
+- fd.rs
 - fnc/duration.rs
 - .unescape_escape_sequence
-- ExternalSort
+- InsertRelation
 - count_exists_rewriter.rs
-- exec.rs
+- DatabaseSuperblock
 - kvs/util.rs
 - basic_idiom
-- providers.rs
+- .eat_separated_digits
 - Language
-- AlterEventStatement
+- coerce.rs
 - Datastore
-- engine/mod.rs
+- BodyParser<'a>
 - DefineModuleStatement
 - DefineNamespaceStatement
 - Value
-- HnswRecordPending
+- Http
 - gql_stage_common.rs
-- .parse_inner_kind
+- expr/statements/info.rs
 - test/limit.rs
 - TokenBuffer<S>
-- File
-- SurrealAuthNamespace
+- .new
+- ContentType
 - AlterParamStatement
 - version_client.rs
 - HasKind
@@ -1056,43 +1057,43 @@
 - .from_string
 - .parse_sync
 - AlterFunctionStatement
-- reclaim_test.rs
-- SurrealDatabase
-- DefineIndexStatement
+- Result
+- tx_cache_test.rs
+- race_stress.rs
 - IndentFormatter<W>
 - expr/statements/define/model.rs
 - Number
-- ControlFlowExpr
-- .pick
+- Span
+- .poll_next_before
 - atom_model.rs
 - Reason
-- ImportReport
-- expr/statements/define/sequence.rs
+- walk.rs
+- Content
 - Cond
-- hashset_vs_vector.rs
+- LocalPokemonApi
 - expr/record_id/range.rs
 - encode_vec
-- .compute
-- expr/statements/remove/sequence.rs
+- Splits
+- .new
 - gql_traversal_stage_17_probe
-- expect
+- .compute
 - expr/timeout.rs
 - 2. Контракты и архитектура
-- DiagnosticValue
-- .compute
-- Перспективный анализ кода и зависимостей (этап 1.6)
-- Result
-- Timeout
-- fetch/mod.rs
-- EngineOptions
-- Mock
+- Action
+- DiskAtomRef
+- 6. Перспективная роль существующих модулей `src`
+- TransactionMetrics
+- cmp.rs
+- .add
+- PageHeader
+- DatabaseCatalog
 - .arbitrary
 - План прототипирования нового storage engine и BufferPool V2
 - AlterConfigStatement
 - AlterIndexStatement
 - AlterModuleStatement
 - AlterSequenceStatement
-- ModuleDefinition
+- .get_live_queries_version
 - Отчёт этапа 8.1: переход на graph-first модель атомов
 - DefineSequenceStatement
 - InsertStatement
@@ -1101,41 +1102,41 @@
 - RemoveUserStatement
 - BytesReader
 - Span
-- sq.rs
+- View
 - .cut
-- .compute
+- IndexId
 - tests/table.rs
 - McpRecorderAdapter
-- Reference
-- request
+- .decrement
+- catalog/access.rs
 - WithMap
-- th.rs
-- expr/statements/alter/index.rs
-- VectorDistanceKnn
+- DatabaseDefinition
+- LiveQueryRouter
+- core/tests/select.rs
 - enum_untagged.rs
 - Model Setup
 - Отчёт по этапу 8: Core DDL vertical slices
 - Отчёт по этапу 6: StatisticsStore
 - memory/registry.rs
-- EventQueue
-- .contains
+- Import
+- ApiInvoke
 - Profiling with DTRACE (MacOS / FreeBSD)
-- .poll_next
+- File
 - Fmt
 - Отчёт по этапу 3.2: внедрение гибридного storage engine
-- cli/config.rs
-- .compute
+- Parser<'_>
+- UpdateGraphStatement
 - KindLiteral
 - SlotArray<S, N>
 - expr/statements/define/config/api.rs
-- KindLiteral
+- Giver
 - Record
-- Split
+- BloomFilter
 - План доведения Ferros-Grynn до Windows GA-core и полной draft-conformance
 - Token
 - benches/bench.rs
 - expr/statements/define/module.rs
-- DefineFunctionStatement
+- AlterFunctionStatement
 - RemoveModelStatement
 - TransactionCache
 - NotrackAlloc<A>
@@ -1153,27 +1154,27 @@
 - RemoveEventStatement
 - RemoveFieldStatement
 - RemoveIndexStatement
-- evaluate_physical_path
+- GraphStorageMode
 - RemoveSequenceStatement
 - RemoveTableStatement
-- Append
-- expr/part.rs
+- relation
+- serde_wrapper_roundtrip.rs
 - Этап 19. Windows GA-core gate — итоговый evidence
-- .deserialize_revisioned
-- Instrument
+- bu.rs
+- run_imports
 - RebuildIndexStatement
 - enum_tagged_tag_content.rs
 - enum_tagged_variant.rs
 - SurrealAuthDatabase
-- Telemetry
+- .compute
 - Method
 - NotrackAlloc<A>
 - Pool
 - surrealdb/CLAUDE.md
-- signals.rs
-- QueueEntry
-- heap_estimator.rs
-- expr/statements/output.rs
+- Di
+- expr/statements/remove/sequence.rs
+- Base
+- cli/start.rs
 - SequenceNextval
 - File
 - Uuid
@@ -1182,7 +1183,7 @@
 - surrealdb/mod.rs
 - Этап 17. Traversal VM, полноценные closures, `FAST` и physical sparse frontier
 - Этап 18. Самодостаточные graph-results и Atomic `BUILD GRAPH`
-- Explain
+- prefix_concurrency.rs
 - Block
 - File
 - RecordIdLit
@@ -1196,33 +1197,33 @@
 - SurrealDB MCP server
 - src/test/mod.rs
 - Subcommands
-- 6. Перспективная роль существующих модулей `src`
-- rocksdb_cursor.rs
+- .computed_fields_inner
+- TempDir
 - Socket
 - graphql/schema.rs
-- TraceLayer
+- Dd
 - AGENTS.md — `gql_status`
-- ApiConfig
-- .from_select
+- DefineFunctionStatement
+- ap.rs
 - reproduce_issue_6242.rs
 - ferntree/README.md
 - GQL to MatchPlan lowering (v2)
 - (c) MATCH and patterns
 - ISO GQL — distilled reference for the v1 read-only subset
-- He
+- Id
 - lib/routines/mod.rs
 - Closure
 - Cancellation
 - NoHeapEstimatorCache
-- IfelseStatement
+- Hd
 - Отчёт по этапу 9: DML vertical slices
 - rebuild_index_store
 - Duration
-- expr/statements/remove/function.rs
+- .compute
 - encode
 - AccessDuration
 - ChangeFeed
-- AlterFunctionStatement
+- .compute
 - fnc/object.rs
 - Filter
 - Limit
@@ -1248,22 +1249,22 @@
 - local_build.py
 - Version
 - async_drop.rs
-- NamedFields
-- DiskAtomRef
-- core/tests/select.rs
+- DynamicConfiguration
+- AlterEventStatement
+- DefineParamStatement
 - Frequently Asked Questions
 - GQL module guidance
-- AlterNamespaceStatement
+- upgrade.rs
 - LocalStorageStatus
-- Access
-- collator
-- .computed_fields_inner
-- DataFileId
+- find_cuts_with_check
+- DefineIndexStatement
+- DiskAtomRef
+- hashset_vs_vector.rs
 - gql/lexer/ident.rs
 - expr/statements/define/namespace.rs
 - .add_validator
-- Version
-- Self
+- MlModelDefinition
+- AlterModuleStatement
 - HttpTraceLayerHooks
 - .compute
 - Optional Inputs
@@ -1271,19 +1272,19 @@
 - tests/control.rs
 - 3. Остальной код в `src`
 - expr/statements/define/param.rs
-- expr/statements/alter/bucket.rs
+- .pick
 - Отчёт этапа 6: Windows Native Async I/O
 - .parse_insert_stmt
-- impl_enum
+- Position
 - tests/access.rs
-- dbs/session.rs
+- subscriber.rs
 - root_info
-- StatementCounters
+- expr/statements/output.rs
 - .parse
 - Отчёт этапа 7: границы transaction-private spill
 - expr/statements/alter/param.rs
 - ReplayRemap
-- .from_fb
+- Position
 - Surrealism Macros
 - Surrealism Types
 - ECS module guidance
@@ -1298,21 +1299,21 @@
 - Data
 - .into_js
 - fut
-- Hd
+- fnc/record.rs
 - Error
 - mac/mod.rs
 - UserDuration
 - SurrealDB Core — Surrealism Integration
 - .range_of_span
 - .parse_if_stmt
-- runtime/value.rs
-- Ds
+- sq.rs
+- AllIndexRoot
 - tests/changefeeds.rs
 - tests/relate.rs
 - tests/update.rs
 - tests/upsert.rs
-- wasm_target.rs
-- gql_stage_13_resource_probe
+- EventQueue
+- mem/registry.rs
 - Session
 - GeometryKind
 - Q: Почему один файл тестов? Лучше логически разделять тесты на несколько файлов, хотя бы два файла для local и in-memory БД.
@@ -1333,25 +1334,25 @@
 - De
 - Resamples
 - Отчёт этапа 16: graph-first AtomWalk, hyper/meta и nested `MATCH`
-- .compute
-- BloomFilter
+- Update
+- cli/export.rs
 - .from_js
-- handle.rs
-- root/access/gr.rs
-- GraphqlError
+- Append
+- .extend
+- .one_index
 - asyncevent.rs
-- process_cpu_time
+- session_isolation.rs
 - tests/field.rs
 - range_shard.rs
 - Отчёт этапа 14: Rule/CBO optimizer, `DETERMINISTIC` и `EXPLAIN`
-- UpdateGraphStatement
+- ValueKind
 - Q: Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование.
 - enum_mixed_with_value.rs
-- UnitSlot
+- Constant
 - async_stream/bench.rs
 - JsonValue
 - storekey-derive/src/lib.rs
-- match_nested.rs
+- .drop
 - Cross-Cutting Concerns
 - Security Review Guide
 - Fuzzing
@@ -1376,9 +1377,9 @@
 - Отчёт этапа 5: Windows sync storage completion
 - Q: Почему superblock.fgb, раздельные freelist-файлы и std/uniq имена были заменены?
 - tests/query.rs
-- LocalPokemonApi
+- providers.rs
 - init
-- AlterModuleStatement
+- Telemetry
 - Отчёт по этапу 21: durable PARAM, именованные UDF и оставшийся язык
 - SurrealMl
 - find_and_move_rust_surrealml_file
@@ -1393,12 +1394,12 @@
 - array_intersect.rs
 - array_uniq.rs
 - want.rs
-- AllIndexRoot
-- Canceller
+- check_is_path_allowed
+- expr/statements/alter/index.rs
 - EscapeWriter<W>
 - len
 - RemoveNamespaceStatement
-- runtime/mod.rs
+- generate_registration_body
 - observe/process.rs
 - Format
 - tests/script.rs
@@ -1412,9 +1413,9 @@
 - &'a EscapedSlice
 - (b) Keywords
 - Code Review Guidelines
-- .fmt_sql
+- Idioms
 - gql_stage_14_optimizer_probe
-- test
+- Dir
 - Script
 - fnc/not.rs
 - .fmt
@@ -1425,7 +1426,7 @@
 - get_prompt
 - get_prompt
 - alloc.rs
-- Аналитический отчёт по этапу 1.6
+- Option
 - local_build.sh
 - Security Policy
 - storekey/README.md
@@ -1450,7 +1451,7 @@
 - benches/parser.rs
 - sdb.rs
 - mem/notrack.rs
-- IntoFuture
+- expr/statements/alter/sequence.rs
 - .all
 - Q: Проверь основной Cargo.toml: почему workspace dependencies не находятся?
 - .def
@@ -1459,7 +1460,8 @@
 - .replace
 - tests/dml.rs
 - tests/merge.rs
-- Result
+- ApiError
+- impl_enum
 - src/tls.rs
 - User
 - Исполнение dependency-ordered продолжения
@@ -1492,11 +1494,11 @@
 - functions/value.rs
 - kvs/direction.rs
 - surrealdb/core/src/lib.rs
-- Groups
+- import_load.rs
 - Value
 - surrealdb/surrealdb/README.md
 - server/README.md
-- prefix_concurrency.rs
+- IfelseStatement
 - src/datetime.rs
 - src/duration.rs
 - record_id_key.rs
@@ -1513,23 +1515,23 @@
 - run_tests.sh
 - src/direction.rs
 - build_store
-- nd.rs
-- Building on Ubuntu 20.04 (amd64)
+- parse_surrealism_attrs
+- ctx/context.rs
 - BorrowedTreeNode<'static, S>
-- Building on Ubuntu 20.04 (arm64)
+- arbitrary/parts.rs
 - Asynchronous module guidance
 - stats/AGENTS.md
-- fnc/geo.rs
+- ModuleCommand
 - Q: Где в проекте определены DiskANN, ALTER, NativeAsync, format v1, conformance и статусы реализации для этапа 2?
-- Action
-- Troubleshooting
-- SqlFormat
-- Idioms
-- topological_sort_computed_fields
+- PathEliminationSignal
+- Hg
+- .from_fb
+- values/storage/mod.rs
+- Ds
 - commit_people_graph
-- init
-- .compute
-- Datastore module guidance
+- He
+- Signin
+- query_20260830_161826_какие_границы_модулей__прямые_зависимости_и_refere.md
 - array/sort.rs
 - Graph module guidance
 - Storage module guidance
@@ -1538,22 +1540,22 @@
 - functions/crypto.rs
 - functions/duration.rs
 - encoding/json.rs
-- Dd
+- .set
 - functions/geo.rs
 - 4. Все прямые crates из корневого `Cargo.toml`
 - functions/math.rs
 - functions/meta.rs
 - functions/object.rs
 - email.rs
-- CustomFilter
+- future.rs
 - functions/session.rs
 - functions/string.rs
-- Scoring
+- cast.rs
 - string/distance.rs
 - html.rs
 - semver/inc.rs
 - Transaction
-- RELEASING.md
+- LetStatement
 - semver/set.rs
 - string/similarity.rs
 - functions/time.rs
@@ -1561,124 +1563,433 @@
 - functions/vector.rs
 - vector/distance.rs
 - vector/similarity.rs
-- Base
-- Version Management
+- compat/fixtures.rs
+- .compute
 - Key
-- tests/create.rs
-- literals.rs
-- visit.rs
+- Отчёт по этапу 23: HNSW и DiskANN
+- new
 - Этап 23. Exact KNN, HNSW и page-backed DiskANN
 - Key
 - match_oracle.rs
 - Level
-- upgrade.rs
-- live_query_scaling.rs
+- Scoring
+- .fmt
 - Этап 10. Atomic Import
 - Отчёт этапа 15: полный StandardPath `MATCH`
 - local_store/tests.rs
-- lib/mod.rs
-- .compute
-- .one_index
-- evaluate_recurse_path
-- Step-by-Step Instructions
-- evaluate_recurse_shortest
+- live_query_scaling.rs
+- Self
+- major
+- engine/mod.rs
+- AuthLimit
+- expect
 - tests/import.rs
 - Q: Добавить точный layout label entry page и typed node/edge label key в combined statistics
-- cli/export.rs
-- .poll_want
-- State
+- is_allowed
+- geometry_performance_probe.rs
+- Dn
 - .value
 - Lookup
-- Architecture
+- ApiResponse
 - Connect<Db, R>
-- execute
+- Commit
 - Отчёт этапа 13: реляционный SELECT для атомов и графов
-- column_name
-- Constant
+- surrealmx/tests/scan_out_of_range.rs
+- physical_index_base_path
 - LocalQuerySnapshotInner
 - init
-- Dir
-- fingerprint.rs
+- image
+- ReturnStatement
 - Этап 22. Durable analyzers и Fulltext BM25
-- Examples
-- Patch Release Workflow
-- module/info.rs
-- SkipContent
-- Lookup
-- ApiError
-- Этап 19. Windows GA-core gate и freeze core v1
-- query_20260830_161826_какие_границы_модулей__прямые_зависимости_и_refere.md
-- ColorMode
-- NoError
-- Отчёт этапа 18: self-contained graph results и Atomic `BUILD GRAPH`
-- GeometryKind
-- tests/match.rs
-- TopLevelExpr
-- match_standard.rs
-- Отчёт по шагу A8: durable AtomStore
-- Отчёт по этапу 23: HNSW и DiskANN
-- Result<T, NoError>
-- TimeZone
-- future.rs
-- .compute
-- Commit
+- stmt/transaction.rs
 - execute
+- execute
+- .atomic_import_item
+- Lookup
+- wasm_target.rs
+- Этап 19. Windows GA-core gate и freeze core v1
+- Version
+- ColorMode
+- backup_version.rs
+- Отчёт этапа 18: self-contained graph results и Atomic `BUILD GRAPH`
+- visit.rs
+- tests/match.rs
+- Отчёт этапа 11: транзакционные операторы GrynnQL
+- match_standard.rs
+- Аналитический отчёт по этапу 1.6
+- parser/stmt/define.rs
+- tests/create.rs
+- TraceLayer
 - src/storage/mod.rs
-- Freeze-manifest storage core v1
-- fnc/record.rs
-- .fmt
-- mem/registry.rs
-- ModuleCommand
-- ClassIndex
-- Этап 20. Durable maintenance и admin surface
-- TestDirectory
-- .fmt
+- Signup
+- gql_stage_13_resource_probe
+- direct_unix.rs
+- Versioned Releases
+- Option
+- Building on Ubuntu 20.04 (amd64)
+- direct_windows.rs
+- Building on Ubuntu 20.04 (arm64)
+- Troubleshooting
+- IndexScope
+- column_name
+- pages
+- Community 1772
 - match_atomwalk.rs
-- rnd.rs
+- Hasher
 - tests/explain.rs
 - match_hyper.rs
-- .fmt
-- level.rs
-- .atomic_import_item
-- .of
-- database/tests.rs
-- PipelineCounters
-- Fs
-- Community 1789
-- char.rs
-- Create
-- Cursor
-- .compute
-- OnUnwind<F>
-- .compute
-- with_enough_stack
-- surrealdb/tests/common/mod.rs
-- Versioned Releases
-- Read
-- .from
-- surrealmx/tests/scan_out_of_range.rs
-- FerrosGrynnError
-- Signin
-- .validate_value
-- SystemClock
-- .fmt
-- api_scope.rs
-- direct_unix.rs
-- direct_windows.rs
+- impl_format
+- StatementCounters
+- impl_format
 - benches/processor.rs
+- Этап 24 — Geometry R-tree: evidence checkpoint
+- rnd.rs
+- Этап 25 — производные графовые индексы: evidence checkpoint
+- .substitute_indices
 - gc_range
-- doc/store.rs
-- PathEliminationSignal
+- Step-by-Step Instructions
+- with_enough_stack
+- IntoFuture
+- Отчёт этапа 17: Traversal VM, closures, `FAST` и physical sparse frontier
+- Result
+- median_phase
+- gc_range
+- RELEASING.md
+- OnUnwind<F>
 - tl.rs
+- Version Management
+- api_integration/run.rs
 - build_and_pack_demo
-- push_ident
-- ExecutionControl
-- build_graph_image_with_membership
-- geo/mod.rs
-- fnc/count.rs
-- IndexBinding
+- header
+- Formatted
+- .compute
+- .from
+- .compute
+- FerrosGrynnError
+- lib/mod.rs
+- Option
+- .validate_value
+- Отчёт по шагу A8: durable AtomStore
+- Этап 17 — закрытие Q-10: physical sparse frontier
+- .from
+- .from_str
+- RelationInfo
+- Отчёт по этапу 22: durable analyzers и Fulltext
+- backup.rs
+- surrealdb/tests/common/mod.rs
+- .poll_want
+- Этап 20. Durable maintenance и admin surface
+- Directory
+- Directory
+- Directory
+- Directory
+- doc/store.rs
+- State
+- char.rs
+- Cursor
+- Architecture
+- Examples
+- Patch Release Workflow
+- .new
+- list.rs
+- api_integration/version.rs
+- .records
+- Formatted<'_, F, T>
+- open_graph_image
+- serialisation.rs
+- BuiltGraph
+- Column
+- Mutation
+- AtomId
+- IndexId
+- SchemaId
+- StatisticsStore
+- AtomId
+- AtomId
+- Apply
+- IndexId
+- Run
+- Value
+- IndexId
+- AtomId
+- IndexId
+- Value
+- Condvar
+- AtomId
+- IndexId
+- JoinHandle
+- Value
+- AtomId
+- GraphRef
+- Value
+- AtomId
+- GraphRef
+- IndexId
+- Path
+- StatisticsStore
+- Value
+- GraphRef
+- Value
+- Value
+- IndexId
+- GeometryKind
+- IndexId
+- IndexId
+- SchemaId
+- Identifier
+- ParserSettings
+- QueryResult
+- Statement
+- Value
+- AsRef
+- ParserSettings
+- Path
+- QueryResult
+- AtomId
+- GraphRef
+- AtomId
+- AtomId
+- GraphRef
+- Value
+- AtomId
+- GraphRef
+- AtomId
+- GraphRef
+- ParserSettings
+- QueryResult
+- SchemaId
+- Value
+- AtomId
+- AtomOccurrenceRef
+- EdgeDirection
+- GraphRef
+- IndexId
+- StatisticsStore
+- Value
+- GraphRef
+- IndexId
+- Value
+- GraphRef
+- Aggregate
+- BinaryOperator
+- ClosureExpr
+- DefineAnalyzerStatement
+- DefineFieldStatement
+- DefineFunctionStatement
+- DefineIndexStatement
+- Expr
+- GraphRef
+- Identifier
+- Literal
+- RangeInclusive
+- Schema
+- Slot
+- Statement
+- Value
+- Value
+- AtomOccurrenceRef
+- GraphRef
+- IndexId
+- ParserSettings
+- QueryResult
+- Schema
+- Statement
+- Value
+- Expand
+- GraphRef
+- PathExpand
+- Value
+- AtomId
 - QueryCursor
-- syn/ast/mod.rs
+- GraphRef
+- AtomOccurrenceRef
+- GraphRef
+- Path
+- PathStep
+- GraphRef
+- Path
+- Value
+- AtomId
+- EdgeDirection
+- GraphRef
+- Value
+- AtomRef
+- AtomRef
+- GraphRef
+- State
+- Value
+- ControlFlow
+- IndexId
+- Value
+- ControlFlow
+- ParserSettings
+- QueryResult
+- Statement
+- Value
+- GraphRef
+- Value
+- GraphRef
+- IndexId
+- Value
+- GQLConfig
+- Value
+- Path
+- Value
+- AtomId
+- AtomOccurrenceRef
+- AtomRef
+- GraphRef
+- Path
+- Value
+- AtomOccurrenceRef
+- AtomRef
+- GraphRef
+- IndexId
+- PathStep
+- Schema
+- Value
+- NonZeroU64
+- Value
+- AtomOccurrenceRef
+- GraphRef
+- Path
+- Value
+- Aggregate
+- BinaryOperator
+- Expand
+- ExplainFormat
+- GraphRef
+- PathExpand
+- Schema
+- Value
+- Statement
+- Value
+- Value
+- PathExpand
+- IndexId
+- GraphRef
+- IndexId
+- SchemaId
+- ParserSettings
+- Status
+- Value
+- AtomId
+- GraphRef
+- Schema
+- Value
+- AtomOccurrenceRef
+- AtomRef
+- GraphRef
+- AtomId
+- FusedIterator
+- Inner
+- Sized
+- S
+- SmallVec
+- AtomId
+- Vertex
+- AtomId
+- DoubleEndedIterator
+- EdgeDirection
+- AtomId
+- AtomId
+- GraphRef
+- Path
+- AtomId
+- Path
+- StatisticsStore
+- Value
+- IndexId
+- SchemaId
+- SchemaId
+- DiskAtomRef
+- Path
+- Value
+- DiskAtomRef
+- GeometryKind
+- Path
+- Path
+- Path
+- Path
+- ReadPage
+- IndexId
+- IndexId
+- Membership
+- Path
+- Primary
+- DiskAtomRef
+- IndexId
+- Value
+- IndexId
+- Path
+- Path
+- IndexId
+- StreamLocation
+- AtomId
+- DiskAtomRef
+- EdgeDirection
+- IndexId
+- Path
+- E
+- AtomId
+- DiskAtomRef
+- IndexId
+- IndexId
+- Path
+- IndexId
+- Path
+- ClosureExpr
+- Literal
+- RecordKey
+- Statement
+- BinaryOperator
+- Expr
+- Identifier
+- ParserSettings
+- Statement
+- Token
+- Statement
+- Identifier
+- Expr
+- Identifier
+- Expr
+- Identifier
+- AlterStatement
+- CreateStatement
+- DefineAnalyzerStatement
+- DefineFieldStatement
+- DefineFunctionStatement
+- DefineIndexStatement
+- DeleteStatement
+- Expr
+- Identifier
+- InfoStatement
+- KillStatement
+- RemoveStatement
+- Expr
+- Identifier
+- Expr
+- Polygon
+- Value
+- Position
+- FromStr
+- TryFrom
+- AtomOccurrenceRef
+- AtomRef
+- GraphRef
+- Path
+- Regex
+- Set
+- Position
+- f16
+- Position
+- AtomRef
+- Deref
+- GraphRef
+- Span
+- Value
+- Path
+- Value
 
 ## God Nodes (most connected - your core abstractions)
 1. `NamespaceId` - 837 edges
@@ -1686,11 +1997,11 @@
 3. `Options` - 556 edges
 4. `SqlFormat` - 426 edges
 5. `ToSql` - 424 edges
-6. `CursorDoc` - 315 edges
-7. `AlignedPage` - 310 edges
-8. `PageNo` - 272 edges
-9. `Session` - 268 edges
-10. `ExecutionControl` - 262 edges
+6. `Value` - 348 edges
+7. `AlignedPage` - 347 edges
+8. `CursorDoc` - 315 edges
+9. `PageNo` - 297 edges
+10. `ExecutionControl` - 288 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `Claude Ferros-Grynn Guidance` --semantically_similar_to--> `Prototype-to-Production Migration Architecture`  [INFERRED] [semantically similar]
@@ -1701,10 +2012,14 @@
   src/values/AGENTS.md → docs/values_plan.md
 - `Arrow Validity Plus Presence Bitmap` --semantically_similar_to--> `PropertyBatch Presence Model`  [INFERRED] [semantically similar]
   src/values/AGENTS.md → docs/values_plan.md
-- `LoadReceipt` --references--> `PageHeader`  [EXTRACTED]
-  crates/fg-storage-engine-prototypes/src/atomic_arena.rs → src/storage/page.rs
+- `landmark_traversal_weighted_all_pairs_preserves_dijkstra_paths_and_numeric_types()` --calls--> `decimal()`  [INFERRED]
+  src/gql/execution/tests/landmark.rs → crates/surrealdb/surrealdb/core/src/fnc/type.rs
 
 ## Import Cycles
+- 1-file cycle: `src/graph/hypergraph.rs -> src/graph/hypergraph.rs`
+- 1-file cycle: `src/graph/metagraph.rs -> src/graph/metagraph.rs`
+- 1-file cycle: `src/graph/subgraph.rs -> src/graph/subgraph.rs`
+- 1-file cycle: `src/values/runtime/text.rs -> src/values/runtime/text.rs`
 - 1-file cycle: `crates/surrealdb/surrealdb/core/src/idx/seqdocids.rs -> crates/surrealdb/surrealdb/core/src/idx/seqdocids.rs`
 - 1-file cycle: `crates/surrealdb/surrealdb/core/src/idx/trees/hnsw/mod.rs -> crates/surrealdb/surrealdb/core/src/idx/trees/hnsw/mod.rs`
 - 1-file cycle: `crates/surrealdb/surrealdb/core/src/observe/events.rs -> crates/surrealdb/surrealdb/core/src/observe/events.rs`
@@ -1719,10 +2034,6 @@
 - 1-file cycle: `crates/surrealdb/surrealdb/src/engine/tasks.rs -> crates/surrealdb/surrealdb/src/engine/tasks.rs`
 - 1-file cycle: `crates/surrealdb/surrealdb/tests/api_integration/mod.rs -> crates/surrealdb/surrealdb/tests/api_integration/mod.rs`
 - 1-file cycle: `src/collections/radixdb/store/blob_store.rs -> src/collections/radixdb/store/blob_store.rs`
-- 1-file cycle: `src/graph/hypergraph.rs -> src/graph/hypergraph.rs`
-- 1-file cycle: `src/graph/metagraph.rs -> src/graph/metagraph.rs`
-- 1-file cycle: `src/graph/subgraph.rs -> src/graph/subgraph.rs`
-- 1-file cycle: `src/values/runtime/text.rs -> src/values/runtime/text.rs`
 - 2-file cycle: `crates/surrealdb/surrealdb/types/derive/src/attr/mod.rs -> crates/surrealdb/surrealdb/types/derive/src/attr/unnamed_fields.rs -> crates/surrealdb/surrealdb/types/derive/src/attr/mod.rs`
 - 2-file cycle: `crates/surrealdb/surrealdb/core/src/exec/pre_decode_filter/mod.rs -> crates/surrealdb/surrealdb/core/src/exec/pre_decode_filter/streaming.rs -> crates/surrealdb/surrealdb/core/src/exec/pre_decode_filter/mod.rs`
 
@@ -1730,39 +2041,39 @@
 - **GrynQL Contract Stack** — docs_gql_spec_grynql_language, docs_gql_grammar_grynql_grammar, docs_gql_tech_spec_query_engine [INFERRED 0.95]
 - **Values Runtime Storage Separation** — docs_values_plan_runtime_storage_boundary, docs_values_plan_storage_value, src_values_agents_runtime_invariants, src_values_agents_presence_bitmap [INFERRED 0.95]
 
-## Communities (1821 total, 110 thin omitted)
+## Communities (2131 total, 424 thin omitted)
 
 ### Community 0 - "cover"
 Cohesion: 0.09
-Nodes (41): cover(), distinguishes_spaced_record_separator(), enforces_query_depth(), linear_pattern(), parse(), Parser, parses_analyzer_schema_statements_and_inline_mapper(), parses_atomic_import_as_the_only_top_level_statement() (+33 more)
+Nodes (43): GQLConfig, cover(), parse(), ParserSettings, Default, FerrosGrynnResult, From, Self (+35 more)
 
-### Community 1 - "Traverser"
-Cohesion: 0.06
-Nodes (69): BarrierCursor, buffered_value(), is_barrier(), next_group(), CursorRecord, FerrosGrynnResult, Option, Read (+61 more)
+### Community 1 - "collect_dml_candidates"
+Cohesion: 0.09
+Nodes (58): apply_dml_candidate(), apply_dml_data(), collect_dml_candidates(), create_dml_atom(), dml_diff(), dml_property_map(), dml_return_value(), DmlCandidate (+50 more)
 
 ### Community 2 - "trees/knn.rs"
 Cohesion: 0.06
-Nodes (38): confirm_binaryheaps_faster_than_btreeset(), EmptyIterator, f64, FloatKey, get_seed_rnd(), knn_result_builder_test(), new_random_vec(), new_vectors_from_file() (+30 more)
+Nodes (41): confirm_binaryheaps_faster_than_btreeset(), EmptyIterator, f64, FloatKey, get_seed_rnd(), knn_result_builder_test(), KnnResultBuilder, new_random_vec() (+33 more)
 
 ### Community 3 - "Category"
 Cohesion: 0.01
-Nodes (157): Categorise, Category, Display, Formatter, Result, DbAccess, DbAccess<'a>, key() (+149 more)
+Nodes (188): Categorise, Category, Display, Formatter, Result, DbAccess, DbAccess<'a>, key() (+180 more)
 
-### Community 4 - "Row"
-Cohesion: 0.07
-Nodes (70): ResolvedExpand, connector_matches(), direction_accepts(), edge_candidates(), EdgeExpandCursor, EdgeExpandCursor<'a, Graph>, endpoint_is_meta(), expand_row() (+62 more)
+### Community 4 - "EvalContext"
+Cohesion: 0.14
+Nodes (33): argon2_compare_impl(), argon2_generate_impl(), bcrypt_compare_impl(), bcrypt_generate_impl(), cpu_intensive(), pbkdf2_compare_impl(), pbkdf2_generate_impl(), F (+25 more)
 
-### Community 5 - "DatabaseId"
+### Community 5 - "NamespaceId"
 Cohesion: 0.02
-Nodes (177): node_live_query_basic(), DatabaseId, DeserializeRevisioned, Display, Error, Formatter, From, R (+169 more)
+Nodes (181): NamespaceId, DeserializeRevisioned, Display, Error, Formatter, From, R, Result (+173 more)
 
 ### Community 6 - "debug.rs"
 Cohesion: 0.04
 Nodes (58): Hh, Hh<'a>, Cow, IndexId, Self, TableName, test_key(), test_key_size_constant() (+50 more)
 
-### Community 7 - "MaintenanceJobInfo"
-Cohesion: 0.06
-Nodes (50): begin_job(), CoordinatorShared, CoordinatorState, fifo_worker_completes_database_compaction_and_stops_cleanly(), finish_job(), gql_admin_surface_returns_and_resolves_durable_job_ids(), gql_analyze_supports_scoped_approximate_histograms(), job_kind_name() (+42 more)
+### Community 7 - "JobId"
+Cohesion: 0.09
+Nodes (40): Condvar, JoinHandle, begin_job(), CoordinatorShared, CoordinatorState, fifo_worker_completes_database_compaction_and_stops_cleanly(), finish_job(), gql_admin_surface_returns_and_resolves_durable_job_ids() (+32 more)
 
 ### Community 8 - "quarantine.rs"
 Cohesion: 0.12
@@ -1770,115 +2081,107 @@ Nodes (49): ContextCounts, decode_footer(), decode_graph_kind(), decode_header()
 
 ### Community 9 - "FerrosGrynnResult"
 Cohesion: 0.14
-Nodes (31): catalog_checksum(), decode_analyze_mode(), decode_job(), decode_kind(), decode_state(), Decoder, Decoder<'a>, encode_analyze_mode() (+23 more)
+Nodes (32): catalog_checksum(), decode_analyze_mode(), decode_job(), decode_kind(), decode_state(), Decoder, Decoder<'a>, encode_analyze_mode() (+24 more)
 
-### Community 10 - "compat/fixtures.rs"
-Cohesion: 0.02
-Nodes (141): access_bearer(), access_bearer_refresh(), access_jwt_jwks(), access_record(), access_with_authenticate(), batch_value_basic(), database_id_basic(), doc_length_and_count_basic() (+133 more)
+### Community 10 - "TableDefinition"
+Cohesion: 0.04
+Nodes (62): table_any_type(), table_basic(), table_mutations_def(), table_mutations_del(), table_mutations_del_with_original(), table_mutations_set(), table_mutations_set_with_diff(), table_relation() (+54 more)
 
-### Community 11 - "NamespaceId"
+### Community 11 - "DatabaseId"
 Cohesion: 0.02
-Nodes (168): NamespaceId, DeserializeRevisioned, Display, Error, Formatter, From, R, Result (+160 more)
+Nodes (191): node_live_query_basic(), DatabaseId, DeserializeRevisioned, Display, Error, Formatter, From, R (+183 more)
 
 ### Community 12 - "Transaction"
 Cohesion: 0.04
-Nodes (56): BoxProviderFut, ValueType, Base, DefineUserStatement, Duration, Option, Strand, String (+48 more)
+Nodes (58): BoxProviderFut, ValueType, AccessGrant, Datetime, Base, DefineUserStatement, Duration, Option (+50 more)
 
 ### Community 13 - "WindowsIoRing"
 Cohesion: 0.06
 Nodes (49): c_void, HIORING, IORING_BUFFER_REF, IORING_HANDLE_REF, IORING_VERSION, FilePageExtent, IoProfile, median_sample() (+41 more)
 
 ### Community 14 - "SchemaAnalyzer"
-Cohesion: 0.06
-Nodes (77): Filters, AnalyzerFilter, AnalyzerLanguage, canonicalizes_tokenizer_set_but_preserves_filter_order(), rejects_invalid_ngrams_and_mapper_terms(), BTreeMap, BTreeSet, ExactSizeIterator (+69 more)
+Cohesion: 0.09
+Nodes (27): Filters, AnalyzerFilter, AnalyzerId, AnalyzerLanguage, AnalyzerTokenizer, canonicalizes_tokenizer_set_but_preserves_filter_order(), rejects_invalid_ngrams_and_mapper_terms(), BTreeMap (+19 more)
 
-### Community 15 - "SnapshotId"
-Cohesion: 0.06
-Nodes (43): CanonicalScopedHop, AtomRef, EndpointRole, graph_ref(), Path, PathDirection, PathStep, PathTraceArena (+35 more)
+### Community 15 - "Path"
+Cohesion: 0.04
+Nodes (70): FilterCursor, LimitCursor, MatchGraphFields<'a, Read>, MatchGraphFields<'_, Read>, OneRowCursor, ProjectCursor, properties_object(), RecordFields (+62 more)
 
-### Community 16 - "IndexDefinition"
-Cohesion: 0.13
-Nodes (35): IndexDefinition, DefineIndexStatement, Idiom, Index, TableName, RangeBound, CompoundEqualIterator, CompoundRangeBackwardIterator (+27 more)
-
-### Community 17 - "eval"
-Cohesion: 0.15
-Nodes (43): AtomFieldRead, arithmetic(), binary(), cast(), collection_values(), contains(), current_field(), decimal_arithmetic() (+35 more)
+### Community 16 - "Result"
+Cohesion: 0.12
+Nodes (32): RangeBound, Self, Value, CompoundEqualIterator, CompoundRangeBackwardIterator, CompoundRangeForwardIterator, CompoundRangeIterator, compute_compound_key_range() (+24 more)
 
 ### Community 18 - "Number"
 Cohesion: 0.08
 Nodes (30): BigInt, canonical_float(), canonical_fraction(), canonicalizes_nan_and_signed_zero_for_eq_ord_and_hash(), CanonicalNumber, conversion_error(), Decimal, f32 (+22 more)
 
-### Community 19 - "harness.rs"
-Cohesion: 0.06
-Nodes (60): Buffer, candidate_bases_are_interleaved_before_rotation(), CandidateFootprint, ColdDirectTransport, combination_candidates(), CombinationCandidate, contiguous_hot_preload(), extent_inputs() (+52 more)
+### Community 19 - "RowCursor"
+Cohesion: 0.02
+Nodes (272): Canonical, EdgeGraph, Hop, QueryPhysicalTraversalCandidate, ascending(), bound_atom_value(), distinct_rows(), invalid_match_run() (+264 more)
 
 ### Community 20 - "ferntree/src/iter.rs"
 Cohesion: 0.04
 Nodes (113): Anchor, bidirectional_from_end(), bidirectional_from_start(), bidirectional_next_prev_consistency(), Cursor, cursor_alternating_next_prev(), cursor_next_from_after_middle(), cursor_next_from_after_second_to_last() (+105 more)
 
 ### Community 21 - "ExecOperator"
-Cohesion: 0.05
-Nodes (123): ExecOperator, binding(), binding_name(), binding_names(), ChainStage, clause_edge_bindings(), clause_mut(), col() (+115 more)
+Cohesion: 0.04
+Nodes (135): ExecOperator, binding(), binding_name(), binding_names(), ChainStage, clause_edge_bindings(), clause_mut(), col() (+127 more)
 
 ### Community 22 - "TreeNode<S>"
 Cohesion: 0.04
-Nodes (23): BorrowedBlobRef, BorrowedBlobRef<'a>, BorrowedTreeNode, BorrowedTreeNode<'a, S>, BorrowedTreeNodeIter<S>, CompactOwnedBlob, Header, OwnedBlobRef (+15 more)
+Nodes (23): BorrowedBlobRef, BorrowedBlobRef<'a>, BorrowedTreeNode<'a, S>, ChildrenRef<S>, CompactOwnedBlob, Header, OwnedBlobRef, OwnedBlobRef<'a> (+15 more)
 
-### Community 23 - "bind_match_position"
-Cohesion: 0.07
-Nodes (64): atom_matches(), bind_atom(), bind_match_position(), resolve_expand(), resolve_match_binding(), resolve_path_expand(), ResolvedMatchBinding, ResolvedMatchSelector (+56 more)
+### Community 23 - "TransactionGraphView"
+Cohesion: 0.09
+Nodes (24): effective_projection_borrows_base_until_an_overlay_exists(), Arc, AtomicU64, Cow, DatabaseRoot, Edge, EdgeIds, FerrosGrynnResult (+16 more)
 
 ### Community 24 - "status_codes.rs"
 Cohesion: 0.09
 Nodes (28): define_status_codes(), is_string(), is_vec_string(), last_path_ident(), option_lit(), LitStr, Option, Parse (+20 more)
 
-### Community 25 - "write_explicit"
-Cohesion: 0.07
-Nodes (51): build_explicit(), build_scoped_index_images(), invalid(), label_filename(), label_ids(), local_address(), local_addresses(), AtomId (+43 more)
+### Community 25 - "f"
+Cohesion: 0.10
+Nodes (19): f(), S2, inner_combine_children_pred(), left_combine_children_pred(), RadixTree, RadixTree<S>, AsRef, Copy (+11 more)
 
 ### Community 26 - ".persist_generation"
-Cohesion: 0.08
-Nodes (45): create_generation_files(), create_generation_files_with_mode(), create_import_generation_files(), io_failure(), page_count(), Error, FerrosGrynnError, FerrosGrynnResult (+37 more)
+Cohesion: 0.05
+Nodes (66): DatabaseLock, PageIo, RetiredGeneration, create_generation_files(), create_generation_files_with_mode(), create_import_generation_files(), io_failure(), page_count() (+58 more)
 
 ### Community 27 - "GraphKind"
 Cohesion: 0.02
-Nodes (78): assert_snapshot_released(), AtomIds, AtomIds<'a>, AtomOccurrenceRef, AtomRef, cascade_removal_marks_removed_incident_edges_dirty(), disk_view_and_hybrid_materialization_have_the_same_read_result(), DiskGraphView (+70 more)
+Nodes (71): FusedIterator, Inner, assert_snapshot_released(), AtomIds, AtomIds<'a>, AtomRef, cascade_removal_marks_removed_incident_edges_dirty(), disk_view_and_hybrid_materialization_have_the_same_read_result() (+63 more)
 
 ### Community 28 - "DirectedGraph"
-Cohesion: 0.08
-Nodes (38): BitmapIndex, BoxedStrategy, RoaringBitmap, arb_nonempty_tree(), arb_prufer_sequence(), arb_tree(), DfsAncestorsIterator, DfsAncestorsIterator<'a, G> (+30 more)
-
-### Community 29 - "Position"
 Cohesion: 0.07
-Nodes (35): GeoJsonGeometry, GeoJsonPosition, assert_status(), compare_float_slices(), GeoJsonValue, Geometry, into_position(), into_positions() (+27 more)
+Nodes (39): BitmapIndex, BoxedStrategy, RoaringBitmap, ReductionState, arb_nonempty_tree(), arb_prufer_sequence(), arb_tree(), DfsAncestorsIterator (+31 more)
 
 ### Community 30 - "hash_join.rs"
-Cohesion: 0.05
+Cohesion: 0.04
 Nodes (91): DistinctEdges, drops_row_with_duplicate_edge(), drops_row_with_duplicate_hidden_record_id_edges(), drops_when_single_edge_collides_with_group_element(), edge_id_from_object(), edge_obj(), empty_group_passes(), empty_input_yields_nothing() (+83 more)
 
-### Community 31 - "BaseAtom"
-Cohesion: 0.08
-Nodes (21): AtomStoreRoot, BaseAtom, GlobalAtomId, GlobalSlotAllocator, reused_slot_rejects_the_stale_global_atom_id(), Arc, AtomId, BTreeMap (+13 more)
+### Community 31 - "Lsn"
+Cohesion: 0.04
+Nodes (45): PageLoadExtent, Lsn, PageKey, FrameWal, FerrosGrynnResult, Option, Vec, FrameWal (+37 more)
 
-### Community 32 - "Result"
+### Community 32 - "IndexDefinition"
 Cohesion: 0.05
-Nodes (58): count_compaction_batches_visible_deltas(), count_compaction_generation_allows_only_one_winner(), count_compaction_preserves_post_snapshot_deltas(), count_value(), IndexCountCompactionPlan, IndexCountThingIterator, IndexEqualThingIterator, IndexItemRecord (+50 more)
+Nodes (64): IndexDefinition, DefineIndexStatement, Idiom, Index, TableName, count_compaction_batches_visible_deltas(), count_compaction_generation_allows_only_one_winner(), count_compaction_preserves_post_snapshot_deltas() (+56 more)
 
 ### Community 33 - "lower/test.rs"
 Cohesion: 0.02
-Nodes (68): assert_rejects(), lower_err(), lower_plan(), lowers_collect_to_array_group(), lowers_count_field_with_non_null_guard(), lowers_count_star_to_group_all(), lowers_functionally_dependent_column(), lowers_group_by_with_aggregates() (+60 more)
+Nodes (55): assert_rejects(), lower_err(), lowers_collect_to_array_group(), lowers_count_field_with_non_null_guard(), lowers_count_star_to_group_all(), lowers_functionally_dependent_column(), lowers_group_by_with_aggregates(), lowers_order_by_non_projected_group_key() (+47 more)
 
 ### Community 34 - "Text"
 Cohesion: 0.08
 Nodes (24): CompactString, exposes_controlled_utf8_mutation(), round_trips_through_std_and_compact_strings(), AsRef, Borrow, Deref, Display, Err (+16 more)
 
-### Community 35 - "PageCacheKey"
-Cohesion: 0.06
-Nodes (46): AtomicBatchReservation, Self, SourceEpoch, SourceIdentity, DirectoryShard, FrameBytes, FrameMeta, LoadReservation (+38 more)
+### Community 35 - "AtomicArenaBufferPool"
+Cohesion: 0.07
+Nodes (40): AtomicBatchReservation, loader(), DirectoryShard, FrameBytes, FrameMeta, LoadReservation, ModuleLoader, PinResult (+32 more)
 
-### Community 36 - "QueryPlanner"
-Cohesion: 0.10
-Nodes (21): GrantedPermission, IterationStage, QueryPlanner, AtomicU8, Cond, Fields, FrozenContext, Groups (+13 more)
+### Community 36 - "exec.rs"
+Cohesion: 0.03
+Nodes (64): AstDestructurePart, binding_record_id(), check_cancelled(), gql_output_rows_exceeded(), ControlFlow, FlowResult, Option, RecordId (+56 more)
 
 ### Community 37 - "metadata_cow.rs"
 Cohesion: 0.11
@@ -1886,59 +2189,55 @@ Nodes (41): database_lock_is_exclusive(), DatabaseLock, io_failure(), Error, Fer
 
 ### Community 38 - "SparseSet<T>"
 Cohesion: 0.11
-Nodes (19): atom(), invalid_atom(), rejects_null_atom(), AtomId, Box, Default, ExactSizeIterator, FerrosGrynnError (+11 more)
+Nodes (20): atom(), invalid_atom(), rejects_null_atom(), AtomId, Box, Default, ExactSizeIterator, FerrosGrynnError (+12 more)
 
 ### Community 39 - "Duration"
 Cohesion: 0.09
 Nodes (21): DateTime, Duration, Default, Display, Eq, Err, Formatter, From (+13 more)
 
 ### Community 40 - "Id"
-Cohesion: 0.05
-Nodes (27): HeaderValue, Deref, E, Error, From, Header, HeaderName, HeaderValue (+19 more)
+Cohesion: 0.14
+Nodes (7): Id, Default, Index, IndexMut, Output, Vec, SIV<T>
 
 ### Community 41 - "PropertyColumn<T>"
 Cohesion: 0.10
 Nodes (18): atom(), DenseBitmap, distinguishes_none_null_and_value(), PropertyColumn<T>, PropertyState, removing_null_reports_null_instead_of_none(), replacement_removal_and_generation_keep_bitmaps_aligned(), Any (+10 more)
 
 ### Community 42 - "HybridReadEngine"
-Cohesion: 0.06
-Nodes (31): HybridReadEngine, ReadScope, ReadScope<'engine>, ResolvedPageTable, ResolvedPageWindow, Arc, AtomicArenaBufferPool, AtomicEpochPage (+23 more)
+Cohesion: 0.05
+Nodes (44): ReadIntent, HybridReadEngine, ReadScope, ReadScope<'engine>, ResolvedPageTable, ResolvedPageWindow, Arc, AtomicArenaBufferPool (+36 more)
 
-### Community 43 - "imports.rs"
-Cohesion: 0.23
-Nodes (27): count(), del(), del_batch(), del_rng(), encode_range(), entries(), exists(), get() (+19 more)
+### Community 43 - "VersionScope"
+Cohesion: 0.12
+Nodes (8): Arc, FlowResult, Option, Self, String, ValueBatchStream, Vec, VersionScope
 
-### Community 44 - "Closure"
-Cohesion: 0.07
-Nodes (26): ClosureFunction, calls_function_and_keeps_process_identity(), Closure, ClosureImplementation, different_closures_have_different_identity(), rejects_wrong_arity_before_invocation(), Arc, Debug (+18 more)
+### Community 44 - "Type"
+Cohesion: 0.04
+Nodes (42): ClosureFunction, is_option(), ClassField, IntoText, Option, SchemaId, Self, Text (+34 more)
 
 ### Community 45 - "vector_index/codec.rs"
-Cohesion: 0.05
-Nodes (100): bind_physical_indexes(), CachedVectorPage, FerrosDiskAnnProvider, invalid(), LocalStore, PhysicalIndexEntries, PhysicalIndexFile, PhysicalIndexRead (+92 more)
+Cohesion: 0.08
+Nodes (74): assemble_hnsw_index(), decode_directory(), decode_distance(), decode_nodes(), decode_stream(), decode_validated_vector_stream_page(), decode_vector_directory_entry(), decode_vector_header() (+66 more)
 
-### Community 46 - "ContextLevel"
+### Community 46 - "AccessMode"
 Cohesion: 0.01
-Nodes (142): ContextLevel, BuiltinFunctionExec, Any, Arc, BoxFut, FlowResult, String, Value (+134 more)
+Nodes (132): AccessMode, CombineAccessModes, Item, Self, BuiltinFunctionExec, Any, Arc, BoxFut (+124 more)
 
-### Community 47 - "Result"
-Cohesion: 0.04
-Nodes (91): archive_node_for_shutdown(), archive_node_for_shutdown_reports_failure(), archive_node_for_shutdown_reports_success(), archive_node_for_shutdown_reports_timeout(), assert_index_compaction_commit_retry(), await_node_step(), await_node_tx_step(), CatalogNodeEndpointResolver (+83 more)
+### Community 47 - "Datastore"
+Cohesion: 0.03
+Nodes (109): DatastoreCache, Cache, Self, archive_node_for_shutdown(), archive_node_for_shutdown_reports_failure(), archive_node_for_shutdown_reports_success(), archive_node_for_shutdown_reports_timeout(), assert_index_compaction_commit_retry() (+101 more)
 
 ### Community 48 - "PageNo"
-Cohesion: 0.05
-Nodes (103): decode_adjacency_overflow(), decode_cross_level_overflow(), encode_adjacency_overflow(), encode_cross_level_overflow(), EndpointSide, QualifiedDiskAtomRef, DiskAtomRef, FerrosGrynnResult (+95 more)
+Cohesion: 0.03
+Nodes (158): EdgeSlotFlags, NodeSlotFlags, decode_adjacency_overflow(), decode_cross_level_overflow(), encode_adjacency_overflow(), encode_cross_level_overflow(), EndpointSide, QualifiedDiskAtomRef (+150 more)
 
 ### Community 49 - "arrow.rs"
-Cohesion: 0.07
-Nodes (46): ArrayRef, ArrowError, BooleanBuffer, DataType, arrow_failure(), arrow_round_trip_preserves_none_null_and_native_scalars(), build_array(), ColumnKind (+38 more)
-
-### Community 50 - "atom_store_image.rs"
-Cohesion: 0.10
-Nodes (56): AtomStoreCheckpointAuthority, AtomStoreFileSet, backfill_atom_store_checkpoint(), build_atom_store_data_with_context(), build_atom_store_image(), build_atom_store_image_with_context(), build_durable_atom_store_image(), build_durable_atom_store_image_with_context() (+48 more)
+Cohesion: 0.11
+Nodes (36): ArrayRef, ArrowError, DataType, arrow_failure(), arrow_round_trip_preserves_none_null_and_native_scalars(), build_array(), ColumnKind, decode_rows() (+28 more)
 
 ### Community 51 - "SchemaVersion"
-Cohesion: 0.11
-Nodes (73): PruneKind, FunctionId, SchemaVersion, atom(), build_adjacency(), build_diskann_adjacency(), build_distance(), build_graph_with_hasher_and_distance() (+65 more)
+Cohesion: 0.09
+Nodes (76): PruneKind, FunctionId, SchemaVersion, FulltextIndexOptions, AnalyzerId, BTreeSet, atom(), build_adjacency() (+68 more)
 
 ### Community 52 - "Vector"
 Cohesion: 0.09
@@ -1946,39 +2245,39 @@ Nodes (24): canonical_f16(), canonical_f32(), canonical_f64(), compare_f16(), co
 
 ### Community 53 - "tests/function.rs"
 Cohesion: 0.03
-Nodes (133): error_on_invalid_function(), function_custom_typed_returns(), function_http_disabled(), function_idiom_chaining(), function_outside_database(), function_rand_time(), function_rand_ulid(), function_rand_ulid_from_datetime() (+125 more)
+Nodes (155): check_test_is_error(), error_on_invalid_function(), function_custom_typed_returns(), function_http_disabled(), function_idiom_chaining(), function_outside_database(), function_rand_time(), function_rand_ulid() (+147 more)
 
 ### Community 54 - "Range"
 Cohesion: 0.14
 Nodes (26): End, borrow_bound(), Bound<T>, bound_value(), BoundExt, box_bound(), checks_inclusion(), compare_end() (+18 more)
 
 ### Community 55 - "database/codec.rs"
-Cohesion: 0.05
-Nodes (119): class_mode(), decode(), decode_analyzer(), decode_analyzer_filter(), decode_analyzer_language(), decode_atom_kind(), decode_class(), decode_class_mode() (+111 more)
+Cohesion: 0.06
+Nodes (103): analyzer_language(), atom_kind(), class_mode(), decode(), decode_analyzer(), decode_analyzer_filter(), decode_analyzer_language(), decode_atom_kind() (+95 more)
 
 ### Community 56 - "vec_map.rs"
 Cohesion: 0.03
-Nodes (99): FnMut, Ordering, Result, T, search_sorted_by(), &'a VecMap<K, V>, append_full_overlap_all_keys_match(), append_interleaved_keys_merges_sorted() (+91 more)
+Nodes (101): FnMut, Ordering, Result, T, search_sorted_by(), &'a VecMap<K, V>, append_full_overlap_all_keys_match(), append_interleaved_keys_merges_sorted() (+93 more)
 
 ### Community 57 - "diskann/index.rs"
 Cohesion: 0.06
 Nodes (94): cache(), cached_doc_ids(), cancel_silently(), CapturedPendingKey, compact_once(), diskann_accepts_supported_vector_types_and_distances(), diskann_all_pending_states_empty(), diskann_any_pending_state_maybe_empty() (+86 more)
 
 ### Community 58 - "Sequences"
-Cohesion: 0.10
-Nodes (25): key(), NamespaceIdGeneratorStateKey, Self, Uuid, BatchValue, Arc, DocId, Duration (+17 more)
+Cohesion: 0.07
+Nodes (40): sequence_state_basic(), Ib, Ib<'a>, ib_range(), Cow, IndexId, Range, Result (+32 more)
 
 ### Community 59 - "hnsw_memory.rs"
-Cohesion: 0.13
-Nodes (26): Build, CacheEntry, CacheKey, CacheState, configured(), configured_bytes(), configured_cache(), hnsw_build_memory_bytes() (+18 more)
+Cohesion: 0.09
+Nodes (41): compute_schema_fingerprint(), GraphQLSchemaCache, insert_bounded(), insert_bounded_evicts_oldest_first(), insert_bounded_keeps_distinct_prefixes(), insert_bounded_replaces_stale_fingerprint_for_same_prefix(), key(), Arc (+33 more)
 
-### Community 60 - "FerrosGrynnResult"
-Cohesion: 0.16
-Nodes (17): graph_scan_page(), graph_scan_pages_are_bounded_and_resumable(), is_navigation(), occurrence(), AtomId, AtomOccurrenceRef, FerrosGrynnResult, GraphRef (+9 more)
+### Community 60 - "gql/execution/mod.rs"
+Cohesion: 0.08
+Nodes (71): ImportItemPayload, evaluate_graph_properties(), execute_graph_property_update(), graph_row(), intern_object_keys(), object_to_property_map(), property_map_to_object(), Box (+63 more)
 
-### Community 61 - "Type"
-Cohesion: 0.05
-Nodes (111): is_option(), TextSpan, ClassSchemaMode, aggregate_name(), aggregate_type(), all_columns_wildcard(), analyze(), analyze_statement() (+103 more)
+### Community 61 - "FerrosGrynnResult"
+Cohesion: 0.04
+Nodes (122): DmlData, DmlReturn, DmlTarget, ExpectClause, KeepLevelPathClause, RangeInclusive, SelectSource, SelectTarget (+114 more)
 
 ### Community 62 - "Regex"
 Cohesion: 0.09
@@ -1989,16 +2288,16 @@ Cohesion: 0.11
 Nodes (15): &'a Set, BTreeSet<Value>, deduplicates_and_orders_values(), BTreeSet, From, FromIterator, IntoIter, IntoIterator (+7 more)
 
 ### Community 64 - "fulltext_index.rs"
-Cohesion: 0.14
+Cohesion: 0.13
 Nodes (47): analyzer(), build_fulltext_index(), BuiltFulltextIndex, decode_dictionary(), decode_documents(), decode_fulltext_index(), decode_header(), decode_postings() (+39 more)
 
-### Community 65 - "analyze.rs"
-Cohesion: 0.04
-Nodes (95): PlannerDemand, PlannerPropertyDemand, Box, BTreeSet, analyze_base(), analyze_base_with_method_at(), analyze_database(), analyze_database_at() (+87 more)
+### Community 65 - "LocalQuerySnapshot"
+Cohesion: 0.12
+Nodes (37): DecodedHnswIndex, DecodedVectorIndex, PagedVectorHeader, PagedVectorNode, bind_physical_indexes(), CachedVectorPage, FerrosDiskAnnProvider, invalid() (+29 more)
 
 ### Community 66 - "pre_decode_filter/mod.rs"
-Cohesion: 0.09
-Nodes (51): apply_binary(), combine_and(), combine_or(), empty_and_never_rejects(), eval_anyinside_via_apply_binary(), eval_contains_any_negative_rejects(), eval_contains_substring_provably_false_via_apply_binary(), eval_not_inside_via_prednode_not_inverts() (+43 more)
+Cohesion: 0.08
+Nodes (53): apply_binary(), combine_and(), combine_or(), empty_and_never_rejects(), eval_anyinside_via_apply_binary(), eval_contains_any_negative_rejects(), eval_contains_substring_provably_false_via_apply_binary(), eval_not_inside_via_prednode_not_inverts() (+45 more)
 
 ### Community 67 - "Object"
 Cohesion: 0.10
@@ -2009,68 +2308,64 @@ Cohesion: 0.10
 Nodes (23): add_m, Attrs, measurable_inner(), occurrence_error(), add, DeriveInput, Error, Parse (+15 more)
 
 ### Community 69 - "parse_err"
-Cohesion: 0.02
-Nodes (112): accent_quoted_is_always_an_identifier(), aggregate_argument_errors(), assert_string_literal(), cast_rejected(), chained_comparisons_rejected(), double_minus_is_a_comment_in_expressions(), double_quoted_disambiguation(), float_literals() (+104 more)
+Cohesion: 0.03
+Nodes (104): accent_quoted_is_always_an_identifier(), aggregate_argument_errors(), assert_string_literal(), cast_rejected(), chained_comparisons_rejected(), double_minus_is_a_comment_in_expressions(), double_quoted_disambiguation(), float_literals() (+96 more)
 
 ### Community 70 - "BarrierAccount"
 Cohesion: 0.10
 Nodes (59): atom_ref(), build_graph(), BuiltGraph, close_edge(), close_selections(), ContainmentIndex, ContainmentLink, include_minimal_owners() (+51 more)
 
-### Community 71 - "ObjectStore"
-Cohesion: 0.12
-Nodes (23): BucketConnectionKey, BucketsManager, Inner, Arc, Box, Config, DashMap, Option (+15 more)
+### Community 71 - "FerrosGrynnResult"
+Cohesion: 0.14
+Nodes (27): binding(), effective_index_key(), GlobalAtomId, index_key(), IndexStoreRoot, IntoAddress, invalid(), KeyChange (+19 more)
 
-### Community 72 - "Lsn"
-Cohesion: 0.04
-Nodes (50): PageLoadExtent, Lsn, PageKey, FrameWal, FerrosGrynnResult, Option, Vec, PendingTransaction (+42 more)
+### Community 72 - "rocksdb/cnf.rs"
+Cohesion: 0.03
+Nodes (63): BlobCompression, default_blob_file_size(), default_block_cache_size(), default_compaction_readahead_size(), default_enable_blob_files(), default_file_compaction_trigger(), default_grouped_commit_max_batch_size(), default_jobs_count() (+55 more)
 
 ### Community 73 - "CowVec<T, CHUNK_LEN>"
-Cohesion: 0.10
+Cohesion: 0.11
 Nodes (17): clone_copies_only_the_changed_chunk(), CowVec<T, CHUNK_LEN>, Iter, Iter<'a, T>, Arc, Default, FnMut, From (+9 more)
 
-### Community 74 - "label_dict.rs"
-Cohesion: 0.04
-Nodes (128): DegreeHistogramKey, LabelStatistic, write_u32(), append_entries(), append_hash(), bindings(), decode_entries(), decode_hash() (+120 more)
+### Community 74 - "S"
+Cohesion: 0.10
+Nodes (13): first_value(), KeyValueIter, KeyValueIter<S>, last_entry(), last_value(), OwnedTreeNodeIter<'a, S>, Option, S (+5 more)
 
-### Community 75 - "Severity"
-Cohesion: 0.15
-Nodes (10): Severity, Condition, Domain, ErrorCategory, ErrorClassification, NotificationClassification, Option, String (+2 more)
+### Community 75 - "AnalyzerDefinition"
+Cohesion: 0.18
+Nodes (13): analyzer_basic(), analyzer_with_tokenizers(), AnalyzerDefinition, filter_structure_value(), DefineAnalyzerStatement, Filter, Option, Strand (+5 more)
 
 ### Community 76 - "Self"
 Cohesion: 0.12
 Nodes (16): DagView, ForestView, GraphView, Dag<State>, DagView<'graph, R>, directed_forest_view(), Forest<State>, RootedTree<State> (+8 more)
 
-### Community 77 - "RowCursor"
-Cohesion: 0.05
-Nodes (75): EdgeGraph, MatchPredicateContext, BoundAtom, append_scoped_trace_hop(), CrossLevelExpandCursor, CrossLevelExpandCursor<'a, Read>, CrossLevelExpandCursor<'_, Read>, local_atom_is_meta() (+67 more)
+### Community 78 - "ScanDirection"
+Cohesion: 0.04
+Nodes (96): AccessPath, BTreeAccess, find_hinted_index(), IndexRef, Arc, BinaryOperator, Deref, Eq (+88 more)
 
-### Community 78 - "ResolvedTableContext"
-Cohesion: 0.05
-Nodes (97): resolve_table_context(), ResolvedTableContext, Arc, Error, Result, TableName, adjust_direction_for_order(), collect_field_names() (+89 more)
+### Community 79 - "DocumentContext"
+Cohesion: 0.13
+Nodes (24): FrozenContext, Option, Self, SyncDistinct, Processable, Collectable, Collector, ConcurrentCollector (+16 more)
 
-### Community 79 - "open_graph_image"
-Cohesion: 0.08
-Nodes (69): cross_side(), decode_topology(), invalid(), local_side(), resolve_qualified(), AtomId, BTreeMap, DatabaseRoot (+61 more)
-
-### Community 80 - "ObjectKey"
-Cohesion: 0.09
-Nodes (20): ObjectKey, Default, Deref, Display, Eq, Formatter, From, H (+12 more)
+### Community 80 - ".check_permission"
+Cohesion: 0.14
+Nodes (17): accept_payload(), Action, BucketController, BucketController<'a>, BucketOperation, Arc, Bytes, Display (+9 more)
 
 ### Community 81 - "ferntree/src/lib.rs"
 Cohesion: 0.05
-Nodes (113): basic_insert_and_lookup(), clear_empties_tree(), clear_empty_tree(), clear_maintains_invariants(), clear_then_insert(), contains_key_empty_tree(), contains_key_returns_false_for_missing(), contains_key_returns_true_for_existing() (+105 more)
+Nodes (114): basic_insert_and_lookup(), clear_empties_tree(), clear_empty_tree(), clear_maintains_invariants(), clear_then_insert(), contains_key_empty_tree(), contains_key_returns_false_for_missing(), contains_key_returns_true_for_existing() (+106 more)
 
 ### Community 82 - "hnsw/mod.rs"
 Cohesion: 0.08
-Nodes (66): IndexId, DeserializeRevisioned, From, Revisioned, SerializeRevisioned, SkipRevisioned, WalkRevisioned, compute_recall() (+58 more)
+Nodes (65): IndexId, DeserializeRevisioned, From, Revisioned, SerializeRevisioned, SkipRevisioned, WalkRevisioned, compute_recall() (+57 more)
 
 ### Community 83 - "FieldState"
-Cohesion: 0.04
-Nodes (104): ComputedDeps, evaluate_bound_key(), extract_record_ids_into(), fetch_and_filter_records_batch(), resolve_record_batch(), resolve_version_stamp(), Arc, ControlFlow (+96 more)
+Cohesion: 0.03
+Nodes (110): ComputedDeps, evaluate_bound_key(), extract_record_ids_into(), fetch_and_filter_records_batch(), resolve_record_batch(), resolve_version_stamp(), Arc, ControlFlow (+102 more)
 
 ### Community 84 - "path_expand.rs"
-Cohesion: 0.04
-Nodes (84): attrs_render_direction_tables_and_label(), attrs_render_wildcard_tables(), candidate_row(), candidate_row_inserts_edge_and_target(), edge_specs_empty_for_wildcard(), edge_specs_unbounded_per_table(), EdgeBinding, Expand (+76 more)
+Cohesion: 0.03
+Nodes (105): attrs_render_direction_tables_and_label(), attrs_render_wildcard_tables(), candidate_row(), candidate_row_inserts_edge_and_target(), edge_specs_empty_for_wildcard(), edge_specs_unbounded_per_table(), EdgeBinding, Expand (+97 more)
 
 ### Community 85 - "graph_core.rs"
 Cohesion: 0.35
@@ -2081,68 +2376,64 @@ Cohesion: 0.18
 Nodes (8): Bytes, exposes_only_byte_oriented_api(), From, IntoVec, Iter, Self, Vec, Vec<u8>
 
 ### Community 87 - "write_fulltext_index_stream"
-Cohesion: 0.15
-Nodes (28): decode_dictionary_metadata(), decode_term(), decode_token_key(), dictionary_metadata_key(), DictionaryMetadata, document_key(), encode_term(), invalid() (+20 more)
+Cohesion: 0.16
+Nodes (27): decode_dictionary_metadata(), decode_term(), decode_token_key(), dictionary_metadata_key(), DictionaryMetadata, document_key(), encode_term(), invalid() (+19 more)
 
 ### Community 88 - "unsafed/os.rs"
 Cohesion: 0.25
 Nodes (3): get_max_file_descriptors(), get_open_file_descriptors(), Option
 
-### Community 89 - "TableScan"
-Cohesion: 0.14
-Nodes (10): Arc, FlowResult, HashSet, Option, Self, String, TableName, ValueBatchStream (+2 more)
+### Community 89 - "topk_pushdown.rs"
+Cohesion: 0.08
+Nodes (36): Arc, FlowResult, HashSet, Option, Self, String, TableName, ValueBatchStream (+28 more)
 
-### Community 90 - "K"
-Cohesion: 0.07
-Nodes (37): ExclusiveGuard, HybridLatch, OptimisticGuard, AtomicUsize, SharedGuard, Direction, GenericTree<K, V, IC, LC>, InternalNode (+29 more)
+### Community 90 - "V"
+Cohesion: 0.08
+Nodes (38): ExclusiveGuard, HybridLatch, OptimisticGuard, AtomicUsize, SharedGuard, Direction, GenericTree<K, V, IC, LC>, InternalNode (+30 more)
 
 ### Community 91 - "Graphify"
 Cohesion: 0.15
 Nodes (13): Add URL and Watch Folder, Graphify Extra Exports, Semantic Extraction Contract, GitHub Clone and Cross-Repo Merge, Graphify Commit and Claude Hooks, Graph Query Path and Explain, Video and Audio Transcription, Incremental Graph Update (+5 more)
 
-### Community 92 - "match/model.rs"
-Cohesion: 0.11
-Nodes (34): Parser<'_>, FerrosGrynnResult, Identifier, Option, MatchConstraints, MatchContains, MatchEdge, MatchEndpoint (+26 more)
+### Community 92 - "analyze.rs"
+Cohesion: 0.04
+Nodes (113): ReadPage, PlannerPropertyHistogram, analyze_base(), analyze_base_with_method_at(), analyze_database(), analyze_database_at(), analyze_database_with_method_at(), analyze_graph() (+105 more)
 
-### Community 93 - "atomic_arena.rs"
+### Community 93 - "PageCacheKey"
 Cohesion: 0.05
-Nodes (92): assert_pinned_frame_backpressure(), AtomicArenaBufferPool, AtomicBatchReservation, AtomicBatchReservation<'pool>, AtomicEpochPage, AtomicPageGuard, AtomicReadEpoch, bounded_capacity_backoff() (+84 more)
+Nodes (93): assert_pinned_frame_backpressure(), AtomicArenaBufferPool, AtomicBatchReservation, AtomicBatchReservation<'pool>, AtomicEpochPage, AtomicPageGuard, AtomicReadEpoch, bounded_capacity_backoff() (+85 more)
 
 ### Community 94 - "Dag<State>"
 Cohesion: 0.05
-Nodes (55): build_oriented_tree_storage(), build_storage(), constraint(), Dag, Dag<Frozen>, Dag<Mutable>, Dag<State>, DagStorage (+47 more)
-
-### Community 95 - "TableInfoPlan"
-Cohesion: 0.13
-Nodes (12): execute_table_info(), process(), Arc, FlowResult, Option, Self, String, T (+4 more)
+Nodes (53): build_oriented_tree_storage(), build_storage(), constraint(), Dag, Dag<Frozen>, Dag<Mutable>, Dag<State>, DagStorage (+45 more)
 
 ### Community 96 - "Number"
 Cohesion: 0.04
-Nodes (42): Decimal, DecimalExt, fixed_decimal_uses_round_dp(), fixed_float_preserves_non_finite(), Number, NumberKind, ord_test(), Decimal (+34 more)
+Nodes (45): TryNeg, TryPow, Decimal, DecimalExt, fixed_decimal_uses_round_dp(), fixed_float_preserves_non_finite(), Number, NumberKind (+37 more)
 
-### Community 97 - "PageLsn"
-Cohesion: 0.20
-Nodes (29): append_scalar_group(), count_standard_layout(), count_unique_leaves(), flush_internal_group(), flush_label_page(), flush_standard_leaf(), flush_unique_leaf(), internal_accepts() (+21 more)
+### Community 97 - "demo/src/lib.rs"
+Cohesion: 0.07
+Nodes (58): bound_to_tag(), decode_argument_list(), decode_kind_list(), decode_optional_values(), decode_string_key_values(), decode_string_range(), decode_value_list(), encode_argument_list() (+50 more)
 
 ### Community 98 - "Strand"
 Cohesion: 0.04
 Nodes (79): boxed_clone_is_deep_copy(), cross_repr_equality(), default_is_empty_inline(), deserialize_revisioned_rejects_invalid_utf8(), empty_is_inline(), hashing_works_as_map_key(), HeapData, inline_clone_is_independent_copy() (+71 more)
 
 ### Community 99 - "Context"
-Cohesion: 0.04
-Nodes (46): Context, is_allowed_respects_context_auth_toggle_and_base(), Action, Arc, AtomicBool, Base, CancellationToken, Capabilities (+38 more)
+Cohesion: 0.06
+Nodes (25): Context, Arc, AtomicBool, CancellationToken, Capabilities, Debug, Duration, Error (+17 more)
 
 ### Community 100 - "DirectedAcyclicGraph"
 Cohesion: 0.07
-Nodes (38): arb_dag(), BfsVerticesIterator, BfsVerticesIterator<'a>, DirectedAcyclicGraph, DirectedAcyclicGraphValueTree, divisibility_poset_12_children(), divisibility_poset_of_12_descendants(), divisibility_poset_of_12_dfs_descendants() (+30 more)
+Nodes (37): arb_dag(), BfsVerticesIterator, BfsVerticesIterator<'a>, DirectedAcyclicGraph, DirectedAcyclicGraphValueTree, divisibility_poset_12_children(), divisibility_poset_of_12_descendants(), divisibility_poset_of_12_dfs_descendants() (+29 more)
 
-### Community 101 - "ClassId"
-Cohesion: 0.03
-Nodes (51): IntoBody, IntoName, IntoNamespace, class_identity_is_not_an_untyped_schema_identity(), ClassId, GraphSchema, IndexId, Arc (+43 more)
+### Community 101 - "SchemaFunction"
+Cohesion: 0.04
+Nodes (35): IntoBody, IntoName, IntoNamespace, class_identity_is_not_an_untyped_schema_identity(), GraphSchema, AnalyzerId, Arc, BTreeMap (+27 more)
 
 ### Community 102 - "PhysicalExpr"
-Cohesion: 0.04
-Nodes (65): DatabaseInfoPlan, execute_database_info(), process(), Arc, FlowResult, Option, Self, String (+57 more)
+Cohesion: 0.03
+Nodes (75): ExprPlan, Arc, FlowResult, Option, Self, String, ValueBatchStream, Vec (+67 more)
 
 ### Community 103 - "search_cached_hnsw_with_distance"
 Cohesion: 0.16
@@ -2164,37 +2455,37 @@ Nodes (40): DecodedVectorIndex, PagedVectorNode, append_delta_hits(), append_pag
 Cohesion: 0.46
 Nodes (7): atoms(), benchmark_build(), benchmark_dense_iteration(), benchmark_lookup(), AtomId, Criterion, Vec
 
-### Community 108 - "open_reverse_membership_image"
-Cohesion: 0.20
-Nodes (19): ReverseMembershipFile, backfill_reverse_membership_checkpoint(), build_import_reverse_membership_image(), copy_page(), decode_key(), invalid(), open_reverse_membership_image(), DatabaseRoot (+11 more)
+### Community 108 - "I"
+Cohesion: 0.04
+Nodes (74): IdSet, IdSet<I, V, S>, Hash, Index, IndexMut, Option, Output, S (+66 more)
 
 ### Community 109 - "VectorCache"
-Cohesion: 0.10
-Nodes (30): CachedDocId, HnswCacheKey, HnswCacheLifecycle, HnswCacheValue, HnswCacheWeighter, IdsPerIndex, Inner, Arc (+22 more)
+Cohesion: 0.07
+Nodes (40): CachedDocId, HnswCacheKey, HnswCacheLifecycle, HnswCacheValue, HnswCacheWeighter, IdsPerIndex, Inner, Arc (+32 more)
 
 ### Community 110 - "EdgeColumns"
 Cohesion: 0.07
-Nodes (20): CowVec, SlotAllocator, EdgeColumns, empty_topology(), ensure_unique_record(), GraphMetadata, NodeColumns, Arc (+12 more)
+Nodes (19): CowVec, EdgeColumns, empty_topology(), ensure_unique_record(), GraphMetadata, NodeColumns, Arc, AtomId (+11 more)
 
 ### Community 111 - "FullTextIndex"
-Cohesion: 0.08
-Nodes (42): bm25_score_survives_compaction(), Bm25Params, compaction(), compaction_preserves_post_snapshot_deltas(), concurrent_doc_update(), concurrent_search(), concurrent_test(), doc_stats_compaction_batches_deltas() (+34 more)
+Cohesion: 0.07
+Nodes (43): bm25_score_survives_compaction(), Bm25Params, compaction(), compaction_preserves_post_snapshot_deltas(), concurrent_doc_update(), concurrent_search(), concurrent_test(), doc_stats_compaction_batches_deltas() (+35 more)
 
 ### Community 112 - "index/analysis.rs"
-Cohesion: 0.07
-Nodes (81): analyzer(), assert_no_candidate(), bounded_after_merge(), bounded_range_beats_half_bounded(), bounds_are_unsatisfiable(), compound_prefix_bonus_is_capped(), contradictory_range_yields_empty_scan(), covers_order_provides_positive_bonus() (+73 more)
+Cohesion: 0.05
+Nodes (101): analyzer(), assert_no_candidate(), bounded_after_merge(), bounded_range_beats_half_bounded(), bounds_are_unsatisfiable(), compound_prefix_bonus_is_capped(), contradictory_range_yields_empty_scan(), covers_order_provides_positive_bonus() (+93 more)
 
-### Community 113 - "Dc"
-Cohesion: 0.12
-Nodes (22): Dc, Dc<'a>, DcPrefix, DcPrefix<'a>, key_root(), key_with_ids(), range_with_root(), Cow (+14 more)
+### Community 113 - "QueryPlanner"
+Cohesion: 0.09
+Nodes (18): GrantedPermission, QueryPlanner, RecordStrategy, AtomicU8, Formatter, FrozenContext, IteratorRef, Option (+10 more)
 
-### Community 114 - "slowlog.rs"
+### Community 114 - "SqlFormat"
+Cohesion: 0.02
+Nodes (133): String, String, Cond, Expr, String, Dir, String, Explain (+125 more)
+
+### Community 115 - "HnswIndex"
 Cohesion: 0.10
-Nodes (18): Inner, ParamVisitor, Arc, Duration, Error, FrozenContext, Instant, Param (+10 more)
-
-### Community 115 - "Result"
-Cohesion: 0.04
-Nodes (98): ChildrenRef, f(), InPlaceVecBuilder, S2, Join, JoinState, BorrowedTreeNodeIter, ChildrenRef<S> (+90 more)
+Nodes (27): CapturedPendingKey, HnswCompactionPlan, HnswContext<'a>, HnswIndex, PendingOperation, PendingPlanBuilder, Arc, Cond (+19 more)
 
 ### Community 116 - "Error"
 Cohesion: 0.06
@@ -2202,123 +2493,123 @@ Nodes (32): AlreadyExistsError, AuthError, ConfigurationError, ConnectionError, 
 
 ### Community 117 - "Value"
 Cohesion: 0.05
-Nodes (67): VecMap, check_serialize(), convert_array_to_public(), convert_bytes_to_public(), convert_datetime_to_public(), convert_duration_to_public(), convert_file_to_public(), convert_geometry_to_public() (+59 more)
+Nodes (65): VecMap, check_serialize(), convert_array_to_public(), convert_bytes_to_public(), convert_datetime_to_public(), convert_duration_to_public(), convert_file_to_public(), convert_geometry_to_public() (+57 more)
 
-### Community 118 - "select/search.rs"
-Cohesion: 0.11
-Nodes (45): analyze_text(), bm25_score(), choose_fulltext_definition(), choose_vector_definition(), collect_nested_search(), collect_search_predicates(), contains_search(), float_distance() (+37 more)
+### Community 118 - "B"
+Cohesion: 0.10
+Nodes (32): InPlaceVecBuilder, Join, JoinState, BorrowedTreeNode, BorrowedTreeNodeIter, BorrowedTreeNodeIter<S>, cmp(), DetachConverter (+24 more)
 
-### Community 119 - "PropertyMap"
-Cohesion: 0.04
-Nodes (60): effective_projection_borrows_base_until_an_overlay_exists(), Arc, AtomicU64, AtomId, Cow, DatabaseRoot, Edge, EdgeIds (+52 more)
+### Community 119 - "PropertyKeyId"
+Cohesion: 0.06
+Nodes (30): &'a PropertyMap, clone_is_independent(), empty_map_is_pointer_sized_and_does_not_reserve_storage(), entry_ref(), equality_order_and_hash_ignore_insertion_order(), from_iterator_uses_last_duplicate_value(), keeps_entries_sorted_and_replaces_existing_values(), PropertyIter (+22 more)
 
 ### Community 120 - "ferros-grynn-macros/src/lib.rs"
 Cohesion: 0.83
 Nodes (3): define_status_codes(), measurable(), TokenStream
 
-### Community 121 - "ImportSession"
+### Community 121 - "ImportReport"
 Cohesion: 0.09
-Nodes (26): NonZeroU8, ImportItemOutcome, ImportLease, ImportOptions, ImportSession, ImportViolation, ImportViolationPolicy, increment() (+18 more)
+Nodes (21): Apply, QuarantineWriter, bounded_diagnostic(), ImportConstraintMode, ImportIndexMode, ImportItemOutcome, ImportReport, ImportSession (+13 more)
 
 ### Community 122 - "DiskAnnProvider"
 Cohesion: 0.05
 Nodes (70): AdjacencyList, ANNError, ANNResult, diskann_provider_batch_vectors_omits_deleted_elements(), diskann_provider_batches_element_reads_and_reports_missing(), diskann_provider_batches_nodes_and_updates_cache_on_mutation(), DiskAnnNeighborAccessor, DiskAnnProvider (+62 more)
 
-### Community 123 - "AtomKind"
-Cohesion: 0.06
-Nodes (33): checked_record(), collect_delta(), DesiredEdge, DesiredNode, graph_identity(), overlay_action(), OverlayAction, resolve_topology_locals() (+25 more)
+### Community 123 - "GraphId"
+Cohesion: 0.04
+Nodes (68): ContainmentChain, ConflictKey, AtomId, GlobalAtomId, SchemaId, ContainmentOwner, DatabaseRoot, occurrence_child() (+60 more)
 
 ### Community 124 - "P3 Query Execution"
 Cohesion: 0.50
 Nodes (4): P3 Query Execution, P2 Query Frontend, P2 Storage WAL and MVCC, P1 Value Foundation
 
-### Community 125 - "gql/execution/mod.rs"
-Cohesion: 0.11
-Nodes (57): catchable(), ClosureInvocationMode, ControlFlow, ControlRuntime, cooperative_sleep(), eval_query_expression(), eval_query_expression_current(), evaluate_constant() (+49 more)
+### Community 125 - "RpcState"
+Cohesion: 0.04
+Nodes (74): router(), Arc, Data, Extension, HeaderMap, IntoResponse, Schema, State (+66 more)
 
 ### Community 126 - "&'a Bytes"
 Cohesion: 0.50
 Nodes (3): &'a Bytes, IntoIter, IntoIterator
 
-### Community 127 - "DocumentContext"
-Cohesion: 0.08
-Nodes (28): CursorRecord, Document, DocumentContext, Extras, id_field_index(), NsDbTbCtx, NsDbTbMutCtx, Arc (+20 more)
+### Community 127 - "document.rs"
+Cohesion: 0.07
+Nodes (27): CursorRecord, Document, Extras, id_field_index(), NsDbTbCtx, NsDbTbMutCtx, Arc, Cow (+19 more)
 
-### Community 128 - "Collectable"
-Cohesion: 0.13
-Nodes (23): FrozenContext, Option, Self, SyncDistinct, Processable, Collectable, Collector, ConcurrentCollector (+15 more)
+### Community 128 - "src/host.rs"
+Cohesion: 0.16
+Nodes (14): decode_range_bounds(), implement_host_functions(), NullContext, Bound, E, Object, Option, Result (+6 more)
 
 ### Community 129 - "src/formatting.rs"
-Cohesion: 0.11
-Nodes (26): And, Callable, Comma, DisplayValue, Formatted, Formatted<'a, F, T>, Formatted<'_, F, T>, Identifier (+18 more)
+Cohesion: 0.18
+Nodes (15): And, Callable, DisplayValue, Identifier, Join<S, F>, JoinSeparator, Or, ParameterFormatter (+7 more)
 
 ### Community 132 - "windows_vm.rs"
 Cohesion: 0.06
 Nodes (80): concurrent_vm_batches_cannot_retain_mutually_blocking_partial_capacity(), concurrent_vm_miss_is_coalesced_to_one_loader(), distinct_failed_home_pages_do_not_retain_source_sized_signals(), failed_decommit_quarantines_without_hanging_and_retries_cleanup(), failed_validation_never_leaves_committed_resident_bytes(), generation(), home_key(), home_resolved_handle_stales_after_decommit_and_recommit() (+72 more)
 
 ### Community 133 - "physical_traversal.rs"
-Cohesion: 0.13
-Nodes (39): hot_slot_address(), bounded_record_pages(), contiguous_pages(), EncodedCandidate, inline_candidate(), invalid(), LoadedPages, LocalStore (+31 more)
+Cohesion: 0.07
+Nodes (61): AtomStoreFileSet, EdgeHotSlot, NodeHotSlot, PropertyRef, DiskAtomRef, GlobalAtomId, PrimaryAddress, AtomKind (+53 more)
 
 ### Community 135 - "tree.rs"
 Cohesion: 0.09
-Nodes (41): Op, IdiomPosition, IndexesMap, Node, RecordOptions, ResolvedExpression, Arc, Array (+33 more)
+Nodes (43): Op, IdiomPosition, IndexesMap, Node, RecordOptions, ResolvedExpression, Arc, Array (+35 more)
 
 ### Community 136 - "FerrosGrynnResult"
-Cohesion: 0.11
-Nodes (43): binary_local_endpoints(), components_value(), condensation_value(), cuts_value(), domain_error(), graph_is_directed(), induced_atoms(), induced_edges() (+35 more)
+Cohesion: 0.10
+Nodes (41): CutSet, SpanningForest, binary_local_endpoints(), components_value(), condensation_value(), cuts_value(), domain_error(), graph_is_directed() (+33 more)
 
 ### Community 137 - "spill.rs"
 Cohesion: 0.10
-Nodes (43): RunReader, compare_record_anchor(), compare_records(), descending_order_keeps_none_and_null_in_canonical_order(), encode_record(), estimated_record_bytes(), forced_disk_batches_records_into_bounded_runs(), merge_group() (+35 more)
+Nodes (44): RunReader, compare_record_anchor(), compare_records(), decode_record(), descending_order_keeps_none_and_null_in_canonical_order(), encode_record(), estimated_record_bytes(), forced_disk_batches_records_into_bounded_runs() (+36 more)
 
 ### Community 138 - "ExecutionContext"
-Cohesion: 0.04
-Nodes (74): DatabaseContext, ExecutionContext, NamespaceContext, RootContext, Action, Arc, Auth, AuthLimit (+66 more)
+Cohesion: 0.05
+Nodes (54): DatabaseContext, ExecutionContext, NamespaceContext, RootContext, Action, Arc, Auth, AuthLimit (+46 more)
 
-### Community 139 - "IndexStores"
+### Community 139 - "IndexOperation<'a>"
 Cohesion: 0.08
-Nodes (31): Combinator, Indexable, IndexOperation, IndexOperation<'a>, MultiValuesIterator, Array, Box, Cond (+23 more)
+Nodes (29): Combinator, Indexable, IndexOperation, IndexOperation<'a>, MultiValuesIterator, Array, Box, Cond (+21 more)
 
 ### Community 140 - "AtomId"
 Cohesion: 0.06
-Nodes (54): build_parent_map(), build_storage(), constraint(), find_root(), Forest, Forest<Frozen>, Forest<Mutable>, forest_node_removal_marks_every_incident_edge_dirty() (+46 more)
+Nodes (56): Sized, build_parent_map(), build_storage(), constraint(), find_root(), Forest, Forest<Frozen>, Forest<Mutable> (+48 more)
 
 ### Community 141 - "DirtyTarget"
-Cohesion: 0.06
-Nodes (58): ApplyFn, ApplyUpdate, ReadFn, ReplayFn, Vec, accept_remote_discards_local_conflicting_state(), apply_or_pause(), conflicted_live_graph() (+50 more)
+Cohesion: 0.07
+Nodes (56): ApplyFn, ApplyUpdate, ReadFn, ReplayFn, accept_remote_discards_local_conflicting_state(), apply_or_pause(), conflicted_live_graph(), conflicting_changes() (+48 more)
 
 ### Community 142 - "surrealism_integration.rs"
-Cohesion: 0.18
-Nodes (54): check_concurrent_async(), check_error_propagation(), check_fetch_pokemon(), check_fs_read(), check_function_calls(), check_info_db_structure_exports(), check_io(), check_kv_operations() (+46 more)
+Cohesion: 0.21
+Nodes (50): check_concurrent_async(), check_error_propagation(), check_fetch_pokemon(), check_fs_read(), check_function_calls(), check_info_db_structure_exports(), check_io(), check_kv_operations() (+42 more)
 
 ### Community 143 - "index/tests.rs"
-Cohesion: 0.08
-Nodes (121): acquire_build_state_waits_for_prior_generation_reservations(), assert_cancelled_remove_keeps_local_builder(), assert_committed_remove_aborts_local_builder(), assert_no_index_build_artifacts(), cached_index_build_reservation_lookup_errors_on_seq_overflow(), cached_index_build_reservation_remove_clears_entry(), commit_failure_cleans_uncommitted_index_build_artifacts(), commit_failure_preserves_primary_error_when_reservation_cleanup_fails() (+113 more)
+Cohesion: 0.10
+Nodes (86): acquire_build_state_waits_for_prior_generation_reservations(), assert_cancelled_remove_keeps_local_builder(), assert_committed_remove_aborts_local_builder(), assert_no_index_build_artifacts(), cached_index_build_reservation_lookup_errors_on_seq_overflow(), cached_index_build_reservation_remove_clears_entry(), commit_failure_cleans_uncommitted_index_build_artifacts(), commit_failure_preserves_primary_error_when_reservation_cleanup_fails() (+78 more)
 
 ### Community 144 - "Options"
 Cohesion: 0.04
-Nodes (53): Force, Options, Arc, Auth, Base, Error, Option, Result (+45 more)
+Nodes (49): Force, Options, Arc, Auth, Base, Error, Option, Result (+41 more)
 
 ### Community 145 - "Uuid"
 Cohesion: 0.10
 Nodes (16): Datetime, Deref, DerefMut, Display, Err, Error, Formatter, From (+8 more)
 
 ### Community 146 - "Controller"
-Cohesion: 0.11
-Nodes (22): Controller, effective_timeout(), Arc, AtomicU64, Box, Debug, Duration, Error (+14 more)
+Cohesion: 0.13
+Nodes (21): Controller, effective_timeout(), Arc, AtomicU64, Debug, Duration, Error, Formatter (+13 more)
 
-### Community 147 - "RecordIdPart"
-Cohesion: 0.11
-Nodes (26): assert_status(), enforces_the_composite_nesting_limit(), quotes_ambiguous_string_ids_for_round_trip(), RecordId, RecordIdPart, recursively_rejects_unsupported_parts(), rejects_empty_components(), Array (+18 more)
+### Community 147 - "Ulid"
+Cohesion: 0.06
+Nodes (39): InnerUlid, InnerUuid, Display, Err, Formatter, From, FromStr, Result (+31 more)
 
 ### Community 148 - "SortedIndexRecords"
 Cohesion: 0.09
 Nodes (46): check_external_sort_cancelled(), cleanup_external_index_sort(), compare_records(), external_sort_metrics(), ExternalIndexSorter, ExternalSortMetrics, IndexSortRecord, invalid_sort() (+38 more)
 
-### Community 149 - "topk_pushdown.rs"
+### Community 149 - "topk.rs"
 Cohesion: 0.04
-Nodes (78): compare_keys(), compare_keys_by_sort_key(), compare_values(), OrderByField, Arc, Ordering, Value, SortKey (+70 more)
+Nodes (61): compare_keys(), compare_keys_by_sort_key(), compare_values(), OrderByField, Arc, Ordering, Self, Value (+53 more)
 
 ### Community 150 - "Backend"
 Cohesion: 0.10
@@ -2334,19 +2625,19 @@ Nodes (3): Iter<'_, T>, ExactSizeIterator, FusedIterator
 
 ### Community 153 - "exact_ops.rs"
 Cohesion: 0.14
-Nodes (24): CheckedAdd, CheckedMul, CheckedSub, PrimInt, Signed, add_exact(), add_numbers(), AddExact (+16 more)
+Nodes (25): CheckedAdd, CheckedMul, CheckedSub, PrimInt, Signed, integer_arithmetic(), add_exact(), add_numbers() (+17 more)
 
 ### Community 154 - "Transaction"
 Cohesion: 0.05
 Nodes (49): Config, Default, Option, Self, String, TikvConfig, consume_keys(), consume_vals() (+41 more)
 
 ### Community 155 - "Value"
-Cohesion: 0.04
-Nodes (49): Array, bool, Box<Range>, Bytes, Cast, CastError, CastErrorExt, crate::val::TableName (+41 more)
+Cohesion: 0.07
+Nodes (26): Array, Bytes, CastError, RecordId, Box, Display, Error, F (+18 more)
 
 ### Community 156 - "Iterator"
 Cohesion: 0.10
-Nodes (31): EscapedChars<'a>, EscapedIter<'a>, Item, Option, Pairs<'a>, Option, Iterable, Iterator (+23 more)
+Nodes (34): EscapedChars<'a>, EscapedIter<'a>, Item, Option, Pairs<'a>, Option, Iterable, Iterator (+26 more)
 
 ### Community 157 - "Q: What is MetaGraph?"
 Cohesion: 0.40
@@ -2364,17 +2655,17 @@ Nodes (3): Handle<'_, T>, Deref, Target
 Cohesion: 0.22
 Nodes (8): Исправленный benchmark, Калибровка batch, Окружение и команда, Отчёт этапа 2: Sync Direct I/O и BufferPool, Профилирование, Реализованный срез, Результат Windows gate, Решение
 
-### Community 161 - "EdgeTopology"
+### Community 161 - "Hypergraph<State>"
 Cohesion: 0.05
-Nodes (51): INLINE_ENDPOINTS, build_storage(), constraint(), graph_conversion_rejects_edge_endpoints(), Hypergraph, Hypergraph<Frozen>, Hypergraph<Mutable>, Hypergraph<State> (+43 more)
+Nodes (50): atom_kind_mismatch(), FerrosGrynnError, build_storage(), constraint(), graph_conversion_rejects_edge_endpoints(), Hypergraph, Hypergraph<Frozen>, Hypergraph<Mutable> (+42 more)
 
 ### Community 162 - "policy.rs"
-Cohesion: 0.11
-Nodes (41): BuiltinResolver, publication_validation_count(), bypass_preserves_resident_count_and_still_hits_hot_pages(), bypass_revalidates_bytes_after_loader_returns_header(), bypass_uses_a_page_already_resident_in_the_cold_region(), cold_loading_and_point_read_coalesce_without_cross_tier_duplicate(), cold_region_is_bounded_and_other_cursor_promotes(), cold_to_hot_promotion_validates_destination_once() (+33 more)
+Cohesion: 0.13
+Nodes (37): publication_validation_count(), bypass_preserves_resident_count_and_still_hits_hot_pages(), bypass_revalidates_bytes_after_loader_returns_header(), bypass_uses_a_page_already_resident_in_the_cold_region(), cold_loading_and_point_read_coalesce_without_cross_tier_duplicate(), cold_region_is_bounded_and_other_cursor_promotes(), cold_to_hot_promotion_validates_destination_once(), ColdEntry (+29 more)
 
 ### Community 163 - "tables.rs"
 Cohesion: 0.07
-Nodes (99): internal_error(), RelationDirection, aggregate_field_name(), aggregate_groupable_enum_name(), aggregate_object_type_name(), AggregateRow, build_connection_types(), build_table_type() (+91 more)
+Nodes (101): internal_error(), RelationDirection, aggregate_field_name(), aggregate_groupable_enum_name(), aggregate_object_type_name(), AggregateRow, build_aggregate_type(), build_connection_types() (+93 more)
 
 ### Community 164 - "ClockPro"
 Cohesion: 0.07
@@ -2382,35 +2673,31 @@ Nodes (19): ClockPro, FrameState, Arc, CachedPage, FerrosGrynnResult, LoadSignal
 
 ### Community 165 - "AppState"
 Cohesion: 0.04
-Nodes (109): check_ns_db(), Result, String, post_handler(), BTreeMap, Bytes, Extension, Option (+101 more)
+Nodes (108): check_ns_db(), Result, String, handler(), router(), Bytes, Extension, HeaderMap (+100 more)
 
 ### Community 166 - "DecodeError"
 Cohesion: 0.07
-Nodes (48): bool, Bound<D>, Box<D>, BTreeMap<K, V>, BTreeSet<T>, char, Cow<'a, O>, Cow<'de, D> (+40 more)
+Nodes (49): bool, Bound<D>, Box<D>, BTreeMap<K, V>, BTreeSet<T>, char, Cow<'a, O>, Cow<'de, D> (+41 more)
 
-### Community 167 - "AlignedPage"
-Cohesion: 0.06
-Nodes (54): PageFlags, OverflowBuilder, QualifiedOverflowBuilder, Vec, aligned_page_has_exact_size_and_alignment(), aligned_page_slice_is_one_contiguous_byte_extent(), AlignedPage, page_checksum() (+46 more)
-
-### Community 168 - "KnnContext"
-Cohesion: 0.12
-Nodes (20): IndexContext, KnnContext, MatchContext, MatchesContext, MatchInfo, Arc, Debug, Default (+12 more)
-
-### Community 169 - "rocksdb/cnf.rs"
-Cohesion: 0.03
-Nodes (60): BackgroundFlusher, Arc, AtomicBool, Condvar, Duration, JoinHandle, Mutex, OptimisticTransactionDB (+52 more)
-
-### Community 170 - "PropertyKeyId"
-Cohesion: 0.10
-Nodes (23): GraphOccurrence, GraphRoot, OccurrenceState, OverlayValue, PropertyOverlay, AtomId, BTreeMap, BTreeSet (+15 more)
-
-### Community 171 - "ScatterPrefetchCursor"
-Cohesion: 0.10
-Nodes (25): checked_page_no(), LoadedExtent, Arc, AtomicBool, Box, Drop, Error, FerrosGrynnError (+17 more)
-
-### Community 172 - "aggregates/math.rs"
+### Community 167 - "aggregates/math.rs"
 Cohesion: 0.14
 Nodes (45): max_batch_empty(), max_batch_multiple(), max_batch_then_single(), max_merge(), max_multiple_items(), max_single_item(), max_zero_items(), mean_batch_empty() (+37 more)
+
+### Community 168 - "KnnContext"
+Cohesion: 0.13
+Nodes (20): IndexContext, IndexFunction, KnnContext, MatchContext, MatchesContext, MatchInfo, Arc, Debug (+12 more)
+
+### Community 169 - "Patch"
+Cohesion: 0.06
+Nodes (34): Patch, Patch<'_, C, R>, Patch<'r, Client, Option<R>>, Patch<'r, Client, Value>, Patch<'r, Client, Vec<R>>, Cow, IntoFuture, Option (+26 more)
+
+### Community 170 - "GraphRoot"
+Cohesion: 0.09
+Nodes (24): SlotAllocator, GraphOccurrence, GraphRoot, OccurrenceState, OverlayValue, PropertyOverlay, AtomKind, BTreeMap (+16 more)
+
+### Community 171 - "parse_if_exists"
+Cohesion: 0.13
+Nodes (21): ast::AlterAccess, ast::AlterAnalyzer, ast::AlterApi, ast::AlterBucket, ast::AlterConfig, ast::AlterDatabase, ast::AlterEvent, ast::AlterField (+13 more)
 
 ### Community 173 - "ferros-grynn-bench/benches/collections.rs"
 Cohesion: 0.20
@@ -2430,15 +2717,15 @@ Nodes (21): Error, float_key_must_be_finite(), key_must_be_a_string(), MapKeySer
 
 ### Community 178 - "DirectFile"
 Cohesion: 0.10
-Nodes (35): checked_file_length(), checked_page_extent(), checked_page_offset(), configure_direct_io(), direct_io_is_unavailable(), direct_io_raw_error_is_unavailable(), DirectFile, DirectFileOpenMode (+27 more)
+Nodes (34): checked_file_length(), checked_page_extent(), checked_page_offset(), configure_direct_io(), direct_io_is_unavailable(), direct_io_raw_error_is_unavailable(), DirectFile, io_failure() (+26 more)
 
 ### Community 179 - "invalid_wal"
 Cohesion: 0.06
-Nodes (62): TxId, CheckpointEnd, decode_checkpoint_end(), decode_page_init(), decode_page_key(), decode_tx_commit(), encode_page_init(), invalid_wal() (+54 more)
+Nodes (69): TxId, CheckpointEnd, decode_checkpoint_end(), decode_page_init(), decode_page_key(), decode_tx_commit(), encode_page_init(), invalid_wal() (+61 more)
 
 ### Community 180 - "GraphWorkspace<G>"
 Cohesion: 0.10
-Nodes (23): canonical_mutation_invalidates_derived_and_removes_dead_components(), component_mutation_does_not_change_graph_revision(), GraphWorkspace, GraphWorkspace<G>, map_graph_moves_user_components_but_discards_derived_pools(), PageRank, Position, AtomId (+15 more)
+Nodes (25): canonical_mutation_invalidates_derived_and_removes_dead_components(), component_mutation_does_not_change_graph_revision(), GraphWorkspace, GraphWorkspace<G>, map_graph_moves_user_components_but_discards_derived_pools(), PageRank, Position, AtomId (+17 more)
 
 ### Community 181 - "Q: Как изменения этапа 7 связывают лимит write-set, индекс RecordId и публикацию disk-backed local graph?"
 Cohesion: 0.40
@@ -2446,71 +2733,71 @@ Nodes (4): Answer, Outcome, Q: Как изменения этапа 7 связы
 
 ### Community 182 - "compile.rs"
 Cohesion: 0.07
-Nodes (87): Literal, is_simple_binary_eligible(), BinaryOperator, build_root_fused_flat_map(), cluster_multi_specs(), collect_referenced_root_segments(), compile_and_fuses_two_root_leaves(), compile_array_len_eq_n_emits_leaf_streaming() (+79 more)
+Nodes (86): Literal, build_root_fused_flat_map(), cluster_multi_specs(), collect_referenced_root_segments(), compile_and_fuses_two_root_leaves(), compile_array_len_eq_n_emits_leaf_streaming(), compile_array_len_reversed_swaps_operator(), compile_binary() (+78 more)
 
-### Community 183 - ".drop"
-Cohesion: 0.14
-Nodes (19): dag_cycle_failure_removes_the_statement_private_edge(), detach_drops_stored_levelpath_with_the_occurrence(), detach_restrict_rolls_back_and_cascade_keeps_global_edge(), graph_store(), levelpath_covers_nested_binary_edges_and_rejects_hyperedges(), levelpath_is_read_only_until_graph_dml_persists_it(), mutable_query_to_memory_flushes_graph_local_edge_topology(), mutable_query_to_memory_flushes_only_graph_local_overlay() (+11 more)
+### Community 183 - "tests/graph_dml.rs"
+Cohesion: 0.26
+Nodes (12): dag_cycle_failure_removes_the_statement_private_edge(), detach_drops_stored_levelpath_with_the_occurrence(), detach_restrict_rolls_back_and_cascade_keeps_global_edge(), graph_store(), levelpath_covers_nested_binary_edges_and_rejects_hyperedges(), levelpath_is_read_only_until_graph_dml_persists_it(), mutable_query_to_memory_flushes_graph_local_edge_topology(), mutable_query_to_memory_flushes_only_graph_local_overlay() (+4 more)
 
 ### Community 184 - "MaintenanceStatement"
 Cohesion: 0.27
-Nodes (10): AnalyzeModeName, KillStatement, MaintenanceIndexOwner, MaintenanceOperationName, MaintenanceStatement, MaintenanceTargetName, Parser<'_>, FerrosGrynnResult (+2 more)
+Nodes (9): AnalyzeModeName, KillStatement, MaintenanceIndexOwner, MaintenanceOperationName, MaintenanceStatement, MaintenanceTargetName, Parser<'_>, FerrosGrynnResult (+1 more)
 
 ### Community 185 - "Vector"
 Cohesion: 0.06
 Nodes (40): Array1, Distance, old_serialized_vector_cases(), OldSerializedVector, Arc, Error, f16, From (+32 more)
 
 ### Community 186 - "IgnoreError"
-Cohesion: 0.05
-Nodes (54): Document, Cond, FrozenContext, Option, Permission, Result, Stk, Document (+46 more)
+Cohesion: 0.04
+Nodes (65): Document, Cond, FrozenContext, Option, Permission, Result, Stk, Document (+57 more)
 
-### Community 187 - "Frozen"
+### Community 187 - "EdgeTopology"
 Cohesion: 0.05
-Nodes (63): Copied, INLINE_INCIDENCE, atom_does_not_exist(), copy_from_read(), copy_from_read_inner(), endpoint_kind(), freeze_thaw_preserves_identity_ids_and_topology(), GeneralStorage (+55 more)
+Nodes (67): Copied, INLINE_ENDPOINTS, INLINE_INCIDENCE, atom_does_not_exist(), copy_from_read(), copy_from_read_inner(), endpoint_kind(), freeze_thaw_preserves_identity_ids_and_topology() (+59 more)
 
 ### Community 188 - "C"
-Cohesion: 0.02
-Nodes (98): Authenticate, Begin, Begin<C>, IntoFuture, Cancel, Cancel<C>, IntoFuture, Self (+90 more)
+Cohesion: 0.03
+Nodes (75): Authenticate, Begin, Begin<C>, IntoFuture, Cancel, Cancel<C>, IntoFuture, Self (+67 more)
 
 ### Community 189 - "events.rs"
-Cohesion: 0.05
-Nodes (61): AtomicU32, anonymous_session_leaves_user_none(), auth_ctx_collapses_record_principal(), AuthAction, AuthEvent, AuthEventCtx, AuthEventSafe, AuthScope (+53 more)
-
-### Community 190 - "invalid_index"
 Cohesion: 0.06
-Nodes (138): Bulk, Incremental, Address, append_internal_levels(), ChildPage, decode_scalar_atoms(), decode_standard_leaf_entries(), descend_to_leaf() (+130 more)
+Nodes (49): anonymous_session_leaves_user_none(), auth_ctx_collapses_record_principal(), AuthAction, AuthEvent, AuthEventCtx, AuthEventSafe, AuthScope, bounded_enums_have_stable_labels() (+41 more)
+
+### Community 190 - "AlignedPage"
+Cohesion: 0.05
+Nodes (178): Bulk, Incremental, PrimaryIndexMutation, Address, append_internal_levels(), ChildPage, decode_scalar_atoms(), decode_standard_leaf_entries() (+170 more)
 
 ### Community 191 - "parse_unordered_clause"
-Cohesion: 0.05
-Nodes (67): ast::AlterAccess, ast::AlterAnalyzer, ast::AlterApi, ast::AlterBucket, ast::AlterConfig, ast::AlterDatabase, ast::AlterEvent, ast::AlterField (+59 more)
+Cohesion: 0.06
+Nodes (54): ast::ApiAction, ast::ApiMiddleware, ast::DefineAccess, ast::DefineAnalyzer, ast::DefineApi, ast::DefineBucket, ast::DefineConfig, ast::DefineConfigApi (+46 more)
 
-### Community 192 - "Result"
-Cohesion: 0.14
-Nodes (67): Consume, aggregate_measurement(), aligned_pages(), benchmark_page(), build_resident_fixture(), candidate_selector_from_env(), Dataset, env_parse() (+59 more)
+### Community 192 - "harness.rs"
+Cohesion: 0.05
+Nodes (180): Buffer, Consume, aggregate_measurement(), aligned_pages(), artifact_directory(), Artifacts, benchmark_page(), build_resident_fixture() (+172 more)
 
 ### Community 193 - "src/tx.rs"
 Cohesion: 0.08
 Nodes (69): mvcc_conflicting_blind_writes_should_error(), mvcc_conflicting_read_deleted_keys_should_error(), mvcc_conflicting_write_keys_should_error(), mvcc_non_conflicting_keys_should_succeed(), mvcc_scan_conflicting_read_deleted_keys_should_error(), mvcc_scan_conflicting_write_keys_should_error(), mvcc_si_conflicting_read_keys_should_succeed(), mvcc_si_locked_read_conflicting_write_should_error() (+61 more)
 
 ### Community 194 - "CursorDoc"
-Cohesion: 0.07
-Nodes (63): CursorDoc, CursorRecord, Limit, Expr, FrozenContext, Option, Result, Stk (+55 more)
+Cohesion: 0.05
+Nodes (74): BuiltinResolver, CursorDoc, CursorRecord, Limit, Expr, FrozenContext, Option, Result (+66 more)
 
-### Community 195 - "LogicalSelect"
-Cohesion: 0.07
-Nodes (94): build_output_row(), build_output_value(), build_projected_value(), derived_source_rows(), execute_index_seek_page(), execute_select(), execute_select_output(), execute_select_values() (+86 more)
+### Community 195 - "ExecutionControl"
+Cohesion: 0.02
+Nodes (180): Display, Formatter, Result, Status, CursorRecord, IndexSeekCheckout, OutputRow, PlannerDemand (+172 more)
 
 ### Community 196 - "Capabilities"
 Cohesion: 0.08
 Nodes (11): Capabilities, ExperimentalTarget, MethodTarget, RouteTarget, Default, NewPlannerStrategy, S, Self (+3 more)
 
-### Community 197 - "execution/schema.rs"
-Cohesion: 0.13
-Nodes (59): AnalyzerTokenizer, FunctionEffect, analyzer_tokenizer(), alter_analyzer(), alter_class(), alter_field(), alter_function(), alter_parameter() (+51 more)
+### Community 197 - "Value"
+Cohesion: 0.02
+Nodes (205): Array, Regex, Set, FunctionEffect, array(), check(), domain(), execute() (+197 more)
 
-### Community 198 - "SurrealValue"
+### Community 198 - "Value"
 Cohesion: 0.06
-Nodes (26): Self, Run<'_, Client, R>, Arc<T>, BinaryHeap<T>, Box<T>, BTreeSet<T>, cow_clone_type_roundtrip(), cow_str_roundtrip() (+18 more)
+Nodes (23): Arc<T>, BinaryHeap<T>, Box<T>, BTreeSet<T>, cow_clone_type_roundtrip(), cow_str_roundtrip(), Cow<'_, T>, HashSet<T> (+15 more)
 
 ### Community 199 - "catalog/schema/index.rs"
 Cohesion: 0.06
@@ -2518,7 +2805,7 @@ Nodes (40): DiskAnnParams, Distance, FullTextParams, HnswParams, Index, OldDista
 
 ### Community 200 - "FieldPath"
 Cohesion: 0.03
-Nodes (84): FieldPath, FieldPathPart, make_obj(), Cow, Display, Error, Formatter, Idiom (+76 more)
+Nodes (83): FieldPath, FieldPathPart, make_obj(), Cow, Display, Error, Formatter, Idiom (+75 more)
 
 ### Community 201 - "Value"
 Cohesion: 0.06
@@ -2532,51 +2819,51 @@ Nodes (38): exposes_explicit_meta_atom_api_over_general_layout(), Metagraph, Met
 Cohesion: 0.07
 Nodes (45): AsMut, as_mut_provides_direct_access(), exclusive_deref_mut_works(), exclusive_lock_makes_version_odd(), exclusive_lock_provides_write_access(), exclusive_unlock_makes_version_even(), exclusive_unlock_returns_optimistic_with_new_version(), ExclusiveGuard<'a, T> (+37 more)
 
-### Community 204 - "run_resident_concurrency"
-Cohesion: 0.11
-Nodes (22): ConcurrentResidentCandidate, consume_production_resident_operations(), mapping_page(), measure_mmap_resident_concurrency(), measure_resident_next_candidate(), MmapControl, partition_worker_operations(), pin_current_thread() (+14 more)
+### Community 204 - ".build"
+Cohesion: 0.17
+Nodes (25): cell(), DirectedLandmarks, DistanceInterval, DistanceQueue, filled(), hop_row(), interval_row(), interval_side() (+17 more)
 
-### Community 205 - "InfoStructure"
-Cohesion: 0.02
-Nodes (99): api_action_basic(), api_action_multi_method(), api_basic(), api_with_auth_limit(), api_with_middleware(), config_api(), config_default(), config_graphql() (+91 more)
+### Community 205 - "GraphIndex"
+Cohesion: 0.06
+Nodes (45): cost_metadata(), decode_distances(), definition(), direction(), invalid(), LandmarkPathArtifact, projected_costs(), reserve() (+37 more)
 
-### Community 206 - "V"
-Cohesion: 0.09
-Nodes (32): V, BorrowedCowStrDeserializer, BorrowedCowStrDeserializer<'de>, deserialize_number(), EnumDeserializer, Error, MapDeserializer, MapKeyDeserializer (+24 more)
+### Community 206 - "Error"
+Cohesion: 0.08
+Nodes (31): BorrowedCowStrDeserializer, BorrowedCowStrDeserializer<'de>, deserialize_number(), EnumDeserializer, Error, MapDeserializer, MapKeyDeserializer, MapKeyDeserializer<'de> (+23 more)
 
 ### Community 207 - "EncodeError"
-Cohesion: 0.06
-Nodes (42): bool, Bound<E>, Box<E>, BTreeMap<K, V>, BTreeSet<T>, char, Cow<'_, E>, Duration (+34 more)
+Cohesion: 0.07
+Nodes (40): bool, Bound<E>, Box<E>, BTreeMap<K, V>, BTreeSet<T>, char, Cow<'_, E>, Duration (+32 more)
 
 ### Community 208 - "StatusObject"
-Cohesion: 0.10
-Nodes (15): InvalidSeverity, Display, Error, Formatter, From, Location, Option, Result (+7 more)
+Cohesion: 0.06
+Nodes (26): Severity, InvalidSeverity, Display, Error, Formatter, From, Location, Option (+18 more)
 
 ### Community 209 - "array_ops.rs"
 Cohesion: 0.09
 Nodes (13): AllPart, evaluate_all(), evaluate_flatten(), FirstPart, FlattenPart, LastPart, Any, BoxFut (+5 more)
 
-### Community 210 - "AnalyzePlan"
-Cohesion: 0.14
-Nodes (14): AnalyzePlan, ExplainPlan, format_analyze_plan(), format_analyze_plan_json(), format_execution_plan(), format_execution_plan_json(), format_metrics_text(), Arc (+6 more)
+### Community 210 - "RecursionOp"
+Cohesion: 0.08
+Nodes (19): RecursionOp, Arc, FlowResult, Option, Self, String, ValueBatchStream, Vec (+11 more)
 
 ### Community 211 - "GraphEdgeScan"
 Cohesion: 0.05
-Nodes (62): apply_record_predicate(), GraphEdgeScan, GraphScanOutput, compute_graph_ranges(), decode_graph_edge(), EdgeTableSpec, encode_graph_key(), eval_graph_bound() (+54 more)
+Nodes (60): apply_record_predicate(), GraphEdgeScan, GraphScanOutput, compute_graph_ranges(), decode_graph_edge(), EdgeTableSpec, encode_graph_key(), eval_graph_bound() (+52 more)
 
 ### Community 212 - ".install_built_graph_inner"
-Cohesion: 0.12
-Nodes (32): BuiltGraph, apply_effective_properties(), BuiltEdge, BuiltGraph, BuiltNode, clear_graph(), collect_children(), collect_nested_graphs() (+24 more)
-
-### Community 213 - "FunctionsConfig"
 Cohesion: 0.13
-Nodes (18): crate::catalog::GraphQLConfig, crate::catalog::GraphQLFunctionsConfig, crate::catalog::GraphQLIntrospectionConfig, crate::catalog::GraphQLTablesConfig, fmt_function_name_list(), FunctionsConfig, GraphQLConfig, IntrospectionConfig (+10 more)
+Nodes (33): apply_effective_properties(), BuiltEdge, BuiltGraph, BuiltNode, clear_graph(), collect_children(), collect_nested_graphs(), InstallBuiltGraphTree (+25 more)
+
+### Community 213 - "IndexId"
+Cohesion: 0.20
+Nodes (18): check_composite(), Index, Index<'a>, key(), key_none(), Prefix, Prefix<'a>, PrefixIds (+10 more)
 
 ### Community 214 - "InlineVec<T, N>"
 Cohesion: 0.05
 Nodes (44): &'a InlineVec<T, N>, &'a mut InlineVec<T, N>, deref_slice_apis(), Drain, Drain<'a, T, N>, drain_full(), drain_middle(), drain_unconsumed_drops_elements_and_shifts() (+36 more)
 
-### Community 215 - "Run"
+### Community 215 - "method/run.rs"
 Cohesion: 0.13
 Nodes (19): IntoFn, is_function_name(), is_function_version(), parse(), Cow, IntoFuture, Option, PhantomData (+11 more)
 
@@ -2585,60 +2872,60 @@ Cohesion: 0.09
 Nodes (38): DiskAnnEntry, FullTextEntry, HnswEntry, InnerFullTextEntry, InnerQueryExecutor, IteratorEntry, KnnBruteForceExpression, PerExpressionEntry (+30 more)
 
 ### Community 217 - "graphql_integration.rs"
-Cohesion: 0.05
-Nodes (117): Json, Parser<'_>, BTreeMap, Parser, ParseResult, PublicArray, PublicObject, PublicRecordId (+109 more)
-
-### Community 218 - "dbs/executor.rs"
 Cohesion: 0.09
-Nodes (44): CapturingObserver, check_execute_timeout(), create_return_before_reports_one(), delete_return_none_reports_affected_count(), delete_where_no_match_reports_zero(), Executor, import_stream_rejects_option_import_change_midstream(), import_stream_rejects_without_option_import() (+36 more)
+Nodes (85): area(), bearing(), centroid(), decode(), distance(), encode(), Geometry, Result (+77 more)
+
+### Community 218 - "Executor"
+Cohesion: 0.17
+Nodes (18): Executor, PreparedBroker, Arc, Datastore, FlowResult, FrozenContext, Instant, Option (+10 more)
 
 ### Community 219 - "FunctionRegistry"
-Cohesion: 0.04
-Nodes (44): register(), register(), register(), register(), register(), register(), register(), register() (+36 more)
+Cohesion: 0.05
+Nodes (38): register(), register(), register(), register(), register(), register(), register(), register() (+30 more)
 
-### Community 220 - ".check_permission"
-Cohesion: 0.14
-Nodes (17): accept_payload(), Action, BucketController, BucketController<'a>, BucketOperation, Arc, Bytes, Display (+9 more)
+### Community 220 - "FerrosGrynnResult"
+Cohesion: 0.13
+Nodes (19): cancel_during_function(), pure_block_function_runs_without_query_read(), pure_builder_admits_compilers_frames_and_cancels_inside_calls(), PureFunctionEvaluator, PureFunctionEvaluator<'a>, RootCatalog, AnalyzedToken, AnalyzerId (+11 more)
 
 ### Community 221 - "wire_cmp.rs"
 Cohesion: 0.05
-Nodes (85): encoded(), eq_wire(), eq_wire_strand_array_element(), evaluate_leaf_eq_strand_vs_regex_bails_to_none(), evaluate_leaf_on_wire(), evaluate_leaf_on_wire_contain_strand_hit(), evaluate_leaf_on_wire_contain_strand_miss(), evaluate_leaf_on_wire_eq_bool_provably_true() (+77 more)
+Nodes (69): encoded(), eq_wire_strand_array_element(), evaluate_leaf_eq_strand_vs_regex_bails_to_none(), evaluate_leaf_on_wire_contain_strand_hit(), evaluate_leaf_on_wire_contain_strand_miss(), evaluate_leaf_on_wire_eq_bool_provably_true(), evaluate_leaf_on_wire_eq_regex_provably_true_on_match(), evaluate_leaf_on_wire_eq_strand_provably_true() (+61 more)
 
-### Community 222 - "Cardinality"
-Cohesion: 0.03
-Nodes (174): AnalyzeObservation, cardinality_object(), compact_node(), cost_object(), execute_explain(), explain_json(), explain_text(), graph_result_nodes() (+166 more)
+### Community 222 - "PlannerSnapshot"
+Cohesion: 0.02
+Nodes (245): Hasher, AnalyzeObservation, cardinality_object(), compact_node(), cost_object(), execute_explain(), explain_json(), explain_text() (+237 more)
 
 ### Community 223 - "write_streamed_vector_index_images"
 Cohesion: 0.09
 Nodes (55): BTreeMap, Duration, IndexId, String, Vec, ScopedIndexFile, ScopedIndexImages, ScopedIndexKind (+47 more)
 
 ### Community 224 - "Websocket"
-Cohesion: 0.07
-Nodes (48): DbResult, PublicNotification, QueryResult, Vec, begin_rpc_after_cancel_does_not_leak_transaction(), cancelling_websocket_handler_does_not_leak_in_flight_write_transaction(), cancelling_websocket_handler_does_not_leak_live_query_registration(), default_network_ctx_reads_session_under_active_observer() (+40 more)
+Cohesion: 0.08
+Nodes (44): begin_rpc_after_cancel_does_not_leak_transaction(), cancelling_websocket_handler_does_not_leak_in_flight_write_transaction(), cancelling_websocket_handler_does_not_leak_live_query_registration(), default_network_ctx_reads_session_under_active_observer(), default_network_ctx_short_circuits_on_noop_observer(), default_network_ctx_with_missing_session_returns_default(), ensure_propagator(), extract_trace_context() (+36 more)
 
 ### Community 225 - "Option"
-Cohesion: 0.05
-Nodes (58): MapFrom, MapInto, Filter, Filter<S, F>, FilterMap, FilterMap<S, F>, FromFuture, FromFuture<F> (+50 more)
-
-### Community 226 - "SearchState"
 Cohesion: 0.09
-Nodes (27): CanonicalHop, Arc, AtomId, AtomRef, BinaryHeap, Box, BTreeSet, Eq (+19 more)
+Nodes (23): Filter<S, F>, FilterMap<S, F>, FromSortedStream<S>, IntoOrdering<S>, IntoStream<S>, IntoTupleStream<S>, Map<S, F>, MapItem<S, F> (+15 more)
+
+### Community 226 - "AsyncEventRecord"
+Cohesion: 0.14
+Nodes (21): AsyncEventContext, AsyncEventRecord, Document, Action, Arc, Auth, Datastore, Error (+13 more)
 
 ### Community 227 - "fnc/array.rs"
-Cohesion: 0.12
-Nodes (71): add(), all(), any(), append(), array_join(), asc(), at(), boolean_and() (+63 more)
+Cohesion: 0.10
+Nodes (78): add(), all(), any(), append(), array_at(), array_first(), array_join(), array_last() (+70 more)
 
 ### Community 228 - "fnc/string.rs"
-Cohesion: 0.11
-Nodes (71): alpha(), alphanum(), ascii(), capitalize(), check_similarity_input_length(), compare(), concat(), contains() (+63 more)
+Cohesion: 0.12
+Nodes (62): alpha(), alphanum(), ascii(), capitalize(), check_similarity_input_length(), compare(), concat(), contains() (+54 more)
 
 ### Community 229 - "Transaction"
 Cohesion: 0.12
 Nodes (26): Datastore, drain_cursors(), Arc, AtomicBool, AtomicU8, AtomicUsize, BackgroundFlusher, Box (+18 more)
 
 ### Community 230 - "method/query.rs"
-Cohesion: 0.06
-Nodes (48): T, WithStats, Article, check_returns_the_first_error(), IndexedResults, IntoVariables, Query, query_chaining_indexes_results_correctly() (+40 more)
+Cohesion: 0.05
+Nodes (54): Data, Slope, Duration, Option, T, Stats, WithStats, Article (+46 more)
 
 ### Community 231 - "parser/idiom.rs"
 Cohesion: 0.06
@@ -2649,44 +2936,44 @@ Cohesion: 0.06
 Nodes (41): AccessType, BearerAccess, BearerAccessSubject, BearerAccessType, crate::expr::access_type::BearerAccess, crate::expr::access_type::BearerAccessSubject, crate::expr::access_type::BearerAccessType, crate::expr::access_type::JwtAccessIssue (+33 more)
 
 ### Community 233 - "test_datastore"
-Cohesion: 0.09
-Nodes (60): test_all_crud_tools_reject_injection(), test_create_service(), test_create_with_data(), test_default_ns_db(), test_delete_round_trip(), test_error_sanitization_in_results(), test_failing_statement_surfaces_as_tool_error(), test_get_table_schema_resource_backtick_quoted() (+52 more)
+Cohesion: 0.08
+Nodes (63): test_all_crud_tools_reject_injection(), test_create_service(), test_create_with_data(), test_default_ns_db(), test_delete_round_trip(), test_error_sanitization_in_results(), test_failing_statement_surfaces_as_tool_error(), test_get_table_schema_resource_backtick_quoted() (+55 more)
 
 ### Community 234 - "GqlSession"
-Cohesion: 0.10
-Nodes (27): error_result(), finalize_explain_publication(), GqlSession, resolve_analyze_mode(), resolve_job_id(), Arc, Block, Box (+19 more)
+Cohesion: 0.07
+Nodes (40): error_result(), finalize_explain_publication(), GqlSession, resolve_analyze_mode(), resolve_job_id(), Arc, Block, Box (+32 more)
 
 ### Community 235 - "Capabilities"
 Cohesion: 0.08
 Nodes (13): ParseFuncTargetError, ParseNetTargetError, Capabilities, CoreCapabilities, ExperimentalFeature, ExperimentalTarget, NewPlannerStrategy, PlannerStrategy (+5 more)
 
 ### Community 236 - "build_generation_inner"
-Cohesion: 0.10
-Nodes (53): add_atom_superblock(), add_base_statistics(), add_freelist(), add_generation_index(), add_graph(), add_graph_file(), add_graph_statistics(), add_graph_superblock() (+45 more)
+Cohesion: 0.09
+Nodes (65): BuiltGraphImage, DataFileKind, DurableAtomStoreImage, FileImage, LayoutBuilder, Membership, Primary, PhysicalIndexBinding (+57 more)
 
-### Community 237 - "ready.rs"
-Cohesion: 0.13
-Nodes (18): always_available(), app(), community_readiness(), gate_sets_retry_after_header(), readiness_gate(), ready_handler(), router(), Arc (+10 more)
+### Community 237 - "Result"
+Cohesion: 0.11
+Nodes (32): ChildrenRef, common_prefix(), DowncastConverter, extend_lifetime(), filter_prefix(), find(), FindResult, first_entry() (+24 more)
 
 ### Community 238 - "Statement"
-Cohesion: 0.07
-Nodes (30): AccessStatement, Cond, CreateStatement, Data, DeleteStatement, Explain, Fetchs, Fields (+22 more)
+Cohesion: 0.06
+Nodes (36): AccessStatement, Cond, Cow, CreateStatement, Data, DeleteStatement, Explain, Expr (+28 more)
 
 ### Community 239 - "expression_registry.rs"
-Cohesion: 0.08
-Nodes (47): ComputePoint, ExpressionInfo, ExpressionRegistry, idiom_to_flat_name(), literal_expr(), resolve_order_by_alias(), Arc, Error (+39 more)
+Cohesion: 0.04
+Nodes (95): ComputePoint, ExpressionInfo, ExpressionRegistry, idiom_to_flat_name(), literal_expr(), resolve_order_by_alias(), Arc, Error (+87 more)
 
-### Community 240 - "surrealdb/src/lib.rs"
-Cohesion: 0.03
-Nodes (89): Any, BoxFuture, Option, Result, Sealed, Self, Any, BoxFuture (+81 more)
+### Community 240 - "Strategy"
+Cohesion: 0.15
+Nodes (19): key_value_pairs(), Op, operations(), Value, Vec, unique_keys(), Option, Self (+11 more)
 
 ### Community 241 - "Transaction"
 Cohesion: 0.10
-Nodes (28): consume_keys(), consume_vals(), Cursor, Datastore, HistoryCursor, RangeCursor, Arc, AtomicBool (+20 more)
+Nodes (29): Transactable, consume_keys(), consume_vals(), Cursor, Datastore, HistoryCursor, RangeCursor, Arc (+21 more)
 
 ### Community 242 - "SurrealismConfig"
-Cohesion: 0.04
-Nodes (53): DemoHost, Arc, Fn, Object, Option, Result, Self, Send (+45 more)
+Cohesion: 0.06
+Nodes (46): Host, module_allow_net_targets(), module_scoped_capabilities(), parse_semver(), Arc, Capabilities, Fn, FrozenContext (+38 more)
 
 ### Community 243 - "Subgraph<State>"
 Cohesion: 0.05
@@ -2698,27 +2985,27 @@ Nodes (80): RwLock, DiskAnnIndexes, Arc, Default, DiskAnnParams, Result, Self, S
 
 ### Community 245 - "expr_to_ident"
 Cohesion: 0.05
-Nodes (56): expr_to_ident(), expr_to_idiom(), expr_to_optional_ident(), exprs_to_fields(), resolve_idiom(), resolve_local_idiom(), Expr, FrozenContext (+48 more)
+Nodes (64): expr_to_ident(), expr_to_idiom(), expr_to_optional_ident(), exprs_to_fields(), resolve_idiom(), resolve_local_idiom(), Expr, FrozenContext (+56 more)
 
 ### Community 246 - "src/db.rs"
 Cohesion: 0.09
 Nodes (52): begin_tx(), cancelled_tx_is_cancelled(), cleanup_respects_active_reader(), cleanup_trims_commit_queue_when_idle(), commit_watermark_tracks_commits(), committed_tx_is_committed(), count_keys_values(), cursor_bidirectional_switch() (+44 more)
 
 ### Community 247 - "Blob<'a>"
-Cohesion: 0.08
-Nodes (29): Blob, Blob<'a>, BlobStore, custom_new(), DynBlobStore, OwnedBlob, Any, Arc (+21 more)
+Cohesion: 0.06
+Nodes (39): anyhow::Error, Blob, Blob<'a>, BlobStore, custom_new(), DynBlobStore, large_blocks(), NoError (+31 more)
 
 ### Community 248 - "Runtime"
-Cohesion: 0.04
-Nodes (55): Self, benchmark_group(), Criterion, String, rt(), Self, deserialize(), ExportsManifest (+47 more)
+Cohesion: 0.05
+Nodes (38): Self, Self, benchmark_group(), Criterion, String, rt(), Self, Box (+30 more)
 
-### Community 249 - "ops.rs"
-Cohesion: 0.11
-Nodes (14): BinaryOp, PostfixOp, Any, Arc, BinaryOperator, BoxFut, FlowResult, PostfixOperator (+6 more)
+### Community 249 - "ContextLevel"
+Cohesion: 0.02
+Nodes (83): ContextLevel, execute_foreach(), ForeachIter, ForeachPlan, Arc, Block, Expr, FlowResult (+75 more)
 
-### Community 250 - "FanOutObserver"
-Cohesion: 0.07
-Nodes (19): NetworkBytesEvent, QueryEvent, StatementEvent, TransactionEvent, Counting, dispatches_to_every_observer(), empty_fan_out_is_noop(), FanOutObserver (+11 more)
+### Community 250 - "CapturingObserver"
+Cohesion: 0.06
+Nodes (25): HttpRequestEvent, HttpRequestStartEvent, NetworkBytesEvent, QueryEvent, SessionEvent, StatementEvent, TransactionEvent, Counting (+17 more)
 
 ### Community 251 - "gql/import.rs"
 Cohesion: 0.09
@@ -2734,51 +3021,51 @@ Nodes (60): authenticate_generic(), authenticate_record(), create_refresh_token_
 
 ### Community 254 - "IndexOption"
 Cohesion: 0.08
-Nodes (45): Group, IndexOperator, IndexOption, Plan, PlanBuilder, PlanBuilderParameters, RangeValue, Arc (+37 more)
+Nodes (42): Group, IndexOperator, IndexOption, Plan, PlanBuilder, PlanBuilderParameters, Arc, BinaryOperator (+34 more)
 
 ### Community 255 - "DiskAnnCache"
 Cohesion: 0.08
 Nodes (38): CachedDocId, diskann_cache_families_share_one_capacity(), diskann_cache_invalidates_single_element_node_and_doc_set(), diskann_cache_tracks_and_evicts_per_index(), DiskAnnCache, DiskAnnCacheKey, DiskAnnCacheValue, DiskAnnCacheWeighter (+30 more)
 
 ### Community 256 - "http_integration.rs"
-Cohesion: 0.15
-Nodes (65): arbitrary_query_capabilities(), assert_all_sql_ok(), assert_single_sql_err_contains(), assert_single_sql_ok(), basic_auth(), bearer_auth(), bucket_action_and_file_variables_gate_reads_in_streaming_planner(), bucket_action_and_file_variables_gate_writes_in_streaming_planner() (+57 more)
+Cohesion: 0.07
+Nodes (97): Json, Parser<'_>, BTreeMap, Parser, ParseResult, PublicArray, PublicObject, PublicRecordId (+89 more)
 
 ### Community 257 - "versions.rs"
 Cohesion: 0.08
 Nodes (52): IndexOrUpdate, make_version(), make_versions(), Bytes, From, Option, R, Self (+44 more)
 
 ### Community 258 - "MetricsObserver"
-Cohesion: 0.10
-Nodes (41): Counter, any_attr_value_contains(), collect_names(), error_class_label(), fresh_runtime(), http_active_requests_balances_with_default_start_ctx(), http_status(), into_arc_observer() (+33 more)
+Cohesion: 0.08
+Nodes (45): Counter, any_attr_value_contains(), collect_names(), error_class_label(), fresh_runtime(), http_active_requests_balances_with_default_start_ctx(), http_status(), into_arc_observer() (+37 more)
 
 ### Community 259 - "Ident"
-Cohesion: 0.08
-Nodes (58): BinaryOp, DeleteStatement, DetachMode, EdgeDirection, EdgePattern, ElementPredicate, GqlExpr, GqlGroupItem (+50 more)
+Cohesion: 0.07
+Nodes (60): main(), new_ident(), push_ident(), Ast, BinaryOp, DeleteStatement, DetachMode, EdgeDirection (+52 more)
 
 ### Community 260 - "Accumulator"
-Cohesion: 0.05
-Nodes (24): Accumulator, AggregateFunction, Debug, as_float(), MathMax, MathMean, MathMedian, MathMin (+16 more)
+Cohesion: 0.07
+Nodes (14): Accumulator, as_float(), MaxAccumulator, MeanAccumulator, MinAccumulator, Any, Box, Number (+6 more)
 
 ### Community 261 - "expr/statements/remove/mod.rs"
 Cohesion: 0.05
 Nodes (54): RemoveDatabaseStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+46 more)
 
-### Community 262 - "SerializedVector"
-Cohesion: 0.11
-Nodes (31): diskann_docs_batch_does_not_cache_write_transaction_mappings(), diskann_docs_batch_ignores_doc_id_cache_from_old_generation(), diskann_docs_batch_populates_and_uses_doc_id_cache(), diskann_docs_remove_evicts_doc_id_cache(), diskann_vec_docs_caches_hashed_docs_after_disambiguating_vector(), diskann_vec_docs_missing_element_doc_candidate_returns_none(), diskann_vec_docs_populates_and_uses_doc_set_cache(), diskann_vec_docs_resolves_element_doc_cache_misses_in_order() (+23 more)
+### Community 262 - "TableId"
+Cohesion: 0.10
+Nodes (36): DeserializeRevisioned, Revisioned, SerializeRevisioned, SkipRevisioned, WalkRevisioned, TableId, cache_index(), diskann_docs_batch_does_not_cache_write_transaction_mappings() (+28 more)
 
 ### Community 263 - "Transaction"
-Cohesion: 0.11
-Nodes (23): consume_keys(), consume_vals(), Datastore, MemValsCursor, AtomicBool, Box, BoxFut, BoxTimeStampImpl (+15 more)
+Cohesion: 0.16
+Nodes (18): ScanCursorVals, consume_keys(), consume_vals(), Datastore, MemValsCursor, AtomicBool, Box, BoxFut (+10 more)
 
 ### Community 264 - "revision_impl.rs"
 Cohesion: 0.08
 Nodes (36): btree_map_revision_bytes_decode_to_vec_map(), btree_set_revision_bytes_decode_to_vec_set(), revision_bytes(), DeserializeRevisioned, Error, R, Result, Revisioned (+28 more)
 
 ### Community 265 - "BoxTimeStamp"
-Cohesion: 0.09
-Nodes (36): BoxTimeStamp, HlcTimeStamp, HlcTimeStampImpl, IncTimeStamp, IncTimeStampImpl, Any, Box, DateTime (+28 more)
+Cohesion: 0.07
+Nodes (42): BoxTimeStampImpl, DateTime, Duration, Utc, SurrealMxTimeStamp, SurrealMxTimeStampImpl, BoxTimeStamp, HlcTimeStamp (+34 more)
 
 ### Community 266 - "Transactor"
 Cohesion: 0.08
@@ -2797,36 +3084,36 @@ Cohesion: 0.14
 Nodes (12): OnUnwind, Bytes, Direction, Error, F, K, Option, Range (+4 more)
 
 ### Community 270 - "VecSet<T>"
-Cohesion: 0.05
-Nodes (63): &'a VecSet<T>, assert_sorted(), clear_resets_to_empty(), contains_uses_borrow(), difference_disjoint_overlapping_identical_and_empty(), equality_and_ord_are_lexicographic(), extend_inserts_and_dedups(), first_and_last_min_and_max() (+55 more)
+Cohesion: 0.04
+Nodes (65): &'a VecSet<T>, assert_sorted(), clear_resets_to_empty(), contains_uses_borrow(), difference_disjoint_overlapping_identical_and_empty(), equality_and_ord_are_lexicographic(), extend_inserts_and_dedups(), first_and_last_min_and_max() (+57 more)
 
 ### Community 271 - "Builder"
-Cohesion: 0.07
-Nodes (38): BucketConfig, BucketStoreProvider, BucketStoreProviderRequirements, CommunityComposer, Send, Sync, build_with_factory_path_keeps_legacy_shape(), build_with_factory_path_returns_router_state() (+30 more)
+Cohesion: 0.05
+Nodes (49): BucketConfig, BucketStoreProvider, BucketStoreProviderRequirements, CommunityComposer, Config, Arc, BoxFuture, Option (+41 more)
 
-### Community 272 - "ScalarFunction"
-Cohesion: 0.07
-Nodes (23): register(), BoxFut, Result, Signature, Value, Vec, ValueChain, ValueDiff (+15 more)
+### Community 272 - "Result"
+Cohesion: 0.11
+Nodes (10): register(), BoxFut, Result, Signature, Value, Vec, ValueChain, ValueDiff (+2 more)
 
 ### Community 273 - "tests/schema/mod.rs"
 Cohesion: 0.09
 Nodes (48): AuthLevel, BenchDetails, bool_or_f(), BoolOr, BoolOr<T>, Capabilities, default_duration(), default_planner_strategy() (+40 more)
 
-### Community 274 - "FerrosGrynnResult"
-Cohesion: 0.13
-Nodes (21): FilterCursor, LimitCursor, MatchGraphFields<'a, Read>, MatchGraphFields<'_, Read>, OneRowCursor, ProjectCursor, properties_object(), RecordFields (+13 more)
+### Community 274 - "Datetime"
+Cohesion: 0.10
+Nodes (19): Datetime, DateTime<Utc>, Arbitrary, Default, Deref, Display, Err, Error (+11 more)
 
 ### Community 275 - "Decoder<'a>"
 Cohesion: 0.13
-Nodes (18): Decoder<'a>, Box, FerrosGrynnResult, Geometry, Position, Self, T, Text (+10 more)
+Nodes (19): Decoder<'a>, Box, FerrosGrynnResult, Geometry, PropertyKeyId, Self, T, Text (+11 more)
 
 ### Community 276 - "Error"
 Cohesion: 0.06
 Nodes (45): Base64Error, anyhow_to_types_error(), Error, is_query_cancelled(), is_query_timedout(), Box, D, Duration (+37 more)
 
-### Community 277 - "ApiRequest"
-Cohesion: 0.11
-Nodes (24): create_final_action_closure(), create_middleware_closure(), process_api_request(), process_api_request_with_stack(), Closure, Expr, FrozenContext, Result (+16 more)
+### Community 277 - "build_graph_image_with_membership"
+Cohesion: 0.06
+Nodes (66): GraphArena, BTreeMap, build_graph_image(), build_graph_image_with_membership(), build_import_graph_image(), disk_ref(), invalid(), label_kind() (+58 more)
 
 ### Community 278 - "Parser"
 Cohesion: 0.10
@@ -2834,31 +3121,31 @@ Nodes (39): ast::Access, ast::Assignment, ast::Create, ast::Delete, ast::Explain
 
 ### Community 279 - "Value"
 Cohesion: 0.05
-Nodes (45): Indexable, Array, Box, Bytes, Datetime, Duration, Eq, Error (+37 more)
+Nodes (44): Indexable, Array, Box, Bytes, Datetime, Duration, Eq, Error (+36 more)
 
 ### Community 281 - "Surreal"
-Cohesion: 0.04
-Nodes (54): Create, Any, Routine, Self, String, bench_routine(), rand_id(), Routine (+46 more)
+Cohesion: 0.06
+Nodes (43): Create, Any, Routine, Self, String, bench_routine(), rand_id(), Routine (+35 more)
 
 ### Community 282 - "bench/run.rs"
-Cohesion: 0.09
-Nodes (54): bench_marker(), BenchConfig, BenchRunConfig, BenchRunResult, BenchStatement, build_and_populate(), builder_from_config(), calc_group_key() (+46 more)
+Cohesion: 0.10
+Nodes (47): bench_marker(), BenchConfig, BenchRunConfig, BenchRunResult, BenchStatement, build_and_populate(), builder_from_config(), calc_group_key() (+39 more)
 
 ### Community 283 - "Building"
-Cohesion: 0.18
-Nodes (10): Building, AtomicBool, AtomicU64, BuildGeneration, Error, F, Instant, Result (+2 more)
+Cohesion: 0.11
+Nodes (23): Building, BuildingFinishGuard, BuildStart, IndexBuilder, Arc, AtomicBool, AtomicU64, BuildGeneration (+15 more)
 
-### Community 284 - "RowSet"
-Cohesion: 0.08
-Nodes (64): aggregate_value(), AggregateState, contains_select_special(), eval_select_expr(), materialize_specials(), numeric_value(), Aggregate, Array (+56 more)
+### Community 284 - "Range"
+Cohesion: 0.14
+Nodes (16): Range, Bound, From, Option, Ord, Ordering, PartialOrd, RangeBounds (+8 more)
 
-### Community 285 - "TableId"
+### Community 285 - "SerializedVector"
 Cohesion: 0.10
-Nodes (33): DeserializeRevisioned, Revisioned, SerializeRevisioned, SkipRevisioned, WalkRevisioned, TableId, ElementDocs, ElementHashedDocs (+25 more)
+Nodes (31): ElementDocs, ElementHashedDocs, hnsw_docs_batch_does_not_cache_missing_or_write_transaction_mappings(), hnsw_docs_batch_ignores_doc_id_cache_from_old_generation(), hnsw_docs_batch_preserves_order_and_uses_cache(), hnsw_docs_remove_evicts_doc_id_cache(), hnsw_vec_docs_hashed_disambiguates_and_caches_by_element(), hnsw_vec_docs_missing_mapping_returns_none_without_caching() (+23 more)
 
-### Community 286 - "Results"
-Cohesion: 0.05
-Nodes (37): GroupCollector, BTreeMap, FrozenContext, Idiom, Result, Self, Statement, Stk (+29 more)
+### Community 286 - "ObjectKey"
+Cohesion: 0.08
+Nodes (23): ObjectKey, Default, Deref, Display, Eq, Formatter, From, H (+15 more)
 
 ### Community 287 - "T"
 Cohesion: 0.08
@@ -2866,19 +3153,19 @@ Nodes (29): Atomic<T>, CompareExchangeError, Owned, Owned<T>, pin(), AtomicPtr, 
 
 ### Community 288 - "DatabaseRoot"
 Cohesion: 0.07
-Nodes (38): index_context(), class(), compatible_type(), DatabaseRoot, global_node_and_edge_use_distinct_atom_store_slots(), graph(), install_graph(), invalid() (+30 more)
+Nodes (43): AtomStoreRoot, index_context(), PropertyDictionary, class(), compatible_type(), DatabaseRoot, global_node_and_edge_use_distinct_atom_store_slots(), graph() (+35 more)
 
 ### Community 289 - "EdgeEndpoint"
-Cohesion: 0.13
-Nodes (21): EdgeEndpoint, From, deduplicated_steps(), endpoint_kind(), local_steps(), AtomId, Check, DoubleEndedIterator (+13 more)
+Cohesion: 0.07
+Nodes (40): DoubleEndedIterator, I, S, SmallVec, distinguishes_binary_hyper_and_cross_level_topology(), EdgeDirection, EdgeEndpoint, QualifiedAtomId (+32 more)
 
-### Community 290 - "Mem"
-Cohesion: 0.09
-Nodes (22): get_timestamp(), F, Result, walk_directory(), xorshift(), Error, Result, Self (+14 more)
+### Community 290 - "analyzer/filter.rs"
+Cohesion: 0.13
+Nodes (27): test_arabic_stemmer(), test_danish_stemmer(), test_dutch_stemmer(), test_edgengram(), test_english_stemmer(), test_finnish_stemmer(), test_french_stemmer(), test_german_stemmer() (+19 more)
 
 ### Community 291 - "PathSegment"
-Cohesion: 0.09
-Nodes (47): F, T, descend_record_value_path(), descend_to_value_walker(), descend_to_value_walker_parts(), descend_value_path_parts(), descend_value_recursive(), descend_value_slice_path() (+39 more)
+Cohesion: 0.10
+Nodes (44): descend_to_value_walker(), descend_to_value_walker_parts(), descend_value_path_parts(), descend_value_recursive(), descend_value_slice_path(), descend_walker_recursive(), DescendResult, extract_field_from_record_bytes_parts() (+36 more)
 
 ### Community 292 - "ParseSync"
 Cohesion: 0.06
@@ -2886,27 +3173,23 @@ Nodes (42): ast::FileLit, ast::Ident, ast::Integer, ast::Param, ast::Path, ast::
 
 ### Community 293 - "dbs/store.rs"
 Cohesion: 0.08
-Nodes (28): Statement, apply_permutation_in_place(), MemoryCollector, MemoryOrdered, MemoryOrderedLimit, MemoryRandom, OrderedValue, Arc (+20 more)
-
-### Community 294 - "QualifiedAtomId"
-Cohesion: 0.11
-Nodes (16): distinguishes_binary_hyper_and_cross_level_topology(), EdgeDirection, QualifiedAtomId, AtomId, Box, Display, FerrosGrynnResult, FnMut (+8 more)
+Nodes (27): apply_permutation_in_place(), MemoryCollector, MemoryOrdered, MemoryOrderedLimit, MemoryRandom, OrderedValue, Arc, BinaryHeap (+19 more)
 
 ### Community 295 - "Parser<'_>"
-Cohesion: 0.08
-Nodes (32): is_identifier_token(), Parser<'_>, ApiConfig, DefaultConfig, DefineAccessStatement, DefineAnalyzerStatement, DefineApiStatement, DefineBucketStatement (+24 more)
+Cohesion: 0.09
+Nodes (27): Parser<'_>, ApiConfig, DefineAccessStatement, DefineAnalyzerStatement, DefineApiStatement, DefineBucketStatement, DefineConfigStatement, DefineDatabaseStatement (+19 more)
 
 ### Community 296 - "computed_deps.rs"
 Cohesion: 0.10
-Nodes (54): binary_expression_two_fields(), closure_marks_incomplete(), create_subquery_marks_incomplete(), deduplicates_deps(), delete_subquery_marks_incomplete(), extract(), field_expr(), field_plus_literal() (+46 more)
+Nodes (55): binary_expression_two_fields(), closure_marks_incomplete(), create_subquery_marks_incomplete(), deduplicates_deps(), delete_subquery_marks_incomplete(), extract(), extract_computed_deps(), field_expr() (+47 more)
 
 ### Community 297 - "Registry"
 Cohesion: 0.13
 Nodes (35): BindingKind, analyze_clause(), analyze_items(), analyze_optional(), analyze_pattern(), Analyzer, AnchorContext, BindingInfo (+27 more)
 
 ### Community 298 - "Part"
-Cohesion: 0.10
-Nodes (21): &'a Idiom, &'a [Part], DestructurePart, FindRecursionPlan, Next, NextMethod, Part, RecursionPlan (+13 more)
+Cohesion: 0.08
+Nodes (30): &'a Idiom, &'a [Part], DestructurePart, FindRecursionPlan, Next, NextMethod, Part, Recurse (+22 more)
 
 ### Community 299 - "TableName"
 Cohesion: 0.07
@@ -2917,44 +3200,44 @@ Cohesion: 0.06
 Nodes (57): HnswElements, Distance, ElementId, IndexId, Option, Result, Self, Transaction (+49 more)
 
 ### Community 301 - "kvs/config.rs"
-Cohesion: 0.08
-Nodes (23): AolMode, format_duration(), parse_duration(), parse_query_params(), Display, Duration, Err, Formatter (+15 more)
+Cohesion: 0.06
+Nodes (31): AolMode, format_duration(), parse_duration(), parse_query_params(), Display, Duration, Err, Formatter (+23 more)
 
-### Community 302 - "Resource"
+### Community 302 - "SkipContent"
 Cohesion: 0.09
-Nodes (39): CreateResource, Direction, IntoResource, KeyRange, no_colon(), Object, QueryRange, RecordId (+31 more)
+Nodes (20): Path, SkipContent, NamedFieldsAttributes, Attribute, Option, Self, String, Attribute (+12 more)
 
 ### Community 303 - "ws_integration.rs"
 Cohesion: 0.11
 Nodes (56): authenticate(), concurrency(), create(), delete(), detach_connection_session_rejected(), ensure_namespace_and_database(), info(), insert() (+48 more)
 
-### Community 304 - "CommonConfig"
+### Community 304 - "core/src/syn/mod.rs"
 Cohesion: 0.12
-Nodes (40): CommonConfig, Vec, block(), datetime(), duration(), expr(), expr_legacy_strand(), expr_with_capabilities() (+32 more)
+Nodes (38): block(), datetime(), duration(), expr(), expr_legacy_strand(), expr_with_capabilities(), extract_tables_from_kind(), extract_tables_from_kind_impl() (+30 more)
 
 ### Community 305 - "aggregates/array.rs"
-Cohesion: 0.08
-Nodes (35): array_distinct_deduplicates(), array_distinct_merge(), array_distinct_mixed_types(), array_distinct_reset(), array_distinct_single_item(), array_distinct_zero_items(), array_group_merge(), array_group_multiple_items() (+27 more)
+Cohesion: 0.10
+Nodes (32): array_distinct_deduplicates(), array_distinct_merge(), array_distinct_mixed_types(), array_distinct_reset(), array_distinct_single_item(), array_distinct_zero_items(), array_group_merge(), array_group_multiple_items() (+24 more)
 
-### Community 306 - "generate_schema"
-Cohesion: 0.14
-Nodes (19): add_auth_mutations(), build_public_variables(), Arc, Datastore, IndexMap, Object, PublicVariables, Result (+11 more)
+### Community 306 - "Dc"
+Cohesion: 0.12
+Nodes (22): Dc, Dc<'a>, DcPrefix, DcPrefix<'a>, key_root(), key_with_ids(), range_with_root(), Cow (+14 more)
 
-### Community 307 - "ScanDirection"
-Cohesion: 0.06
-Nodes (34): AccessPath, BTreeAccess, find_hinted_index(), IndexRef, Arc, BinaryOperator, Deref, Eq (+26 more)
+### Community 307 - "Resource"
+Cohesion: 0.09
+Nodes (36): CreateResource, Direction, KeyRange, no_colon(), Object, QueryRange, RecordId, Resource (+28 more)
 
 ### Community 308 - "McpService"
-Cohesion: 0.14
-Nodes (25): McpService, CallToolResult, CompleteRequestParams, CompleteResult, Error, F, GetPromptResult, McpError (+17 more)
+Cohesion: 0.16
+Nodes (22): McpService, CallToolResult, CompleteRequestParams, CompleteResult, F, GetPromptResult, McpError, Parameters (+14 more)
 
 ### Community 309 - "CreateDb"
-Cohesion: 0.05
-Nodes (85): export_escaped_table_names(), export_import(), export_with_config(), ml_export_import(), export_import_different_data_types(), export_import_multiple_tables(), export_import_versioned_range_queries(), export_import_versioned_records() (+77 more)
+Cohesion: 0.09
+Nodes (54): authenticate(), binding_edges(), changefeed(), client_side_transactions(), connect(), create_record_no_id(), create_record_no_id_with_content(), create_record_with_id() (+46 more)
 
-### Community 310 - "Tt"
-Cohesion: 0.11
-Nodes (24): key(), Cow, DocId, IndexId, Result, Self, TableName, Uuid (+16 more)
+### Community 310 - "dbs/capabilities.rs"
+Cohesion: 0.06
+Nodes (32): ArbitraryQueryTarget, EvalQueryTarget, FuncTarget, NetTarget, ParseArbitraryQueryTargetError, ParseEvalQueryTargetError, ParseExperimentalTargetError, ParseMethodTargetError (+24 more)
 
 ### Community 311 - "TestCase"
 Cohesion: 0.07
@@ -2970,23 +3253,23 @@ Nodes (36): crate::expr::Kind, crate::expr::kind::GeometryKind, crate::expr::kin
 
 ### Community 314 - "surreal_value/derive/mod.rs"
 Cohesion: 0.06
-Nodes (31): GenericWrapper, Person, PersonRenamed, RawIdentEnum, RawIdentStruct, RecursiveEnum, RecursiveStruct, RouterRequest (+23 more)
+Nodes (30): GenericWrapper, Person, PersonRenamed, RawIdentEnum, RawIdentStruct, RecursiveEnum, RecursiveStruct, RouterRequest (+22 more)
 
 ### Community 315 - "StorageValue"
-Cohesion: 0.09
-Nodes (33): AtomRef, Bound, Box, Bytes, DateTime, Decimal, Deref, Duration (+25 more)
+Cohesion: 0.10
+Nodes (34): DiskGraphRef, QualifiedAtomRef, Span, AtomKind, Bound, Box, Bytes, DateTime (+26 more)
 
-### Community 316 - "FullTextScan"
-Cohesion: 0.16
-Nodes (11): FullTextScan, Arc, FlowResult, HashSet, MatchesOperator, Option, Self, String (+3 more)
+### Community 316 - "Tt"
+Cohesion: 0.11
+Nodes (24): key(), Cow, DocId, IndexId, Result, Self, TableName, Uuid (+16 more)
 
 ### Community 317 - "WorldComponents"
-Cohesion: 0.09
-Nodes (22): AnyPool, atom(), remove_atom_cleans_every_pool_and_respects_generation(), Any, AtomId, Box, FerrosGrynnResult, FnMut (+14 more)
+Cohesion: 0.10
+Nodes (21): AnyPool, atom(), remove_atom_cleans_every_pool_and_respects_generation(), Any, AtomId, Box, FerrosGrynnResult, FnMut (+13 more)
 
 ### Community 318 - "FieldDefinition"
-Cohesion: 0.08
-Nodes (37): ComputedDeps, DefineDefault, FieldDefinition, AuthLimit, DefineFieldStatement, Error, Expr, Idiom (+29 more)
+Cohesion: 0.07
+Nodes (42): field_basic(), field_flexible_with_reference(), field_readonly(), field_with_default_set(), field_with_type(), ComputedDeps, DefineDefault, FieldDefinition (+34 more)
 
 ### Community 319 - "Result"
 Cohesion: 0.11
@@ -3000,25 +3283,25 @@ Nodes (27): AssignOperator, BinaryOperator, BindingPower, BooleanOperator, crate
 Cohesion: 0.09
 Nodes (20): PeekableLexer, PeekableLexer<'source, SIZE>, Clone, Lexer, MaybeUninit, Option, Result, Self (+12 more)
 
-### Community 322 - "Builder"
-Cohesion: 0.10
-Nodes (20): LogFormat, Builder, default_otel_filter(), filter_from_value(), Box, Default, EnvFilter, LevelFilter (+12 more)
+### Community 322 - "Results"
+Cohesion: 0.09
+Nodes (16): Results, Box, From, FrozenContext, Idiom, Option, Result, Selector (+8 more)
 
 ### Community 323 - "remote/http/mod.rs"
 Cohesion: 0.10
 Nodes (41): BackupSender, CoreToken, Auth, Authenticate, AuthResponse, Client, Credentials, default_headers() (+33 more)
 
-### Community 324 - "MemoryStore"
-Cohesion: 0.25
-Nodes (16): Entry, MemoryStore, Box, Bytes, DashMap, Datetime, From, Future (+8 more)
+### Community 324 - "invalid_run"
+Cohesion: 0.17
+Nodes (22): invalid_run(), FerrosGrynnError, Into, String, decode_query_value(), Decoder, direction_tag(), encode_bound() (+14 more)
 
 ### Community 325 - "generator.rs"
 Cohesion: 0.07
 Nodes (46): access_definition_fixtures(), access_grant_fixtures(), analyzer_fixtures(), api_action_fixtures(), api_fixtures(), appending_fixtures(), batch_value_fixtures(), bucket_fixtures() (+38 more)
 
-### Community 326 - "invalid"
-Cohesion: 0.15
-Nodes (22): CatalogPath, companions_are_exact_and_space_local(), Decoder, Decoder<'a>, fgfc_v6_has_exact_auxiliary_roles_and_rejects_v5(), file(), FileCatalogEntry, invalid() (+14 more)
+### Community 326 - "FileCatalog"
+Cohesion: 0.10
+Nodes (34): CatalogPath, companions_are_exact_and_space_local(), Decoder, Decoder<'a>, fgfc_v6_has_exact_auxiliary_roles_and_rejects_v5(), file(), FileCatalog, FileCatalogEntry (+26 more)
 
 ### Community 327 - "Vec<Number>"
 Cohesion: 0.13
@@ -3028,41 +3311,41 @@ Nodes (31): Add, Angle, ChebyshevDistance, check_same_dimension(), CosineDistanc
 Cohesion: 0.09
 Nodes (28): idiom_is_prefix(), MissingKind, Parser<'_>, Base, ChangeFeed, Cond, Data, Distance (+20 more)
 
-### Community 329 - "HnswIndex"
-Cohesion: 0.08
-Nodes (35): bump_compaction_generation(), read_compaction_generation(), K, Option, Transaction, CapturedPendingKey, HnswCompactionPlan, HnswContext<'a> (+27 more)
+### Community 329 - "DefineAnalyzerStatement"
+Cohesion: 0.05
+Nodes (40): fmt_analyzer_function(), fmt_analyzer_function_fn(), fmt_analyzer_function_mod(), function_from_storage(), qualified_name(), Function, String, AlterAnalyzerStatement (+32 more)
 
 ### Community 330 - "wal/mod.rs"
-Cohesion: 0.17
-Nodes (50): encode_page_key(), Path, PathBuf, Vec, segment_path(), append_raw_commit(), append_raw_frame(), checkpoint_end_layout_is_fixed_without_dirty_page_table() (+42 more)
+Cohesion: 0.19
+Nodes (47): encode_page_key(), Path, PathBuf, Vec, segment_path(), append_raw_commit(), append_raw_frame(), checkpoint_end_layout_is_fixed_without_dirty_page_table() (+39 more)
 
 ### Community 331 - "QueryResult"
-Cohesion: 0.10
+Cohesion: 0.09
 Nodes (32): error_query_result(), from_query_result_value(), into_query_result_value(), query_result_error_no_kind_duplication(), query_result_error_round_trip_nested_struct_details(), query_result_error_round_trip_no_inner_details(), query_result_error_round_trip_validation_parse(), query_result_error_round_trip_with_details() (+24 more)
 
 ### Community 332 - "wire_literal.rs"
-Cohesion: 0.10
-Nodes (23): from_value_canonical_variants_round_trip(), from_value_number_decimal_has_no_int_value(), from_value_number_float_has_no_int_value(), from_value_number_round_trips(), from_value_strand_round_trips_and_extracts_utf8(), from_value_strand_with_multi_byte_utf8_indexes_range_correctly(), literal_set_compound_only_goes_to_fallback(), literal_set_marks_number_cross_variant_with_int_and_float() (+15 more)
+Cohesion: 0.08
+Nodes (39): eq_wire(), evaluate_leaf_on_wire(), evidence_bool(), peek_number_sub_variant(), peek_value(), BinaryOperator, Option, Ordering (+31 more)
 
-### Community 333 - "Content"
-Cohesion: 0.04
-Nodes (52): Content, Content<'r, C, R>, Content<'r, Client, Option<R>>, Content<'r, Client, Value>, Content<'r, Client, Vec<R>>, Command, Cow, F (+44 more)
+### Community 333 - "InfoStructure"
+Cohesion: 0.02
+Nodes (114): api_action_basic(), api_action_multi_method(), api_basic(), api_with_auth_limit(), api_with_middleware(), config_api(), config_default(), config_graphql() (+106 more)
+
+### Community 334 - "syn/parser/test/stmt.rs"
+Cohesion: 0.03
+Nodes (6): Access, test_to_sql(), ident_field(), Expr, LiveFields, Subscription
 
 ### Community 335 - "Duration"
 Cohesion: 0.07
 Nodes (19): crate::types::PublicDuration, Duration, Datetime, Deref, Display, Err, Formatter, From (+11 more)
 
-### Community 336 - "Value"
-Cohesion: 0.06
-Nodes (31): Array, AtomOccurrenceRef, AtomRef, Box, Bytes, Closure, DateTime, Duration (+23 more)
-
 ### Community 337 - "aggregates/time.rs"
 Cohesion: 0.13
 Nodes (31): as_datetime(), make_datetime(), Any, Box, Datetime, Option, Result, Signature (+23 more)
 
-### Community 338 - "AnalyzerDefinition"
-Cohesion: 0.11
-Nodes (18): analyzer_basic(), analyzer_with_tokenizers(), AnalyzerDefinition, filter_structure_value(), DefineAnalyzerStatement, Filter, Option, Strand (+10 more)
+### Community 338 - "Bp"
+Cohesion: 0.20
+Nodes (16): advance_key(), Bp, Bp<'a>, BpGenerationPrefix, BpPrefix, BuildGeneration, Cow, IndexId (+8 more)
 
 ### Community 339 - "SurrealProcess"
 Cohesion: 0.13
@@ -3077,20 +3360,20 @@ Cohesion: 0.17
 Nodes (27): bare_lowercase_paths_query_enables_folding(), build_url(), canonical(), default_preserves_case_end_to_end(), FileStore, FileStoreOptions, is_path_allowed(), lowercase_mode_rejects_non_utf8_paths() (+19 more)
 
 ### Community 342 - "fulltext_index_delta.rs"
-Cohesion: 0.18
-Nodes (32): build_fulltext_delta(), decode_fulltext_delta(), decode_header(), decode_records(), decode_stream(), DecodedFulltextDelta, encode_header(), encode_stream() (+24 more)
+Cohesion: 0.17
+Nodes (34): build_fulltext_delta(), decode_fulltext_delta(), decode_header(), decode_records(), decode_stream(), DecodedFulltextDelta, encode_header(), encode_stream() (+26 more)
 
 ### Community 343 - "operators/aggregate.rs"
-Cohesion: 0.07
-Nodes (50): Aggregate, aggregate_field_name(), AggregateExprInfo, AggregateField, compute_aggregate_field_value(), compute_group_result_async(), compute_single_field_value(), create_group_state() (+42 more)
+Cohesion: 0.12
+Nodes (29): Aggregate, aggregate_field_name(), AggregateExprInfo, AggregateField, compute_aggregate_field_value(), compute_group_result_async(), compute_single_field_value(), create_group_state() (+21 more)
 
 ### Community 344 - "physical_expr/mod.rs"
 Cohesion: 0.06
 Nodes (28): evaluate_index(), IndexPart, Any, Arc, BoxFut, FlowResult, Result, String (+20 more)
 
-### Community 345 - "ExecutionObserver"
-Cohesion: 0.07
-Nodes (43): HttpRequestEvent, HttpRequestStartEvent, ExecutionObserver, Send, Sync, CapturingObserver, http_version_from_axum(), HttpCallMetricsFuture<F> (+35 more)
+### Community 345 - "http_tower.rs"
+Cohesion: 0.08
+Nodes (35): http_version_from_axum(), HttpCallMetricsFuture<F>, HttpCallMetricsFuture<Fut>, HttpCallMetricTracker, HttpMetrics, HttpMetrics<S>, HttpMetricsLayer, intern_route() (+27 more)
 
 ### Community 346 - "Closure"
 Cohesion: 0.06
@@ -3104,17 +3387,13 @@ Nodes (44): block_on(), create_runtime(), Datastore, Future, Output, T, setup_da
 Cohesion: 0.10
 Nodes (20): dedups_preserving_first_occurrence_order(), dedups_structurally_equal_rows(), Distinct, distinct_reports_name(), empty_input_yields_nothing(), hash_value(), passes_distinct_rows_through_unchanged(), rows() (+12 more)
 
-### Community 349 - "AlterAnalyzerStatement"
-Cohesion: 0.19
-Nodes (11): AlterAnalyzerStatement, crate::expr::statements::alter::AlterAnalyzerStatement, AlterKind, Default, Expr, Filter, From, Self (+3 more)
-
 ### Community 350 - "local/mod.rs"
 Cohesion: 0.09
-Nodes (38): copy(), Db, export_file(), export_ml(), handle_session_clone_registers_new_session(), IndxDb, kill_live_query(), new_state() (+30 more)
+Nodes (41): MlExportConfig, String, copy(), Db, export_file(), export_ml(), handle_session_clone_registers_new_session(), IndxDb (+33 more)
 
 ### Community 351 - "tests/transaction.rs"
-Cohesion: 0.10
-Nodes (5): atom_exists(), Datastore, QueryResult, Value, selected_value()
+Cohesion: 0.09
+Nodes (6): atom_exists(), gql_stage_11_single_statement_probe(), Datastore, QueryResult, Value, selected_value()
 
 ### Community 352 - "NormaliserType"
 Cohesion: 0.07
@@ -3141,8 +3420,8 @@ Cohesion: 0.12
 Nodes (24): normalize_method(), ReferrerPolicy, Request, Request<'js>, RequestCache, RequestCredentials, RequestInit, RequestInit<'js> (+16 more)
 
 ### Community 358 - "Parser<'a>"
-Cohesion: 0.09
-Nodes (28): GqlQuery, deep_linear_chains_lower_without_overflowing(), parse_to_plan_with_settings_end_to_end(), prepared_query_debug_renders_via_match_plan(), prepared_query_to_sql_renders_via_match_plan(), GqlParserSettings, lower(), parse_str() (+20 more)
+Cohesion: 0.08
+Nodes (31): deep_linear_chains_lower_without_overflowing(), lower_plan(), parse_to_plan_with_settings_end_to_end(), prepared_query_debug_renders_via_match_plan(), prepared_query_to_sql_renders_via_match_plan(), GqlParserSettings, lower(), parse_str() (+23 more)
 
 ### Community 359 - "subscriptions.rs"
 Cohesion: 0.12
@@ -3161,8 +3440,8 @@ Cohesion: 0.13
 Nodes (41): array(), bool(), bytes(), collection(), datetime(), decimal(), duration(), field() (+33 more)
 
 ### Community 363 - "Geometry"
-Cohesion: 0.10
-Nodes (24): encode_decode(), geo::Geometry<f64>, Geometry, round_trip(), F, From, FromIterator, H (+16 more)
+Cohesion: 0.09
+Nodes (25): encode_decode(), geo::Geometry<f64>, Geometry, round_trip(), F, From, FromIterator, H (+17 more)
 
 ### Community 364 - "Object"
 Cohesion: 0.09
@@ -3172,21 +3451,17 @@ Nodes (28): crate::types::PublicObject, Object, BTreeMap, Deref, DerefMut, Error
 Cohesion: 0.05
 Nodes (8): Option, String, TestNoSkipContent, TestOverrideSkip, TestPerVariantSkip, TestSkipContent, TestSkipContentOption, TestSkipContentWithDefault
 
-### Community 366 - "ViewDefinition"
-Cohesion: 0.08
-Nodes (20): Expr, Fields, Groups, Option, String, TableName, Value, Vec (+12 more)
+### Community 366 - "ModuleDefinition"
+Cohesion: 0.07
+Nodes (26): module_no_name(), module_silo(), module_surrealism(), ModuleExecutable, ModuleName, DefineModuleStatement, Display, Error (+18 more)
 
 ### Community 367 - "NodeId"
 Cohesion: 0.12
 Nodes (19): Ast, Ast<L>, ListIter, ListIter<'a, T, L>, Index, IndexMut, Item, L (+11 more)
 
-### Community 368 - "analyzer/mod.rs"
-Cohesion: 0.11
-Nodes (24): Analyzer, FilteringStage, Analyzer, get_analyzer_tokens(), Arc, DocLength, Filter, FrozenContext (+16 more)
-
-### Community 369 - "Splits"
-Cohesion: 0.17
-Nodes (10): Deref, Idiom, IntoIter, IntoIterator, Split, String, Target, Vec (+2 more)
+### Community 368 - "Tokens"
+Cohesion: 0.14
+Nodes (22): Analyzer, FilteringStage, Analyzer, get_analyzer_tokens(), Arc, DocLength, Filter, FrozenContext (+14 more)
 
 ### Community 370 - "graphql/mutations.rs"
 Cohesion: 0.17
@@ -3205,8 +3480,8 @@ Cohesion: 0.08
 Nodes (19): BTreeSet, Error, Expr, From, FromIterator, IntoIter, IntoIterator, Item (+11 more)
 
 ### Community 374 - "Export"
-Cohesion: 0.10
-Nodes (22): Backup, Export, Export<'_, C, R, T>, Export<'r, C, R>, Export<'r, Client, PathBuf, T>, Export<'r, Client, (), T>, Box, Config (+14 more)
+Cohesion: 0.07
+Nodes (26): Backup, Export, Export<'_, C, R, Config>, Export<'_, C, R, T>, Export<'r, C, R>, Export<'r, Client, PathBuf, T>, Export<'r, Client, (), T>, Box (+18 more)
 
 ### Community 375 - "Persistence"
 Cohesion: 0.08
@@ -3218,15 +3493,15 @@ Nodes (39): arb_owned_tree(), arb_prefix(), arb_tree_contents(), arb_value(), di
 
 ### Community 377 - "LeaseHandler"
 Cohesion: 0.16
-Nodes (29): LeaseHandler, LeaseStatus, node_task_lease(), NodeResult, Arc, AtomicI64, CancellationToken, DateTime (+21 more)
+Nodes (30): task_lease_basic(), LeaseHandler, LeaseStatus, node_task_lease(), NodeResult, Arc, AtomicI64, CancellationToken (+22 more)
 
-### Community 378 - "EvalContext"
-Cohesion: 0.10
-Nodes (55): argon2_compare_impl(), argon2_generate_impl(), bcrypt_compare_impl(), bcrypt_generate_impl(), cpu_intensive(), pbkdf2_compare_impl(), pbkdf2_generate_impl(), F (+47 more)
+### Community 378 - "Result"
+Cohesion: 0.16
+Nodes (28): accept_payload(), DestinationFile, file_bucket_impl(), file_copy_if_not_exists_impl(), file_copy_impl(), file_delete_impl(), file_exists_impl(), file_get_impl() (+20 more)
 
 ### Community 379 - "evaluate_recurse_iterative"
-Cohesion: 0.22
-Nodes (18): collect_discovery_targets(), discover_body_targets(), eval_buffered(), eval_buffered_all(), is_recursion_target(), Arc, BoxFut, FlowResult (+10 more)
+Cohesion: 0.10
+Nodes (35): evaluate_recurse_collect(), Arc, FlowResult, Value, collect_discovery_targets(), discover_body_targets(), eval_buffered(), eval_buffered_all() (+27 more)
 
 ### Community 380 - "gql/lexer/test.rs"
 Cohesion: 0.06
@@ -3236,33 +3511,33 @@ Nodes (18): lex_error(), numbers_underscore_errors(), parameter_errors(), quoted
 Cohesion: 0.16
 Nodes (39): aggregate_target(), AggregateTarget, and_chain(), binary_op(), complement(), equality(), function_call(), gql_contains_aggregate() (+31 more)
 
-### Community 382 - "Tokens"
-Cohesion: 0.10
-Nodes (21): CharacterClass, CharacterRole, Filter, From, Position, Result, Self, Strand (+13 more)
+### Community 382 - "analyzer/tokenizer.rs"
+Cohesion: 0.13
+Nodes (15): CharacterClass, CharacterRole, Filter, From, Position, Self, Strand, String (+7 more)
 
-### Community 383 - "ParseResult"
-Cohesion: 0.11
-Nodes (16): Language, NumberToken, Param, Parser<'_>, Decimal, Parser, ParseResult, Self (+8 more)
+### Community 383 - "TokenValue"
+Cohesion: 0.09
+Nodes (27): Language, NumberToken, Param, Parser<'_>, Decimal, Parser, ParseResult, Self (+19 more)
 
 ### Community 384 - "Result"
 Cohesion: 0.15
 Nodes (18): iam_run_case(), new_ds(), new_ns_db(), Datastore, Debug, F, Formatter, Into (+10 more)
 
 ### Community 385 - "Parser<'source, 'ast>"
-Cohesion: 0.05
-Nodes (44): ParseError, Debug, Diagnostic, Drop, Formatter, NonNull, Option, Result (+36 more)
+Cohesion: 0.06
+Nodes (35): ParseError, Debug, Diagnostic, Drop, Formatter, NonNull, Option, Result (+27 more)
 
 ### Community 386 - "L"
-Cohesion: 0.21
-Nodes (18): AlterKind<N>, Bound<N>, Integer, NodeId<N>, NodeListId<N>, Option<N>, Ast, L (+10 more)
+Cohesion: 0.11
+Nodes (30): AlterKind<N>, Bound<N>, Integer, NodeId<N>, NodeListId<N>, Option<N>, Ast, L (+22 more)
 
 ### Community 387 - "CharBuffer"
 Cohesion: 0.09
 Nodes (23): CharBuffer, CharBufferWriter, CharBufferWriter<'a>, Color, DisplayChar, Default, Result, Self (+15 more)
 
 ### Community 388 - "Optional"
-Cohesion: 0.20
-Nodes (42): Optional, ceil(), day(), floor(), format(), group(), hour(), leap_year() (+34 more)
+Cohesion: 0.08
+Nodes (84): Args, Optional, count(), Result, Value, delete(), get(), head() (+76 more)
 
 ### Community 389 - "fnc/search.rs"
 Cohesion: 0.11
@@ -3289,28 +3564,28 @@ Cohesion: 0.09
 Nodes (29): estimated_edge_fields_heap_bytes(), estimated_graph_fixed_heap_bytes(), estimated_graph_heap_bytes(), estimated_nested_graph_heap_bytes(), estimated_node_fields_heap_bytes(), estimated_topology_heap_bytes(), MaterializedGraph, preserves_exact_discriminant_in_generic_transport() (+21 more)
 
 ### Community 395 - "Stream"
-Cohesion: 0.09
-Nodes (37): CoreNotification, deserialize(), into_future(), kill(), register(), Any, Box, BoxFuture (+29 more)
+Cohesion: 0.05
+Nodes (60): CoreNotification, ReadableStream, ReadableStream<R>, Box, Future, Item, Option, Output (+52 more)
 
 ### Community 396 - "source/mod.rs"
 Cohesion: 0.09
 Nodes (25): Annotation, Annotation<'a>, AnnotationKind, Diagnostic, Diagnostic<'a>, Group, Group<'a>, Level (+17 more)
 
 ### Community 397 - "Result"
-Cohesion: 0.14
-Nodes (17): AggregateExprCollector, ParentRewritor, CreateStatement, DefineAccessStatement, DefineApiStatement, DefineFieldStatement, DefineFunctionStatement, DefineIndexStatement (+9 more)
+Cohesion: 0.13
+Nodes (17): ParentRewritor, CreateStatement, DefineAccessStatement, DefineApiStatement, DefineConfigStatement, DefineFieldStatement, DefineFunctionStatement, DefineIndexStatement (+9 more)
 
 ### Community 398 - "String"
 Cohesion: 0.11
 Nodes (24): AccessToken, Credentials, Database, Namespace, Record, Record<P>, RefreshToken, Root (+16 more)
 
-### Community 399 - "ConfigMap"
-Cohesion: 0.09
-Nodes (22): Config, ConfigMap, gql_match_limits_parse_from_config_map(), LiveQueryEngine, memory_threshold_configmap_parses_byte_suffixes(), parse_memory_threshold(), Default, Display (+14 more)
+### Community 399 - "CommonConfig"
+Cohesion: 0.10
+Nodes (24): CommonConfig, Config, ConfigMap, gql_match_limits_parse_from_config_map(), LiveQueryEngine, memory_threshold_configmap_parses_byte_suffixes(), parse_memory_threshold(), Default (+16 more)
 
-### Community 400 - ".sample"
-Cohesion: 0.16
-Nodes (23): artifact_directory(), Artifacts, HarnessConfig, isolated_resident_run_length_from_env(), open_page_fault_csv(), process_memory_snapshot(), ProcessMemorySnapshot, record_component_sample() (+15 more)
+### Community 400 - "dbs/executor.rs"
+Cohesion: 0.12
+Nodes (28): CapturingObserver, check_execute_timeout(), create_return_before_reports_one(), delete_return_none_reports_affected_count(), delete_where_no_match_reports_zero(), import_stream_rejects_option_import_change_midstream(), import_stream_rejects_without_option_import(), import_stream_still_reports_errors() (+20 more)
 
 ### Community 401 - "TempFileIterator"
 Cohesion: 0.13
@@ -3322,7 +3597,7 @@ Nodes (54): ExplainFormat, Expr, expr_with_bytes_matches_serialize(), AlterState
 
 ### Community 403 - "Regex"
 Cohesion: 0.08
-Nodes (28): Regex, regex_compile_limit(), regex_new(), D, Debug, Deserialize, Display, Eq (+20 more)
+Nodes (29): Regex, regex_compile_limit(), regex_new(), D, Debug, Deserialize, Display, Eq (+21 more)
 
 ### Community 404 - "tools/output.rs"
 Cohesion: 0.09
@@ -3340,25 +3615,21 @@ Nodes (41): bench_bloom_concurrent_throughput(), bench_commit_inline_gc(), bench
 Cohesion: 0.13
 Nodes (20): Cursor, Cursor<'a>, KeyIterator, KeyIterator<'a>, next_key(), Arc, BTreeMap, Bytes (+12 more)
 
-### Community 408 - "Parser<'_>"
-Cohesion: 0.19
-Nodes (9): Parser<'_>, BinaryOp, NumberKind, Option, ParseResult, Span, Stk, String (+1 more)
+### Community 408 - "GqlExpr"
+Cohesion: 0.15
+Nodes (13): GqlExpr, BinaryOp, UnaryOp, TruthValue, Parser<'_>, BinaryOp, NumberKind, Option (+5 more)
 
 ### Community 409 - "dynamicset.rs"
 Cohesion: 0.13
 Nodes (12): AHashSet, ArraySet, ArraySet<N>, DynamicSet, Debug, ElementId, HashSet, Item (+4 more)
 
 ### Community 410 - "Delete"
-Cohesion: 0.04
-Nodes (53): Create, Create<'_, C, R>, Create<'r, Client, Option<R>>, Create<'r, Client, Value>, Cow, IntoFuture, PhantomData, R (+45 more)
+Cohesion: 0.12
+Nodes (18): Delete, Delete<'_, C, R>, Delete<'_, C, Value>, Delete<'_, C, Vec<R>>, Delete<'r, Client, Option<R>>, Delete<'r, Client, Value>, Delete<'r, Client, Vec<R>>, Cow (+10 more)
 
-### Community 411 - "body"
-Cohesion: 0.10
-Nodes (25): BodyStrategy, AcceptRange, convert_response_value(), output_body_strategy(), parse_accept(), From, HeaderMap, HeaderValue (+17 more)
-
-### Community 412 - "header"
-Cohesion: 0.16
-Nodes (25): body(), header(), headers(), Box, BTreeMap, Closure, FrozenContext, Option (+17 more)
+### Community 412 - "Enum"
+Cohesion: 0.11
+Nodes (17): Casing, EnumAttributes, Attribute, Option, Self, String, Enum, Attribute (+9 more)
 
 ### Community 413 - "vector_index/delta.rs"
 Cohesion: 0.21
@@ -3370,7 +3641,7 @@ Nodes (35): AlterKind, AlterKind<T>, AlterStatement, AlterAccessStatement, Alter
 
 ### Community 415 - "Sender"
 Cohesion: 0.06
-Nodes (42): Config, ExcludedTables, InlineCommentDisplay, InlineCommentDisplay<F>, InlineCommentWriter, InlineCommentWriter<'_, F>, Default, Display (+34 more)
+Nodes (40): Config, ExcludedTables, InlineCommentDisplay, InlineCommentDisplay<F>, InlineCommentWriter, InlineCommentWriter<'_, F>, Default, Display (+32 more)
 
 ### Community 416 - "Index"
 Cohesion: 0.10
@@ -3381,32 +3652,32 @@ Cohesion: 0.11
 Nodes (22): Parser<'_>, AlterAccessStatement, AlterAnalyzerStatement, AlterApiStatement, AlterBucketStatement, AlterConfigStatement, AlterDatabaseStatement, AlterEventStatement (+14 more)
 
 ### Community 418 - "Receiver"
-Cohesion: 0.08
-Nodes (44): content(), deliver(), drain(), new_ds(), record_session(), replay_table_live_events(), router_delivers_events_captured_before_first_pass(), router_delivery_matches_inline_delivery() (+36 more)
+Cohesion: 0.13
+Nodes (27): community_router(), CommunityComposer, init(), init_with_metrics(), Readiness, RouterFactory, RouterOptions, Arc (+19 more)
 
 ### Community 419 - "src/capabilities.rs"
 Cohesion: 0.08
 Nodes (19): deserialize(), func_pattern_matches(), FunctionTargets, D, Default, Deserialize, Duration, Error (+11 more)
 
-### Community 420 - "provisioner.rs"
-Cohesion: 0.17
-Nodes (20): CanReuse, create_grade_ds(), CreateInfo, Ds, is_base_environment(), Permit, PermitInner, Provisioner (+12 more)
+### Community 420 - "AggregateFunction"
+Cohesion: 0.07
+Nodes (13): AggregateFunction, Debug, ArrayDistinct, ArrayGroup, Signature, MathMax, MathMean, MathMedian (+5 more)
 
 ### Community 421 - "tests/remove.rs"
 Cohesion: 0.15
 Nodes (39): CaseIter, iam_check_cases(), iam_check_cases_impl(), level_db(), level_ns(), level_root(), permissions_checks_remove_analyzer(), permissions_checks_remove_db() (+31 more)
 
 ### Community 422 - "PropertyRef"
-Cohesion: 0.11
-Nodes (33): EdgeSlotFlags, NodeSlotFlags, atom_hot_page_rejects_noncanonical_tombstone(), atom_hot_page_round_trips_live_slots_and_canonical_tombstones(), atom_location(), AtomHotPage, AtomHotSlot, decode_atom_slot() (+25 more)
+Cohesion: 0.16
+Nodes (26): atom_hot_page_rejects_noncanonical_tombstone(), atom_hot_page_round_trips_live_slots_and_canonical_tombstones(), atom_location(), AtomHotPage, AtomHotSlot, decode_atom_slot(), invalid_atom_page(), PropertyRef (+18 more)
 
-### Community 423 - "DecodeContext"
-Cohesion: 0.06
-Nodes (23): ClassDictionary, DecodeContext, BTreeMap, ExactSizeIterator, FerrosGrynnResult, GraphRef, Item, Option (+15 more)
+### Community 423 - "EncodeContext"
+Cohesion: 0.12
+Nodes (16): ClassDictionary, DecodeContext, EncodeContext, BTreeMap, ExactSizeIterator, FerrosGrynnResult, GraphRef, Item (+8 more)
 
-### Community 424 - "Parser<'_>"
-Cohesion: 0.08
-Nodes (44): TypeName, LetStatement, LetValue, Parser<'_>, Expr, FerrosGrynnResult, Identifier, Option (+36 more)
+### Community 424 - "Identifier"
+Cohesion: 0.04
+Nodes (103): AssertInvariantsStatement, AttachStatement, BeginStatement, CommitStatement, CreateStatement, DeleteStatement, DetachStatement, ForStatement (+95 more)
 
 ### Community 425 - "expr/access_type.rs"
 Cohesion: 0.08
@@ -3425,8 +3696,8 @@ Cohesion: 0.09
 Nodes (32): DefineIndexStatement, import_replay_can_reuse_index(), refresh_table_index_cache(), Arc, Default, DefineKind, Expr, FrozenContext (+24 more)
 
 ### Community 429 - ".method"
-Cohesion: 0.12
-Nodes (38): build_jwks_client(), cache_key_from_url(), check_capabilities_url(), config(), fetch_jwks_from_cache(), fetch_jwks_from_url(), find_jwk_from_url(), random_path() (+30 more)
+Cohesion: 0.09
+Nodes (51): header(), test_fetch_denied(), test_fetch_error(), test_fetch_get(), test_fetch_put(), build_jwks_client(), cache_key_from_url(), check_capabilities_url() (+43 more)
 
 ### Community 430 - "CreateDs"
 Cohesion: 0.12
@@ -3440,9 +3711,9 @@ Nodes (25): Ast, crate::expr::ExplainFormat, crate::expr::TopLevelExpr, ExplainF
 Cohesion: 0.13
 Nodes (17): ObservabilityRuntime, ObservabilityRuntimeBuilder, Arc, Option, PrometheusExporter, Resource, SdkLoggerProvider, SdkMeterProvider (+9 more)
 
-### Community 433 - "AsyncEventRecord"
-Cohesion: 0.14
-Nodes (21): AsyncEventContext, AsyncEventRecord, Document, Action, Arc, Auth, Datastore, Error (+13 more)
+### Community 433 - "OrderedStream"
+Cohesion: 0.07
+Nodes (28): FromFuture<F>, FromStream<S, F, Ordering>, FromStreamDirect<S, F>, From, FusedOrderedStream, MaybeBorrowed<'a, T>, Option<S>, OrderedFuture (+20 more)
 
 ### Community 434 - "Performance Benchmark Workflow"
 Cohesion: 0.05
@@ -3456,17 +3727,17 @@ Nodes (30): MatcherExpectation, MatcherMismatch, MatchValueType, Mismatch, Misma
 Cohesion: 0.08
 Nodes (19): ErrorCode, ErrorImpl, ErrorVTable, RawError, RawTypedError, RawTypedError<E>, RawTypedError<T>, Deref (+11 more)
 
-### Community 437 - "Result"
-Cohesion: 0.19
-Nodes (5): FlatBufferBuilder, Input, Output, Result, Self
+### Community 437 - "DbsCapabilities"
+Cohesion: 0.09
+Nodes (21): Capabilities, DbsCapabilities, merge_capabilities(), retry_with_timeout(), retry_with_timeout_check(), Capabilities, Duration, Error (+13 more)
 
 ### Community 438 - "ClassSchema"
-Cohesion: 0.05
-Nodes (33): class_requires_kind_and_explicit_index_scope(), ClassSchema, ExactSizeIterator, FerrosGrynnResult, Fields, IntoText, Item, Option (+25 more)
+Cohesion: 0.06
+Nodes (34): SchemaParameter, class_requires_kind_and_explicit_index_scope(), ClassSchema, AtomKind, ClassField, ExactSizeIterator, FerrosGrynnResult, Fields (+26 more)
 
-### Community 439 - "EncodeContext"
-Cohesion: 0.16
-Nodes (24): decode_record(), invalid_run(), Into, String, decode_query_value(), Decoder, direction_tag(), encode_bound() (+16 more)
+### Community 439 - "label_dict.rs"
+Cohesion: 0.04
+Nodes (127): Cell, LabelStatistic, append_entries(), append_hash(), bindings(), decode_entries(), decode_hash(), decode_label_dictionary() (+119 more)
 
 ### Community 440 - "endpoint.rs"
 Cohesion: 0.12
@@ -3476,9 +3747,9 @@ Nodes (26): attrs_omit_label_when_unset(), attrs_render_edge_field_node_and_labe
 Cohesion: 0.26
 Nodes (32): corrupted_load_is_never_published(), database_and_graph_pages_never_alias(), exact_versions_and_files_share_one_resident_budget(), home_key(), home_key_at(), home_locator_prunes_stale_slots_and_empty_chunks(), load_valid(), production_r8_coalesces_one_miss() (+24 more)
 
-### Community 442 - "datastore/import.rs"
-Cohesion: 0.33
-Nodes (22): abort_discards_the_complete_private_root(), Datastore, deferred_and_maintained_indexes_produce_the_same_root(), deferred_unique_violation_discards_the_complete_import(), email(), forbidden_schema_mutation_poisoned_import_before_allocating_an_id(), full_validation_rechecks_preexisting_atom_schema(), ignored_abort_item_error_poisoned_the_complete_import() (+14 more)
+### Community 442 - "Result"
+Cohesion: 0.19
+Nodes (5): FlatBufferBuilder, Input, Output, Result, Self
 
 ### Community 443 - "row_scope.rs"
 Cohesion: 0.09
@@ -3488,21 +3759,21 @@ Nodes (25): AnalysisScope, bare_parent_field_is_not_param(), classify_idiom_root
 Cohesion: 0.11
 Nodes (17): ResponseInit, Class, StdString, Response, Response<'js>, ResponseType, ArrayBuffer, Blob (+9 more)
 
-### Community 445 - "Range"
-Cohesion: 0.14
-Nodes (16): Range, Bound, From, Option, Ord, Ordering, PartialOrd, RangeBounds (+8 more)
+### Community 445 - "SlowLog"
+Cohesion: 0.10
+Nodes (20): Inner, ParamVisitor, Arc, Duration, Error, FrozenContext, Inner, Instant (+12 more)
 
 ### Community 446 - "TokenKind"
 Cohesion: 0.08
 Nodes (17): Algorithm, Delim, DistanceKind, JavaScript, Operator, Display, Formatter, Keyword (+9 more)
 
-### Community 447 - "Router"
-Cohesion: 0.23
-Nodes (19): RequestData, Route, Router, BoxFuture, Command, Config, Error, HashSet (+11 more)
+### Community 447 - "action.rs"
+Cohesion: 0.10
+Nodes (26): compute_ref_key_range(), eval_ref_bound(), ReferenceScan, ReferenceScanOutput, Arc, Bound, ControlFlow, FlowResult (+18 more)
 
 ### Community 448 - "parse/expr.rs"
-Cohesion: 0.20
-Nodes (34): ast::Destructure, ast::Expr, ast::Lookup, ast::LookupSubject, is_equality_op(), is_relation_op(), parse_basic_infix_op(), parse_bracket_postfix() (+26 more)
+Cohesion: 0.21
+Nodes (32): ast::Destructure, ast::Expr, ast::Lookup, ast::LookupSubject, is_equality_op(), is_relation_op(), parse_basic_infix_op(), parse_bracket_postfix() (+24 more)
 
 ### Community 449 - "Socket"
 Cohesion: 0.14
@@ -3513,24 +3784,28 @@ Cohesion: 0.10
 Nodes (20): earliest_pinned(), Inner, Arc, AtomicBool, AtomicU64, Bytes, Commit, Default (+12 more)
 
 ### Community 451 - "Http"
-Cohesion: 0.06
-Nodes (49): bad_gql_config(), bad_lq_config(), deserialize(), internal_error(), invalid_params(), lq_not_supported(), method_not_allowed(), method_not_found() (+41 more)
+Cohesion: 0.09
+Nodes (33): bad_gql_config(), bad_lq_config(), deserialize(), internal_error(), invalid_params(), lq_not_supported(), method_not_allowed(), method_not_found() (+25 more)
 
-### Community 452 - "run_router"
+### Community 452 - "S"
 Cohesion: 0.12
-Nodes (23): connect(), Connector, large_vector_serialisation_bench(), Message, router_reconnect(), RouterState, BoxFuture, From (+15 more)
+Nodes (28): MapFrom, MapInto, Filter, FilterMap, FromFuture, FromSortedStream, FromStream, FromStreamDirect (+20 more)
 
-### Community 453 - "TableRoot"
-Cohesion: 0.10
-Nodes (21): key(), new(), Cow, Self, TableName, TableRoot, TableRoot<'a>, IndexIdGeneratorBatchKey (+13 more)
+### Community 453 - "index/state.rs"
+Cohesion: 0.13
+Nodes (31): build_owner_expired(), catalog_still_references_index(), delete_durable_build_queues(), durable_index_error_reason(), filter_online_indexes(), index_building_info(), index_building_status_value(), IndexBuildPhase (+23 more)
 
 ### Community 454 - "ObjectMeta"
 Cohesion: 0.18
 Nodes (24): Arc<dyn ObjectStore>, limit_accepts_positive(), limit_accepts_zero(), limit_rejects_negative(), ListOptions, obj(), ObjectMeta, Box (+16 more)
 
 ### Community 455 - "DynamicScan"
-Cohesion: 0.06
-Nodes (47): create_index_operator(), create_test_scan(), DynamicScan, order_touches_restricted_select_field(), resolve_table_scan_stream(), Arc, Cond, ControlFlow (+39 more)
+Cohesion: 0.11
+Nodes (29): create_index_operator(), create_test_scan(), DynamicScan, order_touches_restricted_select_field(), resolve_table_scan_stream(), Arc, Cond, ControlFlow (+21 more)
+
+### Community 456 - "Traverser"
+Cohesion: 0.04
+Nodes (88): BarrierCursor, NonZeroU64, BarrierCursor, buffered_value(), is_barrier(), next_group(), CursorRecord, FerrosGrynnResult (+80 more)
 
 ### Community 457 - "ResourceKind"
 Cohesion: 0.10
@@ -3553,12 +3828,12 @@ Cohesion: 0.11
 Nodes (13): Parser<'_>, Expr, FunctionCall, Kind, Literal, Mock, Param, ParseResult (+5 more)
 
 ### Community 462 - "service.rs"
-Cohesion: 0.14
-Nodes (23): McpMetricsRecorder, Send, Sync, config_with_transport_label_http_opts_into_strict_check(), create_http_service(), create_http_service_with_metrics(), custom_transport_label_is_not_treated_as_stdio(), fresh_datastore() (+15 more)
+Cohesion: 0.10
+Nodes (28): McpMetricsRecorder, McpToolOutcome, Option, Send, Sync, config_with_transport_label_http_opts_into_strict_check(), create_http_service(), create_http_service_with_metrics() (+20 more)
 
 ### Community 463 - "StatusWireV1"
-Cohesion: 0.18
-Nodes (20): completion_omits_severity_and_classification(), DiagnosticRecordWireV1, error_classification(), FerrosGrynnError, labeled_location_to_wire(), LabeledLocationWireV1, location_to_wire(), LocationWireV1 (+12 more)
+Cohesion: 0.19
+Nodes (19): completion_omits_severity_and_classification(), DiagnosticRecordWireV1, FerrosGrynnError, labeled_location_to_wire(), LabeledLocationWireV1, location_to_wire(), LocationWireV1, notification_classification() (+11 more)
 
 ### Community 464 - "KindExpr"
 Cohesion: 0.11
@@ -3576,13 +3851,13 @@ Nodes (29): c_int, AnnIndex, bench_ann_with_db(), bench_db_without_index(), benc
 Cohesion: 0.17
 Nodes (36): assert_tier_linearity_makes_sense(), bench_map_clone(), bench_map_from_sorted_vec(), bench_map_insert(), bench_map_mutation(), bench_map_revision_deserialize(), bench_map_select(), bench_map_storekey_decode_ordered() (+28 more)
 
-### Community 468 - "Task"
-Cohesion: 0.20
-Nodes (35): F, R, spawn(), init(), interval_ticker(), node_membership_update_continues_after_error(), node_membership_update_continues_after_success(), node_membership_update_continues_after_timeout() (+27 more)
+### Community 468 - "EngineOptions"
+Cohesion: 0.12
+Nodes (39): F, R, spawn(), EngineOptions, Default, Duration, Self, init() (+31 more)
 
 ### Community 469 - "Result"
-Cohesion: 0.12
-Nodes (35): arb_group(), arb_order(), arb_splits(), Closure, Data, data_values(), either_kind(), Fetch (+27 more)
+Cohesion: 0.14
+Nodes (26): Closure, Data, data_values(), either_kind(), Fetch, Function, insert_data(), JwtAccess (+18 more)
 
 ### Community 470 - "Lookup"
 Cohesion: 0.09
@@ -3594,7 +3869,7 @@ Nodes (18): Parser<'_>, AccessStatement, Expr, ForeachStatement, InfoStatement, 
 
 ### Community 472 - "Datetime"
 Cohesion: 0.09
-Nodes (22): Datetime, DateTime<Utc>, Deref, Display, Duration, Err, Error, F (+14 more)
+Nodes (23): Datetime, DateTime<Utc>, Deref, Display, Duration, Err, Error, F (+15 more)
 
 ### Community 473 - "McpConfig"
 Cohesion: 0.11
@@ -3605,32 +3880,28 @@ Cohesion: 0.12
 Nodes (20): ast::RemoveAccess, ast::RemoveAnalyzer, ast::RemoveApi, ast::RemoveBucket, ast::RemoveConfig, ast::RemoveDatabase, ast::RemoveEvent, ast::RemoveField (+12 more)
 
 ### Community 475 - "client_ip.rs"
-Cohesion: 0.07
-Nodes (20): client_ip_middleware(), ClientIp, ExtractClientIP, parse_forwarded_for(), Display, Formatter, FromRequestParts, Item (+12 more)
-
-### Community 476 - "ResponseError"
 Cohesion: 0.05
-Nodes (62): handler(), router(), Bytes, Extension, HeaderMap, IntoResponse, Path, Query (+54 more)
+Nodes (32): CommunityComposer, Config, ConfigCheck, ConfigCheckRequirements, Config, Option, PathBuf, Result (+24 more)
+
+### Community 476 - "DataFileId"
+Cohesion: 0.05
+Nodes (72): DataSpaceId, Option, Self, CheckpointMode, DirectFileOpenMode, DataFileRegistration, DataFileRole, FileRegistry (+64 more)
 
 ### Community 477 - "RecordIdKeyRange"
 Cohesion: 0.10
 Nodes (22): RecordIdKeyRange, Bound, Error, From, Kind, Option, Ord, Ordering (+14 more)
 
-### Community 478 - "Host"
-Cohesion: 0.15
-Nodes (19): Host, module_allow_net_targets(), module_scoped_capabilities(), parse_semver(), Arc, Capabilities, Fn, FrozenContext (+11 more)
+### Community 478 - "Cast"
+Cohesion: 0.06
+Nodes (17): bool, Box<Range>, Cast, crate::val::TableName, Datetime, Decimal, Duration, f64 (+9 more)
 
-### Community 479 - "parse/record_id.rs"
-Cohesion: 0.15
-Nodes (27): peek_joined_starts_record_id_key(), peek_starts_prime(), Parser, ParseResult, parse_prefix_range_sync(), Bound, K, P (+19 more)
+### Community 479 - "parse_lookup_range"
+Cohesion: 0.20
+Nodes (21): parse_lookup_range(), RecordIdKeyRange, peek_joined_starts_record_id_key(), peek_starts_prime(), Parser, ParseResult, ast::RecordId, parse_int_id() (+13 more)
 
 ### Community 480 - "atomic_slot.rs"
 Cohesion: 0.17
-Nodes (19): atomic_len_basics(), boxed_slot_arc_roundtrip(), boxed_slot_concurrent_load_after_store(), boxed_slot_concurrent_swap_with_deferred_drop(), boxed_slot_drops_on_destruction(), boxed_slot_load_into_returns_box_borrow(), inline_slot_concurrent_swap_vs_load(), inline_slot_i32_negative() (+11 more)
-
-### Community 481 - "Snapshot"
-Cohesion: 0.08
-Nodes (38): PlannerDemand, analyze_parsed_transaction(), collect_scalar_constraints(), execute_parsed_statement_with_bindings(), execute_parsed_transaction_with_bindings(), execute_transaction(), execute_transaction_with_options(), query_schema() (+30 more)
+Nodes (21): atomic_len_concurrent_writers_readers(), boxed_slot_arc_roundtrip(), boxed_slot_concurrent_load_after_store(), boxed_slot_concurrent_swap_with_deferred_drop(), boxed_slot_drops_on_destruction(), boxed_slot_load_into_returns_box_borrow(), inline_slot_concurrent_swap_vs_load(), inline_slot_i32_negative() (+13 more)
 
 ### Community 482 - "catalog/schema/mod.rs"
 Cohesion: 0.12
@@ -3649,16 +3920,16 @@ Cohesion: 0.08
 Nodes (35): FixCommandArguments, init(), Result, String, init(), IsReadyCommandArguments, DatabaseConnectionArguments, Result (+27 more)
 
 ### Community 486 - "Sample"
-Cohesion: 0.12
-Nodes (7): Percentiles, Box, Deref, Distributions, Option, S, Sample
+Cohesion: 0.18
+Nodes (5): Deref, Distributions, Option, S, Sample
 
 ### Community 487 - "`[env]`"
 Cohesion: 0.06
 Nodes (34): `[bench]` config, Benchmarking, `[env]`, `[env.auth]`, `[env.backend]`, `[env.capabilities]`, `[env.clean]`, `[env.context_timeout]` (+26 more)
 
-### Community 488 - "Result"
-Cohesion: 0.35
-Nodes (7): D, Error, Ok, Result, S, Self, to_deser_error()
+### Community 488 - "cmd/run/mod.rs"
+Cohesion: 0.14
+Nodes (27): base_datastore(), BodyOutcome, case_from_source(), check_retained_keys(), cleanup_environment(), importing_test_failing_to_parse_cleans_up_for_next_test(), make_run(), Arc (+19 more)
 
 ### Community 489 - "catalog/record.rs"
 Cohesion: 0.14
@@ -3672,25 +3943,25 @@ Nodes (15): Join<A, B>, JoinState<A, B, T>, Message, Poll<PollResult<T, I>>, Pol
 Cohesion: 0.09
 Nodes (27): ComputedLookupSubject, Lookup, LookupKind, LookupSubject, Cond, Default, Dir, Fields (+19 more)
 
-### Community 492 - "SurrealismCache"
-Cohesion: 0.15
-Nodes (16): Arc, Cache, Equivalent, F, From, Result, Self, String (+8 more)
+### Community 492 - "TextSpan"
+Cohesion: 0.17
+Nodes (26): TextSpan, Parser<'_>, RecordKey, Box, Expr, FerrosGrynnResult, Identifier, Option (+18 more)
 
-### Community 493 - "PageHeader"
-Cohesion: 0.14
-Nodes (28): read_validated(), frame_ioring_eof_rolls_back_vm_batch_and_decommits_budget(), home_keys(), open_then_truncate(), read_scatter_extent(), Arc, Box, Drop (+20 more)
+### Community 493 - ".new"
+Cohesion: 0.17
+Nodes (24): frame_ioring_eof_rolls_back_vm_batch_and_decommits_budget(), home_keys(), open_then_truncate(), read_scatter_extent(), Arc, Box, Drop, Error (+16 more)
 
 ### Community 494 - ".arbitrary"
 Cohesion: 0.14
 Nodes (19): AlterDatabaseStatement, AlterIndexStatement, AlterNamespaceStatement, AlterSystemStatement, Ast, DefineAccessStatement, DefineAnalyzerStatement, DefineFieldStatement (+11 more)
 
-### Community 495 - "TempDir"
+### Community 495 - "SurrealismPackage"
 Cohesion: 0.11
-Nodes (24): AtomicUsize, Drop, Option, Path, PathBuf, TempDir, AttachedFs, create_temp_dir() (+16 more)
+Nodes (26): init(), PathBuf, Result, init(), Option, PathBuf, Result, String (+18 more)
 
 ### Community 496 - "traversal_frontier.rs"
-Cohesion: 0.13
-Nodes (32): artifact_file(), build_fixture(), Candidate, Fixture, gate_decision(), integer(), local_options(), measure() (+24 more)
+Cohesion: 0.14
+Nodes (31): artifact_file(), build_fixture(), Candidate, Fixture, gate_decision(), integer(), local_options(), measure() (+23 more)
 
 ### Community 497 - "serde_integration.rs"
 Cohesion: 0.13
@@ -3700,17 +3971,17 @@ Nodes (30): T, SerdeWrapper, ApiPayload, ApiResource, base_requirement(), legacy
 Cohesion: 0.18
 Nodes (11): Additional Resources, Branch Lifecycle, Branches, Branching Strategy, Overview, Performing a Dry-Run, Publishing the Release, Quick Start (+3 more)
 
-### Community 499 - "Patch"
+### Community 499 - "LandmarkPathLayout"
+Cohesion: 0.20
+Nodes (14): GraphArtifactIdentity, invalid(), LandmarkPathHeader, LandmarkPathLayout, number(), Check, Element, FerrosGrynnError (+6 more)
+
+### Community 500 - "build_reachability_labels"
+Cohesion: 0.10
+Nodes (43): invalid(), number(), pack_pair(), ReachabilityArtifact, resource(), DatabaseRoot, DerivedSectionKind, FerrosGrynnError (+35 more)
+
+### Community 501 - "geometry_index/mod.rs"
 Cohesion: 0.06
-Nodes (34): Patch, Patch<'_, C, R>, Patch<'r, Client, Option<R>>, Patch<'r, Client, Value>, Patch<'r, Client, Vec<R>>, Cow, IntoFuture, Option (+26 more)
-
-### Community 500 - "fill_vals_batch"
-Cohesion: 0.22
-Nodes (21): DefaultKeysCursor, DefaultKeysCursor<'a, T>, DefaultKeysCursor<'_, T>, DefaultValsCursor, DefaultValsCursor<'a, T>, DefaultValsCursor<'_, T>, fetch_keys_page(), fetch_vals_page() (+13 more)
-
-### Community 501 - "tests/audit.rs"
-Cohesion: 0.19
-Nodes (22): body_to_string(), complete_handshake(), credential_mismatch_emits_audit_record(), db_user_session(), initialize(), owner_session(), post_request(), Arc (+14 more)
+Nodes (85): ScopedIndexKind, build_geometry_delta(), decode_geometry_delta(), DecodedGeometryDelta, geometry_delta_records(), GeometryDeltaRecord, BTreeMap, BTreeSet (+77 more)
 
 ### Community 502 - ".execute_with_session"
 Cohesion: 0.25
@@ -3720,9 +3991,9 @@ Nodes (9): Error, F, Option, QueryResult, Result, String, Value, Variables (+1 m
 Cohesion: 0.23
 Nodes (33): add(), all(), any(), at(), complement(), contains(), difference(), filter() (+25 more)
 
-### Community 504 - "DbsCapabilities"
-Cohesion: 0.09
-Nodes (21): Capabilities, DbsCapabilities, merge_capabilities(), retry_with_timeout(), retry_with_timeout_check(), Capabilities, Duration, Error (+13 more)
+### Community 504 - "text_analyzer.rs"
+Cohesion: 0.15
+Nodes (31): analyze_builtin(), analyze_function_result(), analyzer_limit(), applies_ordered_unicode_ngram_and_mapper_filters(), apply_filters(), bounded_scalar_count(), check_term(), check_token_count() (+23 more)
 
 ### Community 505 - "SourceBoundLocator"
 Cohesion: 0.10
@@ -3736,20 +4007,20 @@ Nodes (21): crate::expr::Part, crate::expr::part::DestructurePart, crate::expr::
 Cohesion: 0.18
 Nodes (33): define_statement_database(), define_statement_index_concurrently_building_status(), define_statement_index_concurrently_building_status_full_text(), define_statement_index_concurrently_building_status_full_text_overwrite(), define_statement_index_concurrently_building_status_standard(), define_statement_index_concurrently_building_status_standard_overwrite(), define_statement_namespace(), define_statement_search_index() (+25 more)
 
-### Community 508 - "ReferenceScan"
-Cohesion: 0.17
-Nodes (17): compute_ref_key_range(), eval_ref_bound(), ReferenceScan, ReferenceScanOutput, Arc, Bound, ControlFlow, FlowResult (+9 more)
+### Community 508 - "MessageBroker"
+Cohesion: 0.15
+Nodes (17): BrokerRoutingContext, LocalMessageBroker, MessageBroker, NodeEndpointResolver, RoutedNotification, Arc, Box, Debug (+9 more)
 
-### Community 509 - "Args"
-Cohesion: 0.09
-Nodes (31): Args, Self, CredentialsLevel, AuthArguments, DatabaseConnectionArguments, DatabaseSelectionArguments, LevelSelectionArguments, OptionalDatabaseConnectionArguments (+23 more)
+### Community 509 - "AuthArguments"
+Cohesion: 0.10
+Nodes (29): CredentialsLevel, AuthArguments, DatabaseConnectionArguments, DatabaseSelectionArguments, LevelSelectionArguments, OptionalDatabaseConnectionArguments, Option, String (+21 more)
 
 ### Community 510 - "cli_integration.rs"
 Cohesion: 0.06
 Nodes (5): all_commands(), double_create(), node(), remove_debug_info(), String
 
 ### Community 511 - "DiagnosticRecord"
-Cohesion: 0.07
+Cohesion: 0.08
 Nodes (23): ArcStr, computes_unicode_locations_without_retaining_source(), DiagnosticRecord, ExecutionPhase, LabeledLocation, line_column_at(), LineColumn, Location (+15 more)
 
 ### Community 512 - "arena/support.rs"
@@ -3758,19 +4029,19 @@ Nodes (33): AtomicBatchReservation, AtomicBatchReservation<'pool>, CapacityWaite
 
 ### Community 513 - "TypedExpr"
 Cohesion: 0.04
-Nodes (121): Column, ClassIndexOptions, logical_block_effect(), logical_statement_effect(), typed_expression_effect(), vector_distance_matches(), LanguageClosureEntry, LanguageClosureRegistry (+113 more)
+Nodes (143): CollatorBorrowed, SelectNulls, SelectOrderDirection, build_collator(), collator(), order_key(), FerrosGrynnResult, Option (+135 more)
 
-### Community 514 - "Datetime"
-Cohesion: 0.10
-Nodes (19): Datetime, DateTime<Utc>, Arbitrary, Default, Deref, Display, Err, Error (+11 more)
+### Community 514 - "TableRoot"
+Cohesion: 0.09
+Nodes (22): key(), new(), Cow, Self, TableName, TableRoot, TableRoot<'a>, IndexIdGeneratorBatchKey (+14 more)
 
 ### Community 515 - "KnnTopK"
 Cohesion: 0.12
 Nodes (19): DistanceEntry, extract_vector(), KnnTopK, Arc, Distance, Eq, FlowResult, Idiom (+11 more)
 
 ### Community 516 - "Fields"
-Cohesion: 0.09
-Nodes (21): Field, Fields, FieldsIter, FieldsIter<'a>, Box, ExactSizeIterator, Expr, Field (+13 more)
+Cohesion: 0.11
+Nodes (18): Field, Fields, FieldsIter, Box, ExactSizeIterator, Expr, Field, FrozenContext (+10 more)
 
 ### Community 517 - "Literal"
 Cohesion: 0.09
@@ -3784,9 +4055,9 @@ Nodes (27): AlterKind, AlterKind<B>, AlterStatement, crate::expr::statements::al
 Cohesion: 0.07
 Nodes (7): load(), router(), Extension, IntoResponse, Result, S, save()
 
-### Community 520 - "index/builder.rs"
-Cohesion: 0.21
-Nodes (11): BuildingFinishGuard, BuildStart, IndexBuilder, Arc, Drop, FrozenContext, IndexBuilding, Option (+3 more)
+### Community 520 - "Mem"
+Cohesion: 0.07
+Nodes (25): Args, main(), Person, PathBuf, Result, String, Mem, () (+17 more)
 
 ### Community 521 - "Array"
 Cohesion: 0.10
@@ -3796,17 +4067,17 @@ Nodes (20): &'a Array, &'a mut Array, Array, BinaryHeap, BTreeSet, Deref, DerefM
 Cohesion: 0.08
 Nodes (21): DisputeStatus, EnumCamelCase, EnumKebabCase, EnumLowercase, EnumPascalCase, EnumScreamingKebabCase, EnumScreamingSnakeCase, EnumSnakeCase (+13 more)
 
-### Community 523 - ".poll_next_before"
-Cohesion: 0.11
-Nodes (19): MaybeBorrowed<'a, T>, Option<S>, Pin<P>, PollResult<T, D>, PollResult<T, Result<D, E>>, AsRef, D, Data (+11 more)
+### Community 523 - "ops.rs"
+Cohesion: 0.10
+Nodes (14): BinaryOp, PostfixOp, Any, Arc, BinaryOperator, BoxFut, FlowResult, PostfixOperator (+6 more)
 
 ### Community 524 - ".new"
 Cohesion: 0.14
 Nodes (25): channel_depth_bounds_completed_extents(), early_drop_cancels_queued_work_and_joins(), first_error_is_terminal_and_ordered(), pipeline_preserves_input_order(), PrefetchMessage, PrototypePrefetchCursor, PrototypePrefetchCursor<Extent>, reservation_token_exposes_ordinal() (+17 more)
 
-### Community 525 - "FileCatalog"
-Cohesion: 0.08
-Nodes (41): FileCatalog, Path, PathBuf, Vec, invalid(), FerrosGrynnError, FerrosGrynnResult, Into (+33 more)
+### Community 525 - "cleanup.rs"
+Cohesion: 0.12
+Nodes (29): cleanup_generation_children(), cleanup_orphan_generations(), cleanup_orphan_quarantines(), cleanup_query_runs(), generation_directories(), inject_cleanup_failures(), io_failure(), remove_generation_directory() (+21 more)
 
 ### Community 526 - "wasi_context.rs"
 Cohesion: 0.12
@@ -3820,17 +4091,17 @@ Nodes (31): boundary_tree_lookup(), boundary_tree_order(), create_boundary_tree(
 Cohesion: 0.13
 Nodes (8): BorrowReader<'de>, Reader<R>, Cow, R, Result, Self, String, Vec
 
-### Community 529 - "Ulid"
+### Community 529 - "AggregateExtractor"
 Cohesion: 0.14
-Nodes (13): InnerUlid, InnerUuid, Display, Err, Formatter, From, FromStr, Result (+5 more)
+Nodes (21): AggregateExtractor, AggregateExtractor<'a>, alias_output_path(), find_group_key_index(), Planner<'ctx>, Arc, CreateStatement, DeleteStatement (+13 more)
 
 ### Community 530 - "Child"
 Cohesion: 0.19
 Nodes (24): Child, Box, Default, Drop, Error, Option, P, Result (+16 more)
 
-### Community 531 - "index/state.rs"
-Cohesion: 0.13
-Nodes (28): build_owner_expired(), catalog_still_references_index(), delete_durable_build_queues(), durable_report_count(), filter_online_indexes(), index_building_info(), index_building_status_value(), IndexBuildPhase (+20 more)
+### Community 531 - "convert.rs"
+Cohesion: 0.22
+Nodes (26): CborValue, from_array(), from_geometry(), from_object(), from_range(), from_record_id_key(), from_record_id_key_range(), from_uuid() (+18 more)
 
 ### Community 532 - "ComputedData"
 Cohesion: 0.17
@@ -3840,21 +4111,21 @@ Nodes (18): apply_assignments(), ComputedAssignment, ComputedData, Document, Arc
 Cohesion: 0.16
 Nodes (20): AuthParams, AuthParams, Cmd, is_session_expired(), QueryResult, RemoteStore, Request, Response (+12 more)
 
-### Community 534 - "delta_debugging_bitmap.rs"
-Cohesion: 0.14
-Nodes (14): arb_bitmap_uniform(), DeltaDebuggingBitmapValueTree, initial_current_is_the_full_set(), Into, NewTree, Range, Self, TestRunner (+6 more)
+### Community 534 - "Explanation"
+Cohesion: 0.13
+Nodes (13): ExplainItem, Explanation, Plan, From, FrozenContext, Option, Self, Statement (+5 more)
 
 ### Community 535 - "MatchesOp"
 Cohesion: 0.11
 Nodes (21): extract_record_id(), extract_table_from_value(), MatchesOp, Any, Arc, BoxFut, Clone, Debug (+13 more)
 
-### Community 536 - "DiskAnnRecordPending"
-Cohesion: 0.20
-Nodes (12): DiskAnnRecordPending, DiskAnnRecordPending<'a>, DiskAnnRecordPendingPrefix, DiskAnnRecordPendingPrefix<'a>, Cow, IndexId, Key, Range (+4 more)
+### Community 536 - "LanguageClosureState"
+Cohesion: 0.10
+Nodes (23): compiler_frames_share_the_cap_and_release_on_error(), compiler_resource(), CompileReservation, LanguageClosureEntry, LanguageClosureRegistry, LanguageClosureState, Arc, AtomicBool (+15 more)
 
 ### Community 537 - ".consume"
 Cohesion: 0.11
-Nodes (25): AdmittedMutation, IndexBuilder, BuildGeneration, BuildTicket, BuildTicketMutationSeq, FrozenContext, IndexId, Result (+17 more)
+Nodes (24): AdmittedMutation, IndexBuilder, BuildGeneration, BuildTicket, BuildTicketMutationSeq, FrozenContext, IndexId, Result (+16 more)
 
 ### Community 538 - "fnc/crypto.rs"
 Cohesion: 0.12
@@ -3876,13 +4147,13 @@ Nodes (36): decode_base_class_statistics(), decode_base_property_statistics(), e
 Cohesion: 0.09
 Nodes (10): Box<[u8]>, Bytes, Cow<'a, [u8]>, IntoBytes, Bytes, Vec, &str, String (+2 more)
 
-### Community 543 - "DbResponse"
-Cohesion: 0.16
-Nodes (14): DbResponse, DbResultStats, Duration, Into, Option, PublicKind, PublicValue, Result (+6 more)
+### Community 543 - "DbResult"
+Cohesion: 0.15
+Nodes (16): DbResponse, DbResult, Into, Option, PublicKind, PublicNotification, PublicValue, QueryResult (+8 more)
 
-### Community 544 - "idx/mod.rs"
-Cohesion: 0.04
-Nodes (61): Inner, is_transaction_condition_not_met(), Arc, Error, Dg, Dg<'a>, Cow, IndexId (+53 more)
+### Community 544 - "PropertyMap"
+Cohesion: 0.06
+Nodes (30): AtomStoreRoot, BaseAtom, GlobalAtomId, GlobalSlotAllocator, reused_slot_rejects_the_stale_global_atom_id(), Arc, AtomId, BTreeMap (+22 more)
 
 ### Community 545 - "tests/http.rs"
 Cohesion: 0.20
@@ -3890,55 +4161,55 @@ Nodes (31): auth_plumbing_picks_up_injected_session(), body_to_string(), complet
 
 ### Community 546 - "OperatorMetrics"
 Cohesion: 0.03
-Nodes (73): MetricsStream, monitor_stream(), now_ns(), OperatorMetrics, Arc, AtomicBool, AtomicU64, Item (+65 more)
+Nodes (71): MetricsStream, monitor_stream(), now_ns(), OperatorMetrics, Arc, AtomicBool, AtomicU64, Item (+63 more)
 
 ### Community 547 - "observe/handler.rs"
+Cohesion: 0.14
+Nodes (18): dump(), filter_drops_non_public_families(), filter_to_public_metrics(), fresh_runtime(), metrics(), MetricsState, no_tenant_canary_in_unauthenticated_prometheus_output(), render_snapshot() (+10 more)
+
+### Community 548 - "SurrealValue"
 Cohesion: 0.10
-Nodes (25): dump(), filter_drops_non_public_families(), filter_to_public_metrics(), fresh_runtime(), metrics(), MetricsState, no_tenant_canary_in_unauthenticated_prometheus_output(), render_snapshot() (+17 more)
+Nodes (19): Patch<'r, C, R>, Into, Self, Self, Run<'_, Client, R>, PatchOp, PatchOps, From (+11 more)
 
-### Community 548 - "PatchOps"
-Cohesion: 0.11
-Nodes (16): Patch<'r, C, R>, Into, Self, PatchOp, PatchOps, From, Into, IntoIter (+8 more)
+### Community 549 - "Entry"
+Cohesion: 0.03
+Nodes (63): namespace_basic(), namespace_with_comment(), NamespaceDefinition, DefineNamespaceStatement, Option, Strand, String, Value (+55 more)
 
-### Community 549 - "ShortestPathExpand"
-Cohesion: 0.11
-Nodes (21): all_shortest_emits_min_depth_ties_only(), any_shortest_emits_first_and_visits_once(), counted_emits_k_and_extends_up_to_k(), counted_groups_emits_k_distinct_lengths(), counted_groups_extends_k_distinct_depths(), min_above_one_disables_pruning(), rid(), Arc (+13 more)
-
-### Community 550 - "FerrosGrynnResult"
+### Community 550 - "DemoHost"
 Cohesion: 0.13
-Nodes (26): AtomId, binding(), effective_index_key(), GlobalAtomId, index_key(), IndexStoreRoot, IntoAddress, invalid() (+18 more)
+Nodes (15): DemoHost, Arc, Fn, Object, Option, Result, Self, Send (+7 more)
 
 ### Community 551 - "Geometry"
 Cohesion: 0.11
 Nodes (18): Geometry, Display, Formatter, H, Hash, LineString, MultiLineString, MultiPoint (+10 more)
 
-### Community 552 - "open_local_state"
-Cohesion: 0.12
-Nodes (24): DatabaseSuperblock, exact_database_superblock_round_trip(), invalid(), read_u32(), read_u64(), FerrosGrynnError, FerrosGrynnResult, Into (+16 more)
+### Community 552 - "TimeZone"
+Cohesion: 0.29
+Nodes (7): ident_field(), Expr, TopLevelExpr, Vec, statements(), test_streaming(), TimeZone
 
 ### Community 553 - "Header"
 Cohesion: 0.14
 Nodes (17): generate_bytes(), generate_string(), Header, Option, Origin, Output, Result, Self (+9 more)
 
-### Community 554 - "IndexCompactionKey"
-Cohesion: 0.20
-Nodes (10): IndexCompactionKey, IndexCompactionKey<'key>, key(), Cow, IndexId, Result, Self, TableName (+2 more)
+### Community 554 - "MemoryStore"
+Cohesion: 0.25
+Nodes (16): Entry, MemoryStore, Box, Bytes, DashMap, Datetime, From, Future (+8 more)
 
 ### Community 555 - "unsafe_coverage.rs"
 Cohesion: 0.07
 Nodes (6): defer_destroy_drops_exactly_once_per_removed_value(), DropCounter, iter_rs_transmute_mut_iter_reverse_then_forward(), Arc, AtomicUsize, Drop
 
 ### Community 556 - "build_generics_types"
-Cohesion: 0.10
-Nodes (27): borrow_decode(), impl_format(), DeriveInput, Option, Result, TokenStream, decode(), impl_format() (+19 more)
+Cohesion: 0.19
+Nodes (15): borrow_decode(), impl_format(), DeriveInput, Option, Result, TokenStream, build_generics_types(), extract_formats() (+7 more)
 
-### Community 557 - "test_queries"
+### Community 557 - "RandomShuffle"
 Cohesion: 0.15
-Nodes (22): check_test_is_error(), function_string_distance_hamming(), function_time_from_unix_limit_and_beyond(), function_vector_add(), function_vector_angle(), function_vector_cross(), function_vector_distance_chebyshev(), function_vector_distance_euclidean() (+14 more)
+Nodes (15): full_shuffle(), RandomShuffle, reservoir_sample(), reservoir_sample_sync(), Arc, FlowResult, Option, Self (+7 more)
 
 ### Community 558 - "aggregation.rs"
-Cohesion: 0.11
-Nodes (25): add_to_aggregation_stats(), aggregate_field_name(), AggregateFields, Aggregation, AggregationStat, create_field_document(), format_indexed_strand(), group_field_name() (+17 more)
+Cohesion: 0.12
+Nodes (25): add_to_aggregation_stats(), aggregate_field_name(), AggregateExprCollector, AggregateFields, Aggregation, AggregationStat, create_field_document(), format_indexed_strand() (+17 more)
 
 ### Community 559 - "DefineStatement"
 Cohesion: 0.11
@@ -3964,21 +4235,21 @@ Nodes (29): compare_array(), compare_array_longer_left(), compare_array_longer_r
 Cohesion: 0.21
 Nodes (29): append_escaped(), composite_strings_escape_zero_without_losing_lexicographic_order(), encode(), encode_decimal(), encode_duration(), encode_float(), encode_index_key(), encode_index_prefix() (+21 more)
 
-### Community 565 - "Filter"
-Cohesion: 0.20
-Nodes (11): Filter, FilterResult, Option, Position, Result, Self, String, Vec (+3 more)
+### Community 565 - "ViewDefinition"
+Cohesion: 0.12
+Nodes (26): AggregationAnalysis, Expr, Fields, Groups, Option, String, TableName, Value (+18 more)
 
 ### Community 566 - "hashmap.rs"
 Cohesion: 0.15
 Nodes (11): HashMap<K, V, S>, F, K, Option, Q, Self, Vec, test_basic_operations() (+3 more)
 
-### Community 567 - "syn/stmt/select.rs"
-Cohesion: 0.16
-Nodes (25): Parser<'_>, RecordKey, Box, Expr, FerrosGrynnResult, Identifier, Option, RecordKey (+17 more)
+### Community 567 - "match/model.rs"
+Cohesion: 0.12
+Nodes (32): SelectOrder, Parser<'_>, FerrosGrynnResult, Option, Symbol, MatchConstraints, MatchContains, MatchEdge (+24 more)
 
-### Community 568 - "analyzer/filter.rs"
-Cohesion: 0.13
-Nodes (26): test_arabic_stemmer(), test_danish_stemmer(), test_dutch_stemmer(), test_edgengram(), test_english_stemmer(), test_finnish_stemmer(), test_french_stemmer(), test_german_stemmer() (+18 more)
+### Community 568 - "Filter"
+Cohesion: 0.20
+Nodes (11): Filter, FilterResult, Option, Position, Result, Self, String, Vec (+3 more)
 
 ### Community 569 - "SurrealError"
 Cohesion: 0.24
@@ -3989,8 +4260,8 @@ Cohesion: 0.16
 Nodes (29): ArcBlob, bench_concurrent_mixed(), bench_concurrent_mixed_string(), bench_concurrent_readers(), bench_concurrent_writers(), bench_insert_random(), bench_insert_random_string(), bench_insert_sequential() (+21 more)
 
 ### Community 571 - "RoughlyEqConfig"
-Cohesion: 0.11
-Nodes (20): bootstrap(), Distributions, S, Sample, Array, Bound<T>, Box<T>, BTreeMap<K, V> (+12 more)
+Cohesion: 0.14
+Nodes (16): Array, Bound<T>, Box<T>, BTreeMap<K, V>, Datetime, Decimal, f64, Number (+8 more)
 
 ### Community 572 - "ast/src/lib.rs"
 Cohesion: 0.09
@@ -4004,9 +4275,9 @@ Nodes (25): MutationStage, DetachMode, classify_node(), label_mutation_rejected(
 Cohesion: 0.11
 Nodes (35): DefaultBroker, Document, new_ds_with_broker(), record_user_session(), Action, Arc, Box, Datastore (+27 more)
 
-### Community 575 - "NamespaceInfoPlan"
-Cohesion: 0.13
-Nodes (12): execute_namespace_info(), NamespaceInfoPlan, process(), Arc, FlowResult, Option, Self, String (+4 more)
+### Community 575 - "resolve_condition_params"
+Cohesion: 0.16
+Nodes (18): ParamCollector, ParamResolver, ProjectionFieldResolver, resolve_condition_params(), resolve_param_value(), resolve_projection_field_idioms(), Cond, Error (+10 more)
 
 ### Community 576 - "Bytesize"
 Cohesion: 0.14
@@ -4024,17 +4295,17 @@ Nodes (17): Inner, KnnBruteForceResult, KnnBruteForceResults, KnnPriorityList, A
 Cohesion: 0.16
 Nodes (12): ElementId, Option, Result, S, Self, Vec, test_clear(), test_node_to_val_and_load_node() (+4 more)
 
-### Community 580 - "DefineTableStatement"
-Cohesion: 0.18
-Nodes (18): DefineTableStatement, ChangeFeed, Default, DefineKind, Expr, Fields, FrozenContext, Option (+10 more)
+### Community 580 - "graph_neighbourhood/mod.rs"
+Cohesion: 0.13
+Nodes (33): admit_artifact(), admit_scratch(), build_lists(), build_neighbourhood_labels(), build_sketches(), distances(), fits(), invalid() (+25 more)
 
-### Community 581 - "CratePath"
-Cohesion: 0.08
-Nodes (18): CratePath, Attribute, Default, Self, TokenStream, Fields, Attribute, Option (+10 more)
-
-### Community 582 - "Select"
+### Community 581 - "ScatterPrefetchCursor"
 Cohesion: 0.10
-Nodes (21): Live, Cow, Into, IntoFuture, Option, PhantomData, R, RecordIdKeyRange (+13 more)
+Nodes (25): checked_page_no(), LoadedExtent, Arc, AtomicBool, Box, Drop, Error, FerrosGrynnError (+17 more)
+
+### Community 582 - "ProjectedRelation"
+Cohesion: 0.26
+Nodes (17): admit(), build_csr(), invalid(), ProjectedCondensation, ProjectedRelation, RelationCsr, resource(), BTreeMap (+9 more)
 
 ### Community 583 - "Lexer<'a>"
 Cohesion: 0.12
@@ -4048,21 +4319,21 @@ Nodes (8): Parser<'a>, Ast, Expr, Option, ParseResult, Stk, Token, TokenKind
 Cohesion: 0.12
 Nodes (20): term_document_basic(), TermFrequency, TermDocument, Highlighter, HighlightParams, Offseter, BTreeMap, From (+12 more)
 
-### Community 586 - "Result"
-Cohesion: 0.14
-Nodes (8): Result, Self, Vec, &str, String, test_kv_value_primitives(), u64, Vec<u8>
+### Community 586 - "DefineTableStatement"
+Cohesion: 0.18
+Nodes (18): DefineTableStatement, ChangeFeed, Default, DefineKind, Expr, Fields, FrozenContext, Option (+10 more)
 
-### Community 587 - "dbs/capabilities.rs"
-Cohesion: 0.06
-Nodes (32): ArbitraryQueryTarget, EvalQueryTarget, FuncTarget, NetTarget, ParseArbitraryQueryTargetError, ParseEvalQueryTargetError, ParseExperimentalTargetError, ParseMethodTargetError (+24 more)
+### Community 587 - "CardinalityHint"
+Cohesion: 0.02
+Nodes (82): buffer_stream(), prefetch_buffered(), PrefetchStream, Drop, FlowResult, Item, JoinHandle, Option (+74 more)
 
 ### Community 588 - "Parser<'_>"
 Cohesion: 0.21
 Nodes (11): BindingPower, Parser<'_>, BinaryOperator, Expr, MatchesOperator, NearestNeighbor, Option, ParseResult (+3 more)
 
 ### Community 589 - "EscapedSlice"
-Cohesion: 0.11
-Nodes (15): Chars, EscapedChars, EscapedIter, EscapedSlice, EscapedStr, Debug, Display, Eq (+7 more)
+Cohesion: 0.10
+Nodes (16): Chars, EscapedChars, EscapedIter, EscapedSlice, EscapedStr, Debug, Display, Eq (+8 more)
 
 ### Community 590 - "functional_coverage.rs"
 Cohesion: 0.11
@@ -4077,32 +4348,32 @@ Cohesion: 0.07
 Nodes (17): classify(), Iter, Iter<'a>, Label, LabeledSample, LabeledSample<'a>, Deref, Error (+9 more)
 
 ### Community 594 - "codec/encode.rs"
-Cohesion: 0.22
-Nodes (29): canonical_f16(), canonicalize_set(), encode_duration(), encode_fixed_vector(), encode_geometry(), encode_polygon_body(), encode_position(), encode_positions() (+21 more)
+Cohesion: 0.21
+Nodes (29): f16, canonical_f16(), canonicalize_set(), encode_duration(), encode_fixed_vector(), encode_geometry(), encode_polygon_body(), encode_position() (+21 more)
 
 ### Community 595 - "Variables"
 Cohesion: 0.12
 Nodes (21): ParameterCapturePass, BTreeMap, Error, From, FromIterator, FrozenContext, Into, IntoIter (+13 more)
 
 ### Community 596 - "object_extract/tests.rs"
-Cohesion: 0.17
-Nodes (30): extract_field_from_record_bytes(), aggregation_view_metadata_extracts_data(), descend_record_value_path_round_trips_all_supported_types(), descend_value_slice_path_decodes_field(), descent_bails_on_zero_depth_limit(), descent_bails_past_depth_limit(), descent_succeeds_at_exact_depth_limit(), edge_metadata_extracts_data() (+22 more)
+Cohesion: 0.16
+Nodes (31): descend_record_value_path(), extract_field_from_record_bytes(), aggregation_view_metadata_extracts_data(), descend_record_value_path_round_trips_all_supported_types(), descend_value_slice_path_decodes_field(), descent_bails_on_zero_depth_limit(), descent_bails_past_depth_limit(), descent_succeeds_at_exact_depth_limit() (+23 more)
 
-### Community 597 - "QuerySnapshot"
-Cohesion: 0.08
-Nodes (66): base_record_id(), deferred_index_missing(), exact_index_probe_key(), graph_record_id(), intersect_sorted(), key_in_bounds(), key_is_after(), next_prefix() (+58 more)
+### Community 597 - "GraphRef"
+Cohesion: 0.03
+Nodes (136): Savepoint, GraphIndexRoot, IndexBinding, IndexEntries, IndexEntries<Address>, IndexField, IndexStoreRoot, AtomKind (+128 more)
 
 ### Community 598 - "prefix_extractor.rs"
 Cohesion: 0.08
 Nodes (7): build(), extract(), in_domain(), parse_prefix_end(), Option, transform(), SliceTransform
 
-### Community 599 - "fnc/rand.rs"
-Cohesion: 0.20
-Nodes (23): bool(), duration(), float(), id(), int(), NoneOrRange, r#enum(), rand() (+15 more)
+### Community 599 - "SurrealDatabase"
+Cohesion: 0.12
+Nodes (13): HeaderValue, Deref, E, Error, From, Header, HeaderName, HeaderValue (+5 more)
 
 ### Community 600 - "codec/mod.rs"
-Cohesion: 0.23
-Nodes (14): all_format_v1_tags_round_trip(), archive_envelope_checks_magic_version_schema_length_and_checksum(), assert_status(), canonical_f32(), canonical_float_encoding_rejects_signed_zero_and_nan_payloads(), CanonicalCodec, duration_rejects_reserved_bits_zero_units_and_negative_zero(), enforces_depth_length_and_allocation_limits_before_reserve() (+6 more)
+Cohesion: 0.17
+Nodes (17): Deref, all_format_v1_tags_round_trip(), archive_envelope_checks_magic_version_schema_length_and_checksum(), assert_status(), canonical_float_encoding_rejects_signed_zero_and_nan_payloads(), CanonicalCodec, duration_rejects_reserved_bits_zero_units_and_negative_zero(), enforces_depth_length_and_allocation_limits_before_reserve() (+9 more)
 
 ### Community 601 - "SleepPlan"
 Cohesion: 0.13
@@ -4112,17 +4383,17 @@ Nodes (14): Arc, Duration, FlowResult, Option, Self, String, ValueBatchStream, V
 Cohesion: 0.11
 Nodes (17): &'a mut Object, &'a Object, Object, BTreeMap, Deref, DerefMut, From, FromIterator (+9 more)
 
-### Community 603 - "ExprPlan"
-Cohesion: 0.13
-Nodes (8): ExprPlan, Arc, FlowResult, Option, Self, String, ValueBatchStream, Vec
+### Community 603 - "AnalyzePlan"
+Cohesion: 0.14
+Nodes (14): AnalyzePlan, ExplainPlan, format_analyze_plan(), format_analyze_plan_json(), format_execution_plan(), format_execution_plan_json(), format_metrics_text(), Arc (+6 more)
 
 ### Community 604 - "Variables"
 Cohesion: 0.11
 Nodes (16): Object, BTreeMap, From, FromIterator, Into, IntoIter, IntoIterator, Iter (+8 more)
 
-### Community 606 - "cursor/barrier.rs"
-Cohesion: 0.16
-Nodes (24): ascending(), bound_atom_value(), distinct_rows(), invalid_match_run(), match_record(), match_row(), MatchProjectCursor, optional_atom() (+16 more)
+### Community 606 - "surrealdb/src/lib.rs"
+Cohesion: 0.03
+Nodes (88): Any, BoxFuture, Option, Result, Sealed, Self, Any, BoxFuture (+80 more)
 
 ### Community 607 - "decode_page_chain"
 Cohesion: 0.19
@@ -4144,29 +4415,29 @@ Nodes (15): column_from_index(), index_from_row_column(), ones_at_column_bug1(),
 Cohesion: 0.13
 Nodes (26): DefineKind, DefineStatement, DefineAccessStatement, DefineAnalyzerStatement, DefineApiStatement, DefineBucketStatement, DefineConfigStatement, DefineDatabaseStatement (+18 more)
 
-### Community 612 - "invalid"
-Cohesion: 0.15
-Nodes (18): child_graph(), ChildBinding, disk_ref(), GraphArena<'database>, invalid(), PendingGraph, AtomId, DatabaseRoot (+10 more)
+### Community 612 - "DataFileKind"
+Cohesion: 0.10
+Nodes (8): CommitTs, data_file_id_layout_is_stable_and_validated(), DataFileKind, page_key_uses_data_space_identity(), FerrosGrynnResult, Option, Self, CommitOutcome
 
-### Community 613 - "ForeachPlan"
-Cohesion: 0.11
-Nodes (16): execute_foreach(), ForeachIter, ForeachPlan, Arc, Block, Expr, FlowResult, IntoIter (+8 more)
+### Community 613 - ".restore"
+Cohesion: 0.16
+Nodes (20): build_graph_index_relation(), DatabaseRoot, FerrosGrynnResult, FnMut, snapshot_relation_uses_definition_labels_direction_mode_and_global_order(), check_lists(), invalid(), NeighbourhoodArtifact (+12 more)
 
 ### Community 614 - "DmlTarget"
-Cohesion: 0.14
-Nodes (28): Assignment, CreateStatement, DeleteStatement, DmlData, DmlReturn, DmlReturnItem, DmlTarget, ExpectClause (+20 more)
+Cohesion: 0.24
+Nodes (17): Assignment, CreateStatement, DeleteStatement, DmlData, DmlReturn, DmlReturnItem, DmlTarget, ExpectClause (+9 more)
 
 ### Community 615 - "Fields"
 Cohesion: 0.12
 Nodes (16): crate::expr::field::Field, crate::expr::field::Fields, crate::expr::field::Selector, Field, Fields, Box, Expr, Field (+8 more)
 
 ### Community 616 - "handle_function"
-Cohesion: 0.16
-Nodes (25): arg_sentinel_const_name(), encode_name(), generate_arg_sentinels(), generate_registration_body(), generate_sentinel(), Option, Pat, String (+17 more)
+Cohesion: 0.25
+Nodes (14): extract_doc_comment(), handle_function(), handle_module(), process_mod_items(), Attribute, Item, Option, Signature (+6 more)
 
 ### Community 617 - "Parser"
-Cohesion: 0.22
-Nodes (16): ast::Array, ast::Block, ast::Closure, ast::JsFunction, ast::Object, expect_close_block(), parse_object_continue(), parse_object_like() (+8 more)
+Cohesion: 0.15
+Nodes (24): ast::Array, ast::Block, ast::Closure, ast::JsFunction, ast::Object, expect_close_block(), parse_object_continue(), parse_object_like() (+16 more)
 
 ### Community 618 - "LetPlan"
 Cohesion: 0.06
@@ -4180,29 +4451,29 @@ Nodes (21): cors_origin(), dir_exists(), duration(), endpoint_valid(), eval_quer
 Cohesion: 0.10
 Nodes (18): Config, Capabilities, ClientConfig, Duration, Into, Level, Option, PathBuf (+10 more)
 
-### Community 621 - "extract_args"
+### Community 621 - "derived_index/mod.rs"
 Cohesion: 0.24
-Nodes (9): extract_args(), Extractor, Option<Value>, E, Option, Self, Sized, Vec (+1 more)
+Nodes (26): ArrayPage, check_header(), check_link(), check_ordinal(), check_page_no(), check_reference(), decode_array(), decode_records() (+18 more)
 
 ### Community 622 - "SurrealError"
-Cohesion: 0.13
-Nodes (16): Display, Formatter, Result, Self, String, SurrealError, SurrealErrorStatus, get_session() (+8 more)
+Cohesion: 0.17
+Nodes (13): Display, Formatter, Result, Self, String, SurrealError, SurrealErrorStatus, extract_label() (+5 more)
 
 ### Community 623 - "CountScan"
 Cohesion: 0.13
 Nodes (23): check_perm_value(), count_range(), count_with_perm_fallback(), CountScan, make_count_batch(), range_end_key(), range_start_key(), Arc (+15 more)
 
-### Community 624 - "compute_idiom_recursion"
-Cohesion: 0.18
-Nodes (18): evaluate_recurse_default(), Arc, FlowResult, Value, clean_iteration(), compute_idiom_recursion(), get_final(), is_final() (+10 more)
+### Community 624 - "datastore/import.rs"
+Cohesion: 0.30
+Nodes (24): abort_discards_the_complete_private_root(), Datastore, deferred_and_maintained_indexes_produce_the_same_root(), deferred_unique_violation_discards_the_complete_import(), email(), forbidden_schema_mutation_poisoned_import_before_allocating_an_id(), full_validation_rechecks_preexisting_atom_schema(), ignored_abort_item_error_poisoned_the_complete_import() (+16 more)
 
-### Community 625 - "ToSql"
-Cohesion: 0.02
-Nodes (86): Cond, Expr, String, Dir, String, Explain, String, Filter (+78 more)
+### Community 625 - "rocksdb/tests.rs"
+Cohesion: 0.15
+Nodes (18): CommunityComposer, cancel_blocks_until_live_cursor_drops(), commit_blocks_until_live_cursor_drops(), concurrent_cursors_do_not_evict(), concurrent_cursors_on_writable_tx(), cursor_drop_releases_slot(), memtable_merge_count_clamp_inner(), memtable_merge_count_clamp_non_versioned() (+10 more)
 
 ### Community 626 - "kvs/mod.rs"
-Cohesion: 0.24
-Nodes (16): inject_non_retryable_errors(), inject_retryable_conflict(), inject_retryable_conflicts(), maybe_inject_non_retryable_error(), maybe_inject_retryable_conflict(), non_retryable_errors(), NonRetryableErrorGuard, NonRetryableErrorSite (+8 more)
+Cohesion: 0.19
+Nodes (22): concurrent_indexing_retries_initial_batch_stops_after_abort(), concurrent_indexing_retries_initial_cleanup_stops_after_abort(), Uuid, wait_for_retry_conflict(), wait_for_retry_conflict_count_to_stabilize(), inject_non_retryable_error(), inject_non_retryable_errors(), inject_retryable_conflict() (+14 more)
 
 ### Community 627 - "stdio.rs"
 Cohesion: 0.15
@@ -4216,33 +4487,33 @@ Nodes (5): as_ref(), bound(), Input, Option, Vec
 Cohesion: 0.13
 Nodes (15): Deref, DerefMut, Option, Self, T, RwLock<T>, RwLockReadGuard, RwLockReadGuard<'a, T> (+7 more)
 
-### Community 630 - ".run_triggers"
-Cohesion: 0.25
-Nodes (16): AggregationAnalysis, Document, Recalculation, Action, Arc, Expr, FrozenContext, Option (+8 more)
+### Community 630 - "AlterAccessStatement"
+Cohesion: 0.21
+Nodes (13): AlterAccessStatement, AlterKind, Base, Default, Duration, Expr, FrozenContext, Option (+5 more)
 
-### Community 631 - "demo/src/lib.rs"
-Cohesion: 0.07
-Nodes (58): bound_to_tag(), decode_argument_list(), decode_kind_list(), decode_optional_values(), decode_string_key_values(), decode_string_range(), decode_value_list(), encode_argument_list() (+50 more)
+### Community 631 - "DatabaseInfoPlan"
+Cohesion: 0.13
+Nodes (12): DatabaseInfoPlan, execute_database_info(), process(), Arc, FlowResult, Option, Self, String (+4 more)
 
-### Community 632 - "Param"
-Cohesion: 0.11
-Nodes (12): MockExpr, Param, Any, Arc, BoxFut, FlowResult, Mock, Option (+4 more)
+### Community 632 - "ApiRequest"
+Cohesion: 0.06
+Nodes (56): create_final_action_closure(), create_middleware_closure(), process_api_request(), process_api_request_with_stack(), Closure, Expr, FrozenContext, Result (+48 more)
 
 ### Community 633 - "evaluate_streaming"
 Cohesion: 0.13
 Nodes (14): eval_signature(), EvalGql, EvalSurql, evaluate_streaming(), register(), BoxFut, Dialect, Object (+6 more)
 
-### Community 634 - ".output_write"
-Cohesion: 0.30
-Nodes (11): Document, Fields, FrozenContext, Idiom, Option, Output, Result, SelectStatement (+3 more)
+### Community 634 - "write_explicit"
+Cohesion: 0.07
+Nodes (53): build_explicit(), build_scoped_index_images(), invalid(), label_filename(), label_ids(), local_address(), local_addresses(), AtomKind (+45 more)
 
 ### Community 635 - "arc.rs"
-Cohesion: 0.04
-Nodes (41): force_epoch_advancement(), no_leak_after_clear(), no_leak_after_insert_remove_all(), no_leak_after_merges(), no_leak_after_splits(), no_leak_concurrent_insert_remove(), no_leak_concurrent_inserts(), no_leak_concurrent_updates() (+33 more)
+Cohesion: 0.05
+Nodes (38): force_epoch_advancement(), no_leak_after_clear(), no_leak_after_insert_remove_all(), no_leak_after_merges(), no_leak_after_splits(), no_leak_concurrent_insert_remove(), no_leak_concurrent_inserts(), no_leak_concurrent_updates() (+30 more)
 
-### Community 636 - "DestructurePart"
-Cohesion: 0.18
-Nodes (11): DestructureField, DestructurePart, evaluate_destructure(), Any, Arc, BoxFut, FlowResult, Strand (+3 more)
+### Community 636 - "Select"
+Cohesion: 0.10
+Nodes (21): Live, Cow, Into, IntoFuture, Option, PhantomData, R, RecordIdKeyRange (+13 more)
 
 ### Community 637 - "expr/statements/kill.rs"
 Cohesion: 0.22
@@ -4252,9 +4523,9 @@ Nodes (25): db_session(), kill_live_query(), KillStatement, new_ds_no_auth(), ne
 Cohesion: 0.18
 Nodes (11): Headers, Ctx, HeaderMap, Option, Result, Self, String, Value (+3 more)
 
-### Community 639 - "Enum"
-Cohesion: 0.11
-Nodes (17): Casing, EnumAttributes, Attribute, Option, Self, String, Enum, Attribute (+9 more)
+### Community 639 - "CratePath"
+Cohesion: 0.08
+Nodes (18): CratePath, Attribute, Default, Self, TokenStream, Fields, Attribute, Option (+10 more)
 
 ### Community 640 - "ModuleExecutable"
 Cohesion: 0.15
@@ -4269,12 +4540,12 @@ Cohesion: 0.12
 Nodes (36): Error, ErrorData, invalid_params(), From, Into, Self, String, CallToolResult (+28 more)
 
 ### Community 643 - "Self"
-Cohesion: 0.14
-Nodes (7): InlineSlot<T>, isize, MaybeUninit, Self, T, Sealed, usize
+Cohesion: 0.15
+Nodes (8): BoxedSlot, InlineSlot<T>, isize, AtomicPtr, Box, PhantomData, Self, T
 
-### Community 644 - "ApiResponse"
-Cohesion: 0.18
-Nodes (13): ApiResponse, Error, From, HeaderMap, Into, PublicObject, PublicValue, Result (+5 more)
+### Community 644 - "binaries.rs"
+Cohesion: 0.08
+Nodes (32): DsVersion, parse(), ResultsMode, ArgMatches, D, Display, Error, Formatter (+24 more)
 
 ### Community 645 - "Bytes"
 Cohesion: 0.11
@@ -4293,8 +4564,8 @@ Cohesion: 0.13
 Nodes (13): execute_root_info(), process(), RootInfoPlan, Arc, FlowResult, Option, Self, String (+5 more)
 
 ### Community 650 - "api_integration/mod.rs"
-Cohesion: 0.09
-Nodes (16): Con, AuthParams, F, new_db(), Record, RecordBuf, RecordName, Any (+8 more)
+Cohesion: 0.10
+Nodes (14): Con, AuthParams, F, new_db(), Record, RecordBuf, RecordName, Any (+6 more)
 
 ### Community 651 - "Catalog Backwards Compatibility Tests"
 Cohesion: 0.08
@@ -4304,9 +4575,9 @@ Nodes (25): Architecture, Catalog Backwards Compatibility Tests, Data Flow, File
 Cohesion: 0.15
 Nodes (37): McpSession, Arc, Datastore, FnOnce, R, Self, bind_data(), collapse_single() (+29 more)
 
-### Community 653 - "MessageBroker"
-Cohesion: 0.16
-Nodes (17): BrokerRoutingContext, LocalMessageBroker, MessageBroker, NodeEndpointResolver, RoutedNotification, Arc, Box, Debug (+9 more)
+### Community 653 - "get.rs"
+Cohesion: 0.13
+Nodes (24): expr_references_parent(), get_array(), get_array_field(), get_array_fields(), get_array_fields_flat(), get_array_thing(), get_array_where_field(), get_array_where_fields() (+16 more)
 
 ### Community 654 - "RecordIdKeyLit"
 Cohesion: 0.11
@@ -4318,39 +4589,39 @@ Nodes (22): is_document_dependent(), IsDocumentDependentChecker, LiveFields, Liv
 
 ### Community 656 - "Body"
 Cohesion: 0.08
-Nodes (30): Body, BodyData, BodyKind, Bytes, Cell, Ctx, Default, FromJs (+22 more)
+Nodes (29): Body, BodyData, BodyKind, Bytes, Cell, Ctx, Default, FromJs (+21 more)
 
-### Community 657 - "new"
-Cohesion: 0.29
-Nodes (7): new(), Box, Layer, Result, S, Send, Sync
+### Community 657 - "Router"
+Cohesion: 0.23
+Nodes (19): RequestData, Route, Router, BoxFuture, Command, Config, Error, HashSet (+11 more)
 
 ### Community 658 - "OrderList"
 Cohesion: 0.14
 Nodes (15): crate::expr::order::Order, crate::expr::order::Ordering, crate::expr::order::OrderList, Order, Ordering, OrderList, Deref, From (+7 more)
 
-### Community 659 - "ReturnPlan"
-Cohesion: 0.16
-Nodes (8): ReturnPlan, Arc, FlowResult, Option, Self, String, ValueBatchStream, Vec
+### Community 659 - "AlterApiClause"
+Cohesion: 0.17
+Nodes (14): AlterApiClause, AlterApiStatement, crate::expr::statements::alter::AlterApiClause, crate::expr::statements::alter::AlterApiStatement, AlterKind, ApiAction, ApiConfig, Default (+6 more)
 
 ### Community 660 - "BytesReader<'a>"
 Cohesion: 0.14
 Nodes (9): BytesReader<'a>, CharError, From, Item, Option, Result, Self, Span (+1 more)
 
 ### Community 661 - "Range"
-Cohesion: 0.09
-Nodes (24): encode_decode(), encoding_ordering(), ensure_order(), IntegerRangeIter, r(), Range, round_trip(), Array (+16 more)
-
-### Community 662 - "FieldEditContext"
 Cohesion: 0.07
-Nodes (25): clean_none(), Document, FieldEditContext, RefAction, Arc, FrozenContext, Option, RecordId (+17 more)
+Nodes (30): crate::expr::Mock, Mock, From, Self, String, TableName, encode_decode(), encoding_ordering() (+22 more)
+
+### Community 662 - "every.rs"
+Cohesion: 0.10
+Nodes (13): ArrayBehaviour, every_given_one_path_part(), Idiom, Option, Part, Vec, Value, merge_basic() (+5 more)
 
 ### Community 663 - "src/auth.rs"
 Cohesion: 0.14
-Nodes (21): anonymous_bound_subject_accepts_missing_or_anonymous(), audit_label_distinguishes_anonymous_and_authenticated(), BoundSubject, check_subject(), extract_session_from_parts(), extracts_session_when_present(), incoming_subject(), missing_or_anonymous_is_rejected_for_authenticated_bound_subject() (+13 more)
+Nodes (20): anonymous_bound_subject_accepts_missing_or_anonymous(), audit_label_distinguishes_anonymous_and_authenticated(), BoundSubject, check_subject(), extract_session_from_parts(), extracts_session_when_present(), incoming_subject(), missing_or_anonymous_is_rejected_for_authenticated_bound_subject() (+12 more)
 
 ### Community 664 - "usize"
-Cohesion: 0.26
-Nodes (19): (), QueryResult, QueryStream, HashSet, LinkedList, Notification, Option, R (+11 more)
+Cohesion: 0.22
+Nodes (21): DbResultStats, Duration, (), QueryResult, QueryStream, HashSet, LinkedList, Notification (+13 more)
 
 ### Community 665 - "RecordIdKey"
 Cohesion: 0.13
@@ -4372,37 +4643,33 @@ Nodes (13): MergeQueueScenario, ReadsetConflictScenario, Arc, Bytes, Commit, Dat
 Cohesion: 0.19
 Nodes (18): KeySource, MergeIterator, MergeIterator<'a>, MergeQueueIter, Arc, Box, Bytes, Direction (+10 more)
 
-### Community 671 - "invalid"
-Cohesion: 0.26
-Nodes (12): decrement(), effective_property_count(), increment(), invalid(), FerrosGrynnError, FerrosGrynnResult, Into, Option (+4 more)
+### Community 671 - "StatisticsStore"
+Cohesion: 0.23
+Nodes (17): decrement(), effective_property_count(), increment(), invalid(), AtomKind, BaseAtom, FerrosGrynnError, FerrosGrynnResult (+9 more)
 
 ### Community 672 - "waitgroup.rs"
 Cohesion: 0.13
 Nodes (16): AtomicWaker, Inner, Arc, Default, Drop, Future, Inner, Output (+8 more)
 
-### Community 673 - "FieldDependencyExtractor"
-Cohesion: 0.15
-Nodes (18): closure_incomplete_forces_all(), closure_only_needed(), closure_simple(), ComputedDeps, extract_computed_deps(), field_name_from_part(), FieldDependencyExtractor, parse_idiom_root() (+10 more)
+### Community 673 - "Compute"
+Cohesion: 0.13
+Nodes (16): Compute, compute_batch(), literal_expr(), Arc, ControlFlow, FlowResult, Option, Result (+8 more)
 
 ### Community 674 - "StatusReport"
 Cohesion: 0.11
 Nodes (19): applies_gql_precedence(), Outcome, Outcome<T>, precedence(), rejects_errors(), Display, Error, ExactSizeIterator (+11 more)
 
-### Community 675 - "convert.rs"
-Cohesion: 0.22
-Nodes (26): CborValue, from_array(), from_geometry(), from_object(), from_range(), from_record_id_key(), from_record_id_key_range(), from_uuid() (+18 more)
+### Community 675 - "DatabaseRoot"
+Cohesion: 0.14
+Nodes (14): analyzer_exists(), analyzer_missing(), DatabaseRoot, function_exists(), function_missing(), parameter_missing(), AnalyzerId, BTreeMap (+6 more)
 
-### Community 676 - "Result"
-Cohesion: 0.38
-Nodes (5): FlatBufferBuilder, Input, Output, Result, Self
+### Community 677 - "Set"
+Cohesion: 0.14
+Nodes (14): &'a Set, BTreeSet, Deref, DerefMut, From, IntoIter, IntoIterator, Self (+6 more)
 
-### Community 677 - "AlterTableStatement"
-Cohesion: 0.16
-Nodes (14): AlterTableStatement, AlterKind, ChangeFeed, Default, Expr, FrozenContext, Option, Permissions (+6 more)
-
-### Community 678 - "ClosureFieldCallPart"
-Cohesion: 0.15
-Nodes (9): ClosureFieldCallPart, MethodPart, Any, Arc, BoxFut, FlowResult, String, Value (+1 more)
+### Community 678 - "api_scope.rs"
+Cohesion: 0.61
+Nodes (7): api_invoke_rejects_cross_tenant_scope(), get_request(), http_route_rejects_cross_tenant_scope(), Datastore, Result, run(), setup_victim_tenant()
 
 ### Community 679 - "Function"
 Cohesion: 0.17
@@ -4420,21 +4687,21 @@ Nodes (14): DecimalLexEncoder, Decimal, Result, Vec, test_cases(), test_decode_b
 Cohesion: 0.17
 Nodes (18): check_perms(), Function, FunctionCall, Expr, FlowResult, FrozenContext, Idiom, Kind (+10 more)
 
-### Community 683 - "atom_store_superblock.rs"
-Cohesion: 0.20
-Nodes (14): exact_offsets_round_trip_and_preserve_logical_lsn(), fixture(), invalid(), read_u32(), read_u64(), rejects_invalid_counts_ceilings_and_checkpoint_tuple(), rejects_wrong_header_version_reserved_checksum_and_legacy_graph_page(), FerrosGrynnError (+6 more)
+### Community 683 - "GraphqlError"
+Cohesion: 0.09
+Nodes (67): async_graphql::Error, auth_error(), GraphqlError, resolver_error(), Error, From, Into, Kind (+59 more)
 
 ### Community 684 - "Blob"
 Cohesion: 0.14
 Nodes (16): append_blob_part(), Blob, content_type_from_headers(), EndingType, normalize_type(), ArrayBuffer, Bytes, BytesMut (+8 more)
 
 ### Community 685 - ".from_arguments"
-Cohesion: 0.17
+Cohesion: 0.16
 Nodes (17): FormData, FormData<'js>, FormDataValue, FormDataValue<'js>, Blob, Class, Coerced, Ctx (+9 more)
 
-### Community 686 - "ix.rs"
-Cohesion: 0.19
-Nodes (14): IndexDefinitionKey, IndexDefinitionKey<'key>, IndexNameLookupKey, IndexNameLookupKey<'key>, key(), new(), prefix(), Cow (+6 more)
+### Community 686 - "fill_vals_batch"
+Cohesion: 0.22
+Nodes (21): DefaultKeysCursor, DefaultKeysCursor<'a, T>, DefaultKeysCursor<'_, T>, DefaultValsCursor, DefaultValsCursor<'a, T>, DefaultValsCursor<'_, T>, fetch_keys_page(), fetch_vals_page() (+13 more)
 
 ### Community 687 - "LiveEventBuffer"
 Cohesion: 0.11
@@ -4444,33 +4711,33 @@ Nodes (17): LiveAction, LiveEvent, LiveEvents, RecordId, Self, Value, Vec, Buffe
 Cohesion: 0.15
 Nodes (15): Diagnostic, DiagnosticKind, Box, F, Option, Self, Span, String (+7 more)
 
-### Community 689 - "route.rs"
+### Community 689 - "FieldEditContext"
 Cohesion: 0.22
-Nodes (13): ReadIntent, min3(), ReadIntent, ReadRoute, ReadWindow, route_read(), Self, scatter_extent_pages() (+5 more)
+Nodes (12): clean_none(), Document, FieldEditContext, RefAction, Arc, FrozenContext, Option, RecordId (+4 more)
 
-### Community 690 - "tests/index.rs"
+### Community 690 - "Operation"
 Cohesion: 0.21
-Nodes (24): batch_ingestion(), collect_query(), collect_value_ids(), concurrent_tasks(), diskann_pending_and_compacted_knn(), hnsw_concurrent_writes(), multi_index_concurrent_test(), multi_index_concurrent_test_create_update_delete() (+16 more)
+Nodes (14): Operation, PatchError, reject_root_from(), round_trip_all_variants(), round_trip_root_path(), roundtrip(), Display, Formatter (+6 more)
 
 ### Community 691 - "mcp/tests/common/mod.rs"
-Cohesion: 0.11
-Nodes (18): test_init_session(), test_list_truncates_oversized_subtree(), AuditCapture, CapturedEvent, FieldVisitor, GlobalAuditLayer, root_session(), Arc (+10 more)
+Cohesion: 0.12
+Nodes (16): AuditCapture, CapturedEvent, FieldVisitor, GlobalAuditLayer, Arc, Datastore, Debug, Field (+8 more)
 
 ### Community 692 - "parse_bare_type"
 Cohesion: 0.15
 Nodes (20): ast::Type, no_either_type(), parse_bare_type(), parse_geometry_sub_type(), parse_ident_list_type(), parse_prime_type(), Parse, Parser (+12 more)
 
 ### Community 693 - "StatusCode"
-Cohesion: 0.11
-Nodes (15): D, Deserialize, Display, Err, Error, Formatter, FromStr, Ok (+7 more)
+Cohesion: 0.14
+Nodes (14): D, Deserialize, Display, Err, Error, Formatter, FromStr, Ok (+6 more)
 
 ### Community 694 - "Building SurrealDB"
 Cohesion: 0.17
 Nodes (12): Building on Debian 13 Trixie (amd64), Building on macOS (arm64), Building on Windows-amd64 (Windows OS), Building SurrealDB, Building using the Nix package manager, ✅ Compile for `aarch64-unknown-linux-gnu` (Linux), ✅ Compile for `apple-darwin` (macOS), ✅ Compile for `windows-amd64` (+4 more)
 
-### Community 695 - "KnnScan"
-Cohesion: 0.05
-Nodes (39): count_btree_index_keys(), count_with_filter_fallback(), IndexCountScan, make_count_batch(), Arc, Cond, ControlFlow, FlowResult (+31 more)
+### Community 695 - "NamedFields"
+Cohesion: 0.16
+Nodes (15): FieldAttributes, FieldDefault, Field, Option, Path, Self, String, String (+7 more)
 
 ### Community 696 - "run_with_timeout"
 Cohesion: 0.14
@@ -4520,57 +4787,53 @@ Nodes (9): Box<[u8]>, Bytes, Cow<'_, [u8]>, IntoBytes, Bytes, &str, String, &[u8
 Cohesion: 0.18
 Nodes (11): Commit, Merge, readset(), Arc, AtomicBool, AtomicU64, BTreeMap, Bytes (+3 more)
 
-### Community 708 - "execute"
-Cohesion: 0.26
-Nodes (28): array(), check(), domain(), execute(), length(), math_abs(), meta_class(), meta_id() (+20 more)
-
-### Community 709 - "cmd/run/mod.rs"
-Cohesion: 0.14
-Nodes (27): base_datastore(), BodyOutcome, case_from_source(), check_retained_keys(), cleanup_environment(), importing_test_failing_to_parse_cleans_up_for_next_test(), make_run(), Arc (+19 more)
+### Community 709 - "BuildGraphStatement"
+Cohesion: 0.15
+Nodes (20): BuildGraphSource, BuildGraphStatement, GraphContract, GraphFamilyName, GraphValidatorName, Parser<'_>, ReturnGraph, Box (+12 more)
 
 ### Community 710 - "Notify"
-Cohesion: 0.12
-Nodes (20): bool, Captures, extract_mask(), Notify, Option<T>, AtomicUsize, F, Future (+12 more)
+Cohesion: 0.10
+Nodes (26): bool, Captures, extract_mask(), Notify, Option<T>, AtomicUsize, F, Future (+18 more)
 
 ### Community 711 - "connectivity.rs"
-Cohesion: 0.24
-Nodes (30): bfs(), bfs_with_check(), check_candidate(), collect_node_ids(), collect_node_ids_with_check(), Condensation, condensation_with_check(), dfs() (+22 more)
+Cohesion: 0.12
+Nodes (40): bfs(), bfs_with_check(), check_candidate(), collect_node_ids(), collect_node_ids_with_check(), Condensation, condensation_with_check(), dfs() (+32 more)
 
-### Community 712 - "AccessMode"
-Cohesion: 0.04
-Nodes (40): AccessMode, CombineAccessModes, Item, Self, Any, Arc, BoxFut, FlowResult (+32 more)
+### Community 712 - "Parts"
+Cohesion: 0.13
+Nodes (27): CoordPos, OperatorAuth, FromRequestParts, Rejection, Result, S, Self, Line (+19 more)
 
 ### Community 713 - "gql_stage20_21.rs"
 Cohesion: 0.21
 Nodes (18): assert_query(), benchmark_stage20(), benchmark_stage21(), local_maintenance_fixture(), LocalMaintenanceFixture, mutate_all(), mutation_fixture(), MutationFixture (+10 more)
 
 ### Community 714 - "fulltext_row"
-Cohesion: 0.20
-Nodes (26): file_entry(), fulltext_row(), invalid(), LocalStore, prepare_fulltext_delta(), prepare_vector_delta(), PreparedDelta, rebuild_threshold() (+18 more)
+Cohesion: 0.14
+Nodes (34): DecodedFulltextDelta, DecodedVectorDelta, FileCatalogEntry, file_entry(), fulltext_row(), invalid(), LocalStore, prepare_fulltext_delta() (+26 more)
 
 ### Community 715 - "Исследование порчи первого байта `AlignedPage` на Windows MSVC"
 Cohesion: 0.08
 Nodes (24): 10. Как решают aligned Direct I/O buffers, 11. Рассмотренные варианты, 12. Внесённое исправление, 13.1. Результат первого bulk-builder аудита, 13. Оставшийся риск и следующий минимальный шаг, 14. Команды финальной проверки, 1. Итог, 2. Что именно повреждалось (+16 more)
 
-### Community 716 - "GraphId"
-Cohesion: 0.12
-Nodes (26): ContainmentChain, ContainmentOwner, DatabaseRoot, occurrence_child(), AtomRef, BTreeSet, FerrosGrynnResult, GlobalAtomId (+18 more)
+### Community 716 - "FerrosGrynnResult"
+Cohesion: 0.23
+Nodes (12): endpoint_posting_write_bytes(), Arc, DatabaseRoot, FerrosGrynnResult, GlobalAtomId, GraphId, Number, Option (+4 more)
 
-### Community 717 - "coerce.rs"
-Cohesion: 0.12
-Nodes (11): Cast, CoerceErrorExt, ElementPosition, Result<T, CoerceError>, F, String, test_coerce_array_element_position_in_error(), test_coerce_table_empty_tables_list() (+3 more)
+### Community 717 - "PrefixedStore<T>"
+Cohesion: 0.38
+Nodes (11): PrefixedStore<T>, Box, Bytes, Future, Option, Output, Pin, Result (+3 more)
 
-### Community 718 - "parse_surrealism_attrs"
-Cohesion: 0.22
-Nodes (12): parse_surrealism_attr(), parse_surrealism_attrs(), Attribute, Option, Result, String, SurrealismAttrs, validate_export_name() (+4 more)
+### Community 718 - "gql_integration.rs"
+Cohesion: 0.29
+Nodes (25): ensure_namespace_and_database(), gql_accept_negotiation(), gql_endpoint_happy_path(), gql_parse_error_shape(), gql_rejects_invalid_utf8(), gql_requires_experimental_capability(), gql_route_can_be_denied(), gql_rpc_method() (+17 more)
 
 ### Community 719 - "lower/mod.rs"
-Cohesion: 0.31
-Nodes (21): Column, column_is_grouped(), lower(), lower_aggregating_order(), lower_count(), lower_group_keys(), lower_order_item(), lower_output() (+13 more)
+Cohesion: 0.27
+Nodes (22): Column, column_is_grouped(), lower(), lower_aggregating_order(), lower_count(), lower_group_keys(), lower_order_item(), lower_output() (+14 more)
 
-### Community 720 - "classes.rs"
-Cohesion: 0.15
-Nodes (14): Query, QueryVariables, Coerced, Ctx, Expr, FromJs, Opt, Option (+6 more)
+### Community 720 - "wait_for_index_ready"
+Cohesion: 0.23
+Nodes (25): count_index_delete_before_scan_preserves_plain_count_baseline(), count_index_delete_before_scan_preserves_where_count_baseline(), count_index_updates_before_scan_preserve_where_count_baseline(), define_index_overwrite_aborts_retired_local_builder_after_commit(), distributed_admission_error_after_registration_releases_reservation(), distributed_blocking_rebuild_waits_for_remote_owner(), distributed_committed_cleanup_failure_recovers_from_appending(), distributed_fulltext_index_replays_second_node_update() (+17 more)
 
 ### Community 721 - "ToFloat"
 Cohesion: 0.11
@@ -4580,9 +4843,9 @@ Nodes (14): deviation(), f32, f64, half::f16, i16, i32, i64, i8 (+6 more)
 Cohesion: 0.26
 Nodes (8): edge_pattern_starts(), Parser<'_>, Option, ParseResult, PathMode, Stk, TokenKind, simplified_path_starts()
 
-### Community 723 - "Result"
-Cohesion: 0.29
-Nodes (8): OrdMap<K, V>, OrdSet<T>, F, R, Result, Self, W, Vector<T>
+### Community 723 - "rc.rs"
+Cohesion: 0.22
+Nodes (12): database_key_roundtrips(), index_key_roundtrips(), ReclaimKey, ReclaimKey<'key>, ReclaimState, Cow, IndexId, Result (+4 more)
 
 ### Community 724 - "observer.rs"
 Cohesion: 0.11
@@ -4592,13 +4855,13 @@ Nodes (12): classify_anyhow_error(), classify_http_status(), classify_types_erro
 Cohesion: 0.16
 Nodes (22): check_permissions_auth_disabled(), check_permissions_auth_enabled(), common_permissions_checks(), insert_ignore(), insert_relation(), insert_relation_array_with_extra_fields(), insert_relation_ignore_unique_index_fix_test(), insert_relation_on_duplicate_key_update_extra_fields() (+14 more)
 
-### Community 726 - "strand.rs"
-Cohesion: 0.04
-Nodes (59): T, test_serialize_deserialize(), Hi, Hi<'a>, key(), Cow, IndexId, RecordIdKey (+51 more)
+### Community 726 - "ExportsManifest"
+Cohesion: 0.14
+Nodes (16): deserialize(), ExportsManifest, FunctionExport, roundtrip_manifest(), D, Error, Kind, Ok (+8 more)
 
-### Community 727 - "ShortestPaths"
-Cohesion: 0.19
-Nodes (27): algorithm_failure(), Into, String, bellman_ford(), bellman_ford_with_check(), check_candidate(), collect_weights_with_check(), dijkstra() (+19 more)
+### Community 727 - "AtomId"
+Cohesion: 0.14
+Nodes (38): Admit, Refine, AtomId, algorithm_failure(), Into, String, bellman_ford(), bellman_ford_with_check() (+30 more)
 
 ### Community 728 - "Result"
 Cohesion: 0.28
@@ -4609,16 +4872,16 @@ Cohesion: 0.10
 Nodes (30): generate_bytes(), generate_string(), generate_struct(), KeyBindings, Display, Formatter, Result, Self (+22 more)
 
 ### Community 731 - "Schedular"
-Cohesion: 0.22
-Nodes (8): Arc, Drop, F, Self, Semaphore, Schedular, SemaphoreGuard, JoinSet
+Cohesion: 0.23
+Nodes (7): Arc, Drop, F, Self, Semaphore, Schedular, SemaphoreGuard
 
 ### Community 732 - "cycle_guard.rs"
 Cohesion: 0.20
 Nodes (18): cloned_guards_share_state(), cross_database_keys_are_distinct(), CycleGuard, CycleGuardEntry, distinct_keys_coexist(), drop_removes_entry(), empty_guard_does_not_contain_anything(), key() (+10 more)
 
-### Community 733 - "Relation"
-Cohesion: 0.23
-Nodes (10): Relation, Error, Kind, Option, R, Result, Self, Vec (+2 more)
+### Community 733 - "atom_store_image.rs"
+Cohesion: 0.05
+Nodes (107): AtomStoreCheckpointAuthority, AtomStoreFileSet, backfill_atom_store_checkpoint(), build_atom_store_data_with_context(), build_atom_store_image(), build_atom_store_image_with_context(), build_durable_atom_store_image(), build_durable_atom_store_image_with_context() (+99 more)
 
 ### Community 734 - "TrackAlloc<A>"
 Cohesion: 0.16
@@ -4640,13 +4903,13 @@ Nodes (14): CaseConfig, default_gql_planner_strategy(), Parser, Parser<'a>, plan
 Cohesion: 0.11
 Nodes (15): ArcSwap, backoff(), IsolationLevel, pin_slot(), Arc, Box, BTreeMap, Commit (+7 more)
 
-### Community 739 - "Result"
-Cohesion: 0.22
-Nodes (12): AstEnumFormatter<W>, AstFormatter<W>, AstStructFormatter<W>, Ast, D, Error, F, L (+4 more)
+### Community 739 - "iu.rs"
+Cohesion: 0.19
+Nodes (16): compacted_key(), IndexCountKey, IndexCountKey<'a>, key(), Prefix, Prefix<'a>, range(), Cow (+8 more)
 
-### Community 740 - "expr/statements/alter/api.rs"
-Cohesion: 0.18
-Nodes (16): AlterApiClause, AlterApiStatement, remove_methods_from_actions(), AlterKind, ApiAction, ApiConfig, Default, Expr (+8 more)
+### Community 740 - "AnalyzedToken"
+Cohesion: 0.24
+Nodes (25): AnalyzedToken, Text, FulltextDocument, analyze(), build_fulltext_index_images(), explicit_kind(), fulltext_sources(), FulltextSource (+17 more)
 
 ### Community 741 - ".path"
 Cohesion: 0.16
@@ -4656,9 +4919,9 @@ Nodes (39): assert_people_graph_atom(), atomic_import_all_dml_matches_ram_before
 Cohesion: 0.16
 Nodes (12): Message, router_reconnect(), RouterState, BoxFuture, MessageSink, MessageStream, Option, Result (+4 more)
 
-### Community 743 - "AlterEventStatement"
-Cohesion: 0.17
-Nodes (12): AlterEventStatement, AlterKind, Default, Expr, FrozenContext, Option, Result, Self (+4 more)
+### Community 743 - "Rest"
+Cohesion: 0.24
+Nodes (16): Rest, console(), debug(), error(), info(), log(), Printer, Coerced (+8 more)
 
 ### Community 744 - "AlterUserStatement"
 Cohesion: 0.19
@@ -4668,29 +4931,29 @@ Nodes (14): AlterUserStatement, AlterKind, Base, Default, Duration, Expr, Frozen
 Cohesion: 0.17
 Nodes (17): RelateStatement, RelateThrough, Data, Expr, From, FrozenContext, Option, Output (+9 more)
 
-### Community 746 - "trees/store/mod.rs"
-Cohesion: 0.18
-Nodes (8): Arc, DiskAnnParams, FrozenContext, HnswParams, Result, Self, SharedDiskAnnIndex, SharedHnswIndex
+### Community 746 - "request"
+Cohesion: 0.35
+Nodes (18): decode_response(), delete(), encode_body(), get(), head(), patch(), post(), put() (+10 more)
 
-### Community 748 - "Set"
-Cohesion: 0.14
-Nodes (14): &'a Set, BTreeSet, Deref, DerefMut, From, IntoIter, IntoIterator, Self (+6 more)
+### Community 747 - "parser/expression.rs"
+Cohesion: 0.10
+Nodes (3): Token, Assignment, Unexpected
 
 ### Community 749 - "tests/delete.rs"
-Cohesion: 0.19
-Nodes (17): CapturingTransactionObserver, check_permissions_auth_disabled(), check_permissions_auth_enabled(), common_permissions_checks(), delete_filtered_live_notification(), delete_with_reference_keys_still_deletes_reference_range(), delete_without_references_skips_reference_range_delete(), level_db() (+9 more)
+Cohesion: 0.17
+Nodes (18): TransactionMetricsSnapshot, CapturingTransactionObserver, check_permissions_auth_disabled(), check_permissions_auth_enabled(), common_permissions_checks(), delete_filtered_live_notification(), delete_with_reference_keys_still_deletes_reference_range(), delete_without_references_skips_reference_range_delete() (+10 more)
 
 ### Community 750 - "net/mod.rs"
 Cohesion: 0.14
 Nodes (11): FilteringResolver, is_private_ip(), make_resolver(), NetFilter, Arc, IpAddr, Self, test_filtering_resolver_private_ip_allowed_when_allow_all() (+3 more)
 
 ### Community 751 - "IndexKeyBase"
-Cohesion: 0.06
-Nodes (27): IndexKeyBase, AppendingId, BatchId, BuildGeneration, BuildTicket, BuildTicketMutationSeq, Display, DocId (+19 more)
+Cohesion: 0.05
+Nodes (41): bump_compaction_generation(), IndexKeyBase, is_transaction_condition_not_met(), read_compaction_generation(), AppendingId, Arc, BatchId, BuildGeneration (+33 more)
 
 ### Community 752 - "RecordIdKeyLit"
-Cohesion: 0.16
-Nodes (14): crate::expr::RecordIdKeyGen, crate::expr::RecordIdKeyLit, RecordIdKeyGen, RecordIdKeyLit, Box, Expr, From, ObjectEntry (+6 more)
+Cohesion: 0.14
+Nodes (15): crate::expr::RecordIdKeyGen, crate::expr::RecordIdKeyLit, RecordIdKeyGen, RecordIdKeyLit, Box, Expr, From, ObjectEntry (+7 more)
 
 ### Community 753 - "SelectStatement"
 Cohesion: 0.11
@@ -4700,13 +4963,13 @@ Nodes (18): crate::expr::statements::SelectStatement, Cond, Explain, Expr, Fetch
 Cohesion: 0.22
 Nodes (21): ask_permission(), download_v2(), ensure_binary_present(), flush(), get_existing_version(), get_latest_version(), init(), make_executable() (+13 more)
 
-### Community 755 - "checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates"
-Cohesion: 0.20
-Nodes (21): atom_store_image_round_trips_global_ids_primary_and_properties(), catalog_entry(), checkpoint_backfills_data_and_recovers_only_authorized_cow_candidates(), corrupt_byte(), create_layout(), data_file_id(), durable_commit_preserves_snapshots_and_recovers_wal_frames(), install_class() (+13 more)
+### Community 755 - "Invalidate"
+Cohesion: 0.17
+Nodes (11): Invalidate, Invalidate<'_, C, T>, Invalidate<'r, Client>, Invalidate<'r, Client, Token>, Client, Cow, IntoFuture, PhantomData (+3 more)
 
-### Community 756 - "Option"
-Cohesion: 0.29
-Nodes (4): KeysIter<'a>, Item, Option, ValsIter<'a>
+### Community 756 - "HttpClient"
+Cohesion: 0.14
+Nodes (18): HttpClient, Client, Arc, Cache, Equivalent, F, From, Result (+10 more)
 
 ### Community 757 - "remote/mod.rs"
 Cohesion: 0.17
@@ -4720,9 +4983,9 @@ Nodes (21): ApiRecordIdWithFetchedLink, ApiRecordIdWithUnfetchedLink, LinkConten
 Cohesion: 0.14
 Nodes (13): create_token_with_refresh(), create_token_without_refresh(), Token, test_token_debug_implementation(), test_token_edge_case_empty_strings(), test_token_edge_case_special_characters(), test_token_edge_case_very_long_strings(), test_token_into_value_with_refresh() (+5 more)
 
-### Community 760 - "trait.rs"
-Cohesion: 0.10
-Nodes (12): geo_line(), geo_multilinestring(), geo_multipoint(), geo_multipolygon(), geo_point(), geo_polygon(), geometry_point(), LineString (+4 more)
+### Community 760 - "Point"
+Cohesion: 0.08
+Nodes (18): decode(), encode(), Geometry, String, Point, test_simple_multi_field_struct(), geo_line(), geo_multilinestring() (+10 more)
 
 ### Community 761 - "Engine"
 Cohesion: 0.13
@@ -4732,33 +4995,33 @@ Nodes (14): base_config(), EngineHandle, Arc, AtomicU64, Config, Self, shared_en
 Cohesion: 0.21
 Nodes (13): find_entry(), Option, Result, String, Vec, SurrealismPlugin, Option, Result (+5 more)
 
-### Community 764 - "cli/sql.rs"
+### Community 764 - "ObjectStore"
 Cohesion: 0.21
-Nodes (15): filter_line_continuations(), init(), InputValidator, pretty_print_json(), print(), process(), DatabaseConnectionArguments, JsonValue (+7 more)
+Nodes (14): BucketConnectionKey, BucketsManager, Inner, Arc, Box, Config, DashMap, Option (+6 more)
 
-### Community 765 - "query/mod.rs"
-Cohesion: 0.11
-Nodes (20): Constructor, fetch(), register(), Ctx, Result, query(), QueryContext, QueryContext<'js> (+12 more)
+### Community 765 - "query"
+Cohesion: 0.12
+Nodes (17): Constructor, fetch(), register(), Ctx, Result, query(), QueryContext<'js>, Ctx (+9 more)
 
 ### Community 766 - "RecordExists"
 Cohesion: 0.16
 Nodes (8): RecordExists, RecordIsEdge, register(), BoxFut, Result, Signature, Value, Vec
 
-### Community 767 - "StreamExt"
-Cohesion: 0.04
-Nodes (49): bench_import_throughput(), generate_insert_statement(), Criterion, String, statements_needed(), target_size_bytes(), Limit, Arc (+41 more)
+### Community 767 - "Split"
+Cohesion: 0.18
+Nodes (16): Arc, FlowResult, Idiom, Option, Self, String, Value, ValueBatchStream (+8 more)
 
-### Community 768 - "Br"
-Cohesion: 0.22
-Nodes (13): Br, Br<'a>, BrPrefix, BuildGeneration, BuildTicket, Cow, IndexId, Key (+5 more)
-
-### Community 769 - "CaseImports"
+### Community 768 - "middleware/res.rs"
 Cohesion: 0.13
-Nodes (17): ListConfig, ArgMatches, Result, String, run(), CaseImports, Arc, F (+9 more)
+Nodes (18): BodyStrategy, Self, AcceptRange, convert_response_value(), output_body_strategy(), parse_accept(), From, HeaderMap (+10 more)
 
-### Community 770 - "AlterAccessStatement"
-Cohesion: 0.21
-Nodes (13): AlterAccessStatement, AlterKind, Base, Default, Duration, Expr, FrozenContext, Option (+5 more)
+### Community 769 - "upgrade/mod.rs"
+Cohesion: 0.23
+Nodes (17): Config, is_port_available(), Arc, ArgMatches, Option, Result, Self, String (+9 more)
+
+### Community 770 - "expr/statements/alter/bucket.rs"
+Cohesion: 0.20
+Nodes (12): AlterBucketStatement, AlterKind, Default, Expr, FrozenContext, Option, Permission, Result (+4 more)
 
 ### Community 771 - "DefineAnalyzerStatement"
 Cohesion: 0.16
@@ -4780,33 +5043,33 @@ Nodes (16): Cond, Data, Default, Explain, Expr, FrozenContext, Option, Output (+
 Cohesion: 0.35
 Nodes (15): domain(), fragment(), host(), path(), port(), port_default_port_specified(), port_no_port_specified(), port_no_scheme_no_port_specified() (+7 more)
 
-### Community 776 - "minimum_spanning_forest_with_check"
-Cohesion: 0.19
-Nodes (16): binary_edges_with_check(), BinaryEdge, check_candidate(), DisjointSets, minimum_spanning_forest(), minimum_spanning_forest_with_check(), minimum_spanning_tree(), AtomId (+8 more)
+### Community 776 - "KVKey"
+Cohesion: 0.03
+Nodes (70): Hi, Hi<'a>, key(), Cow, IndexId, RecordIdKey, Result, Self (+62 more)
 
 ### Community 777 - ".parse_insert_filler"
 Cohesion: 0.22
 Nodes (11): Parser<'_>, DeleteStatement, DetachMode, InsertStatement, Option, ParseResult, RemoveStatement, SetStatement (+3 more)
 
-### Community 778 - "table/lq.rs"
-Cohesion: 0.28
-Nodes (12): key(), Lq, Lq<'a>, new(), prefix(), Cow, Result, Self (+4 more)
+### Community 778 - "mock"
+Cohesion: 0.10
+Nodes (39): mock(), FrozenContext, del_array(), del_array_field(), del_array_fields(), del_array_fields_flat(), del_array_where_field(), del_array_where_fields() (+31 more)
 
-### Community 779 - "Split"
-Cohesion: 0.18
-Nodes (16): Arc, FlowResult, Idiom, Option, Self, String, Value, ValueBatchStream (+8 more)
+### Community 779 - "ScalarFunction"
+Cohesion: 0.17
+Nodes (17): build_method_registry(), get(), MethodDescriptor, MethodRegistry, Arc, Option, Result, Self (+9 more)
 
 ### Community 780 - "replay.rs"
-Cohesion: 0.12
-Nodes (32): appending_both(), appending_new_values(), appending_none(), appending_old_values(), primary_appending_basic(), ExistingPrimaryAppending, Appending, Building (+24 more)
+Cohesion: 0.13
+Nodes (28): primary_appending_basic(), ExistingPrimaryAppending, Appending, Building, CountPrimaryAppendingScan, InitialIndexValue, PrimaryAppending, PrimaryAppendingTicket (+20 more)
 
 ### Community 781 - "InlineGuard"
 Cohesion: 0.13
 Nodes (13): always_diverts_when_runtime_below_reserve(), diverts_when_permits_exhausted(), grants_when_permits_available(), InlineGuard, AtomicU64, Drop, F, R (+5 more)
 
-### Community 782 - "surrealkv/cnf.rs"
-Cohesion: 0.09
-Nodes (24): default_block_cache_capacity(), default_log_file_size(), default_max_memtable_size(), Config, Default, Duration, Self, SurrealKvConfig (+16 more)
+### Community 782 - "CommitCoordinator"
+Cohesion: 0.15
+Nodes (16): CommitBatcher, CommitCoordinator, Arc, AtomicBool, Condvar, Duration, JoinHandle, Mutex (+8 more)
 
 ### Community 783 - "TrackAlloc<A>"
 Cohesion: 0.17
@@ -4816,9 +5079,9 @@ Nodes (8): Alloc, Cell, GlobalAlloc, Layout, Self, ThreadState, TrackAlloc, Trac
 Cohesion: 0.15
 Nodes (18): ping_with_trace_context(), Request, Option, PublicArray, PublicObject, PublicUuid, PublicValue, Result (+10 more)
 
-### Community 785 - "TokenValue"
-Cohesion: 0.18
-Nodes (16): Sized, surrealdb_types::Number, TokenValue, f32, f64, i64, Numeric, parse_integer() (+8 more)
+### Community 785 - "Parser"
+Cohesion: 0.40
+Nodes (5): parse_integer(), parse_signed_integer(), Parser, ParseResult, Self
 
 ### Community 786 - "AlterFieldStatement"
 Cohesion: 0.16
@@ -4836,21 +5099,17 @@ Nodes (6): canonical_hash(), CanonicalHasher, Hasher, Self, T, Vec
 Cohesion: 0.08
 Nodes (41): Array, BTreeMap<String, Kind>, Object, Set, geo::Coord, geo::LineString, geo::MultiLineString, geo::MultiPoint (+33 more)
 
-### Community 790 - "PrefixedStore<T>"
-Cohesion: 0.29
-Nodes (14): PrefixedStore, PrefixedStore<T>, Box, Bytes, Future, Option, Output, Pin (+6 more)
-
-### Community 791 - "Self"
-Cohesion: 0.22
-Nodes (4): Export<'_, C, R, Config>, Into, Self, TableConfig
+### Community 790 - "AlterTableStatement"
+Cohesion: 0.16
+Nodes (14): AlterTableStatement, AlterKind, ChangeFeed, Default, Expr, FrozenContext, Option, Permissions (+6 more)
 
 ### Community 792 - "surreal_value.rs"
 Cohesion: 0.11
 Nodes (16): cow_from_value_type_mismatch(), Gerald, Datetime, Debug, Deserialize, Duration, PartialEq, RecordId (+8 more)
 
 ### Community 793 - "Community 793"
-Cohesion: 0.06
-Nodes (26): bench(), Big, fill(), random_keys(), Criterion, IC, LC, String (+18 more)
+Cohesion: 0.05
+Nodes (37): bench(), Big, fill(), random_keys(), Criterion, IC, LC, String (+29 more)
 
 ### Community 794 - "wrap.rs"
 Cohesion: 0.16
@@ -4860,25 +5119,21 @@ Nodes (13): Blanket, BlanketOnAComfyEvening, GerardTheValueless, IncompatablePer
 Cohesion: 0.16
 Nodes (17): Building, diskann_knn_after_concurrent_build_should_not_fail(), format_vector(), InfoForIndex, Any, Box, Building, Duration (+9 more)
 
-### Community 796 - "ControlFlow"
-Cohesion: 0.15
-Nodes (16): ControlFlow, ControlFlowExt, FlowResult<Value>, FlowResultExt, Option<T>, Display, Error, F (+8 more)
+### Community 797 - "Actor"
+Cohesion: 0.12
+Nodes (13): Actor, AuthLimit, Default, Deref, Display, Formatter, Level, Resource (+5 more)
 
-### Community 797 - "graphql/cache.rs"
+### Community 798 - "tests/index.rs"
 Cohesion: 0.21
-Nodes (16): compute_schema_fingerprint(), GraphQLSchemaCache, insert_bounded(), insert_bounded_evicts_oldest_first(), insert_bounded_keeps_distinct_prefixes(), insert_bounded_replaces_stale_fingerprint_for_same_prefix(), key(), Arc (+8 more)
+Nodes (24): batch_ingestion(), collect_query(), collect_value_ids(), concurrent_tasks(), diskann_pending_and_compacted_knn(), hnsw_concurrent_writes(), multi_index_concurrent_test(), multi_index_concurrent_test_create_update_delete() (+16 more)
 
-### Community 798 - "StringValue"
-Cohesion: 0.17
-Nodes (11): Display, Formatter, Option, Result, Self, String, StringValue, test_fresh() (+3 more)
-
-### Community 799 - "BodyParser<'a>"
-Cohesion: 0.34
-Nodes (5): BodyParser, BodyParser<'a>, Mime, Option, Result
+### Community 799 - "MaintenanceJobInfo"
+Cohesion: 0.11
+Nodes (6): job_kind_name(), MaintenanceJobInfo, NonZeroUsize, StatusCode, String, SystemTime
 
 ### Community 800 - "rocksdb/mod.rs"
 Cohesion: 0.06
-Nodes (64): KeysBatch, KeysBatch<'c>, KeysIter, KeySpan, KeyValSpan, KeyVisitor, ControlFlow, ExactSizeIterator (+56 more)
+Nodes (62): KeysBatch, KeysBatch<'c>, KeysIter, KeySpan, KeyValSpan, KeyVisitor, ControlFlow, ExactSizeIterator (+54 more)
 
 ### Community 801 - "hash_btree.rs"
 Cohesion: 0.32
@@ -4888,13 +5143,13 @@ Nodes (19): bench_btree(), bench_btree_get(), bench_btree_insert(), bench_hash()
 Cohesion: 0.18
 Nodes (12): AuthLevel, AuthLimit, crate::iam::AuthLimit, crate::iam::Level, Default, From, Level, Option (+4 more)
 
-### Community 803 - "Strategy"
-Cohesion: 0.12
-Nodes (23): key_value_pairs(), Op, operations(), Value, Vec, unique_keys(), Option, Self (+15 more)
+### Community 803 - "FieldDependencyExtractor"
+Cohesion: 0.11
+Nodes (23): closure_incomplete_forces_all(), closure_only_needed(), closure_simple(), ComputedDeps, field_name_from_part(), FieldDependencyExtractor, parse_idiom_root(), resolve_required_computed_fields() (+15 more)
 
-### Community 804 - "JwtAccess"
+### Community 804 - "UserInfoPlan"
 Cohesion: 0.16
-Nodes (8): crate::expr::JwtAccess, JwtAccess, DefineAccessStatement, Duration, JwtAccessIssue, JwtAccessVerify, Option, Value
+Nodes (11): execute_user_info(), Arc, Base, FlowResult, Option, Self, String, Value (+3 more)
 
 ### Community 805 - "live_events.rs"
 Cohesion: 0.22
@@ -4904,17 +5159,17 @@ Nodes (17): build_ds(), Document, gc_collects_events_after_subscribers_leave(), 
 Cohesion: 0.19
 Nodes (15): AxumResponse, invalid_request(), parse_error(), ContentType, Format, HttpFormat, Bytes, ContentType (+7 more)
 
-### Community 807 - "iu.rs"
-Cohesion: 0.19
-Nodes (16): compacted_key(), IndexCountKey, IndexCountKey<'a>, key(), Prefix, Prefix<'a>, range(), Cow (+8 more)
+### Community 807 - "QuarantineId"
+Cohesion: 0.11
+Nodes (11): QuarantinedItem, QuarantineId, QuarantineReader, Display, Formatter, Item, Iterator, Option (+3 more)
 
-### Community 808 - "Rest"
-Cohesion: 0.24
-Nodes (16): Rest, console(), debug(), error(), info(), log(), Printer, Coerced (+8 more)
+### Community 808 - "delta_debugging_bitmap.rs"
+Cohesion: 0.14
+Nodes (14): arb_bitmap_uniform(), DeltaDebuggingBitmapValueTree, initial_current_is_the_full_set(), Into, NewTree, Range, Self, TestRunner (+6 more)
 
 ### Community 809 - "Idiom"
-Cohesion: 0.09
-Nodes (29): field(), Idiom, IdiomTrie, lit_bool(), lit_float(), lit_int(), lit_str(), DeserializeRevisioned (+21 more)
+Cohesion: 0.11
+Nodes (13): Idiom, DeserializeRevisioned, From, FromStr, LengthPrefixedBytes, Revisioned, SerializeRevisioned, SkipRevisioned (+5 more)
 
 ### Community 810 - "direct_io/tests.rs"
 Cohesion: 0.28
@@ -4924,41 +5179,41 @@ Nodes (21): create_new_never_overwrites_existing_file(), direct_file_batch_rejec
 Cohesion: 0.15
 Nodes (15): get_model_path(), Model, FlowResult, FrozenContext, Option, Stk, Strand, String (+7 more)
 
-### Community 812 - "Role"
-Cohesion: 0.13
-Nodes (9): Option, Option, Role, Display, Err, Formatter, FromStr, Result (+1 more)
+### Community 812 - "try_join_all_buffered.rs"
+Cohesion: 0.17
+Nodes (15): BenchFuture, benchmark_try_join_all(), comparison(), F, Future, IntoIter, Item, Output (+7 more)
 
-### Community 813 - "StatementKind"
-Cohesion: 0.03
-Nodes (98): analyze_transaction_statement(), block_mutates_state(), ExecutionMode, parse(), QueryResult, QueryStatementKind, Block, Duration (+90 more)
+### Community 813 - "Block"
+Cohesion: 0.22
+Nodes (15): AssertInvariantsStatement, Block, CatchClause, ForStatement, IfStatement, Parser<'_>, Expr, FerrosGrynnResult (+7 more)
 
 ### Community 814 - "StoreInner"
-Cohesion: 0.06
-Nodes (35): cmd(), Command, in_memory_stores_own_distinct_query_scratch_roots(), maintenance_source_items(), prepare_index_maintenance(), Arc, AtomicU64, AtomicUsize (+27 more)
+Cohesion: 0.05
+Nodes (39): cmd(), Command, RwLock, in_memory_stores_own_distinct_query_scratch_roots(), maintenance_source_items(), prepare_index_maintenance(), Arc, AtomicU64 (+31 more)
 
-### Community 815 - "ContentType"
+### Community 815 - "ControlFlow"
 Cohesion: 0.15
-Nodes (11): ContentType, HeaderValue, Display, E, Error, Formatter, From, Header (+3 more)
+Nodes (16): ControlFlow, ControlFlowExt, FlowResult<Value>, FlowResultExt, Option<T>, Display, Error, F (+8 more)
 
 ### Community 816 - "builtin/type.rs"
 Cohesion: 0.17
 Nodes (11): evaluate_idiom_on_value(), register(), BoxFut, Idiom, Part, Result, Signature, Value (+3 more)
 
-### Community 817 - ".load"
-Cohesion: 0.14
-Nodes (7): AtomicU16, atomic_len_concurrent_writers_readers(), AtomicLen, Debug, Formatter, Option, Result
+### Community 817 - "AtomicLen"
+Cohesion: 0.15
+Nodes (5): AtomicU16, AtomicLen, Debug, Formatter, Result
 
-### Community 818 - "Bind"
-Cohesion: 0.14
-Nodes (11): attrs_report_binding_name(), Bind, binds_each_value_under_name(), preserves_stream_order_and_empty_input(), Arc, FlowResult, Option, Self (+3 more)
+### Community 818 - ".add"
+Cohesion: 0.19
+Nodes (16): atom_prefix(), file_image_preserves_over_aligned_page_bytes(), FileImage, GenerationBindings, graph_prefix(), invalid(), LayoutBuilder, BTreeMap (+8 more)
 
 ### Community 819 - "Fetchs"
 Cohesion: 0.16
 Nodes (12): crate::expr::Fetch, crate::expr::Fetchs, Fetch, Fetchs, Deref, Expr, Fetch, From (+4 more)
 
-### Community 820 - "cli/start.rs"
-Cohesion: 0.24
-Nodes (16): build_observability(), init(), Arc, CancellationToken, Duration, Option, PathBuf, Result (+8 more)
+### Community 820 - "js.rs"
+Cohesion: 0.08
+Nodes (26): init(), Ctx, Result, Query, QueryVariables, Coerced, Ctx, Expr (+18 more)
 
 ### Community 821 - "Parser<'_>"
 Cohesion: 0.33
@@ -4972,17 +5227,17 @@ Nodes (10): Advanced inter-document relations and analysis. No JOINs. No pain., 
 Cohesion: 0.22
 Nodes (11): level_db(), level_ns(), level_root(), permissions_checks_info_db(), permissions_checks_info_ns(), permissions_checks_info_root(), permissions_checks_info_table(), permissions_checks_info_user_db() (+3 more)
 
-### Community 824 - "RpcState"
-Cohesion: 0.05
-Nodes (72): router(), Arc, Data, Extension, HeaderMap, IntoResponse, Schema, State (+64 more)
+### Community 824 - "compute_idiom_recursion"
+Cohesion: 0.18
+Nodes (18): evaluate_recurse_default(), Arc, FlowResult, Value, clean_iteration(), compute_idiom_recursion(), get_final(), is_final() (+10 more)
 
-### Community 825 - "CommitCoordinator"
-Cohesion: 0.14
-Nodes (17): CommitBatcher, CommitCoordinator, Arc, AtomicBool, Condvar, Duration, JoinHandle, Mutex (+9 more)
+### Community 825 - "Result"
+Cohesion: 0.35
+Nodes (7): D, Error, Ok, Result, S, Self, to_deser_error()
 
-### Community 826 - ".from_string"
-Cohesion: 0.22
-Nodes (10): Origin, OriginValue, Display, Formatter, Result, Self, String, test_fresh() (+2 more)
+### Community 826 - "StringValue"
+Cohesion: 0.10
+Nodes (21): Origin, OriginValue, Display, Formatter, Result, Self, String, test_fresh() (+13 more)
 
 ### Community 827 - ".from_string"
 Cohesion: 0.17
@@ -4992,33 +5247,33 @@ Nodes (13): Output, Display, Formatter, Option, Result, Self, String, test_from_
 Cohesion: 0.18
 Nodes (13): ProxyArray, ProxyNumber, ProxyObject, ProxyValue, BTreeMap, Deref, DerefMut, From (+5 more)
 
-### Community 830 - "is_allowed"
-Cohesion: 0.36
-Nodes (8): Error, is_allowed(), is_allowed_check(), is_expired_token_error(), Action, Resource, Result, String
+### Community 830 - "ResolvedNetAllow"
+Cohesion: 0.21
+Nodes (15): parses_ip_and_cidr(), parses_ip_with_port(), resolve_allow_net(), resolve_hostname(), resolve_one(), ResolvedNetAllow, Arc, IpAddr (+7 more)
 
-### Community 831 - "ApiMethod"
-Cohesion: 0.07
-Nodes (32): ApiMethod, Display, Formatter, Result, AlterApiClause, AlterApiStatement, crate::expr::statements::alter::AlterApiClause, crate::expr::statements::alter::AlterApiStatement (+24 more)
+### Community 831 - "minimum_spanning_forest_with_check"
+Cohesion: 0.19
+Nodes (16): binary_edges_with_check(), BinaryEdge, check_candidate(), DisjointSets, minimum_spanning_forest(), minimum_spanning_forest_with_check(), minimum_spanning_tree(), AtomId (+8 more)
 
 ### Community 832 - "execution/tests/select.rs"
-Cohesion: 0.12
-Nodes (32): applies_inner_limits_and_only_to_derived_sources(), composite_index_prefix_and_range_match_scan_results(), dp_and_greedy_join_orders_match_fixed_left_deep_results(), effective_index_matches_graph_scan_and_preserves_ties(), enforces_cursor_limit_and_order_offset_contract(), exact_knn_uses_bounded_top_k_and_stable_ties(), executes_join_group_order_and_derived_source(), executes_split_omit_only_and_scalar_subquery() (+24 more)
+Cohesion: 0.10
+Nodes (34): applies_inner_limits_and_only_to_derived_sources(), composite_index_prefix_and_range_match_scan_results(), dp_and_greedy_join_orders_match_fixed_left_deep_results(), effective_index_matches_graph_scan_and_preserves_ties(), enforces_cursor_limit_and_order_offset_contract(), exact_knn_uses_bounded_top_k_and_stable_ties(), executes_join_group_order_and_derived_source(), executes_split_omit_only_and_scalar_subquery() (+26 more)
 
-### Community 833 - "T"
-Cohesion: 0.16
-Nodes (7): Receiver<'_, T>, FnOnce, R, Self, T, Sender<'a, T>, Watch<T>
+### Community 833 - "headers.rs"
+Cohesion: 0.11
+Nodes (14): fetch(), Ctx, Opt, Response, Result, Value, register(), RequestError (+6 more)
 
 ### Community 834 - "ClosureExpr"
 Cohesion: 0.15
 Nodes (14): ClosureExpr, Expr, FrozenContext, Kind, Option, Ord, Ordering, Param (+6 more)
 
-### Community 835 - "DatabaseRoot"
-Cohesion: 0.14
-Nodes (13): analyzer_exists(), analyzer_missing(), DatabaseRoot, function_exists(), function_missing(), parameter_missing(), BTreeMap, FerrosGrynnError (+5 more)
+### Community 835 - "T"
+Cohesion: 0.16
+Nodes (7): Receiver<'_, T>, FnOnce, R, Self, T, Sender<'a, T>, Watch<T>
 
 ### Community 836 - "traversal.rs"
 Cohesion: 0.09
-Nodes (3): Value, traversal_group_accepts_a_composite_field_key(), traverse()
+Nodes (8): estimate_store(), estimate_value(), k_hop_estimate_private_invalidation_old_snapshot_and_ssi(), k_hop_estimate_rejects_invalid_radii_and_enforces_exact_resource_budgets(), k_hop_estimate_selects_only_compatible_sketches_and_keeps_exact_enumeration(), Datastore, traversal_group_accepts_a_composite_field_key(), traverse()
 
 ### Community 837 - "SelectStatement"
 Cohesion: 0.12
@@ -5032,24 +5287,24 @@ Nodes (14): crate::expr::statements::UpdateStatement, Cond, Data, Default, Expla
 Cohesion: 0.13
 Nodes (14): crate::expr::statements::UpsertStatement, Cond, Data, Default, Explain, Expr, From, Option (+6 more)
 
-### Community 840 - "expected.rs"
-Cohesion: 0.17
-Nodes (13): Parser<'_>, Fields, Limit, Option, Order, Ordering, ParseResult, SelectStatement (+5 more)
+### Community 840 - ".try_parse_orders"
+Cohesion: 0.22
+Nodes (12): Parser<'_>, Fields, Limit, Option, Order, Ordering, ParseResult, SelectStatement (+4 more)
 
-### Community 841 - "UserInfoPlan"
+### Community 841 - "strand.rs"
+Cohesion: 0.06
+Nodes (6): T, test_serialize_deserialize(), bench_strand_cloning(), bench_strand_comparison(), bench_strand_ordering(), Criterion
+
+### Community 842 - "Bind"
 Cohesion: 0.14
-Nodes (11): execute_user_info(), Arc, Base, FlowResult, Option, Self, String, Value (+3 more)
-
-### Community 842 - "resources/schema.rs"
-Cohesion: 0.23
-Nodes (17): database_schema_enriches_backtick_quoted_tables(), database_schema_includes_per_table_fields(), enrich_tables(), fetch_table_schema(), fetch_table_schema_rejects_quote_breaking_names(), get_database_schema(), get_server_info(), get_table_schema() (+9 more)
+Nodes (11): attrs_report_binding_name(), Bind, binds_each_value_under_name(), preserves_stream_order_and_empty_input(), Arc, FlowResult, Option, Self (+3 more)
 
 ### Community 843 - "expr/statements/define/config/mod.rs"
 Cohesion: 0.24
 Nodes (12): ConfigInner, DefineConfigStatement, ApiConfig, ConfigInner, DefaultConfig, DefineKind, FrozenContext, GraphQLConfig (+4 more)
 
 ### Community 844 - "tests/schema.rs"
-Cohesion: 0.20
+Cohesion: 0.15
 Nodes (11): deferred_index_is_stale_inside_mutation_and_never_serves_old_rows(), durable_analyzers_support_inline_mapper_alter_info_and_rollback(), durable_named_function_supports_ddl_overloads_and_calls(), durable_parameters_support_ddl_precedence_and_transaction_rollback(), info_for_index_exposes_deferred_query_visibility(), named_function_arguments_bind_by_declared_name(), named_function_effects_are_transitive_and_deterministic_requires_pure(), named_function_recursion_requires_and_enforces_max_depth() (+3 more)
 
 ### Community 845 - "UpdateStatement"
@@ -5060,49 +5315,49 @@ Nodes (16): Cond, Data, Default, Explain, Expr, FrozenContext, Option, Output (+
 Cohesion: 0.14
 Nodes (34): build_records(), BuilderSample, common_prefix_len(), environment_usize(), full_key_layout(), KeyWorkload, LayoutSample, measure() (+26 more)
 
-### Community 847 - "Http"
-Cohesion: 0.11
-Nodes (24): Header, add_header(), add_server_header(), add_version_header(), parse_typed_header(), Error, H, HeaderName (+16 more)
-
-### Community 848 - "js.rs"
-Cohesion: 0.11
-Nodes (18): init(), Ctx, Result, fetch(), Ctx, Opt, Response, Result (+10 more)
-
-### Community 849 - "Algorithm"
+### Community 847 - "ClosureFieldCallPart"
 Cohesion: 0.15
-Nodes (9): Algorithm, crate::expr::access_type::JwtAccessVerify, crate::expr::Algorithm, JwtAccessVerify, Display, Formatter, JwtAccessVerifyJwks, JwtAccessVerifyKey (+1 more)
+Nodes (9): ClosureFieldCallPart, MethodPart, Any, Arc, BoxFut, FlowResult, String, Value (+1 more)
 
-### Community 850 - "CreateStatement"
+### Community 848 - "DefineApiStatement"
 Cohesion: 0.16
-Nodes (13): CreateStatement, Data, Default, Expr, FrozenContext, Option, Output, Result (+5 more)
+Nodes (14): ApiAction, crate::expr::statements::define::ApiAction, crate::expr::statements::DefineApiStatement, DefineApiStatement, ApiAction, ApiConfig, Default, DefineKind (+6 more)
 
-### Community 851 - "ReclaimKey"
-Cohesion: 0.22
-Nodes (12): database_key_roundtrips(), index_key_roundtrips(), ReclaimKey, ReclaimKey<'key>, ReclaimState, Cow, IndexId, Result (+4 more)
+### Community 849 - "Bg"
+Cohesion: 0.23
+Nodes (14): Bg, Bg<'a>, BgPrefix, BuildGeneration, BuildTicket, BuildTicketMutationSeq, Cow, IndexId (+6 more)
 
-### Community 853 - "src/audit.rs"
+### Community 850 - "module/build.rs"
+Cohesion: 0.29
+Nodes (20): apply_wasm_opt(), build_wasm_module(), extract_exports(), get_source_wasm(), init(), load_config(), metadata(), optimize_component() (+12 more)
+
+### Community 851 - "ready.rs"
+Cohesion: 0.13
+Nodes (18): always_available(), app(), community_readiness(), gate_sets_retry_after_header(), readiness_gate(), ready_handler(), router(), Arc (+10 more)
+
+### Community 853 - "NeighbourhoodLayout"
 Cohesion: 0.20
-Nodes (16): classifies_multi_statement_first_error_kind(), classifies_protocol_error(), classifies_success(), classifies_tool_error_and_extracts_kind(), classify(), error_code_label(), extract_kind(), Outcome (+8 more)
+Nodes (14): invalid(), NeighbourhoodHeader, NeighbourhoodLayout, NeighbourhoodTag, number(), Check, Element, FerrosGrynnError (+6 more)
 
-### Community 854 - "Actor"
-Cohesion: 0.17
-Nodes (10): Actor, AuthLimit, Default, Display, Level, Resource, Self, String (+2 more)
-
-### Community 855 - "binaries.rs"
-Cohesion: 0.08
-Nodes (32): DsVersion, parse(), ResultsMode, ArgMatches, D, Display, Error, Formatter (+24 more)
-
-### Community 856 - "Ib"
+### Community 854 - "PropertyBatch"
 Cohesion: 0.22
-Nodes (10): Ib, Ib<'a>, ib_range(), Cow, IndexId, Range, Result, Self (+2 more)
+Nodes (10): BooleanBuffer, imported_arrow_batch_requires_property_metadata(), PropertyBatch, BTreeMap, FerrosGrynnResult, Option, RecordBatch, Self (+2 more)
+
+### Community 855 - "provisioner.rs"
+Cohesion: 0.11
+Nodes (28): CanReuse, create_grade_ds(), CreateInfo, Ds, is_base_environment(), Permit, PermitInner, Provisioner (+20 more)
+
+### Community 856 - "TableInfoPlan"
+Cohesion: 0.13
+Nodes (12): execute_table_info(), process(), Arc, FlowResult, Option, Self, String, T (+4 more)
 
 ### Community 857 - "transaction/tests.rs"
-Cohesion: 0.15
-Nodes (27): atom_snapshot_keeps_its_immutable_payload_after_a_private_update(), base_and_overlay_writes_are_independent_conflict_targets(), commit_rechecks_memberships_added_after_base_preflight(), commit_rejects_a_direct_rust_mutation_that_breaks_simple(), commit_rejects_direct_rust_family_and_root_violations(), concurrent_create_of_the_same_record_still_conflicts(), disjoint_graph_memberships_rebase_snapshot_local_slots(), fanout_limit_fails_before_private_state_changes() (+19 more)
+Cohesion: 0.14
+Nodes (26): atom_snapshot_keeps_its_immutable_payload_after_a_private_update(), base_and_overlay_writes_are_independent_conflict_targets(), commit_rechecks_memberships_added_after_base_preflight(), commit_rejects_a_direct_rust_mutation_that_breaks_simple(), commit_rejects_direct_rust_family_and_root_violations(), concurrent_create_of_the_same_record_still_conflicts(), disjoint_graph_memberships_rebase_snapshot_local_slots(), fanout_limit_fails_before_private_state_changes() (+18 more)
 
 ### Community 858 - "full_plan.md"
-Cohesion: 0.10
-Nodes (5): 1. Реализованный срез, 2. Correctness evidence, 3. Performance evidence, 4. Что остаётся до закрытия F10–F11, Отчёт по этапу 22: durable analyzers и Fulltext
+Cohesion: 0.07
+Nodes (10): Gates, Контракт, Порядок и условия готовности, Этап 25 — производные графовые индексы, 1. Версии и совместимость, 2. Общие инварианты, 3. Замороженные core codecs, 4. Решение `Q-20`: B+tree keys (+2 more)
 
 ### Community 859 - "report/update.rs"
 Cohesion: 0.23
@@ -5116,25 +5371,25 @@ Nodes (8): FlatBufferBuilder, Input, Output, Result, Self, test_flatbuffers_roun
 Cohesion: 0.27
 Nodes (10): build_metadata(), build_version(), Command, CommandExt, git(), main(), Command, Option (+2 more)
 
-### Community 862 - "graph/traversal/mod.rs"
-Cohesion: 0.14
-Nodes (15): check_candidate(), CutFrame, CutSet, find_cuts(), find_cuts_with_check(), AtomId, Box, Check (+7 more)
+### Community 862 - "signals.rs"
+Cohesion: 0.36
+Nodes (9): graceful_shutdown(), listen(), Arc, CancellationToken, Handle, JoinHandle, Result, SocketAddr (+1 more)
 
 ### Community 863 - ".parse_ref"
 Cohesion: 0.16
 Nodes (12): CredentialsLevelParser, Arg, Box, Command, Error, Item, Option, OsStr (+4 more)
 
-### Community 864 - "ErrorValue"
-Cohesion: 0.17
-Nodes (5): ErrorValue, FerrosGrynnError, Self, String, Vec
+### Community 864 - "Fs"
+Cohesion: 0.15
+Nodes (11): FormatCommandArguments, init(), parse_line(), parse_single_line_comment(), ParsedLine, Lexer, ParseResult, Result (+3 more)
 
-### Community 865 - "fnc/http.rs"
-Cohesion: 0.46
-Nodes (14): delete(), get(), head(), patch(), post(), put(), FrozenContext, Object (+6 more)
+### Community 865 - "ControlFlowExpr"
+Cohesion: 0.12
+Nodes (12): ControlFlowExpr, ControlFlowKind, Any, Arc, BoxFut, Display, FlowResult, Formatter (+4 more)
 
-### Community 866 - "expr/statements/alter/sequence.rs"
-Cohesion: 0.20
-Nodes (10): AlterSequenceStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+2 more)
+### Community 866 - "Position"
+Cohesion: 0.07
+Nodes (41): Err, GeoJsonGeometry, GeoJsonPosition, assert_status(), checks_directly_constructed_values_and_depth_before_kernels(), compare_float_slices(), convert_geojson(), empty_geometries_have_no_mbr_and_geodesic_distance_is_in_metres() (+33 more)
 
 ### Community 867 - "server/src/graphql/mod.rs"
 Cohesion: 0.18
@@ -5160,13 +5415,13 @@ Nodes (13): crate::expr::statements::DeleteStatement, DeleteStatement, Cond, Def
 Cohesion: 0.17
 Nodes (12): crate::expr::statements::LiveFields, crate::expr::statements::LiveStatement, LiveFields, LiveStatement, Cond, Expr, Fetchs, Fields (+4 more)
 
-### Community 873 - "Permissions"
-Cohesion: 0.16
-Nodes (10): crate::catalog::Permission, crate::catalog::Permissions, Permission, PermissionKind, Permissions, Expr, From, Permission (+2 more)
+### Community 873 - "Relation"
+Cohesion: 0.20
+Nodes (11): Relation, Error, Kind, Option, R, Result, Self, TableName (+3 more)
 
 ### Community 874 - "expr/kind.rs"
-Cohesion: 0.10
-Nodes (12): collect(), collect_either_union_and_containers(), collect_mixed_typed_and_untyped_is_unbounded(), collect_non_record_is_empty(), collect_typed_record(), collect_untyped_record_is_unbounded(), Decimal, Hash (+4 more)
+Cohesion: 0.12
+Nodes (9): collect(), collect_either_union_and_containers(), collect_mixed_typed_and_untyped_is_unbounded(), collect_non_record_is_empty(), collect_typed_record(), collect_untyped_record_is_unbounded(), HashSet, TableName (+1 more)
 
 ### Community 875 - "prompts/mod.rs"
 Cohesion: 0.13
@@ -5180,9 +5435,9 @@ Nodes (17): collect_name(), collect_org(), dir_name_sanitized(), init(), resolve
 Cohesion: 0.14
 Nodes (15): DeleteStatement, Cond, Default, Explain, Expr, FrozenContext, Option, Output (+7 more)
 
-### Community 879 - ".compute"
-Cohesion: 0.20
-Nodes (11): DefineBucketStatement, Default, DefineKind, Expr, FrozenContext, Option, Permission, Result (+3 more)
+### Community 879 - "Dp"
+Cohesion: 0.15
+Nodes (14): Dp, Dp<'a>, pending_state_key_is_outside_dr_range(), Cow, IndexId, Self, TableName, Dy (+6 more)
 
 ### Community 880 - "SurrealDB Types"
 Cohesion: 0.11
@@ -5200,17 +5455,17 @@ Nodes (14): RawWaker, find_frame(), get_waker_data(), F, Item, NonNull, Option, 
 Cohesion: 0.12
 Nodes (13): HeaderValue, Deref, E, Error, From, Header, HeaderName, HeaderValue (+5 more)
 
-### Community 884 - "ResolvedNetAllow"
-Cohesion: 0.21
-Nodes (15): parses_ip_and_cidr(), parses_ip_with_port(), resolve_allow_net(), resolve_hostname(), resolve_one(), ResolvedNetAllow, Arc, IpAddr (+7 more)
+### Community 884 - "Result"
+Cohesion: 0.19
+Nodes (9): Chain, Option<T>, Result<T, E>, E, F, Formatter, Infallible, Result (+1 more)
 
 ### Community 885 - "Phase 2-5 implementation guide"
 Cohesion: 0.12
 Nodes (16): API decision: `OptimisticRead` gains `type Slot`, Current state (end of working session), Estimated effort, `find_shared_leaf_and_optimistic_parent` migration (Phase 4), InternalNode struct change, LeafNode struct change, Method rewrites per node type, Moving quarantined tests into `--lib` (+8 more)
 
-### Community 886 - "Operation"
-Cohesion: 0.21
-Nodes (14): Operation, PatchError, reject_root_from(), round_trip_all_variants(), round_trip_root_path(), roundtrip(), Display, Formatter (+6 more)
+### Community 886 - ".import_at"
+Cohesion: 0.14
+Nodes (13): NonZeroU8, Run, ImportLease, ImportOptions, ImportViolationPolicy, Arc, Default, Drop (+5 more)
 
 ### Community 887 - "exact_vector_distance"
 Cohesion: 0.26
@@ -5220,17 +5475,17 @@ Nodes (17): builtin_distances_cover_supported_kinds_and_dimensions(), component(
 Cohesion: 0.12
 Nodes (16): Architecture, Core Traits, Design Rules, Entry Points, exec/ — Streaming Query Execution Engine, `function/` — Function System, `index/` — Index Support, Key Types (+8 more)
 
-### Community 889 - "Data"
-Cohesion: 0.21
-Nodes (11): Assignment, crate::expr::Data, crate::expr::data::Assignment, Data, Assignment, AssignOperator, Expr, From (+3 more)
+### Community 889 - "Permissions"
+Cohesion: 0.05
+Nodes (39): CoverStmts, Expr, Assignment, crate::expr::Data, crate::expr::data::Assignment, Data, Assignment, AssignOperator (+31 more)
 
 ### Community 890 - "Этапы 15–16. Полный StandardPath MATCH и graph-first AtomWalk/nested MATCH"
 Cohesion: 0.10
 Nodes (21): 1. Результат, 2.1. Канонический синтаксис, 2.2. Bindings и ограничения позиций, 2.3. OPTIONAL и DISTINCT, 2.4. Variable paths и constraints, 2.5. Shortest paths, 2.6. Path values, 2. Нормативный контракт (+13 more)
 
-### Community 891 - "builtin/http.rs"
-Cohesion: 0.48
-Nodes (17): extract_body(), extract_opts(), extract_uri(), http_delete_impl(), http_disabled(), http_get_impl(), http_head_impl(), http_patch_impl() (+9 more)
+### Community 891 - "tests/audit.rs"
+Cohesion: 0.19
+Nodes (22): body_to_string(), complete_handshake(), credential_mismatch_emits_audit_record(), db_user_session(), initialize(), owner_session(), post_request(), Arc (+14 more)
 
 ### Community 892 - "DefineFunctionStatement"
 Cohesion: 0.18
@@ -5248,9 +5503,9 @@ Nodes (15): Dialect, gql(), prepare(), Auth, Block, Capabilities, FrozenContext,
 Cohesion: 0.16
 Nodes (10): NumberKind, NumberSuffix, Display, Formatter, Keyword, Option, Result, Span (+2 more)
 
-### Community 896 - "rocksdb/tests.rs"
-Cohesion: 0.14
-Nodes (18): CommunityComposer, cancel_blocks_until_live_cursor_drops(), commit_blocks_until_live_cursor_drops(), concurrent_cursors_do_not_evict(), concurrent_cursors_on_writable_tx(), cursor_drop_releases_slot(), memtable_merge_count_clamp_inner(), memtable_merge_count_clamp_non_versioned() (+10 more)
+### Community 896 - "T"
+Cohesion: 0.18
+Nodes (7): Handle, Handle<'a, T>, Metadata, Handle, Self, T, SIV
 
 ### Community 897 - "comparator.rs"
 Cohesion: 0.20
@@ -5261,16 +5516,16 @@ Cohesion: 0.17
 Nodes (14): GarbageCollector, Arc, AtomicBool, Condvar, Duration, JoinHandle, Mutex, OptimisticTransactionDB (+6 more)
 
 ### Community 899 - "Group"
-Cohesion: 0.20
-Nodes (10): crate::expr::Group, crate::expr::Groups, Group, Groups, From, Group, Idiom, Self (+2 more)
-
-### Community 900 - "FieldPart"
-Cohesion: 0.18
-Nodes (9): evaluate_field(), FieldPart, Any, BoxFut, FlowResult, Option, String, Value (+1 more)
-
-### Community 901 - "RecursionOp"
 Cohesion: 0.08
-Nodes (19): RecursionOp, Arc, FlowResult, Option, Self, String, ValueBatchStream, Vec (+11 more)
+Nodes (20): crate::expr::Explain, Explain, From, Self, String, crate::expr::Group, crate::expr::Groups, Group (+12 more)
+
+### Community 900 - "FerrosGrynnResult"
+Cohesion: 0.12
+Nodes (27): charge(), check_geojson_bounds(), check_rings(), check_structure(), coordinate(), Geometry, invalid(), line() (+19 more)
+
+### Community 901 - "CustomFilter"
+Cohesion: 0.09
+Nodes (27): LogFormat, CustomFilter, Clone, EnvFilter, Fn, LevelFilter, Metadata, S (+19 more)
 
 ### Community 902 - "BinaryLiftingIndex"
 Cohesion: 0.20
@@ -5280,9 +5535,9 @@ Nodes (12): BinaryLiftingIndex, AtomId, Box, FerrosGrynnResult, FnMut, Option, R
 Cohesion: 0.17
 Nodes (12): find_suggestion(), levenshtein(), Parser<'_>, PathKind, Constant, Expr, FunctionCall, Option (+4 more)
 
-### Community 904 - "Bytes"
-Cohesion: 0.21
-Nodes (10): Bytes, bytes::Bytes, Deref, From, Self, String, Target, Vec (+2 more)
+### Community 904 - "unsafed/memory.rs"
+Cohesion: 0.12
+Nodes (8): allocate_memory(), compare_and_swap_i64(), compare_and_swap_u64(), get_and_add_i64(), get_and_set_i64(), AtomicI64, AtomicU64, Result
 
 ### Community 905 - "each.rs"
 Cohesion: 0.12
@@ -5292,41 +5547,37 @@ Nodes (4): Idiom, Part, Vec, Value
 Cohesion: 0.20
 Nodes (16): cast_chain(), excessive_cast_chain_depth(), ok_cast_chain_depth(), ok_graph_traversal_depth(), DoubleEndedIterator, ExactSizeIterator, Item, Result (+8 more)
 
-### Community 907 - "invoke"
-Cohesion: 0.23
-Nodes (13): invoke(), Box, Closure, Duration, FrozenContext, Option, Result, Stk (+5 more)
+### Community 907 - "SurrealAuthNamespace"
+Cohesion: 0.12
+Nodes (13): HeaderValue, Deref, E, Error, From, Header, HeaderName, HeaderValue (+5 more)
 
-### Community 908 - "DefineParamStatement"
-Cohesion: 0.22
-Nodes (9): crate::expr::statements::DefineParamStatement, DefineParamStatement, DefineKind, Expr, From, Permission, Self, Strand (+1 more)
+### Community 908 - "builtin/http.rs"
+Cohesion: 0.48
+Nodes (17): extract_body(), extract_opts(), extract_uri(), http_delete_impl(), http_disabled(), http_get_impl(), http_head_impl(), http_patch_impl() (+9 more)
 
 ### Community 909 - "Endpoint"
-Cohesion: 0.06
-Nodes (44): CoreReceiver, Any, connect(), __into_endpoint(), IntoEndpoint, local_engine_with_auth(), local_engine_without_auth(), Result (+36 more)
+Cohesion: 0.05
+Nodes (54): Any, connect(), __into_endpoint(), IntoEndpoint, local_engine_with_auth(), local_engine_without_auth(), Result, Sealed (+46 more)
 
 ### Community 910 - "BoxedSlot<T>"
-Cohesion: 0.12
-Nodes (12): AtomicLoadable, BoxedSlot, BoxedSlot<T>, OptimisticSlot, AtomicPtr, Box, Copy, Default (+4 more)
-
-### Community 911 - "CardinalityHint"
-Cohesion: 0.03
-Nodes (64): buffer_stream(), prefetch_buffered(), PrefetchStream, Drop, FlowResult, Item, JoinHandle, Option (+56 more)
+Cohesion: 0.20
+Nodes (9): AtomicLoadable, BoxedSlot<T>, OptimisticSlot, Copy, Default, Send, Sized, Sync (+1 more)
 
 ### Community 912 - "expr/statements/define/database.rs"
 Cohesion: 0.21
 Nodes (11): DefineDatabaseStatement, ChangeFeed, Default, DefineKind, Expr, FrozenContext, Option, Result (+3 more)
 
 ### Community 913 - "GraphSuperblock"
-Cohesion: 0.08
-Nodes (43): GraphFileSet, backfill_graph_checkpoint(), GraphCheckpointAuthority, invalid(), FerrosGrynnError, FerrosGrynnResult, FrameWal, Into (+35 more)
+Cohesion: 0.19
+Nodes (14): exact_layout_round_trips(), fixture(), GraphSuperblock, invalid(), read_u32(), read_u64(), rejects_zero_space_reserved_bytes_and_invalid_ceilings(), FerrosGrynnError (+6 more)
 
 ### Community 914 - "fnc/session.rs"
 Cohesion: 0.53
 Nodes (11): ac(), db(), id(), ip(), ns(), origin(), rd(), FrozenContext (+3 more)
 
-### Community 915 - "VersionScope"
-Cohesion: 0.12
-Nodes (8): Arc, FlowResult, Option, Self, String, ValueBatchStream, Vec, VersionScope
+### Community 915 - "IndexCountScan"
+Cohesion: 0.13
+Nodes (18): count_btree_index_keys(), count_with_filter_fallback(), IndexCountScan, make_count_batch(), Arc, Cond, ControlFlow, FlowResult (+10 more)
 
 ### Community 916 - ".from_string"
 Cohesion: 0.18
@@ -5340,29 +5591,25 @@ Nodes (12): This file trains and saves the sklearn linear model to the model sta
 Cohesion: 0.23
 Nodes (4): DatabaseOptions, Default, Duration, Self
 
-### Community 919 - "race_stress.rs"
-Cohesion: 0.17
-Nodes (7): make_value(), prefix_key(), prefix_range(), Vec, t1_reverse_scan_under_merge_heavy_churn_emits_only_in_range(), t2_boxed_v_lookup_optimistic_never_sees_torn_snapshot(), verify_value()
+### Community 919 - "resources/schema.rs"
+Cohesion: 0.23
+Nodes (17): database_schema_enriches_backtick_quoted_tables(), database_schema_includes_per_table_fields(), enrich_tables(), fetch_table_schema(), fetch_table_schema_rejects_quote_breaking_names(), get_database_schema(), get_server_info(), get_table_schema() (+9 more)
 
-### Community 920 - ".poll_next_before"
+### Community 920 - "ImmutableStreamWriter<'a>"
+Cohesion: 0.19
+Nodes (10): ImmutableStreamWriter, ImmutableStreamWriter<'a>, invalid(), Box, FerrosGrynnError, FerrosGrynnResult, Into, PageType (+2 more)
+
+### Community 921 - "FieldPart"
 Cohesion: 0.18
-Nodes (15): join_mutiple(), join_one_slow(), JoinMultiple, JoinMultiple<C>, JoinMultiplePin, JoinMultiplePin<C>, Message, poll_multiple_step() (+7 more)
-
-### Community 921 - "Этап 21. Durable PARAM, именованные UDF и оставшийся язык"
-Cohesion: 0.33
-Nodes (6): 1. Durable schema, 2. Analysis и execution, 3. Runtime language, 4. Порядок реализации, 5. Gate, Этап 21. Durable PARAM, именованные UDF и оставшийся язык
+Nodes (9): evaluate_field(), FieldPart, Any, BoxFut, FlowResult, Option, String, Value (+1 more)
 
 ### Community 922 - "obs/mod.rs"
 Cohesion: 0.24
 Nodes (15): BoxStream, del(), get(), hash(), initialize_store(), put(), Arc, Bytes (+7 more)
 
-### Community 923 - "Id"
-Cohesion: 0.20
-Nodes (7): Id, Copy, Option, Self, Sized, u32, usize
-
-### Community 924 - "View"
-Cohesion: 0.17
-Nodes (11): crate::expr::View, Cond, Fields, From, Groups, Option, Self, String (+3 more)
+### Community 923 - "BackgroundFlusher"
+Cohesion: 0.15
+Nodes (14): BackgroundFlusher, Arc, AtomicBool, Condvar, Duration, JoinHandle, Mutex, OptimisticTransactionDB (+6 more)
 
 ### Community 925 - "VectorId"
 Cohesion: 0.10
@@ -5372,21 +5619,21 @@ Nodes (24): DiskAnnTruthyDocumentFilter, DiskAnnTruthyDocumentFilter<'a>, Arc, C
 Cohesion: 0.21
 Nodes (14): DiskAnnRecordPendingShard, DiskAnnRecordPendingShard<'a>, DiskAnnRecordPendingShardPrefix, DiskAnnRecordPendingShardPrefix<'a>, key(), Cow, IndexId, Key (+6 more)
 
-### Community 927 - "Di"
-Cohesion: 0.18
-Nodes (9): Di, Di<'a>, Cow, IndexId, RecordIdKey, Result, Self, TableName (+1 more)
+### Community 927 - "add_auth_mutations"
+Cohesion: 0.36
+Nodes (8): add_auth_mutations(), build_public_variables(), Arc, Datastore, IndexMap, Object, PublicVariables, Result
 
-### Community 928 - "LiveQueryRouter"
-Cohesion: 0.22
-Nodes (8): LiveQueryRouter, process(), Datastore, Mutex, Option, Result, Self, Event
+### Community 928 - "DiagnosticValue"
+Cohesion: 0.14
+Nodes (11): bool, DiagnosticValue, f32, f64, BTreeMap, String, StatusParameter, str (+3 more)
 
-### Community 929 - "finish_histograms"
-Cohesion: 0.22
-Nodes (15): finish_histograms(), HistogramBuilder, HistogramInput, HistogramOutput, invalid(), BTreeMap, FerrosGrynnError, FerrosGrynnResult (+7 more)
+### Community 929 - "ReachabilityLayout"
+Cohesion: 0.25
+Nodes (11): invalid(), number(), ReachabilityHeader, ReachabilityLayout, ReachabilityTag, FerrosGrynnError, FerrosGrynnResult, FnMut (+3 more)
 
-### Community 930 - "AsynkStrim"
-Cohesion: 0.18
-Nodes (12): AsynkStrim, AsynkStrim<F, Fut, Yieldr, Item>, init(), F, Fut, Item, Option, PhantomData (+4 more)
+### Community 930 - ".parse_inner_kind"
+Cohesion: 0.34
+Nodes (8): kind(), Parser<'_>, GeometryKind, Kind, ParseResult, Span, Stk, test_kind()
 
 ### Community 931 - "SetStatement"
 Cohesion: 0.17
@@ -5396,9 +5643,9 @@ Nodes (10): Expr, FlowResult, FrozenContext, Kind, Option, Stk, Strand, String (
 Cohesion: 0.17
 Nodes (16): decode(), encode(), Bytes, Result, String, Value, test_base64_decode_no_pad(), test_base64_decode_with_pad() (+8 more)
 
-### Community 933 - "providers.rs"
-Cohesion: 0.20
-Nodes (11): AlterConfigStatement, AlterKind, ConfigInner, Default, FrozenContext, Option, Result, Self (+3 more)
+### Community 933 - "cmd/graphql.rs"
+Cohesion: 0.21
+Nodes (16): build_request(), case_source(), generate_schema(), graphql_value_to_value(), request_variables(), response_to_result(), Arc, Datastore (+8 more)
 
 ### Community 934 - "Sprintable"
 Cohesion: 0.17
@@ -5416,17 +5663,17 @@ Nodes (13): BackgroundFlusher, Arc, AtomicBool, Condvar, Duration, JoinHandle, M
 Cohesion: 0.17
 Nodes (9): Algorithm, crate::expr::Algorithm, jsonwebtoken::Algorithm, Display, Formatter, From, Result, Self (+1 more)
 
-### Community 938 - "MajorVersion"
-Cohesion: 0.16
-Nodes (10): version_1(), version_3(), MajorVersion, From, Option, Result, Self, Vec (+2 more)
+### Community 938 - "idiom/mod.rs"
+Cohesion: 0.22
+Nodes (12): field(), IdiomTrie, IdiomTrie<T>, IdiomTrieContains, lit_bool(), lit_float(), lit_int(), lit_str() (+4 more)
 
 ### Community 939 - "gql_graph_result_stage_18_probe"
 Cohesion: 0.35
 Nodes (15): artifact_file(), assert_counts(), build_graph(), copy_graph(), env_usize(), fixture(), gql_graph_result_stage_18_probe(), process_memory() (+7 more)
 
-### Community 940 - "Bg"
-Cohesion: 0.23
-Nodes (14): Bg, Bg<'a>, BgPrefix, BuildGeneration, BuildTicket, BuildTicketMutationSeq, Cow, IndexId (+6 more)
+### Community 940 - "ResponseError"
+Cohesion: 0.04
+Nodes (70): ApiHandlerError, Error, ErrorMessage, ResponseError, E, From, HeaderName, IntoResponse (+62 more)
 
 ### Community 941 - "ConfigInner"
 Cohesion: 0.19
@@ -5456,9 +5703,9 @@ Nodes (6): Lexer<'_>, Result, Span, SyntaxError, Token, Vec
 Cohesion: 0.28
 Nodes (8): Lexer<'_>, PublicBytes, PublicFile, PublicUuid, Result, Span, SyntaxError, Vec
 
-### Community 948 - "ReadableStream"
-Cohesion: 0.20
-Nodes (14): ReadableStream, ReadableStream<R>, Box, Future, Item, Option, Output, Pin (+6 more)
+### Community 948 - "Bytes"
+Cohesion: 0.21
+Nodes (10): Bytes, bytes::Bytes, Deref, From, Self, String, Target, Vec (+2 more)
 
 ### Community 949 - ".put"
 Cohesion: 0.23
@@ -5472,21 +5719,21 @@ Nodes (14): database_template_parses(), list_resource_templates(), list_resource
 Cohesion: 0.26
 Nodes (9): CredentialsBuilder, Error, Database, Into, Option, Result, Root, Self (+1 more)
 
-### Community 952 - "serde_wrapper_roundtrip.rs"
-Cohesion: 0.21
-Nodes (9): deserialize_any_handles_native_datetime_in_untagged_enum(), DateTime, String, Utc, UntaggedEvent, utc_ts(), wrapper_hashmap_types_use_native_variants_and_roundtrip(), wrapper_upstream_container_types_use_native_variants_and_roundtrip() (+1 more)
+### Community 952 - "SurrealId"
+Cohesion: 0.12
+Nodes (13): HeaderValue, Deref, E, Error, From, Header, HeaderName, HeaderValue (+5 more)
 
-### Community 953 - ".parse_ref"
-Cohesion: 0.16
-Nodes (12): CustomFilterParser, Arg, Box, Command, Error, Item, Option, OsStr (+4 more)
+### Community 953 - "tracing.rs"
+Cohesion: 0.08
+Nodes (25): CustomFilterParser, Arg, Box, Command, Error, Item, Option, OsStr (+17 more)
 
-### Community 954 - "Giver"
+### Community 954 - "DiskAnnRecordPending"
 Cohesion: 0.20
-Nodes (7): Closed, Giver, Arc, Debug, Future, SharedGiver, Want
+Nodes (12): DiskAnnRecordPending, DiskAnnRecordPending<'a>, DiskAnnRecordPendingPrefix, DiskAnnRecordPendingPrefix<'a>, Cow, IndexId, Key, Range (+4 more)
 
-### Community 955 - "DynamicConfiguration"
+### Community 955 - ".compute"
 Cohesion: 0.21
-Nodes (8): DynamicConfiguration, Inner, Arc, AtomicU64, Duration, Inner, Option, Value
+Nodes (14): extract_table_and_rid_key(), InsertStatement, iterable(), Data, Expr, FrozenContext, Option, Output (+6 more)
 
 ### Community 956 - "Merge"
 Cohesion: 0.17
@@ -5506,7 +5753,7 @@ Nodes (10): (), Args, Error, Kind, Result, Self, Sized, Value (+2 more)
 
 ### Community 960 - "Mapper"
 Cohesion: 0.15
-Nodes (19): check_is_path_allowed(), extract_allowed_paths(), Path, PathBuf, Result, Vec, test_allow_list_access(), test_empty_allow_list_denies_access() (+11 more)
+Nodes (16): Mapper, Arc, Path, PathBuf, Result, Self, String, Tree (+8 more)
 
 ### Community 961 - "SurMlFile"
 Cohesion: 0.35
@@ -5528,9 +5775,9 @@ Nodes (9): CompressedReader, CompressedWriter, Box, R, Read, Result, Self, W (+1
 Cohesion: 0.27
 Nodes (13): deeply_nested_surrealdb_style_keys(), delete_every_other_forces_leaf_merges(), delete_majority_then_reinsert_different_keys(), long_shared_prefix_small_suffix(), multiple_prefix_groups_isolated_scans(), pkey(), prefix_end(), random_order_insert_with_shared_prefix() (+5 more)
 
-### Community 966 - "walk.rs"
-Cohesion: 0.12
-Nodes (5): Idiom, Part, Self, Vec, Value
+### Community 966 - "Role"
+Cohesion: 0.13
+Nodes (9): Option, Option, Role, Display, Err, Formatter, FromStr, Result (+1 more)
 
 ### Community 967 - "Отчёт по этапу 20: durable maintenance и admin surface"
 Cohesion: 0.20
@@ -5544,61 +5791,61 @@ Nodes (18): analyze(), emit(), emit_resource(), env_usize(), execute(), gql_matc
 Cohesion: 0.13
 Nodes (14): 0. Pinned semantic rules (normative), 10. Relational convergence (future Postgres), 1. Division of labor (the IR contract), 2. The IR — new `surrealdb/core/src/expr/match_plan.rs`, 3. Binding rows, 4. W0 — FieldState-aware fetch helper (CRITICAL, lands first), 5. Operators — `surrealdb/core/src/exec/operators/`, 6. Planner — `exec/planner/match_plan.rs` (+ dispatch arm in planner.rs) (+6 more)
 
-### Community 970 - "mock"
-Cohesion: 0.03
-Nodes (117): mock(), FrozenContext, BenchFuture, benchmark_try_join_all(), comparison(), F, Future, IntoIter (+109 more)
+### Community 970 - "rpc/protocol.rs"
+Cohesion: 0.15
+Nodes (16): method_to_auth_action(), QueryForm, RpcProtocol, Ast, Expr, Option, PublicValue, PublicVariables (+8 more)
 
-### Community 971 - ".compute"
-Cohesion: 0.19
-Nodes (9): RecordIdLit, FlowResult, FrozenContext, Option, RecordId, RecordIdKeyLit, Stk, String (+1 more)
+### Community 971 - "Kind"
+Cohesion: 0.16
+Nodes (11): Kind, Box, Display, Formatter, GeometryKind, KindLiteral, Option, Result (+3 more)
 
 ### Community 972 - "AtomicPageGuard"
 Cohesion: 0.16
 Nodes (9): AtomicEpochPage, AtomicPageGuard, AtomicReadEpoch, AtomicArenaBufferPool, AtomicEpochPage, Drop, FrameLocator, Option (+1 more)
 
 ### Community 973 - "Timestamp"
-Cohesion: 0.10
-Nodes (14): Node, Display, Duration, Formatter, From, Option, Output, Result (+6 more)
+Cohesion: 0.08
+Nodes (18): Node, Display, Duration, Formatter, From, Option, Output, Result (+10 more)
 
 ### Community 974 - "graphql/naming.rs"
 Cohesion: 0.21
 Nodes (17): description_with_deprecation(), field_base_name(), field_graphql_name(), get_field_name(), idiom_to_default_name(), list_field_name(), mutation_cap_name(), mutation_cap_plural_name() (+9 more)
 
-### Community 975 - "cmd/graphql.rs"
-Cohesion: 0.21
-Nodes (16): build_request(), case_source(), generate_schema(), graphql_value_to_value(), request_variables(), response_to_result(), Arc, Datastore (+8 more)
+### Community 975 - "IterKey"
+Cohesion: 0.12
+Nodes (6): GroupBy<S, F>, IterKey, OwnedValueRef<'a, Detached>, Borrow, Deref, Target
 
-### Community 976 - "ApiInvoke"
+### Community 976 - "cli/sql.rs"
 Cohesion: 0.21
-Nodes (7): ApiInvoke, register(), BoxFut, Result, Signature, Value, Vec
+Nodes (15): filter_line_continuations(), init(), InputValidator, pretty_print_json(), print(), process(), DatabaseConnectionArguments, JsonValue (+7 more)
 
 ### Community 977 - "Аналитический отчёт по этапу 1.6"
 Cohesion: 0.17
 Nodes (12): 10. Что позаимствовать из `surrealmx`, 11. Что позаимствовать из `ferntree`, 12. Топологически упорядоченные рекомендации, 1. Результат и метод, 2. Локальные `AGENTS.md`, 5. `logos` и lexer, 6. `VecMap` и `VecSet`, 7. Top-level statements и macro AST (+4 more)
 
-### Community 978 - "execute_graph_property_update"
-Cohesion: 0.28
-Nodes (17): evaluate_graph_properties(), execute_graph_property_update(), graph_row(), intern_object_keys(), object_to_property_map(), property_map_to_object(), Box, FerrosGrynnResult (+9 more)
+### Community 978 - "ArraySection"
+Cohesion: 0.24
+Nodes (9): ArraySection, Check, Element, FerrosGrynnResult, Read, Self, Vec, Visit (+1 more)
 
-### Community 979 - "collect_dml_candidates"
-Cohesion: 0.09
-Nodes (58): apply_dml_candidate(), apply_dml_data(), collect_dml_candidates(), create_dml_atom(), dml_diff(), dml_property_map(), dml_return_value(), DmlCandidate (+50 more)
+### Community 979 - "DestructurePart"
+Cohesion: 0.18
+Nodes (11): DestructureField, DestructurePart, evaluate_destructure(), Any, Arc, BoxFut, FlowResult, Strand (+3 more)
 
 ### Community 980 - "IfelseStatement"
 Cohesion: 0.17
 Nodes (9): IfelseStatement, Expr, FlowResult, FrozenContext, Option, Stk, String, Value (+1 more)
 
-### Community 981 - "tb.rs"
-Cohesion: 0.26
-Nodes (11): key(), new(), prefix(), Cow, Result, Self, TableName, Vec (+3 more)
+### Community 981 - "lookup"
+Cohesion: 0.27
+Nodes (18): buffered(), decode_header(), encode_header(), endpoint_pages_distinguish_scopes_and_check_metadata_and_reserved_keys(), EndpointHeader, invalid(), lookup(), prefix() (+10 more)
 
-### Community 982 - "SetStatement"
+### Community 982 - "ScalarSubquery"
 Cohesion: 0.19
-Nodes (9): crate::expr::statements::SetStatement, Expr, From, Kind, Option, Self, Strand, String (+1 more)
+Nodes (8): Any, Arc, BoxFut, FlowResult, String, Value, Vec, ScalarSubquery
 
-### Community 983 - "module/build.rs"
+### Community 983 - "RelateStatement"
 Cohesion: 0.29
-Nodes (20): apply_wasm_opt(), build_wasm_module(), extract_exports(), get_source_wasm(), init(), load_config(), metadata(), optimize_component() (+12 more)
+Nodes (11): AttachStatement, DetachStatement, KeepLevelPathClause, Parser<'_>, RelateStatement, Expr, FerrosGrynnResult, Identifier (+3 more)
 
 ### Community 984 - "AlterAccessStatement"
 Cohesion: 0.19
@@ -5608,17 +5855,17 @@ Nodes (10): AlterAccessStatement, crate::expr::statements::alter::AlterAccessSta
 Cohesion: 0.07
 Nodes (28): Flamegraph, Hash lookup, плотная память и VecMap, Intel VTune, NativeAsync, RSS, системный кэш и PageCache, Tracy, WPR/WPA, Исправление методики benchmark (+20 more)
 
-### Community 986 - "Stats"
-Cohesion: 0.13
-Nodes (11): Data, Data<'a>, Pairs, Distributions, S, Sample, Data, Slope (+3 more)
+### Community 986 - "tests/landmark.rs"
+Cohesion: 0.15
+Nodes (34): assert_traversal_results(), custom_path_cost_recomputes_in_order_and_preserves_snapshot_occurrences(), custom_path_cost_rejects_invalid_scopes_functions_arithmetic_and_work_limits(), global_match_cost_normalizes_local_defaults_overrides_and_stateful_fallback(), global_match_cost_uses_connector_scope_for_nested_and_hyper_paths(), landmark_custom_cost_matches_exhaustive_reduction_and_zero_cost_ties(), landmark_custom_cost_private_writes_old_snapshots_dependencies_and_ssi(), landmark_match_binding_explain_expansions_fallback_and_private_snapshot() (+26 more)
 
 ### Community 987 - "Param"
 Cohesion: 0.23
 Nodes (7): crate::expr::Param, Param, From, Into, Self, Strand, String
 
-### Community 988 - "ap.rs"
-Cohesion: 0.26
-Nodes (10): Ap, Ap<'a>, key(), new(), prefix(), Cow, Result, Self (+2 more)
+### Community 988 - "local/native.rs"
+Cohesion: 0.23
+Nodes (13): CoreReceiver, router_loop(), Arc, BoxFuture, CancellationToken, Datastore, Notification, Option (+5 more)
 
 ### Community 989 - "AlterBucketStatement"
 Cohesion: 0.19
@@ -5640,9 +5887,9 @@ Nodes (10): crate::expr::statements::DefineDatabaseStatement, DefineDatabaseStat
 Cohesion: 0.19
 Nodes (10): crate::expr::statements::DefineModelStatement, DefineModelStatement, Default, DefineKind, Expr, From, Permission, Self (+2 more)
 
-### Community 994 - "ImmutableStreamWriter<'a>"
-Cohesion: 0.19
-Nodes (10): ImmutableStreamWriter, ImmutableStreamWriter<'a>, invalid(), Box, FerrosGrynnError, FerrosGrynnResult, Into, PageType (+2 more)
+### Community 994 - "CreateStatement"
+Cohesion: 0.16
+Nodes (13): CreateStatement, Data, Default, Expr, FrozenContext, Option, Output, Result (+5 more)
 
 ### Community 995 - "str/bytes.rs"
 Cohesion: 0.13
@@ -5660,17 +5907,17 @@ Nodes (7): Environment, Information, refresh(), Default, Pid, Self, System
 Cohesion: 0.18
 Nodes (6): diff_change_text_root(), diff_replace_root(), Operation, Strand, Vec, Value
 
-### Community 999 - "az.rs"
-Cohesion: 0.26
-Nodes (10): Az, Az<'a>, key(), new(), prefix(), Cow, Result, Self (+2 more)
+### Community 999 - "GroupCollector"
+Cohesion: 0.22
+Nodes (10): GroupCollector, BTreeMap, FrozenContext, Idiom, Result, Self, Statement, Stk (+2 more)
 
 ### Community 1000 - "Authenticate"
 Cohesion: 0.20
 Nodes (10): Authenticate, Authenticate<'r, Client>, Authenticate<'r, Client, RefreshToken>, Authenticate<'r, Client, T>, Client, Cow, IntoFuture, PhantomData (+2 more)
 
 ### Community 1001 - "TryYielder<Ok, Error>"
-Cohesion: 0.10
-Nodes (20): Error, From, Ok, Result, Self, TryYielder, TryYielder<Ok, Error>, Future (+12 more)
+Cohesion: 0.06
+Nodes (32): AsynkStrim, AsynkStrim<F, Fut, Yieldr, Item>, init(), F, Fut, Item, Option, PhantomData (+24 more)
 
 ### Community 1002 - "AlterTableStatement"
 Cohesion: 0.16
@@ -5678,15 +5925,15 @@ Nodes (12): AlterTableStatement, crate::expr::statements::alter::AlterTableState
 
 ### Community 1003 - "Table"
 Cohesion: 0.04
-Nodes (53): crate::expr::Idiom, Idiom, From, Into, Part, Self, Strand, String (+45 more)
+Nodes (54): crate::expr::Idiom, Idiom, From, Into, Part, Self, Strand, String (+46 more)
 
 ### Community 1004 - "File"
 Cohesion: 0.17
 Nodes (9): crate::File, File, fmt_inner(), Arbitrary, K, Result, Self, String (+1 more)
 
-### Community 1005 - "load_reserved_extents"
-Cohesion: 0.20
-Nodes (13): BatchLoadReservation, install_loaded_page(), load_reserved_extents(), LoadSignal, Arc, CachedPage, Condvar, FerrosGrynnResult (+5 more)
+### Community 1005 - "validate_loaded_header"
+Cohesion: 0.08
+Nodes (23): Self, SourceEpoch, SourceIdentity, PageKey, BatchLoadReservation, install_loaded_page(), load_reserved_extents(), LoadSignal (+15 more)
 
 ### Community 1006 - "MemStore"
 Cohesion: 0.20
@@ -5704,9 +5951,9 @@ Nodes (7): Environment, Information, refresh(), Default, Pid, Self, System
 Cohesion: 0.11
 Nodes (18): Addendum 8.1: database и graph data spaces, Bypass и prefetch, Correctness gate, Dependency-ordered реализация, Mode 1 — Full In Memory, Mode 2 — Full On Disk, Mode 3 — Query To Memory, Performance gate (+10 more)
 
-### Community 1010 - "ParserSettings"
-Cohesion: 0.21
-Nodes (9): GQLConfig, Default, Self, parse(), ParserSettings, Default, FerrosGrynnResult, From (+1 more)
+### Community 1010 - "VectorDistanceKnn"
+Cohesion: 0.16
+Nodes (10): extract_record_id(), register(), BoxFut, Option, RecordId, Result, Signature, Value (+2 more)
 
 ### Community 1011 - "Отчёт по этапу 7: базовый индексный контур"
 Cohesion: 0.12
@@ -5728,33 +5975,33 @@ Nodes (10): IntoStr, MemTable, SessionContext, PropertyBatch, registers_only_aft
 Cohesion: 0.16
 Nodes (11): crate::expr::statements::CreateStatement, CreateStatement, Data, Default, Expr, From, Option, Output (+3 more)
 
-### Community 1016 - "DefineAnalyzerStatement"
-Cohesion: 0.19
-Nodes (12): crate::expr::statements::DefineAnalyzerStatement, DefineAnalyzerStatement, Default, DefineKind, Expr, Filter, From, Option (+4 more)
+### Community 1016 - "IndexCompactionKey"
+Cohesion: 0.20
+Nodes (10): IndexCompactionKey, IndexCompactionKey<'key>, key(), Cow, IndexId, Result, Self, TableName (+2 more)
 
-### Community 1017 - "span.rs"
-Cohesion: 0.09
-Nodes (15): Option, R, Range, Self, Span, Lexer<'_>, Copy, Fn (+7 more)
+### Community 1017 - "Br"
+Cohesion: 0.22
+Nodes (13): Br, Br<'a>, BrPrefix, BuildGeneration, BuildTicket, Cow, IndexId, Key (+5 more)
 
-### Community 1018 - "upgrade/mod.rs"
+### Community 1018 - ".deserialize_revisioned"
 Cohesion: 0.23
-Nodes (17): Config, is_port_available(), Arc, ArgMatches, Option, Result, Self, String (+9 more)
+Nodes (8): idiom_revisioned_roundtrip(), idiom_with_bytes_matches_serialize(), Error, R, Result, String, W, Walker
 
-### Community 1019 - "Entry"
-Cohesion: 0.04
-Nodes (59): AccessGrant, Grant, GrantBearer, GrantJwt, GrantRecord, Datetime, Option, RecordId (+51 more)
+### Community 1019 - "DefineUserStatement"
+Cohesion: 0.20
+Nodes (11): crate::expr::statements::DefineUserStatement, DefineUserStatement, PassType, Base, Default, DefineKind, Expr, From (+3 more)
 
-### Community 1020 - "Parser<'_>"
-Cohesion: 0.37
-Nodes (5): Parser<'_>, ParseResult, Span, Stk, Vec
+### Community 1020 - ".increment"
+Cohesion: 0.23
+Nodes (14): increment_array_array(), increment_array_number(), increment_array_value(), increment_none(), increment_number(), increment_number_string_errors(), increment_object(), increment_object_number_errors() (+6 more)
 
 ### Community 1021 - "completions.rs"
 Cohesion: 0.31
 Nodes (16): dispatches_database_arg_to_db_listing(), dispatches_namespace_arg_to_ns_listing(), dispatches_table_arg_to_table_listing(), extract_keys(), handle_completion(), list_databases(), list_namespaces(), list_tables() (+8 more)
 
-### Community 1022 - "collect_expr"
-Cohesion: 0.34
-Nodes (13): AtomColumns, collect_expr(), collect_match_binding(), collect_source(), degree_directions(), demand_column(), PlannerDemand, property_demand() (+5 more)
+### Community 1022 - "fd.rs"
+Cohesion: 0.25
+Nodes (13): Fd, Fd<'a>, key(), new(), prefix(), Cow, Result, Self (+5 more)
 
 ### Community 1023 - "fnc/duration.rs"
 Cohesion: 0.52
@@ -5764,17 +6011,17 @@ Nodes (13): days(), hours(), micros(), millis(), mins(), nanos(), Duration, Resu
 Cohesion: 0.36
 Nodes (7): Lexer<'_>, CharIndices, Result, Span, String, SyntaxError, Token
 
-### Community 1025 - "ExternalSort"
+### Community 1025 - "InsertRelation"
 Cohesion: 0.17
-Nodes (9): ExternalSort, Arc, FlowResult, Option, PathBuf, Self, String, ValueBatchStream (+1 more)
+Nodes (13): InsertRelation, InsertRelation<'r, C, R>, InsertRelation<'r, Client, Option<R>>, InsertRelation<'r, Client, Value>, InsertRelation<'r, Client, Vec<R>>, Command, Cow, F (+5 more)
 
 ### Community 1026 - "count_exists_rewriter.rs"
 Cohesion: 0.30
 Nodes (12): compute_limit(), count_comparison_limit(), CountLimitRewriter, flip_comparison(), inject_limit(), is_count_of_graph_traversal(), BinaryOperator, Error (+4 more)
 
-### Community 1027 - "exec.rs"
-Cohesion: 0.04
-Nodes (57): AstDestructurePart, binding_record_id(), check_cancelled(), gql_output_rows_exceeded(), ControlFlow, FlowResult, Option, RecordId (+49 more)
+### Community 1027 - "DatabaseSuperblock"
+Cohesion: 0.23
+Nodes (12): DatabaseSuperblock, exact_database_superblock_round_trip(), invalid(), read_u32(), read_u64(), FerrosGrynnError, FerrosGrynnResult, Into (+4 more)
 
 ### Community 1028 - "kvs/util.rs"
 Cohesion: 0.21
@@ -5784,25 +6031,25 @@ Nodes (12): deserialize_cache(), Arc, Direction, K, Key, Option, Range, Result (
 Cohesion: 0.35
 Nodes (10): basic_idiom(), continued_idiom(), Idiom, Part, plain_idiom(), RecurseInstruction, Arbitrary, Result (+2 more)
 
-### Community 1030 - "providers.rs"
-Cohesion: 0.10
-Nodes (28): ApiProvider, AuthorisationProvider, BucketProvider, CatalogProvider, DatabaseProvider, NamespaceProvider, NodeProvider, ProviderFutureSendRequirement (+20 more)
+### Community 1030 - ".eat_separated_digits"
+Cohesion: 0.29
+Nodes (9): Lexer<'_>, Copy, Fn, FnOnce, NumberKind, Option, Result, SyntaxError (+1 more)
 
 ### Community 1031 - "Language"
 Cohesion: 0.21
 Nodes (8): crate::expr::language::Language, Language, Display, Formatter, From, Result, Self, String
 
-### Community 1032 - "AlterEventStatement"
-Cohesion: 0.11
-Nodes (18): EventKind, AlterEventStatement, crate::expr::statements::alter::AlterEventStatement, AlterKind, Default, Expr, From, Self (+10 more)
+### Community 1032 - "coerce.rs"
+Cohesion: 0.13
+Nodes (9): Cast, CoerceErrorExt, Result<T, CoerceError>, F, test_coerce_array_element_position_in_error(), test_coerce_table_empty_tables_list(), test_coerce_table_to_table(), test_coerce_to_table_generic() (+1 more)
 
 ### Community 1033 - "Datastore"
-Cohesion: 0.10
-Nodes (16): CheckpointMode, Datastore, Arc, Clone, Drop, FerrosGrynnResult, Object, Option (+8 more)
+Cohesion: 0.07
+Nodes (30): AsRef, LocalOptions, NonZeroUsize, PageIoMode, validate_local_options(), ValidatedLocalOptions, MaintenanceJobKind, MaintenanceTarget (+22 more)
 
-### Community 1034 - "engine/mod.rs"
-Cohesion: 0.27
-Nodes (8): IntervalStream, Instant, Option, Pin, Poll, Self, Uuid, Interval
+### Community 1034 - "BodyParser<'a>"
+Cohesion: 0.34
+Nodes (5): BodyParser, BodyParser<'a>, Mime, Option, Result
 
 ### Community 1035 - "DefineModuleStatement"
 Cohesion: 0.20
@@ -5813,20 +6060,20 @@ Cohesion: 0.20
 Nodes (9): crate::expr::statements::DefineNamespaceStatement, DefineNamespaceStatement, Default, DefineKind, Expr, From, Option, Self (+1 more)
 
 ### Community 1037 - "Value"
-Cohesion: 0.13
-Nodes (31): AtomOccurrenceRef, AtomRef, bool, Closure, Graph<Frozen>, GraphRef, MaterializedGraph, Number (+23 more)
+Cohesion: 0.09
+Nodes (36): AtomOccurrenceRef, AtomRef, bool, Closure, Graph<Frozen>, GraphRef, MaterializedGraph, Number (+28 more)
 
-### Community 1038 - "HnswRecordPending"
-Cohesion: 0.10
-Nodes (27): HnswRecordPending, HnswRecordPending<'a>, HnswRecordPendingPrefix, HnswRecordPendingPrefix<'a>, record_pending_key_is_outside_hp_range(), Cow, IndexId, Key (+19 more)
+### Community 1038 - "Http"
+Cohesion: 0.11
+Nodes (24): Header, add_header(), add_server_header(), add_version_header(), parse_typed_header(), Error, H, HeaderName (+16 more)
 
 ### Community 1039 - "gql_stage_common.rs"
 Cohesion: 0.35
 Nodes (10): assert_query(), benchmark_common(), mutate_all(), mutation_fixture(), MutationFixture, rows(), Criterion, Datastore (+2 more)
 
-### Community 1040 - ".parse_inner_kind"
-Cohesion: 0.34
-Nodes (8): kind(), Parser<'_>, GeometryKind, Kind, ParseResult, Span, Stk, test_kind()
+### Community 1040 - "expr/statements/info.rs"
+Cohesion: 0.22
+Nodes (16): get_module_exports(), InfoStatement, process(), process_modules(), Arc, Base, Expr, FrozenContext (+8 more)
 
 ### Community 1041 - "test/limit.rs"
 Cohesion: 0.21
@@ -5836,13 +6083,13 @@ Nodes (10): expr_depth_default_limit_is_stack_safe(), linear_infix(), nested_cas
 Cohesion: 0.21
 Nodes (5): Option, Self, Token, TokenBuffer, TokenBuffer<S>
 
-### Community 1043 - "File"
-Cohesion: 0.25
-Nodes (7): File, fmt_inner(), From, Self, String, surrealdb_types::File, IndexFormat
-
-### Community 1044 - "SurrealAuthNamespace"
+### Community 1043 - ".new"
 Cohesion: 0.12
-Nodes (13): HeaderValue, Deref, E, Error, From, Header, HeaderName, HeaderValue (+5 more)
+Nodes (15): Data, Data<'a>, Pairs, Distributions, S, Sample, F, Self (+7 more)
+
+### Community 1044 - "ContentType"
+Cohesion: 0.15
+Nodes (11): ContentType, HeaderValue, Display, E, Error, Formatter, From, Header (+3 more)
 
 ### Community 1045 - "AlterParamStatement"
 Cohesion: 0.21
@@ -5857,16 +6104,16 @@ Cohesion: 0.11
 Nodes (10): Array, Closure, crate::val::Object, File, HasKind, RecordId, Regex, Set (+2 more)
 
 ### Community 1048 - "gql/parser/test/mod.rs"
-Cohesion: 0.22
-Nodes (20): assert_property(), assert_variable(), edge_directions(), expr_str(), expression_precedence(), label_str(), match_clauses(), non_reserved_keywords_as_identifiers() (+12 more)
+Cohesion: 0.16
+Nodes (24): non_reserved_words_are_variables(), assert_property(), assert_variable(), edge_directions(), expr_str(), expression_precedence(), label_str(), match_clauses() (+16 more)
 
 ### Community 1049 - "Mock"
 Cohesion: 0.20
 Nodes (8): IntoIter, IntoIterKey, Mock, IntoIterator, Option, RecordId, String, TableName
 
 ### Community 1050 - "AlterUserStatement"
-Cohesion: 0.09
-Nodes (24): Package, AlterUserStatement, crate::expr::statements::alter::AlterUserStatement, AlterKind, Base, Default, Expr, From (+16 more)
+Cohesion: 0.15
+Nodes (13): Package, AlterUserStatement, crate::expr::statements::alter::AlterUserStatement, AlterKind, Base, Default, Expr, From (+5 more)
 
 ### Community 1051 - "Отчёт этапа 10: Atomic Import"
 Cohesion: 0.11
@@ -5881,24 +6128,24 @@ Cohesion: 0.20
 Nodes (8): Display, Formatter, Result, Self, String, test_from_string(), test_increment(), Version
 
 ### Community 1054 - ".parse_sync"
-Cohesion: 0.23
-Nodes (12): ast::OptionStmt, ast::Query, ast::Show, ast::TopLevelExpr, ast::Transaction, ast::Use, name_previous_statement(), Parse (+4 more)
+Cohesion: 0.19
+Nodes (14): ast::Kill, ast::OptionStmt, ast::Query, ast::Show, ast::TopLevelExpr, ast::Transaction, ast::Use, name_previous_statement() (+6 more)
 
 ### Community 1056 - "AlterFunctionStatement"
 Cohesion: 0.20
 Nodes (12): AlterFunctionStatement, AlterKind, Block, FrozenContext, Kind, Option, Permission, Result (+4 more)
 
-### Community 1057 - "reclaim_test.rs"
-Cohesion: 0.28
-Nodes (12): count_range(), mem_ds(), now_ms(), reclaim_entry_observed_ms(), reclaim_is_idempotent_and_safe_when_empty(), reclaim_queue_len(), reclaim_respects_grace_period(), reclaim_runs_once_observation_ages_past_grace() (+4 more)
+### Community 1057 - "Result"
+Cohesion: 0.38
+Nodes (5): FlatBufferBuilder, Input, Output, Result, Self
 
-### Community 1058 - "SurrealDatabase"
-Cohesion: 0.12
-Nodes (13): HeaderValue, Deref, E, Error, From, Header, HeaderName, HeaderValue (+5 more)
-
-### Community 1059 - "DefineIndexStatement"
+### Community 1058 - "tx_cache_test.rs"
 Cohesion: 0.21
-Nodes (9): crate::expr::statements::DefineIndexStatement, DefineIndexStatement, DefineKind, Expr, From, Index, Self, String (+1 more)
+Nodes (9): Datastore, Transaction, setup_tx_with_ns_db(), test_single_tx_cache_invalidation_on_field_put(), test_single_tx_cache_invalidation_on_index_delete(), test_single_tx_cache_invalidation_on_index_put(), test_single_tx_cache_invalidation_on_ns_put(), test_single_tx_cache_invalidation_on_param_put() (+1 more)
+
+### Community 1059 - "race_stress.rs"
+Cohesion: 0.17
+Nodes (7): make_value(), prefix_key(), prefix_range(), Vec, t1_reverse_scan_under_merge_heavy_churn_emits_only_in_range(), t2_boxed_v_lookup_optimistic_never_sees_torn_snapshot(), verify_value()
 
 ### Community 1060 - "IndentFormatter<W>"
 Cohesion: 0.17
@@ -5909,16 +6156,16 @@ Cohesion: 0.21
 Nodes (11): DefineModelStatement, DefineKind, Expr, FrozenContext, Option, Permission, Result, Stk (+3 more)
 
 ### Community 1062 - "Number"
-Cohesion: 0.14
-Nodes (14): Number, Decimal, Default, Display, Eq, From, H, Hash (+6 more)
+Cohesion: 0.05
+Nodes (37): String, KindLiteral, BTreeMap, Decimal, Duration, Eq, H, Hash (+29 more)
 
-### Community 1063 - "ControlFlowExpr"
-Cohesion: 0.12
-Nodes (12): ControlFlowExpr, ControlFlowKind, Any, Arc, BoxFut, Display, FlowResult, Formatter (+4 more)
+### Community 1063 - "Span"
+Cohesion: 0.19
+Nodes (5): Option, R, Range, Self, Span
 
-### Community 1064 - ".pick"
-Cohesion: 0.26
-Nodes (11): pick_array(), pick_array_field(), pick_array_fields(), pick_array_fields_flat(), pick_array_thing(), pick_basic(), pick_none(), pick_thing() (+3 more)
+### Community 1064 - ".poll_next_before"
+Cohesion: 0.24
+Nodes (13): join_mutiple(), join_one_slow(), JoinMultiple, JoinMultiplePin, JoinMultiplePin<C>, Message, poll_multiple_step(), Data (+5 more)
 
 ### Community 1065 - "atom_model.rs"
 Cohesion: 0.28
@@ -5928,45 +6175,41 @@ Nodes (12): benchmark_base_update_fanout(), benchmark_mode_one_scans(), benchmar
 Cohesion: 0.22
 Nodes (9): Error, io::Error, Reason, Display, Duration, Formatter, From, Result (+1 more)
 
-### Community 1067 - "ImportReport"
-Cohesion: 0.11
-Nodes (13): bounded_diagnostic(), ImportConstraintMode, ImportIndexMode, ImportReport, QuarantineId, BTreeMap, Display, Duration (+5 more)
+### Community 1067 - "walk.rs"
+Cohesion: 0.12
+Nodes (5): Idiom, Part, Self, Vec, Value
 
-### Community 1068 - "expr/statements/define/sequence.rs"
-Cohesion: 0.21
-Nodes (10): DefineSequenceStatement, Default, DefineKind, Expr, FrozenContext, Option, Result, Self (+2 more)
+### Community 1068 - "Content"
+Cohesion: 0.05
+Nodes (52): Content, Content<'r, C, R>, Content<'r, Client, Option<R>>, Content<'r, Client, Value>, Content<'r, Client, Vec<R>>, Command, Cow, F (+44 more)
 
 ### Community 1069 - "Cond"
 Cohesion: 0.29
 Nodes (6): Cond, crate::expr::Cond, Expr, From, Self, String
 
-### Community 1070 - "hashset_vs_vector.rs"
-Cohesion: 0.32
-Nodes (11): bench_ahashset(), bench_array(), bench_hashset(), bench_hashset_vs_vector(), bench_vector(), create_samples(), group_test(), BenchmarkGroup (+3 more)
+### Community 1070 - "LocalPokemonApi"
+Cohesion: 0.13
+Nodes (12): handle_pokemon_connection(), LocalPokemonApi, QueryResult, Drop, JoinHandle, Option, Self, SocketAddr (+4 more)
 
 ### Community 1071 - "expr/record_id/range.rs"
 Cohesion: 0.23
 Nodes (9): RecordIdKeyRangeLit, Bound, FrozenContext, Option, RecordIdKeyLit, RecordIdKeyRange, Result, Stk (+1 more)
 
 ### Community 1072 - "encode_vec"
-Cohesion: 0.04
-Nodes (58): decode_borrow(), decode_borrow_format(), decode_format(), encode_format(), encode_vec(), encode_vec_format(), MessageError, Box (+50 more)
+Cohesion: 0.05
+Nodes (57): decode_borrow(), decode_borrow_format(), decode_format(), encode_format(), encode_vec(), encode_vec_format(), MessageError, Box (+49 more)
 
-### Community 1073 - ".compute"
-Cohesion: 0.23
-Nodes (9): RemoveBucketStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+1 more)
-
-### Community 1074 - "expr/statements/remove/sequence.rs"
-Cohesion: 0.23
-Nodes (9): RemoveSequenceStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+1 more)
+### Community 1073 - "Splits"
+Cohesion: 0.17
+Nodes (10): Deref, Idiom, IntoIter, IntoIterator, Split, String, Target, Vec (+2 more)
 
 ### Community 1075 - "gql_traversal_stage_17_probe"
 Cohesion: 0.29
 Nodes (18): artifact_file(), assert_count(), begin(), env_usize(), execute(), fixture(), gql_traversal_stage_17_probe(), measure() (+10 more)
 
-### Community 1076 - "expect"
-Cohesion: 0.36
-Nodes (11): chain(), diff(), expect(), patch(), Box, Closure, FrozenContext, Option (+3 more)
+### Community 1076 - ".compute"
+Cohesion: 0.19
+Nodes (13): ApiAction, DefineApiStatement, ApiAction, ApiConfig, DefineKind, Expr, FrozenContext, Option (+5 more)
 
 ### Community 1077 - "expr/timeout.rs"
 Cohesion: 0.22
@@ -5976,37 +6219,33 @@ Nodes (9): Default, Duration, Expr, Option, Result, Self, Stk, String (+1 more)
 Cohesion: 0.12
 Nodes (17): 1. Результат и зафиксированные решения, 2.1. Один concrete optimizer, 2.2. Граница с datastore, 2.3. Канонические rules, 2.4. Statistics и cost model, 2.5. Index access и hints, 2.6. Join и ORDER planning, 2.7. Строгий `DETERMINISTIC` (+9 more)
 
-### Community 1079 - "DiagnosticValue"
-Cohesion: 0.14
-Nodes (11): bool, DiagnosticValue, f32, f64, BTreeMap, String, StatusParameter, str (+3 more)
-
-### Community 1080 - ".compute"
+### Community 1079 - "Action"
 Cohesion: 0.21
-Nodes (14): extract_table_and_rid_key(), InsertStatement, iterable(), Data, Expr, FrozenContext, Option, Output (+6 more)
+Nodes (11): Action, Notification, Display, Err, Formatter, FromStr, Option, Result (+3 more)
 
-### Community 1081 - "Перспективный анализ кода и зависимостей (этап 1.6)"
+### Community 1081 - "6. Перспективная роль существующих модулей `src`"
+Cohesion: 0.04
+Nodes (51): 10. Реестр «не изобретать заново», 11.1. Один владелец семантики, 11.2. Один выбранный primitive на boundary, 11.3. Формат задела может быть неверен, алгоритм — полезен, 11.4. Опциональные вертикали должны иметь build boundary, 11. Архитектурные ограничения на будущую интеграцию, 12. Предлагаемый процесс сохранения и выбора, 13. Итоговый прогноз (+43 more)
+
+### Community 1082 - "TransactionMetrics"
+Cohesion: 0.35
+Nodes (8): AtomicU32, AtomicU64, transaction_metrics_are_concurrent_safe(), transaction_metrics_record_accumulates(), transaction_metrics_record_ignores_zero_byte_payloads(), transaction_metrics_snapshot_derives_totals(), transaction_metrics_snapshot_is_non_destructive(), TransactionMetrics
+
+### Community 1083 - "cmp.rs"
+Cohesion: 0.20
+Nodes (6): bootstrap(), Distributions, S, Sample, Percentiles, Box
+
+### Community 1084 - ".add"
+Cohesion: 0.21
+Nodes (8): BorrowBag, BorrowBag<V>, Handle, N, Navigator, Output, Self, T
+
+### Community 1085 - "PageHeader"
+Cohesion: 0.10
+Nodes (20): PageFlags, aligned_page_has_exact_size_and_alignment(), aligned_page_slice_is_one_contiguous_byte_extent(), page_checksum(), page_checksum_mut(), page_checksum_rejects_payload_corruption(), page_codec_rejects_wrong_page_number_and_invalid_raw_fields(), page_codec_round_trips_little_endian_header() (+12 more)
+
+### Community 1086 - "DatabaseCatalog"
 Cohesion: 0.05
-Nodes (36): 10. Реестр «не изобретать заново», 11.1. Один владелец семантики, 11.2. Один выбранный primitive на boundary, 11.3. Формат задела может быть неверен, алгоритм — полезен, 11.4. Опциональные вертикали должны иметь build boundary, 11. Архитектурные ограничения на будущую интеграцию, 12. Предлагаемый процесс сохранения и выбора, 13. Итоговый прогноз (+28 more)
-
-### Community 1082 - "Result"
-Cohesion: 0.19
-Nodes (9): Chain, Option<T>, Result<T, E>, E, F, Formatter, Infallible, Result (+1 more)
-
-### Community 1083 - "Timeout"
-Cohesion: 0.15
-Nodes (8): Arc, FlowResult, Option, Self, String, ValueBatchStream, Vec, Timeout
-
-### Community 1084 - "fetch/mod.rs"
-Cohesion: 0.21
-Nodes (8): register(), RequestError, Arc, Ctx, Display, Error, Formatter, Result
-
-### Community 1085 - "EngineOptions"
-Cohesion: 0.26
-Nodes (4): EngineOptions, Default, Duration, Self
-
-### Community 1086 - "Mock"
-Cohesion: 0.29
-Nodes (6): crate::expr::Mock, Mock, From, Self, String, TableName
+Nodes (77): CatalogKind, DirectFileOpenMode, AnalyzerCatalogEntry, AtomStoreCatalogBinding, ClassCatalogEntry, ClassFieldCatalogEntry, ClassIndexCatalogEntry, DatabaseCatalog (+69 more)
 
 ### Community 1087 - ".arbitrary"
 Cohesion: 0.29
@@ -6032,9 +6271,9 @@ Nodes (9): AlterModuleStatement, crate::expr::statements::alter::AlterModuleStat
 Cohesion: 0.21
 Nodes (8): AlterSequenceStatement, crate::expr::statements::alter::AlterSequenceStatement, Default, Expr, From, Option, Self, String
 
-### Community 1093 - "ModuleDefinition"
-Cohesion: 0.06
-Nodes (42): module_no_name(), module_silo(), module_surrealism(), ModuleExecutable, ModuleName, DefineModuleStatement, Display, Error (+34 more)
+### Community 1093 - ".get_live_queries_version"
+Cohesion: 0.31
+Nodes (6): Entry, Lookup, Option, Result, TableName, Uuid
 
 ### Community 1094 - "Отчёт этапа 8.1: переход на graph-first модель атомов"
 Cohesion: 0.14
@@ -6068,49 +6307,45 @@ Nodes (7): BytesReader, ExactSizeIterator, Lexer<'_>, PublicDatetime, RangeInclu
 Cohesion: 0.26
 Nodes (7): PartialResult, F, R, Result, Span, SyntaxError, T
 
-### Community 1102 - "sq.rs"
-Cohesion: 0.26
-Nodes (9): key(), prefix(), Cow, Result, Self, Vec, Sq, Sq<'a> (+1 more)
+### Community 1102 - "View"
+Cohesion: 0.17
+Nodes (11): crate::expr::View, Cond, Fields, From, Groups, Option, Self, String (+3 more)
 
 ### Community 1103 - ".cut"
 Cohesion: 0.27
 Nodes (11): cut_array(), cut_array_field(), cut_array_fields(), cut_array_fields_flat(), cut_basic(), cut_none(), cut_other(), cut_reset() (+3 more)
-
-### Community 1104 - ".compute"
-Cohesion: 0.23
-Nodes (9): RemoveIndexStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+1 more)
 
 ### Community 1105 - "tests/table.rs"
 Cohesion: 0.42
 Nodes (12): define_foreign_table_group(), define_foreign_table_with_cond_group_max(), define_foreign_table_with_cond_group_mean(), define_foreign_table_with_cond_group_min(), define_foreign_table_with_cond_group_sum(), define_foreign_table_with_no_cond_and_group_count(), define_foreign_table_with_no_cond_and_group_max(), define_foreign_table_with_no_cond_and_group_mean() (+4 more)
 
 ### Community 1106 - "McpRecorderAdapter"
-Cohesion: 0.19
-Nodes (6): McpToolOutcome, Option, McpRecorderAdapter, Arc, Duration, Self
+Cohesion: 0.36
+Nodes (4): McpRecorderAdapter, Arc, Duration, Self
 
-### Community 1107 - "Reference"
-Cohesion: 0.27
-Nodes (8): crate::expr::reference::Reference, crate::expr::reference::ReferenceDeleteStrategy, Reference, ReferenceDeleteStrategy, Expr, From, ReferenceDeleteStrategy, Self
+### Community 1107 - ".decrement"
+Cohesion: 0.25
+Nodes (12): decrement_array_array(), decrement_array_number(), decrement_array_value(), decrement_none(), decrement_number(), decrement_number_string_errors(), decrement_object_number_errors(), FrozenContext (+4 more)
 
-### Community 1108 - "request"
-Cohesion: 0.35
-Nodes (18): decode_response(), delete(), encode_body(), get(), head(), patch(), post(), put() (+10 more)
+### Community 1108 - "catalog/access.rs"
+Cohesion: 0.25
+Nodes (10): Grant, GrantBearer, GrantJwt, GrantRecord, Option, RecordId, Self, String (+2 more)
 
 ### Community 1109 - "WithMap"
 Cohesion: 0.32
 Nodes (6): Option, Self, TokenStream2, Vec, With, WithMap
 
-### Community 1110 - "th.rs"
-Cohesion: 0.24
-Nodes (8): key(), range(), DatabaseRoot, Range, Result, Self, Vec, TableIdGeneratorBatchKey
+### Community 1110 - "DatabaseDefinition"
+Cohesion: 0.21
+Nodes (10): database_basic(), database_strict(), database_with_changefeed(), DatabaseDefinition, ChangeFeed, DefineDatabaseStatement, Option, Strand (+2 more)
 
-### Community 1111 - "expr/statements/alter/index.rs"
-Cohesion: 0.19
-Nodes (11): AlterIndexStatement, AlterKind, Default, Expr, FrozenContext, Option, Result, Self (+3 more)
+### Community 1111 - "LiveQueryRouter"
+Cohesion: 0.22
+Nodes (8): LiveQueryRouter, process(), Datastore, Mutex, Option, Result, Self, Event
 
-### Community 1112 - "VectorDistanceKnn"
-Cohesion: 0.15
-Nodes (10): extract_record_id(), register(), BoxFut, Option, RecordId, Result, Signature, Value (+2 more)
+### Community 1112 - "core/tests/select.rs"
+Cohesion: 0.37
+Nodes (13): query_count_value(), query_row_count(), Datastore, Result, select_count_where_btree_paths(), select_indexed_partial_filter_limit_not_pushed(), select_indexed_range_expression_integer(), select_indexed_range_expression_string() (+5 more)
 
 ### Community 1113 - "enum_untagged.rs"
 Cohesion: 0.15
@@ -6132,61 +6367,61 @@ Nodes (12): 1. Граница этапа, 2. Нормативный контра
 Cohesion: 0.21
 Nodes (10): memory_reporters_allocated_by_name(), MemoryReporter, MemoryReporterEntry, register_memory_reporter(), MemoryReporter, RapidHashMap, Send, String (+2 more)
 
-### Community 1118 - "EventQueue"
-Cohesion: 0.23
-Nodes (7): EventQueue, EventQueue<'a>, Cow, Result, TableName, Uuid, Vec
+### Community 1118 - "Import"
+Cohesion: 0.20
+Nodes (10): Import, Import<'_, C, T>, Import<'r, C>, Import<'r, Client, T>, Cow, IntoFuture, Model, PathBuf (+2 more)
 
-### Community 1119 - ".contains"
-Cohesion: 0.47
-Nodes (3): IdiomTrie<T>, IdiomTrieContains, T
+### Community 1119 - "ApiInvoke"
+Cohesion: 0.21
+Nodes (7): ApiInvoke, register(), BoxFut, Result, Signature, Value, Vec
 
 ### Community 1120 - "Profiling with DTRACE (MacOS / FreeBSD)"
 Cohesion: 0.17
 Nodes (11): 1. Start SurrealDB, 2. Start profiling, 3. Do some operation, 3. Stop profiling, 4. Check the results, Prerequisites:, profile_avg_cpu_time.txt, profile.out (+3 more)
 
-### Community 1121 - ".poll_next"
-Cohesion: 0.21
-Nodes (9): File, Item, Option, Pin, Poll, Result, Self, String (+1 more)
+### Community 1121 - "File"
+Cohesion: 0.25
+Nodes (7): File, fmt_inner(), From, Self, String, surrealdb_types::File, IndexFormat
 
 ### Community 1122 - "Fmt"
 Cohesion: 0.03
-Nodes (61): F, Result, String, SurValue, TestReport, Base, Display, Formatter (+53 more)
+Nodes (67): F, Result, String, SurValue, TestReport, Base, Display, Formatter (+59 more)
 
 ### Community 1123 - "Отчёт по этапу 3.2: внедрение гибридного storage engine"
 Cohesion: 0.08
 Nodes (24): 10. Следующие зависимые работы, 11. Артефакты, 1. Итог, 2.1. R8 Atomic Arena, 2.2. Source lifecycle и общий бюджет, 2.3. Router и transports, 2.4. Transient memory, 2. Что перенесено в production (+16 more)
 
-### Community 1124 - "cli/config.rs"
-Cohesion: 0.18
-Nodes (13): CommunityComposer, Config, ConfigCheck, ConfigCheckRequirements, Config, Option, PathBuf, Result (+5 more)
+### Community 1124 - "Parser<'_>"
+Cohesion: 0.37
+Nodes (5): Parser<'_>, ParseResult, Span, Stk, Vec
 
-### Community 1125 - ".compute"
-Cohesion: 0.19
-Nodes (13): ApiAction, DefineApiStatement, ApiAction, ApiConfig, DefineKind, Expr, FrozenContext, Option (+5 more)
+### Community 1125 - "UpdateGraphStatement"
+Cohesion: 0.24
+Nodes (11): GraphPropertyAssignment, GraphPropertyMutation, GraphPropertyPath, Parser<'_>, Expr, FerrosGrynnResult, Identifier, Option (+3 more)
 
 ### Community 1126 - "KindLiteral"
-Cohesion: 0.20
-Nodes (11): Box<Kind>, crate::types::PublicKindLiteral, KindLiteral, BTreeMap, Duration, Eq, From, H (+3 more)
+Cohesion: 0.17
+Nodes (12): KindLiteral, BTreeMap, Decimal, Duration, Eq, H, Hash, PartialEq (+4 more)
 
 ### Community 1127 - "SlotArray<S, N>"
 Cohesion: 0.18
-Nodes (8): OptimisticOption, AtomicU8, M, S, Value, SlotArray, SlotArray<S, N>, unit_slot_load_into_returns_unit()
+Nodes (6): OptimisticOption, AtomicU8, M, S, SlotArray, SlotArray<S, N>
 
 ### Community 1128 - "expr/statements/define/config/api.rs"
 Cohesion: 0.23
 Nodes (11): ApiConfig, Middleware, Expr, FrozenContext, Middleware, Option, Permission, Result (+3 more)
 
-### Community 1129 - "KindLiteral"
-Cohesion: 0.14
-Nodes (13): KindLiteral, BTreeMap, Decimal, Duration, Eq, H, Hash, Kind (+5 more)
+### Community 1129 - "Giver"
+Cohesion: 0.20
+Nodes (7): Closed, Giver, Arc, Debug, Future, SharedGiver, Want
 
 ### Community 1130 - "Record"
 Cohesion: 0.23
 Nodes (5): Record, RecordId, Self, String, Value
 
-### Community 1131 - "Split"
-Cohesion: 0.19
-Nodes (11): crate::expr::Split, crate::expr::Splits, Deref, From, Idiom, Self, Split, Target (+3 more)
+### Community 1131 - "BloomFilter"
+Cohesion: 0.26
+Nodes (6): BloomFilter, clear_resets_filter(), empty_filter_contains_nothing(), inserted_keys_are_found(), missing_keys_usually_not_found(), Self
 
 ### Community 1132 - "План доведения Ferros-Grynn до Windows GA-core и полной draft-conformance"
 Cohesion: 0.11
@@ -6204,9 +6439,9 @@ Nodes (8): criterion_benchmark(), gather_lang_tests(), parse(), Criterion, F, Pa
 Cohesion: 0.23
 Nodes (11): DefineModuleStatement, DefineKind, Expr, FrozenContext, ModuleExecutable, Option, Permission, Result (+3 more)
 
-### Community 1136 - "DefineFunctionStatement"
-Cohesion: 0.16
-Nodes (13): crate::expr::statements::DefineFunctionStatement, DefineFunctionStatement, Block, DefineKind, Expr, From, Kind, Option (+5 more)
+### Community 1136 - "AlterFunctionStatement"
+Cohesion: 0.17
+Nodes (12): AlterFunctionStatement, crate::expr::statements::alter::AlterFunctionStatement, AlterKind, Block, From, Kind, Option, Permission (+4 more)
 
 ### Community 1137 - "RemoveModelStatement"
 Cohesion: 0.29
@@ -6276,10 +6511,6 @@ Nodes (7): crate::expr::statements::RemoveFieldStatement, RemoveFieldStatement, 
 Cohesion: 0.23
 Nodes (7): crate::expr::statements::RemoveIndexStatement, RemoveIndexStatement, Default, Expr, From, Self, String
 
-### Community 1154 - "evaluate_physical_path"
-Cohesion: 0.29
-Nodes (9): evaluate_recurse_collect(), Arc, FlowResult, Value, evaluate_physical_path(), Arc, BoxFut, FlowResult (+1 more)
-
 ### Community 1155 - "RemoveSequenceStatement"
 Cohesion: 0.23
 Nodes (7): crate::expr::statements::remove::RemoveSequenceStatement, RemoveSequenceStatement, Default, Expr, From, Self, String
@@ -6288,25 +6519,25 @@ Nodes (7): crate::expr::statements::remove::RemoveSequenceStatement, RemoveSeque
 Cohesion: 0.23
 Nodes (7): crate::expr::statements::RemoveTableStatement, RemoveTableStatement, Default, Expr, From, Self, String
 
-### Community 1157 - "Append"
-Cohesion: 0.10
-Nodes (22): T, U, (), Append, append_test(), PrefixedWith, Handle, Navigator (+14 more)
+### Community 1157 - "relation"
+Cohesion: 0.38
+Nodes (10): directed_landmark_all_pairs_match_integer_oracle_and_alt_is_admissible(), directed_landmark_budgets_malformed_relations_and_cancellation_fail_closed(), directed_landmark_selection_and_asymmetric_terms_are_deterministic(), landmark_intervals_preserve_large_integer_decimal_float_and_zero_boundaries(), limits(), oracle(), relation(), Number (+2 more)
 
-### Community 1158 - "expr/part.rs"
-Cohesion: 0.49
-Nodes (7): RecurseInstruction, Expr, FrozenContext, Result, Stk, Value, walk_paths()
+### Community 1158 - "serde_wrapper_roundtrip.rs"
+Cohesion: 0.21
+Nodes (9): deserialize_any_handles_native_datetime_in_untagged_enum(), DateTime, String, Utc, UntaggedEvent, utc_ts(), wrapper_hashmap_types_use_native_variants_and_roundtrip(), wrapper_upstream_container_types_use_native_variants_and_roundtrip() (+1 more)
 
 ### Community 1159 - "Этап 19. Windows GA-core gate — итоговый evidence"
 Cohesion: 0.13
 Nodes (15): 10. W9 — closure gate, 1. Release inventory, 2. W1 — runtime resources, 3. W2 — Serializable concurrency, 4.1. Lazy handles (`Q-22`), 4.2. Durable statistics и lazy explicit indexes (`Q-36`), 4. W3 — reopen и startup, 5. W4 — format freeze (`Q-20`) (+7 more)
 
-### Community 1160 - ".deserialize_revisioned"
-Cohesion: 0.23
-Nodes (8): idiom_revisioned_roundtrip(), idiom_with_bytes_matches_serialize(), Error, R, Result, String, W, Walker
+### Community 1160 - "bu.rs"
+Cohesion: 0.26
+Nodes (10): BucketKey, BucketKey<'a>, key(), new(), prefix(), Cow, Result, Self (+2 more)
 
-### Community 1161 - "Instrument"
-Cohesion: 0.33
-Nodes (10): duration_ms_view(), duration_seconds_view(), init(), MetricsInit, Option, PrometheusExporter, Result, SdkMeterProvider (+2 more)
+### Community 1161 - "run_imports"
+Cohesion: 0.23
+Nodes (12): core_capabilities_from_test_config(), Arc, Capabilities, Datastore, NewPlannerStrategy, Option, Result, T (+4 more)
 
 ### Community 1162 - "RebuildIndexStatement"
 Cohesion: 0.21
@@ -6324,9 +6555,9 @@ Nodes (4): EnumTaggedVariant, EnumTaggedVariantLowercase, EnumTaggedVariantUpper
 Cohesion: 0.12
 Nodes (13): HeaderValue, Deref, E, Error, From, Header, HeaderName, HeaderValue (+5 more)
 
-### Community 1167 - "Telemetry"
-Cohesion: 0.20
-Nodes (8): Backward-compatibility instrument set (`OtelObserver`), Histogram bucket views, Local development, Process metric freshness, Push interval, Removed environment variables, Telemetry, What flows over OTLP
+### Community 1167 - ".compute"
+Cohesion: 0.21
+Nodes (10): RemoveAccessStatement, Base, Default, Expr, FrozenContext, Option, Result, Self (+2 more)
 
 ### Community 1168 - "Method"
 Cohesion: 0.12
@@ -6344,21 +6575,21 @@ Nodes (7): ArrayQueue, Pool, Arc, Inner, Self, Transaction, TransactionInner
 Cohesion: 0.18
 Nodes (9): Bug Investigation Protocol, Code Quality Rules, Common Commands, Documentation References, Language Tests (`language-tests/tests/*.surql`, `*.gql`), Project Overview, Project Structure, SDK/Integration Tests (+1 more)
 
-### Community 1172 - "signals.rs"
-Cohesion: 0.36
-Nodes (9): graceful_shutdown(), listen(), Arc, CancellationToken, Handle, JoinHandle, Result, SocketAddr (+1 more)
+### Community 1172 - "Di"
+Cohesion: 0.19
+Nodes (9): Di, Di<'a>, Cow, IndexId, RecordIdKey, Result, Self, TableName (+1 more)
 
-### Community 1173 - "QueueEntry"
-Cohesion: 0.31
-Nodes (7): QueueEntry, Eq, Ord, Ordering, PartialEq, PartialOrd, Self
+### Community 1173 - "expr/statements/remove/sequence.rs"
+Cohesion: 0.23
+Nodes (9): RemoveSequenceStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+1 more)
 
-### Community 1174 - "heap_estimator.rs"
+### Community 1174 - "Base"
+Cohesion: 0.21
+Nodes (8): Base, crate::expr::Base, Display, Formatter, From, Result, Self, Value
+
+### Community 1175 - "cli/start.rs"
 Cohesion: 0.14
-Nodes (11): Box, K, S, String, T, Vec, size_of_box(), size_of_hashmap() (+3 more)
-
-### Community 1175 - "expr/statements/output.rs"
-Cohesion: 0.29
-Nodes (8): OutputStatement, Expr, Fetchs, FlowResult, FrozenContext, Option, Stk, Value
+Nodes (25): build_observability(), init(), Arc, CancellationToken, Duration, Option, PathBuf, Result (+17 more)
 
 ### Community 1176 - "SequenceNextval"
 Cohesion: 0.20
@@ -6385,16 +6616,16 @@ Cohesion: 0.25
 Nodes (8): Package, pkg(), Ctx, Declarations, Exports, ModuleDef, Result, Value
 
 ### Community 1182 - "Этап 17. Traversal VM, полноценные closures, `FAST` и physical sparse frontier"
-Cohesion: 0.06
-Nodes (30): 10. Намеренно отложено, 1. Результат, 2.1. Синтаксис и источники, 2.2. Traverser и bulking, 2.3. Steps, 2. Traversal contract, 3. Language closures, 4. Algorithms (+22 more)
+Cohesion: 0.13
+Nodes (15): 10. Намеренно отложено, 1. Результат, 2.1. Синтаксис и источники, 2.2. Traverser и bulking, 2.3. Steps, 2. Traversal contract, 3. Language closures, 4. Algorithms (+7 more)
 
 ### Community 1183 - "Этап 18. Самодостаточные graph-results и Atomic `BUILD GRAPH`"
 Cohesion: 0.15
 Nodes (13): 10. Performance gate, 1. Результат и основные решения, 2. Нормативный синтаксис, 3.1. Иерархия и shared child, 3. Семантика assembly, 4. Family, root и validators, 5.1. Create/overwrite, 5. Именованный `BUILD GRAPH` (+5 more)
 
-### Community 1184 - "Explain"
+### Community 1184 - "prefix_concurrency.rs"
 Cohesion: 0.31
-Nodes (5): crate::expr::Explain, Explain, From, Self, String
+Nodes (9): concurrent_deletes_no_phantom_within_snapshot(), concurrent_writers_compete_for_same_keys(), concurrent_writers_disjoint_prefix_groups(), concurrent_writers_same_prefix_group_disjoint_keys(), many_readers_during_inserts(), pkey(), prefix_end(), Vec (+1 more)
 
 ### Community 1185 - "Block"
 Cohesion: 0.24
@@ -6448,13 +6679,13 @@ Nodes (10): all_language_tests(), all_language_tests_impl(), ann_keywords_keep_d
 Cohesion: 0.18
 Nodes (10): `build` (`build.rs`), CLI Module Subcommands, `DemoHost` (`host.rs`), `info` (`info.rs`), `init` (`init_cmd.rs`), Key Files, Overview, `run` (`run.rs`) (+2 more)
 
-### Community 1199 - "6. Перспективная роль существующих модулей `src`"
-Cohesion: 0.13
-Nodes (15): 6.0. Уже подключённое ядро, 6.10. `src/ecs`, 6.11. `src/math`, 6.12. `src/unsafed`, 6.13. Глобальные макросы и detached utilities, 6.1. `src/asynchronous`, 6.2. `src/collections/cow_vec`, 6.3. `src/collections/siv` (+7 more)
+### Community 1199 - ".computed_fields_inner"
+Cohesion: 0.29
+Nodes (9): DocKind, Document, FrozenContext, HashSet, Option, RecordId, Result, Stk (+1 more)
 
-### Community 1200 - "rocksdb_cursor.rs"
-Cohesion: 0.40
-Nodes (9): bench_bulk_scan(), bench_nested_edge(), prefix_range(), Criterion, Datastore, Range, Vec, runtime() (+1 more)
+### Community 1200 - "TempDir"
+Cohesion: 0.16
+Nodes (15): AtomicUsize, Drop, Option, Path, PathBuf, TempDir, bench_bulk_scan(), bench_nested_edge() (+7 more)
 
 ### Community 1201 - "Socket"
 Cohesion: 0.27
@@ -6462,23 +6693,23 @@ Nodes (7): connect(), Result, Self, SocketAddr, TcpStream, Write, Socket
 
 ### Community 1202 - "graphql/schema.rs"
 Cohesion: 0.09
-Nodes (52): process_fns(), Arc, Datastore, Object, Result, Vec, convert_static_expr(), convert_static_literal() (+44 more)
+Nodes (42): process_fns(), Arc, Datastore, Object, Result, Vec, decimal_string_round_trips(), enum_token_to_literal() (+34 more)
 
-### Community 1203 - "TraceLayer"
+### Community 1203 - "Dd"
 Cohesion: 0.27
-Nodes (10): new(), Box, Layer, Option, Result, S, SdkTracerProvider, Send (+2 more)
+Nodes (9): Dd, Dd<'a>, DdRoot, DdRoot<'a>, Cow, DocId, IndexId, Self (+1 more)
 
 ### Community 1204 - "AGENTS.md — `gql_status`"
 Cohesion: 0.15
 Nodes (12): AGENTS.md — `gql_status`, DSL каталога, Locations, Wire и безопасность, Карта файлов, Коды, Назначение и границы, Ортогональные измерения (+4 more)
 
-### Community 1205 - "ApiConfig"
-Cohesion: 0.18
-Nodes (12): ApiConfig, crate::expr::statements::define::config::api::ApiConfig, crate::expr::statements::define::config::api::Middleware, Middleware, Expr, From, Middleware, Permission (+4 more)
+### Community 1205 - "DefineFunctionStatement"
+Cohesion: 0.08
+Nodes (25): ApiConfig, crate::expr::statements::define::config::api::ApiConfig, crate::expr::statements::define::config::api::Middleware, Middleware, Expr, From, Middleware, Permission (+17 more)
 
-### Community 1206 - ".from_select"
-Cohesion: 0.27
-Nodes (6): Cow, Expr, FrozenContext, Result, SelectStatement, Stk
+### Community 1206 - "ap.rs"
+Cohesion: 0.26
+Nodes (10): Ap, Ap<'a>, key(), new(), prefix(), Cow, Result, Self (+2 more)
 
 ### Community 1207 - "reproduce_issue_6242.rs"
 Cohesion: 0.24
@@ -6500,9 +6731,9 @@ Nodes (10): (c) MATCH and patterns, Edge pattern (lines 1035–1086), Graph patt
 Cohesion: 0.20
 Nodes (10): (d) RETURN and ordering, (e) Value expression precedence, (f) Deviations to watch (openCypher ≠ ISO GQL), Former rejections that are now features, (g) v2 execution semantics (R1–R8), (h) v1 → v2 behaviour changes, ISO GQL — distilled reference for the v1 read-only subset, Mutations (+2 more)
 
-### Community 1212 - "He"
-Cohesion: 0.36
-Nodes (8): He, He<'a>, key(), Cow, ElementId, IndexId, Self, TableName
+### Community 1212 - "Id"
+Cohesion: 0.20
+Nodes (7): Id, Copy, Option, Self, Sized, u32, usize
 
 ### Community 1213 - "lib/routines/mod.rs"
 Cohesion: 0.29
@@ -6520,9 +6751,9 @@ Nodes (6): Cancellation, Arc, AtomicBool, Instant, Option, Vec
 Cohesion: 0.32
 Nodes (4): HeapEstimatorCache, Measurable, NoHeapEstimatorCache, Self
 
-### Community 1217 - "IfelseStatement"
-Cohesion: 0.21
-Nodes (8): crate::expr::statements::IfelseStatement, IfelseStatement, Expr, From, Option, Self, String, Vec
+### Community 1217 - "Hd"
+Cohesion: 0.26
+Nodes (11): Hd, Hd<'a>, HdRoot, HdRoot<'a>, key(), root(), Cow, DocId (+3 more)
 
 ### Community 1218 - "Отчёт по этапу 9: DML vertical slices"
 Cohesion: 0.18
@@ -6536,9 +6767,9 @@ Nodes (9): invalid(), rebuild_index_store(), rebuild_lookup_index_store(), Datab
 Cohesion: 0.27
 Nodes (4): Duration, Option, Self, String
 
-### Community 1221 - "expr/statements/remove/function.rs"
-Cohesion: 0.31
-Nodes (6): RemoveFunctionStatement, FrozenContext, Result, Strand, String, Value
+### Community 1221 - ".compute"
+Cohesion: 0.23
+Nodes (9): RemoveIndexStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+1 more)
 
 ### Community 1222 - "encode"
 Cohesion: 0.33
@@ -6552,9 +6783,9 @@ Nodes (6): AccessDuration, crate::expr::access::AccessDuration, Default, Expr, F
 Cohesion: 0.29
 Nodes (6): ChangeFeed, crate::expr::ChangeFeed, From, PublicDuration, Self, String
 
-### Community 1225 - "AlterFunctionStatement"
-Cohesion: 0.17
-Nodes (12): AlterFunctionStatement, crate::expr::statements::alter::AlterFunctionStatement, AlterKind, Block, From, Kind, Option, Permission (+4 more)
+### Community 1225 - ".compute"
+Cohesion: 0.23
+Nodes (9): RemoveEventStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+1 more)
 
 ### Community 1226 - "fnc/object.rs"
 Cohesion: 0.41
@@ -6585,8 +6816,8 @@ Cohesion: 0.29
 Nodes (6): crate::expr::statements::RemoveFunctionStatement, RemoveFunctionStatement, From, Self, Strand, String
 
 ### Community 1233 - "EventDefinition"
-Cohesion: 0.05
-Nodes (43): event_async(), event_basic(), subscription_basic(), subscription_with_filters(), subscription_with_vars(), EventDefinition, AuthLimit, DefineEventStatement (+35 more)
+Cohesion: 0.04
+Nodes (55): event_async(), event_basic(), subscription_basic(), subscription_with_filters(), subscription_with_vars(), EventDefinition, EventKind, AuthLimit (+47 more)
 
 ### Community 1234 - "RemoveModuleStatement"
 Cohesion: 0.29
@@ -6609,8 +6840,8 @@ Cohesion: 0.38
 Nodes (9): new_ds_with_timeout(), query_timeout(), Datastore, Duration, Option, Result, statement_timeouts(), transaction_timeout() (+1 more)
 
 ### Community 1241 - "Отчёт этапа 12: выражения и управляющий язык GrynnQL"
-Cohesion: 0.13
-Nodes (14): Atomic Import, Correctness и resource evidence, Expression и builtin core, Savepoints и ошибки, Отложенная поверхность, Отчёт этапа 12: выражения и управляющий язык GrynnQL, Результат, Correctness evidence (+6 more)
+Cohesion: 0.29
+Nodes (7): Atomic Import, Correctness и resource evidence, Expression и builtin core, Savepoints и ошибки, Отложенная поверхность, Отчёт этапа 12: выражения и управляющий язык GrynnQL, Результат
 
 ### Community 1242 - "Set"
 Cohesion: 0.27
@@ -6648,17 +6879,17 @@ Nodes (7): Bytes, Option, Ord, Ordering, PartialOrd, Self, Version
 Cohesion: 0.27
 Nodes (7): current_thread(), Foo, Foo<'a>, multi_thread(), no_runtime(), Drop, test_core()
 
-### Community 1254 - "NamedFields"
-Cohesion: 0.16
-Nodes (15): FieldAttributes, FieldDefault, Field, Option, Path, Self, String, String (+7 more)
+### Community 1254 - "DynamicConfiguration"
+Cohesion: 0.21
+Nodes (8): DynamicConfiguration, Inner, Arc, AtomicU64, Duration, Inner, Option, Value
 
-### Community 1255 - "DiskAtomRef"
-Cohesion: 0.23
-Nodes (6): DiskAtomRef, GlobalAtomId, PrimaryAddress, Copy, Eq, Self
+### Community 1255 - "AlterEventStatement"
+Cohesion: 0.17
+Nodes (12): AlterEventStatement, AlterKind, Default, Expr, FrozenContext, Option, Result, Self (+4 more)
 
-### Community 1256 - "core/tests/select.rs"
-Cohesion: 0.37
-Nodes (13): query_count_value(), query_row_count(), Datastore, Result, select_count_where_btree_paths(), select_indexed_partial_filter_limit_not_pushed(), select_indexed_range_expression_integer(), select_indexed_range_expression_string() (+5 more)
+### Community 1256 - "DefineParamStatement"
+Cohesion: 0.22
+Nodes (9): crate::expr::statements::DefineParamStatement, DefineParamStatement, DefineKind, Expr, From, Permission, Self, Strand (+1 more)
 
 ### Community 1257 - "Frequently Asked Questions"
 Cohesion: 0.22
@@ -6668,29 +6899,25 @@ Nodes (8): Client library architecture, Do you support language X?, Frequently A
 Cohesion: 0.40
 Nodes (4): GQL module guidance, Архитектурная цепочка, Инварианты, Спецификации и проверка
 
-### Community 1259 - "AlterNamespaceStatement"
-Cohesion: 0.31
-Nodes (5): AlterNamespaceStatement, crate::expr::statements::alter::AlterNamespaceStatement, From, Self, String
+### Community 1259 - "upgrade.rs"
+Cohesion: 0.32
+Nodes (11): file_platform_suffix(), init(), parse_version(), replace_exe(), Cow, Option, Path, Result (+3 more)
 
 ### Community 1260 - "LocalStorageStatus"
-Cohesion: 0.07
-Nodes (14): CheckpointPolicy, DatastoreOptions, InMemoryOptions, IsolationLevel, LocalOptions, Default, Duration, Self (+6 more)
+Cohesion: 0.08
+Nodes (14): CheckpointPolicy, DatastoreOptions, InMemoryOptions, IoMode, IsolationLevel, LocalOptions, MaintenanceOptions, Default (+6 more)
 
-### Community 1261 - "Access"
+### Community 1261 - "find_cuts_with_check"
 Cohesion: 0.29
-Nodes (5): Access, test_to_sql(), Assignment, LiveFields, Subscription
+Nodes (10): check_candidate(), CutFrame, CutSet, find_cuts(), find_cuts_with_check(), AtomId, Box, Check (+2 more)
 
-### Community 1262 - "collator"
-Cohesion: 0.39
-Nodes (7): CollatorBorrowed, build_collator(), collator(), order_key(), FerrosGrynnResult, Option, Value
+### Community 1262 - "DefineIndexStatement"
+Cohesion: 0.21
+Nodes (9): crate::expr::statements::DefineIndexStatement, DefineIndexStatement, DefineKind, Expr, From, Index, Self, String (+1 more)
 
-### Community 1263 - ".computed_fields_inner"
-Cohesion: 0.29
-Nodes (9): DocKind, Document, FrozenContext, HashSet, Option, RecordId, Result, Stk (+1 more)
-
-### Community 1264 - "DataFileId"
-Cohesion: 0.05
-Nodes (53): DataSpaceId, Option, Self, catalog_singleton(), Self, DataFileRegistration, DataFileRole, FileRegistry (+45 more)
+### Community 1264 - "hashset_vs_vector.rs"
+Cohesion: 0.32
+Nodes (11): bench_ahashset(), bench_array(), bench_hashset(), bench_hashset_vs_vector(), bench_vector(), create_samples(), group_test(), BenchmarkGroup (+3 more)
 
 ### Community 1265 - "gql/lexer/ident.rs"
 Cohesion: 0.39
@@ -6704,13 +6931,13 @@ Nodes (10): DefineNamespaceStatement, Default, DefineKind, Expr, FrozenContext, 
 Cohesion: 0.22
 Nodes (7): async_graphql::dynamic::Scalar, Fn, Self, Send, Sync, Value, ValidatorExt
 
-### Community 1268 - "Version"
-Cohesion: 0.32
-Nodes (5): Cow, IntoFuture, Version, Version<'_, C>, Version<'r, Client>
+### Community 1268 - "MlModelDefinition"
+Cohesion: 0.24
+Nodes (8): model_basic(), MlModelDefinition, DefineModelStatement, Option, Permission, Strand, String, Value
 
-### Community 1269 - "Self"
-Cohesion: 0.07
-Nodes (28): AccessType, BearerAccess, BearerAccessSubject, BearerAccessType, crate::expr::access_type::BearerAccess, crate::expr::access_type::BearerAccessSubject, crate::expr::access_type::BearerAccessType, crate::expr::access_type::JwtAccessIssue (+20 more)
+### Community 1269 - "AlterModuleStatement"
+Cohesion: 0.24
+Nodes (9): AlterModuleStatement, AlterKind, FrozenContext, ModuleName, Option, Permission, Result, String (+1 more)
 
 ### Community 1270 - "HttpTraceLayerHooks"
 Cohesion: 0.18
@@ -6729,7 +6956,7 @@ Cohesion: 0.28
 Nodes (3): FakeAlloc, Default, Self
 
 ### Community 1274 - "tests/control.rs"
-Cohesion: 0.17
+Cohesion: 0.16
 Nodes (10): assert_invariants_reads_private_root(), matcher_shares_state_and_reports_unicode_scalar_offsets(), mutable_collection_helpers_require_and_update_lexical_bindings(), object_conversion_merges_collections_without_silent_overwrite(), Datastore, FerrosGrynnResult, sleep_is_cooperative_and_rejected_in_deterministic_mode(), stage21_string_and_random_builtins_follow_runtime_contract() (+2 more)
 
 ### Community 1275 - "3. Остальной код в `src`"
@@ -6740,9 +6967,9 @@ Nodes (3): 3.1. Фактическая топология, 3.2. Размер ф�
 Cohesion: 0.26
 Nodes (10): DefineParamStatement, DefineKind, Expr, FrozenContext, Option, Permission, Result, Stk (+2 more)
 
-### Community 1277 - "expr/statements/alter/bucket.rs"
-Cohesion: 0.20
-Nodes (12): AlterBucketStatement, AlterKind, Default, Expr, FrozenContext, Option, Permission, Result (+4 more)
+### Community 1277 - ".pick"
+Cohesion: 0.26
+Nodes (11): pick_array(), pick_array_field(), pick_array_fields(), pick_array_fields_flat(), pick_array_thing(), pick_basic(), pick_none(), pick_thing() (+3 more)
 
 ### Community 1278 - "Отчёт этапа 6: Windows Native Async I/O"
 Cohesion: 0.33
@@ -6752,25 +6979,21 @@ Nodes (5): Flamegraph, Корректность и границы, Отчёт э
 Cohesion: 0.44
 Nodes (5): Parser<'_>, Data, InsertStatement, ParseResult, Stk
 
-### Community 1280 - "impl_enum"
-Cohesion: 0.20
-Nodes (11): impl_enum(), Generics, TokenStream, impl_struct(), Fields, Generics, TokenStream, kind() (+3 more)
-
 ### Community 1281 - "tests/access.rs"
 Cohesion: 0.22
 Nodes (3): Option, String, TestLevel
 
-### Community 1282 - "dbs/session.rs"
-Cohesion: 0.15
-Nodes (10): NewPlannerStrategy, Display, Err, Formatter, FromStr, Result, Self, Uuid (+2 more)
+### Community 1282 - "subscriber.rs"
+Cohesion: 0.22
+Nodes (17): content(), deliver(), drain(), new_ds(), record_session(), replay_table_live_events(), router_delivers_events_captured_before_first_pass(), router_delivery_matches_inline_delivery() (+9 more)
 
 ### Community 1283 - "root_info"
 Cohesion: 0.47
 Nodes (8): process_use_does_not_create_for_anonymous_session_with_auth_enabled(), process_use_does_not_recreate_dropped_parent_for_namespace_editor(), process_use_materializes_for_root_editor(), root_info(), Datastore, Result, String, use_ns_db_does_not_recreate_dropped_parent_for_namespace_editor()
 
-### Community 1284 - "StatementCounters"
+### Community 1284 - "expr/statements/output.rs"
 Cohesion: 0.29
-Nodes (4): Arc, AtomicU64, Self, StatementCounters
+Nodes (8): OutputStatement, Expr, Fetchs, FlowResult, FrozenContext, Option, Stk, Value
 
 ### Community 1285 - ".parse"
 Cohesion: 0.31
@@ -6785,12 +7008,8 @@ Cohesion: 0.25
 Nodes (11): AlterParamStatement, AlterKind, Expr, FrozenContext, Option, Permission, Result, Stk (+3 more)
 
 ### Community 1288 - "ReplayRemap"
-Cohesion: 0.16
-Nodes (13): Mutation, mutation_affects_explicit_indexes(), mutation_allows_physical_index_delta(), ReplayRemap, AtomId, BTreeMap, BTreeSet, DatabaseRoot (+5 more)
-
-### Community 1289 - ".from_fb"
-Cohesion: 0.25
-Nodes (6): FlatBufferBuilder, Input, Output, Result, Self, test_flatbuffers_roundtrip_value()
+Cohesion: 0.19
+Nodes (11): ReplayRemap, BTreeMap, BTreeSet, ConflictKey, DatabaseRoot, FerrosGrynnResult, GlobalAtomId, GraphId (+3 more)
 
 ### Community 1290 - "Surrealism Macros"
 Cohesion: 0.22
@@ -6848,9 +7067,9 @@ Nodes (6): &Geometry, Ctx, Error, Result, Value, IntoJs
 Cohesion: 0.50
 Nodes (7): fut(), Package, Ctx, Result, Value, Vec, run()
 
-### Community 1305 - "Hd"
-Cohesion: 0.26
-Nodes (11): Hd, Hd<'a>, HdRoot, HdRoot<'a>, key(), root(), Cow, DocId (+3 more)
+### Community 1305 - "fnc/record.rs"
+Cohesion: 0.44
+Nodes (10): edge(), exists(), id(), FrozenContext, Option, RecordId, Result, Stk (+2 more)
 
 ### Community 1306 - "Error"
 Cohesion: 0.29
@@ -6876,13 +7095,13 @@ Nodes (5): Location, Range, Self, Span, str_offset()
 Cohesion: 0.57
 Nodes (4): Parser<'_>, IfelseStatement, ParseResult, Stk
 
-### Community 1312 - "runtime/value.rs"
-Cohesion: 0.20
-Nodes (13): bound_value(), estimated_bound_heap_bytes(), estimated_geometry_heap_bytes(), estimated_position_heap_bytes(), estimated_positions_heap_bytes(), estimated_record_id_heap_bytes(), estimated_record_part_heap_bytes(), estimated_values_heap_bytes() (+5 more)
+### Community 1312 - "sq.rs"
+Cohesion: 0.26
+Nodes (9): key(), prefix(), Cow, Result, Self, Vec, Sq, Sq<'a> (+1 more)
 
-### Community 1313 - "Ds"
-Cohesion: 0.36
-Nodes (6): Ds, Ds<'a>, Cow, IndexId, Self, TableName
+### Community 1313 - "AllIndexRoot"
+Cohesion: 0.33
+Nodes (9): AllIndexRoot, AllIndexRoot<'a>, key(), new(), root(), Cow, IndexId, Self (+1 more)
 
 ### Community 1314 - "tests/changefeeds.rs"
 Cohesion: 0.46
@@ -6900,21 +7119,21 @@ Nodes (7): check_permissions_auth_disabled(), check_permissions_auth_enabled(), 
 Cohesion: 0.43
 Nodes (7): check_permissions_auth_disabled(), check_permissions_auth_enabled(), common_permissions_checks(), level_db(), level_ns(), level_root(), Level
 
-### Community 1318 - "wasm_target.rs"
-Cohesion: 0.39
-Nodes (7): apply_rustflags(), ensure_cargo_config(), merge_tokio_unstable_rustflags(), Command, Path, Result, String
+### Community 1318 - "EventQueue"
+Cohesion: 0.23
+Nodes (7): EventQueue, EventQueue<'a>, Cow, Result, TableName, Uuid, Vec
 
-### Community 1319 - "gql_stage_13_resource_probe"
-Cohesion: 0.32
-Nodes (8): directory_bytes(), gql_stage_13_resource_probe(), profile_resources(), profile_rss(), AtomicBool, Path, String, stage13_resource_query()
+### Community 1319 - "mem/registry.rs"
+Cohesion: 0.25
+Nodes (9): memory_reporters_allocated_by_name(), MemoryReporter, MemoryReporterEntry, register_memory_reporter(), MemoryReporter, Send, String, Sync (+1 more)
 
 ### Community 1320 - "Session"
 Cohesion: 0.04
-Nodes (52): CancelHandle, Arc, AtomicBool, CancellationToken, Default, Self, Arc, Auth (+44 more)
+Nodes (60): Create, Arc, Datastore, Routine, String, Read, Arc, Datastore (+52 more)
 
 ### Community 1321 - "GeometryKind"
-Cohesion: 0.16
-Nodes (8): crate::types::PublicGeometryKind, GeometryKind, Err, Formatter, FromStr, PublicGeometryKind, Result, String
+Cohesion: 0.27
+Nodes (7): Box<Kind>, crate::types::PublicGeometryKind, crate::types::PublicKindLiteral, GeometryKind, From, FromStr, PublicGeometryKind
 
 ### Community 1322 - "Q: Почему один файл тестов? Лучше логически разделять тесты на несколько файлов, хотя бы два файла для local и in-memory БД."
 Cohesion: 0.40
@@ -6988,37 +7207,37 @@ Nodes (15): Resamples, Resamples<'a>, Data, Option, Rng, Vec, new_rng(), Rng (+7
 Cohesion: 0.22
 Nodes (9): 1. Итог, 2. Multi-graph runtime, 3. AtomWalk и nested incidence, 4. Hyper и containment, 5. Correctness evidence, 6. Resource/performance evidence, 7. Planner и наблюдаемость, 8. Открытая граница `Q-10` (+1 more)
 
-### Community 1340 - ".compute"
-Cohesion: 0.21
-Nodes (10): RemoveAccessStatement, Base, Default, Expr, FrozenContext, Option, Result, Self (+2 more)
+### Community 1340 - "Update"
+Cohesion: 0.10
+Nodes (21): Cow, D, Into, IntoFuture, Merge, Option, PhantomData, R (+13 more)
 
-### Community 1341 - "BloomFilter"
-Cohesion: 0.26
-Nodes (6): BloomFilter, clear_resets_filter(), empty_filter_contains_nothing(), inserted_keys_are_found(), missing_keys_usually_not_found(), Self
+### Community 1341 - "cli/export.rs"
+Cohesion: 0.29
+Nodes (11): apply_config(), DatabaseConnectionArguments, ExportCommandArguments, ExportConfigArguments, init(), Option, R, Result (+3 more)
 
 ### Community 1342 - ".from_js"
 Cohesion: 0.29
 Nodes (6): Ctx, Error, FromJs, Result, Self, Value
 
-### Community 1343 - "handle.rs"
-Cohesion: 0.17
-Nodes (14): Handle, Handle<T, N>, new_handle(), Clone, Copy, N, PhantomData, T (+6 more)
+### Community 1343 - "Append"
+Cohesion: 0.12
+Nodes (22): (), Append, append_test(), Handle, Navigator, Output, T, (U, V) (+14 more)
 
-### Community 1344 - "root/access/gr.rs"
-Cohesion: 0.23
-Nodes (12): Gr, Gr<'a>, key(), new(), prefix(), Cow, Result, Self (+4 more)
+### Community 1344 - ".extend"
+Cohesion: 0.29
+Nodes (9): extend_array_array(), extend_array_value(), extend_number_errors(), extend_object_errors(), FrozenContext, Part, Result, Stk (+1 more)
 
-### Community 1345 - "GraphqlError"
-Cohesion: 0.10
-Nodes (52): async_graphql::Error, auth_error(), GraphqlError, resolver_error(), Error, From, Into, Kind (+44 more)
+### Community 1345 - ".one_index"
+Cohesion: 0.36
+Nodes (8): Document, FrozenContext, Option, RecordId, Result, Stk, Value, Vec
 
 ### Community 1347 - "asyncevent.rs"
 Cohesion: 0.67
 Nodes (6): Datastore, Result, test_async_event(), test_async_event_max_depth(), test_async_event_retry(), wait_for_events_processing()
 
-### Community 1348 - "process_cpu_time"
-Cohesion: 0.29
-Nodes (7): filetime_ticks(), MeasurementTimer, MeasurementTiming, process_cpu_time(), Duration, Instant, FILETIME
+### Community 1348 - "session_isolation.rs"
+Cohesion: 0.18
+Nodes (11): clone_creates_new_session(), clone_then_immediate_query(), mixed_session_operations(), multiple_namespaces_databases(), query_variables_with_session_vars(), RecordId, session_authentication_isolated(), session_transactions_isolated() (+3 more)
 
 ### Community 1349 - "tests/field.rs"
 Cohesion: 0.52
@@ -7032,9 +7251,9 @@ Nodes (12): assert_valid(), empty_range_returns_single_shard(), full_byte_range_
 Cohesion: 0.15
 Nodes (13): 10. Известные границы и следующие минимальные эксперименты, 1. Итог, 2.1. Physical alternatives, 2.2. Canonical rules, 2. Реализованная структура, 3. Statistics и cost model, 4. Performance screening, 5. Resources и spill (+5 more)
 
-### Community 1352 - "UpdateGraphStatement"
-Cohesion: 0.24
-Nodes (11): GraphPropertyAssignment, GraphPropertyMutation, GraphPropertyPath, Parser<'_>, Expr, FerrosGrynnResult, Identifier, Option (+3 more)
+### Community 1352 - "ValueKind"
+Cohesion: 0.22
+Nodes (5): Display, Formatter, Result, Self, ValueKind
 
 ### Community 1353 - "Q: Добавь в full_plan.md этап сбора проблем, требующих пересмотра спецификаций и исправления кода, включая функциональность, производительность, UX и дублирование."
 Cohesion: 0.40
@@ -7043,6 +7262,10 @@ Nodes (4): Answer, Outcome, Q: Добавь в full_plan.md этап сбора 
 ### Community 1354 - "enum_mixed_with_value.rs"
 Cohesion: 0.29
 Nodes (3): EnumMixedWithValue, String, Vec
+
+### Community 1355 - "Constant"
+Cohesion: 0.31
+Nodes (5): Constant, crate::expr::Constant, From, Self, String
 
 ### Community 1357 - "async_stream/bench.rs"
 Cohesion: 0.57
@@ -7056,9 +7279,9 @@ Nodes (9): geometry_into_json_value(), line_into_json_value(), point_into_json_v
 Cohesion: 0.60
 Nodes (5): borrow_decode(), decode(), encode(), TokenStream, to_escaped()
 
-### Community 1360 - "match_nested.rs"
-Cohesion: 0.33
-Nodes (3): row_count(), Transaction, within_is_bounded_transitive_and_preserves_multiple_owners()
+### Community 1360 - ".drop"
+Cohesion: 0.22
+Nodes (5): return_graph_is_owned_and_closes_selected_edge_endpoints(), row_count(), Transaction, within_is_bounded_transitive_and_preserves_multiple_owners(), transaction_execute_rejects_nested_transaction_syntax_before_mutation()
 
 ### Community 1361 - "Cross-Cutting Concerns"
 Cohesion: 0.33
@@ -7156,21 +7379,21 @@ Nodes (4): Answer, Outcome, Q: Почему superblock.fgb, раздельные
 Cohesion: 0.60
 Nodes (5): query_basic(), query_basic_with_modification(), query_root_function(), query_root_record(), Result
 
-### Community 1385 - "LocalPokemonApi"
-Cohesion: 0.20
-Nodes (8): LocalPokemonApi, QueryResult, Drop, JoinHandle, Option, SocketAddr, String, Value
+### Community 1385 - "providers.rs"
+Cohesion: 0.04
+Nodes (64): ApiProvider, AuthorisationProvider, BucketProvider, CatalogProvider, DatabaseProvider, NamespaceProvider, NodeProvider, ProviderFutureSendRequirement (+56 more)
 
 ### Community 1386 - "init"
 Cohesion: 0.40
 Nodes (5): init(), otlp_logs_active(), Option, Result, SdkLoggerProvider
 
-### Community 1387 - "AlterModuleStatement"
-Cohesion: 0.24
-Nodes (9): AlterModuleStatement, AlterKind, FrozenContext, ModuleName, Option, Permission, Result, String (+1 more)
+### Community 1387 - "Telemetry"
+Cohesion: 0.20
+Nodes (8): Backward-compatibility instrument set (`OtelObserver`), Histogram bucket views, Local development, Process metric freshness, Push interval, Removed environment variables, Telemetry, What flows over OTLP
 
 ### Community 1388 - "Отчёт по этапу 21: durable PARAM, именованные UDF и оставшийся язык"
-Cohesion: 0.25
-Nodes (8): 1. Реализованный срез, 2. Correctness evidence, 3. Методика U11, 4. Результаты U11, 5. Найденные и устранённые hot paths, 6. VTune, 7. Закрытие U12, Отчёт по этапу 21: durable PARAM, именованные UDF и оставшийся язык
+Cohesion: 0.13
+Nodes (14): 1. Durable schema, 2. Analysis и execution, 3. Runtime language, 4. Порядок реализации, 5. Gate, Этап 21. Durable PARAM, именованные UDF и оставшийся язык, 1. Реализованный срез, 2. Correctness evidence (+6 more)
 
 ### Community 1389 - "SurrealMl"
 Cohesion: 0.33
@@ -7224,13 +7447,13 @@ Nodes (4): array_uniq(), criterion_benchmark(), Array, Criterion
 Cohesion: 0.17
 Nodes (16): join_two(), block_on(), cancel(), Inner, new(), AtomicUsize, Drop, F (+8 more)
 
-### Community 1403 - "AllIndexRoot"
+### Community 1403 - "check_is_path_allowed"
 Cohesion: 0.33
-Nodes (9): AllIndexRoot, AllIndexRoot<'a>, key(), new(), root(), Cow, IndexId, Self (+1 more)
+Nodes (8): check_is_path_allowed(), extract_allowed_paths(), Path, PathBuf, Result, Vec, test_allow_list_access(), test_empty_allow_list_denies_access()
 
-### Community 1404 - "Canceller"
-Cohesion: 0.43
-Nodes (3): Canceller, Arc, AtomicBool
+### Community 1404 - "expr/statements/alter/index.rs"
+Cohesion: 0.19
+Nodes (11): AlterIndexStatement, AlterKind, Default, Expr, FrozenContext, Option, Result, Self (+3 more)
 
 ### Community 1405 - "EscapeWriter<W>"
 Cohesion: 0.60
@@ -7244,9 +7467,9 @@ Nodes (4): len(), Bytes, Result, Value
 Cohesion: 0.23
 Nodes (7): crate::expr::statements::RemoveNamespaceStatement, RemoveNamespaceStatement, Default, Expr, From, Self, String
 
-### Community 1409 - "runtime/mod.rs"
-Cohesion: 0.10
-Nodes (4): FerrosGrynnError, H, Result, ValueKind
+### Community 1409 - "generate_registration_body"
+Cohesion: 0.41
+Nodes (11): arg_sentinel_const_name(), encode_name(), generate_arg_sentinels(), generate_registration_body(), generate_sentinel(), Option, Pat, String (+3 more)
 
 ### Community 1410 - "observe/process.rs"
 Cohesion: 0.80
@@ -7300,13 +7523,17 @@ Nodes (4): (b) Keywords, Non-reserved words (lines 3538–3584 and `nonReservedW
 Cohesion: 0.50
 Nodes (3): Always check, Code Review Guidelines, Skip
 
-### Community 1424 - "gql_stage_14_optimizer_probe"
-Cohesion: 0.29
-Nodes (13): emit_result(), execute_value(), explain_operator(), gql_stage_14_optimizer_probe(), median(), percentile(), ProbeResult, Datastore (+5 more)
+### Community 1423 - "Idioms"
+Cohesion: 0.18
+Nodes (8): Idioms, Deref, Idiom, IntoIter, IntoIterator, Ord, PartialOrd, Target
 
-### Community 1425 - "test"
-Cohesion: 0.29
-Nodes (7): array_at(), array_first(), array_last(), array_slice(), test(), string_matches(), string_slice()
+### Community 1424 - "gql_stage_14_optimizer_probe"
+Cohesion: 0.36
+Nodes (11): emit_result(), execute_value(), explain_operator(), gql_stage_14_optimizer_probe(), median(), percentile(), ProbeResult, Datastore (+3 more)
+
+### Community 1425 - "Dir"
+Cohesion: 0.31
+Nodes (5): crate::expr::Dir, Dir, From, Self, String
 
 ### Community 1426 - "Script"
 Cohesion: 0.27
@@ -7341,12 +7568,12 @@ Cohesion: 0.50
 Nodes (3): get_prompt(), GetPromptResult, Value
 
 ### Community 1435 - "alloc.rs"
-Cohesion: 0.07
-Nodes (22): AllocationStats, check_balanced_with_tolerance(), check_no_leaks(), get_stats(), reset_counters(), GlobalAlloc, Layout, test_reset_counters() (+14 more)
+Cohesion: 0.17
+Nodes (14): AllocationStats, check_balanced_with_tolerance(), check_no_leaks(), get_stats(), reset_counters(), GlobalAlloc, Layout, test_reset_counters() (+6 more)
 
-### Community 1436 - "Аналитический отчёт по этапу 1.6"
-Cohesion: 0.20
-Nodes (9): 1. Результат и метод, 2. `logos` и lexer, 3. `VecMap` и `VecSet`, 4. Top-level statements и macro AST, 5. Macro type system наподобие `SurrealValue`, 6. Что позаимствовать из `storekey`, 7. Что позаимствовать из `surrealmx`, 8. Что позаимствовать из `ferntree` (+1 more)
+### Community 1436 - "Option"
+Cohesion: 0.22
+Nodes (3): MaybeUninit, Option, UnitSlot
 
 ### Community 1442 - "10. Import / Export"
 Cohesion: 0.67
@@ -7408,9 +7635,9 @@ Nodes (3): 8. Schema Definition (DEFINE / ALTER / REMOVE), Invariants, Review Tr
 Cohesion: 0.67
 Nodes (3): 9. Custom API Dispatch, Invariants, Review Triggers
 
-### Community 1462 - "IntoFuture"
-Cohesion: 0.52
-Nodes (4): IntoFuture, Select<'r, Client, Option<R>, Live>, Select<'r, Client, Value, Live>, Select<'r, Client, Vec<R>, Live>
+### Community 1462 - "expr/statements/alter/sequence.rs"
+Cohesion: 0.24
+Nodes (9): AlterSequenceStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+1 more)
 
 ### Community 1464 - "Q: Проверь основной Cargo.toml: почему workspace dependencies не находятся?"
 Cohesion: 0.40
@@ -7420,81 +7647,89 @@ Nodes (4): Answer, Outcome, Q: Проверь основной Cargo.toml: по�
 Cohesion: 0.36
 Nodes (9): delete_restricts_attached_global_atom(), direct_dml_uses_global_atom_store_without_graph_membership(), graph_scoped_record_reference_falls_back_to_base_for_non_member(), graph_scoped_record_reference_uses_effective_member_properties(), graph_scoped_select_and_update_use_effective_properties(), graph_scoped_update_requires_membership(), referenced_store(), Datastore (+1 more)
 
+### Community 1471 - "ApiError"
+Cohesion: 0.32
+Nodes (3): ApiError, String, TypesError
+
+### Community 1472 - "impl_enum"
+Cohesion: 0.20
+Nodes (11): impl_enum(), Generics, TokenStream, impl_struct(), Fields, Generics, TokenStream, kind() (+3 more)
+
 ### Community 1475 - "Исполнение dependency-ordered продолжения"
 Cohesion: 0.22
 Nodes (9): B+tree: hot roots и disjoint leaf chain, Graph frontier и sparse properties, Oversubscribed mmap и точная классификация page faults, R8: read epoch и таблица разрешённых страниц, VTune для frame-IoRing QD32, Исполнение dependency-ordered продолжения, Контроль аппаратного окружения, Методика mixed DB workloads (+1 more)
 
-### Community 1510 - "Groups"
-Cohesion: 0.19
-Nodes (8): Group, Groups, Deref, Group, Idiom, String, Target, Vec
+### Community 1510 - "import_load.rs"
+Cohesion: 0.52
+Nodes (6): bench_import_throughput(), generate_insert_statement(), Criterion, String, statements_needed(), target_size_bytes()
 
-### Community 1518 - "prefix_concurrency.rs"
-Cohesion: 0.31
-Nodes (9): concurrent_deletes_no_phantom_within_snapshot(), concurrent_writers_compete_for_same_keys(), concurrent_writers_disjoint_prefix_groups(), concurrent_writers_same_prefix_group_disjoint_keys(), many_readers_during_inserts(), pkey(), prefix_end(), Vec (+1 more)
+### Community 1518 - "IfelseStatement"
+Cohesion: 0.21
+Nodes (8): crate::expr::statements::IfelseStatement, IfelseStatement, Expr, From, Option, Self, String, Vec
 
 ### Community 1536 - "build_store"
 Cohesion: 0.57
 Nodes (7): build_store(), main(), query_row_count(), Box, Datastore, Error, Result
 
-### Community 1537 - "nd.rs"
-Cohesion: 0.27
-Nodes (10): key(), Nd, new(), prefix(), Self, Uuid, Vec, suffix() (+2 more)
+### Community 1537 - "parse_surrealism_attrs"
+Cohesion: 0.22
+Nodes (13): Comma, parse_surrealism_attr(), parse_surrealism_attrs(), Attribute, Option, Result, String, SurrealismAttrs (+5 more)
 
-### Community 1614 - "Building on Ubuntu 20.04 (amd64)"
-Cohesion: 0.33
-Nodes (6): Building on Ubuntu 20.04 (amd64), ✅ Compile for `aarch64-unknown-linux-gnu` (Linux), ✅ Compile for `x86_64-unknown-linux-gnu` (Linux), ❌ Cross-compile for `armv7-unknown-linux-musleabihf` (Raspberry Pi), ❌ Cross-compile for `x86_64-pc-windows-gnu` (Windows), ❌ Cross-compile for `x86_64-unknown-linux-musl` (Linux Musl)
+### Community 1614 - "ctx/context.rs"
+Cohesion: 0.14
+Nodes (18): Canceller, Arc, AtomicBool, is_allowed_respects_context_auth_toggle_and_base(), Action, Base, PublicVariables, Url (+10 more)
 
-### Community 1649 - "Building on Ubuntu 20.04 (arm64)"
-Cohesion: 0.33
-Nodes (6): Building on Ubuntu 20.04 (arm64), ✅ Compile for `aarch64-unknown-linux-gnu` (Linux), ✅ Compile for `x86_64-unknown-linux-gnu` (Linux), ❌ Cross-compile for `armv7-unknown-linux-musleabihf` (Raspberry Pi), ❌ Cross-compile for `x86_64-pc-windows-gnu` (Windows), ❌ Cross-compile for `x86_64-unknown-linux-musl` (Linux Musl)
+### Community 1649 - "arbitrary/parts.rs"
+Cohesion: 0.35
+Nodes (9): arb_group(), arb_order(), arb_splits(), idiom_from_expr(), idiom_is_basic(), Fields, Groups, Ordering (+1 more)
 
 ### Community 1650 - "Asynchronous module guidance"
 Cohesion: 0.40
 Nodes (4): Asynchronous module guidance, Карта подмодулей, Назначение и границы, Проверка при подключении
 
-### Community 1652 - "fnc/geo.rs"
-Cohesion: 0.51
-Nodes (10): area(), bearing(), centroid(), decode(), distance(), encode(), Geometry, Result (+2 more)
+### Community 1652 - "ModuleCommand"
+Cohesion: 0.31
+Nodes (10): init(), ModuleCommand, ModuleCommandArgs, parse_value(), Option, PathBuf, Result, String (+2 more)
 
 ### Community 1653 - "Q: Где в проекте определены DiskANN, ALTER, NativeAsync, format v1, conformance и статусы реализации для этапа 2?"
 Cohesion: 0.50
 Nodes (3): Answer, Outcome, Q: Где в проекте определены DiskANN, ALTER, NativeAsync, format v1, conformance и статусы реализации для этапа 2?
 
-### Community 1654 - "Action"
-Cohesion: 0.21
-Nodes (11): Action, Notification, Display, Err, Formatter, FromStr, Option, Result (+3 more)
-
-### Community 1655 - "Troubleshooting"
+### Community 1654 - "PathEliminationSignal"
 Cohesion: 0.33
-Nodes (6): Crate Publishing Fails, Need to Retry a Failed Release, PR Already Exists, Troubleshooting, Workflow Fails on Branch Creation, Wrong Version on Main
+Nodes (5): PathEliminationSignal, Display, Error, Formatter, Result
 
-### Community 1656 - "SqlFormat"
-Cohesion: 0.03
-Nodes (77): IdSet, IdSet<I, V, S>, Hash, Index, IndexMut, Option, Output, S (+69 more)
+### Community 1655 - "Hg"
+Cohesion: 0.31
+Nodes (7): generation_key_is_outside_hp_range(), Hg, Hg<'a>, Cow, IndexId, Self, TableName
 
-### Community 1657 - "Idioms"
-Cohesion: 0.14
-Nodes (12): Idioms, Deref, Idiom, Into, IntoIter, IntoIterator, Ord, Ordering (+4 more)
+### Community 1656 - ".from_fb"
+Cohesion: 0.25
+Nodes (6): FlatBufferBuilder, Input, Output, Result, Self, test_flatbuffers_roundtrip_value()
 
-### Community 1658 - "topological_sort_computed_fields"
-Cohesion: 0.33
-Nodes (6): topo_sort_dep_on_stored_field(), topo_sort_diamond(), topo_sort_empty(), topo_sort_linear_chain(), topo_sort_no_deps(), topological_sort_computed_fields()
+### Community 1657 - "values/storage/mod.rs"
+Cohesion: 0.08
+Nodes (9): FerrosGrynnError, DiskAtomRef, QualifiedAtomRef, Display, FerrosGrynnResult, Formatter, Result, Self (+1 more)
+
+### Community 1658 - "Ds"
+Cohesion: 0.36
+Nodes (6): Ds, Ds<'a>, Cow, IndexId, Self, TableName
 
 ### Community 1659 - "commit_people_graph"
-Cohesion: 0.33
+Cohesion: 0.29
 Nodes (10): assert_people_graph(), commit_people_graph(), create_uncommitted_graph(), exercise_normalized_atom_model(), AtomRef, Datastore, GraphRef, commit_is_visible_through_the_public_graph_api() (+2 more)
 
-### Community 1660 - "init"
-Cohesion: 0.47
-Nodes (5): init(), Option, PathBuf, Result, String
+### Community 1660 - "He"
+Cohesion: 0.36
+Nodes (8): He, He<'a>, key(), Cow, ElementId, IndexId, Self, TableName
 
-### Community 1661 - ".compute"
-Cohesion: 0.21
-Nodes (10): RemoveUserStatement, Base, Default, Expr, FrozenContext, Option, Result, Self (+2 more)
+### Community 1661 - "Signin"
+Cohesion: 0.31
+Nodes (6): Cow, IntoFuture, Value, Signin, Signin<'_, C>, Signin<'r, Client>
 
-### Community 1662 - "Datastore module guidance"
-Cohesion: 0.33
-Nodes (5): Datastore module guidance, Инварианты, Карта владельцев, Назначение, Проверка
+### Community 1662 - "query_20260830_161826_какие_границы_модулей__прямые_зависимости_и_refere.md"
+Cohesion: 0.22
+Nodes (7): Answer, Q: Какие границы модулей, прямые зависимости и reference-подходы полезны для этапа 1.6 Ferros-Grynn?, Datastore module guidance, Инварианты, Карта владельцев, Назначение, Проверка
 
 ### Community 1664 - "Graph module guidance"
 Cohesion: 0.33
@@ -7505,48 +7740,52 @@ Cohesion: 0.33
 Nodes (5): Storage module guidance, Инварианты, Карта владельцев, Назначение и границы, Проверка
 
 ### Community 1666 - "Syntax frontend guidance"
-Cohesion: 0.40
+Cohesion: 0.33
 Nodes (5): Syntax frontend guidance, Инварианты, Карта владельцев, Назначение, Проверка
 
-### Community 1671 - "Dd"
-Cohesion: 0.27
-Nodes (9): Dd, Dd<'a>, DdRoot, DdRoot<'a>, Cow, DocId, IndexId, Self (+1 more)
+### Community 1671 - ".set"
+Cohesion: 0.60
+Nodes (4): FrozenContext, Part, Result, Stk
 
 ### Community 1673 - "4. Все прямые crates из корневого `Cargo.toml`"
 Cohesion: 0.40
 Nodes (5): 4.1. Есть подтверждённый connected production/test consumer, 4.2. Consumer существует только в prototype, отключённом коде, tests или другом package, 4.3. Импортов не найдено: удалить сейчас, вернуть только с первым consumer, 4.4. Порядок dependency cleanup, 4. Все прямые crates из корневого `Cargo.toml`
 
-### Community 1678 - "CustomFilter"
-Cohesion: 0.13
-Nodes (20): CustomFilter, Clone, EnvFilter, Fn, LevelFilter, Metadata, S, Self (+12 more)
+### Community 1678 - "future.rs"
+Cohesion: 0.33
+Nodes (7): F, Kvs, new_ds(), Datastore, Uuid, concurrency(), Result
+
+### Community 1681 - "cast.rs"
+Cohesion: 0.20
+Nodes (8): CastErrorExt, Result<T, CastError>, test_cast_table_to_table(), test_cast_to_table_generic(), test_cast_to_table_specific(), test_cast_to_table_union(), ElementPosition, String
 
 ### Community 1685 - "Transaction"
-Cohesion: 0.06
-Nodes (37): ConflictKey, AtomId, GlobalAtomId, SchemaId, TransactionOptions, AtomSnapshot, invariant_assertion_error(), Mutation (+29 more)
+Cohesion: 0.07
+Nodes (38): mutation_affects_explicit_indexes(), mutation_allows_physical_index_delta(), AtomSnapshot, invariant_assertion_error(), Mutation, AnalyzerId, Arc, AtomKind (+30 more)
 
-### Community 1695 - "Base"
-Cohesion: 0.19
-Nodes (8): Base, crate::expr::Base, Display, Formatter, From, Result, Self, String
+### Community 1686 - "LetStatement"
+Cohesion: 0.22
+Nodes (8): LetStatement, LetValue, Parser<'_>, Expr, FerrosGrynnResult, Identifier, Option, Stk
 
-### Community 1696 - "Version Management"
-Cohesion: 0.40
-Nodes (5): Auto-Calculation Rules, Main Branch Version Evolution, Manual Override, Surrealism Crates, Version Management
+### Community 1695 - "compat/fixtures.rs"
+Cohesion: 0.02
+Nodes (127): access_bearer(), access_bearer_refresh(), access_jwt_jwks(), access_record(), access_with_authenticate(), appending_both(), appending_new_values(), appending_none() (+119 more)
+
+### Community 1696 - ".compute"
+Cohesion: 0.21
+Nodes (10): RemoveUserStatement, Base, Default, Expr, FrozenContext, Option, Result, Self (+2 more)
 
 ### Community 1697 - "Key"
 Cohesion: 0.33
 Nodes (7): Key, From, Lookup, Self, String, TableName, Uuid
 
-### Community 1698 - "tests/create.rs"
-Cohesion: 0.53
-Nodes (5): check_permissions_auth_disabled(), check_permissions_auth_enabled(), common_permissions_checks(), create_or_insert_with_permissions(), Result
+### Community 1698 - "Отчёт по этапу 23: HNSW и DiskANN"
+Cohesion: 0.25
+Nodes (8): 1. Реализованный срез, 2. Сверка с SurrealDB, 3. Correctness evidence, 4. Recall и 100K latency, 5. High-dimensional HNSW, 6. Low-cache stress и profiling, 7. Что остаётся до закрытия V11–V13, Отчёт по этапу 23: HNSW и DiskANN
 
-### Community 1699 - "literals.rs"
-Cohesion: 0.20
-Nodes (20): ExpressionFolder, fold_condition_expressions(), is_empty_array_literal(), key_lit_to_expr(), literal_to_value(), BinaryOperator, Cond, Error (+12 more)
-
-### Community 1700 - "visit.rs"
-Cohesion: 0.22
-Nodes (7): KnnConditionRewriter, KnnConditionRewriter<'a>, Error, Expr, KnnExpressions, MutVisitor, Result
+### Community 1699 - "new"
+Cohesion: 0.29
+Nodes (7): new(), Box, Layer, Result, S, Send, Sync
 
 ### Community 1701 - "Этап 23. Exact KNN, HNSW и page-backed DiskANN"
 Cohesion: 0.20
@@ -7564,14 +7803,6 @@ Nodes (8): generated_small_graphs_match_the_path_mode_and_shortest_oracle(), ora
 Cohesion: 0.16
 Nodes (7): Level, Display, Formatter, Option, Result, Self, String
 
-### Community 1705 - "upgrade.rs"
-Cohesion: 0.32
-Nodes (11): file_platform_suffix(), init(), parse_version(), replace_exe(), Cow, Option, Path, Result (+3 more)
-
-### Community 1706 - "live_query_scaling.rs"
-Cohesion: 0.39
-Nodes (8): bench_live_query_scaling(), create_one(), env(), prepare(), Prepared, Criterion, Datastore, T
-
 ### Community 1707 - "Этап 10. Atomic Import"
 Cohesion: 0.20
 Nodes (9): 1. Назначение и статус, 2.1. Atomic COW staging, 2.2. Statements и graph scope, 2.3. Options, 2. Нормативный контракт, 3. Публичный Rust API, 4. Dependency-ordered реализация, 5. Gates (+1 more)
@@ -7581,32 +7812,32 @@ Cohesion: 0.20
 Nodes (10): 1. Итог, 2.1. Occurrence и path contract, 2.2. Parser, analysis и IR, 2.3. Enumeration и shortest, 2. Реализация, 3. Correctness evidence, 4. Performance и профилирование, 5. Resource contract (+2 more)
 
 ### Community 1709 - "local_store/tests.rs"
-Cohesion: 0.09
-Nodes (45): last_startup_timings(), Duration, StartupTimings, atom_and_graph_cow_churn_keeps_only_live_generations(), cleanup_failure_does_not_undo_commit_and_is_retried(), corrupt_page_checksum(), corrupt_search_indexes_fall_back_automatically_but_fail_when_forced(), deferred_search_indexes_rebuild_before_becoming_query_visible() (+37 more)
+Cohesion: 0.15
+Nodes (33): atom_and_graph_cow_churn_keeps_only_live_generations(), cleanup_failure_does_not_undo_commit_and_is_retried(), corrupt_page_checksum(), corrupt_search_indexes_fall_back_automatically_but_fail_when_forced(), deferred_search_indexes_rebuild_before_becoming_query_visible(), defining_sibling_vector_indexes_reuses_existing_bases(), derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen(), diagnostic_usize() (+25 more)
 
-### Community 1710 - "lib/mod.rs"
-Cohesion: 0.60
-Nodes (4): benchmark_group(), init(), Criterion, String
+### Community 1710 - "live_query_scaling.rs"
+Cohesion: 0.39
+Nodes (8): bench_live_query_scaling(), create_one(), env(), prepare(), Prepared, Criterion, Datastore, T
 
-### Community 1711 - ".compute"
-Cohesion: 0.23
-Nodes (9): RemoveAnalyzerStatement, Default, Expr, FrozenContext, Option, Result, Self, Stk (+1 more)
+### Community 1711 - "Self"
+Cohesion: 0.39
+Nodes (4): Into, Ordering, Self, Strand
 
-### Community 1712 - ".one_index"
+### Community 1712 - "major"
+Cohesion: 0.44
+Nodes (9): major(), minor(), parse_version(), patch(), Version, semver_extract(), semver_increment(), semver_set() (+1 more)
+
+### Community 1713 - "engine/mod.rs"
+Cohesion: 0.27
+Nodes (8): IntervalStream, Instant, Option, Pin, Poll, Self, Uuid, Interval
+
+### Community 1714 - "AuthLimit"
+Cohesion: 0.33
+Nodes (5): AuthLimit, Auth, Level, Option, Self
+
+### Community 1715 - "expect"
 Cohesion: 0.36
-Nodes (8): Document, FrozenContext, Option, RecordId, Result, Stk, Value, Vec
-
-### Community 1713 - "evaluate_recurse_path"
-Cohesion: 0.70
-Nodes (4): evaluate_recurse_path(), Arc, FlowResult, Value
-
-### Community 1714 - "Step-by-Step Instructions"
-Cohesion: 0.40
-Nodes (5): Major Version Bump, Patch Release (X.Y.Z), Pre-Release (Alpha/Beta/RC), Stable Release (X.Y.0), Step-by-Step Instructions
-
-### Community 1715 - "evaluate_recurse_shortest"
-Cohesion: 0.70
-Nodes (4): evaluate_recurse_shortest(), Arc, FlowResult, Value
+Nodes (11): chain(), diff(), expect(), patch(), Box, Closure, FrozenContext, Option (+3 more)
 
 ### Community 1716 - "tests/import.rs"
 Cohesion: 0.23
@@ -7616,17 +7847,17 @@ Nodes (13): gql_and_callback_import_publish_the_same_logical_root_and_report(), 
 Cohesion: 0.40
 Nodes (4): Answer, Outcome, Q: Добавить точный layout label entry page и typed node/edge label key в combined statistics, Source Nodes
 
-### Community 1718 - "cli/export.rs"
+### Community 1718 - "is_allowed"
+Cohesion: 0.36
+Nodes (8): Error, is_allowed(), is_allowed_check(), is_expired_token_error(), Action, Resource, Result, String
+
+### Community 1719 - "geometry_performance_probe.rs"
 Cohesion: 0.29
-Nodes (11): apply_config(), DatabaseConnectionArguments, ExportCommandArguments, ExportConfigArguments, init(), Option, R, Result (+3 more)
+Nodes (11): Directory, execute(), geometry_stage_24_paired_probe(), measure(), measure_dml(), median(), Datastore, Drop (+3 more)
 
-### Community 1719 - ".poll_want"
-Cohesion: 0.50
-Nodes (3): Pin, Poll, Self
-
-### Community 1720 - "State"
-Cohesion: 0.60
-Nodes (3): From, State, usize
+### Community 1720 - "Dn"
+Cohesion: 0.33
+Nodes (7): Dn, Dn<'a>, Cow, ElementId, IndexId, Self, TableName
 
 ### Community 1721 - ".value"
 Cohesion: 0.29
@@ -7636,322 +7867,390 @@ Nodes (6): Constant, ConstantValue, Datetime, Duration, String, Value
 Cohesion: 0.50
 Nodes (6): Lookup, Equivalent, Key, RecordIdKey, Uuid, test_equivalent()
 
-### Community 1723 - "Architecture"
-Cohesion: 0.50
-Nodes (4): Architecture, Key Features, Scripts, Workflow Jobs
+### Community 1723 - "ApiResponse"
+Cohesion: 0.18
+Nodes (13): ApiResponse, Error, From, HeaderMap, Into, PublicObject, PublicValue, Result (+5 more)
 
 ### Community 1724 - "Connect<Db, R>"
 Cohesion: 0.23
 Nodes (6): Connect<Db, R>, AolMode, Display, Duration, Self, SnapshotMode
 
-### Community 1725 - "execute"
-Cohesion: 0.32
-Nodes (7): execute(), GqlParams, CallToolResult, Option, Result, String, Value
+### Community 1725 - "Commit"
+Cohesion: 0.25
+Nodes (6): Commit, Commit<C>, IntoFuture, Self, Transaction, Uuid
 
 ### Community 1726 - "Отчёт этапа 13: реляционный SELECT для атомов и графов"
 Cohesion: 0.17
 Nodes (12): Bounded/spilled workloads, Correctness evidence, Durable graph properties, Performance и resource gate, Row, source и execution model, Spill, память и cursors, Tooling gate, Отложенная поверхность (+4 more)
 
-### Community 1727 - "column_name"
-Cohesion: 0.47
-Nodes (8): column_name(), Result, Span, String, SyntaxError, validate_alias(), validate_param_name(), validate_var()
+### Community 1727 - "surrealmx/tests/scan_out_of_range.rs"
+Cohesion: 0.33
+Nodes (8): hex(), make_key(), make_range(), Duration, String, Vec, run_once(), scan_never_returns_keys_outside_requested_range()
 
-### Community 1728 - "Constant"
-Cohesion: 0.31
-Nodes (5): Constant, crate::expr::Constant, From, Self, String
+### Community 1728 - "physical_index_base_path"
+Cohesion: 0.22
+Nodes (7): GenerationFailureGuard, physical_index_base_path(), Datastore, Drop, PathBuf, Self, TestDirectory
 
 ### Community 1729 - "LocalQuerySnapshotInner"
-Cohesion: 0.14
-Nodes (31): ClassCounts, DegreeHistograms, LabelCounts, PropertyHistograms, LocalQuerySnapshotInner, BTreeMap, IndexId, CachedPart (+23 more)
+Cohesion: 0.12
+Nodes (35): ClassCounts, DegreeHistograms, LabelCounts, PropertyHistograms, LocalQuerySnapshotInner, BTreeMap, CheckpointGeneration, Lsn (+27 more)
 
 ### Community 1730 - "init"
 Cohesion: 0.32
 Nodes (7): init(), Option, PathBuf, Result, String, Value, Vec
 
-### Community 1731 - "Dir"
-Cohesion: 0.31
-Nodes (5): crate::expr::Dir, Dir, From, Self, String
+### Community 1731 - "image"
+Cohesion: 0.47
+Nodes (7): empty_projection_and_budget_overflow_cancellation_fail_before_publication(), every_algorithm_round_trips_exact_full_page_projection_and_payload(), header(), header_and_sections_reject_adversarial_roots_tags_ordinals_and_reserved_bytes(), image(), FerrosGrynnResult, Vec
 
-### Community 1732 - "fingerprint.rs"
-Cohesion: 0.56
-Nodes (8): fingerprints(), hash_expr(), hash_graph_reference(), hash_optional_expr(), hash_select(), hash_source(), Hasher, Option
+### Community 1732 - "ReturnStatement"
+Cohesion: 0.22
+Nodes (7): Parser<'_>, ReturnStatement, Expr, FerrosGrynnResult, Identifier, Option, Stk
 
 ### Community 1733 - "Этап 22. Durable analyzers и Fulltext BM25"
 Cohesion: 0.25
 Nodes (8): 1. Граница этапа, 2. Analyzer, 3. Fulltext, 4. Durable layout и публикация, 5. MVCC, planning и maintenance, 6. Порядок реализации, 7. Gates, Этап 22. Durable analyzers и Fulltext BM25
 
-### Community 1734 - "Examples"
-Cohesion: 0.50
-Nodes (4): Example 1: Beta Release Series, Example 2: Patch Release Series, Example 3: Parallel Releases, Examples
+### Community 1734 - "stmt/transaction.rs"
+Cohesion: 0.33
+Nodes (6): BeginStatement, CommitStatement, ExecutionModeName, Parser<'_>, FerrosGrynnResult, TransactionIsolationName
 
-### Community 1735 - "Patch Release Workflow"
-Cohesion: 0.50
-Nodes (4): Example Workflow, Individual Backport PRs, Main First Philosophy, Patch Release Workflow
+### Community 1735 - "execute"
+Cohesion: 0.32
+Nodes (7): execute(), GqlParams, CallToolResult, Option, Result, String, Value
 
-### Community 1738 - "module/info.rs"
-Cohesion: 0.83
-Nodes (3): init(), PathBuf, Result
+### Community 1738 - "execute"
+Cohesion: 0.32
+Nodes (7): execute(), QueryParams, CallToolResult, Option, Result, String, Value
 
-### Community 1739 - "SkipContent"
-Cohesion: 0.09
-Nodes (20): Path, SkipContent, NamedFieldsAttributes, Attribute, Option, Self, String, Attribute (+12 more)
+### Community 1739 - ".atomic_import_item"
+Cohesion: 0.18
+Nodes (7): Mutation, Apply, DatabaseRoot, FerrosGrynnResult, IndexId, Vec, Transaction
 
 ### Community 1740 - "Lookup"
 Cohesion: 0.52
 Nodes (5): Lookup, Equivalent, Key, TableName, Uuid
 
-### Community 1741 - "ApiError"
-Cohesion: 0.32
-Nodes (3): ApiError, String, TypesError
+### Community 1741 - "wasm_target.rs"
+Cohesion: 0.39
+Nodes (7): apply_rustflags(), ensure_cargo_config(), merge_tokio_unstable_rustflags(), Command, Path, Result, String
 
 ### Community 1742 - "Этап 19. Windows GA-core gate и freeze core v1"
 Cohesion: 0.25
 Nodes (8): 1. Граница этапа, 2. Dependency-ordered выполнение, 3. Утверждённый runtime-resource contract, 4. Correctness gates, 5. Resource/performance gates, 6. Финальный gate, Текущий прогресс, Этап 19. Windows GA-core gate и freeze core v1
 
+### Community 1743 - "Version"
+Cohesion: 0.32
+Nodes (5): Cow, IntoFuture, Version, Version<'_, C>, Version<'r, Client>
+
 ### Community 1744 - "ColorMode"
 Cohesion: 0.14
 Nodes (14): ColorMode, ArgMatches, Result, run(), Progress, Progress<I, BufWriter<Stderr>>, Progress<I, W>, Error (+6 more)
 
-### Community 1745 - "NoError"
-Cohesion: 0.83
-Nodes (3): anyhow::Error, NoError, From
+### Community 1745 - "backup_version.rs"
+Cohesion: 0.25
+Nodes (7): export_import_different_data_types(), export_import_multiple_tables(), export_import_versioned_range_queries(), export_import_versioned_records(), export_import_versions_with_inserts_updates_deletes(), String, User
 
 ### Community 1746 - "Отчёт этапа 18: self-contained graph results и Atomic `BUILD GRAPH`"
 Cohesion: 0.25
 Nodes (8): 1. Итог, 2. Реализованный срез, 3. Durable contract, 4. Correctness evidence, 5. Resource и performance gate, 6. Границы результата, 7. Финальные tooling gates, Отчёт этапа 18: self-contained graph results и Atomic `BUILD GRAPH`
 
-### Community 1747 - "GeometryKind"
-Cohesion: 0.29
-Nodes (5): GeometryKind, Display, Formatter, Result, String
+### Community 1747 - "visit.rs"
+Cohesion: 0.22
+Nodes (7): KnnConditionRewriter, KnnConditionRewriter<'a>, Error, Expr, KnnExpressions, MutVisitor, Result
 
 ### Community 1748 - "tests/match.rs"
 Cohesion: 0.18
 Nodes (5): match_optional_distinct_modes_and_expansion_budget_follow_the_clause_contract(), matching_ids(), RecordId, Transaction, Vec
 
-### Community 1749 - "TopLevelExpr"
+### Community 1749 - "Отчёт этапа 11: транзакционные операторы GrynnQL"
+Cohesion: 0.29
+Nodes (7): Correctness evidence, Performance gate, Q-06: Serializable concurrency, Tooling, Отчёт этапа 11: транзакционные операторы GrynnQL, Реализация, Результат
+
+### Community 1751 - "Аналитический отчёт по этапу 1.6"
 Cohesion: 0.20
-Nodes (9): AccessStatement, Box, Expr, KillStatement, LiveStatement, OptionStatement, ShowStatement, UseStatement (+1 more)
+Nodes (9): 1. Результат и метод, 2. `logos` и lexer, 3. `VecMap` и `VecSet`, 4. Top-level statements и macro AST, 5. Macro type system наподобие `SurrealValue`, 6. Что позаимствовать из `storekey`, 7. Что позаимствовать из `surrealmx`, 8. Что позаимствовать из `ferntree` (+1 more)
 
-### Community 1751 - "Отчёт по шагу A8: durable AtomStore"
-Cohesion: 0.29
-Nodes (7): Изменённые компоненты, Исправления по итоговому review, Отложенная работа, Отчёт по шагу A8: durable AtomStore, Проверенные свойства, Проверка, Результат
+### Community 1753 - "parser/stmt/define.rs"
+Cohesion: 0.47
+Nodes (5): is_identifier_token(), DefaultConfig, Parser, Strand, Token
 
-### Community 1752 - "Отчёт по этапу 23: HNSW и DiskANN"
-Cohesion: 0.25
-Nodes (8): 1. Реализованный срез, 2. Сверка с SurrealDB, 3. Correctness evidence, 4. Recall и 100K latency, 5. High-dimensional HNSW, 6. Low-cache stress и profiling, 7. Что остаётся до закрытия V11–V13, Отчёт по этапу 23: HNSW и DiskANN
+### Community 1754 - "tests/create.rs"
+Cohesion: 0.53
+Nodes (5): check_permissions_auth_disabled(), check_permissions_auth_enabled(), common_permissions_checks(), create_or_insert_with_permissions(), Result
 
-### Community 1753 - "Result<T, NoError>"
-Cohesion: 0.67
-Nodes (3): Result<T, NoError>, T, UnwrapSafeExt
+### Community 1755 - "TraceLayer"
+Cohesion: 0.27
+Nodes (10): new(), Box, Layer, Option, Result, S, SdkTracerProvider, Send (+2 more)
 
-### Community 1754 - "TimeZone"
-Cohesion: 0.29
-Nodes (7): ident_field(), Expr, TopLevelExpr, Vec, statements(), test_streaming(), TimeZone
-
-### Community 1755 - "future.rs"
-Cohesion: 0.33
-Nodes (7): F, Kvs, new_ds(), Datastore, Uuid, concurrency(), Result
-
-### Community 1756 - ".compute"
-Cohesion: 0.25
-Nodes (9): DefineEventStatement, DefineKind, Expr, FrozenContext, Option, Result, Stk, Value (+1 more)
-
-### Community 1757 - "Commit"
-Cohesion: 0.25
-Nodes (6): Commit, Commit<C>, IntoFuture, Self, Transaction, Uuid
-
-### Community 1758 - "execute"
-Cohesion: 0.32
-Nodes (7): execute(), QueryParams, CallToolResult, Option, Result, String, Value
-
-### Community 1759 - "src/storage/mod.rs"
+### Community 1756 - "src/storage/mod.rs"
 Cohesion: 0.25
 Nodes (5): E, FerrosGrynnError, Into, String, storage_io_failure_with_source()
 
-### Community 1762 - "Freeze-manifest storage core v1"
-Cohesion: 0.33
-Nodes (6): 1. Версии и совместимость, 2. Общие инварианты, 3. Замороженные core codecs, 4. Решение `Q-20`: B+tree keys, 5. Обязательное evidence, Freeze-manifest storage core v1
-
-### Community 1763 - "fnc/record.rs"
-Cohesion: 0.44
-Nodes (10): edge(), exists(), id(), FrozenContext, Option, RecordId, Result, Stk (+2 more)
-
-### Community 1764 - ".fmt"
-Cohesion: 0.40
-Nodes (4): Display, Formatter, Result, Status
-
-### Community 1765 - "mem/registry.rs"
-Cohesion: 0.25
-Nodes (9): memory_reporters_allocated_by_name(), MemoryReporter, MemoryReporterEntry, register_memory_reporter(), MemoryReporter, Send, String, Sync (+1 more)
-
-### Community 1766 - "ModuleCommand"
+### Community 1757 - "Signup"
 Cohesion: 0.31
-Nodes (10): init(), ModuleCommand, ModuleCommandArgs, parse_value(), Option, PathBuf, Result, String (+2 more)
+Nodes (6): Cow, IntoFuture, Value, Signup, Signup<'_, C>, Signup<'r, Client>
 
-### Community 1767 - "ClassIndex"
-Cohesion: 0.04
-Nodes (41): IntoField, AnalyzerId, Display, Formatter, Result, SchemaId, ClassIndex, ClassIndexKind (+33 more)
+### Community 1758 - "gql_stage_13_resource_probe"
+Cohesion: 0.29
+Nodes (8): directory_bytes(), gql_stage_13_resource_probe(), profile_resources(), profile_rss(), profile_usize(), AtomicBool, String, stage13_resource_query()
 
-### Community 1768 - "Этап 20. Durable maintenance и admin surface"
-Cohesion: 0.40
-Nodes (5): 1. Контракт, 2. Несовместимый cutover, 3. Порядок реализации, 4. Gate, Этап 20. Durable maintenance и admin surface
+### Community 1759 - "direct_unix.rs"
+Cohesion: 0.32
+Nodes (7): configure_direct_io(), read_at(), FerrosGrynnResult, File, OpenOptions, Result, write_at()
 
-### Community 1770 - "TestDirectory"
-Cohesion: 0.50
-Nodes (3): Drop, PathBuf, TestDirectory
-
-### Community 1774 - "rnd.rs"
+### Community 1760 - "Versioned Releases"
 Cohesion: 0.33
-Nodes (6): reseed(), reseed_makes_output_deterministic(), FnOnce, T, with_rng(), RngCore
+Nodes (6): Nightly Releases, Patch Release (X.Y.Z where Z > 0), Pre-Release (Alpha/Beta/RC), Release Types, Stable Release (X.Y.0), Versioned Releases
+
+### Community 1762 - "Option"
+Cohesion: 0.29
+Nodes (4): KeysIter<'a>, Item, Option, ValsIter<'a>
+
+### Community 1763 - "Building on Ubuntu 20.04 (amd64)"
+Cohesion: 0.33
+Nodes (6): Building on Ubuntu 20.04 (amd64), ✅ Compile for `aarch64-unknown-linux-gnu` (Linux), ✅ Compile for `x86_64-unknown-linux-gnu` (Linux), ❌ Cross-compile for `armv7-unknown-linux-musleabihf` (Raspberry Pi), ❌ Cross-compile for `x86_64-pc-windows-gnu` (Windows), ❌ Cross-compile for `x86_64-unknown-linux-musl` (Linux Musl)
+
+### Community 1764 - "direct_windows.rs"
+Cohesion: 0.32
+Nodes (7): configure_direct_io(), read_at(), FerrosGrynnResult, File, OpenOptions, Result, write_at()
+
+### Community 1765 - "Building on Ubuntu 20.04 (arm64)"
+Cohesion: 0.33
+Nodes (6): Building on Ubuntu 20.04 (arm64), ✅ Compile for `aarch64-unknown-linux-gnu` (Linux), ✅ Compile for `x86_64-unknown-linux-gnu` (Linux), ❌ Cross-compile for `armv7-unknown-linux-musleabihf` (Raspberry Pi), ❌ Cross-compile for `x86_64-pc-windows-gnu` (Windows), ❌ Cross-compile for `x86_64-unknown-linux-musl` (Linux Musl)
+
+### Community 1766 - "Troubleshooting"
+Cohesion: 0.33
+Nodes (6): Crate Publishing Fails, Need to Retry a Failed Release, PR Already Exists, Troubleshooting, Workflow Fails on Branch Creation, Wrong Version on Main
+
+### Community 1767 - "IndexScope"
+Cohesion: 0.05
+Nodes (35): FromStr, IntoField, Self, ClassIndex, ClassIndexKind, ClassIndexOptions, ClassIndexState, DiskAnnIndexOptions (+27 more)
+
+### Community 1768 - "column_name"
+Cohesion: 0.47
+Nodes (8): column_name(), Result, Span, String, SyntaxError, validate_alias(), validate_param_name(), validate_var()
+
+### Community 1770 - "pages"
+Cohesion: 0.43
+Nodes (7): element(), header(), landmark_path_corrupt_header_sections_admission_and_cancellation(), landmark_path_roundtrip_empty_and_multiple_pages_all_costs(), pages(), FerrosGrynnResult, Vec
+
+### Community 1772 - "Community 1772"
+Cohesion: 0.29
+Nodes (8): (), ExportDestination, IntoExportDestination, PathBuf, R, Sealed, Sealed, T
 
 ### Community 1775 - "tests/explain.rs"
 Cohesion: 0.33
 Nodes (7): atom_exists(), explain_match_projects_physical_algorithms_and_runtime_metrics(), explain_plans_without_effect_and_analyze_executes_once(), explain_traverse_projects_vm_steps_and_fast_effect_limit(), json_result(), Datastore, Object
 
-### Community 1778 - "level.rs"
-Cohesion: 0.29
-Nodes (3): Deref, Formatter, Result
+### Community 1777 - "impl_format"
+Cohesion: 0.43
+Nodes (6): decode(), impl_format(), DeriveInput, Option, Result, TokenStream
 
-### Community 1779 - ".atomic_import_item"
+### Community 1778 - "StatementCounters"
+Cohesion: 0.29
+Nodes (4): Arc, AtomicU64, Self, StatementCounters
+
+### Community 1779 - "impl_format"
+Cohesion: 0.43
+Nodes (6): encode(), impl_format(), DeriveInput, Option, Result, TokenStream
+
+### Community 1780 - "benches/processor.rs"
+Cohesion: 0.57
+Nodes (6): bench_processor(), Input, prepare_data(), Criterion, Datastore, run()
+
+### Community 1781 - "Этап 24 — Geometry R-tree: evidence checkpoint"
 Cohesion: 0.18
-Nodes (7): Mutation, Apply, DatabaseRoot, FerrosGrynnResult, IndexId, Vec, Transaction
+Nodes (9): Gates, Нормативный контракт, Порядок, Этап 24 — Geometry R-tree, Correctness evidence, Открытые gates, Предварительные performance observations, Реализованный срез (+1 more)
 
-### Community 1782 - "database/tests.rs"
-Cohesion: 0.41
-Nodes (12): fgdc_rejects_duplicate_or_unsorted_graph_properties(), fgdc_rejects_old_version_truncation_and_duplicate_schema_identity(), fgdc_v10_allows_one_internal_child_through_multiple_owner_scopes(), fgdc_v10_rejects_duplicate_scope_and_noncanonical_internal_name(), fgdc_v10_rejects_invalid_internal_ownership_and_scope_ancestry(), fgdc_v10_rejects_unknown_constraint_bits_and_invalid_roots(), fgdc_v10_round_trips_fulltext_hnsw_and_disk_ann_payloads(), fgdc_v10_round_trips_recursive_types_bindings_and_graph_properties() (+4 more)
-
-### Community 1784 - "PipelineCounters"
+### Community 1782 - "rnd.rs"
 Cohesion: 0.33
-Nodes (5): CommunityComposer, ObservabilityProvider, PipelineCounters, Send, Sync
+Nodes (6): reseed(), reseed_makes_output_deterministic(), FnOnce, T, with_rng(), RngCore
 
-### Community 1788 - "Fs"
-Cohesion: 0.16
-Nodes (11): FormatCommandArguments, init(), parse_line(), parse_single_line_comment(), ParsedLine, Lexer, ParseResult, Result (+3 more)
+### Community 1783 - "Этап 25 — производные графовые индексы: evidence checkpoint"
+Cohesion: 0.12
+Nodes (17): D0 — текущий срез, D1 — EdgeEndpoint, D2 — общие section codecs, D3 — incidence relation и общий SCC, D4 — Reachability artifacts, D5 — Neighbourhood artifacts, D6 — явно приблизительный count через общий pipeline, D7 — admission перед клонированием path buffers (+9 more)
 
-### Community 1789 - "Community 1789"
-Cohesion: 0.29
-Nodes (8): (), ExportDestination, IntoExportDestination, PathBuf, R, Sealed, Sealed, T
+### Community 1784 - ".substitute_indices"
+Cohesion: 0.43
+Nodes (4): FlowResult, FrozenContext, Option, Stk
 
-### Community 1792 - "Create"
-Cohesion: 0.39
-Nodes (5): Create, Arc, Datastore, Routine, String
+### Community 1785 - "gc_range"
+Cohesion: 0.52
+Nodes (6): gc_all_at(), gc_range(), BoxTimeStampImpl, Duration, Result, Transaction
 
-### Community 1794 - ".compute"
-Cohesion: 0.33
-Nodes (4): AlterDatabaseStatement, Result, String, Value
+### Community 1786 - "Step-by-Step Instructions"
+Cohesion: 0.40
+Nodes (5): Major Version Bump, Patch Release (X.Y.Z), Pre-Release (Alpha/Beta/RC), Stable Release (X.Y.0), Step-by-Step Instructions
 
-### Community 1796 - ".compute"
-Cohesion: 0.33
-Nodes (4): AlterNamespaceStatement, Result, String, Value
-
-### Community 1797 - "with_enough_stack"
+### Community 1787 - "with_enough_stack"
 Cohesion: 0.48
 Nodes (6): init(), ExitCode, Future, Output, Send, with_enough_stack()
 
-### Community 1799 - "surrealdb/tests/common/mod.rs"
+### Community 1788 - "IntoFuture"
+Cohesion: 0.52
+Nodes (4): IntoFuture, Select<'r, Client, Option<R>, Live>, Select<'r, Client, Value, Live>, Select<'r, Client, Vec<R>, Live>
+
+### Community 1789 - "Отчёт этапа 17: Traversal VM, closures, `FAST` и physical sparse frontier"
+Cohesion: 0.25
+Nodes (8): 1. Итог, 2. Архитектурные границы, 3. Correctness evidence, 4. Performance evidence, 5. `Q-10`, 6. Профилирование и tooling, 7. Отложенная поверхность, Отчёт этапа 17: Traversal VM, closures, `FAST` и physical sparse frontier
+
+### Community 1792 - "median_phase"
+Cohesion: 0.33
+Nodes (7): last_startup_timings(), Duration, StartupTimings, median_duration(), median_phase(), Duration, Fn
+
+### Community 1793 - "gc_range"
 Cohesion: 0.60
-Nodes (4): is_notification(), is_notification_from_lq(), Value, Socket
+Nodes (5): gc_all_at(), gc_range(), BoxTimeStampImpl, Result, Transaction
 
-### Community 1800 - "Versioned Releases"
+### Community 1796 - "tl.rs"
+Cohesion: 0.40
+Nodes (3): key_changefeed_cleanup(), Self, Tl
+
+### Community 1797 - "Version Management"
+Cohesion: 0.40
+Nodes (5): Auto-Calculation Rules, Main Branch Version Evolution, Manual Override, Surrealism Crates, Version Management
+
+### Community 1798 - "api_integration/run.rs"
 Cohesion: 0.33
-Nodes (6): Nightly Releases, Patch Release (X.Y.Z where Z > 0), Pre-Release (Alpha/Beta/RC), Release Types, Stable Release (X.Y.0), Versioned Releases
+Nodes (5): run_builtin_math(), run_custom_function_string(), run_no_args(), run_with_multiple_args(), run_with_single_arg()
 
-### Community 1801 - "Read"
-Cohesion: 0.29
-Nodes (6): Read, Arc, Datastore, Routine, Self, String
+### Community 1799 - "build_and_pack_demo"
+Cohesion: 0.40
+Nodes (6): build_and_pack_demo(), build_demo_dir(), DemoModuleDir, has_wasm_target(), PathBuf, surreal_bin()
 
-### Community 1803 - ".from"
+### Community 1800 - "header"
+Cohesion: 0.53
+Nodes (5): element(), header(), neighbourhood_header_and_forged_sections_fail_before_output(), neighbourhood_layout_streams_exact_pages_for_all_algorithms(), FerrosGrynnResult
+
+### Community 1801 - "Formatted"
+Cohesion: 0.50
+Nodes (5): Formatted, Join, F, PhantomData, S
+
+### Community 1802 - ".compute"
 Cohesion: 0.33
-Nodes (3): crate::types::PublicKind, Geometry, PublicKind
+Nodes (4): AlterDatabaseStatement, Result, String, Value
 
-### Community 1804 - "surrealmx/tests/scan_out_of_range.rs"
+### Community 1804 - ".compute"
 Cohesion: 0.33
-Nodes (8): hex(), make_key(), make_range(), Duration, String, Vec, run_once(), scan_never_returns_keys_outside_requested_range()
+Nodes (4): AlterNamespaceStatement, Result, String, Value
 
 ### Community 1805 - "FerrosGrynnError"
 Cohesion: 0.08
 Nodes (25): ErrorState, FerrosGrynnError, NonErrorStatus, Arc, Debug, Display, E, Error (+17 more)
 
-### Community 1806 - "Signin"
-Cohesion: 0.31
-Nodes (6): Cow, IntoFuture, Value, Signin, Signin<'_, C>, Signin<'r, Client>
+### Community 1806 - "lib/mod.rs"
+Cohesion: 0.60
+Nodes (4): benchmark_group(), init(), Criterion, String
 
-### Community 1809 - "SystemClock"
-Cohesion: 0.39
-Nodes (4): get_clock_now(), Default, Self, SystemClock
+### Community 1807 - "Option"
+Cohesion: 0.50
+Nodes (3): FieldsIter<'a>, Item, Option
 
-### Community 1811 - "api_scope.rs"
-Cohesion: 0.61
-Nodes (7): api_invoke_rejects_cross_tenant_scope(), get_request(), http_route_rejects_cross_tenant_scope(), Datastore, Result, run(), setup_victim_tenant()
+### Community 1809 - "Отчёт по шагу A8: durable AtomStore"
+Cohesion: 0.29
+Nodes (7): Изменённые компоненты, Исправления по итоговому review, Отложенная работа, Отчёт по шагу A8: durable AtomStore, Проверенные свойства, Проверка, Результат
 
-### Community 1815 - "direct_unix.rs"
-Cohesion: 0.32
-Nodes (7): configure_direct_io(), read_at(), FerrosGrynnResult, File, OpenOptions, Result, write_at()
+### Community 1810 - "Этап 17 — закрытие Q-10: physical sparse frontier"
+Cohesion: 0.29
+Nodes (7): 1. Проверяемая граница, 2. Сборка и символы, 3. Нагрузка, 4. Результаты, 5. Вывод, 6. Проверки и tooling, Этап 17 — закрытие Q-10: physical sparse frontier
 
-### Community 1816 - "direct_windows.rs"
-Cohesion: 0.32
-Nodes (7): configure_direct_io(), read_at(), FerrosGrynnResult, File, OpenOptions, Result, write_at()
+### Community 1811 - ".from"
+Cohesion: 0.50
+Nodes (3): Err, test_validate_local_error_message_for_bracket(), test_validate_local_error_message_for_disallowed_part()
 
-### Community 1821 - "benches/processor.rs"
-Cohesion: 0.57
-Nodes (6): bench_processor(), Input, prepare_data(), Criterion, Datastore, run()
+### Community 1812 - ".from_str"
+Cohesion: 0.40
+Nodes (3): Err, Formatter, Result
 
-### Community 1823 - "gc_range"
+### Community 1813 - "RelationInfo"
+Cohesion: 0.70
+Nodes (4): collect_relations(), RelationInfo, TableName, Vec
+
+### Community 1814 - "Отчёт по этапу 22: durable analyzers и Fulltext"
+Cohesion: 0.40
+Nodes (5): 1. Реализованный срез, 2. Correctness evidence, 3. Performance evidence, 4. Что остаётся до закрытия F10–F11, Отчёт по этапу 22: durable analyzers и Fulltext
+
+### Community 1815 - "backup.rs"
+Cohesion: 0.40
+Nodes (4): export_escaped_table_names(), export_import(), export_with_config(), ml_export_import()
+
+### Community 1816 - "surrealdb/tests/common/mod.rs"
+Cohesion: 0.60
+Nodes (4): is_notification(), is_notification_from_lq(), Value, Socket
+
+### Community 1817 - ".poll_want"
+Cohesion: 0.50
+Nodes (3): Pin, Poll, Self
+
+### Community 1818 - "Этап 20. Durable maintenance и admin surface"
+Cohesion: 0.40
+Nodes (5): 1. Контракт, 2. Несовместимый cutover, 3. Порядок реализации, 4. Gate, Этап 20. Durable maintenance и admin surface
+
+### Community 1819 - "Directory"
+Cohesion: 0.53
+Nodes (4): Directory, geometry_native_async_index_matches_scan_after_mutation_and_reopen(), Drop, PathBuf
+
+### Community 1820 - "Directory"
+Cohesion: 0.47
+Nodes (4): Directory, geometry_sync_effective_delta_private_writes_and_recovery(), Drop, PathBuf
+
+### Community 1821 - "Directory"
 Cohesion: 0.52
-Nodes (6): gc_all_at(), gc_range(), BoxTimeStampImpl, Duration, Result, Transaction
+Nodes (5): derived_graph_artifacts_native_async_publication_checkpoint_and_reopen(), Directory, edge_endpoint_native_async_abort_old_snapshot_rebuild_and_reopen(), Drop, PathBuf
 
-### Community 1828 - "doc/store.rs"
+### Community 1822 - "Directory"
+Cohesion: 0.52
+Nodes (5): derived_graph_artifacts_publish_reuse_reopen_and_invalidate_in_own_graph(), Directory, graph_index_definition_commit_abort_conflict_snapshot_and_reopen(), Drop, PathBuf
+
+### Community 1823 - "doc/store.rs"
 Cohesion: 0.47
 Nodes (4): Document, FrozenContext, Result, Statement
 
-### Community 1829 - "PathEliminationSignal"
-Cohesion: 0.33
-Nodes (5): PathEliminationSignal, Display, Error, Formatter, Result
+### Community 1824 - "State"
+Cohesion: 0.60
+Nodes (3): From, State, usize
 
-### Community 1830 - "tl.rs"
-Cohesion: 0.40
-Nodes (3): key_changefeed_cleanup(), Self, Tl
-
-### Community 1831 - "build_and_pack_demo"
-Cohesion: 0.40
-Nodes (6): build_and_pack_demo(), build_demo_dir(), DemoModuleDir, has_wasm_target(), PathBuf, surreal_bin()
-
-### Community 1834 - "push_ident"
-Cohesion: 0.80
-Nodes (4): main(), new_ident(), push_ident(), Ast
-
-### Community 1835 - "ExecutionControl"
-Cohesion: 0.04
-Nodes (39): BarrierMemory, child_controls_share_one_barrier_budget(), deterministic_statement_seed_covers_parameters_and_user_seed(), ExecutionControl, GraphAssemblyMetrics, GraphAssemblyMetricsSnapshot, MatchMetrics, MatchMetricsSnapshot (+31 more)
-
-### Community 1836 - "build_graph_image_with_membership"
-Cohesion: 0.06
-Nodes (66): GraphArena, BTreeMap, build_graph_image(), build_graph_image_with_membership(), build_import_graph_image(), disk_ref(), invalid(), label_kind() (+58 more)
-
-### Community 1838 - "geo/mod.rs"
+### Community 1828 - "Architecture"
 Cohesion: 0.50
-Nodes (4): decode(), encode(), Geometry, String
+Nodes (4): Architecture, Key Features, Scripts, Workflow Jobs
 
-### Community 1841 - "fnc/count.rs"
+### Community 1829 - "Examples"
+Cohesion: 0.50
+Nodes (4): Example 1: Beta Release Series, Example 2: Patch Release Series, Example 3: Parallel Releases, Examples
+
+### Community 1830 - "Patch Release Workflow"
+Cohesion: 0.50
+Nodes (4): Example Workflow, Individual Backport PRs, Main First Philosophy, Patch Release Workflow
+
+### Community 1831 - ".new"
+Cohesion: 0.50
+Nodes (3): Formatted<'a, F, T>, joins_zero_one_two_and_many_values(), Self
+
+### Community 1832 - "list.rs"
 Cohesion: 0.83
-Nodes (3): count(), Result, Value
+Nodes (3): ArgMatches, Result, run()
 
-### Community 1856 - "IndexBinding"
-Cohesion: 0.12
-Nodes (20): GraphIndexRoot, IndexBinding, IndexEntries, IndexEntries<Address>, IndexField, IndexStoreRoot, AtomId, Bound (+12 more)
+### Community 1833 - "api_integration/version.rs"
+Cohesion: 0.50
+Nodes (3): info_for_db_with_versioned_tables(), info_for_table_with_versioned_fields(), select_with_version()
+
+### Community 1836 - "open_graph_image"
+Cohesion: 0.08
+Nodes (60): Build, cross_side(), decode_topology(), invalid(), local_side(), resolve_qualified(), AtomId, BTreeMap (+52 more)
 
 ### Community 1941 - "QueryCursor"
 Cohesion: 0.10
 Nodes (30): CursorAnchor, CursorEntry, CursorOffset, CursorPage, CursorRecord, CursorRows, CursorRuntime, CursorSpool (+22 more)
 
-### Community 1972 - "syn/ast/mod.rs"
-Cohesion: 0.19
-Nodes (21): BinaryOperator, ClosureBody, ClosureExpr, ClosureParameter, Expr, ExprKind, Identifier, KnnDistance (+13 more)
+### Community 1972 - "GQLConfig"
+Cohesion: 0.40
+Nodes (3): GQLConfig, Default, Self
 
 ## Knowledge Gaps
-- **1614 isolated node(s):** `Op`, `Error`, `OptimisticOrShared<'a, T>`, `OptimisticOrExclusive<'a, T>`, `String` (+1609 more)
+- **1637 isolated node(s):** `Результат`, `Обязательный контекст реализации`, `1.1. Зафиксировать сохраняемые контракты`, `1.2. Разделить `datastore.rs` -> `datastore/**``, `1.3. Разделить storage` (+1632 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **110 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **424 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Work-memory lessons
 
@@ -7963,17 +8262,17 @@ Nodes (21): BinaryOperator, ClosureBody, ClosureExpr, ClosureParameter, Expr, Ex
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `ToSql` connect `ToSql` to `Datetime`, `exec.rs`, `Fields`, `Literal`, `AlterStatement`, `Language`, `AlterEventStatement`, `Array`, `compat/fixtures.rs`, `DefineModuleStatement`, `Transaction`, `DefineNamespaceStatement`, `IndexDefinition`, `File`, `ExecOperator`, `AlterParamStatement`, `MatchesOp`, `Mock`, `AlterUserStatement`, `AlterFunctionStatement`, `DefineIndexStatement`, `expr/statements/define/model.rs`, `Number`, `ControlFlowExpr`, `Geometry`, `Cond`, `ContextLevel`, `expr/record_id/range.rs`, `DefineStatement`, `Uuid`, `expr/timeout.rs`, `.compute`, `Mock`, `Bytesize`, `AlterConfigStatement`, `AlterIndexStatement`, `AlterModuleStatement`, `AlterSequenceStatement`, `ModuleDefinition`, `DefineSequenceStatement`, `InsertStatement`, `RelateStatement`, `RemoveAccessStatement`, `RemoveUserStatement`, `Reference`, `expr/statements/alter/index.rs`, `SleepPlan`, `Object`, `ExprPlan`, `Number`, `Fmt`, `ForeachPlan`, `PhysicalExpr`, `KindLiteral`, `.compute`, `Fields`, `LetPlan`, `Split`, `KindLiteral`, `DefineFunctionStatement`, `RemoveModelStatement`, `Value`, `Script`, `DefaultConfig`, `Param`, `SqlFormat`, `ForeachStatement`, `InfoStatement`, `DestructurePart`, `OutputStatement`, `RemoveAnalyzerStatement`, `RemoveApiStatement`, `ModuleExecutable`, `RemoveBucketStatement`, `RemoveDatabaseStatement`, `RemoveEventStatement`, `RemoveFieldStatement`, `RemoveIndexStatement`, `expr/part.rs`, `RemoveSequenceStatement`, `RemoveTableStatement`, `ExecutionContext`, `RebuildIndexStatement`, `RecordIdKeyLit`, `Uuid`, `OrderList`, `Range`, `RecordIdKey`, `Base`, `Explain`, `Block`, `File`, `RecordIdLit`, `RecordIdKeyRangeLit`, `AlterTableStatement`, `ClosureFieldCallPart`, `Function`, `AlterSystemStatement`, `OptionStatement`, `.compute`, `Start`, `RemoveStatement`, `ApiConfig`, `compile.rs`, `.value`, `Fetchs`, `Kind`, `DefineAccessStatement`, `Closure`, `Constant`, `IfelseStatement`, `CursorDoc`, `Dir`, `expr/statements/remove/function.rs`, `catalog/schema/index.rs`, `AccessMode`, `ChangeFeed`, `AlterFunctionStatement`, `Filter`, `Limit`, `InfoStructure`, `Model`, `lower/mod.rs`, `KillStatement`, `EventDefinition`, `array_ops.rs`, `GraphEdgeScan`, `RemoveFunctionStatement`, `TopLevelExpr`, `FunctionsConfig`, `RemoveModuleStatement`, `RemoveParamStatement`, `SleepStatement`, `UseStatement`, `AlterDatabaseStatement`, `GeometryKind`, `expr/statements/alter/api.rs`, `AlterEventStatement`, `AlterUserStatement`, `Self`, `AlterNamespaceStatement`, `Set`, `Access`, `Statement`, `RecordIdKeyLit`, `SelectStatement`, `expr_to_ident`, `.compute`, `ops.rs`, `expr/statements/alter/bucket.rs`, `StreamExt`, `AlterAccessStatement`, `.compute`, `.compute`, `IdiomExpr`, `DefineAnalyzerStatement`, `expr/statements/alter/param.rs`, `DefineUserStatement`, `UpsertStatement`, `Array`, `RecordIdKey`, `AlterFieldStatement`, `DefineFieldStatement`, `Value`, `Session`, `Idiom`, `GeometryKind`, `expr/model.rs`, `Part`, `TableName`, `Fetchs`, `Kind`, `FieldDefinition`, `ApiMethod`, `Self`, `ClosureExpr`, `UpdateStatement`, `UpsertStatement`, `UpdateStatement`, `Duration`, `Algorithm`, `AnalyzerDefinition`, `CreateStatement`, `physical_expr/mod.rs`, `Closure`, `AlterAnalyzerStatement`, `Path`, `expr/statements/alter/sequence.rs`, `Scoring`, `DefineTableStatement`, `DeleteStatement`, `LiveStatement`, `Permissions`, `AlterModuleStatement`, `Geometry`, `DeleteStatement`, `ViewDefinition`, `Object`, `Splits`, `Expr`, `From`, `Set`, `Operation`, `Data`, `DefineFunctionStatement`, `RemoveNamespaceStatement`, `Group`, `FieldPart`, `RecursionOp`, `Duration`, `Bytes`, `Regex`, `DefineParamStatement`, `CardinalityHint`, `.fmt_sql`, `Expr`, `Script`, `Regex`, `View`, `expr/statements/alter/mod.rs`, `Index`, `SetStatement`, `providers.rs`, `AlterAnalyzerStatement`, `Algorithm`, `expr/module.rs`, `expr/statements/access.rs`, `expr/statements/define/index.rs`, `ConfigInner`, `ShowStatement`, `TopLevelExpr`, `Relation`, `Range`, `ResourceKind`, `.compute`, `Literal`, `Timestamp`, `IfelseStatement`, `Lookup`, `SetStatement`, `AlterAccessStatement`, `Datetime`, `Param`, `AlterBucketStatement`, `DefineAccessStatement`, `DefineBucketStatement`, `DefineDatabaseStatement`, `DefineModelStatement`, `catalog/schema/mod.rs`, `Block`, `Param`, `RecordIdKeyRange`, `Groups`, `AlterTableStatement`, `Lookup`, `Table`, `File`, `CreateStatement`, `DefineAnalyzerStatement`, `Part`, `Entry`?**
-  _High betweenness centrality (0.136) - this node is a cross-community bridge._
-- **Why does `HashMap` connect `HashMap` to `Result`, `tree.rs`, `index/builder.rs`, `compat/fixtures.rs`, `ExecutionContext`, `Transaction`, `Result`, `CustomFilter`, `ConfigMap`, `ScalarFunction`, `.from_object`, `Child`, `heap_estimator.rs`, `verify.rs`, `hash_join.rs`, `hash_btree.rs`, `FieldDependencyExtractor`, `tables.rs`, `QueryPlanner`, `ShortestPathExpand`, `tests/remove.rs`, `KnnContext`, `Idiom`, `.from_arguments`, `aggregation.rs`, `kvs/config.rs`, `LiveEventBuffer`, `AsyncEventRecord`, `mcp/tests/common/mod.rs`, `hashmap.rs`, `TestCase`, `diskann/index.rs`, `SurrealError`, `KnnBruteForceResult`, `UndirectedGraph<S>`, `Http`, `remote/http/mod.rs`, `DynamicScan`, `Offset`, `HnswIndex`, `V`, `pre_decode_filter/streaming.rs`, `hnsw/mod.rs`, `collections/benches/collections.rs`, `FieldState`, `GraphEdgeScan`, `operators/aggregate.rs`, `physical_expr/mod.rs`, `QueryExecutor`, `Object`, `FunctionRegistry`, `operators/distinct.rs`, `Variables`, `local/mod.rs`, `KeyBindings`, `Websocket`, `Context`, `mem/registry.rs`, `method/query.rs`, `subscriptions.rs`, `Object`, `expression_registry.rs`, `analyzer/mod.rs`, `FullTextIndex`, `kvs/mod.rs`, `Value`, `EvalContext`, `IndexOption`?**
-  _High betweenness centrality (0.094) - this node is a cross-community bridge._
-- **Why does `Fmt` connect `Fmt` to `Datetime`, `Category`, `Language`, `AlterEventStatement`, `AlterParamStatement`, `AlterUserStatement`, `verify.rs`, `.from_string`, `idx/mod.rs`, `DefineIndexStatement`, `IndentFormatter<W>`, `QueryPlanner`, `Number`, `Geometry`, `Result`, `encode_vec`, `Uuid`, `fetch/mod.rs`, `ModuleDefinition`, `dbs/capabilities.rs`, `EscapedSlice`, `ObjectKey`, `ferntree/src/lib.rs`, `Number`, `Strand`, `Context`, `Fields`, `Split`, `SurrealError`, `DefineFunctionStatement`, `ToSql`, `Error`, `Action`, `SqlFormat`, `DocumentContext`, `Bytes`, `RebuildIndexStatement`, `Uuid`, `OrderList`, `Controller`, `Value`, `Base`, `Function`, `ApiConfig`, `Connect<Db, R>`, `IfelseStatement`, `catalog/schema/index.rs`, `FieldPath`, `AlterFunctionStatement`, `InfoStructure`, `coerce.rs`, `ColorMode`, `InlineVec<T, N>`, `KeyBindings`, `.check_permission`, `Websocket`, `ClassIndex`, `RecordIdKeyLit`, `SelectStatement`, `surrealdb/src/lib.rs`, `Self`, `HttpTraceLayerHooks`, `Runtime`, `dbs/session.rs`, `Transactor`, `Builder`, `tests/schema/mod.rs`, `AlterFieldStatement`, `Error`, `StringValue`, `QualifiedAtomId`, `Rest`, `TableName`, `kvs/config.rs`, `Fetchs`, `Kind`, `.from_string`, `.from_string`, `ApiMethod`, `Self`, `UpdateStatement`, `UpsertStatement`, `QueryResult`, `SurrealProcess`, `src/error/mod.rs`, `binaries.rs`, `ExecutionObserver`, `AlterAnalyzerStatement`, `NormaliserType`, `Path`, `DefineTableStatement`, `DeleteStatement`, `expr/kind.rs`, `Geometry`, `Expr`, `From`, `Operation`, `want.rs`, `gql/token/mod.rs`, `Result`, `Parser<'source, 'ast>`, `L`, `CharBuffer`, `Regex`, `source/mod.rs`, `DefineParamStatement`, `String`, `ConfigMap`, `Regex`, `.from_string`, `QueryCursor`, `View`, `Sender`, `DecodeContext`, `Algorithm`, `TopLevelExpr`, `render.rs`, `RawError`, `TokenKind`, `Literal`, `Timestamp`, `Lookup`, `SetStatement`, `AlterAccessStatement`, `Datetime`, `AlterBucketStatement`, `DefineModelStatement`, `catalog/schema/mod.rs`, `AlterTableStatement`, `CreateStatement`, `DefineAnalyzerStatement`, `Part`, `Entry`?**
-  _High betweenness centrality (0.067) - this node is a cross-community bridge._
+- **Why does `HashMap` connect `HashMap` to `Result`, `EvalContext`, `CustomFilter`, `tree.rs`, `Mem`, `TableDefinition`, `ExecutionContext`, `ScalarFunction`, `Transaction`, `CommonConfig`, `.from_object`, `Child`, `Building`, `verify.rs`, `hash_join.rs`, `hash_btree.rs`, `FieldDependencyExtractor`, `tables.rs`, `tests/remove.rs`, `mem/registry.rs`, `KnnContext`, `idiom/mod.rs`, `.from_arguments`, `aggregation.rs`, `kvs/config.rs`, `LiveEventBuffer`, `mcp/tests/common/mod.rs`, `hashmap.rs`, `TestCase`, `diskann/index.rs`, `tracing.rs`, `SurrealError`, `resolve_condition_params`, `KnnBruteForceResult`, `UndirectedGraph<S>`, `Http`, `remote/http/mod.rs`, `Offset`, `ctx/context.rs`, `pre_decode_filter/streaming.rs`, `hnsw/mod.rs`, `collections/benches/collections.rs`, `path_expand.rs`, `FieldState`, `GraphEdgeScan`, `operators/aggregate.rs`, `physical_expr/mod.rs`, `QueryExecutor`, `V`, `FunctionRegistry`, `operators/distinct.rs`, `Object`, `local/mod.rs`, `Variables`, `Websocket`, `KeyBindings`, `AsyncEventRecord`, `Context`, `method/query.rs`, `subscriptions.rs`, `Object`, `expression_registry.rs`, `Tokens`, `FullTextIndex`, `QueryPlanner`, `HnswIndex`, `kvs/mod.rs`, `Value`, `ContextLevel`, `IndexOption`?**
+  _High betweenness centrality (0.118) - this node is a cross-community bridge._
+- **Why does `ToSql` connect `SqlFormat` to `Fields`, `Literal`, `AlterStatement`, `Language`, `Array`, `TableDefinition`, `ops.rs`, `Transaction`, `DefineModuleStatement`, `DefineNamespaceStatement`, `ExecOperator`, `AlterParamStatement`, `MatchesOp`, `Mock`, `AlterUserStatement`, `IndexDefinition`, `AlterFunctionStatement`, `OperatorMetrics`, `exec.rs`, `Entry`, `expr/statements/define/model.rs`, `Number`, `Geometry`, `Cond`, `AccessMode`, `expr/record_id/range.rs`, `DefineStatement`, `Splits`, `Uuid`, `.compute`, `ViewDefinition`, `expr/timeout.rs`, `Bytesize`, `AlterConfigStatement`, `AlterIndexStatement`, `AlterModuleStatement`, `AlterSequenceStatement`, `DefineSequenceStatement`, `InsertStatement`, `RelateStatement`, `RemoveAccessStatement`, `AnalyzerDefinition`, `RemoveUserStatement`, `View`, `DatabaseDefinition`, `SleepPlan`, `Object`, `Number`, `File`, `Fmt`, `PhysicalExpr`, `KindLiteral`, `Fields`, `LetPlan`, `I`, `AlterFunctionStatement`, `RemoveModelStatement`, `Value`, `AlterAccessStatement`, `Script`, `DefaultConfig`, `ForeachStatement`, `InfoStatement`, `OutputStatement`, `RemoveAnalyzerStatement`, `RemoveApiStatement`, `RemoveBucketStatement`, `RemoveDatabaseStatement`, `ModuleExecutable`, `RemoveEventStatement`, `RemoveFieldStatement`, `RemoveIndexStatement`, `RemoveSequenceStatement`, `RemoveTableStatement`, `RebuildIndexStatement`, `RecordIdKeyLit`, `Uuid`, `OrderList`, `AlterApiClause`, `Range`, `RecordIdKey`, `compat/fixtures.rs`, `Block`, `File`, `RecordIdLit`, `RecordIdKeyRangeLit`, `AlterSystemStatement`, `OptionStatement`, `Function`, `RemoveStatement`, `Set`, `.compute`, `Start`, `Operation`, `DefineFunctionStatement`, `compile.rs`, `.value`, `Fetchs`, `Kind`, `DefineAccessStatement`, `Closure`, `CursorDoc`, `catalog/schema/index.rs`, `ChangeFeed`, `.compute`, `Filter`, `Limit`, `Model`, `lower/mod.rs`, `KillStatement`, `EventDefinition`, `array_ops.rs`, `GraphEdgeScan`, `RecursionOp`, `RemoveFunctionStatement`, `RemoveModuleStatement`, `RemoveParamStatement`, `SleepStatement`, `UseStatement`, `AlterDatabaseStatement`, `AlterEventStatement`, `AlterUserStatement`, `Self`, `DefineParamStatement`, `Statement`, `DefineIndexStatement`, `RecordIdKeyLit`, `SelectStatement`, `MlModelDefinition`, `expr_to_ident`, `AlterModuleStatement`, `.compute`, `ContextLevel`, `expr/statements/alter/bucket.rs`, `DefineAnalyzerStatement`, `DefineUserStatement`, `IdiomExpr`, `UpsertStatement`, `expr/statements/alter/param.rs`, `.compute`, `Array`, `.compute`, `RecordIdKey`, `AlterFieldStatement`, `DefineFieldStatement`, `Datetime`, `AlterTableStatement`, `Value`, `Range`, `Session`, `Idiom`, `GeometryKind`, `expr/model.rs`, `Part`, `TableName`, `Fetchs`, `Kind`, `FieldDefinition`, `Self`, `ClosureExpr`, `UpdateStatement`, `UpsertStatement`, `DefineAnalyzerStatement`, `Constant`, `InfoStructure`, `UpdateStatement`, `ClosureFieldCallPart`, `DefineApiStatement`, `syn/parser/test/stmt.rs`, `Duration`, `physical_expr/mod.rs`, `Closure`, `ControlFlowExpr`, `Path`, `Scoring`, `DefineTableStatement`, `DeleteStatement`, `LiveStatement`, `providers.rs`, `Geometry`, `Object`, `DeleteStatement`, `ModuleDefinition`, `Expr`, `From`, `Set`, `Permissions`, `expr/statements/alter/index.rs`, `DefineFunctionStatement`, `RemoveNamespaceStatement`, `Group`, `Duration`, `Regex`, `Dir`, `Expr`, `Script`, `Regex`, `FieldPart`, `expr/statements/alter/mod.rs`, `Index`, `SetStatement`, `AlterAnalyzerStatement`, `Algorithm`, `expr/module.rs`, `expr/statements/access.rs`, `expr/statements/define/index.rs`, `ConfigInner`, `ShowStatement`, `TopLevelExpr`, `Relation`, `Bytes`, `expr/statements/alter/sequence.rs`, `.compute`, `ResourceKind`, `Literal`, `Kind`, `Timestamp`, `DestructurePart`, `IfelseStatement`, `ScalarSubquery`, `Lookup`, `AlterAccessStatement`, `Datetime`, `Param`, `AlterBucketStatement`, `DefineAccessStatement`, `DefineBucketStatement`, `DefineDatabaseStatement`, `DefineModelStatement`, `catalog/schema/mod.rs`, `Block`, `Param`, `CreateStatement`, `RecordIdKeyRange`, `AlterTableStatement`, `Lookup`, `Table`, `File`, `IfelseStatement`, `CreateStatement`, `Part`, `DefineUserStatement`?**
+  _High betweenness centrality (0.093) - this node is a cross-community bridge._
+- **Why does `V` connect `V` to `trees/knn.rs`, `Mem`, `Transactor`, `Error`, `CommonConfig`, `ferntree/src/iter.rs`, `f`, `hash_btree.rs`, `vector_index/codec.rs`, `SchemaVersion`, `hashmap.rs`, `vec_map.rs`, `hnsw_memory.rs`, `.add`, `SlowLog`, `Object`, `Error`, `ferntree/src/lib.rs`, `Variables`, `types/mod.rs`, `I`, `NodeId`, `SqlFormat`, `HashMap`, `Value`, `TokenValue`?**
+  _High betweenness centrality (0.082) - this node is a cross-community bridge._
 - **Are the 14 inferred relationships involving `NamespaceId` (e.g. with `test_signin_bearer_for_record()` and `test_signin_record_with_refresh()`) actually correct?**
   _`NamespaceId` has 14 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 14 inferred relationships involving `DatabaseId` (e.g. with `test_signin_bearer_for_record()` and `test_signin_record_with_refresh()`) actually correct?**
   _`DatabaseId` has 14 INFERRED edges - model-reasoned connections that need verification._
-- **What connects `Op`, `Error`, `OptimisticOrShared<'a, T>` to the rest of the system?**
-  _1614 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **What connects `Результат`, `Обязательный контекст реализации`, `1.1. Зафиксировать сохраняемые контракты` to the rest of the system?**
+  _1637 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `cover` be split into smaller, more focused modules?**
-  _Cohesion score 0.09177215189873418 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.08720596672403902 - nodes in this community are weakly interconnected._

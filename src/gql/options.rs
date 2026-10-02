@@ -64,7 +64,9 @@ pub struct QueryExecutionOptions {
 	/// Combined number of loop backedges allowed in one top-level statement.
 	pub max_loop_iterations: u64,
 	/// Maximum topology branches, hyper assignments, and containment links
-	/// considered by MATCH in one statement.
+	/// considered by MATCH in one statement. Also bounds exact neighbourhood
+	/// projection/traversal work across all kHopEstimate seeds in that
+	/// statement.
 	pub max_path_expansions: u64,
 	/// Maximum unique node atoms retained by one graph-result assembly.
 	pub max_graph_nodes: u64,
@@ -127,6 +129,8 @@ pub(crate) struct ExecutionControl {
 	deadline: Option<Instant>,
 	timeout_ms: u64,
 	cancellation: Option<QueryCancellation>,
+	/// Optional cooperative check supplied by an embedding maintenance worker.
+	cooperative_check: Option<fn() -> FerrosGrynnResult<()>>,
 	notifications: Arc<Mutex<Vec<Status>>>,
 	pub(crate) max_control_depth: u32,
 	pub(crate) max_loop_iterations: u64,
@@ -153,6 +157,12 @@ pub(crate) struct ExecutionControl {
 
 #[derive(Debug, Default)]
 struct MatchMetrics {
+	/// Successful reads of directed landmark bounds.
+	landmark_lookups: AtomicU64,
+	/// Searches using exact traversal without a compatible bound.
+	landmark_fallbacks: AtomicU64,
+	/// Generation bytes admitted once per bound source-target search.
+	landmark_artifact_bytes: AtomicU64,
 	seeds: AtomicU64,
 	frontier_peak: AtomicU64,
 	trace_nodes: AtomicU64,
@@ -185,6 +195,12 @@ struct GraphAssemblyMetrics {
 /// Snapshot of MATCH-specific counters collected by `EXPLAIN ANALYZE`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MatchMetricsSnapshot {
+	/// Directed lower-bound reads and exact-search fallbacks.
+	pub(crate) landmark_lookups: u64,
+	/// Searches using exact traversal without a compatible bound.
+	pub(crate) landmark_fallbacks: u64,
+	/// Generation bytes admitted once per bound source-target search.
+	pub(crate) landmark_artifact_bytes: u64,
 	pub(crate) seeds: u64,
 	pub(crate) frontier_peak: u64,
 	pub(crate) trace_nodes: u64,
@@ -203,6 +219,11 @@ impl MatchMetricsSnapshot {
 	/// Returns a delta between two observations of the same statement control.
 	pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
 		Self {
+			landmark_lookups: self.landmark_lookups.saturating_sub(earlier.landmark_lookups),
+			landmark_fallbacks: self.landmark_fallbacks.saturating_sub(earlier.landmark_fallbacks),
+			landmark_artifact_bytes: self
+				.landmark_artifact_bytes
+				.saturating_sub(earlier.landmark_artifact_bytes),
 			seeds: self.seeds.saturating_sub(earlier.seeds),
 			frontier_peak: self.frontier_peak,
 			trace_nodes: self.trace_nodes.saturating_sub(earlier.trace_nodes),
@@ -272,6 +293,18 @@ struct BarrierMemory {
 	spill_bytes: AtomicU64,
 	spill_runs: AtomicU64,
 	row_pulls: AtomicU64,
+	/// MBR candidates returned by all spatial sources.
+	spatial_candidates: AtomicU64,
+	/// Rows sent through exact spatial post-filters.
+	spatial_refinements: AtomicU64,
+	/// Automatic spatial sources falling back to exact scans.
+	spatial_fallbacks: AtomicU64,
+	/// Tree node page reads, including resident hits.
+	spatial_tree_pages: AtomicU64,
+	/// Snapshot replacement records consulted.
+	spatial_delta_records: AtomicU64,
+	/// Sketch hits, exact fallbacks, charged work and consulted artifact bytes.
+	neighbourhood: [AtomicU64; 4],
 }
 
 /// Bytes retained by one in-memory SELECT barrier.
@@ -291,6 +324,12 @@ impl BarrierAccount {
 				spill_bytes: AtomicU64::new(0),
 				spill_runs: AtomicU64::new(0),
 				row_pulls: AtomicU64::new(0),
+				spatial_candidates: AtomicU64::new(0),
+				spatial_refinements: AtomicU64::new(0),
+				spatial_fallbacks: AtomicU64::new(0),
+				spatial_tree_pages: AtomicU64::new(0),
+				spatial_delta_records: AtomicU64::new(0),
+				neighbourhood: std::array::from_fn(|_| AtomicU64::new(0)),
 			}),
 			bytes: 0,
 		}
@@ -379,6 +418,7 @@ impl ExecutionControl {
 				.map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
 				.unwrap_or(0),
 			cancellation: options.cancellation.clone(),
+			cooperative_check: None,
 			notifications: Arc::new(Mutex::new(Vec::new())),
 			max_control_depth: options.max_control_depth,
 			max_loop_iterations: options.max_loop_iterations,
@@ -395,6 +435,12 @@ impl ExecutionControl {
 				spill_bytes: AtomicU64::new(0),
 				spill_runs: AtomicU64::new(0),
 				row_pulls: AtomicU64::new(0),
+				spatial_candidates: AtomicU64::new(0),
+				spatial_refinements: AtomicU64::new(0),
+				spatial_fallbacks: AtomicU64::new(0),
+				spatial_tree_pages: AtomicU64::new(0),
+				spatial_delta_records: AtomicU64::new(0),
+				neighbourhood: std::array::from_fn(|_| AtomicU64::new(0)),
 			}),
 			temporary_directory: options.temporary_directory.clone(),
 			cursors,
@@ -536,7 +582,19 @@ impl ExecutionControl {
 		if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
 			return Err(FerrosGrynnError::query_timed_out(self.timeout_ms));
 		}
+		if let Some(check) = self.cooperative_check {
+			check()?;
+		}
 		Ok(())
+	}
+
+	/// Attaches the caller's cancellation boundary to every child statement.
+	pub(in crate::gql) fn with_cooperative_check(
+		mut self,
+		check: fn() -> FerrosGrynnResult<()>,
+	) -> Self {
+		self.cooperative_check = Some(check);
+		self
 	}
 
 	pub(crate) fn child(&self, timeout: Option<Duration>) -> Self {
@@ -561,6 +619,7 @@ impl ExecutionControl {
 			deadline,
 			timeout_ms,
 			cancellation: self.cancellation.clone(),
+			cooperative_check: self.cooperative_check,
 			notifications: self.notifications.clone(),
 			max_control_depth: self.max_control_depth,
 			max_loop_iterations: self.max_loop_iterations,
@@ -600,6 +659,52 @@ impl ExecutionControl {
 	/// Returns the statement-wide barrier limit used by physical planning.
 	pub(crate) fn barrier_memory_limit(&self) -> usize {
 		self.barrier_memory.limit
+	}
+
+	/// Returns currently unreserved statement scratch memory.
+	pub(crate) fn barrier_memory_available(&self) -> usize {
+		self.barrier_memory.limit.saturating_sub(self.barrier_memory.used.load(Ordering::Acquire))
+	}
+
+	/// Returns the remaining statement-wide exact neighbourhood work budget.
+	pub(crate) fn remaining_neighbourhood_work(&self) -> u64 {
+		self.max_path_expansions
+			.saturating_sub(self.barrier_memory.neighbourhood[2].load(Ordering::Acquire))
+	}
+
+	/// Charges exact work even when telemetry is disabled.
+	///
+	/// # Errors
+	/// Rejects work exceeding the statement-wide neighbourhood budget.
+	pub(crate) fn record_neighbourhood_estimate(
+		&self,
+		approximate: bool,
+		work: u64,
+		bytes: u64,
+	) -> FerrosGrynnResult<()> {
+		self.barrier_memory.neighbourhood[2]
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+				current.checked_add(work).filter(|next| *next <= self.max_path_expansions)
+			})
+			.map_err(|_current| {
+				FerrosGrynnError::traversal_resource_limit_exceeded(
+					"neighbourhood exact work",
+					self.max_path_expansions,
+				)
+			})?;
+		if self.instrumentation {
+			self.barrier_memory.neighbourhood[usize::from(!approximate)]
+				.fetch_add(1, Ordering::Relaxed);
+			self.barrier_memory.neighbourhood[3].fetch_add(bytes, Ordering::Relaxed);
+		}
+		Ok(())
+	}
+
+	/// Returns sketch hits, exact fallbacks, work and artifact bytes.
+	pub(crate) fn neighbourhood_metrics(&self) -> [u64; 4] {
+		std::array::from_fn(|index| {
+			self.barrier_memory.neighbourhood[index].load(Ordering::Acquire)
+		})
 	}
 
 	/// Returns the statement-wide unique-node ceiling for owned graph results.
@@ -658,6 +763,47 @@ impl ExecutionControl {
 	/// Returns the number of topology branches charged by this statement.
 	pub(crate) fn path_expansions(&self) -> u64 {
 		self.path_expansions.load(Ordering::Acquire)
+	}
+
+	/// Records admitted MBR candidates when EXPLAIN ANALYZE is active.
+	pub(crate) fn record_spatial_candidates(&self, count: usize) {
+		if self.instrumentation {
+			self.barrier_memory.spatial_candidates.fetch_add(count as u64, Ordering::Relaxed);
+		}
+	}
+
+	/// Records one exact spatial refinement.
+	pub(crate) fn record_spatial_refinement(&self) {
+		if self.instrumentation {
+			self.barrier_memory.spatial_refinements.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Records one unavailable automatic geometry binding.
+	pub(crate) fn record_spatial_fallback(&self) {
+		if self.instrumentation {
+			self.barrier_memory.spatial_fallbacks.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Records tree-page and replacement work for one spatial lookup.
+	pub(crate) fn record_spatial_work(&self, pages: u64, delta_records: u64) {
+		if self.instrumentation {
+			self.barrier_memory.spatial_tree_pages.fetch_add(pages, Ordering::Relaxed);
+			self.barrier_memory.spatial_delta_records.fetch_add(delta_records, Ordering::Relaxed);
+		}
+	}
+
+	/// Returns candidates, refinements, fallbacks, tree pages and delta
+	/// records, in that order.
+	pub(crate) fn spatial_metrics(&self) -> [u64; 5] {
+		[
+			self.barrier_memory.spatial_candidates.load(Ordering::Acquire),
+			self.barrier_memory.spatial_refinements.load(Ordering::Acquire),
+			self.barrier_memory.spatial_fallbacks.load(Ordering::Acquire),
+			self.barrier_memory.spatial_tree_pages.load(Ordering::Acquire),
+			self.barrier_memory.spatial_delta_records.load(Ordering::Acquire),
+		]
 	}
 
 	/// Records one accepted MATCH seed when instrumentation is active.
@@ -723,9 +869,30 @@ impl ExecutionControl {
 		self.match_metrics.physical_ioring_pages.fetch_add(ioring_pages, Ordering::Relaxed);
 	}
 
+	/// Records a successful logical lower-bound lookup.
+	pub(crate) fn record_landmark_lookup(&self, bytes: u64) {
+		if self.instrumentation {
+			self.match_metrics.landmark_lookups.fetch_add(1, Ordering::Relaxed);
+			self.match_metrics.landmark_artifact_bytes.fetch_add(bytes, Ordering::Relaxed);
+		}
+	}
+
+	/// Records one source-target search using the exact fallback.
+	pub(crate) fn record_landmark_fallback(&self) {
+		if self.instrumentation {
+			self.match_metrics.landmark_fallbacks.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
 	/// Returns MATCH counters collected so far.
 	pub(crate) fn match_metrics(&self) -> MatchMetricsSnapshot {
 		MatchMetricsSnapshot {
+			landmark_lookups: self.match_metrics.landmark_lookups.load(Ordering::Acquire),
+			landmark_fallbacks: self.match_metrics.landmark_fallbacks.load(Ordering::Acquire),
+			landmark_artifact_bytes: self
+				.match_metrics
+				.landmark_artifact_bytes
+				.load(Ordering::Acquire),
 			seeds: self.match_metrics.seeds.load(Ordering::Acquire),
 			frontier_peak: self.match_metrics.frontier_peak.load(Ordering::Acquire),
 			trace_nodes: self.match_metrics.trace_nodes.load(Ordering::Acquire),

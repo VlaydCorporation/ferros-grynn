@@ -52,8 +52,11 @@ P0–P2-профиль для `MATCH`. Dependency-ordered реализацию �
 7. Global и local constraints имеют независимые оси mode, objective и AND-combined filters.
    Локальная ось заменяет одноимённую global axis; повтор mode/objective в scope ошибочен.
 8. `SHORTEST` и `WEIGHTED SHORTEST` возвращают один канонический путь на source–target пару.
-   Используются BFS и Dijkstra; weight складывается exact numeric matrix, отсутствующий равен
-   единице, negative/non-finite даёт typed runtime error.
+   Используются BFS и bounded Dijkstra/ALT; weight складывается exact numeric matrix,
+   отсутствующий равен единице, negative/non-finite даёт typed runtime error. Для WEIGHT
+   completion bound учитывает оставшееся число шагов и округление runtime reduction.
+   Terminal result выдаётся после проверки всех pending bounds, способных улучшить cost
+   либо canonical tie; zero-weight terminal может быть промежуточным prefix другого пути.
 9. Public atom binding является `AtomOccurrenceRef = { AtomRef, GraphRef }`. `AtomRef` остаётся
    global durable identity; occurrence задаёт effective-property и topology scope. Durable fields
    occurrence не принимают.
@@ -1157,6 +1160,13 @@ graph-local label указывается отдельно, например `<(P
 `~[]~>` и других анонимных связей нет.
 
 Длина пути: количество связывающих рёбер (= количество шагов), как в StandardPath.
+
+В этапе 25 AtomWalk использует общий диапазон `~[Class*min..max ...]~>`:
+например, `MATCH ATOM path = <(person:a AS a)>~[link*1..4 SHORTEST]~><[link:b AS b]>`.
+WALK/TRAIL/ACYCLIC/SIMPLE, objectives и MAXDEPTH проверяются общим analysis.
+Kind delimiters ограничивают конечные bindings сегмента; промежуточные endpoints
+могут быть nodes или edges. Connector selector и LABEL применяются к каждому шагу.
+Qualified/cross-level paths сохраняют exact scoped traversal.
 
 Пример: E–E incidence-путь:
 ```
@@ -2421,6 +2431,7 @@ disk-resident side-file с bounded page cache. Граф, его списки с�
 DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     ON [ GRAPH ] @graph
     PATH
+    [ MODE NODE | ATOM ]
     [ WEIGHTED | COST fn::@function ]
     [ EDGES @edge_label ]
     [ ALGORITHM LANDMARK_SSSP(@n) 
@@ -2432,9 +2443,17 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     [ COMMENT @string ]
     [ CONCURRENTLY ]
     [ DEFER ]
-    WITH ( MAX_BYTES = @bytes )
+    [ WITH ( MAX_BYTES = @bytes ) ]
 ;
 ```
+
+Path/Reachability/Neighbourhood — graph-owned versioned definitions. `MODE` по умолчанию NODE,
+одна definition хранит одну проекцию; DIRECTION по умолчанию OUT. `EDGES` принимает список labels
+через запятую, без modifier подходят все labels. `WITH (MAX_BYTES=n)` — hard cap artifact pages
+и metadata, scratch ограничен отдельно maintenance options. LANDMARK_SSSP и PATTERN_CACHE требуют
+MAX_BYTES; ON_DEMAND не требует side-file. PATTERNS задаётся списком literal sources
+`['MATCH ...', 'MATCH ...']`; executable typed IR не сериализуется. Engine-owned label,
+adjacency и edge_endpoint нельзя DEFINE/REMOVE; INFO/REBUILD доступны согласно capability.
 
 **Алгоритмы:**
 
@@ -2464,8 +2483,9 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
 DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     ON [ GRAPH ] @graph
     REACHABILITY
+    [ MODE NODE | ATOM ]
     [ EDGES @edge_label ]
-    [ ALGORITHM TREE_COVER
+    [ ALGORITHM AUTO | TREE_COVER
         | GRAIL [ (@k) ]
         | FERRARI [ (@max_ranges) ]
         | BFL [ (@bits) ]
@@ -2491,7 +2511,9 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
   Допустим только для TREE/ROOTED_TREE/FOREST; generic DAG отклоняется.
   Инвалидируется при мутациях.
 
-- `GRAIL(k)` — k детерминированно seeded DFS-обходов, каждый порождает `[in_ts,out_ts]`.
+- `GRAIL(k)` — k детерминированно seeded DFS-обходов, каждый порождает min-post interval
+  `[minimum_reachable_postorder, own_postorder]`. Minimum распространяется от successors
+  в reverse topological order; обычный entry/exit interval для DAG недостаточен.
   Нарушение containment хотя бы в одном измерении даёт `No`; только прохождение всех k даёт
   `Maybe` и exact traversal. `k ∈ [1,32]`, default 2.
   Возможны false positives (гарантирует отсутствие false negatives).
@@ -2538,9 +2560,10 @@ artifact.
 DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     ON [ GRAPH ] @graph
     NEIGHBOURHOOD(@k)
+    [ MODE NODE | ATOM ]
     [ EDGES @edge_label ]
-    [ ALGORITHM EXACT 
-        | SKETCH 
+    [ ALGORITHM AUTO | EXACT
+        | SKETCH [ (@p) ]
         | LANDMARK(@n) 
         | ON_DEMAND 
     ]
@@ -2548,37 +2571,54 @@ DEFINE INDEX [ OVERWRITE | IF NOT EXISTS ] @name
     [ COMMENT @string ]
     [ CONCURRENTLY ]
     [ DEFER ]
+    [ WITH ( MAX_BYTES = @bytes ) ]
 ;
 ```
 
 Параметр `@k` — максимальный предвычисленный радиус (int ≥ 1).
 k = 1 — инцидентность, бесплатно (данные из NodeHotSlot adjacency, не требует индекса).
+EXACT/SKETCH/LANDMARK материализуют только k≤4 с обязательным MAX_BYTES. Explicit k>4
+отклоняется; AUTO при k>4 выбирает ON_DEMAND. Explicit build выше budget возвращает resource
+error, а не partial result. AUTO выбирает exact candidate только если он помещается.
 
 **Алгоритмы:**
 
 - `EXACT` — явные списки соседей для каждой вершины на каждом расстоянии 1..k. 
   Запрос O(1). Пространство экспоненциально растёт с k и avg_degree.
-  Применение: k ≤ 3, разреженные графы (avg_degree ≤ 10).
+  Хранит distinct members по радиусам, k≤4. Seed inclusion соответствует exact traversal API.
 
 - `SKETCH` — приближённый подсчёт через HyperLogLog. 
-  Отвечает на «сколько вершин в k-окрестности?» с погрешностью ~2%. 
-  Не поддерживает точное перечисление членов окрестности. Пространство O(n·k·64) байт.
+  Используется только явно approximate `tv::kHopEstimate(k)` и planner estimates.
+  p=12 по умолчанию означает 4096 однобайтовых registers (погрешность около 1.63%), range 4..18.
+  Merge — registerwise max. Пространство O(n·k·2^p) байт. `tv::kHop`, перечисление и обычные
+  counts остаются exact. Без совместимого Ready sketch estimate выполняет exact traversal.
+  `tv::kHopEstimate(k)` возвращает integer count distinct members на расстоянии ≤k, включая
+  seed (при k=0 count=1), в OUT-проекции NODE либо ATOM текущего TRAVERSE. При ATOM обычное
+  ребро не становится промежуточной вершиной; действуют существующие edge-endpoint steps.
+  Planner выбирает только unfiltered graph-local Ready SKETCH с совпадающими MODE/OUT и
+  достаточным radius, предпочитая больший p, затем меньшие bytes/IndexId. Binding фиксируется
+  physical plan и PlanHash. Dynamic radius, k>4, cross-level artifact и отсутствие совместимого
+  binding используют bounded exact graph-local traversal. Exact fallback делит statement
+  scratch budget и work ceiling `max_path_expansions` между seeds; exhaustion возвращает error
+  без partial result. Bulk сохраняет multiplicity. EXPLAIN показывает binding/projection/p/bytes
+  и exact fallback; ANALYZE — sketch reads, fallbacks, exact work и consulted artifact bytes.
+  Peak scratch в ANALYZE — admission reservation, не измеренный RSS.
 
-- `LANDMARK(n)` — n landmark-вершин выбираются эвристически (высокая степень, центральность). 
-  Для них: точные окрестности. Для остальных: BFS с ранним отсечением через landmark-расстояния. 
-  Компромисс между памятью и точностью.
+- `LANDMARK(n)` — n landmarks с exact cached neighbourhood. При достижении landmark обход
+  дополняется cached members для оставшегося радиуса; результат остаётся точным.
 
 - `ON_DEMAND` — BFS при каждом запросе. O(V+E) запрос.
 
 **Автоматический выбор:**
 
-| k   | avg_degree | Алгоритм                  |
-|-----|------------|---------------------------|
-| 1   | любой      | (adjacency, без хранения) |
-| 2   | ≤ 10       | EXACT                     |
-| 2   | > 10       | ON_DEMAND                 |
-| ≥ 3 | ≤ 5        | EXACT                     |
-| ≥ 3 | > 5        | ON_DEMAND                 |
+| k    | avg_degree | Алгоритм                  |
+|------|------------|---------------------------|
+| 1    | любой      | (adjacency, без хранения) |
+| 2    | ≤ 10       | EXACT                     |
+| 2    | > 10       | ON_DEMAND                 |
+| 3..4 | ≤ 5        | EXACT, если помещается    |
+| 3..4 | > 5        | ON_DEMAND                 |
+| > 4  | любой      | ON_DEMAND                 |
 
 ### 9.7. DEFINE ANALYZER
 
@@ -2861,7 +2901,8 @@ source. Stage 14 не пересекает secondary indexes: несколько
 
 Каждый явно названный source обязан получить один совместимый Ready-index из своего набора;
 неqualified имя допустимо только при однозначном source. Forced hint проверяется до row pull.
-`WITH COST @const_fn` применимо только для будущих `MATCH`/`TRAVERSE` cost-функций.
+`WITH COST fn::name` задаёт MATCH path-cost default и TRAVERSE connector cost (§15.5).
+SELECT не принимает этот path modifier.
 
 ### 10.4. GROUP
 
@@ -3316,6 +3357,7 @@ Match mode ограничивает отображение переменных,
     @pattern [ , @pattern ... ]
     [ CONTAINS ... ]
     IN GRAPH @graph_ref
+    [ WITH COST fn::name ]
     [ WHERE @condition ]
     [ MAXDEPTH @depth ]
     [ TIMEOUT @duration ]
@@ -3326,8 +3368,8 @@ Match mode ограничивает отображение переменных,
 @pattern ::= [ @path_name = ] @relations_pattern
 ```
 
-`WITH INDEX` и custom path `WITH COST` принадлежат этапу 25, а `KEEP LEVELPATH` — этапу 17;
-они не являются скрытыми compatibility clauses профиля этапов 15–16.
+`WITH COST` реализован в срезе этапа 25 (§15.5). `WITH INDEX` принадлежит этапу 25,
+а `KEEP LEVELPATH` — этапу 17; это отдельные clauses текущего профиля.
 
 ### 12.3. Синтаксис паттернов
 
@@ -3664,6 +3706,7 @@ Pipeline начинается с исходного набора и послед
 TRAVERSE [ CONSTRAINTS <@path_constraints> ]
     FROM @source
     [ IN GRAPH @graph_ref ]
+    [ WITH COST fn::name ]
     |> step(...)
     |> step(...)
 [ RETURN @projection ]
@@ -3673,6 +3716,7 @@ TRAVERSE [ CONSTRAINTS <@path_constraints> ]
 TRAVERSE ATOM [ CONSTRAINTS <@path_constraints> ]
     FROM @source
     [ IN GRAPH @graph_ref ]
+    [ WITH COST fn::name ]
     |> step(...)
     |> step(...)
 [ RETURN @projection ]
@@ -3809,13 +3853,14 @@ RETURN weights_sum;
 
 **Пути и расстояния**
 
-| Шаг                                               | Описание                                                                            |
-|---------------------------------------------------|-------------------------------------------------------------------------------------|
-| `tv::shortestPath(target)`                        | Кратчайший путь до target по числу рёбер (BFS)                                      |
-| `tv::weightedShortestPath(target, weight_field?)` | Взвешенный кратчайший путь (Dijkstra); требует неотрицательных весов                |
-| `tv::bellmanFord(target, weight_field?)`          | Взвешенный кратчайший путь с отрицательными весами; сообщает об отрицательном цикле |
-| `tv::distanceTo(target, weight_field?)`           | Только длина/стоимость, без материализации пути                                     |
-| `tv::kHop(k)`                                     | Множество вершин ровно на расстоянии k                                              |
+| Шаг                                               | Описание                                                                                        |
+|---------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| `tv::shortestPath(target)`                        | Кратчайший путь по числу рёбер; BFS либо directed ALT/A* с прежним canonical BFS path           |
+| `tv::weightedShortestPath(target, weight_field?)` | Взвешенный кратчайший путь; Dijkstra с compatible directed ALT refinement, неотрицательные веса |
+| `tv::bellmanFord(target, weight_field?)`          | Взвешенный кратчайший путь с отрицательными весами; сообщает об отрицательном цикле             |
+| `tv::distanceTo(target, weight_field?)`           | Только длина/стоимость, без материализации пути                                                 |
+| `tv::kHop(k)`                                     | Точные вершины на расстоянии ≤k, включая seed; существующий порядок BFS                         |
+| `tv::kHopEstimate(k)`                             | Явно approximate distinct count на расстоянии ≤k с seed; без Ready sketch exact fallback        |
 
 **Структура графа**
 
@@ -3836,6 +3881,35 @@ barrier-операторами. PageRank, centralities, all-shortest enumeration
 label propagation и Louvain принадлежат этапу 26. С этапа 21 `tv::algo(fn::name, ...)`
 вызывает versioned named PURE/STABLE UDF через общий function catalog; отдельного algorithm
 registry нет.
+
+Seed-local `shortestPath`, `weightedShortestPath`, `distanceTo`, `reachable`, `bellmanFord`
+и `lca` сохраняют NODE domain. `TRAVERSE ATOM` не расширяет domain этих алгоритмов.
+Target принимает `RecordId`, `AtomRef` либо `AtomOccurrenceRef`; RecordId разрешается по
+membership графа seed, qualified target другого GraphId отклоняется. Повторные seeds сохраняют
+bag multiplicity, включая внутренний bulk.
+
+`tv::shortestPath` выбирает только Ready NODE/OUT/HOP LANDMARK_SSSP без edge-label filter.
+A* вычисляет exact длину с reopening; отдельный BFS отсекает только completion bounds больше
+этой длины и сохраняет прежний FIFO/connector порядок равных путей. Artifact не восстанавливает
+path самостоятельно. Stale/private/cross-level generation сохраняет exact BFS fallback.
+
+`tv::weightedShortestPath` и `tv::distanceTo` выбирают Ready NODE/OUT/WEIGHT generation без
+edge-label restriction. Общий Dijkstra сохраняет distance/node очередь и первый predecessor
+при равных стоимостях; ALT отсекает только strictly greater completion bounds. Все edge weights
+валидируются до refinement. Если numeric guard не доказывает монотонность reduction и отсутствие
+overflow, выполняется тот же полный Dijkstra: это сохраняет ошибки смешанного float/decimal,
+больших integer→float casts и reachable arithmetic даже при zero-length target. Integer/decimal
+guard использует conservative i64 ceiling; float guard дополнительно проверяет exact integer
+prefix casts и outward-rounded верхнюю границу всех additions. Этот fallback наблюдаем в counters.
+При `WITH COST` эти две операции используют full-state exact kernel (§15.5) с captured
+PURE contribution и compatible additive function landmarks; stored WEIGHT порядок остаётся прежним.
+
+EXPLAIN/PlanHash фиксируют generation; анализ считает lower-bound lookups, fallback, expansions
+и artifact bytes. Adjacency, frontier и retained algorithm batch ограничены общим statement
+scratch budget; при исчерпании budget partial traversal result не возвращается. Итоговая owned
+материализация не подменяет scratch budget сортировки/дедупликации: spill сохраняет свой контракт.
+Shared Path/graph
+references при heap admission учитываются консервативно.
 
 ### 13.5. Sack
 
@@ -4047,11 +4121,50 @@ RETURN path1, path2;
 
 $```cost(path) = \sum_i weight(e_i)```$
 
-Пользовательская функция стоимости: `DEFINE COST FUNCTION fn::my_cost(edge, accumulated_cost)`.
-Её можно использовать тремя способами:
-- для определённого пути `[E ... COST fn::my_cost]`;
-- как модификатор всего запроса `MATCH ... WITH COST fn::my_cost`;
-- как второй аргумент функции стоимости: `path::cost($path, $cost_fn)`
+Локальный `COST fn::name` у fixed либо bounded variable-length MATCH segment принимает опубликованную
+versioned PURE COST функцию `(edge: any|edge-occurrence) -> number` либо
+`(edge: any|edge-occurrence, prefix: number) -> number`. Первая получает qualified connector
+occurrence и effective properties из того же snapshot; её additive semantics совместимы с
+LANDMARK_SSSP при совпадении MODE/direction/labels и function/version. Вторая получает exact
+накопленную стоимость текущего segment, начиная с нуля. Return — вклад текущего hop, который
+прибавляется к prefix через обычную numeric matrix; это stateful COST, исполняемый ON_DEMAND.
+Materialized definition с такой двухаргументной функцией отклоняется.
+
+Каждый вклад должен быть finite и неотрицательным, иначе возвращается typed error. `COST`
+используется при перечислении путей и с `WEIGHTED SHORTEST`; `SHORTEST COST` отклоняется,
+поскольку SHORTEST сравнивает hop count. Qualified identity, version и stateful flag входят
+в физический plan/EXPLAIN/PlanHash (encoding version 5). Scoped/cross-level запрос сохраняет
+exact traversal и qualified target identity; он не использует graph-local landmark artifact.
+
+Глобальный модификатор `MATCH ... IN GRAPH graph WITH COST fn::name` расположен перед WHERE
+и задаёт default каждому linear connector segment; local COST его переопределяет. Глобальная
+функция проверяется даже при local overrides. Clause без linear connector отвергается.
+Fixed segment сохраняет обычные edge bindings/uniqueness и начинает stateful prefix с нуля;
+named path суммирует вклады всех segments. COST проверяется и когда path не проецируется.
+WHERE/RETURN/RETURN GRAPH используют обычный pipeline.
+
+`TRAVERSE FROM source [IN GRAPH graph] WITH COST fn::name |> ...` задаёт вклад connector
+для прямых navigation steps и `tv::weightedShortestPath`/`tv::distanceTo`. Navigation
+использует накопленный prefix traverser, даже без `tv::path()`; seed-local algorithm
+начинает отдельный segment с нуля и сохраняет NODE domain внутри TRAVERSE ATOM.
+Unary additive COST может использовать Ready NODE/OUT/function-version LANDMARK_SSSP
+без label filter; stateful COST всегда ON_DEMAND. Exact search сохраняет OUT incidence
+с undirected edges, path mode/filters, seed multiplicity и canonical full-path ties.
+TRAIL/ACYCLIC/SIMPLE имеют структурные bounds; WALK использует общие work/memory limits
+и возвращает typed resource error при исчерпании, включая zero-cost cycles. Глобальные
+SHORTEST, `tv::shortestPath` и BellmanFord с COST отклоняются; отсутствие connector consumer
+также ошибочно. Вложенные statements/closures имеют собственную область COST.
+
+`path::cost(path, fn::name)` повторно вычисляет стоимость через ту же статически
+разрешённую versioned PURE COST функцию. Connector occurrences обрабатываются в порядке
+пути; stateful prefix начинается с нуля для всего переданного пути. Это может отличаться
+от сохранённого COST, если MATCH применял разные функции или сбрасывал prefix между segments.
+Runtime closure вместо `fn::name` не поддерживается. До чтения contributions проверяются
+origin первого graph, SnapshotId и membership всех qualified occurrences; effective properties
+читаются через обычный snapshot/SSI adapter. Отсутствующий connector, чужой snapshot, неверный
+тип, отрицательный/non-finite вклад и arithmetic overflow дают typed error. На connector
+расходуется один шаг общего `max_path_expansions`; cancellation проверяется в обеих фазах.
+Суммирование потоковое, без массива промежуточных contributions. Путь без connectors имеет cost 0.
 
 ### 15.6. Именованный путь и функции над ним
 
@@ -4062,13 +4175,14 @@ IN GRAPH social
 RETURN path, path::length(path), path::cost(path);
 ```
 
-| Функция           | Тип результата           | Описание                               |
-|-------------------|--------------------------|----------------------------------------|
-| `path::atoms(p)`  | `array<atom-occurrence>` | Полная чередующаяся последовательность |
-| `path::nodes(p)`  | `array<atom-occurrence>` | Node endpoint occurrences              |
-| `path::edges(p)`  | `array<atom-occurrence>` | Connector edge occurrences             |
-| `path::length(p)` | `int`                    | Количество connector steps             |
-| `path::cost(p)`   | `number`                 | Exact сумма весов либо длина           |
+| Функция                   | Тип результата           | Описание                                                    |
+|---------------------------|--------------------------|-------------------------------------------------------------|
+| `path::atoms(p)`          | `array<atom-occurrence>` | Полная чередующаяся последовательность                      |
+| `path::nodes(p)`          | `array<atom-occurrence>` | Node endpoint occurrences                                   |
+| `path::edges(p)`          | `array<atom-occurrence>` | Connector edge occurrences                                  |
+| `path::length(p)`         | `int`                    | Количество connector steps                                  |
+| `path::cost(p)`           | `number`                 | Exact сумма весов либо длина                                |
+| `path::cost(p, fn::name)` | `number`                 | Повторное exact вычисление через PURE COST в query snapshot |
 
 Именованный или возвращаемый путь отслеживается с начала соответствующего обхода. Если путь
 не именован, не возвращается и не используется `tv::path()`/path-функциями, исполнитель вправе
@@ -4077,7 +4191,8 @@ RETURN path, path::length(path), path::cost(path);
 `RETURN path` материализует самодостаточную неизменяемую структуру: `SnapshotId`,
 упорядоченные шаги с `AtomOccurrenceRef`, направление и exact `Number` cost. Внутренний
 `AtomId` в результат не попадает. `path::nodes`, `path::edges`, `path::atoms`,
-`path::length` и `path::cost` работают без живого storage snapshot.
+`path::length` и одноаргументный `path::cost` работают без живого storage snapshot.
+Двухаргументный `path::cost` требует matching query snapshot для чтения contributions.
 
 Свойства атомов не копируются в каждый шаг автоматически. Каждый occurrence уже несёт точный
 `GraphRef`, а path — `SnapshotId`; молчаливый переход к latest revision запрещён. Если
@@ -4765,7 +4880,7 @@ RapidHash V3 по versioned canonical physical-plan bytes: `DefaultHasher`, `Deb
 | `regex::`                   | stateful runtime-only matcher                             | —                                     |
 | `uuid`/`ulid`/`rand::`      | UUIDv7, ULID, `rand::id([length])`                        | —                                     |
 | `search::`                  | —                                                         | этап 22                               |
-| `geo::`                     | —                                                         | этап 24                               |
+| `geo::`                     | `within`, `intersects`, Point/Point `distance`            | R-tree gates — этап 24                |
 | `computed::`                | —                                                         | назначенный schema/query этап         |
 
 Этап 12 использует закрытый статический enum/signature table и обычный `match`: runtime
@@ -6213,3 +6328,35 @@ enum BridgeData<'a> {
 > Список отложенного (JIT-компиляция, SMT-верификация оптимизатора, параллельный recovery,
 > graph-специфические индексы, distributed execution) объединён там со сводками из
 > `gql_tech_spec.md` §18 и `disk_storage_spec.md`.
+
+## Geometry — нормативный срез этапа 24
+
+`geometry` хранит собственные runtime values всех семи GeoJSON families. WGS-84 longitude/latitude:
+две finite координаты в диапазонах ±180/±90. Conversion, persistence, predicates и builds используют
+общий validator. Кольца явно замкнуты до foreign polygon; self-intersections и некорректные holes
+отклоняются. Eq/Ord/Hash и canonical encoding сохраняются. Valid empty geometries не имеют MBR.
+
+`INSIDE`/`geo::within(a,b)` используют OGC Within: a покрывается b и их interiors пересекаются.
+Точка на границе не внутри. `INTERSECTS`/`geo::intersects` включают boundary contact.
+`OUTSIDE`/`NOTINSIDE` — отрицание Within после missing/NONE/NULL проверки: sentinel всегда false.
+Неверный непустой тип возвращает typed error. ALLINSIDE/ANYINSIDE/NONEINSIDE принимают Array/Set,
+проверяют все элементы и дают true/false/true для пустой коллекции. Nested GeometryCollection
+имеет semantics set union, включая overlapping members и общие seams; predicates сохраняют
+исходные f64 coordinates без quantized polygon union.
+
+`geo::distance` поддерживает Point/Point и возвращает WGS-84 геодезические метры. Topology плоская:
+сегменты линейны в lon/lat, антимеридиан не оборачивается. Область, пересекающую его, представляют
+разделёнными частями MultiPolygon. Другие CRS, spherical predicates и сложный distance вне среза.
+
+`DEFINE INDEX ... FIELDS field GEOMETRY [TYPE family] SCOPE BASE|EFFECTIVE IN GRAPH graph` принимает
+ровно одно declared geometry/option<geometry> поле. TYPE проверяется при writes/builds независимо
+для BASE/EFFECTIVE, с обычными overlay Value/Hidden/absent semantics. Ready R-tree допускается для
+positive leading INSIDE/INTERSECTS с exact refinement в том же snapshot. Отрицания/distance
+сохраняют scan. Несовместимый/stale forced index ошибочен до row pull. Resource/cancellation
+errors не превращаются в scan fallback.
+
+Aggregate elements≤1 000 000, nesting depth≤64; validation scratch+retained bytes≤128 MiB.
+Collection arrangement и hole-touch checks имеют bounded pairwise work 16 000 000; превышение —
+typed resource error. Index candidates подчиняются statement barrier-memory/cancellation policy.
+Bulk ANALYZE хранит ≤1024 nonempty MBR и отдельную nonempty population. Sample влияет только на
+planning. Полный correctness/resource/performance статус фиксируется в отчёте этапа 24.

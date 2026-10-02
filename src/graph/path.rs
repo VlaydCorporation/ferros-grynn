@@ -113,6 +113,26 @@ impl Path {
 		self.cost
 	}
 
+	/// Estimates retained steps, public identifiers and graph references
+	/// without allocation. Shared references are charged conservatively.
+	pub(crate) fn estimated_heap_bytes(&self) -> usize {
+		self.steps.iter().fold(
+			self.steps.len().saturating_mul(size_of::<PathStep>()),
+			|bytes, step| {
+				let occurrence_bytes = |atom: &AtomOccurrenceRef| {
+					atom.atom()
+						.id()
+						.estimated_heap_bytes()
+						.saturating_add(size_of::<super::GraphRef>())
+						.saturating_add(atom.graph().name().len())
+				};
+				bytes
+					.saturating_add(occurrence_bytes(step.atom()))
+					.saturating_add(step.via_edge().map_or(0, occurrence_bytes))
+			},
+		)
+	}
+
 	pub fn atoms(&self) -> impl Iterator<Item = &AtomOccurrenceRef> {
 		self.steps.iter().flat_map(|step| step.via_edge().into_iter().chain([step.atom()]))
 	}
@@ -349,10 +369,49 @@ impl PathTraceArena {
 		origin: Uuid,
 		snapshot: SnapshotId,
 	) -> FerrosGrynnResult<Path> {
+		self.materialize_with_admission(end, origin, snapshot, &mut |_| Ok(()), &mut || Ok(()))
+	}
+
+	/// Reserves the complete output before cloning any trace steps.
+	///
+	/// # Errors
+	/// Rejects absent traces, cancellation, size overflow or memory admission.
+	pub(crate) fn materialize_with_admission(
+		&self,
+		end: PathTraceId,
+		origin: Uuid,
+		snapshot: SnapshotId,
+		admit: &mut impl FnMut(usize) -> FerrosGrynnResult<()>,
+		check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Path> {
 		let mut cursor = Some(end);
-		let mut steps = Vec::new();
+		let mut count = 0usize;
+		let mut bytes = std::mem::size_of::<Path>().saturating_add(64);
+		while let Some(id) = cursor {
+			check()?;
+			let node = self.nodes.get(id.0 as usize).ok_or_else(|| {
+				FerrosGrynnError::graph_constraint_violation(
+					"path trace",
+					"the terminal trace node does not exist",
+				)
+			})?;
+			count = count
+				.checked_add(1)
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("path steps"))?;
+			bytes = Self::estimated_node_heap_bytes(&node.step)
+				.checked_mul(2)
+				.and_then(|node_bytes| bytes.checked_add(node_bytes))
+				.ok_or_else(|| {
+					FerrosGrynnError::operation_overflow("path materialization bytes")
+				})?;
+			cursor = node.previous;
+		}
+		admit(bytes)?;
+		let mut cursor = Some(end);
+		let mut steps = Vec::with_capacity(count);
 		let mut cost = None;
 		while let Some(id) = cursor {
+			check()?;
 			let node = self.nodes.get(id.0 as usize).ok_or_else(|| {
 				FerrosGrynnError::graph_constraint_violation(
 					"path trace",
@@ -441,6 +500,29 @@ mod tests {
 	}
 
 	#[test]
+	fn path_value_heap_estimate_includes_steps_and_long_public_identifiers() {
+		let record = crate::values::RecordId::new(
+			"person",
+			crate::values::RecordIdPart::String("x".repeat(4096).into()),
+		)
+		.unwrap();
+		let graph = Graph::<Mutable>::new();
+		let step = PathStep::new(
+			AtomOccurrenceRef::new(
+				super::super::AtomRef::new(super::super::AtomKind::Node, record),
+				graph_ref(),
+			),
+			None,
+			PathDirection::Forward,
+			EndpointRole::Source,
+		);
+		let path = super::Path::new(graph.identity(), graph.snapshot_id(), vec![step], None);
+		let value = crate::values::Value::Path(Box::new(path));
+		assert!(value.estimated_heap_bytes() > 4096);
+		assert_eq!(value.estimated_heap_bytes(), value.clone().estimated_heap_bytes());
+	}
+
+	#[test]
 	fn trace_arena_shares_prefixes_and_materializes_order() {
 		let mut graph = Graph::<Mutable>::new();
 		let first = graph.add_node(None, PropertyMap::new()).unwrap();
@@ -482,6 +564,27 @@ mod tests {
 			)
 			.unwrap();
 		let path = arena.materialize(end, graph.identity(), graph.snapshot_id()).unwrap();
+		let mut checked = 0;
+		let mut admitted = 0;
+		assert!(
+			arena
+				.materialize_with_admission(
+					end,
+					graph.identity(),
+					graph.snapshot_id(),
+					&mut |bytes| {
+						admitted = bytes;
+						Err(super::FerrosGrynnError::invalid_argument("test admission rejection"))
+					},
+					&mut || {
+						checked += 1;
+						Ok(())
+					},
+				)
+				.is_err()
+		);
+		assert_eq!(checked, 2);
+		assert!(admitted > 2 * std::mem::size_of::<PathStep>());
 
 		assert_eq!(path.length(), 1);
 		assert_eq!(path.nodes().count(), 2);

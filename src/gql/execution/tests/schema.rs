@@ -5,6 +5,182 @@ use crate::{
 };
 
 #[test]
+fn graph_index_ddl_validates_projection_budgets_versions_and_info() {
+	let store = Datastore::in_memory();
+	let results = store
+		.execute(
+			"DEFINE GRAPH network;
+		 DEFINE INDEX reach ON GRAPH network REACHABILITY ALGORITHM GRAIL MODE ATOM DIRECTION BOTH EDGES \
+			 road,rail WITH (MAX_BYTES=1048576);
+		 DEFINE INDEX nh ON network NEIGHBOURHOOD(5) ALGORITHM AUTO;
+		 DEFINE INDEX path ON GRAPH network PATH ALGORITHM ON_DEMAND;
+		 INFO FOR INDEX reach ON GRAPH network;
+		 REBUILD INDEX path ON GRAPH network;",
+			&Object::new(),
+		)
+		.unwrap();
+	for (ordinal, result) in results.iter().enumerate() {
+		assert!(result.result.is_ok(), "statement {ordinal}: {:?}", result.result);
+	}
+	let catalog = store.schema_catalog();
+	let graph = catalog.named_graph("network").unwrap();
+	let index = graph.indexes().find(|index| index.name().as_str() == "reach").unwrap();
+	assert_eq!(index.mode(), crate::graph::TraversalSemantics::Atom);
+	assert_eq!(index.direction(), crate::graph::TraversalDirection::Both);
+	assert_eq!(index.definition(), &crate::datastore::GraphIndexDefinition::Reachability {
+		algorithm: crate::datastore::ReachabilityAlgorithm::Grail(2)
+	});
+	let id = index.id();
+	let version = index.version();
+	let fingerprint = index.fingerprint().unwrap();
+	let info = results[4].result.as_ref().unwrap().value().as_object().unwrap();
+	assert_eq!(info.get("mode"), Some(&Value::from("ATOM")));
+	assert_eq!(info.get("fingerprint"), Some(&Value::from(fingerprint)));
+	let overwritten = store
+		.execute(
+			"DEFINE INDEX OVERWRITE reach ON GRAPH network REACHABILITY ALGORITHM BFL;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(overwritten[0].result.is_ok());
+	let catalog = store.schema_catalog();
+	let graph = catalog.named_graph("network").unwrap();
+	let index = graph.indexes().find(|index| index.name().as_str() == "reach").unwrap();
+	assert_eq!(index.id(), id);
+	assert!(index.version() > version);
+	for query in [
+		"DEFINE INDEX bad ON GRAPH network REACHABILITY ALGORITHM TREE_COVER;",
+		"DEFINE INDEX bad ON GRAPH network REACHABILITY ALGORITHM CHAIN_COVER;",
+		"DEFINE INDEX bad ON GRAPH network REACHABILITY ALGORITHM BFL(159);",
+		"DEFINE INDEX bad ON GRAPH network NEIGHBOURHOOD(5) ALGORITHM EXACT WITH \
+		 (MAX_BYTES=1048576);",
+		"DEFINE INDEX bad ON GRAPH network NEIGHBOURHOOD(4) ALGORITHM SKETCH;",
+		"DEFINE INDEX bad ON GRAPH network PATH ALGORITHM LANDMARK_SSSP(1);",
+		"DEFINE INDEX adjacency ON GRAPH network REACHABILITY ALGORITHM ON_DEMAND;",
+		"REMOVE INDEX adjacency ON GRAPH network;",
+	] {
+		assert!(store.execute(query, &Object::new()).unwrap()[0].result.is_err(), "{query}");
+	}
+	assert!(
+		store
+			.execute(
+				"DEFINE INDEX bad ON GRAPH network REACHABILITY MODE ATOM MODE NODE;",
+				&Object::new()
+			)
+			.is_err()
+	);
+	let removed = store
+		.execute(
+			"REMOVE INDEX reach ON GRAPH network; REMOVE INDEX IF EXISTS reach ON GRAPH network;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(removed.iter().all(|result| result.result.is_ok()));
+}
+
+#[test]
+fn graph_index_function_versions_invalidate_atomically_and_keep_old_snapshots() {
+	let store = Datastore::in_memory();
+	let defined = store
+		.execute(
+			"DEFINE GRAPH network; DEFINE PURE COST FUNCTION fn::cost(edge: any) -> int { RETURN \
+			 1; }; DEFINE INDEX path ON GRAPH network PATH ALGORITHM ON_DEMAND COST fn::cost;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(defined.iter().all(|result| result.result.is_ok()), "{defined:?}");
+	let before =
+		store.schema_catalog().named_graph("network").unwrap().indexes().next().unwrap().clone();
+	assert_eq!(before.state(), crate::datastore::ClassIndexState::Ready);
+	let mut old = store.begin();
+	let mut session = store.session();
+	let private = session
+		.execute(
+			"BEGIN; ALTER FUNCTION fn::cost(any) { RETURN 2; }; INFO FOR INDEX path ON GRAPH \
+			 network; CANCEL;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(private.iter().all(|result| result.result.is_ok()), "{private:?}");
+	assert_eq!(
+		private[2].result.as_ref().unwrap().value().as_object().unwrap().get("state"),
+		Some(&Value::from("stale"))
+	);
+	assert_eq!(
+		store.schema_catalog().named_graph("network").unwrap().indexes().next().unwrap(),
+		&before
+	);
+	let mut competing = store.begin();
+	competing
+		.define_graph_index(
+			"network",
+			crate::datastore::GraphIndex::new(
+				"reach",
+				crate::datastore::GraphIndexDefinition::Reachability {
+					algorithm: crate::datastore::ReachabilityAlgorithm::OnDemand,
+				},
+				None,
+			)
+			.unwrap(),
+		)
+		.unwrap();
+	let changed =
+		store.execute("ALTER FUNCTION fn::cost(any) { RETURN 3; };", &Object::new()).unwrap();
+	assert!(changed[0].result.is_ok());
+	assert!(competing.commit().is_err());
+	let after =
+		store.schema_catalog().named_graph("network").unwrap().indexes().next().unwrap().clone();
+	assert_eq!(after.id(), before.id());
+	assert!(after.version() > before.version());
+	assert_eq!(after.state(), crate::datastore::ClassIndexState::Stale);
+	assert_ne!(after.fingerprint().unwrap(), before.fingerprint().unwrap());
+	assert_eq!(old.graphs().unwrap()[0].indexes().next().unwrap(), &before);
+	let removed = store
+		.execute(
+			"REMOVE FUNCTION fn::cost(any); INFO FOR INDEX path ON GRAPH network;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(removed.iter().all(|result| result.result.is_ok()), "{removed:?}");
+	assert_eq!(
+		store.schema_catalog().named_graph("network").unwrap().indexes().next().unwrap().state(),
+		crate::datastore::ClassIndexState::Stale
+	);
+}
+
+#[test]
+fn geometry_index_ddl_preserves_type_scope_and_info() {
+	let store = Datastore::in_memory();
+	let results = store
+		.execute(
+			"DEFINE CLASS place TYPE NODE SCHEMAFULL; DEFINE FIELD shape ON CLASS place TYPE \
+			 geometry; DEFINE INDEX by_shape ON CLASS place FIELDS shape GEOMETRY TYPE Polygon \
+			 SCOPE BASE; INFO FOR INDEX by_shape ON CLASS place;",
+			&Object::new(),
+		)
+		.unwrap();
+	for result in &results {
+		assert!(result.result.is_ok(), "{:?}", result.result);
+	}
+	let catalog = store.schema_catalog();
+	let class = catalog.class("place").unwrap();
+	let index = class.indexes().next().unwrap();
+	assert_eq!(index.kind(), ClassIndexKind::Geometry);
+	assert_eq!(
+		index.geometry_options().unwrap().geometry_type(),
+		Some(crate::values::GeometryKind::Polygon)
+	);
+	assert_eq!(index.scope(), IndexScope::Base);
+	let result = store
+		.execute(
+			"DEFINE INDEX wrong ON CLASS place FIELDS shape GEOMETRY TYPE Rectangle SCOPE BASE;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(result[0].result.is_err());
+}
+
+#[test]
 fn durable_named_function_supports_ddl_overloads_and_calls() -> FerrosGrynnResult<()> {
 	let store = Datastore::in_memory();
 	let defined = store.execute(

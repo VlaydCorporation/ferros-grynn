@@ -169,6 +169,18 @@ pub(super) fn encode_database_catalog(
 				topology_constraints: schema.topology_constraints(),
 				label_index: (label.id(), label.version()),
 				adjacency_index: (adjacency.id(), adjacency.version()),
+				edge_endpoint_index: schema
+					.edge_endpoint_index()
+					.map(|index| (index.id(), index.version())),
+				edge_endpoint: binding.edge_endpoint,
+				indexes: schema.indexes().cloned().collect(),
+				index_bindings: schema
+					.indexes()
+					.filter_map(|index| {
+						let id = index.id()?;
+						physical_indexes.get(&id).copied().map(|binding| (id, binding))
+					})
+					.collect(),
 				membership: binding.membership,
 				owner_root: schema.owner_root(),
 				root,
@@ -351,7 +363,7 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 	for entry in &catalog.graphs {
 		let reference =
 			GraphRef::new(entry.id, entry.name.clone(), entry.kind, GraphStorageMode::DiskBacked)?;
-		let graph = Arc::new(crate::datastore::GraphSchema::new(
+		let mut graph = crate::datastore::GraphSchema::new(
 			entry.version,
 			reference,
 			SystemIndex::from_storage(
@@ -369,7 +381,16 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 			None,
 			entry.owner_root,
 			entry.published_at,
-		));
+		);
+		graph.indexes = entry.indexes.clone();
+		if let Some((id, version)) = entry.edge_endpoint_index {
+			graph = graph.with_edge_endpoint_index(SystemIndex::from_storage(
+				id,
+				version,
+				SystemIndexKind::EdgeEndpoint,
+			))?;
+		}
+		let graph = Arc::new(graph);
 		if entry.owner_root.is_none() {
 			schema.graph_names.insert(entry.name.to_string(), entry.id);
 		}
@@ -442,7 +463,7 @@ pub(super) fn decode_catalog_values(
 				}
 			})
 			.transpose()?;
-		let graph = Arc::new(crate::datastore::GraphSchema::new(
+		let mut graph = crate::datastore::GraphSchema::new(
 			entry.version,
 			current.reference().clone(),
 			current
@@ -460,7 +481,16 @@ pub(super) fn decode_catalog_values(
 			root,
 			entry.owner_root,
 			entry.published_at,
-		));
+		);
+		graph.indexes = entry.indexes.clone();
+		if let Some((id, version)) = entry.edge_endpoint_index {
+			graph = graph.with_edge_endpoint_index(SystemIndex::from_storage(
+				id,
+				version,
+				SystemIndexKind::EdgeEndpoint,
+			))?;
+		}
+		let graph = Arc::new(graph);
 		schema.graphs.insert(entry.id, graph);
 	}
 	for entry in &catalog.parameters {

@@ -211,7 +211,7 @@ impl Transaction {
 		let changed_records = self.index_delta_records(&current, &next, &remap);
 		let delta_eligible = self.mutations.iter().all(mutation_allows_physical_index_delta);
 		store.inner.persist_root(
-			&next,
+			&mut next,
 			Some(&current),
 			delta_eligible.then_some(&changed_records),
 			graph_catalog_only,
@@ -514,7 +514,7 @@ impl Transaction {
 					root.remove_parameter(*parameter)?;
 				}
 				Mutation::RemoveFunction(function) => {
-					root.remove_function(*function)?;
+					root.remove_function(*function, published_at)?;
 				}
 				Mutation::RemoveAnalyzer(analyzer) => {
 					root.remove_analyzer(*analyzer)?;

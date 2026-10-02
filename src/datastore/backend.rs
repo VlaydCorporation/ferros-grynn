@@ -123,14 +123,21 @@ impl StoreInner {
 
 	pub(crate) fn persist_root(
 		&self,
-		root: &DatabaseRoot,
+		root: &mut DatabaseRoot,
 		previous: Option<&DatabaseRoot>,
 		changed_records: Option<&std::collections::BTreeSet<RecordId>>,
 		graph_catalog_only: bool,
 		dictionary_changed: bool,
 	) -> FerrosGrynnResult<()> {
 		match &self.backend {
-			StoreBackend::InMemory => Ok(()),
+			StoreBackend::InMemory => {
+				root.resident_geometry = Arc::new(crate::storage::build_resident_geometry_indexes(
+					previous,
+					root,
+					changed_records,
+				)?);
+				Ok(())
+			}
 			StoreBackend::Local(local) => {
 				let evaluator = PureFunctionEvaluator::new(root);
 				let mut analyze =
@@ -156,11 +163,13 @@ impl StoreInner {
 
 	pub(crate) fn persist_import_root(
 		&self,
-		root: &DatabaseRoot,
+		root: &mut DatabaseRoot,
 		quarantine: Option<&mut QuarantineArtifact>,
 	) -> FerrosGrynnResult<BTreeMap<super::IndexId, std::time::Duration>> {
 		match &self.backend {
 			StoreBackend::InMemory => {
+				root.resident_geometry =
+					Arc::new(crate::storage::build_resident_geometry_indexes(None, root, None)?);
 				if let Some(artifact) = quarantine {
 					let id = artifact.id();
 					let path = artifact.install(&self.query_scratch_root)?;
@@ -259,6 +268,22 @@ impl StoreInner {
 		};
 		let root = self.current_root();
 		match job.target {
+			MaintenanceTarget::GraphIndex {
+				graph,
+				index,
+				version,
+			} => root.schema.graph(graph).is_some_and(|definition| {
+				definition.edge_endpoint_index().is_some_and(|candidate| {
+					candidate.id() == index
+						&& candidate.version() == version
+						&& root.commit_ts == fingerprint
+				}) || definition.indexes().any(|candidate| {
+					candidate.id() == Some(index)
+						&& candidate.version() == version
+						&& candidate.state() == super::ClassIndexState::Ready
+						&& candidate.build_revision() == fingerprint
+				})
+			}),
 			MaintenanceTarget::Index {
 				class,
 				index,
@@ -292,6 +317,17 @@ impl StoreInner {
 	pub(crate) fn maintenance_target_exists(&self, target: MaintenanceTarget) -> bool {
 		let root = self.current_root();
 		match target {
+			MaintenanceTarget::GraphIndex {
+				graph,
+				index,
+				version,
+			} => root.schema.graph(graph).is_some_and(|definition| {
+				definition.edge_endpoint_index().is_some_and(|candidate| {
+					candidate.id() == index && candidate.version() == version
+				}) || definition.indexes().any(|candidate| {
+					candidate.id() == Some(index) && candidate.version() == version
+				})
+			}),
 			MaintenanceTarget::Database => true,
 			MaintenanceTarget::Graph(graph) => root.graph(graph).is_some(),
 			MaintenanceTarget::BaseClass(class) => root.schema.class_by_id(class).is_some(),
@@ -350,6 +386,9 @@ impl StoreInner {
 				)
 			}
 			MaintenanceTarget::Index {
+				..
+			}
+			| MaintenanceTarget::GraphIndex {
 				..
 			} => {
 				return Err(FerrosGrynnError::invalid_argument(
@@ -436,7 +475,7 @@ impl StoreInner {
 					return Ok(MaintenanceRunOutcome::Cancelled);
 				}
 				next.commit_ts = publication;
-				self.persist_root(&next, None, None, false, false)?;
+				self.persist_root(&mut next, None, None, false, false)?;
 				*self.current.write() = Arc::new(next);
 				self.maintenance.acknowledge_index_changes(job.target, snapshot.commit_ts);
 				Ok(MaintenanceRunOutcome::Completed)
@@ -478,7 +517,7 @@ impl StoreInner {
 					return Err(FerrosGrynnError::maintenance_revision_race(target.display_name()));
 				}
 				next.commit_ts = publication;
-				self.persist_root(&next, None, None, false, false)?;
+				self.persist_root(&mut next, None, None, false, false)?;
 				*self.current.write() = Arc::new(next);
 				Ok(())
 			},
@@ -569,6 +608,19 @@ impl StoreInner {
 			StoreBackend::Local(local) => {
 				local.search_diskann_index(snapshot, index, query, k, breadth)
 			}
+		}
+	}
+
+	pub(crate) fn search_geometry_index(
+		&self,
+		snapshot: &LocalQuerySnapshot,
+		index: super::IndexId,
+		mbr: [f64; 4],
+		admit: &mut dyn FnMut(usize) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Option<crate::storage::GeometryCandidates>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => local.search_geometry_index(snapshot, index, mbr, admit),
 		}
 	}
 
@@ -706,6 +758,103 @@ fn prepare_index_maintenance(
 	target: MaintenanceTarget,
 	build_revision: u64,
 ) -> FerrosGrynnResult<()> {
+	if let MaintenanceTarget::GraphIndex {
+		graph,
+		index,
+		version,
+	} = target
+	{
+		let definition = database
+			.schema
+			.graph(graph)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?;
+		if definition
+			.edge_endpoint_index()
+			.is_some_and(|candidate| candidate.id() == index && candidate.version() == version)
+		{
+			return Ok(());
+		}
+		let mut indexes = definition.indexes().cloned().collect::<Vec<_>>();
+		let candidate =
+			indexes.iter_mut().find(|candidate| candidate.id() == Some(index)).ok_or_else(
+				|| FerrosGrynnError::invalid_argument("graph maintenance index is absent"),
+			)?;
+		if candidate.version() != version {
+			return Err(FerrosGrynnError::invalid_argument(
+				"graph maintenance definition changed before build",
+			));
+		}
+		if matches!(candidate.definition(), super::GraphIndexDefinition::Reachability { .. })
+			&& !candidate.is_on_demand()
+		{
+			let artifact = super::ReachabilityArtifact::build(
+				database,
+				candidate,
+				build_revision,
+				crate::storage::external_sort_run_budget(),
+				&mut crate::storage::check_external_sort_cancelled,
+			)?;
+			let artifacts = Arc::make_mut(&mut database.reachability_artifacts);
+			artifacts.remove(&index);
+			if let Some(artifact) = artifact {
+				artifacts.insert(index, Arc::new(artifact));
+			}
+		} else if matches!(
+			candidate.definition(),
+			super::GraphIndexDefinition::Neighbourhood { .. }
+		) && !candidate.is_on_demand()
+		{
+			let artifact = super::NeighbourhoodArtifact::build(
+				database,
+				candidate,
+				build_revision,
+				crate::storage::external_sort_run_budget(),
+				&mut crate::storage::check_external_sort_cancelled,
+			)?;
+			let artifacts = Arc::make_mut(&mut database.neighbourhood_artifacts);
+			artifacts.remove(&index);
+			if let Some(artifact) = artifact {
+				artifacts.insert(index, Arc::new(artifact));
+			}
+		} else if matches!(candidate.definition(), super::GraphIndexDefinition::Path {
+			algorithm: super::PathIndexAlgorithm::LandmarkSssp(_),
+			..
+		}) {
+			if let super::GraphIndexDefinition::Path {
+				cost: super::GraphIndexCost::Function {
+					function,
+					version,
+				},
+				..
+			} = candidate.definition()
+			{
+				candidate.dependencies = PureFunctionEvaluator::for_builder(
+					database,
+					crate::storage::external_sort_run_budget(),
+					crate::storage::check_external_sort_cancelled,
+				)?
+				.dependencies(*function, *version)?;
+				candidate.validate()?;
+			}
+			let artifact = super::LandmarkPathArtifact::build(
+				database,
+				candidate,
+				build_revision,
+				crate::storage::external_sort_run_budget(),
+				&mut crate::storage::check_external_sort_cancelled,
+			)?;
+			Arc::make_mut(&mut database.path_artifacts).insert(index, Arc::new(artifact));
+		} else if !candidate.is_on_demand() {
+			return Err(FerrosGrynnError::query_feature_not_supported(
+				"materialized graph index build",
+			));
+		}
+		candidate.state = super::ClassIndexState::Ready;
+		candidate.build_revision = build_revision;
+		let replacement = definition.replace_indexes(indexes)?;
+		database.replace_graph_schema(replacement, build_revision)?;
+		return Ok(());
+	}
 	let MaintenanceTarget::Index {
 		class,
 		index,
@@ -748,7 +897,11 @@ fn maintenance_source_items(database: &DatabaseRoot, target: MaintenanceTarget) 
 			.count()
 			.try_into()
 			.unwrap_or(u64::MAX),
-		MaintenanceTarget::Graph(graph) => database
+		MaintenanceTarget::Graph(graph)
+		| MaintenanceTarget::GraphIndex {
+			graph,
+			..
+		} => database
 			.graphs
 			.get(&graph)
 			.map_or(0, |graph| graph.occurrences().count().try_into().unwrap_or(u64::MAX)),

@@ -518,6 +518,12 @@ fn visit_streaming_select_values<Read: QueryRead>(
 		|| (!plan.order.is_empty() && (physical.requires_sort || control.cursors().is_some()))
 		|| plan.tempfiles
 		|| plan.filter.as_ref().is_some_and(contains_search)
+		|| physical.sources.iter().any(|source| {
+			matches!(
+				source.operator,
+				crate::gql::optimizer::SourceOperator::GeometryIndexScan { .. }
+			)
+		})
 		|| matches!(plan.source.kind, LogicalSelectSourceKind::Derived(_))
 	{
 		return Ok(None);
@@ -756,6 +762,7 @@ fn execute_select_output<Read: QueryRead>(
 		snapshot,
 		logical_source(plan, physical.execution_order.first().copied().unwrap_or(0)),
 		physical.execution_order.first().and_then(|source| physical.sources.get(*source)),
+		plan.filter.as_ref(),
 		physical
 			.pushed_filter
 			.then_some(plan.filter.as_ref())
@@ -804,6 +811,7 @@ fn execute_select_output<Read: QueryRead>(
 			snapshot,
 			source_plan,
 			physical.sources.get(physical_join.right_source),
+			plan.filter.as_ref(),
 			None,
 			slots,
 			source,
@@ -849,7 +857,16 @@ fn execute_select_output<Read: QueryRead>(
 			)?;
 		}
 		let mut filtered = RowCollector::new(read, control, false);
+		let spatial = physical.sources.iter().any(|source| {
+			matches!(
+				source.operator,
+				crate::gql::optimizer::SourceOperator::GeometryIndexScan { .. }
+			)
+		});
 		rows.consume(|row| {
+			if spatial {
+				control.record_spatial_refinement();
+			}
 			if eval_select_expr(read, snapshot, predicate, &row, None, slots, source, control)?
 				.is_truthy()
 			{
@@ -1175,6 +1192,7 @@ fn source_rows<Read: QueryRead>(
 	snapshot: Snapshot,
 	source_plan: &LogicalSelectSource,
 	physical: Option<&crate::gql::optimizer::PhysicalSource>,
+	spatial_filter: Option<&TypedExpr>,
 	predicate: Option<&TypedExpr>,
 	slots: &[Value],
 	source: &str,
@@ -1201,6 +1219,89 @@ fn source_rows<Read: QueryRead>(
 				.transpose()?;
 			match target {
 				ScanTarget::Class(class) => {
+					if let Some(physical) = physical
+						&& let crate::gql::optimizer::SourceOperator::GeometryIndexScan {
+							index,
+							column,
+							forced,
+							..
+						} = physical.operator
+						&& let Some(query) = spatial_filter
+							.and_then(|filter| crate::gql::optimizer::spatial_query(filter, column))
+					{
+						let value = eval(query, None, slots, source, None, None)?;
+						let mut memory = control.barrier_account();
+						let mut admit = |bytes| {
+							control.check()?;
+							if memory.reserve(bytes) {
+								Ok(())
+							} else {
+								Err(FerrosGrynnError::control_limit_exceeded(
+									"geometry candidate memory",
+									control.barrier_memory_limit() as u64,
+								))
+							}
+						};
+						let candidates = match &value {
+							Value::None | Value::Null => {
+								Some(crate::datastore::QueryGeometryIndexRead::default())
+							}
+							Value::Geometry(geometry) => match read.geometry_index(
+								snapshot,
+								class,
+								graph.as_ref(),
+								index,
+								geometry,
+								&mut admit,
+							) {
+								Ok(candidates) => candidates,
+								Err(error) if forced => return Err(error),
+								Err(error)
+									if matches!(
+										error.status().status(),
+										crate::gql_status::Status::InvalidStorageFile { .. }
+											| crate::gql_status::Status::InvalidStoragePage { .. }
+									) =>
+								{
+									None
+								}
+								Err(error) => return Err(error),
+							},
+							_ => {
+								return Err(FerrosGrynnError::invalid_argument(
+									"spatial query operand must be geometry",
+								));
+							}
+						};
+						if let Some(candidates) = candidates {
+							control.record_spatial_candidates(candidates.records.len());
+							control.record_spatial_work(
+								candidates.page_reads,
+								candidates.delta_records,
+							);
+							let mut rows = RowCollector::new(read, control, false);
+							for (ordinal, record) in candidates.records.into_iter().enumerate() {
+								control.check()?;
+								let row = read.get(snapshot, &record, graph.as_ref())?.ok_or_else(
+									|| {
+										FerrosGrynnError::invalid_storage_file(
+											"geometry candidate is absent from its snapshot",
+										)
+									},
+								)?;
+								rows.push(
+									read,
+									snapshot,
+									layout_row(
+										row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+										layout,
+									),
+								)?;
+							}
+							return rows.finish();
+						}
+						control.record_spatial_fallback();
+					}
 					if let Some((filter, access, prepared)) = physical_search {
 						let planned_index = physical.and_then(planned_search_index);
 						if let Some(candidates) = try_physical_fulltext(

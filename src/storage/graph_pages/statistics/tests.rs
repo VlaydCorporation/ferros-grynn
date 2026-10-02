@@ -71,6 +71,8 @@ fn split_statistics_are_exact_and_auxiliary_files_are_lazy() -> FerrosGrynnResul
 		},
 	};
 	statistics.property_histograms.insert(property_key, PropertyHistogram {
+		mbr_sample: Vec::new(),
+		mbr_population: 0,
 		type_tag: TypeTag::Int.byte(),
 		method: HistogramMethod::Exact,
 		sample_count: 2,
@@ -135,6 +137,75 @@ fn root_rejects_unreachable_or_extra_split_pages() -> FerrosGrynnResult<()> {
 	let files =
 		encode_statistics(&crate::stats::GraphStatistics::default(), &dictionary, PageLsn::ZERO)?;
 	assert!(decode_statistics_root(&files.graph[0], 2, 0, 0).is_err());
+	Ok(())
+}
+
+#[test]
+fn geometry_statistics_round_trip_bounds_and_continuations() -> FerrosGrynnResult<()> {
+	let key = PropertyHistogramKey {
+		class_id: ClassId::new(3).unwrap(),
+		field_id: SchemaId::new(4).unwrap(),
+		scope: StatisticsScope::Base,
+	};
+	for count in [0, 1, 509, 510, 1018, 1024] {
+		let histogram = PropertyHistogram {
+			type_tag: 0x27,
+			method: HistogramMethod::Exact,
+			sample_count: 2000,
+			distinct_count: 0,
+			null_fraction: 0.25,
+			buckets: Vec::new(),
+			mbr_sample: vec![[1.0, 2.0, 3.0, 4.0]; count],
+			mbr_population: if count == 0 {
+				0
+			} else {
+				1500
+			},
+		};
+		let input = std::collections::BTreeMap::from([(key, histogram)]);
+		let mut pages = super::property::encode_property_statistics(&input, PageLsn::ZERO)?;
+		let read = |page, destination: &mut crate::storage::page::AlignedPage| {
+			copy_page(&pages, page, destination, &Cell::new(0))
+		};
+		assert_eq!(
+			super::property::decode_property_statistics_range(read, pages.len() as u32)?,
+			input
+		);
+		if count == 509 || count == 1018 || count == 0 {
+			let mut extra = Box::new(crate::storage::page::AlignedPage::zeroed());
+			extra.as_bytes_mut().copy_from_slice(pages.last().unwrap().as_bytes());
+			extra.as_bytes_mut()[68..70].copy_from_slice(&0_u16.to_le_bytes());
+			extra.as_bytes_mut()[70..72].copy_from_slice(&(pages.len() as u16).to_le_bytes());
+			extra.as_bytes_mut()[80..].fill(0);
+			extra.seal()?;
+			pages.push(crate::storage::page::AlignedPage::zeroed());
+			pages.last_mut().unwrap().as_bytes_mut().copy_from_slice(extra.as_bytes());
+			assert!(
+				super::property::decode_property_statistics_range(
+					|page, destination| copy_page(&pages, page, destination, &Cell::new(0)),
+					pages.len() as u32
+				)
+				.is_err()
+			);
+		}
+	}
+	let oversized = PropertyHistogram {
+		type_tag: 0x27,
+		method: HistogramMethod::Exact,
+		sample_count: 2000,
+		distinct_count: 0,
+		null_fraction: 0.0,
+		buckets: Vec::new(),
+		mbr_sample: vec![[0.0; 4]; 1025],
+		mbr_population: 2000,
+	};
+	assert!(
+		super::property::encode_property_statistics(
+			&std::collections::BTreeMap::from([(key, oversized)]),
+			PageLsn::ZERO
+		)
+		.is_err()
+	);
 	Ok(())
 }
 

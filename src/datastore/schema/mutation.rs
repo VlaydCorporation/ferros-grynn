@@ -176,11 +176,20 @@ impl DatabaseRoot {
 		for index in stale_indexes {
 			indexes.remove_explicit_index(index);
 		}
+		self.invalidate_graph_function_indexes(
+			id,
+			self.schema.functions.get(&id).map(|function| function.version()),
+			published_at,
+		)?;
 		Ok(())
 	}
 
 	/// Removes one named-function overload by stable identity.
-	pub(crate) fn remove_function(&mut self, id: FunctionId) -> FerrosGrynnResult<()> {
+	pub(crate) fn remove_function(
+		&mut self,
+		id: FunctionId,
+		published_at: u64,
+	) -> FerrosGrynnResult<()> {
 		if self
 			.schema
 			.analyzers
@@ -214,6 +223,65 @@ impl DatabaseRoot {
 		catalog.functions.remove(&id);
 		catalog.function_signatures.remove(&current.signature());
 		catalog.function_versions.remove(&id);
+		self.invalidate_graph_function_indexes(id, None, published_at)?;
+		Ok(())
+	}
+
+	/// Invalidates versioned graph function dependencies in the same private
+	/// root.
+	fn invalidate_graph_function_indexes(
+		&mut self,
+		function: FunctionId,
+		version: Option<SchemaVersion>,
+		published_at: u64,
+	) -> FerrosGrynnResult<()> {
+		let graphs = self
+			.schema
+			.all_graphs()
+			.filter(|graph| {
+				graph.indexes().any(|index| index.dependencies().any(|(id, _)| *id == function))
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		for graph in graphs {
+			let mut indexes = graph.indexes().cloned().collect::<Vec<_>>();
+			for index in &mut indexes {
+				if !index.dependencies().any(|(id, _)| *id == function) {
+					continue;
+				}
+				if let Some(version) = version {
+					index.dependencies.retain(|(id, _)| *id != function);
+					index.dependencies.insert((function, version));
+					if let crate::datastore::GraphIndexDefinition::Path {
+						cost:
+							crate::datastore::GraphIndexCost::Function {
+								function: id,
+								version: captured,
+							},
+						..
+					} = &mut index.definition
+						&& *id == function
+					{
+						*captured = version;
+					}
+				}
+				index.version = index.version.next()?;
+				index.state = ClassIndexState::Stale;
+				if let Some(id) = index.id() {
+					Arc::make_mut(&mut self.path_artifacts).remove(&id);
+				}
+			}
+			let mut replacement = graph.replace_indexes(indexes)?;
+			replacement.published_at = published_at;
+			let catalog = Arc::make_mut(&mut self.schema);
+			catalog.graph_versions.insert(graph.id(), published_at);
+			catalog.graphs.insert(graph.id(), Arc::new(replacement));
+			self.mark_version(
+				crate::datastore::ConflictKey::GraphDefinition(graph.id()),
+				published_at,
+			);
+			self.mark_version(crate::datastore::ConflictKey::GraphCatalogRange, published_at);
+		}
 		Ok(())
 	}
 
@@ -258,7 +326,9 @@ impl DatabaseRoot {
 						};
 						ClassIndexOptions::Hnsw(options)
 					}
-					ClassIndexOptions::Scalar | ClassIndexOptions::DiskAnn(_) => continue,
+					ClassIndexOptions::Scalar
+					| ClassIndexOptions::DiskAnn(_)
+					| ClassIndexOptions::Geometry(_) => continue,
 				};
 				index.options = options;
 				index.version = index.version.next()?;
@@ -355,16 +425,103 @@ impl DatabaseRoot {
 			.graph(id)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(id.to_string()))?;
 		if current.reference() != replacement.reference()
-			|| current.system_indexes().ne(replacement.system_indexes())
+			|| current.system_indexes().take(2).ne(replacement.system_indexes().take(2))
+			|| current
+				.edge_endpoint_index()
+				.is_some_and(|capability| replacement.edge_endpoint_index() != Some(capability))
 		{
 			return Err(FerrosGrynnError::invalid_argument(
 				"graph identity, family, storage mode, and system indexes are immutable",
 			));
 		}
+		if replacement.indexes.len() > 4096 {
+			return Err(FerrosGrynnError::invalid_argument(
+				"graph supports at most 4096 user indexes",
+			));
+		}
+		let mut names = std::collections::BTreeSet::new();
+		let mut previous = None;
+		for index in replacement.indexes() {
+			index.validate()?;
+			index.validate_family(replacement.reference().kind())?;
+			let index_id = index.id().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("published graph index has no identity")
+			})?;
+			if index.graph() != Some(id)
+				|| previous.is_some_and(|previous| previous >= index_id)
+				|| !names.insert(index.name().as_str())
+			{
+				return Err(FerrosGrynnError::invalid_argument(
+					"graph indexes have invalid ownership, ordering, or names",
+				));
+			}
+			let new_definition = current
+				.indexes()
+				.all(|old| old.id() != Some(index_id) || old.version() != index.version());
+			if new_definition {
+				for &(function, version) in index.dependencies() {
+					if self.schema.functions.get(&function).is_none_or(|dependency| {
+						dependency.version() != version
+							|| !index.is_on_demand()
+								&& dependency.effect() != crate::datastore::FunctionEffect::Pure
+					}) {
+						return Err(FerrosGrynnError::invalid_argument(
+							"graph index function dependency changed before publication",
+						));
+					}
+				}
+			}
+			previous = Some(index_id);
+		}
 		replacement.published_at = published_at;
 		let catalog = Arc::make_mut(&mut self.schema);
 		catalog.graphs.insert(id, Arc::new(replacement));
 		catalog.graph_versions.insert(id, published_at);
+		if !self.reachability_artifacts.is_empty() {
+			Arc::make_mut(&mut self.reachability_artifacts).retain(|index, artifact| {
+				artifact.layout.header.identity.graph != id.get()
+					|| catalog.graphs.get(&id).is_some_and(|graph| {
+						graph.indexes().any(|definition| {
+							definition.id() == Some(*index)
+								&& definition.state() == ClassIndexState::Ready
+								&& definition.version().get()
+									== artifact.layout.header.identity.version
+								&& definition.build_revision()
+									== artifact.layout.header.identity.revision
+						})
+					})
+			});
+		}
+		if !self.neighbourhood_artifacts.is_empty() {
+			Arc::make_mut(&mut self.neighbourhood_artifacts).retain(|index, artifact| {
+				artifact.layout.header.identity.graph != id.get()
+					|| catalog.graphs.get(&id).is_some_and(|graph| {
+						graph.indexes().any(|definition| {
+							definition.id() == Some(*index)
+								&& definition.state() == ClassIndexState::Ready
+								&& definition.version().get()
+									== artifact.layout.header.identity.version
+								&& definition.build_revision()
+									== artifact.layout.header.identity.revision
+						})
+					})
+			});
+		}
+		if !self.path_artifacts.is_empty() {
+			Arc::make_mut(&mut self.path_artifacts).retain(|index, artifact| {
+				artifact.layout.header.identity.graph != id.get()
+					|| catalog.graphs.get(&id).is_some_and(|graph| {
+						graph.indexes().any(|definition| {
+							definition.id() == Some(*index)
+								&& definition.state() == ClassIndexState::Ready
+								&& definition.version().get()
+									== artifact.layout.header.identity.version
+								&& definition.build_revision()
+									== artifact.layout.header.identity.revision
+						})
+					})
+			});
+		}
 		Ok(())
 	}
 
@@ -471,6 +628,18 @@ impl DatabaseRoot {
 				next.detach(graph, global)?;
 			}
 			next.graphs.remove(&graph);
+			if !next.path_artifacts.is_empty() {
+				Arc::make_mut(&mut next.path_artifacts)
+					.retain(|_, artifact| artifact.layout.header.identity.graph != graph.get());
+			}
+			if !next.neighbourhood_artifacts.is_empty() {
+				Arc::make_mut(&mut next.neighbourhood_artifacts)
+					.retain(|_, artifact| artifact.layout.header.identity.graph != graph.get());
+			}
+			if !next.reachability_artifacts.is_empty() {
+				Arc::make_mut(&mut next.reachability_artifacts)
+					.retain(|_, artifact| artifact.layout.header.identity.graph != graph.get());
+			}
 			let catalog = Arc::make_mut(&mut next.schema);
 			catalog.graphs.remove(&graph);
 			catalog.graph_names.remove(schema.name().as_str());

@@ -143,12 +143,14 @@ pub(super) use scalar_idx::{
 	mutate_scalar_index_leaves,
 	range_scalar_index,
 	scan_scalar_index,
+	visit_unique_range,
 };
 pub(super) use streaming::{
 	StreamedIndex,
 	stream_label_index,
 	stream_standard_index,
 	stream_unique_index,
+	stream_unique_index_with_layout,
 };
 
 const LEAF_NEXT_OFFSET: usize = PAGE_HEADER_SIZE;

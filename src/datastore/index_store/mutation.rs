@@ -120,6 +120,7 @@ impl IndexStoreRoot {
 		properties: &PropertyMap,
 		context: &mut EncodeContext,
 	) -> FerrosGrynnResult<PreparedBaseInsert> {
+		class.validate_geometry_values(IndexScope::Base, |key| properties.get(key))?;
 		let class_id = class.id().ok_or_else(|| invalid("atom class has no ClassId"))?;
 		let mut keys = Vec::new();
 		for binding in self.base.values().filter(|binding| binding.class_id == class_id) {

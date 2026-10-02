@@ -41,6 +41,16 @@ pub(crate) fn rebuild_index_store(database: &DatabaseRoot) -> FerrosGrynnResult<
 			let atom = database
 				.atom(occurrence.global_id())
 				.ok_or_else(|| invalid("graph occurrence references an absent base atom"))?;
+			database
+				.schema
+				.class_by_id(atom.class_id())
+				.ok_or_else(|| invalid("geometry class is absent"))?
+				.validate_geometry_values(
+					crate::datastore::IndexScope::Effective {
+						graph: *graph_id,
+					},
+					|key| occurrence.effective_value(atom.properties().get(key), key),
+				)?;
 			let prepared = indexes.prepare_restored_occurrence_insert(
 				*graph_id,
 				atom,

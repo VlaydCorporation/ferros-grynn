@@ -233,6 +233,27 @@ The release/bench profiles use `lto = "fat"`, `codegen-units = 1` — full optim
 - Performance matters: think about impact of every change.
 - Don't add dependencies without confirmation.
 
+## Eternal limits, not a checklist
+
+If the two principles conflict, choose the one that reduces the future cost of changes in this particular codebase more.
+
+THE HARD RULE is to refactor the code according to the principle first, and only then change the behavior.
+
+1. Separation of Concerns — one category of work per part of the system: UI / domain / persistence / infra. The basic principle.
+2. Encapsulation / Information Hiding is a small stable contract, the internals are hidden.
+3. High Cohesion + Loose Coupling — what changes together must live together; independent parts communicate through narrow interfaces.
+4. DRY — one authoritative representation for each knowledge, not for each similar line. Don't overdo it with DRY.
+5. KISS is the simplest architecture that works. Complexity is a long—term tax.
+6. Single Responsibility is one reason to change.
+7. Depend on Abstractions — policy does not depend on details; both depend on contracts.
+8. YAGNI — no speculative features, frameworks and hooks "for later".
+9. Composition over Inheritance — assemble a system from components, rather than grow fragile hierarchies.
+10. Open/Closed, but with discipline — expand the system across stable boundaries and only where the same change has already been needed twice.
+
+Also useful: Law of Demeter · fail fast / illegal states unrepresentable · optimize for deletion · Unix-the principle of "do one thing well" + composition.
+
+Treat it as a limitation. If common sense requires you to break the slogan, break it.
+
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.

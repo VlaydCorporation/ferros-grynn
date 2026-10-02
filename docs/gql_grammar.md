@@ -33,7 +33,7 @@ grammar. Полная EBNF находится в §6; канонический s
 approved_match_stmt ::= [ "OPTIONAL" ] "MATCH" [ "DISTINCT" ] [ "ATOM" ]
                         [ match_mode ] [ match_scope ] [ constraints_clause ]
                         approved_pattern_list [ contains_clause ]
-                        graph_scope [ where_clause ] [ maxdepth_clause ] [ timeout_clause ]
+                        graph_scope [ match_cost_clause ] [ where_clause ] [ maxdepth_clause ] [ timeout_clause ]
                         match_return [ order_clause ]
 ```
 
@@ -754,6 +754,7 @@ match_stmt ::= [ "OPTIONAL" ] "MATCH" [ "DISTINCT" ]
                ( match_standard_head | match_atom_head )
                [ contains_clause ]
                graph_scope
+               [ match_cost_clause ]
                [ where_clause ]
                [ maxdepth_clause ]
                [ timeout_clause ]
@@ -772,6 +773,7 @@ atom_match_pattern ::= [ alias "=" ] ( atomwalk_pattern | hyper_pattern )
 
 maxdepth_clause    ::= "MAXDEPTH" integer
 constraints_clause ::= "CONSTRAINTS" "<" path_constraint { path_constraint } ">"
+match_cost_clause ::= "WITH" "COST" fn_name
 
 match_return ::= "RETURN" [ "DISTINCT" ] ( return_item_list | graph_return_body )
 return_item_list ::= return_item { "," return_item }
@@ -812,6 +814,12 @@ length_spec   ::= integer ".." integer                (* *1..3 *)
 edge_flag     ::= "CROSS_LEVEL"
 cost_clause   ::= "COST" fn_name
 ```
+
+`MATCH ... IN GRAPH ... WITH COST fn::name` задаёт default для всех linear connector segments.
+Локальный `COST fn::name` его переопределяет, включая fixed segment с edge alias. Функция
+разрешается в analysis; повторный WITH, отсутствие COST/function и положение после WHERE
+отклоняются. Clause без linear connector не принимает WITH COST. Local mode/objective по-прежнему
+требуют variable-length segment; stateful prefix начинается с нуля для каждого segment.
 
 ### 6.2. Модификаторы пути (path constraints)
 
@@ -878,8 +886,10 @@ Kind задают delimiters и kind выбранного class; label нико�
 
 ```ebnf
 traverse_stmt ::= "TRAVERSE" [ "ATOM" ] [ constraints_clause ]
-                  "FROM" traverse_source [ graph_scope ]
+                  "FROM" traverse_source [ graph_scope ] [ traverse_cost ]
                   pipeline_tail [ traverse_return ] [ timeout_clause ]
+
+traverse_cost ::= "WITH" "COST" function_signature_name
 
 traverse_source ::=
       graph_expr
@@ -911,6 +921,11 @@ traverse_return ::= "RETURN" return_item_list
 `graph_scope`; `AtomOccurrenceRef` использует свой scope. В `TRAVERSE ATOM` непосредственно
 записанный endpoint может использовать `atom_endpoint_ref`: `<(...)>` для vertex или `<[...]>`
 для edge.
+
+`WITH COST` захватывает статическое versioned PURE COST имя для navigation и
+`tv::weightedShortestPath`/`tv::distanceTo`; проверка signature/effect принадлежит analysis.
+У вложенного MATCH source собственный `WITH COST`: outer modifier требует отдельный
+outer `graph_scope`, чтобы границы двух statements были явными.
 
 Pipeline-оператор `|>` лево-ассоциативен (§12.10). Источником pipeline может быть любой оператор,
 возвращающий набор (`SELECT`, `MATCH`, `TRAVERSE`, массив, переменная).
@@ -1481,6 +1496,11 @@ arg       ::= [ ident "=" ] expr                (* именованные арг
 ```
 
 Дженерик-форма `type::is<edge>(x)`, `type::to<int>(x)` — через `[ "<" type ">" ]`.
+
+Для `path::cost(path, fn::name)` второй positional аргумент — статическое имя
+versioned PURE COST функции без signature/type arguments; analysis разрешает его в
+captured identity. Parser сохраняет обычную expression grammar. Одноаргументная форма
+читает сохранённую стоимость Path, двухаргументная — повторно вычисляет её в query snapshot.
 
 Базовый статический catalog: `math::{abs,sqrt,pow,floor,ceil}`,
 `string::{upper,lower,len,contains,split,concat}`, `time::{now,format,add,diff}`,

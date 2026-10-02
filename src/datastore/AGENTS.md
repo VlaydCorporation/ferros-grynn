@@ -16,9 +16,15 @@ indexes и schema одним storage snapshot.
 - `atom_store` — global `RecordId → GlobalAtomId`, base properties и точный
   reverse membership index;
 - `occurrence` — graph-local `AtomId`, label, topology и ленивый sparse overlay;
+- EdgeEndpoint capability выделяется при первом local/qualified edge endpoint.
+  Postings сохраняют полный containment path и actual source/target side; topology
+  replacement/delete/BUILD GRAPH используют общий GraphRoot maintenance path.
 - `identity` — `DataSpaceId::Database` либо ненулевой `GraphId` для будущего WAL;
 - `schema` — `ClassSchema`, `GraphSchema` и типизированные durable identities;
 - `root` — единый immutable commit image AtomStore + graphs + logical versions;
+- Geometry definitions проверяют TYPE при BASE/EFFECTIVE DML; RAM root удерживает
+  immutable STR generations, а local transaction закрепляет physical generation
+  одновременно с logical snapshot при begin и Read Committed refresh.
 - `index_store` — Base и Effective index images, class/label/count lookup и
   проверка Unique;
 - `conflict` — независимые `BaseAtom`, `GraphMembership`, `GraphOverlay` и
@@ -96,6 +102,20 @@ metadata-COW только ради progress запрещён, поскольку
   вместе с exact physical binding. Один datastore исполняет не более одного тяжёлого job.
 - Durable PARAM и FUNCTION используют общий schema clock. Function overload identity включает
   declared parameter types; compiled cache ключуется `FunctionId`, version и schema epoch.
+- Graph-owned `GraphIndex` использует тот же IndexId/version/state и обычный FCW/SSI replay.
+  NODE/ATOM, direction, labels, artifact budget и function versions входят в canonical fingerprint.
+  Materialized definition остаётся Stale до publication полного artifact; ON_DEMAND side-file
+  не создаёт. Function mutation атомарно обновляет captured versions и делает definition Stale.
+- Reachability и Neighbourhood artifacts удерживаются immutable root через Arc. Membership, topology и
+  edge-label mutation атомарно делают свои materialized definitions Stale и исключают artifact;
+  старый snapshot сохраняет прежние labels. Обычная base/overlay property mutation без
+  изменения relation не инвалидирует эти artifacts.
+- `graph_path` хранит immutable directed LANDMARK_SSSP distances и full definition descriptor.
+  HOP/WEIGHT/PURE COST builds используют общий incidence kernel и maintenance publication.
+  Weight mutation исключает WEIGHT generation; base/overlay/occurrence property mutation
+  консервативно исключает PURE COST generations. Function mutation захватывает новые
+  transitive versions; rebuild перепроверяет dependencies под существующим commit lock.
+  Query adapter возвращает logical metadata/Number bounds, никогда таблицы или страницы.
 
 ## Проверка
 

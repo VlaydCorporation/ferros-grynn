@@ -100,6 +100,12 @@ pub(crate) enum MaintenanceAnalyzeMode {
 /// Logical target retained by the durable job ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum MaintenanceTarget {
+	/// Graph-owned user definition, distinct from graph-wide maintenance.
+	GraphIndex {
+		graph: GraphId,
+		index: IndexId,
+		version: SchemaVersion,
+	},
 	Index {
 		class: ClassId,
 		index: IndexId,
@@ -319,6 +325,11 @@ impl MaintenanceJobInfo {
 impl MaintenanceTarget {
 	pub(crate) fn display_name(self) -> String {
 		match self {
+			Self::GraphIndex {
+				graph,
+				index,
+				..
+			} => format!("graph:{graph}/index:{index}"),
 			Self::Index {
 				class,
 				index,
@@ -1404,9 +1415,10 @@ mod tests {
 			]),
 		)?;
 		if setup.iter().any(|result| result.result.is_err()) {
-			return Err(FerrosGrynnError::invalid_argument(
-				"local maintenance recovery fixture setup failed",
-			));
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"local maintenance recovery fixture setup failed: {:?}",
+				setup.iter().filter_map(|result| result.result.as_ref().err()).collect::<Vec<_>>()
+			)));
 		}
 		let class = store
 			.class("document")

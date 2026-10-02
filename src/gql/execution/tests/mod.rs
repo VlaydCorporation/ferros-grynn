@@ -4,6 +4,7 @@ mod explain;
 mod graph_dml;
 mod graph_result;
 mod import;
+mod landmark;
 mod r#match;
 mod match_atomwalk;
 mod match_hyper;

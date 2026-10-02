@@ -62,6 +62,7 @@ mod tests;
 
 pub use graph_view::TransactionGraphView;
 pub(crate) use query::{
+	QueryGeometryIndexRead,
 	QuerySnapshot,
 	QueryStatisticsDemand,
 	QueryStorageCursor,
@@ -70,6 +71,7 @@ pub(crate) use query::{
 	ScalarIndexConstraint,
 	ScalarIndexWindow,
 };
+pub use query::{QueryLandmarkPath, QueryNeighbourhoodEstimate, QueryNeighbourhoodSketch};
 
 /// Owned database-global atom value returned by a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +216,10 @@ pub struct Transaction {
 	started: Instant,
 	options: TransactionOptions,
 	snapshot: Arc<DatabaseRoot>,
+	/// Retains physical generations already captured by this immutable MVCC
+	/// root.
+	physical_query_snapshot:
+		Option<(u64, FerrosGrynnResult<Option<crate::storage::LocalQuerySnapshot>>)>,
 	working: DatabaseRoot,
 	reads: Mutex<RapidHashMap<ConflictKey, u64>>,
 	missing_records: Mutex<BTreeSet<RecordId>>,
@@ -256,6 +262,15 @@ impl Transaction {
 		options: TransactionOptions,
 		snapshot: Arc<DatabaseRoot>,
 	) -> Self {
+		let physical_query_snapshot =
+			(matches!(&store.inner.backend, super::StoreBackend::Local(_))
+				&& snapshot.schema.has_snapshot_indexes())
+			.then(|| {
+				(
+					snapshot.commit_ts,
+					store.inner.capture_physical_query_snapshot(snapshot.commit_ts),
+				)
+			});
 		Self {
 			store,
 			id,
@@ -263,6 +278,7 @@ impl Transaction {
 			options,
 			working: (*snapshot).clone(),
 			snapshot,
+			physical_query_snapshot,
 			reads: Mutex::new(RapidHashMap::default()),
 			missing_records: Mutex::new(BTreeSet::new()),
 			last_base_read: None,
@@ -692,6 +708,7 @@ impl Transaction {
 			Value::AtomOccurrence(occurrence) => {
 				self.intern_record_id_keys(occurrence.atom().id().id())
 			}
+			Value::Geometry(geometry) => geometry.validate(),
 			_ => Ok(()),
 		}
 	}
@@ -1024,7 +1041,14 @@ impl Transaction {
 		if self.options.isolation != IsolationLevel::ReadCommitted {
 			return Ok(());
 		}
-		let current = self.store.inner.current_root();
+		let store = self.store.clone();
+		let mut current = store.inner.current_root();
+		let _commit = (matches!(&store.inner.backend, super::StoreBackend::Local(_))
+			&& current.schema.has_snapshot_indexes())
+		.then(|| store.inner.commit.lock());
+		if _commit.is_some() {
+			current = store.inner.current_root();
+		}
 		if current.commit_ts == self.snapshot.commit_ts {
 			return Ok(());
 		}
@@ -1041,6 +1065,15 @@ impl Transaction {
 		)?;
 		self.snapshot = current;
 		self.working = working;
+		self.physical_query_snapshot =
+			(matches!(&store.inner.backend, super::StoreBackend::Local(_))
+				&& self.working.schema.has_snapshot_indexes())
+			.then(|| {
+				(
+					self.working.commit_ts,
+					store.inner.capture_physical_query_snapshot(self.working.commit_ts),
+				)
+			});
 		self.reads.lock().clear();
 		self.missing_records.lock().clear();
 		self.last_base_read = None;

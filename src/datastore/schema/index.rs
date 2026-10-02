@@ -8,7 +8,7 @@ use std::{
 use super::{AnalyzerId, FunctionId, IndexId, SchemaVersion};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::{GraphId, Text, VectorKind},
+	values::runtime::{GeometryKind, GraphId, Text, VectorKind},
 };
 
 /// Distance contract shared by exact KNN and durable ANN definitions.
@@ -441,6 +441,42 @@ pub enum ClassIndexKind {
 	Hnsw,
 	/// Page-backed DiskANN vector index.
 	DiskAnn,
+	/// Exact STR R-tree candidates over one geometry field.
+	Geometry,
+}
+
+/// Geometry definition options; topology, coordinate model and fill are fixed
+/// by stage 24.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GeometryIndexOptions {
+	/// Optional exact geometry family; None accepts all seven families.
+	pub(crate) geometry_type: Option<GeometryKind>,
+}
+
+impl GeometryIndexOptions {
+	/// Creates options from an already validated geometry family.
+	pub const fn new(geometry_type: Option<GeometryKind>) -> Self {
+		Self {
+			geometry_type,
+		}
+	}
+
+	/// Returns the declared family restriction.
+	pub const fn geometry_type(self) -> Option<GeometryKind> {
+		self.geometry_type
+	}
+
+	/// Validates geometry and the optional TYPE restriction at build/write
+	/// boundaries.
+	pub(crate) fn validate(self, geometry: &crate::values::Geometry) -> FerrosGrynnResult<()> {
+		geometry.validate()?;
+		if self.geometry_type.is_some_and(|kind| kind != geometry.kind()) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"geometry does not match the index TYPE restriction",
+			));
+		}
+		Ok(())
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,6 +485,7 @@ pub(crate) enum ClassIndexOptions {
 	Fulltext(FulltextIndexOptions),
 	Hnsw(HnswIndexOptions),
 	DiskAnn(DiskAnnIndexOptions),
+	Geometry(GeometryIndexOptions),
 }
 
 /// Transaction-visible usability state of one declared class index.
@@ -523,7 +560,10 @@ impl ClassIndex {
 		let invalid_fields = match kind {
 			ClassIndexKind::Count => !fields.is_empty(),
 			ClassIndexKind::Standard | ClassIndexKind::Unique => fields.is_empty(),
-			ClassIndexKind::Fulltext | ClassIndexKind::Hnsw | ClassIndexKind::DiskAnn => true,
+			ClassIndexKind::Fulltext
+			| ClassIndexKind::Hnsw
+			| ClassIndexKind::DiskAnn
+			| ClassIndexKind::Geometry => true,
 		};
 		if name.is_empty()
 			|| name.as_str().contains('\0')
@@ -629,6 +669,34 @@ impl ClassIndex {
 			fields: vec![field],
 			options,
 		})
+	}
+
+	/// Creates an STR geometry index over exactly one geometry field.
+	///
+	/// # Errors
+	/// Rejects empty names or reserved fields; field types are checked by
+	/// ClassSchema.
+	pub fn new_geometry<IntoText: Into<Text>, IntoField: Into<Text>>(
+		name: IntoText,
+		scope: IndexScope,
+		field: IntoField,
+		options: GeometryIndexOptions,
+	) -> FerrosGrynnResult<Self> {
+		Self::new_specialized(
+			name.into(),
+			ClassIndexKind::Geometry,
+			scope,
+			field.into(),
+			ClassIndexOptions::Geometry(options),
+		)
+	}
+
+	/// Returns the geometry-specific definition options.
+	pub const fn geometry_options(&self) -> Option<GeometryIndexOptions> {
+		match self.options {
+			ClassIndexOptions::Geometry(options) => Some(options),
+			_ => None,
+		}
 	}
 
 	/// Selects the write-side maintenance policy.

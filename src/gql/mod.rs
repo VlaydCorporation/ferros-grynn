@@ -288,6 +288,7 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		| StatementKind::DefineClass(_)
 		| StatementKind::DefineField(_)
 		| StatementKind::DefineIndex(_)
+		| StatementKind::DefineGraphIndex(_)
 		| StatementKind::DefineAnalyzer(_)
 		| StatementKind::DefineFunction(_)
 		| StatementKind::DefineParameter(_) => QueryStatementKind::Define,
@@ -326,6 +327,7 @@ pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
 			| StatementKind::DefineClass(_)
 			| StatementKind::DefineField(_)
 			| StatementKind::DefineIndex(_)
+			| StatementKind::DefineGraphIndex(_)
 			| StatementKind::DefineAnalyzer(_)
 			| StatementKind::DefineFunction(_)
 			| StatementKind::DefineParameter(_)

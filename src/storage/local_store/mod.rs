@@ -128,6 +128,7 @@ pub(super) struct GraphBinding {
 	pub(super) generation: u64,
 	pub(super) files: GraphFileSet,
 	pub(super) membership: PhysicalIndexBinding,
+	pub(super) edge_endpoint: Option<PhysicalIndexBinding>,
 	pub(super) arena: GraphArenaBindings,
 }
 
@@ -627,13 +628,14 @@ impl LocalStore {
 			&Vector,
 		) -> FerrosGrynnResult<f64>,
 	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
-		let reuse = match (previous, changed_records, import) {
+		let mut reuse = match (previous, changed_records, import) {
 			(Some(previous), Some(changed), false) => {
 				self.prepare_index_reuse(previous, database, changed, analyze_function)?
 			}
 			_ => IndexReusePlan::default(),
 		};
 		let mut state = self.state.lock();
+		if !import { reuse.retain_graph_artifacts(database, &state._database_catalog, &state.file_catalog)?; }
 		self.checkpoint_if_due(&mut state)?;
 		let expected = self
 			.wal

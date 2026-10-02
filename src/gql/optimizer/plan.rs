@@ -64,6 +64,13 @@ pub(crate) enum SourceOperator {
 		name: Box<str>,
 	},
 	/// Exact count index lookup.
+	GeometryIndexScan {
+		index: IndexId,
+		name: Box<str>,
+		column: usize,
+		forced: bool,
+	},
+	/// Exact count index lookup.
 	CountLookup {
 		/// Stable logical index identity.
 		index: IndexId,
@@ -215,10 +222,16 @@ pub(crate) enum MatchOperator {
 	/// Expands one StandardPath connector.
 	FixedExpand {
 		direction: crate::syn::MatchDirection,
+		/// Captured contribution identity included in the canonical
+		/// fingerprint.
+		cost: Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
 	},
 	/// Expands one AtomWalk connector.
 	AtomExpand {
 		direction: crate::syn::MatchDirection,
+		/// Captured contribution identity included in the canonical
+		/// fingerprint.
+		cost: Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
 	},
 	/// Validates and opens a qualified endpoint in a nested graph.
 	ResolveNestedEndpoint,
@@ -228,6 +241,8 @@ pub(crate) enum MatchOperator {
 		mode: crate::syn::MatchPathMode,
 		min: u32,
 		max: u32,
+		/// Captured versioned cost included even when no artifact is selected.
+		cost: Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
 	},
 	/// Finds one canonical unweighted shortest path per target.
 	BreadthFirstShortest {
@@ -242,12 +257,30 @@ pub(crate) enum MatchOperator {
 		mode: crate::syn::MatchPathMode,
 		min: u32,
 		max: u32,
+		/// Additive or stateful PURE COST invocation contract.
+		cost: Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
+	},
+	/// Refines a directed landmark bound through the exact bounded search.
+	LandmarkShortest {
+		/// Preserved direction and path uniqueness/depth constraints.
+		direction: crate::syn::MatchDirection,
+		/// Path uniqueness semantics applied by exact refinement.
+		mode: crate::syn::MatchPathMode,
+		/// Inclusive minimum path length.
+		min: u32,
+		/// Inclusive maximum path length.
+		max: u32,
+		/// Captured generation included in the stable plan hash.
+		binding: crate::datastore::QueryLandmarkPath,
 	},
 	/// Assigns endpoint positions of one hyperedge.
 	HyperContains,
 	/// Expands a connector constrained to hyperedge topology.
 	HyperExpand {
 		direction: crate::syn::MatchDirection,
+		/// Captured contribution identity included in the canonical
+		/// fingerprint.
+		cost: Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
 	},
 	/// Joins an atom with its direct containing owner.
 	WithinJoin,
@@ -312,7 +345,7 @@ pub(crate) enum TraversalSourceOperator {
 }
 
 /// Concrete traversal operator fixed before execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TraversalOperator {
 	/// Initial source adapter.
 	Source(TraversalSourceOperator),
@@ -320,6 +353,17 @@ pub(crate) enum TraversalOperator {
 	Step(TraverseStepKind),
 	/// Final traversal RETURN projection.
 	Project,
+	/// Ready approximate neighbourhood binding fixed by physical planning.
+	NeighbourhoodSketch(crate::datastore::QueryNeighbourhoodSketch),
+	/// Directed HOP bound followed by exact canonical path reconstruction.
+	LandmarkShortest(crate::datastore::QueryLandmarkPath),
+	/// Directed WEIGHT or additive COST bound followed by exact refinement.
+	LandmarkWeighted {
+		/// The analyzed path or distance operation.
+		kind: TraverseStepKind,
+		/// Captured logical generation and projection metadata.
+		index: crate::datastore::QueryLandmarkPath,
+	},
 }
 
 /// One stable-preorder traversal plan node.
@@ -352,6 +396,12 @@ pub(crate) struct PhysicalTraversalPlan {
 	pub(crate) cost: PlanCost,
 	/// Stable planning warnings.
 	pub(crate) warnings: Vec<PlanWarning>,
+	/// Versioned static contribution captured before pulling traversal rows.
+	pub(crate) custom_cost:
+		Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
+	/// Full-state custom shortest path uniqueness and filters.
+	pub(crate) custom_constraints:
+		Option<(crate::syn::MatchPathMode, Vec<crate::syn::MatchPathFilter>)>,
 }
 
 impl PhysicalMatchPlan {
@@ -509,6 +559,8 @@ impl PhysicalPlan {
 			}
 			Self::Traversal(plan) => {
 				2_u8.hash(&mut writer);
+				plan.custom_cost.hash(&mut writer);
+				plan.custom_constraints.hash(&mut writer);
 				for node in &plan.nodes {
 					node.node_id.hash(&mut writer);
 					node.step_index.hash(&mut writer);

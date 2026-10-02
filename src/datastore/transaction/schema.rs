@@ -13,6 +13,7 @@ use crate::{
 		ConflictKey,
 		FunctionEffect,
 		FunctionId,
+		GraphIndex,
 		IndexId,
 		IndexScope,
 		SchemaAnalyzer,
@@ -233,7 +234,7 @@ impl Transaction {
 	pub(crate) fn remove_function(&mut self, id: FunctionId) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
-		self.working.remove_function(id)?;
+		self.working.remove_function(id, self.snapshot.commit_ts)?;
 		self.insert_write(ConflictKey::SchemaFunction(id), SCHEMA_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::FunctionCatalogRange);
 		self.mutations.push(Mutation::RemoveFunction(id));
@@ -393,6 +394,198 @@ impl Transaction {
 		self.prepare_read()?;
 		self.record_read(ConflictKey::GraphCatalogRange);
 		Ok(self.working.schema.graphs().map(|graph| graph.as_ref().clone()).collect())
+	}
+
+	/// Defines a graph-owned index through the shared schema identity clock.
+	///
+	/// # Errors
+	/// Returns a graph, duplicate-definition, dependency, transaction, or
+	/// resource error.
+	pub fn define_graph_index(
+		&mut self,
+		graph: &str,
+		mut index: GraphIndex,
+	) -> FerrosGrynnResult<IndexId> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let current = self
+			.working
+			.schema
+			.named_graph(graph)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph))?;
+		if current.indexes().len() == 4096 {
+			return Err(FerrosGrynnError::invalid_argument(
+				"graph supports at most 4096 user indexes",
+			));
+		}
+		if index.id.is_some()
+			|| index.graph.is_some()
+			|| current.indexes().any(|existing| existing.name() == index.name())
+		{
+			return Err(FerrosGrynnError::invalid_argument("graph index is already defined"));
+		}
+		index.validate()?;
+		index.validate_family(current.reference().kind())?;
+		self.validate_graph_index_functions(&mut index)?;
+		let write_bytes = SCHEMA_WRITE_BYTES.saturating_add(index.descriptor()?.len());
+		self.ensure_capacity(write_bytes)?;
+		let id = IndexId::from_schema_id(self.store.inner.allocate_schema_id()?);
+		index.id = Some(id);
+		index.graph = Some(current.id());
+		let mut indexes = current.indexes().cloned().collect::<Vec<_>>();
+		indexes.push(index);
+		indexes.sort_by_key(GraphIndex::id);
+		self.publish_graph_replacement(current.replace_indexes(indexes)?, write_bytes)?;
+		Ok(id)
+	}
+
+	/// Replaces a graph user index while preserving its identity and advancing
+	/// its version.
+	///
+	/// # Errors
+	/// Returns a missing graph/index, definition, dependency, transaction, or
+	/// resource error.
+	pub fn overwrite_graph_index(
+		&mut self,
+		graph: &str,
+		mut index: GraphIndex,
+	) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		let current = self
+			.working
+			.schema
+			.named_graph(graph)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph))?;
+		let mut indexes = current.indexes().cloned().collect::<Vec<_>>();
+		let position = indexes
+			.iter()
+			.position(|old| old.name() == index.name())
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("graph user index is absent"))?;
+		index.validate()?;
+		index.validate_family(current.reference().kind())?;
+		self.validate_graph_index_functions(&mut index)?;
+		index.id = indexes[position].id;
+		index.graph = Some(current.id());
+		index.version = indexes[position].version.next()?;
+		let write_bytes = SCHEMA_WRITE_BYTES.saturating_add(index.descriptor()?.len());
+		self.ensure_capacity(write_bytes)?;
+		indexes[position] = index;
+		self.publish_graph_replacement(current.replace_indexes(indexes)?, write_bytes)
+	}
+
+	/// Checks the additive function signature shared by SDK and GQL
+	/// definitions.
+	fn validate_graph_index_functions(&mut self, index: &mut GraphIndex) -> FerrosGrynnResult<()> {
+		if !index.is_on_demand()
+			&& let crate::datastore::GraphIndexDefinition::Path {
+				cost:
+					crate::datastore::GraphIndexCost::Function {
+						function,
+						version,
+					},
+				..
+			} = index.definition()
+		{
+			let dependencies = crate::gql::PureFunctionEvaluator::path_dependencies(
+				&self.working,
+				*function,
+				*version,
+			)?;
+			index.dependencies.extend(dependencies);
+			index.validate()?;
+		}
+		for &(function, version) in &index.dependencies {
+			let dependency = self.function_by_id(function)?.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("graph index function dependency is absent")
+			})?;
+			if dependency.version() != version
+				|| !index.is_on_demand() && dependency.effect() != FunctionEffect::Pure
+			{
+				return Err(FerrosGrynnError::invalid_argument(
+					"graph index requires the captured PURE function version",
+				));
+			}
+		}
+		if let crate::datastore::GraphIndexDefinition::Path {
+			cost: crate::datastore::GraphIndexCost::Function {
+				function,
+				version,
+			},
+			..
+		} = index.definition()
+		{
+			let function = self.function_by_id(*function)?.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("graph COST function is absent")
+			})?;
+			if function.version() != *version
+				|| !(function.parameters().len() == 1
+					|| index.is_on_demand()
+						&& function.parameters().len() == 2
+						&& function.parameters().nth(1).is_some_and(|parameter| {
+							parameter.value_type() == &crate::values::Type::Number
+						}))
+				|| function.parameters().next().is_none_or(|parameter| {
+					!matches!(
+						parameter.value_type(),
+						crate::values::Type::Any
+							| crate::values::Type::AtomOccurrence(crate::graph::AtomKind::Edge)
+					)
+				})
+				|| !matches!(
+					function.result(),
+					crate::values::Type::Int
+						| crate::values::Type::Float
+						| crate::values::Type::Decimal
+						| crate::values::Type::Number
+				)
+				|| !index.is_on_demand()
+					&& (function.effect() != FunctionEffect::Pure || !function.is_cost())
+			{
+				return Err(FerrosGrynnError::invalid_argument(
+					"graph COST requires a numeric edge function; materialization requires PURE \
+					 COST",
+				));
+			}
+		}
+		Ok(())
+	}
+
+	/// Removes a graph-owned user definition from the transaction-private
+	/// catalog.
+	///
+	/// # Errors
+	/// Returns a missing graph/index, transaction, or resource error.
+	/// Engine-owned label, adjacency, and endpoint capabilities cannot be
+	/// removed by this API.
+	pub fn remove_graph_index(&mut self, graph: &str, name: &str) -> FerrosGrynnResult<()> {
+		self.prepare_schema_mutation()?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
+		let current = self
+			.working
+			.schema
+			.named_graph(graph)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph))?;
+		let mut indexes = current.indexes().cloned().collect::<Vec<_>>();
+		let position =
+			indexes.iter().position(|index| index.name().as_str() == name).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("graph user index is absent or engine-owned")
+			})?;
+		indexes.remove(position);
+		self.publish_graph_replacement(current.replace_indexes(indexes)?, SCHEMA_WRITE_BYTES)
+	}
+
+	/// Publishes a graph catalog replacement through normal FCW/SSI replay.
+	pub(super) fn publish_graph_replacement(
+		&mut self,
+		replacement: crate::datastore::GraphSchema,
+		write_bytes: usize,
+	) -> FerrosGrynnResult<()> {
+		let id = replacement.id();
+		self.working.replace_graph_schema(replacement.clone(), self.snapshot.commit_ts)?;
+		self.insert_write(ConflictKey::GraphDefinition(id), write_bytes);
+		self.mark_range_change(ConflictKey::GraphCatalogRange);
+		self.mutations.push(Mutation::ReplaceGraph(replacement));
+		Ok(())
 	}
 
 	pub(crate) fn replace_graph_properties(

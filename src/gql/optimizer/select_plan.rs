@@ -2,9 +2,9 @@
 
 mod access;
 mod join_order;
-
 use std::collections::BTreeSet;
 
+pub(in crate::gql) use access::spatial_query;
 use access::{index_join_probe, plan_source, resolve_hints, sort_eliminated, source_cardinality};
 use join_order::{
 	enumerate_join_order,

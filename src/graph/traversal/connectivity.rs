@@ -1,4 +1,7 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::{
+	collections::{BTreeSet, VecDeque},
+	hash::Hash,
+};
 
 use rapidhash::{RapidHashMap, RapidHashSet};
 
@@ -125,31 +128,48 @@ where
 {
 	let index = TraversalIndex::new_with_check(graph, TraversalSemantics::Node, check)?;
 	let nodes = collect_node_ids_with_check(graph, check)?;
-	let mut visited = RapidHashSet::default();
-	let mut finish = Vec::with_capacity(nodes.len());
+	strong_components_with_steps(
+		nodes.into_iter(),
+		|node, direction| {
+			local_steps(&index, node, direction)
+				.filter_map(|step| step.target.local_id().filter(|id| id.is_node()))
+		},
+		check,
+	)
+}
 
-	for start in nodes.iter().copied() {
+/// Iterative Kosaraju kernel shared by the public NODE traversal and bounded
+/// NODE/ATOM artifact relations. Adjacency order remains caller-owned.
+///
+/// # Errors
+/// Propagates the caller's cancellation or resource check.
+pub(super) fn strong_components_with_steps<Vertex, Steps>(
+	vertices: impl Iterator<Item = Vertex>,
+	mut steps: impl FnMut(Vertex, TraversalDirection) -> Steps,
+	check: &mut impl FnMut() -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<Vec<Vec<Vertex>>>
+where
+	Vertex: Copy + Eq + Hash,
+	Steps: Iterator<Item = Vertex>,
+{
+	let mut visited = RapidHashSet::default();
+	let mut finish = Vec::with_capacity(vertices.size_hint().0);
+
+	for start in vertices {
 		check()?;
 		if !visited.insert(start) {
 			continue;
 		}
-		let mut stack = vec![(start, false)];
-		while let Some((node, returning)) = stack.pop() {
+		let mut stack = vec![(start, steps(start, TraversalDirection::Forward))];
+		while let Some((node, neighbours)) = stack.last_mut() {
 			check()?;
-			if returning {
-				finish.push(node);
-				continue;
-			}
-			stack.push((node, true));
-			for (candidate, target) in local_steps(&index, node, TraversalDirection::Forward)
-				.filter_map(|step| step.target.local_id().filter(|id| id.is_node()))
-				.rev()
-				.enumerate()
-			{
-				check_candidate(check, candidate)?;
+			if let Some(target) = neighbours.next() {
 				if visited.insert(target) {
-					stack.push((target, false));
+					stack.push((target, steps(target, TraversalDirection::Forward)));
 				}
+			} else {
+				finish.push(*node);
+				stack.pop();
 			}
 		}
 	}
@@ -166,16 +186,9 @@ where
 		while let Some(node) = stack.pop() {
 			check()?;
 			component.push(node);
-			for (candidate, step) in
-				local_steps(&index, node, TraversalDirection::Backward).enumerate()
-			{
+			for (candidate, target) in steps(node, TraversalDirection::Backward).enumerate() {
 				check_candidate(check, candidate)?;
-				if let Some(target) = step
-					.target
-					.local_id()
-					.filter(|id| id.is_node())
-					.filter(|target| assigned.insert(*target))
-				{
+				if assigned.insert(target) {
 					stack.push(target);
 				}
 			}
