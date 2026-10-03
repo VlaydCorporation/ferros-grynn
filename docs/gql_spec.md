@@ -641,15 +641,14 @@ $B_{ep} \in \left\{ 0; 1 \right\}^{|A| \times |R| \times 2}$:
 каждого endpoint'а, даже если дисковая запись хранит единое множество только в `source`.
 Тензор охватывает V–V, V–E, E–V, E–E, hyper- и cross-level-инцидентность.
 
-**C — Atom Adjacency Matrix**
+**Binary и weighted Atom Adjacency Matrix**
 
-- $C[a_1, a_2] = \displaystyle\sum_r B_{ep}[a_1, r, 0] \cdot B_{ep}[a_2, r, 1] \cdot \text{weight}(r)$
-- $C[a_1, a_2] \neq 0 \Longleftrightarrow \exists r: a_1 \in \operatorname{source}(r) \wedge a_2 \in \operatorname{target}(r)$.
-
-Суммируется при мультирёбрах (взвешенная граф-матрица смежности).
-
-Полная atom $\times$ atom смежность восстанавливается из $B_{ep}$:
-- $C[a_1, a_2] = \operatorname{OR}_r (B_{ep}[a_1, r, 0] \; \operatorname{AND} \; B_{ep}[a_2, r, 1])$
+Binary связь существует при допустимом incidence-переходе через хотя бы один connector.
+Weighted cell суммирует его Number weights (missing = 1) по разным connectors.
+Нулевые веса и cancellation не удаляют binary связь. Direction, repeated endpoints и
+undirected self-loops проверяются общим endpoint kernel: слепое произведение planes
+не восстанавливает bidirectional reverse steps и создаёт ложную undirected диагональ.
+Каждый connector даёт один вклад на допустимую pair; parallel connectors различаются.
 
 Полная atom $\times$ atom матрица смежности $C = C_{vv} + C_{ve} + C_{ev} + C_{ee}$:
 - $C_{vv}[v_1, v_2]$ — через V-V рёбра (nodes $\times$ nodes)
@@ -671,8 +670,22 @@ $B_{ep}$ позволяет строить любую из этих подмат
 | `IncidenceTensor` | $B_{ep}$ (только nodes) | node $\times$ edge $\times$ side                 |
 | `EndpointTensor`  | $B_{ep}$ (все атомы)    | **atom $\times$ edge $\times$ {Source, Target}** |
 
-`IncidenceMatrix` и `IncidenceTensor` сохраняются для обратной совместимости.
-`EndpointTensor` — полное представление единого механизма.
+`IncidenceMatrix` и `IncidenceTensor` — NODE-only views нового EndpointTensor, без legacy layout.
+Public Rust API предоставляет shape, axis dictionaries, ordinal lookup, checked cells,
+nonzero/CSR access, VV/VE/EV/EE blocks и bounded dense export. Default representation sparse.
+Standalone GraphRead axes используют {Uuid, AtomRef}; datastore axes — AtomOccurrenceRef.
+LOCAL columns принадлежат root graph; referenced boundary rows доступны в tensor, но
+не входят в local analytics. ROOTED явно включает containment closure и cross-level arcs.
+Containment не добавляет arcs. Нормативный контракт этапа и алгоритмов:
+[gql_tensor_analytics_stage_26_plan.md](gql_tensor_analytics_stage_26_plan.md).
+
+Harmonic closeness и betweenness используют пути без повторения projected vertex.
+Один qualified connector может участвовать в разных projected pairs такого пути.
+Это аналитическая область расстояний; default TRAIL и явные path constraints
+для ALL SHORTEST bindings определяются отдельно. Non-integer costs не допускают
+преждевременного отсечения неминимальных prefixes: Number rounding может создать
+равные минимальные final costs. Все ограничения work/memory и numeric errors
+сохраняются; epsilon ties не вводятся.
 
 ### 3.9. Ограничения типов графов
 
@@ -3857,12 +3870,52 @@ RETURN weights_sum;
 |---------------------------------------------------|-------------------------------------------------------------------------------------------------|
 | `tv::shortestPath(target)`                        | Кратчайший путь по числу рёбер; BFS либо directed ALT/A* с прежним canonical BFS path           |
 | `tv::weightedShortestPath(target, weight_field?)` | Взвешенный кратчайший путь; Dijkstra с compatible directed ALT refinement, неотрицательные веса |
+| `tv::allShortestPaths(target, options?)`          | Все минимальные допустимые пути по hops; полный результат либо typed error                      |
+| `tv::allWeightedShortestPaths(target, options?)`  | Все минимальные пути по stored weights или versioned PURE COST; exact Number ties               |
 | `tv::bellmanFord(target, weight_field?)`          | Взвешенный кратчайший путь с отрицательными весами; сообщает об отрицательном цикле             |
 | `tv::distanceTo(target, weight_field?)`           | Только длина/стоимость, без материализации пути                                                 |
 | `tv::kHop(k)`                                     | Точные вершины на расстоянии ≤k, включая seed; существующий порядок BFS                         |
 | `tv::kHopEstimate(k)`                             | Явно approximate distinct count на расстоянии ≤k с seed; без Ready sketch exact fallback        |
 
 **Структура графа**
+
+Этап 26 добавляет graph-wide barriers `tv::degree`, `tv::pageRank`,
+`tv::harmonicCloseness`, `tv::betweenness`, `tv::eigenvector`, `tv::katz`,
+`tv::triangles`, `tv::clustering`, `tv::labelPropagation` и `tv::louvain`.
+Каждый принимает optional object и возвращает один report: `values` с qualified
+`atom` identities и typed `value`, `parameters`, `convergence`, `scope`, `mode`,
+`direction`, `work`; structural/community reports также содержат totals/modularity.
+Область — induced distinct occurrences текущего потока; duplicate seeds не
+размножают vertices. Пустой поток возвращает пустые values и нулевые counts.
+
+Общие options: `scope:'LOCAL'|'ROOTED'`, `direction:'OUT'|'IN'|'BOTH'`, `labels:[...]`.
+Числовые kernels принимают `weights:'UNWEIGHTED'|'STORED'`; degree всегда возвращает
+raw counts и stored strengths, triangles использует binary topology.
+`orientation:'UNDIRECTED'|'DIRECTED'` относится к triangles/clustering/Louvain.
+PageRank/eigenvector/Katz принимают tolerance/max_iterations; PageRank damping;
+Katz alpha/beta; harmonic/betweenness normalized; LPA votes/max_sweeps;
+Louvain resolution/max_sweeps/max_levels. Unknown/inapplicable fields ошибочны.
+Defaults и weight domains совпадают с `graph::analytics` (§3.8.4).
+
+ALL path options: scope/direction/labels/min_depth/max_depth. Seed bulk и lexical
+environment сохраняются. MATCH принимает `ALL SHORTEST` и `ALL WEIGHTED SHORTEST`
+в local path constraints, например `[road LABEL allowed*1..4 ALL SHORTEST]`.
+Branch/terminal predicates проверяются до выбора minimum; per-hop COST captures
+повторно не исполняются при materialization. Named path cost складывается в
+исходном порядке contributions, сохраняя mixed `Number` semantics.
+Weighted WALK требует explicit finite depth. Stateful COST использует full-state
+search; ONE shortest сохраняет прежнее поведение.
+
+`QueryExecutionOptions.graph_algorithm_limits` ограничивает общие scratch, work
+и all-shortest enumeration statement, включая nested controls и seed multiplicity.
+Исчерпанная path quota не запрещает non-enumerating analytics. Failed catchable
+invocations удерживают work admission; refund возможен после полного успеха.
+Silent truncation и successful unconverged scores запрещены.
+
+Cache DDL: `DEFINE INDEX name ON GRAPH graph TENSOR FORMAT CSR|DENSE|AUTO
+SCOPE LOCAL|ROOTED WITH (MAX_BYTES=...);` хранит полную ATOM incidence; NODE,
+direction, labels и weights являются views. INFO/REBUILD/REMOVE используют общие
+graph index semantics. Rust SDK предоставляет те же операции без исполнения GQL.
 
 | Шаг                                        | Описание                                                           |
 |--------------------------------------------|--------------------------------------------------------------------|
@@ -3876,9 +3929,12 @@ RETURN weights_sum;
 | `tv::hasCycle()`                           | Наличие цикла                                                      |
 | `tv::reachable(target)`                    | Достижимость; использует reachability-индекс, если он `ready`      |
 
-Graph-wide algorithms работают над induced graph node occurrences одного `GraphId` и являются
-barrier-операторами. PageRank, centralities, all-shortest enumeration, triangles, clustering,
-label propagation и Louvain принадлежат этапу 26. С этапа 21 `tv::algo(fn::name, ...)`
+Алгоритмы этапа 17 работают над induced graph node occurrences одного `GraphId` и являются
+barrier-операторами. Новые аналитические barriers этапа 26 используют qualified NODE/ATOM
+domain с LOCAL/ROOTED scope согласно контракту выше. All-shortest остаётся seed-local.
+Embedded `FROM MATCH ... RETURN ... ORDER BY ...` сохраняет граф MATCH как tensor root;
+внешний `|>` не является частью projection или ORDER expression.
+С этапа 21 `tv::algo(fn::name, ...)`
 вызывает versioned named PURE/STABLE UDF через общий function catalog; отдельного algorithm
 registry нет.
 

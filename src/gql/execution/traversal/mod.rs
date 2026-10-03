@@ -8,6 +8,9 @@
 //! Streaming GrynnQL traversal virtual machine.
 
 mod algorithms;
+mod all_shortest;
+/// Qualified tensor-backed analytical barriers.
+mod analytics;
 mod barrier;
 mod model;
 mod navigation;
@@ -37,6 +40,7 @@ struct PreparedStep {
 	algorithm_input: Option<Type>,
 	neighbourhood_index: Option<crate::datastore::IndexId>,
 	landmark_path: Option<crate::datastore::QueryLandmarkPath>,
+	tensor_cache: Option<crate::datastore::QueryTensorCache>,
 	match_plan: Option<Box<LogicalMatch>>,
 	repeat: Option<PreparedRepeat>,
 }
@@ -100,13 +104,16 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 	visit: &mut impl FnMut(Value) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Option<Value>> {
 	let physical = if plan.steps.iter().any(|step| {
-		matches!(
-			step.kind,
-			TraverseStepKind::KHopEstimate
-				| TraverseStepKind::ShortestPath
-				| TraverseStepKind::WeightedShortestPath
-				| TraverseStepKind::DistanceTo
-		)
+		step.kind.is_tensor_analytics()
+			|| matches!(
+				step.kind,
+				TraverseStepKind::KHopEstimate
+					| TraverseStepKind::ShortestPath
+					| TraverseStepKind::WeightedShortestPath
+					| TraverseStepKind::DistanceTo
+					| TraverseStepKind::AllShortestPaths
+					| TraverseStepKind::AllWeightedShortestPaths
+			)
 	}) {
 		let demand = crate::gql::optimizer::PlannerDemand::for_traverse(plan);
 		let snapshot = read.planner_snapshot(snapshot, &demand)?;
@@ -131,7 +138,23 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 		.map(|reference| {
 			select::resolve_graph_reference(read, snapshot, reference, None, slots, source, control)
 		})
-		.transpose()?;
+		.transpose()?
+		.or_else(|| {
+			let tensor_consumer = plan.steps.iter().any(|step| {
+				step.kind.is_tensor_analytics()
+					|| matches!(
+						step.kind,
+						TraverseStepKind::AllShortestPaths
+							| TraverseStepKind::AllWeightedShortestPaths
+					)
+			});
+			match &plan.source {
+				LogicalTraverseSource::Match(statement) if tensor_consumer => {
+					Some(statement.graph.clone())
+				}
+				_ => None,
+			}
+		});
 	let (source_value, source_binding, retain_environment) = match &plan.source {
 		LogicalTraverseSource::Expression(expression) => {
 			let fields = RecordFields {
@@ -203,6 +226,7 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 		plan.atom,
 		plan.custom_cost,
 		&plan.constraints,
+		graph.clone(),
 	);
 	if let Some(graph_plan) = &plan.return_graph {
 		let mut assembly = graph_result::GraphAssemblyAccumulator::new(graph, None, None, control);
@@ -448,6 +472,20 @@ fn prepare_steps(
 						}
 					})
 				}),
+				tensor_cache: physical.and_then(|plan| {
+					plan.nodes.iter().find_map(|node| {
+						if node.step_index == Some(ordinal)
+							&& let crate::gql::optimizer::TraversalOperator::Tensor {
+								projection,
+								..
+							} = &node.operator
+						{
+							projection.binding.clone()
+						} else {
+							None
+						}
+					})
+				}),
 				match_plan: step.match_plan.clone(),
 				repeat,
 			})
@@ -509,6 +547,8 @@ struct TraversalMachine<'a, Read: QueryRead> {
 	atom_semantics: bool,
 	custom_cost: Option<crate::gql::ir::LogicalPathCost>,
 	constraints: crate::syn::MatchConstraints,
+	/// Declared graph root for qualified ROOTED domains.
+	graph: Option<GraphRef>,
 	side_effects: Object,
 	occurrences: std::collections::BTreeMap<BoundAtom, AtomOccurrenceRef>,
 	local_indexes: std::collections::BTreeMap<crate::graph::GraphId, Option<Rc<TraversalIndex>>>,
@@ -551,6 +591,7 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 		atom_semantics: bool,
 		custom_cost: Option<crate::gql::ir::LogicalPathCost>,
 		constraints: &crate::syn::MatchConstraints,
+		graph: Option<GraphRef>,
 	) -> Self {
 		let mut queues = (0..=steps.len()).map(|_| VecDeque::new()).collect::<Vec<_>>();
 		queues[0] = source_queue;
@@ -572,6 +613,7 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 			atom_semantics,
 			custom_cost,
 			constraints: constraints.clone(),
+			graph,
 			side_effects: Object::new(),
 			occurrences: std::collections::BTreeMap::new(),
 			local_indexes: std::collections::BTreeMap::new(),

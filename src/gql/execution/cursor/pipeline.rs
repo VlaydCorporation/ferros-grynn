@@ -25,7 +25,35 @@ impl RowCursor for OneRowCursor {
 }
 
 /// Resolves public fields for an atom bound in a MATCH row.
-pub(in crate::gql::execution) trait AtomFieldRead {
+pub(in crate::gql) trait AtomFieldRead {
+	/// Records a snapshot dependency used by a context-dependent PURE helper.
+	fn observe(&self, _key: crate::datastore::ConflictKey) {}
+
+	/// Whether this resolver enforces an embedding's hard evaluation budgets.
+	fn bounded(&self) -> bool {
+		false
+	}
+
+	/// Admits the complete value representation before cloning or scanning it.
+	fn admit_value(&self, _value: &Value) -> FerrosGrynnResult<()> {
+		Ok(())
+	}
+	/// Admits owned evaluation allocations before copying or growing values.
+	fn admit(&self, _bytes: usize) -> FerrosGrynnResult<()> {
+		Ok(())
+	}
+
+	/// Charges embedding-specific evaluator work before executing it.
+	fn work(&self, _operations: u64) -> FerrosGrynnResult<()> {
+		Ok(())
+	}
+
+	/// Copies a value only after admitting its complete owned payload.
+	fn copy_value(&self, value: &Value) -> FerrosGrynnResult<Value> {
+		self.admit_value(value)?;
+		Ok(value.clone())
+	}
+
 	/// Reads `id`, `label`, or a dictionary-backed property.
 	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value>;
 
@@ -57,21 +85,60 @@ pub(in crate::gql::execution) trait AtomFieldRead {
 
 /// Immutable builder resolver; values and typed execution retain public
 /// identities.
-pub(in crate::gql::execution) struct RootFields<'a>(
-	pub(in crate::gql::execution) &'a crate::datastore::DatabaseRoot,
-);
+pub(in crate::gql) struct RootFields<'a> {
+	/// Exact immutable database read root.
+	root: &'a crate::datastore::DatabaseRoot,
+	/// Shared runtime memory and cancellation policy.
+	control: &'a ExecutionControl,
+	/// Conservatively retained owned/transient value admission.
+	account: RefCell<BarrierAccount>,
+	/// Snapshot-aware SSI observer supplied by the transaction adapter.
+	read: &'a dyn Fn(crate::datastore::ConflictKey),
+	/// Operation-wide work admission supplied by the caller.
+	work: &'a dyn Fn(u64) -> FerrosGrynnResult<()>,
+}
 
 impl RootFields<'_> {
+	/// Shares one invocation account and snapshot read observer with nested
+	/// calls.
+	pub(in crate::gql) fn new<'a>(
+		root: &'a crate::datastore::DatabaseRoot,
+		control: &'a ExecutionControl,
+		read: &'a dyn Fn(crate::datastore::ConflictKey),
+		work: &'a dyn Fn(u64) -> FerrosGrynnResult<()>,
+	) -> RootFields<'a> {
+		RootFields {
+			root,
+			control,
+			account: RefCell::new(control.barrier_account()),
+			read,
+			work,
+		}
+	}
+
 	/// Resolves a qualified durable occurrence against this exact root.
 	fn bound(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<BoundAtom> {
 		let global = self
-			.0
+			.root
 			.resolve_atom(occurrence.atom().id())
 			.filter(|global| global.kind() == Some(occurrence.atom().kind()))
 			.ok_or_else(|| {
+				if let Some(class) = self
+					.root
+					.schema
+					.class(occurrence.atom().id().class())
+					.and_then(|class| class.id())
+				{
+					(self.read)(crate::datastore::ConflictKey::BaseClassRange(class));
+				}
 				FerrosGrynnError::atom_does_not_exist("atom", occurrence.atom().id().to_string())
 			})?;
-		let local = self.0.membership(occurrence.graph().id(), global).ok_or_else(|| {
+		(self.read)(crate::datastore::ConflictKey::BaseAtom(global));
+		(self.read)(crate::datastore::ConflictKey::GraphMembership(
+			occurrence.graph().id(),
+			global,
+		));
+		let local = self.root.membership(occurrence.graph().id(), global).ok_or_else(|| {
 			FerrosGrynnError::atom_does_not_exist("occurrence", occurrence.atom().id().to_string())
 		})?;
 		Ok(BoundAtom::new(occurrence.graph().id(), local))
@@ -79,41 +146,155 @@ impl RootFields<'_> {
 }
 
 impl AtomFieldRead for RootFields<'_> {
+	fn observe(&self, key: crate::datastore::ConflictKey) {
+		(self.read)(key);
+	}
+
+	fn bounded(&self) -> bool {
+		true
+	}
+
+	fn admit_value(&self, value: &Value) -> FerrosGrynnResult<()> {
+		self.admit(2 * size_of::<&Value>())?;
+		let mut pending = vec![value];
+		while let Some(value) = pending.pop() {
+			self.work(1)?;
+			let count = match value {
+				Value::Array(values) => values.len(),
+				Value::Set(values) => values.len(),
+				Value::Object(values) => values.len(),
+				Value::Range(_) => 2,
+				Value::Path(path) => {
+					self.work(path.steps().len() as u64)?;
+					0
+				}
+				_ => 0,
+			};
+			self.work(count as u64)?;
+			self.admit(
+				count
+					.checked_mul(2 * size_of::<Value>() + 128 + 2 * size_of::<&Value>())
+					.ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("PURE collection scratch")
+					})?,
+			)?;
+			pending.try_reserve(count).map_err(|cause| {
+				FerrosGrynnError::traversal_resource_limit_exceeded(
+					"PURE value traversal",
+					self.control.barrier_memory_limit() as u64,
+				)
+				.with_technical_source(cause)
+			})?;
+			match value {
+				Value::Array(values) => pending.extend(values.iter()),
+				Value::Set(values) => pending.extend(values.iter()),
+				Value::Object(values) => {
+					for (name, value) in values.iter() {
+						self.admit(name.len())?;
+						pending.push(value);
+					}
+				}
+				Value::Range(range) => {
+					for bound in [range.start(), range.end()] {
+						if let std::ops::Bound::Included(value) | std::ops::Bound::Excluded(value) =
+							bound
+						{
+							pending.push(value);
+						}
+					}
+				}
+				_ => self.admit(value.estimated_heap_bytes())?,
+			}
+		}
+		Ok(())
+	}
+
+	fn admit(&self, bytes: usize) -> FerrosGrynnResult<()> {
+		// ponytail: retain conservative transient charges until the outer call
+		// returns; use value-lifetime accounts if long scalar loops need more
+		// room.
+		if !self.account.borrow_mut().reserve(bytes) {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"PURE value scratch",
+				self.control.barrier_memory_limit() as u64,
+			));
+		}
+		Ok(())
+	}
+
+	fn work(&self, operations: u64) -> FerrosGrynnResult<()> {
+		(self.work)(operations)
+	}
+
 	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value> {
 		let bound = atom;
-		let occurrence = self.0.occurrence(bound.graph, bound.atom).ok_or_else(|| {
+		(self.read)(crate::datastore::ConflictKey::GraphIncidence(bound.graph, bound.atom));
+		let occurrence = self.root.occurrence(bound.graph, bound.atom).ok_or_else(|| {
 			FerrosGrynnError::atom_does_not_exist("occurrence", bound.atom.to_string())
 		})?;
 		let base = self
-			.0
+			.root
 			.atom(occurrence.global_id())
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("PURE occurrence has no base"))?;
+		(self.read)(crate::datastore::ConflictKey::BaseAtom(occurrence.global_id()));
+		(self.read)(crate::datastore::ConflictKey::GraphMembership(
+			bound.graph,
+			occurrence.global_id(),
+		));
+		(self.read)(crate::datastore::ConflictKey::GraphOverlay(
+			bound.graph,
+			occurrence.global_id(),
+		));
+		(self.read)(crate::datastore::ConflictKey::PropertyDictionary);
 		match field {
-			"id" => Ok(Value::Record(Box::new(base.record_id().clone()))),
-			"class" => Ok(Value::from(base.record_id().class())),
+			"id" => {
+				self.admit(size_of::<RecordId>() + base.record_id().estimated_heap_bytes())?;
+				Ok(Value::Record(Box::new(base.record_id().clone())))
+			}
+			"class" => {
+				self.admit(base.record_id().class().len())?;
+				Ok(Value::from(base.record_id().class()))
+			}
 			"kind" => Ok(Value::from(if bound.atom.is_edge() {
 				"edge"
 			} else {
 				"node"
 			})),
-			"label" => Ok(occurrence.label().cloned().map_or(Value::None, Value::String)),
+			"label" => {
+				self.admit(occurrence.label().map_or(0, |label| label.len()))?;
+				Ok(occurrence.label().cloned().map_or(Value::None, Value::String))
+			}
 			"graph" => self
-				.0
+				.root
 				.graph(bound.graph)
-				.map(|graph| Value::GraphRef(Box::new(graph.reference().clone())))
-				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(bound.graph.to_string())),
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(bound.graph.to_string()))
+				.and_then(|graph| {
+					(self.read)(crate::datastore::ConflictKey::GraphDefinition(bound.graph));
+					self.admit(size_of::<GraphRef>() + graph.reference().name().len())?;
+					Ok(Value::GraphRef(Box::new(graph.reference().clone())))
+				}),
 			"properties" => {
-				let mut object = properties_object(base.properties(), &self.0.dictionary)?;
+				let mut object = Object::new();
+				for (key, value) in base.properties().iter() {
+					self.work(1)?;
+					let name = self.root.dictionary.resolve(key).ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("PURE property name is absent")
+					})?;
+					self.admit(name.len() + 128)?;
+					object.insert(name.clone(), self.copy_value(value)?);
+				}
 				if let Some(overlay) = occurrence.overlay() {
 					for (key, value) in overlay.iter() {
-						let name = self.0.dictionary.resolve(key).ok_or_else(|| {
+						self.work(1)?;
+						let name = self.root.dictionary.resolve(key).ok_or_else(|| {
 							FerrosGrynnError::invalid_storage_file(
 								"PURE overlay property name is absent",
 							)
 						})?;
 						match value {
 							crate::datastore::OverlayValue::Value(value) => {
-								object.insert(name.clone(), value.clone());
+								self.admit(name.len() + 128)?;
+								object.insert(name.clone(), self.copy_value(value)?);
 							}
 							crate::datastore::OverlayValue::Hidden => {
 								object.remove(name);
@@ -123,13 +304,12 @@ impl AtomFieldRead for RootFields<'_> {
 				}
 				Ok(Value::Object(object))
 			}
-			_ => Ok(self
-				.0
+			_ => self
+				.root
 				.dictionary
 				.get(field)
 				.and_then(|key| occurrence.effective_value(base.properties().get(key), key))
-				.cloned()
-				.unwrap_or(Value::None)),
+				.map_or(Ok(Value::None), |value| self.copy_value(value)),
 		}
 	}
 
@@ -143,7 +323,8 @@ impl AtomFieldRead for RootFields<'_> {
 
 	fn inner_graph(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		let bound = self.bound(occurrence)?;
-		let current = self.0.occurrence(bound.graph, bound.atom).ok_or_else(|| {
+		(self.read)(crate::datastore::ConflictKey::GraphIncidence(bound.graph, bound.atom));
+		let current = self.root.occurrence(bound.graph, bound.atom).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("PURE owner occurrence is absent")
 		})?;
 		let nested = match current.state() {
@@ -157,37 +338,61 @@ impl AtomFieldRead for RootFields<'_> {
 		};
 		match nested {
 			None => Ok(Value::None),
-			Some(id) => self
-				.0
-				.graph(id)
-				.map(|graph| Value::GraphRef(Box::new(graph.reference().clone())))
-				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(id.to_string())),
+			Some(id) => {
+				(self.read)(crate::datastore::ConflictKey::GraphDefinition(id));
+				let graph = self
+					.root
+					.graph(id)
+					.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(id.to_string()))?;
+				self.admit(size_of::<GraphRef>() + graph.reference().name().len())?;
+				Ok(Value::GraphRef(Box::new(graph.reference().clone())))
+			}
 		}
 	}
 
 	fn level_path(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value> {
 		let bound = self.bound(occurrence)?;
-		let current = self.0.occurrence(bound.graph, bound.atom).ok_or_else(|| {
+		(self.read)(crate::datastore::ConflictKey::GraphCatalogRange);
+		for graph in self.root.schema.graphs() {
+			self.work(1)?;
+			(self.read)(crate::datastore::ConflictKey::GraphKindRange(graph.id(), AtomKind::Node));
+			(self.read)(crate::datastore::ConflictKey::GraphKindRange(graph.id(), AtomKind::Edge));
+		}
+		let current = self.root.occurrence(bound.graph, bound.atom).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("PURE LevelPath occurrence is absent")
 		})?;
-		self.0.level_path_value(bound.graph, current.global_id())
+		self.root.level_path_value_bounded(bound.graph, current.global_id(), &|bytes, work| {
+			self.admit(bytes)?;
+			self.work(work)
+		})
 	}
 
 	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
-		let base =
-			self.0.resolve_atom(record).and_then(|global| self.0.atom(global)).ok_or_else(
-				|| FerrosGrynnError::atom_does_not_exist("record", record.to_string()),
-			)?;
+		let global = self.root.resolve_atom(record).ok_or_else(|| {
+			if let Some(class) = self.root.schema.class(record.class()).and_then(|class| class.id())
+			{
+				(self.read)(crate::datastore::ConflictKey::BaseClassRange(class));
+			}
+			FerrosGrynnError::atom_does_not_exist("record", record.to_string())
+		})?;
+		(self.read)(crate::datastore::ConflictKey::BaseAtom(global));
+		(self.read)(crate::datastore::ConflictKey::PropertyDictionary);
+		let base = self
+			.root
+			.atom(global)
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("record", record.to_string()))?;
 		match field {
-			"id" => Ok(Value::Record(Box::new(record.clone()))),
+			"id" => {
+				self.admit(size_of::<RecordId>() + record.estimated_heap_bytes())?;
+				Ok(Value::Record(Box::new(record.clone())))
+			}
 			"label" => Ok(Value::None),
-			_ => Ok(self
-				.0
+			_ => self
+				.root
 				.dictionary
 				.get(field)
 				.and_then(|key| base.properties().get(key))
-				.cloned()
-				.unwrap_or(Value::None)),
+				.map_or(Ok(Value::None), |value| self.copy_value(value)),
 		}
 	}
 }

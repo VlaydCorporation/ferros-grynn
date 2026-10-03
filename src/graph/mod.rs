@@ -14,6 +14,8 @@
 )]
 
 pub mod algo;
+/// Qualified sparse graph analytics and convergence metadata.
+pub mod analytics;
 mod dag;
 mod forest;
 mod general;
@@ -26,13 +28,15 @@ mod path;
 mod read;
 mod storage;
 mod subgraph;
+pub mod tensor;
 mod topology;
 mod traversal;
 mod validate;
 mod view;
 mod workspace;
 
-pub(crate) use traversal::visit_endpoint_steps;
+pub(crate) use read::nested_graph_reference;
+pub(crate) use traversal::{visit_endpoint_steps, visit_incidence_targets};
 
 #[derive(Debug, Default, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[non_exhaustive]

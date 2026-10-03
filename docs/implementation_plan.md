@@ -500,39 +500,21 @@ reader watermark. При рассинхроне страница восстан�
 `Array<T> = { data: Vec<T>, validity: Bitmap }`, а `Sel = { indices: Vec<u32> }` — selection
 vector для фильтрации без копирования. Подробности — в спецификации.
 
-### 3.5. Тензорное представление — `EndpointTensor` (🔴 P5)
+### 3.5. Тензорное представление — `EndpointTensor` (этап 26)
 
 Из `gql_spec.md` §3.8. `IncidenceMatrix`/`IncidenceTensor` сохраняются как vertex-only views;
 `EndpointTensor` охватывает все атомы единого endpoint-механизма. `from_graph` логически
 помещает endpoint неориентированного ребра в обе стороны тензора, даже если storage хранит
 единый массив `source`.
 
-```rust
-/// Endpoint-тензор: atom × edge × 2 (Source/Target).
-/// Обобщение IncidenceTensor на все атомы.
-pub struct EndpointTensor {
-    pub matrix:     DMatrix<u8>,               // shape: (|A|, |E| × 2)
-    pub atom_index: FxHashMap<AtomId, usize>,  // nodes + edges
-    pub edge_index: FxHashMap<AtomId, usize>,  // только edges
-    pub index_atom: Vec<AtomId>,
-}
-
-impl EndpointTensor {
-    /// matrix[(atom_i, edge_j * 2 + side)] = 0 или 1
-    /// side: 0=Source, 1=Target
-    pub fn from_graph(g: &MetaGraph) -> Self { ... }
-    pub fn get(&self, atom_i: usize, edge_j: usize, side: usize) -> u8 { ... }
-    /// Atom adjacency: C = B[:,:,0] × B[:,:,1]^T (binary)
-    pub fn atom_adjacency_binary(&self) -> DMatrix<u8> { ... }
-    /// Weighted atom adjacency с весами рёбер
-    pub fn atom_adjacency_weighted(&self, g: &MetaGraph) -> DMatrix<f64> { ... }
-    /// Подматрица для конкретного вида инцидентности
-    pub fn submatrix_vv(&self, g: &MetaGraph) -> DMatrix<u8> { ... }
-    pub fn submatrix_ve(&self, g: &MetaGraph) -> DMatrix<u8> { ... }
-    pub fn submatrix_ev(&self, g: &MetaGraph) -> DMatrix<u8> { ... }
-    pub fn submatrix_ee(&self, g: &MetaGraph) -> DMatrix<u8> { ... }
-}
-```
+Public `graph::tensor` использует собственные immutable sparse types и borrowed views.
+Новый обязательный DMatrix/nalgebra dependency не вводится. Shape/ordinal/CSR/dense
+exports проверяют budgets до allocation. Binary и Number-weighted adjacency разделены;
+топология дополняет membership planes и обрабатывается общим incidence kernel.
+Qualified datastore axes сохраняют AtomOccurrenceRef; standalone graph без catalog
+identity использует {Uuid, AtomRef}, без синтетического GraphId. Все algorithms
+`graph::analytics` доступны через Rust SDK; GQL только адаптирует их.
+Подробный контракт и gates — [план этапа 26](gql_tensor_analytics_stage_26_plan.md).
 
 ### 3.6. Новые компоненты (сводно)
 
@@ -896,17 +878,17 @@ qualified overflow. Таблица ниже теперь относится к �
 работе в production-модулях, а не к correctness уже завершённого local store. `fg-meta` в этот
 план изменений не входит.
 
-| Компонент                         | Что исправить                                                                                                       |
-|-----------------------------------|---------------------------------------------------------------------------------------------------------------------|
-| `graph.rs::register_adjacency()`  | Путь для edge-endpoints: регистрировать в `EdgeEndpointIndex`, а не игнорировать                                    |
-| `graph.rs::EdgeFlags`             | Добавить `CROSS_LEVEL = 0b0100_0000`                                                                                |
-| `graph.rs::add_cross_meta_edge()` | Ставить `CROSS_LEVEL`; убрать `__from_inner`/`__to_inner`; использовать `source_atom_ref`/`target_atom_ref` в props |
-| `node.rs::NodeFlags`              | Убрать legacy-бит `PORT`; в disk format v1 значение `0x10` зарезервировано                                          |
-| `edge.rs`                         | Переименовать legacy endpoint-поля в `source/target`; удалить role-enum и второй edge/edge incidence path           |
-| `traversal.rs::neighbors()`       | Параметризовать: `NodeOnly` (текущий) vs `AtomWalk` (через единые endpoint'ы и `EdgeEndpointIndex`)                 |
-| `traversal.rs::TarjanCuts`        | Параметризовать тип обхода; `n.is_node()` — только в `NodeOnly`                                                     |
-| `matrix.rs`                       | Добавить `EndpointTensor` (§3.5)                                                                                    |
-| `id.rs`                           | Добавить `QualifiedAtomRef { sg_slot: u32, local_ref: DiskAtomRef }`                                                |
+| Компонент                           | Что исправить                                                                                                           |
+|-------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
+| `graph.rs::register_adjacency()`    | Путь для edge-endpoints: регистрировать в `EdgeEndpointIndex`, а не игнорировать                                        |
+| `graph.rs::EdgeFlags`               | Добавить `CROSS_LEVEL = 0b0100_0000`                                                                                    |
+| `graph.rs::add_cross_meta_edge()`   | Ставить `CROSS_LEVEL`; убрать `__from_inner`/`__to_inner`; использовать `source_atom_ref`/`target_atom_ref` в props     |
+| `node.rs::NodeFlags`                | Убрать legacy-бит `PORT`; в disk format v1 значение `0x10` зарезервировано                                              |
+| `edge.rs`                           | Переименовать legacy endpoint-поля в `source/target`; удалить role-enum и второй edge/edge incidence path               |
+| `traversal.rs::neighbors()`         | Параметризовать: `NodeOnly` (текущий) vs `AtomWalk` (через единые endpoint'ы и `EdgeEndpointIndex`)                     |
+| `traversal.rs::TarjanCuts`          | Параметризовать тип обхода; `n.is_node()` — только в `NodeOnly`                                                         |
+| `graph/tensor/`, `graph/analytics/` | EndpointTensor, все matrix views и ten analytic kernels подключены (§3.5); SDK/GQL correctness PASS, closure gates OPEN |
+| `id.rs`                             | Добавить `QualifiedAtomRef { sg_slot: u32, local_ref: DiskAtomRef }`                                                    |
 
 ### Область O. Мосты (bridges) — MVP+
 
@@ -938,7 +920,7 @@ qualified overflow. Таблица ниже теперь относится к �
 | **P4**                   | N       | `src/graph`, `src/index`                 | Derived incidence indexes и аналитические представления             |
 | **P5** (низкий)          | G       | `src/index/hnsw.rs`, `rtree.rs`          | `HnswIndex`, `RtreeIndex`                                           |
 | **P5**                   | M       | `src/changefeed/`                        | `ChangefeedStore`, `LiveQueryRegistry`                              |
-| **P5**                   | 3.5     | `matrix.rs`                              | `EndpointTensor`                                                    |
+| **P5**                   | 3.5     | `graph/tensor/`                          | `EndpointTensor`                                                    |
 | **P2–P3**                | B, L    | `store.rs`, storage adapter              | Минимальный `open_disk_graph` и disk-backed vertical slice          |
 | **MVP+**                 | O       | bridges                                  | `Bridge` trait, `SurrealBridge`                                     |
 
@@ -988,19 +970,19 @@ qualified overflow. Таблица ниже теперь относится к �
 
 Сводно из `gql_tech_spec.md` §18, `gql_spec.md` §32.3 и заметок `disk_storage_spec.md`.
 
-| Область                                                        | Решение                                                                              |
-|----------------------------------------------------------------|--------------------------------------------------------------------------------------|
-| JIT-компиляция (LLVM: expression/operator-fusion/pipeline JIT) | Не входит в контракт языка; implementation detail; после стабилизации интерпретатора |
-| Worst-Case Optimal Join (Leapfrog TrieJoin)                    | Базовый Index NL достаточен для MVP; WCOJ — для паттернов с циклами позже            |
-| Advanced disk indexes/pages сверх минимального режима 2        | После disk-backed vertical slice и полного sync-gate                                 |
-| Physical-WAL + ARIES (Undo/CLR)                                | Не требуется: frame-WAL даёт те же гарантии без UNDO/CLR                             |
-| Параллельный recovery                                          | Отложено; single-pass достаточен для MVP                                             |
-| SPDK / NVMe kernel-bypass                                      | Задел (`spdk.rs`), Linux-only, не развивается                                        |
-| SMT-верификация оптимизатора                                   | Long-term; property-based тесты — практический инструмент                            |
-| Тензорные кеши (dense/CSR на диске)                            | `TensorCachePage` — для ML/аналитики позже                                           |
-| Graph-специфические индексы (adjacency, reachability)          | Future                                                                               |
-| Path-tree cover / Chain-Cover                                  | Future (read amplification без очевидного выигрыша)                                  |
-| Distributed execution                                          | Вне scope; движок embedded-only                                                      |
+| Область                                                        | Решение                                                                                |
+|----------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| JIT-компиляция (LLVM: expression/operator-fusion/pipeline JIT) | Не входит в контракт языка; implementation detail; после стабилизации интерпретатора   |
+| Worst-Case Optimal Join (Leapfrog TrieJoin)                    | Базовый Index NL достаточен для MVP; WCOJ — для паттернов с циклами позже              |
+| Advanced disk indexes/pages сверх минимального режима 2        | После disk-backed vertical slice и полного sync-gate                                   |
+| Physical-WAL + ARIES (Undo/CLR)                                | Не требуется: frame-WAL даёт те же гарантии без UNDO/CLR                               |
+| Параллельный recovery                                          | Отложено; single-pass достаточен для MVP                                               |
+| SPDK / NVMe kernel-bypass                                      | Задел (`spdk.rs`), Linux-only, не развивается                                          |
+| SMT-верификация оптимизатора                                   | Long-term; property-based тесты — практический инструмент                              |
+| Тензорные кеши (dense/CSR на диске)                            | Этап 26: codecs/publication/SDK/GQL и focused lifecycle PASS; общие closure gates OPEN |
+| Graph-специфические индексы (adjacency, reachability)          | Future                                                                                 |
+| Path-tree cover / Chain-Cover                                  | Future (read amplification без очевидного выигрыша)                                    |
+| Distributed execution                                          | Вне scope; движок embedded-only                                                        |
 
 ---
 

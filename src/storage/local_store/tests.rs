@@ -609,8 +609,21 @@ fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
 		NeighbourhoodAlgorithm,
 		PathIndexAlgorithm,
 		ReachabilityAlgorithm,
+		TensorCacheFormat,
 	};
 	for definition in [
+		GraphIndexDefinition::Tensor {
+			scope: crate::graph::tensor::TensorScope::Local,
+			format: TensorCacheFormat::Csr,
+		},
+		GraphIndexDefinition::Tensor {
+			scope: crate::graph::tensor::TensorScope::Rooted,
+			format: TensorCacheFormat::Dense,
+		},
+		GraphIndexDefinition::Tensor {
+			scope: crate::graph::tensor::TensorScope::Local,
+			format: TensorCacheFormat::Auto,
+		},
 		GraphIndexDefinition::Path {
 			algorithm: PathIndexAlgorithm::LandmarkSssp(2),
 			cost: GraphIndexCost::Hop,
@@ -687,6 +700,7 @@ fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
 			assert!(!store.inner.current_root().reachability_artifacts.contains_key(&id));
 			assert!(!store.inner.current_root().neighbourhood_artifacts.contains_key(&id));
 			assert!(!store.inner.current_root().path_artifacts.contains_key(&id));
+			assert!(!store.inner.current_root().tensor_artifacts.contains_key(&id));
 			assert_eq!(generation_directories(&directory.0), generation_count);
 		}
 		assert!(store.execute(rebuild, &Object::new()).unwrap()[0].result.is_ok());
@@ -733,6 +747,7 @@ fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
 			reopened.inner.current_root().reachability_artifacts.contains_key(&id)
 				|| reopened.inner.current_root().neighbourhood_artifacts.contains_key(&id)
 				|| reopened.inner.current_root().path_artifacts.contains_key(&id)
+				|| reopened.inner.current_root().tensor_artifacts.contains_key(&id)
 		);
 		drop(reopened);
 		corrupt_page_checksum(&directory.0.join(&before.1));
@@ -744,6 +759,7 @@ fn derived_graph_artifact_publication_failures_reuse_and_corrupt_reopen() {
 		assert!(!reopened.inner.current_root().reachability_artifacts.contains_key(&id));
 		assert!(!reopened.inner.current_root().neighbourhood_artifacts.contains_key(&id));
 		assert!(!reopened.inner.current_root().path_artifacts.contains_key(&id));
+		assert!(!reopened.inner.current_root().tensor_artifacts.contains_key(&id));
 		assert!(reopened.begin().atom(&records[0]).unwrap().is_some());
 	}
 }

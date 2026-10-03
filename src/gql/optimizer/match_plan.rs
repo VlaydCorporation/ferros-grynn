@@ -123,8 +123,11 @@ fn select_landmark_path(
 		}
 	};
 	let cost = match expand.objective? {
-		crate::syn::MatchPathObjective::Shortest => crate::datastore::GraphIndexCost::Hop,
-		crate::syn::MatchPathObjective::WeightedShortest => {
+		crate::syn::MatchPathObjective::Shortest | crate::syn::MatchPathObjective::AllShortest => {
+			crate::datastore::GraphIndexCost::Hop
+		}
+		crate::syn::MatchPathObjective::WeightedShortest
+		| crate::syn::MatchPathObjective::AllWeightedShortest => {
 			if let Some(cost) = expand.custom_cost {
 				if cost.stateful {
 					return None;
@@ -216,12 +219,71 @@ fn match_nodes(
 						);
 					}
 					let landmark = match operation {
-						MatchOp::PathExpand(expand) if !scoped && expand.objective.is_some() => {
+						MatchOp::PathExpand(expand)
+							if !scoped
+								&& expand
+									.objective
+									.is_some_and(|objective| !objective.is_all()) =>
+						{
 							select_landmark_path(graph, statement.atom, expand)
 						}
 						_ => None,
 					};
-					let operator = if let (MatchOp::PathExpand(expand), Some(binding)) =
+					let operator = if let MatchOp::PathExpand(expand) = operation
+						&& expand.objective.is_some_and(crate::syn::MatchPathObjective::is_all)
+					{
+						let scope = if scoped {
+							crate::graph::tensor::TensorScope::Rooted
+						} else {
+							crate::graph::tensor::TensorScope::Local
+						};
+						use std::hash::{Hash, Hasher};
+						let mut parameters = super::CanonicalHasher::versioned(
+							super::PLAN_ENCODING_VERSION,
+							b"tensor-match-constraints",
+						);
+						expand.filters.hash(&mut parameters);
+						for binding in [&expand.source, &expand.edge, &expand.target] {
+							super::fingerprint::hash_match_binding(binding, &mut parameters);
+						}
+						MatchOperator::TensorAllShortest {
+							projection: super::TensorProjectionPlan {
+								mode: if statement.atom {
+									crate::graph::TraversalSemantics::Atom
+								} else {
+									crate::graph::TraversalSemantics::Node
+								},
+								scope: Some(scope),
+								direction: Some(match direction {
+									crate::syn::MatchDirection::Forward => {
+										crate::graph::TraversalDirection::Forward
+									}
+									crate::syn::MatchDirection::Backward => {
+										crate::graph::TraversalDirection::Backward
+									}
+									_ => crate::graph::TraversalDirection::Both,
+								}),
+								weights: Some(crate::graph::tensor::WeightSelection::Unweighted),
+								labels: Some(expand.edge.label.iter().cloned().collect()),
+								parameters_hash: parameters.finish(),
+								dynamic_binding: false,
+								binding: graph
+									.tensor_caches
+									.iter()
+									.filter(|binding| binding.scope == scope)
+									.min_by_key(|binding| (binding.bytes, binding.index))
+									.cloned(),
+							},
+							direction,
+							mode: expand.mode,
+							min: expand.min,
+							max: expand.max,
+							weighted: expand
+								.objective
+								.is_some_and(crate::syn::MatchPathObjective::is_weighted),
+							cost,
+						}
+					} else if let (MatchOp::PathExpand(expand), Some(binding)) =
 						(operation, landmark)
 					{
 						MatchOperator::LandmarkShortest {
@@ -252,23 +314,25 @@ fn match_nodes(
 								cost,
 							},
 							MatchOp::PathExpand(expand) => match expand.objective {
-								Some(crate::syn::MatchPathObjective::Shortest) => {
-									MatchOperator::BreadthFirstShortest {
-										direction,
-										mode: expand.mode,
-										min: expand.min,
-										max: expand.max,
-									}
-								}
-								Some(crate::syn::MatchPathObjective::WeightedShortest) => {
-									MatchOperator::DijkstraShortest {
-										direction,
-										mode: expand.mode,
-										min: expand.min,
-										max: expand.max,
-										cost,
-									}
-								}
+								Some(
+									crate::syn::MatchPathObjective::Shortest
+									| crate::syn::MatchPathObjective::AllShortest,
+								) => MatchOperator::BreadthFirstShortest {
+									direction,
+									mode: expand.mode,
+									min: expand.min,
+									max: expand.max,
+								},
+								Some(
+									crate::syn::MatchPathObjective::WeightedShortest
+									| crate::syn::MatchPathObjective::AllWeightedShortest,
+								) => MatchOperator::DijkstraShortest {
+									direction,
+									mode: expand.mode,
+									min: expand.min,
+									max: expand.max,
+									cost,
+								},
 								None => MatchOperator::PathEnumerate {
 									direction,
 									mode: expand.mode,

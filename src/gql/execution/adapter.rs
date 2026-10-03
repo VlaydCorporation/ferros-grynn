@@ -299,8 +299,50 @@ impl QueryRead for TransactionRead<'_> {
 		Self: 'a;
 	type Savepoint = crate::datastore::TransactionSavepoint;
 
+	fn endpoint_tensor(
+		&self,
+		_snapshot: Snapshot,
+		graph: &GraphRef,
+		options: crate::graph::tensor::TensorOptions,
+		check: &mut dyn FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<crate::graph::tensor::EndpointTensor> {
+		self.transaction.endpoint_tensor_at(&self.snapshot, graph, options, &mut || check())
+	}
+
+	fn endpoint_tensor_selected(
+		&self,
+		_snapshot: Snapshot,
+		graph: &GraphRef,
+		options: crate::graph::tensor::TensorOptions,
+		selected: Option<&crate::datastore::QueryTensorCache>,
+		check: &mut dyn FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<(
+		crate::graph::tensor::EndpointTensor,
+		Option<crate::datastore::QueryTensorCache>,
+	)> {
+		self.transaction.endpoint_tensor_selected_at(
+			&self.snapshot,
+			graph,
+			options,
+			selected,
+			&mut || check(),
+		)
+	}
+
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot> {
 		Ok(Snapshot(self.snapshot.commit_ts()))
+	}
+
+	fn tensor_cost_evaluator(
+		&self,
+		_snapshot: Snapshot,
+		bytes: usize,
+	) -> FerrosGrynnResult<crate::gql::PureFunctionEvaluator<'_>> {
+		self.transaction.tensor_cost_evaluator_at(&self.snapshot, bytes)
+	}
+
+	fn observe_tensor_cost(&self, key: crate::datastore::ConflictKey) {
+		self.transaction.observe_tensor_cost(key);
 	}
 
 	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<Snapshot> {
@@ -474,6 +516,11 @@ impl QueryRead for TransactionRead<'_> {
 				},
 				landmark_paths: if demand.landmark_paths {
 					self.transaction.query_landmark_paths(&self.snapshot, graph.reference())?
+				} else {
+					Vec::new()
+				},
+				tensor_caches: if demand.tensor_caches {
+					self.transaction.query_tensor_caches(&self.snapshot, graph.reference())?
 				} else {
 					Vec::new()
 				},

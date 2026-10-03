@@ -46,6 +46,7 @@ pub use graph_index::{
 	NeighbourhoodAlgorithm,
 	PathIndexAlgorithm,
 	ReachabilityAlgorithm,
+	TensorCacheFormat,
 };
 pub(crate) use index::ClassIndexOptions;
 pub use index::{

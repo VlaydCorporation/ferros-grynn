@@ -1317,6 +1317,91 @@ mod tests {
 	}
 
 	#[test]
+	fn tensor_maintenance_rejects_rooted_revision_races_and_cancellation() -> FerrosGrynnResult<()>
+	{
+		use crate::{
+			datastore::{ClassSchema, GraphIndex, TensorCacheFormat},
+			graph::{AtomKind, GraphKind, tensor::TensorScope},
+			values::{PropertyMap, RecordId},
+		};
+		let store = Datastore::in_memory();
+		let mut seed = store.begin();
+		seed.define_class(ClassSchema::new("n", AtomKind::Node, [])?)?;
+		let child = seed.define_graph("child", GraphKind::Graph)?;
+		let parent = seed.define_graph("parent", GraphKind::Graph)?;
+		let owner: RecordId = "n:owner".parse()?;
+		seed.create_atom(owner.clone(), PropertyMap::new())?;
+		seed.attach_node(parent.id(), &owner, None, Some(child.id()))?;
+		let index = seed.define_graph_index(
+			"parent",
+			GraphIndex::new_tensor(
+				"tensor",
+				TensorScope::Rooted,
+				TensorCacheFormat::Auto,
+				1 << 20,
+			)?,
+		)?;
+		seed.commit()?;
+		let target = MaintenanceTarget::GraphIndex {
+			graph: parent.id(),
+			index,
+			version: SchemaVersion::INITIAL,
+		};
+		let register = || -> FerrosGrynnResult<JobId> {
+			let job = MaintenanceJobInfo::new(
+				MaintenanceJobKind::RebuildIndex,
+				target,
+				store.inner.current_root().commit_ts,
+				MaintenanceOptions::default(),
+				None,
+			);
+			let id = job.id;
+			{
+				let mut state = store.inner.maintenance.shared.state.lock();
+				state.cancellation_tokens.insert(id, Arc::new(AtomicBool::new(false)));
+				state.jobs.insert(id, job);
+			}
+			begin_job(store.inner.maintenance.shared.as_ref(), store.inner.as_ref(), id)?;
+			Ok(id)
+		};
+		let race = register()?;
+		let outcome = store.inner.run_maintenance_job_interleaved(race, || {
+			let mut write = store.begin();
+			let record: RecordId = "n:child".parse()?;
+			write.create_atom(record.clone(), PropertyMap::new())?;
+			write.attach_node(child.id(), &record, None, None)?;
+			write.commit()?;
+			Ok(())
+		})?;
+		assert!(matches!(outcome, MaintenanceRunOutcome::Retry));
+		assert!(!store.inner.current_root().tensor_artifacts.contains_key(&index));
+		finish_job(
+			store.inner.maintenance.shared.as_ref(),
+			store.inner.as_ref(),
+			race,
+			Ok(MaintenanceRunOutcome::Cancelled),
+		);
+		let cancelled = register()?;
+		let revision = store.inner.current_root().commit_ts;
+		let outcome = store.inner.run_maintenance_job_interleaved(cancelled, || {
+			store.kill_job(cancelled)?;
+			Ok(())
+		})?;
+		assert!(matches!(outcome, MaintenanceRunOutcome::Cancelled));
+		assert_eq!(store.inner.current_root().commit_ts, revision);
+		assert!(!store.inner.current_root().tensor_artifacts.contains_key(&index));
+		finish_job(
+			store.inner.maintenance.shared.as_ref(),
+			store.inner.as_ref(),
+			cancelled,
+			Ok(MaintenanceRunOutcome::Cancelled),
+		);
+		store.rebuild_graph_index(parent.id(), index, MaintenanceOptions::default())?;
+		assert!(store.inner.current_root().tensor_artifacts.contains_key(&index));
+		Ok(())
+	}
+
+	#[test]
 	fn recovery_cancels_orphans_and_requires_exact_index_build_revision() -> FerrosGrynnResult<()> {
 		let store = Datastore::in_memory();
 		let results = store.execute(

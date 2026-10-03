@@ -1698,7 +1698,7 @@ Total = PAGE_SIZE байт
   `presence=0` означает `none`; `presence=1 && validity=0` — `null`;
   `presence=1 && validity=1` — значение. Одна validity bitmap недостаточна, потому что она не
   различает `none` и `null`.
-- Инвалидация — как у `TensorCachePage`: `build_lsn < текущий checkpoint_lsn` при любой мутации соответствующего поля делает кэш устаревшим. Устаревший кэш не используется молча: планировщик либо перестраивает его, либо идёт по обычному пути.
+- Инвалидация — как у `TensorCachePage`: mutation captured dependency атомарно делает generation Stale; dependency revision vector определяет актуальность, а checkpoint LSN не является её критерием. Устаревший кэш не используется молча: планировщик либо перестраивает его, либо идёт по обычному пути.
 - Раскладка `decimal` (§3.3) выбрана так, что колонка `decimal` побайтово совместима с Arrow `Decimal128Array`.
 
 #### Продвинутая аналитика — через Arrow, а не своим кодом
@@ -3291,22 +3291,22 @@ record payload, первый равен 0, последний — payload length
 
 Единое пространство `section_kind`:
 
-|      Код | Секция                 |      Код | Секция                 |
-|---------:|------------------------|---------:|------------------------|
-| `0x0001` | NodeComponentMap       | `0x0010` | PatternDescriptor      |
-| `0x0002` | EdgeComponentMap       | `0x0011` | PatternCanonicalIr     |
-| `0x0003` | SccRepresentativeMap   | `0x0012` | PatternBindingSchema   |
-| `0x0004` | CondensationCsrOffsets | `0x0013` | PatternDependencies    |
-| `0x0005` | CondensationCsrTargets | `0x0014` | PatternBindingRows     |
-| `0x0006` | PathVertexMap          | `0x0100` | TreeCoverIntervals     |
-| `0x0007` | LandmarkRefs           | `0x0101` | GrailIntervals         |
-| `0x0008` | LandmarkDistanceFrom   | `0x0102` | FerrariIntervals       |
-| `0x0009` | LandmarkDistanceTo     | `0x0103` | BflBitsets             |
-| `0x000A` | DefinitionDescriptor   | `0x0106` | PostorderRanks         |
-|          |                        | `0x0104` | ChainCoordinates       |
-|          |                        | `0x0105` | ChainReachabilityCells |
-| `0x0200` | NeighbourhoodCenters   | `0x0201` | NeighbourhoodOffsets   |
-| `0x0202` | NeighbourhoodMembers   | `0x0203` | NeighbourhoodRegisters |
+|      Код | Секция                       |      Код | Секция                 |
+|---------:|------------------------------|---------:|------------------------|
+| `0x0001` | NodeComponentMap             | `0x0010` | PatternDescriptor      |
+| `0x0002` | EdgeComponentMap             | `0x0011` | PatternCanonicalIr     |
+| `0x0003` | SccRepresentativeMap         | `0x0012` | PatternBindingSchema   |
+| `0x0004` | CondensationCsrOffsets       | `0x0013` | PatternDependencies    |
+| `0x0005` | CondensationCsrTargets       | `0x0014` | PatternBindingRows     |
+| `0x0006` | PathVertexMap                | `0x0100` | TreeCoverIntervals     |
+| `0x0007` | LandmarkRefs                 | `0x0101` | GrailIntervals         |
+| `0x0008` | LandmarkDistanceFrom         | `0x0102` | FerrariIntervals       |
+| `0x0009` | LandmarkDistanceTo           | `0x0103` | BflBitsets             |
+| `0x000A` | DefinitionDescriptor         | `0x0106` | PostorderRanks         |
+|          |                              | `0x0104` | ChainCoordinates       |
+|          |                              | `0x0105` | ChainReachabilityCells |
+| `0x0200` | NeighbourhoodCenters         | `0x0201` | NeighbourhoodOffsets   |
+| `0x0202` | NeighbourhoodMembers         | `0x0203` | NeighbourhoodRegisters |
 | `0x0204` | NeighbourhoodLandmarkMembers | `0x0205` | NeighbourhoodVertexMap |
 
 `0x003E` принимает `0x0001..=0x000A`, `0x0106`, `0x0200/0x0201/0x0205`; `0x003F` — `0x0010..=0x0014`; specialized page types
@@ -4371,26 +4371,67 @@ fn hot_offset(slot: u64)  -> usize { (32 + (slot % SLOTS_PER_HOT_PAGE) * HOT_SLO
 
 ### 26.2. TensorCachePage (для cached-режима)
 
-```
-PageHeader(32) (magic=MAGIC_TENSOR, type=TensorCache)
-  tensor_kind:  u8    -- 0=endpoint_source, 1=endpoint_target
-  format:       u8    -- 0=dense_u8, 1=csr_u8
-  n_atoms:      u32   -- число строк (atoms)
-  n_edges:      u32   -- число столбцов (edges)
-  data_pages:   u64   -- первая страница данных
-  build_lsn:    u64   -- LSN момента кэширования
-```
+Полная ATOM incidence публикуется одним graph-owned файлом `DataFileKind::TensorCache`
+(`0x0d`). Page zero имеет `PageType::TensorCache` (`0x0037`); availability остаётся в catalog.
+Все integers little-endian, checksum/common PageHeader проверяется первым.
 
-- Dense-формат: packed bit-matrix, 1 бит на ячейку.
-- Страница данных: PageHeader(32) + 16352 байт битовой матрицы = 16352 × 8 = 130816 бит на страницу.
+| Offset               |  Bytes | Поле                                                               |
+|----------------------|-------:|--------------------------------------------------------------------|
+| 0                    |     32 | common PageHeader                                                  |
+| 32 / 36              |  4 / 4 | IndexId / definition version                                       |
+| 40 / 48 / 56         | 8 each | GraphId / build publication revision / full-descriptor fingerprint |
+| 64 / 72              | 8 each | atom rows / connector columns; side axis = 2                       |
+| 80 / 88              | 8 each | source / target distinct nonzeros                                  |
+| 96 / 104 / 112 / 120 | 8 each | metadata bytes / descriptor bytes / MAX_BYTES / exact page count   |
+| 128 / 129            | 1 each | concrete format: 1=CSR, 2=DENSE / scope: 0=LOCAL, 1=ROOTED         |
+| 130                  |      6 | reserved zero                                                      |
+| 136                  |     64 | eight consecutive section roots, NULL for empty sections           |
+| 200                  |   rest | reserved zero                                                      |
 
-Например, для n_atoms=10000, n_edges=50000: matrix size = 10000 × 50000 / 8 = 62.5 МБ ≈ 3823 страниц.
-Только для специализированных ML-сценариев.
+Sections используют общий `IndexDerivedArray` codec (§25): `TensorMetadata=0x0300` (width=1),
+`DefinitionDescriptor=0x000a` (1), source offsets/ordinals `0x0301/0x0302` (8),
+target offsets/ordinals `0x0303/0x0304` (8), source/target bits `0x0305/0x0306` (1).
+Sections упакованы consecutively после page zero; roots и полный file extent каноничны.
+CSR offsets имеют `rows+1` элементов, первый 0, последний nnz; columns в каждой строке sorted distinct
+и меньше connector count. В DENSE CSR sections пусты; две planes имеют `ceil(rows*columns/8)` bytes,
+row-major LSB-first; unused tail bits равны zero, popcount равен declared nnz. Payload каждой
+array page начинается с offset 64. AUTO выбирает меньший **полный** file extent среди форматов,
+допущенных artifact и encoding work budgets; при равенстве CSR. Reopen проверяет записанный
+concrete format, не повторяет AUTO selection по текущим лимитам; полный AUTO descriptor сохраняется.
+
+Metadata: `FGTCMETA` (8 bytes), затем пять u64: primary binding ordinal, atom count,
+connector count, dependency count, containment count. Dependency vector содержит пары
+`{GraphId:u64, incidence_revision:u64}` в canonical binding order. Каждый atom dictionary entry:
+`{GraphId:u64, GlobalAtomId:u64, is_node:u8, induced_domain:u8, reserved[6]=0}`.
+Connector metadata: qualified identity (16), direction plus zero padding (8; 0=directed,
+1=bidirectional, 2=undirected), label length:u32 + present:u8 + reserved[3] + UTF-8 bytes,
+Number weight (24: tag:u8 + reserved[7], payload[16]; 0=i64, 1=f64 raw bits, 2=Decimal.serialize).
+Integer/float payload tail[8] равен zero. Для original Source, затем Target: count:u64,
+для каждого endpoint `{row:u64, owner_count:u64}` и ordered qualified owner identities (16 each).
+Repetitions/owner routes сохраняются независимо от binary plane. Containment entries:
+qualified owner (16) + child GraphId:u64. Public identities восстанавливаются по captured logical root;
+полные metadata bytes проверяются вместе с definition bytes, hash alone не является доказательством.
+
+Definition descriptor family tag=3; algorithm=0/AUTO, 1/CSR, 2/DENSE; parameter=0/LOCAL, 1/ROOTED,
+radius=0, cost=HOP, labels/patterns/function dependencies empty, mode=ATOM, direction=BOTH.
+MAX_BYTES обязателен. Development `FGDC v10` graph entry после user index definitions/bindings
+дополняется `incidence_revision:u64 <= generation`. Commit membership/incidence writes обновляет
+эту revision; ordinary property updates и unrelated COW/checkpoint не меняют её. Compatibility decoder нет.
 
 ### 26.3. Инвалидация кэша
 
-TensorCachePage инвалидируется при любом изменении топологии (NodeAlloc, EdgeAlloc, NodeFree, EdgeFree WAL entries).
-Признак инвалидации: `build_lsn < current_checkpoint_lsn`.
+Cache definition имеет IndexId/version/state и полный canonical descriptor; header
+страницы zero содержит shape, section roots, axis dictionaries и dependency revision
+vector. Source/Target planes дополняются original topology metadata. Dense — две
+row-major LSB-first planes; CSR — checked offsets/sorted distinct connector ordinals.
+Offsets/section tags и golden vectors заданы §26.2; старого decoder нет.
+
+Membership/topology/containment/relevant labels и captured weights/properties
+атомарно делают cache Stale. Build повторно проверяет definition/dependencies под
+commit lock, затем публикует через общий WAL/COW. Private mutations исключают старый
+cache, old snapshots удерживают прежнюю generation. Checkpoint LSN не является
+критерием актуальности. MAX_BYTES учитывает pages/dictionaries/metadata; scratch
+отдельно ограничен. План: [этап 26](gql_tensor_analytics_stage_26_plan.md).
 
 ---
 

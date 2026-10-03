@@ -80,36 +80,47 @@ fn eval_current(
 	if let Some(control) = control {
 		control.check()?;
 	}
+	if let Some(fields) = fields {
+		fields.work(1)?;
+	}
 	let result = match &expr.kind {
-		TypedExprKind::Constant(value) => Ok(value.clone()),
+		TypedExprKind::Constant(value) => copy_evaluation_value(value, fields),
 		TypedExprKind::Slot(slot) => slots
 			.values()
 			.get(*slot as usize)
-			.cloned()
-			.ok_or_else(|| FerrosGrynnError::invalid_argument("Expression slot is invalid.")),
-		TypedExprKind::Column(column) => {
-			row.and_then(|row| row.value(*column)).cloned().ok_or_else(|| {
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("Expression slot is invalid."))
+			.and_then(|value| copy_evaluation_value(value, fields)),
+		TypedExprKind::Column(column) => row
+			.and_then(|row| row.value(*column))
+			.ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("Column is missing from the input row.")
 			})
+			.and_then(|value| copy_evaluation_value(value, fields)),
+		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
+			admit_evaluation_values(std::iter::empty(), values.len(), fields)?;
+			let values = values
+				.iter()
+				.map(|value| eval_current(value, row, slots, source, fields, current, control));
+			if matches!(expr.kind, TypedExprKind::Array(_)) {
+				values.collect::<FerrosGrynnResult<Array>>().map(Value::Array)
+			} else {
+				values.collect::<FerrosGrynnResult<crate::values::Set>>().map(Value::Set)
+			}
 		}
-		TypedExprKind::Array(values) => values
-			.iter()
-			.map(|value| eval_current(value, row, slots, source, fields, current, control))
-			.collect::<FerrosGrynnResult<Array>>()
-			.map(Value::Array),
-		TypedExprKind::Set(values) => values
-			.iter()
-			.map(|value| eval_current(value, row, slots, source, fields, current, control))
-			.collect::<FerrosGrynnResult<crate::values::Set>>()
-			.map(Value::Set),
-		TypedExprKind::Object(object_fields) => object_fields
-			.iter()
-			.map(|(name, value)| {
-				eval_current(value, row, slots, source, fields, current, control)
-					.map(|value| (name.as_ref(), value))
-			})
-			.collect::<FerrosGrynnResult<Object>>()
-			.map(Value::Object),
+		TypedExprKind::Object(object_fields) => {
+			admit_evaluation_values(std::iter::empty(), object_fields.len(), fields)?;
+			object_fields
+				.iter()
+				.map(|(name, value)| {
+					if let Some(fields) = fields {
+						fields.admit(name.len())?;
+					}
+					eval_current(value, row, slots, source, fields, current, control)
+						.map(|value| (name.as_ref(), value))
+				})
+				.collect::<FerrosGrynnResult<Object>>()
+				.map(Value::Object)
+		}
 		TypedExprKind::Range {
 			start,
 			end,
@@ -148,11 +159,20 @@ fn eval_current(
 				BinaryOperator::Or if left.is_truthy() => Ok(Value::Bool(true)),
 				BinaryOperator::Coalesce if !matches!(left, Value::None | Value::Null) => Ok(left),
 				BinaryOperator::Elvis if left.is_truthy() => Ok(left),
-				_ => binary(
-					*op,
-					left,
-					eval_current(right, row, slots, source, fields, current, control)?,
-				),
+				_ => {
+					let right = eval_current(right, row, slots, source, fields, current, control)?;
+					if let Some(fields) = fields.filter(|fields| fields.bounded()) {
+						fields.admit_value(&left)?;
+						fields.admit_value(&right)?;
+						let left = left.estimated_heap_bytes().saturating_add(1);
+						let right = right.estimated_heap_bytes().saturating_add(1);
+						let work = left.checked_mul(right).ok_or_else(|| {
+							FerrosGrynnError::operation_overflow("PURE comparison work")
+						})?;
+						fields.work(work as u64)?;
+					}
+					binary(*op, left, right)
+				}
 			}
 		}
 		TypedExprKind::Conditional {
@@ -211,7 +231,9 @@ fn eval_current(
 			}
 			let base = eval_current(base, row, slots, source, fields, current, control)?;
 			match base {
-				Value::Object(object) => Ok(object.get(field).cloned().unwrap_or(Value::None)),
+				Value::Object(object) => object
+					.get(field)
+					.map_or(Ok(Value::None), |value| copy_evaluation_value(value, fields)),
 				Value::Error(error) => Ok(error_field(&error, field)),
 				Value::Matcher(matcher) => matcher_field(&matcher, field),
 				Value::AtomOccurrence(occurrence) if fields.is_some() => fields
@@ -233,7 +255,12 @@ fn eval_current(
 				))),
 			}
 		}
-		TypedExprKind::CurrentField(field) => current_field(current, field),
+		TypedExprKind::CurrentField(field) => {
+			if let Some(current) = current {
+				admit_evaluation_values(std::iter::once(current), 0, fields)?;
+			}
+			current_field(current, field)
+		}
 		TypedExprKind::Destructure {
 			base,
 			fields: names,
@@ -247,6 +274,7 @@ fn eval_current(
 					source,
 				));
 			};
+			admit_evaluation_values(base.values(), names.len(), fields)?;
 			Ok(Value::Object(
 				names
 					.iter()
@@ -257,10 +285,12 @@ fn eval_current(
 		TypedExprKind::Index {
 			base,
 			index,
-		} => index_value(
-			eval_current(base, row, slots, source, fields, current, control)?,
-			eval_current(index, row, slots, source, fields, current, control)?,
-		),
+		} => {
+			let base = eval_current(base, row, slots, source, fields, current, control)?;
+			let index = eval_current(index, row, slots, source, fields, current, control)?;
+			admit_evaluation_values(std::iter::once(&base), 0, fields)?;
+			index_value(base, index)
+		}
 		TypedExprKind::Filter {
 			base,
 			predicate,
@@ -274,6 +304,7 @@ fn eval_current(
 					source,
 				));
 			};
+			admit_evaluation_values(values.iter(), values.len(), fields)?;
 			let mut filtered = Array::new(Vec::new());
 			for value in values {
 				if eval_current(predicate, row, slots, source, fields, Some(&value), control)?
@@ -302,6 +333,7 @@ fn eval_current(
 					eval_current(argument, row, slots, source, fields, current, control)
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			admit_evaluation_values(arguments.iter(), arguments.len(), fields)?;
 			mutate_collection(function, arguments, slots)
 		}
 		TypedExprKind::Builtin {
@@ -393,20 +425,61 @@ fn eval_current(
 			else {
 				unreachable!("search analyzer dispatch was guarded above")
 			};
+			if let Some(fields) = fields {
+				if let Some(id) = analyzer.id() {
+					fields.observe(crate::datastore::ConflictKey::SchemaAnalyzer(id));
+				}
+				fields.admit(input.len())?;
+			}
 			let tokens = if let Some(function) = function {
 				let plan = control.resolve_named_function(*function)?;
 				let _frame = control.enter_named_function(*function)?;
-				let result = invoke_logical_closure(
+				let result = invoke_logical_closure_with_fields(
 					control,
 					&plan,
 					&[],
 					&[Value::String(input.clone())],
 					source,
+					fields,
 				)?;
-				crate::datastore::analyze_function_result(analyzer, input.as_str(), &result)?
+				admit_evaluation_values(std::iter::once(&result), 0, fields)?;
+				if let Some(fields) = fields.filter(|fields| fields.bounded()) {
+					fields.admit(result.estimated_heap_bytes().checked_mul(4).ok_or_else(
+						|| FerrosGrynnError::operation_overflow("PURE analyzer token copies"),
+					)?)?;
+				}
+				crate::datastore::analyze_function_result_bounded(
+					analyzer,
+					input.as_str(),
+					&result,
+					&|bytes, work| {
+						if let Some(fields) = fields {
+							fields.admit(bytes)?;
+							fields.work(work)?;
+						}
+						Ok(())
+					},
+				)?
 			} else {
-				crate::datastore::analyze_builtin(analyzer, input.as_str())?
+				if let Some(fields) = fields.filter(|fields| fields.bounded()) {
+					fields.work(input.len() as u64)?;
+					fields.admit(input.len().checked_mul(256).ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("PURE analyzer scratch")
+					})?)?;
+				}
+				crate::datastore::analyze_builtin_bounded(
+					analyzer,
+					input.as_str(),
+					&|bytes, work| {
+						if let Some(fields) = fields {
+							fields.admit(bytes)?;
+							fields.work(work)?;
+						}
+						Ok(())
+					},
+				)?
 			};
+			admit_evaluation_values(std::iter::empty(), tokens.len(), fields)?;
 			Ok(Value::Array(crate::values::Array::from_iter(
 				tokens.into_iter().map(|token| Value::String(token.term)),
 			)))
@@ -474,7 +547,9 @@ fn eval_current(
 			.map(|argument| eval_current(argument, row, slots, source, fields, current, control))
 			.collect::<FerrosGrynnResult<Vec<_>>>()
 			.and_then(|arguments| {
-				crate::gql::execution::builtins::execute(function, arguments, control)
+				crate::gql::execution::builtins::execute_with_fields(
+					function, arguments, control, fields,
+				)
 			}),
 		TypedExprKind::Closure(closure) => control
 			.ok_or_else(|| {
@@ -569,6 +644,33 @@ fn eval_current(
 		} => cast(eval_current(expr, row, slots, source, fields, current, control)?, target),
 	};
 	result.map_err(|error| locate_execution(error, expr, source))
+}
+
+/// Admits deep clones before allocating any owned evaluation value.
+fn copy_evaluation_value(
+	value: &Value,
+	fields: Option<&dyn AtomFieldRead>,
+) -> FerrosGrynnResult<Value> {
+	fields.map_or_else(|| Ok(value.clone()), |fields| fields.copy_value(value))
+}
+
+/// Conservatively accounts payload copies and collection-node growth.
+fn admit_evaluation_values<'a>(
+	values: impl Iterator<Item = &'a Value>,
+	shells: usize,
+	fields: Option<&dyn AtomFieldRead>,
+) -> FerrosGrynnResult<()> {
+	if let Some(fields) = fields.filter(|fields| fields.bounded()) {
+		fields.admit(
+			shells
+				.checked_mul(128)
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("PURE value scratch"))?,
+		)?;
+		for value in values {
+			fields.admit_value(value)?;
+		}
+	}
+	Ok(())
 }
 
 fn render_highlight(
@@ -667,6 +769,8 @@ pub(in crate::gql) fn invoke_root_logical_closure(
 	plan: &LogicalClosure,
 	arguments: &[Value],
 	source: &str,
+	read: &dyn Fn(crate::datastore::ConflictKey),
+	work: &dyn Fn(u64) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Value> {
 	invoke_logical_closure_with_fields(
 		control,
@@ -674,7 +778,7 @@ pub(in crate::gql) fn invoke_root_logical_closure(
 		&[],
 		arguments,
 		source,
-		Some(&RootFields(root)),
+		Some(&RootFields::new(root, control, read, work)),
 	)
 }
 
@@ -804,6 +908,9 @@ fn execute_pure_statement(
 			u64::from(control.max_control_depth),
 		));
 	}
+	if let Some(fields) = fields {
+		fields.work(1)?;
+	}
 	let value = match statement {
 		LogicalStatement::Let {
 			slot,
@@ -862,6 +969,9 @@ fn execute_pure_statement(
 			let mut last = Value::None;
 			for value in values {
 				control.check()?;
+				if let Some(fields) = fields {
+					fields.work(1)?;
+				}
 				super::record_iteration(runtime, control)?;
 				slots[*slot as usize] = value;
 				match execute_pure_block(body, slots, source, control, runtime, depth + 1, fields)?
@@ -881,6 +991,9 @@ fn execute_pure_statement(
 			let mut last = Value::None;
 			while eval_mut(condition, None, slots, source, fields, Some(control))?.is_truthy() {
 				control.check()?;
+				if let Some(fields) = fields {
+					fields.work(1)?;
+				}
 				super::record_iteration(runtime, control)?;
 				match execute_pure_block(body, slots, source, control, runtime, depth + 1, fields)?
 				{
@@ -898,10 +1011,12 @@ fn execute_pure_statement(
 			body,
 			catch,
 		} => {
+			admit_evaluation_values(slots.iter(), slots.len(), fields)?;
 			let saved_slots = slots.to_vec();
 			match execute_pure_block(body, slots, source, control, runtime, depth + 1, fields) {
 				Ok(flow) => return Ok(flow),
 				Err(error) if catch.as_ref().is_some_and(|_| super::catchable(&error)) => {
+					admit_evaluation_values(saved_slots.iter(), saved_slots.len(), fields)?;
 					slots.clone_from_slice(&saved_slots);
 					let (slot, handler) = catch.as_ref().ok_or_else(|| {
 						FerrosGrynnError::invalid_argument("CATCH handler is missing.")

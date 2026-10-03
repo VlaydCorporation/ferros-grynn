@@ -435,13 +435,25 @@ impl Parser<'_> {
 		Ok(expressions)
 	}
 
+	/// Parses ordinary ORDER BY expressions and modifiers.
 	pub(in crate::syn) async fn select_order_list(
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<Vec<SelectOrder>> {
+		self.select_order_list_with_power(context, 0).await
+	}
+
+	/// Preserves an enclosing traversal pipeline after an embedded ORDER BY.
+	pub(in crate::syn) async fn select_order_list_with_power(
+		&mut self,
+		context: &mut Stk,
+		minimum_binding_power: u8,
+	) -> FerrosGrynnResult<Vec<SelectOrder>> {
 		let mut order = Vec::new();
 		loop {
-			let expression = context.run(|context| self.expression(context, 0, 1, 0)).await?;
+			let expression = context
+				.run(|context| self.expression(context, minimum_binding_power, 1, 0))
+				.await?;
 			let random = select_order_is_rand(&expression);
 			let mut collate = false;
 			let mut numeric = false;

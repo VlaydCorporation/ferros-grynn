@@ -1156,8 +1156,24 @@ fn graph_index_info(index: &crate::datastore::GraphIndex) -> FerrosGrynnResult<V
 		NeighbourhoodAlgorithm,
 		PathIndexAlgorithm,
 		ReachabilityAlgorithm,
+		TensorCacheFormat,
 	};
 	let (kind, algorithm, parameter, radius, cost, patterns) = match index.definition() {
+		GraphIndexDefinition::Tensor {
+			scope,
+			format,
+		} => (
+			"TENSOR",
+			match format {
+				TensorCacheFormat::Auto => "AUTO",
+				TensorCacheFormat::Csr => "CSR",
+				TensorCacheFormat::Dense => "DENSE",
+			},
+			u64::from(*scope == crate::graph::tensor::TensorScope::Rooted),
+			0,
+			GraphIndexCost::Hop,
+			&[][..],
+		),
 		GraphIndexDefinition::Reachability {
 			algorithm,
 		} => {

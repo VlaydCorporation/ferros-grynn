@@ -302,6 +302,7 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 			}],
 		}],
 		graphs: vec![GraphCatalogEntry {
+			tensor_revision: 0,
 			id: graph,
 			version: SchemaVersion::INITIAL,
 			published_at: 1,
@@ -381,6 +382,46 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 	})
 }
 
+#[test]
+fn fgdc_tensor_bindings_require_the_dedicated_family_without_weakening_indexes()
+-> FerrosGrynnResult<()> {
+	use crate::{
+		datastore::{GraphIndex, TensorCacheFormat},
+		graph::tensor::TensorScope,
+	};
+	let mut catalog = fixture()?;
+	let graph = &mut catalog.graphs[0];
+	let mut definition =
+		GraphIndex::new_tensor("tensor", TensorScope::Local, TensorCacheFormat::Csr, 1 << 20)?;
+	let id = IndexId::new(9).ok_or_else(|| codec::invalid("invalid fixture index"))?;
+	definition.id = Some(id);
+	definition.graph = Some(graph.id);
+	definition.state = ClassIndexState::Ready;
+	definition.build_revision = 11;
+	graph.indexes.push(definition);
+	let binding = PhysicalIndexBinding {
+		file_id: DataFileId::new(20, DataFileKind::TensorCache)
+			.ok_or_else(|| codec::invalid("invalid tensor file"))?,
+		root: crate::storage::page::PageNo::new(0),
+	};
+	graph.index_bindings.insert(id, binding);
+	catalog.next_schema_id = 10;
+	let bytes = catalog.encode()?;
+	let decoded = DatabaseCatalog::decode(&bytes)?;
+	assert_eq!(decoded.graphs[0].index_bindings[&id], binding);
+	catalog.graphs[0]
+		.index_bindings
+		.get_mut(&id)
+		.ok_or_else(|| codec::invalid("missing tensor binding"))?
+		.file_id = DataFileId::new(20, DataFileKind::Index)
+		.ok_or_else(|| codec::invalid("invalid ordinary file"))?;
+	assert!(catalog.encode().is_err());
+	catalog.graphs[0].index_bindings.insert(id, binding);
+	catalog.atom_store.primary = binding;
+	assert!(catalog.encode().is_err());
+	Ok(())
+}
+
 fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 	let mut catalog = fixture()?;
 	let root = catalog.graphs[0].id;
@@ -395,6 +436,7 @@ fn fixture_with_shared_child() -> FerrosGrynnResult<DatabaseCatalog> {
 		.scope_by_slot
 		.extend([(1, vec![owner_a].into_boxed_slice()), (2, vec![owner_b].into_boxed_slice())]);
 	catalog.graphs.push(GraphCatalogEntry {
+		tensor_revision: 0,
 		id: child,
 		version: SchemaVersion::INITIAL,
 		published_at: 1,

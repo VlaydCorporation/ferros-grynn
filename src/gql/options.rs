@@ -68,6 +68,8 @@ pub struct QueryExecutionOptions {
 	/// projection/traversal work across all kHopEstimate seeds in that
 	/// statement.
 	pub max_path_expansions: u64,
+	/// Tensor/analytics scratch, aggregate work and complete-path limits.
+	pub graph_algorithm_limits: crate::graph::tensor::GraphAlgorithmLimits,
 	/// Maximum unique node atoms retained by one graph-result assembly.
 	pub max_graph_nodes: u64,
 	/// Maximum unique edge atoms retained by one graph-result assembly.
@@ -91,6 +93,7 @@ impl Default for QueryExecutionOptions {
 			max_control_depth: 20,
 			max_loop_iterations: 1_000_000,
 			max_path_expansions: 1_000_000,
+			graph_algorithm_limits: crate::graph::tensor::GraphAlgorithmLimits::default(),
 			max_graph_nodes: 1_000_000,
 			max_graph_edges: 5_000_000,
 			cancellation: None,
@@ -104,6 +107,16 @@ impl Default for QueryExecutionOptions {
 
 impl QueryExecutionOptions {
 	pub(crate) fn validate(&self) -> FerrosGrynnResult<()> {
+		let limits = self.graph_algorithm_limits;
+		if limits.memory_bytes == 0
+			|| limits.memory_bytes > DEFAULT_BARRIER_MEMORY_BYTES
+			|| limits.max_work == 0
+			|| limits.max_paths == 0
+		{
+			return Err(FerrosGrynnError::invalid_argument(
+				"graph algorithm limits must be positive and scratch may not exceed 256 MiB",
+			));
+		}
 		if self.barrier_memory_bytes.get() > DEFAULT_BARRIER_MEMORY_BYTES {
 			return Err(FerrosGrynnError::invalid_argument(format!(
 				"barrier_memory_bytes may not exceed {DEFAULT_BARRIER_MEMORY_BYTES}."
@@ -135,6 +148,8 @@ pub(crate) struct ExecutionControl {
 	pub(crate) max_control_depth: u32,
 	pub(crate) max_loop_iterations: u64,
 	max_path_expansions: u64,
+	/// Shared caps for exact tensor and analytical operations.
+	graph_algorithm_limits: crate::graph::tensor::GraphAlgorithmLimits,
 	max_graph_nodes: u64,
 	max_graph_edges: u64,
 	path_expansions: Arc<AtomicU64>,
@@ -157,6 +172,22 @@ pub(crate) struct ExecutionControl {
 
 #[derive(Debug, Default)]
 struct MatchMetrics {
+	/// Actual graph-kernel work, shared by nested statement controls.
+	algorithm_work: AtomicU64,
+	/// Complete all-shortest paths shared by nested controls and seed batches.
+	algorithm_paths: AtomicUsize,
+	/// Captures using a snapshot-exact tensor generation.
+	tensor_cache_hits: AtomicU64,
+	/// Captures using exact incidence rather than a compatible generation.
+	tensor_fallbacks: AtomicU64,
+	/// Full logical source/target plane cells represented by captures.
+	tensor_cells: AtomicU64,
+	/// Actual distinct source/target memberships represented by captures.
+	tensor_nonzeros: AtomicU64,
+	/// Completed analytical iterations across tensor consumers.
+	tensor_iterations: AtomicU64,
+	/// Encoded generation footprints used by cache captures, not bytes read.
+	tensor_artifact_bytes: AtomicU64,
 	/// Successful reads of directed landmark bounds.
 	landmark_lookups: AtomicU64,
 	/// Searches using exact traversal without a compatible bound.
@@ -195,6 +226,22 @@ struct GraphAssemblyMetrics {
 /// Snapshot of MATCH-specific counters collected by `EXPLAIN ANALYZE`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MatchMetricsSnapshot {
+	/// Shared graph-kernel work admission, including retained failed work.
+	pub(crate) algorithm_work: u64,
+	/// Complete logical paths charged against the statement cap.
+	pub(crate) algorithm_paths: usize,
+	/// Snapshot-exact tensor cache captures.
+	pub(crate) tensor_cache_hits: u64,
+	/// Exact on-demand captures.
+	pub(crate) tensor_fallbacks: u64,
+	/// Logical plane cells represented by captures.
+	pub(crate) tensor_cells: u64,
+	/// Distinct source/target memberships represented by captures.
+	pub(crate) tensor_nonzeros: u64,
+	/// Completed analytical iterations.
+	pub(crate) tensor_iterations: u64,
+	/// Complete encoded footprints, independent of actual I/O counters.
+	pub(crate) tensor_artifact_bytes: u64,
 	/// Directed lower-bound reads and exact-search fallbacks.
 	pub(crate) landmark_lookups: u64,
 	/// Searches using exact traversal without a compatible bound.
@@ -219,6 +266,16 @@ impl MatchMetricsSnapshot {
 	/// Returns a delta between two observations of the same statement control.
 	pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
 		Self {
+			algorithm_work: self.algorithm_work.saturating_sub(earlier.algorithm_work),
+			algorithm_paths: self.algorithm_paths.saturating_sub(earlier.algorithm_paths),
+			tensor_cache_hits: self.tensor_cache_hits.saturating_sub(earlier.tensor_cache_hits),
+			tensor_fallbacks: self.tensor_fallbacks.saturating_sub(earlier.tensor_fallbacks),
+			tensor_cells: self.tensor_cells.saturating_sub(earlier.tensor_cells),
+			tensor_nonzeros: self.tensor_nonzeros.saturating_sub(earlier.tensor_nonzeros),
+			tensor_iterations: self.tensor_iterations.saturating_sub(earlier.tensor_iterations),
+			tensor_artifact_bytes: self
+				.tensor_artifact_bytes
+				.saturating_sub(earlier.tensor_artifact_bytes),
 			landmark_lookups: self.landmark_lookups.saturating_sub(earlier.landmark_lookups),
 			landmark_fallbacks: self.landmark_fallbacks.saturating_sub(earlier.landmark_fallbacks),
 			landmark_artifact_bytes: self
@@ -423,6 +480,7 @@ impl ExecutionControl {
 			max_control_depth: options.max_control_depth,
 			max_loop_iterations: options.max_loop_iterations,
 			max_path_expansions: options.max_path_expansions,
+			graph_algorithm_limits: options.graph_algorithm_limits,
 			max_graph_nodes: options.max_graph_nodes,
 			max_graph_edges: options.max_graph_edges,
 			path_expansions: Arc::new(AtomicU64::new(0)),
@@ -624,6 +682,7 @@ impl ExecutionControl {
 			max_control_depth: self.max_control_depth,
 			max_loop_iterations: self.max_loop_iterations,
 			max_path_expansions: self.max_path_expansions,
+			graph_algorithm_limits: self.graph_algorithm_limits,
 			max_graph_nodes: self.max_graph_nodes,
 			max_graph_edges: self.max_graph_edges,
 			path_expansions: self.path_expansions.clone(),
@@ -664,6 +723,65 @@ impl ExecutionControl {
 	/// Returns currently unreserved statement scratch memory.
 	pub(crate) fn barrier_memory_available(&self) -> usize {
 		self.barrier_memory.limit.saturating_sub(self.barrier_memory.used.load(Ordering::Acquire))
+	}
+
+	/// Returns the remaining shared graph-kernel caps before an operation.
+	pub(crate) fn graph_algorithm_limits(&self) -> crate::graph::tensor::GraphAlgorithmLimits {
+		crate::graph::tensor::GraphAlgorithmLimits {
+			memory_bytes: self
+				.graph_algorithm_limits
+				.memory_bytes
+				.min(self.barrier_memory_available()),
+			max_work: self
+				.graph_algorithm_limits
+				.max_work
+				.saturating_sub(self.match_metrics.algorithm_work.load(Ordering::Acquire)),
+			max_paths: self
+				.graph_algorithm_limits
+				.max_paths
+				.saturating_sub(self.match_metrics.algorithm_paths.load(Ordering::Acquire)),
+		}
+	}
+
+	/// Reserves exact operation work even when telemetry is disabled.
+	pub(crate) fn record_graph_work(&self, work: u64) -> FerrosGrynnResult<()> {
+		self.match_metrics
+			.algorithm_work
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+				current
+					.checked_add(work)
+					.filter(|next| *next <= self.graph_algorithm_limits.max_work)
+			})
+			.map_err(|_current| {
+				FerrosGrynnError::traversal_resource_limit_exceeded(
+					"graph algorithm work",
+					self.graph_algorithm_limits.max_work,
+				)
+			})?;
+		Ok(())
+	}
+
+	/// Returns unused admission after a complete, successful graph operation.
+	pub(crate) fn release_graph_work(&self, work: u64) {
+		self.match_metrics.algorithm_work.fetch_sub(work, Ordering::AcqRel);
+	}
+
+	/// Charges complete paths before retaining them; never silently truncates.
+	pub(crate) fn record_graph_paths(&self, paths: usize) -> FerrosGrynnResult<()> {
+		self.match_metrics
+			.algorithm_paths
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+				current
+					.checked_add(paths)
+					.filter(|next| *next <= self.graph_algorithm_limits.max_paths)
+			})
+			.map_err(|_current| {
+				FerrosGrynnError::traversal_resource_limit_exceeded(
+					"all-shortest enumeration",
+					self.graph_algorithm_limits.max_paths as u64,
+				)
+			})?;
+		Ok(())
 	}
 
 	/// Returns the remaining statement-wide exact neighbourhood work budget.
@@ -884,9 +1002,51 @@ impl ExecutionControl {
 		}
 	}
 
+	/// Records one actual cache/on-demand capture at the adapter boundary.
+	pub(crate) fn record_tensor_capture(
+		&self,
+		tensor: &crate::graph::tensor::EndpointTensor,
+		binding: Option<&crate::datastore::QueryTensorCache>,
+	) {
+		if !self.instrumentation {
+			return;
+		}
+		if let Some(binding) = binding {
+			self.match_metrics.tensor_cache_hits.fetch_add(1, Ordering::Relaxed);
+			self.match_metrics.tensor_artifact_bytes.fetch_add(binding.bytes, Ordering::Relaxed);
+		} else {
+			self.match_metrics.tensor_fallbacks.fetch_add(1, Ordering::Relaxed);
+		}
+		let (rows, connectors, sides) = tensor.shape();
+		self.match_metrics.tensor_cells.fetch_add(
+			(rows as u64).saturating_mul(connectors as u64).saturating_mul(sides as u64),
+			Ordering::Relaxed,
+		);
+		self.match_metrics.tensor_nonzeros.fetch_add(
+			(tensor.source.stored_cells() as u64)
+				.saturating_add(tensor.target.stored_cells() as u64),
+			Ordering::Relaxed,
+		);
+	}
+
+	/// Records only completed converged analytical iterations.
+	pub(crate) fn record_tensor_iterations(&self, iterations: u64) {
+		if self.instrumentation {
+			self.match_metrics.tensor_iterations.fetch_add(iterations, Ordering::Relaxed);
+		}
+	}
+
 	/// Returns MATCH counters collected so far.
 	pub(crate) fn match_metrics(&self) -> MatchMetricsSnapshot {
 		MatchMetricsSnapshot {
+			algorithm_work: self.match_metrics.algorithm_work.load(Ordering::Acquire),
+			algorithm_paths: self.match_metrics.algorithm_paths.load(Ordering::Acquire),
+			tensor_cache_hits: self.match_metrics.tensor_cache_hits.load(Ordering::Acquire),
+			tensor_fallbacks: self.match_metrics.tensor_fallbacks.load(Ordering::Acquire),
+			tensor_cells: self.match_metrics.tensor_cells.load(Ordering::Acquire),
+			tensor_nonzeros: self.match_metrics.tensor_nonzeros.load(Ordering::Acquire),
+			tensor_iterations: self.match_metrics.tensor_iterations.load(Ordering::Acquire),
+			tensor_artifact_bytes: self.match_metrics.tensor_artifact_bytes.load(Ordering::Acquire),
 			landmark_lookups: self.match_metrics.landmark_lookups.load(Ordering::Acquire),
 			landmark_fallbacks: self.match_metrics.landmark_fallbacks.load(Ordering::Acquire),
 			landmark_artifact_bytes: self
@@ -1263,5 +1423,31 @@ mod tests {
 		let child = control.child(None);
 		assert!(control.record_path_expansion().is_ok());
 		assert!(child.record_path_expansion().is_err());
+	}
+
+	#[test]
+	fn graph_work_admission_is_shared_and_only_complete_work_is_refunded() {
+		let mut options = QueryExecutionOptions::default();
+		options.graph_algorithm_limits.max_work = 100;
+		let control = ExecutionControl::new(&options, None);
+		let child = control.child(None);
+		control.record_graph_work(100).unwrap();
+		assert!(child.record_graph_work(1).is_err());
+		control.release_graph_work(70);
+		assert_eq!(child.graph_algorithm_limits().max_work, 70);
+		child.record_graph_work(70).unwrap();
+		assert!(control.record_graph_work(1).is_err());
+	}
+
+	#[test]
+	fn exhausted_path_quota_does_not_reject_non_enumerating_graph_work() {
+		let mut options = QueryExecutionOptions::default();
+		options.graph_algorithm_limits.max_paths = 1;
+		let control = ExecutionControl::new(&options, None);
+		control.record_graph_paths(1).unwrap();
+		let remaining = control.graph_algorithm_limits();
+		assert_eq!(remaining.max_paths, 0);
+		assert!(crate::graph::tensor::control::Control::new(remaining, &mut || Ok(())).is_ok());
+		assert!(control.record_graph_paths(1).is_err());
 	}
 }

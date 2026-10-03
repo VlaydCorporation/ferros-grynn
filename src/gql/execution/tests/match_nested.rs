@@ -231,4 +231,75 @@ fn cross_level_filter_accepts_only_the_selected_nested_branch() {
 		),
 		1,
 	);
+	let analytics = "TRAVERSE FROM MATCH (module:root AS m)-[bridge]->(document AS d) IN GRAPH \
+	                 filter_meta RETURN d |> tv::degree({scope:'ROOTED'});";
+	assert_eq!(row_count(&mut transaction, analytics), 1);
+	for order in ["ORDER BY d.id", "ORDER BY d.id DESC"] {
+		assert_eq!(
+			row_count(
+				&mut transaction,
+				&analytics.replace("RETURN d |> ", &format!("RETURN d {order} |> "))
+			),
+			1
+		);
+	}
+	let mut parameters = Object::new();
+	parameters.insert(
+		"target",
+		crate::values::Value::from(crate::graph::AtomOccurrenceRef::new(
+			crate::graph::AtomRef::new(AtomKind::Node, module),
+			std::sync::Arc::new(meta.clone()),
+		)),
+	);
+	let paths = "TRAVERSE FROM MATCH (module:root AS m)-[bridge]->(document AS d) IN GRAPH \
+	             filter_meta RETURN d |> \
+	             tv::allShortestPaths($target,{scope:'ROOTED',direction:'IN',max_depth:1});";
+	let results = transaction.execute(paths, &parameters).unwrap();
+	assert_eq!(results[0].result.as_ref().unwrap().value().as_array().unwrap().len(), 2);
+	drop(transaction);
+	let mut seed = store.begin();
+	let cache = seed
+		.define_graph_index(
+			"filter_meta",
+			crate::datastore::GraphIndex::new_tensor(
+				"rooted",
+				crate::graph::tensor::TensorScope::Rooted,
+				crate::datastore::TensorCacheFormat::Csr,
+				1 << 20,
+			)
+			.unwrap(),
+		)
+		.unwrap();
+	seed.commit().unwrap();
+	store
+		.rebuild_graph_index(meta.id(), cache, crate::datastore::MaintenanceOptions::default())
+		.unwrap();
+	let explained =
+		store.execute(&format!("EXPLAIN ANALYZE FORMAT JSON {analytics}"), &Object::new()).unwrap();
+	let metrics = explained[0]
+		.result
+		.as_ref()
+		.unwrap()
+		.value()
+		.as_object()
+		.unwrap()
+		.get("analyze")
+		.unwrap()
+		.as_object()
+		.unwrap();
+	assert_eq!(metrics.get("tensor_cache_hits"), Some(&crate::values::Value::from(1_u64)));
+	let explained =
+		store.execute(&format!("EXPLAIN ANALYZE FORMAT JSON {paths}"), &parameters).unwrap();
+	let metrics = explained[0]
+		.result
+		.as_ref()
+		.unwrap()
+		.value()
+		.as_object()
+		.unwrap()
+		.get("analyze")
+		.unwrap()
+		.as_object()
+		.unwrap();
+	assert_eq!(metrics.get("tensor_cache_hits"), Some(&crate::values::Value::from(2_u64)));
 }

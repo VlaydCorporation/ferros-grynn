@@ -30,8 +30,8 @@ pub(crate) use connectivity::{
 };
 pub(crate) use cuts::find_cuts_with_check;
 pub use cuts::{CutSet, find_cuts};
-pub(crate) use index::visit_endpoint_steps;
 pub use index::{TraversalDirection, TraversalIndex, TraversalSemantics, TraversalStep};
+pub(crate) use index::{visit_endpoint_steps, visit_incidence_targets};
 pub use landmark::{
 	DirectedLandmarks,
 	DistanceInterval,

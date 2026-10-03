@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use super::{ClassIndexState, FunctionId, IndexId, IndexMaintenanceMode, SchemaVersion};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::{GraphId, GraphKind, TraversalDirection, TraversalSemantics},
+	graph::{GraphId, GraphKind, TraversalDirection, TraversalSemantics, tensor::TensorScope},
 	values::Text,
 };
 
@@ -76,6 +76,19 @@ pub enum GraphIndexCost {
 	},
 }
 
+/// Physical membership representation for a complete ATOM endpoint cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum TensorCacheFormat {
+	/// Selects the smaller admitted encoded representation.
+	#[default]
+	Auto,
+	/// Sorted sparse connector ordinals for both membership planes.
+	Csr,
+	/// Two row-major, LSB-first binary membership planes.
+	Dense,
+}
+
 /// Kind-specific graph index definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -100,6 +113,16 @@ pub enum GraphIndexDefinition {
 		cost: GraphIndexCost,
 		/// Pattern source; executable IR is never persisted.
 		patterns: Vec<Text>,
+	},
+	/// Complete qualified incidence, topology, containment and captured
+	/// weights.
+	Tensor {
+		/// LOCAL includes boundary endpoints; ROOTED also includes child
+		/// domains.
+		scope: TensorScope,
+		/// Requested membership encoding; AUTO selects a concrete format at
+		/// build.
+		format: TensorCacheFormat,
 	},
 }
 
@@ -165,6 +188,10 @@ impl GraphIndex {
 			dependencies: BTreeSet::new(),
 			comment: None,
 		};
+		if matches!(index.definition, GraphIndexDefinition::Tensor { .. }) {
+			index.mode = TraversalSemantics::Atom;
+			index.direction = TraversalDirection::Both;
+		}
 		if let GraphIndexDefinition::Path {
 			cost: GraphIndexCost::Function {
 				function,
@@ -180,6 +207,57 @@ impl GraphIndex {
 			index.state = ClassIndexState::Ready;
 		}
 		Ok(index)
+	}
+
+	/// Creates a complete ATOM tensor cache with an explicit artifact byte cap.
+	/// NODE and label/direction projections remain views over the captured
+	/// data.
+	///
+	/// # Errors
+	/// Returns invalid name, scope, format or zero-budget errors.
+	///
+	/// # Examples
+	/// ```
+	/// use ferros_grynn::{
+	/// 	datastore::{Datastore, GraphIndex, MaintenanceOptions, TensorCacheFormat},
+	/// 	graph::{
+	/// 		GraphKind,
+	/// 		tensor::{TensorOptions, TensorScope},
+	/// 	},
+	/// };
+	/// # fn main() -> ferros_grynn::gql_status::FerrosGrynnResult<()> {
+	/// let store = Datastore::in_memory();
+	/// let mut tx = store.begin();
+	/// let graph = tx.define_graph("example", GraphKind::Graph)?;
+	/// let id = tx.define_graph_index(
+	/// 	"example",
+	/// 	GraphIndex::new_tensor("incidence", TensorScope::Local, TensorCacheFormat::Auto, 1 << 20)?,
+	/// )?;
+	/// tx.commit()?;
+	/// store.rebuild_graph_index(graph.id(), id, MaintenanceOptions::default())?;
+	/// let mut read = store.begin();
+	/// let tensor = read.endpoint_tensor_using_index(&graph, TensorOptions::default(), id)?;
+	/// assert_eq!(tensor.shape(), (0, 0, 2));
+	/// assert!(read.graph_index("example", "incidence")?.is_some());
+	/// read.remove_graph_index("example", "incidence")?;
+	/// read.commit()?;
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn new_tensor<IntoText: Into<Text>>(
+		name: IntoText,
+		scope: TensorScope,
+		format: TensorCacheFormat,
+		max_bytes: u64,
+	) -> FerrosGrynnResult<Self> {
+		Self::new(
+			name,
+			GraphIndexDefinition::Tensor {
+				scope,
+				format,
+			},
+			Some(max_bytes),
+		)
 	}
 
 	/// Selects the incidence projection stored by this definition.
@@ -356,6 +434,21 @@ impl GraphIndex {
 				};
 				(2, tag, parameter, 0, *cost, patterns.as_slice())
 			}
+			GraphIndexDefinition::Tensor {
+				scope,
+				format,
+			} => (
+				3,
+				match format {
+					TensorCacheFormat::Auto => 0,
+					TensorCacheFormat::Csr => 1,
+					TensorCacheFormat::Dense => 2,
+				},
+				u32::from(*scope == TensorScope::Rooted),
+				0,
+				GraphIndexCost::Hop,
+				&[][..],
+			),
 		};
 		let resource = || {
 			FerrosGrynnError::traversal_resource_limit_exceeded(
@@ -472,6 +565,21 @@ impl GraphIndex {
 			return Err(FerrosGrynnError::invalid_argument("MAX_BYTES must be positive"));
 		}
 		let requires_budget = match &self.definition {
+			GraphIndexDefinition::Tensor {
+				..
+			} => {
+				if self.mode != TraversalSemantics::Atom
+					|| self.direction != TraversalDirection::Both
+					|| !self.edge_labels.is_empty()
+					|| !self.dependencies.is_empty()
+				{
+					return Err(FerrosGrynnError::invalid_argument(
+						"tensor cache stores complete ATOM incidence without label or direction \
+						 filters",
+					));
+				}
+				true
+			}
 			GraphIndexDefinition::Reachability {
 				algorithm,
 			} => {

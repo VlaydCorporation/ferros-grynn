@@ -86,6 +86,21 @@ pub enum SectionKind {
 	NeighbourhoodLandmarkMembers = 0x0204,
 	/// Canonical vertex ordinal to graph-local atom reference.
 	NeighbourhoodVertexMap = 0x0205,
+	/// Qualified axes, revision vector, original topology and containment
+	/// bytes.
+	TensorMetadata = 0x0300,
+	/// Source row offsets.
+	TensorSourceOffsets = 0x0301,
+	/// Sorted distinct source connector ordinals.
+	TensorSourceOrdinals = 0x0302,
+	/// Target row offsets.
+	TensorTargetOffsets = 0x0303,
+	/// Sorted distinct target connector ordinals.
+	TensorTargetOrdinals = 0x0304,
+	/// Row-major, LSB-first source membership.
+	TensorSourceBits = 0x0305,
+	/// Row-major, LSB-first target membership.
+	TensorTargetBits = 0x0306,
 }
 
 impl SectionKind {
@@ -102,8 +117,15 @@ impl SectionKind {
 			| Self::PostorderRanks
 			| Self::NeighbourhoodCenters
 			| Self::NeighbourhoodOffsets
-			| Self::NeighbourhoodVertexMap => (PageType::IndexDerivedArray, width == 8),
-			Self::DefinitionDescriptor => (PageType::IndexDerivedArray, width == 1),
+			| Self::NeighbourhoodVertexMap
+			| Self::TensorSourceOffsets
+			| Self::TensorSourceOrdinals
+			| Self::TensorTargetOffsets
+			| Self::TensorTargetOrdinals => (PageType::IndexDerivedArray, width == 8),
+			Self::DefinitionDescriptor
+			| Self::TensorMetadata
+			| Self::TensorSourceBits
+			| Self::TensorTargetBits => (PageType::IndexDerivedArray, width == 1),
 			Self::LandmarkDistanceFrom | Self::LandmarkDistanceTo => {
 				(PageType::IndexDerivedArray, matches!(width, 8 | 16))
 			}

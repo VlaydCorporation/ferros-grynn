@@ -17,6 +17,16 @@ impl Parser<'_> {
 		context: &mut Stk,
 		optional: bool,
 	) -> FerrosGrynnResult<MatchStatement> {
+		self.match_statement_with_projection_power(context, optional, 0).await
+	}
+
+	/// Leaves the enclosing traversal's pipeline outside MATCH projection.
+	pub(in crate::syn) async fn match_statement_with_projection_power(
+		&mut self,
+		context: &mut Stk,
+		optional: bool,
+		projection_power: u8,
+	) -> FerrosGrynnResult<MatchStatement> {
 		if self.at_keyword(keywords::OPTIONAL) {
 			return Err(self.syntax(
 				"Use `OPTIONAL MATCH`; `MATCH OPTIONAL` is not valid.",
@@ -79,11 +89,11 @@ impl Parser<'_> {
 		let projection = if return_graph.is_some() {
 			Vec::new()
 		} else {
-			self.match_projection(context).await?
+			self.match_projection(context, projection_power).await?
 		};
 		let order = if return_graph.is_none() && self.consume_keyword(keywords::ORDER).is_some() {
 			self.expect_keyword(keywords::BY, "Expected `BY` after MATCH ORDER.")?;
-			self.select_order_list(context).await?
+			self.select_order_list_with_power(context, projection_power).await?
 		} else {
 			Vec::new()
 		};
@@ -138,13 +148,17 @@ impl Parser<'_> {
 		}
 	}
 
+	/// Parses comma-separated expressions without consuming an outer pipeline.
 	async fn match_projection(
 		&mut self,
 		context: &mut Stk,
+		minimum_binding_power: u8,
 	) -> FerrosGrynnResult<Vec<MatchReturnItem>> {
 		let mut projection = Vec::new();
 		loop {
-			let expr = context.run(|context| self.expression(context, 0, 1, 0)).await?;
+			let expr = context
+				.run(|context| self.expression(context, minimum_binding_power, 1, 0))
+				.await?;
 			let alias = if self.consume_keyword(keywords::AS).is_some() {
 				Some(self.identifier()?)
 			} else {

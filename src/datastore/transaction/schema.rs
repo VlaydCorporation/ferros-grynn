@@ -396,6 +396,26 @@ impl Transaction {
 		Ok(self.working.schema.graphs().map(|graph| graph.as_ref().clone()).collect())
 	}
 
+	/// Returns one graph-owned definition from the current transaction
+	/// snapshot.
+	///
+	/// # Errors
+	/// Returns a missing graph or transaction refresh error.
+	pub fn graph_index(
+		&mut self,
+		graph: &str,
+		name: &str,
+	) -> FerrosGrynnResult<Option<GraphIndex>> {
+		self.prepare_read()?;
+		let schema = self
+			.working
+			.schema
+			.named_graph(graph)
+			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph))?;
+		self.record_read(ConflictKey::GraphDefinition(schema.id()));
+		Ok(schema.indexes().find(|index| index.name().as_str() == name).cloned())
+	}
+
 	/// Defines a graph-owned index through the shared schema identity clock.
 	///
 	/// # Errors

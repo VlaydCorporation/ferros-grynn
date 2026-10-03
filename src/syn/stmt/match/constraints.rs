@@ -59,6 +59,7 @@ impl Parser<'_> {
 				continue;
 			}
 
+			let all = self.consume_keyword(keywords::ALL).is_some();
 			let objective = if self.consume_keyword(keywords::SHORTEST).is_some() {
 				Some(MatchPathObjective::Shortest)
 			} else if self.at_keyword(keywords::WEIGHTED)
@@ -74,6 +75,22 @@ impl Parser<'_> {
 				Some(MatchPathObjective::WeightedShortest)
 			} else {
 				None
+			};
+			let objective = if all {
+				Some(match objective {
+					Some(MatchPathObjective::Shortest) => MatchPathObjective::AllShortest,
+					Some(MatchPathObjective::WeightedShortest) => {
+						MatchPathObjective::AllWeightedShortest
+					}
+					_ => {
+						return Err(self.syntax(
+							"ALL requires SHORTEST or WEIGHTED SHORTEST.",
+							self.previous_span(),
+						));
+					}
+				})
+			} else {
+				objective
 			};
 			if let Some(objective) = objective {
 				if constraints.objective.replace(objective).is_some() {

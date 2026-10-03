@@ -538,7 +538,12 @@ impl StoreInner {
 			| MaintenanceJobKind::RebuildIndex
 			| MaintenanceJobKind::DeferredIndexCatchUp
 			| MaintenanceJobKind::CompactIndex => {
-				prepare_index_maintenance(&mut next, target, build_revision)?;
+				prepare_index_maintenance(
+					&mut next,
+					target,
+					build_revision,
+					&self.import_scratch_root().join("maintenance"),
+				)?;
 				next.rebuild_indexes()?;
 			}
 			MaintenanceJobKind::Analyze => {
@@ -757,6 +762,7 @@ fn prepare_index_maintenance(
 	database: &mut DatabaseRoot,
 	target: MaintenanceTarget,
 	build_revision: u64,
+	sort_root: &std::path::Path,
 ) -> FerrosGrynnResult<()> {
 	if let MaintenanceTarget::GraphIndex {
 		graph,
@@ -844,6 +850,19 @@ fn prepare_index_maintenance(
 				&mut crate::storage::check_external_sort_cancelled,
 			)?;
 			Arc::make_mut(&mut database.path_artifacts).insert(index, Arc::new(artifact));
+		} else if matches!(candidate.definition(), super::GraphIndexDefinition::Tensor { .. }) {
+			let artifact = super::TensorArtifact::build(
+				database,
+				candidate,
+				build_revision,
+				crate::graph::tensor::GraphAlgorithmLimits {
+					memory_bytes: crate::storage::external_sort_run_budget(),
+					..Default::default()
+				},
+				Some(sort_root),
+				&mut crate::storage::check_external_sort_cancelled,
+			)?;
+			Arc::make_mut(&mut database.tensor_artifacts).insert(index, Arc::new(artifact));
 		} else if !candidate.is_on_demand() {
 			return Err(FerrosGrynnError::query_feature_not_supported(
 				"materialized graph index build",

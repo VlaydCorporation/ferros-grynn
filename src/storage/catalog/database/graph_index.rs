@@ -16,9 +16,10 @@ use crate::{
 		PathIndexAlgorithm,
 		ReachabilityAlgorithm,
 		SchemaVersion,
+		TensorCacheFormat,
 	},
 	gql_status::FerrosGrynnResult,
-	graph::{GraphId, TraversalDirection, TraversalSemantics},
+	graph::{GraphId, TraversalDirection, TraversalSemantics, tensor::TensorScope},
 	values::Text,
 };
 
@@ -163,6 +164,21 @@ pub(super) fn decode(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphIndex>
 				_ => return Err(invalid("path algorithm is invalid")),
 			},
 		},
+		3 if radius == 0 && cost == GraphIndexCost::Hop && patterns.is_empty() => {
+			GraphIndexDefinition::Tensor {
+				scope: match parameter {
+					0 => TensorScope::Local,
+					1 => TensorScope::Rooted,
+					_ => return Err(invalid("tensor scope is invalid")),
+				},
+				format: match algorithm {
+					0 => TensorCacheFormat::Auto,
+					1 => TensorCacheFormat::Csr,
+					2 => TensorCacheFormat::Dense,
+					_ => return Err(invalid("tensor format is invalid")),
+				},
+			}
+		}
 		_ => return Err(invalid("graph index kind is invalid")),
 	};
 	let index = GraphIndex {
@@ -211,6 +227,42 @@ fn text(decoder: &mut Decoder<'_>, limit: usize) -> FerrosGrynnResult<Text> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn tensor_definition_round_trip_requires_full_projection_and_explicit_budget() {
+		for scope in [TensorScope::Local, TensorScope::Rooted] {
+			for format in
+				[TensorCacheFormat::Auto, TensorCacheFormat::Csr, TensorCacheFormat::Dense]
+			{
+				let mut index = GraphIndex::new_tensor("tensor", scope, format, 1 << 20).unwrap();
+				index.id = IndexId::new(9);
+				index.graph = GraphId::new(7);
+				let mut bytes = Vec::new();
+				encode(&mut bytes, &index).unwrap();
+				assert_eq!(entry(&bytes).unwrap(), index);
+				assert!(index.clone().with_mode(TraversalSemantics::Node).validate().is_err());
+				assert!(
+					index.clone().with_direction(TraversalDirection::Forward).validate().is_err()
+				);
+				assert!(index.with_edge_labels(["edge"]).unwrap().validate().is_err());
+			}
+		}
+		assert!(
+			GraphIndex::new_tensor("tensor", TensorScope::Local, TensorCacheFormat::Auto, 0)
+				.is_err()
+		);
+		assert!(
+			GraphIndex::new(
+				"tensor",
+				GraphIndexDefinition::Tensor {
+					scope: TensorScope::Local,
+					format: TensorCacheFormat::Csr
+				},
+				None
+			)
+			.is_err()
+		);
+	}
 
 	/// Decodes one complete catalog entry, including trailing-byte rejection.
 	fn entry(bytes: &[u8]) -> FerrosGrynnResult<GraphIndex> {

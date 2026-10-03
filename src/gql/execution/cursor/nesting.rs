@@ -256,19 +256,5 @@ pub(in crate::gql::execution) fn nested_graph_reference<Graph: GraphRead>(
 	graph: &Graph,
 	owner: AtomId,
 ) -> FerrosGrynnResult<Option<GraphRef>> {
-	match owner.kind() {
-		Some(AtomKind::Node) => graph
-			.node(owner)?
-			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", owner.to_string()))?
-			.inner_graph_ref()
-			.map(|value| value.map(std::borrow::Cow::into_owned)),
-		Some(AtomKind::Edge) => graph
-			.edge(owner)?
-			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", owner.to_string()))?
-			.transition_graph_ref()
-			.map(|value| value.map(std::borrow::Cow::into_owned)),
-		None => Err(FerrosGrynnError::invalid_storage_file(
-			"MATCH containment owner has an invalid atom kind",
-		)),
-	}
+	crate::graph::nested_graph_reference(graph, owner)
 }

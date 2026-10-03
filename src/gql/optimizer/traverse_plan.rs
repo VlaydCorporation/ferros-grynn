@@ -117,7 +117,16 @@ pub(in crate::gql) fn plan_traverse(
 		nodes.push(PhysicalTraversalNode {
 			node_id: u32::try_from(step_index + 1).unwrap_or(u32::MAX),
 			step_index: Some(step_index),
-			operator: if step.kind == TraverseStepKind::KHopEstimate {
+			operator: if step.kind.is_tensor_analytics()
+				|| matches!(
+					step.kind,
+					TraverseStepKind::AllShortestPaths | TraverseStepKind::AllWeightedShortestPaths
+				) {
+				TraversalOperator::Tensor {
+					kind: step.kind,
+					projection: tensor_projection(statement, step, graph),
+				}
+			} else if step.kind == TraverseStepKind::KHopEstimate {
 				graph
 					.and_then(|graph| {
 						constant_u64(step.arguments.first()).and_then(|radius| {
@@ -228,6 +237,137 @@ pub(in crate::gql) fn plan_traverse(
 	})
 }
 
+/// Captures static projection fields while hashing complete dynamic arguments.
+fn tensor_projection(
+	statement: &LogicalTraverse,
+	step: &crate::gql::ir::LogicalTraverseStep,
+	graph: Option<&PlannerGraph>,
+) -> super::TensorProjectionPlan {
+	use std::hash::{Hash, Hasher};
+
+	use crate::graph::{
+		TraversalDirection,
+		TraversalSemantics,
+		tensor::{TensorScope, WeightSelection},
+	};
+	let all_paths = matches!(
+		step.kind,
+		TraverseStepKind::AllShortestPaths | TraverseStepKind::AllWeightedShortestPaths
+	);
+	let options = step.arguments.get(usize::from(all_paths));
+	let scope = match static_option_text(options, "scope", "LOCAL") {
+		Some("LOCAL") => Some(TensorScope::Local),
+		Some("ROOTED") => Some(TensorScope::Rooted),
+		_ => None,
+	};
+	let direction = match static_option_text(options, "direction", "OUT") {
+		Some("OUT") => Some(TraversalDirection::Forward),
+		Some("IN") => Some(TraversalDirection::Backward),
+		Some("BOTH") => Some(TraversalDirection::Both),
+		_ => None,
+	};
+	let weights = if step.kind == TraverseStepKind::Degree {
+		Some(WeightSelection::Stored)
+	} else {
+		match static_option_text(options, "weights", "UNWEIGHTED") {
+			Some("UNWEIGHTED") => Some(WeightSelection::Unweighted),
+			Some("STORED") => Some(WeightSelection::Stored),
+			_ => None,
+		}
+	};
+	let mut writer = super::CanonicalHasher::versioned(
+		super::PLAN_ENCODING_VERSION,
+		b"tensor-traversal-arguments",
+	);
+	for argument in &step.arguments {
+		super::fingerprint::hash_expr(argument, &mut writer);
+	}
+	if all_paths {
+		statement.constraints.mode.hash(&mut writer);
+		statement.constraints.filters.hash(&mut writer);
+	}
+	super::TensorProjectionPlan {
+		mode: if statement.atom {
+			TraversalSemantics::Atom
+		} else {
+			TraversalSemantics::Node
+		},
+		scope,
+		direction,
+		weights,
+		labels: static_labels(options),
+		parameters_hash: writer.finish(),
+		dynamic_binding: graph.is_none() || scope.is_none(),
+		binding: graph.and_then(|graph| {
+			graph
+				.tensor_caches
+				.iter()
+				.filter(|binding| Some(binding.scope) == scope)
+				.min_by_key(|binding| (binding.bytes, binding.index))
+				.cloned()
+		}),
+	}
+}
+
+/// Returns a literal option without evaluating query expressions while
+/// planning.
+fn static_option_value<'a>(options: Option<&'a TypedExpr>, key: &str) -> Option<Option<&'a Value>> {
+	match options.map(|value| &value.kind) {
+		None => Some(None),
+		Some(TypedExprKind::Constant(Value::Object(object))) => Some(object.get(key)),
+		Some(TypedExprKind::Object(fields)) => {
+			match fields.iter().find(|(name, _value)| name.as_ref() == key) {
+				None => Some(None),
+				Some((_name, value)) => {
+					if let TypedExprKind::Constant(value) = &value.kind {
+						Some(Some(value))
+					} else {
+						None
+					}
+				}
+			}
+		}
+		_ => None,
+	}
+}
+
+/// Distinguishes a known default from runtime selection.
+fn static_option_text<'a>(
+	options: Option<&'a TypedExpr>,
+	key: &str,
+	default: &'a str,
+) -> Option<&'a str> {
+	static_option_value(options, key)?.map_or(Some(default), Value::as_str)
+}
+
+/// Copies only known canonical label filters into physical metadata.
+fn static_labels(options: Option<&TypedExpr>) -> Option<Vec<Box<str>>> {
+	let mut labels: Vec<Box<str>> = if let Some(TypedExprKind::Object(fields)) =
+		options.map(|options| &options.kind)
+		&& let Some((_key, value)) = fields.iter().find(|(key, _value)| key.as_ref() == "labels")
+		&& let TypedExprKind::Array(values) = &value.kind
+	{
+		values
+			.iter()
+			.map(|value| match &value.kind {
+				TypedExprKind::Constant(value) => value.as_str().map(Into::into),
+				_ => None,
+			})
+			.collect::<Option<Vec<_>>>()?
+	} else {
+		match static_option_value(options, "labels")? {
+			None => Some(Vec::new()),
+			Some(Value::Array(values)) => {
+				values.iter().map(|value| value.as_str().map(Into::into)).collect()
+			}
+			_ => None,
+		}?
+	};
+	labels.sort_unstable();
+	labels.dedup();
+	Some(labels)
+}
+
 fn correlated_cardinality(input: Cardinality, child: Cardinality) -> Cardinality {
 	Cardinality::new(
 		input.lower.saturating_mul(child.lower),
@@ -303,6 +443,8 @@ fn estimate_step(
 		| TraverseStepKind::BothEdges
 		| TraverseStepKind::Hyper => expand_cardinality(kind, input, graph),
 		TraverseStepKind::FlatMap
+		| TraverseStepKind::AllShortestPaths
+		| TraverseStepKind::AllWeightedShortestPaths
 		| TraverseStepKind::Algorithm
 		| TraverseStepKind::Unfold
 		| TraverseStepKind::Branch
@@ -342,7 +484,17 @@ fn estimate_step(
 		| TraverseStepKind::MinimumSpanningForest
 		| TraverseStepKind::Cuts
 		| TraverseStepKind::LowestCommonAncestor
-		| TraverseStepKind::HasCycle => Cardinality::exact(1),
+		| TraverseStepKind::HasCycle
+		| TraverseStepKind::PageRank
+		| TraverseStepKind::Degree
+		| TraverseStepKind::HarmonicCloseness
+		| TraverseStepKind::Betweenness
+		| TraverseStepKind::Eigenvector
+		| TraverseStepKind::Katz
+		| TraverseStepKind::Triangles
+		| TraverseStepKind::Clustering
+		| TraverseStepKind::LabelPropagation
+		| TraverseStepKind::Louvain => Cardinality::exact(1),
 		TraverseStepKind::KHopEstimate => input,
 		TraverseStepKind::InVertex
 		| TraverseStepKind::OutVertex

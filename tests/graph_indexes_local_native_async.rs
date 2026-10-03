@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+mod common;
+
 use ferros_grynn::{
 	datastore::{
 		CheckpointMode,
@@ -24,6 +26,95 @@ use ferros_grynn::{
 
 /// Removes the isolated database after all native handles are released.
 struct Directory(PathBuf);
+
+#[test]
+fn tensor_cache_native_async_sdk_formats_wal_reopen_and_checkpoint() {
+	use ferros_grynn::{
+		datastore::{MaintenanceOptions, TensorCacheFormat},
+		graph::tensor::{TensorOptions, TensorScope},
+	};
+	let directory = Directory(
+		std::env::temp_dir()
+			.join(format!("fgdb-{:016x}", Uuid::now_v7().as_inner().as_u128() as u64)),
+	);
+	let mut options = LocalOptions::default();
+	options.io_mode = IoMode::NativeAsync;
+	options.buffer_pool_pages = 16;
+	let store = Datastore::create_local(&directory.0, options).unwrap();
+	let (graph, _, _) = common::commit_people_graph(&store);
+	let baseline = store.begin().endpoint_tensor(&graph, TensorOptions::default()).unwrap();
+	let mut define = store.begin();
+	let ids =
+		[TensorCacheFormat::Csr, TensorCacheFormat::Dense, TensorCacheFormat::Auto].map(|format| {
+			define
+				.define_graph_index(
+					"people",
+					GraphIndex::new_tensor(
+						format!("tensor_{format:?}"),
+						TensorScope::Local,
+						format,
+						1 << 20,
+					)
+					.unwrap(),
+				)
+				.unwrap()
+		});
+	define.commit().unwrap();
+	for id in ids {
+		store.rebuild_graph_index(graph.id(), id, MaintenanceOptions::default()).unwrap();
+	}
+	drop(store);
+	let reopened = Datastore::open_local(&directory.0, options).unwrap();
+	for id in ids {
+		let cached = reopened
+			.begin()
+			.endpoint_tensor_using_index(&graph, TensorOptions::default(), id)
+			.unwrap();
+		assert_eq!(cached.atoms(), baseline.atoms());
+		assert_eq!(cached.connectors(), baseline.connectors());
+	}
+	// Open already performs a passive checkpoint; commit new frames before
+	// Restart.
+	let mut write = reopened.begin();
+	write.create_atom("person:unattached".parse().unwrap(), PropertyMap::new()).unwrap();
+	write.commit().unwrap();
+	assert!(reopened.checkpoint(CheckpointMode::Restart).unwrap());
+	drop(reopened);
+	let checkpointed = Datastore::open_local(&directory.0, options).unwrap();
+	for id in ids {
+		assert_eq!(
+			checkpointed
+				.begin()
+				.endpoint_tensor_using_index(&graph, TensorOptions::default(), id)
+				.unwrap()
+				.connectors(),
+			baseline.connectors()
+		);
+	}
+	drop(checkpointed);
+	let mut constrained = options;
+	constrained.maintenance.max_memory_bytes = std::num::NonZeroUsize::new(1024).unwrap();
+	let constrained = Datastore::open_local(&directory.0, constrained).unwrap();
+	for id in ids {
+		assert!(
+			constrained
+				.begin()
+				.endpoint_tensor_using_index(&graph, TensorOptions::default(), id)
+				.is_err()
+		);
+	}
+	assert!(constrained.begin().atom(&"person:alice".parse().unwrap()).unwrap().is_some());
+	drop(constrained);
+	let restored = Datastore::open_local(&directory.0, options).unwrap();
+	for id in ids {
+		assert!(
+			restored
+				.begin()
+				.endpoint_tensor_using_index(&graph, TensorOptions::default(), id)
+				.is_ok()
+		);
+	}
+}
 
 impl Drop for Directory {
 	fn drop(&mut self) {

@@ -1,14 +1,49 @@
+//! Shared span-independent canonical hashing of analyzed expressions.
+
 use std::hash::{Hash, Hasher};
 
-use super::super::*;
-use crate::gql::{
-	ir::LogicalKnnDistance,
-	optimizer::{CanonicalHasher, PLAN_ENCODING_VERSION},
+use super::{CanonicalHasher, PLAN_ENCODING_VERSION};
+use crate::gql::ir::{
+	LogicalGraphReference,
+	LogicalKnnDistance,
+	LogicalSelect,
+	LogicalSelectAccess,
+	LogicalSelectItem,
+	LogicalSelectSource,
+	LogicalSelectSourceKind,
+	LogicalTraverseSource,
+	LogicalWildcardField,
+	ScanTarget,
+	TypedExpr,
+	TypedExprKind,
 };
 
+/// Existing ordering identity retained across the module move.
 const COLLATION_FINGERPRINT: &[u8] = b"icu4x-2.2.1-root-primary-tertiary-numeric-v1";
 
-pub(in crate::gql::execution) fn fingerprints(plan: &LogicalSelect) -> (u64, u64) {
+/// Hashes exact binding eligibility independently of source spans and aliases.
+pub(super) fn hash_match_binding(binding: &crate::gql::ir::MatchBinding, state: &mut impl Hasher) {
+	std::mem::discriminant(&binding.domain).hash(state);
+	std::mem::discriminant(&binding.selector).hash(state);
+	match &binding.selector {
+		crate::gql::ir::LogicalMatchSelector::Any => {}
+		crate::gql::ir::LogicalMatchSelector::Class(class) => class.hash(state),
+		crate::gql::ir::LogicalMatchSelector::Record(record) => {
+			record.class.hash(state);
+			hash_expr(&record.key, state);
+		}
+	}
+	binding.label.hash(state);
+	binding.meta.hash(state);
+	for (field, expression) in &binding.properties {
+		field.hash(state);
+		hash_expr(expression, state);
+	}
+	hash_optional_expr(binding.predicate.as_ref(), state);
+}
+
+/// Returns normalized SELECT relation and ordering identities.
+pub(in crate::gql) fn fingerprints(plan: &LogicalSelect) -> (u64, u64) {
 	let mut query = CanonicalHasher::versioned(PLAN_ENCODING_VERSION, b"select-query");
 	hash_select(plan, &mut query);
 	let mut order = CanonicalHasher::versioned(PLAN_ENCODING_VERSION, b"select-order");
@@ -26,6 +61,7 @@ pub(in crate::gql::execution) fn fingerprints(plan: &LogicalSelect) -> (u64, u64
 	(query.finish(), order.finish())
 }
 
+/// Encodes relation semantics while excluding cursor page state.
 fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
 	hash_source(&plan.source, state);
 	for join in &plan.joins {
@@ -111,6 +147,7 @@ fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
 	plan.outer_columns.hash(state);
 }
 
+/// Encodes a declared atom, graph-catalog or derived source.
 fn hash_source(source: &LogicalSelectSource, state: &mut impl Hasher) {
 	source.alias.hash(state);
 	match &source.kind {
@@ -150,6 +187,7 @@ fn hash_source(source: &LogicalSelectSource, state: &mut impl Hasher) {
 	}
 }
 
+/// Distinguishes static graph identity from an analyzed runtime expression.
 fn hash_graph_reference(reference: &LogicalGraphReference, state: &mut impl Hasher) {
 	match reference {
 		LogicalGraphReference::Static(reference) => {
@@ -163,6 +201,7 @@ fn hash_graph_reference(reference: &LogicalGraphReference, state: &mut impl Hash
 	}
 }
 
+/// Frames presence separately from expression bytes.
 fn hash_optional_expr(expression: Option<&TypedExpr>, state: &mut impl Hasher) {
 	match expression {
 		None => 0_u8.hash(state),
@@ -173,7 +212,8 @@ fn hash_optional_expr(expression: Option<&TypedExpr>, state: &mut impl Hasher) {
 	}
 }
 
-fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
+/// Encodes analyzed expression semantics without text spans.
+pub(super) fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 	std::mem::discriminant(&expression.kind).hash(state);
 	match &expression.kind {
 		TypedExprKind::Constant(value) => value.hash(state),

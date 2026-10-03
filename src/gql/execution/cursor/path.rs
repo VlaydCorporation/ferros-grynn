@@ -708,7 +708,7 @@ pub(in crate::gql::execution) fn path_edge_weight<Graph: GraphRead>(
 	expand: &ResolvedPathExpand,
 	edge: AtomId,
 ) -> FerrosGrynnResult<Number> {
-	if expand.objective != Some(crate::syn::MatchPathObjective::WeightedShortest) {
+	if !expand.objective.is_some_and(crate::syn::MatchPathObjective::is_weighted) {
 		return Ok(Number::Int(1));
 	}
 	let weight = graph

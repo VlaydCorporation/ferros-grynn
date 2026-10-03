@@ -120,6 +120,12 @@
 - Ready Reachability/Neighbourhood/LANDMARK_SSSP binding удерживает один immutable файл своей проекции. Независимый
   commit сохраняет DataFileId; reopen проверяет maps/CSR/labels против того же snapshot.
   Ошибка secondary decode исключает artifact и делает logical definition Stale.
+- Tensor binding использует только FileKind/PageType TensorCache. AUTO descriptor
+  сохраняется полностью; reopen проверяет записанный concrete CSR/DENSE format,
+  canonical sections, metadata и durable graph incidence revisions. Checkpoint LSN
+  не определяет актуальность. Publication/retirement используют общие WAL/COW paths.
+  Recovery использует maintenance budget открывающего datastore. Tensor restore
+  учитывает encoding reservation ровно один раз и отдельно проверяет все stored cells.
 
 ## Проверка
 

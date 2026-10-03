@@ -304,8 +304,10 @@ mod numeric_tests {
 impl SearchFrontier {
 	fn new(objective: crate::syn::MatchPathObjective) -> Self {
 		match objective {
-			crate::syn::MatchPathObjective::Shortest => Self::Breadth(VecDeque::new()),
-			crate::syn::MatchPathObjective::WeightedShortest => Self::Weighted(BinaryHeap::new()),
+			crate::syn::MatchPathObjective::Shortest
+			| crate::syn::MatchPathObjective::AllShortest => Self::Breadth(VecDeque::new()),
+			crate::syn::MatchPathObjective::WeightedShortest
+			| crate::syn::MatchPathObjective::AllWeightedShortest => Self::Weighted(BinaryHeap::new()),
 		}
 	}
 

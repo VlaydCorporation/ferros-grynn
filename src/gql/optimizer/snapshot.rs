@@ -50,6 +50,8 @@ pub(crate) struct PlannerDemand {
 	pub(crate) neighbourhood_sketches: bool,
 	/// Whether a shortest-path objective needs directed landmark bindings.
 	pub(crate) landmark_paths: bool,
+	/// Whether tensor-backed consumers need snapshot-exact cache metadata.
+	pub(crate) tensor_caches: bool,
 	/// Property distributions used by predicates, grouping, or ordering.
 	pub(crate) properties: BTreeSet<PlannerPropertyDemand>,
 	/// Degree distributions used by current MATCH estimates.
@@ -150,6 +152,8 @@ pub(crate) struct PlannerGraph {
 	pub(crate) neighbourhood_sketches: Vec<crate::datastore::QueryNeighbourhoodSketch>,
 	/// Logical Ready path bindings, independent of physical storage pages.
 	pub(crate) landmark_paths: Vec<crate::datastore::QueryLandmarkPath>,
+	/// Logical full incidence generations, independent of page addresses.
+	pub(crate) tensor_caches: Vec<crate::datastore::QueryTensorCache>,
 }
 
 /// One demanded histogram together with its build method.

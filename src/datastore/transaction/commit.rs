@@ -164,6 +164,7 @@ impl Transaction {
 			};
 			self.validate_graph_family_in_root(validation_root.clone(), schema.reference())?;
 		}
+		drop(validation_root);
 		next.commit_ts = commit_ts;
 		for key in self.writes.keys() {
 			next.mark_version(remap.conflict(*key), commit_ts);

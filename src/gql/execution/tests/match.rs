@@ -191,6 +191,26 @@ fn match_shortest_uses_bfs_dijkstra_and_path_functions() {
 		&nodes[1],
 		"equal-cost paths use public occurrence identity as the canonical tie-break"
 	);
+	let all = query(&mut transaction, "ALL WEIGHTED SHORTEST");
+	let all = all.as_array().unwrap();
+	assert_eq!(all.len(), 2);
+	for row in all.iter() {
+		let row = row.as_object().unwrap();
+		assert_eq!(row.get("length"), Some(&Value::from(2_i64)));
+		assert_eq!(row.get("cost"), Some(&Value::from(2_i64)));
+	}
+	let all_hop = query(&mut transaction, "ALL SHORTEST");
+	assert_eq!(all_hop.as_array().unwrap().len(), 1);
+	let traversed = transaction
+		.execute(
+			"TRAVERSE FROM [person:a,person:a] IN GRAPH @routes |> \
+			 tv::allWeightedShortestPaths(person:d);",
+			&Object::new(),
+		)
+		.unwrap();
+	let traversed = traversed[0].result.as_ref().unwrap().value().as_array().unwrap();
+	assert_eq!(traversed.len(), 4);
+	assert!(traversed.iter().all(|value| matches!(value, Value::Path(_))));
 }
 
 #[test]
@@ -322,6 +342,8 @@ fn atomwalk_supports_vertex_edge_and_edge_edge_incidence() {
 		 atomwalk RETURN e, c, p",
 		"MATCH ATOM <[relation:target AS a]>~[relation:ee AS c]~><[relation:ve AS b]> IN GRAPH \
 		 atomwalk RETURN a, c, b",
+		"MATCH ATOM path=<(person:a)>~[relation*1..2 ALL SHORTEST]~><[relation:target]> IN GRAPH \
+		 atomwalk RETURN path",
 	] {
 		let result = transaction.execute(query, &Object::new()).unwrap();
 		let rows = result[0].result.as_ref().unwrap().value().as_array().unwrap();
@@ -437,6 +459,14 @@ fn nested_match_preserves_scopes_for_fixed_variable_and_shortest_paths() {
 		shortest.get(0).unwrap().as_object().unwrap().get("cost"),
 		Some(&Value::from(3_i64))
 	);
+	let all = transaction
+		.execute(
+			"MATCH path=(module:root)-[bridge*1..2 ALL WEIGHTED SHORTEST]->(document:spec) IN \
+			 GRAPH nested_meta RETURN path::cost(path) AS cost",
+			&Object::new(),
+		)
+		.unwrap();
+	assert_eq!(all[0].result.as_ref().unwrap().value().as_array().unwrap(), shortest);
 
 	let hyper = transaction
 		.execute(

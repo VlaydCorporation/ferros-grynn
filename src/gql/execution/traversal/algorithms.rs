@@ -40,6 +40,15 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 		step: &PreparedStep,
 		input: Vec<Traverser>,
 	) -> FerrosGrynnResult<Vec<Traverser>> {
+		if kind.is_tensor_analytics() {
+			return self.execute_tensor_analytics(kind, step, input);
+		}
+		if matches!(
+			kind,
+			TraverseStepKind::AllShortestPaths | TraverseStepKind::AllWeightedShortestPaths
+		) {
+			return self.execute_all_shortest(step, input);
+		}
 		match kind {
 			TraverseStepKind::KHop
 			| TraverseStepKind::KHopEstimate
@@ -736,7 +745,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 	}
 }
 
-fn occurrence(value: &Value) -> FerrosGrynnResult<&AtomOccurrenceRef> {
+pub(super) fn occurrence(value: &Value) -> FerrosGrynnResult<&AtomOccurrenceRef> {
 	value.as_atom_occurrence().ok_or_else(|| {
 		FerrosGrynnError::traversal_source_type_mismatch(
 			"node occurrence".to_owned(),
@@ -745,7 +754,7 @@ fn occurrence(value: &Value) -> FerrosGrynnResult<&AtomOccurrenceRef> {
 	})
 }
 
-fn non_negative_usize(value: Option<&Value>) -> FerrosGrynnResult<usize> {
+pub(super) fn non_negative_usize(value: Option<&Value>) -> FerrosGrynnResult<usize> {
 	let value = value.ok_or_else(|| FerrosGrynnError::invalid_argument("Missing depth."))?;
 	value
 		.as_number()

@@ -33,11 +33,18 @@ mod immutable_stream;
 mod job_catalog;
 mod neighbourhood_index;
 pub(crate) use neighbourhood_index::{NeighbourhoodHeader, NeighbourhoodLayout, NeighbourhoodTag};
+mod tensor_index;
+pub use tensor_index::{TensorCacheHeader, TensorCacheLayout, TensorCacheTag};
 mod local;
 mod local_store;
 mod membership_index;
 mod metadata_cow;
 mod page;
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "The internal artifact binding reports page-aligned encoded bytes"
+)]
+pub(super) use page::PAGE_SIZE;
 mod page_cache;
 mod page_io;
 mod path_index;

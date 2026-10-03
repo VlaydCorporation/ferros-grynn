@@ -184,6 +184,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			|| !graph_names.insert(graph.name.as_str())
 			|| graph.storage_mode != GraphStorageMode::DiskBacked
 			|| graph.kind == GraphKind::Subgraph
+			|| graph.tensor_revision > graph.generation
 		{
 			return Err(invalid("graph catalog ordering, identity, or storage mode is invalid"));
 		}
@@ -229,7 +230,15 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		for index in &graph.indexes {
 			let id = index.id().ok_or_else(|| invalid("graph index has no identity"))?;
 			if let Some(binding) = graph.index_bindings.get(&id) {
-				validate_binding(*binding)?;
+				let kind = if matches!(
+					index.definition(),
+					crate::datastore::GraphIndexDefinition::Tensor { .. }
+				) {
+					DataFileKind::TensorCache
+				} else {
+					DataFileKind::Index
+				};
+				validate_binding_kind(*binding, kind)?;
 				if index.state() != ClassIndexState::Ready
 					|| index.is_on_demand()
 					|| binding.root != PageNo::new(0)
@@ -500,7 +509,15 @@ fn internal_graph_name(owner: crate::graph::GraphId, child: crate::graph::GraphI
 }
 
 fn validate_binding(binding: PhysicalIndexBinding) -> FerrosGrynnResult<()> {
-	if binding.file_id.kind() != Some(DataFileKind::Index) || binding.root == PageNo::NULL {
+	validate_binding_kind(binding, DataFileKind::Index)
+}
+
+/// Validates a derived binding against exactly its declared physical family.
+fn validate_binding_kind(
+	binding: PhysicalIndexBinding,
+	kind: DataFileKind,
+) -> FerrosGrynnResult<()> {
+	if binding.file_id.kind() != Some(kind) || binding.root == PageNo::NULL {
 		return Err(invalid("physical index binding is invalid"));
 	}
 	Ok(())

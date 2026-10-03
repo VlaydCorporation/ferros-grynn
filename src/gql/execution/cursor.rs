@@ -19,7 +19,7 @@ pub(super) struct Snapshot(pub(super) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Snapshot-local atom handle qualified by its graph occurrence.
-pub(super) struct BoundAtom {
+pub(in crate::gql) struct BoundAtom {
 	pub(super) graph: crate::graph::GraphId,
 	pub(super) atom: AtomId,
 }
@@ -327,6 +327,40 @@ pub(super) trait QueryRead {
 	fn mutation_count(&self) -> usize;
 
 	fn catalog(&self, snapshot: Snapshot) -> &dyn QueryCatalog;
+
+	/// Captures immutable qualified incidence from this statement's read root.
+	fn endpoint_tensor(
+		&self,
+		snapshot: Snapshot,
+		graph: &GraphRef,
+		options: crate::graph::tensor::TensorOptions,
+		check: &mut dyn FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<crate::graph::tensor::EndpointTensor> {
+		let view = self.graph(snapshot, graph)?;
+		crate::graph::tensor::EndpointTensor::from_graph_with_check(&view, options, &mut || check())
+	}
+
+	/// Reads the selected logical generation, reporting exact on-demand fallback.
+	fn endpoint_tensor_selected(
+		&self, snapshot: Snapshot, graph: &GraphRef,
+		options: crate::graph::tensor::TensorOptions,
+		_selected: Option<&crate::datastore::QueryTensorCache>,
+		check: &mut dyn FnMut() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<(crate::graph::tensor::EndpointTensor, Option<crate::datastore::QueryTensorCache>)> {
+		self.endpoint_tensor(snapshot, graph, options, check).map(|tensor| (tensor, None))
+	}
+
+	/// Reuses the bounded PURE evaluator against this exact immutable root.
+	fn tensor_cost_evaluator(
+		&self,
+		_snapshot: Snapshot,
+		_bytes: usize,
+	) -> FerrosGrynnResult<crate::gql::PureFunctionEvaluator<'_>> {
+		Err(FerrosGrynnError::invalid_argument("this reader has no published PURE COST catalog"))
+	}
+
+	/// Records dependencies consulted by bounded tensor COST evaluation.
+	fn observe_tensor_cost(&self, _key: crate::datastore::ConflictKey) {}
 
 	/// Captures the catalog, index, exact-counter, and demanded-histogram
 	/// projection used by physical planning.
@@ -1132,6 +1166,7 @@ mod pipeline;
 mod scoped;
 mod scoped_path;
 mod shortest;
+mod tensor_shortest;
 
 pub(super) use barrier::{MatchProjectCursor, OptionalCursor, distinct_rows, sort_match_rows};
 pub(super) use binding::{
@@ -1169,13 +1204,12 @@ pub(super) use path::{
 	path_hop_cost,
 	path_row,
 };
+pub(in crate::gql) use pipeline::{AtomFieldRead, RootFields};
 pub(super) use pipeline::{
-	AtomFieldRead,
 	FilterCursor,
 	MatchGraphFields,
 	OneRowCursor,
 	RecordFields,
-	RootFields,
 	properties_object,
 };
 pub(super) use scoped::{ScopedTraversalCandidate, ScopedTraversalIndex, resolve_scoped_endpoint};
@@ -1188,3 +1222,4 @@ pub(super) use shortest::{
 	extend_path_buffers,
 	monotone_path_prefix,
 };
+pub(super) use tensor_shortest::TensorShortestPathCursor;

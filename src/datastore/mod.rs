@@ -43,8 +43,11 @@ mod schema;
 mod session;
 /// In-memory database owner and commit serialization.
 mod store;
+/// Full qualified tensor captures and their checked durable encodings.
+mod tensor_artifact;
 /// Shared durable-analyzer execution used by scans and index builders.
 mod text_analyzer;
+pub(crate) use tensor_artifact::TensorArtifact;
 /// Snapshot-isolated reads, mutations, and commit validation.
 mod transaction;
 /// Exact vector-distance oracle used by scans and ANN reranking.
@@ -141,12 +144,19 @@ pub use schema::{
 	SchemaVersion,
 	SystemIndex,
 	SystemIndexKind,
+	TensorCacheFormat,
 	VectorDistance,
 };
 pub use session::GqlSession;
 pub(crate) use session::validate_control_structure;
 pub use store::Datastore;
-pub(crate) use text_analyzer::{AnalyzedToken, analyze_builtin, analyze_function_result};
+pub(crate) use text_analyzer::{
+	AnalyzedToken,
+	analyze_builtin,
+	analyze_builtin_bounded,
+	analyze_function_result,
+	analyze_function_result_bounded,
+};
 pub use transaction::{AtomSnapshot, CommitResult, Transaction, TransactionGraphView};
 pub(crate) use transaction::{
 	QueryGeometryIndexRead,
@@ -157,6 +167,7 @@ pub(crate) use transaction::{
 	QueryStatisticsDemand,
 	QueryStorageCursor,
 	QueryStorageRow,
+	QueryTensorCache,
 	ScalarComparison,
 	ScalarIndexConstraint,
 	ScalarIndexWindow,

@@ -15,6 +15,47 @@ pub(super) fn execute(
 	arguments: Vec<Value>,
 	control: Option<&ExecutionControl>,
 ) -> FerrosGrynnResult<Value> {
+	execute_with_fields(function, arguments, control, None)
+}
+
+/// Admits bounded PURE values before executing collection/string helpers.
+pub(super) fn execute_with_fields(
+	function: &Builtin,
+	arguments: Vec<Value>,
+	control: Option<&ExecutionControl>,
+	fields: Option<&dyn super::AtomFieldRead>,
+) -> FerrosGrynnResult<Value> {
+	if let Some(fields) = fields.filter(|fields| fields.bounded()) {
+		// Dynamic regex compilation has no preallocation proof.
+		// Reject it before entering external allocators under a hard COST cap.
+		if matches!(function, Builtin::RegexMatcher) {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"unbounded PURE helper scratch",
+				control.map_or(0, ExecutionControl::barrier_memory_limit) as u64,
+			));
+		}
+		for value in &arguments {
+			fields.admit_value(value)?;
+		}
+		let input_bytes = arguments
+			.iter()
+			.try_fold(0_usize, |bytes, value| bytes.checked_add(value.estimated_heap_bytes()))
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("PURE builtin input"))?;
+		let multiplier = if matches!(function, Builtin::StringSplit) {
+			2 * size_of::<Value>() + 4
+		} else {
+			4
+		};
+		let bytes = input_bytes
+			.checked_mul(multiplier)
+			.and_then(|bytes| bytes.checked_add(arguments.len().checked_mul(128)?))
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("PURE builtin scratch"))?;
+		fields.admit(bytes)?;
+		fields.work(
+			u64::try_from(input_bytes)
+				.map_err(|_cause| FerrosGrynnError::operation_overflow("PURE builtin work"))?,
+		)?;
+	}
 	match function {
 		Builtin::GeoWithin | Builtin::GeoIntersects => {
 			let (left, right) = two(arguments)?;
@@ -71,6 +112,31 @@ pub(super) fn execute(
 		Builtin::StringMatches => {
 			let (value, pattern) = two(arguments)?;
 			let value = string(value, "string::matches")?;
+			if let Some(fields) = fields.filter(|fields| fields.bounded()) {
+				let pattern = match &pattern {
+					Value::Regex(pattern) => pattern.as_str(),
+					Value::String(pattern) => pattern.as_str(),
+					_ => return Err(type_error("string::matches", "regex or string")),
+				};
+				// Existing escaping identifies the literal fast path without
+				// compiling an AST. ponytail: complex patterns
+				// need a proven compiler allocation envelope.
+				if regex::escape(pattern) != pattern {
+					return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+						"regular expression compiler scratch",
+						control.map_or(0, ExecutionControl::barrier_memory_limit) as u64,
+					));
+				}
+				let work = value
+					.len()
+					.checked_add(1)
+					.and_then(|n| pattern.len().checked_add(1).and_then(|m| n.checked_mul(m)))
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("literal regex work"))?;
+				fields.work(u64::try_from(work).map_err(|_cause| {
+					FerrosGrynnError::operation_overflow("literal regex work")
+				})?)?;
+				return Ok(Value::Bool(value.contains(pattern)));
+			}
 			let pattern = match pattern {
 				Value::Regex(pattern) => pattern,
 				Value::String(pattern) => Regex::new(pattern).map_err(|error| {
@@ -134,7 +200,7 @@ pub(super) fn execute(
 				return Err(type_error("time::format", "datetime"));
 			};
 			let format = string(format, "time::format")?;
-			Ok(Value::from(value.as_inner().strftime(format.as_str()).to_string()))
+			format_time(&value, format.as_str(), fields)
 		}
 		Builtin::TimeAdd => {
 			let (value, duration) = two(arguments)?;
@@ -481,6 +547,117 @@ fn length(value: usize) -> FerrosGrynnResult<Value> {
 	i64::try_from(value)
 		.map(Value::from)
 		.map_err(|_| FerrosGrynnError::operation_overflow("collection length"))
+}
+
+/// Counts a deterministic formatting stream before allocating its exact output.
+fn format_time(
+	value: &crate::values::DateTime,
+	format: &str,
+	fields: Option<&dyn super::AtomFieldRead>,
+) -> FerrosGrynnResult<Value> {
+	if let Some(fields) = fields {
+		fields.admit(
+			value
+				.as_inner()
+				.time_zone()
+				.iana_name()
+				.map_or(512, |name| name.len().saturating_add(512)),
+		)?;
+		fields.work(
+			u64::try_from(format.len())
+				.map_err(|_cause| FerrosGrynnError::operation_overflow("time format scan"))?
+				.checked_mul(2)
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("time format scan"))?,
+		)?;
+	}
+	let broken = jiff::fmt::strtime::BrokenDownTime::from(value.as_inner());
+	let config = jiff::fmt::strtime::Config::new().lenient(true);
+	let mut counter = TimeFormatWriter {
+		output: None,
+		bytes: 0,
+		fields,
+		failure: None,
+	};
+	let counted =
+		broken.format_with_config(&config, format, &mut jiff::fmt::StdFmtWrite(&mut counter));
+	if let Some(error) = counter.failure {
+		return Err(error);
+	}
+	counted.map_err(FerrosGrynnError::from)?;
+	let bytes = counter.bytes;
+	if let Some(fields) = fields {
+		fields.admit(
+			bytes
+				.checked_mul(2)
+				.and_then(|bytes| bytes.checked_add(512))
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("time format output"))?,
+		)?;
+	}
+	let mut output = String::new();
+	output.try_reserve_exact(bytes).map_err(|cause| {
+		FerrosGrynnError::traversal_resource_limit_exceeded("time format allocation", bytes as u64)
+			.with_technical_source(cause)
+	})?;
+	let mut writer = TimeFormatWriter {
+		output: Some(&mut output),
+		bytes: 0,
+		fields,
+		failure: None,
+	};
+	let written =
+		broken.format_with_config(&config, format, &mut jiff::fmt::StdFmtWrite(&mut writer));
+	if let Some(error) = writer.failure {
+		return Err(error);
+	}
+	written.map_err(FerrosGrynnError::from)?;
+	Ok(Value::from(output))
+}
+
+/// Bounded two-pass writer; lenient formatting cannot swallow admission
+/// failures.
+struct TimeFormatWriter<'a> {
+	/// Absent in the allocation-free counting pass.
+	output: Option<&'a mut String>,
+	/// Checked bytes already formatted in this pass.
+	bytes: usize,
+	/// Optional embedding-wide resource admission.
+	fields: Option<&'a dyn super::AtomFieldRead>,
+	/// Original typed failure preserved across lenient directive retries.
+	failure: Option<FerrosGrynnError>,
+}
+
+impl std::fmt::Write for TimeFormatWriter<'_> {
+	fn write_str(&mut self, s: &str) -> std::fmt::Result {
+		if self.failure.is_some() {
+			return Err(std::fmt::Error);
+		}
+		let result = (|| {
+			let bytes = self
+				.bytes
+				.checked_add(s.len())
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("time format output"))?;
+			if let Some(fields) = self.fields {
+				fields.work(u64::try_from(s.len()).map_err(|_cause| {
+					FerrosGrynnError::operation_overflow("time format work")
+				})?)?;
+			}
+			if let Some(output) = &mut self.output {
+				if bytes > output.capacity() {
+					return Err(FerrosGrynnError::invalid_argument(
+						"time format changed between immutable passes",
+					));
+				}
+				output.push_str(s);
+			}
+			self.bytes = bytes;
+			Ok(())
+		})();
+		if let Err(error) = result {
+			self.failure = Some(error);
+			return Err(std::fmt::Error);
+		}
+		Ok(())
+	}
 }
 
 fn type_error(function: &str, expected: &str) -> FerrosGrynnError {

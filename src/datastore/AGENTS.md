@@ -90,9 +90,22 @@ metadata-COW только ради progress запрещён, поскольку
 - Physical и materialized traversal routes регистрируют одинаковые SSI
   predicates; page guards, `DataFileId` и storage DTO не проходят transaction
   query adapter.
+- `Transaction::endpoint_tensor` фиксирует один QuerySnapshot для всего LOCAL/ROOTED
+  чтения; GraphDefinition, membership/overlay/incidence predicates сохраняются.
+  Node/edge metadata readers не materialize-ят effective properties до properties().
+- Tensor cache удерживает полную ATOM incidence и durable revision vector всех
+  qualified dependencies. Topology/membership/labels/containment/weights исключают
+  generation из private reads сразу; old roots сохраняют прежний immutable artifact.
+  `endpoint_tensor_using_index` проверяет forced binding до чтения; обычный SDK
+  lookup использует exact on-demand fallback в общем memory/work budget.
+- `Datastore::rebuild_graph_index` и `rebuild_graph_index_concurrently` используют
+  существующий maintenance coordinator. Tensor planes строятся существующим
+  external sorter; qualified dictionaries/topology остаются bounded scratch.
 - `LocalOptions` является единственной construction authority локального
   backend. `local_storage_status()` только наблюдает effective budgets и
   pressure; environment variables не переопределяют параметры экземпляра.
+  `open_local` передаёт maintenance limits в recovery тем же scoped external-sort
+  context; нехватка бюджета secondary исключает generation, сохраняя primary data.
 - Deferred Standard/Count index становится `Stale` атомарно с primary mutation.
   Stale binding не является query candidate; forced hint ошибочен, обычный planner
   использует exact scan. Потеря недолговечной pending queue после crash означает full rebuild,

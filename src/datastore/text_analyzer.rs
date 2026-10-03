@@ -30,13 +30,33 @@ pub(crate) fn analyze_builtin(
 	analyzer: &SchemaAnalyzer,
 	input: &str,
 ) -> FerrosGrynnResult<Vec<AnalyzedToken>> {
+	analyze_builtin_bounded(analyzer, input, &|_bytes, _work| Ok(()))
+}
+
+/// Applies the normal analyzer with caller admission before token expansion.
+///
+/// # Errors
+/// Propagates validation and caller resource/cancellation failures.
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "Bounded analysis is re-exported for the GQL evaluation boundary"
+)]
+pub(crate) fn analyze_builtin_bounded(
+	analyzer: &SchemaAnalyzer,
+	input: &str,
+	admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<Vec<AnalyzedToken>> {
 	if analyzer.function().is_some() {
 		return Err(FerrosGrynnError::invalid_argument(
 			"a function-backed analyzer requires evaluated UDF tokens",
 		));
 	}
+	admit(
+		input.len().checked_mul(256).ok_or_else(|| analyzer_limit("tokenization scratch"))?,
+		input.len() as u64,
+	)?;
 	let tokens = tokenize(input, analyzer.tokenizers())?;
-	apply_filters(analyzer, tokens)
+	apply_filters(analyzer, tokens, admit)
 }
 
 /// Converts a function result into checked source-spanned tokens, then applies
@@ -51,18 +71,44 @@ pub(crate) fn analyze_function_result(
 	input: &str,
 	result: &Value,
 ) -> FerrosGrynnResult<Vec<AnalyzedToken>> {
+	analyze_function_result_bounded(analyzer, input, result, &|_bytes, _work| Ok(()))
+}
+
+/// Admits function-token copies and ordered filters before allocation.
+///
+/// # Errors
+/// Propagates token validation and caller admission failures.
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "Bounded token conversion is re-exported for the GQL evaluation boundary"
+)]
+pub(crate) fn analyze_function_result_bounded(
+	analyzer: &SchemaAnalyzer,
+	input: &str,
+	result: &Value,
+	admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<Vec<AnalyzedToken>> {
 	if analyzer.function().is_none() {
 		return Err(FerrosGrynnError::invalid_argument(
 			"built-in analyzer does not accept UDF token output",
 		));
 	}
+	admit(0, input.len() as u64)?;
 	let scalar_count = bounded_scalar_count(input)?;
 	let values = result.as_array().ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("analyzer function must return array<object>")
 	})?;
 	check_token_count(values.len())?;
+	admit(
+		values
+			.len()
+			.checked_mul(size_of::<AnalyzedToken>())
+			.ok_or_else(|| analyzer_limit("token array scratch"))?,
+		values.len() as u64,
+	)?;
 	let mut tokens = Vec::with_capacity(values.len());
 	for value in values {
+		admit(0, 1)?;
 		let object = value.as_object().ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("each analyzer function token must be an object")
 		})?;
@@ -82,6 +128,7 @@ pub(crate) fn analyze_function_result(
 			.ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("analyzer token term must be a non-empty string")
 			})?;
+		admit(term.len(), term.len() as u64)?;
 		check_term(term.as_str())?;
 		let start = token_offset(object.get("start"), "start")?;
 		let end = token_offset(object.get("end"), "end")?;
@@ -96,7 +143,7 @@ pub(crate) fn analyze_function_result(
 			end,
 		});
 	}
-	apply_filters(analyzer, tokens)
+	apply_filters(analyzer, tokens, admit)
 }
 
 fn tokenize(
@@ -198,41 +245,59 @@ fn is_punctuation(value: char) -> bool {
 fn apply_filters(
 	analyzer: &SchemaAnalyzer,
 	mut tokens: Vec<AnalyzedToken>,
+	admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Vec<AnalyzedToken>> {
 	for filter in analyzer.filters() {
+		admit(
+			tokens
+				.len()
+				.checked_mul(2 * size_of::<AnalyzedToken>())
+				.ok_or_else(|| analyzer_limit("filter token array"))?,
+			tokens.len() as u64,
+		)?;
 		tokens = match filter {
-			AnalyzerFilter::Nfc => map_terms(tokens, |term| {
+			AnalyzerFilter::Nfc => map_terms(tokens, admit, |term| {
 				ComposingNormalizerBorrowed::new_nfc().normalize(term).into_owned()
 			})?,
-			AnalyzerFilter::Nfkc => map_terms(tokens, |term| {
+			AnalyzerFilter::Nfkc => map_terms(tokens, admit, |term| {
 				ComposingNormalizerBorrowed::new_nfkc().normalize(term).into_owned()
 			})?,
-			AnalyzerFilter::Ascii => map_terms(tokens, deunicode::deunicode)?,
-			AnalyzerFilter::Lowercase => map_terms(tokens, str::to_lowercase)?,
-			AnalyzerFilter::Uppercase => map_terms(tokens, str::to_uppercase)?,
+			AnalyzerFilter::Ascii => map_terms(tokens, admit, deunicode::deunicode)?,
+			AnalyzerFilter::Lowercase => map_terms(tokens, admit, str::to_lowercase)?,
+			AnalyzerFilter::Uppercase => map_terms(tokens, admit, str::to_uppercase)?,
 			AnalyzerFilter::EdgeNgram {
 				min,
 				max,
-			} => ngrams(tokens, usize::from(*min), usize::from(*max), true)?,
+			} => ngrams(tokens, usize::from(*min), usize::from(*max), true, admit)?,
 			AnalyzerFilter::Ngram {
 				min,
 				max,
-			} => ngrams(tokens, usize::from(*min), usize::from(*max), false)?,
+			} => ngrams(tokens, usize::from(*min), usize::from(*max), false, admit)?,
 			AnalyzerFilter::Snowball(language) => {
 				let stemmer = Stemmer::create(stemmer_algorithm(*language));
-				map_terms(tokens, |term| stemmer.stem(&term.to_lowercase()).into_owned())?
+				map_terms(tokens, admit, |term| stemmer.stem(&term.to_lowercase()).into_owned())?
 			}
-			AnalyzerFilter::Mapper(mapper) => tokens
-				.into_iter()
-				.filter_map(|mut token| match mapper.get(&token.term) {
-					Some(Some(replacement)) => {
-						token.term = replacement.clone();
-						Some(token)
+			AnalyzerFilter::Mapper(mapper) => {
+				let mut output = Vec::with_capacity(tokens.len());
+				for mut token in tokens {
+					admit(
+						0,
+						(token.term.len() as u64)
+							.checked_mul(u64::from(usize::BITS - mapper.len().leading_zeros()) + 1)
+							.ok_or_else(|| analyzer_limit("mapper lookup work"))?,
+					)?;
+					match mapper.get(&token.term) {
+						Some(Some(replacement)) => {
+							admit(replacement.len(), replacement.len() as u64)?;
+							token.term = replacement.clone();
+						}
+						Some(None) => continue,
+						None => {}
 					}
-					Some(None) => None,
-					None => Some(token),
-				})
-				.collect(),
+					output.push(token);
+				}
+				output
+			}
 		};
 		check_token_count(tokens.len())?;
 	}
@@ -241,10 +306,22 @@ fn apply_filters(
 
 fn map_terms(
 	tokens: Vec<AnalyzedToken>,
+	admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
 	mut transform: impl FnMut(&str) -> String,
 ) -> FerrosGrynnResult<Vec<AnalyzedToken>> {
 	let mut output = Vec::with_capacity(tokens.len());
 	for mut token in tokens {
+		admit(
+			token
+				.term
+				.len()
+				.checked_mul(128)
+				.and_then(|bytes| bytes.checked_add(MAX_ANALYZER_TERM_BYTES))
+				.ok_or_else(|| analyzer_limit("term transform scratch"))?,
+			(token.term.len() as u64)
+				.checked_mul(128)
+				.ok_or_else(|| analyzer_limit("term transform work"))?,
+		)?;
 		let term = transform(token.term.as_str());
 		if term.is_empty() {
 			continue;
@@ -261,9 +338,19 @@ fn ngrams(
 	minimum: usize,
 	maximum: usize,
 	edge_only: bool,
+	admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Vec<AnalyzedToken>> {
 	let mut output = Vec::new();
 	for token in tokens {
+		admit(
+			token
+				.term
+				.len()
+				.checked_add(1)
+				.and_then(|len| len.checked_mul(2 * size_of::<usize>()))
+				.ok_or_else(|| analyzer_limit("ngram boundaries"))?,
+			token.term.len() as u64,
+		)?;
 		let boundaries = token
 			.term
 			.char_indices()
@@ -272,15 +359,23 @@ fn ngrams(
 			.collect::<Vec<_>>();
 		let scalar_count = boundaries.len().saturating_sub(1);
 		for length in minimum..=maximum.min(scalar_count) {
+			admit(0, 1)?;
 			let starts = if edge_only {
 				0..=0
 			} else {
 				0..=scalar_count.saturating_sub(length)
 			};
 			for start in starts {
+				let term = &token.term[boundaries[start]..boundaries[start + length]];
+				admit(
+					term.len()
+						.checked_add(4 * size_of::<AnalyzedToken>())
+						.ok_or_else(|| analyzer_limit("ngram token scratch"))?,
+					term.len() as u64 + 1,
+				)?;
 				check_token_count(output.len().saturating_add(1))?;
 				output.push(AnalyzedToken {
-					term: Text::from(&token.term[boundaries[start]..boundaries[start + length]]),
+					term: Text::from(term),
 					start: token.start,
 					end: token.end,
 				});
@@ -353,6 +448,68 @@ fn token_offset(value: Option<&Value>, field: &str) -> FerrosGrynnResult<u32> {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn bounded_filters_admit_mapper_and_ngram_expansion_before_copy() {
+		use std::{cell::Cell, collections::BTreeMap};
+
+		use super::analyze_builtin_bounded;
+		use crate::{
+			datastore::{AnalyzerFilter, SchemaAnalyzer},
+			gql_status::FerrosGrynnError,
+			values::Text,
+		};
+		let bytes = Cell::new(0_usize);
+		let work = Cell::new(0_u64);
+		let admit = |allocation: usize, operations: u64| {
+			let next_bytes =
+				bytes.get().checked_add(allocation).filter(|bytes| *bytes <= 1024 * 1024);
+			let next_work = work.get().checked_add(operations).filter(|work| *work <= 2000);
+			let (Some(next_bytes), Some(next_work)) = (next_bytes, next_work) else {
+				return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"test analyzer budget",
+					2000,
+				));
+			};
+			bytes.set(next_bytes);
+			work.set(next_work);
+			Ok(())
+		};
+		let mapper =
+			BTreeMap::from([(Text::from("x"), Some(Text::from("y".repeat(4 * 1024 * 1024))))]);
+		let mapper =
+			SchemaAnalyzer::new("mapper_budget", [], [AnalyzerFilter::Mapper(mapper)]).unwrap();
+		assert_eq!(
+			analyze_builtin_bounded(&mapper, "x", &admit).unwrap_err().status().code().to_string(),
+			"FG-54F13"
+		);
+		bytes.set(0);
+		work.set(0);
+		let grams = SchemaAnalyzer::new("gram_budget", [], [AnalyzerFilter::Ngram {
+			min: 1,
+			max: 1000,
+		}])
+		.unwrap();
+		assert_eq!(
+			analyze_builtin_bounded(&grams, &"a".repeat(1000), &admit)
+				.unwrap_err()
+				.status()
+				.code()
+				.to_string(),
+			"FG-54F13"
+		);
+		bytes.set(0);
+		work.set(0);
+		let small = SchemaAnalyzer::new("small_budget", [], [AnalyzerFilter::Ngram {
+			min: 1,
+			max: 2,
+		}])
+		.unwrap();
+		assert_eq!(
+			analyze_builtin_bounded(&small, "ab", &admit).unwrap(),
+			super::analyze_builtin(&small, "ab").unwrap()
+		);
+	}
+
 	use std::collections::BTreeMap;
 
 	use super::{analyze_builtin, analyze_function_result};

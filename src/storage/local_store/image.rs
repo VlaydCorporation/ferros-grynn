@@ -890,27 +890,34 @@ fn add_graph_artifacts(
 		let reachability = database.reachability_artifacts.get(&id);
 		let neighbourhood = database.neighbourhood_artifacts.get(&id);
 		let path_artifact = database.path_artifacts.get(&id);
+		let tensor_artifact = database.tensor_artifacts.get(&id);
 		let (identity, page_count, descriptor, family) =
-			match (reachability, neighbourhood, path_artifact) {
-				(Some(artifact), None, None) => (
+			match (reachability, neighbourhood, path_artifact, tensor_artifact) {
+				(Some(artifact), None, None, None) => (
 					artifact.layout.header.identity,
 					artifact.layout.page_count,
 					&artifact.descriptor,
 					"reach",
 				),
-				(None, Some(artifact), None) => (
+				(None, Some(artifact), None, None) => (
 					artifact.layout.header.identity,
 					artifact.layout.page_count,
 					&artifact.descriptor,
 					"neighbour",
 				),
-				(None, None, Some(artifact)) => (
+				(None, None, Some(artifact), None) => (
 					artifact.layout.header.identity,
 					artifact.layout.page_count,
 					&artifact.descriptor,
 					"path",
 				),
-				(None, None, None) => continue,
+				(None, None, None, Some(artifact)) => (
+					artifact.layout.header.identity,
+					artifact.layout.page_count,
+					&artifact.descriptor,
+					"tensor",
+				),
+				(None, None, None, None) => continue,
 				_ => {
 					return Err(invalid("graph definition has multiple artifact families"));
 				}
@@ -925,6 +932,11 @@ fn add_graph_artifacts(
 			continue;
 		}
 		let path = format!("{prefix}/idx/{family}_{ordinal:04}.fgidx");
+		let file_kind = if tensor_artifact.is_some() {
+			DataFileKind::TensorCache
+		} else {
+			DataFileKind::Index
+		};
 		let space = DataSpaceId::Graph(graph);
 		let stream = |write: &mut dyn FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>| {
 			if let Some(artifact) = reachability {
@@ -945,6 +957,12 @@ fn add_graph_artifacts(
 					write,
 					&mut crate::storage::check_external_sort_cancelled,
 				)
+			} else if let Some(artifact) = tensor_artifact {
+				artifact.layout.stream(
+					|kind, ordinal, output| artifact.encode_element(kind, ordinal, output),
+					write,
+					&mut crate::storage::check_external_sort_cancelled,
+				)
 			} else {
 				Err(invalid("graph artifact disappeared before page streaming"))
 			}
@@ -960,7 +978,7 @@ fn add_graph_artifacts(
 				})?;
 			layout.add_prewritten(
 				space,
-				DataFileKind::Index,
+				file_kind,
 				DataFileRole::WalBackfilled,
 				path,
 				built.page_count,
@@ -972,6 +990,13 @@ fn add_graph_artifacts(
 				artifact.layout.admit_decode(crate::storage::external_sort_run_budget())?;
 			} else if let Some(artifact) = path_artifact {
 				artifact.layout.admit_decode(crate::storage::external_sort_run_budget())?;
+			} else if let Some(artifact) = tensor_artifact {
+				crate::storage::derived_index::ArraySection::admit_decode(
+					&artifact.layout.sections,
+					artifact.layout.header.rows,
+					artifact.layout.header.connectors,
+					crate::storage::external_sort_run_budget(),
+				)?;
 			}
 			let count = usize::try_from(page_count).map_err(|cause| {
 				invalid("graph artifact image page extent exceeds platform")
@@ -992,14 +1017,7 @@ fn add_graph_artifacts(
 				pages[at.get() as usize].as_bytes_mut().copy_from_slice(page.as_bytes());
 				Ok(())
 			})?;
-			layout.add(
-				space,
-				DataFileKind::Index,
-				DataFileRole::WalBackfilled,
-				path,
-				None,
-				pages,
-			)?
+			layout.add(space, file_kind, DataFileRole::WalBackfilled, path, None, pages)?
 		};
 		physical.insert(id, PhysicalIndexBinding {
 			file_id,

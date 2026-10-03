@@ -227,6 +227,20 @@ pub enum MatchPathMode {
 pub enum MatchPathObjective {
 	Shortest,
 	WeightedShortest,
+	AllShortest,
+	AllWeightedShortest,
+}
+
+impl MatchPathObjective {
+	/// Returns whether this objective preserves every minimum-cost alternative.
+	pub const fn is_all(self) -> bool {
+		matches!(self, Self::AllShortest | Self::AllWeightedShortest)
+	}
+
+	/// Returns whether the objective selects stored or custom numerical costs.
+	pub const fn is_weighted(self) -> bool {
+		matches!(self, Self::WeightedShortest | Self::AllWeightedShortest)
+	}
 }
 
 /// Boolean constraint applied to candidate path branches.

@@ -5,6 +5,7 @@ mod demand;
 mod deterministic;
 mod encode;
 mod estimate;
+pub(in crate::gql) mod fingerprint;
 mod graph_result_plan;
 mod match_plan;
 mod plan;
@@ -26,6 +27,11 @@ pub(in crate::gql) use graph_result_plan::{
 	plan_traverse_graph_result,
 };
 pub(in crate::gql) use match_plan::plan_match;
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "Shared physical metadata is read by both query consumers"
+)]
+pub(crate) use plan::TensorProjectionPlan;
 pub(crate) use plan::{
 	AppliedRule,
 	GraphResultMode,
@@ -69,7 +75,7 @@ pub(in crate::gql) use traverse_plan::plan_traverse;
 pub(in crate::gql) use write_plan::plan_write;
 
 /// Version mixed into canonical query and physical-plan fingerprints.
-pub(crate) const PLAN_ENCODING_VERSION: u16 = 5;
+pub(crate) const PLAN_ENCODING_VERSION: u16 = 6;
 
 #[cfg(test)]
 mod tests;

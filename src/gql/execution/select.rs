@@ -7,11 +7,11 @@ use super::*;
 use crate::gql::{
 	cursor::{CursorAnchor, CursorPage, CursorRecord, IndexSeekCheckout, IndexSeekPlan},
 	ir::LogicalKnnDistance,
+	optimizer::fingerprint,
 	spill::{QuerySorter, SortField, SortedRecords, compare_record_anchor},
 };
 
 mod expression;
-pub(super) mod fingerprint;
 mod join;
 mod pagination;
 mod rows;

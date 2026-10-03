@@ -208,7 +208,7 @@ pub(super) fn open_local_state(
 			.ok_or_else(|| invalid("graph binding has no schema definition"))?
 			.reference()
 			.clone();
-		let (graph, superblock) = open_durable_graph_image(
+		let (mut graph, superblock) = open_durable_graph_image(
 			&wal,
 			&registry,
 			Some(engine),
@@ -220,6 +220,12 @@ pub(super) fn open_local_state(
 			&database,
 			&decode,
 		)?;
+		graph.tensor_revision = database_catalog
+			.graphs
+			.iter()
+			.find(|entry| entry.id == binding.graph_id)
+			.ok_or_else(|| invalid("opened graph has no catalog revision"))?
+			.tensor_revision;
 		database.install_opened_graph(graph)?;
 		graph_superblocks.insert(binding.graph_id, superblock);
 	}
@@ -311,6 +317,7 @@ fn load_graph_artifacts(
 					index.definition(),
 					crate::datastore::GraphIndexDefinition::Reachability { .. }
 						| crate::datastore::GraphIndexDefinition::Neighbourhood { .. }
+						| crate::datastore::GraphIndexDefinition::Tensor { .. }
 						| crate::datastore::GraphIndexDefinition::Path {
 							algorithm: crate::datastore::PathIndexAlgorithm::LandmarkSssp(_),
 							..
@@ -426,6 +433,33 @@ fn load_graph_artifacts(
 							&mut crate::storage::check_external_sort_cancelled,
 						)?;
 						Arc::make_mut(&mut database.path_artifacts).insert(id, Arc::new(artifact));
+					}
+					crate::datastore::GraphIndexDefinition::Tensor {
+						..
+					} => {
+						let layout = crate::storage::TensorCacheLayout::decode_header(
+							&page,
+							identity,
+							registered.page_count(),
+						)?;
+						let data = layout.load_sections(
+							budget,
+							&mut read,
+							&mut crate::storage::check_external_sort_cancelled,
+						)?;
+						let artifact = crate::datastore::TensorArtifact::restore(
+							database,
+							index,
+							layout,
+							data,
+							crate::graph::tensor::GraphAlgorithmLimits {
+								memory_bytes: budget,
+								..Default::default()
+							},
+							&mut crate::storage::check_external_sort_cancelled,
+						)?;
+						Arc::make_mut(&mut database.tensor_artifacts)
+							.insert(id, Arc::new(artifact));
 					}
 					_ => return Err(invalid("unknown graph artifact family")),
 				}

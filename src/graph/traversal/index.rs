@@ -566,12 +566,32 @@ pub fn visit_endpoint_steps(
 			role,
 		})
 	};
-	if let EdgeTopology::Undirected {
-		endpoints,
-	} = topology
-	{
-		let occurrences = endpoints.iter().filter(|source| *source == endpoint).count();
-		for target in endpoints {
+	visit_incidence_targets(
+		topology.direction(),
+		topology.source(),
+		topology.target(),
+		endpoint,
+		direction,
+		&mut emit,
+	)
+}
+
+/// Shares direction and repeated-endpoint rules with ordinal tensor views.
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "Re-exported at crate scope for exact tensor projection"
+)]
+pub(crate) fn visit_incidence_targets<T: Eq>(
+	topology: EdgeDirection,
+	source: &[T],
+	target: &[T],
+	endpoint: &T,
+	direction: TraversalDirection,
+	mut emit: impl FnMut(&T, PathDirection, EndpointRole) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()> {
+	if topology == EdgeDirection::Undirected {
+		let occurrences = source.iter().filter(|candidate| *candidate == endpoint).count();
+		for target in source {
 			for _ in 0..occurrences.saturating_sub(usize::from(target == endpoint)) {
 				emit(target, PathDirection::Undirected, EndpointRole::Undirected)?;
 			}
@@ -581,7 +601,7 @@ pub fn visit_endpoint_steps(
 	for forward in [true, false] {
 		if !forward
 			&& direction == TraversalDirection::Both
-			&& topology.direction() == EdgeDirection::Bidirectional
+			&& topology == EdgeDirection::Bidirectional
 		{
 			continue;
 		}
@@ -590,17 +610,13 @@ pub fn visit_endpoint_steps(
 		{
 			continue;
 		}
-		if (forward || topology.direction() == EdgeDirection::Bidirectional)
-			&& topology.source().contains(endpoint)
-		{
-			for target in topology.target() {
+		if (forward || topology == EdgeDirection::Bidirectional) && source.contains(endpoint) {
+			for target in target {
 				emit(target, PathDirection::Forward, EndpointRole::Target)?;
 			}
 		}
-		if (!forward || topology.direction() == EdgeDirection::Bidirectional)
-			&& topology.target().contains(endpoint)
-		{
-			for target in topology.source() {
+		if (!forward || topology == EdgeDirection::Bidirectional) && target.contains(endpoint) {
+			for target in source {
 				emit(target, PathDirection::Reverse, EndpointRole::Source)?;
 			}
 		}

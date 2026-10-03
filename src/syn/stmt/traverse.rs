@@ -51,7 +51,9 @@ impl Parser<'_> {
 		self.expect_keyword(keywords::FROM, "Expected `FROM` in TRAVERSE statement.")?;
 		let source = if self.consume_keyword(keywords::MATCH).is_some() {
 			TraverseSource::Match(Box::new(
-				context.run(|context| self.match_statement(context, false)).await?,
+				context
+					.run(|context| self.match_statement_with_projection_power(context, false, 2))
+					.await?,
 			))
 		} else if self.consume_keyword(keywords::SELECT).is_some() {
 			TraverseSource::Select(Box::new(

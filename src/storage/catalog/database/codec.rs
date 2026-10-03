@@ -553,6 +553,7 @@ fn encode_graph(output: &mut Vec<u8>, graph: &GraphCatalogEntry) -> FerrosGrynnR
 			index.id().and_then(|id| graph.index_bindings.get(&id).copied()),
 		);
 	}
+	output.extend_from_slice(&graph.tensor_revision.to_le_bytes());
 	Ok(())
 }
 
@@ -634,7 +635,15 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 	let mut index_bindings = BTreeMap::new();
 	for _ in 0..index_count {
 		let index = super::graph_index::decode(decoder)?;
-		if let Some(binding) = read_optional_binding(decoder)? {
+		let kind = if matches!(
+			index.definition(),
+			crate::datastore::GraphIndexDefinition::Tensor { .. }
+		) {
+			DataFileKind::TensorCache
+		} else {
+			DataFileKind::Index
+		};
+		if let Some(binding) = read_optional_binding_kind(decoder, kind)? {
 			let id = index
 				.id()
 				.ok_or_else(|| invalid("graph artifact binding has no definition identity"))?;
@@ -644,7 +653,12 @@ fn decode_graph(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<GraphCatalogEntr
 		}
 		indexes.push(index);
 	}
+	let tensor_revision = decoder.read_u64()?;
+	if tensor_revision > generation {
+		return Err(invalid("graph incidence revision exceeds its publication"));
+	}
 	Ok(GraphCatalogEntry {
+		tensor_revision,
 		id,
 		version,
 		published_at,
@@ -1066,6 +1080,15 @@ fn write_optional_binding(output: &mut Vec<u8>, binding: Option<PhysicalIndexBin
 fn read_optional_binding(
 	decoder: &mut Decoder<'_>,
 ) -> FerrosGrynnResult<Option<PhysicalIndexBinding>> {
+	read_optional_binding_kind(decoder, DataFileKind::Index)
+}
+
+/// Decodes the owning family's physical kind without weakening ordinary
+/// indexes.
+fn read_optional_binding_kind(
+	decoder: &mut Decoder<'_>,
+	kind: DataFileKind,
+) -> FerrosGrynnResult<Option<PhysicalIndexBinding>> {
 	let raw_file = decoder.read_u64()?;
 	let root = PageNo::new(decoder.read_u64()?);
 	if raw_file == 0 && root == PageNo::NULL {
@@ -1073,7 +1096,7 @@ fn read_optional_binding(
 	}
 	let file_id = DataFileId::from_raw(raw_file)
 		.ok_or_else(|| invalid("optional index binding contains an unknown file identity"))?;
-	if file_id.kind() != Some(DataFileKind::Index) || root == PageNo::NULL {
+	if file_id.kind() != Some(kind) || root == PageNo::NULL {
 		return Err(invalid("optional index binding is incomplete"));
 	}
 	Ok(Some(PhysicalIndexBinding {

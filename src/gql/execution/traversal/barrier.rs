@@ -13,7 +13,10 @@ pub(super) const fn is_barrier(kind: TraverseStepKind) -> bool {
 }
 
 pub(super) enum BarrierCursor {
-	Buffered(VecDeque<Traverser>),
+	Buffered {
+		values: VecDeque<Traverser>,
+		account: BarrierAccount,
+	},
 	Records(RecordStream),
 	Groups {
 		stream: RecordStream,
@@ -27,7 +30,16 @@ impl BarrierCursor {
 		machine: &mut TraversalMachine<'_, Read>,
 	) -> FerrosGrynnResult<Option<Traverser>> {
 		match self {
-			Self::Buffered(values) => Ok(values.pop_front()),
+			Self::Buffered {
+				values,
+				account,
+			} => {
+				let value = values.pop_front();
+				if let Some(value) = &value {
+					account.release(value.estimated_heap_bytes());
+				}
+				Ok(value)
+			}
 			Self::Records(stream) => {
 				stream.next()?.map(|record| machine.traverser_from_record(record)).transpose()
 			}
@@ -58,12 +70,18 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 					}
 				})
 			}
-			TraverseStepKind::Fold => self.fold(upstream).map(buffered_value),
-			TraverseStepKind::Count => self.count(upstream).map(buffered_value),
+			TraverseStepKind::Fold => {
+				self.fold(upstream).and_then(|value| buffered_value(value, self.control))
+			}
+			TraverseStepKind::Count => {
+				self.count(upstream).and_then(|value| buffered_value(value, self.control))
+			}
 			TraverseStepKind::Sum
 			| TraverseStepKind::Minimum
 			| TraverseStepKind::Maximum
-			| TraverseStepKind::Average => self.aggregate_stream(upstream, step.kind).map(buffered_value),
+			| TraverseStepKind::Average => self
+				.aggregate_stream(upstream, step.kind)
+				.and_then(|value| buffered_value(value, self.control)),
 			kind => self.algorithm_barrier(upstream, kind, step),
 		}
 	}
@@ -210,6 +228,7 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 						self.control.barrier_memory_limit() as u64,
 					));
 				}
+				reserve_slot(&mut values, &mut account, self.control)?;
 				values.push(traverser.current.clone());
 			}
 		}
@@ -302,10 +321,12 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 					self.control.barrier_memory_limit() as u64,
 				));
 			}
+			reserve_slot(&mut input, &mut account, self.control)?;
 			input.push(traverser);
 		}
-		self.execute_algorithm(kind, step, input)
-			.map(|values| BarrierCursor::Buffered(values.into()))
+		let values = self.execute_algorithm(kind, step, input)?;
+		drop(account);
+		buffered_values(values, self.control)
 	}
 
 	fn traverser_record(
@@ -470,8 +491,89 @@ fn next_group<Read: QueryRead>(
 	Ok(Some(Traverser::new(Value::Object(value))))
 }
 
-fn buffered_value(value: Value) -> BarrierCursor {
-	BarrierCursor::Buffered(VecDeque::from([Traverser::new(value)]))
+fn buffered_value(value: Value, control: &ExecutionControl) -> FerrosGrynnResult<BarrierCursor> {
+	let mut account = control.barrier_account();
+	let traverser = Traverser::new(value);
+	if !account.reserve(traverser.estimated_heap_bytes()) {
+		return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+			"retained traversal result",
+			control.barrier_memory_limit() as u64,
+		));
+	}
+	let mut values = Vec::new();
+	reserve_slot(&mut values, &mut account, control)?;
+	values.push(traverser);
+	Ok(BarrierCursor::Buffered {
+		values: values.into(),
+		account,
+	})
+}
+
+/// Admits old and new allocations before growing a buffered array.
+fn reserve_slot<T>(
+	values: &mut Vec<T>,
+	account: &mut BarrierAccount,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<()> {
+	if values.len() < values.capacity() {
+		return Ok(());
+	}
+	let old = values
+		.capacity()
+		.checked_mul(size_of::<T>())
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("traversal buffer capacity"))?;
+	let capacity = values
+		.capacity()
+		.checked_mul(2)
+		.map(|value| value.max(4))
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("traversal buffer capacity"))?;
+	let bytes = capacity
+		.checked_mul(size_of::<T>())
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("traversal buffer bytes"))?;
+	if !account.reserve(bytes) {
+		return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+			"traversal buffer capacity",
+			control.barrier_memory_limit() as u64,
+		));
+	}
+	values.try_reserve_exact(capacity - values.len()).map_err(|cause| {
+		FerrosGrynnError::traversal_resource_limit_exceeded(
+			"traversal buffer allocation",
+			control.barrier_memory_limit() as u64,
+		)
+		.with_technical_source(cause)
+	})?;
+	account.release(old);
+	Ok(())
+}
+
+/// Holds complete retained output under the shared account until it is pulled.
+fn buffered_values(
+	values: Vec<Traverser>,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<BarrierCursor> {
+	let bytes = values.iter().try_fold(
+		values
+			.capacity()
+			.checked_mul(size_of::<Traverser>())
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("traversal result capacity"))?,
+		|bytes, value| {
+			bytes
+				.checked_add(value.estimated_heap_bytes())
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("traversal result bytes"))
+		},
+	)?;
+	let mut account = control.barrier_account();
+	if !account.reserve(bytes) {
+		return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+			"retained graph result",
+			control.barrier_memory_limit() as u64,
+		));
+	}
+	Ok(BarrierCursor::Buffered {
+		values: values.into(),
+		account,
+	})
 }
 
 fn spill_u32(value: Option<Value>, field: &str) -> FerrosGrynnResult<u32> {
@@ -481,4 +583,29 @@ fn spill_u32(value: Option<Value>, field: &str) -> FerrosGrynnResult<u32> {
 		.ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file(format!("traversal run {field} is invalid"))
 		})
+}
+
+#[cfg(test)]
+mod tests {
+	use std::num::NonZeroUsize;
+
+	use super::*;
+
+	#[test]
+	fn capacity_is_admitted_before_growth_including_old_allocation() {
+		let options = crate::gql::QueryExecutionOptions {
+			barrier_memory_bytes: NonZeroUsize::new(64).unwrap(),
+			..Default::default()
+		};
+		let control = ExecutionControl::new(&options, None);
+		let mut account = control.barrier_account();
+		let mut traversers = Vec::<Traverser>::new();
+		assert!(reserve_slot(&mut traversers, &mut account, &control).is_err());
+		assert_eq!(traversers.capacity(), 0);
+		let mut values = Vec::<u64>::new();
+		reserve_slot(&mut values, &mut account, &control).unwrap();
+		values.extend([0, 1, 2, 3]);
+		assert!(reserve_slot(&mut values, &mut account, &control).is_err());
+		assert_eq!(values.capacity(), 4);
+	}
 }

@@ -879,38 +879,82 @@ pub(crate) enum TraverseStepKind {
 	HasCycle,
 	/// Explicit approximate distinct count within the given hop radius.
 	KHopEstimate,
+	/// Normalized sparse PageRank over induced qualified occurrences.
+	PageRank,
+	/// Exact in/out/total degree and stored connector strength.
+	Degree,
+	/// Reciprocal finite distances with unreachable occurrences contributing zero.
+	HarmonicCloseness,
+	/// Full-source Brandes centrality with parallel shortest multiplicity.
+	Betweenness,
+	/// Shifted sparse power iteration with original eigenproblem residual.
+	Eigenvector,
+	/// Contractive Katz iteration with an admitted norm bound.
+	Katz,
+	/// Exact binary undirected and directed triangle counts.
+	Triangles,
+	/// Local, mean and global clustering coefficients.
+	Clustering,
+	/// Canonical sequential weighted or unweighted community voting.
+	LabelPropagation,
+	/// Positive-gain local moves and deterministic community aggregation.
+	Louvain,
+	/// Complete minimal hop paths for each qualified source-target seed.
+	AllShortestPaths,
+	/// Complete minimal stored or PURE COST paths using exact Number ordering.
+	AllWeightedShortestPaths,
 }
 
 impl TraverseStepKind {
-	pub(super) const fn is_barrier(self) -> bool {
+	/// Identifies the qualified graph-wide tensor consumers.
+	pub(super) const fn is_tensor_analytics(self) -> bool {
 		matches!(
 			self,
-			Self::Deduplicate
-				| Self::DeduplicateBy
-				| Self::Order
-				| Self::Group
-				| Self::Fold
-				| Self::Count
-				| Self::Sum
-				| Self::Minimum
-				| Self::Maximum
-				| Self::Average
-				| Self::KHop
-				| Self::KHopEstimate
-				| Self::Reachable
-				| Self::ShortestPath
-				| Self::WeightedShortestPath
-				| Self::DistanceTo
-				| Self::BellmanFord
-				| Self::TopologicalSort
-				| Self::StronglyConnectedComponents
-				| Self::WeaklyConnectedComponents
-				| Self::Condensation
-				| Self::MinimumSpanningForest
-				| Self::Cuts
-				| Self::LowestCommonAncestor
-				| Self::HasCycle
+			Self::PageRank
+				| Self::Degree
+				| Self::HarmonicCloseness
+				| Self::Betweenness
+				| Self::Eigenvector
+				| Self::Katz
+				| Self::Triangles
+				| Self::Clustering
+				| Self::LabelPropagation
+				| Self::Louvain
 		)
+	}
+
+	pub(super) const fn is_barrier(self) -> bool {
+		self.is_tensor_analytics()
+			|| matches!(
+				self,
+				Self::Deduplicate
+					| Self::DeduplicateBy
+					| Self::Order
+					| Self::Group
+					| Self::Fold
+					| Self::Count
+					| Self::Sum
+					| Self::Minimum
+					| Self::Maximum
+					| Self::Average
+					| Self::KHop
+					| Self::KHopEstimate
+					| Self::Reachable
+					| Self::ShortestPath
+					| Self::WeightedShortestPath
+					| Self::AllShortestPaths
+					| Self::AllWeightedShortestPaths
+					| Self::DistanceTo
+					| Self::BellmanFord
+					| Self::TopologicalSort
+					| Self::StronglyConnectedComponents
+					| Self::WeaklyConnectedComponents
+					| Self::Condensation
+					| Self::MinimumSpanningForest
+					| Self::Cuts
+					| Self::LowestCommonAncestor
+					| Self::HasCycle
+			)
 	}
 }
 

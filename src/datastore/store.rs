@@ -133,12 +133,18 @@ impl Datastore {
 	/// Opens, recovers, and exclusively owns an existing local database.
 	pub fn open_local(path: impl AsRef<Path>, options: LocalOptions) -> FerrosGrynnResult<Self> {
 		let validated = validate_local_options(options)?;
-		let (local, root) = LocalStore::open(
-			path.as_ref(),
-			validated.pool_pages,
-			validated.io_mode,
-			validated.checkpoint_page_threshold,
-			options.checkpoint.interval,
+		let (local, root) = crate::storage::with_external_sort_options(
+			options.maintenance.max_memory_bytes,
+			options.maintenance.max_parallelism,
+			|| {
+				LocalStore::open(
+					path.as_ref(),
+					validated.pool_pages,
+					validated.io_mode,
+					validated.checkpoint_page_threshold,
+					options.checkpoint.interval,
+				)
+			},
 		)?;
 		let store = Self::from_parts(
 			DatastoreOptions::Local(options),
@@ -192,6 +198,67 @@ impl Datastore {
 	/// Cooperatively cancels one queued or running maintenance job.
 	pub fn kill_job(&self, id: super::JobId) -> FerrosGrynnResult<MaintenanceJobInfo> {
 		self.inner.maintenance.kill(self.inner.as_ref(), id)
+	}
+
+	/// Builds or rebuilds one graph index through the existing publication
+	/// path.
+	///
+	/// # Errors
+	/// Returns a missing definition, invalid options, concurrent revision,
+	/// resource, cancellation or storage error.
+	pub fn rebuild_graph_index(
+		&self,
+		graph: crate::graph::GraphId,
+		index: super::IndexId,
+		options: MaintenanceOptions,
+	) -> FerrosGrynnResult<()> {
+		let target = self.graph_index_target(graph, index)?;
+		self.run_foreground_maintenance(MaintenanceJobKind::RebuildIndex, target, options)
+	}
+
+	/// Queues a graph-index rebuild on the datastore's durable maintenance
+	/// worker.
+	///
+	/// # Errors
+	/// Returns a missing definition, invalid options, queue or storage error.
+	pub fn rebuild_graph_index_concurrently(
+		&self,
+		graph: crate::graph::GraphId,
+		index: super::IndexId,
+		options: Option<MaintenanceOptions>,
+	) -> FerrosGrynnResult<super::JobId> {
+		let target = self.graph_index_target(graph, index)?;
+		self.enqueue_maintenance(MaintenanceJobKind::RebuildIndex, target, options)
+	}
+
+	/// Resolves an exact graph index/version for both SDK maintenance routes.
+	fn graph_index_target(
+		&self,
+		graph: crate::graph::GraphId,
+		index: super::IndexId,
+	) -> FerrosGrynnResult<MaintenanceTarget> {
+		let root = self.inner.current_root();
+		let schema = root.schema.graph(graph).ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::graph_does_not_exist(graph.to_string())
+		})?;
+		let version = if let Some(definition) =
+			schema.indexes().find(|definition| definition.id() == Some(index))
+		{
+			definition.version()
+		} else if let Some(endpoint) =
+			schema.edge_endpoint_index().filter(|endpoint| endpoint.id() == index)
+		{
+			endpoint.version()
+		} else {
+			return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+				"graph index is absent",
+			));
+		};
+		Ok(MaintenanceTarget::GraphIndex {
+			graph,
+			index,
+			version,
+		})
 	}
 
 	pub(crate) fn enqueue_maintenance(

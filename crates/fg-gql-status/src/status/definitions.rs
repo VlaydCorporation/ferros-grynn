@@ -1419,6 +1419,22 @@ define_status_codes!(
 			maximum: u64 => DisplayValue,
 		},
 	},
+	GraphAlgorithmDidNotConverge, "FG-54F14" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::ProgramLimitExceeded,
+		domain: Domain::Graph,
+		subcondition: "graph algorithm did not converge",
+		message: "Graph algorithm {algorithm} did not converge in {iterations} iterations; residual is {residual}.",
+		params: {
+			algorithm: String => Identifier,
+			iterations: u64 => DisplayValue,
+			residual: f64 => DisplayValue,
+		},
+	},
 	UserThrown, "FG-52F01" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,

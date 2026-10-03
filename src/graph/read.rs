@@ -14,6 +14,32 @@ use crate::{
 	values::runtime::{Number, PropertyMap, RecordId, Text, Uuid},
 };
 
+/// Resolves containment metadata without materializing the child graph.
+///
+/// # Errors
+/// Propagates reader errors and rejects missing or invalid owners.
+#[allow(clippy::redundant_pub_crate, reason = "Re-exported at crate scope for snapshot adapters")]
+pub(crate) fn nested_graph_reference<G: GraphRead>(
+	graph: &G,
+	owner: AtomId,
+) -> FerrosGrynnResult<Option<GraphRef>> {
+	match owner.kind() {
+		Some(AtomKind::Node) => graph
+			.node(owner)?
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("node", owner.to_string()))?
+			.inner_graph_ref()
+			.map(|value| value.map(Cow::into_owned)),
+		Some(AtomKind::Edge) => graph
+			.edge(owner)?
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("edge", owner.to_string()))?
+			.transition_graph_ref()
+			.map(|value| value.map(Cow::into_owned)),
+		None => Err(FerrosGrynnError::invalid_storage_file(
+			"MATCH containment owner has an invalid atom kind",
+		)),
+	}
+}
+
 /// Stable iterator over atom handles in a graph snapshot.
 pub struct AtomIds<'a> {
 	inner: cow_vec::Iter<'a, AtomId>,

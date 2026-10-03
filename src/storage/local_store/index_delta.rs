@@ -60,6 +60,7 @@ impl IndexReusePlan {
 					next.reachability_artifacts.contains_key(id)
 						|| next.neighbourhood_artifacts.contains_key(id)
 						|| next.path_artifacts.contains_key(id)
+						|| next.tensor_artifacts.contains_key(id)
 				}) else {
 					continue;
 				};

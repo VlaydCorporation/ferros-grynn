@@ -154,9 +154,7 @@ impl StatisticsStore {
 		atom: &BaseAtom,
 		occurrence: &GraphOccurrence,
 	) -> FerrosGrynnResult<()> {
-		let property_count =
-			u64::try_from(effective_property_count(atom.properties(), occurrence)?)
-				.map_err(|_error| invalid("effective property count exceeds u64"))?;
+		let property_count = effective_property_count(atom.properties(), occurrence)?;
 		let statistics =
 			self.graph_mut(graph).ok_or_else(|| invalid("statistics graph is absent"))?;
 		decrement(
@@ -184,21 +182,13 @@ impl StatisticsStore {
 					undirected,
 					"total undirected degree",
 				)?;
-				statistics.maximum_out_degree = statistics.maximum_out_degree.min(statistics.total_out_degree);
-				statistics.maximum_in_degree = statistics.maximum_in_degree.min(statistics.total_in_degree);
+				statistics.maximum_out_degree =
+					statistics.maximum_out_degree.min(statistics.total_out_degree);
+				statistics.maximum_in_degree =
+					statistics.maximum_in_degree.min(statistics.total_in_degree);
 			}
 		}
-		if let Some(label) = occurrence.label() {
-			let label = statistics
-				.labels
-				.get_mut(&LabelStatisticKey {
-					kind: atom.kind(),
-					label: label.clone(),
-				})
-				.ok_or_else(|| invalid("label statistic is absent"))?;
-			decrement(&mut label.atom_count, 1, "label atom count")?;
-			decrement(&mut label.property_count, property_count, "label property count")?;
-		}
+		self.remove_label(graph, atom, occurrence, property_count)?;
 		self.mark_graph_dirty(graph, 1)
 	}
 
@@ -211,17 +201,31 @@ impl StatisticsStore {
 	) -> FerrosGrynnResult<()> {
 		let before_count = effective_property_count(atom.properties(), before)?;
 		let after_count = effective_property_count(atom.properties(), after)?;
-		if let (OccurrenceState::Edge { topology: before, .. }, OccurrenceState::Edge { topology: after, .. }) = (before.state(), after.state())
-			&& before != after {
+		if let (
+			OccurrenceState::Edge {
+				topology: before,
+				..
+			},
+			OccurrenceState::Edge {
+				topology: after,
+				..
+			},
+		) = (before.state(), after.state())
+			&& before != after
+		{
 			let before = topology_counts(before)?;
 			let after = topology_counts(after)?;
-			let statistics = self.graph_mut(graph).ok_or_else(|| invalid("statistics graph is absent"))?;
+			let statistics =
+				self.graph_mut(graph).ok_or_else(|| invalid("statistics graph is absent"))?;
 			for (total, old, new) in [
 				(&mut statistics.total_out_degree, before[0], after[0]),
 				(&mut statistics.total_in_degree, before[1], after[1]),
 				(&mut statistics.total_undirected_degree, before[2], after[2]),
 			] {
-				*total = total.checked_sub(old).and_then(|value| value.checked_add(new)).ok_or_else(|| invalid("topology degree delta exceeds its counter domain"))?;
+				*total = total
+					.checked_sub(old)
+					.and_then(|value| value.checked_add(new))
+					.ok_or_else(|| invalid("topology degree delta exceeds its counter domain"))?;
 			}
 			statistics.maximum_out_degree = statistics.total_out_degree;
 			statistics.maximum_in_degree = statistics.total_in_degree;
@@ -277,22 +281,28 @@ impl StatisticsStore {
 		let Some(label) = occurrence.label() else {
 			return Ok(());
 		};
-		let statistic = self
-			.graph_mut(graph)
-			.ok_or_else(|| invalid("statistics graph is absent"))?
-			.labels
-			.get_mut(&LabelStatisticKey {
-				kind: atom.kind(),
-				label: label.clone(),
-			})
-			.ok_or_else(|| invalid("label statistic is absent"))?;
+		let statistics =
+			self.graph_mut(graph).ok_or_else(|| invalid("statistics graph is absent"))?;
+		let key = LabelStatisticKey {
+			kind: atom.kind(),
+			label: label.clone(),
+		};
+		let statistic =
+			statistics.labels.get_mut(&key).ok_or_else(|| invalid("label statistic is absent"))?;
 		decrement(&mut statistic.atom_count, 1, "label atom count")?;
 		decrement(
 			&mut statistic.property_count,
 			u64::try_from(property_count)
 				.map_err(|_error| invalid("effective property count exceeds u64"))?,
 			"label property count",
-		)
+		)?;
+		if statistic.atom_count == 0 {
+			if statistic.property_count != 0 {
+				return Err(invalid("empty label has nonzero property count"));
+			}
+			statistics.labels.remove(&key);
+		}
+		Ok(())
 	}
 
 	fn adjust_label_property_count(

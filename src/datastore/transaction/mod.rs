@@ -48,6 +48,7 @@ use crate::{
 	values::{Number, PropertyKeyId, PropertyMap, RecordId, RecordIdPart, Text, Value},
 };
 
+mod all_shortest;
 mod build_graph;
 mod commit;
 mod graph;
@@ -55,12 +56,18 @@ mod graph_view;
 mod import;
 mod query;
 mod schema;
+mod tensor;
 mod writeback;
 
 #[cfg(test)]
 mod tests;
 
 pub use graph_view::TransactionGraphView;
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "Tensor metadata crosses the datastore query adapter"
+)]
+pub(crate) use query::QueryTensorCache;
 pub(crate) use query::{
 	QueryGeometryIndexRead,
 	QuerySnapshot,
@@ -72,6 +79,7 @@ pub(crate) use query::{
 	ScalarIndexWindow,
 };
 pub use query::{QueryLandmarkPath, QueryNeighbourhoodEstimate, QueryNeighbourhoodSketch};
+pub use tensor::capture_tensor;
 
 /// Owned database-global atom value returned by a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]

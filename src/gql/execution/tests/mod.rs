@@ -14,5 +14,7 @@ mod match_standard;
 mod optimizer_probe;
 mod schema;
 mod select;
+mod tensor_analytics;
+mod tensor_paths;
 mod transaction;
 mod traversal;

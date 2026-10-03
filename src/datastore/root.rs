@@ -49,6 +49,8 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) neighbourhood_artifacts: Arc<BTreeMap<IndexId, Arc<super::NeighbourhoodArtifact>>>,
 	/// Immutable directed landmark tables retained by the logical snapshot.
 	pub(crate) path_artifacts: Arc<BTreeMap<IndexId, Arc<super::LandmarkPathArtifact>>>,
+	/// Full qualified incidence generations retained by old logical snapshots.
+	pub(crate) tensor_artifacts: Arc<BTreeMap<IndexId, Arc<super::TensorArtifact>>>,
 	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphRoot>>,
 	pub(crate) versions: Arc<BTreeMap<ConflictKey, u64>>,
 }
@@ -122,6 +124,7 @@ impl Default for DatabaseRoot {
 			reachability_artifacts: Arc::new(BTreeMap::new()),
 			neighbourhood_artifacts: Arc::new(BTreeMap::new()),
 			path_artifacts: Arc::new(BTreeMap::new()),
+			tensor_artifacts: Arc::new(BTreeMap::new()),
 			graphs: BTreeMap::new(),
 			versions: Arc::new(BTreeMap::new()),
 		}
@@ -1072,6 +1075,7 @@ impl DatabaseRoot {
 		change(&mut after);
 		let cost_changed = before != after;
 		let weight_changed = matches!((before.state(), after.state()), (OccurrenceState::Edge { weight: before, .. }, OccurrenceState::Edge { weight: after, .. }) if before != after);
+		let tensor_changed = before.label() != after.label() || before.state() != after.state();
 		let class = self.schema.class_by_id(atom.class_id());
 		let relation_changed = before.label() != after.label() && local.is_edge()
 			|| match (before.state(), after.state()) {
@@ -1122,6 +1126,9 @@ impl DatabaseRoot {
 		if weight_changed {
 			self.invalidate_path_cost_artifacts(Some(graph), true);
 		}
+		if tensor_changed {
+			self.invalidate_tensor_artifacts(graph);
+		}
 		Ok(())
 	}
 
@@ -1131,6 +1138,12 @@ impl DatabaseRoot {
 
 	pub(crate) fn mark_version(&mut self, key: ConflictKey, commit_ts: u64) {
 		Arc::make_mut(&mut self.versions).insert(key, commit_ts);
+		if let ConflictKey::GraphIncidence(graph, _) | ConflictKey::GraphMembership(graph, _) = key
+		{
+			if let Some(root) = self.graphs.get_mut(&graph) {
+				Arc::make_mut(root).tensor_revision = commit_ts;
+			}
+		}
 	}
 
 	pub(crate) fn advance_identity_clocks(&mut self, next_schema_id: u64, next_graph_id: u64) {
@@ -1152,7 +1165,8 @@ impl DatabaseRoot {
 
 	/// Excludes graph relation artifacts after a successful relation
 	/// mutation.
-	fn invalidate_relation_artifacts(&mut self, graph: GraphId) {
+	pub(super) fn invalidate_relation_artifacts(&mut self, graph: GraphId) {
+		self.invalidate_tensor_artifacts(graph);
 		let Some(schema) = self.schema.graph(graph) else {
 			return;
 		};
@@ -1183,6 +1197,36 @@ impl DatabaseRoot {
 						Arc::make_mut(&mut self.neighbourhood_artifacts).remove(&id);
 						Arc::make_mut(&mut self.path_artifacts).remove(&id);
 					}
+				}
+			}
+		}
+	}
+
+	/// Invalidates every cache that captured this graph, including rooted
+	/// owners.
+	fn invalidate_tensor_artifacts(&mut self, graph: GraphId) {
+		let relevant = |artifact: &super::TensorArtifact| {
+			artifact.dependencies.iter().any(|(dependency, _)| *dependency == graph)
+		};
+		if !self.tensor_artifacts.values().any(|artifact| relevant(artifact)) {
+			return;
+		}
+		let artifacts = Arc::make_mut(&mut self.tensor_artifacts);
+		for schema in Arc::make_mut(&mut self.schema).graphs.values_mut() {
+			if !schema.indexes().any(|index| {
+				index
+					.id()
+					.and_then(|id| artifacts.get(&id))
+					.is_some_and(|artifact| relevant(artifact))
+			}) {
+				continue;
+			}
+			for index in &mut Arc::make_mut(schema).indexes {
+				if let Some(id) = index.id()
+					&& artifacts.get(&id).is_some_and(|artifact| relevant(artifact))
+				{
+					index.state = ClassIndexState::Stale;
+					artifacts.remove(&id);
 				}
 			}
 		}

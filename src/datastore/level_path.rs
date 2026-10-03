@@ -32,6 +32,17 @@ impl DatabaseRoot {
 		graph: GraphId,
 		global: GlobalAtomId,
 	) -> FerrosGrynnResult<Value> {
+		self.level_path_value_bounded(graph, global, &|_bytes, _work| Ok(()))
+	}
+
+	/// Builds the same value with allocation/work admission before every copy.
+	pub(crate) fn level_path_value_bounded(
+		&self,
+		graph: GraphId,
+		global: GlobalAtomId,
+		admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Value> {
+		admit(256, 1)?;
 		let local = self.membership(graph, global).ok_or_else(|| {
 			FerrosGrynnError::atom_does_not_exist("occurrence", global.to_string())
 		})?;
@@ -46,7 +57,7 @@ impl DatabaseRoot {
 			} => {
 				let mut value = Object::new();
 				value.insert("kind", "atom");
-				value.insert("chains", self.containment_chains_value(graph)?);
+				value.insert("chains", self.containment_chains_value(graph, admit)?);
 				Ok(Value::Object(value))
 			}
 			OccurrenceState::Edge {
@@ -76,8 +87,8 @@ impl DatabaseRoot {
 				};
 				let mut value = Object::new();
 				value.insert("kind", "binary_edge");
-				value.insert("source", self.endpoint_level_path(graph, source)?);
-				value.insert("target", self.endpoint_level_path(graph, target)?);
+				value.insert("source", self.endpoint_level_path(graph, source, admit)?);
+				value.insert("target", self.endpoint_level_path(graph, target, admit)?);
 				Ok(Value::Object(value))
 			}
 		}
@@ -87,12 +98,14 @@ impl DatabaseRoot {
 		&self,
 		graph: GraphId,
 		endpoint: &EdgeEndpoint,
+		admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<Value> {
+		admit(256, 1)?;
 		let (graph, occurrence) = self.resolve_level_path_endpoint(graph, endpoint)?;
-		let atom = self.atom_ref(occurrence)?;
+		let atom = self.atom_ref(occurrence, admit)?;
 		let mut value = Object::new();
 		value.insert("atom", atom);
-		value.insert("chains", self.containment_chains_value(graph)?);
+		value.insert("chains", self.containment_chains_value(graph, admit)?);
 		Ok(Value::Object(value))
 	}
 
@@ -135,8 +148,23 @@ impl DatabaseRoot {
 		}
 	}
 
-	fn containment_chains_value(&self, child: GraphId) -> FerrosGrynnResult<Value> {
-		let chains = self.containment_chains(child, &mut BTreeSet::new())?;
+	fn containment_chains_value(
+		&self,
+		child: GraphId,
+		admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Value> {
+		let chains = self.containment_chains(child, admit)?;
+		let owners = chains
+			.iter()
+			.try_fold(0_usize, |count, chain| count.checked_add(chain.len()))
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("LevelPath owners"))?;
+		admit(
+			owners
+				.checked_mul(384)
+				.and_then(|bytes| bytes.checked_add(chains.len().checked_mul(128)?))
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("LevelPath value"))?,
+			owners as u64,
+		)?;
 		Ok(Value::Array(Array::new(
 			chains
 				.into_iter()
@@ -160,64 +188,114 @@ impl DatabaseRoot {
 	fn containment_chains(
 		&self,
 		child: GraphId,
-		visiting: &mut BTreeSet<(GraphId, GlobalAtomId)>,
+		admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<Vec<ContainmentChain>> {
-		let parents = self.containment_parents(child)?;
-		if parents.is_empty() {
-			return Ok(vec![Vec::new()]);
-		}
 		#[allow(
 			clippy::mutable_key_type,
 			reason = "GraphRef ordering uses immutable graph identity and revision fields"
 		)]
 		let mut chains = BTreeSet::new();
-		for (graph, owner_global, owner) in parents {
-			let key = (graph.id(), owner_global);
-			if !visiting.insert(key) {
-				return Err(FerrosGrynnError::graph_constraint_violation(
-					graph.name().to_string(),
-					"LevelPath containment contains a cycle",
-				));
-			}
-			for mut chain in self.containment_chains(graph.id(), visiting)? {
-				chain.push(ContainmentOwner {
-					graph: graph.clone(),
-					owner: owner.clone(),
-				});
+		admit(128, 1)?;
+		let mut pending = vec![(child, Vec::<ContainmentOwner>::new())];
+		while let Some((child, mut chain)) = pending.pop() {
+			let parents = self.containment_parents(child, admit)?;
+			if parents.is_empty() {
+				admit(128, chain.len() as u64)?;
+				chain.reverse();
 				chains.insert(chain);
+				continue;
 			}
-			visiting.remove(&key);
+			for (graph, _owner_global, owner) in parents {
+				admit(0, chain.len() as u64)?;
+				if chain
+					.iter()
+					.any(|current| current.graph.id() == graph.id() && current.owner == owner)
+				{
+					return Err(FerrosGrynnError::graph_constraint_violation(
+						graph.name().to_string(),
+						"LevelPath containment contains a cycle",
+					));
+				}
+				let shell_bytes = chain
+					.len()
+					.checked_add(1)
+					.and_then(|len| {
+						len.checked_mul(2 * size_of::<ContainmentOwner>() + 2 * size_of::<Value>())
+					})
+					.and_then(|bytes| bytes.checked_add(128))
+					.ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("LevelPath chain storage")
+					})?;
+				let bytes = chain
+					.iter()
+					.try_fold(shell_bytes, |bytes, current| {
+						bytes.checked_add(
+							current.graph.name().len() + current.owner.id().estimated_heap_bytes(),
+						)
+					})
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("LevelPath chain"))?;
+				admit(bytes, chain.len() as u64)?;
+				let mut next = chain.clone();
+				let parent = graph.id();
+				next.push(ContainmentOwner {
+					graph,
+					owner,
+				});
+				pending.push((parent, next));
+			}
 		}
+		admit(
+			chains
+				.len()
+				.checked_mul(size_of::<ContainmentChain>())
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("LevelPath result"))?,
+			chains.len() as u64,
+		)?;
 		Ok(chains.into_iter().collect())
 	}
 
 	fn containment_parents(
 		&self,
 		child: GraphId,
+		admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<Vec<(GraphRef, GlobalAtomId, AtomRef)>> {
 		let mut parents = Vec::new();
 		for graph in self.graphs.values() {
+			admit(0, 1)?;
 			for occurrence in graph.occurrences() {
+				admit(0, 1)?;
 				if occurrence_child(occurrence) == Some(child) {
+					admit(256 + graph.reference().name().len(), 1)?;
 					parents.push((
 						graph.reference().clone(),
 						occurrence.global_id(),
-						self.atom_ref(occurrence)?,
+						self.atom_ref(occurrence, admit)?,
 					));
 				}
 			}
 		}
+		admit(
+			0,
+			(parents.len() as u64)
+				.checked_mul(u64::from(usize::BITS - parents.len().leading_zeros()) + 1)
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("LevelPath sorting"))?,
+		)?;
 		parents.sort_by(|left, right| (left.0.id(), &left.2).cmp(&(right.0.id(), &right.2)));
 		parents.dedup_by(|left, right| left.0.id() == right.0.id() && left.2 == right.2);
 		Ok(parents)
 	}
 
-	fn atom_ref(&self, occurrence: &GraphOccurrence) -> FerrosGrynnResult<AtomRef> {
+	fn atom_ref(
+		&self,
+		occurrence: &GraphOccurrence,
+		admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<AtomRef> {
 		let atom = self.atom(occurrence.global_id()).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file(
 				"LevelPath occurrence references an absent base atom",
 			)
 		})?;
+		admit(atom.record_id().estimated_heap_bytes(), 1)?;
 		Ok(AtomRef::new(atom.kind(), atom.record_id().clone()))
 	}
 }

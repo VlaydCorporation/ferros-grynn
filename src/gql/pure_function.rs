@@ -37,6 +37,15 @@ pub(crate) struct PureFunctionEvaluator<'a> {
 }
 
 impl<'a> PureFunctionEvaluator<'a> {
+	/// Reuses bounded occurrence resolution and gas for query path predicates.
+	pub(in crate::gql) fn fields<'b>(
+		&'b self,
+		read: &'b dyn Fn(crate::datastore::ConflictKey),
+		work: &'b dyn Fn(u64) -> FerrosGrynnResult<()>,
+	) -> impl crate::gql::execution::AtomFieldRead + 'b {
+		crate::gql::execution::RootFields::new(self.catalog.0, &self.control, read, work)
+	}
+
 	/// Captures the exact catalog root being persisted.
 	pub(crate) fn new(root: &'a DatabaseRoot) -> Self {
 		let cache = Arc::new(LanguageClosureState::default());
@@ -148,7 +157,7 @@ impl<'a> PureFunctionEvaluator<'a> {
 			.catalog
 			.function(function)?
 			.ok_or_else(|| FerrosGrynnError::invalid_storage_file("COST function is absent"))?;
-		if !definition.is_cost() || definition.parameters().len() != 1 {
+		if !Self::valid_path_cost(&definition, Some(1)) {
 			return Err(FerrosGrynnError::invalid_argument(
 				"path COST requires a unary PURE COST function",
 			));
@@ -212,11 +221,90 @@ impl<'a> PureFunctionEvaluator<'a> {
 		Ok(dependencies)
 	}
 
+	/// Evaluates a versioned unary or prefix-dependent PURE COST contribution.
+	pub(crate) fn path_contribution(
+		&self,
+		function: FunctionId,
+		version: SchemaVersion,
+		edge: &crate::graph::AtomOccurrenceRef,
+		prefix: Number,
+		read: &dyn Fn(crate::datastore::ConflictKey),
+		work: &dyn Fn(u64) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Number> {
+		let definition = self
+			.catalog
+			.function(function)?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("COST function is absent"))?;
+		let parameters = definition.parameters().len();
+		if !Self::valid_path_cost(&definition, None) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"COST requires a unary or prefix-dependent PURE COST function",
+			));
+		}
+		let bytes = edge
+			.atom()
+			.id()
+			.estimated_heap_bytes()
+			.checked_add(2 * size_of::<Value>())
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("COST arguments"))?;
+		let mut arguments_account = self.control.barrier_account();
+		if !arguments_account.reserve(bytes) {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"COST arguments",
+				self.control.barrier_memory_limit() as u64,
+			));
+		}
+		let arguments = [Value::from(edge.clone()), Value::Number(prefix)];
+		let Value::Number(number) =
+			self.invoke_observed(function, version, &arguments[..parameters], read, work)?
+		else {
+			return Err(FerrosGrynnError::invalid_argument("COST did not return a number"));
+		};
+		if !crate::math::number_is_finite(number) || number < Number::Int(0) {
+			return Err(FerrosGrynnError::invalid_argument(
+				"COST requires finite nonnegative contributions",
+			));
+		}
+		Ok(number)
+	}
+
+	/// Checks the existing numeric edge/PURE COST contract before typed
+	/// invocation.
+	pub(crate) fn valid_path_cost(function: &SchemaFunction, arity: Option<usize>) -> bool {
+		use crate::values::Type;
+		let count = function.parameters().len();
+		function.is_cost()
+			&& function.effect() == FunctionEffect::Pure
+			&& (1..=2).contains(&count)
+			&& arity.is_none_or(|arity| arity == count)
+			&& function.parameters().next().is_some_and(|parameter| {
+				matches!(parameter.value_type(), Type::Any | Type::AtomOccurrence(AtomKind::Edge))
+			})
+			&& (count == 1
+				|| function
+					.parameters()
+					.nth(1)
+					.is_some_and(|parameter| parameter.value_type() == &Type::Number))
+			&& matches!(function.result(), Type::Int | Type::Float | Type::Decimal | Type::Number)
+	}
+
 	fn invoke(
 		&self,
 		id: FunctionId,
 		version: SchemaVersion,
 		arguments: &[Value],
+	) -> FerrosGrynnResult<Value> {
+		self.invoke_observed(id, version, arguments, &|_key| {}, &|_work| Ok(()))
+	}
+
+	/// Preserves snapshot observations and aggregate work across nested calls.
+	fn invoke_observed(
+		&self,
+		id: FunctionId,
+		version: SchemaVersion,
+		arguments: &[Value],
+		read: &dyn Fn(crate::datastore::ConflictKey),
+		work: &dyn Fn(u64) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<Value> {
 		self.control.check()?;
 		let function = self
@@ -259,6 +347,8 @@ impl<'a> PureFunctionEvaluator<'a> {
 			&plan,
 			arguments,
 			function.body().as_str(),
+			read,
+			work,
 		)
 	}
 }

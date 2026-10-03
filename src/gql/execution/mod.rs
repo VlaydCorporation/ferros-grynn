@@ -29,6 +29,7 @@ pub(crate) use adapter::execute_parsed_transaction_with_bindings;
 pub(in crate::gql) use adapter::query_schema;
 pub(crate) use adapter::{analyze_parsed_transaction, execute_parsed_statement_with_bindings};
 pub use adapter::{execute_transaction, execute_transaction_with_options};
+pub(in crate::gql) use cursor::{AtomFieldRead, RootFields};
 use dml::{execute_dml, execute_graph_dml};
 pub(in crate::gql) use eval::{invoke_logical_closure, invoke_root_logical_closure};
 use rust_decimal::Decimal;
@@ -1610,27 +1611,13 @@ fn visit_match_with_environment<Read: QueryRead>(
 	control.record_match_graph_open();
 	let graph = Rc::new(read.graph(snapshot, &plan.graph)?);
 	let graph_ref = Arc::new(plan.graph.clone());
-	let has_chain = plan.patterns.iter().any(|pattern| {
-		matches!(
-			&pattern.kind,
-			LogicalMatchPatternKind::Linear(pattern) if pattern.ops.len() > 1
-		)
-	});
-	let has_path = plan
-		.patterns
-		.iter()
-		.filter_map(|pattern| match &pattern.kind {
-			LogicalMatchPatternKind::Linear(pattern) => Some(pattern.ops.as_slice()),
-			LogicalMatchPatternKind::Hyper(_) | LogicalMatchPatternKind::Within(_) => None,
-		})
-		.flatten()
-		.any(|op| matches!(op, MatchOp::PathExpand(_)));
+	let (needs_local_index, needs_scoped_index) = match_adjacency_requirements(plan, &physical);
 	let semantics = if plan.atom || plan.patterns.iter().any(pattern_uses_edge_endpoint) {
 		TraversalSemantics::Atom
 	} else {
 		TraversalSemantics::Node
 	};
-	let index = (has_chain || has_path)
+	let index = needs_local_index
 		.then(|| TraversalIndex::new(graph.as_ref(), semantics).map(Rc::new))
 		.transpose()?;
 	let fields = MatchGraphFields::new(
@@ -1639,8 +1626,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 		read.property_dictionary(snapshot),
 		graph_ref.clone(),
 	);
-	let scoped_index = physical
-		.uses_scoped_traversal()
+	let scoped_index = needs_scoped_index
 		.then(|| {
 			ScopedTraversalIndex::build(
 				read,
@@ -1778,6 +1764,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 								crate::gql::optimizer::MatchOperator::BreadthFirstShortest { .. }
 									| crate::gql::optimizer::MatchOperator::DijkstraShortest { .. }
 									| crate::gql::optimizer::MatchOperator::LandmarkShortest { .. }
+									| crate::gql::optimizer::MatchOperator::TensorAllShortest { .. }
 							);
 							if !shortest
 								&& !matches!(
@@ -1789,7 +1776,29 @@ fn visit_match_with_environment<Read: QueryRead>(
 									 expansion.",
 								));
 							}
-							if scoped {
+							if expand.objective.is_some_and(crate::syn::MatchPathObjective::is_all)
+							{
+								Box::new(TensorShortestPathCursor::new(
+									cursor,
+									read,
+									snapshot,
+									&fields,
+									graph_ref.clone(),
+									expand,
+									match_predicate,
+									trace.clone(),
+									semantics,
+									if scoped {
+										crate::graph::tensor::TensorScope::Rooted
+									} else {
+										crate::graph::tensor::TensorScope::Local
+									},
+									true,
+									std::collections::BTreeSet::new(),
+									1,
+									match operator { crate::gql::optimizer::MatchOperator::TensorAllShortest { projection, .. } => projection.binding.clone(), _ => None },
+								))
+							} else if scoped {
 								let scoped_index = scoped_index.as_ref().ok_or_else(|| {
 									FerrosGrynnError::invalid_argument(
 										"MATCH physical plan requires scoped adjacency.",
@@ -2013,6 +2022,32 @@ fn visit_match_with_environment<Read: QueryRead>(
 		visit(Value::Object(object))?;
 	}
 	Ok(None)
+}
+
+/// Builds legacy adjacency only for operations that consume it.
+fn match_adjacency_requirements(
+	plan: &LogicalMatch,
+	physical: &crate::gql::optimizer::PhysicalMatchPlan,
+) -> (bool, bool) {
+	let mut local = false;
+	let mut scoped = false;
+	for (pattern_index, pattern) in plan.patterns.iter().enumerate() {
+		let LogicalMatchPatternKind::Linear(pattern) = &pattern.kind else {
+			continue;
+		};
+		for (operation_index, operation) in pattern.ops.iter().enumerate() {
+			if matches!(operation, MatchOp::PathExpand(expand) if expand.objective.is_some_and(crate::syn::MatchPathObjective::is_all))
+			{
+				continue;
+			}
+			if physical.operation_is_scoped(pattern_index, operation_index) {
+				scoped = true;
+			} else {
+				local |= matches!(operation, MatchOp::PathExpand(_)) || pattern.ops.len() > 1;
+			}
+		}
+	}
+	(local, scoped)
 }
 
 /// Reports whether a pattern requires AtomWalk traversal semantics.

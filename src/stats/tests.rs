@@ -16,6 +16,47 @@ use crate::{
 };
 
 #[test]
+fn last_label_member_removal_and_renaming_remove_empty_counters() -> FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("n", AtomKind::Node, [])?)?;
+	let graph = seed.define_graph("labels", GraphKind::Graph)?;
+	let record: RecordId = "n:one".parse()?;
+	seed.create_atom(record.clone(), PropertyMap::new())?;
+	seed.attach_node(graph.id(), &record, Some("old".into()), None)?;
+	seed.commit()?;
+	let mut rename = store.begin();
+	rename.set_occurrence_label(graph.id(), &record, Some("new".into()))?;
+	rename.commit()?;
+	let root = store.inner.current_root();
+	let counters = &root
+		.statistics
+		.graph(graph.id())
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("missing graph statistics")
+		})?
+		.labels;
+	assert_eq!(counters.len(), 1);
+	assert_eq!(counters.keys().next().map(|key| key.label.as_str()), Some("new"));
+	let mut remove = store.begin();
+	remove.detach_occurrence(graph.id(), &record, false)?;
+	remove.commit()?;
+	assert!(
+		store
+			.inner
+			.current_root()
+			.statistics
+			.graph(graph.id())
+			.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument(
+				"missing graph statistics"
+			))?
+			.labels
+			.is_empty()
+	);
+	Ok(())
+}
+
+#[test]
 fn full_scan_separates_base_and_effective_populations() -> FerrosGrynnResult<()> {
 	let store = Datastore::in_memory();
 	let mut define = store.begin();

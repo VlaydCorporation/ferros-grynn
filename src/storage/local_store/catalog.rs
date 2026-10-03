@@ -151,6 +151,10 @@ pub(super) fn encode_database_catalog(
 					})
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
+			let tensor_revision = root
+				.graph(binding.graph_id)
+				.ok_or_else(|| invalid("graph root is absent"))?
+				.tensor_revision;
 			let root = schema
 				.root()
 				.map(|root| {
@@ -159,6 +163,7 @@ pub(super) fn encode_database_catalog(
 				})
 				.transpose()?;
 			Ok(GraphCatalogEntry {
+				tensor_revision,
 				id: binding.graph_id,
 				version: schema.version(),
 				published_at: schema.published_at,

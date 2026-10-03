@@ -160,6 +160,8 @@ pub enum GraphIndexFamilyName {
 	Reachability,
 	/// Maximum neighbourhood radius.
 	Neighbourhood(u32),
+	/// Complete ATOM incidence cache with NODE exposed as a view.
+	Tensor,
 }
 
 /// Graph-owned `DEFINE INDEX` syntax before catalog resolution.
@@ -175,6 +177,10 @@ pub struct DefineGraphIndexStatement {
 	pub family: GraphIndexFamilyName,
 	/// Optional algorithm and numeric parameter.
 	pub algorithm: Option<(Identifier, Option<u32>)>,
+	/// Tensor physical representation: AUTO, CSR or DENSE.
+	pub cache_format: Option<Identifier>,
+	/// Qualified tensor scope: LOCAL or ROOTED.
+	pub cache_scope: Option<Identifier>,
 	/// Optional NODE/ATOM projection; NODE is the default.
 	pub projection: Option<Identifier>,
 	/// Optional OUT/IN/BOTH direction; OUT is the default.
@@ -1006,10 +1012,13 @@ impl Parser<'_> {
 			let radius = self.graph_index_u32("neighbourhood radius")?;
 			self.close(Symbol::RightParen, open.span, "`)`")?;
 			GraphIndexFamilyName::Neighbourhood(radius)
+		} else if self.consume_keyword("TENSOR").is_some() {
+			GraphIndexFamilyName::Tensor
 		} else {
-			return Err(
-				self.syntax("Expected PATH, REACHABILITY, or NEIGHBOURHOOD.", self.current().span)
-			);
+			return Err(self.syntax(
+				"Expected PATH, REACHABILITY, NEIGHBOURHOOD, or TENSOR.",
+				self.current().span,
+			));
 		};
 		let mut definition = DefineGraphIndexStatement {
 			mode,
@@ -1017,6 +1026,8 @@ impl Parser<'_> {
 			graph,
 			family,
 			algorithm: None,
+			cache_format: None,
+			cache_scope: None,
 			projection: None,
 			direction: None,
 			edge_labels: Vec::new(),
@@ -1038,6 +1049,14 @@ impl Parser<'_> {
 				return Err(self.syntax("Duplicate graph index clause.", self.current().span));
 			}
 			match clause.as_str() {
+				"FORMAT" => {
+					self.tokens.next();
+					definition.cache_format = Some(self.identifier()?);
+				}
+				"SCOPE" => {
+					self.tokens.next();
+					definition.cache_scope = Some(self.identifier()?);
+				}
 				"ALGORITHM" => {
 					self.tokens.next();
 					let algorithm = self.identifier()?;

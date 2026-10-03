@@ -139,7 +139,9 @@ pub(super) fn execute_explain<Read: QueryRead>(
 		None
 	};
 	let query_fingerprint = match explain.statement.as_ref() {
-		LogicalStatement::Select(select) => super::select::fingerprint::fingerprints(select).0,
+		LogicalStatement::Select(select) => {
+			crate::gql::optimizer::fingerprint::fingerprints(select).0
+		}
 		_ => plan.hash(),
 	};
 	let seed = control.statement_seed(query_fingerprint, snapshot.0);
@@ -344,6 +346,18 @@ fn explain_text(
 			observation.match_metrics.landmark_lookups,
 			observation.match_metrics.landmark_fallbacks,
 			observation.match_metrics.landmark_artifact_bytes,
+		));
+		lines.push(format!(
+			"  algorithm_work={} algorithm_paths={} tensor_cache_hits={} tensor_fallbacks={} \
+			 tensor_cells={} tensor_nonzeros={} tensor_iterations={} tensor_artifact_bytes={}",
+			observation.match_metrics.algorithm_work,
+			observation.match_metrics.algorithm_paths,
+			observation.match_metrics.tensor_cache_hits,
+			observation.match_metrics.tensor_fallbacks,
+			observation.match_metrics.tensor_cells,
+			observation.match_metrics.tensor_nonzeros,
+			observation.match_metrics.tensor_iterations,
+			observation.match_metrics.tensor_artifact_bytes
 		));
 		lines.push(format!(
 			"  spatial_candidates={} spatial_refinements={} spatial_fallbacks={}",
@@ -560,6 +574,22 @@ fn traversal_nodes(plan: &PhysicalTraversalPlan) -> Vec<Value> {
 					node.insert("refinement", "canonical full-state path");
 					node.insert("fallback", "exact_traversal");
 				}
+			} else if let TraversalOperator::Tensor {
+				kind,
+				projection,
+			} = &planned.operator
+			{
+				node.insert("barrier", true);
+				node.insert("step", traversal_step_name(*kind));
+				node.insert(
+					"enumeration",
+					matches!(
+						kind,
+						TraverseStepKind::AllShortestPaths
+							| TraverseStepKind::AllWeightedShortestPaths
+					),
+				);
+				project_tensor(&mut node, projection);
 			} else if let TraversalOperator::NeighbourhoodSketch(index) = &planned.operator {
 				node.insert("barrier", true);
 				node.insert("graph_id", index.graph.get());
@@ -641,6 +671,10 @@ fn traversal_operator_name(operator: &TraversalOperator) -> &'static str {
 		TraversalOperator::Source(TraversalSourceOperator::SelectSource) => "SelectSource",
 		TraversalOperator::Project => "Project",
 		TraversalOperator::Step(kind) => traversal_step_name(*kind),
+		TraversalOperator::Tensor {
+			kind,
+			..
+		} => traversal_step_name(*kind),
 		TraversalOperator::NeighbourhoodSketch(_) => "NeighbourhoodSketch",
 		TraversalOperator::LandmarkShortest(_) => "LandmarkShortest",
 		TraversalOperator::LandmarkWeighted {
@@ -708,6 +742,8 @@ fn traversal_step_name(kind: TraverseStepKind) -> &'static str {
 		TraverseStepKind::Reachable => "Reachable",
 		TraverseStepKind::ShortestPath => "ShortestPath",
 		TraverseStepKind::WeightedShortestPath => "WeightedShortestPath",
+		TraverseStepKind::AllShortestPaths => "AllShortestPaths",
+		TraverseStepKind::AllWeightedShortestPaths => "AllWeightedShortestPaths",
 		TraverseStepKind::DistanceTo => "DistanceTo",
 		TraverseStepKind::BellmanFord => "BellmanFord",
 		TraverseStepKind::TopologicalSort => "TopologicalSort",
@@ -718,6 +754,16 @@ fn traversal_step_name(kind: TraverseStepKind) -> &'static str {
 		TraverseStepKind::Cuts => "Cuts",
 		TraverseStepKind::LowestCommonAncestor => "LowestCommonAncestor",
 		TraverseStepKind::HasCycle => "HasCycle",
+		TraverseStepKind::PageRank => "PageRank",
+		TraverseStepKind::Degree => "Degree",
+		TraverseStepKind::HarmonicCloseness => "HarmonicCloseness",
+		TraverseStepKind::Betweenness => "Betweenness",
+		TraverseStepKind::Eigenvector => "Eigenvector",
+		TraverseStepKind::Katz => "Katz",
+		TraverseStepKind::Triangles => "Triangles",
+		TraverseStepKind::Clustering => "Clustering",
+		TraverseStepKind::LabelPropagation => "LabelPropagation",
+		TraverseStepKind::Louvain => "Louvain",
 	}
 }
 
@@ -744,6 +790,14 @@ fn match_operator_name(operator: &MatchOperator) -> &'static str {
 		MatchOperator::LandmarkShortest {
 			..
 		} => "LandmarkShortest",
+		MatchOperator::TensorAllShortest {
+			weighted: false,
+			..
+		} => "TensorAllShortest",
+		MatchOperator::TensorAllShortest {
+			weighted: true,
+			..
+		} => "TensorAllWeightedShortest",
 		MatchOperator::HyperContains => "HyperContains",
 		MatchOperator::HyperExpand {
 			..
@@ -800,6 +854,23 @@ fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 			node.insert("path_mode", format!("{mode:?}"));
 			node.insert("minimum_depth", u64::from(*min));
 			node.insert("maximum_depth", u64::from(*max));
+		}
+		MatchOperator::TensorAllShortest {
+			projection,
+			direction,
+			mode,
+			min,
+			max,
+			weighted,
+			..
+		} => {
+			project_tensor(node, projection);
+			node.insert("direction", format!("{direction:?}"));
+			node.insert("path_mode", format!("{mode:?}"));
+			node.insert("minimum_depth", u64::from(*min));
+			node.insert("maximum_depth", u64::from(*max));
+			node.insert("weighted", *weighted);
+			node.insert("enumeration", "complete minimal alternatives");
 		}
 		MatchOperator::TransitiveWithin {
 			min,
@@ -859,6 +930,10 @@ fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 	| MatchOperator::DijkstraShortest {
 		cost: Some((function, version, epoch, stateful)),
 		..
+	}
+	| MatchOperator::TensorAllShortest {
+		cost: Some((function, version, epoch, stateful)),
+		..
 	} = operator
 	{
 		node.insert("cost_function_id", u64::from(function.get()));
@@ -866,6 +941,85 @@ fn project_match_operator(node: &mut Object, operator: &MatchOperator) {
 		node.insert("cost_schema_epoch", *epoch);
 		node.insert("cost_stateful", *stateful);
 		node.insert("cost_execution", "ON_DEMAND");
+	}
+}
+
+/// Projects logical tensor metadata without exposing pages or private payloads.
+fn project_tensor(node: &mut Object, projection: &crate::gql::optimizer::TensorProjectionPlan) {
+	node.insert(
+		"projection",
+		if projection.mode == crate::graph::TraversalSemantics::Atom {
+			"ATOM"
+		} else {
+			"NODE"
+		},
+	);
+	node.insert(
+		"scope",
+		projection.scope.map_or("DYNAMIC", |scope| {
+			if scope == crate::graph::tensor::TensorScope::Local {
+				"LOCAL"
+			} else {
+				"ROOTED"
+			}
+		}),
+	);
+	node.insert(
+		"direction",
+		projection.direction.map_or("DYNAMIC", |direction| match direction {
+			crate::graph::TraversalDirection::Forward => "OUT",
+			crate::graph::TraversalDirection::Backward => "IN",
+			crate::graph::TraversalDirection::Both => "BOTH",
+		}),
+	);
+	node.insert(
+		"weights",
+		projection.weights.map_or("DYNAMIC", |weights| {
+			if weights == crate::graph::tensor::WeightSelection::Stored {
+				"STORED"
+			} else {
+				"UNWEIGHTED"
+			}
+		}),
+	);
+	node.insert(
+		"labels",
+		projection.labels.as_ref().map_or(Value::None, |labels| {
+			Value::from(Array::new(
+				labels.iter().map(|label| Value::from(label.as_ref())).collect(),
+			))
+		}),
+	);
+	node.insert("parameters_hash", projection.parameters_hash);
+	node.insert("fallback", "exact_on_demand");
+	if let Some(binding) = &projection.binding {
+		node.insert("graph_id", binding.graph.get());
+		node.insert("index_id", binding.index.get());
+		node.insert("index_version", binding.version.get());
+		node.insert("build_revision", binding.revision);
+		node.insert("fingerprint", binding.fingerprint);
+		node.insert(
+			"format",
+			if binding.format == crate::datastore::TensorCacheFormat::Csr {
+				"CSR"
+			} else {
+				"DENSE"
+			},
+		);
+		node.insert("rows", binding.rows);
+		node.insert("connectors", binding.connectors);
+		node.insert("source_cells", binding.source_cells);
+		node.insert("target_cells", binding.target_cells);
+		node.insert("artifact_bytes", binding.bytes);
+	} else {
+		node.insert(
+			"format",
+			if projection.dynamic_binding {
+				"DYNAMIC"
+			} else {
+				"ON_DEMAND"
+			},
+		);
 	}
 }
 
@@ -1111,6 +1265,14 @@ fn observation_object(value: &AnalyzeObservation) -> Object {
 	object.insert("spill_runs", value.spill_runs);
 	object.insert("peak_accounted_memory", value.peak_memory);
 	object.insert("path_expansions", value.path_expansions);
+	object.insert("algorithm_work", value.match_metrics.algorithm_work);
+	object.insert("algorithm_paths", value.match_metrics.algorithm_paths as u64);
+	object.insert("tensor_cache_hits", value.match_metrics.tensor_cache_hits);
+	object.insert("tensor_fallbacks", value.match_metrics.tensor_fallbacks);
+	object.insert("tensor_cells", value.match_metrics.tensor_cells);
+	object.insert("tensor_nonzeros", value.match_metrics.tensor_nonzeros);
+	object.insert("tensor_iterations", value.match_metrics.tensor_iterations);
+	object.insert("tensor_artifact_bytes", value.match_metrics.tensor_artifact_bytes);
 	object.insert("landmark_lookups", value.match_metrics.landmark_lookups);
 	object.insert("landmark_fallbacks", value.match_metrics.landmark_fallbacks);
 	object.insert("landmark_artifact_bytes", value.match_metrics.landmark_artifact_bytes);

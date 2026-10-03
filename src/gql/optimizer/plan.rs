@@ -212,6 +212,31 @@ pub(crate) struct PhysicalSelectPlan {
 	pub(crate) warnings: Vec<PlanWarning>,
 }
 
+/// Logical projection and captured incidence cache for both tensor consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "Shared physical metadata is re-exported to query consumers"
+)]
+pub(crate) struct TensorProjectionPlan {
+	/// NODE/ATOM applies to endpoints, never connector intermediary vertices.
+	pub(crate) mode: crate::graph::TraversalSemantics,
+	/// Static LOCAL/ROOTED scope, or a runtime options expression.
+	pub(crate) scope: Option<crate::graph::tensor::TensorScope>,
+	/// Static projected direction, or runtime options.
+	pub(crate) direction: Option<crate::graph::TraversalDirection>,
+	/// Static strength selection, or runtime options.
+	pub(crate) weights: Option<crate::graph::tensor::WeightSelection>,
+	/// Static connector labels; None means runtime selection.
+	pub(crate) labels: Option<Vec<Box<str>>>,
+	/// Span-independent complete argument/parameter identity.
+	pub(crate) parameters_hash: u64,
+	/// Graph or scope must be resolved from runtime query values.
+	pub(crate) dynamic_binding: bool,
+	/// Snapshot-exact generation selected by the physical planner.
+	pub(crate) binding: Option<crate::datastore::QueryTensorCache>,
+}
+
 /// Concrete operator selected for one MATCH plan node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum MatchOperator {
@@ -272,6 +297,23 @@ pub(crate) enum MatchOperator {
 		max: u32,
 		/// Captured generation included in the stable plan hash.
 		binding: crate::datastore::QueryLandmarkPath,
+	},
+	/// Proves and retains every minimal path through the common tensor kernel.
+	TensorAllShortest {
+		/// Complete logical projection and cache binding.
+		projection: TensorProjectionPlan,
+		/// MATCH topology arrow semantics retained beyond projection direction.
+		direction: crate::syn::MatchDirection,
+		/// Path uniqueness semantics.
+		mode: crate::syn::MatchPathMode,
+		/// Inclusive minimum path length.
+		min: u32,
+		/// Inclusive maximum path length.
+		max: u32,
+		/// Stored/custom costs or hops.
+		weighted: bool,
+		/// Versioned contribution contract, including stateful prefix use.
+		cost: Option<(crate::datastore::FunctionId, crate::datastore::SchemaVersion, u64, bool)>,
 	},
 	/// Assigns endpoint positions of one hyperedge.
 	HyperContains,
@@ -351,6 +393,14 @@ pub(crate) enum TraversalOperator {
 	Source(TraversalSourceOperator),
 	/// One analyzed `tv::` step.
 	Step(TraverseStepKind),
+	/// Induced analytics or complete seed-local all-shortest tensor operation.
+	Tensor {
+		/// Closed analyzed operation vocabulary.
+		kind: TraverseStepKind,
+		/// Static controls and captured cache; dynamic options resolve at
+		/// runtime.
+		projection: TensorProjectionPlan,
+	},
 	/// Final traversal RETURN projection.
 	Project,
 	/// Ready approximate neighbourhood binding fixed by physical planning.
@@ -428,11 +478,6 @@ impl PhysicalMatchPlan {
 				&& node.operation_index == Some(operation_index)
 				&& matches!(node.operator, MatchOperator::ResolveNestedEndpoint)
 		})
-	}
-
-	/// Returns whether any selected operator can cross a graph boundary.
-	pub(crate) fn uses_scoped_traversal(&self) -> bool {
-		self.nodes.iter().any(|node| matches!(node.operator, MatchOperator::ResolveNestedEndpoint))
 	}
 }
 

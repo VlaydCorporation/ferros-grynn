@@ -507,6 +507,21 @@ impl DatabaseRoot {
 					})
 			});
 		}
+		if !self.tensor_artifacts.is_empty() {
+			Arc::make_mut(&mut self.tensor_artifacts).retain(|index, artifact| {
+				artifact.layout.header.identity.graph != id.get()
+					|| catalog.graphs.get(&id).is_some_and(|graph| {
+						graph.indexes().any(|definition| {
+							definition.id() == Some(*index)
+								&& definition.state() == ClassIndexState::Ready
+								&& definition.version().get()
+									== artifact.layout.header.identity.version
+								&& definition.build_revision()
+									== artifact.layout.header.identity.revision
+						})
+					})
+			});
+		}
 		if !self.path_artifacts.is_empty() {
 			Arc::make_mut(&mut self.path_artifacts).retain(|index, artifact| {
 				artifact.layout.header.identity.graph != id.get()
@@ -614,6 +629,7 @@ impl DatabaseRoot {
 			.collect::<Vec<_>>();
 		remove.push(graph);
 		for graph in remove {
+			next.invalidate_relation_artifacts(graph);
 			let schema = next
 				.schema
 				.graph(graph)

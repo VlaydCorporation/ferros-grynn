@@ -124,6 +124,8 @@ pub(in crate::storage) struct ClassCatalogEntry {
 /// One named graph definition and its graph-local generation bindings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct GraphCatalogEntry {
+	/// Durable incidence dependency revision; unrelated COW/checkpoint does not change it.
+	pub(in crate::storage) tensor_revision: u64,
 	pub(in crate::storage) id: GraphId,
 	pub(in crate::storage) version: SchemaVersion,
 	pub(in crate::storage) published_at: u64,

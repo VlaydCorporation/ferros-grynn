@@ -32,6 +32,13 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
 - Executor исполняет выбранные physical operators. Resource fallback допустим
   только внутри заранее выбранного семейства (например, in-memory hash join в
   partitioned hash join), но не как скрытый повторный planner.
+- Stage-26 analytics и ALL paths вызывают публичные tensor/analytics kernels через
+  один statement snapshot. Branch/terminal eligibility проверяется до minimum;
+  bounded PURE fields/COST сохраняют SSI и общий work budget. Перенос captured
+  contributions в named Path сохраняет left-to-right Number reduction без повторного COST.
+  Barrier accounts покрывают retained buffers и scratch до allocation, включая
+  capacity growth overlap и trace phase. Enumeration quota учитывает seed bulk;
+  её исчерпание не запрещает обычную аналитику.
 - `tv::kHopEstimate` выбирает только compatible Ready Neighbourhood SKETCH в physical planner.
   Adapter проверяет captured binding и выполняет bounded exact NODE/ATOM fallback; обычный
   `tv::kHop` не читает sketch. Metadata/PlanHash содержат logical identity/version/projection,
@@ -49,7 +56,7 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
   текущему segment. Global `IN GRAPH ... WITH COST` задаёт default linear connector segments;
   local COST переопределяет его. Fixed Expand сохраняет edge aliases/uniqueness и вызывает
   общий PURE contribution helper с нулевым segment prefix, включая scoped/hyper/AtomWalk.
-  Cost вычисляется и без path projection. Identity/version/stateful flag входят в PlanHash version 5.
+  Cost вычисляется и без path projection. Identity/version/stateful flag входят в PlanHash version 6.
 - `path::cost(path, fn::name)` использует общий versioned PURE COST resolver и contribution helper.
   Перед property reads проверяются origin первого graph, snapshot и все qualified occurrences.
   Stateful prefix начинается с нуля для всего Path; reduction потоковый и расходует один

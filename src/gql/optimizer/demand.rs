@@ -90,7 +90,11 @@ impl PlannerDemand {
 								(&expand.source, &expand.edge, &expand.target, expand.direction)
 							}
 							MatchOp::PathExpand(expand) => {
-								demand.landmark_paths |= expand.objective.is_some();
+								demand.tensor_caches |= expand
+									.objective
+									.is_some_and(crate::syn::MatchPathObjective::is_all);
+								demand.landmark_paths |=
+									expand.objective.is_some_and(|objective| !objective.is_all());
 								(&expand.source, &expand.edge, &expand.target, expand.direction)
 							}
 						};
@@ -151,6 +155,12 @@ impl PlannerDemand {
 			}
 		}
 		for step in &statement.steps {
+			demand.tensor_caches |= step.kind.is_tensor_analytics()
+				|| matches!(
+					step.kind,
+					crate::gql::ir::TraverseStepKind::AllShortestPaths
+						| crate::gql::ir::TraverseStepKind::AllWeightedShortestPaths
+				);
 			demand.neighbourhood_sketches |=
 				step.kind == crate::gql::ir::TraverseStepKind::KHopEstimate;
 			demand.landmark_paths |= matches!(
@@ -314,6 +324,7 @@ impl PlannerDemand {
 		self.all_graphs |= other.all_graphs;
 		self.neighbourhood_sketches |= other.neighbourhood_sketches;
 		self.landmark_paths |= other.landmark_paths;
+		self.tensor_caches |= other.tensor_caches;
 		self.properties.extend(other.properties);
 		for (graph, keys) in other.degrees {
 			self.degrees.entry(graph).or_default().extend(keys);

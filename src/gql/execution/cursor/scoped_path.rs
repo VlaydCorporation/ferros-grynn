@@ -313,8 +313,10 @@ enum ScopedSearchFrontier {
 impl ScopedSearchFrontier {
 	fn new(objective: crate::syn::MatchPathObjective) -> Self {
 		match objective {
-			crate::syn::MatchPathObjective::Shortest => Self::Breadth(VecDeque::new()),
-			crate::syn::MatchPathObjective::WeightedShortest => Self::Weighted(BinaryHeap::new()),
+			crate::syn::MatchPathObjective::Shortest
+			| crate::syn::MatchPathObjective::AllShortest => Self::Breadth(VecDeque::new()),
+			crate::syn::MatchPathObjective::WeightedShortest
+			| crate::syn::MatchPathObjective::AllWeightedShortest => Self::Weighted(BinaryHeap::new()),
 		}
 	}
 
@@ -772,7 +774,7 @@ fn scoped_atom_matches<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "one scoped branch validates path, clause, filter, and inline predicates"
 )]
-fn scoped_path_candidate_allowed<Read: QueryRead>(
+pub(in crate::gql::execution) fn scoped_path_candidate_allowed<Read: QueryRead>(
 	row: &Row,
 	source: BoundAtom,
 	current: BoundAtom,
@@ -851,7 +853,7 @@ fn scoped_path_candidate_allowed<Read: QueryRead>(
 	clippy::too_many_arguments,
 	reason = "path materialization needs exact graph scope for each retained hop"
 )]
-fn scoped_path_row<Read: QueryRead>(
+pub(in crate::gql::execution) fn scoped_path_row<Read: QueryRead>(
 	input: &Row,
 	expand: &ResolvedPathExpand,
 	first: BoundAtom,
@@ -866,39 +868,12 @@ fn scoped_path_row<Read: QueryRead>(
 	origin: crate::values::Uuid,
 	snapshot_id: crate::graph::SnapshotId,
 ) -> FerrosGrynnResult<Option<Row>> {
-	let mut row = input.clone();
-	for (position, hop) in hops.iter().enumerate() {
-		match expand.match_mode {
-			crate::syn::MatchMode::RepeatableElements => {}
-			crate::syn::MatchMode::DifferentEdges => {
-				if !row.used_edges.contains(&hop.edge) {
-					row.used_edges.push(hop.edge);
-				}
-			}
-			crate::syn::MatchMode::DifferentAtoms => {
-				if !row.used_atoms.contains(&hop.edge) {
-					row.used_atoms.push(hop.edge);
-				}
-				if position + 1 != hops.len() && !row.used_atoms.contains(&hop.target) {
-					row.used_atoms.push(hop.target);
-				}
-			}
-		}
-	}
-	let target_ref = fields.reference(target.graph)?;
-	let target_graph = read.graph(snapshot, &target_ref)?;
-	if !bind_match_position(
-		&mut row,
-		&expand.target,
-		target.atom,
-		&target_graph,
-		&target_ref,
-		expand.match_mode,
-		predicate,
-		control,
-	)? {
+	let Some(mut row) = scoped_path_binding(
+		input, expand, target, hops, read, snapshot, fields, predicate, control,
+	)?
+	else {
 		return Ok(None);
-	}
+	};
 	let mut cost = Number::Int(0);
 	for hop in hops {
 		let edge_ref = fields.reference(hop.edge.graph)?;
@@ -966,13 +941,66 @@ fn scoped_path_row<Read: QueryRead>(
 	Ok(Some(row))
 }
 
+/// Binds an eligible terminal without materializing traces or evaluating COST.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "Qualified terminal predicates share the complete MATCH context"
+)]
+pub(in crate::gql::execution) fn scoped_path_binding<Read: QueryRead>(
+	input: &Row,
+	expand: &ResolvedPathExpand,
+	target: BoundAtom,
+	hops: &[ScopedTraversalCandidate],
+	read: &Read,
+	snapshot: Snapshot,
+	fields: &MatchGraphFields<'_, Read>,
+	predicate: MatchPredicateContext<'_>,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Option<Row>> {
+	let mut row = input.clone();
+	for (position, hop) in hops.iter().enumerate() {
+		match expand.match_mode {
+			crate::syn::MatchMode::RepeatableElements => {}
+			crate::syn::MatchMode::DifferentEdges => {
+				if !row.used_edges.contains(&hop.edge) {
+					row.used_edges.push(hop.edge);
+				}
+			}
+			crate::syn::MatchMode::DifferentAtoms => {
+				if !row.used_atoms.contains(&hop.edge) {
+					row.used_atoms.push(hop.edge);
+				}
+				if position + 1 != hops.len() && !row.used_atoms.contains(&hop.target) {
+					row.used_atoms.push(hop.target);
+				}
+			}
+		}
+	}
+	let target_ref = fields.reference(target.graph)?;
+	let target_graph = read.graph(snapshot, &target_ref)?;
+	if !bind_match_position(
+		&mut row,
+		&expand.target,
+		target.atom,
+		&target_graph,
+		&target_ref,
+		expand.match_mode,
+		predicate,
+		control,
+	)? {
+		return Ok(None);
+	}
+	row.current = Some(target);
+	Ok(Some(row))
+}
+
 /// Resolves the connector's qualified occurrence before invoking shared cost
 /// semantics; graph-local weights and UDF fields use the same snapshot.
 #[allow(
 	clippy::too_many_arguments,
 	reason = "scoped costs preserve the read root, occurrence and evaluator context explicitly"
 )]
-fn scoped_hop_cost<Read: QueryRead>(
+pub(in crate::gql::execution) fn scoped_hop_cost<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
 	fields: &MatchGraphFields<'_, Read>,
@@ -983,7 +1011,7 @@ fn scoped_hop_cost<Read: QueryRead>(
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Number> {
 	if expand.custom_cost.is_none()
-		&& expand.objective != Some(crate::syn::MatchPathObjective::WeightedShortest)
+		&& !expand.objective.is_some_and(crate::syn::MatchPathObjective::is_weighted)
 	{
 		return Ok(Number::Int(1));
 	}

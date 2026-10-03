@@ -163,6 +163,8 @@ impl GraphOccurrence {
 /// All occurrences and local address allocation for one graph.
 #[derive(Debug, Clone)]
 pub(crate) struct GraphRoot {
+	/// Durable logical incidence revision, independent of checkpoint LSN.
+	pub(crate) tensor_revision: u64,
 	reference: GraphRef,
 	nodes: SlotAllocator,
 	edges: SlotAllocator,
@@ -176,6 +178,7 @@ pub(crate) struct GraphRoot {
 impl GraphRoot {
 	pub(crate) fn new(reference: GraphRef) -> Self {
 		Self {
+			tensor_revision: 0,
 			reference,
 			nodes: SlotAllocator::new(AtomKind::Node),
 			edges: SlotAllocator::new(AtomKind::Edge),

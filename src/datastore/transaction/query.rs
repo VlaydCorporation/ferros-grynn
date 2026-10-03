@@ -136,6 +136,38 @@ pub struct QueryLandmarkPath {
 	pub(crate) bytes: u64,
 }
 
+/// Logical snapshot binding for one complete qualified incidence generation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::redundant_pub_crate, reason = "Logical metadata is re-exported to the GQL adapter")]
+pub(crate) struct QueryTensorCache {
+	/// Owning graph and exact catalog index.
+	pub(crate) graph: GraphId,
+	/// Catalog index identity.
+	pub(crate) index: IndexId,
+	/// Captured semantic definition version.
+	pub(crate) version: crate::datastore::SchemaVersion,
+	/// Snapshot revision captured by the builder.
+	pub(crate) revision: u64,
+	/// Canonical definition fingerprint, checked with full bytes during lookup.
+	pub(crate) fingerprint: u64,
+	/// Complete LOCAL or ROOTED incidence scope.
+	pub(crate) scope: crate::graph::tensor::TensorScope,
+	/// Actual CSR or DENSE encoding; AUTO is never a stored format.
+	pub(crate) format: crate::datastore::TensorCacheFormat,
+	/// Full ATOM axis length.
+	pub(crate) rows: u64,
+	/// Qualified connector axis length.
+	pub(crate) connectors: u64,
+	/// Distinct source membership cells.
+	pub(crate) source_cells: u64,
+	/// Distinct target membership cells.
+	pub(crate) target_cells: u64,
+	/// Complete encoded generation footprint.
+	pub(crate) bytes: u64,
+	/// Durable incidence revisions; sharing avoids planner-to-cursor copies.
+	pub(crate) dependencies: Arc<[(GraphId, u64)]>,
+}
+
 /// Explicit approximate count or bounded exact fallback, with logical work.
 pub struct QueryNeighbourhoodEstimate {
 	/// Distinct count including the source occurrence.

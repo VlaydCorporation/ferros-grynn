@@ -45,6 +45,20 @@ handle конкретного materialization и нужен в том числе
   views;
 - `path` — public path и внутренний trace arena;
 - `traversal` — connectivity, shortest paths, spanning, cuts и LCA;
+- `tensor` — owned qualified EndpointTensor, NODE/full incidence planes и sparse
+  binary/Number adjacency с borrowed VV/VE/EV/EE views. LOCAL retains boundary
+  endpoints; induced analytics domain не включает их. Containment хранится отдельно.
+  Public CSR constructor/export принимает Copy cells; memory/work admission учитывает
+  retained capacities и filtered/empty-row scans, а dense export всегда явный.
+  ROOTED runtime capture и qualified endpoint routes обходятся итеративно через borrowed
+  views; произвольный depth ceiling не вводится. Undirected incidence устанавливает обе
+  logical planes; original endpoint roles сохраняются отдельно для adjacency.
+- `analytics` — owned qualified degree/spectral/distance results, sparse motifs,
+  clustering и deterministic communities. Centrality distances используют
+  vertex-acyclic projected paths; connector reuse в разных projected pairs разрешён.
+  Non-Int costs сохраняют все prefixes в bounded full-state fallback. LPA votes
+  используют Number; Louvain принимает только положительный certified gain.
+  Counts, work и scratch checked; convergence exhaustion не возвращает partial success.
 - `traversal/relation` — bounded NODE/ATOM incidence projection и deterministic
   condensation CSR; общий SCC kernel в connectivity сохраняет public NODE API.
   General CSR restore допускает cycles/self arcs; condensation restore требует DAG.

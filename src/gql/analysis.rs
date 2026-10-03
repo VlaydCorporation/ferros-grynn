@@ -1314,6 +1314,78 @@ impl<'a> Analyzer<'a> {
 			syn::GraphIndexFamilyName,
 		};
 		let graph = self.catalog.graph(&definition.graph.value)?;
+		if definition.family == GraphIndexFamilyName::Tensor {
+			if definition.algorithm.is_some()
+				|| definition.projection.is_some()
+				|| definition.direction.is_some()
+				|| !definition.edge_labels.is_empty()
+				|| definition.weighted
+				|| definition.cost.is_some()
+				|| !definition.patterns.is_empty()
+			{
+				return Err(self.semantic(
+					"TENSOR stores complete ATOM incidence; use FORMAT, SCOPE and MAX_BYTES.",
+					definition.name.span,
+				));
+			}
+			let scope = match definition
+				.cache_scope
+				.as_ref()
+				.map(|value| value.value.to_ascii_uppercase())
+				.as_deref()
+				.unwrap_or("LOCAL")
+			{
+				"LOCAL" => crate::graph::tensor::TensorScope::Local,
+				"ROOTED" => crate::graph::tensor::TensorScope::Rooted,
+				_ => {
+					return Err(self
+						.semantic("TENSOR SCOPE must be LOCAL or ROOTED.", definition.name.span));
+				}
+			};
+			let format = match definition
+				.cache_format
+				.as_ref()
+				.map(|value| value.value.to_ascii_uppercase())
+				.as_deref()
+				.unwrap_or("AUTO")
+			{
+				"AUTO" => crate::datastore::TensorCacheFormat::Auto,
+				"CSR" => crate::datastore::TensorCacheFormat::Csr,
+				"DENSE" => crate::datastore::TensorCacheFormat::Dense,
+				_ => {
+					return Err(self.semantic(
+						"TENSOR FORMAT must be AUTO, CSR or DENSE.",
+						definition.name.span,
+					));
+				}
+			};
+			let mut index = GraphIndex::new_tensor(
+				definition.name.value.as_ref(),
+				scope,
+				format,
+				definition.max_bytes.ok_or_else(|| {
+					self.semantic("TENSOR requires MAX_BYTES.", definition.name.span)
+				})?,
+			)?
+			.with_maintenance_mode(if definition.deferred {
+				IndexMaintenanceMode::Deferred
+			} else {
+				IndexMaintenanceMode::Immediate
+			});
+			index.comment = definition.comment.as_ref().map(|comment| comment.as_ref().into());
+			index.validate()?;
+			return Ok(LogicalSchemaStatement::DefineGraphIndex {
+				mode: definition.mode,
+				graph: definition.graph.value.clone(),
+				index,
+				concurrently: definition.concurrently,
+			});
+		}
+		if definition.cache_scope.is_some() || definition.cache_format.is_some() {
+			return Err(
+				self.semantic("FORMAT and SCOPE require a TENSOR index.", definition.name.span)
+			);
+		}
 		let algorithm =
 			definition.algorithm.as_ref().map(|(name, _)| name.value.to_ascii_uppercase());
 		let parameter = definition.algorithm.as_ref().and_then(|(_, parameter)| *parameter);
@@ -1349,6 +1421,11 @@ impl<'a> Analyzer<'a> {
 			);
 		}
 		let options = match definition.family {
+			GraphIndexFamilyName::Tensor => {
+				return Err(
+					self.semantic("TENSOR definition was not resolved.", definition.name.span)
+				);
+			}
 			GraphIndexFamilyName::Reachability => GraphIndexDefinition::Reachability {
 				algorithm: match algorithm.as_deref().unwrap_or("AUTO") {
 					"AUTO" => ReachabilityAlgorithm::Auto,
@@ -2320,11 +2397,13 @@ impl<'a> Analyzer<'a> {
 			steps.push(analyzed);
 		}
 		if custom_cost.is_some() {
-			if statement.constraints.objective == Some(crate::syn::MatchPathObjective::Shortest)
+			if statement.constraints.objective.is_some_and(|objective| !objective.is_weighted())
 				|| steps.iter().any(|step| {
 					matches!(
 						step.kind,
-						TraverseStepKind::ShortestPath | TraverseStepKind::BellmanFord
+						TraverseStepKind::ShortestPath
+							| TraverseStepKind::AllShortestPaths
+							| TraverseStepKind::BellmanFord
 					)
 				}) {
 				return Err(self.semantic(
@@ -2336,6 +2415,7 @@ impl<'a> Analyzer<'a> {
 				matches!(
 					step.kind,
 					TraverseStepKind::WeightedShortestPath
+						| TraverseStepKind::AllWeightedShortestPaths
 						| TraverseStepKind::DistanceTo
 						| TraverseStepKind::Out
 						| TraverseStepKind::In
@@ -2527,6 +2607,13 @@ impl<'a> Analyzer<'a> {
 			.map(|argument| self.expr(argument, None))
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		self.validate_traverse_step_effect(kind, &arguments)?;
+		if kind.is_tensor_analytics()
+			&& arguments
+				.first()
+				.is_some_and(|argument| !matches!(argument.ty, Type::Object | Type::Any))
+		{
+			return Err(self.semantic("Analytical options must be an object.", span));
+		}
 		Ok(LogicalTraverseStep {
 			kind,
 			arguments,
@@ -2982,7 +3069,7 @@ impl<'a> Analyzer<'a> {
 				.or(global_constraints.mode)
 				.unwrap_or(MatchPathMode::Trail);
 			let objective = step.edge.constraints.objective.or(global_constraints.objective);
-			if custom_cost.is_some() && objective == Some(crate::syn::MatchPathObjective::Shortest)
+			if custom_cost.is_some() && objective.is_some_and(|objective| !objective.is_weighted())
 			{
 				return Err(self.semantic(
 					"COST requires WEIGHTED SHORTEST or path enumeration.",
@@ -2995,6 +3082,15 @@ impl<'a> Analyzer<'a> {
 				step.edge.constraints.filters.clone()
 			};
 			if let Some(length) = step.edge.length {
+				if objective == Some(crate::syn::MatchPathObjective::AllWeightedShortest)
+					&& mode == MatchPathMode::Walk
+					&& length.max.is_none()
+				{
+					return Err(self.semantic(
+						"ALL WEIGHTED SHORTEST WALK requires an explicit finite depth bound.",
+						length.span,
+					));
+				}
 				if let Some(alias) = &step.edge.alias {
 					return Err(self.semantic(
 						"A variable-length MATCH edge cannot have an alias; bind the path instead.",
@@ -7359,6 +7455,9 @@ fn collection_item_type(ty: &Type) -> Type {
 }
 
 fn traverse_step_output_type(step: &LogicalTraverseStep, current: Type) -> Type {
+	if step.kind.is_tensor_analytics() {
+		return Type::Object;
+	}
 	if let Some(output) = &step.output_type {
 		return collection_item_type(output);
 	}
@@ -7396,7 +7495,9 @@ fn traverse_step_output_type(step: &LogicalTraverseStep, current: Type) -> Type 
 		}
 		TraverseStepKind::Path
 		| TraverseStepKind::ShortestPath
-		| TraverseStepKind::WeightedShortestPath => Type::Path,
+		| TraverseStepKind::WeightedShortestPath
+		| TraverseStepKind::AllShortestPaths
+		| TraverseStepKind::AllWeightedShortestPaths => Type::Path,
 		TraverseStepKind::Count | TraverseStepKind::KHopEstimate => Type::Int,
 		TraverseStepKind::Sum
 		| TraverseStepKind::Minimum
@@ -7466,6 +7567,8 @@ fn traverse_step_kind(name: &str) -> Option<TraverseStepKind> {
 		"reachable" => TraverseStepKind::Reachable,
 		"shortestpath" => TraverseStepKind::ShortestPath,
 		"weightedshortestpath" => TraverseStepKind::WeightedShortestPath,
+		"allshortestpaths" => TraverseStepKind::AllShortestPaths,
+		"allweightedshortestpaths" => TraverseStepKind::AllWeightedShortestPaths,
 		"distanceto" => TraverseStepKind::DistanceTo,
 		"bellmanford" => TraverseStepKind::BellmanFord,
 		"topologicalsort" => TraverseStepKind::TopologicalSort,
@@ -7476,12 +7579,33 @@ fn traverse_step_kind(name: &str) -> Option<TraverseStepKind> {
 		"findcuts" => TraverseStepKind::Cuts,
 		"lca" => TraverseStepKind::LowestCommonAncestor,
 		"hascycle" => TraverseStepKind::HasCycle,
+		"pagerank" => TraverseStepKind::PageRank,
+		"degree" => TraverseStepKind::Degree,
+		"harmoniccloseness" => TraverseStepKind::HarmonicCloseness,
+		"betweenness" => TraverseStepKind::Betweenness,
+		"eigenvector" => TraverseStepKind::Eigenvector,
+		"katz" => TraverseStepKind::Katz,
+		"triangles" => TraverseStepKind::Triangles,
+		"clustering" => TraverseStepKind::Clustering,
+		"labelpropagation" => TraverseStepKind::LabelPropagation,
+		"louvain" => TraverseStepKind::Louvain,
 		_ => return None,
 	})
 }
 
 const fn traverse_step_arity(kind: TraverseStepKind) -> std::ops::RangeInclusive<usize> {
 	match kind {
+		TraverseStepKind::AllShortestPaths | TraverseStepKind::AllWeightedShortestPaths => 1..=2,
+		TraverseStepKind::PageRank
+		| TraverseStepKind::Degree
+		| TraverseStepKind::HarmonicCloseness
+		| TraverseStepKind::Betweenness
+		| TraverseStepKind::Eigenvector
+		| TraverseStepKind::Katz
+		| TraverseStepKind::Triangles
+		| TraverseStepKind::Clustering
+		| TraverseStepKind::LabelPropagation
+		| TraverseStepKind::Louvain => 0..=1,
 		TraverseStepKind::Vertices
 		| TraverseStepKind::Edges
 		| TraverseStepKind::InVertex

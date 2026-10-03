@@ -15,6 +15,7 @@ use crate::{
 		GraphRoot,
 		OccurrenceState,
 		OverlayValue,
+		occurrence::PropertyOverlay,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{
@@ -35,7 +36,9 @@ use crate::{
 /// Snapshot-bound normalized graph view over global atoms and graph-local
 /// occurrences.
 pub struct TransactionGraphView<'tx> {
-	transaction: &'tx Transaction,
+	/// Optional SSI observer; maintenance captures retain only the immutable
+	/// root.
+	transaction: Option<&'tx Transaction>,
 	root: Arc<DatabaseRoot>,
 	graph: Arc<GraphRoot>,
 	reference: GraphRef,
@@ -49,7 +52,7 @@ pub struct TransactionNodeRead<'view> {
 	id: AtomId,
 	record_id: &'view RecordId,
 	label: Option<&'view Text>,
-	properties: Cow<'view, PropertyMap>,
+	properties: EffectiveProperties<'view>,
 	inner_graph: Option<&'view GraphRef>,
 }
 
@@ -67,7 +70,7 @@ impl NodeRead for TransactionNodeRead<'_> {
 	}
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
-		Ok(Cow::Borrowed(self.properties.as_ref()))
+		Ok(self.properties.resolve())
 	}
 
 	fn inner_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
@@ -82,7 +85,7 @@ pub struct TransactionEdgeRead<'view> {
 	record_id: &'view RecordId,
 	topology: &'view EdgeTopology,
 	label: Option<&'view Text>,
-	properties: Cow<'view, PropertyMap>,
+	properties: EffectiveProperties<'view>,
 	weight: Option<Number>,
 	transition_graph: Option<&'view GraphRef>,
 }
@@ -105,7 +108,7 @@ impl EdgeRead for TransactionEdgeRead<'_> {
 	}
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
-		Ok(Cow::Borrowed(self.properties.as_ref()))
+		Ok(self.properties.resolve())
 	}
 
 	fn weight(&self) -> Option<Number> {
@@ -114,6 +117,36 @@ impl EdgeRead for TransactionEdgeRead<'_> {
 
 	fn transition_graph_ref(&self) -> FerrosGrynnResult<Option<Cow<'_, GraphRef>>> {
 		Ok(self.transition_graph.map(Cow::Borrowed))
+	}
+}
+
+/// Metadata readers retain property references; only properties() materializes
+/// an effective overlay. Tensor/topology callers never clone unrelated values.
+struct EffectiveProperties<'a> {
+	/// Borrowed original base values; metadata reads do not copy them.
+	base: &'a PropertyMap,
+	/// Sparse effective changes, materialized only on explicit property access.
+	overlay: Option<&'a PropertyOverlay>,
+}
+
+impl EffectiveProperties<'_> {
+	/// Borrows the base or applies the sparse overlay to an owned value map.
+	fn resolve(&self) -> Cow<'_, PropertyMap> {
+		let Some(overlay) = self.overlay else {
+			return Cow::Borrowed(self.base);
+		};
+		let mut properties = self.base.clone();
+		for (key, value) in overlay.iter() {
+			match value {
+				OverlayValue::Value(value) => {
+					properties.insert(key, value.clone());
+				}
+				OverlayValue::Hidden => {
+					properties.remove(key);
+				}
+			}
+		}
+		Cow::Owned(properties)
 	}
 }
 
@@ -135,7 +168,7 @@ impl Transaction {
 			));
 		}
 		Ok(TransactionGraphView {
-			transaction: self,
+			transaction: Some(self),
 			root: snapshot.root.clone(),
 			graph,
 			reference: reference.clone(),
@@ -162,8 +195,50 @@ impl GraphRefReader for Transaction {
 }
 
 impl TransactionGraphView<'_> {
+	/// Opens an immutable maintenance/recovery root through the same graph
+	/// reader.
+	pub(crate) fn for_root(
+		root: Arc<DatabaseRoot>,
+		reference: &GraphRef,
+		snapshot: SnapshotId,
+	) -> FerrosGrynnResult<Self> {
+		let graph =
+			root.graphs.get(&reference.id()).cloned().ok_or_else(|| {
+				FerrosGrynnError::graph_does_not_exist(reference.name().to_string())
+			})?;
+		if graph.reference() != reference {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"tensor graph reference differs from root",
+			));
+		}
+		Ok(Self {
+			transaction: None,
+			root,
+			graph,
+			reference: reference.clone(),
+			snapshot,
+			last_recorded: AtomicU64::new(AtomId::NULL.raw()),
+		})
+	}
+
+	/// Retains transaction predicates while maintenance reads stay
+	/// observational.
+	fn record_read(&self, key: ConflictKey) {
+		if let Some(transaction) = self.transaction {
+			transaction.record_read(key);
+		}
+	}
+
+	/// Records independently versioned occurrence keys through the shared
+	/// reader.
+	fn record_reads<const COUNT: usize>(&self, keys: [ConflictKey; COUNT]) {
+		if let Some(transaction) = self.transaction {
+			transaction.record_reads(keys);
+		}
+	}
+
 	fn record_incidence(&self, id: AtomId) {
-		self.transaction.record_read(ConflictKey::GraphIncidence(self.reference.id(), id));
+		self.record_read(ConflictKey::GraphIncidence(self.reference.id(), id));
 	}
 
 	fn record_occurrence(&self, occurrence: &GraphOccurrence) {
@@ -173,7 +248,7 @@ impl TransactionGraphView<'_> {
 		}
 		let graph = self.reference.id();
 		let global = occurrence.global_id();
-		self.transaction.record_reads([
+		self.record_reads([
 			ConflictKey::BaseAtom(global),
 			ConflictKey::GraphMembership(graph, global),
 			ConflictKey::GraphOverlay(graph, global),
@@ -192,27 +267,16 @@ impl TransactionGraphView<'_> {
 	fn effective_properties<'view>(
 		&'view self,
 		occurrence: &'view GraphOccurrence,
-	) -> FerrosGrynnResult<Cow<'view, PropertyMap>> {
+	) -> FerrosGrynnResult<EffectiveProperties<'view>> {
 		let atom = self.root.atom(occurrence.global_id()).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file(
 				"graph occurrence references an absent global atom",
 			)
 		})?;
-		let Some(overlay) = occurrence.overlay() else {
-			return Ok(Cow::Borrowed(atom.properties()));
-		};
-		let mut properties = atom.properties().clone();
-		for (key, value) in overlay.iter() {
-			match value {
-				OverlayValue::Value(value) => {
-					properties.insert(key, value.clone());
-				}
-				OverlayValue::Hidden => {
-					properties.remove(key);
-				}
-			}
-		}
-		Ok(Cow::Owned(properties))
+		Ok(EffectiveProperties {
+			base: atom.properties(),
+			overlay: occurrence.overlay(),
+		})
 	}
 
 	fn graph_reference<'view>(
@@ -236,7 +300,7 @@ impl GraphRead for TransactionGraphView<'_> {
 	where
 		Self: 'a;
 	type EdgeIds<'a>
-		= std::vec::IntoIter<FerrosGrynnResult<AtomId>>
+		= Box<dyn Iterator<Item = FerrosGrynnResult<AtomId>> + 'a>
 	where
 		Self: 'a;
 	type Node<'a>
@@ -244,7 +308,7 @@ impl GraphRead for TransactionGraphView<'_> {
 	where
 		Self: 'a;
 	type NodeIds<'a>
-		= std::vec::IntoIter<FerrosGrynnResult<AtomId>>
+		= Box<dyn Iterator<Item = FerrosGrynnResult<AtomId>> + 'a>
 	where
 		Self: 'a;
 
@@ -261,7 +325,7 @@ impl GraphRead for TransactionGraphView<'_> {
 	}
 
 	fn properties(&self) -> FerrosGrynnResult<Cow<'_, PropertyMap>> {
-		self.transaction.record_read(ConflictKey::GraphDefinition(self.reference.id()));
+		self.record_read(ConflictKey::GraphDefinition(self.reference.id()));
 		let schema = self.root.schema.graphs.get(&self.reference.id()).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("graph view has no schema definition")
 		})?;
@@ -279,27 +343,23 @@ impl GraphRead for TransactionGraphView<'_> {
 	}
 
 	fn node_ids(&self) -> FerrosGrynnResult<Self::NodeIds<'_>> {
-		self.transaction
-			.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Node));
-		Ok(self
-			.graph
-			.occurrences()
-			.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Node))
-			.map(|occurrence| Ok(occurrence.local_id()))
-			.collect::<Vec<_>>()
-			.into_iter())
+		self.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Node));
+		Ok(Box::new(
+			self.graph
+				.occurrences()
+				.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Node))
+				.map(|occurrence| Ok(occurrence.local_id())),
+		))
 	}
 
 	fn edge_ids(&self) -> FerrosGrynnResult<Self::EdgeIds<'_>> {
-		self.transaction
-			.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Edge));
-		Ok(self
-			.graph
-			.occurrences()
-			.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Edge))
-			.map(|occurrence| Ok(occurrence.local_id()))
-			.collect::<Vec<_>>()
-			.into_iter())
+		self.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Edge));
+		Ok(Box::new(
+			self.graph
+				.occurrences()
+				.filter(|occurrence| occurrence.local_id().kind() == Some(AtomKind::Edge))
+				.map(|occurrence| Ok(occurrence.local_id())),
+		))
 	}
 
 	fn edge_endpoint_connectors(
@@ -316,8 +376,7 @@ impl GraphRead for TransactionGraphView<'_> {
 		{
 			return Ok(None);
 		}
-		self.transaction
-			.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Edge));
+		self.record_read(ConflictKey::GraphKindRange(self.reference.id(), AtomKind::Edge));
 		if let Some(local) = endpoint.local_id() {
 			self.record_incidence(local);
 		}
@@ -437,7 +496,7 @@ mod tests {
 		let read = store.begin();
 		let view = graph.read(&read).unwrap();
 		let node = view.node(local).unwrap().unwrap();
-		assert!(matches!(node.properties, Cow::Borrowed(_)));
+		assert!(matches!(node.properties().unwrap(), Cow::Borrowed(_)));
 		drop(view);
 		drop(read);
 
@@ -447,6 +506,7 @@ mod tests {
 		let read = store.begin();
 		let view = graph.read(&read).unwrap();
 		let node = view.node(local).unwrap().unwrap();
-		assert!(matches!(node.properties, Cow::Owned(_)));
+		assert!(node.properties.overlay.is_some());
+		assert!(matches!(node.properties().unwrap(), Cow::Owned(_)));
 	}
 }
