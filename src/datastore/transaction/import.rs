@@ -46,6 +46,17 @@ impl Transaction {
 	where
 		Apply: FnOnce(&mut Self) -> FerrosGrynnResult<T>,
 	{
+		let captures = self
+			.working
+			.changefeeds()
+			.definitions
+			.values()
+			.any(|definition| definition.state == crate::changefeed::ChangefeedState::Active);
+		let capture_images =
+			captures && self.import_changefeed.mode == crate::datastore::ImportChangefeedMode::On;
+		if capture_images {
+			self.prepare_import_capture_segment()?;
+		}
 		self.atomic_mutation(|transaction| {
 			let mutation_start = transaction.mutations.len();
 			let _value = apply(transaction)?;
@@ -68,13 +79,25 @@ impl Transaction {
 					transaction.validate_graph_family(graph)?;
 				}
 			}
-			Ok(transaction.mutations.len() != mutation_start)
+			let changed = transaction.mutations.len() != mutation_start;
+			transaction.finish_change_operation(true);
+			let captured = match (capture_images, captures) {
+				(true, _) => false,
+				(false, true) => transaction.retain_import_suppression(mutation_start)?,
+				(false, false) => {
+					transaction.change_journal.clear_segment();
+					false
+				}
+			};
+			Ok(changed || captured)
 		})
 	}
 
 	/// Stamps and clears transaction-local tracking at one private segment
 	/// boundary.
-	pub(crate) fn seal_import_segment(&mut self, commit_ts: u64) {
+	/// Returns capture admission/replay failures without clearing pending work.
+	pub(crate) fn seal_import_segment(&mut self, commit_ts: u64) -> FerrosGrynnResult<bool> {
+		let captured = self.retain_import_segment()?;
 		for key in self.writes.keys().copied().chain(self.range_writes.iter().copied()) {
 			self.working.mark_version(key, commit_ts);
 		}
@@ -87,6 +110,8 @@ impl Transaction {
 		self.fanout_reservations.clear();
 		self.write_bytes = 0;
 		self.mutations.clear();
+		self.change_journal.clear_segment();
+		Ok(captured)
 	}
 
 	/// Performs final validation, derived-state rebuild, and identity-clock
@@ -136,6 +161,7 @@ impl Transaction {
 			self.store.inner.next_graph_id.load(Ordering::Relaxed),
 		);
 		let base_commit_ts = self.snapshot.commit_ts;
+		self.publish_import_changes(commit_ts)?;
 		Ok((self.working, base_commit_ts, built_indexes))
 	}
 

@@ -772,7 +772,7 @@ watermark.
 - `FileCatalog` (`FGFC`, payload version 6): sealed mapping
   `(DataSpaceId, DataFileId) → (companion_of, role, validated relative path)`.
 
-`FGDC v10` начинается с exact 88-byte header:
+`FGDC v10` начинается с exact 128-byte header (development layout, Q-40):
 
 ```text
 0   4   magic = FGDC
@@ -785,13 +785,17 @@ watermark.
 32  4   graph_count
 36  4   parameter_count
 40  4   function_count
-44  4   reserved = 0
+44  4   analyzer_count
 48  8   atom_store_generation
 56 16   primary physical binding
 72 16   reverse-membership physical binding
+88 16   durable database UUID; nil запрещён
+104 16  nondecreasing UTC commit time, signed epoch nanoseconds (LE)
+120 4   changefeed_count
+124 4   reserved = 0
 ```
 
-Sections следуют строго в порядке timezone → class → graph → parameter → function и обязаны
+Sections следуют строго в порядке timezone → class → graph → parameter → function → analyzer → changefeed и обязаны
 полностью потребить payload. Index entry использует maintenance byte `0=Immediate`,
 `1=Deferred`; unknown value является corruption. Parameter entry хранит identity/version,
 `published_at`, canonical value bytes, name и optional comment. Function entry хранит
@@ -799,6 +803,16 @@ Sections следуют строго в порядке timezone → class → gr
 types, effect `PURE|STABLE|IMPURE`, `COST`, optional `MAXDEPTH 1..=64`, source UTF-8 body и
 optional comment. Уникальны identity и `(namespace, name, parameter types)`; typed IR и
 platform bytecode не сохраняются.
+
+Retained changefeed descriptor хранится независимо от существования owner: UUID 16 bytes;
+source-kind/state/capture-flags/closed-presence по byte; source-id u64; version u32,
+reserved u32; fixed retention i128 nanoseconds; defined/published/last/purge/closed stamps
+по u64; name length u32 и UTF-8 bytes; epoch count u32 и epochs по 32 bytes.
+Epoch: inclusive start stamp u64, flags u8 (`bit0=enabled, bit1=FULL, bit2=ORIGINAL`),
+reserved 7 bytes, retention i128. Disabled epoch имеет zero flags/retention.
+Epochs sorted strictly; несколько policy actions одного commit схлопываются до final policy.
+Все reserved bytes нулевые; counts проверяются относительно оставшегося payload до allocation.
+Retained CLASS/GRAPH identity меньше соответствующего allocation clock, включая retired sources.
 
 `FGFC v6` имеет 24-byte header (`FGFC`, version 6, reserved, count, reserved,
 `next_file_instance_id`). Каждая запись сохраняет 32-байтовый fixed header:
@@ -1000,8 +1014,9 @@ fields и `SchemaVersion`. `DataFileId` может измениться при C
 | `0x14`   | `PropertyDictionary`          |
 | `0x15`   | `JobCatalog`                  |
 | `0x16`   | `ImportQuarantine`            |
+| `0x17`   | `Changefeed`                  |
 
-`0x00` и `0x17..=0xff` зарезервированы. До написания codecs новые discriminants и соответствующие
+`0x00` и `0x18..=0xff` зарезервированы. До написания codecs новые discriminants и соответствующие
 page types обязаны получить golden vectors. Неизвестное значение при open/recovery является
 повреждением либо incompatible format, но не молча пропускаемым расширением.
 
@@ -3808,44 +3823,175 @@ replay не является скрытым вторым writer path.
 
 Требуется `CHANGEFEED @duration` в определении CLASS либо GRAPH source.
 
-**duration** — время хранения изменений (например, `CHANGEFEED 7d` хранит 7 дней).
+**duration** — положительное фиксированное время хранения изменений; years/months
+не принимаются. `INCLUDE ORIGINAL` выбирает полный before вместо обратимого before-diff;
+`FULL` сохраняет logical operation history, включая targeted no-op.
+Нормативные lifecycle/read rules: `gql_changefeed_stage_27_plan.md`, CF-01–CF-17.
 
 ```
-changefeed/<space_id>_<class_id>_<since_lsn>.fcf
+changefeed/<changefeed_uuid>/<segment_uuid>.fcf
 ```
 
 #### 21.1.1. ChangefeedPage
 
 ```
-PageHeader(32) (magic=MAGIC_CHANGEFEED, type=ChangefeedHeader)
-space_id:      u64  -- DataSpaceId
-class_id:      u32
-next_page:     u64
-entry_count:   u32
-_pad:          4
-entries: [ChangefeedEntry]×N
+ChangefeedHeader: PageHeader + format/source/segment identities + checked section refs
+ChangefeedEntry:  PageHeader + checked continuation framing + logical payload
 ```
 
-**ChangefeedEntry (variable):**
+`Changefeed=0x17` принадлежит `DataSpaceId::Database`, включая GRAPH sources.
+Role — только `WalBackfilled`; companion freelist отсутствует. Canonical path содержит
+два non-nil UUID в lowercase hyphenated форме; иные роли, data spaces и aliases отклоняются.
 
-```
-PageHeader (magic=MAGIC_CHANGEFEED, type=ChangefeedEntry)
-lsn:           u64
-versionstamp:  u64   -- монотонно растущий глобальный счётчик
-event_kind:    u8    -- 0=create, 1=update, 2=delete, 3=define_class, 4=membership
-global_atom:   u64   -- GlobalAtomId; generation проверяется
-record_id_len: u16
-record_id:     [u8]  -- encoded RecordId
-[before_len:   u32]  -- если event_kind ∈ {1, 2}
-[before_data:  [u8]] -- PropertyMap до изменения
-[after_len:    u32]  -- если event_kind ∈ {0, 1}
-[after_data:   [u8]] -- PropertyMap после изменения
-```
+Offsets ниже относительны к body после общего 32-byte PageHeader. Все числовые поля
+little-endian; общий checksum покрывает header и body. Неиспользованный хвост страницы
+нулевой. Header страницы segment — только page 0 (`PageType::ChangefeedHeader`):
+
+| Offset | Bytes | Field                                  |
+|-------:|------:|----------------------------------------|
+|      0 |     4 | `FCFS`                                 |
+|      4 |     2 | framing version `1`                    |
+|      6 |     2 | reserved zero                          |
+|      8 |    16 | database UUID                          |
+|     24 |    16 | ChangefeedId                           |
+|     40 |    16 | segment UUID                           |
+|     56 |     8 | exclusive page ceiling, включая page 0 |
+|     64 |     8 | whole commit group count               |
+|     72 |     8 | first versionstamp                     |
+|     80 |     8 | last versionstamp                      |
+|     88 |    16 | first UTC epoch nanoseconds            |
+|    104 |    16 | last UTC epoch nanoseconds             |
+
+Bounds сверяются с authoritative catalog того же snapshot; header не заменяет catalog.
+
+Retained source descriptor FGDC v10 после optional close stamp сохраняет
+`purged_time_ns: i128`, `closed_time_ns: i128`, `retained_page: u64` и
+`retained_groups: u64`, затем name length; fixed minimum descriptor —
+152 bytes без name/epochs/segments. `closed_time_ns` равен нулю для active source,
+иначе это обязательный UTC timestamp close publication. При `purged_through=0`
+purge time равен нулю;
+иначе это trusted UTC time последнего удалённого commit, не больше catalog commit
+time и first time полностью retained segments. Частичный purge первого segment
+оставляет физические bounds файла: `retained_page` задаёт первый доступный group,
+`retained_groups` — число пропущенных groups; оба поля ненулевые только вместе.
+Reader начинает с этой позиции и не возвращает stamps до floor включительно.
+При удалении целого первого segment эти позиции сбрасываются в ноль.
+Это обеспечивает inclusive timestamp GAP
+без чтения удалённых pages. Segment descriptor — 128 bytes: file id u64, database/
+feed/segment UUID, pages/commits/first/last stamp u64, first/last time i128, reserved 8.
+Стампы whole commit groups строго возрастают: `commits - 1 <= last_stamp - first_stamp`.
+Единственный commit имеет равные first/last stamp и UTC time; gaps глобального clock
+между группами допустимы.
+Group pages имеют `PageType::ChangefeedEntry` и contiguous framing без произвольных links:
+
+| Offset |    Bytes | Field                          |
+|-------:|---------:|--------------------------------|
+|      0 |        4 | `FCFE`                         |
+|      4 |        2 | framing version `1`            |
+|      6 |        2 | reserved zero                  |
+|      8 |        8 | whole-commit versionstamp      |
+|     16 |        8 | first page number этого group  |
+|     24 |        4 | fragment ordinal, начиная с 0  |
+|     28 |        4 | exact fragment count           |
+|     32 |        8 | complete logical payload bytes |
+|     40 |        4 | chunk bytes                    |
+|     44 |        4 | reserved zero                  |
+|     48 | variable | chunk, максимум 16304 bytes    |
+
+Fragment count равен `ceil(payload_bytes / 16304)`; каждый chunk кроме последнего
+полный. Нулевая payload length, нулевой first page, overflow, ordinal mismatch,
+ссылки за snapshot ceiling и nonzero padding являются corruption. Payload cap —
+256 MiB, но aggregate scratch и shared WAL cap проверяются отдельно до allocation/write.
+
+Inverse before-diff над canonical encoded image содержит четыре `u64`:
+`before_bytes`, `common_prefix_bytes`, `common_suffix_bytes`, `stored_middle_bytes`,
+затем exact middle bytes. Before восстанавливается как after prefix + stored middle +
+after suffix. Prefix/suffix не перекрываются и находятся в after bounds; сумма lengths
+равна before_bytes. Для deletion after пуст, middle содержит всё before. INCLUDE ORIGINAL
+использует full canonical before вместо patch. Dictionary/reference data относится к
+историческому encoding, не извлекается из нынешних primary records.
+
+**Logical commit group (variable, explicit checked codec):**
+
+Envelope `FGCB` занимает 80 bytes перед dictionary и entry body:
+
+| Offset | Bytes | Field                                                    |
+|-------:|------:|----------------------------------------------------------|
+|      0 |     4 | `FGCB`                                                   |
+|      4 |     2 | codec version `1`                                        |
+|      6 |     2 | flags: bit 0 INCLUDE ORIGINAL, bit 1 historical FULL     |
+|      8 |    16 | ChangefeedId UUID                                        |
+|     24 |     8 | versionstamp = durable commit_ts                         |
+|     32 |    16 | checked UTC epoch nanoseconds                            |
+|     48 |     4 | nonzero captured definition revision                     |
+|     52 |     4 | dictionary bytes                                         |
+|     56 |     8 | complete entry body bytes                                |
+|     64 |     4 | NET count                                                |
+|     68 |     4 | FULL count; zero when FULL flag absent                   |
+|     72 |     1 | suppression: 0 none, 1 SourceDropped, 2 ImportSuppressed |
+|     73 |     7 | reserved zero                                            |
+
+Dictionary хранит четыре последовательных sections с `u32 count`: property names,
+class names, IANA time-zone names, full historical graph descriptors. Name —
+`u64 UTF-8 bytes` + bytes. Property slots плотные с 0; class/time-zone/graph slots — с 1.
+Graph row: actual GraphId `u64`, kind `u8` (GRAPH=0, TREE=1, ROOTED_TREE=2, FOREST=3,
+DAG=4, HYPERGRAPH=5, METAGRAPH=6, SUBGRAPH=7), storage mode `u8`
+(IN_MEMORY=0, DISK_BACKED=1, HYBRID=2), reserved zero 6 bytes, name.
+Два исторических descriptors одного actual GraphId могут занимать разные slots.
+Canonical `StorageValue` graph reference кодирует historical slot; decoding возвращает
+original qualified identity/name/kind/mode. Primary `EncodeContext::register_graph`
+сохраняет требование совпадения actual GraphId и durable reference.
+
+Body содержит все NET entries, затем FULL entries. Entry имеет `ordinal u64`,
+`operation u64`, image flags `u8` (bit 0 before, bit 1 after), reserved zero 7 bytes,
+after blob (`u64 length` + bytes), before blob того же framing. Before blob — inverse
+patch либо full image согласно историческому ORIGINAL. Хотя minimum entry framing
+40 bytes, обе images отсутствовать не могут. Mode-local ordinals начинаются с 0 без
+пропусков. NET identities строго упорядочены и unique; FULL operation order не убывает.
+Before/after identity одной entry совпадает; NET representation bytes должны отличаться.
+Suppression group не содержит entries/FULL section; его границы равны stamp этого commit.
+
+Image: identity kind `u8` (CLASS=0, GRAPH=1), state kind `u8` (none=0, node=1, edge=2),
+label presence `u8`, reserved zero 5 bytes. Identity содержит canonical AtomRef blob;
+GRAPH предваряет его historical graph slot `u64`. Properties — `u32 count`, затем
+property slot `u32` и canonical StorageValue blob; decoded names строго возрастают.
+Overlays — `u32 count`, property slot `u32`, decision `u8` (Hidden=0, Value=1), reserved
+zero 3 bytes; Value дополняется canonical blob. Optional label — UTF-8 blob.
+Node state хранит nullable child graph slot `u64`, zero означает отсутствие. Edge state:
+direction `u8` (DIRECTED=0, BIDIRECTIONAL=1, UNDIRECTED=2), weight presence `u8`, reserved
+zero 6 bytes, nullable transition graph slot `u64`, optional canonical Number blob,
+source/target endpoint sections. Endpoint section: `u32 count`, qualified occurrence
+и `u32 owner count` с ordered qualified owner occurrences. Endpoint order и multiplicity
+сохраняются; owner route ограничен 64. CLASS image не содержит graph-local полей.
+
+Collection/dictionary counts ограничены 1M независимо от payload cap. Aggregate scratch
+учитывает canonical DTO allocations, dictionary-name expansion при runtime conversion,
+output growth и inverse-patch restoration до allocation; encoded input charge задаёт caller.
+
+PageHeader не повторяется на каждую logical entry. Большие images используют checked
+continuations; malformed lengths/counts/refs/reserved bytes отклоняются до allocation.
+Public decoder восстанавливает owned images без current primary record lookup.
+`GlobalAtomId`, local `AtomId` и physical pages в runtime result не попадают.
+
+FGDC хранит durable database UUID, UTC commit metadata, source descriptors/capture epochs,
+segment refs, snapshot page ceilings, stamp/time bounds и purge floor. Удалённые CLASS/GRAPH
+не нужны для декодирования retained history. Filename и checkpoint LSN не являются authority.
+.fcf регистрируется как Changefeed kind / WalBackfilled role и сохраняется в FileCatalog
+при любых unrelated generation/import builds. Primary/feed/catalog stage-ятся в одном
+TxHandle и публикуются одним TxCommit/barrier; existing 256 MiB staged-pages cap общий.
 
 #### 21.1.2. Changefeed purge
 
-WAL-like rotation: файлы старше `changefeed_duration` удаляются.
-Cursor `since_lsn` в имени файла позволяет быстро найти нужный диапазон.
+Target segment size — 64 MiB; rotation выполняется между whole commit groups.
+Existing maintenance worker выполняет bounded PurgeChangefeed passes и timed idle wake.
+Purge сначала durable-публикует raised floor и unreferenced segments, затем unlink после
+snapshot/file pins; cleanup failure повторяется и не отменяет committed floor.
+Uncertain WAL append/sync запрещает cleanup до recovery reachability decision.
+
+Активный source сохраняет floor даже без segments; retired tombstone живёт до TTL.
+Missing/corrupt secondary history с trusted bounds означает explicit GAP плюс available tail;
+authority corruption без доказуемых bounds — typed error. После полного source retirement
+старый database-matched cursor получает terminal FeedExpiredOrRetired GAP.
 
 ### 21.2. Live SELECT
 
@@ -4492,8 +4638,8 @@ Runtime-граница этапа 20 — `MaintenanceOptions` и bounded overrid
 **Сборка индексов и массовая загрузка** (§20.13)
 
 Таблица ниже задаёт effective runtime policy. Этап 20 подключает общий memory budget и
-parallelism через `MaintenanceOptions` и import overrides; merge fan-in остаётся фиксированным
-64. Значение `FILL_FACTOR` в GrynQL остаётся typed unsupported: Stage-20 diagnostic дал
+parallelism через `MaintenanceOptions` и import overrides; merge fan-in остаётся фиксированным 64. 
+Значение `FILL_FACTOR` в GrynQL остаётся typed unsupported: Stage-20 diagnostic дал
 `11–26%` роста page-set при допустимом лимите `5%`. Возможная иная bounded/adaptive policy
 отслеживается в `Q-39`; текущий immutable generation packer не разрежается.
 

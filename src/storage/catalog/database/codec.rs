@@ -53,7 +53,7 @@ use crate::{
 
 const MAGIC: [u8; 4] = *b"FGDC";
 const VERSION: u16 = 10;
-const HEADER_BYTES: usize = 88;
+const HEADER_BYTES: usize = 128;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
 
@@ -74,6 +74,10 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	output.extend_from_slice(&catalog.atom_store.generation.to_le_bytes());
 	write_binding(&mut output, catalog.atom_store.primary);
 	write_binding(&mut output, catalog.atom_store.reverse_membership);
+	output.extend_from_slice(catalog.database_uuid.as_bytes());
+	output.extend_from_slice(&catalog.committed_at_ns.to_le_bytes());
+	write_u32(&mut output, catalog.changefeeds.len(), "changefeed count")?;
+	output.extend_from_slice(&0_u32.to_le_bytes());
 
 	for name in &catalog.time_zones {
 		write_string(&mut output, name.as_str(), "time-zone name")?;
@@ -92,6 +96,9 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	}
 	for analyzer in &catalog.analyzers {
 		encode_analyzer(&mut output, analyzer)?;
+	}
+	for entry in &catalog.changefeeds {
+		super::changefeed::encode(&mut output, entry)?;
 	}
 	if output.len() > MAX_BYTES {
 		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
@@ -134,6 +141,36 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	let generation = decoder.read_u64()?;
 	let primary = read_binding(&mut decoder)?;
 	let reverse_membership = read_binding(&mut decoder)?;
+	let database_uuid = uuid::Uuid::from_slice(decoder.read_exact(16)?).map_err(|error| {
+		invalid("database origin UUID is malformed").with_technical_source(error)
+	})?;
+	let committed_at_ns =
+		i128::from_le_bytes(decoder.read_exact(16)?.try_into().map_err(|error| {
+			invalid("database commit time is truncated").with_technical_source(error)
+		})?);
+	let changefeed_count = decoder.read_count("changefeed count")?;
+	decoder.expect_zero(4, "database origin reserved bytes")?;
+	if changefeed_count > bytes.len().saturating_sub(HEADER_BYTES) / super::changefeed::MIN_BYTES {
+		return Err(invalid("changefeed count exceeds its encoded payload"));
+	}
+	let section_counts = [
+		time_zone_count,
+		class_count,
+		graph_count,
+		parameter_count,
+		function_count,
+		analyzer_count,
+	];
+	let minimum_bytes = section_counts
+		.into_iter()
+		.try_fold(0_usize, |total, count| total.checked_add(count.checked_mul(4)?))
+		.and_then(|total| {
+			total.checked_add(changefeed_count.checked_mul(super::changefeed::MIN_BYTES)?)
+		})
+		.ok_or_else(|| invalid("catalog section counts overflow"))?;
+	if minimum_bytes > bytes.len().saturating_sub(HEADER_BYTES) {
+		return Err(invalid("catalog section counts exceed available encoded bytes"));
+	}
 
 	let mut time_zones = Vec::with_capacity(time_zone_count);
 	for _ in 0..time_zone_count {
@@ -159,8 +196,20 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	for _ in 0..analyzer_count {
 		analyzers.push(decode_analyzer(&mut decoder)?);
 	}
+	if changefeed_count
+		> decoder.bytes.len().saturating_sub(decoder.position) / super::changefeed::MIN_BYTES
+	{
+		return Err(invalid("changefeed count exceeds remaining catalog bytes"));
+	}
+	let mut changefeeds = Vec::with_capacity(changefeed_count);
+	for _ in 0..changefeed_count {
+		changefeeds.push(super::changefeed::decode(&mut decoder)?);
+	}
 	decoder.finish()?;
 	let catalog = DatabaseCatalog {
+		database_uuid,
+		committed_at_ns,
+		changefeeds,
 		next_graph_id,
 		next_schema_id,
 		time_zones,
@@ -1288,6 +1337,11 @@ pub(super) struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
+	/// Bounds section allocations against the unread input.
+	pub(super) fn remaining_bytes(&self) -> usize {
+		self.bytes.len().saturating_sub(self.position)
+	}
+
 	pub(super) fn new(bytes: &'a [u8]) -> Self {
 		Self {
 			bytes,

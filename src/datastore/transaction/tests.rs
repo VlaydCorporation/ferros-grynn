@@ -439,7 +439,9 @@ fn fanout_uses_reverse_memberships_not_all_graphs() {
 	let (store, identity, graphs) = setup(1, 32);
 	let root = (*store.inner.current_root()).clone();
 	let mut options = InMemoryOptions::default();
-	options.max_write_set_bytes = BASE_ATOM_WRITE_BYTES + EFFECTIVE_FANOUT_WRITE_BYTES;
+	options.max_write_set_bytes = BASE_ATOM_WRITE_BYTES + EFFECTIVE_FANOUT_WRITE_BYTES
+		+ std::mem::size_of::<changefeed_journal::CaptureOperation>()
+		+ std::mem::size_of::<changefeed_journal::CaptureIntent>();
 	let limited = Datastore::from_root_for_test(options, root);
 	let mut transaction = limited.begin();
 
@@ -457,7 +459,9 @@ fn commit_rechecks_memberships_added_after_base_preflight() {
 	let (store, identity, graphs) = setup(0, 2);
 	let root = (*store.inner.current_root()).clone();
 	let mut options = InMemoryOptions::default();
-	options.max_write_set_bytes = GRAPH_MEMBERSHIP_WRITE_BYTES + GRAPH_INCIDENCE_WRITE_BYTES;
+	options.max_write_set_bytes = GRAPH_MEMBERSHIP_WRITE_BYTES + GRAPH_INCIDENCE_WRITE_BYTES
+		+ std::mem::size_of::<changefeed_journal::CaptureOperation>()
+		+ std::mem::size_of::<changefeed_journal::CaptureIntent>();
 	let limited = Datastore::from_root_for_test(options, root);
 	let mut base = limited.begin_with(TransactionOptions::new(
 		IsolationLevel::Snapshot,

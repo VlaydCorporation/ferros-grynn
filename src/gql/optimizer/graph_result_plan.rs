@@ -253,5 +253,6 @@ fn output_cardinality(plan: &PhysicalPlan) -> Cardinality {
 		PhysicalPlan::Traversal(plan) => plan.cardinality,
 		PhysicalPlan::Write(plan) => plan.cardinality,
 		PhysicalPlan::GraphResult(_) => Cardinality::exact(1),
+		PhysicalPlan::Changefeed(plan) => Cardinality::unknown(plan.limit.unwrap_or(u64::MAX)),
 	}
 }

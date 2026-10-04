@@ -271,6 +271,8 @@ pub(super) enum LogicalSchemaStatement {
 		constraints: GraphTopologyConstraints,
 		root: Option<TypedExpr>,
 		content: Option<TypedExpr>,
+		/// Final validated capture policy for the defined graph source.
+		changefeed: Option<crate::changefeed::ChangefeedConfig>,
 	},
 	UpdateGraph {
 		graph: GraphRef,
@@ -282,6 +284,8 @@ pub(super) enum LogicalSchemaStatement {
 		name: Box<str>,
 		kind: crate::values::AtomKind,
 		schema_mode: ClassSchemaMode,
+		/// Final validated capture policy for the defined global class source.
+		changefeed: Option<crate::changefeed::ChangefeedConfig>,
 	},
 	DefineField {
 		mode: DefinitionMode,
@@ -372,6 +376,37 @@ pub(super) enum LogicalSchemaStatement {
 		name: Box<str>,
 		mode: ClassSchemaMode,
 	},
+	/// Changes only the capture policy of an existing catalog owner.
+	AlterChangefeed {
+		/// Selects a graph owner instead of a global class owner.
+		graph: bool,
+		if_exists: bool,
+		name: Box<str>,
+		/// A validated policy, or None for DROP CHANGEFEED.
+		configuration: Option<crate::changefeed::ChangefeedConfig>,
+	},
+	/// Reads metadata by the runtime retained feed UUID.
+	InfoChangefeed {
+		/// Runtime feed identity.
+		id: TypedExpr,
+		/// Bounded source spelling owned by the analyzer, independent of
+		/// callers.
+		spelling: Box<str>,
+	},
+	/// Reads whole commits through the public changefeed reader.
+	ShowChanges {
+		/// Runtime or retained-name source binding.
+		target: LogicalChangefeedTarget,
+		/// Exact exclusive stamp, inclusive time, or opaque cursor expression.
+		since: TypedExpr,
+		/// Requires historical FULL coverage before any pull.
+		full: bool,
+		/// Whole-commit/GAP element limit.
+		limit: Option<TypedExpr>,
+		/// Bounded operand source owned by the analyzer, independent of
+		/// callers.
+		spelling: Box<str>,
+	},
 	AlterFieldType {
 		if_exists: bool,
 		class: Box<str>,
@@ -440,7 +475,27 @@ pub(super) enum LogicalGraphPropertyMutation {
 	Unset(Vec<Vec<Box<str>>>),
 }
 
+/// History binding independent of current schema-name resolution.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalChangefeedTarget {
+	/// Active-name-first lookup through the retained feed catalog.
+	Named(crate::changefeed::ChangefeedSelector),
+	/// A graph reference or graph-name value evaluated by the ordinary
+	/// evaluator.
+	Graph(TypedExpr),
+	/// A runtime UUID value evaluated by the ordinary evaluator.
+	Id(TypedExpr),
+}
+
 impl LogicalSchemaStatement {
+	/// Distinguishes history/catalog reads from atomic schema mutations.
+	pub(super) const fn is_read(&self) -> bool {
+		matches!(
+			self.statement_kind(),
+			crate::gql::QueryStatementKind::Info | crate::gql::QueryStatementKind::ShowChanges
+		)
+	}
+
 	pub(super) const fn statement_kind(&self) -> crate::gql::QueryStatementKind {
 		match self {
 			Self::DefineGraph {
@@ -497,6 +552,9 @@ impl LogicalSchemaStatement {
 			Self::AlterClassMode {
 				..
 			}
+			| Self::AlterChangefeed {
+				..
+			}
 			| Self::AlterFieldType {
 				..
 			}
@@ -512,7 +570,13 @@ impl LogicalSchemaStatement {
 			| Self::AlterAnalyzer {
 				..
 			} => crate::gql::QueryStatementKind::Alter,
-			Self::InfoDatabase
+			Self::ShowChanges {
+				..
+			} => crate::gql::QueryStatementKind::ShowChanges,
+			Self::InfoChangefeed {
+				..
+			}
+			| Self::InfoDatabase
 			| Self::InfoAnalyzer {
 				..
 			}
@@ -883,7 +947,8 @@ pub(crate) enum TraverseStepKind {
 	PageRank,
 	/// Exact in/out/total degree and stored connector strength.
 	Degree,
-	/// Reciprocal finite distances with unreachable occurrences contributing zero.
+	/// Reciprocal finite distances with unreachable occurrences contributing
+	/// zero.
 	HarmonicCloseness,
 	/// Full-source Brandes centrality with parallel shortest multiplicity.
 	Betweenness,

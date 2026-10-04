@@ -1,3 +1,4 @@
+mod changefeed;
 mod control;
 mod dml;
 mod explain;

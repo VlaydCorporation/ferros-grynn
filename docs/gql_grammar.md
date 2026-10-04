@@ -123,7 +123,7 @@ edge_filter     ::= node_filter
 alter_class_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
                      | "COMPACT"
                      | schema_mode
-                     | "CHANGEFEED" duration_lit
+                     | "CHANGEFEED" duration_lit [ "INCLUDE" "ORIGINAL" ] [ "FULL" ]
                      | "COMMENT" string_lit
 
 stage81_statement ::= define_class | define_field | define_index
@@ -135,7 +135,7 @@ stage81_statement ::= define_class | define_field | define_index
 define_class ::= "DEFINE" "CLASS" [ overwrite_or_ifne ] class_name
                  "TYPE" class_kind
                  [ schema_mode ]
-                 [ "CHANGEFEED" duration_lit ]
+                 [ "CHANGEFEED" duration_lit [ "INCLUDE" "ORIGINAL" ] [ "FULL" ] ]
                  [ "COMMENT" string_lit ]
 
 define_field ::= "DEFINE" "FIELD" [ overwrite_or_ifne ] name
@@ -1002,7 +1002,7 @@ if_exists         ::= "IF" "EXISTS"
 define_class ::= "DEFINE" "CLASS" [ overwrite_or_ifne ] class_name
                  "TYPE" ( "NODE" | "EDGE" )
                  [ "SCHEMALESS" | "SCHEMAFULL" ]
-                 [ "CHANGEFEED" duration_lit ]
+                 [ "CHANGEFEED" duration_lit [ "INCLUDE" "ORIGINAL" ] [ "FULL" ] ]
                  [ "COMMENT" string_lit ]
 ```
 
@@ -1142,6 +1142,7 @@ define_graph ::= "DEFINE" "GRAPH" [ overwrite_or_ifne ] name
                  [ "ROOT" root_ref | "ROOTS" array_lit ]
                  [ "VALIDATE" ( "ON_MUTATION" | "DEFERRED" ) ]
                  [ "CONTENT" expr ]
+                 [ "CHANGEFEED" duration_lit [ "INCLUDE" "ORIGINAL" ] [ "FULL" ] ]
                  [ "COMMENT" string_lit ]
 root_ref ::= record_id | "(" record_id ")"
 
@@ -1220,13 +1221,15 @@ alter_class ::= "ALTER" "CLASS" [ if_exists ] class_name
                 [ "WITH" "MIGRATION" ] [ "CONCURRENTLY" ]
 alter_class_action ::= "DROP" ( "COMMENT" | "CHANGEFEED" )
                       | "COMPACT" | "SCHEMAFULL" | "SCHEMALESS"
-                      | "CHANGEFEED" duration_lit | "COMMENT" string_lit
+                      | "CHANGEFEED" duration_lit [ "INCLUDE" "ORIGINAL" ] [ "FULL" ] | "COMMENT" string_lit
 
 alter_graph ::= "ALTER" "GRAPH" [ if_exists ] name
                 alter_graph_action { alter_graph_action }
 alter_graph_action ::= "TYPE" graph_contract_body
                      | "ROOT" root_ref | "ROOTS" array_lit | "DROP" "ROOTS"
                      | "VALIDATE" ( "ON_MUTATION" | "DEFERRED" )
+                     | "CHANGEFEED" duration_lit [ "INCLUDE" "ORIGINAL" ] [ "FULL" ]
+                     | "DROP" "CHANGEFEED"
                      | "COMMENT" string_lit | "DROP" "COMMENT"
 ```
 
@@ -1259,8 +1262,9 @@ analyze_stmt ::= "ANALYZE"
                  [ "CONCURRENTLY" ] [ maintenance_options ]
 
 show_changes_stmt ::= "SHOW" "CHANGES" "FOR"
-                      ( "CLASS" class_name | "GRAPH" graph_ref )
+                      ( "CLASS" class_name | "GRAPH" graph_ref | "CHANGEFEED" expr )
                       "SINCE" ( datetime_lit | integer | expr )
+                      [ "FULL" ]
                       [ "LIMIT" integer ]
 
 kill_stmt ::= "KILL" param

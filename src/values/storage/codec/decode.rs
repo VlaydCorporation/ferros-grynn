@@ -49,7 +49,7 @@ pub(super) struct Decoder<'a> {
 	bytes: &'a [u8],
 	pub(super) position: usize,
 	limits: DecodeLimits,
-	allocated: usize,
+	pub(super) allocated: usize,
 }
 
 impl<'a> Decoder<'a> {

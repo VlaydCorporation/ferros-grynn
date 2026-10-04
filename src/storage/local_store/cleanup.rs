@@ -1,7 +1,7 @@
 //! Removal of unpublished UUID generations left by failed imports or crashes.
 
 use std::{
-	collections::BTreeSet,
+	collections::{BTreeMap, BTreeSet},
 	fs,
 	path::{Path, PathBuf},
 	sync::Weak,
@@ -14,10 +14,82 @@ use crate::{
 	storage::{
 		catalog::FileCatalog,
 		file_registry::{FileRegistry, RegisteredDataFile},
-		types::DataFileKind,
+		types::{DataFileId, DataFileKind},
 	},
 	values::Uuid,
 };
+
+/// Individual append-only file whose catalog reference was durably removed.
+pub(super) struct RetiredChangefeedFile {
+	/// Exact logical file identity used to test old binding-map pins.
+	file: DataFileId,
+	/// Canonical catalog path below the database directory.
+	path: PathBuf,
+}
+
+impl RetiredChangefeedFile {
+	/// Admits complete removal metadata before the WAL publication boundary.
+	pub(super) fn between(
+		root: &Path,
+		previous: &FileCatalog,
+		current: &FileCatalog,
+	) -> FerrosGrynnResult<Vec<Self>> {
+		let missing = |entry: &&crate::storage::catalog::FileCatalogEntry| {
+			entry.file_id.kind() == Some(DataFileKind::Changefeed)
+				&& current
+					.files
+					.binary_search_by_key(&(entry.space_id, entry.file_id), |candidate| {
+						(candidate.space_id, candidate.file_id)
+					})
+					.is_err()
+		};
+		let count = previous.files.iter().filter(missing).count();
+		let bytes =
+			count.checked_mul(2048).ok_or_else(|| invalid("feed retirement metadata overflows"))?;
+		let maximum = crate::storage::external_sort_run_budget().min(256 * 1024 * 1024);
+		if bytes > maximum {
+			return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+				"feed retirement metadata",
+				bytes as u64,
+				maximum as u64,
+			));
+		}
+		let mut result = Vec::new();
+		result
+			.try_reserve_exact(count)
+			.map_err(|_error| invalid("feed retirement allocation failed"))?;
+		for entry in previous.files.iter().filter(missing) {
+			result.push(Self {
+				file: entry.file_id,
+				path: entry.path.resolve(root),
+			});
+		}
+		Ok(result)
+	}
+
+	/// Deletes only after every earlier binding map releases this file.
+	pub(super) fn sweep(
+		&self,
+		pinned: &[Weak<BTreeMap<DataFileId, std::sync::Arc<RegisteredDataFile>>>],
+	) -> FerrosGrynnResult<bool> {
+		if pinned
+			.iter()
+			.any(|map| map.upgrade().is_some_and(|files| files.contains_key(&self.file)))
+		{
+			return Ok(false);
+		}
+		let metadata = match fs::symlink_metadata(&self.path) {
+			Ok(metadata) => metadata,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+			Err(error) => return Err(io_failure("inspect retired feed", error)),
+		};
+		if !metadata.is_file() || metadata.file_type().is_symlink() {
+			return Err(invalid("retired feed path is not a physical file"));
+		}
+		fs::remove_file(&self.path).map_err(|error| io_failure("remove retired feed", error))?;
+		Ok(true)
+	}
+}
 
 /// One catalog generation that is no longer current but may still be pinned
 /// by an exact physical query snapshot.
@@ -103,6 +175,13 @@ impl UnpublishedGeneration {
 	pub(super) fn publish(&mut self) {
 		self.armed = false;
 	}
+
+	/// Keeps files after an uncertain WAL append/fsync outcome. Recovered
+	/// catalog reachability, rather than an error return, decides their
+	/// cleanup.
+	pub(super) fn preserve_for_recovery(&mut self) {
+		self.armed = false;
+	}
 }
 
 impl Drop for UnpublishedGeneration {
@@ -112,6 +191,61 @@ impl Drop for UnpublishedGeneration {
 		}
 		for directory in &self.directories {
 			drop(fs::remove_dir_all(directory));
+		}
+	}
+}
+
+/// Owns only newly created feed files before the WAL call. Appended old files
+/// are never removed; their old committed ceilings remain authoritative.
+pub(super) struct PendingChangefeedFiles {
+	/// Canonical new segment paths belonging to this private publication.
+	paths: Vec<PathBuf>,
+	/// Known failures clean up; uncertain WAL outcomes defer to recovery.
+	armed: bool,
+}
+
+impl PendingChangefeedFiles {
+	/// Admits cleanup metadata before any new segment file is created.
+	pub(super) fn new(root: &Path, images: &[super::layout::FileImage]) -> FerrosGrynnResult<Self> {
+		let new_file = |image: &&super::layout::FileImage| {
+			image.entry.file_id.kind() == Some(DataFileKind::Changefeed)
+				&& image.page_numbers.get(1).is_some_and(|number| number.get() == 1)
+		};
+		let count = images.iter().filter(new_file).count();
+		let bytes = root
+			.as_os_str()
+			.len()
+			.checked_add(256)
+			.and_then(|bytes| bytes.checked_mul(3))
+			.and_then(|bytes| bytes.checked_mul(count))
+			.ok_or_else(|| invalid("pending feed cleanup metadata overflows"))?;
+		if bytes > 16 * 1024 * 1024 {
+			return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+				"pending feed cleanup bytes",
+				bytes as u64,
+				16 * 1024 * 1024,
+			));
+		}
+		let paths =
+			images.iter().filter(new_file).map(|image| image.entry.path.resolve(root)).collect();
+		Ok(Self {
+			paths,
+			armed: true,
+		})
+	}
+
+	/// Once append/fsync begins, only recovery may prove a file unreachable.
+	pub(super) fn preserve_for_recovery(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for PendingChangefeedFiles {
+	fn drop(&mut self) {
+		if self.armed {
+			for path in &self.paths {
+				drop(fs::remove_file(path));
+			}
 		}
 	}
 }
@@ -185,6 +319,70 @@ pub(super) fn cleanup_orphan_quarantines(
 	Ok(())
 }
 
+/// Removes only canonical feed files proven unreachable by the recovered
+/// catalog. This runs after recovery establishes the WAL commit outcome.
+pub(super) fn cleanup_orphan_changefeeds(
+	root: &Path,
+	catalog: &FileCatalog,
+) -> FerrosGrynnResult<()> {
+	let directory = root.join("changefeed");
+	let metadata = match fs::symlink_metadata(&directory) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(io_failure("inspect feed directory", error)),
+	};
+	if !metadata.is_dir() || metadata.file_type().is_symlink() {
+		return Err(invalid("feed directory is not a physical directory"));
+	}
+	let reachable = catalog
+		.files
+		.iter()
+		.filter(|entry| entry.file_id.kind() == Some(DataFileKind::Changefeed))
+		.map(|entry| entry.path.resolve(root))
+		.collect::<BTreeSet<_>>();
+	for entry in
+		fs::read_dir(&directory).map_err(|error| io_failure("read feed directories", error))?
+	{
+		let entry = entry.map_err(|error| io_failure("read feed directory", error))?;
+		let kind =
+			entry.file_type().map_err(|error| io_failure("inspect feed directory", error))?;
+		let canonical = entry.file_name().to_str().is_some_and(canonical_uuid);
+		if !kind.is_dir() || kind.is_symlink() || !canonical {
+			continue;
+		}
+		for file in
+			fs::read_dir(entry.path()).map_err(|error| io_failure("read feed segments", error))?
+		{
+			let file = file.map_err(|error| io_failure("read feed segment", error))?;
+			let kind =
+				file.file_type().map_err(|error| io_failure("inspect feed segment", error))?;
+			let canonical = file
+				.file_name()
+				.to_str()
+				.and_then(|name| name.strip_suffix(".fcf"))
+				.is_some_and(canonical_uuid);
+			if !kind.is_file()
+				|| kind.is_symlink()
+				|| !canonical
+				|| reachable.contains(&file.path())
+			{
+				continue;
+			}
+			match fs::remove_file(file.path()) {
+				Ok(()) => {}
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+				Err(error) => return Err(io_failure("remove orphan feed segment", error)),
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Recognizes exactly the non-nil lowercase UUID spelling used by the catalog.
+fn canonical_uuid(name: &str) -> bool {
+	name.parse::<uuid::Uuid>().is_ok_and(|id| !id.is_nil() && id.to_string() == name)
+}
+
 /// Removes transient query runs left by an interrupted process before the
 /// database accepts sessions.
 pub(super) fn cleanup_query_runs(root: &Path) -> FerrosGrynnResult<()> {
@@ -206,7 +404,11 @@ fn generation_directories(
 		if file.file_id.kind() == Some(DataFileKind::SystemCatalog)
 			|| matches!(
 				file.file_id.kind(),
-				Some(DataFileKind::JobCatalog | DataFileKind::ImportQuarantine)
+				Some(
+					DataFileKind::JobCatalog
+						| DataFileKind::ImportQuarantine
+						| DataFileKind::Changefeed
+				)
 			) {
 			continue;
 		}

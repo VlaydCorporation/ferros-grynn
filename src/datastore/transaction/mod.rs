@@ -50,6 +50,17 @@ use crate::{
 
 mod all_shortest;
 mod build_graph;
+mod changefeed;
+/// Validated operation replay and final-policy NET/FULL capture.
+mod changefeed_capture;
+/// Owned historical image projection and representation comparison.
+mod changefeed_images;
+/// Accepted-item history retained across private import segments.
+mod changefeed_import;
+/// Compact operation grouping and targeted no-op metadata.
+mod changefeed_journal;
+/// Snapshot-bound public history selection, preflight and pull reading.
+mod changefeed_reader;
 mod commit;
 mod graph;
 mod graph_view;
@@ -126,10 +137,26 @@ impl CommitResult {
 	pub const fn commit_ts(self) -> u64 {
 		self.commit_ts
 	}
+
+	/// Returns the exact durable position shared by all entries of this commit.
+	pub const fn versionstamp(self) -> crate::changefeed::Versionstamp {
+		crate::changefeed::Versionstamp::new(self.commit_ts)
+	}
 }
 
 #[derive(Debug, Clone)]
 enum Mutation {
+	/// Final capture configuration of a retained class or graph feed.
+	ConfigureChangefeed {
+		/// Stable owning class or graph identity.
+		source: crate::changefeed::ChangefeedSource,
+		/// Stable retained incarnation.
+		id: crate::changefeed::ChangefeedId,
+		/// Historical source name.
+		name: Text,
+		/// Validated policy, or None to stop capture.
+		config: Option<crate::changefeed::ChangefeedConfig>,
+	},
 	InternProperty {
 		key: PropertyKeyId,
 		name: Text,
@@ -228,6 +255,10 @@ pub struct Transaction {
 	/// root.
 	physical_query_snapshot:
 		Option<(u64, FerrosGrynnResult<Option<crate::storage::LocalQuerySnapshot>>)>,
+	/// Constant-size history visibility/file pin, independent of graph
+	/// bindings.
+	changefeed_snapshot:
+		Option<(u64, FerrosGrynnResult<Option<crate::storage::LocalChangefeedSnapshot>>)>,
 	working: DatabaseRoot,
 	reads: Mutex<RapidHashMap<ConflictKey, u64>>,
 	missing_records: Mutex<BTreeSet<RecordId>>,
@@ -240,6 +271,11 @@ pub struct Transaction {
 	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
 	write_bytes: usize,
 	mutations: Vec<Mutation>,
+	/// Bounded operation ranges and targets, without captured images.
+	change_journal: changefeed_journal::ChangeJournal,
+	/// Bounded accepted-item spool, never visible before final import
+	/// publication.
+	import_changefeed: changefeed_import::ImportCaptureSpool,
 	import_constraints: Option<ImportConstraintMode>,
 	import_graph_scope: Option<GraphId>,
 	rollback_mutation_errors: bool,
@@ -260,6 +296,10 @@ pub(crate) struct TransactionSavepoint {
 	fanout_reservations: BTreeSet<(GlobalAtomId, GraphId, PropertyKeyId)>,
 	write_bytes: usize,
 	mutation_len: usize,
+	/// Capture journal rollback, including checked ordinals and reservations.
+	change_journal: changefeed_journal::JournalCheckpoint,
+	/// Spool rollback position for rejected or failed item boundaries.
+	import_changefeed: changefeed_import::SpoolCheckpoint,
 	gql_bindings: crate::values::Object,
 }
 
@@ -279,6 +319,9 @@ impl Transaction {
 					store.inner.capture_physical_query_snapshot(snapshot.commit_ts),
 				)
 			});
+		let changefeed_snapshot = (!snapshot.changefeed_segments().is_empty()).then(|| {
+			(snapshot.commit_ts, store.inner.capture_changefeed_snapshot(snapshot.commit_ts))
+		});
 		Self {
 			store,
 			id,
@@ -287,6 +330,7 @@ impl Transaction {
 			working: (*snapshot).clone(),
 			snapshot,
 			physical_query_snapshot,
+			changefeed_snapshot,
 			reads: Mutex::new(RapidHashMap::default()),
 			missing_records: Mutex::new(BTreeSet::new()),
 			last_base_read: None,
@@ -296,6 +340,8 @@ impl Transaction {
 			fanout_reservations: BTreeSet::new(),
 			write_bytes: 0,
 			mutations: Vec::new(),
+			change_journal: changefeed_journal::ChangeJournal::default(),
+			import_changefeed: changefeed_import::ImportCaptureSpool::default(),
 			import_constraints: None,
 			import_graph_scope: None,
 			rollback_mutation_errors: true,
@@ -315,6 +361,8 @@ impl Transaction {
 		constraints: ImportConstraintMode,
 		on_violation: ImportViolationPolicy,
 		graph_scope: Option<GraphId>,
+		changefeed: super::ImportChangefeedMode,
+		commit_ts: u64,
 	) -> Self {
 		let mut transaction = Self::new(store, id, options, snapshot);
 		if indexes == ImportIndexMode::Deferred {
@@ -324,6 +372,8 @@ impl Transaction {
 		}
 		transaction.import_constraints = Some(constraints);
 		transaction.import_graph_scope = graph_scope;
+		transaction.import_changefeed.mode = changefeed;
+		transaction.import_changefeed.stamp = commit_ts;
 		transaction.rollback_mutation_errors =
 			matches!(on_violation, ImportViolationPolicy::Skip | ImportViolationPolicy::Quarantine);
 		transaction
@@ -347,6 +397,19 @@ impl Transaction {
 	/// Returns bytes already reserved by the logical write-set preflight.
 	pub const fn write_set_bytes(&self) -> usize {
 		self.write_bytes
+			.saturating_add(self.admitted_journal_bytes())
+			.saturating_add(self.import_changefeed.retained_bytes())
+	}
+
+	/// ON segment replay retains vector capacities alongside captured chunks.
+	const fn admitted_journal_bytes(&self) -> usize {
+		if self.import_constraints.is_some()
+			&& matches!(self.import_changefeed.mode, super::ImportChangefeedMode::On)
+		{
+			self.change_journal.allocation_bytes()
+		} else {
+			self.change_journal.bytes
+		}
 	}
 
 	pub(crate) fn active_maintenance_job(
@@ -441,6 +504,8 @@ impl Transaction {
 			fanout_reservations: self.fanout_reservations.clone(),
 			write_bytes: self.write_bytes,
 			mutation_len: self.mutations.len(),
+			change_journal: self.change_journal.checkpoint(),
+			import_changefeed: self.import_changefeed.checkpoint(),
 			gql_bindings: self.gql_bindings.clone(),
 		}
 	}
@@ -456,6 +521,8 @@ impl Transaction {
 		self.fanout_reservations = savepoint.fanout_reservations;
 		self.write_bytes = savepoint.write_bytes;
 		self.mutations.truncate(savepoint.mutation_len);
+		self.change_journal.restore(savepoint.change_journal);
+		self.import_changefeed.restore(savepoint.import_changefeed);
 		self.gql_bindings = savepoint.gql_bindings;
 	}
 
@@ -492,17 +559,29 @@ impl Transaction {
 			return mutate(self);
 		}
 		self.prepare_mutation()?;
-		self.atomic_mutation_depth = 1;
 		if !self.rollback_mutation_errors {
+			let checkpoint = self.change_journal.checkpoint();
+			let owned = self.begin_change_operation();
+			self.atomic_mutation_depth = 1;
 			let result = mutate(self);
 			self.atomic_mutation_depth = 0;
+			if result.is_ok() {
+				self.finish_change_operation(owned);
+			} else {
+				self.change_journal.restore(checkpoint);
+			}
 			return result;
 		}
 		let savepoint = self.gql_savepoint();
+		let owned = self.begin_change_operation();
+		self.atomic_mutation_depth = 1;
 		let result = mutate(self);
 		self.atomic_mutation_depth = 0;
 		match result {
-			Ok(value) => Ok(value),
+			Ok(value) => {
+				self.finish_change_operation(owned);
+				Ok(value)
+			}
 			Err(error) => {
 				self.restore_gql_savepoint(savepoint);
 				Err(error)
@@ -772,8 +851,9 @@ impl Transaction {
 		for (_key, value) in &properties {
 			self.intern_value_keys(value)?;
 		}
-		self.ensure_capacity(BASE_ATOM_WRITE_BYTES)?;
+		self.admit_change_target(BASE_ATOM_WRITE_BYTES)?;
 		let global = self.working.insert_atom(&class, record_id.clone(), properties.clone())?;
+		self.record_created_change_target(global, class_id);
 		let key = ConflictKey::BaseAtom(global);
 		self.insert_write(key, BASE_ATOM_WRITE_BYTES);
 		self.mark_range_change(ConflictKey::BaseClassRange(class_id));
@@ -817,12 +897,26 @@ impl Transaction {
 		key: PropertyKeyId,
 		value: Value,
 	) -> FerrosGrynnResult<Option<Value>> {
+		self.logical_operation(|transaction| {
+			transaction.set_base_property_inner(record_id, key, value)
+		})
+	}
+
+	/// Applies one base setter inside the current logical operation.
+	fn set_base_property_inner(
+		&mut self,
+		record_id: &RecordId,
+		key: PropertyKeyId,
+		value: Value,
+	) -> FerrosGrynnResult<Option<Value>> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
+		self.note_change_target(global, None, ConflictKey::BaseAtom(global))?;
 		self.intern_value_keys(&value)?;
 		let (class_id, _kind) = self.atom_domain(global)?;
 		let write = ConflictKey::BaseAtom(global);
 		let fanout = self.inherited_memberships(global, key);
+		self.note_import_suppressed_fanout(global, key, Some(&value), &fanout)?;
 		let new_fanout = fanout
 			.iter()
 			.filter(|graph| !self.fanout_reservations.contains(&(global, **graph, key)))
@@ -876,14 +970,25 @@ impl Transaction {
 		record_id: &RecordId,
 		key: PropertyKeyId,
 	) -> FerrosGrynnResult<Option<Value>> {
+		self.logical_operation(|transaction| transaction.remove_base_property_inner(record_id, key))
+	}
+
+	/// Records targeted absence before removing a base value.
+	fn remove_base_property_inner(
+		&mut self,
+		record_id: &RecordId,
+		key: PropertyKeyId,
+	) -> FerrosGrynnResult<Option<Value>> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
+		self.note_change_target(global, None, ConflictKey::BaseAtom(global))?;
 		let (class_id, _kind) = self.atom_domain(global)?;
 		if self.working.atom(global).and_then(|atom| atom.properties().get(key)).is_none() {
 			return Ok(None);
 		}
 		let write = ConflictKey::BaseAtom(global);
 		let fanout = self.inherited_memberships(global, key);
+		self.note_import_suppressed_fanout(global, key, None, &fanout)?;
 		let new_fanout = fanout
 			.iter()
 			.filter(|graph| !self.fanout_reservations.contains(&(global, **graph, key)))
@@ -951,6 +1056,7 @@ impl Transaction {
 
 	fn delete_atom_inner(&mut self, record_id: &RecordId, cascade: bool) -> FerrosGrynnResult<()> {
 		let global = self.require_atom(record_id)?;
+		self.note_change_target(global, None, ConflictKey::BaseAtom(global))?;
 		let (class_id, _kind) = self.atom_domain(global)?;
 		let write = ConflictKey::BaseAtom(global);
 		if !self.writes.contains_key(&write) {
@@ -1052,7 +1158,8 @@ impl Transaction {
 		let store = self.store.clone();
 		let mut current = store.inner.current_root();
 		let _commit = (matches!(&store.inner.backend, super::StoreBackend::Local(_))
-			&& current.schema.has_snapshot_indexes())
+			&& (current.schema.has_snapshot_indexes()
+				|| !current.changefeed_segments().is_empty()))
 		.then(|| store.inner.commit.lock());
 		if _commit.is_some() {
 			current = store.inner.current_root();
@@ -1082,6 +1189,12 @@ impl Transaction {
 					store.inner.capture_physical_query_snapshot(self.working.commit_ts),
 				)
 			});
+		self.changefeed_snapshot = (!self.working.changefeed_segments().is_empty()).then(|| {
+			(
+				self.working.commit_ts,
+				store.inner.capture_changefeed_snapshot(self.working.commit_ts),
+			)
+		});
 		self.reads.lock().clear();
 		self.missing_records.lock().clear();
 		self.last_base_read = None;
@@ -1153,9 +1266,26 @@ impl Transaction {
 	}
 
 	fn ensure_capacity(&self, additional: usize) -> FerrosGrynnResult<()> {
-		let actual = self.write_bytes.checked_add(additional).unwrap_or(usize::MAX);
-		if actual > self.store.inner.transaction_limits().max_write_set_bytes {
-			return Err(self.limit_error(actual));
+		let actual = self
+			.write_bytes
+			.checked_add(self.admitted_journal_bytes())
+			.and_then(|bytes| bytes.checked_add(self.import_changefeed.retained_bytes()))
+			.and_then(|bytes| bytes.checked_add(additional))
+			.unwrap_or(usize::MAX);
+		let maximum = self.store.inner.transaction_limits().max_write_set_bytes;
+		let maximum = if self.import_constraints.is_some()
+			&& self.import_changefeed.mode == super::ImportChangefeedMode::On
+		{
+			maximum.min(256 * 1024 * 1024)
+		} else {
+			maximum
+		};
+		if actual > maximum {
+			return Err(FerrosGrynnError::transaction_write_set_limit_exceeded(
+				self.id,
+				actual as u64,
+				maximum as u64,
+			));
 		}
 		Ok(())
 	}

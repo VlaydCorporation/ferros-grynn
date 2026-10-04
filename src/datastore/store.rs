@@ -181,8 +181,35 @@ impl Datastore {
 				query_scratch_root,
 				quarantines: Mutex::new(std::collections::BTreeMap::new()),
 				maintenance: MaintenanceCoordinator::new(recovered_jobs),
+				changefeed_observation: super::changefeed_observation::Counters::default(),
 			}),
 		}
+	}
+
+	/// Queues bounded retention passes on the existing maintenance worker.
+	///
+	/// ```
+	/// use ferros_grynn::datastore::Datastore;
+	/// # fn main() -> ferros_grynn::gql_status::FerrosGrynnResult<()> {
+	/// let store = Datastore::in_memory();
+	/// let job = store.purge_changefeeds(None)?;
+	/// assert!(store.job(job)?.is_some());
+	/// # Ok(())
+	/// # }
+	/// ```
+	///
+	/// # Errors
+	///
+	/// Returns worker, durable job publication or resource errors.
+	pub fn purge_changefeeds(
+		&self,
+		options: Option<MaintenanceOptions>,
+	) -> FerrosGrynnResult<super::JobId> {
+		self.enqueue_maintenance_coalesced(
+			MaintenanceJobKind::PurgeChangefeed,
+			MaintenanceTarget::Database,
+			options,
+		)
 	}
 
 	/// Returns one durable maintenance job, if it exists.
@@ -381,7 +408,7 @@ impl Datastore {
 	pub fn begin_with(&self, options: TransactionOptions) -> Transaction {
 		let mut root = self.inner.current_root();
 		let _commit = (matches!(&self.inner.backend, StoreBackend::Local(_))
-			&& root.schema.has_snapshot_indexes())
+			&& (root.schema.has_snapshot_indexes() || !root.changefeed_segments().is_empty()))
 		.then(|| self.inner.commit.lock());
 		if _commit.is_some() {
 			root = self.inner.current_root();

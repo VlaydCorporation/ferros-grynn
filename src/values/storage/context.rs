@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	values::runtime::{GraphRef, PropertyDictionary, Text},
+	values::runtime::{GraphRef, PropertyDictionary, PropertyKeyId, Text},
 };
 
 #[derive(Debug, Default)]
@@ -118,6 +118,16 @@ impl EncodeContext {
 		&self.properties
 	}
 
+	/// Registers an exact dense property slot in an independent historical
+	/// dictionary, preserving the primary dictionary's restore checks.
+	pub(crate) fn register_property_name(
+		&mut self,
+		id: PropertyKeyId,
+		name: Text,
+	) -> FerrosGrynnResult<()> {
+		self.properties.restore(id, name)
+	}
+
 	/// Registers one exact catalog class identity used by canonical RecordId
 	/// values.
 	pub(crate) fn register_class_name(&mut self, id: u32, name: Text) -> FerrosGrynnResult<()> {
@@ -166,8 +176,20 @@ impl EncodeContext {
 		runtime: GraphRef,
 		disk: DiskGraphRef,
 	) -> FerrosGrynnResult<()> {
-		if runtime.id() != disk.graph_id()
-			|| self.graphs_to_disk.get(&runtime).is_some_and(|existing| *existing != disk)
+		if runtime.id() != disk.graph_id() {
+			return Err(FerrosGrynnError::storage_context_conflict("graph", disk.to_string()));
+		}
+		self.register_historical_graph(runtime, disk)
+	}
+
+	/// Registers a group-local historical slot without consulting the current
+	/// graph catalog. The runtime identity and descriptor remain unchanged.
+	pub(crate) fn register_historical_graph(
+		&mut self,
+		runtime: GraphRef,
+		disk: DiskGraphRef,
+	) -> FerrosGrynnResult<()> {
+		if self.graphs_to_disk.get(&runtime).is_some_and(|existing| *existing != disk)
 			|| self.graphs_from_disk.get(&disk).is_some_and(|existing| existing != &runtime)
 		{
 			return Err(FerrosGrynnError::storage_context_conflict("graph", disk.to_string()));

@@ -318,6 +318,32 @@ pub(super) trait QueryRead {
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot>;
 
+	/// Returns committed origin/boundary even after a feed incarnation has
+	/// expired.
+	fn changefeed_context(
+		&self,
+	) -> FerrosGrynnResult<(crate::values::Uuid, crate::changefeed::Versionstamp)> {
+		Err(FerrosGrynnError::invalid_argument("this reader has no changefeed catalog"))
+	}
+
+	/// Visits private function definitions in identity order without cloning
+	/// the catalog or evaluating bodies.
+	fn visit_changefeed_functions(
+		&self,
+		_visitor: &mut dyn FnMut(&crate::datastore::SchemaFunction) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<()> {
+		Err(FerrosGrynnError::invalid_argument("this reader has no function catalog"))
+	}
+
+	/// Returns allocation-free committed history metadata without evaluating
+	/// operands.
+	fn changefeed_binding(
+		&self,
+		_selector: &crate::changefeed::ChangefeedSelector,
+	) -> FerrosGrynnResult<Option<crate::changefeed::ChangefeedReadBinding>> {
+		Err(FerrosGrynnError::invalid_argument("this reader has no changefeed catalog"))
+	}
+
 	/// Recaptures the transaction-private root after an explicit traversal
 	/// side effect and returns its logical snapshot identity.
 	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<Snapshot>;
@@ -340,13 +366,19 @@ pub(super) trait QueryRead {
 		crate::graph::tensor::EndpointTensor::from_graph_with_check(&view, options, &mut || check())
 	}
 
-	/// Reads the selected logical generation, reporting exact on-demand fallback.
+	/// Reads the selected logical generation, reporting exact on-demand
+	/// fallback.
 	fn endpoint_tensor_selected(
-		&self, snapshot: Snapshot, graph: &GraphRef,
+		&self,
+		snapshot: Snapshot,
+		graph: &GraphRef,
 		options: crate::graph::tensor::TensorOptions,
 		_selected: Option<&crate::datastore::QueryTensorCache>,
 		check: &mut dyn FnMut() -> FerrosGrynnResult<()>,
-	) -> FerrosGrynnResult<(crate::graph::tensor::EndpointTensor, Option<crate::datastore::QueryTensorCache>)> {
+	) -> FerrosGrynnResult<(
+		crate::graph::tensor::EndpointTensor,
+		Option<crate::datastore::QueryTensorCache>,
+	)> {
 		self.endpoint_tensor(snapshot, graph, options, check).map(|tensor| (tensor, None))
 	}
 

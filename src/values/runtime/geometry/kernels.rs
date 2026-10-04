@@ -67,7 +67,6 @@ impl Geometry {
 
 	/// Validates before converting to private foreign kernel types.
 	fn checked_geo(&self) -> FerrosGrynnResult<geo::Geometry<f64>> {
-		check_structure(self, 0, &mut 0)?;
 		self.validation_scratch_bytes()?;
 		let geometry = to_geo(self);
 		geometry.check_validation().map_err(|cause| {
@@ -80,6 +79,7 @@ impl Geometry {
 	/// Bounds family-specific validation scratch before entering the foreign
 	/// kernel.
 	pub(crate) fn validation_scratch_bytes(&self) -> FerrosGrynnResult<usize> {
+		check_structure(self, 0, &mut 0)?;
 		fn sum(
 			mut values: impl Iterator<Item = FerrosGrynnResult<usize>>,
 		) -> FerrosGrynnResult<usize> {

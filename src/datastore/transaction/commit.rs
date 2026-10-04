@@ -25,7 +25,7 @@ pub(super) struct ReplayRemap {
 }
 
 impl ReplayRemap {
-	fn global(&self, id: super::GlobalAtomId) -> super::GlobalAtomId {
+	pub(super) fn global(&self, id: super::GlobalAtomId) -> super::GlobalAtomId {
 		self.globals.get(&id).copied().unwrap_or(id)
 	}
 
@@ -115,18 +115,18 @@ impl Transaction {
 	pub fn commit(self) -> FerrosGrynnResult<CommitResult> {
 		self.ensure_live()?;
 		let store = self.store.clone();
-		if !self.mutations.is_empty() {
+		if !self.mutations.is_empty() || self.has_full_capture(&self.working) {
 			store.inner.ensure_write_allowed(self.id)?;
 		}
 		let _commit = store.inner.commit.lock();
 		self.ensure_live()?;
-		if !self.mutations.is_empty() {
+		if !self.mutations.is_empty() || self.has_full_capture(&store.inner.current_root()) {
 			store.inner.ensure_write_allowed(self.id)?;
 		}
 		let current = store.inner.current_root();
 		self.validate_against(&current)?;
 		self.validate_commit_fanout(&current)?;
-		if self.mutations.is_empty() {
+		if self.mutations.is_empty() && !self.has_full_capture(&current) {
 			return Ok(CommitResult {
 				transaction: self.id,
 				commit_ts: current.commit_ts,
@@ -165,7 +165,10 @@ impl Transaction {
 			self.validate_graph_family_in_root(validation_root.clone(), schema.reference())?;
 		}
 		drop(validation_root);
+		self.validate_full_noops(&current, &next)?;
 		next.commit_ts = commit_ts;
+		next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
+		self.capture_changes(&current, &mut next, commit_ts)?;
 		for key in self.writes.keys() {
 			next.mark_version(remap.conflict(*key), commit_ts);
 		}
@@ -176,6 +179,7 @@ impl Transaction {
 			matches!(
 				mutation,
 				Mutation::InternProperty { .. }
+					| Mutation::ConfigureChangefeed { .. }
 					| Mutation::ReplaceGraph(_)
 					| Mutation::DefineParameter(_)
 					| Mutation::ReplaceParameter(_)
@@ -191,6 +195,7 @@ impl Transaction {
 			matches!(
 				mutation,
 				Mutation::ReplaceGraph(_)
+					| Mutation::ConfigureChangefeed { .. }
 					| Mutation::DefineParameter(_)
 					| Mutation::ReplaceParameter(_)
 					| Mutation::RemoveParameter(_)
@@ -311,7 +316,9 @@ impl Transaction {
 
 	fn validate_against(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
 		self.validate_write_requirements(current)?;
-		if self.options.isolation == IsolationLevel::Serializable && !self.mutations.is_empty() {
+		if self.options.isolation == IsolationLevel::Serializable
+			&& (!self.mutations.is_empty() || self.has_full_capture(current))
+		{
 			for (key, observed) in self.reads.lock().iter() {
 				if current.version(*key) != *observed
 					&& !self.is_private_allocation_collision(current, *key)
@@ -353,7 +360,11 @@ impl Transaction {
 
 	/// Distinguishes a stale physical address chosen by a private root from a
 	/// real logical conflict. The latter remains a serialization failure.
-	fn is_private_allocation_collision(&self, current: &DatabaseRoot, key: ConflictKey) -> bool {
+	pub(super) fn is_private_allocation_collision(
+		&self,
+		current: &DatabaseRoot,
+		key: ConflictKey,
+	) -> bool {
 		let created_record = |global| {
 			self.mutations.iter().find_map(|mutation| match mutation {
 				Mutation::CreateAtom {
@@ -401,7 +412,10 @@ impl Transaction {
 	fn validate_commit_fanout(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
 		let initial_fanout_bytes =
 			self.fanout_reservations.len().saturating_mul(EFFECTIVE_FANOUT_WRITE_BYTES);
-		let non_fanout_bytes = self.write_bytes.saturating_sub(initial_fanout_bytes);
+		let non_fanout_bytes = self
+			.write_bytes
+			.saturating_sub(initial_fanout_bytes)
+			.saturating_add(self.change_journal.bytes);
 		let mut actual = BTreeSet::new();
 		for mutation in &self.mutations {
 			let (global, key) = match mutation {
@@ -467,8 +481,52 @@ impl Transaction {
 			root.rebuild_indexes()?;
 		}
 		let mut remap = ReplayRemap::default();
+		Self::replay_mutations(root, mutations, published_at, rebase_allocations, &mut remap)?;
+		root.publish_statistics_revision(published_at);
+		for source in root.retire_missing_changefeeds(published_at)? {
+			root.mark_version(ConflictKey::ChangefeedDefinition(source), published_at);
+			root.mark_version(ConflictKey::ChangefeedCatalogRange, published_at);
+		}
+		Ok(remap)
+	}
+
+	/// Replays consecutive operation ranges using one allocation translation.
+	pub(super) fn replay_mutations(
+		root: &mut DatabaseRoot,
+		mutations: &[Mutation],
+		published_at: u64,
+		rebase_allocations: bool,
+		remap: &mut ReplayRemap,
+	) -> FerrosGrynnResult<()> {
 		for mutation in mutations {
 			match mutation {
+				Mutation::ConfigureChangefeed {
+					source,
+					id,
+					name,
+					config,
+				} => {
+					let present = match source {
+						crate::changefeed::ChangefeedSource::Class(class) => {
+							root.schema.class_by_id(*class).is_some()
+						}
+						crate::changefeed::ChangefeedSource::Graph(graph) => {
+							root.schema.graph(*graph).is_some()
+						}
+					};
+					if config.is_some() && !present {
+						return Err(FerrosGrynnError::invalid_argument(
+							"changefeed owner changed before publication",
+						));
+					}
+					Arc::make_mut(root.changefeeds_mut()).configure(
+						*source,
+						*id,
+						name.clone(),
+						*config,
+						published_at,
+					)?;
+				}
 				Mutation::InternProperty {
 					key,
 					name,
@@ -667,8 +725,7 @@ impl Transaction {
 				}
 			}
 		}
-		root.publish_statistics_revision(published_at);
-		Ok(remap)
+		Ok(())
 	}
 }
 

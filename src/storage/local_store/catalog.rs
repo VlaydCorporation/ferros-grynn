@@ -27,6 +27,7 @@ use crate::{
 			AnalyzerCatalogEntry,
 			AnalyzerFilterCatalogEntry,
 			AtomStoreCatalogBinding,
+			ChangefeedCatalogEntry,
 			ClassCatalogEntry,
 			ClassFieldCatalogEntry,
 			ClassIndexCatalogEntry,
@@ -257,6 +258,35 @@ pub(super) fn encode_database_catalog(
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 
 	Ok(DatabaseCatalog {
+		database_uuid: root.database_uuid,
+		committed_at_ns: root.committed_at_ns,
+		changefeeds: root
+			.changefeeds()
+			.definitions
+			.values()
+			.map(|entry| ChangefeedCatalogEntry {
+				id: entry.id,
+				source: entry.source,
+				name: entry.name.clone(),
+				config: entry.config,
+				state: entry.state,
+				version: entry.version,
+				defined_at: entry.defined_at,
+				published_at: entry.published_at,
+				last_stamp: entry.last_stamp,
+				purged_through: entry.purged_through,
+				purged_time_ns: entry.purged_time_ns,
+				retained_page: entry.retained_page,
+				retained_groups: entry.retained_groups,
+				closed_at: entry.closed_at,
+				closed_time_ns: entry.closed_time_ns,
+				epochs: entry.epochs.clone(),
+				segments: root
+					.changefeed_segments()
+					.get(&entry.id)
+					.map_or_else(Vec::new, |segments| segments.as_ref().clone()),
+			})
+			.collect(),
 		next_graph_id: root.schema.next_graph_id,
 		next_schema_id: root.schema.next_schema_id,
 		time_zones: context.time_zone_names().cloned().collect(),
@@ -267,6 +297,53 @@ pub(super) fn encode_database_catalog(
 		functions,
 		analyzers,
 	})
+}
+
+/// Restores retained capture descriptors independently of surviving owners.
+pub(super) fn decode_changefeeds(catalog: &DatabaseCatalog) -> crate::datastore::ChangefeedCatalog {
+	crate::datastore::ChangefeedCatalog {
+		definitions: catalog
+			.changefeeds
+			.iter()
+			.map(|entry| {
+				(
+					entry.id,
+					Arc::new(crate::datastore::ChangefeedDefinition {
+						id: entry.id,
+						source: entry.source,
+						name: entry.name.clone(),
+						config: entry.config,
+						state: entry.state,
+						version: entry.version,
+						defined_at: entry.defined_at,
+						published_at: entry.published_at,
+						last_stamp: entry.last_stamp,
+						purged_through: entry.purged_through,
+						purged_time_ns: entry.purged_time_ns,
+						retained_page: entry.retained_page,
+						retained_groups: entry.retained_groups,
+						closed_at: entry.closed_at,
+						closed_time_ns: entry.closed_time_ns,
+						epochs: entry.epochs.clone(),
+					}),
+				)
+			})
+			.collect(),
+	}
+}
+
+/// Shares catalog bounds with logical snapshots without decoding commit images.
+pub(super) fn decode_changefeed_segments(
+	catalog: &DatabaseCatalog,
+) -> crate::storage::ChangefeedSegments {
+	Arc::new(
+		catalog
+			.changefeeds
+			.iter()
+			.filter(|entry| !entry.segments.is_empty())
+			.map(|entry| (entry.id, Arc::new(entry.segments.clone())))
+			.collect(),
+	)
 }
 
 fn encode_analyzer_filter(

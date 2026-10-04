@@ -5,6 +5,7 @@
 
 mod adapter;
 mod builtins;
+mod changefeed;
 mod collation;
 mod cursor;
 mod dml;

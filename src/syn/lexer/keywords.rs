@@ -25,6 +25,16 @@ pub(in crate::syn) const BY: &str = "BY";
 pub(in crate::syn) const CATCH: &str = "CATCH";
 pub(in crate::syn) const CASE: &str = "CASE";
 pub(in crate::syn) const CHANGEFEED: &str = "CHANGEFEED";
+/// Whole-commit history statement payload.
+pub(in crate::syn) const CHANGES: &str = "CHANGES";
+/// History-read statement introducer.
+pub(in crate::syn) const SHOW: &str = "SHOW";
+/// Inclusive time or exclusive stamp lower bound.
+pub(in crate::syn) const SINCE: &str = "SINCE";
+/// Complete before-image capture option.
+pub(in crate::syn) const ORIGINAL: &str = "ORIGINAL";
+/// Introduces the complete-original capture flag.
+pub(in crate::syn) const INCLUDE: &str = "INCLUDE";
 pub(in crate::syn) const CLASS: &str = "CLASS";
 pub(in crate::syn) const CASCADE: &str = "CASCADE";
 pub(in crate::syn) const COLUMNS: &str = "COLUMNS";
@@ -245,4 +255,4 @@ pub(in crate::syn) const WHEN: &str = "WHEN";
 pub(in crate::syn) const WHILE: &str = "WHILE";
 
 /// Statement starts recognized only to return the explicit unsupported status.
-pub(in crate::syn) const UNSUPPORTED_STATEMENTS: &[&str] = &["SHOW", "LIVE"];
+pub(in crate::syn) const UNSUPPORTED_STATEMENTS: &[&str] = &["LIVE"];

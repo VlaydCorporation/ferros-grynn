@@ -277,6 +277,9 @@ fn validate(catalog: &FileCatalog) -> FerrosGrynnResult<()> {
 			Some(DataFileKind::ImportQuarantine) => {
 				validate_quarantine_path(file.space_id, file.path.as_str())?;
 			}
+			Some(DataFileKind::Changefeed) => {
+				validate_changefeed_path(file.space_id, file.path.as_str())?;
+			}
 			_ => {}
 		}
 		if file.file_id.kind() == Some(DataFileKind::Freelist) {
@@ -339,6 +342,7 @@ fn validate_space_kind(space: DataSpaceId, kind: Option<DataFileKind>) -> Ferros
 				| DataFileKind::PropertyDictionary
 				| DataFileKind::JobCatalog
 				| DataFileKind::ImportQuarantine
+				| DataFileKind::Changefeed
 		),
 		(DataSpaceId::Graph(_), Some(kind)) => matches!(
 			kind,
@@ -360,6 +364,26 @@ fn validate_space_kind(space: DataSpaceId, kind: Option<DataFileKind>) -> Ferros
 	};
 	if !valid {
 		return Err(invalid("data-file kind does not belong to its data space"));
+	}
+	Ok(())
+}
+
+/// Checks a feed/source directory and an exact segment UUID filename.
+fn validate_changefeed_path(space: DataSpaceId, path: &str) -> FerrosGrynnResult<()> {
+	let (source, segment) = path
+		.strip_prefix("changefeed/")
+		.and_then(|path| path.strip_suffix(".fcf"))
+		.and_then(|path| path.split_once('/'))
+		.ok_or_else(|| invalid("changefeed segment path is not canonical"))?;
+	for id in [source, segment] {
+		let parsed = uuid::Uuid::parse_str(id)
+			.map_err(|_error| invalid("changefeed path does not contain a UUID"))?;
+		if parsed.is_nil() || parsed.to_string() != id {
+			return Err(invalid("changefeed path UUID is not canonical"));
+		}
+	}
+	if space != DataSpaceId::Database {
+		return Err(invalid("changefeed file must belong to the database data space"));
 	}
 	Ok(())
 }
@@ -670,6 +694,54 @@ mod tests {
 			role: DataFileRole::WalBackfilled,
 			path: CatalogPath::parse(path)?,
 		})
+	}
+
+	#[test]
+	fn changefeed_kind_is_database_wal_backfilled_with_canonical_segment_path()
+	-> FerrosGrynnResult<()> {
+		let path = "changefeed/00000000-0000-0000-0000-000000000001/\
+		            00000000-0000-0000-0000-000000000002.fcf";
+		let mut catalog = FileCatalog::bootstrap()?;
+		let entry = file(1, DataFileKind::Changefeed, DataSpaceId::Database, path, None)?;
+		assert_eq!(entry.file_id.get().to_le_bytes(), [0x17, 1, 0, 0, 0, 0, 0, 0]);
+		assert_eq!(DataFileKind::from_raw(0x17), Some(DataFileKind::Changefeed));
+		assert_eq!(DataFileKind::from_raw(0x18), None);
+		catalog.next_file_instance_id = 2;
+		catalog.files.push(entry);
+		catalog.files.sort_unstable_by_key(|entry| (entry.space_id, entry.file_id));
+		assert_eq!(FileCatalog::decode(&catalog.encode()?)?, catalog);
+		for role in
+			[DataFileRole::Superblock, DataFileRole::MetadataCow, DataFileRole::AuxiliaryImmutable]
+		{
+			let mut wrong = catalog.clone();
+			let entry = wrong
+				.files
+				.iter_mut()
+				.find(|entry| entry.file_id.kind() == Some(DataFileKind::Changefeed))
+				.ok_or_else(|| invalid("fixture changefeed file is absent"))?;
+			entry.role = role;
+			assert!(wrong.encode().is_err());
+		}
+		for path in [
+			"changefeed/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000002.\
+			 fcf",
+			"changefeed/00000000000000000000000000000001/00000000-0000-0000-0000-000000000002.fcf",
+			"changefeed/a/b.fcf",
+			"changefeed/00000000-0000-0000-0000-000000000001/nested/\
+			 00000000-0000-0000-0000-000000000002.fcf",
+		] {
+			assert!(validate_changefeed_path(DataSpaceId::Database, path).is_err());
+		}
+		assert!(
+			validate_changefeed_path(
+				DataSpaceId::Graph(
+					GraphId::new(1).ok_or_else(|| invalid("fixture graph identity is invalid"))?
+				),
+				path
+			)
+			.is_err()
+		);
+		Ok(())
 	}
 
 	#[test]

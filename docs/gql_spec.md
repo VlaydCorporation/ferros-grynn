@@ -2057,8 +2057,9 @@ primary/base storage остаётся фатальным и не маскиру�
 Требует предварительного определения changefeed через `DEFINE`.
 
 ```
-SHOW CHANGES FOR CLASS @class_name
+SHOW CHANGES FOR (CLASS @class_name | GRAPH @graph | CHANGEFEED @id)
 	SINCE @timestamp | @versionstamp
+	[ FULL ]
 	[ LIMIT @number ]
 ;
 ```
@@ -2105,7 +2106,7 @@ Foreground использует тот же builder в caller thread; `CONCURREN
 DEFINE CLASS [ OVERWRITE | IF NOT EXISTS ] @name
 	TYPE NODE | EDGE
 	[ SCHEMAFULL | SCHEMALESS ]
-	[ CHANGEFEED @duration [ INCLUDE ORIGINAL ] ]
+	[ CHANGEFEED @duration [ INCLUDE ORIGINAL ] [ FULL ] ]
     [ COMMENT @string ];
 ```
 
@@ -2654,6 +2655,7 @@ DEFINE GRAPH [IF NOT EXISTS | OVERWRITE] @name
     [ ROOT @root_atom | ROOTS @root_atoms_array ]
     [ VALIDATE ON_MUTATION | DEFERRED ]
     [ CONTENT @object ]
+    [ CHANGEFEED @duration [ INCLUDE ORIGINAL ] [ FULL ] ]
     [ COMMENT @string ]
 ;
 ```
@@ -2811,7 +2813,7 @@ ALTER CLASS [ IF EXISTS ] @name
       | COMPACT
       | SCHEMAFULL
       | SCHEMALESS
-      | CHANGEFEED @duration
+      | CHANGEFEED @duration [ INCLUDE ORIGINAL ] [ FULL ]
       | COMMENT @string
     ) [...]
 [ WITH MIGRATION ] [ CONCURRENTLY ]
@@ -2836,6 +2838,8 @@ ALTER GRAPH [IF EXISTS] @graph
   | DROP ROOTS
   | VALIDATE ON_MUTATION
   | VALIDATE DEFERRED
+  | CHANGEFEED @duration [ INCLUDE ORIGINAL ] [ FULL ]
+  | DROP CHANGEFEED
   | COMMENT @string
   | DROP COMMENT ) [...]
 ;
@@ -5421,7 +5425,7 @@ LIVE SELECT позволяет отслеживать создание, обно
 |-------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Порядок     | **Тотальный** по `versionstamp` в пределах подписки. `versionstamp` — глобальный монотонный счётчик, тот же, что у changefeed ([§21.3](#213-show-changes)) |
 | Доставка    | **At-least-once** с подтверждением. Событие удаляется из очереди подписки только после `ack` клиента                                                       |
-| Дубли       | Возможны при переподключении. Каждое событие несёт `versionstamp` — клиент делает дедупликацию по нему (идемпотентное применение)                          |
+| Дубли       | Возможны при переподключении. Commit несёт один versionstamp; entries имеют ordinal. Дедупликация — source/stamp/ordinal в выбранном mode                  |
 | Потери      | **Невозможны молча.** Любой разрыв последовательности явно помечается событием-разрывом (см. ниже)                                                         |
 | Атомарность | События одной транзакции доставляются подряд и помечены общим `tx_id`; частичная видимость транзакции исключена                                            |
 | Видимость   | Событие публикуется **после** коммита транзакции. Откатившиеся транзакции не порождают событий                                                             |
@@ -5436,8 +5440,9 @@ LET $sub = LIVE SELECT DIFF FROM person WHERE active = true SINCE $last_seen;
 
 История берётся из changefeed соответствующего class/graph source, поэтому `SINCE` работает лишь
 в пределах `CHANGEFEED @duration`, заданного его DDL. Если запрошенная позиция уже вычищена,
-возвращается `ChangefeedExpired` — клиенту следует перечитать состояние целиком и подписаться
-заново. Без changefeed у source `SINCE` недоступен, и подписка начинается с текущего момента.
+durable reader этапа 27 возвращает explicit GAP и доступный хвост. Live consumer этапа 28
+обязан явно обработать GAP; бесшумно продолжать после потери истории запрещено.
+Без changefeed у source `SINCE` недоступен, и подписка начинается с текущего момента.
 
 #### 21.1.3. Backpressure и переполнение
 
@@ -5488,8 +5493,9 @@ KILL $query_id;
 Требует `CHANGEFEED duration` в определении соответствующего CLASS или GRAPH.
 
 ```
-SHOW CHANGES FOR CLASS @classname
+SHOW CHANGES FOR (CLASS @classname | GRAPH @graph | CHANGEFEED @id)
     SINCE @timestamp | @versionstamp
+    [ FULL ]
     [ LIMIT @number ]
 ;
 ```
@@ -5497,8 +5503,37 @@ SHOW CHANGES FOR CLASS @classname
 С помощью каналов изменений можно получать и синхронизировать изменения из Ferros-Grynn с внешними системами и платформами с помощью инструкции SHOW.
 Инструкцию SHOW можно использовать для воспроизведения изменений, внесённых в class source.
 
-Возвращает объект с `versionstamp` и `changes`, внутри которого описывается список событий:
-`define_class`, `create`, `update`, ... с указанием имени / id.
+Нормативный контракт этапа 27: `gql_changefeed_stage_27_plan.md`, CF-01–CF-17.
+Возвращает whole commit batches с `versionstamp`, UTC `committed_at`, `changes` и resumable
+cursor либо explicit GAP с причиной, известными bounds и доступным хвостом. LIMIT считает
+batches/GAP items, не entries; commit не разрезается. Versionstamp — existing commit_ts,
+один на commit; ordinal различает entries. Дедупликация: source/stamp/ordinal в одном mode.
+
+Обычный SHOW всегда coalesce-ит net change по identity за commit и исключает equality.
+FULL source сохраняет successful logical operations, включая targeted no-op; SHOW FULL
+выдаёт их по порядку. Нет FULL coverage — typed error до row pull, без синтеза history.
+Финальная validated-конфигурация применяется ко всем DML commit, даже до её включения.
+DROP подавляет DML commit с explicit GAP/control transition прежнего source.
+
+SINCE stamp exclusive; SINCE timestamp inclusive. Cursor фиксирует database UUID, source,
+mode и целый commit. Images owned/self-contained: named properties, overlay state и
+qualified topology; current primary records при декодировании не читаются. Default payload
+хранит after и обратимый before-diff; INCLUDE ORIGINAL хранит полный before.
+
+DROP/REMOVE оставляют историю/tombstone до TTL. Active name wins; историческое имя требует
+однозначности; CHANGEFEED id выбирает прежний source. После полного retirement старый cursor
+получает terminal FeedExpiredOrRetired GAP без resumable tail. Sparse global stamps сами
+по себе не GAP. Import config frozen; ON history переживает segment seals и END публикует
+один commit, OFF маркирует suppressed events. LIVE/ACK относятся к следующему этапу.
+
+EXPLAIN показывает logical `ChangefeedHistoryRead`/`ChangefeedInfo`, source binding,
+NET/FULL, committed snapshot bounds, resume и whole-commit limit. Dynamic operands
+не исполняются ради planning. PlanHash учитывает owned operand spelling, runtime
+slots, private function versions/bodies и committed database/snapshot; formatting
+может изменить hash. EXPLAIN ANALYZE показывает whole batches/entries/GAP, inspected
+groups, logical page requests/bytes, work, segment visits и admitted scratch peak.
+Эти counters не являются disk misses, RSS или delivery acknowledgements; payloads,
+тексты функций, file paths и WAL identities в telemetry не выводятся.
 
 ### 21.4. События (DEFINE EVENT)
 

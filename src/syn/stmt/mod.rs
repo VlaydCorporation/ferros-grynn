@@ -1,3 +1,4 @@
+mod changefeed;
 mod control;
 mod dml;
 mod explain;
@@ -14,6 +15,7 @@ mod select;
 mod transaction;
 mod traverse;
 
+pub use changefeed::{ChangefeedClause, ShowChangesStatement, ShowChangesTarget};
 pub use control::{
 	AssertInvariantsStatement,
 	Block,
@@ -187,6 +189,8 @@ pub enum StatementKind {
 	Remove(RemoveStatement),
 	Alter(AlterStatement),
 	Info(InfoStatement),
+	/// Durable whole-commit history read.
+	ShowChanges(ShowChangesStatement),
 	Maintenance(MaintenanceStatement),
 	Kill(KillStatement),
 	Import(ImportStatement),

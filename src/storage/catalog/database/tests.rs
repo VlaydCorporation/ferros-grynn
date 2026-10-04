@@ -42,6 +42,168 @@ fn fgdc_v10_round_trips_recursive_types_bindings_and_graph_properties() -> Ferro
 }
 
 #[test]
+fn fgdc_changefeed_origin_bounds_and_reserved_bytes_are_checked() -> FerrosGrynnResult<()> {
+	use crate::changefeed::{ChangefeedConfig, ChangefeedId, ChangefeedSource, ChangefeedState};
+	let mut catalog = fixture()?;
+	catalog.changefeeds.push(ChangefeedCatalogEntry {
+		id: ChangefeedId::from_uuid(uuid::Uuid::from_u128(42).into())?,
+		source: ChangefeedSource::Class(catalog.classes[0].id),
+		name: "person".into(),
+		config: ChangefeedConfig::from_nanoseconds(1_234)?
+			.with_full(true)
+			.with_include_original(true),
+		state: ChangefeedState::Active,
+		version: SchemaVersion::INITIAL,
+		defined_at: 1,
+		published_at: 2,
+		last_stamp: u64::MAX,
+		purged_through: 9,
+		purged_time_ns: 0,
+		retained_page: 0,
+		retained_groups: 0,
+		closed_at: None,
+		closed_time_ns: None,
+		segments: Vec::new(),
+		epochs: vec![crate::changefeed::ChangefeedCaptureEpoch {
+			started_at: 2.into(),
+			configuration: Some(
+				ChangefeedConfig::from_nanoseconds(1_234)?
+					.with_full(true)
+					.with_include_original(true),
+			),
+		}],
+	});
+	let bytes = catalog.encode()?;
+	assert_eq!(&bytes[88..104], catalog.database_uuid.as_bytes());
+	assert_eq!(&bytes[104..120], &catalog.committed_at_ns.to_le_bytes());
+	assert_eq!(&bytes[120..124], &1_u32.to_le_bytes());
+	assert_eq!(&bytes[124..128], &[0; 4]);
+	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	let descriptor = bytes.len() - 152 - 32 - "person".len();
+	assert_eq!(&bytes[descriptor..descriptor + 16], uuid::Uuid::from_u128(42).as_bytes());
+	assert_eq!(&bytes[descriptor + 16..descriptor + 20], &[0, 0, 3, 0]);
+	for offset in
+		[124, descriptor + 16, descriptor + 17, descriptor + 18, descriptor + 19, descriptor + 32]
+	{
+		let mut malformed = bytes.clone();
+		malformed[offset] = u8::MAX;
+		assert!(DatabaseCatalog::decode(&malformed).is_err(), "offset {offset}");
+	}
+	for end in descriptor..bytes.len() {
+		assert!(DatabaseCatalog::decode(&bytes[..end]).is_err());
+	}
+	let mut huge_count = bytes.clone();
+	huge_count[120..124].copy_from_slice(&u32::MAX.to_le_bytes());
+	assert!(DatabaseCatalog::decode(&huge_count).is_err());
+	let mut nil_origin = bytes.clone();
+	nil_origin[88..104].fill(0);
+	assert!(DatabaseCatalog::decode(&nil_origin).is_err());
+	catalog.changefeeds[0].state = ChangefeedState::Retired;
+	catalog.changefeeds[0].closed_at = Some(2);
+	catalog.changefeeds[0].closed_time_ns = Some(catalog.committed_at_ns);
+	catalog.changefeeds[0].epochs[0].configuration = None;
+	catalog.classes.clear();
+	assert_eq!(DatabaseCatalog::decode(&catalog.encode()?)?, catalog);
+	for source in [
+		ChangefeedSource::Class(ClassId::from_storage(catalog.next_schema_id as u32)?),
+		ChangefeedSource::Graph(
+			GraphId::new(catalog.next_graph_id)
+				.ok_or_else(|| codec::invalid("fixture graph clock is zero"))?,
+		),
+	] {
+		let mut future = catalog.clone();
+		future.changefeeds[0].source = source;
+		assert!(future.encode().is_err());
+	}
+	catalog.changefeeds[0].name = "invalid\0name".into();
+	assert!(catalog.encode().is_err());
+	Ok(())
+}
+
+/// Trusted segment bounds remain decodable independently of file contents.
+#[test]
+fn fgdc_changefeed_segment_descriptors_check_ids_bounds_lengths_and_reserved()
+-> FerrosGrynnResult<()> {
+	use crate::{
+		changefeed::{ChangefeedConfig, ChangefeedId, ChangefeedSource, ChangefeedState},
+		storage::{ChangefeedSegment, changefeed::SegmentHeader},
+	};
+	let mut catalog = fixture()?;
+	let id = ChangefeedId::from_uuid(uuid::Uuid::from_u128(42).into())?;
+	let config = ChangefeedConfig::from_nanoseconds(1_234)?;
+	let segment = ChangefeedSegment {
+		file: DataFileId::new(99, DataFileKind::Changefeed)
+			.ok_or_else(|| codec::invalid("fixture file identity invalid"))?,
+		header: SegmentHeader {
+			database: catalog.database_uuid,
+			feed: id,
+			segment: uuid::Uuid::from_u128(51),
+			pages: 2,
+			commits: 1,
+			first_stamp: 10,
+			last_stamp: 10,
+			first_time: 0,
+			last_time: 0,
+		},
+	};
+	catalog.changefeeds.push(ChangefeedCatalogEntry {
+		id,
+		source: ChangefeedSource::Class(catalog.classes[0].id),
+		name: "person".into(),
+		config,
+		state: ChangefeedState::Active,
+		version: SchemaVersion::INITIAL,
+		defined_at: 1,
+		published_at: 1,
+		last_stamp: 10,
+		purged_through: 0,
+		purged_time_ns: 0,
+		retained_page: 0,
+		retained_groups: 0,
+		closed_at: None,
+		closed_time_ns: None,
+		epochs: vec![crate::changefeed::ChangefeedCaptureEpoch {
+			started_at: 1.into(),
+			configuration: Some(config),
+		}],
+		segments: vec![segment],
+	});
+	let bytes = catalog.encode()?;
+	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
+	let start = bytes.len() - 128;
+	assert_eq!(&bytes[start..start + 8], &segment.file.get().to_le_bytes());
+	assert_eq!(&bytes[start + 56..start + 64], &2_u64.to_le_bytes());
+	assert_eq!(&bytes[start + 120..], &[0; 8]);
+	for offset in [start + 120, start + 127] {
+		let mut malformed = bytes.clone();
+		malformed[offset] = u8::MAX;
+		assert!(DatabaseCatalog::decode(&malformed).is_err(), "offset {offset}");
+	}
+	for (offset, value) in [(start + 56, 1_u64), (start + 64, 0_u64), (start + 64, 2_u64)] {
+		let mut malformed = bytes.clone();
+		malformed[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+		assert!(DatabaseCatalog::decode(&malformed).is_err(), "offset {offset}, value {value}");
+	}
+	let mut count = bytes.clone();
+	count[start - 4..start].copy_from_slice(&u32::MAX.to_le_bytes());
+	assert!(DatabaseCatalog::decode(&count).is_err());
+	for end in start..bytes.len() {
+		assert!(DatabaseCatalog::decode(&bytes[..end]).is_err());
+	}
+	let mut bad = catalog.clone();
+	bad.changefeeds[0].segments[0].header.feed =
+		ChangefeedId::from_uuid(uuid::Uuid::from_u128(43).into())?;
+	assert!(bad.encode().is_err());
+	let mut bad = catalog.clone();
+	bad.changefeeds[0].segments[0].header.last_stamp = 11;
+	assert!(bad.encode().is_err());
+	let mut bad = catalog.clone();
+	bad.changefeeds[0].segments.push(segment);
+	assert!(bad.encode().is_err());
+	Ok(())
+}
+
+#[test]
 fn fgdc_v10_round_trips_fulltext_hnsw_and_disk_ann_payloads() -> FerrosGrynnResult<()> {
 	let mut catalog = fixture()?;
 	let class = &mut catalog.classes[0];
@@ -264,6 +426,9 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 		})
 	};
 	Ok(DatabaseCatalog {
+		database_uuid: uuid::Uuid::from_u128(1),
+		committed_at_ns: 123_456_789,
+		changefeeds: Vec::new(),
 		next_graph_id: 8,
 		next_schema_id: 9,
 		time_zones: vec!["Europe/London".into()],

@@ -39,6 +39,8 @@ pub struct DefineGraphStatement {
 	pub contract: GraphContract,
 	pub root: Option<Expr>,
 	pub content: Option<Expr>,
+	/// Optional durable capture policy.
+	pub changefeed: Option<ChangefeedClause>,
 }
 
 /// Core `DEFINE CLASS` syntax.
@@ -49,6 +51,8 @@ pub struct DefineClassStatement {
 	pub name: Identifier,
 	pub kind: ClassKindName,
 	pub schema_mode: ClassSchemaModeName,
+	/// Optional durable capture policy.
+	pub changefeed: Option<ChangefeedClause>,
 }
 
 /// Core `DEFINE FIELD` syntax.
@@ -360,6 +364,17 @@ pub struct RemoveStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AlterTarget {
+	/// Configures or stops capture for one existing class or graph.
+	Changefeed {
+		/// Whether the owner is GRAPH rather than CLASS.
+		graph: bool,
+		/// Suppresses missing-owner errors.
+		if_exists: bool,
+		/// Catalog owner name.
+		name: Identifier,
+		/// None represents DROP CHANGEFEED.
+		configuration: Option<ChangefeedClause>,
+	},
 	Analyzer {
 		if_exists: bool,
 		name: Identifier,
@@ -411,6 +426,8 @@ pub struct AlterStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InfoTarget {
+	/// Runtime parameter containing the retained feed UUID.
+	Changefeed(Identifier),
 	/// Reads a graph-owned user or engine index definition.
 	GraphIndex {
 		name: Identifier,
@@ -437,6 +454,40 @@ pub struct InfoStatement {
 }
 
 impl Parser<'_> {
+	/// Dispatches the DEFINE family before parsing each definition's own
+	/// clauses.
+	pub(in crate::syn) async fn definition_statement(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<StatementKind> {
+		Ok(if self.at_function_definition() {
+			StatementKind::DefineFunction(
+				context.run(|context| self.define_function_statement(context)).await?,
+			)
+		} else if self.consume_keyword(keywords::ANALYZER).is_some() {
+			StatementKind::DefineAnalyzer(
+				context.run(|context| self.define_analyzer_statement(context)).await?,
+			)
+		} else if self.consume_keyword(keywords::PARAM).is_some() {
+			StatementKind::DefineParameter(
+				context.run(|context| self.define_parameter_statement(context)).await?,
+			)
+		} else if self.consume_keyword(keywords::GRAPH).is_some() {
+			StatementKind::DefineGraph(
+				context.run(|context| self.define_graph_statement(context)).await?,
+			)
+		} else if self.consume_keyword(keywords::CLASS).is_some() {
+			StatementKind::DefineClass(self.define_class_statement()?)
+		} else if self.consume_keyword(keywords::FIELD).is_some() {
+			StatementKind::DefineField(self.define_field_statement()?)
+		} else if self.consume_keyword(keywords::INDEX).is_some() {
+			self.define_index_statement()?
+		} else {
+			let feature = self.current_word().unwrap_or("DEFINE target");
+			return Err(self.unsupported(feature, self.current().span));
+		})
+	}
+
 	pub(in crate::syn) async fn define_function_statement(
 		&mut self,
 		context: &mut Stk,
@@ -708,6 +759,7 @@ impl Parser<'_> {
 		};
 		let mut root = None;
 		let mut content = None;
+		let mut changefeed = None;
 		loop {
 			if self.consume_keyword(keywords::ROOT).is_some() {
 				if root.is_some() {
@@ -723,6 +775,13 @@ impl Parser<'_> {
 					));
 				}
 				content = Some(context.run(|context| self.expression(context, 0, 1, 0)).await?);
+			} else if self.consume_keyword(keywords::CHANGEFEED).is_some() {
+				if changefeed.is_some() {
+					return Err(
+						self.syntax("CHANGEFEED may appear only once.", self.previous_span())
+					);
+				}
+				changefeed = Some(self.changefeed_clause()?);
 			} else {
 				break;
 			}
@@ -741,6 +800,7 @@ impl Parser<'_> {
 			contract,
 			root,
 			content,
+			changefeed,
 		})
 	}
 
@@ -761,16 +821,23 @@ impl Parser<'_> {
 			return Err(self.syntax("Expected `NODE` or `EDGE` after `TYPE`.", self.current().span));
 		};
 		let mut schema_mode = ClassSchemaModeName::Schemaless;
+		let mut changefeed = None;
 		while !self.at_statement_end() {
 			if self.consume_keyword(keywords::SCHEMALESS).is_some() {
 				schema_mode = ClassSchemaModeName::Schemaless;
 			} else if self.consume_keyword(keywords::SCHEMAFULL).is_some() {
 				schema_mode = ClassSchemaModeName::Schemafull;
-			} else if let Some(feature) =
-				[keywords::DROP, keywords::AS, keywords::CHANGEFEED, keywords::COMMENT]
-					.iter()
-					.copied()
-					.find(|keyword| self.at_keyword(keyword))
+			} else if self.consume_keyword(keywords::CHANGEFEED).is_some() {
+				if changefeed.is_some() {
+					return Err(
+						self.syntax("CHANGEFEED may appear only once.", self.previous_span())
+					);
+				}
+				changefeed = Some(self.changefeed_clause()?);
+			} else if let Some(feature) = [keywords::DROP, keywords::AS, keywords::COMMENT]
+				.iter()
+				.copied()
+				.find(|keyword| self.at_keyword(keyword))
 			{
 				return Err(self.unsupported(feature, self.current().span));
 			} else {
@@ -782,6 +849,7 @@ impl Parser<'_> {
 			name,
 			kind,
 			schema_mode,
+			changefeed,
 		})
 	}
 
@@ -1560,6 +1628,13 @@ impl Parser<'_> {
 		} else if self.consume_keyword(keywords::CLASS).is_some() {
 			let if_exists = self.if_exists()?;
 			let name = self.identifier()?;
+			if self.at_keyword(keywords::CHANGEFEED) || self.at_keyword(keywords::DROP) {
+				let target = self.alter_changefeed(false, if_exists, name)?;
+				self.expect_statement_end("ALTER CLASS")?;
+				return Ok(AlterStatement {
+					target,
+				});
+			}
 			let schema_mode = if self.consume_keyword(keywords::SCHEMAFULL).is_some() {
 				ClassSchemaModeName::Schemafull
 			} else if self.consume_keyword(keywords::SCHEMALESS).is_some() {
@@ -1601,8 +1676,10 @@ impl Parser<'_> {
 				name,
 				class,
 			}
-		} else if self.at_keyword(keywords::GRAPH) {
-			return Err(self.unsupported("ALTER GRAPH", self.current().span));
+		} else if self.consume_keyword(keywords::GRAPH).is_some() {
+			let if_exists = self.if_exists()?;
+			let name = self.identifier()?;
+			self.alter_changefeed(true, if_exists, name)?
 		} else {
 			let feature = self.current_word().unwrap_or("ALTER target");
 			return Err(self.unsupported(feature, self.current().span));
@@ -1617,6 +1694,8 @@ impl Parser<'_> {
 		self.expect_keyword(keywords::FOR, "Expected `FOR` after `INFO`.")?;
 		let target = if self.consume_keyword(keywords::DB).is_some() {
 			InfoTarget::Database
+		} else if self.consume_keyword(keywords::CHANGEFEED).is_some() {
+			InfoTarget::Changefeed(self.parameter()?)
 		} else if self.consume_keyword(keywords::ANALYZER).is_some() {
 			InfoTarget::Analyzer(self.identifier()?)
 		} else if self.consume_keyword(keywords::FUNCTION).is_some() {

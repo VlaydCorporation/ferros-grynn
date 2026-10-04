@@ -27,6 +27,7 @@ const MAX_FIXED_TIME_ZONE_OFFSET: i32 = 86_400;
 const MAX_IANA_TIME_ZONE_ID: u32 = FIRST_FIXED_TIME_ZONE_ID - 1;
 
 pub use context::{DecodeContext, EncodeContext};
+pub(crate) use dto::tree_allocation_bytes;
 pub use dto::{
 	StorageAtomRef,
 	StorageBound,

@@ -10,6 +10,7 @@ use super::{ExecutionControl, QueryResult, QueryStatementKind};
 use crate::{
 	datastore::{
 		Datastore,
+		ImportChangefeedMode,
 		ImportConstraintMode,
 		ImportIndexMode,
 		ImportOptions,
@@ -226,12 +227,13 @@ fn import_options(
 			}
 			ImportOptionName::Changefeed => {
 				let value = option_word(option, source)?;
-				if value.eq_ignore_ascii_case("ON") {
-					return Err(unsupported(source, option.span, "IMPORT CHANGEFEED=ON"));
-				}
-				if !value.eq_ignore_ascii_case("OFF") {
+				result.changefeed = if value.eq_ignore_ascii_case("ON") {
+					ImportChangefeedMode::On
+				} else if value.eq_ignore_ascii_case("OFF") {
+					ImportChangefeedMode::Off
+				} else {
 					return Err(invalid_option_value(source, option));
-				}
+				};
 			}
 			ImportOptionName::FillFactor => {
 				return Err(unsupported(source, option.span, "IMPORT FILL_FACTOR"));

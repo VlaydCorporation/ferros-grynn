@@ -1,6 +1,9 @@
 //! Local durability owner for the normalized AtomStore and graph spaces.
 
 mod catalog;
+mod changefeed;
+/// Pinned whole-commit reading and metadata-only coverage preflight.
+mod changefeed_reader;
 mod checkpoint;
 mod cleanup;
 mod files;
@@ -23,6 +26,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
+pub(crate) use changefeed_reader::LocalChangefeedSnapshot;
 use parking_lot::Mutex;
 pub(crate) use physical_index::{
 	PhysicalIndexAtom,
@@ -42,14 +46,17 @@ use self::{
 	checkpoint::checkpoint,
 	cleanup::{
 		RetiredGeneration,
+		cleanup_orphan_changefeeds,
 		cleanup_orphan_generations,
 		cleanup_orphan_quarantines,
 		cleanup_query_runs,
 	},
 	files::{
+		create_file_images,
 		create_generation_files,
 		create_import_generation_files,
 		stage_database_catalog,
+		stage_file_images,
 		stage_generation,
 		stage_import_catalog,
 	},
@@ -137,6 +144,10 @@ struct LocalState {
 	database_superblock: DatabaseSuperblock,
 	file_catalog: FileCatalog,
 	_database_catalog: DatabaseCatalog,
+	/// Shared segment descriptors retained by logical snapshots.
+	changefeed_segments: crate::storage::ChangefeedSegments,
+	/// Physical pins shared by exact query snapshots and feed readers.
+	changefeed_files: changefeed::ChangefeedFiles,
 	bindings: GenerationBindings,
 	registry: FileRegistry,
 	atom_superblock: AtomStoreSuperblock,
@@ -145,6 +156,18 @@ struct LocalState {
 	physical_statistics: Option<std::sync::Arc<PhysicalStatisticsFiles>>,
 	job_catalog: JobCatalog,
 	retired_generations: Vec<RetiredGeneration>,
+	/// Retired individual feed files, unlinked only after all map pins
+	/// disappear.
+	retired_changefeeds: Vec<cleanup::RetiredChangefeedFile>,
+	/// Old binding maps protected across multiple catalog replacements.
+	old_changefeed_pins: Vec<
+		std::sync::Weak<
+			BTreeMap<
+				super::types::DataFileId,
+				std::sync::Arc<super::file_registry::RegisteredDataFile>,
+			>,
+		>,
+	>,
 	generation_cleanup_failures: u64,
 	last_checkpoint: Instant,
 }
@@ -283,6 +306,8 @@ impl LocalStore {
 			database_superblock: superblock,
 			file_catalog: generation.file_catalog,
 			_database_catalog: generation.database_catalog,
+			changefeed_segments: std::sync::Arc::clone(database.changefeed_segments()),
+			changefeed_files: std::sync::Arc::default(),
 			bindings: generation.bindings,
 			registry,
 			atom_superblock: generation.atom_superblock,
@@ -291,6 +316,8 @@ impl LocalStore {
 			physical_statistics: None,
 			job_catalog,
 			retired_generations: Vec::new(),
+			retired_changefeeds: Vec::new(),
+			old_changefeed_pins: Vec::new(),
 			generation_cleanup_failures: 0,
 			last_checkpoint: Instant::now(),
 		};
@@ -343,12 +370,16 @@ impl LocalStore {
 		} = opened;
 		cleanup_orphan_generations(root, &file_catalog)?;
 		cleanup_orphan_quarantines(root, &file_catalog)?;
+		cleanup_orphan_changefeeds(root, &file_catalog)?;
 		let physical_indexes = bind_physical_indexes(&database_catalog, &registry, None)?;
+		let changefeed_files = changefeed::bind_files(&file_catalog, &database_catalog, &registry)?;
 		let state = LocalState {
 			database_superblock_path: root.join(DATABASE_SUPERBLOCK_FILE),
 			database_superblock,
 			file_catalog,
 			_database_catalog: database_catalog,
+			changefeed_segments: std::sync::Arc::clone(database.changefeed_segments()),
+			changefeed_files,
 			bindings,
 			registry,
 			atom_superblock,
@@ -357,6 +388,8 @@ impl LocalStore {
 			physical_statistics: Some(physical_statistics),
 			job_catalog,
 			retired_generations: Vec::new(),
+			retired_changefeeds: Vec::new(),
+			old_changefeed_pins: Vec::new(),
 			generation_cleanup_failures: 0,
 			last_checkpoint: Instant::now(),
 		};
@@ -498,6 +531,7 @@ impl LocalStore {
 		dictionary_changed: bool,
 	) -> FerrosGrynnResult<()> {
 		let mut state = self.state.lock();
+		self.wal.ensure_writable()?;
 		self.checkpoint_if_due(&mut state)?;
 		let expected = self
 			.wal
@@ -520,7 +554,7 @@ impl LocalStore {
 				"graph property value contains dictionary keys absent from the MVCC root",
 			));
 		}
-		let catalog = self::catalog::encode_database_catalog(
+		let mut catalog = self::catalog::encode_database_catalog(
 			database,
 			state._database_catalog.atom_store,
 			&state.bindings.graphs,
@@ -552,6 +586,27 @@ impl LocalStore {
 			dictionary_image = Some(image);
 		}
 
+		let capture = catalog
+			.changefeeds
+			.iter()
+			.any(|entry| database.change_history().contains_key(&(entry.id, database.commit_ts)));
+		let refresh_files = capture || database.changefeed_segments() != &state.changefeed_segments;
+		let mut feed_files = Vec::new();
+		let mut file_catalog = None;
+		let mut segments = None;
+		if refresh_files {
+			let mut files = state.file_catalog.clone();
+			changefeed::prepare(
+				database,
+				&state.file_catalog,
+				&mut files,
+				&mut catalog,
+				&mut feed_files,
+			)?;
+			image::append_catalog_pages(&mut feed_files, &files, &catalog)?;
+			segments = Some(catalog::decode_changefeed_segments(&catalog));
+			file_catalog = Some(files);
+		}
 		let mut tx = self.wal.begin_tx()?;
 		if let Some(image) = &dictionary_image {
 			stage_pages(
@@ -569,14 +624,57 @@ impl LocalStore {
 				&next_atom_superblock.encode()?,
 			)?;
 		}
-		stage_database_catalog(&mut tx, &catalog)?;
+		if refresh_files {
+			stage_file_images(&mut tx, &feed_files, false)?;
+		} else {
+			stage_database_catalog(&mut tx, &catalog)?;
+		}
+		let mut pending_feeds = cleanup::PendingChangefeedFiles::new(&self.root, &feed_files)?;
+		let registry = if let Some(files) = &file_catalog {
+			create_file_images(&self.root, &feed_files, false, false)?;
+			Some(FileRegistry::open(
+				files.registrations(&self.root),
+				self.io.file_open_mode(),
+				&changefeed::degradable(files),
+			)?)
+		} else {
+			None
+		};
+		let feed_pins = match (&file_catalog, &registry) {
+			(Some(files), Some(registry)) => {
+				Some(changefeed::bind_files(files, &catalog, registry)?)
+			}
+			_ => None,
+		};
+		let retired_feeds = if let Some(files) = &file_catalog {
+			cleanup::RetiredChangefeedFile::between(&self.root, &state.file_catalog, files)?
+		} else {
+			Vec::new()
+		};
+		prepare_feed_retirement(&mut state, retired_feeds.len(), feed_pins.is_some())?;
+		pending_feeds.preserve_for_recovery();
 		let outcome = self.wal.commit_tx(tx)?;
 		if outcome.commit_ts().get() != database.commit_ts {
 			return Err(invalid("WAL published an unexpected logical commit timestamp"));
 		}
 		state._database_catalog = catalog;
+		if let Some(files) = file_catalog {
+			state.file_catalog = files;
+		}
+		if let Some(segments) = segments {
+			state.changefeed_segments = segments;
+		}
+		if let Some(registry) = registry {
+			state.registry = registry;
+		}
+		if let Some(pins) = feed_pins {
+			remember_feed_pins(&mut state);
+			state.changefeed_files = pins;
+		}
+		state.retired_changefeeds.extend(retired_feeds);
 		state.atom_superblock = next_atom_superblock;
 		state.physical_statistics = None;
+		sweep_retired_generations(&mut state);
 		Ok(())
 	}
 
@@ -628,6 +726,7 @@ impl LocalStore {
 			&Vector,
 		) -> FerrosGrynnResult<f64>,
 	) -> FerrosGrynnResult<BTreeMap<IndexId, Duration>> {
+		self.wal.ensure_writable()?;
 		let mut reuse = match (previous, changed_records, import) {
 			(Some(previous), Some(changed), false) => {
 				self.prepare_index_reuse(previous, database, changed, analyze_function)?
@@ -635,7 +734,13 @@ impl LocalStore {
 			_ => IndexReusePlan::default(),
 		};
 		let mut state = self.state.lock();
-		if !import { reuse.retain_graph_artifacts(database, &state._database_catalog, &state.file_catalog)?; }
+		if !import {
+			reuse.retain_graph_artifacts(
+				database,
+				&state._database_catalog,
+				&state.file_catalog,
+			)?;
+		}
 		self.checkpoint_if_due(&mut state)?;
 		let expected = self
 			.wal
@@ -672,8 +777,27 @@ impl LocalStore {
 			quarantine.as_ref().map(|artifact| artifact.id()),
 			removed_quarantine,
 		)?;
+		changefeed::prepare(
+			database,
+			&state.file_catalog,
+			&mut generation.file_catalog,
+			&mut generation.database_catalog,
+			&mut generation.files,
+		)?;
+		if !generation.database_catalog.changefeeds.is_empty() {
+			generation.refresh_catalogs()?;
+		}
+		let segments = catalog::decode_changefeed_segments(&generation.database_catalog);
 		#[cfg(test)]
 		inject_generation_failure(GenerationFailurePoint::AfterBuild)?;
+		let mut pending_feeds =
+			cleanup::PendingChangefeedFiles::new(&self.root, &generation.files)?;
+		let mut tx = self.wal.begin_tx()?;
+		if import {
+			stage_import_catalog(&mut tx, &generation)?;
+		} else {
+			stage_generation(&mut tx, &generation)?;
+		}
 		if import {
 			create_import_generation_files(&self.root, &generation)?;
 		} else {
@@ -687,7 +811,12 @@ impl LocalStore {
 		let registry = FileRegistry::open(
 			generation.file_catalog.registrations(&self.root),
 			self.io.file_open_mode(),
-			&rapidhash::RapidHashSet::default(),
+			&changefeed::degradable(&generation.file_catalog),
+		)?;
+		let feed_pins = changefeed::bind_files(
+			&generation.file_catalog,
+			&generation.database_catalog,
+			&registry,
 		)?;
 		let physical_indexes = bind_physical_indexes(
 			&generation.database_catalog,
@@ -700,16 +829,23 @@ impl LocalStore {
 			&generation.file_catalog,
 			&state.registry,
 		)?;
-		let mut tx = self.wal.begin_tx()?;
-		if import {
-			stage_import_catalog(&mut tx, &generation)?;
-		} else {
-			stage_generation(&mut tx, &generation)?;
-		}
+		let retired_feeds = cleanup::RetiredChangefeedFile::between(
+			&self.root,
+			&state.file_catalog,
+			&generation.file_catalog,
+		)?;
+		prepare_feed_retirement(&mut state, retired_feeds.len(), true)?;
 		#[cfg(test)]
 		{
 			inject_generation_failure(GenerationFailurePoint::AfterCatalogStage)?;
 			inject_generation_failure(GenerationFailurePoint::BeforeWalCommit)?;
+		}
+		if let Some(generation) = &mut unpublished {
+			generation.preserve_for_recovery();
+		}
+		pending_feeds.preserve_for_recovery();
+		if let Some(artifact) = quarantine.as_deref_mut() {
+			artifact.preserve_for_recovery();
 		}
 		let outcome = self.wal.commit_tx(tx)?;
 		if let Some(generation) = &mut unpublished {
@@ -723,6 +859,10 @@ impl LocalStore {
 		}
 		state.file_catalog = generation.file_catalog;
 		state._database_catalog = generation.database_catalog;
+		state.changefeed_segments = segments;
+		remember_feed_pins(&mut state);
+		state.changefeed_files = feed_pins;
+		state.retired_changefeeds.extend(retired_feeds);
 		state.bindings = generation.bindings;
 		state.registry = registry;
 		state.atom_superblock = generation.atom_superblock;
@@ -758,6 +898,61 @@ impl LocalStore {
 		}
 		Ok(())
 	}
+
+	/// Retries only unreferenced file cleanup from the existing idle worker.
+	pub(crate) fn sweep_retired_changefeeds(&self) {
+		sweep_retired_generations(&mut self.state.lock());
+	}
+}
+
+/// Reserves retirement queues before committing; no fallible allocation
+/// follows.
+fn prepare_feed_retirement(
+	state: &mut LocalState,
+	additional: usize,
+	replacing: bool,
+) -> FerrosGrynnResult<()> {
+	state.old_changefeed_pins.retain(|pin| pin.strong_count() != 0);
+	let pins = usize::from(replacing && std::sync::Arc::strong_count(&state.changefeed_files) > 1);
+	let files = state
+		.retired_changefeeds
+		.len()
+		.checked_add(additional)
+		.ok_or_else(|| invalid("feed retirement backlog overflows"))?;
+	let maps = state
+		.old_changefeed_pins
+		.len()
+		.checked_add(pins)
+		.ok_or_else(|| invalid("feed pin backlog overflows"))?;
+	let bytes = files
+		.checked_mul(2048)
+		.and_then(|bytes| bytes.checked_add(maps.checked_mul(32)?))
+		.ok_or_else(|| invalid("feed retirement backlog bytes overflow"))?;
+	let maximum = crate::storage::external_sort_run_budget().min(256 * 1024 * 1024);
+	if bytes > maximum {
+		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+			"feed retirement backlog",
+			bytes as u64,
+			maximum as u64,
+		));
+	}
+	state
+		.retired_changefeeds
+		.try_reserve_exact(additional)
+		.map_err(|_error| invalid("feed retirement queue allocation failed"))?;
+	state
+		.old_changefeed_pins
+		.try_reserve_exact(pins)
+		.map_err(|_error| invalid("feed pin queue allocation failed"))?;
+	Ok(())
+}
+
+/// Preserves maps from every replacement, including readers older than one
+/// generation.
+fn remember_feed_pins(state: &mut LocalState) {
+	if std::sync::Arc::strong_count(&state.changefeed_files) > 1 {
+		state.old_changefeed_pins.push(std::sync::Arc::downgrade(&state.changefeed_files));
+	}
 }
 
 /// Retries post-publication generation cleanup without changing commit
@@ -765,6 +960,25 @@ impl LocalStore {
 /// point.
 fn sweep_retired_generations(state: &mut LocalState) {
 	let mut failures = 0_u64;
+	let mut attempts = 0_u32;
+	state.old_changefeed_pins.retain(|pin| pin.strong_count() != 0);
+	state.retired_changefeeds.retain(|file| {
+		if attempts >= 1024 {
+			return true;
+		}
+		attempts += 1;
+		match file.sweep(&state.old_changefeed_pins) {
+			Ok(removed) => !removed,
+			Err(_error) => {
+				failures = failures.saturating_add(1);
+				true
+			}
+		}
+	});
+	if attempts == 1024 && !state.retired_changefeeds.is_empty() {
+		let rotate = 1024 % state.retired_changefeeds.len();
+		state.retired_changefeeds.rotate_left(rotate);
+	}
 	state.retired_generations.retain_mut(|generation| {
 		failures = failures.saturating_add(generation.sweep());
 		!generation.is_empty()

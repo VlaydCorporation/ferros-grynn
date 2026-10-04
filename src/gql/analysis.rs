@@ -494,7 +494,7 @@ impl<'a> Analyzer<'a> {
 				LogicalStatement::Schema(self.define_graph(definition, statement.span)?)
 			}
 			StatementKind::DefineClass(definition) => {
-				LogicalStatement::Schema(Self::define_class(definition))
+				LogicalStatement::Schema(self.define_class(definition)?)
 			}
 			StatementKind::DefineField(definition) => {
 				LogicalStatement::Schema(self.define_field(definition)?)
@@ -522,6 +522,9 @@ impl<'a> Analyzer<'a> {
 			}
 			StatementKind::Info(statement) => {
 				LogicalStatement::Schema(self.info(&statement.target)?)
+			}
+			StatementKind::ShowChanges(statement) => {
+				LogicalStatement::Schema(self.show_changes(statement)?)
 			}
 			StatementKind::Maintenance(_) | StatementKind::Kill(_) => {
 				return Err(self.semantic(
@@ -1086,6 +1089,11 @@ impl<'a> Analyzer<'a> {
 			name: definition.name.value.clone(),
 			kind,
 			constraints: contract.validators,
+			changefeed: definition
+				.changefeed
+				.as_ref()
+				.map(|clause| self.changefeed_config(clause))
+				.transpose()?,
 			root: definition.root.as_ref().map(|root| self.expr(root, None)).transpose()?,
 			content: definition
 				.content
@@ -1272,13 +1280,129 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
-	fn define_class(definition: &DefineClassStatement) -> LogicalSchemaStatement {
-		LogicalSchemaStatement::DefineClass {
+	/// Validates a global class and its optional fixed-duration capture policy.
+	fn define_class(
+		&self,
+		definition: &DefineClassStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		Ok(LogicalSchemaStatement::DefineClass {
 			mode: definition.mode,
 			name: definition.name.value.clone(),
 			kind: class_kind(definition.kind),
 			schema_mode: class_schema_mode(definition.schema_mode),
+			changefeed: definition
+				.changefeed
+				.as_ref()
+				.map(|clause| self.changefeed_config(clause))
+				.transpose()?,
+		})
+	}
+
+	/// Validates literal fixed retention using the public runtime duration
+	/// policy.
+	fn changefeed_config(
+		&self,
+		clause: &crate::syn::ChangefeedClause,
+	) -> FerrosGrynnResult<crate::changefeed::ChangefeedConfig> {
+		let duration = clause
+			.duration
+			.parse::<crate::values::Duration>()
+			.map_err(|error| self.semantic(&error.to_string(), clause.span))?;
+		crate::changefeed::ChangefeedConfig::new(duration)
+			.map(|config| {
+				config.with_include_original(clause.include_original).with_full(clause.full)
+			})
+			.map_err(|error| {
+				self.locate(error.with_phase(ExecutionPhase::SemanticAnalysis), clause.span)
+			})
+	}
+
+	/// Lowers history expressions without requiring a currently live schema
+	/// owner.
+	fn show_changes(
+		&self,
+		statement: &crate::syn::ShowChangesStatement,
+	) -> FerrosGrynnResult<LogicalSchemaStatement> {
+		use crate::{
+			changefeed::ChangefeedSelector,
+			gql::ir::LogicalChangefeedTarget,
+			syn::ShowChangesTarget,
+		};
+		let target = match &statement.target {
+			ShowChangesTarget::Class(name) => LogicalChangefeedTarget::Named(
+				ChangefeedSelector::ClassName(Text::from(name.value.as_ref())),
+			),
+			ShowChangesTarget::GraphName(name) => LogicalChangefeedTarget::Named(
+				ChangefeedSelector::GraphName(Text::from(name.value.as_ref())),
+			),
+			ShowChangesTarget::Graph(value) => {
+				LogicalChangefeedTarget::Graph(self.expr(value, None)?)
+			}
+			ShowChangesTarget::Changefeed(value) => {
+				LogicalChangefeedTarget::Id(self.expr(value, None)?)
+			}
+		};
+		let since = self.expr(&statement.since, None)?;
+		if !compatible(&Type::Number, &since.ty)
+			&& !matches!(since.ty, Type::DateTime | Type::Bytes)
+		{
+			return Err(self.semantic(
+				"SINCE requires an exact integer stamp, timestamp or cursor bytes.",
+				since.span,
+			));
 		}
+		let limit = statement.limit.as_ref().map(|value| self.expr(value, None)).transpose()?;
+		if let Some(limit) = &limit
+			&& !compatible(&Type::Number, &limit.ty)
+		{
+			return Err(self.semantic("LIMIT requires a nonnegative integer.", limit.span));
+		}
+		let target_span = match &target {
+			LogicalChangefeedTarget::Graph(value) | LogicalChangefeedTarget::Id(value) => {
+				Some(value.span)
+			}
+			LogicalChangefeedTarget::Named(_) => None,
+		};
+		let spelling = self.changefeed_spelling(
+			[target_span, Some(since.span), limit.as_ref().map(|value| value.span)]
+				.into_iter()
+				.flatten(),
+		)?;
+		Ok(LogicalSchemaStatement::ShowChanges {
+			target,
+			since,
+			full: statement.full,
+			limit,
+			spelling,
+		})
+	}
+
+	/// Owns bounded operand spelling while spans still refer to this analyzer.
+	fn changefeed_spelling(
+		&self,
+		spans: impl IntoIterator<Item = TextSpan>,
+	) -> FerrosGrynnResult<Box<str>> {
+		let mut start = usize::MAX;
+		let mut end = 0;
+		for span in spans {
+			let offset = span.offset as usize;
+			start = start.min(offset);
+			end =
+				end.max(offset.checked_add(span.len as usize).ok_or_else(|| {
+					FerrosGrynnError::operation_overflow("changefeed operand span")
+				})?);
+		}
+		let spelling = self.source.get(start..end).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("changefeed operand span is outside its definition")
+		})?;
+		if spelling.len() > 1_000_000 {
+			return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+				"changefeed operand spelling",
+				spelling.len() as u64,
+				1_000_000,
+			));
+		}
+		Ok(spelling.into())
 	}
 
 	fn define_field(
@@ -2089,6 +2213,20 @@ impl<'a> Analyzer<'a> {
 
 	fn alter(&self, target: &AlterTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
+			AlterTarget::Changefeed {
+				graph,
+				if_exists,
+				name,
+				configuration,
+			} => Ok(LogicalSchemaStatement::AlterChangefeed {
+				graph: *graph,
+				if_exists: *if_exists,
+				name: name.value.clone(),
+				configuration: configuration
+					.as_ref()
+					.map(|clause| self.changefeed_config(clause))
+					.transpose()?,
+			}),
 			AlterTarget::Analyzer {
 				if_exists,
 				name,
@@ -2290,6 +2428,16 @@ impl<'a> Analyzer<'a> {
 	fn info(&self, target: &InfoTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		Ok(match target {
 			InfoTarget::Database => LogicalSchemaStatement::InfoDatabase,
+			InfoTarget::Changefeed(parameter) => LogicalSchemaStatement::InfoChangefeed {
+				id: self.expr(
+					&Expr {
+						kind: ExprKind::Parameter(parameter.clone()),
+						span: parameter.span,
+					},
+					None,
+				)?,
+				spelling: self.changefeed_spelling([parameter.span])?,
+			},
 			InfoTarget::Analyzer(name) => LogicalSchemaStatement::InfoAnalyzer {
 				name: name.value.clone(),
 			},
@@ -6540,13 +6688,30 @@ fn logical_statement_effect(statement: &LogicalStatement) -> ClosureEffect {
 				ClosureEffect::StableRead
 			}
 		}
-		LogicalStatement::Schema(statement) => {
-			if statement.statement_kind() == crate::gql::QueryStatementKind::Info {
+		LogicalStatement::Schema(statement) => match statement {
+			LogicalSchemaStatement::InfoChangefeed {
+				id,
+				..
+			} => ClosureEffect::StableRead.max(typed_expression_effect(id)),
+			LogicalSchemaStatement::ShowChanges {
+				target,
+				since,
+				limit,
+				..
+			} => {
+				let target_effect = match target {
+					crate::gql::ir::LogicalChangefeedTarget::Named(_) => ClosureEffect::Pure,
+					crate::gql::ir::LogicalChangefeedTarget::Graph(value)
+					| crate::gql::ir::LogicalChangefeedTarget::Id(value) => typed_expression_effect(value),
+				};
 				ClosureEffect::StableRead
-			} else {
-				ClosureEffect::SchemaMutation
+					.max(target_effect)
+					.max(typed_expression_effect(since))
+					.max(limit.as_ref().map_or(ClosureEffect::Pure, typed_expression_effect))
 			}
-		}
+			statement if statement.is_read() => ClosureEffect::StableRead,
+			_ => ClosureEffect::SchemaMutation,
+		},
 		LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => ClosureEffect::DataMutation,
 		LogicalStatement::BuildGraph(build) => {
 			if build.name.is_some() {
@@ -7149,7 +7314,7 @@ pub(in crate::gql) fn compile_named_function(
 		.collect::<FerrosGrynnResult<Vec<_>>>()?
 		.join(", ");
 	let source = format!(
-		"|{parameters}| -> {} {}",
+		"| {parameters} | -> {} {}",
 		function_source_type(function.result())?,
 		function.body()
 	);

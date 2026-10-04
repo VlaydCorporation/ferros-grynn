@@ -27,6 +27,125 @@ use crate::{
 };
 
 pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
+	if catalog.database_uuid.is_nil() {
+		return Err(invalid("database origin UUID is nil"));
+	}
+	jiff::Timestamp::from_nanosecond(catalog.committed_at_ns)
+		.map_err(|_| invalid("database commit UTC time is outside its supported domain"))?;
+	let mut feed_ids = BTreeSet::new();
+	let mut feed_sources = BTreeSet::new();
+	let mut feed_files = BTreeSet::new();
+	let mut feed_segments = BTreeSet::new();
+	for entry in &catalog.changefeeds {
+		let first =
+			entry.epochs.first().ok_or_else(|| invalid("changefeed capture epochs are empty"))?;
+		let last =
+			entry.epochs.last().ok_or_else(|| invalid("changefeed capture epochs are empty"))?;
+		if first.started_at().get() < entry.defined_at
+			|| last.started_at().get() != entry.published_at
+			|| entry.epochs.windows(2).any(|pair| pair[0].started_at() >= pair[1].started_at())
+		{
+			return Err(invalid("changefeed capture epoch bounds are invalid"));
+		}
+		let final_configuration =
+			(entry.state == crate::changefeed::ChangefeedState::Active).then_some(entry.config);
+		if last.configuration() != final_configuration {
+			return Err(invalid("changefeed final capture epoch disagrees with lifecycle"));
+		}
+		let below_clock = match entry.source {
+			crate::changefeed::ChangefeedSource::Class(id) => {
+				u64::from(id.get()) < catalog.next_schema_id
+			}
+			crate::changefeed::ChangefeedSource::Graph(id) => id.get() < catalog.next_graph_id,
+		};
+		if !below_clock {
+			return Err(invalid("retained changefeed source exceeds its owner identity clock"));
+		}
+		if entry.name.as_str().is_empty() || entry.name.as_str().contains('\0') {
+			return Err(invalid("retained changefeed source name is invalid"));
+		}
+		if !feed_ids.insert(entry.id) || !feed_sources.insert(entry.source) {
+			return Err(invalid("changefeed catalog has duplicate identities or sources"));
+		}
+		if entry.defined_at > entry.published_at || entry.purged_through > entry.last_stamp {
+			return Err(invalid("changefeed catalog bounds are reversed"));
+		}
+		if entry.purged_through == 0 && entry.purged_time_ns != 0
+			|| entry.purged_through != 0 && entry.purged_time_ns > catalog.committed_at_ns
+			|| jiff::Timestamp::from_nanosecond(entry.purged_time_ns).is_err()
+		{
+			return Err(invalid("changefeed purge time contradicts its trusted bounds"));
+		}
+		if (entry.state == crate::changefeed::ChangefeedState::Active) != entry.closed_at.is_none()
+			|| entry.closed_at.is_some() != entry.closed_time_ns.is_some()
+		{
+			return Err(invalid("changefeed lifecycle and close stamp disagree"));
+		}
+		if entry.closed_time_ns.is_some_and(|time| {
+			time > catalog.committed_at_ns || jiff::Timestamp::from_nanosecond(time).is_err()
+		}) {
+			return Err(invalid("changefeed close time contradicts the database clock"));
+		}
+		let partial = entry.retained_page != 0 || entry.retained_groups != 0;
+		if partial
+			&& !entry.segments.first().is_some_and(|segment| {
+				entry.retained_page > 1
+					&& entry.retained_page < segment.header.pages
+					&& entry.retained_groups > 0
+					&& entry.retained_groups < segment.header.commits
+					&& entry.purged_through >= segment.header.first_stamp
+					&& entry.purged_through < segment.header.last_stamp
+					&& entry.purged_time_ns >= segment.header.first_time
+					&& entry.purged_time_ns <= segment.header.last_time
+			}) {
+			return Err(invalid("changefeed retained prefix position is invalid"));
+		}
+		if entry
+			.closed_at
+			.is_some_and(|closed| closed < entry.defined_at || closed > entry.published_at)
+		{
+			return Err(invalid("changefeed close stamp is outside descriptor bounds"));
+		}
+		if entry.state == crate::changefeed::ChangefeedState::Active {
+			let present = match entry.source {
+				crate::changefeed::ChangefeedSource::Class(id) => {
+					catalog.classes.iter().any(|class| class.id == id)
+				}
+				crate::changefeed::ChangefeedSource::Graph(id) => {
+					catalog.graphs.iter().any(|graph| graph.id == id)
+				}
+			};
+			if !present {
+				return Err(invalid("active changefeed owner is absent"));
+			}
+		}
+		let mut previous_segment = None;
+		for (ordinal, segment) in entry.segments.iter().enumerate() {
+			let header = segment.header;
+			header.validate()?;
+			if segment.file.kind() != Some(DataFileKind::Changefeed)
+				|| !feed_files.insert(segment.file)
+				|| !feed_segments.insert(header.segment)
+				|| header.database != catalog.database_uuid
+				|| header.feed != entry.id
+				|| (!partial || ordinal != 0) && header.first_stamp <= entry.purged_through
+				|| header.first_stamp < entry.defined_at
+				|| header.last_stamp > entry.last_stamp
+				|| header.last_time > catalog.committed_at_ns
+				|| entry.purged_through != 0
+					&& (!partial || ordinal != 0)
+					&& header.first_time < entry.purged_time_ns
+			{
+				return Err(invalid("changefeed segment identities or catalog bounds disagree"));
+			}
+			if previous_segment.is_some_and(|(stamp, time)| {
+				stamp >= header.first_stamp || time > header.first_time
+			}) {
+				return Err(invalid("changefeed segments overlap or are out of order"));
+			}
+			previous_segment = Some((header.last_stamp, header.last_time));
+		}
+	}
 	if catalog.next_graph_id == 0 {
 		return Err(invalid("next graph identity is zero"));
 	}

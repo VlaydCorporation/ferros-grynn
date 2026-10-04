@@ -50,18 +50,27 @@ pub(super) fn execute_schema(
 			constraints,
 			root,
 			content,
-		} => define_graph(
-			transaction,
-			*mode,
-			name,
-			*kind,
-			*constraints,
-			root.as_ref(),
-			content.as_ref(),
-			slots,
-			source,
-			control,
-		),
+			changefeed,
+		} => {
+			let skipped =
+				*mode == DefinitionMode::IfNotExists && transaction.named_graph(name)?.is_some();
+			let value = define_graph(
+				transaction,
+				*mode,
+				name,
+				*kind,
+				*constraints,
+				root.as_ref(),
+				content.as_ref(),
+				slots,
+				source,
+				control,
+			)?;
+			if !skipped && let Some(config) = changefeed {
+				super::changefeed::configure(transaction, true, false, name, Some(*config))?;
+			}
+			Ok(value)
+		}
 		LogicalSchemaStatement::UpdateGraph {
 			graph,
 			mutation,
@@ -81,7 +90,16 @@ pub(super) fn execute_schema(
 			name,
 			kind,
 			schema_mode,
-		} => define_class(transaction, *mode, name, *kind, *schema_mode),
+			changefeed,
+		} => {
+			let skipped =
+				*mode == DefinitionMode::IfNotExists && transaction.class(name)?.is_some();
+			let value = define_class(transaction, *mode, name, *kind, *schema_mode)?;
+			if !skipped && let Some(config) = changefeed {
+				super::changefeed::configure(transaction, false, false, name, Some(*config))?;
+			}
+			Ok(value)
+		}
 		LogicalSchemaStatement::DefineField {
 			mode,
 			class,
@@ -227,6 +245,32 @@ pub(super) fn execute_schema(
 			name,
 			mode,
 		} => alter_class(transaction, *if_exists, name, *mode),
+		LogicalSchemaStatement::AlterChangefeed {
+			graph,
+			if_exists,
+			name,
+			configuration,
+		} => super::changefeed::configure(transaction, *graph, *if_exists, name, *configuration),
+		LogicalSchemaStatement::InfoChangefeed {
+			id,
+			..
+		} => super::changefeed::info(transaction, id, slots, source, control),
+		LogicalSchemaStatement::ShowChanges {
+			target,
+			since,
+			full,
+			limit,
+			..
+		} => super::changefeed::show(
+			transaction,
+			target,
+			since,
+			*full,
+			limit.as_ref(),
+			slots,
+			source,
+			control,
+		),
 		LogicalSchemaStatement::AlterFieldType {
 			if_exists,
 			class,

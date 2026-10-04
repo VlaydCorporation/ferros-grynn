@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use super::{
-	file_registry::FileRegistry,
+	file_registry::{FileRegistry, RegisteredDataFile},
 	hybrid_engine::HybridReadEngine,
 	page::{AlignedPage, PageNo},
 	page_cache::{PageCacheKey, PageCacheVersion},
@@ -130,6 +130,30 @@ pub(super) fn read_page_cached(
 	output: &mut AlignedPage,
 ) -> FerrosGrynnResult<()> {
 	let home = registry.resolve(key)?;
+	read_pinned_page_cached(
+		wal,
+		&home,
+		engine,
+		snapshot,
+		home_generation,
+		home_ceiling,
+		key,
+		output,
+	)
+}
+
+/// Reads from an exact registered-file pin after its catalog generation
+/// retires.
+pub(super) fn read_pinned_page_cached(
+	wal: &FrameWal,
+	home: &RegisteredDataFile,
+	engine: &HybridReadEngine,
+	snapshot: StorageSnapshot,
+	home_generation: CheckpointGeneration,
+	home_ceiling: Lsn,
+	key: PageKey,
+	output: &mut AlignedPage,
+) -> FerrosGrynnResult<()> {
 	let visible = wal.visible_frames(std::slice::from_ref(&key), snapshot);
 	let frame = visible.frames()[0];
 	let version = frame.map_or(

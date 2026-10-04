@@ -95,13 +95,22 @@ impl Transaction {
 		}
 
 		for node in &nodes {
+			let intent_start = self.change_intent_count();
+			let mutation_start = self.mutations.len();
+			self.note_dml_change_target(&node.record, Some(reference.id()))?;
 			self.set_occurrence_label(reference.id(), &node.record, node.label.clone())?;
 			self.replace_occurrence_state(reference.id(), &node.record, OccurrenceState::Node {
 				nested_graph: node.nested_graph,
 			})?;
 			self.write_effective_properties(reference.id(), &node.record, &node.properties)?;
+			if self.mutations.len() == mutation_start {
+				self.mark_change_noops(intent_start);
+			}
 		}
 		for edge in &edges {
+			let intent_start = self.change_intent_count();
+			let mutation_start = self.mutations.len();
+			self.note_dml_change_target(&edge.record, Some(reference.id()))?;
 			resolve_topology_locals(self, reference.id(), origin, &edge.topology, &mut locals)?;
 			let topology = remap_topology(&edge.topology, &locals)?;
 			self.set_occurrence_label(reference.id(), &edge.record, edge.label.clone())?;
@@ -111,6 +120,9 @@ impl Transaction {
 				transition_graph: edge.transition_graph,
 			})?;
 			self.write_effective_properties(reference.id(), &edge.record, &edge.properties)?;
+			if self.mutations.len() == mutation_start {
+				self.mark_change_noops(intent_start);
+			}
 		}
 		self.validate_graph_family(reference)
 	}

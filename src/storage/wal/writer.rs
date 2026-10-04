@@ -5,7 +5,76 @@
 
 use super::*;
 
+/// Test-only durability boundaries; failures poison the writer like real I/O.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitFailurePoint {
+	/// Ordinary production behavior.
+	None,
+	/// No transaction bytes have been appended.
+	BeforeAppend,
+	/// Complete records reached the buffered writer.
+	AfterAppend,
+	/// Buffered records reached the file, before synchronization.
+	AfterFlush,
+	/// The barrier succeeded, but no in-process visibility was published.
+	AfterSync,
+}
+
+#[cfg(test)]
+thread_local! {
+	/// Scoped test thread state, never shared by unrelated commits.
+	static COMMIT_FAILURE_POINT: std::cell::Cell<CommitFailurePoint> = const { std::cell::Cell::new(CommitFailurePoint::None) };
+}
+
+/// Restores the previous failure boundary when the test leaves its scope.
+#[cfg(test)]
+pub(crate) struct CommitFailureGuard(CommitFailurePoint);
+
+#[cfg(test)]
+impl CommitFailureGuard {
+	/// Installs one test failure after ordinary seed commits have completed.
+	pub(crate) fn set(point: CommitFailurePoint) -> Self {
+		Self(COMMIT_FAILURE_POINT.replace(point))
+	}
+}
+
+#[cfg(test)]
+impl Drop for CommitFailureGuard {
+	fn drop(&mut self) {
+		COMMIT_FAILURE_POINT.set(self.0);
+	}
+}
+
+/// Models an uncertain transport result without exposing partial publication.
+#[cfg(test)]
+fn inject_commit_failure(
+	writer: &mut WriterState,
+	point: CommitFailurePoint,
+) -> FerrosGrynnResult<()> {
+	if COMMIT_FAILURE_POINT.get() == point {
+		writer.health = WriterHealth::Poisoned;
+		return Err(io_failure(
+			"injected WAL durability failure",
+			io::Error::other("test commit boundary"),
+		));
+	}
+	Ok(())
+}
+
 impl FrameWal {
+	/// Rejects publication preparation after an uncertain transport failure,
+	/// before callers create more unreachable files. Read pins remain usable.
+	pub(in crate::storage) fn ensure_writable(&self) -> FerrosGrynnResult<()> {
+		if self.inner.writer.lock().health == WriterHealth::Poisoned {
+			return Err(io_failure(
+				"prepare publication with poisoned WAL; reopen to recover",
+				io::Error::other("previous WAL durability barrier failed"),
+			));
+		}
+		Ok(())
+	}
+
 	/// Creates a new WAL directory and its first empty segment.
 	///
 	/// # Errors
@@ -247,7 +316,7 @@ impl FrameWal {
 				{
 					// The higher datastore layer rebases atom deltas before
 					// opening this serialized storage transaction; this
-					// guard still protects direct PageManager callers.
+					// guard still protects direct frame-WAL callers.
 					return Err(FerrosGrynnError::serialization_failure(
 						tx.id.get(),
 						format!("page {:?} changed after the transaction snapshot", key),
@@ -272,6 +341,8 @@ impl FrameWal {
 			writer.rotate(&self.inner.directory)?;
 		}
 
+		#[cfg(test)]
+		inject_commit_failure(&mut writer, CommitFailurePoint::BeforeAppend)?;
 		let append_result = writer.append_transaction(tx.id, commit_ts, &mut tx.staged);
 		let (commit_lsn, committed_frames) = match append_result {
 			Ok(result) => result,
@@ -281,15 +352,21 @@ impl FrameWal {
 			}
 		};
 
+		#[cfg(test)]
+		inject_commit_failure(&mut writer, CommitFailurePoint::AfterAppend)?;
 		if let Err(source) = writer.segment.writer.flush() {
 			writer.health = WriterHealth::Poisoned;
 			return Err(io_failure("flush WAL transaction", source));
 		}
+		#[cfg(test)]
+		inject_commit_failure(&mut writer, CommitFailurePoint::AfterFlush)?;
 		if let Err(source) = writer.segment.writer.get_ref().sync_data() {
 			writer.health = WriterHealth::Poisoned;
 			return Err(io_failure("synchronize WAL transaction", source));
 		}
 
+		#[cfg(test)]
+		inject_commit_failure(&mut writer, CommitFailurePoint::AfterSync)?;
 		{
 			let mut published = self.inner.published.write();
 			for (key, version) in committed_frames {

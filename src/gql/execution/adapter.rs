@@ -341,6 +341,26 @@ impl QueryRead for TransactionRead<'_> {
 		self.transaction.tensor_cost_evaluator_at(&self.snapshot, bytes)
 	}
 
+	fn changefeed_binding(
+		&self,
+		selector: &crate::changefeed::ChangefeedSelector,
+	) -> FerrosGrynnResult<Option<crate::changefeed::ChangefeedReadBinding>> {
+		self.transaction.query_changefeed_binding(selector)
+	}
+
+	fn changefeed_context(
+		&self,
+	) -> FerrosGrynnResult<(crate::values::Uuid, crate::changefeed::Versionstamp)> {
+		self.transaction.query_changefeed_context()
+	}
+
+	fn visit_changefeed_functions(
+		&self,
+		visitor: &mut dyn FnMut(&crate::datastore::SchemaFunction) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<()> {
+		self.transaction.query_visit_schema_functions(&self.snapshot, visitor)
+	}
+
 	fn observe_tensor_cost(&self, key: crate::datastore::ConflictKey) {
 		self.transaction.observe_tensor_cost(key);
 	}
@@ -1082,7 +1102,7 @@ impl QueryRead for TransactionRead<'_> {
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
 		let snapshot = self.snapshot.clone();
-		let value = if statement.statement_kind() == crate::gql::QueryStatementKind::Info {
+		let value = if statement.is_read() {
 			execute_schema(self.transaction, &snapshot, statement, slots, source, control)?
 		} else {
 			self.transaction.atomic_mutation(|transaction| {

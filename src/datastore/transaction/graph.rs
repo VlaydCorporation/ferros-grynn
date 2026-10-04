@@ -47,8 +47,22 @@ impl Transaction {
 		label: Option<Text>,
 		nested_graph: Option<GraphId>,
 	) -> FerrosGrynnResult<AtomId> {
+		self.logical_operation(|transaction| {
+			transaction.attach_node_inner(graph, record_id, label, nested_graph)
+		})
+	}
+
+	/// Attaches a node under the current outer operation.
+	fn attach_node_inner(
+		&mut self,
+		graph: GraphId,
+		record_id: &RecordId,
+		label: Option<Text>,
+		nested_graph: Option<GraphId>,
+	) -> FerrosGrynnResult<AtomId> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
+		self.note_change_target(global, Some(graph), ConflictKey::GraphMembership(graph, global))?;
 		let (class_id, kind) = self.atom_domain(global)?;
 		if self.working.membership(graph, global).is_some() {
 			return Err(FerrosGrynnError::graph_constraint_violation(
@@ -93,8 +107,31 @@ impl Transaction {
 		weight: Option<Number>,
 		transition_graph: Option<GraphId>,
 	) -> FerrosGrynnResult<AtomId> {
+		self.logical_operation(|transaction| {
+			transaction.attach_edge_inner(
+				graph,
+				record_id,
+				label,
+				topology,
+				weight,
+				transition_graph,
+			)
+		})
+	}
+
+	/// Attaches a connector under the current outer operation.
+	fn attach_edge_inner(
+		&mut self,
+		graph: GraphId,
+		record_id: &RecordId,
+		label: Option<Text>,
+		topology: EdgeTopology,
+		weight: Option<Number>,
+		transition_graph: Option<GraphId>,
+	) -> FerrosGrynnResult<AtomId> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
+		self.note_change_target(global, Some(graph), ConflictKey::GraphMembership(graph, global))?;
 		let (class_id, kind) = self.atom_domain(global)?;
 		if self.working.membership(graph, global).is_some() {
 			return Err(FerrosGrynnError::graph_constraint_violation(
@@ -176,6 +213,18 @@ impl Transaction {
 		record_id: &RecordId,
 		cascade: bool,
 	) -> FerrosGrynnResult<()> {
+		self.logical_operation(|transaction| {
+			transaction.detach_occurrence_inner(graph, record_id, cascade)
+		})
+	}
+
+	/// Preflights all cascade targets before the first occurrence is removed.
+	fn detach_occurrence_inner(
+		&mut self,
+		graph: GraphId,
+		record_id: &RecordId,
+		cascade: bool,
+	) -> FerrosGrynnResult<()> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
 		let plan = self
@@ -221,6 +270,14 @@ impl Transaction {
 					.ok_or_else(|| self.limit_error(usize::MAX))?;
 			}
 			removals.push((global, local, has_overlay, class_id, kind, posting_bytes));
+		}
+		self.ensure_capacity(additional)?;
+		for (global, _, _, _, _, _) in &removals {
+			self.note_change_target(
+				*global,
+				Some(graph),
+				ConflictKey::GraphMembership(graph, *global),
+			)?;
 		}
 		self.ensure_capacity(additional)?;
 		for (global, local, has_overlay, class_id, kind, posting_bytes) in removals {
@@ -346,7 +403,9 @@ impl Transaction {
 		key: PropertyKeyId,
 		value: Value,
 	) -> FerrosGrynnResult<()> {
-		self.change_overlay(graph, record_id, key, Some(value))
+		self.logical_operation(|transaction| {
+			transaction.change_overlay(graph, record_id, key, Some(value))
+		})
 	}
 
 	/// Computes and stores the canonical system-managed LevelPath overlay.
@@ -374,7 +433,9 @@ impl Transaction {
 		record_id: &RecordId,
 		key: PropertyKeyId,
 	) -> FerrosGrynnResult<()> {
-		self.change_overlay(graph, record_id, key, None)
+		self.logical_operation(|transaction| {
+			transaction.change_overlay(graph, record_id, key, None)
+		})
 	}
 
 	/// Removes a graph-local property decision and resumes base inheritance.
@@ -388,9 +449,22 @@ impl Transaction {
 		record_id: &RecordId,
 		key: PropertyKeyId,
 	) -> FerrosGrynnResult<()> {
+		self.logical_operation(|transaction| {
+			transaction.reset_property_inner(graph, record_id, key)
+		})
+	}
+
+	/// Records inherited no-ops before the overlay equality fast path.
+	fn reset_property_inner(
+		&mut self,
+		graph: GraphId,
+		record_id: &RecordId,
+		key: PropertyKeyId,
+	) -> FerrosGrynnResult<()> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
 		let local = self.require_membership(graph, global)?;
+		self.note_change_target(global, Some(graph), ConflictKey::GraphOverlay(graph, global))?;
 		if self.working.inherits_property(graph, global, key) {
 			return Ok(());
 		}
@@ -417,9 +491,22 @@ impl Transaction {
 		record_id: &RecordId,
 		label: Option<Text>,
 	) -> FerrosGrynnResult<()> {
+		self.logical_operation(|transaction| {
+			transaction.set_occurrence_label_inner(graph, record_id, label)
+		})
+	}
+
+	/// Records a label call before equal labels return without mutations.
+	fn set_occurrence_label_inner(
+		&mut self,
+		graph: GraphId,
+		record_id: &RecordId,
+		label: Option<Text>,
+	) -> FerrosGrynnResult<()> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
 		let local = self.require_membership(graph, global)?;
+		self.note_change_target(global, Some(graph), ConflictKey::GraphIncidence(graph, local))?;
 		if self
 			.working
 			.occurrence(graph, local)
@@ -449,9 +536,22 @@ impl Transaction {
 		record_id: &RecordId,
 		state: OccurrenceState,
 	) -> FerrosGrynnResult<()> {
+		self.logical_operation(|transaction| {
+			transaction.replace_occurrence_state_inner(graph, record_id, state)
+		})
+	}
+
+	/// Records topology/weight calls before equal states are skipped.
+	fn replace_occurrence_state_inner(
+		&mut self,
+		graph: GraphId,
+		record_id: &RecordId,
+		state: OccurrenceState,
+	) -> FerrosGrynnResult<()> {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
 		let local = self.require_membership(graph, global)?;
+		self.note_change_target(global, Some(graph), ConflictKey::GraphIncidence(graph, local))?;
 		if self
 			.working
 			.occurrence(graph, local)
@@ -577,6 +677,7 @@ impl Transaction {
 		self.prepare_mutation()?;
 		let global = self.require_atom(record_id)?;
 		let local = self.require_membership(graph, global)?;
+		self.note_change_target(global, Some(graph), ConflictKey::GraphOverlay(graph, global))?;
 		if let Some(value) = &value {
 			self.intern_value_keys(value)?;
 		}

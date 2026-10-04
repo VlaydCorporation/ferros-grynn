@@ -72,6 +72,17 @@ pub enum ImportViolationPolicy {
 	Quarantine,
 }
 
+/// History capture policy of one atomic import.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ImportChangefeedMode {
+	/// Suppress eligible events and publish explicit gaps.
+	#[default]
+	Off,
+	/// Preserve accepted-item history and publish it only at END.
+	On,
+}
+
 /// Stable public identity of one immutable rejected-item set.
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[repr(transparent)]
@@ -180,6 +191,8 @@ impl Iterator for QuarantineReader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ImportOptions {
+	/// Accepted-item history capture; disabled by default.
+	pub changefeed: ImportChangefeedMode,
 	/// Index-maintenance policy.
 	pub indexes: ImportIndexMode,
 	/// Constraint-validation policy.
@@ -204,6 +217,7 @@ pub struct ImportOptions {
 impl Default for ImportOptions {
 	fn default() -> Self {
 		Self {
+			changefeed: ImportChangefeedMode::Off,
 			indexes: ImportIndexMode::Deferred,
 			constraints: ImportConstraintMode::Deferred,
 			on_violation: ImportViolationPolicy::Abort,
@@ -548,7 +562,8 @@ impl ImportSession {
 					})?;
 				self.changed |= changed;
 				if self.applied_in_segment == self.options.segment_size {
-					self.transaction
+					let captured = self
+						.transaction
 						.as_mut()
 						.ok_or_else(|| {
 							FerrosGrynnError::invalid_argument(
@@ -556,6 +571,13 @@ impl ImportSession {
 							)
 						})?
 						.seal_import_segment(self.commit_ts);
+					match captured {
+						Ok(captured) => self.changed |= captured,
+						Err(error) => {
+							self.failure = Some(error.clone());
+							return Err(error);
+						}
+					}
 					increment(&mut self.segments, "import segment count")?;
 					self.applied_in_segment = 0;
 				}
@@ -648,7 +670,7 @@ impl ImportSession {
 			FerrosGrynnError::invalid_argument("the import session is already finished")
 		})?;
 		if self.applied_in_segment != 0 {
-			transaction.seal_import_segment(self.commit_ts);
+			self.changed |= transaction.seal_import_segment(self.commit_ts)?;
 			increment(&mut self.segments, "import segment count")?;
 		}
 		let quarantine = self.quarantine.take().map(QuarantineWriter::finish).transpose()?;
@@ -740,6 +762,8 @@ impl Datastore {
 				options.constraints,
 				options.on_violation,
 				graph_scope,
+				options.changefeed,
+				commit_ts,
 			);
 			(lease, transaction, commit_ts)
 		};

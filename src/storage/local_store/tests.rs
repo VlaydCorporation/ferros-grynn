@@ -38,6 +38,7 @@ use crate::{
 	values::{Object, PropertyMap, RecordId, RecordIdPart, Type, Value, Vector},
 };
 
+mod changefeed_tests;
 mod search_scope_tests;
 
 #[test]
@@ -822,6 +823,17 @@ fn graph_property_catalog_update_reuses_graph_generation_and_reopens() {
 		.unwrap();
 	assert!(define[0].result.is_ok());
 	let before = generation_directories(&directory.0);
+	let StoreBackend::Local(local) = &store.inner.backend else {
+		panic!("test requires local storage");
+	};
+	let graph_generations = local
+		.state
+		.lock()
+		.bindings
+		.graphs
+		.iter()
+		.map(|binding| (binding.graph_id, binding.generation))
+		.collect::<Vec<_>>();
 
 	let update = store
 		.execute(
@@ -830,7 +842,19 @@ fn graph_property_catalog_update_reuses_graph_generation_and_reopens() {
 		)
 		.unwrap();
 	assert!(update[0].result.is_ok());
-	assert_eq!(generation_directories(&directory.0), before);
+	assert_eq!(
+		local
+			.state
+			.lock()
+			.bindings
+			.graphs
+			.iter()
+			.map(|binding| (binding.graph_id, binding.generation))
+			.collect::<Vec<_>>(),
+		graph_generations,
+	);
+	// Catalog publication may retire older unpinned atom generations.
+	assert!(generation_directories(&directory.0) <= before);
 	assert!(store.checkpoint(CheckpointMode::Restart).unwrap());
 	drop(store);
 

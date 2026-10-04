@@ -8,6 +8,7 @@ pub(super) use database::{
 	AnalyzerCatalogEntry,
 	AnalyzerFilterCatalogEntry,
 	AtomStoreCatalogBinding,
+	ChangefeedCatalogEntry,
 	ClassCatalogEntry,
 	ClassFieldCatalogEntry,
 	ClassIndexCatalogEntry,

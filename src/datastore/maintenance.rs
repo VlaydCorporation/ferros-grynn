@@ -71,6 +71,8 @@ pub enum MaintenanceJobKind {
 	CompactIndex,
 	CompactGraph,
 	CompactDatabase,
+	/// Publishes expired history prefixes and retires closed sources.
+	PurgeChangefeed,
 }
 
 /// Durable lifecycle state of one maintenance job.
@@ -271,6 +273,7 @@ const fn job_kind_name(kind: MaintenanceJobKind) -> &'static str {
 		MaintenanceJobKind::CompactIndex => "compact_index",
 		MaintenanceJobKind::CompactGraph => "compact_graph",
 		MaintenanceJobKind::CompactDatabase => "compact_database",
+		MaintenanceJobKind::PurgeChangefeed => "purge_changefeed",
 	}
 }
 
@@ -612,9 +615,13 @@ impl MaintenanceCoordinator {
 	) -> FerrosGrynnResult<JobId> {
 		self.start(store)?;
 		let mut state = self.shared.state.lock();
-		if let Some(existing) =
-			state.jobs.values().find(|job| job.target == target && !terminal(job.state))
-		{
+		if let Some(existing) = state.jobs.values().find(|job| {
+			job.target == target
+				&& !terminal(job.state)
+				&& (job.kind == kind
+					|| job.kind != MaintenanceJobKind::PurgeChangefeed
+						&& kind != MaintenanceJobKind::PurgeChangefeed)
+		}) {
 			if coalesce {
 				return Ok(existing.id);
 			}
@@ -834,25 +841,44 @@ impl MaintenanceCoordinator {
 			}
 		}
 	}
+
+	/// Lets idle metadata scans observe the worker owner's shutdown request.
+	pub(super) fn is_stopping(&self) -> bool {
+		self.shared.state.lock().stopping
+	}
 }
 
 fn worker_loop(shared: &Arc<CoordinatorShared>, store: &Weak<StoreInner>) {
 	loop {
 		let id = {
 			let mut state = shared.state.lock();
-			while state.queue.is_empty() && !state.stopping {
-				shared.wake.wait(&mut state);
+			if state.queue.is_empty() && !state.stopping {
+				shared.wake.wait_for(&mut state, std::time::Duration::from_secs(1));
 			}
 			if state.stopping {
 				return;
 			}
-			match state.queue.pop_front() {
-				Some(id) => id,
-				None => continue,
-			}
+			state.queue.pop_front()
 		};
 		let Some(store) = store.upgrade() else {
 			return;
+		};
+		let Some(id) = id else {
+			store.sweep_retired_changefeeds();
+			if store.has_changefeed_retention_work().is_ok_and(|due| due) {
+				let options = match store.options {
+					DatastoreOptions::InMemory(options) => options.maintenance,
+					DatastoreOptions::Local(options) => options.maintenance,
+				};
+				drop(store.maintenance.enqueue_coalesced(
+					&store,
+					MaintenanceJobKind::PurgeChangefeed,
+					MaintenanceTarget::Database,
+					options,
+					None,
+				));
+			}
+			continue;
 		};
 		if begin_job(shared, store.as_ref(), id).is_err() {
 			continue;
@@ -1313,6 +1339,97 @@ mod tests {
 		assert!(invalid.first().is_some_and(|result| result.result.is_err()));
 		assert!(store.execute("ANALYZE DATABASE;", &Object::new()).is_err());
 		assert!(store.execute("ANALYZE INDEX by_age ON CLASS person;", &Object::new()).is_err());
+		Ok(())
+	}
+
+	#[test]
+	fn changefeed_purge_rechecks_revision_cancellation_and_job_kind() -> FerrosGrynnResult<()> {
+		use crate::{
+			changefeed::{ChangefeedConfig, ChangefeedSource},
+			datastore::{ClassSchema, changefeed_retention::TEST_TIME},
+			graph::AtomKind,
+			values::{PropertyMap, RecordId},
+		};
+		struct Clock(Option<i128>);
+		impl Drop for Clock {
+			fn drop(&mut self) {
+				TEST_TIME.set(self.0);
+			}
+		}
+		let store = Datastore::in_memory();
+		let mut seed = store.begin();
+		let class = seed.define_class(ClassSchema::new("n", AtomKind::Node, [])?)?;
+		let key = seed.intern_property("value")?;
+		let record: RecordId = "n:a".parse()?;
+		seed.create_atom(record.clone(), PropertyMap::new())?;
+		let ttl = 86_400_000_000_000;
+		let feed = seed.configure_changefeed(
+			ChangefeedSource::Class(class),
+			ChangefeedConfig::from_nanoseconds(ttl)?,
+		)?;
+		seed.commit()?;
+		let _clock =
+			Clock(TEST_TIME.replace(Some(store.inner.current_root().committed_at_ns + ttl)));
+		let register = |kind| -> FerrosGrynnResult<JobId> {
+			let job = MaintenanceJobInfo::new(
+				kind,
+				MaintenanceTarget::Database,
+				store.inner.current_root().commit_ts,
+				MaintenanceOptions::default(),
+				None,
+			);
+			let id = job.id;
+			{
+				let mut state = store.inner.maintenance.shared.state.lock();
+				state.cancellation_tokens.insert(id, Arc::new(AtomicBool::new(false)));
+				state.jobs.insert(id, job);
+			}
+			begin_job(store.inner.maintenance.shared.as_ref(), store.inner.as_ref(), id)?;
+			Ok(id)
+		};
+		let race = register(MaintenanceJobKind::PurgeChangefeed)?;
+		let outcome = store.inner.run_maintenance_job_interleaved(race, || {
+			let mut tx = store.begin();
+			tx.set_base_property(&record, key, 2.into())?;
+			tx.commit()?;
+			Ok(())
+		})?;
+		assert!(matches!(outcome, MaintenanceRunOutcome::Retry));
+		assert_eq!(store.begin().changefeed_info(feed)?.purged_through().get(), 0);
+		finish_job(
+			store.inner.maintenance.shared.as_ref(),
+			store.inner.as_ref(),
+			race,
+			Ok(MaintenanceRunOutcome::Cancelled),
+		);
+		let cancelled = register(MaintenanceJobKind::PurgeChangefeed)?;
+		let stamp = store.inner.current_root().commit_ts;
+		let outcome = store.inner.run_maintenance_job_interleaved(cancelled, || {
+			store.kill_job(cancelled)?;
+			Ok(())
+		})?;
+		assert!(matches!(outcome, MaintenanceRunOutcome::Cancelled));
+		assert_eq!(store.inner.current_root().commit_ts, stamp);
+		assert_eq!(store.begin().changefeed_info(feed)?.purged_through().get(), 0);
+		finish_job(
+			store.inner.maintenance.shared.as_ref(),
+			store.inner.as_ref(),
+			cancelled,
+			Ok(MaintenanceRunOutcome::Cancelled),
+		);
+		let compact = register(MaintenanceJobKind::CompactDatabase)?;
+		let purge = register(MaintenanceJobKind::PurgeChangefeed)?;
+		assert_eq!(store.purge_changefeeds(None)?, purge);
+		assert_eq!(
+			store.inner.maintenance.enqueue_coalesced(
+				&store.inner,
+				MaintenanceJobKind::CompactDatabase,
+				MaintenanceTarget::Database,
+				MaintenanceOptions::default(),
+				None
+			)?,
+			compact
+		);
 		Ok(())
 	}
 

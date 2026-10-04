@@ -253,6 +253,80 @@ pub enum StorageValue {
 }
 
 impl StorageValue {
+	/// Bounds the owned runtime conversion, including dictionary-name clones
+	/// that are absent from the canonical decoder's allocation accounting.
+	pub(crate) fn runtime_allocation_bytes(
+		&self,
+		context: &DecodeContext<'_>,
+	) -> FerrosGrynnResult<usize> {
+		let mut bytes = 256usize;
+		match self {
+			Self::Array(values) | Self::Set(values) => {
+				if matches!(self, Self::Set(_)) {
+					allocation_add(
+						&mut bytes,
+						tree_allocation_bytes(values.len(), std::mem::size_of::<Value>())?,
+					)?;
+				}
+				for value in values {
+					allocation_add(&mut bytes, value.runtime_allocation_bytes(context)?)?;
+				}
+			}
+			Self::Object(values) => {
+				allocation_add(
+					&mut bytes,
+					tree_allocation_bytes(values.len(), std::mem::size_of::<(Text, Value)>())?,
+				)?;
+				for (key, value) in values {
+					let name = context
+						.properties
+						.resolve(*key)
+						.ok_or_else(|| unresolved("property key", key.to_string()))?;
+					allocation_add(&mut bytes, name.len())?;
+					allocation_add(&mut bytes, value.runtime_allocation_bytes(context)?)?;
+				}
+			}
+			Self::Record(value) => {
+				allocation_add(&mut bytes, value.runtime_allocation_bytes(context)?)?;
+			}
+			Self::AtomRef(value) => {
+				allocation_add(&mut bytes, value.record_id.runtime_allocation_bytes(context)?)?;
+			}
+			Self::GraphRef(value) => {
+				allocation_add(&mut bytes, context.graph_from_disk(*value)?.name().len())?;
+			}
+			Self::Range(value) => {
+				for bound in [&value.start, &value.end] {
+					if let StorageBound::Included(value) | StorageBound::Excluded(value) = bound {
+						allocation_add(&mut bytes, value.runtime_allocation_bytes(context)?)?;
+					}
+				}
+			}
+			Self::QualifiedAtomRef(_) => {
+				return Err(FerrosGrynnError::unsupported_storage_value(
+					"qualified atom reference",
+				));
+			}
+			Self::Geometry(geometry) => {
+				allocation_add(&mut bytes, geometry.validation_scratch_bytes()?)?;
+			}
+			Self::None
+			| Self::Null
+			| Self::Bool(_)
+			| Self::Int(_)
+			| Self::Float(_)
+			| Self::Decimal(_)
+			| Self::String(_)
+			| Self::Bytes(_)
+			| Self::DateTime(_)
+			| Self::Duration(_)
+			| Self::Uuid(_)
+			| Self::Ulid(_)
+			| Self::Vector(_) => {}
+		}
+		Ok(bytes)
+	}
+
 	pub fn from_runtime(value: Value, context: &mut EncodeContext) -> FerrosGrynnResult<Self> {
 		match value {
 			Value::None => Ok(Self::None),
@@ -470,6 +544,38 @@ impl StorageDateTime {
 }
 
 impl StorageRecordId {
+	/// Bounds class-name and composite-part allocations before conversion.
+	fn runtime_allocation_bytes(&self, context: &DecodeContext<'_>) -> FerrosGrynnResult<usize> {
+		let class = context
+			.classes
+			.resolve(self.class_id)
+			.ok_or_else(|| unresolved("class", self.class_id.to_string()))?;
+		let mut bytes = 256usize;
+		allocation_add(&mut bytes, class.len())?;
+		match &self.part {
+			StorageRecordIdPart::Array(values) => {
+				for value in values {
+					allocation_add(&mut bytes, record_value_allocation(value)?)?;
+				}
+			}
+			StorageRecordIdPart::Object(values) => {
+				allocation_add(
+					&mut bytes,
+					tree_allocation_bytes(values.len(), std::mem::size_of::<(Text, Value)>())?,
+				)?;
+				for (name, value) in values {
+					allocation_add(&mut bytes, name.len())?;
+					allocation_add(&mut bytes, record_value_allocation(value)?)?;
+				}
+			}
+			StorageRecordIdPart::Int(_)
+			| StorageRecordIdPart::String(_)
+			| StorageRecordIdPart::Uuid(_)
+			| StorageRecordIdPart::Ulid(_) => {}
+		}
+		Ok(bytes)
+	}
+
 	pub(crate) fn from_runtime(
 		value: RecordId,
 		context: &mut EncodeContext,
@@ -523,6 +629,61 @@ impl StorageRecordId {
 		};
 		RecordId::new(class, part)
 	}
+}
+
+/// Accumulates allocation reservations without saturating a hard cap.
+fn allocation_add(bytes: &mut usize, additional: usize) -> FerrosGrynnResult<()> {
+	*bytes = bytes
+		.checked_add(additional)
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("runtime conversion allocation"))?;
+	Ok(())
+}
+
+/// Reserves complete initial B-tree nodes and sparse node occupancy, rather
+/// than charging only live entries. The fixed reserve covers root/split
+/// scratch; four slots per entry cover current std node occupancy and pointer
+/// arrays.
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "The private DTO module re-exports this shared admission helper to physical codecs."
+)]
+pub(crate) fn tree_allocation_bytes(count: usize, entry_bytes: usize) -> FerrosGrynnResult<usize> {
+	if count == 0 {
+		return Ok(0);
+	}
+	entry_bytes
+		.checked_add(32)
+		.and_then(|bytes| bytes.checked_mul(4))
+		.and_then(|bytes| bytes.checked_mul(count))
+		.and_then(|bytes| bytes.checked_add(4096))
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("runtime tree allocation"))
+}
+
+/// Bounds composite RecordId conversion without materializing its runtime tree.
+fn record_value_allocation(value: &StorageRecordValue) -> FerrosGrynnResult<usize> {
+	let mut bytes = 256usize;
+	match value {
+		StorageRecordValue::Array(values) => {
+			for value in values {
+				allocation_add(&mut bytes, record_value_allocation(value)?)?;
+			}
+		}
+		StorageRecordValue::Object(values) => {
+			allocation_add(
+				&mut bytes,
+				tree_allocation_bytes(values.len(), std::mem::size_of::<(Text, Value)>())?,
+			)?;
+			for (name, value) in values {
+				allocation_add(&mut bytes, name.len())?;
+				allocation_add(&mut bytes, record_value_allocation(value)?)?;
+			}
+		}
+		StorageRecordValue::Int(_)
+		| StorageRecordValue::String(_)
+		| StorageRecordValue::Uuid(_)
+		| StorageRecordValue::Ulid(_) => {}
+	}
+	Ok(bytes)
 }
 
 impl StorageAtomRef {

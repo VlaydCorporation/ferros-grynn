@@ -1,5 +1,7 @@
 //! Exact `FGDC v10` logical model and codec.
 
+/// Retained source policies and database origin for durable resume.
+mod changefeed;
 mod codec;
 /// Checked graph-owned definition descriptors.
 mod graph_index;
@@ -124,7 +126,8 @@ pub(in crate::storage) struct ClassCatalogEntry {
 /// One named graph definition and its graph-local generation bindings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct GraphCatalogEntry {
-	/// Durable incidence dependency revision; unrelated COW/checkpoint does not change it.
+	/// Durable incidence dependency revision; unrelated COW/checkpoint does not
+	/// change it.
 	pub(in crate::storage) tensor_revision: u64,
 	pub(in crate::storage) id: GraphId,
 	pub(in crate::storage) version: SchemaVersion,
@@ -197,6 +200,12 @@ pub(in crate::storage) struct FunctionCatalogEntry {
 /// Canonical `FGDC v10` payload independent of physical catalog pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct DatabaseCatalog {
+	/// Durable non-nil database origin.
+	pub(in crate::storage) database_uuid: uuid::Uuid,
+	/// Nondecreasing UTC publication time in epoch nanoseconds.
+	pub(in crate::storage) committed_at_ns: i128,
+	/// Retained source metadata independent of surviving owner schemas.
+	pub(in crate::storage) changefeeds: Vec<ChangefeedCatalogEntry>,
 	pub(in crate::storage) next_graph_id: u64,
 	pub(in crate::storage) next_schema_id: u64,
 	pub(in crate::storage) time_zones: Vec<Text>,
@@ -206,6 +215,46 @@ pub(in crate::storage) struct DatabaseCatalog {
 	pub(in crate::storage) parameters: Vec<ParameterCatalogEntry>,
 	pub(in crate::storage) functions: Vec<FunctionCatalogEntry>,
 	pub(in crate::storage) analyzers: Vec<AnalyzerCatalogEntry>,
+}
+
+/// One retained feed descriptor, independent of a surviving source schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::storage) struct ChangefeedCatalogEntry {
+	/// Stable retained source incarnation.
+	pub(in crate::storage) id: crate::changefeed::ChangefeedId,
+	/// Stable owning class or graph identity.
+	pub(in crate::storage) source: crate::changefeed::ChangefeedSource,
+	/// Historical owner name.
+	pub(in crate::storage) name: Text,
+	/// Latest validated capture policy.
+	pub(in crate::storage) config: crate::changefeed::ChangefeedConfig,
+	/// Active, stopped, or retired owner state.
+	pub(in crate::storage) state: crate::changefeed::ChangefeedState,
+	/// Checked descriptor revision.
+	pub(in crate::storage) version: SchemaVersion,
+	/// Commit creating this retained incarnation.
+	pub(in crate::storage) defined_at: u64,
+	/// Commit publishing the latest capture policy.
+	pub(in crate::storage) published_at: u64,
+	/// Latest recorded history commit, or zero.
+	pub(in crate::storage) last_stamp: u64,
+	/// Durable unavailable-prefix floor, or zero.
+	pub(in crate::storage) purged_through: u64,
+	/// Trusted UTC time of the final removed commit, or zero before purging.
+	pub(in crate::storage) purged_time_ns: i128,
+	/// First live group page in the first retained segment, or zero.
+	pub(in crate::storage) retained_page: u64,
+	/// Expired groups preceding that page, or zero.
+	pub(in crate::storage) retained_groups: u64,
+	/// Commit stopping capture or removing its owner.
+	pub(in crate::storage) closed_at: Option<u64>,
+	/// UTC time closing this source; absent while active.
+	pub(in crate::storage) closed_time_ns: Option<i128>,
+	/// Historical policies sorted by inclusive start stamp.
+	pub(in crate::storage) epochs: Vec<crate::changefeed::ChangefeedCaptureEpoch>,
+	/// Sorted immutable segment references, including trusted stamp/time
+	/// bounds.
+	pub(in crate::storage) segments: Vec<crate::storage::ChangefeedSegment>,
 }
 
 impl DatabaseCatalog {

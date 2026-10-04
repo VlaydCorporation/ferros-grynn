@@ -8,6 +8,9 @@ mod base_statistics;
 #[cfg(feature = "storage-engine-prototype-api")]
 mod buffer_pool;
 mod catalog;
+/// Checked changefeed group framing; publication is owned by the local store.
+mod changefeed;
+pub(crate) use changefeed::{ChangefeedGroupInfo, ChangefeedSegment, ChangefeedSegments};
 mod consts;
 mod database_superblock;
 mod derived_index;
@@ -62,6 +65,7 @@ mod wal;
 use direct_io as direct;
 pub(crate) use fulltext_index_delta::FulltextDeltaRecord;
 pub(crate) use local_store::{
+	LocalChangefeedSnapshot,
 	LocalQuerySnapshot,
 	LocalStore,
 	PhysicalIndexAtom,
@@ -76,6 +80,8 @@ pub(crate) use local_store::{
 pub use page_io::PageIoMode;
 pub(crate) use quarantine::{QuarantineArchiveReader, QuarantineArtifact, QuarantineWriter};
 pub(crate) use vector_index::VectorSearchHit;
+#[cfg(test)]
+pub(crate) use wal::{CommitFailureGuard, CommitFailurePoint};
 
 #[cfg(feature = "storage-engine-prototype-api")]
 #[doc(hidden)]

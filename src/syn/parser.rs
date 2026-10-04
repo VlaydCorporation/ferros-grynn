@@ -180,32 +180,7 @@ impl Parser<'_> {
 				context.run(|context| self.build_graph_statement(context)).await?,
 			)
 		} else if self.consume_keyword(keywords::DEFINE).is_some() {
-			if self.at_function_definition() {
-				StatementKind::DefineFunction(
-					context.run(|context| self.define_function_statement(context)).await?,
-				)
-			} else if self.consume_keyword(keywords::ANALYZER).is_some() {
-				StatementKind::DefineAnalyzer(
-					context.run(|context| self.define_analyzer_statement(context)).await?,
-				)
-			} else if self.consume_keyword(keywords::PARAM).is_some() {
-				StatementKind::DefineParameter(
-					context.run(|context| self.define_parameter_statement(context)).await?,
-				)
-			} else if self.consume_keyword(keywords::GRAPH).is_some() {
-				StatementKind::DefineGraph(
-					context.run(|context| self.define_graph_statement(context)).await?,
-				)
-			} else if self.consume_keyword(keywords::CLASS).is_some() {
-				StatementKind::DefineClass(self.define_class_statement()?)
-			} else if self.consume_keyword(keywords::FIELD).is_some() {
-				StatementKind::DefineField(self.define_field_statement()?)
-			} else if self.consume_keyword(keywords::INDEX).is_some() {
-				self.define_index_statement()?
-			} else {
-				let feature = self.current_word().unwrap_or("DEFINE target");
-				return Err(self.unsupported(feature, self.current().span));
-			}
+			context.run(|context| self.definition_statement(context)).await?
 		} else if self.consume_keyword(keywords::CREATE).is_some() {
 			StatementKind::Create(context.run(|context| self.create_statement(context)).await?)
 		} else if self.consume_keyword(keywords::ATTACH).is_some() {
@@ -242,6 +217,10 @@ impl Parser<'_> {
 			}
 		} else if self.consume_keyword(keywords::INFO).is_some() {
 			StatementKind::Info(self.info_statement()?)
+		} else if self.consume_keyword(keywords::SHOW).is_some() {
+			StatementKind::ShowChanges(
+				context.run(|context| self.show_changes_statement(context)).await?,
+			)
 		} else if self.consume_keyword(keywords::LET).is_some() {
 			StatementKind::Let(context.run(|context| self.let_statement(context)).await?)
 		} else if self.consume_keyword(keywords::OPTIONAL).is_some() {
@@ -267,7 +246,22 @@ impl Parser<'_> {
 			}) => statement.timeout.take(),
 			_ => None,
 		};
-		let timeout = if embedded_timeout.is_some() {
+		let timeout = self.statement_timeout(&kind, embedded_timeout)?;
+		let end = self.previous_span();
+		Ok(Statement {
+			kind,
+			span: cover(start, end),
+			timeout,
+		})
+	}
+
+	/// Resolves the ordinary statement timeout after the statement body.
+	fn statement_timeout(
+		&mut self,
+		kind: &StatementKind,
+		embedded_timeout: Option<TimeoutValue>,
+	) -> FerrosGrynnResult<Option<TimeoutValue>> {
+		Ok(if embedded_timeout.is_some() {
 			embedded_timeout
 		} else if self.consume_keyword(keywords::TIMEOUT).is_some() {
 			if matches!(kind, StatementKind::Match(_)) {
@@ -288,6 +282,7 @@ impl Parser<'_> {
 					| StatementKind::Select(_)
 					| StatementKind::Match(_)
 					| StatementKind::Traverse(_)
+					| StatementKind::ShowChanges(_)
 			) {
 				return Err(
 					self.syntax("TIMEOUT is not valid for this statement.", self.previous_span())
@@ -296,12 +291,6 @@ impl Parser<'_> {
 			Some(self.timeout_value()?)
 		} else {
 			None
-		};
-		let end = self.previous_span();
-		Ok(Statement {
-			kind,
-			span: cover(start, end),
-			timeout,
 		})
 	}
 
@@ -1355,6 +1344,33 @@ mod tests {
 	}
 
 	#[test]
+	fn changefeed_clauses_and_history_reads_have_checked_statement_boundaries()
+	-> FerrosGrynnResult<()> {
+		let program = parse(
+			"DEFINE CLASS item TYPE NODE CHANGEFEED 7d INCLUDE ORIGINAL FULL; DEFINE GRAPH scope \
+			 TYPE GRAPH CHANGEFEED 1h FULL; ALTER CLASS item DROP CHANGEFEED; ALTER GRAPH scope \
+			 CHANGEFEED 2d; SHOW CHANGES FOR GRAPH $graph SINCE $cursor FULL LIMIT 2; INFO FOR \
+			 CHANGEFEED $id;",
+			ParserSettings::default(),
+		)?;
+		assert_eq!(program.statements.len(), 6);
+		assert!(matches!(program.statements[4].kind, StatementKind::ShowChanges(_)));
+		for query in [
+			"DEFINE CLASS item TYPE NODE CHANGEFEED $ttl;",
+			"DEFINE CLASS item TYPE NODE CHANGEFEED 7d FULL FULL;",
+			"DEFINE GRAPH scope TYPE GRAPH CHANGEFEED 7d CHANGEFEED 1d;",
+			"ALTER GRAPH scope CHANGEFEED 1d INCLUDE ORIGINAL INCLUDE ORIGINAL;",
+			"SHOW CHANGES FOR CLASS item;",
+			"SHOW CHANGES FOR CLASS item SINCE 0 FULL FULL;",
+			"SHOW CHANGES FOR CLASS item SINCE 0 LIMIT 1 FULL;",
+			"SHOW CHANGES FOR CLASS item SINCE 0 LIMIT;",
+		] {
+			assert!(parse(query, ParserSettings::default()).is_err(), "{query}");
+		}
+		Ok(())
+	}
+
+	#[test]
 	fn reports_unsupported_statement_and_unclosed_delimiter() {
 		let transaction = parse("BEGIN; COMMIT;", ParserSettings::default())
 			.expect("transaction statements belong to the executable stage-11 profile");
@@ -1833,8 +1849,9 @@ mod tests {
 		)
 		.expect_err("HNSW requires a dimension");
 		let alter_graph = parse("ALTER GRAPH social", ParserSettings::default())
-			.expect_err("ALTER GRAPH has no approved semantics");
-		assert_eq!(alter_graph.status().code().to_string(), "FG-50F03");
+			.expect_err("ALTER GRAPH requires a capture action");
+		assert_eq!(alter_graph.status().code().to_string(), "FG-42001");
+		assert!(parse("ALTER GRAPH social CHANGEFEED 7d FULL", ParserSettings::default()).is_ok());
 		assert!(parse("DEFINE TABLE user TYPE NODE", ParserSettings::default()).is_err());
 		assert!(
 			parse(

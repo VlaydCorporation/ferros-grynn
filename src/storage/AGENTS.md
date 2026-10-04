@@ -30,11 +30,20 @@
 - `hybrid_engine` — R8 Atomic Arena, source locators, read scopes, router,
   transient budget, scatter/P1 и sparse IoRing;
 - `buffer_pool` — прежний Clock-Pro, доступный только тестам и prototype-control;
-- `page_manager` — staged/WAL/home resolution и production HybridReadEngine;
+- `image_io` — staged/WAL/home resolution через production HybridReadEngine;
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
 - `catalog` — `FGFC v6` physical registry и bounded `FGDC v10` page-chain;
 - `job_catalog` — checksummed metadata-COW `FGJB v1` с `main/.prev` recovery;
 - `quarantine` — immutable streaming `FGQR v1`; файл не является positional page source;
+- `changefeed` — explicit `FCFS`/`FCFE` pages, `FGCB` whole-commit NET/FULL payload,
+  independent historical dictionaries и inverse before-diffs. `.fcf` имеет kind
+  `Changefeed=0x17`, database-only `WalBackfilled`; publication остаётся в local_store.
+  Purge floor и file unreference публикуются до unlink. Partial first segment
+  сохраняет physical bounds; retained_page/groups задают доступный prefix.
+  Weak registry maps всех смен generations защищают `.fcf` от удаления до
+  освобождения pinned readers; cleanup attempts ограничены и повторяются idle worker.
+  Codec admission учитывает owned runtime conversion, geometry validation scratch
+  и complete B-tree nodes. Filled AlignedPage строятся в окончательных slots.
 - `atom_store_superblock` — exact database-global AtomStore ceilings/counts и checkpoint tuple;
 - `property_dictionary` — append-only database-global `PropertyKeyId ↔ UTF-8` pages и hash lookup;
 - `metadata_cow` — общий checkpoint-протокол `.tmp`/main/`.prev`, не используемый обычным commit;
@@ -128,6 +137,11 @@
   учитывает encoding reservation ровно один раз и отдельно проверяет все stored cells.
 
 ## Проверка
+
+Changefeed `.fcf` — WalBackfilled pages; primary/feed/catalog публикуются одним
+TxHandle. Catalog bounds авторитетны независимо от доступности segment bytes.
+Dedicated history snapshots удерживают WAL visibility и shared file handles;
+optional segment corruption даёт GAP, resource/catalog failures остаются errors.
 
 Минимум для изменения: узкий unit/integration test владельца, `cargo check
 --lib --no-default-features`, `cargo +nightly fmt --check`. Для WAL/page/layout

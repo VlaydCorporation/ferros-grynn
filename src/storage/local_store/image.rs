@@ -157,6 +157,11 @@ impl BuiltGeneration {
 				path: CatalogPath::parse(&format!("admin/quarantine/{id}.fgq"))?,
 			});
 		}
+		self.refresh_catalogs()
+	}
+
+	/// Replaces both staged catalog chains after adding retained side files.
+	pub(super) fn refresh_catalogs(&mut self) -> FerrosGrynnResult<()> {
 		self.file_catalog.files.sort_unstable_by_key(|entry| (entry.space_id, entry.file_id));
 		self.file_catalog.encode()?;
 		self.files.retain(|image| image.entry.file_id.kind() != Some(DataFileKind::SystemCatalog));
@@ -1338,7 +1343,7 @@ fn merge_streamed_images(
 	Ok(())
 }
 
-fn append_catalog_pages(
+pub(super) fn append_catalog_pages(
 	files: &mut Vec<FileImage>,
 	file_catalog: &FileCatalog,
 	database_catalog: &DatabaseCatalog,

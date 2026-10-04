@@ -841,6 +841,25 @@ impl Transaction {
 		Ok(snapshot.root.schema.classes().map(|class| class.as_ref().clone()).collect())
 	}
 
+	/// Visits transaction-visible function definitions in stable identity
+	/// order.
+	///
+	/// # Errors
+	///
+	/// Returns snapshot expiry or the visitor's bounded admission error.
+	pub(crate) fn query_visit_schema_functions(
+		&self,
+		snapshot: &QuerySnapshot,
+		visitor: &mut dyn FnMut(&crate::datastore::SchemaFunction) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<()> {
+		self.ensure_live()?;
+		self.record_read(crate::datastore::ConflictKey::FunctionCatalogRange);
+		for function in snapshot.root.schema.functions() {
+			visitor(function)?;
+		}
+		Ok(())
+	}
+
 	pub(crate) fn query_schema_functions(
 		&self,
 		snapshot: &QuerySnapshot,

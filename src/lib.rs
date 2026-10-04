@@ -1,4 +1,5 @@
 // mod common;
+pub mod changefeed;
 mod collections;
 pub mod datastore;
 pub mod ecs;

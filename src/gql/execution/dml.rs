@@ -88,6 +88,14 @@ pub(super) fn execute_dml(
 		let schema = transaction.query_class(snapshot, &target.class)?;
 		let affected = candidate.exists()
 			|| matches!(statement.kind, LogicalDmlKind::Create | LogicalDmlKind::Upsert);
+		let intent_start = transaction.change_intent_count();
+		let mutation_start = transaction.mutation_count();
+		if candidate.exists() {
+			transaction.note_dml_change_target(
+				&candidate.record_id,
+				statement.graph.as_ref().map(GraphRef::id),
+			)?;
+		}
 		let after = apply_dml_candidate(
 			transaction,
 			statement,
@@ -99,6 +107,9 @@ pub(super) fn execute_dml(
 			&dictionary,
 			control,
 		)?;
+		if candidate.exists() && transaction.mutation_count() == mutation_start {
+			transaction.mark_change_noops(intent_start);
+		}
 		if affected
 			&& !returns_none
 			&& let Some(value) = dml_return_value(

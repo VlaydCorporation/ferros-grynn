@@ -86,6 +86,20 @@ impl CanonicalCodec {
 		Ok(value)
 	}
 
+	/// Returns the decoder's admitted allocation for a caller sharing an
+	/// aggregate budget across multiple canonical values.
+	pub(crate) fn decode_with_allocation(
+		bytes: &[u8],
+		limits: DecodeLimits,
+	) -> FerrosGrynnResult<(StorageValue, usize)> {
+		let mut decoder = decode::Decoder::new(bytes, limits);
+		let value = decoder.decode_value(0)?;
+		if decoder.position != bytes.len() {
+			return Err(invalid(decoder.position, "trailing bytes after StorageValue"));
+		}
+		Ok((value, decoder.allocated))
+	}
+
 	/// Decodes one self-delimiting value from the beginning of a larger
 	/// canonical record.
 	pub(crate) fn decode_prefix(

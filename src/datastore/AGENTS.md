@@ -132,6 +132,22 @@ metadata-COW только ради progress запрещён, поскольку
 
 ## Проверка
 
+Changefeed capture использует final policy, compact operation journal и единый
+ReplayRemap; NET/FULL images не восстанавливаются из текущих primary records.
+ON import удерживает один admitted before-root и accepted-item journal на private
+segment. Seal переносит replay images в bounded spool до очистки mutations.
+Transient replay/journal charges не накапливаются в retained spool; fatal seal
+error отравляет import session и запрещает END. OFF сохраняет компактные intents.
+`Transaction::changes` читает committed root, исключает private writes, проверяет
+historical FULL coverage до row pull. History pin не сканирует graph bindings.
+Changefeed catalog/history/segment handles сгруппированы одним immutable root
+binding, но сохраняют независимый inner COW. Read accessors не отделяют root;
+mutable accessors сначала отделяют binding, затем только выбранную map.
+Maintenance сравнивает catalog, а dedicated WAL/file pins живут отдельно.
+Retention публикует prefix floor и partial-segment position catalog-only под
+тем же commit lock/WAL barrier. Один worker просыпается для idle TTL; private
+import lease блокирует purge publication. Active source сохраняет пустой floor.
+
 Проверять focused schema/value/root/transaction/query tests, RAM/local parity,
 reopen/recovery в обеих I/O feature-конфигурациях и effective-index/predicate
 regressions. Ошибка commit никогда не должна менять опубликованный root.

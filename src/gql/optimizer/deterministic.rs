@@ -170,6 +170,25 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 			root.as_ref().is_some_and(expr_contains_impure)
 				|| content.as_ref().is_some_and(expr_contains_impure)
 		}
+		LogicalSchemaStatement::InfoChangefeed {
+			id,
+			..
+		} => expr_contains_impure(id),
+		LogicalSchemaStatement::ShowChanges {
+			target,
+			since,
+			limit,
+			..
+		} => {
+			let target = match target {
+				crate::gql::ir::LogicalChangefeedTarget::Named(_) => false,
+				crate::gql::ir::LogicalChangefeedTarget::Graph(value)
+				| crate::gql::ir::LogicalChangefeedTarget::Id(value) => expr_contains_impure(value),
+			};
+			target
+				|| expr_contains_impure(since)
+				|| limit.as_ref().is_some_and(expr_contains_impure)
+		}
 		LogicalSchemaStatement::UpdateGraph {
 			mutation,
 			returning,
@@ -229,6 +248,9 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 			..
 		}
 		| LogicalSchemaStatement::AlterClassMode {
+			..
+		}
+		| LogicalSchemaStatement::AlterChangefeed {
 			..
 		}
 		| LogicalSchemaStatement::AlterFieldType {

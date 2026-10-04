@@ -332,7 +332,10 @@ fn validate_job_target(
 				| MaintenanceTarget::EffectiveClass { .. }
 				| MaintenanceTarget::Graph(_)
 		) | (MaintenanceJobKind::CompactGraph, MaintenanceTarget::Graph(_))
-			| (MaintenanceJobKind::CompactDatabase, MaintenanceTarget::Database)
+			| (
+				MaintenanceJobKind::CompactDatabase | MaintenanceJobKind::PurgeChangefeed,
+				MaintenanceTarget::Database
+			)
 	);
 	if compatible {
 		Ok(())
@@ -411,6 +414,7 @@ const fn kind_byte(kind: MaintenanceJobKind) -> u8 {
 		MaintenanceJobKind::CompactIndex => 4,
 		MaintenanceJobKind::CompactGraph => 5,
 		MaintenanceJobKind::CompactDatabase => 6,
+		MaintenanceJobKind::PurgeChangefeed => 7,
 	}
 }
 
@@ -423,6 +427,7 @@ fn decode_kind(value: u8) -> FerrosGrynnResult<MaintenanceJobKind> {
 		4 => Ok(MaintenanceJobKind::CompactIndex),
 		5 => Ok(MaintenanceJobKind::CompactGraph),
 		6 => Ok(MaintenanceJobKind::CompactDatabase),
+		7 => Ok(MaintenanceJobKind::PurgeChangefeed),
 		_ => Err(invalid("job record contains an unknown kind")),
 	}
 }

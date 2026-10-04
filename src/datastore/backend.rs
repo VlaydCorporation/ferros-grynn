@@ -38,6 +38,7 @@ use crate::{
 	graph::{AtomKind, GraphId, GraphStorageMode},
 	stats::StatisticsStore,
 	storage::{
+		LocalChangefeedSnapshot,
 		LocalQuerySnapshot,
 		LocalStore,
 		PageIoMode,
@@ -64,6 +65,8 @@ pub(crate) struct StoreInner {
 	pub(crate) query_scratch_root: PathBuf,
 	pub(crate) quarantines: Mutex<BTreeMap<Uuid, PathBuf>>,
 	pub(crate) maintenance: MaintenanceCoordinator,
+	/// Diagnostic capture/publication counts; no per-source metric labels.
+	pub(in crate::datastore) changefeed_observation: super::changefeed_observation::Counters,
 }
 
 pub(crate) enum StoreBackend {
@@ -129,7 +132,11 @@ impl StoreInner {
 		graph_catalog_only: bool,
 		dictionary_changed: bool,
 	) -> FerrosGrynnResult<()> {
-		match &self.backend {
+		if previous.is_none_or(|previous| root.committed_at_ns == previous.committed_at_ns) {
+			root.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
+		}
+		let observation = super::changefeed_observation::Publication::capture(root);
+		let result = match &self.backend {
 			StoreBackend::InMemory => {
 				root.resident_geometry = Arc::new(crate::storage::build_resident_geometry_indexes(
 					previous,
@@ -156,9 +163,16 @@ impl StoreInner {
 					dictionary_changed,
 					&mut analyze,
 					&mut distance,
-				)
+				)?;
+				*root.changefeed_segments_mut() = local.changefeed_segments();
+				*root.change_history_mut() = Arc::default();
+				Ok(())
 			}
+		};
+		if result.is_ok() {
+			self.changefeed_observation.published(observation);
 		}
+		result
 	}
 
 	pub(crate) fn persist_import_root(
@@ -166,7 +180,11 @@ impl StoreInner {
 		root: &mut DatabaseRoot,
 		quarantine: Option<&mut QuarantineArtifact>,
 	) -> FerrosGrynnResult<BTreeMap<super::IndexId, std::time::Duration>> {
-		match &self.backend {
+		if root.committed_at_ns == self.current_root().committed_at_ns {
+			root.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
+		}
+		let observation = super::changefeed_observation::Publication::capture(root);
+		let result = match &self.backend {
 			StoreBackend::InMemory => {
 				root.resident_geometry =
 					Arc::new(crate::storage::build_resident_geometry_indexes(None, root, None)?);
@@ -188,9 +206,17 @@ impl StoreInner {
 				                    right: &Vector| {
 					evaluator.distance(function, version, left, right)
 				};
-				local.persist_import_root(root, quarantine, &mut analyze, &mut distance)
+				let timings =
+					local.persist_import_root(root, quarantine, &mut analyze, &mut distance)?;
+				*root.changefeed_segments_mut() = local.changefeed_segments();
+				*root.change_history_mut() = Arc::default();
+				Ok(timings)
 			}
+		};
+		if result.is_ok() {
+			self.changefeed_observation.published(observation);
 		}
+		result
 	}
 
 	pub(crate) fn open_quarantine(&self, id: Uuid) -> FerrosGrynnResult<QuarantineArchiveReader> {
@@ -229,6 +255,7 @@ impl StoreInner {
 						"quarantine removal commit clock is exhausted",
 					)
 				})?;
+				next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
 				let evaluator = PureFunctionEvaluator::new(&next);
 				let mut analyze =
 					|analyzer: &SchemaAnalyzer, input: &str| evaluator.analyze(analyzer, input);
@@ -443,13 +470,27 @@ impl StoreInner {
 				let publication = snapshot.commit_ts.checked_add(1).ok_or_else(|| {
 					FerrosGrynnError::invalid_argument("maintenance commit clock is exhausted")
 				})?;
-				let mut next = self.build_maintenance_candidate(
+				let candidate = self.build_maintenance_candidate(
 					&snapshot,
 					job.kind,
 					job.target,
 					publication,
 					job.analyze_mode,
-				)?;
+				);
+				let mut next = match candidate {
+					Err(_error)
+						if job.kind == MaintenanceJobKind::PurgeChangefeed
+							&& self.current_root().commit_ts != snapshot.commit_ts =>
+					{
+						return Ok(MaintenanceRunOutcome::Retry);
+					}
+					other => other?,
+				};
+				if job.kind == MaintenanceJobKind::PurgeChangefeed
+					&& next.changefeeds() == snapshot.changefeeds()
+				{
+					return Ok(MaintenanceRunOutcome::Completed);
+				}
 				let metrics = crate::storage::external_sort_metrics();
 				self.maintenance.stage_progress(
 					id,
@@ -475,7 +516,17 @@ impl StoreInner {
 					return Ok(MaintenanceRunOutcome::Cancelled);
 				}
 				next.commit_ts = publication;
-				self.persist_root(&mut next, None, None, false, false)?;
+				if job.kind == MaintenanceJobKind::PurgeChangefeed {
+					self.ensure_write_allowed(0)?;
+					next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
+				}
+				self.persist_root(
+					&mut next,
+					None,
+					None,
+					job.kind == MaintenanceJobKind::PurgeChangefeed,
+					false,
+				)?;
 				*self.current.write() = Arc::new(next);
 				self.maintenance.acknowledge_index_changes(job.target, snapshot.commit_ts);
 				Ok(MaintenanceRunOutcome::Completed)
@@ -512,12 +563,27 @@ impl StoreInner {
 					publication,
 					analyze_mode,
 				)?;
+				if kind == MaintenanceJobKind::PurgeChangefeed
+					&& next.changefeeds() == snapshot.changefeeds()
+				{
+					return Ok(());
+				}
 				let _commit = self.commit.lock();
 				if self.current_root().commit_ts != snapshot.commit_ts {
 					return Err(FerrosGrynnError::maintenance_revision_race(target.display_name()));
 				}
 				next.commit_ts = publication;
-				self.persist_root(&mut next, None, None, false, false)?;
+				if kind == MaintenanceJobKind::PurgeChangefeed {
+					self.ensure_write_allowed(0)?;
+					next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
+				}
+				self.persist_root(
+					&mut next,
+					None,
+					None,
+					kind == MaintenanceJobKind::PurgeChangefeed,
+					false,
+				)?;
 				*self.current.write() = Arc::new(next);
 				Ok(())
 			},
@@ -532,6 +598,14 @@ impl StoreInner {
 		build_revision: u64,
 		analyze_mode: Option<super::MaintenanceAnalyzeMode>,
 	) -> FerrosGrynnResult<DatabaseRoot> {
+		if kind == MaintenanceJobKind::PurgeChangefeed {
+			if target != MaintenanceTarget::Database {
+				return Err(FerrosGrynnError::invalid_argument(
+					"changefeed purge requires a database target",
+				));
+			}
+			return self.purge_changefeed_candidate(snapshot, build_revision);
+		}
 		let mut next = snapshot.clone();
 		match kind {
 			MaintenanceJobKind::BuildIndex
@@ -559,6 +633,7 @@ impl StoreInner {
 				)?;
 			}
 			MaintenanceJobKind::CompactGraph | MaintenanceJobKind::CompactDatabase => {}
+			MaintenanceJobKind::PurgeChangefeed => {}
 		}
 		next.validate_full_import_state()?;
 		Ok(next)
@@ -568,6 +643,13 @@ impl StoreInner {
 		self.query_scratch_root.clone()
 	}
 
+	/// Retries physical unlinks after old readers release their file pins.
+	pub(super) fn sweep_retired_changefeeds(&self) {
+		if let StoreBackend::Local(local) = &self.backend {
+			local.sweep_retired_changefeeds();
+		}
+	}
+
 	pub(crate) fn capture_physical_query_snapshot(
 		&self,
 		commit_ts: u64,
@@ -575,6 +657,56 @@ impl StoreInner {
 		match &self.backend {
 			StoreBackend::InMemory => Ok(None),
 			StoreBackend::Local(local) => local.capture_query_snapshot(commit_ts),
+		}
+	}
+
+	/// Pins only feed handles and exact visibility without scanning graph
+	/// bindings.
+	pub(crate) fn capture_changefeed_snapshot(
+		&self,
+		stamp: u64,
+	) -> FerrosGrynnResult<Option<LocalChangefeedSnapshot>> {
+		match &self.backend {
+			StoreBackend::InMemory => Ok(None),
+			StoreBackend::Local(local) => local.capture_changefeed_snapshot(stamp),
+		}
+	}
+
+	/// Performs allocation-free coverage/seek metadata reads in a pinned
+	/// snapshot.
+	pub(crate) fn inspect_changefeed_group(
+		&self,
+		snapshot: &LocalChangefeedSnapshot,
+		segment: crate::storage::ChangefeedSegment,
+		first: u64,
+		memory_bytes: usize,
+	) -> FerrosGrynnResult<Option<crate::storage::ChangefeedGroupInfo>> {
+		match &self.backend {
+			StoreBackend::Local(local) => {
+				local.inspect_changefeed_group(snapshot, segment, first, memory_bytes)
+			}
+			StoreBackend::InMemory => Err(FerrosGrynnError::invalid_argument(
+				"physical changefeed read requires a local backend",
+			)),
+		}
+	}
+
+	/// Restores one owned whole commit or unavailable segment under catalog
+	/// bounds.
+	pub(crate) fn read_changefeed_batch(
+		&self,
+		snapshot: &LocalChangefeedSnapshot,
+		segment: crate::storage::ChangefeedSegment,
+		first: u64,
+		memory_bytes: usize,
+	) -> FerrosGrynnResult<Option<(super::CapturedCommit, u64)>> {
+		match &self.backend {
+			StoreBackend::Local(local) => {
+				local.read_changefeed_batch(snapshot, segment, first, memory_bytes)
+			}
+			StoreBackend::InMemory => Err(FerrosGrynnError::invalid_argument(
+				"physical changefeed read requires a local backend",
+			)),
 		}
 	}
 

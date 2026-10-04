@@ -86,6 +86,7 @@ fn explainable(statement: &StatementKind) -> bool {
 			| StatementKind::Detach(_)
 			| StatementKind::DefineGraph(_)
 			| StatementKind::DefineClass(_)
+			| StatementKind::ShowChanges(_)
 			| StatementKind::DefineField(_)
 			| StatementKind::DefineIndex(_)
 			| StatementKind::DefineGraphIndex(_)

@@ -324,8 +324,35 @@ impl Transaction {
 			child_schemas,
 			graphs,
 		};
+		for graph in mutation.graph_ids() {
+			if let Some(root) = self.working.graphs.get(&graph).cloned() {
+				for occurrence in root.occurrences() {
+					let global = occurrence.global_id();
+					self.note_change_target(
+						global,
+						Some(graph),
+						ConflictKey::GraphMembership(graph, global),
+					)?;
+				}
+			}
+		}
+		for built in &mutation.graphs {
+			for global in built
+				.nodes
+				.iter()
+				.map(|node| node.global)
+				.chain(built.edges.iter().map(|edge| edge.global))
+			{
+				self.note_change_target(
+					global,
+					Some(built.graph),
+					ConflictKey::GraphMembership(built.graph, global),
+				)?;
+			}
+		}
 		self.register_built_graph_write_set(&mutation)?;
 		mutation.apply(&mut self.working, self.snapshot.commit_ts)?;
+		self.retire_missing_changefeeds()?;
 		let reference = mutation.root_schema.reference().clone();
 		self.mutations.push(Mutation::InstallBuiltGraphTree(mutation));
 		Ok(reference)

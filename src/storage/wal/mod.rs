@@ -57,6 +57,8 @@ pub(in crate::storage) use state::{
 	VisibleFrames,
 	WalClocks,
 };
+#[cfg(test)]
+pub(crate) use writer::{CommitFailureGuard, CommitFailurePoint};
 #[allow(
 	clippy::wildcard_imports,
 	reason = "move-only WAL split keeps the existing codec and recovery helpers during stage 1"
@@ -116,7 +118,7 @@ mod tests {
 	/// First currently unassigned recovery-kind byte.
 	const TEST_UNASSIGNED_KIND: u8 = WalKind::GraphDrop.get() + 1;
 	/// First reserved format-v1 data-file kind encoded as a complete identity.
-	const TEST_RESERVED_FILE_ID: u64 = DataFileKind::ImportQuarantine.get() as u64 + 1;
+	const TEST_RESERVED_FILE_ID: u64 = DataFileKind::Changefeed.get() as u64 + 1;
 	/// Monotonic suffix for collision-resistant WAL test directories.
 	static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -161,6 +163,44 @@ mod tests {
 		page.as_bytes_mut()[PAGE_HEADER_SIZE] = marker;
 		page.seal()?;
 		Ok(page)
+	}
+
+	/// Primary, catalog and feed pages share a single admission counter. The
+	/// boundary reservation avoids allocating the remaining 256 MiB in a unit
+	/// test.
+	#[test]
+	fn changefeed_wal_cap_is_shared_with_primary_and_catalog() -> Result<(), Box<dyn Error>> {
+		let directory = TestDirectory::new()?;
+		let wal = FrameWal::create_new(directory.as_path())?;
+		let mut tx = wal.begin_tx()?;
+		let page = marked_page(0, 1)?;
+		let mut keys = Vec::new();
+		for (instance, kind) in [
+			(1, DataFileKind::Index),
+			(2, DataFileKind::SystemCatalog),
+			(3, DataFileKind::Changefeed),
+		] {
+			let file = DataFileId::new(instance, kind)
+				.ok_or_else(|| io::Error::other("test file identity invalid"))?;
+			let key = PageKey::new(DataSpaceId::Database, file, PageNo::new(0));
+			tx.stage_page(key, &page)?;
+			keys.push(key);
+		}
+		assert_eq!(tx.staged_bytes, 3 * PAGE_SIZE);
+		// Simulate previously admitted unique frames, preserving the actual
+		// staged keys to verify replacement and rejection have no
+		// write-set side effects.
+		tx.staged_bytes = MAX_TX_WRITE_BYTES;
+		tx.stage_page(keys[2], &page)?;
+		assert_eq!(tx.staged_bytes, MAX_TX_WRITE_BYTES);
+		let before = tx.staged.len();
+		let rejected = PageKey::new(DataSpaceId::Database, keys[2].file_id(), PageNo::new(1));
+		assert!(tx.stage_page(rejected, &marked_page(1, 2)?).is_err());
+		assert_eq!(tx.staged.len(), before);
+		assert_eq!(tx.staged_bytes, MAX_TX_WRITE_BYTES);
+		drop(tx);
+		assert_eq!(wal.snapshot().commit_ts().get(), 0);
+		Ok(())
 	}
 
 	/// Reads the marker from the newest frame visible to a snapshot.

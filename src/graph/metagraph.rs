@@ -389,8 +389,15 @@ pub(crate) fn validate_nested_references<R: GraphRead>(graph: &R) -> FerrosGrynn
 						"a qualified endpoint has an empty scope",
 					));
 				};
-				let is_meta = match graph.node(first)? {
-					Some(node) => node.is_meta()?,
+				let is_meta = match first.kind() {
+					Some(super::AtomKind::Node) => match graph.node(first)? {
+						Some(node) => node.is_meta()?,
+						None => false,
+					},
+					Some(super::AtomKind::Edge) => match graph.edge(first)? {
+						Some(edge) => edge.is_meta()?,
+						None => false,
+					},
 					None => false,
 				};
 				if !is_meta {

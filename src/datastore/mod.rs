@@ -4,6 +4,13 @@
 mod atom_store;
 /// Volatile/local backend ownership and policy conversion.
 mod backend;
+/// Retained source definitions independent of active class/graph lifetimes.
+mod changefeed;
+/// Payload-free process counters and snapshot-bound publication observations.
+mod changefeed_observation;
+/// Bounded TTL prefix publication and closed-source retirement.
+mod changefeed_retention;
+pub(crate) use changefeed::{CapturedCommit, ChangefeedCatalog, ChangefeedDefinition};
 /// Independently versioned MVCC conflict targets.
 mod conflict;
 /// Shared datastore constants.
@@ -57,6 +64,7 @@ pub(crate) use backend::{StoreBackend, StoreInner, validate_local_options};
 pub(crate) use conflict::ConflictKey;
 pub(crate) use identity::DataSpaceId;
 pub use import::{
+	ImportChangefeedMode,
 	ImportConstraintMode,
 	ImportIndexMode,
 	ImportItemOutcome,

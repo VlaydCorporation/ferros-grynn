@@ -142,6 +142,7 @@ pub(super) fn open_local_state(
 		CatalogKind::Database,
 	)
 	.and_then(|bytes| DatabaseCatalog::decode(&bytes))?;
+	super::changefeed::validate_recovered(&database_catalog, snapshot.commit_ts().get())?;
 	#[cfg(test)]
 	let catalog = catalog_started.elapsed();
 	#[cfg(test)]
@@ -149,8 +150,9 @@ pub(super) fn open_local_state(
 	let registry = FileRegistry::open(
 		file_catalog.registrations(root_path),
 		open_mode,
-		&RapidHashSet::default(),
+		&super::changefeed::degradable(&file_catalog),
 	)?;
+	drop(super::changefeed::bind_files(&file_catalog, &database_catalog, &registry)?);
 	#[cfg(test)]
 	let registry_duration = registry_started.elapsed();
 	#[cfg(test)]
@@ -175,6 +177,11 @@ pub(super) fn open_local_state(
 
 	let mut database = DatabaseRoot::default();
 	database.commit_ts = snapshot.commit_ts().get();
+	database.database_uuid = database_catalog.database_uuid;
+	database.committed_at_ns = database_catalog.committed_at_ns;
+	*database.changefeeds_mut() = Arc::new(super::catalog::decode_changefeeds(&database_catalog));
+	*database.changefeed_segments_mut() =
+		super::catalog::decode_changefeed_segments(&database_catalog);
 	database.schema = Arc::new(schema);
 	database.dictionary = Arc::new(dictionary);
 	database.atoms = Arc::new(atoms);

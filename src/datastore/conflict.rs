@@ -37,4 +37,8 @@ pub(crate) enum ConflictKey {
 	GraphClassRange(GraphId, ClassId),
 	/// MATCH candidate/topology set for one graph-local atom kind.
 	GraphKindRange(GraphId, AtomKind),
+	/// Capture policy of one class or graph source.
+	ChangefeedDefinition(crate::changefeed::ChangefeedSource),
+	/// Retained source namespace observed by historical name/id lookup.
+	ChangefeedCatalogRange,
 }

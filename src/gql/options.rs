@@ -168,6 +168,9 @@ pub(crate) struct ExecutionControl {
 	statement_nonce: u64,
 	publication_deferred: bool,
 	instrumentation: bool,
+	/// Optional counters scoped to one ANALYZE execution and its child
+	/// controls.
+	changefeed: Option<Arc<[AtomicU64; 9]>>,
 }
 
 #[derive(Debug, Default)]
@@ -512,6 +515,7 @@ impl ExecutionControl {
 			statement_nonce: next_statement_nonce(),
 			publication_deferred: false,
 			instrumentation: false,
+			changefeed: None,
 		}
 	}
 
@@ -602,8 +606,10 @@ impl ExecutionControl {
 		self
 	}
 
-	pub(crate) const fn with_instrumentation(mut self) -> Self {
+	/// Opens one independent actual-observation scope for EXPLAIN ANALYZE.
+	pub(crate) fn with_instrumentation(mut self) -> Self {
 		self.instrumentation = true;
+		self.changefeed = Some(Arc::new(std::array::from_fn(|_| AtomicU64::new(0))));
 		self
 	}
 
@@ -701,6 +707,7 @@ impl ExecutionControl {
 			statement_nonce: self.statement_nonce,
 			publication_deferred: self.publication_deferred,
 			instrumentation: self.instrumentation,
+			changefeed: self.changefeed.clone(),
 		}
 	}
 
@@ -822,6 +829,41 @@ impl ExecutionControl {
 	pub(crate) fn neighbourhood_metrics(&self) -> [u64; 4] {
 		std::array::from_fn(|index| {
 			self.barrier_memory.neighbourhood[index].load(Ordering::Acquire)
+		})
+	}
+
+	/// Records one completed history reader using bounded-cardinality scalar
+	/// counters.
+	pub(crate) fn record_changefeed(
+		&self,
+		statistics: crate::changefeed::ChangefeedReadStatistics,
+	) {
+		let Some(counters) = &self.changefeed else {
+			return;
+		};
+		let values = [
+			statistics.batches,
+			statistics.entries,
+			statistics.gaps,
+			statistics.groups_inspected,
+			statistics.page_reads,
+			statistics.bytes_read,
+			statistics.segment_visits,
+			statistics.work,
+		];
+		for (counter, value) in counters.iter().zip(values) {
+			let _previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+				Some(current.saturating_add(value))
+			});
+		}
+		counters[8].fetch_max(statistics.peak_scratch_bytes, Ordering::Relaxed);
+	}
+
+	/// Returns cumulative logical reader counters and the admitted scratch
+	/// peak.
+	pub(crate) fn changefeed_metrics(&self) -> [u64; 9] {
+		self.changefeed.as_ref().map_or([0; 9], |counters| {
+			std::array::from_fn(|index| counters[index].load(Ordering::Acquire))
 		})
 	}
 

@@ -243,6 +243,7 @@ impl Parser<'_> {
 			&& !self.at_statement_end()
 			&& !self.at_keyword(keywords::ROOT)
 			&& !self.at_keyword(keywords::CONTENT)
+			&& !self.at_keyword(keywords::CHANGEFEED)
 		{
 			let token = self.tokens.next();
 			let TokenKind::Word {

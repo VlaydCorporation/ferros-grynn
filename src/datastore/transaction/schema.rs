@@ -843,6 +843,12 @@ impl Transaction {
 	/// Returns an error when the class is absent, owns atoms, or mutation
 	/// policy rejects the operation.
 	pub fn remove_class(&mut self, name: &str) -> FerrosGrynnResult<()> {
+		self.atomic_mutation(|transaction| transaction.remove_class_inner(name))
+	}
+
+	/// Removes an owner and its retained-source policy as one fallible
+	/// mutation.
+	fn remove_class_inner(&mut self, name: &str) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let class = self.require_class(name)?;
@@ -850,6 +856,7 @@ impl Transaction {
 			FerrosGrynnError::invalid_argument("published class is missing ClassId")
 		})?;
 		self.working.remove_class(id)?;
+		self.retire_missing_changefeeds()?;
 		self.write_bytes += SCHEMA_WRITE_BYTES;
 		self.mutations.push(Mutation::RemoveClass(id));
 		Ok(())
@@ -862,6 +869,12 @@ impl Transaction {
 	/// Returns an error when the graph is absent or mutation policy rejects the
 	/// operation.
 	pub fn remove_graph(&mut self, name: &str) -> FerrosGrynnResult<()> {
+		self.atomic_mutation(|transaction| transaction.remove_graph_inner(name))
+	}
+
+	/// Removes a graph tree and its retained policies without partial private
+	/// writes.
+	fn remove_graph_inner(&mut self, name: &str) -> FerrosGrynnResult<()> {
 		self.prepare_schema_mutation()?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		let graph = self
@@ -880,6 +893,7 @@ impl Transaction {
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
 		self.working.remove_graph(graph)?;
+		self.retire_missing_changefeeds()?;
 		self.insert_write(ConflictKey::GraphDefinition(graph), 0);
 		self.mark_range_change(ConflictKey::GraphCatalogRange);
 		for (class, kind) in ranges {

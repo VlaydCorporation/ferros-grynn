@@ -36,6 +36,12 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct DatabaseRoot {
 	pub(crate) commit_ts: u64,
+	/// Persistent origin for portable changefeed cursors.
+	pub(crate) database_uuid: uuid::Uuid,
+	/// Nondecreasing UTC publication time in exact epoch nanoseconds.
+	pub(crate) committed_at_ns: i128,
+	/// One shared changefeed binding, with selective inner copy-on-write maps.
+	changefeed: Arc<ChangefeedRoot>,
 	pub(crate) schema: Arc<SchemaCatalog>,
 	pub(crate) dictionary: Arc<PropertyDictionary>,
 	pub(crate) atoms: Arc<AtomStoreRoot>,
@@ -54,6 +60,21 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphRoot>>,
 	pub(crate) versions: Arc<BTreeMap<ConflictKey, u64>>,
 }
+
+/// Snapshot-owned changefeed state cloned as one handle by ordinary reads.
+#[derive(Clone, Default)]
+struct ChangefeedRoot {
+	/// Definitions survive removal of the current schema owner.
+	catalog: Arc<super::ChangefeedCatalog>,
+	/// RAM history is independent of primary records and physical segments.
+	history: ChangeHistory,
+	/// Durable bounds do not load historical images.
+	segments: crate::storage::ChangefeedSegments,
+}
+
+/// Shared logical batches retained independently of the outer snapshot binding.
+type ChangeHistory =
+	Arc<BTreeMap<(crate::changefeed::ChangefeedId, u64), Arc<super::CapturedCommit>>>;
 
 /// Complete normalized-state violations collected for `ASSERT INVARIANTS`.
 pub(crate) struct InvariantViolationReport {
@@ -115,6 +136,9 @@ impl Default for DatabaseRoot {
 	fn default() -> Self {
 		Self {
 			commit_ts: 0,
+			database_uuid: uuid::Uuid::now_v7(),
+			committed_at_ns: 0,
+			changefeed: Arc::default(),
 			schema: Arc::new(SchemaCatalog::default()),
 			dictionary: Arc::new(PropertyDictionary::new()),
 			atoms: Arc::new(AtomStoreRoot::default()),
@@ -132,6 +156,112 @@ impl Default for DatabaseRoot {
 }
 
 impl DatabaseRoot {
+	/// Borrows definitions from this exact logical root.
+	#[inline]
+	pub(crate) fn changefeeds(&self) -> &Arc<super::ChangefeedCatalog> {
+		&self.changefeed.catalog
+	}
+
+	/// Detaches the outer binding before selective catalog COW.
+	#[inline]
+	pub(crate) fn changefeeds_mut(&mut self) -> &mut Arc<super::ChangefeedCatalog> {
+		&mut Arc::make_mut(&mut self.changefeed).catalog
+	}
+
+	/// Borrows RAM batches without copying their images.
+	#[inline]
+	pub(crate) fn change_history(&self) -> &ChangeHistory {
+		&self.changefeed.history
+	}
+
+	/// Detaches the binding before selective RAM-history COW.
+	#[inline]
+	pub(crate) fn change_history_mut(&mut self) -> &mut ChangeHistory {
+		&mut Arc::make_mut(&mut self.changefeed).history
+	}
+
+	/// Borrows durable segment references from the same binding.
+	#[inline]
+	pub(crate) fn changefeed_segments(&self) -> &crate::storage::ChangefeedSegments {
+		&self.changefeed.segments
+	}
+
+	/// Detaches the binding before selective segment-table COW.
+	#[inline]
+	pub(crate) fn changefeed_segments_mut(&mut self) -> &mut crate::storage::ChangefeedSegments {
+		&mut Arc::make_mut(&mut self.changefeed).segments
+	}
+
+	/// Records UTC time without allowing a host clock rollback to reverse it.
+	pub(crate) fn advance_commit_time(&mut self, observed_ns: i128) {
+		self.committed_at_ns = self.committed_at_ns.max(observed_ns);
+		if self
+			.changefeeds()
+			.definitions
+			.values()
+			.any(|entry| entry.closed_at == Some(self.commit_ts) && entry.closed_time_ns.is_none())
+		{
+			let commit_ts = self.commit_ts;
+			let committed_at_ns = self.committed_at_ns;
+			for entry in Arc::make_mut(self.changefeeds_mut()).definitions.values_mut() {
+				if entry.closed_at == Some(commit_ts) && entry.closed_time_ns.is_none() {
+					Arc::make_mut(entry).closed_time_ns = Some(committed_at_ns);
+				}
+			}
+		}
+	}
+
+	/// Retains descriptors after their source owner disappears in this root.
+	pub(crate) fn retire_missing_changefeeds(
+		&mut self,
+		published_at: u64,
+	) -> FerrosGrynnResult<Vec<crate::changefeed::ChangefeedSource>> {
+		let sources = self
+			.changefeeds()
+			.definitions
+			.values()
+			.filter(|entry| {
+				entry.state != crate::changefeed::ChangefeedState::Retired
+					&& match entry.source {
+						crate::changefeed::ChangefeedSource::Class(class) => {
+							self.schema.class_by_id(class).is_none()
+						}
+						crate::changefeed::ChangefeedSource::Graph(graph) => {
+							self.schema.graph(graph).is_none()
+						}
+					}
+			})
+			.map(|entry| entry.id)
+			.collect::<Vec<_>>();
+		let updates = sources
+			.into_iter()
+			.map(|id| {
+				let mut definition = self
+					.changefeeds()
+					.definitions
+					.get(&id)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("retained changefeed disappeared")
+					})?
+					.as_ref()
+					.clone();
+				definition.version = definition.version.next()?;
+				definition.state = crate::changefeed::ChangefeedState::Retired;
+				definition.published_at = published_at;
+				definition.closed_at = Some(published_at);
+				definition.closed_time_ns = None;
+				definition.set_capture_epoch(published_at, None)?;
+				Ok((id, Arc::new(definition)))
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let mut changed = Vec::with_capacity(updates.len());
+		for (id, definition) in updates {
+			changed.push(definition.source);
+			Arc::make_mut(self.changefeeds_mut()).definitions.insert(id, definition);
+		}
+		Ok(changed)
+	}
+
 	/// Checks geometry constraints owned by a published class in one scope.
 	fn validate_geometry_values<'value>(
 		&self,
@@ -304,8 +434,12 @@ impl DatabaseRoot {
 			self.indexes.prepare_base_replace(&before, &after, &memberships, &mut context)?;
 		let mut indexes = self.indexes.as_ref().clone();
 		indexes.apply_replace(prepared)?;
-		let mut atoms = self.atoms.as_ref().clone();
-		let atom = atoms
+		let mut statistics = self.statistics.as_ref().clone();
+		statistics.replace_base_property(&before, &after, key, &memberships)?;
+		// Complete fallible derived-state preparation before mutating primary
+		// state. A unique private root can reuse its registry across setters;
+		// shared snapshot/savepoint roots still detach through copy-on-write.
+		let atom = Arc::make_mut(&mut self.atoms)
 			.atom_mut(global)
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("global", global.to_string()))?;
 		match value {
@@ -316,10 +450,7 @@ impl DatabaseRoot {
 				atom.properties_mut().remove(key);
 			}
 		}
-		let mut statistics = self.statistics.as_ref().clone();
-		statistics.replace_base_property(&before, &after, key, &memberships)?;
 		self.indexes = Arc::new(indexes);
-		self.atoms = Arc::new(atoms);
 		self.statistics = Arc::new(statistics);
 		if before != after {
 			self.invalidate_path_cost_artifacts(None, false);
@@ -1339,6 +1470,47 @@ mod tests {
 	fn graph(id: u64, name: &str) -> GraphRef {
 		GraphRef::new(GraphId::new(id).unwrap(), name, GraphKind::Graph, GraphStorageMode::InMemory)
 			.unwrap()
+	}
+
+	/// One component's COW must preserve both sibling handles and the old root.
+	#[test]
+	fn changefeed_binding_detaches_selectively() -> crate::gql_status::FerrosGrynnResult<()> {
+		let mut original = DatabaseRoot::default();
+		let feed = crate::changefeed::ChangefeedId::allocate();
+		let duration = "P1D".parse::<crate::values::Duration>().map_err(|error| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+		})?;
+		Arc::make_mut(original.changefeeds_mut()).configure(
+			crate::changefeed::ChangefeedSource::Class(ClassId::new(1).ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::invalid_argument("fixture class identity")
+			})?),
+			feed,
+			"item".into(),
+			Some(crate::changefeed::ChangefeedConfig::new(duration)?),
+			0,
+		)?;
+		for component in 0..3 {
+			let mut changed = original.clone();
+			match component {
+				0 => {
+					Arc::make_mut(changed.changefeeds_mut()).definitions.remove(&feed);
+				}
+				1 => Arc::make_mut(changed.change_history_mut()).clear(),
+				_ => Arc::make_mut(changed.changefeed_segments_mut()).clear(),
+			}
+			assert_eq!(Arc::ptr_eq(original.changefeeds(), changed.changefeeds()), component != 0);
+			assert_eq!(
+				Arc::ptr_eq(original.change_history(), changed.change_history()),
+				component != 1
+			);
+			assert_eq!(
+				Arc::ptr_eq(original.changefeed_segments(), changed.changefeed_segments()),
+				component != 2
+			);
+			assert!(original.changefeeds().definitions.contains_key(&feed));
+			assert_eq!(changed.changefeeds().definitions.contains_key(&feed), component != 0);
+		}
+		Ok(())
 	}
 
 	#[test]

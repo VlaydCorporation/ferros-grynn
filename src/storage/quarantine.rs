@@ -230,6 +230,12 @@ impl QuarantineArtifact {
 	pub(crate) fn publish(&mut self) {
 		self.armed = false;
 	}
+
+	/// Preserves the installed file when WAL append/fsync has an uncertain
+	/// outcome. Recovered catalog reachability decides whether to remove it.
+	pub(crate) fn preserve_for_recovery(&mut self) {
+		self.armed = false;
+	}
 }
 
 impl Drop for QuarantineArtifact {

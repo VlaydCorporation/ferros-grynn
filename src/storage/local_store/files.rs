@@ -4,7 +4,7 @@ use std::{fs, path::Path};
 
 use super::{
 	image::BuiltGeneration,
-	layout::{DATABASE_CATALOG_CONTINUATION, DATABASE_CATALOG_ROOT, invalid},
+	layout::{DATABASE_CATALOG_CONTINUATION, DATABASE_CATALOG_ROOT, FileImage, invalid},
 };
 use crate::{
 	datastore::DataSpaceId,
@@ -43,7 +43,17 @@ fn create_generation_files_with_mode(
 	install_home: bool,
 	write_unreachable_home: bool,
 ) -> FerrosGrynnResult<()> {
-	for image in &generation.files {
+	create_file_images(root, &generation.files, install_home, write_unreachable_home)
+}
+
+/// Creates or extends only the catalog-authorized files of a pending commit.
+pub(super) fn create_file_images(
+	root: &Path,
+	images: &[FileImage],
+	install_home: bool,
+	write_unreachable_home: bool,
+) -> FerrosGrynnResult<()> {
+	for image in images {
 		let path = image.entry.path.resolve(root);
 		if let Some(expected) = image.prewritten_page_count {
 			let file = DirectFile::open_read_write(&path)?;
@@ -64,12 +74,26 @@ fn create_generation_files_with_mode(
 			}
 			continue;
 		}
+		if image.entry.file_id.kind() == Some(DataFileKind::Changefeed)
+			&& image.page_numbers.get(1).is_some_and(|number| number.get() > 1)
+		{
+			let file = DirectFile::open_read_write(&path)?;
+			let required = page_count(image)?;
+			if file.page_count() < required {
+				file.resize_pages(required)?;
+			}
+			file.sync_data()?;
+			continue;
+		}
 		let parent = path.parent().ok_or_else(|| invalid("data file has no parent directory"))?;
 		fs::create_dir_all(parent)
 			.map_err(|source| io_failure("create generation directory", source))?;
 		let file = DirectFile::create_new(&path)?;
 		file.resize_pages(page_count(image)?)?;
-		if install_home || write_unreachable_home {
+		if install_home
+			|| write_unreachable_home
+				&& image.entry.file_id.kind() != Some(DataFileKind::Changefeed)
+		{
 			for (number, page) in image.page_numbers.iter().copied().zip(&image.pages) {
 				file.write_page(number, page)?;
 			}
@@ -84,7 +108,23 @@ pub(super) fn stage_generation(
 	tx: &mut TxHandle,
 	generation: &BuiltGeneration,
 ) -> FerrosGrynnResult<()> {
-	for image in &generation.files {
+	stage_file_images(tx, &generation.files, false)
+}
+
+/// Shares the WAL staging path between full and catalog-only publications.
+pub(super) fn stage_file_images(
+	tx: &mut TxHandle,
+	images: &[FileImage],
+	import: bool,
+) -> FerrosGrynnResult<()> {
+	for image in images {
+		if import
+			&& !matches!(
+				image.entry.file_id.kind(),
+				Some(DataFileKind::SystemCatalog | DataFileKind::Changefeed)
+			) {
+			continue;
+		}
 		if image.prewritten_page_count.is_some() {
 			continue;
 		}
@@ -102,19 +142,7 @@ pub(super) fn stage_import_catalog(
 	tx: &mut TxHandle,
 	generation: &BuiltGeneration,
 ) -> FerrosGrynnResult<()> {
-	let image = generation
-		.files
-		.iter()
-		.find(|image| {
-			image.entry.space_id == DataSpaceId::Database
-				&& image.entry.file_id.kind() == Some(DataFileKind::SystemCatalog)
-		})
-		.ok_or_else(|| invalid("import generation has no system catalog image"))?;
-	page_count(image)?;
-	for (number, page) in image.page_numbers.iter().copied().zip(&image.pages) {
-		tx.stage_page(PageKey::new(image.entry.space_id, image.entry.file_id, number), page)?;
-	}
-	Ok(())
+	stage_file_images(tx, &generation.files, true)
 }
 
 /// Stages only the database catalog chain while retaining every physical

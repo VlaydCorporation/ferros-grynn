@@ -229,7 +229,11 @@ impl FileRegistry {
 	/// generation. A retired generation remains pinned while any exact physical
 	/// snapshot can still upgrade one of these markers.
 	pub(super) fn retirement_markers(&self) -> Vec<Weak<RegisteredDataFile>> {
-		self.files.values().map(Arc::downgrade).collect()
+		self.files
+			.iter()
+			.filter(|((_, file), _)| file.kind() != Some(DataFileKind::Changefeed))
+			.map(|(_, file)| Arc::downgrade(file))
+			.collect()
 	}
 
 	/// Returns `(registrations, open positional handles)`.

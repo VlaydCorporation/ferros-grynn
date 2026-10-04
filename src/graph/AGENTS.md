@@ -71,6 +71,9 @@ handle конкретного materialization и нужен в том числе
   `fg-meta` не переносить.
 - Mutation проверяет generation, graph identity и structural constraints до
   публикации.
+- Qualified nested incidence допускает node и edge owners с child/transition graph;
+  validator проверяет соответствующий kind. Edge owner без transition graph не
+  является meta atom. Changefeed сохраняет ordered qualified route, а не local IDs.
 - Алгоритмы принимают `GraphRead` и дают одну семантику для всех storage modes.
 - Public all-target Dijkstra и query point refinement используют один loop с тем же distance/node
   queue и strict predecessor improvement. Query callbacks остаются crate-private через re-export;

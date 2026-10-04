@@ -36,6 +36,8 @@ struct AnalyzeObservation {
 	spatial: [u64; 5],
 	/// Sketch hits, exact fallbacks, charged work and consulted artifact bytes.
 	neighbourhood: [u64; 4],
+	/// Logical history reader counters, with admitted scratch peak last.
+	changefeed: [u64; 9],
 	publication: &'static str,
 }
 
@@ -61,15 +63,23 @@ pub(super) fn execute_explain<Read: QueryRead>(
 	} else {
 		&planner_snapshot
 	};
-	let plan = physical_plan(
-		&explain.statement,
-		planning_snapshot,
-		control.barrier_memory_limit(),
-		control.deterministic(),
-		control.fast(),
-		control.max_graph_nodes(),
-		control.max_graph_edges(),
-	)?;
+	let history_plan = match explain.statement.as_ref() {
+		LogicalStatement::Schema(statement) => changefeed::plan(read, statement, slots, control)?,
+		_ => None,
+	};
+	let plan = if let Some(plan) = history_plan {
+		plan
+	} else {
+		physical_plan(
+			&explain.statement,
+			planning_snapshot,
+			control.barrier_memory_limit(),
+			control.deterministic(),
+			control.fast(),
+			control.max_graph_nodes(),
+			control.max_graph_edges(),
+		)?
+	};
 	let planning_ns = nanos(planning_started.elapsed());
 	let observation = if explain.mode == ExplainMode::Analyze {
 		let mutation_before = read.mutation_count();
@@ -125,6 +135,7 @@ pub(super) fn execute_explain<Read: QueryRead>(
 				analyze_control.neighbourhood_metrics()[index]
 					.saturating_sub(neighbourhood_before[index])
 			}),
+			changefeed: analyze_control.changefeed_metrics(),
 			publication: if logical_mutates(&explain.statement) {
 				if control.publication_deferred() {
 					"deferred"
@@ -375,6 +386,22 @@ fn explain_text(
 			observation.neighbourhood[2],
 			observation.neighbourhood[3]
 		));
+		for (name, counter) in [
+			"changefeed_batches",
+			"changefeed_entries",
+			"changefeed_gaps",
+			"changefeed_groups_inspected",
+			"changefeed_page_reads",
+			"changefeed_bytes_read",
+			"changefeed_segment_visits",
+			"changefeed_work",
+			"changefeed_peak_scratch_bytes",
+		]
+		.into_iter()
+		.zip(observation.changefeed)
+		{
+			lines.push(format!("  {name}={counter}"));
+		}
 	}
 	Value::from(lines.join("\n"))
 }
@@ -444,7 +471,22 @@ fn logical_nodes(statement: &LogicalStatement) -> Vec<Value> {
 			);
 			push_node(&mut nodes, 1, "Source", None, None);
 		}
-		LogicalStatement::Schema(_) => push_node(&mut nodes, 0, "CatalogMutation", None, None),
+		LogicalStatement::Schema(schema) => push_node(
+			&mut nodes,
+			0,
+			match schema {
+				crate::gql::ir::LogicalSchemaStatement::ShowChanges {
+					..
+				} => "ChangefeedRead",
+				crate::gql::ir::LogicalSchemaStatement::InfoChangefeed {
+					..
+				} => "ChangefeedInfo",
+				_ if schema.is_read() => "CatalogRead",
+				_ => "CatalogMutation",
+			},
+			None,
+			None,
+		),
 		LogicalStatement::Dml(_) | LogicalStatement::GraphDml(_) => {
 			push_node(&mut nodes, 0, "TargetSelection", None, None);
 			push_node(&mut nodes, 1, "Mutation", None, None);
@@ -492,6 +534,20 @@ fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value>
 			})
 			.collect(),
 		PhysicalPlan::GraphResult(plan) => graph_result_nodes(plan, snapshot),
+		PhysicalPlan::Changefeed(plan) => {
+			let mut node = node_object(
+				0,
+				if plan.mode.is_some() {
+					"ChangefeedHistoryRead"
+				} else {
+					"ChangefeedInfo"
+				},
+				None,
+				None,
+			);
+			changefeed::project_plan(&mut node, plan);
+			vec![Value::Object(node)]
+		}
 	}
 }
 
@@ -1172,6 +1228,16 @@ fn ordering_projection(
 	statement: &LogicalStatement,
 	plan: &PhysicalPlan,
 ) -> (Vec<Value>, &'static str) {
+	if let PhysicalPlan::Changefeed(plan) = plan {
+		return (
+			vec![Value::from("versionstamp"), Value::from("ordinal")],
+			if plan.mode.is_some() {
+				"whole_commit_order"
+			} else {
+				"not_applicable"
+			},
+		);
+	}
 	if let (LogicalStatement::Traverse(statement), PhysicalPlan::Traversal(plan)) =
 		(statement, plan)
 	{
@@ -1309,6 +1375,22 @@ fn observation_object(value: &AnalyzeObservation) -> Object {
 	object.insert("neighbourhood_exact_work", value.neighbourhood[2]);
 	object.insert("graph_artifact_bytes", value.neighbourhood[3]);
 	object.insert("publication_state", value.publication);
+	for (name, counter) in [
+		"changefeed_batches",
+		"changefeed_entries",
+		"changefeed_gaps",
+		"changefeed_groups_inspected",
+		"changefeed_page_reads",
+		"changefeed_bytes_read",
+		"changefeed_segment_visits",
+		"changefeed_work",
+		"changefeed_peak_scratch_bytes",
+	]
+	.into_iter()
+	.zip(value.changefeed)
+	{
+		object.insert(name, counter);
+	}
 	object
 }
 
@@ -1317,7 +1399,7 @@ fn plan_warnings(plan: &PhysicalPlan) -> Vec<Value> {
 		PhysicalPlan::Select(plan) => &plan.warnings,
 		PhysicalPlan::Match(plan) => &plan.warnings,
 		PhysicalPlan::Traversal(plan) => &plan.warnings,
-		PhysicalPlan::Write(_) => return Vec::new(),
+		PhysicalPlan::Write(_) | PhysicalPlan::Changefeed(_) => return Vec::new(),
 		PhysicalPlan::GraphResult(plan) => &plan.warnings,
 	};
 	warnings
@@ -1421,6 +1503,8 @@ fn statement_name(statement: &LogicalStatement) -> &'static str {
 			} => "RELATE",
 		},
 		LogicalStatement::Schema(statement) => match statement.statement_kind() {
+			QueryStatementKind::ShowChanges => "SHOW CHANGES",
+			QueryStatementKind::Info => "INFO",
 			QueryStatementKind::Define => "DEFINE",
 			QueryStatementKind::Remove => "REMOVE",
 			QueryStatementKind::Alter => "ALTER",
@@ -1440,6 +1524,9 @@ fn mode_name(mode: ExplainMode) -> &'static str {
 }
 
 fn logical_mutates(statement: &LogicalStatement) -> bool {
+	if let LogicalStatement::Schema(schema) = statement {
+		return !schema.is_read();
+	}
 	matches!(
 		statement,
 		LogicalStatement::Schema(_)
@@ -1466,7 +1553,29 @@ fn compact_node(value: &Value) -> String {
 	};
 	let id = object.get("node_id").map_or_else(|| "?".to_owned(), value_text);
 	let operator = object.get("operator").map_or_else(|| "?".to_owned(), value_text);
-	format!("#{id} {operator}")
+	let mut text = format!("#{id} {operator}");
+	if operator.starts_with("Changefeed") {
+		for field in [
+			"source",
+			"binding",
+			"read_mode",
+			"capture_revision",
+			"capture_full",
+			"snapshot_through",
+			"purged_through",
+			"since",
+			"resume",
+			"whole_commit_limit",
+		] {
+			if let Some(value) = object.get(field) {
+				text.push(' ');
+				text.push_str(field);
+				text.push('=');
+				text.push_str(&value_text(value));
+			}
+		}
+	}
+	text
 }
 
 fn value_text(value: &Value) -> String {

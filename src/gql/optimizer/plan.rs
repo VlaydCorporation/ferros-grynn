@@ -548,6 +548,35 @@ pub(crate) struct PhysicalGraphResultPlan {
 	pub(crate) warnings: Vec<PlanWarning>,
 }
 
+/// Logical snapshot-bound history operations; no physical address is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "Physical metadata is re-exported to execution consumers"
+)]
+pub(crate) struct PhysicalChangefeedPlan {
+	/// Bounded operand spelling and runtime slots, excluding text offsets.
+	pub(crate) request_hash: u64,
+	/// Committed origin, including after source retirement.
+	pub(crate) database: crate::values::Uuid,
+	/// Fixed committed upper history boundary.
+	pub(crate) snapshot: crate::changefeed::Versionstamp,
+	/// Bounded private function catalog descriptor, including versions and
+	/// bodies.
+	pub(crate) function_fingerprint: u64,
+	/// Committed catalog binding; None means deferred or fully retired source.
+	pub(crate) binding: Option<crate::changefeed::ChangefeedReadBinding>,
+	/// Historical NET/FULL view; None for metadata lookup.
+	pub(crate) mode: Option<crate::changefeed::ChangefeedReadMode>,
+	/// Exact selection when statically available; None is runtime-bound.
+	pub(crate) since: Option<crate::changefeed::ChangefeedSince>,
+	/// Whole-commit/GAP limit; None is runtime-bound.
+	pub(crate) limit: Option<u64>,
+	/// Source expression needs ordinary execution, never speculative UDF
+	/// evaluation.
+	pub(crate) dynamic_source: bool,
+}
+
 /// Complete internal physical plan used by EXPLAIN and replay hashing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PhysicalPlan {
@@ -561,6 +590,9 @@ pub(crate) enum PhysicalPlan {
 	Write(PhysicalWritePlan),
 	/// Owned graph assembly and optional named publication.
 	GraphResult(PhysicalGraphResultPlan),
+	/// Snapshot history read or logical metadata lookup without mutation
+	/// phases.
+	Changefeed(PhysicalChangefeedPlan),
 }
 
 impl PhysicalPlan {
@@ -634,6 +666,10 @@ impl PhysicalPlan {
 				plan.expected_nodes.hash(&mut writer);
 				plan.expected_edges.hash(&mut writer);
 				plan.expected_scopes.hash(&mut writer);
+			}
+			Self::Changefeed(plan) => {
+				5_u8.hash(&mut writer);
+				plan.hash(&mut writer);
 			}
 		}
 		writer.finish()
