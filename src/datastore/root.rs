@@ -40,8 +40,8 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) database_uuid: uuid::Uuid,
 	/// Nondecreasing UTC publication time in exact epoch nanoseconds.
 	pub(crate) committed_at_ns: i128,
-	/// One shared changefeed binding, with selective inner copy-on-write maps.
-	changefeed: Arc<ChangefeedRoot>,
+	/// One shared history binding, with selective inner copy-on-write maps.
+	history_binding: Arc<HistoryRoot>,
 	pub(crate) schema: Arc<SchemaCatalog>,
 	pub(crate) dictionary: Arc<PropertyDictionary>,
 	pub(crate) atoms: Arc<AtomStoreRoot>,
@@ -58,23 +58,32 @@ pub(crate) struct DatabaseRoot {
 	/// Full qualified incidence generations retained by old logical snapshots.
 	pub(crate) tensor_artifacts: Arc<BTreeMap<IndexId, Arc<super::TensorArtifact>>>,
 	pub(crate) graphs: BTreeMap<GraphId, Arc<GraphRoot>>,
-	pub(crate) versions: Arc<BTreeMap<ConflictKey, u64>>,
+	pub(super) versions: Arc<super::versions::VersionStore>,
 }
 
-/// Snapshot-owned changefeed state cloned as one handle by ordinary reads.
+/// Snapshot-owned historical state cloned as one handle by ordinary reads.
 #[derive(Clone, Default)]
-struct ChangefeedRoot {
+struct HistoryRoot {
+	/// Reactive definitions share snapshot ownership with retained history.
+	live: Arc<super::LiveCatalog>,
 	/// Definitions survive removal of the current schema owner.
 	catalog: Arc<super::ChangefeedCatalog>,
 	/// RAM history is independent of primary records and physical segments.
 	history: ChangeHistory,
 	/// Durable bounds do not load historical images.
 	segments: crate::storage::ChangefeedSegments,
+	/// RAM computed envelopes own results independently of primary records.
+	live_history: LiveHistoryGroups,
+	/// Private physical references remain separate from source history.
+	live_segments: crate::storage::LiveHistorySegments,
 }
 
 /// Shared logical batches retained independently of the outer snapshot binding.
 type ChangeHistory =
 	Arc<BTreeMap<(crate::changefeed::ChangefeedId, u64), Arc<super::CapturedCommit>>>;
+
+/// Shared exact computed envelopes retained independently of primary records.
+pub(super) type LiveHistoryGroups = Arc<BTreeMap<(crate::live::LiveId, u64), Arc<[u8]>>>;
 
 /// Complete normalized-state violations collected for `ASSERT INVARIANTS`.
 pub(crate) struct InvariantViolationReport {
@@ -138,7 +147,7 @@ impl Default for DatabaseRoot {
 			commit_ts: 0,
 			database_uuid: uuid::Uuid::now_v7(),
 			committed_at_ns: 0,
-			changefeed: Arc::default(),
+			history_binding: Arc::default(),
 			schema: Arc::new(SchemaCatalog::default()),
 			dictionary: Arc::new(PropertyDictionary::new()),
 			atoms: Arc::new(AtomStoreRoot::default()),
@@ -150,46 +159,154 @@ impl Default for DatabaseRoot {
 			path_artifacts: Arc::new(BTreeMap::new()),
 			tensor_artifacts: Arc::new(BTreeMap::new()),
 			graphs: BTreeMap::new(),
-			versions: Arc::new(BTreeMap::new()),
+			versions: Arc::default(),
 		}
 	}
 }
 
 impl DatabaseRoot {
+	/// Checks leased primary/schema/capture inputs independently of LIVE
+	/// control commits and transfers the latest complete history binding.
+	///
+	/// # Errors
+	///
+	/// Returns a serialization failure for changed import inputs, or a
+	/// resource failure before copying revision metadata.
+	pub(super) fn rebase_import_controls(
+		&mut self,
+		base: &Self,
+		current: &Self,
+		transaction: u64,
+		maximum: usize,
+	) -> FerrosGrynnResult<()> {
+		if base.database_uuid != current.database_uuid
+			|| !Arc::ptr_eq(&base.atoms, &current.atoms)
+			|| !Arc::ptr_eq(&base.dictionary, &current.dictionary)
+			|| base.graphs.len() != current.graphs.len()
+			|| base
+				.graphs
+				.iter()
+				.zip(&current.graphs)
+				.any(|((id, graph), (other, next))| id != other || !Arc::ptr_eq(graph, next))
+			|| base.schema.class_versions != current.schema.class_versions
+			|| base.changefeeds() != current.changefeeds()
+			|| !base.versions.same_primary(&current.versions)
+		{
+			return Err(FerrosGrynnError::serialization_failure(
+				transaction,
+				"the import primary, schema or capture inputs changed before publication",
+			));
+		}
+		let from = self.commit_ts;
+		let stamp = current.commit_ts.checked_add(1).ok_or_else(|| {
+			FerrosGrynnError::serialization_failure(transaction, "the commit clock is exhausted")
+		})?;
+		let controls_changed = !self.versions.same_live(&current.versions);
+		let restamp = from != stamp;
+		let restamp_primary = restamp && self.versions.primary_has_revision(from);
+		if controls_changed || restamp_primary {
+			let bytes = self.versions.rebase_allocation_bytes(restamp_primary)?;
+			if bytes > maximum {
+				return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+					"import revision scratch",
+					bytes as u64,
+					maximum as u64,
+				));
+			}
+			// A committed close can equal the provisional stamp. Only data
+			// revisions are restamped; current LIVE controls remain shared.
+			Arc::make_mut(&mut self.versions).rebase(
+				&current.versions,
+				from,
+				stamp,
+				restamp_primary,
+			);
+		}
+		for graph in
+			self.graphs.values_mut().filter(|graph| restamp && graph.tensor_revision == from)
+		{
+			// Changed private graphs have no escaping runtime snapshot. Do
+			// not silently deep-copy an unexpectedly retained import graph.
+			let graph = Arc::get_mut(graph).ok_or_else(|| {
+				FerrosGrynnError::traversal_resource_limit_exceeded(
+					"retained private import graph",
+					maximum as u64,
+				)
+			})?;
+			graph.tensor_revision = stamp;
+		}
+		self.history_binding = Arc::clone(&current.history_binding);
+		self.commit_ts = stamp;
+		self.advance_commit_time(current.committed_at_ns);
+		self.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
+		Ok(())
+	}
+
+	/// Borrows reactive definitions from this exact logical snapshot.
+	pub(crate) fn live_catalog(&self) -> &Arc<super::LiveCatalog> {
+		&self.history_binding.live
+	}
+
+	/// Detaches only the selected inner catalog on registry mutation.
+	pub(crate) fn live_catalog_mut(&mut self) -> &mut Arc<super::LiveCatalog> {
+		&mut Arc::make_mut(&mut self.history_binding).live
+	}
+
+	/// Shares already-computed historical envelopes without copying their
+	/// images.
+	pub(crate) fn live_history(&self) -> &LiveHistoryGroups {
+		&self.history_binding.live_history
+	}
+
+	/// Detaches only the selected history table before a bounded publication.
+	pub(crate) fn live_history_mut(&mut self) -> &mut LiveHistoryGroups {
+		&mut Arc::make_mut(&mut self.history_binding).live_history
+	}
+
+	/// Returns private physical bounds without loading computed images.
+	pub(crate) fn live_segments(&self) -> &crate::storage::LiveHistorySegments {
+		&self.history_binding.live_segments
+	}
+
+	/// Detaches the selected physical descriptor map for bounded publication.
+	pub(crate) fn live_segments_mut(&mut self) -> &mut crate::storage::LiveHistorySegments {
+		&mut Arc::make_mut(&mut self.history_binding).live_segments
+	}
+
 	/// Borrows definitions from this exact logical root.
 	#[inline]
 	pub(crate) fn changefeeds(&self) -> &Arc<super::ChangefeedCatalog> {
-		&self.changefeed.catalog
+		&self.history_binding.catalog
 	}
 
 	/// Detaches the outer binding before selective catalog COW.
 	#[inline]
 	pub(crate) fn changefeeds_mut(&mut self) -> &mut Arc<super::ChangefeedCatalog> {
-		&mut Arc::make_mut(&mut self.changefeed).catalog
+		&mut Arc::make_mut(&mut self.history_binding).catalog
 	}
 
 	/// Borrows RAM batches without copying their images.
 	#[inline]
 	pub(crate) fn change_history(&self) -> &ChangeHistory {
-		&self.changefeed.history
+		&self.history_binding.history
 	}
 
 	/// Detaches the binding before selective RAM-history COW.
 	#[inline]
 	pub(crate) fn change_history_mut(&mut self) -> &mut ChangeHistory {
-		&mut Arc::make_mut(&mut self.changefeed).history
+		&mut Arc::make_mut(&mut self.history_binding).history
 	}
 
 	/// Borrows durable segment references from the same binding.
 	#[inline]
 	pub(crate) fn changefeed_segments(&self) -> &crate::storage::ChangefeedSegments {
-		&self.changefeed.segments
+		&self.history_binding.segments
 	}
 
 	/// Detaches the binding before selective segment-table COW.
 	#[inline]
 	pub(crate) fn changefeed_segments_mut(&mut self) -> &mut crate::storage::ChangefeedSegments {
-		&mut Arc::make_mut(&mut self.changefeed).segments
+		&mut Arc::make_mut(&mut self.history_binding).segments
 	}
 
 	/// Records UTC time without allowing a host clock rollback to reverse it.
@@ -284,6 +401,11 @@ impl DatabaseRoot {
 	pub(crate) fn mark_deferred_indexes_stale(
 		&mut self,
 	) -> FerrosGrynnResult<Vec<(ClassId, IndexId, super::SchemaVersion)>> {
+		if !self.schema.classes.values().any(|class| {
+			class.indexes().any(|index| index.maintenance_mode() == IndexMaintenanceMode::Deferred)
+		}) {
+			return Ok(Vec::new());
+		}
 		let mut affected = Vec::new();
 		let mut newly_stale = Vec::new();
 		{
@@ -307,9 +429,11 @@ impl DatabaseRoot {
 				}
 			}
 		}
-		let indexes = Arc::make_mut(&mut self.indexes);
-		for id in newly_stale {
-			indexes.remove_explicit_index(id);
+		if !newly_stale.is_empty() {
+			let indexes = Arc::make_mut(&mut self.indexes);
+			for id in newly_stale {
+				indexes.remove_explicit_index(id);
+			}
 		}
 		Ok(affected)
 	}
@@ -432,8 +556,13 @@ impl DatabaseRoot {
 		let mut context = index_context(&self.schema, &self.dictionary)?;
 		let prepared =
 			self.indexes.prepare_base_replace(&before, &after, &memberships, &mut context)?;
-		let mut indexes = self.indexes.as_ref().clone();
-		indexes.apply_replace(prepared)?;
+		let indexes = if prepared.is_empty() {
+			None
+		} else {
+			let mut indexes = self.indexes.as_ref().clone();
+			indexes.apply_replace(prepared)?;
+			Some(indexes)
+		};
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.replace_base_property(&before, &after, key, &memberships)?;
 		// Complete fallible derived-state preparation before mutating primary
@@ -450,7 +579,9 @@ impl DatabaseRoot {
 				atom.properties_mut().remove(key);
 			}
 		}
-		self.indexes = Arc::new(indexes);
+		if let Some(indexes) = indexes {
+			self.indexes = Arc::new(indexes);
+		}
 		self.statistics = Arc::new(statistics);
 		if before != after {
 			self.invalidate_path_cost_artifacts(None, false);
@@ -533,6 +664,7 @@ impl DatabaseRoot {
 		self.dictionary = Arc::new(dictionary);
 		self.indexes = Arc::new(indexes);
 		self.statistics = Arc::new(statistics);
+		self.mark_version(ConflictKey::ClassCatalogRange, published_at);
 		Ok(id)
 	}
 
@@ -1245,7 +1377,9 @@ impl DatabaseRoot {
 			self.indexes.prepare_occurrence_replace(graph, &atom, &before, &after, &mut context)?;
 		let mut statistics = self.statistics.as_ref().clone();
 		statistics.replace_occurrence(graph, &atom, &before, &after)?;
-		Arc::make_mut(&mut self.indexes).apply_replace(prepared)?;
+		if !prepared.is_empty() {
+			Arc::make_mut(&mut self.indexes).apply_replace(prepared)?;
+		}
 		self.graph_mut(graph)?.replace_occurrence(after);
 		self.statistics = Arc::new(statistics);
 		if relation_changed {
@@ -1264,6 +1398,9 @@ impl DatabaseRoot {
 	}
 
 	pub(crate) fn version(&self, key: ConflictKey) -> u64 {
+		if let ConflictKey::SchemaClass(class) = key {
+			return self.schema.class_versions.get(&class).copied().unwrap_or(0);
+		}
 		self.versions.get(&key).copied().unwrap_or(0)
 	}
 
@@ -1278,12 +1415,20 @@ impl DatabaseRoot {
 	}
 
 	pub(crate) fn advance_identity_clocks(&mut self, next_schema_id: u64, next_graph_id: u64) {
+		if self.schema.next_schema_id == next_schema_id
+			&& self.schema.next_graph_id == next_graph_id
+		{
+			return;
+		}
 		let catalog = Arc::make_mut(&mut self.schema);
 		catalog.next_schema_id = next_schema_id;
 		catalog.next_graph_id = next_graph_id;
 	}
 
 	pub(crate) fn publish_statistics_revision(&mut self, revision: u64) {
+		if !self.statistics.has_revision_updates() {
+			return;
+		}
 		Arc::make_mut(&mut self.statistics).publish_revision(revision);
 	}
 

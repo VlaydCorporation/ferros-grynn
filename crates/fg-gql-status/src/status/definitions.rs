@@ -858,6 +858,22 @@ define_status_codes!(
 			reason: String => DisplayValue,
 		},
 	},
+	LiveEvaluationFault, "FG-G1F09" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DependentObjectError,
+		domain: Domain::Query,
+		subcondition: "reactive evaluation is paused",
+		message: "LIVE identity {identity} is paused after {origin_code}: {reason}.",
+		params: {
+			identity: String => DisplayValue,
+			origin_code: String => DisplayValue,
+			reason: String => DisplayValue,
+		},
+	},
 	GraphDoesNotExist, "FG-G1F07" => {
 		kind: Error {
 			classification: ErrorClassification::ClientError,

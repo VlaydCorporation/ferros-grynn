@@ -17,9 +17,18 @@ use crate::{
 	values::{Array, ErrorValue, Geometry, Object, Position, RecordId, RecordIdPart, Value},
 };
 
+/// Shares the existing history limits with an optional operand admission hook.
+struct Work<'a> {
+	/// Aggregate checked work, including nested identities and diagnostics.
+	count: &'a mut u64,
+	/// Caller work and cancellation checks performed before every descent.
+	admit: Option<&'a dyn Fn(u64) -> FerrosGrynnResult<()>>,
+}
+
 /// Charges one inspected value/endpoint before recursion or conversion.
-fn step(work: &mut u64, depth: usize) -> FerrosGrynnResult<()> {
-	*work = work
+fn step(work: &mut Work<'_>, depth: usize) -> FerrosGrynnResult<()> {
+	*work.count = work
+		.count
 		.checked_add(1)
 		.ok_or_else(|| FerrosGrynnError::operation_overflow("SHOW CHANGES work"))?;
 	if depth > 64 {
@@ -29,18 +38,21 @@ fn step(work: &mut u64, depth: usize) -> FerrosGrynnResult<()> {
 			64,
 		));
 	}
-	if *work > 1_000_000 {
+	if *work.count > 1_000_000 {
 		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
 			"SHOW CHANGES work",
-			*work,
+			*work.count,
 			1_000_000,
 		));
+	}
+	if let Some(admit) = work.admit {
+		admit(1)?;
 	}
 	Ok(())
 }
 
 /// Complete object nodes are charged even for singleton maps.
-fn object_bytes(object: &Object, work: &mut u64, depth: usize) -> FerrosGrynnResult<usize> {
+fn object_bytes(object: &Object, work: &mut Work<'_>, depth: usize) -> FerrosGrynnResult<usize> {
 	step(work, depth)?;
 	let mut bytes = 2048_usize.saturating_mul(object.len());
 	for (key, value) in object {
@@ -52,7 +64,7 @@ fn object_bytes(object: &Object, work: &mut u64, depth: usize) -> FerrosGrynnRes
 
 /// Admits nested singleton objects and composite record identities without
 /// constructing temporary Values or cloning the source images.
-pub(super) fn value_bytes(value: &Value, work: &mut u64, depth: usize) -> FerrosGrynnResult<usize> {
+fn value_bytes(value: &Value, work: &mut Work<'_>, depth: usize) -> FerrosGrynnResult<usize> {
 	step(work, depth)?;
 	Ok(match value {
 		Value::Object(object) => object_bytes(object, work, depth + 1)?,
@@ -101,10 +113,26 @@ pub(super) fn value_bytes(value: &Value, work: &mut u64, depth: usize) -> Ferros
 	})
 }
 
+/// Measures scalar copies with the same depth limits and caller work budget.
+pub(super) fn operand_bytes(
+	value: &Value,
+	admit: &dyn Fn(u64) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<usize> {
+	let mut count = 0;
+	value_bytes(
+		value,
+		&mut Work {
+			count: &mut count,
+			admit: Some(admit),
+		},
+		0,
+	)
+}
+
 /// Measures one bounded coordinate sequence without conversion or allocation.
 fn positions_bytes(
 	positions: &[Position],
-	work: &mut u64,
+	work: &mut Work<'_>,
 	depth: usize,
 ) -> FerrosGrynnResult<usize> {
 	step(work, depth)?;
@@ -122,7 +150,11 @@ fn positions_bytes(
 }
 
 /// Checks all container depths and positions before Geometry's recursive Hash.
-fn geometry_bytes(geometry: &Geometry, work: &mut u64, depth: usize) -> FerrosGrynnResult<usize> {
+fn geometry_bytes(
+	geometry: &Geometry,
+	work: &mut Work<'_>,
+	depth: usize,
+) -> FerrosGrynnResult<usize> {
 	step(work, depth)?;
 	let mut bytes = 256_usize;
 	match geometry {
@@ -160,7 +192,7 @@ fn geometry_bytes(geometry: &Geometry, work: &mut u64, depth: usize) -> FerrosGr
 }
 
 /// Checks cause depth and includes every diagnostic string before Error Hash.
-fn error_bytes(error: &ErrorValue, work: &mut u64, depth: usize) -> FerrosGrynnResult<usize> {
+fn error_bytes(error: &ErrorValue, work: &mut Work<'_>, depth: usize) -> FerrosGrynnResult<usize> {
 	step(work, depth)?;
 	let mut bytes = 512_usize;
 	for text in [
@@ -180,7 +212,7 @@ fn error_bytes(error: &ErrorValue, work: &mut u64, depth: usize) -> FerrosGrynnR
 }
 
 /// Includes child values of array/object RecordIds in the same checked walk.
-fn record_bytes(record: &RecordId, work: &mut u64, depth: usize) -> FerrosGrynnResult<usize> {
+fn record_bytes(record: &RecordId, work: &mut Work<'_>, depth: usize) -> FerrosGrynnResult<usize> {
 	step(work, depth)?;
 	let part = match record.id() {
 		RecordIdPart::Object(object) => object_bytes(object, work, depth + 1)?,
@@ -198,13 +230,13 @@ fn record_bytes(record: &RecordId, work: &mut u64, depth: usize) -> FerrosGrynnR
 }
 
 /// One qualified occurrence copied into a historical topology object.
-fn occurrence_bytes(atom: &AtomOccurrenceRef, work: &mut u64) -> FerrosGrynnResult<usize> {
+fn occurrence_bytes(atom: &AtomOccurrenceRef, work: &mut Work<'_>) -> FerrosGrynnResult<usize> {
 	record_bytes(atom.atom().id(), work, 0)
 		.map(|bytes| bytes.saturating_add(atom.graph().name().len()))
 }
 
 /// Complete image, including explicit overlays and qualified endpoint routes.
-fn image_bytes(image: &ChangeImage, work: &mut u64) -> FerrosGrynnResult<usize> {
+fn image_bytes(image: &ChangeImage, work: &mut Work<'_>) -> FerrosGrynnResult<usize> {
 	let mut bytes = 4096_usize.saturating_add(object_bytes(image.properties(), work, 0)?);
 	bytes = bytes.saturating_add(image.label().map_or(0, |label| label.len()));
 	bytes = bytes.saturating_add(match image.identity() {
@@ -237,13 +269,17 @@ fn image_bytes(image: &ChangeImage, work: &mut u64) -> FerrosGrynnResult<usize> 
 
 /// Accounts source batch storage and the complete output while both are live.
 pub(super) fn item_bytes(item: &ChangefeedReadItem, work: &mut u64) -> FerrosGrynnResult<usize> {
+	let mut work = Work {
+		count: work,
+		admit: None,
+	};
 	let mut bytes = 4096_usize;
 	if let ChangefeedReadItem::Commit(batch) = item {
 		for entry in batch.entries() {
-			step(work, 0)?;
+			step(&mut work, 0)?;
 			bytes = bytes.saturating_add(4096);
 			for image in entry.before().into_iter().chain(entry.after()) {
-				bytes = bytes.saturating_add(image_bytes(image, work)?.saturating_mul(2));
+				bytes = bytes.saturating_add(image_bytes(image, &mut work)?.saturating_mul(2));
 			}
 		}
 	}

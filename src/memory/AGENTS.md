@@ -23,7 +23,8 @@
 ## Карта подмодулей
 
 - `mod.rs` — target/feature selection единственного global allocator и фасад
-  memory reporters;
+  memory reporters; общий checked B-tree allocation reserve применяется runtime
+  presentation и physical codecs. Это консервативная admission estimate, не RSS;
 - `track.rs` — `TrackAlloc`, thread-local batching, global counter и threshold
   при feature `allocation-tracking`;
 - `notrack.rs` — прозрачная allocator-обёртка без tracking для обычных builds;

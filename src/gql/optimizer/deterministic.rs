@@ -55,10 +55,15 @@ fn statement_contains_impure(statement: &LogicalStatement) -> bool {
 			value,
 			..
 		} => match value {
+			LogicalLetValue::Live(statement) => schema_contains_impure(statement),
 			LogicalLetValue::Expression(value) => expr_contains_impure(value),
 			LogicalLetValue::BuildGraph(build) => build_graph_contains_impure(build),
 		},
-		LogicalStatement::Return {
+		LogicalStatement::SetBinding {
+			value,
+			..
+		}
+		| LogicalStatement::Return {
 			value,
 		}
 		| LogicalStatement::Expression {
@@ -162,6 +167,27 @@ fn block_contains_impure(block: &LogicalBlock) -> bool {
 
 fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 	match statement {
+		LogicalSchemaStatement::RegisterLive(plan) => {
+			plan.frozen_graphs.iter().any(|capture| expr_contains_impure(&capture.graph))
+				|| plan.since.as_ref().is_some_and(expr_contains_impure)
+				|| plan.buffer.as_ref().is_some_and(expr_contains_impure)
+		}
+		LogicalSchemaStatement::DefineLiveBinding(_) => false,
+		LogicalSchemaStatement::ReplaceLiveBinding {
+			id,
+			..
+		}
+		| LogicalSchemaStatement::InfoLiveBinding {
+			id,
+		}
+		| LogicalSchemaStatement::RemoveLiveBinding {
+			id,
+		} => expr_contains_impure(id),
+		LogicalSchemaStatement::AckLive {
+			id,
+			cursor,
+			..
+		} => expr_contains_impure(id) || expr_contains_impure(cursor),
 		LogicalSchemaStatement::DefineGraph {
 			root,
 			content,
@@ -173,6 +199,12 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 		LogicalSchemaStatement::InfoChangefeed {
 			id,
 			..
+		}
+		| LogicalSchemaStatement::InfoLive {
+			id,
+		}
+		| LogicalSchemaStatement::CloseLive {
+			id,
 		} => expr_contains_impure(id),
 		LogicalSchemaStatement::ShowChanges {
 			target,
@@ -415,7 +447,8 @@ fn binding_contains_impure(binding: &crate::gql::ir::MatchBinding) -> bool {
 }
 
 fn select_contains_impure(statement: &LogicalSelect) -> bool {
-	source_contains_impure(&statement.source)
+	statement.union_inputs.iter().any(select_contains_impure)
+		|| source_contains_impure(&statement.source)
 		|| statement.joins.iter().any(|join| {
 			source_contains_impure(&join.source)
 				|| join.predicate.as_ref().is_some_and(expr_contains_impure)
@@ -428,6 +461,10 @@ fn select_contains_impure(statement: &LogicalSelect) -> bool {
 				expression,
 				..
 			} => expr_contains_impure(expression),
+			LogicalSelectItem::WildcardVariants {
+				selector,
+				..
+			} => expr_contains_impure(selector),
 			LogicalSelectItem::Wildcard(_) => false,
 		})
 		|| statement.order.iter().any(|order| expr_contains_impure(&order.expression))
@@ -443,7 +480,14 @@ fn select_contains_impure(statement: &LogicalSelect) -> bool {
 
 fn source_contains_impure(source: &LogicalSelectSource) -> bool {
 	match &source.kind {
-		LogicalSelectSourceKind::Atoms {
+		LogicalSelectSourceKind::Empty {
+			graph,
+		}
+		| LogicalSelectSourceKind::Atoms {
+			graph,
+			..
+		}
+		| LogicalSelectSourceKind::AtomUnion {
 			graph,
 			..
 		} => graph.as_ref().is_some_and(|graph| match graph {
@@ -611,6 +655,7 @@ fn expr_contains_impure(expression: &TypedExpr) -> bool {
 		} => select_contains_impure(select),
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
+		| TypedExprKind::LiveSlot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_) => false,
 	}

@@ -138,23 +138,24 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 		.map(|reference| {
 			select::resolve_graph_reference(read, snapshot, reference, None, slots, source, control)
 		})
-		.transpose()?
-		.or_else(|| {
-			let tensor_consumer = plan.steps.iter().any(|step| {
-				step.kind.is_tensor_analytics()
-					|| matches!(
-						step.kind,
-						TraverseStepKind::AllShortestPaths
-							| TraverseStepKind::AllWeightedShortestPaths
-					)
-			});
-			match &plan.source {
-				LogicalTraverseSource::Match(statement) if tensor_consumer => {
-					Some(statement.graph.clone())
-				}
-				_ => None,
-			}
+		.transpose()?;
+	let graph = if graph.is_none() {
+		let tensor_consumer = plan.steps.iter().any(|step| {
+			step.kind.is_tensor_analytics()
+				|| matches!(
+					step.kind,
+					TraverseStepKind::AllShortestPaths | TraverseStepKind::AllWeightedShortestPaths
+				)
 		});
+		match &plan.source {
+			LogicalTraverseSource::Match(statement) if tensor_consumer => {
+				Some(resolve_match_graph(read, snapshot, statement, slots, source, control)?)
+			}
+			_ => None,
+		}
+	} else {
+		graph
+	};
 	let (source_value, source_binding, retain_environment) = match &plan.source {
 		LogicalTraverseSource::Expression(expression) => {
 			let fields = RecordFields {
@@ -227,7 +228,7 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 		plan.custom_cost,
 		&plan.constraints,
 		graph.clone(),
-	);
+	)?;
 	if let Some(graph_plan) = &plan.return_graph {
 		let mut assembly = graph_result::GraphAssemblyAccumulator::new(graph, None, None, control);
 		while let Some(traverser) = machine.next()? {
@@ -578,6 +579,11 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 	}
 
 	#[allow(clippy::too_many_arguments, reason = "the VM owns one explicit statement context")]
+	/// Prepares every stage before pulling the first VM traverser.
+	///
+	/// # Errors
+	///
+	/// Returns invalid count errors without constructing a partial machine.
 	fn new(
 		read: &'a mut Read,
 		snapshot: Snapshot,
@@ -592,11 +598,11 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 		custom_cost: Option<crate::gql::ir::LogicalPathCost>,
 		constraints: &crate::syn::MatchConstraints,
 		graph: Option<GraphRef>,
-	) -> Self {
+	) -> FerrosGrynnResult<Self> {
+		let states = steps.iter().map(prepared_state).collect::<FerrosGrynnResult<Vec<_>>>()?;
 		let mut queues = (0..=steps.len()).map(|_| VecDeque::new()).collect::<Vec<_>>();
 		queues[0] = source_queue;
-		let states = steps.iter().map(prepared_state).collect::<Vec<_>>();
-		Self {
+		Ok(Self {
 			read,
 			snapshot,
 			steps,
@@ -618,7 +624,7 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 			occurrences: std::collections::BTreeMap::new(),
 			local_indexes: std::collections::BTreeMap::new(),
 			scoped_indexes: std::collections::BTreeMap::new(),
-		}
+		})
 	}
 
 	fn next(&mut self) -> FerrosGrynnResult<Option<Traverser>> {
@@ -773,25 +779,44 @@ impl<'a, Read: QueryRead> TraversalMachine<'a, Read> {
 	}
 }
 
-fn prepared_state(step: &PreparedStep) -> StageState {
-	match step.kind {
+/// Builds one stage state without substituting invalid counts with zero.
+///
+/// # Errors
+///
+/// Returns missing, nonnumeric, fractional, negative or overflowing count
+/// errors.
+fn prepared_state(step: &PreparedStep) -> FerrosGrynnResult<StageState> {
+	Ok(match step.kind {
 		TraverseStepKind::Vertices | TraverseStepKind::Edges => StageState::GraphScan(None),
-		TraverseStepKind::Limit => {
-			StageState::Limit(step.arguments.first().and_then(value_u64).unwrap_or(0))
-		}
-		TraverseStepKind::Skip => {
-			StageState::Skip(step.arguments.first().and_then(value_u64).unwrap_or(0))
+		TraverseStepKind::Limit | TraverseStepKind::Skip => {
+			let value = step.arguments.first().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("Traversal LIMIT/SKIP count is missing")
+			})?;
+			let count = value_u64(value)?;
+			if matches!(step.kind, TraverseStepKind::Limit) {
+				StageState::Limit(count)
+			} else {
+				StageState::Skip(count)
+			}
 		}
 		kind if barrier::is_barrier(kind) => StageState::Barrier(None),
 		_ => StageState::Streaming,
-	}
+	})
 }
 
-fn value_u64(value: &Value) -> Option<u64> {
-	value
-		.as_number()
-		.and_then(|number| i64::try_from(number).ok())
-		.and_then(|value| u64::try_from(value).ok())
+/// Uses the common exact numeric conversion for a traversal count.
+///
+/// # Errors
+///
+/// Returns a type mismatch or the existing unsigned integer conversion error.
+fn value_u64(value: &Value) -> FerrosGrynnResult<u64> {
+	let number = value.as_number().ok_or_else(|| {
+		FerrosGrynnError::traversal_source_type_mismatch(
+			"non-negative integer".to_owned(),
+			value.kind().to_string(),
+		)
+	})?;
+	u64::try_from(number)
 }
 
 fn expand_value(value: Value) -> FerrosGrynnResult<Vec<Value>> {

@@ -80,6 +80,9 @@ fn captured(original: bool) -> FerrosGrynnResult<CapturedCommit> {
 		}],
 	};
 	Ok(CapturedCommit {
+		revision: crate::datastore::SchemaVersion::new(7).ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("fixture revision")
+		})?,
 		net,
 		full: Some(full),
 		include_original: original,
@@ -92,7 +95,7 @@ fn changefeed_group_roundtrips_exact_numeric_tags_and_historical_full_noop() -> 
 {
 	for original in [false, true] {
 		let expected = captured(original)?;
-		let bytes = group::encode(&expected, 7, &mut CodecBudget::new(1024 * 1024, 0)?)?;
+		let bytes = group::encode(&expected, &mut CodecBudget::new(1024 * 1024, 0)?)?;
 		let decoded = group::decode(&bytes, &mut CodecBudget::new(1024 * 1024, bytes.len())?)?;
 		assert_eq!(group::inspect(&bytes[..80], bytes.len() as u64)?.revision, 7);
 		assert_eq!(decoded.commit.net, expected.net);
@@ -120,7 +123,7 @@ fn changefeed_group_roundtrips_exact_numeric_tags_and_historical_full_noop() -> 
 #[test]
 fn changefeed_group_rejects_truncation_flags_counts_lengths_ordinals_and_budget()
 -> FerrosGrynnResult<()> {
-	let bytes = group::encode(&captured(false)?, 7, &mut CodecBudget::new(1024 * 1024, 0)?)?;
+	let bytes = group::encode(&captured(false)?, &mut CodecBudget::new(1024 * 1024, 0)?)?;
 	for length in 0..bytes.len() {
 		assert!(group::decode(&bytes[..length], &mut CodecBudget::new(1024 * 1024, 0)?).is_err());
 	}
@@ -154,7 +157,7 @@ fn changefeed_group_rejects_truncation_flags_counts_lengths_ordinals_and_budget(
 	bad[80 + dictionary_length] = 1;
 	assert!(group::decode(&bad, &mut CodecBudget::new(1024 * 1024, 0)?).is_err());
 	assert!(group::decode(&bytes, &mut CodecBudget::new(1, 0)?).is_err());
-	assert!(group::encode(&captured(false)?, 7, &mut CodecBudget::new(1, 0)?).is_err());
+	assert!(group::encode(&captured(false)?, &mut CodecBudget::new(1, 0)?).is_err());
 	Ok(())
 }
 
@@ -169,7 +172,7 @@ fn changefeed_control_group_has_complete_header_and_no_image_rows() -> FerrosGry
 		from: Some(commit.net.versionstamp()),
 		through: Some(commit.net.versionstamp()),
 	});
-	let bytes = group::encode(&commit, 1, &mut CodecBudget::new(1024, 0)?)?;
+	let bytes = group::encode(&commit, &mut CodecBudget::new(1024, 0)?)?;
 	assert_eq!(bytes.len(), 96);
 	assert_eq!(&bytes[52..64], &[16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 	assert_eq!(&bytes[64..80], &[0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
@@ -369,8 +372,8 @@ fn changefeed_large_images_roundtrip_whole_commit_continuations() -> FerrosGrynn
 	commit.full = None;
 	commit.net.entries[0].before = Some(record(Value::from("before".repeat(10_000)))?);
 	commit.net.entries[0].after = Some(record(Value::from("after".repeat(10_000)))?);
-	let bytes = group::encode(&commit, 1, &mut CodecBudget::new(16 * 1024 * 1024, 0)?)?;
-	let (locator, pages) = super::pages::encode_pages(
+	let bytes = group::encode(&commit, &mut CodecBudget::new(16 * 1024 * 1024, 0)?)?;
+	let (locator, pages) = super::encode_pages(
 		&bytes,
 		commit.net.versionstamp().get(),
 		1,
@@ -384,7 +387,7 @@ fn changefeed_large_images_roundtrip_whole_commit_continuations() -> FerrosGrynn
 		output.as_bytes_mut().copy_from_slice(pages[(number.get() - 1) as usize].as_bytes());
 		Ok(())
 	};
-	let restored = super::pages::decode_pages(
+	let restored = super::decode_pages(
 		locator,
 		u64::from(locator.pages) + 1,
 		&mut read,

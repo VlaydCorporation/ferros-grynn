@@ -229,6 +229,33 @@ fn changefeed_reader_budgets_and_future_cursors_are_errors_not_gaps() -> FerrosG
 	Ok(())
 }
 
+/// A transaction lifetime failure is returned once without advancing position.
+#[test]
+fn changefeed_reader_transaction_failure_is_fused() -> FerrosGrynnResult<()> {
+	use crate::changefeed::ReadBatches;
+	let (store, id, record, key) = fixture()?;
+	two_commits(&store, &record, key)?;
+	let mut tx = store.begin();
+	let history = crate::datastore::source_history::SourceReader::new(
+		&store.inner,
+		Arc::clone(&tx.snapshot),
+		id,
+		ChangefeedReadOptions::default(),
+		None,
+		false,
+	)?;
+	tx.gql_aborted = true;
+	let mut reader = super::SnapshotReader {
+		transaction: &tx,
+		history,
+	};
+	let cursor = reader.cursor();
+	assert!(reader.next_batch(None).is_err());
+	assert_eq!(reader.cursor(), cursor);
+	assert!(reader.next_batch(None)?.is_none());
+	Ok(())
+}
+
 /// A stamp-only cursor cannot preserve a time boundary that has not been met.
 #[test]
 fn changefeed_reader_timestamp_seek_never_exports_an_earlier_stamp_cursor() -> FerrosGrynnResult<()>

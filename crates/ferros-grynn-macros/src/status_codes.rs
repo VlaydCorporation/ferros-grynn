@@ -49,6 +49,8 @@ impl ToTokens for StatusInput {
 		let definitions = self.definitions.iter().map(StatusDefinition::definition_arm);
 		let messages = self.definitions.iter().map(StatusDefinition::message_arm);
 		let parameter_arms = self.definitions.iter().map(StatusDefinition::parameters_arm);
+		let restore_arms = self.definitions.iter().map(StatusDefinition::restore_arm);
+		let allocation_arms = self.definitions.iter().map(StatusDefinition::allocation_arm);
 		let status_constructors = self.definitions.iter().map(StatusDefinition::status_constructor);
 		let error_constructors = self
 			.definitions
@@ -66,6 +68,27 @@ impl ToTokens for StatusInput {
 			}
 
 			impl Status {
+				/// Restores a declared status without losing typed parameter representations.
+				///
+				/// # Errors
+				/// Returns an invalid-argument status for an unknown code, missing/extra
+				/// parameter or mismatched diagnostic kind.
+				pub fn from_parameters(
+					code: crate::gql_status::StatusCode,
+					mut values: ::std::collections::BTreeMap<String, crate::gql_status::formatting::DiagnosticValue>,
+				) -> crate::gql_status::FerrosGrynnResult<Self> {
+					match code.body() {
+						#(#restore_arms,)*
+						_ => Err(crate::gql_status::FerrosGrynnError::invalid_argument("captured status code is not declared")),
+					}
+				}
+
+				/// Measures all owned parameter copies before constructing a diagnostic map.
+				/// Returns None when the required admission overflows usize.
+				pub fn parameter_allocation_bytes(&self) -> Option<usize> {
+					match self { #(#allocation_arms,)* }
+				}
+
 				pub const fn definition(&self) -> &'static StatusDefinition {
 					match self {
 						#(#definitions,)*
@@ -229,6 +252,63 @@ impl StatusDefinition {
 				let mut values = ::std::collections::BTreeMap::new();
 				#(#inserts)*
 				values
+			}
+		}
+	}
+
+	/// Generates exact reverse construction from the same declared parameter
+	/// schema.
+	fn restore_arm(&self) -> TokenStream {
+		let code = self.code.value();
+		let body = code.trim_start_matches("FG-");
+		let variant = &self.name;
+		let count = self.body.params.len();
+		let fields = self.body.params.iter().map(|parameter| &parameter.name);
+		let captures = self.body.params.iter().map(|parameter| {
+			let name = &parameter.name;
+			let ty = &parameter.ty;
+			let key = name.to_string();
+			quote! {
+				let #name: #ty = <#ty as crate::gql_status::formatting::CapturedParameter>::from_diagnostic(
+					values.remove(#key).ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("captured status parameter is missing"))?
+				).ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("captured status parameter kind is invalid"))?;
+			}
+		});
+		let construction = if count == 0 {
+			quote!(Self::#variant)
+		} else {
+			quote!(Self::#variant { #(#fields),* })
+		};
+		quote! {
+			#body => {
+				if values.len() != #count {
+					return Err(crate::gql_status::FerrosGrynnError::invalid_argument("captured status parameter count is invalid"));
+				}
+				#(#captures)*
+				Ok(#construction)
+			}
+		}
+	}
+
+	/// Measures borrowed fields before the existing parameters method clones
+	/// them.
+	fn allocation_arm(&self) -> TokenStream {
+		let pattern = self.match_pattern(true);
+		let base = self.body.params.len() * 256;
+		if base == 0 {
+			return quote! { #pattern => Some(0) };
+		}
+		let fields = self.body.params.iter().map(|parameter| {
+			let name = &parameter.name;
+			quote! {
+				bytes = bytes.checked_add(crate::gql_status::formatting::CapturedParameter::allocation_bytes(#name))?;
+			}
+		});
+		quote! {
+			#pattern => {
+				let mut bytes = #base;
+				#(#fields)*
+				Some(bytes)
 			}
 		}
 	}

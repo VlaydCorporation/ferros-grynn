@@ -5,6 +5,7 @@ pub mod datastore;
 pub mod ecs;
 pub mod gql;
 pub mod graph;
+pub mod live;
 pub mod math;
 mod memory;
 pub mod stats;

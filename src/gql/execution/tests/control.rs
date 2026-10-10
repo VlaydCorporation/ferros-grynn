@@ -308,6 +308,338 @@ fn sleep_is_cooperative_and_rejected_in_deterministic_mode()
 	Ok(())
 }
 
+/// Duration operands resolve the current lexical frame rather than raw
+/// execute parameters captured before an enclosing block.
+#[test]
+fn duration_operands_use_lexical_and_live_values() -> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let setup = store.execute(
+		"DEFINE CLASS duration_probe TYPE NODE; CREATE duration_probe:seed;",
+		&Object::new(),
+	)?;
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+	let mut inputs = Object::new();
+	for (name, duration) in [("zero", "0ms"), ("second", "1s")] {
+		inputs.insert(
+			name,
+			Value::from(duration.parse::<crate::values::Duration>().map_err(|error| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+			})?),
+		);
+	}
+	for source in [
+		"IF true { LET $delay = $zero; SLEEP $delay; RETURN 7; };",
+		"IF true { LET $limit = $second; SELECT VALUE 7 FROM duration_probe TIMEOUT $limit; \
+		 RETURN 7; };",
+		"LET $limit = $zero; IF true { LET $limit = $second; SELECT VALUE 7 FROM duration_probe \
+		 TIMEOUT $limit; RETURN 7; };",
+		"IF true { LET $limit = $zero; ALTER LET $limit VALUE $second; SELECT VALUE 7 FROM \
+		 duration_probe TIMEOUT $limit; RETURN 7; };",
+		"IF true { LET $delay: any = $zero; SLEEP $delay; RETURN 7; };",
+		"LET $bounded = |$limit| { IF true { SELECT VALUE 7 FROM duration_probe TIMEOUT $limit; \
+		 }; RETURN 7; }; RETURN $bounded($second);",
+	] {
+		let results = store.execute(source, &inputs)?;
+		assert!(results.iter().all(|result| result.result.is_ok()), "{source}: {results:?}");
+		assert_eq!(
+			results
+				.last()
+				.and_then(|result| result.result.as_ref().ok())
+				.map(|result| result.value()),
+			Some(&Value::from(7_i64))
+		);
+	}
+	let mut session = store.session();
+	for source in [
+		"LIVE LET $delay = $zero; SLEEP $delay;",
+		"ALTER LIVE LET $delay VALUE $second; IF true { SELECT VALUE 7 FROM duration_probe \
+		 TIMEOUT $delay; RETURN 7; };",
+	] {
+		let results = session.execute(source, &inputs)?;
+		assert!(results.iter().all(|result| result.result.is_ok()), "{source}: {results:?}");
+	}
+	let timed_out = session.execute(
+		"ALTER LIVE LET $delay VALUE $zero; IF true { SELECT VALUE 7 FROM duration_probe TIMEOUT \
+		 $delay; };",
+		&inputs,
+	)?;
+	assert!(timed_out[0].result.is_ok());
+	assert!(timed_out[1].result.is_err());
+	let mut transaction = store.begin();
+	let direct = transaction.execute(
+		"LIVE LET $direct = $zero; IF true { SLEEP $direct; SELECT VALUE 7 FROM duration_probe \
+		 TIMEOUT $second; };",
+		&inputs,
+	)?;
+	assert!(direct.iter().all(|result| result.result.is_ok()), "{direct:?}");
+	transaction.commit()?;
+	Ok(())
+}
+
+/// Top-level clauses use the predeclaration lexical frame and reactive value.
+#[test]
+fn duration_top_level_resolves_live_and_shadowed_bindings()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let mut inputs = Object::new();
+	for (name, duration) in [("zero", "0ms"), ("second", "1s")] {
+		inputs.insert(
+			name,
+			Value::from(duration.parse::<crate::values::Duration>().map_err(|error| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+			})?),
+		);
+	}
+	let setup = store.execute(
+		"DEFINE CLASS duration_probe TYPE NODE; CREATE duration_probe:seed;",
+		&Object::new(),
+	)?;
+	assert!(setup.iter().all(|result| result.result.is_ok()));
+	let mut session = store.session();
+	for source in [
+		"LIVE LET $limit = $second; SELECT VALUE 7 FROM duration_probe TIMEOUT $limit;",
+		"CREATE duration_probe:live TIMEOUT $limit;",
+		"LET $outer = $second; BEGIN; LET $outer = BUILD GRAPH FROM [] TIMEOUT $outer; CANCEL;",
+		"ALTER LIVE LET $limit VALUE $zero; CREATE duration_probe:rejected TIMEOUT $limit;",
+	] {
+		let results = session.execute(source, &inputs)?;
+		if source.contains("rejected") {
+			assert!(results[0].result.is_ok());
+			assert!(results[1].result.is_err());
+		} else {
+			assert!(results.iter().all(|result| result.result.is_ok()), "{source}: {results:?}");
+		}
+	}
+	assert!(store.begin().atom(&"duration_probe:rejected".parse::<RecordId>()?)?.is_none());
+	let mut transaction = store.begin();
+	let direct = transaction.execute(
+		"LIVE LET $direct = $second; CREATE duration_probe:direct TIMEOUT $direct;",
+		&inputs,
+	)?;
+	assert!(direct.iter().all(|result| result.result.is_ok()), "{direct:?}");
+	transaction.commit()?;
+	Ok(())
+}
+
+/// A resolved top-level deadline also bounds LIVE BLOCK publication waits.
+#[test]
+fn duration_top_level_reaches_block_publication() -> crate::gql_status::FerrosGrynnResult<()> {
+	use std::{sync::mpsc, thread, time::Duration};
+
+	use crate::{
+		datastore::ClassSchema,
+		gql::QueryCancellation,
+		gql_status::FerrosGrynnError,
+		graph::AtomKind,
+		live::{LiveNext, LiveOptions, LiveOverflowPolicy, LiveQuery, LiveSource},
+		values::PropertyMap,
+	};
+
+	for (source, parent_timeout, clause) in [
+		("CREATE duration_probe:rejected TIMEOUT $limit;", None, "40ms"),
+		(
+			"BEGIN IMPORT; CREATE duration_probe:rejected TIMEOUT $limit; END IMPORT;",
+			Some(Duration::from_millis(40)),
+			"1s",
+		),
+	] {
+		let store = Datastore::in_memory();
+		let mut setup = store.begin();
+		let class = setup.define_class(ClassSchema::new("duration_probe", AtomKind::Node, [])?)?;
+		setup.commit()?;
+		let mut subscription = store.subscribe_live(
+			LiveQuery::new(LiveSource::Class(class)),
+			LiveOptions::default().with_queue(1, 1 << 20)?.with_overflow(LiveOverflowPolicy::Block),
+		)?;
+		let mut first = store.begin();
+		first.create_atom("duration_probe:seed".parse()?, PropertyMap::new())?;
+		first.commit()?;
+		let LiveNext::Delivery(delivery) = subscription.next()? else {
+			return Err(FerrosGrynnError::invalid_argument("missing BLOCK seed"));
+		};
+		let cancellation = QueryCancellation::default();
+		let options = QueryExecutionOptions {
+			statement_timeout: parent_timeout,
+			cancellation: Some(cancellation.clone()),
+			..QueryExecutionOptions::default()
+		};
+		let (send, receive) = mpsc::channel();
+		let error = thread::scope(|scope| -> crate::gql_status::FerrosGrynnResult<String> {
+			let store = &store;
+			scope.spawn(move || {
+				let result = (|| -> crate::gql_status::FerrosGrynnResult<String> {
+					let short = clause
+						.parse::<crate::values::Duration>()
+						.map_err(|error| FerrosGrynnError::invalid_argument(error.to_string()))?;
+					let mut session = store.session();
+					let inputs = Object::from_iter([("short", Value::from(short))]);
+					for result in session.execute("LIVE LET $limit = $short;", &inputs)? {
+						result.result?;
+					}
+					let results = session.execute_with_options(source, &Object::new(), options)?;
+					results[0].result.as_ref().err().map(ToString::to_string).ok_or_else(|| {
+						FerrosGrynnError::invalid_argument("expired BLOCK statement published")
+					})
+				})();
+				let _sent = send.send(result.map_err(|error| error.to_string()));
+			});
+			let response = receive.recv_timeout(Duration::from_secs(2));
+			if response.is_err() {
+				cancellation.cancel();
+				let _cleanup = receive.recv_timeout(Duration::from_secs(2));
+			}
+			response
+				.map_err(|error| {
+					FerrosGrynnError::invalid_argument("BLOCK clause deadline did not finish")
+						.with_technical_source(error)
+				})?
+				.map_err(FerrosGrynnError::invalid_argument)
+		})?;
+		assert!(error.to_ascii_lowercase().contains("timeout"), "{error}");
+		let rejected = "duration_probe:rejected".parse::<RecordId>()?;
+		assert!(store.begin().atom(&rejected)?.is_none());
+		subscription.ack(delivery.token())?;
+		let retry = store.execute("CREATE duration_probe:rejected TIMEOUT 1s;", &Object::new())?;
+		assert!(retry[0].result.is_ok(), "{retry:?}");
+		assert!(store.begin().atom(&rejected)?.is_some());
+	}
+	Ok(())
+}
+
+/// Invalid durations fail before a nested operation can mutate or publish.
+#[test]
+fn duration_operands_reject_invalid_values_and_overflow() -> crate::gql_status::FerrosGrynnResult<()>
+{
+	let store = Datastore::in_memory();
+	let schema = store.execute("DEFINE CLASS duration_probe TYPE NODE;", &Object::new())?;
+	assert!(schema[0].result.is_ok());
+	for (duration, expected) in
+		[("P1M", "calendar"), ("-PT1S", "negative"), ("PT20000000000S", "too large")]
+	{
+		let inputs = Object::from_iter([(
+			"limit",
+			Value::from(duration.parse::<crate::values::Duration>().map_err(|error| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+			})?),
+		)]);
+		for source in [
+			"IF true { SLEEP $limit; };",
+			"IF true { CREATE duration_probe:x TIMEOUT $limit; };",
+			"CREATE duration_probe:x TIMEOUT $limit;",
+		] {
+			let results = store.execute(source, &inputs)?;
+			let error = results[0].result.as_ref().err().ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(
+					"invalid duration was accepted",
+				)
+			})?;
+			assert!(error.to_string().contains(expected), "{source}: {error}");
+		}
+	}
+	let huge = store.execute(
+		"IF true { CREATE duration_probe:x TIMEOUT 18446744073709549568s; };",
+		&Object::new(),
+	)?;
+	assert!(huge[0].result.is_err());
+	let huge_top =
+		store.execute("CREATE duration_probe:x TIMEOUT 18446744073709549568s;", &Object::new())?;
+	assert!(huge_top[0].result.is_err());
+	assert!(store.begin().atom(&"duration_probe:x".parse::<RecordId>()?)?.is_none());
+	Ok(())
+}
+
+/// Reactive duration reads retain old snapshot values and participate in SSI.
+#[test]
+fn duration_operands_snapshot_and_ssi() -> crate::gql_status::FerrosGrynnResult<()> {
+	for (initial, source) in [
+		("0ms", "SLEEP $duration;"),
+		("1s", "SELECT * FROM duration_probe TIMEOUT $duration;"),
+		("1s", "EXPLAIN SELECT * FROM duration_probe TIMEOUT $duration;"),
+		(
+			"1s",
+			"TRAVERSE FROM MATCH (* AS n) IN GRAPH duration_scope TIMEOUT $duration RETURN n |> \
+			 tv::count();",
+		),
+		(
+			"1s",
+			"TRAVERSE FROM $scope |> tv::V() |> tv::match(MATCH (* AS n) IN GRAPH duration_scope \
+			 TIMEOUT $duration RETURN n) |> tv::count();",
+		),
+	] {
+		for isolation in ["SNAPSHOT", "READ COMMITTED", "SERIALIZABLE"] {
+			let store = Datastore::in_memory();
+			let mut setup = store.begin();
+			let graph = setup.define_graph("duration_scope", GraphKind::Graph)?;
+			let record = "duration_probe:seed".parse::<RecordId>()?;
+			setup.define_class(crate::datastore::ClassSchema::new(
+				"duration_probe",
+				crate::graph::AtomKind::Node,
+				[],
+			)?)?;
+			setup.create_atom(record.clone(), crate::values::PropertyMap::new())?;
+			setup.attach_node(graph.id(), &record, None, None)?;
+			setup.commit()?;
+			let mut session = store.session();
+			let initial = initial.parse::<crate::values::Duration>().map_err(|error| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+			})?;
+			let parameters = Object::from_iter([
+				("initial", Value::from(initial)),
+				("graph", Value::from(graph)),
+			]);
+			let registered = session.execute(
+				"LIVE LET $duration = $initial; INFO FOR LIVE LET $duration; LET $scope = $graph;",
+				&parameters,
+			)?;
+			let Some(Value::Uuid(uuid)) = registered[1]
+				.result
+				.as_ref()
+				.map_err(Clone::clone)?
+				.value()
+				.as_object()
+				.and_then(|row| row.get("id"))
+			else {
+				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+					"duration binding has no UUID",
+				));
+			};
+			let id = crate::live::LiveBindingId::from_uuid(*uuid)?;
+			let begun = session
+				.execute(&format!("BEGIN ISOLATION LEVEL {isolation}; {source}"), &Object::new())?;
+			assert!(begun.iter().all(|result| result.result.is_ok()), "{begun:?}");
+			let negative = "-PT1S".parse::<crate::values::Duration>().map_err(|error| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+			})?;
+			let mut writer = store.begin();
+			writer.replace_live_binding_value(id, Value::from(negative))?;
+			writer.commit()?;
+			if isolation == "READ COMMITTED" {
+				let latest = session.execute(source, &Object::new())?;
+				assert!(latest[0].result.is_err());
+			} else {
+				let old = session.execute(source, &Object::new())?;
+				assert!(old.iter().all(|result| result.result.is_ok()), "{old:?}");
+				if isolation == "SERIALIZABLE" {
+					let commit = session
+						.execute("CREATE duration_probe:written; COMMIT;", &Object::new())?;
+					assert!(commit[0].result.is_ok());
+					assert!(commit[1].result.is_err());
+					assert!(
+						store
+							.begin()
+							.atom(&"duration_probe:written".parse::<RecordId>()?)?
+							.is_none()
+					);
+				} else {
+					assert!(session.execute("CANCEL;", &Object::new())?[0].result.is_ok());
+				}
+			}
+			assert!(session.execute(source, &Object::new())?[0].result.is_err());
+		}
+	}
+	Ok(())
+}
+
 #[test]
 fn enforces_numeric_coercion_and_power_contract() {
 	let store = Datastore::in_memory();

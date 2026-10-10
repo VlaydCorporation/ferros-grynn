@@ -25,7 +25,7 @@ use crate::{
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomKind, GraphKind},
-	storage::{ChangefeedSegment, LocalChangefeedSnapshot, LocalStore},
+	storage::{HistorySegment, LocalChangefeedSnapshot, LocalStore},
 	values::{PropertyKeyId, PropertyMap, RecordId, Value},
 };
 
@@ -33,7 +33,15 @@ use crate::{
 fn fixture(
 	path: &std::path::Path,
 ) -> FerrosGrynnResult<(Datastore, RecordId, PropertyKeyId, ChangefeedId, ChangefeedId)> {
-	let store = Datastore::create_local(path, LocalOptions::default())?;
+	fixture_with_options(path, LocalOptions::default())
+}
+
+/// Keeps FULL-source setup identical across independently selected backends.
+fn fixture_with_options(
+	path: &std::path::Path,
+	options: LocalOptions,
+) -> FerrosGrynnResult<(Datastore, RecordId, PropertyKeyId, ChangefeedId, ChangefeedId)> {
+	let store = Datastore::create_local(path, options)?;
 	let mut seed = store.begin();
 	let class = seed.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
 	let graph = seed.define_graph("scope", GraphKind::Graph)?;
@@ -133,7 +141,7 @@ fn groups(store: &Datastore, feed: ChangefeedId) -> FerrosGrynnResult<Vec<Captur
 }
 
 /// Gets the first authoritative descriptor without indexing an absent fixture.
-fn first_segment(store: &Datastore, feed: ChangefeedId) -> FerrosGrynnResult<ChangefeedSegment> {
+fn first_segment(store: &Datastore, feed: ChangefeedId) -> FerrosGrynnResult<HistorySegment> {
 	store
 		.inner
 		.current_root()
@@ -142,6 +150,36 @@ fn first_segment(store: &Datastore, feed: ChangefeedId) -> FerrosGrynnResult<Cha
 		.and_then(|segments| segments.first())
 		.copied()
 		.ok_or_else(|| FerrosGrynnError::invalid_argument("fixture segment absent"))
+}
+
+/// Authoritative namespace errors remain typed errors rather than optional
+/// segment corruption or skipped source bounds.
+#[test]
+fn changefeed_local_rejects_other_history_owners_before_optional_read() -> FerrosGrynnResult<()> {
+	let directory = TestDirectory::new();
+	let (store, record, key, feed, _) = fixture(&directory.0)?;
+	let mut update = store.begin();
+	update.set_base_property(&record, key, Value::from(2))?;
+	update.commit()?;
+	let segment = first_segment(&store, feed)?;
+	let snapshot = snapshot(&store)?;
+	assert!(local(&store)?.inspect_live_group(&snapshot, segment, 1, 256 * 1024 * 1024).is_err());
+	assert!(local(&store)?.read_live_payload(&snapshot, segment, 1, 256 * 1024 * 1024).is_err());
+	let mut private = segment;
+	private.header.owner =
+		crate::storage::HistoryOwner::Live(crate::live::LiveId::from_uuid(feed.as_uuid().clone())?);
+	assert!(
+		local(&store)?.inspect_changefeed_group(&snapshot, private, 1, 256 * 1024 * 1024).is_err()
+	);
+	assert!(
+		local(&store)?.read_changefeed_batch(&snapshot, private, 1, 256 * 1024 * 1024).is_err()
+	);
+	assert_eq!(
+		snapshot.read_observation().0,
+		0,
+		"wrong owners fail before reading any physical page"
+	);
+	Ok(())
 }
 
 #[test]
@@ -528,6 +566,64 @@ fn segment_file_count(root: &std::path::Path) -> FerrosGrynnResult<usize> {
 		}
 	}
 	Ok(count)
+}
+
+/// The first captured import segment hydrates its immutable replay origin
+/// before a cascade removes recovered global and graph-local records.
+fn first_segment_delete_survives_reopen(mode: crate::datastore::IoMode) -> FerrosGrynnResult<()> {
+	let options = LocalOptions {
+		io_mode: mode,
+		..LocalOptions::default()
+	};
+	let directory = TestDirectory::new();
+	let (store, record, _key, feed, graph_feed) =
+		fixture_with_options(&directory.0, options.clone())?;
+	drop(store);
+	let store = Datastore::open_local(&directory.0, options.clone())?;
+	assert!(store.inner.current_root().statistics.auxiliary_deferred());
+	let report = store.import(
+		ImportOptions {
+			changefeed: ImportChangefeedMode::On,
+			segment_size: 1,
+			..ImportOptions::default()
+		},
+		|session| {
+			session.apply_item(|tx| tx.delete_atom_cascade(&record, true))?;
+			Ok(())
+		},
+	)?;
+	assert_eq!(report.applied_items(), 1);
+	assert!(store.begin().atom(&record)?.is_none());
+	for source in [feed, graph_feed] {
+		let captured = groups(&store, source)?;
+		assert_eq!(captured.len(), 1);
+		assert_eq!(captured[0].net.entries().len(), 1);
+		assert_eq!(captured[0].full.as_ref().map(|full| full.entries().len()), Some(1));
+		assert_eq!(
+			captured[0].net.entries()[0].before().and_then(|image| image.properties().get("value")),
+			Some(&Value::from(1))
+		);
+		assert!(captured[0].net.entries()[0].after().is_none());
+	}
+	drop(store);
+	let store = Datastore::open_local(&directory.0, options)?;
+	for source in [feed, graph_feed] {
+		let captured = groups(&store, source)?;
+		assert_eq!(captured.len(), 1);
+		assert!(captured[0].net.entries()[0].after().is_none());
+	}
+	Ok(())
+}
+
+#[test]
+fn changefeed_local_import_reopen_first_segment_delete() -> FerrosGrynnResult<()> {
+	first_segment_delete_survives_reopen(crate::datastore::IoMode::Sync)
+}
+
+#[cfg(feature = "native-async-io")]
+#[test]
+fn changefeed_local_import_reopen_first_segment_delete_native_async() -> FerrosGrynnResult<()> {
+	first_segment_delete_survives_reopen(crate::datastore::IoMode::NativeAsync)
 }
 
 /// A source with no segments must still obey the recovered publication clock.

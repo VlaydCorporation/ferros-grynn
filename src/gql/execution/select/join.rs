@@ -9,21 +9,77 @@ use crate::gql::spill::RecordStream;
 
 const JOIN_PARTITIONS: u64 = 64;
 
-fn combine_rows(left: &Row, right: &Row, right_layout: (usize, usize)) -> Row {
-	let mut values = left.values.clone();
+/// Admits each product before cloning, including predicate-free CROSS joins.
+///
+/// # Errors
+/// Propagates cancellation/resource errors and rejects malformed padded
+/// layouts.
+pub(super) fn combine_rows<Read: QueryRead>(
+	read: &Read,
+	control: &ExecutionControl,
+	left: &Row,
+	right: &Row,
+	right_layout: (usize, usize),
+) -> FerrosGrynnResult<Row> {
+	control.check()?;
 	let (offset, width) = right_layout;
-	values[offset..offset.saturating_add(width)]
-		.clone_from_slice(&right.values[offset..offset.saturating_add(width)]);
+	let end = offset
+		.checked_add(width)
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("JOIN row layout"))?;
+	let right_values = right.values.get(offset..end).ok_or_else(|| {
+		FerrosGrynnError::invalid_storage_file("JOIN right row layout is invalid")
+	})?;
+	if end > left.values.len() {
+		return Err(FerrosGrynnError::invalid_storage_file("JOIN left row layout is invalid"));
+	}
+	if let Some(fields) = read.bounded_fields() {
+		fields.work(1)?;
+		let values = left
+			.values
+			.len()
+			.checked_add(left.stable.len())
+			.and_then(|n| n.checked_add(right.stable.len()))
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("JOIN row values"))?;
+		let sequence = left
+			.sequence
+			.len()
+			.checked_add(right.sequence.len())
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("JOIN row sequence"))?;
+		fields.admit(
+			values
+				.checked_mul(2 * size_of::<Value>())
+				.and_then(|n| {
+					sequence.checked_mul(2 * size_of::<usize>()).and_then(|m| n.checked_add(m))
+				})
+				.and_then(|n| n.checked_add(size_of::<Row>()))
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("JOIN row allocation"))?,
+		)?;
+		for value in left.values.iter().chain(right_values).chain(&left.stable).chain(&right.stable)
+		{
+			fields.admit_value(value)?;
+		}
+		if let Some(graph) = left.graph.as_ref().or(right.graph.as_ref()) {
+			fields.admit(
+				graph
+					.name()
+					.len()
+					.checked_add(size_of::<GraphRef>())
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("JOIN graph scope"))?,
+			)?;
+		}
+	}
+	let mut values = left.values.clone();
+	values[offset..end].clone_from_slice(right_values);
 	let mut stable = Vec::with_capacity(left.stable.len() + right.stable.len());
 	stable.extend(left.stable.iter().cloned());
 	stable.extend(right.stable.iter().cloned());
 	let mut sequence = Vec::with_capacity(left.sequence.len() + right.sequence.len());
 	sequence.extend(left.sequence.iter().copied());
 	sequence.extend(right.sequence.iter().copied());
-	Row::new(values)
+	Ok(Row::new(values)
 		.with_graph(left.graph.clone().or_else(|| right.graph.clone()))
 		.with_sequence(sequence)
-		.with_stable(stable)
+		.with_stable(stable))
 }
 
 #[allow(clippy::too_many_arguments, reason = "join evaluation uses the complete statement context")]
@@ -172,11 +228,14 @@ pub(super) fn index_nested_join_rows<Read: QueryRead>(
 				read.probe_index(snapshot, class, graph.as_ref(), probe.index, &key, true)?;
 			let mut ordinal = 0_usize;
 			while let Some(right) = right.next(control)? {
-				let right = layout_row(
-					right.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+				let right = scoped_layout_row(
+					read,
+					right,
+					graph.as_ref(),
+					Some(&[ordinal]),
 					Some((right_layout.0, right_layout.1, left.values.len())),
-				);
-				let row = combine_rows(&left, &right, right_layout);
+				)?;
+				let row = combine_rows(read, control, &left, &right, right_layout)?;
 				if join_predicates_match(read, snapshot, predicates, &row, slots, source, control)?
 				{
 					matched = true;
@@ -295,7 +354,7 @@ fn join_block<Read: QueryRead>(
 	right.visit(|right| {
 		control.check()?;
 		for (index, left) in left.iter().enumerate() {
-			let row = combine_rows(left, &right, right_layout);
+			let row = combine_rows(read, control, left, &right, right_layout)?;
 			if join_predicates_match(read, snapshot, predicates, &row, slots, source, control)? {
 				matched[index] = true;
 				joined.push(read, snapshot, row)?;
@@ -401,7 +460,8 @@ fn hash_join_rows<Read: QueryRead>(
 				let mut matched = false;
 				if let Some(candidates) = candidates {
 					for position in candidates {
-						let row = combine_rows(&left, &right[*position], right_layout);
+						let row =
+							combine_rows(read, control, &left, &right[*position], right_layout)?;
 						if join_predicates_match(
 							read, snapshot, predicates, &row, slots, source, control,
 						)? {
@@ -424,7 +484,8 @@ fn hash_join_rows<Read: QueryRead>(
 				}
 				if let Some(candidates) = index.get(&key) {
 					for position in candidates {
-						let row = combine_rows(&left[*position], &right, right_layout);
+						let row =
+							combine_rows(read, control, &left[*position], &right, right_layout)?;
 						if join_predicates_match(
 							read, snapshot, predicates, &row, slots, source, control,
 						)? {
@@ -700,7 +761,7 @@ fn join_partition<Read: QueryRead>(
 					&& let Some(candidates) = index.get(&key)
 				{
 					for right in candidates {
-						let row = combine_rows(&left, right, right_layout);
+						let row = combine_rows(read, control, &left, right, right_layout)?;
 						if join_predicates_match(
 							read, snapshot, predicates, &row, slots, source, control,
 						)? {
@@ -775,7 +836,7 @@ fn join_partition<Read: QueryRead>(
 					&& let Some(candidates) = index.get(&key)
 				{
 					for left in candidates {
-						let row = combine_rows(left, &right, right_layout);
+						let row = combine_rows(read, control, left, &right, right_layout)?;
 						if join_predicates_match(
 							read, snapshot, predicates, &row, slots, source, control,
 						)? {
@@ -811,7 +872,7 @@ fn nested_join_partition<Read: QueryRead>(
 	left.consume(|left| {
 		let mut matched = false;
 		right.visit(|right| {
-			let row = combine_rows(&left, &right, right_layout);
+			let row = combine_rows(read, control, &left, &right, right_layout)?;
 			if join_predicates_match(read, snapshot, predicates, &row, slots, source, control)? {
 				matched = true;
 				joined.push(read, snapshot, row)?;

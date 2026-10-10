@@ -10,6 +10,7 @@ use super::{
 	QualifiedAtomRef,
 	canonical_f64,
 	codec,
+	tree_allocation_bytes,
 	unresolved,
 };
 use crate::{
@@ -639,26 +640,6 @@ fn allocation_add(bytes: &mut usize, additional: usize) -> FerrosGrynnResult<()>
 	Ok(())
 }
 
-/// Reserves complete initial B-tree nodes and sparse node occupancy, rather
-/// than charging only live entries. The fixed reserve covers root/split
-/// scratch; four slots per entry cover current std node occupancy and pointer
-/// arrays.
-#[allow(
-	clippy::redundant_pub_crate,
-	reason = "The private DTO module re-exports this shared admission helper to physical codecs."
-)]
-pub(crate) fn tree_allocation_bytes(count: usize, entry_bytes: usize) -> FerrosGrynnResult<usize> {
-	if count == 0 {
-		return Ok(0);
-	}
-	entry_bytes
-		.checked_add(32)
-		.and_then(|bytes| bytes.checked_mul(4))
-		.and_then(|bytes| bytes.checked_mul(count))
-		.and_then(|bytes| bytes.checked_add(4096))
-		.ok_or_else(|| FerrosGrynnError::operation_overflow("runtime tree allocation"))
-}
-
 /// Bounds composite RecordId conversion without materializing its runtime tree.
 fn record_value_allocation(value: &StorageRecordValue) -> FerrosGrynnResult<usize> {
 	let mut bytes = 256usize;
@@ -709,7 +690,11 @@ impl StorageRange {
 	}
 
 	fn into_runtime(self, context: &DecodeContext<'_>) -> FerrosGrynnResult<Range> {
-		Range::new(self.start.into_runtime(context)?, self.end.into_runtime(context)?)
+		Range::new_with_diagnostic_admission(
+			self.start.into_runtime(context)?,
+			self.end.into_runtime(context)?,
+			|_, _| Err(FerrosGrynnError::invalid_storage_file("Stored range bounds are invalid")),
+		)
 	}
 }
 

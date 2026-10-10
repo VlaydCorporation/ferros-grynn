@@ -159,9 +159,9 @@ pub(in crate::storage) struct DecodedGroup {
 /// budget.
 pub(in crate::storage) fn encode(
 	commit: &CapturedCommit,
-	revision: u32,
 	budget: &mut CodecBudget,
 ) -> FerrosGrynnResult<Vec<u8>> {
+	let revision = commit.revision.get();
 	validate_commit(commit, revision)?;
 	let mut context = EncodeContext::default();
 	let mut body = Vec::new();
@@ -278,6 +278,8 @@ pub(in crate::storage) fn decode(
 		_ => return Err(invalid("changefeed suppression reason is unknown")),
 	};
 	let commit = CapturedCommit {
+		revision: crate::datastore::SchemaVersion::new(revision)
+			.ok_or_else(|| invalid("changefeed source revision is reserved"))?,
 		net: batch,
 		full,
 		include_original: original,

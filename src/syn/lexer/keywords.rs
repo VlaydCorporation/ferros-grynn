@@ -1,5 +1,10 @@
 //! Keywords recognized by the current parser profile.
 
+/// Whole-delivery confirmation, never an arbitrary numeric watermark.
+pub(in crate::syn) const ACK: &str = "ACK";
+/// Serialized origin/query/version bound LIVE token operand.
+pub(in crate::syn) const CURSOR: &str = "CURSOR";
+
 pub(in crate::syn) const AFTER: &str = "AFTER";
 pub(in crate::syn) const ALPHA: &str = "ALPHA";
 pub(in crate::syn) const ALL: &str = "ALL";
@@ -255,4 +260,17 @@ pub(in crate::syn) const WHEN: &str = "WHEN";
 pub(in crate::syn) const WHILE: &str = "WHILE";
 
 /// Statement starts recognized only to return the explicit unsupported status.
-pub(in crate::syn) const UNSUPPORTED_STATEMENTS: &[&str] = &["LIVE"];
+pub(in crate::syn) const UNSUPPORTED_STATEMENTS: &[&str] = &[];
+
+/// Reactive query/binding statement prefix.
+pub(in crate::syn) const LIVE: &str = "LIVE";
+/// Introduces queue overflow policy.
+pub(in crate::syn) const OVERFLOW: &str = "OVERFLOW";
+/// Explicit delivery loss policy.
+pub(in crate::syn) const GAP: &str = "GAP";
+/// Terminal overflow policy.
+pub(in crate::syn) const DISCONNECT: &str = "DISCONNECT";
+/// Capacity wait policy before publication.
+pub(in crate::syn) const BLOCK: &str = "BLOCK";
+/// Maximum event entries retained by a queue.
+pub(in crate::syn) const BUFFER: &str = "BUFFER";

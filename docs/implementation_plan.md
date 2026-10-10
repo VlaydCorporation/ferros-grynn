@@ -93,7 +93,7 @@ implementation oracle и не могут использоваться как tar
 | `GQL-VECTOR`       | HNSW, затем DiskANN; KNN/ANN и HASHED_VECTOR                                                          | 23                                                                   | контракт утверждён / реализация отсутствует                         | Per-algorithm recall/latency/memory/build/recovery gates                                  |
 | `GQL-GEO-DERIVED`  | Geometry R-tree и graph-derived indexes                                                               | 24–25                                                                | `draft` / `missing`                                                 | Exact post-filter; `build_lsn`/`stale` fallback and rebuild tests                         |
 | `GQL-CHANGEFEED`   | Durable CLASS/GRAPH history и самостоятельный Rust SDK                                                | 27                                                                   | C0–C9 и C10 full/backend correctness PASS; performance/tooling OPEN | NET/FULL, whole-commit cursor/GAP, unified WAL, bounded retention; stage-27 report        |
-| `GQL-LIVE-EVENTS`  | `LIVE SELECT`, events, LiveGraph integration                                                          | 28–29                                                                | `draft` / `missing`                                                 | Bounded queues, retry/idempotency/conflict tests                                          |
+| `GQL-LIVE-EVENTS`  | `LIVE SELECT`, events, LiveGraph integration                                                          | 28–29                                                                | Stage 28 `partial`; Stage 29 `missing`; closure OPEN                | LIVE SDK/LET/queues/ACK, JOIN/DIFF/PATCH; L10 metadata/counters/plans; L11 и closure OPEN |
 | `GQL-BRIDGES`      | `Bridge`, `.use_bridge`, `BridgeData`, `SurrealBridge`                                                | 30                                                                   | `draft` / `missing`                                                 | Public-value boundary, external failure mapping и cross-database E2E                      |
 
 ## Утверждённый срез GrynQL P0–P2
@@ -867,8 +867,102 @@ storage-интеграция зависит от B.
   storage — registered .fcf pages и checked codecs. Existing commit_ts, один TxHandle/WAL
   barrier, whole-commit resume, NET/FULL и explicit GAP; retention через existing worker.
   Durable source metadata не зависит от существования удалённой CLASS/GRAPH definition.
-- **Этап 28** — `LiveQueryRegistry`, bounded session queue и ack. Этап 27 эти структуры
-  не создаёт; LIVE consumer использует durable pull reader и явно обрабатывает GAP.
+- **Этап 28** — [план LIVE SELECT/LIVE LET](gql_live_stage_28_plan.md): самостоятельный
+  `live` SDK, frozen captures/reactive binding DAG, root-bound SELECT/FETCH,
+  durable computed result history, bounded queues, whole-commit ACK/resume.
+  Executable IR не сериализуется; существующие WAL/worker/query pipeline сохраняются.
+  [Evidence](reports/gql_live_stage_28_report.md), closure OPEN.
+  C28-4/5: private selective revision COW и scoped backfill segment reuse.
+  Full lib1149, public LIVE46 и local checkpoint16 PASS, Clippy delta0.
+  RAM ACK1M~303x по paired samples; C28-5 Sync ACK1M~1.69x по paired CI; общий L11 остаётся OPEN.
+  Прежний attempt cap снят; новое указание разрешает пять новых оптимизаций.
+  Used **5/5**: final C28-19 exclusive readset correctness PASS
+  (full1165/10 ignored/backend10/38/16/focused3), release PASS;
+  Пятаяправка оставлена: pairedcontrols6/6 pass5%vsC28-15, universal speedup
+  не заявляется. **Оптимизации STOP5/5**, только closure/evidence.
+  Финальный default run6: 72 cells, 0 timeouts, original common **5/9 PASS**,
+  FAIL_OR_INCONCLUSIVE. `just all-check`: check/fmt PASS, global Clippy
+  pre-existing FAIL 6989/537; 646 protected Rust files сохранены.
+  Fixed large-work100K/1M RAM/Sync **24/24 MeasuredWithOracle**, по10 samples,
+  без timeout/GAP/faults; final source627 и protected646 hashes неизменны.
+  Предыдущие результаты: C28-18 one-line read forwarding correctness PASS, stable
+  performance benefit не доказан; **откатан** к provenC28-15.
+  Предыдущие результаты: C28-17 cold LIVE AST payload boxing correctness/layout PASS,
+  RETURN performance не прошёл; **откатан** к proven C28-15 source.
+  Предыдущие результаты: C28-15 full1162/10 ignored/backend10/38/16 PASS, registration
+  timeout устранён; full run5 common3/9, FAIL_OR_INCONCLUSIVE. C28-16 private
+  revision comparator correctness PASS, paired result mixed; **откатан** к
+  proven C28-15 source, source optimizations used2/5.
+  После пятой прекращаются оптимизации, closure по evidence остаётся OPEN.
+  L1–L7 foundation correctness gates PASS (SDK/bindings/results/durable history,
+  common import publication и consumer queues/ACK). RAM/Sync/NativeAsync проверены
+  для owned Array/Set/Object/unary/Access/Index/IF/CASE/CAST/Range и scalar operators/Truthy
+  recipes, typed/named/DISTINCT calls с reopened resume→ACK→mutation;
+  GQL reactive inputs, START AFTER и deferred MATCH GRAPH/MAXDEPTH получают отдельные
+  focused gates. Полнота L9 остаётся OPEN;
+  general historical coverage, observability и closure требуют L8–L11;
+  performance/tooling closure остаётся OPEN. Static scoped GraphRecord и
+  SLEEP/nested TIMEOUT snapshot operands имеют focused correctness evidence.
+  Ordinary top-level TIMEOUT сохраняет snapshot/SSI, construction clock и
+  publication deadline, с общим continuation cleanup на ошибках.
+  Import item TIMEOUT имеет typed snapshot preflight, frozen values до lease/END
+  и inherited session metadata; nested shadowing/root race/parent deadline проверены.
+  EXPLAIN TIMEOUT использует normalized outer statement и общий borrowed
+  cursor retirement для top/block/entry errors. Embedded MATCH удерживает typed
+  invocation duration до общей visitor boundary; три consumers, RETURN GRAPH
+  и final-row cancellation проверены.
+  Ordinary reactive record Field удерживает snapshot resolver; shared selected-field
+  admission сохраняет Hidden/overlay/base fallback и property SSI без whole-row copy.
+  Limit/Skip counts сохраняют exact u64 и typed errors; slice oracle, snapshot/SSI,
+  negative replacement и exact checkpoint/reopen проходят отдельные backend gates.
+  Frozen root graph parameters reify static GraphClass/GraphRecord при registration;
+  bounded named lookup, catalog SSI и saved-result reopen/ACK проходят gates.
+  Tracked/computed/nested class/record scopes используют общий RootRead;
+  durable owner/name pair проходит pending/future-SINCE/name-reuse и reopen gates.
+  SDK GraphExpr выбирает весь qualified occurrence domain; root/nested scope
+  разрешается один раз, zero/multi-class, lexical shadowing и PURE overloads PASS.
+  LIVE capture owner хранится в immutable catalog отдельно от recipe; publication
+  и recovery validation читают identity без user evaluation. Static parity gate PASS.
+  Empty source сохраняет optional typed graph scope и validation при zero classes,
+  nested SELECT, COUNT и LIMIT 0; PlanHash encoding v9, source/resource review PASS.
+  GROUP BY/ALL SDK/GQL сохраняет exact group identity, per-class argument plans,
+  frozen/reactive provenance и owned saved-result resume.
+  Compound aggregate constructors используют общий bounded SELECT kernel,
+  metadata compatibility и lazy IF/CASE; composite resume Sync/NativeAsync PASS.
+  OMIT SDK/GQL/descriptor использует shared SELECT до FETCH; row/group identities
+  сохраняются отдельно, work/depth/cancellation checked. OMIT history и
+  saved-result replay Sync/NativeAsync PASS 1/1 каждый.
+  L9k0 typed root/grouped union применяет общий exact LIMIT/START window с
+  сохранением anchors, zero-scope reads и work/cancellation skip; focused 6/6 PASS.
+  L9k1 global row union/grouped ORDER kernel PASS 11/11. L9k2 owned ORDER/LIMIT/START
+  SDK/GQL/FGLD recipes PASS focused 18/18, LIVE 266/266; complete-domain history.
+  Public window Sync/NativeAsync PASS 1/1 каждый, rustdoc LIVE 13/13 PASS.
+  L9l0/L9l1 shared SELECT ONLY и public recipes PASS focused 26/26;
+  composite JOIN/SPLIT identities выбраны пользователем; runtime/codec L9m0 PASS3/3,
+  SPLIT kernel/recipes/history PASS focused34/34, saved qualified replay/ACK
+  Sync/NativeAsync1/1 каждый; root JOIN kernel PASS8/8 (qualified slots, CBO/LEFT,
+  source/pair admission, union/group и ON scheduling), public recipes OPEN.
+  Source-owned frozen scopes и primary alias SDK/GQL/codec PASS; qualified
+  historical row-only coverage сохраняется shared qualifier rule.
+  Latest full lib 1104 passed / 10 ignored
+  (test debug=0/j1; default-symbol build OOM); ONLY window Sync/NativeAsync 1/1,
+  alias/SPLIT replay/ACK Sync/NativeAsync1/1 каждый, rustdoc LIVE 17/17;
+  Clippy added diagnostics 0.
+  Hydrated before-root общий для primary/capture replay; first ON import segment
+  допускает metadata и hydration до retained origin, separate Sync/NativeAsync PASS.
+  Enriched duration/import/EXPLAIN/MATCH backend fixtures Sync/NativeAsync PASS 1/1 каждый.
+  Reactive record navigation и selected-field resource fixtures PASS 1/1 для каждого
+  backend; focused/full/source gates закрыты, stage closure по-прежнему OPEN.
+  L9m8/m9 full correctness закрывает polymorphic JOIN/family reductions и native
+  DIFF/PATCH consumers. L10a/b metadata и process counters имеют full1134 PASS;
+  L10c physical LIVE phases/PlanHash v10, named option slot provenance и borrowed
+  controlled codecs имеют focused EXPLAIN3/3 и descriptor24/24 PASS; full lib1138/10 ignored/0 filtered PASS, check/fmt PASS, Clippy delta0; отдельные backend/tooling closure gates завершаются. Registry/current value/history metadata не смешиваются.
+  L11 performance attempts 1/5 Failed (неполная матрица); после scoped streaming
+  admission repair full lib1144/10 ignored/0 filtered, resource6/6, RAM10/10 и
+  Sync+NativeAsync36/36 PASS; Clippy delta0. Post-repair optimized build10m47s PASS; paired попытка2 Completed/FAIL_OR_INCONCLUSIVE:72 cells,26 capacity gaps,4 timeouts,
+  common2/9 criteria PASS. Attempts3–5 не запущены; closure OPEN.
+  После пятой неудачи оптимизации прекращаются,
+  оставшаяся работа продолжается с открытым performance gate.
 - **`LiveGraph<Frozen>`** 🔴 — COW delta, atomic publish frozen revision и revision guard.
 - **`LiveGraph<Mutable>`** 🔴 — dirty-set, incoming queue, pause-on-conflict и явные
   `accept_remote`/`keep_local`/`discard_local`/`rebase`/`flush`/`resume`; ни remote delta, ни

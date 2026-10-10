@@ -78,7 +78,7 @@ pub(in crate::storage) fn backfill_graph_checkpoint(
 				return Err(invalid("checkpoint selected an invalid GraphSuperblock frame"));
 			}
 			let mut page = AlignedPage::zeroed();
-			wal.read_frame(*frame, &mut page)?;
+			wal.frame_read_scope().read_frame(*frame, &mut page)?;
 			logical_superblock = Some(GraphSuperblock::decode(&page)?);
 			continue;
 		}

@@ -11,7 +11,7 @@ use std::{
 	mem::size_of,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 };
 
@@ -31,6 +31,10 @@ pub(crate) struct LanguageClosureState {
 	registry: Mutex<LanguageClosureRegistry>,
 	populated: AtomicBool,
 	compiler_bounded: bool,
+	/// Optional embedding work cap, charged before tokenization/analysis.
+	compiler_work: Option<AtomicU64>,
+	/// Registration compiler interruption without retaining the caller cache.
+	compiler_checks: Option<super::options::ExecutionChecks>,
 }
 
 impl LanguageClosureState {
@@ -44,7 +48,25 @@ impl LanguageClosureState {
 			}),
 			populated: AtomicBool::new(false),
 			compiler_bounded: true,
+			compiler_work: None,
+			compiler_checks: None,
 		}
+	}
+
+	/// Adds a conservative source-byte work cap to the existing compiler scope.
+	pub(in crate::gql) fn bounded_with_work(limit: usize, work: u64) -> Self {
+		let mut state = Self::bounded(limit);
+		state.compiler_work = Some(AtomicU64::new(work));
+		state
+	}
+
+	/// Binds checks only for the lifetime of this private compiler instance.
+	pub(in crate::gql) fn with_compile_checks(
+		mut self,
+		checks: Option<super::options::ExecutionChecks>,
+	) -> Self {
+		self.compiler_checks = checks;
+		self
 	}
 
 	/// Admits compilation before source, tokens, syntax or typed IR are
@@ -53,6 +75,56 @@ impl LanguageClosureState {
 		&self,
 		source_bytes: usize,
 	) -> FerrosGrynnResult<CompileReservation<'_>> {
+		self.check_compile()?;
+		let work = if self.compiler_work.is_some() {
+			u64::try_from(source_bytes)
+				.ok()
+				.and_then(|bytes| bytes.checked_add(1))
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("PURE compiler work"))?
+		} else {
+			0
+		};
+		self.reserve_compile(
+			source_bytes.checked_mul(1024).and_then(|bytes| bytes.checked_add(16_384)),
+			work,
+		)
+	}
+
+	/// Raw signature copies share the existing account without source
+	/// expansion.
+	pub(in crate::gql) fn admit_compile_metadata(
+		&self,
+		bytes: usize,
+		work: u64,
+	) -> FerrosGrynnResult<CompileReservation<'_>> {
+		self.check_compile()?;
+		self.reserve_compile(Some(bytes), work)
+	}
+
+	/// Borrowed metadata traversal inherits compiler cancellation and deadline.
+	pub(in crate::gql) fn check_compile(&self) -> FerrosGrynnResult<()> {
+		if let Some(checks) = &self.compiler_checks {
+			checks.check()?;
+		}
+		Ok(())
+	}
+
+	/// The sole work/scratch ledger admits either expanded source or raw
+	/// copies.
+	fn reserve_compile(
+		&self,
+		bytes: Option<usize>,
+		work: u64,
+	) -> FerrosGrynnResult<CompileReservation<'_>> {
+		if let Some(remaining) = &self.compiler_work {
+			remaining
+				.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+					remaining.checked_sub(work)
+				})
+				.map_err(|_work| {
+					FerrosGrynnError::traversal_resource_limit_exceeded("PURE compiler work", work)
+				})?;
+		}
 		if !self.compiler_bounded {
 			return Ok(CompileReservation {
 				state: self,
@@ -61,10 +133,7 @@ impl LanguageClosureState {
 		}
 		let mut registry = self.registry.lock();
 		let bytes = if let Some(limit) = registry.scratch_limit {
-			let bytes = source_bytes
-				.checked_mul(1024)
-				.and_then(|bytes| bytes.checked_add(16_384))
-				.ok_or_else(|| compiler_resource(limit))?;
+			let bytes = bytes.ok_or_else(|| compiler_resource(limit))?;
 			let next = registry
 				.compiling_bytes
 				.checked_add(bytes)
@@ -86,6 +155,16 @@ impl LanguageClosureState {
 
 	pub(crate) fn has_entries(&self) -> bool {
 		self.populated.load(Ordering::Acquire)
+	}
+
+	/// Identifies compiler frames with an existing embedding scratch ceiling.
+	pub(in crate::gql) const fn is_compiler_bounded(&self) -> bool {
+		self.compiler_bounded
+	}
+
+	/// Hands the compiler's unspent gas to a bounded embedding's runtime.
+	pub(in crate::gql) fn remaining_compile_work(&self) -> Option<u64> {
+		self.compiler_work.as_ref().map(|work| work.load(Ordering::Acquire))
 	}
 
 	pub(in crate::gql) fn register(
@@ -134,14 +213,44 @@ impl LanguageClosureState {
 	}
 
 	pub(in crate::gql) fn cache_named_plan(&self, plan: &LogicalClosure) -> FerrosGrynnResult<()> {
+		if let Some(checks) = &self.compiler_checks {
+			checks.check()?;
+		}
 		self.registry.lock().cache_named(plan)?;
 		self.populated.store(true, Ordering::Release);
+		Ok(())
+	}
+
+	/// Retains only compiled plans; the destination never inherits compiler
+	/// checks, budgets or caller state from this temporary scope.
+	pub(in crate::gql) fn promote_named_to(&self, target: &Self) -> FerrosGrynnResult<()> {
+		if let Some(checks) = &self.compiler_checks {
+			checks.check()?;
+		}
+		let registry = self.registry.lock();
+		let mut destination = target.registry.lock();
+		for plan in registry.named_entries.values() {
+			if let Some(function) = plan.named_function
+				&& destination.admit_named(function, plan.retained_plan_bytes)?
+			{
+				destination.named_entries.insert(function, Arc::clone(plan));
+			}
+		}
+		target.populated.store(
+			!destination.entries.is_empty() || !destination.named_entries.is_empty(),
+			Ordering::Release,
+		);
 		Ok(())
 	}
 
 	#[cfg(test)]
 	pub(crate) fn retained_bytes(&self) -> usize {
 		self.registry.lock().retained_bytes()
+	}
+
+	/// Admission count for the immutable cache's transitive named-call keys.
+	pub(in crate::gql) fn named_dependency_count(&self) -> usize {
+		self.registry.lock().named_entries.len()
 	}
 
 	/// Captured identities for already compiled transitive named calls.
@@ -285,18 +394,24 @@ impl LanguageClosureRegistry {
 		let Some(function) = plan.named_function else {
 			return Ok(());
 		};
+		if self.admit_named(function, plan.retained_plan_bytes)? {
+			self.named_entries.insert(function, Arc::new(plan.clone()));
+		}
+		Ok(())
+	}
+
+	/// Applies the same epoch and retained-byte authority to owned and shared
+	/// plans before either insertion allocates.
+	fn admit_named(&mut self, function: NamedFunctionKey, bytes: usize) -> FerrosGrynnResult<bool> {
 		if self.named_epoch != Some(function.schema_epoch) {
 			self.named_entries.clear();
 			self.named_bytes = 0;
 			self.named_epoch = Some(function.schema_epoch);
 		}
 		if self.named_entries.contains_key(&function) {
-			return Ok(());
+			return Ok(false);
 		}
-		let retained = self
-			.retained_bytes
-			.saturating_add(self.named_bytes)
-			.saturating_add(plan.retained_plan_bytes);
+		let retained = self.retained_bytes.saturating_add(self.named_bytes).saturating_add(bytes);
 		let limit = self.scratch_limit.unwrap_or(MAX_RETAINED_BYTES);
 		if retained.saturating_add(self.compiling_bytes) > limit {
 			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
@@ -304,9 +419,8 @@ impl LanguageClosureRegistry {
 				limit as u64,
 			));
 		}
-		self.named_bytes = self.named_bytes.saturating_add(plan.retained_plan_bytes);
-		self.named_entries.insert(function, Arc::new(plan.clone()));
-		Ok(())
+		self.named_bytes = self.named_bytes.saturating_add(bytes);
+		Ok(true)
 	}
 
 	/// Releases closures created by one statement unless its result or a

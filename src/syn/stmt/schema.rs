@@ -315,6 +315,8 @@ pub enum ParameterCommentChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RemoveTarget {
+	/// Removes a reactive binding after checking its dependents.
+	LiveLet(Identifier),
 	/// Removes a graph-owned user definition.
 	GraphIndex {
 		if_exists: bool,
@@ -364,6 +366,20 @@ pub struct RemoveStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AlterTarget {
+	/// Replaces a reactive expression while retaining the binding identity.
+	LiveLet {
+		/// Existing reactive identity, independent of its current value.
+		name: Identifier,
+		/// Replacement expression; a literal discards previous dependencies.
+		value: Expr,
+	},
+	/// Replaces a mutable lexical LET value without changing LIVE captures.
+	Let {
+		/// Existing nearest lexical binding, excluding execute parameters.
+		name: Identifier,
+		/// Complete replacement value, evaluated by the normal pipeline.
+		value: Expr,
+	},
 	/// Configures or stops capture for one existing class or graph.
 	Changefeed {
 		/// Whether the owner is GRAPH rather than CLASS.
@@ -426,6 +442,10 @@ pub struct AlterStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InfoTarget {
+	/// Reads a reactive identity and its definition/value revisions.
+	LiveLet(Identifier),
+	/// Runtime UUID parameter containing a retained LIVE query incarnation.
+	Live(Identifier),
 	/// Runtime parameter containing the retained feed UUID.
 	Changefeed(Identifier),
 	/// Reads a graph-owned user or engine index definition.
@@ -1339,7 +1359,10 @@ impl Parser<'_> {
 	}
 
 	pub(in crate::syn) fn remove_statement(&mut self) -> FerrosGrynnResult<RemoveStatement> {
-		let target = if self.consume_keyword(keywords::ANALYZER).is_some() {
+		let target = if self.consume_keyword(keywords::LIVE).is_some() {
+			self.expect_keyword(keywords::LET, "Expected LET after REMOVE LIVE.")?;
+			RemoveTarget::LiveLet(self.parameter()?)
+		} else if self.consume_keyword(keywords::ANALYZER).is_some() {
 			let if_exists = self.if_exists()?;
 			RemoveTarget::Analyzer {
 				if_exists,
@@ -1404,6 +1427,38 @@ impl Parser<'_> {
 	}
 
 	pub(in crate::syn) async fn alter_statement(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<AlterStatement> {
+		let live = self.consume_keyword(keywords::LIVE).is_some();
+		if live {
+			self.expect_keyword(keywords::LET, "Expected LET after ALTER LIVE.")?;
+		}
+		if live || self.consume_keyword(keywords::LET).is_some() {
+			let name = self.parameter()?;
+			self.expect_keyword(keywords::VALUE, "Expected VALUE after ALTER LET binding.")?;
+			let value = context.run(|context| self.expression(context, 0, 1, 0)).await?;
+			self.expect_statement_end("ALTER LET")?;
+			return Ok(AlterStatement {
+				target: if live {
+					AlterTarget::LiveLet {
+						name,
+						value,
+					}
+				} else {
+					AlterTarget::Let {
+						name,
+						value,
+					}
+				},
+			});
+		}
+		context.run(|context| self.alter_schema_statement(context)).await
+	}
+
+	/// Schema definitions retain their existing parser independently of lexical
+	/// updates.
+	async fn alter_schema_statement(
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<AlterStatement> {
@@ -1696,6 +1751,12 @@ impl Parser<'_> {
 			InfoTarget::Database
 		} else if self.consume_keyword(keywords::CHANGEFEED).is_some() {
 			InfoTarget::Changefeed(self.parameter()?)
+		} else if self.consume_keyword(keywords::LIVE).is_some() {
+			if self.consume_keyword(keywords::LET).is_some() {
+				InfoTarget::LiveLet(self.parameter()?)
+			} else {
+				InfoTarget::Live(self.parameter()?)
+			}
 		} else if self.consume_keyword(keywords::ANALYZER).is_some() {
 			InfoTarget::Analyzer(self.identifier()?)
 		} else if self.consume_keyword(keywords::FUNCTION).is_some() {

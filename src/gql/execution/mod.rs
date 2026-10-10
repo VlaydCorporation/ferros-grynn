@@ -13,6 +13,9 @@ mod eval;
 mod explain;
 mod graph_properties;
 mod graph_result;
+mod live_planning;
+mod root_read;
+pub(in crate::gql) use root_read::RootRead;
 mod schema;
 mod select;
 mod traversal;
@@ -25,10 +28,11 @@ use std::{
 };
 
 use adapter::TransactionRead;
+pub(super) use adapter::analyze_import_preflight;
 #[cfg(test)]
 pub(crate) use adapter::execute_parsed_transaction_with_bindings;
-pub(in crate::gql) use adapter::query_schema;
 pub(crate) use adapter::{analyze_parsed_transaction, execute_parsed_statement_with_bindings};
+pub(in crate::gql) use adapter::{atom_source_schema, query_schema};
 pub use adapter::{execute_transaction, execute_transaction_with_options};
 pub(in crate::gql) use cursor::{AtomFieldRead, RootFields};
 use dml::{execute_dml, execute_graph_dml};
@@ -36,6 +40,13 @@ pub(in crate::gql) use eval::{invoke_logical_closure, invoke_root_logical_closur
 use rust_decimal::Decimal;
 use schema::execute_schema;
 use select::execute_select;
+pub(in crate::gql) use select::{
+	normalize_root_select,
+	resolve_root_graph_reference,
+	visit_root_aggregate_union,
+	visit_root_row_union,
+	visit_root_select,
+};
 #[allow(
 	clippy::wildcard_imports,
 	reason = "move-only executor split keeps the existing cursor and evaluator names during stage \
@@ -45,6 +56,24 @@ use {cursor::*, eval::*};
 
 pub(in crate::gql) fn evaluate_constant(expression: &TypedExpr) -> Option<Value> {
 	eval(expression, None, &[], "", None, None).ok()
+}
+
+/// Standalone reactive expressions use the same special SELECT materialization.
+pub(in crate::gql) fn evaluate_root_expression(
+	read: &RootRead<'_>,
+	expression: &TypedExpr,
+	slots: &[Value],
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	select::eval_row_expression(
+		read,
+		read.snapshot()?,
+		expression,
+		&Row::new(Vec::new()),
+		slots,
+		"",
+		control,
+	)
 }
 
 use super::{
@@ -182,27 +211,64 @@ fn execute_parsed_statement<Read: QueryRead>(
 	statement: &crate::syn::Statement,
 	bindings: &mut Object,
 	mutable_bindings: &std::collections::BTreeSet<Box<str>>,
-	control: &ExecutionControl,
+	control: &mut ExecutionControl,
 ) -> FerrosGrynnResult<QueryResult> {
 	let snapshot = read.snapshot()?;
-	let logical = analyze_statement_with_runtime(
+	let (logical, timeout) = analyze_statement_with_runtime(
 		statement,
 		source,
 		read.catalog(snapshot),
 		bindings,
 		mutable_bindings,
-		control.function_cache(),
+		control,
 	)?;
 	let mut slots = initialize_slots(&logical, bindings);
 	let statement = logical.statements.first().ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("Analyzed statement produced no executable IR.")
 	})?;
+	let preparation = (|| {
+		if let Some(duration) = timeout.as_ref() {
+			let duration = eval_query_duration(read, duration, &slots, source, control, "TIMEOUT")?;
+			control.restrict_timeout(duration)?;
+		}
+		control.check()
+	})();
+	if let Err(error) = preparation {
+		discard_statement_cursor(statement, &slots, control);
+		return Err(error);
+	}
+	if control.infer_write_access()
+		&& logical.statements.iter().any(|statement| {
+			crate::gql::analysis::logical_statement_effect(statement) >= ClosureEffect::DataMutation
+		}) {
+		read.prepare_mutating_statement()?;
+	}
 	let result =
 		execute_logical_statement(read, source, statement, &mut slots, bindings, control, false)?;
 	if result.result.is_ok() {
 		persist_mutable_initial_slots(&logical, &slots, bindings)?;
 	}
 	Ok(result)
+}
+
+/// All preparation boundaries retire only a directly supplied continuation.
+/// EXPLAIN is unwrapped without evaluating its SELECT inputs a second time.
+fn discard_statement_cursor(
+	statement: &LogicalStatement,
+	slots: &[Value],
+	control: &ExecutionControl,
+) {
+	let plan = match statement {
+		LogicalStatement::Select(plan) => Some(plan),
+		LogicalStatement::Explain(explain) => match explain.statement.as_ref() {
+			LogicalStatement::Select(plan) => Some(plan),
+			_ => None,
+		},
+		_ => None,
+	};
+	if let Some(plan) = plan {
+		select::discard_supplied_cursor(plan, slots, control);
+	}
 }
 
 fn execute_logical_program<Read: QueryRead>(
@@ -287,7 +353,7 @@ pub(crate) fn execute_import_program(
 	let mut slots = initialize_slots(logical, variables);
 	let mut bindings = variables.clone();
 	for ((statement, timeout), payload) in logical.statements.iter().zip(timeouts).zip(payloads) {
-		let control = parent_control.child(*timeout);
+		let control = parent_control.checked_child(*timeout)?;
 		control.check()?;
 		let mut runtime = ControlRuntime::default();
 		if let LogicalStatement::For {
@@ -372,6 +438,7 @@ fn execute_import_statement(
 	let mut read = TransactionRead {
 		transaction,
 		snapshot,
+		metadata_only: false,
 	};
 	match execute_statement(
 		&mut read, statement, slots, bindings, source, control, runtime, 0, false,
@@ -397,6 +464,7 @@ fn execute_import_block(
 	let mut read = TransactionRead {
 		transaction,
 		snapshot,
+		metadata_only: false,
 	};
 	execute_block(&mut read, block, slots, bindings, source, control, runtime, 1)
 }
@@ -432,16 +500,33 @@ fn execute_statement<Read: QueryRead>(
 	depth: u32,
 	persist_let: bool,
 ) -> FerrosGrynnResult<ControlFlow> {
-	if !matches!(statement, LogicalStatement::Select(_)) {
-		control.check()?;
+	if !matches!(statement, LogicalStatement::Select(_))
+		&& let Err(error) = control.check()
+	{
+		discard_statement_cursor(statement, slots, control);
+		return Err(error);
 	}
 	if depth > control.max_control_depth {
+		discard_statement_cursor(statement, slots, control);
 		return Err(FerrosGrynnError::control_limit_exceeded(
 			"nesting depth",
 			u64::from(control.max_control_depth),
 		));
 	}
 	let value = match statement {
+		LogicalStatement::SetBinding {
+			slot,
+			expected,
+			value,
+		} => {
+			let value = eval_query_expression(read, value, slots, source, control, runtime)?;
+			super::bindings::validate_value(expected, &value, control, None)?;
+			let target = slots.get_mut(*slot as usize).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("ALTER LET slot is outside its typed frame")
+			})?;
+			*target = value;
+			Value::None
+		}
 		LogicalStatement::Explain(explain) => {
 			return explain::execute_explain(
 				read, explain, slots, bindings, source, control, runtime, depth,
@@ -457,11 +542,17 @@ fn execute_statement<Read: QueryRead>(
 		LogicalStatement::Let {
 			name,
 			slot,
+			expected,
 			value,
 		} => {
+			let reactive = matches!(value, LogicalLetValue::Live(command)
+				if matches!(command.as_ref(), crate::gql::ir::LogicalSchemaStatement::DefineLiveBinding(_)));
 			let value = match value {
 				LogicalLetValue::Expression(value) => {
 					eval_query_expression(read, value, slots, source, control, runtime)?
+				}
+				LogicalLetValue::Live(command) => {
+					read.execute_schema(command, slots, source, control)?
 				}
 				LogicalLetValue::BuildGraph(build) => graph_result::execute_build_graph(
 					read,
@@ -473,6 +564,14 @@ fn execute_statement<Read: QueryRead>(
 					runtime,
 				)?,
 			};
+			super::bindings::validate_value(expected, &value, control, None)?;
+			if persist_let && name.as_ref() != "_" {
+				if reactive {
+					read.note_reactive_binding(name, control)?;
+				} else {
+					read.note_binding_type(name, expected, control)?;
+				}
+			}
 			slots[*slot as usize] = value.clone();
 			if persist_let && name.as_ref() != "_" {
 				bindings.insert(name.as_ref(), value);
@@ -635,7 +734,8 @@ fn execute_statement<Read: QueryRead>(
 			return Err(FerrosGrynnError::user_thrown(message.to_string()));
 		}
 		LogicalStatement::Sleep(duration) => {
-			cooperative_sleep(*duration, control)?;
+			let duration = eval_query_duration(read, duration, slots, source, control, "SLEEP")?;
+			cooperative_sleep(duration, control)?;
 			Value::None
 		}
 		LogicalStatement::AssertInvariants {
@@ -668,6 +768,33 @@ fn execute_statement<Read: QueryRead>(
 	};
 	control.check()?;
 	Ok(ControlFlow::Value(value))
+}
+
+/// Both duration consumers borrow from the same lexical or reactive read frame.
+fn eval_query_duration<Read: QueryRead>(
+	read: &Read,
+	duration: &crate::gql::ir::LogicalDuration,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	subject: &str,
+) -> FerrosGrynnResult<Duration> {
+	if matches!(
+		duration,
+		crate::gql::ir::LogicalDuration::Parameter(TypedExpr {
+			kind: TypedExprKind::LiveSlot(_),
+			..
+		})
+	) {
+		let fields = cursor::RecordFields {
+			read,
+			snapshot: read.snapshot()?,
+			graph: None,
+		};
+		eval::eval_duration(duration, slots, source, Some(&fields), control, subject)
+	} else {
+		eval::eval_duration(duration, slots, source, read.bounded_fields(), control, subject)
+	}
 }
 
 fn cooperative_sleep(duration: Duration, control: &ExecutionControl) -> FerrosGrynnResult<()> {
@@ -708,6 +835,14 @@ fn eval_query_expression_current<Read: QueryRead>(
 		return eval_mut_current(expression, None, slots, source, None, current, Some(control));
 	}
 	match &expression.kind {
+		TypedExprKind::LiveSlot(_) => {
+			let fields = cursor::RecordFields {
+				read,
+				snapshot: read.snapshot()?,
+				graph: None,
+			};
+			eval_mut_current(expression, None, slots, source, Some(&fields), current, Some(control))
+		}
 		TypedExprKind::Traversal(plan) => traversal::execute_traverse(
 			read,
 			read.snapshot()?,
@@ -822,7 +957,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 						None,
 						slots,
 						source,
-						None,
+						read.bounded_fields(),
 						current,
 						Some(control),
 					)
@@ -955,7 +1090,15 @@ fn eval_query_expression_current<Read: QueryRead>(
 					Some(control),
 				);
 			}
-			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+			eval_mut_current(
+				&expression,
+				None,
+				slots,
+				source,
+				read.bounded_fields(),
+				current,
+				Some(control),
+			)
 		}
 		TypedExprKind::Range {
 			start,
@@ -989,7 +1132,15 @@ fn eval_query_expression_current<Read: QueryRead>(
 				ty: expression.ty.clone(),
 				span: expression.span,
 			};
-			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+			eval_mut_current(
+				&expression,
+				None,
+				slots,
+				source,
+				read.bounded_fields(),
+				current,
+				Some(control),
+			)
 		}
 		TypedExprKind::Unary {
 			op,
@@ -1006,7 +1157,15 @@ fn eval_query_expression_current<Read: QueryRead>(
 				ty: expression.ty.clone(),
 				span: expression.span,
 			};
-			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+			eval_mut_current(
+				&expression,
+				None,
+				slots,
+				source,
+				read.bounded_fields(),
+				current,
+				Some(control),
+			)
 		}
 		TypedExprKind::Field {
 			base,
@@ -1016,6 +1175,11 @@ fn eval_query_expression_current<Read: QueryRead>(
 			let value = eval_query_expression_current(
 				read, base, slots, source, control, runtime, current,
 			)?;
+			let fields = RecordFields {
+				read,
+				snapshot: read.snapshot()?,
+				graph: None,
+			};
 			let expression = TypedExpr {
 				kind: TypedExprKind::Field {
 					base: Box::new(query_constant(base, value)),
@@ -1025,7 +1189,15 @@ fn eval_query_expression_current<Read: QueryRead>(
 				ty: expression.ty.clone(),
 				span: expression.span,
 			};
-			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+			eval_mut_current(
+				&expression,
+				None,
+				slots,
+				source,
+				Some(&fields),
+				current,
+				Some(control),
+			)
 		}
 		TypedExprKind::Destructure {
 			base,
@@ -1042,7 +1214,15 @@ fn eval_query_expression_current<Read: QueryRead>(
 				ty: expression.ty.clone(),
 				span: expression.span,
 			};
-			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+			eval_mut_current(
+				&expression,
+				None,
+				slots,
+				source,
+				read.bounded_fields(),
+				current,
+				Some(control),
+			)
 		}
 		TypedExprKind::Index {
 			base,
@@ -1062,7 +1242,15 @@ fn eval_query_expression_current<Read: QueryRead>(
 				ty: expression.ty.clone(),
 				span: expression.span,
 			};
-			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+			eval_mut_current(
+				&expression,
+				None,
+				slots,
+				source,
+				read.bounded_fields(),
+				current,
+				Some(control),
+			)
 		}
 		TypedExprKind::Cast {
 			target,
@@ -1079,7 +1267,15 @@ fn eval_query_expression_current<Read: QueryRead>(
 				ty: expression.ty.clone(),
 				span: expression.span,
 			};
-			eval_mut_current(&expression, None, slots, source, None, current, Some(control))
+			eval_mut_current(
+				&expression,
+				None,
+				slots,
+				source,
+				read.bounded_fields(),
+				current,
+				Some(control),
+			)
 		}
 		_ => eval_mut_current(expression, None, slots, source, None, current, Some(control)),
 	}
@@ -1095,6 +1291,7 @@ fn query_constant(expression: &TypedExpr, value: Value) -> TypedExpr {
 
 fn query_expression_requires_read(expression: &TypedExpr) -> bool {
 	match &expression.kind {
+		TypedExprKind::LiveSlot(_) => true,
 		TypedExprKind::Invoke {
 			..
 		}
@@ -1208,7 +1405,23 @@ fn execute_block<Read: QueryRead>(
 ) -> FerrosGrynnResult<ControlFlow> {
 	let mut last = Value::None;
 	for statement in &block.statements {
-		let control = control.child(statement.timeout);
+		let preparation = (|| {
+			let timeout = statement
+				.timeout
+				.as_ref()
+				.map(|duration| {
+					eval_query_duration(read, duration, slots, source, control, "TIMEOUT")
+				})
+				.transpose()?;
+			control.checked_child(timeout)
+		})();
+		let control = match preparation {
+			Ok(control) => control,
+			Err(error) => {
+				discard_statement_cursor(&statement.statement, slots, control);
+				return Err(error);
+			}
+		};
 		match execute_statement(
 			read,
 			&statement.statement,
@@ -1274,7 +1487,8 @@ fn invoke_logical_closure_with_read<Read: QueryRead>(
 	runtime: &mut ControlRuntime,
 	mode: ClosureInvocationMode,
 ) -> FerrosGrynnResult<Value> {
-	let effect_allowed = match (plan.effect, mode) {
+	let effect = plan.invocation_effect();
+	let effect_allowed = match (effect, mode) {
 		(ClosureEffect::Pure | ClosureEffect::StableRead, _) => true,
 		(ClosureEffect::DataMutation, ClosureInvocationMode::TraversalSideEffect)
 		| (
@@ -1293,7 +1507,7 @@ fn invoke_logical_closure_with_read<Read: QueryRead>(
 			ClosureInvocationMode::Standalone => "standalone closure",
 		};
 		return Err(FerrosGrynnError::closure_effect_not_allowed(
-			format!("{:?}", plan.effect),
+			format!("{effect:?}"),
 			position.to_owned(),
 		));
 	}
@@ -1302,6 +1516,10 @@ fn invoke_logical_closure_with_read<Read: QueryRead>(
 			format!("{} closure arguments", arguments.len()),
 			format!("{} arguments", plan.parameters.len()),
 		));
+	}
+	let control = &control.closure_scope(effect)?;
+	if control.infer_write_access() && effect >= ClosureEffect::DataMutation {
+		read.prepare_mutating_statement()?;
 	}
 	let _frame =
 		plan.named_function.map(|function| control.enter_named_function(function)).transpose()?;
@@ -1475,6 +1693,9 @@ fn catchable(error: &FerrosGrynnError) -> bool {
 
 const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementKind {
 	match statement {
+		LogicalStatement::SetBinding {
+			..
+		} => QueryStatementKind::Alter,
 		LogicalStatement::Explain(_) => QueryStatementKind::Explain,
 		LogicalStatement::Schema(statement) => statement.statement_kind(),
 		LogicalStatement::Dml(statement) => statement.kind.statement_kind(),
@@ -1517,7 +1738,7 @@ const fn logical_statement_kind(statement: &LogicalStatement) -> QueryStatementK
 	}
 }
 
-fn initialize_slots(program: &LogicalProgram, variables: &Object) -> Vec<Value> {
+pub(in crate::gql) fn initialize_slots(program: &LogicalProgram, variables: &Object) -> Vec<Value> {
 	let mut slots = vec![Value::None; program.slot_count];
 	for (name, slot, _) in &program.initial_slots {
 		if let Some(value) = variables.get(name) {
@@ -1542,6 +1763,106 @@ fn persist_mutable_initial_slots(
 		bindings.insert(name.as_ref(), value);
 	}
 	Ok(())
+}
+
+/// Resolves and validates the graph identity against the invocation snapshot.
+fn resolve_match_graph<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalMatch,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<GraphRef> {
+	let reference = match &plan.graph {
+		LogicalGraphReference::Static(reference) => reference.clone(),
+		LogicalGraphReference::Expression(expression) => {
+			let fields = RecordFields {
+				read,
+				snapshot,
+				graph: None,
+			};
+			let value = eval(expression, None, slots, source, Some(&fields), Some(control))?;
+			let Value::GraphRef(reference) = value else {
+				return Err(FerrosGrynnError::invalid_argument(
+					"MATCH graph parameters must contain a GraphRef.",
+				));
+			};
+			*reference
+		}
+	};
+	let visible = read.catalog(snapshot).graph(reference.name())?;
+	if visible.id() != reference.id() {
+		return Err(FerrosGrynnError::graph_does_not_exist(reference.name().to_owned()));
+	}
+	Ok(visible)
+}
+
+/// Resolves a lexical clause bound before planning or pulling any MATCH row.
+fn resolve_match_max_depth<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalMatch,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<u32> {
+	let max_depth = if let Some(expression) = &plan.max_depth_binding {
+		let fields = RecordFields {
+			read,
+			snapshot,
+			graph: None,
+		};
+		let value = eval(expression, None, slots, source, Some(&fields), Some(control))?;
+		crate::gql::ir::validate_match_max_depth(&value)?
+	} else {
+		plan.max_depth
+	};
+	for pattern in &plan.patterns {
+		if let LogicalMatchPatternKind::Linear(pattern) = &pattern.kind {
+			for operation in &pattern.ops {
+				if let MatchOp::PathExpand(expand) = operation
+					&& expand.min > expand.maximum(max_depth)
+				{
+					return Err(FerrosGrynnError::invalid_argument(
+						"MATCH path minimum exceeds its maximum.",
+					));
+				}
+			}
+		}
+	}
+	Ok(max_depth)
+}
+
+/// Resolves an embedded deadline without replacing the caller control when
+/// the MATCH has no clause.
+///
+/// # Errors
+///
+/// Returns snapshot, duration conversion, cancellation, or deadline errors.
+fn resolve_match_control<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalMatch,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Option<ExecutionControl>> {
+	plan.timeout
+		.as_ref()
+		.map(|timeout| {
+			let fields = RecordFields {
+				read,
+				snapshot,
+				graph: None,
+			};
+			let duration =
+				eval::eval_duration(timeout, slots, source, Some(&fields), control, "TIMEOUT")?;
+			let child = control.checked_child(Some(duration))?;
+			child.check()?;
+			Ok(child)
+		})
+		.transpose()
 }
 
 /// Executes a logical MATCH as a synchronous pull pipeline.
@@ -1598,7 +1919,11 @@ fn visit_match_with_environment<Read: QueryRead>(
 	environment: &Object,
 	visit: &mut impl FnMut(Value) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Option<Value>> {
-	let demand = crate::gql::optimizer::PlannerDemand::for_match(plan);
+	let invocation_control = resolve_match_control(read, snapshot, plan, slots, source, control)?;
+	let control = invocation_control.as_ref().unwrap_or(control);
+	let reference = resolve_match_graph(read, snapshot, plan, slots, source, control)?;
+	let max_depth = resolve_match_max_depth(read, snapshot, plan, slots, source, control)?;
+	let demand = crate::gql::optimizer::PlannerDemand::for_match_bound(plan, reference.id());
 	let planner_snapshot = read.planner_snapshot(snapshot, &demand)?;
 	let deterministic_snapshot;
 	let planner_snapshot = if control.deterministic() {
@@ -1607,11 +1932,16 @@ fn visit_match_with_environment<Read: QueryRead>(
 	} else {
 		&planner_snapshot
 	};
-	let physical =
-		crate::gql::optimizer::plan_match(plan, planner_snapshot, control.deterministic())?;
+	let physical = crate::gql::optimizer::plan_match_bound(
+		plan,
+		planner_snapshot,
+		control.deterministic(),
+		Some(&reference),
+		max_depth,
+	)?;
 	control.record_match_graph_open();
-	let graph = Rc::new(read.graph(snapshot, &plan.graph)?);
-	let graph_ref = Arc::new(plan.graph.clone());
+	let graph = Rc::new(read.graph(snapshot, &reference)?);
+	let graph_ref = Arc::new(reference);
 	let (needs_local_index, needs_scoped_index) = match_adjacency_requirements(plan, &physical);
 	let semantics = if plan.atom || plan.patterns.iter().any(pattern_uses_edge_endpoint) {
 		TraversalSemantics::Atom
@@ -1679,8 +2009,8 @@ fn visit_match_with_environment<Read: QueryRead>(
 				let trace = pattern
 					.path_column
 					.map(|_column| Rc::new(RefCell::new(MatchPathTrace::new(control))));
-				let start = resolve_match_binding(&pattern.start, slots, source, control)?;
-				let candidates = read.match_candidates(snapshot, &plan.graph, &start)?;
+				let start = resolve_match_binding(&pattern.start, match_predicate, control)?;
+				let candidates = read.match_candidates(snapshot, &graph_ref, &start)?;
 				cursor = Box::new(SeedCursor::new(
 					cursor,
 					graph.clone(),
@@ -1708,7 +2038,8 @@ fn visit_match_with_environment<Read: QueryRead>(
 					let scoped = physical.operation_is_scoped(pattern_index, operation_index);
 					cursor = match op {
 						MatchOp::Expand(expand) => {
-							let expand = resolve_expand(expand, slots, source, control, plan.mode)?;
+							let expand =
+								resolve_expand(expand, match_predicate, control, plan.mode)?;
 							if !matches!(
 								operator,
 								crate::gql::optimizer::MatchOperator::FixedExpand { .. }
@@ -1758,8 +2089,13 @@ fn visit_match_with_environment<Read: QueryRead>(
 							}
 						}
 						MatchOp::PathExpand(expand) => {
-							let expand =
-								resolve_path_expand(expand, slots, source, control, plan.mode)?;
+							let expand = resolve_path_expand(
+								expand,
+								match_predicate,
+								control,
+								plan.mode,
+								max_depth,
+							)?;
 							let shortest = matches!(
 								operator,
 								crate::gql::optimizer::MatchOperator::BreadthFirstShortest { .. }
@@ -1880,7 +2216,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 				}
 			}
 			LogicalMatchPatternKind::Hyper(pattern) => {
-				let edge = resolve_match_binding(&pattern.edge, slots, source, control)?;
+				let edge = resolve_match_binding(&pattern.edge, match_predicate, control)?;
 				let contains = pattern
 					.contains
 					.iter()
@@ -1891,7 +2227,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 								.endpoints
 								.iter()
 								.map(|binding| {
-									resolve_match_binding(binding, slots, source, control)
+									resolve_match_binding(binding, match_predicate, control)
 								})
 								.collect::<FerrosGrynnResult<Vec<_>>>()?,
 						})
@@ -1912,8 +2248,8 @@ fn visit_match_with_environment<Read: QueryRead>(
 			}
 			LogicalMatchPatternKind::Within(pattern) => {
 				let relation = ResolvedWithin {
-					child: resolve_match_binding(&pattern.child, slots, source, control)?,
-					owner: resolve_match_binding(&pattern.owner, slots, source, control)?,
+					child: resolve_match_binding(&pattern.child, match_predicate, control)?,
+					owner: resolve_match_binding(&pattern.owner, match_predicate, control)?,
 					min: pattern.min,
 					max: pattern.max,
 				};
@@ -1951,7 +2287,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 	}
 	if let Some(graph_plan) = &plan.return_graph {
 		let mut assembly = graph_result::GraphAssemblyAccumulator::new(
-			Some(plan.graph.clone()),
+			Some(graph_ref.as_ref().clone()),
 			None,
 			None,
 			control,
@@ -1985,9 +2321,9 @@ fn visit_match_with_environment<Read: QueryRead>(
 				)?)?;
 			}
 		}
-		return assembly
-			.finish(read, snapshot, graph_plan.contract)
-			.map(|graph| Some(Value::Graph(Box::new(graph))));
+		let graph = assembly.finish(read, snapshot, graph_plan.contract)?;
+		invocation_control.as_ref().map_or(Ok(()), ExecutionControl::check)?;
+		return Ok(Some(Value::Graph(Box::new(graph))));
 	}
 	let random_seed = plan.order.iter().any(|order| order.random).then(|| {
 		control.statement_seed(
@@ -2022,6 +2358,7 @@ fn visit_match_with_environment<Read: QueryRead>(
 			.collect::<Object>();
 		visit(Value::Object(object))?;
 	}
+	invocation_control.as_ref().map_or(Ok(()), ExecutionControl::check)?;
 	Ok(None)
 }
 

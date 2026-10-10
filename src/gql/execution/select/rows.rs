@@ -66,6 +66,23 @@ impl RowSet {
 			} => spool.for_each(offset, |record| visit(row_from_record(record)?)),
 		}
 	}
+
+	/// Reductions borrow resident rows and one decoded spill row at a time.
+	pub(super) fn visit_borrowed(
+		&self,
+		mut visit: impl FnMut(&Row) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<()> {
+		match self {
+			Self::Memory {
+				rows,
+				..
+			} => rows.iter().try_for_each(visit),
+			Self::Disk {
+				spool,
+				offset,
+			} => spool.for_each(*offset, |record| visit(&row_from_record(record)?)),
+		}
+	}
 }
 
 pub(super) struct RowCollector {

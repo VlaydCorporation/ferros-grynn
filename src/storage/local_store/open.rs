@@ -177,11 +177,17 @@ pub(super) fn open_local_state(
 
 	let mut database = DatabaseRoot::default();
 	database.commit_ts = snapshot.commit_ts().get();
+	// Process-local predicate revisions are re-anchored before any reader
+	// exists.
+	database.mark_version(crate::datastore::ConflictKey::ClassCatalogRange, database.commit_ts);
 	database.database_uuid = database_catalog.database_uuid;
 	database.committed_at_ns = database_catalog.committed_at_ns;
+	*database.live_catalog_mut() = Arc::new(super::catalog::decode_live(&database_catalog));
+	database.live_catalog().validate_recovered(database.commit_ts)?;
 	*database.changefeeds_mut() = Arc::new(super::catalog::decode_changefeeds(&database_catalog));
 	*database.changefeed_segments_mut() =
 		super::catalog::decode_changefeed_segments(&database_catalog);
+	*database.live_segments_mut() = super::catalog::decode_live_segments(&database_catalog);
 	database.schema = Arc::new(schema);
 	database.dictionary = Arc::new(dictionary);
 	database.atoms = Arc::new(atoms);

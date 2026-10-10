@@ -1,4 +1,4 @@
-//! Canonical little-endian encoding for `FGDC v10`.
+//! Canonical little-endian encoding for `FGDC v13`.
 
 use std::collections::BTreeMap;
 
@@ -52,8 +52,9 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"FGDC";
-const VERSION: u16 = 10;
-const HEADER_BYTES: usize = 128;
+/// Current development layout; older catalogs are deliberately rejected.
+const VERSION: u16 = 13;
+const HEADER_BYTES: usize = 136;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
 
@@ -77,7 +78,9 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	output.extend_from_slice(catalog.database_uuid.as_bytes());
 	output.extend_from_slice(&catalog.committed_at_ns.to_le_bytes());
 	write_u32(&mut output, catalog.changefeeds.len(), "changefeed count")?;
-	output.extend_from_slice(&0_u32.to_le_bytes());
+	write_u32(&mut output, catalog.live_queries.len(), "LIVE query count")?;
+	write_u32(&mut output, catalog.live_bindings.len(), "LIVE binding count")?;
+	write_u32(&mut output, catalog.live_history.len(), "LIVE history count")?;
 
 	for name in &catalog.time_zones {
 		write_string(&mut output, name.as_str(), "time-zone name")?;
@@ -100,12 +103,27 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	for entry in &catalog.changefeeds {
 		super::changefeed::encode(&mut output, entry)?;
 	}
+	for entry in &catalog.live_queries {
+		super::live::encode(&mut output, entry)?;
+	}
+	for entry in &catalog.live_bindings {
+		super::live_binding::encode(&mut output, entry)?;
+	}
+	for entry in &catalog.live_history {
+		super::live_history::encode(&mut output, entry)?;
+	}
 	if output.len() > MAX_BYTES {
 		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
 			"database catalog bytes",
 			MAX_BYTES as u64,
 			output.len() as u64,
 		));
+	}
+	if !catalog.live_queries.is_empty() || !catalog.live_bindings.is_empty() {
+		// Admission must match the recovery reader before any catalog pages/WAL
+		// are written. Empty registries keep the existing publication fast
+		// path.
+		let _recoverable = decode(&output)?;
 	}
 	Ok(output)
 }
@@ -149,7 +167,9 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 			invalid("database commit time is truncated").with_technical_source(error)
 		})?);
 	let changefeed_count = decoder.read_count("changefeed count")?;
-	decoder.expect_zero(4, "database origin reserved bytes")?;
+	let live_count = decoder.read_count("LIVE query count")?;
+	let binding_count = decoder.read_count("LIVE binding count")?;
+	let history_count = decoder.read_count("LIVE history count")?;
 	if changefeed_count > bytes.len().saturating_sub(HEADER_BYTES) / super::changefeed::MIN_BYTES {
 		return Err(invalid("changefeed count exceeds its encoded payload"));
 	}
@@ -166,6 +186,13 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 		.try_fold(0_usize, |total, count| total.checked_add(count.checked_mul(4)?))
 		.and_then(|total| {
 			total.checked_add(changefeed_count.checked_mul(super::changefeed::MIN_BYTES)?)
+		})
+		.and_then(|total| total.checked_add(live_count.checked_mul(super::live::MIN_BYTES)?))
+		.and_then(|total| {
+			total.checked_add(binding_count.checked_mul(super::live_binding::MIN_BYTES)?)
+		})
+		.and_then(|total| {
+			total.checked_add(history_count.checked_mul(super::live_history::MIN_BYTES)?)
 		})
 		.ok_or_else(|| invalid("catalog section counts overflow"))?;
 	if minimum_bytes > bytes.len().saturating_sub(HEADER_BYTES) {
@@ -205,11 +232,63 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	for _ in 0..changefeed_count {
 		changefeeds.push(super::changefeed::decode(&mut decoder)?);
 	}
+	if live_count > decoder.bytes.len().saturating_sub(decoder.position) / super::live::MIN_BYTES {
+		return Err(invalid("LIVE query count exceeds remaining catalog bytes"));
+	}
+	let mut budget =
+		crate::storage::history_codec::CodecBudget::new(256 * 1024 * 1024, bytes.len())?;
+	budget.admit(
+		live_count
+			.checked_mul(std::mem::size_of::<super::LiveCatalogEntry>())
+			.ok_or_else(|| invalid("LIVE catalog allocation length overflows"))?,
+	)?;
+	let mut live_queries = Vec::new();
+	live_queries
+		.try_reserve_exact(live_count)
+		.map_err(|_error| invalid("LIVE catalog allocation failed"))?;
+	for _ in 0..live_count {
+		live_queries.push(super::live::decode(&mut decoder, &mut budget)?);
+	}
+	if binding_count
+		> decoder.bytes.len().saturating_sub(decoder.position) / super::live_binding::MIN_BYTES
+	{
+		return Err(invalid("LIVE binding count exceeds remaining catalog bytes"));
+	}
+	budget.admit(
+		binding_count
+			.checked_mul(std::mem::size_of::<super::LiveBindingCatalogEntry>())
+			.ok_or_else(|| invalid("LIVE binding allocation length overflows"))?,
+	)?;
+	let mut live_bindings = Vec::new();
+	live_bindings
+		.try_reserve_exact(binding_count)
+		.map_err(|_error| invalid("LIVE binding allocation failed"))?;
+	for _ in 0..binding_count {
+		live_bindings.push(super::live_binding::decode(&mut decoder, &mut budget)?);
+	}
+	if history_count > decoder.remaining_bytes() / super::live_history::MIN_BYTES {
+		return Err(invalid("LIVE history count exceeds remaining bytes"));
+	}
+	budget.admit(
+		history_count
+			.checked_mul(std::mem::size_of::<super::LiveHistoryCatalogEntry>())
+			.ok_or_else(|| invalid("LIVE history allocation overflows"))?,
+	)?;
+	let mut live_history = Vec::new();
+	live_history
+		.try_reserve_exact(history_count)
+		.map_err(|_error| invalid("LIVE history allocation failed"))?;
+	for _ in 0..history_count {
+		live_history.push(super::live_history::decode(&mut decoder, &mut budget)?);
+	}
 	decoder.finish()?;
 	let catalog = DatabaseCatalog {
 		database_uuid,
 		committed_at_ns,
 		changefeeds,
+		live_queries,
+		live_bindings,
+		live_history,
 		next_graph_id,
 		next_schema_id,
 		time_zones,

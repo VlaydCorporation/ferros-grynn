@@ -11,6 +11,8 @@ use super::*;
 pub enum LetValue {
 	Expression(Expr),
 	BuildGraph(BuildGraphStatement),
+	/// A LIVE registration returns its owned UUID to the lexical binding.
+	LiveSelect(Box<LiveSelectStatement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +24,32 @@ pub struct LetStatement {
 }
 
 impl Parser<'_> {
+	/// Ordinary and reactive bindings share one frontend dispatch boundary.
+	pub(in crate::syn) fn at_binding_statement(&self) -> bool {
+		self.at_keyword(keywords::LET) || self.at_keyword(keywords::LIVE)
+	}
+
+	/// Consumes the common lexical registration prefixes.
+	pub(in crate::syn) async fn binding_statement(
+		&mut self,
+		context: &mut Stk,
+	) -> FerrosGrynnResult<StatementKind> {
+		if self.consume_keyword(keywords::LET).is_some() {
+			Ok(StatementKind::Let(context.run(|context| self.let_statement(context)).await?))
+		} else {
+			self.expect_keyword(keywords::LIVE, "Expected LIVE registration.")?;
+			if self.consume_keyword(keywords::LET).is_some() {
+				Ok(StatementKind::LiveLet(
+					context.run(|context| self.live_let_statement(context)).await?,
+				))
+			} else {
+				Ok(StatementKind::LiveSelect(
+					context.run(|context| self.live_select_statement(context)).await?,
+				))
+			}
+		}
+	}
+
 	pub(in crate::syn) async fn let_statement(
 		&mut self,
 		context: &mut Stk,
@@ -33,7 +61,11 @@ impl Parser<'_> {
 			None
 		};
 		self.expect_symbol(Symbol::Equal, "Expected `=` in LET statement.")?;
-		let value = if self.consume_keyword(keywords::BUILD).is_some() {
+		let value = if self.consume_keyword(keywords::LIVE).is_some() {
+			LetValue::LiveSelect(Box::new(
+				context.run(|context| self.live_select_statement(context)).await?,
+			))
+		} else if self.consume_keyword(keywords::BUILD).is_some() {
 			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `BUILD`.")?;
 			LetValue::BuildGraph(context.run(|context| self.build_graph_statement(context)).await?)
 		} else {

@@ -27,7 +27,24 @@ impl Ord for Range {
 
 impl Range {
 	pub fn new(start: Bound<Value>, end: Bound<Value>) -> Result<Self, FerrosGrynnError> {
-		validate_bounds(&start, &end)?;
+		Self::new_with_diagnostic_admission(start, end, |_, _| Ok(()))
+	}
+
+	/// Lets bounded callers admit invalid-bound diagnostics before rendering.
+	/// Valid bounds retain the same validation and move directly into Boxes.
+	///
+	/// # Errors
+	///
+	/// Returns admission failures or the ordinary range conversion status.
+	pub(crate) fn new_with_diagnostic_admission<Admission>(
+		start: Bound<Value>,
+		end: Bound<Value>,
+		admit: Admission,
+	) -> Result<Self, FerrosGrynnError>
+	where
+		Admission: FnMut(&Value, &Value) -> Result<(), FerrosGrynnError>,
+	{
+		validate_bounds(&start, &end, admit)?;
 		Ok(Self {
 			start: box_bound(start),
 			end: box_bound(end),
@@ -79,7 +96,14 @@ impl Range {
 	}
 }
 
-fn validate_bounds(start: &Bound<Value>, end: &Bound<Value>) -> Result<(), FerrosGrynnError> {
+fn validate_bounds<Admission>(
+	start: &Bound<Value>,
+	end: &Bound<Value>,
+	mut admit: Admission,
+) -> Result<(), FerrosGrynnError>
+where
+	Admission: FnMut(&Value, &Value) -> Result<(), FerrosGrynnError>,
+{
 	let Some(start_value) = bound_value(start) else {
 		return Ok(());
 	};
@@ -88,6 +112,7 @@ fn validate_bounds(start: &Bound<Value>, end: &Bound<Value>) -> Result<(), Ferro
 	};
 
 	if !start_value.kind().is_compatible_with(end_value.kind()) || start_value > end_value {
+		admit(start_value, end_value)?;
 		return Err(FerrosGrynnError::conversion_error(
 			format!("{start_value}..{end_value}"),
 			"Range",

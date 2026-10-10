@@ -62,6 +62,16 @@ pub struct LineColumn {
 	pub column: NonZeroU32,
 }
 
+impl LineColumn {
+	/// Constructs source coordinates from already validated nonzero components.
+	pub const fn new(line: NonZeroU32, column: NonZeroU32) -> Self {
+		Self {
+			line,
+			column,
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
 	source_id: Option<Arc<str>>,

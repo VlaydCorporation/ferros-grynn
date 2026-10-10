@@ -291,6 +291,227 @@ fn deferred_graph_family_failure_discards_the_complete_import() {
 	assert!(store.begin().atom(&"person:alice".parse::<RecordId>().unwrap()).unwrap().is_none());
 }
 
+/// Import loop locals share the normal typed duration resolver. Invalid
+/// clause values remain item failures; elapsed deadlines abort the whole
+/// import.
+#[test]
+fn duration_operands_in_import_loops() -> crate::gql_status::FerrosGrynnResult<()> {
+	let store = import_store();
+	let duration = "1s".parse::<crate::values::Duration>().map_err(|error| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+	})?;
+	let inputs = Object::from_iter([("limits", Value::from(vec![Value::from(duration)]))]);
+	let results = store.execute(
+		"BEGIN IMPORT; FOR $limit IN $limits { CREATE person:timed TIMEOUT $limit; }; END IMPORT;",
+		&inputs,
+	)?;
+	assert!(results[0].result.is_ok(), "{results:?}");
+	assert!(store.begin().atom(&"person:timed".parse::<RecordId>()?)?.is_some());
+	let zero = "0ms".parse::<crate::values::Duration>().map_err(|error| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(error.to_string())
+	})?;
+	let inputs = Object::from_iter([("limits", Value::from(vec![Value::from(zero)]))]);
+	let aborted = store.execute(
+		"BEGIN IMPORT WITH (ON VIOLATION = SKIP, REJECT LIMIT = 1); CREATE person:rolled_back; \
+		 FOR $limit IN $limits { CREATE person:timeout TIMEOUT $limit; }; END IMPORT;",
+		&inputs,
+	)?;
+	assert!(aborted[0].result.is_err());
+	for name in ["person:rolled_back", "person:timeout"] {
+		assert!(store.begin().atom(&name.parse::<RecordId>()?)?.is_none());
+	}
+	Ok(())
+}
+
+/// A plan cannot acquire a lease after its captured preflight root changes.
+#[test]
+fn duration_import_preflight_rejects_root_race() -> crate::gql_status::FerrosGrynnResult<()> {
+	let store = import_store();
+	let source = "CREATE person:rejected TIMEOUT $limit;";
+	let program = crate::gql::parse(source, crate::syn::ParserSettings::default())?;
+	let inputs =
+		Object::from_iter([("limit", Value::from("1s".parse::<crate::values::Duration>()?))]);
+	let control = crate::gql::ExecutionControl::with_runtime(
+		&QueryExecutionOptions::default(),
+		None,
+		None,
+		std::sync::Arc::new(crate::gql::closure::LanguageClosureState::default()),
+	);
+	let mut preflight = store.begin();
+	let (_, _, stamp) = super::super::analyze_import_preflight(
+		&mut preflight,
+		source,
+		&program,
+		&inputs,
+		&control,
+	)?;
+	drop(preflight);
+	let created = store.execute("CREATE person:concurrent;", &Object::new())?;
+	assert!(created[0].result.is_ok());
+	let mut entered = false;
+	let result = store.import_at_controlled(
+		ImportOptions::default(),
+		Some(stamp),
+		None,
+		None,
+		&|| Ok(()),
+		|_session| {
+			entered = true;
+			Ok(())
+		},
+	);
+	assert!(result.is_err());
+	assert!(!entered);
+	let retry = store.execute("BEGIN IMPORT; CREATE person:after; END IMPORT;", &Object::new())?;
+	assert!(retry[0].result.is_ok());
+	Ok(())
+}
+
+/// Import preflight preserves lexical metadata for reactive duration operands.
+#[test]
+fn duration_import_preflight_uses_live_values() -> crate::gql_status::FerrosGrynnResult<()> {
+	let store = import_store();
+	let mut session = store.session();
+	let inputs = Object::from_iter([
+		("second", Value::from("1s".parse::<crate::values::Duration>()?)),
+		("zero", Value::from("0ms".parse::<crate::values::Duration>()?)),
+	]);
+	for result in session.execute("LIVE LET $limit = $second;", &inputs)? {
+		result.result?;
+	}
+	let imported = session
+		.execute("BEGIN IMPORT; CREATE person:timed TIMEOUT $limit; END IMPORT;", &Object::new())?;
+	assert!(imported[0].result.is_ok(), "{imported:?}");
+	assert!(store.begin().atom(&"person:timed".parse::<RecordId>()?)?.is_some());
+	let info = session.execute("INFO FOR LIVE LET $limit;", &Object::new())?;
+	let ordinary = info[0]
+		.result
+		.as_ref()
+		.map_err(Clone::clone)?
+		.value()
+		.as_object()
+		.and_then(|value| value.get("id"))
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("test binding identity missing")
+		})?;
+	assert!(
+		session
+			.execute(
+				"BEGIN IMPORT; CREATE person:rejected TIMEOUT $ordinary; END IMPORT;",
+				&Object::from_iter([("ordinary", ordinary.clone())]),
+			)
+			.is_err()
+	);
+	for result in session.execute("ALTER LIVE LET $limit VALUE $zero;", &inputs)? {
+		result.result?;
+	}
+	let shadowed = session.execute(
+		"BEGIN IMPORT; FOR $limit IN [$second] { CREATE person:shadowed TIMEOUT $limit; }; END \
+		 IMPORT;",
+		&inputs,
+	)?;
+	assert!(shadowed[0].result.is_ok(), "{shadowed:?}");
+	assert!(store.begin().atom(&"person:shadowed".parse::<RecordId>()?)?.is_some());
+	let aborted = session.execute(
+		"BEGIN IMPORT WITH (ON VIOLATION = SKIP, REJECT LIMIT = 1); CREATE person:earlier; CREATE \
+		 person:rejected TIMEOUT $limit; END IMPORT;",
+		&Object::new(),
+	)?;
+	assert!(aborted[0].result.is_err());
+	for name in ["person:earlier", "person:rejected"] {
+		assert!(store.begin().atom(&name.parse::<RecordId>()?)?.is_none());
+	}
+	Ok(())
+}
+
+/// Private source changes do not reevaluate preflight deadlines before END.
+#[test]
+fn duration_import_freezes_source_dependent_binding() -> crate::gql_status::FerrosGrynnResult<()> {
+	let store = import_store();
+	let mut session = store.session();
+	let inputs = Object::from_iter([
+		("second", Value::from("1s".parse::<crate::values::Duration>()?)),
+		("zero", Value::from("0ms".parse::<crate::values::Duration>()?)),
+	]);
+	for result in session.execute(
+		"CREATE person:policy; LIVE LET $limit = IF (SELECT VALUE count() FROM person) > 0 THEN \
+		 $second ELSE $zero END; LET $fixed = $second;",
+		&inputs,
+	)? {
+		result.result?;
+	}
+	let imported = session.execute(
+		"BEGIN IMPORT WITH (SEGMENT SIZE = 1); DELETE person:policy; CREATE person:timed TIMEOUT \
+		 $limit; DELETE person:timed TIMEOUT $fixed; END IMPORT;",
+		&Object::new(),
+	)?;
+	assert!(imported[0].result.is_ok(), "{imported:?}");
+	let value = session.execute("RETURN $limit;", &Object::new())?;
+	assert_eq!(value[0].result.as_ref().ok().map(|result| result.value()), inputs.get("zero"));
+	assert!(store.begin().atom(&"person:policy".parse::<RecordId>()?)?.is_none());
+	assert!(store.begin().atom(&"person:timed".parse::<RecordId>()?)?.is_none());
+	Ok(())
+}
+
+/// Invalid captures and metadata admission fail before a writer lease or DML.
+#[test]
+fn duration_import_preflight_rejects_invalid_inputs() -> crate::gql_status::FerrosGrynnResult<()> {
+	for duration in ["P1M", "-PT1S", "PT20000000000S"] {
+		let store = import_store();
+		let mut session = store.session();
+		let inputs =
+			Object::from_iter([("bad", Value::from(duration.parse::<crate::values::Duration>()?))]);
+		for result in session.execute("LIVE LET $limit = $bad;", &inputs)? {
+			result.result?;
+		}
+		assert!(
+			session
+				.execute(
+					"BEGIN IMPORT WITH (ON VIOLATION = SKIP, REJECT LIMIT = 1); CREATE \
+					 person:earlier; CREATE person:rejected TIMEOUT $limit; END IMPORT;",
+					&Object::new(),
+				)
+				.is_err()
+		);
+		for name in ["person:earlier", "person:rejected"] {
+			assert!(store.begin().atom(&name.parse::<RecordId>()?)?.is_none());
+		}
+		let imported =
+			store.execute("BEGIN IMPORT; CREATE person:after; END IMPORT;", &Object::new())?;
+		assert!(imported[0].result.is_ok(), "{imported:?}");
+	}
+	let store = import_store();
+	let mut session = store.session();
+	let inputs =
+		Object::from_iter([("limit", Value::from("1s".parse::<crate::values::Duration>()?))]);
+	let options = QueryExecutionOptions {
+		barrier_memory_bytes: std::num::NonZeroUsize::new(1).ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("invalid test budget")
+		})?,
+		..QueryExecutionOptions::default()
+	};
+	let error = session
+		.execute_with_options(
+			"BEGIN IMPORT; CREATE person:rejected TIMEOUT $limit; END IMPORT;",
+			&inputs,
+			options,
+		)
+		.err()
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(
+				"timeout metadata exceeded its budget",
+			)
+		})?;
+	assert!(error.to_string().contains("import timeout metadata"), "{error}");
+	for name in ["person:earlier", "person:rejected"] {
+		assert!(store.begin().atom(&name.parse::<RecordId>()?)?.is_none());
+	}
+	let imported =
+		store.execute("BEGIN IMPORT; CREATE person:after; END IMPORT;", &Object::new())?;
+	assert!(imported[0].result.is_ok(), "{imported:?}");
+	Ok(())
+}
+
 #[test]
 fn import_for_uses_one_item_per_iteration() {
 	let store = import_store();

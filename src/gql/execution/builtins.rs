@@ -320,7 +320,7 @@ pub(super) fn execute_with_fields(
 			Ok(Value::Bool(set(values, "set::has")?.contains(&value)))
 		}
 		Builtin::TypeIs(target) => Ok(Value::Bool(type_matches(target, &one(arguments)?))),
-		Builtin::TypeTo(target) => cast(one(arguments)?, target),
+		Builtin::TypeTo(target) => cast(one(arguments)?, target, fields, control),
 		Builtin::MetaId => meta_id(one(arguments)?),
 		Builtin::MetaClass => meta_class(one(arguments)?),
 		Builtin::MetaType => Ok(Value::from(one(arguments)?.value_type().to_string())),

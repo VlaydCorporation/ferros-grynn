@@ -192,6 +192,7 @@ pub(super) fn backfill_pages(
 	ticket: &CheckpointTicket,
 ) -> FerrosGrynnResult<()> {
 	let mut touched = BTreeSet::new();
+	let mut reader = wal.frame_read_scope();
 	for frame in ticket.frames() {
 		let key = frame.key();
 		if key.space_id() != space || !files.contains(&key.file_id()) {
@@ -199,7 +200,7 @@ pub(super) fn backfill_pages(
 		}
 		let registered = registry.resolve(key)?;
 		let mut page = AlignedPage::zeroed();
-		wal.read_frame(*frame, &mut page)?;
+		reader.read_frame(*frame, &mut page)?;
 		registered.file()?.write_page(key.page_no(), &page)?;
 		touched.insert(key.file_id());
 	}

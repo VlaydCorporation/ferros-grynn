@@ -11,7 +11,8 @@ use crate::{
 	gql_status::{Condition, FerrosGrynnResult},
 	storage::{
 		ChangefeedGroupInfo,
-		ChangefeedSegment,
+		HistoryOwner,
+		HistorySegment,
 		changefeed::{
 			CodecBudget,
 			CommitLocator,
@@ -51,6 +52,11 @@ impl LocalChangefeedSnapshot {
 	/// Returns logical page attempts and admitted codec scratch bytes.
 	pub(crate) fn read_observation(&self) -> (u64, u64) {
 		(self.1.pages.load(Ordering::Relaxed), self.1.scratch.load(Ordering::Relaxed))
+	}
+
+	/// Accounts both source and private LIVE decode admission in the same pin.
+	pub(super) fn record_history_scratch(&self, bytes: usize) {
+		self.1.scratch.fetch_max(bytes as u64, Ordering::Relaxed);
 	}
 }
 
@@ -100,16 +106,16 @@ impl LocalStore {
 	pub(crate) fn inspect_changefeed_group(
 		&self,
 		snapshot: &LocalChangefeedSnapshot,
-		segment: ChangefeedSegment,
+		segment: HistorySegment,
 		first: u64,
 		memory_bytes: usize,
 	) -> FerrosGrynnResult<Option<ChangefeedGroupInfo>> {
-		check_access(snapshot, segment, memory_bytes)?;
+		check_source_access(snapshot, segment, memory_bytes)?;
 		available((|| {
 			let mut page = AlignedPage::zeroed();
-			let locator = self.changefeed_locator(snapshot, segment, first, &mut page)?;
+			let locator = self.history_locator(snapshot, segment, first, &mut page)?;
 			let mut info = inspect_group(first_payload(&page)?, locator.bytes)?;
-			if info.source != segment.header.feed
+			if segment.header.owner != HistoryOwner::Changefeed(info.source)
 				|| info.stamp != locator.stamp
 				|| info.time < segment.header.first_time
 				|| info.time > segment.header.last_time
@@ -126,11 +132,11 @@ impl LocalStore {
 	pub(crate) fn read_changefeed_batch(
 		&self,
 		snapshot: &LocalChangefeedSnapshot,
-		segment: ChangefeedSegment,
+		segment: HistorySegment,
 		first: u64,
 		memory_bytes: usize,
 	) -> FerrosGrynnResult<Option<(CapturedCommit, u64)>> {
-		check_access(snapshot, segment, memory_bytes)?;
+		check_source_access(snapshot, segment, memory_bytes)?;
 		available(self.read_changefeed_group(snapshot, segment, first, memory_bytes))
 	}
 
@@ -138,22 +144,22 @@ impl LocalStore {
 	pub(crate) fn read_changefeed_group(
 		&self,
 		snapshot: &LocalChangefeedSnapshot,
-		segment: ChangefeedSegment,
+		segment: HistorySegment,
 		first: u64,
 		memory_bytes: usize,
 	) -> FerrosGrynnResult<(CapturedCommit, u64)> {
-		check_access(snapshot, segment, memory_bytes)?;
+		check_source_access(snapshot, segment, memory_bytes)?;
 		let mut budget = CodecBudget::new(memory_bytes, PAGE_SIZE)?;
 		let result = (|| {
 			let mut page = AlignedPage::zeroed();
-			let locator = self.changefeed_locator(snapshot, segment, first, &mut page)?;
+			let locator = self.history_locator(snapshot, segment, first, &mut page)?;
 			let mut read = |number, output: &mut AlignedPage| {
-				self.read_changefeed_page(snapshot, segment, number, output)
+				self.read_history_page(snapshot, segment, number, output)
 			};
 			let bytes = decode_pages(locator, segment.header.pages, &mut read, &mut budget)?;
 			let group = decode_group(&bytes, &mut budget)?;
 			let time = group.commit.net.committed_at().as_inner().timestamp().as_nanosecond();
-			if group.commit.net.source() != segment.header.feed
+			if segment.header.owner != HistoryOwner::Changefeed(group.commit.net.source())
 				|| group.commit.net.versionstamp().get() != locator.stamp
 				|| time < segment.header.first_time
 				|| time > segment.header.last_time
@@ -162,27 +168,27 @@ impl LocalStore {
 			}
 			Ok((group.commit, first + u64::from(locator.pages)))
 		})();
-		snapshot.1.scratch.fetch_max(budget.admitted_bytes() as u64, Ordering::Relaxed);
+		snapshot.record_history_scratch(budget.admitted_bytes());
 		result
 	}
 
 	/// Verifies page-zero authority and the first continuation before payload
 	/// work.
-	fn changefeed_locator(
+	pub(super) fn history_locator(
 		&self,
 		snapshot: &LocalChangefeedSnapshot,
-		segment: ChangefeedSegment,
+		segment: HistorySegment,
 		first: u64,
 		page: &mut AlignedPage,
 	) -> FerrosGrynnResult<CommitLocator> {
-		self.read_changefeed_page(snapshot, segment, PageNo::new(0), page)?;
+		self.read_history_page(snapshot, segment, PageNo::new(0), page)?;
 		if decode_header(page)? != segment.header {
 			return Err(invalid("changefeed segment header disagrees with snapshot catalog"));
 		}
 		if first == 0 || first >= segment.header.pages {
 			return Err(invalid("changefeed group ordinal is outside its segment"));
 		}
-		self.read_changefeed_page(snapshot, segment, PageNo::new(first), page)?;
+		self.read_history_page(snapshot, segment, PageNo::new(first), page)?;
 		let locator = decode_locator(page, PageNo::new(first), segment.header.pages)?;
 		if locator.stamp < segment.header.first_stamp || locator.stamp > segment.header.last_stamp {
 			return Err(invalid("changefeed group stamp exceeds trusted bounds"));
@@ -191,10 +197,10 @@ impl LocalStore {
 	}
 
 	/// Resolves a pinned file without consulting later catalog generations.
-	fn read_changefeed_page(
+	pub(super) fn read_history_page(
 		&self,
 		snapshot: &LocalChangefeedSnapshot,
-		segment: ChangefeedSegment,
+		segment: HistorySegment,
 		number: PageNo,
 		output: &mut AlignedPage,
 	) -> FerrosGrynnResult<()> {
@@ -222,9 +228,22 @@ impl LocalStore {
 }
 
 /// Authoritative corruption, expired pins and resource limits are never GAPs.
-fn check_access(
+fn check_source_access(
 	snapshot: &LocalChangefeedSnapshot,
-	segment: ChangefeedSegment,
+	segment: HistorySegment,
+	memory_bytes: usize,
+) -> FerrosGrynnResult<()> {
+	check_history_access(snapshot, segment, memory_bytes)?;
+	if !matches!(segment.owner(), HistoryOwner::Changefeed(_)) {
+		return Err(invalid("source history reader received a private LIVE segment"));
+	}
+	Ok(())
+}
+
+/// Shared authoritative checks run before optional bytes may degrade to a GAP.
+pub(super) fn check_history_access(
+	snapshot: &LocalChangefeedSnapshot,
+	segment: HistorySegment,
 	memory_bytes: usize,
 ) -> FerrosGrynnResult<()> {
 	if !snapshot.0._pin.is_active() {
@@ -236,7 +255,7 @@ fn check_access(
 }
 
 /// Only optional segment I/O/format failures degrade to trusted-bound GAPs.
-fn available<T>(result: FerrosGrynnResult<T>) -> FerrosGrynnResult<Option<T>> {
+pub(super) fn available<T>(result: FerrosGrynnResult<T>) -> FerrosGrynnResult<Option<T>> {
 	match result {
 		Ok(value) => Ok(Some(value)),
 		Err(error) if error.status().condition() == Condition::ProgramLimitExceeded => Err(error),

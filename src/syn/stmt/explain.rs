@@ -75,6 +75,23 @@ impl Parser<'_> {
 }
 
 fn explainable(statement: &StatementKind) -> bool {
+	if matches!(
+		statement,
+		StatementKind::LiveSelect(_)
+			| StatementKind::LiveLet(_)
+			| StatementKind::AckLive(_)
+			| StatementKind::Kill(_)
+			| StatementKind::Let(LetStatement {
+				value: LetValue::LiveSelect(_),
+				..
+			})
+			| StatementKind::Info(InfoStatement {
+				target: InfoTarget::Live(_) | InfoTarget::LiveLet(_),
+				..
+			})
+	) {
+		return true;
+	}
 	matches!(
 		statement,
 		StatementKind::Attach(_)

@@ -851,8 +851,58 @@ types при необходимости расширяется общими ти
     Full/backend correctness PASS; closure остаётся OPEN по performance/tooling:
     RETURN10K не прошёл предел 5%, cold/fanout matrix и global tooling требуют evidence.
 
-28. **LIVE SELECT** — зависит от **13, 27**.
-    Реализовать registry подписок, сериализованный predicate IR, bounded per-session queue, resume и output modes. Публичный Rust API остаётся pull-based: subscription id, `next`, `resume` и `close`; silent event loss запрещён.
+28. **LIVE SELECT и LIVE LET** — зависит от **13, 27**.
+    Versioned logical descriptors, frozen LET captures, reactive binding DAG,
+    root-bound SELECT/FETCH, durable result history, bounded queues и whole-commit
+    ACK/resume реализованы через самостоятельный Rust SDK и общий GQL pipeline.
+    Квалифицированные sources/overlays, aggregates/GROUP, JOIN/SPLIT identities,
+    стабильные RHS GraphId anchors, DIFF/PATCH, историческая coverage с явным GAP,
+    publication/import, retention/recovery и EXPLAIN/PlanHash v10 имеют correctness
+    evidence. Executable IR не сериализуется; silent event loss запрещён.
+    [Нормативный план](gql_live_stage_28_plan.md),
+    [evidence report](reports/gql_live_stage_28_report.md).
+    Последующие C28-4–12: exact LIVE revision COW, bounded WAL backfill reader,
+    empty index replacement/invalidation, readonly statement ownership/accounting
+    и bounded dependencies с authority фактического CLASS scan; untimed session
+    не читает лишний clock, timed/nested origins сохраняются.
+    Текущий full lib **1165 PASS/10 ignored/0 failed/0 filtered**; public LIVE
+    RAM **10/10**, local LIVE **38/38** (Sync + NativeAsync) и general local
+    **16/16 PASS**. Production check/scoped nightly fmt PASS; Clippy delta **0**,
+    прежний глобальный lint debt сохраняется.
+    RAM ACK1M14.21ms→46.84µs; Sync ACK1M665ms→393ms (**1.69x**, paired CI).
+    Import OFF1M завершён за10.12s; ON1M проверенно отклоняется WAL/resource cap,
+    без partial publication. Сопоставимые optimized builds используют debug0 и
+    прежние opt3/fatLTO/codegen1; исходный debug2 LLVM OOM не объявляется исправленным.
+    Финальный L11 run6 завершён:72 cells,0timeouts; common **5/9 PASS**, итог
+    **FAIL_OR_INCONCLUSIVE**. Capacity gaps и NativeAsync/cold-device performance
+    остаются открытыми. Последующие fixed-CPU RETURN diagnostics всё ещё превышают
+    5%; C28-9 пары смешанные. Отдельный large-work1M workload выявил
+    dependency scratch32MiB; C28-11 исправление прошло exact1M RAM probe:
+    scan1 mean2.72s, scratch133KiB, без faults/GAP. Defaults прежние; прочие
+    large-work/backend cells ещё требуют evidence; C28-12 full common5/9 PASS,
+    итог FAIL_OR_INCONCLUSIVE. Controlled CPU0 пары0.0%/+3.2%, последняя CI upper5.18%. Ledger/hashes/raw evidence сохранены.
+    Новый лимит пользователя: пять новых оптимизаций; используются **5/5**.
+    ПОСЛЕДНЯЯ C28-19 exclusive readset: focused3/full1165/10 ignored/backend10/38/16
+    PASS, check/Clippy delta0/release PASS; pairedcontrols6/6 pass5%vsC28-15.
+    Пятаяправка оставлена, Source optimizations **STOP5/5**; originalbaseline
+    gate **НЕ ПРОЙДЕН**: finalcommon5/9 PASS vsoriginal196d21b.
+    Fixed large-work RAM/Sync100K/1M: **24/24 MeasuredWithOracle**, по10 samples,
+    без timeout/fault/GAP; source627/protected646 hashes неизменны.
+    Performance/global tooling closure OPEN, новых ускорений не вводится.
+    C28-18 single-key inline experiment: correctness PASS, paired result mixed;
+    откатан к provenC28-15, evidence сохранён; это исторический результат 4/5.
+    C28-17 boxed LIVE AST payload: correctness/layout PASS, RETURN paired+6.0%/+8.8%;
+    эксперимент откатан к proven C28-15, evidence сохранён.
+    C28-16 comparator experiment: correctness PASS, все4 controlled pairs сохранены;
+    stable benefit не доказан, правка откатана к proven C28-15 source.
+    Результаты C28-15 сохранены отдельно:
+    C28-15 focused21/full1162 (10 ignored), RAM10/local LIVE38/general local16
+    PASS; check PASS/Clippy delta0. Release PASS11m24s; RAM100K/100 subscriptions
+    проходит registration и oracle (mean commit16.624s), прежний timeout900s устранён.
+    Full run5:72 cells/0timeouts, common3/9 PASS, итог FAIL_OR_INCONCLUSIVE.
+    После пятой оптимизации ускорения прекращаются, остальные проверки продолжаются.
+    Итоговые performance/tooling и closure gates **OPEN**; этап не помечается
+    завершённым до полного evidence.
 
 29. **Events и LiveGraph integration** — зависит от **12, 20, 27, 28**.
     Реализовать `DEFINE EVENT`, sync/async execution, retry, `MAXDEPTH`, idempotency guidance и генерацию AtomWalk-рёбер. Mutable LiveGraph применяет remote delta только после явного conflict resolution и повторной проверки family invariants.

@@ -10,6 +10,8 @@ mod files;
 mod image;
 mod index_delta;
 mod layout;
+/// Exact computed result replay through shared pinned history transport.
+mod live_reader;
 mod open;
 mod physical_index;
 mod physical_traversal;
@@ -146,6 +148,8 @@ struct LocalState {
 	_database_catalog: DatabaseCatalog,
 	/// Shared segment descriptors retained by logical snapshots.
 	changefeed_segments: crate::storage::ChangefeedSegments,
+	/// Snapshot-exact ceilings for private computed results.
+	live_segments: crate::storage::LiveHistorySegments,
 	/// Physical pins shared by exact query snapshots and feed readers.
 	changefeed_files: changefeed::ChangefeedFiles,
 	bindings: GenerationBindings,
@@ -307,6 +311,7 @@ impl LocalStore {
 			file_catalog: generation.file_catalog,
 			_database_catalog: generation.database_catalog,
 			changefeed_segments: std::sync::Arc::clone(database.changefeed_segments()),
+			live_segments: std::sync::Arc::clone(database.live_segments()),
 			changefeed_files: std::sync::Arc::default(),
 			bindings: generation.bindings,
 			registry,
@@ -379,6 +384,7 @@ impl LocalStore {
 			file_catalog,
 			_database_catalog: database_catalog,
 			changefeed_segments: std::sync::Arc::clone(database.changefeed_segments()),
+			live_segments: std::sync::Arc::clone(database.live_segments()),
 			changefeed_files,
 			bindings,
 			registry,
@@ -531,6 +537,9 @@ impl LocalStore {
 		dictionary_changed: bool,
 	) -> FerrosGrynnResult<()> {
 		let mut state = self.state.lock();
+		if !database.live_catalog().queries.is_empty() {
+			sweep_retired_generations(&mut state);
+		}
 		self.wal.ensure_writable()?;
 		self.checkpoint_if_due(&mut state)?;
 		let expected = self
@@ -590,10 +599,18 @@ impl LocalStore {
 			.changefeeds
 			.iter()
 			.any(|entry| database.change_history().contains_key(&(entry.id, database.commit_ts)));
-		let refresh_files = capture || database.changefeed_segments() != &state.changefeed_segments;
+		let live_capture = catalog
+			.live_history
+			.iter()
+			.any(|entry| changefeed::fresh_live_groups(database, entry.id).next().is_some());
+		let refresh_files = capture
+			|| live_capture
+			|| database.changefeed_segments() != &state.changefeed_segments
+			|| database.live_segments() != &state.live_segments;
 		let mut feed_files = Vec::new();
 		let mut file_catalog = None;
 		let mut segments = None;
+		let mut live_segments = None;
 		if refresh_files {
 			let mut files = state.file_catalog.clone();
 			changefeed::prepare(
@@ -605,6 +622,7 @@ impl LocalStore {
 			)?;
 			image::append_catalog_pages(&mut feed_files, &files, &catalog)?;
 			segments = Some(catalog::decode_changefeed_segments(&catalog));
+			live_segments = Some(catalog::decode_live_segments(&catalog));
 			file_catalog = Some(files);
 		}
 		let mut tx = self.wal.begin_tx()?;
@@ -664,6 +682,9 @@ impl LocalStore {
 		if let Some(segments) = segments {
 			state.changefeed_segments = segments;
 		}
+		if let Some(segments) = live_segments {
+			state.live_segments = segments;
+		}
 		if let Some(registry) = registry {
 			state.registry = registry;
 		}
@@ -673,8 +694,11 @@ impl LocalStore {
 		}
 		state.retired_changefeeds.extend(retired_feeds);
 		state.atom_superblock = next_atom_superblock;
-		state.physical_statistics = None;
-		sweep_retired_generations(&mut state);
+		// Catalog-only publication keeps the immutable statistics files and
+		// their deferred binding, including across LIVE ACK and CLOSE.
+		if database.live_catalog().queries.is_empty() {
+			sweep_retired_generations(&mut state);
+		}
 		Ok(())
 	}
 
@@ -741,6 +765,9 @@ impl LocalStore {
 				&state.file_catalog,
 			)?;
 		}
+		if !database.live_catalog().queries.is_empty() {
+			sweep_retired_generations(&mut state);
+		}
 		self.checkpoint_if_due(&mut state)?;
 		let expected = self
 			.wal
@@ -784,10 +811,13 @@ impl LocalStore {
 			&mut generation.database_catalog,
 			&mut generation.files,
 		)?;
-		if !generation.database_catalog.changefeeds.is_empty() {
+		if !generation.database_catalog.changefeeds.is_empty()
+			|| !generation.database_catalog.live_history.is_empty()
+		{
 			generation.refresh_catalogs()?;
 		}
 		let segments = catalog::decode_changefeed_segments(&generation.database_catalog);
+		let live_segments = catalog::decode_live_segments(&generation.database_catalog);
 		#[cfg(test)]
 		inject_generation_failure(GenerationFailurePoint::AfterBuild)?;
 		let mut pending_feeds =
@@ -834,6 +864,7 @@ impl LocalStore {
 			&state.file_catalog,
 			&generation.file_catalog,
 		)?;
+		prepare_generation_retirement(&mut state, retired.as_ref())?;
 		prepare_feed_retirement(&mut state, retired_feeds.len(), true)?;
 		#[cfg(test)]
 		{
@@ -860,6 +891,7 @@ impl LocalStore {
 		state.file_catalog = generation.file_catalog;
 		state._database_catalog = generation.database_catalog;
 		state.changefeed_segments = segments;
+		state.live_segments = live_segments;
 		remember_feed_pins(&mut state);
 		state.changefeed_files = feed_pins;
 		state.retired_changefeeds.extend(retired_feeds);
@@ -872,7 +904,11 @@ impl LocalStore {
 		if let Some(retired) = retired {
 			state.retired_generations.push(retired);
 		}
-		sweep_retired_generations(&mut state);
+		// LIVE handoff follows immediately after returning to datastore.
+		// Its existing idle maintenance wake retires these generations later.
+		if database.live_catalog().queries.is_empty() {
+			sweep_retired_generations(&mut state);
+		}
 		Ok(std::mem::take(&mut generation.index_timings))
 	}
 
@@ -903,6 +939,57 @@ impl LocalStore {
 	pub(crate) fn sweep_retired_changefeeds(&self) {
 		sweep_retired_generations(&mut self.state.lock());
 	}
+}
+
+/// Bounds pinned generation metadata and reserves its queue before WAL.
+fn prepare_generation_retirement(
+	state: &mut LocalState,
+	additional: Option<&RetiredGeneration>,
+) -> FerrosGrynnResult<()> {
+	let count = state
+		.retired_generations
+		.len()
+		.checked_add(usize::from(additional.is_some()))
+		.ok_or_else(|| invalid("generation retirement backlog overflows"))?;
+	let slots = state.retired_generations.capacity().max(count);
+	let mut bytes = slots
+		.checked_mul(std::mem::size_of::<RetiredGeneration>())
+		.ok_or_else(|| invalid("generation retirement queue bytes overflow"))?;
+	for generation in state.retired_generations.iter().chain(additional) {
+		bytes = bytes
+			.checked_add(generation.heap_bytes()?)
+			.ok_or_else(|| invalid("generation retirement backlog bytes overflow"))?;
+	}
+	let maximum = crate::storage::external_sort_run_budget().min(256 * 1024 * 1024);
+	if bytes > maximum {
+		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+			"generation retirement backlog",
+			bytes as u64,
+			maximum as u64,
+		));
+	}
+	state.retired_generations.try_reserve_exact(usize::from(additional.is_some())).map_err(
+		|error| {
+			invalid("generation retirement queue allocation failed").with_technical_source(error)
+		},
+	)?;
+	let extra = state
+		.retired_generations
+		.capacity()
+		.saturating_sub(slots)
+		.checked_mul(std::mem::size_of::<RetiredGeneration>())
+		.ok_or_else(|| invalid("generation retirement allocation bytes overflow"))?;
+	let allocated = bytes
+		.checked_add(extra)
+		.ok_or_else(|| invalid("generation retirement allocated bytes overflow"))?;
+	if allocated > maximum {
+		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
+			"generation retirement allocated backlog",
+			allocated as u64,
+			maximum as u64,
+		));
+	}
+	Ok(())
 }
 
 /// Reserves retirement queues before committing; no fallible allocation

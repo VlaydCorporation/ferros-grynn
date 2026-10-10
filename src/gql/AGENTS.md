@@ -11,7 +11,13 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
               -> execution -> datastore adapter
 ```
 
-- `analysis.rs` владеет name/type resolution и semantic errors;
+- Lexical BindingTypes default имеет lazy empty representation; declaration
+  maps и rich types сохраняют immutable sharing и pre-copy admission.
+  Ordinary shadowing маскирует reactive provenance, empty export не теряет
+  outer declarations. Control.started сохраняет original named TIMEOUT origin;
+  readonly commit без mutations/intents не требует LIVE timing origin.
+- `analysis/mod.rs` владеет name/type resolution и semantic errors;
+  `analysis/live.rs` — checked syntax-to-owned LIVE recipes и private bounded preflight;
 - `ir.rs` — typed logical plan, не storage plan;
 - `optimizer/` — единственный crate-private rule/CBO optimizer, physical plans,
   fixed-point estimates/costs, deterministic plan encoding и EXPLAIN projection;
@@ -19,11 +25,212 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
 - `execution/cursor.rs` — pull-based relational cursors;
 - `execution/eval.rs` — вычисление typed expressions;
 - `execution/mod.rs` — orchestration и statement results;
+- `execution/schema/live.rs` — регистрация frozen runtime captures и bounded metadata.
+  LIVE LET использует тот же SDK registry: reactive slot хранит identity, value
+  разрешается через snapshot/SSI с admission до clone. BindingTypes удерживает
+  reactive flavor отдельно от Value; closure захватывает identity, ordinary
+  shadow маскирует flavor. SINCE/BUFFER/ACK inputs используют общий RootRead.
+  Root ordinary `IN GRAPH $scope` имеет private registration expression: bounded
+  command RootRead разрешает GraphRef/String и наблюдает catalog dependencies,
+  затем существующий GraphClass/GraphRecord reifies до SDK validation/publication.
+  Typed scope не сериализуется. Tracked scope не замораживается как ordinary capture;
+  Registration IR хранит frozen scopes отдельно по declaration ordinal, не в
+  shared Option: primary0, JOIN1..N. Analyzer допускает exact capture capacity
+  до allocation; deterministic visitor проходит все retained expressions.
+  Executor проверяет ordered distinct source captures и declaration bounds до
+  scope evaluation. Каждый RHS имеет собственный frozen scope; computed String
+  RHS удерживает отдельный last-success GraphId/name anchor по ordinal.
+  class/record computed scopes используют GraphClassExpr/GraphRecordExpr recipes.
+  Root scope разрешается один раз до row pull через тот же RootRead. Успешные
+  String operand и GraphId публикуются вместе; неизменное имя сохраняет identity
+  при rename/recreate, fault оставляет последнюю успешную пару. Nested graph
+  expressions сохраняют ordinary snapshot name resolution как read dependencies.
+  SDK GraphExpr использует class union qualified occurrences, с одним scope
+  resolution на invocation. Shared nested scope хранится в Empty wrapper и
+  нормализует pre-admitted input copies; frozen nested parameters не берутся из
+  внешнего capture frame. Aggregate inputs сохраняют class-specific overloads.
+- Grouped LIVE использует обычный SELECT grouping/sort/reduction. Graph class
+  union объединяет raw rows, CASE сохраняет class-specific key/argument plans;
+  projected key subtrees используют обычное group_expr_equivalent. Key identity
+  не зависит от output alias. Group clauses входят в frozen/reactive captures.
+  Aggregate outer constructors сохраняют kind/length/names/optional flags/types;
+  каждый child объединяется borrowed, per-class overload остаётся в row CASE.
+  Общий admit_special_copy допускает CASE buffer и Cast target до allocation/clone
+  в merge и materialization. Lazy IF/CASE исполняется только ordinary evaluator.
+  Shared transaction-aware Field evaluation после materialization base сохраняет
+  existing RecordFields, включая ordinary closure/scalar traversal RecordId lookup.
+  Snapshot и SSI относятся и к binding value, и к прочитанной base property;
+  bounded RootRead delegation и qualified occurrence resolver сохраняются.
+  Private record-field traits передают optional caller control. Transaction
+  adapter допускает selected properties/id/label до clone в reactive pool;
+  bounded RootRead использует собственный account. Borrowed point_parts отделён
+  от complete row construction; scalar field projection не копирует unrelated
+  properties. Shared field_from_atom сохраняет effective/Hidden/base semantics.
+  INFO удерживает vector account до завершения projection, GQL REMOVE передаёт
+  caller budgets/checks. LIMIT/offset и MATCH record keys используют snapshot fields;
+  Fulltext/KNN проверяют dynamic query types до rows. Query analyzer/terms и PURE
+  analyzer argument используют bounded scratch/work; per-document search policy
+  отдельна. INFO/SHOW CHANGES scalar operands используют тот же QuerySnapshot/SSI;
+  image walker сохраняет depth checks и per-step caller work/cancellation,
+  retained account переживает lookup borrow. Остальные input seams L9b требуют
+  отдельного evidence.
+  START AFTER выбирает session cursor через statement fields/control; direct
+  supplied Slot/Constant spool освобождается даже при early eval cancellation,
+  computed expression не выполняется повторно ради cleanup.
+  Top-level timeout preparation errors и SELECT evaluation errors используют
+  общий borrowed direct-input retirement helper до возврата ошибки.
+  EXPLAIN wrapper получает нормализованный statement timeout без нового IR.
+  Common direct Select/Explain->Select retirement dispatcher используется
+  top/block preparation и statement-entry control/depth guards; computed
+  continuation expression не выполняется повторно для cleanup.
+  Import item timeout metadata типизируется на одном preflight Analyzer/root
+  с inherited BindingTypes. Shared borrowed duration lookup фиксирует значения
+  до expected-stamp lease; nested locals разрешаются при invocation. Sparse
+  typed/frozen metadata допускается до allocation общим retained account.
+  Item checked child сохраняет platform overflow error; END publication
+  удерживает исходный caller options deadline.
+  MATCH MAXDEPTH сохраняет typed lexical operand и open-range provenance;
+  snapshot-bound validation выполняется до planner/row pull. Explicit max независим;
+  CBO/cursor/direct EXPLAIN используют один bound. Outer embedded estimates до
+  invocation используют checked upper bound с warning; GraphResult EXPLAIN
+  recursively сохраняет source warnings. MATCH GRAPH также удерживает typed operand;
+  snapshot GraphRef-only validation предшествует demand/CBO/open. Build/return/traverse
+  consumers сохраняют qualified domain. Outer estimates не фабрикуют GraphId;
+  deferred tensor scope/format — DYNAMIC. Physical encoding v8 включает resolved
+  GraphId, direct EXPLAIN показывает resolved/deferred binding.
+
+  Direct INFO/KILL используют catalog-only snapshot; LIVE close проходит узкий
+  control preflight/savepoint без подготовки data writer, включая import lease.
+  Session допускает consumer/handle capacity до WAL и exposes handle после commit.
+  ACK требует retained session consumer и ранее выданную whole-commit delivery;
+  fixed cursor cache меняется после commit. Runtime closure effects сохраняют
+  declared PURE/STABLE ceiling и explicit READ ONLY.
+- `root_catalog.rs`, `execution/root_read.rs` — read-only adapters к одному
+  immutable candidate root для PURE/LIVE; обычная transaction внутри commit evaluator
+  не открывается. SELECT/FETCH используют те же kernels и порядок ошибок.
+- LIVE dependency recorder различает schema-only range observation и actual
+  global CLASS scan. Только успешный root scan разрешает coalescing same-class
+  BaseAtom keys; marker private и входит в admission существующего key. Point
+  и graph-scoped reads без global scan сохраняют точные BaseAtom dependencies;
+  membership/overlay/incidence, schema/functions/bindings не coalesce-ятся.
+  RootRead default constructor не включает scan callback у иных consumers.
+- `live_lowering/` — Rust logical recipes → обычный analyzer, owned result identities
+  и bounded dependency recorder. Graph-wide агрегат объединяет class inputs до
+  reduction, сохраняя per-class overloads. SDK nested SELECT независим от outer row;
+  textual correlated SELECT сохраняет прежнюю семантику.
+  Polymorphic JOIN использует private JoinedTypingVariants/AtomUnion и bounded
+  SELECT family collapse до reduction. WildcardVariants выбирает прежний
+  projector; ON видит только declaration prefix. NONE state и source tags не
+  изменяют публичные fields/identity. Root и nested unions используют те же
+  GROUP/window kernels; scratch/work проверяются до copies/allocations.
+  Primary source alias хранится отдельно от synthetic lexical capture owner.
+  Qualified GQL Field сохраняет source prefix в recipe; borrowed
+  source_field_segments — общая authority lowering и row-only history proof.
+  SDK record sources используют BoundRecord class/literal slot metadata;
+  ordinary analyzer создаёт exact ScanTarget для root/nested/JOIN. Global WHERE
+  restriction и primary-only post-analysis rewrite не применяются. Rich-key
+  literals допускаются до clone; mutable/reactive/wrong-class slots отклоняются.
+  Explicit alias имеет precedence, class-name qualifier применяется только
+  при отсутствии одноимённого declared property; foreign navigation требует
+  полной coverage и не становится row-local после удаления prefix.
+  Owned Access/Index lowering использует ordinary expressions, null-safe flag
+  не теряется; source qualification сохраняется отдельно от record navigation.
+  Owned Conditional lowering использует обычный IF evaluator; capture/DAG walkers
+  обходят обе ветви, historical fast path допускается только при proof всех children.
+  Owned Set использует ordinary evaluator; ordered inputs с duplicates проходят
+  bounded lowering, captures и dependency/history proof до deduplication.
+  Owned Cast использует ordinary type-name analyzer/evaluator; shared admission
+  ограничивает bytes/work/type copies и generic nesting до recursion/allocation.
+  Owned Case сохраняет optional operand и ordered branches; empty branch list
+  отклоняется до ordinary analysis, все children проходят capture/DAG validation.
+  Owned Range сохраняет оба optional endpoints и inclusive_end; ordinary kernel
+  проверяет domain/order. Bounded evaluator допускает endpoint shells и invalid
+  diagnostics до rendering через общий scalar pool с CAST.
+  Общий nullable type widening идемпотентен; repeated NONE/NULL в CASE/Array/Set
+  не создают новый Option вокруг уже optional inferred type.
+  OMIT/FETCH recipes используют общий checked literal-path converter и SELECT
+  projection kernel: OMIT до FETCH, identity отдельно от payload. Shared OMIT
+  traversal проверяет cancellation/work/depth без нового executor; no-op paths
+  не добавляют внешние reads. Исторический proof учитывает work обоих path lists.
+  Root SELECT и grouped class union используют общий record-preserving pager:
+  LIMIT/START OFFSET разрешаются точно до row pull, anchors сохраняют source/group
+  identity. LIMIT 0 проверяет graph scope и фиксирует read dependency; skipped
+  records учитывают bounded work/cancellation. SELECT subqueries используют тот
+  же value wrapper. START expression допускается до optimizer/union plan clone.
+  Row-local class union сохраняет original per-class projection/ORDER keys и
+  применяет один global window через QuerySorter; unordered окна останавливают
+  projection/FETCH после global limit. Nested maximum применяется после START.
+  Grouped ORDER rebases top-level projected alias за padded input/class tag;
+  aggregate ORDER использует existing per-class merge_expression. Unchanged
+  clauses сохраняют прежний streaming путь. Retained START AFTER остаётся session
+  operation; owned LIVE ORDER/LIMIT/START Offset recipes используют тот же kernel.
+  ONLY использует общий final cardinality checker после window/projection/FETCH:
+  streaming cap2 остаётся после global offset, barriers вычисляются полностью.
+  Per-class union pull не применяет ONLY; qualified compact-row anchor берётся
+  из logical id при пустом stable с admission до copy. Nested wrapper сохраняет
+  ONLY flag и scalar shape, complete-domain history учитывает неизменных competitors.
+  LIVE SPLIT recipes/bindings/DAG используют общий WHERE/SPLIT preparation;
+  single-source stable anchor содержит original id, clause positions и отдельный
+  output ordinal. Последний не входит в Composite identity. Graph union применяет
+  один global window; aggregate union готовит WHERE/SPLIT до padding/grouping.
+  Expansion проверяет complete row/key growth, work и cancellation до clone;
+  historical changed-row replay запрещён, complete-domain proof остаётся обязательным.
+  Root JOIN kernel фиксирует logical source offsets/scopes на copied plan;
+  source tuple/SPLIT suffix идёт после прежнего unique output ordinal, не меняя
+  Row/transient row layout. Ordered union ставит global tie ordinal перед suffix.
+  Generic prepared input общий для ordinary finishing и aggregate union.
+  Shared combine_rows допускает каждый product до clone, включая CROSS без
+  predicates. ON-source discovery использует полный typed visitor; enumeration
+  и scheduling разделяют equality-INNER prefix boundary, suffix следует original
+  syntactic steps. Root zero-window проверяет все joined scopes на frozen copy.
+  Bare Name keys сохраняют projected alias/input precedence, Expression keys —
+  source qualification. GQL bind_query и общий DAG walker посещают все operands;
+  history с окном требует полного source domain, не только изменённых строк.
+  Scalar binary recipes сохраняют ordinary operator semantics и short-circuit;
+  syntax Truthy нормализуется в два admitted Not nodes. Общий operand/product
+  guard использует bounded RootRead либо reactive scalar pool; quantified loops
+  проверяют cancellation, сохраняя eager validation invalid later members.
+  CallWithOptions сохраняет symbolic type/DISTINCT/ordered optional names до
+  ordinary signature mapping. Shared bounded compiler signature guard допускает
+  types/names до ranking/result clone и direct/transitive compilation; existing
+  compiler RAII budget переиспользуется. DISTINCT deep copies используют общий
+  scalar admission. Historical spill context читает empty reconstructed graph
+  catalog; eligibility по-прежнему исключает graph/foreign input operations.
+  Static GraphRecord source проходит scoped exact point/FETCH с qualified
+  identity и negative membership dependencies; record class owner frozen.
+  Graph source policy и saved-result history не наследуют CLASS feed.
+  Internal Empty source сохраняет optional typed graph reference при нуле classes.
+  Effect/demand/fingerprint/copy visitors не теряют scope. Streaming LIMIT0 и
+  materialized COUNT/nested paths валидируют graph через общий helper против
+  того же snapshot, без metadata rows и без фиктивного class. Encoding v9.
+  SLEEP и nested TIMEOUT удерживают typed lexical duration до invocation;
+  borrowed binding lookup сохраняет snapshot/SSI без copy invalid payloads.
+  Общий converter проверяет fixed nanoseconds/calendar/negative/overflow;
+  checked child не отключает deadline при Instant overflow. PURE block учитывает
+  effect timeout operand; single-return closure не теряет timeout metadata.
+  Ordinary top-level TIMEOUT lower-ится до declaration/shadowing и разрешается
+  до mutating writer inference. Caller-owned control сохраняет construction
+  anchor/minimum deadline до autocommit export/admission/publication; clone
+  не обновляет clock. Import preflight и EXPLAIN normalization описаны выше.
+  Embedded MATCH удерживает private LogicalDuration до общей visitor boundary;
+  converter читает переданный invocation snapshot до planner/open. Child control
+  живёт до terminal visitor/graph assembly check, tv::match разрешает его для
+  каждого seed. Отсутствие clause сохраняет прежний control path.
 - `mod.rs` — публичный facade и re-exports syntax types.
 
 ## Инварианты
 
 - Не обходить analysis прямым исполнением AST.
+- `bindings.rs` хранит private immutable lexical type metadata независимо от
+  runtime Value. LET/ALTER LET проверяют dynamic members до slot write в normal
+  и PURE executor; annotations сохраняются между calls и в TRY savepoints.
+  Session export допускается до consuming commit, transaction locals не
+  экспортируются при explicit COMMIT/CANCEL. Это не durable LIVE LET registry.
+- LIVE возвращает canonical Record/Occurrence/Aggregate identity отдельно от
+  projection. Missing/negative FETCH, schema namespace и concrete PURE versions
+  входят в зависимости; compiler/rows/dependencies разделяют work budget.
+  Empty graph сохраняет стандартные atom columns; VALUE eligibility вложенного
+  SELECT не зависит от числа classes. Копии nested typed plans учитываются до clone.
 - IR и executor не зависят от page/WAL DTO; storage доступен только через
   transaction/query adapter.
 - Optimizer получает только read-only `PlannerSnapshot`: catalog/index metadata,
@@ -155,6 +362,10 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
   trace, sacks и env, а observable path либо impure side effect отключает
   небезопасное слияние. Resource exhaustion fail-closed и не выдаёт partial
   traversal result.
+- Подготовка traversal VM fallible: Limit/Skip разрешают count через общий exact
+  Number → u64 и отклоняют неверное значение до VM row pull, в том числе при пустом
+  source. Source к этому моменту уже может быть вычислен. Silent zero fallback
+  запрещён; limit(0) сохраняет ранний обрыв.
 - Все рассмотренные topology branches считаются в `max_path_expansions`;
   frontier/history/trace учитываются в statement barrier budget. При исчерпании
   бюджета path execution fail-closed и не выдаёт partial path.
@@ -167,3 +378,21 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
 `docs/gql_tech_spec.md`; при конфликте не угадывать. Минимальная проверка:
 parser/semantic/execution tests одной конструкции, RAM/local parity при
 storage access, затем `cargo check --lib --no-default-features` и rustfmt.
+
+LIVE EXPLAIN использует один command selector для Schema/LET wrappers и fixed-root
+QueryRead metadata. PlanHash v10 не исполняет UDF; current results/queue/ACK bounds
+не подменяют logical identity. Registration-only inputs записываются существующим
+Analyzer parameter resolver в optional bounded mask; named captures сохраняют
+соответствие при reorder/shadowing. Не вводить второй Expr walker или executor.
+Transient encoding/hash accounts освобождаются до execution; owned plan/output
+допускаются отдельно. INFO остаётся read-only, ANALYZE использует обычный pipeline один раз.
+
+## Root streaming admission
+
+Direct root SELECT Class callback удерживает transient BarrierAccount от cursor.next
+до завершения projection/visitor. Retained results до insertion отдельно учитывают
+value и qualified identity heap. Nested SELECT, index pages, row unions, ORDER,
+GROUP/JOIN и materializing collectors не включают этот scope: их escaping values
+остаются под прежней conservative policy. Scope восстанавливает enclosing account
+при EOF/early return/error/cancellation; не сбрасывать общий retained/read budget
+и не делить admission token между infallible deep Row clones. Work limits сохраняются.

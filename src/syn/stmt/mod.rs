@@ -7,6 +7,7 @@ mod graph_properties;
 mod graph_result;
 mod import;
 mod r#let;
+mod live;
 mod maintenance;
 mod r#match;
 mod r#return;
@@ -35,6 +36,13 @@ pub use graph_result::{
 	ReturnGraph,
 };
 pub use r#let::{LetStatement, LetValue};
+pub use live::{
+	LiveAckStatement,
+	LiveLetStatement,
+	LiveOutputName,
+	LiveOverflowName,
+	LiveSelectStatement,
+};
 pub use maintenance::{
 	AnalyzeModeName,
 	KillStatement,
@@ -116,6 +124,7 @@ pub use select::{
 	SelectStart,
 	SelectStatement,
 	SelectTarget,
+	SelectUnionPurpose,
 };
 pub use transaction::{
 	BeginStatement,
@@ -195,6 +204,12 @@ pub enum StatementKind {
 	Kill(KillStatement),
 	Import(ImportStatement),
 	Let(LetStatement),
+	/// Registers one transactional LIVE query incarnation.
+	LiveSelect(LiveSelectStatement),
+	/// Defines one transactional reactive binding identity.
+	LiveLet(LiveLetStatement),
+	/// Confirms one issued whole-commit delivery.
+	AckLive(LiveAckStatement),
 	Match(MatchStatement),
 	Relate(RelateStatement),
 	Return(ReturnStatement),

@@ -18,6 +18,7 @@ use super::{
 use crate::{
 	gql::ir::{
 		EndpointDomain,
+		LogicalGraphReference,
 		LogicalMatch,
 		LogicalMatchPattern,
 		LogicalMatchPatternKind,
@@ -36,9 +37,41 @@ pub(in crate::gql) fn plan_match(
 	snapshot: &PlannerSnapshot,
 	deterministic: bool,
 ) -> FerrosGrynnResult<PhysicalMatchPlan> {
-	let graph = snapshot.graph(statement.graph.id()).ok_or_else(|| {
-		FerrosGrynnError::graph_does_not_exist(statement.graph.name().to_string())
-	})?;
+	let reference = match &statement.graph {
+		LogicalGraphReference::Static(reference) => Some(reference),
+		LogicalGraphReference::Expression(_) => None,
+	};
+	let mut plan =
+		plan_match_bound(statement, snapshot, deterministic, reference, statement.max_depth)?;
+	if reference.is_none() {
+		plan.warnings.push(PlanWarning::ExecutionLimited(
+			"MATCH GRAPH is bound at invocation; outer estimates are conservative".into(),
+		));
+	}
+	if statement.max_depth_binding.is_some() {
+		plan.warnings.push(PlanWarning::ExecutionLimited(
+			"MATCH MAXDEPTH is bound at invocation; outer estimates use its checked upper bound"
+				.into(),
+		));
+	}
+	Ok(plan)
+}
+
+/// Plans a MATCH using the same clause bound that its pull cursors execute.
+pub(in crate::gql) fn plan_match_bound(
+	statement: &LogicalMatch,
+	snapshot: &PlannerSnapshot,
+	deterministic: bool,
+	reference: Option<&crate::graph::GraphRef>,
+	max_depth: u32,
+) -> FerrosGrynnResult<PhysicalMatchPlan> {
+	let graph = reference
+		.map(|reference| {
+			snapshot
+				.graph(reference.id())
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(reference.name().to_string()))
+		})
+		.transpose()?;
 	let mut remaining = (0..statement.patterns.len()).collect::<Vec<_>>();
 	let mut known = BTreeSet::new();
 	let mut pattern_order = Vec::with_capacity(remaining.len());
@@ -52,8 +85,12 @@ pub(in crate::gql) fn plan_match(
 		for (position, pattern_index) in remaining.iter().copied().enumerate() {
 			let pattern = &statement.patterns[pattern_index];
 			let connected = pattern_columns(pattern).any(|column| known.contains(&column));
-			let (estimate, candidate_cost, candidate_warnings) =
-				estimate_pattern(pattern, graph, snapshot, statement.graph.id());
+			let (estimate, candidate_cost, candidate_warnings) = if let Some(graph) = graph {
+				estimate_pattern(pattern, graph, snapshot, graph.reference.id(), max_depth)
+			} else {
+				let estimate = Cardinality::unknown(u64::MAX);
+				(estimate, scan_cost(estimate, 1, CostWeights::default()), Vec::new())
+			};
 			let key = (
 				!connected && !known.is_empty(),
 				candidate_cost.total(),
@@ -93,8 +130,10 @@ pub(in crate::gql) fn plan_match(
 		&pattern_costs,
 		cardinality,
 		deterministic,
+		max_depth,
 	);
 	Ok(PhysicalMatchPlan {
+		graph: reference.map(crate::graph::GraphRef::id),
 		pattern_order,
 		nodes,
 		cardinality,
@@ -157,14 +196,19 @@ fn select_landmark_path(
 		.cloned()
 }
 
+#[allow(
+	clippy::too_many_arguments,
+	reason = "bound clause depth is shared by every physical operator"
+)]
 fn match_nodes(
 	statement: &LogicalMatch,
-	graph: &PlannerGraph,
+	graph: Option<&PlannerGraph>,
 	pattern_order: &[usize],
 	pattern_estimates: &[Cardinality],
 	pattern_costs: &[PlanCost],
 	final_cardinality: Cardinality,
 	deterministic: bool,
+	max_depth: u32,
 ) -> Vec<PhysicalMatchNode> {
 	let mut nodes = Vec::new();
 	for (execution_index, pattern_index) in pattern_order.iter().copied().enumerate() {
@@ -206,8 +250,9 @@ fn match_nodes(
 							cost.stateful,
 						)
 					});
-					let scoped = graph.reference.kind() == crate::graph::GraphKind::Metagraph
-						|| filters.contains(&crate::syn::MatchPathFilter::CrossLevel);
+					let scoped = graph.is_none_or(|graph| {
+						graph.reference.kind() == crate::graph::GraphKind::Metagraph
+					}) || filters.contains(&crate::syn::MatchPathFilter::CrossLevel);
 					if scoped {
 						push_match_node(
 							&mut nodes,
@@ -225,7 +270,9 @@ fn match_nodes(
 									.objective
 									.is_some_and(|objective| !objective.is_all()) =>
 						{
-							select_landmark_path(graph, statement.atom, expand)
+							graph.and_then(|graph| {
+								select_landmark_path(graph, statement.atom, expand)
+							})
 						}
 						_ => None,
 					};
@@ -253,7 +300,7 @@ fn match_nodes(
 								} else {
 									crate::graph::TraversalSemantics::Node
 								},
-								scope: Some(scope),
+								scope: graph.map(|_| scope),
 								direction: Some(match direction {
 									crate::syn::MatchDirection::Forward => {
 										crate::graph::TraversalDirection::Forward
@@ -266,18 +313,20 @@ fn match_nodes(
 								weights: Some(crate::graph::tensor::WeightSelection::Unweighted),
 								labels: Some(expand.edge.label.iter().cloned().collect()),
 								parameters_hash: parameters.finish(),
-								dynamic_binding: false,
-								binding: graph
-									.tensor_caches
-									.iter()
-									.filter(|binding| binding.scope == scope)
-									.min_by_key(|binding| (binding.bytes, binding.index))
-									.cloned(),
+								dynamic_binding: graph.is_none(),
+								binding: graph.and_then(|graph| {
+									graph
+										.tensor_caches
+										.iter()
+										.filter(|binding| binding.scope == scope)
+										.min_by_key(|binding| (binding.bytes, binding.index))
+										.cloned()
+								}),
 							},
 							direction,
 							mode: expand.mode,
 							min: expand.min,
-							max: expand.max,
+							max: expand.maximum(max_depth),
 							weighted: expand
 								.objective
 								.is_some_and(crate::syn::MatchPathObjective::is_weighted),
@@ -290,7 +339,7 @@ fn match_nodes(
 							direction,
 							mode: expand.mode,
 							min: expand.min,
-							max: expand.max,
+							max: expand.maximum(max_depth),
 							binding,
 						}
 					} else {
@@ -321,7 +370,7 @@ fn match_nodes(
 									direction,
 									mode: expand.mode,
 									min: expand.min,
-									max: expand.max,
+									max: expand.maximum(max_depth),
 								},
 								Some(
 									crate::syn::MatchPathObjective::WeightedShortest
@@ -330,14 +379,14 @@ fn match_nodes(
 									direction,
 									mode: expand.mode,
 									min: expand.min,
-									max: expand.max,
+									max: expand.maximum(max_depth),
 									cost,
 								},
 								None => MatchOperator::PathEnumerate {
 									direction,
 									mode: expand.mode,
 									min: expand.min,
-									max: expand.max,
+									max: expand.maximum(max_depth),
 									cost,
 								},
 							},
@@ -452,6 +501,7 @@ fn estimate_pattern(
 	graph: &PlannerGraph,
 	snapshot: &PlannerSnapshot,
 	graph_id: crate::graph::GraphId,
+	max_depth: u32,
 ) -> (Cardinality, PlanCost, Vec<PlanWarning>) {
 	let mut warnings = Vec::new();
 	let pattern = match &pattern.kind {
@@ -494,7 +544,7 @@ fn estimate_pattern(
 		let (source, direction, min_hops, max_hops) = match operation {
 			MatchOp::Expand(expand) => (&expand.source, expand.direction, 1, 1),
 			MatchOp::PathExpand(expand) => {
-				(&expand.source, expand.direction, expand.min, expand.max)
+				(&expand.source, expand.direction, expand.min, expand.maximum(max_depth))
 			}
 		};
 		let (expected_degree, maximum_degree) =

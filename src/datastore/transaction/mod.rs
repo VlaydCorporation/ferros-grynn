@@ -65,11 +65,27 @@ mod commit;
 mod graph;
 mod graph_view;
 mod import;
+/// Transaction-private reactive registration, replacement and close.
+mod live;
+/// Session-issued ACK evidence, independent of primary mutation capture.
+mod live_ack;
+pub use live_ack::{GqlLiveAck, GqlLiveAttachment};
+/// Historical registration uses captured images and the ordinary SELECT
+/// executor.
+mod live_backfill;
+/// Independent reactive parameters, replacement and dependency validation.
+mod live_binding;
+/// Bounded candidate-root reactive evaluation before commit publication.
+mod live_evaluation;
+/// Whole-commit net SELECT/FETCH results over before/after immutable roots.
+pub(in crate::datastore) mod live_result;
 mod query;
 mod schema;
 mod tensor;
 mod writeback;
 
+#[cfg(test)]
+mod read_tracking_tests;
 #[cfg(test)]
 mod tests;
 
@@ -91,6 +107,48 @@ pub(crate) use query::{
 };
 pub use query::{QueryLandmarkPath, QueryNeighbourhoodEstimate, QueryNeighbourhoodSketch};
 pub use tensor::capture_tensor;
+
+/// Durable result coverage selected by the publication path.
+#[derive(Clone, Copy)]
+pub(super) enum LiveHistoryCapture {
+	/// Normal commit or explicitly captured import.
+	Enabled,
+	/// Current delivery can compute net results; durable backfill was disabled.
+	ImportSuppressed,
+}
+
+/// Query candidates selected by a validated normal-commit mutation boundary.
+#[derive(Clone, Copy)]
+pub(super) enum LiveQueryTargets {
+	/// Data, bindings, import or temporal activation may affect existing
+	/// results.
+	All,
+	/// Only new definitions require evaluation after unrelated registration.
+	Pending,
+}
+
+/// Prepares exact reactive values and result history against one complete
+/// candidate. Normal commit and import END share this executor boundary.
+///
+/// # Errors
+///
+/// Returns registration or shared publication admission errors. Active
+/// evaluation failures become owned query faults without vetoing source DML.
+pub(super) fn prepare_live_publication(
+	before: &Arc<DatabaseRoot>,
+	next: &mut DatabaseRoot,
+	scratch_root: std::path::PathBuf,
+	capture: LiveHistoryCapture,
+	targets: LiveQueryTargets,
+	observations: &crate::datastore::live_observation::Counters,
+) -> FerrosGrynnResult<()> {
+	live_evaluation::evaluate_bindings(next, scratch_root.clone(), observations)?;
+	live_result::evaluate_queries(before, next, scratch_root, targets, observations)?;
+	if matches!(capture, LiveHistoryCapture::ImportSuppressed) {
+		live_result::suppress_import_history(next)?;
+	}
+	crate::datastore::live_history::prepare(next)
+}
 
 /// Owned database-global atom value returned by a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +204,23 @@ impl CommitResult {
 
 #[derive(Debug, Clone)]
 enum Mutation {
+	/// New stable reactive identity and its frozen logical recipe.
+	DefineLiveBinding(Arc<super::LiveBindingDefinition>),
+	/// Checked expression replacement retaining the same stable identity.
+	ReplaceLiveBinding {
+		/// Private validated replacement recipe and captures.
+		definition: Arc<super::LiveBindingDefinition>,
+		/// Concrete preceding version required during replay.
+		expected: crate::live::LiveVersion,
+	},
+	/// Explicit removal after checking all reactive dependents.
+	RemoveLiveBinding(crate::live::LiveBindingId),
+	/// Immutable private recipe; publication activates its final lifecycle.
+	RegisterLive(Arc<super::LiveDefinition>),
+	/// Explicit stop, retaining historical identity.
+	CloseLive(crate::live::LiveId),
+	/// Whole-commit confirmation validated by an attached issuing consumer.
+	AcknowledgeLive(crate::live::LiveCursor),
 	/// Final capture configuration of a retained class or graph feed.
 	ConfigureChangefeed {
 		/// Stable owning class or graph identity.
@@ -283,6 +358,16 @@ pub struct Transaction {
 	gql_statement_depth: usize,
 	gql_aborted: bool,
 	gql_bindings: crate::values::Object,
+	/// Own lexical declarations and immutable outer session metadata.
+	gql_binding_types: crate::gql::bindings::BindingTypes,
+	/// Inherited immutable captures never become transaction-local
+	/// declarations.
+	gql_outer_binding_types: crate::gql::bindings::BindingTypes,
+	/// Only GQL registrations need a session consumer admitted before COMMIT.
+	gql_live_registrations: Vec<crate::live::LiveId>,
+	/// Private attachment witnesses revalidated before WAL and retired by
+	/// rollback.
+	gql_live_acks: Vec<GqlLiveAck>,
 }
 
 pub(crate) struct TransactionSavepoint {
@@ -301,6 +386,13 @@ pub(crate) struct TransactionSavepoint {
 	/// Spool rollback position for rejected or failed item boundaries.
 	import_changefeed: changefeed_import::SpoolCheckpoint,
 	gql_bindings: crate::values::Object,
+	/// Immutable lexical contracts restored together with their values.
+	gql_binding_types: crate::gql::bindings::BindingTypes,
+	/// TRY rollback removes pending session registrations without move-only
+	/// handles.
+	gql_live_registration_len: usize,
+	/// Restores ACK evidence together with staged control mutations.
+	gql_live_ack_len: usize,
 }
 
 impl Transaction {
@@ -349,6 +441,10 @@ impl Transaction {
 			gql_statement_depth: 0,
 			gql_aborted: false,
 			gql_bindings: crate::values::Object::new(),
+			gql_binding_types: crate::gql::bindings::BindingTypes::default(),
+			gql_outer_binding_types: crate::gql::bindings::BindingTypes::default(),
+			gql_live_registrations: Vec::new(),
+			gql_live_acks: Vec::new(),
 		}
 	}
 
@@ -392,6 +488,13 @@ impl Transaction {
 	/// Returns the isolation and access policy selected at begin time.
 	pub const fn options(&self) -> TransactionOptions {
 		self.options
+	}
+
+	/// Promotes an implicit session transaction after ordinary typed analysis.
+	pub(crate) fn infer_gql_write_access(&mut self) -> FerrosGrynnResult<()> {
+		self.ensure_live()?;
+		self.options.access = TransactionAccess::ReadWrite;
+		Ok(())
 	}
 
 	/// Returns bytes already reserved by the logical write-set preflight.
@@ -492,6 +595,64 @@ impl Transaction {
 		self.gql_bindings = bindings;
 	}
 
+	/// Inherits only type metadata; explicit transaction locals remain
+	/// separate.
+	pub(crate) fn inherit_gql_binding_types(&mut self, types: crate::gql::bindings::BindingTypes) {
+		self.gql_outer_binding_types = types;
+	}
+
+	/// Returns the nearest lexical declaration's original runtime contract.
+	pub(crate) fn gql_binding_type(&self, name: &str) -> Option<&crate::values::Type> {
+		self.gql_binding_types.get(name).or_else(|| self.gql_outer_binding_types.get(name))
+	}
+
+	/// Preserves nearest-scope provenance even when an ordinary value is UUID.
+	pub(crate) fn gql_binding_is_reactive(&self, name: &str) -> bool {
+		if self.gql_binding_types.get(name).is_some() {
+			self.gql_binding_types.is_reactive(name)
+		} else {
+			self.gql_outer_binding_types.is_reactive(name)
+		}
+	}
+
+	/// Reactive declarations share the same savepointed lexical metadata.
+	pub(crate) fn note_gql_reactive_binding(
+		&mut self,
+		name: &str,
+		control: &crate::gql::ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		self.gql_binding_types = self.gql_binding_types.with_reactive_binding(
+			name,
+			control,
+			&self.gql_outer_binding_types,
+		)?;
+		Ok(())
+	}
+
+	/// Admits metadata without creating a primary mutation or commit stamp.
+	pub(crate) fn note_gql_binding_type(
+		&mut self,
+		name: &str,
+		ty: &crate::values::Type,
+		control: &crate::gql::ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		self.gql_binding_types = self.gql_binding_types.with_binding(
+			name,
+			ty,
+			control,
+			&self.gql_outer_binding_types,
+		)?;
+		Ok(())
+	}
+
+	/// Prepares the session export before autocommit durable publication.
+	pub(crate) fn export_gql_binding_types(
+		&self,
+		control: &crate::gql::ExecutionControl,
+	) -> FerrosGrynnResult<crate::gql::bindings::BindingTypes> {
+		self.gql_binding_types.overlay(&self.gql_outer_binding_types, control)
+	}
+
 	pub(crate) fn gql_savepoint(&self) -> TransactionSavepoint {
 		TransactionSavepoint {
 			working: self.working.clone(),
@@ -507,6 +668,9 @@ impl Transaction {
 			change_journal: self.change_journal.checkpoint(),
 			import_changefeed: self.import_changefeed.checkpoint(),
 			gql_bindings: self.gql_bindings.clone(),
+			gql_binding_types: self.gql_binding_types.clone(),
+			gql_live_registration_len: self.gql_live_registrations.len(),
+			gql_live_ack_len: self.gql_live_acks.len(),
 		}
 	}
 
@@ -524,6 +688,9 @@ impl Transaction {
 		self.change_journal.restore(savepoint.change_journal);
 		self.import_changefeed.restore(savepoint.import_changefeed);
 		self.gql_bindings = savepoint.gql_bindings;
+		self.gql_binding_types = savepoint.gql_binding_types;
+		self.gql_live_registrations.truncate(savepoint.gql_live_registration_len);
+		self.gql_live_acks.truncate(savepoint.gql_live_ack_len);
 	}
 
 	pub(crate) fn assert_invariants(
@@ -582,6 +749,22 @@ impl Transaction {
 				self.finish_change_operation(owned);
 				Ok(value)
 			}
+			Err(error) => {
+				self.restore_gql_savepoint(savepoint);
+				Err(error)
+			}
+		}
+	}
+
+	/// Rolls back one LIVE control without applying data-writer preparation.
+	pub(crate) fn atomic_live_control<T>(
+		&mut self,
+		control: impl FnOnce(&mut Self) -> FerrosGrynnResult<T>,
+	) -> FerrosGrynnResult<T> {
+		self.prepare_live_control()?;
+		let savepoint = self.gql_savepoint();
+		match control(self) {
+			Ok(value) => Ok(value),
 			Err(error) => {
 				self.restore_gql_savepoint(savepoint);
 				Err(error)
@@ -879,7 +1062,7 @@ impl Transaction {
 		};
 		let atom = self.atom_snapshot(global)?;
 		if self.last_base_read != Some(global) {
-			self.record_read(ConflictKey::BaseAtom(global));
+			self.record_read_exclusive(ConflictKey::BaseAtom(global));
 			self.last_base_read = Some(global);
 		}
 		Ok(Some(atom))
@@ -1134,6 +1317,47 @@ impl Transaction {
 		self.prepare_write(false)
 	}
 
+	/// Stages control without opening the import lease to data or schema DML.
+	fn prepare_live_control(&mut self) -> FerrosGrynnResult<()> {
+		if self.import_constraints.is_some() {
+			return Err(FerrosGrynnError::query_feature_not_supported(
+				"LIVE control inside BEGIN IMPORT",
+			));
+		}
+		self.prepare_read()?;
+		if self.options.access == TransactionAccess::ReadOnly {
+			return Err(FerrosGrynnError::read_only_transaction(self.id));
+		}
+		if !self.live_control_mutations() {
+			self.store.inner.ensure_write_allowed(self.id)?;
+		}
+		Ok(())
+	}
+
+	/// No-op data intents also exclude a transaction from the control lease.
+	fn live_control_mutations(&self) -> bool {
+		self.change_journal.intents.is_empty()
+			&& self.change_journal.operations.is_empty()
+			&& self.mutations.iter().all(|mutation| {
+				matches!(mutation, Mutation::CloseLive(_) | Mutation::AcknowledgeLive(_))
+			})
+	}
+
+	/// An empty read is not a publication; only actual controls bypass a lease.
+	fn is_live_control_commit(&self) -> bool {
+		!self.mutations.is_empty() && self.live_control_mutations()
+	}
+
+	/// Rechecks the narrow exception at both commit preparation and
+	/// publication.
+	fn ensure_commit_write_allowed(&self) -> FerrosGrynnResult<()> {
+		if self.is_live_control_commit() {
+			Ok(())
+		} else {
+			self.store.inner.ensure_write_allowed(self.id)
+		}
+	}
+
 	fn ensure_live(&self) -> FerrosGrynnResult<()> {
 		if self.gql_aborted {
 			return Err(FerrosGrynnError::transaction_aborted(self.id));
@@ -1238,10 +1462,24 @@ impl Transaction {
 		self.record_reads([key]);
 	}
 
+	/// Exclusive transaction access already excludes concurrent shared readers.
+	fn record_read_exclusive(&mut self, key: ConflictKey) {
+		Self::record_revisions(&self.snapshot, self.reads.get_mut(), [key]);
+	}
+
 	fn record_reads<const COUNT: usize>(&self, keys: [ConflictKey; COUNT]) {
 		let mut reads = self.reads.lock();
+		Self::record_revisions(&self.snapshot, &mut reads, keys);
+	}
+
+	/// Retains the first observed snapshot revision for each logical target.
+	fn record_revisions<const COUNT: usize>(
+		snapshot: &DatabaseRoot,
+		reads: &mut RapidHashMap<ConflictKey, u64>,
+		keys: [ConflictKey; COUNT],
+	) {
 		for key in keys {
-			reads.entry(key).or_insert_with(|| self.snapshot.version(key));
+			reads.entry(key).or_insert_with(|| snapshot.version(key));
 		}
 	}
 

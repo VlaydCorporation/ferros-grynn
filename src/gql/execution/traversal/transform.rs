@@ -62,7 +62,12 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 				let target = step.algorithm_input.as_ref().ok_or_else(|| {
 					FerrosGrynnError::invalid_argument("tv::algo input type is missing.")
 				})?;
-				let current = cast(traverser.current.clone(), target)?;
+				let current = cast(
+					traverser.current.clone(),
+					target,
+					self.read.bounded_fields(),
+					Some(self.control),
+				)?;
 				let offset = usize::from(step.named_function.is_none());
 				let mut arguments = Vec::with_capacity(step.arguments.len() + 1 - offset);
 				arguments.push(current);

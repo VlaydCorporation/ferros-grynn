@@ -512,9 +512,15 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 		contract.family = Some(crate::graph::GraphKind::Graph);
 	}
 	let root_hint = match &plan.source {
-		LogicalBuildGraphSource::Match(statement) => Some(statement.graph.clone()),
+		LogicalBuildGraphSource::Match(statement) => {
+			Some(resolve_match_graph(read, snapshot, statement, slots, source, control)?)
+		}
 		LogicalBuildGraphSource::Select(statement) => match &statement.source.kind {
 			LogicalSelectSourceKind::Atoms {
+				graph: Some(reference),
+				..
+			}
+			| LogicalSelectSourceKind::AtomUnion {
 				graph: Some(reference),
 				..
 			} => Some(select::resolve_graph_reference(
@@ -525,6 +531,13 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 				..
 			}
 			| LogicalSelectSourceKind::Graphs {
+				..
+			}
+			| LogicalSelectSourceKind::Empty {
+				..
+			}
+			| LogicalSelectSourceKind::AtomUnion {
+				graph: None,
 				..
 			}
 			| LogicalSelectSourceKind::Derived(_) => None,

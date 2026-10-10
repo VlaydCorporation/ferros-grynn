@@ -43,6 +43,73 @@ pub(super) fn eval_mut_current(
 	eval_current(expr, row, &mut slots, source, fields, current, control)
 }
 
+/// Validates duration slots by borrowing values; invalid containers are never
+/// copied merely to diagnose their type.
+pub(super) fn eval_duration(
+	duration: &crate::gql::ir::LogicalDuration,
+	slots: &[Value],
+	source: &str,
+	fields: Option<&dyn AtomFieldRead>,
+	control: &ExecutionControl,
+	subject: &str,
+) -> FerrosGrynnResult<Duration> {
+	eval_duration_with_lookup(
+		duration,
+		|slot| slots.get(slot as usize),
+		source,
+		fields,
+		control,
+		subject,
+	)
+}
+
+/// Import preflight borrows initial inputs without materializing an owned
+/// frame.
+pub(super) fn eval_duration_with_lookup<'a>(
+	duration: &crate::gql::ir::LogicalDuration,
+	slot_value: impl Fn(u32) -> Option<&'a Value>,
+	source: &str,
+	fields: Option<&dyn AtomFieldRead>,
+	control: &ExecutionControl,
+	subject: &str,
+) -> FerrosGrynnResult<Duration> {
+	control.check()?;
+	if let Some(fields) = fields {
+		fields.work(1)?;
+	}
+	let expression = match duration {
+		crate::gql::ir::LogicalDuration::Fixed(duration) => return Ok(*duration),
+		crate::gql::ir::LogicalDuration::Parameter(expression) => expression,
+	};
+	let value = match &expression.kind {
+		TypedExprKind::Slot(slot) => slot_value(*slot)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("Expression slot is invalid."))?,
+		TypedExprKind::LiveSlot(slot) => {
+			let id = live_slot_identity(slot_value(*slot))?;
+			fields
+				.ok_or_else(|| {
+					FerrosGrynnError::invalid_argument("LIVE LET requires a query snapshot")
+				})?
+				.live_binding(id)?
+		}
+		_ => {
+			return Err(FerrosGrynnError::invalid_argument(
+				"Duration parameter is not a lexical slot.",
+			));
+		}
+	};
+	crate::gql::options::parameter_duration(value, subject)
+		.map_err(|error| locate_execution(error, expression, source))
+}
+
+/// UUID shape alone never assigns reactive provenance to an ordinary slot.
+fn live_slot_identity(value: Option<&Value>) -> FerrosGrynnResult<crate::live::LiveBindingId> {
+	let Some(Value::Uuid(uuid)) = value else {
+		return Err(FerrosGrynnError::invalid_argument("LIVE LET frame identity requires a UUID"));
+	};
+	crate::live::LiveBindingId::from_uuid(*uuid)
+}
+
 enum SlotFrame<'a> {
 	Read(&'a [Value]),
 	Write(&'a mut [Value]),
@@ -84,20 +151,30 @@ fn eval_current(
 		fields.work(1)?;
 	}
 	let result = match &expr.kind {
-		TypedExprKind::Constant(value) => copy_evaluation_value(value, fields),
+		TypedExprKind::Constant(value) => copy_evaluation_value(value, fields, control),
 		TypedExprKind::Slot(slot) => slots
 			.values()
 			.get(*slot as usize)
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("Expression slot is invalid."))
-			.and_then(|value| copy_evaluation_value(value, fields)),
+			.and_then(|value| copy_evaluation_value(value, fields, control)),
+		TypedExprKind::LiveSlot(slot) => {
+			let id = live_slot_identity(slots.values().get(*slot as usize))?;
+			let fields = fields.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("LIVE LET requires a query snapshot")
+			})?;
+			let control = control.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("LIVE LET requires evaluation control")
+			})?;
+			fields.live_binding_value(id, control)
+		}
 		TypedExprKind::Column(column) => row
 			.and_then(|row| row.value(*column))
 			.ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("Column is missing from the input row.")
 			})
-			.and_then(|value| copy_evaluation_value(value, fields)),
+			.and_then(|value| copy_evaluation_value(value, fields, control)),
 		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
-			admit_evaluation_values(std::iter::empty(), values.len(), fields)?;
+			admit_evaluation_values(std::iter::empty(), values.len(), fields, control)?;
 			let values = values
 				.iter()
 				.map(|value| eval_current(value, row, slots, source, fields, current, control));
@@ -108,7 +185,7 @@ fn eval_current(
 			}
 		}
 		TypedExprKind::Object(object_fields) => {
-			admit_evaluation_values(std::iter::empty(), object_fields.len(), fields)?;
+			admit_evaluation_values(std::iter::empty(), object_fields.len(), fields, control)?;
 			object_fields
 				.iter()
 				.map(|(name, value)| {
@@ -142,7 +219,14 @@ fn eval_current(
 						std::ops::Bound::Excluded(value)
 					}
 				});
-			crate::values::Range::new(start, end).map(Value::Range)
+			let shells = usize::from(!matches!(start, std::ops::Bound::Unbounded))
+				+ usize::from(!matches!(end, std::ops::Bound::Unbounded));
+			admit_evaluation_values(std::iter::empty(), shells, fields, control)?;
+			crate::values::Range::new_with_diagnostic_admission(start, end, |start, end| {
+				admit_value_render(start, fields, control)?;
+				admit_value_render(end, fields, control)
+			})
+			.map(Value::Range)
 		}
 		TypedExprKind::Unary {
 			op,
@@ -154,24 +238,20 @@ fn eval_current(
 			right,
 		} => {
 			let left = eval_current(left, row, slots, source, fields, current, control)?;
-			match op {
-				BinaryOperator::And if !left.is_truthy() => Ok(Value::Bool(false)),
-				BinaryOperator::Or if left.is_truthy() => Ok(Value::Bool(true)),
-				BinaryOperator::Coalesce if !matches!(left, Value::None | Value::Null) => Ok(left),
-				BinaryOperator::Elvis if left.is_truthy() => Ok(left),
-				_ => {
+			match after_binary_left(*op, left) {
+				std::ops::ControlFlow::Break(value) => Ok(value),
+				std::ops::ControlFlow::Continue(left) => {
 					let right = eval_current(right, row, slots, source, fields, current, control)?;
-					if let Some(fields) = fields.filter(|fields| fields.bounded()) {
-						fields.admit_value(&left)?;
-						fields.admit_value(&right)?;
-						let left = left.estimated_heap_bytes().saturating_add(1);
-						let right = right.estimated_heap_bytes().saturating_add(1);
-						let work = left.checked_mul(right).ok_or_else(|| {
-							FerrosGrynnError::operation_overflow("PURE comparison work")
-						})?;
-						fields.work(work as u64)?;
-					}
-					binary(*op, left, right)
+					admit_binary_operands(&left, &right, fields, control)?;
+					binary_checked(*op, left, right, || {
+						if let Some(control) = control {
+							control.check()?;
+						}
+						if let Some(fields) = fields {
+							fields.work(0)?;
+						}
+						Ok(())
+					})
 				}
 			}
 		}
@@ -231,9 +311,7 @@ fn eval_current(
 			}
 			let base = eval_current(base, row, slots, source, fields, current, control)?;
 			match base {
-				Value::Object(object) => object
-					.get(field)
-					.map_or(Ok(Value::None), |value| copy_evaluation_value(value, fields)),
+				Value::Object(mut object) => Ok(object.remove(field).unwrap_or(Value::None)),
 				Value::Error(error) => Ok(error_field(&error, field)),
 				Value::Matcher(matcher) => matcher_field(&matcher, field),
 				Value::AtomOccurrence(occurrence) if fields.is_some() => fields
@@ -247,7 +325,7 @@ fn eval_current(
 					.ok_or_else(|| {
 						FerrosGrynnError::invalid_argument("Record resolver is unavailable.")
 					})?
-					.record_field(&record, field),
+					.record_field(&record, field, control),
 				Value::None | Value::Null if *null_safe => Ok(Value::None),
 				value => Err(FerrosGrynnError::invalid_argument(format!(
 					"Cannot access field `{field}` on {}.",
@@ -257,7 +335,7 @@ fn eval_current(
 		}
 		TypedExprKind::CurrentField(field) => {
 			if let Some(current) = current {
-				admit_evaluation_values(std::iter::once(current), 0, fields)?;
+				admit_evaluation_values(std::iter::once(current), 0, fields, control)?;
 			}
 			current_field(current, field)
 		}
@@ -274,12 +352,18 @@ fn eval_current(
 					source,
 				));
 			};
-			admit_evaluation_values(base.values(), names.len(), fields)?;
+			admit_evaluation_values(base.values(), names.len(), fields, control)?;
 			Ok(Value::Object(
 				names
 					.iter()
-					.map(|name| (name.as_ref(), base.get(name).cloned().unwrap_or(Value::None)))
-					.collect(),
+					.map(|name| {
+						base.get(name)
+							.map_or(Ok(Value::None), |value| {
+								copy_evaluation_value(value, fields, control)
+							})
+							.map(|value| (name.as_ref(), value))
+					})
+					.collect::<FerrosGrynnResult<Object>>()?,
 			))
 		}
 		TypedExprKind::Index {
@@ -288,7 +372,6 @@ fn eval_current(
 		} => {
 			let base = eval_current(base, row, slots, source, fields, current, control)?;
 			let index = eval_current(index, row, slots, source, fields, current, control)?;
-			admit_evaluation_values(std::iter::once(&base), 0, fields)?;
 			index_value(base, index)
 		}
 		TypedExprKind::Filter {
@@ -304,7 +387,7 @@ fn eval_current(
 					source,
 				));
 			};
-			admit_evaluation_values(values.iter(), values.len(), fields)?;
+			admit_evaluation_values(values.iter(), values.len(), fields, control)?;
 			let mut filtered = Array::new(Vec::new());
 			for value in values {
 				if eval_current(predicate, row, slots, source, fields, Some(&value), control)?
@@ -333,7 +416,7 @@ fn eval_current(
 					eval_current(argument, row, slots, source, fields, current, control)
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
-			admit_evaluation_values(arguments.iter(), arguments.len(), fields)?;
+			admit_evaluation_values(arguments.iter(), arguments.len(), fields, control)?;
 			mutate_collection(function, arguments, slots)
 		}
 		TypedExprKind::Builtin {
@@ -442,7 +525,7 @@ fn eval_current(
 					source,
 					fields,
 				)?;
-				admit_evaluation_values(std::iter::once(&result), 0, fields)?;
+				admit_evaluation_values(std::iter::once(&result), 0, fields, Some(control))?;
 				if let Some(fields) = fields.filter(|fields| fields.bounded()) {
 					fields.admit(result.estimated_heap_bytes().checked_mul(4).ok_or_else(
 						|| FerrosGrynnError::operation_overflow("PURE analyzer token copies"),
@@ -479,7 +562,7 @@ fn eval_current(
 					},
 				)?
 			};
-			admit_evaluation_values(std::iter::empty(), tokens.len(), fields)?;
+			admit_evaluation_values(std::iter::empty(), tokens.len(), fields, Some(control))?;
 			Ok(Value::Array(crate::values::Array::from_iter(
 				tokens.into_iter().map(|token| Value::String(token.term)),
 			)))
@@ -641,17 +724,90 @@ fn eval_current(
 		TypedExprKind::Cast {
 			target,
 			expr,
-		} => cast(eval_current(expr, row, slots, source, fields, current, control)?, target),
+		} => {
+			let value = eval_current(expr, row, slots, source, fields, current, control)?;
+			cast(value, target, fields, control)
+		}
 	};
 	result.map_err(|error| locate_execution(error, expr, source))
 }
 
-/// Admits deep clones before allocating any owned evaluation value.
-fn copy_evaluation_value(
+/// Success and failure rendering spend the same pool as scalar payload copies.
+fn admit_value_render(
 	value: &Value,
 	fields: Option<&dyn AtomFieldRead>,
+	control: Option<&ExecutionControl>,
+) -> FerrosGrynnResult<()> {
+	let bounded = fields.filter(|fields| fields.bounded());
+	let reactive = control.filter(|control| control.has_reactive_copies());
+	if bounded.is_some() || reactive.is_some() {
+		admit_evaluation_values(std::iter::once(value), 0, fields, control)?;
+		// ponytail: conservatively bound escaping and simultaneous formatter
+		// buffers; use a streaming renderer if this rejects useful workloads.
+		let bytes = value
+			.estimated_heap_bytes()
+			.checked_add(std::mem::size_of::<Value>())
+			.and_then(|bytes| bytes.checked_mul(16))
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("scalar renderer scratch"))?;
+		admit_cast_bytes(bytes, fields, control)?;
+	}
+	Ok(())
+}
+
+/// Shares renderer and object-output bytes with the existing scalar pool.
+fn admit_cast_bytes(
+	bytes: usize,
+	fields: Option<&dyn AtomFieldRead>,
+	control: Option<&ExecutionControl>,
+) -> FerrosGrynnResult<()> {
+	if let Some(fields) = fields.filter(|fields| fields.bounded()) {
+		fields.admit(bytes)
+	} else if let Some(control) = control.filter(|control| control.has_reactive_copies()) {
+		control.admit_reactive_bytes(bytes)
+	} else {
+		Ok(())
+	}
+}
+
+/// Admits deep clones before allocating any owned evaluation value.
+pub(super) fn copy_evaluation_value(
+	value: &Value,
+	fields: Option<&dyn AtomFieldRead>,
+	control: Option<&ExecutionControl>,
 ) -> FerrosGrynnResult<Value> {
-	fields.map_or_else(|| Ok(value.clone()), |fields| fields.copy_value(value))
+	if let Some(fields) = fields.filter(|fields| fields.bounded()) {
+		fields.copy_value(value)
+	} else if let Some(control) = control.filter(|control| control.has_reactive_copies()) {
+		control.copy_reactive_value(value)
+	} else {
+		Ok(value.clone())
+	}
+}
+
+/// Admits binary scratch and comparison work through the existing scalar pool.
+fn admit_binary_operands(
+	left: &Value,
+	right: &Value,
+	fields: Option<&dyn AtomFieldRead>,
+	control: Option<&ExecutionControl>,
+) -> FerrosGrynnResult<()> {
+	let bounded = fields.filter(|fields| fields.bounded());
+	let reactive = control.filter(|control| control.has_reactive_copies());
+	if bounded.is_some() || reactive.is_some() {
+		admit_evaluation_values([left, right].into_iter(), 0, fields, control)?;
+		let work = left
+			.estimated_heap_bytes()
+			.saturating_add(1)
+			.checked_mul(right.estimated_heap_bytes().saturating_add(1))
+			.and_then(|work| u64::try_from(work).ok())
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("PURE comparison work"))?;
+		if let Some(fields) = bounded {
+			fields.work(work)?;
+		} else if let Some(control) = reactive {
+			control.admit_reactive_work(work)?;
+		}
+	}
+	Ok(())
 }
 
 /// Conservatively accounts payload copies and collection-node growth.
@@ -659,15 +815,20 @@ fn admit_evaluation_values<'a>(
 	values: impl Iterator<Item = &'a Value>,
 	shells: usize,
 	fields: Option<&dyn AtomFieldRead>,
+	control: Option<&ExecutionControl>,
 ) -> FerrosGrynnResult<()> {
+	let bytes = shells
+		.checked_mul(128)
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("PURE value scratch"))?;
 	if let Some(fields) = fields.filter(|fields| fields.bounded()) {
-		fields.admit(
-			shells
-				.checked_mul(128)
-				.ok_or_else(|| FerrosGrynnError::operation_overflow("PURE value scratch"))?,
-		)?;
+		fields.admit(bytes)?;
 		for value in values {
 			fields.admit_value(value)?;
+		}
+	} else if let Some(control) = control.filter(|control| control.has_reactive_copies()) {
+		control.admit_reactive_bytes(bytes)?;
+		for value in values {
+			control.admit_reactive_value(value)?;
 		}
 	}
 	Ok(())
@@ -792,6 +953,7 @@ pub(in crate::gql::execution) fn invoke_logical_closure_with_fields(
 	source: &str,
 	fields: Option<&dyn AtomFieldRead>,
 ) -> FerrosGrynnResult<Value> {
+	let control = &control.closure_scope(plan.invocation_effect())?;
 	if plan.parameters.len() != arguments.len() {
 		return Err(FerrosGrynnError::conversion_error(
 			format!("{} closure arguments", arguments.len()),
@@ -871,7 +1033,12 @@ fn execute_pure_block(
 ) -> FerrosGrynnResult<PureControlFlow> {
 	let mut last = Value::None;
 	for statement in &block.statements {
-		let child = control.child(statement.timeout);
+		let timeout = statement
+			.timeout
+			.as_ref()
+			.map(|duration| eval_duration(duration, slots, source, fields, control, "TIMEOUT"))
+			.transpose()?;
+		let child = control.checked_child(timeout)?;
 		match execute_pure_statement(
 			&statement.statement,
 			slots,
@@ -912,12 +1079,28 @@ fn execute_pure_statement(
 		fields.work(1)?;
 	}
 	let value = match statement {
+		LogicalStatement::SetBinding {
+			slot,
+			expected,
+			value,
+		} => {
+			let value = eval_mut(value, None, slots, source, fields, Some(control))?;
+			crate::gql::bindings::validate_value(expected, &value, control, fields)?;
+			let target = slots.get_mut(*slot as usize).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("ALTER LET slot is outside its typed frame")
+			})?;
+			*target = value;
+			Value::None
+		}
 		LogicalStatement::Let {
 			slot,
+			expected,
 			value: LogicalLetValue::Expression(value),
 			..
 		} => {
-			slots[*slot as usize] = eval_mut(value, None, slots, source, fields, Some(control))?;
+			let value = eval_mut(value, None, slots, source, fields, Some(control))?;
+			crate::gql::bindings::validate_value(expected, &value, control, fields)?;
+			slots[*slot as usize] = value;
 			Value::None
 		}
 		LogicalStatement::Return {
@@ -1011,12 +1194,17 @@ fn execute_pure_statement(
 			body,
 			catch,
 		} => {
-			admit_evaluation_values(slots.iter(), slots.len(), fields)?;
+			admit_evaluation_values(slots.iter(), slots.len(), fields, Some(control))?;
 			let saved_slots = slots.to_vec();
 			match execute_pure_block(body, slots, source, control, runtime, depth + 1, fields) {
 				Ok(flow) => return Ok(flow),
 				Err(error) if catch.as_ref().is_some_and(|_| super::catchable(&error)) => {
-					admit_evaluation_values(saved_slots.iter(), saved_slots.len(), fields)?;
+					admit_evaluation_values(
+						saved_slots.iter(),
+						saved_slots.len(),
+						fields,
+						Some(control),
+					)?;
 					slots.clone_from_slice(&saved_slots);
 					let (slot, handler) = catch.as_ref().ok_or_else(|| {
 						FerrosGrynnError::invalid_argument("CATCH handler is missing.")
@@ -1054,6 +1242,32 @@ fn execute_pure_statement(
 	};
 	control.check()?;
 	Ok(PureControlFlow::Value(value))
+}
+
+/// Identifies operators whose right operand may remain unevaluated.
+pub(super) const fn lazy_binary(operator: BinaryOperator) -> bool {
+	matches!(
+		operator,
+		BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Coalesce | BinaryOperator::Elvis
+	)
+}
+
+/// Shared short-circuit decision for scalar and SELECT-special evaluation.
+pub(super) fn after_binary_left(
+	operator: BinaryOperator,
+	left: Value,
+) -> std::ops::ControlFlow<Value, Value> {
+	match operator {
+		BinaryOperator::And if !left.is_truthy() => {
+			std::ops::ControlFlow::Break(Value::Bool(false))
+		}
+		BinaryOperator::Or if left.is_truthy() => std::ops::ControlFlow::Break(Value::Bool(true)),
+		BinaryOperator::Coalesce if !matches!(left, Value::None | Value::Null) => {
+			std::ops::ControlFlow::Break(left)
+		}
+		BinaryOperator::Elvis if left.is_truthy() => std::ops::ControlFlow::Break(left),
+		_ => std::ops::ControlFlow::Continue(left),
+	}
 }
 
 fn mutate_collection(
@@ -1156,7 +1370,21 @@ pub(super) fn binary(
 	left: Value,
 	right: Value,
 ) -> FerrosGrynnResult<Value> {
-	match operator {
+	binary_checked(operator, left, right, || Ok(()))
+}
+
+/// Preserves ordinary operator semantics while checking admitted long loops.
+fn binary_checked<Check>(
+	operator: BinaryOperator,
+	left: Value,
+	right: Value,
+	mut check: Check,
+) -> FerrosGrynnResult<Value>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	check()?;
+	let value = match operator {
 		BinaryOperator::Inside
 		| BinaryOperator::NotInside
 		| BinaryOperator::Outside
@@ -1176,6 +1404,7 @@ pub(super) fn binary(
 			let mut any = false;
 			let mut all = true;
 			for value in collection_values(&left)? {
+				check()?;
 				let matched = spatial(BinaryOperator::Inside, value, &right)?;
 				any |= matched;
 				all &= matched;
@@ -1199,7 +1428,7 @@ pub(super) fn binary(
 		BinaryOperator::Equal | BinaryOperator::Is => Ok(Value::Bool(left == right)),
 		BinaryOperator::NotEqual | BinaryOperator::NotIs => Ok(Value::Bool(left != right)),
 		BinaryOperator::In | BinaryOperator::NotIn => {
-			let contains = contains(&right, &left)?;
+			let contains = contains(&right, &left, &mut check)?;
 			Ok(Value::Bool(if matches!(operator, BinaryOperator::NotIn) {
 				!contains
 			} else {
@@ -1210,7 +1439,7 @@ pub(super) fn binary(
 			let values = collection_values(&left)?;
 			let matches = values
 				.iter()
-				.map(|value| contains(&right, value))
+				.map(|value| contains(&right, value, &mut check))
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			Ok(Value::Bool(match operator {
 				BinaryOperator::AllIn => matches.into_iter().all(|value| value),
@@ -1221,14 +1450,19 @@ pub(super) fn binary(
 		}
 		BinaryOperator::AnyEqual | BinaryOperator::AllEqual => {
 			let values = collection_values(&left)?;
-			Ok(Value::Bool(if matches!(operator, BinaryOperator::AnyEqual) {
-				values.iter().any(|value| *value == &right)
-			} else {
-				values.iter().all(|value| *value == &right)
-			}))
+			let all = matches!(operator, BinaryOperator::AllEqual);
+			let mut matched = all;
+			for value in values {
+				check()?;
+				if (value == &right) != all {
+					matched = !all;
+					break;
+				}
+			}
+			Ok(Value::Bool(matched))
 		}
 		BinaryOperator::Contains | BinaryOperator::ContainsNot => {
-			let contains = contains(&left, &right)?;
+			let contains = contains(&left, &right, &mut check)?;
 			Ok(Value::Bool(if matches!(operator, BinaryOperator::ContainsNot) {
 				!contains
 			} else {
@@ -1239,7 +1473,7 @@ pub(super) fn binary(
 			let values = collection_values(&right)?;
 			let matches = values
 				.iter()
-				.map(|value| contains(&left, value))
+				.map(|value| contains(&left, value, &mut check))
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			Ok(Value::Bool(if matches!(operator, BinaryOperator::ContainsAny) {
 				matches.into_iter().any(|value| value)
@@ -1262,7 +1496,9 @@ pub(super) fn binary(
 		BinaryOperator::Pipeline => {
 			Err(FerrosGrynnError::query_feature_not_supported("expression pipeline"))
 		}
-	}
+	}?;
+	check()?;
+	Ok(value)
 }
 
 /// Shared exact spatial predicate; sentinel checks precede every negation.
@@ -1284,9 +1520,21 @@ fn spatial(operator: BinaryOperator, left: &Value, right: &Value) -> FerrosGrynn
 	}
 }
 
-fn contains(container: &Value, needle: &Value) -> FerrosGrynnResult<bool> {
+fn contains<Check>(container: &Value, needle: &Value, check: &mut Check) -> FerrosGrynnResult<bool>
+where
+	Check: FnMut() -> FerrosGrynnResult<()>,
+{
+	check()?;
 	match container {
-		Value::Array(values) => Ok(values.iter().any(|value| value == needle)),
+		Value::Array(values) => {
+			for value in values {
+				check()?;
+				if value == needle {
+					return Ok(true);
+				}
+			}
+			Ok(false)
+		}
 		Value::Set(values) => Ok(values.contains(needle)),
 		Value::Object(values) => {
 			Ok(needle.as_str().is_some_and(|needle| values.contains_key(needle)))
@@ -1498,9 +1746,11 @@ const fn operator_name(operator: BinaryOperator) -> &'static str {
 
 fn index_value(base: Value, index: Value) -> FerrosGrynnResult<Value> {
 	match (base, index) {
-		(Value::Array(values), Value::Number(number)) => usize::try_from(number)
+		(Value::Array(mut values), Value::Number(number)) => usize::try_from(number)
 			.ok()
-			.and_then(|index| values.get(index).cloned())
+			.and_then(|index| {
+				values.get_mut(index).map(|value| std::mem::replace(value, Value::None))
+			})
 			.ok_or_else(|| FerrosGrynnError::invalid_argument("Array index is out of bounds.")),
 		(Value::Vector(vector), Value::Number(number)) => {
 			let index = usize::try_from(number).map_err(|_| {
@@ -1532,8 +1782,8 @@ fn index_value(base: Value, index: Value) -> FerrosGrynnResult<Value> {
 				.map(Value::Number)
 				.ok_or_else(|| FerrosGrynnError::invalid_argument("Vector index is out of bounds."))
 		}
-		(Value::Object(values), Value::String(key)) => {
-			Ok(values.get(key.as_str()).cloned().unwrap_or(Value::None))
+		(Value::Object(mut values), Value::String(key)) => {
+			Ok(values.remove(key.as_str()).unwrap_or(Value::None))
 		}
 		(value, _) => {
 			Err(FerrosGrynnError::invalid_argument(format!("Cannot index {}.", value.kind())))
@@ -1541,7 +1791,12 @@ fn index_value(base: Value, index: Value) -> FerrosGrynnResult<Value> {
 	}
 }
 
-pub(super) fn cast(value: Value, target: &Type) -> FerrosGrynnResult<Value> {
+pub(super) fn cast(
+	value: Value,
+	target: &Type,
+	fields: Option<&dyn AtomFieldRead>,
+	control: Option<&ExecutionControl>,
+) -> FerrosGrynnResult<Value> {
 	match target {
 		Type::Geometry => match value {
 			Value::Geometry(geometry) => {
@@ -1556,52 +1811,84 @@ pub(super) fn cast(value: Value, target: &Type) -> FerrosGrynnResult<Value> {
 		},
 		Type::Any => Ok(value),
 		Type::Bool => Ok(Value::Bool(value.is_truthy())),
-		Type::String => Ok(Value::from(value.to_string())),
-		Type::Number => match value {
+		Type::String => {
+			admit_value_render(&value, fields, control)?;
+			Ok(Value::from(value.to_string()))
+		}
+		Type::Number => match &value {
 			Value::Number(_) => Ok(value),
-			Value::String(value) => value.parse::<Number>().map(Value::Number),
-			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "number")),
+			Value::String(text) => {
+				// Number's parser constructs its typed diagnostic internally.
+				admit_value_render(&value, fields, control)?;
+				text.parse::<Number>().map(Value::Number)
+			}
+			_ => {
+				admit_value_render(&value, fields, control)?;
+				Err(FerrosGrynnError::conversion_error(value.to_string(), "number"))
+			}
 		},
-		Type::Int => match value {
-			Value::Number(value) => i64::try_from(value).map(Value::from),
-			Value::String(value) => value
-				.parse::<i64>()
-				.map(Value::from)
-				.map_err(|_parse_error| FerrosGrynnError::conversion_error(value.as_str(), "int")),
-			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "int")),
-		},
-		Type::Float => match value {
-			Value::Number(value) => f64::try_from(value).map(Value::from),
-			Value::String(value) => value.parse::<f64>().map(Value::from).map_err(|_parse_error| {
-				FerrosGrynnError::conversion_error(value.as_str(), "float")
+		Type::Int => match &value {
+			Value::Number(number) => i64::try_from(*number).map(Value::from),
+			Value::String(text) => text.parse::<i64>().map(Value::from).or_else(|_parse_error| {
+				admit_value_render(&value, fields, control)?;
+				Err(FerrosGrynnError::conversion_error(text.as_str(), "int"))
 			}),
-			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "float")),
+			_ => {
+				admit_value_render(&value, fields, control)?;
+				Err(FerrosGrynnError::conversion_error(value.to_string(), "int"))
+			}
 		},
-		Type::Decimal => match value {
-			Value::Number(value) => {
-				Decimal::try_from(value).map(|value| Value::Number(Number::Decimal(value)))
+		Type::Float => match &value {
+			Value::Number(number) => f64::try_from(*number).map(Value::from),
+			Value::String(text) => text.parse::<f64>().map(Value::from).or_else(|_parse_error| {
+				admit_value_render(&value, fields, control)?;
+				Err(FerrosGrynnError::conversion_error(text.as_str(), "float"))
+			}),
+			_ => {
+				admit_value_render(&value, fields, control)?;
+				Err(FerrosGrynnError::conversion_error(value.to_string(), "float"))
 			}
-			Value::String(value) => {
-				value.parse::<Decimal>().map(|value| Value::Number(Number::Decimal(value))).map_err(
-					|_parse_error| FerrosGrynnError::conversion_error(value.as_str(), "decimal"),
-				)
+		},
+		Type::Decimal => match &value {
+			Value::Number(number) => {
+				Decimal::try_from(*number).map(|value| Value::Number(Number::Decimal(value)))
 			}
-			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "decimal")),
+			Value::String(text) => text
+				.parse::<Decimal>()
+				.map(|value| Value::Number(Number::Decimal(value)))
+				.or_else(|_parse_error| {
+					admit_value_render(&value, fields, control)?;
+					Err(FerrosGrynnError::conversion_error(text.as_str(), "decimal"))
+				}),
+			_ => {
+				admit_value_render(&value, fields, control)?;
+				Err(FerrosGrynnError::conversion_error(value.to_string(), "decimal"))
+			}
 		},
 		Type::Object => match value {
 			Value::Object(_) => Ok(value),
-			Value::Array(values) => merge_objects(values),
-			Value::Set(values) => merge_objects(values),
-			_ => Err(FerrosGrynnError::conversion_error(value.to_string(), "object")),
+			Value::Array(values) => merge_objects(values, fields, control),
+			Value::Set(values) => merge_objects(values, fields, control),
+			_ => {
+				admit_value_render(&value, fields, control)?;
+				Err(FerrosGrynnError::conversion_error(value.to_string(), "object"))
+			}
 		},
 		Type::None if matches!(value, Value::None) => Ok(value),
 		Type::Null if matches!(value, Value::Null) => Ok(value),
-		_ => Err(FerrosGrynnError::conversion_error(value.to_string(), target.to_string())),
+		_ => {
+			admit_value_render(&value, fields, control)?;
+			Err(FerrosGrynnError::conversion_error(value.to_string(), target.to_string()))
+		}
 	}
 }
 
-fn merge_objects(values: impl IntoIterator<Item = Value>) -> FerrosGrynnResult<Value> {
-	let mut merged = Object::new();
+fn merge_objects(
+	values: impl IntoIterator<Item = Value>,
+	fields: Option<&dyn AtomFieldRead>,
+	control: Option<&ExecutionControl>,
+) -> FerrosGrynnResult<Value> {
+	let mut merged = std::collections::BTreeMap::new();
 	for value in values {
 		let Value::Object(value) = value else {
 			return Err(FerrosGrynnError::invalid_argument(
@@ -1609,23 +1896,45 @@ fn merge_objects(values: impl IntoIterator<Item = Value>) -> FerrosGrynnResult<V
 			));
 		};
 		for (key, value) in value {
-			if merged.insert(key.clone(), value).is_some() {
-				return Err(FerrosGrynnError::invalid_argument(format!(
-					"Object conversion contains duplicate key `{key}`."
-				)));
+			// ponytail: reserve a full B-tree node per field; use capacity
+			// accounting if this conservative cap rejects useful merges.
+			admit_cast_bytes(
+				1024 + 16 * std::mem::size_of::<(crate::values::Text, Value)>(),
+				fields,
+				control,
+			)?;
+			match merged.entry(key) {
+				std::collections::btree_map::Entry::Vacant(entry) => {
+					entry.insert(value);
+				}
+				std::collections::btree_map::Entry::Occupied(entry) => {
+					let key = entry.key();
+					let bytes = key
+						.len()
+						.checked_mul(16)
+						.and_then(|bytes| bytes.checked_add(256))
+						.ok_or_else(|| {
+							FerrosGrynnError::operation_overflow("cast duplicate-key diagnostic")
+						})?;
+					admit_cast_bytes(bytes, fields, control)?;
+					return Err(FerrosGrynnError::invalid_argument(format!(
+						"Object conversion contains duplicate key `{key}`."
+					)));
+				}
 			}
 		}
 	}
-	Ok(Value::Object(merged))
+	Ok(Value::Object(Object::from(merged)))
 }
 
 pub(super) fn eval_usize(
 	expr: &TypedExpr,
 	slots: &[Value],
 	source: &str,
+	fields: &dyn AtomFieldRead,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<usize> {
-	let value = eval(expr, None, slots, source, None, Some(control))?;
+	let value = eval(expr, None, slots, source, Some(fields), Some(control))?;
 	let Value::Number(number) = value else {
 		return Err(locate_execution(
 			FerrosGrynnError::invalid_argument("Expected a non-negative integer."),
@@ -1644,4 +1953,98 @@ fn locate_execution(error: FerrosGrynnError, expr: &TypedExpr, source: &str) -> 
 
 pub(super) fn execution_phase(error: FerrosGrynnError) -> FerrosGrynnError {
 	error.with_phase(ExecutionPhase::Execution)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The PURE mirror retains parameter deadlines; wrong large inputs are
+	/// diagnosed by kind without reserving scratch or copying their payload.
+	#[test]
+	fn duration_operands_pure_block_and_borrowed_validation() -> FerrosGrynnResult<()> {
+		use crate::gql::ir::{
+			LogicalBlock,
+			LogicalBlockStatement,
+			LogicalDuration,
+			LogicalStatement,
+		};
+		let control = ExecutionControl::new(&crate::gql::QueryExecutionOptions::default(), None);
+		let parameter = LogicalDuration::Parameter(TypedExpr {
+			kind: TypedExprKind::Slot(0),
+			ty: Type::Any,
+			span: crate::gql_status::TextSpan::new(0, 0),
+		});
+		let block = LogicalBlock {
+			statements: vec![LogicalBlockStatement {
+				statement: LogicalStatement::Return {
+					value: TypedExpr {
+						kind: TypedExprKind::Constant(Value::from(7_i64)),
+						ty: Type::Int,
+						span: crate::gql_status::TextSpan::new(0, 0),
+					},
+				},
+				timeout: Some(parameter.clone()),
+			}],
+		};
+		let second = "1s"
+			.parse::<crate::values::Duration>()
+			.map_err(|error| FerrosGrynnError::invalid_argument(error.to_string()))?;
+		let mut slots = vec![Value::from(second)];
+		let result = execute_pure_block(
+			&block,
+			&mut slots,
+			"",
+			&control,
+			&mut super::super::ControlRuntime::default(),
+			1,
+			None,
+		)?;
+		assert!(matches!(result, PureControlFlow::Return(value) if value == Value::from(7_i64)));
+		slots[0] = Value::from(crate::values::Duration::default());
+		assert!(
+			execute_pure_block(
+				&block,
+				&mut slots,
+				"",
+				&control,
+				&mut super::super::ControlRuntime::default(),
+				1,
+				None
+			)
+			.is_err()
+		);
+		slots[0] = Value::from(vec![Value::from(1_i64); 4096]);
+		let available = control.barrier_memory_available();
+		let error = eval_duration(&parameter, &slots, "", None, &control, "TIMEOUT")
+			.err()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("wrong duration kind accepted"))?;
+		assert!(error.to_string().contains("array"));
+		assert_eq!(control.barrier_memory_available(), available);
+		assert!(eval_duration(&parameter, &[], "", None, &control, "TIMEOUT").is_err());
+		Ok(())
+	}
+
+	/// Cancellation is observed inside the shared containment kernel.
+	#[test]
+	fn live_recipe_binary_cancellation() -> FerrosGrynnResult<()> {
+		let values = Value::from((0_i64..100).map(Value::from).collect::<Vec<_>>());
+		let mut checks = 0;
+		let error = binary_checked(BinaryOperator::AllIn, values.clone(), values, || {
+			checks += 1;
+			if checks == 8 {
+				Err(FerrosGrynnError::query_cancelled())
+			} else {
+				Ok(())
+			}
+		})
+		.err()
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("binary cancellation ignored"))?;
+		assert_eq!(checks, 8);
+		assert_eq!(
+			error.status().condition(),
+			FerrosGrynnError::query_cancelled().status().condition()
+		);
+		Ok(())
+	}
 }

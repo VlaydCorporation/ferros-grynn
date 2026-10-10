@@ -17,6 +17,9 @@ pub(super) use database::{
 	FunctionParameterCatalogEntry,
 	GraphCatalogEntry,
 	GraphPropertyCatalogEntry,
+	LiveBindingCatalogEntry,
+	LiveCatalogEntry,
+	LiveHistoryCatalogEntry,
 	ParameterCatalogEntry,
 	PhysicalIndexBinding,
 };

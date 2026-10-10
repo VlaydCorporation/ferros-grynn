@@ -495,7 +495,9 @@ impl<Read: QueryRead> TraversalMachine<'_, Read> {
 	pub(super) fn field_value(&self, value: &Value, field: &str) -> FerrosGrynnResult<Value> {
 		match value {
 			Value::Object(object) => Ok(object.get(field).cloned().unwrap_or(Value::None)),
-			Value::Record(record) => self.read.record_field(self.snapshot, record, None, field),
+			Value::Record(record) => {
+				self.read.record_field(self.snapshot, record, None, field, Some(self.control))
+			}
 			Value::AtomOccurrence(occurrence) => {
 				let dictionary = self.read.property_dictionary(self.snapshot);
 				let key = dictionary.get(field);

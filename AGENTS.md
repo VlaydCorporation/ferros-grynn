@@ -15,6 +15,7 @@ Most design docs, code comments, and `docs/implementation_notes.md` are written 
 
 ```text
 src/
+  changefeed/    # Public owned changefeed configuration, images and cursors
   asynchronous/  # Reusable async/concurrency components; disconnected until audited
   collections/   # Reusable collections and data structures
   datastore/     # Datastore composition, catalogs, MVCC and transactions
@@ -22,6 +23,7 @@ src/
   gql/           # Semantic analysis, logical IR and query execution
   gql_status/    # Project-wide statuses, diagnostics, outcomes and errors
   graph/         # Public runtime graph families, views, paths and algorithms
+  live/          # Public owned LIVE recipes, identities, options and metadata
   math/          # Project-wide reusable mathematical operations
   memory/        # Allocator/tracking, heap accounting and resource policy
   storage/       # Local pages, indexes, WAL, recovery and Direct I/O

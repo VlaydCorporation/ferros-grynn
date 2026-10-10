@@ -3,25 +3,473 @@
 	reason = "the SELECT executor composes the existing concrete query runtime"
 )]
 
+use std::borrow::Cow;
+
 use super::*;
-use crate::gql::{
-	cursor::{CursorAnchor, CursorPage, CursorRecord, IndexSeekCheckout, IndexSeekPlan},
-	ir::LogicalKnnDistance,
-	optimizer::fingerprint,
-	spill::{QuerySorter, SortField, SortedRecords, compare_record_anchor},
+use crate::{
+	gql::{
+		cursor::{CursorAnchor, CursorPage, CursorRecord, IndexSeekCheckout, IndexSeekPlan},
+		ir::LogicalKnnDistance,
+		optimizer::fingerprint,
+		spill::{QuerySorter, SortField, SortedRecords, compare_record_anchor},
+	},
+	values::Text,
 };
 
+mod admission;
+mod aggregate_union;
+#[cfg(test)]
+mod atom_union_tests;
 mod expression;
+mod identity;
 mod join;
+mod join_family;
 mod pagination;
 mod rows;
 mod search;
+mod union;
+#[cfg(test)]
+mod window_tests;
 
 use expression::*;
+use identity::JoinedSources;
 use join::*;
 use pagination::*;
 use rows::*;
 use search::*;
+
+/// Normalizes the root SDK family before global class-union reduction.
+pub(in crate::gql) fn normalize_root_select(
+	read: &RootRead<'_>,
+	plan: &mut LogicalSelect,
+	slots: &[Value],
+) -> FerrosGrynnResult<()> {
+	if let Cow::Owned(normalized) = join_family::collapse(read, plan, slots)? {
+		*plan = normalized;
+	}
+	Ok(())
+}
+
+/// Row-free reactive values share SELECT special-expression materialization.
+pub(super) fn eval_row_expression<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	expression: &TypedExpr,
+	row: &Row,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	eval_select_expr(read, snapshot, expression, row, None, slots, source, control)
+}
+
+/// Keeps source identity through the shared SELECT projection and FETCH path.
+pub(in crate::gql) fn visit_root_select(
+	read: &RootRead<'_>,
+	logical: &LogicalSelect,
+	slots: &[Value],
+	control: &ExecutionControl,
+	mut visit: impl FnMut(crate::live::LiveIdentity, Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()> {
+	let snapshot = read.snapshot()?;
+	let (mut plan, physical) = prepare_physical_plan(read, snapshot, logical, control)?;
+	let joined_sources = if plan.joins.is_empty() {
+		None
+	} else {
+		Some(JoinedSources::prepare(read, snapshot, &mut plan, slots, control)?)
+	};
+	let fields = RecordFields {
+		read,
+		snapshot,
+		graph: None,
+	};
+	let (start, limit) = select_window(&plan, slots, "", &fields, control)?;
+	if limit == 0 {
+		validate_zero_window(read, snapshot, &plan, slots, "", control, None)?;
+		return Ok(());
+	}
+	if let Some(count) = visit_streaming_select_values(
+		read,
+		snapshot,
+		&plan,
+		&physical,
+		slots,
+		"",
+		control,
+		None,
+		start,
+		limit,
+		true,
+		&mut |row, value| {
+			let identity = if let Some(row) = row {
+				let Some(Value::Record(record)) = row.value(0) else {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"LIVE source row has no logical record identity",
+					));
+				};
+				root_record_identity(read, record, row.graph.as_ref())?
+			} else {
+				crate::live::LiveIdentity::Aggregate(Vec::new())
+			};
+			visit(identity, value)
+		},
+	)? {
+		return check_select_cardinality(plan.only, count);
+	}
+	let graph = match &plan.source.kind {
+		LogicalSelectSourceKind::Atoms {
+			graph,
+			..
+		} => graph
+			.as_ref()
+			.map(|reference| {
+				resolve_graph_reference(read, snapshot, reference, None, slots, "", control)
+			})
+			.transpose()?,
+		_ => None,
+	};
+	let output = execute_select_output(
+		read,
+		snapshot,
+		&plan,
+		&physical,
+		slots,
+		"",
+		control,
+		None,
+		joined_sources.as_ref(),
+	)?;
+	let count = visit_records(read, output, start, limit, control, |record| {
+		let identity = if plan.group.is_some() {
+			let mut keys = record.anchor.stable_key;
+			keys.pop();
+			crate::live::LiveIdentity::Aggregate(keys)
+		} else if !plan.joins.is_empty() {
+			identity::joined_identity(
+				read,
+				&record.anchor.stable_key,
+				plan.joins.len() + 1,
+				plan.split.len(),
+			)?
+		} else {
+			root_row_identity(read, &record.anchor.stable_key, graph.as_ref(), plan.split.len())?
+		};
+		visit(identity, record.value)
+	})?;
+	check_select_cardinality(plan.only, count)
+}
+
+/// Copies a qualified identity independently of its projected result image.
+fn root_record_identity(
+	read: &RootRead<'_>,
+	record: &RecordId,
+	graph: Option<&GraphRef>,
+) -> FerrosGrynnResult<crate::live::LiveIdentity> {
+	read.fields().admit(
+		record
+			.estimated_heap_bytes()
+			.checked_add(128)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE record identity"))?,
+	)?;
+	if let Some(graph) = graph {
+		read.fields().admit(
+			graph
+				.name()
+				.len()
+				.checked_add(std::mem::size_of::<GraphRef>())
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE graph identity"))?,
+		)?;
+		Ok(crate::live::LiveIdentity::Occurrence(AtomOccurrenceRef::new(
+			crate::graph::AtomRef::new(read.class_kind(record.class())?, record.clone()),
+			Arc::new(graph.clone()),
+		)))
+	} else {
+		Ok(crate::live::LiveIdentity::Record(record.clone()))
+	}
+}
+
+/// Applies one row-local window over all class outputs of a qualified domain.
+pub(in crate::gql) fn visit_root_row_union(
+	read: &RootRead<'_>,
+	plans: &[&LogicalSelect],
+	slots: &[Value],
+	control: &ExecutionControl,
+	mut visit: impl FnMut(crate::live::LiveIdentity, Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()> {
+	let snapshot = read.snapshot()?;
+	let graph = plans
+		.first()
+		.filter(|plan| plan.joins.is_empty())
+		.and_then(|plan| plan.source.kind.graph_scope())
+		.map(|reference| {
+			resolve_graph_reference(read, snapshot, reference, None, slots, "", control)
+		})
+		.transpose()?;
+	union::visit_rows(read, plans, slots, control, None, true, |record| {
+		visit(
+			if plans.first().is_some_and(|plan| !plan.joins.is_empty()) {
+				identity::joined_identity(
+					read,
+					&record.anchor.stable_key,
+					plans[0].joins.len() + 1,
+					plans[0].split.len(),
+				)?
+			} else {
+				root_row_identity(
+					read,
+					&record.anchor.stable_key,
+					graph.as_ref(),
+					plans.first().map_or(0, |plan| plan.split.len()),
+				)?
+			},
+			record.value,
+		)
+	})?;
+	Ok(())
+}
+
+/// SPLIT adds exact positions to an original source anchor. The final output
+/// ordinal is only a sorter tie breaker and never a result identity part.
+fn root_row_identity(
+	read: &RootRead<'_>,
+	stable: &[Value],
+	graph: Option<&GraphRef>,
+	splits: usize,
+) -> FerrosGrynnResult<crate::live::LiveIdentity> {
+	use crate::live::{LiveIdentity, LiveIdentityPart};
+	let Some(Value::Record(record)) = stable.first() else {
+		return Err(FerrosGrynnError::invalid_storage_file(
+			"LIVE output lost its original source identity",
+		));
+	};
+	if splits == 0 {
+		return root_record_identity(read, record, graph);
+	}
+	let count = splits
+		.checked_add(1)
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE SPLIT identity"))?;
+	if stable.len()
+		!= count
+			.checked_add(1)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE SPLIT anchor"))?
+	{
+		return Err(FerrosGrynnError::invalid_storage_file("LIVE SPLIT anchor layout mismatch"));
+	}
+	read.fields().work(count as u64)?;
+	read.fields().admit(
+		count.checked_mul(std::mem::size_of::<LiveIdentityPart>()).ok_or_else(|| {
+			FerrosGrynnError::operation_overflow("LIVE SPLIT identity allocation")
+		})?,
+	)?;
+	let mut parts = Vec::new();
+	parts.try_reserve_exact(count).map_err(|error| {
+		FerrosGrynnError::traversal_resource_limit_exceeded("LIVE SPLIT identity", count as u64)
+			.with_technical_source(error)
+	})?;
+	parts.push(match root_record_identity(read, record, graph)? {
+		LiveIdentity::Record(record) => LiveIdentityPart::Record(record),
+		LiveIdentity::Occurrence(occurrence) => LiveIdentityPart::Occurrence(occurrence),
+		_ => {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"LIVE source identity kind mismatch",
+			));
+		}
+	});
+	for position in &stable[1..count] {
+		let Value::Number(number) = position else {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"LIVE SPLIT position is not numeric",
+			));
+		};
+		parts.push(LiveIdentityPart::Split(u64::try_from(*number)?));
+	}
+	Ok(LiveIdentity::Composite(parts))
+}
+
+/// Keeps class layouts tagged through one existing aggregate reduction.
+pub(in crate::gql) fn visit_root_aggregate_union(
+	read: &RootRead<'_>,
+	plans: &[&LogicalSelect],
+	slots: &[Value],
+	control: &ExecutionControl,
+	visit: impl FnMut(crate::live::LiveIdentity, Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()> {
+	visit_aggregate_union(read, plans, slots, control, visit)
+}
+
+/// Nested independent SELECTs share the reduction without exposing the
+/// executor's private read trait outside its owner.
+fn visit_aggregate_union<Read: QueryRead>(
+	read: &Read,
+	plans: &[&LogicalSelect],
+	slots: &[Value],
+	control: &ExecutionControl,
+	mut visit: impl FnMut(crate::live::LiveIdentity, Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()> {
+	let Some(first) = plans.first() else {
+		return Ok(());
+	};
+	if plans.iter().any(|input| input.only != first.only) {
+		return Err(FerrosGrynnError::invalid_argument("LIVE union ONLY mismatch"));
+	}
+	let fields = read.bounded_fields().ok_or_else(|| {
+		FerrosGrynnError::invalid_argument("independent SELECT union requires bounded evaluation")
+	})?;
+	let snapshot = read.snapshot()?;
+	let (mut plan, mut physical) = prepare_physical_plan(read, snapshot, first, control)?;
+	let row_fields = RecordFields {
+		read,
+		snapshot,
+		graph: None,
+	};
+	let (start, limit) = select_window(&plan, slots, "", &row_fields, control)?;
+	if limit == 0 {
+		for input in plans {
+			if !input.joins.is_empty() {
+				let (mut scoped, _physical) =
+					prepare_physical_plan(read, snapshot, input, control)?;
+				JoinedSources::prepare(read, snapshot, &mut scoped, slots, control)?;
+				validate_zero_window(read, snapshot, &scoped, slots, "", control, None)?;
+			} else {
+				validate_zero_window(read, snapshot, input, slots, "", control, None)?;
+			}
+		}
+		return Ok(());
+	}
+	let Some(group) = &mut plan.group else {
+		return Err(FerrosGrynnError::invalid_argument(
+			"LIVE graph aggregate union requires grouping",
+		));
+	};
+	let class_column = plans.iter().map(|plan| plan.input_schema.columns.len()).max().unwrap_or(0);
+	fields.admit(
+		plans
+			.len()
+			.checked_mul(std::mem::size_of::<&[TypedExpr]>())
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE union group variants"))?,
+	)?;
+	let groups = plans
+		.iter()
+		.map(|input| {
+			input
+				.group
+				.as_deref()
+				.filter(|keys| keys.len() == group.len())
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("LIVE union group mismatch"))
+		})
+		.collect::<FerrosGrynnResult<Vec<_>>>()?;
+	for (index, key) in group.iter_mut().enumerate() {
+		fields.admit(plans.len().checked_mul(std::mem::size_of::<&TypedExpr>()).ok_or_else(
+			|| FerrosGrynnError::operation_overflow("LIVE union group key variants"),
+		)?)?;
+		let variants = groups.iter().map(|keys| &keys[index]).collect::<Vec<_>>();
+		*key = aggregate_union::row_expression(read, &variants, class_column)?;
+	}
+	for (index, output) in plan.projection.iter_mut().enumerate() {
+		let LogicalSelectItem::Expression {
+			expression,
+			..
+		} = output
+		else {
+			return Err(FerrosGrynnError::invalid_argument("LIVE aggregate wildcard projection"));
+		};
+		fields.admit(plans.len().checked_mul(std::mem::size_of::<&TypedExpr>()).ok_or_else(
+			|| FerrosGrynnError::operation_overflow("LIVE aggregate projection variants"),
+		)?)?;
+		let variants = plans
+			.iter()
+			.map(|plan| match plan.projection.get(index) {
+				Some(LogicalSelectItem::Expression {
+					expression,
+					..
+				}) => Ok(expression),
+				_ => Err(FerrosGrynnError::invalid_argument("LIVE aggregate projection mismatch")),
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		*expression =
+			aggregate_union::merge_expression(read, &variants, class_column, slots, &groups)?;
+	}
+	for input in plans {
+		union::check_order(first, input)?;
+	}
+	for (index, order) in plan.order.iter_mut().enumerate() {
+		order.expression =
+			aggregate_union::merge_order(read, plans, index, class_column, slots, &groups)?;
+	}
+	physical.requires_sort |= !plan.order.is_empty();
+	let mut merged = RowCollector::new(read, control, false);
+	for (ordinal, input) in plans.iter().enumerate() {
+		if input.filter.as_ref().is_some_and(contains_search) {
+			return Err(FerrosGrynnError::query_feature_not_supported(
+				"LIVE aggregate union with relational barriers",
+			));
+		}
+		let (mut input, input_physical) = prepare_physical_plan(read, snapshot, input, control)?;
+		if !input.joins.is_empty() {
+			JoinedSources::prepare(read, snapshot, &mut input, slots, control)?;
+		}
+		let (rows, prepared_search) = prepare_select_input(
+			read,
+			snapshot,
+			&input,
+			&input_physical,
+			slots,
+			"",
+			control,
+			None,
+		)?;
+		let rows = prepare_select_rows(
+			read,
+			snapshot,
+			&input,
+			&input_physical,
+			rows,
+			slots,
+			"",
+			control,
+			prepared_search.as_ref(),
+		)?;
+		rows.consume(|mut row| {
+			fields.work(class_column as u64)?;
+			fields.admit(
+				class_column
+					.checked_add(1)
+					.and_then(|count| count.checked_mul(2 * std::mem::size_of::<Value>()))
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE union row"))?,
+			)?;
+			row.values.try_reserve_exact(class_column + 1 - row.values.len()).map_err(|error| {
+				FerrosGrynnError::traversal_resource_limit_exceeded(
+					"LIVE union row",
+					class_column as u64,
+				)
+				.with_technical_source(error)
+			})?;
+			row.values.resize(class_column, Value::None);
+			row.values.push(Value::from(ordinal));
+			merged.push(read, snapshot, row)
+		})?;
+	}
+	plan.filter = None;
+	plan.split.clear();
+	let output = finish_select_rows(
+		read,
+		snapshot,
+		&plan,
+		&physical,
+		merged.finish()?,
+		slots,
+		"",
+		control,
+		None,
+		None,
+	)?;
+	let count = visit_records(read, output, start, limit, control, |record| {
+		let mut keys = record.anchor.stable_key;
+		keys.pop();
+		visit(crate::live::LiveIdentity::Aggregate(keys), record.value)
+	})?;
+	check_select_cardinality(plan.only, count)
+}
 
 fn prepare_physical_plan<Read: QueryRead>(
 	read: &Read,
@@ -29,6 +477,9 @@ fn prepare_physical_plan<Read: QueryRead>(
 	logical: &LogicalSelect,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<(LogicalSelect, crate::gql::optimizer::PhysicalSelectPlan)> {
+	if read.bounded_fields().is_some() {
+		admission::select_copy(read, logical, 0)?;
+	}
 	let demand = crate::gql::optimizer::PlannerDemand::for_select(logical);
 	let planner_snapshot = read.planner_snapshot(snapshot, &demand)?;
 	let deterministic_snapshot;
@@ -41,6 +492,30 @@ fn prepare_physical_plan<Read: QueryRead>(
 	crate::gql::optimizer::prepare_select(logical, planner_snapshot, control.barrier_memory_limit())
 }
 
+/// Retires a direct continuation when preparation fails before evaluation.
+/// Computed inputs are never evaluated again for cleanup.
+pub(super) fn discard_supplied_cursor(
+	plan: &LogicalSelect,
+	slots: &[Value],
+	control: &ExecutionControl,
+) {
+	let Some(LogicalSelectStart::After {
+		cursor,
+		..
+	}) = plan.start.as_ref()
+	else {
+		return;
+	};
+	let supplied = match &cursor.kind {
+		TypedExprKind::Slot(slot) => slots.get(*slot as usize),
+		TypedExprKind::Constant(value) => Some(value),
+		_ => None,
+	};
+	if let Some(Value::Cursor(cursor)) = supplied {
+		control.discard_cursor(*cursor);
+	}
+}
+
 pub(super) fn execute_select<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -49,6 +524,11 @@ pub(super) fn execute_select<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
+	let fields = RecordFields {
+		read,
+		snapshot,
+		graph: None,
+	};
 	let (plan, physical) = prepare_physical_plan(read, snapshot, plan, control)?;
 	let plan = &plan;
 	let (fingerprint, order_fingerprint) = fingerprint::fingerprints(plan);
@@ -64,7 +544,14 @@ pub(super) fn execute_select<Read: QueryRead>(
 				.limit
 				.as_ref()
 				.ok_or_else(|| FerrosGrynnError::invalid_argument("START AFTER requires LIMIT."))?;
-			let cursor = match eval(cursor, None, slots, source, None, None)? {
+			let value = match eval(cursor, None, slots, source, Some(&fields), Some(control)) {
+				Ok(value) => value,
+				Err(error) => {
+					discard_supplied_cursor(plan, slots, control);
+					return Err(error);
+				}
+			};
+			let cursor = match value {
 				Value::Cursor(cursor) => cursor,
 				value => {
 					return Err(FerrosGrynnError::invalid_argument(format!(
@@ -82,7 +569,7 @@ pub(super) fn execute_select<Read: QueryRead>(
 				control.discard_cursor(cursor);
 				return Err(error);
 			}
-			let page_size = match eval_usize(limit, slots, source, control) {
+			let page_size = match eval_usize(limit, slots, source, &fields, control) {
 				Ok(page_size) => page_size,
 				Err(error) => {
 					control.discard_cursor(cursor);
@@ -141,7 +628,7 @@ pub(super) fn execute_select<Read: QueryRead>(
 					)?
 				} else {
 					let output = execute_select_output(
-						read, snapshot, plan, &physical, slots, source, control, None,
+						read, snapshot, plan, &physical, slots, source, control, None, None,
 					)?;
 					let output = output_after_anchor(output, &anchor, plan)?;
 					page_output(
@@ -161,14 +648,14 @@ pub(super) fn execute_select<Read: QueryRead>(
 			control.check()?;
 			let start = match &plan.start {
 				Some(LogicalSelectStart::Offset(value)) => {
-					eval_usize(value, slots, source, control)?
+					eval_usize(value, slots, source, &fields, control)?
 				}
 				None => 0,
 				Some(LogicalSelectStart::After {
 					..
 				}) => unreachable!(),
 			};
-			let limit = select_limit(plan, slots, source, control)?;
+			let limit = select_limit(plan, slots, source, &fields, control)?;
 			if start == 0
 				&& limit.is_some_and(|limit| limit != 0)
 				&& (control.cursors().is_none() || !control.publication_deferred())
@@ -210,7 +697,7 @@ pub(super) fn execute_select<Read: QueryRead>(
 				values
 			} else {
 				let output = execute_select_output(
-					read, snapshot, plan, &physical, slots, source, control, None,
+					read, snapshot, plan, &physical, slots, source, control, None, None,
 				)?;
 				page_output(
 					output,
@@ -226,12 +713,8 @@ pub(super) fn execute_select<Read: QueryRead>(
 		}
 	};
 	if plan.only {
-		return match values.as_slice() {
-			[] => Ok(Value::None),
-			[value] => Ok(value.clone()),
-			_ => Err(FerrosGrynnError::select_cardinality_violation(values.len() as u64)
-				.with_phase(ExecutionPhase::Execution)),
-		};
+		check_select_cardinality(true, values.len())?;
+		return Ok(values.into_iter().next().unwrap_or(Value::None));
 	}
 	Ok(Value::Array(values.into_iter().collect()))
 }
@@ -293,6 +776,7 @@ fn resume_index_seek(
 		let read = TransactionRead {
 			transaction: &mut checkout.transaction,
 			snapshot,
+			metadata_only: false,
 		};
 		execute_index_seek_page(
 			&read,
@@ -354,8 +838,10 @@ fn execute_index_seek_page<Read: QueryRead>(
 		|| plan.tempfiles
 		|| plan.order.is_empty()
 		|| physical.requires_sort
-		|| matches!(plan.source.kind, LogicalSelectSourceKind::Derived(_))
-	{
+		|| matches!(
+			plan.source.kind,
+			LogicalSelectSourceKind::Derived(_) | LogicalSelectSourceKind::AtomUnion { .. }
+		) {
 		return Ok(None);
 	}
 	let Some(index) = physical.sources.first().and_then(planned_scalar_index) else {
@@ -378,9 +864,10 @@ fn execute_index_seek_page<Read: QueryRead>(
 			maximum,
 		}),
 		None,
+		false,
 		|row| {
 			let output = build_output_row(
-				read, snapshot, plan, row, None, ordinal, None, slots, source, control,
+				read, snapshot, plan, row, None, ordinal, None, slots, source, control, None,
 			)?;
 			ordinal = ordinal.checked_add(1).ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("index continuation ordinal overflow")
@@ -404,6 +891,10 @@ fn execute_select_values<Read: QueryRead>(
 ) -> FerrosGrynnResult<Vec<Value>> {
 	let mut values = Vec::new();
 	visit_select_values(read, snapshot, plan, slots, source, control, outer, maximum, |value| {
+		if let Some(fields) = read.bounded_fields() {
+			fields.work(1)?;
+			fields.admit(2 * std::mem::size_of::<Value>())?;
+		}
 		values.push(value);
 		Ok(())
 	})?;
@@ -425,37 +916,188 @@ pub(super) fn visit_select_values<Read: QueryRead>(
 	maximum: Option<usize>,
 	mut visit: impl FnMut(Value) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<usize> {
+	visit_select_values_dyn(
+		read, snapshot, plan, slots, source, control, outer, maximum, &mut visit,
+	)
+}
+
+/// Recursive independent unions reuse one callback type instead of nesting
+/// mutable references at each lexical SELECT level.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "SELECT pull execution retains the complete analyzed statement context"
+)]
+fn visit_select_values_dyn<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+	maximum: Option<usize>,
+	visit: &mut dyn FnMut(Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<usize> {
+	if let Cow::Owned(normalized) = join_family::collapse(read, plan, slots)? {
+		return visit_select_values_dyn(
+			read,
+			snapshot,
+			&normalized,
+			slots,
+			source,
+			control,
+			outer,
+			maximum,
+			visit,
+		);
+	}
+	if !plan.union_inputs.is_empty() {
+		let fields = read.bounded_fields().ok_or_else(|| {
+			FerrosGrynnError::invalid_argument(
+				"independent SELECT union requires bounded evaluation",
+			)
+		})?;
+		let inputs = if let Some(reference) = plan.source.kind.graph_scope() {
+			admission::graph_copy(read, reference, 0)?;
+			let graph =
+				resolve_graph_reference(read, snapshot, reference, None, slots, source, control)?;
+			read.graph(snapshot, &graph)?;
+			fields.admit(
+				plan.union_inputs
+					.len()
+					.checked_mul(std::mem::size_of::<LogicalSelect>())
+					.ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("LIVE union scope plans")
+					})?,
+			)?;
+			let mut inputs = Vec::with_capacity(plan.union_inputs.len());
+			for input in &plan.union_inputs {
+				admission::select_copy(read, input, 0)?;
+				let mut input = input.clone();
+				let reference = input.source.kind.graph_scope_mut().ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("LIVE union input has no graph scope")
+				})?;
+				fields.admit(
+					graph.name().len().checked_add(std::mem::size_of_val(&graph)).ok_or_else(
+						|| FerrosGrynnError::operation_overflow("LIVE union scope copy"),
+					)?,
+				)?;
+				*reference = LogicalGraphReference::Static(graph.clone());
+				inputs.push(input);
+			}
+			Cow::Owned(inputs)
+		} else {
+			Cow::Borrowed(plan.union_inputs.as_slice())
+		};
+		let inputs = if inputs.iter().any(|input| {
+			input.union_purpose == crate::syn::SelectUnionPurpose::JoinedTypingVariants
+				&& !input.union_inputs.is_empty()
+		}) {
+			fields.admit(
+				inputs
+					.len()
+					.checked_mul(std::mem::size_of::<LogicalSelect>())
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("nested JOIN families"))?,
+			)?;
+			let mut normalized = Vec::with_capacity(inputs.len());
+			for input in inputs.iter() {
+				match join_family::collapse(read, input, slots)? {
+					Cow::Owned(input) => normalized.push(input),
+					Cow::Borrowed(input) => {
+						admission::select_copy(read, input, 0)?;
+						normalized.push(input.clone());
+					}
+				}
+			}
+			Cow::Owned(normalized)
+		} else {
+			inputs
+		};
+		let limit = maximum.unwrap_or(usize::MAX);
+		let mut count = 0_usize;
+		if inputs[0].group.is_some() {
+			fields.admit(
+				inputs
+					.len()
+					.checked_mul(std::mem::size_of::<&LogicalSelect>())
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE union plans"))?,
+			)?;
+			let inputs = inputs.iter().collect::<Vec<_>>();
+			visit_aggregate_union(read, &inputs, slots, control, |_identity, value| {
+				if count < limit {
+					visit(value)?;
+					count += 1;
+				}
+				Ok(())
+			})?;
+		} else if union::needs_window(&inputs[0]) {
+			fields.admit(
+				inputs
+					.len()
+					.checked_mul(std::mem::size_of::<&LogicalSelect>())
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE union plans"))?,
+			)?;
+			let inputs = inputs.iter().collect::<Vec<_>>();
+			count = union::visit_rows(read, &inputs, slots, control, maximum, false, |record| {
+				visit(record.value)
+			})?;
+		} else {
+			for input in inputs.iter() {
+				if count == limit {
+					break;
+				}
+				count += visit_select_values_dyn(
+					read,
+					snapshot,
+					input,
+					slots,
+					source,
+					control,
+					None,
+					Some(limit - count),
+					visit,
+				)?;
+			}
+		}
+		check_select_cardinality(plan.only, count)?;
+		return Ok(count);
+	}
 	let (plan, physical) = prepare_physical_plan(read, snapshot, plan, control)?;
 	let plan = &plan;
-	let start = match &plan.start {
-		None => 0,
-		Some(LogicalSelectStart::Offset(value)) => eval_usize(value, slots, source, control)?,
-		Some(LogicalSelectStart::After {
-			..
-		}) => {
-			return Err(FerrosGrynnError::query_feature_not_supported(
-				"START AFTER inside a SELECT subquery",
-			));
-		}
+	let fields = RecordFields {
+		read,
+		snapshot,
+		graph: None,
 	};
-	let limit = select_limit(plan, slots, source, control)?
-		.unwrap_or(usize::MAX)
-		.min(maximum.unwrap_or(usize::MAX));
+	let (start, limit) = select_window(plan, slots, source, &fields, control)?;
+	let limit = limit.min(maximum.unwrap_or(usize::MAX));
+	if limit == 0 {
+		validate_zero_window(read, snapshot, plan, slots, source, control, outer)?;
+		return Ok(0);
+	}
 	let count = match visit_streaming_select_values(
-		read, snapshot, plan, &physical, slots, source, control, outer, start, limit, &mut visit,
+		read,
+		snapshot,
+		plan,
+		&physical,
+		slots,
+		source,
+		control,
+		outer,
+		start,
+		limit,
+		false,
+		&mut |_row, value| visit(value),
 	)? {
 		Some(count) => count,
 		None => {
 			let output = execute_select_output(
-				read, snapshot, plan, &physical, slots, source, control, outer,
+				read, snapshot, plan, &physical, slots, source, control, outer, None,
 			)?;
-			visit_record_values(output, start, limit, &mut visit)?
+			visit_record_values(read, output, start, limit, control, &mut *visit)?
 		}
 	};
-	if plan.only && count > 1 {
-		return Err(FerrosGrynnError::select_cardinality_violation(count as u64)
-			.with_phase(ExecutionPhase::Execution));
-	}
+	check_select_cardinality(plan.only, count)?;
 	Ok(count)
 }
 
@@ -487,7 +1129,8 @@ fn execute_streaming_select_values<Read: QueryRead>(
 		outer,
 		start,
 		limit,
-		&mut |value| {
+		false,
+		&mut |_row, value| {
 			values.push(value);
 			Ok(())
 		},
@@ -510,7 +1153,8 @@ fn visit_streaming_select_values<Read: QueryRead>(
 	outer: Option<&Row>,
 	start: usize,
 	limit: usize,
-	visit: &mut impl FnMut(Value) -> FerrosGrynnResult<()>,
+	transient_rows: bool,
+	visit: &mut impl FnMut(Option<&Row>, Value) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Option<usize>> {
 	if !plan.joins.is_empty()
 		|| plan.group.is_some()
@@ -524,15 +1168,22 @@ fn visit_streaming_select_values<Read: QueryRead>(
 				crate::gql::optimizer::SourceOperator::GeometryIndexScan { .. }
 			)
 		})
-		|| matches!(plan.source.kind, LogicalSelectSourceKind::Derived(_))
-	{
+		|| matches!(
+			plan.source.kind,
+			LogicalSelectSourceKind::Derived(_) | LogicalSelectSourceKind::AtomUnion { .. }
+		) {
 		return Ok(None);
 	}
-	let limit = if plan.only {
-		limit.min(2)
-	} else {
-		limit
-	};
+	if let LogicalSelectSourceKind::Empty {
+		graph,
+	} = &plan.source.kind
+	{
+		if let Some(reference) = graph {
+			validate_empty_graph(read, snapshot, reference, outer, slots, source, control)?;
+		}
+		return Ok(Some(0));
+	}
+	let limit = select_pull_limit(plan.only, limit);
 	if limit == 0 {
 		return Ok(Some(0));
 	}
@@ -579,7 +1230,7 @@ fn visit_streaming_select_values<Read: QueryRead>(
 			value.insert(name.as_ref(), count);
 			Value::Object(value)
 		};
-		visit(value)?;
+		visit(None, value)?;
 		return Ok(Some(1));
 	}
 	let mut visited = 0_usize;
@@ -602,6 +1253,7 @@ fn visit_streaming_select_values<Read: QueryRead>(
 		index,
 		window,
 		physical.pushed_filter.then_some(plan.filter.as_ref()).flatten(),
+		transient_rows,
 		|row| {
 			if let Some(predicate) = &plan.filter
 				&& !eval_select_expr(read, snapshot, predicate, &row, None, slots, source, control)?
@@ -617,7 +1269,7 @@ fn visit_streaming_select_values<Read: QueryRead>(
 			if projected <= start {
 				return Ok(true);
 			}
-			visit(output)?;
+			visit(Some(&row), output)?;
 			visited = visited.checked_add(1).ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("projected row count overflow")
 			})?;
@@ -643,6 +1295,7 @@ fn visit_streaming_source_rows<Read: QueryRead>(
 	index: Option<(crate::datastore::IndexId, bool)>,
 	window: Option<IndexScanWindow<'_>>,
 	predicate: Option<&TypedExpr>,
+	transient_rows: bool,
 	mut visit: impl FnMut(Row) -> FerrosGrynnResult<bool>,
 ) -> FerrosGrynnResult<()> {
 	let append_outer = |mut row: Row| {
@@ -653,6 +1306,13 @@ fn visit_streaming_source_rows<Read: QueryRead>(
 		row
 	};
 	match &source_plan.kind {
+		LogicalSelectSourceKind::Empty {
+			graph,
+		} => {
+			if let Some(reference) = graph {
+				validate_empty_graph(read, snapshot, reference, outer, slots, source, control)?;
+			}
+		}
 		LogicalSelectSourceKind::Atoms {
 			target,
 			graph,
@@ -679,7 +1339,15 @@ fn visit_streaming_source_rows<Read: QueryRead>(
 						full_row,
 					)?;
 					let mut ordinal = 0_usize;
-					while let Some(row) = cursor.next(control)? {
+					loop {
+						let _scope = if transient_rows {
+							read.bounded_fields().and_then(|fields| fields.transient_scope())
+						} else {
+							None
+						};
+						let Some(row) = cursor.next(control)? else {
+							break;
+						};
 						let row = append_outer(row.with_graph(graph.clone()));
 						ordinal = ordinal.checked_add(1).ok_or_else(|| {
 							FerrosGrynnError::invalid_argument("source row ordinal overflow")
@@ -722,15 +1390,22 @@ fn visit_streaming_source_rows<Read: QueryRead>(
 				}
 			}
 		}
-		LogicalSelectSourceKind::Derived(_) => {
+		LogicalSelectSourceKind::Derived(_)
+		| LogicalSelectSourceKind::AtomUnion {
+			..
+		} => {
 			return Err(FerrosGrynnError::invalid_argument(
-				"derived source reached the direct pull path",
+				"materialized source reached the direct pull path",
 			));
 		}
 	}
 	Ok(())
 }
 
+#[allow(
+	clippy::too_many_arguments,
+	reason = "root identities share the existing SELECT execution context"
+)]
 fn execute_select_output<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -740,13 +1415,53 @@ fn execute_select_output<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 	outer: Option<&Row>,
+	joined_sources: Option<&JoinedSources>,
 ) -> FerrosGrynnResult<SortedRecords> {
+	let (rows, prepared_search) =
+		prepare_select_input(read, snapshot, plan, physical, slots, source, control, outer)?;
+	finish_select_rows(
+		read,
+		snapshot,
+		plan,
+		physical,
+		rows,
+		slots,
+		source,
+		control,
+		prepared_search.as_ref(),
+		joined_sources,
+	)
+}
+
+/// Source scans, joins and outer-row bindings share one prepared input owner.
+///
+/// # Errors
+/// Propagates the existing read, expression, resource and cancellation errors.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "input preparation retains the existing SELECT context"
+)]
+fn prepare_select_input<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	physical: &crate::gql::optimizer::PhysicalSelectPlan,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+) -> FerrosGrynnResult<(RowSet, Option<PreparedSearch>)> {
 	control.check()?;
+	let fields = RecordFields {
+		read,
+		snapshot,
+		graph: None,
+	};
 	let mut prepared_search = plan
 		.filter
 		.as_ref()
 		.filter(|filter| contains_search(filter))
-		.map(|filter| prepare_search_inputs(filter, &plan.access, slots, source, control))
+		.map(|filter| prepare_search_inputs(filter, &plan.access, slots, source, &fields, control))
 		.transpose()?;
 	let local_width = plan.input_schema.columns.len().saturating_sub(plan.outer_columns);
 	let physical_search = if plan.joins.is_empty() {
@@ -845,9 +1560,26 @@ fn execute_select_output<Read: QueryRead>(
 		})?;
 		rows = transformed.finish()?;
 	}
+	Ok((rows, prepared_search))
+}
+
+/// Shared WHERE/SPLIT preparation preserves ordinary filtering, refinement,
+/// ordering of clauses, spill behavior and resource controls.
+#[allow(clippy::too_many_arguments, reason = "row preparation retains the complete query context")]
+fn prepare_select_rows<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	physical: &crate::gql::optimizer::PhysicalSelectPlan,
+	mut rows: RowSet,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	prepared_search: Option<&PreparedSearch>,
+) -> FerrosGrynnResult<RowSet> {
 	if let Some(predicate) = &plan.filter {
 		if contains_search(predicate) {
-			let prepared = prepared_search.as_ref().ok_or_else(|| {
+			let prepared = prepared_search.ok_or_else(|| {
 				FerrosGrynnError::invalid_argument(
 					"search inputs were not prepared before source row pull",
 				)
@@ -879,6 +1611,37 @@ fn execute_select_output<Read: QueryRead>(
 	for split in &plan.split {
 		rows = split_rows(read, snapshot, rows, split, slots, source, control)?;
 	}
+
+	Ok(rows)
+}
+/// Ordinary SELECT and graph-wide LIVE aggregates share filtering/grouping.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "SELECT finishing retains the complete statement and prepared search context"
+)]
+fn finish_select_rows<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	physical: &crate::gql::optimizer::PhysicalSelectPlan,
+	rows: RowSet,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	prepared_search: Option<&PreparedSearch>,
+	joined_sources: Option<&JoinedSources>,
+) -> FerrosGrynnResult<SortedRecords> {
+	let rows = prepare_select_rows(
+		read,
+		snapshot,
+		plan,
+		physical,
+		rows,
+		slots,
+		source,
+		control,
+		prepared_search,
+	)?;
 	let random_seed = plan
 		.order
 		.iter()
@@ -900,6 +1663,7 @@ fn execute_select_output<Read: QueryRead>(
 				slots,
 				source,
 				control,
+				joined_sources,
 			)?;
 			output.push(output_row)
 		})?;
@@ -917,6 +1681,7 @@ fn execute_select_output<Read: QueryRead>(
 				slots,
 				source,
 				control,
+				joined_sources,
 			)?;
 			ordinal += 1;
 			output.push(output_row)
@@ -933,6 +1698,16 @@ fn select_requires_expanded_atom_row(plan: &LogicalSelect) -> bool {
 	plan.projection.iter().any(|item| match item {
 		LogicalSelectItem::Wildcard(fields) => {
 			fields.iter().any(|field| matches!(field, LogicalWildcardField::Properties { .. }))
+		}
+		LogicalSelectItem::WildcardVariants {
+			selector,
+			choices,
+		} => {
+			choices
+				.iter()
+				.flatten()
+				.any(|field| matches!(field, LogicalWildcardField::Properties { .. }))
+				|| metadata.iter().any(|column| expression_uses_column(selector, *column))
 		}
 		LogicalSelectItem::Expression {
 			expression,
@@ -1060,6 +1835,7 @@ fn expression_uses_column(expression: &TypedExpr, column: usize) -> bool {
 		TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
+		| TypedExprKind::LiveSlot(_)
 		| TypedExprKind::CurrentField(_)
 		| TypedExprKind::Closure(_) => false,
 	}
@@ -1077,7 +1853,13 @@ fn build_output_row<Read: QueryRead>(
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
+	joined_sources: Option<&JoinedSources>,
 ) -> FerrosGrynnResult<OutputRow> {
+	let identity = if group.is_none() {
+		joined_sources.map(|sources| sources.capture(read, &row)).transpose()?
+	} else {
+		None
+	};
 	let (value, projected) =
 		build_projected_value(read, snapshot, plan, &row, group, slots, source, control)?;
 	let mut order_row = row.clone();
@@ -1123,6 +1905,19 @@ fn build_output_row<Read: QueryRead>(
 		row.stable.clone()
 	};
 	stable.push(Value::from(ordinal));
+	if let Some(identity) = identity {
+		if let Some(fields) = read.bounded_fields() {
+			fields.admit(2 * std::mem::size_of::<Value>())?;
+		}
+		stable.try_reserve(1).map_err(|error| {
+			FerrosGrynnError::traversal_resource_limit_exceeded(
+				"LIVE JOIN output anchor",
+				stable.len() as u64,
+			)
+			.with_technical_source(error)
+		})?;
+		stable.push(identity);
+	}
 	let sequence = row.sequence.iter().copied().map(Value::from).collect();
 	Ok(OutputRow {
 		value,
@@ -1146,7 +1941,13 @@ fn build_projected_value<Read: QueryRead>(
 ) -> FerrosGrynnResult<(Value, Vec<Value>)> {
 	let (mut value, projected) = project(read, snapshot, plan, row, group, slots, source, control)?;
 	for path in &plan.omit {
-		omit_path(&mut value, path);
+		if path.len() > control.max_control_depth as usize {
+			return Err(FerrosGrynnError::control_limit_exceeded(
+				"OMIT depth",
+				u64::from(control.max_control_depth),
+			));
+		}
+		omit_path(read, &mut value, path, control)?;
 	}
 	for path in &plan.fetch {
 		if path.len() > control.max_control_depth as usize {
@@ -1205,6 +2006,100 @@ fn source_rows<Read: QueryRead>(
 		.zip(total_width)
 		.map(|(source, total)| (source.column_offset, source.column_width, total));
 	match &source_plan.kind {
+		LogicalSelectSourceKind::AtomUnion {
+			targets,
+			graph,
+			tag_column,
+			..
+		} => {
+			let fields = read.bounded_fields().ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("atom union requires bounded evaluation")
+			})?;
+			fields.work(targets.len() as u64)?;
+			if *tag_column < 5
+				|| tag_column.checked_add(1) != Some(source_plan.schema.columns.len())
+				|| targets.windows(2).any(|pair| pair[0].class() >= pair[1].class())
+				|| targets.iter().any(|target| !matches!(target, ScanTarget::Class(_)))
+			{
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"atom union source layout is invalid",
+				));
+			}
+			let graph = graph
+				.as_ref()
+				.map(|reference| {
+					resolve_graph_reference(
+						read, snapshot, reference, outer, slots, source, control,
+					)
+				})
+				.transpose()?;
+			if let Some(graph) = &graph {
+				read.graph(snapshot, graph)?;
+			}
+			let mut rows = RowCollector::new(read, control, false);
+			for (tag, target) in targets.iter().enumerate() {
+				let mut cursor = read.scan(
+					snapshot,
+					target.class(),
+					graph.as_ref(),
+					None,
+					None,
+					None,
+					slots,
+					source,
+					true,
+				)?;
+				let mut ordinal = 0_usize;
+				while let Some(mut row) = cursor.next(control)? {
+					fields.work(1)?;
+					let extra = tag_column.checked_sub(row.values.len()).ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file(
+							"atom union row exceeds its class layout",
+						)
+					})?;
+					fields.admit(
+						extra
+							.checked_add(4)
+							.and_then(|count| count.checked_mul(2 * std::mem::size_of::<Value>()))
+							.ok_or_else(|| {
+								FerrosGrynnError::operation_overflow("atom union row padding")
+							})?,
+					)?;
+					row.values.try_reserve_exact(extra + 1).map_err(|error| {
+						FerrosGrynnError::traversal_resource_limit_exceeded(
+							"atom union row padding",
+							*tag_column as u64,
+						)
+						.with_technical_source(error)
+					})?;
+					row.values.resize(*tag_column, Value::None);
+					row.values.push(Value::from(tag));
+					rows.push(
+						read,
+						snapshot,
+						scoped_layout_row(
+							read,
+							row,
+							graph.as_ref(),
+							Some(&[tag, ordinal]),
+							layout,
+						)?,
+					)?;
+					ordinal = ordinal.checked_add(1).ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("atom union row ordinal")
+					})?;
+				}
+			}
+			rows.finish()
+		}
+		LogicalSelectSourceKind::Empty {
+			graph,
+		} => {
+			if let Some(reference) = graph {
+				validate_empty_graph(read, snapshot, reference, outer, slots, source, control)?;
+			}
+			rows_to_set(read, snapshot, control, Vec::new())
+		}
 		LogicalSelectSourceKind::Atoms {
 			target,
 			graph,
@@ -1292,10 +2187,13 @@ fn source_rows<Read: QueryRead>(
 								rows.push(
 									read,
 									snapshot,
-									layout_row(
-										row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+									scoped_layout_row(
+										read,
+										row,
+										graph.as_ref(),
+										Some(&[ordinal]),
 										layout,
-									),
+									)?,
 								)?;
 							}
 							return rows.finish();
@@ -1328,10 +2226,13 @@ fn source_rows<Read: QueryRead>(
 								rows.push(
 									read,
 									snapshot,
-									layout_row(
-										row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+									scoped_layout_row(
+										read,
+										row,
+										graph.as_ref(),
+										Some(&[ordinal]),
 										layout,
-									),
+									)?,
 								)?;
 							}
 							return rows.finish();
@@ -1359,10 +2260,13 @@ fn source_rows<Read: QueryRead>(
 								rows.push(
 									read,
 									snapshot,
-									layout_row(
-										row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
+									scoped_layout_row(
+										read,
+										row,
+										graph.as_ref(),
+										Some(&[ordinal]),
 										layout,
-									),
+									)?,
 								)?;
 							}
 							return rows.finish();
@@ -1385,10 +2289,7 @@ fn source_rows<Read: QueryRead>(
 						rows.push(
 							read,
 							snapshot,
-							layout_row(
-								row.with_graph(graph.clone()).with_sequence(vec![ordinal]),
-								layout,
-							),
+							scoped_layout_row(read, row, graph.as_ref(), Some(&[ordinal]), layout)?,
 						)?;
 						ordinal = ordinal.checked_add(1).ok_or_else(|| {
 							FerrosGrynnError::invalid_argument("source row ordinal overflow")
@@ -1401,7 +2302,8 @@ fn source_rows<Read: QueryRead>(
 					snapshot,
 					control,
 					read.get(snapshot, record, graph.as_ref())?
-						.map(|row| layout_row(row.with_graph(graph), layout))
+						.map(|row| scoped_layout_row(read, row, graph.as_ref(), None, layout))
+						.transpose()?
 						.into_iter()
 						.collect(),
 				),
@@ -1429,14 +2331,16 @@ fn source_rows<Read: QueryRead>(
 				control,
 				read.graph_rows(snapshot, references.as_deref())?
 					.into_iter()
-					.map(|row| layout_row(row, layout))
-					.collect(),
+					.map(|row| layout_row(read, row, layout))
+					.collect::<FerrosGrynnResult<Vec<_>>>()?,
 			)
 		}
 		LogicalSelectSourceKind::Derived(select) => {
 			let rows = derived_source_rows(read, snapshot, select, slots, source, control)?;
 			if let Some(layout) = layout {
-				map_row_set(read, snapshot, control, rows, |row| layout_row(row, Some(layout)))
+				map_row_set(read, snapshot, control, rows, |row| {
+					layout_row(read, row, Some(layout))
+				})
 			} else {
 				Ok(rows)
 			}
@@ -1452,11 +2356,77 @@ fn logical_source(plan: &LogicalSelect, index: usize) -> &LogicalSelectSource {
 	}
 }
 
-fn layout_row(mut row: Row, layout: Option<(usize, usize, usize)>) -> Row {
+/// Checks the complete allocation and slice bounds before copying source cells.
+fn admit_row_layout<Read: QueryRead>(
+	read: &Read,
+	length: usize,
+	layout: Option<(usize, usize, usize)>,
+) -> FerrosGrynnResult<()> {
+	if let Some((offset, width, total)) = layout {
+		if length != width || offset.checked_add(width).is_none_or(|end| end > total) {
+			return Err(FerrosGrynnError::invalid_storage_file("source row layout is invalid"));
+		}
+		if offset == 0 && width == total {
+			return Ok(());
+		}
+		if let Some(fields) = read.bounded_fields() {
+			fields.work(total as u64)?;
+			fields.admit(
+				total
+					.checked_mul(2 * std::mem::size_of::<Value>())
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("source row layout"))?,
+			)?;
+		}
+	}
+	Ok(())
+}
+
+/// Scoped scans share preflight for graph names, sequence and padded layout.
+fn scoped_layout_row<Read: QueryRead>(
+	read: &Read,
+	mut row: Row,
+	graph: Option<&GraphRef>,
+	sequence: Option<&[usize]>,
+	layout: Option<(usize, usize, usize)>,
+) -> FerrosGrynnResult<Row> {
+	admit_row_layout(read, row.values.len(), layout)?;
+	if let Some(fields) = read.bounded_fields() {
+		let graph_bytes = graph
+			.map(|graph| graph.name().len().checked_add(std::mem::size_of::<GraphRef>()))
+			.unwrap_or(Some(0))
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("source graph metadata"))?;
+		let bytes = sequence
+			.map_or(0, <[usize]>::len)
+			.checked_mul(2 * std::mem::size_of::<usize>())
+			.and_then(|bytes| bytes.checked_add(graph_bytes))
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("source scope metadata"))?;
+		fields.admit(bytes)?;
+	}
+	row = row.with_graph(graph.cloned());
+	if let Some(sequence) = sequence {
+		row = row.with_sequence(sequence.to_vec());
+	}
+	Ok(apply_row_layout(row, layout))
+}
+
+/// Unscoped/derived inputs use the same checked allocation owner.
+fn layout_row<Read: QueryRead>(
+	read: &Read,
+	row: Row,
+	layout: Option<(usize, usize, usize)>,
+) -> FerrosGrynnResult<Row> {
+	admit_row_layout(read, row.values.len(), layout)?;
+	Ok(apply_row_layout(row, layout))
+}
+
+/// Applies a pre-admitted layout; every caller validates its exact bounds.
+fn apply_row_layout(mut row: Row, layout: Option<(usize, usize, usize)>) -> Row {
 	let Some((offset, width, total)) = layout else {
 		return row;
 	};
-	debug_assert_eq!(row.values.len(), width);
+	if offset == 0 && width == total {
+		return row;
+	}
 	let mut values = vec![Value::None; total];
 	for (target, value) in
 		values[offset..offset.saturating_add(width)].iter_mut().zip(row.values.drain(..))
@@ -1472,10 +2442,10 @@ fn map_row_set<Read: QueryRead>(
 	snapshot: Snapshot,
 	control: &ExecutionControl,
 	rows: RowSet,
-	mut map: impl FnMut(Row) -> Row,
+	mut map: impl FnMut(Row) -> FerrosGrynnResult<Row>,
 ) -> FerrosGrynnResult<RowSet> {
 	let mut output = RowCollector::new(read, control, false);
-	rows.consume(|row| output.push(read, snapshot, map(row)))?;
+	rows.consume(|row| output.push(read, snapshot, map(row)?))?;
 	output.finish()
 }
 
@@ -1522,11 +2492,19 @@ fn derived_source_rows<Read: QueryRead>(
 ) -> FerrosGrynnResult<RowSet> {
 	let (select, physical) = prepare_physical_plan(read, snapshot, select, control)?;
 	let select = &select;
-	let output =
-		execute_select_output(read, snapshot, select, &physical, slots, source, control, None)?;
+	let output = execute_select_output(
+		read, snapshot, select, &physical, slots, source, control, None, None,
+	)?;
+	let fields = RecordFields {
+		read,
+		snapshot,
+		graph: None,
+	};
 	let start = match &select.start {
 		None => 0,
-		Some(LogicalSelectStart::Offset(value)) => eval_usize(value, slots, source, control)?,
+		Some(LogicalSelectStart::Offset(value)) => {
+			eval_usize(value, slots, source, &fields, control)?
+		}
 		Some(LogicalSelectStart::After {
 			..
 		}) => {
@@ -1535,10 +2513,9 @@ fn derived_source_rows<Read: QueryRead>(
 			));
 		}
 	};
-	let mut remaining = select_limit(select, slots, source, control)?.unwrap_or(usize::MAX);
-	if select.only {
-		remaining = remaining.min(2);
-	}
+	let mut remaining =
+		select_limit(select, slots, source, &fields, control)?.unwrap_or(usize::MAX);
+	remaining = select_pull_limit(select.only, remaining);
 	let mut stream = output.into_stream()?;
 	for _index in 0..start {
 		if stream.next()?.is_none() {
@@ -1569,10 +2546,7 @@ fn derived_source_rows<Read: QueryRead>(
 			FerrosGrynnError::invalid_argument("derived source row ordinal overflow")
 		})?;
 	}
-	if select.only && ordinal > 1 {
-		return Err(FerrosGrynnError::select_cardinality_violation(ordinal as u64)
-			.with_phase(ExecutionPhase::Execution));
-	}
+	check_select_cardinality(select.only, ordinal)?;
 	rows.finish()
 }
 
@@ -1592,6 +2566,100 @@ fn rows_to_set<Read: QueryRead>(
 	collector.finish()
 }
 
+/// A zero result window still observes and validates its graph scope.
+fn validate_zero_window<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+) -> FerrosGrynnResult<()> {
+	control.check()?;
+	if let Some(reference) = plan.source.kind.graph_scope() {
+		validate_empty_graph(read, snapshot, reference, outer, slots, source, control)?;
+	}
+	Ok(())
+}
+
+/// Validates an empty scoped relation without materializing graph rows.
+///
+/// # Errors
+///
+/// Returns scope evaluation, snapshot, graph identity or budget errors.
+fn validate_empty_graph<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	reference: &LogicalGraphReference,
+	outer: Option<&Row>,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<()> {
+	let graph = resolve_graph_reference(read, snapshot, reference, outer, slots, source, control)?;
+	read.graph(snapshot, &graph)?;
+	Ok(())
+}
+
+/// Resolves and refreshes a root scope before collecting any LIVE rows.
+///
+/// # Errors
+///
+/// Returns bounded expression, graph lookup, snapshot or interruption errors.
+pub(in crate::gql) fn resolve_root_graph_reference(
+	read: &RootRead<'_>,
+	reference: &LogicalGraphReference,
+	slots: &[Value],
+	control: &ExecutionControl,
+	anchor: Option<(crate::graph::GraphId, &str)>,
+) -> FerrosGrynnResult<(GraphRef, Option<Text>)> {
+	let snapshot = read.snapshot()?;
+	let value = match reference {
+		LogicalGraphReference::Static(reference) => {
+			read.fields().admit(
+				reference
+					.name()
+					.len()
+					.checked_add(std::mem::size_of::<GraphRef>() + std::mem::size_of::<Value>())
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE scope reference"))?,
+			)?;
+			Value::from(reference.clone())
+		}
+		LogicalGraphReference::Expression(expression) => eval_select_expr(
+			read,
+			snapshot,
+			expression,
+			&Row::new(Vec::new()),
+			None,
+			slots,
+			"",
+			control,
+		)?,
+	};
+	read.fields().admit_value(&value)?;
+	let graph = match &value {
+		Value::GraphRef(reference) => reference.id(),
+		Value::String(name) => match anchor {
+			// The durable last-successful operand keeps its identity through
+			// renames and rejects removal/recreate, including quiet intervals.
+			Some((graph, previous)) if previous == name.as_str() => graph,
+			_ => read.catalog(snapshot).graph(name.as_str())?.id(),
+		},
+		value => {
+			return Err(FerrosGrynnError::invalid_argument(format!(
+				"GRAPH reference requires graph_ref or string, found {}.",
+				value.kind()
+			)));
+		}
+	};
+	let name = match value {
+		Value::String(name) => Some(name),
+		_ => None,
+	};
+	Ok((read.graph_reference(snapshot, graph)?, name))
+}
+
 pub(in crate::gql::execution) fn resolve_graph_reference<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
@@ -1603,8 +2671,8 @@ pub(in crate::gql::execution) fn resolve_graph_reference<Read: QueryRead>(
 ) -> FerrosGrynnResult<GraphRef> {
 	match reference {
 		LogicalGraphReference::Static(reference) => Ok(reference.clone()),
-		LogicalGraphReference::Expression(expression) => {
-			match eval_select_expr(
+		LogicalGraphReference::Expression(expression) => resolve_graph_value(
+			eval_select_expr(
 				read,
 				snapshot,
 				expression,
@@ -1613,15 +2681,28 @@ pub(in crate::gql::execution) fn resolve_graph_reference<Read: QueryRead>(
 				slots,
 				source,
 				control,
-			)? {
-				Value::GraphRef(reference) => Ok(*reference),
-				Value::String(name) => read.catalog(snapshot).graph(name.as_str()),
-				value => Err(FerrosGrynnError::invalid_argument(format!(
-					"GRAPH reference requires graph_ref or string, found {}.",
-					value.kind()
-				))),
-			}
-		}
+			)?,
+			read.catalog(snapshot),
+		),
+	}
+}
+
+/// Resolves an already evaluated scope through the caller's fixed catalog.
+///
+/// # Errors
+///
+/// Returns missing graph names or the ordinary GRAPH operand type error.
+pub(in crate::gql::execution) fn resolve_graph_value(
+	value: Value,
+	catalog: &dyn QueryCatalog,
+) -> FerrosGrynnResult<GraphRef> {
+	match value {
+		Value::GraphRef(reference) => Ok(*reference),
+		Value::String(name) => catalog.graph(name.as_str()),
+		value => Err(FerrosGrynnError::invalid_argument(format!(
+			"GRAPH reference requires graph_ref or string, found {}.",
+			value.kind()
+		))),
 	}
 }
 
@@ -1655,7 +2736,40 @@ fn split_rows<Read: QueryRead>(
 			}
 		};
 		for (ordinal, value) in values.into_iter().enumerate() {
+			control.check()?;
+			if let Some(fields) = read.bounded_fields() {
+				fields.work(1)?;
+				let growth = row
+					.stable
+					.len()
+					.checked_add(1)
+					.and_then(|count| count.checked_mul(std::mem::size_of::<Value>()))
+					.and_then(|bytes| {
+						row.sequence
+							.len()
+							.checked_add(1)
+							.and_then(|count| count.checked_mul(std::mem::size_of::<usize>()))
+							.and_then(|sequence| bytes.checked_add(sequence))
+					})
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("SPLIT row growth"))?;
+				fields.admit(
+					estimated_row_bytes(&row)
+						.checked_add(growth)
+						.ok_or_else(|| FerrosGrynnError::operation_overflow("SPLIT row copy"))?,
+				)?;
+				for value in row.values.iter().chain(&row.stable).chain(&row.order) {
+					fields.admit_value(value)?;
+				}
+			}
 			let mut expanded = row.clone();
+			expanded.stable.try_reserve_exact(1).map_err(|error| {
+				FerrosGrynnError::traversal_resource_limit_exceeded("SPLIT stable growth", 1)
+					.with_technical_source(error)
+			})?;
+			expanded.sequence.try_reserve_exact(1).map_err(|error| {
+				FerrosGrynnError::traversal_resource_limit_exceeded("SPLIT sequence growth", 1)
+					.with_technical_source(error)
+			})?;
 			let target = expanded.values.get_mut(column).ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("SPLIT source column is outside the row.")
 			})?;
@@ -1760,8 +2874,8 @@ fn for_each_group<Read: QueryRead>(
 	let mut current_key = None::<Vec<Value>>;
 	let mut current = None::<RowCollector>;
 	let mut group_ordinal = 0_usize;
-	consume_records(sorted, |record| {
-		let key = record.anchor.order_keys.clone();
+	consume_records(sorted, |mut record| {
+		let key = std::mem::take(&mut record.anchor.order_keys);
 		if current_key.as_ref().is_some_and(|current| current != &key) {
 			let group = current
 				.take()
@@ -1800,33 +2914,29 @@ fn project<Read: QueryRead>(
 ) -> FerrosGrynnResult<(Value, Vec<Value>)> {
 	let mut object = Object::new();
 	let mut projected = Vec::new();
-	for item in &plan.projection {
+	for (index, item) in plan.projection.iter().enumerate() {
 		match item {
 			LogicalSelectItem::Wildcard(fields) => {
-				for field in fields {
-					match field {
-						LogicalWildcardField::Column {
-							name,
-							index,
-						} => {
-							let value = row.value(*index).cloned().unwrap_or(Value::None);
-							object.insert(name.as_ref(), value.clone());
-							projected.push(value);
-						}
-						LogicalWildcardField::Properties {
-							index,
-						} => {
-							let Value::Object(properties) =
-								row.values.get(*index).cloned().unwrap_or(Value::None)
-							else {
-								continue;
-							};
-							for (name, value) in properties {
-								object.insert(name, value);
-							}
-						}
-					}
-				}
+				project_wildcard_fields(row, fields, &mut object, &mut projected);
+			}
+			LogicalSelectItem::WildcardVariants {
+				selector,
+				choices,
+			} => {
+				let ordinal =
+					eval_select_expr(read, snapshot, selector, row, group, slots, source, control)?;
+				let Value::Number(ordinal) = ordinal else {
+					return Err(FerrosGrynnError::invalid_storage_file(
+						"JOIN wildcard selector is not numeric",
+					));
+				};
+				let ordinal = usize::try_from(u64::try_from(ordinal)?).map_err(|_error| {
+					FerrosGrynnError::operation_overflow("JOIN wildcard ordinal")
+				})?;
+				let fields = choices.get(ordinal).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("JOIN wildcard ordinal is out of range")
+				})?;
+				project_wildcard_fields(row, fields, &mut object, &mut projected);
 			}
 			LogicalSelectItem::Expression {
 				name,
@@ -1836,7 +2946,11 @@ fn project<Read: QueryRead>(
 					read, snapshot, expression, row, group, slots, source, control,
 				)?;
 				projected.push(value.clone());
-				object.insert(name.as_ref(), value);
+				if let Some(Some(path)) = plan.projection_paths.get(index) {
+					insert_projection_path(&mut object, path, value, read.bounded_fields())?;
+				} else {
+					object.insert(name.as_ref(), value);
+				}
 			}
 		}
 	}
@@ -1847,18 +2961,147 @@ fn project<Read: QueryRead>(
 	}
 }
 
-fn omit_path(value: &mut Value, path: &[Box<str>]) {
+/// Shared schemafull columns and schemaless property flattening.
+fn project_wildcard_fields(
+	row: &Row,
+	fields: &[LogicalWildcardField],
+	object: &mut Object,
+	projected: &mut Vec<Value>,
+) {
+	for field in fields {
+		match field {
+			LogicalWildcardField::Column {
+				name,
+				index,
+			} => {
+				let value = row.value(*index).cloned().unwrap_or(Value::None);
+				object.insert(name.as_ref(), value.clone());
+				projected.push(value);
+			}
+			LogicalWildcardField::Properties {
+				index,
+			} => {
+				let Value::Object(properties) =
+					row.values.get(*index).cloned().unwrap_or(Value::None)
+				else {
+					continue;
+				};
+				for (name, value) in properties {
+					object.insert(name, value);
+				}
+			}
+		}
+	}
+}
+
+/// Shapes checked SDK aliases after expression evaluation and before FETCH.
+fn insert_projection_path(
+	object: &mut Object,
+	path: &[Box<str>],
+	value: Value,
+	fields: Option<&dyn AtomFieldRead>,
+) -> FerrosGrynnResult<()> {
 	let Some((head, tail)) = path.split_first() else {
-		return;
+		return Err(FerrosGrynnError::invalid_argument("SELECT output path is empty"));
+	};
+	if let Some(fields) = fields {
+		fields.work(1)?;
+		fields.admit(head.len() + 128)?;
+	}
+	if tail.is_empty() {
+		if object.get(head.as_ref()).is_some() {
+			return Err(FerrosGrynnError::invalid_argument("SELECT output paths overlap"));
+		}
+		object.insert(head.as_ref(), value);
+		return Ok(());
+	}
+	if object.get(head.as_ref()).is_none() {
+		object.insert(head.as_ref(), Value::Object(Object::new()));
+	}
+	let Some(Value::Object(nested)) = object.get_mut(head.as_ref()) else {
+		return Err(FerrosGrynnError::invalid_argument("SELECT output paths overlap"));
+	};
+	insert_projection_path(nested, tail, value, fields)
+}
+
+/// Removes literal object paths with the shared cancellation and work budget.
+#[cfg(test)]
+mod omit_tests {
+	use std::cell::Cell;
+
+	use super::*;
+
+	/// Failed work or cancellation stops a nested path before removal.
+	#[test]
+	fn live_omit_traversal_checks_work_and_cancellation() -> FerrosGrynnResult<()> {
+		let store = crate::datastore::Datastore::in_memory();
+		let root = store.inner.current_root();
+		let path = vec![Box::<str>::from("nested"), Box::<str>::from("secret")];
+		let original = Value::Object(Object::from_iter([(
+			"nested",
+			Value::Object(Object::from_iter([("secret", Value::from(1))])),
+		)]));
+		for cancellation in [false, true] {
+			let token = crate::gql::QueryCancellation::default();
+			let control = ExecutionControl::new(
+				&crate::gql::QueryExecutionOptions {
+					cancellation: Some(token.clone()),
+					..crate::gql::QueryExecutionOptions::default()
+				},
+				None,
+			);
+			let calls = Cell::new(0);
+			let work = |_amount| {
+				calls.set(calls.get() + 1);
+				if cancellation {
+					token.cancel();
+					Ok(())
+				} else if calls.get() > 1 {
+					Err(FerrosGrynnError::traversal_resource_limit_exceeded("OMIT test work", 1))
+				} else {
+					Ok(())
+				}
+			};
+			let read = RootRead::new(&root, &control, &|_| {}, &work, std::env::temp_dir());
+			let mut value = original.clone();
+			assert!(omit_path(&read, &mut value, &path, &control).is_err());
+			assert_eq!(value, original);
+			assert_eq!(
+				calls.get(),
+				if cancellation {
+					1
+				} else {
+					2
+				}
+			);
+		}
+		Ok(())
+	}
+}
+
+/// Removes literal object paths with the shared cancellation and work budget.
+fn omit_path<Read: QueryRead>(
+	read: &Read,
+	value: &mut Value,
+	path: &[Box<str>],
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<()> {
+	control.check()?;
+	if let Some(fields) = read.bounded_fields() {
+		fields.work(1)?;
+	}
+	let Some((head, tail)) = path.split_first() else {
+		return Ok(());
 	};
 	let Value::Object(object) = value else {
-		return;
+		return Ok(());
 	};
 	if tail.is_empty() {
 		object.remove(head);
 	} else if let Some(value) = object.get_mut(head) {
-		omit_path(value, tail);
+		omit_path(read, value, tail, control)?;
 	}
+	Ok(())
 }
 
 fn fetch_path<Read: QueryRead>(
@@ -1870,6 +3113,9 @@ fn fetch_path<Read: QueryRead>(
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<()> {
 	control.check()?;
+	if let Some(fields) = read.bounded_fields() {
+		fields.work(1)?;
+	}
 	if let Value::Array(values) = value {
 		for value in values {
 			fetch_path(read, snapshot, value, path, graph, control)?;
@@ -1894,7 +3140,11 @@ fn fetch_path<Read: QueryRead>(
 	let Some(target) = object.get_mut(head) else {
 		return Ok(());
 	};
-	*target = fetch_value(read, snapshot, target.clone(), graph, control)?;
+	let owned = match read.bounded_fields() {
+		Some(fields) => fields.copy_value(target)?,
+		None => target.clone(),
+	};
+	*target = fetch_value(read, snapshot, owned, graph, control)?;
 	if !tail.is_empty() {
 		fetch_path(read, snapshot, target, tail, graph, control)?;
 	}
@@ -1909,12 +3159,26 @@ fn fetch_value<Read: QueryRead>(
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	control.check()?;
+	if let Some(fields) = read.bounded_fields() {
+		fields.work(1)?;
+		let count = match &value {
+			Value::Array(values) => values.len(),
+			Value::Set(values) => values.len(),
+			_ => 0,
+		};
+		fields.admit(
+			count
+				.checked_mul(2 * std::mem::size_of::<Value>() + 128)
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE FETCH collection"))?,
+		)?;
+	}
 	match value {
 		Value::Record(record) => {
 			let row = match graph {
-				Some(graph) => {
-					read.get(snapshot, &record, Some(graph))?.or(read.get(snapshot, &record, None)?)
-				}
+				Some(graph) => match read.get(snapshot, &record, Some(graph))? {
+					Some(row) => Some(row),
+					None => read.get(snapshot, &record, None)?,
+				},
 				None => read.get(snapshot, &record, None)?,
 			};
 			let Some(row) = row else {

@@ -58,6 +58,13 @@ pub(crate) struct PreparedReplace {
 	changes: Vec<KeyChange>,
 }
 
+impl PreparedReplace {
+	/// Returns whether validation found any index entries to replace.
+	pub(in crate::datastore) fn is_empty(&self) -> bool {
+		self.changes.is_empty()
+	}
+}
+
 impl IndexStoreRoot {
 	pub(crate) fn register_class(&mut self, class: &ClassSchema) -> FerrosGrynnResult<()> {
 		self.register_class_with_mode(class, false)

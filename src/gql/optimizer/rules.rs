@@ -65,6 +65,10 @@ fn fold_select(select: &mut LogicalSelect) -> bool {
 		if let LogicalSelectItem::Expression {
 			expression,
 			..
+		}
+		| LogicalSelectItem::WildcardVariants {
+			selector: expression,
+			..
 		} = projection
 		{
 			changed |= fold_expr(expression);
@@ -92,7 +96,14 @@ fn fold_select(select: &mut LogicalSelect) -> bool {
 
 fn fold_source(source: &mut LogicalSelectSource) -> bool {
 	match &mut source.kind {
-		LogicalSelectSourceKind::Atoms {
+		LogicalSelectSourceKind::Empty {
+			graph: Some(LogicalGraphReference::Expression(expression)),
+		}
+		| LogicalSelectSourceKind::Atoms {
+			graph: Some(LogicalGraphReference::Expression(expression)),
+			..
+		}
+		| LogicalSelectSourceKind::AtomUnion {
 			graph: Some(LogicalGraphReference::Expression(expression)),
 			..
 		} => fold_expr(expression),
@@ -109,7 +120,13 @@ fn fold_source(source: &mut LogicalSelectSource) -> bool {
 		LogicalSelectSourceKind::Atoms {
 			..
 		}
+		| LogicalSelectSourceKind::Empty {
+			..
+		}
 		| LogicalSelectSourceKind::Graphs {
+			..
+		}
+		| LogicalSelectSourceKind::AtomUnion {
 			..
 		} => false,
 	}
@@ -226,6 +243,7 @@ fn fold_expr(expression: &mut TypedExpr) -> bool {
 		TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
+		| TypedExprKind::LiveSlot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_)
 		| TypedExprKind::Closure(_) => false,
@@ -340,7 +358,8 @@ fn constant_expression(expression: &TypedExpr) -> bool {
 		| TypedExprKind::Knn {
 			..
 		} => false,
-		TypedExprKind::Slot(_)
+		TypedExprKind::LiveSlot(_)
+		| TypedExprKind::Slot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_)
 		| TypedExprKind::Aggregate {

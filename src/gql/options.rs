@@ -24,7 +24,7 @@ use super::{
 	QueryCursor,
 	closure::{LanguageClosureEntry, LanguageClosureState},
 	cursor::CursorRuntime,
-	ir::{LogicalClosure, NamedFunctionKey},
+	ir::{ClosureEffect, LogicalClosure, NamedFunctionKey},
 };
 use crate::{
 	datastore::{FunctionId, Transaction},
@@ -36,6 +36,50 @@ use crate::{
 /// Cooperative cancellation handle shared with one or more query executions.
 #[derive(Debug, Clone, Default)]
 pub struct QueryCancellation(Arc<AtomicBool>);
+
+/// Owned interruption boundary shared with a private bounded compiler scope.
+#[derive(Debug, Clone)]
+pub(in crate::gql) struct ExecutionChecks {
+	/// Absolute deadline is never restarted for registration.
+	deadline: Option<Instant>,
+	/// Original timeout diagnostic, independent of elapsed registration work.
+	timeout_ms: u64,
+	/// Shared cooperative cancellation token.
+	cancellation: Option<QueryCancellation>,
+	/// Optional embedding check.
+	cooperative: Option<fn() -> FerrosGrynnResult<()>>,
+}
+
+impl ExecutionChecks {
+	/// Uses the same typed interruption semantics as query execution.
+	pub(in crate::gql) fn check(&self) -> FerrosGrynnResult<()> {
+		check_interrupt(
+			self.cancellation.as_ref(),
+			self.deadline,
+			self.timeout_ms,
+			self.cooperative,
+		)
+	}
+}
+
+/// One check authority for runtime and compiler without per-row clones.
+fn check_interrupt(
+	cancellation: Option<&QueryCancellation>,
+	deadline: Option<Instant>,
+	timeout_ms: u64,
+	cooperative: Option<fn() -> FerrosGrynnResult<()>>,
+) -> FerrosGrynnResult<()> {
+	if cancellation.is_some_and(QueryCancellation::is_cancelled) {
+		return Err(FerrosGrynnError::query_cancelled());
+	}
+	if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+		return Err(FerrosGrynnError::query_timed_out(timeout_ms));
+	}
+	if let Some(check) = cooperative {
+		check()?;
+	}
+	Ok(())
+}
 
 impl QueryCancellation {
 	/// Requests cancellation. In-flight synchronous system I/O observes it
@@ -136,9 +180,28 @@ impl QueryExecutionOptions {
 	}
 }
 
+/// Admitted session authority shared with nested statement runtimes.
+#[derive(Debug)]
+struct LiveAttachmentScope {
+	/// Exact retained consumer identities, never serialized in a recipe.
+	entries: Vec<crate::datastore::GqlLiveAttachment>,
+	/// Retained authority stays charged until all child runtimes release it.
+	_account: BarrierAccount,
+}
+
 /// Statement-local deadline and cancellation state.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionControl {
+	/// Only an implicit session transaction may infer write access from typed
+	/// IR.
+	infer_write_access: bool,
+	/// A callback cannot exceed the effect declared by its enclosing function.
+	effect_ceiling: ClosureEffect,
+	/// Session-only ACK authority; recipes and interruption contexts never
+	/// retain it.
+	live_attachments: Option<Arc<LiveAttachmentScope>>,
+	/// Clause deadlines include analysis and snapshot setup time.
+	started: Instant,
 	deadline: Option<Instant>,
 	timeout_ms: u64,
 	cancellation: Option<QueryCancellation>,
@@ -353,6 +416,8 @@ struct BarrierMemory {
 	spill_bytes: AtomicU64,
 	spill_runs: AtomicU64,
 	row_pulls: AtomicU64,
+	/// Checked work for ordinary reads of reactive lexical values.
+	reactive_work: AtomicU64,
 	/// MBR candidates returned by all spatial sources.
 	spatial_candidates: AtomicU64,
 	/// Rows sent through exact spatial post-filters.
@@ -365,6 +430,28 @@ struct BarrierMemory {
 	spatial_delta_records: AtomicU64,
 	/// Sketch hits, exact fallbacks, charged work and consulted artifact bytes.
 	neighbourhood: [AtomicU64; 4],
+}
+
+impl BarrierMemory {
+	/// Admits bytes in the existing statement pool before an owner allocates.
+	fn reserve(&self, bytes: usize) -> bool {
+		if bytes == 0 {
+			return true;
+		}
+		let mut used = self.used.load(Ordering::Acquire);
+		loop {
+			let Some(next) = used.checked_add(bytes).filter(|next| *next <= self.limit) else {
+				return false;
+			};
+			match self.used.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire) {
+				Ok(_) => {
+					self.peak.fetch_max(next, Ordering::AcqRel);
+					return true;
+				}
+				Err(current) => used = current,
+			}
+		}
+	}
 }
 
 /// Bytes retained by one in-memory SELECT barrier.
@@ -384,6 +471,7 @@ impl BarrierAccount {
 				spill_bytes: AtomicU64::new(0),
 				spill_runs: AtomicU64::new(0),
 				row_pulls: AtomicU64::new(0),
+				reactive_work: AtomicU64::new(0),
 				spatial_candidates: AtomicU64::new(0),
 				spatial_refinements: AtomicU64::new(0),
 				spatial_fallbacks: AtomicU64::new(0),
@@ -396,29 +484,11 @@ impl BarrierAccount {
 	}
 
 	pub(crate) fn reserve(&mut self, bytes: usize) -> bool {
-		if bytes == 0 {
-			return true;
+		if !self.memory.reserve(bytes) {
+			return false;
 		}
-		let mut used = self.memory.used.load(Ordering::Acquire);
-		loop {
-			let Some(next) = used.checked_add(bytes).filter(|next| *next <= self.memory.limit)
-			else {
-				return false;
-			};
-			match self.memory.used.compare_exchange_weak(
-				used,
-				next,
-				Ordering::AcqRel,
-				Ordering::Acquire,
-			) {
-				Ok(_) => {
-					self.memory.peak.fetch_max(next, Ordering::AcqRel);
-					self.bytes += bytes;
-					return true;
-				}
-				Err(current) => used = current,
-			}
-		}
+		self.bytes += bytes;
+		true
 	}
 
 	pub(crate) fn release_all(&mut self) {
@@ -467,13 +537,43 @@ impl ExecutionControl {
 		cursors: Option<Arc<Mutex<CursorRuntime>>>,
 		closure_registry: Arc<LanguageClosureState>,
 	) -> Self {
+		Self::with_runtime_origin(options, timeout, cursors, closure_registry, None)
+	}
+
+	/// Reuses an unused session origin only when no statement timeout can be
+	/// resolved.
+	pub(crate) fn with_session_runtime(
+		options: &QueryExecutionOptions,
+		statement_timed: bool,
+		started: Instant,
+		cursors: Option<Arc<Mutex<CursorRuntime>>>,
+		closure_registry: Arc<LanguageClosureState>,
+	) -> Self {
+		let origin = (options.statement_timeout.is_none() && !statement_timed).then_some(started);
+		Self::with_runtime_origin(options, None, cursors, closure_registry, origin)
+	}
+
+	/// Shared initializer; generic callers retain their original origin
+	/// capture.
+	fn with_runtime_origin(
+		options: &QueryExecutionOptions,
+		timeout: Option<Duration>,
+		cursors: Option<Arc<Mutex<CursorRuntime>>>,
+		closure_registry: Arc<LanguageClosureState>,
+		origin: Option<Instant>,
+	) -> Self {
 		let timeout = match (options.statement_timeout, timeout) {
 			(Some(left), Some(right)) => Some(left.min(right)),
 			(Some(value), None) | (None, Some(value)) => Some(value),
 			(None, None) => None,
 		};
+		let started = origin.unwrap_or_else(Instant::now);
 		Self {
-			deadline: timeout.and_then(|value| Instant::now().checked_add(value)),
+			started,
+			deadline: timeout.and_then(|value| started.checked_add(value)),
+			infer_write_access: false,
+			effect_ceiling: ClosureEffect::SchemaMutation,
+			live_attachments: None,
 			timeout_ms: timeout
 				.map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
 				.unwrap_or(0),
@@ -496,6 +596,7 @@ impl ExecutionControl {
 				spill_bytes: AtomicU64::new(0),
 				spill_runs: AtomicU64::new(0),
 				row_pulls: AtomicU64::new(0),
+				reactive_work: AtomicU64::new(0),
 				spatial_candidates: AtomicU64::new(0),
 				spatial_refinements: AtomicU64::new(0),
 				spatial_fallbacks: AtomicU64::new(0),
@@ -533,6 +634,61 @@ impl ExecutionControl {
 			);
 		}
 		self
+	}
+
+	/// Allows typed effects to select access for an implicit session
+	/// transaction.
+	pub(crate) const fn with_inferred_write_access(mut self) -> Self {
+		self.infer_write_access = true;
+		self
+	}
+
+	/// Explicit transaction access is never inferred or promoted.
+	pub(in crate::gql) const fn infer_write_access(&self) -> bool {
+		self.infer_write_access
+	}
+
+	/// Preserves declared effects through dynamically resolved nested
+	/// callbacks.
+	pub(in crate::gql) fn closure_scope(&self, effect: ClosureEffect) -> FerrosGrynnResult<Self> {
+		if effect > self.effect_ceiling {
+			return Err(FerrosGrynnError::closure_effect_not_allowed(
+				format!("{effect:?}"),
+				format!("{:?} caller", self.effect_ceiling),
+			));
+		}
+		let mut child = self.clone();
+		child.effect_ceiling = effect;
+		Ok(child)
+	}
+
+	/// Attaches pre-admitted immutable authority for the current session call.
+	pub(crate) fn with_live_attachments(
+		mut self,
+		entries: Vec<crate::datastore::GqlLiveAttachment>,
+		account: BarrierAccount,
+	) -> Self {
+		self.live_attachments = Some(Arc::new(LiveAttachmentScope {
+			entries,
+			_account: account,
+		}));
+		self
+	}
+
+	/// Requires retained attachment ownership in addition to a valid cursor.
+	pub(in crate::gql) fn live_attachment(
+		&self,
+		id: crate::live::LiveId,
+	) -> FerrosGrynnResult<crate::datastore::GqlLiveAttachment> {
+		self.live_attachments
+			.as_ref()
+			.and_then(|scope| scope.entries.iter().find(|entry| entry.id() == id))
+			.copied()
+			.ok_or_else(|| {
+				FerrosGrynnError::invalid_argument(
+					"GQL ACK requires a retained session LIVE consumer",
+				)
+			})
 	}
 
 	pub(in crate::gql) fn create_closure(
@@ -636,20 +792,41 @@ impl ExecutionControl {
 		)
 	}
 
+	/// Keeps publication waits within the statement's original deadline.
+	pub(crate) const fn deadline(&self) -> Option<Instant> {
+		self.deadline
+	}
+
+	/// Preserves caller interruption while keeping independent LIVE budgets.
+	pub(crate) fn inherit_checks(mut self, parent: &Self) -> Self {
+		self.started = parent.started;
+		self.deadline = parent.deadline;
+		self.timeout_ms = parent.timeout_ms;
+		self.cancellation = parent.cancellation.clone();
+		self.cooperative_check = parent.cooperative_check;
+		self
+	}
+
+	/// Copies interruption only; no cache, cursor or snapshot is retained.
+	pub(in crate::gql) fn interruption(&self) -> ExecutionChecks {
+		ExecutionChecks {
+			deadline: self.deadline,
+			timeout_ms: self.timeout_ms,
+			cancellation: self.cancellation.clone(),
+			cooperative: self.cooperative_check,
+		}
+	}
+
 	pub(crate) fn check(&self) -> FerrosGrynnResult<()> {
 		if self.instrumentation {
 			self.match_metrics.cancellation_checks.fetch_add(1, Ordering::Relaxed);
 		}
-		if self.cancellation.as_ref().is_some_and(QueryCancellation::is_cancelled) {
-			return Err(FerrosGrynnError::query_cancelled());
-		}
-		if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-			return Err(FerrosGrynnError::query_timed_out(self.timeout_ms));
-		}
-		if let Some(check) = self.cooperative_check {
-			check()?;
-		}
-		Ok(())
+		check_interrupt(
+			self.cancellation.as_ref(),
+			self.deadline,
+			self.timeout_ms,
+			self.cooperative_check,
+		)
 	}
 
 	/// Attaches the caller's cancellation boundary to every child statement.
@@ -663,6 +840,41 @@ impl ExecutionControl {
 
 	pub(crate) fn child(&self, timeout: Option<Duration>) -> Self {
 		let child_deadline = timeout.and_then(|value| Instant::now().checked_add(value));
+		self.child_at(timeout, child_deadline)
+	}
+
+	/// Applies a top-level clause without restarting its clock or resources.
+	pub(in crate::gql) fn restrict_timeout(&mut self, timeout: Duration) -> FerrosGrynnResult<()> {
+		let deadline = self.started.checked_add(timeout).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("TIMEOUT duration is too large for this platform.")
+		})?;
+		if self.deadline.is_none_or(|parent| deadline < parent) {
+			self.deadline = Some(deadline);
+			self.timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+		}
+		Ok(())
+	}
+
+	/// Rejects duration overflow rather than silently dropping a clause
+	/// deadline.
+	pub(in crate::gql) fn checked_child(
+		&self,
+		timeout: Option<Duration>,
+	) -> FerrosGrynnResult<Self> {
+		let child_deadline = timeout
+			.map(|value| {
+				Instant::now().checked_add(value).ok_or_else(|| {
+					FerrosGrynnError::invalid_argument(
+						"TIMEOUT duration is too large for this platform.",
+					)
+				})
+			})
+			.transpose()?;
+		Ok(self.child_at(timeout, child_deadline))
+	}
+
+	/// Builds a child once its relative deadline has been resolved.
+	fn child_at(&self, timeout: Option<Duration>, child_deadline: Option<Instant>) -> Self {
 		let (deadline, timeout_ms) = match (self.deadline, child_deadline) {
 			(Some(parent), Some(child)) if child < parent => (
 				Some(child),
@@ -680,7 +892,11 @@ impl ExecutionControl {
 			(None, None) => (None, 0),
 		};
 		Self {
+			started: self.started,
 			deadline,
+			infer_write_access: self.infer_write_access,
+			effect_ceiling: self.effect_ceiling,
+			live_attachments: self.live_attachments.clone(),
 			timeout_ms,
 			cancellation: self.cancellation.clone(),
 			cooperative_check: self.cooperative_check,
@@ -720,6 +936,57 @@ impl ExecutionControl {
 			memory: self.barrier_memory.clone(),
 			bytes: 0,
 		}
+	}
+
+	/// Admits the full reactive payload before cloning it for ordinary
+	/// evaluation.
+	pub(crate) fn copy_reactive_value(&self, value: &Value) -> FerrosGrynnResult<Value> {
+		self.admit_reactive_value(value)?;
+		Ok(value.clone())
+	}
+
+	/// Shared admission also covers clones performed by scalar operators.
+	pub(crate) fn admit_reactive_value(&self, value: &Value) -> FerrosGrynnResult<()> {
+		// Reactive copies remain conservatively charged until the statement
+		// pool is released, including all child controls and callbacks.
+		let admit = |bytes| self.admit_reactive_bytes(bytes);
+		let work = |amount| self.admit_reactive_work(amount);
+		crate::gql::value_admission::admit_value(value, self.barrier_memory.limit, &admit, &work)
+	}
+
+	/// Shares checked work with operators consuming admitted reactive values.
+	pub(crate) fn admit_reactive_work(&self, amount: u64) -> FerrosGrynnResult<()> {
+		self.check()?;
+		self.barrier_memory
+			.reactive_work
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+				current.checked_add(amount).filter(|next| *next <= self.max_loop_iterations)
+			})
+			.map_err(|_current| {
+				FerrosGrynnError::traversal_resource_limit_exceeded(
+					"LIVE LET value work",
+					self.max_loop_iterations,
+				)
+			})?;
+		Ok(())
+	}
+
+	/// Retains collection shells in the same statement-wide scratch pool.
+	pub(crate) fn admit_reactive_bytes(&self, bytes: usize) -> FerrosGrynnResult<()> {
+		self.check()?;
+		if self.barrier_memory.reserve(bytes) {
+			Ok(())
+		} else {
+			Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"LIVE LET value scratch",
+				self.barrier_memory.limit as u64,
+			))
+		}
+	}
+
+	/// Materialized operands can outlive their first admitted reactive copy.
+	pub(crate) fn has_reactive_copies(&self) -> bool {
+		self.barrier_memory.reactive_work.load(Ordering::Acquire) != 0
 	}
 
 	/// Returns the statement-wide barrier limit used by physical planning.
@@ -1307,16 +1574,6 @@ impl Drop for NamedFunctionFrame {
 	}
 }
 
-pub(crate) fn resolve_timeout(
-	value: Option<&TimeoutValue>,
-	bindings: &Object,
-) -> FerrosGrynnResult<Option<Duration>> {
-	let Some(value) = value else {
-		return Ok(None);
-	};
-	resolve_duration(value, bindings, "TIMEOUT").map(Some)
-}
-
 pub(crate) fn resolve_duration(
 	value: &TimeoutValue,
 	bindings: &Object,
@@ -1334,30 +1591,34 @@ pub(crate) fn resolve_duration(
 					parameter.value
 				)));
 			};
-			let Value::Duration(value) = value else {
-				return Err(FerrosGrynnError::invalid_argument(format!(
-					"{subject} parameter has type {}, expected duration.",
-					value.value_type()
-				)));
-			};
-			let nanoseconds = value.fixed_nanoseconds().ok_or_else(|| {
-				FerrosGrynnError::invalid_argument(format!(
-					"{subject} cannot use a calendar duration containing years or months."
-				))
-			})?;
-			if nanoseconds < 0 {
-				return Err(FerrosGrynnError::invalid_argument(format!(
-					"{subject} cannot be negative."
-				)));
-			}
-			let nanoseconds = u64::try_from(nanoseconds).map_err(|_| {
-				FerrosGrynnError::invalid_argument(format!(
-					"{subject} is too large for this platform."
-				))
-			})?;
-			Ok(Duration::from_nanos(nanoseconds))
+			parameter_duration(value, subject)
 		}
 	}
+}
+
+/// Converts a borrowed scalar without copying or traversing invalid payloads.
+pub(in crate::gql) fn parameter_duration(
+	value: &Value,
+	subject: &str,
+) -> FerrosGrynnResult<Duration> {
+	let Value::Duration(value) = value else {
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"{subject} parameter has type {}, expected duration.",
+			value.kind().name()
+		)));
+	};
+	let nanoseconds = value.fixed_nanoseconds().ok_or_else(|| {
+		FerrosGrynnError::invalid_argument(format!(
+			"{subject} cannot use a calendar duration containing years or months."
+		))
+	})?;
+	if nanoseconds < 0 {
+		return Err(FerrosGrynnError::invalid_argument(format!("{subject} cannot be negative.")));
+	}
+	let nanoseconds = u64::try_from(nanoseconds).map_err(|_| {
+		FerrosGrynnError::invalid_argument(format!("{subject} is too large for this platform."))
+	})?;
+	Ok(Duration::from_nanos(nanoseconds))
 }
 
 fn parse_fixed_duration(value: &str, subject: &str) -> FerrosGrynnResult<Duration> {
@@ -1401,9 +1662,107 @@ mod tests {
 		values::{Object, Value},
 	};
 
+	/// Compiler checks and child runtimes share the caller's cancellation
+	/// token.
+	#[test]
+	fn cancellation_is_observed_by_runtime_compiler_and_children() {
+		let cancellation = super::QueryCancellation::default();
+		let options = QueryExecutionOptions {
+			cancellation: Some(cancellation.clone()),
+			..QueryExecutionOptions::default()
+		};
+		let control = ExecutionControl::new(&options, None);
+		let child = control.child(None);
+		let checks = control.interruption();
+		assert!(control.check().is_ok());
+		cancellation.cancel();
+		assert!(cancellation.is_cancelled());
+		assert!(options.cancellation.as_ref().is_some_and(super::QueryCancellation::is_cancelled));
+		assert!(control.check().is_err());
+		assert!(child.check().is_err());
+		assert!(checks.check().is_err());
+	}
+
 	#[test]
 	fn duration_at_rounded_u64_boundary_is_rejected_without_panicking() {
 		assert!(parse_fixed_duration("18446744073709551615s", "TIMEOUT").is_err());
+	}
+
+	/// Untimed reuse does not anchor nested or subsequently resolved deadlines
+	/// early.
+	#[test]
+	fn session_untimed_origin_preserves_timed_and_nested_deadlines()
+	-> crate::gql_status::FerrosGrynnResult<()> {
+		use std::{
+			sync::Arc,
+			time::{Duration, Instant},
+		};
+
+		use crate::gql_status::FerrosGrynnError;
+
+		let now = Instant::now();
+		let old = now.checked_sub(Duration::from_secs(1)).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("clock fixture cannot subtract one second")
+		})?;
+		let construct = |options: &QueryExecutionOptions, statement_timed| {
+			ExecutionControl::with_session_runtime(
+				options,
+				statement_timed,
+				old,
+				None,
+				Arc::new(super::LanguageClosureState::default()),
+			)
+		};
+		let untimed = construct(&QueryExecutionOptions::default(), false);
+		assert_eq!(untimed.started, old);
+		assert!(untimed.deadline().is_none());
+		let invoked = Instant::now();
+		let child = untimed.checked_child(Some(Duration::from_secs(1)))?;
+		assert!(child.deadline().is_some_and(|deadline| {
+			invoked.checked_add(Duration::from_secs(1)).is_some_and(|minimum| deadline >= minimum)
+		}));
+		let mut timed = construct(&QueryExecutionOptions::default(), true);
+		assert!(timed.started >= now);
+		let origin = timed.started;
+		timed.restrict_timeout(Duration::from_secs(1))?;
+		assert_eq!(timed.deadline(), origin.checked_add(Duration::from_secs(1)));
+		let configured = construct(
+			&QueryExecutionOptions {
+				statement_timeout: Some(Duration::from_secs(1)),
+				..QueryExecutionOptions::default()
+			},
+			false,
+		);
+		assert!(configured.started >= now);
+		assert_eq!(configured.deadline(), configured.started.checked_add(Duration::from_secs(1)));
+		Ok(())
+	}
+
+	/// Resolution after analysis cannot renew a top-level timeout.
+	#[test]
+	fn duration_top_level_clock_anchor_and_default_minimum()
+	-> crate::gql_status::FerrosGrynnResult<()> {
+		let mut control = ExecutionControl::new(&QueryExecutionOptions::default(), None);
+		let origin = control.started;
+		control.restrict_timeout(std::time::Duration::from_secs(1))?;
+		assert_eq!(control.deadline(), origin.checked_add(std::time::Duration::from_secs(1)));
+		let mut copy = control.clone();
+		copy.restrict_timeout(std::time::Duration::from_secs(2))?;
+		assert_eq!(copy.deadline(), control.deadline());
+		assert_eq!(copy.started, origin);
+		assert_eq!(control.child(None).started, origin);
+		let mut earlier = ExecutionControl::new(
+			&QueryExecutionOptions {
+				statement_timeout: Some(std::time::Duration::from_millis(50)),
+				..QueryExecutionOptions::default()
+			},
+			None,
+		);
+		let default = earlier.deadline();
+		earlier.restrict_timeout(std::time::Duration::from_secs(1))?;
+		assert_eq!(earlier.deadline(), default);
+		assert!(earlier.restrict_timeout(std::time::Duration::MAX).is_err());
+		Ok(())
 	}
 
 	#[test]

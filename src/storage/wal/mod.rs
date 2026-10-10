@@ -50,6 +50,7 @@ pub(in crate::storage) use state::{
 	CheckpointCommit,
 	CheckpointTicket,
 	CommitOutcome,
+	FrameReadScope,
 	FrameWal,
 	RecoverySeed,
 	ResolvedFrame,
@@ -979,6 +980,105 @@ mod tests {
 		visible.read_frame(frame, &mut page)?;
 		assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], 9);
 		drop(visible);
+		assert!(wal.inner.prune_gate.try_write().is_some());
+		Ok(())
+	}
+	/// Cached physical handles support reverse seeks and segment switches
+	/// while the scope alone prevents pruning of the selected frames.
+	#[test]
+	fn checkpoint_frame_scope_reuses_handles_and_switches_segments() -> Result<(), Box<dyn Error>> {
+		let directory = TestDirectory::new()?;
+		let wal =
+			FrameWal::create_new_with_target(directory.as_path(), transaction_encoded_size(2)?)?;
+		let mut tx = wal.begin_tx()?;
+		tx.stage_page(page_key(0), &marked_page(0, 8)?)?;
+		tx.stage_page(page_key(1), &marked_page(1, 9)?)?;
+		wal.commit_tx(tx)?;
+		let mut tx = wal.begin_tx()?;
+		tx.stage_page(page_key(2), &marked_page(2, 10)?)?;
+		wal.commit_tx(tx)?;
+		let visible = wal.visible_frames(&[page_key(0), page_key(1), page_key(2)], wal.snapshot());
+		let frames = visible
+			.frames()
+			.iter()
+			.copied()
+			.collect::<Option<Vec<_>>>()
+			.ok_or_else(|| io::Error::other("test frame absent"))?;
+		drop(visible);
+		assert_eq!(
+			frames[0].version.location.segment_start_lsn,
+			frames[1].version.location.segment_start_lsn
+		);
+		assert_ne!(
+			frames[0].version.location.segment_start_lsn,
+			frames[2].version.location.segment_start_lsn
+		);
+		let mut reader = wal.frame_read_scope();
+		let mut page = AlignedPage::zeroed();
+		reader.read_frame(frames[1], &mut page)?;
+		assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], 9);
+		assert!(wal.inner.prune_gate.try_write().is_none());
+		let segment =
+			segment_path(directory.as_path(), frames[0].version.location.segment_start_lsn);
+		let renamed = directory.as_path().join("cached-segment.tmp");
+		fs::rename(&segment, &renamed)?;
+		// Reopening the old path would fail; the retained handle must serve
+		// both a backward seek and another forward read.
+		reader.read_frame(frames[0], &mut page)?;
+		assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], 8);
+		reader.read_frame(frames[1], &mut page)?;
+		assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], 9);
+		fs::rename(&renamed, &segment)?;
+		reader.read_frame(frames[2], &mut page)?;
+		assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], 10);
+		reader.read_frame(frames[0], &mut page)?;
+		assert_eq!(page.as_bytes()[PAGE_HEADER_SIZE], 8);
+		drop(reader);
+		assert!(wal.inner.prune_gate.try_write().is_some());
+		let target = wal
+			.capture_checkpoint_target()
+			.ok_or_else(|| io::Error::other("checkpoint target absent"))?;
+		let ticket = wal.begin_checkpoint(target, CheckpointGeneration::ZERO)?;
+		let checkpoint = wal.finish_checkpoint(ticket)?;
+		wal.publish_checkpoint(&checkpoint)?;
+		assert_eq!(list_segments(directory.as_path())?.len(), 1);
+		Ok(())
+	}
+
+	/// The cached path uses the same page/LSN/exact-read validation and
+	/// releases its pruning guard when the caller leaves after an error.
+	#[test]
+	fn checkpoint_frame_scope_validates_pages_and_releases_guard_on_error()
+	-> Result<(), Box<dyn Error>> {
+		let directory = TestDirectory::new()?;
+		let wal = FrameWal::create_new(directory.as_path())?;
+		let mut tx = wal.begin_tx()?;
+		tx.stage_page(page_key(0), &marked_page(0, 9)?)?;
+		wal.commit_tx(tx)?;
+		let visible = wal.visible_frames(&[page_key(0)], wal.snapshot());
+		let frame = visible.frames()[0].ok_or_else(|| io::Error::other("test frame absent"))?;
+		drop(visible);
+		let mut reader = wal.frame_read_scope();
+		let mut page = AlignedPage::zeroed();
+		reader.read_frame(frame, &mut page)?;
+		let mut wrong_page = frame;
+		wrong_page.key = page_key(1);
+		assert!(reader.read_frame(wrong_page, &mut page).is_err());
+		let mut wrong_lsn = frame;
+		wrong_lsn.version.frame_lsn = Lsn::new(frame.version.frame_lsn.get() + 1);
+		assert!(reader.read_frame(wrong_lsn, &mut page).is_err());
+		let path = segment_path(directory.as_path(), frame.version.location.segment_start_lsn);
+		let mut file = OpenOptions::new().write(true).open(path)?;
+		file.seek(SeekFrom::Start(
+			frame.version.location.page_bytes_offset + PAGE_HEADER_SIZE as u64,
+		))?;
+		file.write_all(&[10])?;
+		file.sync_data()?;
+		assert!(reader.read_frame(frame, &mut page).is_err());
+		file.set_len(frame.version.location.page_bytes_offset + PAGE_SIZE as u64 - 1)?;
+		assert!(reader.read_frame(frame, &mut page).is_err());
+		assert!(wal.inner.prune_gate.try_write().is_none());
+		drop(reader);
 		assert!(wal.inner.prune_gate.try_write().is_some());
 		Ok(())
 	}

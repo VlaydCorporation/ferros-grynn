@@ -1,4 +1,4 @@
-//! Cross-entry validation for one decoded `FGDC v10` payload.
+//! Cross-entry validation for one decoded `FGDC v13` payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,6 +32,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 	}
 	jiff::Timestamp::from_nanosecond(catalog.committed_at_ns)
 		.map_err(|_| invalid("database commit UTC time is outside its supported domain"))?;
+	super::live::validate_entries(catalog)?;
 	let mut feed_ids = BTreeSet::new();
 	let mut feed_sources = BTreeSet::new();
 	let mut feed_files = BTreeSet::new();
@@ -43,7 +44,10 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			entry.epochs.last().ok_or_else(|| invalid("changefeed capture epochs are empty"))?;
 		if first.started_at().get() < entry.defined_at
 			|| last.started_at().get() != entry.published_at
+			|| last.revision() != entry.version
+			|| entry.epochs.iter().any(|epoch| epoch.revision() > entry.version)
 			|| entry.epochs.windows(2).any(|pair| pair[0].started_at() >= pair[1].started_at())
+			|| entry.epochs.windows(2).any(|pair| pair[0].revision() > pair[1].revision())
 		{
 			return Err(invalid("changefeed capture epoch bounds are invalid"));
 		}
@@ -127,7 +131,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 				|| !feed_files.insert(segment.file)
 				|| !feed_segments.insert(header.segment)
 				|| header.database != catalog.database_uuid
-				|| header.feed != entry.id
+				|| header.owner != crate::storage::HistoryOwner::Changefeed(entry.id)
 				|| (!partial || ordinal != 0) && header.first_stamp <= entry.purged_through
 				|| header.first_stamp < entry.defined_at
 				|| header.last_stamp > entry.last_stamp
@@ -146,6 +150,7 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 			previous_segment = Some((header.last_stamp, header.last_time));
 		}
 	}
+	super::live_history::validate_entries(catalog, &mut feed_files, &mut feed_segments)?;
 	if catalog.next_graph_id == 0 {
 		return Err(invalid("next graph identity is zero"));
 	}

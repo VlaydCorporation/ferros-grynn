@@ -81,6 +81,13 @@ pub(crate) enum SourceOperator {
 	GraphCatalogScan,
 	/// Materialized relation produced by a nested SELECT.
 	Derived,
+	/// One bounded raw relation over canonical class scans, before JOIN.
+	AtomUnion {
+		/// Ordered class identities used by the logical relation.
+		classes: Vec<Box<str>>,
+		/// Fixed occurrence scope, or None for global/dynamic scope.
+		graph: Option<crate::graph::GraphId>,
+	},
 }
 
 /// Shape of a scalar-index access selected before runtime values are encoded.
@@ -363,6 +370,8 @@ pub(crate) struct PhysicalMatchNode {
 /// Current MATCH operator sequence selected by the shared cost model.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PhysicalMatchPlan {
+	/// Resolved graph identity, absent only in deferred outer estimates.
+	pub(crate) graph: Option<crate::graph::GraphId>,
 	/// Pattern indexes in chosen execution order.
 	pub(crate) pattern_order: Vec<usize>,
 	/// Physical operators in stable execution preorder.
@@ -577,6 +586,128 @@ pub(crate) struct PhysicalChangefeedPlan {
 	pub(crate) dynamic_source: bool,
 }
 
+/// Logical LIVE command; execution remains in the ordinary statement pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::gql) enum LiveOperation {
+	/// Registers a new query incarnation.
+	Register,
+	/// Defines a reactive expression identity.
+	DefineBinding,
+	/// Replaces a reactive expression while retaining identity.
+	ReplaceBinding,
+	/// Reads retained query metadata.
+	Info,
+	/// Reads reactive definition metadata.
+	InfoBinding,
+	/// Removes a binding after dependency validation.
+	RemoveBinding,
+	/// Confirms a previously issued whole commit.
+	Ack,
+	/// Stops future capture for this incarnation.
+	Close,
+}
+
+impl LiveOperation {
+	/// Returns the command's actual validation/read/publication phases.
+	pub(in crate::gql) const fn phases(self) -> &'static [&'static str] {
+		match self {
+			Self::Register => {
+				&["LiveCaptureInputs", "LiveValidateRecipe", "LiveCatalogMutation", "Publication"]
+			}
+			Self::DefineBinding | Self::ReplaceBinding => &[
+				"LiveCaptureInputs",
+				"LiveValidateDependencies",
+				"LiveCatalogMutation",
+				"Publication",
+			],
+			Self::Info | Self::InfoBinding => &["LiveSnapshotMetadataRead"],
+			Self::RemoveBinding => {
+				&["LiveValidateDependencies", "LiveCatalogMutation", "Publication"]
+			}
+			Self::Ack => &["LiveValidateIssuedToken", "LiveConfirmWatermark", "Publication"],
+			Self::Close => &["LiveStopCapture", "Publication"],
+		}
+	}
+
+	/// Returns a stable user-facing logical command name.
+	pub(in crate::gql) const fn name(self) -> &'static str {
+		match self {
+			Self::Register => "LIVE SELECT",
+			Self::DefineBinding => "LIVE LET",
+			Self::ReplaceBinding => "ALTER LIVE LET",
+			Self::Info => "INFO FOR LIVE",
+			Self::InfoBinding => "INFO FOR LIVE LET",
+			Self::RemoveBinding => "REMOVE LIVE LET",
+			Self::Ack => "ACK LIVE",
+			Self::Close => "KILL LIVE",
+		}
+	}
+}
+
+/// One bounded qualified logical source, never a physical storage locator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(in crate::gql) struct PhysicalLiveSource {
+	/// Logical declaration order, with FROM at zero.
+	pub(in crate::gql) ordinal: u32,
+	/// Qualified source category.
+	pub(in crate::gql) kind: &'static str,
+	/// Frozen class owner when statically resolved.
+	pub(in crate::gql) class: Option<crate::datastore::ClassId>,
+	/// Snapshot graph identity when statically resolved.
+	pub(in crate::gql) graph: Option<crate::graph::GraphId>,
+	/// Owned exact record selector, independent of primary contents.
+	pub(in crate::gql) record: Option<RecordId>,
+	/// Scope requires ordinary reactive or deferred evaluation.
+	pub(in crate::gql) dynamic_scope: bool,
+}
+
+/// Immutable logical LIVE metadata, independent of queues and current result
+/// values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "Payload visibility matches the existing crate-visible PhysicalPlan enum"
+)]
+pub(crate) struct PhysicalLivePlan {
+	/// Ordinary executor command selected by the wrapper.
+	pub(in crate::gql) operation: LiveOperation,
+	/// Captured input and registration-operand fingerprint.
+	pub(in crate::gql) request_hash: u64,
+	/// Canonical logical recipe fingerprint, without executable IR.
+	pub(in crate::gql) descriptor_hash: Option<u64>,
+	/// Snapshot function versions, signatures and bodies.
+	pub(in crate::gql) function_fingerprint: u64,
+	/// Durable database origin.
+	pub(in crate::gql) database: crate::values::Uuid,
+	/// Fixed statement commit clock.
+	pub(in crate::gql) snapshot: crate::changefeed::Versionstamp,
+	/// Existing binding/query identity, absent for registration or deferred
+	/// operands.
+	pub(in crate::gql) identity: Option<crate::values::Uuid>,
+	/// Existing expression/query definition version.
+	pub(in crate::gql) definition_version: Option<u64>,
+	/// Bounded source declarations in logical order.
+	pub(in crate::gql) sources: Vec<PhysicalLiveSource>,
+	/// Native result presentation mode.
+	pub(in crate::gql) output: Option<crate::live::LiveOutputMode>,
+	/// Starting or issued-position operand category.
+	pub(in crate::gql) since_kind: &'static str,
+	/// Exact owned operand; never projected as a capture value.
+	pub(in crate::gql) since_value: Option<crate::values::Value>,
+	/// Whole-commit entry admission ceiling, absent when deferred.
+	pub(in crate::gql) queue_entries: Option<u64>,
+	/// Retained queue byte ceiling.
+	pub(in crate::gql) queue_bytes: u64,
+	/// Configured statement or retained definition scratch ceiling.
+	pub(in crate::gql) scratch_bytes: u64,
+	/// Checked evaluation work ceiling.
+	pub(in crate::gql) work: u64,
+	/// Whole-commit backpressure policy.
+	pub(in crate::gql) overflow: Option<crate::live::LiveOverflowPolicy>,
+	/// At least one registration/control operand requires execution.
+	pub(in crate::gql) dynamic_operands: bool,
+}
+
 /// Complete internal physical plan used by EXPLAIN and replay hashing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PhysicalPlan {
@@ -593,6 +724,8 @@ pub(crate) enum PhysicalPlan {
 	/// Snapshot history read or logical metadata lookup without mutation
 	/// phases.
 	Changefeed(PhysicalChangefeedPlan),
+	/// Logical LIVE catalog/read phases and snapshot-bound descriptor identity.
+	Live(PhysicalLivePlan),
 }
 
 impl PhysicalPlan {
@@ -628,6 +761,7 @@ impl PhysicalPlan {
 			}
 			Self::Match(plan) => {
 				1_u8.hash(&mut writer);
+				plan.graph.hash(&mut writer);
 				plan.pattern_order.hash(&mut writer);
 				plan.nodes.hash(&mut writer);
 				plan.cardinality.hash(&mut writer);
@@ -669,6 +803,10 @@ impl PhysicalPlan {
 			}
 			Self::Changefeed(plan) => {
 				5_u8.hash(&mut writer);
+				plan.hash(&mut writer);
+			}
+			Self::Live(plan) => {
+				6_u8.hash(&mut writer);
 				plan.hash(&mut writer);
 			}
 		}

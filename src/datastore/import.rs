@@ -709,6 +709,24 @@ impl Datastore {
 		self.import_at(options, None, None, run)
 	}
 
+	/// Runs an atomic import with controlled final publication and BLOCK waits.
+	/// The callback may check the same cancellation token for its own work.
+	///
+	/// # Errors
+	///
+	/// Returns import, cancellation or deadline errors before publication.
+	pub fn import_with_commit_options<Run>(
+		&self,
+		options: ImportOptions,
+		controls: &super::CommitOptions,
+		run: Run,
+	) -> FerrosGrynnResult<ImportReport>
+	where
+		Run: FnOnce(&mut ImportSession) -> FerrosGrynnResult<()>,
+	{
+		self.import_at_controlled(options, None, None, controls.deadline, &|| controls.check(), run)
+	}
+
 	/// Runs an import with analysis-time snapshot and graph-scope guards.
 	///
 	/// # Errors
@@ -725,6 +743,23 @@ impl Datastore {
 	where
 		Run: FnOnce(&mut ImportSession) -> FerrosGrynnResult<()>,
 	{
+		self.import_at_controlled(options, expected_commit_ts, graph_scope, None, &|| Ok(()), run)
+	}
+
+	/// Propagates the existing statement controls through the import barrier.
+	pub(crate) fn import_at_controlled<Run>(
+		&self,
+		options: ImportOptions,
+		expected_commit_ts: Option<u64>,
+		graph_scope: Option<GraphId>,
+		deadline: Option<Instant>,
+		check: &impl Fn() -> FerrosGrynnResult<()>,
+		run: Run,
+	) -> FerrosGrynnResult<ImportReport>
+	where
+		Run: FnOnce(&mut ImportSession) -> FerrosGrynnResult<()>,
+	{
+		check()?;
 		let configured = match self.inner.options {
 			super::DatastoreOptions::InMemory(options) => options.maintenance,
 			super::DatastoreOptions::Local(options) => options.maintenance,
@@ -772,33 +807,63 @@ impl Datastore {
 		let mut session =
 			ImportSession::new(transaction, options, commit_ts, self.inner.import_scratch_root());
 		run(&mut session)?;
+		check()?;
 		let callback_elapsed = callback_started.elapsed();
 		let (transaction, mut report, changed, mut quarantine) = session.finish()?;
 
 		let validation_started = Instant::now();
-		let (mut root, base_commit_ts, built_indexes) =
+		let (mut transaction, built_indexes) =
 			with_external_sort_options(sort_memory, parallelism, || {
 				transaction.finish_import(commit_ts, options.indexes, options.full_validation)
 			})?;
+		check()?;
 		report.phase_timings.insert("validation".to_owned(), validation_started.elapsed());
 		report.built_indexes = built_indexes;
 
 		let publication_started = Instant::now();
 		if changed || quarantine.is_some() {
-			let _commit = self.inner.commit.lock();
-			self.inner.ensure_import_owner(owner)?;
-			let current = self.inner.current_root();
-			if current.commit_ts != base_commit_ts {
+			let mut published = false;
+			for _attempt in 0..8 {
+				check()?;
+				self.inner.ensure_import_owner(owner)?;
+				let observed = self.inner.current_root();
+				with_external_sort_options(sort_memory, parallelism, || {
+					transaction.prepare_import_publication(&observed, sort_memory.get())
+				})?;
+				let queues = self.inner.live_consumers.reserve(
+					transaction.import_publication_root(),
+					publication_started,
+					deadline,
+					&|| {
+						check()?;
+						self.inner.ensure_import_owner(owner)
+					},
+				)?;
+				let _commit = self.inner.commit.lock();
+				self.inner.ensure_import_owner(owner)?;
+				check()?;
+				if !Arc::ptr_eq(&observed, &self.inner.current_root()) || !queues.valid() {
+					continue;
+				}
+				let mut published_root = Arc::new(transaction.into_import_root());
+				let root = Arc::get_mut(&mut published_root).ok_or_else(|| {
+					FerrosGrynnError::invalid_storage_file("unpublished import root is shared")
+				})?;
+				report.index_timings =
+					with_external_sort_options(sort_memory, parallelism, || {
+						self.inner.persist_import_root(root, quarantine.as_mut())
+					})?;
+				*self.inner.current.write() = published_root;
+				queues.publish();
+				published = true;
+				break;
+			}
+			if !published {
 				return Err(FerrosGrynnError::serialization_failure(
 					owner,
-					"the import base snapshot changed before publication",
+					"the LIVE import candidate changed during bounded publication preparation",
 				));
 			}
-			root.commit_ts = commit_ts;
-			report.index_timings = with_external_sort_options(sort_memory, parallelism, || {
-				self.inner.persist_import_root(&mut root, quarantine.as_mut())
-			})?;
-			*self.inner.current.write() = Arc::new(root);
 		}
 		report.phase_timings.insert("callback".to_owned(), callback_elapsed);
 		report.phase_timings.insert("publication".to_owned(), publication_started.elapsed());
@@ -916,6 +981,9 @@ fn increment(counter: &mut u64, operation: &'static str) -> FerrosGrynnResult<()
 		counter.checked_add(1).ok_or_else(|| FerrosGrynnError::operation_overflow(operation))?;
 	Ok(())
 }
+
+#[cfg(test)]
+mod live_publication_tests;
 
 #[cfg(test)]
 mod tests {

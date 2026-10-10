@@ -1,4 +1,4 @@
-//! Conversion between the MVCC schema root and exact `FGDC v10` entries.
+//! Conversion between the MVCC schema root and exact `FGDC v12` entries.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -36,6 +36,9 @@ use crate::{
 			FunctionParameterCatalogEntry,
 			GraphCatalogEntry,
 			GraphPropertyCatalogEntry,
+			LiveBindingCatalogEntry,
+			LiveCatalogEntry,
+			LiveHistoryCatalogEntry,
 			ParameterCatalogEntry,
 			PhysicalIndexBinding,
 		},
@@ -60,6 +63,92 @@ pub(super) fn encode_database_catalog(
 	physical_deltas: &BTreeMap<IndexId, PhysicalIndexBinding>,
 	context: &mut EncodeContext,
 ) -> FerrosGrynnResult<DatabaseCatalog> {
+	// Catalog DTOs share values/recipes but own their identity vectors. Admit
+	// the aggregate conversion before collect or copying any such vectors.
+	let mut live_budget = crate::storage::history_codec::CodecBudget::new(256 * 1024 * 1024, 0)?;
+	for (id, history) in &root.live_catalog().histories {
+		let bytes = history
+			.epochs
+			.len()
+			.checked_mul(std::mem::size_of::<crate::datastore::LiveCaptureEpoch>())
+			.and_then(|bytes| {
+				bytes.checked_add(
+					root.live_segments()
+						.get(id)
+						.map_or(0, |segments| segments.len())
+						.checked_mul(std::mem::size_of::<crate::storage::HistorySegment>())?,
+				)
+			})
+			.and_then(|bytes| {
+				bytes.checked_add(std::mem::size_of::<LiveHistoryCatalogEntry>() + 512)
+			})
+			.ok_or_else(|| invalid("LIVE history catalog metadata overflows"))?;
+		live_budget.admit(bytes)?;
+	}
+	for entry in root.live_catalog().bindings.values() {
+		let diagnostic_bytes = match entry.diagnostic.as_ref().map(|error| error.status().status())
+		{
+			Some(crate::gql_status::Status::LiveEvaluationFault {
+				origin_code,
+				reason,
+				..
+			}) => origin_code
+				.len()
+				.checked_add(reason.len())
+				.and_then(|bytes| bytes.checked_mul(2))
+				.ok_or_else(|| invalid("LIVE fault metadata overflows"))?,
+			_ => 0,
+		};
+		let bytes = entry
+			.dependencies
+			.len()
+			.checked_mul(std::mem::size_of::<crate::live::LiveBindingId>())
+			.and_then(|bytes| {
+				bytes.checked_add(entry.functions.len().checked_mul(std::mem::size_of::<(
+					crate::datastore::FunctionId,
+					crate::datastore::SchemaVersion,
+				)>())?)
+			})
+			.and_then(|bytes| {
+				bytes.checked_add(entry.record_sources.len().checked_mul(std::mem::size_of::<(
+					crate::values::Text,
+					crate::datastore::ClassId,
+				)>())?)
+			})
+			.and_then(|bytes| {
+				bytes.checked_add(std::mem::size_of::<LiveBindingCatalogEntry>() + 512)
+			})
+			.and_then(|bytes| bytes.checked_add(diagnostic_bytes))
+			.ok_or_else(|| invalid("LIVE binding catalog metadata overflows"))?;
+		live_budget.admit(bytes)?;
+		for (name, _) in &entry.record_sources {
+			live_budget.admit(name.len())?;
+		}
+	}
+	for entry in root.live_catalog().queries.values() {
+		live_budget.admit(crate::datastore::LiveRhsScopeAnchor::retained_bytes(
+			&entry.rhs_scope_anchors,
+		)?)?;
+		let bytes = entry
+			.functions
+			.len()
+			.checked_mul(std::mem::size_of::<(
+				crate::datastore::FunctionId,
+				crate::datastore::SchemaVersion,
+			)>())
+			.and_then(|bytes| {
+				bytes.checked_add(entry.record_sources.len().checked_mul(std::mem::size_of::<(
+					crate::values::Text,
+					crate::datastore::ClassId,
+				)>())?)
+			})
+			.and_then(|bytes| bytes.checked_add(std::mem::size_of::<LiveCatalogEntry>() + 512))
+			.ok_or_else(|| invalid("LIVE query catalog metadata overflows"))?;
+		live_budget.admit(bytes)?;
+		for (name, _) in &entry.record_sources {
+			live_budget.admit(name.len())?;
+		}
+	}
 	let classes = root
 		.schema
 		.classes()
@@ -260,6 +349,103 @@ pub(super) fn encode_database_catalog(
 	Ok(DatabaseCatalog {
 		database_uuid: root.database_uuid,
 		committed_at_ns: root.committed_at_ns,
+		live_history: root
+			.live_catalog()
+			.histories
+			.iter()
+			.map(|(id, metadata)| LiveHistoryCatalogEntry {
+				id: *id,
+				metadata: metadata.as_ref().clone(),
+				segments: root
+					.live_segments()
+					.get(id)
+					.map_or_else(Vec::new, |segments| segments.as_ref().clone()),
+			})
+			.collect(),
+		live_bindings: root
+			.live_catalog()
+			.bindings
+			.values()
+			.map(|entry| {
+				let diagnostic = match &entry.diagnostic {
+					None => None,
+					Some(error) => match error.status().status() {
+						crate::gql_status::Status::LiveEvaluationFault {
+							identity,
+							origin_code,
+							reason,
+						} if identity == &entry.id.to_string() => {
+							Some((origin_code.as_str().into(), reason.as_str().into()))
+						}
+						_ => {
+							return Err(FerrosGrynnError::invalid_storage_file(
+								"LIVE binding has a noncanonical fault diagnostic",
+							));
+						}
+					},
+				};
+				Ok(LiveBindingCatalogEntry {
+					id: entry.id,
+					version: entry.version,
+					state: entry.state,
+					defined_at: entry.defined_at,
+					published_at: entry.published_at,
+					value_at: entry.value_at,
+					options: entry.options.clone(),
+					expression: entry.expression.clone(),
+					parameters: entry.parameters.clone(),
+					value: entry.value.clone(),
+					descriptor: entry.descriptor.clone(),
+					value_descriptor: entry.value_descriptor.clone(),
+					dependencies: entry.dependencies.clone(),
+					functions: entry.functions.clone(),
+					record_sources: entry.record_sources.clone(),
+					diagnostic,
+				})
+			})
+			.collect::<FerrosGrynnResult<Vec<_>>>()?,
+		live_queries: root
+			.live_catalog()
+			.queries
+			.values()
+			.map(|entry| {
+				Ok(LiveCatalogEntry {
+					id: entry.id,
+					version: entry.version,
+					state: entry.state,
+					defined_at: entry.defined_at,
+					published_at: entry.published_at,
+					acknowledged: entry.acknowledged,
+					starting_after: entry.starting_after,
+					options: entry.options.clone(),
+					query: entry.query.clone(),
+					descriptor: entry.descriptor.clone(),
+					source_class: entry.source_class,
+					capture_source: entry.capture_source,
+					capture_scope_name: entry.capture_scope_name.clone(),
+					rhs_scope_anchors: entry.rhs_scope_anchors.clone(),
+					functions: entry.functions.clone(),
+					record_sources: entry.record_sources.clone(),
+					diagnostic: match &entry.diagnostic {
+						None => None,
+						Some(error) => match error.status().status() {
+							crate::gql_status::Status::LiveEvaluationFault {
+								identity,
+								origin_code,
+								reason,
+							} if identity == &entry.id.to_string() => {
+								Some((origin_code.as_str().into(), reason.as_str().into()))
+							}
+							_ => {
+								return Err(invalid(
+									"LIVE query diagnostic is not a restorable fault",
+								));
+							}
+						},
+					},
+				})
+			})
+			.collect::<FerrosGrynnResult<_>>()?,
 		changefeeds: root
 			.changefeeds()
 			.definitions
@@ -297,6 +483,86 @@ pub(super) fn encode_database_catalog(
 		functions,
 		analyzers,
 	})
+}
+
+/// Restores retained capture descriptors independently of surviving owners.
+pub(super) fn decode_live(catalog: &DatabaseCatalog) -> crate::datastore::LiveCatalog {
+	crate::datastore::LiveCatalog {
+		prepared: Arc::default(),
+		prepared_encoded: Arc::default(),
+		histories: catalog
+			.live_history
+			.iter()
+			.map(|entry| (entry.id, Arc::new(entry.metadata.clone())))
+			.collect(),
+		bindings: catalog
+			.live_bindings
+			.iter()
+			.map(|entry| {
+				(
+					entry.id,
+					Arc::new(crate::datastore::LiveBindingDefinition {
+						id: entry.id,
+						version: entry.version,
+						state: entry.state,
+						defined_at: entry.defined_at,
+						published_at: entry.published_at,
+						value_at: entry.value_at,
+						options: entry.options.clone(),
+						expression: entry.expression.clone(),
+						parameters: entry.parameters.clone(),
+						value: entry.value.clone(),
+						descriptor: entry.descriptor.clone(),
+						value_descriptor: entry.value_descriptor.clone(),
+						dependencies: entry.dependencies.clone(),
+						functions: entry.functions.clone(),
+						record_sources: entry.record_sources.clone(),
+						diagnostic: entry.diagnostic.as_ref().map(|(code, reason)| {
+							FerrosGrynnError::live_evaluation_fault(
+								entry.id.to_string(),
+								code.as_str(),
+								reason.as_str(),
+							)
+						}),
+					}),
+				)
+			})
+			.collect(),
+		queries: catalog
+			.live_queries
+			.iter()
+			.map(|entry| {
+				(
+					entry.id,
+					Arc::new(crate::datastore::LiveDefinition {
+						id: entry.id,
+						version: entry.version,
+						state: entry.state,
+						defined_at: entry.defined_at,
+						published_at: entry.published_at,
+						acknowledged: entry.acknowledged,
+						starting_after: entry.starting_after,
+						options: entry.options.clone(),
+						query: entry.query.clone(),
+						descriptor: entry.descriptor.clone(),
+						source_class: entry.source_class,
+						capture_source: entry.capture_source,
+						capture_scope_name: entry.capture_scope_name.clone(),
+						rhs_scope_anchors: entry.rhs_scope_anchors.clone(),
+						functions: entry.functions.clone(),
+						record_sources: entry.record_sources.clone(),
+						diagnostic: entry.diagnostic.as_ref().map(|(code, reason)| {
+							FerrosGrynnError::live_evaluation_fault(
+								entry.id.to_string(),
+								code.as_str(),
+								reason.as_str(),
+							)
+						}),
+					}),
+				)
+			})
+			.collect(),
+	}
 }
 
 /// Restores retained capture descriptors independently of surviving owners.
@@ -339,6 +605,20 @@ pub(super) fn decode_changefeed_segments(
 	Arc::new(
 		catalog
 			.changefeeds
+			.iter()
+			.filter(|entry| !entry.segments.is_empty())
+			.map(|entry| (entry.id, Arc::new(entry.segments.clone())))
+			.collect(),
+	)
+}
+
+/// Shares private computed-history ceilings without decoding historical values.
+pub(super) fn decode_live_segments(
+	catalog: &DatabaseCatalog,
+) -> crate::storage::LiveHistorySegments {
+	Arc::new(
+		catalog
+			.live_history
 			.iter()
 			.filter(|entry| !entry.segments.is_empty())
 			.map(|entry| (entry.id, Arc::new(entry.segments.clone())))

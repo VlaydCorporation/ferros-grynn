@@ -196,6 +196,16 @@ pub(in crate::storage) struct ResolvedFrame {
 	pub(in crate::storage::wal) version: FrameVersion,
 }
 
+/// Bounded physical frame reader retaining one segment until scope exit.
+pub(in crate::storage) struct FrameReadScope<'wal> {
+	/// WAL directory and shared pruning boundary.
+	pub(in crate::storage::wal) wal: &'wal FrameWal,
+	/// Drops before the guard so segment pruning never races a retained file.
+	pub(in crate::storage::wal) segment: Option<(Lsn, File)>,
+	/// Prevents prefix removal throughout physical reads and home backfill.
+	pub(in crate::storage::wal) _prune_gate: RwLockReadGuard<'wal, ()>,
+}
+
 /// Snapshot-visible frame resolutions protected from concurrent pruning.
 pub(in crate::storage) struct VisibleFrames<'wal> {
 	/// WAL used to load the resolved physical locations.

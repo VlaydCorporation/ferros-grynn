@@ -32,7 +32,49 @@
 - `buffer_pool` — прежний Clock-Pro, доступный только тестам и prototype-control;
 - `image_io` — staged/WAL/home resolution через production HybridReadEngine;
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
-- `catalog` — `FGFC v6` physical registry и bounded `FGDC v10` page-chain;
+- `catalog` — `FGFC v6` physical registry и bounded `FGDC v13` page-chain;
+- `history_codec` — общий bounded historical Value codec для changefeed images
+  и canonical LIVE descriptors; dictionaries не обращаются к current primary.
+- `live_descriptor` — versioned logical recipes, FGLD/FGLC validation; executable
+  IR и consumer queues не сериализуются. FGDC v13 хранит definitions/options/ACK.
+  LIVE-query header — 160 bytes; checked capture owner имеет kind/reserved/id и
+  optional successful String scope-name length/payload (UTF-8, cap 128 bytes).
+  Options byte bit0 обозначает nonempty root RHS anchor tail после primary
+  scope-name, перед diagnostic: count/u32 owner/reserved4/GraphId/u32 name length/
+  UTF-8 1..128. Owners sorted distinct positive и относятся к computed JOIN;
+  conversion/capture/decode учитывают retained vector/names до copies. Fault
+  удерживает last-success pairs; generation/reopen не исполняют recipes для них.
+  Static source equality и отсутствие scope-name обязательны. Recovery читает
+  durable owner/name pair без user evaluation; FGLD source tags 5/6/7 держат
+  GraphClassExpr/GraphRecordExpr/GraphExpr в общем bounded recipe codec.
+  Query body содержит GROUP tag после filter: 0=absent, 1=ALL, 2=BY с positive
+  checked u32 count и bounded expression children. Unknown tags, zero BY count,
+  lengths/depth/reserved bytes проверяются до allocation; Q-40 layout inplace.
+  После projection идут ORDER count/keys (Expression/Name, checked flags/reserved),
+  optional LIMIT/START Offset expressions, затем ordered OMIT и FETCH path lists (checked u32 counts,
+  1..64 literal nonempty/NUL-free UTF-8 segments). Empty query FGLD — 67 bytes,
+  минимальная LIVE catalog entry — 227 bytes; canonical decode не читает primary.
+  Final query flags: output в bits 0–1 (3 invalid), ONLY в bit 2, SPLIT tail в bit 3,
+  bit 4 — checked source alias tail после SPLIT, bit 5 — ordered nonempty JOIN
+  tail, bits 6–7 zero. JOIN codec держит positive count, kind/reserved bytes,
+  checked alias/source/optional ON; INNER/LEFT требуют ON, CROSS запрещает ON.
+  Alias — u64 byte
+  length и nonempty/NUL-free UTF-8; shared runtime validation, owned/work admission
+  и canonical decode обязательны. Nonempty SPLIT tail содержит positive checked count u32 и ordered
+  expressions; count/remaining bytes/depth/work/scratch проверяются до allocation.
+  Empty SPLIT сохраняет default encoded bytes/minima. Typed IR не сериализуется.
+- `live_history` — FGLB whole-commit computed results, exact qualified values/Path,
+  binding revisions и typed fault diagnostics; primary records не нужны для replay.
+  `history_codec/pages` владеет общими FCFS/FCFE pages с typed CHANGEFEED/LIVE owner;
+  catalog references двух namespaces не смешиваются. Source reader и retention
+  проверяют owner до trusted bounds и optional corruption/GAP conversion.
+  Consumer restoration ограничивает whole control 64 KiB до continuation
+  allocation и во время owned diagnostic decode, сохраняя общий page budget.
+  Generic wire codec не является разрешением на oversized queue control.
+  Composite identity tag3 использует flat checked parts count>=2: Record0,
+  Occurrence1, Unmatched2, SPLIT u64 LE3. Primary source обязателен, source slots
+  перед positions; shared runtime shape authority проверяется до writer bytes.
+  Decoder допускает count/work/owned capacity до allocation и не читает primary.
 - `job_catalog` — checksummed metadata-COW `FGJB v1` с `main/.prev` recovery;
 - `quarantine` — immutable streaming `FGQR v1`; файл не является positional page source;
 - `changefeed` — explicit `FCFS`/`FCFE` pages, `FGCB` whole-commit NET/FULL payload,
@@ -68,8 +110,23 @@
 
 ## Инварианты
 
+- Checkpoint backfill использует WAL-owned FrameReadScope с одним last-segment
+  handle. Shared prune guard удерживается через физические чтения/home sync;
+  scope завершается до publish_checkpoint exclusive gate. File закрывается до
+  guard, segment switch сначала закрывает прежний handle. Singleton и scoped
+  reads используют один seek/exact-read/page/LSN validator; target/order,
+  checkpoint thresholds и durable publication не меняются.
 - WAL durable publication предшествует видимости page frames; incomplete tail
   repair не должен маскировать полную corruption.
+- Catalog-only publication сохраняет immutable physical statistics binding:
+  statistics files/layouts не меняются, reads используют текущую snapshot boundary.
+  Это обязательно для deferred root после reopen→LIVE ACK/CLOSE→mutation.
+  Full generation publication сбрасывает прежний statistics binding.
+- У LIVE handoff successful WAL path использует заранее reserved RapidHashMap
+  slots, version Vecs и publication buffer; prune gate берётся перед writer.
+  Backend empty-history handles/COW и retirement metadata допускаются до barrier.
+  LIVE generation cleanup выполняется перед admission либо существующим idle
+  maintenance; pinned paths/markers и сохранённая Vec capacity входят в budget.
 - Checkpoint публикуется атомарно и не удаляет данные, удерживаемые активным
   snapshot.
 - Pinned physical snapshot допускает home page LSN до своего `visible_lsn`:
@@ -97,12 +154,12 @@
   base properties. `NodeHotPage`/`EdgeHotPage` хранят membership occurrence,
   `GlobalAtomId`, label/overlay и topology. Точные offsets задают
   `docs/disk_storage_spec.md` §§10–11.
-- Собираемый target использует только `FGDC v10`/`FGFC v6`, `DataSpaceId::Database` для AtomStore
+- Собираемый target использует только `FGDC v13`/`FGFC v6`, `DataSpaceId::Database` для AtomStore
   и не создаёт системный graph; `GraphId` каждого graph ненулевой. AtomStore и
   graph occurrences публикуются одним WAL transaction и открываются по одной
   snapshot boundary. Missing/unopenable/checksum-corrupt secondary переводится в `Stale` и даёт scan
   fallback, а primary/base corruption остаётся фатальной.
-- `FGDC v10` хранит topology constraint bits, optional rooted-tree `RecordId`,
+- `FGDC v13` хранит topology constraint bits, optional rooted-tree `RecordId`,
   public owner root и dense arena slots. Несколько slots могут указывать на один
   child `GraphId`, но `(scope, child)` уникален, containment cycle запрещён, а
   name map содержит только public graphs. Он также хранит durable parameter/function
@@ -123,7 +180,7 @@
   primary/Unique и `0.80` для Standard. Это writer policy, не новый disk tag.
 - Любая входная длина/счётчик проверяется до allocation; ошибки проходят через
   `gql_status` без раскрытия локальных путей и сырых страниц.
-- Graph-owned definitions хранятся в FGDC v10 отдельно от availability/build revision,
+- Graph-owned definitions хранятся в FGDC v13 отдельно от availability/build revision,
   checked canonical descriptor и полные bytes обязательны наряду с fingerprint. GraphIndex
   durable job имеет target tag 5; graph-wide target и class index target не смешиваются.
 - Ready Reachability/Neighbourhood/LANDMARK_SSSP binding удерживает один immutable файл своей проекции. Независимый
@@ -147,3 +204,8 @@ optional segment corruption даёт GAP, resource/catalog failures остают
 --lib --no-default-features`, `cargo +nightly fmt --check`. Для WAL/page/layout
 добавлять reopen/recovery или golden-vector проверку; для platform I/O —
 соответствующую Windows/Unix конфигурацию.
+
+LIVE FGLD borrowed descriptor view переиспользует owned canonical bytes и validation.
+Optional caller work/cancellation проходит через existing value preflight до copies;
+borrowed RecordId source допускается до owning envelope clone. Canonical framing не
+зависит от EXPLAIN, typed IR не сериализуется и runtime types остаются владельцами API.

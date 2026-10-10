@@ -45,10 +45,16 @@ use crate::{
 pub struct GqlSession {
 	store: Datastore,
 	bindings: Object,
+	/// Owned lexical contracts, independent of the current value
+	/// representation.
+	binding_types: crate::gql::bindings::BindingTypes,
 	transaction: Option<Transaction>,
 	execution_mode: ExecutionMode,
 	cursors: Option<Arc<Mutex<CursorRuntime>>>,
 	closures: Arc<LanguageClosureState>,
+	/// Owned admitted consumers detach when the session or extracted handle
+	/// drops.
+	live_subscriptions: Vec<crate::live::LiveSubscription>,
 }
 
 impl GqlSession {
@@ -60,10 +66,12 @@ impl GqlSession {
 		Self {
 			store,
 			bindings: Object::new(),
+			binding_types: crate::gql::bindings::BindingTypes::default(),
 			transaction: None,
 			execution_mode: ExecutionMode::BestEffort,
 			cursors: Some(Arc::new(Mutex::new(CursorRuntime::new(max_snapshot_age)))),
 			closures: Arc::new(LanguageClosureState::default()),
+			live_subscriptions: Vec::new(),
 		}
 	}
 
@@ -71,16 +79,194 @@ impl GqlSession {
 		Self {
 			store,
 			bindings: Object::new(),
+			binding_types: crate::gql::bindings::BindingTypes::default(),
 			transaction: None,
 			execution_mode: ExecutionMode::BestEffort,
 			cursors: None,
 			closures: Arc::new(LanguageClosureState::default()),
+			live_subscriptions: Vec::new(),
 		}
 	}
 
 	/// Returns whether this session currently owns an explicit transaction.
 	pub const fn has_active_transaction(&self) -> bool {
 		self.transaction.is_some()
+	}
+
+	/// Extracts the owned consumer of a successfully committed LIVE SELECT.
+	/// The handle retains no transaction snapshot and survives this session.
+	///
+	/// # Errors
+	///
+	/// Returns an invalid-argument status for an unknown or already extracted
+	/// ID.
+	pub fn take_live_subscription(
+		&mut self,
+		id: crate::live::LiveId,
+	) -> FerrosGrynnResult<crate::live::LiveSubscription> {
+		let position =
+			self.live_subscriptions.iter().position(|handle| handle.id() == id).ok_or_else(
+				|| FerrosGrynnError::invalid_argument("LIVE consumer is absent from this session"),
+			)?;
+		Ok(self.live_subscriptions.swap_remove(position))
+	}
+
+	/// Polls a retained LIVE consumer without transferring ACK authority.
+	///
+	/// # Errors
+	///
+	/// Returns a missing attachment or the same checked error as
+	/// [`crate::live::LiveSubscription::next`]. Extracted handles must be
+	/// polled and acknowledged through their Rust API instead.
+	pub fn next_live(
+		&mut self,
+		id: crate::live::LiveId,
+	) -> FerrosGrynnResult<crate::live::LiveNext> {
+		let handle =
+			self.live_subscriptions.iter_mut().find(|handle| handle.id() == id).ok_or_else(
+				|| FerrosGrynnError::invalid_argument("LIVE consumer is absent from this session"),
+			)?;
+		handle.next()
+	}
+
+	/// Admits immutable authority before attaching it to a statement runtime.
+	fn attach_live_authority(
+		&self,
+		control: ExecutionControl,
+	) -> FerrosGrynnResult<ExecutionControl> {
+		if self.live_subscriptions.is_empty() {
+			return Ok(control);
+		}
+		let bytes = self
+			.live_subscriptions
+			.len()
+			.checked_mul(std::mem::size_of::<super::GqlLiveAttachment>() * 2)
+			.and_then(|bytes| bytes.checked_add(256))
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("session LIVE authority"))?;
+		let mut account = control.barrier_account();
+		if !account.reserve(bytes) {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"session LIVE authority",
+				control.barrier_memory_limit() as u64,
+			));
+		}
+		let mut attachments = Vec::new();
+		attachments.try_reserve_exact(self.live_subscriptions.len()).map_err(|error| {
+			FerrosGrynnError::traversal_resource_limit_exceeded(
+				"session LIVE authority",
+				bytes as u64,
+			)
+			.with_technical_source(error)
+		})?;
+		for handle in &self.live_subscriptions {
+			attachments.push(handle.inner.gql_attachment());
+		}
+		Ok(control.with_live_attachments(attachments, account))
+	}
+
+	/// Checks current ownership and prepares fixed cursor updates before WAL.
+	fn prepare_live_acks(
+		&self,
+		tx: &Transaction,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<(Vec<super::GqlLiveAck>, Option<crate::gql::BarrierAccount>)> {
+		if tx.gql_live_acks().is_empty() {
+			return Ok((Vec::new(), None));
+		}
+		for ack in tx.gql_live_acks() {
+			control.check()?;
+			if !self
+				.live_subscriptions
+				.iter()
+				.any(|handle| handle.inner.gql_attachment() == ack.attachment)
+			{
+				return Err(FerrosGrynnError::invalid_argument(
+					"GQL ACK attachment was transferred before COMMIT",
+				));
+			}
+		}
+		let bytes = tx
+			.gql_live_acks()
+			.len()
+			.checked_mul(std::mem::size_of::<super::GqlLiveAck>())
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("GQL ACK cursor updates"))?;
+		let mut account = control.barrier_account();
+		if !account.reserve(bytes) {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"GQL ACK cursor updates",
+				control.barrier_memory_limit() as u64,
+			));
+		}
+		Ok((tx.gql_live_acks().to_vec(), Some(account)))
+	}
+
+	/// Publication already confirmed queues; only owned fixed metadata moves.
+	fn publish_live_acks(&mut self, acks: &[super::GqlLiveAck]) {
+		for ack in acks {
+			for handle in &mut self.live_subscriptions {
+				handle.inner.apply_gql_ack(ack);
+			}
+		}
+	}
+
+	/// Pre-admits all surviving GQL registrations and retained handle capacity.
+	fn prepare_live_subscriptions(
+		&mut self,
+		tx: &mut Transaction,
+	) -> FerrosGrynnResult<Vec<crate::live::LiveSubscription>> {
+		let count = tx.gql_live_registrations().len();
+		if count == 0 {
+			return Ok(Vec::new());
+		}
+		let total = self
+			.live_subscriptions
+			.len()
+			.checked_add(count)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("session LIVE handles"))?;
+		if total
+			.checked_mul(std::mem::size_of::<crate::live::LiveSubscription>() * 2)
+			.is_none_or(|bytes| bytes > super::live_queue::SESSION_BYTES)
+		{
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"session LIVE handles",
+				super::live_queue::SESSION_BYTES as u64,
+			));
+		}
+		self.live_subscriptions.try_reserve(count).map_err(|error| {
+			FerrosGrynnError::traversal_resource_limit_exceeded(
+				"session LIVE handles",
+				total as u64,
+			)
+			.with_technical_source(error)
+		})?;
+		let mut pending = Vec::new();
+		pending.try_reserve_exact(count).map_err(|error| {
+			FerrosGrynnError::traversal_resource_limit_exceeded(
+				"pending LIVE handles",
+				count as u64,
+			)
+			.with_technical_source(error)
+		})?;
+		for index in 0..count {
+			let id = tx.gql_live_registrations()[index];
+			if tx.live_info(id)?.state() != crate::live::LiveState::Closed {
+				pending.push(self.store.prepare_live_attachment(tx, id)?);
+			}
+		}
+		Ok(pending)
+	}
+
+	/// Finishes only prepared consumers; vector capacity was reserved before
+	/// WAL.
+	fn publish_live_subscriptions(
+		&mut self,
+		pending: Vec<crate::live::LiveSubscription>,
+	) -> FerrosGrynnResult<()> {
+		for mut subscription in pending {
+			subscription.inner.finish_registration()?;
+			self.live_subscriptions.push(subscription);
+		}
+		Ok(())
 	}
 
 	/// Returns closure-registry memory retained by persistent session values.
@@ -181,16 +367,15 @@ impl GqlSession {
 		}
 		let mut bindings = self.merged_bindings(variables)?;
 		if let [
-			statement @ Statement {
+			Statement {
 				kind: StatementKind::Import(import),
 				..
 			},
 		] = program.statements.as_slice()
 		{
-			let timeout = crate::gql::resolve_timeout(statement.timeout.as_ref(), &bindings)?;
 			let control = ExecutionControl::with_runtime(
 				options,
-				timeout,
+				None,
 				self.cursors.clone(),
 				self.closures.clone(),
 			)
@@ -200,6 +385,7 @@ impl GqlSession {
 				source,
 				import,
 				&bindings,
+				&self.binding_types,
 				&control,
 			)
 			.map(|result| vec![result]);
@@ -216,7 +402,13 @@ impl GqlSession {
 					crate::gql::analyze_transaction_statement(statement)?.ok_or_else(|| {
 						FerrosGrynnError::invalid_argument("Transaction statement has no command.")
 					})?;
-				let result = self.execute_transaction_command(command);
+				let control = ExecutionControl::with_runtime(
+					options,
+					None,
+					self.cursors.clone(),
+					self.closures.clone(),
+				);
+				let result = self.execute_transaction_command(command, &control);
 				let failed = result.is_err();
 				results.push(QueryResult {
 					kind: crate::gql::statement_kind(&statement.kind),
@@ -245,18 +437,10 @@ impl GqlSession {
 				continue;
 			}
 
-			let clause_timeout =
-				match crate::gql::resolve_timeout(statement.timeout.as_ref(), &bindings) {
-					Ok(value) => value,
-					Err(error) => {
-						self.rollback_explicit_transaction();
-						results.push(error_result(statement, started, error));
-						break;
-					}
-				};
-			let control = ExecutionControl::with_runtime(
+			let control = ExecutionControl::with_session_runtime(
 				options,
-				clause_timeout,
+				statement.timeout.is_some(),
+				started,
 				self.cursors.clone(),
 				self.closures.clone(),
 			);
@@ -267,7 +451,18 @@ impl GqlSession {
 					.with_execution_mode(self.execution_mode, &bindings)
 					.with_publication_deferred(self.transaction.is_some())
 			};
+			let mut control = match self.attach_live_authority(control) {
+				Ok(control) => control,
+				Err(error) => {
+					self.rollback_explicit_transaction();
+					results.push(error_result(statement, started, error));
+					break;
+				}
+			};
 			let let_name = match &statement.kind {
+				StatementKind::LiveLet(statement) if statement.name.value.as_ref() != "_" => {
+					Some(statement.name.value.as_ref())
+				}
 				StatementKind::Let(statement) if statement.name.value.as_ref() != "_" => {
 					Some(statement.name.value.as_ref())
 				}
@@ -291,16 +486,17 @@ impl GqlSession {
 					source,
 					&mut bindings,
 					&mutable_bindings,
-					&control,
+					&mut control,
 					started,
 				)
 			} else {
+				control = control.with_inferred_write_access();
 				self.execute_autocommit(
 					statement,
 					source,
 					&mut bindings,
 					&mutable_bindings,
-					&control,
+					&mut control,
 					started,
 				)
 			};
@@ -367,29 +563,7 @@ impl GqlSession {
 			}
 			let failed = result.result.is_err();
 			if !failed {
-				if let Some(transaction) = &mut self.transaction {
-					let mut transaction_bindings = transaction.gql_bindings().clone();
-					for name in &mutable_bindings {
-						if let Some(value) = bindings.get(name).cloned() {
-							transaction_bindings.insert(name.as_ref(), value);
-						}
-					}
-					if let Some(name) = let_name {
-						transaction_bindings
-							.insert(name, bindings.get(name).cloned().unwrap_or(Value::None));
-					}
-					transaction.replace_gql_bindings(transaction_bindings);
-				} else {
-					for name in &mutable_bindings {
-						if let Some(value) = bindings.get(name).cloned() {
-							self.bindings.insert(name.as_ref(), value);
-						}
-					}
-					if let Some(name) = let_name {
-						self.bindings
-							.insert(name, bindings.get(name).cloned().unwrap_or(Value::None));
-					}
-				}
+				self.persist_statement_bindings(&bindings, &mutable_bindings, let_name);
 			} else {
 				self.rollback_explicit_transaction();
 			}
@@ -417,8 +591,39 @@ impl GqlSession {
 		Ok(results)
 	}
 
+	/// Preserves the current lexical scope only after successful statement
+	/// execution.
+	fn persist_statement_bindings(
+		&mut self,
+		bindings: &Object,
+		mutable: &std::collections::BTreeSet<Box<str>>,
+		declared: Option<&str>,
+	) {
+		if let Some(transaction) = &mut self.transaction {
+			let mut retained = transaction.gql_bindings().clone();
+			for name in mutable {
+				if let Some(value) = bindings.get(name).cloned() {
+					retained.insert(name.as_ref(), value);
+				}
+			}
+			if let Some(name) = declared {
+				retained.insert(name, bindings.get(name).cloned().unwrap_or(Value::None));
+			}
+			transaction.replace_gql_bindings(retained);
+		} else {
+			for name in mutable {
+				if let Some(value) = bindings.get(name).cloned() {
+					self.bindings.insert(name.as_ref(), value);
+				}
+			}
+			if let Some(name) = declared {
+				self.bindings.insert(name, bindings.get(name).cloned().unwrap_or(Value::None));
+			}
+		}
+	}
+
 	fn execute_admin_statement(
-		&self,
+		&mut self,
 		statement: &Statement,
 		bindings: &Object,
 		started: Instant,
@@ -448,6 +653,11 @@ impl GqlSession {
 				}
 			}
 			StatementKind::Kill(kill) => {
+				match self.live_kill_target(bindings, &kill.job) {
+					Ok(true) => return None,
+					Err(error) => return Some(error_result(statement, started, error)),
+					Ok(false) => {}
+				}
 				if self.transaction.is_some() {
 					Err(FerrosGrynnError::query_feature_not_supported(
 						"KILL inside an explicit transaction",
@@ -480,6 +690,25 @@ impl GqlSession {
 			result: result.map(Outcome::success),
 			continuation: None,
 		})
+	}
+
+	/// Retained LIVE identities, including private registrations and closed
+	/// incarnations, take the transactional path; jobs retain admin dispatch.
+	fn live_kill_target(
+		&mut self,
+		bindings: &Object,
+		target: &crate::syn::Identifier,
+	) -> FerrosGrynnResult<bool> {
+		let Some(Value::Uuid(uuid)) = bindings.get(target.value.as_ref()) else {
+			return Ok(false);
+		};
+		let Ok(id) = crate::live::LiveId::from_uuid(*uuid) else {
+			return Ok(false);
+		};
+		match self.transaction.as_mut() {
+			Some(tx) => tx.contains_live_query(id),
+			None => Ok(self.store.inner.current_root().live_catalog().queries.contains_key(&id)),
+		}
 	}
 
 	fn execute_maintenance(
@@ -767,6 +996,7 @@ impl GqlSession {
 	fn execute_transaction_command(
 		&mut self,
 		command: TransactionCommand,
+		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
 		match command {
 			TransactionCommand::Begin {
@@ -775,19 +1005,28 @@ impl GqlSession {
 			} => {
 				debug_assert!(self.transaction.is_none());
 				self.transaction = Some(self.store.begin_with(options));
+				if let Some(transaction) = &mut self.transaction {
+					transaction.inherit_gql_binding_types(self.binding_types.clone());
+				}
 				self.execution_mode = execution_mode;
 				Ok(Value::None)
 			}
 			TransactionCommand::Commit {
 				full_validation,
 			} => {
-				let transaction =
+				let mut transaction =
 					self.transaction.take().ok_or_else(FerrosGrynnError::transaction_not_active)?;
+				let (acks, _ack_admission) = self.prepare_live_acks(&transaction, control)?;
+				let pending = self.prepare_live_subscriptions(&mut transaction)?;
 				if full_validation {
-					transaction.commit_with_validation()?;
+					transaction.commit_with_validation_controlled(control.deadline(), &|| {
+						control.check()
+					})?;
 				} else {
-					transaction.commit()?;
+					transaction.commit_controlled(control.deadline(), &|| control.check())?;
 				}
+				self.publish_live_acks(&acks);
+				self.publish_live_subscriptions(pending)?;
 				self.execution_mode = ExecutionMode::BestEffort;
 				Ok(Value::None)
 			}
@@ -805,7 +1044,7 @@ impl GqlSession {
 		source: &str,
 		bindings: &mut Object,
 		mutable_bindings: &std::collections::BTreeSet<Box<str>>,
-		control: &ExecutionControl,
+		control: &mut ExecutionControl,
 		started: Instant,
 	) -> QueryResult {
 		let Some(transaction) = self.transaction.as_mut() else {
@@ -827,12 +1066,12 @@ impl GqlSession {
 	}
 
 	fn execute_autocommit(
-		&self,
+		&mut self,
 		statement: &Statement,
 		source: &str,
 		bindings: &mut Object,
 		mutable_bindings: &std::collections::BTreeSet<Box<str>>,
-		control: &ExecutionControl,
+		control: &mut ExecutionControl,
 		started: Instant,
 	) -> QueryResult {
 		let access = if crate::gql::statement_mutates_state(&statement.kind) {
@@ -844,6 +1083,7 @@ impl GqlSession {
 			crate::datastore::IsolationLevel::Serializable,
 			access,
 		));
+		transaction.inherit_gql_binding_types(self.binding_types.clone());
 		let execution = transaction.run_gql_statement(|transaction| {
 			crate::gql::execute_parsed_statement_with_bindings(
 				transaction,
@@ -859,16 +1099,44 @@ impl GqlSession {
 			Err(error) => return error_result(statement, started, error),
 		};
 		if result.result.is_ok() {
+			let binding_types = match transaction.export_gql_binding_types(control) {
+				Ok(types) => types,
+				Err(error) => {
+					result.result = Err(error);
+					return result;
+				}
+			};
 			match control.attach_pending_index_seek(transaction) {
 				Ok(Some(transaction)) => {
+					let mut transaction = transaction;
+					let (acks, _ack_admission) = match self.prepare_live_acks(&transaction, control)
+					{
+						Ok(acks) => acks,
+						Err(error) => {
+							result.result = Err(error);
+							return result;
+						}
+					};
+					let pending = match self.prepare_live_subscriptions(&mut transaction) {
+						Ok(pending) => pending,
+						Err(error) => {
+							result.result = Err(error);
+							return result;
+						}
+					};
 					let commit_started = matches!(
 						statement.kind,
 						StatementKind::Explain(ref explain)
 							if explain.mode == crate::syn::ExplainMode::Analyze
 					)
 					.then(Instant::now);
-					match transaction.commit() {
+					match transaction.commit_controlled(control.deadline(), &|| control.check()) {
 						Ok(_) => {
+							self.binding_types = binding_types;
+							self.publish_live_acks(&acks);
+							if let Err(error) = self.publish_live_subscriptions(pending) {
+								result.result = Err(error);
+							}
 							if let Some(started) = commit_started {
 								finalize_explain_publication(&mut result, started.elapsed());
 							}

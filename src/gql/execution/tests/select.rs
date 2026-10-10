@@ -174,6 +174,58 @@ fn statement_error(store: &Datastore, source: &str) -> crate::gql_status::Ferros
 	store.execute(source, &Object::new()).unwrap()[0].result.clone().unwrap_err()
 }
 
+/// Special SELECT inputs preserve normal argument order and lazy branches.
+#[test]
+fn select_specials_preserve_argument_errors_and_lazy_branches()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let mut tx = store.begin();
+	tx.define_class(crate::datastore::ClassSchema::new(
+		"person",
+		crate::graph::AtomKind::Node,
+		[],
+	)?)?;
+	tx.define_function(crate::datastore::SchemaFunction::new(
+		"fn",
+		"two",
+		vec![
+			crate::datastore::SchemaFunctionParameter::new("left", crate::values::Type::Any)?,
+			crate::datastore::SchemaFunctionParameter::new("right", crate::values::Type::Any)?,
+		],
+		crate::values::Type::Any,
+		crate::datastore::FunctionEffect::Pure,
+		false,
+		None,
+		"{ RETURN $left; }",
+	)?)?;
+	tx.commit()?;
+	let setup = store.execute("CREATE person:a; CREATE person:b;", &Object::new())?;
+	assert!(setup.iter().all(|result| result.result.is_ok()), "{setup:?}");
+	let expected = statement_error(&store, "SELECT VALUE 1 / 0 FROM person;");
+	let actual = statement_error(
+		&store,
+		"SELECT VALUE fn::two(1 / 0, (SELECT VALUE 1 FROM person)) FROM person;",
+	);
+	assert_eq!(actual.status().status(), expected.status().status());
+	for expression in [
+		"false AND ((SELECT VALUE 1 / 0 FROM person) = 0)",
+		"true OR ((SELECT VALUE 1 / 0 FROM person) = 0)",
+		"true ? 7 : (SELECT VALUE 1 / 0 FROM person)",
+		"CASE WHEN true THEN 7 ELSE (SELECT VALUE 1 / 0 FROM person) END",
+	] {
+		let result = value(&store, &format!("SELECT VALUE {expression} FROM person LIMIT 1;"));
+		let expected = if expression.starts_with("false") {
+			Value::Bool(false)
+		} else if expression.starts_with("true OR") {
+			Value::Bool(true)
+		} else {
+			Value::from(7_i64)
+		};
+		assert_eq!(result, Value::Array(vec![expected].into()), "{expression}");
+	}
+	Ok(())
+}
+
 #[test]
 fn forced_scalar_indexes_and_count_lookup_match_scan_results() {
 	let store = Datastore::in_memory();
@@ -800,54 +852,212 @@ fn persistent_session_replays_exact_ordered_pages() {
 }
 
 #[test]
-fn cancellation_closes_the_supplied_cursor_spool() {
+fn duration_explain_nested_error_retires_cursor() -> crate::gql_status::FerrosGrynnResult<()> {
+	for prefix in ["", "EXPLAIN ", "EXPLAIN FULL ", "EXPLAIN ANALYZE "] {
+		for (duration, timeout) in
+			[("0ms", "$deadline"), ("-PT1S", "$deadline"), ("0ms", "18446744073709549568s")]
+		{
+			let store = Datastore::in_memory();
+			let mut session = store.session();
+			let inputs = Object::from_iter([(
+				"duration",
+				Value::from(duration.parse::<crate::values::Duration>()?),
+			)]);
+			for result in session.execute(
+				"DEFINE CLASS person TYPE NODE SCHEMALESS; CREATE person:a SET rank = 1; CREATE \
+				 person:b SET rank = 2; LIVE LET $deadline = $duration;",
+				&inputs,
+			)? {
+				result.result?;
+			}
+			let first = session.execute(
+				"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;",
+				&Object::new(),
+			)?;
+			let cursor = first[0].continuation.ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::invalid_argument("test continuation missing")
+			})?;
+			let inputs = Object::from_iter([("cursor", Value::from(cursor))]);
+			let failed = session.execute(
+				&format!(
+					"IF true {{ {prefix}SELECT VALUE properties.rank FROM person ORDER BY \
+					 properties.rank LIMIT 1 START AFTER $cursor TIMEOUT {timeout}; }};"
+				),
+				&inputs,
+			)?;
+			assert!(failed[0].result.is_err());
+			let resumed = session.execute(
+				"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1 START \
+				 AFTER $cursor;",
+				&inputs,
+			)?;
+			let error = resumed[0].result.as_ref().err().ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(format!(
+					"failed block retained its supplied cursor: {prefix}/{duration}/{timeout}"
+				))
+			})?;
+			assert_eq!(error.status().code().to_string(), "FG-22F20");
+		}
+	}
+	Ok(())
+}
+
+#[test]
+fn duration_explain_invocation_cancellation_retires_cursor()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	use std::{collections::BTreeSet, sync::Arc, time::Duration};
+
+	use super::super::{ControlRuntime, TransactionRead, execute_statement, initialize_slots};
+	use crate::gql::{
+		ExecutionControl,
+		analysis::analyze,
+		closure::LanguageClosureState,
+		cursor::CursorRuntime,
+	};
 	let store = Datastore::in_memory();
-	store
-		.execute(
-			"DEFINE CLASS person TYPE NODE SCHEMALESS; CREATE person:a SET rank = 1; CREATE \
-			 person:b SET rank = 2;",
-			&Object::new(),
-		)
-		.unwrap();
-	let mut session = store.session();
-	let first = session
-		.execute(
-			"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;",
-			&Object::new(),
-		)
-		.unwrap()
-		.remove(0);
-	let cursor = first.continuation.unwrap();
-	let mut variables = Object::new();
-	variables.insert("cursor", Value::from(cursor));
+	for result in store.execute(
+		"DEFINE CLASS person TYPE NODE SCHEMALESS; CREATE person:a SET rank = 1; CREATE person:b \
+		 SET rank = 2;",
+		&Object::new(),
+	)? {
+		result.result?;
+	}
+	let cursors = Arc::new(parking_lot::Mutex::new(CursorRuntime::new(Duration::from_secs(60))));
+	let closures = Arc::new(LanguageClosureState::default());
+	let mut healthy = ExecutionControl::with_runtime(
+		&QueryExecutionOptions::default(),
+		None,
+		Some(cursors.clone()),
+		closures.clone(),
+	);
+	let mut transaction = store.begin();
+	let mut bindings = Object::new();
+	let first_source = "SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;";
+	let first_program = crate::gql::parse(first_source, crate::syn::ParserSettings::default())?;
+	let first = super::super::execute_parsed_statement_with_bindings(
+		&mut transaction,
+		first_source,
+		&first_program.statements[0],
+		&mut bindings,
+		&BTreeSet::new(),
+		&mut healthy,
+	)?;
+	first.result?;
+	let cursor = first.continuation.ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::invalid_argument("test continuation missing")
+	})?;
+	let mut bindings = Object::from_iter([("cursor", Value::from(cursor))]);
+	let source = "EXPLAIN SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT \
+	              1 START AFTER $cursor;";
+	let program = crate::gql::parse(source, crate::syn::ParserSettings::default())?;
+	let snapshot = transaction.query_snapshot()?;
+	let mut read = TransactionRead {
+		transaction: &mut transaction,
+		snapshot,
+		metadata_only: false,
+	};
+	let logical = analyze(&program, source, &read, &bindings)?;
+	let mut slots = initialize_slots(&logical, &bindings);
 	let cancellation = QueryCancellation::default();
 	cancellation.cancel();
-	let cancelled = session
-		.execute_with_options(
-			"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1 START \
-			 AFTER $cursor;",
-			&variables,
-			QueryExecutionOptions {
-				cancellation: Some(cancellation),
-				..QueryExecutionOptions::default()
-			},
+	let options = QueryExecutionOptions {
+		cancellation: Some(cancellation),
+		..QueryExecutionOptions::default()
+	};
+	let cancelled = ExecutionControl::with_runtime(&options, None, Some(cursors), closures);
+	let result = execute_statement(
+		&mut read,
+		&logical.statements[0],
+		&mut slots,
+		&mut bindings,
+		source,
+		&cancelled,
+		&mut ControlRuntime::default(),
+		1,
+		false,
+	);
+	assert!(result.is_err());
+	drop(read);
+	let source = "SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1 START \
+	              AFTER $cursor;";
+	let program = crate::gql::parse(source, crate::syn::ParserSettings::default())?;
+	let resumed = super::super::execute_parsed_statement_with_bindings(
+		&mut transaction,
+		source,
+		&program.statements[0],
+		&mut bindings,
+		&BTreeSet::new(),
+		&mut healthy,
+	)?;
+	let error = resumed.result.err().ok_or_else(|| {
+		crate::gql_status::FerrosGrynnError::invalid_argument(
+			"cancelled invocation retained its cursor",
 		)
-		.unwrap()
-		.remove(0)
-		.result
-		.unwrap_err();
-	assert_eq!(cancelled.status().code().to_string(), "FG-50F05");
-	let closed = session
-		.execute(
-			"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1 START \
-			 AFTER $cursor;",
-			&variables,
-		)
-		.unwrap()
-		.remove(0)
-		.result
-		.unwrap_err();
-	assert_eq!(closed.status().code().to_string(), "FG-22F20");
+	})?;
+	assert_eq!(error.status().code().to_string(), "FG-22F20");
+	Ok(())
+}
+
+#[test]
+fn cancellation_closes_the_supplied_cursor_spool() -> crate::gql_status::FerrosGrynnResult<()> {
+	for prefix in ["", "EXPLAIN ", "EXPLAIN FULL ", "EXPLAIN ANALYZE "] {
+		for timeout in ["", " TIMEOUT 1s", " TIMEOUT $deadline"] {
+			let store = Datastore::in_memory();
+			store
+				.execute(
+					"DEFINE CLASS person TYPE NODE SCHEMALESS; CREATE person:a SET rank = 1; \
+					 CREATE person:b SET rank = 2;",
+					&Object::new(),
+				)
+				.unwrap();
+			let mut session = store.session();
+			let duration = "1s".parse::<crate::values::Duration>()?;
+			let inputs = Object::from_iter([("duration", Value::from(duration))]);
+			let binding = session.execute("LIVE LET $deadline = $duration;", &inputs)?;
+			binding[0].result.as_ref().map_err(Clone::clone)?;
+			let first = session
+				.execute(
+					"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1;",
+					&Object::new(),
+				)
+				.unwrap()
+				.remove(0);
+			let cursor = first.continuation.unwrap();
+			let mut variables = Object::new();
+			variables.insert("cursor", Value::from(cursor));
+			let cancellation = QueryCancellation::default();
+			cancellation.cancel();
+			let cancelled = session
+				.execute_with_options(
+					&format!(
+						"{prefix}SELECT VALUE properties.rank FROM person ORDER BY \
+						 properties.rank LIMIT 1 START AFTER $cursor{timeout};"
+					),
+					&variables,
+					QueryExecutionOptions {
+						cancellation: Some(cancellation),
+						..QueryExecutionOptions::default()
+					},
+				)
+				.unwrap()
+				.remove(0)
+				.result
+				.unwrap_err();
+			assert_eq!(cancelled.status().code().to_string(), "FG-50F05");
+			let closed = session
+				.execute(
+					"SELECT VALUE properties.rank FROM person ORDER BY properties.rank LIMIT 1 \
+					 START AFTER $cursor;",
+					&variables,
+				)
+				.unwrap()
+				.remove(0)
+				.result
+				.unwrap_err();
+			assert_eq!(closed.status().code().to_string(), "FG-22F20");
+		}
+	}
+	Ok(())
 }
 
 #[test]

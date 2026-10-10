@@ -153,8 +153,25 @@ pub(super) fn plan_source(
 		},
 		LogicalSelectSourceKind::Graphs {
 			..
+		}
+		| LogicalSelectSourceKind::Empty {
+			..
 		} => (SourceOperator::GraphCatalogScan, false),
 		LogicalSelectSourceKind::Derived(_) => (SourceOperator::Derived, false),
+		LogicalSelectSourceKind::AtomUnion {
+			targets,
+			graph,
+			..
+		} => (
+			SourceOperator::AtomUnion {
+				classes: targets.iter().map(|target| target.class().into()).collect(),
+				graph: graph.as_ref().and_then(|graph| match graph {
+					LogicalGraphReference::Static(graph) => Some(graph.id()),
+					LogicalGraphReference::Expression(_) => None,
+				}),
+			},
+			false,
+		),
 	};
 	let mut cardinality = baseline;
 	let mut cost = if random {
@@ -566,6 +583,9 @@ fn order_source_column(logical: &LogicalSelect, expression: &TypedExpr) -> Optio
 	let mut output = 0_usize;
 	for item in &logical.projection {
 		match item {
+			LogicalSelectItem::WildcardVariants {
+				..
+			} => return None,
 			LogicalSelectItem::Wildcard(fields) => {
 				for field in fields {
 					if output == target {
@@ -685,6 +705,9 @@ pub(super) fn source_cardinality(
 	snapshot: &PlannerSnapshot,
 ) -> FerrosGrynnResult<Cardinality> {
 	Ok(match &source.kind {
+		LogicalSelectSourceKind::Empty {
+			..
+		} => Cardinality::exact(0),
 		LogicalSelectSourceKind::Atoms {
 			target: ScanTarget::Record(_),
 			..
@@ -712,6 +735,39 @@ pub(super) fn source_cardinality(
 			u64::try_from(references.as_ref().map_or(snapshot.graphs.len(), Vec::len))
 				.unwrap_or(u64::MAX),
 		),
+		LogicalSelectSourceKind::AtomUnion {
+			targets,
+			graph,
+			..
+		} => {
+			let mut sum = Cardinality::exact(0);
+			for target in targets {
+				let metadata = snapshot.class(target.class()).ok_or_else(|| {
+					FerrosGrynnError::class_does_not_exist(target.class().to_owned())
+				})?;
+				let rows = match graph {
+					None => Cardinality::exact(metadata.base_rows),
+					Some(LogicalGraphReference::Static(graph)) => Cardinality::exact(
+						metadata.graph_rows.get(&graph.id()).copied().unwrap_or(0),
+					),
+					Some(LogicalGraphReference::Expression(_)) => {
+						Cardinality::unknown(metadata.base_rows)
+					}
+				};
+				sum = Cardinality::new(
+					sum.lower.checked_add(rows.lower).ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("atom union cardinality")
+					})?,
+					sum.expected.checked_add(rows.expected).ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("atom union cardinality")
+					})?,
+					sum.upper.checked_add(rows.upper).ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("atom union cardinality")
+					})?,
+				);
+			}
+			sum
+		}
 		LogicalSelectSourceKind::Derived(select) => {
 			plan_select(select, snapshot, usize::MAX)?.cardinality
 		}
@@ -727,7 +783,13 @@ fn source_class(source: &LogicalSelectSource) -> Option<&str> {
 		LogicalSelectSourceKind::Graphs {
 			..
 		}
+		| LogicalSelectSourceKind::Empty {
+			..
+		}
 		| LogicalSelectSourceKind::Derived(_) => None,
+		LogicalSelectSourceKind::AtomUnion {
+			..
+		} => None,
 	}
 }
 
@@ -750,7 +812,13 @@ fn source_scope(source: &LogicalSelectSource) -> Option<IndexScope> {
 		| LogicalSelectSourceKind::Graphs {
 			..
 		}
+		| LogicalSelectSourceKind::Empty {
+			..
+		}
 		| LogicalSelectSourceKind::Derived(_) => None,
+		LogicalSelectSourceKind::AtomUnion {
+			..
+		} => None,
 	}
 }
 

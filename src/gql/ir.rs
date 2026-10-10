@@ -14,11 +14,31 @@ use crate::{
 		SchemaVersion,
 		VectorDistance,
 	},
-	gql_status::TextSpan,
+	gql_status::{FerrosGrynnError, FerrosGrynnResult, TextSpan},
 	graph::GraphTopologyConstraints,
 	syn::{DefinitionMode, MatchDirection},
 	values::{DateTime, GraphKind, GraphRef, RecordId, Text, Type, Value},
 };
+
+/// Hard ceiling shared by MATCH analysis and invocation-time validation.
+pub(super) const MAX_MATCH_PATH_DEPTH: u32 = 30;
+
+/// Validates an exact, non-negative MATCH clause depth before row pull.
+pub(super) fn validate_match_max_depth(value: &Value) -> FerrosGrynnResult<u32> {
+	let depth = value
+		.as_number()
+		.and_then(|number| i64::try_from(number).ok())
+		.and_then(|number| u32::try_from(number).ok())
+		.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("MATCH MAXDEPTH must be a non-negative integer.")
+		})?;
+	if depth > MAX_MATCH_PATH_DEPTH {
+		return Err(FerrosGrynnError::invalid_argument(format!(
+			"MATCH MAXDEPTH cannot exceed {MAX_MATCH_PATH_DEPTH}."
+		)));
+	}
+	Ok(depth)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct NodeId(pub(super) u32);
@@ -32,6 +52,16 @@ pub(super) struct LogicalProgram {
 
 #[derive(Debug, Clone)]
 pub(super) enum LogicalStatement {
+	/// Replaces a mutable lexical value while preserving frozen LIVE captures.
+	SetBinding {
+		/// Checked nearest lexical slot.
+		slot: u32,
+		/// Runtime contract retained even when the replacement has dynamic
+		/// type.
+		expected: Type,
+		/// Typed replacement retaining the binding's value type.
+		value: TypedExpr,
+	},
 	Explain(LogicalExplain),
 	Schema(LogicalSchemaStatement),
 	Dml(LogicalDmlStatement),
@@ -39,6 +69,8 @@ pub(super) enum LogicalStatement {
 	Let {
 		name: Box<str>,
 		slot: u32,
+		/// Declared type, or the inferred initializer type when unannotated.
+		expected: Type,
 		value: LogicalLetValue,
 	},
 	Return {
@@ -70,7 +102,7 @@ pub(super) enum LogicalStatement {
 	Throw {
 		value: TypedExpr,
 	},
-	Sleep(Duration),
+	Sleep(LogicalDuration),
 	AssertInvariants {
 		graph: Option<GraphRef>,
 		report: usize,
@@ -87,6 +119,65 @@ pub(super) enum LogicalStatement {
 pub(super) enum LogicalLetValue {
 	Expression(TypedExpr),
 	BuildGraph(LogicalBuildGraph),
+	/// Checked catalog command used only by LET ... = LIVE SELECT.
+	Live(Box<LogicalSchemaStatement>),
+}
+
+/// Analyzed logical recipe with captures resolved at execution, never during
+/// analysis of an enclosing block.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalLiveSelect {
+	/// Conservative retained recipe allowance admitted before runtime clone.
+	pub(super) retained_bytes: usize,
+	/// Owned recipe; no executable typed plan is serialized in its descriptor.
+	pub(super) query: crate::live::LiveQuery,
+	/// Ordinary graph parameters belong to their logical source declaration.
+	/// Reactive scopes retain their expression in the owned query recipe.
+	pub(super) frozen_graphs: Vec<LogicalLiveSourceCapture>,
+	/// Lexical names and exact frame slots read at registration.
+	pub(super) captures: Vec<LogicalLiveCapture>,
+	/// Runtime exclusive stamp or inclusive timestamp.
+	pub(super) since: Option<TypedExpr>,
+	/// Runtime checked event ceiling.
+	pub(super) buffer: Option<TypedExpr>,
+	/// Explicit validated queue behavior.
+	pub(super) overflow: crate::live::LiveOverflowPolicy,
+	/// Analyzer-owned registration-only operands; executable IR is never
+	/// serialized.
+	pub(super) operand_spelling: Box<str>,
+	/// Actual lexical reads made by registration-only expressions.
+	pub(super) operand_slots: Vec<LogicalLiveCapture>,
+}
+
+/// One registration-only scope keeps its source owner independently of aliases.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalLiveSourceCapture {
+	/// Declaration ordinal: zero is FROM; positive ordinals are JOIN sources.
+	pub(super) source: u32,
+	/// Ordinary scope expression evaluated once at registration.
+	pub(super) graph: TypedExpr,
+}
+
+/// One lexical capture retains provenance independently of its UUID value.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalLiveCapture {
+	/// Recoverable parameter spelling within the logical recipe.
+	pub(super) name: Box<str>,
+	/// Exact frame position chosen by lexical resolution.
+	pub(super) slot: u32,
+	/// Tracks a reactive identity rather than freezing an ordinary value.
+	pub(super) reactive: bool,
+}
+
+/// Checked expression recipe and its registration-time lexical captures.
+#[derive(Debug, Clone)]
+pub(super) struct LogicalLiveBinding {
+	/// Admission for the recipe before its owned runtime copy.
+	pub(super) retained_bytes: usize,
+	/// Recoverable expression evaluated by the common pipeline.
+	pub(super) expression: crate::live::LiveExpr,
+	/// Frozen values and independent reactive identities.
+	pub(super) captures: Vec<LogicalLiveCapture>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +195,16 @@ pub(super) struct LogicalBlock {
 #[derive(Debug, Clone)]
 pub(super) struct LogicalBlockStatement {
 	pub(super) statement: LogicalStatement,
-	pub(super) timeout: Option<Duration>,
+	pub(super) timeout: Option<LogicalDuration>,
+}
+
+/// A duration literal is fixed; a parameter retains its lexical provenance.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalDuration {
+	/// Literal duration validated by the existing fixed-duration parser.
+	Fixed(Duration),
+	/// Checked Slot/LiveSlot with invocation-time value and source location.
+	Parameter(TypedExpr),
 }
 
 /// One analyzed graph-membership or graph-incidence mutation.
@@ -264,6 +364,47 @@ pub(super) enum LogicalExpect {
 /// Typed core schema command executed by the datastore adapter.
 #[derive(Debug, Clone)]
 pub(super) enum LogicalSchemaStatement {
+	/// Defines a reactive identity through the ordinary transaction API.
+	DefineLiveBinding(Box<LogicalLiveBinding>),
+	/// Replaces a recipe without changing the identity seen by dependents.
+	ReplaceLiveBinding {
+		/// Raw lexical identity selected independently of value resolution.
+		id: TypedExpr,
+		/// Recoverable replacement and current capture positions.
+		plan: Box<LogicalLiveBinding>,
+	},
+	/// Reads retained binding metadata and its exact latest value.
+	InfoLiveBinding {
+		/// Raw lexical identity of the retained definition.
+		id: TypedExpr,
+	},
+	/// Removes a binding after the common dependency check.
+	RemoveLiveBinding {
+		/// Raw lexical identity checked against active dependents.
+		id: TypedExpr,
+	},
+	/// Registers a logical LIVE incarnation through the ordinary transaction.
+	RegisterLive(Box<LogicalLiveSelect>),
+	/// Reads one incarnation through the same snapshot metadata API as Rust.
+	InfoLive {
+		/// Typed UUID operand, independent of the lexical variable spelling.
+		id: TypedExpr,
+	},
+	/// Stops capture transactionally, without discarding retained history.
+	CloseLive {
+		/// Typed UUID operand, resolved before staging the close.
+		id: TypedExpr,
+	},
+	/// Confirms only a token issued by a retained session consumer.
+	AckLive {
+		/// Typed UUID identity operand.
+		id: TypedExpr,
+		/// Typed fixed Bytes cursor operand.
+		cursor: TypedExpr,
+		/// Definition-owned operand text for deferred, side-effect-free
+		/// planning.
+		spelling: Box<str>,
+	},
 	DefineGraph {
 		mode: DefinitionMode,
 		name: Box<str>,
@@ -498,6 +639,15 @@ impl LogicalSchemaStatement {
 
 	pub(super) const fn statement_kind(&self) -> crate::gql::QueryStatementKind {
 		match self {
+			Self::RegisterLive(_) | Self::DefineLiveBinding(_) => {
+				crate::gql::QueryStatementKind::Live
+			}
+			Self::AckLive {
+				..
+			} => crate::gql::QueryStatementKind::Ack,
+			Self::CloseLive {
+				..
+			} => crate::gql::QueryStatementKind::Kill,
 			Self::DefineGraph {
 				..
 			}
@@ -525,7 +675,10 @@ impl LogicalSchemaStatement {
 			Self::UpdateGraph {
 				..
 			} => crate::gql::QueryStatementKind::Update,
-			Self::RemoveGraph {
+			Self::RemoveLiveBinding {
+				..
+			}
+			| Self::RemoveGraph {
 				..
 			}
 			| Self::RemoveClass {
@@ -549,7 +702,10 @@ impl LogicalSchemaStatement {
 			| Self::RemoveAnalyzer {
 				..
 			} => crate::gql::QueryStatementKind::Remove,
-			Self::AlterClassMode {
+			Self::ReplaceLiveBinding {
+				..
+			}
+			| Self::AlterClassMode {
 				..
 			}
 			| Self::AlterChangefeed {
@@ -574,6 +730,12 @@ impl LogicalSchemaStatement {
 				..
 			} => crate::gql::QueryStatementKind::ShowChanges,
 			Self::InfoChangefeed {
+				..
+			}
+			| Self::InfoLive {
+				..
+			}
+			| Self::InfoLiveBinding {
 				..
 			}
 			| Self::InfoDatabase
@@ -640,10 +802,12 @@ pub(super) struct LogicalBuildGraph {
 }
 
 #[derive(Debug, Clone)]
-/// An analyzed MATCH statement tied to one catalog graph.
+/// An analyzed MATCH statement with a snapshot-bound catalog graph.
 pub(super) struct LogicalMatch {
-	/// Resolved graph reference captured during analysis.
-	pub(super) graph: GraphRef,
+	/// Static identity or lexical GraphRef operand resolved before planning.
+	pub(super) graph: LogicalGraphReference,
+	/// Invocation deadline retained for MATCH embedded in another statement.
+	pub(super) timeout: Option<LogicalDuration>,
 	/// Whether an unmatched input row survives with new aliases set to none.
 	pub(super) optional: bool,
 	/// Whether complete binding tuples are deduplicated before projection.
@@ -668,8 +832,11 @@ pub(super) struct LogicalMatch {
 	pub(super) projection_distinct: bool,
 	/// Ordering applied after projection.
 	pub(super) order: Vec<LogicalOrder>,
-	/// Effective maximum for open path ranges.
+	/// Fixed clause maximum, or the checked upper bound for a deferred operand.
 	pub(super) max_depth: u32,
+	/// Lexical operand resolved against the invocation snapshot before
+	/// planning.
+	pub(super) max_depth_binding: Option<TypedExpr>,
 	/// Public result-column schema.
 	pub(super) result: Schema,
 }
@@ -769,6 +936,8 @@ pub(super) struct PathExpand {
 	pub(super) min: u32,
 	/// Inclusive maximum hop count.
 	pub(super) max: u32,
+	/// Whether an open range inherits the invocation's clause maximum.
+	pub(super) inherits_max_depth: bool,
 	/// Per-path uniqueness mode after local/global override.
 	pub(super) mode: crate::syn::MatchPathMode,
 	/// Optional shortest-path objective after local/global override.
@@ -779,6 +948,17 @@ pub(super) struct PathExpand {
 	pub(super) filters: Vec<crate::syn::MatchPathFilter>,
 	/// Optional column receiving the public path value.
 	pub(super) path_column: Option<usize>,
+}
+
+impl PathExpand {
+	/// Resolves only open ranges; explicit segment bounds remain independent.
+	pub(super) const fn maximum(&self, clause_depth: u32) -> u32 {
+		if self.inherits_max_depth {
+			clause_depth
+		} else {
+			self.max
+		}
+	}
 }
 
 /// One versioned path contribution; stateful functions receive the current
@@ -841,6 +1021,12 @@ pub(super) enum LogicalMatchSelector {
 
 #[derive(Debug, Clone)]
 pub(super) struct LogicalSelect {
+	/// Independent SDK source plans share ordinary SELECT evaluation.
+	pub(super) union_inputs: Vec<Self>,
+	/// A private typing family becomes one JOIN input before relational work.
+	pub(super) union_purpose: crate::syn::SelectUnionPurpose,
+	/// Logical lexical origin proves identical independent subqueries.
+	pub(super) lexical_id: Option<u32>,
 	pub(super) source: LogicalSelectSource,
 	pub(super) joins: Vec<LogicalSelectJoin>,
 	pub(super) access: LogicalSelectAccess,
@@ -849,6 +1035,9 @@ pub(super) struct LogicalSelect {
 	pub(super) split: Vec<TypedExpr>,
 	pub(super) group: Option<Vec<TypedExpr>>,
 	pub(super) projection: Vec<LogicalSelectItem>,
+	/// Optional SDK output paths, parallel to projection; empty for ordinary
+	/// aliases.
+	pub(super) projection_paths: Vec<Option<Vec<Box<str>>>>,
 	pub(super) result: Schema,
 	pub(super) omit: Vec<Vec<Box<str>>>,
 	pub(super) fetch: Vec<Vec<Box<str>>>,
@@ -1088,14 +1277,74 @@ pub(super) struct LogicalSelectSource {
 
 #[derive(Debug, Clone)]
 pub(super) enum LogicalSelectSourceKind {
+	/// A zero-row SDK relation still validates its optional graph scope.
+	Empty {
+		/// Graph source identity is checked even when there are no classes.
+		graph: Option<LogicalGraphReference>,
+	},
 	Atoms {
 		target: ScanTarget,
 		graph: Option<LogicalGraphReference>,
+	},
+	/// One qualified raw relation retains class-local cells and a hidden tag.
+	AtomUnion {
+		/// Canonical distinct class scans; point sources retain ordinary Atoms.
+		targets: Vec<ScanTarget>,
+		/// One once-resolved scope shared by all inputs.
+		graph: Option<LogicalGraphReference>,
+		/// Last cell of the padded source layout, excluded from names/output.
+		tag_column: usize,
+		/// Analyzer-only state; None types an unmatched LEFT slot.
+		typing: Option<usize>,
 	},
 	Graphs {
 		references: Option<Vec<LogicalGraphReference>>,
 	},
 	Derived(Box<LogicalSelect>),
+}
+
+impl LogicalSelectSourceKind {
+	/// Borrows an occurrence scope, including a zero-row union wrapper.
+	pub(super) fn graph_scope(&self) -> Option<&LogicalGraphReference> {
+		match self {
+			Self::Empty {
+				graph,
+			}
+			| Self::Atoms {
+				graph,
+				..
+			}
+			| Self::AtomUnion {
+				graph,
+				..
+			} => graph.as_ref(),
+			Self::Graphs {
+				..
+			}
+			| Self::Derived(_) => None,
+		}
+	}
+
+	/// Replaces an admitted occurrence scope without changing metadata sources.
+	pub(super) fn graph_scope_mut(&mut self) -> Option<&mut LogicalGraphReference> {
+		match self {
+			Self::Empty {
+				graph,
+			}
+			| Self::Atoms {
+				graph,
+				..
+			}
+			| Self::AtomUnion {
+				graph,
+				..
+			} => graph.as_mut(),
+			Self::Graphs {
+				..
+			}
+			| Self::Derived(_) => None,
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -1114,6 +1363,13 @@ pub(super) struct LogicalSelectJoin {
 #[derive(Debug, Clone)]
 pub(super) enum LogicalSelectItem {
 	Wildcard(Vec<LogicalWildcardField>),
+	/// Uses the ordinary wildcard projector for one class typing state.
+	WildcardVariants {
+		/// Lazy class tuple CASE returning a checked field-list ordinal.
+		selector: TypedExpr,
+		/// Original ordinary wildcard lists, in analyzer variant order.
+		choices: Vec<Vec<LogicalWildcardField>>,
+	},
 	Expression {
 		name: Box<str>,
 		expression: TypedExpr,
@@ -1173,7 +1429,9 @@ pub(super) struct Schema {
 
 impl Schema {
 	pub(super) fn index_of(&self, name: &str) -> Option<usize> {
-		self.columns.iter().position(|column| column.name.eq_ignore_ascii_case(name))
+		self.columns.iter().position(|column| {
+			!column.name.starts_with('\0') && column.name.eq_ignore_ascii_case(name)
+		})
 	}
 
 	pub(super) fn matching_indices<'a>(
@@ -1181,13 +1439,18 @@ impl Schema {
 		name: &'a str,
 	) -> impl Iterator<Item = usize> + 'a {
 		self.columns.iter().enumerate().filter_map(move |(index, column)| {
-			column.name.eq_ignore_ascii_case(name).then_some(index)
+			(!column.name.starts_with('\0') && column.name.eq_ignore_ascii_case(name))
+				.then_some(index)
 		})
 	}
 
 	pub(super) fn qualified_index(&self, qualifier: &str, name: &str) -> Option<usize> {
 		self.columns.iter().position(|column| {
-			column.qualifier.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(qualifier))
+			!column.name.starts_with('\0')
+				&& column
+					.qualifier
+					.as_deref()
+					.is_some_and(|value| value.eq_ignore_ascii_case(qualifier))
 				&& column.name.eq_ignore_ascii_case(name)
 		})
 	}
@@ -1247,6 +1510,21 @@ pub(super) struct LogicalClosure {
 	/// Conservative retained size of the typed closure plan.
 	pub(super) retained_plan_bytes: usize,
 	pub(super) named_function: Option<NamedFunctionKey>,
+}
+
+impl LogicalClosure {
+	/// Named invocation preserves the published declaration, including
+	/// callbacks.
+	pub(in crate::gql) const fn invocation_effect(&self) -> ClosureEffect {
+		match self.named_function {
+			Some(function) => match function.effect {
+				FunctionEffect::Pure => ClosureEffect::Pure,
+				FunctionEffect::Stable => ClosureEffect::StableRead,
+				FunctionEffect::Impure => ClosureEffect::DataMutation,
+			},
+			None => self.effect,
+		}
+	}
 }
 
 /// Session-cache identity and recursion contract of one compiled named UDF.
@@ -1352,6 +1630,8 @@ pub(super) enum TypedExprKind {
 		target: Type,
 		expr: Box<TypedExpr>,
 	},
+	/// Reads the value of a lexical reactive identity from this exact snapshot.
+	LiveSlot(u32),
 }
 
 /// Snapshot-exact Fulltext definition selected during semantic analysis.

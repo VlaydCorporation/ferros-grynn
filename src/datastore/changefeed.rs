@@ -90,6 +90,7 @@ impl ChangefeedDefinition {
 		const MAX_EPOCHS: usize = (16 * 1024 * 1024) / 32;
 		let epoch = ChangefeedCaptureEpoch {
 			started_at: stamp.into(),
+			revision: self.version,
 			configuration,
 		};
 		if let Some(last) = self.epochs.last_mut() {
@@ -159,6 +160,8 @@ pub(crate) struct ChangefeedCatalog {
 #[derive(Debug, Clone)]
 #[allow(clippy::redundant_pub_crate, reason = "shared internally with the physical feed codec")]
 pub(crate) struct CapturedCommit {
+	/// Final source revision, retained identically by RAM and local history.
+	pub(crate) revision: SchemaVersion,
 	/// Exact ordinary view, empty when only FULL contains successful no-ops.
 	pub(crate) net: crate::changefeed::ChangeBatch,
 	/// Exact operation view only when historically captured in FULL mode.

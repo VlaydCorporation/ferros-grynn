@@ -1,6 +1,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	sync::{Arc, atomic::Ordering},
+	time::Instant,
 };
 
 use super::{CommitResult, Mutation, Transaction};
@@ -85,14 +86,95 @@ impl ReplayRemap {
 	}
 }
 
+/// Complete replay image retained until the existing publication barrier.
+struct PreparedCommit {
+	/// Validated candidate containing final primary/catalog/history state.
+	root: DatabaseRoot,
+	/// One translation shared by replay, versions and index deltas.
+	remap: ReplayRemap,
+	/// The existing durable whole-commit clock.
+	commit_ts: u64,
+	/// Deferred definitions to enqueue after successful publication.
+	stale_indexes: Vec<(
+		crate::datastore::ClassId,
+		crate::datastore::IndexId,
+		crate::datastore::SchemaVersion,
+	)>,
+}
+
 impl Transaction {
+	/// Registration supplies no new inputs to existing NOW queries without
+	/// bindings.
+	fn registration_query_targets(
+		&self,
+		before: &DatabaseRoot,
+		next: &DatabaseRoot,
+	) -> super::LiveQueryTargets {
+		let only_registration = !self.mutations.is_empty()
+			&& self.mutations.iter().all(|mutation| matches!(mutation, Mutation::RegisterLive(_)))
+			&& self.change_journal.intents.is_empty()
+			&& self.change_journal.operations.is_empty();
+		if !only_registration
+			|| !before.live_catalog().bindings.is_empty()
+			|| !next.live_catalog().bindings.is_empty()
+			|| before
+				.live_catalog()
+				.queries
+				.values()
+				.any(|entry| !matches!(entry.options.since(), crate::live::LiveSince::Now))
+		{
+			return super::LiveQueryTargets::All;
+		}
+		// Revision stamps are installed after preparation, so compare actual
+		// inputs.
+		let unchanged = Arc::ptr_eq(&before.schema, &next.schema)
+			&& Arc::ptr_eq(&before.dictionary, &next.dictionary)
+			&& Arc::ptr_eq(&before.atoms, &next.atoms)
+			&& Arc::ptr_eq(&before.indexes, &next.indexes)
+			&& Arc::ptr_eq(&before.statistics, &next.statistics)
+			&& Arc::ptr_eq(before.changefeeds(), next.changefeeds())
+			&& before.graphs.len() == next.graphs.len()
+			&& before.graphs.iter().zip(&next.graphs).all(
+				|((left_id, left), (right_id, right))| {
+					left_id == right_id && Arc::ptr_eq(left, right)
+				},
+			);
+		if unchanged {
+			super::LiveQueryTargets::Pending
+		} else {
+			super::LiveQueryTargets::All
+		}
+	}
+
 	/// Revalidates the complete private root before the normal atomic commit.
 	///
 	/// # Errors
 	///
 	/// Returns a graph-family, normalized-state, conflict, persistence, or
 	/// publication failure without publishing a partial root.
-	pub fn commit_with_validation(mut self) -> FerrosGrynnResult<CommitResult> {
+	pub fn commit_with_validation(self) -> FerrosGrynnResult<CommitResult> {
+		self.commit_with_validation_controlled(None, &|| Ok(()))
+	}
+
+	/// Validates the private root with cooperative publication controls.
+	///
+	/// # Errors
+	///
+	/// Returns validation, cancellation, deadline or publication failures.
+	pub fn commit_with_validation_options(
+		self,
+		options: &crate::datastore::CommitOptions,
+	) -> FerrosGrynnResult<CommitResult> {
+		self.commit_with_validation_controlled(options.deadline, &|| options.check())
+	}
+
+	/// Shares the query's existing controls without starting a new deadline.
+	pub(crate) fn commit_with_validation_controlled(
+		mut self,
+		deadline: Option<Instant>,
+		check: &impl Fn() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<CommitResult> {
+		check()?;
 		let graphs = self
 			.working
 			.schema
@@ -100,10 +182,11 @@ impl Transaction {
 			.map(|graph| graph.reference().clone())
 			.collect::<Vec<_>>();
 		for graph in &graphs {
+			check()?;
 			self.validate_graph_family(graph)?;
 		}
 		self.working.validate_full_import_state()?;
-		self.commit()
+		self.commit_controlled(deadline, check)
 	}
 
 	/// Validates and atomically publishes all transaction-private mutations.
@@ -113,62 +196,162 @@ impl Transaction {
 	/// Returns a snapshot-age, FCW/SSI serialization, replay, or fanout budget
 	/// error without publishing a partial root.
 	pub fn commit(self) -> FerrosGrynnResult<CommitResult> {
+		self.commit_controlled(None, &|| Ok(()))
+	}
+
+	/// Publishes with cooperative cancellation and an absolute deadline.
+	/// LIVE BLOCK uses the earlier of this deadline and its own timeout.
+	///
+	/// # Errors
+	///
+	/// Returns commit failures or cancellation/deadline errors before the
+	/// durable barrier; unsuccessful preparation publishes no queue state.
+	pub fn commit_with_options(
+		self,
+		options: &crate::datastore::CommitOptions,
+	) -> FerrosGrynnResult<CommitResult> {
+		self.commit_controlled(options.deadline, &|| options.check())
+	}
+
+	/// Preserves the statement's control boundary through queue admission.
+	pub(crate) fn commit_controlled(
+		self,
+		deadline: Option<Instant>,
+		check: &impl Fn() -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<CommitResult> {
+		check()?;
 		self.ensure_live()?;
+		// Only mutations or targeted intents can publish, including a FULL
+		// policy enabled concurrently. Their BLOCK origin remains unchanged.
+		let could_publish = !self.mutations.is_empty() || !self.change_journal.intents.is_empty();
+		let live_started = could_publish.then(Instant::now);
 		let store = self.store.clone();
-		if !self.mutations.is_empty() || self.has_full_capture(&self.working) {
-			store.inner.ensure_write_allowed(self.id)?;
-		}
-		let _commit = store.inner.commit.lock();
-		self.ensure_live()?;
-		if !self.mutations.is_empty() || self.has_full_capture(&store.inner.current_root()) {
-			store.inner.ensure_write_allowed(self.id)?;
-		}
-		let current = store.inner.current_root();
-		self.validate_against(&current)?;
-		self.validate_commit_fanout(&current)?;
-		if self.mutations.is_empty() && !self.has_full_capture(&current) {
+		if !could_publish {
+			check()?;
+			let _commit = store.inner.commit.lock();
+			let current = store.inner.current_root();
+			self.validate_commit_snapshot(&current)?;
+			check()?;
 			return Ok(CommitResult {
 				transaction: self.id,
 				commit_ts: current.commit_ts,
 			});
 		}
-
-		let commit_ts = current.commit_ts.checked_add(1).ok_or_else(|| {
-			FerrosGrynnError::serialization_failure(self.id, "the commit clock is exhausted")
-		})?;
-		let mut next = (*current).clone();
-		store.inner.hydrate_statistics(&mut next)?;
-		let affected_graphs = self.affected_graphs(&current);
-		let remap = Self::apply_mutations(&mut next, &self.mutations, commit_ts, true).map_err(
-			|error| {
-				FerrosGrynnError::serialization_failure(
-					self.id,
-					"a transaction prerequisite changed before commit",
-				)
-				.with_cause(error)
-			},
-		)?;
-		let stale_indexes = if self.mutations.iter().any(mutation_affects_explicit_indexes) {
-			next.mark_deferred_indexes_stale()?
-		} else {
-			Vec::new()
-		};
-		next.advance_identity_clocks(
-			store.inner.next_schema_id.load(Ordering::Relaxed),
-			store.inner.next_graph_id.load(Ordering::Relaxed),
-		);
-		let validation_root = Arc::new(next.clone());
-		for graph in affected_graphs {
-			let Some(schema) = validation_root.schema.graph(graph) else {
-				continue;
-			};
-			self.validate_graph_family_in_root(validation_root.clone(), schema.reference())?;
+		if !self.mutations.is_empty() || self.has_full_capture(&self.working) {
+			self.ensure_commit_write_allowed()?;
 		}
-		drop(validation_root);
-		self.validate_full_noops(&current, &next)?;
-		next.commit_ts = commit_ts;
-		next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
-		self.capture_changes(&current, &mut next, commit_ts)?;
+		let defines_bindings = self.mutations.iter().any(|mutation| {
+			matches!(
+				mutation,
+				Mutation::DefineLiveBinding(_)
+					| Mutation::ReplaceLiveBinding { .. }
+					| Mutation::RegisterLive(_)
+			)
+		});
+		for _attempt in 0..8 {
+			check()?;
+			let observed = store.inner.current_root();
+			let writes = !self.mutations.is_empty() || self.has_full_capture(&observed);
+			if writes
+				&& (defines_bindings
+					|| !observed.live_catalog().bindings.is_empty()
+					|| !observed.live_catalog().queries.is_empty())
+			{
+				self.validate_commit_snapshot(&observed)?;
+				// User expression evaluation borrows only this immutable
+				// candidate and finishes before attempting the
+				// publication mutex.
+				let historical = self.mutations.iter().any(|mutation| {
+					matches!(mutation, Mutation::RegisterLive(definition)
+						if !matches!(definition.options.since(), crate::live::LiveSince::Now))
+				});
+				let history_pin = if historical {
+					let _commit = store.inner.commit.lock();
+					if !Arc::ptr_eq(&observed, &store.inner.current_root()) {
+						continue;
+					}
+					store.inner.capture_changefeed_snapshot(observed.commit_ts)?
+				} else {
+					None
+				};
+				let mut prepared = self.prepare_commit_root(&observed, history_pin)?;
+				let queues = store.inner.live_consumers.reserve(
+					&prepared.root,
+					live_started.unwrap_or_else(Instant::now),
+					deadline,
+					&|| {
+						check()?;
+						self.ensure_live()
+					},
+				)?;
+				let _commit = store.inner.commit.lock();
+				let current = store.inner.current_root();
+				if !Arc::ptr_eq(&observed, &current) || !queues.valid() {
+					continue;
+				}
+				self.validate_commit_snapshot(&current)?;
+				check()?;
+				prepared.root.advance_identity_clocks(
+					store.inner.next_schema_id.load(Ordering::Relaxed),
+					store.inner.next_graph_id.load(Ordering::Relaxed),
+				);
+				return self.publish_commit_root(&current, prepared, Some(queues));
+			}
+			let _commit = store.inner.commit.lock();
+			let current = store.inner.current_root();
+			let writes = !self.mutations.is_empty() || self.has_full_capture(&current);
+			// A concurrent registration may have enabled evaluation between the
+			// fast-path inspection and lock acquisition.
+			if writes
+				&& (defines_bindings
+					|| !current.live_catalog().bindings.is_empty()
+					|| !current.live_catalog().queries.is_empty())
+			{
+				continue;
+			}
+			self.validate_commit_snapshot(&current)?;
+			check()?;
+			if !writes {
+				return Ok(CommitResult {
+					transaction: self.id,
+					commit_ts: current.commit_ts,
+				});
+			}
+			let prepared = self.prepare_commit_root(&current, None)?;
+			check()?;
+			return self.publish_commit_root(&current, prepared, None);
+		}
+		Err(FerrosGrynnError::serialization_failure(
+			self.id,
+			"the LIVE candidate root changed during bounded commit preparation",
+		))
+	}
+
+	/// Rechecks ordinary writer lease, FCW/SSI and fanout against one root.
+	fn validate_commit_snapshot(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
+		self.ensure_live()?;
+		self.validate_gql_live_acks()?;
+		if !self.mutations.is_empty() || self.has_full_capture(current) {
+			self.ensure_commit_write_allowed()?;
+		}
+		self.validate_against(current)?;
+		self.validate_commit_fanout(current)
+	}
+
+	/// Publishes one rechecked image using the existing WAL barrier and clock.
+	fn publish_commit_root(
+		&self,
+		current: &Arc<DatabaseRoot>,
+		prepared: PreparedCommit,
+		queues: Option<crate::datastore::live_queue::Reservations<'_>>,
+	) -> FerrosGrynnResult<CommitResult> {
+		let store = &self.store;
+		let PreparedCommit {
+			root: mut next,
+			remap,
+			commit_ts,
+			stale_indexes,
+		} = prepared;
 		for key in self.writes.keys() {
 			next.mark_version(remap.conflict(*key), commit_ts);
 		}
@@ -179,7 +362,13 @@ impl Transaction {
 			matches!(
 				mutation,
 				Mutation::InternProperty { .. }
+					| Mutation::DefineLiveBinding(_)
+					| Mutation::ReplaceLiveBinding { .. }
+					| Mutation::RemoveLiveBinding(_)
 					| Mutation::ConfigureChangefeed { .. }
+					| Mutation::RegisterLive(_)
+					| Mutation::CloseLive(_)
+					| Mutation::AcknowledgeLive(_)
 					| Mutation::ReplaceGraph(_)
 					| Mutation::DefineParameter(_)
 					| Mutation::ReplaceParameter(_)
@@ -195,7 +384,13 @@ impl Transaction {
 			matches!(
 				mutation,
 				Mutation::ReplaceGraph(_)
+					| Mutation::DefineLiveBinding(_)
+					| Mutation::ReplaceLiveBinding { .. }
+					| Mutation::RemoveLiveBinding(_)
 					| Mutation::ConfigureChangefeed { .. }
+					| Mutation::RegisterLive(_)
+					| Mutation::CloseLive(_)
+					| Mutation::AcknowledgeLive(_)
 					| Mutation::DefineParameter(_)
 					| Mutation::ReplaceParameter(_)
 					| Mutation::RemoveParameter(_)
@@ -214,16 +409,23 @@ impl Transaction {
 		let dependency_indexes_changed = self.mutations.iter().any(|mutation| {
 			matches!(mutation, Mutation::ReplaceAnalyzer(_) | Mutation::ReplaceFunction(_))
 		});
-		let changed_records = self.index_delta_records(&current, &next, &remap);
+		let changed_records = self.index_delta_records(current, &next, &remap);
 		let delta_eligible = self.mutations.iter().all(mutation_allows_physical_index_delta);
+		let mut published = Arc::new(next);
+		let next = Arc::get_mut(&mut published).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("unpublished commit root is shared")
+		})?;
 		store.inner.persist_root(
-			&mut next,
-			Some(&current),
+			next,
+			Some(current),
 			delta_eligible.then_some(&changed_records),
 			graph_catalog_only,
 			dictionary_changed,
 		)?;
-		*store.inner.current.write() = Arc::new(next);
+		*store.inner.current.write() = published;
+		if let Some(queues) = queues {
+			queues.publish();
+		}
 		if dependency_indexes_changed {
 			// The Stale catalog state is the correctness boundary. A ledger I/O
 			// failure may delay availability, but cannot expose an incompatible
@@ -246,6 +448,102 @@ impl Transaction {
 		Ok(CommitResult {
 			transaction: self.id,
 			commit_ts,
+		})
+	}
+
+	/// Builds the final immutable image separately from physical publication.
+	fn prepare_commit_root(
+		&self,
+		current: &Arc<DatabaseRoot>,
+		history_pin: Option<crate::storage::LocalChangefeedSnapshot>,
+	) -> FerrosGrynnResult<PreparedCommit> {
+		let commit_ts = current.commit_ts.checked_add(1).ok_or_else(|| {
+			FerrosGrynnError::serialization_failure(self.id, "the commit clock is exhausted")
+		})?;
+		// Primary and operation-image replay share one hydrated before-root.
+		// The published root may still hold only lazy statistics headers.
+		let mut before = current.as_ref().clone();
+		if !self.is_live_control_commit() {
+			self.store.inner.hydrate_statistics(&mut before)?;
+		}
+		let mut next = before.clone();
+		let affected_graphs = self.affected_graphs(current);
+		let remap = Self::apply_mutations(&mut next, &self.mutations, commit_ts, true).map_err(
+			|error| {
+				FerrosGrynnError::serialization_failure(
+					self.id,
+					"a transaction prerequisite changed before commit",
+				)
+				.with_cause(error)
+			},
+		)?;
+		let stale_indexes = if self.mutations.iter().any(mutation_affects_explicit_indexes) {
+			next.mark_deferred_indexes_stale()?
+		} else {
+			Vec::new()
+		};
+		next.advance_identity_clocks(
+			self.store.inner.next_schema_id.load(Ordering::Relaxed),
+			self.store.inner.next_graph_id.load(Ordering::Relaxed),
+		);
+		let validation_root = Arc::new(next.clone());
+		for graph in affected_graphs {
+			let Some(schema) = validation_root.schema.graph(graph) else {
+				continue;
+			};
+			self.validate_graph_family_in_root(validation_root.clone(), schema.reference())?;
+		}
+		drop(validation_root);
+		self.validate_full_noops(current, &next)?;
+		next.commit_ts = commit_ts;
+		next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
+		self.capture_changes(&before, &mut next, commit_ts)?;
+		if self.mutations.iter().any(|mutation| matches!(mutation, Mutation::RegisterLive(_))) {
+			for definition in next
+				.live_catalog()
+				.queries
+				.values()
+				.filter(|entry| entry.state == crate::live::LiveState::Pending)
+			{
+				super::live::validate_source(&next, definition.query.source())?;
+				if super::live::source_class(&next, definition.query.source())?
+					!= definition.source_class
+				{
+					return Err(FerrosGrynnError::invalid_argument(
+						"LIVE source owner changed before activation",
+					));
+				}
+			}
+			Arc::make_mut(next.live_catalog_mut()).activate(commit_ts)?;
+			super::live_backfill::prepare(
+				&self.store.inner,
+				current,
+				&mut next,
+				history_pin,
+				self.query_scratch_root(),
+			)?;
+		}
+		if self.is_live_control_commit() {
+			let catalog = Arc::make_mut(next.live_catalog_mut());
+			catalog.prepared = Arc::default();
+			catalog.prepared_encoded = Arc::default();
+			crate::datastore::live_history::prepare(&mut next)?;
+		} else {
+			let targets = self.registration_query_targets(&before, &next);
+			super::prepare_live_publication(
+				current,
+				&mut next,
+				self.query_scratch_root(),
+				super::LiveHistoryCapture::Enabled,
+				targets,
+				&self.store.inner.live_observation,
+			)?;
+		}
+		Ok(PreparedCommit {
+			root: next,
+			remap,
+			commit_ts,
+			stale_indexes,
 		})
 	}
 
@@ -500,6 +798,53 @@ impl Transaction {
 	) -> FerrosGrynnResult<()> {
 		for mutation in mutations {
 			match mutation {
+				Mutation::DefineLiveBinding(definition) => {
+					let catalog = Arc::make_mut(root.live_catalog_mut());
+					if catalog.bindings.contains_key(&definition.id) {
+						return Err(FerrosGrynnError::invalid_argument(
+							"LIVE LET identity is already registered",
+						));
+					}
+					catalog.bindings.insert(definition.id, definition.clone());
+				}
+				Mutation::ReplaceLiveBinding {
+					definition,
+					expected,
+				} => {
+					Arc::make_mut(root.live_catalog_mut())
+						.replace_binding(definition.clone(), *expected)?;
+				}
+				Mutation::RemoveLiveBinding(id) => {
+					Arc::make_mut(root.live_catalog_mut()).remove_binding(
+						*id,
+						published_at,
+						&mut crate::datastore::BindingAdmission::new(
+							&crate::live::LiveBindingOptions::default(),
+						),
+						&|| Ok(()),
+					)?;
+				}
+				Mutation::RegisterLive(definition) => {
+					super::live::validate_source(root, definition.query.source())?;
+					Arc::make_mut(root.live_catalog_mut()).register(definition.clone())?;
+				}
+				Mutation::CloseLive(id) => {
+					Arc::make_mut(root.live_catalog_mut()).close(*id, published_at)?;
+				}
+				Mutation::AcknowledgeLive(token) => {
+					if token.database_id() != root.database_uuid.into()
+						|| token.versionstamp().get() > root.commit_ts
+					{
+						return Err(FerrosGrynnError::invalid_argument(
+							"LIVE ACK origin/position changed",
+						));
+					}
+					Arc::make_mut(root.live_catalog_mut()).acknowledge(
+						token.live_id(),
+						token.version(),
+						token.versionstamp().get(),
+					)?;
+				}
 				Mutation::ConfigureChangefeed {
 					source,
 					id,
@@ -567,7 +912,7 @@ impl Transaction {
 					build.apply(root, published_at)?;
 				}
 				Mutation::RemoveClass(class) => {
-					root.remove_class(*class)?;
+					root.remove_class(*class, published_at)?;
 				}
 				Mutation::RemoveParameter(parameter) => {
 					root.remove_parameter(*parameter)?;

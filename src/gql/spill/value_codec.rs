@@ -274,7 +274,10 @@ impl Decoder<'_> {
 			TAG_RANGE => {
 				let start = self.decode_bound(context, depth + 1)?;
 				let end = self.decode_bound(context, depth + 1)?;
-				Range::new(start, end).map(Value::Range)
+				Range::new_with_diagnostic_admission(start, end, |_, _| {
+					Err(invalid_run("query-run range bounds are invalid"))
+				})
+				.map(Value::Range)
 			}
 			_tag => Err(invalid_run("query-run value tag is invalid")),
 		}

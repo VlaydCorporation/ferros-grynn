@@ -24,11 +24,18 @@ pub enum ChangefeedState {
 pub struct ChangefeedCaptureEpoch {
 	/// Inclusive first commit covered by this capture epoch.
 	pub(crate) started_at: Versionstamp,
+	/// Final validated definition revision governing this epoch.
+	pub(crate) revision: SchemaVersion,
 	/// Capture policy, or None while capture is suppressed.
 	pub(crate) configuration: Option<ChangefeedConfig>,
 }
 
 impl ChangefeedCaptureEpoch {
+	/// Returns the captured source definition revision.
+	pub const fn revision(self) -> SchemaVersion {
+		self.revision
+	}
+
 	/// Returns the first commit covered by this policy.
 	pub const fn started_at(self) -> Versionstamp {
 		self.started_at

@@ -404,7 +404,7 @@ fn exact_len(length: usize) -> Cardinality {
 
 fn static_graph(statement: &LogicalTraverse) -> Option<GraphId> {
 	statement.graph.as_ref().and_then(static_graph_reference).or_else(|| match &statement.source {
-		LogicalTraverseSource::Match(statement) => Some(statement.graph.id()),
+		LogicalTraverseSource::Match(statement) => static_graph_reference(&statement.graph),
 		LogicalTraverseSource::Expression(expression) => match &expression.kind {
 			TypedExprKind::Constant(Value::GraphRef(graph)) => Some(graph.id()),
 			_ => None,

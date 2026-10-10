@@ -1,4 +1,7 @@
-use std::{num::NonZeroUsize, time::Duration};
+use std::{
+	num::NonZeroUsize,
+	time::{Duration, Instant},
+};
 
 use super::consts::{
 	DEFAULT_BUFFER_POOL_PAGES,
@@ -165,5 +168,30 @@ impl TransactionOptions {
 			isolation,
 			access,
 		}
+	}
+}
+
+/// Cooperative controls for commit preparation and LIVE capacity waits.
+/// Cancellation uses the existing query token so query execution and its
+/// publication share one boundary. Controls stop before the durable barrier.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct CommitOptions {
+	/// Absolute deadline, also bounding LIVE BLOCK waits.
+	pub deadline: Option<Instant>,
+	/// Shared cooperative cancellation request.
+	pub cancellation: Option<crate::gql::QueryCancellation>,
+}
+
+impl CommitOptions {
+	/// Checks cancellation and the absolute deadline before publication.
+	pub(crate) fn check(&self) -> crate::gql_status::FerrosGrynnResult<()> {
+		if self.cancellation.as_ref().is_some_and(crate::gql::QueryCancellation::is_cancelled) {
+			return Err(crate::gql_status::FerrosGrynnError::query_cancelled());
+		}
+		if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+			return Err(crate::gql_status::FerrosGrynnError::query_timed_out(0));
+		}
+		Ok(())
 	}
 }

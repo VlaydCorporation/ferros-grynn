@@ -63,7 +63,7 @@ impl Publication {
 }
 
 /// Saturating diagnostics never change commit results or delivery semantics.
-fn add(counter: &AtomicU64, value: u64) {
+pub(super) fn add(counter: &AtomicU64, value: u64) {
 	let _previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
 		Some(current.saturating_add(value))
 	});

@@ -211,6 +211,9 @@ impl Transaction {
 		};
 		budget.admit(bytes)?;
 		self.ensure_capacity(bytes)?;
+		// The first captured item precedes ordinary mutation preparation.
+		// Its retained origin must already support exact replay deltas.
+		self.store.inner.hydrate_statistics(&mut self.working)?;
 		self.import_changefeed.segment_before = Some(Box::new(self.working.clone()));
 		self.import_changefeed.segment_bytes = bytes;
 		self.import_changefeed.bytes = budget.bytes;
@@ -389,7 +392,9 @@ impl Transaction {
 		{
 			return Ok(());
 		}
-		let spool = std::mem::take(&mut self.import_changefeed);
+		// Retain the accepted spool until the root passes optimistic
+		// publication. A control race must not consume accepted history.
+		let spool = &self.import_changefeed;
 		self.working.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
 		let timestamp =
 			jiff::Timestamp::from_nanosecond(self.working.committed_at_ns).map_err(|error| {
@@ -406,10 +411,10 @@ impl Transaction {
 		let mut net: BTreeMap<(ChangefeedId, ChangeIdentity), ChangeEntry> = BTreeMap::new();
 		let mut full: BTreeMap<ChangefeedId, Vec<ChangeEntry>> = BTreeMap::new();
 		let mut originals: BTreeMap<ChangefeedId, bool> = BTreeMap::new();
-		for (feed, group) in spool.chunks {
+		for (feed, group) in &spool.chunks {
 			budget.admit(128)?;
-			originals.insert(feed, group.include_original);
-			for entry in group.net.entries {
+			originals.insert(*feed, group.include_original);
+			for entry in &group.net.entries {
 				let identity = entry
 					.after
 					.as_ref()
@@ -419,17 +424,19 @@ impl Transaction {
 						FerrosGrynnError::invalid_storage_file("import NET entry has no identity")
 					})?;
 				budget.admit(512)?;
-				let key = (feed, identity.clone());
+				let key = (*feed, identity.clone());
 				if let Some(previous) = net.get_mut(&key) {
-					previous.after = entry.after;
+					previous.after = entry.after.clone();
 				} else {
-					net.insert(key, entry);
+					net.insert(key, entry.clone());
 				}
 			}
-			if let Some(batch) = group.full {
-				let entries = full.entry(feed).or_default();
-				for mut entry in batch.entries {
+			if let Some(batch) = &group.full {
+				budget.admit(128)?;
+				let entries = full.entry(*feed).or_default();
+				for entry in &batch.entries {
 					budget.reserve(entries)?;
+					let mut entry = entry.clone();
 					entry.ordinal = u64::try_from(entries.len()).map_err(|_error| {
 						FerrosGrynnError::operation_overflow("import FULL ordinal")
 					})?;
@@ -453,6 +460,15 @@ impl Transaction {
 				entries,
 			});
 			groups.insert(feed, CapturedCommit {
+				revision: self
+					.working
+					.changefeeds()
+					.definitions
+					.get(&feed)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("import capture revision is absent")
+					})?
+					.version,
 				net: batch,
 				full,
 				include_original,
@@ -471,8 +487,12 @@ impl Transaction {
 				.map_err(|_error| FerrosGrynnError::operation_overflow("import NET ordinal"))?;
 			group.net.entries.push(entry);
 		}
-		let mut gaps = spool.gaps;
-		for (feed, intent) in spool.targets {
+		let mut gaps = Vec::new();
+		for feed in &spool.gaps {
+			budget.reserve(&mut gaps)?;
+			gaps.push(*feed);
+		}
+		for (feed, intent) in &spool.targets {
 			let record = self
 				.snapshot
 				.atom(intent.global)
@@ -482,7 +502,7 @@ impl Transaction {
 				&& !same_suppressed_target(&self.snapshot, &self.working, record, intent.graph)?
 			{
 				budget.reserve(&mut gaps)?;
-				gaps.push(feed);
+				gaps.push(*feed);
 			}
 		}
 		for feed in gaps {
@@ -497,6 +517,15 @@ impl Transaction {
 				entries: Vec::new(),
 			};
 			groups.insert(feed, CapturedCommit {
+				revision: self
+					.working
+					.changefeeds()
+					.definitions
+					.get(&feed)
+					.ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("import capture revision is absent")
+					})?
+					.version,
 				net: batch,
 				full: None,
 				include_original: false,

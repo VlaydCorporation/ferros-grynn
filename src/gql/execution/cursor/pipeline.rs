@@ -26,6 +26,18 @@ impl RowCursor for OneRowCursor {
 
 /// Resolves public fields for an atom bound in a MATCH row.
 pub(in crate::gql) trait AtomFieldRead {
+	/// Borrows a reactive scalar from this resolver's fixed snapshot.
+	fn live_binding(&self, _id: crate::live::LiveBindingId) -> FerrosGrynnResult<&Value> {
+		Err(FerrosGrynnError::invalid_argument("LIVE LET requires a query snapshot"))
+	}
+	/// Resolves a reactive identity with admission before an owned value copy.
+	fn live_binding_value(
+		&self,
+		_id: crate::live::LiveBindingId,
+		_control: &ExecutionControl,
+	) -> FerrosGrynnResult<Value> {
+		Err(FerrosGrynnError::invalid_argument("LIVE LET requires a query snapshot"))
+	}
 	/// Records a snapshot dependency used by a context-dependent PURE helper.
 	fn observe(&self, _key: crate::datastore::ConflictKey) {}
 
@@ -41,6 +53,14 @@ pub(in crate::gql) trait AtomFieldRead {
 	/// Admits owned evaluation allocations before copying or growing values.
 	fn admit(&self, _bytes: usize) -> FerrosGrynnResult<()> {
 		Ok(())
+	}
+	/// Admits values that survive a streaming row callback.
+	fn admit_retained(&self, bytes: usize) -> FerrosGrynnResult<()> {
+		self.admit(bytes)
+	}
+	/// Bounds transient copies within one nonretaining row callback.
+	fn transient_scope(&self) -> Option<TransientAdmission<'_>> {
+		None
 	}
 
 	/// Charges embedding-specific evaluator work before executing it.
@@ -71,7 +91,12 @@ pub(in crate::gql) trait AtomFieldRead {
 	fn level_path(&self, occurrence: &AtomOccurrenceRef) -> FerrosGrynnResult<Value>;
 
 	/// Reads a field through a stable database record reference.
-	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value>;
+	fn record_field(
+		&self,
+		record: &RecordId,
+		field: &str,
+		control: Option<&ExecutionControl>,
+	) -> FerrosGrynnResult<Value>;
 
 	/// Validates a runtime path before reading snapshot-bound contributions.
 	fn validate_path(
@@ -80,6 +105,22 @@ pub(in crate::gql) trait AtomFieldRead {
 		_control: &ExecutionControl,
 	) -> FerrosGrynnResult<()> {
 		Err(FerrosGrynnError::invalid_argument("custom path cost requires a query snapshot"))
+	}
+}
+
+/// Restores the enclosing account after a lexically nested row callback.
+#[derive(Debug)]
+#[must_use]
+pub(in crate::gql) struct TransientAdmission<'a> {
+	/// Only the private executor opens scopes; no RefCell borrow escapes.
+	active: &'a RefCell<Option<BarrierAccount>>,
+	/// An enclosing row keeps its reservations while a nested scope runs.
+	previous: Option<BarrierAccount>,
+}
+
+impl Drop for TransientAdmission<'_> {
+	fn drop(&mut self) {
+		*self.active.borrow_mut() = self.previous.take();
 	}
 }
 
@@ -92,6 +133,8 @@ pub(in crate::gql) struct RootFields<'a> {
 	control: &'a ExecutionControl,
 	/// Conservatively retained owned/transient value admission.
 	account: RefCell<BarrierAccount>,
+	/// Transient row copies share the same hard limit as retained values.
+	transient: RefCell<Option<BarrierAccount>>,
 	/// Snapshot-aware SSI observer supplied by the transaction adapter.
 	read: &'a dyn Fn(crate::datastore::ConflictKey),
 	/// Operation-wide work admission supplied by the caller.
@@ -111,6 +154,7 @@ impl RootFields<'_> {
 			root,
 			control,
 			account: RefCell::new(control.barrier_account()),
+			transient: RefCell::new(None),
 			read,
 			work,
 		}
@@ -129,7 +173,10 @@ impl RootFields<'_> {
 					.class(occurrence.atom().id().class())
 					.and_then(|class| class.id())
 				{
+					(self.read)(crate::datastore::ConflictKey::SchemaClass(class));
 					(self.read)(crate::datastore::ConflictKey::BaseClassRange(class));
+				} else {
+					(self.read)(crate::datastore::ConflictKey::ClassCatalogRange);
 				}
 				FerrosGrynnError::atom_does_not_exist("atom", occurrence.atom().id().to_string())
 			})?;
@@ -146,6 +193,20 @@ impl RootFields<'_> {
 }
 
 impl AtomFieldRead for RootFields<'_> {
+	fn live_binding(&self, id: crate::live::LiveBindingId) -> FerrosGrynnResult<&Value> {
+		self.control.check()?;
+		self.observe(crate::datastore::ConflictKey::LiveBinding(id));
+		self.root.live_catalog().binding_value(id)
+	}
+
+	fn live_binding_value(
+		&self,
+		id: crate::live::LiveBindingId,
+		_control: &ExecutionControl,
+	) -> FerrosGrynnResult<Value> {
+		self.copy_value(self.live_binding(id)?)
+	}
+
 	fn observe(&self, key: crate::datastore::ConflictKey) {
 		(self.read)(key);
 	}
@@ -155,64 +216,30 @@ impl AtomFieldRead for RootFields<'_> {
 	}
 
 	fn admit_value(&self, value: &Value) -> FerrosGrynnResult<()> {
-		self.admit(2 * size_of::<&Value>())?;
-		let mut pending = vec![value];
-		while let Some(value) = pending.pop() {
-			self.work(1)?;
-			let count = match value {
-				Value::Array(values) => values.len(),
-				Value::Set(values) => values.len(),
-				Value::Object(values) => values.len(),
-				Value::Range(_) => 2,
-				Value::Path(path) => {
-					self.work(path.steps().len() as u64)?;
-					0
-				}
-				_ => 0,
-			};
-			self.work(count as u64)?;
-			self.admit(
-				count
-					.checked_mul(2 * size_of::<Value>() + 128 + 2 * size_of::<&Value>())
-					.ok_or_else(|| {
-						FerrosGrynnError::operation_overflow("PURE collection scratch")
-					})?,
-			)?;
-			pending.try_reserve(count).map_err(|cause| {
-				FerrosGrynnError::traversal_resource_limit_exceeded(
-					"PURE value traversal",
-					self.control.barrier_memory_limit() as u64,
-				)
-				.with_technical_source(cause)
-			})?;
-			match value {
-				Value::Array(values) => pending.extend(values.iter()),
-				Value::Set(values) => pending.extend(values.iter()),
-				Value::Object(values) => {
-					for (name, value) in values.iter() {
-						self.admit(name.len())?;
-						pending.push(value);
-					}
-				}
-				Value::Range(range) => {
-					for bound in [range.start(), range.end()] {
-						if let std::ops::Bound::Included(value) | std::ops::Bound::Excluded(value) =
-							bound
-						{
-							pending.push(value);
-						}
-					}
-				}
-				_ => self.admit(value.estimated_heap_bytes())?,
-			}
-		}
-		Ok(())
+		crate::gql::value_admission::admit_value(
+			value,
+			self.control.barrier_memory_limit(),
+			&|bytes| self.admit(bytes),
+			&|work| self.work(work),
+		)
 	}
 
 	fn admit(&self, bytes: usize) -> FerrosGrynnResult<()> {
-		// ponytail: retain conservative transient charges until the outer call
-		// returns; use value-lifetime accounts if long scalar loops need more
-		// room.
+		if let Some(account) = self.transient.borrow_mut().as_mut() {
+			if !account.reserve(bytes) {
+				return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"PURE value scratch",
+					self.control.barrier_memory_limit() as u64,
+				));
+			}
+			return Ok(());
+		}
+		// shortcut: materialized paths retain conservative transient charges;
+		// add lifetime accounts when their measured scratch requires it.
+		self.admit_retained(bytes)
+	}
+
+	fn admit_retained(&self, bytes: usize) -> FerrosGrynnResult<()> {
 		if !self.account.borrow_mut().reserve(bytes) {
 			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
 				"PURE value scratch",
@@ -220,6 +247,14 @@ impl AtomFieldRead for RootFields<'_> {
 			));
 		}
 		Ok(())
+	}
+
+	fn transient_scope(&self) -> Option<TransientAdmission<'_>> {
+		let previous = self.transient.replace(Some(self.control.barrier_account()));
+		Some(TransientAdmission {
+			active: &self.transient,
+			previous,
+		})
 	}
 
 	fn work(&self, operations: u64) -> FerrosGrynnResult<()> {
@@ -367,11 +402,19 @@ impl AtomFieldRead for RootFields<'_> {
 		})
 	}
 
-	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
+	fn record_field(
+		&self,
+		record: &RecordId,
+		field: &str,
+		_control: Option<&ExecutionControl>,
+	) -> FerrosGrynnResult<Value> {
 		let global = self.root.resolve_atom(record).ok_or_else(|| {
 			if let Some(class) = self.root.schema.class(record.class()).and_then(|class| class.id())
 			{
+				(self.read)(crate::datastore::ConflictKey::SchemaClass(class));
 				(self.read)(crate::datastore::ConflictKey::BaseClassRange(class));
+			} else {
+				(self.read)(crate::datastore::ConflictKey::ClassCatalogRange);
 			}
 			FerrosGrynnError::atom_does_not_exist("record", record.to_string())
 		})?;
@@ -381,6 +424,7 @@ impl AtomFieldRead for RootFields<'_> {
 			.root
 			.atom(global)
 			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("record", record.to_string()))?;
+		(self.read)(crate::datastore::ConflictKey::SchemaClass(base.class_id()));
 		match field {
 			"id" => {
 				self.admit(size_of::<RecordId>() + record.estimated_heap_bytes())?;
@@ -452,6 +496,51 @@ pub(in crate::gql::execution) struct RecordFields<'a, Read> {
 }
 
 impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
+	fn live_binding(&self, id: crate::live::LiveBindingId) -> FerrosGrynnResult<&Value> {
+		self.read.live_binding_value(self.snapshot, id)
+	}
+
+	fn live_binding_value(
+		&self,
+		id: crate::live::LiveBindingId,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<Value> {
+		if let Some(fields) = self.read.bounded_fields() {
+			return fields.live_binding_value(id, control);
+		}
+		control.copy_reactive_value(self.live_binding(id)?)
+	}
+
+	fn observe(&self, key: crate::datastore::ConflictKey) {
+		if let Some(fields) = self.read.bounded_fields() {
+			fields.observe(key);
+		}
+	}
+
+	fn bounded(&self) -> bool {
+		self.read.bounded_fields().is_some()
+	}
+
+	fn admit_value(&self, value: &Value) -> FerrosGrynnResult<()> {
+		self.read.bounded_fields().map_or(Ok(()), |fields| fields.admit_value(value))
+	}
+
+	fn admit(&self, bytes: usize) -> FerrosGrynnResult<()> {
+		self.read.bounded_fields().map_or(Ok(()), |fields| fields.admit(bytes))
+	}
+
+	fn admit_retained(&self, bytes: usize) -> FerrosGrynnResult<()> {
+		self.read.bounded_fields().map_or(Ok(()), |fields| fields.admit_retained(bytes))
+	}
+
+	fn transient_scope(&self) -> Option<TransientAdmission<'_>> {
+		self.read.bounded_fields().and_then(|fields| fields.transient_scope())
+	}
+
+	fn work(&self, operations: u64) -> FerrosGrynnResult<()> {
+		self.read.bounded_fields().map_or(Ok(()), |fields| fields.work(operations))
+	}
+
 	fn field(&self, atom: BoundAtom, _field: &str) -> FerrosGrynnResult<Value> {
 		Err(FerrosGrynnError::invalid_argument(format!(
 			"SELECT row has no graph-local atom binding for {}.",
@@ -464,6 +553,10 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 		occurrence: &AtomOccurrenceRef,
 		field: &str,
 	) -> FerrosGrynnResult<Value> {
+		if let Some(fields) = self.read.bounded_fields() {
+			self.read.graph(self.snapshot, occurrence.graph())?;
+			return fields.occurrence_field(occurrence, field);
+		}
 		let fields = MatchGraphFields::new(
 			self.read,
 			self.snapshot,
@@ -483,8 +576,13 @@ impl<Read: QueryRead> AtomFieldRead for RecordFields<'_, Read> {
 		))
 	}
 
-	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
-		self.read.record_field(self.snapshot, record, self.graph, field)
+	fn record_field(
+		&self,
+		record: &RecordId,
+		field: &str,
+		control: Option<&ExecutionControl>,
+	) -> FerrosGrynnResult<Value> {
+		self.read.record_field(self.snapshot, record, self.graph, field, control)
 	}
 
 	fn validate_path(
@@ -543,6 +641,23 @@ impl<'a, Read: QueryRead> MatchGraphFields<'a, Read> {
 }
 
 impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
+	fn live_binding(&self, id: crate::live::LiveBindingId) -> FerrosGrynnResult<&Value> {
+		self.read.live_binding_value(self.snapshot, id)
+	}
+
+	fn live_binding_value(
+		&self,
+		id: crate::live::LiveBindingId,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<Value> {
+		RecordFields {
+			read: self.read,
+			snapshot: self.snapshot,
+			graph: None,
+		}
+		.live_binding_value(id, control)
+	}
+
 	fn field(&self, atom: BoundAtom, field: &str) -> FerrosGrynnResult<Value> {
 		let reference = self.reference(atom.graph)?;
 		if field == "graph" {
@@ -652,8 +767,13 @@ impl<Read: QueryRead> AtomFieldRead for MatchGraphFields<'_, Read> {
 		self.read.level_path(self.snapshot, occurrence)
 	}
 
-	fn record_field(&self, record: &RecordId, field: &str) -> FerrosGrynnResult<Value> {
-		self.read.record_field(self.snapshot, record, None, field)
+	fn record_field(
+		&self,
+		record: &RecordId,
+		field: &str,
+		control: Option<&ExecutionControl>,
+	) -> FerrosGrynnResult<Value> {
+		self.read.record_field(self.snapshot, record, None, field, control)
 	}
 
 	fn validate_path(

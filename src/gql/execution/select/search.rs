@@ -114,6 +114,7 @@ pub(super) fn contains_search(expression: &TypedExpr) -> bool {
 		} => argument.as_deref().is_some_and(contains_search),
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
+		| TypedExprKind::LiveSlot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_)
 		| TypedExprKind::Closure(_)
@@ -129,6 +130,7 @@ pub(super) fn prepare_search_inputs(
 	access: &LogicalSelectAccess,
 	slots: &[Value],
 	source: &str,
+	fields: &dyn AtomFieldRead,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<PreparedSearch> {
 	let mut fulltext = Vec::new();
@@ -155,12 +157,12 @@ pub(super) fn prepare_search_inputs(
 		}
 		let definition = choose_fulltext_definition(definitions, access)?;
 		prepared_fulltext.insert(expression.span.offset, PreparedFulltext {
-			terms: fulltext_query_terms(*op, right, definition, slots, source, control)?,
+			terms: fulltext_query_terms(*op, right, definition, slots, source, fields, control)?,
 			definition: definition.clone(),
 		});
 	}
 	let knn = knn
-		.map(|expression| prepare_knn_input(expression, access, slots, source, control))
+		.map(|expression| prepare_knn_input(expression, access, slots, source, fields, control))
 		.transpose()?;
 	Ok(PreparedSearch {
 		fulltext: prepared_fulltext,
@@ -299,6 +301,7 @@ pub(super) fn try_physical_fulltext<Read: QueryRead>(
 			&document.record_id,
 			graph,
 			definition.field.as_ref(),
+			Some(control),
 		)? {
 			Value::String(value) => value.as_str().into(),
 			Value::None | Value::Null => {
@@ -651,6 +654,7 @@ fn collect_nested_search<'a>(
 		}
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
+		| TypedExprKind::LiveSlot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_)
 		| TypedExprKind::Closure(_)
@@ -731,7 +735,8 @@ fn prepare_fulltext<Read: QueryRead>(
 			));
 		};
 		document_count = document_count.saturating_add(1);
-		let tokens = analyze_text(definition, text.as_str(), control, source)?;
+		let tokens =
+			analyze_text(definition, text.as_str(), control, source, None, &|_, _| Ok(()))?;
 		total_length = total_length.saturating_add(tokens.len() as u64);
 		let mut present = BTreeSet::new();
 		for token in tokens {
@@ -756,7 +761,8 @@ fn prepare_fulltext<Read: QueryRead>(
 		let (matched, score, text, spans) = match value {
 			Value::None | Value::Null => (false, 0.0, Box::<str>::from(""), Vec::new()),
 			Value::String(text) => {
-				let tokens = analyze_text(definition, text.as_str(), control, source)?;
+				let tokens =
+					analyze_text(definition, text.as_str(), control, source, None, &|_, _| Ok(()))?;
 				let mut term_frequency = BTreeMap::<Box<str>, u64>::new();
 				let mut spans = Vec::new();
 				for token in &tokens {
@@ -822,9 +828,10 @@ fn fulltext_query_terms(
 	definition: &LogicalFulltextDefinition,
 	slots: &[Value],
 	source: &str,
+	fields: &dyn AtomFieldRead,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<BTreeSet<Box<str>>> {
-	let query = eval(right, None, slots, source, None, Some(control))?;
+	let query = eval(right, None, slots, source, Some(fields), Some(control))?;
 	let inputs = match (op, query) {
 		(
 			crate::syn::FulltextOperator::Any | crate::syn::FulltextOperator::Slot(_),
@@ -850,9 +857,23 @@ fn fulltext_query_terms(
 			));
 		}
 	};
+	let admit = |bytes, work| {
+		if fields.bounded() {
+			fields.work(work)?;
+			fields.admit(bytes)
+		} else if control.has_reactive_copies() {
+			control.admit_reactive_work(work)?;
+			control.admit_reactive_bytes(bytes)
+		} else {
+			Ok(())
+		}
+	};
 	let mut terms = BTreeSet::<Box<str>>::new();
 	for input in inputs {
-		for token in analyze_text(definition, input.as_str(), control, source)? {
+		for token in
+			analyze_text(definition, input.as_str(), control, source, Some(fields), &admit)?
+		{
+			admit(token.term.len() + 256, 1)?;
 			terms.insert(token.term.as_str().into());
 		}
 	}
@@ -864,14 +885,29 @@ fn analyze_text(
 	input: &str,
 	control: &ExecutionControl,
 	source: &str,
+	fields: Option<&dyn AtomFieldRead>,
+	admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<Vec<crate::datastore::AnalyzedToken>> {
 	if let Some(function) = definition.analyzer_function {
 		let plan = control.resolve_named_function(function)?;
 		let _frame = control.enter_named_function(function)?;
-		let result = invoke_logical_closure(control, &plan, &[], &[Value::from(input)], source)?;
-		crate::datastore::analyze_function_result(&definition.analyzer, input, &result)
+		admit(input.len() + size_of::<Value>(), 1)?;
+		let result = invoke_logical_closure_with_fields(
+			control,
+			&plan,
+			&[],
+			&[Value::from(input)],
+			source,
+			fields,
+		)?;
+		crate::datastore::analyze_function_result_bounded(
+			&definition.analyzer,
+			input,
+			&result,
+			admit,
+		)
 	} else {
-		crate::datastore::analyze_builtin(&definition.analyzer, input)
+		crate::datastore::analyze_builtin_bounded(&definition.analyzer, input, admit)
 	}
 }
 
@@ -1038,9 +1074,11 @@ fn prepare_knn_input(
 	access: &LogicalSelectAccess,
 	slots: &[Value],
 	source: &str,
+	fields: &dyn AtomFieldRead,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<PreparedKnn> {
 	let TypedExprKind::Knn {
+		left,
 		k,
 		ef,
 		distance,
@@ -1052,9 +1090,10 @@ fn prepare_knn_input(
 		unreachable!("KNN collection retained a non-KNN expression")
 	};
 	let definition = choose_vector_definition(definitions, access, ef.is_some())?;
-	let k = positive_usize(eval(k, None, slots, source, None, Some(control))?, "KNN K")?;
+	let k = positive_usize(eval(k, None, slots, source, Some(fields), Some(control))?, "KNN K")?;
 	let ef = if let Some(ef) = ef {
-		let ef = positive_usize(eval(ef, None, slots, source, None, Some(control))?, "KNN EF")?;
+		let ef =
+			positive_usize(eval(ef, None, slots, source, Some(fields), Some(control))?, "KNN EF")?;
 		if ef < k {
 			return Err(FerrosGrynnError::invalid_argument("KNN EF must be at least K"));
 		}
@@ -1062,15 +1101,21 @@ fn prepare_knn_input(
 	} else {
 		None
 	};
-	let Value::Vector(query) = eval(right, None, slots, source, None, Some(control))? else {
+	let Value::Vector(query) = eval(right, None, slots, source, Some(fields), Some(control))?
+	else {
 		return Err(FerrosGrynnError::invalid_argument("KNN query must evaluate to a vector"));
 	};
+	if left.ty != Type::Vector(query.kind()) {
+		return Err(FerrosGrynnError::invalid_argument(
+			"KNN field and query vector element types must match",
+		));
+	}
 	Ok(PreparedKnn {
 		predicate: expression.span.offset,
 		k,
 		ef,
 		query,
-		distance: runtime_distance(distance, slots, source, control)?,
+		distance: runtime_distance(distance, slots, source, fields, control)?,
 		definition,
 	})
 }
@@ -1185,12 +1230,13 @@ fn runtime_distance(
 	distance: &LogicalKnnDistance,
 	slots: &[Value],
 	source: &str,
+	fields: &dyn AtomFieldRead,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<RuntimeDistance> {
 	match distance {
 		LogicalKnnDistance::Builtin(distance) => Ok(RuntimeDistance::Builtin(*distance)),
 		LogicalKnnDistance::Minkowski(exponent) => {
-			let value = eval(exponent, None, slots, source, None, Some(control))?;
+			let value = eval(exponent, None, slots, source, Some(fields), Some(control))?;
 			let exponent =
 				value.as_number().and_then(|number| f64::try_from(number).ok()).ok_or_else(
 					|| FerrosGrynnError::invalid_argument("MINKOWSKI exponent must be numeric"),
@@ -1201,7 +1247,8 @@ fn runtime_distance(
 		}
 		LogicalKnnDistance::Named(function) => Ok(RuntimeDistance::Named(*function)),
 		LogicalKnnDistance::Callable(callable) => {
-			let Value::Closure(closure) = eval(callable, None, slots, source, None, Some(control))?
+			let Value::Closure(closure) =
+				eval(callable, None, slots, source, Some(fields), Some(control))?
 			else {
 				return Err(FerrosGrynnError::invalid_argument(
 					"custom KNN distance must evaluate to a closure",

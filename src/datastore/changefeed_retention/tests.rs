@@ -95,6 +95,163 @@ fn purge(store: &Datastore, time: i128) -> FerrosGrynnResult<()> {
 	)
 }
 
+/// The same TTL publisher retires computed groups while old replay pins stay
+/// valid.
+fn live_prefix_purge(store: &Datastore) -> FerrosGrynnResult<()> {
+	use crate::live::{
+		LiveExpr,
+		LiveGapReason,
+		LiveNext,
+		LiveOptions,
+		LivePayload,
+		LiveProjection,
+		LiveQuery,
+		LiveSource,
+	};
+	let (feed, record, key) = fixture(store)?;
+	let class = store.begin().changefeed_info(feed)?.source();
+	let ChangefeedSource::Class(class) = class else {
+		return Err(FerrosGrynnError::invalid_argument("expected class source"));
+	};
+	let initial = store.subscribe_live(
+		LiveQuery::new(LiveSource::Class(class)).with_projection(LiveProjection::Value(
+			LiveExpr::Field(crate::live::LivePath::new(vec!["properties".into(), "value".into()])?),
+		)),
+		LiveOptions::default().with_queue(10, 1 << 20)?,
+	)?;
+	let saved = initial.cursor().clone();
+	drop(initial);
+	let mut update = store.begin();
+	update.set_base_property(&record, key, 2.into())?;
+	let first = update.commit()?.versionstamp();
+	let first_time = store.inner.current_root().committed_at_ns;
+	let mut update = store.begin();
+	update.set_base_property(&record, key, 3.into())?;
+	let second = update.commit()?.versionstamp();
+	let second_time = store.inner.current_root().committed_at_ns;
+	assert!(second_time > first_time, "separate commits provide a partial TTL boundary");
+	let mut pinned = store.resume_live(&saved)?;
+	purge(store, first_time + TTL)?;
+	let current = store.inner.current_root();
+	assert_eq!(current.live_catalog().histories[&saved.live_id()].purged_through, first.get());
+	let info = store.begin().live_info(saved.live_id())?;
+	let history = info.history().ok_or_else(|| {
+		FerrosGrynnError::invalid_argument("public partial purge metadata missing")
+	})?;
+	assert_eq!(history.purged_through(), first);
+	assert_eq!(history.last_stamp(), second);
+	assert_eq!(
+		history.purged_at().map(|time| time.as_inner().timestamp().as_nanosecond()),
+		Some(first_time)
+	);
+	let LiveNext::Delivery(old) = pinned.next()? else {
+		return Err(FerrosGrynnError::invalid_argument("pinned replay disappeared"));
+	};
+	assert_eq!(old.token().versionstamp(), first);
+	assert!(matches!(old.payload(), LivePayload::Batch(_)));
+	drop(pinned);
+	let mut fresh = store.resume_live(&saved)?;
+	let LiveNext::Delivery(gap) = fresh.next()? else {
+		return Err(FerrosGrynnError::invalid_argument("missing retention GAP"));
+	};
+	assert!(
+		matches!(gap.payload(), LivePayload::Gap(gap) if gap.reason() == LiveGapReason::Retention && gap.through() == Some(first))
+	);
+	fresh.ack(gap.token())?;
+	let LiveNext::Delivery(tail) = fresh.next()? else {
+		return Err(FerrosGrynnError::invalid_argument("missing retained tail"));
+	};
+	assert_eq!(tail.token().versionstamp(), second);
+	assert!(matches!(tail.payload(), LivePayload::Batch(_)));
+	drop(fresh);
+	purge(store, second_time + TTL)?;
+	let current = store.inner.current_root();
+	assert_eq!(current.live_catalog().histories[&saved.live_id()].purged_through, second.get());
+	assert!(!current.live_segments().contains_key(&saved.live_id()));
+	assert!(!current.live_history().keys().any(|(id, _)| *id == saved.live_id()));
+	let info = store.begin().live_info(saved.live_id())?;
+	let history = info.history().ok_or_else(|| {
+		FerrosGrynnError::invalid_argument("public complete purge metadata missing")
+	})?;
+	assert_eq!(history.purged_through(), second);
+	assert_eq!(history.last_stamp(), second, "purge does not lower the recorded watermark");
+	assert_eq!(
+		history.purged_at().map(|time| time.as_inner().timestamp().as_nanosecond()),
+		Some(second_time)
+	);
+	let mut empty = store.resume_live(&saved)?;
+	let LiveNext::Delivery(gap) = empty.next()? else {
+		return Err(FerrosGrynnError::invalid_argument("empty catalog lost its floor"));
+	};
+	assert!(
+		matches!(gap.payload(), LivePayload::Gap(gap) if gap.reason() == LiveGapReason::Retention && gap.through() == Some(second))
+	);
+	Ok(())
+}
+
+#[test]
+fn live_retention_ram_prefix_and_pins() -> FerrosGrynnResult<()> {
+	live_prefix_purge(&Datastore::in_memory())
+}
+
+#[cfg(windows)]
+#[test]
+fn live_retention_local_sync_prefix_and_pins() -> FerrosGrynnResult<()> {
+	let directory = Directory::new();
+	live_prefix_purge(&Datastore::create_local(&directory.0, LocalOptions::default())?)
+}
+
+/// Shortened capture TTL can drain the final page through the partial path.
+#[cfg(windows)]
+#[test]
+fn live_retention_local_ttl_change_drains_partial_segment_and_reopens() -> FerrosGrynnResult<()> {
+	use crate::live::{LiveNext, LiveOptions, LivePayload, LiveQuery, LiveSource};
+	let directory = Directory::new();
+	let store = Datastore::create_local(&directory.0, LocalOptions::default())?;
+	let (feed, record, key) = fixture(&store)?;
+	let ChangefeedSource::Class(class) = store.begin().changefeed_info(feed)?.source() else {
+		return Err(FerrosGrynnError::invalid_argument("expected class source"));
+	};
+	let initial =
+		store.subscribe_live(LiveQuery::new(LiveSource::Class(class)), LiveOptions::default())?;
+	let saved = initial.cursor().clone();
+	drop(initial);
+	let short = 60_000_000_000;
+	let mut update = store.begin();
+	update.configure_changefeed(
+		ChangefeedSource::Class(class),
+		ChangefeedConfig::from_nanoseconds(short)?,
+	)?;
+	update.set_base_property(&record, key, 2.into())?;
+	let stamp = update.commit()?.versionstamp();
+	let time = store.inner.current_root().committed_at_ns;
+	assert!(store.inner.current_root().live_segments().contains_key(&saved.live_id()));
+	purge(&store, time + short)?;
+	assert!(!store.inner.current_root().live_segments().contains_key(&saved.live_id()));
+	assert_eq!(
+		store.inner.current_root().live_catalog().histories[&saved.live_id()].retained_page,
+		0
+	);
+	store.checkpoint(CheckpointMode::Restart)?;
+	drop(store);
+	let store = Datastore::open_local(&directory.0, LocalOptions::default())?;
+	let mut resumed = store.resume_live(&saved)?;
+	let LiveNext::Delivery(gap) = resumed.next()? else {
+		return Err(FerrosGrynnError::invalid_argument("missing reopened purge floor"));
+	};
+	assert!(matches!(gap.payload(), LivePayload::Gap(gap) if gap.through() == Some(stamp)));
+	Ok(())
+}
+
+#[cfg(all(windows, feature = "native-async-io"))]
+#[test]
+fn live_retention_local_native_async_prefix_and_pins() -> FerrosGrynnResult<()> {
+	let directory = Directory::new();
+	let mut options = LocalOptions::default();
+	options.io_mode = crate::datastore::IoMode::NativeAsync;
+	live_prefix_purge(&Datastore::create_local(&directory.0, options)?)
+}
+
 /// Obtains one complete public batch rather than peeking into stored DTOs.
 fn batch(
 	tx: &mut crate::datastore::Transaction,

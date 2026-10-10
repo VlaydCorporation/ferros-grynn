@@ -27,7 +27,6 @@ const MAX_FIXED_TIME_ZONE_OFFSET: i32 = 86_400;
 const MAX_IANA_TIME_ZONE_ID: u32 = FIRST_FIXED_TIME_ZONE_ID - 1;
 
 pub use context::{DecodeContext, EncodeContext};
-pub(crate) use dto::tree_allocation_bytes;
 pub use dto::{
 	StorageAtomRef,
 	StorageBound,
@@ -44,6 +43,8 @@ pub use dto::{
 pub(crate) use order_key::encode_index_prefix;
 pub use order_key::{encode_index_key, validate_index_type};
 pub use tags_refs::{DiskAtomRef, DiskGraphRef, QualifiedAtomRef, TypeTag};
+
+pub(crate) use crate::memory::tree_allocation_bytes;
 
 fn canonical_f64(value: f64) -> u64 {
 	if value.is_nan() {

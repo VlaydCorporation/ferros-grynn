@@ -855,7 +855,7 @@ impl Transaction {
 		let id = class.id().ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("published class is missing ClassId")
 		})?;
-		self.working.remove_class(id)?;
+		self.working.remove_class(id, self.snapshot.commit_ts)?;
 		self.retire_missing_changefeeds()?;
 		self.write_bytes += SCHEMA_WRITE_BYTES;
 		self.mutations.push(Mutation::RemoveClass(id));

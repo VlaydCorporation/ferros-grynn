@@ -7,7 +7,7 @@ use crate::{
 	datastore::{DatabaseRoot, GlobalAtomId, OccurrenceState, OverlayValue},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::{AtomId, AtomOccurrenceRef, AtomRef, EdgeEndpoint, GraphId, GraphRef},
-	values::{Number, Object, Value},
+	values::Object,
 };
 
 /// Aggregate capture scratch admission, performed before copies and growth.
@@ -329,84 +329,7 @@ pub(super) fn same_image(left: Option<&ChangeImage>, right: Option<&ChangeImage>
 }
 
 /// Compares named properties in canonical key order.
-fn same_object(left: &Object, right: &Object) -> bool {
-	left.len() == right.len()
-		&& left.iter().zip(right).all(|((lk, lv), (rk, rv))| lk == rk && same_value(lv, rv))
-}
-
-/// Numeric storage preserves variant and decimal mantissa/scale.
-#[allow(
-	clippy::float_cmp,
-	reason = "captured numeric equality deliberately uses exact comparison with no epsilon ties"
-)]
-pub(super) fn same_number(left: Number, right: Number) -> bool {
-	match (left, right) {
-		(Number::Int(left), Number::Int(right)) => left == right,
-		(Number::Float(left), Number::Float(right)) => {
-			left == right || left.is_nan() && right.is_nan()
-		}
-		(Number::Decimal(left), Number::Decimal(right)) => {
-			left.mantissa() == right.mantissa() && left.scale() == right.scale()
-		}
-		_ => false,
-	}
-}
-
-/// Recurses through numeric cells; nonnumeric scalar equality stays unchanged.
-pub(super) fn same_value(left: &Value, right: &Value) -> bool {
-	match (left, right) {
-		(Value::Number(left), Value::Number(right)) => same_number(*left, *right),
-		(Value::Object(left), Value::Object(right)) => same_object(left, right),
-		(Value::Array(left), Value::Array(right)) => {
-			left.len() == right.len()
-				&& left.iter().zip(right).all(|(left, right)| same_value(left, right))
-		}
-		(Value::Set(left), Value::Set(right)) => {
-			left.len() == right.len()
-				&& left.iter().zip(right).all(|(left, right)| same_value(left, right))
-		}
-		(Value::Range(left), Value::Range(right)) => {
-			same_bound(left.start(), right.start()) && same_bound(left.end(), right.end())
-		}
-		(Value::Vector(left), Value::Vector(right)) => left.kind() == right.kind() && left == right,
-		(Value::DateTime(left), Value::DateTime(right)) => {
-			left.as_inner().timestamp() == right.as_inner().timestamp()
-				&& left.as_inner().time_zone() == right.as_inner().time_zone()
-		}
-		(Value::Duration(left), Value::Duration(right)) => {
-			duration_units(*left) == duration_units(*right)
-		}
-		_ => left.kind() == right.kind() && left == right,
-	}
-}
-
-/// Canonical range encoding preserves inclusive and exclusive markers.
-fn same_bound(left: std::ops::Bound<&Value>, right: std::ops::Bound<&Value>) -> bool {
-	match (left, right) {
-		(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded) => true,
-		(std::ops::Bound::Included(left), std::ops::Bound::Included(right))
-		| (std::ops::Bound::Excluded(left), std::ops::Bound::Excluded(right)) => same_value(left, right),
-		_ => false,
-	}
-}
-
-/// Canonical duration retains each signed stored component, without unit
-/// folding.
-fn duration_units(value: crate::values::Duration) -> [i64; 10] {
-	let span = value.as_inner();
-	[
-		i64::from(span.get_years()),
-		i64::from(span.get_months()),
-		i64::from(span.get_weeks()),
-		i64::from(span.get_days()),
-		i64::from(span.get_hours()),
-		span.get_minutes(),
-		span.get_seconds(),
-		span.get_milliseconds(),
-		span.get_microseconds(),
-		span.get_nanoseconds(),
-	]
-}
+pub(super) use crate::values::runtime::{same_number, same_object, same_value};
 
 /// Typed malformed normalized-state error.
 fn invalid(detail: &str) -> FerrosGrynnError {

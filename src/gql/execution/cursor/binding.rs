@@ -57,8 +57,7 @@ pub(in crate::gql::execution) struct ResolvedPathExpand {
 
 pub(in crate::gql::execution) fn resolve_match_binding(
 	binding: &MatchBinding,
-	slots: &[Value],
-	source: &str,
+	predicate: MatchPredicateContext<'_>,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<ResolvedMatchBinding> {
 	let selector = match &binding.selector {
@@ -67,7 +66,14 @@ pub(in crate::gql::execution) fn resolve_match_binding(
 		LogicalMatchSelector::Record(record) => {
 			ResolvedMatchSelector::Record(RecordId::from_value(
 				record.class.as_ref(),
-				eval(&record.key, None, slots, source, None, Some(control))?,
+				eval(
+					&record.key,
+					None,
+					predicate.slots,
+					predicate.source,
+					Some(predicate.fields),
+					Some(control),
+				)?,
 			)?)
 		}
 	};
@@ -84,14 +90,13 @@ pub(in crate::gql::execution) fn resolve_match_binding(
 
 pub(in crate::gql::execution) fn resolve_expand(
 	expand: &Expand,
-	slots: &[Value],
-	source: &str,
+	predicate: MatchPredicateContext<'_>,
 	control: &ExecutionControl,
 	mode: crate::syn::MatchMode,
 ) -> FerrosGrynnResult<ResolvedExpand> {
 	Ok(ResolvedExpand {
-		edge: resolve_match_binding(&expand.edge, slots, source, control)?,
-		target: resolve_match_binding(&expand.target, slots, source, control)?,
+		edge: resolve_match_binding(&expand.edge, predicate, control)?,
+		target: resolve_match_binding(&expand.target, predicate, control)?,
 		direction: expand.direction,
 		mode,
 		custom_cost: expand.custom_cost,
@@ -101,17 +106,17 @@ pub(in crate::gql::execution) fn resolve_expand(
 
 pub(in crate::gql::execution) fn resolve_path_expand(
 	expand: &PathExpand,
-	slots: &[Value],
-	source: &str,
+	predicate: MatchPredicateContext<'_>,
 	control: &ExecutionControl,
 	match_mode: crate::syn::MatchMode,
+	max_depth: u32,
 ) -> FerrosGrynnResult<ResolvedPathExpand> {
 	Ok(ResolvedPathExpand {
-		edge: resolve_match_binding(&expand.edge, slots, source, control)?,
-		target: resolve_match_binding(&expand.target, slots, source, control)?,
+		edge: resolve_match_binding(&expand.edge, predicate, control)?,
+		target: resolve_match_binding(&expand.target, predicate, control)?,
 		direction: expand.direction,
 		min: expand.min,
-		max: expand.max,
+		max: expand.maximum(max_depth),
 		path_column: expand.path_column,
 		match_mode,
 		path_mode: expand.mode,

@@ -592,7 +592,7 @@ impl DatabaseRoot {
 	}
 
 	/// Removes an empty class and all of its derived index/statistics state.
-	pub(crate) fn remove_class(&mut self, id: ClassId) -> FerrosGrynnResult<()> {
+	pub(crate) fn remove_class(&mut self, id: ClassId, published_at: u64) -> FerrosGrynnResult<()> {
 		let current = self
 			.schema
 			.class_by_id(id)
@@ -608,6 +608,7 @@ impl DatabaseRoot {
 		catalog.classes.remove(&id);
 		catalog.class_names.remove(current.name().as_str());
 		catalog.class_versions.remove(&id);
+		next.mark_version(crate::datastore::ConflictKey::ClassCatalogRange, published_at);
 		next.rebuild_derived_state()?;
 		*self = next;
 		Ok(())

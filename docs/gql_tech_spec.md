@@ -352,6 +352,11 @@ runtime `Value`; публичный facade находится в `src/gql/mod.rs
 Типизация `Γ ⊢ expr : T` (§24 gql_spec). Первый read-only срез использует направленный вывод и
 локальную унификацию `number`, `option` и union. Общий Hindley–Milner solver вводится вместе с
 closures/UDF, когда появится его первый потребитель.
+Nullable widening идемпотентен: объединение `option<T>` с `NONE`/`NULL` сохраняет
+`option<T>` в любом порядке. Повторные nullable results CASE/Array/Set не увеличивают
+глубину inferred type по числу branches/items; обычные values не меняются.
+Optional и nonnullable branches унифицируют inner types под одной nullable оболочкой:
+`option<T> ∪ U = option<T ∪ U>`, `option<T> ∪ option<U> = option<T ∪ U>`.
 
 Типовые домены (§59.2 gql_spec):
 1. Value: `int | float | decimal | string | bool | bytes | datetime | duration | …`
@@ -1381,6 +1386,10 @@ UserSeed + PlanHash`. Effective seed включает versioned query/parameter 
 При равенстве fixed-point стоимости выбираются лексикографически минимальные canonical physical
 plan bytes. `PlanHash` вычисляется RapidHash V3 по этим versioned bytes. `DefaultHasher`, Debug
 output и iteration order hash maps запрещены и для effective seed, и для `PlanHash`.
+Encoding version 8 включает resolved GraphId MATCH. Deferred embedded MATCH до
+invocation хранит absent identity, conservative bounds и warning; tensor format/scope
+помечаются DYNAMIC. Runtime binding выполняется из statement snapshot перед CBO,
+причём graph families и artifacts выбираются по реальному GraphRef без копии patterns.
 
 ---
 

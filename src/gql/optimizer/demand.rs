@@ -38,6 +38,9 @@ impl PlannerDemand {
 	/// SELECT, including nested SELECT expressions.
 	pub(in crate::gql) fn for_select(select: &LogicalSelect) -> Self {
 		let mut demand = Self::default();
+		for input in &select.union_inputs {
+			demand.merge(Self::for_select(input));
+		}
 		let mut owners = Vec::new();
 		let mut offset = 0;
 		collect_source(&select.source, offset, &mut demand, &mut owners);
@@ -60,6 +63,10 @@ impl PlannerDemand {
 			if let LogicalSelectItem::Expression {
 				expression,
 				..
+			}
+			| LogicalSelectItem::WildcardVariants {
+				selector: expression,
+				..
 			} = item
 			{
 				collect_expr(Some(expression), &owners, &mut demand);
@@ -77,9 +84,31 @@ impl PlannerDemand {
 	/// Discovers graph, class, label, and degree metadata used by current
 	/// MATCH.
 	pub(in crate::gql) fn for_match(statement: &LogicalMatch) -> Self {
+		let graph = match &statement.graph {
+			LogicalGraphReference::Static(graph) => Some(graph.id()),
+			LogicalGraphReference::Expression(_) => None,
+		};
+		Self::match_graph(statement, graph)
+	}
+
+	/// Collects statistics for the graph resolved by this MATCH invocation.
+	pub(in crate::gql) fn for_match_bound(
+		statement: &LogicalMatch,
+		graph: crate::graph::GraphId,
+	) -> Self {
+		Self::match_graph(statement, Some(graph))
+	}
+
+	/// Retains expression demand while graph-specific statistics await binding.
+	fn match_graph(statement: &LogicalMatch, graph: Option<crate::graph::GraphId>) -> Self {
 		let mut demand = Self::default();
-		let graph = statement.graph.id();
-		demand.graphs.insert(graph);
+		if let Some(graph) = graph {
+			demand.graphs.insert(graph);
+		}
+		if let LogicalGraphReference::Expression(expression) = &statement.graph {
+			collect_expr(Some(expression), &[], &mut demand);
+		}
+		collect_expr(statement.max_depth_binding.as_ref(), &[], &mut demand);
 		for pattern in &statement.patterns {
 			match &pattern.kind {
 				LogicalMatchPatternKind::Linear(pattern) => {
@@ -102,13 +131,19 @@ impl PlannerDemand {
 						collect_match_binding(edge, &mut demand);
 						collect_match_binding(target, &mut demand);
 						for direction in degree_directions(direction) {
-							demand.degrees.entry(graph).or_default().insert(DegreeHistogramKey {
-								label: source.label.as_ref().map(|label| LabelStatisticKey {
-									kind: source.domain.atom_kind(),
-									label: label.as_ref().into(),
-								}),
-								direction,
-							});
+							if let Some(graph) = graph {
+								demand.degrees.entry(graph).or_default().insert(
+									DegreeHistogramKey {
+										label: source.label.as_ref().map(|label| {
+											LabelStatisticKey {
+												kind: source.domain.atom_kind(),
+												label: label.as_ref().into(),
+											}
+										}),
+										direction,
+									},
+								);
+							}
 						}
 					}
 				}
@@ -362,6 +397,17 @@ fn collect_source(
 	owners: &mut Vec<AtomColumns>,
 ) {
 	match &source.kind {
+		LogicalSelectSourceKind::Empty {
+			graph,
+		} => match graph {
+			Some(LogicalGraphReference::Static(graph)) => {
+				demand.graphs.insert(graph.id());
+			}
+			Some(LogicalGraphReference::Expression(expression)) => {
+				collect_expr(Some(expression), owners, demand);
+			}
+			None => {}
+		},
 		LogicalSelectSourceKind::Atoms {
 			target,
 			graph,
@@ -406,6 +452,24 @@ fn collect_source(
 			}
 			None => demand.all_graphs = true,
 		},
+		LogicalSelectSourceKind::AtomUnion {
+			targets,
+			graph,
+			..
+		} => {
+			for target in targets {
+				demand.classes.insert(target.class().into());
+			}
+			match graph {
+				Some(LogicalGraphReference::Static(graph)) => {
+					demand.graphs.insert(graph.id());
+				}
+				Some(LogicalGraphReference::Expression(expression)) => {
+					collect_expr(Some(expression), owners, demand);
+				}
+				None => {}
+			}
+		}
 		LogicalSelectSourceKind::Derived(select) => {
 			demand.merge(PlannerDemand::for_select(select));
 		}
@@ -570,6 +634,7 @@ fn collect_expr(
 		}
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
+		| TypedExprKind::LiveSlot(_)
 		| TypedExprKind::CurrentField(_)
 		| TypedExprKind::Closure(_) => {}
 	}

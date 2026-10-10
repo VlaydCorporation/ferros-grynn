@@ -373,7 +373,7 @@ pub(super) fn backfill_atom_store_checkpoint(
 				return Err(invalid("checkpoint selected an invalid AtomStore superblock frame"));
 			}
 			let mut page = AlignedPage::zeroed();
-			wal.read_frame(*frame, &mut page)?;
+			wal.frame_read_scope().read_frame(*frame, &mut page)?;
 			logical_superblock = Some(AtomStoreSuperblock::decode(&page)?);
 			continue;
 		}

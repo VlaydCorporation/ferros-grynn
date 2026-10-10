@@ -298,6 +298,9 @@ impl FrameWal {
 			});
 		}
 
+		// Lock order matches checkpoint publication: prune gate → writer.
+		// Reserved version vectors cannot disappear before visibility handoff.
+		let _prune_gate = self.inner.prune_gate.read();
 		let mut writer = self.inner.writer.lock();
 		if writer.health == WriterHealth::Poisoned {
 			return Err(io_failure(
@@ -306,8 +309,11 @@ impl FrameWal {
 			));
 		}
 
+		// Checkpoint pruning must not remove version vectors whose next slot
+		// is admitted here. Writer serialization prevents concurrent inserts.
+		let mut new_versions = RapidHashMap::default();
 		let commit_ts = {
-			let published = self.inner.published.read();
+			let mut published = self.inner.published.write();
 			for key in tx.staged.keys() {
 				if published
 					.latest_commit
@@ -321,6 +327,34 @@ impl FrameWal {
 						tx.id.get(),
 						format!("page {:?} changed after the transaction snapshot", key),
 					));
+				}
+			}
+			let missing_versions =
+				tx.staged.keys().filter(|key| !published.versions.contains_key(*key)).count();
+			let missing_latest =
+				tx.staged.keys().filter(|key| !published.latest_commit.contains_key(*key)).count();
+			published.versions.try_reserve(missing_versions).map_err(|error| {
+				invalid_wal("WAL visibility allocation failed").with_technical_source(error)
+			})?;
+			published.latest_commit.try_reserve(missing_latest).map_err(|error| {
+				invalid_wal("WAL commit map allocation failed").with_technical_source(error)
+			})?;
+			new_versions.try_reserve(missing_versions).map_err(|error| {
+				invalid_wal("WAL new version admission failed").with_technical_source(error)
+			})?;
+			for key in tx.staged.keys() {
+				if let Some(versions) = published.versions.get_mut(key) {
+					versions.try_reserve(1).map_err(|error| {
+						invalid_wal("WAL version slot allocation failed")
+							.with_technical_source(error)
+					})?;
+				} else {
+					let mut versions = Vec::<FrameVersion>::new();
+					versions.try_reserve_exact(1).map_err(|error| {
+						invalid_wal("WAL first version allocation failed")
+							.with_technical_source(error)
+					})?;
+					new_versions.insert(*key, versions);
 				}
 			}
 			published
@@ -341,6 +375,10 @@ impl FrameWal {
 			writer.rotate(&self.inner.directory)?;
 		}
 
+		let mut publication = Vec::new();
+		publication.try_reserve_exact(tx.staged.len()).map_err(|error| {
+			invalid_wal("WAL publication admission failed").with_technical_source(error)
+		})?;
 		#[cfg(test)]
 		inject_commit_failure(&mut writer, CommitFailurePoint::BeforeAppend)?;
 		let append_result = writer.append_transaction(tx.id, commit_ts, &mut tx.staged);
@@ -351,6 +389,14 @@ impl FrameWal {
 				return Err(error);
 			}
 		};
+		// Validate the private insertion plan before the durability barrier.
+		for (key, version) in committed_frames {
+			let mut new = new_versions.remove(&key);
+			if let Some(versions) = &mut new {
+				versions.push(version);
+			}
+			publication.push((key, version, new));
+		}
 
 		#[cfg(test)]
 		inject_commit_failure(&mut writer, CommitFailurePoint::AfterAppend)?;
@@ -369,8 +415,12 @@ impl FrameWal {
 		inject_commit_failure(&mut writer, CommitFailurePoint::AfterSync)?;
 		{
 			let mut published = self.inner.published.write();
-			for (key, version) in committed_frames {
-				published.versions.entry(key).or_default().push(version);
+			for (key, version, new) in publication {
+				if let Some(versions) = new {
+					published.versions.insert(key, versions);
+				} else if let Some(versions) = published.versions.get_mut(&key) {
+					versions.push(version);
+				}
 				published.latest_commit.insert(key, commit_lsn);
 				published.next_file_instance_id =
 					published.next_file_instance_id.max(file_instance_successor(key.file_id()));
@@ -439,19 +489,13 @@ impl FrameWal {
 			.max()
 	}
 
-	/// Reads and validates one previously resolved complete frame.
-	///
-	/// # Errors
-	///
-	/// Returns an I/O error, invalid page error, or a mismatch between the
-	/// version index and the persisted page LSN.
-	pub(in crate::storage) fn read_frame(
-		&self,
-		frame: ResolvedFrame,
-		output: &mut AlignedPage,
-	) -> FerrosGrynnResult<PageHeader> {
-		let _prune_gate = self.inner.prune_gate.read();
-		self.read_frame_unlocked(frame, output)
+	/// Pins segments and reuses one handle for a bounded physical read scope.
+	pub(in crate::storage) fn frame_read_scope(&self) -> FrameReadScope<'_> {
+		FrameReadScope {
+			wal: self,
+			segment: None,
+			_prune_gate: self.inner.prune_gate.read(),
+		}
 	}
 
 	/// Loads one resolved frame while the caller holds the shared prune gate.
@@ -461,24 +505,68 @@ impl FrameWal {
 		output: &mut AlignedPage,
 	) -> FerrosGrynnResult<PageHeader> {
 		let path = segment_path(&self.inner.directory, frame.version.location.segment_start_lsn);
-		// ponytail: open per cache miss; add a bounded segment-handle cache
-		// only if profiles show this open in the read-path budget.
+		// Singleton reads open once; checkpoint scopes reuse the segment
+		// handle.
 		let mut file =
 			File::open(path).map_err(|source| io_failure("open WAL frame segment", source))?;
-		file.seek(SeekFrom::Start(frame.version.location.page_bytes_offset))
-			.map_err(|source| io_failure("seek to WAL page frame", source))?;
-		read_exact_required(&mut file, output.as_bytes_mut(), "read WAL page frame")?;
-		let header = output.validate(frame.key.page_no())?;
-		if header.page_lsn().get() != frame.version.frame_lsn.get() {
-			return Err(invalid_wal(format!(
-				"frame {} contains page LSN {}",
-				frame.version.frame_lsn.get(),
-				header.page_lsn().get()
-			)));
-		}
-		Ok(header)
+		read_frame_from(&mut file, frame, output)
 	}
 }
+
+impl FrameReadScope<'_> {
+	/// Reads a resolved frame without reopening an unchanged segment.
+	///
+	/// # Errors
+	///
+	/// Returns the existing open, seek, exact-read, page or LSN validation
+	/// error.
+	pub(in crate::storage) fn read_frame(
+		&mut self,
+		frame: ResolvedFrame,
+		output: &mut AlignedPage,
+	) -> FerrosGrynnResult<PageHeader> {
+		let start = frame.version.location.segment_start_lsn;
+		if let Some((cached, file)) = &mut self.segment
+			&& *cached == start
+		{
+			return read_frame_from(file, frame, output);
+		}
+		// Close the previous segment first: at most one handle is live.
+		self.segment = None;
+		let path = segment_path(&self.wal.inner.directory, start);
+		let mut file =
+			File::open(path).map_err(|source| io_failure("open WAL frame segment", source))?;
+		let result = read_frame_from(&mut file, frame, output);
+		self.segment = Some((start, file));
+		result
+	}
+}
+
+/// Loads and validates one resolved frame from its already opened segment.
+///
+/// # Errors
+///
+/// Returns the existing seek, exact-read, page-validation or LSN mismatch
+/// error.
+fn read_frame_from(
+	file: &mut File,
+	frame: ResolvedFrame,
+	output: &mut AlignedPage,
+) -> FerrosGrynnResult<PageHeader> {
+	file.seek(SeekFrom::Start(frame.version.location.page_bytes_offset))
+		.map_err(|source| io_failure("seek to WAL page frame", source))?;
+	read_exact_required(file, output.as_bytes_mut(), "read WAL page frame")?;
+	let header = output.validate(frame.key.page_no())?;
+	if header.page_lsn().get() != frame.version.frame_lsn.get() {
+		return Err(invalid_wal(format!(
+			"frame {} contains page LSN {}",
+			frame.version.frame_lsn.get(),
+			header.page_lsn().get()
+		)));
+	}
+	Ok(header)
+}
+
 impl WriterState {
 	/// Rotates before a transaction without splitting its records.
 	pub(in crate::storage::wal) fn rotate(&mut self, directory: &Path) -> FerrosGrynnResult<()> {

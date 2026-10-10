@@ -16,13 +16,12 @@ use crate::{
 	datastore::{ClassId, SchemaVersion},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphId,
-	storage::{ChangefeedSegment, changefeed::SegmentHeader, types::DataFileId},
 };
 
 /// Minimum descriptor bytes before its name and capture epochs.
 pub(super) const MIN_BYTES: usize = 152;
 /// Complete physical identity, trusted bounds and canonical reserved bytes.
-const SEGMENT_BYTES: usize = 128;
+const SEGMENT_BYTES: usize = super::history_segment::BYTES;
 /// Shared immutable catalog payload cap.
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum owned UTF-8 source name.
@@ -104,14 +103,15 @@ pub(super) fn encode(
 			(0, 0)
 		};
 		output.push(flags);
-		output.extend_from_slice(&[0; 7]);
+		output.extend_from_slice(&[0; 3]);
+		output.extend_from_slice(&epoch.revision().get().to_le_bytes());
 		output.extend_from_slice(&nanos.to_le_bytes());
 	}
 	let count = u32::try_from(entry.segments.len())
 		.map_err(|_error| invalid("feed segment count overflows"))?;
 	output.extend_from_slice(&count.to_le_bytes());
 	for segment in &entry.segments {
-		encode_segment(output, *segment);
+		super::history_segment::encode(output, *segment);
 	}
 	Ok(())
 }
@@ -202,7 +202,9 @@ pub(super) fn decode(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ChangefeedC
 		if flags & !7 != 0 || flags & 1 == 0 && flags != 0 {
 			return Err(invalid("capture epoch flags are invalid"));
 		}
-		decoder.expect_zero(7, "capture epoch reserved bytes")?;
+		decoder.expect_zero(3, "capture epoch reserved bytes")?;
+		let revision = SchemaVersion::new(decoder.read_u32()?)
+			.ok_or_else(|| invalid("capture epoch revision is reserved"))?;
 		let nanos = i128::from_le_bytes(
 			decoder
 				.read_exact(16)?
@@ -224,6 +226,7 @@ pub(super) fn decode(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ChangefeedC
 		};
 		epochs.push(ChangefeedCaptureEpoch {
 			started_at,
+			revision,
 			configuration,
 		});
 	}
@@ -233,7 +236,7 @@ pub(super) fn decode(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ChangefeedC
 	}
 	let mut segments = Vec::with_capacity(count);
 	for _ in 0..count {
-		segments.push(decode_segment(decoder)?);
+		segments.push(super::history_segment::decode(decoder)?);
 	}
 	Ok(ChangefeedCatalogEntry {
 		id,
@@ -254,58 +257,6 @@ pub(super) fn decode(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ChangefeedC
 		epochs,
 		segments,
 	})
-}
-
-/// Encodes a fixed-size catalog descriptor independent of mutable page headers.
-fn encode_segment(output: &mut Vec<u8>, segment: ChangefeedSegment) {
-	output.extend_from_slice(&segment.file.get().to_le_bytes());
-	let header = segment.header;
-	output.extend_from_slice(header.database.as_bytes());
-	output.extend_from_slice(header.feed.as_uuid().as_inner().as_bytes());
-	output.extend_from_slice(header.segment.as_bytes());
-	for value in [header.pages, header.commits, header.first_stamp, header.last_stamp] {
-		output.extend_from_slice(&value.to_le_bytes());
-	}
-	output.extend_from_slice(&header.first_time.to_le_bytes());
-	output.extend_from_slice(&header.last_time.to_le_bytes());
-	output.extend_from_slice(&[0; 8]);
-}
-
-/// Checks all descriptor identities and bounds before catalog publication.
-fn decode_segment(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ChangefeedSegment> {
-	let file = DataFileId::from_raw(decoder.read_u64()?)
-		.ok_or_else(|| invalid("feed file identity is invalid"))?;
-	let database = read_uuid(decoder)?;
-	let feed = ChangefeedId::from_uuid(read_uuid(decoder)?.into())
-		.map_err(|_error| invalid("feed segment source is nil"))?;
-	let segment = read_uuid(decoder)?;
-	let header = SegmentHeader {
-		database,
-		feed,
-		segment,
-		pages: decoder.read_u64()?,
-		commits: decoder.read_u64()?,
-		first_stamp: decoder.read_u64()?,
-		last_stamp: decoder.read_u64()?,
-		first_time: read_i128(decoder)?,
-		last_time: read_i128(decoder)?,
-	};
-	decoder.expect_zero(8, "feed segment reserved bytes")?;
-	header.validate()?;
-	Ok(ChangefeedSegment {
-		file,
-		header,
-	})
-}
-
-/// Decodes a complete non-nil UUID from an authoritative descriptor.
-fn read_uuid(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<uuid::Uuid> {
-	let value = uuid::Uuid::from_slice(decoder.read_exact(16)?)
-		.map_err(|_error| invalid("segment UUID is malformed"))?;
-	if value.is_nil() {
-		return Err(invalid("segment UUID is nil"));
-	}
-	Ok(value)
 }
 
 /// Reads an exact signed UTC nanosecond field without unchecked indexing.

@@ -16,6 +16,9 @@ mod query_cursor;
 mod range;
 mod record_id;
 mod regex;
+/// Durable images compare exact runtime representations without changing Eq.
+mod representation;
+pub(crate) use representation::{same_number, same_object, same_value};
 mod set;
 mod temporal;
 mod text;

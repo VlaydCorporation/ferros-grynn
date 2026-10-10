@@ -27,7 +27,14 @@ use crate::{
 /// Counts a conservative canonical buffer ceiling before the allocating hash
 /// pass.
 #[derive(Default)]
-struct HashBytes(usize);
+pub(in crate::gql::execution) struct HashBytes(usize);
+
+impl HashBytes {
+	/// Returns the conservative allocation ceiling for the canonical writer.
+	pub(in crate::gql::execution) const fn bytes(&self) -> usize {
+		self.0
+	}
+}
 
 impl Hasher for HashBytes {
 	fn finish(&self) -> u64 {
@@ -172,7 +179,7 @@ fn admit_type(value: &Type, operands: &Operands<'_>, depth: usize) -> FerrosGryn
 
 /// Includes private versions and bodies, even when rollback reuses a version.
 /// Comments do not affect execution and are excluded.
-fn hash_function(
+pub(in crate::gql::execution) fn hash_function(
 	function: &crate::datastore::SchemaFunction,
 	writer: &mut impl Hasher,
 	admission: Option<&Operands<'_>>,

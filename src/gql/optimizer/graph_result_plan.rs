@@ -57,11 +57,28 @@ pub(in crate::gql) fn plan_match_graph_result(
 	max_edges: u64,
 	barrier_bytes: usize,
 ) -> FerrosGrynnResult<PhysicalPlan> {
-	let source = PhysicalPlan::Match(plan_match(statement, snapshot, deterministic)?);
+	Ok(finish_match_graph_result(
+		statement,
+		plan_match(statement, snapshot, deterministic)?,
+		max_nodes,
+		max_edges,
+		barrier_bytes,
+	))
+}
+
+/// Wraps an already bound MATCH plan without copying its logical patterns.
+pub(in crate::gql) fn finish_match_graph_result(
+	statement: &LogicalMatch,
+	plan: super::PhysicalMatchPlan,
+	max_nodes: u64,
+	max_edges: u64,
+	barrier_bytes: usize,
+) -> PhysicalPlan {
+	let source = PhysicalPlan::Match(plan);
 	let Some(result) = &statement.return_graph else {
-		return Ok(source);
+		return source;
 	};
-	Ok(graph_plan(
+	graph_plan(
 		GraphResultOperator::GraphAssemble,
 		GraphResultMode::Anonymous,
 		Some(source),
@@ -75,7 +92,7 @@ pub(in crate::gql) fn plan_match_graph_result(
 		max_edges,
 		Cardinality::exact(1),
 		barrier_bytes,
-	))
+	)
 }
 
 /// Wraps a traversal plan when its terminal result is an owned graph.
@@ -254,5 +271,6 @@ fn output_cardinality(plan: &PhysicalPlan) -> Cardinality {
 		PhysicalPlan::Write(plan) => plan.cardinality,
 		PhysicalPlan::GraphResult(_) => Cardinality::exact(1),
 		PhysicalPlan::Changefeed(plan) => Cardinality::unknown(plan.limit.unwrap_or(u64::MAX)),
+		PhysicalPlan::Live(_) => Cardinality::exact(1),
 	}
 }

@@ -21,7 +21,105 @@ indexes и schema одним storage snapshot.
   replacement/delete/BUILD GRAPH используют общий GraphRoot maintenance path.
 - `identity` — `DataSpaceId::Database` либо ненулевой `GraphId` для будущего WAL;
 - `schema` — `ClassSchema`, `GraphSchema` и типизированные durable identities;
+- Session statement control имеет одного caller owner; explicit/autocommit
+  execution helpers заимствуют его mutable до завершения export/ACK/commit.
+  Per-statement named TIMEOUT не теряет origin или authority; inferred write
+  access включён только для autocommit. True readonly commit (нет mutations и
+  targeted intents) валидирует один current root под commit mutex; every
+  possible FULL/live publisher сохраняет прежний retry/BLOCK origin.
+- Main session loop использует existing elapsed origin только если ни parsed
+  statement, ни execution options не содержат timeout. Timed statements и
+  generic constructors сохраняют fresh origin до analysis; nested/function/
+  import relative deadlines начинаются при invocation. Commit/BLOCK clocks
+  не зависят от этого reuse.
+- Пустой GQL ACK не создаёт BarrierAccount; непустой сохраняет pre-copy
+  authority/control/byte admission и owner через commit/publication. Metadata
+  snapshot account создаётся только для INFO LIVE/INFO LIVE LET/KILL/ACK;
+  selector, pre-copy limits и error semantics остаются общими.
+- Empty scalar-index replacement plans сохраняют shared lookup ownership;
+  nonempty base changes остаются staged через fallible statistics preparation.
+  Overlay/root/statistics/artifact mutations не пропускаются. No-deferred
+  invalidation не делает COW; already-Stale deferred IDs продолжают возвращаться
+  для bounded catch-up queue, index bindings копируются только при real removal.
+- `versions` — exact FCW/SSI revisions с одним outer snapshot handle и независимыми
+  inner COW domains для primary и LIVE control keys.
+  atom(&mut Transaction) записывает readset через exclusive Mutex::get_mut;
+  graph/shared&self readers сохраняютmutex. Одна private record_revisions policy
+  хранит first-observed snapshot version для всех namespaces. Refresh/savepoint
+  сохраняют прежние map/cache rules; exclusive access не ослабляет FCW/SSI. ACK/CLOSE не копируют per-atom
+  revisions; import restamp меняет только unpublished primary stamps и переносит
+  уже committed LIVE controls без изменения. Admission предшествует COW.
 - `root` — единый immutable commit image AtomStore + graphs + logical versions;
+  Primary replay и operation-image changefeed replay используют один hydrated
+  immutable before-root. Lazy current statistics headers после reopen нельзя
+  передавать в replay, который применяет exact counter deltas; FCW/SSI остаются
+  привязаны к original current, ACK/close не требуют data hydration.
+  First ON import segment гидратирует working statistics до retained before-root;
+  spool admission и savepoints остаются у changefeed_import, OFF origin не удерживает.
+- Registration-only commit может вычислять только pending definitions при
+  неизменных actual primary/schema/capture inputs, пустых source intents и
+  bindings и прежних definitions SINCE Now. Historical/future SINCE, mixed DML
+  и binding changes сохраняют full evaluation. Catalog admission, capture
+  metadata, activation, FCW/SSI и publication не пропускаются. Identity clocks
+  не отделяют schema при равных обоих clocks; statistics revision не делает
+  COW без touched counters. Replay сравнивает hydrated before-root, FCW/SSI —
+  исходный current root.
+- `live_catalog` — snapshot-owned logical LIVE identities/recipes; registry
+  mutations используют обычные FCW/SSI replay и transaction savepoints. Consumer
+  queues не принадлежат immutable root. Исторические catalogs удерживаются одним
+  outer Arc с независимыми inner COW, без удорожания обычного root clone новым Arc.
+  Capture owner сохраняется отдельно как последняя успешная ChangefeedSource;
+  publication/backfill читают его без повторного evaluation logical recipe.
+  Reactive bindings сохраняют frozen inputs, stable source owners, PURE versions
+  и exact latest values. DAG/descriptor traversal общий с storage validation в
+  private `live::dependencies`; user evaluation идёт до commit mutex и проверяется
+  повторно вместе с root/FCW/SSI перед existing WAL barrier.
+- `live_observation` владеет constant-size process counters. Attempts/admitted
+  reserve/work наблюдаются вне commit lock; successful publication/ACK — после
+  backend barrier. Scalar summary собирается до очистки local RAM history и
+  включает fresh historical ranges по previous last_stamp/purge floor.
+  Consumer first-issue count и gauges читаются под existing queue mutex.
+  Replay использует independent existing observed-reader scope, включая errors;
+  cache/WAL page requests не выдаются за physical disk I/O.
+- `live_history` применяет final source capture policy к целому commit, сохраняет
+  private computed envelopes и capture epochs. Registry/version и source policy
+  сверяются при recovery; volatile payload не выдаётся за durable coverage.
+  Изменение epochs/last recorded stamp отмечает existing LiveCatalogRange;
+  purge использует тот же predicate. Owned INFO читает его вместе с definition
+  и direct bindings. Source result changes не делают definition отдельным FCW
+  write ради metadata. SDK/GQL проецируют один root; GQL не refresh-ит statement.
+  Dynamic class/record graph scopes публикуют успешную capture owner/name pair
+  с результатом. String operand удерживает GraphId до явной смены значения;
+  fault не перепривязывает owner/name и не отклоняет source DML. Pending activation,
+  future SINCE и reopen используют тот же durable anchor; nested graph inputs
+  остаются ordinary read dependencies.
+- `source_history` — один bounded fixed-root NET/FULL walker для transaction reads
+  и historical LIVE preparation. Public changes() сохраняет transaction borrow и
+  age/error fusion; commit evaluator не открывает вложенную transaction.
+- Обычный commit и import END используют один LIVE preparation hook вне commit
+  mutex. END сохраняет accepted-item spool для bounded retry, переносит latest
+  control metadata и назначает свежий final stamp; provisional data revisions
+  restamp-ятся, уже committed CLOSE и пользовательские Path/values — нет.
+  Writer lease допускает только самостоятельные CLOSE/ACK control commits;
+  DML, FULL no-op, schema/capture mutations и maintenance остаются запрещены.
+  Timestamp фиксируется до source/LIVE encoding и не меняется в backend barrier,
+  даже если он равен времени предыдущего commit.
+- `live_queue` — StoreInner-owned transient consumers, отдельный issued delivery
+  и pending tail; snapshots и typed IR в очереди не удерживаются. Publication
+  предварительно допускает fanout outside commit mutex и сверяет root/consumer
+  revisions под ним. ACK сохраняется обычной catalog mutation до освобождения
+  capacity. Pending SDK attachment активируется вместе с registration; Weak
+  handle не продлевает logical datastore lifetime. GAP/DISCONNECT/BLOCK применяются
+  к per-query и общему retained ceiling; control slots оплачены при attachment.
+  CommitOptions переиспользует QueryCancellation; GQL передаёт исходный deadline
+	в normal commit и import END. Ни ожидание capacity, ни user evaluation после
+  WAL barrier не допускаются. Existing-incarnation resume фиксирует cutoff/tail
+  под одним commit guard и использует persisted ACK; lazy saved-result decode
+  не удерживает primary root/transaction. Historical head оплачивается отдельно
+  от live tail, но входит в общий session ceiling. EOF/error/Drop освобождают pins
+  и holdback; decode error fuses handle без продвижения ACK. Computed TTL/floors
+  публикуются тем же PurgeChangefeed worker с captured epoch policy; exhausted
+  partial segment удаляется до publication. Fresh-registration SINCE — L8c gate.
 - Geometry definitions проверяют TYPE при BASE/EFFECTIVE DML; RAM root удерживает
   immutable STR generations, а local transaction закрепляет physical generation
   одновременно с logical snapshot при begin и Read Committed refresh.
@@ -31,6 +129,18 @@ indexes и schema одним storage snapshot.
   `GraphIncidence` conflict keys;
 - `transaction` — private root, FCW/SSI validation, bounded fanout preflight и
   replay непересекающихся writes поверх актуального root;
+  Query scalar record-field lookup сохраняет ensure_live и point SSI reads,
+  выбирает borrowed atom/occurrence и использует shared field_from_atom.
+  Selected property и id/label допускаются callback policy до copy; whole
+  properties row для scalar dereference не строится. Public DTO не расширяются.
+- Session/transaction lexical types разделяют immutable `gql::bindings`
+  metadata, не schema catalog и не public Value wrappers. TRY восстанавливает
+  types вместе с values; explicit transaction locals исчезают при COMMIT/CANCEL.
+  Autocommit готовит metadata export до WAL и заменяет session map после success.
+  Reactive flavor хранится в этой же metadata; UUID frame удерживает LIVE LET
+  identity. Borrowed value lookup фиксирует statement snapshot и SSI key до
+  admission/clone, сохраняет paused diagnostic/cause. Registry mutation и
+  lexical declaration откатываются совместно; session detach не удаляет identity.
 - `store` — datastore owner, ID clocks и один commit mutex;
 - `options`/`consts` — transaction, import и maintenance resource limits;
 - `maintenance` — один durable FIFO coordinator, job reconciliation, cancellation и
@@ -59,8 +169,9 @@ metadata-COW только ради progress запрещён, поскольку
 - Snapshot/SI читают один immutable root. Read Committed обновляет root между
   вызовами API и replay-ит собственные непересекающиеся writes. Serializable
   write transaction консервативно abort-ится при изменении прочитанного key.
-- Commit под одним mutex сначала проверяет FCW, structural requirements, SSI и
-  fanout, затем строит полный новый root и публикует его одной заменой `Arc`.
+- Commit под одним mutex повторно проверяет FCW, structural requirements, SSI,
+  fanout и captured root, затем публикует подготовленный root одной заменой `Arc`.
+  Reactive user evaluation выполняется вне этого mutex.
 - Новые global/local slots, выбранные private snapshot, являются временными
   физическими адресами. Commit replay повторно выделяет их из актуального root
   и переводит topology/conflict keys; логическая коллизия `RecordId` или
@@ -151,3 +262,9 @@ import lease блокирует purge publication. Active source сохраня�
 Проверять focused schema/value/root/transaction/query tests, RAM/local parity,
 reopen/recovery в обеих I/O feature-конфигурациях и effective-index/predicate
 regressions. Ошибка commit никогда не должна менять опубликованный root.
+
+SubscriptionHandle разделяет fused transport/polling от confirmed durable capture
+stop. DISCONNECT/read error могут detach/fuse consumer; explicit close всё ещё
+публикует close_live. Только successful barrier устанавливает close idempotence.
+LiveInfo direct-binding revisions принадлежат текущему snapshot; used revisions
+принадлежат сохранённому LiveBatch, эти два смысла не смешиваются.

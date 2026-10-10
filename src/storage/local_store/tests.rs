@@ -39,6 +39,7 @@ use crate::{
 };
 
 mod changefeed_tests;
+mod live_history_tests;
 mod search_scope_tests;
 
 #[test]

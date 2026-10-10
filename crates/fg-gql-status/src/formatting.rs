@@ -198,6 +198,52 @@ pub trait StatusParameter {
 	fn to_diagnostic_value(&self) -> DiagnosticValue;
 }
 
+/// Exact owned parameter recovery used by generated status constructors.
+pub(crate) trait CapturedParameter: Sized {
+	/// Admits parameter clones before producing a historical diagnostic map.
+	fn allocation_bytes(&self) -> usize;
+	/// Rejects a mismatched diagnostic kind rather than coercing it.
+	fn from_diagnostic(value: DiagnosticValue) -> Option<Self>;
+}
+
+impl CapturedParameter for String {
+	fn allocation_bytes(&self) -> usize {
+		self.len()
+	}
+
+	fn from_diagnostic(value: DiagnosticValue) -> Option<Self> {
+		if let DiagnosticValue::String(value) = value {
+			Some(value)
+		} else {
+			None
+		}
+	}
+}
+
+/// Primitive status fields preserve their declared numeric representation.
+macro_rules! captured_primitive {
+	($type:ty, $variant:ident) => {
+		impl CapturedParameter for $type {
+			fn allocation_bytes(&self) -> usize {
+				0
+			}
+
+			fn from_diagnostic(value: DiagnosticValue) -> Option<Self> {
+				if let DiagnosticValue::$variant(value) = value {
+					Some(value)
+				} else {
+					None
+				}
+			}
+		}
+	};
+}
+
+captured_primitive!(u64, Unsigned);
+captured_primitive!(i64, Integer);
+captured_primitive!(f64, Float);
+captured_primitive!(bool, Bool);
+
 impl StatusParameter for String {
 	fn to_diagnostic_value(&self) -> DiagnosticValue {
 		DiagnosticValue::String(self.clone())

@@ -39,6 +39,12 @@ P0–P2-профиль для `MATCH`. Dependency-ordered реализацию �
 1. Optionality записывается только как `OPTIONAL MATCH`; `MATCH OPTIONAL` не принимается.
 2. Источник задаётся только `IN GRAPH graph_ref`, где `graph_ref` — имя либо параметр типа
    `GraphRef`; историческая MATCH-форма `FROM graph` не принимается.
+   Lexical parameter (execute, LET, LIVE LET) разрешается из invocation snapshot до
+   planner/graph open/row pull; string не заменяет GraphRef. Identity сверяется с видимым
+   catalog: удаление/recreate имени не перепривязывает прежнюю reference. Qualified domain
+   одинаков для standalone/embedded MATCH и BUILD/RETURN GRAPH. Direct EXPLAIN/PlanHash
+   содержат resolved GraphId; outer embedded estimates до invocation имеют явный warning
+   и conservative bounds без фиктивной graph identity.
 3. `OPTIONAL MATCH DISTINCT` сочетает независимые outer-match и binding-dedup semantics.
    `RETURN DISTINCT` отдельно дедуплицирует projected values.
 4. `DIFFERENT EDGES` является default match mode. Mode распространяется на именованные и
@@ -49,6 +55,12 @@ P0–P2-профиль для `MATCH`. Dependency-ordered реализацию �
 6. Открытые path ranges нормализуются до конечного max: `MAXDEPTH`, иначе
    `FG_PATH_MAX_DEPTH = 30`. Max больше 30 отклоняется до row pull. Default path mode — `TRAIL`;
    `WALK`, `ACYCLIC` и `SIMPLE` имеют различимую семантику из §15.
+   `MAXDEPTH` принимает integer literal либо lexical parameter (execute, LET, LIVE LET).
+   Параметр разрешается из invocation snapshot и проверяется как exact integer `0..=30`
+   до planning/row pull. Он меняет только открытые ranges; explicit segment max независим.
+   `min > max` ошибочен, в том числе после runtime binding. Direct EXPLAIN/PlanHash
+   используют resolved max; outer embedded estimates до child invocation могут использовать
+   checked upper bound 30 с явным предупреждением, не меняя точный обход child.
 7. Global и local constraints имеют независимые оси mode, objective и AND-combined filters.
    Локальная ось заменяет одноимённую global axis; повтор mode/objective в scope ошибочен.
 8. `SHORTEST` и `WEIGHTED SHORTEST` возвращают один канонический путь на source–target пару.
@@ -1354,6 +1366,14 @@ errors. Без явного `EF` HNSW использует `max(K, 1024, DIMENSI
 `max(K, 64)`; explicit `EF` не корректируется. Выбранный approximate path и индекс
 отображаются в `EXPLAIN`.
 
+Statement-fixed query operands могут иметь динамический тип `any`, в том числе
+при чтении LIVE LET. До чтения source rows выполняются runtime checks: Fulltext
+требует string для `@@`/`@n@` и array<string> для `@AND@`/`@OR@`; KNN query vector
+должен иметь тот же element kind, что declared field, K/EF — положительные integers.
+MINKOWSKI exponent допускает row-independent STABLE expression из snapshot;
+пользовательский distance callback по-прежнему обязан быть PURE. Динамический тип
+не вызывает implicit conversion или изменение метрики.
+
 ### 6.5. Условные выражения
 
 ```
@@ -1513,7 +1533,9 @@ EXPLAIN [ ANALYZE | FULL ] [ FORMAT TEXT | JSON ] @statement
   создаёт.
 
 Поддерживаются SELECT, текущий исполнимый MATCH, CREATE/UPDATE/UPSERT/DELETE,
-ATTACH/DETACH/RELATE/UPDATE GRAPH и DEFINE/ALTER/REMOVE. Transaction statements, Atomic Import,
+ATTACH/DETACH/RELATE/UPDATE GRAPH и DEFINE/ALTER/REMOVE. LIVE SELECT/LIVE LET,
+LET с LIVE SELECT, INFO FOR LIVE [LET], ACK LIVE и KILL также explainable; INFO
+остаётся read-only, ANALYZE исполняет каталоговую операцию ровно один раз. Transaction statements, Atomic Import,
 control flow, вложенный `EXPLAIN` и ещё не реализованные statements отклоняются структурно.
 `FORMAT TEXT` является default; `FORMAT JSON` возвращает structured object с versioned
 `PlanHash`, snapshot, mode/seed, stable preorder node IDs, logical/physical operators,
@@ -1548,6 +1570,11 @@ SLEEP @time
 Duration должна быть неотрицательной. Ожидание разбивается на короткие cooperative intervals с
 проверкой timeout/cancellation; эти ошибки не перехватываются `TRY/CATCH`. `SLEEP` запрещён в
 Atomic Import и `DETERMINISTIC`; явная транзакция сохраняет snapshot и max-snapshot-age contract.
+
+Параметр SLEEP разрешается по ближайшей lexical binding при исполнении. Обычный
+LET читает текущее значение frame; LIVE LET читает binding identity из того же
+statement snapshot и участвует в SSI. Фиксированная duration не допускает
+календарные месяцы/годы, отрицательные значения и переполнение nanoseconds.
 
 ### 7.9. TRY-CATCH
 
@@ -3101,6 +3128,44 @@ TIMEOUT @duration
 
 При превышении — транзакционная ошибка с откатом.
 
+Во вложенном block TIMEOUT-параметр разрешается при каждой invocation по тому же
+lexical frame/snapshot, до исполнения самого оператора. Значение с типом `any`
+проверяется динамически; оно должно быть duration. LIVE LET использует snapshot
+binding identity. Вложенный deadline ограничен родительским; переполнение
+platform Instant возвращает ошибку и не отключает ограничение. Эти правила
+сохраняются в обычном и PURE executor, включая импортные FOR locals.
+
+Обычный top-level TIMEOUT разрешается против pre-statement lexical frame и
+того же snapshot до подготовки mutating writer. Declaration в самом операторе
+не меняет binding timeout operand. Deadline отсчитывается от создания statement
+control и включает analysis/snapshot setup; позднее разрешение значения его
+не обновляет. Минимум clause/default deadline сохраняется до autocommit
+publication, включая LIVE BLOCK ожидания.
+
+Top-level item TIMEOUT внутри BEGIN IMPORT типизируется вместе с program на
+одном preflight snapshot, с lexical type/reactive metadata текущей session.
+Проверенные значения фиксируются до writer lease; expected commit stamp
+исключает применение плана после смены root. Lease сохраняет binding revisions
+до END. Private изменения source не перевычисляют item deadlines: новое значение
+LIVE LET появляется при END publication. Вложенные FOR locals разрешаются при
+invocation, включая ordinary shadow над reactive binding. Item clause ограничивает
+item execution; END publication использует исходный caller options deadline.
+Grammar не допускает TIMEOUT после END IMPORT.
+
+TIMEOUT wrapped statement внутри EXPLAIN является deadline всего wrapper:
+parser нормализует его в единственное внешнее timeout поле. Все режимы
+EXPLAIN проверяют typed duration против pre-statement snapshot/lexical frame;
+plain/FULL строят только план, ANALYZE выполняет inner statement один раз.
+Deadline имеет тот же construction clock и minimum caller limit. Nested
+block EXPLAIN сохраняет invocation-time conversion. Nested EXPLAIN и второй
+TIMEOUT отклоняются. TIMEOUT embedded MATCH в TRAVERSE source, tv::match и
+BUILD GRAPH source ограничивает каждый MATCH invocation отдельно. Typed operand
+разрешается до planner/open против переданного invocation snapshot и lexical
+frame; deadline ограничен caller. Ошибка после последнего visitor или graph
+assembly не считается успешным результатом. Plain/FULL EXPLAIN embedded plans
+не исполняет MATCH и не разрешает его runtime duration; ANALYZE выполняет обычную
+invocation boundary. Direct MATCH сохраняет внешний statement deadline.
+
 ### 10.11. CONSTRAINTS
 
 Определяет ограничения пути. Применим только к `MATCH` и `TRAVERSE`. 
@@ -3854,6 +3919,13 @@ RETURN weights_sum;
 | `tv::branch(step1, step2, ...)`       | Разветвить поток: один traverser → несколько         |
 | `tv::choose(closure, step1, step2)`   | Условное ветвление                                   |
 | `tv::coalesce(step1, step2, ...)`     | Попробовать шаги по очереди; вернуть первый непустой |
+
+`tv::limit(n)` и `tv::skip(n)` принимают точное неотрицательное целое в диапазоне
+`u64`, включая целочисленные Float/Decimal. Отрицательное, дробное, non-finite,
+переполняющее или нечисловое значение получает typed error до первого VM row pull,
+даже для пустого source. Значения LET/LIVE LET разрешаются в snapshot выполняемого
+statement. `limit(0)` сохраняет ранний обрыв; значения выше `i64::MAX` не заменяются
+нулём. Source может быть вычислен до подготовки VM.
 
 #### Агрегация
 
@@ -5389,10 +5461,9 @@ LIVE SELECT позволяет отслеживать создание, обно
 
 ```
 [LET $id =] LIVE SELECT
-	[
-		[ VALUE ] @fields ... [ AS @alias ]
-		| [ DIFF | PATCH ]
-	]
+	[ DIFF | PATCH ]
+	[ ONLY ]
+	[ [ VALUE ] @fields ... [ AS @alias ] ]
 	FROM @targets
 	[ WHERE @conditions ]
 	[ FETCH @fields ... ]
@@ -5402,8 +5473,26 @@ LIVE SELECT позволяет отслеживать создание, обно
 ;
 ```
 
+DIFF/PATCH без явной projection перед FROM используют wildcard shorthand.
+Явные fields и VALUE сохраняют обычную семантику SELECT. Runtime выдача содержит
+точные before/after и подготовленный native DIFF/PATCH; images остаются
+authoritative в durable history. PATCH заменяет arrays целиком и экранирует
+literal path segments согласно JSON Pointer. Явный JSON export отклоняет
+несовместимые native values/nonfinite numbers и сохраняет integer/decimal tokens
+без преобразования в f64.
+
 Оператор ```LIVE SELECT``` можно использовать для выбора данных class или graph source в режиме
 реального времени, в том числе с возможностью применения фильтров.
+
+`LIVE SELECT ... FROM person:alice IN GRAPH scope` выбирает один qualified
+occurrence с effective properties. Отсутствие membership — read dependency;
+ATTACH/DETACH может ввести или вывести запись из результата. Один base atom в
+разных графах имеет отдельные result identities. Rust recipe использует
+`LiveSource::GraphRecord { graph, record }`; record class owner фиксируется по
+ClassId при регистрации, graph scope — по GraphId. Его durable history следует
+GRAPH capture policy, независимо от CHANGEFEED base CLASS. FETCH использует
+обычный reader и учитывает отсутствующие связанные записи. Dynamic scope и
+новая historical graph reconstruction требуют своих vertical slices.
 
 С практической точки зрения, когда вы выполняете ```LIVE SELECT``` запрос, запускается непрерывный сеанс,
 в ходе которого фиксируются все последующие изменения данных в режиме реального времени.
@@ -5411,7 +5500,7 @@ LIVE SELECT позволяет отслеживать создание, обно
 
 Режимы результата: 
 - полные записи; 
-- `VALUE ...` — только изменённые поля; 
+- projected fields/`VALUE ...` — полный выбранный результат изменившейся identity;
 - `DIFF` — diff запись;
 - `PATCH` - JSON Patch.
 
@@ -5442,24 +5531,225 @@ LET $sub = LIVE SELECT DIFF FROM person WHERE active = true SINCE $last_seen;
 в пределах `CHANGEFEED @duration`, заданного его DDL. Если запрошенная позиция уже вычищена,
 durable reader этапа 27 возвращает explicit GAP и доступный хвост. Live consumer этапа 28
 обязан явно обработать GAP; бесшумно продолжать после потери истории запрещено.
-Без changefeed у source `SINCE` недоступен, и подписка начинается с текущего момента.
+Без changefeed `SINCE` не превращается молча в подписку «сейчас»: reader возвращает
+явный GAP либо typed coverage error. Для FETCH/read-only внешних зависимостей durable
+LIVE сохраняет вычисленные before/after результата и revisions параметров; resume
+не читает текущие primary records. Новая historical регистрация требует доказанной
+coverage всех inputs. Нормативный контракт: [этап 28](gql_live_stage_28_plan.md).
+
+LIVE EXPLAIN отражает реальные capture/validation/catalog/publication phases;
+INFO показывает snapshot metadata read, ACK — issued-token validation и whole-commit
+confirmation, KILL — capture stop. FULL/LOGICAL не исполняют UDF, FETCH, query или
+binding expression. Deferred SINCE/BUFFER/scopes сохраняют analyzer-owned spelling
+и фактические named lexical inputs, включая свободные captures closure; shadowed
+local parameters не становятся внешними inputs. Только execution разрешает сложный
+operand. Обычный запрет standalone SELECT subquery в command option сохраняется.
+
+PlanHash encoding v10 включает fixed snapshot/database, logical descriptor, sources,
+output, budgets/overflow/SINCE, captured ordinary values, tracked identities и exact
+function definitions/versions. Registration-only LIVE LET operands учитывают также
+snapshot value, поскольку они фиксируются при регистрации. INFO не хеширует current
+binding/result values, queue/process statistics, diagnostics/history/ACK watermarks.
+Name/value correspondence не зависит от расположения слотов в lexical frame.
+Captures не раскрываются в EXPLAIN output. Canonical borrowed encoding переиспользует
+storage validation, с caller work/cancellation до copies и отдельным transient scratch;
+owned source/plan/output buffers учитываются до allocation.
 
 #### 21.1.3. Backpressure и переполнение
 
-У каждой подписки — своя очередь, ограниченная `BUFFER @number` событий (по умолчанию `FG_LIVE_QUEUE_CAPACITY`). Медленный подписчик не должен ни блокировать писателя, ни терять события молча. Поведение при переполнении задаётся `ON OVERFLOW`:
+Default queue ограничена 10000 events и64MiB на subscription; общий retained session
+budget —256MiB. BUFFER меняет event ceiling, delivery всегда содержит целый commit.
+GAP/fault имеют заранее admitted control slot. Потеря computed history не скрывается.
 
-| Режим                | Поведение                                                                                                                                                                                                                            |
-|----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `GAP` (по умолчанию) | Очередь усекается, подписке доставляется служебное событие `{ kind: "gap", from: @vs_last_delivered, to: @vs_now }`. Клиент знает точный диапазон пропущенного и может добрать его через `SHOW CHANGES ... SINCE @vs_last_delivered` |
-| `DISCONNECT`         | Подписка закрывается со статусом `LiveSubscriberTooSlow` и последним доставленным `versionstamp`; клиент переподключается через `SINCE`                                                                                              |
-| `BLOCK`              | Писатель ждёт освобождения места в очереди. Гарантирует отсутствие разрывов ценой замедления записи. Применять осознанно: одна зависшая подписка тормозит все мутации                                                                |
+| Режим           | Поведение                                                                                                                                                                |
+|-----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `GAP` (default) | Освобождает bounded queue и выдаёт явный недоступный interval. Resume использует saved computed LIVE history; source SHOW CHANGES не заменяет result images/FETCH.       |
+| `DISCONNECT`    | Прекращает доставку медленному consumer с диагностикой и confirmed watermark. Повторное подключение проверяет coverage и возвращает GAP при потере истории.              |
+| `BLOCK`         | Получает весь набор capacity reservations вне commit lock, ограниченный30s и более ранним transaction deadline. Cancellation/timeout освобождают permits до publication. |
 
-`GAP` выбран по умолчанию как единственный режим, который одновременно не теряет данные молча и не даёт подписчику влиять на скорость записи.
+Batch, не помещающийся даже в пустую queue, приостанавливает затронутый LIVE с
+resource fault/GAP; бесконечного BLOCK нет. После durable publication не выполняются
+user evaluation, allocation или capacity wait. Ошибка вычисления LIVE не откатывает
+успешные source mutations. Defaults/ownership/public API задаёт нормативный план этапа28.
 
 #### 21.1.4. Стоимость и ограничения
 
-- Фильтр `WHERE` подписки вычисляется на каждой мутации подходящего class/graph source; сложные предикаты и `FETCH` удорожают запись. Предикат подписки вычисляется по IR (`filter_ir`), а не переразбирается.
-- Состояние подписки (`live_id`, цель, `filter_ir`, режим вывода, последний подтверждённый `versionstamp`) персистентно и переживает перезапуск; сами очереди — в памяти и после перезапуска восстанавливаются через `SINCE`.
+- LIVE выдаёт net изменение результата за commit, учитывая before/after WHERE,
+  projection/FETCH, внешние read dependencies и финальные параметры совместно.
+  Обычный analyzer/typed IR evaluator работает через root-bound read adapter.
+- Состояние подписки хранит versioned canonical logical descriptor, captures,
+  dependencies и подтверждённый watermark. Executable typed IR на диск не записывается.
+  Очереди in-memory; durable result history и ACK переживают reopen.
+- Rust `LiveInfo` и `INFO FOR LIVE` возвращают snapshot/start/publication bounds,
+  последний успешно выбранный capture source, frozen class/record owners и PURE
+  versions. История имеет отдельные last recorded group, purge floor/time и
+  source capture epochs (identity/revision/fixed retention либо disabled policy).
+  До первого durable capture history отсутствует. Last stamp не уменьшается при
+  purge; first available group из этих watermarks не выводится. INFO operand и
+  metadata используют один statement snapshot и обычные SSI predicates.
+  Binding revisions в INFO описывают текущие direct dependencies этого snapshot;
+  LiveBatch сохраняет revisions, действительно использованные для своих images.
+  Terminated/detached consumer не означает stopped capture: явный close остаётся
+  durable control commit, в том числе после DISCONNECT либо fused read error.
+- Обычные LET и execute parameters захватываются по значению. ALTER LET меняет lexical
+  binding, но уже зарегистрированная подписка требует ручной перерегистрации.
+  Ordinary parameter в root `IN GRAPH $scope` разрешается при регистрации against
+  statement snapshot: GraphRef либо имя графа становятся canonical graph identity
+  static GraphClass/GraphRecord descriptor. Lexical replacement не меняет этот scope.
+  Named lookup использует bounded catalog dependency recorder.
+  Для class/record sources отслеживаемый либо вычисляемый graph scope сохраняется
+  как owned LiveExpr (SDK GraphClassExpr/GraphRecordExpr). LIVE LET связывается по
+  identity, scope разрешается against before/after roots до row pull. Смена GraphId
+  даёт qualified leave/enter; финальный graph feed определяет capture policy commit.
+  Root subscription source сохраняет успешно разрешённые String operand и GraphId:
+  неизменное имя удерживает identity при rename; remove/recreate вызывает fault.
+  Явная смена operand допускает переключение scope. Вложенные graph expressions
+  являются read dependencies и используют обычное snapshot name resolution.
+  При evaluation fault подписка приостанавливается, сохраняя последнюю успешную
+  capture identity для контрольной истории. Catalog не исполняет scope recipes.
+  Пустой домен графовых occurrences не отменяет scope/PURE validation и dependency
+  reads; включая ноль classes, nested SELECT и LIMIT 0. Валидный пустой source
+  возвращает ноль rows (count() = 0); неверный тип или отсутствующий GraphRef —
+  typed error до результата. Metadata rows графа не подменяют его occurrences.
+  SDK `LiveSource::GraphExpr` выбирает весь qualified occurrence domain графа,
+  включая все ClassId текущего snapshot. Scope разрешается один раз до class
+  union для root и independent nested SELECT. Nested frozen parameters сохраняют
+  собственный lexical frame при shadowing. Aggregate reduction объединяет inputs
+  до вычисления результата; class-specific PURE overloads сохраняются. Ordinary
+  GQL `FROM GRAPH` metadata semantics остаётся самостоятельным контрактом.
+- LIVE GROUP BY использует ordered exact keys как самостоятельную identity
+  результата, независимо от projected fields. GROUP ALL и implicit aggregate
+  имеют пустой key tuple. Rust SDK предоставляет checked `with_group_by`,
+  `with_group_all` и borrowed `group`. Ordinary validation групповых expressions,
+  wildcard, PURE effects и scalar-subquery cardinality остаётся общей с SELECT.
+  Graph-wide grouping объединяет raw class rows до reduction: одинаковые keys
+  принадлежат одной группе, DISTINCT/AVG сохраняют bag semantics и class-specific
+  row overloads. None/Null различны; exact Number comparison не проходит через f64.
+  Пустой GROUP BY возвращает ноль групп, GROUP ALL — один empty-domain результат.
+  Frozen и reactive group inputs подчиняются обычным capture/DAG правилам.
+  LIVE ORDER BY и LIMIT/START Offset используют обычный SELECT kernel для всего
+  source domain, включая class union и GROUP. Rust SDK предоставляет `LiveOrder`,
+  собственные direction/nulls enums, `with_order`, `with_limit`, `with_start_offset`
+  и borrowed accessors. `LiveOrder::by_name` сохраняет projected alias/input name
+  precedence; expression key сохраняет source qualification. Ascending, NULLS LAST,
+  без COLLATE/NUMERIC — defaults; COLLATE/NUMERIC имеют обычную SELECT семантику.
+  Bounds — exact nonnegative integral Number с checked ordinal conversion;
+  frozen LET/execute parameters и tracked LIVE LET действуют также в ORDER/bounds.
+  ORDER определяет membership окна, а delivery остаётся в canonical identity order.
+  Изменение rank при неизменных identity/payload не порождает event. Выход/вход в
+  окно даёт net leave/enter независимо от того, менялась ли сама запись.
+  Historical replay требует complete captured domain, включая неизменных
+  конкурентов. Недоказанная coverage даёт явный GAP. RAND и START AFTER требуют
+  отдельных semantics и отклоняются в этом owned recipe до registration.
+  `LIVE SELECT ONLY` и Rust `with_only(bool)`/`only()` проверяют cardinality после
+  общего ORDER/START/LIMIT и projection/OMIT/FETCH. Пустой result не создаёт NONE
+  identity; один результат сохраняет row/group identity. Более одного результата
+  отклоняют registration; активная подписка получает fault/Paused при успешном
+  source DML. Для graph class union ONLY действует один раз над общим domain.
+  Nested ONLY сохраняет обычную scalar SELECT shape. Историческое чтение требует
+  complete-domain proof; changed-row replay не допускается, поскольку неизменный
+  конкурент может вызвать нарушение cardinality.
+  Array/Set/Object, IF/CASE, field/index access, CAST и Range вокруг aggregates
+  используют те же scalar constructors в class и graph-wide domains. IF/CASE
+  вычисляют только выбранную ветвь; class-specific plans остаются внутри row
+  arguments. Разные outer typed descriptors не подменяются первым class plan.
+  New SINCE требует доказанной complete-domain history всех inputs; saved-result
+  resume читает сохранённые group identities/images.
+- LIVE JOIN/SPLIT используют составную result identity: source slots в порядке
+  FROM/JOIN declarations, qualified Record/Occurrence каждого участника и явный
+  Unmatched для отсутствующего RIGHT участника LEFT JOIN. CBO order, aliases,
+  scan/output ordinals и projected payload не входят в identity. SPLIT positions
+  zero-based u64 следуют порядку clauses; arrays сохраняют duplicates и порядок,
+  sets — существующий canonical Value order. Array reorder меняет значения на
+  сохранённых positions. Source identity фиксируется до SPLIT/projection/OMIT.
+  GROUP сохраняет Aggregate identity; без expansion прежние Record/Occurrence
+  identities неизменны. Rust API: `LiveIdentity::Composite(Vec<LiveIdentityPart>)`,
+  flat parts Record/Occurrence/Unmatched/Split. Primary source обязателен;
+  >=2 parts, source slots идут перед positions. Такое представление сохраняет
+  bag multiplicity. Runtime/codec support не означает готовность JOIN/SPLIT
+  lowering: feature активируется только после соответствующих correctness gates.
+- Source alias сохраняется в owned LIVE recipe. Rust `with_alias`/borrowed `alias`
+  принимают nonempty/NUL-free name; qualified Field path задаётся отдельными
+  segments alias/field. Case-insensitive source qualification и bare property
+  precedence совпадают с SELECT. User alias не становится synthetic lexical
+  capture identity: nested одинаковые aliases сохраняют независимые parameter
+  frames. Изменение alias не меняет result identity. Durable logical descriptor
+  сохраняет qualifier, executable IR по-прежнему не сериализуется.
+- LIVE SPLIT и Rust `with_split(Vec<LiveExpr>)`/`split()` используют общий SELECT
+  kernel после WHERE и до GROUP/projection. Operands связываются с source columns
+  либо nested field chains; `LiveExpr::field` сохраняет literal name, составной
+  путь задаётся `LiveExpr::Field(LivePath)`. Array/Set expansion сохраняет правила
+  identity выше; NONE/NULL дают пустой результат, неверный тип — typed error.
+  Shared expansion допускает complete row/key growth и проверяет work/cancellation
+  до clone. GROUP, nested queries и graph class union сохраняют общий global window.
+  Историческое чтение требует complete-domain proof; changed-row replay запрещён.
+  Отсутствие creation anchor даёт explicit InsufficientCoverage GAP, saved-result
+  resume читает сохранённые Composite identities/images без current primary.
+- LIVE OMIT использует ordinary SELECT paths после projection и перед FETCH.
+  Rust SDK предоставляет `with_omit` и borrowed `omit`; ordered literal segments
+  сохраняются, включая точки внутри segment и повторные paths. Missing и
+  non-object paths дают обычный no-op; array fanout не добавляется. Row/group
+  identity хранится отдельно: удаление id либо projected group key не удаляет
+  identity события. Изменение только omitted payload не создаёт net event;
+  удалённый FETCH path не читает внешнюю запись. Shared traversal проверяет
+  cancellation, depth и work до lookup/removal. Historical eligibility учитывает
+  path work; удаление само по себе не добавляет read dependencies.
+- LIVE LET создаёт самостоятельную versioned binding identity. Автоматическое
+  перевычисление data/binding dependencies выполняется по DAG; cycles отклоняются.
+  ALTER LIVE LET VALUE принимает expression, а literal удаляет прежние dependencies.
+  REMOVE LIVE LET с dependents возвращает dependency error. Savepoints/rollback
+  отменяют registry mutations; активация происходит только после commit.
+- Публичные LIVE recipes поддерживают ordered Array/Object construction и numeric
+  unary minus/plus через ordinary evaluator. Duplicate object keys используют
+  обычное последнее значение; unary plus сохраняет numeric type validation.
+  Числа, включая integers выше 2^53, не преобразуются в f64 при lowering.
+- Access/Index recipes сохраняют ordinary field/index/null-safe semantics,
+  включая `$parameter.field`, `$parameter[index]` и dereference record-valued
+  binding через root-bound dependency recorder. Row alias qualification
+  разрешается тем же schema rule, что в SELECT; имена с точкой остаются literal.
+- Range recipes сохраняют optional included start, optional included/excluded end
+  и exact runtime bounds. Frozen и reactive endpoints используют общие capture
+  rules; lowering не перечисляет members и не переводит numbers в f64.
+- Scalar binary recipes поддерживают arithmetic, equality, quantified membership
+  и spatial operators обычного SELECT. IS/NOT IS означают runtime equality/inequality;
+  Elvis использует truthiness, Coalesce — NONE/NULL. Short-circuit сохраняется.
+  Truthy (`!!value`) нормализуется в Not(Not(value)) и доступен Rust SDK через
+  `LiveExpr::truthy()`. Binary operands/work и quantified loops используют общий
+  resource/cancellation contract. Pipeline относится к traversal IR.
+- LIVE call recipes сохраняют symbolic type argument, DISTINCT и ordered named
+  arguments (`name = expression`). Ordinary analyzer разрешает builtin/PURE
+  signature и конкретные function versions; вызовы с runtime-only callee
+  отклоняются. DISTINCT разрешён только в SELECT aggregates и сохраняет exact
+  Value equality, включая числа выше 2^53; captures обходят все arguments.
+  Historical count/sum DISTINCT требуют доказанной complete-domain coverage.
+- Чтение `$binding` использует значение identity из текущего statement snapshot;
+  closure захватывает identity и читает её при invocation. Обычный lexical shadow
+  маскирует reactive flavor, а UUID execute parameter остаётся обычным значением.
+  Удалённый binding не читается; paused binding возвращает сохранённую typed
+  диагностику и cause. INFO остаётся доступным для обоих состояний.
+  Если значение binding — RecordId, чтение его поля в ordinary expression,
+  captured closure и scalar traversal использует тот же statement snapshot и
+  record resolver; property reads участвуют в SSI отдельно от binding revision.
+  Missing property сохраняет NONE, обычный UUID не превращается в reactive binding.
+  Scalar record dereference копирует только выбранное base/effective поле;
+  reactive и bounded evaluation допускают property/id/label до копирования.
+  Hidden overlay возвращает NONE; отсутствие membership сохраняет base fallback.
+- SINCE и BUFFER вычисляются при регистрации, включая LIVE LET, через тот же
+  bounded snapshot evaluator. Эти опции фиксируются на lifetime подписки;
+  последующая смена binding не изменяет queue limit или starting position.
+- Pull handle имеет одну неподтверждённую delivery; next повторяет её до whole-commit
+  ACK. cursor обозначает последний подтверждённый watermark. Durable ACK публикуется
+  до освобождения queue. Drop detach-ит consumer; close прекращает подписку.
+- Active evaluation fault приостанавливает затронутые подписки с диагностикой/GAP,
+  сохраняя успешный исходный DML. Registration fault отклоняет регистрацию.
+- Import END вычисляет итоговые LIVE/LIVE LET результаты через тот же root-bound
+  executor и сохраняет concurrent ACK/close metadata. Writer lease запрещает
+  primary/schema/capture changes других writers. Финальные stamp/time фиксируются
+  до history encoding; повторное UTC time допустимо и не переназначается при
+  persistence. CHANGEFEED=OFF обозначает suppressed durable interval через GAP.
+- Defaults: 10 000 entries/64 MiB queue, 256 MiB retained session/scratch,
+  1M evaluation work, BLOCK 30s с transaction deadline. Admission выполняется до
+  allocation/publication; oversized batch не ждёт бесконечно. Whole commits не режутся.
 - Порядок между **разными** sources не гарантируется, если подписка не охватывает их одной целью: `versionstamp` глобален, но доставка идёт по подпискам независимо.
 
 #### 21.1.5. Материализация live-графа

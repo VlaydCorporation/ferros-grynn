@@ -349,6 +349,7 @@ impl Transaction {
 				entries: accumulator.full,
 			});
 			let group = CapturedCommit {
+				revision: definition.version,
 				net: batch,
 				full,
 				include_original: definition.config.include_original(),
@@ -366,6 +367,7 @@ impl Transaction {
 			};
 			budget.admit(256)?;
 			groups.insert(feed, CapturedCommit {
+				revision: definition.version,
 				net: batch,
 				full: None,
 				include_original: definition.config.include_original(),

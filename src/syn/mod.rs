@@ -24,6 +24,7 @@ pub use ast::{
 };
 pub use config::GQLConfig;
 use fg_gql_status::FerrosGrynnResult;
+pub(crate) use stmt::SelectUnionPurpose;
 pub use stmt::{
 	AlterStatement,
 	AlterTarget,
@@ -88,6 +89,11 @@ pub use stmt::{
 	KillStatement,
 	LetStatement,
 	LetValue,
+	LiveAckStatement,
+	LiveLetStatement,
+	LiveOutputName,
+	LiveOverflowName,
+	LiveSelectStatement,
 	MaintenanceIndexOwner,
 	MaintenanceOperationName,
 	MaintenanceStatement,

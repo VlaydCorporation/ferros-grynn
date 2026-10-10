@@ -93,9 +93,54 @@ pub(super) fn select_limit(
 	plan: &LogicalSelect,
 	slots: &[Value],
 	source: &str,
+	fields: &dyn AtomFieldRead,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Option<usize>> {
-	plan.limit.as_ref().map(|value| eval_usize(value, slots, source, control)).transpose()
+	plan.limit.as_ref().map(|value| eval_usize(value, slots, source, fields, control)).transpose()
+}
+
+/// Resolves an entire result window before its source pulls any rows.
+pub(super) fn select_window(
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	fields: &dyn AtomFieldRead,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<(usize, usize)> {
+	let start = match &plan.start {
+		None => 0,
+		Some(LogicalSelectStart::Offset(value)) => {
+			eval_usize(value, slots, source, fields, control)?
+		}
+		Some(LogicalSelectStart::After {
+			..
+		}) => {
+			return Err(FerrosGrynnError::query_feature_not_supported(
+				"START AFTER requires a retained query-session cursor",
+			));
+		}
+	};
+	Ok((start, select_limit(plan, slots, source, fields, control)?.unwrap_or(usize::MAX)))
+}
+
+/// Streaming ONLY needs two fully evaluated payloads to prove a violation.
+pub(super) fn select_pull_limit(only: bool, limit: usize) -> usize {
+	if only {
+		limit.min(2)
+	} else {
+		limit
+	}
+}
+
+/// Cardinality is checked after the selected window and payload evaluation.
+pub(super) fn check_select_cardinality(only: bool, count: usize) -> FerrosGrynnResult<()> {
+	if only && count > 1 {
+		let count = u64::try_from(count)
+			.map_err(|_error| FerrosGrynnError::operation_overflow("SELECT cardinality"))?;
+		return Err(FerrosGrynnError::select_cardinality_violation(count)
+			.with_phase(ExecutionPhase::Execution));
+	}
+	Ok(())
 }
 
 pub(super) struct OutputRow {
@@ -185,6 +230,37 @@ impl OutputCollector {
 			} => sorter.finish(),
 		}
 	}
+
+	/// Moved class outputs keep anchors; unsorted unions retain concatenation
+	/// order.
+	pub(super) fn push_record(
+		&mut self,
+		mut record: CursorRecord,
+		ordinal: usize,
+	) -> FerrosGrynnResult<()> {
+		match self {
+			Self::Memory(records) => {
+				records.try_reserve(1).map_err(|error| {
+					FerrosGrynnError::traversal_resource_limit_exceeded(
+						"LIVE union output",
+						ordinal as u64,
+					)
+					.with_technical_source(error)
+				})?;
+				records.push(record);
+				Ok(())
+			}
+			Self::Sorter {
+				sorter,
+				preserve_input_order,
+			} => {
+				if *preserve_input_order {
+					record.anchor.order_keys = vec![Value::from(ordinal)];
+				}
+				sorter.push(record)
+			}
+		}
+	}
 }
 
 pub(super) fn output_record(row: OutputRow) -> CursorRecord {
@@ -243,38 +319,53 @@ pub(super) fn output_after_anchor(
 	}
 }
 
-pub(super) fn record_values(
+/// Preserves source/group anchors while applying one bounded result window.
+pub(super) fn visit_records<Read: QueryRead>(
+	read: &Read,
 	output: SortedRecords,
 	start: usize,
 	limit: usize,
-) -> FerrosGrynnResult<Vec<Value>> {
-	let mut values = Vec::with_capacity(limit.min(1024));
-	visit_record_values(output, start, limit, |value| {
-		values.push(value);
-		Ok(())
-	})?;
-	Ok(values)
-}
-
-pub(super) fn visit_record_values(
-	output: SortedRecords,
-	start: usize,
-	limit: usize,
-	mut visit: impl FnMut(Value) -> FerrosGrynnResult<()>,
+	control: &ExecutionControl,
+	mut visit: impl FnMut(CursorRecord) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<usize> {
+	let check = || {
+		control.check()?;
+		if let Some(fields) = read.bounded_fields() {
+			fields.work(1)?;
+		}
+		control.check()
+	};
+	control.check()?;
+	if limit == 0 {
+		return Ok(0);
+	}
 	let mut stream = output.into_stream()?;
 	for _index in 0..start {
+		check()?;
 		if stream.next()?.is_none() {
 			return Ok(0);
 		}
 	}
 	let mut visited = 0;
 	while visited < limit {
+		check()?;
 		let Some(record) = stream.next()? else {
 			break;
 		};
-		visit(record.value)?;
+		visit(record)?;
 		visited += 1;
 	}
 	Ok(visited)
+}
+
+/// Value-only consumers use the same window and resource checks.
+pub(super) fn visit_record_values<Read: QueryRead>(
+	read: &Read,
+	output: SortedRecords,
+	start: usize,
+	limit: usize,
+	control: &ExecutionControl,
+	mut visit: impl FnMut(Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<usize> {
+	visit_records(read, output, start, limit, control, |record| visit(record.value))
 }

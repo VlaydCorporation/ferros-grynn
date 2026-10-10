@@ -10,6 +10,9 @@ degree, label и property части читаются независимо и л
 транзакционный snapshot.
 
 - Простые счётчики изменяются одной транзакционной дельтой при commit.
+  `has_revision_updates` наблюдает exact base/graph touched flags; immutable
+  publication не делает COW при их отсутствии, при наличии сохраняет прежние
+  revision stamps и очистку flags.
 - Degree/property histograms заменяются только полным bulk scan и могут быть
   устаревшими; это влияет лишь на качество будущего плана.
 - Границы property buckets используют order-preserving codec из `values`.

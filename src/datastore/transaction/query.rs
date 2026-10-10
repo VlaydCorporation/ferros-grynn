@@ -44,6 +44,84 @@ pub(crate) struct QueryStorageRow {
 	pub(crate) properties: PropertyMap,
 }
 
+impl QueryStorageRow {
+	/// Resolves an owned row in one immutable root, without transaction
+	/// refresh.
+	pub(crate) fn point_in_root(
+		root: &DatabaseRoot,
+		record: &RecordId,
+		graph: Option<&GraphRef>,
+	) -> FerrosGrynnResult<Option<Self>> {
+		let Some(atom) = root.atom_by_record(record) else {
+			return Ok(None);
+		};
+		let class = root.schema.class_by_id(atom.class_id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("global atom references an absent class")
+		})?;
+		if let Some(reference) = graph {
+			let graph = query_graph_root(root, reference)?;
+			let Some(local) = graph.local_id(atom.id()) else {
+				return Ok(None);
+			};
+			let occurrence = graph.occurrence(local).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"graph membership references an absent occurrence",
+				)
+			})?;
+			return row_from_occurrence(root, occurrence, &class).map(Some);
+		}
+		Ok(Some(row_from_atom(atom, &class)))
+	}
+
+	/// Copies only one borrowed base/effective field after admitting its owned
+	/// representation; scalar readers never construct an unrelated full row.
+	///
+	/// # Errors
+	///
+	/// Returns corruption, checked-size overflow, or caller admission/copy
+	/// errors.
+	pub(crate) fn field_from_atom(
+		root: &DatabaseRoot,
+		atom: &crate::datastore::BaseAtom,
+		occurrence: Option<&GraphOccurrence>,
+		field: &str,
+		admit: impl FnOnce(usize) -> FerrosGrynnResult<()>,
+		copy: impl FnOnce(&Value) -> FerrosGrynnResult<Value>,
+	) -> FerrosGrynnResult<Value> {
+		root.schema.class_by_id(atom.class_id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("global atom references an absent class")
+		})?;
+		match field {
+			"id" => {
+				let bytes = std::mem::size_of::<RecordId>()
+					.checked_add(atom.record_id().estimated_heap_bytes())
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("record field identity"))?;
+				admit(bytes)?;
+				Ok(Value::Record(Box::new(atom.record_id().clone())))
+			}
+			"label" => {
+				let Some(label) = occurrence.and_then(GraphOccurrence::label) else {
+					return Ok(Value::None);
+				};
+				let bytes = std::mem::size_of::<Text>()
+					.checked_add(label.len())
+					.ok_or_else(|| FerrosGrynnError::operation_overflow("record field label"))?;
+				admit(bytes)?;
+				Ok(Value::String(label.clone()))
+			}
+			_ => {
+				let Some(key) = root.dictionary.get(field) else {
+					return Ok(Value::None);
+				};
+				let base = atom.properties().get(key);
+				let value =
+					occurrence.map_or(base, |occurrence| occurrence.effective_value(base, key));
+				value.map_or(Ok(Value::None), copy)
+			}
+		}
+	}
+}
+
 /// One query term retained from a validated immutable Fulltext side-file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueryFulltextTermRead {
@@ -201,7 +279,98 @@ pub(crate) struct QueryStorageCursor<'snapshot> {
 	source: QueryCursorSource<'snapshot>,
 }
 
-impl QueryStorageCursor<'_> {
+impl<'snapshot> QueryStorageCursor<'snapshot> {
+	/// Opens a primary class range without materializing or copying its ids.
+	pub(crate) fn scan_in_root(
+		root: &'snapshot DatabaseRoot,
+		class: Arc<ClassSchema>,
+		graph: Option<&GraphRef>,
+	) -> FerrosGrynnResult<Self> {
+		let class_id = class.id().ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("published class is missing ClassId")
+		})?;
+		let source = if let Some(reference) = graph {
+			query_graph_root(root, reference)?;
+			root.indexes
+				.graphs
+				.get(&reference.id())
+				.and_then(|indexes| indexes.classes.get(&class_id))
+				.map(|ids| QueryCursorSource::Graph {
+					graph: reference.id(),
+					ids: ids.iter(),
+				})
+				.unwrap_or(QueryCursorSource::Empty)
+		} else {
+			root.indexes
+				.classes
+				.get(&class_id)
+				.map(|ids| QueryCursorSource::Base(ids.iter()))
+				.unwrap_or(QueryCursorSource::Empty)
+		};
+		Ok(Self {
+			root,
+			class,
+			source,
+		})
+	}
+
+	/// Admits borrowed payloads before the next ordinary row materialization.
+	pub(crate) fn next_row_admitted(
+		&mut self,
+		mut admit: impl FnMut(
+			&crate::datastore::BaseAtom,
+			Option<&GraphOccurrence>,
+		) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
+		let (global, occurrence) = match &self.source {
+			QueryCursorSource::Empty => return Ok(None),
+			QueryCursorSource::Base(ids) => (ids.clone().next().copied(), None),
+			QueryCursorSource::BaseOwned(ids) => (ids.as_slice().first().copied(), None),
+			QueryCursorSource::Graph {
+				graph,
+				ids,
+			} => {
+				let local = ids.clone().next().copied();
+				let occurrence = local
+					.map(|local| {
+						self.root.occurrence(*graph, local).ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"query cursor references an absent occurrence",
+							)
+						})
+					})
+					.transpose()?;
+				(occurrence.map(GraphOccurrence::global_id), occurrence)
+			}
+			QueryCursorSource::GraphOwned {
+				graph,
+				ids,
+			} => {
+				let occurrence = ids
+					.as_slice()
+					.first()
+					.map(|local| {
+						self.root.occurrence(*graph, *local).ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"query cursor references an absent occurrence",
+							)
+						})
+					})
+					.transpose()?;
+				(occurrence.map(GraphOccurrence::global_id), occurrence)
+			}
+		};
+		if let Some(global) = global {
+			let atom = self.root.atom(global).ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file(
+					"query cursor references an absent global atom",
+				)
+			})?;
+			admit(atom, occurrence)?;
+		}
+		self.next_row()
+	}
+
 	/// Pulls one owned row without materializing the remaining class.
 	pub(crate) fn next_row(&mut self) -> FerrosGrynnResult<Option<QueryStorageRow>> {
 		let row = match &mut self.source {
@@ -356,9 +525,32 @@ impl QuerySnapshot {
 	pub(crate) fn commit_ts(&self) -> u64 {
 		self.root.commit_ts
 	}
+
+	/// Borrows the fixed logical root for the existing bounded expression
+	/// adapter.
+	pub(crate) const fn logical_root(&self) -> &Arc<DatabaseRoot> {
+		&self.root
+	}
 }
 
 impl Transaction {
+	/// Borrows the reactive value and records its identity in the ordinary SSI
+	/// set.
+	pub(crate) fn query_live_binding_value<'snapshot>(
+		&self,
+		snapshot: &'snapshot QuerySnapshot,
+		id: crate::live::LiveBindingId,
+	) -> FerrosGrynnResult<&'snapshot Value> {
+		self.ensure_live()?;
+		self.record_read(crate::datastore::ConflictKey::LiveBinding(id));
+		snapshot.root.live_catalog().binding_value(id)
+	}
+
+	/// Records root-bound expression reads in the ordinary transaction SSI set.
+	pub(crate) fn observe_query_dependency(&self, key: crate::datastore::ConflictKey) {
+		self.record_read(key);
+	}
+
 	/// Projects admitted Ready path bindings without physical addresses.
 	///
 	/// # Errors
@@ -750,8 +942,27 @@ impl Transaction {
 	}
 
 	pub(crate) fn query_snapshot(&mut self) -> FerrosGrynnResult<QuerySnapshot> {
+		self.query_snapshot_admitted(false, |_bytes| Ok(()))
+	}
+
+	/// Admits the graph-map copy before capturing an owned statement root.
+	pub(crate) fn query_snapshot_admitted(
+		&mut self,
+		metadata_only: bool,
+		admit: impl FnOnce(usize) -> FerrosGrynnResult<()>,
+	) -> FerrosGrynnResult<QuerySnapshot> {
 		self.prepare_read()?;
-		let physical = if self.mutations.is_empty() {
+		let bytes = self
+			.working
+			.graphs
+			.len()
+			.checked_mul(512)
+			.and_then(|bytes| {
+				bytes.checked_add(std::mem::size_of::<super::super::DatabaseRoot>() + 64)
+			})
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("query snapshot graph map"))?;
+		admit(bytes)?;
+		let physical = if !metadata_only && self.mutations.is_empty() {
 			if self
 				.physical_query_snapshot
 				.as_ref()
@@ -1588,17 +1799,7 @@ impl Transaction {
 					ids: ids.into_iter(),
 				}
 			} else {
-				snapshot
-					.root
-					.indexes
-					.graphs
-					.get(&reference.id())
-					.and_then(|indexes| indexes.classes.get(&class_id))
-					.map(|ids| QueryCursorSource::Graph {
-						graph: reference.id(),
-						ids: ids.iter(),
-					})
-					.unwrap_or(QueryCursorSource::Empty)
+				return QueryStorageCursor::scan_in_root(&snapshot.root, class, graph);
 			}
 		} else {
 			self.record_read(crate::datastore::ConflictKey::BaseClassRange(class_id));
@@ -1657,13 +1858,7 @@ impl Transaction {
 				};
 				QueryCursorSource::BaseOwned(ids.into_iter())
 			} else {
-				snapshot
-					.root
-					.indexes
-					.classes
-					.get(&class_id)
-					.map(|ids| QueryCursorSource::Base(ids.iter()))
-					.unwrap_or(QueryCursorSource::Empty)
+				return QueryStorageCursor::scan_in_root(&snapshot.root, class, None);
 			}
 		};
 		Ok(QueryStorageCursor {
@@ -2140,55 +2335,47 @@ impl Transaction {
 	) -> FerrosGrynnResult<Option<QueryStorageRow>> {
 		self.ensure_live()?;
 		self.track_query_point(snapshot, record, graph)?;
-		let Some(atom) = snapshot.root.atom_by_record(record) else {
-			return Ok(None);
-		};
-		let class = snapshot.root.schema.class_by_id(atom.class_id()).ok_or_else(|| {
-			FerrosGrynnError::invalid_storage_file("global atom references an absent class")
-		})?;
-		if let Some(reference) = graph {
-			let graph = query_graph_root(&snapshot.root, reference)?;
-			let Some(local) = graph.local_id(atom.id()) else {
-				return Ok(None);
-			};
-			let occurrence = graph.occurrence(local).ok_or_else(|| {
-				FerrosGrynnError::invalid_storage_file(
-					"graph membership references an absent occurrence",
-				)
-			})?;
-			return row_from_occurrence(&snapshot.root, occurrence, &class).map(Some);
-		}
-		Ok(Some(row_from_atom(atom, &class)))
+		QueryStorageRow::point_in_root(&snapshot.root, record, graph)
 	}
 
 	/// Resolves one record field under the normative base/effective reference
-	/// rules.
+	/// rules, admitting selected payloads before copying them.
 	pub(crate) fn query_record_field(
 		&self,
 		snapshot: &QuerySnapshot,
 		record: &RecordId,
 		graph: Option<&GraphRef>,
 		field: &str,
+		admit: impl FnOnce(usize) -> FerrosGrynnResult<()>,
+		copy: impl FnOnce(&Value) -> FerrosGrynnResult<Value>,
 	) -> FerrosGrynnResult<Value> {
-		let row = match graph {
-			Some(graph) => match self.query_point(snapshot, record, Some(graph))? {
-				Some(row) => Some(row),
-				None => self.query_point(snapshot, record, None)?,
-			},
-			None => self.query_point(snapshot, record, None)?,
-		}
-		.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("record", record.to_string()))?;
+		self.ensure_live()?;
+		self.track_query_point(snapshot, record, graph)?;
+		let atom = snapshot
+			.root
+			.atom_by_record(record)
+			.ok_or_else(|| FerrosGrynnError::atom_does_not_exist("record", record.to_string()))?;
+		snapshot.root.schema.class_by_id(atom.class_id()).ok_or_else(|| {
+			FerrosGrynnError::invalid_storage_file("global atom references an absent class")
+		})?;
+		let occurrence = graph
+			.map(|reference| {
+				let graph = query_graph_root(&snapshot.root, reference)?;
+				graph
+					.local_id(atom.id())
+					.map(|local| {
+						graph.occurrence(local).ok_or_else(|| {
+							FerrosGrynnError::invalid_storage_file(
+								"graph membership references an absent occurrence",
+							)
+						})
+					})
+					.transpose()
+			})
+			.transpose()?
+			.flatten();
 
-		match field {
-			"id" => Ok(Value::Record(Box::new(row.record_id))),
-			"label" => Ok(row.label.map(Value::String).unwrap_or(Value::None)),
-			_ => {
-				let Some(key) = snapshot.root.dictionary.get(field) else {
-					return Ok(Value::None);
-				};
-				Ok(row.properties.get(key).cloned().unwrap_or(Value::None))
-			}
-		}
+		QueryStorageRow::field_from_atom(&snapshot.root, atom, occurrence, field, admit, copy)
 	}
 
 	fn track_query_point(

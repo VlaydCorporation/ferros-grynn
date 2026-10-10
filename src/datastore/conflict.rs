@@ -10,6 +10,10 @@ pub(crate) enum ConflictKey {
 	GraphDefinition(GraphId),
 	/// Set of graph definitions observed by a catalog scan.
 	GraphCatalogRange,
+	/// One class definition, independent of its record contents.
+	SchemaClass(ClassId),
+	/// Class namespace including absent-name and graph-wide source reads.
+	ClassCatalogRange,
 	/// One durable database parameter definition.
 	SchemaParameter(SchemaId),
 	/// Set of durable database parameters observed by a catalog scan.
@@ -41,4 +45,10 @@ pub(crate) enum ConflictKey {
 	ChangefeedDefinition(crate::changefeed::ChangefeedSource),
 	/// Retained source namespace observed by historical name/id lookup.
 	ChangefeedCatalogRange,
+	/// One subscription incarnation, independent of source data changes.
+	LiveDefinition(crate::live::LiveId),
+	/// One reactive identity, expression revision or committed value.
+	LiveBinding(crate::live::LiveBindingId),
+	/// Registry namespace observed by metadata lookup.
+	LiveCatalogRange,
 }

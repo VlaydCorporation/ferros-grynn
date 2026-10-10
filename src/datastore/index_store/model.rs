@@ -270,7 +270,15 @@ impl IndexStoreRoot {
 	}
 
 	pub(crate) fn base_class(&self, class: ClassId) -> Vec<GlobalAtomId> {
-		self.classes.get(&class).into_iter().flat_map(BTreeSet::iter).copied().collect()
+		self.base_class_iter(class).collect()
+	}
+
+	/// Borrows class membership without allocating a complete address vector.
+	pub(crate) fn base_class_iter(
+		&self,
+		class: ClassId,
+	) -> impl Iterator<Item = GlobalAtomId> + '_ {
+		self.classes.get(&class).into_iter().flat_map(BTreeSet::iter).copied()
 	}
 
 	pub(crate) fn graph_class(&self, graph: GraphId, class: ClassId) -> Vec<AtomId> {

@@ -64,12 +64,201 @@ impl Clone for Datastore {
 impl Drop for Datastore {
 	fn drop(&mut self) {
 		if self.inner.datastore_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+			{
+				let _commit = self.inner.commit.lock();
+				self.inner.live_consumers.shutdown();
+			}
 			self.inner.maintenance.shutdown();
 		}
 	}
 }
 
 impl Datastore {
+	/// Temporarily acquires a logical datastore owner for an attached control
+	/// operation; a weak consumer cannot resurrect a closed datastore.
+	pub(in crate::datastore) fn from_inner_alive(
+		inner: Arc<StoreInner>,
+	) -> FerrosGrynnResult<Self> {
+		inner
+			.datastore_handles
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |handles| {
+				if handles == 0 {
+					None
+				} else {
+					handles.checked_add(1)
+				}
+			})
+			.map_err(|_handles| {
+				crate::gql_status::FerrosGrynnError::invalid_argument("LIVE datastore is closed")
+			})?;
+		Ok(Self {
+			inner,
+		})
+	}
+
+	/// Registers and attaches one owned LIVE consumer atomically with
+	/// activation.
+	///
+	/// # Errors
+	///
+	/// Returns registration, capture, capacity, conflict or publication errors.
+	/// Historical starting positions replay proven source coverage, explicitly
+	/// report unavailable inputs, then join the exact current tail.
+	pub fn subscribe_live(
+		&self,
+		query: crate::live::LiveQuery,
+		options: crate::live::LiveOptions,
+	) -> FerrosGrynnResult<crate::live::LiveSubscription> {
+		let mut tx = self.begin();
+		let id = tx.register_live(query, options)?;
+		self.attach_live_registration(tx, id)
+	}
+
+	/// Resumes from the authoritative persisted ACK, then joins the live tail.
+	/// A stale saved cursor uses the newer persisted ACK; an unconfirmed cursor
+	/// above that watermark is rejected. Saved results never FETCH current
+	/// data.
+	///
+	/// # Errors
+	///
+	/// Returns origin/query/version, unconfirmed-position, history/catalog,
+	/// snapshot-pin or bounded capacity errors before attaching the consumer.
+	///
+	/// ```
+	/// use ferros_grynn::{
+	/// 	changefeed::{ChangefeedConfig, ChangefeedSource},
+	/// 	datastore::{ClassSchema, Datastore},
+	/// 	graph::AtomKind,
+	/// 	live::{LiveNext, LiveOptions, LiveQuery, LiveSource},
+	/// };
+	/// # fn example() -> ferros_grynn::gql_status::FerrosGrynnResult<()> {
+	/// let store = Datastore::in_memory();
+	/// let mut tx = store.begin();
+	/// let class = tx.define_class(ClassSchema::new("person", AtomKind::Node, [])?)?;
+	/// let config = ChangefeedConfig::new("P1D".parse()?)?;
+	/// tx.configure_changefeed(ChangefeedSource::Class(class), config)?;
+	/// tx.commit()?;
+	/// let query = LiveQuery::new(LiveSource::Class(class));
+	/// let subscription = store.subscribe_live(query, LiveOptions::default())?;
+	/// let saved = subscription.cursor().clone();
+	/// drop(subscription);
+	/// let mut resumed = store.resume_live(&saved)?;
+	/// assert!(matches!(resumed.next()?, LiveNext::Idle));
+	/// # Ok(()) }
+	/// # example()?;
+	/// # Ok::<(), ferros_grynn::gql_status::FerrosGrynnError>(())
+	/// ```
+	#[expect(
+		clippy::tabs_in_doc_comments,
+		reason = "Nightly rustfmt applies the project's required hard tabs to this Rustdoc example"
+	)]
+	pub fn resume_live(
+		&self,
+		cursor: &crate::live::LiveCursor,
+	) -> FerrosGrynnResult<crate::live::LiveSubscription> {
+		let _commit = self.inner.commit.lock();
+		let root = self.inner.current_root();
+		let definition = root.live_catalog().queries.get(&cursor.live_id()).ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(
+				"LIVE resume incarnation is absent",
+			)
+		})?;
+		cursor.validate(root.database_uuid.into(), definition.id, definition.version)?;
+		if cursor.versionstamp().get() > definition.acknowledged {
+			return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+				"LIVE resume position was not confirmed",
+			));
+		}
+		let confirmed = crate::live::LiveCursor::new(
+			root.database_uuid.into(),
+			definition.id,
+			definition.version,
+			definition.acknowledged.into(),
+		)?;
+		let physical = if root
+			.live_segments()
+			.get(&definition.id)
+			.is_some_and(|segments| !segments.is_empty())
+		{
+			self.inner.capture_changefeed_snapshot(root.commit_ts)?
+		} else {
+			None
+		};
+		let replay =
+			super::live_queue::Replay::new(&root, &confirmed, &definition.options, physical)?;
+		let has_work = replay.has_work();
+		let key = self.inner.live_consumers.attach_replay(
+			confirmed.clone(),
+			definition.options.clone(),
+			if has_work {
+				replay.cutoff()
+			} else {
+				confirmed.versionstamp().get()
+			},
+			definition.state == crate::live::LiveState::Closed,
+		)?;
+		let handle = super::SubscriptionHandle::new(&self.inner, key, confirmed);
+		let handle = if has_work {
+			handle.with_replay(replay)
+		} else {
+			handle
+		};
+		Ok(crate::live::LiveSubscription {
+			inner: handle,
+		})
+	}
+
+	/// Closes an incarnation and registers its replacement in one commit.
+	///
+	/// # Errors
+	///
+	/// Returns source/capture validation, capacity, conflict or publication
+	/// errors.
+	pub fn reregister_live(
+		&self,
+		old: crate::live::LiveId,
+		query: crate::live::LiveQuery,
+		options: crate::live::LiveOptions,
+	) -> FerrosGrynnResult<crate::live::LiveSubscription> {
+		let mut tx = self.begin();
+		let id = tx.reregister_live(old, query, options)?;
+		self.attach_live_registration(tx, id)
+	}
+
+	/// Keeps pending-attachment cleanup outside the consuming commit call.
+	fn attach_live_registration(
+		&self,
+		mut tx: Transaction,
+		id: crate::live::LiveId,
+	) -> FerrosGrynnResult<crate::live::LiveSubscription> {
+		let mut subscription = self.prepare_live_attachment(&mut tx, id)?;
+		tx.commit()?;
+		subscription.inner.finish_registration()?;
+		Ok(subscription)
+	}
+
+	/// Admits one pending consumer before publication; its RAII owner remains
+	/// outside the consuming commit call, including every error return.
+	pub(crate) fn prepare_live_attachment(
+		&self,
+		tx: &mut Transaction,
+		id: crate::live::LiveId,
+	) -> FerrosGrynnResult<crate::live::LiveSubscription> {
+		let info = tx.live_info(id)?;
+		let key = {
+			let _commit = self.inner.commit.lock();
+			self.inner.live_consumers.attach(
+				info.cursor().clone(),
+				info.options().clone(),
+				false,
+			)?
+		};
+		let handle = super::SubscriptionHandle::new(&self.inner, key, info.cursor().clone());
+		Ok(crate::live::LiveSubscription {
+			inner: handle,
+		})
+	}
+
 	/// Opens one immutable rejected-item set by its durable identity.
 	///
 	/// # Errors
@@ -178,10 +367,12 @@ impl Datastore {
 				datastore_handles: AtomicUsize::new(1),
 				current: RwLock::new(Arc::new(root)),
 				commit: Mutex::new(()),
+				live_consumers: super::live_queue::Consumers::default(),
 				query_scratch_root,
 				quarantines: Mutex::new(std::collections::BTreeMap::new()),
 				maintenance: MaintenanceCoordinator::new(recovered_jobs),
 				changefeed_observation: super::changefeed_observation::Counters::default(),
+				live_observation: super::live_observation::Counters::default(),
 			}),
 		}
 	}

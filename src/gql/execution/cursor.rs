@@ -318,6 +318,42 @@ pub(super) trait QueryRead {
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot>;
 
+	/// Reads owned LIVE metadata from the same immutable statement root.
+	fn live_info(
+		&self,
+		_snapshot: Snapshot,
+		_id: crate::live::LiveId,
+		_maximum: usize,
+	) -> FerrosGrynnResult<crate::live::LiveInfo> {
+		Err(FerrosGrynnError::invalid_argument("this reader has no LIVE catalog"))
+	}
+
+	/// Retains the bounded metadata account while its recipe is inspected.
+	fn live_binding_info(
+		&self,
+		_snapshot: Snapshot,
+		_id: crate::live::LiveBindingId,
+		_control: &ExecutionControl,
+	) -> FerrosGrynnResult<(crate::live::LiveBindingInfo, crate::gql::options::BarrierAccount)>
+	{
+		Err(FerrosGrynnError::invalid_argument("this reader has no LIVE LET catalog"))
+	}
+
+	/// Borrows a reactive value from the same root as all statement row reads.
+	fn live_binding_value(
+		&self,
+		_snapshot: Snapshot,
+		_id: crate::live::LiveBindingId,
+	) -> FerrosGrynnResult<&Value> {
+		Err(FerrosGrynnError::invalid_argument("this reader has no LIVE LET catalog"))
+	}
+
+	/// Implicit session transactions infer mutation access after typed
+	/// analysis.
+	fn prepare_mutating_statement(&mut self) -> FerrosGrynnResult<()> {
+		Err(FerrosGrynnError::query_feature_not_supported("mutation in a read adapter"))
+	}
+
 	/// Returns committed origin/boundary even after a feed incarnation has
 	/// expired.
 	fn changefeed_context(
@@ -353,6 +389,12 @@ pub(super) trait QueryRead {
 	fn mutation_count(&self) -> usize;
 
 	fn catalog(&self, snapshot: Snapshot) -> &dyn QueryCatalog;
+
+	/// Root-bound embeddings share their checked scalar work/memory resolver.
+	/// Ordinary transaction readers retain their existing query policy.
+	fn bounded_fields(&self) -> Option<&dyn AtomFieldRead> {
+		None
+	}
 
 	/// Captures immutable qualified incidence from this statement's read root.
 	fn endpoint_tensor(
@@ -562,6 +604,7 @@ pub(super) trait QueryRead {
 		record: &RecordId,
 		graph: Option<&GraphRef>,
 		field: &str,
+		control: Option<&ExecutionControl>,
 	) -> FerrosGrynnResult<Value>;
 
 	/// Opens a graph without refreshing the statement snapshot.
@@ -608,6 +651,26 @@ pub(super) trait QueryRead {
 	fn query_scratch_root(&self) -> std::path::PathBuf;
 
 	fn savepoint(&self) -> Self::Savepoint;
+
+	/// Retains a successful outer declaration for a later statement analysis.
+	fn note_binding_type(
+		&mut self,
+		_name: &str,
+		_type: &Type,
+		_control: &ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		Ok(())
+	}
+
+	/// Retains reactive provenance independently of the identity stored in
+	/// Value.
+	fn note_reactive_binding(
+		&mut self,
+		_name: &str,
+		_control: &ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		Err(FerrosGrynnError::invalid_argument("this reader cannot retain LIVE LET declarations"))
+	}
 
 	fn restore_savepoint(&mut self, savepoint: Self::Savepoint) -> FerrosGrynnResult<()>;
 

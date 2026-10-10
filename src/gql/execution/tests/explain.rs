@@ -22,6 +22,89 @@ fn json_result(store: &Datastore, source: &str) -> Object {
 }
 
 #[test]
+fn duration_explain_uses_wrapped_timeout() -> crate::gql_status::FerrosGrynnResult<()> {
+	let store = Datastore::in_memory();
+	let mut session = store.session();
+	let inputs = Object::from_iter([
+		("second", Value::from("1s".parse::<crate::values::Duration>()?)),
+		("zero", Value::from("0ms".parse::<crate::values::Duration>()?)),
+	]);
+	for result in session.execute(
+		"DEFINE CLASS person TYPE NODE; CREATE person:seed; LIVE LET $limit = $zero; LET $fixed = \
+		 $zero;",
+		&inputs,
+	)? {
+		result.result?;
+	}
+	for prefix in ["EXPLAIN", "EXPLAIN FULL", "EXPLAIN ANALYZE"] {
+		for timeout in ["$limit", "$fixed", "0ms"] {
+			let source = format!("{prefix} SELECT id FROM person TIMEOUT {timeout};");
+			let results = session.execute(&source, &Object::new())?;
+			assert!(results[0].result.is_err(), "{source}: {results:?}");
+		}
+	}
+	for result in session
+		.execute("ALTER LIVE LET $limit VALUE $second; ALTER LET $fixed VALUE $second;", &inputs)?
+	{
+		result.result?;
+	}
+	for prefix in ["EXPLAIN", "EXPLAIN FULL", "EXPLAIN ANALYZE"] {
+		for timeout in ["$limit", "$fixed", "1s"] {
+			let source = format!("{prefix} SELECT id FROM person TIMEOUT {timeout};");
+			let results = session.execute(&source, &Object::new())?;
+			assert!(results[0].result.is_ok(), "{source}: {results:?}");
+		}
+	}
+	let planned =
+		session.execute("EXPLAIN FULL CREATE person:planned TIMEOUT 1s;", &Object::new())?;
+	assert!(planned[0].result.is_ok());
+	assert!(store.begin().atom(&"person:planned".parse::<RecordId>()?)?.is_none());
+	let rejected =
+		session.execute("EXPLAIN ANALYZE CREATE person:rejected TIMEOUT 0ms;", &Object::new())?;
+	assert!(rejected[0].result.is_err());
+	assert!(store.begin().atom(&"person:rejected".parse::<RecordId>()?)?.is_none());
+	let overflow = session.execute(
+		"EXPLAIN ANALYZE CREATE person:rejected TIMEOUT 18446744073709549568s;",
+		&Object::new(),
+	)?;
+	assert!(overflow[0].result.is_err());
+	assert!(store.begin().atom(&"person:rejected".parse::<RecordId>()?)?.is_none());
+	let nested = session.execute(
+		"IF true { LET $limit = $second; EXPLAIN SELECT id FROM person TIMEOUT $limit; };",
+		&inputs,
+	)?;
+	assert!(nested[0].result.is_ok(), "{nested:?}");
+	let info = session.execute("INFO FOR LIVE LET $limit;", &Object::new())?;
+	let uuid = info[0]
+		.result
+		.as_ref()
+		.map_err(Clone::clone)?
+		.value()
+		.as_object()
+		.and_then(|value| value.get("id"))
+		.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("test binding identity missing")
+		})?;
+	let invalid_uuid = session.execute(
+		"EXPLAIN SELECT id FROM person TIMEOUT $ordinary;",
+		&Object::from_iter([("ordinary", uuid.clone())]),
+	)?;
+	assert!(invalid_uuid[0].result.is_err());
+	for duration in ["P1M", "-PT1S", "PT20000000000S"] {
+		let inputs =
+			Object::from_iter([("bad", Value::from(duration.parse::<crate::values::Duration>()?))]);
+		for result in session.execute("ALTER LIVE LET $limit VALUE $bad;", &inputs)? {
+			result.result?;
+		}
+		let rejected = session
+			.execute("EXPLAIN ANALYZE CREATE person:rejected TIMEOUT $limit;", &Object::new())?;
+		assert!(rejected[0].result.is_err());
+		assert!(store.begin().atom(&"person:rejected".parse::<RecordId>()?)?.is_none());
+	}
+	Ok(())
+}
+
+#[test]
 fn explain_plans_without_effect_and_analyze_executes_once() {
 	let store = Datastore::in_memory();
 	store

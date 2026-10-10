@@ -82,6 +82,12 @@ impl StatisticsStore {
 		self.auxiliary_deferred = false;
 	}
 
+	/// Reports whether publication changes any part of this statistics
+	/// snapshot.
+	pub(crate) fn has_revision_updates(&self) -> bool {
+		self.base_touched || !self.graphs_touched.is_empty()
+	}
+
 	pub(crate) fn publish_revision(&mut self, revision: u64) {
 		if self.base_touched {
 			self.base.revision = revision;

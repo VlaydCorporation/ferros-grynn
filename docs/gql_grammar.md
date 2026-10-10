@@ -550,6 +550,8 @@ explainable_stmt ::= select_stmt | match_stmt
                    | create_stmt | update_stmt | upsert_stmt | delete_stmt
                    | attach_stmt | detach_stmt | relate_stmt
                    | define_stmt | alter_stmt | remove_stmt
+                   | live_select_stmt | live_let_stmt | info_live_stmt | ack_live_stmt
+                   | "KILL" param | "LET" param "=" live_select_stmt
 
 assert_invariants_stmt ::= "ASSERT" "INVARIANTS" [ "FOR" "GRAPH" graph_ref ] [ "REPORT" integer ]
 
@@ -1285,22 +1287,49 @@ maintenance_option  ::= ( "SORT_MEM" | "PARALLELISM" ) "=" integer
 with_options ::= "WITH" "(" option_assign { "," option_assign } ")"
 option_assign ::= ident "=" expr
 
-live_select_stmt ::= "LIVE" "SELECT" live_projection
+live_select_stmt ::= "LIVE" "SELECT" live_output_projection
                      "FROM" target_list
+                     [ "IN" "GRAPH" expr ]
                      [ where_clause ]
+                     [ group_clause ]
+                     [ order_clause ]
+                     [ limit_clause ]
+                     [ start_clause ]
+                     [ omit_clause ]
                      [ fetch_clause ]
-                     [ "SINCE" ( param | integer | datetime_lit ) ]
+                     [ "SINCE" expr ]
                      [ "ON" "OVERFLOW" overflow_policy ]
-                     [ "BUFFER" integer ]
+                     [ "BUFFER" expr ]
 overflow_policy  ::= "GAP" | "DISCONNECT" | "BLOCK"
+live_let_stmt    ::= "LIVE" "LET" param "=" expr
+alter_let_stmt   ::= "ALTER" [ "LIVE" ] "LET" param "VALUE" expr
+remove_live_let_stmt ::= "REMOVE" "LIVE" "LET" param
+info_live_stmt   ::= "INFO" "FOR" "LIVE" [ "LET" ] param
+ack_live_stmt    ::= "ACK" "LIVE" param "CURSOR" expr
 live_projection ::= [ "VALUE" ] select_field_list [ "AS" alias ]
-                  | "DIFF"
-                  | "PATCH"
+live_output_projection ::= [ "ONLY" ] live_projection
+                         | ( "DIFF" | "PATCH" ) [ "ONLY" ] [ live_projection ]
 ```
 
 `LIVE SELECT` обычно связывается с идентификатором: `LET $id = LIVE SELECT ...`, где `$id` используется в `KILL`.
-Оператор возвращает event stream. `LiveGraph<Frozen/Mutable>` является SDK-материализацией этого
-потока и не добавляет отдельной синтаксической формы.
+Регистрация возвращает UUID; pull stream доступен через session/Rust handle.
+Обычные LET и execute parameters frozen; LIVE LET отслеживается по versioned identity.
+Cursor передаётся как Bytes. Нормативный контракт: [этап 28](gql_live_stage_28_plan.md).
+LIVE ORDER допускает deterministic Name/expression keys; RAND отклоняется при
+registration. START поддерживает Offset; START AFTER требует отдельного retained
+session cursor contract и здесь отклоняется. ORDER определяет membership окна,
+delivery сохраняет canonical identity order без rank-only событий.
+SINCE вычисляется обычным evaluator и требует точный versionstamp либо timestamp;
+BUFFER — положительный integer. Execute parameters, frozen LET и опубликованные
+PURE calls и LIVE LET допустимы в этих expressions. SINCE/BUFFER фиксируются
+при регистрации; их последующие изменения требуют новой подписки.
+Обычный ALTER LET требует mutable binding
+ближайшего lexical scope, сохраняет его тип и не меняет frozen captures прежних LIVE.
+LIVE LET declaration создаёт immutable lexical identity; ALTER LIVE LET заменяет
+expression этой identity. INFO/REMOVE принимают её lexical spelling либо UUID input;
+обычный `$binding` читает snapshot value, включая вызов captured closure.
+`LiveGraph<Frozen/Mutable>` является SDK-материализацией этапа 29 и не добавляет
+отдельной синтаксической формы.
 
 ---
 
@@ -1365,8 +1394,8 @@ order_term_list ::= order_term { "," order_term }
 order_term   ::= expr [ "COLLATE" ] [ "NUMERIC" ] [ "ASC" | "DESC" ] [ nulls_pos ]
 nulls_pos    ::= "NULLS" ( "FIRST" | "LAST" )
 
-limit_clause ::= "LIMIT" [ "BY" ] ( integer | param )
-start_clause ::= "START" [ "AT" ] ( integer | param )
+limit_clause ::= "LIMIT" [ "BY" ] expr
+start_clause ::= "START" [ "AT" ] expr
               | "START" "AFTER" ( param | expr ) [ "READ" "COMMITTED" ]
 
 fetch_clause ::= "FETCH" idiom_list

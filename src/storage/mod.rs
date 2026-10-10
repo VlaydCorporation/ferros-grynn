@@ -10,7 +10,8 @@ mod buffer_pool;
 mod catalog;
 /// Checked changefeed group framing; publication is owned by the local store.
 mod changefeed;
-pub(crate) use changefeed::{ChangefeedGroupInfo, ChangefeedSegment, ChangefeedSegments};
+pub(crate) use changefeed::{ChangefeedGroupInfo, ChangefeedSegments};
+pub use history_codec::pages::{HistoryOwner, HistorySegment};
 mod consts;
 mod database_superblock;
 mod derived_index;
@@ -30,6 +31,7 @@ mod graph_index;
 mod graph_pages;
 mod graph_store;
 mod graph_superblock;
+mod history_codec;
 mod hybrid_engine;
 mod image_io;
 mod immutable_stream;
@@ -38,6 +40,10 @@ mod neighbourhood_index;
 pub(crate) use neighbourhood_index::{NeighbourhoodHeader, NeighbourhoodLayout, NeighbourhoodTag};
 mod tensor_index;
 pub use tensor_index::{TensorCacheHeader, TensorCacheLayout, TensorCacheTag};
+pub(crate) mod live_descriptor;
+/// Exact computed result history; never source SHOW CHANGES payloads.
+pub(crate) mod live_history;
+pub use live_history::LiveHistorySegments;
 mod local;
 mod local_store;
 mod membership_index;

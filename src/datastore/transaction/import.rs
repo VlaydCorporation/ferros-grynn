@@ -1,12 +1,15 @@
 //! Import-only transaction state rotation and final validation.
 
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
 use super::{Mutation, Transaction};
 use crate::{
 	datastore::{DatabaseRoot, ImportConstraintMode, ImportIndexMode, IndexId},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 };
+
+#[cfg(test)]
+mod tests;
 
 impl Mutation {
 	/// Returns whether this mutation belongs to the Stage 10 DML whitelist.
@@ -126,7 +129,7 @@ impl Transaction {
 		commit_ts: u64,
 		indexes: ImportIndexMode,
 		full_validation: bool,
-	) -> FerrosGrynnResult<(DatabaseRoot, u64, Vec<IndexId>)> {
+	) -> FerrosGrynnResult<(Self, Vec<IndexId>)> {
 		self.ensure_live()?;
 		let graphs = self
 			.working
@@ -142,7 +145,6 @@ impl Transaction {
 		}
 
 		self.working.commit_ts = commit_ts;
-		let scratch_root = self.store.inner.import_scratch_root();
 		let rebuild = indexes == ImportIndexMode::Deferred || full_validation;
 		let built_indexes = if rebuild {
 			self.working.rebuild_indexes()?;
@@ -155,14 +157,49 @@ impl Transaction {
 		} else {
 			Vec::new()
 		};
-		self.working.rebuild_statistics_at(&scratch_root)?;
 		self.working.advance_identity_clocks(
 			self.store.inner.next_schema_id.load(Ordering::Relaxed),
 			self.store.inner.next_graph_id.load(Ordering::Relaxed),
 		);
-		let base_commit_ts = self.snapshot.commit_ts;
-		self.publish_import_changes(commit_ts)?;
-		Ok((self.working, base_commit_ts, built_indexes))
+		Ok((self, built_indexes))
+	}
+
+	/// Reuses the accepted primary image and spool after a control race. No
+	/// expression evaluation or waiting takes place under the commit mutex.
+	pub(in crate::datastore) fn prepare_import_publication(
+		&mut self,
+		current: &Arc<DatabaseRoot>,
+		maximum: usize,
+	) -> FerrosGrynnResult<()> {
+		self.working.rebase_import_controls(&self.snapshot, current, self.id, maximum)?;
+		self.working.rebuild_statistics_at(&self.store.inner.import_scratch_root())?;
+		let stamp = self.working.commit_ts;
+		self.publish_import_changes(stamp)?;
+		let capture = match self.import_changefeed.mode {
+			crate::datastore::ImportChangefeedMode::On => super::LiveHistoryCapture::Enabled,
+			crate::datastore::ImportChangefeedMode::Off => {
+				super::LiveHistoryCapture::ImportSuppressed
+			}
+		};
+		super::prepare_live_publication(
+			current,
+			&mut self.working,
+			self.store.inner.query_scratch_root(),
+			capture,
+			super::LiveQueryTargets::All,
+			&self.store.inner.live_observation,
+		)
+	}
+
+	/// Transfers the complete rechecked candidate to the existing persistence
+	/// barrier only after optimistic publication succeeds.
+	pub(in crate::datastore) fn into_import_root(self) -> DatabaseRoot {
+		self.working
+	}
+
+	/// Borrows the final candidate only for transient queue admission.
+	pub(in crate::datastore) const fn import_publication_root(&self) -> &DatabaseRoot {
+		&self.working
 	}
 
 	/// Returns whether graph-family constraints are checked after every item.

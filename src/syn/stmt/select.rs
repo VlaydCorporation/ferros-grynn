@@ -5,9 +5,29 @@
 
 use super::*;
 
+/// Internal SDK unions separate row concatenation from JOIN typing states.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SelectUnionPurpose {
+	/// Independent class outputs share one global result window/reduction.
+	#[default]
+	IndependentOutputs,
+	/// Class and missing-row states collapse before one relational JOIN.
+	JoinedTypingVariants,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[allow(
+	clippy::partial_pub_fields,
+	reason = "SDK lowering metadata is internal while text syntax fields retain their public API"
+)]
 pub struct SelectStatement {
+	/// Independent SDK source plans; textual SELECT leaves this empty.
+	pub(crate) union_inputs: Vec<Self>,
+	/// Typing alternatives collapse before JOIN; they are not independent rows.
+	pub(crate) union_purpose: SelectUnionPurpose,
+	/// Canonical lexical origin within one SDK lowering, never a pointer.
+	pub(crate) lexical_id: Option<u32>,
 	pub only: bool,
 	pub value: bool,
 	pub projection: Vec<SelectItem>,
@@ -23,6 +43,38 @@ pub struct SelectStatement {
 	pub limit: Option<Expr>,
 	pub start: Option<SelectStart>,
 	pub tempfiles: bool,
+}
+
+impl SelectStatement {
+	/// Wraps admitted independent inputs without cloning their syntax trees.
+	pub(crate) fn independent_union(inputs: Vec<Self>, lexical_id: u32) -> Self {
+		let value = inputs.first().is_some_and(|input| input.value);
+		Self {
+			union_inputs: inputs,
+			union_purpose: SelectUnionPurpose::IndependentOutputs,
+			lexical_id: Some(lexical_id),
+			only: false,
+			value,
+			projection: Vec::new(),
+			source: SelectSource {
+				kind: SelectSourceKind::Empty,
+				graph: None,
+				alias: None,
+				span: TextSpan::new(0, 0),
+			},
+			joins: Vec::new(),
+			access: None,
+			filter: None,
+			split: Vec::new(),
+			group: None,
+			omit: Vec::new(),
+			fetch: Vec::new(),
+			order: Vec::new(),
+			limit: None,
+			start: None,
+			tempfiles: false,
+		}
+	}
 }
 
 /// Optional user restriction over secondary-index candidates.
@@ -52,6 +104,13 @@ pub enum SelectItem {
 		expr: Expr,
 		alias: Option<Identifier>,
 	},
+	/// A checked logical output path supplied by the Rust LIVE builder.
+	PathExpr {
+		/// Expression evaluated in the original projection order.
+		expr: Expr,
+		/// Nested output shape applied before FETCH.
+		alias: SelectPath,
+	},
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,7 +125,18 @@ pub struct SelectSource {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum SelectSourceKind {
+	/// Explicit zero-domain SDK source, without a synthetic class.
+	Empty,
 	Atoms(SelectTarget),
+	/// SDK-only class typing state over one raw atom relation. Text parsing
+	/// never creates this metadata; None describes an unmatched LEFT slot.
+	#[doc(hidden)]
+	AtomUnion {
+		/// Canonical source classes, resolved against the same snapshot.
+		classes: Vec<Identifier>,
+		/// Selected class ordinal, or the explicit missing-row typing state.
+		typing: Option<usize>,
+	},
 	Graph(Expr),
 	Graphs(Option<Vec<Expr>>),
 	Derived(Box<SelectStatement>),
@@ -145,6 +215,15 @@ pub struct SelectPath {
 #[non_exhaustive]
 pub enum SelectTarget {
 	Class(Identifier),
+	/// SDK-only exact identity supplied through an immutable literal parameter.
+	/// Text parsing never creates this metadata.
+	#[doc(hidden)]
+	BoundRecord {
+		/// Declared class spelling, checked against the captured identity.
+		class: Identifier,
+		/// Supplied literal slot; never evaluated as user code during analysis.
+		parameter: Identifier,
+	},
 	Record {
 		class: Identifier,
 		key: RecordKey,
@@ -172,28 +251,19 @@ impl Parser<'_> {
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<SelectStatement> {
+		self.select_with_projection(context, None).await
+	}
+
+	/// Shares source/clauses with LIVE DIFF/PATCH, including implicit wildcard
+	/// shorthand and ordinary explicit projections.
+	pub(in crate::syn) async fn select_with_projection(
+		&mut self,
+		context: &mut Stk,
+		implicit: Option<SelectItem>,
+	) -> FerrosGrynnResult<SelectStatement> {
 		let only = self.consume_keyword(keywords::ONLY).is_some();
 		let value = self.consume_keyword(keywords::VALUE).is_some();
-		let mut projection = Vec::new();
-		loop {
-			if let Some(token) = self.consume_symbol(Symbol::Star) {
-				projection.push(SelectItem::Wildcard(token.span));
-			} else {
-				let expr = context.run(|context| self.expression(context, 0, 1, 0)).await?;
-				let alias = if self.consume_keyword(keywords::AS).is_some() {
-					Some(self.identifier()?)
-				} else {
-					None
-				};
-				projection.push(SelectItem::Expr {
-					expr,
-					alias,
-				});
-			}
-			if self.consume_symbol(Symbol::Comma).is_none() {
-				break;
-			}
-		}
+		let projection = context.run(|context| self.select_projection(context, implicit)).await?;
 		if value && projection.len() != 1 {
 			return Err(
 				self.syntax("SELECT VALUE requires exactly one expression.", self.current().span)
@@ -328,6 +398,9 @@ impl Parser<'_> {
 		}
 		let tempfiles = self.consume_keyword(keywords::TEMPFILES).is_some();
 		Ok(SelectStatement {
+			union_inputs: Vec::new(),
+			union_purpose: SelectUnionPurpose::IndependentOutputs,
+			lexical_id: None,
 			only,
 			value,
 			projection,
@@ -344,6 +417,38 @@ impl Parser<'_> {
 			start,
 			tempfiles,
 		})
+	}
+
+	/// Parses output items before the shared FROM/clauses continuation.
+	async fn select_projection(
+		&mut self,
+		context: &mut Stk,
+		implicit: Option<SelectItem>,
+	) -> FerrosGrynnResult<Vec<SelectItem>> {
+		if let Some(item) = implicit {
+			return Ok(vec![item]);
+		}
+		let mut projection = Vec::new();
+		loop {
+			if let Some(token) = self.consume_symbol(Symbol::Star) {
+				projection.push(SelectItem::Wildcard(token.span));
+			} else {
+				let expr = context.run(|context| self.expression(context, 0, 1, 0)).await?;
+				let alias = if self.consume_keyword(keywords::AS).is_some() {
+					Some(self.identifier()?)
+				} else {
+					None
+				};
+				projection.push(SelectItem::Expr {
+					expr,
+					alias,
+				});
+			}
+			if self.consume_symbol(Symbol::Comma).is_none() {
+				break;
+			}
+		}
+		Ok(projection)
 	}
 
 	async fn select_source(&mut self, context: &mut Stk) -> FerrosGrynnResult<SelectSource> {

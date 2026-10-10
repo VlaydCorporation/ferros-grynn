@@ -63,6 +63,20 @@ pub(in crate::gql) fn fingerprints(plan: &LogicalSelect) -> (u64, u64) {
 
 /// Encodes relation semantics while excluding cursor page state.
 fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
+	if !plan.union_inputs.is_empty() {
+		match plan.union_purpose {
+			crate::syn::SelectUnionPurpose::IndependentOutputs => {
+				"independent SELECT union".hash(state);
+			}
+			crate::syn::SelectUnionPurpose::JoinedTypingVariants => {
+				"JOIN typing family".hash(state);
+			}
+		}
+		plan.union_inputs.len().hash(state);
+		for input in &plan.union_inputs {
+			hash_select(input, state);
+		}
+	}
 	hash_source(&plan.source, state);
 	for join in &plan.joins {
 		std::mem::discriminant(&join.kind).hash(state);
@@ -116,6 +130,35 @@ fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
 					}
 				}
 			}
+			LogicalSelectItem::WildcardVariants {
+				selector,
+				choices,
+			} => {
+				2_u8.hash(state);
+				hash_expr(selector, state);
+				choices.len().hash(state);
+				for fields in choices {
+					fields.len().hash(state);
+					for field in fields {
+						match field {
+							LogicalWildcardField::Column {
+								name,
+								index,
+							} => {
+								0_u8.hash(state);
+								name.hash(state);
+								index.hash(state);
+							}
+							LogicalWildcardField::Properties {
+								index,
+							} => {
+								1_u8.hash(state);
+								index.hash(state);
+							}
+						}
+					}
+				}
+			}
 			LogicalSelectItem::Expression {
 				name,
 				expression,
@@ -128,6 +171,10 @@ fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
 	}
 	plan.omit.hash(state);
 	plan.fetch.hash(state);
+	if !plan.projection_paths.is_empty() {
+		b"projection-paths-v1".hash(state);
+		plan.projection_paths.hash(state);
+	}
 	for item in &plan.order {
 		item.random.hash(state);
 		item.collate.hash(state);
@@ -151,6 +198,15 @@ fn hash_select(plan: &LogicalSelect, state: &mut impl Hasher) {
 fn hash_source(source: &LogicalSelectSource, state: &mut impl Hasher) {
 	source.alias.hash(state);
 	match &source.kind {
+		LogicalSelectSourceKind::Empty {
+			graph,
+		} => {
+			3_u8.hash(state);
+			graph.is_some().hash(state);
+			if let Some(graph) = graph {
+				hash_graph_reference(graph, state);
+			}
+		}
 		LogicalSelectSourceKind::Atoms {
 			target,
 			graph,
@@ -178,6 +234,24 @@ fn hash_source(source: &LogicalSelectSource, state: &mut impl Hasher) {
 				for reference in references {
 					hash_graph_reference(reference, state);
 				}
+			}
+		}
+		LogicalSelectSourceKind::AtomUnion {
+			targets,
+			graph,
+			tag_column,
+			typing,
+		} => {
+			4_u8.hash(state);
+			typing.hash(state);
+			targets.len().hash(state);
+			for target in targets {
+				target.class().hash(state);
+			}
+			tag_column.hash(state);
+			graph.is_some().hash(state);
+			if let Some(graph) = graph {
+				hash_graph_reference(graph, state);
 			}
 		}
 		LogicalSelectSourceKind::Derived(select) => {
@@ -217,7 +291,7 @@ pub(super) fn hash_expr(expression: &TypedExpr, state: &mut impl Hasher) {
 	std::mem::discriminant(&expression.kind).hash(state);
 	match &expression.kind {
 		TypedExprKind::Constant(value) => value.hash(state),
-		TypedExprKind::Slot(slot) => slot.hash(state),
+		TypedExprKind::Slot(slot) | TypedExprKind::LiveSlot(slot) => slot.hash(state),
 		TypedExprKind::Column(column) => column.hash(state),
 		TypedExprKind::Array(values) | TypedExprKind::Set(values) => {
 			for value in values {

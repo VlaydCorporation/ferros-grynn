@@ -2,6 +2,7 @@
 // layer lands.
 #[allow(dead_code, reason = "used by the Datastore adapter in the next vertical slice")]
 mod analysis;
+pub(crate) mod bindings;
 pub(crate) mod closure;
 pub(crate) mod cursor;
 #[allow(dead_code, reason = "used by the Datastore adapter in the next vertical slice")]
@@ -9,10 +10,14 @@ mod execution;
 pub(crate) mod import;
 #[allow(dead_code, reason = "the crate-private executor owns the logical IR")]
 mod ir;
+/// Rust LIVE descriptors lower through the ordinary typed SELECT pipeline.
+pub(crate) mod live_lowering;
 pub(crate) mod optimizer;
 mod options;
 mod pure_function;
+mod root_catalog;
 pub(crate) mod spill;
+mod value_admission;
 
 use std::time::Duration;
 
@@ -23,7 +28,7 @@ pub(crate) use execution::{
 	execute_transaction,
 	execute_transaction_with_options,
 };
-pub(crate) use options::{ExecutionControl, resolve_timeout};
+pub(crate) use options::{BarrierAccount, ExecutionControl};
 pub use options::{QueryCancellation, QueryExecutionOptions};
 pub(crate) use pure_function::PureFunctionEvaluator;
 
@@ -96,6 +101,7 @@ pub use crate::{
 		LetStatement,
 		LetValue,
 		Literal,
+		LiveLetStatement,
 		MatchDirection,
 		MatchEdge,
 		MatchEndpoint,
@@ -185,6 +191,10 @@ pub enum QueryStatementKind {
 	Info,
 	/// Whole-commit durable history, including explicit gaps.
 	ShowChanges,
+	/// Transactional LIVE query registration.
+	Live,
+	/// Transactional confirmation of an issued LIVE delivery.
+	Ack,
 	Maintenance,
 	Kill,
 	Let,
@@ -305,6 +315,8 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		StatementKind::Kill(_) => QueryStatementKind::Kill,
 		StatementKind::Import(_) => QueryStatementKind::Import,
 		StatementKind::Let(_) => QueryStatementKind::Let,
+		StatementKind::LiveSelect(_) | StatementKind::LiveLet(_) => QueryStatementKind::Live,
+		StatementKind::AckLive(_) => QueryStatementKind::Ack,
 		StatementKind::Match(_) => QueryStatementKind::Match,
 		StatementKind::Relate(_) => QueryStatementKind::Relate,
 		StatementKind::Return(_) => QueryStatementKind::Return,
@@ -315,6 +327,14 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 }
 
 pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
+	if matches!(
+		statement,
+		StatementKind::Alter(crate::syn::AlterStatement {
+			target: crate::syn::AlterTarget::Let { .. },
+		})
+	) {
+		return false;
+	}
 	if let StatementKind::Explain(explain) = statement {
 		return explain.mode == ExplainMode::Analyze
 			&& statement_mutates_state(&explain.statement.kind);
@@ -342,6 +362,13 @@ pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
 			| StatementKind::Maintenance(_)
 			| StatementKind::Kill(_)
 			| StatementKind::Import(_)
+			| StatementKind::LiveSelect(_)
+			| StatementKind::LiveLet(_)
+			| StatementKind::AckLive(_)
+			| StatementKind::Let(crate::syn::LetStatement {
+				value: crate::syn::LetValue::LiveSelect(_),
+				..
+			})
 			| StatementKind::BuildGraph(crate::syn::BuildGraphStatement {
 				name: Some(_),
 				..

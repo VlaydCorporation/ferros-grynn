@@ -34,6 +34,30 @@ mod import;
 mod index_store;
 /// Canonical graph-local LevelPath projection.
 mod level_path;
+/// Restorable subscription recipes and transactional lifecycle.
+mod live_catalog;
+/// Computed history capture epochs, independent of queue delivery.
+mod live_history;
+/// Payload-free process observations over LIVE preparation and publication.
+mod live_observation;
+/// Bounded whole-commit consumer state and publication admission.
+mod live_queue;
+pub(crate) use live_catalog::{
+	BindingAdmission,
+	LiveBindingDefinition,
+	LiveCatalog,
+	LiveDefinition,
+	LiveRhsScopeAnchor,
+	expression_dependencies,
+	query_dependencies,
+};
+pub(crate) use live_history::{
+	LiveCaptureEpoch,
+	LiveCapturePolicy,
+	LiveHistoryMetadata,
+	capture_source,
+};
+pub(crate) use live_queue::SubscriptionHandle;
 /// Durable maintenance jobs and their public projections.
 mod maintenance;
 /// Graph-local occurrences and sparse overlays.
@@ -48,6 +72,8 @@ mod runtime_status;
 mod schema;
 /// Persistent GrynnQL statement driver.
 mod session;
+/// Fixed-root source history shared by transaction reads and LIVE catch-up.
+mod source_history;
 /// In-memory database owner and commit serialization.
 mod store;
 /// Full qualified tensor captures and their checked durable encodings.
@@ -59,6 +85,8 @@ pub(crate) use tensor_artifact::TensorArtifact;
 mod transaction;
 /// Exact vector-distance oracle used by scans and ANN reranking.
 mod vector_distance;
+/// Snapshot-owned logical conflict revisions.
+mod versions;
 pub(crate) use atom_store::{AtomStoreRoot, BaseAtom, GlobalAtomId};
 pub(crate) use backend::{StoreBackend, StoreInner, validate_local_options};
 pub(crate) use conflict::ConflictKey;
@@ -103,6 +131,7 @@ pub(crate) use occurrence::{
 pub use options::{
 	CheckpointMode,
 	CheckpointPolicy,
+	CommitOptions,
 	DatastoreOptions,
 	InMemoryOptions,
 	IoMode,
@@ -167,6 +196,8 @@ pub(crate) use text_analyzer::{
 };
 pub use transaction::{AtomSnapshot, CommitResult, Transaction, TransactionGraphView};
 pub(crate) use transaction::{
+	GqlLiveAck,
+	GqlLiveAttachment,
 	QueryGeometryIndexRead,
 	QueryLandmarkPath,
 	QueryNeighbourhoodEstimate,

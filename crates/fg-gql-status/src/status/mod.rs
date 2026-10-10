@@ -29,6 +29,42 @@ pub use taxonomy::{
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult, formatting::DiagnosticValue};
+
+	/// Reverse construction shares the declaration's exact parameter types and
+	/// names.
+	#[test]
+	fn captured_status_restores_exact_parameters_and_rejects_wrong_schema() -> FerrosGrynnResult<()>
+	{
+		let original =
+			Status::storage_decode_limit_exceeded("LIVE result bytes", u64::MAX - 1, u64::MAX);
+		let parameters =
+			original.parameters().into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
+		let restored = Status::from_parameters(original.definition().code, parameters)?;
+		assert_eq!(restored, original);
+		let parameters = std::collections::BTreeMap::from([
+			("limit".to_owned(), DiagnosticValue::String("bytes".to_owned())),
+			("observed".to_owned(), DiagnosticValue::Integer(1)),
+			("maximum".to_owned(), DiagnosticValue::Unsigned(2)),
+		]);
+		assert!(Status::from_parameters(original.definition().code, parameters).is_err());
+		assert!(
+			Status::from_parameters(original.definition().code, std::collections::BTreeMap::new())
+				.is_err()
+		);
+		let unknown = "FG-ZZZZZ"
+			.parse()
+			.map_err(|_error| FerrosGrynnError::invalid_argument("fixture code"))?;
+		assert!(Status::from_parameters(unknown, std::collections::BTreeMap::new()).is_err());
+		assert_eq!(
+			Status::from_parameters(
+				Status::division_by_zero().definition().code,
+				std::collections::BTreeMap::new()
+			)?,
+			Status::division_by_zero()
+		);
+		Ok(())
+	}
 
 	#[test]
 	fn parses_and_formats_status_code() {

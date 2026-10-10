@@ -101,6 +101,28 @@ pub(super) struct RetiredGeneration {
 }
 
 impl RetiredGeneration {
+	/// Accounts pinned retirement metadata before admission of another
+	/// generation. Paths and file markers remain owned until cleanup.
+	pub(super) fn heap_bytes(&self) -> FerrosGrynnResult<usize> {
+		let fixed = self
+			.directories
+			.capacity()
+			.checked_mul(std::mem::size_of::<PathBuf>())
+			.and_then(|bytes| {
+				bytes.checked_add(
+					self.markers
+						.capacity()
+						.checked_mul(std::mem::size_of::<Weak<RegisteredDataFile>>())?,
+				)
+			})
+			.ok_or_else(|| invalid("generation retirement metadata overflows"))?;
+		self.directories.iter().try_fold(fixed, |bytes, path| {
+			bytes
+				.checked_add(path.capacity())
+				.ok_or_else(|| invalid("generation retirement paths overflow"))
+		})
+	}
+
 	/// Captures the directories retired by one durable catalog replacement.
 	pub(super) fn between(
 		root: &Path,

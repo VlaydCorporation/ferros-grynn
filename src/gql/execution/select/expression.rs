@@ -135,6 +135,7 @@ fn contains_select_special(expression: &TypedExpr) -> bool {
 		TypedExprKind::Traversal(_) => false,
 		TypedExprKind::Constant(_)
 		| TypedExprKind::Slot(_)
+		| TypedExprKind::LiveSlot(_)
 		| TypedExprKind::Column(_)
 		| TypedExprKind::CurrentField(_)
 		| TypedExprKind::Closure(_) => false,
@@ -151,8 +152,19 @@ fn materialize_specials<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<TypedExpr> {
+	admit_special_copy(read, expression)?;
 	let recurse = |value: &TypedExpr| {
 		materialize_specials(read, snapshot, value, row, group, slots, source, control)
+	};
+	let evaluated = |value: &TypedExpr| {
+		admit_special_copy(read, value)?;
+		Ok::<_, FerrosGrynnError>(TypedExpr {
+			kind: TypedExprKind::Constant(eval_select_expr(
+				read, snapshot, value, row, group, slots, source, control,
+			)?),
+			ty: value.ty.clone(),
+			span: value.span,
+		})
 	};
 	let kind = match &expression.kind {
 		TypedExprKind::Aggregate {
@@ -239,32 +251,82 @@ fn materialize_specials<Read: QueryRead>(
 			left,
 			op,
 			right,
+		} if lazy_binary(*op) => {
+			let left_value =
+				eval_select_expr(read, snapshot, left, row, group, slots, source, control)?;
+			match after_binary_left(*op, left_value) {
+				std::ops::ControlFlow::Break(value) => TypedExprKind::Constant(value),
+				std::ops::ControlFlow::Continue(value) => TypedExprKind::Binary {
+					left: Box::new(TypedExpr {
+						kind: TypedExprKind::Constant(value),
+						ty: left.ty.clone(),
+						span: left.span,
+					}),
+					op: *op,
+					right: Box::new(recurse(right)?),
+				},
+			}
+		}
+		TypedExprKind::Binary {
+			left,
+			op,
+			right,
 		} => TypedExprKind::Binary {
-			left: Box::new(recurse(left)?),
+			left: Box::new(evaluated(left)?),
 			op: *op,
-			right: Box::new(recurse(right)?),
+			right: Box::new(evaluated(right)?),
 		},
 		TypedExprKind::Conditional {
 			condition,
 			then_value,
 			else_value,
-		} => TypedExprKind::Conditional {
-			condition: Box::new(recurse(condition)?),
-			then_value: Box::new(recurse(then_value)?),
-			else_value: Box::new(recurse(else_value)?),
-		},
+		} => {
+			let condition =
+				eval_select_expr(read, snapshot, condition, row, group, slots, source, control)?;
+			let selected = if condition.is_truthy() {
+				then_value
+			} else {
+				else_value
+			};
+			TypedExprKind::Constant(eval_select_expr(
+				read, snapshot, selected, row, group, slots, source, control,
+			)?)
+		}
 		TypedExprKind::Case {
 			operand,
 			branches,
 			else_value,
-		} => TypedExprKind::Case {
-			operand: operand.as_deref().map(recurse).transpose()?.map(Box::new),
-			branches: branches
-				.iter()
-				.map(|(condition, value)| Ok((recurse(condition)?, recurse(value)?)))
-				.collect::<FerrosGrynnResult<_>>()?,
-			else_value: else_value.as_deref().map(recurse).transpose()?.map(Box::new),
-		},
+		} => {
+			let operand = operand
+				.as_deref()
+				.map(|operand| {
+					eval_select_expr(read, snapshot, operand, row, group, slots, source, control)
+				})
+				.transpose()?;
+			let mut selected = else_value.as_deref();
+			for (condition, value) in branches {
+				let condition = eval_select_expr(
+					read, snapshot, condition, row, group, slots, source, control,
+				)?;
+				if operand
+					.as_ref()
+					.map_or_else(|| condition.is_truthy(), |operand| operand == &condition)
+				{
+					selected = Some(value);
+					break;
+				}
+			}
+			TypedExprKind::Constant(
+				selected
+					.map(|selected| {
+						eval_select_expr(
+							read, snapshot, selected, row, group, slots, source, control,
+						)
+					})
+					.transpose()?
+					.unwrap_or(Value::None),
+			)
+		}
 		TypedExprKind::Field {
 			base,
 			field,
@@ -300,7 +362,21 @@ fn materialize_specials<Read: QueryRead>(
 			arguments,
 		} => TypedExprKind::Builtin {
 			function: function.clone(),
-			arguments: arguments.iter().map(recurse).collect::<FerrosGrynnResult<_>>()?,
+			arguments: arguments.iter().map(evaluated).collect::<FerrosGrynnResult<_>>()?,
+		},
+		TypedExprKind::Invoke {
+			callee,
+			arguments,
+		} => TypedExprKind::Invoke {
+			callee: Box::new(evaluated(callee)?),
+			arguments: arguments.iter().map(evaluated).collect::<FerrosGrynnResult<_>>()?,
+		},
+		TypedExprKind::NamedInvoke {
+			function,
+			arguments,
+		} => TypedExprKind::NamedInvoke {
+			function: *function,
+			arguments: arguments.iter().map(evaluated).collect::<FerrosGrynnResult<_>>()?,
 		},
 		TypedExprKind::Cast {
 			target,
@@ -318,6 +394,77 @@ fn materialize_specials<Read: QueryRead>(
 	})
 }
 
+/// Bounded embeddings admit copied typed nodes before SELECT materialization.
+pub(super) fn admit_special_copy<Read: QueryRead>(
+	read: &Read,
+	expression: &TypedExpr,
+) -> FerrosGrynnResult<()> {
+	let Some(fields) = read.bounded_fields() else {
+		return Ok(());
+	};
+	fields.work(1)?;
+	fields.admit(2 * std::mem::size_of::<TypedExpr>())?;
+	crate::gql::live_lowering::admit_type_shape(&expression.ty, 0, 1, &mut |bytes, work| {
+		fields.work(work)?;
+		fields.admit(bytes)
+	})?;
+	let count = match &expression.kind {
+		TypedExprKind::Array(values) | TypedExprKind::Set(values) => values.len(),
+		TypedExprKind::Builtin {
+			arguments,
+			..
+		}
+		| TypedExprKind::Invoke {
+			arguments,
+			..
+		}
+		| TypedExprKind::NamedInvoke {
+			arguments,
+			..
+		} => arguments.len(),
+		TypedExprKind::Object(values) => {
+			for (name, _) in values {
+				fields.admit(name.len())?;
+			}
+			values.len()
+		}
+		TypedExprKind::Case {
+			branches,
+			..
+		} => branches
+			.len()
+			.checked_mul(2)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE typed CASE branches"))?,
+		TypedExprKind::Cast {
+			target,
+			..
+		} => {
+			crate::gql::live_lowering::admit_type_shape(target, 0, 1, &mut |bytes, work| {
+				fields.work(work)?;
+				fields.admit(bytes)
+			})?;
+			0
+		}
+		TypedExprKind::Constant(value) => {
+			fields.admit_value(value)?;
+			0
+		}
+		TypedExprKind::Field {
+			field,
+			..
+		} => {
+			fields.admit(field.len())?;
+			0
+		}
+		_ => 0,
+	};
+	fields.admit(
+		count
+			.checked_mul(2 * std::mem::size_of::<TypedExpr>())
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE typed materialization"))?,
+	)
+}
+
 #[allow(clippy::too_many_arguments, reason = "aggregate evaluation needs the statement context")]
 fn aggregate_value<Read: QueryRead>(
 	read: &Read,
@@ -332,10 +479,18 @@ fn aggregate_value<Read: QueryRead>(
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	let mut state = AggregateState::new(function);
-	let mut push_value = |row: Row| {
+	let admit_row = || {
+		control.check()?;
+		if let Some(fields) = read.bounded_fields() {
+			fields.work(1)?;
+		}
+		Ok::<_, FerrosGrynnError>(())
+	};
+	let mut push_value = |row: &Row| {
+		admit_row()?;
 		let value = match argument {
 			Some(argument) => {
-				eval_select_expr(read, snapshot, argument, &row, None, slots, source, control)?
+				eval_select_expr(read, snapshot, argument, row, None, slots, source, control)?
 			}
 			None => Value::from(1_i64),
 		};
@@ -359,14 +514,19 @@ fn aggregate_value<Read: QueryRead>(
 		)?;
 		let mut ordinal = 0_usize;
 		visit_group(group, fallback, |row| {
+			admit_row()?;
 			let value = match argument {
 				Some(argument) => {
-					eval_select_expr(read, snapshot, argument, &row, None, slots, source, control)?
+					eval_select_expr(read, snapshot, argument, row, None, slots, source, control)?
 				}
 				None => Value::from(1_i64),
 			};
 			sorter.push(CursorRecord {
-				value: value.clone(),
+				value: super::super::eval::copy_evaluation_value(
+					&value,
+					read.bounded_fields(),
+					Some(control),
+				)?,
 				anchor: CursorAnchor {
 					order_keys: vec![value],
 					stable_key: vec![Value::from(ordinal)],
@@ -379,10 +539,15 @@ fn aggregate_value<Read: QueryRead>(
 		})?;
 		let mut previous = None::<Value>;
 		consume_records(sorter.finish()?, |record| {
+			admit_row()?;
 			if previous.as_ref() == Some(&record.value) {
 				return Ok(());
 			}
-			previous = Some(record.value.clone());
+			previous = Some(super::super::eval::copy_evaluation_value(
+				&record.value,
+				read.bounded_fields(),
+				Some(control),
+			)?);
 			state.push(record.value, argument.is_none())
 		})?;
 	} else {
@@ -394,11 +559,11 @@ fn aggregate_value<Read: QueryRead>(
 fn visit_group(
 	group: Option<&RowSet>,
 	fallback: &Row,
-	mut visit: impl FnMut(Row) -> FerrosGrynnResult<()>,
+	mut visit: impl FnMut(&Row) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<()> {
 	match group {
-		Some(group) => group.visit(visit),
-		None => visit(fallback.clone()),
+		Some(group) => group.visit_borrowed(visit),
+		None => visit(fallback),
 	}
 }
 
@@ -567,4 +732,61 @@ fn numeric_value(value: &Value) -> FerrosGrynnResult<f64> {
 	number.as_f64().ok_or_else(|| {
 		FerrosGrynnError::invalid_argument("Numeric value cannot be represented as f64.")
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// DISTINCT owns input/dedup copies only after shared bounded admission.
+	#[test]
+	fn live_recipe_distinct_clone_work_bounded() -> FerrosGrynnResult<()> {
+		let store = crate::datastore::Datastore::in_memory();
+		let root = store.inner.current_root();
+		let options = crate::gql::QueryExecutionOptions::default();
+		let control = ExecutionControl::new(&options, None);
+		let observe = |_key| {};
+		let consumed = std::cell::Cell::new(0_u64);
+		let work = |amount: u64| {
+			let used = consumed
+				.get()
+				.checked_add(amount)
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("distinct fixture work"))?;
+			if used > 5 {
+				return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"distinct fixture work",
+					5,
+				));
+			}
+			consumed.set(used);
+			Ok(())
+		};
+		let read = RootRead::new(&root, &control, &observe, &work, std::path::PathBuf::new());
+		let argument = TypedExpr {
+			kind: TypedExprKind::Constant(Value::from("x".repeat(32 * 1024))),
+			ty: crate::values::Type::String,
+			span: crate::gql_status::TextSpan::new(0, 0),
+		};
+		let error = aggregate_value(
+			&read,
+			Snapshot(root.commit_ts),
+			Aggregate::Count,
+			Some(&argument),
+			true,
+			None,
+			&Row::new(Vec::new()),
+			&[],
+			"",
+			&control,
+		)
+		.err()
+		.ok_or_else(|| {
+			FerrosGrynnError::invalid_argument(format!(
+				"distinct clone work ignored; used {}",
+				consumed.get()
+			))
+		})?;
+		assert_eq!(error.status().condition(), crate::gql_status::Condition::ProgramLimitExceeded);
+		Ok(())
+	}
 }

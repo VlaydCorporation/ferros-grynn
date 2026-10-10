@@ -62,11 +62,16 @@ pub(crate) struct StoreInner {
 	pub(crate) datastore_handles: AtomicUsize,
 	pub(crate) current: RwLock<Arc<DatabaseRoot>>,
 	pub(crate) commit: Mutex<()>,
+	/// Transient whole-commit delivery authority, independent of MVCC roots.
+	pub(in crate::datastore) live_consumers: super::live_queue::Consumers,
 	pub(crate) query_scratch_root: PathBuf,
 	pub(crate) quarantines: Mutex<BTreeMap<Uuid, PathBuf>>,
 	pub(crate) maintenance: MaintenanceCoordinator,
 	/// Diagnostic capture/publication counts; no per-source metric labels.
 	pub(in crate::datastore) changefeed_observation: super::changefeed_observation::Counters,
+	/// Non-authoritative LIVE process counters; no per-query labels or
+	/// payloads.
+	pub(in crate::datastore) live_observation: super::live_observation::Counters,
 }
 
 pub(crate) enum StoreBackend {
@@ -132,10 +137,15 @@ impl StoreInner {
 		graph_catalog_only: bool,
 		dictionary_changed: bool,
 	) -> FerrosGrynnResult<()> {
-		if previous.is_none_or(|previous| root.committed_at_ns == previous.committed_at_ns) {
+		// Transaction preparation has already frozen the time used by source
+		// and LIVE envelopes. Only maintenance callers assign it here.
+		if previous.is_none() {
 			root.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
 		}
 		let observation = super::changefeed_observation::Publication::capture(root);
+		let current = previous.is_none().then(|| self.current_root());
+		let live_observation =
+			super::live_observation::Publication::capture(root, previous.or(current.as_deref()));
 		let result = match &self.backend {
 			StoreBackend::InMemory => {
 				root.resident_geometry = Arc::new(crate::storage::build_resident_geometry_indexes(
@@ -146,6 +156,11 @@ impl StoreInner {
 				Ok(())
 			}
 			StoreBackend::Local(local) => {
+				// Detach outer COW and allocate empty RAM tables before the WAL
+				// barrier. The post-barrier path only installs owned handles.
+				let empty_history = Arc::default();
+				let empty_live_history = Arc::default();
+				let _history = root.change_history_mut();
 				let evaluator = PureFunctionEvaluator::new(root);
 				let mut analyze =
 					|analyzer: &SchemaAnalyzer, input: &str| evaluator.analyze(analyzer, input);
@@ -165,12 +180,15 @@ impl StoreInner {
 					&mut distance,
 				)?;
 				*root.changefeed_segments_mut() = local.changefeed_segments();
-				*root.change_history_mut() = Arc::default();
+				*root.change_history_mut() = empty_history;
+				*root.live_segments_mut() = local.live_segments();
+				*root.live_history_mut() = empty_live_history;
 				Ok(())
 			}
 		};
 		if result.is_ok() {
 			self.changefeed_observation.published(observation);
+			self.live_observation.published(live_observation);
 		}
 		result
 	}
@@ -180,10 +198,11 @@ impl StoreInner {
 		root: &mut DatabaseRoot,
 		quarantine: Option<&mut QuarantineArtifact>,
 	) -> FerrosGrynnResult<BTreeMap<super::IndexId, std::time::Duration>> {
-		if root.committed_at_ns == self.current_root().committed_at_ns {
-			root.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
-		}
+		// END preparation freezes the final stamp/time before encoding any
+		// source or computed result envelope, including repeated UTC times.
 		let observation = super::changefeed_observation::Publication::capture(root);
+		let current = self.current_root();
+		let live_observation = super::live_observation::Publication::capture(root, Some(&current));
 		let result = match &self.backend {
 			StoreBackend::InMemory => {
 				root.resident_geometry =
@@ -197,6 +216,9 @@ impl StoreInner {
 				Ok(BTreeMap::new())
 			}
 			StoreBackend::Local(local) => {
+				let empty_history = Arc::default();
+				let empty_live_history = Arc::default();
+				let _history = root.change_history_mut();
 				let evaluator = PureFunctionEvaluator::new(root);
 				let mut analyze =
 					|analyzer: &SchemaAnalyzer, input: &str| evaluator.analyze(analyzer, input);
@@ -209,12 +231,15 @@ impl StoreInner {
 				let timings =
 					local.persist_import_root(root, quarantine, &mut analyze, &mut distance)?;
 				*root.changefeed_segments_mut() = local.changefeed_segments();
-				*root.change_history_mut() = Arc::default();
+				*root.change_history_mut() = empty_history;
+				*root.live_segments_mut() = local.live_segments();
+				*root.live_history_mut() = empty_live_history;
 				Ok(timings)
 			}
 		};
 		if result.is_ok() {
 			self.changefeed_observation.published(observation);
+			self.live_observation.published(live_observation);
 		}
 		result
 	}
@@ -488,6 +513,7 @@ impl StoreInner {
 				};
 				if job.kind == MaintenanceJobKind::PurgeChangefeed
 					&& next.changefeeds() == snapshot.changefeeds()
+					&& next.live_catalog().histories == snapshot.live_catalog().histories
 				{
 					return Ok(MaintenanceRunOutcome::Completed);
 				}
@@ -515,9 +541,9 @@ impl StoreInner {
 				if self.maintenance.is_cancelled(id) {
 					return Ok(MaintenanceRunOutcome::Cancelled);
 				}
+				self.ensure_write_allowed(0)?;
 				next.commit_ts = publication;
 				if job.kind == MaintenanceJobKind::PurgeChangefeed {
-					self.ensure_write_allowed(0)?;
 					next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
 				}
 				self.persist_root(
@@ -565,6 +591,7 @@ impl StoreInner {
 				)?;
 				if kind == MaintenanceJobKind::PurgeChangefeed
 					&& next.changefeeds() == snapshot.changefeeds()
+					&& next.live_catalog().histories == snapshot.live_catalog().histories
 				{
 					return Ok(());
 				}
@@ -572,9 +599,9 @@ impl StoreInner {
 				if self.current_root().commit_ts != snapshot.commit_ts {
 					return Err(FerrosGrynnError::maintenance_revision_race(target.display_name()));
 				}
+				self.ensure_write_allowed(0)?;
 				next.commit_ts = publication;
 				if kind == MaintenanceJobKind::PurgeChangefeed {
-					self.ensure_write_allowed(0)?;
 					next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
 				}
 				self.persist_root(
@@ -674,10 +701,54 @@ impl StoreInner {
 
 	/// Performs allocation-free coverage/seek metadata reads in a pinned
 	/// snapshot.
+	pub(crate) fn inspect_live_group(
+		&self,
+		snapshot: &LocalChangefeedSnapshot,
+		segment: crate::storage::HistorySegment,
+		first: u64,
+		memory_bytes: usize,
+	) -> FerrosGrynnResult<Option<(crate::storage::live_history::LiveGroupInfo, u64)>> {
+		let before = snapshot.read_observation().0;
+		let result = match &self.backend {
+			StoreBackend::Local(local) => {
+				local.inspect_live_group(snapshot, segment, first, memory_bytes)
+			}
+			StoreBackend::InMemory => Err(FerrosGrynnError::invalid_argument(
+				"physical LIVE read requires a local backend",
+			)),
+		};
+		self.live_observation.page_reads(snapshot.read_observation().0.saturating_sub(before));
+		result
+	}
+
+	/// Restores captured result images without touching current primary data.
+	pub(crate) fn read_live_payload(
+		&self,
+		snapshot: &LocalChangefeedSnapshot,
+		segment: crate::storage::HistorySegment,
+		first: u64,
+		memory_bytes: usize,
+	) -> FerrosGrynnResult<
+		Option<(crate::live::LivePayload, crate::storage::live_history::LiveGroupInfo, u64)>,
+	> {
+		let before = snapshot.read_observation().0;
+		let result = match &self.backend {
+			StoreBackend::Local(local) => {
+				local.read_live_payload(snapshot, segment, first, memory_bytes)
+			}
+			StoreBackend::InMemory => Err(FerrosGrynnError::invalid_argument(
+				"physical LIVE read requires a local backend",
+			)),
+		};
+		self.live_observation.page_reads(snapshot.read_observation().0.saturating_sub(before));
+		result
+	}
+
+	/// Performs allocation-free source coverage/seek metadata reads.
 	pub(crate) fn inspect_changefeed_group(
 		&self,
 		snapshot: &LocalChangefeedSnapshot,
-		segment: crate::storage::ChangefeedSegment,
+		segment: crate::storage::HistorySegment,
 		first: u64,
 		memory_bytes: usize,
 	) -> FerrosGrynnResult<Option<crate::storage::ChangefeedGroupInfo>> {
@@ -696,7 +767,7 @@ impl StoreInner {
 	pub(crate) fn read_changefeed_batch(
 		&self,
 		snapshot: &LocalChangefeedSnapshot,
-		segment: crate::storage::ChangefeedSegment,
+		segment: crate::storage::HistorySegment,
 		first: u64,
 		memory_bytes: usize,
 	) -> FerrosGrynnResult<Option<(super::CapturedCommit, u64)>> {

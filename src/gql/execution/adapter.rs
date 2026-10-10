@@ -3,7 +3,7 @@
 	reason = "move-only executor split keeps the existing imports during stage 1"
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use crate::datastore::{ClassSchema, ClassSchemaMode};
@@ -82,6 +82,11 @@ pub fn execute_transaction_with_options(
 	for statement in &program.statements {
 		let started = std::time::Instant::now();
 		let let_name = match &statement.kind {
+			crate::syn::StatementKind::LiveLet(statement)
+				if statement.name.value.as_ref() != "_" =>
+			{
+				Some(statement.name.value.as_ref())
+			}
 			crate::syn::StatementKind::Let(statement) if statement.name.value.as_ref() != "_" => {
 				Some(statement.name.value.as_ref())
 			}
@@ -102,22 +107,9 @@ pub fn execute_transaction_with_options(
 			results.push(result);
 			break;
 		}
-		let timeout = match crate::gql::resolve_timeout(statement.timeout.as_ref(), &bindings) {
-			Ok(timeout) => timeout,
-			Err(error) => {
-				transaction.abort_gql();
-				results.push(QueryResult {
-					kind: crate::gql::statement_kind(&statement.kind),
-					elapsed: started.elapsed(),
-					result: Err(error),
-					continuation: None,
-				});
-				break;
-			}
-		};
-		let control = crate::gql::options::ExecutionControl::with_runtime(
+		let mut control = crate::gql::options::ExecutionControl::with_runtime(
 			&options,
-			timeout,
+			None,
 			None,
 			closures.clone(),
 		)
@@ -134,7 +126,7 @@ pub fn execute_transaction_with_options(
 				statement,
 				&mut bindings,
 				&mutable_bindings,
-				&control,
+				&mut control,
 			)
 		});
 		let mut result = match execution {
@@ -177,14 +169,73 @@ pub(crate) fn analyze_parsed_transaction(
 	source: &str,
 	program: &Program,
 	variables: &Object,
+	function_cache: Option<&crate::gql::closure::LanguageClosureState>,
 ) -> FerrosGrynnResult<(LogicalProgram, u64)> {
 	let snapshot = transaction.query_snapshot()?;
 	let read = TransactionRead {
 		transaction,
 		snapshot,
+		metadata_only: false,
 	};
-	let logical = analyze(program, source, &read, variables)?;
+	let logical = match function_cache {
+		None => analyze(program, source, &read, variables)?,
+		Some(cache) => {
+			crate::gql::analysis::analyze_with_runtime(program, source, &read, variables, cache)?
+		}
+	};
 	Ok((logical, read.snapshot.commit_ts()))
+}
+
+/// Analyzes and freezes item deadlines against the same preflight root.
+/// The caller retains admission for both timeout vectors through import END.
+pub(in crate::gql) fn analyze_import_preflight(
+	transaction: &mut Transaction,
+	source: &str,
+	program: &Program,
+	variables: &Object,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<(LogicalProgram, Vec<Option<Duration>>, u64)> {
+	let snapshot = transaction.query_snapshot()?;
+	let read = TransactionRead {
+		transaction,
+		snapshot,
+		metadata_only: false,
+	};
+	let (logical, typed_timeouts) = crate::gql::analysis::analyze_import_with_runtime(
+		program, source, &read, variables, control,
+	)?;
+	let fields = cursor::RecordFields {
+		read: &read,
+		snapshot: read.snapshot()?,
+		graph: None,
+	};
+	let mut timeouts = vec![None; program.statements.len()];
+	for (index, timeout) in typed_timeouts {
+		let duration = eval::eval_duration_with_lookup(
+			&timeout,
+			|slot| {
+				logical
+					.initial_slots
+					.iter()
+					.find(|(_, id, _)| *id == slot)
+					.and_then(|(name, _, _)| variables.get(name.as_ref()))
+			},
+			source,
+			Some(&fields),
+			control,
+			"TIMEOUT",
+		)?;
+		// Validate platform range before obtaining the writer lease. Zero
+		// remains an item-local deadline, handled by the ordinary
+		// execution checks.
+		control.checked_child(Some(duration))?;
+		let item = timeouts.get_mut(index).ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("Import timeout ordinal is invalid.")
+		})?;
+		*item = Some(duration);
+	}
+	control.check()?;
+	Ok((logical, timeouts, read.snapshot.commit_ts()))
 }
 
 #[cfg(test)]
@@ -199,6 +250,7 @@ pub(crate) fn execute_parsed_transaction_with_bindings(
 	let mut read = TransactionRead {
 		transaction,
 		snapshot,
+		metadata_only: false,
 	};
 	execute_program(&mut read, source, program, bindings, control)
 }
@@ -209,12 +261,35 @@ pub(crate) fn execute_parsed_statement_with_bindings(
 	statement: &crate::syn::Statement,
 	bindings: &mut Object,
 	mutable_bindings: &BTreeSet<Box<str>>,
-	control: &crate::gql::options::ExecutionControl,
+	control: &mut crate::gql::options::ExecutionControl,
 ) -> FerrosGrynnResult<QueryResult> {
-	let snapshot = transaction.query_snapshot()?;
+	let metadata_only = matches!(
+		statement.kind,
+		crate::syn::StatementKind::Info(crate::syn::InfoStatement {
+			target: crate::syn::InfoTarget::Live(_) | crate::syn::InfoTarget::LiveLet(_),
+		}) | crate::syn::StatementKind::Kill(_)
+			| crate::syn::StatementKind::AckLive(_)
+	);
+	let mut metadata_account = metadata_only.then(|| control.barrier_account());
+	let snapshot = transaction.query_snapshot_admitted(metadata_only, |bytes| {
+		if metadata_only {
+			control.check()?;
+			let bytes = bytes.checked_mul(2).ok_or_else(|| {
+				FerrosGrynnError::operation_overflow("LIVE metadata snapshot overlap")
+			})?;
+			if !metadata_account.as_mut().is_some_and(|account| account.reserve(bytes)) {
+				return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+					"LIVE metadata snapshot",
+					control.barrier_memory_limit() as u64,
+				));
+			}
+		}
+		Ok(())
+	})?;
 	let mut read = TransactionRead {
 		transaction,
 		snapshot,
+		metadata_only,
 	};
 	execute_parsed_statement(&mut read, source, statement, bindings, mutable_bindings, control)
 }
@@ -222,16 +297,27 @@ pub(crate) fn execute_parsed_statement_with_bindings(
 pub(super) struct TransactionRead<'a> {
 	pub(super) transaction: &'a mut Transaction,
 	pub(super) snapshot: QuerySnapshot,
+	/// Catalog-only commands neither bind physical indexes nor pull records.
+	pub(super) metadata_only: bool,
 }
 
 impl TransactionRead<'_> {
 	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<()> {
-		self.snapshot = self.transaction.query_snapshot()?;
+		self.snapshot =
+			self.transaction.query_snapshot_admitted(self.metadata_only, |_bytes| Ok(()))?;
 		Ok(())
 	}
 }
 
 impl QueryCatalog for TransactionRead<'_> {
+	fn lexical_binding_type(&self, name: &str) -> Option<&Type> {
+		self.transaction.gql_binding_type(name)
+	}
+
+	fn lexical_binding_is_reactive(&self, name: &str) -> bool {
+		self.transaction.gql_binding_is_reactive(name)
+	}
+
 	fn schema_epoch(&self) -> u64 {
 		self.snapshot.commit_ts()
 	}
@@ -299,6 +385,42 @@ impl QueryRead for TransactionRead<'_> {
 		Self: 'a;
 	type Savepoint = crate::datastore::TransactionSavepoint;
 
+	fn live_info(
+		&self,
+		snapshot: Snapshot,
+		id: crate::live::LiveId,
+		maximum: usize,
+	) -> FerrosGrynnResult<crate::live::LiveInfo> {
+		if snapshot.0 != self.snapshot.commit_ts() {
+			return Err(FerrosGrynnError::invalid_argument("LIVE metadata snapshot mismatch"));
+		}
+		self.transaction.query_live_info(&self.snapshot, id, maximum)
+	}
+
+	fn live_binding_info(
+		&self,
+		snapshot: Snapshot,
+		id: crate::live::LiveBindingId,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<(crate::live::LiveBindingInfo, crate::gql::options::BarrierAccount)>
+	{
+		if snapshot.0 != self.snapshot.commit_ts() {
+			return Err(FerrosGrynnError::invalid_argument("LIVE LET metadata snapshot mismatch"));
+		}
+		self.transaction.query_live_binding_info(&self.snapshot, id, control)
+	}
+
+	fn live_binding_value(
+		&self,
+		snapshot: Snapshot,
+		id: crate::live::LiveBindingId,
+	) -> FerrosGrynnResult<&Value> {
+		if snapshot.0 != self.snapshot.commit_ts() {
+			return Err(FerrosGrynnError::invalid_argument("LIVE LET read snapshot mismatch"));
+		}
+		self.transaction.query_live_binding_value(&self.snapshot, id)
+	}
+
 	fn endpoint_tensor(
 		&self,
 		_snapshot: Snapshot,
@@ -331,6 +453,10 @@ impl QueryRead for TransactionRead<'_> {
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot> {
 		Ok(Snapshot(self.snapshot.commit_ts()))
+	}
+
+	fn prepare_mutating_statement(&mut self) -> FerrosGrynnResult<()> {
+		self.transaction.infer_gql_write_access()
 	}
 
 	fn tensor_cost_evaluator(
@@ -366,7 +492,7 @@ impl QueryRead for TransactionRead<'_> {
 	}
 
 	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<Snapshot> {
-		self.snapshot = self.transaction.query_snapshot()?;
+		TransactionRead::refresh_snapshot(self)?;
 		Ok(Snapshot(self.snapshot.commit_ts()))
 	}
 
@@ -998,8 +1124,25 @@ impl QueryRead for TransactionRead<'_> {
 		record: &RecordId,
 		graph: Option<&GraphRef>,
 		field: &str,
+		control: Option<&ExecutionControl>,
 	) -> FerrosGrynnResult<Value> {
-		self.transaction.query_record_field(&self.snapshot, record, graph, field)
+		let control = control.filter(|control| control.has_reactive_copies());
+		self.transaction.query_record_field(
+			&self.snapshot,
+			record,
+			graph,
+			field,
+			|bytes| {
+				control.map_or(Ok(()), |control| {
+					control.admit_reactive_work(1)?;
+					control.admit_reactive_bytes(bytes)
+				})
+			},
+			|value| {
+				control
+					.map_or_else(|| Ok(value.clone()), |control| control.copy_reactive_value(value))
+			},
+		)
 	}
 
 	fn graph(
@@ -1081,6 +1224,23 @@ impl QueryRead for TransactionRead<'_> {
 		self.transaction.gql_savepoint()
 	}
 
+	fn note_binding_type(
+		&mut self,
+		name: &str,
+		ty: &Type,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		self.transaction.note_gql_binding_type(name, ty, control)
+	}
+
+	fn note_reactive_binding(
+		&mut self,
+		name: &str,
+		control: &ExecutionControl,
+	) -> FerrosGrynnResult<()> {
+		self.transaction.note_gql_reactive_binding(name, control)
+	}
+
 	fn restore_savepoint(&mut self, savepoint: Self::Savepoint) -> FerrosGrynnResult<()> {
 		self.transaction.restore_gql_savepoint(savepoint);
 		self.refresh_snapshot()
@@ -1104,6 +1264,13 @@ impl QueryRead for TransactionRead<'_> {
 		let snapshot = self.snapshot.clone();
 		let value = if statement.is_read() {
 			execute_schema(self.transaction, &snapshot, statement, slots, source, control)?
+		} else if matches!(
+			statement,
+			LogicalSchemaStatement::CloseLive { .. } | LogicalSchemaStatement::AckLive { .. }
+		) {
+			self.transaction.atomic_live_control(|transaction| {
+				execute_schema(transaction, &snapshot, statement, slots, source, control)
+			})?
 		} else {
 			self.transaction.atomic_mutation(|transaction| {
 				execute_schema(transaction, &snapshot, statement, slots, source, control)
@@ -1233,14 +1400,15 @@ fn scalar_constraint_value(expr: &TypedExpr, slots: &[Value]) -> Option<Value> {
 	}
 }
 
-pub(in crate::gql) fn query_schema(schema: &ClassSchema) -> Schema {
-	let mut columns = Vec::with_capacity(schema.fields().len() + 5);
-	columns.push(Column {
-		name: "id".into(),
-		qualifier: None,
-		ty: Type::Record,
-	});
+/// Universal atom columns also type-check an empty graph occurrence domain.
+pub(in crate::gql) fn atom_source_schema(additional: usize) -> Schema {
+	let mut columns = Vec::with_capacity(additional + 5);
 	columns.extend([
+		Column {
+			name: "id".into(),
+			qualifier: None,
+			ty: Type::Record,
+		},
 		Column {
 			name: "class".into(),
 			qualifier: None,
@@ -1262,6 +1430,14 @@ pub(in crate::gql) fn query_schema(schema: &ClassSchema) -> Schema {
 			ty: Type::Object,
 		},
 	]);
+	Schema {
+		columns,
+		origins: BTreeMap::new(),
+	}
+}
+
+pub(in crate::gql) fn query_schema(schema: &ClassSchema) -> Schema {
+	let mut columns = atom_source_schema(schema.fields().len()).columns;
 	columns.extend(schema.fields().map(|field| Column {
 		name: field.name().as_str().into(),
 		qualifier: None,
@@ -1304,7 +1480,7 @@ impl RowCursor for StorageCursor<'_> {
 	}
 }
 
-fn storage_row(
+pub(super) fn storage_row(
 	row: QueryStorageRow,
 	dictionary: &PropertyDictionary,
 	full_row: bool,

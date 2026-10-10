@@ -26,15 +26,7 @@ pub(super) fn enumerate_join_order(
 	if sources.len() <= 1 {
 		return (0..sources.len()).collect();
 	}
-	let reorderable = logical
-		.joins
-		.iter()
-		.take_while(|join| {
-			join.kind == SelectJoinKind::Inner
-				&& join.predicate.as_ref().and_then(equality_column_pairs).is_some()
-		})
-		.count()
-		.saturating_add(1);
+	let reorderable = reorderable_sources(logical);
 	let mut order = if reorderable <= 2 {
 		(0..reorderable).collect()
 	} else if reorderable <= 8 {
@@ -52,6 +44,19 @@ pub(super) fn enumerate_join_order(
 	};
 	order.extend(reorderable..sources.len());
 	order
+}
+
+/// Enumeration and predicate scheduling share the same INNER prefix boundary.
+fn reorderable_sources(logical: &LogicalSelect) -> usize {
+	logical
+		.joins
+		.iter()
+		.take_while(|join| {
+			join.kind == SelectJoinKind::Inner
+				&& join.predicate.as_ref().and_then(equality_column_pairs).is_some()
+		})
+		.count()
+		.saturating_add(1)
 }
 
 #[allow(
@@ -189,16 +194,18 @@ pub(super) fn ready_join_predicates(
 	assigned: &mut [bool],
 ) -> Vec<usize> {
 	let mut ready = Vec::new();
+	let reorderable = reorderable_sources(logical);
 	for (index, join) in logical.joins.iter().enumerate() {
 		if assigned[index] {
 			continue;
 		}
-		let is_ready = if join.kind != SelectJoinKind::Inner {
+		let is_ready = if index + 1 >= reorderable {
 			index + 1 == right
 		} else if let Some(predicate) = &join.predicate {
 			let sources = expression_sources(logical, offsets, predicate);
-			sources.contains(&right)
-				&& sources.iter().all(|source| *source == right || joined.contains(source))
+			(sources.contains(&right)
+				&& sources.iter().all(|source| *source == right || joined.contains(source)))
+				|| (right < reorderable && joined.len() + 1 == reorderable)
 		} else {
 			index + 1 == right
 		};
@@ -266,22 +273,29 @@ fn expression_sources(
 	expression: &TypedExpr,
 ) -> BTreeSet<usize> {
 	let mut columns = Vec::new();
-	collect_columns(expression, &mut columns);
-	columns.into_iter().filter_map(|column| source_for_column(logical, offsets, column)).collect()
-}
-
-fn collect_columns(expression: &TypedExpr, columns: &mut Vec<usize>) {
-	match &expression.kind {
-		TypedExprKind::Column(column) => columns.push(*column),
-		TypedExprKind::Binary {
-			left,
-			right,
-			..
-		} => {
-			collect_columns(left, columns);
-			collect_columns(right, columns);
+	let mut conservative = false;
+	match crate::gql::analysis::visit_typed_expression(expression, &mut |node| {
+		match &node.kind {
+			TypedExprKind::Column(column) => columns.push(*column),
+			TypedExprKind::Subquery {
+				..
+			}
+			| TypedExprKind::Closure(_)
+			| TypedExprKind::Traversal(_) => conservative = true,
+			_ => {}
 		}
-		_ => {}
+		Ok::<(), std::convert::Infallible>(())
+	}) {
+		Ok(()) => {}
+		Err(never) => match never {},
+	}
+	if conservative {
+		(0..offsets.len()).collect()
+	} else {
+		columns
+			.into_iter()
+			.filter_map(|column| source_for_column(logical, offsets, column))
+			.collect()
 	}
 }
 

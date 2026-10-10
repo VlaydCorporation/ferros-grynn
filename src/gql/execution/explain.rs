@@ -54,7 +54,20 @@ pub(super) fn execute_explain<Read: QueryRead>(
 ) -> FerrosGrynnResult<ControlFlow> {
 	let snapshot = read.snapshot()?;
 	let planning_started = Instant::now();
-	let demand = PlannerDemand::for_statement(&explain.statement);
+	let match_binding = match explain.statement.as_ref() {
+		LogicalStatement::Match(plan) => Some((
+			resolve_match_graph(read, snapshot, plan, slots, source, control)?,
+			resolve_match_max_depth(read, snapshot, plan, slots, source, control)?,
+		)),
+		_ => None,
+	};
+	let demand = if let (LogicalStatement::Match(plan), Some((graph, _))) =
+		(explain.statement.as_ref(), &match_binding)
+	{
+		PlannerDemand::for_match_bound(plan, graph.id())
+	} else {
+		PlannerDemand::for_statement(&explain.statement)
+	};
 	let planner_snapshot = read.planner_snapshot(snapshot, &demand)?;
 	let deterministic_snapshot;
 	let planning_snapshot = if control.deterministic() {
@@ -67,8 +80,29 @@ pub(super) fn execute_explain<Read: QueryRead>(
 		LogicalStatement::Schema(statement) => changefeed::plan(read, statement, slots, control)?,
 		_ => None,
 	};
-	let plan = if let Some(plan) = history_plan {
+	let live_plan = live_planning::plan(read, &explain.statement, slots, control)?;
+	let mut live_account = None;
+	let plan = if let Some((plan, account)) = live_plan {
+		live_account = Some(account);
+		PhysicalPlan::Live(plan)
+	} else if let Some(plan) = history_plan {
 		plan
+	} else if let (LogicalStatement::Match(statement), Some((graph, max_depth))) =
+		(explain.statement.as_ref(), &match_binding)
+	{
+		crate::gql::optimizer::finish_match_graph_result(
+			statement,
+			crate::gql::optimizer::plan_match_bound(
+				statement,
+				planning_snapshot,
+				control.deterministic(),
+				Some(graph),
+				*max_depth,
+			)?,
+			control.max_graph_nodes(),
+			control.max_graph_edges(),
+			control.barrier_memory_limit(),
+		)
 	} else {
 		physical_plan(
 			&explain.statement,
@@ -178,6 +212,7 @@ pub(super) fn execute_explain<Read: QueryRead>(
 			observation.as_ref(),
 		),
 	};
+	drop(live_account);
 	Ok(ControlFlow::Value(value))
 }
 
@@ -408,6 +443,10 @@ fn explain_text(
 
 fn logical_nodes(statement: &LogicalStatement) -> Vec<Value> {
 	let mut nodes = Vec::new();
+	if let Some((_, operation)) = live_planning::command(statement) {
+		push_node(&mut nodes, 0, operation.name(), None, None);
+		return nodes;
+	}
 	match statement {
 		LogicalStatement::Select(select) => {
 			push_node(&mut nodes, 0, "Select", None, None);
@@ -509,6 +548,18 @@ fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value>
 					Some(planned.cardinality),
 					Some(planned.cost),
 				);
+				node.insert(
+					"graph_id",
+					plan.graph.map_or(Value::None, |graph| Value::from(graph.get())),
+				);
+				node.insert(
+					"graph_binding",
+					if plan.graph.is_some() {
+						"resolved"
+					} else {
+						"deferred"
+					},
+				);
 				if let Some(pattern) = planned.pattern_index {
 					node.insert("pattern_index", u64::try_from(pattern).unwrap_or(u64::MAX));
 				}
@@ -534,6 +585,7 @@ fn physical_nodes(plan: &PhysicalPlan, snapshot: &PlannerSnapshot) -> Vec<Value>
 			})
 			.collect(),
 		PhysicalPlan::GraphResult(plan) => graph_result_nodes(plan, snapshot),
+		PhysicalPlan::Live(plan) => live_planning::project(plan),
 		PhysicalPlan::Changefeed(plan) => {
 			let mut node = node_object(
 				0,
@@ -1399,10 +1451,12 @@ fn plan_warnings(plan: &PhysicalPlan) -> Vec<Value> {
 		PhysicalPlan::Select(plan) => &plan.warnings,
 		PhysicalPlan::Match(plan) => &plan.warnings,
 		PhysicalPlan::Traversal(plan) => &plan.warnings,
-		PhysicalPlan::Write(_) | PhysicalPlan::Changefeed(_) => return Vec::new(),
+		PhysicalPlan::Write(_) | PhysicalPlan::Changefeed(_) | PhysicalPlan::Live(_) => {
+			return Vec::new();
+		}
 		PhysicalPlan::GraphResult(plan) => &plan.warnings,
 	};
-	warnings
+	let mut values = warnings
 		.iter()
 		.map(|warning| {
 			let (code, detail) = match warning {
@@ -1424,7 +1478,13 @@ fn plan_warnings(plan: &PhysicalPlan) -> Vec<Value> {
 			};
 			Value::from(format!("{code}: {detail}"))
 		})
-		.collect()
+		.collect::<Vec<_>>();
+	if let PhysicalPlan::GraphResult(plan) = plan
+		&& let Some(source) = &plan.source
+	{
+		values.extend(plan_warnings(source));
+	}
+	values
 }
 
 fn plan_rules(plan: &PhysicalPlan) -> Vec<Value> {
@@ -1463,14 +1523,23 @@ fn source_operator_name(operator: &SourceOperator) -> &'static str {
 		} => "GeometryIndexScan",
 		SourceOperator::GraphCatalogScan => "GraphCatalogScan",
 		SourceOperator::Derived => "Derived",
+		SourceOperator::AtomUnion {
+			..
+		} => "AtomUnionScan",
 	}
 }
 
 fn source_name(source: &LogicalSelectSourceKind) -> &'static str {
 	match source {
+		LogicalSelectSourceKind::Empty {
+			..
+		} => "EmptySource",
 		LogicalSelectSourceKind::Atoms {
 			..
 		} => "AtomSource",
+		LogicalSelectSourceKind::AtomUnion {
+			..
+		} => "AtomUnionSource",
 		LogicalSelectSourceKind::Graphs {
 			..
 		} => "GraphSource",
@@ -1479,6 +1548,9 @@ fn source_name(source: &LogicalSelectSourceKind) -> &'static str {
 }
 
 fn statement_name(statement: &LogicalStatement) -> &'static str {
+	if let Some((_, operation)) = live_planning::command(statement) {
+		return operation.name();
+	}
 	match statement {
 		LogicalStatement::Select(_) => "SELECT",
 		LogicalStatement::Match(_) => "MATCH",
@@ -1524,6 +1596,9 @@ fn mode_name(mode: ExplainMode) -> &'static str {
 }
 
 fn logical_mutates(statement: &LogicalStatement) -> bool {
+	if let Some((schema, _)) = live_planning::command(statement) {
+		return !schema.is_read();
+	}
 	if let LogicalStatement::Schema(schema) = statement {
 		return !schema.is_read();
 	}
@@ -1554,6 +1629,34 @@ fn compact_node(value: &Value) -> String {
 	let id = object.get("node_id").map_or_else(|| "?".to_owned(), value_text);
 	let operator = object.get("operator").map_or_else(|| "?".to_owned(), value_text);
 	let mut text = format!("#{id} {operator}");
+	if operator.starts_with("Live") || object.get("live_command").is_some() {
+		for field in [
+			"live_command",
+			"live_id",
+			"definition_version",
+			"snapshot_through",
+			"read_strategy",
+			"delivery",
+			"since",
+			"operand_binding",
+			"sources",
+			"output",
+			"overflow",
+			"queue_entries",
+			"queue_bytes",
+			"scratch_bytes",
+			"work_limit",
+			"descriptor_hash",
+			"function_fingerprint",
+		] {
+			if let Some(value) = object.get(field) {
+				text.push(' ');
+				text.push_str(field);
+				text.push('=');
+				text.push_str(&value_text(value));
+			}
+		}
+	}
 	if operator.starts_with("Changefeed") {
 		for field in [
 			"source",

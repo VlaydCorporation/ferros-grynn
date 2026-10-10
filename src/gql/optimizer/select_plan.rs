@@ -201,7 +201,10 @@ pub(in crate::gql) fn plan_select(
 	}
 	let pushed_filter = logical.filter.is_some()
 		&& logical.joins.is_empty()
-		&& !matches!(logical.source.kind, LogicalSelectSourceKind::Derived(_));
+		&& !matches!(
+			logical.source.kind,
+			LogicalSelectSourceKind::Derived(_) | LogicalSelectSourceKind::AtomUnion { .. }
+		);
 	let pushed_limit = safe_limit_pushdown(logical);
 	let sort_eliminated = sort_eliminated(logical, snapshot, &sources);
 	let mut rules = Vec::new();
@@ -245,12 +248,18 @@ fn safe_limit_pushdown(select: &LogicalSelect) -> bool {
 		&& select.split.is_empty()
 		&& select.order.is_empty()
 		&& !select.only
-		&& !matches!(select.source.kind, LogicalSelectSourceKind::Derived(_))
+		&& !matches!(
+			select.source.kind,
+			LogicalSelectSourceKind::Derived(_) | LogicalSelectSourceKind::AtomUnion { .. }
+		)
 }
 
 fn projection_pruned(select: &LogicalSelect) -> bool {
-	!select
-		.projection
-		.iter()
-		.any(|item| matches!(item, crate::gql::ir::LogicalSelectItem::Wildcard(_)))
+	!select.projection.iter().any(|item| {
+		matches!(
+			item,
+			crate::gql::ir::LogicalSelectItem::Wildcard(_)
+				| crate::gql::ir::LogicalSelectItem::WildcardVariants { .. }
+		)
+	})
 }

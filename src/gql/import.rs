@@ -55,6 +55,7 @@ pub fn execute_import(
 	source: &str,
 	statement: &ImportStatement,
 	variables: &Object,
+	binding_types: &super::bindings::BindingTypes,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<QueryResult> {
 	control.check()?;
@@ -67,32 +68,57 @@ pub fn execute_import(
 		span: import_graph_span(statement.graph.as_ref()),
 	});
 	let program = normalize_program(statement, graph_identifier.as_ref(), source)?;
+	let timeout_count = program.statements.iter().filter(|item| item.timeout.is_some()).count();
+	let timeout_bytes = timeout_count
+		.checked_mul(std::mem::size_of::<(usize, super::ir::LogicalDuration)>())
+		.and_then(|typed| {
+			program
+				.statements
+				.len()
+				.checked_mul(std::mem::size_of::<Option<Duration>>())
+				.and_then(|frozen| typed.checked_add(frozen))
+		})
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("import timeout metadata"))?;
+	let mut timeout_admission = control.barrier_account();
+	if !timeout_admission.reserve(timeout_bytes) {
+		return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+			"import timeout metadata",
+			control.barrier_memory_limit() as u64,
+		));
+	}
 	let payloads = program
 		.statements
 		.iter()
 		.map(|statement| ImportItemPayload::from_statement(statement, source))
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
-	let timeouts = program
-		.statements
-		.iter()
-		.map(|statement| super::resolve_timeout(statement.timeout.as_ref(), variables))
-		.collect::<FerrosGrynnResult<Vec<_>>>()?;
-
 	let mut preflight = store.begin_with(TransactionOptions::new(
 		IsolationLevel::Serializable,
 		TransactionAccess::ReadOnly,
 	));
-	let (logical, expected_commit_ts) =
-		super::execution::analyze_parsed_transaction(&mut preflight, source, &program, variables)?;
+	preflight.inherit_gql_binding_types(binding_types.clone());
+	let (logical, timeouts, expected_commit_ts) = super::execution::analyze_import_preflight(
+		&mut preflight,
+		source,
+		&program,
+		variables,
+		control,
+	)?;
 	drop(preflight);
 	control.check()?;
 
 	let result = store
-		.import_at(options, Some(expected_commit_ts), graph.as_ref().map(GraphRef::id), |session| {
-			super::execution::execute_import_program(
-				session, source, &logical, variables, control, &timeouts, &payloads,
-			)
-		})
+		.import_at_controlled(
+			options,
+			Some(expected_commit_ts),
+			graph.as_ref().map(GraphRef::id),
+			control.deadline(),
+			&|| control.check(),
+			|session| {
+				super::execution::execute_import_program(
+					session, source, &logical, variables, control, &timeouts, &payloads,
+				)
+			},
+		)
 		.map(report_value)
 		.map(Outcome::success);
 	Ok(QueryResult {

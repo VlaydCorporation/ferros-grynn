@@ -172,8 +172,8 @@ impl Parser<'_> {
 			StatementKind::Maintenance(self.rebuild_index_statement()?)
 		} else if self.consume_keyword(keywords::COMPACT).is_some() {
 			StatementKind::Maintenance(self.compact_statement()?)
-		} else if self.consume_keyword(keywords::KILL).is_some() {
-			StatementKind::Kill(self.kill_statement()?)
+		} else if self.at_consumer_control() {
+			context.run(|context| self.consumer_control_statement(context)).await?
 		} else if self.consume_keyword(keywords::BUILD).is_some() {
 			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `BUILD`.")?;
 			StatementKind::BuildGraph(
@@ -221,8 +221,8 @@ impl Parser<'_> {
 			StatementKind::ShowChanges(
 				context.run(|context| self.show_changes_statement(context)).await?,
 			)
-		} else if self.consume_keyword(keywords::LET).is_some() {
-			StatementKind::Let(context.run(|context| self.let_statement(context)).await?)
+		} else if self.at_binding_statement() {
+			context.run(|context| self.binding_statement(context)).await?
 		} else if self.consume_keyword(keywords::OPTIONAL).is_some() {
 			self.expect_keyword(keywords::MATCH, "Expected `MATCH` after `OPTIONAL`.")?;
 			StatementKind::Match(context.run(|context| self.match_statement(context, true)).await?)
@@ -237,16 +237,7 @@ impl Parser<'_> {
 				context.run(|context| self.expression(context, 0, 1, 0)).await?,
 			)
 		};
-		let embedded_timeout = match &mut kind {
-			StatementKind::Match(statement) => statement.timeout.take(),
-			StatementKind::BuildGraph(statement) => statement.timeout.take(),
-			StatementKind::Let(crate::syn::LetStatement {
-				value: crate::syn::LetValue::BuildGraph(statement),
-				..
-			}) => statement.timeout.take(),
-			_ => None,
-		};
-		let timeout = self.statement_timeout(&kind, embedded_timeout)?;
+		let timeout = self.statement_timeout(&mut kind)?;
 		let end = self.previous_span();
 		Ok(Statement {
 			kind,
@@ -255,12 +246,21 @@ impl Parser<'_> {
 		})
 	}
 
-	/// Resolves the ordinary statement timeout after the statement body.
+	/// Resolves embedded and trailing timeout clauses after the statement body.
 	fn statement_timeout(
 		&mut self,
-		kind: &StatementKind,
-		embedded_timeout: Option<TimeoutValue>,
+		kind: &mut StatementKind,
 	) -> FerrosGrynnResult<Option<TimeoutValue>> {
+		let embedded_timeout = match kind {
+			StatementKind::Explain(statement) => statement.statement.timeout.take(),
+			StatementKind::Match(statement) => statement.timeout.take(),
+			StatementKind::BuildGraph(statement) => statement.timeout.take(),
+			StatementKind::Let(crate::syn::LetStatement {
+				value: crate::syn::LetValue::BuildGraph(statement),
+				..
+			}) => statement.timeout.take(),
+			_ => None,
+		};
 		Ok(if embedded_timeout.is_some() {
 			embedded_timeout
 		} else if self.consume_keyword(keywords::TIMEOUT).is_some() {
@@ -1958,6 +1958,31 @@ mod tests {
 		assert!(
 			parse("UPDATE GRAPH sales SET owner = 'risk'", ParserSettings::default(),).is_err()
 		);
+	}
+
+	#[test]
+	fn duration_explain_normalizes_timeout() -> FerrosGrynnResult<()> {
+		for source in [
+			"EXPLAIN SELECT id FROM person TIMEOUT $limit;",
+			"EXPLAIN FULL CREATE person:planned TIMEOUT 1s;",
+			"EXPLAIN ANALYZE MATCH (* AS n) IN GRAPH social TIMEOUT $limit RETURN n;",
+		] {
+			let program = parse(source, ParserSettings::default())?;
+			let statement = &program.statements[0];
+			let StatementKind::Explain(explain) = &statement.kind else {
+				return Err(FerrosGrynnError::invalid_argument("test EXPLAIN missing"));
+			};
+			assert!(statement.timeout.is_some(), "{source}");
+			assert!(explain.statement.timeout.is_none(), "{source}");
+		}
+		for source in [
+			"EXPLAIN SELECT id FROM person TIMEOUT 1s TIMEOUT 2s;",
+			"EXPLAIN EXPLAIN SELECT id FROM person TIMEOUT 1s;",
+			"EXPLAIN DEFINE CLASS person TYPE NODE TIMEOUT 1s;",
+		] {
+			assert!(parse(source, ParserSettings::default()).is_err(), "{source}");
+		}
+		Ok(())
 	}
 
 	#[test]

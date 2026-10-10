@@ -4,7 +4,8 @@ mod images;
 mod operands;
 mod planning;
 
-pub(super) use planning::{plan, project_plan};
+pub(super) use operands::Operands;
+pub(super) use planning::{HashBytes, hash_function, plan, project_plan};
 
 use super::eval::eval;
 use crate::{
@@ -23,6 +24,7 @@ use crate::{
 	datastore::Transaction,
 	gql::{
 		ExecutionControl,
+		execution::QuerySnapshot,
 		ir::{LogicalChangefeedTarget, TypedExpr},
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -71,13 +73,18 @@ fn feed_id(value: Value) -> FerrosGrynnResult<ChangefeedId> {
 /// Reads logical source metadata from the same public SDK surface.
 pub(super) fn info(
 	transaction: &mut Transaction,
+	snapshot: &QuerySnapshot,
 	id: &TypedExpr,
 	slots: &[Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
-	let operands = operands::Operands::new(control);
-	let id = feed_id(eval(id, None, slots, source, Some(&operands), Some(control))?)?;
+	let (id, _operand_account) = {
+		let read = |id| transaction.query_live_binding_value(snapshot, id);
+		let operands = operands::Operands::new(control).with_bindings(&read);
+		let id = feed_id(eval(id, None, slots, source, Some(&operands), Some(control))?)?;
+		(id, operands.into_account())
+	};
 	let mut account = control.barrier_account();
 	let info = transaction.changefeed_info_admitted(id, |metadata_bytes| {
 		// Owned metadata and the projected object remain live together.
@@ -159,6 +166,7 @@ fn selector(
 )]
 pub(super) fn show(
 	transaction: &mut Transaction,
+	snapshot: &QuerySnapshot,
 	target: &LogicalChangefeedTarget,
 	since: &TypedExpr,
 	full: bool,
@@ -168,27 +176,33 @@ pub(super) fn show(
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	control.check()?;
-	let operands = operands::Operands::new(control);
-	let target = selector(target, slots, source, control, &operands)?;
-	let since = match eval(since, None, slots, source, Some(&operands), Some(control))? {
-		Value::Number(stamp) => ChangefeedSince::Versionstamp(u64::try_from(stamp)?.into()),
-		Value::DateTime(time) => ChangefeedSince::Timestamp(time),
-		Value::Bytes(cursor) => {
-			ChangefeedSince::Cursor(ChangefeedCursor::decode(cursor.as_slice())?)
-		}
-		_ => {
-			return Err(FerrosGrynnError::invalid_argument(
-				"SINCE requires an integer stamp, UTC timestamp or cursor bytes",
-			));
-		}
+	let (target, since, limit, _operand_account) = {
+		let read = |id| transaction.query_live_binding_value(snapshot, id);
+		let operands = operands::Operands::new(control).with_bindings(&read);
+		let target = selector(target, slots, source, control, &operands)?;
+		let since = match eval(since, None, slots, source, Some(&operands), Some(control))? {
+			Value::Number(stamp) => ChangefeedSince::Versionstamp(u64::try_from(stamp)?.into()),
+			Value::DateTime(time) => ChangefeedSince::Timestamp(time),
+			Value::Bytes(cursor) => {
+				ChangefeedSince::Cursor(ChangefeedCursor::decode(cursor.as_slice())?)
+			}
+			_ => {
+				return Err(FerrosGrynnError::invalid_argument(
+					"SINCE requires an integer stamp, UTC timestamp or cursor bytes",
+				));
+			}
+		};
+		let limit = limit
+			.map(|limit| match eval(limit, None, slots, source, Some(&operands), Some(control))? {
+				Value::Number(limit) => u64::try_from(limit),
+				_ => {
+					Err(FerrosGrynnError::invalid_argument("LIMIT requires a nonnegative integer"))
+				}
+			})
+			.transpose()?
+			.unwrap_or(u64::MAX);
+		(target, since, limit, operands.into_account())
 	};
-	let limit = limit
-		.map(|limit| match eval(limit, None, slots, source, Some(&operands), Some(control))? {
-			Value::Number(limit) => u64::try_from(limit),
-			_ => Err(FerrosGrynnError::invalid_argument("LIMIT requires a nonnegative integer")),
-		})
-		.transpose()?
-		.unwrap_or(u64::MAX);
 	let mode = if full {
 		ChangefeedReadMode::Full
 	} else {
