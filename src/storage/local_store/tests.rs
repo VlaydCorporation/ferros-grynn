@@ -38,6 +38,7 @@ use crate::{
 	values::{Object, PropertyMap, RecordId, RecordIdPart, Type, Value, Vector},
 };
 
+mod bridge_tests;
 mod changefeed_tests;
 mod event_outbox_tests;
 mod live_history_tests;

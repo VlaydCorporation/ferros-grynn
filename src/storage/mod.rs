@@ -5,6 +5,9 @@ mod atom_page;
 mod atom_store_image;
 mod atom_store_superblock;
 mod base_statistics;
+/// Explicit mapping records reuse property pages and generic unique B+trees.
+mod bridge_mapping;
+pub use bridge_mapping::{BridgeCatalogBinding, validate_database_record, validate_mapping_record};
 #[cfg(feature = "storage-engine-prototype-api")]
 mod buffer_pool;
 mod catalog;

@@ -1,4 +1,6 @@
+mod bridge;
 mod changefeed;
+pub use bridge::BridgeClause;
 mod control;
 mod dml;
 /// Class/graph event definitions and ordered lifecycle actions.

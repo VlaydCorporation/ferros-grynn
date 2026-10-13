@@ -172,6 +172,8 @@ pub enum DataFileKind {
 	Changefeed = 0x17,
 	/// Authoritative accepted invocation journal backfilled by the shared WAL.
 	EventOutbox = 0x18,
+	/// Owned correspondence payloads and generic lookup trees.
+	BridgeMappings = 0x19,
 }
 
 impl DataFileKind {
@@ -230,6 +232,8 @@ impl DataFileKind {
 			Some(Self::Changefeed)
 		} else if value == Self::EventOutbox.get() {
 			Some(Self::EventOutbox)
+		} else if value == Self::BridgeMappings.get() {
+			Some(Self::BridgeMappings)
 		} else {
 			None
 		}
@@ -411,7 +415,7 @@ mod tests {
 			DataFileId::from_raw(0x18).and_then(DataFileId::kind),
 			Some(DataFileKind::EventOutbox)
 		);
-		assert!(DataFileId::from_raw(0x19).is_none());
+		assert!(DataFileId::from_raw(0x1a).is_none());
 	}
 
 	/// Page keys keep database storage distinct from every graph address space.

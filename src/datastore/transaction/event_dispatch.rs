@@ -547,7 +547,12 @@ fn mutation_target(
 			..
 		}
 		| Mutation::RemoveAnalyzer(_)
-		| Mutation::RemoveGraph(_) => None,
+		| Mutation::RemoveGraph(_)
+		| Mutation::RegisterBridgeDatabase(_)
+		| Mutation::RegisterBridgeMapping(_)
+		| Mutation::TransitionBridgeMapping {
+			..
+		} => None,
 	}
 }
 

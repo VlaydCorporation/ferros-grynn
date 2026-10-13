@@ -135,7 +135,16 @@ pub(super) fn read_property_record(
 	slot: u16,
 	expected_len: u32,
 ) -> FerrosGrynnResult<&[u8]> {
-	read_slotted_record(page, page_no, slot, expected_len, PageType::PropHeap)
+	read_slotted_record(page, page_no, slot, Some(expected_len), PageType::PropHeap)
+}
+
+/// Reads a validated raw slotted payload whose owner stores a compact locator.
+pub(super) fn read_raw_property_record(
+	page: &AlignedPage,
+	page_no: PageNo,
+	slot: u16,
+) -> FerrosGrynnResult<&[u8]> {
+	read_slotted_record(page, page_no, slot, None, PageType::PropHeap)
 }
 
 /// Reads one graph-overlay record after validating its complete slotted page.
@@ -145,14 +154,14 @@ pub(super) fn read_overlay_record(
 	slot: u16,
 	expected_len: u32,
 ) -> FerrosGrynnResult<&[u8]> {
-	read_slotted_record(page, page_no, slot, expected_len, PageType::GraphOverlay)
+	read_slotted_record(page, page_no, slot, Some(expected_len), PageType::GraphOverlay)
 }
 
 fn read_slotted_record(
 	page: &AlignedPage,
 	page_no: PageNo,
 	slot: u16,
-	expected_len: u32,
+	expected_len: Option<u32>,
 	page_type: PageType,
 ) -> FerrosGrynnResult<&[u8]> {
 	let header = page.validate(page_no)?;
@@ -183,7 +192,7 @@ fn read_slotted_record(
 	if record_offset == 0
 		|| record_offset < usize::from(free_end)
 		|| record_end > PAGE_SIZE
-		|| u32::try_from(record_len).ok() != Some(expected_len)
+		|| expected_len.is_some_and(|expected| u32::try_from(record_len).ok() != Some(expected))
 	{
 		return Err(invalid(page_no.get(), "property record range or length is invalid"));
 	}

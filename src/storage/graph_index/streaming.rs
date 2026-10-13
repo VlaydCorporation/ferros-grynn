@@ -14,6 +14,14 @@ pub(in crate::storage) struct StreamedIndex {
 	pub(in crate::storage) page_count: u64,
 }
 
+/// Checks the exact one-entry unique leaf layout before accepting an owned key.
+pub(in crate::storage) fn validate_unique_index_key(key: &[u8]) -> FerrosGrynnResult<()> {
+	if key.is_empty() || !leaf_accepts_bytes(1, 0, unique_entry_bytes(key.len())?, PAGE_SIZE)? {
+		return Err(invalid_index("one unique key exceeds leaf-page capacity"));
+	}
+	Ok(())
+}
+
 /// Writes one unique B+tree without retaining its output pages.
 pub(in crate::storage) fn stream_unique_index<Address: PrimaryAddress>(
 	records: &SortedIndexRecords,
@@ -21,10 +29,19 @@ pub(in crate::storage) fn stream_unique_index<Address: PrimaryAddress>(
 	page_lsn: PageLsn,
 	write: impl FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<StreamedIndex> {
-	stream_unique_index_with_layout::<Address>(records, scratch_root, page_lsn, PageType::IndexUniqueBtreeLeaf, PageNo::new(0), external_sort_run_budget(), write)
+	stream_unique_index_with_layout::<Address>(
+		records,
+		scratch_root,
+		page_lsn,
+		PageType::IndexUniqueBtreeLeaf,
+		PageNo::new(0),
+		external_sort_run_budget(),
+		write,
+	)
 }
 
-/// Streams the shared unique tree at a checked base page with a concrete leaf type.
+/// Streams the shared unique tree at a checked base page with a concrete leaf
+/// type.
 pub(in crate::storage) fn stream_unique_index_with_layout<Address: PrimaryAddress>(
 	records: &SortedIndexRecords,
 	scratch_root: &Path,
@@ -34,7 +51,9 @@ pub(in crate::storage) fn stream_unique_index_with_layout<Address: PrimaryAddres
 	sort_budget: usize,
 	mut write: impl FnMut(PageNo, &AlignedPage) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<StreamedIndex> {
-	if first_page == PageNo::NULL || !matches!(leaf_type, PageType::IndexUniqueBtreeLeaf | PageType::IndexEdgeEndpointEntry) {
+	if first_page == PageNo::NULL
+		|| !matches!(leaf_type, PageType::IndexUniqueBtreeLeaf | PageType::IndexEdgeEndpointEntry)
+	{
 		return Err(invalid_index("unique tree page layout is invalid"));
 	}
 	let leaf_count = count_unique_leaves::<Address>(records)?;
@@ -58,7 +77,16 @@ pub(in crate::storage) fn stream_unique_index_with_layout<Address: PrimaryAddres
 				entry_bytes,
 				MUTABLE_PRIMARY_LEAF_BYTES,
 			)? {
-			flush_unique_leaf(&mut write, &mut children, leaf_index, leaf_count, &leaf, page_lsn, leaf_type, first_page)?;
+			flush_unique_leaf(
+				&mut write,
+				&mut children,
+				leaf_index,
+				leaf_count,
+				&leaf,
+				page_lsn,
+				leaf_type,
+				first_page,
+			)?;
 			leaf_index += 1;
 			leaf.clear();
 			leaf_data_bytes = 0;
@@ -76,14 +104,26 @@ pub(in crate::storage) fn stream_unique_index_with_layout<Address: PrimaryAddres
 		previous_key = Some(key.to_vec());
 		Ok(())
 	})?;
-	flush_unique_leaf(&mut write, &mut children, leaf_index, leaf_count, &leaf, page_lsn, leaf_type, first_page)?;
+	flush_unique_leaf(
+		&mut write,
+		&mut children,
+		leaf_index,
+		leaf_count,
+		&leaf,
+		page_lsn,
+		leaf_type,
+		first_page,
+	)?;
 	if leaf_index + 1 != leaf_count {
 		return Err(invalid_index("unique leaf sizing pass disagrees with packing pass"));
 	}
 	if leaf_count == 1 {
 		return Ok(StreamedIndex {
 			root: first_page,
-			page_count: first_page.get().checked_add(1).ok_or_else(|| invalid_index("unique page count overflows"))?,
+			page_count: first_page
+				.get()
+				.checked_add(1)
+				.ok_or_else(|| invalid_index("unique page count overflows"))?,
 		});
 	}
 	let children = children.finish()?;
@@ -91,7 +131,8 @@ pub(in crate::storage) fn stream_unique_index_with_layout<Address: PrimaryAddres
 		children,
 		u64::try_from(leaf_count)
 			.map_err(|_error| invalid_index("unique leaf count exceeds u64"))?
-			.checked_add(first_page.get()).ok_or_else(|| invalid_index("unique page count overflows"))?,
+			.checked_add(first_page.get())
+			.ok_or_else(|| invalid_index("unique page count overflows"))?,
 		scratch_root,
 		page_lsn,
 		sort_budget,
@@ -186,8 +227,14 @@ pub(in crate::storage) fn stream_standard_index<Address: PrimaryAddress + Ord>(
 		});
 	}
 	let children = children.finish()?;
-	let (root, page_count) =
-		stream_internal_levels(children, leaf_and_posting, scratch_root, page_lsn, external_sort_run_budget(), &mut write)?;
+	let (root, page_count) = stream_internal_levels(
+		children,
+		leaf_and_posting,
+		scratch_root,
+		page_lsn,
+		external_sort_run_budget(),
+		&mut write,
+	)?;
 	Ok(StreamedIndex {
 		root,
 		page_count,
@@ -260,9 +307,7 @@ fn count_unique_leaves<Address: PrimaryAddress>(
 			entries = 0;
 			data_bytes = 0;
 		}
-		if !leaf_accepts_bytes(entries + 1, data_bytes, bytes, PAGE_SIZE)? {
-			return Err(invalid_index("one unique key exceeds leaf-page capacity"));
-		}
+		validate_unique_index_key(key)?;
 		entries = entries
 			.checked_add(1)
 			.ok_or_else(|| invalid_index("unique leaf entry count overflows usize"))?;
@@ -486,7 +531,12 @@ fn flush_unique_leaf<Address: PrimaryAddress>(
 	leaf_type: PageType,
 	first_page: PageNo,
 ) -> FerrosGrynnResult<()> {
-	let page_no = PageNo::new(usize_page_no(leaf_index, "unique leaf page index")?.get().checked_add(first_page.get()).ok_or_else(|| invalid_index("unique leaf page number overflows"))?);
+	let page_no = PageNo::new(
+		usize_page_no(leaf_index, "unique leaf page index")?
+			.get()
+			.checked_add(first_page.get())
+			.ok_or_else(|| invalid_index("unique leaf page number overflows"))?,
+	);
 	let next = (leaf_index + 1 < leaf_count).then(|| PageNo::new(page_no.get() + 1));
 	let mut page = Box::new(AlignedPage::zeroed());
 	encode_unique_leaf_with_type(&mut page, page_no, page_lsn, next, leaf, leaf_type)?;

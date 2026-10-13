@@ -129,6 +129,7 @@ pub(super) use primary_idx::{
 	lookup_primary_index,
 	mutate_primary_index_leaves,
 	scan_primary_index,
+	visit_primary_index,
 	visit_primary_leaf_page,
 };
 #[cfg(test)]
@@ -151,6 +152,7 @@ pub(super) use streaming::{
 	stream_standard_index,
 	stream_unique_index,
 	stream_unique_index_with_layout,
+	validate_unique_index_key,
 };
 
 const LEAF_NEXT_OFFSET: usize = PAGE_HEADER_SIZE;

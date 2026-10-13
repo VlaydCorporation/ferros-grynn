@@ -287,6 +287,10 @@ fn explain_json(
 	root.insert("plan_version", u64::from(crate::gql::optimizer::PLAN_ENCODING_VERSION));
 	root.insert("plan_hash", plan.hash());
 	root.insert("statement_kind", statement_name(statement));
+	let bridges = bridge_metadata(statement);
+	if !bridges.is_empty() {
+		root.insert("bridges", Value::Array(bridges.into()));
+	}
 	root.insert("mode", mode_name(mode));
 	root.insert("snapshot", query_snapshot.0);
 	root.insert("seed", seed);
@@ -312,6 +316,49 @@ fn explain_json(
 	Value::Object(root)
 }
 
+/// Shows the explicit external boundary without executing the adapter.
+fn bridge_metadata(statement: &LogicalStatement) -> Vec<Value> {
+	let item = |alias: &str, phase: &str| {
+		Value::Object(Object::from_iter([
+			("alias", Value::from(alias)),
+			("phase", Value::from(phase)),
+		]))
+	};
+	match statement {
+		LogicalStatement::GraphDml(LogicalGraphDmlStatement::Relate {
+			bridge: Some(alias),
+			..
+		}) => vec![item(alias, "local commit -> Pending mirror -> Ready confirmation")],
+		LogicalStatement::ReturnGraph(graph) => graph
+			.bridge
+			.as_deref()
+			.map(|alias| item(alias, "mapped local identities -> shared graph assembler"))
+			.into_iter()
+			.collect(),
+		LogicalStatement::BuildGraph(graph) => graph
+			.bridge
+			.as_deref()
+			.map(|alias| item(alias, "mapped local identities -> shared atomic graph build"))
+			.into_iter()
+			.collect(),
+		LogicalStatement::Select(select) => {
+			let mut items = select
+				.fetch_bridges
+				.iter()
+				.flat_map(|bridges| bridges.iter().flatten())
+				.map(|alias| item(alias, "FETCH before ORDER and pagination"))
+				.collect::<Vec<_>>();
+			if let Some(alias) =
+				select.return_graph.as_ref().and_then(|graph| graph.bridge.as_deref())
+			{
+				items.push(item(alias, "mapped local identities -> shared graph assembler"));
+			}
+			items
+		}
+		_ => Vec::new(),
+	}
+}
+
 #[allow(clippy::too_many_arguments, reason = "the explain envelope has fixed contract fields")]
 fn explain_text(
 	mode: ExplainMode,
@@ -334,6 +381,9 @@ fn explain_text(
 		snapshot.revision,
 		planning_ns,
 	)];
+	for bridge in bridge_metadata(statement) {
+		lines.push(format!("  bridge: {}", value_text(&bridge)));
+	}
 	let nodes = if mode == ExplainMode::Logical {
 		logical_nodes(statement)
 	} else {

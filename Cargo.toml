@@ -37,7 +37,7 @@ mimalloc-pprof = { version = "1.0.0", default-features = false }
 #async-stream = "0.3.6"
 #boxcar = "0.2.14"
 #dynify = { version = "0.1.2", features = ["smallvec"] }
-tokio = { version = "1.48.0", features = ["fs", "io-util", "rt", "rt-multi-thread"] }
+tokio = { version = "1.48.0", features = ["fs", "io-util", "rt", "rt-multi-thread", "sync", "time"] }
 #tokio-graceful = "0.2.2"
 #tokio_env = "0.1.0"
 #tokio-stream = "0.1.19"
@@ -81,9 +81,10 @@ reblessive = "0.4.3"
 # --------- Data ---------
 arrow = { version = "58.4.0", default-features = false }
 datafusion = { version = "54.1.0", default-features = false }
+surrealdb = { version = "=3.3.4", default-features = false, features = ["parse"] }
 bytes = "1.12.1"
 compact_str = { version = "0.10.0", features = ["rkyv"] }
-geo = { version = "=0.33.1", default-features = false }
+geo = { version = "=0.32.0", default-features = false }
 geojson = "1.0.0"
 jiff = "0.2.34"
 humantime = "2.3.0"
@@ -219,6 +220,9 @@ default = ["columnar", "datafusion"]
 columnar = ["dep:arrow"]
 datafusion = ["columnar", "dep:datafusion"]
 native-async-io = []
+bridge-surreal = ["dep:surrealdb"]
+bridge-surreal-mem = ["bridge-surreal", "surrealdb/kv-mem"]
+bridge-surreal-rocksdb = ["bridge-surreal", "surrealdb/kv-rocksdb"]
 allocation-tracking = []
 storage-engine-prototype-api = []
 
@@ -260,6 +264,7 @@ reblessive = { workspace = true }
 # --------- Data ---------
 arrow = { workspace = true, optional = true }
 datafusion = { workspace = true, optional = true }
+surrealdb = { workspace = true, optional = true }
 compact_str = { workspace = true }
 geojson = { workspace = true }
 geo = { workspace = true }

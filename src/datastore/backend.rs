@@ -62,6 +62,9 @@ pub(crate) struct StoreInner {
 	pub(crate) datastore_handles: AtomicUsize,
 	pub(crate) current: RwLock<Arc<DatabaseRoot>>,
 	pub(crate) commit: Mutex<()>,
+	/// Runtime-only clients are independent of durable mapping definitions.
+	pub(crate) bridge_adapters:
+		RwLock<BTreeMap<crate::bridge::BridgeDatabaseId, Arc<dyn crate::bridge::Bridge>>>,
 	/// Transient whole-commit delivery authority, independent of MVCC roots.
 	pub(in crate::datastore) live_consumers: super::live_queue::Consumers,
 	pub(crate) query_scratch_root: PathBuf,
@@ -159,6 +162,9 @@ impl StoreInner {
 				Ok(())
 			}
 			StoreBackend::Local(local) => {
+				if !root.bridges.databases.is_empty() {
+					let _bridge = Arc::make_mut(&mut root.bridges);
+				}
 				// Detach outer COW and allocate empty RAM tables before the WAL
 				// barrier. The post-barrier path only installs owned handles.
 				let empty_history = Arc::default();
@@ -173,16 +179,29 @@ impl StoreInner {
 				                    right: &Vector| {
 					evaluator.distance(function, version, left, right)
 				};
-				local.persist_root(
-					root,
-					previous,
-					changed_records,
-					graph_catalog_only,
-					dictionary_changed,
-					&mut analyze,
-					&mut distance,
+				let maintenance = match self.options {
+					DatastoreOptions::Local(options) => options.maintenance,
+					DatastoreOptions::InMemory(options) => options.maintenance,
+				};
+				crate::storage::with_external_sort_options(
+					maintenance.max_memory_bytes,
+					maintenance.max_parallelism,
+					|| {
+						local.persist_root(
+							root,
+							previous,
+							changed_records,
+							graph_catalog_only,
+							dictionary_changed,
+							&mut analyze,
+							&mut distance,
+						)
+					},
 				)?;
 				*root.changefeed_segments_mut() = local.changefeed_segments();
+				if !root.bridges.databases.is_empty() {
+					Arc::make_mut(&mut root.bridges).physical = local.bridge_binding();
+				}
 				*root.change_history_mut() = empty_history;
 				*root.live_segments_mut() = local.live_segments();
 				std::sync::Arc::make_mut(root.live_catalog_mut()).graph_segments =
@@ -204,6 +223,9 @@ impl StoreInner {
 		root: &mut DatabaseRoot,
 		quarantine: Option<&mut QuarantineArtifact>,
 	) -> FerrosGrynnResult<BTreeMap<super::IndexId, std::time::Duration>> {
+		if !root.bridges.databases.is_empty() {
+			let _bridge = Arc::make_mut(&mut root.bridges);
+		}
 		// END preparation freezes the final stamp/time before encoding any
 		// source or computed result envelope, including repeated UTC times.
 		let observation = super::changefeed_observation::Publication::capture(root);
@@ -234,8 +256,18 @@ impl StoreInner {
 				                    right: &Vector| {
 					evaluator.distance(function, version, left, right)
 				};
-				let timings =
-					local.persist_import_root(root, quarantine, &mut analyze, &mut distance)?;
+				let maintenance = match self.options {
+					DatastoreOptions::Local(options) => options.maintenance,
+					DatastoreOptions::InMemory(options) => options.maintenance,
+				};
+				let timings = crate::storage::with_external_sort_options(
+					maintenance.max_memory_bytes,
+					maintenance.max_parallelism,
+					|| local.persist_import_root(root, quarantine, &mut analyze, &mut distance),
+				)?;
+				if !root.bridges.databases.is_empty() {
+					Arc::make_mut(&mut root.bridges).physical = local.bridge_binding();
+				}
 				*root.changefeed_segments_mut() = local.changefeed_segments();
 				*root.change_history_mut() = empty_history;
 				*root.live_segments_mut() = local.live_segments();

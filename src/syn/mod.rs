@@ -37,6 +37,7 @@ pub use stmt::{
 	BasicIndexDefinition,
 	BeginStatement,
 	Block,
+	BridgeClause,
 	BuildGraphSource,
 	BuildGraphStatement,
 	CatchClause,
@@ -190,6 +191,12 @@ impl From<&GQLConfig> for ParserSettings {
 
 pub fn parse(source: &str, settings: ParserSettings) -> FerrosGrynnResult<Program> {
 	parser::parse(source, settings)
+}
+
+/// Examines actual tokens, excluding quoted names, strings and comments.
+pub(crate) fn has_bridge_clause(source: &str) -> FerrosGrynnResult<bool> {
+	let tokens = lexer::lex(source)?;
+	Ok(tokens.windows(2).any(|pair| matches!((&pair[0].kind, &pair[1].kind), (token::TokenKind::Word { value: left, quoted: false }, token::TokenKind::Word { value: right, quoted: false }) if left.eq_ignore_ascii_case("WITH") && right.eq_ignore_ascii_case("BRIDGE"))))
 }
 
 #[cfg(test)]

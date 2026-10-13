@@ -317,6 +317,37 @@ pub(super) trait QueryRead {
 	type Savepoint;
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot>;
+	/// Captures conservative SSI dependencies before a mutable source visitor.
+	fn bridge_recipe_reads(&self, _snapshot: Snapshot) -> FerrosGrynnResult<()> {
+		Ok(())
+	}
+
+	/// Resolves mappings against the exact statement snapshot.
+	fn bridge_mapping(
+		&self,
+		snapshot: Snapshot,
+		database: crate::bridge::BridgeDatabaseRef,
+		subject: &crate::bridge::BridgeMappingSubject,
+	) -> FerrosGrynnResult<Option<crate::bridge::BridgeMapping>> {
+		let root = self.snapshot_root(snapshot)?;
+		if root.database_uuid != database.datastore {
+			return Err(FerrosGrynnError::bridge_mapping_error("foreign database reference"));
+		}
+		Ok(root.bridges.local(database.id, subject).map(|row| row.as_ref().clone()))
+	}
+	/// Resolves foreign recipes against the same snapshot and role domain.
+	fn bridge_inverse(
+		&self,
+		snapshot: Snapshot,
+		entity: &crate::bridge::BridgeEntityRef,
+		role: crate::bridge::BridgeMappingRole,
+	) -> FerrosGrynnResult<Option<crate::bridge::BridgeMapping>> {
+		let root = self.snapshot_root(snapshot)?;
+		if root.database_uuid != entity.database.datastore {
+			return Err(FerrosGrynnError::bridge_mapping_error("foreign database reference"));
+		}
+		Ok(root.bridges.external(entity, role).map(|row| row.as_ref().clone()))
+	}
 
 	/// Owned authority used only by a retained graph-result cursor.
 	fn snapshot_root(

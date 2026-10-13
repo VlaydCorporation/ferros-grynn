@@ -39,6 +39,9 @@ pub struct SelectStatement {
 	pub group: Option<SelectGroup>,
 	pub omit: Vec<SelectPath>,
 	pub fetch: Vec<SelectPath>,
+	/// Cold aliases correspond positionally to FETCH paths; absent for local
+	/// FETCH.
+	pub fetch_bridges: Option<Box<[Option<BridgeClause>]>>,
 	pub order: Vec<SelectOrder>,
 	pub limit: Option<Expr>,
 	pub start: Option<SelectStart>,
@@ -71,6 +74,7 @@ impl SelectStatement {
 			group: None,
 			omit: Vec::new(),
 			fetch: Vec::new(),
+			fetch_bridges: None,
 			order: Vec::new(),
 			limit: None,
 			start: None,
@@ -348,10 +352,10 @@ impl Parser<'_> {
 		} else {
 			Vec::new()
 		};
-		let fetch = if self.consume_keyword(keywords::FETCH).is_some() {
-			self.select_path_list()?
+		let (fetch, fetch_bridges) = if self.consume_keyword(keywords::FETCH).is_some() {
+			self.select_fetch_list()?
 		} else {
-			Vec::new()
+			(Vec::new(), None)
 		};
 		let order = if self.consume_keyword(keywords::ORDER).is_some() {
 			self.expect_keyword(keywords::BY, "Expected BY after ORDER.")?;
@@ -423,6 +427,7 @@ impl Parser<'_> {
 			group,
 			omit,
 			fetch,
+			fetch_bridges,
 			order,
 			limit,
 			start,
@@ -643,6 +648,33 @@ impl Parser<'_> {
 			}
 		}
 		Ok(paths)
+	}
+
+	/// FETCH owns individual adapter selections without changing OMIT path
+	/// semantics.
+	fn select_fetch_list(
+		&mut self,
+	) -> FerrosGrynnResult<(Vec<SelectPath>, Option<Box<[Option<BridgeClause>]>>)> {
+		let mut paths = Vec::new();
+		let mut bridges = Vec::new();
+		loop {
+			let first = self.identifier()?;
+			let start = first.span;
+			let mut segments = vec![first];
+			while self.consume_symbol(Symbol::Dot).is_some() {
+				segments.push(self.identifier()?);
+			}
+			paths.push(SelectPath {
+				span: cover(start, self.previous_span()),
+				segments,
+			});
+			bridges.push(self.bridge_clause()?);
+			if self.consume_symbol(Symbol::Comma).is_none() {
+				break;
+			}
+		}
+		let bridges = bridges.iter().any(Option::is_some).then(|| bridges.into_boxed_slice());
+		Ok((paths, bridges))
 	}
 
 	pub(in crate::syn) fn graph_reference_expr(&mut self) -> FerrosGrynnResult<Expr> {

@@ -20,7 +20,7 @@ evidence и ограничения зафиксированы в
 Она заменяет graph-owned atom/table candidate на database-level AtomStore и graph-local
 occurrences. При конфликте с сохранёнными ниже legacy layout-примечаниями действуют §§2, 4, 7,
 10–11, 17–18 и 22 в редакции 9.0. После этапов 20–21 cutover принимает только
-`FGDC v14`/`FGFC v6`; миграции
+`FGDC v15`/`FGFC v7`; миграции
 промежуточных кандидатов нет.
 
 ---
@@ -454,7 +454,7 @@ enum RecordIdPart {
 
 ```
 tag(u8) = 0x10
-class_id(u32)             -- stable ClassId из FGDC v14
+class_id(u32)             -- stable ClassId из FGDC v15
 id_kind(u8):
   0x00 = Int
   0x01 = String
@@ -764,22 +764,22 @@ database-level AtomStore и catalog files. Транзакция не может 
 namespace. Backfill можно планировать по data space, но обрезка единого WAL использует общий
 watermark.
 
-### 7.2. DatabaseCatalog `FGDC v14` и FileCatalog `FGFC v6`
+### 7.2. DatabaseCatalog `FGDC v15` и FileCatalog `FGFC v7`
 
 `db.fgb` хранит root-page ссылки; канонические каталоги лежат в `schema/catalog.fgb` и
 публикуются тем же frame-WAL commit, что data pages:
 
-- `DatabaseCatalog` (`FGDC`, payload version 14): identity clocks, IANA timezone table,
+- `DatabaseCatalog` (`FGDC`, payload version 15): identity clocks, IANA timezone table,
   versioned CLASS/FIELD/INDEX definitions, graph catalog, AtomStore generation/bindings,
   durable parameters и named functions. Property-key strings в payload не дублируются;
-- `FileCatalog` (`FGFC`, payload version 6): sealed mapping
+- `FileCatalog` (`FGFC`, payload version 7): sealed mapping
   `(DataSpaceId, DataFileId) → (companion_of, role, validated relative path)`.
 
-`FGDC v14` начинается с exact 144-byte header (development layout, Q-40):
+`FGDC v15` начинается с exact 248-byte header (development layout, Q-40):
 
 ```text
 0   4   magic = FGDC
-4   2   version = 14
+4   2   version = 15
 6   2   reserved = 0
 8   8   next_graph_id
 16  8   next_schema_id
@@ -800,7 +800,55 @@ watermark.
 132 4   live_history_count
 136 4   event_definition_count
 140 4   event_outbox_segment_count
+144 8   bridges_present: u8(0|1) и 7 нулевых reserved bytes
+152 8   bridge_registry_generation
+160 16  bridge_generation_directory UUID
+176 8   bridge_record_count (database descriptors + mappings)
+184 16  bridge heap physical binding
+200 16  bridge primary UUID index physical binding
+216 16  bridge local-subject index physical binding
+232 16  bridge external-identity index physical binding
 ```
+
+При `bridges_present=0` все 104 bytes bridge descriptor равны нулю. При `1`
+generation/count положительны, UUID не nil; четыре bindings различны и принадлежат
+database-space файлам `BridgeMappings=0x19`. Bridge payload не входит в общий
+16-МиБ catalog limit.
+
+Bridge generation хранится в `atoms/<uuid>/bridges/`: `records.fgb`,
+`primary.fgidx`, `local.fgidx`, `external.fgidx`. Heap использует обычные slotted
+property pages и overflow pages, индексы — production B+tree. Locator есть
+`page(48)|slot(16)` и никогда не является `AtomId`. Запись `FGBR v1` содержит
+8-byte marker/version/reserved (`FGBR`, `1`, три нуля), два u32-length-prefixed
+blob: локальный property-key dictionary и canonical typed value envelope.
+Максимум одной записи — 4 МиБ; counts, lengths, recursion и aggregate recovery
+memory проверяются до allocation. `FGBL v1` overflow pointer хранит marker,
+version/reserved, u32 total length и u64 first page; common page bytes не меняются.
+Перед регистрацией database descriptor проверяется этим же bounded codec;
+encoded direct/reverse keys проверяются по точному production page layout.
+При странице 16384 bytes максимум такого Unique key равен 16330 bytes:
+он помещается в leaf и допускает internal fanout не менее двух. Непредставимое
+соответствие отклоняется до изменения registry, одинаково для RAM и local.
+
+Authoritative mapping содержит datastore UUID, невоспроизводимый MappingId UUID,
+role/subject, qualified external identity, `Pending|Ready|Tombstoned` и optional
+immutable mirror intent. GraphId кодируется как восемь LE bytes, включая полный
+u64 domain. Прямой/обратный индексы содержат только locator authoritative row;
+Tombstoned rows остаются в primary index и освобождают обе уникальные стороны.
+Database descriptors сохраняют alias/provider/namespace/database и injective
+class/table, graph/table correspondences; clients/credentials не сериализуются.
+Namespace/database сами по себе не идентифицируют разные embedded экземпляры.
+
+Новые файлы полностью записываются и синхронизируются до publication, затем
+catalog reachability публикуется обычным WAL commit. В WAL не копируется весь
+immutable registry: размер generation не ограничивается лимитом одного WAL frame.
+Неопубликованные generations удаляются RAII; неизвестный commit outcome сохраняет
+их для recovery. Чистое подтверждение `Ready` удерживает atom/graph files. При
+удалении subject tombstone публикуется той же локальной транзакцией; внешняя БД
+автоматически не изменяется.
+
+Это draft cutover: только `FGDC v15`/`FGFC v7` принимаются. Старый catalog даёт
+typed format error без автоматической миграции или переписывания при `open`.
 
 Sections следуют строго в порядке timezone → class → graph → parameter → function → analyzer → changefeed → live-query → live-binding → live-history → event-definition → event-outbox-segment и обязаны
 полностью потребить payload. Index entry использует maintenance byte `0=Immediate`,
@@ -811,7 +859,7 @@ types, effect `PURE|STABLE|IMPURE`, `COST`, optional `MAXDEPTH 1..=64`, source U
 optional comment. Уникальны identity и `(namespace, name, parameter types)`; typed IR и
 platform bytecode не сохраняются.
 
-LIVE-query section (`FGDC v14`, этапы 28–29) содержит entries в canonical порядке по
+LIVE-query section (`FGDC v15`, этапы 28–29) содержит entries в canonical порядке по
 `LiveId`. Fixed header entry занимает 160 bytes: UUID(16), definition version(u64),
 defined/starting-after/published/ACK stamps(4 × u64), state/overflow/SINCE tag(3 × u8), options flags(1),
 original source ClassId(u32; 0 только для graph-wide source),
@@ -914,7 +962,7 @@ Epochs sorted strictly; несколько policy actions одного commit с
 Все reserved bytes нулевые; counts проверяются относительно оставшегося payload до allocation.
 Retained CLASS/GRAPH identity меньше соответствующего allocation clock, включая retired sources.
 
-`FGFC v6` имеет 24-byte header (`FGFC`, version 6, reserved, count, reserved,
+`FGFC v7` имеет 24-byte header (`FGFC`, version 7, reserved, count, reserved,
 `next_file_instance_id`). Каждая запись сохраняет 32-байтовый fixed header:
 
 ```text
@@ -962,7 +1010,7 @@ Class definition хранит стабильные `ClassId`/`SchemaVersion`, im
 `GraphRef` не кодируется как `RecordId`. Удаление graph удаляет только его catalog entry,
 occurrences, topology, overlays и effective indexes; global atoms и classes сохраняются.
 
-Graph entry `FGDC v14` сохраняет development fixed header этапа 18 (Q-40):
+Graph entry `FGDC v15` сохраняет development fixed header этапа 18 (Q-40):
 
 ```text
 0   8   graph_id
@@ -1046,7 +1094,7 @@ graph. Internal graph имеет ненулевой `owner_root_graph_id`, ук�
 graphs. Internal graph не может принадлежать другому internal graph или быть доступен из arena
 чужого owner root.
 
-После fixed graph fields `FGDC v14` хранит catalog-owned properties:
+После fixed graph fields `FGDC v15` хранит catalog-owned properties:
 
 ```text
 property_count: u32 LE
@@ -1061,7 +1109,7 @@ unknown key, `none`, runtime-only value, неверная длина и нека
 corruption. `null` является обычным хранимым значением. Properties изменяют catalog/schema
 revision при сохранении `GraphId` и physical bindings; в `GraphSuperblock` они не дублируются.
 
-Decoder принимает только `FGDC v14` и `FGFC v6`. `FGDC v5..=v13`, `FGFC v4/v5` и
+Decoder принимает только `FGDC v15` и `FGFC v7`. `FGDC v5..=v14`, `FGFC v4/v5/v6` и
 graph-owned atom layout возвращают typed incompatible-format error. Migration и test-only
 compatibility отсутствуют. `STORAGE_FORMAT_VERSION` остаётся `1`; development catalog layout
 изменяется на месте по Q-40, без промежуточной заморозки и compatibility decoders.
@@ -1126,7 +1174,7 @@ PageKey    = (DataSpaceId, DataFileId, PageNo)
 ```
 
 `instance_id` занимает 56 бит и не переиспользуется. Registry строится только из проверенного
-`FGFC v6`: `(DataSpaceId, DataFileId) → (role, trusted path, DirectFile)`. Superblock files не
+`FGFC v7`: `(DataSpaceId, DataFileId) → (role, trusted path, DirectFile)`. Superblock files не
 удерживают долгоживущий Windows handle, чтобы atomic replace не оставлял ссылку на старый file
 object. Отсутствующий id является fatal corruption.
 
@@ -1882,7 +1930,7 @@ Format-v1 создаёт отдельный `FreelistPage` для двух из�
 `subgraphs.fgb`. Их companions называются соответственно `freelist_atoms.fgb`,
 `freelist_props.fgb`, `freelist_nodes.fgb`, `freelist_edges.fgb`, `freelist_adj.fgb`,
 `freelist_adj_cl.fgb`, `freelist_overlays.fgb` и `freelist_subgraphs.fgb`; связь хранится явно
-в `FGFC v6.companion_of`.
+в `FGFC v7.companion_of`.
 Superblock, labels, statistics и immutable index side-files freelist не имеют. Пока
 incremental page allocation не реализован, каждый из восьми freelist-файлов содержит одну
 валидную пустую страницу и не читается обычным index/page hot path.
@@ -1916,14 +1964,14 @@ Total = PAGE_SIZE байт
 Строковые пространства разделены. Database-wide `PropertyDictionary` интернирует только ключи
 свойств. `LabelDictionary` каждого графа интернирует только graph-local node/edge labels и имеет
 две независимые плотные последовательности ID. Имена classes принадлежат `ClassCatalog`, а IANA
-timezone names — `FGDC v14`.
+timezone names — `FGDC v15`.
 
 ### 16.1. Database-wide `PropertyDictionary`
 
 `atoms/<generation>/property_keys.fgb` имеет `DataFileKind::PropertyDictionary = 0x14`, является
 append-only, WAL-versioned и не имеет freelist. `PropertyKeyId` плотны, стабильны и монотонны в
 диапазоне `[0, entry_count)`; удалённый ключ не переиспользуется. `FileCatalog` — единственная
-authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v14`.
+authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v15`.
 
 ```text
 PropertyDictionaryRoot (PageType 0x003C):
@@ -2309,7 +2357,7 @@ Vector definition хранит separately-versioned side-format binding и exact
 
 Executable IR не является durable representation: WHEN/THEN сохраняются как
 versioned source/logical descriptors со stable target identity и SchemaVersion.
-FGDC v14 содержит source-only definition section; каждый entry имеет минимум
+FGDC v15 содержит source-only definition section; каждый entry имеет минимум
 44 bytes. Durable outbox использует отдельные versioned WAL-backed side-formats FGEI/FGEO;
 его authority принадлежит transactional root. Admin job ledger служит восстанавливаемой
 проекцией. Definition и принятый invocation не содержат executable IR; development layout
@@ -4053,7 +4101,7 @@ little-endian; общий checksum покрывает header и body. Неисп
 
 Bounds сверяются с authoritative catalog того же snapshot; header не заменяет catalog.
 
-Retained source descriptor FGDC v14 после optional close stamp сохраняет
+Retained source descriptor FGDC v15 после optional close stamp сохраняет
 `purged_time_ns: i128`, `closed_time_ns: i128`, `retained_page: u64` и
 `retained_groups: u64`, затем name length; fixed minimum descriptor —
 152 bytes без name/epochs/segments. `closed_time_ns` равен нулю для active source,
@@ -4999,7 +5047,7 @@ qualified owner (16) + child GraphId:u64. Public identities восстанавл
 
 Definition descriptor family tag=3; algorithm=0/AUTO, 1/CSR, 2/DENSE; parameter=0/LOCAL, 1/ROOTED,
 radius=0, cost=HOP, labels/patterns/function dependencies empty, mode=ATOM, direction=BOTH.
-MAX_BYTES обязателен. Development `FGDC v14` graph entry после user index definitions/bindings
+MAX_BYTES обязателен. Development `FGDC v15` graph entry после user index definitions/bindings
 дополняется `incidence_revision:u64 <= generation`. Commit membership/incidence writes обновляет
 эту revision; ordinary property updates и unrelated COW/checkpoint не меняют её. Compatibility decoder нет.
 

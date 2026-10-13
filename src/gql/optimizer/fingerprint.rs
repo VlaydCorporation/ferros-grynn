@@ -188,6 +188,10 @@ fn hash_select_inner(plan: &LogicalSelect, state: &mut impl Hasher, text: Option
 	}
 	plan.omit.hash(state);
 	plan.fetch.hash(state);
+	if let Some(bridges) = &plan.fetch_bridges {
+		b"fetch-bridge-v1".hash(state);
+		bridges.hash(state);
+	}
 	if !plan.projection_paths.is_empty() {
 		b"projection-paths-v1".hash(state);
 		plan.projection_paths.hash(state);
@@ -210,6 +214,10 @@ fn hash_select_inner(plan: &LogicalSelect, state: &mut impl Hasher, text: Option
 	plan.tempfiles.hash(state);
 	plan.outer_columns.hash(state);
 	if let Some(graph) = &plan.return_graph {
+		if let Some(bridge) = &graph.bridge {
+			b"graph-bridge-v1".hash(state);
+			bridge.hash(state);
+		}
 		b"select-return-graph-v1".hash(state);
 		graph.contract.family.hash(state);
 		graph.contract.validators.bits().hash(state);

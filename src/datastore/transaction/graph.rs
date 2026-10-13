@@ -297,6 +297,20 @@ impl Transaction {
 		}
 		self.ensure_capacity(additional)?;
 		for (global, local, has_overlay, class_id, kind, posting_bytes) in removals {
+			if kind == AtomKind::Edge {
+				let record = self
+					.working
+					.atom(global)
+					.ok_or_else(|| {
+						FerrosGrynnError::bridge_mapping_error("deleted occurrence atom is absent")
+					})?
+					.record_id()
+					.clone();
+				self.admit_bridge_tombstones(&crate::bridge::BridgeMappingSubject::Relation {
+					graph,
+					edge: record,
+				})?;
+			}
 			self.working.detach(graph, global)?.ok_or_else(|| {
 				FerrosGrynnError::atom_does_not_exist("occurrence", global.to_string())
 			})?;

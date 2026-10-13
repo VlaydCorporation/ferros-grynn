@@ -6878,8 +6878,8 @@ Live-запросы и changefeed ([§21](#21-события-и-live-запро�
 При создании запроса к Ferros-Grynn можно использовать метод `.use_bridge<B: Bridge>(bridge: B, data: BridgeData)`, в который передаётся инстанс моста
 и данные, представленные перечислением `BridgeData`.
 
-Инстанс моста индивидуален для каждой БД, с которой может соединяться Ferros-Grynn, реализует `Bridge trait` 
-и имеет возможности подключаться к своей БД всеми доступными для этой БД способами (локальное хранилище, подключение по сети и т.д.).
+Инстанс моста индивидуален для внешней БД и реализует открытый `Bridge` trait.
+Этап 30 включает embedded SurrealDB Mem/RocksDB; network transport не реализуется.
 
 Перечисление `BridgeData` имеет следующие варианты:
 
@@ -6906,11 +6906,42 @@ enum BridgeData<'a> {
 
 Это мост к SurrealDB.
 
+Этап 30 уточняет нормативную границу: atoms, RecordId и topology принадлежат
+Ferros-Grynn. Внешняя БД хранит property-records и relation recipes, сопоставленные
+локальным сущностям; cross-database atoms не вводятся. Operation-level
+`WITH BRIDGE alias` использует named runtime adapter, подключённый через Rust API.
+InternalQuery допускает только чтение, включая транзитивные UDF effects. Без
+mapping source result связывается с `$bridge`; mapping принимает Object и
+сопоставляет его поля с типизированными параметрами receiving query.
+
+Mappings принадлежат datastore, участвуют в MVCC/WAL/checkpoint и имеют отдельные
+роли для global atom properties и graph occurrence relation. Обе стороны
+уникальны в пределах external database и role. Pending резервирует стороны,
+Ready подтверждает действие, Tombstoned сохраняет диагностику удалённого subject.
+Mapping reference содержит datastore UUID и не переиспользуемый MappingId.
+
+`RELATE ... IN GRAPH g WITH BRIDGE alias` атомарно создаёт local incidence и
+Pending intent. После local commit bridge создаёт external relation с заранее
+зарезервированной identity, не создавая endpoint records. Внешний сбой оставляет
+Pending и возвращается отдельно от local result. Явный resume проверяет либо
+создаёт запись, затем подтверждает Ready; он не повторяет local RELATE/Events.
+Общая транзакция двух БД и автоматические background retries отсутствуют.
+
+`FETCH path WITH BRIDGE alias` выполняется до ORDER/pagination и сохраняет local
+record. Внешние свойства помещаются в `external[alias]` вместе с database identity
+и mapping reference. Local id/topology/properties не перезаписываются.
+RETURN/BUILD GRAPH разрешают external relation recipes в существующие local
+atoms через mapping и используют общий assembler/family validators. Отсутствующий
+atom требует явного импорта; named BUILD не создаёт global atoms.
+
+Полный контракт, lifecycle и acceptance matrix:
+[gql_bridges_stage_30_plan.md](gql_bridges_stage_30_plan.md).
+
 Помимо базового функционала моста, `SurrealBridge` расширяет операторы:
 - `RETURN GRAPH`, `BUILD GRAPH`: строит графы из внешних relation-записей SurrealDB
-  формата `{ id, in, out }`; class каждого внешнего `RecordId` переводится в
-  явный Ferros-Grynn `CLASS` по bridge mapping, а не становится внутренней TABLE-моделью;
-- `RELATE`: создаёт внешнюю relation-запись SurrealDB, но не создаёт сами endpoint-сущности;
+  формата `{ id, in, out }`; bidirectional mapping разрешает каждую внешнюю
+  identity в существующий локальный atom и нужную graph occurrence;
+- `RELATE` с явным `WITH BRIDGE`: после локального commit создаёт внешнюю relation-запись SurrealDB, но не создаёт сами endpoint-сущности;
   внутри Ferros-Grynn её identity по-прежнему задаётся `RecordId = class:id`.
 
 ## 31. Соответствие кодовой базе

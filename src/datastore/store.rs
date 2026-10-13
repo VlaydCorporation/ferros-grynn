@@ -501,6 +501,7 @@ impl Datastore {
 				datastore_handles: AtomicUsize::new(1),
 				current: RwLock::new(Arc::new(root)),
 				commit: Mutex::new(()),
+				bridge_adapters: RwLock::new(std::collections::BTreeMap::new()),
 				live_consumers: super::live_queue::Consumers::default(),
 				query_scratch_root,
 				quarantines: Mutex::new(std::collections::BTreeMap::new()),

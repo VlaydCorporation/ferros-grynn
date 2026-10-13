@@ -1,5 +1,7 @@
 //! Local durability owner for the normalized AtomStore and graph spaces.
 
+/// Correspondence files share ordinary publication and recovery.
+mod bridge;
 mod catalog;
 mod changefeed;
 /// Pinned whole-commit reading and metadata-only coverage preflight.
@@ -204,6 +206,12 @@ pub(crate) struct LocalStore {
 }
 
 impl LocalStore {
+	/// Returns already accepted mapping roots without loading any record
+	/// payload.
+	pub(crate) fn bridge_binding(&self) -> Option<crate::storage::BridgeCatalogBinding> {
+		self.state.lock()._database_catalog.bridges
+	}
+
 	/// Captures effective budgets and cumulative pressure without exposing
 	/// physical file identities.
 	pub(crate) fn runtime_status(&self, options: LocalOptions) -> LocalStorageStatus {
@@ -626,6 +634,8 @@ impl LocalStore {
 			.iter()
 			.any(|entry| changefeed::fresh_live_groups(database, entry.id).next().is_some());
 		let refresh_files = capture
+			|| database.bridges.generation
+				!= state._database_catalog.bridges.map_or(0, |binding| binding.generation)
 			|| live_capture
 			|| !database.live_catalog().prepared_graphs.is_empty()
 			|| database.live_catalog().graph_segments != state.live_graph_segments
@@ -633,6 +643,7 @@ impl LocalStore {
 			|| database.changefeed_segments() != &state.changefeed_segments
 			|| database.live_segments() != &state.live_segments;
 		let mut feed_files = Vec::new();
+		let mut pending_mappings = None;
 		let mut file_catalog = None;
 		let mut segments = None;
 		let mut live_segments = None;
@@ -640,6 +651,13 @@ impl LocalStore {
 		let mut event_segments = None;
 		if refresh_files {
 			let mut files = state.file_catalog.clone();
+			pending_mappings = bridge::prepare_catalog(
+				database,
+				&mut files,
+				&mut catalog,
+				&mut feed_files,
+				&self.root,
+			)?;
 			changefeed::prepare(
 				database,
 				&state.file_catalog,
@@ -662,6 +680,8 @@ impl LocalStore {
 			event_segments = Some(std::sync::Arc::new(catalog.event_outbox_segments.clone()));
 			file_catalog = Some(files);
 		}
+		#[cfg(test)]
+		inject_generation_failure(GenerationFailurePoint::AfterBuild)?;
 		let mut tx = self.wal.begin_tx()?;
 		if let Some(image) = &dictionary_image {
 			stage_pages(
@@ -687,6 +707,8 @@ impl LocalStore {
 		let mut pending_feeds = cleanup::PendingChangefeedFiles::new(&self.root, &feed_files)?;
 		let registry = if let Some(files) = &file_catalog {
 			create_file_images(&self.root, &feed_files, false, false)?;
+			#[cfg(test)]
+			inject_generation_failure(GenerationFailurePoint::AfterFileSync)?;
 			Some(FileRegistry::open(
 				files.registrations(&self.root),
 				self.io.file_open_mode(),
@@ -708,12 +730,30 @@ impl LocalStore {
 			Vec::new()
 		};
 		prepare_feed_retirement(&mut state, retired_feeds.len(), feed_pins.is_some())?;
+		let retired_mappings = match &file_catalog {
+			Some(files) => {
+				RetiredGeneration::between(&self.root, &state.file_catalog, files, &state.registry)?
+			}
+			None => None,
+		};
+		prepare_generation_retirement(&mut state, retired_mappings.as_ref())?;
+		#[cfg(test)]
+		{
+			inject_generation_failure(GenerationFailurePoint::AfterCatalogStage)?;
+			inject_generation_failure(GenerationFailurePoint::BeforeWalCommit)?;
+		}
 		pending_feeds.preserve_for_recovery();
+		if let Some(cleanup) = &mut pending_mappings {
+			cleanup.preserve_for_recovery();
+		}
 		let outcome = self.wal.commit_tx(tx)?;
 		if outcome.commit_ts().get() != database.commit_ts {
 			return Err(invalid("WAL published an unexpected logical commit timestamp"));
 		}
 		state._database_catalog = catalog;
+		if let Some(retired) = retired_mappings {
+			state.retired_generations.push(retired);
+		}
 		if let Some(files) = file_catalog {
 			state.file_catalog = files;
 		}
@@ -940,6 +980,9 @@ impl LocalStore {
 		}
 		if let Some(generation) = &mut unpublished {
 			generation.preserve_for_recovery();
+		}
+		if let Some(cleanup) = &mut generation.mapping_cleanup {
+			cleanup.preserve_for_recovery();
 		}
 		pending_feeds.preserve_for_recovery();
 		if let Some(artifact) = quarantine.as_deref_mut() {

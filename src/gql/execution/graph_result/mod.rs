@@ -135,7 +135,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 			Some(&graph.edges),
 			graph.root.as_ref(),
 			|expression| {
-				select::eval_row_expression(
+				let value = select::eval_row_expression(
 					read,
 					snapshot,
 					expression,
@@ -143,7 +143,13 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 					slots,
 					source,
 					self.control,
-				)
+				)?;
+				match graph.bridge.as_deref() {
+					Some(alias) => {
+						super::bridge::recipes(read, snapshot, value, alias, self.control)
+					}
+					None => Ok(value),
+				}
 			},
 		)
 	}
@@ -597,7 +603,13 @@ pub(super) fn execute_return_graph<Read: QueryRead>(
 		Some(&plan.nodes),
 		Some(&plan.edges),
 		plan.root.as_ref(),
-		|expression| eval(expression, None, slots, source, None, Some(control)),
+		|expression| {
+			let value = eval(expression, None, slots, source, None, Some(control))?;
+			match plan.bridge.as_deref() {
+				Some(alias) => super::bridge::recipes(read, snapshot, value, alias, control),
+				None => Ok(value),
+			}
+		},
 	)?;
 	assembly.finish(read, snapshot, plan.contract).map(|graph| Value::Graph(Box::new(graph)))
 }
@@ -660,6 +672,9 @@ fn execute_select_graph_from_root<Read: QueryRead>(
 	let plan = template;
 	let graph =
 		plan.return_graph.as_ref().ok_or_else(|| invalid("SELECT graph terminal is absent"))?;
+	if let Some(alias) = &graph.bridge {
+		super::bridge::resolve(read, snapshot, alias, control, false)?;
+	}
 	let (bound, root_hint) =
 		select::bind_terminal_graph_scope(read, snapshot, plan, slots, source, control, outer)?;
 	let plan = bound.as_ref();
@@ -775,12 +790,26 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 	};
 	let mut assembly =
 		GraphAssemblyAccumulator::new(root_hint, plan.limit_nodes, plan.limit_edges, control);
+	let recipe_root = if plan.bridge.is_some() {
+		read.bridge_recipe_reads(snapshot)?;
+		Some(read.snapshot_root(snapshot)?)
+	} else {
+		None
+	};
+	let observe_recipe = |_key| {};
+	let recipe_work = |_amount| control.check();
+	let recipe_read = recipe_root.as_ref().map(|root| {
+		RootRead::new(root, control, &observe_recipe, &recipe_work, read.query_scratch_root())
+	});
 	match &plan.source {
 		LogicalBuildGraphSource::Expression(expression) => {
 			assembly.record_source_row();
-			assembly.add_auto(eval_query_expression(
-				read, expression, slots, source, control, runtime,
-			)?)?;
+			let value = eval_query_expression(read, expression, slots, source, control, runtime)?;
+			let value = match plan.bridge.as_deref() {
+				Some(alias) => super::bridge::recipes(read, snapshot, value, alias, control)?,
+				None => value,
+			};
+			assembly.add_auto(value)?;
 			if let Some(root) = &plan.root {
 				assembly.add_root(eval_query_expression(
 					read, root, slots, source, control, runtime,
@@ -790,6 +819,8 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 		LogicalBuildGraphSource::Match(statement) => {
 			let mut consume = |value| {
 				consume_query_value(
+					Some(read),
+					snapshot,
 					&mut assembly,
 					value,
 					&statement.result,
@@ -824,13 +855,25 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 				None,
 				None,
 				|value| {
-					consume_query_value(&mut assembly, value, &schema, plan, slots, source, control)
+					consume_query_value(
+						Some(read),
+						snapshot,
+						&mut assembly,
+						value,
+						&schema,
+						plan,
+						slots,
+						source,
+						control,
+					)
 				},
 			)?;
 		}
 		LogicalBuildGraphSource::Traverse(statement) => {
 			let mut consume = |value| {
 				consume_query_value(
+					recipe_read.as_ref(),
+					snapshot,
 					&mut assembly,
 					value,
 					&statement.result,
@@ -862,7 +905,10 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 		.map(|reference| Value::GraphRef(Box::new(reference)))
 }
 
-fn consume_query_value(
+/// Resolves optional external recipes before using the shared graph assembler.
+fn consume_query_value<Read: QueryRead>(
+	read: Option<&Read>,
+	snapshot: Snapshot,
 	assembly: &mut GraphAssemblyAccumulator<'_>,
 	value: Value,
 	schema: &Schema,
@@ -874,7 +920,17 @@ fn consume_query_value(
 	control.check()?;
 	assembly.record_source_row();
 	if plan.nodes.is_none() && plan.edges.is_none() {
-		assembly.add_auto(value.clone())?;
+		let value = match plan.bridge.as_deref() {
+			Some(alias) => super::bridge::recipes(
+				read.ok_or_else(|| invalid("bridge recipe reader is absent"))?,
+				snapshot,
+				value.clone(),
+				alias,
+				control,
+			)?,
+			None => value.clone(),
+		};
+		assembly.add_auto(value)?;
 	}
 	let value_mode =
 		matches!(&plan.source, LogicalBuildGraphSource::Select(select) if select.value);
@@ -883,7 +939,19 @@ fn consume_query_value(
 		plan.nodes.as_ref(),
 		plan.edges.as_ref(),
 		plan.root.as_ref(),
-		|expression| eval(expression, Some(&row), slots, source, None, Some(control)),
+		|expression| {
+			let value = eval(expression, Some(&row), slots, source, None, Some(control))?;
+			match plan.bridge.as_deref() {
+				Some(alias) => super::bridge::recipes(
+					read.ok_or_else(|| invalid("bridge recipe reader is absent"))?,
+					snapshot,
+					value,
+					alias,
+					control,
+				),
+				None => Ok(value),
+			}
+		},
 	)
 }
 

@@ -42,6 +42,7 @@ pub struct GraphContract {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ReturnGraph {
+	pub bridge: Option<Box<BridgeClause>>,
 	pub contract: Option<GraphContract>,
 	pub root: Option<Expr>,
 	pub nodes: Expr,
@@ -63,6 +64,7 @@ pub enum BuildGraphSource {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct BuildGraphStatement {
+	pub bridge: Option<Box<BridgeClause>>,
 	pub mode: DefinitionMode,
 	pub contract: Option<GraphContract>,
 	pub name: Option<Identifier>,
@@ -96,7 +98,9 @@ impl Parser<'_> {
 		self.expect_symbol(Symbol::Colon, "Expected `:` after RETURN GRAPH edges.")?;
 		let edges = context.run(|context| self.expression(context, 0, 1, 0)).await?;
 		let close = self.close(Symbol::RightBrace, open.span, "`}`")?;
+		let bridge = self.bridge_clause()?.map(Box::new);
 		Ok(ReturnGraph {
+			bridge,
 			contract,
 			root,
 			nodes,
@@ -124,6 +128,7 @@ impl Parser<'_> {
 		let mut limit_nodes = None;
 		let mut limit_edges = None;
 		let mut timeout = None;
+		let mut bridge = None;
 		while !self.at_statement_end() && !self.at_symbol(Symbol::RightParen) {
 			if self.consume_keyword(keywords::ROOT).is_some() {
 				if root.is_some() {
@@ -165,6 +170,14 @@ impl Parser<'_> {
 						self.current().span,
 					));
 				}
+			} else if self.at_keyword(keywords::WITH) {
+				if bridge.is_some() {
+					return Err(self.syntax(
+						"BUILD GRAPH WITH BRIDGE may appear only once.",
+						self.current().span,
+					));
+				}
+				bridge = self.bridge_clause()?.map(Box::new);
 			} else if self.consume_keyword(keywords::TIMEOUT).is_some() {
 				if timeout.replace(self.timeout_value()?).is_some() {
 					return Err(self.syntax(
@@ -177,6 +190,7 @@ impl Parser<'_> {
 			}
 		}
 		Ok(BuildGraphStatement {
+			bridge,
 			mode,
 			contract,
 			name,

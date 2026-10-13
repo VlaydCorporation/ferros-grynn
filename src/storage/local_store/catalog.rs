@@ -323,6 +323,7 @@ pub(super) fn encode_database_catalog(
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 
 	Ok(DatabaseCatalog {
+		bridges: root.bridges.physical,
 		event_outbox_segments: root.event_outbox_segments().as_ref().clone(),
 		events: root.schema.events().map(|event| event.as_ref().clone()).collect(),
 		database_uuid: root.database_uuid,
@@ -453,7 +454,9 @@ pub(super) fn encode_database_catalog(
 			})
 			.collect(),
 		next_graph_id: root.schema.next_graph_id,
-		next_schema_id: root.schema.next_schema_id,
+		next_schema_id: root.schema.next_schema_id.max(
+			root.bridges.databases.keys().map(|id| u64::from(id.get()) + 1).max().unwrap_or(1),
+		),
 		time_zones: context.time_zone_names().cloned().collect(),
 		atom_store,
 		classes,

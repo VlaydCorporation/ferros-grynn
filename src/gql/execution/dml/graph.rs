@@ -61,6 +61,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			Ok(Value::None)
 		}
 		LogicalGraphDmlStatement::Relate {
+			bridge,
 			atom_endpoints,
 			source: source_target,
 			edge,
@@ -71,6 +72,20 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			weight,
 			keep_levelpath,
 		} => {
+			if let Some(alias) = bridge.as_deref() {
+				let scope = control.bridge_scope.as_ref().ok_or_else(|| {
+					FerrosGrynnError::bridge_operation_error(
+						"WITH BRIDGE requires Datastore::query",
+					)
+				})?;
+				let (database, capabilities) = scope.resolve(alias)?;
+				if !capabilities.mirror {
+					return Err(FerrosGrynnError::bridge_operation_error(
+						"adapter cannot mirror relations",
+					));
+				}
+				database.graph_table(graph.id())?;
+			}
 			let source_local = relate_endpoint(
 				transaction,
 				snapshot,
@@ -91,6 +106,59 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 				source,
 				control,
 			)?;
+			let mirror = bridge
+				.as_deref()
+				.map(|alias| {
+					let scope = control.bridge_scope.as_ref().ok_or_else(|| {
+						FerrosGrynnError::bridge_operation_error(
+							"WITH BRIDGE requires Datastore::query",
+						)
+					})?;
+					let (database, capabilities) = scope.resolve(alias)?;
+					if !capabilities.mirror {
+						return Err(FerrosGrynnError::bridge_operation_error(
+							"adapter cannot mirror relations",
+						));
+					}
+					let registered = transaction.bridge_database(alias)?.ok_or_else(|| {
+						FerrosGrynnError::bridge_mapping_error("bridge database is absent")
+					})?;
+					if registered != *database {
+						return Err(FerrosGrynnError::bridge_mapping_error(
+							"bridge metadata differs from transaction",
+						));
+					}
+					let table = database.graph_table(graph.id())?.clone();
+					let endpoint = |endpoint: &EdgeEndpoint, transaction: &mut Transaction| {
+						let subject = transaction.bridge_endpoint_subject(graph.id(), endpoint)?;
+						let mapping =
+							transaction.bridge_mapping_local(database.reference(), &subject)?;
+						let mapping = match mapping {
+							Some(mapping) => Some(mapping),
+							None => transaction.bridge_mapping_local(
+								database.reference(),
+								&crate::bridge::BridgeMappingSubject::Atom(
+									subject.record().clone(),
+								),
+							)?,
+						}
+						.ok_or_else(|| {
+							FerrosGrynnError::bridge_mapping_error(
+								"RELATE endpoint mapping is absent",
+							)
+						})?;
+						if mapping.state() != crate::bridge::BridgeMappingState::Ready {
+							return Err(FerrosGrynnError::bridge_mapping_error(
+								"RELATE endpoint mapping is not Ready",
+							));
+						}
+						Ok(mapping.external().record.clone())
+					};
+					let source = endpoint(&source_local, transaction)?;
+					let target = endpoint(&target_local, transaction)?;
+					Ok::<_, FerrosGrynnError>((database, table, source, target))
+				})
+				.transpose()?;
 			let edge_record = edge
 				.key
 				.as_ref()
@@ -187,6 +255,49 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			}
 			if transaction.validates_import_constraints_immediately() {
 				transaction.validate_graph_family(graph)?;
+			}
+			if let Some((database, table, source_endpoint, target_endpoint)) = mirror {
+				let subject = crate::bridge::BridgeMappingSubject::Relation {
+					graph: graph.id(),
+					edge: edge_record.clone(),
+				};
+				let existing = transaction.bridge_mapping_local(database.reference(), &subject)?;
+				let relation = match &existing {
+					Some(row) => row.external().record.clone(),
+					None => RecordId::new(
+						table,
+						crate::values::RecordIdPart::Uuid(uuid::Uuid::now_v7().into()),
+					)?,
+				};
+				let mut properties = after.clone();
+				for name in ["id", "in", "out"] {
+					properties.remove(name);
+				}
+				let intent = crate::bridge::BridgeMirrorRequest {
+					relation: relation.clone(),
+					source: source_endpoint,
+					target: target_endpoint,
+					properties,
+				};
+				let reference = transaction.reserve_bridge_mapping(
+					subject,
+					crate::bridge::BridgeEntityRef {
+						database: database.reference(),
+						record: relation,
+					},
+					intent,
+				)?;
+				let scope = control.bridge_scope.as_ref().ok_or_else(|| {
+					FerrosGrynnError::bridge_operation_error("bridge scope is absent")
+				})?;
+				let mut pending = scope.pending.lock();
+				if !pending.contains(&reference) {
+					scope.context.admit_bytes(
+						2 * std::mem::size_of::<crate::bridge::BridgeMappingRef>()
+							+ std::mem::size_of::<crate::bridge::BridgeEffectOutcome>(),
+					)?;
+					pending.push(reference);
+				}
 			}
 			graph_result(
 				transaction,

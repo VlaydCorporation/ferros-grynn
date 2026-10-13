@@ -118,6 +118,9 @@ pub fn execute_transaction_with_options(
 			closures.clone(),
 		)
 		.with_publication_deferred(true);
+		if options.bridge_read_only {
+			control = control.closure_scope(crate::gql::ir::ClosureEffect::StableRead)?;
+		}
 		let mutable_bindings = transaction
 			.gql_bindings()
 			.keys()
@@ -394,6 +397,44 @@ impl QueryRead for TransactionRead<'_> {
 	where
 		Self: 'a;
 	type Savepoint = crate::datastore::TransactionSavepoint;
+
+	fn bridge_recipe_reads(&self, snapshot: Snapshot) -> FerrosGrynnResult<()> {
+		let root = self.snapshot_root(snapshot)?;
+		self.transaction.query_bridge_recipe_reads(&root);
+		Ok(())
+	}
+
+	fn bridge_mapping(
+		&self,
+		snapshot: Snapshot,
+		database: crate::bridge::BridgeDatabaseRef,
+		subject: &crate::bridge::BridgeMappingSubject,
+	) -> FerrosGrynnResult<Option<crate::bridge::BridgeMapping>> {
+		self.snapshot_root(snapshot)?;
+		self.transaction.query_bridge_domain(database.id, subject.role());
+		Ok(self
+			.snapshot
+			.logical_root()
+			.bridges
+			.local(database.id, subject)
+			.map(|row| row.as_ref().clone()))
+	}
+
+	fn bridge_inverse(
+		&self,
+		snapshot: Snapshot,
+		entity: &crate::bridge::BridgeEntityRef,
+		role: crate::bridge::BridgeMappingRole,
+	) -> FerrosGrynnResult<Option<crate::bridge::BridgeMapping>> {
+		self.snapshot_root(snapshot)?;
+		self.transaction.query_bridge_domain(entity.database.id, role);
+		Ok(self
+			.snapshot
+			.logical_root()
+			.bridges
+			.external(entity, role)
+			.map(|row| row.as_ref().clone()))
+	}
 
 	fn live_info(
 		&self,

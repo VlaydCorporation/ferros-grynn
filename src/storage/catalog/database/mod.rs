@@ -223,6 +223,8 @@ pub(in crate::storage) struct FunctionCatalogEntry {
 /// Canonical `FGDC v12` payload independent of physical catalog pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct DatabaseCatalog {
+	/// Independent correspondence heap and lookup-tree roots.
+	pub(in crate::storage) bridges: Option<crate::storage::BridgeCatalogBinding>,
 	/// Authoritative ordered checkpoint/delta segments for accepted
 	/// invocations.
 	pub(in crate::storage) event_outbox_segments: Vec<crate::storage::HistorySegment>,

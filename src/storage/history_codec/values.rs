@@ -169,7 +169,7 @@ pub(in crate::storage) fn property(
 
 /// Admits clones, conversion, dictionary growth and canonical encode scratch.
 /// The per-node reservation includes temporary set ordering buffers.
-fn prepare(
+pub(in crate::storage) fn prepare(
 	value: &Value,
 	context: &mut EncodeContext,
 	budget: &mut CodecBudget,

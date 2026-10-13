@@ -1073,6 +1073,7 @@ impl<'a> Analyzer<'a> {
 			|message, span| self.semantic(message, span),
 		)?;
 		Ok(LogicalGraphDmlStatement::Relate {
+			bridge: statement.bridge.as_ref().map(|clause| clause.alias.value.clone()),
 			atom_endpoints: statement.atom_endpoints,
 			source,
 			edge: LogicalRelateEdge {
@@ -1433,6 +1434,7 @@ impl<'a> Analyzer<'a> {
 			return Err(self.semantic("RETURN GRAPH ROOT requires ROOTED_TREE.", span));
 		}
 		Ok(LogicalReturnGraph {
+			bridge: graph.bridge.as_ref().map(|clause| clause.alias.value.clone()),
 			contract,
 			root: graph.root.as_ref().map(|root| self.expr(root, schema)).transpose()?,
 			nodes: self.expr(&graph.nodes, schema)?,
@@ -1500,6 +1502,7 @@ impl<'a> Analyzer<'a> {
 		}
 		let schema = schema.as_ref();
 		Ok(LogicalBuildGraph {
+			bridge: build.bridge.as_ref().map(|clause| clause.alias.value.clone()),
 			mode: build.mode,
 			contract,
 			contract_explicit: build.contract.is_some(),
@@ -4069,6 +4072,7 @@ impl<'a> Analyzer<'a> {
 				result,
 				omit: Vec::new(),
 				fetch: Vec::new(),
+				fetch_bridges: None,
 				order: Vec::new(),
 				start: None,
 				limit: None,
@@ -4304,7 +4308,25 @@ impl<'a> Analyzer<'a> {
 						span: order.expression.span,
 					}
 				} else {
-					self.select_expr(&order.expression, Some(&input_schema), true, 0)?
+					if statement.fetch_bridges.is_some() {
+						let mut schema = input_schema.clone();
+						for column in &mut schema.columns {
+							if result.index_of(&column.name).is_some() {
+								column.name = "".into();
+							}
+						}
+						let offset = schema.columns.len();
+						schema.columns.extend(result.columns.iter().cloned());
+						schema.origins.extend(
+							result
+								.origins
+								.iter()
+								.map(|(index, origin)| (offset + *index, origin.clone())),
+						);
+						self.select_expr(&order.expression, Some(&schema), true, 0)?
+					} else {
+						self.select_expr(&order.expression, Some(&input_schema), true, 0)?
+					}
 				};
 				Ok(LogicalOrder {
 					expression,
@@ -4440,6 +4462,12 @@ impl<'a> Analyzer<'a> {
 				.iter()
 				.map(|path| path.segments.iter().map(|part| part.value.clone()).collect())
 				.collect(),
+			fetch_bridges: statement.fetch_bridges.as_ref().map(|clauses| {
+				clauses
+					.iter()
+					.map(|clause| clause.as_ref().map(|clause| clause.alias.value.clone()))
+					.collect()
+			}),
 			order,
 			start,
 			limit,

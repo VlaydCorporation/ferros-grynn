@@ -4,6 +4,7 @@
 )]
 
 mod adapter;
+mod bridge;
 mod builtins;
 mod changefeed;
 mod collation;
@@ -533,6 +534,10 @@ fn execute_statement<Read: QueryRead>(
 			"nesting depth",
 			u64::from(control.max_control_depth),
 		));
+	}
+	if control.effect_is_limited() {
+		let _admitted_effect =
+			control.closure_scope(super::analysis::logical_statement_effect(statement))?;
 	}
 	let value = match statement {
 		LogicalStatement::SetBinding {

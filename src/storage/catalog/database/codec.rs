@@ -51,9 +51,9 @@ use crate::{
 
 const MAGIC: [u8; 4] = *b"FGDC";
 /// Current development layout; older catalogs are deliberately rejected.
-const VERSION: u16 = 14;
-/// Fixed header including the source-only EVENT descriptor count.
-const HEADER_BYTES: usize = 144;
+const VERSION: u16 = 15;
+/// Fixed header including EVENT counts and independent bridge generation roots.
+const HEADER_BYTES: usize = 248;
 /// Independent cap for the complete logical database catalog.
 pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
@@ -83,6 +83,17 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	write_u32(&mut output, catalog.live_history.len(), "LIVE history count")?;
 	write_u32(&mut output, catalog.events.len(), "EVENT count")?;
 	write_u32(&mut output, catalog.event_outbox_segments.len(), "EVENT outbox segment count")?;
+	if let Some(binding) = catalog.bridges {
+		output.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+		output.extend_from_slice(&binding.generation.to_le_bytes());
+		output.extend_from_slice(binding.directory.as_bytes());
+		output.extend_from_slice(&binding.count.to_le_bytes());
+		for root in [binding.heap, binding.primary, binding.direct, binding.reverse] {
+			write_binding(&mut output, root);
+		}
+	} else {
+		output.extend_from_slice(&[0; 104]);
+	}
 
 	for name in &catalog.time_zones {
 		write_string(&mut output, name.as_str(), "time-zone name")?;
@@ -180,6 +191,31 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	let history_count = decoder.read_count("LIVE history count")?;
 	let event_count = decoder.read_count("EVENT count")?;
 	let outbox_count = decoder.read_count("EVENT outbox segment count")?;
+	let bridge_tag = decoder.read_exact(1)?[0];
+	decoder.expect_zero(7, "bridge catalog reserved bytes")?;
+	let bridges = match bridge_tag {
+		0 => {
+			decoder.expect_zero(96, "absent bridge descriptor")?;
+			None
+		}
+		1 => {
+			let generation = decoder.read_u64()?;
+			let directory = uuid::Uuid::from_slice(decoder.read_exact(16)?).map_err(|error| {
+				invalid("bridge generation UUID is malformed").with_technical_source(error)
+			})?;
+			let count = decoder.read_u64()?;
+			Some(crate::storage::BridgeCatalogBinding {
+				generation,
+				directory,
+				count,
+				heap: read_binding_kind(&mut decoder, DataFileKind::BridgeMappings)?,
+				primary: read_binding_kind(&mut decoder, DataFileKind::BridgeMappings)?,
+				direct: read_binding_kind(&mut decoder, DataFileKind::BridgeMappings)?,
+				reverse: read_binding_kind(&mut decoder, DataFileKind::BridgeMappings)?,
+			})
+		}
+		_ => return Err(invalid("unknown bridge catalog descriptor tag")),
+	};
 	if changefeed_count > bytes.len().saturating_sub(HEADER_BYTES) / super::changefeed::MIN_BYTES {
 		return Err(invalid("changefeed count exceeds its encoded payload"));
 	}
@@ -324,6 +360,7 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	}
 	decoder.finish()?;
 	let catalog = DatabaseCatalog {
+		bridges,
 		event_outbox_segments,
 		events,
 		database_uuid,
@@ -1137,10 +1174,18 @@ fn write_binding(output: &mut Vec<u8>, binding: PhysicalIndexBinding) {
 }
 
 fn read_binding(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<PhysicalIndexBinding> {
+	read_binding_kind(decoder, DataFileKind::Index)
+}
+
+/// Validates an exact physical binding against its catalog file kind.
+fn read_binding_kind(
+	decoder: &mut Decoder<'_>,
+	kind: DataFileKind,
+) -> FerrosGrynnResult<PhysicalIndexBinding> {
 	let file_id = DataFileId::from_raw(decoder.read_u64()?)
 		.ok_or_else(|| invalid("catalog binding contains an unknown file identity"))?;
 	let root = PageNo::new(decoder.read_u64()?);
-	if file_id.kind() != Some(DataFileKind::Index) || root == PageNo::NULL {
+	if file_id.kind() != Some(kind) || root == PageNo::NULL {
 		return Err(invalid("catalog index binding is invalid"));
 	}
 	Ok(PhysicalIndexBinding {

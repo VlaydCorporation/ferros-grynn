@@ -4,6 +4,10 @@ use crate::graph::{AtomId, AtomKind, GraphId};
 /// Independently versioned logical targets used by FCW and SSI validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ConflictKey {
+	/// Registered external database namespace and alias lookups.
+	BridgeDatabases,
+	/// Exact reservation/confirmation domain; no lossy uniqueness-key hashes.
+	BridgeMappings(crate::bridge::BridgeDatabaseId, crate::bridge::BridgeMappingRole),
 	/// Append-only property-name dictionary revision.
 	PropertyDictionary,
 	/// One named graph definition, including catalog-owned properties.

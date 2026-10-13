@@ -225,16 +225,15 @@ impl FileRegistry {
 		self.files.iter().map(|(key, file)| (*key, file.clone())).collect()
 	}
 
-	/// Returns non-owning markers for every file in the current physical
-	/// generation. A retired generation remains pinned while any exact physical
-	/// snapshot can still upgrade one of these markers.
-	pub(super) fn retirement_markers(&self) -> Vec<Weak<RegisteredDataFile>> {
+	/// Pins only replaced directories, independently of retained statistics.
+	pub(super) fn directory_markers(
+		&self,
+		directories: &[std::path::PathBuf],
+	) -> Vec<Weak<RegisteredDataFile>> {
 		self.files
-			.iter()
-			.filter(|((_, file), _)| {
-				!matches!(file.kind(), Some(DataFileKind::Changefeed | DataFileKind::EventOutbox))
-			})
-			.map(|(_, file)| Arc::downgrade(file))
+			.values()
+			.filter(|file| directories.iter().any(|directory| file.path().starts_with(directory)))
+			.map(Arc::downgrade)
 			.collect()
 	}
 

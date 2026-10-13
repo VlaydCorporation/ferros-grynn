@@ -1480,6 +1480,30 @@ define_status_codes!(
 			operation: String => StringLiteral,
 		},
 	},
+	BridgeMappingError, "FG-22B00" => {
+		kind: Error {
+			classification: ErrorClassification::ClientError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::DataException,
+		domain: Domain::External,
+		subcondition: "invalid database correspondence",
+		message: "{message}",
+		params: { message: String => DisplayValue, },
+	},
+	BridgeOperationError, "FG-50B00" => {
+		kind: Error {
+			classification: ErrorClassification::DatabaseError,
+			category: ErrorCategory::Runtime,
+			severity: Severity::Error,
+		},
+		condition: Condition::GeneralProcessingException,
+		domain: Domain::External,
+		subcondition: "database bridge operation failed",
+		message: "{message}",
+		params: { message: String => DisplayValue, },
+	},
 	ArrowPropertyBatchFailure, "FG-50F01" => {
 		kind: Error {
 			classification: ErrorClassification::DatabaseError,

@@ -93,7 +93,13 @@ impl InstallBuiltGraphTree {
 		if self.create_root {
 			root.install_graph(self.root_schema.clone(), published_at)?;
 		} else {
-			clear_graph(root, self.root())?;
+			let retained = self
+				.graphs
+				.iter()
+				.find(|graph| graph.graph == self.root())
+				.map(|graph| graph.edges.iter().map(|edge| edge.global).collect::<BTreeSet<_>>())
+				.unwrap_or_else(BTreeSet::new);
+			clear_graph(root, self.root(), &retained)?;
 			for child in &self.removed_children {
 				root.remove_graph(*child)?;
 			}
@@ -351,7 +357,17 @@ impl Transaction {
 			}
 		}
 		for child in &mutation.removed_children {
+			self.admit_bridge_graph_removal(*child, None)?;
 			self.remove_source_events(crate::datastore::EventTarget::Graph(*child))?;
+		}
+		if !mutation.create_root {
+			let retained = mutation
+				.graphs
+				.iter()
+				.find(|graph| graph.graph == mutation.root())
+				.map(|graph| graph.edges.iter().map(|edge| edge.global).collect::<BTreeSet<_>>())
+				.unwrap_or_else(BTreeSet::new);
+			self.admit_bridge_graph_removal(mutation.root(), Some(&retained))?;
 		}
 		self.register_built_graph_write_set(&mutation)?;
 		mutation.apply(&mut self.working, self.snapshot.commit_ts)?;
@@ -556,7 +572,12 @@ fn collect_children(
 	Ok(())
 }
 
-fn clear_graph(root: &mut DatabaseRoot, graph: GraphId) -> FerrosGrynnResult<()> {
+/// Clears the previous materialization, preserving retained edge mappings.
+fn clear_graph(
+	root: &mut DatabaseRoot,
+	graph: GraphId,
+	retained: &BTreeSet<GlobalAtomId>,
+) -> FerrosGrynnResult<()> {
 	let occurrences = root
 		.graph(graph)
 		.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?
@@ -564,7 +585,12 @@ fn clear_graph(root: &mut DatabaseRoot, graph: GraphId) -> FerrosGrynnResult<()>
 		.map(|occurrence| occurrence.global_id())
 		.collect::<Vec<_>>();
 	for global in occurrences {
-		root.detach(graph, global)?.ok_or_else(|| {
+		let removed = if retained.contains(&global) {
+			root.detach_for_replacement(graph, global)?
+		} else {
+			root.detach(graph, global)?
+		};
+		removed.ok_or_else(|| {
 			FerrosGrynnError::atom_does_not_exist("occurrence", global.to_string())
 		})?;
 	}

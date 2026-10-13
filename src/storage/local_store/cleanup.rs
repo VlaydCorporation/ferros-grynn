@@ -138,9 +138,10 @@ impl RetiredGeneration {
 		if directories.is_empty() {
 			return Ok(None);
 		}
+		let markers = registry.directory_markers(&directories);
 		Ok(Some(Self {
 			directories,
-			markers: registry.retirement_markers(),
+			markers,
 		}))
 	}
 
@@ -183,6 +184,14 @@ pub(super) struct UnpublishedGeneration {
 }
 
 impl UnpublishedGeneration {
+	/// Arms cleanup for one independent immutable mapping generation.
+	pub(super) fn for_mapping(root: &Path, directory: uuid::Uuid) -> Self {
+		Self {
+			directories: vec![root.join("atoms").join(directory.to_string())],
+			armed: true,
+		}
+	}
+
 	/// Arms cleanup before the first streamed side-file is created.
 	pub(super) fn for_database(root: &Path, database: &DatabaseRoot, generation: &str) -> Self {
 		let mut directories = vec![root.join("atoms").join(generation)];

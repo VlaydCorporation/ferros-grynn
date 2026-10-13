@@ -647,6 +647,11 @@ pub(super) fn execute_select_projected_page<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Vec<Value>> {
+	if let Some(aliases) = &plan.fetch_bridges {
+		for alias in aliases.iter().flatten() {
+			super::bridge::resolve(read, snapshot, alias, control, false)?;
+		}
+	}
 	let fields = RecordFields {
 		read,
 		snapshot,
@@ -1072,6 +1077,11 @@ fn visit_select_values_dyn<Read: QueryRead>(
 	maximum: Option<usize>,
 	visit: &mut dyn FnMut(Value) -> FerrosGrynnResult<()>,
 ) -> FerrosGrynnResult<usize> {
+	if let Some(aliases) = &plan.fetch_bridges {
+		for alias in aliases.iter().flatten() {
+			super::bridge::resolve(read, snapshot, alias, control, false)?;
+		}
+	}
 	if let Cow::Owned(normalized) = join_family::collapse(read, plan, slots)? {
 		return visit_select_values_dyn(
 			read,
@@ -2073,7 +2083,8 @@ fn build_projected_value<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<(Value, Vec<Value>)> {
-	let (mut value, projected) = project(read, snapshot, plan, row, group, slots, source, control)?;
+	let (mut value, mut projected) =
+		project(read, snapshot, plan, row, group, slots, source, control)?;
 	for path in &plan.omit {
 		if path.len() > control.max_control_depth as usize {
 			return Err(FerrosGrynnError::control_limit_exceeded(
@@ -2083,14 +2094,31 @@ fn build_projected_value<Read: QueryRead>(
 		}
 		omit_path(read, &mut value, path, control)?;
 	}
-	for path in &plan.fetch {
+	for (index, path) in plan.fetch.iter().enumerate() {
 		if path.len() > control.max_control_depth as usize {
 			return Err(FerrosGrynnError::control_limit_exceeded(
 				"FETCH depth",
 				u64::from(control.max_control_depth),
 			));
 		}
-		fetch_path(read, snapshot, &mut value, path, row.graph.as_ref(), control)?;
+		let alias = plan
+			.fetch_bridges
+			.as_ref()
+			.and_then(|bridges| bridges.get(index))
+			.and_then(Option::as_deref);
+		fetch_path(read, snapshot, &mut value, path, row.graph.as_ref(), alias, control)?;
+	}
+	if plan.fetch_bridges.is_some() {
+		if plan.value {
+			projected = vec![value.clone()];
+		} else if let Value::Object(object) = &value {
+			projected = plan
+				.result
+				.columns
+				.iter()
+				.map(|column| object.get(column.name.as_ref()).cloned().unwrap_or(Value::None))
+				.collect();
+		}
 	}
 	Ok((value, projected))
 }
@@ -3256,6 +3284,7 @@ fn fetch_path<Read: QueryRead>(
 	value: &mut Value,
 	path: &[Box<str>],
 	graph: Option<&GraphRef>,
+	bridge: Option<&str>,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<()> {
 	control.check()?;
@@ -3264,14 +3293,14 @@ fn fetch_path<Read: QueryRead>(
 	}
 	if let Value::Array(values) = value {
 		for value in values {
-			fetch_path(read, snapshot, value, path, graph, control)?;
+			fetch_path(read, snapshot, value, path, graph, bridge, control)?;
 		}
 		return Ok(());
 	}
 	if let Value::Set(values) = value {
 		let mut fetched = crate::values::Set::new();
 		for mut value in std::mem::take(values) {
-			fetch_path(read, snapshot, &mut value, path, graph, control)?;
+			fetch_path(read, snapshot, &mut value, path, graph, bridge, control)?;
 			fetched.insert(value);
 		}
 		*values = fetched;
@@ -3290,9 +3319,9 @@ fn fetch_path<Read: QueryRead>(
 		Some(fields) => fields.copy_value(target)?,
 		None => target.clone(),
 	};
-	*target = fetch_value(read, snapshot, owned, graph, control)?;
+	*target = fetch_value(read, snapshot, owned, graph, bridge, control)?;
 	if !tail.is_empty() {
-		fetch_path(read, snapshot, target, tail, graph, control)?;
+		fetch_path(read, snapshot, target, tail, graph, bridge, control)?;
 	}
 	Ok(())
 }
@@ -3302,9 +3331,15 @@ fn fetch_value<Read: QueryRead>(
 	snapshot: Snapshot,
 	value: Value,
 	graph: Option<&GraphRef>,
+	bridge: Option<&str>,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	control.check()?;
+	if matches!(&value, Value::Array(_) | Value::Set(_))
+		&& let Some(alias) = bridge
+	{
+		super::bridge::prefetch(read, snapshot, &value, graph, alias, control)?;
+	}
 	if let Some(fields) = read.bounded_fields() {
 		fields.work(1)?;
 		let count = match &value {
@@ -3331,14 +3366,18 @@ fn fetch_value<Read: QueryRead>(
 				return Ok(Value::None);
 			};
 			let schema = read.catalog(snapshot).schema(record.class())?;
-			Ok(Value::Object(
-				schema
-					.columns
-					.iter()
-					.zip(row.values)
-					.map(|(column, value)| (column.name.as_ref(), value))
-					.collect(),
-			))
+			let object: Object = schema
+				.columns
+				.iter()
+				.zip(row.values)
+				.map(|(column, value)| (column.name.as_ref(), value))
+				.collect();
+			match bridge {
+				Some(alias) => {
+					super::bridge::fetch(read, snapshot, &record, graph, alias, object, control)
+				}
+				None => Ok(Value::Object(object)),
+			}
 		}
 		Value::GraphRef(reference) => {
 			let rows = read.graph_rows(snapshot, Some(std::slice::from_ref(reference.as_ref())))?;
@@ -3359,14 +3398,32 @@ fn fetch_value<Read: QueryRead>(
 		}
 		Value::Array(values) => values
 			.into_iter()
-			.map(|value| fetch_value(read, snapshot, value, graph, control))
+			.map(|value| fetch_value(read, snapshot, value, graph, bridge, control))
 			.collect::<FerrosGrynnResult<Array>>()
 			.map(Value::Array),
 		Value::Set(values) => values
 			.into_iter()
-			.map(|value| fetch_value(read, snapshot, value, graph, control))
+			.map(|value| fetch_value(read, snapshot, value, graph, bridge, control))
 			.collect::<FerrosGrynnResult<crate::values::Set>>()
 			.map(Value::Set),
+		Value::Object(object) if bridge.is_some() => {
+			if let Some(Value::Record(record)) = object.get("id") {
+				let record = record.as_ref().clone();
+				super::bridge::fetch(
+					read,
+					snapshot,
+					&record,
+					graph,
+					bridge.ok_or_else(|| {
+						FerrosGrynnError::bridge_operation_error("bridge alias is absent")
+					})?,
+					object,
+					control,
+				)
+			} else {
+				Ok(Value::Object(object))
+			}
+		}
 		value => Ok(value),
 	}
 }

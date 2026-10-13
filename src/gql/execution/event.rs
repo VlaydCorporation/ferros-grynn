@@ -270,6 +270,11 @@ fn compile_event_source(
 		.checked_add(EVENT_CONTEXT_PREFIX.len())
 		.ok_or_else(|| FerrosGrynnError::operation_overflow("EVENT compiler source"))?;
 	let _compiler_reservation = cache.admit_compile(source_bytes)?;
+	if crate::syn::has_bridge_clause(source)? {
+		return Err(FerrosGrynnError::query_feature_not_supported(
+			"WITH BRIDGE dependencies in durable EVENT recipes",
+		));
+	}
 	let source = format!("{EVENT_CONTEXT_PREFIX}{source}");
 	let parsed = crate::gql::parse(&source, crate::syn::ParserSettings::default())?;
 	if parsed.statements.len() != 1 {
@@ -279,6 +284,13 @@ fn compile_event_source(
 	}
 	let (mut program, functions) =
 		analyze_event_source(transaction, &source, &parsed, cache, frozen, origin)?;
+	for function in &functions {
+		if crate::syn::has_bridge_clause(function.body())? {
+			return Err(FerrosGrynnError::query_feature_not_supported(
+				"WITH BRIDGE function dependencies in durable EVENT recipes",
+			));
+		}
+	}
 	let Some(LogicalStatement::Expression {
 		value,
 	}) = program.statements.pop()

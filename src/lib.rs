@@ -1,4 +1,6 @@
 // mod common;
+/// Owned database adapters and durable correspondence references.
+pub mod bridge;
 pub mod changefeed;
 mod collections;
 pub mod datastore;

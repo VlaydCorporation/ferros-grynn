@@ -1026,12 +1026,18 @@ impl GqlSession {
 					transaction.commit_controlled(control.deadline(), &|| control.check())?;
 				}
 				self.publish_live_acks(&acks);
+				if let Some(scope) = &control.bridge_scope {
+					scope.committed();
+				}
 				self.publish_live_subscriptions(pending)?;
 				self.execution_mode = ExecutionMode::BestEffort;
 				Ok(Value::None)
 			}
 			TransactionCommand::Cancel => {
 				self.transaction.take().ok_or_else(FerrosGrynnError::transaction_not_active)?;
+				if let Some(scope) = &control.bridge_scope {
+					scope.cancelled();
+				}
 				self.execution_mode = ExecutionMode::BestEffort;
 				Ok(Value::None)
 			}
@@ -1133,6 +1139,9 @@ impl GqlSession {
 					match transaction.commit_controlled(control.deadline(), &|| control.check()) {
 						Ok(_) => {
 							self.binding_types = binding_types;
+							if let Some(scope) = &control.bridge_scope {
+								scope.committed();
+							}
 							self.publish_live_acks(&acks);
 							if let Err(error) = self.publish_live_subscriptions(pending) {
 								result.result = Err(error);

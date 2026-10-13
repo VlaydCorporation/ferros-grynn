@@ -460,7 +460,10 @@ impl Transaction {
 		let graph_catalog_only = self.mutations.iter().all(|mutation| {
 			matches!(
 				mutation,
-				Mutation::InternProperty { .. }
+				Mutation::RegisterBridgeDatabase(_)
+					| Mutation::RegisterBridgeMapping(_)
+					| Mutation::TransitionBridgeMapping { .. }
+					| Mutation::InternProperty { .. }
 					| Mutation::DefineLiveBinding(_)
 					| Mutation::ReplaceLiveBinding { .. }
 					| Mutation::RemoveLiveBinding(_)
@@ -487,7 +490,10 @@ impl Transaction {
 		}) && self.mutations.iter().any(|mutation| {
 			matches!(
 				mutation,
-				Mutation::ReplaceGraph(_)
+				Mutation::RegisterBridgeDatabase(_)
+					| Mutation::RegisterBridgeMapping(_)
+					| Mutation::TransitionBridgeMapping { .. }
+					| Mutation::ReplaceGraph(_)
 					| Mutation::DefineLiveBinding(_)
 					| Mutation::ReplaceLiveBinding { .. }
 					| Mutation::RemoveLiveBinding(_)
@@ -944,6 +950,7 @@ impl Transaction {
 		let mut remap = ReplayRemap::default();
 		Self::replay_mutations(root, mutations, published_at, rebase_allocations, &mut remap)?;
 		root.publish_statistics_revision(published_at);
+		root.publish_bridge_revisions(published_at);
 		for source in root.retire_missing_changefeeds(published_at)? {
 			root.mark_version(ConflictKey::ChangefeedDefinition(source), published_at);
 			root.mark_version(ConflictKey::ChangefeedCatalogRange, published_at);
@@ -961,6 +968,18 @@ impl Transaction {
 	) -> FerrosGrynnResult<()> {
 		for mutation in mutations {
 			match mutation {
+				Mutation::RegisterBridgeDatabase(database) => {
+					Arc::make_mut(&mut root.bridges).install_database(database.clone())?;
+				}
+				Mutation::RegisterBridgeMapping(mapping) => {
+					Arc::make_mut(&mut root.bridges).install(mapping.clone())?;
+				}
+				Mutation::TransitionBridgeMapping {
+					reference,
+					state,
+				} => {
+					Arc::make_mut(&mut root.bridges).transition(reference.id, *state)?;
+				}
 				Mutation::DefineLiveBinding(definition) => {
 					let catalog = Arc::make_mut(root.live_catalog_mut());
 					if catalog.bindings.contains_key(&definition.id) {

@@ -66,7 +66,7 @@ impl Geometry {
 	}
 
 	/// Validates before converting to private foreign kernel types.
-	fn checked_geo(&self) -> FerrosGrynnResult<geo::Geometry<f64>> {
+	pub(crate) fn checked_geo(&self) -> FerrosGrynnResult<geo::Geometry<f64>> {
 		self.validation_scratch_bytes()?;
 		let geometry = to_geo(self);
 		geometry.check_validation().map_err(|cause| {

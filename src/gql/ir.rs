@@ -225,6 +225,8 @@ pub(super) enum LogicalGraphDmlStatement {
 		cascade: bool,
 	},
 	Relate {
+		/// Optional runtime adapter for post-commit relation mirroring.
+		bridge: Option<Box<str>>,
 		atom_endpoints: bool,
 		/// Retains the analyzed source endpoint identity for ordinary RELATE.
 		source: LogicalRelateEndpoint,
@@ -896,6 +898,8 @@ pub(super) struct LogicalGraphContract {
 /// Typed selectors used by an owned graph result.
 #[derive(Debug, Clone)]
 pub(super) struct LogicalReturnGraph {
+	/// Optional adapter resolving external relation recipes into local atoms.
+	pub(super) bridge: Option<Box<str>>,
 	pub(super) contract: LogicalGraphContract,
 	pub(super) root: Option<TypedExpr>,
 	pub(super) nodes: TypedExpr,
@@ -921,6 +925,8 @@ pub(super) enum LogicalBuildGraphSource {
 /// One anonymous materialization or named atomic graph installation.
 #[derive(Debug, Clone)]
 pub(super) struct LogicalBuildGraph {
+	/// Optional adapter resolving external relation recipes before assembly.
+	pub(super) bridge: Option<Box<str>>,
 	pub(super) mode: DefinitionMode,
 	pub(super) contract: LogicalGraphContract,
 	pub(super) contract_explicit: bool,
@@ -1175,6 +1181,8 @@ pub(super) struct LogicalSelect {
 	pub(super) result: Schema,
 	pub(super) omit: Vec<Vec<Box<str>>>,
 	pub(super) fetch: Vec<Vec<Box<str>>>,
+	/// Optional adapter aliases parallel to the ordinary FETCH paths.
+	pub(super) fetch_bridges: Option<Box<[Option<Box<str>>]>>,
 	pub(super) order: Vec<LogicalOrder>,
 	pub(super) start: Option<LogicalSelectStart>,
 	pub(super) limit: Option<TypedExpr>,

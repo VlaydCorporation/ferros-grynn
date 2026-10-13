@@ -98,12 +98,23 @@ impl QueryCancellation {
 	pub fn is_cancelled(&self) -> bool {
 		self.0.load(Ordering::Acquire)
 	}
+
+	/// Shares cancellation with the async bridge dispatcher.
+	pub(crate) fn atomic(&self) -> Arc<AtomicBool> {
+		self.0.clone()
+	}
 }
 
 /// Parser and bounded-runtime settings for one `execute` call.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct QueryExecutionOptions {
+	/// Explicit bridge orchestration shares the ordinary statement pool.
+	pub(crate) bridge_memory: Option<Arc<Mutex<BarrierAccount>>>,
+	/// Runtime adapters are never part of a durable query recipe.
+	pub(crate) bridge_scope: Option<Arc<crate::bridge::BridgeQueryScope>>,
+	/// Sources cannot promote transaction access or transitive UDF effects.
+	pub(crate) bridge_read_only: bool,
 	/// Parser nesting and object-depth limits.
 	pub parser_settings: ParserSettings,
 	/// Default per-statement timeout, overridden only by an earlier clause
@@ -138,6 +149,9 @@ pub struct QueryExecutionOptions {
 impl Default for QueryExecutionOptions {
 	fn default() -> Self {
 		Self {
+			bridge_memory: None,
+			bridge_scope: None,
+			bridge_read_only: false,
 			parser_settings: ParserSettings::default(),
 			statement_timeout: None,
 			max_control_depth: 20,
@@ -198,6 +212,8 @@ struct LiveAttachmentScope {
 /// Statement-local deadline and cancellation state.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionControl {
+	/// Query-scoped async port used by the synchronous executor.
+	pub(crate) bridge_scope: Option<Arc<crate::bridge::BridgeQueryScope>>,
 	/// Only an implicit session transaction may infer write access from typed
 	/// IR.
 	infer_write_access: bool,
@@ -493,6 +509,14 @@ pub(crate) struct BarrierAccount {
 }
 
 impl BarrierAccount {
+	/// Creates another owner charged to this same bounded allocation pool.
+	pub(crate) fn shared(&self) -> Self {
+		Self {
+			memory: self.memory.clone(),
+			bytes: 0,
+		}
+	}
+
 	pub(crate) fn new(limit: usize) -> Self {
 		Self {
 			memory: Arc::new(BarrierMemory {
@@ -601,6 +625,7 @@ impl ExecutionControl {
 		let started = origin.unwrap_or_else(Instant::now);
 		Self {
 			started,
+			bridge_scope: options.bridge_scope.clone(),
 			deadline: timeout.and_then(|value| started.checked_add(value)),
 			infer_write_access: false,
 			effect_ceiling: ClosureEffect::SchemaMutation,
@@ -620,21 +645,26 @@ impl ExecutionControl {
 			path_expansions: Arc::new(AtomicU64::new(0)),
 			match_metrics: Arc::new(MatchMetrics::default()),
 			graph_assembly_metrics: Arc::new(GraphAssemblyMetrics::default()),
-			barrier_memory: Arc::new(BarrierMemory {
-				limit: options.barrier_memory_bytes.get(),
-				used: AtomicUsize::new(0),
-				peak: AtomicUsize::new(0),
-				spill_bytes: AtomicU64::new(0),
-				spill_runs: AtomicU64::new(0),
-				row_pulls: AtomicU64::new(0),
-				reactive_work: AtomicU64::new(0),
-				spatial_candidates: AtomicU64::new(0),
-				spatial_refinements: AtomicU64::new(0),
-				spatial_fallbacks: AtomicU64::new(0),
-				spatial_tree_pages: AtomicU64::new(0),
-				spatial_delta_records: AtomicU64::new(0),
-				neighbourhood: std::array::from_fn(|_| AtomicU64::new(0)),
-			}),
+			barrier_memory: options.bridge_memory.as_ref().map_or_else(
+				|| {
+					Arc::new(BarrierMemory {
+						limit: options.barrier_memory_bytes.get(),
+						used: AtomicUsize::new(0),
+						peak: AtomicUsize::new(0),
+						spill_bytes: AtomicU64::new(0),
+						spill_runs: AtomicU64::new(0),
+						row_pulls: AtomicU64::new(0),
+						reactive_work: AtomicU64::new(0),
+						spatial_candidates: AtomicU64::new(0),
+						spatial_refinements: AtomicU64::new(0),
+						spatial_fallbacks: AtomicU64::new(0),
+						spatial_tree_pages: AtomicU64::new(0),
+						spatial_delta_records: AtomicU64::new(0),
+						neighbourhood: std::array::from_fn(|_| AtomicU64::new(0)),
+					})
+				},
+				|account| account.lock().memory.clone(),
+			),
 			temporary_directory: options.temporary_directory.clone(),
 			cursors,
 			continuation: Arc::new(Mutex::new(None)),
@@ -691,6 +721,11 @@ impl ExecutionControl {
 		let mut child = self.clone();
 		child.effect_ceiling = effect;
 		Ok(child)
+	}
+
+	/// Reports whether the current execution has an explicit effect ceiling.
+	pub(in crate::gql) fn effect_is_limited(&self) -> bool {
+		self.effect_ceiling < ClosureEffect::SchemaMutation
 	}
 
 	/// Attaches pre-admitted immutable authority for the current session call.
@@ -868,6 +903,9 @@ impl ExecutionControl {
 	}
 
 	pub(crate) fn check(&self) -> FerrosGrynnResult<()> {
+		if let Some(scope) = &self.bridge_scope {
+			scope.context.check()?;
+		}
 		if self.instrumentation {
 			self.match_metrics.cancellation_checks.fetch_add(1, Ordering::Relaxed);
 		}
@@ -943,6 +981,7 @@ impl ExecutionControl {
 		};
 		Self {
 			started: self.started,
+			bridge_scope: self.bridge_scope.clone(),
 			deadline,
 			infer_write_access: self.infer_write_access,
 			effect_ceiling: self.effect_ceiling,

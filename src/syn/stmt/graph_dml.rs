@@ -28,6 +28,7 @@ pub struct DetachStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct RelateStatement {
+	pub bridge: Option<Box<BridgeClause>>,
 	pub atom_endpoints: bool,
 	pub source: RelateEndpoint,
 	pub edge: DmlTarget,
@@ -204,6 +205,7 @@ impl Parser<'_> {
 		} else {
 			return Err(self.syntax("Expected `IN GRAPH` after RELATE path.", self.current().span));
 		};
+		let mut bridge = self.bridge_clause()?.map(Box::new);
 		let weight = if self.consume_keyword(keywords::WEIGHTED).is_some() {
 			Some(context.run(|context| self.expression(context, 0, 1, 0)).await?)
 		} else {
@@ -226,8 +228,15 @@ impl Parser<'_> {
 		let keep_levelpath = self.keep_levelpath_clause()?;
 		let returning = self.dml_return(context, true).await?;
 		let expect = self.expect_clause(context).await?;
+		if let Some(trailing) = self.bridge_clause()? {
+			if bridge.is_some() {
+				return Err(self.syntax("RELATE WITH BRIDGE may appear only once.", trailing.span));
+			}
+			bridge = Some(Box::new(trailing));
+		}
 		self.finish_dml("RELATE")?;
 		Ok(RelateStatement {
+			bridge,
 			atom_endpoints,
 			source,
 			edge,

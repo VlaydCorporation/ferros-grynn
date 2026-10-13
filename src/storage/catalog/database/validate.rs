@@ -27,6 +27,20 @@ use crate::{
 };
 
 pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
+	if let Some(binding) = catalog.bridges {
+		let roots = [binding.heap, binding.primary, binding.direct, binding.reverse];
+		if binding.generation == 0
+			|| binding.directory.is_nil()
+			|| binding.count == 0
+			|| roots.iter().any(|root| {
+				root.file_id.kind() != Some(DataFileKind::BridgeMappings)
+					|| root.root == PageNo::NULL
+			})
+			|| roots.iter().map(|root| root.file_id).collect::<BTreeSet<_>>().len() != 4
+		{
+			return Err(invalid("mapping catalog descriptor is invalid"));
+		}
+	}
 	if catalog.database_uuid.is_nil() {
 		return Err(invalid("database origin UUID is nil"));
 	}

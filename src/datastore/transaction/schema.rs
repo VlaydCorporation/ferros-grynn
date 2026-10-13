@@ -894,6 +894,16 @@ impl Transaction {
 				self.atom_domain(occurrence.global_id()).map(|(class, kind)| (class, kind))
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		let removed = self
+			.working
+			.schema
+			.all_graphs()
+			.filter(|schema| schema.id() == graph || schema.owner_root() == Some(graph))
+			.map(|schema| schema.id())
+			.collect::<Vec<_>>();
+		for removed in removed {
+			self.admit_bridge_graph_removal(removed, None)?;
+		}
 		self.remove_source_events(crate::datastore::EventTarget::Graph(graph))?;
 		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		self.working.remove_graph(graph)?;

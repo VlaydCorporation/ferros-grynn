@@ -108,6 +108,8 @@ impl GenerationIndex {
 
 /// All pages and exact roots of one not-yet-published generation.
 pub(super) struct BuiltGeneration {
+	/// Removes unpublished mapping files unless publication retains them.
+	pub(super) mapping_cleanup: Option<UnpublishedGeneration>,
 	pub(super) file_catalog: FileCatalog,
 	pub(super) database_catalog: DatabaseCatalog,
 	pub(super) bindings: GenerationBindings,
@@ -664,6 +666,8 @@ fn build_generation_inner(
 		raw_graphs.push(raw);
 	}
 
+	let (bridge_binding, mapping_cleanup) =
+		super::bridge::prepare_layout(database, &mut layout, stream_root)?;
 	let (file_catalog, mut files) = layout.finish()?;
 	let atoms = AtomStoreFileSet::from_catalog(&file_catalog, primary, primary_root)?;
 	let reverse = ReverseMembershipFile::from_catalog(&file_catalog, reverse_file, reverse_root)?;
@@ -703,7 +707,7 @@ fn build_generation_inner(
 			root: reverse_root,
 		},
 	};
-	let database_catalog = encode_database_catalog(
+	let mut database_catalog = encode_database_catalog(
 		database,
 		atom_binding,
 		&bindings.graphs,
@@ -711,10 +715,12 @@ fn build_generation_inner(
 		&bindings.physical_deltas,
 		&mut context,
 	)?;
+	database_catalog.bridges = bridge_binding;
 	append_catalog_pages(&mut files, &file_catalog, &database_catalog)?;
 	let index_timings = streamed.map(|images| images.index_timings).unwrap_or_default();
 
 	Ok(BuiltGeneration {
+		mapping_cleanup,
 		file_catalog,
 		database_catalog,
 		bindings,

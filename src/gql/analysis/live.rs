@@ -506,6 +506,13 @@ impl Recipe<'_, '_> {
 		span: TextSpan,
 		depth: usize,
 	) -> FerrosGrynnResult<LiveQuery> {
+		if select.fetch_bridges.is_some()
+			|| select.return_graph.as_ref().is_some_and(|graph| graph.bridge.is_some())
+		{
+			return Err(FerrosGrynnError::query_feature_not_supported(
+				"WITH BRIDGE in durable LIVE recipes",
+			));
+		}
 		let query = self.select_inner(select, span, depth)?;
 		let checked = self.preflight(false, |analyzer| analyzer.select(select, span))?;
 		crate::gql::optimizer::validate_deterministic_statement(&LogicalStatement::Select(
@@ -581,6 +588,15 @@ impl Recipe<'_, '_> {
 				.current_function_has_explicit_result,
 		};
 		let checked = check(&analyzer)?;
+		for (id, _version) in cache.named_dependencies() {
+			if let Some(function) = self.analyzer.catalog.function(id)? {
+				if crate::syn::has_bridge_clause(function.body())? {
+					return Err(FerrosGrynnError::query_feature_not_supported(
+						"WITH BRIDGE function dependencies in durable LIVE recipes",
+					));
+				}
+			}
+		}
 		if let Some(reads) = &analyzer.slot_reads {
 			let reads = reads.borrow();
 			for (name, slot) in &self.analyzer.slots {

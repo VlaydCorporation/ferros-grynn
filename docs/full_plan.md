@@ -934,7 +934,7 @@ types при необходимости расширяется общими ти
     Этап не отмечается завершённым до закрытия всех собственных gates.
 
 30. **Bridges** — зависит от **18, 21, 29**.
-    Реализовать нормативные `Bridge`, `.use_bridge(...)` и `BridgeData`, затем `SurrealBridge`, включая RecordOrTable, ExternalQuery, InternalQuery, RELATE и graph construction. Bridge boundary преобразует данные только в публичные `Value`/`RecordId`/graph-типы.
+    **Реализован** нормативный `Bridge`, `.use_bridge(...)` и `BridgeData`, затем `SurrealBridge`, включая RecordOrClass, ExternalQuery, InternalQuery, RELATE mirror, FETCH и graph construction. Bridge boundary преобразует данные только в публичные `Value`/`RecordId`/graph-типы. Атомы и topology принадлежат Ferros-Grynn; внешний registry двусторонний и durable. Dependency-ordered контракт B0–B9: [gql_bridges_stage_30_plan.md](gql_bridges_stage_30_plan.md); собственные correctness/recovery/resource/performance gates и их scope: [evidence report](reports/gql_stage30_bridge_evidence.md). Performance gate этапа29 и общий conformance gate этапа31 остаются отдельными открытыми обязательствами.
 
 31. **Финальный conformance gate** — зависит от **20–30**.
     Каждая строка conformance-матрицы должна быть реализована, протестирована либо явно помечена как ненормативная/out-of-scope. Прогнать обе платформы, все feature-комбинации, fuzz/crash/soak/performance suites, examples и cross-document audit. Выпустить итоговый русскоязычный отчёт.

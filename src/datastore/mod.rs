@@ -4,6 +4,9 @@
 mod atom_store;
 /// Volatile/local backend ownership and policy conversion.
 mod backend;
+/// Durable database correspondence authority and its lookup indexes.
+mod bridge_registry;
+pub(crate) use bridge_registry::BridgeRegistry;
 /// Retained source definitions independent of active class/graph lifetimes.
 mod changefeed;
 /// Payload-free process counters and snapshot-bound publication observations.

@@ -38,6 +38,9 @@ pub(crate) struct DatabaseRoot {
 	pub(crate) commit_ts: u64,
 	/// Persistent origin for portable changefeed cursors.
 	pub(crate) database_uuid: uuid::Uuid,
+	/// Snapshot-owned correspondence authority, independent of primary atom
+	/// maps.
+	pub(crate) bridges: Arc<super::BridgeRegistry>,
 	/// Nondecreasing UTC publication time in exact epoch nanoseconds.
 	pub(crate) committed_at_ns: i128,
 	/// One shared history binding, with selective inner copy-on-write maps.
@@ -151,6 +154,7 @@ impl Default for DatabaseRoot {
 		Self {
 			commit_ts: 0,
 			database_uuid: uuid::Uuid::now_v7(),
+			bridges: Arc::default(),
 			committed_at_ns: 0,
 			history_binding: Arc::default(),
 			schema: Arc::new(SchemaCatalog::default()),
@@ -170,6 +174,17 @@ impl Default for DatabaseRoot {
 }
 
 impl DatabaseRoot {
+	/// Stamps implicit tombstones through the same FCW/SSI revision authority.
+	pub(crate) fn publish_bridge_revisions(&mut self, revision: u64) {
+		if self.bridges.touched.is_empty() {
+			return;
+		}
+		let domains = std::mem::take(&mut Arc::make_mut(&mut self.bridges).touched);
+		for (database, role) in domains {
+			self.mark_version(ConflictKey::BridgeMappings(database, role), revision);
+		}
+	}
+
 	/// Reads invocation authority from the exact immutable transaction root.
 	pub(crate) fn event_outbox(&self) -> &Arc<super::EventOutbox> {
 		&self.history_binding.events
@@ -652,6 +667,9 @@ impl DatabaseRoot {
 		self.indexes = Arc::new(indexes);
 		self.statistics = Arc::new(statistics);
 		self.atoms = Arc::new(atoms);
+		if !self.bridges.databases.is_empty() {
+			Arc::make_mut(&mut self.bridges).tombstone_atom(atom.record_id())?;
+		}
 		Ok(removed)
 	}
 
@@ -1229,6 +1247,25 @@ impl DatabaseRoot {
 		graph: GraphId,
 		global: GlobalAtomId,
 	) -> FerrosGrynnResult<Option<GraphOccurrence>> {
+		self.detach_with_bridge_lifecycle(graph, global, true)
+	}
+
+	/// Retains mappings while atomic BUILD replaces a surviving occurrence.
+	pub(crate) fn detach_for_replacement(
+		&mut self,
+		graph: GraphId,
+		global: GlobalAtomId,
+	) -> FerrosGrynnResult<Option<GraphOccurrence>> {
+		self.detach_with_bridge_lifecycle(graph, global, false)
+	}
+
+	/// Removes local membership and applies the requested mapping lifecycle.
+	fn detach_with_bridge_lifecycle(
+		&mut self,
+		graph: GraphId,
+		global: GlobalAtomId,
+		tombstone: bool,
+	) -> FerrosGrynnResult<Option<GraphOccurrence>> {
 		let atom = self
 			.atom(global)
 			.cloned()
@@ -1253,6 +1290,14 @@ impl DatabaseRoot {
 			));
 		}
 		if removed.is_some() {
+			if tombstone && !self.bridges.databases.is_empty() {
+				Arc::make_mut(&mut self.bridges).tombstone_subject(
+					&crate::bridge::BridgeMappingSubject::Relation {
+						graph,
+						edge: atom.record_id().clone(),
+					},
+				)?;
+			}
 			Arc::make_mut(&mut self.atoms).remove_membership(global, graph);
 			self.statistics = Arc::new(statistics);
 			self.invalidate_relation_artifacts(graph);

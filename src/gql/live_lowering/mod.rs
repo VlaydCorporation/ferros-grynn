@@ -669,6 +669,7 @@ impl<'query> Lowering<'_, 'query> {
 			GraphKind::Subgraph => None,
 		};
 		Ok(ReturnGraph {
+			bridge: None,
 			contract: Some(GraphContract {
 				family,
 				validators: graph
@@ -748,6 +749,7 @@ impl<'query> Lowering<'_, 'query> {
 			.map(|value| self.expression(value))
 			.collect::<FerrosGrynnResult<_>>()?;
 		Ok(SelectStatement {
+			fetch_bridges: None,
 			return_graph: query
 				.graph_result()
 				.map(|graph| self.graph_terminal(graph).map(Box::new))

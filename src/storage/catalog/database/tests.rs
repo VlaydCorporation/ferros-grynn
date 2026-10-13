@@ -32,11 +32,11 @@ use crate::{
 };
 
 #[test]
-fn fgdc_v12_round_trips_recursive_types_bindings_and_graph_properties() -> FerrosGrynnResult<()> {
+fn fgdc_v15_round_trips_recursive_types_bindings_and_graph_properties() -> FerrosGrynnResult<()> {
 	let catalog = fixture()?;
 	let bytes = catalog.encode()?;
 	assert_eq!(&bytes[..4], b"FGDC");
-	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
+	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 15);
 	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
 	Ok(())
 }
@@ -1213,6 +1213,7 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 		})
 	};
 	Ok(DatabaseCatalog {
+		bridges: None,
 		event_outbox_segments: Vec::new(),
 		events: Vec::new(),
 		database_uuid: uuid::Uuid::from_u128(1),

@@ -16,7 +16,7 @@ use crate::{
 /// File-catalog format magic.
 const MAGIC: [u8; 4] = *b"FGFC";
 /// Only accepted file-catalog version.
-const VERSION: u16 = 6;
+const VERSION: u16 = 7;
 /// Fixed byte width of the catalog header.
 const HEADER_BYTES: usize = 24;
 /// Fixed byte width of one entry before its path bytes.
@@ -80,7 +80,7 @@ pub(in crate::storage) struct FileCatalogEntry {
 	pub(in crate::storage) path: CatalogPath,
 }
 
-/// Canonical `FGFC v6` payload.
+/// Canonical `FGFC v7` payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct FileCatalog {
 	/// Next unused physical file-instance identity.
@@ -353,6 +353,7 @@ fn validate_space_kind(space: DataSpaceId, kind: Option<DataFileKind>) -> Ferros
 				| DataFileKind::ImportQuarantine
 				| DataFileKind::Changefeed
 				| DataFileKind::EventOutbox
+				| DataFileKind::BridgeMappings
 		),
 		(DataSpaceId::Graph(_), Some(kind)) => matches!(
 			kind,
@@ -559,11 +560,11 @@ mod tests {
 	use crate::graph::GraphId;
 
 	#[test]
-	fn fgfc_v6_has_exact_auxiliary_roles_and_rejects_v5() -> FerrosGrynnResult<()> {
+	fn fgfc_v7_has_exact_auxiliary_roles_and_rejects_v6() -> FerrosGrynnResult<()> {
 		let catalog = FileCatalog::bootstrap()?;
 		let bytes = catalog.encode()?;
 		let mut expected = vec![
-			b'F', b'G', b'F', b'C', 6, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+			b'F', b'G', b'F', b'C', 7, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
 		];
 		expected.extend_from_slice(&0_u64.to_le_bytes());
 		expected.extend_from_slice(
@@ -587,7 +588,7 @@ mod tests {
 		assert_eq!(catalog.registrations(Path::new("db")).len(), 1);
 
 		let mut old = bytes;
-		old[4..6].copy_from_slice(&5_u16.to_le_bytes());
+		old[4..6].copy_from_slice(&6_u16.to_le_bytes());
 		assert_eq!(
 			FileCatalog::decode(&old).err().map(|error| error.status().code().to_string()),
 			Some("FG-51S01".to_owned())
@@ -716,7 +717,7 @@ mod tests {
 		assert_eq!(entry.file_id.get().to_le_bytes(), [0x17, 1, 0, 0, 0, 0, 0, 0]);
 		assert_eq!(DataFileKind::from_raw(0x17), Some(DataFileKind::Changefeed));
 		assert_eq!(DataFileKind::from_raw(0x18), Some(DataFileKind::EventOutbox));
-		assert_eq!(DataFileKind::from_raw(0x19), None);
+		assert_eq!(DataFileKind::from_raw(0x1a), None);
 		catalog.next_file_instance_id = 2;
 		catalog.files.push(entry);
 		catalog.files.sort_unstable_by_key(|entry| (entry.space_id, entry.file_id));

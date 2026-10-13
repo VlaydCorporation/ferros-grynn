@@ -311,6 +311,16 @@ pub(super) fn open_local_state(
 		snapshot,
 		&database_superblock,
 	)?;
+	super::bridge::recover(
+		&mut database,
+		&database_catalog,
+		&file_catalog,
+		&registry,
+		&wal,
+		engine,
+		snapshot,
+		&database_superblock,
+	)?;
 	validate_opened_root(&database, &database_catalog, &file_catalog, snapshot)?;
 	#[cfg(test)]
 	LAST_STARTUP_TIMINGS.set(StartupTimings {

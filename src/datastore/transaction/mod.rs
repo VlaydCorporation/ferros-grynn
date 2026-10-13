@@ -51,6 +51,8 @@ use crate::{
 };
 
 mod all_shortest;
+/// Durable correspondence mutations and bidirectional snapshot lookups.
+mod bridge;
 mod build_graph;
 mod changefeed;
 /// Validated operation replay and final-policy NET/FULL capture.
@@ -223,6 +225,17 @@ impl CommitResult {
 
 #[derive(Debug, Clone)]
 enum Mutation {
+	/// Durable non-secret database identity and correspondence rules.
+	RegisterBridgeDatabase(Arc<crate::bridge::BridgeDatabase>),
+	/// One authoritative row reserving both uniqueness directions.
+	RegisterBridgeMapping(Arc<crate::bridge::BridgeMapping>),
+	/// Checked confirmation or diagnostic tombstone of an existing row.
+	TransitionBridgeMapping {
+		/// Stable reference to the row being transitioned.
+		reference: crate::bridge::BridgeMappingRef,
+		/// Requested terminal or confirmed state.
+		state: crate::bridge::BridgeMappingState,
+	},
 	/// New stable reactive identity and its frozen logical recipe.
 	DefineLiveBinding(Arc<super::LiveBindingDefinition>),
 	/// Checked expression replacement retaining the same stable identity.
@@ -1294,6 +1307,9 @@ impl Transaction {
 	}
 
 	fn delete_atom_inner(&mut self, record_id: &RecordId, cascade: bool) -> FerrosGrynnResult<()> {
+		self.admit_bridge_tombstones(&crate::bridge::BridgeMappingSubject::Atom(
+			record_id.clone(),
+		))?;
 		let global = self.require_atom(record_id)?;
 		self.note_change_target(global, None, ConflictKey::BaseAtom(global))?;
 		let (class_id, _kind) = self.atom_domain(global)?;
