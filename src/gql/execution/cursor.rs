@@ -318,6 +318,20 @@ pub(super) trait QueryRead {
 
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot>;
 
+	/// Owned authority used only by a retained graph-result cursor.
+	fn snapshot_root(
+		&self,
+		_snapshot: Snapshot,
+	) -> FerrosGrynnResult<Arc<crate::datastore::DatabaseRoot>> {
+		Err(FerrosGrynnError::query_feature_not_supported("graph cursor snapshot authority"))
+	}
+
+	/// Ambient graph for implicit record fields; qualified occurrences keep
+	/// their own graph.
+	fn scalar_graph(&self) -> Option<&GraphRef> {
+		None
+	}
+
 	/// Reads owned LIVE metadata from the same immutable statement root.
 	fn live_info(
 		&self,
@@ -693,7 +707,7 @@ pub(super) trait QueryRead {
 	fn execute_dml(
 		&mut self,
 		statement: &LogicalDmlStatement,
-		slots: &[Value],
+		slots: &mut [Value],
 		source: &str,
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value>;
@@ -702,7 +716,7 @@ pub(super) trait QueryRead {
 	fn execute_graph_dml(
 		&mut self,
 		statement: &LogicalGraphDmlStatement,
-		slots: &[Value],
+		slots: &mut [Value],
 		source: &str,
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value>;
@@ -715,6 +729,7 @@ pub(super) trait QueryRead {
 		mode: crate::syn::DefinitionMode,
 		contract_explicit: bool,
 		graph: crate::graph::MaterializedGraph,
+		control: &ExecutionControl,
 	) -> FerrosGrynnResult<GraphRef>;
 }
 

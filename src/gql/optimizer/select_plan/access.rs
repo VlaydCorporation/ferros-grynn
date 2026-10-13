@@ -769,6 +769,9 @@ pub(super) fn source_cardinality(
 			sum
 		}
 		LogicalSelectSourceKind::Derived(select) => {
+			if select.return_graph.is_some() {
+				return Ok(Cardinality::exact(1));
+			}
 			plan_select(select, snapshot, usize::MAX)?.cardinality
 		}
 	})

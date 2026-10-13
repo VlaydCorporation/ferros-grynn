@@ -1402,6 +1402,7 @@ fn duration_embedded_match_checks_final_visitor() -> FerrosGrynnResult<()> {
 	let mut transaction = store.begin();
 	let snapshot = transaction.query_snapshot()?;
 	let read = TransactionRead {
+		scalar_graph: None,
 		transaction: &mut transaction,
 		snapshot,
 		metadata_only: false,

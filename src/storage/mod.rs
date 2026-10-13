@@ -18,6 +18,8 @@ mod derived_index;
 pub(crate) use derived_index::{GraphArtifactIdentity, SectionKind as DerivedSectionKind};
 mod direct_io;
 mod edge_endpoint_index;
+/// Durable accepted EVENT contexts and immutable function source versions.
+pub mod event_outbox;
 mod file_registry;
 mod fulltext_index;
 mod fulltext_index_delta;
@@ -41,6 +43,9 @@ pub(crate) use neighbourhood_index::{NeighbourhoodHeader, NeighbourhoodLayout, N
 mod tensor_index;
 pub use tensor_index::{TensorCacheHeader, TensorCacheLayout, TensorCacheTag};
 pub(crate) mod live_descriptor;
+/// Self-contained logical graph checkpoints, independent of
+/// StorageValue::Graph.
+pub mod live_graph_image;
 /// Exact computed result history; never source SHOW CHANGES payloads.
 pub(crate) mod live_history;
 pub use live_history::LiveHistorySegments;

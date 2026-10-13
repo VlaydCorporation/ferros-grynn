@@ -8,12 +8,12 @@
 
 /// Exact declared statuses, metadata and cause chains for replayed faults.
 mod diagnostic;
+/// Separate owned graph checkpoints over the existing history transport.
+mod graph;
 #[cfg(test)]
 mod resource_tests;
 #[cfg(test)]
 mod tests;
-/// Qualified runtime result values, separate from persistable properties.
-mod values;
 
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
@@ -37,6 +37,7 @@ use crate::{
 		append_blob,
 		checked_payload,
 		invalid,
+		logical_values::{self as values, Work},
 		qualified,
 		values as canonical,
 	},
@@ -73,14 +74,19 @@ pub(crate) struct LiveGroupInfo {
 }
 
 impl LiveGroupInfo {
+	/// Separates graph data from ordinary rows and prepaid controls.
+	pub(crate) const fn is_graph(self) -> bool {
+		self.kind == 3
+	}
+
 	/// Returns whether this envelope is an explicit GAP or fault control.
 	pub(crate) const fn is_control(self) -> bool {
-		self.kind != 0
+		matches!(self.kind, 1 | 2)
 	}
 
 	/// Rejects oversized controls before continuation pages are allocated.
 	pub(in crate::storage) fn admit_delivery(&self, bytes: u64) -> FerrosGrynnResult<()> {
-		if self.kind != 0 && bytes > CONTROL_BYTES as u64 {
+		if self.is_control() && bytes > CONTROL_BYTES as u64 {
 			return Err(FerrosGrynnError::storage_decode_limit_exceeded(
 				"LIVE control delivery",
 				bytes,
@@ -103,34 +109,6 @@ struct Header {
 	body: usize,
 }
 
-/// Checked recursion and total logical work, including path steps.
-struct Work {
-	/// Remaining nodes for this entire commit envelope.
-	remaining: usize,
-}
-
-impl Work {
-	/// Fails before entering recursion or allocating a declared collection.
-	fn take(&mut self, depth: usize, count: usize) -> FerrosGrynnResult<()> {
-		if depth > 64 {
-			return Err(invalid("LIVE history nesting exceeds 64"));
-		}
-		self.remaining = self
-			.remaining
-			.checked_sub(count)
-			.ok_or_else(|| invalid("LIVE history logical work exceeds its cap"))?;
-		Ok(())
-	}
-
-	/// Validates a collection's minimum work before allocation.
-	fn check_count(&self, count: usize) -> FerrosGrynnResult<()> {
-		if count > self.remaining {
-			return Err(invalid("LIVE history count exceeds remaining work"));
-		}
-		Ok(())
-	}
-}
-
 /// Reads fixed framing without allocating dictionaries or results.
 pub(crate) fn inspect(prefix: &[u8], length: u64) -> FerrosGrynnResult<LiveGroupInfo> {
 	Ok(header(prefix, length)?.info)
@@ -142,7 +120,7 @@ fn header(prefix: &[u8], length: u64) -> FerrosGrynnResult<Header> {
 	let mut decoder = Decoder::new(
 		prefix.get(..HEADER_BYTES).ok_or_else(|| invalid("LIVE result header is truncated"))?,
 	);
-	if decoder.take(4)? != b"FGLB" || decoder.take(2)? != 1_u16.to_le_bytes() {
+	if decoder.take(4)? != b"FGLB" || decoder.take(2)? != 2_u16.to_le_bytes() {
 		return Err(invalid("LIVE result marker/version is invalid"));
 	}
 	let kind = decoder.u8()?;
@@ -164,11 +142,11 @@ fn header(prefix: &[u8], length: u64) -> FerrosGrynnResult<Header> {
 	decoder.zero(16)?;
 	decoder.finish()?;
 	if stamp == 0
-		|| kind > 2
+		|| kind > 3
 		|| bindings > MAX_NODES
 		|| events as usize > MAX_NODES
-		|| kind != 0 && (events != 0 || bindings != 0)
-		|| kind == 0 && events == 0
+		|| matches!(kind, 1 | 2) && (events != 0 || bindings != 0)
+		|| matches!(kind, 0 | 3) && events == 0
 		|| dictionary < 16
 		|| dictionary.checked_add(body).and_then(|bytes| bytes.checked_add(HEADER_BYTES))
 			!= Some(length)
@@ -390,6 +368,10 @@ pub(crate) fn encode(
 			}
 			(0, batch.bindings().len(), batch.events().len())
 		}
+		LivePayload::Graph(batch) => {
+			graph::encode(&mut body, batch, id, version, stamp, time, &mut budget, &mut work)?;
+			(3, batch.bindings().len(), batch.delta().changes().len().max(1))
+		}
 		LivePayload::Gap(gap) => {
 			encode_gap(&mut body, gap, id, stamp, &mut budget)?;
 			(1, 0, 0)
@@ -411,7 +393,7 @@ pub(crate) fn encode(
 	let dictionary = canonical::encode_dictionary(&context, &mut budget)?;
 	let mut output = Vec::new();
 	append(&mut output, b"FGLB", &mut budget)?;
-	append(&mut output, &1_u16.to_le_bytes(), &mut budget)?;
+	append(&mut output, &2_u16.to_le_bytes(), &mut budget)?;
 	append(&mut output, &[kind, 0], &mut budget)?;
 	append(&mut output, id.as_uuid().as_inner().as_bytes(), &mut budget)?;
 	append(&mut output, &version.get().to_le_bytes(), &mut budget)?;
@@ -450,7 +432,7 @@ pub(in crate::storage) fn decode_delivery_bounded(
 	let info = inspect(bytes, bytes.len() as u64)?;
 	info.admit_delivery(bytes.len() as u64)?;
 	let maximum = budget.maximum;
-	if info.kind != 0 {
+	if info.is_control() {
 		budget.maximum = maximum.min(
 			budget
 				.used
@@ -537,6 +519,10 @@ pub(in crate::storage) fn decode_bounded(
 		};
 		validate_batch(&batch)?;
 		LivePayload::Batch(batch)
+	} else if info.kind == 3 {
+		LivePayload::Graph(std::sync::Arc::new(graph::decode(
+			&mut data, info, bindings, budget, &mut work,
+		)?))
 	} else {
 		let gap = decode_gap(&mut data, info.id, info.stamp)?;
 		if info.kind == 1 {

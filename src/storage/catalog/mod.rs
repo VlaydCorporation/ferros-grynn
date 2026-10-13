@@ -23,6 +23,13 @@ pub(super) use database::{
 	ParameterCatalogEntry,
 	PhysicalIndexBinding,
 };
+pub(in crate::storage) use database::{
+	SourceDecoder,
+	decode_event_source,
+	decode_function_source,
+	encode_event_source,
+	encode_function_source,
+};
 pub(super) use file::{CatalogPath, FileCatalog, FileCatalogEntry};
 pub(super) use page_chain::{CatalogKind, decode_page_chain, encode_page_chain};
 

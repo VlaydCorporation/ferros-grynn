@@ -8,6 +8,7 @@ use std::{
 
 use super::{
 	LocalStore,
+	history_publication::{append_group, reserve},
 	layout::{FileImage, invalid},
 };
 use crate::{
@@ -43,7 +44,7 @@ thread_local! {
 }
 
 /// Uses the fixed production target unless a test scopes a smaller rotation.
-fn segment_target() -> u64 {
+pub(super) fn segment_target() -> u64 {
 	#[cfg(test)]
 	{
 		TEST_SEGMENT_TARGET.with(std::cell::Cell::get)
@@ -118,6 +119,15 @@ pub(super) fn validate_recovered(catalog: &DatabaseCatalog, stamp: u64) -> Ferro
 			.starting_after;
 		entry.metadata.validate(starting_after, stamp)?;
 	}
+	for entry in &catalog.live_queries {
+		if entry.state != crate::live::LiveState::Closed
+			&& entry.query.graph_result().is_some()
+			&& entry.graph_checkpoint.is_none()
+			|| entry.graph_checkpoint.is_some_and(|segment| segment.header.last_stamp > stamp)
+		{
+			return Err(invalid("LIVE graph checkpoint is absent or exceeds recovery clock"));
+		}
+	}
 	Ok(())
 }
 
@@ -130,6 +140,12 @@ impl LocalStore {
 	/// Shares computed-history bounds with the same immutable logical snapshot.
 	pub(crate) fn live_segments(&self) -> crate::storage::LiveHistorySegments {
 		Arc::clone(&self.state.lock().live_segments)
+	}
+
+	/// Shares the already-admitted checkpoint reference map after its WAL
+	/// barrier.
+	pub(crate) fn live_graph_segments(&self) -> Arc<BTreeMap<crate::live::LiveId, HistorySegment>> {
+		Arc::clone(&self.state.lock().live_graph_segments)
 	}
 }
 
@@ -224,6 +240,11 @@ pub(super) fn prepare(
 				.ok_or_else(|| invalid("LIVE retained input bytes overflow"))?;
 		}
 	}
+	for (_, bytes) in root.live_catalog().prepared_graphs.iter() {
+		retained = retained
+			.checked_add(bytes.len())
+			.ok_or_else(|| invalid("LIVE checkpoint retained bytes overflow"))?;
+	}
 	let mut budget = CodecBudget::new(MAX_SCRATCH_BYTES, retained)?;
 	for entry in &mut catalog.changefeeds {
 		if entry
@@ -284,6 +305,34 @@ pub(super) fn prepare(
 			)?;
 		}
 	}
+	for (id, payload) in root.live_catalog().prepared_graphs.iter() {
+		let info = crate::storage::live_history::inspect(payload, payload.len() as u64)?;
+		let entry = catalog
+			.live_queries
+			.iter_mut()
+			.find(|entry| entry.id == *id)
+			.ok_or_else(|| invalid("LIVE graph checkpoint owner is absent"))?;
+		if info.id != *id
+			|| info.version != entry.version
+			|| !info.is_graph()
+			|| info.stamp != root.commit_ts
+			|| info.time != root.committed_at_ns
+		{
+			return Err(invalid("LIVE graph checkpoint envelope differs from publication"));
+		}
+		let mut segments = Vec::new();
+		append_group(
+			root,
+			HistoryOwner::Live(*id),
+			payload,
+			(info.stamp, info.time),
+			&mut segments,
+			files,
+			images,
+			&mut budget,
+		)?;
+		entry.graph_checkpoint = segments.first().copied();
+	}
 	let count = history_segments(catalog).count();
 	budget.admit(crate::values::storage::tree_allocation_bytes(
 		count,
@@ -313,121 +362,6 @@ pub(super) fn prepare(
 	Ok(())
 }
 
-/// Stages one whole result or source group through the existing WAL transport.
-fn append_group(
-	root: &DatabaseRoot,
-	owner: HistoryOwner,
-	payload: &[u8],
-	clock: (u64, i128),
-	segments: &mut Vec<HistorySegment>,
-	files: &mut FileCatalog,
-	images: &mut Vec<FileImage>,
-	budget: &mut CodecBudget,
-) -> FerrosGrynnResult<()> {
-	let (stamp, time) = clock;
-	if stamp == 0 || stamp > root.commit_ts || time > root.committed_at_ns {
-		return Err(invalid("feed group exceeds the publication clock"));
-	}
-	let group_pages = u64::from(payload_pages(payload.len())?);
-	let append = segments.last().copied().filter(|segment| {
-		segment
-			.header
-			.pages
-			.checked_add(group_pages)
-			.and_then(|pages| pages.checked_mul(PAGE_SIZE as u64))
-			.is_some_and(|bytes| bytes <= segment_target())
-	});
-	// Page packing checks the complete payload before allocating
-	// continuations.
-	let first = append.map_or(1, |segment| segment.header.pages);
-	let (locator, pages) = encode_pages(payload, stamp, first, budget)?;
-	let mut segment = match append {
-		Some(segment) => segment,
-		None => {
-			let file = DataFileId::new(files.next_file_instance_id, DataFileKind::Changefeed)
-				.ok_or_else(|| invalid("feed file identity clock is exhausted"))?;
-			files.next_file_instance_id = files
-				.next_file_instance_id
-				.checked_add(1)
-				.ok_or_else(|| invalid("feed file identity clock is exhausted"))?;
-			HistorySegment {
-				file,
-				header: SegmentHeader {
-					database: root.database_uuid,
-					owner,
-					segment: uuid::Uuid::now_v7(),
-					pages: 1,
-					commits: 0,
-					first_stamp: stamp,
-					last_stamp: stamp,
-					first_time: time,
-					last_time: time,
-				},
-			}
-		}
-	};
-	if segment.header.commits != 0
-		&& (segment.header.last_stamp >= stamp || segment.header.last_time > time)
-	{
-		return Err(invalid("feed append clocks moved backwards"));
-	}
-	segment.header.pages = first
-		.checked_add(u64::from(locator.pages))
-		.ok_or_else(|| invalid("feed page ceiling overflows"))?;
-	segment.header.commits = segment
-		.header
-		.commits
-		.checked_add(1)
-		.ok_or_else(|| invalid("feed group count overflows"))?;
-	segment.header.last_stamp = stamp;
-	segment.header.last_time = time;
-	let registration = FileCatalogEntry {
-		space_id: DataSpaceId::Database,
-		file_id: segment.file,
-		companion_of: None,
-		role: DataFileRole::WalBackfilled,
-		path: CatalogPath::parse(&format!(
-			"changefeed/{}/{}.fcf",
-			owner.uuid(),
-			segment.header.segment
-		))?,
-	};
-	let count =
-		pages.len().checked_add(1).ok_or_else(|| invalid("feed staging page count overflows"))?;
-	budget.admit(
-		count
-			.checked_mul(2 * PAGE_SIZE + std::mem::size_of::<PageNo>() + 512)
-			.ok_or_else(|| invalid("feed staging bytes overflow"))?,
-	)?;
-	let mut final_pages = Vec::new();
-	final_pages
-		.try_reserve_exact(count)
-		.map_err(|_error| invalid("feed staging allocation failed"))?;
-	final_pages.resize_with(count, AlignedPage::zeroed);
-	encode_header(segment.header, &mut final_pages[0])?;
-	for (source, output) in pages.iter().zip(&mut final_pages[1..]) {
-		output.as_bytes_mut().copy_from_slice(source.as_bytes());
-	}
-	let page_numbers = std::iter::once(PageNo::new(0))
-		.chain((first..segment.header.pages).map(PageNo::new))
-		.collect();
-	reserve(images, 1, budget)?;
-	images.push(FileImage {
-		entry: registration,
-		page_numbers,
-		pages: final_pages,
-		prewritten_page_count: None,
-	});
-	if append.is_some() {
-		let last = segments.last_mut().ok_or_else(|| invalid("feed append segment disappeared"))?;
-		*last = segment;
-	} else {
-		reserve(segments, 1, budget)?;
-		segments.push(segment);
-	}
-	Ok(())
-}
-
 /// One authoritative reachability set covers source and private result files.
 fn history_segments(catalog: &DatabaseCatalog) -> impl Iterator<Item = &HistorySegment> {
 	catalog
@@ -435,35 +369,7 @@ fn history_segments(catalog: &DatabaseCatalog) -> impl Iterator<Item = &HistoryS
 		.iter()
 		.flat_map(|entry| &entry.segments)
 		.chain(catalog.live_history.iter().flat_map(|entry| &entry.segments))
-}
-
-/// Reserves complete replacement vector capacity before amortized growth.
-fn reserve<T>(
-	output: &mut Vec<T>,
-	additional: usize,
-	budget: &mut CodecBudget,
-) -> FerrosGrynnResult<()> {
-	let required = output
-		.len()
-		.checked_add(additional)
-		.ok_or_else(|| invalid("feed vector count overflows"))?;
-	if required <= output.capacity() {
-		return Ok(());
-	}
-	let capacity = output
-		.capacity()
-		.max(4)
-		.checked_mul(2)
-		.map(|count| count.max(required))
-		.ok_or_else(|| invalid("feed vector capacity overflows"))?;
-	budget.admit(
-		capacity
-			.checked_mul(std::mem::size_of::<T>())
-			.ok_or_else(|| invalid("feed vector bytes overflow"))?,
-	)?;
-	output
-		.try_reserve_exact(capacity - output.len())
-		.map_err(|_error| invalid("feed vector allocation failed"))
+		.chain(catalog.live_queries.iter().filter_map(|entry| entry.graph_checkpoint.as_ref()))
 }
 
 /// Charges owned capture inputs before physical encoding creates any copies.

@@ -952,6 +952,7 @@ fn duration_explain_invocation_cancellation_retires_cursor()
 	let program = crate::gql::parse(source, crate::syn::ParserSettings::default())?;
 	let snapshot = transaction.query_snapshot()?;
 	let mut read = TransactionRead {
+		scalar_graph: None,
 		transaction: &mut transaction,
 		snapshot,
 		metadata_only: false,
@@ -972,7 +973,7 @@ fn duration_explain_invocation_cancellation_retires_cursor()
 		&mut bindings,
 		source,
 		&cancelled,
-		&mut ControlRuntime::default(),
+		&mut ControlRuntime::new(&cancelled),
 		1,
 		false,
 	);

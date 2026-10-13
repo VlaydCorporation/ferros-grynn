@@ -24,9 +24,12 @@ use std::time::Duration;
 #[cfg(test)]
 pub(crate) use execution::execute_parsed_transaction_with_bindings;
 pub(crate) use execution::{
+	execute_event,
+	execute_event_handler,
 	execute_parsed_statement_with_bindings,
 	execute_transaction,
 	execute_transaction_with_options,
+	validate_event_definition,
 };
 pub(crate) use options::{BarrierAccount, ExecutionControl};
 pub use options::{QueryCancellation, QueryExecutionOptions};
@@ -59,6 +62,7 @@ pub use crate::{
 		CommitStatement,
 		CreateStatement,
 		DefineClassStatement,
+		DefineEventStatement,
 		DefineFieldStatement,
 		DefineFunctionStatement,
 		DefineGraphStatement,
@@ -71,6 +75,10 @@ pub use crate::{
 		DmlReturn,
 		DmlReturnItem,
 		DmlTarget,
+		EventAlterAction,
+		EventAsyncName,
+		EventBody,
+		EventOwnerName,
 		ExecutionModeName,
 		ExpectClause,
 		ExplainFormat,
@@ -118,6 +126,8 @@ pub use crate::{
 		ParserSettings,
 		Program,
 		RecordKey,
+		RelateEndpoint,
+		RelateEndpointTarget,
 		RelateStatement,
 		RemoveStatement,
 		RemoveTarget,
@@ -306,6 +316,7 @@ pub(crate) const fn statement_kind(statement: &StatementKind) -> QueryStatementK
 		| StatementKind::DefineGraphIndex(_)
 		| StatementKind::DefineAnalyzer(_)
 		| StatementKind::DefineFunction(_)
+		| StatementKind::DefineEvent(_)
 		| StatementKind::DefineParameter(_) => QueryStatementKind::Define,
 		StatementKind::Remove(_) => QueryStatementKind::Remove,
 		StatementKind::Alter(_) => QueryStatementKind::Alter,
@@ -356,6 +367,7 @@ pub(crate) fn statement_mutates_state(statement: &StatementKind) -> bool {
 			| StatementKind::DefineGraphIndex(_)
 			| StatementKind::DefineAnalyzer(_)
 			| StatementKind::DefineFunction(_)
+			| StatementKind::DefineEvent(_)
 			| StatementKind::DefineParameter(_)
 			| StatementKind::Remove(_)
 			| StatementKind::Alter(_)

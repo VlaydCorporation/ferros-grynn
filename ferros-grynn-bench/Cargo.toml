@@ -56,6 +56,10 @@ harness = false
 name = "gql_stage28"
 harness = false
 
+[[bench]]
+name = "gql_stage29"
+harness = false
+
 [dependencies]
 ferros-grynn = { workspace = true, default-features = false }
 

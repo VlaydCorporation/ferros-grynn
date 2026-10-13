@@ -280,6 +280,15 @@ fn validate(catalog: &FileCatalog) -> FerrosGrynnResult<()> {
 			Some(DataFileKind::Changefeed) => {
 				validate_changefeed_path(file.space_id, file.path.as_str())?;
 			}
+			Some(DataFileKind::EventOutbox) => {
+				let feed_path = file
+					.path
+					.as_str()
+					.strip_prefix("events/")
+					.and_then(|path| path.strip_suffix(".feo"))
+					.ok_or_else(|| invalid("EVENT outbox path is not canonical"))?;
+				validate_changefeed_path(file.space_id, &format!("changefeed/{feed_path}.fcf"))?;
+			}
 			_ => {}
 		}
 		if file.file_id.kind() == Some(DataFileKind::Freelist) {
@@ -343,6 +352,7 @@ fn validate_space_kind(space: DataSpaceId, kind: Option<DataFileKind>) -> Ferros
 				| DataFileKind::JobCatalog
 				| DataFileKind::ImportQuarantine
 				| DataFileKind::Changefeed
+				| DataFileKind::EventOutbox
 		),
 		(DataSpaceId::Graph(_), Some(kind)) => matches!(
 			kind,
@@ -705,7 +715,8 @@ mod tests {
 		let entry = file(1, DataFileKind::Changefeed, DataSpaceId::Database, path, None)?;
 		assert_eq!(entry.file_id.get().to_le_bytes(), [0x17, 1, 0, 0, 0, 0, 0, 0]);
 		assert_eq!(DataFileKind::from_raw(0x17), Some(DataFileKind::Changefeed));
-		assert_eq!(DataFileKind::from_raw(0x18), None);
+		assert_eq!(DataFileKind::from_raw(0x18), Some(DataFileKind::EventOutbox));
+		assert_eq!(DataFileKind::from_raw(0x19), None);
 		catalog.next_file_instance_id = 2;
 		catalog.files.push(entry);
 		catalog.files.sort_unstable_by_key(|entry| (entry.space_id, entry.file_id));

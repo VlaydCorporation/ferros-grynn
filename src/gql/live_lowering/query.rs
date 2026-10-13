@@ -26,6 +26,9 @@ mod scratch_tests;
 #[cfg(test)]
 mod window_tests;
 
+#[cfg(test)]
+mod graph_tests;
+
 /// Exact owned rows and evidence from one immutable root evaluation.
 pub struct QueryEvaluation {
 	/// Successful capture owner from the same root as the exact result rows.
@@ -38,6 +41,11 @@ pub struct QueryEvaluation {
 	pub(crate) rhs_scope_anchors: Vec<crate::datastore::LiveRhsScopeAnchor>,
 	/// Source/group identities remain separate from projected payload values.
 	pub(crate) rows: BTreeMap<LiveIdentity, Value>,
+	/// Graph terminals use a separate owned result, never a runtime Value
+	/// codec.
+	pub(crate) graph: Option<crate::graph::MaterializedGraph>,
+	/// Qualified logical content prepared for graph publication and replay.
+	pub(crate) graph_image: Option<crate::live::LiveGraphImage>,
 	/// Concrete transitive PURE versions; changed overloads require
 	/// re-registration.
 	pub(crate) functions: Vec<(FunctionId, SchemaVersion)>,
@@ -367,8 +375,19 @@ pub fn evaluate_query_controlled<'root>(
 		})
 		.collect::<Vec<_>>();
 	let mut rows = BTreeMap::new();
+	let graph_plan = plans.first().copied().filter(|plan| plan.return_graph.is_some());
+	let mut graph_assembly = graph_plan
+		.map(|plan| {
+			crate::gql::execution::GraphAssemblyAccumulator::for_select(
+				&read, plan, &slots, &control,
+			)
+		})
+		.transpose()?;
 	let mut collect = |identity: LiveIdentity, value: Value| {
 		fields.work(1)?;
+		if let (Some(assembly), Some(plan)) = (&mut graph_assembly, graph_plan) {
+			return assembly.add_root_row(&read, plan, value, &slots);
+		}
 		fields.admit_retained(
 			value
 				.estimated_heap_bytes()
@@ -403,6 +422,32 @@ pub fn evaluate_query_controlled<'root>(
 			crate::gql::execution::visit_root_select(&read, plan, &slots, &control, &mut collect)?;
 		}
 	}
+	let graph = graph_assembly
+		.map(|assembly| {
+			let plan = graph_plan.ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("LIVE graph plan is missing")
+			})?;
+			let terminal = plan.return_graph.as_ref().ok_or_else(|| {
+				FerrosGrynnError::invalid_storage_file("LIVE graph terminal is missing")
+			})?;
+			assembly.finish_root(&read, terminal.contract)
+		})
+		.transpose()?;
+	let graph_image = graph
+		.as_ref()
+		.map(|graph| {
+			fields.admit_retained(graph.estimated_heap_bytes())?;
+			crate::live::LiveGraphImage::capture(
+				graph,
+				&root.dictionary,
+				&|bytes, work| {
+					fields.admit_retained(bytes)?;
+					fields.work(work)
+				},
+				&|atom, graph| read.graph_source_mapping(atom, graph),
+			)
+		})
+		.transpose()?;
 	let count = cache.named_dependency_count();
 	fields.work(count as u64)?;
 	fields.admit(
@@ -439,6 +484,8 @@ pub fn evaluate_query_controlled<'root>(
 		capture_scope_name,
 		rhs_scope_anchors: resolved_rhs,
 		rows,
+		graph,
+		graph_image,
 		functions,
 		record_sources,
 		reads: reads.keys.into_keys().collect(),

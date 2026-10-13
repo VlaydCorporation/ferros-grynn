@@ -172,7 +172,7 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 				|| plan.since.as_ref().is_some_and(expr_contains_impure)
 				|| plan.buffer.as_ref().is_some_and(expr_contains_impure)
 		}
-		LogicalSchemaStatement::DefineLiveBinding(_) => false,
+		LogicalSchemaStatement::DefineLiveBinding(_) | LogicalSchemaStatement::Event(_) => false,
 		LogicalSchemaStatement::ReplaceLiveBinding {
 			id,
 			..
@@ -301,6 +301,9 @@ fn schema_contains_impure(statement: &LogicalSchemaStatement) -> bool {
 		| LogicalSchemaStatement::InfoClass {
 			..
 		}
+		| LogicalSchemaStatement::InfoGraph {
+			..
+		}
 		| LogicalSchemaStatement::InfoIndex {
 			..
 		}
@@ -393,8 +396,8 @@ fn graph_dml_contains_impure(statement: &LogicalGraphDmlStatement) -> bool {
 			weight,
 			..
 		} => {
-			expr_contains_impure(&source.key)
-				|| expr_contains_impure(&target.key)
+			expr_contains_impure(source.expression())
+				|| expr_contains_impure(target.expression())
 				|| edge.key.as_ref().is_some_and(expr_contains_impure)
 				|| edge.data.as_ref().is_some_and(data_contains_impure)
 				|| return_contains_impure(&edge.returning)
@@ -447,7 +450,8 @@ fn binding_contains_impure(binding: &crate::gql::ir::MatchBinding) -> bool {
 }
 
 fn select_contains_impure(statement: &LogicalSelect) -> bool {
-	statement.union_inputs.iter().any(select_contains_impure)
+	statement.return_graph.as_deref().is_some_and(return_graph_contains_impure)
+		|| statement.union_inputs.iter().any(select_contains_impure)
 		|| source_contains_impure(&statement.source)
 		|| statement.joins.iter().any(|join| {
 			source_contains_impure(&join.source)

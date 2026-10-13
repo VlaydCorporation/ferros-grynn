@@ -93,7 +93,7 @@ implementation oracle и не могут использоваться как tar
 | `GQL-VECTOR`       | HNSW, затем DiskANN; KNN/ANN и HASHED_VECTOR                                                          | 23                                                                   | контракт утверждён / реализация отсутствует                         | Per-algorithm recall/latency/memory/build/recovery gates                                  |
 | `GQL-GEO-DERIVED`  | Geometry R-tree и graph-derived indexes                                                               | 24–25                                                                | `draft` / `missing`                                                 | Exact post-filter; `build_lsn`/`stale` fallback and rebuild tests                         |
 | `GQL-CHANGEFEED`   | Durable CLASS/GRAPH history и самостоятельный Rust SDK                                                | 27                                                                   | C0–C9 и C10 full/backend correctness PASS; performance/tooling OPEN | NET/FULL, whole-commit cursor/GAP, unified WAL, bounded retention; stage-27 report        |
-| `GQL-LIVE-EVENTS`  | `LIVE SELECT`, events, LiveGraph integration                                                          | 28–29                                                                | Stage 28 `partial`; Stage 29 `missing`; closure OPEN                | LIVE SDK/LET/queues/ACK, JOIN/DIFF/PATCH; L10 metadata/counters/plans; L11 и closure OPEN |
+| `GQL-LIVE-EVENTS`  | `LIVE SELECT`, events, LiveGraph integration                                                          | 28–29                                                                | Stage 28 `partial`; Stage 29 correctness/resource PASS; closure OPEN | Events/outbox/import; shared RETURN GRAPH, selector Conflict, flush/resnapshot; full1334/1342/1351+88 tests PASS; fixed8 performance/control inconclusive, общий Q-14 tooling debt |
 | `GQL-BRIDGES`      | `Bridge`, `.use_bridge`, `BridgeData`, `SurrealBridge`                                                | 30                                                                   | `draft` / `missing`                                                 | Public-value boundary, external failure mapping и cross-database E2E                      |
 
 ## Утверждённый срез GrynQL P0–P2
@@ -963,8 +963,10 @@ storage-интеграция зависит от B.
   common2/9 criteria PASS. Attempts3–5 не запущены; closure OPEN.
   После пятой неудачи оптимизации прекращаются,
   оставшаяся работа продолжается с открытым performance gate.
-- **`LiveGraph<Frozen>`** 🔴 — COW delta, atomic publish frozen revision и revision guard.
-- **`LiveGraph<Mutable>`** 🔴 — dirty-set, incoming queue, pause-on-conflict и явные
+- **`LiveGraph<Frozen>`** 🟡 — общий RETURN GRAPH, owned checkpoints/deltas,
+  whole-commit apply/ACK, explicit resnapshot и immutable revision guards реализованы;
+  Stage29 closure gates OPEN.
+- **`LiveGraph<Mutable>`** 🟡 — qualified dirty-set, incoming queue, typed conflict branch и явные
   `accept_remote`/`keep_local`/`discard_local`/`rebase`/`flush`/`resume`; ни remote delta, ни
   local changes не коммитятся при конфликте автоматически.
 

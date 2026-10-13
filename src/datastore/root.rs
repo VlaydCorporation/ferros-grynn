@@ -64,6 +64,11 @@ pub(crate) struct DatabaseRoot {
 /// Snapshot-owned historical state cloned as one handle by ordinary reads.
 #[derive(Clone, Default)]
 struct HistoryRoot {
+	/// Accepted invocations share snapshot ownership with logical history.
+	events: Arc<super::EventOutbox>,
+	/// Snapshot-exact physical journal descriptors, separate from logical
+	/// payloads.
+	event_segments: Arc<Vec<crate::storage::HistorySegment>>,
 	/// Reactive definitions share snapshot ownership with retained history.
 	live: Arc<super::LiveCatalog>,
 	/// Definitions survive removal of the current schema owner.
@@ -165,6 +170,43 @@ impl Default for DatabaseRoot {
 }
 
 impl DatabaseRoot {
+	/// Reads invocation authority from the exact immutable transaction root.
+	pub(crate) fn event_outbox(&self) -> &Arc<super::EventOutbox> {
+		&self.history_binding.events
+	}
+
+	/// Detaches only accepted invocation state on enqueue or marker
+	/// publication.
+	pub(crate) fn event_outbox_mut(&mut self) -> &mut Arc<super::EventOutbox> {
+		&mut Arc::make_mut(&mut self.history_binding).events
+	}
+
+	/// Admits only the invocation namespace, independently of data and LIVE
+	/// maps.
+	pub(crate) fn event_revision_copy_bytes(&self) -> FerrosGrynnResult<usize> {
+		self.versions.event_copy_bytes(1)
+	}
+
+	/// Completion retention bounds its FCW metadata as well as the outbox map.
+	pub(super) fn retain_event_revisions(&mut self) {
+		let outbox = Arc::clone(self.event_outbox());
+		Arc::make_mut(&mut self.versions).retain_event_invocations(&outbox);
+	}
+
+	/// Borrows durable outbox reachability without loading payload pages.
+	pub(crate) fn event_outbox_segments(&self) -> &Arc<Vec<crate::storage::HistorySegment>> {
+		&self.history_binding.event_segments
+	}
+
+	/// Associates a prepared/recovered physical journal with the logical
+	/// snapshot.
+	pub(crate) fn set_event_outbox_segments(
+		&mut self,
+		segments: Arc<Vec<crate::storage::HistorySegment>>,
+	) {
+		Arc::make_mut(&mut self.history_binding).event_segments = segments;
+	}
+
 	/// Checks leased primary/schema/capture inputs independently of LIVE
 	/// control commits and transfers the latest complete history binding.
 	///
@@ -201,7 +243,7 @@ impl DatabaseRoot {
 		let stamp = current.commit_ts.checked_add(1).ok_or_else(|| {
 			FerrosGrynnError::serialization_failure(transaction, "the commit clock is exhausted")
 		})?;
-		let controls_changed = !self.versions.same_live(&current.versions);
+		let controls_changed = !self.versions.same_controls(&current.versions);
 		let restamp = from != stamp;
 		let restamp_primary = restamp && self.versions.primary_has_revision(from);
 		if controls_changed || restamp_primary {
@@ -1051,6 +1093,7 @@ impl DatabaseRoot {
 		transition_graph: Option<GraphId>,
 	) -> FerrosGrynnResult<AtomId> {
 		self.require_kind(global, AtomKind::Edge)?;
+		self.validate_qualified_incidence(graph, &topology)?;
 		let atom = self
 			.atom(global)
 			.cloned()
@@ -1094,6 +1137,7 @@ impl DatabaseRoot {
 		transition_graph: Option<GraphId>,
 	) -> FerrosGrynnResult<()> {
 		self.require_kind(global, AtomKind::Edge)?;
+		self.validate_qualified_incidence(graph, &topology)?;
 		let atom = self
 			.atom(global)
 			.cloned()
@@ -1286,6 +1330,13 @@ impl DatabaseRoot {
 		local: AtomId,
 		state: OccurrenceState,
 	) -> FerrosGrynnResult<()> {
+		if let OccurrenceState::Edge {
+			topology,
+			..
+		} = &state
+		{
+			self.validate_qualified_incidence(graph, topology)?;
+		}
 		self.graph(graph)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?
 			.validate_state(local, &state)?;

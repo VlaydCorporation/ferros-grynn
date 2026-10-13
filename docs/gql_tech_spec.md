@@ -8,10 +8,11 @@
 
 ## Утверждённый технический профиль этапов 20–21
 
-**Статус профиля:** `implemented` (2026-09-29). Dependency order и gates задают
-[`gql_admin_stage_20_plan.md`](gql_admin_stage_20_plan.md) и
-[`gql_udf_stage_21_plan.md`](gql_udf_stage_21_plan.md); evidence находится в одноимённых
-отчётах каталога `reports/`.
+**Статус профиля:** `implemented` (2026-09-29). Administrative jobs и durable named UDF
+используют общий schema catalog, transaction controls и publication. Job lifecycle обязан
+сохранять атомарность при enqueue/cancellation/restart; function publication требует parse,
+type/effect/cycle validation. Correctness проверяется на RAM и Windows Sync/NativeAsync,
+включая reopen/recovery, resource exhaustion и cancellation.
 
 Stage 20 добавляет один concrete `MaintenanceCoordinator` на datastore: FIFO worker на
 `std::thread + Mutex + Condvar`, durable `FGJB v1`, cooperative cancellation и publication
@@ -46,8 +47,9 @@ ICU4X sort keys учитываются в общем barrier budget и transient
 ## Утверждённый технический профиль этапов 15–16
 
 **Статус профиля:** `approved-for-implementation`. Этот раздел заменяет технический
-P0–P2-профиль MATCH; dependency order и gates задаёт
-[`gql_match_stages_15_16_plan.md`](gql_match_stages_15_16_plan.md).
+P0–P2-профиль MATCH. Все graph modes используют один analyzer/executor, statement snapshot
+и qualified bindings. Index и scan paths, RAM и local backends обязаны сохранять одинаковые
+bag/path results, error order, SSI predicates и resource/cancellation semantics.
 
 Единый pipeline остаётся:
 
@@ -169,7 +171,10 @@ ClassScan / RecordLookup
 
 **Вне охвата:** физический формат страниц и байтовые раскладки (это `disk_storage_spec.md`); грамматика (это `gql_grammar.md`); семантика операторов языка (это `gql_spec.md`).
 
-> **Важно об архитектуре хранения.** Ранние черновики этого файла описывали LSM-дерево (L0/L1/compaction). Это устранено: `disk_storage_spec.md` §20.2.8 отклоняет LSM в пользу B+tree. Модель дискового режима — **frame-WAL (COW в логе) + бэкфилл на штатные места + MVCC через индекс версий страниц**, журнал единый на базу данных (§12). См. [implementation_plan.md](implementation_plan.md) §1.2.
+> **Архитектура хранения:** B+tree и единый database-level frame-WAL. Изменённые страницы
+> создаются как COW frames в логе; checkpoint выполняет backfill на штатные места, а MVCC
+> выбирает snapshot-visible версии через индекс страниц. LSM, раздельные DiskWal/MvccWal
+> и physical-WAL с ARIES/UNDO не являются альтернативными production contracts.
 
 ---
 
@@ -198,7 +203,7 @@ Fail-closed неприятнее в моменте, но честнее в эк�
 
 Архитектурные контракты выражаются через код: traits, инварианты типов, паттерны. Ключевые интерфейсы-границы:
 
-- **`SyncPageManager`** ([implementation_plan.md](implementation_plan.md) §3.3) — единый
+- **`SyncPageManager`** — единый
   crate-private Windows-first manager под frame-WAL: `TxHandle` владеет snapshot-регистрацией,
   `PageRead<'tx>` объединяет staged borrow и immutable `PageGuard`; recovery остаётся внутренним,
   а checkpoint доступен через `Datastore::checkpoint(Passive | Restart)`. Trait с единственной
@@ -892,8 +897,10 @@ materialization нужна только явной мутации или реж�
 ### 10.2. Абстракция страничного доступа
 
 Исполнитель никогда не читает файлы напрямую — только через crate-private concrete
-`SyncPageManager` поверх `HybridReadEngine`. Полное определение действующей frame-WAL-редакции — в
-[implementation_plan.md](implementation_plan.md) §3.3. `read_page(&TxHandle, ...)` возвращает
+`SyncPageManager` поверх `HybridReadEngine`. `begin_tx` регистрирует snapshot в TxHandle;
+`stage_frame` сохраняет private изменённую страницу, не перезаписывая home page.
+`commit_tx` валидирует candidate и публикует frames/catalog одним WAL barrier;
+`abort_tx` освобождает private frames без UNDO/CLR. `read_page(&TxHandle, ...)` возвращает
 `PageRead<'tx>` (staged borrow или immutable cache guard), `read_pages` сохраняет порядок и
 дубликаты. Snapshot живёт внутри зарегистрированного `TxHandle`, а не передаётся голым token.
 LSN и checksum назначает WAL-слой. Checkpoint не бэкфиллит версии новее самого старого живого
@@ -1007,8 +1014,17 @@ let working = query_to_memory::<Dag<Mutable>, _>(&view)?;
 
 ### 10.7. Graph family и type-state
 
+SELECT и LIVE SELECT используют общий terminal RETURN GRAPH: AST и analyzer понижают
+family/validators/ROOT/node/edge selectors в LogicalReturnGraph. GraphAssemblyAccumulator
+выполняет assembly, endpoint/containment closure и family validators. Multi-source,
+JOIN/SPLIT/grouping и reactive bindings сохраняют обычную SELECT semantics; selectors
+читают projected rows после полного row pipeline/window, а SELECT ONLY проверяет
+cardinality до assembly. Scalar subquery возвращает один owned graph value. Qualified
+occurrence сохраняет scope; global edge без occurrence не получает синтетической topology.
+Executable IR и Value::Graph не становятся durable value representation.
+
 Общие публичные типы: `Graph<State>`, `Tree<State>`, `RootedTree<State>`, `Forest<State>`,
-`Dag<State>`, `Hypergraph<State>`, `Metagraph<State>`, где `State = Mutable | Frozen`.
+`Dag<State>`, `Hypergraph<State>`, `Metagraph<State>`, `Subgraph<State>`, где `State = Mutable | Frozen`.
 Один универсальный backing для всех типов не используется:
 
 - general family — универсальная multi-hyper-meta topology;
@@ -1022,15 +1038,131 @@ views не перестраивают данные; сужающие conversions
 
 ### 10.8. Live graph materialization
 
-`LiveGraph<Frozen>` хранит atomically replaceable `Arc` текущей frozen revision. Changefeed
-delta применяется к copy-on-write chunks, валидируется и публикуется одним swap; `read()`
-возвращает guard одной revision.
+`LiveGraph<State, G = Graph<State>>`, LiveReadGuard и LiveUpdate используют sealed contract
+всех восьми families, включая Subgraph, с раздельными layouts/validators и существующим COW.
+Frozen хранит atomically replaceable Arc текущей revision; read() возвращает guard одной
+immutable revision. Старые guards остаются валидны после новых publications.
 
-`LiveGraph<Mutable>` дополнительно содержит local dirty-set и incoming queue. При пересечении
-remote delta с dirty-set подписка ставится на паузу и выдаёт `LiveEvent::Conflict` с incoming,
-local, conflicts и remote revision. Delta не применяется автоматически. После явного
-`accept_remote`/`keep_local`/`discard_local`/`rebase`/`flush`/`resume` повторно проверяются
-инварианты graph family.
+Initial и subsequent results вычисляются общим root-bound SELECT/RETURN GRAPH executor
+на одном candidate root до WAL barrier. Dependencies включают topology, membership,
+properties, closure-required atoms и binding revisions; они повторно проверяются перед
+publication. Topology-only change учитывается при неизменной row projection. Используется
+canonical diff предыдущего/нового owned logical graph image, без отдельного incremental
+query executor. Image хранит root/source/derived scope identities, AtomRef, ordered qualified
+endpoint/owner routes, effective properties с owned names, family/validators каждого scope
+и source ClassId/snapshot Versionstamp. Derived scope определяется canonical owner route;
+runtime UUID служит только capture-local deduplication. AtomId не сохраняется. same_value
+определяет equality, а изменение одного watermark не меняет graph content.
+
+LIVE descriptor/history содержит отдельный graph payload; general StorageValue codec не
+расширяется. Initial checkpoint и whole commit deltas публикуются общим LIVE/WAL pipeline.
+Retention сохраняет checkpoint для первого replay interval; потеря coverage даёт GAP, без
+обращения к current primary. Checkpoints принадлежат transactional root независимо от
+CHANGEFEED policy; catalog хранит компактную ссылку на whole-group файл LIVE transport.
+Active/paused/closed checkpoints ограничены 256 MiB на datastore; publication и recovery
+проверяют один accounting contract, decoder имеет отдельный scratch budget. FGLG/FGLB
+и logical recipe formats определены непосредственно в disk_storage_spec.md §21.2.
+
+Datastore::subscribe_live_graph(...) и LiveGraphSubscription<State, G> предоставляют
+polling/cursor/close/materialization и явный переход в Mutable. Incarnation сохраняет
+result identity, remote watermark берётся из Versionstamp. Automatic adapter использует
+qualified logical identity/source mapping. ACK следует за принятием целого delta;
+ACK failure сохраняет applied-but-unconfirmed token, повтор delivery не применяет delta
+снова. Pending/base/dirty/queue меняются только после успешной проверки полного candidate.
+Paused callback adapter проверяет candidate поверх принятого remote tail, удерживая один
+COW tail вместо повторного проигрывания всей очереди.
+
+Mutable хранит local dirty-set и bounded incoming queue. Disjoint delta применяется
+автоматически; dirty intersection приостанавливает применение и ACK и выдаёт
+LiveGraphNext::Conflict с incoming/local changes, qualified conflicts и remote revision.
+Отдельно valid disjoint changes, совместно нарушающие family/topology/containment, также
+дают typed Conflict с diagnostic. Resource exhaustion остаётся обычной ошибкой.
+accept_remote/discard_local принимают remote state и очищают local changes; keep_local
+сохраняет актуальные local decisions поверх нового base, включая edits после notification;
+rebase строит explicit merged candidate из решений callback поверх incoming image.
+Каждый resolution проверяет family/topology/containment до смены состояния. Ошибка
+сохраняет conflict и прежнюю revision; resume не обходит unresolved conflict. Разные owned
+views одного logical child обязаны иметь одинаковое содержимое.
+
+flush принимает owned explicit Transaction и qualified однозначный write-back mapping,
+проверяет effective image/owner routes, FCW/SSI и общий validator. Другой datastore,
+unmapped/new atoms, derived scopes и stale effective image отклоняются до mutation.
+Accepted dependencies являются FCW requirements при любом isolation; Read Committed
+preflight/staging использует один statement root. CommitResult выдаётся после source
+barrier; exact checkpoint того же commit принимается и ACK-ится ordered polling.
+Последующая polling error не откатывает commit. Post-flush edits сохраняются отдельно
+от queued deltas; invalid merge даёт Conflict с last agreed revision. Resolution не
+откатывает source effects. Принятие более раннего delivery очищает старые decisions;
+следующий checkpoint не восстанавливает их как edits. Container bindings предшествуют
+final connector anchors; equal physical topology не отменяет explicit logical reselection.
+Уход child из result closure не удаляет source graph/atoms. GAP/fault сохраняет last agreed
+revision; явный resnapshot закрывает capture и создаёт новую Frozen incarnation. Старые
+materializations/guards сохраняются, переход новой подписки в Mutable выбирает caller.
+
+Mutable SDK surface включает selectable branch-based ожидание, в том числе
+отдельную typed conflict-ветку с ручным решением пользователя. Все ветки одного
+subscription разделяют одного delivery consumer и bounded pending state;
+cancellation/проигрыш ветки не теряет conflict/delta, не выполняет ACK и не
+меняет resolution. Surface совместим с `tokio::select!` без нового runtime.
+Один `LiveGraphSubscription::next_event()` предоставляет typed события;
+`live_graph_select!` сопоставляет их branches выбранному caller selector.
+Conflict notification не повторяется при каждом poll; `conflict()` сохраняет
+его frozen context, а resolution остаётся отдельным явным вызовом.
+Interned property names удерживаются в bounded registry между revisions; следующий wait
+допускает внешние commands/cancellation без busy loop на unresolved delivery.
+
+### 10.9. Events: dispatch, транзакции и durable execution
+
+Schema владеет checked EventId, EventDefinition/EventTarget, definitions и SchemaVersion;
+datastore — operation dispatch, outbox, savepoints и FCW/SSI; GQL — общим analyzer/evaluator;
+storage — bounded source descriptors, pages и recovery. DEFINE/ALTER/REMOVE EVENT ON
+CLASS/GRAPH и SDK registration/change/remove/read используют один catalog lifecycle.
+WHEN/THEN хранятся как source/logical descriptors со stable targets, без executable IR.
+WHEN допускает read-only effects, THEN — ordinary expressions/blocks/DML/UDF/control flow.
+External transaction control, IMPORT и административные jobs внутри handler запрещены.
+
+После успешной mutation общий boundary фиксирует historical context $event/$before/
+$after/$value/$input. CLASS получает logical CREATE/UPDATE/DELETE/RELATE, GRAPH — occurrence
+CREATE/DELETE, effective-image UPDATE и topology RELATE. Memberships, overlays, labels,
+topology и effective base fanout учитываются. Equality no-op и внутренние storage/index
+mutations не вызывают дополнительный dispatch; Changefeed operation ordinals сохраняются.
+Targets имеют canonical order, definitions — stable EventId order. GRAPH RELATE сохраняет
+null before/after и value с edge/qualified endpoints, включая ordered owner routes.
+
+Sync handlers исполняются в source transaction после mutation; outer mutation и handlers
+имеют одну rollback boundary. TRY/savepoint восстанавливает data, lexical state, event
+metadata и pending outbox. Nested mutations используют тот же dispatch/control-depth budget.
+Commit replay не запускает user code повторно; definitions, predicates и handler reads
+участвуют в FCW/SSI. Пользовательский evaluator не исполняется под commit mutex.
+
+ASYNC WHEN исполняется в source transaction; принятый invocation фиксирует definition
+version, context и transitive UDF source closure. ALTER/REMOVE влияет на будущие вызовы;
+existing invocation отменяется явно. Outbox authority — transactional root, admin ledger —
+восстанавливаемая проекция. Outbox/primary/Changefeed/LIVE публикуются одним WAL commit.
+Versioned FGEI/FGEO side-formats и source-only FGDC v14 описаны в disk_storage_spec.md §18.6;
+development format заменяется на месте без compatibility decoders.
+
+Общий maintenance worker последовательно чередует due event attempts и maintenance jobs;
+FG_ASYNC_EVENT_PROCESSING_INTERVAL default 5 секунд. Каждая попытка открывает новую transaction
+с актуальными данными, сохраняя исторический context. Success effects и completion marker
+публикуются атомарно; recovery проверяет marker, pending corruption даёт ошибку. RETRY default
+0, 0..=255 дополнительных attempts, identity/depth не меняются. Root ASYNC depth 0; вызов из
+EVENT увеличивает causal depth. MAXDEPTH default 3, 0..=16; ancestor limits сохраняются при
+sync/async переходах, превышение даёт typed error. External exactly-once не обещается.
+
+Pending admission: 10 000 invocations/64 MiB на datastore и transaction limits, до allocation/
+publication; overflow отклоняет source operation. INFO CLASS/GRAPH показывает Events,
+INFO JOB — state/attempts/depth/bounded diagnostic. KILL отменяет pending invocation либо
+cooperatively прерывает active attempt. Parallel event execution не входит в текущий контракт.
+
+ImportEventsMode Off/On (default Off) независим от CHANGEFEED. ON запускает sync handlers
+внутри item boundary и держит ASYNC invocations в bounded private spool до успешного END.
+SKIP/QUARANTINE откатывает item effects/invocations; abort/failed END ничего не публикует.
+Anchors переживают private seals и откатываются с item/TRY. AtomWalk V–V/V–E/E–V/E–E
+использует ordinary RELATE и общий qualified incidence validator. Explicit owner/terminal
+route фиксируется на attach/topology boundary; owner rebinding/BUILD overwrite не меняет
+принятую logical identity из-за совпадения physical slots. Новый route требует явного
+topology change или detach/reattach; equality no-op сохраняет anchors.
 
 ---
 
@@ -1412,19 +1544,32 @@ invocation хранит absent identity, conservative bounds и warning; tensor 
 
 ## 17. Соответствие кодовой базе
 
-> **Вынесено в [implementation_plan.md](implementation_plan.md) §1 «Соответствие кодовой базе».**
-> Таблица «компонент tech-spec → модуль → статус» и перечень того, что требует реализации,
-> объединены там с аналогичной таблицей `gql_spec.md` §31 в единый источник (без дублирования).
+Владельцы production contracts:
+
+| Область | Владелец и граница |
+|---------|-------------------|
+| Parse/AST | syn; storage access отсутствует |
+| Analysis/IR/execution | gql; один transaction/root-bound adapter, owned Value/RecordId results |
+| Schema/MVCC/publication | datastore; immutable roots, catalog, savepoints, FCW/SSI |
+| Pages/WAL/recovery | storage; checked versioned physical formats и private page guards |
+| Graph families/materialization | graph; family layouts, validators, COW и local AtomId |
+| LIVE recipes/delivery | live; owned logical identity, whole-commit ACK и SDK adapter |
+| Values/diagnostics/resources | values, gql_status, memory; общие codecs, typed errors и budgets |
+
+Пофайловый статус реализации не меняет требования этих интерфейсов. Reference trees и
+disconnected modules не являются behavioral authority; их подключение требует проверки
+тех же validation, errors, safety, cancellation, resource и platform contracts.
 
 ---
 
 ## 18. Отложено / вне MVP
 
-> **Вынесено в [implementation_plan.md](implementation_plan.md) §6 «Отложено / вне MVP».**
-> Сводный список отложенного (JIT, WCOJ, advanced storage-функции, ARIES/UNDO, параллельный
-> recovery, Linux Native Async I/O, SPDK, SMT-верификация
-> оптимизатора, тензорные кеши) собран там из `gql_tech_spec.md`,
-> `gql_spec.md` §32.3 и `disk_storage_spec.md`.
+JIT/operator fusion, WCOJ, parallel recovery, Linux Native Async I/O, SPDK и SMT-верификация
+не требуются для текущего production profile. Frame-WAL не требует ARIES/UNDO/CLR.
+Distributed execution не поддерживается. Graph-derived indexes и tensor caches описаны
+собственными нормативными разделами и не заменяют exact correctness path. Добавление
+оптимизации требует сохранения snapshot/error/constraint/resource semantics и измеренного
+выигрыша; отсутствие оптимизации не разрешает partial или approximate result.
 
 ---
 

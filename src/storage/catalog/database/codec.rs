@@ -1,4 +1,4 @@
-//! Canonical little-endian encoding for `FGDC v13`.
+//! Canonical little-endian encoding for `FGDC v14`.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +11,6 @@ use super::{
 	ClassIndexCatalogEntry,
 	DatabaseCatalog,
 	FunctionCatalogEntry,
-	FunctionParameterCatalogEntry,
 	GraphCatalogEntry,
 	GraphPropertyCatalogEntry,
 	ParameterCatalogEntry,
@@ -31,7 +30,6 @@ use crate::{
 		ClassSchemaMode,
 		DiskAnnIndexOptions,
 		FulltextIndexOptions,
-		FunctionEffect,
 		FunctionId,
 		HnswIndexOptions,
 		IndexId,
@@ -53,9 +51,11 @@ use crate::{
 
 const MAGIC: [u8; 4] = *b"FGDC";
 /// Current development layout; older catalogs are deliberately rejected.
-const VERSION: u16 = 13;
-const HEADER_BYTES: usize = 136;
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+const VERSION: u16 = 14;
+/// Fixed header including the source-only EVENT descriptor count.
+const HEADER_BYTES: usize = 144;
+/// Independent cap for the complete logical database catalog.
+pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
 
 pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
@@ -81,6 +81,8 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	write_u32(&mut output, catalog.live_queries.len(), "LIVE query count")?;
 	write_u32(&mut output, catalog.live_bindings.len(), "LIVE binding count")?;
 	write_u32(&mut output, catalog.live_history.len(), "LIVE history count")?;
+	write_u32(&mut output, catalog.events.len(), "EVENT count")?;
+	write_u32(&mut output, catalog.event_outbox_segments.len(), "EVENT outbox segment count")?;
 
 	for name in &catalog.time_zones {
 		write_string(&mut output, name.as_str(), "time-zone name")?;
@@ -95,7 +97,7 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 		encode_parameter(&mut output, parameter)?;
 	}
 	for function in &catalog.functions {
-		encode_function(&mut output, function)?;
+		super::function::encode(&mut output, function)?;
 	}
 	for analyzer in &catalog.analyzers {
 		encode_analyzer(&mut output, analyzer)?;
@@ -111,6 +113,12 @@ pub(super) fn encode(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Vec<u8>> {
 	}
 	for entry in &catalog.live_history {
 		super::live_history::encode(&mut output, entry)?;
+	}
+	for event in &catalog.events {
+		super::event::encode(&mut output, event)?;
+	}
+	for segment in &catalog.event_outbox_segments {
+		super::history_segment::encode(&mut output, *segment);
 	}
 	if output.len() > MAX_BYTES {
 		return Err(FerrosGrynnError::storage_decode_limit_exceeded(
@@ -170,6 +178,8 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	let live_count = decoder.read_count("LIVE query count")?;
 	let binding_count = decoder.read_count("LIVE binding count")?;
 	let history_count = decoder.read_count("LIVE history count")?;
+	let event_count = decoder.read_count("EVENT count")?;
+	let outbox_count = decoder.read_count("EVENT outbox segment count")?;
 	if changefeed_count > bytes.len().saturating_sub(HEADER_BYTES) / super::changefeed::MIN_BYTES {
 		return Err(invalid("changefeed count exceeds its encoded payload"));
 	}
@@ -194,6 +204,7 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 		.and_then(|total| {
 			total.checked_add(history_count.checked_mul(super::live_history::MIN_BYTES)?)
 		})
+		.and_then(|total| total.checked_add(event_count.checked_mul(super::event::MIN_BYTES)?))
 		.ok_or_else(|| invalid("catalog section counts overflow"))?;
 	if minimum_bytes > bytes.len().saturating_sub(HEADER_BYTES) {
 		return Err(invalid("catalog section counts exceed available encoded bytes"));
@@ -217,7 +228,7 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	}
 	let mut functions = Vec::with_capacity(function_count);
 	for _ in 0..function_count {
-		functions.push(decode_function(&mut decoder)?);
+		functions.push(super::function::decode(&mut decoder)?);
 	}
 	let mut analyzers = Vec::with_capacity(analyzer_count);
 	for _ in 0..analyzer_count {
@@ -281,8 +292,40 @@ pub(super) fn decode(bytes: &[u8]) -> FerrosGrynnResult<DatabaseCatalog> {
 	for _ in 0..history_count {
 		live_history.push(super::live_history::decode(&mut decoder, &mut budget)?);
 	}
+	if event_count > decoder.remaining_bytes() / super::event::MIN_BYTES {
+		return Err(invalid("EVENT count exceeds remaining catalog bytes"));
+	}
+	budget.admit(
+		event_count
+			.checked_mul(std::mem::size_of::<crate::datastore::EventDefinition>())
+			.ok_or_else(|| invalid("EVENT catalog allocation overflows"))?,
+	)?;
+	let mut events = Vec::new();
+	events
+		.try_reserve_exact(event_count)
+		.map_err(|error| invalid("EVENT catalog allocation failed").with_technical_source(error))?;
+	for _ in 0..event_count {
+		events.push(super::event::decode(&mut decoder, &mut budget)?);
+	}
+	if outbox_count > decoder.remaining_bytes() / 128 {
+		return Err(invalid("EVENT outbox segment count exceeds encoded bytes"));
+	}
+	budget.admit(
+		outbox_count
+			.checked_mul(std::mem::size_of::<crate::storage::HistorySegment>())
+			.ok_or_else(|| invalid("EVENT outbox segment bytes overflow"))?,
+	)?;
+	let mut event_outbox_segments = Vec::new();
+	event_outbox_segments.try_reserve_exact(outbox_count).map_err(|error| {
+		invalid("EVENT outbox segment allocation failed").with_technical_source(error)
+	})?;
+	for _ in 0..outbox_count {
+		event_outbox_segments.push(super::history_segment::decode(&mut decoder)?);
+	}
 	decoder.finish()?;
 	let catalog = DatabaseCatalog {
+		event_outbox_segments,
+		events,
 		database_uuid,
 		committed_at_ns,
 		changefeeds,
@@ -848,99 +891,6 @@ fn decode_parameter(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<ParameterCat
 	})
 }
 
-fn encode_function(output: &mut Vec<u8>, function: &FunctionCatalogEntry) -> FerrosGrynnResult<()> {
-	output.extend_from_slice(&function.id.get().to_le_bytes());
-	output.extend_from_slice(&function.version.get().to_le_bytes());
-	output.extend_from_slice(&function.published_at.to_le_bytes());
-	output.push(function_effect(function.effect));
-	output.push(u8::from(function.cost));
-	output.push(function.max_depth.unwrap_or(0));
-	output.push(0);
-	write_u16(output, function.parameters.len(), "function parameter count")?;
-	output.extend_from_slice(&0_u16.to_le_bytes());
-	write_u32(output, function.body.len(), "function body length")?;
-	write_string(output, function.namespace.as_str(), "function namespace")?;
-	write_string(output, function.name.as_str(), "function name")?;
-	type_codec::encode(output, &function.result, 0)?;
-	for parameter in &function.parameters {
-		write_string(output, parameter.name.as_str(), "function parameter name")?;
-		type_codec::encode(output, &parameter.value_type, 0)?;
-	}
-	write_optional_string(
-		output,
-		function.comment.as_ref().map(|comment| comment.as_str()),
-		"function comment",
-	)?;
-	output.extend_from_slice(function.body.as_bytes());
-	Ok(())
-}
-
-fn decode_function(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<FunctionCatalogEntry> {
-	let id = FunctionId::from_storage(decoder.read_u32()?)?;
-	let version = SchemaVersion::from_storage(decoder.read_u32()?)?;
-	let published_at = decoder.read_u64()?;
-	let effect = decode_function_effect(decoder.read_u8()?)?;
-	let cost = match decoder.read_u8()? {
-		0 => false,
-		1 => true,
-		_ => return Err(invalid("function cost flag is invalid")),
-	};
-	let max_depth = match decoder.read_u8()? {
-		0 => None,
-		value @ 1..=64 => Some(value),
-		_ => return Err(invalid("function recursion bound is invalid")),
-	};
-	decoder.expect_zero(1, "function reserved byte")?;
-	let parameter_count = usize::from(decoder.read_u16()?);
-	decoder.expect_zero(2, "function reserved bytes")?;
-	let body_len = decoder.read_count("function body length")?;
-	let namespace = read_string(decoder, "function namespace")?.into();
-	let name = read_string(decoder, "function name")?.into();
-	let result = type_codec::decode(decoder, 0)?;
-	let mut parameters = Vec::with_capacity(parameter_count);
-	for _ in 0..parameter_count {
-		parameters.push(FunctionParameterCatalogEntry {
-			name: read_string(decoder, "function parameter name")?.into(),
-			value_type: type_codec::decode(decoder, 0)?,
-		});
-	}
-	let comment = read_optional_string(decoder, "function comment")?.map(Into::into);
-	let body = std::str::from_utf8(decoder.read_exact(body_len)?)
-		.map_err(|_error| invalid("function body is not UTF-8"))?
-		.into();
-	Ok(FunctionCatalogEntry {
-		id,
-		version,
-		published_at,
-		namespace,
-		name,
-		parameters,
-		result,
-		effect,
-		cost,
-		max_depth,
-		body,
-		comment,
-	})
-}
-
-const fn function_effect(effect: FunctionEffect) -> u8 {
-	match effect {
-		FunctionEffect::Pure => 0,
-		FunctionEffect::Stable => 1,
-		FunctionEffect::Impure => 2,
-	}
-}
-
-fn decode_function_effect(value: u8) -> FerrosGrynnResult<FunctionEffect> {
-	match value {
-		0 => Ok(FunctionEffect::Pure),
-		1 => Ok(FunctionEffect::Stable),
-		2 => Ok(FunctionEffect::Impure),
-		_ => Err(invalid("function effect is invalid")),
-	}
-}
-
 fn encode_analyzer(output: &mut Vec<u8>, analyzer: &AnalyzerCatalogEntry) -> FerrosGrynnResult<()> {
 	output.extend_from_slice(&analyzer.id.get().to_le_bytes());
 	output.extend_from_slice(&analyzer.version.get().to_le_bytes());
@@ -1174,6 +1124,10 @@ pub(super) fn read_optional_string<'a>(
 	if value.len() > MAX_STRING_BYTES {
 		return Err(invalid(format!("{field} exceeds its format limit")));
 	}
+	if value.contains('\0') {
+		return Err(invalid(format!("{field} contains NUL")));
+	}
+	decoder.admit_heap(value.len().saturating_mul(2).saturating_add(64))?;
 	Ok(Some(value))
 }
 
@@ -1258,10 +1212,13 @@ pub(super) fn read_string(decoder: &mut Decoder<'_>, field: &str) -> FerrosGrynn
 	if value.contains('\0') {
 		return Err(invalid(format!("{field} contains NUL")));
 	}
+	decoder.admit_heap(value.len().saturating_mul(2).saturating_add(64))?;
 	Ok(value.to_owned())
 }
 
-fn write_u16(output: &mut Vec<u8>, value: usize, field: &str) -> FerrosGrynnResult<()> {
+/// Writes a checked catalog length without silently truncating the source
+/// descriptor.
+pub(super) fn write_u16(output: &mut Vec<u8>, value: usize, field: &str) -> FerrosGrynnResult<()> {
 	output.extend_from_slice(
 		&u16::try_from(value)
 			.map_err(|_error| invalid(format!("{field} exceeds u16")))?
@@ -1270,7 +1227,9 @@ fn write_u16(output: &mut Vec<u8>, value: usize, field: &str) -> FerrosGrynnResu
 	Ok(())
 }
 
-fn write_u32(output: &mut Vec<u8>, value: usize, field: &str) -> FerrosGrynnResult<()> {
+/// Writes a checked catalog length without silently truncating the source
+/// descriptor.
+pub(super) fn write_u32(output: &mut Vec<u8>, value: usize, field: &str) -> FerrosGrynnResult<()> {
 	output.extend_from_slice(
 		&u32::try_from(value)
 			.map_err(|_error| invalid(format!("{field} exceeds u32")))?
@@ -1410,9 +1369,14 @@ fn decode_storage_mode(value: u8) -> FerrosGrynnResult<GraphStorageMode> {
 	}
 }
 
-pub(super) struct Decoder<'a> {
+/// Consumes a bounded source descriptor without compatibility or executable-IR
+/// decoding.
+pub(in crate::storage) struct Decoder<'a> {
 	bytes: &'a [u8],
 	position: usize,
+	/// Frozen source decoding owns a ledger; ordinary catalog callers retain
+	/// their contract.
+	admission: Option<crate::storage::history_codec::CodecBudget>,
 }
 
 impl<'a> Decoder<'a> {
@@ -1421,11 +1385,36 @@ impl<'a> Decoder<'a> {
 		self.bytes.len().saturating_sub(self.position)
 	}
 
-	pub(super) fn new(bytes: &'a [u8]) -> Self {
+	/// Starts a checked decoder at the beginning of its owned descriptor slice.
+	pub(in crate::storage) fn new(bytes: &'a [u8]) -> Self {
 		Self {
 			bytes,
 			position: 0,
+			admission: None,
 		}
+	}
+
+	/// Bounds every owned source allocation by the enclosing codec's remaining
+	/// budget.
+	pub(super) fn bounded(bytes: &'a [u8], available: usize) -> FerrosGrynnResult<Self> {
+		let mut decoder = Self::new(bytes);
+		decoder.admission = Some(crate::storage::history_codec::CodecBudget::new(available, 0)?);
+		Ok(decoder)
+	}
+
+	/// Admits before strings, boxes or member vectors allocate.
+	pub(super) fn admit_heap(&mut self, bytes: usize) -> FerrosGrynnResult<()> {
+		match &mut self.admission {
+			Some(budget) => budget.admit(bytes),
+			None => Ok(()),
+		}
+	}
+
+	/// Transfers the private source reservation into the outer payload ledger.
+	pub(super) fn admitted_bytes(&self) -> usize {
+		self.admission
+			.as_ref()
+			.map_or(0, crate::storage::history_codec::CodecBudget::admitted_bytes)
 	}
 
 	pub(super) fn read_exact(&mut self, count: usize) -> FerrosGrynnResult<&'a [u8]> {
@@ -1481,7 +1470,9 @@ impl<'a> Decoder<'a> {
 		Ok(())
 	}
 
-	pub(super) fn finish(self) -> FerrosGrynnResult<()> {
+	/// Requires exact descriptor consumption so trailing bytes cannot hide
+	/// another record.
+	pub(in crate::storage) fn finish(self) -> FerrosGrynnResult<()> {
 		if self.position != self.bytes.len() {
 			return Err(invalid("database catalog contains trailing bytes"));
 		}

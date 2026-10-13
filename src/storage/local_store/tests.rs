@@ -39,7 +39,9 @@ use crate::{
 };
 
 mod changefeed_tests;
+mod event_outbox_tests;
 mod live_history_tests;
+mod qualified_incidence_tests;
 mod search_scope_tests;
 
 #[test]
@@ -538,7 +540,8 @@ fn every_prepublication_failure_discards_root_and_unreachable_generation() {
 }
 
 #[test]
-fn streamed_search_index_failures_discard_unreachable_generation() {
+fn streamed_search_index_failures_discard_unreachable_generation()
+-> crate::gql_status::FerrosGrynnResult<()> {
 	let directory = TestDirectory::new();
 	let options = LocalOptions::default();
 	let store = Datastore::create_local(&directory.0, options).unwrap();
@@ -553,7 +556,41 @@ fn streamed_search_index_failures_discard_unreachable_generation() {
 		)
 		.unwrap();
 	assert!(setup.iter().all(|result| result.result.is_ok()));
-	let generation_count = generation_directories(&directory.0);
+	let generations =
+		|| -> crate::gql_status::FerrosGrynnResult<std::collections::BTreeSet<PathBuf>> {
+			let io = |error| {
+				crate::gql_status::FerrosGrynnError::invalid_storage_file(
+					"test generation scan failed",
+				)
+				.with_technical_source(error)
+			};
+			let mut result = std::collections::BTreeSet::new();
+			for family in ["atoms", "graphs"] {
+				let entries = match fs::read_dir(directory.0.join(family)) {
+					Ok(entries) => entries,
+					Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+					Err(error) => return Err(io(error)),
+				};
+				for entry in entries {
+					let entry = entry.map_err(io)?;
+					if !entry.file_type().map_err(io)?.is_dir() {
+						continue;
+					}
+					if family == "atoms" {
+						result.insert(entry.path());
+					} else {
+						for generation in fs::read_dir(entry.path()).map_err(io)? {
+							let generation = generation.map_err(io)?;
+							if generation.file_type().map_err(io)?.is_dir() {
+								result.insert(generation.path());
+							}
+						}
+					}
+				}
+			}
+			Ok(result)
+		};
+	let baseline_generations = generations()?;
 
 	let definitions = [
 		(
@@ -589,7 +626,14 @@ fn streamed_search_index_failures_discard_unreachable_generation() {
 
 			assert!(define[0].result.is_err());
 			assert!(store.class("document").unwrap().indexes().all(|index| index.name() != name));
-			assert_eq!(generation_directories(&directory.0), generation_count);
+			// Cleanup may retire an older unpinned baseline generation; no
+			// failed build may leave a new UUID directory behind.
+			let remaining = generations()?;
+			assert!(
+				remaining.is_subset(&baseline_generations),
+				"failed {name} build leaked generations: {remaining:?}; baseline: \
+				 {baseline_generations:?}"
+			);
 			assert!(
 				store.begin().atom(&"document:a".parse::<RecordId>().unwrap()).unwrap().is_some()
 			);
@@ -600,6 +644,7 @@ fn streamed_search_index_failures_discard_unreachable_generation() {
 	let reopened = Datastore::open_local(&directory.0, options).unwrap();
 	assert!(reopened.class("document").unwrap().indexes().next().is_none());
 	assert!(reopened.begin().atom(&"document:a".parse::<RecordId>().unwrap()).unwrap().is_some());
+	Ok(())
 }
 
 #[test]

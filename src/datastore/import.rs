@@ -83,6 +83,19 @@ pub enum ImportChangefeedMode {
 	On,
 }
 
+/// Event dispatch is independent of source history capture during atomic
+/// import.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ImportEventsMode {
+	/// Suppresses handlers and accepted invocations during import.
+	#[default]
+	Off,
+	/// Runs synchronous handlers and retains asynchronous invocations until
+	/// END.
+	On,
+}
+
 /// Stable public identity of one immutable rejected-item set.
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Ord, Hash)]
 #[repr(transparent)]
@@ -191,6 +204,8 @@ impl Iterator for QuarantineReader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ImportOptions {
+	/// Handler dispatch; disabled independently of CHANGEFEED by default.
+	pub events: ImportEventsMode,
 	/// Accepted-item history capture; disabled by default.
 	pub changefeed: ImportChangefeedMode,
 	/// Index-maintenance policy.
@@ -218,6 +233,7 @@ impl Default for ImportOptions {
 	fn default() -> Self {
 		Self {
 			changefeed: ImportChangefeedMode::Off,
+			events: ImportEventsMode::Off,
 			indexes: ImportIndexMode::Deferred,
 			constraints: ImportConstraintMode::Deferred,
 			on_violation: ImportViolationPolicy::Abort,
@@ -798,6 +814,7 @@ impl Datastore {
 				options.on_violation,
 				graph_scope,
 				options.changefeed,
+				options.events,
 				commit_ts,
 			);
 			(lease, transaction, commit_ts)
@@ -821,6 +838,11 @@ impl Datastore {
 		report.built_indexes = built_indexes;
 
 		let publication_started = Instant::now();
+		let _notification = self.inner.live_consumers.notification();
+		let event_jobs = transaction.has_import_event_jobs();
+		if event_jobs {
+			self.inner.maintenance.start(&self.inner)?;
+		}
 		if changed || quarantine.is_some() {
 			let mut published = false;
 			for _attempt in 0..8 {
@@ -869,6 +891,9 @@ impl Datastore {
 		report.phase_timings.insert("publication".to_owned(), publication_started.elapsed());
 		report.phase_timings.insert("total".to_owned(), started.elapsed());
 		drop(lease);
+		if event_jobs {
+			self.inner.maintenance.wake_events();
+		}
 		Ok(report)
 	}
 }

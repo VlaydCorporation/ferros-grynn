@@ -1,6 +1,6 @@
 //! Exact net result preparation; delivery never re-evaluates primary records.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use crate::{
 	datastore::{BindingAdmission, ConflictKey, DatabaseRoot, LiveDefinition},
@@ -37,17 +37,25 @@ pub(super) fn suppress_import_history(next: &mut DatabaseRoot) -> FerrosGrynnRes
 			.with_technical_source(error)
 	})?;
 	for (id, payload) in next.live_catalog().prepared.iter() {
-		if let LivePayload::Batch(batch) = payload.as_ref() {
+		let captured = match payload.as_ref() {
+			LivePayload::Batch(batch) => Some((batch.version(), batch.versionstamp())),
+			LivePayload::Graph(batch) => Some((batch.version(), batch.versionstamp())),
+			LivePayload::Gap(_)
+			| LivePayload::Fault {
+				..
+			} => None,
+		};
+		if let Some((version, stamp)) = captured {
 			let gap = LivePayload::Gap(LiveGap {
 				id: *id,
 				reason: LiveGapReason::ImportSuppressed,
-				from: Some(batch.stamp),
-				through: Some(batch.stamp),
+				from: Some(stamp),
+				through: Some(stamp),
 			});
 			let bytes = crate::storage::live_history::encode(
 				&gap,
 				*id,
-				batch.version,
+				version,
 				next.commit_ts,
 				next.committed_at_ns,
 				budget.remaining_options()?.scratch_bytes(),
@@ -114,6 +122,14 @@ pub(super) fn evaluate_queries(
 	let mut root = Arc::new(next.clone());
 	let mut prepared = Vec::new();
 	let mut encoded = Vec::new();
+	let mut graph_encoded = Vec::new();
+	graph_encoded.try_reserve_exact(count).map_err(|error| {
+		FerrosGrynnError::traversal_resource_limit_exceeded(
+			"LIVE graph checkpoint envelopes",
+			count as u64,
+		)
+		.with_technical_source(error)
+	})?;
 	encoded.try_reserve_exact(count).map_err(|_error| {
 		FerrosGrynnError::traversal_resource_limit_exceeded("LIVE encoded envelopes", count as u64)
 	})?;
@@ -152,8 +168,9 @@ pub(super) fn evaluate_queries(
 		);
 		match result {
 			Ok(PreparedEvaluation {
-				batch,
+				payload,
 				envelope,
+				graph_checkpoint,
 				capture_source: source,
 				capture_scope_name,
 				rhs_scope_anchors,
@@ -179,32 +196,23 @@ pub(super) fn evaluate_queries(
 					entry.published_at = stamp;
 					candidate.mark_version(ConflictKey::LiveDefinition(id), stamp);
 				}
-				if !batch.events.is_empty() {
-					let bytes = batch
-						.events
-						.iter()
-						.try_fold(512_usize, |bytes, entry| {
-							bytes
-								.checked_add(
-									entry.before.as_ref().map_or(0, Value::estimated_heap_bytes),
-								)?
-								.checked_add(
-									entry.after.as_ref().map_or(0, Value::estimated_heap_bytes),
-								)?
-								.checked_add(entry.identity.estimated_heap_bytes())?
-								.checked_add(
-									entry.output.as_ref().map_or(0, |output| output.reserved_bytes),
-								)?
-								.checked_add(192)
-						})
-						.ok_or_else(|| {
-							FerrosGrynnError::operation_overflow("LIVE candidate batch bytes")
-						})?;
-					budget.admit(bytes, batch.events.len() as u64)?;
-					if let Some(bytes) = bytes_for_batch(envelope, &mut budget)? {
+				let envelope = bytes_for_batch(envelope, &mut budget)?;
+				if let Some(checkpoint) = graph_checkpoint {
+					let bytes = envelope.as_ref().ok_or_else(|| {
+						FerrosGrynnError::invalid_storage_file("graph checkpoint has no envelope")
+					})?;
+					budget.admit(512, 1)?;
+					Arc::make_mut(Arc::make_mut(&mut root).live_catalog_mut())
+						.replace_graph_checkpoint(id, checkpoint)?;
+					graph_encoded.push((id, Arc::clone(bytes)));
+				}
+				if let Some(payload) = payload {
+					let cost = crate::datastore::live_queue::Footprint::payload(&payload)?;
+					budget.admit(cost.bytes, cost.entries as u64)?;
+					if let Some(bytes) = envelope {
 						encoded.push((id, bytes));
 					}
-					prepared.push((id, Arc::new(LivePayload::Batch(batch))));
+					prepared.push((id, Arc::new(payload)));
 				}
 			}
 			Err(error) if pending => return Err(error),
@@ -232,6 +240,8 @@ pub(super) fn evaluate_queries(
 	}
 	Arc::make_mut(Arc::make_mut(&mut root).live_catalog_mut()).prepared = prepared.into();
 	Arc::make_mut(Arc::make_mut(&mut root).live_catalog_mut()).prepared_encoded = encoded.into();
+	Arc::make_mut(Arc::make_mut(&mut root).live_catalog_mut()).prepared_graphs =
+		graph_encoded.into();
 	*next = Arc::unwrap_or_clone(root);
 	Ok(())
 }
@@ -330,9 +340,11 @@ fn prepare_fault(
 /// independent.
 struct PreparedEvaluation {
 	/// Whole-commit result, possibly empty.
-	batch: LiveBatch,
+	payload: Option<LivePayload>,
 	/// Exact durable bytes when the batch has events.
 	envelope: Option<Vec<u8>>,
+	/// Activation also persists its accepted image without issuing a delivery.
+	graph_checkpoint: Option<Arc<crate::live::LiveGraphBatch>>,
 	/// Successful root source owner.
 	capture_source: crate::changefeed::ChangefeedSource,
 	/// Successful string scope operand paired with that owner.
@@ -433,12 +445,12 @@ fn evaluate_one_admitted(
 			})
 			.transpose()?
 			.unwrap_or(false);
-	let old = if pending && !historical_rows {
+	let old = if definition.query.graph_result().is_some() || pending && !historical_rows {
 		None
 	} else {
 		Some(evaluate(before, budget)?)
 	};
-	let new = evaluate(after, budget)?;
+	let mut new = evaluate(after, budget)?;
 	let capture_source = new.capture_source;
 	if pending {
 		validate_evaluation(&new, budget)?;
@@ -465,6 +477,70 @@ fn evaluate_one_admitted(
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let capture_scope_name = new.capture_scope_name;
 	let rhs_scope_anchors = new.rhs_scope_anchors;
+	if let Some(image) = new.graph_image.take() {
+		let prior = before.live_catalog().graph_checkpoints.get(&definition.id);
+		if !pending && prior.is_none() {
+			return Err(FerrosGrynnError::invalid_storage_file(
+				"LIVE graph lost its accepted checkpoint",
+			));
+		}
+		let base = prior.map_or(0.into(), |batch| batch.versionstamp());
+		let previous = prior.map(|batch| Arc::clone(&batch.delta.after));
+		let admission = RefCell::new(&mut *budget);
+		let delta = crate::live::LiveGraphDelta::between(
+			previous,
+			Arc::new(image),
+			base,
+			after.commit_ts.into(),
+			&|bytes, work| admission.borrow_mut().admit(bytes, work),
+		)?;
+		let changed = pending || !delta.changes().is_empty();
+		if !changed {
+			return Ok(PreparedEvaluation {
+				payload: None,
+				envelope: None,
+				graph_checkpoint: None,
+				capture_source,
+				capture_scope_name,
+				rhs_scope_anchors,
+			});
+		}
+		let checkpoint = Arc::new(crate::live::LiveGraphBatch {
+			id: definition.id,
+			version: definition.version,
+			committed_at: DateTime::from(
+				jiff::Timestamp::from_nanosecond(after.committed_at_ns)?
+					.to_zoned(jiff::tz::TimeZone::UTC),
+			),
+			delta,
+			bindings,
+		});
+		after.live_catalog().graph_checkpoint_total(definition.id, &checkpoint)?;
+		let payload = LivePayload::Graph(Arc::clone(&checkpoint));
+		if !crate::datastore::live_queue::Footprint::fits_empty(&payload, &definition.options)? {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"LIVE graph whole commit exceeds an empty queue",
+				definition.options.queue_bytes() as u64,
+			));
+		}
+		let maximum = budget.remaining_options()?.scratch_bytes();
+		let envelope = Some(crate::storage::live_history::encode(
+			&payload,
+			definition.id,
+			definition.version,
+			after.commit_ts,
+			after.committed_at_ns,
+			maximum,
+		)?);
+		return Ok(PreparedEvaluation {
+			payload: (!pending).then_some(payload),
+			envelope,
+			graph_checkpoint: Some(checkpoint),
+			capture_source,
+			capture_scope_name,
+			rhs_scope_anchors,
+		});
+	}
 	let events = match old {
 		None => Vec::new(),
 		Some(old) => net_changes(old.rows, new.rows, budget)?,
@@ -512,16 +588,14 @@ fn evaluate_one_admitted(
 			maximum,
 		)?)
 	};
-	match payload {
-		LivePayload::Batch(batch) => Ok(PreparedEvaluation {
-			batch,
-			envelope: bytes,
-			capture_source,
-			capture_scope_name,
-			rhs_scope_anchors,
-		}),
-		_ => Err(FerrosGrynnError::invalid_storage_file("LIVE batch preparation changed its kind")),
-	}
+	Ok(PreparedEvaluation {
+		payload: has_events.then_some(payload),
+		envelope: bytes,
+		graph_checkpoint: None,
+		capture_source,
+		capture_scope_name,
+		rhs_scope_anchors,
+	})
 }
 
 /// Admits the final shared bytes and their temporary Vec-to-Arc copy before
@@ -563,6 +637,19 @@ pub(super) fn admit_evaluation(
 			bytes.checked_add(evaluation.capture_scope_name.as_ref().map_or(0, |name| name.len()))
 		})
 		.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE retained result scratch"))?;
+	let bytes = bytes
+		.checked_add(evaluation.graph.as_ref().map_or(0, |graph| graph.estimated_heap_bytes()))
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE graph retained scratch"))?;
+	let bytes = bytes
+		.checked_add(
+			evaluation
+				.graph_image
+				.as_ref()
+				.map(crate::live::LiveGraphImage::estimated_heap_bytes)
+				.transpose()?
+				.unwrap_or(0),
+		)
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("LIVE graph image retained scratch"))?;
 	budget.admit(bytes, evaluation.work_used).and_then(|()| {
 		budget.admit(
 			crate::datastore::LiveRhsScopeAnchor::retained_bytes(&evaluation.rhs_scope_anchors)?,
@@ -577,6 +664,10 @@ pub(super) fn validate_evaluation(
 	budget: &mut BindingAdmission,
 ) -> FerrosGrynnResult<()> {
 	let maximum = budget.remaining_options()?.scratch_bytes();
+	if let Some(image) = &evaluation.graph_image {
+		let bytes = crate::storage::live_graph_image::encode(image, maximum)?;
+		return budget.admit(bytes.len(), 1);
+	}
 	let (bytes, work) =
 		crate::storage::live_history::validate_rows(evaluation.rows.iter(), maximum)?;
 	budget.admit(bytes, work)

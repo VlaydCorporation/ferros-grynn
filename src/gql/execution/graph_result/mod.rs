@@ -5,6 +5,7 @@ use std::{
 	mem::size_of,
 };
 
+mod cursor;
 mod hierarchy;
 
 use hierarchy::{materialize_hierarchy, resolve_root};
@@ -45,7 +46,7 @@ struct GraphSelection {
 }
 
 /// One statement-local, non-spilling owned graph builder.
-pub(super) struct GraphAssemblyAccumulator<'a> {
+pub(in crate::gql) struct GraphAssemblyAccumulator<'a> {
 	root_hint: Option<GraphRef>,
 	graphs: BTreeMap<GraphId, GraphRef>,
 	selections: BTreeMap<GraphId, GraphSelection>,
@@ -59,6 +60,94 @@ pub(super) struct GraphAssemblyAccumulator<'a> {
 }
 
 impl<'a> GraphAssemblyAccumulator<'a> {
+	/// Uses the same source scope as an ordinary SELECT graph terminal.
+	pub(in crate::gql) fn for_select(
+		read: &RootRead<'_>,
+		plan: &LogicalSelect,
+		slots: &[Value],
+		control: &'a ExecutionControl,
+	) -> FerrosGrynnResult<Self> {
+		let (_, root_hint) = select::bind_terminal_graph_scope(
+			read,
+			read.snapshot()?,
+			plan,
+			slots,
+			"",
+			control,
+			None,
+		)?;
+		Ok(Self::new(root_hint, None, None, control))
+	}
+
+	/// Root evaluation keeps the generic transaction adapter inside execution.
+	pub(in crate::gql) fn add_root_row(
+		&mut self,
+		read: &RootRead<'_>,
+		plan: &LogicalSelect,
+		value: Value,
+		slots: &[Value],
+	) -> FerrosGrynnResult<()> {
+		self.add_projected_row(read, read.snapshot()?, plan, value, slots, "")
+	}
+
+	/// Completes the same family validation and closure on the supplied root.
+	pub(in crate::gql) fn finish_root(
+		self,
+		read: &RootRead<'_>,
+		contract: LogicalGraphContract,
+	) -> FerrosGrynnResult<MaterializedGraph> {
+		let graph = self.finish(read, read.snapshot()?, contract)?;
+		read.observe_graph_result(&graph)?;
+		Ok(graph)
+	}
+
+	/// Evaluates selectors over an ordinary projected row with copy admission.
+	#[allow(clippy::too_many_arguments, reason = "one shared projected SELECT row invocation")]
+	pub(super) fn add_projected_row<Read: QueryRead>(
+		&mut self,
+		read: &Read,
+		snapshot: Snapshot,
+		plan: &LogicalSelect,
+		value: Value,
+		slots: &[Value],
+		source: &str,
+	) -> FerrosGrynnResult<()> {
+		let graph =
+			plan.return_graph.as_ref().ok_or_else(|| invalid("SELECT graph terminal is absent"))?;
+		self.reserve(
+			value
+				.estimated_heap_bytes()
+				.checked_add(
+					plan.result
+						.columns
+						.len()
+						.checked_mul(size_of::<Value>())
+						.ok_or_else(|| invalid("graph row size overflows"))?,
+				)
+				.and_then(|bytes| bytes.checked_add(size_of::<Row>()))
+				.ok_or_else(|| invalid("graph row size overflows"))?,
+		)?;
+		self.record_source_row();
+		let mut row = result_row(value, &plan.result, plan.value)?;
+		row.graph = self.root_hint.clone();
+		self.add_selectors(
+			Some(&graph.nodes),
+			Some(&graph.edges),
+			graph.root.as_ref(),
+			|expression| {
+				select::eval_row_expression(
+					read,
+					snapshot,
+					expression,
+					&row,
+					slots,
+					source,
+					self.control,
+				)
+			},
+		)
+	}
+
 	pub(super) fn new(
 		root_hint: Option<GraphRef>,
 		node_limit: Option<u64>,
@@ -86,6 +175,9 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 	}
 
 	pub(super) fn add_root(&mut self, value: Value) -> FerrosGrynnResult<()> {
+		if matches!(value, Value::None) {
+			return Err(invalid("ROOT must resolve to one node occurrence"));
+		}
 		if !matches!(value, Value::None) && self.root_values.contains(&value) {
 			self.control.record_graph_deduplicated_value();
 		} else if !matches!(value, Value::None) {
@@ -97,6 +189,26 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 
 	pub(super) fn record_source_row(&self) {
 		self.control.record_graph_source_row();
+	}
+
+	/// Applies explicit selectors using the caller's ordinary row evaluator.
+	pub(super) fn add_selectors(
+		&mut self,
+		nodes: Option<&TypedExpr>,
+		edges: Option<&TypedExpr>,
+		root: Option<&TypedExpr>,
+		mut evaluate: impl FnMut(&TypedExpr) -> FerrosGrynnResult<Value>,
+	) -> FerrosGrynnResult<()> {
+		if let Some(nodes) = nodes {
+			self.add_nodes(evaluate(nodes)?)?;
+		}
+		if let Some(edges) = edges {
+			self.add_edges(evaluate(edges)?)?;
+		}
+		if let Some(root) = root {
+			self.add_root(evaluate(root)?)?;
+		}
+		Ok(())
 	}
 
 	pub(super) fn add_nodes(&mut self, value: Value) -> FerrosGrynnResult<()> {
@@ -424,6 +536,7 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 				self.control,
 			)?
 		};
+		let mut global_source_atoms = BTreeMap::new();
 		for record in std::mem::take(&mut self.graphless_nodes) {
 			self.control.check()?;
 			let Some((kind, properties)) = read.base_atom(snapshot, &record)? else {
@@ -442,8 +555,20 @@ impl<'a> GraphAssemblyAccumulator<'a> {
 			)?;
 			let atom = crate::graph::AtomRef::new(kind, record.clone());
 			if graph.atom_id(&atom)?.is_none() {
-				graph.materialize_query_node(record, None, properties, None)?;
+				let local = graph.materialize_query_node(record, None, properties, None)?;
+				if root_scope.is_none() {
+					self.reserve(128 + size_of::<(crate::graph::AtomId, crate::graph::AtomRef)>())?;
+					global_source_atoms.insert(local, atom);
+				}
 			}
+		}
+		if root_scope.is_none() {
+			graph.finish_query_materialization_parts(
+				graph.identity(),
+				crate::graph::SnapshotId::new(snapshot.0, snapshot.0),
+				None,
+				global_source_atoms,
+			);
 		}
 		check_limit(graph.node_count(), self.node_limit, "nodes")?;
 		check_limit(graph.edge_count(), self.edge_limit, "edges")?;
@@ -468,12 +593,107 @@ pub(super) fn execute_return_graph<Read: QueryRead>(
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	let mut assembly = GraphAssemblyAccumulator::new(None, None, None, control);
-	assembly.add_nodes(eval(&plan.nodes, None, slots, source, None, Some(control))?)?;
-	assembly.add_edges(eval(&plan.edges, None, slots, source, None, Some(control))?)?;
-	if let Some(root) = &plan.root {
-		assembly.add_root(eval(root, None, slots, source, None, Some(control))?)?;
-	}
+	assembly.add_selectors(
+		Some(&plan.nodes),
+		Some(&plan.edges),
+		plan.root.as_ref(),
+		|expression| eval(expression, None, slots, source, None, Some(control)),
+	)?;
 	assembly.finish(read, snapshot, plan.contract).map(|graph| Value::Graph(Box::new(graph)))
+}
+
+/// Uses the ordinary SELECT projection/window before the shared graph assembly.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "graph terminal retains the ordinary SELECT invocation"
+)]
+pub(super) fn execute_select_graph<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+	retain_cursor: bool,
+) -> FerrosGrynnResult<Value> {
+	if retain_cursor {
+		match cursor::resume(read, snapshot, plan, slots, source, control) {
+			Ok(Some(value)) => return Ok(value),
+			Ok(None) => {}
+			Err(error) => {
+				control.discard_continuation();
+				return Err(error);
+			}
+		}
+	}
+	let result = execute_select_graph_from_root(
+		read,
+		snapshot,
+		plan,
+		slots,
+		source,
+		control,
+		outer,
+		retain_cursor,
+		None,
+	);
+	if result.is_err() && retain_cursor {
+		control.discard_continuation();
+	}
+	result
+}
+
+/// One fixed root owns row selection, selector evaluation and endpoint closure.
+#[allow(clippy::too_many_arguments, reason = "one direct or embedded SELECT graph invocation")]
+fn execute_select_graph_from_root<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	template: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+	retain_cursor: bool,
+	captured_page: Option<Vec<Value>>,
+) -> FerrosGrynnResult<Value> {
+	let plan = template;
+	let graph =
+		plan.return_graph.as_ref().ok_or_else(|| invalid("SELECT graph terminal is absent"))?;
+	let (bound, root_hint) =
+		select::bind_terminal_graph_scope(read, snapshot, plan, slots, source, control, outer)?;
+	let plan = bound.as_ref();
+	let mut assembly = GraphAssemblyAccumulator::new(root_hint, None, None, control);
+	let mut consume =
+		|value| assembly.add_projected_row(read, snapshot, plan, value, slots, source);
+	if let Some(values) = captured_page {
+		for value in values {
+			consume(value)?;
+		}
+	} else if retain_cursor {
+		let values =
+			select::execute_select_projected_page(read, snapshot, plan, slots, source, control)?;
+		for value in values {
+			consume(value)?;
+		}
+	} else {
+		select::visit_select_projected_values(
+			read,
+			snapshot,
+			plan,
+			slots,
+			source,
+			control,
+			outer,
+			None,
+			&mut consume,
+		)?;
+	}
+	let graph = assembly.finish(read, snapshot, graph.contract)?;
+	if retain_cursor {
+		cursor::capture(read, snapshot, template, plan, slots, source, control)?;
+	}
+	Ok(Value::Graph(Box::new(graph)))
 }
 
 #[allow(clippy::too_many_arguments, reason = "BUILD GRAPH reuses every existing query executor")]
@@ -593,6 +813,7 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 			}
 		}
 		LogicalBuildGraphSource::Select(statement) => {
+			let schema = statement.output_schema();
 			select::visit_select_values(
 				read,
 				snapshot,
@@ -603,15 +824,7 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 				None,
 				None,
 				|value| {
-					consume_query_value(
-						&mut assembly,
-						value,
-						&statement.result,
-						plan,
-						slots,
-						source,
-						control,
-					)
+					consume_query_value(&mut assembly, value, &schema, plan, slots, source, control)
 				},
 			)?;
 		}
@@ -645,7 +858,7 @@ pub(super) fn execute_build_graph<Read: QueryRead>(
 	let Some(name) = &plan.name else {
 		return Ok(Value::Graph(Box::new(graph)));
 	};
-	read.install_built_graph(name, plan.mode, plan.contract_explicit, graph)
+	read.install_built_graph(name, plan.mode, plan.contract_explicit, graph, control)
 		.map(|reference| Value::GraphRef(Box::new(reference)))
 }
 
@@ -663,21 +876,20 @@ fn consume_query_value(
 	if plan.nodes.is_none() && plan.edges.is_none() {
 		assembly.add_auto(value.clone())?;
 	}
-	let row = result_row(value, schema)?;
-	if let Some(nodes) = &plan.nodes {
-		assembly.add_nodes(eval(nodes, Some(&row), slots, source, None, Some(control))?)?;
-	}
-	if let Some(edges) = &plan.edges {
-		assembly.add_edges(eval(edges, Some(&row), slots, source, None, Some(control))?)?;
-	}
-	if let Some(root) = &plan.root {
-		assembly.add_root(eval(root, Some(&row), slots, source, None, Some(control))?)?;
-	}
-	Ok(())
+	let value_mode =
+		matches!(&plan.source, LogicalBuildGraphSource::Select(select) if select.value);
+	let row = result_row(value, schema, value_mode)?;
+	assembly.add_selectors(
+		plan.nodes.as_ref(),
+		plan.edges.as_ref(),
+		plan.root.as_ref(),
+		|expression| eval(expression, Some(&row), slots, source, None, Some(control)),
+	)
 }
 
-fn result_row(value: Value, schema: &Schema) -> FerrosGrynnResult<Row> {
-	if let Value::Object(object) = value {
+/// Projects the owned graph terminal into the existing result-row surface.
+fn result_row(value: Value, schema: &Schema, value_mode: bool) -> FerrosGrynnResult<Row> {
+	if !value_mode && let Value::Object(object) = &value {
 		return Ok(Row::new(
 			schema
 				.columns
@@ -705,33 +917,18 @@ fn finish_family(
 		.map(|record| graph.atom_id(&crate::graph::AtomRef::new(AtomKind::Node, record.clone())))
 		.transpose()?
 		.flatten();
+	if root.is_some() && root_id.is_none() {
+		return Err(invalid("ROOT must identify a selected root-scope node"));
+	}
 	let graph = graph.freeze();
-	let materialized = match contract.family {
-		None => MaterializedGraph::from(Subgraph::from_graph(graph)),
-		Some(crate::graph::GraphKind::Graph) => MaterializedGraph::from(graph),
-		Some(crate::graph::GraphKind::Tree) => MaterializedGraph::from(Tree::try_from(graph)?),
-		Some(crate::graph::GraphKind::RootedTree) => {
-			let rooted = if let Some(root) = root_id {
-				RootedTree::try_from_graph_with_root(graph, root)?
-			} else {
-				RootedTree::try_from(graph)?
-			};
-			MaterializedGraph::from(rooted)
-		}
-		Some(crate::graph::GraphKind::Forest) => MaterializedGraph::from(Forest::try_from(graph)?),
-		Some(crate::graph::GraphKind::Dag) => MaterializedGraph::from(Dag::try_from(graph)?),
-		Some(crate::graph::GraphKind::Hypergraph) => {
-			MaterializedGraph::from(Hypergraph::try_from(graph)?)
-		}
-		Some(crate::graph::GraphKind::Metagraph) => {
-			MaterializedGraph::from(Metagraph::try_from(graph)?)
-		}
-		Some(crate::graph::GraphKind::Subgraph) => {
-			return Err(invalid("Subgraph is not a named graph contract family"));
-		}
-	};
-	validate_topology_constraints(&materialized, contract.validators)?;
-	Ok(materialized)
+	if contract.family == Some(crate::graph::GraphKind::Subgraph) {
+		return Err(invalid("Subgraph is not a named graph contract family"));
+	}
+	MaterializedGraph::from_general(
+		graph,
+		contract.family.unwrap_or(crate::graph::GraphKind::Subgraph),
+		root_id,
+	)
 }
 
 fn root_record(

@@ -46,6 +46,10 @@ state. Он не выполняет запросы и не разрешает sc
 - `stmt/live.rs` владеет LIVE SELECT/LIVE LET/ACK syntax; schema module парсит
   ALTER/INFO/REMOVE LIVE LET. Reactive identity, DAG, capture и runtime value
   принадлежат analysis/execution/datastore, а не parser.
+- `stmt/event.rs` владеет EVENT owner/options/body syntax; schema dispatch
+  подключает DEFINE/ALTER/REMOVE EVENT. Effects, causal depth и frozen versions
+  проверяются в GQL/datastore. Новый SELECT graph terminal хранится в owned Box,
+  чтобы optional payload не увеличивал каждую обычную statement/future.
 - Именованные аргументы допускаются только после positional; duplicate name и positional после
   named отклоняются до analysis. Signature qualifier UDF содержит только declared argument
   types и не использует return type как overload discriminator.

@@ -123,6 +123,12 @@ impl JobCatalog {
 }
 
 fn encode_job(output: &mut Vec<u8>, job: &MaintenanceJobInfo) -> FerrosGrynnResult<()> {
+	if job.event.is_some()
+		|| job.kind == MaintenanceJobKind::EventInvocation
+		|| job.state == MaintenanceJobState::Running
+	{
+		return Err(invalid("EVENT projections belong to the transactional outbox"));
+	}
 	validate_job_target(job.kind, job.target)?;
 	output.extend_from_slice(job.id.as_uuid().as_inner().as_bytes());
 	output.push(kind_byte(job.kind));
@@ -294,6 +300,7 @@ fn decode_job(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<MaintenanceJobInfo
 	};
 	validate_job_target(kind, target)?;
 	Ok(MaintenanceJobInfo {
+		event: None,
 		id,
 		kind,
 		state,
@@ -407,6 +414,7 @@ fn read_time(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<SystemTime> {
 
 const fn kind_byte(kind: MaintenanceJobKind) -> u8 {
 	match kind {
+		MaintenanceJobKind::EventInvocation => 8,
 		MaintenanceJobKind::BuildIndex => 0,
 		MaintenanceJobKind::RebuildIndex => 1,
 		MaintenanceJobKind::DeferredIndexCatchUp => 2,
@@ -434,6 +442,7 @@ fn decode_kind(value: u8) -> FerrosGrynnResult<MaintenanceJobKind> {
 
 const fn state_byte(state: MaintenanceJobState) -> u8 {
 	match state {
+		MaintenanceJobState::Running => 8,
 		MaintenanceJobState::Queued => 0,
 		MaintenanceJobState::BuildingInitial => 1,
 		MaintenanceJobState::CatchingUp => 2,
@@ -559,6 +568,7 @@ mod tests {
 	fn sample() -> FerrosGrynnResult<MaintenanceJobInfo> {
 		let now = UNIX_EPOCH + Duration::new(1_700_000_000, 123);
 		Ok(MaintenanceJobInfo {
+			event: None,
 			id: JobId::from_uuid(Uuid::from(uuid::Uuid::from_u128(
 				0x018b_cfe5_6800_7000_8000_0000_0000_0001,
 			))),
@@ -588,6 +598,7 @@ mod tests {
 	fn sample_analyze() -> FerrosGrynnResult<MaintenanceJobInfo> {
 		let now = UNIX_EPOCH + Duration::new(1_700_000_001, 456);
 		Ok(MaintenanceJobInfo {
+			event: None,
 			id: JobId::from_uuid(Uuid::from(uuid::Uuid::from_u128(
 				0x018b_cfe5_6801_7000_8000_0000_0000_0002,
 			))),

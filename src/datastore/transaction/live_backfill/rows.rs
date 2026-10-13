@@ -27,6 +27,7 @@ pub(in crate::datastore::transaction) fn eligible(
 ) -> FerrosGrynnResult<bool> {
 	budget.admit(0, 1)?;
 	if !matches!(query.source(), LiveSource::Class(_) | LiveSource::Record(_))
+		|| query.graph_result().is_some()
 		|| !query.joins().is_empty()
 		|| !query.fetch().is_empty()
 		|| query.group().is_some()

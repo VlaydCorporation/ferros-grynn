@@ -165,3 +165,36 @@ fn graph_scoped_record_reference_uses_effective_member_properties() {
 		Value::from("Scoped profile")
 	]);
 }
+
+#[test]
+fn graph_scoped_dml_record_operand_preserves_member_and_base_fallback()
+-> crate::gql_status::FerrosGrynnResult<()> {
+	for member in [false, true] {
+		let store = referenced_store(member);
+		let mut transaction = store.begin();
+		if member {
+			for result in transaction.execute(
+				"UPDATE profile:primary IN GRAPH social SET name = 'Scoped profile';",
+				&Object::new(),
+			)? {
+				let _value = result.result?;
+			}
+		}
+		let results = transaction.execute(
+			"UPDATE person:alice IN GRAPH social SET name = profile.name RETURN VALUE name;",
+			&Object::new(),
+		)?;
+		let expected = if member {
+			"Scoped profile"
+		} else {
+			"Base profile"
+		};
+		for result in results {
+			assert_eq!(
+				result.result?.value().as_array().map(crate::values::Array::as_slice),
+				Some([Value::from(expected)].as_slice())
+			);
+		}
+	}
+	Ok(())
+}

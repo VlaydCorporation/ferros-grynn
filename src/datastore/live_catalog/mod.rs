@@ -27,6 +27,15 @@ pub struct LiveCatalog {
 	pub(crate) bindings: BTreeMap<crate::live::LiveBindingId, Arc<LiveBindingDefinition>>,
 	/// Capture epochs and trusted bounds survive source policy changes.
 	pub(crate) histories: BTreeMap<LiveId, Arc<super::LiveHistoryMetadata>>,
+	/// Latest accepted graph images survive quiet commits and consumer detach.
+	pub(crate) graph_checkpoints: BTreeMap<LiveId, Arc<crate::live::LiveGraphBatch>>,
+	/// Aggregate owned checkpoint admission, independent of per-attempt
+	/// scratch.
+	pub(crate) graph_bytes: usize,
+	/// One same-WAL checkpoint file per graph result, independent of retention.
+	pub(crate) graph_segments: Arc<BTreeMap<LiveId, crate::storage::HistorySegment>>,
+	/// Exact replacements prepared before publication, including activation.
+	pub(crate) prepared_graphs: Arc<[(LiveId, Arc<[u8]>)]>,
 	/// Complete admitted publication payloads for this root's commit.
 	pub(crate) prepared: Arc<[(LiveId, Arc<crate::live::LivePayload>)]>,
 	/// Bounded restorable envelopes prepared before the commit mutex.
@@ -251,6 +260,47 @@ impl LiveDefinition {
 }
 
 impl LiveCatalog {
+	/// Checks replacement before allocation/publication using the recovery cap.
+	pub(crate) fn graph_checkpoint_total(
+		&self,
+		id: LiveId,
+		batch: &crate::live::LiveGraphBatch,
+	) -> FerrosGrynnResult<usize> {
+		let old = self
+			.graph_checkpoints
+			.get(&id)
+			.map(|batch| batch.estimated_heap_bytes())
+			.transpose()?
+			.unwrap_or(0);
+		let new_bytes = batch.estimated_heap_bytes()?;
+		let total = self
+			.graph_bytes
+			.checked_sub(old)
+			.and_then(|bytes| bytes.checked_add(new_bytes))
+			.ok_or_else(|| {
+				FerrosGrynnError::operation_overflow("LIVE retained graph checkpoint bytes")
+			})?;
+		if total > 256 * 1024 * 1024 {
+			return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"LIVE retained graph checkpoints",
+				total as u64,
+			));
+		}
+		Ok(total)
+	}
+
+	/// RAM publication and cold recovery share one checked retained authority.
+	pub(crate) fn replace_graph_checkpoint(
+		&mut self,
+		id: LiveId,
+		batch: Arc<crate::live::LiveGraphBatch>,
+	) -> FerrosGrynnResult<()> {
+		let total = self.graph_checkpoint_total(id, &batch)?;
+		self.graph_checkpoints.insert(id, batch);
+		self.graph_bytes = total;
+		Ok(())
+	}
+
 	/// Resolves one stable value identity within the exact candidate catalog.
 	pub(crate) fn binding_value(
 		&self,

@@ -35,13 +35,15 @@ impl RetiredChangefeedFile {
 		current: &FileCatalog,
 	) -> FerrosGrynnResult<Vec<Self>> {
 		let missing = |entry: &&crate::storage::catalog::FileCatalogEntry| {
-			entry.file_id.kind() == Some(DataFileKind::Changefeed)
-				&& current
-					.files
-					.binary_search_by_key(&(entry.space_id, entry.file_id), |candidate| {
-						(candidate.space_id, candidate.file_id)
-					})
-					.is_err()
+			matches!(
+				entry.file_id.kind(),
+				Some(DataFileKind::Changefeed | DataFileKind::EventOutbox)
+			) && current
+				.files
+				.binary_search_by_key(&(entry.space_id, entry.file_id), |candidate| {
+					(candidate.space_id, candidate.file_id)
+				})
+				.is_err()
 		};
 		let count = previous.files.iter().filter(missing).count();
 		let bytes =
@@ -230,8 +232,10 @@ impl PendingChangefeedFiles {
 	/// Admits cleanup metadata before any new segment file is created.
 	pub(super) fn new(root: &Path, images: &[super::layout::FileImage]) -> FerrosGrynnResult<Self> {
 		let new_file = |image: &&super::layout::FileImage| {
-			image.entry.file_id.kind() == Some(DataFileKind::Changefeed)
-				&& image.page_numbers.get(1).is_some_and(|number| number.get() == 1)
+			matches!(
+				image.entry.file_id.kind(),
+				Some(DataFileKind::Changefeed | DataFileKind::EventOutbox)
+			) && image.page_numbers.get(1).is_some_and(|number| number.get() == 1)
 		};
 		let count = images.iter().filter(new_file).count();
 		let bytes = root
@@ -347,7 +351,23 @@ pub(super) fn cleanup_orphan_changefeeds(
 	root: &Path,
 	catalog: &FileCatalog,
 ) -> FerrosGrynnResult<()> {
-	let directory = root.join("changefeed");
+	cleanup_orphan_history(root, catalog, DataFileKind::Changefeed, "changefeed", ".fcf")
+}
+
+/// Removes unpublished invocation journals only after strict recovery succeeds.
+pub(super) fn cleanup_orphan_events(root: &Path, catalog: &FileCatalog) -> FerrosGrynnResult<()> {
+	cleanup_orphan_history(root, catalog, DataFileKind::EventOutbox, "events", ".feo")
+}
+
+/// The shared physical-directory checks protect both append-only namespaces.
+fn cleanup_orphan_history(
+	root: &Path,
+	catalog: &FileCatalog,
+	file_kind: DataFileKind,
+	name: &str,
+	suffix: &str,
+) -> FerrosGrynnResult<()> {
+	let directory = root.join(name);
 	let metadata = match fs::symlink_metadata(&directory) {
 		Ok(metadata) => metadata,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -359,7 +379,7 @@ pub(super) fn cleanup_orphan_changefeeds(
 	let reachable = catalog
 		.files
 		.iter()
-		.filter(|entry| entry.file_id.kind() == Some(DataFileKind::Changefeed))
+		.filter(|entry| entry.file_id.kind() == Some(file_kind))
 		.map(|entry| entry.path.resolve(root))
 		.collect::<BTreeSet<_>>();
 	for entry in
@@ -381,7 +401,7 @@ pub(super) fn cleanup_orphan_changefeeds(
 			let canonical = file
 				.file_name()
 				.to_str()
-				.and_then(|name| name.strip_suffix(".fcf"))
+				.and_then(|name| name.strip_suffix(suffix))
 				.is_some_and(canonical_uuid);
 			if !kind.is_file()
 				|| kind.is_symlink()
@@ -430,6 +450,7 @@ fn generation_directories(
 					DataFileKind::JobCatalog
 						| DataFileKind::ImportQuarantine
 						| DataFileKind::Changefeed
+						| DataFileKind::EventOutbox
 				)
 			) {
 			continue;

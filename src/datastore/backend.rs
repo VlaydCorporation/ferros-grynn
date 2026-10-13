@@ -67,6 +67,9 @@ pub(crate) struct StoreInner {
 	pub(crate) query_scratch_root: PathBuf,
 	pub(crate) quarantines: Mutex<BTreeMap<Uuid, PathBuf>>,
 	pub(crate) maintenance: MaintenanceCoordinator,
+	/// Positive millisecond setting captured once for accepted invocation
+	/// scheduling.
+	pub(in crate::datastore) event_processing_interval: std::time::Duration,
 	/// Diagnostic capture/publication counts; no per-source metric labels.
 	pub(in crate::datastore) changefeed_observation: super::changefeed_observation::Counters,
 	/// Non-authoritative LIVE process counters; no per-query labels or
@@ -182,6 +185,9 @@ impl StoreInner {
 				*root.changefeed_segments_mut() = local.changefeed_segments();
 				*root.change_history_mut() = empty_history;
 				*root.live_segments_mut() = local.live_segments();
+				std::sync::Arc::make_mut(root.live_catalog_mut()).graph_segments =
+					local.live_graph_segments();
+				root.set_event_outbox_segments(local.event_outbox_segments());
 				*root.live_history_mut() = empty_live_history;
 				Ok(())
 			}
@@ -233,6 +239,9 @@ impl StoreInner {
 				*root.changefeed_segments_mut() = local.changefeed_segments();
 				*root.change_history_mut() = empty_history;
 				*root.live_segments_mut() = local.live_segments();
+				std::sync::Arc::make_mut(root.live_catalog_mut()).graph_segments =
+					local.live_graph_segments();
+				root.set_event_outbox_segments(local.event_outbox_segments());
 				*root.live_history_mut() = empty_live_history;
 				Ok(timings)
 			}
@@ -635,6 +644,11 @@ impl StoreInner {
 		}
 		let mut next = snapshot.clone();
 		match kind {
+			MaintenanceJobKind::EventInvocation => {
+				return Err(FerrosGrynnError::invalid_argument(
+					"EVENT effects require an accepted invocation transaction",
+				));
+			}
 			MaintenanceJobKind::BuildIndex
 			| MaintenanceJobKind::RebuildIndex
 			| MaintenanceJobKind::DeferredIndexCatchUp

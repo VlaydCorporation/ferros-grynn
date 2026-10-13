@@ -189,6 +189,11 @@ pub(super) fn open_local_state(
 		super::catalog::decode_changefeed_segments(&database_catalog);
 	*database.live_segments_mut() = super::catalog::decode_live_segments(&database_catalog);
 	database.schema = Arc::new(schema);
+	for event in &database_catalog.events {
+		let id = event.id().ok_or_else(|| invalid("published EVENT has no identity"))?;
+		database.mark_version(crate::datastore::ConflictKey::SchemaEvent(id), event.published_at);
+	}
+	database.mark_version(crate::datastore::ConflictKey::EventCatalogRange, database.commit_ts);
 	database.dictionary = Arc::new(dictionary);
 	database.atoms = Arc::new(atoms);
 	let mut decode = value_context(&database.schema, database.dictionary.as_ref().clone())?;
@@ -287,6 +292,25 @@ pub(super) fn open_local_state(
 	let derived = derived_started.elapsed();
 	#[cfg(test)]
 	let validation_started = Instant::now();
+	super::event_outbox::recover(
+		&mut database,
+		&database_catalog,
+		&file_catalog,
+		&registry,
+		&wal,
+		engine,
+		snapshot,
+		&database_superblock,
+	)?;
+	super::live_graph::recover(
+		&mut database,
+		&database_catalog,
+		&registry,
+		&wal,
+		engine,
+		snapshot,
+		&database_superblock,
+	)?;
 	validate_opened_root(&database, &database_catalog, &file_catalog, snapshot)?;
 	#[cfg(test)]
 	LAST_STARTUP_TIMINGS.set(StartupTimings {

@@ -5,20 +5,39 @@ use std::{collections::BTreeMap, sync::Arc};
 use super::ConflictKey;
 use crate::gql_status::{FerrosGrynnError, FerrosGrynnResult};
 
-/// Exact FCW/SSI revisions with independently copied data and LIVE domains.
+/// Exact revisions keep the ordinary root-clone cost at two inner Arc handles.
 #[derive(Clone, Default)]
 pub(super) struct VersionStore {
 	/// Data, schema and source-capture revisions retained by old snapshots.
 	primary: Arc<BTreeMap<ConflictKey, u64>>,
-	/// LIVE control revisions do not copy the per-atom data domain.
-	live: Arc<BTreeMap<ConflictKey, u64>>,
+	/// Independent controls share one shell; each active namespace copies its
+	/// own map.
+	controls: Arc<ControlVersions>,
 }
 
-/// Classifies only the independently writable LIVE control namespace.
-fn is_live(key: &ConflictKey) -> bool {
+/// LIVE and invocation revisions have independent lifetimes and retention
+/// policies.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct ControlVersions {
+	/// Existing subscription/binding controls preserve their snapshot
+	/// semantics.
+	live: Arc<BTreeMap<ConflictKey, u64>>,
+	/// Invocation keys are bounded by the reachable outbox identities.
+	events: Arc<BTreeMap<ConflictKey, u64>>,
+}
+
+/// Invocation lifecycle never copies data or subscription revision maps.
+fn is_event(key: &ConflictKey) -> bool {
+	matches!(key, ConflictKey::EventInvocation(_) | ConflictKey::EventOutboxRange)
+}
+
+/// Classifies independently writable subscription and invocation namespaces.
+fn is_control(key: &ConflictKey) -> bool {
 	matches!(
 		key,
-		ConflictKey::LiveDefinition(_)
+		ConflictKey::EventInvocation(_)
+			| ConflictKey::EventOutboxRange
+			| ConflictKey::LiveDefinition(_)
 			| ConflictKey::LiveBinding(_)
 			| ConflictKey::LiveCatalogRange
 	)
@@ -27,8 +46,12 @@ fn is_live(key: &ConflictKey) -> bool {
 impl VersionStore {
 	/// Borrows the last publication revision of one logical key.
 	pub(super) fn get(&self, key: &ConflictKey) -> Option<&u64> {
-		if is_live(key) {
-			self.live.get(key)
+		if is_control(key) {
+			if is_event(key) {
+				self.controls.events.get(key)
+			} else {
+				self.controls.live.get(key)
+			}
 		} else {
 			self.primary.get(key)
 		}
@@ -36,12 +59,43 @@ impl VersionStore {
 
 	/// Records a revision, copying only the affected domain.
 	pub(super) fn insert(&mut self, key: ConflictKey, revision: u64) {
-		let domain = if is_live(&key) {
-			&mut self.live
+		let domain = if is_control(&key) {
+			let controls = Arc::make_mut(&mut self.controls);
+			if is_event(&key) {
+				&mut controls.events
+			} else {
+				&mut controls.live
+			}
 		} else {
 			&mut self.primary
 		};
 		Arc::make_mut(domain).insert(key, revision);
+	}
+
+	/// Charges the small COW shells and exact invocation map before a lifecycle
+	/// write.
+	pub(super) fn event_copy_bytes(&self, additional: usize) -> FerrosGrynnResult<usize> {
+		let count = self
+			.controls
+			.events
+			.len()
+			.checked_add(additional)
+			.ok_or_else(|| FerrosGrynnError::operation_overflow("EVENT revision count"))?;
+		crate::values::storage::tree_allocation_bytes(
+			count,
+			std::mem::size_of::<(ConflictKey, u64)>(),
+		)?
+		.checked_add(std::mem::size_of::<Self>() + std::mem::size_of::<ControlVersions>() + 64)
+		.ok_or_else(|| FerrosGrynnError::operation_overflow("EVENT revision bytes"))
+	}
+
+	/// Retired job IDs cannot be reused; stale lifecycle writes also require a
+	/// live marker.
+	pub(super) fn retain_event_invocations(&mut self, outbox: &super::EventOutbox) {
+		Arc::make_mut(&mut Arc::make_mut(&mut self.controls).events).retain(|key, _| match key {
+			ConflictKey::EventInvocation(id) => outbox.invocations.contains_key(id),
+			_ => true,
+		});
 	}
 
 	/// Compares leased data inputs, including independently allocated equal
@@ -51,8 +105,8 @@ impl VersionStore {
 	}
 
 	/// Compares control revisions without scanning the data domain.
-	pub(super) fn same_live(&self, other: &Self) -> bool {
-		Arc::ptr_eq(&self.live, &other.live) || self.live == other.live
+	pub(super) fn same_controls(&self, other: &Self) -> bool {
+		Arc::ptr_eq(&self.controls, &other.controls) || self.controls == other.controls
 	}
 
 	/// Checks whether an import has unpublished revisions at its provisional
@@ -93,7 +147,7 @@ impl VersionStore {
 				}
 			}
 		}
-		self.live = Arc::clone(&current.live);
+		self.controls = Arc::clone(&current.controls);
 	}
 
 	/// Reserves both B-tree roots for conservative retention admission.
@@ -104,9 +158,12 @@ impl VersionStore {
 	pub(super) fn allocation_bytes(&self) -> FerrosGrynnResult<usize> {
 		let width = std::mem::size_of::<(ConflictKey, u64)>();
 		let primary = crate::values::storage::tree_allocation_bytes(self.primary.len(), width)?;
-		let live = crate::values::storage::tree_allocation_bytes(self.live.len(), width)?;
+		let live = crate::values::storage::tree_allocation_bytes(self.controls.live.len(), width)?;
+		let events =
+			crate::values::storage::tree_allocation_bytes(self.controls.events.len(), width)?;
 		primary
 			.checked_add(live)
+			.and_then(|bytes| bytes.checked_add(events))
 			.ok_or_else(|| FerrosGrynnError::operation_overflow("revision metadata"))
 	}
 }

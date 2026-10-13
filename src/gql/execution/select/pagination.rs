@@ -133,7 +133,10 @@ pub(super) fn select_pull_limit(only: bool, limit: usize) -> usize {
 }
 
 /// Cardinality is checked after the selected window and payload evaluation.
-pub(super) fn check_select_cardinality(only: bool, count: usize) -> FerrosGrynnResult<()> {
+pub(in crate::gql::execution) fn check_select_cardinality(
+	only: bool,
+	count: usize,
+) -> FerrosGrynnResult<()> {
 	if only && count > 1 {
 		let count = u64::try_from(count)
 			.map_err(|_error| FerrosGrynnError::operation_overflow("SELECT cardinality"))?;

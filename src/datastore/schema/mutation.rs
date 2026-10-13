@@ -608,6 +608,7 @@ impl DatabaseRoot {
 		catalog.classes.remove(&id);
 		catalog.class_names.remove(current.name().as_str());
 		catalog.class_versions.remove(&id);
+		next.discard_source_events(crate::datastore::EventTarget::Class(id));
 		next.mark_version(crate::datastore::ConflictKey::ClassCatalogRange, published_at);
 		next.rebuild_derived_state()?;
 		*self = next;
@@ -630,6 +631,7 @@ impl DatabaseRoot {
 			.collect::<Vec<_>>();
 		remove.push(graph);
 		for graph in remove {
+			next.discard_source_events(crate::datastore::EventTarget::Graph(graph));
 			next.invalidate_relation_artifacts(graph);
 			let schema = next
 				.schema

@@ -57,6 +57,7 @@ fn live_import_preparation_retry_keeps_spool_and_latest_controls() -> FerrosGryn
 		options.on_violation,
 		None,
 		options.changefeed,
+		options.events,
 		provisional,
 	);
 	let mut session =

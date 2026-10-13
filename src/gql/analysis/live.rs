@@ -925,6 +925,39 @@ impl Recipe<'_, '_> {
 		}
 		let omit = self.paths(&select.omit, depth)?;
 		let fetch = self.paths(&select.fetch, depth)?;
+		if let Some(graph) = &select.return_graph {
+			use crate::{
+				graph::{GraphKind, GraphTopologyConstraint},
+				syn::{GraphFamilyName, GraphValidatorName},
+			};
+			self.node(depth + 1, std::mem::size_of::<crate::live::LiveGraphResult>() * 2)?;
+			let mut result = crate::live::LiveGraphResult::new(
+				self.expression(&graph.nodes, None, depth + 1)?,
+				self.expression(&graph.edges, None, depth + 1)?,
+			);
+			if let Some(contract) = &graph.contract {
+				result = result
+					.with_family(match contract.family {
+						None => GraphKind::Subgraph,
+						Some(GraphFamilyName::Graph) => GraphKind::Graph,
+						Some(GraphFamilyName::Tree) => GraphKind::Tree,
+						Some(GraphFamilyName::RootedTree) => GraphKind::RootedTree,
+						Some(GraphFamilyName::Forest) => GraphKind::Forest,
+						Some(GraphFamilyName::Dag) => GraphKind::Dag,
+						Some(GraphFamilyName::Hyper) => GraphKind::Hypergraph,
+						Some(GraphFamilyName::Meta) => GraphKind::Metagraph,
+					})
+					.with_validators(contract.validators.iter().map(|validator| match validator {
+						GraphValidatorName::Simple => GraphTopologyConstraint::Simple,
+						GraphValidatorName::Bipartite => GraphTopologyConstraint::Bipartite,
+						GraphValidatorName::Complete => GraphTopologyConstraint::Complete,
+					}));
+			}
+			if let Some(root) = &graph.root {
+				result = result.with_root(self.expression(root, None, depth + 1)?);
+			}
+			query = query.with_graph_result(result);
+		}
 		Ok(query.with_omit(omit).with_fetch(fetch))
 	}
 

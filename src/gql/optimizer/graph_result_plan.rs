@@ -18,6 +18,7 @@ use crate::{
 		LogicalBuildGraphSource,
 		LogicalMatch,
 		LogicalReturnGraph,
+		LogicalSelect,
 		LogicalTraverse,
 	},
 	gql_status::FerrosGrynnResult,
@@ -46,6 +47,37 @@ pub(in crate::gql) fn plan_return_graph(
 		Cardinality::exact(1),
 		barrier_bytes,
 	)
+}
+
+/// Wraps ordinary SELECT rows when its terminal result is an owned graph.
+pub(in crate::gql) fn plan_select_graph_result(
+	statement: &LogicalSelect,
+	snapshot: &super::PlannerSnapshot,
+	max_nodes: u64,
+	max_edges: u64,
+	barrier_bytes: usize,
+) -> FerrosGrynnResult<PhysicalPlan> {
+	let (_, source) = prepare_select(statement, snapshot, barrier_bytes)?;
+	let source = PhysicalPlan::Select(source);
+	let Some(result) = &statement.return_graph else {
+		return Ok(source);
+	};
+	let source_rows = output_cardinality(&source);
+	Ok(graph_plan(
+		GraphResultOperator::GraphAssemble,
+		GraphResultMode::Anonymous,
+		Some(source),
+		None,
+		result.contract.family,
+		result.contract.validators.bits(),
+		result.root.is_some(),
+		true,
+		true,
+		max_nodes,
+		max_edges,
+		source_rows,
+		barrier_bytes,
+	))
 }
 
 /// Wraps a MATCH physical plan when its terminal result is an owned graph.
@@ -160,10 +192,13 @@ pub(in crate::gql) fn plan_build_graph(
 			max_edges,
 			barrier_bytes,
 		)?),
-		LogicalBuildGraphSource::Select(statement) => {
-			let (_logical, plan) = prepare_select(statement, snapshot, barrier_bytes)?;
-			Some(PhysicalPlan::Select(plan))
-		}
+		LogicalBuildGraphSource::Select(statement) => Some(plan_select_graph_result(
+			statement,
+			snapshot,
+			max_nodes,
+			max_edges,
+			barrier_bytes,
+		)?),
 		LogicalBuildGraphSource::Traverse(statement) => Some(plan_traverse_graph_result(
 			statement,
 			snapshot,

@@ -34,11 +34,6 @@ impl Transaction {
 		PureFunctionEvaluator::for_builder(&snapshot.root, bytes, || Ok(()))
 	}
 
-	/// Preserves the same SSI observer for direct SDK and GQL tensor costs.
-	pub(crate) fn observe_tensor_cost(&self, key: ConflictKey) {
-		self.record_read(key);
-	}
-
 	/// Resolves one named PURE COST overload and captures its durable version.
 	///
 	/// # Errors

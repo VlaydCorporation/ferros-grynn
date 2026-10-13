@@ -6,6 +6,7 @@ use super::{
 	Row,
 	Schema,
 	dml_return_value,
+	eval_dml_read_value,
 	expect_matches,
 	generated_record_id,
 	missing_candidate,
@@ -13,9 +14,9 @@ use super::{
 };
 use crate::{
 	datastore::{AtomSnapshot, QuerySnapshot, Transaction},
-	gql::{execution::eval, ir::LogicalRecordTarget, options::ExecutionControl},
+	gql::{ir::LogicalRecordTarget, options::ExecutionControl},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::{AtomId, AtomKind, EdgeTopology},
+	graph::{AtomId, AtomKind, EdgeEndpoint, EdgeTopology},
 	values::{Array, GraphRef, Number, PropertyDictionary, RecordId, Value},
 };
 
@@ -24,7 +25,7 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 	transaction: &mut Transaction,
 	snapshot: &QuerySnapshot,
 	statement: &LogicalGraphDmlStatement,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
@@ -35,7 +36,8 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			label,
 			keep_levelpath,
 		} => {
-			let record = record_id(record, slots, source, control)?;
+			let record =
+				record_id(transaction, snapshot, Some(graph), record, slots, source, control)?;
 			transaction.attach_node(graph.id(), &record, label.clone(), None)?;
 			if *keep_levelpath {
 				transaction.store_level_path(graph.id(), &record)?;
@@ -50,7 +52,8 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			graph,
 			cascade,
 		} => {
-			let record = record_id(record, slots, source, control)?;
+			let record =
+				record_id(transaction, snapshot, Some(graph), record, slots, source, control)?;
 			transaction.detach_occurrence(graph.id(), &record, *cascade)?;
 			if transaction.validates_import_constraints_immediately() {
 				transaction.validate_graph_family(graph)?;
@@ -68,18 +71,41 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			weight,
 			keep_levelpath,
 		} => {
-			let source_record = record_id(source_target, slots, source, control)?;
-			let target_record = record_id(target, slots, source, control)?;
-			let source_local =
-				ensure_endpoint(transaction, graph, &source_record, *atom_endpoints)?;
-			let target_local =
-				ensure_endpoint(transaction, graph, &target_record, *atom_endpoints)?;
+			let source_local = relate_endpoint(
+				transaction,
+				snapshot,
+				graph,
+				source_target,
+				*atom_endpoints,
+				slots,
+				source,
+				control,
+			)?;
+			let target_local = relate_endpoint(
+				transaction,
+				snapshot,
+				graph,
+				target,
+				*atom_endpoints,
+				slots,
+				source,
+				control,
+			)?;
 			let edge_record = edge
 				.key
 				.as_ref()
 				.map(|key| {
-					eval(key, None, slots, source, None, Some(control))
-						.and_then(|key| RecordId::from_value(edge.class.as_ref(), key))
+					eval_dml_read_value(
+						transaction,
+						snapshot,
+						Some(graph),
+						key,
+						&Row::new(Vec::new()),
+						slots,
+						source,
+						control,
+					)
+					.and_then(|key| RecordId::from_value(edge.class.as_ref(), key))
 				})
 				.transpose()?
 				.map_or_else(|| generated_record_id(&edge.class), Ok)?;
@@ -89,7 +115,16 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 				Some(atom) => candidate_from_atom(atom, &edge.schema, &dictionary)?,
 				None => missing_candidate(0, edge_record.clone(), &edge.schema),
 			};
-			if !expect_matches(edge.expect.as_ref(), &candidate, slots, source, control)? {
+			if !expect_matches(
+				transaction,
+				snapshot,
+				Some(graph),
+				edge.expect.as_ref(),
+				&candidate,
+				slots,
+				source,
+				control,
+			)? {
 				return Err(FerrosGrynnError::condition_failed(edge_record.to_string()));
 			}
 			if let Some(atom) = &before {
@@ -106,7 +141,16 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 			let weight = weight
 				.as_ref()
 				.map(|weight| {
-					numeric_weight(eval(weight, None, slots, source, None, Some(control))?)
+					numeric_weight(eval_dml_read_value(
+						transaction,
+						snapshot,
+						Some(graph),
+						weight,
+						&Row::new(Vec::new()),
+						slots,
+						source,
+						control,
+					)?)
 				})
 				.transpose()?;
 			let local = transaction.attach_edge(
@@ -145,6 +189,8 @@ pub(in crate::gql::execution) fn execute_graph_dml(
 				transaction.validate_graph_family(graph)?;
 			}
 			graph_result(
+				transaction,
+				Some(graph),
 				&edge.returning,
 				&edge.schema,
 				&candidate.before,
@@ -167,15 +213,74 @@ fn transaction_class(
 }
 
 fn record_id(
+	transaction: &Transaction,
+	snapshot: &QuerySnapshot,
+	graph: Option<&GraphRef>,
 	target: &LogicalRecordTarget,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<RecordId> {
 	RecordId::from_value(
 		target.class.as_ref(),
-		eval(&target.key, None, slots, source, None, Some(control))?,
+		eval_dml_read_value(
+			transaction,
+			snapshot,
+			graph,
+			&target.key,
+			&Row::new(Vec::new()),
+			slots,
+			source,
+			control,
+		)?,
 	)
+}
+
+/// References use the ordinary reader-aware kernel and the common incidence
+/// resolver.
+fn relate_endpoint(
+	transaction: &mut Transaction,
+	snapshot: &QuerySnapshot,
+	graph: &GraphRef,
+	endpoint: &crate::gql::ir::LogicalRelateEndpoint,
+	atom: bool,
+	slots: &mut [Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<EdgeEndpoint> {
+	match endpoint {
+		crate::gql::ir::LogicalRelateEndpoint::Record(record) => {
+			let record =
+				record_id(transaction, snapshot, Some(graph), record, slots, source, control)?;
+			ensure_endpoint(transaction, graph, &record, atom).map(EdgeEndpoint::Local)
+		}
+		crate::gql::ir::LogicalRelateEndpoint::Reference {
+			value,
+			kind,
+		} => {
+			let value = eval_dml_read_value(
+				transaction,
+				snapshot,
+				Some(graph),
+				value,
+				&Row::new(Vec::new()),
+				slots,
+				source,
+				control,
+			)?;
+			let memory = std::cell::RefCell::new(control.barrier_account());
+			transaction.resolve_relate_reference(graph, &value, atom, *kind, &|bytes| {
+				control.check()?;
+				if !memory.borrow_mut().reserve(bytes) {
+					return Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+						"RELATE endpoint scratch",
+						control.barrier_memory_limit() as u64,
+					));
+				}
+				Ok(())
+			})
+		}
+	}
 }
 
 fn ensure_endpoint(
@@ -204,7 +309,12 @@ fn ensure_endpoint(
 	transaction.attach_node(graph.id(), record, None, None)
 }
 
-fn topology(direction: crate::syn::MatchDirection, source: AtomId, target: AtomId) -> EdgeTopology {
+/// Builds the logical qualified topology used for exact mutation images.
+fn topology(
+	direction: crate::syn::MatchDirection,
+	source: EdgeEndpoint,
+	target: EdgeEndpoint,
+) -> EdgeTopology {
 	match direction {
 		crate::syn::MatchDirection::Forward => EdgeTopology::directed([source], [target]),
 		crate::syn::MatchDirection::Backward => EdgeTopology::directed([target], [source]),
@@ -258,17 +368,29 @@ fn candidate_from_atom(
 }
 
 fn graph_result(
+	transaction: &mut Transaction,
+	graph: Option<&GraphRef>,
 	returning: &LogicalDmlReturn,
 	schema: &Schema,
 	before: &Object,
 	after: &Object,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	if matches!(returning, LogicalDmlReturn::None) {
 		return Ok(Value::None);
 	}
-	let value = dml_return_value(returning, schema, before, Some(after), slots, source, control)?;
+	let value = dml_return_value(
+		transaction,
+		graph,
+		returning,
+		schema,
+		before,
+		Some(after),
+		slots,
+		source,
+		control,
+	)?;
 	Ok(Value::Array(Array::new(value.into_iter().collect())))
 }

@@ -38,7 +38,7 @@ pub(super) fn execute_dml(
 	transaction: &mut Transaction,
 	snapshot: &QuerySnapshot,
 	statement: &LogicalDmlStatement,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
@@ -72,7 +72,16 @@ pub(super) fn execute_dml(
 	}
 	for candidate in &candidates {
 		let target = &statement.targets[candidate.target];
-		if !expect_matches(target.expect.as_ref(), candidate, slots, source, control)? {
+		if !expect_matches(
+			transaction,
+			snapshot,
+			statement.graph.as_ref(),
+			target.expect.as_ref(),
+			candidate,
+			slots,
+			source,
+			control,
+		)? {
 			return Err(FerrosGrynnError::condition_failed(candidate.record_id.to_string()));
 		}
 	}
@@ -113,6 +122,8 @@ pub(super) fn execute_dml(
 		if affected
 			&& !returns_none
 			&& let Some(value) = dml_return_value(
+				transaction,
+				statement.graph.as_ref(),
 				&target.returning,
 				&target.schema,
 				&candidate.before,
@@ -142,7 +153,7 @@ fn collect_dml_candidates(
 	graph: Option<&GraphRef>,
 	target_index: usize,
 	target: &LogicalDmlTarget,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	dictionary: &PropertyDictionary,
 	output: &mut Vec<DmlCandidate>,
@@ -169,7 +180,16 @@ fn collect_dml_candidates(
 		LogicalDmlSelector::Record(key) => {
 			let record_id = RecordId::from_value(
 				target.class.as_ref(),
-				eval(key, None, slots, source, None, Some(control))?,
+				eval_dml_read_value(
+					transaction,
+					snapshot,
+					graph,
+					key,
+					&Row::new(Vec::new()),
+					slots,
+					source,
+					control,
+				)?,
 			)?;
 			let row = transaction.query_point(snapshot, &record_id, graph)?;
 			if graph.is_some()
@@ -186,7 +206,16 @@ fn collect_dml_candidates(
 				None => missing_candidate(target_index, record_id, &target.schema),
 			};
 			if candidate.exists() {
-				if filter_matches(target.filter.as_ref(), &candidate.row, slots, source, control)? {
+				if filter_matches(
+					transaction,
+					snapshot,
+					graph,
+					target.filter.as_ref(),
+					&candidate.row,
+					slots,
+					source,
+					control,
+				)? {
 					output.push(candidate);
 				}
 			} else if target.filter.is_none() {
@@ -200,7 +229,16 @@ fn collect_dml_candidates(
 			while let Some(row) = cursor.next_row()? {
 				control.check()?;
 				let candidate = storage_candidate(target_index, row, &target.schema, dictionary)?;
-				if filter_matches(target.filter.as_ref(), &candidate.row, slots, source, control)? {
+				if filter_matches(
+					transaction,
+					snapshot,
+					graph,
+					target.filter.as_ref(),
+					&candidate.row,
+					slots,
+					source,
+					control,
+				)? {
 					output.push(candidate);
 				}
 			}
@@ -267,31 +305,45 @@ fn storage_candidate(
 }
 
 fn filter_matches(
+	transaction: &Transaction,
+	snapshot: &QuerySnapshot,
+	graph: Option<&GraphRef>,
 	filter: Option<&TypedExpr>,
 	row: &Row,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<bool> {
 	filter.map_or(Ok(true), |filter| {
-		eval(filter, Some(row), slots, source, None, Some(control)).map(|value| value.is_truthy())
+		eval_dml_read_value(transaction, snapshot, graph, filter, row, slots, source, control)
+			.map(|value| value.is_truthy())
 	})
 }
 
 fn expect_matches(
+	transaction: &Transaction,
+	snapshot: &QuerySnapshot,
+	graph: Option<&GraphRef>,
 	expect: Option<&LogicalExpect>,
 	candidate: &DmlCandidate,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<bool> {
 	match expect {
 		None => Ok(true),
 		Some(LogicalExpect::Exists(expected)) => Ok(candidate.exists() == *expected),
-		Some(LogicalExpect::Predicate(predicate)) => {
-			eval(predicate, Some(&candidate.row), slots, source, None, Some(control))
-				.map(|value| value.is_truthy())
-		}
+		Some(LogicalExpect::Predicate(predicate)) => eval_dml_read_value(
+			transaction,
+			snapshot,
+			graph,
+			predicate,
+			&candidate.row,
+			slots,
+			source,
+			control,
+		)
+		.map(|value| value.is_truthy()),
 	}
 }
 
@@ -305,7 +357,7 @@ fn apply_dml_candidate(
 	target: &LogicalDmlTarget,
 	schema: &ClassSchema,
 	candidate: &DmlCandidate,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	dictionary: &PropertyDictionary,
 	control: &ExecutionControl,
@@ -352,7 +404,17 @@ fn apply_dml_candidate(
 	} else {
 		Object::new()
 	};
-	apply_dml_data(target.data.as_ref(), &candidate.row, slots, source, &mut after, control)?;
+	apply_dml_data(
+		transaction,
+		&candidate.record_id,
+		None,
+		target.data.as_ref(),
+		&candidate.row,
+		slots,
+		source,
+		&mut after,
+		control,
+	)?;
 	after.insert("id", Value::Record(Box::new(candidate.record_id.clone())));
 	validate_dml_object(schema, &after)?;
 	if exists {
@@ -365,50 +427,71 @@ fn apply_dml_candidate(
 	Ok(Some(after))
 }
 
+#[allow(
+	clippy::too_many_arguments,
+	reason = "one evaluation supplies both the mutation image and the explicit EVENT input"
+)]
 pub(super) fn apply_dml_data(
+	transaction: &mut Transaction,
+	record: &RecordId,
+	graph: Option<crate::graph::GraphId>,
 	data: Option<&LogicalDmlData>,
 	row: &Row,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	image: &mut Object,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<()> {
+	transaction.declare_event_input(record, graph)?;
 	let Some(data) = data else {
 		return Ok(());
 	};
 	match data {
 		LogicalDmlData::Content(value) => {
-			*image = eval_object(value, row, slots, source, control)?;
+			let value = eval_object(transaction, graph, value, row, slots, source, control)?;
+			for (name, field) in &value {
+				transaction.capture_event_input_field(record, graph, name.as_str(), field)?;
+			}
+			*image = value;
 			image.remove("id");
 		}
 		LogicalDmlData::Replace(value) => {
-			let replacement = eval_object(value, row, slots, source, control)?;
+			let replacement = eval_object(transaction, graph, value, row, slots, source, control)?;
 			if replacement.contains_key("id") {
 				return Err(FerrosGrynnError::invalid_argument(
 					"REPLACE cannot change the implicit read-only `id` field.",
 				));
 			}
+			for (name, value) in &replacement {
+				transaction.capture_event_input_field(record, graph, name.as_str(), value)?;
+			}
 			*image = replacement;
 		}
 		LogicalDmlData::Merge(value) => {
-			for (name, value) in eval_object(value, row, slots, source, control)? {
+			for (name, value) in
+				eval_object(transaction, graph, value, row, slots, source, control)?
+			{
 				control.check()?;
 				if name.as_str().eq_ignore_ascii_case("id") {
 					return Err(FerrosGrynnError::invalid_argument(
 						"MERGE cannot change the implicit read-only `id` field.",
 					));
 				}
+				transaction.capture_event_input_field(record, graph, name.as_str(), &value)?;
 				image.insert(name.as_ref(), value);
 			}
 		}
 		LogicalDmlData::Patch(value) => {
-			for (name, value) in eval_object(value, row, slots, source, control)? {
+			for (name, value) in
+				eval_object(transaction, graph, value, row, slots, source, control)?
+			{
 				control.check()?;
 				if name.as_str().eq_ignore_ascii_case("id") {
 					return Err(FerrosGrynnError::invalid_argument(
 						"PATCH cannot change the implicit read-only `id` field.",
 					));
 				}
+				transaction.capture_event_input_field(record, graph, name.as_str(), &value)?;
 				if value == Value::None {
 					image.remove(name.as_str());
 				} else {
@@ -420,17 +503,24 @@ pub(super) fn apply_dml_data(
 			let values = assignments
 				.iter()
 				.map(|(name, value)| {
-					eval(value, Some(row), slots, source, None, Some(control))
+					eval_dml_value(transaction, graph, value, row, slots, source, control)
 						.map(|value| (name.clone(), value))
 				})
 				.collect::<FerrosGrynnResult<Vec<_>>>()?;
 			for (name, value) in values {
+				transaction.capture_event_input_field(record, graph, name.as_ref(), &value)?;
 				image.insert(name.as_ref(), value);
 			}
 		}
 		LogicalDmlData::Unset(fields) => {
 			for field in fields {
 				control.check()?;
+				transaction.capture_event_input_field(
+					record,
+					graph,
+					field.as_ref(),
+					&Value::None,
+				)?;
 				image.remove(field);
 			}
 		}
@@ -444,19 +534,116 @@ pub(super) fn apply_dml_data(
 }
 
 fn eval_object(
+	transaction: &mut Transaction,
+	graph: Option<crate::graph::GraphId>,
 	expr: &TypedExpr,
 	row: &Row,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Object> {
-	match eval(expr, Some(row), slots, source, None, Some(control))? {
+	match eval_dml_value(transaction, graph, expr, row, slots, source, control)? {
 		Value::Object(value) => Ok(value),
 		value => Err(FerrosGrynnError::invalid_argument(format!(
 			"DML object mode received {}",
 			value.value_type()
 		))),
 	}
+}
+
+/// Scalar-only inputs retain their cheap path; calls use the common query
+/// kernel.
+fn eval_dml_value(
+	transaction: &mut Transaction,
+	graph: Option<crate::graph::GraphId>,
+	expression: &TypedExpr,
+	row: &Row,
+	slots: &mut [Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	if !super::query_expression_requires_read(expression) {
+		return eval_mut(expression, Some(row), slots, source, None, Some(control));
+	}
+	let mut account = control.barrier_account();
+	let snapshot = transaction.query_snapshot_admitted(false, |bytes| {
+		if account.reserve(bytes) {
+			Ok(())
+		} else {
+			Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"DML expression snapshot",
+				bytes as u64,
+			))
+		}
+	})?;
+	let scalar_graph = graph
+		.map(|id| {
+			snapshot
+				.logical_root()
+				.schema
+				.graph(id)
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("DML scalar graph is absent"))
+		})
+		.transpose()?;
+	let scalar_graph = scalar_graph.map(|schema| schema.reference().clone());
+	let mut read = super::adapter::TransactionRead {
+		scalar_graph,
+		transaction,
+		snapshot,
+		metadata_only: false,
+	};
+	super::eval_query_expression_current(
+		&mut read,
+		expression,
+		slots,
+		source,
+		control,
+		&mut ControlRuntime::new(control),
+		None,
+		Some(row),
+	)
+}
+
+/// Preflight and return operands share normal queries with a read-only effect
+/// ceiling.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "one fixed snapshot, row and lexical frame define readonly DML operands"
+)]
+fn eval_dml_read_value(
+	transaction: &Transaction,
+	snapshot: &QuerySnapshot,
+	graph: Option<&GraphRef>,
+	expression: &TypedExpr,
+	row: &Row,
+	slots: &mut [Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	if !super::query_expression_requires_read(expression) {
+		return eval_mut(expression, Some(row), slots, source, None, Some(control));
+	}
+	let control = control.closure_scope(crate::gql::ir::ClosureEffect::StableRead)?;
+	let observe = |key| transaction.observe_query_dependency(key);
+	let work = |amount| control.admit_reactive_work(amount);
+	let mut read = super::root_read::RootRead::new(
+		snapshot.logical_root(),
+		&control,
+		&observe,
+		&work,
+		transaction.query_scratch_root(),
+	)
+	.with_scalar_graph(graph);
+	super::eval_query_expression_current(
+		&mut read,
+		expression,
+		slots,
+		source,
+		&control,
+		&mut ControlRuntime::new(&control),
+		None,
+		Some(row),
+	)
 }
 
 pub(super) fn validate_dml_object(schema: &ClassSchema, image: &Object) -> FerrosGrynnResult<()> {
@@ -551,11 +738,13 @@ fn dml_property_map(
 }
 
 fn dml_return_value(
+	transaction: &mut Transaction,
+	graph: Option<&GraphRef>,
 	returning: &LogicalDmlReturn,
 	schema: &Schema,
 	before: &Object,
 	after: Option<&Object>,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Option<Value>> {
@@ -567,7 +756,8 @@ fn dml_return_value(
 		LogicalDmlReturn::Diff => Ok(Some(Value::Object(dml_diff(before, after)))),
 		LogicalDmlReturn::Value(value) => {
 			let row = object_row(schema, selected);
-			eval(value, Some(&row), slots, source, None, Some(control)).map(Some)
+			eval_dml_return_expression(transaction, graph, value, &row, slots, source, control)
+				.map(Some)
 		}
 		LogicalDmlReturn::Fields(items) => {
 			let row = object_row(schema, selected);
@@ -586,7 +776,15 @@ fn dml_return_value(
 					} => {
 						object.insert(
 							name.as_ref(),
-							eval(value, Some(&row), slots, source, None, Some(control))?,
+							eval_dml_return_expression(
+								transaction,
+								graph,
+								value,
+								&row,
+								slots,
+								source,
+								control,
+							)?,
 						);
 					}
 				}
@@ -594,6 +792,34 @@ fn dml_return_value(
 			Ok(Some(Value::Object(object)))
 		}
 	}
+}
+
+/// Return expressions observe completed private writes before dispatch and
+/// publication.
+fn eval_dml_return_expression(
+	transaction: &mut Transaction,
+	graph: Option<&GraphRef>,
+	expression: &TypedExpr,
+	row: &Row,
+	slots: &mut [Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	if !super::query_expression_requires_read(expression) {
+		return eval_mut(expression, Some(row), slots, source, None, Some(control));
+	}
+	let mut account = control.barrier_account();
+	let snapshot = transaction.query_snapshot_admitted(false, |bytes| {
+		if account.reserve(bytes) {
+			Ok(())
+		} else {
+			Err(FerrosGrynnError::traversal_resource_limit_exceeded(
+				"DML return snapshot",
+				bytes as u64,
+			))
+		}
+	})?;
+	eval_dml_read_value(transaction, &snapshot, graph, expression, row, slots, source, control)
 }
 
 fn object_row(schema: &Schema, object: &Object) -> Row {

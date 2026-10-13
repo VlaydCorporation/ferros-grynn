@@ -36,7 +36,7 @@ fn fgdc_v12_round_trips_recursive_types_bindings_and_graph_properties() -> Ferro
 	let catalog = fixture()?;
 	let bytes = catalog.encode()?;
 	assert_eq!(&bytes[..4], b"FGDC");
-	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+	assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
 	assert_eq!(DatabaseCatalog::decode(&bytes)?, catalog);
 	Ok(())
 }
@@ -214,6 +214,7 @@ fn fgdc_live_bindings_reject_cycles_sources_and_invalid_function_references()
 		.with_projection(LiveProjection::Value(LiveExpr::Binding(second)));
 	let descriptor = live_descriptor::encode(&LiveDescriptor::Query(query.clone()), 1024 * 1024)?;
 	catalog.live_queries.push(LiveCatalogEntry {
+		graph_checkpoint: None,
 		id: LiveId::from_uuid(uuid::Uuid::from_u128(3).into())?,
 		version: LiveVersion::default(),
 		state: LiveState::Active,
@@ -258,6 +259,7 @@ fn fgdc_live_history_epochs_bounds_and_malformed_sections() -> FerrosGrynnResult
 	let id = LiveId::from_uuid(uuid::Uuid::from_u128(43).into())?;
 	let query = LiveQuery::new(LiveSource::Class(catalog.classes[0].id));
 	catalog.live_queries.push(LiveCatalogEntry {
+		graph_checkpoint: None,
 		id,
 		version: LiveVersion::default(),
 		state: LiveState::Active,
@@ -489,6 +491,7 @@ fn fgdc_live_recipe_options_and_watermarks_are_checked() -> FerrosGrynnResult<()
 		)?),
 	] {
 		catalog.live_queries = vec![LiveCatalogEntry {
+			graph_checkpoint: None,
 			id,
 			version: LiveVersion::default(),
 			state: LiveState::Active,
@@ -636,6 +639,7 @@ fn fgdc_live_capture_graph_owners_are_checked() -> FerrosGrynnResult<()> {
 		let query = LiveQuery::new(source);
 		let descriptor = live_descriptor::encode(&LiveDescriptor::Query(query.clone()), 1 << 20)?;
 		catalog.live_queries = vec![LiveCatalogEntry {
+			graph_checkpoint: None,
 			id: LiveId::from_uuid(uuid::Uuid::from_u128(42).into())?,
 			version: LiveVersion::default(),
 			state: LiveState::Active,
@@ -738,6 +742,7 @@ fn fgdc_live_query_captures_and_faults_reject_corrupted_tails() -> FerrosGrynnRe
 		live_descriptor::encode(&LiveDescriptor::Query(query.as_ref().clone()), 1024 * 1024)?
 			.into();
 	catalog.live_queries.push(LiveCatalogEntry {
+		graph_checkpoint: None,
 		id: LiveId::from_uuid(uuid::Uuid::from_u128(42).into())?,
 		version: LiveVersion::default(),
 		state: LiveState::Active,
@@ -869,6 +874,7 @@ fn fgdc_live_writer_rejects_catalog_exceeding_recovery_scratch() -> FerrosGrynnR
 	assert!(descriptor.len() < 1024 * 1024);
 	for ordinal in 1..=20 {
 		catalog.live_queries.push(LiveCatalogEntry {
+			graph_checkpoint: None,
 			id: LiveId::from_uuid(uuid::Uuid::from_u128(ordinal).into())?,
 			version: LiveVersion::default(),
 			state: LiveState::Active,
@@ -1207,6 +1213,8 @@ fn fixture() -> FerrosGrynnResult<DatabaseCatalog> {
 		})
 	};
 	Ok(DatabaseCatalog {
+		event_outbox_segments: Vec::new(),
+		events: Vec::new(),
 		database_uuid: uuid::Uuid::from_u128(1),
 		committed_at_ns: 123_456_789,
 		changefeeds: Vec::new(),

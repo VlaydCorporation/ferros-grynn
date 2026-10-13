@@ -15,6 +15,11 @@ pub(crate) use changefeed::{CapturedCommit, ChangefeedCatalog, ChangefeedDefinit
 mod conflict;
 /// Shared datastore constants.
 mod consts;
+/// Accepted invocation bytes, causal ancestry and atomic completion markers.
+mod event_outbox;
+/// Accepted invocation attempts run sequentially on the maintenance worker.
+mod event_worker;
+pub(crate) use event_outbox::{EventCause, EventInvocation, EventInvocationState, EventOutbox};
 /// Snapshot-root adapter for derived incidence projections.
 mod graph_index_relation;
 /// Directed landmark snapshot artifacts and their checked physical adapters.
@@ -30,6 +35,8 @@ pub(crate) use graph_reachability::ReachabilityArtifact;
 mod identity;
 /// Atomic bulk-import coordination and public reports.
 mod import;
+/// Shared complete owner-chain and terminal incidence resolution.
+mod incidence;
 /// MVCC-owned class, label, and explicit scalar indexes.
 mod index_store;
 /// Canonical graph-local LevelPath projection.
@@ -94,6 +101,7 @@ pub(crate) use identity::DataSpaceId;
 pub use import::{
 	ImportChangefeedMode,
 	ImportConstraintMode,
+	ImportEventsMode,
 	ImportIndexMode,
 	ImportItemOutcome,
 	ImportOptions,
@@ -114,7 +122,13 @@ pub(crate) use index_store::{
 	rebuild_lookup_index_store,
 };
 pub(crate) use level_path::LEVEL_PATH_PROPERTY;
-pub use maintenance::{JobId, MaintenanceJobInfo, MaintenanceJobKind, MaintenanceJobState};
+pub use maintenance::{
+	EventJobInfo,
+	JobId,
+	MaintenanceJobInfo,
+	MaintenanceJobKind,
+	MaintenanceJobState,
+};
 pub(crate) use maintenance::{
 	MaintenanceAnalyzeMode,
 	MaintenanceCoordinator,
@@ -157,6 +171,11 @@ pub use schema::{
 	ClassSchema,
 	ClassSchemaMode,
 	DiskAnnIndexOptions,
+	EventAsyncOptions,
+	EventDefinition,
+	EventExecution,
+	EventId,
+	EventTarget,
 	FulltextIndexOptions,
 	FunctionEffect,
 	FunctionId,

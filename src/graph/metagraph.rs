@@ -116,6 +116,24 @@ impl Metagraph<Mutable> {
 		}
 	}
 
+	/// Clones the COW layout while retaining identity, revision and dirty
+	/// metadata.
+	pub(crate) fn clone_preserving_state(&self) -> Self {
+		Self {
+			graph: self.graph.clone_preserving_state(),
+		}
+	}
+
+	/// Adopts an accepted remote watermark without creating a local edit.
+	pub(crate) fn adopt_external_revision(&mut self, revision: u64) {
+		self.graph.adopt_external_revision(revision);
+	}
+
+	/// Clears local dirty metadata after accepting the remote base.
+	pub(crate) fn clear_live_dirty(&mut self) {
+		self.graph.clear_live_dirty();
+	}
+
 	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let (origin, dirty) = self.graph.writeback_context()?;
 		writer.flush(self, &origin, &dirty)?;
@@ -287,6 +305,10 @@ impl<State> GraphRead for Metagraph<State> {
 	fn graph_ref(&self) -> Option<&super::GraphRef> {
 		self.graph.graph_ref()
 	}
+
+	fn materialization_origin(&self) -> Option<&super::MaterializationOrigin> {
+		self.graph.materialization_origin()
+	}
 }
 
 impl GraphMut for Metagraph<Mutable> {
@@ -440,5 +462,30 @@ mod tests {
 
 		assert!(graph.edge(edge).unwrap().topology().is_cross_level());
 		assert_eq!(graph.kind(), super::GraphKind::Metagraph);
+	}
+
+	#[test]
+	fn owned_anonymous_children_are_meta_through_generic_read_traits()
+	-> crate::gql_status::FerrosGrynnResult<()> {
+		let child = Graph::<Mutable>::new().freeze();
+		let mut graph = Metagraph::<Mutable>::new();
+		let node = graph.add_metavertex(child.clone(), None, PropertyMap::new())?;
+		let edge = graph.add_metaedge(
+			EdgeTopology::directed([node], [node]),
+			child,
+			None,
+			PropertyMap::new(),
+		)?;
+		let node = graph.node(node).ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("missing meta node")
+		})?;
+		let edge = graph.edge(edge).ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("missing meta edge")
+		})?;
+		assert!(crate::graph::NodeRead::inner_graph_ref(&node)?.is_none());
+		assert!(crate::graph::EdgeRead::transition_graph_ref(&edge)?.is_none());
+		assert!(crate::graph::NodeRead::is_meta(&node)?);
+		assert!(crate::graph::EdgeRead::is_meta(&edge)?);
+		Ok(())
 	}
 }

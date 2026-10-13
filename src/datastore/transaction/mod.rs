@@ -14,6 +14,8 @@ use super::{
 	ConflictKey,
 	DatabaseRoot,
 	Datastore,
+	EventDefinition,
+	EventId,
 	FunctionId,
 	GlobalAtomId,
 	GraphSchema,
@@ -53,8 +55,6 @@ mod build_graph;
 mod changefeed;
 /// Validated operation replay and final-policy NET/FULL capture.
 mod changefeed_capture;
-/// Owned historical image projection and representation comparison.
-mod changefeed_images;
 /// Accepted-item history retained across private import segments.
 mod changefeed_import;
 /// Compact operation grouping and targeted no-op metadata.
@@ -62,6 +62,15 @@ mod changefeed_journal;
 /// Snapshot-bound public history selection, preflight and pull reading.
 mod changefeed_reader;
 mod commit;
+/// Versioned event registration and transaction-visible metadata.
+mod event;
+/// Operation-image event dispatch with independent recursion and controls.
+mod event_dispatch;
+/// Private accepted invocations survive segment rotation and publish only at
+/// END.
+mod event_import;
+/// Durable invocation admission and atomic lifecycle transitions.
+mod event_outbox;
 mod graph;
 mod graph_view;
 mod import;
@@ -69,6 +78,8 @@ mod import;
 mod live;
 /// Session-issued ACK evidence, independent of primary mutation capture.
 mod live_ack;
+/// Accepted qualified graph images preflight all source writes before mutation.
+mod live_graph_flush;
 pub use live_ack::{GqlLiveAck, GqlLiveAttachment};
 /// Historical registration uses captured images and the ordinary SELECT
 /// executor.
@@ -79,7 +90,15 @@ mod live_binding;
 mod live_evaluation;
 /// Whole-commit net SELECT/FETCH results over before/after immutable roots.
 pub(in crate::datastore) mod live_result;
+/// Shared SDK/GQL logical mutation and rollback boundaries.
+mod operation;
+/// Owned operation image projection and representation comparison.
+mod operation_image;
+/// Logical qualified endpoint selections retained across private mutations.
+mod qualified_incidence;
 mod query;
+/// Logical endpoint references and explicit owner routes for RELATE.
+mod relate;
 mod schema;
 mod tensor;
 mod writeback;
@@ -239,17 +258,38 @@ enum Mutation {
 	DefineClass(ClassSchema),
 	DefineParameter(SchemaParameter),
 	DefineFunction(SchemaFunction),
+	/// A new event definition with a stable schema identity.
+	DefineEvent(EventDefinition),
 	DefineAnalyzer(SchemaAnalyzer),
 	DefineGraph(GraphSchema),
 	ReplaceClass(ClassSchema),
 	ReplaceParameter(SchemaParameter),
 	ReplaceFunction(SchemaFunction),
+	/// Definition replacement, preserving target and event identity.
+	ReplaceEvent(EventDefinition),
 	ReplaceAnalyzer(SchemaAnalyzer),
 	ReplaceGraph(GraphSchema),
 	InstallBuiltGraphTree(build_graph::InstallBuiltGraphTree),
 	RemoveClass(ClassId),
 	RemoveParameter(SchemaId),
 	RemoveFunction(FunctionId),
+	/// Event removal affects future dispatch, not accepted invocations.
+	RemoveEvent(EventId),
+	/// Accepted immutable payload; replay never evaluates its source.
+	EnqueueEvent(Arc<super::EventInvocation>),
+	/// Checked attempt/cancellation/completion publication.
+	TransitionEvent {
+		/// Stable accepted identity.
+		id: super::JobId,
+		/// Expected started-attempt count, revalidated by FCW.
+		expected_attempts: u16,
+		/// Candidate lifecycle state.
+		state: super::EventInvocationState,
+		/// Next due UTC time for queued retries.
+		due_at_ns: i128,
+		/// Bounded failure or cancellation explanation.
+		diagnostic: Option<Text>,
+	},
 	RemoveAnalyzer(AnalyzerId),
 	RemoveGraph(GraphId),
 	CreateAtom {
@@ -351,10 +391,22 @@ pub struct Transaction {
 	/// Bounded accepted-item spool, never visible before final import
 	/// publication.
 	import_changefeed: changefeed_import::ImportCaptureSpool,
+	/// Off imports and ordinary transactions allocate no invocation spool.
+	import_events: Option<Box<event_import::ImportEventSpool>>,
+	/// Ordinary local-only mutations allocate no logical anchor journal.
+	qualified_incidence: Option<Box<qualified_incidence::Journal>>,
 	import_constraints: Option<ImportConstraintMode>,
 	import_graph_scope: Option<GraphId>,
 	rollback_mutation_errors: bool,
 	atomic_mutation_depth: usize,
+	/// Scoped caller control is retained only while a logical mutation runs.
+	event_control: Option<Box<crate::gql::ExecutionControl>>,
+	/// Evaluated GQL input is private to the current logical mutation.
+	event_inputs: Option<Box<event_dispatch::EventInputs>>,
+	/// Event recursion is independent of the outer Changefeed operation.
+	event_depth: u32,
+	/// Accepted ancestry persists across sync handlers and async attempts.
+	event_cause: Option<super::EventCause>,
 	gql_statement_depth: usize,
 	gql_aborted: bool,
 	gql_bindings: crate::values::Object,
@@ -371,6 +423,10 @@ pub struct Transaction {
 }
 
 pub(crate) struct TransactionSavepoint {
+	/// Historical accepted ancestry restored with the private operation state.
+	event_cause: Option<super::EventCause>,
+	/// Independent event recursion frame restored with transaction state.
+	event_depth: u32,
 	working: DatabaseRoot,
 	reads: RapidHashMap<ConflictKey, u64>,
 	missing_records: BTreeSet<RecordId>,
@@ -385,6 +441,10 @@ pub(crate) struct TransactionSavepoint {
 	change_journal: changefeed_journal::JournalCheckpoint,
 	/// Spool rollback position for rejected or failed item boundaries.
 	import_changefeed: changefeed_import::SpoolCheckpoint,
+	/// TRY and rejected items truncate private accepted invocations.
+	import_events: Option<event_import::EventSpoolCheckpoint>,
+	/// Restores accepted qualified routes together with item/TRY effects.
+	qualified_incidence: Option<qualified_incidence::Checkpoint>,
 	gql_bindings: crate::values::Object,
 	/// Immutable lexical contracts restored together with their values.
 	gql_binding_types: crate::gql::bindings::BindingTypes,
@@ -434,10 +494,16 @@ impl Transaction {
 			mutations: Vec::new(),
 			change_journal: changefeed_journal::ChangeJournal::default(),
 			import_changefeed: changefeed_import::ImportCaptureSpool::default(),
+			import_events: None,
+			qualified_incidence: None,
 			import_constraints: None,
 			import_graph_scope: None,
 			rollback_mutation_errors: true,
 			atomic_mutation_depth: 0,
+			event_control: None,
+			event_inputs: None,
+			event_depth: 0,
+			event_cause: None,
 			gql_statement_depth: 0,
 			gql_aborted: false,
 			gql_bindings: crate::values::Object::new(),
@@ -458,6 +524,7 @@ impl Transaction {
 		on_violation: ImportViolationPolicy,
 		graph_scope: Option<GraphId>,
 		changefeed: super::ImportChangefeedMode,
+		events: super::ImportEventsMode,
 		commit_ts: u64,
 	) -> Self {
 		let mut transaction = Self::new(store, id, options, snapshot);
@@ -470,6 +537,9 @@ impl Transaction {
 		transaction.import_graph_scope = graph_scope;
 		transaction.import_changefeed.mode = changefeed;
 		transaction.import_changefeed.stamp = commit_ts;
+		if events == super::ImportEventsMode::On {
+			transaction.import_events = Some(Box::default());
+		}
 		transaction.rollback_mutation_errors =
 			matches!(on_violation, ImportViolationPolicy::Skip | ImportViolationPolicy::Quarantine);
 		transaction
@@ -502,6 +572,14 @@ impl Transaction {
 		self.write_bytes
 			.saturating_add(self.admitted_journal_bytes())
 			.saturating_add(self.import_changefeed.retained_bytes())
+			.saturating_add(match &self.import_events {
+				Some(spool) => spool.retained_bytes(),
+				None => 0,
+			})
+			.saturating_add(match &self.qualified_incidence {
+				Some(journal) => journal.retained_bytes(),
+				None => 0,
+			})
 	}
 
 	/// ON segment replay retains vector capacities alongside captured chunks.
@@ -655,6 +733,8 @@ impl Transaction {
 
 	pub(crate) fn gql_savepoint(&self) -> TransactionSavepoint {
 		TransactionSavepoint {
+			event_cause: self.event_cause,
+			event_depth: self.event_depth,
 			working: self.working.clone(),
 			reads: self.reads.lock().clone(),
 			missing_records: self.missing_records.lock().clone(),
@@ -667,6 +747,11 @@ impl Transaction {
 			mutation_len: self.mutations.len(),
 			change_journal: self.change_journal.checkpoint(),
 			import_changefeed: self.import_changefeed.checkpoint(),
+			import_events: self.import_events.as_ref().map(|spool| spool.checkpoint()),
+			qualified_incidence: self
+				.qualified_incidence
+				.as_ref()
+				.map(|journal| journal.checkpoint()),
 			gql_bindings: self.gql_bindings.clone(),
 			gql_binding_types: self.gql_binding_types.clone(),
 			gql_live_registration_len: self.gql_live_registrations.len(),
@@ -675,6 +760,8 @@ impl Transaction {
 	}
 
 	pub(crate) fn restore_gql_savepoint(&mut self, savepoint: TransactionSavepoint) {
+		self.event_cause = savepoint.event_cause;
+		self.event_depth = savepoint.event_depth;
 		self.working = savepoint.working;
 		*self.reads.lock() = savepoint.reads;
 		*self.missing_records.lock() = savepoint.missing_records;
@@ -685,8 +772,17 @@ impl Transaction {
 		self.fanout_reservations = savepoint.fanout_reservations;
 		self.write_bytes = savepoint.write_bytes;
 		self.mutations.truncate(savepoint.mutation_len);
+		match (&mut self.qualified_incidence, savepoint.qualified_incidence) {
+			(Some(journal), Some(checkpoint)) => journal.restore(checkpoint),
+			(_, None) => self.qualified_incidence = None,
+			(None, Some(_checkpoint)) => {}
+		}
 		self.change_journal.restore(savepoint.change_journal);
 		self.import_changefeed.restore(savepoint.import_changefeed);
+		if let (Some(spool), Some(checkpoint)) = (&mut self.import_events, savepoint.import_events)
+		{
+			spool.restore(checkpoint);
+		}
 		self.gql_bindings = savepoint.gql_bindings;
 		self.gql_binding_types = savepoint.gql_binding_types;
 		self.gql_live_registrations.truncate(savepoint.gql_live_registration_len);
@@ -716,52 +812,12 @@ impl Transaction {
 		Ok(graphs.len())
 	}
 
-	/// Executes one statement-sized mutation with rollback to the transaction's
-	/// prior private state when validation or execution fails.
-	pub(crate) fn atomic_mutation<T>(
-		&mut self,
-		mutate: impl FnOnce(&mut Self) -> FerrosGrynnResult<T>,
-	) -> FerrosGrynnResult<T> {
-		if self.atomic_mutation_depth != 0 {
-			return mutate(self);
-		}
-		self.prepare_mutation()?;
-		if !self.rollback_mutation_errors {
-			let checkpoint = self.change_journal.checkpoint();
-			let owned = self.begin_change_operation();
-			self.atomic_mutation_depth = 1;
-			let result = mutate(self);
-			self.atomic_mutation_depth = 0;
-			if result.is_ok() {
-				self.finish_change_operation(owned);
-			} else {
-				self.change_journal.restore(checkpoint);
-			}
-			return result;
-		}
-		let savepoint = self.gql_savepoint();
-		let owned = self.begin_change_operation();
-		self.atomic_mutation_depth = 1;
-		let result = mutate(self);
-		self.atomic_mutation_depth = 0;
-		match result {
-			Ok(value) => {
-				self.finish_change_operation(owned);
-				Ok(value)
-			}
-			Err(error) => {
-				self.restore_gql_savepoint(savepoint);
-				Err(error)
-			}
-		}
-	}
-
 	/// Rolls back one LIVE control without applying data-writer preparation.
 	pub(crate) fn atomic_live_control<T>(
 		&mut self,
 		control: impl FnOnce(&mut Self) -> FerrosGrynnResult<T>,
 	) -> FerrosGrynnResult<T> {
-		self.prepare_live_control()?;
+		self.prepare_control()?;
 		let savepoint = self.gql_savepoint();
 		match control(self) {
 			Ok(value) => Ok(value),
@@ -1318,40 +1374,45 @@ impl Transaction {
 	}
 
 	/// Stages control without opening the import lease to data or schema DML.
-	fn prepare_live_control(&mut self) -> FerrosGrynnResult<()> {
+	fn prepare_control(&mut self) -> FerrosGrynnResult<()> {
 		if self.import_constraints.is_some() {
 			return Err(FerrosGrynnError::query_feature_not_supported(
-				"LIVE control inside BEGIN IMPORT",
+				"lifecycle control inside BEGIN IMPORT",
 			));
 		}
 		self.prepare_read()?;
 		if self.options.access == TransactionAccess::ReadOnly {
 			return Err(FerrosGrynnError::read_only_transaction(self.id));
 		}
-		if !self.live_control_mutations() {
+		if !self.control_mutations() {
 			self.store.inner.ensure_write_allowed(self.id)?;
 		}
 		Ok(())
 	}
 
 	/// No-op data intents also exclude a transaction from the control lease.
-	fn live_control_mutations(&self) -> bool {
+	fn control_mutations(&self) -> bool {
 		self.change_journal.intents.is_empty()
 			&& self.change_journal.operations.is_empty()
 			&& self.mutations.iter().all(|mutation| {
-				matches!(mutation, Mutation::CloseLive(_) | Mutation::AcknowledgeLive(_))
+				matches!(
+					mutation,
+					Mutation::CloseLive(_)
+						| Mutation::AcknowledgeLive(_)
+						| Mutation::TransitionEvent { .. }
+				)
 			})
 	}
 
 	/// An empty read is not a publication; only actual controls bypass a lease.
-	fn is_live_control_commit(&self) -> bool {
-		!self.mutations.is_empty() && self.live_control_mutations()
+	fn is_control_commit(&self) -> bool {
+		!self.mutations.is_empty() && self.control_mutations()
 	}
 
 	/// Rechecks the narrow exception at both commit preparation and
 	/// publication.
 	fn ensure_commit_write_allowed(&self) -> FerrosGrynnResult<()> {
-		if self.is_live_control_commit() {
+		if self.is_control_commit() {
 			Ok(())
 		} else {
 			self.store.inner.ensure_write_allowed(self.id)
@@ -1504,12 +1565,7 @@ impl Transaction {
 	}
 
 	fn ensure_capacity(&self, additional: usize) -> FerrosGrynnResult<()> {
-		let actual = self
-			.write_bytes
-			.checked_add(self.admitted_journal_bytes())
-			.and_then(|bytes| bytes.checked_add(self.import_changefeed.retained_bytes()))
-			.and_then(|bytes| bytes.checked_add(additional))
-			.unwrap_or(usize::MAX);
+		let actual = self.write_set_bytes().saturating_add(additional);
 		let maximum = self.store.inner.transaction_limits().max_write_set_bytes;
 		let maximum = if self.import_constraints.is_some()
 			&& self.import_changefeed.mode == super::ImportChangefeedMode::On

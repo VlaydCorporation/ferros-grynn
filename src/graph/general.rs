@@ -28,6 +28,7 @@ use super::{
 	GraphMut,
 	GraphRead,
 	GraphReadView,
+	GraphRef,
 	GraphStorageMode,
 	GraphTopologyConstraints,
 	GraphWriteBack,
@@ -214,16 +215,38 @@ impl GeneralStorage {
 		let Some(first) = scope.next() else {
 			return false;
 		};
-		let Some(mut graph) = self.node_inner(first) else {
+		let Some(mut graph) = self.owned_child(first) else {
 			return false;
 		};
 		for container in scope {
-			let Some(next) = graph.node(container).and_then(NodeView::inner_graph) else {
+			let Some(next) = graph.storage.owned_child(container) else {
 				return false;
 			};
 			graph = next;
 		}
 		graph.contains(qualified.atom())
+	}
+
+	/// Borrows the immutable child bound to this concrete owner.
+	fn owned_child(&self, owner: AtomId) -> Option<&Graph<Frozen>> {
+		match owner.kind()? {
+			AtomKind::Node => self.node_inner(owner),
+			AtomKind::Edge => self.edge_transition(owner),
+		}
+	}
+
+	/// Visits physically retained child layouts for shared-scope accounting.
+	fn owned_children(&self) -> impl Iterator<Item = &Graph<Frozen>> {
+		self.node_inner.iter().chain(self.edge_transition.iter()).flatten().map(Arc::as_ref)
+	}
+
+	/// Validates qualified incidence after restoring owned child bindings.
+	fn validate_owned_topology(&self) -> FerrosGrynnResult<()> {
+		for id in self.edges.ids().iter() {
+			let topology = self.edges.topology(*id).ok_or_else(|| atom_does_not_exist(*id))?;
+			self.validate_topology(topology)?;
+		}
+		Ok(())
 	}
 
 	fn contains(&self, id: AtomId) -> bool {
@@ -501,6 +524,11 @@ impl Graph<Mutable> {
 		self.metadata.adopt_external_revision(revision);
 	}
 
+	/// Clears local dirty metadata after accepting the remote base.
+	pub(crate) fn clear_live_dirty(&mut self) {
+		self.metadata.clear_dirty();
+	}
+
 	pub(crate) fn clone_preserving_state(&self) -> Self {
 		Self {
 			metadata: self.metadata.clone(),
@@ -559,6 +587,22 @@ impl Graph<Mutable> {
 		}
 	}
 
+	/// Starts a restored result with its stable incarnation identity and
+	/// watermark.
+	pub(crate) fn begin_live_materialization(
+		identity: Uuid,
+		revision: u64,
+		properties: PropertyMap,
+		nodes: usize,
+		edges: usize,
+	) -> Self {
+		Self {
+			metadata: GraphMetadata::with_identity(identity, revision, properties),
+			storage: GeneralStorage::with_capacity(nodes, edges),
+			state: PhantomData,
+		}
+	}
+
 	/// Inserts one fully decoded node into a query result.
 	pub(crate) fn materialize_query_node(
 		&mut self,
@@ -598,6 +642,23 @@ impl Graph<Mutable> {
 		topology: EdgeTopology,
 	) -> FerrosGrynnResult<()> {
 		self.storage.set_edge_topology(id, topology)
+	}
+
+	/// Attaches owned logical mappings for global query results and restored
+	/// images.
+	pub(crate) fn finish_query_materialization_parts(
+		&mut self,
+		identity: Uuid,
+		snapshot: SnapshotId,
+		reference: Option<GraphRef>,
+		source_atoms: BTreeMap<AtomId, AtomRef>,
+	) {
+		self.metadata.set_origin(MaterializationOrigin::from_parts(
+			identity,
+			snapshot,
+			reference,
+			source_atoms,
+		));
 	}
 
 	/// Attaches the exact source snapshot and clears construction state.
@@ -777,6 +838,80 @@ impl Clone for Graph<Frozen> {
 }
 
 impl<State> Graph<State> {
+	/// Validates owned endpoint routes and every contained graph without
+	/// copying layouts.
+	pub(crate) fn validate_owned_topology(&self) -> FerrosGrynnResult<()> {
+		self.storage.validate_owned_topology()?;
+		let mut pending = self.storage.owned_children().collect::<Vec<_>>();
+		let mut containment = BTreeMap::from([(
+			self.identity(),
+			self.storage.owned_children().map(Graph::identity).collect::<BTreeSet<_>>(),
+		)]);
+		let mut visited = BTreeSet::new();
+		while let Some(graph) = pending.pop() {
+			if !visited.insert(std::ptr::from_ref(graph)) {
+				continue;
+			}
+			graph.storage.validate_owned_topology()?;
+			super::validate_topology_constraints(graph, graph.topology_constraints())?;
+			// Union every physical variant's logical links before memoizing
+			// traversal.
+			containment
+				.entry(graph.identity())
+				.or_default()
+				.extend(graph.storage.owned_children().map(Graph::identity));
+			pending.extend(graph.storage.owned_children());
+		}
+		let mut incoming = containment
+			.keys()
+			.copied()
+			.map(|identity| (identity, 0_usize))
+			.collect::<BTreeMap<_, _>>();
+		for children in containment.values() {
+			for child in children {
+				let count = incoming.get_mut(child).ok_or_else(|| {
+					FerrosGrynnError::graph_constraint_violation(
+						"graph containment",
+						"a contained graph was not inspected",
+					)
+				})?;
+				*count = count.checked_add(1).ok_or_else(|| {
+					FerrosGrynnError::operation_overflow("graph containment indegree")
+				})?;
+			}
+		}
+		let mut ready = incoming
+			.iter()
+			.filter_map(|(identity, count)| (*count == 0).then_some(*identity))
+			.collect::<Vec<_>>();
+		while let Some(identity) = ready.pop() {
+			incoming.remove(&identity);
+			if let Some(children) = containment.get(&identity) {
+				for child in children {
+					let count = incoming.get_mut(child).ok_or_else(|| {
+						FerrosGrynnError::graph_constraint_violation(
+							"graph containment",
+							"a contained graph was processed before its owner",
+						)
+					})?;
+					*count = count.checked_sub(1).ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("graph containment indegree")
+					})?;
+					if *count == 0 {
+						ready.push(*child);
+					}
+				}
+			}
+		}
+		if !incoming.is_empty() {
+			return Err(FerrosGrynnError::graph_constraint_violation(
+				"graph containment",
+				"a contained graph repeats an ancestor identity",
+			));
+		}
+		Ok(())
+	}
+
 	pub(crate) fn restore_free_slot(
 		&mut self,
 		kind: AtomKind,
@@ -1007,6 +1142,10 @@ impl<State> GraphRead for Graph<State> {
 	fn graph_ref(&self) -> Option<&super::GraphRef> {
 		self.metadata.graph_ref()
 	}
+
+	fn materialization_origin(&self) -> Option<&MaterializationOrigin> {
+		self.metadata.origin()
+	}
 }
 
 impl GraphMut for Graph<Mutable> {
@@ -1219,6 +1358,9 @@ fn copy_from_read_inner<R: GraphRead>(
 			result.properties(),
 		)
 		.saturating_add(variable_bytes)
+		.saturating_add(
+			result.materialization_origin().map_or(0, MaterializationOrigin::estimated_heap_bytes),
+		)
 	} else {
 		0
 	};

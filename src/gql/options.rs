@@ -82,6 +82,12 @@ fn check_interrupt(
 }
 
 impl QueryCancellation {
+	/// Adapts the datastore worker's existing cooperative token without a
+	/// second flag.
+	pub(crate) fn from_token(token: Arc<AtomicBool>) -> Self {
+		Self(token)
+	}
+
 	/// Requests cancellation. In-flight synchronous system I/O observes it
 	/// after the system call returns.
 	pub fn cancel(&self) {
@@ -224,7 +230,8 @@ pub(crate) struct ExecutionControl {
 	continuation: Arc<Mutex<Option<QueryCursor>>>,
 	pending_index_seek: Arc<Mutex<Option<QueryCursor>>>,
 	closure_registry: Arc<LanguageClosureState>,
-	function_depths: Arc<Mutex<BTreeMap<FunctionId, u8>>>,
+	/// One shared execution gas/depth authority for nested calls and handlers.
+	runtime_budget: Arc<RuntimeBudget>,
 	execution_mode: ExecutionMode,
 	user_seed: u64,
 	parameter_fingerprint: u64,
@@ -234,6 +241,30 @@ pub(crate) struct ExecutionControl {
 	/// Optional counters scoped to one ANALYZE execution and its child
 	/// controls.
 	changefeed: Option<Arc<[AtomicU64; 9]>>,
+}
+
+/// Existing depth allocation also owns gas shared across invocation frames.
+#[derive(Debug, Default)]
+pub(in crate::gql) struct RuntimeBudget {
+	/// Named-function depth is protected only while entering/leaving a frame.
+	function_depths: Mutex<BTreeMap<FunctionId, u8>>,
+	/// Independent quota accounting publishes no data; relaxed ordering
+	/// suffices.
+	loop_iterations: AtomicU64,
+}
+
+impl RuntimeBudget {
+	/// Admits one loop step without holding a lock around user code.
+	pub(in crate::gql) fn record_iteration(&self, maximum: u64) -> FerrosGrynnResult<()> {
+		self.loop_iterations
+			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+				value.checked_add(1).filter(|next| *next <= maximum)
+			})
+			.map_err(|_value| {
+				FerrosGrynnError::control_limit_exceeded("loop iterations", maximum)
+			})?;
+		Ok(())
+	}
 }
 
 #[derive(Debug, Default)]
@@ -609,7 +640,7 @@ impl ExecutionControl {
 			continuation: Arc::new(Mutex::new(None)),
 			pending_index_seek: Arc::new(Mutex::new(None)),
 			closure_registry,
-			function_depths: Arc::new(Mutex::new(BTreeMap::new())),
+			runtime_budget: Arc::new(RuntimeBudget::default()),
 			execution_mode: ExecutionMode::BestEffort,
 			user_seed: options.deterministic_seed,
 			parameter_fingerprint: 0,
@@ -734,7 +765,7 @@ impl ExecutionControl {
 			});
 		};
 		let maximum = maximum.min(self.max_control_depth);
-		let mut depths = self.function_depths.lock();
+		let mut depths = self.runtime_budget.function_depths.lock();
 		let depth = depths.entry(function.id).or_default();
 		if u32::from(*depth) >= maximum {
 			return Err(FerrosGrynnError::control_limit_exceeded(
@@ -744,13 +775,32 @@ impl ExecutionControl {
 		}
 		*depth = depth.saturating_add(1);
 		Ok(NamedFunctionFrame {
-			depths: Some(self.function_depths.clone()),
+			depths: Some(self.runtime_budget.clone()),
 			function: function.id,
 		})
 	}
 
 	pub(crate) const fn deterministic(&self) -> bool {
 		matches!(self.execution_mode, ExecutionMode::Deterministic)
+	}
+
+	/// Pins the same gas authority for another interpreter invocation frame.
+	pub(in crate::gql) fn runtime_budget(&self) -> Arc<RuntimeBudget> {
+		Arc::clone(&self.runtime_budget)
+	}
+
+	/// Starts an independent top-level statement; nested calls never reset gas.
+	pub(in crate::gql) fn reset_loop_statement(&self) {
+		self.runtime_budget.loop_iterations.store(0, Ordering::Relaxed);
+	}
+
+	/// Swaps compilation cache while retaining deadlines and shared resources.
+	pub(in crate::gql) fn with_closure_registry(
+		mut self,
+		registry: Arc<LanguageClosureState>,
+	) -> Self {
+		self.closure_registry = registry;
+		self
 	}
 
 	pub(crate) const fn fast(&self) -> bool {
@@ -916,7 +966,7 @@ impl ExecutionControl {
 			continuation: self.continuation.clone(),
 			pending_index_seek: self.pending_index_seek.clone(),
 			closure_registry: self.closure_registry.clone(),
-			function_depths: self.function_depths.clone(),
+			runtime_budget: self.runtime_budget.clone(),
 			execution_mode: self.execution_mode,
 			user_seed: self.user_seed,
 			parameter_fingerprint: self.parameter_fingerprint,
@@ -1492,6 +1542,17 @@ impl ExecutionControl {
 		*self.continuation.lock() = Some(cursor);
 	}
 
+	/// Borrows the issued position without consuming publication state.
+	pub(in crate::gql) fn continuation(&self) -> Option<QueryCursor> {
+		*self.continuation.lock()
+	}
+
+	/// Samples caller-owned admission while preparing one nonconcurrent cursor
+	/// frame.
+	pub(in crate::gql) fn admitted_memory(&self) -> usize {
+		self.barrier_memory.used.load(Ordering::Relaxed)
+	}
+
 	pub(crate) fn set_pending_index_seek(&self, cursor: QueryCursor) {
 		*self.pending_index_seek.lock() = Some(cursor);
 	}
@@ -1555,7 +1616,8 @@ impl ExecutionControl {
 }
 
 pub(in crate::gql) struct NamedFunctionFrame {
-	depths: Option<Arc<Mutex<BTreeMap<FunctionId, u8>>>>,
+	/// The shared recursion authority released when the invocation frame exits.
+	depths: Option<Arc<RuntimeBudget>>,
 	function: FunctionId,
 }
 
@@ -1564,7 +1626,7 @@ impl Drop for NamedFunctionFrame {
 		let Some(depths) = &self.depths else {
 			return;
 		};
-		let mut depths = depths.lock();
+		let mut depths = depths.function_depths.lock();
 		if let Some(depth) = depths.get_mut(&self.function) {
 			*depth = depth.saturating_sub(1);
 			if *depth == 0 {

@@ -74,10 +74,12 @@ pub(super) enum LogicalStatement {
 		value: LogicalLetValue,
 	},
 	Return {
+		/// Carries the analyzed endpoint expression through ordinary execution.
 		value: TypedExpr,
 	},
 	ReturnGraph(LogicalReturnGraph),
 	Expression {
+		/// Carries the analyzed endpoint expression through ordinary execution.
 		value: TypedExpr,
 	},
 	If {
@@ -100,6 +102,7 @@ pub(super) enum LogicalStatement {
 		catch: Option<(u32, LogicalBlock)>,
 	},
 	Throw {
+		/// Carries the analyzed endpoint expression through ordinary execution.
 		value: TypedExpr,
 	},
 	Sleep(LogicalDuration),
@@ -223,9 +226,11 @@ pub(super) enum LogicalGraphDmlStatement {
 	},
 	Relate {
 		atom_endpoints: bool,
-		source: LogicalRecordTarget,
+		/// Retains the analyzed source endpoint identity for ordinary RELATE.
+		source: LogicalRelateEndpoint,
 		edge: LogicalRelateEdge,
-		target: LogicalRecordTarget,
+		/// Retains the analyzed target endpoint identity for ordinary RELATE.
+		target: LogicalRelateEndpoint,
 		graph: GraphRef,
 		label: Option<Text>,
 		direction: MatchDirection,
@@ -255,6 +260,34 @@ impl LogicalGraphDmlStatement {
 pub(super) struct LogicalRecordTarget {
 	pub(super) class: Box<str>,
 	pub(super) key: TypedExpr,
+}
+
+/// Typed RELATE endpoint selection has no ATTACH/DETACH target responsibility.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalRelateEndpoint {
+	/// An exact class-qualified record with ordinary key evaluation.
+	Record(LogicalRecordTarget),
+	/// Runtime reference with an optional explicit AtomWalk kind constraint.
+	Reference {
+		/// Carries the analyzed endpoint expression through ordinary execution.
+		value: TypedExpr,
+		/// Retains an explicit node or edge kind supplied by the reference
+		/// idiom.
+		kind: Option<crate::graph::AtomKind>,
+	},
+}
+
+impl LogicalRelateEndpoint {
+	/// Shared effect validation observes the evaluated endpoint operand.
+	pub(super) const fn expression(&self) -> &TypedExpr {
+		match self {
+			Self::Record(record) => &record.key,
+			Self::Reference {
+				value,
+				..
+			} => value,
+		}
+	}
 }
 
 /// Edge atom and graph-local payload prepared for RELATE.
@@ -350,6 +383,7 @@ pub(super) enum LogicalDmlReturnItem {
 	Wildcard,
 	Expr {
 		name: Box<str>,
+		/// Carries the analyzed endpoint expression through ordinary execution.
 		value: TypedExpr,
 	},
 }
@@ -361,9 +395,90 @@ pub(super) enum LogicalExpect {
 	Predicate(TypedExpr),
 }
 
+/// Logical source owner resolved by the ordinary transaction catalog adapter.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalEventOwner {
+	/// Global class namespace, resolved at command execution.
+	Class(Box<str>),
+	/// Graph namespace, resolved at command execution.
+	Graph(Box<str>),
+}
+
+/// One ordered source/policy replacement within ALTER EVENT.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalEventChange {
+	/// Checked synchronous or asynchronous policy replacement.
+	Execution(crate::datastore::EventExecution),
+	/// Owned read-only predicate source replacement.
+	When(Text),
+	/// Owned expression/block handler source replacement.
+	Then(Text),
+	/// Optional durable comment replacement or removal.
+	Comment(Option<Text>),
+}
+
+/// Source-only lifecycle commands; handler typed IR is never stored here.
+#[derive(Debug, Clone)]
+pub(super) enum LogicalEventStatement {
+	/// Registers or overwrites one source-owned definition.
+	Define {
+		/// Duplicate-definition policy.
+		mode: DefinitionMode,
+		/// Name within the stable source owner.
+		name: Box<str>,
+		/// Logical owner resolved to ClassId or GraphId.
+		owner: LogicalEventOwner,
+		/// Checked execution, retry and depth policy.
+		execution: crate::datastore::EventExecution,
+		/// Owned predicate source.
+		when: Text,
+		/// Owned handler source.
+		then: Text,
+	},
+	/// Removes a definition without cancelling frozen accepted invocations.
+	Remove {
+		/// Suppresses absence of the definition or its owner.
+		if_exists: bool,
+		/// Source-owned event name.
+		name: Box<str>,
+		/// Logical class or graph source.
+		owner: LogicalEventOwner,
+	},
+	/// Applies ordered changes, validating the complete final definition.
+	Alter {
+		/// Suppresses absence of the definition or its owner.
+		if_exists: bool,
+		/// Source-owned event name.
+		name: Box<str>,
+		/// Logical class or graph source.
+		owner: LogicalEventOwner,
+		/// Source/policy changes in declaration order.
+		actions: Vec<LogicalEventChange>,
+	},
+}
+
+impl LogicalEventStatement {
+	/// Classifies each event lifecycle command for shared schema execution.
+	pub(super) const fn statement_kind(&self) -> crate::gql::QueryStatementKind {
+		match self {
+			Self::Define {
+				..
+			} => crate::gql::QueryStatementKind::Define,
+			Self::Remove {
+				..
+			} => crate::gql::QueryStatementKind::Remove,
+			Self::Alter {
+				..
+			} => crate::gql::QueryStatementKind::Alter,
+		}
+	}
+}
+
 /// Typed core schema command executed by the datastore adapter.
 #[derive(Debug, Clone)]
 pub(super) enum LogicalSchemaStatement {
+	/// Event DDL retains source recipes, never executable handler IR.
+	Event(LogicalEventStatement),
 	/// Defines a reactive identity through the ordinary transaction API.
 	DefineLiveBinding(Box<LogicalLiveBinding>),
 	/// Replaces a recipe without changing the identity seen by dependents.
@@ -459,6 +574,7 @@ pub(super) enum LogicalSchemaStatement {
 	DefineParameter {
 		mode: DefinitionMode,
 		name: Box<str>,
+		/// Carries the analyzed endpoint expression through ordinary execution.
 		value: TypedExpr,
 		comment: Option<Text>,
 	},
@@ -590,6 +706,11 @@ pub(super) enum LogicalSchemaStatement {
 	InfoClass {
 		name: Box<str>,
 	},
+	/// Read-only graph metadata and its source-owned event definitions.
+	InfoGraph {
+		/// Case-sensitive graph name in the statement snapshot.
+		name: Box<str>,
+	},
 	InfoIndex {
 		class: Box<str>,
 		name: Box<str>,
@@ -639,6 +760,7 @@ impl LogicalSchemaStatement {
 
 	pub(super) const fn statement_kind(&self) -> crate::gql::QueryStatementKind {
 		match self {
+			Self::Event(statement) => statement.statement_kind(),
 			Self::RegisterLive(_) | Self::DefineLiveBinding(_) => {
 				crate::gql::QueryStatementKind::Live
 			}
@@ -745,6 +867,9 @@ impl LogicalSchemaStatement {
 			| Self::InfoClass {
 				..
 			}
+			| Self::InfoGraph {
+				..
+			}
 			| Self::InfoIndex {
 				..
 			}
@@ -775,6 +900,13 @@ pub(super) struct LogicalReturnGraph {
 	pub(super) root: Option<TypedExpr>,
 	pub(super) nodes: TypedExpr,
 	pub(super) edges: TypedExpr,
+}
+
+impl LogicalReturnGraph {
+	/// Traverses selector children in their evaluation order.
+	pub(super) fn expressions(&self) -> impl Iterator<Item = &TypedExpr> {
+		std::iter::once(&self.nodes).chain(std::iter::once(&self.edges)).chain(self.root.iter())
+	}
 }
 
 /// Typed source consumed by `BUILD GRAPH`.
@@ -1021,6 +1153,8 @@ pub(super) enum LogicalMatchSelector {
 
 #[derive(Debug, Clone)]
 pub(super) struct LogicalSelect {
+	/// Cold graph selectors stay outside ordinary SELECT storage.
+	pub(super) return_graph: Option<Box<LogicalReturnGraph>>,
 	/// Independent SDK source plans share ordinary SELECT evaluation.
 	pub(super) union_inputs: Vec<Self>,
 	/// A private typing family becomes one JOIN input before relational work.
@@ -1048,6 +1182,24 @@ pub(super) struct LogicalSelect {
 	pub(super) only: bool,
 	pub(super) tempfiles: bool,
 	pub(super) outer_columns: usize,
+}
+
+impl LogicalSelect {
+	/// Terminal results expose one graph column; selectors retain the projected
+	/// schema.
+	pub(super) fn output_schema(&self) -> Schema {
+		self.return_graph.as_ref().map_or_else(
+			|| self.result.clone(),
+			|graph| Schema {
+				columns: vec![Column {
+					name: "graph".into(),
+					qualifier: None,
+					ty: Type::Graph(graph.contract.family.unwrap_or(GraphKind::Subgraph)),
+				}],
+				origins: std::collections::BTreeMap::new(),
+			},
+		)
+	}
 }
 
 /// Typed source consumed by a traversal pipeline.

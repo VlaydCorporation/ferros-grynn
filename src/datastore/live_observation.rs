@@ -73,6 +73,11 @@ impl Publication {
 					result.batches = result.batches.saturating_add(1);
 					result.events = result.events.saturating_add(batch.events().len() as u64);
 				}
+				LivePayload::Graph(batch) if batch.versionstamp().get() == root.commit_ts => {
+					result.batches = result.batches.saturating_add(1);
+					result.events =
+						result.events.saturating_add(batch.delta().changes().len().max(1) as u64);
+				}
 				LivePayload::Gap(gap)
 					if gap.through().is_some_and(|stamp| stamp.get() == root.commit_ts) =>
 				{

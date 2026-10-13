@@ -1,6 +1,8 @@
 mod changefeed;
 mod control;
 mod dml;
+/// Class/graph event definitions and ordered lifecycle actions.
+mod event;
 mod explain;
 mod graph_dml;
 mod graph_properties;
@@ -25,6 +27,13 @@ pub use control::{
 	IfStatement,
 	TryStatement,
 	WhileStatement,
+};
+pub use event::{
+	DefineEventStatement,
+	EventAlterAction,
+	EventAsyncName,
+	EventBody,
+	EventOwnerName,
 };
 pub use explain::{ExplainFormat, ExplainMode, ExplainStatement};
 pub use graph_result::{
@@ -191,6 +200,8 @@ pub enum StatementKind {
 	DefineField(DefineFieldStatement),
 	DefineAnalyzer(DefineAnalyzerStatement),
 	DefineFunction(DefineFunctionStatement),
+	/// Versioned source-owned event definition.
+	DefineEvent(DefineEventStatement),
 	DefineIndex(DefineIndexStatement),
 	/// Graph-owned snapshot index definition.
 	DefineGraphIndex(DefineGraphIndexStatement),
@@ -228,7 +239,14 @@ pub use dml::{
 	ExpectClause,
 	MutateStatement,
 };
-pub use graph_dml::{AttachStatement, DetachStatement, KeepLevelPathClause, RelateStatement};
+pub use graph_dml::{
+	AttachStatement,
+	DetachStatement,
+	KeepLevelPathClause,
+	RelateEndpoint,
+	RelateEndpointTarget,
+	RelateStatement,
+};
 pub use graph_properties::{
 	GraphPropertyAssignment,
 	GraphPropertyMutation,

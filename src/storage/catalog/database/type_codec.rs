@@ -170,7 +170,11 @@ pub(super) fn decode(decoder: &mut Decoder<'_>, depth: usize) -> FerrosGrynnResu
 	if depth > MAX_DEPTH {
 		return Err(invalid("schema type nesting exceeds 64 levels"));
 	}
-	Ok(match Tag::decode(decoder.read_u8()?)? {
+	let tag = Tag::decode(decoder.read_u8()?)?;
+	if matches!(tag, Tag::Array | Tag::Set | Tag::Range | Tag::Option | Tag::Closure) {
+		decoder.admit_heap(std::mem::size_of::<Type>())?;
+	}
+	Ok(match tag {
 		Tag::Any => Type::Any,
 		Tag::None => Type::None,
 		Tag::Null => Type::Null,
@@ -201,6 +205,12 @@ pub(super) fn decode(decoder: &mut Decoder<'_>, depth: usize) -> FerrosGrynnResu
 		Tag::Option => Type::Option(Box::new(decode(decoder, depth + 1)?)),
 		Tag::Union => {
 			let count = read_count(decoder)?;
+			check_member_bytes(decoder, count, 1)?;
+			decoder.admit_heap(
+				count
+					.checked_mul(std::mem::size_of::<Type>())
+					.ok_or_else(|| invalid("schema type allocation overflows"))?,
+			)?;
 			let mut values = Vec::with_capacity(count);
 			for _ in 0..count {
 				values.push(decode(decoder, depth + 1)?);
@@ -209,6 +219,12 @@ pub(super) fn decode(decoder: &mut Decoder<'_>, depth: usize) -> FerrosGrynnResu
 		}
 		Tag::RecordShape => {
 			let count = read_count(decoder)?;
+			check_member_bytes(decoder, count, 4)?;
+			decoder.admit_heap(
+				count
+					.checked_mul(std::mem::size_of::<(crate::values::Text, Type)>())
+					.ok_or_else(|| invalid("schema type allocation overflows"))?,
+			)?;
 			let mut fields = Vec::with_capacity(count);
 			for _ in 0..count {
 				fields.push((
@@ -220,6 +236,12 @@ pub(super) fn decode(decoder: &mut Decoder<'_>, depth: usize) -> FerrosGrynnResu
 		}
 		Tag::Closure => {
 			let count = read_count(decoder)?;
+			check_member_bytes(decoder, count.saturating_add(1), 1)?;
+			decoder.admit_heap(
+				count
+					.checked_mul(std::mem::size_of::<Type>())
+					.ok_or_else(|| invalid("schema type allocation overflows"))?,
+			)?;
 			let mut parameters = Vec::with_capacity(count);
 			for _ in 0..count {
 				parameters.push(decode(decoder, depth + 1)?);
@@ -250,6 +272,18 @@ fn read_count(decoder: &mut Decoder<'_>) -> FerrosGrynnResult<usize> {
 		return Err(invalid("schema type member count exceeds 4096"));
 	}
 	Ok(count)
+}
+
+/// Persisted counts must have enough encoded members before reserving slots.
+fn check_member_bytes(
+	decoder: &Decoder<'_>,
+	count: usize,
+	minimum: usize,
+) -> FerrosGrynnResult<()> {
+	if count > decoder.remaining_bytes() / minimum {
+		return Err(invalid("schema type member count exceeds remaining bytes"));
+	}
+	Ok(())
 }
 
 const fn atom_kind(kind: AtomKind) -> u8 {

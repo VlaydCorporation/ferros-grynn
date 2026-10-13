@@ -315,6 +315,15 @@ pub enum ParameterCommentChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RemoveTarget {
+	/// Removes one event definition without cancelling accepted jobs.
+	Event {
+		/// Suppresses missing-definition and missing-owner diagnostics.
+		if_exists: bool,
+		/// Name within the stable source owner.
+		name: Identifier,
+		/// Explicit class or graph namespace.
+		owner: EventOwnerName,
+	},
 	/// Removes a reactive binding after checking its dependents.
 	LiveLet(Identifier),
 	/// Removes a graph-owned user definition.
@@ -366,6 +375,17 @@ pub struct RemoveStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AlterTarget {
+	/// Applies ordered changes to a source-owned event definition.
+	Event {
+		/// Suppresses missing-definition and missing-owner diagnostics.
+		if_exists: bool,
+		/// Name within the stable source owner.
+		name: Identifier,
+		/// Explicit class or graph namespace.
+		owner: EventOwnerName,
+		/// Source and policy changes in declaration order.
+		actions: Vec<EventAlterAction>,
+	},
 	/// Replaces a reactive expression while retaining the binding identity.
 	LiveLet {
 		/// Existing reactive identity, independent of its current value.
@@ -460,6 +480,8 @@ pub enum InfoTarget {
 	Job(Identifier),
 	Jobs,
 	Class(Identifier),
+	/// Reads graph schema metadata, including source-owned events.
+	Graph(Identifier),
 	Index {
 		name: Identifier,
 		class: Identifier,
@@ -480,7 +502,11 @@ impl Parser<'_> {
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<StatementKind> {
-		Ok(if self.at_function_definition() {
+		Ok(if self.consume_keyword("EVENT").is_some() {
+			StatementKind::DefineEvent(
+				context.run(|context| self.define_event_statement(context)).await?,
+			)
+		} else if self.at_function_definition() {
 			StatementKind::DefineFunction(
 				context.run(|context| self.define_function_statement(context)).await?,
 			)
@@ -1359,7 +1385,15 @@ impl Parser<'_> {
 	}
 
 	pub(in crate::syn) fn remove_statement(&mut self) -> FerrosGrynnResult<RemoveStatement> {
-		let target = if self.consume_keyword(keywords::LIVE).is_some() {
+		let target = if self.consume_keyword("EVENT").is_some() {
+			let if_exists = self.if_exists()?;
+			let name = self.identifier()?;
+			RemoveTarget::Event {
+				if_exists,
+				name,
+				owner: self.event_owner()?,
+			}
+		} else if self.consume_keyword(keywords::LIVE).is_some() {
 			self.expect_keyword(keywords::LET, "Expected LET after REMOVE LIVE.")?;
 			RemoveTarget::LiveLet(self.parameter()?)
 		} else if self.consume_keyword(keywords::ANALYZER).is_some() {
@@ -1462,7 +1496,18 @@ impl Parser<'_> {
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<AlterStatement> {
-		let target = if self.consume_keyword(keywords::ANALYZER).is_some() {
+		let target = if self.consume_keyword("EVENT").is_some() {
+			let if_exists = self.if_exists()?;
+			let name = self.identifier()?;
+			let owner = self.event_owner()?;
+			let actions = context.run(|context| self.event_alter_actions(context)).await?;
+			AlterTarget::Event {
+				if_exists,
+				name,
+				owner,
+				actions,
+			}
+		} else if self.consume_keyword(keywords::ANALYZER).is_some() {
 			let if_exists = self.if_exists()?;
 			let name = self.identifier()?;
 			let mut function = None;
@@ -1769,6 +1814,8 @@ impl Parser<'_> {
 			InfoTarget::Jobs
 		} else if self.consume_keyword(keywords::CLASS).is_some() {
 			InfoTarget::Class(self.identifier()?)
+		} else if self.consume_keyword(keywords::GRAPH).is_some() {
+			InfoTarget::Graph(self.identifier()?)
 		} else if self.consume_keyword(keywords::INDEX).is_some() {
 			let name = self.identifier()?;
 			match self.maintenance_index_owner()? {
@@ -1839,7 +1886,9 @@ impl Parser<'_> {
 		}
 	}
 
-	fn string_value(&mut self, message: &str) -> FerrosGrynnResult<Box<str>> {
+	/// Reads the shared quoted-string clause used by schema and EVENT
+	/// statements.
+	pub(super) fn string_value(&mut self, message: &str) -> FerrosGrynnResult<Box<str>> {
 		let token = self.tokens.next();
 		match token.kind {
 			TokenKind::String(value) => Ok(value),

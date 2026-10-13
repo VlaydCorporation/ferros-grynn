@@ -419,6 +419,26 @@ impl Forest<Mutable> {
 		}
 	}
 
+	/// Clones the COW layout while retaining identity, revision and dirty
+	/// metadata.
+	pub(crate) fn clone_preserving_state(&self) -> Self {
+		Self {
+			metadata: self.metadata.clone(),
+			storage: self.storage.clone(),
+			state: PhantomData,
+		}
+	}
+
+	/// Adopts an accepted remote watermark without creating a local edit.
+	pub(crate) fn adopt_external_revision(&mut self, revision: u64) {
+		self.metadata.adopt_external_revision(revision);
+	}
+
+	/// Clears local dirty metadata after accepting the remote base.
+	pub(crate) fn clear_live_dirty(&mut self) {
+		self.metadata.clear_dirty();
+	}
+
 	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
@@ -522,6 +542,26 @@ impl Tree<Mutable> {
 		}
 	}
 
+	/// Clones the COW layout while retaining identity, revision and dirty
+	/// metadata.
+	pub(crate) fn clone_preserving_state(&self) -> Self {
+		Self {
+			metadata: self.metadata.clone(),
+			storage: self.storage.clone(),
+			state: PhantomData,
+		}
+	}
+
+	/// Adopts an accepted remote watermark without creating a local edit.
+	pub(crate) fn adopt_external_revision(&mut self, revision: u64) {
+		self.metadata.adopt_external_revision(revision);
+	}
+
+	/// Clears local dirty metadata after accepting the remote base.
+	pub(crate) fn clear_live_dirty(&mut self) {
+		self.metadata.clear_dirty();
+	}
+
 	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
@@ -618,6 +658,27 @@ impl RootedTree<Mutable> {
 			root: self.root,
 			state: PhantomData,
 		}
+	}
+
+	/// Clones the COW layout while retaining identity, revision and dirty
+	/// metadata.
+	pub(crate) fn clone_preserving_state(&self) -> Self {
+		Self {
+			metadata: self.metadata.clone(),
+			storage: self.storage.clone(),
+			root: self.root,
+			state: PhantomData,
+		}
+	}
+
+	/// Adopts an accepted remote watermark without creating a local edit.
+	pub(crate) fn adopt_external_revision(&mut self, revision: u64) {
+		self.metadata.adopt_external_revision(revision);
+	}
+
+	/// Clears local dirty metadata after accepting the remote base.
+	pub(crate) fn clear_live_dirty(&mut self) {
+		self.metadata.clear_dirty();
 	}
 
 	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
@@ -754,6 +815,10 @@ macro_rules! impl_forest_read {
 
 			fn graph_ref(&self) -> Option<&super::GraphRef> {
 				self.metadata.graph_ref()
+			}
+
+			fn materialization_origin(&self) -> Option<&super::MaterializationOrigin> {
+				self.metadata.origin()
 			}
 		}
 	};
@@ -1180,11 +1245,19 @@ fn build_storage<R: GraphRead>(source: &R) -> FerrosGrynnResult<ForestStorage> {
 	let mut direction = None;
 	let mut nodes = BTreeMap::new();
 	for (index, id) in source.node_ids()?.enumerate() {
-		nodes.insert(id?, index);
+		let id = id?;
+		let node = source.node(id)?.ok_or_else(|| atom_does_not_exist(id))?;
+		if node.is_meta()? {
+			return Err(constraint("forest nodes cannot contain child graphs"));
+		}
+		nodes.insert(id, index);
 	}
 	for id in source.edge_ids()? {
 		let id = id?;
 		let edge = source.edge(id)?.ok_or_else(|| atom_does_not_exist(id))?;
+		if edge.is_meta()? {
+			return Err(constraint("forest edges cannot contain transition graphs"));
+		}
 		let topology = edge.topology()?.into_owned();
 		let (left, right, edge_direction) = topology.local_binary().ok_or_else(|| {
 			constraint("forest edges must be local binary vertex-to-vertex edges")
@@ -1453,5 +1526,24 @@ mod tests {
 		assert!(dirty.contains(&DirtyTarget::Atom(middle)));
 		assert!(dirty.contains(&DirtyTarget::Atom(first_edge)));
 		assert!(dirty.contains(&DirtyTarget::Atom(last_edge)));
+	}
+
+	#[test]
+	fn forest_conversion_rejects_containment_before_discarding_it() {
+		let mut child = Graph::<Mutable>::new();
+		child.add_node(None, PropertyMap::new()).unwrap();
+		let child = child.freeze();
+		let mut source = Graph::<Mutable>::new();
+		let owner = source.add_node(None, PropertyMap::new()).unwrap();
+		source.replace_inner_graph(owner, Some(child.clone())).unwrap();
+		assert!(Forest::try_from(source.freeze()).is_err());
+		let mut source = Graph::<Mutable>::new();
+		let left = source.add_node(None, PropertyMap::new()).unwrap();
+		let right = source.add_node(None, PropertyMap::new()).unwrap();
+		let edge = source
+			.add_edge(super::EdgeTopology::undirected([left, right]), None, PropertyMap::new())
+			.unwrap();
+		source.replace_transition_graph(edge, Some(child)).unwrap();
+		assert!(Tree::try_from(source.freeze()).is_err());
 	}
 }

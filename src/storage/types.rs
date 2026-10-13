@@ -170,6 +170,8 @@ pub enum DataFileKind {
 	ImportQuarantine = 0x16,
 	/// Durable whole-commit changefeed pages backfilled by the shared WAL.
 	Changefeed = 0x17,
+	/// Authoritative accepted invocation journal backfilled by the shared WAL.
+	EventOutbox = 0x18,
 }
 
 impl DataFileKind {
@@ -226,6 +228,8 @@ impl DataFileKind {
 			Some(Self::ImportQuarantine)
 		} else if value == Self::Changefeed.get() {
 			Some(Self::Changefeed)
+		} else if value == Self::EventOutbox.get() {
+			Some(Self::EventOutbox)
 		} else {
 			None
 		}
@@ -403,7 +407,11 @@ mod tests {
 			DataFileId::from_raw(0x17).and_then(DataFileId::kind),
 			Some(DataFileKind::Changefeed)
 		);
-		assert!(DataFileId::from_raw(0x18).is_none());
+		assert_eq!(
+			DataFileId::from_raw(0x18).and_then(DataFileId::kind),
+			Some(DataFileKind::EventOutbox)
+		);
+		assert!(DataFileId::from_raw(0x19).is_none());
 	}
 
 	/// Page keys keep database storage distinct from every graph address space.

@@ -1002,7 +1002,7 @@ pub(in crate::gql::execution) fn invoke_logical_closure_with_fields(
 			eval_mut(expression, None, &mut slots, source, fields, Some(control))
 		}
 		crate::gql::ir::LogicalClosureBody::Block(block) => {
-			let mut runtime = super::ControlRuntime::default();
+			let mut runtime = super::ControlRuntime::new(control);
 			match execute_pure_block(block, &mut slots, source, control, &mut runtime, 1, fields)? {
 				PureControlFlow::Value(value) | PureControlFlow::Return(value) => Ok(value),
 				PureControlFlow::Break | PureControlFlow::Continue => {
@@ -1996,7 +1996,7 @@ mod tests {
 			&mut slots,
 			"",
 			&control,
-			&mut super::super::ControlRuntime::default(),
+			&mut super::super::ControlRuntime::new(&control),
 			1,
 			None,
 		)?;
@@ -2008,7 +2008,7 @@ mod tests {
 				&mut slots,
 				"",
 				&control,
-				&mut super::super::ControlRuntime::default(),
+				&mut super::super::ControlRuntime::new(&control),
 				1,
 				None
 			)

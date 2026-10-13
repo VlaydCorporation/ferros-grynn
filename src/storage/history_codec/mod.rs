@@ -4,6 +4,10 @@
 /// Shared checked segment headers and whole-commit continuation pages.
 pub(in crate::storage) mod pages;
 
+/// Owned qualified values shared by computed history and durable EVENT
+/// contexts.
+pub(in crate::storage) mod logical_values;
+
 /// Stable identities shared by source images and computed LIVE results.
 pub(in crate::storage) mod qualified;
 pub(in crate::storage) mod values;

@@ -2,6 +2,308 @@
 
 use std::sync::Arc;
 
+/// Query-owned checkpoints survive reopen with or without optional history.
+fn graph_checkpoint_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {
+	use crate::live::{LiveGraphResult, LiveNext};
+	for durable_history in [false, true] {
+		let directory = TestDirectory::new();
+		let mut options = LocalOptions::default();
+		options.io_mode = mode;
+		options.buffer_pool_pages = 16;
+		let store = Datastore::create_local(&directory.0, options.clone())?;
+		let mut seed = store.begin();
+		let class = seed.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
+		let key = seed.intern_property("value")?;
+		let record: RecordId = "item:a".parse()?;
+		seed.create_atom(record.clone(), PropertyMap::from_iter([(key, Value::from(1))]))?;
+		if durable_history {
+			seed.configure_changefeed(
+				ChangefeedSource::Class(class),
+				ChangefeedConfig::from_nanoseconds(86_400_000_000_000)?,
+			)?;
+		}
+		seed.commit()?;
+		let query = LiveQuery::new(LiveSource::Class(class)).with_graph_result(
+			LiveGraphResult::new(LiveExpr::field("id")?, LiveExpr::Literal(Value::None)),
+		);
+		let mut never_active = store.begin();
+		let closed = never_active.register_live(query.clone(), LiveOptions::default())?;
+		never_active.close_live(closed)?;
+		never_active.commit()?;
+		let mut subscription = store.subscribe_live(query, LiveOptions::default())?;
+		let id = subscription.id();
+		let original = subscription.cursor().clone();
+		let initial = subscription
+			.inner
+			.take_graph_checkpoint()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("initial graph absent"))?;
+		assert_eq!(initial.versionstamp(), original.versionstamp());
+		assert!(store.inner.current_root().live_catalog().graph_segments.contains_key(&id));
+		let mut write = store.begin();
+		write.set_base_property(&record, key, Value::from(2))?;
+		let changed = write.commit()?.versionstamp();
+		let LiveNext::Delivery(delivery) = subscription.next()? else {
+			return Err(FerrosGrynnError::invalid_argument("graph delivery absent"));
+		};
+		let LivePayload::Graph(expected) = delivery.payload() else {
+			return Err(FerrosGrynnError::invalid_argument("graph delivery faulted"));
+		};
+		let expected = Arc::clone(expected);
+		drop(subscription);
+		store.checkpoint(CheckpointMode::Restart)?;
+		let mut generation = store.begin();
+		generation.define_class(ClassSchema::new("other", AtomKind::Node, [])?)?;
+		generation.commit()?;
+		drop(store);
+		let store = Datastore::open_local(&directory.0, options)?;
+		assert_eq!(store.begin().live_info(closed)?.state(), crate::live::LiveState::Closed);
+		let mut unrelated = store.begin();
+		unrelated.create_atom("other:a".parse()?, PropertyMap::new())?;
+		unrelated.commit()?;
+		let root = store.inner.current_root();
+		let recovered = root
+			.live_catalog()
+			.graph_checkpoints
+			.get(&id)
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("recovered graph absent"))?;
+		assert_eq!(recovered.versionstamp(), changed);
+		assert_eq!(recovered.delta().after(), expected.delta().after());
+		assert_eq!(recovered.delta().before(), expected.delta().before());
+		assert!(
+			!root.live_catalog().prepared.iter().any(|(owner, _)| *owner == id),
+			"unrelated post-open DML must not create a graph delta"
+		);
+		if durable_history {
+			let mut replay = store.resume_live(&original)?;
+			let LiveNext::Delivery(delivery) = replay.next()? else {
+				return Err(FerrosGrynnError::invalid_argument("graph replay absent"));
+			};
+			let LivePayload::Graph(batch) = delivery.payload() else {
+				return Err(FerrosGrynnError::invalid_argument("graph replay GAP"));
+			};
+			assert_eq!(batch.versionstamp(), changed);
+			assert_eq!(batch.delta().after(), expected.delta().after());
+			replay.ack(delivery.token())?;
+			assert!(matches!(replay.next()?, LiveNext::Idle));
+		}
+	}
+	Ok(())
+}
+
+#[test]
+fn live_graph_checkpoint_local_sync_reopen_history_and_generation() -> FerrosGrynnResult<()> {
+	graph_checkpoint_survives_reopen(IoMode::Sync)
+}
+
+#[cfg(feature = "native-async-io")]
+#[test]
+fn live_graph_checkpoint_local_native_async_reopen_history_and_generation() -> FerrosGrynnResult<()>
+{
+	graph_checkpoint_survives_reopen(IoMode::NativeAsync)
+}
+
+/// Failed durable ACK never reapplies a resolved candidate or loses its token.
+fn graph_sdk_ack_failure(mode: IoMode) -> FerrosGrynnResult<()> {
+	use crate::{
+		graph::{AtomRef, Frozen, GraphMut, GraphRead, Subgraph},
+		live::{LiveGraphNext, LiveGraphResult},
+		storage::wal::{CommitFailureGuard, CommitFailurePoint},
+	};
+	for point in [CommitFailurePoint::BeforeAppend, CommitFailurePoint::AfterAppend] {
+		let directory = TestDirectory::new();
+		let mut options = LocalOptions::default();
+		options.io_mode = mode;
+		options.buffer_pool_pages = 16;
+		let store = Datastore::create_local(&directory.0, options.clone())?;
+		let mut seed = store.begin();
+		let class = seed.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
+		let key = seed.intern_property("score")?;
+		let record: RecordId = "item:a".parse()?;
+		seed.create_atom(record.clone(), PropertyMap::from_iter([(key, Value::from(1))]))?;
+		seed.configure_changefeed(
+			ChangefeedSource::Class(class),
+			ChangefeedConfig::from_nanoseconds(86_400_000_000_000)?,
+		)?;
+		seed.commit()?;
+		let query = LiveQuery::new(LiveSource::Class(class)).with_graph_result(
+			LiveGraphResult::new(LiveExpr::field("id")?, LiveExpr::Literal(Value::None)),
+		);
+		let mut subscription = store
+			.subscribe_live_graph::<Subgraph<Frozen>>(query, LiveOptions::default())?
+			.into_mutable()?;
+		let saved = subscription.cursor().clone();
+		let atom = AtomRef::new(AtomKind::Node, record.clone());
+		subscription.materialization()?.mutate_local([], |graph| {
+			let id = graph
+				.atom_id(&atom)?
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("local atom absent"))?;
+			graph.node_properties_mut(id)?.insert(key, 99);
+			Ok(())
+		})?;
+		let mut write = store.begin();
+		write.set_base_property(&record, key, 2.into())?;
+		let revision = write.commit()?.versionstamp();
+		assert!(matches!(subscription.next()?, LiveGraphNext::Conflict(_)));
+		let failure = CommitFailureGuard::set(point);
+		assert!(subscription.keep_local().is_err());
+		drop(failure);
+		assert_eq!(subscription.revision(), Some(revision));
+		assert_eq!(subscription.cursor(), &saved);
+		assert!(subscription.applied_unconfirmed().is_some());
+		assert!(subscription.conflict().is_none());
+		subscription.materialization()?.mutate_local([], |graph| {
+			let id = graph
+				.atom_id(&atom)?
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("local atom absent"))?;
+			graph.node_properties_mut(id)?.insert(key, 120);
+			Ok(())
+		})?;
+		// Injected WAL I/O failure poisons the writer until ordinary reopen.
+		assert!(subscription.next().is_err());
+		assert!(subscription.applied_unconfirmed().is_some());
+		subscription.materialization()?.with_graph(|graph| {
+			let id = graph
+				.atom_id(&atom)?
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("local atom absent"))?;
+			let node = graph
+				.node(id)?
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("local node absent"))?;
+			assert_eq!(node.properties().get(key), Some(&Value::from(120)));
+			Ok::<(), FerrosGrynnError>(())
+		})??;
+		drop(store);
+		assert!(matches!(subscription.next()?, LiveGraphNext::Closed));
+		assert!(subscription.applied_unconfirmed().is_some());
+		let store = Datastore::open_local(&directory.0, options)?;
+		let mut resumed = store.resume_live_graph::<Subgraph<Frozen>>(&saved)?;
+		if point == CommitFailurePoint::BeforeAppend {
+			assert!(
+				matches!(resumed.next()?, LiveGraphNext::Updated { revision: received } if received == revision)
+			);
+		}
+		assert_eq!(resumed.revision(), Some(revision));
+		assert!(matches!(resumed.next()?, LiveGraphNext::Idle));
+		resumed.close()?;
+	}
+	Ok(())
+}
+
+#[test]
+fn live_graph_sdk_ack_failure_local_sync() -> FerrosGrynnResult<()> {
+	graph_sdk_ack_failure(IoMode::Sync)
+}
+
+#[cfg(feature = "native-async-io")]
+#[test]
+fn live_graph_sdk_ack_failure_local_native_async() -> FerrosGrynnResult<()> {
+	graph_sdk_ack_failure(IoMode::NativeAsync)
+}
+
+/// Source write-back and graph checkpoint recovery share one local WAL barrier.
+fn graph_sdk_flush_local(mode: IoMode) -> FerrosGrynnResult<()> {
+	use crate::{
+		graph::{AtomRef, Frozen, GraphMut, GraphRead, Subgraph},
+		live::{LiveGraphNext, LiveGraphResult},
+		storage::wal::{CommitFailureGuard, CommitFailurePoint},
+	};
+	let directory = TestDirectory::new();
+	let mut options = LocalOptions::default();
+	options.io_mode = mode;
+	options.buffer_pool_pages = 16;
+	let store = Datastore::create_local(&directory.0, options.clone())?;
+	let mut seed = store.begin();
+	let class = seed.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
+	let key = seed.intern_property("score")?;
+	let record: RecordId = "item:one".parse()?;
+	seed.create_atom(record.clone(), PropertyMap::from_iter([(key, Value::from(1))]))?;
+	seed.configure_changefeed(
+		ChangefeedSource::Class(class),
+		ChangefeedConfig::from_nanoseconds(86_400_000_000_000)?,
+	)?;
+	seed.commit()?;
+	let query = LiveQuery::new(LiveSource::Class(class)).with_graph_result(LiveGraphResult::new(
+		LiveExpr::field("id")?,
+		LiveExpr::Literal(Value::None),
+	));
+	let mut subscription = store
+		.subscribe_live_graph::<Subgraph<Frozen>>(query, LiveOptions::default())?
+		.into_mutable()?;
+	let saved = subscription.cursor().clone();
+	let atom = AtomRef::new(AtomKind::Node, record.clone());
+	subscription.materialization()?.mutate_local([], |graph| {
+		let id = graph
+			.atom_id(&atom)?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("local atom absent"))?;
+		graph.node_properties_mut(id)?.insert(key, 99);
+		Ok(())
+	})?;
+	let old_stamp = store.inner.current_root().commit_ts;
+	let failure = CommitFailureGuard::set(CommitFailurePoint::BeforeAppend);
+	assert!(subscription.flush(store.begin()).is_err());
+	drop(failure);
+	assert_eq!(store.inner.current_root().commit_ts, old_stamp);
+	assert_eq!(subscription.cursor(), &saved);
+	subscription.materialization()?.with_graph(|graph| {
+		let id = graph
+			.atom_id(&atom)?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("local atom absent"))?;
+		assert_eq!(
+			graph
+				.node(id)?
+				.ok_or_else(|| FerrosGrynnError::invalid_argument("local node absent"))?
+				.properties()
+				.get(key),
+			Some(&Value::from(99))
+		);
+		Ok::<(), FerrosGrynnError>(())
+	})??;
+	drop(subscription);
+	drop(store);
+	let store = Datastore::open_local(&directory.0, options.clone())?;
+	let mut subscription = store.resume_live_graph::<Subgraph<Frozen>>(&saved)?.into_mutable()?;
+	subscription.materialization()?.mutate_local([], |graph| {
+		let id = graph
+			.atom_id(&atom)?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("local atom absent"))?;
+		graph.node_properties_mut(id)?.insert(key, 99);
+		Ok(())
+	})?;
+	let committed = subscription.flush(store.begin())?;
+	assert!(
+		matches!(subscription.next()?, LiveGraphNext::Updated { revision } if revision == committed.versionstamp())
+	);
+	let saved = subscription.cursor().clone();
+	drop(subscription);
+	store.checkpoint(CheckpointMode::Restart)?;
+	drop(store);
+	let store = Datastore::open_local(&directory.0, options)?;
+	assert_eq!(
+		store
+			.begin()
+			.atom(&record)?
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("source absent"))?
+			.properties()
+			.get(key),
+		Some(&Value::from(99))
+	);
+	let mut subscription = store.resume_live_graph::<Subgraph<Frozen>>(&saved)?;
+	assert_eq!(subscription.revision(), Some(committed.versionstamp()));
+	assert!(matches!(subscription.next()?, LiveGraphNext::Idle));
+	subscription.close()?;
+	Ok(())
+}
+
+#[test]
+fn live_graph_flush_local_sync_commit_failure_and_reopen() -> FerrosGrynnResult<()> {
+	graph_sdk_flush_local(IoMode::Sync)
+}
+
+#[cfg(feature = "native-async-io")]
+#[test]
+fn live_graph_flush_local_native_commit_failure_and_reopen() -> FerrosGrynnResult<()> {
+	graph_sdk_flush_local(IoMode::NativeAsync)
+}
+
 /// The SDK restores immutable computed values across checkpoint and generation
 /// replacement.
 fn resume_survives_reopen(mode: IoMode) -> FerrosGrynnResult<()> {

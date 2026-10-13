@@ -25,6 +25,14 @@ src/syn parse -> analysis -> logical IR -> canonical rules -> physical optimizer
 - `execution/cursor.rs` — pull-based relational cursors;
 - `execution/eval.rs` — вычисление typed expressions;
 - `execution/mod.rs` — orchestration и statement results;
+- `analysis/event.rs` — EVENT DDL и source-preserving effect validation;
+  `execution/event.rs` и `execution/adapter/event.rs` используют обычные closure,
+  expression, control-flow и DML kernels с текущим transaction reader. Schema
+  definitions, dispatch/outbox/import lifecycle и durable payloads остаются у
+  schema/datastore/storage. Executable handler IR не сериализуется.
+  `ExecutionControl` владеет общим `RuntimeBudget`: вложенные handlers и UDF
+  делят loop gas и depth; только независимый top-level statement сбрасывает gas.
+  Пользовательский код не запускается в commit replay или под commit mutex.
 - `execution/schema/live.rs` — регистрация frozen runtime captures и bounded metadata.
   LIVE LET использует тот же SDK registry: reactive slot хранит identity, value
   разрешается через snapshot/SSI с admission до clone. BindingTypes удерживает
@@ -388,6 +396,12 @@ Transient encoding/hash accounts освобождаются до execution; owne
 допускаются отдельно. INFO остаётся read-only, ANALYZE использует обычный pipeline один раз.
 
 ## Root streaming admission
+
+SELECT graph terminal — cold owned payload в AST/IR. Его Box shell допускается
+analyzer до allocation и учитывается отдельно при копировании typed SELECT;
+уменьшение `size_of::<LogicalSelect>()` не освобождает от pointee accounting.
+MATCH/TRAVERSE/standalone RETURN GRAPH сохраняют свои прежние layouts и общий
+graph assembler. Typed IR не является durable representation.
 
 Direct root SELECT Class callback удерживает transient BarrierAccount от cursor.next
 до завершения projection/visitor. Retained results до insertion отдельно учитывают

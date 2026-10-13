@@ -522,6 +522,10 @@ impl NodeRead for NodeView<'_> {
 	fn inner_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
 		Ok(self.inner_graph.map(Cow::Borrowed))
 	}
+
+	fn is_meta(&self) -> FerrosGrynnResult<bool> {
+		Ok(self.inner_graph.is_some())
+	}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -665,6 +669,10 @@ impl EdgeRead for EdgeView<'_> {
 	fn transition_graph(&self) -> FerrosGrynnResult<Option<Cow<'_, Graph<Frozen>>>> {
 		Ok(self.transition_graph.map(Cow::Borrowed))
 	}
+
+	fn is_meta(&self) -> FerrosGrynnResult<bool> {
+		Ok(self.transition_graph.is_some())
+	}
 }
 
 pub trait GraphRead {
@@ -715,6 +723,12 @@ pub trait GraphRead {
 	}
 
 	fn graph_ref(&self) -> Option<&GraphRef> {
+		None
+	}
+
+	/// Returns owned write-back provenance when this reader is a
+	/// materialization.
+	fn materialization_origin(&self) -> Option<&MaterializationOrigin> {
 		None
 	}
 
@@ -792,16 +806,33 @@ pub struct MaterializationOrigin {
 	identity: Uuid,
 	snapshot: SnapshotId,
 	graph_ref: Option<GraphRef>,
-	source_atoms: BTreeMap<AtomId, AtomRef>,
+	/// Maps local handles to qualified logical source atoms for automatic
+	/// updates.
+	source_atoms: Arc<BTreeMap<AtomId, AtomRef>>,
 }
 
 impl MaterializationOrigin {
+	/// Restores logical source mappings without a live storage reader.
+	pub(crate) fn from_parts(
+		identity: Uuid,
+		snapshot: SnapshotId,
+		graph_ref: Option<GraphRef>,
+		source_atoms: BTreeMap<AtomId, AtomRef>,
+	) -> Self {
+		Self {
+			identity,
+			snapshot,
+			graph_ref,
+			source_atoms: Arc::new(source_atoms),
+		}
+	}
+
 	pub(crate) fn new<R: GraphRead>(source: &R, source_atoms: BTreeMap<AtomId, AtomRef>) -> Self {
 		Self {
 			identity: source.identity(),
 			snapshot: source.snapshot_id(),
 			graph_ref: source.graph_ref().cloned(),
-			source_atoms,
+			source_atoms: Arc::new(source_atoms),
 		}
 	}
 
@@ -823,6 +854,26 @@ impl MaterializationOrigin {
 
 	pub(crate) fn source_atoms(&self) -> impl ExactSizeIterator<Item = (AtomId, &AtomRef)> {
 		self.source_atoms.iter().map(|(local, atom)| (*local, atom))
+	}
+
+	/// Conservative retained bytes; immutable origin maps share storage across
+	/// COW clones.
+	pub(crate) fn estimated_heap_bytes(&self) -> usize {
+		self.source_atoms.values().fold(
+			std::mem::size_of::<BTreeMap<AtomId, AtomRef>>()
+				+ 2 * std::mem::size_of::<usize>()
+				+ self
+					.graph_ref
+					.as_ref()
+					.map_or(0, |graph| graph.name().len() + std::mem::size_of::<GraphRef>()),
+			|bytes, atom| {
+				bytes.saturating_add(
+					128 + std::mem::size_of::<AtomId>()
+						+ std::mem::size_of::<AtomRef>()
+						+ atom.id().estimated_heap_bytes(),
+				)
+			},
+		)
 	}
 }
 

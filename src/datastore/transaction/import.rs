@@ -60,40 +60,59 @@ impl Transaction {
 		if capture_images {
 			self.prepare_import_capture_segment()?;
 		}
-		self.atomic_mutation(|transaction| {
-			let mutation_start = transaction.mutations.len();
-			let _value = apply(transaction)?;
-			if transaction.mutations[mutation_start..]
-				.iter()
-				.any(|mutation| !mutation.allowed_in_import())
+		self.prepare_mutation()?;
+		let dispatch = self.has_operation_events();
+		let savepoint = (self.rollback_mutation_errors || dispatch).then(|| self.gql_savepoint());
+		let checkpoint = self.change_journal.checkpoint();
+		let mutation_start = self.mutations.len();
+		let owned = self.begin_change_operation();
+		// The item shares a Changefeed ordinal, but each call dispatches Events
+		// before its caller control and logical before/after images disappear.
+		if !dispatch {
+			self.atomic_mutation_depth = 1;
+		}
+		let result = apply(self);
+		if !dispatch {
+			self.atomic_mutation_depth = 0;
+		}
+		let result = result.and_then(|_value| {
+			if self.mutations[mutation_start..].iter().any(|mutation| !mutation.allowed_in_import())
 			{
 				return Err(FerrosGrynnError::query_feature_not_supported(
 					"schema mutation inside BEGIN IMPORT",
 				));
 			}
-			if transaction.validates_import_constraints_immediately() {
-				let graphs = transaction
+			if self.validates_import_constraints_immediately() {
+				let graphs = self
 					.working
 					.schema
 					.graphs()
 					.map(|graph| graph.reference().clone())
 					.collect::<Vec<_>>();
 				for graph in &graphs {
-					transaction.validate_graph_family(graph)?;
+					self.validate_graph_family(graph)?;
 				}
 			}
-			let changed = transaction.mutations.len() != mutation_start;
-			transaction.finish_change_operation(true);
+			let changed = self.mutations.len() != mutation_start;
+			self.finish_change_operation(owned);
 			let captured = match (capture_images, captures) {
 				(true, _) => false,
-				(false, true) => transaction.retain_import_suppression(mutation_start)?,
+				(false, true) => self.retain_import_suppression(mutation_start)?,
 				(false, false) => {
-					transaction.change_journal.clear_segment();
+					self.change_journal.clear_segment();
 					false
 				}
 			};
 			Ok(changed || captured)
-		})
+		});
+		if result.is_err() {
+			if let Some(savepoint) = savepoint {
+				self.restore_gql_savepoint(savepoint);
+			} else {
+				self.change_journal.restore(checkpoint);
+			}
+		}
+		result
 	}
 
 	/// Stamps and clears transaction-local tracking at one private segment
@@ -140,6 +159,16 @@ impl Transaction {
 		for graph in &graphs {
 			self.validate_graph_family(graph)?;
 		}
+		self.working.validate_all_qualified_incidence()?;
+		self.validate_pending_qualified_incidence(&self.working)?;
+		self.working.validate_preserved_qualified_incidence(
+			&self.snapshot,
+			|graph, connector| {
+				self.snapshot
+					.atom(connector.global_id())
+					.is_some_and(|atom| self.has_qualified_anchor(graph, atom.record_id()))
+			},
+		)?;
 		if full_validation {
 			self.working.validate_full_import_state()?;
 		}
@@ -172,6 +201,7 @@ impl Transaction {
 		maximum: usize,
 	) -> FerrosGrynnResult<()> {
 		self.working.rebase_import_controls(&self.snapshot, current, self.id, maximum)?;
+		self.publish_import_events(maximum)?;
 		self.working.rebuild_statistics_at(&self.store.inner.import_scratch_root())?;
 		let stamp = self.working.commit_ts;
 		self.publish_import_changes(stamp)?;

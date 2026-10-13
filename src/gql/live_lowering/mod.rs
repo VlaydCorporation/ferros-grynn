@@ -635,6 +635,61 @@ impl<'query> Lowering<'_, 'query> {
 	}
 
 	/// Builds one typed SELECT in the original evaluation order.
+	fn graph_expression(&mut self, expression: &'query LiveExpr) -> FerrosGrynnResult<Expr> {
+		let previous_schema = self.current_schema.take();
+		let previous_logical_alias = self.current_logical_alias.take();
+		let previous_multi_source = std::mem::replace(&mut self.multi_source, true);
+		let result = self.expression(expression);
+		self.current_schema = previous_schema;
+		self.current_logical_alias = previous_logical_alias;
+		self.multi_source = previous_multi_source;
+		result
+	}
+
+	/// Graph selectors use result aliases while parameter names retain their
+	/// lexical owner.
+	fn graph_terminal(
+		&mut self,
+		graph: &'query crate::live::LiveGraphResult,
+	) -> FerrosGrynnResult<crate::syn::ReturnGraph> {
+		use crate::{
+			graph::{GraphKind, GraphTopologyConstraint},
+			syn::{GraphContract, GraphFamilyName, GraphValidatorName, ReturnGraph},
+		};
+		self.admit(2 * std::mem::size_of::<ReturnGraph>())?;
+		self.admit_array::<GraphValidatorName>(graph.validators().iter().count())?;
+		let family = match graph.family() {
+			GraphKind::Graph => Some(GraphFamilyName::Graph),
+			GraphKind::Tree => Some(GraphFamilyName::Tree),
+			GraphKind::RootedTree => Some(GraphFamilyName::RootedTree),
+			GraphKind::Forest => Some(GraphFamilyName::Forest),
+			GraphKind::Dag => Some(GraphFamilyName::Dag),
+			GraphKind::Hypergraph => Some(GraphFamilyName::Hyper),
+			GraphKind::Metagraph => Some(GraphFamilyName::Meta),
+			GraphKind::Subgraph => None,
+		};
+		Ok(ReturnGraph {
+			contract: Some(GraphContract {
+				family,
+				validators: graph
+					.validators()
+					.iter()
+					.map(|validator| match validator {
+						GraphTopologyConstraint::Simple => GraphValidatorName::Simple,
+						GraphTopologyConstraint::Bipartite => GraphValidatorName::Bipartite,
+						GraphTopologyConstraint::Complete => GraphValidatorName::Complete,
+					})
+					.collect(),
+				span: span(),
+			}),
+			nodes: self.graph_expression(graph.nodes())?,
+			edges: self.graph_expression(graph.edges())?,
+			root: graph.root().map(|root| self.graph_expression(root)).transpose()?,
+			span: span(),
+		})
+	}
+
+	/// Builds one typed SELECT in the original evaluation order.
 	fn select_statement(
 		&mut self,
 		query: &'query LiveQuery,
@@ -693,6 +748,10 @@ impl<'query> Lowering<'_, 'query> {
 			.map(|value| self.expression(value))
 			.collect::<FerrosGrynnResult<_>>()?;
 		Ok(SelectStatement {
+			return_graph: query
+				.graph_result()
+				.map(|graph| self.graph_terminal(graph).map(Box::new))
+				.transpose()?,
 			group: match query.group() {
 				None => None,
 				Some([]) => Some(SelectGroup::All(span())),

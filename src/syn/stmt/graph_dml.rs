@@ -29,18 +29,42 @@ pub struct DetachStatement {
 #[non_exhaustive]
 pub struct RelateStatement {
 	pub atom_endpoints: bool,
-	pub source: DmlTarget,
+	pub source: RelateEndpoint,
 	pub edge: DmlTarget,
 	pub alias: Option<Identifier>,
 	pub label: Option<Identifier>,
 	pub direction: MatchDirection,
-	pub target: DmlTarget,
+	pub target: RelateEndpoint,
 	pub graph: Option<Identifier>,
 	pub weight: Option<Expr>,
 	pub data: Option<DmlData>,
 	pub keep_levelpath: Option<KeepLevelPathClause>,
 	pub returning: Option<DmlReturn>,
 	pub expect: Option<ExpectClause>,
+}
+
+/// RELATE owns endpoint selection independently of ATTACH/DETACH record
+/// targets.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct RelateEndpoint {
+	/// Endpoint syntax analyzed by the RELATE pipeline.
+	pub target: RelateEndpointTarget,
+	/// Endpoint diagnostic location.
+	pub span: TextSpan,
+	/// Explicit AtomWalk node or edge wrapper, when supplied.
+	pub kind: Option<MatchEndpointKind>,
+}
+
+/// One endpoint selector; exact record keys keep ordinary DML semantics.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum RelateEndpointTarget {
+	/// An exact class-qualified record with a dynamically evaluated key.
+	Record(DmlTarget),
+	/// A lexical reference or idiom evaluated by the ordinary expression
+	/// kernel.
+	Reference(Expr),
 }
 
 /// Explicit request to persist the canonical graph-local LevelPath overlay.
@@ -113,15 +137,29 @@ impl Parser<'_> {
 		if self.at_keyword("HYPER") {
 			return Err(self.unsupported("RELATE HYPER", self.current().span));
 		}
-		let source = self.exact_graph_target(context, "RELATE endpoint").await?;
+		let source = self.relate_endpoint(context, atom_endpoints).await?;
 		let prefix_token = self.tokens.next();
 		let TokenKind::Symbol(prefix) = prefix_token.kind else {
 			return Err(self.syntax("Expected a RELATE edge connector.", prefix_token.span));
 		};
-		if !matches!(prefix, Symbol::Minus | Symbol::ArrowLeft) {
-			return Err(self.syntax("Expected `-[` or `<-[` in RELATE.", prefix_token.span));
-		}
-		let open = self.expect_symbol(Symbol::LeftBracket, "Expected `[` in RELATE edge.")?;
+		let (left, atom_connector, open_span) = match prefix {
+			Symbol::Minus | Symbol::ArrowLeft => (
+				prefix == Symbol::ArrowLeft,
+				false,
+				self.expect_symbol(Symbol::LeftBracket, "Expected `[` in RELATE edge.")?.span,
+			),
+			Symbol::TildeLeftBracket | Symbol::LeftTildeLeftBracket
+				if atom_endpoints && source.kind.is_some() =>
+			{
+				(prefix == Symbol::LeftTildeLeftBracket, true, prefix_token.span)
+			}
+			_ => {
+				return Err(self.syntax(
+					"Expected a RELATE edge connector with matching AtomWalk wrappers.",
+					prefix_token.span,
+				));
+			}
+		};
 		let edge = self.dml_target(context, false).await?;
 		let alias = if self.consume_keyword(keywords::AS).is_some() {
 			Some(self.identifier()?)
@@ -133,19 +171,31 @@ impl Parser<'_> {
 		} else {
 			None
 		};
-		self.close(Symbol::RightBracket, open.span, "`]`")?;
+		if !atom_connector {
+			self.close(Symbol::RightBracket, open_span, "`]`")?;
+		}
 		let suffix_token = self.tokens.next();
 		let TokenKind::Symbol(suffix) = suffix_token.kind else {
 			return Err(self.syntax("Expected `-` or `->` after RELATE edge.", suffix_token.span));
 		};
-		let direction = match (prefix, suffix) {
-			(Symbol::Minus, Symbol::ArrowRight) => MatchDirection::Forward,
-			(Symbol::ArrowLeft, Symbol::Minus) => MatchDirection::Backward,
-			(Symbol::Minus, Symbol::Minus) => MatchDirection::Undirected,
-			(Symbol::ArrowLeft, Symbol::ArrowRight) => MatchDirection::Bidirectional,
+		let right = match (atom_connector, suffix) {
+			(false, Symbol::Minus) | (true, Symbol::RightBracketTilde) => false,
+			(false, Symbol::ArrowRight) | (true, Symbol::RightBracketTildeRight) => true,
 			_ => return Err(self.syntax("Invalid RELATE direction.", suffix_token.span)),
 		};
-		let target = self.exact_graph_target(context, "RELATE endpoint").await?;
+		let direction = match (left, right) {
+			(false, true) => MatchDirection::Forward,
+			(true, false) => MatchDirection::Backward,
+			(false, false) => MatchDirection::Undirected,
+			(true, true) => MatchDirection::Bidirectional,
+		};
+		let target = self.relate_endpoint(context, atom_endpoints).await?;
+		if atom_connector && target.kind.is_none() {
+			return Err(self.syntax(
+				"AtomWalk RELATE requires an explicit node/edge target wrapper.",
+				target.span,
+			));
+		}
 		let graph = if self.consume_keyword(keywords::IN).is_some() {
 			self.expect_keyword(keywords::GRAPH, "Expected `GRAPH` after `IN`.")?;
 			Some(self.identifier()?)
@@ -229,5 +279,77 @@ impl Parser<'_> {
 			));
 		}
 		Ok(target)
+	}
+
+	/// Retains exact record keys and references without consuming connector
+	/// operators.
+	async fn relate_endpoint(
+		&mut self,
+		context: &mut Stk,
+		atom: bool,
+	) -> FerrosGrynnResult<RelateEndpoint> {
+		let start = self.current().span;
+		let outer = self.consume_symbol(Symbol::Less);
+		if outer.is_some() && !atom {
+			return Err(self.syntax("AtomWalk wrappers require RELATE ATOM.", start));
+		}
+		let (open, kind, close) = if outer.is_some() {
+			let open = self.tokens.next();
+			match open.kind {
+				TokenKind::Symbol(Symbol::LeftParen) => {
+					(Some(open.span), Some(MatchEndpointKind::Node), Symbol::RightParen)
+				}
+				TokenKind::Symbol(Symbol::LeftBracket) => {
+					(Some(open.span), Some(MatchEndpointKind::Edge), Symbol::RightBracket)
+				}
+				_ => {
+					return Err(
+						self.syntax("Expected `(` or `[` inside AtomWalk endpoint.", open.span)
+					);
+				}
+			}
+		} else {
+			(self.consume_symbol(Symbol::LeftParen).map(|open| open.span), None, Symbol::RightParen)
+		};
+		let minimum = if open.is_some() {
+			0
+		} else {
+			u8::MAX
+		};
+		let (target, end) = if matches!(self.current().kind, TokenKind::Word { .. })
+			&& matches!(self.tokens.peek(1).kind, TokenKind::Symbol(Symbol::Colon))
+		{
+			let target = self.class_or_record_target_at(context, minimum).await?;
+			if !target.is_exact() {
+				return Err(self.syntax("RELATE requires an exact record endpoint.", start));
+			}
+			let end = match &target {
+				DmlTarget::Record {
+					span,
+					..
+				} => *span,
+				_ => start,
+			};
+			(RelateEndpointTarget::Record(target), end)
+		} else {
+			let value = context.run(|context| self.expression(context, minimum, 1, 0)).await?;
+			let end = value.span;
+			(RelateEndpointTarget::Reference(value), end)
+		};
+		let end = if let Some(open) = open {
+			self.close(close, open, "endpoint closing delimiter")?.span
+		} else {
+			end
+		};
+		let end = if outer.is_some() {
+			self.expect_symbol(Symbol::Greater, "Expected `>` after AtomWalk endpoint.")?.span
+		} else {
+			end
+		};
+		Ok(RelateEndpoint {
+			target,
+			kind,
+			span: cover(start, end),
+		})
 	}
 }

@@ -240,32 +240,14 @@ pub(super) fn visit_traverse_values<Read: QueryRead>(
 				snapshot,
 				graph: None,
 			};
-			assembly.add_nodes(eval(
-				&graph_plan.nodes,
-				Some(&row),
-				slots,
-				source,
-				Some(&fields),
-				Some(control),
-			)?)?;
-			assembly.add_edges(eval(
-				&graph_plan.edges,
-				Some(&row),
-				slots,
-				source,
-				Some(&fields),
-				Some(control),
-			)?)?;
-			if let Some(root) = &graph_plan.root {
-				assembly.add_root(eval(
-					root,
-					Some(&row),
-					slots,
-					source,
-					Some(&fields),
-					Some(control),
-				)?)?;
-			}
+			assembly.add_selectors(
+				Some(&graph_plan.nodes),
+				Some(&graph_plan.edges),
+				graph_plan.root.as_ref(),
+				|expression| {
+					eval(expression, Some(&row), slots, source, Some(&fields), Some(control))
+				},
+			)?;
 		}
 		return assembly
 			.finish(machine.read, snapshot, graph_plan.contract)

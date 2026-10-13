@@ -64,7 +64,7 @@ pub(crate) use general::{merge_transaction_graph, remap_topology};
 pub use hypergraph::{FrozenHypergraph, Hypergraph, MutableHypergraph};
 pub(crate) use id::SlotAllocator;
 pub use id::{AtomId, AtomKind, GraphId};
-pub use live::{LiveEvent, LiveGraph, LiveReadGuard, LiveUpdate};
+pub use live::{LiveEvent, LiveFamily, LiveGraph, LiveReadGuard, LiveUpdate};
 pub use materialized::MaterializedGraph;
 pub(crate) use materialized::estimated_topology_heap_bytes;
 pub(crate) use metagraph::validate_nested_references;

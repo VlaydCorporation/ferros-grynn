@@ -64,6 +64,8 @@ impl Display for JobId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MaintenanceJobKind {
+	/// Runs one accepted durable EVENT revision through the query kernel.
+	EventInvocation,
 	BuildIndex,
 	RebuildIndex,
 	DeferredIndexCatchUp,
@@ -79,6 +81,8 @@ pub enum MaintenanceJobKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MaintenanceJobState {
+	/// An EVENT attempt has started; its effects remain transaction-private.
+	Running,
 	Queued,
 	BuildingInitial,
 	CatchingUp,
@@ -122,9 +126,61 @@ pub(crate) enum MaintenanceTarget {
 	Database,
 }
 
+/// Accepted EVENT revision and retry ancestry, without retaining its payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventJobInfo {
+	/// Stable schema identity captured by the source operation.
+	pub(crate) id: super::EventId,
+	/// Definition revision retained after ALTER or REMOVE.
+	pub(crate) version: SchemaVersion,
+	/// Distinct attempts started, excluding an interrupted attempt's recovery.
+	pub(crate) attempts: u16,
+	/// Historical depth, unchanged by retry.
+	pub(crate) depth: u8,
+	/// Additional permitted attempts.
+	pub(crate) retries: u8,
+	/// Tightest retained ancestor bound.
+	pub(crate) max_depth: u8,
+}
+
+impl EventJobInfo {
+	/// Returns the accepted definition identity.
+	pub const fn id(&self) -> super::EventId {
+		self.id
+	}
+
+	/// Returns the accepted definition version.
+	pub const fn version(&self) -> SchemaVersion {
+		self.version
+	}
+
+	/// Returns how many distinct attempts started.
+	pub const fn attempts(&self) -> u16 {
+		self.attempts
+	}
+
+	/// Returns the invocation's historical causal depth.
+	pub const fn depth(&self) -> u8 {
+		self.depth
+	}
+
+	/// Returns the number of additional permitted attempts.
+	pub const fn retries(&self) -> u8 {
+		self.retries
+	}
+
+	/// Returns the inherited causal depth ceiling.
+	pub const fn max_depth(&self) -> u8 {
+		self.max_depth
+	}
+}
+
 /// Immutable public projection of one durable job record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceJobInfo {
+	/// Invocation-only metadata is projected from the authoritative MVCC
+	/// outbox.
+	pub(crate) event: Option<EventJobInfo>,
 	pub(crate) id: JobId,
 	pub(crate) kind: MaintenanceJobKind,
 	pub(crate) state: MaintenanceJobState,
@@ -145,6 +201,11 @@ pub struct MaintenanceJobInfo {
 }
 
 impl MaintenanceJobInfo {
+	/// Returns accepted EVENT metadata for invocation jobs.
+	pub const fn event(&self) -> Option<&EventJobInfo> {
+		self.event.as_ref()
+	}
+
 	/// Returns the stable job identity.
 	pub const fn id(&self) -> JobId {
 		self.id
@@ -243,7 +304,7 @@ impl MaintenanceJobInfo {
 	}
 
 	pub(crate) fn value(&self) -> Value {
-		Value::from(Object::from_iter([
+		let mut value = Object::from_iter([
 			("id", Value::from(self.id.as_uuid())),
 			("kind", Value::from(job_kind_name(self.kind))),
 			("state", Value::from(job_state_name(self.state))),
@@ -260,12 +321,26 @@ impl MaintenanceJobInfo {
 				self.terminal_status.map_or(Value::None, |status| Value::from(status.to_string())),
 			),
 			("diagnostic", self.diagnostic.clone().map_or(Value::None, Value::from)),
-		]))
+		]);
+		if let Some(event) = &self.event {
+			for (name, field) in [
+				("event_id", Value::from(event.id.get())),
+				("event_version", Value::from(event.version.get())),
+				("attempts", Value::from(event.attempts)),
+				("depth", Value::from(event.depth)),
+				("retry", Value::from(event.retries)),
+				("maxdepth", Value::from(event.max_depth)),
+			] {
+				value.insert(name, field);
+			}
+		}
+		Value::from(value)
 	}
 }
 
 const fn job_kind_name(kind: MaintenanceJobKind) -> &'static str {
 	match kind {
+		MaintenanceJobKind::EventInvocation => "event_invocation",
 		MaintenanceJobKind::BuildIndex => "build_index",
 		MaintenanceJobKind::RebuildIndex => "rebuild_index",
 		MaintenanceJobKind::DeferredIndexCatchUp => "deferred_index_catch_up",
@@ -279,6 +354,7 @@ const fn job_kind_name(kind: MaintenanceJobKind) -> &'static str {
 
 const fn job_state_name(state: MaintenanceJobState) -> &'static str {
 	match state {
+		MaintenanceJobState::Running => "running",
 		MaintenanceJobState::Queued => "queued",
 		MaintenanceJobState::BuildingInitial => "building_initial",
 		MaintenanceJobState::CatchingUp => "catching_up",
@@ -295,7 +371,9 @@ const fn job_state_name(state: MaintenanceJobState) -> &'static str {
 	reason = "public job projection and coordinator-only construction are intentionally separated"
 )]
 impl MaintenanceJobInfo {
-	fn new(
+	/// Configures the existing fair maintenance worker with the datastore EVENT
+	/// interval.
+	pub(in crate::datastore) fn new(
 		kind: MaintenanceJobKind,
 		target: MaintenanceTarget,
 		source_revision: u64,
@@ -304,6 +382,7 @@ impl MaintenanceJobInfo {
 	) -> Self {
 		let now = SystemTime::now();
 		Self {
+			event: None,
 			id: JobId::new(),
 			kind,
 			state: MaintenanceJobState::Queued,
@@ -351,6 +430,8 @@ impl MaintenanceTarget {
 
 #[derive(Clone)]
 struct CoordinatorState {
+	/// Protects root-owned invocation wakeups against a predicate/wait race.
+	event_wake: u64,
 	jobs: BTreeMap<JobId, MaintenanceJobInfo>,
 	queue: VecDeque<JobId>,
 	pending_index_changes: VecDeque<(MaintenanceTarget, u64)>,
@@ -409,6 +490,34 @@ pub(crate) struct MaintenanceCoordinator {
 }
 
 impl MaintenanceCoordinator {
+	/// Wakes the existing scheduler after an invocation publication.
+	pub(crate) fn wake_events(&self) {
+		let mut state = self.shared.state.lock();
+		state.event_wake = state.event_wake.wrapping_add(1);
+		self.shared.wake.notify_one();
+	}
+
+	/// The single worker owns at most one invocation token at a time.
+	pub(crate) fn begin_event_attempt(&self, id: JobId) -> Arc<AtomicBool> {
+		let mut state = self.shared.state.lock();
+		let token = Arc::new(AtomicBool::new(state.stopping));
+		state.cancellation_tokens.insert(id, Arc::clone(&token));
+		token
+	}
+
+	/// Removes the transient attempt token; root state remains the authority.
+	pub(crate) fn end_event_attempt(&self, id: JobId) {
+		self.shared.state.lock().cancellation_tokens.remove(&id);
+	}
+
+	/// KILL publishes cancellation before signalling a running attempt.
+	pub(crate) fn cancel_event_attempt(&self, id: JobId) {
+		if let Some(token) = self.shared.state.lock().cancellation_tokens.get(&id) {
+			token.store(true, Ordering::Release);
+		}
+		self.shared.wake.notify_one();
+	}
+
 	pub(crate) fn new(recovered: Vec<MaintenanceJobInfo>) -> Self {
 		let jobs: BTreeMap<JobId, MaintenanceJobInfo> =
 			recovered.into_iter().map(|job| (job.id, job)).collect();
@@ -417,6 +526,7 @@ impl MaintenanceCoordinator {
 		Self {
 			shared: Arc::new(CoordinatorShared {
 				state: Mutex::new(CoordinatorState {
+					event_wake: 0,
 					jobs,
 					queue: VecDeque::new(),
 					pending_index_changes: VecDeque::new(),
@@ -548,6 +658,11 @@ impl MaintenanceCoordinator {
 				continue;
 			}
 			match job.state {
+				MaintenanceJobState::Running => {
+					return Err(FerrosGrynnError::invalid_argument(
+						"EVENT state cannot be recovered from the maintenance ledger",
+					));
+				}
 				MaintenanceJobState::Queued => state.queue.push_back(id),
 				MaintenanceJobState::Publishing if store.maintenance_publication_matches(job) => {
 					job.state = MaintenanceJobState::Completed;
@@ -849,11 +964,42 @@ impl MaintenanceCoordinator {
 }
 
 fn worker_loop(shared: &Arc<CoordinatorShared>, store: &Weak<StoreInner>) {
+	let mut prefer_events = true;
+	let mut last_discovery: Option<std::time::Instant> = None;
 	loop {
+		let event_wake = shared.state.lock().event_wake;
+		let Some(owner) = store.upgrade() else {
+			return;
+		};
+		if shared.state.lock().stopping {
+			return;
+		}
+		if last_discovery.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1)) {
+			owner.sweep_retired_changefeeds();
+			if owner.has_changefeed_retention_work().is_ok_and(|due| due) {
+				let options = owner.transaction_limits().maintenance;
+				drop(owner.maintenance.enqueue_coalesced(
+					&owner,
+					MaintenanceJobKind::PurgeChangefeed,
+					MaintenanceTarget::Database,
+					options,
+					None,
+				));
+			}
+			last_discovery = Some(std::time::Instant::now());
+		}
+		if (prefer_events || shared.state.lock().queue.is_empty())
+			&& owner.run_due_event(jiff::Timestamp::now().as_nanosecond()).is_ok_and(|ran| ran)
+		{
+			prefer_events = false;
+			continue;
+		}
+		let idle_wait = owner.event_wait_duration(jiff::Timestamp::now().as_nanosecond());
+		drop(owner);
 		let id = {
 			let mut state = shared.state.lock();
-			if state.queue.is_empty() && !state.stopping {
-				shared.wake.wait_for(&mut state, std::time::Duration::from_secs(1));
+			if state.queue.is_empty() && !state.stopping && state.event_wake == event_wake {
+				shared.wake.wait_for(&mut state, idle_wait);
 			}
 			if state.stopping {
 				return;
@@ -864,19 +1010,9 @@ fn worker_loop(shared: &Arc<CoordinatorShared>, store: &Weak<StoreInner>) {
 			return;
 		};
 		let Some(id) = id else {
-			store.sweep_retired_changefeeds();
-			if store.has_changefeed_retention_work().is_ok_and(|due| due) {
-				let options = match store.options {
-					DatastoreOptions::InMemory(options) => options.maintenance,
-					DatastoreOptions::Local(options) => options.maintenance,
-				};
-				drop(store.maintenance.enqueue_coalesced(
-					&store,
-					MaintenanceJobKind::PurgeChangefeed,
-					MaintenanceTarget::Database,
-					options,
-					None,
-				));
+			if store.run_due_event(jiff::Timestamp::now().as_nanosecond()).is_ok_and(|ran| ran) {
+				prefer_events = false;
+				continue;
 			}
 			continue;
 		};
@@ -885,6 +1021,7 @@ fn worker_loop(shared: &Arc<CoordinatorShared>, store: &Weak<StoreInner>) {
 		}
 		let result = store.run_maintenance_job(id);
 		finish_job(shared, store.as_ref(), id, result);
+		prefer_events = true;
 	}
 }
 
@@ -1047,6 +1184,7 @@ mod tests {
 			version: SchemaVersion::INITIAL,
 		};
 		let mut state = CoordinatorState {
+			event_wake: 0,
 			jobs: BTreeMap::new(),
 			queue: VecDeque::new(),
 			pending_index_changes: VecDeque::new(),

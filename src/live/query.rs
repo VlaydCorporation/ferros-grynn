@@ -664,6 +664,8 @@ pub enum LiveOutputMode {
 	reason = "nightly rustfmt uses required hard tabs in Rustdoc examples"
 )]
 pub struct LiveQuery {
+	/// Optional owned graph terminal, separate from row delivery presentation.
+	pub(crate) graph_result: Option<super::LiveGraphResult>,
 	/// Source identity, resolved without reparsing text.
 	pub(crate) source: LiveSource,
 	/// Optional logical qualifier, independent of the source identity.
@@ -701,6 +703,7 @@ impl LiveQuery {
 	/// parameters.
 	pub fn new(source: LiveSource) -> Self {
 		Self {
+			graph_result: None,
 			source,
 			alias: None,
 			joins: Vec::new(),
@@ -895,6 +898,18 @@ impl LiveQuery {
 	pub fn with_projection(mut self, projection: LiveProjection) -> Self {
 		self.projection = projection;
 		self
+	}
+
+	/// Adds a terminal graph projection using ordinary SELECT result aliases.
+	#[must_use]
+	pub fn with_graph_result(mut self, result: super::LiveGraphResult) -> Self {
+		self.graph_result = Some(result);
+		self
+	}
+
+	/// Borrows the logical graph recipe without materializing its sources.
+	pub const fn graph_result(&self) -> Option<&super::LiveGraphResult> {
+		self.graph_result.as_ref()
 	}
 
 	/// Removes output paths after projection and before FETCH.

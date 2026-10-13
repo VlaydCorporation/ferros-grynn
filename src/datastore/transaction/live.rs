@@ -198,7 +198,7 @@ impl Transaction {
 	/// Returns missing-definition, read-only, import-item or resource errors.
 	/// Standalone close commits remain available during a leased import.
 	pub fn close_live(&mut self, id: LiveId) -> FerrosGrynnResult<()> {
-		self.prepare_live_control()?;
+		self.prepare_control()?;
 		let definition =
 			self.working.live_catalog().queries.get(&id).ok_or_else(|| {
 				FerrosGrynnError::invalid_argument("LIVE identity is not registered")
@@ -221,7 +221,7 @@ impl Transaction {
 		&mut self,
 		token: &crate::live::LiveCursor,
 	) -> FerrosGrynnResult<()> {
-		self.prepare_live_control()?;
+		self.prepare_control()?;
 		let id = token.live_id();
 		let definition =
 			self.working.live_catalog().queries.get(&id).ok_or_else(|| {

@@ -101,51 +101,13 @@ impl DatabaseRoot {
 		admit: &dyn Fn(usize, u64) -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<Value> {
 		admit(256, 1)?;
-		let (graph, occurrence) = self.resolve_level_path_endpoint(graph, endpoint)?;
+		let (graph, occurrence) =
+			self.resolve_incidence_endpoint(graph, endpoint, |_graph, _owner| Ok(()))?;
 		let atom = self.atom_ref(occurrence, admit)?;
 		let mut value = Object::new();
 		value.insert("atom", atom);
 		value.insert("chains", self.containment_chains_value(graph, admit)?);
 		Ok(Value::Object(value))
-	}
-
-	fn resolve_level_path_endpoint(
-		&self,
-		graph: GraphId,
-		endpoint: &EdgeEndpoint,
-	) -> FerrosGrynnResult<(GraphId, &GraphOccurrence)> {
-		match endpoint {
-			EdgeEndpoint::Local(local) => self
-				.occurrence(graph, *local)
-				.map(|occurrence| (graph, occurrence))
-				.ok_or_else(|| {
-					FerrosGrynnError::invalid_storage_file(
-						"LevelPath edge references an absent local endpoint",
-					)
-				}),
-			EdgeEndpoint::Nested(qualified) => {
-				let mut current = graph;
-				for owner in qualified.scope() {
-					let occurrence = self.occurrence(current, *owner).ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file(
-							"LevelPath endpoint scope references an absent owner",
-						)
-					})?;
-					current = occurrence_child(occurrence).ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file(
-							"LevelPath endpoint scope contains a non-meta owner",
-						)
-					})?;
-				}
-				self.occurrence(current, qualified.atom())
-					.map(|occurrence| (current, occurrence))
-					.ok_or_else(|| {
-						FerrosGrynnError::invalid_storage_file(
-							"LevelPath endpoint references an absent nested atom",
-						)
-					})
-			}
-		}
 	}
 
 	fn containment_chains_value(
@@ -264,7 +226,7 @@ impl DatabaseRoot {
 			admit(0, 1)?;
 			for occurrence in graph.occurrences() {
 				admit(0, 1)?;
-				if occurrence_child(occurrence) == Some(child) {
+				if occurrence.child_graph() == Some(child) {
 					admit(256 + graph.reference().name().len(), 1)?;
 					parents.push((
 						graph.reference().clone(),
@@ -297,18 +259,6 @@ impl DatabaseRoot {
 		})?;
 		admit(atom.record_id().estimated_heap_bytes(), 1)?;
 		Ok(AtomRef::new(atom.kind(), atom.record_id().clone()))
-	}
-}
-
-fn occurrence_child(occurrence: &GraphOccurrence) -> Option<GraphId> {
-	match occurrence.state() {
-		OccurrenceState::Node {
-			nested_graph,
-		} => *nested_graph,
-		OccurrenceState::Edge {
-			transition_graph,
-			..
-		} => *transition_graph,
 	}
 }
 

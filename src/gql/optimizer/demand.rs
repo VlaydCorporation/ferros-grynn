@@ -78,6 +78,11 @@ impl PlannerDemand {
 		if let Some(limit) = &select.limit {
 			collect_expr(Some(limit), &owners, &mut demand);
 		}
+		if let Some(graph) = &select.return_graph {
+			for expression in graph.expressions() {
+				collect_expr(Some(expression), &[], &mut demand);
+			}
+		}
 		demand
 	}
 
@@ -294,9 +299,13 @@ impl PlannerDemand {
 						graph,
 						..
 					} => {
-						demand.classes.insert(source.class.clone());
+						for endpoint in [source, target] {
+							if let crate::gql::ir::LogicalRelateEndpoint::Record(record) = endpoint
+							{
+								demand.classes.insert(record.class.clone());
+							}
+						}
 						demand.classes.insert(edge.class.clone());
-						demand.classes.insert(target.class.clone());
 						demand.graphs.insert(graph.id());
 					}
 				}

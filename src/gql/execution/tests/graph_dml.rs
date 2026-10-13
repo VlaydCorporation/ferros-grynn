@@ -41,6 +41,158 @@ fn graph_store(kind: GraphKind, names: &[&str]) -> Datastore {
 }
 
 #[test]
+fn relate_atomwalk_reference_endpoints_cover_all_incidence_directions() -> FerrosGrynnResult<()> {
+	let store = graph_store(GraphKind::Graph, &["scope"]);
+	for result in store.execute(
+		"RELATE (person:alice)-[friendship:base]->(person:bob) IN GRAPH scope; RELATE \
+		 (person:bob)-[friendship:other]->(person:carol) IN GRAPH scope;",
+		&Object::new(),
+	)? {
+		result.result?;
+	}
+	let inputs = Object::from_iter([
+		("node", Value::Record(Box::new("person:alice".parse()?))),
+		("edge", Value::Atom(Box::new(AtomRef::new(AtomKind::Edge, "friendship:base".parse()?)))),
+		("other", Value::Record(Box::new("friendship:other".parse()?))),
+	]);
+	for query in [
+		"RELATE ATOM <($node)>~[friendship:vv]~><(person:carol)> IN GRAPH scope;",
+		"RELATE ATOM <($node)><~[friendship:ve]~<[$edge]> IN GRAPH scope;",
+		"RELATE ATOM <[$edge]>~[friendship:ev]~<($node)> IN GRAPH scope;",
+		"RELATE ATOM <[$edge]><~[friendship:ee]~><[$other]> IN GRAPH scope;",
+	] {
+		for result in store.execute(query, &inputs)? {
+			result.result?;
+		}
+	}
+	let mut read = store.begin();
+	let graph = read
+		.named_graph("scope")?
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("missing scope"))?;
+	let view = graph.read(&read)?;
+	for (record, direction, kinds) in [
+		("friendship:vv", crate::graph::EdgeDirection::Directed, [AtomKind::Node, AtomKind::Node]),
+		("friendship:ve", crate::graph::EdgeDirection::Directed, [AtomKind::Edge, AtomKind::Node]),
+		("friendship:ev", crate::graph::EdgeDirection::Undirected, [
+			AtomKind::Edge,
+			AtomKind::Node,
+		]),
+		("friendship:ee", crate::graph::EdgeDirection::Bidirectional, [
+			AtomKind::Edge,
+			AtomKind::Edge,
+		]),
+	] {
+		let id =
+			view.atom_id(&AtomRef::new(AtomKind::Edge, record.parse()?))?.ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::invalid_argument("missing connector")
+			})?;
+		let edge = view.edge(id)?.ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument("missing connector edge")
+		})?;
+		let topology = edge.topology()?;
+		assert_eq!(topology.direction(), direction);
+		assert_eq!(
+			topology.endpoints().map(|endpoint| endpoint.kind()).collect::<Vec<_>>(),
+			kinds.map(Some)
+		);
+	}
+	Ok(())
+}
+
+#[test]
+fn relate_reference_idioms_and_bare_numeric_records_preserve_key_semantics() -> FerrosGrynnResult<()>
+{
+	let store = graph_store(GraphKind::Graph, &["scope"]);
+	for result in store.execute("CREATE person:1; CREATE person:2;", &Object::new())? {
+		result.result?;
+	}
+	let inputs = Object::from_iter([(
+		"source",
+		Value::Object(Object::from_iter([(
+			"endpoint",
+			Value::Record(Box::new("person:alice".parse()?)),
+		)])),
+	)]);
+	for result in store.execute(
+		"RELATE person:1-[friendship:numeric]->person:2 IN GRAPH scope; RELATE \
+		 ($source.endpoint)-[friendship:idiom]->(person:bob) IN GRAPH scope;",
+		&inputs,
+	)? {
+		result.result?;
+	}
+	assert!(store.begin().atom(&"friendship:numeric".parse()?)?.is_some());
+	assert!(store.begin().atom(&"friendship:idiom".parse()?)?.is_some());
+	Ok(())
+}
+
+#[test]
+fn relate_qualified_references_reject_wrong_routes_kinds_and_unattached_edges()
+-> FerrosGrynnResult<()> {
+	let store = graph_store(GraphKind::Metagraph, &["parent", "child", "other"]);
+	let mut seed = store.begin();
+	let parent = seed
+		.named_graph("parent")?
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("missing parent"))?;
+	let child = seed
+		.named_graph("child")?
+		.ok_or_else(|| crate::gql_status::FerrosGrynnError::invalid_argument("missing child"))?;
+	seed.attach_node(parent.id(), &"person:bob".parse()?, None, Some(child.id()))?;
+	seed.attach_node(parent.id(), &"person:carol".parse()?, None, None)?;
+	seed.attach_node(child.id(), &"person:alice".parse()?, None, None)?;
+	seed.create_atom("friendship:unattached".parse()?, Default::default())?;
+	seed.commit()?;
+	let occurrence = |record: &str, graph: &crate::values::GraphRef| -> FerrosGrynnResult<Value> {
+		Ok(Value::AtomOccurrence(Box::new(AtomOccurrenceRef::new(
+			AtomRef::new(AtomKind::Node, record.parse()?),
+			Arc::new(graph.clone()),
+		))))
+	};
+	let terminal = occurrence("person:alice", &child)?;
+	let owner = occurrence("person:bob", &parent)?;
+	let descriptor = |owners: Vec<Value>| {
+		Value::Object(Object::from_iter([
+			("occurrence", terminal.clone()),
+			("owners", Value::from(owners)),
+		]))
+	};
+	for result in store.execute(
+		"RELATE ATOM <($endpoint)>~[friendship:valid]~><(person:carol)> IN GRAPH parent;",
+		&Object::from_iter([("endpoint", descriptor(vec![owner.clone()]))]),
+	)? {
+		result.result?;
+	}
+	let malformed = [
+		terminal.clone(),
+		descriptor(vec![]),
+		descriptor(vec![occurrence("person:carol", &parent)?]),
+		descriptor(vec![owner.clone(); 65]),
+		Value::Record(Box::new("friendship:unattached".parse()?)),
+	];
+	for endpoint in malformed {
+		let failed = match store.execute(
+			"RELATE ATOM <($endpoint)>~[friendship:bad]~><(person:carol)> IN GRAPH parent;",
+			&Object::from_iter([("endpoint", endpoint)]),
+		) {
+			Err(_error) => true,
+			Ok(results) => results.iter().any(|result| result.result.is_err()),
+		};
+		assert!(failed);
+		assert!(store.begin().atom(&"friendship:bad".parse()?)?.is_none());
+		assert!(store.begin().membership(parent.id(), &"person:alice".parse()?)?.is_none());
+	}
+	let failed = match store.execute(
+		"RELATE ATOM <[$endpoint]>~[friendship:bad]~><(person:carol)> IN GRAPH parent;",
+		&Object::from_iter([("endpoint", descriptor(vec![owner]))]),
+	) {
+		Err(_error) => true,
+		Ok(results) => results.iter().any(|result| result.result.is_err()),
+	};
+	assert!(failed);
+	assert!(store.begin().atom(&"friendship:bad".parse()?)?.is_none());
+	Ok(())
+}
+
+#[test]
 fn relate_reuses_one_edge_with_graph_local_topology_label_and_weight() {
 	let store = graph_store(GraphKind::Graph, &["first", "second"]);
 	let mut transaction = store.begin();

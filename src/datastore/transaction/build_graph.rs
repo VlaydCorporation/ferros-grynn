@@ -350,8 +350,21 @@ impl Transaction {
 				)?;
 			}
 		}
+		for child in &mutation.removed_children {
+			self.remove_source_events(crate::datastore::EventTarget::Graph(*child))?;
+		}
 		self.register_built_graph_write_set(&mutation)?;
 		mutation.apply(&mut self.working, self.snapshot.commit_ts)?;
+		for graph in &mutation.graphs {
+			for edge in &graph.edges {
+				let mut anchor =
+					self.prepare_qualified_anchor(graph.graph, &edge.record, &edge.topology, 0)?;
+				if let Some(anchor) = &mut anchor {
+					anchor.after_build(self.mutations.len() + 1);
+				}
+				self.retain_qualified_anchor(anchor);
+			}
+		}
 		self.retire_missing_changefeeds()?;
 		let reference = mutation.root_schema.reference().clone();
 		self.mutations.push(Mutation::InstallBuiltGraphTree(mutation));

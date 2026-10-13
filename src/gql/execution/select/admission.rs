@@ -104,6 +104,12 @@ pub(super) fn select_copy<Read: QueryRead>(
 	for order in &plan.order {
 		expression_copy(read, &order.expression, depth)?;
 	}
+	if let Some(graph) = &plan.return_graph {
+		fields.admit(4 * std::mem::size_of::<crate::gql::ir::LogicalReturnGraph>())?;
+		for expression in graph.expressions() {
+			expression_copy(read, expression, depth)?;
+		}
+	}
 	if let Some(start) = &plan.start {
 		let expression = match start {
 			LogicalSelectStart::Offset(expression) => expression,
@@ -306,4 +312,69 @@ fn check_depth(depth: usize) -> FerrosGrynnResult<()> {
 /// Arithmetic failure occurs before copied buffers or names are allocated.
 fn overflow() -> FerrosGrynnError {
 	FerrosGrynnError::operation_overflow("LIVE typed SELECT copy")
+}
+
+#[cfg(test)]
+mod tests {
+	use std::num::NonZeroUsize;
+
+	use super::*;
+	use crate::{
+		datastore::{ClassSchema, Datastore},
+		gql::{
+			ExecutionControl,
+			QueryExecutionOptions,
+			analysis,
+			execution::RootRead,
+			ir::LogicalStatement,
+		},
+		graph::AtomKind,
+		syn::{ParserSettings, parse},
+		values::Object,
+	};
+
+	/// Child admission alone cannot cover copied cold graph-selector storage.
+	#[test]
+	fn select_copy_admits_boxed_graph_shell_before_cloning() -> FerrosGrynnResult<()> {
+		let store = Datastore::in_memory();
+		let mut setup = store.begin();
+		setup.define_class(ClassSchema::new("item", AtomKind::Node, [])?)?;
+		setup.commit()?;
+		let root = store.inner.current_root();
+		let options = QueryExecutionOptions::default();
+		let control = ExecutionControl::new(&options, None);
+		let observe = |_| {};
+		let work = |_| Ok(());
+		let read = RootRead::new(&root, &control, &observe, &work, std::env::temp_dir());
+		let source = "SELECT 1 AS picked FROM item RETURN GRAPH {nodes: [], edges: []};";
+		let syntax = parse(source, ParserSettings::default())?;
+		let logical = analysis::analyze(&syntax, source, &read, &Object::new())?;
+		let Some(LogicalStatement::Select(mut plan)) = logical.statements.into_iter().next() else {
+			return Err(FerrosGrynnError::invalid_argument("SELECT admission fixture absent"));
+		};
+		let graph = plan
+			.return_graph
+			.take()
+			.ok_or_else(|| FerrosGrynnError::invalid_argument("graph admission fixture absent"))?;
+		let calibration = ExecutionControl::new(&options, None);
+		let calibration_read =
+			RootRead::new(&root, &calibration, &observe, &work, std::env::temp_dir());
+		select_copy(&calibration_read, &plan, 0)?;
+		for expression in graph.expressions() {
+			expression_copy(&calibration_read, expression, 0)?;
+		}
+		let children_only =
+			calibration.barrier_memory_limit() - calibration.barrier_memory_available();
+		let options = QueryExecutionOptions {
+			barrier_memory_bytes: NonZeroUsize::new(children_only).ok_or_else(|| {
+				FerrosGrynnError::invalid_argument("admission calibration was empty")
+			})?,
+			..options
+		};
+		plan.return_graph = Some(graph);
+		let limited = ExecutionControl::new(&options, None);
+		let limited_read = RootRead::new(&root, &limited, &observe, &work, std::env::temp_dir());
+		assert!(select_copy(&limited_read, &plan, 0).is_err());
+		Ok(())
+	}
 }

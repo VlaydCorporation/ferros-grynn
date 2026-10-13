@@ -5,7 +5,15 @@ use std::{
 	sync::Arc,
 };
 
-use super::{AnalyzerId, ClassSchema, GraphIndex, SchemaAnalyzer};
+use super::{
+	AnalyzerId,
+	ClassSchema,
+	EventDefinition,
+	EventId,
+	EventTarget,
+	GraphIndex,
+	SchemaAnalyzer,
+};
 use crate::{
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
 	graph::GraphTopologyConstraints,
@@ -701,6 +709,10 @@ pub struct SchemaCatalog {
 	pub(crate) analyzers: BTreeMap<AnalyzerId, Arc<SchemaAnalyzer>>,
 	pub(crate) analyzer_names: BTreeMap<String, AnalyzerId>,
 	pub(crate) analyzer_versions: BTreeMap<AnalyzerId, u64>,
+	/// Source-owned event definitions in stable dispatch order.
+	pub(crate) events: BTreeMap<EventId, Arc<EventDefinition>>,
+	/// Event names are unique within one stable source owner.
+	pub(crate) event_names: BTreeMap<(EventTarget, Text), EventId>,
 }
 
 impl Default for SchemaCatalog {
@@ -722,11 +734,31 @@ impl Default for SchemaCatalog {
 			analyzers: BTreeMap::new(),
 			analyzer_names: BTreeMap::new(),
 			analyzer_versions: BTreeMap::new(),
+			events: BTreeMap::new(),
+			event_names: BTreeMap::new(),
 		}
 	}
 }
 
 impl SchemaCatalog {
+	/// Resolves one transaction-visible event by its stable identity.
+	pub fn event(&self, id: EventId) -> Option<Arc<EventDefinition>> {
+		self.events.get(&id).cloned()
+	}
+
+	/// Resolves an event name within its stable class or graph owner.
+	pub fn named_event(&self, target: EventTarget, name: &str) -> Option<Arc<EventDefinition>> {
+		self.events
+			.values()
+			.find(|event| event.target == target && event.name.as_str() == name)
+			.cloned()
+	}
+
+	/// Iterates events in stable dispatch order without copying definitions.
+	pub fn events(&self) -> impl ExactSizeIterator<Item = &Arc<EventDefinition>> {
+		self.events.values()
+	}
+
 	/// Resolves a graph definition by its stable identity.
 	pub fn graph(&self, id: GraphId) -> Option<Arc<GraphSchema>> {
 		self.graphs.get(&id).cloned()

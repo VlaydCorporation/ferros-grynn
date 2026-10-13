@@ -10,7 +10,6 @@ use super::{
 	AtomKind,
 	Dag,
 	EdgeEndpoint,
-	EdgeRead,
 	EdgeTopology,
 	EdgeView,
 	Forest,
@@ -21,7 +20,6 @@ use super::{
 	GraphTopologyConstraints,
 	Hypergraph,
 	Metagraph,
-	NodeRead,
 	NodeView,
 	RootedTree,
 	Subgraph,
@@ -121,6 +119,46 @@ impl GraphRead for MaterializedGraph {
 	fn edge(&self, id: AtomId) -> FerrosGrynnResult<Option<Self::Edge<'_>>> {
 		Ok(Self::edge(self, id))
 	}
+
+	fn materialization_origin(&self) -> Option<&super::MaterializationOrigin> {
+		match self {
+			Self::Graph(graph) => GraphRead::materialization_origin(graph),
+			Self::Tree(graph) => GraphRead::materialization_origin(graph),
+			Self::RootedTree(graph) => GraphRead::materialization_origin(graph),
+			Self::Forest(graph) => GraphRead::materialization_origin(graph),
+			Self::Dag(graph) => GraphRead::materialization_origin(graph),
+			Self::Hypergraph(graph) => GraphRead::materialization_origin(graph),
+			Self::Metagraph(graph) => GraphRead::materialization_origin(graph),
+			Self::Subgraph(graph) => GraphRead::materialization_origin(graph),
+		}
+	}
+}
+
+impl MaterializedGraph {
+	/// Converts one owned general candidate through the existing concrete
+	/// family validators.
+	pub(crate) fn from_general(
+		graph: Graph<Frozen>,
+		family: GraphKind,
+		root: Option<AtomId>,
+	) -> FerrosGrynnResult<Self> {
+		let validators = graph.topology_constraints();
+		let result = match family {
+			GraphKind::Graph => Self::Graph(graph),
+			GraphKind::Tree => Self::Tree(Tree::try_from(graph)?),
+			GraphKind::RootedTree => Self::RootedTree(match root {
+				Some(root) => RootedTree::try_from_graph_with_root(graph, root)?,
+				None => RootedTree::try_from(graph)?,
+			}),
+			GraphKind::Forest => Self::Forest(Forest::try_from(graph)?),
+			GraphKind::Dag => Self::Dag(Dag::try_from(graph)?),
+			GraphKind::Hypergraph => Self::Hypergraph(Hypergraph::try_from(graph)?),
+			GraphKind::Metagraph => Self::Metagraph(Metagraph::try_from(graph)?),
+			GraphKind::Subgraph => Self::Subgraph(Subgraph::from_graph(graph)),
+		};
+		super::validate_topology_constraints(&result, validators)?;
+		Ok(result)
+	}
 }
 
 /// Conservatively estimates heap bytes owned by one nested general graph.
@@ -186,57 +224,127 @@ pub(crate) fn estimated_edge_fields_heap_bytes(
 	Ok(bytes)
 }
 
-fn estimated_graph_heap_bytes<Reader: GraphRead>(
-	graph: &Reader,
+/// Accounts retained layouts once even when child bindings share physical
+/// storage.
+fn estimated_graph_heap_bytes<'a, Reader>(
+	graph: &'a Reader,
 	node_capacity: usize,
 	edge_capacity: usize,
-) -> FerrosGrynnResult<usize> {
+) -> FerrosGrynnResult<usize>
+where
+	Reader: GraphRead<Node<'a> = NodeView<'a>, Edge<'a> = EdgeView<'a>> + 'a,
+{
+	let mut bytes = 0_usize;
+	visit_graph_heap_bytes(graph, node_capacity, edge_capacity, &mut |additional, _work| {
+		bytes = bytes.saturating_add(additional);
+		Ok(())
+	})?;
+	Ok(bytes)
+}
+
+/// Admits the borrowed runtime image before its COW snapshot clones metadata.
+pub fn admit_graph_snapshot<'a, Reader>(
+	graph: &'a Reader,
+	admit: &mut dyn FnMut(usize, u64) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()>
+where
+	Reader: GraphRead<Node<'a> = NodeView<'a>, Edge<'a> = EdgeView<'a>> + 'a,
+{
+	visit_graph_heap_bytes(graph, 0, 0, admit)
+}
+
+/// Visits each physical graph once through the shared retained-memory ledger.
+fn visit_graph_heap_bytes<'a, Reader>(
+	graph: &'a Reader,
+	node_capacity: usize,
+	edge_capacity: usize,
+	admit: &mut dyn FnMut(usize, u64) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()>
+where
+	Reader: GraphRead<Node<'a> = NodeView<'a>, Edge<'a> = EdgeView<'a>> + 'a,
+{
+	let mut pending = Vec::new();
+	let mut visited = std::collections::BTreeSet::new();
+	visit_graph_fields(graph, node_capacity, edge_capacity, &mut pending, admit)?;
+	while let Some(child) = pending.pop() {
+		admit(0, 1)?;
+		let identity = std::ptr::from_ref(child) as usize;
+		if visited.contains(&identity) {
+			continue;
+		}
+		admit(128, 1)?;
+		visited.insert(identity);
+		visit_graph_fields(
+			child,
+			child.slot_capacity(AtomKind::Node),
+			child.slot_capacity(AtomKind::Edge),
+			&mut pending,
+			admit,
+		)?;
+	}
+	Ok(())
+}
+
+/// Charges the graph fields and schedules its immutable child layouts.
+fn visit_graph_fields<'a, Reader>(
+	graph: &'a Reader,
+	node_capacity: usize,
+	edge_capacity: usize,
+	pending: &mut Vec<&'a Graph<Frozen>>,
+	admit: &mut dyn FnMut(usize, u64) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<()>
+where
+	Reader: GraphRead<Node<'a> = NodeView<'a>, Edge<'a> = EdgeView<'a>> + 'a,
+{
 	let properties = graph.properties()?;
-	let mut bytes = estimated_graph_fixed_heap_bytes(
+	let bytes = estimated_graph_fixed_heap_bytes(
 		size_of_val(graph),
 		node_capacity,
 		edge_capacity,
 		properties.as_ref(),
 	);
+	admit(bytes, 1)?;
+	if let Some(origin) = graph.materialization_origin() {
+		admit(origin.estimated_heap_bytes(), 1)?;
+	}
 	for id in graph.node_ids()? {
+		admit(0, 1)?;
 		let id = id?;
 		let node = graph.node(id)?.ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file(
 				"nested graph node disappeared during accounting",
 			)
 		})?;
-		let record_id = node.record_id()?;
-		let label = node.label_text()?;
-		let properties = node.properties()?;
-		let inner = node.inner_graph()?;
-		bytes = bytes.saturating_add(estimated_node_fields_heap_bytes(
-			record_id.as_ref(),
-			label.as_deref(),
-			properties.as_ref(),
-			inner.as_deref(),
-		)?);
+		let record_id = node.record_id();
+		let label = node.label_text();
+		let properties = node.properties();
+		let inner = node.inner_graph();
+		admit(estimated_node_fields_heap_bytes(record_id, label, properties, None)?, 0)?;
+		if let Some(inner) = inner {
+			admit(128, 1)?;
+			pending.push(inner);
+		}
 	}
 	for id in graph.edge_ids()? {
+		admit(0, 1)?;
 		let id = id?;
 		let edge = graph.edge(id)?.ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file(
 				"nested graph edge disappeared during accounting",
 			)
 		})?;
-		let record_id = edge.record_id()?;
-		let label = edge.label_text()?;
-		let properties = edge.properties()?;
-		let topology = edge.topology()?;
-		let transition = edge.transition_graph()?;
-		bytes = bytes.saturating_add(estimated_edge_fields_heap_bytes(
-			record_id.as_ref(),
-			label.as_deref(),
-			properties.as_ref(),
-			topology.as_ref(),
-			transition.as_deref(),
-		)?);
+		let record_id = edge.record_id();
+		let label = edge.label_text();
+		let properties = edge.properties();
+		let topology = edge.topology();
+		let transition = edge.transition_graph();
+		admit(estimated_edge_fields_heap_bytes(record_id, label, properties, topology, None)?, 0)?;
+		if let Some(transition) = transition {
+			admit(128, 1)?;
+			pending.push(transition);
+		}
 	}
-	Ok(bytes)
+	Ok(())
 }
 
 /// Estimates the recursively owned endpoint buffers of one topology.

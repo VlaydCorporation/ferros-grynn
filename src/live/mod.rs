@@ -9,6 +9,10 @@
 mod cursor;
 mod delivery;
 pub(crate) mod dependencies;
+mod graph_conflict;
+mod graph_image;
+mod graph_result;
+mod graph_subscription;
 mod identity;
 mod info;
 mod options;
@@ -16,6 +20,7 @@ mod order;
 mod presentation;
 mod query;
 mod result_identity;
+mod select;
 mod statistics;
 mod subscription;
 pub use cursor::LiveCursor;
@@ -25,9 +30,25 @@ pub use delivery::{
 	LiveEvent,
 	LiveGap,
 	LiveGapReason,
+	LiveGraphBatch,
 	LiveNext,
 	LivePayload,
 };
+pub use graph_conflict::LiveGraphConflict;
+pub use graph_image::{
+	LiveGraphAtomId,
+	LiveGraphDelta,
+	LiveGraphEdge,
+	LiveGraphEndpoint,
+	LiveGraphImage,
+	LiveGraphNode,
+	LiveGraphScope,
+	LiveGraphScopeId,
+	LiveGraphSource,
+	LiveGraphTarget,
+};
+pub use graph_result::LiveGraphResult;
+pub use graph_subscription::{LiveGraphNext, LiveGraphSubscription};
 pub use identity::{LiveBindingId, LiveId, LiveVersion};
 pub use info::{
 	LiveBindingInfo,

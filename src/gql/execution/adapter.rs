@@ -8,6 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 use crate::datastore::{ClassSchema, ClassSchemaMode};
 
+/// EVENT attempts keep frozen function sources while reading current data.
+mod event;
+pub(in crate::gql::execution) use event::analyze_event_source;
+
 /// Parses, analyzes, and executes query text within an existing transaction.
 ///
 /// # Errors
@@ -173,6 +177,7 @@ pub(crate) fn analyze_parsed_transaction(
 ) -> FerrosGrynnResult<(LogicalProgram, u64)> {
 	let snapshot = transaction.query_snapshot()?;
 	let read = TransactionRead {
+		scalar_graph: None,
 		transaction,
 		snapshot,
 		metadata_only: false,
@@ -197,6 +202,7 @@ pub(in crate::gql) fn analyze_import_preflight(
 ) -> FerrosGrynnResult<(LogicalProgram, Vec<Option<Duration>>, u64)> {
 	let snapshot = transaction.query_snapshot()?;
 	let read = TransactionRead {
+		scalar_graph: None,
 		transaction,
 		snapshot,
 		metadata_only: false,
@@ -248,6 +254,7 @@ pub(crate) fn execute_parsed_transaction_with_bindings(
 ) -> FerrosGrynnResult<Vec<QueryResult>> {
 	let snapshot = transaction.query_snapshot()?;
 	let mut read = TransactionRead {
+		scalar_graph: None,
 		transaction,
 		snapshot,
 		metadata_only: false,
@@ -287,6 +294,7 @@ pub(crate) fn execute_parsed_statement_with_bindings(
 		Ok(())
 	})?;
 	let mut read = TransactionRead {
+		scalar_graph: None,
 		transaction,
 		snapshot,
 		metadata_only,
@@ -295,6 +303,8 @@ pub(crate) fn execute_parsed_statement_with_bindings(
 }
 
 pub(super) struct TransactionRead<'a> {
+	/// Explicit host statement scope for implicit scalar record references.
+	pub(super) scalar_graph: Option<GraphRef>,
 	pub(super) transaction: &'a mut Transaction,
 	pub(super) snapshot: QuerySnapshot,
 	/// Catalog-only commands neither bind physical indexes nor pull records.
@@ -455,6 +465,20 @@ impl QueryRead for TransactionRead<'_> {
 		Ok(Snapshot(self.snapshot.commit_ts()))
 	}
 
+	fn scalar_graph(&self) -> Option<&GraphRef> {
+		self.scalar_graph.as_ref()
+	}
+
+	fn snapshot_root(
+		&self,
+		snapshot: Snapshot,
+	) -> FerrosGrynnResult<Arc<crate::datastore::DatabaseRoot>> {
+		if snapshot.0 != self.snapshot.commit_ts() {
+			return Err(FerrosGrynnError::invalid_argument("graph cursor snapshot mismatch"));
+		}
+		Ok(Arc::clone(self.snapshot.logical_root()))
+	}
+
 	fn prepare_mutating_statement(&mut self) -> FerrosGrynnResult<()> {
 		self.transaction.infer_gql_write_access()
 	}
@@ -488,7 +512,7 @@ impl QueryRead for TransactionRead<'_> {
 	}
 
 	fn observe_tensor_cost(&self, key: crate::datastore::ConflictKey) {
-		self.transaction.observe_tensor_cost(key);
+		self.transaction.observe_query_dependency(key);
 	}
 
 	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<Snapshot> {
@@ -1272,8 +1296,10 @@ impl QueryRead for TransactionRead<'_> {
 				execute_schema(transaction, &snapshot, statement, slots, source, control)
 			})?
 		} else {
-			self.transaction.atomic_mutation(|transaction| {
-				execute_schema(transaction, &snapshot, statement, slots, source, control)
+			self.transaction.with_event_control(control, |transaction| {
+				transaction.atomic_mutation(|transaction| {
+					execute_schema(transaction, &snapshot, statement, slots, source, control)
+				})
 			})?
 		};
 		self.refresh_snapshot()?;
@@ -1283,13 +1309,15 @@ impl QueryRead for TransactionRead<'_> {
 	fn execute_dml(
 		&mut self,
 		statement: &LogicalDmlStatement,
-		slots: &[Value],
+		slots: &mut [Value],
 		source: &str,
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
 		let snapshot = self.snapshot.clone();
-		let value = self.transaction.atomic_mutation(|transaction| {
-			execute_dml(transaction, &snapshot, statement, slots, source, control)
+		let value = self.transaction.with_event_control(control, |transaction| {
+			transaction.atomic_mutation(|transaction| {
+				execute_dml(transaction, &snapshot, statement, slots, source, control)
+			})
 		})?;
 		self.refresh_snapshot()?;
 		Ok(value)
@@ -1298,13 +1326,15 @@ impl QueryRead for TransactionRead<'_> {
 	fn execute_graph_dml(
 		&mut self,
 		statement: &LogicalGraphDmlStatement,
-		slots: &[Value],
+		slots: &mut [Value],
 		source: &str,
 		control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
 		let snapshot = self.snapshot.clone();
-		let value = self.transaction.atomic_mutation(|transaction| {
-			execute_graph_dml(transaction, &snapshot, statement, slots, source, control)
+		let value = self.transaction.with_event_control(control, |transaction| {
+			transaction.atomic_mutation(|transaction| {
+				execute_graph_dml(transaction, &snapshot, statement, slots, source, control)
+			})
 		})?;
 		self.refresh_snapshot()?;
 		Ok(value)
@@ -1316,9 +1346,12 @@ impl QueryRead for TransactionRead<'_> {
 		mode: crate::syn::DefinitionMode,
 		contract_explicit: bool,
 		graph: crate::graph::MaterializedGraph,
+		control: &ExecutionControl,
 	) -> FerrosGrynnResult<GraphRef> {
-		let reference = self.transaction.atomic_mutation(|transaction| {
-			transaction.install_built_graph(name, mode, contract_explicit, &graph)
+		let reference = self.transaction.with_event_control(control, |transaction| {
+			transaction.atomic_mutation(|transaction| {
+				transaction.install_built_graph(name, mode, contract_explicit, &graph)
+			})
 		})?;
 		self.refresh_snapshot()?;
 		Ok(reference)

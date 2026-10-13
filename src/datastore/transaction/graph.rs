@@ -33,6 +33,9 @@ use crate::{
 	values::{AtomKind, Number, PropertyKeyId, RecordId, Text, Value},
 };
 
+#[cfg(test)]
+mod tests;
+
 impl Transaction {
 	/// Attaches a global node to one graph and returns its graph-local handle.
 	///
@@ -166,7 +169,10 @@ impl Transaction {
 				})
 			})
 			.ok_or_else(|| self.limit_error(usize::MAX))?;
-		self.ensure_capacity(additional)?;
+		let anchor = self.prepare_qualified_anchor(graph, record_id, &topology, additional)?;
+		let pending = additional.saturating_add(anchor.as_ref().map_or(0, |anchor| anchor.bytes));
+		self.observe_qualified_topology(graph, &topology, pending)?;
+		self.ensure_capacity(pending)?;
 		let local = self.working.attach_edge(
 			graph,
 			global,
@@ -198,6 +204,7 @@ impl Transaction {
 			weight,
 			transition_graph,
 		});
+		self.retain_qualified_anchor(anchor);
 		Ok(local)
 	}
 
@@ -232,6 +239,15 @@ impl Transaction {
 			.graph(graph)
 			.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(graph.to_string()))?
 			.detach_plan(global, cascade)?;
+		self.detach_occurrence_plan(graph, plan)
+	}
+
+	/// Executes an already checked exact deletion set, including E-E cycles.
+	pub(super) fn detach_occurrence_plan(
+		&mut self,
+		graph: GraphId,
+		plan: Vec<super::GlobalAtomId>,
+	) -> FerrosGrynnResult<()> {
 		let mut additional = 0_usize;
 		let mut removals = Vec::with_capacity(plan.len());
 		for global in plan {
@@ -557,6 +573,19 @@ impl Transaction {
 			.occurrence(graph, local)
 			.is_some_and(|occurrence| occurrence.state() == &state)
 		{
+			// Equal physical slots may explicitly select a new logical child
+			// route.
+			if let OccurrenceState::Edge {
+				topology,
+				..
+			} = &state
+			{
+				if topology.is_cross_level() {
+					self.observe_qualified_topology(graph, topology, 0)?;
+					let anchor = self.prepare_qualified_anchor(graph, record_id, topology, 0)?;
+					self.retain_qualified_anchor(anchor);
+				}
+			}
 			return Ok(());
 		}
 		let endpoint_capability = if let OccurrenceState::Edge {
@@ -594,21 +623,37 @@ impl Transaction {
 				return Err(FerrosGrynnError::graph_does_not_exist(nested.to_string()));
 			}
 		}
-		if !self.writes.contains_key(&ConflictKey::GraphIncidence(graph, local)) {
-			self.ensure_capacity(incidence_bytes.saturating_add(
-				if endpoint_capability.is_some() {
-					SCHEMA_WRITE_BYTES
-				} else {
-					0
-				},
-			))?;
-		} else {
-			self.ensure_capacity(posting_bytes.saturating_add(if endpoint_capability.is_some() {
+		let pending = if !self.writes.contains_key(&ConflictKey::GraphIncidence(graph, local)) {
+			incidence_bytes.saturating_add(if endpoint_capability.is_some() {
 				SCHEMA_WRITE_BYTES
 			} else {
 				0
-			}))?;
+			})
+		} else {
+			posting_bytes.saturating_add(if endpoint_capability.is_some() {
+				SCHEMA_WRITE_BYTES
+			} else {
+				0
+			})
+		};
+		let anchor = if let OccurrenceState::Edge {
+			topology,
+			..
+		} = &state
+		{
+			self.prepare_qualified_anchor(graph, record_id, topology, pending)?
+		} else {
+			None
+		};
+		let pending = pending.saturating_add(anchor.as_ref().map_or(0, |anchor| anchor.bytes));
+		if let OccurrenceState::Edge {
+			topology,
+			..
+		} = &state
+		{
+			self.observe_qualified_topology(graph, topology, pending)?;
 		}
+		self.ensure_capacity(pending)?;
 		if let OccurrenceState::Edge {
 			topology,
 			..
@@ -642,6 +687,7 @@ impl Transaction {
 			local,
 			state,
 		});
+		self.retain_qualified_anchor(anchor);
 		Ok(())
 	}
 
@@ -720,7 +766,9 @@ impl Transaction {
 		Ok(())
 	}
 
-	fn require_membership(
+	/// Records the exact membership prerequisite for replay and conflict
+	/// validation.
+	pub(super) fn require_membership(
 		&self,
 		graph: GraphId,
 		global: GlobalAtomId,
@@ -754,6 +802,76 @@ impl Transaction {
 			.replace_indexes(schema.indexes().cloned().collect())?
 			.with_edge_endpoint_index(index)
 			.map(Some)
+	}
+
+	/// Qualified owner bindings and terminals are structural prerequisites even
+	/// under Snapshot isolation; their tracked allocations precede mutation.
+	fn observe_qualified_topology(
+		&mut self,
+		graph: GraphId,
+		topology: &EdgeTopology,
+		pending: usize,
+	) -> FerrosGrynnResult<()> {
+		let count = topology.endpoints().try_fold(0_usize, |count, endpoint| {
+			let crate::graph::EdgeEndpoint::Nested(qualified) = endpoint else {
+				return Ok(count);
+			};
+			if qualified.scope().len() > 64 {
+				return Err(FerrosGrynnError::invalid_argument(
+					"edge endpoint scope exceeds 64 levels",
+				));
+			}
+			count
+				.checked_add(qualified.scope().len() + 1)
+				.ok_or_else(|| self.limit_error(usize::MAX))
+		})?;
+		if count == 0 {
+			return Ok(());
+		}
+		let scratch = count
+			.checked_mul(size_of::<(GraphId, AtomId, GlobalAtomId)>())
+			.ok_or_else(|| self.limit_error(usize::MAX))?;
+		self.ensure_capacity(
+			count
+				.checked_mul(576)
+				.and_then(|bytes| bytes.checked_add(scratch))
+				.and_then(|bytes| bytes.checked_add(pending))
+				.ok_or_else(|| self.limit_error(usize::MAX))?,
+		)?;
+		let mut dependencies = Vec::new();
+		dependencies
+			.try_reserve_exact(count)
+			.map_err(|error| self.limit_error(scratch).with_technical_source(error))?;
+		for endpoint in topology.endpoints().filter(|endpoint| endpoint.is_cross_level()) {
+			let (terminal_graph, terminal) = self
+				.working
+				.resolve_incidence_endpoint(graph, endpoint, |owner_graph, owner| {
+					dependencies.push((owner_graph, owner.local_id(), owner.global_id()));
+					Ok(())
+				})
+				.map_err(|error| {
+					FerrosGrynnError::graph_constraint_violation(
+						graph.to_string(),
+						"qualified endpoint owner chain or terminal is absent",
+					)
+					.with_cause(error)
+				})?;
+			dependencies.push((terminal_graph, terminal.local_id(), terminal.global_id()));
+		}
+		for (graph, local, global) in dependencies {
+			for key in [
+				ConflictKey::GraphDefinition(graph),
+				ConflictKey::GraphMembership(graph, global),
+				ConflictKey::GraphIncidence(graph, local),
+			] {
+				let bytes = usize::from(!self.requirements.contains_key(&key)) * 128
+					+ usize::from(!self.reads.lock().contains_key(&key)) * 64;
+				self.record_requirement(key);
+				self.record_read(key);
+				self.write_bytes += bytes;
+			}
+		}
+		Ok(())
 	}
 }
 

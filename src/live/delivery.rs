@@ -117,6 +117,94 @@ impl LiveBatch {
 	}
 }
 
+/// Complete owned graph changes for one subscription and database commit.
+#[derive(Debug, Clone)]
+pub struct LiveGraphBatch {
+	/// Identifies the stable LIVE result incarnation.
+	pub(crate) id: LiveId,
+	/// Identifies the accepted logical recipe version.
+	pub(crate) version: LiveVersion,
+	/// Stores the publication time used by bounded history retention.
+	pub(crate) committed_at: DateTime,
+	/// Owns the complete qualified graph revision and its predecessor
+	/// checkpoint.
+	pub(crate) delta: super::LiveGraphDelta,
+	/// Retains the exact reactive revisions captured with this graph result.
+	pub(crate) bindings: Vec<LiveBindingRevision>,
+}
+
+impl LiveGraphBatch {
+	/// One shared admission authority for retained checkpoints and queue data.
+	pub(crate) fn estimated_heap_bytes(&self) -> crate::gql_status::FerrosGrynnResult<usize> {
+		let overflow = || FerrosGrynnError::operation_overflow("LIVE graph batch bytes");
+		let mut bytes = 512_usize
+			.checked_add(self.delta.after().estimated_heap_bytes()?)
+			.ok_or_else(overflow)?;
+		if let Some(before) = self.delta.before() {
+			bytes = bytes.checked_add(before.estimated_heap_bytes()?).ok_or_else(overflow)?;
+		}
+		bytes = bytes
+			.checked_add(
+				self.bindings
+					.capacity()
+					.checked_mul(std::mem::size_of::<LiveBindingRevision>())
+					.ok_or_else(overflow)?,
+			)
+			.ok_or_else(overflow)?;
+		bytes = bytes
+			.checked_add(
+				self.delta
+					.changes
+					.capacity()
+					.checked_mul(std::mem::size_of::<super::LiveGraphTarget>())
+					.ok_or_else(overflow)?,
+			)
+			.ok_or_else(overflow)?;
+		for target in self.delta.changes() {
+			let heap = match target {
+				super::LiveGraphTarget::Graph(scope) => scope.estimated_heap_bytes(),
+				super::LiveGraphTarget::Atom(atom) => atom
+					.scope()
+					.estimated_heap_bytes()
+					.checked_add(atom.atom().id().estimated_heap_bytes())
+					.ok_or_else(overflow)?,
+			};
+			bytes = bytes.checked_add(heap).ok_or_else(overflow)?;
+		}
+		Ok(bytes)
+	}
+
+	/// Returns the subscription incarnation producing this graph.
+	pub const fn id(&self) -> LiveId {
+		self.id
+	}
+
+	/// Returns the accepted query definition version.
+	pub const fn version(&self) -> LiveVersion {
+		self.version
+	}
+
+	/// Returns the whole remote commit watermark.
+	pub const fn versionstamp(&self) -> Versionstamp {
+		self.delta.revision()
+	}
+
+	/// Borrows the complete graph delta and its checkpoint images.
+	pub const fn delta(&self) -> &super::LiveGraphDelta {
+		&self.delta
+	}
+
+	/// Borrows the persisted UTC publication time.
+	pub const fn committed_at(&self) -> &DateTime {
+		&self.committed_at
+	}
+
+	/// Borrows the captured reactive parameter revisions.
+	pub fn bindings(&self) -> &[LiveBindingRevision] {
+		&self.bindings
+	}
+}
+
 /// Explicit reason history or computed result coverage is unavailable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -180,6 +268,8 @@ impl LiveGap {
 pub enum LivePayload {
 	/// All net changes of one commit.
 	Batch(LiveBatch),
+	/// Complete graph revision using qualified logical identities.
+	Graph(Arc<LiveGraphBatch>),
 	/// Explicit unavailable interval, followed by available tail where
 	/// possible.
 	Gap(LiveGap),

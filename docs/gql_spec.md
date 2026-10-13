@@ -12,8 +12,10 @@ storage/durability — [disk_storage_spec.md](disk_storage_spec.md), реали�
 ## Утверждённый профиль этапов 15–16 — полный graph-first MATCH
 
 **Статус профиля:** `approved-for-implementation`. Этот раздел заменяет исторический
-P0–P2-профиль для `MATCH`. Dependency-ordered реализацию и полный gate задаёт
-[`gql_match_stages_15_16_plan.md`](gql_match_stages_15_16_plan.md).
+P0–P2-профиль для `MATCH`. Все формы MATCH проходят общий parse → analyze → logical IR →
+execute pipeline и сохраняют bag/path semantics, один statement snapshot, SSI predicates,
+ограничения work/memory/depth и cancellation. Результат должен совпадать для RAM и local
+backends, а также при index lookup и exact scan; compatibility-профиль P0–P2 не поддерживается.
 
 Каноническая форма:
 
@@ -670,8 +672,9 @@ undirected self-loops проверяются общим endpoint kernel: сле�
 
 $B_{ep}$ позволяет строить любую из этих подматриц фильтрацией по типу атома.
 
-**Реализация в Rust**: `EndpointTensor` вынесен в
-[implementation_plan.md](implementation_plan.md) §3.5 «Тензорное представление».
+**Rust SDK:** `graph::tensor::EndpointTensor` предоставляет immutable sparse representation
+и borrowed views. Shape, ordinal lookup и dense export проверяют входные данные и budgets
+до allocation; обязательного стороннего matrix representation в public API нет.
 
 **Соотношение с существующими матрицами:**
 
@@ -688,8 +691,16 @@ nonzero/CSR access, VV/VE/EV/EE blocks и bounded dense export. Default represen
 Standalone GraphRead axes используют {Uuid, AtomRef}; datastore axes — AtomOccurrenceRef.
 LOCAL columns принадлежат root graph; referenced boundary rows доступны в tensor, но
 не входят в local analytics. ROOTED явно включает containment closure и cross-level arcs.
-Containment не добавляет arcs. Нормативный контракт этапа и алгоритмов:
-[gql_tensor_analytics_stage_26_plan.md](gql_tensor_analytics_stage_26_plan.md).
+Containment не добавляет arcs. Binary adjacency и Number-weighted adjacency разделены:
+нулевой weight или cancellation весов не удаляет topology; missing weight равен 1.
+NODE domain включает node endpoints, ATOM — также edge endpoints; connector не становится
+промежуточной вершиной автоматически. Axes имеют canonical qualified ordering; occurrences
+одного base atom в разных GraphId не схлопываются. Shared child graph читается один раз,
+но разные owner routes сохраняются. Пустые axes допустимы; invalid ordinal/origin/snapshot
+возвращает typed error. Аналитика доступна через Rust SDK и GQL с одинаковой семантикой.
+Default budgets: 256 MiB scratch, 100M work units и 1M enumerated paths; admission,
+work и cancellation проверяются до allocation и во время build/iteration/enumeration.
+Исчерпание convergence/work budget даёт ошибку, а не приближённый успешный результат.
 
 Harmonic closeness и betweenness используют пути без повторения projected vertex.
 Один qualified connector может участвовать в разных projected pairs такого пути.
@@ -698,6 +709,35 @@ Harmonic closeness и betweenness используют пути без повт�
 преждевременного отсечения неминимальных prefixes: Number rounding может создать
 равные минимальные final costs. Все ограничения work/memory и numeric errors
 сохраняются; epsilon ties не вводятся.
+
+#### 3.8.5. Аналитика над endpoint projection
+
+`graph::analytics` и graph-wide GQL barriers используют следующие одинаковые kernels:
+
+| Алгоритм           | Нормативное поведение                                                                                                                           |
+|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| PageRank           | Sparse power iteration, damping 0.85 по умолчанию, uniform teleport/dangling redistribution; strengths finite/nonnegative, сумма scores равна 1 |
+| Degree/strength    | IN/OUT/total, raw и normalized; parallel connectors учитываются отдельно, undirected self-loop даёт двойной вклад                               |
+| Harmonic closeness | sum(1/d)/(n−1), unreachable=0; hop либо strictly positive weighted distances                                                                    |
+| Betweenness        | Exact all-source Brandes с parallel shortest-path multiplicity, positive weighted costs и checked path counters                                 |
+| Eigenvector        | Uniform start, shifted sparse iteration, L2 normalization и проверка residual исходного eigenproblem                                            |
+| Katz               | x=α Aᵀx+β; β=1, default α=0.5/max(1,κ), explicit ακ<1 по conservative norm bound                                                                |
+| Triangles          | Undirected либо directed cycles/transitive; binary topology, self-loops исключаются                                                             |
+| Clustering         | Local/mean/global transitivity; directed Fagiolo и normalized weighted extension, zero denominator=0                                            |
+| Label propagation  | IN/OUT/BOTH votes, default BOTH; canonical sequential sweeps, текущая maximal label сохраняется при ties                                        |
+| Louvain            | Local moves/aggregation для undirected/directed modularity, default γ=1, canonical community identity; global optimum не гарантируется          |
+
+Default tolerance PageRank/eigenvector/Katz — 1e-10, iteration limit — 1000. LPA ограничена
+1000 sweeps, Louvain — 100 sweeps на level и 64 levels. Исчерпание convergence limit даёт
+typed error. Empty domain возвращает empty scores/communities и zero counts. Sampling не
+подменяет exact metrics. Iterative scores используют f64, topology/counts/distances —
+соответствующий exact domain и checked arithmetic.
+
+All-shortest SDK/MATCH/TRAVERSE сохраняет exact Number ties, path constraints, canonical
+order и bag multiplicity для hops, weights и additive/stateful COST. Default — TRAIL;
+zero costs допустимы, ALL WEIGHTED SHORTEST WALK требует finite depth. Stateful COST
+использует full-state ON_DEMAND, landmarks дают только совместимые bounds. Fallible
+enumeration сообщает ошибку, collect_all возвращает полный результат либо error.
 
 ### 3.9. Ограничения типов графов
 
@@ -1641,8 +1681,8 @@ END IMPORT [ WITH VALIDATION ];
 |----------------|---------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `INDEXES`      | `DEFERRED`                | `DEFERRED` перестраивает secondary/Label/Count/effective indexes в конце; primary identity и correctness-critical lookup сопровождаются всегда. `MAINTAINED` использует обычное incremental сопровождение private root. |
 | `CONSTRAINTS`  | `DEFERRED`                | `DEFERRED` проверяет graph-family и deferred Unique перед publication; `IMMEDIATE` — после каждого logical item. Schema/type/kind/reference checks не откладываются.                                                    |
-| `EVENTS`       | `OFF`                     | Этап 10 принимает только `OFF`; `ON` распознаётся и возвращает typed unsupported.                                                                                                                                       |
-| `CHANGEFEED`   | `OFF`                     | Этап 10 принимает только `OFF`; `ON` распознаётся и возвращает typed unsupported.                                                                                                                                       |
+| `EVENTS`       | `OFF`                     | Независимо от `CHANGEFEED`: `ON` запускает sync handlers после каждой логической операции внутри item rollback boundary; accepted ASYNC contexts остаются в bounded private spool до успешного END (§21.4, этап 29).    |
+| `CHANGEFEED`   | `OFF`                     | `ON` сохраняет whole-commit Changefeed effects accepted items после успешного END; `OFF` подавляет import capture. Mode независим от `EVENTS` (§21.3, этап 27).                                                         |
 | `ON VIOLATION` | `ABORT`                   | `ABORT` отбрасывает весь import; `SKIP` атомарно пропускает item-level нарушение; `QUARANTINE` дополнительно сохраняет canonical payload/status в durable `FGQR v1`.                                                    |
 | `REJECT LIMIT` | отсутствует               | Для `SKIP` и `QUARANTINE` обязателен явный положительный предел; нарушение `limit + 1` отбрасывает весь import.                                                                                                         |
 | `SEGMENT SIZE` | `FG_IMPORT_SEGMENT_ITEMS` | Applied items во внутреннем transaction segment; не commit и не recovery point.                                                                                                                                         |
@@ -2234,7 +2274,7 @@ cycle additionally требует explicit return type и bound у каждог�
 ```
 DEFINE EVENT 
     [ OVERWRITE | IF NOT EXISTS ] 
-    @name ON CLASS @class
+    @name ON ( CLASS @class | GRAPH @graph )
     [ ASYNC [ RETRY @n ] [ MAXDEPTH @n ] ]
     WHEN @expression 
     THEN @expression
@@ -2243,10 +2283,28 @@ DEFINE EVENT
 
 Переменные контекста:
 - `$event` — тип события: `CREATE`, `UPDATE`, `DELETE`, `RELATE`; можно использовать внутри `WHEN`.
-- `$before` — состояние записи до изменения.
+- `$before` — состояние записи или occurrence до изменения.
 - `$after` — состояние после изменения.
 - `$value` — запись после (для CREATE/UPDATE) или до (для DELETE).
 - `$input` — данные, поступившие на вход оператора.
+
+Для GRAPH `RELATE` `$before` и `$after` равны `null`; `$value` содержит созданное
+ребро и qualified endpoints по контракту §21.4.1. Контекст фиксируется на границе
+логического изменения; equality no-op не запускает EVENT. CLASS triggers соответствуют
+логическим CREATE/UPDATE/DELETE/RELATE. GRAPH получает CREATE при появлении occurrence,
+DELETE при удалении, UPDATE при изменении effective image и RELATE при создании связи.
+Изменения memberships, overlays, labels, topology и effective values через base atom
+учитываются; внутренние storage/index mutations не создают дополнительных вызовов.
+Targets обходятся в каноническом порядке, definitions — по стабильному EventId.
+Контекст каждого изменения фиксируется до effects следующих handlers.
+
+WHEN допускает только read-only effects; THEN — обычные expressions, blocks, DML, UDF
+и control flow. Управление внешней transaction, IMPORT и запуск административных jobs
+внутри handler запрещены. Definitions хранят source/logical descriptor, stable target
+identity и SchemaVersion; executable IR не сериализуется. DEFINE/ALTER/REMOVE и чтение
+definitions доступны через самостоятельный Rust SDK с checked EventId/EventTarget,
+EventDefinition и execution options. INFO CLASS/GRAPH показывает definitions;
+INFO/KILL JOB обслуживает ASYNC invocations. Полный lifecycle задан непосредственно в §21.4.
 
 Без `ASYNC` событие выполняется синхронно в рамках текущей транзакции. 
 Это обеспечивает согласованность, но может привести к увеличению задержки при операциях записи, 
@@ -2259,14 +2317,27 @@ DEFINE EVENT
 Еще замечаний об особенностях асинхронных событий:
 - Атомарность: событие ставится в очередь в рамках той же транзакции, что и изменение документа. Если транзакция завершается сбоем, событие не ставится в очередь.
 - Согласованность: асинхронные события выполняются в рамках отдельной транзакции, не связанной с исходным изменением. Они учитывают состояние базы данных на момент выполнения.
-- Порядок обработки: события обычно обрабатываются в том порядке, в котором они были созданы, хотя в рамках одного пакета возможна параллельная обработка.
+- Принятая версия EVENT, context и source descriptors зависимых UDF сохраняются
+  в durable outbox. `ALTER`/`REMOVE EVENT` влияют на последующие вызовы; ранее
+  поставленные задания отменяются явно через `KILL JOB`.
+- Порядок обработки: общий maintenance worker последовательно исполняет due
+  invocations, чередуя event attempts и maintenance jobs. Effects успешной попытки
+  и completion marker публикуются одним commit; recovery проверяет marker.
 
-Предложение `MAXDEPTH` используется для указания максимального количества повторных вызовов асинхронного события. 
-Число, следующее за ним, может варьироваться от 0 до 16. 
-По умолчанию для `MAXDEPTH` установлено значение 3, поскольку события, определяемые другими событиями, 
-которые приводят к созданию записи, на более высоких уровнях могут быстро выйти из-под контроля.
+ASYNC execution последователен. Возможный bounded parallelism требует отдельного
+контракта ordering, conflict retries, fairness и resource admission и не является
+гарантией текущего execution mode.
 
-Предложение `RETRY` подходит для событий, которые могут завершиться неудачей, но могут завершиться успехом при последовательных попытках.
+`MAXDEPTH` ограничивает причинную глубину вызовов EVENT: корневой ASYNC invocation
+имеет depth 0, каждый вызов из EVENT увеличивает depth. Диапазон — `0..=16`,
+default — 3; ограничения предков сохраняются через sync/async переходы.
+Превышение возвращает явную ошибку. Retry не увеличивает depth и не меняет
+invocation identity; sync recursion дополнительно ограничена общим control-depth budget.
+
+`RETRY` задаёт число дополнительных попыток после первой: default — 0,
+диапазон — `0..=255`. Каждая попытка читает актуальные данные в новой transaction;
+исторический context остаётся неизменным. Exactly-once для внешних effects
+не обещается; обработчик должен учитывать повтор и использовать идемпотентность.
 
 ### 9.6. DEFINE INDEX
 
@@ -2697,7 +2768,7 @@ DEFINE GRAPH [IF NOT EXISTS | OVERWRITE] @name
 ```
 REMOVE [
 	DATABASE [ IF EXISTS] @name
-	| EVENT [ IF EXISTS ] @name ON CLASS @class
+	| EVENT [ IF EXISTS ] @name ON ( CLASS @class | GRAPH @graph )
 	| FIELD [ IF EXISTS ] @name ON CLASS @class
 	| INDEX [ IF EXISTS ] @name ON ( CLASS @class | GRAPH @graph )
     | ANALYZER [ IF EXISTS ] @name
@@ -2748,11 +2819,11 @@ ALTER DATABASE COMPACT;
 Используется для изменения существующего определенного события.
 
 ```
-ALTER EVENT [ IF EXISTS ] @name ON CLASS @class
+ALTER EVENT [ IF EXISTS ] @name ON ( CLASS @class | GRAPH @graph )
   (
       ASYNC [ RETRY @retry ] [ MAXDEPTH @max_depth ] | DROP ASYNC
     | WHEN @condition | DROP WHEN
-    | THEN @action, ... | DROP THEN
+    | THEN ( @block | @action, ... ) | DROP THEN
     | COMMENT @string | DROP COMMENT
   ) [...]
 ;
@@ -3971,7 +4042,7 @@ raw counts и stored strengths, triangles использует binary topology.
 PageRank/eigenvector/Katz принимают tolerance/max_iterations; PageRank damping;
 Katz alpha/beta; harmonic/betweenness normalized; LPA votes/max_sweeps;
 Louvain resolution/max_sweeps/max_levels. Unknown/inapplicable fields ошибочны.
-Defaults и weight domains совпадают с `graph::analytics` (§3.8.4).
+Defaults и weight domains совпадают с `graph::analytics` (§3.8.5).
 
 ALL path options: scope/direction/labels/min_depth/max_depth. Seed bulk и lexical
 environment сохраняются. MATCH принимает `ALL SHORTEST` и `ALL WEIGHTED SHORTEST`
@@ -5535,7 +5606,12 @@ durable reader этапа 27 возвращает explicit GAP и доступн
 явный GAP либо typed coverage error. Для FETCH/read-only внешних зависимостей durable
 LIVE сохраняет вычисленные before/after результата и revisions параметров; resume
 не читает текущие primary records. Новая historical регистрация требует доказанной
-coverage всех inputs. Нормативный контракт: [этап 28](gql_live_stage_28_plan.md).
+coverage всех inputs. При недостаточной coverage выдаётся GAP перед доступным хвостом;
+неизвестные authoritative bounds дают typed error. Новая подписка по умолчанию начинает
+доставку после registration commit без initial rows. Обычные LET и execute parameters
+фиксируются по значению; изменение lexical binding не меняет captures прежней подписки.
+LIVE LET имеет versioned identity, транзакционно изменяется и перевычисляется по dependency
+DAG; cycle и REMOVE с dependents отклоняются до publication.
 
 LIVE EXPLAIN отражает реальные capture/validation/catalog/publication phases;
 INFO показывает snapshot metadata read, ACK — issued-token validation и whole-commit
@@ -5570,7 +5646,14 @@ GAP/fault имеют заранее admitted control slot. Потеря computed
 Batch, не помещающийся даже в пустую queue, приостанавливает затронутый LIVE с
 resource fault/GAP; бесконечного BLOCK нет. После durable publication не выполняются
 user evaluation, allocation или capacity wait. Ошибка вычисления LIVE не откатывает
-успешные source mutations. Defaults/ownership/public API задаёт нормативный план этапа28.
+успешные source mutations. Ошибка регистрации отклоняет регистрацию; ошибка активного
+evaluator приостанавливает затронутые подписки с fault/GAP. Общие WAL/resource failures
+сохраняют атомарность source transaction. Самостоятельный Rust SDK предоставляет owned
+LiveQuery/LiveExpr/LiveProjection/LiveSource, LiveOptions/LiveSince/LiveOverflowPolicy,
+LiveId/LiveBindingId/LiveCursor и LiveBatch/LiveEvent/LiveGap/LiveDelivery/LiveInfo.
+Datastore::subscribe_live/resume_live/reregister_live используют общий query pipeline;
+перерегистрация атомарно создаёт новую identity. Handle предоставляет id/next/ack/cursor/close.
+Idle отличается от terminal; ожидание не удерживает transaction snapshot.
 
 #### 21.1.4. Стоимость и ограничения
 
@@ -5754,21 +5837,109 @@ user evaluation, allocation или capacity wait. Ошибка вычислен�
 
 #### 21.1.5. Материализация live-графа
 
-Сам `LIVE SELECT` возвращает поток событий, как указано выше. Rust SDK может применить этот
-поток к материализованному `LiveGraph<State>`:
+SELECT и LIVE SELECT поддерживают terminal `RETURN GRAPH` через общий graph-result
+контракт. Family, validators, ROOT, node/edge selectors задаются запросом либо owned SDK
+recipe. JOIN, SPLIT, grouping, несколько sources и reactive bindings сохраняют обычную
+SELECT semantics. Selectors читают projected rows после WHERE/JOIN/SPLIT/GROUP/OMIT/FETCH/
+ORDER/window; имена обозначают projection aliases. SELECT ONLY проверяет cardinality row
+window до assembly. Scalar subquery с RETURN GRAPH возвращает один owned graph value.
+Qualified occurrences сохраняют scope; global edge без occurrence не получает выдуманной
+topology. Допустимость результата определяется общей assembly, endpoint/containment
+closure и family/topology validators; дополнительного ограничения одним source graph нет.
+
+Rust SDK материализует результат в `LiveGraph<State, G = Graph<State>>`; LiveReadGuard и
+LiveUpdate поддерживают тот же sealed family contract. Graph, Tree, RootedTree, Forest,
+Dag, Hypergraph, Metagraph и Subgraph сохраняют отдельные layouts, COW и validators:
 
 - `LiveGraph<Frozen>` публикует каждую согласованную revision атомарно; read-guard всегда видит
   одну неизменяемую версию, а ранее полученные guards продолжают читать прежнюю;
 - обычный query result остаётся статическим `Graph<Frozen>` и сам не обновляется;
 - `LiveGraph<Mutable>` создаётся только явным преобразованием и ведёт локальный dirty-set.
 
-Для mutable live-графа непересекающиеся remote changes могут применяться автоматически. Если
-incoming change пересекается с локальным dirty-set, подписка **приостанавливается**, remote delta
-не применяется и не коммитится. Клиент получает отдельное conflict-событие с incoming changes,
-local changes, множеством конфликтов и remote revision, после чего явно выбирает
-`accept_remote`, `keep_local`, `discard_local`, `rebase`, `flush` или `resume`. После разрешения
-движок повторно проверяет структурные инварианты graph family. Одновременная локальная и
-query-based мутация без такого разрешения запрещена.
+Начальная и каждая следующая revision вычисляются общей graph assembly на одном candidate
+root до WAL barrier; topology, membership, properties и closure-required atoms входят в
+dependencies, которые повторно проверяются перед publication. Topology-only change меняет
+граф даже при неизменной row projection. History хранит owned logical graph images и whole
+commit deltas: qualified identities, effective properties, topology, family, validators и root.
+Предыдущий/новый результат сравниваются canonical diff с обычной same_value semantics;
+смена одного watermark не считается изменением graph content. Value::Graph остаётся
+runtime-only. Initial checkpoint и checkpoint для первого retained replay interval обязательны;
+недоступная coverage выражается GAP, без чтения актуальной primary data вместо history.
+
+Datastore::subscribe_live_graph(...) и LiveGraphSubscription<State, G> предоставляют polling,
+cursor, close, materialization и явный переход в Mutable. Одна subscription incarnation
+сохраняет стабильную result identity; remote watermark — Versionstamp. SDK хранит qualified
+logical identities и source mapping, а AtomId используется только внутри materialization.
+ACK выполняется после принятия целого delta. Ошибка ACK сохраняет applied-but-unconfirmed
+token; повтор delivery подтверждает прежнее применение, не применяя delta второй раз.
+Owned checkpoints active/paused/closed incarnations ограничены 256 MiB на datastore;
+один decoder имеет отдельный scratch budget.
+
+Pending delta, remote base, local dirty state и queue изменяются только после успешной
+подготовки и проверки полного candidate. Правило действует и для ручного callback adapter:
+paused callbacks проверяются поверх принятого remote tail, а не conflicted local copy.
+Старые read guards продолжают читать прежние immutable revisions.
+
+Для Mutable непересекающийся delta применяется автоматически. Пересечение с dirty-set
+приостанавливает применение и ACK. Conflict содержит incoming/local changes, qualified
+conflicts и remote revision; ожидание использует bounded LIVE queues. Если отдельно valid
+disjoint changes вместе нарушают family/topology/containment, также выдаётся typed Conflict
+с diagnostic. Resource exhaustion сохраняет обычный error path.
+
+- `accept_remote`/`discard_local` принимают incoming remote state и очищают local changes.
+- `keep_local` переносит актуальные local decisions поверх нового remote base, включая edits
+  после conflict notification.
+- `rebase` строит явный merged candidate и сохраняет только решения, внесённые callback
+  поверх incoming image.
+
+Каждый resolution повторно проверяет family, topology constraints и containment. Ошибка
+сохраняет прежнее состояние и conflict. Разные owned views одного logical child scope
+обязаны иметь согласованное содержимое; расхождение отклоняется до application/ACK.
+`resume` не обходит unresolved conflict.
+
+`flush(owned Transaction)` использует explicit transaction, qualified source mapping,
+FCW/SSI и общий validator. Другой datastore, targets без однозначного write-back mapping,
+unmapped/new atoms, derived scopes и stale effective images отклоняются до source mutation.
+При всех isolation modes accepted dependencies являются FCW requirements; Read Committed
+preflight/staging использует один statement root. Успешный CommitResult возвращается только
+после source barrier. Exact checkpoint берётся из того же commit candidate и принимается/ACK
+через ordered polling. Ошибка последующего next() не откатывает source commit. Post-flush
+local edits отделены от уже queued remote changes; невалидное объединение выдаёт Conflict
+и сохраняет last agreed revision. Resolution не откатывает опубликованные source effects.
+Принятие раннего delivery очищает старые local decisions; последующий checkpoint не считает
+отброшенные значения новыми edits. Container bindings устанавливаются до final qualified
+connector anchors; explicit logical reselection сохраняется при equal physical topology.
+Исчезновение child scope из result closure не удаляет child source graph/atoms.
+
+GAP/fault сохраняет последнюю согласованную revision. `resnapshot()` явно закрывает старый
+capture и возвращает новую Frozen incarnation с текущим результатом. Прежние materializations
+и read guards остаются доступны; caller явно выбирает переход новой подписки в Mutable.
+
+Rust SDK предоставляет ожидание с отдельными ветками обновления, конфликта,
+GAP/fault и завершения по образцу `tokio::select!`; ветка конфликта передаёт
+информацию вызывающему коду для ручного решения. Ветки одного subscription не
+создают конкурирующих consumers. Ожидание cancellation-safe: отмена или
+проигравшая ветка сохраняет pending delta/conflict, не выполняет ACK и не выбирает
+resolution. Конкретная surface — `LiveGraphSubscription::next_event()` с
+`LiveGraphNext::Conflict` и macro `live_graph_select!`; решение принимается
+отдельным вызовом resolution method. Conflict notification выдаётся один раз;
+`conflict()` сохраняет frozen conflict boundary до resolution. Следующее ожидание допускает
+commands/cancellation и не создаёт busy loop на удерживаемом delta. Interned property names
+сохраняются между revisions в bounded registry. Новый runtime или зависимости не требуются.
+
+```rust,ignore
+ferros_grynn::live_graph_select! {
+    select = tokio::select;
+    event = subscription.next_event() => {
+        Ok(LiveGraphNext::Conflict(conflict)) => show_conflict(conflict),
+        Ok(LiveGraphNext::Updated { revision }) => render(revision),
+        Ok(other) => handle_lifecycle(other),
+        Err(error) => report(error),
+    },
+    command = commands.recv() => handle_command(command),
+    _ = cancellation.cancelled() => stop_waiting(),
+}
+```
 
 ### 21.2. KILL
 
@@ -5793,7 +5964,6 @@ SHOW CHANGES FOR (CLASS @classname | GRAPH @graph | CHANGEFEED @id)
 С помощью каналов изменений можно получать и синхронизировать изменения из Ferros-Grynn с внешними системами и платформами с помощью инструкции SHOW.
 Инструкцию SHOW можно использовать для воспроизведения изменений, внесённых в class source.
 
-Нормативный контракт этапа 27: `gql_changefeed_stage_27_plan.md`, CF-01–CF-17.
 Возвращает whole commit batches с `versionstamp`, UTC `committed_at`, `changes` и resumable
 cursor либо explicit GAP с причиной, известными bounds и доступным хвостом. LIMIT считает
 batches/GAP items, не entries; commit не разрезается. Versionstamp — existing commit_ts,
@@ -5814,7 +5984,35 @@ DROP/REMOVE оставляют историю/tombstone до TTL. Active name wi
 однозначности; CHANGEFEED id выбирает прежний source. После полного retirement старый cursor
 получает terminal FeedExpiredOrRetired GAP без resumable tail. Sparse global stamps сами
 по себе не GAP. Import config frozen; ON history переживает segment seals и END публикует
-один commit, OFF маркирует suppressed events. LIVE/ACK относятся к следующему этапу.
+один commit, OFF маркирует suppressed events. Failed/SKIP/QUARANTINE item откатывает свою
+историю; abort/failed END ничего не публикует. Writer lease и запрет schema DDL в import
+сохраняются. GRAPH source локален: containment не создаёт recursive source. Base mutation
+fanout проверяется по current reverse memberships; masked effective values не создают
+property event. FULL no-op относится только к явно targeted identity; zero matches,
+failed operation и abort не создают entries, а internal setters/cascades принадлежат outer
+logical operation. Images включают labels, overlay decisions, weight, graph references,
+topology и ordered qualified owner routes; local AtomId/GlobalAtomId не экспортируются.
+
+Reader фиксирует upper snapshot boundary и удерживает snapshot/pins; private writes
+не являются committed history. FULL preflight проверяет весь запрошенный interval до
+snapshot upper bound независимо от LIMIT. EOF может продвинуть cursor через stamps без
+событий. Timestamp reader до первого pull не имеет cursor; после ошибки pull прекращается,
+сохраняя последнюю позицию. Default Rust read options: NET от stamp 0, без whole-item limit,
+256 MiB scratch и 1M work units. GQL и SDK используют один reader и одинаковые budgets.
+Source configuration updates сохраняют identity; после полного retirement включение
+получает новый ChangefeedId. UTC committed_at сохраняется и не убывает.
+Expired/suppressed/corrupt history с известными bounds даёт explicit GAP с доступным
+хвостом; authority corruption без доказуемых bounds даёт typed error.
+
+Capture/images/spool/read buffers ограничиваются до allocation/write. Primary, feed pages,
+catalog и bounds публикуются одним WAL commit; history делит 256 MiB staged-WAL cap с
+primary/catalog. Feed-only no-op проходит writer/SSI validation. Неопределённый WAL outcome
+не допускает преждевременного удаления возможно опубликованных files. Partial result и
+silent drop запрещены. Rotation происходит между whole commit groups с target 64 MiB.
+Retention сначала публикует floor/unreferences, затем удаляет files; pins защищают old
+snapshots. Bounded purge выполняет общий maintenance worker с timed idle wake.
+Самостоятельный changefeed SDK предоставляет validated config/source/selector/id,
+Versionstamp/cursor, owned batches/images/GAP и pull next_batch/cursor без physical DTO.
 
 EXPLAIN показывает logical `ChangefeedHistoryRead`/`ChangefeedInfo`, source binding,
 NET/FULL, committed snapshot bounds, resume и whole-commit limit. Dynamic operands
@@ -5827,12 +6025,43 @@ groups, logical page requests/bytes, work, segment visits и admitted scratch pe
 
 ### 21.4. События (DEFINE EVENT)
 
-Подробный синтаксис — §9.5. 
+Синтаксис и контекст определены в §9.5; следующие правила задают transactional lifecycle.
 
-Гарантии:
-- Синхронные события (`без ASYNC`) — выполняются в рамках одной транзакции и могут привести к её откату при ошибке.
-- Асинхронные события (`ASYNC`) — ставятся в очередь; при сбое — повторяются `RETRY @n` раз; глубина вложенности событий ограничена `MAXDEPTH`.
-- Асинхронные события не имеют гарантии exactly-once по умолчанию; для at-least-once нужна явная идемпотентность.
+Sync handlers запускаются после успешной логической мутации в той же transaction.
+Мутация и вызванные handlers составляют одну rollback boundary. TRY/CATCH восстанавливает
+данные, lexical state, event metadata и pending outbox entries. Вложенные изменения проходят
+тот же dispatch; sync recursion ограничена общим control-depth budget. Commit replay
+повторно не исполняет handlers. Definitions, predicates и handler reads участвуют в FCW/SSI
+validation; пользовательские expressions не исполняются под commit mutex.
+
+ASYNC WHEN вычисляется в исходной transaction. Принятый invocation сохраняет EVENT version,
+context, необходимые transitive source descriptors UDF и стабильную invocation identity.
+ALTER/REMOVE EVENT действует на последующие вызовы; pending invocation отменяется явно.
+Outbox принадлежит transactional root, а admin job ledger является восстанавливаемой
+проекцией. Primary data, outbox, Changefeed и LIVE effects публикуются одним WAL commit.
+Versioned WAL-backed side-format хранит logical/source descriptors без executable IR;
+general StorageValue codec не расширяется.
+
+Общий maintenance worker последовательно обрабатывает due invocations, чередуя event
+attempts и maintenance jobs. FG_ASYNC_EVENT_PROCESSING_INTERVAL default — 5 секунд.
+Каждая попытка открывает новую transaction и читает актуальные данные; исторический context
+не изменяется. Effects успешной попытки и completion marker публикуются атомарно. Recovery
+проверяет marker перед повтором; повреждение pending payload является ошибкой восстановления,
+а не основанием потерять задание. RETRY — дополнительные попытки (default 0, 0..=255),
+не меняющие identity/depth. Корневой ASYNC depth равен 0; причинный вызов из EVENT увеличивает
+depth. MAXDEPTH default 3, 0..=16; ограничения предков сохраняются через sync/async переходы,
+превышение возвращает typed error. Exactly-once для внешних effects не обещается.
+
+Pending outbox ограничен 10 000 invocations и 64 MiB на datastore, дополнительно действуют
+transaction limits. Admission предшествует allocation/publication; overflow отклоняет
+исходную операцию. INFO JOB показывает state, attempts, depth и bounded diagnostic;
+KILL JOB отменяет pending invocation либо кооперативно прерывает текущую попытку.
+
+ImportEventsMode::{Off, On}, default Off, независим от CHANGEFEED. ON исполняет sync
+handlers внутри item boundary; ASYNC invocations находятся в bounded private spool
+и становятся видимыми только после успешного END. SKIP/QUARANTINE откатывает effects и
+invocations отвергнутого item; abort/failed END ничего не публикует. Transient anchors
+переживают segment seals и откатываются вместе с item/TRY.
 
 #### 21.4.1. Автогенерация AtomWalk-рёбер
 
@@ -5861,6 +6090,19 @@ DEFINE EVENT
 
 Внутри `@relate_stmt` можно создавать V–E, E–V и E–E связи, если их endpoint-атомы уже
 разрешены из `$value` или внешнего scope. Каждая такая связь создаёт отдельное обычное ребро.
+V–V/V–E/E–V/E–E проходят обычный RELATE и общий incidence validator, включая qualified
+cross-level endpoints. Endpoint reference принимает RecordId, AtomRef либо AtomOccurrenceRef.
+Для occurrence вне connector graph задаётся explicit descriptor
+`{ occurrence: @qualified_occurrence, owners: [@owner_occurrence, ...] }`.
+Каждый owner принадлежит текущему уровню маршрута, terminal — child graph последнего owner;
+empty owners разрешён только для local occurrence. Контекст source_paths/target_paths хранит
+эти ordered owner routes; маршрут не выводится только из terminal при нескольких owners.
+Node/edge wrappers проверяют kind; qualified occurrence не auto-attach в connector graph.
+Unqualified global node сохраняет обычное auto-attachment, edge требует существующей topology.
+Logical owner/terminal identities фиксируются на attach/topology boundary. Rebinding owner
+или BUILD overwrite не перенаправляет существующую/pending связь на другой RecordId/GraphId
+из-за совпадения physical slots; новый маршрут принимает только явное topology change или
+detach/reattach. Equality no-op сохраняет принятое решение.
 
 ---
 
@@ -6673,11 +6915,12 @@ enum BridgeData<'a> {
 
 ## 31. Соответствие кодовой базе
 
-> **Вынесено в [implementation_plan.md](implementation_plan.md) §1 «Соответствие кодовой базе».**
-> Таблицы «Согласовано» и «Требуют согласования» перенесены в план и объединены с аналогичной
-> таблицей `gql_tech_spec.md` §17 в единый источник: §1.1 — что реализовано / каркас / новое;
-> §1.2 — открытые вопросы (`PropertyMap` ↔ `object`, публичная форма `RecordId`,
-> `RELATE HYPER` / `MATCH HYPER`, метаатомы, ECS-компоненты).
+Нормативный контракт не зависит от пофайлового статуса реализации. Public query rows
+возвращают owned RecordId/Value и qualified graph references; physical pages, slot identifiers
+и storage DTO через этот интерфейс не выдаются. PropertyMap является внутренним
+представлением свойств и не заменяет object semantics языка. RELATE/MATCH используют единый
+endpoint kernel для обычной, hyper-, meta- и cross-level incidence. ECS хранит производные
+компоненты отдельно и не меняет durable graph identity, equality или property semantics.
 
 ---
 
@@ -6705,10 +6948,12 @@ enum BridgeData<'a> {
 
 ### 32.3. Отложено / вне MVP
 
-> **Вынесено в [implementation_plan.md](implementation_plan.md) §6 «Отложено / вне MVP».**
-> Список отложенного (JIT-компиляция, SMT-верификация оптимизатора, параллельный recovery,
-> graph-специфические индексы, distributed execution) объединён там со сводками из
-> `gql_tech_spec.md` §18 и `disk_storage_spec.md`.
+Embedded execution является границей текущего контракта: distributed execution не
+поддерживается. JIT-компиляция, SMT-верификация оптимизатора и параллельный recovery не
+требуются для исполнения языка. Добавление этих механизмов не может ослаблять snapshot,
+ACID, validation, error или resource semantics. Graph-derived indexes и tensor caches,
+описанные в нормативных разделах, сохраняют exact scan fallback при отсутствии/stale
+binding; существование оптимизации не является предусловием корректного результата.
 
 ## Geometry — нормативный срез этапа 24
 

@@ -226,10 +226,13 @@ fn physical_plan(
 	max_graph_edges: u64,
 ) -> FerrosGrynnResult<PhysicalPlan> {
 	match statement {
-		LogicalStatement::Select(select) => {
-			crate::gql::optimizer::prepare_select(select, snapshot, barrier_bytes)
-				.map(|(_logical, plan)| PhysicalPlan::Select(plan))
-		}
+		LogicalStatement::Select(select) => crate::gql::optimizer::plan_select_graph_result(
+			select,
+			snapshot,
+			max_graph_nodes,
+			max_graph_edges,
+			barrier_bytes,
+		),
 		LogicalStatement::Match(statement) => crate::gql::optimizer::plan_match_graph_result(
 			statement,
 			snapshot,

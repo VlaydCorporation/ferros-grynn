@@ -2,6 +2,8 @@ use super::{
 	eval::eval,
 	graph_properties::{evaluate_graph_properties, execute_graph_property_update},
 };
+/// Event lifecycle commands use the common SDK source validator.
+mod event;
 use crate::{
 	datastore::{
 		AnalyzerFilter,
@@ -43,6 +45,7 @@ pub(super) fn execute_schema(
 	control: &crate::gql::ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	match statement {
+		LogicalSchemaStatement::Event(statement) => event::execute(transaction, statement, control),
 		LogicalSchemaStatement::DefineLiveBinding(plan) => {
 			live::binding(transaction, plan, None, slots, source, control)
 		}
@@ -379,7 +382,23 @@ pub(super) fn execute_schema(
 		} => info_analyzer(transaction, name),
 		LogicalSchemaStatement::InfoClass {
 			name,
-		} => info_class(transaction, name),
+		} => info_class(transaction, name, control),
+		LogicalSchemaStatement::InfoGraph {
+			name,
+		} => {
+			let graph = transaction
+				.named_graph(name)?
+				.ok_or_else(|| FerrosGrynnError::graph_does_not_exist(name.as_ref()))?;
+			let events = event::info(
+				transaction,
+				crate::datastore::EventTarget::Graph(graph.id()),
+				control,
+			)?;
+			Ok(Value::from(Object::from_iter([
+				("definition", Value::from(graph)),
+				("events", Value::from(events)),
+			])))
+		}
 		LogicalSchemaStatement::InfoIndex {
 			class,
 			name,
@@ -1210,7 +1229,12 @@ fn parameter_info(parameter: &SchemaParameter) -> Value {
 	]))
 }
 
-fn info_class(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Value> {
+/// Projects the current class definition and its source-owned Events.
+fn info_class(
+	transaction: &mut Transaction,
+	name: &str,
+	control: &crate::gql::ExecutionControl,
+) -> FerrosGrynnResult<Value> {
 	let schema = require_class(transaction, name)?;
 	let graphs = transaction.graphs()?;
 	let fields = schema
@@ -1223,10 +1247,14 @@ fn info_class(transaction: &mut Transaction, name: &str) -> FerrosGrynnResult<Va
 		.collect::<Object>();
 	indexes.insert("class", system_index_info(name, "class"));
 	indexes.insert("primary", system_index_info(name, "primary"));
+	let class = schema
+		.id()
+		.ok_or_else(|| FerrosGrynnError::invalid_argument("published class has no identity"))?;
+	let events = event::info(transaction, crate::datastore::EventTarget::Class(class), control)?;
 	Ok(Value::from(Object::from_iter([
 		("classes", Value::from(Object::new())),
 		("definition", class_definition(&schema)),
-		("events", Value::from(Object::new())),
+		("events", Value::from(events)),
 		("fields", Value::from(fields)),
 		("indexes", Value::from(indexes)),
 		("lives", Value::from(Object::new())),

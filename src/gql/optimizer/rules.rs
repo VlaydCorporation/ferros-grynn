@@ -91,6 +91,13 @@ fn fold_select(select: &mut LogicalSelect) -> bool {
 	if let Some(limit) = &mut select.limit {
 		changed |= fold_expr(limit);
 	}
+	if let Some(graph) = &mut select.return_graph {
+		changed |= fold_expr(&mut graph.nodes);
+		changed |= fold_expr(&mut graph.edges);
+		if let Some(root) = &mut graph.root {
+			changed |= fold_expr(root);
+		}
+	}
 	changed
 }
 

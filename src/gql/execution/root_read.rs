@@ -55,12 +55,23 @@ use crate::{
 		},
 		root_catalog::RootCatalog,
 	},
-	graph::{AtomId, AtomKind, AtomOccurrenceRef, GraphId, GraphRead, SnapshotId},
+	graph::{
+		AtomId,
+		AtomKind,
+		AtomOccurrenceRef,
+		GraphId,
+		GraphRead,
+		MaterializationOrigin,
+		MaterializedGraph,
+		SnapshotId,
+	},
 };
 
 /// Candidate roots are borrowed only during bounded evaluation, never delivery
 /// waits.
 pub(in crate::gql) struct RootRead<'a> {
+	/// Explicit host statement scope for implicit scalar record references.
+	scalar_graph: Option<&'a GraphRef>,
 	/// The complete replayed commit image.
 	root: &'a Arc<DatabaseRoot>,
 	/// Shared ordinary schema/function resolution.
@@ -78,6 +89,94 @@ pub(in crate::gql) struct RootRead<'a> {
 }
 
 impl<'a> RootRead<'a> {
+	/// Captures source incarnation and durable watermark of its effective
+	/// image.
+	pub(in crate::gql) fn graph_source_mapping(
+		&self,
+		atom: &crate::graph::AtomRef,
+		graph: Option<&GraphRef>,
+	) -> FerrosGrynnResult<Option<crate::live::LiveGraphSource>> {
+		let Some((base, _occurrence)) = self.point_parts(atom.id(), graph)? else {
+			return Ok(None);
+		};
+		if base.kind() != atom.kind() {
+			return Ok(None);
+		}
+		(self.observe)(ConflictKey::SchemaClass(base.class_id()));
+		Ok(Some(crate::live::LiveGraphSource {
+			class: base.class_id(),
+			revision: self.root.commit_ts.into(),
+		}))
+	}
+
+	/// Observes closure-required effective images without copying property
+	/// rows.
+	pub(super) fn observe_graph_result(&self, graph: &MaterializedGraph) -> FerrosGrynnResult<()> {
+		(self.observe)(ConflictKey::PropertyDictionary);
+		self.observe_graph_origin(graph.materialization_origin())?;
+		let mut pending = Vec::new();
+		for id in graph.node_ids()? {
+			self.work(1)?;
+			if let Some(child) = graph.node(id?).and_then(|node| node.inner_graph()) {
+				self.fields.admit(2 * size_of::<&crate::graph::Graph<crate::graph::Frozen>>())?;
+				pending.push(child);
+			}
+		}
+		for id in graph.edge_ids()? {
+			self.work(1)?;
+			if let Some(child) = graph.edge(id?).and_then(|edge| edge.transition_graph()) {
+				self.fields.admit(2 * size_of::<&crate::graph::Graph<crate::graph::Frozen>>())?;
+				pending.push(child);
+			}
+		}
+		let mut seen = std::collections::BTreeSet::new();
+		while let Some(child) = pending.pop() {
+			let pointer = std::ptr::from_ref(child);
+			if seen.contains(&pointer) {
+				continue;
+			}
+			self.fields.admit(128)?;
+			seen.insert(pointer);
+			self.observe_graph_origin(child.materialization_origin())?;
+			for id in child.node_ids()? {
+				self.work(1)?;
+				if let Some(next) = child.node(id?).and_then(|node| node.inner_graph()) {
+					self.fields
+						.admit(2 * size_of::<&crate::graph::Graph<crate::graph::Frozen>>())?;
+					pending.push(next);
+				}
+			}
+			for id in child.edge_ids()? {
+				self.work(1)?;
+				if let Some(next) = child.edge(id?).and_then(|edge| edge.transition_graph()) {
+					self.fields
+						.admit(2 * size_of::<&crate::graph::Graph<crate::graph::Frozen>>())?;
+					pending.push(next);
+				}
+			}
+		}
+		self.control.check()
+	}
+
+	/// Origins identify every qualified source record copied into this exact
+	/// result.
+	fn observe_graph_origin(
+		&self,
+		origin: Option<&MaterializationOrigin>,
+	) -> FerrosGrynnResult<()> {
+		let Some(origin) = origin else {
+			return Ok(());
+		};
+		for (_, atom) in origin.source_atoms() {
+			if self.point_parts(atom.id(), origin.graph_ref())?.is_none() {
+				return Err(FerrosGrynnError::invalid_storage_file(
+					"graph result source image is absent",
+				));
+			}
+		}
+		Ok(())
+	}
+
 	/// Reuses one scalar admission account across compilation and evaluation.
 	pub(in crate::gql) fn fields(&self) -> &dyn AtomFieldRead {
 		&self.fields
@@ -92,6 +191,7 @@ impl<'a> RootRead<'a> {
 		scratch_root: PathBuf,
 	) -> Self {
 		Self {
+			scalar_graph: None,
 			root,
 			catalog: RootCatalog(root),
 			fields: RootFields::new(root, control, observe, work),
@@ -100,6 +200,13 @@ impl<'a> RootRead<'a> {
 			control,
 			scratch_root,
 		}
+	}
+
+	/// Retains the host statement's scope for implicit scalar record
+	/// references.
+	pub(in crate::gql) fn with_scalar_graph(mut self, graph: Option<&'a GraphRef>) -> Self {
+		self.scalar_graph = graph;
+		self
 	}
 
 	/// Enables the LIVE recorder to distinguish scans from schema metadata.
@@ -273,6 +380,17 @@ impl QueryRead for RootRead<'_> {
 	fn snapshot(&self) -> FerrosGrynnResult<Snapshot> {
 		self.control.check()?;
 		Ok(Snapshot(self.root.commit_ts))
+	}
+
+	fn scalar_graph(&self) -> Option<&GraphRef> {
+		self.scalar_graph
+	}
+
+	fn snapshot_root(&self, snapshot: Snapshot) -> FerrosGrynnResult<Arc<DatabaseRoot>> {
+		if snapshot.0 != self.root.commit_ts {
+			return Err(FerrosGrynnError::invalid_argument("graph cursor snapshot mismatch"));
+		}
+		Ok(Arc::clone(self.root))
 	}
 
 	fn refresh_snapshot(&mut self) -> FerrosGrynnResult<Snapshot> {
@@ -803,7 +921,7 @@ impl QueryRead for RootRead<'_> {
 	fn execute_dml(
 		&mut self,
 		_statement: &LogicalDmlStatement,
-		_slots: &[Value],
+		_slots: &mut [Value],
 		_source: &str,
 		_control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
@@ -813,7 +931,7 @@ impl QueryRead for RootRead<'_> {
 	fn execute_graph_dml(
 		&mut self,
 		_statement: &LogicalGraphDmlStatement,
-		_slots: &[Value],
+		_slots: &mut [Value],
 		_source: &str,
 		_control: &ExecutionControl,
 	) -> FerrosGrynnResult<Value> {
@@ -826,6 +944,7 @@ impl QueryRead for RootRead<'_> {
 		_mode: crate::syn::DefinitionMode,
 		_contract_explicit: bool,
 		_graph: crate::graph::MaterializedGraph,
+		_control: &ExecutionControl,
 	) -> FerrosGrynnResult<GraphRef> {
 		read_only()
 	}

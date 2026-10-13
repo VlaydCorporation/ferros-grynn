@@ -43,37 +43,71 @@ use crate::{
 /// Database owning one global atom registry and any number of graph views.
 pub struct Datastore {
 	pub(crate) inner: Arc<StoreInner>,
+	/// Background transactions retain storage without extending user ownership.
+	owns_handle: bool,
+}
+
+#[cfg(test)]
+mod ownership_tests {
+	use super::*;
+
+	#[test]
+	fn event_background_transaction_does_not_extend_user_lifetime() {
+		let store = Datastore::in_memory();
+		let background = Datastore::background(Arc::clone(&store.inner));
+		let transaction = background.begin();
+		assert_eq!(background.inner.datastore_handles.load(Ordering::Acquire), 1);
+		drop(store);
+		assert_eq!(background.inner.datastore_handles.load(Ordering::Acquire), 0);
+		assert!(background.inner.maintenance.is_stopping());
+		drop(transaction);
+		drop(background);
+	}
 }
 
 impl Clone for Datastore {
 	fn clone(&self) -> Self {
-		if self
-			.inner
-			.datastore_handles
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handles| handles.checked_add(1))
-			.is_err()
+		if self.owns_handle
+			&& self
+				.inner
+				.datastore_handles
+				.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handles| {
+					handles.checked_add(1)
+				})
+				.is_err()
 		{
 			std::process::abort();
 		}
 		Self {
 			inner: self.inner.clone(),
+			owns_handle: self.owns_handle,
 		}
 	}
 }
 
 impl Drop for Datastore {
 	fn drop(&mut self) {
-		if self.inner.datastore_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+		if self.owns_handle && self.inner.datastore_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
 			{
 				let _commit = self.inner.commit.lock();
 				self.inner.live_consumers.shutdown();
 			}
+			self.inner.live_consumers.wake_ready();
 			self.inner.maintenance.shutdown();
 		}
 	}
 }
 
 impl Datastore {
+	/// The owned worker checks shutdown and carries its existing cancellation
+	/// token.
+	pub(in crate::datastore) fn background(inner: Arc<StoreInner>) -> Self {
+		Self {
+			inner,
+			owns_handle: false,
+		}
+	}
+
 	/// Temporarily acquires a logical datastore owner for an attached control
 	/// operation; a weak consumer cannot resurrect a closed datastore.
 	pub(in crate::datastore) fn from_inner_alive(
@@ -93,6 +127,7 @@ impl Datastore {
 			})?;
 		Ok(Self {
 			inner,
+			owns_handle: true,
 		})
 	}
 
@@ -112,6 +147,101 @@ impl Datastore {
 		let mut tx = self.begin();
 		let id = tx.register_live(query, options)?;
 		self.attach_live_registration(tx, id)
+	}
+
+	/// Subscribes to an exact concrete graph family through common RETURN
+	/// GRAPH.
+	///
+	/// # Errors
+	/// Returns a recipe/family mismatch before registration, or existing LIVE
+	/// registration, graph validation, resource and publication errors.
+	pub fn subscribe_live_graph<
+		G: crate::graph::LiveFamily<State = crate::graph::Frozen, Frozen = G> + Clone,
+	>(
+		&self,
+		query: crate::live::LiveQuery,
+		options: crate::live::LiveOptions,
+	) -> FerrosGrynnResult<crate::live::LiveGraphSubscription<crate::graph::Frozen, G>> {
+		let recipe = query.graph_result().ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(
+				"LIVE graph subscription requires a graph-result recipe",
+			)
+		})?;
+		if recipe.family() != G::family_kind() {
+			return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+				"LIVE graph recipe does not match the requested Rust family",
+			));
+		}
+		let subscription = self.subscribe_live(query, options.clone())?;
+		crate::live::LiveGraphSubscription::registered(subscription, options)
+	}
+
+	/// Restores the covered graph at confirmed ACK and then joins saved deltas.
+	///
+	/// # Errors
+	/// Returns incarnation/family, coverage, graph validation or resource
+	/// errors.
+	pub fn resume_live_graph<
+		G: crate::graph::LiveFamily<State = crate::graph::Frozen, Frozen = G> + Clone,
+	>(
+		&self,
+		cursor: &crate::live::LiveCursor,
+	) -> FerrosGrynnResult<crate::live::LiveGraphSubscription<crate::graph::Frozen, G>> {
+		let options = {
+			let _commit = self.inner.commit.lock();
+			let root = self.inner.current_root();
+			let definition =
+				root.live_catalog().queries.get(&cursor.live_id()).ok_or_else(|| {
+					crate::gql_status::FerrosGrynnError::invalid_argument(
+						"LIVE graph resume incarnation is absent",
+					)
+				})?;
+			let recipe = definition.query.graph_result().ok_or_else(|| {
+				crate::gql_status::FerrosGrynnError::invalid_argument(
+					"LIVE graph resume requires a graph-result recipe",
+				)
+			})?;
+			if recipe.family() != G::family_kind() {
+				return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+					"LIVE graph resume family differs from the Rust family",
+				));
+			}
+			definition.options.clone()
+		};
+		crate::live::LiveGraphSubscription::registered(self.resume_live(cursor)?, options)
+	}
+
+	/// Replaces this result incarnation with a fresh current-data snapshot,
+	/// atomically closing its former capture during ordinary registration.
+	///
+	/// # Errors
+	/// Returns the existing origin, recipe, family, capacity or publication
+	/// errors. SDK materialization is checked after successful registration.
+	pub fn resnapshot_live_graph<
+		G: crate::graph::LiveFamily<State = crate::graph::Frozen, Frozen = G> + Clone,
+	>(
+		&self,
+		cursor: &crate::live::LiveCursor,
+	) -> FerrosGrynnResult<crate::live::LiveGraphSubscription<crate::graph::Frozen, G>> {
+		let mut tx = self.begin();
+		let info = tx.live_info(cursor.live_id())?;
+		cursor.validate(info.cursor().database_id(), info.id(), info.cursor().version())?;
+		let recipe = info.query().graph_result().ok_or_else(|| {
+			crate::gql_status::FerrosGrynnError::invalid_argument(
+				"resnapshot requires a graph recipe",
+			)
+		})?;
+		if recipe.family() != G::family_kind() {
+			return Err(crate::gql_status::FerrosGrynnError::invalid_argument(
+				"resnapshot family mismatch",
+			));
+		}
+		let options = info.options().clone().with_since(crate::live::LiveSince::Now);
+		let id = tx.reregister_live(info.id(), info.query().clone(), options.clone())?;
+		crate::live::LiveGraphSubscription::registered(
+			self.attach_live_registration(tx, id)?,
+			options,
+		)
 	}
 
 	/// Resumes from the authoritative persisted ACK, then joins the live tail.
@@ -179,6 +309,7 @@ impl Datastore {
 			.live_segments()
 			.get(&definition.id)
 			.is_some_and(|segments| !segments.is_empty())
+			|| root.live_catalog().graph_segments.contains_key(&definition.id)
 		{
 			self.inner.capture_changefeed_snapshot(root.commit_ts)?
 		} else {
@@ -197,7 +328,9 @@ impl Datastore {
 			},
 			definition.state == crate::live::LiveState::Closed,
 		)?;
-		let handle = super::SubscriptionHandle::new(&self.inner, key, confirmed);
+		let checkpoint = root.live_catalog().graph_checkpoints.get(&definition.id).cloned();
+		let handle = super::SubscriptionHandle::new(&self.inner, key, confirmed)
+			.with_graph_checkpoint(checkpoint);
 		let handle = if has_work {
 			handle.with_replay(replay)
 		} else {
@@ -357,6 +490,7 @@ impl Datastore {
 			StoreBackend::Local(local) => local.maintenance_jobs(),
 		};
 		Self {
+			owns_handle: true,
 			inner: Arc::new(StoreInner {
 				options,
 				backend,
@@ -371,6 +505,7 @@ impl Datastore {
 				query_scratch_root,
 				quarantines: Mutex::new(std::collections::BTreeMap::new()),
 				maintenance: MaintenanceCoordinator::new(recovered_jobs),
+				event_processing_interval: super::event_worker::configured_interval(),
 				changefeed_observation: super::changefeed_observation::Counters::default(),
 				live_observation: super::live_observation::Counters::default(),
 			}),
@@ -405,16 +540,27 @@ impl Datastore {
 
 	/// Returns one durable maintenance job, if it exists.
 	pub fn job(&self, id: super::JobId) -> FerrosGrynnResult<Option<MaintenanceJobInfo>> {
+		if let Some(invocation) = self.inner.current_root().event_outbox().invocations.get(&id) {
+			return self.inner.event_job_info(invocation).map(Some);
+		}
 		Ok(self.inner.maintenance.job(id))
 	}
 
 	/// Returns all retained active and terminal maintenance jobs.
 	pub fn jobs(&self) -> FerrosGrynnResult<Vec<MaintenanceJobInfo>> {
-		Ok(self.inner.maintenance.jobs())
+		let mut jobs = self.inner.maintenance.jobs();
+		for invocation in self.inner.current_root().event_outbox().invocations.values() {
+			jobs.push(self.inner.event_job_info(invocation)?);
+		}
+		jobs.sort_unstable_by_key(MaintenanceJobInfo::id);
+		Ok(jobs)
 	}
 
 	/// Cooperatively cancels one queued or running maintenance job.
 	pub fn kill_job(&self, id: super::JobId) -> FerrosGrynnResult<MaintenanceJobInfo> {
+		if self.inner.current_root().event_outbox().invocations.contains_key(&id) {
+			return self.kill_event_job(id);
+		}
 		self.inner.maintenance.kill(self.inner.as_ref(), id)
 	}
 

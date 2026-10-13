@@ -1,4 +1,4 @@
-use super::{AnalyzerId, ClassId, FunctionId, GlobalAtomId, SchemaId};
+use super::{AnalyzerId, ClassId, EventId, FunctionId, GlobalAtomId, SchemaId};
 use crate::graph::{AtomId, AtomKind, GraphId};
 
 /// Independently versioned logical targets used by FCW and SSI validation.
@@ -22,6 +22,14 @@ pub(crate) enum ConflictKey {
 	SchemaFunction(FunctionId),
 	/// Set of durable named-function overloads observed by a catalog scan.
 	FunctionCatalogRange,
+	/// One versioned class or graph event definition.
+	SchemaEvent(EventId),
+	/// Event namespace, including absent owner/name lookups.
+	EventCatalogRange,
+	/// One accepted invocation or atomic completion/cancellation marker.
+	EventInvocation(super::JobId),
+	/// Invocation namespace observed by bounded job administration.
+	EventOutboxRange,
 	/// One durable text-analyzer definition.
 	SchemaAnalyzer(AnalyzerId),
 	/// Set of durable text analyzers observed by a catalog scan.

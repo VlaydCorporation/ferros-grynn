@@ -220,7 +220,6 @@ fn gql_and_callback_import_publish_the_same_logical_root_and_report() {
 fn import_preflight_rejects_results_scope_mismatch_and_unsupported_options() {
 	let store = import_store();
 	for source in [
-		"BEGIN IMPORT WITH (EVENTS = ON); CREATE person:alice; END IMPORT;",
 		"BEGIN IMPORT INTO GRAPH social; CREATE person:alice RETURN VALUE id; END IMPORT;",
 		"BEGIN IMPORT INTO GRAPH social; ATTACH person:alice TO GRAPH other; END IMPORT;",
 	] {

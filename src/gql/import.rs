@@ -244,12 +244,13 @@ fn import_options(
 			}
 			ImportOptionName::Events => {
 				let value = option_word(option, source)?;
-				if value.eq_ignore_ascii_case("ON") {
-					return Err(unsupported(source, option.span, "IMPORT EVENTS=ON"));
-				}
-				if !value.eq_ignore_ascii_case("OFF") {
+				result.events = if value.eq_ignore_ascii_case("ON") {
+					crate::datastore::ImportEventsMode::On
+				} else if value.eq_ignore_ascii_case("OFF") {
+					crate::datastore::ImportEventsMode::Off
+				} else {
 					return Err(invalid_option_value(source, option));
-				}
+				};
 			}
 			ImportOptionName::Changefeed => {
 				let value = option_word(option, source)?;
@@ -423,7 +424,7 @@ fn normalize_statement(
 				default_graph,
 				true,
 				source,
-				statement.source.class().span,
+				statement.source.span,
 			)?;
 			normalize_return(&mut statement.returning, source, statement_span)?;
 		}

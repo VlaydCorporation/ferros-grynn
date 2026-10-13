@@ -49,6 +49,7 @@ use super::{
 		LogicalProgram,
 		LogicalRecordTarget,
 		LogicalRelateEdge,
+		LogicalRelateEndpoint,
 		LogicalRepeat,
 		LogicalReturnGraph,
 		LogicalSchemaStatement,
@@ -371,6 +372,8 @@ struct Analyzer<'a> {
 	current_function_has_explicit_result: bool,
 }
 
+/// Source-preserving event definition and lifecycle lowering.
+mod event;
 /// Bounded LIVE syntax recipes share literal/source/type analysis.
 mod live;
 
@@ -620,6 +623,9 @@ impl<'a> Analyzer<'a> {
 			}
 			StatementKind::DefineFunction(definition) => {
 				LogicalStatement::Schema(self.define_function(definition)?)
+			}
+			StatementKind::DefineEvent(definition) => {
+				LogicalStatement::Schema(self.define_event(definition)?)
 			}
 			StatementKind::Remove(statement) => {
 				LogicalStatement::Schema(self.remove(&statement.target)?)
@@ -979,29 +985,53 @@ impl<'a> Analyzer<'a> {
 		})
 	}
 
+	/// Static record classes and dynamic references share endpoint-kind
+	/// validation.
+	fn relate_endpoint(
+		&self,
+		endpoint: &crate::syn::RelateEndpoint,
+		atom: bool,
+	) -> FerrosGrynnResult<LogicalRelateEndpoint> {
+		let expected = endpoint.kind.map(|kind| match kind {
+			crate::syn::MatchEndpointKind::Node => AtomKind::Node,
+			crate::syn::MatchEndpointKind::Edge => AtomKind::Edge,
+		});
+		match &endpoint.target {
+			crate::syn::RelateEndpointTarget::Record(target) => {
+				let kind = self.catalog.class_kind(target.class().value.as_ref())?;
+				if !atom && kind != AtomKind::Node
+					|| expected.is_some_and(|expected| expected != kind)
+				{
+					return Err(self.semantic(
+						"RELATE endpoint class does not match its node/edge wrapper.",
+						endpoint.span,
+					));
+				}
+				self.record_target(target).map(LogicalRelateEndpoint::Record)
+			}
+			crate::syn::RelateEndpointTarget::Reference(value) => {
+				Ok(LogicalRelateEndpoint::Reference {
+					value: self.expr(value, None)?,
+					kind: expected,
+				})
+			}
+		}
+	}
+
 	fn relate(
 		&self,
 		statement: &crate::syn::RelateStatement,
 	) -> FerrosGrynnResult<LogicalGraphDmlStatement> {
 		let graph = statement.graph.as_ref().ok_or_else(|| {
-			self.semantic("RELATE requires a graph scope.", statement.source.class().span)
+			self.semantic("RELATE requires a graph scope.", statement.source.span)
 		})?;
-		for endpoint in [&statement.source, &statement.target] {
-			let kind = self.catalog.class_kind(endpoint.class().value.as_ref())?;
-			if !statement.atom_endpoints && kind != AtomKind::Node {
-				return Err(self.semantic(
-					"RELATE endpoints require NODE classes unless `RELATE ATOM` is used.",
-					endpoint.class().span,
-				));
-			}
-		}
 		if self.catalog.class_kind(statement.edge.class().value.as_ref())? != AtomKind::Edge {
 			return Err(
 				self.semantic("RELATE edge requires an EDGE class.", statement.edge.class().span)
 			);
 		}
-		let source = self.record_target(&statement.source)?;
-		let target = self.record_target(&statement.target)?;
+		let source = self.relate_endpoint(&statement.source, statement.atom_endpoints)?;
+		let target = self.relate_endpoint(&statement.target, statement.atom_endpoints)?;
 		let class = statement.edge.class().value.clone();
 		validate_reserved_levelpath_data(statement.data.as_ref(), |message, span| {
 			self.semantic(message, span)
@@ -1375,6 +1405,17 @@ impl<'a> Analyzer<'a> {
 		}
 	}
 
+	/// Admits cold SELECT storage before allocating its owned graph selectors.
+	fn select_return_graph(
+		&self,
+		graph: &ReturnGraph,
+		schema: &Schema,
+		span: TextSpan,
+	) -> FerrosGrynnResult<Box<LogicalReturnGraph>> {
+		self.catalog.admit_analysis(std::mem::size_of::<LogicalReturnGraph>(), 0)?;
+		self.return_graph(graph, Some(schema), span).map(Box::new)
+	}
+
 	fn return_graph(
 		&self,
 		graph: &ReturnGraph,
@@ -1440,7 +1481,7 @@ impl<'a> Analyzer<'a> {
 			}
 			BuildGraphSource::Select(statement) => {
 				let statement = self.select(statement, span)?;
-				let schema = statement.result.clone();
+				let schema = statement.output_schema();
 				(LogicalBuildGraphSource::Select(Box::new(statement)), Some(schema), false)
 			}
 			BuildGraphSource::Traverse(statement) => {
@@ -2395,6 +2436,15 @@ impl<'a> Analyzer<'a> {
 
 	fn remove(&self, target: &RemoveTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
+			RemoveTarget::Event {
+				if_exists,
+				name,
+				owner,
+			} => Ok(LogicalSchemaStatement::Event(crate::gql::ir::LogicalEventStatement::Remove {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+				owner: event::event_owner(owner),
+			})),
 			RemoveTarget::LiveLet(name) => Ok(LogicalSchemaStatement::RemoveLiveBinding {
 				id: self.live_binding_identity(name)?,
 			}),
@@ -2467,6 +2517,17 @@ impl<'a> Analyzer<'a> {
 
 	fn alter(&self, target: &AlterTarget) -> FerrosGrynnResult<LogicalSchemaStatement> {
 		match target {
+			AlterTarget::Event {
+				if_exists,
+				name,
+				owner,
+				actions,
+			} => Ok(LogicalSchemaStatement::Event(crate::gql::ir::LogicalEventStatement::Alter {
+				if_exists: *if_exists,
+				name: name.value.clone(),
+				owner: event::event_owner(owner),
+				actions: self.event_changes(actions)?,
+			})),
 			AlterTarget::LiveLet {
 				name,
 				value,
@@ -2741,6 +2802,9 @@ impl<'a> Analyzer<'a> {
 				));
 			}
 			InfoTarget::Class(name) => LogicalSchemaStatement::InfoClass {
+				name: name.value.clone(),
+			},
+			InfoTarget::Graph(name) => LogicalSchemaStatement::InfoGraph {
 				name: name.value.clone(),
 			},
 			InfoTarget::Index {
@@ -3973,6 +4037,11 @@ impl<'a> Analyzer<'a> {
 				.result
 				.clone();
 			return Ok(LogicalSelect {
+				return_graph: statement
+					.return_graph
+					.as_deref()
+					.map(|graph| self.select_return_graph(graph, &result, span))
+					.transpose()?,
 				union_inputs: inputs,
 				union_purpose: crate::syn::SelectUnionPurpose::IndependentOutputs,
 				lexical_id: statement.lexical_id,
@@ -4343,6 +4412,11 @@ impl<'a> Analyzer<'a> {
 			Vec::new()
 		};
 		Ok(LogicalSelect {
+			return_graph: statement
+				.return_graph
+				.as_deref()
+				.map(|graph| self.select_return_graph(graph, &result, span))
+				.transpose()?,
 			union_inputs: Vec::new(),
 			union_purpose: crate::syn::SelectUnionPurpose::IndependentOutputs,
 			lexical_id: statement.lexical_id,
@@ -4950,7 +5024,7 @@ impl<'a> Analyzer<'a> {
 			}
 			SelectSourceKind::Derived(select) => {
 				let select = self.select_with_outer(select, source.span, None)?;
-				let schema = select.result.clone();
+				let schema = select.output_schema();
 				(
 					LogicalSelectSourceKind::Derived(Box::new(select)),
 					schema.clone(),
@@ -7902,6 +7976,14 @@ fn collect_expr_names(expr: &Expr, names: &mut BTreeMap<Box<str>, TextSpan>) {
 					expr,
 					..
 				} = item
+				{
+					collect_expr_names(expr, names);
+				}
+			}
+			if let Some(graph) = &select.return_graph {
+				for expr in std::iter::once(&graph.nodes)
+					.chain(std::iter::once(&graph.edges))
+					.chain(graph.root.iter())
 				{
 					collect_expr_names(expr, names);
 				}

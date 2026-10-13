@@ -306,6 +306,15 @@ impl Parser<'_> {
 		&mut self,
 		context: &mut Stk,
 	) -> FerrosGrynnResult<DmlTarget> {
+		self.class_or_record_target_at(context, 0).await
+	}
+
+	/// Bare RELATE endpoints stop before binary connector punctuation.
+	pub(super) async fn class_or_record_target_at(
+		&mut self,
+		context: &mut Stk,
+		minimum: u8,
+	) -> FerrosGrynnResult<DmlTarget> {
 		let class = self.identifier()?;
 		if self.at_symbol(Symbol::Colon)
 			&& !self.current().gap_before
@@ -326,7 +335,7 @@ impl Parser<'_> {
 					span: token.span,
 				}
 			} else {
-				context.run(|context| self.expression(context, 0, 1, 0)).await?
+				context.run(|context| self.expression(context, minimum, 1, 0)).await?
 			};
 			let span = cover(class.span, key.span);
 			Ok(DmlTarget::Record {

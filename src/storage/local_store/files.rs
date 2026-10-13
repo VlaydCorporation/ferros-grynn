@@ -74,8 +74,10 @@ pub(super) fn create_file_images(
 			}
 			continue;
 		}
-		if image.entry.file_id.kind() == Some(DataFileKind::Changefeed)
-			&& image.page_numbers.get(1).is_some_and(|number| number.get() > 1)
+		if matches!(
+			image.entry.file_id.kind(),
+			Some(DataFileKind::Changefeed | DataFileKind::EventOutbox)
+		) && image.page_numbers.get(1).is_some_and(|number| number.get() > 1)
 		{
 			let file = DirectFile::open_read_write(&path)?;
 			let required = page_count(image)?;
@@ -92,8 +94,10 @@ pub(super) fn create_file_images(
 		file.resize_pages(page_count(image)?)?;
 		if install_home
 			|| write_unreachable_home
-				&& image.entry.file_id.kind() != Some(DataFileKind::Changefeed)
-		{
+				&& !matches!(
+					image.entry.file_id.kind(),
+					Some(DataFileKind::Changefeed | DataFileKind::EventOutbox)
+				) {
 			for (number, page) in image.page_numbers.iter().copied().zip(&image.pages) {
 				file.write_page(number, page)?;
 			}
@@ -121,7 +125,11 @@ pub(super) fn stage_file_images(
 		if import
 			&& !matches!(
 				image.entry.file_id.kind(),
-				Some(DataFileKind::SystemCatalog | DataFileKind::Changefeed)
+				Some(
+					DataFileKind::SystemCatalog
+						| DataFileKind::Changefeed
+						| DataFileKind::EventOutbox
+				)
 			) {
 			continue;
 		}

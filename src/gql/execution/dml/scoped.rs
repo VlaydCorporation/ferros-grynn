@@ -22,7 +22,7 @@ pub(super) fn apply_graph_update(
 	data: Option<&LogicalDmlData>,
 	schema: &ClassSchema,
 	candidate: &DmlCandidate,
-	slots: &[Value],
+	slots: &mut [Value],
 	source: &str,
 	dictionary: &PropertyDictionary,
 	control: &ExecutionControl,
@@ -33,9 +33,28 @@ pub(super) fn apply_graph_update(
 	let mut after = candidate.before.clone();
 	match data {
 		Some(LogicalDmlData::Reset(fields)) => {
+			transaction.declare_event_input(&candidate.record_id, Some(graph.id()))?;
+			for field in fields {
+				transaction.capture_event_input_field(
+					&candidate.record_id,
+					Some(graph.id()),
+					field.as_ref(),
+					&Value::None,
+				)?;
+			}
 			reset_effective_fields(fields, &candidate.base_properties, dictionary, &mut after);
 		}
-		data => apply_dml_data(data, &candidate.row, slots, source, &mut after, control)?,
+		data => apply_dml_data(
+			transaction,
+			&candidate.record_id,
+			Some(graph.id()),
+			data,
+			&candidate.row,
+			slots,
+			source,
+			&mut after,
+			control,
+		)?,
 	}
 	after.insert("id", Value::Record(Box::new(candidate.record_id.clone())));
 	if candidate.before.get(crate::datastore::LEVEL_PATH_PROPERTY)

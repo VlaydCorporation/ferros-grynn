@@ -46,6 +46,7 @@ pub(in crate::datastore::transaction) fn eligible(
 ) -> FerrosGrynnResult<bool> {
 	budget.admit(0, 1)?;
 	if !matches!(query.source(), LiveSource::Class(_) | LiveSource::Record(_))
+		|| query.graph_result().is_some()
 		|| !query.joins().is_empty()
 	{
 		return Ok(false);
@@ -335,7 +336,7 @@ impl Domain {
 			};
 			let key = atom.id();
 			if previous.is_some_and(|previous| previous >= key)
-				|| !super::super::changefeed_images::same_image(
+				|| !super::super::operation_image::same_image(
 					self.images.get(key).map(Arc::as_ref),
 					entry.before(),
 				) {

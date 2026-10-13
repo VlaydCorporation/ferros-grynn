@@ -44,7 +44,7 @@ impl Transaction {
 		attachment: GqlLiveAttachment,
 		cursor: LiveCursor,
 	) -> FerrosGrynnResult<()> {
-		self.prepare_live_control()?;
+		self.prepare_control()?;
 		let evidence = {
 			let _commit = self.store.inner.commit.lock();
 			self.store.inner.live_consumers.ack_evidence(attachment.key, &cursor)?

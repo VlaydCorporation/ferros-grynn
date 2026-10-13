@@ -85,6 +85,9 @@ impl Footprint {
 				}
 				(batch.events.len(), bytes)
 			}
+			LivePayload::Graph(batch) => {
+				(batch.delta().changes().len().max(1), batch.estimated_heap_bytes()?)
+			}
 			LivePayload::Gap(_) => (0, 512),
 			// Computed diagnostics have a separate checked 64-KiB capture cap.
 			LivePayload::Fault {
@@ -367,7 +370,9 @@ impl Queue {
 					gap,
 					..
 				} => gap.from,
-				LivePayload::Batch(_) => Some(entry.delivery.token().versionstamp()),
+				LivePayload::Batch(_) | LivePayload::Graph(_) => {
+					Some(entry.delivery.token().versionstamp())
+				}
 			}
 		});
 		let diagnostic = self.pending.iter().find_map(|entry| match entry.delivery.payload() {
@@ -425,7 +430,7 @@ fn merge_control(
 			gap,
 			..
 		} => Some(gap.clone()),
-		LivePayload::Batch(_) => None,
+		LivePayload::Batch(_) | LivePayload::Graph(_) => None,
 	};
 	let before = gap(previous.payload())
 		.ok_or_else(|| FerrosGrynnError::invalid_argument("LIVE control expected"))?;

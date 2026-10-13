@@ -32,11 +32,16 @@
 - `buffer_pool` — прежний Clock-Pro, доступный только тестам и prototype-control;
 - `image_io` — staged/WAL/home resolution через production HybridReadEngine;
 - `wal` — codec, published state, writer/segments, recovery и checkpoint;
-- `catalog` — `FGFC v6` physical registry и bounded `FGDC v13` page-chain;
+- `catalog` — `FGFC v6` physical registry и bounded `FGDC v14` page-chain;
+  Stage29 source-only EVENT descriptors и `.feo` invocation segments сохраняются
+  в explicit codecs; pending corruption требует recovery error. `FGLG v1` owned
+  graph images и `FGLB v2` graph deltas не расширяют общий StorageValue codec.
+  Graph checkpoint reference включён в обычный LIVE ownership/reachability;
+  cold recovery сверяет family/validators с recipe и source watermark bounds.
 - `history_codec` — общий bounded historical Value codec для changefeed images
   и canonical LIVE descriptors; dictionaries не обращаются к current primary.
 - `live_descriptor` — versioned logical recipes, FGLD/FGLC validation; executable
-  IR и consumer queues не сериализуются. FGDC v13 хранит definitions/options/ACK.
+  IR и consumer queues не сериализуются. FGDC v14 хранит definitions/options/ACK.
   LIVE-query header — 160 bytes; checked capture owner имеет kind/reserved/id и
   optional successful String scope-name length/payload (UTF-8, cap 128 bytes).
   Options byte bit0 обозначает nonempty root RHS anchor tail после primary

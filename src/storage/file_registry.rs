@@ -231,7 +231,9 @@ impl FileRegistry {
 	pub(super) fn retirement_markers(&self) -> Vec<Weak<RegisteredDataFile>> {
 		self.files
 			.iter()
-			.filter(|((_, file), _)| file.kind() != Some(DataFileKind::Changefeed))
+			.filter(|((_, file), _)| {
+				!matches!(file.kind(), Some(DataFileKind::Changefeed | DataFileKind::EventOutbox))
+			})
 			.map(|(_, file)| Arc::downgrade(file))
 			.collect()
 	}

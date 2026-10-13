@@ -6,6 +6,10 @@ mod analyzer;
 mod catalog;
 /// Atom-class definitions.
 mod class;
+/// Durable class/graph event definitions and checked execution policies.
+mod event;
+/// Atomic event catalog installation and replay.
+mod event_catalog;
 /// Class field definitions.
 mod field;
 /// Graph-owned snapshot index definitions.
@@ -38,6 +42,7 @@ pub use catalog::{
 	SystemIndexKind,
 };
 pub use class::{ClassSchema, ClassSchemaMode};
+pub use event::{EventAsyncOptions, EventDefinition, EventExecution, EventId, EventTarget};
 pub use field::ClassField;
 pub use graph_index::{
 	GraphIndex,

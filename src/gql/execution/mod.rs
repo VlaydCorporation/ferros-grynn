@@ -10,6 +10,13 @@ mod collation;
 mod cursor;
 mod dml;
 mod eval;
+/// Source-only event compilation through the ordinary closure analyzer.
+mod event;
+#[allow(
+	clippy::redundant_pub_crate,
+	reason = "the GQL facade re-exports these functions to datastore dispatch"
+)]
+pub(crate) use event::{execute_event, execute_event_handler, validate_event_definition};
 mod explain;
 mod graph_properties;
 mod graph_result;
@@ -37,6 +44,7 @@ pub use adapter::{execute_transaction, execute_transaction_with_options};
 pub(in crate::gql) use cursor::{AtomFieldRead, RootFields};
 use dml::{execute_dml, execute_graph_dml};
 pub(in crate::gql) use eval::{invoke_logical_closure, invoke_root_logical_closure};
+pub(in crate::gql) use graph_result::GraphAssemblyAccumulator;
 use rust_decimal::Decimal;
 use schema::execute_schema;
 use select::execute_select;
@@ -307,7 +315,8 @@ fn execute_logical_statement<Read: QueryRead>(
 	}
 	let start = measure_elapsed.then(Instant::now);
 	let kind = logical_statement_kind(statement);
-	let mut runtime = ControlRuntime::default();
+	control.reset_loop_statement();
+	let mut runtime = ControlRuntime::new(control);
 	let result =
 		execute_statement(read, statement, slots, bindings, source, control, &mut runtime, 0, true)
 			.and_then(|flow| match flow {
@@ -355,7 +364,8 @@ pub(crate) fn execute_import_program(
 	for ((statement, timeout), payload) in logical.statements.iter().zip(timeouts).zip(payloads) {
 		let control = parent_control.checked_child(*timeout)?;
 		control.check()?;
-		let mut runtime = ControlRuntime::default();
+		control.reset_loop_statement();
+		let mut runtime = ControlRuntime::new(&control);
 		if let LogicalStatement::For {
 			slot,
 			iterable,
@@ -436,6 +446,7 @@ fn execute_import_statement(
 ) -> FerrosGrynnResult<()> {
 	let snapshot = transaction.query_snapshot()?;
 	let mut read = TransactionRead {
+		scalar_graph: None,
 		transaction,
 		snapshot,
 		metadata_only: false,
@@ -462,6 +473,7 @@ fn execute_import_block(
 ) -> FerrosGrynnResult<ControlFlow> {
 	let snapshot = transaction.query_snapshot()?;
 	let mut read = TransactionRead {
+		scalar_graph: None,
 		transaction,
 		snapshot,
 		metadata_only: false,
@@ -469,9 +481,18 @@ fn execute_import_block(
 	execute_block(&mut read, block, slots, bindings, source, control, runtime, 1)
 }
 
-#[derive(Default)]
 pub(in crate::gql::execution) struct ControlRuntime {
-	iterations: u64,
+	/// Invocation-local view of the control's shared loop gas authority.
+	budget: Arc<crate::gql::options::RuntimeBudget>,
+}
+
+impl ControlRuntime {
+	/// Pins shared gas without allocating another counter or resetting it.
+	pub(in crate::gql::execution) fn new(control: &ExecutionControl) -> Self {
+		Self {
+			budget: control.runtime_budget(),
+		}
+	}
 }
 
 enum ControlFlow {
@@ -819,9 +840,14 @@ fn eval_query_expression<Read: QueryRead>(
 	control: &ExecutionControl,
 	runtime: &mut ControlRuntime,
 ) -> FerrosGrynnResult<Value> {
-	eval_query_expression_current(read, expression, slots, source, control, runtime, None)
+	eval_query_expression_current(read, expression, slots, source, control, runtime, None, None)
 }
 
+/// Preserves a candidate row through transaction-aware expression recursion.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "one shared evaluator retains query, row, lexical and collection-filter context"
+)]
 fn eval_query_expression_current<Read: QueryRead>(
 	read: &mut Read,
 	expression: &TypedExpr,
@@ -830,18 +856,32 @@ fn eval_query_expression_current<Read: QueryRead>(
 	control: &ExecutionControl,
 	runtime: &mut ControlRuntime,
 	current: Option<&Value>,
+	row: Option<&Row>,
 ) -> FerrosGrynnResult<Value> {
 	if !query_expression_requires_read(expression) {
-		return eval_mut_current(expression, None, slots, source, None, current, Some(control));
+		let fields = cursor::RecordFields {
+			read,
+			snapshot: read.snapshot()?,
+			graph: read.scalar_graph(),
+		};
+		return eval_mut_current(
+			expression,
+			row,
+			slots,
+			source,
+			Some(&fields),
+			current,
+			Some(control),
+		);
 	}
 	match &expression.kind {
 		TypedExprKind::LiveSlot(_) => {
 			let fields = cursor::RecordFields {
 				read,
 				snapshot: read.snapshot()?,
-				graph: None,
+				graph: read.scalar_graph(),
 			};
-			eval_mut_current(expression, None, slots, source, Some(&fields), current, Some(control))
+			eval_mut_current(expression, row, slots, source, Some(&fields), current, Some(control))
 		}
 		TypedExprKind::Traversal(plan) => traversal::execute_traverse(
 			read,
@@ -857,7 +897,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			arguments,
 		} => {
 			let callee = eval_query_expression_current(
-				read, callee, slots, source, control, runtime, current,
+				read, callee, slots, source, control, runtime, current, row,
 			)?;
 			let Value::Closure(closure) = callee else {
 				return Err(FerrosGrynnError::invalid_argument(
@@ -867,7 +907,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			let mut values = Vec::with_capacity(arguments.len());
 			for argument in arguments {
 				values.push(eval_query_expression_current(
-					read, argument, slots, source, control, runtime, current,
+					read, argument, slots, source, control, runtime, current, row,
 				)?);
 			}
 			invoke_closure(
@@ -887,7 +927,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			let mut values = Vec::with_capacity(arguments.len());
 			for argument in arguments {
 				values.push(eval_query_expression_current(
-					read, argument, slots, source, control, runtime, current,
+					read, argument, slots, source, control, runtime, current, row,
 				)?);
 			}
 			let plan = control.resolve_named_function(*function)?;
@@ -905,22 +945,28 @@ fn eval_query_expression_current<Read: QueryRead>(
 		TypedExprKind::Array(values) => values
 			.iter()
 			.map(|value| {
-				eval_query_expression_current(read, value, slots, source, control, runtime, current)
+				eval_query_expression_current(
+					read, value, slots, source, control, runtime, current, row,
+				)
 			})
 			.collect::<FerrosGrynnResult<Array>>()
 			.map(Value::Array),
 		TypedExprKind::Set(values) => values
 			.iter()
 			.map(|value| {
-				eval_query_expression_current(read, value, slots, source, control, runtime, current)
+				eval_query_expression_current(
+					read, value, slots, source, control, runtime, current, row,
+				)
 			})
 			.collect::<FerrosGrynnResult<crate::values::Set>>()
 			.map(Value::Set),
 		TypedExprKind::Object(fields) => fields
 			.iter()
 			.map(|(name, value)| {
-				eval_query_expression_current(read, value, slots, source, control, runtime, current)
-					.map(|value| (name.as_ref(), value))
+				eval_query_expression_current(
+					read, value, slots, source, control, runtime, current, row,
+				)
+				.map(|value| (name.as_ref(), value))
 			})
 			.collect::<FerrosGrynnResult<Object>>()
 			.map(Value::Object),
@@ -930,7 +976,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			right,
 		} => {
 			let left_value = eval_query_expression_current(
-				read, left, slots, source, control, runtime, current,
+				read, left, slots, source, control, runtime, current, row,
 			)?;
 			match op {
 				BinaryOperator::And if !left_value.is_truthy() => Ok(Value::Bool(false)),
@@ -941,7 +987,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 				BinaryOperator::Elvis if left_value.is_truthy() => Ok(left_value),
 				_ => {
 					let right_value = eval_query_expression_current(
-						read, right, slots, source, control, runtime, current,
+						read, right, slots, source, control, runtime, current, row,
 					)?;
 					let materialized = TypedExpr {
 						kind: TypedExprKind::Binary {
@@ -954,7 +1000,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 					};
 					eval_mut_current(
 						&materialized,
-						None,
+						row,
 						slots,
 						source,
 						read.bounded_fields(),
@@ -970,16 +1016,16 @@ fn eval_query_expression_current<Read: QueryRead>(
 			else_value,
 		} => {
 			if eval_query_expression_current(
-				read, condition, slots, source, control, runtime, current,
+				read, condition, slots, source, control, runtime, current, row,
 			)?
 			.is_truthy()
 			{
 				eval_query_expression_current(
-					read, then_value, slots, source, control, runtime, current,
+					read, then_value, slots, source, control, runtime, current, row,
 				)
 			} else {
 				eval_query_expression_current(
-					read, else_value, slots, source, control, runtime, current,
+					read, else_value, slots, source, control, runtime, current, row,
 				)
 			}
 		}
@@ -992,25 +1038,27 @@ fn eval_query_expression_current<Read: QueryRead>(
 				.as_deref()
 				.map(|value| {
 					eval_query_expression_current(
-						read, value, slots, source, control, runtime, current,
+						read, value, slots, source, control, runtime, current, row,
 					)
 				})
 				.transpose()?;
 			for (condition, value) in branches {
 				let condition = eval_query_expression_current(
-					read, condition, slots, source, control, runtime, current,
+					read, condition, slots, source, control, runtime, current, row,
 				)?;
 				if operand
 					.as_ref()
 					.map_or_else(|| condition.is_truthy(), |operand| operand == &condition)
 				{
 					return eval_query_expression_current(
-						read, value, slots, source, control, runtime, current,
+						read, value, slots, source, control, runtime, current, row,
 					);
 				}
 			}
 			else_value.as_deref().map_or(Ok(Value::None), |value| {
-				eval_query_expression_current(read, value, slots, source, control, runtime, current)
+				eval_query_expression_current(
+					read, value, slots, source, control, runtime, current, row,
+				)
 			})
 		}
 		TypedExprKind::Filter {
@@ -1018,7 +1066,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			predicate,
 		} => {
 			let Value::Array(values) = eval_query_expression_current(
-				read, base, slots, source, control, runtime, current,
+				read, base, slots, source, control, runtime, current, row,
 			)?
 			else {
 				return Err(FerrosGrynnError::invalid_argument(
@@ -1035,6 +1083,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 					control,
 					runtime,
 					Some(&value),
+					row,
 				)?
 				.is_truthy()
 				{
@@ -1061,7 +1110,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 					materialized.push(argument.clone());
 				} else {
 					let value = eval_query_expression_current(
-						read, argument, slots, source, control, runtime, current,
+						read, argument, slots, source, control, runtime, current, row,
 					)?;
 					materialized.push(query_constant(argument, value));
 				}
@@ -1078,11 +1127,11 @@ fn eval_query_expression_current<Read: QueryRead>(
 				let fields = RecordFields {
 					read,
 					snapshot: read.snapshot()?,
-					graph: None,
+					graph: read.scalar_graph(),
 				};
 				return eval_mut_current(
 					&expression,
-					None,
+					row,
 					slots,
 					source,
 					Some(&fields),
@@ -1092,7 +1141,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			}
 			eval_mut_current(
 				&expression,
-				None,
+				row,
 				slots,
 				source,
 				read.bounded_fields(),
@@ -1109,7 +1158,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 				.as_deref()
 				.map(|value| {
 					eval_query_expression_current(
-						read, value, slots, source, control, runtime, current,
+						read, value, slots, source, control, runtime, current, row,
 					)
 					.map(|result| Box::new(query_constant(value, result)))
 				})
@@ -1118,7 +1167,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 				.as_deref()
 				.map(|value| {
 					eval_query_expression_current(
-						read, value, slots, source, control, runtime, current,
+						read, value, slots, source, control, runtime, current, row,
 					)
 					.map(|result| Box::new(query_constant(value, result)))
 				})
@@ -1134,7 +1183,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			};
 			eval_mut_current(
 				&expression,
-				None,
+				row,
 				slots,
 				source,
 				read.bounded_fields(),
@@ -1147,7 +1196,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			expr,
 		} => {
 			let value = eval_query_expression_current(
-				read, expr, slots, source, control, runtime, current,
+				read, expr, slots, source, control, runtime, current, row,
 			)?;
 			let expression = TypedExpr {
 				kind: TypedExprKind::Unary {
@@ -1159,7 +1208,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			};
 			eval_mut_current(
 				&expression,
-				None,
+				row,
 				slots,
 				source,
 				read.bounded_fields(),
@@ -1173,12 +1222,12 @@ fn eval_query_expression_current<Read: QueryRead>(
 			null_safe,
 		} => {
 			let value = eval_query_expression_current(
-				read, base, slots, source, control, runtime, current,
+				read, base, slots, source, control, runtime, current, row,
 			)?;
 			let fields = RecordFields {
 				read,
 				snapshot: read.snapshot()?,
-				graph: None,
+				graph: read.scalar_graph(),
 			};
 			let expression = TypedExpr {
 				kind: TypedExprKind::Field {
@@ -1189,22 +1238,14 @@ fn eval_query_expression_current<Read: QueryRead>(
 				ty: expression.ty.clone(),
 				span: expression.span,
 			};
-			eval_mut_current(
-				&expression,
-				None,
-				slots,
-				source,
-				Some(&fields),
-				current,
-				Some(control),
-			)
+			eval_mut_current(&expression, row, slots, source, Some(&fields), current, Some(control))
 		}
 		TypedExprKind::Destructure {
 			base,
 			fields,
 		} => {
 			let value = eval_query_expression_current(
-				read, base, slots, source, control, runtime, current,
+				read, base, slots, source, control, runtime, current, row,
 			)?;
 			let expression = TypedExpr {
 				kind: TypedExprKind::Destructure {
@@ -1216,7 +1257,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			};
 			eval_mut_current(
 				&expression,
-				None,
+				row,
 				slots,
 				source,
 				read.bounded_fields(),
@@ -1229,10 +1270,10 @@ fn eval_query_expression_current<Read: QueryRead>(
 			index,
 		} => {
 			let base_value = eval_query_expression_current(
-				read, base, slots, source, control, runtime, current,
+				read, base, slots, source, control, runtime, current, row,
 			)?;
 			let index_value = eval_query_expression_current(
-				read, index, slots, source, control, runtime, current,
+				read, index, slots, source, control, runtime, current, row,
 			)?;
 			let expression = TypedExpr {
 				kind: TypedExprKind::Index {
@@ -1244,7 +1285,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			};
 			eval_mut_current(
 				&expression,
-				None,
+				row,
 				slots,
 				source,
 				read.bounded_fields(),
@@ -1257,7 +1298,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			expr,
 		} => {
 			let value = eval_query_expression_current(
-				read, expr, slots, source, control, runtime, current,
+				read, expr, slots, source, control, runtime, current, row,
 			)?;
 			let expression = TypedExpr {
 				kind: TypedExprKind::Cast {
@@ -1269,7 +1310,7 @@ fn eval_query_expression_current<Read: QueryRead>(
 			};
 			eval_mut_current(
 				&expression,
-				None,
+				row,
 				slots,
 				source,
 				read.bounded_fields(),
@@ -1277,7 +1318,14 @@ fn eval_query_expression_current<Read: QueryRead>(
 				Some(control),
 			)
 		}
-		_ => eval_mut_current(expression, None, slots, source, None, current, Some(control)),
+		_ => {
+			let fields = cursor::RecordFields {
+				read,
+				snapshot: read.snapshot()?,
+				graph: read.scalar_graph(),
+			};
+			eval_mut_current(expression, row, slots, source, Some(&fields), current, Some(control))
+		}
 	}
 }
 
@@ -1319,12 +1367,11 @@ fn query_expression_requires_read(expression: &TypedExpr) -> bool {
 			start.as_deref().is_some_and(query_expression_requires_read)
 				|| end.as_deref().is_some_and(query_expression_requires_read)
 		}
+		TypedExprKind::Field {
+			..
+		} => true,
 		TypedExprKind::Unary {
 			expr,
-			..
-		}
-		| TypedExprKind::Field {
-			base: expr,
 			..
 		}
 		| TypedExprKind::Destructure {
@@ -1473,11 +1520,12 @@ pub(in crate::gql::execution) fn invoke_closure<Read: QueryRead>(
 	)
 }
 
+/// Runs one isolated closure frame through the common transaction-aware kernel.
 #[allow(
 	clippy::too_many_arguments,
 	reason = "named and closure calls share one transaction-aware evaluator"
 )]
-fn invoke_logical_closure_with_read<Read: QueryRead>(
+pub(in crate::gql::execution) fn invoke_logical_closure_with_read<Read: QueryRead>(
 	read: &mut Read,
 	plan: &LogicalClosure,
 	captures: &[(u32, Value)],
@@ -1584,14 +1632,7 @@ fn record_iteration(
 	runtime: &mut ControlRuntime,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<()> {
-	runtime.iterations = runtime.iterations.saturating_add(1);
-	if runtime.iterations > control.max_loop_iterations {
-		return Err(FerrosGrynnError::control_limit_exceeded(
-			"loop iterations",
-			control.max_loop_iterations,
-		));
-	}
-	Ok(())
+	runtime.budget.record_iteration(control.max_loop_iterations)
 }
 
 fn iterable_values(value: Value) -> FerrosGrynnResult<IterableValues> {
@@ -2294,32 +2335,14 @@ fn visit_match_with_environment<Read: QueryRead>(
 		);
 		while let Some(row) = cursor.next(control).map_err(execution_phase)? {
 			assembly.record_source_row();
-			assembly.add_nodes(eval(
-				&graph_plan.nodes,
-				Some(&row),
-				slots,
-				source,
-				Some(&fields),
-				Some(control),
-			)?)?;
-			assembly.add_edges(eval(
-				&graph_plan.edges,
-				Some(&row),
-				slots,
-				source,
-				Some(&fields),
-				Some(control),
-			)?)?;
-			if let Some(root) = &graph_plan.root {
-				assembly.add_root(eval(
-					root,
-					Some(&row),
-					slots,
-					source,
-					Some(&fields),
-					Some(control),
-				)?)?;
-			}
+			assembly.add_selectors(
+				Some(&graph_plan.nodes),
+				Some(&graph_plan.edges),
+				graph_plan.root.as_ref(),
+				|expression| {
+					eval(expression, Some(&row), slots, source, Some(&fields), Some(control))
+				},
+			)?;
 		}
 		let graph = assembly.finish(read, snapshot, graph_plan.contract)?;
 		invocation_control.as_ref().map_or(Ok(()), ExecutionControl::check)?;

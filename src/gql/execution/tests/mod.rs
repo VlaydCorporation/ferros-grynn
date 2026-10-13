@@ -1,6 +1,7 @@
 mod changefeed;
 mod control;
 mod dml;
+mod event;
 mod explain;
 mod graph_dml;
 mod graph_result;

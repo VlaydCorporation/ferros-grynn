@@ -1,8 +1,18 @@
-//! Exact `FGDC v12` logical model and codec.
+//! Exact `FGDC v14` logical model and codec.
 
 /// Retained source policies and database origin for durable resume.
 mod changefeed;
 mod codec;
+/// Versioned event definitions with bounded source descriptors.
+mod event;
+/// Authoritative explicit function source descriptor bytes.
+mod function;
+pub(in crate::storage) use codec::Decoder as SourceDecoder;
+pub(in crate::storage) use event::{decode as decode_event_source, encode as encode_event_source};
+pub(in crate::storage) use function::{
+	decode_source as decode_function_source,
+	encode_source as encode_function_source,
+};
 /// Checked graph-owned definition descriptors.
 mod graph_index;
 /// Checked references shared by source history and private LIVE history.
@@ -213,6 +223,11 @@ pub(in crate::storage) struct FunctionCatalogEntry {
 /// Canonical `FGDC v12` payload independent of physical catalog pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct DatabaseCatalog {
+	/// Authoritative ordered checkpoint/delta segments for accepted
+	/// invocations.
+	pub(in crate::storage) event_outbox_segments: Vec<crate::storage::HistorySegment>,
+	/// Published source-owned events in stable schema identity order.
+	pub(in crate::storage) events: Vec<crate::datastore::EventDefinition>,
 	/// Durable non-nil database origin.
 	pub(in crate::storage) database_uuid: uuid::Uuid,
 	/// Nondecreasing UTC publication time in epoch nanoseconds.
@@ -291,6 +306,8 @@ pub(in crate::storage) struct ChangefeedCatalogEntry {
 /// One restorable subscription incarnation in the same durable catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::storage) struct LiveCatalogEntry {
+	/// Query-owned graph checkpoint, independent of optional source capture.
+	pub(in crate::storage) graph_checkpoint: Option<crate::storage::HistorySegment>,
 	/// Stable incarnation retained independently of attached handles.
 	pub(in crate::storage) id: crate::live::LiveId,
 	/// Nonzero logical definition version.

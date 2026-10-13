@@ -43,6 +43,8 @@ pub struct SelectStatement {
 	pub limit: Option<Expr>,
 	pub start: Option<SelectStart>,
 	pub tempfiles: bool,
+	/// Cold graph selectors stay outside ordinary statement storage.
+	pub return_graph: Option<Box<ReturnGraph>>,
 }
 
 impl SelectStatement {
@@ -73,6 +75,7 @@ impl SelectStatement {
 			limit: None,
 			start: None,
 			tempfiles: false,
+			return_graph: None,
 		}
 	}
 }
@@ -397,6 +400,14 @@ impl Parser<'_> {
 			break;
 		}
 		let tempfiles = self.consume_keyword(keywords::TEMPFILES).is_some();
+		let return_graph =
+			if self.at_keyword(keywords::RETURN) && self.peek_keyword(1, keywords::GRAPH) {
+				self.tokens.next();
+				self.tokens.next();
+				Some(Box::new(context.run(|context| self.return_graph(context)).await?))
+			} else {
+				None
+			};
 		Ok(SelectStatement {
 			union_inputs: Vec::new(),
 			union_purpose: SelectUnionPurpose::IndependentOutputs,
@@ -416,6 +427,7 @@ impl Parser<'_> {
 			limit,
 			start,
 			tempfiles,
+			return_graph,
 		})
 	}
 

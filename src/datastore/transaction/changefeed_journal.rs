@@ -145,31 +145,6 @@ impl Transaction {
 		}
 	}
 
-	/// Groups a simple SDK call without adding a root/image savepoint.
-	pub(super) fn logical_operation<T>(
-		&mut self,
-		mutate: impl FnOnce(&mut Self) -> FerrosGrynnResult<T>,
-	) -> FerrosGrynnResult<T> {
-		let checkpoint = self.change_journal.checkpoint();
-		let spool = self.import_changefeed.checkpoint();
-		let owned = self.begin_change_operation();
-		let mutation_start = self.mutations.len();
-		match mutate(self) {
-			Ok(value) => {
-				if owned && mutation_start == self.mutations.len() {
-					self.mark_change_noops(checkpoint.intents);
-				}
-				self.finish_change_operation(owned);
-				Ok(value)
-			}
-			Err(error) => {
-				self.change_journal.restore(checkpoint);
-				self.import_changefeed.restore(spool);
-				Err(error)
-			}
-		}
-	}
-
 	/// Records an observed target before mutation or an equality early return.
 	pub(super) fn note_change_target(
 		&mut self,

@@ -600,6 +600,39 @@ pub(super) fn validate(catalog: &DatabaseCatalog) -> FerrosGrynnResult<()> {
 		}
 		previous_analyzer = Some(analyzer.id);
 	}
+	let mut previous_event = None;
+	let mut event_names = BTreeSet::new();
+	for event in &catalog.events {
+		let id = event.id().ok_or_else(|| invalid("published EVENT has no identity"))?;
+		insert_schema(&mut schema_ids, id.into(), catalog.next_schema_id)?;
+		let owner_exists = match event.target() {
+			crate::datastore::EventTarget::Class(class) => class_ids.contains(&class),
+			crate::datastore::EventTarget::Graph(graph) => graph_ids.contains(&graph),
+		};
+		if !owner_exists
+			|| event.published_at == 0
+			|| previous_event.is_some_and(|previous| previous >= id)
+			|| !event_names.insert((event.target(), event.name().as_str()))
+		{
+			return Err(invalid("EVENT source, identity, name or ordering is invalid"));
+		}
+		previous_event = Some(id);
+	}
+	let mut previous_outbox = None;
+	for segment in &catalog.event_outbox_segments {
+		let header = segment.header;
+		header.validate()?;
+		if segment.file.kind() != Some(DataFileKind::EventOutbox)
+			|| segment.file.instance_id() == 0
+			|| header.database != catalog.database_uuid
+			|| header.owner != crate::storage::HistoryOwner::EventOutbox(catalog.database_uuid)
+			|| previous_outbox
+				.is_some_and(|(stamp, file)| stamp >= header.first_stamp || file >= segment.file)
+		{
+			return Err(invalid("EVENT outbox segment identity, owner or order is invalid"));
+		}
+		previous_outbox = Some((header.last_stamp, segment.file));
+	}
 	Ok(())
 }
 

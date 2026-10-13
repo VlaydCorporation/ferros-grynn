@@ -220,7 +220,7 @@ fn live_composite_history_rejects_noncanonical_shapes() -> FerrosGrynnResult<()>
 fn live_history_header_golden_and_exact_none() -> FerrosGrynnResult<()> {
 	let original = batch()?;
 	let encoded = bytes(&original)?;
-	assert_eq!(&encoded[..8], b"FGLB\x01\x00\x00\x00");
+	assert_eq!(&encoded[..8], b"FGLB\x02\x00\x00\x00");
 	assert_eq!(&encoded[8..24], &[0x11; 16]);
 	assert_eq!(&encoded[24..32], &7_u64.to_le_bytes());
 	assert_eq!(&encoded[32..40], &((1_u64 << 53) + 17).to_le_bytes());

@@ -3,8 +3,11 @@
 Этот документ фиксирует graph family Ferros-Grynn, их структурные инварианты и допустимые
 преобразования. Языковой контракт операторов находится в
 [gql_spec.md](gql_spec.md) §3.9, §15–§17; способы хранения и materialization — в
-[gql_tech_spec.md](gql_tech_spec.md) §10–§11. Модель identity, membership и graph-local
-инстансинга утверждена этапом 8.1 в [rework_plan.md](rework_plan.md).
+[gql_tech_spec.md](gql_tech_spec.md) §10–§11. Глобальный атом имеет database-local RecordId
+и единственный CLASS; graph occurrence хранит независимые membership, topology и sparse
+overlay, не меняя base identity. Effective image определяется overlay Value/Hidden/absent
+поверх base properties. GraphRef/GraphId задают отдельную catalog identity, а AtomId является
+только materialization-local handle. Эти правила непосредственно раскрыты в §1.1.
 
 ## 1. Базовая модель
 

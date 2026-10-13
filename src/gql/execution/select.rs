@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use super::*;
 use crate::{
 	gql::{
-		cursor::{CursorAnchor, CursorPage, CursorRecord, IndexSeekCheckout, IndexSeekPlan},
+		cursor::{CursorAnchor, CursorRecord, IndexSeekCheckout, IndexSeekPlan},
 		ir::LogicalKnnDistance,
 		optimizer::fingerprint,
 		spill::{QuerySorter, SortField, SortedRecords, compare_record_anchor},
@@ -34,6 +34,7 @@ mod window_tests;
 use expression::*;
 use identity::JoinedSources;
 use join::*;
+pub(super) use pagination::check_select_cardinality;
 use pagination::*;
 use rows::*;
 use search::*;
@@ -61,6 +62,69 @@ pub(super) fn eval_row_expression<Read: QueryRead>(
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
 	eval_select_expr(read, snapshot, expression, row, None, slots, source, control)
+}
+
+/// Keeps source identity through the shared SELECT projection and FETCH path.
+pub(super) fn admit_graph_cursor_frame<Read: QueryRead>(
+	read: &Read,
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+) -> FerrosGrynnResult<()> {
+	admission::select_copy(read, plan, 0)?;
+	if let Some(fields) = read.bounded_fields() {
+		fields.admit(
+			source
+				.len()
+				.checked_add(
+					slots.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(|| {
+						FerrosGrynnError::operation_overflow("graph cursor slots")
+					})?,
+				)
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("graph cursor frame"))?,
+		)?;
+		for value in slots {
+			fields.admit_value(value)?;
+		}
+	}
+	Ok(())
+}
+
+/// Keeps source identity through the shared SELECT projection and FETCH path.
+#[allow(clippy::too_many_arguments, reason = "scope binding retains the SELECT invocation context")]
+pub(super) fn bind_terminal_graph_scope<'plan, Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &'plan LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+) -> FerrosGrynnResult<(Cow<'plan, LogicalSelect>, Option<GraphRef>)> {
+	let Some(reference) = plan.source.kind.graph_scope() else {
+		return Ok((Cow::Borrowed(plan), None));
+	};
+	let graph = resolve_graph_reference(read, snapshot, reference, outer, slots, source, control)?;
+	if matches!(reference, LogicalGraphReference::Static(_)) {
+		return Ok((Cow::Borrowed(plan), Some(graph)));
+	}
+	admission::select_copy(read, plan, 0)?;
+	if let Some(fields) = read.bounded_fields() {
+		fields.admit(
+			graph
+				.name()
+				.len()
+				.checked_add(std::mem::size_of::<GraphRef>())
+				.ok_or_else(|| FerrosGrynnError::operation_overflow("graph terminal scope copy"))?,
+		)?;
+	}
+	let mut bound = plan.clone();
+	let reference =
+		bound.source.kind.graph_scope_mut().ok_or_else(|| {
+			FerrosGrynnError::invalid_argument("graph terminal scope disappeared")
+		})?;
+	*reference = LogicalGraphReference::Static(graph.clone());
+	Ok((Cow::Owned(bound), Some(graph)))
 }
 
 /// Keeps source identity through the shared SELECT projection and FETCH path.
@@ -524,6 +588,65 @@ pub(super) fn execute_select<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<Value> {
+	if plan.return_graph.is_some() {
+		return graph_result::execute_select_graph(
+			read, snapshot, plan, slots, source, control, None, true,
+		);
+	}
+	execute_select_projected(read, snapshot, plan, slots, source, control)
+}
+
+/// Preserves ordinary retained-session pagination before terminal assembly.
+pub(super) fn execute_select_projected<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Value> {
+	let values = execute_select_projected_page(read, snapshot, plan, slots, source, control)?;
+	if plan.only {
+		return Ok(values.into_iter().next().unwrap_or(Value::None));
+	}
+	Ok(Value::Array(values.into_iter().collect()))
+}
+
+/// Exact pages use their original spool/index authority without fresh planning.
+pub(super) fn resume_retained_page(
+	control: &ExecutionControl,
+	cursor: crate::values::QueryCursor,
+	identity: (u64, u64),
+	page_size: usize,
+) -> FerrosGrynnResult<Vec<Value>> {
+	let runtime = control.cursors().ok_or_else(|| {
+		FerrosGrynnError::invalid_query_cursor("continuation requires a query session")
+	})?;
+	control.check()?;
+	let checkout = runtime.lock().checkout_index_seek(cursor, identity.0, identity.1)?;
+	if let Some(checkout) = checkout {
+		return resume_index_seek(runtime, checkout, page_size, control);
+	}
+	let page = runtime.lock().page(cursor, identity.0, identity.1, page_size)?;
+	if let Err(error) = control.check() {
+		control.discard_cursor(cursor);
+		return Err(error);
+	}
+	if let Some(cursor) = page.continuation {
+		control.set_continuation(cursor);
+	}
+	Ok(page.values)
+}
+
+/// Keeps an empty ONLY window distinct from a selected VALUE NONE row.
+pub(super) fn execute_select_projected_page<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Vec<Value>> {
 	let fields = RecordFields {
 		read,
 		snapshot,
@@ -577,26 +700,7 @@ pub(super) fn execute_select<Read: QueryRead>(
 				}
 			};
 			if !*read_committed {
-				let checkout =
-					runtime.lock().checkout_index_seek(cursor, fingerprint, order_fingerprint)?;
-				if let Some(checkout) = checkout {
-					resume_index_seek(runtime, checkout, page_size, control)?
-				} else {
-					let page =
-						runtime.lock().page(cursor, fingerprint, order_fingerprint, page_size)?;
-					if let Err(error) = control.check() {
-						control.discard_cursor(cursor);
-						return Err(error);
-					}
-					let CursorPage {
-						values,
-						continuation,
-					} = page;
-					if let Some(cursor) = continuation {
-						control.set_continuation(cursor);
-					}
-					values
-				}
+				resume_retained_page(control, cursor, (fingerprint, order_fingerprint), page_size)?
 			} else {
 				let anchor =
 					runtime.lock().read_committed_anchor(cursor, fingerprint, order_fingerprint)?;
@@ -714,9 +818,8 @@ pub(super) fn execute_select<Read: QueryRead>(
 	};
 	if plan.only {
 		check_select_cardinality(true, values.len())?;
-		return Ok(values.into_iter().next().unwrap_or(Value::None));
 	}
-	Ok(Value::Array(values.into_iter().collect()))
+	Ok(values)
 }
 
 #[allow(
@@ -774,6 +877,7 @@ fn resume_index_seek(
 		let snapshot = checkout.transaction.query_snapshot()?;
 		let snapshot_id = Snapshot(snapshot.commit_ts());
 		let read = TransactionRead {
+			scalar_graph: None,
 			transaction: &mut checkout.transaction,
 			snapshot,
 			metadata_only: false,
@@ -906,6 +1010,36 @@ fn execute_select_values<Read: QueryRead>(
 	reason = "SELECT pull execution retains the complete analyzed statement context"
 )]
 pub(super) fn visit_select_values<Read: QueryRead>(
+	read: &Read,
+	snapshot: Snapshot,
+	plan: &LogicalSelect,
+	slots: &[Value],
+	source: &str,
+	control: &ExecutionControl,
+	outer: Option<&Row>,
+	maximum: Option<usize>,
+	mut visit: impl FnMut(Value) -> FerrosGrynnResult<()>,
+) -> FerrosGrynnResult<usize> {
+	if plan.return_graph.is_some() {
+		if maximum == Some(0) {
+			return Ok(0);
+		}
+		visit(graph_result::execute_select_graph(
+			read, snapshot, plan, slots, source, control, outer, false,
+		)?)?;
+		return Ok(1);
+	}
+	visit_select_projected_values(
+		read, snapshot, plan, slots, source, control, outer, maximum, visit,
+	)
+}
+
+/// Visits ordinary projected rows before any terminal graph materialization.
+#[allow(
+	clippy::too_many_arguments,
+	reason = "the shared SELECT visitor retains the invocation context"
+)]
+pub(super) fn visit_select_projected_values<Read: QueryRead>(
 	read: &Read,
 	snapshot: Snapshot,
 	plan: &LogicalSelect,
@@ -2490,6 +2624,18 @@ fn derived_source_rows<Read: QueryRead>(
 	source: &str,
 	control: &ExecutionControl,
 ) -> FerrosGrynnResult<RowSet> {
+	if select.return_graph.is_some() {
+		let value = graph_result::execute_select_graph(
+			read, snapshot, select, slots, source, control, None, false,
+		)?;
+		let mut rows = RowCollector::new(read, control, false);
+		rows.push(
+			read,
+			snapshot,
+			Row::new(vec![value]).with_stable(Vec::new()).with_sequence(vec![0]),
+		)?;
+		return rows.finish();
+	}
 	let (select, physical) = prepare_physical_plan(read, snapshot, select, control)?;
 	let select = &select;
 	let output = execute_select_output(

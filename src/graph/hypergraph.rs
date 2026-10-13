@@ -267,6 +267,26 @@ impl Hypergraph<Mutable> {
 		}
 	}
 
+	/// Clones the COW layout while retaining identity, revision and dirty
+	/// metadata.
+	pub(crate) fn clone_preserving_state(&self) -> Self {
+		Self {
+			metadata: self.metadata.clone(),
+			storage: self.storage.clone(),
+			state: PhantomData,
+		}
+	}
+
+	/// Adopts an accepted remote watermark without creating a local edit.
+	pub(crate) fn adopt_external_revision(&mut self, revision: u64) {
+		self.metadata.adopt_external_revision(revision);
+	}
+
+	/// Clears local dirty metadata after accepting the remote base.
+	pub(crate) fn clear_live_dirty(&mut self) {
+		self.metadata.clear_dirty();
+	}
+
 	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let origin = self
 			.metadata
@@ -486,6 +506,10 @@ impl<State> GraphRead for Hypergraph<State> {
 
 	fn graph_ref(&self) -> Option<&super::GraphRef> {
 		self.metadata.graph_ref()
+	}
+
+	fn materialization_origin(&self) -> Option<&super::MaterializationOrigin> {
+		self.metadata.origin()
 	}
 }
 

@@ -6,10 +6,17 @@ mod changefeed;
 mod changefeed_reader;
 mod checkpoint;
 mod cleanup;
+/// Authoritative invocation payloads and lifecycle markers share the source
+/// WAL.
+mod event_outbox;
 mod files;
+/// Shared append-only whole-group page packing for logical side-formats.
+mod history_publication;
 mod image;
 mod index_delta;
 mod layout;
+/// Query-owned graph checkpoints use the same versioned LIVE history pages.
+mod live_graph;
 /// Exact computed result replay through shared pinned history transport.
 mod live_reader;
 mod open;
@@ -150,6 +157,14 @@ struct LocalState {
 	changefeed_segments: crate::storage::ChangefeedSegments,
 	/// Snapshot-exact ceilings for private computed results.
 	live_segments: crate::storage::LiveHistorySegments,
+	/// Preallocated query checkpoint references installed with the WAL commit.
+	live_graph_segments:
+		std::sync::Arc<BTreeMap<crate::live::LiveId, crate::storage::HistorySegment>>,
+	/// Last committed invocation image used to encode immutable-payload deltas.
+	event_outbox: std::sync::Arc<crate::datastore::EventOutbox>,
+	/// Ordered authoritative journal segments, shared with immutable MVCC
+	/// roots.
+	event_outbox_segments: std::sync::Arc<Vec<crate::storage::HistorySegment>>,
 	/// Physical pins shared by exact query snapshots and feed readers.
 	changefeed_files: changefeed::ChangefeedFiles,
 	bindings: GenerationBindings,
@@ -312,6 +327,9 @@ impl LocalStore {
 			_database_catalog: generation.database_catalog,
 			changefeed_segments: std::sync::Arc::clone(database.changefeed_segments()),
 			live_segments: std::sync::Arc::clone(database.live_segments()),
+			live_graph_segments: std::sync::Arc::clone(&database.live_catalog().graph_segments),
+			event_outbox: std::sync::Arc::clone(database.event_outbox()),
+			event_outbox_segments: std::sync::Arc::clone(database.event_outbox_segments()),
 			changefeed_files: std::sync::Arc::default(),
 			bindings: generation.bindings,
 			registry,
@@ -376,6 +394,7 @@ impl LocalStore {
 		cleanup_orphan_generations(root, &file_catalog)?;
 		cleanup_orphan_quarantines(root, &file_catalog)?;
 		cleanup_orphan_changefeeds(root, &file_catalog)?;
+		cleanup::cleanup_orphan_events(root, &file_catalog)?;
 		let physical_indexes = bind_physical_indexes(&database_catalog, &registry, None)?;
 		let changefeed_files = changefeed::bind_files(&file_catalog, &database_catalog, &registry)?;
 		let state = LocalState {
@@ -385,6 +404,9 @@ impl LocalStore {
 			_database_catalog: database_catalog,
 			changefeed_segments: std::sync::Arc::clone(database.changefeed_segments()),
 			live_segments: std::sync::Arc::clone(database.live_segments()),
+			live_graph_segments: std::sync::Arc::clone(&database.live_catalog().graph_segments),
+			event_outbox: std::sync::Arc::clone(database.event_outbox()),
+			event_outbox_segments: std::sync::Arc::clone(database.event_outbox_segments()),
 			changefeed_files,
 			bindings,
 			registry,
@@ -605,12 +627,17 @@ impl LocalStore {
 			.any(|entry| changefeed::fresh_live_groups(database, entry.id).next().is_some());
 		let refresh_files = capture
 			|| live_capture
+			|| !database.live_catalog().prepared_graphs.is_empty()
+			|| database.live_catalog().graph_segments != state.live_graph_segments
+			|| !std::sync::Arc::ptr_eq(database.event_outbox(), &state.event_outbox)
 			|| database.changefeed_segments() != &state.changefeed_segments
 			|| database.live_segments() != &state.live_segments;
 		let mut feed_files = Vec::new();
 		let mut file_catalog = None;
 		let mut segments = None;
 		let mut live_segments = None;
+		let mut live_graph_segments = None;
+		let mut event_segments = None;
 		if refresh_files {
 			let mut files = state.file_catalog.clone();
 			changefeed::prepare(
@@ -620,9 +647,19 @@ impl LocalStore {
 				&mut catalog,
 				&mut feed_files,
 			)?;
+			event_outbox::prepare(
+				database,
+				&state.event_outbox,
+				&state.file_catalog,
+				&mut files,
+				&mut catalog,
+				&mut feed_files,
+			)?;
 			image::append_catalog_pages(&mut feed_files, &files, &catalog)?;
 			segments = Some(catalog::decode_changefeed_segments(&catalog));
 			live_segments = Some(catalog::decode_live_segments(&catalog));
+			live_graph_segments = Some(catalog::decode_live_graph_segments(&catalog));
+			event_segments = Some(std::sync::Arc::new(catalog.event_outbox_segments.clone()));
 			file_catalog = Some(files);
 		}
 		let mut tx = self.wal.begin_tx()?;
@@ -660,6 +697,7 @@ impl LocalStore {
 		};
 		let feed_pins = match (&file_catalog, &registry) {
 			(Some(files), Some(registry)) => {
+				event_outbox::validate_files(files, &catalog, registry)?;
 				Some(changefeed::bind_files(files, &catalog, registry)?)
 			}
 			_ => None,
@@ -685,6 +723,13 @@ impl LocalStore {
 		if let Some(segments) = live_segments {
 			state.live_segments = segments;
 		}
+		if let Some(segments) = live_graph_segments {
+			state.live_graph_segments = segments;
+		}
+		if let Some(segments) = event_segments {
+			state.event_outbox_segments = segments;
+		}
+		state.event_outbox = std::sync::Arc::clone(database.event_outbox());
 		if let Some(registry) = registry {
 			state.registry = registry;
 		}
@@ -811,13 +856,30 @@ impl LocalStore {
 			&mut generation.database_catalog,
 			&mut generation.files,
 		)?;
+		event_outbox::prepare(
+			database,
+			&state.event_outbox,
+			&state.file_catalog,
+			&mut generation.file_catalog,
+			&mut generation.database_catalog,
+			&mut generation.files,
+		)?;
 		if !generation.database_catalog.changefeeds.is_empty()
 			|| !generation.database_catalog.live_history.is_empty()
+			|| generation
+				.database_catalog
+				.live_queries
+				.iter()
+				.any(|entry| entry.graph_checkpoint.is_some())
+			|| !generation.database_catalog.event_outbox_segments.is_empty()
 		{
 			generation.refresh_catalogs()?;
 		}
 		let segments = catalog::decode_changefeed_segments(&generation.database_catalog);
 		let live_segments = catalog::decode_live_segments(&generation.database_catalog);
+		let live_graph_segments = catalog::decode_live_graph_segments(&generation.database_catalog);
+		let event_segments =
+			std::sync::Arc::new(generation.database_catalog.event_outbox_segments.clone());
 		#[cfg(test)]
 		inject_generation_failure(GenerationFailurePoint::AfterBuild)?;
 		let mut pending_feeds =
@@ -844,6 +906,11 @@ impl LocalStore {
 			&changefeed::degradable(&generation.file_catalog),
 		)?;
 		let feed_pins = changefeed::bind_files(
+			&generation.file_catalog,
+			&generation.database_catalog,
+			&registry,
+		)?;
+		event_outbox::validate_files(
 			&generation.file_catalog,
 			&generation.database_catalog,
 			&registry,
@@ -892,6 +959,9 @@ impl LocalStore {
 		state._database_catalog = generation.database_catalog;
 		state.changefeed_segments = segments;
 		state.live_segments = live_segments;
+		state.live_graph_segments = live_graph_segments;
+		state.event_outbox_segments = event_segments;
+		state.event_outbox = std::sync::Arc::clone(database.event_outbox());
 		remember_feed_pins(&mut state);
 		state.changefeed_files = feed_pins;
 		state.retired_changefeeds.extend(retired_feeds);

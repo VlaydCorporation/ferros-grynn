@@ -320,8 +320,8 @@
     "semantic_hash": ""
   },
   "docs/gql_spec.md": {
-    "mtime": 1791507235.4065578,
-    "ast_hash": "37ceed8e6d8b717ce9af0b13e54bf0d4",
+    "mtime": 1791593670.382,
+    "ast_hash": "b15222e71a55c9170285626f28dd2bfe",
     "semantic_hash": ""
   },
   "docs/gql_tech_spec.md": {
@@ -335,8 +335,8 @@
     "semantic_hash": ""
   },
   "docs/implementation_plan.md": {
-    "mtime": 1791579428.3390617,
-    "ast_hash": "8af09a4373b6e289a2c01a3e2d681a62",
+    "mtime": 1791593670.414,
+    "ast_hash": "578e6710338b581854e843ac679df58a",
     "semantic_hash": ""
   },
   "docs/values_plan.md": {
@@ -661,7 +661,7 @@
   },
   "crates/surrealdb/context7.json": {
     "mtime": 1784933295.4041705,
-    "ast_hash": "",
+    "ast_hash": "67acd68a0832e1dd3b2293bc711ba6d6",
     "semantic_hash": ""
   },
   "crates/surrealdb/fuzz/fuzz_targets/fuzz_executor.rs": {
@@ -8886,7 +8886,7 @@
   },
   "crates/surrealdb/surrealism/demo/fs/data/config.json": {
     "mtime": 1784933296.1412716,
-    "ast_hash": "",
+    "ast_hash": "d2f8f66a9197c873c9d19c49dc4a40bf",
     "semantic_hash": ""
   },
   "crates/surrealdb/surrealism/demo/src/lib.rs": {
@@ -10170,8 +10170,8 @@
     "semantic_hash": ""
   },
   "docs/full_plan.md": {
-    "mtime": 1791579428.336062,
-    "ast_hash": "534b7edc2061b37bb759620141fbc0ed",
+    "mtime": 1791588649.7815032,
+    "ast_hash": "907ee15b0eb79bd483f70092b9048cf7",
     "semantic_hash": ""
   },
   "crates/ferntree/img/black/logo.svg": {
@@ -10690,8 +10690,8 @@
     "semantic_hash": ""
   },
   "src/datastore/AGENTS.md": {
-    "mtime": 1791573646.2371695,
-    "ast_hash": "ff51dd2d49fc1003568988b8470b68b7",
+    "mtime": 1791580751.089399,
+    "ast_hash": "2b9bbf7c63a3b83c51214c3985a9073d",
     "semantic_hash": ""
   },
   "src/gql/AGENTS.md": {
@@ -12980,13 +12980,13 @@
     "semantic_hash": ""
   },
   "docs/gql_live_stage_28_plan.md": {
-    "mtime": 1791578553.4461887,
-    "ast_hash": "e78840878b24e0a197e80cacdaa58723",
+    "mtime": 1791593637.011,
+    "ast_hash": "7481687c9ad657056b2c4931ec786343",
     "semantic_hash": ""
   },
   "docs/reports/gql_live_stage_28_report.md": {
-    "mtime": 1791579428.3330448,
-    "ast_hash": "5358289482b0dfb682747e18c1265df6",
+    "mtime": 1791593578.18,
+    "ast_hash": "f36a04c83ac474233221a1965a22e15c",
     "semantic_hash": ""
   },
   "src/live/AGENTS.md": {

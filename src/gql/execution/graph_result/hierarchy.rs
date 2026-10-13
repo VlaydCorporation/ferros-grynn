@@ -558,22 +558,24 @@ fn build_graph<Read: QueryRead>(
 		Graph::<Mutable>::begin_query_materialization(graph_properties, nodes.len(), edges.len());
 	result.set_topology_constraints(source.topology_constraints());
 	let mut ids = BTreeMap::new();
+	let mut source_atoms = BTreeMap::new();
 	for source_id in nodes {
 		let node = source.node(source_id)?.ok_or_else(|| invalid("selected node is absent"))?;
 		let child = index
 			.links
 			.get(&(reference.id(), source_id))
-			.map(|link| {
-				built
-					.get(&link.child.id())
-					.map(|child| child.graph.clone())
-					.ok_or_else(|| invalid("assembled child graph is absent"))
-			})
+			.map(|link| clone_built_child(link.child.id(), built, memory, control))
 			.transpose()?;
 		if child.is_some() {
 			control.record_graph_scope_slots(1);
 		}
 		let record = node.record_id()?.into_owned();
+		reserve_accounted(
+			memory,
+			control,
+			record.estimated_heap_bytes().saturating_add(std::mem::size_of::<AtomRef>() + 128),
+		)?;
+		let source_atom = AtomRef::new(AtomKind::Node, record.clone());
 		let label = node.label_text()?.map(std::borrow::Cow::into_owned);
 		let properties = node.properties()?.into_owned();
 		reserve_accounted(
@@ -587,23 +589,25 @@ fn build_graph<Read: QueryRead>(
 		)?;
 		let target = result.materialize_query_node(record, label, properties, child)?;
 		ids.insert(source_id, target);
+		source_atoms.insert(target, source_atom);
 	}
 	for source_id in &edges {
 		let edge = source.edge(*source_id)?.ok_or_else(|| invalid("selected edge is absent"))?;
 		let child = index
 			.links
 			.get(&(reference.id(), *source_id))
-			.map(|link| {
-				built
-					.get(&link.child.id())
-					.map(|child| child.graph.clone())
-					.ok_or_else(|| invalid("assembled transition graph is absent"))
-			})
+			.map(|link| clone_built_child(link.child.id(), built, memory, control))
 			.transpose()?;
 		if child.is_some() {
 			control.record_graph_scope_slots(1);
 		}
 		let record = edge.record_id()?.into_owned();
+		reserve_accounted(
+			memory,
+			control,
+			record.estimated_heap_bytes().saturating_add(std::mem::size_of::<AtomRef>() + 128),
+		)?;
+		let source_atom = AtomRef::new(AtomKind::Edge, record.clone());
 		let label = edge.label_text()?.map(std::borrow::Cow::into_owned);
 		let properties = edge.properties()?.into_owned();
 		reserve_accounted(
@@ -617,6 +621,7 @@ fn build_graph<Read: QueryRead>(
 		)?;
 		let target = result.reserve_query_edge(record, label, properties, edge.weight(), child)?;
 		ids.insert(*source_id, target);
+		source_atoms.insert(target, source_atom);
 	}
 	for source_id in edges {
 		let edge = source.edge(source_id)?.ok_or_else(|| invalid("selected edge is absent"))?;
@@ -630,12 +635,51 @@ fn build_graph<Read: QueryRead>(
 			.ok_or_else(|| invalid("reserved edge mapping is absent"))?;
 		result.materialize_query_edge_topology(target, topology)?;
 	}
+	let graph_ref_bytes = source
+		.graph_ref()
+		.map_or(0, |reference| reference.name().len() + std::mem::size_of::<GraphRef>());
+	reserve_accounted(
+		memory,
+		control,
+		graph_ref_bytes
+			.saturating_add(std::mem::size_of::<crate::graph::MaterializationOrigin>())
+			.saturating_add(
+				std::mem::size_of::<BTreeMap<AtomId, AtomRef>>() + 2 * std::mem::size_of::<usize>(),
+			),
+	)?;
+	result.finish_query_materialization(&source, source_atoms);
 	ancestry.pop();
 	built.insert(reference.id(), BuiltGraph {
 		graph: result.freeze(),
 		ids,
 	});
 	Ok(())
+}
+
+/// Admits the copied metadata before cloning a child's shared COW layout/origin
+/// map.
+fn clone_built_child(
+	id: GraphId,
+	built: &BTreeMap<GraphId, BuiltGraph>,
+	memory: &mut BarrierAccount,
+	control: &ExecutionControl,
+) -> FerrosGrynnResult<Graph> {
+	let child = built.get(&id).ok_or_else(|| invalid("assembled child graph is absent"))?;
+	let graph_ref = child
+		.graph
+		.graph_ref()
+		.map_or(0, |reference| reference.name().len() + std::mem::size_of::<GraphRef>());
+	reserve_accounted(
+		memory,
+		control,
+		child
+			.graph
+			.properties()
+			.estimated_heap_bytes()
+			.saturating_add(graph_ref)
+			.saturating_add(std::mem::size_of::<Graph>()),
+	)?;
+	Ok(child.graph.clone())
 }
 
 fn remap_endpoint(

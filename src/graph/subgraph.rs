@@ -47,6 +47,24 @@ impl Subgraph<Mutable> {
 		}
 	}
 
+	/// Clones the COW layout while retaining identity, revision and dirty
+	/// metadata.
+	pub(crate) fn clone_preserving_state(&self) -> Self {
+		Self {
+			graph: self.graph.clone_preserving_state(),
+		}
+	}
+
+	/// Adopts an accepted remote watermark without creating a local edit.
+	pub(crate) fn adopt_external_revision(&mut self, revision: u64) {
+		self.graph.adopt_external_revision(revision);
+	}
+
+	/// Clears local dirty metadata after accepting the remote base.
+	pub(crate) fn clear_live_dirty(&mut self) {
+		self.graph.clear_live_dirty();
+	}
+
 	pub fn flush<GWB: GraphWriteBack<Self>>(&mut self, writer: &mut GWB) -> FerrosGrynnResult<()> {
 		let (origin, dirty) = self.graph.writeback_context()?;
 		writer.flush(self, &origin, &dirty)?;
@@ -186,6 +204,10 @@ impl<State> GraphRead for Subgraph<State> {
 
 	fn graph_ref(&self) -> Option<&super::GraphRef> {
 		self.graph.graph_ref()
+	}
+
+	fn materialization_origin(&self) -> Option<&super::MaterializationOrigin> {
+		self.graph.materialization_origin()
 	}
 }
 

@@ -109,6 +109,19 @@ impl GraphOccurrence {
 		&self.state
 	}
 
+	/// Resolves the container binding for either node or edge owners.
+	pub(crate) const fn child_graph(&self) -> Option<GraphId> {
+		match &self.state {
+			OccurrenceState::Node {
+				nested_graph,
+			} => *nested_graph,
+			OccurrenceState::Edge {
+				transition_graph,
+				..
+			} => *transition_graph,
+		}
+	}
+
 	pub(crate) const fn has_overlay(&self) -> bool {
 		self.overlay.is_some()
 	}

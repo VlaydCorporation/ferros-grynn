@@ -24,6 +24,8 @@ pub enum HistoryOwner {
 	Changefeed(ChangefeedId),
 	/// Private already-computed subscription history.
 	Live(LiveId),
+	/// Transactional invocation journal owned by the durable database UUID.
+	EventOutbox(uuid::Uuid),
 }
 
 impl HistoryOwner {
@@ -32,6 +34,7 @@ impl HistoryOwner {
 		match self {
 			Self::Changefeed(_) => 0,
 			Self::Live(_) => 1,
+			Self::EventOutbox(_) => 2,
 		}
 	}
 
@@ -41,6 +44,7 @@ impl HistoryOwner {
 		match self {
 			Self::Changefeed(id) => *id.as_uuid().as_inner(),
 			Self::Live(id) => *id.as_uuid().as_inner(),
+			Self::EventOutbox(id) => id,
 		}
 	}
 
@@ -49,6 +53,7 @@ impl HistoryOwner {
 		match tag {
 			0 => Ok(Self::Changefeed(ChangefeedId::from_uuid(identity.into())?)),
 			1 => Ok(Self::Live(LiveId::from_uuid(identity.into())?)),
+			2 if !identity.is_nil() => Ok(Self::EventOutbox(identity)),
 			_ => Err(invalid("history segment owner tag is unknown")),
 		}
 	}
@@ -532,7 +537,10 @@ mod tests {
 		let identity = uuid::Uuid::from_u128(2);
 		let source = HistoryOwner::Changefeed(ChangefeedId::from_uuid(identity.into())?);
 		let live = HistoryOwner::Live(crate::live::LiveId::from_uuid(identity.into())?);
+		let events = HistoryOwner::EventOutbox(identity);
 		assert_ne!(source, live);
+		assert_ne!(source, events);
+		assert_ne!(live, events);
 		let header = SegmentHeader {
 			database: uuid::Uuid::from_u128(1),
 			owner: live,
@@ -549,7 +557,16 @@ mod tests {
 		assert_eq!(page.as_bytes()[BODY + 6], 1);
 		assert_eq!(page.as_bytes()[BODY + 7], 0);
 		assert_eq!(decode_header(&page)?, header);
-		for tag in [2, u8::MAX] {
+		encode_header(
+			SegmentHeader {
+				owner: events,
+				..header
+			},
+			&mut page,
+		)?;
+		assert_eq!(page.as_bytes()[BODY + 6], 2);
+		assert_eq!(decode_header(&page)?.owner, events);
+		for tag in [3, u8::MAX] {
 			encode_header(header, &mut page)?;
 			page.as_bytes_mut()[BODY + 6] = tag;
 			page.seal()?;

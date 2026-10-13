@@ -1045,6 +1045,14 @@ fn_param      ::= ( ident | param ) ":" type
 
 ### 9.5. DEFINE EVENT
 
+EVENT определяется для CLASS либо GRAPH; OVERWRITE и IF NOT EXISTS являются
+взаимоисключающими definition modes. WHEN принимает expression только с read-only effects.
+THEN принимает обычное expression либо block с DML, UDF и control flow. External
+transaction control, IMPORT и administrative jobs внутри handler запрещены.
+Definitions сохраняют source/logical descriptor, stable target identity и SchemaVersion;
+executable IR не сериализуется. Sync исполняется в mutation transaction, ASYNC WHEN —
+также в ней, а принятый invocation — через durable outbox в новой transaction.
+
 ```ebnf
 define_event ::= "DEFINE" "EVENT" [ overwrite_or_ifne ] name
                  "ON" ( "CLASS" class_name | "GRAPH" name )
@@ -1053,7 +1061,13 @@ define_event ::= "DEFINE" "EVENT" [ overwrite_or_ifne ] name
                  "THEN" ( block | expr )
 ```
 
-`MAXDEPTH` ∈ [0, 16] (default 3). Контекст: `$event`, `$before`, `$after`, `$value`, `$input`.
+`RETRY` ∈ [0, 255] (default 0) задаёт дополнительные attempts; `MAXDEPTH` ∈ [0, 16]
+(default 3) — causal depth с root ASYNC depth 0. Retry не меняет identity/depth,
+ancestor limits сохраняются через sync/async переходы. Контекст: `$event`, `$before`,
+`$after`, `$value`, `$input`; GRAPH RELATE имеет null before/after и value с edge и
+qualified endpoint/owner routes. Equality no-op не запускает EVENT. ALTER EVENT actions
+определены в §9.10: ASYNC/DROP ASYNC, WHEN/THEN/COMMENT и их DROP clauses;
+ALTER/REMOVE не меняют уже принятые outbox invocations, которые отменяются KILL JOB.
 
 ### 9.6. DEFINE INDEX
 
@@ -1314,7 +1328,13 @@ live_output_projection ::= [ "ONLY" ] live_projection
 `LIVE SELECT` обычно связывается с идентификатором: `LET $id = LIVE SELECT ...`, где `$id` используется в `KILL`.
 Регистрация возвращает UUID; pull stream доступен через session/Rust handle.
 Обычные LET и execute parameters frozen; LIVE LET отслеживается по versioned identity.
-Cursor передаётся как Bytes. Нормативный контракт: [этап 28](gql_live_stage_28_plan.md).
+Cursor передаётся как Bytes и обозначает последний целиком подтверждённый commit.
+ACK LIVE проверяет database/query/version и выданный delivery token; duplicate ACK
+идемпотентен. Handle повторяет неподтверждённую delivery до ACK; durable ACK сохраняется
+до освобождения queue. KILL прекращает capture. Обычная регистрация начинается после
+своего commit без initial rows; SINCE требует доказанной history coverage всех inputs,
+её потеря даёт explicit GAP, неизвестные authoritative bounds — typed error.
+История хранит computed before/after и binding revisions, resume не читает current primary.
 LIVE ORDER допускает deterministic Name/expression keys; RAND отклоняется при
 registration. START поддерживает Offset; START AFTER требует отдельного retained
 session cursor contract и здесь отклоняется. ORDER определяет membership окна,

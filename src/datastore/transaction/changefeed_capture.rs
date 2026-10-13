@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use super::{
 	Mutation,
 	Transaction,
-	changefeed_images::{CaptureBudget, image, same_image},
 	commit::ReplayRemap,
+	operation_image::{CaptureBudget, image, same_image},
 };
 use crate::{
 	changefeed::{

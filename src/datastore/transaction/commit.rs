@@ -14,7 +14,7 @@ use crate::{
 		consts::EFFECTIVE_FANOUT_WRITE_BYTES,
 	},
 	gql_status::{FerrosGrynnError, FerrosGrynnResult},
-	graph::{AtomId, EdgeEndpoint, EdgeTopology, GraphId, remap_topology},
+	graph::{AtomId, EdgeEndpoint, EdgeTopology, GraphId, QualifiedAtomId, remap_topology},
 };
 
 /// Commit-local address translation for allocations made from an older
@@ -50,7 +50,43 @@ impl ReplayRemap {
 		}
 	}
 
-	fn topology(&self, graph: GraphId, topology: &EdgeTopology) -> FerrosGrynnResult<EdgeTopology> {
+	/// Builds the logical qualified topology used for exact mutation images.
+	fn topology(
+		&self,
+		root: &DatabaseRoot,
+		graph: GraphId,
+		topology: &EdgeTopology,
+	) -> FerrosGrynnResult<EdgeTopology> {
+		if topology.is_cross_level() {
+			return topology.try_map_endpoints(|endpoint| match endpoint {
+				EdgeEndpoint::Local(local) => Ok(EdgeEndpoint::Local(self.local(graph, *local))),
+				EdgeEndpoint::Nested(qualified) => {
+					if qualified.scope().len() > 64 {
+						return Err(FerrosGrynnError::invalid_argument(
+							"edge endpoint scope exceeds 64 levels",
+						));
+					}
+					let mut current = graph;
+					let mut scope = Vec::with_capacity(qualified.scope().len());
+					for owner in qualified.scope() {
+						let actual = self.local(current, *owner);
+						scope.push(actual);
+						current = root
+							.occurrence(current, actual)
+							.and_then(|owner| owner.child_graph())
+							.ok_or_else(|| {
+								FerrosGrynnError::invalid_storage_file(
+									"replayed qualified owner is absent or has no graph",
+								)
+							})?;
+					}
+					Ok(EdgeEndpoint::Nested(QualifiedAtomId::new(
+						scope,
+						self.local(current, qualified.atom()),
+					)?))
+				}
+			});
+		}
 		let ids = topology
 			.endpoints()
 			.filter_map(|endpoint| match endpoint {
@@ -64,6 +100,7 @@ impl ReplayRemap {
 
 	fn occurrence_state(
 		&self,
+		root: &DatabaseRoot,
 		graph: GraphId,
 		state: &super::OccurrenceState,
 	) -> FerrosGrynnResult<super::OccurrenceState> {
@@ -78,7 +115,7 @@ impl ReplayRemap {
 				weight,
 				transition_graph,
 			} => super::OccurrenceState::Edge {
-				topology: self.topology(graph, topology)?,
+				topology: self.topology(root, graph, topology)?,
 				weight: *weight,
 				transition_graph: *transition_graph,
 			},
@@ -100,6 +137,32 @@ struct PreparedCommit {
 		crate::datastore::IndexId,
 		crate::datastore::SchemaVersion,
 	)>,
+}
+
+/// Optional SDK feedback retains only the accepted graph, never a primary root.
+struct GraphFeedback {
+	/// Checked subscription incarnation requested by this commit.
+	target: Option<(crate::live::LiveId, crate::live::LiveVersion)>,
+	/// Exact checkpoint from the candidate which passed the durable barrier.
+	checkpoint: Option<Arc<crate::live::LiveGraphBatch>>,
+}
+
+impl GraphFeedback {
+	/// Copies the already admitted checkpoint before physical publication.
+	fn capture(&mut self, root: &DatabaseRoot) {
+		let Some((id, version)) = self.target else {
+			return;
+		};
+		self.checkpoint = root
+			.live_catalog()
+			.queries
+			.get(&id)
+			.filter(|definition| {
+				definition.version == version && definition.state == crate::live::LiveState::Active
+			})
+			.and_then(|_| root.live_catalog().graph_checkpoints.get(&id))
+			.cloned();
+	}
 }
 
 impl Transaction {
@@ -219,6 +282,33 @@ impl Transaction {
 		deadline: Option<Instant>,
 		check: &impl Fn() -> FerrosGrynnResult<()>,
 	) -> FerrosGrynnResult<CommitResult> {
+		self.commit_with_graph_feedback(deadline, check, &mut GraphFeedback {
+			target: None,
+			checkpoint: None,
+		})
+	}
+
+	/// Returns a source commit and its exact accepted graph checkpoint.
+	pub(crate) fn commit_live_graph(
+		self,
+		cursor: &crate::live::LiveCursor,
+	) -> FerrosGrynnResult<(CommitResult, Option<Arc<crate::live::LiveGraphBatch>>)> {
+		let mut feedback = GraphFeedback {
+			target: Some((cursor.live_id(), cursor.version())),
+			checkpoint: None,
+		};
+		let committed = self.commit_with_graph_feedback(None, &|| Ok(()), &mut feedback)?;
+		Ok((committed, feedback.checkpoint))
+	}
+
+	/// Ordinary and graph SDK commits share validation and publication
+	/// unchanged.
+	fn commit_with_graph_feedback(
+		self,
+		deadline: Option<Instant>,
+		check: &impl Fn() -> FerrosGrynnResult<()>,
+		feedback: &mut GraphFeedback,
+	) -> FerrosGrynnResult<CommitResult> {
 		check()?;
 		self.ensure_live()?;
 		// Only mutations or targeted intents can publish, including a FULL
@@ -226,12 +316,14 @@ impl Transaction {
 		let could_publish = !self.mutations.is_empty() || !self.change_journal.intents.is_empty();
 		let live_started = could_publish.then(Instant::now);
 		let store = self.store.clone();
+		let _notification = store.inner.live_consumers.notification();
 		if !could_publish {
 			check()?;
 			let _commit = store.inner.commit.lock();
 			let current = store.inner.current_root();
 			self.validate_commit_snapshot(&current)?;
 			check()?;
+			feedback.capture(&current);
 			return Ok(CommitResult {
 				transaction: self.id,
 				commit_ts: current.commit_ts,
@@ -295,7 +387,7 @@ impl Transaction {
 					store.inner.next_schema_id.load(Ordering::Relaxed),
 					store.inner.next_graph_id.load(Ordering::Relaxed),
 				);
-				return self.publish_commit_root(&current, prepared, Some(queues));
+				return self.publish_commit_root(&current, prepared, Some(queues), feedback);
 			}
 			let _commit = store.inner.commit.lock();
 			let current = store.inner.current_root();
@@ -312,6 +404,7 @@ impl Transaction {
 			self.validate_commit_snapshot(&current)?;
 			check()?;
 			if !writes {
+				feedback.capture(&current);
 				return Ok(CommitResult {
 					transaction: self.id,
 					commit_ts: current.commit_ts,
@@ -319,7 +412,7 @@ impl Transaction {
 			}
 			let prepared = self.prepare_commit_root(&current, None)?;
 			check()?;
-			return self.publish_commit_root(&current, prepared, None);
+			return self.publish_commit_root(&current, prepared, None, feedback);
 		}
 		Err(FerrosGrynnError::serialization_failure(
 			self.id,
@@ -344,6 +437,7 @@ impl Transaction {
 		current: &Arc<DatabaseRoot>,
 		prepared: PreparedCommit,
 		queues: Option<crate::datastore::live_queue::Reservations<'_>>,
+		feedback: &mut GraphFeedback,
 	) -> FerrosGrynnResult<CommitResult> {
 		let store = &self.store;
 		let PreparedCommit {
@@ -357,6 +451,11 @@ impl Transaction {
 		}
 		for key in &self.range_writes {
 			next.mark_version(*key, commit_ts);
+		}
+		if self.mutations.iter().any(|mutation| {
+			matches!(mutation, Mutation::EnqueueEvent(_) | Mutation::TransitionEvent { .. })
+		}) {
+			next.retain_event_revisions();
 		}
 		let graph_catalog_only = self.mutations.iter().all(|mutation| {
 			matches!(
@@ -374,6 +473,11 @@ impl Transaction {
 					| Mutation::ReplaceParameter(_)
 					| Mutation::RemoveParameter(_)
 					| Mutation::DefineFunction(_)
+					| Mutation::DefineEvent(_)
+					| Mutation::ReplaceEvent(_)
+					| Mutation::RemoveEvent(_)
+					| Mutation::EnqueueEvent(_)
+					| Mutation::TransitionEvent { .. }
 					| Mutation::ReplaceFunction(_)
 					| Mutation::RemoveFunction(_)
 					| Mutation::DefineAnalyzer(_)
@@ -395,6 +499,11 @@ impl Transaction {
 					| Mutation::ReplaceParameter(_)
 					| Mutation::RemoveParameter(_)
 					| Mutation::DefineFunction(_)
+					| Mutation::DefineEvent(_)
+					| Mutation::ReplaceEvent(_)
+					| Mutation::RemoveEvent(_)
+					| Mutation::EnqueueEvent(_)
+					| Mutation::TransitionEvent { .. }
 					| Mutation::ReplaceFunction(_)
 					| Mutation::RemoveFunction(_)
 					| Mutation::DefineAnalyzer(_)
@@ -411,6 +520,7 @@ impl Transaction {
 		});
 		let changed_records = self.index_delta_records(current, &next, &remap);
 		let delta_eligible = self.mutations.iter().all(mutation_allows_physical_index_delta);
+		feedback.capture(&next);
 		let mut published = Arc::new(next);
 		let next = Arc::get_mut(&mut published).ok_or_else(|| {
 			FerrosGrynnError::invalid_storage_file("unpublished commit root is shared")
@@ -423,6 +533,11 @@ impl Transaction {
 			dictionary_changed,
 		)?;
 		*store.inner.current.write() = published;
+		if self.mutations.iter().any(|mutation| {
+			matches!(mutation, Mutation::EnqueueEvent(_) | Mutation::TransitionEvent { .. })
+		}) {
+			store.inner.maintenance.wake_events();
+		}
 		if let Some(queues) = queues {
 			queues.publish();
 		}
@@ -463,7 +578,7 @@ impl Transaction {
 		// Primary and operation-image replay share one hydrated before-root.
 		// The published root may still hold only lazy statistics headers.
 		let mut before = current.as_ref().clone();
-		if !self.is_live_control_commit() {
+		if !self.is_control_commit() {
 			self.store.inner.hydrate_statistics(&mut before)?;
 		}
 		let mut next = before.clone();
@@ -494,9 +609,37 @@ impl Transaction {
 			self.validate_graph_family_in_root(validation_root.clone(), schema.reference())?;
 		}
 		drop(validation_root);
+		self.validate_pending_qualified_incidence(&next)?;
+		if self.mutations.iter().any(|mutation| {
+			matches!(
+				mutation,
+				Mutation::Detach { .. }
+					| Mutation::DeleteAtom { .. }
+					| Mutation::RemoveGraph(_)
+					| Mutation::ReplaceOccurrenceState { .. }
+					| Mutation::InstallBuiltGraphTree(_)
+			)
+		}) {
+			next.validate_all_qualified_incidence()?;
+			next.validate_preserved_qualified_incidence(&before, |graph, connector|
+				before.atom(connector.global_id()).is_some_and(|atom| self.has_qualified_anchor(graph, atom.record_id())) ||
+				self.mutations.iter().any(|mutation| matches!(mutation, Mutation::InstallBuiltGraphTree(tree) if tree.graph_ids().any(|built| built == graph))))?;
+		}
 		self.validate_full_noops(current, &next)?;
 		next.commit_ts = commit_ts;
 		next.advance_commit_time(jiff::Timestamp::now().as_nanosecond());
+		let event_time = next.committed_at_ns;
+		for mutation in &self.mutations {
+			let id = match mutation {
+				Mutation::EnqueueEvent(invocation) => invocation.id,
+				Mutation::TransitionEvent {
+					id,
+					..
+				} => *id,
+				_ => continue,
+			};
+			Arc::make_mut(next.event_outbox_mut()).stamp_time(id, commit_ts, event_time)?;
+		}
 		self.capture_changes(&before, &mut next, commit_ts)?;
 		if self.mutations.iter().any(|mutation| matches!(mutation, Mutation::RegisterLive(_))) {
 			for definition in next
@@ -523,10 +666,11 @@ impl Transaction {
 				self.query_scratch_root(),
 			)?;
 		}
-		if self.is_live_control_commit() {
+		if self.is_control_commit() {
 			let catalog = Arc::make_mut(next.live_catalog_mut());
 			catalog.prepared = Arc::default();
 			catalog.prepared_encoded = Arc::default();
+			catalog.prepared_graphs = Arc::default();
 			crate::datastore::live_history::prepare(&mut next)?;
 		} else {
 			let targets = self.registration_query_targets(&before, &next);
@@ -614,6 +758,25 @@ impl Transaction {
 
 	fn validate_against(&self, current: &DatabaseRoot) -> FerrosGrynnResult<()> {
 		self.validate_write_requirements(current)?;
+		if self.options.isolation == IsolationLevel::Serializable
+			&& (!current.schema.events.is_empty() || !self.snapshot.schema.events.is_empty())
+			&& (!self.change_journal.intents.is_empty()
+				|| self.mutations.iter().any(|mutation| {
+					matches!(
+						mutation,
+						Mutation::RemoveGraph(_)
+							| Mutation::RemoveClass(_)
+							| Mutation::InstallBuiltGraphTree(_)
+					)
+				}))
+			&& current.version(ConflictKey::EventCatalogRange)
+				!= self.snapshot.version(ConflictKey::EventCatalogRange)
+		{
+			return Err(FerrosGrynnError::serialization_failure(
+				self.id,
+				"EVENT definitions changed before source publication",
+			));
+		}
 		if self.options.isolation == IsolationLevel::Serializable
 			&& (!self.mutations.is_empty() || self.has_full_capture(current))
 		{
@@ -887,6 +1050,29 @@ impl Transaction {
 				Mutation::DefineFunction(function) => {
 					root.install_function(function.clone(), published_at)?;
 				}
+				Mutation::DefineEvent(event) => {
+					root.install_event(event.clone(), published_at)?;
+				}
+				Mutation::EnqueueEvent(invocation) => {
+					Arc::make_mut(root.event_outbox_mut())
+						.enqueue(Arc::clone(invocation), published_at)?;
+				}
+				Mutation::TransitionEvent {
+					id,
+					expected_attempts,
+					state,
+					due_at_ns,
+					diagnostic,
+				} => {
+					Arc::make_mut(root.event_outbox_mut()).transition(
+						*id,
+						*expected_attempts,
+						*state,
+						*due_at_ns,
+						diagnostic.clone(),
+						published_at,
+					)?;
+				}
 				Mutation::DefineAnalyzer(analyzer) => {
 					root.install_analyzer(analyzer.clone(), published_at)?;
 				}
@@ -901,6 +1087,9 @@ impl Transaction {
 				}
 				Mutation::ReplaceFunction(function) => {
 					root.replace_function(function.clone(), published_at)?;
+				}
+				Mutation::ReplaceEvent(event) => {
+					root.replace_event(event.clone(), published_at)?;
 				}
 				Mutation::ReplaceAnalyzer(analyzer) => {
 					root.replace_analyzer(analyzer.clone(), published_at)?;
@@ -919,6 +1108,9 @@ impl Transaction {
 				}
 				Mutation::RemoveFunction(function) => {
 					root.remove_function(*function, published_at)?;
+				}
+				Mutation::RemoveEvent(id) => {
+					root.remove_event(*id)?;
 				}
 				Mutation::RemoveAnalyzer(analyzer) => {
 					root.remove_analyzer(*analyzer)?;
@@ -996,7 +1188,7 @@ impl Transaction {
 					weight,
 					transition_graph,
 				} => {
-					let topology = remap.topology(*graph, topology)?;
+					let topology = remap.topology(root, *graph, topology)?;
 					if rebase_allocations {
 						let actual = root.attach_edge(
 							*graph,
@@ -1065,7 +1257,7 @@ impl Transaction {
 					root.replace_occurrence_state(
 						*graph,
 						remap.local(*graph, *local),
-						remap.occurrence_state(*graph, state)?,
+						remap.occurrence_state(root, *graph, state)?,
 					)?;
 				}
 			}
@@ -1096,7 +1288,9 @@ fn mutation_affects_explicit_indexes(mutation: &Mutation) -> bool {
 fn mutation_allows_physical_index_delta(mutation: &Mutation) -> bool {
 	matches!(
 		mutation,
-		Mutation::InternProperty { .. }
+		Mutation::EnqueueEvent(_)
+			| Mutation::TransitionEvent { .. }
+			| Mutation::InternProperty { .. }
 			| Mutation::ReplaceClass(_)
 			| Mutation::CreateAtom { .. }
 			| Mutation::SetBaseProperty { .. }

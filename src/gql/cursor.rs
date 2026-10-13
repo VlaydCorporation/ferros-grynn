@@ -1,6 +1,9 @@
 use std::{
 	collections::BTreeMap,
-	sync::atomic::{AtomicU64, Ordering},
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -18,6 +21,31 @@ use crate::{
 
 const MAX_CURSOR_SPOOLS: usize = 64;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Exact graph selectors and root stay with the existing bounded cursor spool.
+pub(in crate::gql) struct GraphCursorContext {
+	/// Pins the exact immutable root required by this graph cursor.
+	pub(in crate::gql) root: Arc<crate::datastore::DatabaseRoot>,
+	/// Retains the bound logical graph selectors for exact cursor resume.
+	pub(in crate::gql) plan: LogicalSelect,
+	/// Owns the evaluated frame used by the original graph cursor.
+	pub(in crate::gql) slots: Vec<Value>,
+	/// Retains original source text for checked cursor diagnostics.
+	pub(in crate::gql) source: String,
+	/// Stores recipe and ordering fingerprints of the original cursor.
+	pub(in crate::gql) template: (u64, u64),
+	/// Retains admission for the complete cursor frame until its spool closes.
+	pub(in crate::gql) account: BarrierAccount,
+}
+
+impl std::fmt::Debug for GraphCursorContext {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("GraphCursorContext")
+			.field("snapshot", &self.root.commit_ts)
+			.field("template", &self.template)
+			.finish_non_exhaustive()
+	}
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct CursorAnchor {
@@ -39,9 +67,12 @@ pub(crate) struct CursorPage {
 
 /// Immutable execution state retained for an index-ordered continuation.
 pub(in crate::gql) struct IndexSeekPlan {
+	/// Retains the bound logical graph selectors for exact cursor resume.
 	pub(in crate::gql) plan: LogicalSelect,
 	pub(in crate::gql) physical: PhysicalSelectPlan,
+	/// Owns the evaluated frame used by the original graph cursor.
 	pub(in crate::gql) slots: Vec<Value>,
+	/// Retains original source text for checked cursor diagnostics.
 	pub(in crate::gql) source: String,
 }
 
@@ -62,9 +93,12 @@ impl std::fmt::Debug for IndexSeekState {
 /// Temporarily checked-out exact snapshot while one keyset page is produced.
 pub(in crate::gql) struct IndexSeekCheckout {
 	pub(in crate::gql) transaction: Transaction,
+	/// Retains the bound logical graph selectors for exact cursor resume.
 	pub(in crate::gql) plan: LogicalSelect,
 	pub(in crate::gql) physical: PhysicalSelectPlan,
+	/// Owns the evaluated frame used by the original graph cursor.
 	pub(in crate::gql) slots: Vec<Value>,
+	/// Retains original source text for checked cursor diagnostics.
 	pub(in crate::gql) source: String,
 	pub(in crate::gql) anchor: CursorAnchor,
 	spool: u64,
@@ -74,6 +108,8 @@ pub(in crate::gql) struct IndexSeekCheckout {
 
 #[derive(Debug)]
 struct CursorSpool {
+	/// Pins the graph cursor frame for the lifetime of its existing spool.
+	graph: Option<Arc<GraphCursorContext>>,
 	rows: CursorRows,
 	created: Instant,
 	_snapshot: u64,
@@ -142,6 +178,7 @@ impl CursorRuntime {
 		let spool_id = self.allocate_id()?;
 		let cursor = QueryCursor::new(self.session, self.allocate_id()?);
 		self.spools.insert(spool_id, CursorSpool {
+			graph: None,
 			rows: CursorRows::Memory {
 				rows,
 				_account: account,
@@ -175,6 +212,7 @@ impl CursorRuntime {
 		let spool_id = self.allocate_id()?;
 		let cursor = QueryCursor::new(self.session, self.allocate_id()?);
 		self.spools.insert(spool_id, CursorSpool {
+			graph: None,
 			rows: CursorRows::Disk(rows),
 			created: Instant::now(),
 			_snapshot: snapshot,
@@ -204,6 +242,7 @@ impl CursorRuntime {
 		let spool_id = self.allocate_id()?;
 		let cursor = QueryCursor::new(self.session, self.allocate_id()?);
 		self.spools.insert(spool_id, CursorSpool {
+			graph: None,
 			rows: CursorRows::IndexSeek(IndexSeekState {
 				transaction: None,
 				plan,
@@ -249,6 +288,68 @@ impl CursorRuntime {
 		}
 		state.transaction = Some(transaction);
 		Ok(())
+	}
+
+	/// Shares the immutable graph frame across memory/disk/index pages.
+	pub(in crate::gql) fn attach_graph_context(
+		&mut self,
+		cursor: QueryCursor,
+		context: Arc<GraphCursorContext>,
+	) -> FerrosGrynnResult<()> {
+		self.validate_token(cursor)?;
+		let spool =
+			self.entries.get(&cursor.id()).map(|entry| entry.spool).ok_or_else(|| {
+				FerrosGrynnError::invalid_query_cursor("unknown graph continuation")
+			})?;
+		let state = self.spools.get_mut(&spool).ok_or_else(|| {
+			FerrosGrynnError::invalid_query_cursor("graph result spool is unavailable")
+		})?;
+		if state.graph.is_none() {
+			state.graph = Some(context);
+		}
+		Ok(())
+	}
+
+	/// Checks lifetime before lending original graph authority to an exact
+	/// page.
+	pub(in crate::gql) fn graph_context(
+		&mut self,
+		cursor: QueryCursor,
+	) -> FerrosGrynnResult<Option<Arc<GraphCursorContext>>> {
+		self.validate_token(cursor)?;
+		let spool = self
+			.entries
+			.get(&cursor.id())
+			.map(|entry| entry.spool)
+			.ok_or_else(|| FerrosGrynnError::invalid_query_cursor("unknown or closed token"))?;
+		if self
+			.spools
+			.get(&spool)
+			.is_some_and(|state| state.created.elapsed() > self.max_snapshot_age)
+		{
+			self.remove_spool(spool);
+			return Err(FerrosGrynnError::query_cursor_expired(self.max_snapshot_age.as_secs()));
+		}
+		Ok(self.spools.get(&spool).and_then(|state| state.graph.as_ref()).map(Arc::clone))
+	}
+
+	/// Graph templates are checked separately; page identity belongs to the
+	/// retained spool.
+	pub(in crate::gql) fn graph_page_fingerprints(
+		&mut self,
+		cursor: QueryCursor,
+	) -> FerrosGrynnResult<(u64, u64)> {
+		if self.graph_context(cursor)?.is_none() {
+			return Err(FerrosGrynnError::invalid_query_cursor(
+				"graph continuation has no retained frame",
+			));
+		}
+		let state = self
+			.entries
+			.get(&cursor.id())
+			.and_then(|entry| self.spools.get(&entry.spool))
+			.ok_or_else(|| FerrosGrynnError::invalid_query_cursor("graph spool is unavailable"))?;
+		Ok((state.fingerprint, state.order_fingerprint))
 	}
 
 	pub(in crate::gql) fn checkout_index_seek(

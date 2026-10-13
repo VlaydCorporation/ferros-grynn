@@ -25,6 +25,7 @@ pub(in crate::gql) use graph_result_plan::{
 	plan_build_graph,
 	plan_match_graph_result,
 	plan_return_graph,
+	plan_select_graph_result,
 	plan_traverse_graph_result,
 };
 pub(in crate::gql) use match_plan::{plan_match, plan_match_bound};

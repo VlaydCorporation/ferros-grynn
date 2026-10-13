@@ -40,8 +40,11 @@ const HEADER_BYTES: usize = 24;
 /// Comparison recipes and exact optional window expressions.
 mod window;
 
+mod graph_result;
 /// Checked ordered JOIN declarations reuse the source and expression codecs.
 mod join;
+/// Qualified captures share the existing owned historical value codec.
+mod owned_value;
 
 /// Restorable recipe before catalog identity/version and dependency resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +215,7 @@ fn encode_frame(
 	let dictionary = values::encode_dictionary(context, budget)?;
 	let mut output = Vec::new();
 	append(&mut output, b"FGLD", budget)?;
-	append(&mut output, &[1, 0, kind, 0], budget)?;
+	append(&mut output, &[2, 0, kind, 0], budget)?;
 	append(&mut output, &(dictionary.len() as u64).to_le_bytes(), budget)?;
 	append(&mut output, &(body.len() as u64).to_le_bytes(), budget)?;
 	append(&mut output, &dictionary, budget)?;
@@ -235,7 +238,7 @@ pub(in crate::storage) fn decode_bounded(
 ) -> FerrosGrynnResult<LiveDescriptor> {
 	checked_payload(bytes.len() as u64)?;
 	let mut decoder = Decoder::new(bytes);
-	if decoder.take(4)? != b"FGLD" || decoder.take(2)? != [1, 0] {
+	if decoder.take(4)? != b"FGLD" || decoder.take(2)? != [2, 0] {
 		return Err(invalid("LIVE descriptor magic/version is invalid"));
 	}
 	let kind = decoder.u8()?;
@@ -280,7 +283,7 @@ fn encode_value(
 	budget: &mut CodecBudget,
 	observe: Option<&dyn Fn(u64) -> FerrosGrynnResult<()>>,
 ) -> FerrosGrynnResult<()> {
-	let bytes = values::encode_observed(value, context, budget, observe)?;
+	let bytes = owned_value::encode(value, context, budget, observe)?;
 	append_blob(output, &bytes, budget)
 }
 
@@ -372,7 +375,7 @@ fn decode_parameters(
 		if name.is_empty() || previous.as_ref().is_some_and(|last| last >= &name) {
 			return Err(invalid("LIVE parameter names are not strictly ordered"));
 		}
-		let value = values::decode(decoder.blob()?, context, budget)?;
+		let value = owned_value::decode(decoder.blob()?, context, budget)?;
 		budget.admit(name.len())?;
 		previous = Some(name.clone());
 		parameters.insert(name, value);
@@ -554,7 +557,8 @@ fn encode_query(
 		}) | (u8::from(query.only) << 2)
 			| (u8::from(!query.split.is_empty()) << 3)
 			| (u8::from(query.alias.is_some()) << 4)
-			| (u8::from(!query.joins.is_empty()) << 5)],
+			| (u8::from(!query.joins.is_empty()) << 5)
+			| (u8::from(query.graph_result.is_some()) << 6)],
 		budget,
 	)?;
 	if !query.split.is_empty() {
@@ -572,6 +576,9 @@ fn encode_query(
 	}
 	if !query.joins.is_empty() {
 		join::encode(output, &query.joins, context, budget, work, depth)?;
+	}
+	if let Some(graph) = &query.graph_result {
+		graph_result::encode(output, graph, context, budget, work, depth)?;
 	}
 	Ok(())
 }
@@ -705,7 +712,7 @@ fn decode_query(
 	let fetch = decode_paths(decoder, budget, work, depth)?;
 	let parameters = decode_parameters(decoder, context, budget, work)?;
 	let flags = decoder.u8()?;
-	if flags & !63 != 0 {
+	if flags & !127 != 0 {
 		return Err(invalid("LIVE query flags contain reserved bits"));
 	}
 	let output = match flags & 3 {
@@ -750,7 +757,13 @@ fn decode_query(
 	} else {
 		Vec::new()
 	};
+	let graph_result = if flags & 64 != 0 {
+		Some(graph_result::decode(decoder, context, budget, work, depth)?)
+	} else {
+		None
+	};
 	Ok(LiveQuery {
+		graph_result,
 		source,
 		alias,
 		joins,
@@ -1136,7 +1149,7 @@ fn decode_expr(
 				value: Box::new(decode_expr(decoder, context, budget, work, depth + 1)?),
 			}
 		}
-		0 => LiveExpr::Literal(values::decode(decoder.blob()?, context, budget)?),
+		0 => LiveExpr::Literal(owned_value::decode(decoder.blob()?, context, budget)?),
 		1 => LiveExpr::Field(decode_path(decoder, budget, work)?),
 		2 => {
 			let name = values::text(decoder, budget)?;
@@ -1538,7 +1551,7 @@ mod tests {
 		));
 		let descriptor = LiveDescriptor::Query(query);
 		let bytes = encode(&descriptor, 1024 * 1024)?;
-		let mut golden = b"FGLD\x01\x00\x00\x00".to_vec();
+		let mut golden = b"FGLD\x02\x00\x00\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&27_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
@@ -2072,7 +2085,7 @@ mod tests {
 			),
 			parameters: Object::new(),
 		};
-		let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+		let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&51_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
@@ -2092,7 +2105,7 @@ mod tests {
 				parameters: Object::new(),
 			};
 			let bytes = encode(&descriptor, 1024 * 1024)?;
-			let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+			let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 			golden.extend_from_slice(&16_u64.to_le_bytes());
 			golden.extend_from_slice(&9_u64.to_le_bytes());
 			golden.extend_from_slice(&[0; 16]);
@@ -2144,7 +2157,7 @@ mod tests {
 				},
 				parameters: Object::new(),
 			};
-			let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+			let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 			golden.extend_from_slice(&16_u64.to_le_bytes());
 			golden.extend_from_slice(&20_u64.to_le_bytes());
 			golden.extend_from_slice(&[0; 16]);
@@ -2172,7 +2185,7 @@ mod tests {
 			},
 			parameters: Object::new(),
 		};
-		let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+		let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&20_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
@@ -2195,7 +2208,7 @@ mod tests {
 			},
 			parameters: Object::new(),
 		};
-		let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+		let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&25_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
@@ -2231,7 +2244,7 @@ mod tests {
 			]),
 			parameters: Object::new(),
 		};
-		let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+		let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&39_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
@@ -2273,7 +2286,7 @@ mod tests {
 			},
 			parameters: Object::new(),
 		};
-		let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+		let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&51_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
@@ -2336,7 +2349,7 @@ mod tests {
 			},
 			parameters: Object::new(),
 		};
-		let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+		let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&26_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);
@@ -2431,7 +2444,7 @@ mod tests {
 					.binary(operator, LiveExpr::Parameter("y".into())),
 				parameters: Object::new(),
 			};
-			let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+			let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 			golden.extend_from_slice(&16_u64.to_le_bytes());
 			golden.extend_from_slice(&26_u64.to_le_bytes());
 			golden.extend_from_slice(&[0; 16]);
@@ -2508,7 +2521,7 @@ mod tests {
 			body.extend_from_slice(&1_u64.to_le_bytes());
 			body.push(b'x');
 			body.extend_from_slice(&[0; 4]);
-			let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+			let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 			golden.extend_from_slice(&16_u64.to_le_bytes());
 			golden.extend_from_slice(&(body.len() as u64).to_le_bytes());
 			golden.extend_from_slice(&[0; 16]);
@@ -2572,7 +2585,7 @@ mod tests {
 			},
 			parameters: Object::new(),
 		};
-		let mut golden = b"FGLD\x01\x00\x01\x00".to_vec();
+		let mut golden = b"FGLD\x02\x00\x01\x00".to_vec();
 		golden.extend_from_slice(&16_u64.to_le_bytes());
 		golden.extend_from_slice(&26_u64.to_le_bytes());
 		golden.extend_from_slice(&[0; 16]);

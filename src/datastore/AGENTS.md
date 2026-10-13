@@ -74,6 +74,12 @@ indexes и schema одним storage snapshot.
   и exact latest values. DAG/descriptor traversal общий с storage validation в
   private `live::dependencies`; user evaluation идёт до commit mutex и проверяется
   повторно вместе с root/FCW/SSI перед existing WAL barrier.
+- Stage29 Events definitions принадлежат schema; dispatch/outbox/import spool —
+  transaction. Outbox и completion marker публикуются тем же root/WAL barrier.
+  `live_graph_flush` проверяет полный accepted source image, qualified mappings и
+  FCW requirements при любом isolation до mutation; удаление closure не удаляет
+  child source data. Exact graph feedback возвращается из commit candidate,
+  без нового primary-root lookup. SDK принимает его через ordered polling/ACK.
 - `live_observation` владеет constant-size process counters. Attempts/admitted
   reserve/work наблюдаются вне commit lock; successful publication/ACK — после
   backend barrier. Scalar summary собирается до очистки local RAM history и

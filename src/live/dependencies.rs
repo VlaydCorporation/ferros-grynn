@@ -389,6 +389,11 @@ fn visit_query(
 	for value in query.limit().into_iter().chain(query.start_offset()) {
 		visit_expression(value, depth + 1, dependencies, record_names, budget)?;
 	}
+	if let Some(graph) = query.graph_result() {
+		for expression in graph.expressions() {
+			visit_expression(expression, depth + 1, dependencies, record_names, budget)?;
+		}
+	}
 	match query.projection() {
 		LiveProjection::Records => {}
 		LiveProjection::Value(value) => {

@@ -7,6 +7,650 @@ use crate::{
 	values::{Object, PropertyKeyId, PropertyMap, RecordId, Value},
 };
 
+fn select_graph_fixture() -> (Datastore, Object) {
+	let store = Datastore::in_memory();
+	let mut seed = store.begin();
+	seed.define_class(ClassSchema::new("person", AtomKind::Node, []).unwrap()).unwrap();
+	seed.define_class(ClassSchema::new("link", AtomKind::Edge, []).unwrap()).unwrap();
+	let source = seed.define_graph("source", GraphKind::Graph).unwrap();
+	let left = "person:left".parse::<RecordId>().unwrap();
+	let right = "person:right".parse::<RecordId>().unwrap();
+	let edge = "link:edge".parse::<RecordId>().unwrap();
+	for record in [&left, &right, &edge] {
+		seed.create_atom(record.clone(), PropertyMap::new()).unwrap();
+	}
+	let left_id = seed.attach_node(source.id(), &left, None, None).unwrap();
+	let right_id = seed.attach_node(source.id(), &right, None, None).unwrap();
+	seed.attach_edge(
+		source.id(),
+		&edge,
+		None,
+		EdgeTopology::directed([left_id], [right_id]),
+		None,
+		None,
+	)
+	.unwrap();
+	seed.commit().unwrap();
+	let mut variables = Object::new();
+	variables.insert(
+		"edge",
+		crate::graph::AtomOccurrenceRef::new(
+			crate::graph::AtomRef::new(AtomKind::Edge, edge),
+			std::sync::Arc::new(source.clone()),
+		),
+	);
+	variables.insert(
+		"root",
+		crate::graph::AtomOccurrenceRef::new(
+			crate::graph::AtomRef::new(AtomKind::Node, left),
+			std::sync::Arc::new(source),
+		),
+	);
+	(store, variables)
+}
+
+#[test]
+fn select_terminal_graph_consumes_projected_window_group_and_join_rows() {
+	let (store, variables) = select_graph_fixture();
+	for (query, expected_nodes) in [
+		(
+			"SELECT id AS picked FROM person ORDER BY id LIMIT 1 RETURN GRAPH {nodes: picked, \
+			 edges: []}",
+			1,
+		),
+		(
+			"SELECT array::group(id) AS picked FROM person GROUP ALL RETURN GRAPH {nodes: picked, \
+			 edges: []}",
+			2,
+		),
+		(
+			"SELECT p.id AS left_id, q.id AS right_id FROM person AS p CROSS JOIN person AS q \
+			 WHERE p.id = person:left AND q.id = person:right RETURN GRAPH {nodes: [left_id, \
+			 right_id], edges: []}",
+			2,
+		),
+		("SELECT id AS picked FROM person LIMIT 0 RETURN GRAPH {nodes: picked, edges: []}", 0),
+	] {
+		let outcomes = store.execute(query, &variables).unwrap();
+		let value = outcomes[0].result.as_ref().unwrap().value();
+		let Value::Graph(graph) = value else {
+			panic!("expected SELECT graph result");
+		};
+		assert_eq!(graph.kind(), GraphKind::Subgraph, "{query}");
+		assert_eq!(graph.node_ids().unwrap().count(), expected_nodes, "{query}");
+		assert_eq!(graph.edge_ids().unwrap().count(), 0, "{query}");
+	}
+	let outcomes = store
+		.execute(
+			"SELECT ONLY id AS picked FROM person RETURN GRAPH {nodes: picked, edges: []}",
+			&variables,
+		)
+		.unwrap();
+	assert!(outcomes[0].result.is_err());
+}
+
+#[test]
+fn select_terminal_graph_uses_common_family_validators_and_endpoint_closure() {
+	let (store, variables) = select_graph_fixture();
+	for (annotation, expected_kind) in [
+		("", GraphKind::Subgraph),
+		("<GRAPH>", GraphKind::Graph),
+		("<FOREST>", GraphKind::Forest),
+		("<TREE>", GraphKind::Tree),
+		("<ROOTED_TREE> ROOT $root", GraphKind::RootedTree),
+		("<DAG>", GraphKind::Dag),
+		("<HYPER>", GraphKind::Hypergraph),
+		("<META>", GraphKind::Metagraph),
+	] {
+		let query = format!(
+			"SELECT $edge AS picked FROM person LIMIT 1 RETURN GRAPH {annotation} {{nodes: [], \
+			 edges: picked}}"
+		);
+		let outcomes = store.execute(&query, &variables).unwrap();
+		let Value::Graph(graph) = outcomes[0].result.as_ref().unwrap().value() else {
+			panic!("expected exact graph family");
+		};
+		assert_eq!(graph.kind(), expected_kind, "{query}");
+		assert_eq!(graph.node_ids().unwrap().count(), 2);
+		assert_eq!(graph.edge_ids().unwrap().count(), 1);
+	}
+	let outcomes = store
+		.execute(
+			"SELECT id AS picked FROM person WHERE id = person:left RETURN GRAPH <ROOTED_TREE> \
+			 ROOT person:right {nodes: picked, edges: []}",
+			&variables,
+		)
+		.unwrap();
+	assert!(outcomes[0].result.is_err());
+}
+
+#[test]
+fn terminal_select_graph_is_one_scalar_subquery_value() {
+	let (store, variables) = select_graph_fixture();
+	let outcomes = store
+		.execute(
+			"SELECT VALUE (SELECT p.id AS picked FROM person AS p RETURN GRAPH {nodes: picked, \
+			 edges: []}) FROM person:left",
+			&variables,
+		)
+		.unwrap();
+	let Value::Array(values) = outcomes[0].result.as_ref().unwrap().value() else {
+		panic!("expected outer SELECT array");
+	};
+	assert_eq!(values.len(), 1);
+	let Value::Graph(graph) = values.iter().next().unwrap() else {
+		panic!("expected one materialized graph value");
+	};
+	assert_eq!(graph.node_ids().unwrap().count(), 2);
+}
+
+#[test]
+fn explicit_root_none_or_unselected_record_is_rejected_by_shared_assembly() {
+	let (store, variables) = select_graph_fixture();
+	for root in ["NONE", "person:right"] {
+		let terminal = format!(
+			"SELECT id AS picked FROM person WHERE id = person:left RETURN GRAPH <ROOTED_TREE> \
+			 ROOT {root} {{nodes: picked, edges: []}}"
+		);
+		let outcomes = store.execute(&terminal, &variables).unwrap();
+		assert!(outcomes[0].result.is_err(), "{terminal}");
+		let build = format!(
+			"BUILD GRAPH <ROOTED_TREE> FROM (SELECT id AS picked FROM person WHERE id = \
+			 person:left) NODES picked ROOT {root}"
+		);
+		let outcomes = store.execute(&build, &variables).unwrap();
+		assert!(outcomes[0].result.is_err(), "{build}");
+	}
+}
+
+#[test]
+fn graph_terminal_derived_and_build_sources_expose_one_graph_value() {
+	let (store, variables) = select_graph_fixture();
+	let inner = "SELECT id AS picked, $edge AS connector FROM person LIMIT 1 RETURN GRAPH <GRAPH> \
+	             {nodes: picked, edges: connector}";
+	let outcomes =
+		store.execute(&format!("SELECT VALUE d.graph FROM ({inner}) AS d"), &variables).unwrap();
+	let Value::Array(values) = outcomes[0].result.as_ref().unwrap().value() else {
+		panic!("expected one derived row");
+	};
+	assert_eq!(values.len(), 1);
+	assert!(
+		matches!(values.iter().next(), Some(Value::Graph(graph)) if graph.node_count() == 2 && graph.edge_count() == 1)
+	);
+	let outcomes =
+		store.execute(&format!("BUILD GRAPH <GRAPH> FROM ({inner})"), &variables).unwrap();
+	assert!(
+		matches!(outcomes[0].result.as_ref().unwrap().value(), Value::Graph(graph) if graph.node_count() == 2 && graph.edge_count() == 1)
+	);
+	let invalid = "SELECT VALUE d.graph FROM (SELECT id AS picked FROM person WHERE id = \
+	               person:left RETURN GRAPH <ROOTED_TREE> ROOT person:right {nodes: picked, \
+	               edges: []}) AS d";
+	assert!(store.execute(invalid, &variables).unwrap()[0].result.is_err());
+}
+
+#[test]
+fn value_object_keeps_its_single_projected_column_for_graph_selectors() {
+	let (store, variables) = select_graph_fixture();
+	for query in [
+		"SELECT VALUE {node: id} AS picked FROM person RETURN GRAPH {nodes: picked.node, edges: \
+		 []}",
+		"BUILD GRAPH FROM (SELECT VALUE {node: id} AS picked FROM person) NODES picked.node",
+	] {
+		let outcomes = store.execute(query, &variables).unwrap();
+		assert!(
+			matches!(outcomes[0].result.as_ref().unwrap().value(), Value::Graph(graph) if graph.node_count() == 2),
+			"{query}"
+		);
+	}
+}
+
+#[test]
+fn terminal_graph_pages_use_the_retained_session_cursor() {
+	let (store, mut variables) = select_graph_fixture();
+	let mut third = store.begin();
+	third.create_atom("person:third".parse().unwrap(), PropertyMap::new()).unwrap();
+	third.commit().unwrap();
+	let mut session = store.session();
+	let first = session
+		.execute(
+			"SELECT id AS picked FROM person ORDER BY id LIMIT 1 RETURN GRAPH {nodes: picked, \
+			 edges: []}",
+			&variables,
+		)
+		.unwrap()
+		.remove(0);
+	let cursor = first.continuation.unwrap();
+	variables.insert("cursor", cursor);
+	let query = "SELECT id AS picked FROM person ORDER BY id LIMIT 1 START AFTER $cursor RETURN \
+	             GRAPH {nodes: picked, edges: []}";
+	let second = session.execute(query, &variables).unwrap().remove(0);
+	let replay = session.execute(query, &variables).unwrap().remove(0);
+	assert!(second.continuation.is_some());
+	let Value::Graph(first) = first.result.unwrap().into_parts().0 else {
+		panic!("expected first graph page");
+	};
+	let Value::Graph(second) = second.result.unwrap().into_parts().0 else {
+		panic!("expected second graph page");
+	};
+	let Value::Graph(replay) = replay.result.unwrap().into_parts().0 else {
+		panic!("expected replay graph page");
+	};
+	let records = |graph: &crate::graph::MaterializedGraph| {
+		graph
+			.node_ids()
+			.unwrap()
+			.map(|id| graph.node(id.unwrap()).unwrap().record_id().clone())
+			.collect::<Vec<_>>()
+	};
+	assert_ne!(records(&first), records(&second));
+	assert_eq!(records(&second), records(&replay));
+}
+
+#[test]
+fn explain_build_keeps_the_nested_select_graph_assembly() {
+	let (store, variables) = select_graph_fixture();
+	let outcomes = store
+		.execute(
+			"EXPLAIN FULL FORMAT JSON BUILD GRAPH <GRAPH> FROM (SELECT id AS picked FROM person \
+			 RETURN GRAPH <FOREST> {nodes: picked, edges: []})",
+			&variables,
+		)
+		.unwrap();
+	let Value::Object(explain) = outcomes[0].result.as_ref().unwrap().value() else {
+		panic!("expected explain object");
+	};
+	let Some(Value::Array(nodes)) = explain.get("nodes") else {
+		panic!("expected physical nodes");
+	};
+	assert_eq!(nodes.iter().filter(|node| matches!(node, Value::Object(node) if node.get("operator") == Some(&Value::from("GraphAssemble")))).count(), 2);
+}
+
+#[test]
+fn computed_primary_graph_scope_is_read_once_for_rows_and_assembly() {
+	use std::cell::Cell;
+
+	use crate::{
+		datastore::ConflictKey,
+		gql::{
+			ExecutionControl,
+			execution::{RootRead, cursor::QueryRead},
+			ir::LogicalStatement,
+		},
+	};
+	let (store, variables) = select_graph_fixture();
+	assert!(
+		store
+			.execute(
+				"DEFINE CLASS settings TYPE NODE SCHEMALESS; CREATE settings:scope SET name = \
+				 'source';",
+				&Object::new()
+			)
+			.unwrap()
+			.iter()
+			.all(|outcome| outcome.result.is_ok())
+	);
+	let root = store.inner.current_root();
+	let setting = "settings:scope".parse::<RecordId>().unwrap();
+	let reads = Cell::new(0);
+	let observe = |key| {
+		if let ConflictKey::BaseAtom(id) = key
+			&& root.atom(id).is_some_and(|atom| atom.record_id() == &setting)
+		{
+			reads.set(reads.get() + 1);
+		}
+	};
+	let work = |_amount| Ok(());
+	let control = ExecutionControl::new(&QueryExecutionOptions::default(), None);
+	let read = RootRead::new(&root, &control, &observe, &work, std::env::temp_dir());
+	let source = "SELECT id AS picked FROM person IN GRAPH settings:scope.name RETURN GRAPH \
+	              {nodes: picked, edges: []}";
+	let syntax = crate::gql::parse(source, crate::syn::ParserSettings::default()).unwrap();
+	let logical = crate::gql::analysis::analyze(&syntax, source, &read, &variables).unwrap();
+	let LogicalStatement::Select(plan) = &logical.statements[0] else {
+		panic!("expected terminal SELECT");
+	};
+	let slots = crate::gql::execution::initialize_slots(&logical, &variables);
+	let graph = crate::gql::execution::select::execute_select(
+		&read,
+		read.snapshot().unwrap(),
+		plan,
+		&slots,
+		source,
+		&control,
+	)
+	.unwrap();
+	assert!(matches!(graph, Value::Graph(graph) if graph.node_count() == 2));
+	assert_eq!(reads.get(), 1);
+}
+
+#[test]
+fn graph_terminal_only_distinguishes_empty_window_from_value_none() {
+	let (store, variables) = select_graph_fixture();
+	let empty = store
+		.execute(
+			"SELECT ONLY * FROM person WHERE false RETURN GRAPH {nodes: id, edges: []}",
+			&variables,
+		)
+		.unwrap();
+	assert!(
+		matches!(empty[0].result.as_ref().unwrap().value(), Value::Graph(graph) if graph.node_count() == 0)
+	);
+	let one = store
+		.execute(
+			"SELECT ONLY VALUE NONE AS picked FROM person:left RETURN GRAPH {nodes: $root, edges: \
+			 []}",
+			&variables,
+		)
+		.unwrap();
+	assert!(
+		matches!(one[0].result.as_ref().unwrap().value(), Value::Graph(graph) if graph.node_count() == 1)
+	);
+}
+
+#[test]
+fn partial_graph_assembly_retains_qualified_source_mapping() {
+	let (store, variables) = select_graph_fixture();
+	let outcomes = store
+		.execute(
+			"SELECT $edge AS picked FROM person LIMIT 1 RETURN GRAPH <GRAPH> {nodes: [], edges: \
+			 picked}",
+			&variables,
+		)
+		.unwrap();
+	let Value::Graph(graph) = outcomes[0].result.as_ref().unwrap().value() else {
+		panic!("expected graph result");
+	};
+	let crate::graph::MaterializedGraph::Graph(graph) = graph.as_ref() else {
+		panic!("expected general family");
+	};
+	let origin = graph.materialization_origin().unwrap();
+	let Value::AtomOccurrence(edge) = variables.get("edge").unwrap() else {
+		panic!("expected qualified edge input");
+	};
+	assert_eq!(origin.graph_ref().unwrap().id(), edge.graph().id());
+	for atom in graph.node_ids().unwrap().chain(graph.edge_ids().unwrap()) {
+		let atom = atom.unwrap();
+		assert_eq!(origin.source_atom(atom), GraphRead::atom_ref(graph, atom).unwrap().as_ref());
+	}
+	drop(store);
+	assert_eq!(graph.node_count(), 2);
+}
+
+#[test]
+fn embedded_graph_terminals_do_not_publish_an_inner_cursor() {
+	let (store, variables) = select_graph_fixture();
+	let mut session = store.session();
+	for query in [
+		"SELECT VALUE d.graph FROM (SELECT id AS picked FROM person ORDER BY id LIMIT 1 RETURN \
+		 GRAPH {nodes: picked, edges: []}) AS d",
+		"BUILD GRAPH FROM (SELECT id AS picked FROM person ORDER BY id LIMIT 1 RETURN GRAPH \
+		 {nodes: picked, edges: []})",
+	] {
+		let result = session.execute(query, &variables).unwrap().remove(0);
+		assert!(result.result.is_ok(), "{query}");
+		assert!(result.continuation.is_none(), "{query}");
+	}
+}
+
+#[test]
+fn exact_graph_continuations_use_the_original_root_for_memory_and_index_pages() {
+	for (indexed, read_committed) in [(false, false), (true, false), (false, true), (true, true)] {
+		let store = Datastore::in_memory();
+		assert!(
+			store
+				.execute(
+					"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD rank ON CLASS person \
+					 TYPE int; DEFINE FIELD mark ON CLASS person TYPE int; DEFINE INDEX by_rank \
+					 ON CLASS person FIELDS rank UNIQUE SCOPE BASE; CREATE person:a SET rank = 1, \
+					 mark = 11; CREATE person:b SET rank = 2, mark = 22; CREATE person:c SET rank \
+					 = 3, mark = 33;",
+					&Object::new()
+				)
+				.unwrap()
+				.iter()
+				.all(|outcome| outcome.result.is_ok())
+		);
+		let access = if indexed {
+			"WITH INDEX by_rank"
+		} else {
+			"WITH NOINDEX"
+		};
+		let prefix = format!(
+			"SELECT id AS picked FROM person {access} ORDER BY rank ASC NULLS FIRST LIMIT 1"
+		);
+		let mut session = store.session();
+		let first = session
+			.execute(&format!("{prefix} RETURN GRAPH {{nodes: picked, edges: []}}"), &Object::new())
+			.unwrap()
+			.remove(0);
+		let token = first.continuation.unwrap();
+		assert!(
+			store.execute("UPDATE person:b SET mark = 99;", &Object::new()).unwrap()[0]
+				.result
+				.is_ok()
+		);
+		if indexed && !read_committed {
+			assert!(
+				store.execute("REMOVE INDEX by_rank ON CLASS person;", &Object::new()).unwrap()[0]
+					.result
+					.is_ok()
+			);
+		}
+		let variables = Object::from_iter([("cursor", Value::from(token))]);
+		let mode = if read_committed {
+			"READ COMMITTED"
+		} else {
+			""
+		};
+		let second = session
+			.execute(
+				&format!(
+					"{prefix} START AFTER $cursor {mode} RETURN GRAPH {{nodes: picked, edges: []}}"
+				),
+				&variables,
+			)
+			.unwrap()
+			.remove(0);
+		let Value::Graph(graph) = second.result.unwrap().into_parts().0 else {
+			panic!("expected graph continuation");
+		};
+		let node = graph.node(graph.node_ids().unwrap().next().unwrap().unwrap()).unwrap();
+		assert_eq!(node.record_id().to_string(), "person:b");
+		let expected = if read_committed {
+			99
+		} else {
+			22
+		};
+		assert!(node.properties().iter().any(|(_key, value)| value == &Value::from(expected)));
+	}
+}
+
+#[test]
+fn exact_graph_continuation_keeps_the_original_selector_parameters() {
+	let (store, mut variables) = select_graph_fixture();
+	let mut third = store.begin();
+	third.create_atom("person:third".parse().unwrap(), PropertyMap::new()).unwrap();
+	third.commit().unwrap();
+	variables.insert("selection", variables.get("root").unwrap().clone());
+	let mut session = store.session();
+	let first = session
+		.execute(
+			"SELECT id AS picked FROM person ORDER BY id LIMIT 1 RETURN GRAPH {nodes: $selection, \
+			 edges: []}",
+			&variables,
+		)
+		.unwrap()
+		.remove(0);
+	variables.insert("cursor", first.continuation.unwrap());
+	let Value::AtomOccurrence(root) = variables.get("root").unwrap() else {
+		panic!("expected qualified root");
+	};
+	let other = crate::graph::AtomOccurrenceRef::new(
+		crate::graph::AtomRef::new(AtomKind::Node, "person:right".parse().unwrap()),
+		std::sync::Arc::new(root.graph().clone()),
+	);
+	variables.insert("selection", other);
+	let second = session
+		.execute(
+			"SELECT id AS picked FROM person ORDER BY id LIMIT 1 START AFTER $cursor RETURN GRAPH \
+			 {nodes: $selection, edges: []}",
+			&variables,
+		)
+		.unwrap()
+		.remove(0);
+	let Value::Graph(graph) = second.result.unwrap().into_parts().0 else {
+		panic!("expected exact graph page");
+	};
+	let node = graph.node(graph.node_ids().unwrap().next().unwrap().unwrap()).unwrap();
+	assert_eq!(node.record_id().to_string(), "person:left");
+}
+
+#[test]
+fn graph_cursor_capture_admits_unused_parameter_payload_before_retaining_it() {
+	let (store, mut variables) = select_graph_fixture();
+	let mut session = store.session();
+	let query = "SELECT id AS picked FROM person ORDER BY id LIMIT 1 RETURN GRAPH {nodes: picked, \
+	             edges: []}";
+	let options = QueryExecutionOptions {
+		barrier_memory_bytes: NonZeroUsize::new(64 * 1024).unwrap(),
+		..QueryExecutionOptions::default()
+	};
+	let first = session.execute_with_options(query, &variables, options.clone()).unwrap().remove(0);
+	assert!(first.result.is_ok());
+	session.close_cursor(&first.continuation.unwrap()).unwrap();
+	variables.insert("unused", Value::from("x".repeat(1024 * 1024)));
+	let rejected = session.execute_with_options(query, &variables, options).unwrap().remove(0);
+	assert!(rejected.result.is_err());
+	assert!(rejected.continuation.is_none());
+}
+
+#[test]
+fn exact_graph_cursor_closures_check_blocks_and_keep_lexical_captures() {
+	let (store, mut variables) = select_graph_fixture();
+	variables.insert("selection", variables.get("root").unwrap().clone());
+	variables.insert("other", variables.get("root").unwrap().clone());
+	let selector = "(|$dummy| { 0; RETURN $selection; })(0)";
+	let prefix = "SELECT id AS picked FROM person ORDER BY id LIMIT 1";
+	for predeclare_cursor in [false, true] {
+		let mut frame = variables.clone();
+		if predeclare_cursor {
+			frame.insert("cursor", Value::None);
+		}
+		let mut session = store.session();
+		let first = session
+			.execute(&format!("{prefix} RETURN GRAPH {{nodes: {selector}, edges: []}}"), &frame)
+			.unwrap()
+			.remove(0);
+		assert!(first.result.is_ok());
+		frame.insert("cursor", first.continuation.unwrap());
+		let changed = session
+			.execute(
+				&format!(
+					"{prefix} START AFTER $cursor RETURN GRAPH {{nodes: {}, edges: []}}",
+					selector.replace("$selection", "$other")
+				),
+				&frame,
+			)
+			.unwrap()
+			.remove(0);
+		assert!(changed.result.is_err());
+		let same = session
+			.execute(
+				&format!(
+					"{prefix} START AFTER $cursor RETURN GRAPH {{nodes: {selector}, edges: []}}"
+				),
+				&frame,
+			)
+			.unwrap()
+			.remove(0);
+		assert!(same.result.is_ok());
+	}
+}
+
+fn indexed_graph_cursor_store() -> Datastore {
+	let store = Datastore::in_memory();
+	let results = store
+		.execute(
+			"DEFINE CLASS person TYPE NODE SCHEMAFULL; DEFINE FIELD rank ON CLASS person TYPE \
+			 int; DEFINE INDEX by_rank ON CLASS person FIELDS rank UNIQUE SCOPE BASE; CREATE \
+			 person:a SET rank = 1; CREATE person:b SET rank = 2; CREATE person:c SET rank = 3;",
+			&Object::new(),
+		)
+		.unwrap();
+	assert!(results.iter().all(|result| result.result.is_ok()));
+	store
+}
+
+#[test]
+fn exact_graph_cursor_invalid_limit_retires_the_retained_frame() {
+	let store = indexed_graph_cursor_store();
+	let mut session = store.session();
+	let mut variables = Object::from_iter([("page", Value::from(1))]);
+	let prefix = "SELECT id AS picked FROM person WITH INDEX by_rank ORDER BY rank ASC NULLS \
+	              FIRST LIMIT $page";
+	let first = session
+		.execute(&format!("{prefix} RETURN GRAPH {{nodes: picked, edges: []}}"), &variables)
+		.unwrap()
+		.remove(0);
+	variables.insert("cursor", first.continuation.unwrap());
+	variables.insert("page", Value::from(-1));
+	let query = format!("{prefix} START AFTER $cursor RETURN GRAPH {{nodes: picked, edges: []}}");
+	assert!(session.execute(&query, &variables).unwrap()[0].result.is_err());
+	variables.insert("page", Value::from(1));
+	assert!(session.execute(&query, &variables).unwrap()[0].result.is_err());
+}
+
+#[test]
+fn graph_cursor_only_keeps_cardinality_and_has_no_retained_page() {
+	let store = indexed_graph_cursor_store();
+	let mut session = store.session();
+	let prefix =
+		"SELECT ONLY id AS picked FROM person WITH INDEX by_rank ORDER BY rank ASC NULLS FIRST";
+	let first = session
+		.execute(
+			&format!("{prefix} LIMIT 1 RETURN GRAPH {{nodes: picked, edges: []}}"),
+			&Object::new(),
+		)
+		.unwrap()
+		.remove(0);
+	assert!(first.result.is_ok());
+	assert!(first.continuation.is_none());
+	let next = session
+		.execute(
+			&format!("{prefix} LIMIT 2 RETURN GRAPH {{nodes: picked, edges: []}}"),
+			&Object::new(),
+		)
+		.unwrap()
+		.remove(0);
+	let error = next.result.unwrap_err();
+	assert!(matches!(
+		error.status().status(),
+		crate::gql_status::Status::SelectCardinalityViolation { .. }
+	));
+	let ordinary = prefix.replace("SELECT ONLY", "SELECT");
+	let page = session
+		.execute(
+			&format!("{ordinary} LIMIT 1 RETURN GRAPH {{nodes: picked, edges: []}}"),
+			&Object::new(),
+		)
+		.unwrap()
+		.remove(0);
+	let variables = Object::from_iter([("cursor", Value::from(page.continuation.unwrap()))]);
+	assert!(
+		session
+			.execute(
+				&format!(
+					"{prefix} LIMIT 2 START AFTER $cursor RETURN GRAPH {{nodes: picked, edges: \
+					 []}}"
+				),
+				&variables
+			)
+			.unwrap()[0]
+			.result
+			.is_err()
+	);
+}
+
 #[test]
 fn return_graph_is_owned_and_closes_selected_edge_endpoints() {
 	let store = Datastore::in_memory();
@@ -115,6 +759,10 @@ fn return_graph_preserves_one_shared_child_for_multiple_owners() {
 	assert_eq!(children.len(), 2);
 	assert_eq!(children[0].identity(), children[1].identity());
 	assert_eq!(children[0].node_ids().unwrap().count(), 1);
+	let local = children[0].node_ids().unwrap().next().unwrap().unwrap();
+	let first_mapping = children[0].materialization_origin().unwrap().source_atom(local).unwrap();
+	let second_mapping = children[1].materialization_origin().unwrap().source_atom(local).unwrap();
+	assert!(std::ptr::eq(first_mapping, second_mapping));
 
 	let mut variables = Object::new();
 	variables.insert("graph", Value::GraphRef(Box::new(root)));

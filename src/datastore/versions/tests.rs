@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
 	changefeed::ChangefeedSource,
-	datastore::{AnalyzerId, ClassId, FunctionId, GlobalAtomId, SchemaId},
+	datastore::{AnalyzerId, ClassId, EventId, FunctionId, GlobalAtomId, JobId, SchemaId},
 	graph::{AtomId, AtomKind, GraphId},
 	live::{LiveBindingId, LiveId},
 };
@@ -27,6 +27,10 @@ fn keys() -> FerrosGrynnResult<Vec<ConflictKey>> {
 		ConflictKey::FunctionCatalogRange,
 		ConflictKey::SchemaAnalyzer(AnalyzerId::from_storage(1)?),
 		ConflictKey::AnalyzerCatalogRange,
+		ConflictKey::SchemaEvent(EventId::from_storage(1)?),
+		ConflictKey::EventCatalogRange,
+		ConflictKey::EventInvocation(JobId::from_uuid(uuid::Uuid::from_u128(1).into())),
+		ConflictKey::EventOutboxRange,
 		ConflictKey::BaseAtom(global),
 		ConflictKey::BaseClassRange(class),
 		ConflictKey::GraphMembership(graph, global),
@@ -59,12 +63,16 @@ fn versions_match_all_conflict_namespaces_and_preserve_snapshots() -> FerrosGryn
 			assert_eq!(versions.get(key), oracle.get(key));
 			assert_eq!(previous.get(key), previous_oracle.get(key));
 		}
-		assert_eq!(
-			versions.primary.iter().chain(versions.live.iter()).collect::<Vec<_>>(),
-			oracle.iter().collect::<Vec<_>>()
-		);
-		assert_eq!(versions.live.len(), 3);
-		assert_eq!(versions.primary.len(), keys.len() - 3);
+		let combined = versions
+			.primary
+			.iter()
+			.chain(versions.controls.live.iter())
+			.chain(versions.controls.events.iter())
+			.collect::<BTreeMap<_, _>>();
+		assert_eq!(combined.into_iter().collect::<Vec<_>>(), oracle.iter().collect::<Vec<_>>());
+		assert_eq!(versions.controls.live.len(), 3);
+		assert_eq!(versions.controls.events.len(), 2);
+		assert_eq!(versions.primary.len(), keys.len() - 5);
 	}
 	Ok(())
 }
@@ -79,13 +87,19 @@ fn versions_copy_only_the_mutated_domain() -> FerrosGrynnResult<()> {
 	let mut control = original.clone();
 	control.insert(ConflictKey::LiveCatalogRange, 8);
 	assert!(Arc::ptr_eq(&control.primary, &original.primary));
-	assert!(!Arc::ptr_eq(&control.live, &original.live));
+	assert!(!Arc::ptr_eq(&control.controls, &original.controls));
+	assert!(Arc::ptr_eq(&control.controls.events, &original.controls.events));
 	assert_eq!(original.get(&ConflictKey::LiveCatalogRange), Some(&7));
 	let mut primary = original.clone();
 	primary.insert(ConflictKey::PropertyDictionary, 9);
-	assert!(Arc::ptr_eq(&primary.live, &original.live));
+	assert!(Arc::ptr_eq(&primary.controls, &original.controls));
 	assert!(!Arc::ptr_eq(&primary.primary, &original.primary));
 	assert_eq!(original.get(&ConflictKey::PropertyDictionary), Some(&7));
+	let mut event = original.clone();
+	event.insert(ConflictKey::EventOutboxRange, 10);
+	assert!(Arc::ptr_eq(&event.primary, &original.primary));
+	assert!(Arc::ptr_eq(&event.controls.live, &original.controls.live));
+	assert!(!Arc::ptr_eq(&event.controls.events, &original.controls.events));
 	assert!(!primary.same_primary(&original));
 	let mut independently_equal = VersionStore::default();
 	for key in keys()? {
@@ -93,7 +107,7 @@ fn versions_copy_only_the_mutated_domain() -> FerrosGrynnResult<()> {
 	}
 	assert!(!Arc::ptr_eq(&independently_equal.primary, &original.primary));
 	assert!(independently_equal.same_primary(&original));
-	assert!(independently_equal.same_live(&original));
+	assert!(independently_equal.same_controls(&original));
 	Ok(())
 }
 
@@ -114,7 +128,7 @@ fn versions_rebase_restamps_only_private_data_and_admits_both_trees() -> FerrosG
 	assert_eq!(candidate.get(&ConflictKey::PropertyDictionary), Some(&11));
 	assert_eq!(candidate.get(&ConflictKey::LiveCatalogRange), Some(&10));
 	assert_eq!(private_snapshot.get(&ConflictKey::PropertyDictionary), Some(&10));
-	assert!(Arc::ptr_eq(&candidate.live, &current.live));
+	assert!(Arc::ptr_eq(&candidate.controls, &current.controls));
 	assert!(!Arc::ptr_eq(&candidate.primary, &private_snapshot.primary));
 	let mut control_only = original.clone();
 	control_only.rebase(&current, 10, 11, false);
@@ -124,7 +138,54 @@ fn versions_rebase_restamps_only_private_data_and_admits_both_trees() -> FerrosG
 	assert_eq!(
 		original.allocation_bytes()?,
 		crate::values::storage::tree_allocation_bytes(original.primary.len(), width)?
-			+ crate::values::storage::tree_allocation_bytes(original.live.len(), width)?
+			+ crate::values::storage::tree_allocation_bytes(original.controls.live.len(), width)?
+			+ crate::values::storage::tree_allocation_bytes(original.controls.events.len(), width)?
 	);
+	Ok(())
+}
+
+#[test]
+fn versions_retire_only_unreachable_event_keys_and_keep_old_snapshots() -> FerrosGrynnResult<()> {
+	use crate::datastore::{
+		EventAsyncOptions,
+		EventCause,
+		EventDefinition,
+		EventExecution,
+		EventInvocation,
+		EventOutbox,
+		EventTarget,
+	};
+	let mut definition =
+		EventDefinition::new("a", EventTarget::Class(ClassId::from_storage(1)?), "true", "1")?
+			.with_execution(EventExecution::Async(EventAsyncOptions::default()));
+	definition.id = Some(EventId::from_storage(2)?);
+	let mut invocation = EventInvocation::queued(
+		&definition,
+		EventCause::next(None, definition.execution())?,
+		Arc::from([1_u8]),
+		5,
+	)?;
+	let kept = JobId::from_uuid(uuid::Uuid::from_u128(1).into());
+	invocation.id = kept;
+	let mut outbox = EventOutbox::default();
+	outbox.enqueue(Arc::new(invocation), 7)?;
+	let mut original = VersionStore::default();
+	for key in keys()? {
+		original.insert(key, 7);
+	}
+	for index in 2..=20_000_u128 {
+		original.insert(
+			ConflictKey::EventInvocation(JobId::from_uuid(uuid::Uuid::from_u128(index).into())),
+			7,
+		);
+	}
+	let mut current = original.clone();
+	current.retain_event_invocations(&outbox);
+	assert_eq!(current.controls.events.len(), 2);
+	assert_eq!(original.controls.events.len(), 20_001);
+	assert!(Arc::ptr_eq(&current.primary, &original.primary));
+	assert!(Arc::ptr_eq(&current.controls.live, &original.controls.live));
+	assert_eq!(current.get(&ConflictKey::EventInvocation(kept)), Some(&7));
+	assert!(current.event_copy_bytes(1)? < original.event_copy_bytes(1)?);
 	Ok(())
 }

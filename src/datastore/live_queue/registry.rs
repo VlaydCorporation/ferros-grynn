@@ -7,6 +7,8 @@ use std::{
 	time::{Duration, Instant},
 };
 
+/// Bounded cancellation-safe readiness over the existing consumer authority.
+mod readiness;
 use parking_lot::{Condvar, Mutex};
 
 use super::{Footprint, PreparedQueue, Queue, SESSION_BYTES, overflow, resource};
@@ -35,6 +37,10 @@ pub(in crate::datastore) struct ConsumerKey {
 
 /// One attached consumer, activated by its registration publication.
 struct Consumer {
+	/// At most one selectable future borrows this consumer at a time.
+	waiter: Option<readiness::Waiter>,
+	/// Checked registration nonce prevents an old future removing a new waiter.
+	waiter_nonce: u64,
 	/// Complete private attachment identity.
 	key: ConsumerKey,
 	/// Delivery settings captured from the registered definition.
@@ -50,6 +56,10 @@ struct Consumer {
 	replay: Option<ReplayBank>,
 	/// New-incarnation replay admitted before publication, moved to its handle.
 	registration_replay: Option<super::Replay>,
+	/// Accepted activation image captured before concurrent tail publication.
+	registration_graph: Option<Arc<crate::live::LiveGraphBatch>>,
+	/// Charge remains until the handle consumes its initial graph image.
+	registration_graph_bytes: usize,
 	/// Additional capacity held by concurrent optimistic preparations.
 	reserved: Footprint,
 }
@@ -95,12 +105,19 @@ impl Consumer {
 
 	/// Counts head holdback and actual queue storage only once.
 	fn footprint(&self, queue: &Queue) -> FerrosGrynnResult<Footprint> {
-		Self::footprint_with(queue, self.replay)
+		Self::footprint_with(queue, self.replay, self.registration_graph_bytes)
 	}
 
 	/// Measures an admitted successor before changing the attached bank.
-	fn footprint_with(queue: &Queue, replay: Option<ReplayBank>) -> FerrosGrynnResult<Footprint> {
-		queue.footprint()?.add(Self::holdback(queue, replay)?)
+	fn footprint_with(
+		queue: &Queue,
+		replay: Option<ReplayBank>,
+		graph_bytes: usize,
+	) -> FerrosGrynnResult<Footprint> {
+		queue.footprint()?.add(Self::holdback(queue, replay)?)?.add(Footprint {
+			entries: 0,
+			bytes: graph_bytes,
+		})
 	}
 }
 
@@ -124,6 +141,8 @@ struct State {
 /// Store-owned transient delivery service; no delivery worker or snapshots.
 #[derive(Default)]
 pub(in crate::datastore) struct Consumers {
+	/// Empty waiting surface adds only one cheap atomic read to publication.
+	waiters: std::sync::atomic::AtomicUsize,
 	/// Capacity predicate and consumer state share one mutex.
 	state: Mutex<State>,
 	/// ACK, detach, publication and shutdown wake capacity waiters.
@@ -144,6 +163,10 @@ struct Update {
 	replay: Option<ReplayBank>,
 	/// Bounded immutable reader prepared before the durable barrier.
 	registration_replay: Option<super::Replay>,
+	/// Complete activation snapshot, installed only after the source barrier.
+	registration_graph: Option<Arc<crate::live::LiveGraphBatch>>,
+	/// Already-admitted immutable handoff ownership.
+	registration_graph_bytes: usize,
 	/// Only positive capacity differences are reserved before publication.
 	reserved: Footprint,
 }
@@ -282,6 +305,8 @@ impl Consumers {
 			nonce,
 		};
 		state.consumers.insert(key.id, Consumer {
+			waiter: None,
+			waiter_nonce: 0,
 			key,
 			options,
 			queue,
@@ -289,6 +314,8 @@ impl Consumers {
 			closed,
 			replay,
 			registration_replay: None,
+			registration_graph: None,
+			registration_graph_bytes: 0,
 			reserved: Footprint::default(),
 		});
 		state.nonce = nonce;
@@ -301,13 +328,37 @@ impl Consumers {
 	pub(in crate::datastore) fn registration(
 		&self,
 		key: ConsumerKey,
-	) -> FerrosGrynnResult<(LiveCursor, Option<super::Replay>)> {
+	) -> FerrosGrynnResult<(
+		LiveCursor,
+		Option<super::Replay>,
+		Option<Arc<crate::live::LiveGraphBatch>>,
+	)> {
 		let mut state = self.state.lock();
 		let consumer = state.consumer(key)?;
 		if !consumer.active {
 			return Err(FerrosGrynnError::invalid_argument("LIVE registration is not active"));
 		}
-		Ok((consumer.queue.cursor().clone(), consumer.registration_replay.take()))
+		Ok((
+			consumer.queue.cursor().clone(),
+			consumer.registration_replay.take(),
+			consumer.registration_graph.take(),
+		))
+	}
+
+	/// Releases prepaid handoff storage after the SDK takes ownership.
+	pub(in crate::datastore) fn release_registration_graph(&self, key: ConsumerKey) {
+		let mut state = self.state.lock();
+		if let Some(consumer) =
+			state.consumers.get_mut(&key.id).filter(|consumer| consumer.key == key)
+		{
+			consumer.registration_graph_bytes = 0;
+			if let Some(revision) = state.revision.checked_add(1) {
+				state.revision = revision;
+			} else {
+				state.closed = true;
+			}
+			self.changed.notify_all();
+		}
 	}
 
 	/// Detaches only this handle; descriptors and durable ACK remain intact.
@@ -328,7 +379,10 @@ impl Consumers {
 	pub(in crate::datastore) fn shutdown(&self) {
 		let mut state = self.state.lock();
 		state.closed = true;
-		state.consumers.clear();
+		// Wakers are moved and invoked only after the caller's commit guard.
+		if self.waiters.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+			state.consumers.clear();
+		}
 		self.changed.notify_all();
 	}
 
@@ -529,6 +583,16 @@ impl Consumers {
 				let before_queue = acknowledged.as_ref().unwrap_or(&consumer.queue);
 				let closing = definition.state == LiveState::Closed && !consumer.closed;
 				let mut registration_replay = None;
+				let registration_graph = if !consumer.active && !closing {
+					root.live_catalog().graph_checkpoints.get(&consumer.key.id).cloned()
+				} else {
+					None
+				};
+				let graph_bytes = if let Some(graph) = &registration_graph {
+					Footprint::payload(&crate::live::LivePayload::Graph(Arc::clone(graph)))?.bytes
+				} else {
+					consumer.registration_graph_bytes
+				};
 				let replay = if closing {
 					// An externally closed idle handle still owns its private
 					// registration buffers. Keep only their charge until that
@@ -647,7 +711,7 @@ impl Consumers {
 					return Err(resource("LIVE queue preparation", SESSION_BYTES));
 				}
 				let before = consumer.footprint(&consumer.queue)?;
-				let after = Consumer::footprint_with(&queue, replay)?;
+				let after = Consumer::footprint_with(&queue, replay, graph_bytes)?;
 				let additional = Footprint {
 					bytes: after.bytes.saturating_sub(before.bytes),
 					entries: after.entries.saturating_sub(before.entries),
@@ -662,13 +726,16 @@ impl Consumers {
 					closed: consumer.closed || closing,
 					replay,
 					registration_replay,
+					registration_graph,
+					registration_graph_bytes: graph_bytes,
 					reserved: additional,
 				});
 			}
 			let claimed = state.reserved.checked_add(reserved).ok_or_else(overflow)?;
 			if state.retained()?.checked_add(claimed).ok_or_else(overflow)? > SESSION_BYTES
-				&& updates.iter().any(|update| update.registration_replay.is_some())
-			{
+				&& updates.iter().any(|update| {
+					update.registration_replay.is_some() || update.registration_graph.is_some()
+				}) {
 				return Err(resource("LIVE registration retained history", SESSION_BYTES));
 			}
 			if !blocked
@@ -757,7 +824,9 @@ impl Reservations<'_> {
 			{
 				if !consumer.active || update.closed {
 					consumer.registration_replay = update.registration_replay;
+					consumer.registration_graph = update.registration_graph;
 				}
+				consumer.registration_graph_bytes = update.registration_graph_bytes;
 				consumer.queue = update.queue;
 				consumer.active = update.active;
 				consumer.closed = update.closed;

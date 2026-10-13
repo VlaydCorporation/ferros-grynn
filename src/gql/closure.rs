@@ -243,7 +243,7 @@ impl LanguageClosureState {
 		Ok(())
 	}
 
-	#[cfg(test)]
+	/// Retained plans are charged by bounded embeddings before invocation.
 	pub(crate) fn retained_bytes(&self) -> usize {
 		self.registry.lock().retained_bytes()
 	}

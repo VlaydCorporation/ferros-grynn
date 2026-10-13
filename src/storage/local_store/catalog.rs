@@ -13,8 +13,6 @@ use crate::{
 		IndexId,
 		SchemaAnalyzer,
 		SchemaCatalog,
-		SchemaFunction,
-		SchemaFunctionParameter,
 		SchemaParameter,
 		SystemIndex,
 		SystemIndexKind,
@@ -33,7 +31,6 @@ use crate::{
 			ClassIndexCatalogEntry,
 			DatabaseCatalog,
 			FunctionCatalogEntry,
-			FunctionParameterCatalogEntry,
 			GraphCatalogEntry,
 			GraphPropertyCatalogEntry,
 			LiveBindingCatalogEntry,
@@ -303,28 +300,7 @@ pub(super) fn encode_database_catalog(
 	let functions = root
 		.schema
 		.functions()
-		.map(|function| {
-			Ok(FunctionCatalogEntry {
-				id: function.id().ok_or_else(|| invalid("published function has no FunctionId"))?,
-				version: function.version(),
-				published_at: function.published_at,
-				namespace: function.namespace().clone(),
-				name: function.name().clone(),
-				parameters: function
-					.parameters()
-					.map(|parameter| FunctionParameterCatalogEntry {
-						name: parameter.name().clone(),
-						value_type: parameter.value_type().clone(),
-					})
-					.collect(),
-				result: function.result().clone(),
-				effect: function.effect(),
-				cost: function.is_cost(),
-				max_depth: function.max_depth(),
-				body: function.body().clone(),
-				comment: function.comment().cloned(),
-			})
-		})
+		.map(|function| FunctionCatalogEntry::from_definition(function))
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 	let analyzers = root
 		.schema
@@ -347,6 +323,8 @@ pub(super) fn encode_database_catalog(
 		.collect::<FerrosGrynnResult<Vec<_>>>()?;
 
 	Ok(DatabaseCatalog {
+		event_outbox_segments: root.event_outbox_segments().as_ref().clone(),
+		events: root.schema.events().map(|event| event.as_ref().clone()).collect(),
 		database_uuid: root.database_uuid,
 		committed_at_ns: root.committed_at_ns,
 		live_history: root
@@ -410,6 +388,7 @@ pub(super) fn encode_database_catalog(
 			.values()
 			.map(|entry| {
 				Ok(LiveCatalogEntry {
+					graph_checkpoint: root.live_catalog().graph_segments.get(&entry.id).copied(),
 					id: entry.id,
 					version: entry.version,
 					state: entry.state,
@@ -488,6 +467,10 @@ pub(super) fn encode_database_catalog(
 /// Restores retained capture descriptors independently of surviving owners.
 pub(super) fn decode_live(catalog: &DatabaseCatalog) -> crate::datastore::LiveCatalog {
 	crate::datastore::LiveCatalog {
+		graph_checkpoints: std::collections::BTreeMap::new(),
+		graph_bytes: 0,
+		graph_segments: decode_live_graph_segments(catalog),
+		prepared_graphs: Arc::default(),
 		prepared: Arc::default(),
 		prepared_encoded: Arc::default(),
 		histories: catalog
@@ -563,6 +546,19 @@ pub(super) fn decode_live(catalog: &DatabaseCatalog) -> crate::datastore::LiveCa
 			})
 			.collect(),
 	}
+}
+
+/// Restores compact query-owned graph checkpoint references.
+pub(super) fn decode_live_graph_segments(
+	catalog: &DatabaseCatalog,
+) -> Arc<std::collections::BTreeMap<crate::live::LiveId, crate::storage::HistorySegment>> {
+	Arc::new(
+		catalog
+			.live_queries
+			.iter()
+			.filter_map(|entry| entry.graph_checkpoint.map(|segment| (entry.id, segment)))
+			.collect(),
+	)
 }
 
 /// Restores retained capture descriptors independently of surviving owners.
@@ -760,31 +756,16 @@ pub(super) fn decode_schema(catalog: &DatabaseCatalog) -> FerrosGrynnResult<Sche
 		schema.graph_versions.insert(entry.id, entry.published_at);
 	}
 	for entry in &catalog.functions {
-		let parameters = entry
-			.parameters
-			.iter()
-			.map(|parameter| {
-				SchemaFunctionParameter::new(parameter.name.clone(), parameter.value_type.clone())
-			})
-			.collect::<FerrosGrynnResult<Vec<_>>>()?;
-		let mut function = SchemaFunction::new(
-			entry.namespace.clone(),
-			entry.name.clone(),
-			parameters,
-			entry.result.clone(),
-			entry.effect,
-			entry.cost,
-			entry.max_depth,
-			entry.body.clone(),
-		)?;
-		function.id = Some(entry.id);
-		function.version = entry.version;
-		function.comment = entry.comment.clone();
-		function.published_at = entry.published_at;
+		let function = entry.clone().into_definition()?;
 		let signature = function.signature();
 		schema.function_signatures.insert(signature, entry.id);
 		schema.functions.insert(entry.id, Arc::new(function));
 		schema.function_versions.insert(entry.id, entry.published_at);
+	}
+	for event in &catalog.events {
+		let id = event.id().ok_or_else(|| invalid("published EVENT has no identity"))?;
+		schema.event_names.insert((event.target(), event.name().clone()), id);
+		schema.events.insert(id, Arc::new(event.clone()));
 	}
 	Ok(schema)
 }

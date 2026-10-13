@@ -55,7 +55,12 @@ pub(super) fn encode(output: &mut Vec<u8>, entry: &LiveCatalogEntry) -> FerrosGr
 	let scope_name = entry.capture_scope_name.as_ref().map_or("", Text::as_str);
 	let rhs_scopes = super::live_scope::size(&entry.rhs_scope_anchors)?;
 	let length = 160_usize
-		.checked_add(since.len())
+		.checked_add(if entry.graph_checkpoint.is_some() {
+			super::history_segment::BYTES
+		} else {
+			0
+		})
+		.and_then(|length| length.checked_add(since.len()))
 		.and_then(|length| length.checked_add(entry.descriptor.len()))
 		.and_then(|length| length.checked_add(scope_name.len()))
 		.and_then(|length| length.checked_add(rhs_scopes))
@@ -89,7 +94,10 @@ pub(super) fn encode(output: &mut Vec<u8>, entry: &LiveCatalogEntry) -> FerrosGr
 		LiveOverflowPolicy::Block => 2,
 	});
 	output.push(since_tag);
-	output.push(u8::from(!entry.rhs_scope_anchors.is_empty()));
+	output.push(
+		u8::from(!entry.rhs_scope_anchors.is_empty())
+			| (u8::from(entry.graph_checkpoint.is_some()) << 1),
+	);
 	output.extend_from_slice(
 		&entry.source_class.map_or(0, crate::datastore::ClassId::get).to_le_bytes(),
 	);
@@ -124,6 +132,9 @@ pub(super) fn encode(output: &mut Vec<u8>, entry: &LiveCatalogEntry) -> FerrosGr
 			.map_err(|_error| invalid("LIVE capture scope name overflows"))?
 			.to_le_bytes(),
 	);
+	if let Some(segment) = entry.graph_checkpoint {
+		super::history_segment::encode(output, segment);
+	}
 	super::live_capture::encode(output, &entry.functions, &entry.record_sources)?;
 	output.extend_from_slice(&since);
 	output.extend_from_slice(&entry.descriptor);
@@ -164,7 +175,7 @@ pub(super) fn decode(
 	};
 	let since_tag = decoder.read_u8()?;
 	let flags = decoder.read_u8()?;
-	if flags & !1 != 0 {
+	if flags & !3 != 0 {
 		return Err(invalid("LIVE catalog options flags are invalid"));
 	}
 	let class_raw = decoder.read_u32()?;
@@ -212,6 +223,11 @@ pub(super) fn decode(
 	if code_len > 8 || reason_len > 4096 {
 		return Err(invalid("LIVE query diagnostic cap is exceeded"));
 	}
+	let graph_checkpoint = if flags & 2 != 0 {
+		Some(super::history_segment::decode(decoder)?)
+	} else {
+		None
+	};
 	let (functions, record_sources) =
 		super::live_capture::decode(decoder, budget, function_count, source_count)?;
 	let since_bytes = decoder.read_exact(since_len)?;
@@ -261,6 +277,7 @@ pub(super) fn decode(
 	};
 	let diagnostic = super::live_capture::diagnostic(decoder, budget, code_len, reason_len)?;
 	Ok(LiveCatalogEntry {
+		graph_checkpoint,
 		id,
 		version,
 		state,
@@ -405,6 +422,20 @@ pub(super) fn validate_entries(catalog: &super::DatabaseCatalog) -> FerrosGrynnR
 		return Err(invalid("LIVE catalog identities are not canonical sorted distinct"));
 	}
 	for entry in &catalog.live_queries {
+		if let Some(segment) = entry.graph_checkpoint {
+			if entry.query.graph_result().is_none()
+				|| segment.owner() != crate::storage::HistoryOwner::Live(entry.id)
+				|| segment.header.database != catalog.database_uuid
+				|| segment.header.commits != 1
+				|| segment.header.first_stamp != segment.header.last_stamp
+				|| segment.header.first_time != segment.header.last_time
+				|| segment.header.first_stamp < entry.defined_at
+			{
+				return Err(invalid(
+					"LIVE graph checkpoint reference has inconsistent ownership/bounds",
+				));
+			}
+		}
 		let names = crate::live::dependencies::query_record_names(
 			&entry.query,
 			&mut crate::live::dependencies::BindingAdmission::new(

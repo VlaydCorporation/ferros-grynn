@@ -855,6 +855,8 @@ impl Transaction {
 		let id = class.id().ok_or_else(|| {
 			FerrosGrynnError::invalid_argument("published class is missing ClassId")
 		})?;
+		self.remove_source_events(crate::datastore::EventTarget::Class(id))?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		self.working.remove_class(id, self.snapshot.commit_ts)?;
 		self.retire_missing_changefeeds()?;
 		self.write_bytes += SCHEMA_WRITE_BYTES;
@@ -892,6 +894,8 @@ impl Transaction {
 				self.atom_domain(occurrence.global_id()).map(|(class, kind)| (class, kind))
 			})
 			.collect::<FerrosGrynnResult<Vec<_>>>()?;
+		self.remove_source_events(crate::datastore::EventTarget::Graph(graph))?;
+		self.ensure_capacity(SCHEMA_WRITE_BYTES)?;
 		self.working.remove_graph(graph)?;
 		self.retire_missing_changefeeds()?;
 		self.insert_write(ConflictKey::GraphDefinition(graph), 0);

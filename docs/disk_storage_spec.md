@@ -6,8 +6,11 @@
 durability. Семантику GrynQL задаёт [gql_spec.md](gql_spec.md), точный синтаксис —
 [gql_grammar.md](gql_grammar.md), техническую реализацию — [gql_tech_spec.md](gql_tech_spec.md).
 
-**Статус core format v1:** Windows-кандидат. Он фиксируется только после Windows sync
-performance gate и Windows GA-core gate из [full_plan.md](full_plan.md) (этапы 3 и 19). Linux
+**Статус core format v1:** Windows-кандидат. Фиксация требует Windows Sync performance
+evidence: не менее 90% raw Direct throughput, проверки p99/hot-set/RSS и отсутствия
+регрессии NativeAsync. Windows GA-core validation включает crash/recovery, bounded
+malformed-input fuzzing, RAM/Sync/NativeAsync equality, SSI/checkpoint/retirement soak,
+paired storage/query performance и public API/format freeze. Linux
 sync/NativeAsync не блокируют эту фиксацию: после неё несовместимый Linux layout требует format
 v2 и явной миграции.
 
@@ -17,7 +20,7 @@ evidence и ограничения зафиксированы в
 Она заменяет graph-owned atom/table candidate на database-level AtomStore и graph-local
 occurrences. При конфликте с сохранёнными ниже legacy layout-примечаниями действуют §§2, 4, 7,
 10–11, 17–18 и 22 в редакции 9.0. После этапов 20–21 cutover принимает только
-`FGDC v13`/`FGFC v6`; миграции
+`FGDC v14`/`FGFC v6`; миграции
 промежуточных кандидатов нет.
 
 ---
@@ -52,8 +55,8 @@ occurrences. При конфликте с сохранёнными ниже lega
 26. [Тензорные представления](#26-тензорные-представления)
 27. [Конфигурация](#27-конфигурация)
 28. [Эволюция формата](#28-эволюция-формата)
-29. [Новые Rust-компоненты](#29-новые-rust-компоненты)
-30. [План доработки кодовой базы](#30-план-доработки-кодовой-базы)
+29. [Границы Rust-компонентов](#29-границы-rust-компонентов)
+30. [Требования к совместимости реализации](#30-требования-к-совместимости-реализации)
 
 ---
 
@@ -451,7 +454,7 @@ enum RecordIdPart {
 
 ```
 tag(u8) = 0x10
-class_id(u32)             -- stable ClassId из FGDC v13
+class_id(u32)             -- stable ClassId из FGDC v14
 id_kind(u8):
   0x00 = Int
   0x01 = String
@@ -761,22 +764,22 @@ database-level AtomStore и catalog files. Транзакция не может 
 namespace. Backfill можно планировать по data space, но обрезка единого WAL использует общий
 watermark.
 
-### 7.2. DatabaseCatalog `FGDC v13` и FileCatalog `FGFC v6`
+### 7.2. DatabaseCatalog `FGDC v14` и FileCatalog `FGFC v6`
 
 `db.fgb` хранит root-page ссылки; канонические каталоги лежат в `schema/catalog.fgb` и
 публикуются тем же frame-WAL commit, что data pages:
 
-- `DatabaseCatalog` (`FGDC`, payload version 13): identity clocks, IANA timezone table,
+- `DatabaseCatalog` (`FGDC`, payload version 14): identity clocks, IANA timezone table,
   versioned CLASS/FIELD/INDEX definitions, graph catalog, AtomStore generation/bindings,
   durable parameters и named functions. Property-key strings в payload не дублируются;
 - `FileCatalog` (`FGFC`, payload version 6): sealed mapping
   `(DataSpaceId, DataFileId) → (companion_of, role, validated relative path)`.
 
-`FGDC v13` начинается с exact 136-byte header (development layout, Q-40):
+`FGDC v14` начинается с exact 144-byte header (development layout, Q-40):
 
 ```text
 0   4   magic = FGDC
-4   2   version = 12
+4   2   version = 14
 6   2   reserved = 0
 8   8   next_graph_id
 16  8   next_schema_id
@@ -795,9 +798,11 @@ watermark.
 124 4   live_query_count
 128 4   live_binding_count
 132 4   live_history_count
+136 4   event_definition_count
+140 4   event_outbox_segment_count
 ```
 
-Sections следуют строго в порядке timezone → class → graph → parameter → function → analyzer → changefeed → live-query → live-binding → live-history и обязаны
+Sections следуют строго в порядке timezone → class → graph → parameter → function → analyzer → changefeed → live-query → live-binding → live-history → event-definition → event-outbox-segment и обязаны
 полностью потребить payload. Index entry использует maintenance byte `0=Immediate`,
 `1=Deferred`; unknown value является corruption. Parameter entry хранит identity/version,
 `published_at`, canonical value bytes, name и optional comment. Function entry хранит
@@ -806,7 +811,7 @@ types, effect `PURE|STABLE|IMPURE`, `COST`, optional `MAXDEPTH 1..=64`, source U
 optional comment. Уникальны identity и `(namespace, name, parameter types)`; typed IR и
 platform bytecode не сохраняются.
 
-LIVE-query section (`FGDC v13`, этап 28) содержит entries в canonical порядке по
+LIVE-query section (`FGDC v14`, этапы 28–29) содержит entries в canonical порядке по
 `LiveId`. Fixed header entry занимает 160 bytes: UUID(16), definition version(u64),
 defined/starting-after/published/ACK stamps(4 × u64), state/overflow/SINCE tag(3 × u8), options flags(1),
 original source ClassId(u32; 0 только для graph-wide source),
@@ -831,7 +836,8 @@ distinct captured FunctionId/SchemaVersion pairs (8 bytes), sorted record source
 `ClassId(u32), name length(u32), UTF-8 name`, SINCE payload,
 полный canonical FGLD query descriptor (§21.2.1), scope-name UTF-8 bytes,
 optional RHS-scope tail и UTF-8 diagnostic code/reason. Options bit0 обозначает
-непустой RHS tail; остальные bits нулевые. Tail содержит positive count(u32),
+непустой RHS tail; bit1 — graph checkpoint reference (128-byte shared HistorySegment
+после fixed header); остальные bits нулевые. Tail содержит positive count(u32),
 затем sorted distinct positive source ordinals(u32), reserved(4), GraphId(u64),
 name byte length(u32) и UTF-8 1..128 bytes. Ordinal относится к expression-scoped
 root JOIN declaration; primary owner остаётся отдельным. GraphId ниже allocation
@@ -857,7 +863,7 @@ starting-after ≤ defined ≤ published и starting-after ≤ ACK. Reopen св�
 сохраняет исходный owner record-source при переиспользовании имени. Graph source identity
 и ClassId должны быть ниже соответствующих allocation clocks; reserved IDs отклоняются.
 Ordinal/count и section lengths
-не могут превышать оставшийся payload. FGDC v12 и более ранние development layouts
+не могут превышать оставшийся payload. FGDC v13 и более ранние development layouts
 не принимаются и не мигрируются.
 
 LIVE-binding entry имеет 104-byte fixed header: UUID(16), definition version,
@@ -956,7 +962,7 @@ Class definition хранит стабильные `ClassId`/`SchemaVersion`, im
 `GraphRef` не кодируется как `RecordId`. Удаление graph удаляет только его catalog entry,
 occurrences, topology, overlays и effective indexes; global atoms и classes сохраняются.
 
-Graph entry `FGDC v13` расширяет development fixed header этапа 18 на месте (Q-40):
+Graph entry `FGDC v14` сохраняет development fixed header этапа 18 (Q-40):
 
 ```text
 0   8   graph_id
@@ -1040,7 +1046,7 @@ graph. Internal graph имеет ненулевой `owner_root_graph_id`, ук�
 graphs. Internal graph не может принадлежать другому internal graph или быть доступен из arena
 чужого owner root.
 
-После fixed graph fields `FGDC v13` хранит catalog-owned properties:
+После fixed graph fields `FGDC v14` хранит catalog-owned properties:
 
 ```text
 property_count: u32 LE
@@ -1055,7 +1061,7 @@ unknown key, `none`, runtime-only value, неверная длина и нека
 corruption. `null` является обычным хранимым значением. Properties изменяют catalog/schema
 revision при сохранении `GraphId` и physical bindings; в `GraphSuperblock` они не дублируются.
 
-Decoder принимает только `FGDC v13` и `FGFC v6`. `FGDC v5..=v12`, `FGFC v4/v5` и
+Decoder принимает только `FGDC v14` и `FGFC v6`. `FGDC v5..=v13`, `FGFC v4/v5` и
 graph-owned atom layout возвращают typed incompatible-format error. Migration и test-only
 compatibility отсутствуют. `STORAGE_FORMAT_VERSION` остаётся `1`; development catalog layout
 изменяется на месте по Q-40, без промежуточной заморозки и compatibility decoders.
@@ -1910,14 +1916,14 @@ Total = PAGE_SIZE байт
 Строковые пространства разделены. Database-wide `PropertyDictionary` интернирует только ключи
 свойств. `LabelDictionary` каждого графа интернирует только graph-local node/edge labels и имеет
 две независимые плотные последовательности ID. Имена classes принадлежат `ClassCatalog`, а IANA
-timezone names — `FGDC v13`.
+timezone names — `FGDC v14`.
 
 ### 16.1. Database-wide `PropertyDictionary`
 
 `atoms/<generation>/property_keys.fgb` имеет `DataFileKind::PropertyDictionary = 0x14`, является
 append-only, WAL-versioned и не имеет freelist. `PropertyKeyId` плотны, стабильны и монотонны в
 диапазоне `[0, entry_count)`; удалённый ключ не переиспользуется. `FileCatalog` — единственная
-authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v13`.
+authority физического binding, поэтому `DataFileId` словаря не дублируется в `FGDC v14`.
 
 ```text
 PropertyDictionaryRoot (PageType 0x003C):
@@ -2301,29 +2307,89 @@ Vector definition хранит separately-versioned side-format binding и exact
 
 ### 18.6. EventDefinition
 
+Executable IR не является durable representation: WHEN/THEN сохраняются как
+versioned source/logical descriptors со stable target identity и SchemaVersion.
+FGDC v14 содержит source-only definition section; каждый entry имеет минимум
+44 bytes. Durable outbox использует отдельные versioned WAL-backed side-formats FGEI/FGEO;
+его authority принадлежит transactional root. Admin job ledger служит восстанавливаемой
+проекцией. Definition и принятый invocation не содержат executable IR; development layout
+заменяется на месте без compatibility decoders.
+
 ```
-event_name_id:  u32
-async_flag:     u8   -- 0=sync, 1=async
-retry_count:    u8
-max_depth:      u8
-when_expr_len:  u32
-when_expr:      [u8] -- сериализованный IR выражения WHEN
-then_expr_len:  u32
-then_expr:      [u8] -- сериализованный IR THEN-тела
+event_id:       u32 -- checked stable identity
+schema_version: u32
+published_at:   u64
+target_kind:    u8  -- 0=CLASS, 1=GRAPH
+execution:      u8  -- 0=SYNC, 1=ASYNC
+retry_count:    u8  -- дополнительные attempts, 0..=255
+max_depth:      u8  -- ASYNC 0..=16; SYNC retry/depth равны zero
+target_id:      u64 -- CLASS checked u32, GRAPH checked u64
+name:          u32 byte length + UTF-8
+comment:       u8 presence + optional u32 byte length/UTF-8
+when_source:   u32 byte length + UTF-8
+then_source:   u32 byte length + UTF-8
 ```
+
+Text lengths, UTF-8/NUL, target identities и execution flags проверяются до
+allocation. Name/comment ограничены 4 KiB, каждый source — 64 KiB; общий catalog
+cap — 16 MiB. Outbox section хранит checked 128-byte HistorySegment descriptors
+для `.feo` files. Их pages используют `EventInvocation` page type и тот же frame
+WAL commit, что primary data, Changefeed и LIVE. `FGEO v1` содержит invocation
+records, а `FGEI v1` — frozen EVENT/context/UDF descriptors; checksums, tags,
+lengths и completion markers проверяются при recovery. Повреждение pending
+payload является ошибкой восстановления и не превращается в потерю задания.
+
+#### 18.6.1. Принятые invocations и recovery
+
+ASYNC WHEN вычисляется в source transaction. Invocation сохраняет checked stable JobId,
+EventId/SchemaVersion, target identity, historical context и transitive UDF source closure.
+ALTER/REMOVE EVENT не меняет принятый payload; существующее задание отменяется явно.
+Каждая попытка использует новую transaction с актуальными данными и тем же context.
+Effects успешной попытки и completion marker входят в один WAL commit. Recovery проверяет
+marker до повторного запуска; completed invocation повторно не исполняется. Внешние effects
+не получают exactly-once guarantee. Общий worker исполняет due attempts последовательно,
+чередуя их с maintenance jobs; FG_ASYNC_EVENT_PROCESSING_INTERVAL default — 5 секунд.
+
+FGEI v1 начинается с magic `FGEI`, version u16=1 и reserved u16=0. Далее следуют
+length-prefixed EVENT source descriptor, function count u32, ordered distinct function
+source descriptors по FunctionId, historical dictionary и context body. Blob lengths —
+u64 LE. Body содержит ровно пять logical values в порядке $event/$before/$after/$value/
+$input. Dictionary self-contained: decode не обращается к current catalog/primary.
+Unknown marker/version/tags, reserved fields, malformed lengths/counts/UTF-8, unsorted
+или duplicate function identities и trailing bytes отклоняются. Context work ограничен
+1M logical nodes; payload ceiling — 64 MiB, decoder scratch учитывается отдельно.
+
+FGEO v1 сохраняет authoritative checkpoint либо commit delta: stamp, изменённые/удалённые
+invocation identities и проверяемые pending count/bytes. Invocation record содержит accepted
+EVENT version/target, state, retries, attempts, causal depth/ceiling, accepted/updated stamps,
+due/created/updated UTC times, bounded diagnostic и immutable payload либо ссылку на уже
+принятый payload той же identity. Неизвестная ссылка не восстанавливается из current EVENT.
+Checkpoint заменяет outbox целиком; delta применяется к прежнему root только целой
+проверенной группой. Outer pages/continuations и WAL frames используют общие checksums;
+несовпадение stamp, totals, state/marker или повреждение pending payload отклоняет recovery.
+
+RETRY default 0, 0..=255 дополнительных attempts; retry не меняет identity/depth. Root ASYNC
+depth 0, причинный вызов из EVENT увеличивает depth; MAXDEPTH default 3, 0..=16. Ancestor
+limits сохраняются через sync/async transitions; превышение даёт typed error. Pending cap
+10 000 invocations/64 MiB на datastore и transaction caps проверяются до allocation/
+publication; overflow отклоняет source operation. INFO JOB показывает state/attempts/depth/
+bounded diagnostic, KILL отменяет pending либо cooperatively прерывает active attempt.
+Savepoint/TRY rollback восстанавливает metadata и pending entries вместе с data.
+Import EVENTS=OFF по умолчанию и независим от CHANGEFEED. ON удерживает accepted ASYNC
+payloads в bounded private spool до успешного END; SKIP/QUARANTINE откатывает item payloads,
+abort/failed END не публикует spool. Completion/cancellation/outbox transitions не могут
+публиковаться отдельно от соответствующих transactional effects.
 
 ### 18.7. FunctionDefinition
 
-```
-fn_name_id:   u32
-purity:       u8  -- 0=IMPURE, 1=PURE, 2=STABLE
-is_cost_fn:   u8
-arg_count:    u8
-return_tag:   u8  -- TypeTag возвращаемого типа
-args:         [name_id(u32) + type_tag(u8) + type_detail([u8])] × arg_count
-body_len:     u32
-body:         [u8]  -- сериализованный IR тела функции
-```
+Авторитетный durable source descriptor задаётся в §7.2: стабильные FunctionId,
+SchemaVersion и publication watermark, effect/COST/MAXDEPTH, сигнатура с полными
+типами, optional comment и UTF-8 source тела. Executable/typed IR не хранится;
+analyzer восстанавливает его при исполнении. Тот же bounded source descriptor
+сохраняется для transitive frozen UDF dependencies принятого ASYNC EVENT в FGEI.
+Effect tags: PURE=0, STABLE=1, IMPURE=2; неизвестные tags, reserved identities,
+malformed types/lengths и trailing bytes отклоняются. Исходное логическое
+предложение с сериализованным IR не является альтернативным physical codec.
 
 ### 18.8. AnalyzerDefinition
 
@@ -3920,7 +3986,35 @@ replay не является скрытым вторым writer path.
 **duration** — положительное фиксированное время хранения изменений; years/months
 не принимаются. `INCLUDE ORIGINAL` выбирает полный before вместо обратимого before-diff;
 `FULL` сохраняет logical operation history, включая targeted no-op.
-Нормативные lifecycle/read rules: `gql_changefeed_stage_27_plan.md`, CF-01–CF-17.
+Final validated source policy применяется ко всем DML commit, включая операции до включения
+FULL; финальный DROP подавляет DML и публикует explicit GAP/control transition. NET coalesce-ит
+before/after по identity и исключает equality. FULL сохраняет successful logical operations,
+включая targeted no-op, в исходном порядке; zero matches, failed operations и abort не
+создают entries. Internal setters/cascades принадлежат outer logical operation. GRAPH source
+локален, containment не создаёт recursive capture. Base mutation fanout проверяется по
+current reverse memberships; masked effective values не дают property event.
+
+Versionstamp — database-global durable commit_ts, один на commit; ordinal различает entries.
+Дедупликация выполняется по source/stamp/ordinal в фиксированном mode; sparse stamps не GAP.
+SINCE stamp exclusive, timestamp inclusive; UTC committed_at сохраняется и не убывает.
+Cursor хранит database UUID/source/mode и последний целиком прочитанный commit, не WAL LSN.
+Reader фиксирует upper snapshot boundary, удерживает pins и выдаёт owned/self-contained
+images без current primary reads. LIMIT считает whole batches/GAP items; FULL coverage
+проверяется до row pull на всём выбранном interval независимо от LIMIT. NET-only history
+не позволяет синтезировать промежуточные операции. EOF может продвинуть cursor через stamps
+без событий; после ошибки reader прекращается с последней принятой позицией.
+
+Config updates сохраняют ChangefeedId. DROP/REMOVE оставляет history/tombstone до TTL;
+active name wins, historical name разрешается только однозначно. После полного retirement
+включение получает новый id, старый cursor — terminal FeedExpiredOrRetired GAP.
+Import capture policy frozen; CHANGEFEED default OFF. ON history accepted items переживает
+private segment seals и публикуется одним END commit; SKIP/QUARANTINE откатывает item history,
+abort/failed END ничего не публикует. OFF сохраняет suppressed interval через GAP.
+Writer lease и запрет schema DDL сохраняются. Primary/feed/catalog/bounds stage-ятся одним
+TxHandle и публикуются одним WAL barrier; feed-only no-op проходит writer/SSI validation.
+Capture/images/spool/read buffers admission предшествует allocation/write, partial result
+и silent drop запрещены. Shared staged-WAL cap — 256 MiB, default reader scratch — 256 MiB,
+work — 1M. Uncertain WAL outcome запрещает cleanup до recovery reachability decision.
 
 ```
 changefeed/<changefeed_uuid>/<segment_uuid>.fcf
@@ -3945,7 +4039,7 @@ little-endian; общий checksum покрывает header и body. Неисп
 |-------:|------:|----------------------------------------|
 |      0 |     4 | `FCFS`                                 |
 |      4 |     2 | framing version `1`                    |
-|      6 |     1 | owner tag: CHANGEFEED=0, LIVE=1         |
+|      6 |     1 | owner tag: CHANGEFEED=0, LIVE=1        |
 |      7 |     1 | reserved zero                          |
 |      8 |    16 | database UUID                          |
 |     24 |    16 | owner UUID (ChangefeedId или LiveId)   |
@@ -3959,7 +4053,7 @@ little-endian; общий checksum покрывает header и body. Неисп
 
 Bounds сверяются с authoritative catalog того же snapshot; header не заменяет catalog.
 
-Retained source descriptor FGDC v13 после optional close stamp сохраняет
+Retained source descriptor FGDC v14 после optional close stamp сохраняет
 `purged_time_ns: i128`, `closed_time_ns: i128`, `retained_page: u64` и
 `retained_groups: u64`, затем name length; fixed minimum descriptor —
 152 bytes без name/epochs/segments. `closed_time_ns` равен нулю для active source,
@@ -4096,10 +4190,36 @@ authority corruption без доказуемых bounds — typed error. Пос�
 
 `LIVE SELECT` подписывается на изменения class либо graph-scoped effective source.
 
-Нормативный контракт — [этап 28](gql_live_stage_28_plan.md). Immutable catalog хранит
+Immutable catalog хранит
 LiveId/query version, canonical logical descriptor, frozen captures, binding DAG/revisions,
 dependency revisions, durability epochs, history references/bounds и confirmed watermark.
 Executable typed IR не сериализуется. Queue остаётся in-memory.
+
+Ordinary registration начинает delivery после своего commit без initial rows; frozen LET/
+execute captures фиксируются по значению. LIVE LET имеет versioned identity и dependency
+DAG с topological evaluation; cycle/REMOVE с dependents отклоняется. Data и binding changes
+одного commit вычисляются совместно. WHERE/projection/FETCH регистрируют missing records,
+ranges, membership, schema и function versions; неточная dependency требует bounded
+conservative rescan. Registration fault отклоняет регистрацию; active evaluation fault
+приостанавливает затронутые подписки с fault/GAP, сохраняя успешный DML.
+SINCE требует coverage всех inputs; нехватка даёт explicit GAP с доступным хвостом,
+неизвестные authoritative bounds — typed error. Без CHANGEFEED row-result delivery
+transient, restart/queue loss даёт GAP; graph checkpoints имеют отдельную root authority
+независимо от CHANGEFEED policy, как определено в §21.2.3.
+
+Handle имеет одну unconfirmed delivery, повторяемую до whole-commit ACK. Cursor — confirmed
+watermark. ACK проверяет database/query/version/issued token; duplicate ACK идемпотентен.
+Resume existing identity использует persisted ACK: stale client cursor не откатывает его,
+позиция выше persisted ACK отклоняется. Под commit mutex фиксируются cutoff/tail attachment;
+saved payloads до cutoff decode-ятся лениво вне mutex. Historical head prepaid/bounded и
+освобождает pins/holdback после EOF/Drop/error; scan/EOF не подтверждает delivery. Drop
+detaches consumer, close прекращает capture. Rename сохраняет source identity, recreate
+не перепривязывает LIVE; capture policy change создаёт explicit durability epoch.
+Default queue — 10 000 entries/64 MiB на subscription, retained session/scratch — 256 MiB,
+evaluation work — 1M, BLOCK — 30s либо более ранний transaction deadline. Whole commits
+не режутся. GAP/DISCONNECT дают явную потерю coverage; BLOCK reservations получают полным
+набором вне commit lock с RAII release на cancellation/timeout/race. Oversized batch
+приостанавливает subscription с resource fault/GAP вместо бесконечного ожидания.
 
 Private live-result payload использует существующие `.fcf`, PageManager и WAL/COW;
 отдельные catalog references не смешивают его с пользовательским SHOW CHANGES.
@@ -4121,7 +4241,7 @@ Stamp и UTC time фиксируются до кодирования source/LIVE
 
 #### 21.2.1. Logical descriptor и cursor codecs
 
-`FGLD v1`: magic 4 bytes; version u16=1; kind u8 (0=Query, 1=Binding);
+`FGLD v2`: magic 4 bytes; version u16=2; kind u8 (0=Query, 1=Binding);
 reserved u8=0; dictionary_bytes u64; body_bytes u64. Header — 24 bytes;
 далее exact historical dictionary и logical body. Integers little-endian.
 Runtime literals используют authoritative canonical StorageValue codec и независимые
@@ -4232,8 +4352,8 @@ database/query/version отклоняются. Stamp 0 обозначает orig
 
 #### 21.2.2. Computed result envelope
 
-`FGLB v1` — private whole-commit LIVE payload. Fixed header — 96 bytes:
-magic(4), version u16=1, kind u8 (Batch=0/Gap=1/Fault=2), reserved u8=0,
+`FGLB v2` — private whole-commit LIVE payload. Fixed header — 96 bytes:
+magic(4), version u16=2, kind u8 (Batch=0/Gap=1/Fault=2/Graph=3), reserved u8=0,
 LiveId UUID(16), query version u64>0, stamp u64>0, UTC nanoseconds i128,
 binding_count u32, event_count u32, dictionary_bytes u64, body_bytes u64,
 reserved(16)=0. Все integers LE. Далее historical dictionary и complete body.
@@ -4257,6 +4377,15 @@ positions в порядке SPLIT clauses; aliases/physical order/output ordinal
 кодируются. Counts/work/bytes/owned allocation проверяются до reservation и
 write. Existing identity tags0..2 и fixed FGLB header bytes не меняются.
 Binding value stamps не превышают commit.
+
+Graph body содержит sorted binding revisions, base Versionstamp(u64), before
+presence(u8), optional length-prefixed `FGLG v1` before image и обязательный
+length-prefixed after image. Targets выводятся canonical diff и сверяются с
+event_count; пустой delta имеет одну data entry. Graph data не использует 64-KiB
+control cap. Initial checkpoint и preceding image дают replay interval;
+retention/GAP использует существующие whole-commit bounds. Source snapshot stamps
+не превышают соответствующие before-base/after-revision. Codec graph payload не
+обращается к current primary и не сериализует runtime `Value::Graph`.
 
 Logical value tags: scalar canonical blob=0, Array=1, Object=2, Set=3,
 Range=4, AtomOccurrence=5, Path=6. Collection counts u32; Object names —
@@ -4291,6 +4420,43 @@ optional SystemTime (sign u8, seconds u64, nanos u32), extensions и cause prese
 Byte cap — 256 MiB; aggregate logical nodes/entries/path steps ≤1M, depth ≤64.
 Counts и decoded tree allocations проверяются до allocation; encode выполняется
 при preparation до commit mutex. Общая page/WAL publication не меняется.
+
+#### 21.2.3. Logical graph checkpoint
+
+FGLG v1 хранит owned logical graph image отдельно от runtime Value::Graph и общего
+StorageValue codec. Header — 32 bytes, integers LE:
+
+| Offset | Bytes | Field                  |
+|-------:|------:|------------------------|
+|      0 |     4 | magic `FGLG`           |
+|      4 |     2 | version = 1            |
+|      6 |     2 | reserved = 0           |
+|      8 |     8 | dictionary byte length |
+|     16 |     8 | body byte length       |
+|     24 |     8 | RapidHash v3 checksum  |
+
+Checksum охватывает весь envelope с обнулённым checksum field. Dictionary self-contained;
+body сохраняет root/source/derived scopes, AtomRef, ordered qualified endpoint/owner routes,
+effective properties с owned names, family/validators каждого scope и source ClassId/
+snapshot Versionstamp для write-back. Derived scope определяется canonical owner route;
+materialization-local AtomId и executable IR не кодируются. Family tags: Graph=0, Tree=1,
+RootedTree=2, Forest=3, Dag=4, Hypergraph=5, Metagraph=6, Subgraph=7. Counts/tags/presence,
+scope/atom ordering, property handles, closure и containment проверяются до restoration;
+family validators применяются при построении candidate. Unknown versions/tags, malformed
+lengths, reserved bytes и checksum mismatch дают typed error.
+
+Accepted checkpoints принадлежат transactional root; catalog хранит компактную ссылку на
+отдельный whole-group файл LIVE transport. Замена checkpoint публикуется тем же WAL commit,
+что source effects и computed deltas. Owned images active/paused/closed incarnations
+ограничены 256 MiB на datastore; publication/recovery используют одну проверяемую оценку,
+а decoder scratch ограничен отдельно. History сохраняет initial checkpoint, whole commit
+deltas и checkpoint для первого retained replay interval; отсутствующая coverage даёт GAP.
+Resume не подменяет historical image текущими primary records. FGLB v2 kind=3 содержит
+before/after FGLG images; canonical targets выводятся общим diff и сверяются с header count.
+Даже empty graph delta имеет одну data entry для admission; 64-KiB control cap применяется
+только к GAP/fault. Qualified recipe literals/parameters используют FGLV v1 внутри FGLD v2.
+Scalar canonical bytes сохраняют прежний format. Development codecs заменяются на месте
+без compatibility decoders FGLB v1 либо executable IR serialization.
 
 ---
 
@@ -4833,7 +4999,7 @@ qualified owner (16) + child GraphId:u64. Public identities восстанавл
 
 Definition descriptor family tag=3; algorithm=0/AUTO, 1/CSR, 2/DENSE; parameter=0/LOCAL, 1/ROOTED,
 radius=0, cost=HOP, labels/patterns/function dependencies empty, mode=ATOM, direction=BOTH.
-MAX_BYTES обязателен. Development `FGDC v13` graph entry после user index definitions/bindings
+MAX_BYTES обязателен. Development `FGDC v14` graph entry после user index definitions/bindings
 дополняется `incidence_revision:u64 <= generation`. Commit membership/incidence writes обновляет
 эту revision; ordinary property updates и unrelated COW/checkpoint не меняют её. Compatibility decoder нет.
 
@@ -4850,7 +5016,11 @@ Membership/topology/containment/relevant labels и captured weights/properties
 commit lock, затем публикует через общий WAL/COW. Private mutations исключают старый
 cache, old snapshots удерживают прежнюю generation. Checkpoint LSN не является
 критерием актуальности. MAX_BYTES учитывает pages/dictionaries/metadata; scratch
-отдельно ограничен. План: [этап 26](gql_tensor_analytics_stage_26_plan.md).
+отдельно ограничен. AUTO выбирает меньший допустимый DENSE/CSR encoding, иначе возвращает
+resource error. Build использует bounded external sort и streamed pages; MAX_BYTES включает
+pages/dictionaries/metadata и проверяется до write. Автоматический lookup отсутствующего,
+stale либо несовместимого binding сохраняет exact fallback; forced binding возвращает typed
+error до row pull. Recovery/cancellation/retirement используют общий transactional lifecycle.
 
 ---
 
@@ -4991,27 +5161,33 @@ fn migrate(graph_dir: &Path, from_version: u32, to_version: u32) -> io::Result<(
 
 ---
 
-## 29. Новые Rust-компоненты
+## 29. Границы Rust-компонентов
 
-> **Вынесено в [implementation_plan.md](implementation_plan.md).** Целевая структура Rust-модулей,
-> trait `PageManager`, таблица новых компонентов и зависимости `Cargo.toml` перенесены в план
-> реализации: §2 «Целевая структура модулей», §3 «Ключевые Rust-контракты» (§3.3 — действующая
-> frame-WAL-редакция `PageManager`, заменившая раннюю STEAL-версию `write_page_dirty`/`flush_*`),
-> §3.6 «Новые компоненты», §3.7 «Зависимости».
+Storage владеет physical pages/indexes, Direct I/O, frame-WAL, checkpoint/recovery и
+versioned side-formats. Datastore владеет immutable MVCC roots, schema/file catalogs,
+FCW/SSI и единой transactional publication. Query/runtime values используют logical
+identities и owned results; pages, page guards и physical DTO остаются внутри storage.
+
+Страничный доступ выполняет один concrete crate-private SyncPageManager. TxHandle
+удерживает snapshot registration; PageRead объединяет staged borrow и immutable PageGuard.
+read_pages сохраняет порядок и duplicates. stage_frame создаёт private COW page, commit_tx
+публикует весь write set одним WAL barrier, abort_tx отбрасывает его без UNDO/CLR. WAL
+назначает page_lsn/checksum. Версия доступна только при commit_lsn ≤ snapshot.visible_lsn;
+checkpoint не продвигает home pages дальше самого старого live watermark. Datastore
+предоставляет явный checkpoint(Passive | Restart). Отдельный trait с одной реализацией,
+второй WAL или скрытый commit через Drop не требуется.
 
 ---
 
-## 30. План доработки кодовой базы
+## 30. Требования к совместимости реализации
 
-> **Вынесено в [implementation_plan.md](implementation_plan.md).** Пофайловый план доработки
-> (`value.rs`, `serial.rs`, `id.rs`, `mvcc_persist.rs`, `mvcc.rs`, `store.rs`, `graph.rs`),
-> приоритизированный порядок работ и правки полной инцидентности графового ядра перенесены в план:
-> §4 «План реализации по областям» (пофайловая детализация — Области A–D, N) и §5
-> «Приоритизированный порядок работ».
->
-> Часть ранней редакции плана отменена принятыми решениями и в план не переносилась дословно:
-> `WalKind 0x10–0x22` и раздельные `MvccWal`/`DiskWal` → единый **frame-WAL** уровня БД (§22–§23);
-> `DiskAtomRef = u64` (§9). Актуализированные формулировки — в таблице решений в начале плана
-> (помечены 🔄).
+Действующий physical contract использует единый database-level frame-WAL (§22–§23) и
+DiskAtomRef=u64 (§9). Ранние WalKind 0x10–0x22, раздельные MvccWal/DiskWal и STEAL-style
+write_page_dirty/flush не являются допустимыми альтернативами. Logical identity,
+snapshot visibility и полная V–V/V–E/E–V/E–E incidence сохраняются при смене внутреннего
+layout или module structure. Все persisted bytes проходят checked version/tag/length/
+checksum validation и resource admission до allocation/publication; recovery не может
+тихо пропускать authoritative data. Совместимость замороженного формата требует version
+increment и явной migration; до freeze development formats заменяются без legacy decoders.
 
 ---

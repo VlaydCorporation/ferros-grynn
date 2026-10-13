@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use super::{
 	Transaction,
 	changefeed_capture::{admit_history_publication, install_capture},
-	changefeed_images::{CaptureBudget, same_image, same_value},
 	changefeed_journal::CaptureIntent,
+	operation_image::{CaptureBudget, same_image, same_value},
 };
 use crate::{
 	changefeed::{
@@ -732,7 +732,7 @@ fn same_suppressed_target(
 		) => {
 			let weights_equal = match (lw, rw) {
 				(None, None) => true,
-				(Some(left), Some(right)) => super::changefeed_images::same_number(*left, *right),
+				(Some(left), Some(right)) => super::operation_image::same_number(*left, *right),
 				_ => false,
 			};
 			if left.direction() != right.direction()
