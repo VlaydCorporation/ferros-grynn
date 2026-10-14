@@ -168,9 +168,18 @@ pub(super) fn extend_property_dictionary(
 	if new_first != first_new_page {
 		return Err(invalid("property dictionary append did not begin at the file tail"));
 	}
-	let old_last_index = page_index(decoded.root.entry_last_page, image.pages.len())?;
-	write_u64(image.pages[old_last_index].as_bytes_mut(), ENTRY_NEXT_PAGE_OFFSET, new_first.get());
-	image.pages[old_last_index].seal()?;
+	let entry_first_page = if decoded.root.entry_count == 0 {
+		new_first
+	} else {
+		let old_last_index = page_index(decoded.root.entry_last_page, image.pages.len())?;
+		write_u64(
+			image.pages[old_last_index].as_bytes_mut(),
+			ENTRY_NEXT_PAGE_OFFSET,
+			new_first.get(),
+		);
+		image.pages[old_last_index].seal()?;
+		decoded.root.entry_first_page
+	};
 
 	let mut locations = decoded.locations;
 	locations.extend(new_locations);
@@ -183,7 +192,7 @@ pub(super) fn extend_property_dictionary(
 			.entry_page_count
 			.checked_add(new_page_count)
 			.ok_or_else(|| invalid("property dictionary entry page count overflows u32"))?,
-		entry_first_page: decoded.root.entry_first_page,
+		entry_first_page,
 		entry_last_page: new_last,
 		hash_first_page,
 		hash_page_count,
@@ -845,6 +854,30 @@ mod tests {
 		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64)?;
 		assert_eq!(reopened.get("name").map(PropertyKeyId::get), Some(0));
 		assert_eq!(reopened.get("weight").map(PropertyKeyId::get), Some(1));
+		Ok(())
+	}
+
+	#[test]
+	fn empty_dictionary_append_installs_first_chain_and_preserves_old_snapshot()
+	-> FerrosGrynnResult<()> {
+		let original = PropertyDictionary::new();
+		let image = build_property_dictionary(&original, PageLsn::new(1))?;
+		let before = copied_pages(&image.pages);
+		let expanded = dictionary(["driven".to_owned()])?;
+		let image = extend_property_dictionary(image, &expanded, PageLsn::new(2))?;
+		let root = decode_root(&image.pages[0])?;
+		assert_eq!(root.entry_first_page, PageNo::new(1));
+		assert_eq!(root.entry_last_page, PageNo::new(1));
+		assert_eq!(root.entry_page_count, 1);
+		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64)?;
+		assert_eq!(reopened.get("driven"), Some(PropertyKeyId::new(0)));
+		assert!(open_property_dictionary(&before, before.len() as u64)?.is_empty());
+		let mut appended = expanded;
+		appended.intern("drive")?;
+		let image = extend_property_dictionary(image, &appended, PageLsn::new(3))?;
+		let reopened = open_property_dictionary(&image.pages, image.pages.len() as u64)?;
+		assert_eq!(reopened.get("driven"), Some(PropertyKeyId::new(0)));
+		assert_eq!(reopened.get("drive"), Some(PropertyKeyId::new(1)));
 		Ok(())
 	}
 

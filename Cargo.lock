@@ -2387,6 +2387,7 @@ dependencies = [
  "diskann 0.59.0",
  "diskann-vector 0.59.0",
  "fg-gql-status",
+ "flate2",
  "geo",
  "geojson",
  "half",
