@@ -1,0 +1,227 @@
+{
+  "png": [
+    {
+      "file": "png/logo-vertical/logo-vertical-256.png",
+      "width": 256,
+      "height": 256,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-vertical/logo-vertical-512.png",
+      "width": 512,
+      "height": 512,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-vertical/logo-vertical-1024.png",
+      "width": 1024,
+      "height": 1024,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-vertical/logo-vertical-2048.png",
+      "width": 2048,
+      "height": 2048,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-vertical/logo-vertical-4096.png",
+      "width": 4096,
+      "height": 4096,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-horizontal/logo-horizontal-384.png",
+      "width": 384,
+      "height": 154,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-horizontal/logo-horizontal-512.png",
+      "width": 512,
+      "height": 205,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-horizontal/logo-horizontal-1024.png",
+      "width": 1024,
+      "height": 409,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-horizontal/logo-horizontal-2048.png",
+      "width": 2048,
+      "height": 819,
+      "alpha": true
+    },
+    {
+      "file": "png/logo-horizontal/logo-horizontal-4096.png",
+      "width": 4096,
+      "height": 1638,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-16.png",
+      "width": 16,
+      "height": 16,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-20.png",
+      "width": 20,
+      "height": 20,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-24.png",
+      "width": 24,
+      "height": 24,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-32.png",
+      "width": 32,
+      "height": 32,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-40.png",
+      "width": 40,
+      "height": 40,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-48.png",
+      "width": 48,
+      "height": 48,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-64.png",
+      "width": 64,
+      "height": 64,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-96.png",
+      "width": 96,
+      "height": 96,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-128.png",
+      "width": 128,
+      "height": 128,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-180.png",
+      "width": 180,
+      "height": 180,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-192.png",
+      "width": 192,
+      "height": 192,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-256.png",
+      "width": 256,
+      "height": 256,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-384.png",
+      "width": 384,
+      "height": 384,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-512.png",
+      "width": 512,
+      "height": 512,
+      "alpha": true
+    },
+    {
+      "file": "png/icon/icon-1024.png",
+      "width": 1024,
+      "height": 1024,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-16.png",
+      "width": 16,
+      "height": 16,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-20.png",
+      "width": 20,
+      "height": 20,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-24.png",
+      "width": 24,
+      "height": 24,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-32.png",
+      "width": 32,
+      "height": 32,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-40.png",
+      "width": 40,
+      "height": 40,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-48.png",
+      "width": 48,
+      "height": 48,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-64.png",
+      "width": 64,
+      "height": 64,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-96.png",
+      "width": 96,
+      "height": 96,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-128.png",
+      "width": 128,
+      "height": 128,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-256.png",
+      "width": 256,
+      "height": 256,
+      "alpha": true
+    },
+    {
+      "file": "png/icon-light/icon-light-512.png",
+      "width": 512,
+      "height": 512,
+      "alpha": true
+    }
+  ],
+  "svg": [
+    "svg/logo-vertical.svg",
+    "svg/logo-horizontal.svg",
+    "svg/icon.svg",
+    "svg/icon-light.svg"
+  ],
+  "validation": "RGBA transparency, dimensions, ICO entries, vector-only SVG checked"
+}

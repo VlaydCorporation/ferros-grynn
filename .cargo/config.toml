@@ -1,5 +1,8 @@
 [build]
-rustflags = ["--cfg", "tokio_unstable", "-Z", "threads=8"]
+# Keep debug code generation within the Windows build memory budget.
+jobs = 1
+rustflags = ["--cfg", "tokio_unstable"]
+#rustflags = ["--cfg", "tokio_unstable", "-Z", "threads=8"] # for nightly toolchain
 
 [target.x86_64-pc-windows-msvc]
 rustflags = [

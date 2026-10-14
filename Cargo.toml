@@ -205,8 +205,10 @@ authors = ["Vlayd Detect"]
 edition = "2024"
 version = "0.1.0"
 description = "Embedded Graph Database Engine powered by Rust"
-repository = "https://github.com/VlaydDetect/ferros-grynn"
-homepage = "https://github.com/VlaydDetect/ferros-grynn"
+repository = "https://github.com/VlaydCorporation/ferros-grynn"
+homepage = "https://github.com/VlaydCorporation/ferros-grynn"
+readme = "README.md"
+license = "Apache-2.0"
 keywords = [
     "database",
     "embedded-database",
@@ -420,6 +422,13 @@ unwrap_used = "warn"
 while_float = "deny"
 wildcard_dependencies = "deny"
 wildcard_imports = "deny"
+
+# Limited debug information avoids multi-gigabyte archives and Windows mmap failures.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
 
 # aggressive optimizations for benchmark consistency
 [profile.release]

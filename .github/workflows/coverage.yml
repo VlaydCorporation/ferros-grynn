@@ -1,0 +1,73 @@
+name: Coverage
+
+on:
+  push:
+    branches: [master, mvp]
+  pull_request:
+    branches: [master, mvp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FG_RUST_TOOLCHAIN: 1.98.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    name: Windows / core tests and line coverage
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust and matching LLVM tools
+        run: rustup toolchain install $env:FG_RUST_TOOLCHAIN --profile minimal --component llvm-tools-preview
+      - name: Install just and cargo-llvm-cov
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: just@1.46.0,cargo-llvm-cov@0.8.7
+      - name: Measure coverage
+        run: just coverage
+      - name: Upload measured badge data
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-badge
+          path: target/coverage/coverage.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-core-coverage
+          path: target/coverage/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Publish the measured percentage
+    needs: measure
+    if: ${{ always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/mvp' }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download this run's badge data
+        if: needs.measure.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: coverage-badge
+          path: target/coverage/
+      - name: Update the isolated badge branch
+        env:
+          COVERAGE_RESULT: ${{ needs.measure.result }}
+        run: pwsh -NoLogo -NoProfile -File scripts/publish-coverage.ps1 -State $env:COVERAGE_RESULT

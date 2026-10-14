@@ -1,0 +1,50 @@
+name: Building
+
+on:
+  push:
+    branches: [master, mvp]
+  pull_request:
+    branches: [master, mvp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FG_RUST_TOOLCHAIN: 1.98.1
+  FG_RUSTFMT_TOOLCHAIN: nightly-2026-09-23
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows / MSVC
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install $env:FG_RUST_TOOLCHAIN --profile minimal --component clippy
+          rustup toolchain install $env:FG_RUSTFMT_TOOLCHAIN --profile minimal --component rustfmt
+      - name: Install just
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: just@1.46.0
+      - name: Validate CI and documentation contracts
+        run: just ci-check
+      - name: Build with default features
+        run: just build
+      - name: Build the core library
+        run: just build --no-default-features
+      - name: Check formatting and lints
+        run: just all-check
+      - name: Run default-feature tests
+        run: just test
+      - name: Run the README example
+        run: just quick-start

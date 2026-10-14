@@ -204,7 +204,7 @@ These `.md` files are the design authority for sensitive subsystems; when implem
 
 ## Common Commands
 
-Toolchain: **Rust edition 2024** (needs Rust 1.85+). A **nightly** toolchain is required for `cargo fmt` — `.rustfmt.toml` sets `unstable_features = true`. `.cargo/config.toml` passes `--cfg tokio_unstable` globally and static-CRT link args for the `x86_64-pc-windows-msvc` target.
+Toolchain: builds, tests and coverage use **stable Rust** (CI pins Rust 1.98.1), with **edition 2024**. A **nightly** toolchain is required only for `cargo fmt` — `.rustfmt.toml` sets `unstable_features = true`. `.cargo/config.toml` passes `--cfg tokio_unstable` globally and static-CRT link args for the `x86_64-pc-windows-msvc` target. Do not use nightly to compile the production crate.
 
 ```
 # Build lib

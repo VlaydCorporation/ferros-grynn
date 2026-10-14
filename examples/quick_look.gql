@@ -1,0 +1,13 @@
+DEFINE CLASS person TYPE NODE;
+DEFINE FIELD name ON CLASS person TYPE string;
+DEFINE CLASS knows TYPE EDGE;
+DEFINE GRAPH social TYPE GRAPH;
+
+CREATE person:alice SET name = 'Alice';
+CREATE person:bob SET name = 'Bob';
+RELATE (person:alice)-[knows:friendship]->(person:bob)
+    IN GRAPH social;
+
+MATCH (person:alice AS alice)-[knows]->(person AS friend)
+    IN GRAPH social
+    RETURN friend.name AS name;
